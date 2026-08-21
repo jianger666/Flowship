@@ -3,7 +3,7 @@
  * 起 next（dev 或 start）、并在 server ready 后自动开浏览器
  *
  * 使用方法：
- *   - `pnpm start`：起 next dev（热更、改 Flowship 代码时用、但按需编译会抖 chat-mcp globalThis 状态）
+ *   - `pnpm start`：起 next dev --turbo（热更、改 Flowship 代码时用、但按需编译会抖 chat-mcp globalThis 状态）
  *   - `pnpm serve`：先 next build 再起 next start（生产、跑真实大需求用、单一模块树、状态稳）
  *
  * 参数：argv[2] = "start" → 生产模式（next start）；其它 / 缺省 → dev 模式（next dev）
@@ -29,7 +29,11 @@ const FALLBACK_DELAY_MS = 10_000;
 const MODE = process.argv[2] === "start" ? "start" : "dev";
 // -H 127.0.0.1：只绑 loopback——next 默认 0.0.0.0 会把无鉴权 API（含密钥读取 /
 // shell 执行能力）暴露给整个局域网（CR-01）、源码运行也必须钉死本机
-const child = spawn("next", [MODE, "-p", PORT, "-H", "127.0.0.1"], {
+// next dev 一律 --turbo：webpack-dev 会把 Streamdown/Shiki 挂进进程吃 10GB+；
+// next start / next build 不走这条（生产构建仍 webpack）。
+const nextArgs = [MODE, "-p", PORT, "-H", "127.0.0.1"];
+if (MODE === "dev") nextArgs.push("--turbo");
+const child = spawn("next", nextArgs, {
   stdio: ["inherit", "pipe", "pipe"],
 });
 

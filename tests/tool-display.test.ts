@@ -110,6 +110,41 @@ describe("tool-display merge / GB 折叠规则", () => {
     });
   });
 
+  it("回合内工具失败的 kind=error 不进渲染流（历史双写兜底）", () => {
+    const call = ev({
+      id: "a",
+      kind: "tool_call",
+      text: "调用 grep",
+      meta: { callId: "c_grep", name: "grep" },
+    });
+    const boom = ev({
+      id: "err",
+      kind: "error",
+      text: "工具调用失败 grep：ripgrep 不可用",
+      ts: 2,
+      meta: { callId: "c_grep", name: "grep" },
+    });
+    const result = ev({
+      id: "b",
+      kind: "tool_result",
+      text: "工具失败 grep",
+      ts: 3,
+      meta: {
+        callId: "c_grep",
+        name: "grep",
+        status: "error",
+        output: "ripgrep is not available",
+      },
+    });
+    const out = mergeToolDisplayEvents([call, boom, result]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      kind: "__tool_block__",
+      callId: "c_grep",
+      status: "error",
+    });
+  });
+
   it("coerceStaleRunningTools：非 running 会话把转圈块改成 interrupted", () => {
     const running = block({
       id: "r1",
@@ -221,6 +256,7 @@ describe("tool-display merge / GB 折叠规则", () => {
     expect(isVerbGroupMember("shell")).toBe(false);
     expect(isVerbGroupMember("edit")).toBe(false);
     expect(isVerbGroupMember("mcp:feishu:x")).toBe(false);
+    expect(isVerbGroupMember("mcp__feishu__x")).toBe(false);
   });
 
   it("shell 默认折叠、edit 默认展开", () => {

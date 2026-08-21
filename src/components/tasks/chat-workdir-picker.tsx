@@ -3,7 +3,7 @@
 /**
  * ChatWorkdirPicker：chat 自由对话「选工作目录」入口（V0.8）
  *
- * 放输入框下方 footer 左侧、跟 ChatModelPicker 并列。对齐 codex / Cursor Agents / VS Code
+ * 放输入框下方 footer 左侧、跟提供方/模型选择器并列。对齐 codex / Cursor Agents / VS Code
  * 的「Open Recent」模式：点开下拉 = 最近用过的目录一键切换 +「浏览…」选新目录 +
  *「改用主目录」重置。比每次弹原生对话框找路径快（高频在几个项目间来回切）。
  *

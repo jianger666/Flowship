@@ -28,6 +28,39 @@ const execAsync = promisify(exec);
 
 const asTool = (d: unknown): ToolDefinition => d as ToolDefinition;
 
+const DEFAULT_SHELL_TIMEOUT_MS = 60_000;
+const MIN_SHELL_TIMEOUT_MS = 5_000;
+const MAX_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Node `exec` 的 timeout 是毫秒。模型（Cursor / Claude 习惯）经常传秒：15、30、60。
+ * 真实踩坑：模型传 timeout:15 → 被当成 15ms → curl 立刻被杀 → 模型误判「这台机器不能出网」。
+ * 未传 → 60s；<1000 当秒；≥1000 当毫秒；再夹到 5s~10min。
+ */
+export const resolveShellTimeoutMs = (raw: unknown): number => {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+    return DEFAULT_SHELL_TIMEOUT_MS;
+  }
+  const asMs = raw < 1000 ? raw * 1000 : raw;
+  return Math.min(MAX_SHELL_TIMEOUT_MS, Math.max(MIN_SHELL_TIMEOUT_MS, asMs));
+};
+
+/** 超时被杀时把「不是断网」说清楚，避免模型把 15ms kill 编成环境隔离。 */
+export const formatShellFailureText = (opts: {
+  timeoutMs: number;
+  killed?: boolean;
+  stdout?: string;
+  stderr?: string;
+  message?: string;
+}): string => {
+  const out = [opts.stdout, opts.stderr].filter(Boolean).join("\n");
+  if (opts.killed) {
+    const hint = `命令超时被终止（${opts.timeoutMs}ms）。shell 跑在本机、可以访问外网；请加大 timeout（单位秒）后重试。`;
+    return out ? `${hint}\n${out}` : hint;
+  }
+  return out || opts.message || "命令执行失败";
+};
+
 // ----------------- shell（= pi 的 bash） -----------------
 
 const shellTool = (cwd: string): ToolDefinition =>
@@ -35,7 +68,7 @@ const shellTool = (cwd: string): ToolDefinition =>
     name: "shell",
     label: "跑命令",
     description:
-      "在任务工作目录运行一条 shell 命令、返回 stdout / stderr 与退出码。命令在工作目录（cwd）内执行。",
+      "在任务工作目录运行一条 shell 命令，返回 stdout / stderr 与退出码。命令在本机执行、可以访问外网（curl / wget / npm 等）。timeout 为秒，默认 60；大于等于 1000 的值按毫秒理解。",
     parameters: TBObject({
       command: TBString(),
       timeout: TBOptional(TBNumber()),
@@ -43,8 +76,7 @@ const shellTool = (cwd: string): ToolDefinition =>
     execute: async (_toolCallId: string, params: unknown) => {
       const p = params as { command?: unknown; timeout?: unknown };
       const command = typeof p.command === "string" ? p.command : "";
-      const timeout =
-        typeof p.timeout === "number" && p.timeout > 0 ? p.timeout : 60_000;
+      const timeout = resolveShellTimeoutMs(p.timeout);
       if (!command.trim()) {
         return {
           content: [{ type: "text", text: "command 不能为空" }],
@@ -68,14 +100,20 @@ const shellTool = (cwd: string): ToolDefinition =>
           stdout?: string;
           stderr?: string;
           code?: number;
+          killed?: boolean;
           message?: string;
         };
-        const out = [e.stdout, e.stderr].filter(Boolean).join("\n");
         return {
           content: [
             {
               type: "text",
-              text: out || e.message || "命令执行失败",
+              text: formatShellFailureText({
+                timeoutMs: timeout,
+                killed: e.killed === true,
+                stdout: e.stdout,
+                stderr: e.stderr,
+                message: e.message,
+              }),
             },
           ],
           details: { exitCode: typeof e.code === "number" ? e.code : 1 },

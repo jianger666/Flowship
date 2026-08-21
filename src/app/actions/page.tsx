@@ -53,9 +53,13 @@ import {
   fetchCustomActions,
 } from "@/lib/custom-action-client";
 import { removeActionLayoutId } from "@/lib/action-layout";
+import { bootArgsForTask, hasActiveModelCreds } from "@/lib/agent-provider";
 import { getSettings, saveSettings } from "@/lib/local-store";
 import { createTask, sendChatReply } from "@/lib/task-store";
-import type { CustomActionDef } from "@/lib/types";
+import {
+  defaultModelForProvider,
+  type CustomActionDef,
+} from "@/lib/types";
 import { saveDraft } from "@/lib/view-memory";
 
 // 四个能力 tab（key 同时是 ?tab= 的取值）
@@ -117,8 +121,9 @@ const ActionsPanel = () => {
   // AI 先写纯方法论 SKILL.md，再调 create_custom_action 挂壳
   const handleAiCreate = async () => {
     const s = getSettings();
-    if (!s.apiKey?.trim() || !s.defaultModel?.id?.trim()) {
-      toast.error("先在设置页配好 API Key 和默认模型");
+    const defaultModel = defaultModelForProvider(s);
+    if (!hasActiveModelCreds() || !defaultModel?.id?.trim()) {
+      toast.error("先在设置页配好模型和凭据");
       return;
     }
     // action-creator 被关时 AI 拿不到创建规范、chip 也挂不上——提示而不是静默降级
@@ -136,7 +141,8 @@ const ActionsPanel = () => {
         mode: "chat",
         title: "创建 action",
         repoPaths: [appSkillsDir],
-        model: s.defaultModel,
+        model: defaultModel,
+        provider: s.provider,
         disabledMcpServers:
           s.disabledMcpServers && s.disabledMcpServers.length > 0
             ? s.disabledMcpServers
@@ -154,10 +160,11 @@ const ActionsPanel = () => {
   };
 
   // 旧格式「转建新版」：同对话创建链路 + 自动提交首条（带 playbook 全文）；
-  // 无 apiKey 时降级为建对话 + 草稿预填，不自动发
+  // 无模型凭据时降级为建对话 + 草稿预填，不自动发
   const handleConvertLegacy = async (def: CustomActionDef) => {
     if (convertingLegacyId || !def.legacyPlaybook) return;
     const s = getSettings();
+    const defaultModel = defaultModelForProvider(s);
     if (s.disabledSkills?.includes("action-creator")) {
       toast.error("action-creator skill 已被停用、先在 Skill tab 打开再转建");
       return;
@@ -178,7 +185,8 @@ const ActionsPanel = () => {
         mode: "chat",
         title: `转建：${def.label}`,
         repoPaths: [appSkillsDir],
-        model: s.defaultModel?.id?.trim() ? s.defaultModel : undefined,
+        model: defaultModel?.id?.trim() ? defaultModel : undefined,
+        provider: s.provider,
         disabledMcpServers:
           s.disabledMcpServers && s.disabledMcpServers.length > 0
             ? s.disabledMcpServers
@@ -186,11 +194,11 @@ const ActionsPanel = () => {
       });
       createdTaskId = task.id;
 
-      // 无 apiKey / 无默认模型 → 降级：草稿预填 + 挂 chip，用户配好后再发
+      // 无当前 provider 凭据 / 无默认模型 → 降级：草稿预填 + 挂 chip，用户配好后再发
       const canAutoSend =
-        !!s.apiKey?.trim() && !!s.defaultModel?.id?.trim();
+        hasActiveModelCreds() && !!defaultModel?.id?.trim();
       if (!canAutoSend) {
-        toast.error("先在设置页配好 API Key 和默认模型；已把转建说明写入草稿");
+        toast.error("先在设置页配好模型和凭据；已把转建说明写入草稿");
         saveDraft("reply", task.id, text);
         setPendingSlashSkill("action-creator");
         router.push(`/tasks/${task.id}`);
@@ -213,7 +221,7 @@ const ActionsPanel = () => {
         text,
         undefined,
         undefined,
-        { apiKey: s.apiKey, model: s.defaultModel },
+        { apiKey: bootArgsForTask(task, s).apiKey, model: defaultModel },
         [{ name: creator.name, absPath: creator.absPath }],
       );
       // send 后落盘失败——不可忽略提示

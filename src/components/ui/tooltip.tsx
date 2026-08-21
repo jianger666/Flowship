@@ -66,3 +66,60 @@ export const Tooltip = ({
     </TooltipPrimitive.Provider>
   );
 };
+
+/**
+ * 仅当文字真的被截断时才出 tip。短文案不挂气泡，避免每个选项都闪一遍原文。
+ * 外层盒负责量宽；内层才是 Tooltip trigger，避免 Base UI 把观察用的 ref 吃掉。
+ */
+export const OverflowTooltip = ({
+  text,
+  side = "right",
+  delay = 400,
+  className,
+  lineClamp = 1,
+}: {
+  text: string;
+  side?: TooltipPrimitive.Positioner.Props["side"];
+  delay?: number;
+  className?: string;
+  /** 1 = 单行省略；2 = 最多两行再省略（下拉选项用，避免长文案只剩 …） */
+  lineClamp?: 1 | 2;
+}) => {
+  const boxRef = React.useRef<HTMLSpanElement>(null);
+  const [overflowed, setOverflowed] = React.useState(false);
+
+  React.useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    const check = () => {
+      const inner = box.querySelector("[data-overflow-text]");
+      if (!(inner instanceof HTMLElement)) return;
+      setOverflowed(
+        lineClamp === 1
+          ? inner.scrollWidth > inner.clientWidth + 1
+          : inner.scrollHeight > inner.clientHeight + 1,
+      );
+    };
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, [text, lineClamp]);
+
+  return (
+    <span ref={boxRef} className={cn("min-w-0 flex-1", className)}>
+      <Tooltip content={overflowed ? text : ""} side={side} delay={delay}>
+        <span
+          data-overflow-text
+          className={
+            lineClamp === 1
+              ? "block truncate"
+              : "block wrap-anywhere line-clamp-2"
+          }
+        >
+          {text}
+        </span>
+      </Tooltip>
+    </span>
+  );
+};

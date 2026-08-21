@@ -2,11 +2,14 @@
  * 用户 MCP server → pi customTools 的桥接（pi 无 MCP、这里用官方 MCP SDK client 起连接）
  *
  * 每个 MCP server 起一个 Client、listTools 枚举工具、callTool 转发调用。
- * 工具名归一成 `mcp:<server>:<tool>`（跟 cursor SDK 侧 normalizeToolName 的展示口径一致）。
+ * 送给模型的名字是 `mcp__server__tool`（Anthropic / OpenAI 工具名不允许冒号；
+ * DeepSeek Anthropic 面对 `mcp:server:tool` 直接 400）。call 时仍用 MCP 原始名。
  *
  * 连接在 agent 创建时建立、agent 关闭时 close（生命周期随会话）。
  * 单个 server 连不上 / 列工具失败只 warn、不拖垮整轮（对应 cursor 侧 filterHealthyMcp 已剔除过一轮、这里再兜一层）。
  */
+
+import { createHash } from "node:crypto";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -14,8 +17,10 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { McpServerConfig } from "@cursor/sdk";
 
+import { API_TOOL_NAME_MAX, mcpApiToolName } from "@/lib/mcp-tool-name";
+
 export interface BridgedMcpTool {
-  /** 归一名：`mcp:<server>:<tool>` */
+  /** 送给模型的 API 名：`mcp__server__tool` */
   name: string;
   description: string;
   /** MCP 返回的 JSON Schema（工具入参描述、给 LLM function-calling 用） */
@@ -87,9 +92,29 @@ export const connectMcpServer = async (
 
   await client.connect(transport);
   const listResult = await client.listTools();
+  // 同一 server 下两个工具 sanitize 后可能撞名，短 hash 拆开
+  const usedNames = new Set<string>();
+  const uniqueApiName = (innerName: string): string => {
+    const base = mcpApiToolName(serverName, innerName);
+    if (!usedNames.has(base)) {
+      usedNames.add(base);
+      return base;
+    }
+    const hash = createHash("sha1")
+      .update(`${serverName}\0${innerName}`)
+      .digest("hex")
+      .slice(0, 6);
+    const trimmed = base.slice(0, Math.max(1, API_TOOL_NAME_MAX - 1 - hash.length));
+    const name = `${trimmed}_${hash}`;
+    usedNames.add(name);
+    return name;
+  };
   const tools: BridgedMcpTool[] = (listResult.tools ?? []).map((t) => ({
-    name: `mcp:${serverName}:${t.name}`,
-    description: t.description ?? "",
+    name: uniqueApiName(t.name),
+    // description 带原始名，模型仍能对上 MCP 文档里的工具
+    description: t.description
+      ? `MCP ${serverName}.${t.name}：${t.description}`
+      : `MCP 工具 ${serverName}.${t.name}`,
     inputSchema: t.inputSchema ?? {},
     call: async (args: Record<string, unknown>) => {
       const result = await client.callTool({ name: t.name, arguments: args });

@@ -263,13 +263,18 @@ export const assembleServerLayout = async (rootDir, destDir) => {
   // ---------- 2. 运行时按 cwd 读的目录（tracing 对动态 fs 读不保证、显式拷一遍兜底） ----------
   await cp(path.join(rootDir, "prompts"), path.join(destDir, "prompts"));
   await cp(path.join(rootDir, "skills"), path.join(destDir, "skills"));
-  // ssh-exec：公司环境 SSH 执行脚本（agent 用 shell 调、密码脚本内读配置）
+  // ssh-exec / pg-exec：公司环境执行脚本（agent 用 shell 调、密码脚本内读配置）
   await cp(
     path.join(rootDir, "scripts", "ssh-exec.mjs"),
     path.join(destDir, "scripts", "ssh-exec.mjs"),
   );
-  // ssh2 在 ssh-exec.mjs 模块加载时就 require、Next 没有任何 import 会把它带进 standalone
+  await cp(
+    path.join(rootDir, "scripts", "pg-exec.mjs"),
+    path.join(destDir, "scripts", "pg-exec.mjs"),
+  );
+  // 这两个脚本模块加载时就 require、Next 没有任何 import 会把它们带进 standalone
   await addRuntimePackage(rootDir, destDir, "ssh2");
+  await addRuntimePackage(rootDir, destDir, "pg");
 
   // pi（自定义 provider 后端）是 external + bundler-opaque 动态 import（./api/* ./providers/*），
   // nft 静态分析追不到这些子路径、运行时 lazy import 会 MODULE_NOT_FOUND——整包补。

@@ -381,7 +381,10 @@ describe("R31 / R30-3：task-store 客户端透传 persistWarning", () => {
         ),
       ),
     );
-    const result = await submitTaskQuestion("t2", "问一句");
+    const result = await submitTaskQuestion(
+      { id: "t2" } as Task,
+      "问一句",
+    );
     expect(result.persistWarning).toBe(WARNING);
     expect(result.task.id).toBe("t2");
   });
@@ -399,9 +402,13 @@ describe("R31 / R30-3：task-store 客户端透传 persistWarning", () => {
         ),
       ),
     );
-    const result = await submitAskReply("t3", "ask_1", [
+    const result = await submitAskReply(
+      { id: "t3" } as Task,
+      "ask_1",
+      [
       { questionId: "q1", answer: "a" },
-    ]);
+    ],
+    );
     expect(result.ok).toBe(true);
     expect(result.persistWarning).toBe(WARNING);
   });

@@ -162,10 +162,13 @@ export const maskSettingsSecrets = (
     gitToken: maskSecret(settings.gitToken),
   };
   // 自定义 provider 的 apiKey 同级别脱敏（baseUrl / format 非敏感、保留原样）
-  const cp = settings.customProvider;
-  if (cp && typeof cp === "object" && !Array.isArray(cp)) {
-    const c = cp as Record<string, unknown>;
-    out.customProvider = { ...c, apiKey: maskSecret(c.apiKey) };
+  const cps = settings.customProviders;
+  if (Array.isArray(cps)) {
+    out.customProviders = cps.map((row) => {
+      if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+      const c = row as Record<string, unknown>;
+      return { ...c, apiKey: maskSecret(c.apiKey) };
+    });
   }
   return out;
 };
@@ -195,25 +198,29 @@ export const preserveSecretsOnPut = (
       preserved.push(key);
     }
   }
-  // 自定义 provider 的 apiKey：client 误把脱敏展示值当真值回写时保留盘上真值
-  const incCp = out.customProvider;
-  const curCp = current.customProvider;
-  if (
-    incCp &&
-    typeof incCp === "object" &&
-    !Array.isArray(incCp) &&
-    curCp &&
-    typeof curCp === "object" &&
-    !Array.isArray(curCp)
-  ) {
-    const inc = incCp as Record<string, unknown>;
-    const cur = curCp as Record<string, unknown>;
-    const curKey = typeof cur.apiKey === "string" ? (cur.apiKey as string) : "";
-    const incKey = typeof inc.apiKey === "string" ? (inc.apiKey as string) : "";
-    if (curKey && incKey.includes(MASK_MARKER)) {
-      out.customProvider = { ...inc, apiKey: curKey };
-      preserved.push("customProvider.apiKey");
+  // 自定义 provider 列表：按 id 对齐，client 误把脱敏展示值当真值回写时保留盘上真值
+  const incList = out.customProviders;
+  const curList = current.customProviders;
+  if (Array.isArray(incList) && Array.isArray(curList)) {
+    const curById = new Map<string, Record<string, unknown>>();
+    for (const row of curList) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+      const c = row as Record<string, unknown>;
+      if (typeof c.id === "string" && c.id) curById.set(c.id, c);
     }
+    out.customProviders = incList.map((row) => {
+      if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+      const inc = row as Record<string, unknown>;
+      const id = typeof inc.id === "string" ? inc.id : "";
+      const cur = id ? curById.get(id) : undefined;
+      const curKey = typeof cur?.apiKey === "string" ? cur.apiKey : "";
+      const incKey = typeof inc.apiKey === "string" ? inc.apiKey : "";
+      if (curKey && incKey.includes(MASK_MARKER)) {
+        preserved.push(`customProviders.${id}.apiKey`);
+        return { ...inc, apiKey: curKey };
+      }
+      return inc;
+    });
   }
   return { settings: out, preserved };
 };

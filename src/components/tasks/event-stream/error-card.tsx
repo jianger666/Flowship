@@ -11,6 +11,7 @@
  * 现在：error 不进组（见 lib/chat-turns.ts 的 MEMBER_KINDS）、独立平铺成这张卡——
  * destructive 边框 + 底衬给足视觉权重，原始诊断可展开，一键复制整份，
  * 当轮失败还能直接重试（= 把最后一条用户消息原样再发）。
+ * 回合内工具失败（grep 挂了、run 还在继续）不走这张卡，见 isInTurnToolErrorEvent。
  */
 
 import { useState } from "react";

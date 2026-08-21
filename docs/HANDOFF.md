@@ -370,48 +370,18 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-08-05 交卷/提问收尾收敛 + 任务详情头部重构 + 每仓分支切换（v1.7.1）
+### v1.9.0（2026-08-21）自定义 HTTP 提供方：task / chat 都能推
 
-- **交卷 / 提问收尾协议收敛**：`submit_work` 成功即刻由平台补发固定收尾「已完成，产出已更新，请审阅。」（AI 播报形态、内容统一）；交卷 / 提问成功后的模型输出落盘带 `meta.muted` 标记但**不 SSE 广播**（审计保留、UI 不渲染；顺带修掉消音事件广播导致的滚动抖动回归）；删「Action 产出完成、等待 ack」info 里程碑；prompt / 工具返回文案同步「收到宿主 Please continue 直接结束、不重问不调查」。
-- **任务详情头部重构**：标题/操作行 + 任务级入口行（任务上下文 / MCP / 分批 │ 需求群 / 任务文件夹）+ 按仓项目卡片；上下文文档→任务上下文、MCP servers→MCP；未分批入口隐藏（半兼容）；单仓 / 多仓统一短名。
-- **每仓分支展示 + 切换**：项目卡片内分支 chip + 切换弹层（带警告）；worktree 未就绪禁切；分支下拉统一为 `BranchSwitcher`（chat select / task chip）。
-- **产物区 / 操作区打磨**：产物文件名并入 ArtifactPanel toolbar；timeline chip / 主操作按钮去冗余 tooltip；拖拽柄修点击黑框（outline-none）；预览 tooltip 只显示命令。
-- **门禁**：typecheck / lint 干净；vitest 全量通过（本地端口 / 子进程用例沙箱外复跑通过）；test 包构建通过。
-- **已知问题（待排查）**：旧 task 输入条提问偶发「AI 串消息」——答了前一天另一个事件的问题。排查结论：三条注入链路都带的是新消息文本，嫌疑在 `sendToTaskSession` 的 `Agent.resume`——上一回合若被中断（checkpoint 存了可续跑回合），resume+send 时 SDK 可能先把旧回合续完，产出昨日问题的答案；Flowship 未传 `local.force` 也没有上一 run 终态护栏。待同事 task id 坐实后再修（候选：resume 前 force / 或降级一次性答疑）。
-- **已知问题（grep 卡住，2026-08-05 同事 task t_1785900078207_h2nrri 实锤）**：模型 grep 不带 path（全 CWD）或 path 给仓库根时，Windows 机器上单次遍历 60–185s；工具调用串行——一个慢 grep 占住后后续工具全在排队，UI 看“多个工具一起卡”。根因是仓库根目录遍历慢（非隔离任务直接在原仓库跑、根下可能有 node_modules/target 等重型目录）+ 模型 grep 没带精确子路径 + Flowship 无工具级超时。修复候选：prompt 写死 grep 纪律（必须带精确 path、glob 只配子目录用）；可选工具看门狗；或默认隔离 worktree。
-- **已知问题（建群 open_id cross app，2026-08-05 已修）**：点「创建需求群」报 `open_id cross app`——飞书 open_id 应用级隔离，注册表里别的 Flowship 应用名下的 open_id 不能塞进当前应用的 `user_id_list`。已修：`pickGroupCreationTargets` 只把 `botAppId === 当前应用` 的成员 open_id 进名单，跨应用成员跳过本人（bot 照加、按 app_id 全局可用），并留 warn。
+- **为什么**：设置页只能 Cursor / 一条自定义二选一，改默认会劫持所有窗口；老用户升级不能把已有 Cursor 任务悄悄改去跑 HTTP API。
+- **改了什么**：设置页是目录（Cursor SDK 固定第一项，自定义可新增多条）。`settings.provider` 只给**新建**拷到 `task.provider`。已有窗口用自己的提供方；task 创建后、chat 发出第一条后不能再切（PATCH 409）。旧 `{ provider: "custom", customProvider }` 读盘迁成 `cp_legacy`。**没有 `task.provider` 的老任务一律 Cursor**（即使设置页默认已是自定义）。chat / 推进 / 答题 / 标题都走 `agent-backend`：cursor 仍是 SDK + JSONL store，自定义走 pi。自定义允许空 Key。提供方+模型并排 picker；常用改成每提供方最多 2 个星标。`pg-exec.mjs` 查库（brief 有 PG 才注入）。飞书桥接「本机另一处已在收」改注意态，不当失败红叉。pi `shell` 超时按秒理解；SDK 自带 `rg` 注入 PATH；回合内工具失败不再当红框崩溃。
+- **故意不动**：不把 Cursor 会话转成 pi 会话；不按 URL 猜 OpenCode Go。
+- **升级**：未配自定义的老用户路径不变。已配旧单槽自定义的会看见 `cp_legacy`。Cursor 会话恢复口径与 v1.8.2 相同（JSONL store）。
 
-### 2026-07-28 团队 wk 流程门禁 + 交付中心配置 + REQ-ID 可编辑（v1.6.0）
+### 2026-08-19 SDK store 改挂 JSONL（v1.8.2）
 
-> 双模型交叉 review 的逐条结论与判断过程存 `docs/CHANGELOG.md` 同名条目。本段只留「这批干了什么 + 口径」。
-
-- **门禁由 Flowship 在流程节点强制调**（不靠 agent 自觉）：`wk-gate.ts` 三个挂钩点——推进前 `wk-context-init.py`（warn-only）+ `doc-quality-gate.py --command wk:xxx`（**非 0 硬拦**：不 append action、不起 agent、错误进事件流）；action 收尾 `--stage <stage>`（并进 `postCheck.passed`、UI 红条）；过了才 `wk-delivery-sync.py`。起因是我们起 SDK agent 传 `settingSources: []`（修 MCP 泄漏），规范里唯一「平台强制」的 hook guard 加载不了，于是走规范自带的 fallback preflight 条款——反过来把原本靠 agent 自觉的那几类也变可靠了。`wk-state.py transition` 仍归 agent（要带只有它知道的 reason / target-status）。
-- **五档降级 + 一条铁律**：非 wk action（静默）/ 没绑仓 / 没配 doc_repo / 团队库缺脚本 / 文档仓没这个 REQ-ID 目录 → 跳过 + 事件流一条可读提示；**除「preflight 非 0」这一处有意硬拦外，任何异常都不阻塞主流程**（脚本起不来、缺席、超时、读盘炸全部降级放行）。脚本输出经 `wk-gate-output.ts` 转成「一句话结论 + 有限条明细」，不把 stdout 一坨塞进事件流。
-- **脚本目录口径**：门禁脚本在镜像的 `knowledge/skills/global/wk-harness/scripts/`（`wkScriptsDir()`）；`knowledge/scripts/` 放的是知识库维护脚本（`kb_refresh.sh` / `pull_*_repos.sh`）——本文件与 `team-library.ts` 旧注释把这两个写反了，本批订正。
-- **配置落 `~/.wk/config.yaml`**（不用 Flowship 的同事读同一份）：设置页 连接 → 团队 wk 流程 配文档仓路径 + 交付中心地址 + 两个开关；写回是**键级合并**（同事配的其它键与注释原样保留）、解析 / 生成口径对齐官方 python 的 `read_simple_delivery_yaml`；地址留空时三个 `delivery_hub` 键一起删（官方 baseline 脚本遇到「require_* 为真却没 base_url」直接 FAIL 挡死 `wk:*`）。交付中心可达性探测走服务端（hub 在内网、没配 CORS）。
-- **REQ-ID 可编辑**：`resolveReqId`（手填 > 飞书链接派生 > `REQ-TASK-*` 本地兜底）是 prompt 注入与门禁拼 `requirements/<REQ-ID>` 的唯一入口；新建表单与编辑弹窗都能改，提交判定共用 `reqIdPatchValue`（**必须带 `touched`**：只展示派生值不算手填，否则改链接会把旧派生值锁死）。
-- **本轮 review 修掉的两条 P0**：① 团队库版本差异（`wk-context-init.py` 07-27 才加）让老镜像**每次 wk 推进刷一条假告警**——现在 plan 先探盘、缺了整步跳过，且 `runWkScript` 把「退 2 + can't open file」归成 `unavailable/no-script` 而非 `failed`；② 编辑弹窗改飞书链接会把旧 REQ-ID 误锁成手填值。两条都补了先对旧实现跑红过的用例（`tests/wk-gate.test.ts` 的 execFile mock 改成**认真实文件系统**、`tests/req-id{,-form-contract}.test.ts`）。
-- **P1 顺带**：后置门禁最坏耗时 60s → 30s（它挂在 action 从 running 翻 awaiting_ack 的必经路径上）；降级提示带 `meta.notice` 走事件流可见形态（原来被压成一行 truncate 灰字、「去设置页配」这类指引根本看不到）；错误卡保留换行、toast 只留一句结论（明细看事件流）；`no-req-dir` 按 command 分文案（首跑 `wk:biz-analyze` 不再诱导用户改编号）；半截 hub 配置（`require_*=true` 却没地址）允许关掉、非法地址草稿失焦即回滚。
-- **已知欠账**：后置门禁降级时 `postCheck.passed` 仍是 true、而 postCheck 详情只在 `passed=false` 时渲染 → 用户看不到「这次门禁其实没跑」（要修得给 postCheck 加 warn 态、不只是布尔）；交付同步仍是阻塞状态翻转的串行一步。
-- **命名统一 Delivery Hub**（发版前顺手）：产物中心此前代码里叫「Harness Hub」，团队规范（wk-harness skill 全篇）的官方叫法是 delivery hub（项目名 `harness-delivery-hub`、配置键 `delivery_hub.*`）——页面文案 / 事件流消息 / 注释 / 测试断言全量改为「Delivery Hub」（42 处），代码标识符（`hubBaseUrl` 等）不动。
-
-### 2026-07-27 需求群协作 + 受限答疑协议 + 输入体系重构（v1.6.0）
-
-> 稳定形态已写进上面的「当前架构快照」（需求群协作 / 受限答疑旁路）+ `docs/feishu-group-collab.md`；
-> 七轮双模型交叉 review 的逐轮过程存 `docs/CHANGELOG.md` 同名条目。本段只留「这批干了什么 + 还欠什么」。
-
-- **需求群协作一～五期一口气交付**：分享闭环（API + MCP + 产物面板 / 选中段两个 UI 入口）、群消息回流、群内答题卡、群内推进（「推进」出 action 选择卡 / 「推进 <名字>」模糊匹配）、action 完成自动播报、建群按**成员自动注册表**一次带齐角色成员和他们各自的 bot（团队库 `members` 数据分支、⚠️ 不能开保护，否则每个人的自动注册都失败）。方案完全建立在**免审 scope** 上——事后拉人 / 查群成员 / 用户身份发消息全部不可用（实测表见设计文档）。
-- **受限答疑协议**（七轮双模型 review 收敛的成果、架构级）：非属主群消息落只读旁路 `restricted-question.ts`、与 task 运行状态机**完全解耦**；回群登记 **token 化投递**（`runTag` + 事件 `origin`，属主 run 与多位同事的答疑 run 各回各的）；推进收口看 **action 真实状态**而不是 turn 结束；advance 登记的**四条清理链口径表**。三次协议级收敛的共同教训：同族问题第二次以「更细窗口」重现就别再逐分支打补丁（learned-conventions 已立条）。
-- **本轮清尾三条**（终审判可交付后剩的小口子）：① `restoreGroupReply` 放回 `previous` 时 advance **无条件放回**——原来的租约闸等于在回滚路径上静默摘掉一条在飞推进，这第四个改表点同步补进口径表两处；② advance 顶掉 advance 不再静默丢——`advanceTask` **成功之后**给上一轮的发起人 @ 一句「上一轮推进已被新一轮取代」（失败路径要 restore，所以绝不能提前发；「推进结果回群」关掉时不发）；③ 到期回执自己判一次桥接总开关（钩子由 `hasGroupReplies` 的 prune 触发、早于出向那句开关判定）。
-- **输入体系重构**：`rich-input.tsx`（内核）/ `conversation-composer.tsx`（会话壳、原 `composer.tsx`）/ `use-rich-input.ts`（状态层）三层单一来源，chat 输入岛 / task 事件流输入条 / 推进弹窗 / 答题卡四处共用；`/skill` 后端贯通 advance 与 ask-reply 两条链——**不进 `action.userInstruction`**，否则每条 action 历史都重复一段指引。
-- **其它**：团队库源仓迁 `wk-harness-platform` + 默认分支探测（当前 `release/1.0`）+ 排除 `harness-delivery-hub/` + `knowledge/` 豁免敏感扫描；UI 修复若干（事件流工具态不再误判「已中断」、停止键可见性单一源、滚动条布局抖动全局治理、选区浮动按钮抽公共件）。
-- **不答提问、直接发新消息 = 隐式跳过那组提问**（用户实测缺陷：待答卡片 + 顶部「AI 在等你回答」悬浮条一直挂着、推进按钮也被按住，用户原话「像牛皮癣一样」；chat 模式那条链原本一个字都没处理）。协议在 `src/lib/server/ask-skip.ts`：入口**同步认领**（原子摘走 pendingAsk）→ 消息确认交给 agent 后**提交**（写 `meta.supersededAskId` + `askSkipped` 的作废事件 + 置飞书卡片终态）→ 没送出去**回滚**（登记放回、还能回去答）。
-  - **UI 不是删除、是折叠**：事件流里收成一行「AI 提过 N 个问题 · 已跳过」、可展开看原问题（事件流是历史、抹掉会让回溯看不懂 agent 后面那句「按你说的继续」）；那条作废 info 不再单独占一行。悬浮条 / `canAdvance` 跟着 `findPendingAskEvent` 自动恢复——三处共用同一判定，没有第二套。
-  - **agent 消息前置一句跳过上下文**（`ASK_SKIP_AGENT_HINT`），不加的话 AI 大概率换个说法把同一组问题再问一遍；只进 agent 文本、不进事件流气泡。
-  - **答 vs 跳只有一个赢**：仲裁者只有 pendingAsks 一张表，`takePendingAskIf` 是唯一认领口——`ask-reply` 路由从「先 peek、送达后 clear」改成同款原子摘走（失败路径条件放回），跳过赢了则 `ask-reply` 入口的 `isAskSkipped` 闸 409。登记为空时靠 `wasAskTakenRecently` 区分「答题链在飞」与「重启后的孤儿 ask」（前者放手、后者才按事件收口，否则卡片永远挂着）。
-  - **顺带清掉上一批的欠账**：卡片终态收口点（见上「需求群协作」第五条）——现在从 app 答完，群里 / p2p 那张卡也会一起置成终态。
-- **发版前收尾（2026-07-28、三模型交叉 review + 两轮蓝军审查）**：修掉「跳过提问」协议 6 条竞态 / 失败路径问题——① ask-reply `!pending` 入口统一加 `wasAskTakenRecently` 让路守卫（跳过链在飞时既不写作废事件也不走僵尸唤醒，覆盖「已失效」与「僵尸」两个子分支）；② 唤醒兜底的飞书答题卡终态挪到投递成功之后（fire-and-forget 成功路径才 settle、失败只落引导事件，chat 返 false 不再静默）；③ 孤儿跳过 rollback 撤占位打点（新增 `clearAskTakenMark`、askId 匹配才清）；④ commit 写作废事件失败撤打点（自愈窗口 TTL 10 分钟 → 下一条消息）；⑤ `restorePendingAskIf` 撤打点对齐 askId 匹配口径；⑥ fire-and-forget 收尾回调包 `noteWakeFailure`（写盘失败不再逃逸成 unhandled rejection）。已知窄窗口 P2 两条记录在案不阻塞：commit 撤打点后写盘失败+会话死+用户答题三重叠加的双赢可能、僵尸分支 await 后可补守卫复查。
-- **门禁**：typecheck / lint 0 warning / vitest 全绿；并发与协议类新断言逐条先对旧实现跑过、确认会红才算数。用例总数以本地 / CI 实跑为准，⛔ 不在文档里写死数字。
+- **为什么**：同事 Windows 长 run 收尾报 `[internal] unable to open database file`。这是 Cursor SDK 默认 SQLite store（`~/.cursor` 下 WAL）被杀毒 / OneDrive 拦掉，不是 Flowship 自己的库。
+- **改了什么**：`Agent.create` / `resume` / `prompt` 经 `dataRoot/sdk-agent-store` 的 `JsonlLocalAgentStore`（不写用户主目录）。v1.9.0 起入口是 `agent-backend`（cursor 分支仍走这份 store）。Flowship 会话恢复仍走 `events.jsonl`；升级后内存里的旧 agent 会随重启丢掉，下一次续聊 `Agent.resume` 对不上 JSONL 会清锚点、按事件流起新会话。
+- **故意不动**：不在 instrumentation 里 `Cursor.configure`（那个 bundle 不能碰 `@cursor/sdk`）。
 
 ## 关键文件索引
 
@@ -488,8 +458,8 @@ ai-flow-action-hub/
 | 设置：交互偏好卡（提交快捷键 + v0.9.11「推进时默认续用当前 Agent」） | `src/components/settings/preference-card.tsx` + `FeAiFlowSettings.reuseAgentDefault` |
 | 设置：GitLab PAT（Host 从仓库 origin 推导；V0.6.1 新增） | `src/components/settings/git-card.tsx` |
 | **feature 分支命名模板引擎（V0.6.7、client+server 共用）** | `src/lib/branch-template.ts` |
-| 模型选择器统一组件（可搜索 popover + chips 参数、全站 5 处共用） | `src/components/ui/model-select.tsx` |
-| Skills loader | `src/lib/server/skills-loader.ts` |
+| 提供方+模型组合选择（下拉里点星钉常用，每提供方 2 个） | `src/components/ui/{provider-model-picker,model-select,picker}.tsx` + `src/lib/starred-models.ts` |
+| SDK 本地 agent store（躲开 `~/.cursor` SQLite WAL） | `src/lib/server/sdk-agent-store.ts` + `src/lib/server/agent-backend.ts` |
 
 ## 设计变动流程
 

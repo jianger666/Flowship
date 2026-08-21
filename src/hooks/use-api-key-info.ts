@@ -12,14 +12,20 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import type { ApiKeyInfo } from "@/lib/types";
+
+export interface UseApiKeyInfoOptions {
+  /** 用户手动触发（如点「验证」）：即使命中缓存也走非静默，弹出成功/失败 toast */
+  manual?: boolean;
+}
 
 export interface UseApiKeyInfoResult {
   info: ApiKeyInfo | null;
   loading: boolean;
   error: string;
-  fetchInfo: (apiKey: string) => Promise<void>;
+  fetchInfo: (apiKey: string, options?: UseApiKeyInfoOptions) => Promise<void>;
 }
 
 const CACHE_KEY = "flowship:api-key-info-cache";
@@ -76,7 +82,8 @@ export const useApiKeyInfo = (): UseApiKeyInfoResult => {
   // 当前 in-flight 请求的 controller、新请求来时 abort 旧的
   const abortRef = useRef<AbortController | null>(null);
 
-  const fetchInfo = useCallback(async (apiKey: string) => {
+  const fetchInfo = useCallback(async (apiKey: string, options?: UseApiKeyInfoOptions) => {
+    const manual = options?.manual ?? false;
     abortRef.current?.abort();
 
     const trimmed = apiKey.trim();
@@ -87,9 +94,9 @@ export const useApiKeyInfo = (): UseApiKeyInfoResult => {
       return;
     }
 
-    // SWR：缓存命中先出数据、后台静默刷新
+    // SWR：缓存命中先出数据、后台静默刷新；手动验证时即使有缓存也转圈 + toast
     const cached = readCache(trimmed);
-    const silent = cached !== null;
+    const silent = cached !== null && !manual;
     if (cached) {
       setInfo(cached);
       setError("");
@@ -120,16 +127,25 @@ export const useApiKeyInfo = (): UseApiKeyInfoResult => {
           setInfo(null);
           setError(json.error || "获取失败");
         }
+        if (manual) {
+          toast.error(json.error || `获取失败（HTTP ${res.status}）`);
+        }
         return;
       }
       const fresh: ApiKeyInfo | null = json.user ?? null;
       setInfo(fresh);
       if (fresh) writeCache(trimmed, fresh);
+      if (manual) {
+        toast.success(fresh ? "API Key 验证成功" : "API Key 验证完成（未返回账号信息）");
+      }
     } catch (err) {
       // AbortError 是主动 abort（连点 / 改 key）、不算错误
       if (err instanceof DOMException && err.name === "AbortError") return;
       if (ctrl.signal.aborted) return;
       if (!silent) setError(err instanceof Error ? err.message : String(err));
+      if (manual) {
+        toast.error(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       if (!ctrl.signal.aborted && !silent) setLoading(false);
     }

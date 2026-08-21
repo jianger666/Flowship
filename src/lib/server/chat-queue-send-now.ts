@@ -300,7 +300,7 @@ export const sendQueuedChatMessageNow = async (
   deps: SendNowDeps = defaultDeps,
 ): Promise<Response> => {
   // 缺凭据先于取队——避免无意义改队列状态
-  if (!bootArgs?.apiKey || typeof bootArgs.apiKey !== "string") {
+  if (!bootArgs || typeof bootArgs.apiKey !== "string") {
     return errorResponse("缺 bootArgs.apiKey、起新会话必传");
   }
   if (!isValidModel(bootArgs.model)) {

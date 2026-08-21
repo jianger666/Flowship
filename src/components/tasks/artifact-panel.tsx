@@ -12,7 +12,7 @@
  *
  * 保留：
  *   - 正文常显 +「修订」开关（原 Diff tab 已退役）
- *   - revision 对比基准 Select
+ *   - revision 对比基准下拉
  *   - inline code 路径 → cursor:// 跳转
  *   - 红点提示「有未看 revision」（按 actionId 维度记 localStorage）
  *
@@ -81,6 +81,7 @@ import { ChoiceButton } from "@/components/ui/choice-button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { LoadingState } from "@/components/ui/loading-state";
+import { Picker } from "@/components/ui/picker";
 import {
   SelectionFloatButton,
   useSelectionFloat,
@@ -92,19 +93,12 @@ import {
   buildSelectionShareInput,
 } from "@/lib/share-to-group";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   LocalFileLink,
   LocalFilePathSegments,
   useLocalFilePathLinker,
   type LocalFilePathLinker,
 } from "@/components/ui/local-file-link";
-import { resolveLocalFileAbsolute } from "@/components/ui/local-file-preview";
+import { resolveLocalFileAbsolute } from "@/components/ui/local-file-preview-context";
 import { jumpRevisionHit } from "@/lib/revision-hit";
 import { normalizeArtifactSearchQuery } from "@/lib/artifact-search";
 import {
@@ -1017,40 +1011,20 @@ export const ArtifactPanel = ({
 
           {revisionOn && canRevise && (
             <>
-              <Select
-                // 未选对比版本时用 null 保持受控（undefined 会被判为非受控、选版本后切换会报警告）
-                value={compareFromTs == null ? null : String(compareFromTs)}
-                onValueChange={(v) => v != null && setCompareFromTs(Number(v))}
-              >
-                <SelectTrigger size="sm" className="ml-1 max-w-[160px]">
-                  <SelectValue>
-                    {(value) => {
-                      if (value == null) return null;
-                      const ts = Number(value);
-                      if (!Number.isFinite(ts)) return null;
-                      const idx = revisionsDesc.findIndex(
-                        (r) => r.timestamp === ts,
-                      );
-                      if (idx < 0) return null;
-                      return revisionOptionLabel(
-                        revisionsDesc[idx]!,
-                        idx,
-                        totalRevisions,
-                      );
-                    }}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent align="end" alignItemWithTrigger={false}>
-                  {revisionsDesc.map((rev, idx) => (
-                    <SelectItem
-                      key={rev.timestamp}
-                      value={String(rev.timestamp)}
-                    >
-                      {revisionOptionLabel(rev, idx, totalRevisions)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <Picker
+                // 未选对比版本时用空字符串保持受控（跟旧 Select 的 null 同语义）
+                value={compareFromTs == null ? "" : String(compareFromTs)}
+                onChange={(v) => {
+                  if (v) setCompareFromTs(Number(v));
+                }}
+                placeholder=""
+                className="ml-1 h-7 w-auto max-w-[160px] text-xs"
+                align="end"
+                options={revisionsDesc.map((rev, idx) => ({
+                  value: String(rev.timestamp),
+                  label: revisionOptionLabel(rev, idx, totalRevisions),
+                }))}
+              />
               {revisionStats && (
                 <Tooltip content="词级增删统计">
                   <span className="ml-1 tabular-nums text-[11px] text-muted-foreground">

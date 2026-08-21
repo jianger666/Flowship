@@ -16,6 +16,7 @@ import {
   type StreamRenderItem,
   type ToolBlock,
   type ToolVerbGroup,
+  isInTurnToolErrorEvent,
 } from "@/lib/tool-display";
 
 // ---------- 类型 ----------
@@ -146,6 +147,8 @@ export const isLatestErrorEvent = (
 ): boolean => {
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i]!;
+    // 回合内工具失败不算「当轮崩溃」——不能挡真正的 run 错误，也不能自己带重试
+    if (isInTurnToolErrorEvent(ev)) continue;
     if (ev.id === eventId) return ev.kind === "error";
     if (ev.kind === "error" || ev.kind === "user_reply") return false;
   }

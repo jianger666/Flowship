@@ -70,6 +70,7 @@ import {
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
+import { isApiKeyFieldPresent } from "@/lib/agent-provider";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
@@ -452,14 +453,17 @@ const handleAskReply = async (
     apiKey?: string;
     model?: { id: string; params?: Array<{ id: string; value: string }> };
     gitToken?: string;
-  } => ({
-    apiKey: body.bootArgs?.apiKey?.trim() || undefined,
-    model:
-      body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
-        ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
-        : undefined,
-    gitToken: body.bootArgs?.gitToken?.trim() || undefined,
-  });
+  } => {
+    const rawKey = body.bootArgs?.apiKey;
+    return {
+      apiKey: isApiKeyFieldPresent(rawKey) ? rawKey.trim() : undefined,
+      model:
+        body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
+          ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
+          : undefined,
+      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+    };
+  };
 
   const wakeWithAnswer = async (
     // 事件气泡存原文、送 agent 的带 skill 指引（两者只在有 `/` 引用时不同）
@@ -477,10 +481,11 @@ const handleAskReply = async (
     const boot = parseBootArgs();
     // task 唤醒需要 currentAction；chat 只要有 apiKey+model 就能起新会话
     if (isChat) {
-      if (!boot.apiKey || !boot.model) return null;
+      if (!isApiKeyFieldPresent(boot.apiKey) || !boot.model) return null;
     } else {
       const currentAction = task.actions.find((a) => a.id === task.currentActionId);
-      if (!currentAction || !boot.apiKey || !boot.model) return null;
+      if (!currentAction || !isApiKeyFieldPresent(boot.apiKey) || !boot.model)
+        return null;
     }
 
     // 唤醒 = send/start 前落盘——先 strict 写用户回答，成功后再清 pending

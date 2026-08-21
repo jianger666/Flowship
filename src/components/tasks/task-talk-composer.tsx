@@ -13,7 +13,7 @@
  * 任务终态整条隐藏。
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { ConversationComposer } from "@/components/conversation-composer";
@@ -23,8 +23,17 @@ import { ModelSelect } from "@/components/ui/model-select";
 import { useModels } from "@/hooks/use-models";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { findPendingAskEvent } from "@/lib/ask-pending";
-import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
-import { resolveSessionModel } from "@/lib/task-model";
+import { getSettings } from "@/lib/local-store";
+import {
+  getModelCredsForProvider,
+  hasModelCredsForProvider,
+  resolveTaskProvider,
+} from "@/lib/agent-provider";
+import {
+  modelSelectionKey,
+  resolveSessionModel,
+  talkForceModel,
+} from "@/lib/task-model";
 import { submitTaskQuestion } from "@/lib/task-store";
 import { loadDraft } from "@/lib/view-memory";
 import type { ModelSelection, Task } from "@/lib/types";
@@ -62,26 +71,29 @@ export const TaskTalkComposer = ({
     disabled: busy,
   });
 
-  // 显式指定的模型（id 空 = 跟随会话；选了 = 换这个模型处理本条消息）
-  const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
-  // 模型列表：挂载即拉（跟随会话文案要反查 displayName）；打开选择器时再兜底一次
+  // 展示当前推进实际在用的模型（最近 action.agentModel → task.model）。
+  // 说话条里改了只覆盖接下来这一条；新推进换模型或切任务时再跟上。
+  const [pickedModel, setPickedModel] = useState<ModelSelection>(
+    () => resolveSessionModel(task) ?? { id: "" },
+  );
+  const sessionModel = resolveSessionModel(task) ?? { id: "" };
+  const sessionKey = modelSelectionKey(sessionModel);
+  const sessionModelRef = useRef(sessionModel);
+  sessionModelRef.current = sessionModel;
+  useEffect(() => {
+    setPickedModel(sessionModelRef.current);
+  }, [task.id, sessionKey]);
   const { models, fetchModels } = useModels();
   useEffect(() => {
-    if (hasActiveModelCreds() && models.length === 0)
-      void fetchModels(getActiveModelCreds());
-  }, [models.length, fetchModels]);
-
-  // 跟随态 trigger：跟服务端 resume 同口径（最近 action.agentModel → task.model）
-  // 切勿只读 task.model——推进换模型不回写该字段，会一直显示建任务时的旧模型
-  const followPlaceholder = useMemo(() => {
-    const id = resolveSessionModel(task)?.id?.trim();
-    if (!id) return "模型 · 跟随会话";
-    const m = models.find((x) => x.id === id);
-    const raw = m?.displayName;
-    // displayName 是图标 token 时退显 id（与 ModelSelect 同口径）
-    const name = !raw || /:icon-/.test(raw) ? id : raw;
-    return `${name} · 跟随会话`;
-  }, [task, models]);
+    const s = getSettings();
+    const providerId = resolveTaskProvider(task, s);
+    if (hasModelCredsForProvider(s, providerId) && models.length === 0) {
+      void fetchModels({
+        ...getModelCredsForProvider(s, providerId),
+        provider: providerId,
+      });
+    }
+  }, [models.length, fetchModels, task]);
 
   // 切 task 时整条输入态重置再换载对应草稿（详情页在不同任务间导航时组件可能不重挂）。
   // 必须 reset() 全清、不能只清路径附件：贴好的截图 / 已引用的 skill 会跟着串到下一个
@@ -139,10 +151,10 @@ export const TaskTalkComposer = ({
       // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
       const { text, images, attachments, skillRefs } = rich.payload();
       const result = await submitTaskQuestion(
-        task.id,
+        task,
         text,
         images,
-        pickedModel.id ? pickedModel : undefined,
+        talkForceModel(pickedModel, resolveSessionModel(task)),
         attachments,
         skillRefs,
       );
@@ -154,6 +166,8 @@ export const TaskTalkComposer = ({
       }
       onTaskUpdate(result.task);
       rich.reset();
+      // 覆盖只对这一条生效；发完回到当前推进模型（说话条不改 action.agentModel）
+      setPickedModel(resolveSessionModel(result.task) ?? { id: "" });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -187,12 +201,21 @@ export const TaskTalkComposer = ({
               onChange={setPickedModel}
               disabled={busy}
               variant="compact"
-              emptyPlaceholder={followPlaceholder}
-              followOption="跟随会话"
+              emptyPlaceholder="选择模型"
+              providerId={resolveTaskProvider(task, getSettings())}
               onOpenChange={(open) => {
                 if (!open) return;
-                if (hasActiveModelCreds() && models.length === 0)
-                  void fetchModels(getActiveModelCreds());
+                const s = getSettings();
+                const providerId = resolveTaskProvider(task, s);
+                if (
+                  hasModelCredsForProvider(s, providerId) &&
+                  models.length === 0
+                ) {
+                  void fetchModels({
+                    ...getModelCredsForProvider(s, providerId),
+                    provider: providerId,
+                  });
+                }
               }}
             />
           }

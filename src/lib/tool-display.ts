@@ -10,12 +10,21 @@
  * 只做 UI 渲染前合并，不动 events.jsonl。
  */
 
+import { isMcpToolName } from "@/lib/mcp-tool-name";
 import { isAbsolutePathLike } from "@/lib/path-utils";
 import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
 
 /** SSE ephemeral：不进 task.events / 不进持久 rows */
 export const isEphemeralToolOutputDelta = (ev: TaskEvent): boolean =>
   ev.kind === "tool_output_delta" || ev.id.startsWith("ephemeral_tod_");
+
+/**
+ * 回合内某次工具失败（grep / shell 挂了、run 还在继续）。
+ * 旧数据写成了 kind=error + meta.callId，会跟「整轮崩溃」抢同一张红卡和重试按钮。
+ * 渲染层丢掉这些事件，只留 tool_result 配出来的工具行。
+ */
+export const isInTurnToolErrorEvent = (ev: TaskEvent): boolean =>
+  ev.kind === "error" && typeof ev.meta?.callId === "string";
 
 /** 待办条目（updateTodos / todo_write 等） */
 export type TodoItem = {
@@ -171,7 +180,7 @@ export const isVerbGroupMember = (name: string): boolean => {
   const n = name.toLowerCase();
   // 待办专属卡 / 连续合并，绝不进 verb-group
   if (isTodoTool(name)) return false;
-  if (n.startsWith("mcp:")) return false;
+  if (isMcpToolName(n)) return false;
   if (
     n === "shell" ||
     n === "edit" ||
@@ -476,6 +485,8 @@ export const mergeToolDisplayEvents = (
 
   for (const ev of events) {
     if (isEphemeralToolOutputDelta(ev)) continue;
+    // 历史双写：工具失败既落 kind=error 又落 tool_result。红卡是给整轮崩溃的，这里丢掉。
+    if (isInTurnToolErrorEvent(ev)) continue;
 
     if (ev.kind === "tool_call") {
       const cid = getCallId(ev);

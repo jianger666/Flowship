@@ -28,7 +28,7 @@ import { ChoiceButton } from "@/components/ui/choice-button";
 import { Combobox } from "@/components/ui/combobox";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Label } from "@/components/ui/label";
-import { ModelSelect } from "@/components/ui/model-select";
+import { ProviderModelPicker } from "@/components/ui/provider-model-picker";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { Input } from "@/components/ui/input";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
@@ -36,8 +36,11 @@ import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
-import { getSettings, initSettings, recordModelUsage } from "@/lib/local-store";
-import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
+import { getSettings, initSettings } from "@/lib/local-store";
+import {
+  getModelCredsForProvider,
+  hasModelCredsForProvider,
+} from "@/lib/agent-provider";
 import { reqIdPatchValue } from "@/lib/req-id";
 import {
   resolveLaunchIsolateWorktree,
@@ -48,6 +51,8 @@ import { buildDefaultDailyTaskTitle } from "@/lib/task-display";
 import { createTask } from "@/lib/task-store";
 
 import {
+  CURSOR_PROVIDER_ID,
+  defaultModelForProvider,
   type ModelSelection,
   type RepoConfig,
   type Task,
@@ -111,7 +116,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [runInRepo, setRunInRepo] = useState(false);
   // null = 设置尚未加载；测试角色不渲染 worktree UI，提交时也强制不隔离。
   const [userRole, setUserRole] = useState<UserRole | undefined | null>(null);
-  // 模型（默认 settings.defaultModel）
+  // 本单提供方（默认设置页默认项，可在表单里改、不改全局）
+  const [pickedProvider, setPickedProvider] = useState(CURSOR_PROVIDER_ID);
+  // 模型（默认：当前 pickedProvider 的 defaultModelForProvider）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   const [defaultModelId, setDefaultModelId] = useState("");
   const { models: availableModels, fetchModels } = useModels();
@@ -128,11 +135,14 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       await initSettings();
       if (!alive) return;
       const s = getSettings();
+      const providerId = s.provider ?? CURSOR_PROVIDER_ID;
+      const defaultModel = defaultModelForProvider(s, providerId);
+      setPickedProvider(providerId);
       setUserRole(s.userRole);
       setRepos(s.repos);
       setDisabledMcp(s.disabledMcpServers ?? []);
-      setDefaultModelId(s.defaultModel?.id ?? "");
-      setPickedModel(s.defaultModel?.id?.trim() ? s.defaultModel : { id: "" });
+      setDefaultModelId(defaultModel?.id ?? "");
+      setPickedModel(defaultModel?.id?.trim() ? defaultModel : { id: "" });
       // v1.1.x：隔离工作区默认值走设置页偏好（只读型用法可默认直跑原仓）、表单可临时改
       setRunInRepo(s.isolateWorktreeDefault === false);
       const last = readLastLaunch();
@@ -142,7 +152,12 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       // 只配了一个仓库时天然零操作：直接选它
       if (validPaths.length > 0) setRepoPaths(validPaths);
       else if (s.repos.length === 1) setRepoPaths([s.repos[0].path]);
-      if (hasActiveModelCreds()) void fetchModels(getActiveModelCreds());
+      if (hasModelCredsForProvider(s, providerId)) {
+        void fetchModels({
+          ...getModelCredsForProvider(s, providerId),
+          provider: providerId,
+        });
+      }
     })();
     return () => {
       alive = false;
@@ -195,7 +210,6 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
     try {
       const settings = getSettings();
       const model = pickedModel.id?.trim() ? pickedModel : undefined;
-      if (model) recordModelUsage(model);
 
       // 从 settings 快照选中仓的分支配置（settings 在 localStorage、server 读不到、建 task 时固化）
       const repoBaseBranches: Record<string, string> = {};
@@ -257,6 +271,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
           runInRepo,
         }),
         model,
+        provider: pickedProvider,
       });
       // 记住这次的仓库组合、下次预填零操作（旧 LastLaunch.role 不再写入）
       try {
@@ -455,16 +470,29 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       {/* 模型 */}
       <div className="grid gap-1.5">
         <Label>模型</Label>
-        <ModelSelect
+        <ProviderModelPicker
+          variant="full"
+          providerId={pickedProvider}
+          onProviderChange={(nextId) => {
+            const s = getSettings();
+            setPickedProvider(nextId);
+            const nextModel = defaultModelForProvider(s, nextId);
+            setDefaultModelId(nextModel?.id ?? "");
+            setPickedModel(nextModel?.id?.trim() ? nextModel : { id: "" });
+            if (hasModelCredsForProvider(s, nextId)) {
+              void fetchModels({
+                ...getModelCredsForProvider(s, nextId),
+                provider: nextId,
+              });
+            }
+          }}
           models={availableModels}
           selection={pickedModel}
-          onChange={setPickedModel}
-          variant="full"
-          quickPicks
+          onModelChange={setPickedModel}
           emptyPlaceholder={
             defaultModelId
               ? `默认: ${defaultModelId}（API Key 没填、改不了）`
-              : "未配模型、请先去设置页选"
+              : "选择模型"
           }
         />
         {pickedModel.id && defaultModelId && pickedModel.id !== defaultModelId && (

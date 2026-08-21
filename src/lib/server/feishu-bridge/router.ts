@@ -21,7 +21,11 @@ import { readSettingsFile } from "@/lib/server/settings-fs";
 import { listSkillsWithSource } from "@/lib/server/app-skills";
 import { matchLongestSkillName } from "@/lib/skill-token";
 import { isValidModel } from "@/lib/server/route-helpers";
-import type { TaskSummary } from "@/lib/types";
+import { defaultModelForProvider, isCursorProvider, type TaskSummary } from "@/lib/types";
+import {
+  findCustomProvider,
+  migrateProviderSettings,
+} from "@/lib/agent-provider";
 
 import { injectPendingAskText } from "./ask-inject";
 import {
@@ -738,17 +742,31 @@ const titleFromMessage = (text: string): string => {
 export const loadBridgeBootContext = async (): Promise<{
   apiKey: string;
   model: ModelSelection;
+  provider: string;
   repoPaths: string[];
   /** 设置页「默认禁用 MCP」黑名单（与 app 内新建对话同源） */
   disabledMcpServers: string[];
 } | null> => {
   const result = await deps.readSettingsFile();
   if (result.status !== "ok") return null;
-  const s = result.settings;
-  const apiKey = typeof s.apiKey === "string" ? s.apiKey.trim() : "";
-  const model = s.defaultModel as ModelSelection | undefined;
-  if (!apiKey || !isValidModel(model)) return null;
-  const repos = Array.isArray(s.repos) ? s.repos : [];
+  const raw = result.settings as Record<string, unknown>;
+  const migrated = migrateProviderSettings(raw);
+  const settings = {
+    apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
+    defaultModel: (raw.defaultModel as ModelSelection | undefined) ?? { id: "" },
+    customProviders: migrated.customProviders,
+  };
+  const provider = migrated.provider;
+  const model = defaultModelForProvider(settings, provider);
+  const apiKey = isCursorProvider(provider)
+    ? settings.apiKey
+    : (findCustomProvider(settings, provider)?.apiKey ?? "");
+  const hasCreds = isCursorProvider(provider)
+    ? !!apiKey
+    : !!findCustomProvider(settings, provider)?.baseUrl.trim();
+  if (!hasCreds) return null;
+  if (!isValidModel(model)) return null;
+  const repos = Array.isArray(raw.repos) ? raw.repos : [];
   const repoPaths: string[] = [];
   for (const r of repos) {
     if (r && typeof r === "object" && typeof (r as { path?: string }).path === "string") {
@@ -756,10 +774,10 @@ export const loadBridgeBootContext = async (): Promise<{
       if (p) repoPaths.push(p);
     }
   }
-  const disabledMcpServers = Array.isArray(s.disabledMcpServers)
-    ? s.disabledMcpServers.filter((x): x is string => typeof x === "string")
+  const disabledMcpServers = Array.isArray(raw.disabledMcpServers)
+    ? raw.disabledMcpServers.filter((x): x is string => typeof x === "string")
     : [];
-  return { apiKey, model, repoPaths, disabledMcpServers };
+  return { apiKey, model, provider, repoPaths, disabledMcpServers };
 };
 
 /**
@@ -781,6 +799,7 @@ export const createChatTaskForBridge = async (
     mode: "chat",
     repoPaths: [],
     model: boot.model,
+    provider: boot.provider,
     disabledMcpServers:
       boot.disabledMcpServers.length > 0 ? boot.disabledMcpServers : undefined,
   });

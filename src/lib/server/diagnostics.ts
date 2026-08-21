@@ -36,7 +36,18 @@ const readSanitizedConfig = async (): Promise<string> => {
       `gitToken: ${maskSecret(cfg.gitToken)}`,
       `gitHost: （不入 settings、按任务仓库 remote 现推）`,
       `jumpIde: ${String(cfg.jumpIde ?? "cursor")}`,
+      `provider: ${String(cfg.provider ?? "cursor")}`,
       `defaultModel: ${JSON.stringify(cfg.defaultModel ?? null)}`,
+      `customProviders: ${
+        Array.isArray(cfg.customProviders)
+          ? (cfg.customProviders as Array<{ id?: string; name?: string; defaultModel?: unknown }>)
+              .map(
+                (p) =>
+                  `${p.name || p.id || "?"} defaultModel=${JSON.stringify(p.defaultModel ?? null)}`,
+              )
+              .join("；") || "（空）"
+          : "（空）"
+      }`,
       `repos: ${
         Array.isArray(cfg.repos)
           ? (cfg.repos as Array<{ path?: string }>).map((r) => r.path).join("、") || "（空）"

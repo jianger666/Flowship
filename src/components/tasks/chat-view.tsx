@@ -22,7 +22,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pencil } from "lucide-react";
 import { toast } from "sonner";
 
-import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
+import { ChatProviderModelPicker } from "@/components/tasks/chat-provider-model-picker";
 import { BranchSwitcher } from "@/components/tasks/branch-switcher";
 import {
   ChatWorkdirPicker,
@@ -714,7 +714,7 @@ export const ChatView = ({
           queueBanner={queueBanner}
           allowQueueWhileRunning
           composerLeading={
-            <ChatModelPicker task={task} onTaskUpdate={onTaskUpdate} />
+            <ChatProviderModelPicker task={task} onTaskUpdate={onTaskUpdate} />
           }
           composerTop={
             <>

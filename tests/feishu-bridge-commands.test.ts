@@ -225,6 +225,7 @@ describe("ensureBridgeCommandsRegistered", () => {
       loadBridgeBootContext: async () => ({
         apiKey: "sk-test",
         model: { id: "gpt-5" } as never,
+        provider: "cursor",
         repoPaths: ["/tmp/repo"],
         disabledMcpServers: [],
       }),

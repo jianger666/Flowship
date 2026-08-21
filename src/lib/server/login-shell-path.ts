@@ -18,14 +18,16 @@
  * - 仅 darwin 生效：Windows GUI 进程本来就继承完整用户环境变量（注册表 User env）、
  *   没有这个问题；linux 非交付形态不处理。
  * - 失败兜底：探测超时（5s）/ shell 报错 → 保持原 PATH、只 warn 不阻断启动。
- * - 顺序：instrumentation 先 injectFeishuCliPath（tools/bin 前置），再异步跑本函数合并
- *   login PATH；合并时用 pinnedPrefixes 把 tools/bin 重新置顶，避免被 login 段挤到后面。
+ * - 顺序：instrumentation 先 injectFeishuCliPath / injectSdkRgPath（tools/bin 与 SDK rg
+ *   前置），再异步跑本函数合并 login PATH；合并时用 pinnedPrefixes 把这两段重新置顶，
+ *   避免被 login 段挤到后面。
  */
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { getToolsBinDir } from "./feishu-cli";
+import { resolveSdkRgBinDir } from "./sdk-platform-bin";
 
 const execFileAsync = promisify(execFile);
 
@@ -86,12 +88,14 @@ export const mergeLoginShellPath = async (): Promise<void> => {
       console.warn("[login-shell-path] 登录 shell 未返回 PATH、保持原值");
       return;
     }
-    // tools/bin 必须置顶：否则 login PATH 里同名 lark-cli 会抢先于内置 CLI
+    // tools/bin 必须置顶：否则 login PATH 里同名 lark-cli 会抢先于内置 CLI。
+    // SDK rg 次之：有系统 rg 也优先用随包那份，避免版本漂。
     const toolsBin = getToolsBinDir();
+    const sdkRgBin = resolveSdkRgBinDir();
     process.env.PATH = mergePathStrings(
       loginPath,
       process.env.PATH ?? "",
-      [toolsBin],
+      sdkRgBin ? [toolsBin, sdkRgBin] : [toolsBin],
     );
     console.log(
       `[login-shell-path] PATH 已合并登录 shell（${shell}）、共 ${process.env.PATH.split(":").length} 段`,

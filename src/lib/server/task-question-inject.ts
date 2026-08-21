@@ -238,7 +238,9 @@ const runTaskQuestionInject = async (
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
-  const apiKey = body.bootArgs?.apiKey?.trim() || undefined;
+  const rawKey = body.bootArgs?.apiKey;
+  const hasApiKey = typeof rawKey === "string";
+  const apiKey = hasApiKey ? rawKey : undefined;
   const model =
     body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
       ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
@@ -253,7 +255,7 @@ const runTaskQuestionInject = async (
   // 校验提到 snapshot 前：能送达（内存有会话且未 forceModel）或有唤醒凭据；不过直接 400。
   // questionOnly 恒不送达（见选项注释）→ 必须有起一次性 agent 的凭据，否则这里就 400。
   const canDeliver = !questionOnly && !forceModel && agentSessions.has(task.id);
-  const hasWakeCreds = !!apiKey && !!fallbackModel;
+  const hasWakeCreds = hasApiKey && !!fallbackModel;
   if (!canDeliver && !hasWakeCreds) {
     return errorResponse("缺 bootArgs（apiKey / model）、agent 起不来", 400);
   }
@@ -337,7 +339,7 @@ const runTaskQuestionInject = async (
       currentAction.status === "awaiting_ack");
   const useOneShot = !sent && !canResume;
   // 前置校验已拦「无会话且无凭据」；这里兜底会话在校验后死去的 race
-  if (!sent && (!apiKey || !fallbackModel)) {
+  if (!sent && (!hasApiKey || !fallbackModel)) {
     return errorResponse("缺 bootArgs（apiKey / model）、agent 起不来", 400);
   }
 

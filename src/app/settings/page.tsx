@@ -3,14 +3,15 @@
 /**
  * 设置页（壳子）
  *
- * v1.0.x 整合（用户拍板「太零散、一个 tab 下只有一两个设置项」）：8 张卡收成 4 组——
- *   连接（Cursor API Key + GitLab Token + 飞书集成 + 环境配置）/ 团队（wk 流程：WK 产出目录 + Delivery Hub）/
- *   偏好（跳转 IDE + 分支模板 + 提交快捷键 + 续用 Agent + 默认模型）/ 仓库 / 存储。
- * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航五项。
+ * 组卡按用户心智（2026-08-18：模型提供方从「连接」拆成独立一栏）：
+ *   模型（Cursor SDK / 自定义两块目录，默认提供方在目录下面）/ 连接（GitLab Token + 飞书集成 + 环境配置）/
+ *   团队（wk 流程：WK 产出目录 + Delivery Hub）/
+ *   偏好（跳转 IDE + 分支模板 + 提交快捷键 + 续用 Agent）/ 仓库 / 存储。
+ * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航六项。
  *
  * - 能力类配置（MCP / Skill / Action）在 /actions 能力页 tab 管理
- * - 旧深链兼容：?focus=api-key|feishu|git|env → 连接、profile|preference|model → 偏好、
- *   mcp / skills → 重定向 /actions?tab=
+ * - 旧深链兼容：?focus=api-key → 模型、feishu|git|env → 连接、profile|preference → 偏好、
+ *   mcp / skills → 重定向 /actions?tab=；?focus=model 本身就是模型栏、不再映射
  *
  * 拆分约定：状态管理 → hooks；配置节 → components/settings/*-card.tsx；本文件只组合。
  */
@@ -35,17 +36,19 @@ import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
 import { useApiKeyInfo } from "@/hooks/use-api-key-info";
 import {
+  CURSOR_PROVIDER_ID,
   DEFAULT_MEEGLE_PROJECT,
+  defaultModelForProvider,
+  isCursorProvider,
   type AgentProviderId,
   type CustomProviderConfig,
-  type CustomProviderFormat,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-import { ApiKeySection } from "@/components/settings/api-key-card";
+import { ApiKeySection, DefaultModelSection } from "@/components/settings/api-key-card";
 import {
-  CustomProviderSection,
-  ProviderSection,
+  CustomProviderList,
+  DefaultProviderSection,
 } from "@/components/settings/custom-provider-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { StorageCard } from "@/components/settings/storage-card";
@@ -58,8 +61,9 @@ import { FeishuCliSection } from "@/components/settings/feishu-cli-card";
 import { WkHarnessSection } from "@/components/settings/wk-harness-card";
 import { emptyCompanyEnv } from "@/lib/company-env";
 
-// 左侧锚点导航（五组）：id 同 ?focus= 新取值
+// 左侧锚点导航（六组）：id 同 ?focus= 新取值
 const NAV_ITEMS: Array<{ focus: string; label: string }> = [
+  { focus: "model", label: "模型" },
   { focus: "connect", label: "连接" },
   { focus: "team", label: "团队" },
   { focus: "prefs", label: "偏好" },
@@ -69,14 +73,14 @@ const NAV_ITEMS: Array<{ focus: string; label: string }> = [
 
 // 旧 focus 值 → 新分组（全站 settingsUrl("api-key") 等旧跳转不断链）
 const LEGACY_FOCUS: Record<string, string> = {
-  "api-key": "connect",
+  // 凭据曾挂在连接卡；现在模型栏自己就是 id=model、不用再映射
+  "api-key": "model",
   feishu: "connect",
   git: "connect",
   // 曾短暂独立「环境」分组 → 并回连接
   env: "connect",
   profile: "prefs",
   preference: "prefs",
-  model: "prefs",
 };
 
 // 能力类 focus（已迁去 /actions 能力页）→ 对应 tab 的重定向表
@@ -89,82 +93,41 @@ const SettingsPage = () => {
   const router = useRouter();
   const { settings, loaded, update, saveFieldValue } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
-  // API Key 归属信息（Cursor.me）——验证时顺便拉、展示在连接卡
-  const { info: apiKeyInfo, loading: infoLoading, fetchInfo } = useApiKeyInfo();
+  // API Key 归属信息（Cursor.me）——拉模型时顺便拉、展示在 Key 下面
+  const { info: apiKeyInfo, fetchInfo } = useApiKeyInfo();
 
-  // 当前 agent 后端（默认 cursor）+ 自定义 provider 配置（useMemo 保持引用稳定、供 useCallback deps）
-  const provider: AgentProviderId = settings.provider ?? "cursor";
-  const customProvider: CustomProviderConfig = useMemo(
-    () =>
-      settings.customProvider ?? { baseUrl: "", apiKey: "", format: "openai" },
-    [settings.customProvider],
+  // 新建对话用的默认提供方；Cursor 凭据始终可见，自定义条目在下面目录里
+  const provider: AgentProviderId = settings.provider ?? CURSOR_PROVIDER_ID;
+  const customProviders: CustomProviderConfig[] = useMemo(
+    () => settings.customProviders ?? [],
+    [settings.customProviders],
   );
 
-  // 拉模型列表（cursor 再顺带拉账号信息）。isCustom 决定凭据 / 接口走哪条
-  const pullModels = useCallback(
-    (
-      creds: {
-        apiKey: string;
-        baseUrl?: string;
-        format?: CustomProviderFormat;
-      },
-      isCustom: boolean,
-    ) => {
-      if (isCustom ? !creds.baseUrl?.trim() : !creds.apiKey?.trim()) return;
-      void fetchModels({
-        apiKey: creds.apiKey ?? "",
-        baseUrl: creds.baseUrl,
-        format: creds.format,
-      });
-      if (!isCustom) void fetchInfo(creds.apiKey);
+  // 拉 Cursor 模型列表（进页 / 改 Key）。自定义条目各自在行内拉。
+  const pullCursorModels = useCallback(
+    (apiKey: string, options?: { manual?: boolean }) => {
+      if (!apiKey.trim()) {
+        void fetchModels({ provider: CURSOR_PROVIDER_ID, apiKey: "" }, options);
+        return;
+      }
+      void fetchModels({ provider: CURSOR_PROVIDER_ID, apiKey }, options);
+      void fetchInfo(apiKey, options);
     },
     [fetchModels, fetchInfo],
   );
 
-  // 用「当前 provider + 当前凭据」拉一次（Prefs 卡「获取列表」/ 初始自动验证用）
-  const pullModelsForCurrent = useCallback(() => {
-    pullModels(
-      provider === "custom"
-        ? {
-            apiKey: customProvider.apiKey,
-            baseUrl: customProvider.baseUrl,
-            format: customProvider.format,
-          }
-        : { apiKey: settings.apiKey },
-      provider === "custom",
-    );
-  }, [provider, customProvider, settings.apiKey, pullModels]);
-
-  // apiKey 失焦落盘：顺带自动验证（省得用户手动点「验证」才出模型 / 账号信息）
   const handleApiKeyCommit = (value: string) => {
     saveFieldValue("apiKey", value);
-    pullModels({ apiKey: value }, false);
+    pullCursorModels(value);
   };
 
-  // 自定义 provider 失焦落盘：顺带自动验证
-  const handleCustomProviderCommit = (value: CustomProviderConfig) => {
-    saveFieldValue("customProvider", value);
-    pullModels(
-      { apiKey: value.apiKey, baseUrl: value.baseUrl, format: value.format },
-      true,
-    );
+  const handleCustomProvidersCommit = (next: CustomProviderConfig[]) => {
+    saveFieldValue("customProviders", next);
   };
 
-  // 切换 provider：落盘 + 用新侧凭据拉一次
   const handleProviderChange = (next: AgentProviderId) => {
     saveFieldValue("provider", next);
-    if (next === "custom") {
-      pullModels(
-        {
-          apiKey: customProvider.apiKey,
-          baseUrl: customProvider.baseUrl,
-          format: customProvider.format,
-        },
-        true,
-      );
-    } else {
-      pullModels({ apiKey: settings.apiKey }, false);
-    }
+    if (isCursorProvider(next)) pullCursorModels(settings.apiKey);
   };
 
   // 仓库提交：只落盘 repos（host 不进 settings、推进 / ship 时按任务仓库 remote 现推）
@@ -178,14 +141,14 @@ const SettingsPage = () => {
     setAppVersion(window.__appVersion ?? null);
   }, []);
 
-  // 进设置页（配置加载完成）若当前 provider 已配好凭据就自动验证一次——读 SWR 缓存秒出模型、
-  // 不用用户手动点「验证」。用 ref 保证只跑一次。
+  // 进设置页若当前 provider 已配好凭据就自动拉一次——读 SWR 缓存秒出模型。
+  // 用 ref 保证只跑一次。
   const didInitValidate = useRef(false);
   useEffect(() => {
     if (!loaded || didInitValidate.current) return;
     didInitValidate.current = true;
-    pullModelsForCurrent();
-  }, [loaded, pullModelsForCurrent]);
+    pullCursorModels(settings.apiKey);
+  }, [loaded, pullCursorModels, settings.apiKey]);
 
   // 当前导航高亮项（点导航 / 滚动跟随都更新）
   const [activeFocus, setActiveFocus] = useState<string>(NAV_ITEMS[0].focus);
@@ -320,7 +283,64 @@ const SettingsPage = () => {
           </div>
         </div>
 
-        {/* ---- 连接：外部服务凭据（Cursor / GitLab / 飞书 / 公司环境）---- */}
+        {/* ---- 模型：提供方 + 凭据 + 默认模型 ---- */}
+        {wrapCard(
+          "model",
+          <Card>
+            <CardHeader>
+              <CardTitle>模型</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="space-y-3">
+                <div className="text-sm">Cursor SDK</div>
+                <div className="space-y-4 rounded-md border border-border/60 p-4">
+                  <ApiKeySection
+                    apiKey={settings.apiKey}
+                    info={apiKeyInfo}
+                    onChange={(v) => update("apiKey", v)}
+                    onCommit={handleApiKeyCommit}
+                    className="py-0 first:pt-0 last:pb-0"
+                  />
+                  <div className="space-y-2 border-t border-border/60 pt-4">
+                    <DefaultModelSection
+                      models={models}
+                      modelSelection={defaultModelForProvider(
+                        settings,
+                        CURSOR_PROVIDER_ID,
+                      )}
+                      onModelChange={(next) => {
+                        saveFieldValue("defaultModel", next);
+                      }}
+                      canRefreshModels={!!settings.apiKey?.trim()}
+                      onModelsRefresh={() =>
+                        pullCursorModels(settings.apiKey, { manual: true })
+                      }
+                      modelsRefreshing={modelsLoading}
+                      modelsError={modelsError}
+                      providerId={CURSOR_PROVIDER_ID}
+                      className="py-0 first:pt-0 last:pb-0"
+                    />
+                  </div>
+                </div>
+              </div>
+              <CustomProviderList
+                items={customProviders}
+                onChange={(next) => update("customProviders", next)}
+                onCommit={handleCustomProvidersCommit}
+                defaultProvider={provider}
+                onDefaultProviderChange={handleProviderChange}
+              />
+              <DefaultProviderSection
+                value={provider}
+                settings={settings}
+                onChange={handleProviderChange}
+                className="py-0 first:pt-0 last:pb-0"
+              />
+            </CardContent>
+          </Card>,
+        )}
+
+        {/* ---- 连接：GitLab / 飞书 / 公司环境（模型凭据已拆走）---- */}
         {wrapCard(
           "connect",
           <Card>
@@ -328,36 +348,6 @@ const SettingsPage = () => {
               <CardTitle>连接</CardTitle>
             </CardHeader>
             <CardContent className="space-y-5">
-              <ProviderSection value={provider} onChange={handleProviderChange} />
-              <Separator />
-              {provider === "custom" ? (
-                <CustomProviderSection
-                  value={customProvider}
-                  onChange={(v) => update("customProvider", v)}
-                  onCommit={handleCustomProviderCommit}
-                  onValidate={(v) =>
-                    pullModels(
-                      {
-                        apiKey: v.apiKey,
-                        baseUrl: v.baseUrl,
-                        format: v.format,
-                      },
-                      true,
-                    )
-                  }
-                  validating={modelsLoading}
-                />
-              ) : (
-                <ApiKeySection
-                  apiKey={settings.apiKey}
-                  info={apiKeyInfo}
-                  onChange={(v) => update("apiKey", v)}
-                  onCommit={handleApiKeyCommit}
-                  onValidate={(k) => pullModels({ apiKey: k }, false)}
-                  validating={modelsLoading || infoLoading}
-                />
-              )}
-              <Separator />
               <GitLabSection
                 gitToken={settings.gitToken ?? ""}
                 onTokenChange={(v) => update("gitToken", v)}
@@ -432,18 +422,7 @@ const SettingsPage = () => {
                 onIsolateWorktreeDefaultChange={(v) =>
                   saveFieldValue("isolateWorktreeDefault", v)
                 }
-                models={models}
-                modelsError={modelsError}
-                modelSelection={settings.defaultModel}
-                onModelChange={(next) => saveFieldValue("defaultModel", next)}
-                modelsRefreshing={modelsLoading}
-                canRefreshModels={
-                  provider === "custom"
-                    ? !!customProvider.baseUrl?.trim()
-                    : !!settings.apiKey?.trim()
-                }
-                onModelsRefresh={pullModelsForCurrent}
-              />
+                />
             </CardContent>
           </Card>,
         )}

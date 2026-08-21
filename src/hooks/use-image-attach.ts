@@ -124,6 +124,13 @@ export const useImageAttach = (
 
   // 待发送的图片附件列表（粘贴 / 拖拽 / 选文件三种途径添进来）
   const [images, setImages] = useState<PendingImage[]>([]);
+  // images 的同步镜像：addFiles 异步读文件、合并前读 ref 拿最新列表（闭包里的 images 可能陈旧）；
+  // 也让 toast 副作用留在回调里、不进 setState updater（updater 必须纯、StrictMode 双调会弹两次，
+  // 同 use-path-attach 的 pathsRef 套路）
+  const imagesRef = useRef<PendingImage[]>([]);
+  imagesRef.current = images;
+  // 合并串行闸：粘贴 / 拖拽 / 选文件几乎同时完成时，防止「都基于同一份 ref 快照合并」互相覆盖
+  const mergeLockRef = useRef<Promise<void>>(Promise.resolve());
   // 拖拽状态：drag over 时整片输入区高亮、给用户视觉反馈
   const [isDragging, setIsDragging] = useState(false);
   // 隐藏 <input type="file">、点击附图按钮触发它
@@ -131,14 +138,16 @@ export const useImageAttach = (
 
   // 把 File[] 转成 PendingImage[] 加进 images
   // 校验：mimeType 白名单 / 单图 size / 总张数上限（任何一项失败 → toast + 跳过该图）
-  // 名额在 setImages updater 内按最新 prev 截断——并发粘贴不能靠闭包 images.length
+  // 去重（#bugfix）：同一次粘贴在剪贴板里常有同图多条 item（Electron / 截图工具常同时带
+  // image/png + image/x-png + image/bitmap…）、或同一张图被重复粘贴——这些都必须只算一张，
+  // 否则一张图占掉 2~N 个名额、列表被「幽灵重复图」塞满，之后明明只贴了一张却弹「最多附 6 张图」。
   const addFiles = async (files: File[]) => {
     if (options?.disabled) return;
     if (files.length === 0) return;
-    // 软上限：最多读 maxImages 张，真正截断仍在 updater 里按 prev 算
-    const toProcess = files.slice(0, maxImages);
     const additions: PendingImage[] = [];
-    for (const file of toProcess) {
+    // 本次输入内的去重键（base64 内容）：同一张图多条 item 只取第一条
+    const batchSeen = new Set<string>();
+    for (const file of files) {
       if (!DEFAULT_ALLOWED_MIMES.has(file.type)) {
         toast.error(
           `${file.name || "(未命名)"} 不是支持的图片格式（${file.type || "未知"}）`,
@@ -153,11 +162,14 @@ export const useImageAttach = (
       }
       try {
         const dataUrl = await readFileAsDataUrl(file);
+        const data = stripDataUrlPrefix(dataUrl);
+        if (batchSeen.has(data)) continue;
+        batchSeen.add(data);
         additions.push({
           id: newPendingId(),
           file,
           dataUrl,
-          data: stripDataUrlPrefix(dataUrl),
+          data,
           mimeType: file.type,
         });
       } catch (err) {
@@ -168,35 +180,48 @@ export const useImageAttach = (
     }
     if (additions.length === 0) return;
 
-    let accepted = 0;
-    let wasFull = false;
-    setImages((prev) => {
-      const room = maxImages - prev.length;
+    // 合并串行化：同一时刻只有一个合并读/写 imagesRef、再 setImages 绝对列表——
+    // 既保并发粘贴不互相覆盖，又不把副作用写进 setState updater
+    mergeLockRef.current = mergeLockRef.current.then(() => {
+      const current = imagesRef.current;
+      // 对已附图按内容去重：同一张图已经挂着就不重复占名额
+      const existing = new Set(current.map((p) => p.data));
+      const fresh = additions.filter((a) => !existing.has(a.data));
+      const dup = additions.length - fresh.length;
+      const room = maxImages - current.length;
       if (room <= 0) {
-        wasFull = true;
-        return prev;
+        toast.error(`最多附 ${maxImages} 张图、先发送 / 移除几张再加`);
+        return;
       }
-      const kept = additions.slice(0, room);
-      accepted = kept.length;
-      return prev.concat(kept);
+      const kept = fresh.slice(0, room);
+      if (kept.length === 0) {
+        toast.info(`已忽略 ${dup} 张重复图片`);
+        return;
+      }
+      const next = current.concat(kept);
+      imagesRef.current = next;
+      setImages(next);
+      if (fresh.length > room) {
+        toast.warning(
+          `图太多、超出上限 ${maxImages} 张、已截断到 ${kept.length} 张`,
+        );
+      } else if (dup > 0) {
+        toast.info(`已忽略 ${dup} 张重复图片`);
+      }
     });
-    if (wasFull) {
-      toast.error(`最多附 ${maxImages} 张图、先发送 / 移除几张再加`);
-    } else if (accepted < additions.length || files.length > accepted) {
-      toast.warning(
-        `图太多、超出上限 ${maxImages} 张、已截断到 ${accepted} 张`,
-      );
-    }
   };
 
   const removeImage = (id: string) => {
-    setImages((prev) => prev.filter((p) => p.id !== id));
+    const next = imagesRef.current.filter((p) => p.id !== id);
+    imagesRef.current = next;
+    setImages(next);
   };
 
   // useCallback（稳定引用）：调用方要把它放进 useEffect 依赖（切 task 时清附件），
   // 每次 render 换个新函数会让那个 effect 每帧都跑一遍、把用户正在打的内容清掉
   //（use-path-attach 的回调同理，全是稳定引用）
   const reset = useCallback(() => {
+    imagesRef.current = [];
     setImages([]);
     setIsDragging(false);
   }, []);

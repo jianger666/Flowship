@@ -86,6 +86,7 @@ alwaysApply: true
 三种形态、各有归属，⛔ 不许再手写第四种：
 
 - **徽标** → `<Badge>`（`rounded-4xl`）。两档尺寸：`size="default"`（h-5 / 12px，独立状态标）、`size="xs"`（h-4.5 / 11px，挤在行内的元信息标）。语义色走 `variant="success" | "warning" | "destructive"`（三者形状对称、都是 `/10` 底衬 + 同色字）。⛔ 别在调用处用 `className="px-1 py-0 text-[11px]"` 或自己拼 tone class 造第三档。
+- **列表折叠行的身份标**（如自定义提供方「默认」）贴标题，不要跟右侧 host / 摘要拼成一串（2026-08-19 用户纠偏）。
 - **可点选 chip** → `<ChoiceButton shape="chip">`（`rounded-full`）。
 - **行内 tag**（action 归属标、来源标、待办 / 子代理标、skill / file token、muted 小计数标）→ 统一 `rounded-sm` + 11px。事件流的 action 归属标已抽成 `ActionTag`（`event-stream/utils.tsx`）、三处共用，别再各写一份。
 
@@ -94,7 +95,8 @@ alwaysApply: true
 - **每个配置项一律用 `<SettingRow>`**（`src/components/ui/setting-row.tsx`）：左「名称 + 一句说明」右控件；宽控件（Input / ModelSelect）用 `stacked`（名称行 + 全宽控件、`labelExtra` 放名称行右侧操作按钮）。外层容器 `divide-y` 出行间分隔。
 - ⛔ 不要手拼「小节头 + Label + 控件 + 说明」多层文字——三层文字层级挤在一起就是「乱」的根源（踩过两轮）。
 - **禁 placeholder-only 输入**：并排多个同类输入（如三个分支框）必须带迷你 label（`text-[11px] text-muted-foreground`）——有值后 placeholder 消失、用户就不知道哪个框是啥了（ui-ux-pro-max 规范同款）。
-- 设置分组按「用户心智」不按实现：连接（外部服务凭据）/ 偏好（个人习惯）/ 仓库 / 存储；能力类（Action / Skill / MCP）在 /actions 能力页。
+- 设置分组按「用户心智」不按实现：模型（提供方 + 凭据 + 默认模型）/ 连接（GitLab / 飞书 / 环境）/ 团队 / 偏好 / 仓库 / 存储；能力类（Action / Skill / MCP）在 /actions 能力页。
+- **API Key 归属信息**用灰底信息块（`rounded-md border bg-muted/40` + 用户图标、姓名/邮箱一行、密钥名/日期一行），不要压成一行 `muted` 纯文本（2026-08-19 用户纠偏：块样式被自定义提供方 WIP 拆掉后要求加回）。
 
 ## 操作反馈（已有约定、汇总）
 
@@ -102,6 +104,11 @@ alwaysApply: true
 - 不可逆操作（删除 / 放弃）→ `useDialog().confirm` + `destructive: true`
 - 异步动作期间按钮 disabled + spinner（参考 chat-view 「停止」按钮）、防双击连点
 - 结果反馈 → `toast.success` / `toast.error`、错误信息带上下文（`操作失败：${message}`）
+- **当前页已经有选择器时，缺项只说「请选 X」**（2026-08-19）：对话 / 推进弹窗 footer 就有模型下拉，没选就 toast「请选择模型」，⛔ 不要写成「缺少默认模型 / 去设置」。真缺凭据、列表拉不下来才跳设置页。同一校验 toast 带稳定 `id`，连点发送不要叠三张。
+- **设置页删除 / 卸载分两套**（2026-08-19，按「删的是哪一层」选，不要混）：
+  - **行内实例**（仓库一行、环境配置一台机器、MCP / Skill 列表一行）：行尾 ghost 图标或 12px 文字「删除」，不做成主按钮。
+  - **当前正在编辑的整块**（一条自定义提供方的展开表单、飞书 CLI 卸载、存储批量删）：右下 `variant="destructive"` + 图标 +「删除 / 卸载」。
+  - ⛔ 不要把整块删除做成折叠头上的垃圾桶（和环境配置分类头撞车）。
 
 ## 键盘可达性
 
@@ -117,12 +124,16 @@ alwaysApply: true
 - 自定义滚动条是 classic 模式（占 8px 布局宽度）→ 滚动条出现/消失会挤压内容宽度、整页抖动（踩过：能力页切 tab 抖）。
 - **治理机制在 `globals.css`**：`scrollbar-gutter: stable` 挂在 `.overflow-y-auto` / `.overflow-auto` 工具类上——新增滚动容器只要用这两个 Tailwind 类就自动带治理、不需要手动加。
 - ⛔ 不要在单个组件里手加 `[scrollbar-gutter:stable]` 打补丁；⛔ 不要把规则改成 `*` 全局（overflow-hidden 容器会白吃 8px 槽位）。
+- **下拉列表例外**（2026-08-19）：退出写在 `globals.css` 里盖过 `.overflow-y-auto`（`[data-slot=popover-content] .overflow-y-auto` 等）。组件上写 `[scrollbar-gutter:auto]` **无效**——选择器权重一样、globals 更晚、会被盖掉。页面滚动要预留槽防抖；弹层经常只有两三条并不滚动，stable 槽会白吃 8px，弹层比按钮窄、字也对不齐。
 
 ## 输入框「可点区」与 footer 挤压（2026-07-28 用户实测两条一起立规）
 
 - **定高的编辑区、编辑器本体必须撑满外层容器**（`min-h-full`）——外层给了固定高度（推进弹窗 104 / ask 答题卡 84 / 输入条拖高值）而编辑器只有 `min-h-13` 时，下面那截空白属于外层 div、点了不聚焦（用户实测「指令框只有顶上一行能点」）。高度随内容（无固定高）的场景保持 `min-h-13` 即可——外层本来就是被编辑器撑起来的、没有空档。⛔ 别用「外层 onClick 手动 focus」绕：会干扰选词、光标落位也不自然。
 - **`min-w-0` 要加在「自己是 nowrap 内容」的那个 flex item 上、父级加了不算数**——`truncate` 自带 `white-space: nowrap`，该元素的 min-content = 整串文字宽；它作为 flex item 时 `min-width:auto` 就等于内容宽、`max-w-*` 也压不住（min 赢 max），于是溢出父容器压到同排的右侧控件上（踩过：composer footer 模型选择器压住附图 / 发送图标）。父容器的 `min-w-0` 只让父容器能缩、管不到子元素。
 - 给别人塞内容的 **slot 容器**（footer `leading`、dialog body 之类）统一挂 `*:min-w-0` 兜底（同 `DialogContent` 既有做法）、新加内容不必各自记得。
+- **提供方 + 模型两个 picker 一律并排**（2026-08-20）：trigger 跟对话 footer 同一套 compact 样式（`h-7` / `w-auto` / `text-xs`）。Picker 外层必须 `wrapperClassName="w-auto"`。弹层不要锁死 `--anchor-width`，自己给 `min-w-56` / `min-w-72`。⛔ 不要上下堆、不要合成一条可搜索列表。**提供方下拉只出现在建任务表单和尚未发过消息的空对话**；task 一创建、chat 一发出去就只留模型（推进弹窗、任务说话条同款）。设置页默认提供方只给新建拷一份，不劫持已有窗口。
+- **任务说话条展示当前推进用的模型**（2026-08-20）：不写「跟随会话」。trigger 绑最近 `action.agentModel`（再兜 `task.model`）；下拉里改了只覆盖接下来这一条，发完 / 新推进再跟上。不切提供方。
+- **常用模型 ≠ 默认模型**（2026-08-20）：下拉选项右侧五角星钉在当前提供方（最多 2 个 id），满了 toast、不挤掉已钉的。默认模型仍是设置页那条。常用 chip 行只出现在 full 表单（建任务 / 推进），在两个下拉上方；compact footer 只留星、不占 chip 行。思考档：Cursor SDK 用列表原样（标题/档位都跟 IDE）；自定义统一 `thinking`，chip 用英文协议值（`Default` / `low` / `high` / `max`），不要译成高/中/低。Default = 不传覆盖、上游自己的默认。
 
 ## 设计 skill（V0.7.8 引入、两个都在 .cursor/skills/）
 

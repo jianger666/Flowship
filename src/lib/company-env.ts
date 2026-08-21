@@ -449,6 +449,8 @@ export const buildCompanyEnvBrief = (
   fileAbsPath: string,
   /** SSH 执行脚本路径（agent 用 shell 调；缺省给名字、正式调用方传绝对路径） */
   sshExecPath = "ssh-exec.mjs",
+  /** PG 查询脚本路径；有 PostgreSQL 配置才写入 brief */
+  pgExecPath = "pg-exec.mjs",
 ): string => {
   if (!env) return "";
   // 闸门与 isCompanyEnvConfigured 同一谓词：任一子系统有实质配置即注入
@@ -514,9 +516,13 @@ export const buildCompanyEnvBrief = (
     serverCount > 0
       ? `SSH 登录服务器用平台脚本 \`node "${sshExecPath}" --config "${abs}" --env <环境名> [--user <用户>] -- '<远程命令>'\`（整个远程命令必须作为单个带引号的参数传入，脚本原样执行；凭据由脚本从本文件读取、命令不含密码），不要自行拼 ssh 命令。`
       : "";
+  const pgNote =
+    pgRows.length > 0
+      ? `查 PostgreSQL 用 \`node "${pgExecPath}" --config "${abs}" --env <环境名> -- '<SQL>'\`（SQL 作为单个带引号参数；凭据脚本内读，不要自己写 Python / 装 psycopg）。`
+      : "";
   return [
     "## 公司环境",
-    `公司环境已配置（配置文件：\`${abs}\`，已填：${parts.join("、")}）。需要查服务器日志 / 查测试库 / 看调度任务 / 查配置中心 / 调业务 API 时读取该文件使用；禁止 cat 整个文件或打印其中密码字段。条目里的 note 字段是给 AI 的用法提示（尤其 HTTP API），读取 company-env.json 时注意。${sshNote}`,
+    `公司环境已配置（配置文件：\`${abs}\`，已填：${parts.join("、")}）。需要查服务器日志 / 查测试库 / 看调度任务 / 查配置中心 / 调业务 API 时读取该文件使用；禁止 cat 整个文件或打印其中密码字段。条目里的 note 字段是给 AI 的用法提示（尤其 HTTP API），读取 company-env.json 时注意。${sshNote}${pgNote}`,
   ].join("\n");
 };
 

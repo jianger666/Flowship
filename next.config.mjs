@@ -53,9 +53,13 @@ const nextConfig = {
     "@earendil-works/pi-agent-core",
     "@earendil-works/pi-ai",
   ],
-  // dev 模式（next dev）：server 侧代码里的 `node:xxx` 内建模块让 webpack 全走
-  // 运行时 require（默认 externalsPresets 覆盖不到、会报 UnhandledSchemeError）。
-  // 仅 server 构建生效、不改 client bundle；standalone 构建同样受益、行为不变。
+  // 开发一律 Turbopack（`next dev --turbo`）。必须有非空 leaf（空 `{}` 会被 Next
+  // flattenKeys 当成「没配 turbo」）——root 与 outputFileTracingRoot 同口径。
+  turbopack: {
+    root: path.dirname(fileURLToPath(import.meta.url)),
+  },
+  // 仅 `next build` 走 webpack（`next start` 只跑构建产物）。server 侧 `node:xxx`
+  // 全走运行时 require（默认 externalsPresets 覆盖不到、会报 UnhandledSchemeError）。
   webpack: (config, { isServer }) => {
     if (isServer) {
       config.externals = config.externals ?? [];

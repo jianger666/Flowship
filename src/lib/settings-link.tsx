@@ -1,7 +1,7 @@
 /**
  * 设置页 URL 工具
  *
- * focus 对应 settings/page.tsx 里各卡片的 id 后缀（如 api-key → #card-api-key），
+ * focus 对应 settings/page.tsx 里各卡片的 id 后缀（如 model → #card-model），
  * 供 toast action、空态链接等「一键跳到对应配置块」用。
  *
  * v1.0.x：MCP / Skill 配置迁去 /actions 能力页（tab 管理）——这两个 focus 直接出

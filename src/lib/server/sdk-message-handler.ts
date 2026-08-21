@@ -30,10 +30,43 @@ import { buildToolResultMeta } from "./tool-result-persist";
  */
 export const SUBMIT_COMPLETED_TEXT = "已完成，产出已更新，请审阅。";
 
+/** 把攒着的 thinking token 落成一条事件。tool / 正文 / run 结束前都要先冲掉。 */
+export const flushThinkingBuffer = async (
+  taskId: string,
+  ctx: AssistantBufferCtx,
+  lease: () => boolean,
+  origin?: string,
+): Promise<void> => {
+  const text = ctx.thinkingBuffer ?? "";
+  const durationMs = ctx.thinkingDurationMs;
+  ctx.thinkingBuffer = "";
+  ctx.thinkingDurationMs = undefined;
+  if (!text) return;
+  if (!lease()) return;
+  const meta = {
+    ...(durationMs ? { durationMs } : {}),
+    ...(ctx.askSeen ? { muted: true } : {}),
+  };
+  const ev = {
+    kind: "thinking" as const,
+    text,
+    ...(Object.keys(meta).length > 0 ? { meta } : {}),
+  };
+  if (ctx.askSeen) {
+    await appendEvent(taskId, ev, lease);
+    return;
+  }
+  await writeOwnedEventAndPublish(taskId, lease, ev, origin);
+};
+
 // assistant 文本的流式缓冲：delta 先 publish 给 UI 打字机、攒到下个非 assistant 消息时 flush 落盘
 export interface AssistantBufferCtx {
   buffer: string;
   flush: () => Promise<void>;
+  /** 思考 delta 攒在这儿，一段思考只落一条 thinking 事件（pi 的 thinking_delta 是 token 级） */
+  thinkingBuffer?: string;
+  /** 本段思考累加的 durationMs（最后一条 SDK thinking 常带） */
+  thinkingDurationMs?: number;
   sdkErrorMessage?: string;
   /** 本回合已交卷成功（submit_work 返回 [SUBMITTED] / [NO_WAIT_NEEDED]）：之后模型输出（答案）照常广播、固定收尾延到 run 结束 */
   submitSeen?: boolean;
@@ -272,33 +305,18 @@ export const handleSdkMessage = async (
     case "thinking": {
       await assistantCtx.flush();
       if (!stillCurrent()) return;
-      // 提问成功后模型仍在 thinking（常是对宿主「Please continue」的反应）——
-      // 照常落盘但带 muted 标记（审计保留、UI 不渲染）
-      if (assistantCtx.askSeen) {
-        // 消音审计：只落盘、不广播（见 emitToolResult muted 注释）
-        await appendEvent(taskId, {
-          kind: "thinking",
-          text: msg.text,
-          meta: {
-            ...(msg.thinking_duration_ms
-              ? { durationMs: msg.thinking_duration_ms }
-              : {}),
-            muted: true,
-          },
-        }, stillCurrent);
-        break;
+      const chunk = typeof msg.text === "string" ? msg.text : "";
+      if (!chunk) break;
+      assistantCtx.thinkingBuffer = (assistantCtx.thinkingBuffer ?? "") + chunk;
+      if (msg.thinking_duration_ms) {
+        assistantCtx.thinkingDurationMs =
+          (assistantCtx.thinkingDurationMs ?? 0) + msg.thinking_duration_ms;
       }
-      await writeEv({
-        kind: "thinking",
-        text: msg.text,
-        meta: msg.thinking_duration_ms
-          ? { durationMs: msg.thinking_duration_ms }
-          : undefined,
-      });
       break;
     }
 
     case "tool_call": {
+      await flushThinkingBuffer(taskId, assistantCtx, stillCurrent, origin);
       await assistantCtx.flush();
       if (!stillCurrent()) return;
       const argsAny = (msg.args ?? {}) as Record<string, unknown>;
@@ -329,18 +347,6 @@ export const handleSdkMessage = async (
             },
           }, stillCurrent);
         } else if (msg.status === "error") {
-          const resStr = stringifyMeta(msg.result);
-          if (!stillCurrent()) return;
-          await appendEvent(taskId, {
-            kind: "error",
-            text: `工具调用失败 ${msg.name}：${truncate(resStr, 200)}`,
-            meta: {
-              callId: msg.call_id,
-              name: msg.name,
-              result: truncate(resStr),
-              muted: true,
-            },
-          }, stillCurrent);
           await emitToolResult(taskId, msg, stillCurrent, origin, true);
         } else if (msg.status === "completed") {
           await emitToolResult(taskId, msg, stillCurrent, origin, true);
@@ -387,18 +393,6 @@ export const handleSdkMessage = async (
           break;
         }
         if (msg.status === "error") {
-          const resStr = stringifyMeta(msg.result);
-          if (!stillCurrent()) return;
-          await writeEv({
-            kind: "error",
-            text: `artifact 写入失败 ${msg.name} → ${possibleTarget}：${truncate(resStr, 200)}`,
-            meta: {
-              callId: msg.call_id,
-              name: msg.name,
-              target: possibleTarget,
-              result: truncate(resStr),
-            },
-          });
           await emitToolResult(taskId, msg, stillCurrent, origin);
           break;
         }
@@ -476,17 +470,6 @@ export const handleSdkMessage = async (
           },
         });
       } else if (msg.status === "error") {
-        const resStr = stringifyMeta(msg.result);
-        if (!stillCurrent()) return;
-        await writeEv({
-          kind: "error",
-          text: `工具调用失败 ${msg.name}：${truncate(resStr, 200)}`,
-          meta: {
-            callId: msg.call_id,
-            name: msg.name,
-            result: truncate(resStr),
-          },
-        });
         await emitToolResult(taskId, msg, stillCurrent, origin);
       } else if (msg.status === "completed") {
         // Phase 1：completed 结果落盘（此前完全忽略 → shell/read 输出用户看不见）
@@ -516,6 +499,8 @@ export const handleSdkMessage = async (
     }
 
     case "assistant": {
+      await flushThinkingBuffer(taskId, assistantCtx, stillCurrent, origin);
+      if (!stillCurrent()) return;
       // 畸形 SDK 消息可能缺 message / content 非数组 → 直接跳过，避免 TypeError 打崩整轮 run
       const blocks = msg.message?.content;
       if (!Array.isArray(blocks)) break;

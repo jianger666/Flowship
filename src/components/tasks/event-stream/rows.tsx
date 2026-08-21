@@ -66,6 +66,7 @@ import { pathBasename } from "@/lib/path-utils";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { useJumpIde, useSubmitShortcut } from "@/hooks/use-settings";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
+import { isInTurnToolErrorEvent } from "@/lib/tool-display";
 import {
   JUMP_IDE_LABEL,
   type ActionType,
@@ -544,9 +545,12 @@ const EventRowImpl = ({
   );
 
   // 错误：chat / log 共用同一张 destructive 卡（原始诊断 meta.detail、复制、当轮重试都在卡里）。
+  // 只给「整轮崩溃」（断网 / key / run 挂死）。回合内工具失败带 meta.callId，不画红卡、不给重试——
+  // mergeToolDisplayEvents 已丢掉；这里再挡一层，避免漏网。
   // error 已不进「工作过程」组（见 lib/chat-turns.ts 的 MEMBER_KINDS）——run 一结束整组
   // 自动收起、用户正在读的错误会啪一下消失，这是它必须独立平铺的原因。
   if (ev.kind === "error") {
+    if (isInTurnToolErrorEvent(ev)) return null;
     return (
       <ErrorCard
         ev={ev}

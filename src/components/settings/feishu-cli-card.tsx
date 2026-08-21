@@ -19,13 +19,7 @@ import { useDialog } from "@/hooks/use-dialog";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Picker } from "@/components/ui/picker";
 import { SettingRow } from "@/components/ui/setting-row";
 import { FeishuBridgeBlock } from "@/components/settings/feishu-bridge-block";
 import type { FeAiFlowSettings } from "@/lib/types";
@@ -277,7 +271,7 @@ export const FeishuCliSection = ({
 
   const installing = !!state?.install.running;
   const installLog = state?.install.log ?? [];
-  // 下拉选项：列表未回时至少塞进当前已存项、保证 Select 能显示名称
+  // 下拉选项：列表未回时至少塞进当前已存项、保证能显示名称
   const selectOptions =
     projects.length > 0
       ? projects
@@ -318,11 +312,11 @@ export const FeishuCliSection = ({
           {!installing && (state?.larkCli.installed || state?.meegle.installed) && (
             <Button
               type="button"
-              variant="ghost"
+              variant="destructive"
               size="sm"
               disabled={busy}
               onClick={() => void handleUninstall()}
-              className="ml-auto text-muted-foreground hover:text-destructive"
+              className="ml-auto"
             >
               <Trash2 />
               卸载
@@ -338,26 +332,18 @@ export const FeishuCliSection = ({
             hint="工作台与收件箱只处理这个空间"
             className="py-2"
             control={
-              <Select
+              <Picker
+                className="w-56"
                 value={meegleProject.key}
-                onValueChange={(v) => {
+                placeholder="选择空间"
+                onChange={(v) => {
                   if (v) handlePickSpace(v);
                 }}
-              >
-                <SelectTrigger className="w-56">
-                  <SelectValue placeholder="选择空间">
-                    {selectOptions.find((p) => p.key === meegleProject.key)?.name ??
-                      meegleProject.name}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {selectOptions.map((p) => (
-                    <SelectItem key={p.key} value={p.key}>
-                      {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                options={selectOptions.map((p) => ({
+                  value: p.key,
+                  label: p.name,
+                }))}
+              />
             }
           />
         )}

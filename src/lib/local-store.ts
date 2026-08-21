@@ -12,16 +12,14 @@
  * 数据 schema 看 src/lib/types.ts
  */
 
-import { DEFAULT_MEEGLE_PROJECT, JUMP_IDES, USER_ROLES } from "./types";
+import { DEFAULT_MEEGLE_PROJECT, JUMP_IDES, USER_ROLES, CURSOR_PROVIDER_ID } from "./types";
 import type {
   ActionLayoutPref,
-  AgentProviderId,
-  CustomProviderConfig,
   FeAiFlowSettings,
   ModelSelection,
-  ModelUsageEntry,
   UserRole,
 } from "./types";
+import { migrateProviderSettings } from "./agent-provider";
 import {
   emptyActionLayout,
   normalizeCollapsedGroups,
@@ -32,6 +30,11 @@ import {
   emptyCompanyEnv,
   normalizeCompanyEnv,
 } from "./company-env";
+import {
+  parseStarredModels,
+  starredIdsForProvider,
+  toggleStarredModelId,
+} from "./starred-models";
 
 /** 已退役的 settings localStorage key——启动时删掉防残留脏数据被误读 */
 const LEGACY_SETTINGS_KEY = "fe-ai-flow:settings";
@@ -42,8 +45,9 @@ const API_FULL = "/api/settings/full";
 
 export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   apiKey: "",
-  // 默认走 Cursor SDK（历史行为不变）；切 custom 后 runtime 读 customProvider
-  provider: "cursor",
+  // 默认走 Cursor SDK（历史行为不变）；自定义条目在 customProviders，不覆盖旧用户的 apiKey
+  provider: CURSOR_PROVIDER_ID,
+  customProviders: [],
   defaultModel: { id: "" },
   repos: [],
   jumpIde: "cursor",
@@ -65,7 +69,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   isolateWorktreeDefault: true,
   disabledSkills: [],
   disabledRules: [],
-  modelUsage: [],
+  starredModels: {},
   // 默认悟空产研空间——看板 / 收件箱唯一作用域（历史用户零迁移）
   meegleProject: { ...DEFAULT_MEEGLE_PROJECT },
   // 飞书消息桥接：默认关（决策 #3）；插电防休眠默认开（决策 #14）；流式回复默认开
@@ -106,13 +110,16 @@ const cloneDefaultSettings = (): FeAiFlowSettings => ({
   },
   disabledSkills: [...(DEFAULT_SETTINGS.disabledSkills ?? [])],
   disabledRules: [...(DEFAULT_SETTINGS.disabledRules ?? [])],
-  modelUsage: [...(DEFAULT_SETTINGS.modelUsage ?? [])],
+  starredModels: { ...(DEFAULT_SETTINGS.starredModels ?? {}) },
   meegleProject: DEFAULT_SETTINGS.meegleProject
     ? { ...DEFAULT_SETTINGS.meegleProject }
     : undefined,
   companyEnv: cloneCompanyEnv(
     DEFAULT_SETTINGS.companyEnv ?? emptyCompanyEnv(),
   ),
+  customProviders: (DEFAULT_SETTINGS.customProviders ?? []).map((p) => ({
+    ...p,
+  })),
 });
 
 const isBrowser = (): boolean =>
@@ -130,26 +137,6 @@ const readDefaultModel = (raw: unknown): ModelSelection => {
     return raw as ModelSelection;
   }
   return { id: "" };
-};
-
-// provider 枚举归一：非 "custom" 一律回退 cursor（旧档 / 手改坏不炸）
-const readProvider = (raw: unknown): AgentProviderId =>
-  raw === "custom" ? "custom" : "cursor";
-
-/**
- * 自定义 provider 配置归一：baseUrl 空 = 未配置（整段弃、返 undefined）；
- * apiKey 允许空串（本地无鉴权端点，如 LM Studio）；format 非 anthropic 回退 openai。
- */
-const readCustomProvider = (raw: unknown): CustomProviderConfig | undefined => {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const o = raw as { baseUrl?: unknown; apiKey?: unknown; format?: unknown };
-  const baseUrl = typeof o.baseUrl === "string" ? o.baseUrl.trim() : "";
-  if (!baseUrl) return undefined;
-  return {
-    baseUrl,
-    apiKey: typeof o.apiKey === "string" ? o.apiKey : "",
-    format: o.format === "anthropic" ? "anthropic" : "openai",
-  };
 };
 
 // 推进面板布局偏好归一：order / hidden / 分组字段；坏值回退缺省
@@ -223,14 +210,17 @@ export const normalizeSettings = (
   delete (merged as Record<string, unknown>).username;
   delete (merged as Record<string, unknown>).gitHost;
   delete (merged as Record<string, unknown>).groupCollab;
+  // 旧单槽 customProvider 迁进 customProviders 后从归一结果抹掉，下次落盘清掉
+  delete (merged as Record<string, unknown>).customProvider;
+
+  const migratedProvider = migrateProviderSettings(parsed);
 
   return {
     ...merged,
     // 与 gitToken 对称：非 string 脏值回落空串，避免后续当 string 用炸
     apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
-    // Agent 后端来源：枚举外回退 cursor；自定义 provider 配置坏值弃（= 未配置）
-    provider: readProvider(parsed.provider),
-    customProvider: readCustomProvider(parsed.customProvider),
+    provider: migratedProvider.provider,
+    customProviders: migratedProvider.customProviders,
     defaultModel: readDefaultModel(parsed.defaultModel),
     repos,
     // 代码跳转 IDE：枚举外的值（旧档 / 手改坏）回退 cursor
@@ -274,12 +264,8 @@ export const normalizeSettings = (
           (s): s is string => typeof s === "string",
         )
       : [],
-    // V0.11.x：模型使用计数、坏值 / 缺省回退空
-    modelUsage: Array.isArray(parsed.modelUsage)
-      ? (parsed.modelUsage as ModelUsageEntry[]).filter(
-          (e) => e && typeof e.id === "string" && typeof e.count === "number",
-        )
-      : [],
+    // 每提供方常用模型（五角星）、坏值回退空
+    starredModels: parseStarredModels(parsed.starredModels),
     // 我的角色：枚举外 / 缺省 → undefined（首页就绪清单据此判定未选）
     userRole: USER_ROLES.includes(parsed.userRole as UserRole)
       ? (parsed.userRole as UserRole)
@@ -443,58 +429,22 @@ export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => 
   }
 };
 
-// ----------------- 模型使用计数（「常用模型」快捷 chip 数据源、V0.11.x） -----------------
+// ----------------- 每提供方常用模型（下拉里点星钉住、最多 2 个） -----------------
 
-// 「模型 + 参数组合」唯一 key（params 排序后拼、顺序无关）
-const modelUsageKey = (sel: {
-  id: string;
-  params?: Array<{ id: string; value: string }>;
-}): string =>
-  `${sel.id}||${(sel.params ?? [])
-    .map((p) => `${p.id}=${p.value}`)
-    .sort()
-    .join(",")}`;
-
-// 计数上限：超了淘汰「次数最少、其次最久没用」的条目、防列表无限膨胀
-const MODEL_USAGE_CAP = 20;
+export const getStarredModelIds = (providerId: string): string[] =>
+  starredIdsForProvider(getSettings().starredModels, providerId);
 
 /**
- * 记一次模型使用（推进起新 agent / 重启阶段 / 新建任务 / chat 换模型时调）。
- * 按 id + params 组合计数、写回 settings（异步落 config.json）。
+ * 点星钉住 / 取消。已满 2 个且点的是新 id 时不动、返回 `full`。
+ * saveSettings 会乐观写 cache，星标立刻反映在下拉里。
  */
-export const recordModelUsage = (sel: ModelSelection): void => {
-  if (!sel.id?.trim()) return;
-  // 必须等 init 成功后再整对象落盘。init 失败时 cache 是默认值——
-  // 直接 save 会覆盖磁盘有效配置（模型计数是增强数据、丢一次无妨）
-  void initSettings().then(() => {
-    if (!initSucceeded) {
-      console.warn(
-        "[local-store] recordModelUsage 跳过保存：settings 初始化未成功",
-      );
-      return;
-    }
-    const s = getSettings();
-    const key = modelUsageKey(sel);
-    const list = [...(s.modelUsage ?? [])];
-    const idx = list.findIndex((e) => modelUsageKey(e) === key);
-    if (idx >= 0) {
-      list[idx] = { ...list[idx], count: list[idx].count + 1, lastUsedAt: Date.now() };
-    } else {
-      list.push({ id: sel.id, params: sel.params, count: 1, lastUsedAt: Date.now() });
-    }
-    if (list.length > MODEL_USAGE_CAP) {
-      list.sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt);
-      list.length = MODEL_USAGE_CAP;
-    }
-    // 计数是尽力而为的统计、写失败无需打扰用户（下次使用再计）
-    void saveSettings({ ...s, modelUsage: list });
-  });
+export const toggleStarredModel = (
+  providerId: string,
+  modelId: string,
+): { starred: boolean; full: boolean } => {
+  const s = getSettings();
+  const result = toggleStarredModelId(s.starredModels, providerId, modelId);
+  if (result.full) return { starred: false, full: true };
+  void saveSettings({ ...s, starredModels: result.next });
+  return { starred: result.starred, full: false };
 };
-
-/**
- * 取使用次数 top N 的模型（次数同则最近用过的优先）——「常用模型」chip 用。
- */
-export const getTopUsedModels = (n: number): ModelUsageEntry[] =>
-  [...(getSettings().modelUsage ?? [])]
-    .sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt)
-    .slice(0, n);

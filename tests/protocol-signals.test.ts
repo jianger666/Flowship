@@ -17,6 +17,7 @@ import {
   SIGNAL_PREFIXES,
   buildNextActionHead,
 } from "@/lib/protocol-signals";
+import { askSubmittedText } from "@/lib/server/chat-mcp";
 
 const promptsDir = path.resolve(import.meta.dirname, "..", "prompts");
 const superMd = readFileSync(path.join(promptsDir, "_super.md"), "utf-8");
@@ -44,6 +45,10 @@ describe("信号常量 ↔ _super.md 一致性", () => {
     expect(superMd).toContain("[ASK_SUBMITTED]");
     expect(superMd).toContain("[ASK_USER_REPLY]");
     expect(superMd).toContain("[ASK_USER_REPLY deferred]");
+  });
+
+  it("ask_user 收尾不得硬限制「不要再输出任何文本」（宿主空完成会塞续跑）", () => {
+    expect(superMd).not.toContain("不要再输出任何文本");
   });
 
   it("旧协议残留不该再出现在 _super.md（已退役）", () => {
@@ -163,5 +168,16 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
         ).toContain(ph);
       }
     }
+  });
+});
+
+describe("ask_user 收尾文案（对齐 Cursor SDK、去掉空完成硬限制）", () => {
+  it("askSubmittedText 结束本轮、告知静音、不硬限制输出、不对抗宿主续跑", () => {
+    const text = askSubmittedText("ask_test");
+    expect(text).not.toContain("不要再输出任何文本");
+    expect(text).not.toContain("Please continue");
+    expect(text).toContain("静音");
+    expect(text).toContain("[ASK_SUBMITTED]");
+    expect(text).toContain("[ASK_USER_REPLY]");
   });
 });

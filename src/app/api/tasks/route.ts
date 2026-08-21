@@ -141,6 +141,10 @@ export const POST = async (req: Request) => {
           ? body.isolateWorktree
           : undefined,
       model: body.model,
+      provider:
+        typeof body.provider === "string" && body.provider.trim()
+          ? body.provider.trim()
+          : undefined,
     });
     // v1.1.x 提速：隔离工作区后台预热（fire-and-forget、chat / 非隔离任务内部 no-op）——
     // worktree 首建 + 依赖克隆不再算进第一次推进的等待时间

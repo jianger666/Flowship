@@ -12,12 +12,29 @@
 - 识图结果是辅助证据：转述时说明来自 Composer 委派，不要声称是当前模型亲自看到。
 - 截图可能包含客户数据或其他秘密时，先向用户确认再委派（图片会发送给 Cursor 服务）；worker 返回 `ok: false` 时如实报告，不要编造识别结果。
 
-## 打 test 包并重启（禁止 UI 自动化验收）
+## 打包 / 验证流程（默认网页热更，用户要求打 app 才打包）
 
-- **日常迭代走 8776 浏览器热更新验证（这样快）**：用户直接在浏览器看 `http://localhost:8776/settings`（仓库 `next dev`、HMR 秒刷新、`FLOWSHIP_DATA_DIR` 指 `~/Library/Application Support/fe-ai-flow-test/data`）。改完代码 typecheck/lint 过即可让用户刷新看效果，**不打包壳**。dev 模式依赖 `next.config.mjs` 的 server 侧 `node:` externals（否则 `next dev` 报 UnhandledSchemeError）。
-- **只有涉及到需要 app 才能验收的地方、或者用户明确要求时，才打包 app**（走下面 test 打包）；用户明确说不要打包或不要重启时除外。
+### 三端口约定
+
+| 端口 | 服务 | 说明 |
+|---|---|---|
+| **8776** | FlowshipTest 桌面包 | 测试 App 内嵌 server，`pnpm electron:test:restart` 重启后就是它 |
+| **8876** | Flowship 正式桌面包 | 正式 App 内嵌 server（别动） |
+| **8676** | test 网页热更 | `pnpm dev:web`（`next dev` + HMR），日常改 UI 看它 |
+
+> 注意：8776 是「测试桌面包」的端口、**不是**独立网页服务。想网页热更请走 `pnpm dev:web`（8676），不要直接用 8876（正式包占用）或去碰打包。
+
+### 默认：网页热更新（最快）
+
+- **日常改 UI 验证默认走 `pnpm dev:web`**：起 `next dev --turbo` 在 **8676**，自动清掉宿主注入的 `__NEXT_PRIVATE_STANDALONE_CONFIG` / `NEXT_DEPLOYMENT_ID` / `FLOWSHIP_DATA_DIR`（前两个会让 `next build/dev` 报 `generate is not a function`，后者常被注入成正式包数据目录）、再把数据目录写死到 `fe-ai-flow-test`、起完自动开 `http://localhost:8676/settings`。HMR 秒刷新，改完 typecheck/lint 过即可让用户刷新看效果，**不打包壳**。要换端口/数据目录用 `DEV_WEB_PORT` / `DEV_WEB_DATA_DIR`，别用 `PORT` / `FLOWSHIP_DATA_DIR`。`pnpm start` 同样是 `next dev --turbo`（默认 8876，别跟正式桌面包抢端口）。
+- 生产 / `next build` 仍走 webpack（发版链不动）；`next.config.mjs` 的 server 侧 `node:` externals 只给 webpack 用。开发一律 Turbopack（`turbopack.root`），不要再起无 `--turbo` 的 `next dev`。
+
+### 打 test 包并重启（仅当需要 app 验收 / 用户明确要求）
+
+- **用户明确要求「打 app / 打包看看」时就打**（用户不要求时默认网页热更，不要动辄打 5 分钟包）。
 - test 打包和进程级重启不属于「操作 App」：授权范围仅是 **构建、组 server 布局、打 staging unpacked test 包、精确退出旧 FlowshipTest 进程、部署到规范路径、启动新 test 包**，不包含读取或操作界面。
 - 一条命令：`pnpm electron:test:restart`（内部顺序：`BUILD_STANDALONE=1 pnpm build` → `pnpm electron:server` → `pnpm exec electron-builder` 打 **staging**（`dist/electron/.test-restart-staging/`、`productName=FlowshipTest`）→ 确认 staging 产物 → 退出旧 FlowshipTest → 备份并替换规范路径（mac `dist/electron/mac-{arch}/FlowshipTest.app` / win `dist/electron/win-unpacked/FlowshipTest.exe`）→ 启动规范路径新包）。仅 `electron:dist:test` 仍可用于只打 mac test 包（仍写规范路径）。
+- 脚本内已固化两条修复：① spawn 前自动剔除注入的 standalone 环境变量（防 `generate is not a function`）；② 退出旧测试 App 时 osascript 优雅退出被 TCC 权限拦 / 超时，自动降级成进程级精确退出（`pkill -x FlowshipTest`，不碰正式 Flowship）。
 - 命令调用：`process.execPath` + `npm_execpath` 调 pnpm，`pnpm exec electron-builder` 调 builder；禁止依赖 `pnpm.cmd` / `electron-builder.cmd` 或 shell 拼接。
 - **除非用户明确要求 App UI 自动化验收或操作**，Agent 不得使用 computer-use、浏览器自动化、截图、可访问性树等方式打开、查看、点击或验收 App；启动新 test 包后直接交给用户查看，不得自行进入界面验收。
 - 该流程只做进程级重启。**构建/打包失败**：旧 FlowshipTest 保持运行、脚本非零退出。**部署失败**：尽力从 `dist/electron/.test-restart-backup/` 恢复上一可用包并尝试启动旧版，再非零退出。**启动失败**：新包已在规范路径时给出明确错误。

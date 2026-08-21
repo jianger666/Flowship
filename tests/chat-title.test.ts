@@ -85,6 +85,8 @@ describe("sanitizeGeneratedChatTitle", () => {
     expect(sanitizeGeneratedChatTitle(`「${long}」`)).toBe(long.slice(0, 24));
     expect(sanitizeGeneratedChatTitle("   ")).toBeNull();
     expect(sanitizeGeneratedChatTitle("标题。")).toBe("标题");
+    expect(sanitizeGeneratedChatTitle("为对话生成中文标题")).toBeNull();
+    expect(sanitizeGeneratedChatTitle("为这段对话生成一个标题")).toBeNull();
   });
 });
 
@@ -197,5 +199,28 @@ describe("maybeGenerateChatTitle", () => {
     await waitUntil(() => mockCommit.mock.calls.length > 0);
 
     expect(mockCommit).toHaveBeenCalledWith("t-chat-1", long.slice(0, 24));
+  });
+
+  it("模型复读标题指令 → 不写标题、清 pending", async () => {
+    mockGetTask.mockResolvedValue(baseTask());
+    mockPrompt.mockResolvedValue({
+      id: "run-echo",
+      status: "finished",
+      result: "为对话生成中文标题",
+    });
+    const cleared = baseTask({ titleAutoPending: undefined });
+    mockUpdateFields.mockResolvedValue(cleared);
+
+    maybeGenerateChatTitle("t-chat-1", "key-x", "222");
+    await waitUntil(() => mockUpdateFields.mock.calls.length > 0);
+
+    expect(mockCommit).not.toHaveBeenCalled();
+    expect(mockUpdateFields).toHaveBeenCalledWith("t-chat-1", {
+      titleAutoPending: false,
+    });
+    expect(mockPublish).toHaveBeenCalledWith("t-chat-1", {
+      kind: "task",
+      task: cleared,
+    });
   });
 });

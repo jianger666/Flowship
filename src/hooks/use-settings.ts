@@ -115,7 +115,7 @@ export interface UseSettingsResult {
  * - stringEmpty：缺省视同 ""
  * - boolFalse / boolTrue：缺省视同 false / true
  * - stringSet：字符串集合（排序后比，顺序无关）
- * - ignore：非设置页编辑字段（如 modelUsage），恒视为相等（dirty 由调用方硬编码 false）
+ * - ignore：非设置页编辑字段（如 starredModels），恒视为相等（dirty 由调用方硬编码 false）
  */
 type FieldEqKind =
   | "stringEmpty"
@@ -129,7 +129,7 @@ type FieldEqKind =
   | "meegleProject"
   | "companyEnv"
   | "provider"
-  | "customProvider"
+  | "customProviders"
   | "ignore";
 
 const FIELD_EQ_KIND = {
@@ -156,8 +156,8 @@ const FIELD_EQ_KIND = {
   meegleProject: "meegleProject",
   companyEnv: "companyEnv",
   provider: "provider",
-  customProvider: "customProvider",
-  modelUsage: "ignore",
+  customProviders: "customProviders",
+  starredModels: "ignore",
 } as const satisfies Record<SettingsField, FieldEqKind>;
 
 const eqStringSet = (x: string[] | undefined, y: string[] | undefined): boolean => {
@@ -235,10 +235,10 @@ export const isFieldEqual = (
       );
     case "provider":
       return (a.provider ?? "cursor") === (b.provider ?? "cursor");
-    case "customProvider":
+    case "customProviders":
       return (
-        JSON.stringify(a.customProvider ?? null) ===
-        JSON.stringify(b.customProvider ?? null)
+        JSON.stringify(a.customProviders ?? []) ===
+        JSON.stringify(b.customProviders ?? [])
       );
     case "ignore":
       return true;
@@ -306,8 +306,8 @@ export const useSettings = (): UseSettingsResult => {
       ),
       disabledSkills: !isFieldEqual("disabledSkills", settings, savedSettings),
       disabledRules: !isFieldEqual("disabledRules", settings, savedSettings),
-      // 模型使用计数：非设置页字段（recordModelUsage 直写）、恒不 dirty
-      modelUsage: false,
+      // 常用星标：下拉里直写、恒不 dirty
+      starredModels: false,
       meegleProject: !isFieldEqual("meegleProject", settings, savedSettings),
       // 飞书 chat 桥接全局开关 / 插电防休眠（S1 落 settings、UI 段后续接）
       feishuChatBridge: !isFieldEqual(
@@ -332,7 +332,7 @@ export const useSettings = (): UseSettingsResult => {
       ),
       companyEnv: !isFieldEqual("companyEnv", settings, savedSettings),
       provider: !isFieldEqual("provider", settings, savedSettings),
-      customProvider: !isFieldEqual("customProvider", settings, savedSettings),
+      customProviders: !isFieldEqual("customProviders", settings, savedSettings),
     }),
     [settings, savedSettings]
   );

@@ -75,14 +75,18 @@ import {
 } from "@/components/ui/dialog";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Label } from "@/components/ui/label";
-import { ModelSelect } from "@/components/ui/model-select";
+import { ProviderModelPicker } from "@/components/ui/provider-model-picker";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useModels } from "@/hooks/use-models";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { buildActionInstructionHistory } from "@/lib/composer-history";
-import { getSettings, recordModelUsage } from "@/lib/local-store";
-import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
+import { getSettings } from "@/lib/local-store";
+import {
+  getModelCredsForProvider,
+  hasModelCredsForProvider,
+  resolveTaskProvider,
+} from "@/lib/agent-provider";
 import {
   ACTION_LABEL,
   computeBatchProgress,
@@ -119,7 +123,11 @@ import { wkCommandForAction } from "@/lib/wk-command";
 import { isCompanyEnvConfigured } from "@/lib/company-env";
 import { SettingsLink } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
-import { isSharedTeamCategory, TEST_STRATEGY_LABEL } from "@/lib/types";
+import {
+  defaultModelForProvider,
+  isSharedTeamCategory,
+  TEST_STRATEGY_LABEL,
+} from "@/lib/types";
 import type {
   ActionLayoutPref,
   ActionType,
@@ -519,6 +527,9 @@ export const AdvanceDialog = ({
   // 主流程互斥：open / fetch effect 读打开瞬间 actions 快照、不进 deps（防 SSE 重置表单）
   const taskActionsRef = useRef(task.actions);
   taskActionsRef.current = task.actions;
+  // 打开瞬间读 task.provider、不把整个 task 塞进 open effect（SSE 刷新会把表单打回默认）
+  const taskRef = useRef(task);
+  taskRef.current = task;
   // 打开瞬间快照：本次正在创建的 plan 提交后会进 task.actions、但快照不变——
   // 首次 plan 提交时（dialog 还 loading）不会误闪「会追加到现有方案」文案
   const [hasPlanHistory, setHasPlanHistory] = useState(false);
@@ -570,9 +581,14 @@ export const AdvanceDialog = ({
     // 默认模型 = 本 task 最近 action 用的 → task.model（ref.current、打开瞬间最新、不进 deps 防 SSE 重置）
     // → 当次 getSettings().defaultModel 兜底（含 params）。settings 在这里读、保证拿到最新设置页默认模型。
     const s = getSettings();
+    const providerId = resolveTaskProvider(taskRef.current, s);
     // v0.9.11：「续用当前 Agent」默认勾选走设置页偏好（缺省 false = 每 action 新 agent）；dialog 内仍可临时切
     setReuseAgent(s.reuseAgentDefault ?? false);
-    setPickedModel(defaultPickedModelRef.current ?? s.defaultModel ?? { id: "" });
+    setPickedModel(
+      defaultPickedModelRef.current ??
+        defaultModelForProvider(s, providerId) ??
+        { id: "" },
+    );
     setGitToken(s.gitToken?.trim() || undefined);
     // 团队规范开关：缺省 true；关了推进列表隐藏挂载 knowledge skill 的自定义 action
     teamKnowledgeEnabledRef.current = s.teamKnowledgeEnabled !== false;
@@ -679,10 +695,15 @@ export const AdvanceDialog = ({
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
   useEffect(() => {
     if (!open) return;
-    if (hasActiveModelCreds() && availableModels.length === 0) {
-      void fetchModels(getActiveModelCreds());
+    const s = getSettings();
+    const providerId = resolveTaskProvider(task, s);
+    if (hasModelCredsForProvider(s, providerId) && availableModels.length === 0) {
+      void fetchModels({
+        ...getModelCredsForProvider(s, providerId),
+        provider: providerId,
+      });
     }
-  }, [open, availableModels.length, fetchModels]);
+  }, [open, availableModels.length, fetchModels, task]);
 
   // dialog 打开时拉自定义 action 列表 + knowledge skill 名（团队规范开关过滤用）
   // + 已关闭自管 skill 名（推进面板隐藏挂它的自建 action）；拉失败静默清空、不挡内置 action。
@@ -1146,8 +1167,6 @@ export const AdvanceDialog = ({
   const handleSubmit = async () => {
     // actionType 判空给 TS narrow 用（canSubmit 已含该拦截）
     if (!canSubmit || !actionType) return;
-    // 常用模型计数：只在「起新 agent 且选了模型」时记（续用不换模型、不算一次使用）
-    if (!reuseAgent && pickedModel.id) recordModelUsage(pickedModel);
     // 富输入四件套：正文（`/skill`、`@文件` 以原文内联其中）+ 图 + 路径附件 + skill 引用
     const { text, images, attachments, skillRefs } = rich.payload();
     await onSubmit({
@@ -1473,14 +1492,15 @@ export const AdvanceDialog = ({
             >
               <div className="overflow-hidden">
                 <div className="mt-2 border-t border-border/60 pt-2">
-                  <ModelSelect
+                  <ProviderModelPicker
+                    variant="full"
+                    showProvider={false}
+                    providerId={resolveTaskProvider(task, getSettings())}
                     models={availableModels}
                     selection={pickedModel}
-                    onChange={setPickedModel}
+                    onModelChange={setPickedModel}
                     disabled={submitting}
-                    variant="full"
-                    quickPicks
-                    emptyPlaceholder="（请先在设置页拉取模型列表）"
+                    emptyPlaceholder="选择模型"
                   />
                 </div>
               </div>

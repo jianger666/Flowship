@@ -258,6 +258,7 @@ beforeEach(() => {
   loadBridgeBootContext.mockResolvedValue({
     apiKey: "key",
     model: { id: "composer-2" },
+    provider: "cursor",
     repoPaths: [],
   });
   writeUserEventAndPublishStrict.mockResolvedValue({
@@ -710,6 +711,7 @@ describe("handleCardActionEvent", () => {
     loadBridgeBootContext.mockResolvedValue({
       apiKey: "key",
       model: { id: "composer-2" },
+      provider: "cursor",
       repoPaths: [],
     });
     writeUserEventAndPublishStrict.mockResolvedValue({

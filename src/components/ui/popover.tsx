@@ -22,11 +22,14 @@ function PopoverContent({
   sideOffset = 6,
   align = "center",
   alignOffset = 0,
+  // fixed：弹层相对视口定位。absolute 会吃到 Card 的 overflow-hidden
+  //（设置页「模型」卡点开下拉会被裁在卡片底、看起来像把「凭据」挤下去）。
+  positionMethod = "fixed",
   ...props
 }: PopoverPrimitive.Popup.Props &
   Pick<
     PopoverPrimitive.Positioner.Props,
-    "side" | "sideOffset" | "align" | "alignOffset"
+    "side" | "sideOffset" | "align" | "alignOffset" | "positionMethod"
   >) {
   return (
     <PopoverPrimitive.Portal>
@@ -35,6 +38,7 @@ function PopoverContent({
         sideOffset={sideOffset}
         align={align}
         alignOffset={alignOffset}
+        positionMethod={positionMethod}
         className="isolate z-50"
       >
         <PopoverPrimitive.Popup

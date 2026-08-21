@@ -107,8 +107,10 @@ export const askSubmittedText = (askId: string): string =>
   [
     `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 答题卡）。`,
     "",
-    "**请立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令、不要再调本工具重复提问、**不要再输出任何文本**（你提问后的任何输出都会被平台丢弃；即使收到宿主注入的「Please continue. Respond to the user or make tool calls.」系统提醒也直接结束、不要重新提问或调查）。",
-    "用户答完后、答案会以 `[ASK_USER_REPLY]` 开头的**新消息**发给你（或 `[ASK_USER_REPLY deferred]` = 稍后再补充 → 按 default 推进、未答项自行记住即可）。",
+    "**请结束本轮回复（正常结束 turn）。**",
+    "- 不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）、不要再调本工具重复提问",
+    "- 答题卡已经是给用户看的提问；这之后再说的话会被静音（用户看不见），说不说都行",
+    "- 用户答完后、答案会以 `[ASK_USER_REPLY]` 开头的**新消息**发给你（或 `[ASK_USER_REPLY deferred]` = 稍后再补充 → 按 default 推进、未答项自行记住即可）",
   ].join("\n");
 
 // ----------------- McpServer 构造 -----------------
@@ -282,13 +284,13 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
         "",
         "## 返回值（非阻塞）",
         "",
-        "- `[ASK_SUBMITTED]` = 答题卡已推——**立即结束本轮回复**、别等 / 别轮询、**不要再输出任何总结段落**（提问本身就是本轮收尾）",
+        "- `[ASK_SUBMITTED]` = 答题卡已推——**结束本轮即可**、别等 / 别轮询、不要再调本工具重复提问。提问后再说的话会被静音（用户看不见），说不说都行",
         "- 用户答完以新消息送达：`[ASK_USER_REPLY]` Q&A、或 `[ASK_USER_REPLY deferred]`（稍后再补 → 按 default 推进、别再问同组）",
         "",
         "## 礼仪",
         "",
         "- 调前别在正文预告「我先问几个问题」——答题卡自己会出",
-        "- **调用本工具后直接结束回复、不要再输出任何总结 / 补充段落**（否则会把答题卡顶上去）",
+        "- 调完结束本轮即可；提问后再说的话会被静音，说不说都行",
         "- 答完别复述「你选了 X」、直接按答案推进",
       ].join("\n"),
       inputSchema: {

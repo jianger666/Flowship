@@ -46,6 +46,7 @@ import {
   withSdkDeadline,
 } from "./sdk-deadline";
 import {
+  flushThinkingBuffer,
   handleSdkMessage,
   type AssistantBufferCtx,
 } from "./sdk-message-handler";
@@ -301,6 +302,12 @@ export const startRestrictedGroupQuestion = (
       for await (const msg of run.stream()) {
         await handleSdkMessage(task.id, msg, assistantCtx, alive, origin);
       }
+      await flushThinkingBuffer(
+        task.id,
+        assistantCtx,
+        alive,
+        origin,
+      );
       await assistantCtx.flush();
 
       const result = await run.wait();

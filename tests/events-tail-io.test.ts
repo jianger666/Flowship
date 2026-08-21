@@ -193,3 +193,41 @@ describe("readEventsBefore", () => {
     expect(got).toEqual({ events: [], hasMore: false });
   });
 });
+
+describe("readEventsTail thinking 收口", () => {
+  it("尾部上千条 thinking token 不会把更早的 user_reply 挤出窗口", async () => {
+    const user: TaskEvent = {
+      id: "user_1",
+      ts: 1,
+      kind: "user_reply",
+      text: "分析这个项目",
+    };
+    const tokens = Array.from({ length: 800 }, (_, i) => {
+      const e: TaskEvent = {
+        id: `th_${i}`,
+        ts: 2 + i,
+        kind: "thinking",
+        text: i % 2 === 0 ? "改" : "点",
+      };
+      return e;
+    });
+    const stop: TaskEvent = {
+      id: "info_stop",
+      ts: 9000,
+      kind: "info",
+      text: "用户停止了对话",
+    };
+    await writeJsonl(
+      [user, ...tokens, stop].map((e) => JSON.stringify(e)),
+    );
+
+    const { events, hasMore } = await readEventsTail(TASK_ID, 10);
+    expect(hasMore).toBe(false);
+    expect(events.some((e) => e.id === "user_1")).toBe(true);
+    expect(events.some((e) => e.id === "info_stop")).toBe(true);
+    const thinking = events.filter((e) => e.kind === "thinking");
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0]!.text).toContain("改点");
+    expect(thinking[0]!.text.length).toBeGreaterThan(100);
+  });
+});

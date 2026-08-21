@@ -21,6 +21,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   buildElectronBuilderDistTestSpawnSpec,
+  buildForceQuitTestAppSpec,
   buildLaunchTestAppSpec,
   buildPnpmSpawnSpec,
   buildQuitTestAppSpec,
@@ -34,6 +35,18 @@ const PREFIX = "[electron:test:restart]";
 
 function log(phase, message) {
   console.log(`${PREFIX} ${phase}: ${message}`);
+}
+
+/**
+ * 宿主/CI 可能注入 __NEXT_PRIVATE_STANDALONE_CONFIG（JSON 序列化配置）——
+ * Next 一看到就直接当配置用、函数字段（generateBuildId）被剥光，next build 必挂
+ * "generate is not a function"。所有子进程 spawn 一律剔除这两个变量。
+ */
+function cleanEnv() {
+  const env = { ...process.env };
+  delete env.__NEXT_PRIVATE_STANDALONE_CONFIG;
+  delete env.NEXT_DEPLOYMENT_ID;
+  return env;
 }
 
 function runSpawn({ command, args }, { env, label, ignoreFailure = false, detached = false } = {}) {
@@ -189,10 +202,15 @@ async function main() {
   const layout = resolveTestAppPaths();
   const deployPlan = describeDeployPlan(layout);
 
+  // `next dev --turbo` 写过的 .next 不能拿来跑 webpack `next build`：
+  // page manifest 会只剩几条，collect page data 报 Cannot find module for page。
+  log("1/6", "清掉 .next（避免 turbo 开发缓存污染 standalone 构建）");
+  await removeDirRecursive(path.join(process.cwd(), ".next"));
+
   log("1/6", "BUILD_STANDALONE=1 pnpm build");
   await runSpawn(buildPnpmSpawnSpec(["build"]), {
     label: "build",
-    env: { ...process.env, BUILD_STANDALONE: "1" },
+    env: { ...cleanEnv(), BUILD_STANDALONE: "1" },
   });
 
   log("2/6", "pnpm electron:server");
@@ -211,13 +229,25 @@ async function main() {
   log("4/6", `确认 staging 产物 ${layout.stagingArtifactPath}`);
   await verifyArtifact(layout.stagingArtifactPath, "staging 产物");
 
+  // 退出旧测试 App：先 osascript 优雅退出（macOS）；被 TCC 自动化权限拦 / 超时
+  // 仍未退出时降级成进程级精确退出（pkill -x FlowshipTest、不碰正式 Flowship）。
   const quitSpec = buildQuitTestAppSpec(platform);
   log("5/6", `退出旧 FlowshipTest：${quitSpec.command} ${quitSpec.args.join(" ")}`);
   await runSpawn(quitSpec, {
     label: "quit FlowshipTest",
     ignoreFailure: quitSpec.ignoreFailure,
   });
-  await waitForTestAppState(platform, false);
+  try {
+    await waitForTestAppState(platform, false);
+  } catch {
+    const forceSpec = buildForceQuitTestAppSpec(platform);
+    log(
+      "5/6",
+      `优雅退出超时，进程级精确退出：${forceSpec.command} ${forceSpec.args.join(" ")}`,
+    );
+    await runSpawn(forceSpec, { label: "force-quit FlowshipTest", ignoreFailure: true });
+    await waitForTestAppState(platform, false);
+  }
   log("5/6", "旧 FlowshipTest 主进程已完全退出");
 
   try {

@@ -28,7 +28,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { Agent } from "./agent-backend";
+import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { dataRoot } from "./data-root";
@@ -203,6 +203,7 @@ import {
   planBranchesForBuild,
 } from "./action-gates";
 import {
+  flushThinkingBuffer,
   handleSdkMessage,
   maybeEmitSubmitFixedText,
   type AssistantBufferCtx,
@@ -218,8 +219,17 @@ import type {
 } from "@/lib/types";
 import {
   ACTION_FRESH_AGENT_DEFAULT,
+  defaultModelForProvider,
+  isCursorProvider,
   MCP_HEALTH_LABEL,
 } from "@/lib/types";
+import {
+  findCustomProvider,
+  isApiKeyFieldPresent,
+  migrateProviderSettings,
+  resolveTaskProvider,
+  sessionMatchesProvider,
+} from "@/lib/agent-provider";
 import {
   actionDisplayLabel,
   mrTargetBranchOf,
@@ -1711,7 +1721,7 @@ const resumeCurrentActionCore = async (
           : input.fallbackModel;
 
   // 把本次实际启动的模型写回 action.agentModel：换模型唤醒（forceModel）跟当初的
-  // agentModel 不同、不写回的话「跟随会话」会一直显示该 action 当初的旧模型、
+  // agentModel 不同、不写回的话说话条会一直显示该 action 当初的旧模型、
   // 与实际在跑的模型不符（task-model.resolveSessionModel 以 agentModel 为单一来源）。
   if (JSON.stringify(model) !== JSON.stringify(startAction.agentModel)) {
     const modelPatched = await patchActionIfOwner(
@@ -3033,6 +3043,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               Agent.create({
                 apiKey,
                 model,
+                providerId: await resolveProviderIdFromDisk(task),
                 // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
                 // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills /
                 // inline mcpServers）；曾用 ["project"] 时 chat 未绑目录 cwd=homedir 会把
@@ -3357,21 +3368,36 @@ const RECONNECT_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000, 30_000];
  * 服务端凭据兜底（自动重连时没有 client bootArgs 可用）：直接读 config.json。
  * 跟 client settings 同一份文件、apiKey / 默认模型 / git 凭据都在。
  */
-const readServerCreds = async (): Promise<SessionCreds> => {
+const readServerCreds = async (task: Task): Promise<SessionCreds> => {
   try {
     const raw = await fs.readFile(
       path.join(dataRoot(), "config.json"),
       "utf-8",
     );
-    const cfg = JSON.parse(raw) as {
-      apiKey?: string;
-      defaultModel?: ModelSelection;
-      gitToken?: string;
+    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    const migrated = migrateProviderSettings(cfg);
+    const settings = {
+      apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey : "",
+      defaultModel: (cfg.defaultModel as ModelSelection | undefined) ?? { id: "" },
+      customProviders: migrated.customProviders,
     };
+    const providerId = resolveTaskProvider(task, settings);
+    const model = defaultModelForProvider(settings, providerId);
+    const gitToken = typeof cfg.gitToken === "string" ? cfg.gitToken : undefined;
+    if (isCursorProvider(providerId)) {
+      if (!settings.apiKey.trim()) return { gitToken };
+      return {
+        apiKey: settings.apiKey,
+        model: model?.id ? model : undefined,
+        gitToken,
+      };
+    }
+    const cp = findCustomProvider(settings, providerId);
+    if (!cp?.baseUrl.trim()) return { gitToken };
     return {
-      apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey : undefined,
-      model: cfg.defaultModel?.id ? cfg.defaultModel : undefined,
-      gitToken: typeof cfg.gitToken === "string" ? cfg.gitToken : undefined,
+      apiKey: cp.apiKey ?? "",
+      model: model?.id ? model : undefined,
+      gitToken,
     };
   } catch {
     return {};
@@ -3476,7 +3502,7 @@ const tryAutoReconnect = async (
       expectedSessionInstanceId: myReconnectSessionId,
     });
   }
-  const creds = await readServerCreds();
+  const creds = await readServerCreds(task);
   // 透传入场 opHandle——resume 禁止自行重拍 identity
   const record = await resumeTaskSession(fresh, creds, {
     closedSessionInstanceId: myReconnectSessionId,
@@ -4168,6 +4194,9 @@ const consumeSessionRun = async (
     }
     // stream 结束后 flush 也绑 op——失主跳过，避免迟到 assistant_message
     if (!lostStartOwner()) {
+      await flushThinkingBuffer(task.id, assistantCtx, () =>
+        isTaskOpCurrent(opts.opHandle),
+      );
       await assistantCtx.flush();
     }
 
@@ -4788,8 +4817,9 @@ export const resumeTaskSession = async (
    */
   opts?: { closedSessionInstanceId?: number; opHandle?: TaskOpHandle },
 ): Promise<AgentSessionRecord | null> => {
-  if (!task.sessionAgentId || !creds.apiKey) return null;
-  // resume 后 send 必须有显式 model：跟 UI「跟随会话」同一套 resolveSessionModel、
+  // 自定义允许空 Key（本地无鉴权）；缺字段才 resume 不了。Cursor 空 Key 由 SDK 自己失败。
+  if (!task.sessionAgentId || !isApiKeyFieldPresent(creds.apiKey)) return null;
+  // resume 后 send 必须有显式 model：跟说话条 / 推进同一套 resolveSessionModel、
   // 再兜底 client 传来的 settings 默认模型
   const model = resolveSessionModel(task) ?? creds.model;
   if (!model) return null;
@@ -4804,6 +4834,17 @@ export const resumeTaskSession = async (
 
   // 入口拒——finalize 后不得复活 session / 重建 worktree
   if (!(await mayResume())) return null;
+
+  const providerId = await resolveProviderIdFromDisk(task);
+  if (
+    task.sessionAgentId &&
+    !sessionMatchesProvider(task.sessionAgentId, providerId)
+  ) {
+    console.warn(
+      `[task-runner] task=${task.id} 落盘会话与当前提供方不一致，跳过 resume`,
+    );
+    return null;
+  }
 
   // 放 try 外：ensure 失败（分支被占等）应冒泡给调用方；try 只兜 Agent.resume 失败降级
   // resume 传 opHandle 闭包（无 handle 时退 lifecycle + 终态）
@@ -4839,6 +4880,7 @@ export const resumeTaskSession = async (
     const agent = await withSdkDeadline(
       Agent.resume(task.sessionAgentId, {
         apiKey: creds.apiKey,
+        providerId,
         model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
         // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
@@ -5184,6 +5226,7 @@ export const startOneShotQuestion = (
             Agent.create({
               apiKey: creds.apiKey,
               model: creds.model,
+              providerId: await resolveProviderIdFromDisk(task),
               // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
               local: { cwd: effectiveCwd, settingSources: [] },
             }),

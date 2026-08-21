@@ -21,13 +21,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Picker } from "@/components/ui/picker";
 import { Textarea } from "@/components/ui/textarea";
 import {
   createCustomActionReq,
@@ -198,52 +192,42 @@ export const CustomActionEditor = ({
 
           <div className="grid gap-1.5">
             <Label>主 skill</Label>
-            <Select
-              value={draft.skill || undefined}
+            <Picker
+              value={draft.skill}
               disabled={!!editing}
-              onValueChange={(v) => {
-                if (v == null) return;
-                patch({ skill: v });
-              }}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue
-                  placeholder={
-                    editing
-                      ? draft.skill
-                      : mainSkillOptions.length === 0
-                        ? "没有可挂的 skill（先去 Skill tab 创建）"
-                        : "选一个 skill"
-                  }
-                >
-                  {draft.skill
-                    ? mainSkillOptions.find((s) => s.name === draft.skill)
-                        ?.name ?? draft.skill
-                    : null}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {mainSkillOptions.map((s) => (
-                  <SelectItem key={s.name} value={s.name}>
-                    <span className="flex min-w-0 flex-col items-start gap-0.5">
-                      <span
-                        className={cn(
-                          "w-full truncate font-medium",
-                          s.missing && "text-muted-foreground line-through",
-                        )}
-                      >
-                        {s.name}
-                      </span>
-                      {s.description ? (
-                        <span className="line-clamp-1 w-full min-w-0 text-xs text-muted-foreground">
-                          {s.description}
-                        </span>
-                      ) : null}
+              placeholder={
+                editing
+                  ? draft.skill
+                  : mainSkillOptions.length === 0
+                    ? "没有可挂的 skill（先去 Skill tab 创建）"
+                    : "选一个 skill"
+              }
+              onChange={(v) => patch({ skill: v })}
+              options={mainSkillOptions.map((s) => ({
+                value: s.name,
+                label: s.name,
+              }))}
+              renderOption={(option) => {
+                const s = mainSkillOptions.find((x) => x.name === option.value);
+                return (
+                  <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5 overflow-hidden">
+                    <span
+                      className={cn(
+                        "w-full truncate font-medium",
+                        s?.missing && "text-muted-foreground line-through",
+                      )}
+                    >
+                      {option.label}
                     </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+                    {s?.description ? (
+                      <span className="line-clamp-1 w-full min-w-0 text-xs text-muted-foreground">
+                        {s.description}
+                      </span>
+                    ) : null}
+                  </span>
+                );
+              }}
+            />
           </div>
 
           <div className="grid gap-1.5">

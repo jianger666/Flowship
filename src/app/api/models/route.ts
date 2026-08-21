@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { Cursor } from "@cursor/sdk";
 import type { CustomProviderFormat, ModelOption } from "@/lib/types";
+import { visibleModelParameters } from "@/lib/model-params";
 import { listCustomModels } from "@/lib/server/custom-provider";
 
 export const runtime = "nodejs";
@@ -25,8 +26,8 @@ const modelsCache = new Map<string, { models: ModelOption[]; ts: number }>();
 const cacheKeyOf = (body: RequestBody): string => {
   const fmt = body.format === "anthropic" ? "anthropic" : "openai";
   return body.baseUrl
-    ? `custom:${body.baseUrl}:${fmt}:${body.apiKey ?? ""}`
-    : `cursor:${body.apiKey ?? ""}`;
+    ? `custom-v4:${body.baseUrl}:${fmt}:${body.apiKey ?? ""}`
+    : `cursor-v3:${body.apiKey ?? ""}`;
 };
 
 // SDK 返回的 ModelListItem schema 比较杂、只挑前端实际要用的字段透传
@@ -37,7 +38,7 @@ const pickModelFields = (
   id: m.id,
   displayName: m.displayName ?? m.id,
   description: m.description,
-  parameters: m.parameters,
+  parameters: visibleModelParameters(m.parameters),
   variants: m.variants,
 });
 

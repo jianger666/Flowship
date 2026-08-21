@@ -165,7 +165,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>仓库列表</CardTitle>
+        <CardTitle>仓库</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {repos.length === 0 ? (

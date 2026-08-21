@@ -14,18 +14,19 @@
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
+import { bootArgsForTask } from "./agent-provider";
 import { getSettings } from "./local-store";
-import type {
-  ActionRecord,
-  ArtifactRevision,
-  AskUserAnswer,
-  GitBranchState,
-  McpHealth,
-  NewTaskInput,
-  PreviewSlotStatus,
-  Task,
-  TaskEvent,
-  TaskSummary,
+import {
+  type ActionRecord,
+  type ArtifactRevision,
+  type AskUserAnswer,
+  type GitBranchState,
+  type McpHealth,
+  type NewTaskInput,
+  type PreviewSlotStatus,
+  type Task,
+  type TaskEvent,
+  type TaskSummary,
 } from "./types";
 
 /**
@@ -240,6 +241,21 @@ export const setTaskModel = async (
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model }),
+  });
+  const data = await handleJson<{ task: Task }>(res);
+  return data.task;
+};
+
+/** 本窗口切提供方（可同时改写默认模型） */
+export const setTaskProvider = async (
+  id: string,
+  provider: string,
+  model?: ModelSelection,
+): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider, ...(model ? { model } : {}) }),
   });
   const data = await handleJson<{ task: Task }>(res);
   return data.task;
@@ -967,7 +983,7 @@ export const sendQueuedChatMessageNow = async (
  * bootArgs 无脑带上（服务重启 / 空闲回收后靠它 Agent.resume 接回会话）。
  */
 export const submitTaskQuestion = async (
-  taskId: string,
+  task: Task,
   text: string,
   images?: ImagePayload[],
   // 显式指定模型（V0.11.9）：传了 = 不续会话（会话模型换不了）、按后端分流换模型处理
@@ -978,7 +994,8 @@ export const submitTaskQuestion = async (
   skills?: Array<{ name: string; absPath: string }>,
 ): Promise<{ task: Task; persistWarning?: string }> => {
   const s = getSettings();
-  const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/question`, {
+  const boot = bootArgsForTask(task, s);
+  const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/question`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -988,10 +1005,8 @@ export const submitTaskQuestion = async (
         attachments && attachments.length > 0 ? attachments : undefined,
       skills: skills && skills.length > 0 ? skills : undefined,
       bootArgs: {
-        apiKey: s.apiKey,
-        model: s.defaultModel,
-        // 唤醒模式（会话接不回、原地续当前 action）要建 worktree / 提 MR、带上 PAT
-        // （host 由 server 按任务仓库 remote 现推）
+        apiKey: boot.apiKey,
+        model: boot.model,
         gitToken: s.gitToken,
       },
       forceModel: forceModel?.id?.trim() ? forceModel : undefined,
@@ -1136,7 +1151,7 @@ export const removeContextDoc = async (
 // ----------------- ask_user 回复（V0.3.2 + V0.5.6 deferred、V0.6 不变） -----------------
 
 export const submitAskReply = async (
-  taskId: string,
+  task: Task,
   askId: string,
   answers: AskUserAnswer[],
   // V0.8.3：imagesByQuestion key=questionId、每题各自绑各自的图（图-only 也算已答）
@@ -1159,8 +1174,9 @@ export const submitAskReply = async (
     : undefined;
   // V0.11.1：随手带会话恢复凭据——服务重启 / 空闲回收后答案靠它 Agent.resume 接回会话送达
   const s = getSettings();
+  const boot = bootArgsForTask(task, s);
   const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/ask-reply`,
+    `/api/tasks/${encodeURIComponent(task.id)}/ask-reply`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1176,8 +1192,8 @@ export const submitAskReply = async (
           ? { skills: options.skills }
           : {}),
         bootArgs: {
-          apiKey: s.apiKey,
-          model: s.defaultModel,
+          apiKey: boot.apiKey,
+          model: boot.model,
           gitToken: s.gitToken,
         },
       }),

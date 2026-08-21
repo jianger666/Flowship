@@ -15,7 +15,7 @@ import { toast } from "sonner";
 
 import { getSettings } from "@/lib/local-store";
 import { createTask } from "@/lib/task-store";
-import type { Task } from "@/lib/types";
+import { defaultModelForProvider, type Task } from "@/lib/types";
 
 export type CreateChatOptions = {
   /** 预绑工作目录；不传或 [] = Home（不绑仓） */
@@ -31,12 +31,14 @@ export const useNewChat = (onCreated: (task: Task) => void) => {
     setCreating(true);
     try {
       const s = getSettings();
-      const model = s.defaultModel?.id?.trim() ? s.defaultModel : undefined;
+      const defaultModel = defaultModelForProvider(s);
+      const model = defaultModel?.id?.trim() ? defaultModel : undefined;
       const task = await createTask({
         mode: "chat",
         title: "",
         repoPaths: options?.repoPaths ?? [],
         model,
+        provider: s.provider,
         // 跟随设置页「默认禁用 MCP」黑名单（对齐 task 模式 new-task-dialog），
         // 不传 = 黑名单空 = 全部 MCP 启用、不符合用户在设置页配的默认
         disabledMcpServers:

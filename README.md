@@ -67,7 +67,7 @@
 
 ```bash
 pnpm install
-pnpm dev          # http://127.0.0.1:8876
+pnpm dev:web      # http://localhost:8676（test 数据，HMR）
 pnpm typecheck
 pnpm lint
 pnpm test

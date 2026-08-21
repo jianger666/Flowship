@@ -53,9 +53,7 @@ import {
   formatRepoSectionForPrompt,
   getEffectiveCwd,
 } from "@/lib/path-utils";
-import { promises as fs } from "node:fs";
 import os from "node:os";
-import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { createRunPerfTracker } from "./run-perf";
@@ -65,6 +63,7 @@ import {
   createShellOutputDeltaPublisher,
 } from "./shell-output-bridge";
 import {
+  flushThinkingBuffer,
   handleSdkMessage,
   maybeEmitSubmitFixedText,
   type AssistantBufferCtx,
@@ -105,8 +104,18 @@ import {
   writeUserEventAndPublishStrict,
   type TaskStreamEvent,
 } from "./task-stream";
-import { MCP_HEALTH_LABEL } from "@/lib/types";
+import {
+  defaultModelForProvider,
+  MCP_HEALTH_LABEL,
+} from "@/lib/types";
 import type { Task } from "@/lib/types";
+import {
+  findCustomProvider,
+  migrateProviderSettings,
+  resolveTaskProvider,
+  sessionMatchesProvider,
+} from "@/lib/agent-provider";
+import { isCursorProvider } from "@/lib/types";
 import {
   beginChatQueueInFlight,
   dequeueChatMessage,
@@ -175,6 +184,8 @@ interface RunningChatRecord {
   // 切 workdir 懒重启用：chat-workdir-picker 改了 repoPaths 后发下条消息，比对决定续接还是重开
   //（此前只比 model/MCP → 同会话 send 仍用旧 cwd，P1.5 真 bug）。
   repoPaths: string[];
+  // 本会话启动时绑定的提供方（cursor / 某条自定义 id）。切提供方必开新会话，禁止跨后端 resume。
+  providerId: string;
 }
 
 interface ChatRunnerGlobalState {
@@ -348,6 +359,10 @@ export const getChatRunDisabledMcp = (taskId: string): string[] | null =>
  */
 export const getChatRunRepoPaths = (taskId: string): string[] | null =>
   runningChats.get(taskId)?.repoPaths ?? null;
+
+/** 读当前活 chat 会话绑定的提供方（无活会话返 null） */
+export const getChatRunProvider = (taskId: string): string | null =>
+  runningChats.get(taskId)?.providerId ?? null;
 
 /**
  * 等当前 chat Run 真退（轮询 runningChats、退了返 true、超时返 false）。
@@ -828,6 +843,7 @@ export const runChatSession = async (
     disabledMcpServers: task.disabledMcpServers ?? [],
     // 记下本会话绑定的 workdir（create 时 cwd）、供「切 workdir 懒重启」比对
     repoPaths: [...(task.repoPaths ?? [])],
+    providerId: task.provider ?? "cursor",
     cancel: () => {
       cancelled = true;
       if (run) void run.cancel().catch(() => {});
@@ -961,10 +977,20 @@ export const runChatSession = async (
     // SDK local 无 env 透传 → 启动前把 companyEnv 同步到固定路径供 skill 读
     const { syncCompanyEnvFileFromSettings } = await import("./company-env-fs");
     await syncCompanyEnvFileFromSettings();
+    const settingsResult = await readSettingsFile();
+    const providerSettings = migrateProviderSettings(
+      settingsResult.status === "ok" ? settingsResult.settings : {},
+    );
+    const providerId = resolveTaskProvider(task, providerSettings);
+    const recAtCreate = runningChats.get(task.id);
+    if (recAtCreate?.instanceId === myInstanceId) {
+      recAtCreate.providerId = providerId;
+    }
     agent = await withSdkDeadline(
       Agent.create({
         apiKey,
         model,
+        providerId,
         // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
         // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
         // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
@@ -1255,6 +1281,25 @@ export const resumeChatSession = async (
   const startToken = tryReserveChatStart(task.id);
   if (startToken === null) return null;
   try {
+    const settingsResult = await readSettingsFile();
+    const providerSettings = migrateProviderSettings(
+      settingsResult.status === "ok" ? settingsResult.settings : {},
+    );
+    const providerId = resolveTaskProvider(task, providerSettings);
+    if (
+      task.sessionAgentId &&
+      !sessionMatchesProvider(task.sessionAgentId, providerId)
+    ) {
+      console.warn(
+        `[chat-runner] task=${task.id} 落盘会话与当前提供方不一致，跳过 resume`,
+      );
+      void clearTaskSessionAgentIdIf(
+        task.id,
+        task.sessionAgentId,
+        () => !runningChats.has(task.id),
+      );
+      return null;
+    }
     // inline MCP 不随 resume 持久化、重传（同 runChatSession 的 merge 逻辑）
     const enrichedMcp = await enrichMcpServersWithOAuth(
       await resolveTaskMcpServers(task.disabledMcpServers),
@@ -1269,6 +1314,7 @@ export const resumeChatSession = async (
     const agent = await withSdkDeadline(
       Agent.resume(task.sessionAgentId, {
         apiKey: bootArgs.apiKey,
+        providerId,
         // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
         model: bootArgs.model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
@@ -1316,6 +1362,7 @@ export const resumeChatSession = async (
       model: bootArgs.model,
       disabledMcpServers: task.disabledMcpServers ?? [],
       repoPaths: [...(task.repoPaths ?? [])],
+      providerId,
       // claim 态没有真 run，stop（cancelChatRun 见 runActive 走 cancel）
       // 必须真正摘除本实例并记录 cancelled——owner 稍后 send 因 instanceId 不匹配
       // 整段 no-op，路由凭 cancelled 标记识别「用户已停止」、不再降级起新会话重放消息，
@@ -1368,21 +1415,33 @@ const RECONNECT_MAX = 5;
 const RECONNECT_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000, 30_000];
 
 // 服务端凭据兜底（重连时没有 client bootArgs）：读 config.json
-const readServerChatCreds = async (): Promise<{
+const readServerChatCreds = async (
+  task: Task,
+): Promise<{
   apiKey: string;
   model: ModelSelection;
 } | null> => {
-  try {
-    const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");
-    const cfg = JSON.parse(raw) as {
-      apiKey?: string;
-      defaultModel?: ModelSelection;
-    };
-    if (!cfg.apiKey || !cfg.defaultModel?.id) return null;
-    return { apiKey: cfg.apiKey, model: cfg.defaultModel };
-  } catch {
-    return null;
+  const result = await readSettingsFile();
+  if (result.status !== "ok") return null;
+  const migrated = migrateProviderSettings(result.settings);
+  const settings = {
+    apiKey:
+      typeof result.settings.apiKey === "string" ? result.settings.apiKey : "",
+    defaultModel: (result.settings.defaultModel as ModelSelection | undefined) ?? {
+      id: "",
+    },
+    customProviders: migrated.customProviders,
+  };
+  const providerId = resolveTaskProvider(task, settings);
+  const model = defaultModelForProvider(settings, providerId);
+  if (!model?.id?.trim()) return null;
+  if (isCursorProvider(providerId)) {
+    if (!settings.apiKey.trim()) return null;
+    return { apiKey: settings.apiKey, model };
   }
+  const cp = findCustomProvider(settings, providerId);
+  if (!cp?.baseUrl.trim()) return null;
+  return { apiKey: cp.apiKey ?? "", model };
 };
 
 // 可中断 sleep（1s 分片）：退避期间用户停止要立即生效
@@ -1525,7 +1584,7 @@ const runReconnectAttempt = async (
   if (staleInstanceId !== undefined) {
     closeChatSession(task.id, staleInstanceId, { keepPersisted: true });
   }
-  const creds = await readServerChatCreds();
+  const creds = await readServerChatCreds(fresh);
   if (!creds) return false;
   // 重连方是 reconnect prompt 的 owner——认领首发，排队消息等本 run 结束后统一 flush
   const claimedInstanceId = await resumeChatSession(fresh, creds, {
@@ -1837,6 +1896,7 @@ const consumeChatRun = async (
       // chat 主消息流接 instanceId lease（缺省 opHandle ≠ 永远 current 的语义已删）
       await handleSdkMessage(task.id, msg, ctx, chatLease);
     }
+    await flushThinkingBuffer(task.id, ctx, chatLease);
     await ctx.flush();
 
     if (hardTimer) {
@@ -2168,7 +2228,8 @@ export const deliverChatAskReply = async (
     // send_failed（已 close 会话）/ no_session → 落到下面 resume / 新会话
   }
 
-  const apiKey = bootArgs?.apiKey?.trim() || undefined;
+  const rawKey = bootArgs?.apiKey;
+  const apiKey = typeof rawKey === "string" ? rawKey : undefined;
   const model =
     bootArgs?.model && typeof bootArgs.model.id === "string"
       ? bootArgs.model
@@ -2176,7 +2237,8 @@ export const deliverChatAskReply = async (
 
   // 2) 服务重启 / 空闲回收后：Agent.resume 接回再 send
   // 本路径是 ask 答案的 owner——claimRun + ownerInstanceId，先发答案再 flush 队列
-  if (task.sessionAgentId && apiKey && model && !hasChatSession(task.id)) {
+  // 自定义允许空 Key（本地无鉴权），用 `!== undefined` 而不是 truthy
+  if (task.sessionAgentId && apiKey !== undefined && model && !hasChatSession(task.id)) {
     const claimedInstanceId = await resumeChatSession(task, { apiKey, model }, {
       claimRun: true,
     });
@@ -2197,7 +2259,7 @@ export const deliverChatAskReply = async (
   }
 
   // 3) 起新会话（答案作首条）——同 chat-reply 模式 2
-  if (!apiKey || !model) return false;
+  if (apiKey === undefined || !model) return false;
   if (hasChatSession(task.id)) {
     // race：resume 后别处又起了 run → 再试一次 send
     return (await sendChatMessage(task, replyText, imagePaths)) === "sent";

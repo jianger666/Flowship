@@ -13,11 +13,10 @@
  *   - tool_execution_end  → SDKMessage tool_call completed/error + onDelta tool-call-completed
  *   - bash_execution_update → onDelta shell-output-delta（归到最近 bash callId）
  *   - agent_settled       → run 结束（wait 返回 finished/cancelled）
+ *   - assistant stopReason=error → wait 返回 error（pi 不抛，写在会话消息里；
+ *     缺 finish_reason 的残缺收尾除外，当 finished）
  *
- * 已知能力差（vs cursor SDK，见 docs/pi-api-spec.md）：
- *   - pi 无 MCP：用户 MCP（飞书/context7）与 flowshipChat（ask_user/submit_work 等）
- *     暂未桥接进来——后续作为 pi 的 customTools 直连（见 AGENTS/交付说明）。
- *   - pi 无 task 子 agent 工具、无 delete 工具（内置 read/bash/edit/write/grep/find/ls）。
+ * MCP 已桥成 customTools（`mcp-tool-bridge.ts`）；子 agent 用进程内嵌套会话。
  */
 
 import path from "node:path";
@@ -39,10 +38,27 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 
+import {
+  OPENAI_STREAM_COMPAT,
+  fatalAssistantError,
+} from "@/lib/custom-openai-compat";
+import {
+  reasoningFieldsFromCatalog,
+  thinkingLevelFromParams,
+  type ThinkingLevelMap,
+} from "@/lib/custom-effort";
+import { customSdkBaseUrl } from "@/lib/custom-provider-url";
+import {
+  getModelsDevIndex,
+  lookupCatalogReasoning,
+} from "@/lib/server/models-dev-catalog";
+import { mcpDisplayName } from "@/lib/mcp-tool-name";
+
 import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
-import { buildCodingToolDefs } from "./pi-coding-tools";
 import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
+import { buildCodingToolDefs } from "./pi-coding-tools";
+import { injectSdkRgPath } from "./sdk-platform-bin";
 
 const PROVIDER_ID = "flowship-custom";
 // pi 原生里名字跟规范面一致的内置工具（read/grep/edit/write）；
@@ -83,8 +99,10 @@ interface ModelConfigEntry {
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
   contextWindow: number;
   maxTokens: number;
+  thinkingLevelMap?: ThinkingLevelMap;
   compat?: {
     supportsUsageInStreaming: boolean;
+    supportsFinishReason: boolean;
     maxTokensField: "max_tokens" | "max_completion_tokens";
   };
 }
@@ -94,48 +112,90 @@ type SendOptions = {
   onStep?: (args: { step: ConversationStep }) => void;
 };
 
+/**
+ * pi 把 HTTP 400 等失败写进 assistant 消息（stopReason=error），prompt() 不抛。
+ * 从消息里抠 errorMessage，供 run 以 error 收尾而不是卡死等 agent_settled。
+ */
+const readAssistantError = (msg: unknown): string | null => {
+  if (!msg || typeof msg !== "object") return null;
+  const m = msg as {
+    role?: unknown;
+    stopReason?: unknown;
+    errorMessage?: unknown;
+  };
+  if (m.role !== "assistant") return null;
+  if (m.stopReason !== "error" && m.stopReason !== "aborted") return null;
+  const raw =
+    typeof m.errorMessage === "string" && m.errorMessage.trim()
+      ? m.errorMessage.trim()
+      : `模型请求失败（${String(m.stopReason)}）`;
+  // 流已写完、只是上游没给 finish_reason：不当失败，否则 chat/task 的
+  // wait() 都过不了 finished 闸、正文后面跟一张红框。
+  return fatalAssistantError(raw);
+};
+
+const findAssistantError = (messages: unknown): string | null => {
+  if (!Array.isArray(messages)) return readAssistantError(messages);
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const err = readAssistantError(messages[i]);
+    if (err) return err;
+  }
+  return null;
+};
+
 // ----------------- Model / runtime 构造 -----------------
 
+type CatalogFields = ReturnType<typeof reasoningFieldsFromCatalog>;
+
 /** 把用户选/填的 model id 构造成 pi 的 ProviderConfigInput.models 条目 */
-const buildModelConfig = (modelId: string, format: Format): ModelConfigEntry => {
+const buildModelConfig = (
+  modelId: string,
+  format: Format,
+  fields: CatalogFields,
+): ModelConfigEntry => {
   const entry: ModelConfigEntry = {
     id: modelId,
     name: modelId,
     api: apiOf(format),
-    reasoning: false,
+    reasoning: fields.reasoning,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
   };
+  if (fields.thinkingLevelMap) entry.thinkingLevelMap = fields.thinkingLevelMap;
   if (format === "openai") {
-    // 自建 OpenAI 兼容端点建议显式 compat、避免按 baseUrl 探测失败
-    entry.compat = {
-      supportsUsageInStreaming: false,
-      maxTokensField: "max_tokens",
-    };
+    // 自建 OpenAI 兼容端点：不要按官方 OpenAI 严卡 finish_reason / usage 流字段
+    entry.compat = { ...OPENAI_STREAM_COMPAT };
   }
   return entry;
 };
 
 /** 直接构造 Model 实例（provider/baseUrl/api 齐、runtime 里也注册同款 provider） */
-const buildModel = (modelId: string, input: CustomAgentInput): Model<never> => {
+const buildModel = (
+  modelId: string,
+  input: CustomAgentInput,
+  fields: CatalogFields,
+): Model<never> => {
   const model = {
     id: modelId,
     name: modelId,
     api: apiOf(input.format),
     provider: PROVIDER_ID,
-    baseUrl: input.baseUrl,
-    reasoning: false,
+    baseUrl: customSdkBaseUrl(input.baseUrl, input.format),
+    reasoning: fields.reasoning,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
   } as unknown as Model<never>;
+  if (fields.thinkingLevelMap) {
+    (model as unknown as { thinkingLevelMap?: ThinkingLevelMap }).thinkingLevelMap =
+      fields.thinkingLevelMap;
+  }
   if (input.format === "openai") {
     (model as unknown as { compat?: unknown }).compat = {
-      supportsUsageInStreaming: false,
-      maxTokensField: "max_tokens",
+      ...OPENAI_STREAM_COMPAT,
     };
   }
   return model;
@@ -144,18 +204,30 @@ const buildModel = (modelId: string, input: CustomAgentInput): Model<never> => {
 /** 每次会话起一个独立 runtime + 注册 provider + 构造 Model */
 const buildRuntime = async (
   input: CustomAgentInput,
-): Promise<{ runtime: Awaited<ReturnType<typeof ModelRuntime.create>>; model: Model<never> }> => {
+): Promise<{
+  runtime: Awaited<ReturnType<typeof ModelRuntime.create>>;
+  model: Model<never>;
+  thinkingLevel: ReturnType<typeof thinkingLevelFromParams>;
+}> => {
   const modelId = input.model?.id?.trim() || "default";
+  const index = await getModelsDevIndex();
+  const hit = lookupCatalogReasoning(index, modelId);
+  const fields = reasoningFieldsFromCatalog(hit);
+  const thinkingLevel = thinkingLevelFromParams(
+    input.model?.params,
+    hit?.effortValues,
+  );
   const runtime = await ModelRuntime.create({ modelsPath: null });
+  const sdkBase = customSdkBaseUrl(input.baseUrl, input.format);
   // 注册 provider 让 runtime 能解析 apiKey + api 流实现；model 直接构造引用同 provider
   runtime.registerProvider(PROVIDER_ID, {
     name: "Custom",
-    baseUrl: input.baseUrl,
+    baseUrl: sdkBase,
     apiKey: input.apiKey,
     api: apiOf(input.format),
-    models: [buildModelConfig(modelId, input.format)],
+    models: [buildModelConfig(modelId, input.format, fields)],
   });
-  return { runtime, model: buildModel(modelId, input) };
+  return { runtime, model: buildModel(modelId, input, fields), thinkingLevel };
 };
 
 // ----------------- Flowship 自有工具桥接（pi customTools） -----------------
@@ -244,6 +316,7 @@ const runSubagent = async (
     runtime: Awaited<ReturnType<typeof ModelRuntime.create>>;
     model: Model<never>;
     cwd: string;
+    thinkingLevel: ReturnType<typeof thinkingLevelFromParams>;
   },
 ): Promise<string> => {
   const { session } = await createAgentSession({
@@ -252,6 +325,7 @@ const runSubagent = async (
     modelRuntime: opts.runtime,
     model: opts.model,
     tools: [...SUBAGENT_TOOLS],
+    thinkingLevel: opts.thinkingLevel,
     // 子 agent 不落会话文件（一次性）
     sessionManager: SessionManager.inMemory(opts.cwd),
   });
@@ -262,6 +336,9 @@ const runSubagent = async (
         if (ev.type === "message_update") {
           const inner = ev.assistantMessageEvent;
           if (inner?.type === "text_delta" && inner.delta) result += inner.delta;
+        } else if (ev.type === "agent_end" && !ev.willRetry) {
+          unsub();
+          resolve();
         } else if (ev.type === "agent_settled") {
           unsub();
           resolve();
@@ -292,6 +369,7 @@ const buildCustomTools = (
   subagentRuntime: Awaited<ReturnType<typeof ModelRuntime.create>>,
   subagentModel: Model<never>,
   mcpToolDefs: ToolDefinition[],
+  thinkingLevel: ReturnType<typeof thinkingLevelFromParams>,
 ): ToolDefinition[] => [
   ...flowShipTools.map(
     (t) =>
@@ -307,7 +385,12 @@ const buildCustomTools = (
       }) as unknown as ToolDefinition,
   ),
   ...buildCodingToolDefs(cwd, (prompt) =>
-    runSubagent(prompt, { runtime: subagentRuntime, model: subagentModel, cwd }),
+    runSubagent(prompt, {
+      runtime: subagentRuntime,
+      model: subagentModel,
+      cwd,
+      thinkingLevel,
+    }),
   ),
   ...mcpToolDefs,
 ];
@@ -323,6 +406,8 @@ class PiRunAdapter {
   private toolArgs = new Map<string, { name: string; args: unknown }>();
   private ended = false;
   private cancelled = false;
+  /** pi 把 API 失败写在 assistant 消息里，先记下、settle 时带出去 */
+  private lastAssistantError: string | null = null;
   private endResolve: ((r: RunWaitResult) => void) | null = null;
   private endPromise: Promise<RunWaitResult>;
   private unsub: (() => void) | null = null;
@@ -389,12 +474,13 @@ class PiRunAdapter {
             this.push({ type: "thinking", text: inner.delta } as unknown as SDKMessage);
           } else if (inner.type === "toolcall_end" && inner.toolCall) {
             const tc = inner.toolCall;
-            this.toolArgs.set(tc.id, { name: tc.name, args: tc.arguments });
+            const displayName = mcpDisplayName(tc.name);
+            this.toolArgs.set(tc.id, { name: displayName, args: tc.arguments });
             // 工具开始：SDKMessage running + onDelta tool-call-started
             this.push({
               type: "tool_call",
               call_id: tc.id,
-              name: tc.name,
+              name: displayName,
               args: tc.arguments,
               status: "running",
             } as unknown as SDKMessage);
@@ -402,22 +488,54 @@ class PiRunAdapter {
               type: "tool-call-started",
               callId: tc.id,
               toolCall: {
-                type: tc.name === "bash" ? "shell" : tc.name,
-                args: { toolName: tc.name },
+                type: displayName === "bash" ? "shell" : displayName,
+                args: { toolName: displayName },
               },
             } as unknown as InteractionUpdate);
           }
           break;
         }
+        case "message_end": {
+          const err = readAssistantError(ev.message);
+          if (err) this.lastAssistantError = err;
+          break;
+        }
+        case "agent_end": {
+          if (ev.willRetry) break;
+          const err =
+            findAssistantError(ev.messages) ?? this.lastAssistantError;
+          if (err) {
+            this.lastAssistantError = err;
+            // pi 的 HTTP 400 写在 assistant 消息里、prompt() 不抛；不在这里 settle
+            // 的话可能永远等不到 agent_settled，UI 卡在「正在发送首包…」
+            this.settle({ status: "error", result: err });
+          }
+          break;
+        }
+        case "auto_retry_end": {
+          if (!ev.success) {
+            const err = fatalAssistantError(
+              ev.finalError || this.lastAssistantError || "模型请求失败",
+            );
+            // 缺 finish_reason：正文已在，按成功收尾，避免再等 agent_settled
+            this.settle(
+              err
+                ? { status: "error", result: err }
+                : { status: this.cancelled ? "cancelled" : "finished" },
+            );
+          }
+          break;
+        }
         case "tool_execution_end": {
+          const displayName = mcpDisplayName(ev.toolName);
           const cached = this.toolArgs.get(ev.toolCallId) ?? {
-            name: ev.toolName,
+            name: displayName,
             args: {},
           };
           this.push({
             type: "tool_call",
             call_id: ev.toolCallId,
-            name: ev.toolName,
+            name: cached.name,
             args: cached.args,
             status: ev.isError ? "error" : "completed",
             result: ev.result,
@@ -426,7 +544,7 @@ class PiRunAdapter {
             type: "tool-call-completed",
             callId: ev.toolCallId,
             toolCall: {
-              type: ev.toolName === "bash" ? "shell" : ev.toolName,
+              type: cached.name === "bash" ? "shell" : cached.name,
               result: {
                 status: ev.isError ? "error" : "success",
                 value: typeof ev.result === "object" ? ev.result : { output: ev.result },
@@ -445,9 +563,19 @@ class PiRunAdapter {
           break;
         }
         case "agent_settled": {
-          this.settle({
-            status: this.cancelled ? "cancelled" : "finished",
-          });
+          const fromState =
+            this.session.state.errorMessage?.trim() ||
+            findAssistantError(this.session.state.messages);
+          const err = fatalAssistantError(
+            this.lastAssistantError ?? fromState,
+          );
+          if (err && !this.cancelled) {
+            this.settle({ status: "error", result: err });
+          } else {
+            this.settle({
+              status: this.cancelled ? "cancelled" : "finished",
+            });
+          }
           break;
         }
         default:
@@ -529,17 +657,31 @@ const buildAdapter = async (
 export const createCustomAgent = async (
   input: CustomAgentInput,
 ): Promise<PiAgentAdapter> => {
+  // pi grep 找 PATH 上的 rg；instrumentation 已注入，这里再幂等一次防 HMR / 测试没走启动钩子
+  injectSdkRgPath();
   const cwd = input.local?.cwd || process.cwd();
-  const { runtime, model } = await buildRuntime(input);
+  const { runtime, model, thinkingLevel } = await buildRuntime(input);
   const callerToken = extractCallerToken(input.mcpServers);
   const mcp = await bridgeUserMcpServers(input.mcpServers);
+  // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
+  // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
+  // 全部过滤掉，模型只看到 read/edit/write/grep。
+  const customTools = buildCustomTools(
+    callerToken,
+    cwd,
+    runtime,
+    model,
+    mcp.toolDefs,
+    thinkingLevel,
+  );
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
-    tools: [...NATIVE_TOOLS],
-    customTools: buildCustomTools(callerToken, cwd, runtime, model, mcp.toolDefs),
+    thinkingLevel,
+    tools: [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
+    customTools,
     sessionManager: SessionManager.create(cwd, piSessionDir()),
   });
   const agentId = session.sessionFile ?? session.sessionId;
@@ -550,10 +692,20 @@ export const resumeCustomAgent = async (
   agentId: string,
   input: CustomAgentInput,
 ): Promise<PiAgentAdapter> => {
+  injectSdkRgPath();
   const cwd = input.local?.cwd || process.cwd();
-  const { runtime, model } = await buildRuntime(input);
+  const { runtime, model, thinkingLevel } = await buildRuntime(input);
   const callerToken = extractCallerToken(input.mcpServers);
   const mcp = await bridgeUserMcpServers(input.mcpServers);
+  // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
+  const customTools = buildCustomTools(
+    callerToken,
+    cwd,
+    runtime,
+    model,
+    mcp.toolDefs,
+    thinkingLevel,
+  );
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接；
   // 打开失败（文件被清 / 不兼容）会抛、由调用方按 cursor 的 resume 失败口径降级新会话。
   const sessionManager = SessionManager.open(agentId, piSessionDir(), cwd);
@@ -562,8 +714,9 @@ export const resumeCustomAgent = async (
     agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
-    tools: [...NATIVE_TOOLS],
-    customTools: buildCustomTools(callerToken, cwd, runtime, model, mcp.toolDefs),
+    thinkingLevel,
+    tools: [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
+    customTools,
     sessionManager,
   });
   return buildAdapter(session, agentId, mcp.closeAll);
@@ -581,6 +734,7 @@ export const promptOnceCustom = async (
     agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
+    thinkingLevel: "off",
     noTools: "all",
     // 一次性标题生成：不落会话文件
     sessionManager: SessionManager.inMemory(cwd),
@@ -592,6 +746,9 @@ export const promptOnceCustom = async (
         if (ev.type === "message_update") {
           const inner = ev.assistantMessageEvent;
           if (inner?.type === "text_delta" && inner.delta) result += inner.delta;
+        } else if (ev.type === "agent_end" && !ev.willRetry) {
+          unsub();
+          resolve();
         } else if (ev.type === "agent_settled") {
           unsub();
           resolve();

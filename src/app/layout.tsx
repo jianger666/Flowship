@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Providers } from "@/components/providers";
 import { AppShell } from "@/components/app-shell";
 import { Toaster } from "@/components/ui/sonner";
+import { SEARCH_HIGHLIGHT_CSS } from "@/lib/search-highlight-css";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -23,6 +24,8 @@ const RootLayout = ({ children }: { children: React.ReactNode }) => {
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <body className="h-screen overflow-hidden bg-background text-foreground antialiased">
+        {/* ::highlight 不能进 globals.css（见 search-highlight-css.ts），inline 避开 Lightning CSS */}
+        <style dangerouslySetInnerHTML={{ __html: SEARCH_HIGHLIGHT_CSS }} />
         <Providers>
           <AppShell>{children}</AppShell>
           {/* Windows 右上角是系统窗口按钮区域，toast 放 top-center 并下移到 56px 标题栏下方。 */}

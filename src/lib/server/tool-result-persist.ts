@@ -9,6 +9,9 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { isMcpToolName } from "@/lib/mcp-tool-name";
+import { humanizeToolErrorText } from "@/lib/tool-error-text";
+
 import { renameWithRetry } from "./data-root";
 import { stringifyMeta } from "./task-stream";
 import { taskDir, TOOL_OUTPUTS_DIR } from "./task-fs-core";
@@ -199,13 +202,22 @@ export const extractToolOutputText = (
   result: unknown,
 ): string => {
   if (result == null) return "";
-  if (typeof result === "string") return result;
+  if (typeof result === "string") return humanizeToolErrorText(result) || result;
 
   const env = asRecord(result) as ResultEnvelope | null;
   if (!env) return stringifyMeta(result);
 
   if (env.status === "error") {
-    return stringifyMeta(env.error ?? result);
+    return (
+      humanizeToolErrorText(env.error ?? result) ||
+      stringifyMeta(env.error ?? result)
+    );
+  }
+
+  // pi customTools：{ content: [{ type: "text", text }], details }，没有 status 信封
+  if (Array.isArray((env as Record<string, unknown>).content)) {
+    const human = humanizeToolErrorText(result);
+    if (human) return human;
   }
 
   const value = env.value;
@@ -263,7 +275,7 @@ export const resolveToolResultStatus = (
   const env = asRecord(result) as ResultEnvelope | null;
   if (env?.status === "error") return "error";
   if (
-    toolName.startsWith("mcp:") &&
+    isMcpToolName(toolName) &&
     env?.value &&
     env.value.isError === true
   ) {

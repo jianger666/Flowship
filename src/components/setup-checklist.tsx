@@ -3,7 +3,7 @@
 /**
  * 首页「开始使用」就绪清单（v1.0.x、用户拍板「保证新用户进来就去配置安装飞书工具」）
  *
- * 五项就绪度：① Cursor API Key ② 飞书工具 ③ GitLab Token ④ 至少一个仓库 ⑤ 我的角色。
+ * 五项就绪度：① 模型（凭据 + 默认模型）② 飞书工具 ③ GitLab Token ④ 至少一个仓库 ⑤ 我的角色。
  * 任一未完成 → 首页看板位置显示本清单；全部就绪 → 自动消失、首页变正常飞书排期看板。
  * 已配好的老用户永远看不到这张卡（stickyReady：曾经就绪过就不再闪清单）。
  *
@@ -18,7 +18,9 @@ import { ArrowRight, CheckCircle2, Circle } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { buttonVariants } from "@/components/ui/button";
 import { useSettings } from "@/hooks/use-settings";
+import { hasActiveModelCreds } from "@/lib/agent-provider";
 import { settingsUrl } from "@/lib/settings-link";
+import { defaultModelForProvider } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** 曾经全部就绪过就记一笔——回工作台不再因飞书 CLI 瞬态失败闪清单 */
@@ -35,7 +37,8 @@ export interface SetupGate {
   loading: boolean;
   /** 五项全就绪（含 sticky：曾经就绪过也算） */
   ready: boolean;
-  apiKeyReady: boolean;
+  /** 当前 provider 凭据齐 + 已选默认模型（两项都在设置页「模型」卡） */
+  modelReady: boolean;
   feishuReady: boolean;
   gitReady: boolean;
   reposReady: boolean;
@@ -46,7 +49,7 @@ export interface SetupGate {
  * 就绪度判定 hook（HomePage 用它决定渲染看板还是清单）。
  * 未就绪时 3s 轮询 CLI 状态（安装 / 登录都是后台流程、配完回来打勾要实时）；就绪即停。
  * stickyReady 为 true 时跳过 CLI 轮询（老用户不必再探、飞书真掉登录靠看板降级引导）。
- * settings 项（API Key / GitLab Token / 仓库 / 角色）走 useSettings 响应式判定、设置页改完回来 remount 天然拿最新。
+ * settings 项（模型凭据+默认模型 / GitLab Token / 仓库 / 角色）走 useSettings 响应式判定、设置页改完回来 remount 天然拿最新。
  */
 export const useSetupGate = (): SetupGate => {
   const { settings, loaded } = useSettings();
@@ -60,7 +63,12 @@ export const useSetupGate = (): SetupGate => {
   // CLI 状态至少拉到过一次（接口失败也算、避免接口挂了首页永远 loading）
   const [cliLoaded, setCliLoaded] = useState(false);
 
-  const apiKeyReady = loaded && !!settings.apiKey?.trim();
+  // custom-only 用户没有顶层 Cursor apiKey，改看当前 provider 凭据是否齐备；
+  // 默认模型跟凭据同一张卡，没选就不算就绪（新建对话没有模型可跟）
+  const modelReady =
+    loaded &&
+    hasActiveModelCreds() &&
+    !!defaultModelForProvider(settings).id.trim();
   const gitReady = loaded && !!settings.gitToken?.trim();
   const reposReady = loaded && settings.repos.length > 0;
   const roleReady = loaded && !!settings.userRole;
@@ -73,7 +81,7 @@ export const useSetupGate = (): SetupGate => {
 
   // 实时五项判定（不含 sticky）
   const liveReady =
-    apiKeyReady && feishuReady && gitReady && reposReady && roleReady;
+    modelReady && feishuReady && gitReady && reposReady && roleReady;
 
   // 首次 liveReady → 落 sticky、老用户回工作台不再闪清单
   useEffect(() => {
@@ -114,7 +122,7 @@ export const useSetupGate = (): SetupGate => {
     // sticky 时只等 settings；否则还要等 CLI 至少拉过一次
     loading: stickyReady ? !loaded : !loaded || !cliLoaded,
     ready: liveReady || stickyReady,
-    apiKeyReady,
+    modelReady,
     feishuReady,
     gitReady,
     reposReady,
@@ -179,11 +187,11 @@ export const SetupChecklist = ({ gate }: { gate: SetupGate }) => {
       <Card className="mt-6 py-0">
         <CardContent className="divide-y p-0">
           <StepRow
-            done={gate.apiKeyReady}
+            done={gate.modelReady}
             index={1}
-            title="Cursor API Key"
-            hint="AI 跑任务的凭据"
-            focus="api-key"
+            title="模型"
+            hint="凭据和默认模型"
+            focus="model"
           />
           <StepRow
             done={gate.feishuReady}

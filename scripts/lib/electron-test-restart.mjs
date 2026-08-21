@@ -174,6 +174,32 @@ export function buildQuitTestAppSpec(platform = process.platform) {
   );
 }
 
+/**
+ * 进程级精确退出 FlowshipTest（用作 osascript 优雅退出被 TCC 拦 / 超时后的降级）。
+ * 只精确匹配测试应用进程名、不碰正式 Flowship；进程未运行时不视为错误。
+ */
+export function buildForceQuitTestAppSpec(platform = process.platform) {
+  if (platform === "darwin") {
+    return {
+      command: "pkill",
+      args: ["-x", TEST_PRODUCT_NAME],
+      ignoreFailure: true,
+    };
+  }
+  if (platform === "win32") {
+    return {
+      command: "taskkill",
+      args: ["/IM", `${TEST_PRODUCT_NAME}.exe`, "/F"],
+      ignoreFailure: true,
+    };
+  }
+
+  throw new Error(
+    `electron:test:restart 仅支持 macOS 与 Windows，当前 platform=${platform}`,
+  );
+}
+
+
 /** 查询 FlowshipTest 主进程；只匹配测试应用的精确进程名。 */
 export function buildTestAppProcessProbeSpec(platform = process.platform) {
   if (platform === "darwin") {

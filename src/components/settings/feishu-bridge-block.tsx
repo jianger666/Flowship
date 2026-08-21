@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import {
+  AlertTriangle,
   CheckCircle2,
   ExternalLink,
   Loader2,
@@ -27,6 +28,13 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { SettingRow } from "@/components/ui/setting-row";
 import { Switch } from "@/components/ui/switch";
+import {
+  FEISHU_CONSUMER_LABEL,
+  feishuConsumerIssueDetail,
+  feishuConsumerIssueTone,
+  isFeishuConsumerBlocking,
+  type FeishuCheckTone,
+} from "@/lib/feishu-bridge-display";
 import { formatRelative } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
 
@@ -77,50 +85,50 @@ interface BridgeStatusPayload {
   error?: string;
 }
 
-/** consumer 事件 key → 人话标题 */
-const CONSUMER_LABEL: Record<string, string> = {
-  "im.message.receive_v1": "收消息",
-  "card.action.trigger": "卡片按钮",
-};
-
-/** 问题行的说明：讲作用、不讲技术细节（2026-07-19 用户反馈） */
-const CONSUMER_HINT: Record<string, string> = {
-  "im.message.receive_v1": "恢复后才能在飞书里回消息",
-  "card.action.trigger": "开通后可直接点卡片按钮答题",
-};
+const CHECK_TONE_ICON = {
+  ok: { Icon: CheckCircle2, className: "text-success" },
+  warning: { Icon: AlertTriangle, className: "text-warning" },
+  error: { Icon: XCircle, className: "text-destructive" },
+} as const;
 
 const CheckRow = ({
   ok,
+  tone,
   title,
   detail,
   action,
 }: {
-  ok: boolean;
+  ok?: boolean;
+  /** 覆盖 ok：conflict 用 warning，不当成失败红叉 */
+  tone?: FeishuCheckTone;
   title: string;
   detail?: string;
   action?: ReactNode;
-}) => (
-  <div className="flex items-start gap-2.5 py-2">
-    {ok ? (
-      <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-success" />
-    ) : (
-      <XCircle className="mt-0.5 size-4 shrink-0 text-destructive" />
-    )}
-    <div className="min-w-0 flex-1">
-      <div
-        className={cn("text-sm font-medium", ok && "text-muted-foreground")}
-      >
-        {title}
-      </div>
-      {detail && (
-        <div className="mt-0.5 text-xs text-muted-foreground wrap-anywhere">
-          {detail}
+}) => {
+  const resolved: FeishuCheckTone = tone ?? (ok ? "ok" : "error");
+  const { Icon, className: iconClass } = CHECK_TONE_ICON[resolved];
+  return (
+    <div className="flex items-start gap-2.5 py-2">
+      <Icon className={cn("mt-0.5 size-4 shrink-0", iconClass)} />
+      <div className="min-w-0 flex-1">
+        <div
+          className={cn(
+            "text-sm font-medium",
+            resolved === "ok" && "text-muted-foreground",
+          )}
+        >
+          {title}
         </div>
-      )}
+        {detail && (
+          <div className="mt-0.5 text-xs text-muted-foreground wrap-anywhere">
+            {detail}
+          </div>
+        )}
+      </div>
+      {action && <div className="shrink-0">{action}</div>}
     </div>
-    {action && <div className="shrink-0">{action}</div>}
-  </div>
-);
+  );
+};
 
 /** 外链「去开通 / 去订阅」——base-ui Button 无 asChild，用 buttonVariants 套 a */
 const OpenAuthLink = ({ href, label = "去开通" }: { href: string; label?: string }) => (
@@ -265,16 +273,35 @@ export const FeishuBridgeBlock = ({
   const allGreen =
     !!status?.cli?.ok && !!status?.scopes?.ok && !!status?.cardkit?.ok;
 
-  // 监听器里需要用户处理的问题行（unsupported/conflict/error）
-  const problemConsumers = (status?.runtime?.consumers ?? []).filter((c) =>
+  const consumers = status?.runtime?.consumers ?? [];
+  // 没开通 / 监听挂了才算坏；conflict = 本机另一处已占长连接，飞书往往仍可用
+  const blockingConsumers = consumers.filter((c) =>
+    isFeishuConsumerBlocking(c.status),
+  );
+  const attentionConsumers = consumers.filter((c) =>
     ["unsupported", "conflict", "error"].includes(c.status),
   );
-  // 全绿（含收到过消息、无问题监听器、群 @ 认得出）→ 检查区收成一行（用户反馈：四行占空间）
+  // 全绿（含收到过消息、无阻塞监听故障、群 @ 认得出）→ 检查区收成一行
+  // conflict 不挡收拢：自检已绿说明飞书在收，只在底下留注意行
   const allChecksOk =
     allGreen &&
     (!!status?.runtime?.lastInboundAt || !!status?.runtime?.everInbound) &&
     !status?.runtime?.groupMentionUnavailable &&
-    problemConsumers.length === 0;
+    blockingConsumers.length === 0;
+
+  const consumerIssueRows = attentionConsumers.map((c) => (
+    <CheckRow
+      key={c.eventKey}
+      tone={feishuConsumerIssueTone(c.status)}
+      title={FEISHU_CONSUMER_LABEL[c.eventKey] ?? c.eventKey}
+      detail={feishuConsumerIssueDetail(c)}
+      action={
+        c.subscribeUrl ? (
+          <OpenAuthLink href={c.subscribeUrl} label="去订阅" />
+        ) : undefined
+      }
+    />
+  ));
 
   return (
     <div className="space-y-1 border-t pt-3">
@@ -298,16 +325,19 @@ export const FeishuBridgeBlock = ({
                 <LoadingState variant="inline" />
               </div>
             ) : allChecksOk ? (
-              // 全绿收成一行（2026-07-19 用户反馈：四行占空间）；任一有问题才展开逐项
-              <CheckRow
-                ok
-                title="前置检查全部通过"
-                detail={`连接 / 权限 / 卡片 / 收消息${
-                  status?.runtime?.lastInboundAt
-                    ? `（最近收到：${formatRelative(status.runtime.lastInboundAt)}）`
-                    : ""
-                }`}
-              />
+              // 全绿收成一行（2026-07-19 用户反馈：四行占空间）；阻塞项才展开逐项
+              <>
+                <CheckRow
+                  ok
+                  title="前置检查全部通过"
+                  detail={`连接 / 权限 / 卡片 / 收消息${
+                    status?.runtime?.lastInboundAt
+                      ? `（最近收到：${formatRelative(status.runtime.lastInboundAt)}）`
+                      : ""
+                  }`}
+                />
+                {consumerIssueRows}
+              </>
             ) : (
               <>
                 <CheckRow
@@ -381,23 +411,7 @@ export const FeishuBridgeBlock = ({
                 {/* 监听器只展示「需要用户动作/关注」的问题行（unsupported/conflict/error）；
                     ready 正常态和启动瞬态（starting/stopped/backoff 几秒内自愈）不展示、
                     避免误解（2026-07-19 用户反馈：正常也一排 stopped 很吓人） */}
-                {(status?.runtime?.consumers ?? [])
-                  .filter((c) =>
-                    ["unsupported", "conflict", "error"].includes(c.status),
-                  )
-                  .map((c) => (
-                    <CheckRow
-                      key={c.eventKey}
-                      ok={false}
-                      title={CONSUMER_LABEL[c.eventKey] ?? c.eventKey}
-                      detail={CONSUMER_HINT[c.eventKey] ?? c.lastError}
-                      action={
-                        c.subscribeUrl ? (
-                          <OpenAuthLink href={c.subscribeUrl} label="去订阅" />
-                        ) : undefined
-                      }
-                    />
-                  ))}
+                {consumerIssueRows}
               </>
             )}
           </div>

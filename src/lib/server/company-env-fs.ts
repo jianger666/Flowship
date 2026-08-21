@@ -35,6 +35,7 @@ export const loadCompanyEnvBriefSection = async (): Promise<string> => {
       env,
       companyEnvFilePath(),
       path.join(process.cwd(), "scripts", "ssh-exec.mjs"),
+      path.join(process.cwd(), "scripts", "pg-exec.mjs"),
     );
   } catch {
     return "";
@@ -49,6 +50,7 @@ export const companyEnvBriefFromEnv = (
     env ?? null,
     companyEnvFilePath(),
     path.join(process.cwd(), "scripts", "ssh-exec.mjs"),
+    path.join(process.cwd(), "scripts", "pg-exec.mjs"),
   );
 
 /** 把 CompanyEnv 原子写到 company-env.json（0600） */

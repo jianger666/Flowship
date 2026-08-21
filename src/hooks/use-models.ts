@@ -4,7 +4,7 @@
  * 拉模型列表的 hook（cursor 与自定义 provider 共用）
  *
  * 抽出来主要解决两件事：
- * 1. race condition：用户连点「验证」或先后改凭据再点、之前实现里
+ * 1. race condition：用户连点「获取列表」或先后改凭据再点、之前实现里
  *    后发请求未必后到、可能用旧响应覆盖新响应
  *    → AbortController + ref：每次新请求 abort 旧的、AbortError 静默吞掉
  * 2. 把 settings 页里跟模型相关的 4 个 state（models / loading / error / abort ref）打包
@@ -19,23 +19,30 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import type { CustomProviderFormat, ModelOption } from "@/lib/types";
+import type { AgentProviderId, CustomProviderFormat, ModelOption } from "@/lib/types";
 
 export interface ModelsFetchInput {
   apiKey: string;
   /** 自定义 provider 的 baseUrl；有值走 /v1/models、无值走 Cursor SDK */
   baseUrl?: string;
   format?: CustomProviderFormat;
+  /** 当前 Agent 后端，参与缓存 key 区分（cursor / custom） */
+  provider?: AgentProviderId;
+}
+
+export interface ModelsFetchOptions {
+  /** 用户手动触发（如点「获取列表」）：即使命中缓存也要转圈 + 成功/失败 toast，避免“点击没效果” */
+  manual?: boolean;
 }
 
 export interface UseModelsResult {
   models: ModelOption[];
   loading: boolean;
   error: string;
-  fetchModels: (input: ModelsFetchInput) => Promise<void>;
+  fetchModels: (input: ModelsFetchInput, options?: ModelsFetchOptions) => Promise<void>;
 }
 
-const CACHE_KEY = "flowship:models-cache";
+const CACHE_KEY = "flowship:models-cache:v5";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // 凭据摘要：缓存归属判定用（不存明文、本地工具够用的弱指纹）
@@ -43,7 +50,8 @@ const keyHashOf = (input: ModelsFetchInput): string => {
   const apiKey = input.apiKey ?? "";
   const fmt = input.format ?? "";
   const baseUrl = input.baseUrl ?? "";
-  return `${apiKey.length}:${apiKey.slice(0, 4)}:${apiKey.slice(-4)}|${baseUrl}|${fmt}`;
+  const provider = input.provider ?? "";
+  return `${provider}|${apiKey.length}:${apiKey.slice(0, 4)}:${apiKey.slice(-4)}|${baseUrl}|${fmt}`;
 };
 
 interface ModelsCache {
@@ -89,7 +97,8 @@ export const useModels = (): UseModelsResult => {
   // 当前 in-flight 请求的 controller、新请求来时 abort 旧的
   const abortRef = useRef<AbortController | null>(null);
 
-  const fetchModels = useCallback(async (input: ModelsFetchInput) => {
+  const fetchModels = useCallback(async (input: ModelsFetchInput, options?: ModelsFetchOptions) => {
+    const manual = options?.manual ?? false;
     abortRef.current?.abort();
 
     const trimmedKey = input.apiKey?.trim() ?? "";
@@ -103,16 +112,21 @@ export const useModels = (): UseModelsResult => {
     }
 
     // SWR：缓存命中先出数据、后台静默刷新（silent=true 时不转圈、错误不打扰）
+    // 手动触发（manual=true）时即使有缓存也走非静默：要转圈 + toast，避免用户觉得“点击没效果”
     const normalized: ModelsFetchInput = {
+      provider: input.provider,
       apiKey: trimmedKey,
       baseUrl: trimmedBaseUrl || undefined,
       format: input.format,
     };
     const cached = readCache(normalized);
-    const silent = cached !== null;
+    const silent = cached !== null && !manual;
     if (cached) {
       setModels(cached);
       setError("");
+    } else {
+      // 缓存未命中立刻清空——切 provider 时别把上一侧的列表（composer-2.5 等）留在下拉里
+      setModels([]);
     }
 
     const ctrl = new AbortController();
@@ -128,6 +142,7 @@ export const useModels = (): UseModelsResult => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           apiKey: trimmedKey,
+          ...(input.provider ? { provider: input.provider } : {}),
           ...(trimmedBaseUrl ? { baseUrl: trimmedBaseUrl } : {}),
           ...(input.format ? { format: input.format } : {}),
         }),
@@ -144,18 +159,25 @@ export const useModels = (): UseModelsResult => {
           setModels([]);
           setError(json.error || "拉取失败");
         }
+        // 手动触发必须让用户看到失败原因，不能只把错误丢在偏好卡里
+        if (manual) {
+          toast.error(json.error || `拉取失败（HTTP ${res.status}）`);
+        }
         return;
       }
       const fresh: ModelOption[] = json.models || [];
       setModels(fresh);
       writeCache(normalized, fresh);
-      // 静默刷新不弹 toast、首次（或缓存失效后）拉取保留成功提示
-      if (!silent) toast.success(`已加载 ${fresh.length} 个模型`);
+      // 只在用户手动触发时弹成功 toast；自动拉取（进设置页/后台刷新/首次预热）不打扰
+      if (manual) toast.success(`已加载 ${fresh.length} 个模型`);
     } catch (err) {
       // AbortError 是用户主动 abort（比如点了第二次「验证」）、不视为错误
       if (err instanceof DOMException && err.name === "AbortError") return;
       if (ctrl.signal.aborted) return;
       if (!silent) setError(err instanceof Error ? err.message : String(err));
+      if (manual) {
+        toast.error(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       // abort 的请求其 loading 状态已被新请求接管、这里别覆盖
       if (!ctrl.signal.aborted && !silent) setLoading(false);

@@ -4,27 +4,20 @@
  * 「偏好」卡内容（v1.0.x 设置整合二次修——用户实测「还是有点乱」后定型）
  *
  * 布局定式：**统一设置行**（对标 VS Code / Linear）——每项一行、左边「名称 + 一句说明」、
- * 右边控件右对齐；宽控件（分支模板 / 模型选择）用堆叠行（名称行 + 全宽控件）。
+ * 右边控件右对齐；宽控件（分支模板）用堆叠行（名称行 + 全宽控件）。
  * 行间 divide-y 出结构、不再用小节头（三层文字层级挤在一起就是「乱」的根源）。
  *
- * 原 user-profile-card（IDE + 分支模板）/ model-card（默认模型）已并入本文件、单一来源。
+ * 原 user-profile-card（IDE + 分支模板）已并入本文件；默认模型在设置页「模型」卡。
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { Loader2, RefreshCw } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
-import { ModelSelect } from "@/components/ui/model-select";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Picker } from "@/components/ui/picker";
 import { SettingRow } from "@/components/ui/setting-row";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -40,8 +33,6 @@ import {
   USER_ROLE_LABEL,
   USER_ROLES,
   type JumpIde,
-  type ModelOption,
-  type ModelSelection,
   type SubmitShortcut,
   type UserRole,
 } from "@/lib/types";
@@ -68,15 +59,6 @@ interface PreferenceSectionsProps {
   onAgentShellGitBashChange: (next: boolean) => void | Promise<unknown>;
   isolateWorktreeDefault: boolean;
   onIsolateWorktreeDefaultChange: (next: boolean) => void;
-  // 默认模型
-  models: ModelOption[];
-  modelsError: string;
-  modelSelection: ModelSelection;
-  onModelChange: (next: ModelSelection) => void;
-  modelsRefreshing: boolean;
-  /** 当前 provider 凭据是否齐备（cursor 有 key / custom 有 baseUrl）——决定「获取列表」是否可点 */
-  canRefreshModels: boolean;
-  onModelsRefresh: () => void;
 }
 
 export const PreferenceSections = ({
@@ -95,13 +77,6 @@ export const PreferenceSections = ({
   onAgentShellGitBashChange,
   isolateWorktreeDefault,
   onIsolateWorktreeDefaultChange,
-  models,
-  modelsError,
-  modelSelection,
-  onModelChange,
-  modelsRefreshing,
-  canRefreshModels,
-  onModelsRefresh,
 }: PreferenceSectionsProps) => {
   // 本机探测到的可用 IDE 集合（后端扫安装位置 + PATH）；null = 还没回来（全部可选）
   const [availableIdes, setAvailableIdes] = useState<Set<JumpIde> | null>(null);
@@ -269,27 +244,20 @@ export const PreferenceSections = ({
         label="我的角色"
         hint="用于告诉 AI 你的工作视角/身份（注入任务与对话的发起人信息）"
         control={
-          <Select
+          <Picker
+            className="w-44"
             value={userRole ?? ""}
-            onValueChange={(v) => {
+            placeholder="请选择"
+            onChange={(v) => {
               if (USER_ROLES.includes(v as UserRole)) {
                 onUserRoleChange(v as UserRole);
               }
             }}
-          >
-            <SelectTrigger className="w-44">
-              <SelectValue placeholder="请选择">
-                {userRole ? USER_ROLE_LABEL[userRole] : undefined}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {USER_ROLES.map((id) => (
-                <SelectItem key={id} value={id}>
-                  {USER_ROLE_LABEL[id]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            options={USER_ROLES.map((id) => ({
+              value: id,
+              label: USER_ROLE_LABEL[id],
+            }))}
+          />
         }
       />
 
@@ -297,31 +265,25 @@ export const PreferenceSections = ({
         label="代码跳转 IDE"
         hint="路径链接 / 打开工作区用哪个"
         control={
-          <Select
+          <Picker
+            className="w-44"
             value={jumpIde}
-            onValueChange={(v) =>
+            onChange={(v) =>
               onJumpIdeChange(
                 JUMP_IDES.includes(v as JumpIde) ? (v as JumpIde) : "cursor",
               )
             }
-          >
-            <SelectTrigger className="w-44">
-              <SelectValue>{JUMP_IDE_LABEL[jumpIde]}</SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {JUMP_IDES.filter(
-                // 只列本机装了的；当前已选的即使没探到也列；探测没回来前全列
-                (id) =>
-                  availableIdes === null ||
-                  availableIdes.has(id) ||
-                  id === jumpIde,
-              ).map((id) => (
-                <SelectItem key={id} value={id}>
-                  {JUMP_IDE_LABEL[id]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            options={JUMP_IDES.filter(
+              // 只列本机装了的；当前已选的即使没探到也列；探测没回来前全列
+              (id) =>
+                availableIdes === null ||
+                availableIdes.has(id) ||
+                id === jumpIde,
+            ).map((id) => ({
+              value: id,
+              label: JUMP_IDE_LABEL[id],
+            }))}
+          />
         }
       />
 
@@ -329,30 +291,20 @@ export const PreferenceSections = ({
         label="提交快捷键"
         hint="聊天 / 推进输入框的发送方式"
         control={
-          <Select
+          <Picker
+            className="w-64"
             value={submitShortcut}
-            onValueChange={(v) =>
+            onChange={(v) =>
               onSubmitShortcutChange(v === "enter" ? "enter" : "mod-enter")
             }
-          >
-            <SelectTrigger className="w-64">
-              <SelectValue>{SUBMIT_SHORTCUT_LABEL[submitShortcut]}</SelectValue>
-            </SelectTrigger>
-            <SelectContent
-              side="bottom"
-              alignItemWithTrigger={false}
-              collisionAvoidance={{
-                side: "shift",
-                align: "shift",
-                fallbackAxisSide: "none",
-              }}
-            >
-              <SelectItem value="mod-enter">
-                {SUBMIT_SHORTCUT_LABEL["mod-enter"]}
-              </SelectItem>
-              <SelectItem value="enter">{SUBMIT_SHORTCUT_LABEL.enter}</SelectItem>
-            </SelectContent>
-          </Select>
+            options={[
+              {
+                value: "mod-enter",
+                label: SUBMIT_SHORTCUT_LABEL["mod-enter"],
+              },
+              { value: "enter", label: SUBMIT_SHORTCUT_LABEL.enter },
+            ]}
+          />
         }
       />
 
@@ -497,49 +449,6 @@ export const PreferenceSections = ({
         }
       />
 
-      <SettingRow
-        stacked
-        label="默认模型"
-        hint={
-          modelsError ? (
-            <span className="text-destructive">{modelsError}</span>
-          ) : models.length > 0 ? (
-            `共 ${models.length} 个可用模型`
-          ) : (
-            "新任务 / 对话的默认 AI"
-          )
-        }
-        labelExtra={
-          <Tooltip
-            content={
-              canRefreshModels
-                ? "重新拉取可用模型列表"
-                : "请先填 API key / 自定义 provider 的 baseUrl"
-            }
-          >
-            <span className="inline-flex">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => onModelsRefresh()}
-                disabled={modelsRefreshing || !canRefreshModels}
-              >
-                {modelsRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-                获取列表
-              </Button>
-            </span>
-          </Tooltip>
-        }
-        control={
-          <ModelSelect
-            models={models}
-            selection={modelSelection}
-            onChange={onModelChange}
-            variant="full"
-          />
-        }
-      />
-    </div>
+      </div>
   );
 };

@@ -90,46 +90,8 @@ export const formatTs = (ts: number): string => {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
 
-/**
- * 合并相邻 thinking 事件
- *
- * 背景：SDK 把一段连贯思考流式拆成多个 SDKThinkingMessage、每条 100~300 字。
- * 一条条独立渲染会出现「The user wants to」「function as a planning」「agent.」
- * 这种孤立片段、读不通。这里把同 phase、连续相邻的 thinking 合并成一条卡片。
- *
- * 不动 events.jsonl 落盘内容（多条原貌保留、便于复盘）、只在 UI 渲染前做这步合并。
- *
- * 合并策略：
- *   - text：按顺序换行拼接
- *   - durationMs：累加
- *   - id / ts：取第一条（保证 React key 稳定 + 时间标签是思考开始时间）
- */
-export const mergeAdjacentThinking = (events: TaskEvent[]): TaskEvent[] => {
-  const out: TaskEvent[] = [];
-  for (const ev of events) {
-    const last = out[out.length - 1];
-    if (
-      ev.kind === "thinking" &&
-      last &&
-      last.kind === "thinking" &&
-      last.actionId === ev.actionId
-    ) {
-      const lastDur = Number(last.meta?.durationMs) || 0;
-      const curDur = Number(ev.meta?.durationMs) || 0;
-      out[out.length - 1] = {
-        ...last,
-        text: `${last.text}\n${ev.text}`,
-        meta: {
-          ...(last.meta ?? {}),
-          durationMs: lastDur + curDur,
-        },
-      };
-    } else {
-      out.push(ev);
-    }
-  }
-  return out;
-};
+/** 相邻 thinking 收成一条（token 直接拼接、见 lib/merge-thinking） */
+export { coalesceAdjacentThinking as mergeAdjacentThinking } from "@/lib/merge-thinking";
 
 // 默认展开的事件类型：核心对话、HITL 里程碑和失败信号。
 // 这个集合也是 log 形态视觉降权的单一判断源：默认折叠的过程类才降权，信号事件必须保可见。

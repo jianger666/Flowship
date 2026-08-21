@@ -27,6 +27,7 @@ import {
   rollbackDeletionJournalIfTaskDirRemains,
   setTaskDisabledMcpServers,
   setTaskModel,
+  setTaskProvider,
   setTaskPinned,
   setTaskRepoPaths,
   setTaskUiLayout,
@@ -72,7 +73,12 @@ import {
   resolveCheckpointRefManifestForDelete,
   type CheckpointRefManifest,
 } from "@/lib/server/chat-checkpoint";
-import type { ModelSelection } from "@/lib/types";
+import { isCursorProvider, type ModelSelection } from "@/lib/types";
+import {
+  isCustomProviderReady,
+  migrateProviderSettings,
+} from "@/lib/agent-provider";
+import { readSettingsFile } from "@/lib/server/settings-fs";
 
 /** DELETE 等 rewind 退出的轮询间隔 / 上限 */
 const DELETE_REWIND_POLL_MS = 100;
@@ -265,6 +271,59 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       await setTaskUiLayout(id, value);
       // 不返完整 task：高频拖动期间 round-trip 全量没必要、前端 state 已经是源头
       return NextResponse.json({ ok: true });
+    }
+
+    // 空对话可切提供方；任务已创建 / chat 已发过则 409
+    if ("provider" in body) {
+      const p = body.provider;
+      if (typeof p !== "string" || !p.trim() || p.length > 80) {
+        return NextResponse.json(
+          { error: "provider 必须是非空短字符串" },
+          { status: 400 },
+        );
+      }
+      const providerId = p.trim();
+      if (!isCursorProvider(providerId)) {
+        const settingsResult = await readSettingsFile();
+        const migrated = migrateProviderSettings(
+          settingsResult.status === "ok" ? settingsResult.settings : {},
+        );
+        const row = migrated.customProviders.find((x) => x.id === providerId);
+        if (!row || !isCustomProviderReady(row)) {
+          return NextResponse.json(
+            { error: "provider 未配置或接口地址无效" },
+            { status: 400 },
+          );
+        }
+      }
+      let model: { id: string; params?: Array<{ id: string; value: string }> } | undefined;
+      if ("model" in body && body.model) {
+        const m = body.model;
+        if (
+          typeof m !== "object" ||
+          typeof m.id !== "string" ||
+          !m.id.trim()
+        ) {
+          return NextResponse.json(
+            { error: "model 必须是 { id: 非空字符串 }" },
+            { status: 400 },
+          );
+        }
+        model = m;
+      }
+      let task;
+      try {
+        task = await setTaskProvider(id, providerId, model);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes("不能切换提供方")) {
+          return NextResponse.json({ error: message }, { status: 409 });
+        }
+        throw err;
+      }
+      if (!task)
+        return NextResponse.json({ error: "not_found" }, { status: 404 });
+      return NextResponse.json({ task });
     }
 
     // V0.6.24：chat 切模型——只认 { id: 非空字符串 }、params 可选

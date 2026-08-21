@@ -34,6 +34,7 @@ import type {
 } from "@/lib/types";
 import { dataRoot, RenameAbortedError, renameWithRetry } from "./data-root";
 import { failpoint } from "./failpoints";
+import { coalesceAdjacentThinking } from "@/lib/merge-thinking";
 // 只用其纯函数（getTaskCwd 路径计算、零 IO）、task-worktrees 不反向依赖本模块（无环）
 import { getTaskCwd } from "./task-worktrees";
 import { z } from "zod";
@@ -229,6 +230,8 @@ export interface TaskMetaV06 {
   /** token 用量汇总（每轮 turn-ended 落一次账、详见 types.ts TokenUsageRollup） */
   tokenUsage?: TokenUsageRollup;
   model?: ModelSelection;
+  /** 本窗口绑定的 agent 提供方（cursor 或 customProviders.id） */
+  provider?: string;
   uiLayout?: { artifactPanelSize?: number };
 }
 
@@ -515,6 +518,8 @@ export const writeMeta = async (meta: TaskMetaV06): Promise<void> => {
 export const MAX_EVENTS_TAIL = 1000;
 /** cursor 分页单页上限 */
 export const MAX_EVENTS_PAGE = 500;
+/** 为凑够 limit 条「收口后」事件，最多反向扫这么多原始行（防 1.7 万 thinking token 把正文挤出窗口） */
+const MAX_EVENTS_TAIL_RAW = 50_000;
 /** 反向读尾部时每块字节数——IO 量跟「要的条数 × 平均行宽」同阶，不跟文件总长 */
 const EVENTS_TAIL_CHUNK = 64 * 1024;
 
@@ -551,9 +556,9 @@ export const readEvents = async (id: string): Promise<TaskEvent[]> => {
 };
 
 /**
- * 从文件尾按块反向读，只解析最后 n 条有效事件。
- * IO/解析量 ≈ O(n 条对应的字节)，不随文件总长线性增长。
- * hasMore = 文件里还有比返回结果更早的有效事件（多读到第 n+1 条才置 true）。
+ * 从文件尾按块反向读。
+ * 相邻 thinking 收口后再计 limit——token 级思考不会把 user_reply / 工具挤出窗口。
+ * hasMore = 收口后还有更早事件（或触及原始行扫描上限）。
  */
 export const readEventsTail = async (
   id: string,
@@ -576,7 +581,7 @@ export const readEventsTail = async (
     // collected[0] = 文件中最后一条有效事件（倒序）
     const collected: TaskEvent[] = [];
 
-    while (pos > 0 && collected.length <= limit) {
+    while (pos > 0 && collected.length < MAX_EVENTS_TAIL_RAW) {
       const toRead = Math.min(EVENTS_TAIL_CHUNK, pos);
       pos -= toRead;
       const buf = Buffer.allocUnsafe(toRead);
@@ -598,16 +603,27 @@ export const readEventsTail = async (
         if (end > 0) linesFromRight.push(data.subarray(0, end));
       }
 
+      let hitRawCap = false;
       for (const lineBuf of linesFromRight) {
         const ev = parseEventLineBuf(lineBuf);
         if (!ev) continue; // 空行 / 崩溃半行 / 坏 JSON
         collected.push(ev);
-        if (collected.length > limit) break;
+        if (collected.length >= MAX_EVENTS_TAIL_RAW) {
+          hitRawCap = true;
+          break;
+        }
       }
+      const logical = coalesceAdjacentThinking([...collected].reverse());
+      if (logical.length > limit || hitRawCap) break;
     }
 
-    const hasMore = collected.length > limit;
-    const events = collected.slice(0, limit).reverse();
+    const coalesced = coalesceAdjacentThinking([...collected].reverse());
+    const hasMore =
+      pos > 0 ||
+      coalesced.length > limit ||
+      collected.length >= MAX_EVENTS_TAIL_RAW;
+    const events =
+      coalesced.length > limit ? coalesced.slice(-limit) : coalesced;
     return { events, hasMore };
   } finally {
     await fh.close();
@@ -1165,6 +1181,7 @@ export const assembleTask = (
   updatedAt: meta.updatedAt,
   tokenUsage: meta.tokenUsage,
   model: meta.model,
+  provider: meta.provider,
   uiLayout: meta.uiLayout,
   events,
 });

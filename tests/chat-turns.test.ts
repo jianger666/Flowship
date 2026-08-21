@@ -360,6 +360,29 @@ describe("isLatestErrorEvent", () => {
     expect(isLatestErrorEvent(events, "nope")).toBe(false);
     expect(isLatestErrorEvent([], "e")).toBe(false);
   });
+
+  it("回合内工具失败（带 callId）不算当轮崩溃、不给重试、不挡真正的 run 错误", () => {
+    const toolErr = ev({
+      id: "te",
+      kind: "error",
+      text: "工具调用失败 grep",
+      ts: 2,
+      meta: { callId: "c1", name: "grep" },
+    });
+    const runErr = ev({
+      id: "re",
+      kind: "error",
+      text: "Chat agent 异常：断网",
+      ts: 3,
+    });
+    const events = [
+      ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+      toolErr,
+    ];
+    expect(isLatestErrorEvent(events, "te")).toBe(false);
+    expect(isLatestErrorEvent([...events, runErr], "re")).toBe(true);
+    expect(isLatestErrorEvent([...events, runErr], "te")).toBe(false);
+  });
 });
 
 describe("deriveActiveStatus", () => {

@@ -1,11 +1,13 @@
 /**
- * 会话跟随模型：最近 action.agentModel → task.model（对齐 runner resume）
+ * 当前推进实际在用的模型：最近 action.agentModel → task.model（对齐 runner resume）
  */
 import { describe, expect, it } from "vitest";
 
 import {
   latestActionAgentModel,
+  modelSelectionKey,
   resolveSessionModel,
+  talkForceModel,
 } from "@/lib/task-model";
 import type { ActionRecord, ModelSelection, Task } from "@/lib/types";
 
@@ -76,5 +78,57 @@ describe("resolveSessionModel", () => {
 
   it("都没有 → undefined", () => {
     expect(resolveSessionModel(task({ actions: [] }))).toBeUndefined();
+  });
+
+  it("没推进过：说话条跟建任务时的 task.model", () => {
+    expect(
+      resolveSessionModel(
+        task({ model: model("composer-2.5"), actions: [] }),
+      )?.id,
+    ).toBe("composer-2.5");
+  });
+
+  it("推进换模型后：展示新 action.agentModel，不回退建任务模型", () => {
+    expect(
+      resolveSessionModel(
+        task({
+          model: model("composer-2.5"),
+          actions: [act(1, model("grok-4.6"))],
+        }),
+      )?.id,
+    ).toBe("grok-4.6");
+  });
+});
+
+describe("talkForceModel", () => {
+  it("跟当前推进相同 → 不传（续活会话）", () => {
+    expect(
+      talkForceModel(model("composer-2.5"), model("composer-2.5")),
+    ).toBeUndefined();
+  });
+
+  it("params 顺序不同仍算相同", () => {
+    const a: ModelSelection = {
+      id: "composer-2.5",
+      params: [
+        { id: "thinking", value: "high" },
+        { id: "fast", value: "true" },
+      ],
+    };
+    const b: ModelSelection = {
+      id: "composer-2.5",
+      params: [
+        { id: "fast", value: "true" },
+        { id: "thinking", value: "high" },
+      ],
+    };
+    expect(modelSelectionKey(a)).toBe(modelSelectionKey(b));
+    expect(talkForceModel(a, b)).toBeUndefined();
+  });
+
+  it("真换了才带 forceModel", () => {
+    expect(talkForceModel(model("grok-4.6"), model("composer-2.5"))).toEqual(
+      model("grok-4.6"),
+    );
   });
 });

@@ -28,7 +28,7 @@
  *
  * - task 不存在 → 404
  * - 准入条件不满足（如 build 但没 plan）→ 400
- * - 缺 apiKey / model / images 等 → 400
+ * - 缺 apiKey 字段 / model / images 等 → 400（自定义允许空 Key）
  */
 
 import { promises as fs } from "node:fs";
@@ -36,6 +36,7 @@ import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 
 import { isAbsolutePathLike } from "@/lib/path-utils";
+import { isApiKeyFieldPresent } from "@/lib/agent-provider";
 import {
   errorResponse,
   isValidModel,
@@ -138,8 +139,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
   const userInstruction = (body.userInstruction ?? "").trim();
 
-  const apiKey = body.apiKey?.trim();
-  if (!apiKey) return errorResponse("缺少 apiKey");
+  if (!isApiKeyFieldPresent(body.apiKey)) return errorResponse("缺少 apiKey");
+  const apiKey = body.apiKey.trim();
   if (!isValidModel(body.model)) return errorResponse("model 非法");
   const model = body.model;
 

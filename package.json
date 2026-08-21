@@ -8,7 +8,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "next dev -p 8876 -H 127.0.0.1",
+    "dev:web": "node scripts/dev-web.mjs",
     "start": "node scripts/dev-open.mjs",
     "serve": "next build && node scripts/dev-open.mjs start",
     "build": "next build",
@@ -20,7 +20,8 @@
     "electron:dev": "electron electron-app",
     "electron:dist": "electron-builder",
     "electron:dist:test": "electron-builder --mac --dir -c.productName=FlowshipTest",
-    "electron:test:restart": "node scripts/electron-test-restart.mjs"
+    "electron:test:restart": "node scripts/electron-test-restart.mjs",
+    "repair:sdk-store": "node scripts/repair-sdk-store.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",
@@ -48,6 +49,7 @@
     "mdast-util-to-string": "^4.0.0",
     "next": "^15.5.18",
     "next-themes": "^0.4.6",
+    "pg": "^8.23.0",
     "prismjs": "^1.30.0",
     "react": "^19.0.0",
     "react-day-picker": "^10.0.1",

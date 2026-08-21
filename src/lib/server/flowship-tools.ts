@@ -96,7 +96,7 @@ const askUserDef: FlowshipToolDef = {
   description: [
     "遇到不确定 / 要用户选择时、把当前轮想问的全部打包成 questions[]、推 UI 答题卡。task / chat 都可用。",
     "每项 { id, question, options?: [{id,label}], allow_text? }；别塞 Other/其他；options 缺省 allow_text 默认 true。",
-    "返回 [ASK_SUBMITTED] 后立即结束本轮回复、不要再输出文本；答案以 [ASK_USER_REPLY] 新消息送达。",
+    "返回 [ASK_SUBMITTED] 后结束本轮即可；提问后再说会被静音（用户看不见），说不说都行；答案以 [ASK_USER_REPLY] 新消息送达。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),

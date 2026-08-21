@@ -227,8 +227,8 @@ export interface CompanyEnvPg {
   user: string;
   password: string;
   /**
-   * 只读软约束（默认 true）：落 company-env.json + brief 声明禁止写；
-   * 非硬闸，靠 prompt 约束 AI。每个实例各自一份——测试库可写、预发库只读是常态。
+   * 只读（默认 true）：brief 声明禁止写；pg-exec 对只读实例硬挡写语句。
+   * 每个实例各自一份——测试库可写、预发库只读是常态。
    */
   readonly: boolean;
 }
@@ -311,16 +311,21 @@ export interface CompanyEnv {
 }
 
 /**
- * Agent 后端来源（v1.2.x 引入自定义 provider）：
- * - `cursor`：走 @cursor/sdk（默认、历史行为不变）
- * - `custom`：走自定义 HTTP provider（baseUrl + apiKey），底层用轻量 agent 库 pi 承接
+ * Agent 后端 id：
+ * - `"cursor"`：走 @cursor/sdk（固定第一项、不能删）
+ * - 其它：`customProviders[].id`（用户可新增多条）
+ *
+ * 旧档曾把字面 `"custom"` 当唯一自定义槽，读盘时迁成 `cp_legacy`。
  */
-export type AgentProviderId = "cursor" | "custom";
+export type AgentProviderId = string;
 
-export const AGENT_PROVIDER_LABEL: Record<AgentProviderId, string> = {
-  cursor: "Cursor SDK",
-  custom: "自定义 Provider",
-};
+/** Cursor SDK 的稳定 id（设置默认 / 窗口 provider 都用这个） */
+export const CURSOR_PROVIDER_ID = "cursor";
+
+/** 旧单槽 `customProvider` 迁进列表时的稳定 id（老 pi 会话可对上） */
+export const LEGACY_CUSTOM_PROVIDER_ID = "cp_legacy";
+
+export const CURSOR_PROVIDER_LABEL = "Cursor SDK";
 
 /**
  * 自定义 provider 的 HTTP 协议（pi 原生支持两套）：
@@ -334,26 +339,59 @@ export const CUSTOM_PROVIDER_FORMAT_LABEL: Record<CustomProviderFormat, string> 
   anthropic: "Anthropic 兼容",
 };
 
-/** 自定义 provider 配置（仅在 provider === "custom" 时生效） */
+/** 一条自定义 HTTP provider（设置页目录里可多条） */
 export interface CustomProviderConfig {
+  /** 稳定 id（`cp_…`），窗口记住的是这个、不是下标 */
+  id: string;
+  /** 用户起的名字；空则 UI 用 host 兜底 */
+  name: string;
   /** 用户 HTTP API 的 baseUrl（不含 /v1 尾巴也行、运行时归一） */
   baseUrl: string;
-  /** 用户 HTTP API 的 apiKey */
+  /** 用户 HTTP API 的 apiKey（本地无鉴权端点允许空） */
   apiKey: string;
   /** HTTP 协议：openai / anthropic */
   format: CustomProviderFormat;
+  /** 该条自己的默认模型；未配就是空，不回退 Cursor 那份 */
+  defaultModel?: ModelSelection;
 }
+
+/** 是不是 Cursor SDK（空 / 缺省也算） */
+export const isCursorProvider = (id: string | undefined): boolean =>
+  !id || id === CURSOR_PROVIDER_ID;
+
+/**
+ * 按指定 provider 取默认模型：
+ * - cursor → settings.defaultModel
+ * - 自定义 id → 那一条的 defaultModel（未配返空，不回退 Cursor）
+ *
+ * 两套模型 id 空间不同，composer-2.5 在自定义端点上不是合法 id。
+ */
+export const defaultModelForProvider = (
+  settings: Pick<
+    FeAiFlowSettings,
+    "defaultModel" | "customProviders" | "provider"
+  >,
+  provider: AgentProviderId = settings.provider ?? CURSOR_PROVIDER_ID,
+): ModelSelection => {
+  if (!isCursorProvider(provider)) {
+    const picked = settings.customProviders?.find((p) => p.id === provider)
+      ?.defaultModel;
+    return picked?.id?.trim() ? picked : { id: "" };
+  }
+  return settings.defaultModel ?? { id: "" };
+};
 
 export interface FeAiFlowSettings {
   apiKey: string;
+  /** Cursor SDK 的默认模型；自定义条目各记各的 defaultModel，互不回退 */
   defaultModel: ModelSelection;
   /**
-   * Agent 后端来源（默认 cursor、历史行为不变）。
-   * custom 时 runtime 读 customProvider.baseUrl/apiKey、模型走 /v1/models + 手填兜底。
+   * 新建对话 / 任务用的默认提供方（`cursor` 或某条 customProviders.id）。
+   * 已有窗口看 `task.provider`，不跟这项走。
    */
   provider?: AgentProviderId;
-  /** 自定义 provider 配置（provider === "custom" 时读取） */
-  customProvider?: CustomProviderConfig;
+  /** 自定义 HTTP provider 目录（可多条；Cursor SDK 不在这份列表里） */
+  customProviders?: CustomProviderConfig[];
   /** 代码路径点击跳转的 IDE、默认 cursor */
   jumpIde?: JumpIde;
   /** 输入框提交快捷键：默认 Cmd/Ctrl+Enter，Enter 换行 */
@@ -413,11 +451,10 @@ export interface FeAiFlowSettings {
    */
   disabledRules?: string[];
   /**
-   * V0.11.x：模型使用计数（「常用模型」快捷 chip 的数据源、用户拍板自动按次数排序）。
-   * 每次真正提交使用某模型（推进起新 agent / 重启阶段 / 新建任务 / chat 换模型）计一次、
-   * 按「模型 id + 参数组合」区分（Fable High 和 Fable Low 是两个条目）。上限 20 条防膨胀。
+   * 每提供方最多 2 个常用模型 id（下拉里点五角星钉住）。
+   * 和 defaultModel 分开：默认是新建/切提供方的落点，常用是快捷入口。
    */
-  modelUsage?: ModelUsageEntry[];
+  starredModels?: Record<string, string[]>;
   /**
    * 默认飞书项目空间（工作台看板 + 收件箱扫描唯一作用域）。
    * 缺省由 DEFAULT_MEEGLE_PROJECT 兜底（历史用户都是悟空空间、零迁移）。
@@ -473,13 +510,6 @@ export const DEFAULT_MEEGLE_PROJECT = {
   simpleName: "wk-dm",
 } as const;
 
-/** 单条模型使用计数（key = id + params 组合） */
-export interface ModelUsageEntry {
-  id: string;
-  params?: Array<{ id: string; value: string }>;
-  count: number;
-  lastUsedAt: number;
-}
 
 /**
  * 推进面板布局偏好——自定义「推进」弹窗里 action 卡片的顺序 + 显隐。
@@ -1479,6 +1509,12 @@ export interface Task {
    */
   tokenUsage?: TokenUsageRollup;
   model?: ModelSelection;
+  /**
+   * 本窗口绑定的 agent 提供方（`cursor` 或 customProviders.id）。
+   * 新建时从 settings.provider 拷一份；之后只跟本窗口走，设置页改默认不影响已有窗口。
+   * 老任务没这个字段：有 pi-sessions 锚点 → 迁后的那条自定义，否则 cursor。
+   */
+  provider?: AgentProviderId;
   uiLayout?: { artifactPanelSize?: number };
   events: TaskEvent[];
   /**
@@ -1502,6 +1538,7 @@ export type NewTaskInput = Pick<
   | "reqId"
   | "disabledMcpServers"
   | "model"
+  | "provider"
   | "repoBaseBranches"
   | "repoFeatureBranches"
   | "repoTestBranches"

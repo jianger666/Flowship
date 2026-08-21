@@ -26,6 +26,7 @@ import {
   forceClearChatRun,
   getChatRunDisabledMcp,
   getChatRunModel,
+  getChatRunProvider,
   getChatRunRepoPaths,
   hasChatSession,
   isChatQueueDraining,
@@ -77,6 +78,11 @@ import {
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
 import { beginAskSkip, type AskSkipHandle } from "@/lib/server/ask-skip";
 import { buildSkillDirective } from "@/lib/protocol-signals";
+import {
+  migrateProviderSettings,
+  providerDisplayName,
+} from "@/lib/agent-provider";
+import { readSettingsFile } from "@/lib/server/settings-fs";
 import {
   errorResponse,
   isValidModel,
@@ -488,10 +494,17 @@ const runChatReplyInject = async (
   // claim 是实例化 token——保存 resume 返回的 instanceId，后续 owner send /
   // release 都必须带它精确匹配，防止越权操作 stop/forceClear 后换上来的新实例。
   let ownerInstanceId: number | null = null;
+  // 自定义允许空 Key（本地无鉴权端点）；只要求 bootArgs 结构合法，不要用 truthy 挡空串
+  const hasBootArgs =
+    !!bootArgs &&
+    typeof bootArgs.apiKey === "string" &&
+    isValidModel(bootArgs.model);
+
   if (
     !hasChatSession(task.id) &&
     task.sessionAgentId &&
-    bootArgs?.apiKey &&
+    bootArgs &&
+    typeof bootArgs.apiKey === "string" &&
     isValidModel(bootArgs.model)
   ) {
     ownerInstanceId = await resumeChatSession(
@@ -512,6 +525,8 @@ const runChatReplyInject = async (
     const runModel = getChatRunModel(task.id);
     const runMcp = getChatRunDisabledMcp(task.id);
     const runRepos = getChatRunRepoPaths(task.id);
+    const runProvider = getChatRunProvider(task.id);
+    const wantProvider = task.provider ?? runProvider ?? "cursor";
     const mcpUnchanged =
       runMcp === null || stringSetEquals(runMcp, task.disabledMcpServers ?? []);
     // 有序路径列表相等（顺序也算：cwd 取第一项、换序即换 cwd）
@@ -519,13 +534,16 @@ const runChatReplyInject = async (
       runRepos === null ||
       (runRepos.length === task.repoPaths.length &&
         runRepos.every((p, i) => p === task.repoPaths[i]));
-    const canRestart = !!bootArgs?.apiKey && isValidModel(bootArgs.model);
+    const providerUnchanged =
+      runProvider === null || runProvider === wantProvider;
+    const canRestart = hasBootArgs;
     const unchanged =
       !runModel ||
       !canRestart ||
       (modelEquals(runModel, bootArgs!.model!) &&
         mcpUnchanged &&
-        reposUnchanged);
+        reposUnchanged &&
+        providerUnchanged);
 
     if (unchanged) {
       // 队列非空或 drain 中 → 入队，勿在已排队消息前插队直接 send。
@@ -646,7 +664,7 @@ const runChatReplyInject = async (
       const pendingRestartMsg = await checkUpdatePendingRestart();
       if (pendingRestartMsg) return errorResponse(pendingRestartMsg, 409);
 
-      // 模型 / MCP / workdir 变了 → 懒重启：关旧会话、起新会话（这条消息作首条）、
+      // 模型 / MCP / workdir / 提供方变了 → 懒重启：关旧会话、起新会话（这条消息作首条）、
       // 历史靠 events.jsonl 续上（buildInitialPrompt 已给 agent eventsLogPath）
       cancelChatRun(task.id);
       const stopped = await waitForChatToStop(
@@ -659,13 +677,28 @@ const runChatReplyInject = async (
         );
         forceClearChatRun(task.id);
       }
+      if (runProvider !== null && runProvider !== wantProvider) {
+        const settingsResult = await readSettingsFile();
+        const migrated =
+          settingsResult.status === "ok"
+            ? migrateProviderSettings(settingsResult.settings)
+            : { customProviders: [] };
+        const label = providerDisplayName(
+          { customProviders: migrated.customProviders },
+          wantProvider,
+        );
+        await writeEventAndPublish(task.id, {
+          kind: "info",
+          text: `已切换到 ${label}，本窗口用新会话继续，上方历史仍保留。`,
+        });
+      }
     }
   }
 
   // 模式 2：起新会话（首条 / 会话已关 / 懒重启后）
   // 校验 bootArgs——先于落事件，缺凭据不写假「已发送」
   // 400 由外层 finally release
-  if (!bootArgs?.apiKey || typeof bootArgs.apiKey !== "string") {
+  if (!bootArgs || typeof bootArgs.apiKey !== "string") {
     return errorResponse("缺 bootArgs.apiKey、起新会话必传");
   }
   if (!isValidModel(bootArgs.model)) {

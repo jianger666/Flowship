@@ -1,10 +1,10 @@
 "use client";
 
 /**
- * Cursor API Key 配置节（v1.0.x 设置整合：Card 壳退役、作为「连接」卡的一节）
+ * Cursor API Key 配置节 + 共用的「默认模型」行
  * - 默认密码框、可一键切换明文（防截图泄漏）
  * - 输入太短（< 10）时不脱敏、避免出现首尾重叠的奇怪展示（如 crsr_t...test）
- * - 「验证」按钮触发模型列表拉取（由父组件传入）、显示 spinner
+ * - 账号信息用灰底信息块贴在 Key 下面（姓名/邮箱一行、密钥名/日期一行）
  */
 
 import { Eye, EyeOff, Loader2, RefreshCw, User } from "lucide-react";
@@ -12,23 +12,12 @@ import { Eye, EyeOff, Loader2, RefreshCw, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
+import { ModelSelect } from "@/components/ui/model-select";
 import { SettingRow } from "@/components/ui/setting-row";
 
 import { useState } from "react";
 
-import type { ApiKeyInfo } from "@/lib/types";
-
-// 太短就不要脱敏了、否则 6+4 切片会重叠出现 "crsr_t...test" 这种残影
-const MASK_THRESHOLD = 10;
-
-const maskKey = (key: string): string => {
-  if (!key) return "";
-  if (key.length < MASK_THRESHOLD) return key;
-  const head = key.slice(0, 6);
-  const tail = key.slice(-4);
-  const middle = "•".repeat(Math.max(0, key.length - 10));
-  return `${head}${middle}${tail}`;
-};
+import type { ApiKeyInfo, ModelOption, ModelSelection } from "@/lib/types";
 
 interface ApiKeySectionProps {
   apiKey: string;
@@ -37,8 +26,6 @@ interface ApiKeySectionProps {
   // 输入时改草稿、失焦（onBlur）落盘
   onChange: (next: string) => void;
   onCommit: (value: string) => void;
-  onValidate: (apiKey: string) => void;
-  validating: boolean;
 }
 
 // createdAt 是 ISO 串、展示成「YYYY-MM-DD」即可
@@ -58,24 +45,20 @@ export const ApiKeySection = ({
   info,
   onChange,
   onCommit,
-  onValidate,
-  validating,
-}: ApiKeySectionProps) => {
+  className,
+}: ApiKeySectionProps & { className?: string }) => {
   // 是否明文显示 API Key（默认隐藏、防截图）
   const [showKey, setShowKey] = useState(false);
-
-  const masked = !showKey && apiKey ? maskKey(apiKey) : "";
   const name = info ? fullName(info) : "";
 
   return (
     <SettingRow
       stacked
-      // 连接卡 space-y + Separator 分节、去掉自带 py 防双倍间距（同 GitLabSection）
-      className="py-0"
-      label="Cursor API Key"
-      hint="从 cursor.com/dashboard/integrations 创建、以 crsr_ 开头"
+      className={className}
+      label="API Key"
+      hint="从 cursor.com/dashboard/integrations 创建"
       control={
-        <div className="space-y-2">
+        <div className="space-y-1.5">
           <div className="flex gap-2">
             <Input
               type={showKey ? "text" : "password"}
@@ -95,19 +78,7 @@ export const ApiKeySection = ({
                 {showKey ? <EyeOff /> : <Eye />}
               </Button>
             </Tooltip>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onValidate(apiKey)}
-              disabled={validating || !apiKey.trim()}
-            >
-              {validating ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              验证
-            </Button>
           </div>
-          {masked && (
-            <div className="text-xs text-muted-foreground font-mono">{masked}</div>
-          )}
           {info && (
             <div className="flex items-start gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
               <User className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
@@ -133,3 +104,57 @@ export const ApiKeySection = ({
     />
   );
 };
+
+export const DefaultModelSection = ({
+  models,
+  modelSelection,
+  onModelChange,
+  canRefreshModels,
+  onModelsRefresh,
+  modelsRefreshing,
+  modelsError,
+  className,
+  providerId,
+}: {
+  models: ModelOption[];
+  modelSelection: ModelSelection;
+  onModelChange: (next: ModelSelection) => void;
+  canRefreshModels: boolean;
+  onModelsRefresh: () => void;
+  modelsRefreshing: boolean;
+  modelsError?: string;
+  className?: string;
+  providerId?: string;
+}) => (
+  <SettingRow
+    stacked
+    className={className}
+    label="默认模型"
+    labelExtra={
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={onModelsRefresh}
+        disabled={modelsRefreshing || !canRefreshModels}
+      >
+        {modelsRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+        获取列表
+      </Button>
+    }
+    control={
+      <div className="space-y-1.5">
+        <ModelSelect
+          models={models}
+          selection={modelSelection}
+          onChange={onModelChange}
+          variant="full"
+          providerId={providerId}
+        />
+        {modelsError ? (
+          <p className="text-xs text-destructive">{modelsError}</p>
+        ) : null}
+      </div>
+    }
+  />
+);

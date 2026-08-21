@@ -353,7 +353,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       }, SUBMIT_UNLOCK_MS),
     );
     try {
-      const askResult = await submitAskReply(task.id, askId, answers, {
+      const askResult = await submitAskReply(task, askId, answers, {
         imagesByQuestion,
         skills: skillRefs.length > 0 ? skillRefs : undefined,
         signal: ac.signal,
@@ -401,7 +401,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       }, SUBMIT_UNLOCK_MS),
     );
     try {
-      const deferResult = await submitAskReply(task.id, askId, [], {
+      const deferResult = await submitAskReply(task, askId, [], {
         deferred: true,
         signal: ac.signal,
       });

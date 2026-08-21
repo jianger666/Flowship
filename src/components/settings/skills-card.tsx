@@ -31,9 +31,11 @@ import {
   deleteCustomActionReq,
   fetchCustomActions,
 } from "@/lib/custom-action-client";
+import { hasActiveModelCreds } from "@/lib/agent-provider";
 import { getSettings, initSettings, saveSettings } from "@/lib/local-store";
 import { setPendingSlashSkill } from "@/components/slash-skills";
 import { createTask } from "@/lib/task-store";
+import { defaultModelForProvider } from "@/lib/types";
 
 import { SkillEditDialog, SkillViewDialog } from "./skills-panel/edit-dialogs";
 import { ImportSkillsDialog } from "./skills-panel/import-dialog";
@@ -145,8 +147,9 @@ export const SkillsCard = () => {
 
   const handleAiCreate = async () => {
     const s = getSettings();
-    if (!s.apiKey?.trim() || !s.defaultModel?.id?.trim()) {
-      toast.error("先在设置页配好 API Key 和默认模型");
+    const defaultModel = defaultModelForProvider(s);
+    if (!hasActiveModelCreds() || !defaultModel?.id?.trim()) {
+      toast.error("先在设置页配好模型和凭据");
       return;
     }
     if (s.disabledSkills?.includes("skill-creator")) {
@@ -163,7 +166,8 @@ export const SkillsCard = () => {
         mode: "chat",
         title: "创建 skill",
         repoPaths: [appSkillsDir],
-        model: s.defaultModel,
+        model: defaultModel,
+        provider: s.provider,
         disabledMcpServers:
           s.disabledMcpServers && s.disabledMcpServers.length > 0
             ? s.disabledMcpServers

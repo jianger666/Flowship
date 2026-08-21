@@ -61,6 +61,7 @@ import type {
 import { accumulateTokenUsage } from "@/lib/token-usage";
 import { normalizeReqId } from "@/lib/req-id";
 import { mrTargetBranchOf } from "@/lib/task-display";
+import { modelForProviderSwitch, isProviderSwitchLocked } from "@/lib/agent-provider";
 import {
   cleanupOrphanTaskWorktrees,
   computeNonGitRepoPaths,
@@ -1362,6 +1363,7 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
       input.isolateWorktree,
     ),
     model: input.model,
+    provider: input.provider,
     pinned: false,
     createdAt: now,
     updatedAt: now,
@@ -2023,6 +2025,42 @@ export const setTaskModel = async (
     const meta = await readMetaV06(id);
     if (!meta) return null;
     meta.model = model;
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
+ * 本窗口切提供方（可同时改写默认模型）。跟切模型同款：只落盘、下一轮启动才生效。
+ * 任务创建后、chat 发过消息后拒绝。
+ */
+export const setTaskProvider = async (
+  id: string,
+  provider: string,
+  model?: ModelSelection,
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    if (isProviderSwitchLocked(meta)) {
+      throw new Error(
+        meta.mode === "chat"
+          ? "已发送过消息，不能切换提供方"
+          : "任务创建后不能切换提供方",
+      );
+    }
+    const prev = meta.provider?.trim() || "cursor";
+    meta.provider = provider;
+    const nextModel = modelForProviderSwitch(model);
+    if (prev !== provider) {
+      // 两条自定义之间 sessionMatchesProvider 分不出来（都是 pi 锚点），
+      // 切提供方必须丢掉旧会话，下一轮 Agent.create，禁止 resume 到别人的 HTTP 上。
+      meta.sessionAgentId = undefined;
+      // 模型跟新提供方走：没配默认就清空，不能留上一家的 id
+      meta.model = nextModel;
+    } else if (nextModel) {
+      meta.model = nextModel;
+    }
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);

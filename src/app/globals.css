@@ -289,6 +289,15 @@
   overflow-anchor: none;
 }
 
+/* 下拉弹层退出预留槽：这条必须写在上面的 stable 后面。
+   组件上写 [scrollbar-gutter:auto] 会被 .overflow-y-auto 盖掉（同样 0,1,0，本文件更晚）。
+   短列表不滚动也占 8px → 弹层比按钮窄、字比 trigger 更靠左（设置页角色下拉实测）。 */
+[data-slot="popover-content"] .overflow-y-auto,
+[data-slot="select-content"],
+[data-slot="dropdown-menu-content"] {
+  scrollbar-gutter: auto;
+}
+
 /* ---------- Streamdown 代码块 / 表格减重（v1.0.x、用户实测「双层卡片 + 操作栏太重」） ----------
    Streamdown 默认给代码块 / 表格 / mermaid 套「外层 rounded-xl border bg-sidebar p-2 +
    内层再一圈 border」的双层卡片、外加 my-4 大间距——聊天密度下视觉过重。
@@ -495,15 +504,5 @@
   mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>') center / contain no-repeat;
 }
 
-/* 栏内搜索：CSS Custom Highlight 直接标真实渲染文本，不改 React / Streamdown DOM。 */
-::highlight(flowship-artifact-search),
-::highlight(flowship-event-search) {
-  color: inherit;
-  background-color: color-mix(in oklch, var(--warning) 45%, transparent);
-}
-::highlight(flowship-artifact-search-active),
-::highlight(flowship-event-search-active) {
-  color: inherit;
-  background-color: color-mix(in oklch, var(--warning) 78%, transparent);
-  text-decoration: underline 2px color-mix(in oklch, var(--warning) 85%, black);
-}
+/* 栏内搜索 ::highlight() 不能写在这里：Turbopack / Lightning CSS 解析会炸。
+   样式由 layout 注入 src/lib/search-highlight-css.ts，功能不变。 */

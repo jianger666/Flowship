@@ -619,6 +619,7 @@ describe("buildCompanyEnvBrief", () => {
     expect(brief).toContain(ABS);
     expect(brief).toContain("note");
     expect(brief).not.toContain("ssh-exec.mjs");
+    expect(brief).not.toContain("pg-exec");
   });
 
   it("未配置服务器 → 不输出 SSH 指引", () => {
@@ -632,6 +633,7 @@ describe("buildCompanyEnvBrief", () => {
     expect(brief).toContain("自定义（日志路径模板）");
     expect(brief).not.toContain("ssh-exec.mjs");
     expect(brief).not.toContain("SSH 登录服务器");
+    expect(brief).not.toContain("pg-exec");
   });
 
   it("只配 XXL / Nacos / ELK → 也注入", () => {
@@ -706,6 +708,7 @@ describe("buildCompanyEnvBrief", () => {
     expect(brief).toContain("HTTP API");
     expect(brief).toContain("禁止 cat");
     expect(brief).toContain("ssh-exec.mjs");
+    expect(brief).toContain("pg-exec.mjs");
     expect(brief).not.toContain("PGPASSWORD");
     expect(brief).not.toContain("【填写】");
     expect(brief).not.toContain("password");
@@ -735,6 +738,24 @@ describe("buildCompanyEnvBrief", () => {
       'node "/Applications/My App/ssh-exec.mjs" --config "/tmp/fe-data/company-env.json" --env <环境名> [--user <用户>] -- \'<远程命令>\'',
     );
     expect(brief).toContain("单个带引号的参数");
+    expect(brief).not.toContain("pg-exec");
+  });
+
+  it("有 PostgreSQL → 含 pg-exec 绝对路径；未配则不含", () => {
+    const withPg = buildCompanyEnvBrief(
+      {
+        ...emptyCompanyEnv(),
+        pg: [pgRow({ host: "db1", readonly: true })],
+      },
+      "/tmp/fe-data/company-env.json",
+      "ssh-exec.mjs",
+      "/Applications/My App/pg-exec.mjs",
+    );
+    expect(withPg).toContain(
+      `node "/Applications/My App/pg-exec.mjs" --config "/tmp/fe-data/company-env.json" --env <环境名> -- '<SQL>'`,
+    );
+    expect(withPg).toContain("不要自己写 Python");
+    expect(withPg).not.toContain("ssh-exec.mjs");
   });
 
   it("多实例只读性不一致 → 报只读条数、让 AI 回配置文件逐条判断", () => {

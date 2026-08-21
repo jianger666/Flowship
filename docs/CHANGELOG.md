@@ -15,6 +15,38 @@
 
 ---
 
+### v1.9.0（2026-08-21）自定义 HTTP 提供方
+
+- **窗口自己的后端**：设置页可新增多条自定义提供方；`settings.provider` 只影响新建。老任务没有 `task.provider` 的继续走 Cursor，不会被设置页默认劫持。旧单槽 `customProvider` 读盘迁成 `cp_legacy`。chat / 推进 / 答题走同一套 `agent-backend`（cursor = SDK，自定义 = pi）。
+- **选择器**：提供方+模型并排；星标按提供方最多 2 个；思考档自定义统一 `thinking`。
+- **其它**：`pg-exec.mjs` 查库（有 PG 配置才进 brief）；飞书桥接占用改注意态；pi shell 超时按秒；SDK `rg` 注入 PATH；回合内工具失败不再当红框崩溃。
+- **升级**：未配自定义的老用户行为与 v1.8.2 相同。Cursor JSONL store 口径沿用 v1.8.2。
+
+### 2026-08-19 自定义 provider 默认模型不再回退 Cursor
+
+- **为什么**：设置页切到自定义后，默认模型仍显示 `composer-2.5`。那是 Cursor 的 id，自定义端点认不得。根因是 `defaultModelForProvider` 在 custom 未配时回退 `settings.defaultModel`。
+- **改了什么**：custom 只读该条 `defaultModel`，未配就是空（设置页「选择模型」、窗口里没选则 toast「请选择模型」）。切 provider 立刻清掉上一侧模型列表。新用户「开始使用」第一项改成「模型」（凭据 + 默认模型都要齐），深链 `?focus=model`；已就绪过的老用户仍走 sticky、不回清单。
+- **故意不动**：不自动点选自定义列表第一项（OpenAI 兼容列表很长、第一项不一定能用）。Cursor 默认模型仍是空起步，不写死 composer-2.5。
+
+### 2026-08-19 SDK store 躲开用户级 SQLite WAL（`unable to open database file`）
+
+- **为什么**：同事长 run 收尾报 `[internal] unable to open database file`。这是 Cursor SDK 默认 SQLite store（`~/.cursor` 下 WAL）被杀毒 / OneDrive 拦掉，不是 Flowship 自己的库。官方规避是换 JSONL store。
+- **改了什么**：`Agent.create` / `resume` / `prompt` 经 `agent-backend` 统一挂 `dataRoot/sdk-agent-store` 的 `JsonlLocalAgentStore`（不写用户主目录）。同事当前安装包还没这层时，用一次性 Windows 检修脚本（仓库根目录 `发给同事-Windows-SDK-store检修/`，发完可删）。`.ps1` 必须 UTF-8 BOM + 不要中文标点贴着英文引号，否则 WinPS 5 按 GBK 读会把引号吃掉、整份解析失败。
+- **故意不动**：自定义 provider（pi）不走 Cursor store；不在 instrumentation 里 `Cursor.configure`（那个 bundle 不能碰 `@cursor/sdk`）。
+
+### 2026-08-18 `next dev` 一律 Turbopack + 根布局卸 Markdown
+
+- **为什么**：webpack `next dev` 进程常驻 9–11GB，16GB 机器 GC + swap，导航 / 刷新会卡到 60s。不要同时养两套开发打包器。
+- **改了什么**：所有 `next dev` 入口加 `--turbo`（`dev:web` + `pnpm start` / `dev-open.mjs`）；`next.config.mjs` 配 `turbopack.root`（与 tracing root 同口径，消掉 webpack-only 警告）。本地文件预览正文（Streamdown / Shiki）改 `next/dynamic`。`::highlight()` 不能进 `globals.css`（Next 15.5 Lightning CSS 解析失败），改由 layout 注入 `search-highlight-css.ts`。`instrumentation` 拆出 `instrumentation-node.ts`，避免 turbo 把 `process.on` / `node:*` 编进 Edge。
+- **故意不动**：`next build` 仍走 webpack（正式桌面包 / 发版链吃的是这份产物，运行时不再过打包器）。
+
+### 2026-08-18 ask_user 收尾对齐 Cursor SDK（去掉空完成硬限制）
+
+- **为什么**：Composer 2.5 调 `ask_user` 后 prompt 硬性禁止提问后再说话。Cursor 宿主看到空完成会注入 `Please continue. Respond to the user or make tool calls.`，模型把这当续跑信号、同一轮再问一次——答题卡不消失但答案已经送进 AI。
+- **改了什么**：prompt / 工具返回（`askSubmittedText`、`ask_user` description、`flowship-tools`、`prompts/_super.md`）去掉「提问后不许输出」这类硬限制；中性告知答题卡已经是给用户看的提问、提问后再说会被静音（用户看不见）、说不说都行；仍要求结束本轮、别等 / 别轮询、别再调本工具重复提问。答案仍以 `[ASK_USER_REPLY]` 新消息送达。
+- **故意不加**同轮第二次 `ask_user` 硬闸（pending / takenAsks 拒绝）——那种闸是补丁，这次顺着 SDK 改 prompt 即可。
+- **mute 实现不动**：`askSeen` 后 thinking / 正文 / 工具 muted 不广播，保持原样。
+
 ### 2026-08-05 交卷/提问收尾收敛 + 任务详情头部重构 + 每仓分支切换（v1.7.1）
 
 - **交卷/提问收尾协议收敛**：`submit_work` 成功即刻由平台补发固定收尾「已完成，产出已更新，请审阅。」（AI 播报形态、内容统一、不泄露 submit_work 等内部术语）；交卷 / 提问成功后的模型输出（thinking / 正文 / 工具）照常落盘但带 `meta.muted` 标记、**不 SSE 广播**——审计保留、UI 不渲染，同时修掉上版「消音事件广播 → 前端每 chunk 重渲事件流 → 滚动抖动」的回归；删除「Action 产出完成、等待 ack」info 里程碑（状态流转 / 群播报不依赖它）；prompt 与工具返回文案同步：收到宿主 `Please continue` 提醒直接结束、不重问不调查。

@@ -45,6 +45,10 @@ describe("错误：独立平铺成 destructive 卡", () => {
     expect(rows).toContain("<ErrorCard");
   });
 
+  it("回合内工具失败不进 ErrorCard（带 callId 的 error 直接丢掉）", () => {
+    expect(rows).toContain("isInTurnToolErrorEvent");
+  });
+
   it("错误分流在 chat / log 分叉之前——两形态共用同一张卡", () => {
     const errIdx = rows.indexOf('if (ev.kind === "error")');
     // EventRowImpl 里 chat 分支的段落标题（StreamingAssistantRow 也有个 variant 判断、
@@ -163,8 +167,8 @@ describe("thinking 耗时", () => {
   });
 
   it("数据源还在：mergeAdjacentThinking 累加 durationMs", () => {
-    const utils = read("components", "tasks", "event-stream", "utils.tsx");
-    expect(utils).toContain("durationMs: lastDur + curDur");
+    const merge = read("lib", "merge-thinking.ts");
+    expect(merge).toContain("durationMs: lastDur + curDur");
   });
 
   it("工作过程组头改用共享耗时口径、不再自己写一份", () => {
