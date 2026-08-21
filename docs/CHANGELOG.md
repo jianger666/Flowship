@@ -47,6 +47,22 @@
 - **故意不加**同轮第二次 `ask_user` 硬闸（pending / takenAsks 拒绝）——那种闸是补丁，这次顺着 SDK 改 prompt 即可。
 - **mute 实现不动**：`askSeen` 后 thinking / 正文 / 工具 muted 不广播，保持原样。
 
+### 2026-08-19 SDK store 改挂 JSONL，避开 Windows WAL 打不开（v1.8.2）
+
+- **为什么**：同事 Windows 长 run 收尾报 `[internal] unable to open database file`。Cursor SDK 默认把 agent store 写成用户级 SQLite（`~/.cursor` 下 `store.db-wal` / `store.db-shm`），杀毒实时扫描或 OneDrive 重定向家目录时，run 收尾重开 WAL 会 `SQLITE_CANTOPEN`（官方 2026-07-28 已确认）。
+- **改了什么**：四个 `Agent.create` / `resume` / `prompt` 入口改走 `cursor-sdk-agent`，统一挂 `dataRoot/sdk-agent-store` 的 `JsonlLocalAgentStore`。Flowship 自己的会话恢复仍读 `events.jsonl` / artifact，不依赖这份 SDK store。
+- **升级影响**：app 重启后内存 agent 本来就会丢；旧 `sessionAgentId` 在 `~/.cursor` SQLite 里，新代码在 JSONL 里 resume 失败会清锚点、按事件流起新会话。第一次续聊可能闪「正在恢复会话…」、多花一点 token。中途 run 会被重启打断（发版本来就要重启）。
+- **故意不加**：本机杀毒 / OneDrive 检修脚本（Windows 同事双击 PowerShell 因编码解析失败，这条路放弃）。
+- **门禁**：typecheck / lint / `tests/sdk-agent-store.test.ts`。
+
+### 2026-08-15 交卷答案上屏 + 滚动跟随修抖动 + wk 门禁 Delivery Hub 拉取（v1.8.1）
+
+- **交卷收尾语义调整**：`submit_work` 交卷后模型的回答（结论 / 答案）**照常上屏、不再静音**；固定收尾「已完成，产出已更新，请审阅。」改在 run 自然结束时、答案之后补发（此前交卷后正文静音、收尾即刻弹出、用户看不到交卷后的补充说明）。提问（ask_user）仍保持「答题卡即收尾、之后消音」。
+- **滚动跟随修抖动**：跟随判定优先级改为「用户上滚意图 > 几何贴底」——只要主动上滚（不管滚多远）就离开跟随、滚回底部才恢复，修掉流式内容增长把用户拽回底部导致的滚动条上下抖动（scroll-follow.ts）。
+- **wk 门禁 Delivery Hub 拉取**：区分「没配 Delivery Hub（本地没有 = 真没有）」与「配了 Hub（本地没有 = 远端会拉）」两种提示；配了 Hub 且本地缺 `requirements/<REQ-ID>` 目录时建空目录放行、preflight 的 baseline pull 自动从远端拉回方案再校验，不再一律诱导改编号（wk-gate.ts）。
+- **GitLab host 推导排除脚本仓**：`resolveEffectiveGitHost` 新增 `excludeRepoPaths`，脚本仓（不 ship / 不提 MR、origin 常挂别的实例）不参与多实例 fail-fast 推导（gitlab-host.ts）。
+- **门禁**：typecheck / lint 通过。
+
 ### 2026-08-05 交卷/提问收尾收敛 + 任务详情头部重构 + 每仓分支切换（v1.7.1）
 
 - **交卷/提问收尾协议收敛**：`submit_work` 成功即刻由平台补发固定收尾「已完成，产出已更新，请审阅。」（AI 播报形态、内容统一、不泄露 submit_work 等内部术语）；交卷 / 提问成功后的模型输出（thinking / 正文 / 工具）照常落盘但带 `meta.muted` 标记、**不 SSE 广播**——审计保留、UI 不渲染，同时修掉上版「消音事件广播 → 前端每 chunk 重渲事件流 → 滚动抖动」的回归；删除「Action 产出完成、等待 ack」info 里程碑（状态流转 / 群播报不依赖它）；prompt 与工具返回文案同步：收到宿主 `Please continue` 提醒直接结束、不重问不调查。

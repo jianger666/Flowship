@@ -426,6 +426,7 @@ ai-flow-action-hub/
 | Electron 桌面端发版链（V0.7.0 薄壳 + 打包 + 自更新；v0.7.15 起唯一发版链、server 布局组包走公共函数 assemble-server） | `electron-app/main.js` + `electron-builder.yml` + `scripts/assemble-electron-server.mjs` + `scripts/lib/assemble-server.mjs` + `src/lib/server/data-root.ts` |
 | **light/dark 三态主题 + 自定义同色一体标题栏（v0.7.23、next-themes 三态跟随系统 + 壳 hiddenInset/titleBarOverlay 顶栏；色板/prism/滚动条全主题变量化）** | `src/components/app-header.tsx` + `src/components/theme-toggle.tsx` + `src/app/globals.css` + `electron-app/{main.js,preload.cjs}` |
 | **chat 模式独立 runner（V0.6.0.1 新、v0.7.23 进入即占位注册修「停止后还回复」冷启动竞态）** | `src/lib/server/chat-runner.ts` |
+| **SDK 本地 agent store（躲开 `~/.cursor` SQLite WAL）** | `src/lib/server/sdk-agent-store.ts` + `src/lib/server/agent-backend.ts` |
 | **chat 模式 UI（V0.6.0.1 新）** | `src/components/tasks/chat-view.tsx` |
 | **chat 模式 API** | `src/app/api/tasks/[id]/chat-reply/route.ts` |
 | MCP server 本体（v0.9.8 瘦身：工具注册 + premature 兜底 + session transport；V0.11 起 wait 协议退役、submit_work / ask_user 非阻塞） | `src/lib/server/chat-mcp.ts` |
