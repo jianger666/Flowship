@@ -53,7 +53,9 @@ import {
   formatRepoSectionForPrompt,
   getEffectiveCwd,
 } from "@/lib/path-utils";
+import { existsSync } from "node:fs";
 import os from "node:os";
+import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { createRunPerfTracker } from "./run-perf";
@@ -550,6 +552,8 @@ const buildInitialPrompt = (
   larkCliAuthSection = "",
   /** 公司环境常驻声明（有 servers/PG 时非空） */
   companyEnvBriefSection = "",
+  /** cursor 后端链路：pi 的 resource-loader 会自动注入仓库 AGENTS.md，cursor 不会，需补一条必读指令 */
+  isCursorBackend = false,
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -568,14 +572,16 @@ const buildInitialPrompt = (
     // 回合协议（正常多轮对话、说完自然结束回复）单一源、见 wait-protocol-prompt.ts
     chatTurnProtocolSection(),
     "",
-    // 工具清单 = 规范工具面（cursor / pi / 未来 cc、codex 都对齐同一组名，见 docs/pi-api-spec.md）
+    // 工具清单 = 能力导向、不硬编码具体工具名：cursor 链路真实名是 Read/StrReplace 等
+    // PascalCase、pi 链路是 read/edit 等小写——写死任何一端都会漂移（双链路审计实测踩过），
+    // schema 才是唯一真相源，这里只做能力概述并显式声明权威来源
     "## 你能用的工具",
     "",
-    "SDK 内置工具（**名字不带 `_file` 后缀**、就是 `read` / `edit` / `write`、不是 `read_file` 之类）：",
-    "  - `read` 读文件（图片自动走 vision）　`grep` 搜内容　`glob` 找文件名",
-    "  - `shell` 跑命令　`edit` 改已有文件　`write` 建新文件 / 整文件覆盖　`delete` 删文件　`task` 分派子任务",
+    "核心能力（**准确名称与参数一律以你实际收到的工具 schema 为准，不要凭记忆猜名字**）：",
+    "  - 读文件（图片会作为附件给你看）　按内容搜索　按文件名找文件",
+    "  - 编辑已有文件　新建 / 整文件覆盖　删除文件　跑 shell 命令（timeout 参数语义见 schema 说明）　分派子任务",
     "",
-    "另外还有用户配的其他 MCP（飞书 / context7 等）、按场景用。",
+    "另外还有用户配置的 MCP 工具（飞书 / github / context7 等），已在你收到的工具列表里、按场景用。",
     "",
   );
   // 仅 win32 注入（PowerShell 语法条再按当前壳判定）——mac 用户不吃无关内容
@@ -615,6 +621,18 @@ const buildInitialPrompt = (
   if (task.repoPaths.length === 0) {
     lines.push(
       "⚠️ 当前未绑定工作目录、cwd 是用户主目录——写文件/执行有副作用的命令前必须先向用户确认。",
+      "",
+    );
+  } else if (
+    isCursorBackend &&
+    existsSync(path.join(getEffectiveCwd(task.repoPaths), "AGENTS.md"))
+  ) {
+    // pi 链路的 resource-loader 会自动发现并注入仓库 AGENTS.md；cursor 链路实测不会
+    // （双链路审计确认），这里补一条必读指令、避免 cursor 链路全程看不到项目约定
+    lines.push(
+      "## 项目规则（必读）",
+      "",
+      `本任务绑定了工作目录，其中的 \`AGENTS.md\` 是项目级约定、不会自动进入你的上下文。回复涉及该仓库的代码 / 文档前，必须先用 read 工具读一次 \`${path.join(getEffectiveCwd(task.repoPaths), "AGENTS.md")}\` 并遵守其约定。`,
       "",
     );
   }
@@ -1051,6 +1069,7 @@ export const runChatSession = async (
       gitlabAccessSection,
       buildLarkCliAuthMissingRule(),
       companyEnvBriefSection,
+      isCursorProvider(providerId),
     );
     const perfPromptMs = Date.now() - perfPromptStart;
 
