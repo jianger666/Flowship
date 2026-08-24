@@ -46,6 +46,13 @@ function cleanEnv() {
   const env = { ...process.env };
   delete env.__NEXT_PRIVATE_STANDALONE_CONFIG;
   delete env.NEXT_DEPLOYMENT_ID;
+  // 宿主（Electron app-server）拉起 agent shell 时注入的变量：带着它们直启 Electron
+  // 二进制会被当纯 node 跑（ELECTRON_RUN_AS_NODE）或绑错端口 / 数据目录，一律剔除。
+  // 尤其启动 App 这一步：open/直启链路只要沾到这些就可能静默早退（2026-08-24 实测）
+  delete env.ELECTRON_RUN_AS_NODE;
+  delete env.PORT;
+  delete env.HOSTNAME;
+  delete env.FLOWSHIP_DATA_DIR;
   return env;
 }
 
@@ -259,6 +266,7 @@ async function main() {
       try {
         await runSpawn(launchSpec, {
           label: "launch restored FlowshipTest",
+          env: cleanEnv(),
           detached: launchSpec.detached,
         });
         await waitForTestAppState(platform, true);
@@ -276,6 +284,7 @@ async function main() {
   try {
     await runSpawn(launchSpec, {
       label: "launch FlowshipTest",
+      env: cleanEnv(),
       detached: launchSpec.detached,
     });
     await waitForTestAppState(platform, true);

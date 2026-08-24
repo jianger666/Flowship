@@ -233,8 +233,15 @@ export function isTestAppRunningFromProbe(
 /** 启动规范路径下的 unpacked test 包 */
 export function buildLaunchTestAppSpec(launchPath, platform = process.platform) {
   if (platform === "darwin") {
-    // -n 强制 LaunchServices 创建新实例，避免请求被仍在退出的旧实例吞掉。
-    return { command: "open", args: ["-n", launchPath], detached: false };
+    // 直启二进制、不走 `open -n`：实测从 agent 宿主链路拉起时，open 拉起的实例会
+    // 静默早退（2026-08-24 两次复现、无崩溃日志）；直启 + 清洗环境变量稳定。
+    // detached 让脚本退出后 App 存活（与 win32 同款）。
+    const binaryName = path.basename(launchPath).replace(/\.app$/i, "");
+    return {
+      command: path.join(launchPath, "Contents", "MacOS", binaryName),
+      args: [],
+      detached: true,
+    };
   }
   if (platform === "win32") {
     return { command: launchPath, args: [], detached: true };

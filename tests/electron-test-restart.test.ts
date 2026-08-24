@@ -191,12 +191,12 @@ describe("buildQuitTestAppSpec", () => {
 });
 
 describe("buildLaunchTestAppSpec", () => {
-  it("mac 用 open -n 强制创建新实例", () => {
+  it("mac 直启二进制（不走 open，避免宿主链路拉起静默早退）", () => {
     const app = "/tmp/FlowshipTest.app";
     expect(buildLaunchTestAppSpec(app, "darwin")).toEqual({
-      command: "open",
-      args: ["-n", app],
-      detached: false,
+      command: "/tmp/FlowshipTest.app/Contents/MacOS/FlowshipTest",
+      args: [],
+      detached: true,
     });
   });
 
