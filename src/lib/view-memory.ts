@@ -21,10 +21,12 @@ const ss = (): Storage | null => {
 
 const LAST_CHAT_KEY = "flowship:last-chat-id";
 
+/** 记住「最后浏览的对话」task id；切到胶囊其它页再切回时优先落它 */
 export const rememberLastChat = (taskId: string) => {
   ss()?.setItem(LAST_CHAT_KEY, taskId);
 };
 
+/** 读回最后浏览的对话 task id；没记过或存储不可用返回 null */
 export const getLastChatId = (): string | null =>
   ss()?.getItem(LAST_CHAT_KEY) ?? null;
 
@@ -37,9 +39,11 @@ export type DraftScope = "reply" | "talk";
 const draftKey = (scope: DraftScope, taskId: string) =>
   `flowship:draft:${scope}:${taskId}`;
 
+/** 读指定 scope + task 的输入草稿；无草稿返回空串 */
 export const loadDraft = (scope: DraftScope, taskId: string): string =>
   ss()?.getItem(draftKey(scope, taskId)) ?? "";
 
+/** 保存输入草稿；text 为空串时删除该草稿位（发送后清） */
 export const saveDraft = (scope: DraftScope, taskId: string, text: string) => {
   const s = ss();
   if (!s) return;
@@ -59,10 +63,12 @@ interface ScrollAnchor {
 // 模块级内存：key = taskId
 const scrollAnchors = new Map<string, ScrollAnchor>();
 
+/** 记录离开任务事件流时的滚动锚点（模块内存，reload 即忘） */
 export const saveScrollAnchor = (taskId: string, anchor: ScrollAnchor) => {
   scrollAnchors.set(taskId, anchor);
 };
 
+/** 读回滚动锚点；没记过（或贴底跟随中不恢复）由消费方判断 atBottom */
 export const getScrollAnchor = (taskId: string): ScrollAnchor | undefined =>
   scrollAnchors.get(taskId);
 
@@ -90,6 +96,7 @@ const readSeenMap = (): Record<string, number> => {
   }
 };
 
+/** 标记任务详情已被打开（写入当前时间戳，超容量按最老裁剪） */
 export const markTaskSeen = (taskId: string) => {
   try {
     const map = readSeenMap();
@@ -108,6 +115,7 @@ export const markTaskSeen = (taskId: string) => {
   }
 };
 
+/** 读任务最后被打开的时间戳；从未打开过返回 0 */
 export const getTaskSeenAt = (taskId: string): number =>
   readSeenMap()[taskId] ?? 0;
 
@@ -115,6 +123,7 @@ export const getTaskSeenAt = (taskId: string): number =>
 
 const BOX_HEIGHT_KEY = "flowship:talk-box-height";
 
+/** 读用户拖过的输入条高度；没存过或值非法返回 null */
 export const loadBoxHeight = (): number | null => {
   try {
     const v = Number(localStorage.getItem(BOX_HEIGHT_KEY));
@@ -124,6 +133,7 @@ export const loadBoxHeight = (): number | null => {
   }
 };
 
+/** 保存输入条拖动后的高度（四舍五入取整） */
 export const saveBoxHeight = (h: number) => {
   try {
     localStorage.setItem(BOX_HEIGHT_KEY, String(Math.round(h)));
@@ -136,6 +146,7 @@ export const saveBoxHeight = (h: number) => {
 
 const BOARD_RANGE_KEY = "flowship:board-range";
 
+/** 读看板时间范围；没存过或数据非法（from > to / 类型不对）返回 null */
 export const loadBoardRange = (): { from: number; to: number } | null => {
   try {
     const raw = ss()?.getItem(BOARD_RANGE_KEY);
@@ -154,6 +165,7 @@ export const loadBoardRange = (): { from: number; to: number } | null => {
   }
 };
 
+/** 保存看板时间范围（会话级，重启后回默认防陈旧日期） */
 export const saveBoardRange = (range: { from: number; to: number }) => {
   ss()?.setItem(BOARD_RANGE_KEY, JSON.stringify(range));
 };
@@ -181,6 +193,7 @@ export const loadSidebarCollapsedGroups = (): Set<string> => {
   }
 };
 
+/** 保存折叠中的侧栏分组 key 集合（覆盖写） */
 export const saveSidebarCollapsedGroups = (keys: Iterable<string>) => {
   try {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify([...keys]));
@@ -202,6 +215,7 @@ export const loadSidebarPinnedOrder = (): string[] => {
   }
 };
 
+/** 保存置顶区手动顺序（整体覆盖）；未出现的 pinned 由消费方追加末尾 */
 export const saveSidebarPinnedOrder = (ids: readonly string[]) => {
   try {
     localStorage.setItem(SIDEBAR_PINNED_ORDER_KEY, JSON.stringify([...ids]));
