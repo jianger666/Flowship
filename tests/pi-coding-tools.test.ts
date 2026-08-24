@@ -30,9 +30,9 @@ describe("resolveShellTimeoutMs", () => {
     expect(resolveShellTimeoutMs(60_000)).toBe(60_000);
   });
 
-  it("夹到 5 秒 ~ 10 分钟，避免再出现 15ms 秒杀", () => {
-    expect(resolveShellTimeoutMs(1)).toBe(5_000);
-    expect(resolveShellTimeoutMs(4)).toBe(5_000);
+  it("夹到 1 秒 ~ 10 分钟，避免再出现 15ms 秒杀", () => {
+    expect(resolveShellTimeoutMs(1)).toBe(1_000);
+    expect(resolveShellTimeoutMs(2)).toBe(2_000);
     expect(resolveShellTimeoutMs(999)).toBe(10 * 60 * 1000);
     expect(resolveShellTimeoutMs(20 * 60 * 1000)).toBe(10 * 60 * 1000);
   });

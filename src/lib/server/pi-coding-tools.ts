@@ -6,7 +6,9 @@
  *
  * pi 原生是 read / bash / edit / write / grep / find / ls，其中：
  *   - read / grep / edit / write 名字一致、直接走 pi 原生（在 createAgentSession.tools 里留）
- *   - bash → shell、find → glob：这里包成 customTools 重命名（排除 pi 原生的 bash/find）
+ *   - bash → shell、find → glob：这里包成 customTools 重命名（排除 pi 原生的 bash/find）。
+ *     shell 的执行内核复用 pi 原生 createLocalBashOperations（detached spawn + 超时/取消
+ *     killProcessTree 整树杀），本层只保留薄壳职责：改名、宿主环境变量清洗、超时语义收敛
  *   - delete：pi 没有、这里补一个（node fs.rm）
  *   - task（子 agent 分派）：pi 无子 agent，在 custom-agent-backend.ts 里用进程内嵌套会话实现
  *
@@ -15,11 +17,10 @@
  * pi 规范字段再交给原生 execute（customTools 同名会盖掉 builtin）。
  */
 
-import { exec } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
 import { glob } from "glob";
+import { stripHostInjectedEnv } from "./host-env";
 import {
   Number as TBNumber,
   Object as TBObject,
@@ -28,23 +29,22 @@ import {
 } from "typebox/type";
 import {
   createEditToolDefinition,
+  createLocalBashOperations,
   createReadToolDefinition,
   createWriteToolDefinition,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
-const execAsync = promisify(exec);
-
 const asTool = (d: unknown): ToolDefinition => d as ToolDefinition;
 
 const DEFAULT_SHELL_TIMEOUT_MS = 60_000;
-const MIN_SHELL_TIMEOUT_MS = 5_000;
+const MIN_SHELL_TIMEOUT_MS = 1_000;
 const MAX_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Node `exec` 的 timeout 是毫秒。模型（Cursor / Claude 习惯）经常传秒：15、30、60。
  * 真实踩坑：模型传 timeout:15 → 被当成 15ms → curl 立刻被杀 → 模型误判「这台机器不能出网」。
- * 未传 → 60s；<1000 当秒；≥1000 当毫秒；再夹到 5s~10min。
+ * 未传 → 60s；<1000 当秒；≥1000 当毫秒；再夹到 1s~10min。
  */
 export const resolveShellTimeoutMs = (raw: unknown): number => {
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
@@ -53,6 +53,15 @@ export const resolveShellTimeoutMs = (raw: unknown): number => {
   const asMs = raw < 1000 ? raw * 1000 : raw;
   return Math.min(MAX_SHELL_TIMEOUT_MS, Math.max(MIN_SHELL_TIMEOUT_MS, asMs));
 };
+
+/**
+ * pi 原生本地 shell 执行后端（包级导出、给 extension 复用官方行为的口子）：
+ * detached spawn + 超时/abort 时 killProcessTree 整树杀——比裸 exec 只杀 bash 包装进程强，
+ * 长驻命令超时不再留孙进程孤儿。模块级单例即可（无会话状态）。
+ */
+const localBash = createLocalBashOperations();
+/** 输出收集上限（对齐原 maxBuffer 10MB） */
+const MAX_SHELL_OUTPUT_BYTES = 10 * 1024 * 1024;
 
 /** 超时被杀时把「不是断网」说清楚，避免模型把 15ms kill 编成环境隔离。 */
 export const formatShellFailureText = (opts: {
@@ -190,7 +199,11 @@ const shellTool = (cwd: string): ToolDefinition =>
       workingDirectory: TBOptional(TBString()),
     }),
     prepareArguments: prepareShellArgs,
-    execute: async (_toolCallId: string, params: unknown) => {
+    execute: async (
+      _toolCallId: string,
+      params: unknown,
+      signal?: AbortSignal,
+    ) => {
       const p = params as {
         command?: unknown;
         timeout?: unknown;
@@ -211,40 +224,48 @@ const shellTool = (cwd: string): ToolDefinition =>
           details: { exitCode: 1 },
         };
       }
+      // 声明在 try 外：超时/abort 抛错后 catch 仍能把已产生的部分输出带回给模型排障
+      const chunks: Buffer[] = [];
+      let total = 0;
       try {
-        const { stdout, stderr } = await execAsync(command, {
-          cwd: workCwd,
-          timeout,
-          maxBuffer: 10 * 1024 * 1024,
-          shell: process.platform === "win32" ? "cmd.exe" : "/bin/bash",
+        const { exitCode } = await localBash.exec(command, workCwd, {
+          onData: (data) => {
+            if (total >= MAX_SHELL_OUTPUT_BYTES) return;
+            chunks.push(data);
+            total += data.length;
+          },
+          // pi 原生 exec 的 timeout 单位是秒；timeout 已收敛为 ms
+          timeout: timeout / 1000,
+          // 对齐 VS Code getUnixShellEnvironment：宿主注入变量（ELECTRON_RUN_AS_NODE /
+          // PORT / FLOWSHIP_DATA_DIR 等）不泄进 agent shell，否则用户命令启动 Electron
+          // 二进制会静默秒退、next build 会报 generate is not a function（见 host-env.ts）
+          env: stripHostInjectedEnv(),
+          signal: signal ?? undefined,
         });
-        const out = [stdout, stderr].filter(Boolean).join("\n");
+        const out = Buffer.concat(chunks).toString().trim();
+        // 失败时把退出码显式写进文本：details 字段只有宿主能看，模型只看 content
+        const exitNote = exitCode ? `\n（exit code ${exitCode}）` : "";
         return {
-          content: [{ type: "text", text: out || "(无输出)" }],
-          details: { exitCode: 0 },
+          content: [{ type: "text", text: (out || "(无输出)") + exitNote }],
+          details: { exitCode: exitCode ?? -1 },
         };
       } catch (err) {
-        const e = err as {
-          stdout?: string;
-          stderr?: string;
-          code?: number;
-          killed?: boolean;
-          message?: string;
-        };
+        // pi 原生内核的超时抛 Error("timeout:<秒>")、abort 抛 Error("aborted")，都算被杀
+        const message = err instanceof Error ? err.message : String(err);
+        const killed = message.startsWith("timeout:") || message === "aborted";
         return {
           content: [
             {
               type: "text",
               text: formatShellFailureText({
                 timeoutMs: timeout,
-                killed: e.killed === true,
-                stdout: e.stdout,
-                stderr: e.stderr,
-                message: e.message,
+                killed,
+                stdout: Buffer.concat(chunks).toString(),
+                message: killed ? undefined : message,
               }),
             },
           ],
-          details: { exitCode: typeof e.code === "number" ? e.code : 1 },
+          details: { exitCode: 1 },
         };
       }
     },
