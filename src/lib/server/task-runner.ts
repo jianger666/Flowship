@@ -3738,7 +3738,7 @@ export const handleRunFailure = async (
  * 问一问 run 收尾：按当前 action 状态把 runStatus 归回「提问前」的等待位
  * （awaiting_ack / running → awaiting_user、error → error、其余 → idle）。
  * action 仍 running（断掉半路、用户插话唤醒的场景）归 awaiting_user、保住侧栏
- * 「已暂停」可说话唤醒的语义、而不是静默变「空闲」。
+ * 「待输入」（原「已暂停」）可说话唤醒的语义、而不是静默变「空闲」。
  * 只在 runStatus 还挂 running 时动手（compare-set、不覆盖 notifier 已落的状态）。
  *
  * 调用方须先过 `shouldRestoreAfterQuestion`——gen stale / lifecycle 进行中时
@@ -5435,7 +5435,8 @@ const waitForRunToDrain = async (
  *   仍匹配、把刚恢复成功的后继 send/consume 一起关掉）。
  * 铁律：session 关闭只能由当前持有者执行；完成信号只能由最终提交者发出。
  */
-const abortStuckRunForSend = async (taskId: string): Promise<void> => {
+/** 输入条注入闸门等排空超时时的假死恢复入口（与 sendToTaskSessionBody 内部同款） */
+export const abortStuckRunForSend = async (taskId: string): Promise<void> => {
   const stuck = runningTasks.get(taskId);
   if (!stuck) return;
   // 入场记下 stuck instance——后续 CAS 只删这一份，防误删后继
@@ -5695,7 +5696,7 @@ const sendToTaskSessionBody = async (
     }
     session.lastActiveAt = Date.now();
     // 续接 send（ask 答复 / 插话 / 唤醒）受理成功即把盘上 runStatus 刷成 running——
-    // 否则 run 活跃期间盘上仍停 awaiting_user：侧栏标「已暂停」、顶栏「推进」误亮
+    // 否则 run 活跃期间盘上仍停 awaiting_user：侧栏标「待输入」、顶栏「推进」误亮
     //（点了会 claim 所有权掐掉在跑的 agent）。V12 重构删掉路由末尾兜底写后此处成空洞。
     // 写点在 consume 启动前、单线程顺序保证先于本 run 任何出口写（awaiting_user/idle/error）；
     // owner 门控 + 终态内拒（setTaskRunStatusIfRunOwner 自带），stop/接管后不盖写。

@@ -1,5 +1,5 @@
 /**
- * 侧栏 taskStageLine：待回答 / 已暂停 / 待确认 三态
+ * 侧栏 taskStageLine：待回答 / 待输入 / 待确认 三态
  */
 import { describe, expect, it } from "vitest";
 
@@ -42,7 +42,7 @@ describe("taskStageLine", () => {
     });
   });
 
-  it("断掉态（awaiting_user + running + 无 ask）→ 已暂停", () => {
+  it("断掉/等输入态（awaiting_user + running + 无 ask）→ 待输入", () => {
     const line = taskStageLine(
       base({
         runStatus: "awaiting_user",
@@ -53,7 +53,7 @@ describe("taskStageLine", () => {
     );
     expect(line).toEqual({
       stage: "方案",
-      status: "已暂停",
+      status: "待输入",
       tone: "wait",
     });
   });

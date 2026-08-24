@@ -41,9 +41,10 @@ export const taskStageLine = (
       return { stage, status: "待回答", tone: "wait" };
     }
     // awaiting_user + action 仍 running、但无 ask = 非正常断掉（重连失败等）
-    // 用户可在任务里说话唤醒——标「已暂停」别误导成有题
+    // 用户可在任务里说话唤醒——标「待输入」（等你说、随时可继续），
+    // 别误导成有题待答、也别用旧词「已暂停」让人以为出错/被人为停了
     if (task.lastActionStatus === "running") {
-      return { stage, status: "已暂停", tone: "wait" };
+      return { stage, status: "待输入", tone: "wait" };
     }
   }
   return null;

@@ -73,7 +73,7 @@ const useTaskSeenAt = (taskId: string): number => {
 };
 
 // v1.0.x 监控行降噪（用户实测「有了那么多状态反而更杂乱」）：
-// **只有活跃态才出第二行**——运行中 / 待确认 / 待回答 / 已暂停；空闲 / 静息 / 失败一律单行只标题。
+// **只有活跃态才出第二行**——运行中 / 待确认 / 待回答 / 待输入；空闲 / 静息 / 失败一律单行只标题。
 // 判定逻辑见 @/lib/task-stage-line（可单测）。
 
 const TONE_CLASS: Record<"run" | "wait", string> = {
@@ -103,7 +103,7 @@ const LeadingIndicator = ({
   // 真有事等你才亮琥珀点（task 模式限定、见文件头 V0.11.x 收窄说明）：
   // - awaiting_ack 且**未读**（v1.1.x：看过详情即清、跟监控行同判定）
   // - hasPendingAsk：agent 提问等答案
-  // - action 仍 running 且无 ask：断掉「已暂停」——也值得一眼看见、可说话唤醒
+  // - action 仍 running 且无 ask：断掉「待输入」——也值得一眼看见、可说话唤醒
   const needsAttention =
     task.runStatus === "awaiting_user" &&
     task.mode !== "chat" &&

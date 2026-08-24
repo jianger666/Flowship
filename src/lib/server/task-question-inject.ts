@@ -33,6 +33,7 @@ import {
 import { beginAskSkip, type AskSkipHandle } from "@/lib/server/ask-skip";
 import { startRestrictedGroupQuestion } from "@/lib/server/restricted-question";
 import {
+  abortStuckRunForSend,
   deliverTaskQuestion,
   isTaskOpStale,
   resumeCurrentActionWithMessage,
@@ -201,7 +202,14 @@ const runTaskQuestionInject = async (
       drainStatus === "error" ||
       task.runStatus === "idle";
     if (waitingForDrain) {
-      const stopped = await waitForTaskToStop(task.id, 20_000);
+      let stopped = await waitForTaskToStop(task.id, 20_000);
+      if (!stopped) {
+        // 排空超时 = run 假死（stop 后收尾卡住、runningTasks 永不摘除）——
+        // 与 sendToTaskSessionBody 同款假死恢复：强清占位再试短 drain。
+        // 否则一次卡死的收尾会让输入条永久 409「正在跑」（2026-08-24 实测）
+        await abortStuckRunForSend(task.id);
+        stopped = await waitForTaskToStop(task.id, 2_000);
+      }
       if (!stopped) {
         return errorResponse("agent 正在跑、等它说完这轮再问", 409);
       }
