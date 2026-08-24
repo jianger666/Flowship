@@ -68,10 +68,12 @@ import {
   computeReadonlyRepoPaths,
   computeScriptRepoPaths,
   getTaskCwd,
+  getTaskWorkRepoPaths,
   isWorktreeTask,
   removeTaskWorktrees,
   resolveTaskIsolateWorktree,
 } from "./task-worktrees";
+import { reapTaskOrphans } from "./kill-orphans";
 import {
   cleanupCheckpointRefsForTask,
   cleanupCheckpointRefsFromManifest,
@@ -1394,13 +1396,23 @@ export const deleteTask = async (id: string): Promise<boolean> => {
     } catch (err) {
       console.warn(`[task-fs] deleteTask: 停预览失败（忽略）id=${id}`, err);
     }
-    // V0.10：先清隔离工作区（要读 meta 拿 repoPaths、必须在删 task 目录前）；
-    // 失败不挡删除、boot 孤儿扫描兜底
+    // 先读 meta（拿 repoPaths / 实际工作路径，必须在删 task 目录前）
+    const meta = await readMetaV06(id).catch(() => null);
+    // V0.10：先清隔离工作区；失败不挡删除、boot 孤儿扫描兜底
     try {
-      const meta = await readMetaV06(id).catch(() => null);
       if (meta && isWorktreeTask(meta)) await removeTaskWorktrees(meta);
     } catch (err) {
       console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
+    }
+    // agent shell 拉起的孤儿进程兑底收割（cwd 圈定在本任务工作目录内、防误杀），
+    // 与 stop / finalize 同口径——删任务也把 nohup/& 逃逸的进程断干净。
+    // best-effort：失败不挡删除主流程。
+    if (meta) {
+      try {
+        reapTaskOrphans(getTaskWorkRepoPaths(meta));
+      } catch (err) {
+        console.warn(`[task-fs] deleteTask: 孤儿进程收割失败（忽略）id=${id}`, err);
+      }
     }
     // 测试：不可逆 rm 前可注入抛错，验证 DELETE 回滚 journal
     await failpoint("deleteTask.beforeRm");
