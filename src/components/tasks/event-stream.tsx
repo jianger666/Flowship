@@ -99,6 +99,7 @@ import {
   resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
+import { attachScrollProbe, type ScrollProbeHandle } from "@/lib/debug/scroll-probe";
 import {
   extractUserReplyAttachments,
   extractUserReplyImages,
@@ -890,14 +891,28 @@ const EventStreamImpl = ({
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
+  // 滚动抖动取证探针（localStorage[flowship:scroll-debug]==="1" 才激活、默认零开销）
+  const scrollProbeRef = useRef<ScrollProbeHandle | null>(null);
+  useEffect(
+    () => () => {
+      scrollProbeRef.current?.detach();
+      scrollProbeRef.current = null;
+    },
+    [],
+  );
+
   const attachScrollerRef = useCallback(
     (el: HTMLElement | Window | null) => {
       follow.attachScroller(el);
       const root = el instanceof HTMLElement ? el : null;
       searchScrollRootRef.current = root;
       setSearchScrollRoot(root);
+      scrollProbeRef.current?.detach();
+      scrollProbeRef.current = root
+        ? attachScrollProbe(root, task.id)
+        : null;
     },
-    [follow],
+    [follow, task.id],
   );
 
   const scrollToSearchHit = useCallback(
