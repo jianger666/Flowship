@@ -28,6 +28,7 @@ import type {
 } from "@cursor/sdk";
 import {
   ModelRuntime,
+  DefaultResourceLoader,
   createAgentSession,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
@@ -62,6 +63,7 @@ import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
 import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
 import { buildCodingToolDefs, buildNativeToolAliasWrappers } from "./pi-coding-tools";
+import { loadSkillsForTask } from "./skills-loader";
 import { injectSdkRgPath } from "./sdk-platform-bin";
 
 const PROVIDER_ID = "flowship-custom";
@@ -77,6 +79,27 @@ const DEFAULT_MAX_TOKENS = 8_192;
 
 // pi 的 agent 配置 / 会话文件都收进 app 数据目录、不污染 ~/.pi、也不和用户装的 pi 撞车
 const piAgentDir = (): string => path.join(dataRoot(), "pi-agent");
+
+/**
+ * 统一 skill 注入管道：fe 自管 loader（skills-loader.ts，含 agentskills 标准目录）
+ * 是唯一来源；pi 自带发现只作兜底——与 loader 同名的滤掉，防 pi 的
+ * <available_skills> 块和 fe 的「## Skills」段双渲染 / 版本漂移。
+ */
+const buildResourceLoader = async (cwd: string) => {
+  const owned = new Set(
+    (await loadSkillsForTask([cwd]).catch(() => [])).map((s) => s.name),
+  );
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir: piAgentDir(),
+    skillsOverride: (base) => ({
+      skills: base.skills.filter((s) => !owned.has(s.name)),
+      diagnostics: base.diagnostics,
+    }),
+  });
+  await loader.reload();
+  return loader;
+};
 const piSessionDir = (): string => path.join(dataRoot(), "pi-sessions");
 
 type Format = "openai" | "anthropic";
@@ -296,6 +319,7 @@ const runSubagent = async (
   const { session } = await createAgentSession({
     cwd: opts.cwd,
     agentDir: piAgentDir(),
+    resourceLoader: await buildResourceLoader(opts.cwd),
     modelRuntime: opts.runtime,
     model: opts.model,
     tools: [...SUBAGENT_TOOLS],
@@ -661,6 +685,7 @@ export const createCustomAgent = async (
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
+    resourceLoader: await buildResourceLoader(cwd),
     modelRuntime: runtime,
     model,
     thinkingLevel,
@@ -696,6 +721,7 @@ export const resumeCustomAgent = async (
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
+    resourceLoader: await buildResourceLoader(cwd),
     modelRuntime: runtime,
     model,
     thinkingLevel,
@@ -716,6 +742,7 @@ export const promptOnceCustom = async (
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
+    resourceLoader: await buildResourceLoader(cwd),
     modelRuntime: runtime,
     model,
     thinkingLevel: "off",

@@ -4,8 +4,10 @@
  * 加载 SKILL.md 风格的能力扩展（Anthropic Agent Skills 标准）。
  *
  * 设计要点（settingSources:[] 后全部 fe 自管注入 prompt）：
- *   - **只读四源**：`<Flowship>/skills/`（随包）+ `<dataRoot>/skills/`（能力页自管）
- *     + 飞书 CLI skills（`<dataRoot>/tools/skills/`）+ 组共享库 team（clone 的 skills/ + knowledge/skills/）。
+ *   - **只读六源**：`<Flowship>/skills/`（随包）+ `<dataRoot>/skills/`（能力页自管）
+ *     + 飞书 CLI skills（`<dataRoot>/tools/skills/`）+ agentskills.io 标准目录
+ *     （全局 `~/.agents/skills/` + 项目 `<repo>/.agents/skills/`，见 loadSkills /
+ *     loadSkillsForTask）+ 组共享库 team（clone 的 skills/ + knowledge/skills/）。
  *   - **不扫 `~/.cursor/skills/`**：Cursor 全局不再注入；要从 IDE 带过来用能力页「从 Cursor 导入」拷成自管副本。
  *   - **不读 repo `.cursor/skills/`**：SDK 已不再加载 project 层；仓库级 skill 若要用、
  *     请导入到 app 自管 skills（能力页）。
@@ -22,6 +24,7 @@
  */
 
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import matter from "gray-matter";
 
@@ -40,6 +43,14 @@ import { readTeamSkillStates } from "./team-skill-states";
 
 /** app 自管 skills 目录（V0.13 独立化、设置页可视化管理、随 data 目录走） */
 export const getAppSkillsDir = (): string => path.join(dataRoot(), "skills");
+
+/**
+ * agentskills.io 标准全局目录：`~/.agents/skills/`
+ * 用户按规范自装 skill 的跨 harness 位置；作为低优先级源并入
+ * （fe 私有源同名时覆盖它——比如 lark-cli 升级后的新版压过这里的历史副本）。
+ */
+export const getGlobalAgentsSkillsDir = (): string =>
+  path.join(os.homedir(), ".agents", "skills");
 
 // 组共享库路径 re-export（调用方原从本模块拿；实现已下沉 team-library-paths）
 export {
@@ -105,6 +116,9 @@ export const scanSkillsDir = async (
 
   const found: SkillEntry[] = [];
 
+  // 已访问的 realpath（目录级 symlink 解析后防环：A→B→A 会死循环）
+  const seenRealDirs = new Set<string>();
+
   // 递归 walk、深度限制 + 跳过隐藏目录（.git 之类）
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > MAX_SCAN_DEPTH) return;
@@ -118,10 +132,26 @@ export const scanSkillsDir = async (
       // 跳过 . 开头隐藏文件 / 目录（.git / .DS_Store 等）；
       // depth=0 的 root 本身已经在外面 stat 过、这里只过滤子项
       if (ent.name.startsWith(".") && depth > 0) continue;
-      // 与 copyTree 对齐：不跟随 symlink（防共享仓误放/恶意链扫出仓外）
-      if (ent.isSymbolicLink()) continue;
-      const abs = path.join(dir, ent.name);
-      if (ent.isDirectory()) {
+      let abs = path.join(dir, ent.name);
+      // 目录级 symlink 解析一次再跟进（agentskills 规范里常见的链接装法，
+      // 如 <repo>/.agents/skills/<name> → .cursor/skills/<name>）；
+      // 文件 symlink / 断链 / 环一律跳过。原「不跟随 symlink 防扫出仓外」
+      // 的意图收敛为：只跟目录 + realpath 防环（跨仓软链本身是标准装法）。
+      let symlinkedDir = false;
+      if (ent.isSymbolicLink()) {
+        try {
+          const real = await fs.realpath(abs);
+          if (seenRealDirs.has(real)) continue;
+          const st = await fs.stat(real);
+          if (!st.isDirectory()) continue;
+          seenRealDirs.add(real);
+          abs = real;
+          symlinkedDir = true;
+        } catch {
+          continue;
+        }
+      }
+      if (ent.isDirectory() || symlinkedDir) {
         await walk(abs, depth + 1);
         continue;
       }
@@ -225,9 +255,11 @@ export const parseSkillFile = async (
  * 不读 `~/.cursor/skills/`（导入源仅供「从 Cursor 导入」、不注入）；
  * 不读 repo `.cursor/skills/`（SDK 已不加载 project 层；要用请导入到 app 自管）。
  *
- * 同名去重优先级：app 自管 > 平台自带 > 飞书 CLI > team
- * （用户自建覆盖平台默认，与 findSkillByName / playbook 注入一致；平台 skill
- * 如 action-creator 被同名自管 skill 顶掉属预期）。
+ * 同名去重优先级：app 自管 > 平台自带 > 飞书 CLI > 全局标准(~/.agents/skills)
+ *   > 项目标准(<repo>/.agents/skills，见 loadSkillsForTask) > team
+ * （用户自建覆盖平台默认；agentskills 标准目录被 fe 私有源同名覆盖——
+ *   如 lark-cli 升级后的 data/tools/skills 新版压过 ~/.agents 历史副本；
+ *   与 findSkillByName / playbook 注入一致）。
  */
 /** 用户禁用的 skill 名单（settings.disabledSkills、按 name 记；仅作用于 app 自管源） */
 export const readDisabledSkills = async (): Promise<Set<string>> => {
@@ -273,6 +305,8 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   const app = await scanSkillsDir(getAppSkillsDir());
   // V0.12：内置飞书 CLI 的官方 skills（<dataRoot>/tools/skills、一键安装时落盘）
   const feishuCli = await scanSkillsDir(getToolsSkillsDir());
+  // agentskills.io 标准全局目录（用户自装能力；低优先级、被 fe 私有源同名覆盖）
+  const globalStd = await scanSkillsDir(getGlobalAgentsSkillsDir());
   // 组共享库：shared 无总开关（市场模型）；knowledge 受团队规范开关控制
   // team 源扫 name 白名单（app / 内置 / 飞书 CLI 不收紧）
   const knowledgeEnabled = await readTeamKnowledgeEnabled();
@@ -291,10 +325,12 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   //   team → skill-states（enabled=已安装才注入）；app 自管 → settings.disabledSkills；
   //   内置 / 飞书 CLI → 必备只读、永远注入（不查任何禁用表）
   // 优先级：app 自管 > 平台自带 > 飞书 CLI > team（team 内：组 skills/ > 知识库 knowledge/skills/）
-  type Gate = "team" | "app" | "fixed";
+  type Gate = "team" | "app" | "fixed" | "std";
   const byName = new Map<string, { entry: SkillEntry; gate: Gate }>();
   for (const s of teamKb) byName.set(s.name, { entry: s, gate: "team" });
   for (const s of teamGroup) byName.set(s.name, { entry: s, gate: "team" });
+  // 全局标准目录：低于飞书 CLI（lark 新版压历史副本）、高于 team（用户显式自装优先于公司默认）
+  for (const s of globalStd) byName.set(s.name, { entry: s, gate: "std" });
   for (const s of feishuCli) byName.set(s.name, { entry: s, gate: "fixed" });
   for (const s of own) byName.set(s.name, { entry: s, gate: "fixed" });
   for (const s of app) byName.set(s.name, { entry: s, gate: "app" });
@@ -307,7 +343,7 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
     .filter(({ entry, gate }) => {
       if (gate === "team") return teamStates[entry.name] !== "disabled";
       if (gate === "app") return !disabled.has(entry.name);
-      return true;
+      return true; // fixed / std：必备或用户显式自装、不查禁用表
     })
     .map(({ entry }) => entry)
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -351,16 +387,38 @@ const scanRepoMatchedTeamSkills = async (
 };
 
 /**
- * 任务 / chat 注入用：在 loadSkills() 之上，按仓库 basename 强制并入
- * knowledge/skills/<cat>/<basename>/ 命中的工程 skill（即使 skill-states 标 disabled 也加）。
- * 团队规范开关为 false 时不注入匹配命中（与 knowledge 同源）；chat 无仓传 [] ≡ loadSkills。
+ * 任务 / chat 注入用：在 loadSkills() 之上，并入两层——
+ *   1. 项目级 agentskills 标准目录 `<repo>/.agents/skills/`（低优先级、base 同名覆盖）；
+ *   2. 按仓库 basename 强制并入 knowledge/skills/<cat>/<basename>/ 命中的工程 skill
+ *     （即使 skill-states 标 disabled 也加）。
+ * 团队规范开关为 false 时跳过第 2 层（与 knowledge 同源）；chat 无仓传 [] ≡ loadSkills + 项目标准目录。
  */
 export const loadSkillsForTask = async (
   repoPaths: string[],
 ): Promise<SkillEntry[]> => {
   const base = await loadSkills();
+
+  // 第 1 层：项目级标准目录（每个绑仓各扫一份、同名取先到者；base 同名覆盖）
+  const projStd: SkillEntry[] = [];
+  const seenStd = new Set<string>();
+  for (const repo of repoPaths) {
+    const root = String(repo ?? "").trim();
+    if (!root) continue;
+    const dir = path.join(root, ".agents", "skills");
+    for (const s of await scanSkillsDir(dir)) {
+      if (seenStd.has(s.name)) continue;
+      seenStd.add(s.name);
+      projStd.push(s);
+    }
+  }
+
   const knowledgeEnabled = await readTeamKnowledgeEnabled();
-  if (!knowledgeEnabled) return base;
+  if (!knowledgeEnabled) {
+    if (projStd.length === 0) return base;
+    const byName = new Map(projStd.map((s) => [s.name, s]));
+    for (const s of base) byName.set(s.name, s); // base 覆盖项目标准同名
+    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
 
   const basenames = [
     ...new Set(
@@ -369,13 +427,16 @@ export const loadSkillsForTask = async (
         .filter((b) => !!b && b !== "." && b !== ".."),
     ),
   ];
-  if (basenames.length === 0) return base;
+  const matched = basenames.length
+    ? await scanRepoMatchedTeamSkills(basenames)
+    : [];
+  if (projStd.length === 0 && matched.length === 0) return base;
 
-  const matched = await scanRepoMatchedTeamSkills(basenames);
-  if (matched.length === 0) return base;
-
-  // 已有同名保留 base（更高优先级来源）；缺的才强制并入（含被 disabled 滤掉的）
-  const byName = new Map(base.map((s) => [s.name, s]));
+  // 合并顺序：项目标准目录 → base（fe 私有源 + 全局标准，更高优先级）→ team 强制并入（缺的才加）
+  const byName = new Map<SkillEntry["name"], SkillEntry>([
+    ...projStd.map((s) => [s.name, s] as const),
+    ...base.map((s) => [s.name, s] as const),
+  ]);
   for (const s of matched) {
     if (!byName.has(s.name)) byName.set(s.name, s);
   }
@@ -403,6 +464,8 @@ export const findSkillByName = async (
     { dir: getAppSkillsDir() },
     { dir: path.join(process.cwd(), FLOWSHIP_OWN_SKILLS_DIR) },
     { dir: getToolsSkillsDir() },
+    // 与 loadSkills 优先级一致：全局标准目录排在飞书 CLI 之后、team 之前
+    { dir: getGlobalAgentsSkillsDir() },
     { dir: getTeamLibrarySkillsDir(), enforceTeamName: true },
     {
       dir: getTeamLibraryKnowledgeSkillsDir(),

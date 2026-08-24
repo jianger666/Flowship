@@ -10,7 +10,7 @@
  * - skill-states 读写 round-trip + 损坏 fail-open
  * - sync 专用读：损坏 → 备份 + trusted:false → 跳过默认策略
  * - listTeamActions.installed 读 skill-states（同名本地 action 不误标）
- * - scanSkillsDir 跳过 symlink
+ * - scanSkillsDir 目录级 symlink 跟进（agentskills 标准装法）、文件 symlink 跳过、realpath 防环
  * - categoryChipsFor / applyCategoryChip 纯函数
  */
 import { promises as fs } from "node:fs";
@@ -448,32 +448,32 @@ describe("listTeamActions.installed（读 skill-states）", () => {
   });
 });
 
-describe("scanSkillsDir 跳过 symlink", () => {
-  it("目录 symlink / 文件 symlink 都不扫进结果（与 copyTree 对齐）", async () => {
+describe("scanSkillsDir 的 symlink 语义", () => {
+  it("目录级 symlink 跟进（解析 realpath）；文件级 symlink 不扫进结果", async () => {
     const root = path.join(TMP_ROOT, "scan-symlink-root");
     const outside = path.join(TMP_ROOT, "scan-symlink-outside");
     await fs.rm(root, { recursive: true, force: true });
     await fs.rm(outside, { recursive: true, force: true });
 
-    // 仓外真实 skill（若跟随 symlink 就会被扫到）
-    await writeSkill(path.join(outside, "leaked"), "leaked", "仓外");
+    // 仓外真实 skill（agentskills 规范下目录软链是合法装法、应被扫到）
+    await writeSkill(path.join(outside, "linked"), "linked", "仓外");
     // 仓内真实 skill
     await writeSkill(path.join(root, "real"), "real", "仓内");
-    // 目录级 symlink → 仓外
+    // 目录级 symlink → 仓外（应跟进）
     await fs.symlink(
-      path.join(outside, "leaked"),
+      path.join(outside, "linked"),
       path.join(root, "via-dir-link"),
     );
-    // 文件级 symlink：假 SKILL.md 指仓外
+    // 文件级 symlink：假 SKILL.md 指仓外（不跟随，decoy 无产出）
     const decoy = path.join(root, "decoy");
     await fs.mkdir(decoy, { recursive: true });
     await fs.symlink(
-      path.join(outside, "leaked", "SKILL.md"),
+      path.join(outside, "linked", "SKILL.md"),
       path.join(decoy, "SKILL.md"),
     );
 
     const found = await scanSkillsDir(root);
-    expect(found.map((s) => s.name).sort()).toEqual(["real"]);
+    expect(found.map((s) => s.name).sort()).toEqual(["linked", "real"]);
   });
 });
 
