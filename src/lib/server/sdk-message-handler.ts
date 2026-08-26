@@ -43,6 +43,9 @@ export const flushThinkingBuffer = async (
   ctx.thinkingBuffer = "";
   ctx.thinkingDurationMs = undefined;
   if (!text) return;
+  // 确有 thinking 要落盘才冲已缓冲的正文 delta——保住 SSE 帧时序；
+  // （不能无条件冲：case "assistant" 开头也调本函数、逐 chunk 冲会废掉合帧）
+  flushPendingAssistantDeltas(taskId);
   if (!lease()) return;
   const meta = {
     ...(durationMs ? { durationMs } : {}),
@@ -266,6 +269,89 @@ const emitToolResult = async (
   }
 };
 
+// ----------------- assistant_delta 合帧（perf：SSE 帧率收敛） -----------------
+// SDK 的 text chunk 粒度极细（每秒几十条），逐条 publish 会把 SSE 帧 / 前端
+// setState / Streamdown 重解析全部拉满、长对话时体感「吐字卡」。这里按
+// 「70ms 或 240B」合帧后再广播——打字机观感不变、帧数降一个量级。
+// 顺序安全：handleSdkMessage 对所有非 assistant 消息入口先冲缓冲（单线程、无竞态），
+// 保证 tool / thinking / assistant_message 等其余事件永远晚于已缓冲 delta 到达 UI；
+// 各 ctx.flush()（assistant_message 落盘前）也先冲，防「尾巴 delta 晚到成幽灵字」。
+const DELTA_FLUSH_INTERVAL_MS = 70;
+const DELTA_FLUSH_BYTES = 240;
+
+interface PendingDeltaEntry {
+  text: string;
+  timer: NodeJS.Timeout | null;
+  /** 入队时的 lease 闭包——flush 时重估，失主丢弃（闭包本身按当前实例动态判定） */
+  lease: () => boolean;
+  origin?: string;
+}
+
+const DELTA_BUFFER_MAP_KEY = "__flowshipAssistantDeltaBuffers__";
+const getDeltaBufferMap = (): Map<string, PendingDeltaEntry> => {
+  const g = globalThis as unknown as Record<
+    typeof DELTA_BUFFER_MAP_KEY,
+    Map<string, PendingDeltaEntry> | undefined
+  >;
+  if (!g[DELTA_BUFFER_MAP_KEY]) g[DELTA_BUFFER_MAP_KEY] = new Map();
+  return g[DELTA_BUFFER_MAP_KEY];
+};
+
+/** 冲指定 key：有内容且 lease 仍 current 才广播（失主静默丢弃） */
+const flushDeltaKey = (map: Map<string, PendingDeltaEntry>, key: string): void => {
+  const buf = map.get(key);
+  if (!buf) return;
+  if (buf.timer) {
+    clearTimeout(buf.timer);
+    buf.timer = null;
+  }
+  const text = buf.text;
+  buf.text = "";
+  map.delete(key);
+  if (text.length === 0) return;
+  if (!buf.lease()) return;
+  publishIfCurrent(key.split("::")[0]!, buf.lease, {
+    kind: "assistant_delta",
+    text,
+    ...(buf.origin ? { origin: buf.origin } : {}),
+  });
+};
+
+/** 冲掉某任务全部待发 delta（同步、幂等）；空 entry 顺手清掉 */
+export const flushPendingAssistantDeltas = (taskId: string): void => {
+  const map = getDeltaBufferMap();
+  const prefix = `${taskId}::`;
+  for (const key of [...map.keys()]) {
+    if (key.startsWith(prefix)) flushDeltaKey(map, key);
+  }
+};
+
+/** assistant_delta 入队合帧：攒够字节/时间再广播；lease 失主在 flush 时自然丢弃 */
+const enqueueAssistantDelta = (
+  taskId: string,
+  stillCurrent: () => boolean,
+  origin: string | undefined,
+  text: string,
+): void => {
+  const map = getDeltaBufferMap();
+  const key = `${taskId}::${origin ?? ""}`;
+  let buf = map.get(key);
+  if (!buf) {
+    buf = { text: "", timer: null, lease: stillCurrent, origin };
+    map.set(key, buf);
+  }
+  const needFlush = buf.text.length === 0 && buf.timer === null;
+  buf.text += text;
+  if (buf.text.length >= DELTA_FLUSH_BYTES) {
+    flushDeltaKey(map, key);
+    return;
+  }
+  // 首 chunk 起一个定时兜底：慢速滴流也能按时上屏
+  if (needFlush) {
+    buf.timer = setTimeout(() => flushDeltaKey(map, key), DELTA_FLUSH_INTERVAL_MS);
+  }
+};
+
 /**
  * lease 改必传——task consume 传 opHandle 闭包（`() => isTaskOpCurrent(h)`）、
  * chat consume 传 instanceId 闭包（本 run 仍是 runningChats 当前实例才写）。
@@ -290,6 +376,9 @@ export const handleSdkMessage = async (
   // 入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
   const stillCurrent = lease;
   if (!stillCurrent()) return;
+  // 非 assistant 消息可能触发任何事件写入——先冲已缓冲的 delta 保住时序
+  //（assistant 分支不冲：连续文本 chunk 要合并进同一帧）
+  if (msg.type !== "assistant") flushPendingAssistantDeltas(taskId);
 
   /** 本轮统一 sink：lease + origin 一次绑好，下面各分支只管事件内容 */
   const writeEv = (
@@ -512,6 +601,8 @@ export const handleSdkMessage = async (
         // 交卷（submitSeen）后的正文照常广播——答案给用户看、不再静音。
         if (assistantCtx.askSeen) {
           // 消音审计：只落盘、不广播（见 emitToolResult muted 注释）
+          // 落盘前先冲缓冲——muted 消息虽不走 SSE，也不让旧 delta 晚到串味
+          flushPendingAssistantDeltas(taskId);
           await appendEvent(taskId, {
             kind: "assistant_message",
             text,
@@ -520,12 +611,8 @@ export const handleSdkMessage = async (
           break;
         }
         assistantCtx.buffer += text;
-        // streaming delta 也走 publishIfCurrent——失主不清 B 的 UI
-        publishIfCurrent(taskId, stillCurrent, {
-          kind: "assistant_delta",
-          text,
-          ...(origin ? { origin } : {}),
-        });
+        // streaming delta 走合帧缓冲——攒够 70ms/240B 再广播（失主在 flush 时丢弃）
+        enqueueAssistantDelta(taskId, stillCurrent, origin, text);
       }
       break;
     }

@@ -203,6 +203,7 @@ import {
   planBranchesForBuild,
 } from "./action-gates";
 import {
+  flushPendingAssistantDeltas,
   flushThinkingBuffer,
   handleSdkMessage,
   maybeEmitSubmitFixedText,
@@ -4165,6 +4166,8 @@ const consumeSessionRun = async (
     const assistantCtx: AssistantBufferCtx = {
       buffer: "",
       flush: async () => {
+        // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
+        flushPendingAssistantDeltas(task.id);
         const trimmed = assistantCtx.buffer.trim();
         assistantCtx.buffer = "";
         if (trimmed.length === 0) return;

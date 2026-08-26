@@ -65,6 +65,7 @@ import {
   createShellOutputDeltaPublisher,
 } from "./shell-output-bridge";
 import {
+  flushPendingAssistantDeltas,
   flushThinkingBuffer,
   handleSdkMessage,
   maybeEmitSubmitFixedText,
@@ -1905,6 +1906,8 @@ const consumeChatRun = async (
     const ctx: AssistantBufferCtx = {
       buffer: "",
       flush: async () => {
+        // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
+        flushPendingAssistantDeltas(task.id);
         const trimmed = ctx.buffer.trim();
         ctx.buffer = "";
         if (trimmed.length === 0) return;

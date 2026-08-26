@@ -30,6 +30,7 @@ import {
 } from "@/components/tasks/chat-workdir-picker";
 import { ChatMcpPicker } from "@/components/tasks/chat-mcp-picker";
 import { ChatQueueBanner } from "@/components/tasks/chat-queue-banner";
+import { useSmoothStreaming } from "./use-smooth-streaming";
 import { EventStream } from "@/components/tasks/event-stream";
 import { StreamActionsProvider } from "@/components/tasks/event-stream/stream-actions";
 import {
@@ -120,7 +121,10 @@ export const ChatView = ({
 }: Props) => {
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
-  const [streamingText, setStreamingText] = useState("");
+  // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
+  // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
+  // （Codex 式平滑追赶 + rAF 合帧逻辑在 use-smooth-streaming.ts，与任务详情页共用）
+  const { streamingText, pushDelta, clearStreaming } = useSmoothStreaming();
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -202,7 +206,7 @@ export const ChatView = ({
 
   // 切 task：清 streaming 等 UI 态；订阅当前 task ledger
   useEffect(() => {
-    setStreamingText("");
+    clearStreaming();
     // 切走时作废旧提交锁，避免 A finally 误清 B、也避免 UI 锁残留
     submitTokenRef.current = null;
     setIsSubmitting(false);
@@ -212,7 +216,7 @@ export const ChatView = ({
     // 立即投影当前 ledger，再订阅后续 dispatch
     applyLedgerToUi(getChatOpLedger(task.id));
     return subscribeChatOp(task.id, applyLedgerToUi);
-  }, [task.id, applyLedgerToUi]);
+  }, [task.id, applyLedgerToUi, clearStreaming]);
 
   // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松开——
   // 交卷后（awaiting_ack）run 还在流式吐消息时、输入框 loading 不会提前关掉。
@@ -257,7 +261,7 @@ export const ChatView = ({
       }
 
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
-      if (ev.kind === "assistant_message") setStreamingText("");
+      if (ev.kind === "assistant_message") clearStreaming();
 
       // user_reply → 标 persisted（非终态），不写 delivered
       // SSE 绑当前 watch task.id，显式传入（不靠可变 ref 推断）
@@ -318,7 +322,7 @@ export const ChatView = ({
       onTaskUpdateRef.current(t);
     },
     onDone: (t) => {
-      setStreamingText("");
+      clearStreaming();
       setLiveToolOutputs({});
       setRunActive(false);
       const remaining = pendingLocalRepliesRef.current.length;
@@ -343,14 +347,14 @@ export const ChatView = ({
       if (!canCommitTaskSnapshot(t.id)) return;
       onTaskUpdateRef.current(t);
     },
-    onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
+    onAssistantDelta: pushDelta,
     // msg 已是 runner 拼好的可读文案（「Chat agent 异常：…」），别再套一层
     // 「watch 出错」——那会误导成 SSE 断了，实际是 agent 挂了
     onErrorMessage: (msg) => toast.error(msg),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
     // task_deleted / watch 410 → 清 pending/streaming + ledger，再走统一 sink
     onTaskDeleted: (deletedId) => {
-      setStreamingText("");
+      clearStreaming();
       setLiveToolOutputs({});
       dispatchChatOp(deletedId, { type: "clear_all" });
       clearChatOpLedger(deletedId);
@@ -537,7 +541,7 @@ export const ChatView = ({
     setStopping(true);
     try {
       const latest = await stopTask(task.id);
-      setStreamingText("");
+      clearStreaming();
       // stop 后只清已有明确终态；其余等 queue_failed / message_op
       const result = dispatchChatOp(task.id, { type: "done_clear" });
       if (canCommitTaskSnapshot(latest.id)) {
@@ -555,7 +559,7 @@ export const ChatView = ({
     } finally {
       setStopping(false);
     }
-  }, [task.id]);
+  }, [task.id, clearStreaming]);
 
   const handleStop = useCallback(async () => {
     await stopAgentCore();

@@ -44,6 +44,7 @@ import { BatchProgress } from "@/components/tasks/batch-progress";
 import { ChatView } from "@/components/tasks/chat-view";
 import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
+import { useSmoothStreaming } from "@/components/tasks/use-smooth-streaming";
 import { EventStream } from "@/components/tasks/event-stream";
 import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
@@ -146,7 +147,8 @@ const TaskDetailPage = () => {
   // 推进按钮 loading 态
   const [starting, setStarting] = useState(false);
   // 流式打字态（assistant chunk 累加、收到 assistant_message 事件清空）
-  const [streamingText, setStreamingText] = useState("");
+  // （Codex 式平滑追赶 + rAF 合帧逻辑在 use-smooth-streaming.ts，与 ChatView 共用）
+  const { streamingText, pushDelta, clearStreaming } = useSmoothStreaming();
   // 旁路（需求群受限答疑）run 在不在飞——它刻意不写 task.runStatus，
   // 但它的工具调用照样进事件流：不并进「运行中」判定，那些工具块会被渲染成「已中断」。
   // 值由 SSE 的 restricted_run 帧维护（每次连接 bootstrap 都会补发当前值）
@@ -183,21 +185,21 @@ const TaskDetailPage = () => {
   const handleTaskDeleted = useCallback((deletedId: string) => {
     commitTaskDeleted(deletedId);
     if (deletedId !== routeIdRef.current) return;
-    setStreamingText("");
+    clearStreaming();
     setTask(null);
     toast.message("任务已被删除");
-  }, []);
+  }, [clearStreaming]);
 
   // 侧栏 A→B 快切：立刻清本地态，避免短暂显示 A 的内容盖在 B 的 URL 上
   useEffect(() => {
     setTask(null);
     setLoaded(false);
-    setStreamingText("");
+    clearStreaming();
     setSelectedActionId(null);
     // 旁路在飞是 per-task 信号（新任务的 bootstrap 会补发它自己的值）
     setRestrictedRunActive(false);
     setRunActive(false);
-  }, [id]);
+  }, [id, clearStreaming]);
 
   // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松——
   // 交卷后（awaiting_ack）run 还在流式吐消息时、输入条 loading 不会提前关掉。
@@ -366,7 +368,7 @@ const TaskDetailPage = () => {
       onEvent: (ev) => {
         // ephemeral tool_output_delta 不进 task.events（task 模式暂不渲染直播，仍要挡落盘）
         if (isEphemeralToolOutputDelta(ev)) return;
-        if (ev.kind === "assistant_message") setStreamingText("");
+        if (ev.kind === "assistant_message") clearStreaming();
         setTask((prev) => {
           if (!prev) return prev;
           if (prev.events.some((e) => e.id === ev.id)) return prev;
@@ -388,11 +390,11 @@ const TaskDetailPage = () => {
         });
       },
       onDone: (t) => {
-        setStreamingText("");
+        clearStreaming();
         setRunActive(false);
         absorbTask(t);
       },
-      onAssistantDelta: (text) => setStreamingText((p) => p + text),
+      onAssistantDelta: pushDelta,
       onRestrictedRun: setRestrictedRunActive,
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
       onWatchException: (err) => toast.error(`watch 异常：${err.message}`),
