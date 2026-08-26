@@ -46,8 +46,8 @@ type Props = {
   busyName: string | null;
   onEdit: (name: string) => void;
   onView: (name: string, source: SkillRow["source"]) => void;
-  onDelete: (name: string) => void;
-  onToggleApp: (row: SkillRow, enabled: boolean) => void;
+  onDelete: (row: SkillRow) => void;
+  onToggleManageable: (row: SkillRow, enabled: boolean) => void;
   onInstall: (row: SkillRow) => void;
   onUninstall: (row: SkillRow) => void;
   /** 共享行：从远端库删除（误上传清理） */
@@ -59,16 +59,19 @@ const headerMeta = (
   selected: SourceNavKey,
 ): { title: string; hint: string } => {
   switch (selected) {
-    case "app":
-      return { title: "自管", hint: "本机 data/skills，可编辑上传" };
+    case "manageable":
+      return {
+        title: "我的",
+        hint: "自管 / 飞书 CLI / 全局与项目标准目录，可开关、可删除",
+      };
     case "shared":
       return { title: "共享", hint: "组内沉淀，按需安装" };
     case "knowledge":
       return { title: "团队规范", hint: "知识库镜像，可临时启停" };
     case "builtin":
-      return { title: "内置", hint: "随包发布，必备" };
+      return { title: "内置", hint: "随包发布，必备只读" };
     default:
-      return { title: "飞书 CLI", hint: "官方 skill，必备" };
+      return { title: "我的", hint: "" };
   }
 };
 
@@ -90,7 +93,7 @@ export const SkillListPane = ({
   onEdit,
   onView,
   onDelete,
-  onToggleApp,
+  onToggleManageable,
   onInstall,
   onUninstall,
   onDeleteFromLibrary,
@@ -236,7 +239,7 @@ export const SkillListPane = ({
               onEdit={onEdit}
               onView={onView}
               onDelete={onDelete}
-              onToggleApp={onToggleApp}
+              onToggleManageable={onToggleManageable}
               onInstall={onInstall}
               onUninstall={onUninstall}
               onDeleteFromLibrary={onDeleteFromLibrary}

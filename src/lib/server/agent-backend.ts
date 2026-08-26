@@ -37,7 +37,8 @@ export type AgentInstance = Awaited<ReturnType<typeof CursorAgent.create>>;
 /** 与 @cursor/sdk 的 agent.send 返回类型一致 */
 export type AgentRun = Awaited<ReturnType<AgentInstance["send"]>>;
 
-export type CustomProviderFormat = "openai" | "anthropic";
+/** 与 @/lib/types 的 CustomProviderFormat 一致（含 auto 自动路由档） */
+export type CustomProviderFormat = "auto" | "openai" | "anthropic";
 
 export type BackendCreds =
   | { kind: "cursor"; apiKey: string }
@@ -112,7 +113,12 @@ export const resolveBackendCreds = async (
       kind: "custom",
       apiKey: cp?.apiKey ?? "",
       baseUrl: cp?.baseUrl.trim() ?? "",
-      format: cp?.format === "anthropic" ? "anthropic" : "openai",
+      format:
+        cp?.format === "anthropic"
+          ? "anthropic"
+          : cp?.format === "openai"
+            ? "openai"
+            : "auto",
     };
   }
   return { kind: "cursor", apiKey: clientApiKey };

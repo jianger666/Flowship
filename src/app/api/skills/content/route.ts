@@ -20,6 +20,8 @@ const VALID_SOURCES = new Set<SkillSource>([
   "builtin",
   "app",
   "feishu-cli",
+  "global-std",
+  "project-std",
   "team",
 ]);
 

@@ -388,8 +388,11 @@ export const waitForChatToStop = async (
  * 仅 waitForChatToStop 超时兜底用：旧 Run cancel 卡住没按期退、强清好让新会话起得来。
  * 无条件关（用户侧切模型重启意图）；旧 Run 迟到的收尾须带 instanceId 门控、不会再误关新会话。
  */
-export const forceClearChatRun = (taskId: string): void => {
-  closeChatSession(taskId);
+export const forceClearChatRun = (
+  taskId: string,
+  opts: { keepPersisted?: boolean } = {},
+): void => {
+  closeChatSession(taskId, undefined, opts);
   // cancelled 槽只在被 owner 消费时删——forceClear（懒重启换新）后
   // 旧 claim 的标记已无消费者，顺手清防泄漏；旧 owner 迟到 send 会按实例不匹配
   // 收敛为 owner_invalid（同为终态 409、语义仍正确）
@@ -1284,6 +1287,9 @@ const registerChatNotifier = (
  *   resume 后都要自己先发第一条；认领消掉「注册→owner send」窗口里的并发 send 与顺序反转。
  *   通用 resume 不再无条件 drain——后续队列等 owner run 结束后由统一 flush 排出。
  *   调用方若在 send 前失败必须 releaseChatRunClaim(taskId, instanceId)。
+ * @param opts.startToken 调用方已持启动 lease 时传入（send-now 链路）：复用该
+ *   lease、不自行 tryReserveChatStart、也不在 finally 代释放（owner 的 finally
+ *   统一放）。不传则维持旧行为：自预约、finally 自释放。
  * @returns claim 是实例化 token——成功返回注册的 instanceId，owner 后续
  *   send/release 必须带它做精确匹配；失败返 null。不再返布尔，防止旧 owner 越权
  *   操作 stop/forceClear 之后换上来的新实例。
@@ -1291,13 +1297,17 @@ const registerChatNotifier = (
 export const resumeChatSession = async (
   task: Task,
   bootArgs: { apiKey: string; model: ModelSelection },
-  opts: { claimRun?: boolean } = {},
+  opts: { claimRun?: boolean; startToken?: number } = {},
 ): Promise<number | null> => {
   // 同步段：任何 await 之前完成门闩/预约检查（Node 单线程 check-and-set 原子）
   if (!task.sessionAgentId || runningChats.has(task.id)) return null;
   if (isChatRewindInProgress(task.id)) return null;
-  // 复用与新会话启动同一预约：rewind 占门闩后会复查预约并拒绝回退
-  const startToken = tryReserveChatStart(task.id);
+  // 复用与新会话启动同一预约：rewind 占门闩后会复查预约并拒绝回退。
+  // 外部 lease（startToken 显式传入）直接复用——此时本函数绝不自行预约/释放。
+  const startToken =
+    opts.startToken !== undefined
+      ? opts.startToken
+      : tryReserveChatStart(task.id);
   if (startToken === null) return null;
   try {
     const settingsResult = await readSettingsFile();
@@ -1424,7 +1434,8 @@ export const resumeChatSession = async (
     }
     return null;
   } finally {
-    releaseChatStart(task.id, startToken);
+    // 外部 lease 归调用方管（send-now 的 finally 统一 release）；仅自有预约在此释放
+    if (opts.startToken === undefined) releaseChatStart(task.id, startToken);
   }
 };
 
@@ -1786,7 +1797,11 @@ const finalizeChatRunIfCurrent = async (
     if (!isCurrent()) return false;
     // cancelled 清队走唯一 sink（queue_failed + recentSettled）
     failQueuedItems(taskId, { reason: "cancelled" });
-    const closed = closeChatSession(taskId, instanceId);
+    // P0：取消收尾保留落盘 sessionAgentId——停止 / 立即发送打断后，下条消息
+    // 优先 Agent.resume 续接原会话（对齐错误分支口径），不再被动靠 events
+    // 回放丢上下文。真正清锚点只剩 rewind（closeChatSessionUnconditional）、
+    // 提供方不一致（resumeChatSession 内条件清）与 DELETE 收尾。
+    const closed = closeChatSession(taskId, instanceId, { keepPersisted: true });
     if (!closed) return false;
     if (cancelledTask) publish(taskId, { kind: "task", task: cancelledTask });
     publish(taskId, {
@@ -1853,7 +1868,7 @@ const handleChatRunFailure = async (
 /**
  * 消费一个 chat run 的完整生命周期。
  * 自然 finished = 正常出口：runStatus → awaiting_user（等下一条消息）、**内存会话保留**；
- * cancel → 关内存 + 清落盘 sessionAgentId（下一条起新）；
+ * cancel → 关内存但保留落盘 sessionAgentId（P0：下一条优先 Agent.resume 续接）；
  * error → 关内存但保留落盘 sessionAgentId（下一条优先 Agent.resume）。
  */
 const consumeChatRun = async (

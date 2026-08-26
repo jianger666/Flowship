@@ -14,7 +14,7 @@ import {
 } from "@/lib/agent-provider";
 import {
   customModelListAttempts,
-  customSdkBaseUrl,
+  customSdkBaseUrlForFace,
   formatFromCustomBaseUrl,
   normalizeCustomBaseUrl,
 } from "@/lib/custom-provider-url";
@@ -318,23 +318,33 @@ describe("custom baseUrl 归一", () => {
   });
 
   it("OpenAI SDK 地址始终落到 /v1", () => {
-    expect(customSdkBaseUrl("https://api.deepseek.com", "openai")).toBe(
-      "https://api.deepseek.com/v1",
-    );
-    expect(customSdkBaseUrl("https://api.deepseek.com/v1/", "openai")).toBe(
-      "https://api.deepseek.com/v1",
-    );
-    expect(customSdkBaseUrl("https://opencode.ai/zen/go/v1", "openai")).toBe(
-      "https://opencode.ai/zen/go/v1",
-    );
+    expect(
+      customSdkBaseUrlForFace("https://api.deepseek.com", "openai-completions"),
+    ).toBe("https://api.deepseek.com/v1");
+    expect(
+      customSdkBaseUrlForFace("https://api.deepseek.com/v1/", "openai-completions"),
+    ).toBe("https://api.deepseek.com/v1");
+    expect(
+      customSdkBaseUrlForFace("https://opencode.ai/zen/go/v1", "openai-completions"),
+    ).toBe("https://opencode.ai/zen/go/v1");
+    // responses 面同口径（SDK 只拼尾段、地址同样要 /v1）
+    expect(
+      customSdkBaseUrlForFace("https://api.deepseek.com/v1/", "openai-responses"),
+    ).toBe("https://api.deepseek.com/v1");
   });
 
   it("Anthropic SDK 地址不含 /v1（DeepSeek /anthropic 根）", () => {
     expect(
-      customSdkBaseUrl("https://api.deepseek.com/anthropic", "anthropic"),
+      customSdkBaseUrlForFace(
+        "https://api.deepseek.com/anthropic",
+        "anthropic-messages",
+      ),
     ).toBe("https://api.deepseek.com/anthropic");
     expect(
-      customSdkBaseUrl("https://api.deepseek.com/anthropic/v1", "anthropic"),
+      customSdkBaseUrlForFace(
+        "https://api.deepseek.com/anthropic/v1",
+        "anthropic-messages",
+      ),
     ).toBe("https://api.deepseek.com/anthropic");
   });
 

@@ -25,7 +25,6 @@ import {
 import {
   isSharedTeamCategory,
   sharedCategoryOf,
-  skillsForNav,
   type SkillRow,
 } from "./types";
 
@@ -98,7 +97,7 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
       setTeamSkillCategories(byName);
 
       if (mode === "skill") {
-        setAppSkills(skillsForNav(all, "app"));
+        setAppSkills(all.filter((s) => s.source === "app"));
         setActions([]);
         return;
       }
@@ -107,7 +106,7 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
       const actionsRes = await fetchCustomActions().catch(
         () => [] as CustomActionDef[],
       );
-      const app = skillsForNav(all, "app");
+      const app = all.filter((s) => s.source === "app");
       const appNameSet = new Set(app.map((s) => s.name));
       const sourceByName = new Map<string, SkillRow["source"]>();
       for (const s of all) sourceByName.set(s.name, s.source);

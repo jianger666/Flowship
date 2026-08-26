@@ -35,9 +35,13 @@ import {
   tryReserveChatStart,
 } from "@/lib/server/chat-gate";
 import {
+  forceClearChatRun,
   hasChatSession,
   isChatRunActive,
+  resumeChatSession,
   runChatSession,
+  sendChatMessage,
+  waitForChatToStop,
 } from "@/lib/server/chat-runner";
 import { stopTaskAgent } from "@/lib/server/stop-task";
 import {
@@ -53,6 +57,9 @@ export type SendNowBootArgs = {
   apiKey: string;
   model: ModelSelection;
 };
+
+/** stop 后等旧 Run 异步收尾摘表的窗口；超时强清（对齐 chat-inject 懒重启口径） */
+const CHAT_SEND_NOW_STOP_TIMEOUT_MS = 5000;
 
 /**
  * 用已取出的 QueuedChatMsg 起新会话（对齐 chat-inject 队列优先启动）。
@@ -223,6 +230,56 @@ export const startChatFromQueuedMessage = async (
       return leaseAbortedResponse();
     }
 
+    // P0：落盘锚点还在 → 优先 Agent.resume 续接原会话（停止 / 立即发送不丢上下文），
+    // 失败（无锚点 / 提供方不一致 / resume 抛错）降级下面既有新会话路径。
+    // 复用本链 startToken——resume 内部不再自行预约、也不代释放（finally 统一放）。
+    if (task.sessionAgentId && !hasChatSession(taskId)) {
+      const claimedInstanceId = await resumeChatSession(runningTask, bootArgs, {
+        claimRun: true,
+        startToken,
+      });
+      if (claimedInstanceId !== null) {
+        const sent = await sendChatMessage(
+          runningTask,
+          head.agentText,
+          head.imageAbsPaths,
+          head.attachmentAbsPaths?.length ? head.attachmentAbsPaths : undefined,
+          { ownerInstanceId: claimedInstanceId },
+        );
+        if (sent === "sent") {
+          agentStarted = true;
+          endChatQueueInFlight(taskId);
+          const fresh = await getTask(taskId);
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              sentNow: true,
+              resumed: true,
+              itemId: head.itemId,
+              task: fresh ?? runningTask,
+            }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        // cancelled / owner_invalid：claim 又被用户停止摘除 / 实例被换——终态，
+        // 消息按 stopped 收尾、绝不降级新会话重放（AI 会在「已停止」后复述）。
+        if (sent === "cancelled" || sent === "owner_invalid") {
+          settleMessageFailed(taskId, head.itemId, "stopped");
+          endChatQueueInFlight(taskId);
+          return leaseAbortedResponse();
+        }
+        // busy / no_session / send_failed → 降级起新会话。owner 场景的 busy
+        // 实际只可能来自 rewind 门闩（resume 成功返回时 rec.agent 必已就位、
+        // 无冷启动占位记录）；无论哪种原因，只要会话仍挂在表内就必须强清（保锚点）——
+        // 否则下面 runChatSession 入口见 runningChats.has 会把消息改入队自吞、
+        // 且无人在跑永久悬空（rewind 竞态下入口门闩会拒绝、消息走 failOrRequeue 兜底）。
+        // send_failed 内部已关会话，此处幂等。
+        if (hasChatSession(taskId)) {
+          forceClearChatRun(taskId, { keepPersisted: true });
+        }
+      }
+    }
+
     // agentText 已是拼装好的最终文本（含 skill 指引）——不再套一层拼装
     const sessionPromise = runChatSession({
       task: runningTask,
@@ -335,6 +392,21 @@ export const sendQueuedChatMessageNow = async (
     // stop 失败：塞回，避免「已取出却未发出」
     enqueueChatMessageFront(taskId, taken);
     throw err;
+  }
+
+  // stop 的 cancel 对活跃 Run 是 fire-and-forget、旧 Run 异步收尾才摘表——
+  // 不等它真退，start 里的 hasChatSession 防御检查必然撞 409「会话仍在」
+  // （pi 后端 abort→settle 链路更长、必现）。对齐 chat-inject 懒重启：等真退、
+  // 超时强清继续。keepPersisted：锚点留给下面的 resume 续接路径。
+  const stoppedCleanly = await waitForChatToStop(
+    taskId,
+    CHAT_SEND_NOW_STOP_TIMEOUT_MS,
+  );
+  if (!stoppedCleanly) {
+    console.warn(
+      `[chat-queue-send-now] task=${taskId} 旧会话没在 ${CHAT_SEND_NOW_STOP_TIMEOUT_MS}ms 内退、强清继续`,
+    );
+    forceClearChatRun(taskId, { keepPersisted: true });
   }
 
   return deps.start(taskId, taken, validated);

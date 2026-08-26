@@ -7,7 +7,7 @@
  * ④ reconnect preamble × B 已注册 → 不写「正在重连」
  * ⑤ 正常路径回归（A 是当前 instance → 收尾正常执行）
  * ⑥ error 收尾保留落盘 sessionAgentId（内存会话关闭、runStatus=error）
- * ⑦ stop/cancelled 收尾仍清落盘 sessionAgentId
+ * ⑦ stop/cancelled 收尾保留落盘 sessionAgentId（P0：下条消息可 resume 续接）
  *
  * Mock 手法对齐 chat-runner-start-lease / reconnect-race（挂起 run + forceClear + failpoint）。
  */
@@ -586,7 +586,7 @@ describe("R28-2 finalizeChatRunIfCurrent", () => {
   );
 
   it(
-    "⑦ stop/cancelled 收尾：仍清落盘 sessionAgentId",
+    "⑦ stop/cancelled 收尾：关内存会话但保留落盘 sessionAgentId（供下条 resume）",
     async () => {
       const runA = makeControllableRun("cancelled");
       mockCreate.mockResolvedValueOnce({
@@ -619,13 +619,16 @@ describe("R28-2 finalizeChatRunIfCurrent", () => {
 
       for (let i = 0; i < 50; i++) {
         const m = await readMetaV06(TASK_ID);
-        if (!m?.sessionAgentId && m?.runStatus === "idle") break;
+        if (m?.runStatus === "idle") break;
         await new Promise((r) => setTimeout(r, 25));
       }
+      // 等 fire-and-forget setTaskSessionAgentId 与条件清竞态收束
+      await new Promise((r) => setTimeout(r, 80));
       const meta = await readMetaV06(TASK_ID);
       expect(meta?.runStatus).toBe("idle");
+      // 内存已关、落盘锚点保留 → 下条消息优先 Agent.resume 续接原会话
       expect(hasChatSession(TASK_ID)).toBe(false);
-      expect(meta?.sessionAgentId).toBeUndefined();
+      expect(meta?.sessionAgentId).toBe(AGENT_A);
     },
     20_000,
   );

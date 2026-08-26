@@ -261,7 +261,11 @@ export const parseSkillFile = async (
  *   如 lark-cli 升级后的 data/tools/skills 新版压过 ~/.agents 历史副本；
  *   与 findSkillByName / playbook 注入一致）。
  */
-/** 用户禁用的 skill 名单（settings.disabledSkills、按 name 记；仅作用于 app 自管源） */
+/**
+ * 用户禁用的 skill 名单（settings.disabledSkills、按 name 记）。
+ * 作用域：全部「可管理」源——app 自管 / 飞书 CLI / 全局 ~/.agents/skills /
+ * 项目 <repo>/.agents/skills，同名一关全关；内置恒开不受影响；team 走自己的 skill-states。
+ */
 export const readDisabledSkills = async (): Promise<Set<string>> => {
   try {
     const result = await readSettingsFile();
@@ -322,18 +326,22 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
       )
     : [];
   // 合并去重（后 set 的覆盖先 set 的、所以低优先级先放）；带来源标记——启停过滤三分：
-  //   team → skill-states（enabled=已安装才注入）；app 自管 → settings.disabledSkills；
-  //   内置 / 飞书 CLI → 必备只读、永远注入（不查任何禁用表）
-  // 优先级：app 自管 > 平台自带 > 飞书 CLI > team（team 内：组 skills/ > 知识库 knowledge/skills/）
-  type Gate = "team" | "app" | "fixed" | "std";
+  //   team → skill-states（enabled=已安装才注入）；内置 → 必备恒开（不查禁用表）；
+  //   可管理源（app 自管 / 飞书 CLI / 全局标准 / 项目标准）→ 统一按 settings.disabledSkills
+  //   按 name 关——同名多层副本一关全关（设置页「我的」分组与这里的语义一致）。
+  // 优先级：app 自管 > 平台自带 > 飞书 CLI > 全局标准 > 项目标准(见 loadSkillsForTask)
+  //   > team（team 内：组 skills/ > 知识库 knowledge/skills/）
+  type Gate = "team" | "builtin" | "manageable";
   const byName = new Map<string, { entry: SkillEntry; gate: Gate }>();
   for (const s of teamKb) byName.set(s.name, { entry: s, gate: "team" });
   for (const s of teamGroup) byName.set(s.name, { entry: s, gate: "team" });
   // 全局标准目录：低于飞书 CLI（lark 新版压历史副本）、高于 team（用户显式自装优先于公司默认）
-  for (const s of globalStd) byName.set(s.name, { entry: s, gate: "std" });
-  for (const s of feishuCli) byName.set(s.name, { entry: s, gate: "fixed" });
-  for (const s of own) byName.set(s.name, { entry: s, gate: "fixed" });
-  for (const s of app) byName.set(s.name, { entry: s, gate: "app" });
+  for (const s of globalStd)
+    byName.set(s.name, { entry: s, gate: "manageable" });
+  for (const s of feishuCli)
+    byName.set(s.name, { entry: s, gate: "manageable" });
+  for (const s of own) byName.set(s.name, { entry: s, gate: "builtin" });
+  for (const s of app) byName.set(s.name, { entry: s, gate: "manageable" });
   // team：单一 owner 的 skill-states（disabled=未安装不注入；不在表里 = 默认已安装、
   // sync 后策略会补写——fail-open 保证首次 sync 前 loader 不空转）
   const disabled = await readDisabledSkills();
@@ -342,8 +350,8 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   return [...byName.values()]
     .filter(({ entry, gate }) => {
       if (gate === "team") return teamStates[entry.name] !== "disabled";
-      if (gate === "app") return !disabled.has(entry.name);
-      return true; // fixed / std：必备或用户显式自装、不查禁用表
+      if (gate === "builtin") return true; // 内置随包必备、恒开
+      return !disabled.has(entry.name); // 可管理源统一一张禁用表
     })
     .map(({ entry }) => entry)
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -397,8 +405,10 @@ export const loadSkillsForTask = async (
   repoPaths: string[],
 ): Promise<SkillEntry[]> => {
   const base = await loadSkills();
+  const disabled = await readDisabledSkills();
 
-  // 第 1 层：项目级标准目录（每个绑仓各扫一份、同名取先到者；base 同名覆盖）
+  // 第 1 层：项目级标准目录（每个绑仓各扫一份、同名取先到者；base 同名覆盖；
+  // 与其它可管理源同一张 disabledSkills 禁用表——同名一关全关）
   const projStd: SkillEntry[] = [];
   const seenStd = new Set<string>();
   for (const repo of repoPaths) {
@@ -406,7 +416,7 @@ export const loadSkillsForTask = async (
     if (!root) continue;
     const dir = path.join(root, ".agents", "skills");
     for (const s of await scanSkillsDir(dir)) {
-      if (seenStd.has(s.name)) continue;
+      if (seenStd.has(s.name) || disabled.has(s.name)) continue;
       seenStd.add(s.name);
       projStd.push(s);
     }

@@ -328,13 +328,16 @@ export const LEGACY_CUSTOM_PROVIDER_ID = "cp_legacy";
 export const CURSOR_PROVIDER_LABEL = "Cursor SDK";
 
 /**
- * 自定义 provider 的 HTTP 协议（pi 原生支持两套）：
- * - openai：`/v1/chat/completions` + `Authorization: Bearer <key>`
- * - anthropic：`/v1/messages` + `x-api-key: <key>`
+ * 自定义 provider 的 HTTP 协议（pi 原生支持三套）：
+ * - auto：按 models.dev 目录逐模型自动路由（baseURL 命中目录才生效；
+ *   目录外的端点回落 openai）。新配置默认值。
+ * - openai：`/v1/chat/completions` + `Authorization: Bearer <key>`（显式覆盖）
+ * - anthropic：`/v1/messages` + `x-api-key: <key>`（显式覆盖）
  */
-export type CustomProviderFormat = "openai" | "anthropic";
+export type CustomProviderFormat = "auto" | "openai" | "anthropic";
 
 export const CUSTOM_PROVIDER_FORMAT_LABEL: Record<CustomProviderFormat, string> = {
+  auto: "自动",
   openai: "OpenAI 兼容",
   anthropic: "Anthropic 兼容",
 };

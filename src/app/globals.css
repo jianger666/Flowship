@@ -393,6 +393,17 @@
   overflow: hidden;
   gap: 0;
 }
+
+/* 关掉 Streamdown 代码块的内联 content-visibility:auto（streamdown 硬编码在组件 style 里、
+   必须 !important 才盖得过）。2026-08-25 滚动抖动根因（8676 实测 + DevTools 取证）：
+   chat 事件流是 Virtuoso 虚拟列表，cv:auto 的「离屏按估算 200px 报尺寸 / 靠近再渲染真实高度」
+   与 Virtuoso 的条目测量互相打架 → 列表总高度每帧翻转 → Virtuoso 反复 scrollBy 补偿
+   （DevTools 钩到 scrollBy({top:±132}) 死循环）→ 滚动条上下抖。非虚拟化的文档视图不受影响、
+   保留 cv:auto 的省渲染收益；只对虚拟滚动容器内的代码块关闭。
+   注意作用域用 data-virtuoso-scroller 而不是 .prose——artifact 文档视图也是 prose 但不虚拟化。 */
+[data-virtuoso-scroller] [data-streamdown="code-block"] {
+  content-visibility: visible !important;
+}
 .prose [data-streamdown="code-block-header"] {
   height: 1.75rem;
   padding-inline: 0.75rem;

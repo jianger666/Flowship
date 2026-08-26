@@ -36,12 +36,15 @@ export const emptyCustomProvider = (): CustomProviderConfig => ({
   name: "",
   baseUrl: "",
   apiKey: "",
-  format: "openai",
+  format: "auto",
   defaultModel: { id: "" },
 });
 
-const parseFormat = (v: unknown): CustomProviderFormat =>
-  v === "anthropic" ? "anthropic" : "openai";
+// 存量盘上显式写的 openai / anthropic 原样保留（当 override）；缺字段 / auto → auto
+const parseFormat = (v: unknown): CustomProviderFormat => {
+  if (v === "anthropic" || v === "openai") return v;
+  return "auto";
+};
 
 const parseModelSelection = (raw: unknown): ModelSelection | undefined => {
   if (

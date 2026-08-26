@@ -99,7 +99,6 @@ import {
   resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
-import { attachScrollProbe, type ScrollProbeHandle } from "@/lib/debug/scroll-probe";
 import {
   extractUserReplyAttachments,
   extractUserReplyImages,
@@ -415,8 +414,13 @@ const VIRTUOSO_COMPONENTS = { Header: EarlierLoadingHeader };
  * ⚠️ **top 必须留 0**：`rangeChanged` 报的是「已渲染范围」不是「可见范围」，
  * 顶部余量会把 startIndex 往前推——sticky 轮次头会晚出现一屏、滚动位置记忆的
  * 锚点也会记成上面几条，两个既有契约都会漂。底部余量不影响 startIndex，可以放心加。
+ *
+ * bottom 取 1500（2026-08 用户反馈「滚到代码块闪一下」）：带代码块的消息真实高度
+ * 动辄 2000px+，余量太小的话消息还没测完高度就被滚进视口、Virtuoso 用估算高度
+ * 渲染后一次性校正——就是那一下闪。加大余量让未测量的消息在屏外完成挂载+测量+校正，
+ * 进视口前已经稳定。代价是快滚时多渲几条 md（MarkdownText / Streamdown 都有 memo，可控）。
  */
-const VIEWPORT_OVERSCAN = { top: 0, bottom: 400 };
+const VIEWPORT_OVERSCAN = { top: 0, bottom: 1500 };
 
 /**
  * 事件流底部悬浮层：「回到最新」按钮 +「AI 在等你回答」提示条。
@@ -891,28 +895,14 @@ const EventStreamImpl = ({
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
-  // 滚动抖动取证探针（localStorage[flowship:scroll-debug]==="1" 才激活、默认零开销）
-  const scrollProbeRef = useRef<ScrollProbeHandle | null>(null);
-  useEffect(
-    () => () => {
-      scrollProbeRef.current?.detach();
-      scrollProbeRef.current = null;
-    },
-    [],
-  );
-
   const attachScrollerRef = useCallback(
     (el: HTMLElement | Window | null) => {
       follow.attachScroller(el);
       const root = el instanceof HTMLElement ? el : null;
       searchScrollRootRef.current = root;
       setSearchScrollRoot(root);
-      scrollProbeRef.current?.detach();
-      scrollProbeRef.current = root
-        ? attachScrollProbe(root, task.id)
-        : null;
     },
-    [follow, task.id],
+    [follow],
   );
 
   const scrollToSearchHit = useCallback(

@@ -52,7 +52,9 @@ import {
   thinkingLevelFromParams,
   type ThinkingLevelMap,
 } from "@/lib/custom-effort";
-import { customSdkBaseUrl } from "@/lib/custom-provider-url";
+import { customSdkBaseUrlForFace } from "@/lib/custom-provider-url";
+import type { CustomProviderFormat } from "@/lib/types";
+import { resolveModelFace, type CustomFace } from "@/lib/server/custom-route";
 import {
   getModelsDevIndex,
   lookupCatalogReasoning,
@@ -102,9 +104,9 @@ const buildResourceLoader = async (cwd: string) => {
 };
 const piSessionDir = (): string => path.join(dataRoot(), "pi-sessions");
 
-type Format = "openai" | "anthropic";
-const apiOf = (format: Format): "openai-completions" | "anthropic-messages" =>
-  format === "anthropic" ? "anthropic-messages" : "openai-completions";
+// 协议来源：显式 override（openai / anthropic）或 auto（models.dev 目录按模型路由，
+// 见 custom-route.ts）。会话启动时统一收敛成 pi 的请求面（CustomFace）。
+type Format = CustomProviderFormat;
 
 export interface CustomAgentInput {
   kind: "custom";
@@ -121,7 +123,7 @@ export interface CustomAgentInput {
 interface ModelConfigEntry {
   id: string;
   name: string;
-  api: "openai-completions" | "anthropic-messages";
+  api: CustomFace;
   reasoning: boolean;
   input: Array<"text" | "image">;
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -147,13 +149,13 @@ type CatalogFields = ReturnType<typeof reasoningFieldsFromCatalog>;
 /** 把用户选/填的 model id 构造成 pi 的 ProviderConfigInput.models 条目 */
 const buildModelConfig = (
   modelId: string,
-  format: Format,
+  face: CustomFace,
   fields: CatalogFields,
 ): ModelConfigEntry => {
   const entry: ModelConfigEntry = {
     id: modelId,
     name: modelId,
-    api: apiOf(format),
+    api: face,
     reasoning: fields.reasoning,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -161,7 +163,7 @@ const buildModelConfig = (
     maxTokens: DEFAULT_MAX_TOKENS,
   };
   if (fields.thinkingLevelMap) entry.thinkingLevelMap = fields.thinkingLevelMap;
-  if (format === "openai") {
+  if (face === "openai-completions") {
     // 自建 OpenAI 兼容端点：不要按官方 OpenAI 严卡 finish_reason / usage 流字段
     entry.compat = { ...OPENAI_STREAM_COMPAT };
   }
@@ -172,14 +174,15 @@ const buildModelConfig = (
 const buildModel = (
   modelId: string,
   input: CustomAgentInput,
+  face: CustomFace,
   fields: CatalogFields,
 ): Model<never> => {
   const model = {
     id: modelId,
     name: modelId,
-    api: apiOf(input.format),
+    api: face,
     provider: PROVIDER_ID,
-    baseUrl: customSdkBaseUrl(input.baseUrl, input.format),
+    baseUrl: customSdkBaseUrlForFace(input.baseUrl, face),
     reasoning: fields.reasoning,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -190,7 +193,7 @@ const buildModel = (
     (model as unknown as { thinkingLevelMap?: ThinkingLevelMap }).thinkingLevelMap =
       fields.thinkingLevelMap;
   }
-  if (input.format === "openai") {
+  if (face === "openai-completions") {
     (model as unknown as { compat?: unknown }).compat = {
       ...OPENAI_STREAM_COMPAT,
     };
@@ -208,6 +211,8 @@ const buildRuntime = async (
 }> => {
   const modelId = input.model?.id?.trim() || "default";
   const index = await getModelsDevIndex();
+  // auto 档在这里做目录路由；显式 openai / anthropic 直接收敛成对应面
+  const face = await resolveModelFace(input.baseUrl, modelId, input.format);
   const hit = lookupCatalogReasoning(index, modelId);
   const fields = reasoningFieldsFromCatalog(hit);
   const thinkingLevel = thinkingLevelFromParams(
@@ -215,16 +220,16 @@ const buildRuntime = async (
     hit?.effortValues,
   );
   const runtime = await ModelRuntime.create({ modelsPath: null });
-  const sdkBase = customSdkBaseUrl(input.baseUrl, input.format);
+  const sdkBase = customSdkBaseUrlForFace(input.baseUrl, face);
   // 注册 provider 让 runtime 能解析 apiKey + api 流实现；model 直接构造引用同 provider
   runtime.registerProvider(PROVIDER_ID, {
     name: "Custom",
     baseUrl: sdkBase,
     apiKey: input.apiKey,
-    api: apiOf(input.format),
-    models: [buildModelConfig(modelId, input.format, fields)],
+    api: face,
+    models: [buildModelConfig(modelId, face, fields)],
   });
-  return { runtime, model: buildModel(modelId, input, fields), thinkingLevel };
+  return { runtime, model: buildModel(modelId, input, face, fields), thinkingLevel };
 };
 
 // ----------------- Flowship 自有工具桥接（pi customTools） -----------------

@@ -26,12 +26,12 @@ export const customOpenAiSdkBaseUrl = (raw: string): string =>
 export const customAnthropicSdkBaseUrl = (raw: string): string =>
   normalizeCustomBaseUrl(raw);
 
-/** 按协议交给 pi 的 baseURL */
-export const customSdkBaseUrl = (
+/** 按已解析的请求面交给 pi 的 baseURL：responses / completions 都要 `/v1`（SDK 只拼尾段） */
+export const customSdkBaseUrlForFace = (
   raw: string,
-  format: CustomProviderFormat,
+  face: "openai-completions" | "openai-responses" | "anthropic-messages",
 ): string =>
-  format === "anthropic"
+  face === "anthropic-messages"
     ? customAnthropicSdkBaseUrl(raw)
     : customOpenAiSdkBaseUrl(raw);
 
@@ -57,7 +57,8 @@ type HeaderFn = (
   format: CustomProviderFormat,
 ) => Record<string, string>;
 
-/** 拉模型列表的候选：Anthropic 表面常常没有 GET /v1/models，回退到旁路 OpenAI 列表 */
+/** 拉模型列表的候选：Anthropic 表面常常没有 GET /v1/models，回退到旁路 OpenAI 列表。
+ *  auto（未显式选协议）：先 Bearer、再 x-api-key 各试一次。 */
 export const customModelListAttempts = (
   baseUrl: string,
   apiKey: string,
@@ -80,7 +81,16 @@ export const customModelListAttempts = (
     attempts.push({ url, headers });
   };
 
-  if (format === "anthropic") {
+  if (format === "auto") {
+    push(`${root}/v1/models`, headersOf(apiKey, "openai"));
+    if (looksLikeAnthropicPath(root)) {
+      const openaiRoot = root.replace(/\/anthropic$/i, "");
+      if (openaiRoot) {
+        push(`${openaiRoot}/v1/models`, headersOf(apiKey, "openai"));
+      }
+    }
+    push(`${root}/v1/models`, headersOf(apiKey, "anthropic"));
+  } else if (format === "anthropic") {
     push(`${root}/v1/models`, headersOf(apiKey, "anthropic"));
     if (looksLikeAnthropicPath(root)) {
       const openaiRoot = root.replace(/\/anthropic$/i, "");

@@ -2,11 +2,12 @@
 
 /**
  * Skills 列表单行（行尾控件按来源分）：
- * - 自管：常驻「编辑 / 删除」文字按钮 + Switch（disabledSkills）
+ * - 可管理源（自管 / 飞书 CLI / 全局 ~/.agents/skills / 项目 <repo>/.agents/skills）：
+ *   Switch 开关（disabledSkills、同名一关全关）+ 常驻「删除」；自管另有「编辑」
  * - team「共享」（shared:*）：市场模型——未安装「安装」；已安装「已安装」标 + 常驻「卸载」；
  *   另有低调「从库删除」（远端清理误上传）
  * - team「团队规范」（knowledge）：Switch 启停（开=install / 关=uninstall；总开关关时禁用）
- * - 内置 / 飞书 CLI：必备只读、常驻「查看」
+ * - 内置：必备只读、常驻「查看」
  *
  * 操作区一律常驻文字按钮（与 Action tab 统一；废除 hover 显现 + 纯 icon）。
  * 行布局：左侧两行文本 + 右侧操作区垂直居中（items-center）。
@@ -21,7 +22,11 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 
-import { isSharedTeamCategory, type SkillRow } from "./types";
+import {
+  isSharedTeamCategory,
+  MANAGEABLE_SOURCES,
+  type SkillRow,
+} from "./types";
 
 /** 行内次要操作：紧凑 ghost 文字按钮（查看/编辑/删除/卸载共用） */
 const ROW_ACTION_BTN =
@@ -39,9 +44,10 @@ type Props = {
   anyBusy?: boolean;
   onEdit: (name: string) => void;
   onView: (name: string, source: SkillRow["source"]) => void;
-  onDelete: (name: string) => void;
-  /** 仅自管：Switch 切 disabledSkills */
-  onToggleApp: (row: SkillRow, enabled: boolean) => void;
+  /** 可管理源：整行删除（server 按 source/repo 定位目录） */
+  onDelete: (row: SkillRow) => void;
+  /** 可管理源：Switch 切 disabledSkills（同名一关全关） */
+  onToggleManageable: (row: SkillRow, enabled: boolean) => void;
   /** team：安装 / 卸载（shared 市场按钮；knowledge Switch 开/关也走这两条） */
   onInstall: (row: SkillRow) => void;
   onUninstall: (row: SkillRow) => void;
@@ -58,7 +64,7 @@ export const SkillRowItem = ({
   onEdit,
   onView,
   onDelete,
-  onToggleApp,
+  onToggleManageable,
   onInstall,
   onUninstall,
   onDeleteFromLibrary,
@@ -70,6 +76,8 @@ export const SkillRowItem = ({
   const installed = isShared && s.enabled;
   // 装卸控件：任意行忙就禁；spinner 仍只看本行 busy
   const controlsDisabled = dimmed || anyBusy;
+  // 可管理源：可开关（同名一关全关）、可删除
+  const isManageable = MANAGEABLE_SOURCES.includes(s.source);
 
   return (
     <div
@@ -119,24 +127,14 @@ export const SkillRowItem = ({
       {/* 操作区常驻（与 Switch / 安装同排；纯文字按钮） */}
       <div className="flex shrink-0 items-center gap-0.5">
         {s.editable ? (
-          <>
-            <Button
-              size="sm"
-              variant="ghost"
-              className={ROW_ACTION_BTN}
-              onClick={() => onEdit(s.name)}
-            >
-              编辑
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              className={cn(ROW_ACTION_BTN, "hover:text-destructive")}
-              onClick={() => onDelete(s.name)}
-            >
-              删除
-            </Button>
-          </>
+          <Button
+            size="sm"
+            variant="ghost"
+            className={ROW_ACTION_BTN}
+            onClick={() => onEdit(s.name)}
+          >
+            编辑
+          </Button>
         ) : (
           <Button
             size="sm"
@@ -145,6 +143,17 @@ export const SkillRowItem = ({
             onClick={() => onView(s.name, s.source)}
           >
             查看
+          </Button>
+        )}
+        {/* 可管理源常驻删除（含飞书 CLI / 全局 / 项目标准目录） */}
+        {isManageable && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className={cn(ROW_ACTION_BTN, "hover:text-destructive")}
+            onClick={() => onDelete(s)}
+          >
+            删除
           </Button>
         )}
         {/* 共享已安装：常驻卸载（区别于自管「删除」） */}
@@ -174,11 +183,12 @@ export const SkillRowItem = ({
       </div>
 
       {/* 行尾常驻控件：Switch / 安装 */}
-      {s.source === "app" && (
+      {/* 可管理源：Switch 切 disabledSkills（同名一关全关） */}
+      {isManageable && (
         <Switch
           className="shrink-0"
           checked={s.enabled}
-          onCheckedChange={(v) => onToggleApp(s, v)}
+          onCheckedChange={(v) => onToggleManageable(s, v)}
           aria-label={`${s.enabled ? "禁用" : "启用"} ${s.name}`}
         />
       )}

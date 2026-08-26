@@ -13,19 +13,27 @@ import {
 export interface SkillRow {
   name: string;
   description: string;
-  source: "builtin" | "app" | "feishu-cli" | "team";
+  source:
+    | "builtin"
+    | "app"
+    | "feishu-cli"
+    | "global-std"
+    | "project-std"
+    | "team";
   editable: boolean;
   /**
    * 启停语义按来源分：
    * - team shared = 已安装（skill-states，市场装卸）
    * - team knowledge = 已启用（同一 skill-states，Switch 启停）
-   * - app = 未被 disabledSkills 关
-   * - 内置 / 飞书 CLI = 恒 true（必备只读）
+   * - 可管理源（app / 飞书 CLI / 全局 / 项目）= 未被 disabledSkills 关（同名一关全关）
+   * - 内置 = 恒 true（必备只读）
    */
   enabled: boolean;
   absPath: string;
   /** 展示用短路径（home 缩成 ~） */
   displayPath?: string;
+  /** project-std 源：所在仓根路径（删除 API 要回传） */
+  repoPath?: string;
   /** team 源：shared:<cat>（组内沉淀）或 knowledge 顶层目录名（global/frontend/...） */
   teamCategory?: string;
   /**
@@ -47,16 +55,25 @@ export const SOURCE_LABEL: Record<SkillRow["source"], string> = {
   builtin: "内置",
   app: "自管",
   "feishu-cli": "飞书 CLI",
+  "global-std": "全局",
+  "project-std": "项目",
   team: "团队",
 };
 
-/** 左栏导航：永远只有 5 项来源、无嵌套 */
+/** 我的分组（原「可管理」）：合并四源、可开关可删除；与 server 端门禁一致 */
+export const MANAGEABLE_SOURCES: readonly SkillRow["source"][] = [
+  "app",
+  "feishu-cli",
+  "global-std",
+  "project-std",
+];
+
+/** 左栏导航：「我的」合并四源 + 团队三组 + 内置只读组 */
 export type SourceNavKey =
-  | "app"
+  | "manageable"
   | "shared"
   | "knowledge"
-  | "builtin"
-  | "feishu-cli";
+  | "builtin";
 
 /** 上传分类 chip 固定顺序（含 common） */
 export const UPLOAD_CATEGORIES = [
@@ -80,11 +97,14 @@ export const sharedCategoryOf = (s: SkillRow): string =>
 export const knowledgeCategoryOf = (s: SkillRow): string =>
   s.teamCategory ?? "unknown";
 
-/** 左栏来源过滤（不含分类 chip / 搜索） */
+/** 左栏来源过滤（不含分类 chip / 搜索）；manageable 合并四个可管理源 */
 export const skillsForNav = (
   skills: SkillRow[],
   nav: SourceNavKey,
 ): SkillRow[] => {
+  if (nav === "manageable") {
+    return skills.filter((s) => MANAGEABLE_SOURCES.includes(s.source));
+  }
   if (nav === "shared") {
     return skills.filter(
       (s) => s.source === "team" && isSharedTeamCategory(s.teamCategory),
@@ -109,6 +129,25 @@ export const categoryChipsFor = (
   skills: SkillRow[],
   nav: SourceNavKey,
 ): CategoryChip[] => {
+  // 我的分组：按来源出 chip（全部 / 自管 / 飞书 CLI / 全局 / 项目）
+  if (nav === "manageable") {
+    const inManageable = skillsForNav(skills, nav);
+    if (inManageable.length === 0) return [];
+    const counts = new Map<string, number>();
+    for (const s of inManageable) {
+      counts.set(s.source, (counts.get(s.source) ?? 0) + 1);
+    }
+    // 按 MANAGEABLE_SOURCES 声明序稳定排列
+    const keys = MANAGEABLE_SOURCES.filter((src) => counts.has(src));
+    return [
+      { value: "all", label: "全部", count: inManageable.length },
+      ...keys.map((src) => ({
+        value: src,
+        label: SOURCE_LABEL[src],
+        count: counts.get(src) ?? 0,
+      })),
+    ];
+  }
   if (nav !== "shared" && nav !== "knowledge") return [];
   const inNav = skillsForNav(skills, nav);
   const catOf = nav === "shared" ? sharedCategoryOf : knowledgeCategoryOf;
@@ -139,14 +178,18 @@ export const categoryChipsFor = (
   ];
 };
 
-/** 分类 chip 过滤（chip="all" 或非 shared/knowledge 导航 = 不过滤） */
+/** 分类 chip 过滤（chip="all" 或无 chip 的导航 = 不过滤；manageable 按 source 过滤） */
 export const applyCategoryChip = (
   skills: SkillRow[],
   nav: SourceNavKey,
   chip: string,
 ): SkillRow[] => {
   const inNav = skillsForNav(skills, nav);
-  if (chip === "all" || (nav !== "shared" && nav !== "knowledge")) return inNav;
+  if (chip === "all") return inNav;
+  if (nav === "manageable") {
+    return inNav.filter((s) => s.source === chip);
+  }
+  if (nav !== "shared" && nav !== "knowledge") return inNav;
   const catOf = nav === "shared" ? sharedCategoryOf : knowledgeCategoryOf;
   return inNav.filter((s) => catOf(s) === chip);
 };
@@ -156,6 +199,8 @@ export const sourceTagForSkill = (s: SkillRow): string => {
   if (s.source === "app") return "自管";
   if (s.source === "builtin") return "内置";
   if (s.source === "feishu-cli") return "飞书 CLI";
+  if (s.source === "global-std") return "全局";
+  if (s.source === "project-std") return "项目";
   // team：缺 category 时与 knowledgeCategoryOf 对齐成「规范 · unknown」（非 Action 的「共享」）
   return labelTeamCategoryBadge(
     s.teamCategory,

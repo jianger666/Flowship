@@ -23,11 +23,12 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
 const modelsCache = new Map<string, { models: ModelOption[]; ts: number }>();
 
 // 缓存 key：自定义 provider 按 baseUrl+apiKey+format 区分、cursor 按 apiKey
+const parseFormatParam = (v: unknown): CustomProviderFormat =>
+  v === "anthropic" || v === "auto" ? v : "openai";
 const cacheKeyOf = (body: RequestBody): string => {
-  const fmt = body.format === "anthropic" ? "anthropic" : "openai";
-  return body.baseUrl
-    ? `custom-v4:${body.baseUrl}:${fmt}:${body.apiKey ?? ""}`
-    : `cursor-v3:${body.apiKey ?? ""}`;
+  if (!body.baseUrl) return `cursor-v3:${body.apiKey ?? ""}`;
+  const fmt = parseFormatParam(body.format);
+  return `custom-v5:${body.baseUrl}:${fmt}:${body.apiKey ?? ""}`;
 };
 
 // SDK 返回的 ModelListItem schema 比较杂、只挑前端实际要用的字段透传
@@ -94,8 +95,7 @@ export const POST = async (req: Request) => {
       if (!baseUrl) {
         return NextResponse.json({ error: "缺少 baseUrl" }, { status: 400 });
       }
-      const format: CustomProviderFormat =
-        body.format === "anthropic" ? "anthropic" : "openai";
+      const format = parseFormatParam(body.format);
       options = await listCustomModels({
         baseUrl,
         apiKey: body.apiKey?.trim() ?? "",

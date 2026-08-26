@@ -312,7 +312,11 @@ const CustomProviderRow = ({
               value={value.format}
               onChange={(v) => {
                 const format: CustomProviderFormat =
-                  v === "anthropic" ? "anthropic" : "openai";
+                  v === "anthropic"
+                    ? "anthropic"
+                    : v === "openai"
+                      ? "openai"
+                      : "auto";
                 const next = { ...value, format };
                 onChange(next);
                 commit(next, true);
@@ -324,6 +328,11 @@ const CustomProviderRow = ({
                 label: CUSTOM_PROVIDER_FORMAT_LABEL[id],
               }))}
             />
+            {value.format === "auto" ? (
+              <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+                按模型自动选协议（models.dev 目录）；目录外的端点走 OpenAI 兼容
+              </p>
+            ) : null}
           </div>
           <DefaultModelSection
             models={models}

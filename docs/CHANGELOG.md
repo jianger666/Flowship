@@ -15,6 +15,14 @@
 
 ---
 
+### v1.9.2（2026-08-26）停止后立即发送续接原会话 / 自定义提供方协议自动路由 / Skills 多源管理
+
+- **停止 / 立即发送不再丢会话**：chat 停止或 run 收尾中立刻再发消息，原实现强清落盘锚点降级全新会话、上下文全丢。现 cancelled 收尾保留锚点（`keepPersisted`），发送侧带 startToken 租约 `Agent.resume` 续接原会话；resume 成功 → 202 续发，确定性失败才清锚降级新会话，终态不重放；停止等待 5s 超时兜底。
+- **自定义提供方协议 auto 档**：「协议」默认改为自动——按 models.dev 目录该模型条目的 npm 字段推断 openai-completions / openai-responses / anthropic-messages，不用手工猜；目录拉取失败回落手动档。路由索引 URL 小写归一（数据源大小写漂移不漏命中）；base URL 推导收敛到 `customSdkBaseUrlForFace` 单点。
+- **Skills 多源管理收口**：来源扩成 app 自管 / 飞书 CLI / 全局标准（`~/.agents/skills`）/ 项目标准（`<repo>/.agents/skills`），四个可管理源都能在设置页开关与删除；「我的」按来源分组、同名多副本并列展示（如 lark-cli 升级换安装目录留下的历史副本）、同名一关全关；运行时注入仍按优先级去重（自管 > 平台 > 飞书 CLI > 全局 > 项目 > 团队），agent 不吃重复内容。
+- **答题卡投递中态**：提交超时解锁后重试命中服务端 `ask_in_flight`（409）时，答题卡转只读「投递中」、90s 兜底解锁、SSE 终态自动收起——防同轮重复提问。
+- **滚动抖动根治 + 探针退役**：根因是 Streamdown 代码块 `content-visibility:auto` 的估算尺寸和 Virtuoso 条目测量互相打架（DevTools 钩到 `scrollBy(±132)` 死循环）；对虚拟滚动容器内的代码块关闭 cv、非虚拟化视图保留省渲染收益；取证用 scroll-probe（API / 模块 / 诊断收录段）删除。
+
 ### v1.9.1（2026-08-21）交卷收尾 / 系统通知对齐话说完 / Windows 自更新快捷方式
 
 - **交卷收尾槽位**：写完产物先 `submit_work`，回执后再说 1–3 句业务结论。write 后事件流挂「处理中…」，完成后自动收起。系统通知等到这一轮 consume 结束（不再交卷当下就弹）。

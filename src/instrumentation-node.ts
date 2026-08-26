@@ -118,6 +118,18 @@ export const registerNode = (): void => {
       );
     });
 
+  // models.dev 目录预热（fire-and-forget）：目录约 4MB、现拉最长 20s——启动时异步拉好，
+  // 之后首次自定义 provider 调用 / 打开设置页即命中 24h 缓存。refreshIndexes 内部
+  // 自带失败冷却 + 空表兜底（离线也不影响启动），这里只兜动态 import 本身的失败。
+  void import("./lib/server/models-dev-catalog")
+    .then((m) => m.getModelsDevIndex())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] models.dev 目录预热失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+
   // ⚠️ 飞书桥接 bootstrap **不能**挂这里（2026-07-19 dev 冒烟踩过）：
   // bridge 模块图经 router/card-action → chat-inject → chat-runner 静态引到 @cursor/sdk，
   // 而 instrumentation 的 webpack bundle 不吃 serverExternalPackages——SDK 的

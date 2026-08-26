@@ -17,9 +17,11 @@ import { getGlobalCursorDirs } from "./cursor-config";
 import { getToolsSkillsDir } from "./feishu-cli";
 import {
   getAppSkillsDir,
+  getGlobalAgentsSkillsDir,
   scanSkillsDir,
   type SkillEntry,
 } from "./skills-loader";
+import { readSettingsFile } from "./settings-fs";
 import {
   getTeamLibraryKnowledgeRoot,
   getTeamLibraryKnowledgeSkillsDir,
@@ -28,13 +30,37 @@ import {
 } from "./team-library";
 import { getTeamSkillAuthors } from "./team-skill-authors";
 
-/** skill 来源（设置页标签 + 是否可编辑的判定；不含 Cursor 全局——那只作导入源） */
-export type SkillSource = "builtin" | "app" | "feishu-cli" | "team";
+/**
+ * skill 来源（设置页标签 + 是否可编辑的判定；不含 Cursor 全局——那只作导入源）。
+ * - global-std = agentskills.io 标准全局目录 ~/.agents/skills/（用户自装）
+ * - project-std = agentskills.io 标准项目目录 <repo>/.agents/skills/（用户加入仓库）
+ * 这两个 + app / feishu-cli 都是「可管理」源：可开关、可删除；builtin / team 只读。
+ */
+export type SkillSource =
+  | "builtin"
+  | "app"
+  | "feishu-cli"
+  | "global-std"
+  | "project-std"
+  | "team";
+
+/** 可管理源（可开关 / 可删除；与 skills-loader 的 disabledSkills 门禁范围一致） */
+export const MANAGEABLE_SKILL_SOURCES: readonly SkillSource[] = [
+  "app",
+  "feishu-cli",
+  "global-std",
+  "project-std",
+];
+
+export const isManageableSkillSource = (source: SkillSource): boolean =>
+  MANAGEABLE_SKILL_SOURCES.includes(source);
 
 export interface SkillWithSource extends SkillEntry {
   source: SkillSource;
   /** 只有 app 自管的可编辑 / 删除 */
   editable: boolean;
+  /** 仅 project-std 源：skill 所在仓根路径（删除 API 要回传） */
+  repoPath?: string;
   /**
    * 仅 source=team：来自 clone `skills/<cat>/...` → `shared:<cat>`（如 shared:fe）；
    * 来自 `knowledge/skills/<dir>/...` → `<dir>` 原样（如 global/frontend，路径推导不写死枚举）。
@@ -63,25 +89,40 @@ const isSafeSkillName = (name: string): boolean =>
   /^[a-zA-Z0-9\u4e00-\u9fa5][a-zA-Z0-9\u4e00-\u9fa5._-]{0,63}$/.test(name);
 
 /** 按来源列全部 skill（不去重——同名多来源都展示、用户能看清覆盖关系） */
-export const listSkillsWithSource = async (): Promise<SkillWithSource[]> => {
+export const listSkillsWithSource = async (
+  opts?: { repoPaths?: string[] },
+): Promise<SkillWithSource[]> => {
   const out: SkillWithSource[] = [];
   const push = (
     entries: SkillEntry[],
     source: SkillSource,
-    teamCategory?: string,
+    extra?: { repoPath?: string },
   ) => {
     for (const e of entries) {
       out.push({
         ...e,
         source,
+        // 编辑仍仅 app 自管（其它源的编辑会静默写成 app 副本、语义混乱）；
+        // 删除能力由 isManageableSkillSource 判定、不占 editable 字段
         editable: source === "app",
-        ...(teamCategory !== undefined ? { teamCategory } : {}),
+        ...(extra?.repoPath ? { repoPath: extra.repoPath } : {}),
       });
     }
   };
   push(await scanSkillsDir(path.join(process.cwd(), "skills")), "builtin");
   push(await scanSkillsDir(getAppSkillsDir()), "app");
   push(await scanSkillsDir(getToolsSkillsDir()), "feishu-cli");
+  // agentskills 标准全局 / 项目目录（用户自装能力；此前不在设置页露出、盲区收口）
+  push(await scanSkillsDir(getGlobalAgentsSkillsDir()), "global-std");
+  for (const repo of opts?.repoPaths ?? []) {
+    const root = String(repo ?? "").trim();
+    if (!root) continue;
+    push(
+      await scanSkillsDir(path.join(root, ".agents", "skills")),
+      "project-std",
+      { repoPath: root },
+    );
+  }
   // team 条目附创建人：git 历史索引（HEAD 级缓存、失败空表不阻断）
   const repoDir = teamLibraryRepoDir();
   const authors = await getTeamSkillAuthors(repoDir);
@@ -145,7 +186,23 @@ export const readSkillContentByName = async (
   source?: SkillSource,
 ): Promise<string | null> => {
   if (!isSafeSkillName(name)) return null;
-  const all = await listSkillsWithSource();
+  // 项目级源也要能查到（设置页「查看」用）：带已登记仓根路径；读失败退化为非项目源
+  let repoPaths: string[] | undefined;
+  try {
+    const result = await readSettingsFile();
+    if (result.status === "ok") {
+      // settings 读盘结果是宽类型、repos 字段显式收窄（与 previewCommandFor 同套路）
+      const repos = Array.isArray(result.settings?.repos)
+        ? (result.settings.repos as Array<{ path?: unknown }>)
+        : [];
+      repoPaths = repos
+        .map((r) => String(r?.path ?? "").trim())
+        .filter(Boolean);
+    }
+  } catch {
+    // 忽略
+  }
+  const all = await listSkillsWithSource({ repoPaths });
   const hit = source
     ? all.find((s) => s.name === name && s.source === source)
     : all.find((s) => s.name === name);
@@ -179,19 +236,65 @@ export const writeAppSkill = async (
   }
 };
 
-/** 删除 app 自管 skill（整目录删、含附属文件）；不存在也当成功（幂等） */
-export const deleteAppSkill = async (name: string): Promise<string | null> => {
+/** 各可管理源的删除锚点根目录（project-std 需 repoPath 且仓已在 settings.repos 登记） */
+const deletionRootFor = async (
+  source: SkillSource,
+  repoPath?: string,
+): Promise<string | null> => {
+  if (source === "app") return getAppSkillsDir();
+  if (source === "feishu-cli") return getToolsSkillsDir();
+  if (source === "global-std") return getGlobalAgentsSkillsDir();
+  if (source === "project-std") {
+    const root = String(repoPath ?? "").trim();
+    if (!root) return null;
+    // 只允许删「设置页已登记仓」下的项目级 skill——防拿任意路径当仓库
+    try {
+      const result = await readSettingsFile();
+      const repos =
+        result.status === "ok" && Array.isArray(result.settings?.repos)
+          ? (result.settings.repos as Array<{ path?: unknown }>)
+          : [];
+      const norm = (p: string) => String(p ?? "").replace(/[/\\]+$/, "");
+      if (!repos.some((r) => norm(String(r?.path)) === norm(root))) return null;
+    } catch {
+      return null;
+    }
+    return path.join(root, ".agents", "skills");
+  }
+  return null; // builtin / team 不是可管理源
+};
+
+/**
+ * 删除任意可管理源 skill（整目录删、含附属文件）；不存在也当成功（幂等）。
+ * 可管理源 = app 自管 / 飞书 CLI / 全局 ~/.agents/skills / 项目 <repo>/.agents/skills
+ * （都是用户意向安装/加入的，允许真删；飞书 CLI 源重装 lark-cli 可能装回、接受）。
+ * builtin / team 只读 → 返回用户可读原因。
+ */
+export const deleteSkillBySource = async (
+  name: string,
+  source: SkillSource,
+  opts?: { repoPath?: string },
+): Promise<string | null> => {
   if (!isSafeSkillName(name)) return "skill 名非法";
+  if (!isManageableSkillSource(source))
+    return `${source} 来源的 skill 不可删除`;
+  const root = await deletionRootFor(source, opts?.repoPath);
+  if (!root) return "仓库未在设置里登记，拒绝删除项目级 skill";
+  // 锚定校验：目标必须真落在根目录下（isSafeSkillName 已拦穿越字符、这里双保险）
+  const resolvedRoot = path.resolve(root);
+  const target = path.resolve(resolvedRoot, name);
+  if (!target.startsWith(resolvedRoot + path.sep)) return "skill 路径非法";
   try {
-    await fs.rm(path.join(getAppSkillsDir(), name), {
-      recursive: true,
-      force: true,
-    });
+    await fs.rm(target, { recursive: true, force: true });
     return null;
   } catch (err) {
     return `删除失败：${err instanceof Error ? err.message : String(err)}`;
   }
 };
+
+/** 删除 app 自管 skill（兼容旧调用方；完整能力见 deleteSkillBySource） */
+export const deleteAppSkill = async (name: string): Promise<string | null> =>
+  deleteSkillBySource(name, "app");
 
 /**
  * 从全局 `~/.cursor/skills/` 导入（整目录拷贝、含 scripts 等附属文件——

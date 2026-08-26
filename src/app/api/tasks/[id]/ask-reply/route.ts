@@ -606,8 +606,11 @@ const handleAskReply = async (
       console.warn(
         `[ask-reply] task=${task.id} askId=${askId} 另一条链正在了结这组提问、本次回答不投递`,
       );
-      // 文案保持中性：takenAsks 不记谁摘的——双击提交时第二个请求的用户并没发过新消息
-      return errorResponse("这组提问正在被处理、无需再回答", 409);
+      // 文案保持中性：takenAsks 不记谁摘的——双击提交时第二个请求的用户并没发过新消息。
+      // code=ask_in_flight：前端据此把答题卡切「投递中」只读态，而不是留着可编辑让用户反复撞 409
+      return errorResponse("这组提问正在被处理、无需再回答", 409, {
+        code: "ask_in_flight",
+      });
     }
 
     const fresh = (await getTask(id)) ?? task;

@@ -59,7 +59,15 @@ const handleJson = async <T>(res: Response): Promise<T> => {
       typeof (data as { error: unknown }).error === "string"
         ? (data as { error: string }).error
         : `HTTP ${res.status}`;
-    throw new ApiRequestError(msg, res.status);
+    // 服务端稳定错误码（如 ask_in_flight）透传、供调用方做非文案的分支判定
+    const code =
+      typeof data === "object" &&
+      data &&
+      "code" in data &&
+      typeof (data as { code: unknown }).code === "string"
+        ? (data as { code: string }).code
+        : undefined;
+    throw new ApiRequestError(msg, res.status, { code });
   }
   return data as T;
 };

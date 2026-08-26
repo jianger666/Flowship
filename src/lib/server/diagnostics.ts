@@ -17,13 +17,8 @@ import path from "node:path";
 import { dataRoot } from "./data-root";
 import { listIdeToolsDetailed } from "./ide-tools";
 
-// 滚动探针日志路径（与 api/debug/scroll-probe route 同一文件、单一事实源在这边定义会循环依赖、故重复字面量并注释互指）
-const SCROLL_PROBE_LOG = path.join(dataRoot(), "..", "logs", "scroll-probe.jsonl");
-
 // main.log 尾部截取量——太大发飞书费劲、300KB 足够覆盖最近几小时
 const LOG_TAIL_BYTES = 300 * 1024;
-// 滚动探针日志尾部截取量（JSONL 逐帧样本、100KB ≈ 上千条，足够覆盖最近几次抖动现场）
-const SCROLL_PROBE_TAIL_BYTES = 100 * 1024;
 
 // 秘钥脱敏：留前 6 位 + 总长度（足够对上「配没配 / 配的是不是那把」、不泄漏本体）
 const maskSecret = (v: unknown): string => {
@@ -91,51 +86,16 @@ const readMainLogTail = async (): Promise<string> => {
   }
 };
 
-/** 读滚动抖动探针日志尾部（没开过开关 / 从未触发时返提示文案） */
-const readScrollProbeTail = async (): Promise<string> => {
-  // 轮转后旧样本在 .old；两份都取尾部、新的在前
-  const files = [`${SCROLL_PROBE_LOG}.old`, SCROLL_PROBE_LOG];
-  const parts: string[] = [];
-  for (const file of files) {
-    try {
-      const stat = await fs.stat(file);
-      if (stat.size === 0) continue;
-      const start = Math.max(0, stat.size - SCROLL_PROBE_TAIL_BYTES);
-      const fh = await fs.open(file, "r");
-      try {
-        const buf = Buffer.alloc(stat.size - start);
-        await fh.read(buf, 0, buf.length, start);
-        const text = buf.toString("utf8");
-        // 首行可能被截断、丢掉不完整的头
-        const lines = text.split("\n");
-        if (start > 0) lines.shift();
-        parts.push(
-          `--- ${path.basename(file)}（${stat.size} 字节，取尾部） ---\n${lines.join("\n")}`,
-        );
-      } finally {
-        await fh.close();
-      }
-    } catch {
-      /* 文件不存在：跳过 */
-    }
-  }
-  return parts.length > 0
-    ? parts.join("\n")
-    : "（无记录：滚动探针未开启或从未检测到高频抖动。开启方式：DevTools 里 " +
-      "localStorage.setItem('flowship:scroll-debug','1') 后刷新）";
-};
-
 /**
  * 组装诊断包并写到「下载」目录。
  * @param appVersion 壳版本号（客户端从 window.__appVersion 带来、server 自己拿不到）
  * @returns 落盘绝对路径
  */
 export const exportDiagnostics = async (appVersion?: string): Promise<string> => {
-  const [ideTools, config, logTail, scrollProbeTail] = await Promise.all([
+  const [ideTools, config, logTail] = await Promise.all([
     listIdeToolsDetailed(),
     readSanitizedConfig(),
     readMainLogTail(),
-    readScrollProbeTail(),
   ]);
 
   const content = [
@@ -155,9 +115,6 @@ export const exportDiagnostics = async (appVersion?: string): Promise<string> =>
     "",
     `===== main.log 尾部（最后 ${Math.round(LOG_TAIL_BYTES / 1024)}KB） =====`,
     logTail,
-    "",
-    "===== 滚动抖动探针日志 =====",
-    scrollProbeTail,
   ].join("\n");
 
   // 时间戳文件名（本地时间、精确到分、重复导出不覆盖）

@@ -30,12 +30,23 @@ import type { ImageAttachmentInput } from "@/lib/server/task-artifacts";
  *
  * @param message 错误消息（会塞到 `{ error: message }` body 里）
  * @param status  HTTP 状态码、默认 400
+ * @param options.code 可选稳定错误码（如 ask_in_flight）、客户端据此做非文案的分支判定
  */
-export const errorResponse = (message: string, status = 400): Response =>
-  new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+export const errorResponse = (
+  message: string,
+  status = 400,
+  options?: { code?: string },
+): Response =>
+  new Response(
+    JSON.stringify({
+      error: message,
+      ...(options?.code ? { code: options.code } : {}),
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    },
+  );
 
 // ----------------- 类型守卫 -----------------
 

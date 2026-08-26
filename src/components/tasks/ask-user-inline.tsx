@@ -19,7 +19,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Sparkles } from "lucide-react";
+import { AlertTriangle, Loader2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -29,6 +29,7 @@ import { RichInput } from "@/components/rich-input";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/components/tasks/event-stream/rows";
 import { extractAskQuestions } from "@/lib/ask-pending";
+import { ApiRequestError } from "@/lib/task-store";
 import { useDialog } from "@/hooks/use-dialog";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { useSubmitShortcut } from "@/hooks/use-settings";
@@ -276,6 +277,9 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
   const [drafts, setDrafts] = useState<Record<string, AnswerDraft>>({});
   // 提交中：防双击 / 网络重发
   const [submitting, setSubmitting] = useState(false);
+  // 投递中：另一条链（首次提交）正在把答案送 agent、本卡只读等终态事件收起。
+  // 触发：提交超时解锁后用户重试、命中服务端 409 ask_in_flight（见 handleSubmit catch）
+  const [inFlight, setInFlight] = useState(false);
   // agent 已断（runStatus=error）：这组 ask 送不达、禁交互 + 引导用输入条唤醒
   const isStale = task.runStatus === "error";
 
@@ -283,6 +287,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
   useEffect(() => {
     setDrafts({});
     setSubmitting(false);
+    setInFlight(false);
   }, [askId]);
 
   const handleDraftChange = useCallback((qid: string, draft: AnswerDraft) => {
@@ -320,8 +325,19 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     (err instanceof DOMException || err instanceof Error) &&
     err.name === "AbortError";
 
+  // 投递中态：另一条链正在送答案、卡片只读；正常由 SSE 终态事件（ask_user_reply /
+  // supersede）收起，这里给 90s 兑底解锁防事件丢失卡死（比提交超时宽得多：投递链含
+  // 假死检测 + 会话恢复、实测可达数十秒）
+  const IN_FLIGHT_UNLOCK_MS = 90_000;
+  const markInFlight = () => {
+    setSubmitting(false);
+    setInFlight(true);
+    toast.info("你的回答已在投递中，请勿重复提交，完成后会自动收起");
+    trackTimer(window.setTimeout(() => setInFlight(false), IN_FLIGHT_UNLOCK_MS));
+  };
+
   const handleSubmit = async () => {
-    if (!askId || submitting) return;
+    if (!askId || submitting || inFlight) return;
     if (!allAnswered) {
       toast.error("请把所有问题都答完再提交");
       return;
@@ -375,14 +391,29 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         setSubmitting(false);
         return;
       }
+      if (handleAskInFlightError(err)) return;
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
     }
   };
 
+  // 首次提交的链还在飞（如假死中止慢链路）：卡片转「投递中」只读态而不是留在可编辑态
+  // 让用户反复撞 409——终态由 SSE 事件收起，见 markInFlight 注释
+  const handleAskInFlightError = (err: unknown): boolean => {
+    if (
+      err instanceof ApiRequestError &&
+      err.status === 409 &&
+      err.code === "ask_in_flight"
+    ) {
+      markInFlight();
+      return true;
+    }
+    return false;
+  };
+
   // 「稍后再补充」：confirm → deferred 提交、agent 跳过这组 Q 按 default 推进
   const handleDefer = async () => {
-    if (!askId || submitting) return;
+    if (!askId || submitting || inFlight) return;
     const ok = await confirm({
       title: "稍后再补充这些问题？",
       description:
@@ -419,6 +450,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         setSubmitting(false);
         return;
       }
+      if (handleAskInFlightError(err)) return;
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
     }
@@ -452,6 +484,15 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         </span>
       </div>
 
+      {inFlight && (
+        // 投递中横幅：首次提交的链还在送答案（可能含假死检测 + 会话恢复、耗时数十秒）。
+        // 只读等终态：SSE 推 ask_user_reply / supersede 后卡片自动收起或转回放
+        <div className="flex items-center gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 shrink-0 animate-spin" />
+          回答投递中，请勿重复提交——完成后本卡会自动收起。
+        </div>
+      )}
+
       {isStale ? (
         // 失效态：不挡屏、无需 dismiss——提示后用户直接用底部输入条唤醒即可
         <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
@@ -475,7 +516,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
                     taskId={task.id}
                     baseDir={task.workCwd}
                     index={qIdx + 1}
-                    submitting={submitting}
+                    submitting={submitting || inFlight}
                     onChange={handleDraftChange}
                     onSubmitAll={() => void handleSubmit()}
                   />
@@ -492,7 +533,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
               <Button
                 size="sm"
                 variant="ghost"
-                disabled={submitting}
+                disabled={submitting || inFlight}
                 onClick={() => void handleDefer()}
                 className="h-7 text-xs text-muted-foreground"
               >
@@ -500,11 +541,11 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
               </Button>
               <Button
                 size="sm"
-                disabled={submitting || !allAnswered}
+                disabled={submitting || inFlight || !allAnswered}
                 onClick={() => void handleSubmit()}
                 className="h-7 text-xs"
               >
-                {submitting ? "提交中…" : "提交全部回答"}
+                {submitting ? "提交中…" : inFlight ? "投递中…" : "提交全部回答"}
               </Button>
             </div>
           </div>

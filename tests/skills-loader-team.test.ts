@@ -124,16 +124,16 @@ describe("loadSkills（启停三分）", () => {
     expect(list.find((s) => s.name === "kb-a")).toBeTruthy();
   });
 
-  it("disabledSkills 只管 app 自管；飞书 CLI / team 均不受它影响", async () => {
+  it("disabledSkills 管所有可管理源（同名一关全关）；team / 内置不受影响", async () => {
     await writeSkill(path.join(sharedSkills(), "fe", "team-a"), "team-a");
     await writeSkill(path.join(appSkillsDir(), "my-app"), "my-app");
     await writeSkill(path.join(feishuSkillsDir(), "lark-doc"), "lark-doc");
-    // 三个全写进 disabledSkills：只有 app 源的 my-app 被滤
+    // team 走自己的 skill-states；可管理源统一查 disabledSkills
     await writeConfig({ disabledSkills: ["team-a", "my-app", "lark-doc"] });
 
     const list = await loadSkills();
     expect(list.find((s) => s.name === "team-a")).toBeTruthy();
-    expect(list.find((s) => s.name === "lark-doc")).toBeTruthy();
+    expect(list.find((s) => s.name === "lark-doc")).toBeUndefined();
     expect(list.find((s) => s.name === "my-app")).toBeUndefined();
   });
 
@@ -531,7 +531,7 @@ describe("chip 过滤纯函数", () => {
       "e",
       "f",
     ]);
-    expect(skillsForNav(data, "app").map((s) => s.name)).toEqual(["g"]);
+    expect(skillsForNav(data, "manageable").map((s) => s.name)).toEqual(["g"]);
   });
 
   it("categoryChipsFor：全部 + 有内容的分类；shared 按 common/fe/... 优先、未知殿后", () => {
@@ -547,7 +547,7 @@ describe("chip 过滤纯函数", () => {
       { value: "global", label: "global", count: 1 },
     ]);
     // 非 shared/knowledge 来源无 chip 行
-    expect(categoryChipsFor(data, "app")).toEqual([]);
+    expect(categoryChipsFor(data, "builtin")).toEqual([]);
     // 空来源无 chip（连「全部」都不出）
     expect(categoryChipsFor([], "shared")).toEqual([]);
   });
@@ -564,8 +564,8 @@ describe("chip 过滤纯函数", () => {
       applyCategoryChip(data, "knowledge", "global").map((s) => s.name),
     ).toEqual(["e"]);
     // 非 shared/knowledge 导航忽略 chip
-    expect(applyCategoryChip(data, "app", "fe").map((s) => s.name)).toEqual([
-      "g",
+    expect(applyCategoryChip(data, "builtin", "fe").map((s) => s.name)).toEqual([
+      "h",
     ]);
   });
 });

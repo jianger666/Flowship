@@ -92,8 +92,8 @@ export const SkillsCard = () => {
 
   // 搜索关键词
   const [query, setQuery] = useState("");
-  // 左栏选中来源
-  const [selected, setSelected] = useState<SourceNavKey>("app");
+  // 左栏选中来源（默认可管理分组）
+  const [selected, setSelected] = useState<SourceNavKey>("manageable");
   // 右侧分类 chip（"all" 或分类名；切来源 / 分类被清空时重置）
   const [activeChip, setActiveChip] = useState("all");
 
@@ -107,8 +107,18 @@ export const SkillsCard = () => {
 
   const refresh = useCallback(async () => {
     try {
+      // 项目级标准目录（<repo>/.agents/skills）按已登记仓扫：settings 在 localStorage、
+      // 这里直接读缓存快照，避免 refresh 依赖 settings 加载时序
+      const repoPaths = (getSettings().repos ?? [])
+        .map((r) => String(r.path ?? "").trim())
+        .filter(Boolean);
       const [skillsRes, actionsRes] = await Promise.all([
-        fetch("/api/skills", { cache: "no-store" }),
+        fetch(
+          repoPaths.length > 0
+            ? `/api/skills?repos=${encodeURIComponent(JSON.stringify(repoPaths))}`
+            : "/api/skills",
+          { cache: "no-store" },
+        ),
         fetchCustomActions().catch(() => [] as Awaited<
           ReturnType<typeof fetchCustomActions>
         >),
@@ -219,23 +229,35 @@ export const SkillsCard = () => {
     setDialog({ kind: "view", name, content });
   };
 
-  const handleDelete = async (name: string) => {
+  const handleDelete = async (row: SkillRow) => {
+    const name = row.name;
+    const isApp = row.source === "app";
     let mounted: Array<{ id: string; label: string }> = [];
-    try {
-      const defs = await fetchCustomActions();
-      // 只联动自建 action；team 派生同名不算挂载本自管 skill
-      mounted = defs
-        .filter((d) => d.skill === name && d.origin === "app-skill")
-        .map((d) => ({ id: d.id, label: d.label }));
-    } catch {
-      // ignore
+    if (isApp) {
+      // 挂载 action 联动仅自管源：其它源的派生 action 不因删目录而消失
+      try {
+        const defs = await fetchCustomActions();
+        mounted = defs
+          .filter((d) => d.skill === name && d.origin === "app-skill")
+          .map((d) => ({ id: d.id, label: d.label }));
+      } catch {
+        // ignore
+      }
     }
+    const sourceHint =
+      row.source === "feishu-cli"
+        ? "会从飞书 CLI 目录删除；CLI 升级 / 重装后可能回来"
+        : row.source === "global-std"
+          ? "会从 ~/.agents/skills 删除该 skill 目录"
+          : row.source === "project-std"
+            ? `会从 ${row.repoPath ?? "对应仓"}/.agents/skills 删除`
+            : "整个 skill 目录（含附属脚本）会被删除";
     const description =
       mounted.length > 0
         ? `有 ${mounted.length} 个 action 挂载此 skill、将一并删除：${mounted
             .map((a) => `「${a.label}」`)
             .join("、")}`
-        : "整个 skill 目录（含附属脚本）会被删除";
+        : sourceHint;
     const ok = await confirm({
       title: `删除 skill「${name}」？`,
       description,
@@ -253,7 +275,9 @@ export const SkillsCard = () => {
           );
         }
       }
-      const res = await fetch(`/api/skills?name=${encodeURIComponent(name)}`, {
+      const params = new URLSearchParams({ name, source: row.source });
+      if (row.repoPath) params.set("repo", row.repoPath);
+      const res = await fetch(`/api/skills?${params.toString()}`, {
         method: "DELETE",
       });
       if (!res.ok) {
@@ -272,10 +296,10 @@ export const SkillsCard = () => {
     }
   };
 
-  /** 自管源开关：settings.disabledSkills；挂自建 action 关闭前二次确认（推进面板会隐藏） */
-  const handleToggleApp = async (row: SkillRow, enabled: boolean) => {
+  /** 可管理源开关：统一 settings.disabledSkills（同名一关全关）；挂自建 action 关闭前二次确认 */
+  const handleToggleManageable = async (row: SkillRow, enabled: boolean) => {
     const name = row.name;
-    if (!enabled) {
+    if (!enabled && row.source === "app") {
       let mounted: Array<{ label: string }> = [];
       try {
         const defs = await fetchCustomActions();
@@ -303,12 +327,14 @@ export const SkillsCard = () => {
       }
     }
 
-    // 乐观更新（app 源 name 唯一、按 name+source 匹配即可）
+    // 乐观更新（按 name+source+repo 精确匹配行；同名多来源副本各自展示）
     const patchRow = (value: boolean) =>
       setSkills((prev) =>
         prev
           ? prev.map((s) =>
-              s.name === name && s.source === "app"
+              s.name === name &&
+              s.source === row.source &&
+              s.repoPath === row.repoPath
                 ? { ...s, enabled: value }
                 : s,
             )
@@ -602,14 +628,19 @@ export const SkillsCard = () => {
   const q = query.trim().toLowerCase();
   const searching = q.length > 0;
 
+  const manageableCount = useMemo(
+    () => skillsForNav(allSkills, "manageable").length,
+    [allSkills],
+  );
+  // 自管清单（导入 dialog 查重用）
   const appSkills = useMemo(
-    () => skillsForNav(allSkills, "app"),
+    () => allSkills.filter((s) => s.source === "app"),
     [allSkills],
   );
 
   const navNodes: NavNode[] = useMemo(
     () => [
-      { key: "app", label: "自管", count: appSkills.length },
+      { key: "manageable", label: "我的", count: manageableCount },
       {
         key: "shared",
         label: "共享",
@@ -625,13 +656,8 @@ export const SkillsCard = () => {
         label: "内置",
         count: skillsForNav(allSkills, "builtin").length,
       },
-      {
-        key: "feishu-cli",
-        label: "飞书 CLI",
-        count: skillsForNav(allSkills, "feishu-cli").length,
-      },
     ],
-    [allSkills, appSkills.length],
+    [allSkills, manageableCount],
   );
 
   const chips = useMemo(
@@ -671,7 +697,7 @@ export const SkillsCard = () => {
       <CardHeader>
         <CardTitle>Skills</CardTitle>
         <CardDescription>
-          agent 按场景自动取用的能力扩展；自管可编辑，其余只读
+          agent 按场景自动取用的能力扩展；本地源可开关 / 删除（同名一关全关），内置与团队只读
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -745,9 +771,9 @@ export const SkillsCard = () => {
               busyName={busyName}
               onEdit={(name) => void openEdit(name)}
               onView={(name, source) => void openView(name, source)}
-              onDelete={(name) => void handleDelete(name)}
-              onToggleApp={(row, enabled) =>
-                void handleToggleApp(row, enabled)
+              onDelete={(row) => void handleDelete(row)}
+              onToggleManageable={(row, enabled) =>
+                void handleToggleManageable(row, enabled)
               }
               onInstall={(row) => void handleInstall(row)}
               onUninstall={(row) => void handleUninstall(row)}

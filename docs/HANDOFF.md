@@ -370,6 +370,14 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v1.9.2（2026-08-26）停止后立即发送续接原会话 / 自定义提供方协议自动路由 / Skills 多源管理
+
+- **停止 / 立即发送续接原会话（P0）**：chat 停止或 run 收尾中立刻再发消息，原实现强清落盘 sessionAgentId 降级全新会话。现 `finalizeChatRunIfCurrent` cancelled 分支改 `{ keepPersisted: true }` 保锚点；发送侧 `sendChatMessage` 带 startToken 外部租约走 `resumeChatSession(runningTask, bootArgs, { claimRun: true, startToken })` 复用原会话：sent → 202 resumed；cancelled / owner_invalid → 终态不重放；busy / no_session / send_failed → 才强清锚点降级新会话（busy 实际只可能来自 rewind 门闩竞态，兜底去向一致）。停止等待超时 `CHAT_SEND_NOW_STOP_TIMEOUT_MS = 5000`。
+- **自定义提供方协议 auto 档**：「协议」默认 auto——按 models.dev 目录该模型条目 npm 字段推断 openai-completions / openai-responses / anthropic-messages 协议面（路由索引 build/lookup 双侧 URL 小写归一，防数据源大小写漂移漏命中）；目录拉不到回落手动档。base URL 推导收敛到 `custom-provider-url.ts: customSdkBaseUrlForFace` 单点（删死代码 customSdkBaseUrl），buildModel / buildRuntime 两处内联三元统一改调它。
+- **Skills 多源管理收口**：`SkillSource` 扩成 app / feishu-cli / global-std（`~/.agents/skills`）/ project-std（`<repo>/.agents/skills`）/ builtin / team；四个可管理源设置页可开关可删除（DELETE 按 source 路由）。「我的」按来源分组、同名多副本并列展示 + 同名一关全关（disabledSkills 按名字记）；运行时 loadSkills 按优先级去重（自管 > 平台 > 飞书 CLI > 全局 > 项目 > 团队），注入 agent 的索引永远单一副本。
+- **答题卡投递中态**：提交超时解锁后用户重试、命中服务端 409 `ask_in_flight` 时答题卡转只读「投递中」，SSE 终态事件收起 + 90s 兜底解锁；错误码经 task-store 透传供分支判定。
+- **滚动抖动根治 + 探针退役**：根因 Streamdown 代码块 `content-visibility:auto` 与 Virtuoso 条目测量互相打架 → 列表总高度每帧翻转 → scrollBy 死循环；globals.css 对 `[data-virtuoso-scroller]` 内代码块关 cv（非虚拟化视图保留省渲染收益）。取证用 scroll-probe（API route / debug 模块 / diagnostics 收录段 / instrumentation 清理钩子）全部删除。
+
 ### v1.9.1（2026-08-21）交卷收尾槽位 / 系统通知对齐话说完 / Windows 自更新
 
 - **停止后立刻重发 409**：stop 已把 action 标 cancelled、runStatus idle，但 `runningTasks` 要等 consume finally 才摘。输入条把「表里还有 runner」当成真干活，回「agent 正在跑」。现对 cancelled / error / idle 跟 awaiting_ack 一样先 `waitForTaskToStop` 再走唤醒。
@@ -379,13 +387,6 @@ ai-flow-action-hub/
 - **write 后空等**：交卷不进事件流，write 打勾之后下一轮模型还要几秒。工作过程组末尾挂独立「处理中…」，底部状态行同样改口；正文开始流再切回「正在回复…」。不暴露 `submit_work`。write 完成后自动收起（产物栏已有文件），避免处理中时路径展开区一直占着。
 - **系统通知对齐话说完**：交卷后置检查只把 action 标 `awaiting_ack`；收尾旁白还在跑时 `runStatus` 保持 `running`。consume 结束（或检查比旁白慢）才切 `awaiting_user`。mac/win 系统通知跟这个状态走，避免点回来还在「处理中」。
 - **Windows 自更新卸完装不上**：升级时 `taskkill` 去掉 `/T`（不把刚派生的安装器杀掉），仍杀 `Flowship.exe` 清隐形 server；装完强制重建桌面 / 开始菜单快捷方式；`quitAndInstall` 把 `/D=` 钉在当前安装目录。已经点升级后快捷方式「找不到应用」的同事：到 GitHub Release 下载本版 exe 手动装一次（数据在 `fe-ai-flow`，不会丢）。
-
-### v1.9.0（2026-08-21）自定义 HTTP 提供方：task / chat 都能推
-
-- **为什么**：设置页只能 Cursor / 一条自定义二选一，改默认会劫持所有窗口；老用户升级不能把已有 Cursor 任务悄悄改去跑 HTTP API。
-- **改了什么**：设置页是目录（Cursor SDK 固定第一项，自定义可新增多条）。`settings.provider` 只给**新建**拷到 `task.provider`。已有窗口用自己的提供方；task 创建后、chat 发出第一条后不能再切（PATCH 409）。旧 `{ provider: "custom", customProvider }` 读盘迁成 `cp_legacy`。**没有 `task.provider` 的老任务一律 Cursor**（即使设置页默认已是自定义）。chat / 推进 / 答题 / 标题都走 `agent-backend`：cursor 仍是 SDK + JSONL store，自定义走 pi。自定义允许空 Key。提供方+模型并排 picker；常用改成每提供方最多 2 个星标。`pg-exec.mjs` 查库（brief 有 PG 才注入）。飞书桥接「本机另一处已在收」改注意态，不当失败红叉。pi `shell` 超时按秒理解；SDK 自带 `rg` 注入 PATH；回合内工具失败不再当红框崩溃。
-- **故意不动**：不把 Cursor 会话转成 pi 会话；不按 URL 猜 OpenCode Go。
-- **升级**：未配自定义的老用户路径不变。已配旧单槽自定义的会看见 `cp_legacy`。Cursor 会话恢复口径与 v1.8.2 相同（JSONL store）。
 
 ## 关键文件索引
 
