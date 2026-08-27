@@ -123,6 +123,17 @@ const BARE_RUN_DROP_TEXT =
  * - 裸 status=error 无诊断（连接断 / 额度用完、SDK 层无法区分）→ 友好一句话、不加吓人前缀
  * - 其它（有诊断）→ 复用 buildSdkErrorMessage 的详情串、调用方自行加「失败 / 异常」前缀
  */
+/** Cursor 网关偶发的瞬时鉴权抖动：文案固定、重试一次通常就好（用户实测多次）。
+ *  这类错误 isRetryable=false 且 code=16，但属于可恢复的瞬时态、单独放行一次。
+ *  超过一次仍失败则视为真·鉴权失效，不再重试。 */
+const TRANSIENT_AUTH_RE =
+  /Authentication error.*try logging out and back in/i;
+
+export const isTransientAuthError = (rawMessage: string, err: unknown): boolean => {
+  const summary = summarizeRunFailure(rawMessage, err);
+  return TRANSIENT_AUTH_RE.test(summary.detail);
+};
+
 /**
  * run 失败是否值得自动重连（V0.13.x、用户拍板「网络波动断了要自动重连 5 次」）：
  * - 裸 status=error 无诊断（isConnectionDrop：长连接断 / 额度用完 SDK 层不可分——
@@ -130,12 +141,21 @@ const BARE_RUN_DROP_TEXT =
  * - SDK 自标 isRetryable
  * - 诊断串命中网络类关键字（fetch failed / ECONNRESET / timeout / unavailable…）
  * 认证错（unauthenticated）/ 配置错 / 协议错不重试——重试也不会好。
+ * 例外：TRANSIENT_AUTH_RE 这条瞬时鉴权抖动在首次失败时放行一次（attempt===1）。
  */
-export const isRetryableRunError = (rawMessage: string, err: unknown): boolean => {
+export const isRetryableRunError = (
+  rawMessage: string,
+  err: unknown,
+  attempt?: number,
+): boolean => {
   const summary = summarizeRunFailure(rawMessage, err);
   if (summary.isConnectionDrop) return true;
   const bits = extractSdkErrorBits(err);
   if (bits.isRetryable === true) return true;
+  // 瞬时鉴权抖动：首次失败放行一次，超过一次不再重试（真·过期则直接报错）
+  if (TRANSIENT_AUTH_RE.test(summary.detail)) {
+    return (attempt ?? 1) <= 1;
+  }
   // 认证 / 权限类显式排除（code 16 = unauthenticated、7 = permission denied）
   if (bits.code === 16 || bits.code === 7) return false;
   if (/unauthenticated|permission denied|invalid.*key/i.test(summary.detail)) {

@@ -3448,7 +3448,7 @@ const tryAutoReconnect = async (
   const attempt = (opts.reconnectAttempt ?? 0) + 1;
   if (attempt > RECONNECT_MAX) return "give-up";
   const msg = err instanceof Error ? err.message : String(err);
-  if (!isRetryableRunError(msg, err)) return "give-up";
+  if (!isRetryableRunError(msg, err, attempt)) return "give-up";
   if (isCancelled()) return "cancelled";
   // 只认首轮入场的自己会话号——close 必须带号，绝不 undefined 关「当前」
   const myReconnectSessionId =

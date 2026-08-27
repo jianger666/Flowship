@@ -1508,7 +1508,7 @@ const tryChatAutoReconnect = async (
 ): Promise<boolean> => {
   if (attempt > RECONNECT_MAX) return false;
   const msg = err instanceof Error ? err.message : String(err);
-  if (!isRetryableRunError(msg, err)) return false;
+  if (!isRetryableRunError(msg, err, attempt)) return false;
   if (isCancelled()) return false;
   const fresh = await getTask(task.id);
   if (!fresh || fresh.repoStatus === "merged" || fresh.repoStatus === "abandoned") {
