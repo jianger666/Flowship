@@ -13,6 +13,7 @@ import { zhCN } from "react-day-picker/locale";
 import { CalendarRange } from "lucide-react";
 import "react-day-picker/style.css";
 
+import { DAY_PICKER_THEME } from "@/components/ui/day-picker-theme";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -101,31 +102,7 @@ export const DateRangePicker = ({ value, onChange, className }: Props) => {
             // ⚠️ 主题变量必须打在 DayPicker 自己的 root 上（style prop → 内联优先级最高）：
             // 它的 .rdp-root 类自带同名变量默认值、写在外层 div 的继承会被覆盖——
             // 之前写外层导致选中区间渲染成大白块（用户截图两连踩）
-            style={
-              {
-                "--rdp-accent-color": "var(--primary)",
-                "--rdp-accent-background-color":
-                  "color-mix(in oklab, var(--primary) 16%, transparent)",
-                "--rdp-range_middle-background-color":
-                  "color-mix(in oklab, var(--primary) 16%, transparent)",
-                "--rdp-range_middle-color": "var(--foreground)",
-                "--rdp-range_start-background":
-                  "color-mix(in oklab, var(--primary) 16%, transparent)",
-                "--rdp-range_end-background":
-                  "color-mix(in oklab, var(--primary) 16%, transparent)",
-                "--rdp-range_start-color": "var(--primary-foreground)",
-                "--rdp-range_end-color": "var(--primary-foreground)",
-                "--rdp-range_start-date-background-color": "var(--primary)",
-                "--rdp-range_end-date-background-color": "var(--primary)",
-                "--rdp-selected-border": "1px solid var(--primary)",
-                "--rdp-today-color": "var(--primary)",
-                "--rdp-day-height": "30px",
-                "--rdp-day-width": "30px",
-                "--rdp-day_button-height": "28px",
-                "--rdp-day_button-width": "28px",
-                fontSize: "12px",
-              } as React.CSSProperties
-            }
+            style={DAY_PICKER_THEME}
             selected={
               draft ?? { from: new Date(value.from), to: new Date(value.to) }
             }

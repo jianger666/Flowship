@@ -5,7 +5,7 @@
  * - 节流：250ms 或攒 600 字符先到先 flush
  * - 同卡单调递增 sequence；PUT 全量文本且绝不回改已推前缀（坑 #2）
  * - 接近 10 万字符截断（坑 #13）；lark 失败 console.warn 不抛（坑 #10）
- * - streaming:false（设置「流式回复」关）：start 只定稿引用、中间态零 API，
+ * - streaming:false（单测 / 内部关打字机）：start 只定稿引用、中间态零 API，
  *   finalize 复用 buildStreamingCardJson 一次性发普通卡（streaming_mode 关）
  */
 

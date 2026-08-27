@@ -144,7 +144,6 @@ const FIELD_EQ_KIND = {
   feishuChatBridge: "boolFalse",
   isolateWorktreeDefault: "boolTrue",
   feishuBridgeKeepAwake: "boolTrue",
-  feishuBridgeStreaming: "boolTrue",
   teamKnowledgeEnabled: "boolTrue",
   repos: "repos",
   disabledMcpServers: "stringSet",
@@ -317,11 +316,6 @@ export const useSettings = (): UseSettingsResult => {
       ),
       feishuBridgeKeepAwake: !isFieldEqual(
         "feishuBridgeKeepAwake",
-        settings,
-        savedSettings,
-      ),
-      feishuBridgeStreaming: !isFieldEqual(
-        "feishuBridgeStreaming",
         settings,
         savedSettings,
       ),

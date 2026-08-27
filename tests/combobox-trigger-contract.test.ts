@@ -30,7 +30,7 @@ describe("Picker Popover 触发器", () => {
   });
 
   it("trigger 和弹层包在同一层 div 里，避免 FocusGuard 被 space-y 当成额外子元素", () => {
-    const rootStart = pickerSource.indexOf("<Popover open=");
+    const rootStart = pickerSource.search(/<Popover[\s\n]/);
     const rootEnd = pickerSource.indexOf("</Popover>", rootStart);
     const root = pickerSource.slice(rootStart, rootEnd);
     expect(root).toContain("relative w-full min-w-0");

@@ -26,6 +26,7 @@ import {
 } from "react";
 import { Check, ChevronDown, CornerDownLeft, Search, X } from "lucide-react";
 
+import { useFormDisabled } from "@/components/ui/form-context";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
   Popover,
@@ -56,6 +57,8 @@ type PickerSharedProps = {
   clearable?: boolean;
   placeholder?: string;
   disabled?: boolean;
+  /** 提交校验失败：trigger 走 aria-invalid 红框 */
+  invalid?: boolean;
   loading?: boolean;
   emptyHint?: ReactNode;
   /** 单选默认 true，多选默认 false */
@@ -118,7 +121,7 @@ const defaultFilterOption = (option: PickerOption, query: string): boolean => {
 
 // px-3 左右对称：文字距左边框 = 箭头距右边框。勾/箭头是内容不是间距。
 const TRIGGER_CLASS =
-  "flex h-9 w-full items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50";
+  "flex h-9 w-full items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:bg-input/30 dark:hover:bg-input/50 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40";
 
 /** 选项行：列表 p-1（4px 框）+ 这里 px-2 → 文字距弹层边 12px，跟 trigger px-3 对齐。
  *  items-center：两行（名称 + id）时星/勾跟整块文字垂直居中，不要顶对齐第一行。 */
@@ -131,8 +134,9 @@ export const Picker: PickerComponent = (props) => {
     searchable = false,
     allowCustom = false,
     clearable = false,
-    placeholder = "选择…",
-    disabled = false,
+    placeholder = "请选择",
+    disabled: disabledProp = false,
+    invalid = false,
     loading = false,
     emptyHint = "无候选",
     renderOption,
@@ -150,6 +154,8 @@ export const Picker: PickerComponent = (props) => {
     align = "start",
     open: openControlled,
   } = props;
+  const formDisabled = useFormDisabled();
+  const disabled = disabledProp || formDisabled;
 
   const multiple = props.multiple === true;
   const closeOnSelect = props.closeOnSelect ?? !multiple;
@@ -283,7 +289,13 @@ export const Picker: PickerComponent = (props) => {
       : emptyHint;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={disabled ? false : open}
+      onOpenChange={(next) => {
+        if (disabled) return;
+        setOpen(next);
+      }}
+    >
       {/* 包一层：Portal 打开时会在 trigger 旁插入 FocusGuard。SettingRow 的 space-y
           会把这些兄弟当成额外子元素、给后面的行加 margin（设置页点开下拉会往下挤）。 */}
       <div className={cn("relative w-full min-w-0", wrapperClassName)}>
@@ -294,6 +306,7 @@ export const Picker: PickerComponent = (props) => {
             <button
               type="button"
               disabled={disabled}
+              aria-invalid={invalid || undefined}
               title={title}
               className={cn(TRIGGER_CLASS, className)}
             >

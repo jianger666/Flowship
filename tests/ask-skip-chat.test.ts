@@ -79,6 +79,7 @@ vi.mock("@/lib/server/chat-runner", () => ({
   forceClearChatRun: vi.fn(),
   getChatRunDisabledMcp: vi.fn(() => null),
   getChatRunModel,
+  getChatRunProvider: vi.fn(() => null),
   getChatRunRepoPaths: vi.fn(() => null),
   hasChatSession,
   isChatQueueDraining: vi.fn(() => false),

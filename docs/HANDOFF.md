@@ -370,6 +370,17 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v1.9.4（2026-08-27）WK 激活 / Windows 更新对齐 mac / 本版更新弹窗 / 空对话复用
+
+- **启动「激活项目」**：需求任务 + Hub 已配 + 未填 REQ-ID 时可勾选，填语义编码 / 需求方 / 技术 Owner / 上线日，服务端查重再 `activate`，编号回写任务。Token 不进客户端。
+- **Windows 自更新**：点右上角确认一次后下载完直接 `quitAndInstall`，去掉第二次系统框；`autoInstallOnAppQuit=false`，关应用不再静默卸装。
+- **本版更新**：升完版第一次打开弹 3～5 条人话（`src/lib/whats-new.ts`）；设置页版本号旁可再打开。首次安装只记账不弹。
+- **空对话草稿复用**：chat 没发过消息时，再点新建 / Cmd+N / 切仓再开都回到那条空草稿，不堆空窗口。
+- **对话模型 trigger 常显思考档**：长模型名截断不再吃掉 effort；Default 没写进 params 时也标出来。
+- **偏好收口**：菜单栏图标 / 开机自启动 / 插电防休眠进设置→偏好；删掉假的「Agent shell 提速」；Windows 仍可切 Git Bash。
+- **task 提示词去重**：交卷协议只留 `_super.md`「核心机制」+ 关键规则一句指针；各 action playbook 收尾改成「按 super 交卷」。
+- **启动表单 Form/Field**：disabled / invalid 下钻，缺项红字写在标题右侧。
+
 ### v1.9.2（2026-08-26）停止后立即发送续接原会话 / 自定义提供方协议自动路由 / Skills 多源管理
 
 - **停止 / 立即发送续接原会话（P0）**：chat 停止或 run 收尾中立刻再发消息，原实现强清落盘 sessionAgentId 降级全新会话。现 `finalizeChatRunIfCurrent` cancelled 分支改 `{ keepPersisted: true }` 保锚点；发送侧 `sendChatMessage` 带 startToken 外部租约走 `resumeChatSession(runningTask, bootArgs, { claimRun: true, startToken })` 复用原会话：sent → 202 resumed；cancelled / owner_invalid → 终态不重放；busy / no_session / send_failed → 才强清锚点降级新会话（busy 实际只可能来自 rewind 门闩竞态，兜底去向一致）。停止等待超时 `CHAT_SEND_NOW_STOP_TIMEOUT_MS = 5000`。
@@ -377,16 +388,6 @@ ai-flow-action-hub/
 - **Skills 多源管理收口**：`SkillSource` 扩成 app / feishu-cli / global-std（`~/.agents/skills`）/ project-std（`<repo>/.agents/skills`）/ builtin / team；四个可管理源设置页可开关可删除（DELETE 按 source 路由）。「我的」按来源分组、同名多副本并列展示 + 同名一关全关（disabledSkills 按名字记）；运行时 loadSkills 按优先级去重（自管 > 平台 > 飞书 CLI > 全局 > 项目 > 团队），注入 agent 的索引永远单一副本。
 - **答题卡投递中态**：提交超时解锁后用户重试、命中服务端 409 `ask_in_flight` 时答题卡转只读「投递中」，SSE 终态事件收起 + 90s 兜底解锁；错误码经 task-store 透传供分支判定。
 - **滚动抖动根治 + 探针退役**：根因 Streamdown 代码块 `content-visibility:auto` 与 Virtuoso 条目测量互相打架 → 列表总高度每帧翻转 → scrollBy 死循环；globals.css 对 `[data-virtuoso-scroller]` 内代码块关 cv（非虚拟化视图保留省渲染收益）。取证用 scroll-probe（API route / debug 模块 / diagnostics 收录段 / instrumentation 清理钩子）全部删除。
-
-### v1.9.1（2026-08-21）交卷收尾槽位 / 系统通知对齐话说完 / Windows 自更新
-
-- **停止后立刻重发 409**：stop 已把 action 标 cancelled、runStatus idle，但 `runningTasks` 要等 consume finally 才摘。输入条把「表里还有 runner」当成真干活，回「agent 正在跑」。现对 cancelled / error / idle 跟 awaiting_ack 一样先 `waitForTaskToStop` 再走唤醒。
-- **交卷收尾槽位**：写完产物先调 `submit_work`；工具循环下一轮本来就会打模型，回执把它收成 1-3 句业务结论再结束。不 abort、不做同轮正文检测。`ask_user` 仍静音豁免。
-- **事件流本地图带空格**：`![二维码](/Users/…/Application Support/…/qr.png)` 会被 CommonMark 在空格截断、显示成原文。渲染前把这类 destination 包进 `<>`，再走 `/api/local-image`。
-- **中途 503 误触发自动重连**：pi 把 `Endpoint is unavailable` 写进 assistant 后内部重试成功，结论已经上屏，但 settle 从后往前扫整段会话仍命中那条 503 → wait() error →「连接中断、正在自动重连」。现只认最后一条 assistant；后续 stop/toolUse 清掉粘性错误。真重试耗尽仍走重连。
-- **write 后空等**：交卷不进事件流，write 打勾之后下一轮模型还要几秒。工作过程组末尾挂独立「处理中…」，底部状态行同样改口；正文开始流再切回「正在回复…」。不暴露 `submit_work`。write 完成后自动收起（产物栏已有文件），避免处理中时路径展开区一直占着。
-- **系统通知对齐话说完**：交卷后置检查只把 action 标 `awaiting_ack`；收尾旁白还在跑时 `runStatus` 保持 `running`。consume 结束（或检查比旁白慢）才切 `awaiting_user`。mac/win 系统通知跟这个状态走，避免点回来还在「处理中」。
-- **Windows 自更新卸完装不上**：升级时 `taskkill` 去掉 `/T`（不把刚派生的安装器杀掉），仍杀 `Flowship.exe` 清隐形 server；装完强制重建桌面 / 开始菜单快捷方式；`quitAndInstall` 把 `/D=` 钉在当前安装目录。已经点升级后快捷方式「找不到应用」的同事：到 GitHub Release 下载本版 exe 手动装一次（数据在 `fe-ai-flow`，不会丢）。
 
 ## 关键文件索引
 

@@ -4,7 +4,7 @@
  * 职责（保持薄壳、业务全在 Next server 里）：
  * 1. 起内置 Next standalone server（spawn 自带 node 运行时、ELECTRON_RUN_AS_NODE）
  * 2. 等 server 就绪后开 BrowserWindow 指向 http://127.0.0.1:8876
- * 3. 关窗不退出（Tray 常驻 hide）；真退出走 Tray 菜单 / Cmd+Q → 杀 server
+ * 3. 关窗不退出（hide）；有菜单栏/托盘图标时可点回来，真退出走 Tray 菜单 / Cmd+Q → 杀 server
  * 4. win 自动更新（electron-updater + GitHub Releases 的 latest.yml）
  * 5. 自定义协议深链 flowship://（test 实例 flowship-test://）路由到任务页
  *
@@ -36,6 +36,7 @@ import {
   readdirSync,
   existsSync,
   readFileSync,
+  writeFileSync,
 } from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -721,6 +722,39 @@ const createTray = () => {
   log(`[tray] 已创建（${label}）`);
 };
 
+const destroyTray = () => {
+  if (!appTray) return;
+  appTray.destroy();
+  appTray = null;
+  log("[tray] 已销毁");
+};
+
+/** mac 菜单栏闪电：缺文件当显示。Windows 不读、永远建托盘。 */
+const menuBarIconFile = () =>
+  path.join(app.getPath("userData"), "menu-bar-icon.json");
+
+const readMenuBarIconVisible = () => {
+  try {
+    const raw = JSON.parse(readFileSync(menuBarIconFile(), "utf8"));
+    return raw?.visible !== false;
+  } catch {
+    return true;
+  }
+};
+
+const writeMenuBarIconVisible = (visible) => {
+  writeFileSync(
+    menuBarIconFile(),
+    `${JSON.stringify({ visible: visible === true })}\n`,
+    "utf8",
+  );
+};
+
+const applyMenuBarIconVisible = (visible) => {
+  if (visible) createTray();
+  else destroyTray();
+};
+
 // 开机自启读写（设置页 UI 另代理；API 名 auto-launch-get / set 一字不差）
 ipcMain.handle("auto-launch-get", () => {
   try {
@@ -736,6 +770,24 @@ ipcMain.handle("auto-launch-set", (_e, enabled) => {
     log(`[auto-launch] set openAtLogin=${enabled === true}`);
   } catch (err) {
     log(`[auto-launch] set 失败 ${err?.message || err}`);
+    throw err;
+  }
+});
+
+// mac 菜单栏图标显隐（设置页仅 darwin 展示；Windows 不注册也没用，主进程直接忽略）
+ipcMain.handle("menu-bar-icon-get", () => {
+  if (!IS_MAC) return null;
+  return readMenuBarIconVisible();
+});
+ipcMain.handle("menu-bar-icon-set", (_e, visible) => {
+  if (!IS_MAC) return;
+  const next = visible === true;
+  try {
+    writeMenuBarIconVisible(next);
+    applyMenuBarIconVisible(next);
+    log(`[tray] 菜单栏图标 visible=${next}`);
+  } catch (err) {
+    log(`[tray] 写显隐失败 ${err?.message || err}`);
     throw err;
   }
 });
@@ -1571,7 +1623,8 @@ const macSelfUpdate = async (version) => {
 
 // 应用更新（页面点右上角「新版本」徽标走到这；发现新版本身不弹窗，2026-07-15 用户拍板）：
 // mac：确保已暂存 → apply + relaunch（轮询已后台暂存的包在此套用；未暂存则先下）
-// win：此刻才开始下载（autoDownload=false）、下载完弹「立即重启」→ quitAndInstall（用户主动点徽标触发，保留）
+// win：此刻才开始下载（autoDownload=false）、下完直接 quitAndInstall（用户已在页面确认过，
+//      不再弹第二次系统框；退出时也不再静默装——Windows NSIS 卸装路径翻车过多次）
 // 安装互斥锁：徽标连点 / will-navigate 重入时第二次直接忽略——
 // 第一次点击已把暂存包 rename 消费掉、重入 apply 必吃「没有有效的暂存更新」
 // 并误弹「自动更新失败」（2026-07-23 用户线上确诊）。UI disabled 是第一道防线、这里兜底。
@@ -1586,11 +1639,12 @@ const installUpdateNow = async () => {
       return;
     }
     // win：按状态分流——下载中 / 安装中忽略（installing 不短路会落到重新 downloadUpdate、
-    // 二轮复审 P1）；已下载完（用户之前点过「稍后」）直接再弹重启确认、不重复下载；
+    // 二轮复审 P1）；已下载完（上次 quitAndInstall 失败回 ready）直接装，不重复下载；
     // 其余此刻才开始下载（autoDownload=false）
     if (updateState.phase === "downloading" || updateState.phase === "installing") return;
     if (updateState.phase === "ready") {
-      await promptWinInstall(updateReadyVersion);
+      log(`[updater] win 已下载、直接安装重启 v${updateReadyVersion}`);
+      installWinUpdate(updateReadyVersion);
       return;
     }
     try {
@@ -1598,8 +1652,12 @@ const installUpdateNow = async () => {
       const updater = await ensureWinAutoUpdater();
       setUpdateState({ phase: "downloading", version: updateReadyVersion, percent: 0, error: null });
       await updater.downloadUpdate();
-      // 下载完成走 update-downloaded 事件（置 ready + 弹「立即重启」）、这里不用管
+      // 下完直接装：用户点徽标时已经确认过，对齐 mac「确认一次就干」
+      if (updateState.phase === "installing" || quitting) return;
+      installWinUpdate(updateReadyVersion);
     } catch (err) {
+      // quitAndInstall 过程中 downloadUpdate 可能被中断，别误报下载失败
+      if (quitting || updateState.phase === "installing") return;
       mainWindow?.setProgressBar(-1);
       log(`[updater] win 下载失败 ${err?.message || err}`);
       setUpdateState({
@@ -1644,37 +1702,21 @@ let winAutoUpdater = null;
 
 // win electron-updater 懒加载初始化（只做一次）：
 // - autoDownload=false 是本方案核心——检查更新只查版本号、不自动下载、把下载推迟到用户点按钮后（对齐 mac）
-// - 注册下载进度（任务栏进度条）/ 下载完成（弹「立即重启」装）/ 出错事件、只注册一次防监听器泄漏
-// win「立即重启 / 稍后」确认框（update-downloaded 首次弹 + 点「稍后」后再点徽标重弹）。
+// - autoInstallOnAppQuit=false：点了页面「取消」或关应用，不要在退出时静默走 NSIS 卸装
+//   （Windows 同事「关了就打不开 / 快捷方式找不到应用」多次翻车）
+// - 注册下载进度（任务栏进度条）/ 下载完成（置 ready）/ 出错事件、只注册一次防监听器泄漏
 // 确认后 quitAndInstall(true, true)：isSilent=true 走 NSIS /S 静默装（oneClick:false
-// 时不传会弹完整安装向导、与「点了立即重启」预期不符）、isForceRunAfter=true 装完自动拉起。
+// 时不传会弹完整安装向导、与「点了立即更新」预期不符）、isForceRunAfter=true 装完自动拉起。
 // server 清理不在这做：quitAndInstall 内部走 app.quit() → before-quit 已同步 taskkill /T
 // 连树杀（蓝军 P0：若在这提前杀、quitAndInstall 失败不退出时 app 就成了没后端的僵尸）。
-// 弹窗自身加单飞：downloadUpdate resolve 后 installInFlight 已释放、弹窗还开着时
-// 再点徽标（phase=ready 分支）会二次进来叠双弹窗。
-let promptWinInstallInFlight = false;
-const promptWinInstall = async (version) => {
-  if (promptWinInstallInFlight) return;
-  promptWinInstallInFlight = true;
-  try {
-    const { response } = await dialog.showMessageBox(mainWindow, {
-      type: "info",
-      title: "更新完成",
-      message: `已下载 v${version}`,
-      detail: "重启应用后生效。",
-      buttons: ["立即重启", "稍后"],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (response !== 0) return; // 「稍后」：phase 保持 ready、退出时 autoInstallOnAppQuit 兜底
-    quitting = true;
-    setUpdateState({ phase: "installing", version, error: null });
-    // /D= 已在 ensureWinAutoUpdater 钉成当前安装目录；这里再写一次防中途被改。
-    winAutoUpdater.installDirectory = path.dirname(process.execPath);
-    winAutoUpdater.quitAndInstall(true, true);
-  } finally {
-    promptWinInstallInFlight = false;
-  }
+const installWinUpdate = (version) => {
+  if (!winAutoUpdater) return;
+  if (updateState.phase === "installing") return;
+  quitting = true;
+  setUpdateState({ phase: "installing", version, error: null });
+  // /D= 钉成当前安装目录，避免卸在 A、装到 B 导致快捷方式悬空
+  winAutoUpdater.installDirectory = path.dirname(process.execPath);
+  winAutoUpdater.quitAndInstall(true, true);
 };
 
 const ensureWinAutoUpdater = async () => {
@@ -1683,6 +1725,7 @@ const ensureWinAutoUpdater = async () => {
   const { default: updater } = await import("electron-updater");
   winAutoUpdater = updater.autoUpdater;
   winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
+  winAutoUpdater.autoInstallOnAppQuit = false; // 退出不偷偷装，只在用户点徽标确认后装
   // 静默升级把 /D= 钉在当前 exe 目录，避免卸旧路径、装到默认路径导致快捷方式悬空
   winAutoUpdater.installDirectory = path.dirname(process.execPath);
   // 下载进度 → 任务栏进度条 + 页面徽标进度（对齐 mac 的 Dock + 页面双通道）
@@ -1691,13 +1734,12 @@ const ensureWinAutoUpdater = async () => {
     mainWindow?.setProgressBar(p.percent / 100);
     setUpdateState({ phase: "downloading", percent: Math.floor(p.percent) });
   });
-  // 下载完成（autoDownload=false 下只会被用户点按钮后的 downloadUpdate 触发）→ 弹「立即重启」装
-  winAutoUpdater.on("update-downloaded", async (info) => {
+  // 下载完成（autoDownload=false 下只会被用户点按钮后的 downloadUpdate 触发）
+  winAutoUpdater.on("update-downloaded", (info) => {
     mainWindow?.setProgressBar(-1);
     const v = info?.version || updateReadyVersion;
     log(`[updater] 新版本 v${v} 已下载完成`);
     setUpdateState({ phase: "ready", version: v, percent: 100, error: null });
-    await promptWinInstall(v);
   });
   winAutoUpdater.on("error", (err) => {
     mainWindow?.setProgressBar(-1);
@@ -1942,7 +1984,9 @@ if (!app.requestSingleInstanceLock()) {
     // splash 先亮（boot 期间唯一可见窗口、跟主窗同尺寸同位置）、主窗 hidden 待页面就绪
     createSplashWindow(nativeTheme.shouldUseDarkColors, await loadWindowState());
     await createWindow();
-    createTray();
+    if (!IS_MAC || readMenuBarIconVisible()) {
+      createTray();
+    }
     startServer();
     void setupAutoUpdate();
 

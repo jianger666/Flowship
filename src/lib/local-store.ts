@@ -72,10 +72,9 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   starredModels: {},
   // 默认悟空产研空间——看板 / 收件箱唯一作用域（历史用户零迁移）
   meegleProject: { ...DEFAULT_MEEGLE_PROJECT },
-  // 飞书消息桥接：默认关（决策 #3）；插电防休眠默认开（决策 #14）；流式回复默认开
+  // 飞书消息桥接：默认关（决策 #3）；插电防休眠默认开（决策 #14）
   feishuChatBridge: false,
   feishuBridgeKeepAwake: true,
-  feishuBridgeStreaming: true,
   // 团队规范总开关：默认开（日常注入 knowledge）；显式 false 才关
   teamKnowledgeEnabled: true,
   // 公司环境：默认空（设置页「环境配置」填写；运行时同步 company-env.json）
@@ -276,8 +275,6 @@ export const normalizeSettings = (
     feishuChatBridge: parsed.feishuChatBridge === true,
     // 插电防休眠：缺省 / 非 false → true（决策 #14）
     feishuBridgeKeepAwake: parsed.feishuBridgeKeepAwake !== false,
-    // 流式回复：缺省 / 非 false → true
-    feishuBridgeStreaming: parsed.feishuBridgeStreaming !== false,
     // 团队规范总开关：缺省 / 非 false → true（显式 false 才关）
     teamKnowledgeEnabled: parsed.teamKnowledgeEnabled !== false,
     // 公司环境：缺 / 坏 → 空配置（不挡启动）

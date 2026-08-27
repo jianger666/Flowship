@@ -20,7 +20,6 @@ import {
   getTaskWorkspaceDir,
 } from "./task-fs-core";
 import { renderContextDocsSection } from "./context-docs-prompt";
-import { turnDisciplineSection } from "./turn-discipline";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { formatRepoSectionForPrompt } from "@/lib/path-utils";
 import { resolveReqId } from "@/lib/req-id";
@@ -339,8 +338,6 @@ export const buildSuperPrompt = async (
     actionHistorySection,
     firstActionDirective,
     currentActionPlaybook,
-    // V0.7.20：等待纪律共用片段（chat / task 单一源、见 wait-protocol-prompt.ts）
-    waitDiscipline: turnDisciplineSection(),
     // 仅 win32 非空；mac 注入空串、占位保留字面（同 gitlabAccessSection）
     windowsToolDiscipline: buildWindowsToolDisciplineDirective(),
   });

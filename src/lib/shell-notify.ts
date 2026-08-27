@@ -41,6 +41,13 @@ declare global {
       get: () => Promise<boolean>;
       set: (enabled: boolean) => Promise<void>;
     };
+    /**
+     * mac 菜单栏图标显隐。仅桌面端 + darwin 有通道；get 在非 Mac 返 null。
+     */
+    __menuBarIcon?: {
+      get: () => Promise<boolean | null>;
+      set: (visible: boolean) => Promise<void>;
+    };
   }
 }
 

@@ -68,6 +68,44 @@ export const isDefaultThinkingValue = (value: string): boolean =>
 export const thinkingChipLabel = (value: string): string =>
   isDefaultThinkingValue(value) ? "Default" : value.trim();
 
+const isIconToken = (s?: string) => !s || /:icon-/.test(s);
+
+/**
+ * 模型 trigger 上常显的思考档。Default 发请求时会被剥掉，params 里经常没有；
+ * 缺省也要标出来，不能跟长模型名挤进同一段 truncate。
+ */
+export const resolveThinkingTriggerLabel = (
+  model:
+    | Pick<ModelOption, "parameters" | "variants">
+    | undefined,
+  params: Array<{ id: string; value: string }> | undefined,
+  cursorNative: boolean,
+): string | null => {
+  const thinking = model?.parameters?.find((p) => isThinkingParamId(p.id));
+  if (!thinking || thinking.values.length === 0) return null;
+
+  const raw = params?.find((p) => isThinkingParamId(p.id))?.value;
+  if (!cursorNative) {
+    if (raw == null || isDefaultThinkingValue(raw)) {
+      return thinkingChipLabel(DEFAULT_THINKING_VALUE);
+    }
+    return thinkingChipLabel(raw);
+  }
+
+  let value = raw;
+  if (value == null || isDefaultThinkingValue(value)) {
+    const defVariant =
+      model?.variants?.find((v) => v.isDefault) ?? model?.variants?.[0];
+    value =
+      defVariant?.params.find((p) => isThinkingParamId(p.id))?.value ??
+      thinking.values[0]?.value;
+  }
+  if (value == null) return null;
+  const vv = thinking.values.find((x) => x.value === value);
+  if (!vv || isIconToken(vv.displayName)) return thinkingChipLabel(value);
+  return vv.displayName ?? thinkingChipLabel(value);
+};
+
 export const hasBudgetTokens = (options: unknown): boolean =>
   Array.isArray(options) &&
   options.some(

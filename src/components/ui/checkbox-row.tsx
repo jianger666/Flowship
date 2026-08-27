@@ -19,6 +19,7 @@
 import type { KeyboardEvent, ReactNode } from "react";
 
 import { Checkbox } from "@/components/ui/checkbox";
+import { useFormDisabled } from "@/components/ui/form-context";
 import { cn } from "@/lib/utils";
 
 type Props = {
@@ -42,14 +43,15 @@ export const CheckboxRow = ({
   checkboxId,
   children,
 }: Props) => {
+  const locked = disabled || useFormDisabled();
   // 行点击 / 行键盘：直接切受控态（disabled 短路）
   const toggle = () => {
-    if (disabled) return;
+    if (locked) return;
     onCheckedChange(!checked);
   };
 
   const onRowKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (disabled) return;
+    if (locked) return;
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       toggle();
@@ -59,12 +61,12 @@ export const CheckboxRow = ({
   return (
     <div
       role="button"
-      tabIndex={disabled ? -1 : 0}
+      tabIndex={locked ? -1 : 0}
       aria-pressed={checked}
-      aria-disabled={disabled || undefined}
+      aria-disabled={locked || undefined}
       className={cn(
         "flex items-center gap-2",
-        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+        locked ? "cursor-not-allowed opacity-60" : "cursor-pointer",
         // 行焦点环（内部 Checkbox 已 tabIndex=-1）
         "rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
         className,
@@ -76,7 +78,7 @@ export const CheckboxRow = ({
         id={checkboxId}
         className={cn("pointer-events-none", checkboxClassName)}
         checked={checked}
-        disabled={disabled}
+        disabled={locked}
         tabIndex={-1}
         // CheckboxRow 是唯一状态入口；base-ui 内部 change 不再重复改受控态。
         onCheckedChange={() => {}}

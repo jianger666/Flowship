@@ -176,7 +176,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   }, [mode, sorted, pinnedOrder]);
 
   // 新建后即时插入列表 + 跳详情
-  const handleCreated = (task: Task) => {
+  const handleCreated = (task: Task | TaskSummary) => {
     upsertTask(task);
     router.push(`/tasks/${task.id}`);
   };
@@ -337,7 +337,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    className="size-5 shrink-0 text-muted-foreground hover:text-foreground"
+                    className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
                     disabled={creatingChat}
                     aria-label="在此目录新建对话"
                     onClick={(e) => {
@@ -345,7 +345,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                       void createChat({ repoPaths: createPaths });
                     }}
                   >
-                    <Plus className="size-3" />
+                    <Plus className="size-3.5" />
                   </Button>
                 </Tooltip>
               )}

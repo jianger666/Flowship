@@ -23,7 +23,7 @@ describe("测试任务创建与编辑交互", () => {
     expect(edit).toContain("storyUrlLockedHas && !testingTask");
     expect(launch).toContain('userRole !== "qa" &&');
     expect(edit).toContain("!testingTask &&");
-    expect(launch).toContain('<Label htmlFor="l-req-id">REQ-ID</Label>');
+    expect(launch).toContain('label="REQ-ID"');
     expect(edit).toContain('<Label htmlFor="edit-req-id">REQ-ID</Label>');
     expect(`${launch}\n${edit}`).not.toContain(">需求编号</Label>");
   });

@@ -10,8 +10,7 @@
  * 原 user-profile-card（IDE + 分支模板）已并入本文件；默认模型在设置页「模型」卡。
  */
 
-import { useEffect, useMemo, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -59,6 +58,9 @@ interface PreferenceSectionsProps {
   onAgentShellGitBashChange: (next: boolean) => void | Promise<unknown>;
   isolateWorktreeDefault: boolean;
   onIsolateWorktreeDefaultChange: (next: boolean) => void;
+  /** 插电防休眠（默认开；桥接开着时才真正 caffeinate） */
+  feishuBridgeKeepAwake: boolean;
+  onFeishuBridgeKeepAwakeChange: (next: boolean) => void;
 }
 
 export const PreferenceSections = ({
@@ -77,14 +79,12 @@ export const PreferenceSections = ({
   onAgentShellGitBashChange,
   isolateWorktreeDefault,
   onIsolateWorktreeDefaultChange,
+  feishuBridgeKeepAwake,
+  onFeishuBridgeKeepAwakeChange,
 }: PreferenceSectionsProps) => {
   // 本机探测到的可用 IDE 集合（后端扫安装位置 + PATH）；null = 还没回来（全部可选）
   const [availableIdes, setAvailableIdes] = useState<Set<JumpIde> | null>(null);
-  // Agent shell 提速：各目标配置的探测结果；null = 还在请求 / 失败
-  const [shellBoostFiles, setShellBoostFiles] = useState<
-    Array<{ path: string; exists: boolean; boosted: boolean }> | null
-  >(null);
-  // SDK 实际选用的壳类型（GET 一并返回）；null = 尚未拿到
+  // SDK 实际选用的壳类型（拨 Git Bash 开关后刷新）；null = 尚未拿到
   const [agentShellKind, setAgentShellKind] = useState<string | null>(null);
   // 服务端 platform（仅 win32 显示「用 Git Bash」行）；null = 尚未拿到
   const [shellPlatform, setShellPlatform] = useState<string | null>(null);
@@ -92,21 +92,88 @@ export const PreferenceSections = ({
   const [gitBashPath, setGitBashPath] = useState<string | null | undefined>(
     undefined,
   );
-  // 「一键优化」请求中——防双击、按钮 spinner
-  const [shellBoostBusy, setShellBoostBusy] = useState(false);
+  // mac 菜单栏图标：undefined = 非桌面 / 非 darwin / 尚未读到 → 不渲染这一行
+  const [menuBarIcon, setMenuBarIcon] = useState<boolean | undefined>(undefined);
+  const [menuBarIconBusy, setMenuBarIconBusy] = useState(false);
+  // 开机自启：undefined = 非桌面端 / 尚未读到 → 不渲染
+  const [autoLaunch, setAutoLaunch] = useState<boolean | undefined>(undefined);
+  const [autoLaunchBusy, setAutoLaunchBusy] = useState(false);
 
-  /** 拉 shell-boost 探测结果（挂载 + 拨 Git Bash 开关后刷新 agentShellKind） */
-  const refreshShellBoost = async (): Promise<void> => {
+  useEffect(() => {
+    const api = window.__menuBarIcon;
+    if (!api) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const v = await api.get();
+        if (alive && typeof v === "boolean") setMenuBarIcon(v);
+      } catch {
+        /* 读失败当无通道、不展示 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const api = window.__autoLaunch;
+    if (!api) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const v = await api.get();
+        if (alive) setAutoLaunch(v);
+      } catch {
+        /* 读失败当无通道、不展示 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const handleMenuBarIcon = async (next: boolean) => {
+    const api = window.__menuBarIcon;
+    if (!api) return;
+    setMenuBarIconBusy(true);
     try {
-      const res = await fetch("/api/system/shell-boost");
+      await api.set(next);
+      setMenuBarIcon(next);
+    } catch (err) {
+      toast.error(
+        `设置菜单栏图标失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setMenuBarIconBusy(false);
+    }
+  };
+
+  const handleAutoLaunch = async (next: boolean) => {
+    const api = window.__autoLaunch;
+    if (!api) return;
+    setAutoLaunchBusy(true);
+    try {
+      await api.set(next);
+      setAutoLaunch(next);
+    } catch (err) {
+      toast.error(
+        `设置开机自启动失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setAutoLaunchBusy(false);
+    }
+  };
+
+  /** 拉当前 Agent shell 类型 / Git Bash 路径（挂载 + 拨开关后刷新） */
+  const refreshAgentShell = useCallback(async (): Promise<void> => {
+    try {
+      const res = await fetch("/api/system/agent-shell");
       const data = (await res.json()) as {
-        files?: Array<{ path: string; exists: boolean; boosted: boolean }>;
         agentShellKind?: string;
         platform?: string;
         gitBashPath?: string | null;
       };
-      if (!Array.isArray(data.files)) return;
-      setShellBoostFiles(data.files);
       if (typeof data.agentShellKind === "string") {
         setAgentShellKind(data.agentShellKind);
       }
@@ -119,7 +186,7 @@ export const PreferenceSections = ({
     } catch {
       // 探测失败不挡设置页
     }
-  };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -139,94 +206,9 @@ export const PreferenceSections = ({
     };
   }, []);
 
-  // 挂载时探测 shell 配置是否已注入守卫 + 当前 Agent shell 类型 / Git Bash
   useEffect(() => {
-    let alive = true;
-    void (async () => {
-      try {
-        const res = await fetch("/api/system/shell-boost");
-        const data = (await res.json()) as {
-          files?: Array<{ path: string; exists: boolean; boosted: boolean }>;
-          agentShellKind?: string;
-          platform?: string;
-          gitBashPath?: string | null;
-        };
-        if (!alive || !Array.isArray(data.files)) return;
-        setShellBoostFiles(data.files);
-        if (typeof data.agentShellKind === "string") {
-          setAgentShellKind(data.agentShellKind);
-        }
-        if (typeof data.platform === "string") {
-          setShellPlatform(data.platform);
-        }
-        setGitBashPath(
-          typeof data.gitBashPath === "string" ? data.gitBashPath : null,
-        );
-      } catch {
-        // 探测失败不挡设置页
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  // 已存在的目标配置全部已 boosted → 显示「已优化」、隐藏按钮
-  const shellBoostDone =
-    shellBoostFiles !== null &&
-    shellBoostFiles.some((f) => f.exists) &&
-    shellBoostFiles.filter((f) => f.exists).every((f) => f.boosted);
-  // 目标文件一个都不存在 → 无可注入项（中性文案；别说「无需优化」，
-  // 以前 Windows 没探 PowerShell Profile 时那句会误导）
-  const shellBoostNothingToDo =
-    shellBoostFiles !== null && !shellBoostFiles.some((f) => f.exists);
-
-  const handleShellBoost = async () => {
-    setShellBoostBusy(true);
-    try {
-      const res = await fetch("/api/system/shell-boost", { method: "POST" });
-      const data = (await res.json()) as {
-        results?: Array<{
-          path: string;
-          action: "injected" | "already" | "missing";
-        }>;
-        message?: string;
-      };
-      if (!res.ok) {
-        toast.error(
-          `Agent shell 提速失败：${data.message ?? `HTTP ${res.status}`}`,
-        );
-        return;
-      }
-      const results = data.results ?? [];
-      const injected = results.filter((r) => r.action === "injected");
-      const already = results.filter((r) => r.action === "already");
-      if (injected.length > 0) {
-        toast.success(
-          `已写入 ${injected.map((r) => r.path).join("、")}（原文件已备份）`,
-        );
-      } else if (already.length > 0) {
-        toast.success("已是优化状态");
-      } else {
-        // 没有可注入文件不是失败——中性提示、不暗示「本来就够快」
-        toast.info("未检测到 shell 配置文件、无可注入项");
-      }
-      // 刷新探测态（含刚刚注入的）
-      setShellBoostFiles(
-        results.map((r) => ({
-          path: r.path,
-          exists: r.action !== "missing",
-          boosted: r.action === "injected" || r.action === "already",
-        })),
-      );
-    } catch (err) {
-      toast.error(
-        `Agent shell 提速失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      setShellBoostBusy(false);
-    }
-  };
+    void refreshAgentShell();
+  }, [refreshAgentShell]);
 
   // 模板预览：示例变量实时渲染（留空 = 内置兜底）
   const preview = useMemo(
@@ -349,38 +331,39 @@ export const PreferenceSections = ({
         }
       />
 
-      {/* Cursor SDK shell 状态序列化膨胀的官方缓解：配置顶插 agent 守卫 */}
+      {menuBarIcon !== undefined && (
+        <SettingRow
+          label="显示菜单栏图标"
+          control={
+            <Switch
+              checked={menuBarIcon}
+              disabled={menuBarIconBusy}
+              onCheckedChange={(v) => void handleMenuBarIcon(v)}
+            />
+          }
+        />
+      )}
+
+      {autoLaunch !== undefined && (
+        <SettingRow
+          label="开机自启动"
+          control={
+            <Switch
+              checked={autoLaunch}
+              disabled={autoLaunchBusy}
+              onCheckedChange={(v) => void handleAutoLaunch(v)}
+            />
+          }
+        />
+      )}
+
       <SettingRow
-        label="Agent shell 提速"
-        hint={
-          <>
-            配置顶部注入守卫、agent 命令跳过重型初始化
-            {agentShellKind ? (
-              <span className="block text-muted-foreground">
-                当前 Agent shell：{agentShellKind}
-              </span>
-            ) : null}
-          </>
-        }
+        label="插电时防休眠"
         control={
-          shellBoostDone ? (
-            <span className="text-sm text-muted-foreground">已优化 ✓</span>
-          ) : shellBoostNothingToDo ? (
-            <span className="text-sm text-muted-foreground">
-              未检测到 shell 配置文件、无可注入项
-            </span>
-          ) : (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={shellBoostBusy}
-              onClick={() => void handleShellBoost()}
-            >
-              {shellBoostBusy ? <Loader2 className="animate-spin" /> : null}
-              一键优化
-            </Button>
-          )
+          <Switch
+            checked={feishuBridgeKeepAwake}
+            onCheckedChange={onFeishuBridgeKeepAwakeChange}
+          />
         }
       />
 
@@ -389,26 +372,29 @@ export const PreferenceSections = ({
         <SettingRow
           label="Agent shell 用 Git Bash"
           hint={
-            gitBashPath ? (
-              <Tooltip content={gitBashPath}>
-                <span className="block min-w-0 truncate">
-                  {gitBashPath}
-                </span>
-              </Tooltip>
-            ) : gitBashPath === null ? (
-              "未检测到 Git Bash"
-            ) : (
-              "探测中…"
-            )
+            <>
+              {gitBashPath ? (
+                <Tooltip content={gitBashPath}>
+                  <span className="block min-w-0 truncate">{gitBashPath}</span>
+                </Tooltip>
+              ) : gitBashPath === null ? (
+                "未检测到 Git Bash"
+              ) : (
+                "探测中…"
+              )}
+              {agentShellKind ? (
+                <span className="block">当前：{agentShellKind}</span>
+              ) : null}
+            </>
           }
           control={
             <Switch
               checked={agentShellGitBash}
               disabled={!gitBashPath}
               onCheckedChange={(v) => {
-                // 等落盘 + server apply SHELL 完成，再刷新「当前 Agent shell」展示
+                // 等落盘 + server apply SHELL 完成，再刷新「当前」展示
                 void Promise.resolve(onAgentShellGitBashChange(v)).then(() =>
-                  refreshShellBoost(),
+                  refreshAgentShell(),
                 );
               }}
             />

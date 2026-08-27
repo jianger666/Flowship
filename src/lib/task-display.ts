@@ -16,6 +16,7 @@ import type {
   RepoStatus,
   RunStatus,
   Task,
+  TaskMode,
 } from "./types";
 // ACTION_LABEL 单源在 types.ts（server action-gates / stop-task 同引）；此处 re-export 供 UI 原路径 import
 export { ACTION_LABEL } from "./types";
@@ -223,6 +224,61 @@ export const buildPlaceholderChatTitle = (now: Date = new Date()): string =>
 /** 是否还是占位标题（用户尚未发首条消息）、用于决定要不要用首条消息覆盖 */
 export const isPlaceholderChatTitle = (title: string): boolean =>
   title.startsWith(CHAT_TITLE_PLACEHOLDER_PREFIX);
+
+const normalizeRepoPathKey = (p: string): string =>
+  p.trim().replace(/\/+$/, "");
+
+const repoPathsKey = (paths: readonly string[] | undefined): string =>
+  (paths ?? [])
+    .map(normalizeRepoPathKey)
+    .filter(Boolean)
+    .slice()
+    .sort()
+    .join("\0");
+
+export const sameRepoPaths = (
+  a: readonly string[] | undefined,
+  b: readonly string[] | undefined,
+): boolean => repoPathsKey(a) === repoPathsKey(b);
+
+/**
+ * 没说过话的空对话草稿（对齐 Codex：占位标题 + 还没会话锚点）。
+ * 用户改过名或发过首条就不算空，新建时另开。
+ */
+export const isUnusedDraftChat = (t: {
+  mode?: TaskMode;
+  title: string;
+  repoStatus: string;
+  sessionAgentId?: string;
+}): boolean =>
+  t.mode === "chat" &&
+  t.repoStatus === "developing" &&
+  isPlaceholderChatTitle(t.title) &&
+  !t.sessionAgentId?.trim();
+
+/**
+ * 找一条可复用的空草稿。有指定工作目录时优先同目录；没有同目录就复用最近那条空的。
+ */
+export const findUnusedDraftChat = <
+  T extends {
+    mode?: TaskMode;
+    title: string;
+    repoStatus: string;
+    sessionAgentId?: string;
+    updatedAt: number;
+    repoPaths?: string[];
+  },
+>(
+  tasks: readonly T[],
+  repoPaths?: string[],
+): T | undefined => {
+  const unused = tasks.filter(isUnusedDraftChat);
+  if (unused.length === 0) return undefined;
+  const want = repoPaths ?? [];
+  const matched = unused.filter((t) => sameRepoPaths(t.repoPaths, want));
+  const pool = matched.length > 0 ? matched : unused;
+  return [...pool].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+};
 
 /**
  * 日常任务留空标题时的默认名：`日常 · <首仓短名> · MM-DD HH:mm`

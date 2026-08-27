@@ -11,7 +11,7 @@
 import {
   detectAgentShellKind,
   type AgentShellKind,
-} from "./shell-boost";
+} from "./agent-shell";
 
 /**
  * 组装 Windows 工具纪律段。非 win32 返空串（调用方可不注入 / 注入空占位）。

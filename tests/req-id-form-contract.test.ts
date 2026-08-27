@@ -20,14 +20,6 @@ const read = (...seg: string[]): string =>
 const editDialog = read("components", "tasks", "edit-task-dialog.tsx");
 const launchForm = read("components", "tasks", "task-launch-form.tsx");
 
-/** 抠出 `需求编号` 输入框的 placeholder（从 `id="…-req-id"` 往后找第一个 placeholder） */
-const reqIdPlaceholder = (source: string): string | undefined => {
-  const idx = source.indexOf('id="l-req-id"');
-  const at = idx >= 0 ? idx : source.indexOf('id="edit-req-id"');
-  if (at < 0) return undefined;
-  return source.slice(at).match(/placeholder="([^"]+)"/)?.[1];
-};
-
 describe("两个表单都不预填、不派生", () => {
   it("派生函数已经不存在了、谁也别再 import", () => {
     for (const source of [editDialog, launchForm]) {
@@ -60,9 +52,10 @@ describe("提交判定共用一份、两处文案一致", () => {
     }
   });
 
-  it("placeholder 两处一致（改一处必须改另一处）", () => {
-    const placeholder = reqIdPlaceholder(launchForm);
-    expect(placeholder).toBe("暂无 REQ-ID、可后补");
-    expect(reqIdPlaceholder(editDialog)).toBe(placeholder);
+  it("新建用 Field 说明、编辑用 placeholder，都告诉用户可后补", () => {
+    expect(launchForm).toContain(
+      'activateEnabled ? "激活后由 Hub 生成" : "可后补"',
+    );
+    expect(editDialog).toContain('placeholder="暂无 REQ-ID、可后补"');
   });
 });

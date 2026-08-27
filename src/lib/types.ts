@@ -469,15 +469,10 @@ export interface FeAiFlowSettings {
    */
   feishuChatBridge?: boolean;
   /**
-   * 桥接开启时「插电防休眠」（决策 #14）。默认开；显式 false 才关。
-   * 与 feishuChatBridge 独立——桥接关时此项无运行时效果。
+   * 插电防休眠（决策 #14）。默认开；显式 false 才关。
+   * 桥接关着时此项无运行时效果（caffeinate 跟飞书长连接绑在一起）。
    */
   feishuBridgeKeepAwake?: boolean;
-  /**
-   * 桥接「流式回复」（CardKit 打字机）。默认开；显式 false → AI 完成后一次性发整卡。
-   * 与 feishuChatBridge 独立——桥接关时此项无运行时效果。
-   */
-  feishuBridgeStreaming?: boolean;
   /**
    * 团队规范总开关（Skills 区「团队规范」组头）= 一键隔离 wk 知识库那套。
    * 默认 true：日常注入 `knowledge/skills/` + loadSkillsForTask 按仓匹配；

@@ -9,6 +9,7 @@ import {
   reasoningFieldsFromCatalog,
   thinkingLevelFromParams,
   thinkingLevelMapFromValues,
+  resolveThinkingTriggerLabel,
   withCatalogEffort,
 } from "@/lib/custom-effort";
 import {
@@ -247,5 +248,60 @@ describe("custom-effort / models.dev", () => {
     ).toBeUndefined();
     expect(defaultEffortValue(["minimal", "low", "high"])).toBe("default");
     expect(defaultEffortValue([])).toBeUndefined();
+  });
+
+  it("trigger 常显思考档：没写进 params 的 Default 也要标，不能只靠截断后的模型名", () => {
+    const custom = {
+      parameters: [
+        {
+          id: "thinking",
+          values: [
+            { value: "default" },
+            { value: "low" },
+            { value: "high" },
+          ],
+        },
+      ],
+    };
+    expect(resolveThinkingTriggerLabel(custom, undefined, false)).toBe("Default");
+    expect(
+      resolveThinkingTriggerLabel(
+        custom,
+        [{ id: "thinking", value: "default" }],
+        false,
+      ),
+    ).toBe("Default");
+    expect(
+      resolveThinkingTriggerLabel(custom, [{ id: "thinking", value: "high" }], false),
+    ).toBe("high");
+    expect(resolveThinkingTriggerLabel({ parameters: [] }, undefined, false)).toBeNull();
+
+    const cursor = {
+      parameters: [
+        {
+          id: "thinking",
+          values: [
+            { value: "none", displayName: "None" },
+            { value: "medium", displayName: "Medium" },
+            { value: "xhigh", displayName: "Extra High" },
+          ],
+        },
+      ],
+      variants: [
+        {
+          displayName: "default",
+          isDefault: true,
+          params: [{ id: "thinking", value: "none" }],
+        },
+      ],
+    };
+    expect(resolveThinkingTriggerLabel(cursor, undefined, true)).toBe("None");
+    expect(
+      resolveThinkingTriggerLabel(
+        cursor,
+        [{ id: "thinking", value: "xhigh" }],
+        true,
+      ),
+    ).toBe("Extra High");
   });
 });

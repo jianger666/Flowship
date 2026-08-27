@@ -340,21 +340,16 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 1. **「§ 用户决策」段位置**：edit 把它**插入**到「未完成 task」段后、「跟飞书需求对照」段之前（骨架已注明位置）、**不要**追加到 artifact 末尾。用户阅读流是「问题段 → 决策段 → 对照」、决策段插在末尾会让用户先看到对照表再回头看决策、断流。
 2. **`## 修改记录` 段禁写**：§6 所有闭环动作（ask_user 问 / edit plan / 追加用户决策段 / 追加飞书未覆盖项落地）**不属于** `## 修改记录` 段、不要往那里追加任何记录。`## 修改记录` 段只在**用户反馈（`[USER_MESSAGE]`）后按诉求做的修改**才追加。§6 是 review agent 自己执行的标准动作、不是「用户反馈触发的修改」、属于初稿正常流程的一部分、动作全部记到 `## 用户决策` 段即可、不要双写。
 
-### 7. 调 `submit_work`
+### 7. 交卷
 
-> ⚠️ 必须确认 §6 ask_user 已经问完（如有偏差 / 未完成 task / 飞书未覆盖项）、且已经把用户答案落地（动了 plan、追加了「§ 用户决策」段）、才能调 submit_work。
+> ⚠️ 必须确认 §6 ask_user 已经问完（如有偏差 / 未完成 task / 飞书未覆盖项）、且已经把用户答案落地（动了 plan、追加了「§ 用户决策」段）、才能交卷。
 > 否则用户拿到的 review artifact 是「初稿 + 没决策」、得自己 revise 一次才能推进、闭环就被打破了。
 
-参数：
-- `task_id={{taskId}}`
-- `action_id=<本 action 的 id>`
-- `artifact_path=actions/<n>-review.md`
+按 super-prompt 交卷。
 
-拿到 `[SUBMITTED]` 后说 1-3 句业务结论，然后结束本轮回复。用户的下一步会以新消息送达：
-
-- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句、如「为什么 §2 标红了？」「这处差异严重吗？」）→ 不弹窗、不动 artifact；**改类**（其他、含「改回 plan」「修改 plan 描述」「补做 task N」「这条不算差异、删掉」等、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才动文件、动完后**用 `edit` 把本轮修正追加到 review artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）、重新跑 git diff 复核；带图先 read 图再分类。先调一次 `submit_work`（同 action_id + artifact_path）重新交卷，拿到 `[SUBMITTED]` 后再说回应、结束回复
+- `[USER_MESSAGE]`（带〈产出审阅中〉）→ 按 super-prompt「[USER_MESSAGE] 统一处理」。**改类**落地后用 `edit` 把本轮修正追加到 review artifact 的 `## 修改记录` 段末尾（格式 / 禁项见「跨 action 共享规范 §5.1」）、重新跑 git diff 复核
   - **特例·用户对 bug 表态（V0.6.17）**：若 feedback 是对「## bug 复审」里某条 🔴/🟡 的处理决定（「这个不用改」「二期再说」「这个本次修」）→ 复述确认后、把裁决追加到「## bug 复审 → ### 用户裁决」子段（**bug 本体保留**、别从表里删——bug 是事实、裁决是决定）、review 本身**不改代码**。后续 build 读 review 就知道哪些 bug 用户已否决、**不重复问**（决定链落 md）。
-- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出、UI 没有单独「通过」按钮）、按新指令执行、**绝对不自动进入 ship**——下一个 action 类型由用户在 UI 选
+- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行、**绝对不自动进入 ship**
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
 
@@ -540,6 +535,6 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 - **跟飞书原文对照**：拿 plan agent 内联的 `> ✅ ask_user 已确认` 备注、对照 build 实施有没有落实拍板口径；用户没拍板的（plan §6 deferred）不重复审、放在「未完成 task」段提醒用户；**跨角色项不上 review**（噪声）
 - **闭环关键**：「实现偏差」/「未完成 task」/「跟飞书未覆盖项」三段任意非空、必须走 §6 ask_user 弹窗、不在 artifact 里嵌 a/b/c 选项让用户去「再聊聊」；ask_user 答完 b/c → agent 直接 edit 最新 plan + 追加「§ 用户决策」段（位置严格、见 §6.4）；答 a → 记入决策、等用户推进改代码时处理
 - **拍板口径显性留痕**：plan artifact 内联的 `> ✅ ask_user 已确认` 备注、每条都列到「plan 拍板口径复核」段、给 ✅ 一致 / ⚠️ 跑偏 / N/A 没用到 结论、不要让拍板复核留在隐性假设里溜过去
-- **写完 → ask_user → submit_work**：顺序不能颠倒、ask_user 没问完就调 submit_work 等于闭环没合上
+- **写完 → ask_user → 交卷**：顺序不能颠倒、ask_user 没问完就交卷等于闭环没合上
 - **分批需求两层 review（V0.6.23）**：[NEXT_ACTION] 带 `[REVIEW_SCOPE]` 时按它定增量 / 集成（见 §4.5）——增量别把「没 build 的批次」当 bug 报、集成重点查批次之间打不打架
-- **绝对不自动进入下一 action**：review 交卷后结束回复、不要自己跑 ship——下一 action 类型由用户在 UI 选
+- **绝对不自动进入下一 action**：不要自己跑 ship——下一手由用户在 UI 选

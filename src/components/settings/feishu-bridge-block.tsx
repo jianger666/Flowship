@@ -3,8 +3,8 @@
 /**
  * 设置页「消息桥接」块（提案 4.4b / 决策 #3 #4 #14 #19）
  *
- * 挂在 FeishuCliSection 下方：全局开关 → 展开后引导检查 + 欢迎消息 + 防休眠 / 自启。
- * 开机自启走 window.__autoLaunch（系统层），不进 settings。
+ * 挂在 FeishuCliSection 下方：全局开关 → 展开后引导检查 + 欢迎消息。
+ * 开机自启 / 插电防休眠已挪到偏好。
  */
 
 import {
@@ -149,17 +149,9 @@ const OpenAuthLink = ({ href, label = "去开通" }: { href: string; label?: str
 export const FeishuBridgeBlock = ({
   feishuChatBridge,
   onFeishuChatBridgeChange,
-  feishuBridgeKeepAwake,
-  onFeishuBridgeKeepAwakeChange,
-  feishuBridgeStreaming,
-  onFeishuBridgeStreamingChange,
 }: {
   feishuChatBridge: boolean;
   onFeishuChatBridgeChange: (next: boolean) => void;
-  feishuBridgeKeepAwake: boolean;
-  onFeishuBridgeKeepAwakeChange: (next: boolean) => void;
-  feishuBridgeStreaming: boolean;
-  onFeishuBridgeStreamingChange: (next: boolean) => void;
 }) => {
   // 探测结果快照（null = 尚未拉到）
   const [status, setStatus] = useState<BridgeStatusPayload | null>(null);
@@ -167,10 +159,6 @@ export const FeishuBridgeBlock = ({
   const [loading, setLoading] = useState(false);
   // 欢迎消息发送中
   const [welcomeBusy, setWelcomeBusy] = useState(false);
-  // 开机自启：undefined = 非桌面端 / 尚未读到 → 该行隐藏
-  const [autoLaunch, setAutoLaunch] = useState<boolean | undefined>(undefined);
-  // 自启读写飞行中
-  const [autoLaunchBusy, setAutoLaunchBusy] = useState(false);
   // 卸载守卫：async setState 前检查（对齐 use-settings alive 惯例，R1-17f）
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -208,24 +196,6 @@ export const FeishuBridgeBlock = ({
     void refresh();
   }, [feishuChatBridge, refresh]);
 
-  // 桌面端读开机自启；无通道则整行隐藏
-  useEffect(() => {
-    const api = window.__autoLaunch;
-    if (!api) return;
-    let alive = true;
-    void (async () => {
-      try {
-        const v = await api.get();
-        if (alive) setAutoLaunch(v);
-      } catch {
-        // 读失败当无通道、不展示
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
-
   const handleWelcome = async () => {
     if (!mountedRef.current) return;
     setWelcomeBusy(true);
@@ -249,24 +219,6 @@ export const FeishuBridgeBlock = ({
       );
     } finally {
       if (mountedRef.current) setWelcomeBusy(false);
-    }
-  };
-
-  const handleAutoLaunch = async (next: boolean) => {
-    const api = window.__autoLaunch;
-    if (!api || !mountedRef.current) return;
-    setAutoLaunchBusy(true);
-    try {
-      await api.set(next);
-      if (!mountedRef.current) return;
-      setAutoLaunch(next);
-    } catch (err) {
-      if (!mountedRef.current) return;
-      toast.error(
-        `设置开机自启动失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      if (mountedRef.current) setAutoLaunchBusy(false);
     }
   };
 
@@ -441,42 +393,6 @@ export const FeishuBridgeBlock = ({
               {welcomeBusy ? <Loader2 className="animate-spin" /> : null}
               机器人打招呼
             </Button>
-          </div>
-
-          <div className="divide-y">
-            <SettingRow
-              label="流式回复"
-              className="py-2"
-              control={
-                <Switch
-                  checked={feishuBridgeStreaming}
-                  onCheckedChange={onFeishuBridgeStreamingChange}
-                />
-              }
-            />
-            <SettingRow
-              label="插电时防休眠"
-              className="py-2"
-              control={
-                <Switch
-                  checked={feishuBridgeKeepAwake}
-                  onCheckedChange={onFeishuBridgeKeepAwakeChange}
-                />
-              }
-            />
-            {autoLaunch !== undefined && (
-              <SettingRow
-                label="开机自启动"
-                className="py-2"
-                control={
-                  <Switch
-                    checked={autoLaunch}
-                    disabled={autoLaunchBusy}
-                    onCheckedChange={(v) => void handleAutoLaunch(v)}
-                  />
-                }
-              />
-            )}
           </div>
         </div>
       )}

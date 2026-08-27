@@ -205,19 +205,12 @@
 >
 > ⚠️ **重跑 / 接续 plan 必须重调**：批次绑在「当前 action」上、**不会**从上一版 plan 自动继承。如果这是重试 / 接续之前的 plan（哪怕用户只说「启动一下」）、只要你重写了 plan 内容且需求仍要分批——**就必须重新调一次 `set_plan_batches`**、否则本 action 没批次、分批 build 读不到（系统虽会兜底回退到上一版拆好的批次、但别依赖兜底）。
 
-### 6. 调 `submit_work` 交卷、结束回复
+### 6. 交卷
 
-参数：
-- `task_id={{taskId}}`
-- `action_id=<本 action 的 id>`（从 [NEXT_ACTION] 头拿）
-- `artifact_path=actions/<n>-plan.md`
+问完该问的（§5.2）后按 super-prompt 交卷。结论说清方案要点 / 关键决策 / 待确认项。
 
-拿到 `[SUBMITTED]` 后说 1-3 句业务结论（方案要点 / 关键决策 / 待确认项），然后结束本轮回复——不跑任何等待命令。用户的下一步会以新消息送达：
-
-- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句）→ 不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。先调一次 `submit_work`（同 action_id + artifact_path）重新交卷，拿到 `[SUBMITTED]` 后再说回应、结束回复
-- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出、UI 没有单独「通过」按钮）、按新指令执行
-
-`submit_work` 调用前后不要在回复正文里讲它的存在等协议机制、对用户透明。写完 plan artifact 先交卷，拿到 `[SUBMITTED]` 后再给 1-3 句简短结论（方案要点 / 关键决策 / 待确认项）（详见 super-prompt 关键规则 1）。
+- `[USER_MESSAGE]`（带〈产出审阅中〉）→ 按 super-prompt「[USER_MESSAGE] 统一处理」。**改类**落地后按「跨 action 共享规范 §5.2 plan action 内联留痕」
+- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
 
@@ -370,4 +363,4 @@ V0.6.0.1 起这里只做最低门槛 deterministic 检查、不再 grep「不确
 - **⛔ 不省略业务名词 / task name**：表格 / 正文里出现的 task 名 / 业务对象**写全称**、不要图省事用脑内简写
 - **本仓视角**：本 action 只服务于「本仓库（{{repoPath}}）要改什么」、其它端的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨端边界相关时才碰
 - **大需求才分批**：task 多 / 跨层 / 一次 build 跑不稳妥时、才调 `set_plan_batches` 上报批次（见 §5.3）、artifact **不写**批次表（系统自动渲染）；小需求别分批、保持单次 build（分批是为防大需求跑乱、不是 KPI、宁可不分也别硬切）
-- **写完 artifact（+ 必要的 ask_user）→ 调 submit_work → 拿到 `[SUBMITTED]` 后再说 1-3 句结论**：结论说清「方案要点 / 关键决策 / 有无待确认项」（简短）；别说「我写完了你看下」或「已交卷」这种没信息量的空话、也别说完忘了交卷
+- **写完后按 super-prompt 交卷**：结论说清方案要点 / 关键决策 / 有无待确认项；别说「我写完了你看下」这类空话

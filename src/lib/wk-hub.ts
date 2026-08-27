@@ -3,15 +3,9 @@
  *
  * 为什么探 `artifact-state` 而不是 `/health`：翻遍团队 harness 镜像
  * （`wk-harness/references/delivery-hub-sync.md` + `scripts/*.py`）**没有健康检查端点**，
- * 全部对外接口只有这四个：
- *   POST /internal/harness/manifest
- *   POST /internal/harness/events
- *   POST /internal/harness/artifacts/upload
- *   GET  /internal/harness/artifacts/file
- *   GET  /internal/harness/artifact-state?artifactKey=...
- * 其中只有 `artifact-state` 是「GET + 无副作用」——拿它当探针最安全：随便传个
- * 不存在的 key，hub 会回 `{"data":{"exists":false}}`，既证明网络通、鉴权有效，
- * 又证明对面确实是 harness 接口而不是随便一个占了端口的服务。
+ * 内部接口（激活 / 产物 / 事件）都挂 `/internal/harness/*`。探针仍用
+ * `artifact-state`：它是「GET + 无副作用」——随便传个不存在的 key，hub 会回
+ * `{"data":{"exists":false}}`，既证明网络通、鉴权有效，又证明对面确实是 harness。
  */
 
 /** 探测结论：ok=确认是 hub；unexpected=连上了但不像 hub；unreachable=网络不通 */
@@ -25,6 +19,15 @@ export interface WkHubProbeResult {
 
 /** 官方 baseline 脚本查的探针路径 */
 export const HUB_ARTIFACT_STATE_PATH = "/internal/harness/artifact-state";
+
+/** 指令激活草案 / 确认（对齐 wk-activate.py） */
+export const HUB_ACTIVATION_DRAFT_PATH = "/internal/harness/activation-draft";
+export const HUB_ACTIVATE_PATH = "/internal/harness/activate";
+/** 启用中的技术 Owner 候选（label=显示名、value=账号） */
+export const HUB_ACTIVATION_OWNERS_PATH = "/internal/harness/activation-owners";
+
+/** Hub 内部接口鉴权头（Bearer 也能过，官方脚本走这个） */
+export const HUB_HARNESS_TOKEN_HEADER = "X-Delivery-Harness-Token";
 
 /** 探测用的假 key：hub 查不到会老实回 exists:false，不会写任何东西 */
 export const HUB_PROBE_ARTIFACT_KEY = "flowship:probe:connectivity";

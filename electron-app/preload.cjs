@@ -111,6 +111,14 @@ contextBridge.exposeInMainWorld("__autoLaunch", {
   set: (enabled) => ipcRenderer.invoke("auto-launch-set", enabled === true),
 });
 
+// mac 菜单栏图标（仅 darwin 设置页用；Windows 不展示）
+contextBridge.exposeInMainWorld("__menuBarIcon", {
+  /** @returns {Promise<boolean | null>} */
+  get: () => ipcRenderer.invoke("menu-bar-icon-get"),
+  /** @param {boolean} visible */
+  set: (visible) => ipcRenderer.invoke("menu-bar-icon-set", visible === true),
+});
+
 // 壳能力 / 平台信息（自定义标题栏用）
 contextBridge.exposeInMainWorld("__shell", {
   // "darwin" | "win32" | "linux"——页面据此给右侧控件让出 Windows 控制按钮位

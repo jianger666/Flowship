@@ -47,14 +47,9 @@ export const isFeishuBridgeKeepAwakeEnabled = async (): Promise<boolean> => {
   return v !== false;
 };
 
-/** 流式回复子开关（默认开；关则 finalize 一次性发整卡） */
-export const isFeishuBridgeStreamingEnabled = async (): Promise<boolean> => {
-  const result = await readSettingsFile();
-  if (result.status !== "ok") return true;
-  const v = result.settings.feishuBridgeStreaming;
-  // 缺省 / 非 false → true
-  return v !== false;
-};
+/** 飞书卡片打字机：不再挂设置，恒开 */
+export const isFeishuBridgeStreamingEnabled = async (): Promise<boolean> =>
+  true;
 
 /**
  * 需求群协作行为：**固定策略、不再是用户设置**（2026-07-28 用户拍板砍掉三个开关，

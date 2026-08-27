@@ -32,7 +32,7 @@ export const Combobox = ({
   value,
   onValueChange,
   options,
-  placeholder = "选择…",
+  placeholder = "请选择",
   disabled = false,
   loading = false,
   allowCustom = true,

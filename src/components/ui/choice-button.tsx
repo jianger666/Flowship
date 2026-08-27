@@ -1,6 +1,9 @@
+"use client";
+
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 import { cva, type VariantProps } from "class-variance-authority";
 
+import { useFormDisabled } from "@/components/ui/form-context";
 import { cn } from "@/lib/utils";
 
 /**
@@ -99,13 +102,18 @@ export const ChoiceButton = ({
   className,
   children,
   type = "button",
+  disabled,
   ...rest
-}: ChoiceButtonProps) => (
-  <button
-    type={type}
-    className={cn(choiceButtonVariants({ shape, selected }), className)}
-    {...rest}
-  >
-    {children}
-  </button>
-);
+}: ChoiceButtonProps) => {
+  const locked = Boolean(disabled) || useFormDisabled();
+  return (
+    <button
+      type={type}
+      disabled={locked}
+      className={cn(choiceButtonVariants({ shape, selected }), className)}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+};

@@ -302,9 +302,9 @@ meegle comment add \
 2. **目标节点自己判断**：合法流转里选语义为「提测 / 待测试 / 测试中」的节点；**没有明确匹配的就不要流转**（各空间节点命名不同、流转错状态比不流转更糟）、artifact 记「未找到提测类节点、跳过」
 3. 失败：按输出把原因分类记进 artifact «§4.5 节点流转»（真未登录 / 网络不可达 / 未找到提测类节点 / 权限不足）、**不阻塞 ship 完成**、不重试超过 1 次
 
-### 5. 写 ship artifact + submit_work
+### 5. 写 ship artifact
 
-artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit_work({ task_id, action_id, artifact_path: "actions/<N>-ship.md" })` 等用户 ack。
+artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完按 super-prompt 交卷。
 
 ### 6. 需求群播报（**不用你操心**）
 

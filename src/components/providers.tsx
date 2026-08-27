@@ -22,6 +22,7 @@ import { DeepLinkHandler } from "@/components/deep-link-handler";
 import { GlobalShortcuts } from "@/components/global-shortcuts";
 import { SearchDialog } from "@/components/search-dialog";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
+import { WhatsNewHost } from "@/components/whats-new-host";
 import { TaskListProvider } from "@/hooks/use-task-list";
 import { MrInboxProvider } from "@/hooks/use-mr-inbox";
 import { initSettings } from "@/lib/local-store";
@@ -57,7 +58,8 @@ export const Providers = ({ children }: ProvidersProps) => {
       {/* DialogProvider 提供全局 confirm/prompt——禁用 window.{alert,confirm,prompt}、
           统一走 shadcn 风格弹窗。组件内用 useDialog() 拿到 confirm / prompt */}
       <DialogProvider>
-        <ModelsPrefetch />
+        <WhatsNewHost>
+          <ModelsPrefetch />
         {/* ImagePreviewProvider：全局图片 lightbox（任意 ImageThumb 点击站内看大图、多图左右切换） */}
         <ImagePreviewProvider>
           <LocalFilePreviewProvider>
@@ -79,6 +81,7 @@ export const Providers = ({ children }: ProvidersProps) => {
           </TaskListProvider>
           </LocalFilePreviewProvider>
         </ImagePreviewProvider>
+        </WhatsNewHost>
       </DialogProvider>
     </ThemeProvider>
   );

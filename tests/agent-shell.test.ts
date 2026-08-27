@@ -19,8 +19,9 @@ import {
   __setVerifyGitBashForTests,
   __setWhereBashForTests,
   applyAgentShellPreference,
-  deriveBashFromGitExe,
   detectGitBashPath,
+  deriveBashFromGitExe,
+  detectAgentShellKind,
   injectGitBashBinToPath,
   removeInjectedGitBashBinFromPath,
   syncAgentShellEnv,
@@ -28,6 +29,33 @@ import {
 
 /** 与 agent-shell 一致：PATH 段用 win32 `;`，避免 mac 上 `:` 拆坏 `C:\...` */
 const WIN_PATH_DELIM = path.win32.delimiter;
+
+describe("detectAgentShellKind", () => {
+  it("win32：无 Git Bash 迹象 → PowerShell", () => {
+    expect(detectAgentShellKind("win32", {})).toBe("PowerShell");
+    expect(
+      detectAgentShellKind("win32", { SHELL: "C:\\Windows\\System32\\cmd.exe" }),
+    ).toBe("PowerShell");
+  });
+
+  it("win32：MSYSTEM 或 Git Bash SHELL → Git Bash", () => {
+    expect(detectAgentShellKind("win32", { MSYSTEM: "MINGW64" })).toBe(
+      "Git Bash",
+    );
+    expect(
+      detectAgentShellKind("win32", {
+        SHELL: "C:\\Program Files\\Git\\bin\\bash.exe",
+      }),
+    ).toBe("Git Bash");
+  });
+
+  it("darwin/linux：按 SHELL 识别，darwin 缺省 zsh", () => {
+    expect(detectAgentShellKind("darwin", { SHELL: "/bin/zsh" })).toBe("zsh");
+    expect(detectAgentShellKind("linux", { SHELL: "/bin/bash" })).toBe("bash");
+    expect(detectAgentShellKind("darwin", {})).toBe("zsh");
+    expect(detectAgentShellKind("linux", {})).toBe("bash");
+  });
+});
 
 describe("deriveBashFromGitExe", () => {
   it("cmd\\git.exe → 同根 bin\\bash.exe", () => {

@@ -11,8 +11,8 @@
  * # 设计原则（依据 Anthropic prompting best practices、沿用 2026-06-14 立的规矩）
  *
  * - dial back aggressive language：不堆「🚨 绝对禁止」、点明陷阱 + 解释 why
- * - 单一源：chat 起手（chatTurnProtocolSection）、task super prompt（{{waitDiscipline}} 占位、
- *   注入 turnDisciplineSection）各引一份、不再三处漂移
+ * - 单一源：chat 起手用 chatTurnProtocolSection；task 的交卷/结束回合写在 _super.md「核心机制」、
+ *   不再往 super 里灌 turnDisciplineSection（避免和核心机制复读）
  */
 
 /**
@@ -24,7 +24,8 @@ export const ASK_USER_TURN_LINE =
   "- 有不确定项 / 要用户选择 → 调 `ask_user` 推答题卡（提问后再说的话用户看不见）→ 结束回复（答案以 `[ASK_USER_REPLY]` 开头的新消息送达）";
 
 /**
- * task 模式的「回合纪律」段（_super.md {{waitDiscipline}} 占位注入）。
+ * task 模式的「回合纪律」段（曾注入 _super.md；现交卷协议只留 super「核心机制」一处）。
+ * 仍导出给测试对账 chat / task 对 ask_user 的同一句措辞。
  *
  * 讲清三件事：产物写好先交卷、拿到 [SUBMITTED] 后再说结论；提问走 ask_user；
  * 别执行任何等待命令（旧协议肌肉记忆 / 网上教程的轮询套路都不要）。

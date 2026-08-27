@@ -14,6 +14,7 @@
 
 import { Switch as SwitchPrimitive } from "@base-ui/react/switch";
 
+import { useFormDisabled } from "@/components/ui/form-context";
 import { cn } from "@/lib/utils";
 
 interface SwitchProps {
@@ -31,12 +32,13 @@ export const Switch = ({
   className,
   id,
 }: SwitchProps) => {
+  const locked = Boolean(disabled) || useFormDisabled();
   return (
     <SwitchPrimitive.Root
       id={id}
       checked={checked}
       onCheckedChange={onCheckedChange}
-      disabled={disabled}
+      disabled={locked}
       className={cn(
         "peer relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:outline-none",

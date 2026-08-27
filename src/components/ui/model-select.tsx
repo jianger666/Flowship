@@ -18,12 +18,12 @@ import {
   DEFAULT_THINKING_VALUE,
   isDefaultThinkingValue,
   isThinkingParamId,
+  resolveThinkingTriggerLabel,
   thinkingChipLabel,
   withDefaultThinkingParam,
 } from "@/lib/custom-effort";
 import { getStarredModelIds, toggleStarredModel } from "@/lib/local-store";
 import {
-  isHiddenModelParam,
   visibleModelParameters,
   withoutHiddenModelParams,
 } from "@/lib/model-params";
@@ -127,26 +127,9 @@ export const ModelQuickPicks = ({
   );
 };
 
-const summarizeSelection = (
-  models: ModelOption[],
-  sel: { id: string; params?: Array<{ id: string; value: string }> },
-  cursorNative: boolean,
-): string => {
-  const m = models.find((x) => x.id === sel.id);
-  const name = m ? modelName(m) : sel.id;
-  const paramSummary = (sel.params ?? [])
-    .map((sp) => {
-      if (isHiddenModelParam(sp)) return null;
-      if (isThinkingParamId(sp.id) && isDefaultThinkingValue(sp.value)) {
-        return cursorNative ? null : "Default";
-      }
-      const def = m?.parameters?.find((p) => p.id === sp.id);
-      if (!def || isHiddenModelParam(def)) return null;
-      const vv = def.values.find((x) => x.value === sp.value);
-      return vv ? renderParamValue(def, vv, cursorNative) : null;
-    })
-    .filter(Boolean);
-  return paramSummary.length > 0 ? `${name} · ${paramSummary.join(" · ")}` : name;
+const modelLabelOf = (models: ModelOption[], id: string): string => {
+  const m = models.find((x) => x.id === id);
+  return m ? modelName(m) : id;
 };
 
 interface Props {
@@ -189,10 +172,17 @@ export const ModelSelect = ({
     [models, selection.id],
   );
 
-  const triggerLabel = useMemo(() => {
-    if (!selection.id) return emptyPlaceholder;
-    return summarizeSelection(models, selection, cursorNative);
-  }, [selection, models, emptyPlaceholder, cursorNative]);
+  const thinkingLabel = useMemo(
+    () =>
+      selection.id
+        ? resolveThinkingTriggerLabel(
+            selectedModel,
+            selection.params,
+            cursorNative,
+          )
+        : null,
+    [selection.id, selection.params, selectedModel, cursorNative],
+  );
 
   const starredIds = useMemo(
     () => (providerId ? getStarredModelIds(providerId) : []),
@@ -311,7 +301,7 @@ export const ModelSelect = ({
       placeholder={emptyPlaceholder}
       searchPlaceholder="搜索模型…"
       className={
-        variant === "compact" ? "h-7 min-w-0 w-auto max-w-52 text-xs" : undefined
+        variant === "compact" ? "h-7 min-w-0 w-auto max-w-64 text-xs" : undefined
       }
       wrapperClassName={variant === "compact" ? "w-auto" : undefined}
       contentClassName={variant === "compact" ? "w-72 min-w-72 max-w-72" : undefined}
@@ -381,11 +371,21 @@ export const ModelSelect = ({
       renderTrigger={() => (
         <span
           className={cn(
-            "min-w-0 flex-1 truncate text-left",
+            "flex min-w-0 flex-1 items-center text-left",
             !selection.id && "text-muted-foreground",
           )}
         >
-          {triggerLabel}
+          <span className="min-w-0 truncate">
+            {selection.id
+              ? modelLabelOf(models, selection.id)
+              : emptyPlaceholder}
+          </span>
+          {thinkingLabel ? (
+            <span className="shrink-0 text-muted-foreground">
+              {" · "}
+              {thinkingLabel}
+            </span>
+          ) : null}
         </span>
       )}
       footer={paramFooter}

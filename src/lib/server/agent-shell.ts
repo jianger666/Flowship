@@ -133,6 +133,41 @@ export const deriveBashFromGitExe = (gitExePath: string): string | null => {
   return null;
 };
 
+/** SDK agent shell 实际会用的壳类型（设置页 Git Bash 开关旁展示） */
+export type AgentShellKind = "PowerShell" | "Git Bash" | "zsh" | "bash";
+
+/** 只读 env 子集——单测可传普通对象，不必满足完整 ProcessEnv */
+export type AgentShellEnv = {
+  readonly SHELL?: string | undefined;
+  readonly MSYSTEM?: string | undefined;
+};
+
+/**
+ * 复刻 SDK 选壳逻辑的简版（可注入 platform/env 便于单测，不改 process 全局）。
+ * win32：有 MSYSTEM 或 SHELL 像 Git Bash → Git Bash；否则几乎总是 PowerShell
+ * （SDK 找得到 pwsh/powershell 就用它）。
+ */
+export const detectAgentShellKind = (
+  platform: NodeJS.Platform = process.platform,
+  env: AgentShellEnv = {
+    SHELL: process.env.SHELL,
+    MSYSTEM: process.env.MSYSTEM,
+  },
+): AgentShellKind => {
+  if (platform === "win32") {
+    const shell = env.SHELL ?? "";
+    const looksLikeGitBash =
+      Boolean(env.MSYSTEM) ||
+      /(?:^|[\\/])(?:bash(?:\.exe)?)$/i.test(shell) ||
+      /git[\\/].*[\\/]bash/i.test(shell);
+    return looksLikeGitBash ? "Git Bash" : "PowerShell";
+  }
+  const shell = env.SHELL ?? "";
+  if (shell.includes("zsh")) return "zsh";
+  if (shell.includes("bash")) return "bash";
+  return platform === "darwin" ? "zsh" : "bash";
+};
+
 /** fs.access 验证文件存在且可读；失败返 null */
 const accessOrNull = async (absPath: string): Promise<string | null> => {
   try {

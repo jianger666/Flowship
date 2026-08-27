@@ -248,28 +248,4 @@ describe("isFieldEqual 桥接 boolean（R1-11）", () => {
       ),
     ).toBe(true);
   });
-
-  it("feishuBridgeStreaming 切换 → 不相等（缺省 true）", () => {
-    expect(
-      isFieldEqual(
-        "feishuBridgeStreaming",
-        { ...base, feishuBridgeStreaming: true },
-        { ...base, feishuBridgeStreaming: true },
-      ),
-    ).toBe(true);
-    expect(
-      isFieldEqual(
-        "feishuBridgeStreaming",
-        { ...base, feishuBridgeStreaming: false },
-        { ...base, feishuBridgeStreaming: true },
-      ),
-    ).toBe(false);
-    expect(
-      isFieldEqual(
-        "feishuBridgeStreaming",
-        { ...base, feishuBridgeStreaming: undefined },
-        { ...base, feishuBridgeStreaming: true },
-      ),
-    ).toBe(true);
-  });
 });

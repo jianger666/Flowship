@@ -12,12 +12,10 @@
  * - 日常任务：隐藏链接与分支相关字段；提交 storyUrl 空 → 服务端轻量态（原仓当前分支）
  * 切换模式草稿保留（切走再切回链接 / 分支仍在 state）
  *
- * 零操作设计（解「不选仓库就卡住」的痛点）：
- * - 仓库预填「上次启动用的」（localStorage 记忆）、90% 场景直接点启动
- * - 真缺仓库时启动置灰 + 琥珀高亮引导（卡点可见、不是谜题）
+ * 目标仓库每次留空、用户自己选。缺项点启动：对应 Field 标 warning，不在按钮旁挂黄字。
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronDown, ChevronUp, Plug, Rocket } from "lucide-react";
 import { toast } from "sonner";
 
@@ -27,16 +25,27 @@ import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { Combobox } from "@/components/ui/combobox";
 import { EmptyHint } from "@/components/ui/empty-hint";
+import { Field } from "@/components/ui/field";
+import { Form } from "@/components/ui/form";
 import { Label } from "@/components/ui/label";
 import { ProviderModelPicker } from "@/components/ui/provider-model-picker";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { Input } from "@/components/ui/input";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
+import { WkActivateFields } from "@/components/tasks/wk-activate-fields";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings, initSettings } from "@/lib/local-store";
+import {
+  activateWkRequirement,
+  fetchWkActivateContext,
+  matchHubOwnerValue,
+  wkActivateFieldErrors,
+  type HubOwnerOption,
+  type WkActivateFieldErrors,
+} from "@/lib/wk-activate";
 import {
   getModelCredsForProvider,
   hasModelCredsForProvider,
@@ -59,28 +68,14 @@ import {
   type UserRole,
 } from "@/lib/types";
 
-// 上次启动配置的记忆 key（仓库组合——下次预填、零操作启动）
-const LAST_LAUNCH_KEY = "flowship.lastLaunch.v1";
-
-interface LastLaunch {
-  repoPaths?: string[];
-  // 旧版曾存 role、读时忽略、写时不再带
-}
-
 /** 手动建任务时的显式模式（看板预填路径不展示、恒走需求） */
 type LaunchKind = "requirement" | "daily";
 
-const readLastLaunch = (): LastLaunch => {
-  try {
-    const raw = JSON.parse(
-      localStorage.getItem(LAST_LAUNCH_KEY) ?? "{}",
-    ) as LastLaunch & { role?: unknown };
-    // 丢弃历史 role 字段（任务角色已退役）
-    return { repoPaths: raw.repoPaths };
-  } catch {
-    return {};
-  }
-};
+type LaunchFieldErrorKey =
+  | "title"
+  | "storyUrl"
+  | "repos"
+  | keyof WkActivateFieldErrors;
 
 interface Props {
   /** 工作项名（标题预填、可改；手动入口传空） */
@@ -95,14 +90,21 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [title, setTitle] = useState(initialTitle);
   // 飞书链接：预填路径用 prop；手动路径本地可编辑（初始空时放开输入）
   const [storyUrl, setStoryUrl] = useState(feishuStoryUrl);
-  // wk 需求编号（团队规范的 REQ-ID）：需求 owner 分发的编号，没有就留空——
-  // 我们不猜（不从飞书链接 / task id 派生），空着 = 这个 task 没有 REQ-ID、wk 门禁自会跳过
+  // wk 需求编号（团队规范的 REQ-ID）：手填或启动时激活写入；空 = 没有编号
   const [reqId, setReqId] = useState("");
+  // 启动时激活（给技术 Owner 用）：默认关；Hub 没配 / 已手填编号则整块不出现
+  const [wantActivate, setWantActivate] = useState(false);
+  const [activateHubReady, setActivateHubReady] = useState(false);
+  const [activateOwners, setActivateOwners] = useState<HubOwnerOption[]>([]);
+  const [techOwner, setTechOwner] = useState("");
+  const [semanticCode, setSemanticCode] = useState("");
+  const [businessLine, setBusinessLine] = useState("");
+  const [plannedOnlineDate, setPlannedOnlineDate] = useState("");
   // 有预填则隐藏链接框（看板进）；无预填才露出可编辑输入 + 模式二选
   const urlEditable = !feishuStoryUrl.trim();
   // 手动路径：需求任务（默认）/ 日常任务；切走再切回不丢草稿
   const [launchKind, setLaunchKind] = useState<LaunchKind>("requirement");
-  // 目标仓库（预填上次的、过滤掉已从设置删除的）
+  // 目标仓库：每次留空，用户自己选
   const [repoPaths, setRepoPaths] = useState<string[]>([]);
   // QA 被测业务分支（日常模式隐藏、state 保留）
   const [featureBranches, setFeatureBranches] = useState<Record<string, string>>({});
@@ -124,6 +126,10 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const { models: availableModels, fetchModels } = useModels();
   const branchMap = useRepoBranches(repoPaths);
   const [submitting, setSubmitting] = useState(false);
+  // 点启动后才出现的字段校验（Field.error，warning 色）
+  const [fieldErrors, setFieldErrors] = useState<
+    Partial<Record<LaunchFieldErrorKey, string>>
+  >({});
 
   // 手动 + 选了日常 → 轻量态 UI；看板预填恒为需求任务
   const isDailyLaunch = urlEditable && launchKind === "daily";
@@ -145,13 +151,16 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       setPickedModel(defaultModel?.id?.trim() ? defaultModel : { id: "" });
       // v1.1.x：隔离工作区默认值走设置页偏好（只读型用法可默认直跑原仓）、表单可临时改
       setRunInRepo(s.isolateWorktreeDefault === false);
-      const last = readLastLaunch();
-      const validPaths = (last.repoPaths ?? []).filter((p) =>
-        s.repos.some((r) => r.path === p),
-      );
-      // 只配了一个仓库时天然零操作：直接选它
-      if (validPaths.length > 0) setRepoPaths(validPaths);
-      else if (s.repos.length === 1) setRepoPaths([s.repos[0].path]);
+      void fetchWkActivateContext()
+        .then((ctx) => {
+          if (!alive) return;
+          setActivateHubReady(ctx.hubReady);
+          setActivateOwners(ctx.owners);
+          setTechOwner((prev) => prev || matchHubOwnerValue(ctx.owners, ctx.ownerName));
+        })
+        .catch(() => {
+          /* 读不到就当没配 Hub，不挡启动 */
+        });
       if (hasModelCredsForProvider(s, providerId)) {
         void fetchModels({
           ...getModelCredsForProvider(s, providerId),
@@ -182,30 +191,69 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const showWorktreeOptions =
     userRole !== null && roleSupportsWorktree(userRole);
 
-  const canSubmit = useMemo(() => {
-    if (submitting || repoPaths.length === 0) return false;
-    // 需求任务：标题 + 飞书链接必填；日常任务标题选填（空则提交时自动命名）
-    if (!isDailyLaunch) {
-      if (!title.trim()) return false;
-      if (!storyUrl.trim()) return false;
-    }
-    return true;
-  }, [submitting, title, repoPaths, isDailyLaunch, storyUrl]);
+  // 激活块：需求任务 + Hub 已配 + 没手填编号 + 非 QA
+  const showActivate = Boolean(
+    !isDailyLaunch &&
+      userRole !== "qa" &&
+      activateHubReady &&
+      !reqId.trim(),
+  );
+  const activateEnabled = showActivate && wantActivate;
+  const canEnableActivate = activateOwners.length > 0;
 
-  // 缺项引导文案（启动置灰时告诉用户差什么、防隐性卡点）
-  const missingHint = useMemo(() => {
-    if (!isDailyLaunch && !storyUrl.trim()) {
-      return urlEditable
-        ? "粘贴飞书工作项链接即可启动"
-        : "工作项链接缺失、回看板重新进入";
+  const clearFieldError = (key: LaunchFieldErrorKey) => {
+    setFieldErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
+
+  const collectLaunchErrors = (): Partial<
+    Record<LaunchFieldErrorKey, string>
+  > => {
+    const errors: Partial<Record<LaunchFieldErrorKey, string>> = {};
+    if (!isDailyLaunch) {
+      if (!title.trim()) errors.title = "请填写";
+      if (!storyUrl.trim()) {
+        errors.storyUrl = urlEditable
+          ? "请填写"
+          : "工作项链接缺失、回看板重新进入";
+      }
     }
-    if (repoPaths.length === 0) return "选个目标仓库即可启动";
-    if (!isDailyLaunch && !title.trim()) return "填个任务标题即可启动";
-    return null;
-  }, [isDailyLaunch, storyUrl, urlEditable, repoPaths, title]);
+    if (repoPaths.length === 0) errors.repos = "请选择";
+    if (activateEnabled) {
+      Object.assign(
+        errors,
+        wkActivateFieldErrors({
+          semanticCode,
+          businessLine,
+          plannedOnlineDate,
+          techOwner,
+        }),
+      );
+    }
+    return errors;
+  };
 
   const handleLaunch = async () => {
-    if (!canSubmit) return;
+    if (submitting) return;
+    const errors = collectLaunchErrors();
+    if (Object.keys(errors).length > 0) {
+      setFieldErrors(errors);
+      if (errors.storyUrl && !urlEditable) {
+        toast.error(errors.storyUrl);
+      }
+      return;
+    }
+    setFieldErrors({});
+    // 点下去就冻结：激活等待期间再改 worktree 勾选，不能改到即将创建的任务
+    const isolateWorktree = resolveLaunchIsolateWorktree({
+      role: userRole ?? undefined,
+      forceOriginalRepo,
+      runInRepo,
+    });
     setSubmitting(true);
     try {
       const settings = getSettings();
@@ -236,19 +284,40 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         }
       }
 
+      let launchedReqId = isDailyLaunch
+        ? undefined
+        : (reqIdPatchValue(reqId) ?? undefined);
+      if (activateEnabled) {
+        const ownerOpt = activateOwners.find((o) => o.value === techOwner);
+        const activated = await activateWkRequirement({
+          projectUrl: storyUrl.trim(),
+          projectName: title.trim(),
+          semanticCode,
+          businessLine,
+          plannedOnlineDate,
+          techOwner,
+          techOwnerName: ownerOpt?.label,
+        });
+        launchedReqId = activated.reqId;
+        toast.success(
+          activated.alreadyActivated
+            ? `该工作项已激活，使用 ${activated.reqId}`
+            : `已激活 ${activated.reqId}`,
+        );
+      }
+
       const task = await createTask({
         mode: "task",
         // 角色语义随任务固化，后续全局切角色不改变旧任务的分支行为。
         workRole: userRole ?? undefined,
-        // 日常留空 → 自动「日常 · <首仓短名> · MM-DD HH:mm」；需求任务 canSubmit 已拦空标题
+        // 日常留空 → 自动「日常 · <首仓短名> · MM-DD HH:mm」；需求任务提交前 Field 已拦空标题
         title: title.trim()
           ? title.trim()
           : buildDefaultDailyTaskTitle(repoPaths),
         repoPaths,
         // 日常 → 空链接触发服务端轻量态；需求 → 必有链接
         feishuStoryUrl: isDailyLaunch ? undefined : storyUrl.trim() || undefined,
-        // 填了什么存什么、空 = 没有编号（判定与编辑弹窗共用 reqIdPatchValue）
-        reqId: isDailyLaunch ? undefined : (reqIdPatchValue(reqId) ?? undefined),
+        reqId: launchedReqId,
         repoBaseBranches:
           Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
         repoFeatureBranches:
@@ -265,34 +334,22 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
             : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
         // 测试角色永不创建 worktree；其它角色仍按日常 / 用户选择决定。
-        isolateWorktree: resolveLaunchIsolateWorktree({
-          role: userRole ?? undefined,
-          forceOriginalRepo,
-          runInRepo,
-        }),
+        isolateWorktree,
         model,
         provider: pickedProvider,
       });
-      // 记住这次的仓库组合、下次预填零操作（旧 LastLaunch.role 不再写入）
-      try {
-        localStorage.setItem(
-          LAST_LAUNCH_KEY,
-          JSON.stringify({
-            repoPaths,
-          } satisfies LastLaunch),
-        );
-      } catch {
-        /* 存不了不影响主流程 */
-      }
       onCreated(task);
     } catch (err) {
-      toast.error(`创建失败：${(err as Error).message}`);
+      toast.error(`启动失败：${(err as Error).message}`);
       setSubmitting(false);
     }
   };
 
   return (
-    <div className="flex flex-col gap-4 rounded-xl bg-card p-4 text-card-foreground ring-1 ring-foreground/10">
+    <Form
+      disabled={submitting}
+      className="flex flex-col gap-4 rounded-xl bg-card p-4 text-card-foreground ring-1 ring-foreground/10"
+    >
       {/* 手动入口：显式二选，避免「留空链接」隐式触发日常 */}
       {urlEditable && (
         <div className="grid gap-1.5">
@@ -302,7 +359,6 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
               shape="chip"
               selected={launchKind === "requirement"}
               onClick={() => setLaunchKind("requirement")}
-              disabled={submitting}
             >
               需求任务
             </ChoiceButton>
@@ -310,7 +366,6 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
               shape="chip"
               selected={launchKind === "daily"}
               onClick={() => setLaunchKind("daily")}
-              disabled={submitting}
             >
               日常任务
             </ChoiceButton>
@@ -319,95 +374,155 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       )}
 
       {/* 标题：需求任务必填；日常选填（留空提交时自动命名） */}
-      <div className="grid gap-1.5">
-        <Label htmlFor="l-title" required={!isDailyLaunch}>
-          任务标题
-        </Label>
-        <Input
-          id="l-title"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder={isDailyLaunch ? "留空自动命名" : "任务标题"}
-        />
-      </div>
+      <Field
+        htmlFor="l-title"
+        label="任务标题"
+        required={!isDailyLaunch}
+        error={fieldErrors.title}
+      >
+          <Input
+            id="l-title"
+            value={title}
+            onChange={(e) => {
+              setTitle(e.target.value);
+              clearFieldError("title");
+            }}
+            placeholder={isDailyLaunch ? "留空自动命名" : "任务标题"}
+          />
+      </Field>
 
       {/* 飞书链接：需求任务必填（手动可编辑 / 看板预填隐藏）；日常任务整段隐藏、草稿保留 */}
       {urlEditable && !isDailyLaunch && (
-        <div className="grid gap-1.5">
-          <Label htmlFor="l-story-url" required>
-            飞书工作项链接
-          </Label>
+        <Field
+          htmlFor="l-story-url"
+          label="飞书工作项链接"
+          required
+          error={fieldErrors.storyUrl}
+        >
           <Input
             id="l-story-url"
             value={storyUrl}
-            onChange={(e) => setStoryUrl(e.target.value)}
+            onChange={(e) => {
+              setStoryUrl(e.target.value);
+              clearFieldError("storyUrl");
+            }}
             placeholder="粘贴飞书工作项链接"
           />
-        </div>
+        </Field>
+      )}
+
+      {/* 激活在 REQ-ID 上面：勾上后编号由 Hub 生成，不必先填 */}
+      {showActivate && (
+        <WkActivateFields
+          enabled={wantActivate}
+          onEnabledChange={(next) => {
+            setWantActivate(next);
+            if (!next) {
+              setFieldErrors((prev) => {
+                const nextErrors = { ...prev };
+                delete nextErrors.semanticCode;
+                delete nextErrors.businessLine;
+                delete nextErrors.plannedOnlineDate;
+                delete nextErrors.techOwner;
+                return nextErrors;
+              });
+            }
+          }}
+          canEnable={canEnableActivate}
+          owners={activateOwners}
+          techOwner={techOwner}
+          onTechOwnerChange={(next) => {
+            setTechOwner(next);
+            clearFieldError("techOwner");
+          }}
+          semanticCode={semanticCode}
+          onSemanticCodeChange={(next) => {
+            setSemanticCode(next);
+            clearFieldError("semanticCode");
+          }}
+          businessLine={businessLine}
+          onBusinessLineChange={(next) => {
+            setBusinessLine(next);
+            clearFieldError("businessLine");
+          }}
+          plannedOnlineDate={plannedOnlineDate}
+          onPlannedOnlineDateChange={(next) => {
+            setPlannedOnlineDate(next);
+            clearFieldError("plannedOnlineDate");
+          }}
+          errors={{
+            semanticCode: fieldErrors.semanticCode,
+            businessLine: fieldErrors.businessLine,
+            plannedOnlineDate: fieldErrors.plannedOnlineDate,
+            techOwner: fieldErrors.techOwner,
+          }}
+        />
       )}
 
       {/* wk 需求编号：选填、拿到编号后也能在任务详情页补。
           日常任务不出现（推进面板本来就不给日常任务出 wk 流程组） */}
       {!isDailyLaunch && userRole !== "qa" && (
-        <div className="grid gap-1.5">
-          <Label htmlFor="l-req-id">REQ-ID</Label>
+        <Field
+          htmlFor="l-req-id"
+          label="REQ-ID"
+          description={
+            activateEnabled ? "激活后由 Hub 生成" : "可后补"
+          }
+        >
           <Input
             id="l-req-id"
-            value={reqId}
+            value={activateEnabled ? "" : reqId}
+            disabled={activateEnabled}
             onChange={(e) => setReqId(e.target.value)}
-            placeholder="暂无 REQ-ID、可后补"
           />
-        </div>
+        </Field>
       )}
 
-      {/* 仓库（缺项时 warning 高亮引导） */}
-      <div className="grid gap-1.5">
-        <Label required>目标仓库</Label>
+      <Field
+        label="目标仓库"
+        required
+        error={fieldErrors.repos}
+      >
         {repos.length > 0 ? (
-          <div
-            className={
-              repoPaths.length === 0
-                ? "rounded-md ring-1 ring-warning/60"
-                : undefined
-            }
-          >
-            <MultiSelect<RepoConfig>
-              options={repos}
-              value={repoPaths}
-              onChange={setRepoPaths}
-              getKey={(r) => r.path}
-              placeholder="选择仓库（可多选）"
-              renderOption={(r) => (
-                <>
-                  <span className="block w-full truncate font-medium">{r.name}</span>
-                  <span className="block w-full truncate text-xs text-muted-foreground">
-                    {r.path}
-                  </span>
-                </>
-              )}
-              renderTrigger={(selected) => {
-                if (selected.length === 1) {
-                  const r = selected[0]!;
-                  return (
-                    <>
-                      <span className="shrink-0 font-medium">{r.name}</span>
-                      <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                        {r.path}
-                      </span>
-                    </>
-                  );
-                }
+          <MultiSelect<RepoConfig>
+            options={repos}
+            value={repoPaths}
+            onChange={(next) => {
+              setRepoPaths(next);
+              if (next.length > 0) clearFieldError("repos");
+            }}
+            getKey={(r) => r.path}
+            placeholder="选择仓库（可多选）"
+            renderOption={(r) => (
+              <>
+                <span className="block w-full truncate font-medium">{r.name}</span>
+                <span className="block w-full truncate text-xs text-muted-foreground">
+                  {r.path}
+                </span>
+              </>
+            )}
+            renderTrigger={(selected) => {
+              if (selected.length === 1) {
+                const r = selected[0]!;
                 return (
                   <>
-                    <span className="shrink-0 font-medium">已选 {selected.length} 个</span>
+                    <span className="shrink-0 font-medium">{r.name}</span>
                     <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                      {selected.map((r) => r.name).join(" + ")}
+                      {r.path}
                     </span>
                   </>
                 );
-              }}
-            />
-          </div>
+              }
+              return (
+                <>
+                  <span className="shrink-0 font-medium">已选 {selected.length} 个</span>
+                  <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                    {selected.map((r) => r.name).join(" + ")}
+                  </span>
+                </>
+              );
+            }}
+          />
         ) : (
           <EmptyHint size="sm">
             还没配置仓库——
@@ -419,7 +534,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
             </a>
           </EmptyHint>
         )}
-      </div>
+      </Field>
 
       {/* 角色选择已隐藏（v1.1.x 用户拍板「去掉」）：默认自适应——AI 从需求 + 仓库
           自己判断视角、比每单点一次枚举更省；字段保留在数据层、editing 兜底 */}
@@ -506,6 +621,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
           <Button
             type="button"
             variant="ghost"
+            disabled={submitting}
             onClick={() => setMcpExpanded((v) => !v)}
             className="h-auto w-full justify-start rounded-none rounded-t-md px-3 py-2 text-sm font-medium text-foreground/90"
           >
@@ -548,16 +664,17 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
           </CheckboxRow>
         ))}
 
-      {/* 启动 + 缺项引导 */}
+      {/* 启动：缺项点下去对应 Field 闪红圈，不在按钮旁跟黄字 */}
       <div className="flex items-center gap-3">
-        <Button onClick={handleLaunch} disabled={!canSubmit} className="gap-1.5">
+        <Button onClick={handleLaunch} disabled={submitting} className="gap-1.5">
           <Rocket className="size-4" />
-          {submitting ? "创建中…" : "启动任务"}
+          {submitting
+            ? activateEnabled
+              ? "激活中…"
+              : "创建中…"
+            : "启动任务"}
         </Button>
-        {missingHint && (
-          <span className="text-xs text-warning">{missingHint}</span>
-        )}
       </div>
-    </div>
+    </Form>
   );
 };

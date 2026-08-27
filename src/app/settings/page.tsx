@@ -59,7 +59,9 @@ import { CheckUpdateButton } from "@/components/settings/check-update-button";
 import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
 import { FeishuCliSection } from "@/components/settings/feishu-cli-card";
 import { WkHarnessSection } from "@/components/settings/wk-harness-card";
+import { useWhatsNew } from "@/components/whats-new-host";
 import { emptyCompanyEnv } from "@/lib/company-env";
+import { hasWhatsNewFor } from "@/lib/whats-new";
 
 // 左侧锚点导航（六组）：id 同 ?focus= 新取值
 const NAV_ITEMS: Array<{ focus: string; label: string }> = [
@@ -91,6 +93,7 @@ const CAPABILITY_FOCUS: Record<string, string> = {
 
 const SettingsPage = () => {
   const router = useRouter();
+  const { openCurrent: openWhatsNew } = useWhatsNew();
   const { settings, loaded, update, saveFieldValue } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
   // API Key 归属信息（Cursor.me）——拉模型时顺便拉、展示在 Key 下面
@@ -278,6 +281,16 @@ const SettingsPage = () => {
                 </span>
               </Tooltip>
             )}
+            {appVersion && hasWhatsNewFor(appVersion) ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-xs text-muted-foreground"
+                onClick={openWhatsNew}
+              >
+                本版更新
+              </Button>
+            ) : null}
             <DiagnosticsButton />
             <CheckUpdateButton />
           </div>
@@ -361,14 +374,6 @@ const SettingsPage = () => {
                 onFeishuChatBridgeChange={(v) =>
                   saveFieldValue("feishuChatBridge", v)
                 }
-                feishuBridgeKeepAwake={settings.feishuBridgeKeepAwake !== false}
-                onFeishuBridgeKeepAwakeChange={(v) =>
-                  saveFieldValue("feishuBridgeKeepAwake", v)
-                }
-                feishuBridgeStreaming={settings.feishuBridgeStreaming !== false}
-                onFeishuBridgeStreamingChange={(v) =>
-                  saveFieldValue("feishuBridgeStreaming", v)
-                }
               />
               <Separator />
               <CompanyEnvSection
@@ -421,6 +426,10 @@ const SettingsPage = () => {
                 isolateWorktreeDefault={settings.isolateWorktreeDefault ?? true}
                 onIsolateWorktreeDefaultChange={(v) =>
                   saveFieldValue("isolateWorktreeDefault", v)
+                }
+                feishuBridgeKeepAwake={settings.feishuBridgeKeepAwake !== false}
+                onFeishuBridgeKeepAwakeChange={(v) =>
+                  saveFieldValue("feishuBridgeKeepAwake", v)
                 }
                 />
             </CardContent>

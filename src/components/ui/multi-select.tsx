@@ -25,6 +25,7 @@ interface MultiSelectProps<T> {
   renderTrigger?: (selected: T[]) => ReactNode;
   // 未选时 trigger 占位
   placeholder?: ReactNode;
+  invalid?: boolean;
 }
 
 export const MultiSelect = <T,>({
@@ -35,6 +36,7 @@ export const MultiSelect = <T,>({
   renderOption,
   renderTrigger,
   placeholder,
+  invalid,
 }: MultiSelectProps<T>) => {
   const pickerOptions = useMemo(
     () =>
@@ -59,6 +61,7 @@ export const MultiSelect = <T,>({
       options={pickerOptions}
       value={value}
       onChange={onChange}
+      invalid={invalid}
       renderTrigger={() => {
         if (renderTrigger) return renderTrigger(selectedItems);
         if (selectedItems.length === 0) {

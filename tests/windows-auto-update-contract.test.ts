@@ -40,13 +40,15 @@ describe("Windows 自动更新安装器不会被 Flowship 自己杀掉", () => {
     expect(body).toContain('CreateShortCut "$newStartMenuLink" "$appExe"');
   });
 
-  it("仍以静默安装并强制拉起新版本，退出时按 server PID 精确清理", () => {
+  it("仍以静默安装并强制拉起新版本，退出时按 server PID 精确清理；退出不再自动装", () => {
     expect(main).toContain("winAutoUpdater.quitAndInstall(true, true)");
+    expect(main).toContain("winAutoUpdater.autoInstallOnAppQuit = false");
     expect(main).toContain(
       "winAutoUpdater.installDirectory = path.dirname(process.execPath)",
     );
     expect(main).toContain(
       'execFileSync("taskkill", ["/PID", String(serverProc.pid), "/T", "/F"]',
     );
+    expect(main).not.toContain("promptWinInstall");
   });
 });
