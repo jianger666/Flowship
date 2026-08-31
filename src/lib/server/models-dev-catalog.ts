@@ -52,10 +52,10 @@ type CatalogCache = {
 
 const cacheSlot = (): CatalogCache => {
   const g = globalThis as unknown as {
-    __flowshipModelsDevV2?: CatalogCache;
+    __flowshipModelsDevV3?: CatalogCache;
   };
-  if (!g.__flowshipModelsDevV2) {
-    g.__flowshipModelsDevV2 = {
+  if (!g.__flowshipModelsDevV3) {
+    g.__flowshipModelsDevV3 = {
       index: new Map(),
       routeIndex: new Map(),
       ts: 0,
@@ -63,7 +63,7 @@ const cacheSlot = (): CatalogCache => {
       inflight: null,
     };
   }
-  return g.__flowshipModelsDevV2;
+  return g.__flowshipModelsDevV3;
 };
 
 /** models.dev：`attachment: true` 或 `modalities.input` 含 image */
@@ -81,6 +81,23 @@ export const catalogPiInputModalities = (
   imageInput: boolean | null | undefined,
 ): Array<"text" | "image"> => (imageInput ? ["text", "image"] : ["text"]);
 
+const parsePositiveInt = (v: unknown): number | undefined => {
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.round(v);
+  if (typeof v === "string" && /^\d+$/.test(v.trim())) {
+    const n = Number(v.trim());
+    return n > 0 ? n : undefined;
+  }
+  return undefined;
+};
+
+/** models.dev `limit.context` → pi contextWindow；没有就不猜 */
+export const catalogWindowFromModel = (model: unknown): number | undefined => {
+  if (!model || typeof model !== "object") return undefined;
+  const limit = (model as { limit?: unknown }).limit;
+  if (!limit || typeof limit !== "object") return undefined;
+  return parsePositiveInt((limit as { context?: unknown }).context);
+};
+
 const consider = (
   index: Map<string, CatalogReasoning>,
   key: string,
@@ -93,13 +110,22 @@ const consider = (
     index.set(k, {
       ...rec,
       imageInput: Boolean(rec.imageInput || prev?.imageInput),
+      contextWindow: rec.contextWindow ?? prev?.contextWindow,
     });
     return;
   }
-  // 档位仍跟高优先级来源；图像能力任一来源标了就算
+  // 档位仍跟高优先级来源；图像能力 / 窗口任一来源有就补上
+  const next: CatalogReasoning = { ...prev };
+  let changed = false;
   if (rec.imageInput && !prev.imageInput) {
-    index.set(k, { ...prev, imageInput: true });
+    next.imageInput = true;
+    changed = true;
   }
+  if (rec.contextWindow && !prev.contextWindow) {
+    next.contextWindow = rec.contextWindow;
+    changed = true;
+  }
+  if (changed) index.set(k, next);
 };
 
 /** 从 api.json 建 id → reasoning 索引；同 id 优先 opencode，再官方实验室 */
@@ -118,6 +144,7 @@ export const buildModelsDevIndex = (
       models as Record<string, unknown>,
     )) {
       if (!model || typeof model !== "object") continue;
+      const contextWindow = catalogWindowFromModel(model);
       const rec: CatalogReasoning = {
         providerId,
         reasoning: Boolean((model as { reasoning?: unknown }).reasoning),
@@ -125,6 +152,7 @@ export const buildModelsDevIndex = (
           (model as { reasoning_options?: unknown }).reasoning_options,
         ),
         imageInput: catalogModelHasImageInput(model),
+        ...(contextWindow ? { contextWindow } : {}),
       };
       consider(index, modelId, rec);
       const slash = modelId.lastIndexOf("/");

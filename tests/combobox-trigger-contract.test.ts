@@ -37,6 +37,26 @@ describe("Picker Popover 触发器", () => {
     expect(root.indexOf("<div")).toBeLessThan(root.indexOf("<PopoverTrigger"));
     expect(root.indexOf("<PopoverContent")).toBeGreaterThan(root.indexOf("<PopoverTrigger"));
   });
+
+  it("trigger 带 min-w-0，长文案不把右侧清空按钮挤出父容器", () => {
+    expect(pickerSource).toContain(
+      '"flex h-9 w-full min-w-0 items-center justify-between gap-1.5',
+    );
+  });
+});
+
+describe("Combobox 手填范围", () => {
+  const readSrc = (rel: string) =>
+    readFileSync(path.resolve(import.meta.dirname, "..", rel), "utf-8");
+
+  it("默认不许造新值；只有环境字段和 git 探测失败才开「使用 xxx」", () => {
+    expect(comboboxSource).toContain("allowCustom = false");
+    const companyEnv = readSrc("src/components/settings/company-env-card.tsx");
+    expect(companyEnv.match(/allowCustom/g)?.length).toBe(4);
+    const repoCard = readSrc("src/components/settings/repo-card.tsx");
+    expect(repoCard).toContain("allowCustom={Boolean(entry?.gitMissing)}");
+    expect(repoCard).not.toContain("allowCustom={true}");
+  });
 });
 
 describe("Popover 定位", () => {

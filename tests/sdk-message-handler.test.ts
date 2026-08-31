@@ -604,3 +604,91 @@ describe("handleSdkMessage task 工具 args 短字段前置 + 截断", () => {
     expect(parsed![39]?.content).toContain("Task 40:");
   });
 });
+
+describe("handleSdkMessage 自定义 pi 压缩", () => {
+  beforeEach(() => {
+    writeOwnedEventAndPublish.mockClear();
+    appendEvent.mockClear();
+  });
+
+  const infoEvents = (): WrittenEvent[] =>
+    writeOwnedEventAndPublish.mock.calls
+      .map((c) => c[2])
+      .filter((e): e is WrittenEvent => e != null && e.kind === "info");
+
+  it("compaction_start/end 落过程行，不 flush assistant_message", async () => {
+    const flush = vi.fn(async () => {});
+    const ctx: AssistantBufferCtx = { buffer: "结论：可合", flush };
+
+    await handleSdkMessage(
+      "task-1",
+      { type: "compaction_start", reason: "overflow" } as never,
+      ctx,
+      leaseOk,
+    );
+    await handleSdkMessage(
+      "task-1",
+      { type: "compaction_end", reason: "overflow", aborted: false } as never,
+      ctx,
+      leaseOk,
+    );
+
+    expect(flush).not.toHaveBeenCalled();
+    expect(ctx.buffer).toBe("结论：可合");
+    expect(infoEvents()).toEqual([
+      {
+        kind: "info",
+        text: "正在压缩上下文…",
+        meta: { kind: "compaction", status: "running", reason: "overflow" },
+      },
+      {
+        kind: "info",
+        text: "已压缩上下文",
+        meta: { kind: "compaction", status: "done", reason: "overflow" },
+      },
+    ]);
+  });
+
+  it("compaction_end aborted → 压缩已取消", async () => {
+    const flush = vi.fn(async () => {});
+    await handleSdkMessage(
+      "task-1",
+      { type: "compaction_end", aborted: true } as never,
+      { buffer: "", flush },
+      leaseOk,
+    );
+    expect(flush).not.toHaveBeenCalled();
+    expect(infoEvents()[0]).toMatchObject({
+      text: "压缩已取消",
+      meta: { kind: "compaction", status: "aborted" },
+    });
+  });
+
+  it("compaction_end willRetry 不落完成行", async () => {
+    const flush = vi.fn(async () => {});
+    await handleSdkMessage(
+      "task-1",
+      { type: "compaction_start", reason: "overflow" } as never,
+      { buffer: "", flush },
+      leaseOk,
+    );
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "compaction_end",
+        reason: "overflow",
+        aborted: false,
+        willRetry: true,
+      } as never,
+      { buffer: "", flush },
+      leaseOk,
+    );
+    expect(infoEvents()).toEqual([
+      {
+        kind: "info",
+        text: "正在压缩上下文…",
+        meta: { kind: "compaction", status: "running", reason: "overflow" },
+      },
+    ]);
+  });
+});

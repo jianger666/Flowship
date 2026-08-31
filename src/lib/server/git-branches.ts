@@ -71,7 +71,7 @@ export const readGitBranchState = async (
  *
  * 跟 readGitBranchState 的区别：线上 / test / develop 这类长期分支本地常常没 checkout 过、
  * 只列本地分支会缺——所以一并列 refs/remotes、去掉 remote 名前缀后合并。
- * 不主动 git fetch（慢 + 可能要凭据）、用本地已知的 refs；列表缺分支时前端 Combobox 支持手填兜底。
+ * 不主动 git fetch（慢 + 可能要凭据）、用本地已知的 refs。前端 Combobox 只从这份列表选，搜不到不造新值。
  */
 export const listRepoBranches = async (dir: string): Promise<RepoBranchList> => {
   const empty: RepoBranchList = { isRepo: false, branches: [] };

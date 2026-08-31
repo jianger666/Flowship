@@ -6,7 +6,7 @@
  * ③ send 失主回滚 × B 已 running → idle 不落
  * ④ close 迟到清锚点 × B 已落新锚点 → 保留 B
  * ⑤ preamble × B checkpoint 半程（map 空）→ 不写重连事件
- * ⑥ 正常路径回归（ask 切 awaiting、失主回滚 idle、关会话清锚点）
+ * ⑥ 正常路径回归（ask 保持 running + pending、失主回滚 idle、关会话清锚点）
  *
  * Mock 手法对齐 chat-finalize-r28-2 / ownership-r27-matrix。
  */
@@ -74,7 +74,9 @@ const { clearChatGate } = await import("@/lib/server/chat-gate");
 const { setFailpoint, clearFailpoints } = await import(
   "@/lib/server/failpoints"
 );
-const { getExpectedCallerToken } = await import("@/lib/server/chat-pending");
+const { getExpectedCallerToken, getPendingAsk } = await import(
+  "@/lib/server/chat-pending"
+);
 const { dispatchAskUser } = await import("@/lib/server/flowship-tools");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
@@ -471,9 +473,9 @@ describe("R29 chat 旁路共享写", () => {
   );
 
   it(
-    "⑥ 正常路径：ask 切 awaiting、失主回滚 idle、关会话清锚点",
+    "⑥ 正常路径：ask 保持 running、失主回滚 idle、关会话清锚点",
     async () => {
-      // 6a：ask 正常切 awaiting_user
+      // 6a：同一轮还在跑，ask 不切 awaiting_user；输入条看 pending
       const runA = makeControllableRun("finished");
       mockCreate.mockResolvedValueOnce({
         agentId: AGENT_A,
@@ -496,11 +498,11 @@ describe("R29 chat 旁路共享写", () => {
       });
       expect(askOk).toMatchObject({ ok: true });
       for (let i = 0; i < 40; i++) {
-        const m = await readMetaV06(TASK_ID);
-        if (m?.runStatus === "awaiting_user") break;
+        if (getPendingAsk(TASK_ID)) break;
         await new Promise((r) => setTimeout(r, 20));
       }
-      expect((await readMetaV06(TASK_ID))?.runStatus).toBe("awaiting_user");
+      expect(getPendingAsk(TASK_ID)).toBeTruthy();
+      expect((await readMetaV06(TASK_ID))?.runStatus).toBe("running");
 
       // 6b：关会话清锚点（持槽 close → 条件清匹配本 agentId）
       forceClearChatRun(TASK_ID);

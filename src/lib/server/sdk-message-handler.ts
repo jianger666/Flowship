@@ -4,6 +4,7 @@
  *
  * 职责：把 SDK run.stream() 吐的每条消息翻译成 events.jsonl 事件 + SSE publish：
  *   - thinking / tool_call / tool_result / assistant（流式缓冲）/ status
+ *   - compaction_start/end（自定义 pi 合成消息 → info 过程行；不 flush 正文）
  *   - artifact 写入检测（write/edit 命中 actions/ 路径 → 「在写 artifact」+ 落盘后刷 artifactUpdatedAt）
  *   - submit_work 特判（状态由 awaitingNotifier 管、这里只记 error）
  *
@@ -11,6 +12,11 @@
  */
 
 import type { SDKMessage } from "@cursor/sdk";
+
+import {
+  compactionEventMeta,
+  compactionEventText,
+} from "@/lib/compaction-display";
 
 import { appendEvent, getTask, patchActionIfOwner } from "./task-fs";
 import { failpoint } from "./failpoints";
@@ -399,6 +405,31 @@ export const handleSdkMessage = async (
     ev: Parameters<typeof writeOwnedEventAndPublish>[2],
   ): Promise<unknown> =>
     writeOwnedEventAndPublish(taskId, stillCurrent, ev, origin);
+
+  // 自定义 pi 压缩：合成 type，不在 SDKMessage 联合里。只冲 delta 帧（入口已做），
+  // 不 flush assistant_message——压缩代表这轮还没结束，光标继续挂着。
+  const rawType = (msg as { type?: string }).type;
+  if (rawType === "compaction_start" || rawType === "compaction_end") {
+    const start = rawType === "compaction_start";
+    const compactionMsg = msg as unknown as {
+      aborted?: boolean;
+      reason?: unknown;
+      willRetry?: boolean;
+    };
+    const aborted = Boolean(compactionMsg.aborted);
+    const willRetry = Boolean(compactionMsg.willRetry);
+    // 摘要还在重试：保持「正在压缩」那一行，不要连落两条「已压缩」
+    if (!start && willRetry && !aborted) return;
+    const reason =
+      typeof compactionMsg.reason === "string" ? compactionMsg.reason : undefined;
+    if (!stillCurrent()) return;
+    await writeEv({
+      kind: "info",
+      text: compactionEventText({ start, aborted }),
+      meta: compactionEventMeta({ start, aborted, reason }),
+    });
+    return;
+  }
 
   switch (msg.type) {
     case "thinking": {

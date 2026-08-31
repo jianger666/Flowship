@@ -23,8 +23,8 @@ importers:
         specifier: 1.7.0
         version: 1.7.0(@bufbuild/protobuf@1.10.0)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.0))
       '@cursor/sdk':
-        specifier: ^1.0.26
-        version: 1.0.26
+        specifier: ^1.0.30
+        version: 1.0.30
       '@earendil-works/pi-agent-core':
         specifier: 0.84.2
         version: 0.84.2(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
@@ -507,38 +507,38 @@ packages:
     peerDependencies:
       '@bufbuild/protobuf': ^1.10.0
 
-  '@cursor/sdk-darwin-arm64@1.0.26':
-    resolution: {integrity: sha512-PPWtq/8ax4w3/5vh45lMbFpwnXsyvYMl3eR9uW4C2SXScgrtE2V2LfhEU66f1zAt9RKHi2BTTjkuZEnxKJEz+Q==}
+  '@cursor/sdk-darwin-arm64@1.0.30':
+    resolution: {integrity: sha512-O0w2fLd6jxrvAUOJGsKBs8VSi5OojqqEOMFBzHTHS82wU/DX3ZlizK3czzCXxDKs3l8j/BVQwVCxP9jMFcf41Q==}
     cpu: [arm64]
     os: [darwin]
     hasBin: true
 
-  '@cursor/sdk-darwin-x64@1.0.26':
-    resolution: {integrity: sha512-3WJGk1SV0tYTAQY2+PWSzNui6jGp9F7sLUm257EI3bhc7g6h6xCzrLY7wIpD03IEaNdM7emcgVySEN1D0QWsHg==}
+  '@cursor/sdk-darwin-x64@1.0.30':
+    resolution: {integrity: sha512-TdjreV7V6gtSKbUaXDarfE1735PES6uzLgLxp42E5kT6EXpjQhKsifdsYOMdsO/RBw166kya/XxG24L/FUfEHA==}
     cpu: [x64]
     os: [darwin]
     hasBin: true
 
-  '@cursor/sdk-linux-arm64@1.0.26':
-    resolution: {integrity: sha512-DF+zZTn4mszX5q9J3rj9xk7rDu8/JEMfpdDA/UBp3CyaeLo1sPfB/vyoe4GUo1F3I1ZRAgUO8KdBizoHxfBEeQ==}
+  '@cursor/sdk-linux-arm64@1.0.30':
+    resolution: {integrity: sha512-1+bsmri6vJ2YuqL/SQ6QSx/ymu2eBzjGgT1bTgN47tCzxDgNOKacXtghpx4zdHM5AmOtT+aLXVVxXjStXmNtcA==}
     cpu: [arm64]
     os: [linux]
     hasBin: true
 
-  '@cursor/sdk-linux-x64@1.0.26':
-    resolution: {integrity: sha512-NnBvOzgGFXJpKygIdk6XzAcstBSdLjtKZyzLg2jLM0d7KkEDs3br94XsyNAvbVqnWhT18KPwHzrgP62ZEHEFxg==}
+  '@cursor/sdk-linux-x64@1.0.30':
+    resolution: {integrity: sha512-5TRAM1xNwVr0Lox2ay5U5h+VY1OeqJLgnS28da7mx+ZkmeAU+hzuUFq2/lcIqoJrp2qBRdUH5WzI44JNtjBKmg==}
     cpu: [x64]
     os: [linux]
     hasBin: true
 
-  '@cursor/sdk-win32-x64@1.0.26':
-    resolution: {integrity: sha512-C2PyFwmQNJH9qlqYF+Zhpdyh50500cNm2ortmrtzjqgGSFQ+t4WvzMKqSc/UadCT0oNGWFGyiyMnUpO3sLa0nA==}
+  '@cursor/sdk-win32-x64@1.0.30':
+    resolution: {integrity: sha512-kVjpWmLTFLL131TQm3ytz1HbAeyjBRAHMtr6vyLtbBMuLBb0la5igvt58Xi8mXwekymWXim1+rZj7ZYUO3K1rw==}
     cpu: [x64]
     os: [win32]
     hasBin: true
 
-  '@cursor/sdk@1.0.26':
-    resolution: {integrity: sha512-dU3WpJwrxv8yoMjs0DxBgZr5btAJEO+NrvFutl08b6l2+jcuemfFWUlSPBQ2xZAH7zIZun+sqfHvjT5NxW8woQ==}
+  '@cursor/sdk@1.0.30':
+    resolution: {integrity: sha512-s3gIXfTD3w8ys+KFE81JjjoiJcynkHsf/JCDyXrnbliIac3dkT59hwYZII3XhsT1DlXIfqg+YzSMru6w1CkZow==}
     engines: {node: '>=22.13'}
 
   '@date-fns/tz@1.5.0':
@@ -6588,22 +6588,22 @@ snapshots:
     dependencies:
       '@bufbuild/protobuf': 1.10.0
 
-  '@cursor/sdk-darwin-arm64@1.0.26':
+  '@cursor/sdk-darwin-arm64@1.0.30':
     optional: true
 
-  '@cursor/sdk-darwin-x64@1.0.26':
+  '@cursor/sdk-darwin-x64@1.0.30':
     optional: true
 
-  '@cursor/sdk-linux-arm64@1.0.26':
+  '@cursor/sdk-linux-arm64@1.0.30':
     optional: true
 
-  '@cursor/sdk-linux-x64@1.0.26':
+  '@cursor/sdk-linux-x64@1.0.30':
     optional: true
 
-  '@cursor/sdk-win32-x64@1.0.26':
+  '@cursor/sdk-win32-x64@1.0.30':
     optional: true
 
-  '@cursor/sdk@1.0.26':
+  '@cursor/sdk@1.0.30':
     dependencies:
       '@bufbuild/protobuf': 1.10.0
       '@connectrpc/connect': 1.7.0(@bufbuild/protobuf@1.10.0)
@@ -6612,11 +6612,11 @@ snapshots:
       '@statsig/js-client': 3.31.0
       zod: 3.25.76
     optionalDependencies:
-      '@cursor/sdk-darwin-arm64': 1.0.26
-      '@cursor/sdk-darwin-x64': 1.0.26
-      '@cursor/sdk-linux-arm64': 1.0.26
-      '@cursor/sdk-linux-x64': 1.0.26
-      '@cursor/sdk-win32-x64': 1.0.26
+      '@cursor/sdk-darwin-arm64': 1.0.30
+      '@cursor/sdk-darwin-x64': 1.0.30
+      '@cursor/sdk-linux-arm64': 1.0.30
+      '@cursor/sdk-linux-x64': 1.0.30
+      '@cursor/sdk-win32-x64': 1.0.30
 
   '@date-fns/tz@1.5.0': {}
 

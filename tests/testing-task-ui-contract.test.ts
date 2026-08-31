@@ -16,7 +16,7 @@ describe("测试任务创建与编辑交互", () => {
     expect(edit).toContain("补上后从下一个 Action 起生效");
   });
 
-  it("测试任务不展示 REQ-ID，并且业务分支在探测失败时仍允许手填", () => {
+  it("测试任务不展示 REQ-ID", () => {
     const launch = readSrc("src/components/tasks/task-launch-form.tsx");
     const edit = readSrc("src/components/tasks/edit-task-dialog.tsx");
     expect(launch).toContain('!isDailyLaunch && userRole !== "qa"');
@@ -26,5 +26,16 @@ describe("测试任务创建与编辑交互", () => {
     expect(launch).toContain('label="REQ-ID"');
     expect(edit).toContain('<Label htmlFor="edit-req-id">REQ-ID</Label>');
     expect(`${launch}\n${edit}`).not.toContain(">需求编号</Label>");
+  });
+
+  it("被测业务分支 Combobox 把 flex-1 打在 wrapper 上，且默认不许造新分支名", () => {
+    const launch = readSrc("src/components/tasks/task-launch-form.tsx");
+    const edit = readSrc("src/components/tasks/edit-task-dialog.tsx");
+    for (const src of [launch, edit]) {
+      expect(src).toContain('wrapperClassName="w-auto min-w-0 flex-1"');
+      expect(src).toContain("allowCustom={Boolean(entry?.gitMissing)}");
+      expect(src).not.toContain("className=\"min-w-0 flex-1\"");
+      expect(src).not.toContain("可在上方直接输入业务分支");
+    }
   });
 });

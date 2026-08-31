@@ -13,6 +13,11 @@
 
 import type { InteractionUpdate } from "@cursor/sdk";
 
+import {
+  compactionEventMeta,
+  compactionEventText,
+} from "@/lib/compaction-display";
+
 import { publish, writeOwnedEventAndPublish } from "./task-stream";
 
 const FLUSH_INTERVAL_MS = 500;
@@ -136,9 +141,9 @@ export const createShellOutputDeltaPublisher = (
 };
 
 /**
- * 监听 SDK 自带 in-place summarization（summary-started / summary / summary-completed）。
- * summary-completed 时落一条 info 事件；summary-started 只打日志（避免半程失败留孤儿提示）。
- * 写事件是 async——火忘、不阻塞 onDelta 同步签名。
+ * Cursor SDK in-place summarization = 压缩上下文。
+ * `summary-started` 立刻落「正在压缩上下文…」过程行（跟 pi compaction_start 同一套展示）；
+ * `summary-completed` 再落完成行。start/end 串行写，避免火忘乱序。
  *
  * @param lease 绑 instanceId / opHandle——失主丢弃迟到 summary 事件
  */
@@ -148,48 +153,86 @@ export const createSdkSummaryDeltaPublisher = (
 ): ((args: { update: InteractionUpdate }) => void) => {
   // 暂存最近一次 summary 文本字数（summary update 通常先于 summary-completed）
   let lastSummaryChars: number | undefined;
+  // 已经挂过「正在压缩」——summary 正文只补字数，不再落第二条 running
+  let startedEmitted = false;
+  // onDelta 是同步签名：写事件排队，保证 started 先于 completed
+  let writeChain = Promise.resolve();
+
+  const enqueueWrite = (event: {
+    text: string;
+    meta: Record<string, unknown>;
+  }): void => {
+    writeChain = writeChain
+      .then(async () => {
+        if (!lease()) return;
+        await writeOwnedEventAndPublish(taskId, lease, {
+          kind: "info",
+          text: event.text,
+          meta: event.meta,
+        });
+      })
+      .catch((err) => {
+        console.warn(`[sdk-summary] task=${taskId} 写事件失败:`, err);
+      });
+  };
 
   return (args: { update: InteractionUpdate }): void => {
     try {
       const { update } = args;
+      const type = String(update.type);
+      const looksLikeSummary =
+        type === "summary-started" ||
+        type === "summary" ||
+        type === "summary-completed" ||
+        (typeof type === "string" && /summar/i.test(type));
 
-      if (update.type === "summary-started") {
+      if (looksLikeSummary && !lease()) {
+        console.warn(`[sdk-summary] task=${taskId} type=${type} 已失主，丢弃`);
+        return;
+      }
+
+      if (type === "summary-started" || type === "summarization-started") {
         lastSummaryChars = undefined;
-        console.log(`[sdk-summary] task=${taskId} summary-started`);
+        startedEmitted = true;
+        enqueueWrite({
+          text: compactionEventText({ start: true }),
+          meta: compactionEventMeta({ start: true, reason: "sdk" }),
+        });
         return;
       }
 
-      if (update.type === "summary") {
-        const text = typeof update.summary === "string" ? update.summary : "";
+      if (type === "summary" || type === "summarization") {
+        const text =
+          typeof (update as { summary?: unknown }).summary === "string"
+            ? (update as { summary: string }).summary
+            : "";
         lastSummaryChars = text.length;
+        // 有的 SDK 版本跳过 started，收到摘要正文才挂过程行
+        if (!startedEmitted) {
+          startedEmitted = true;
+          enqueueWrite({
+            text: compactionEventText({ start: true }),
+            meta: compactionEventMeta({ start: true, reason: "sdk" }),
+          });
+        }
         return;
       }
 
-      if (update.type !== "summary-completed") return;
+      if (type !== "summary-completed" && type !== "summarization-completed") {
+        return;
+      }
+
+      startedEmitted = false;
 
       const summaryChars = lastSummaryChars;
       lastSummaryChars = undefined;
-      console.log(
-        `[sdk-summary] task=${taskId} summary-completed` +
-          (summaryChars != null ? ` chars=${summaryChars}` : ""),
-      );
-
-      // onDelta 同步签名——写事件火忘，失主由 lease 挡住
-      void (async () => {
-        try {
-          if (!lease()) return;
-          await writeOwnedEventAndPublish(taskId, lease, {
-            kind: "info",
-            text: "上下文过长，SDK 已自动压缩会话",
-            meta: {
-              kind: "sdk_summary",
-              ...(summaryChars != null ? { summaryChars } : {}),
-            },
-          });
-        } catch (err) {
-          console.warn(`[sdk-summary] task=${taskId} 写事件失败:`, err);
-        }
-      })();
+      enqueueWrite({
+        text: compactionEventText({ start: false }),
+        meta: {
+          ...compactionEventMeta({ start: false, reason: "sdk" }),
+          ...(summaryChars != null ? { summaryChars } : {}),
+        },
+      });
     } catch (err) {
       console.warn(`[sdk-summary] onDelta 失败 task=${taskId}`, err);
     }

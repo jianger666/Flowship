@@ -44,6 +44,11 @@ export type CatalogReasoning = {
    * 不能盖掉 zai / opencode 的多模态条。
    */
   imageInput?: boolean;
+  /**
+   * models.dev `limit.context`。pi 用它当 contextWindow：写小了会过早 overflow 压缩，
+   * 压缩后剩余输出配额也被卡死（实测 12.8 万窗口 + 21 万 input → 空 thinking / 没正文）。
+   */
+  contextWindow?: number;
 };
 
 export type ThinkingLevelMap = Partial<

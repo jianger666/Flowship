@@ -162,6 +162,7 @@ describe("渲染管线分层：流式 chunk 不许重跑事件管线", () => {
   it("虚拟项那层（跟着 chunk 变的那层）不许再调 buildStreamItems", () => {
     const items = sliceBalanced(eventStream, "const items: RenderItem[] = useMemo", "(");
     expect(items).toContain("streamingText");
+    expect(items).toContain("insertBeforeTrailingCompaction");
     expect(items).not.toContain("buildStreamItems");
   });
 });

@@ -80,6 +80,7 @@ import {
   saveScrollAnchor,
 } from "@/lib/view-memory";
 import type { Task, TaskEvent } from "@/lib/types";
+import { insertBeforeTrailingCompaction, isCompactionInfo } from "@/lib/compaction-display";
 
 import {
   deriveActiveStatus,
@@ -108,6 +109,7 @@ import {
 } from "./event-stream/utils";
 import {
   AskUserRequestRow,
+  CompactionRow,
   EventRow,
   PendingLocalReplyRow,
   ReconnectingRow,
@@ -677,10 +679,13 @@ const EventStreamImpl = ({
       ),
     ];
     if (streamingText) {
-      return [
-        ...withPending,
-        { kind: "__streaming__", id: "__streaming__", text: streamingText },
-      ];
+      // 压缩 info 会落在 events 尾部；流式气泡默认拼末尾会跑到压缩上面。
+      // 插到尾部连续 compaction 之前，视觉上是「回复 → 正在压缩」。
+      return insertBeforeTrailingCompaction(withPending, {
+        kind: "__streaming__",
+        id: "__streaming__",
+        text: streamingText,
+      });
     }
     // F 批次：启动链进度（正在检查 MCP / 创建会话 / 发送首包）——
     // 渐进单行（经最小停留缓冲挨个切换）；agent 活动后整组消失。
@@ -1692,6 +1697,9 @@ const EventStreamImpl = ({
                 ) : item.kind === "info" && item.meta?.kind === "reconnecting" ? (
                   // V0.13.x 自动重连过程行（spinner、同 thinking 一档的细行）
                   <ReconnectingRow ev={item} events={task.events} />
+                ) : isCompactionInfo(item) ? (
+                  // 自定义 pi 压缩：跟重连同档，不要走普通 info 灰细线
+                  <CompactionRow ev={item} events={task.events} isRunning={isRunning} />
                 ) : (
                   <EventRow
                     ev={item}

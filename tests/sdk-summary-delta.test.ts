@@ -53,7 +53,7 @@ afterAll(() => {
 });
 
 describe("createSdkSummaryDeltaPublisher", () => {
-  it("summary-completed → 落 info（meta.kind=sdk_summary + summaryChars）", async () => {
+  it("summary-started / completed → 同一套 compaction 过程行", async () => {
     const taskId = "t_1700000001501_sdk_summary_ok";
     await seedTask(taskId);
     const onDelta = createSdkSummaryDeltaPublisher(taskId, () => true);
@@ -64,12 +64,23 @@ describe("createSdkSummaryDeltaPublisher", () => {
     await vi.waitFor(
       async () => {
         const events = await readEvents(taskId);
-        const hit = events.find(
-          (e) => e.kind === "info" && e.meta?.kind === "sdk_summary",
+        const hits = events.filter(
+          (e) => e.kind === "info" && e.meta?.kind === "compaction",
         );
-        expect(hit).toBeTruthy();
-        expect(hit!.text).toBe("上下文过长，SDK 已自动压缩会话");
-        expect(hit!.meta?.summaryChars).toBe("hello-summary-text".length);
+        expect(hits).toHaveLength(2);
+        expect(hits[0]).toMatchObject({
+          text: "正在压缩上下文…",
+          meta: { kind: "compaction", status: "running", reason: "sdk" },
+        });
+        expect(hits[1]).toMatchObject({
+          text: "已压缩上下文",
+          meta: {
+            kind: "compaction",
+            status: "done",
+            reason: "sdk",
+            summaryChars: "hello-summary-text".length,
+          },
+        });
       },
       { timeout: 3_000, interval: 20 },
     );
@@ -79,12 +90,30 @@ describe("createSdkSummaryDeltaPublisher", () => {
     const taskId = "t_1700000001502_sdk_summary_lease";
     await seedTask(taskId);
     const onDelta = createSdkSummaryDeltaPublisher(taskId, () => false);
+    onDelta({ update: { type: "summary-started" } });
     onDelta({ update: { type: "summary", summary: "x".repeat(40) } });
     onDelta({ update: { type: "summary-completed" } });
     await new Promise((r) => setTimeout(r, 120));
     const events = await readEvents(taskId);
     expect(
-      events.some((e) => e.kind === "info" && e.meta?.kind === "sdk_summary"),
+      events.some((e) => e.kind === "info" && e.meta?.kind === "compaction"),
     ).toBe(false);
+  });
+
+  it("只有 summary 没有 started 也先挂正在压缩", async () => {
+    const taskId = "t_1700000001503_sdk_summary_body_only";
+    await seedTask(taskId);
+    const onDelta = createSdkSummaryDeltaPublisher(taskId, () => true);
+    onDelta({ update: { type: "summary", summary: "condensed" } });
+    onDelta({ update: { type: "summary-completed" } });
+    await vi.waitFor(async () => {
+      const events = await readEvents(taskId);
+      const hits = events.filter(
+        (e) => e.kind === "info" && e.meta?.kind === "compaction",
+      );
+      expect(hits).toHaveLength(2);
+      expect(hits[0]?.text).toBe("正在压缩上下文…");
+      expect(hits[1]?.text).toBe("已压缩上下文");
+    });
   });
 });

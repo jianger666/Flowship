@@ -160,6 +160,7 @@ const InstanceCardHeader = ({
       onValueChange={onEnvChange}
       options={ENV_OPTIONS}
       placeholder="请选择"
+      allowCustom
       className="h-8 w-full"
     />
   </MiniField>
@@ -646,6 +647,7 @@ export const CompanyEnvSection = ({
                         }}
                         options={ENV_OPTIONS}
                         placeholder="请选择"
+                        allowCustom
                         className="h-8 w-full"
                       />
                     </MiniField>
@@ -1016,6 +1018,7 @@ export const CompanyEnvSection = ({
                           onValueChange={(env) => commitXxl({ ...x, env })}
                           options={ENV_OPTIONS}
                           placeholder="请选择"
+                          allowCustom
                           className="h-8 w-full"
                         />
                       </MiniField>
@@ -1353,6 +1356,7 @@ export const CompanyEnvSection = ({
                           onValueChange={(env) => commitApi({ ...h, env })}
                           options={ENV_OPTIONS}
                           placeholder="请选择"
+                          allowCustom
                           className="h-8 w-full"
                         />
                       </MiniField>

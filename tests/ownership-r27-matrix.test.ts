@@ -782,7 +782,8 @@ describe("ownership R27 真实提交点矩阵", () => {
         ).length,
       ).toBeGreaterThanOrEqual(1);
       expect(getPendingAsk(id)?.askId).toBe(askIdB);
-      expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
+      // ask 不切 awaiting_user：本用例 resume 不写 runStatus，种子 idle 保持 idle
+      expect((await readMetaV06(id))?.runStatus).toBe("idle");
     },
     20_000,
   );

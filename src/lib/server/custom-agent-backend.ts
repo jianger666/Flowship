@@ -12,6 +12,7 @@
  *   - toolcall_end        → SDKMessage tool_call running + onDelta tool-call-started
  *   - tool_execution_end  → SDKMessage tool_call completed/error + onDelta tool-call-completed
  *   - bash_execution_update → onDelta shell-output-delta（归到最近 bash callId）
+ *   - compaction_start/end → 合成 SDKMessage（事件流「正在压缩上下文…」过程行）
  *   - agent_settled       → run 结束（wait 返回 finished/cancelled）
  *   - assistant stopReason=error → wait 返回 error（pi 不抛，写在会话消息里；
  *     缺 finish_reason 的残缺收尾除外，当 finished）
@@ -77,7 +78,9 @@ const PROVIDER_ID = "flowship-custom";
 const NATIVE_TOOLS = ["read", "edit", "write", "grep"];
 // 子 agent 用 pi 原生全套（读/写/跑命令），不带 task / 系统工具——防递归与副作用
 const SUBAGENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-// 自定义端点元数据缺省（用户 endpoint 不提供时给合理兜底）
+// 自定义端点元数据缺省（用户 endpoint 不提供时给合理兜底）。
+// 窗口优先用 models.dev limit.context；缺目录才 12.8 万。muse-spark 实际 1M，
+// 写死 12.8 万会过早 overflow，压完剩余输出配额被卡死、界面上看不到回复。
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
 
@@ -156,6 +159,7 @@ const buildModelConfig = (
   face: CustomFace,
   fields: CatalogFields,
   imageInput: boolean,
+  contextWindow: number,
 ): ModelConfigEntry => {
   const entry: ModelConfigEntry = {
     id: modelId,
@@ -165,7 +169,7 @@ const buildModelConfig = (
     // 目录标明多模态才让 pi 把 read 到的图塞进请求；否则会换成空占位
     input: catalogPiInputModalities(imageInput),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    contextWindow,
     maxTokens: DEFAULT_MAX_TOKENS,
   };
   if (fields.thinkingLevelMap) entry.thinkingLevelMap = fields.thinkingLevelMap;
@@ -183,6 +187,7 @@ const buildModel = (
   face: CustomFace,
   fields: CatalogFields,
   imageInput: boolean,
+  contextWindow: number,
 ): Model<never> => {
   const model = {
     id: modelId,
@@ -193,7 +198,7 @@ const buildModel = (
     reasoning: fields.reasoning,
     input: catalogPiInputModalities(imageInput),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    contextWindow,
     maxTokens: DEFAULT_MAX_TOKENS,
   } as unknown as Model<never>;
   if (fields.thinkingLevelMap) {
@@ -226,6 +231,11 @@ const buildRuntime = async (
     input.model?.params,
     hit?.effortValues,
   );
+  // 窗口跟目录走：写死 12.8 万会让 20 万+ 的 muse-spark 过早 overflow，压完没配额写正文
+  const contextWindow = hit?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+  console.log(
+    `[custom-agent] model=${modelId} face=${face} contextWindow=${contextWindow} catalog=${hit?.contextWindow ?? "miss"}`,
+  );
   const runtime = await ModelRuntime.create({ modelsPath: null });
   const sdkBase = customSdkBaseUrlForFace(input.baseUrl, face);
   // 注册 provider 让 runtime 能解析 apiKey + api 流实现；model 直接构造引用同 provider
@@ -234,11 +244,26 @@ const buildRuntime = async (
     baseUrl: sdkBase,
     apiKey: input.apiKey,
     api: face,
-    models: [buildModelConfig(modelId, face, fields, Boolean(hit?.imageInput))],
+    models: [
+      buildModelConfig(
+        modelId,
+        face,
+        fields,
+        Boolean(hit?.imageInput),
+        contextWindow,
+      ),
+    ],
   });
   return {
     runtime,
-    model: buildModel(modelId, input, face, fields, Boolean(hit?.imageInput)),
+    model: buildModel(
+      modelId,
+      input,
+      face,
+      fields,
+      Boolean(hit?.imageInput),
+      contextWindow,
+    ),
     thinkingLevel,
   };
 };
@@ -574,6 +599,23 @@ class PiRunAdapter {
               event: { case: "stdout", value: { data: ev.delta } },
             } as unknown as InteractionUpdate);
           }
+          break;
+        }
+        case "compaction_start": {
+          // 合成消息给 sdk-message-handler 落过程行；不在这里 settle——压缩 = 这轮还没结束
+          this.push({
+            type: "compaction_start",
+            reason: ev.reason,
+          } as unknown as SDKMessage);
+          break;
+        }
+        case "compaction_end": {
+          this.push({
+            type: "compaction_end",
+            reason: ev.reason,
+            aborted: ev.aborted,
+            willRetry: ev.willRetry,
+          } as unknown as SDKMessage);
           break;
         }
         case "agent_settled": {

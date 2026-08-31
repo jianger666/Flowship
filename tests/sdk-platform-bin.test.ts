@@ -40,7 +40,7 @@ describe("resolveSdkRgPathFrom", () => {
         root,
         "node_modules",
         ".pnpm",
-        `@cursor+${plat}@1.0.26`,
+        `@cursor+${plat}@1.0.30`,
         "node_modules",
         "@cursor",
         plat,

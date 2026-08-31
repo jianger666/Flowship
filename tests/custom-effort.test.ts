@@ -16,6 +16,7 @@ import {
   buildModelsDevIndex,
   catalogModelHasImageInput,
   catalogPiInputModalities,
+  catalogWindowFromModel,
   lookupCatalogReasoning,
 } from "@/lib/server/models-dev-catalog";
 
@@ -203,6 +204,37 @@ describe("custom-effort / models.dev", () => {
       "off",
       "max",
     ]);
+  });
+
+  it("limit.context 进 CatalogReasoning.contextWindow，低优先级来源可补窗口", () => {
+    const index = buildModelsDevIndex({
+      opencode: {
+        models: {
+          "muse-spark-1.2-contributor": {
+            reasoning: true,
+            limit: { context: 1_048_576, output: 131_072 },
+          },
+        },
+      },
+      openrouter: {
+        models: {
+          "muse-spark-1.2-contributor": {
+            reasoning: true,
+            limit: { context: 999 },
+          },
+        },
+      },
+    });
+    expect(
+      lookupCatalogReasoning(index, "muse-spark-1.2-contributor")?.contextWindow,
+    ).toBe(1_048_576);
+  });
+
+  it("limit.context 非法值不进窗口", () => {
+    expect(catalogWindowFromModel({ limit: { context: 0 } })).toBeUndefined();
+    expect(catalogWindowFromModel({ limit: { context: -100 } })).toBeUndefined();
+    expect(catalogWindowFromModel({ limit: { context: "0" } })).toBeUndefined();
+    expect(catalogWindowFromModel({ limit: { context: "-100" } })).toBeUndefined();
   });
 
   it("图像能力：attachment 或 modalities.input 含 image 即标多模态", () => {

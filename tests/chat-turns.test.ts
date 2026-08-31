@@ -562,6 +562,45 @@ describe("deriveActiveStatus", () => {
     expect(status?.detail?.length).toBeLessThanOrEqual(81);
     expect(status?.detail?.endsWith("…")).toBe(true);
   });
+
+  it("压缩进行中盖过「正在回复…」；结束后继续往前扫", () => {
+    const running = ev({
+      id: "c",
+      kind: "info",
+      text: "正在压缩上下文…",
+      ts: 3,
+      meta: { kind: "compaction", status: "running" },
+    });
+    expect(
+      deriveActiveStatus(
+        [
+          ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+          ev({ id: "a", kind: "assistant_message", text: "结论：可合", ts: 2 }),
+          running,
+        ],
+        undefined,
+        { streaming: true },
+      ),
+    ).toEqual({ label: "正在压缩上下文…" });
+
+    expect(
+      deriveActiveStatus(
+        [
+          ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+          ev({ id: "a", kind: "assistant_message", text: "结论：可合", ts: 2 }),
+          ev({
+            id: "d",
+            kind: "info",
+            text: "已压缩上下文",
+            ts: 4,
+            meta: { kind: "compaction", status: "done" },
+          }),
+        ],
+        undefined,
+        { streaming: true },
+      ),
+    ).toEqual({ label: "正在回复…" });
+  });
 });
 
 describe("shouldShowProcessingPlaceholder", () => {

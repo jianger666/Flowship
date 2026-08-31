@@ -176,8 +176,8 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
           <div className="space-y-2">
             {repos.map((r) => {
               // v0.9.11：该仓分支候选——undefined=拉取中（先禁用）、真非 git 仓禁用；
-              // gitMissing（git 命令不可用、判定不了）不禁用、放开手填（同事 Windows 踩过：
-              // git 只在 IDE 内置、全部输入被禁死没法配置）
+              // gitMissing（git 命令不可用、判定不了）不禁用、Combobox 开手填（同事 Windows 踩过：
+              // git 只在 IDE 内置、全部输入被禁死没法配置）。git 正常时只能从列表选，不出「使用 xxx」。
               const entry = branchMap[r.path];
               const branchDisabled = !entry || (entry.isRepo === false && !entry.gitMissing);
               const branchPlaceholder =
@@ -236,8 +236,9 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                   </div>
 
                   {/* 第二行：线上 / 提测 / 联调 分支（都选填）。
-                      v0.9.11 换 Combobox：候选自动拉本地 + 远端分支、可搜索、列表缺分支时可手填；
+                      v0.9.11 换 Combobox：候选自动拉本地 + 远端分支、可搜索；
                       非 git 目录（手填的坏路径 / 普通文件夹）禁用——没分支可选。
+                      搜不到不要「使用「xxx」」——只能从已探测到的分支里选。
                       v1.0.x：三框加迷你 label（原来 placeholder-only、有值后就不知道哪个框是啥了） */}
                   <div className="grid grid-cols-3 gap-2">
                     <div className="grid gap-1">
@@ -250,6 +251,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                         options={entry?.branches ?? []}
                         loading={!entry}
                         disabled={branchDisabled}
+                        allowCustom={Boolean(entry?.gitMissing)}
                         placeholder={branchPlaceholder ?? "留空自动探测"}
                         title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
                       />
@@ -264,6 +266,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                         options={entry?.branches ?? []}
                         loading={!entry}
                         disabled={branchDisabled}
+                        allowCustom={Boolean(entry?.gitMissing)}
                         placeholder={branchPlaceholder ?? "留空默认 test"}
                         title="ship 提测 MR 的目标分支、留空则默认 test"
                       />
@@ -278,6 +281,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                         options={entry?.branches ?? []}
                         loading={!entry}
                         disabled={branchDisabled}
+                        allowCustom={Boolean(entry?.gitMissing)}
                         placeholder={branchPlaceholder ?? "选填"}
                         title="dev / 联调分支（联调 action 的推送目标）"
                       />

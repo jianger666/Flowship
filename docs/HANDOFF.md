@@ -370,6 +370,15 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v1.9.5（2026-08-31）压缩过程行 / 上下文窗口纠偏 / Cursor SDK 1.0.30
+
+- **压缩过程行**：自定义 pi 的 `compaction_start/end` 与 Cursor SDK 的 `summary-started/summary/summary-completed` 走同一套 info（「正在压缩上下文…」→「已压缩上下文」）。压缩不是回合结束，不 flush 正在流的回复。Cursor 只在 SDK 真吐 summary 事件时出过程行，不再按 token 掉档伪造。
+- **自定义模型窗口**：`contextWindow` 从 models.dev `limit.context` 读（Spark 是 1M），不再写死 128k；非法值（0 / 负数）丢弃。同 id 多来源窗口补位，防 huggingface 纯文本条盖掉官方窗口。
+- **分支框收口**：Combobox 默认不许手填（`allowCustom=false`），仓库 / 环境分支只认列表；需要手填的调用方显式打开。Picker 外层 `min-w-0`，长名字不撑破表单。
+- **事件流行宽**：待办 / 子代理卡补回 `min-w-0 max-w-full`，长标题不横向撑视口。
+- **`@cursor/sdk` 1.0.26 → 1.0.30**。本地 `cwd` 仍是字符串，不受 1.0.27「去掉 cwd 数组」影响。
+- **随本版发出（1.9.4 tag 之后已合未发）**：系统工具改 SDK customTools + 提问同一轮 curl 等答案；侧栏对话粘性序；新会话接续最近 12 轮正文。
+
 ### v1.9.4（2026-08-27）WK 激活 / Windows 更新对齐 mac / 本版更新弹窗 / 空对话复用
 
 - **启动「激活项目」**：需求任务 + Hub 已配 + 未填 REQ-ID 时可勾选，填语义编码 / 需求方 / 技术 Owner / 上线日，服务端查重再 `activate`，编号回写任务。Token 不进客户端。
@@ -387,14 +396,6 @@ ai-flow-action-hub/
 - **启动表单 Form/Field**：disabled / invalid 下钻，缺项红字写在标题右侧。
 - **侧栏对话序**：按仓库分组保留；组间 / 组内改为粘性序，不再跟 agent 流式 `updatedAt` 对跳。新建或用户发送才把该对话（及其仓组）顶到上面；转圈 / 相对时间仍原地更新。工作台时间桶不变。
 - **chat 新会话接续历史**：resume 失败 / 懒重启 / 空闲回收后起新会话时，把最近至多 12 轮 `user_reply` / `assistant_message` 正文写入起手 prompt（约 12k 字符封顶），标明「接续不是新开」。resume 成功不加。自定义 pi 对缺失 / 空会话文件改为抛错，避免静默空会话只带当前句。
-
-### v1.9.2（2026-08-26）停止后立即发送续接原会话 / 自定义提供方协议自动路由 / Skills 多源管理
-
-- **停止 / 立即发送续接原会话（P0）**：chat 停止或 run 收尾中立刻再发消息，原实现强清落盘 sessionAgentId 降级全新会话。现 `finalizeChatRunIfCurrent` cancelled 分支改 `{ keepPersisted: true }` 保锚点；发送侧 `sendChatMessage` 带 startToken 外部租约走 `resumeChatSession(runningTask, bootArgs, { claimRun: true, startToken })` 复用原会话：sent → 202 resumed；cancelled / owner_invalid → 终态不重放；busy / no_session / send_failed → 才强清锚点降级新会话（busy 实际只可能来自 rewind 门闩竞态，兜底去向一致）。停止等待超时 `CHAT_SEND_NOW_STOP_TIMEOUT_MS = 5000`。
-- **自定义提供方协议 auto 档**：「协议」默认 auto——按 models.dev 目录该模型条目 npm 字段推断 openai-completions / openai-responses / anthropic-messages 协议面（路由索引 build/lookup 双侧 URL 小写归一，防数据源大小写漂移漏命中）；目录拉不到回落手动档。base URL 推导收敛到 `custom-provider-url.ts: customSdkBaseUrlForFace` 单点（删死代码 customSdkBaseUrl），buildModel / buildRuntime 两处内联三元统一改调它。
-- **Skills 多源管理收口**：`SkillSource` 扩成 app / feishu-cli / global-std（`~/.agents/skills`）/ project-std（`<repo>/.agents/skills`）/ builtin / team；四个可管理源设置页可开关可删除（DELETE 按 source 路由）。「我的」按来源分组、同名多副本并列展示 + 同名一关全关（disabledSkills 按名字记）；运行时 loadSkills 按优先级去重（自管 > 平台 > 飞书 CLI > 全局 > 项目 > 团队），注入 agent 的索引永远单一副本。
-- **答题卡投递中态**：提交超时解锁后用户重试、命中服务端 409 `ask_in_flight` 时答题卡转只读「投递中」，SSE 终态事件收起 + 90s 兜底解锁；错误码经 task-store 透传供分支判定。
-- **滚动抖动根治 + 探针退役**：根因 Streamdown 代码块 `content-visibility:auto` 与 Virtuoso 条目测量互相打架 → 列表总高度每帧翻转 → scrollBy 死循环；globals.css 对 `[data-virtuoso-scroller]` 内代码块关 cv（非虚拟化视图保留省渲染收益）。取证用 scroll-probe（API route / debug 模块 / diagnostics 收录段 / instrumentation 清理钩子）全部删除。
 
 ## 关键文件索引
 

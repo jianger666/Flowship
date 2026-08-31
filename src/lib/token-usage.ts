@@ -12,8 +12,8 @@
  *    prompt token 之和（实测单轮 542 万），不是某一次调用送进去的上下文长度。
  *
  * 所以这里只提供绝对值展示，绝不编一个假的窗口大小去算百分比。
- * 「上下文真的满了」这个信号另有权威来源：SDK 自动压缩会话时会落一条 info 事件
- * （shell-output-bridge.createSdkSummaryDeltaPublisher）。
+ * 「上下文真的满了」这个信号另有权威来源：SDK 自动压缩时落 compaction 过程行
+ * （shell-output-bridge.createSdkSummaryDeltaPublisher，onDelta summary-*）。
  */
 
 import type { TokenUsageRollup, TurnTokenUsage } from "./types";

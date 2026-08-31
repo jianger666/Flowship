@@ -19,12 +19,19 @@ import type { TaskEvent } from "@/lib/types";
 
 /**
  * chat 历史噪声：旧版「Chat 任务启动 (model:…)」info。
- * 勿误伤重连 info（meta.kind=reconnecting / reconnected）。
+ * 勿误伤重连 info（meta.kind=reconnecting / reconnected）和压缩过程行。
  */
 export const isChatStartupNoiseInfo = (ev: TaskEvent): boolean => {
   if (ev.kind !== "info") return false;
   const metaKind = ev.meta?.kind;
-  if (metaKind === "reconnecting" || metaKind === "reconnected") return false;
+  if (
+    metaKind === "reconnecting" ||
+    metaKind === "reconnected" ||
+    metaKind === "compaction" ||
+    metaKind === "sdk_summary"
+  ) {
+    return false;
+  }
   return /^Chat 任务启动/.test(ev.text);
 };
 

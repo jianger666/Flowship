@@ -78,6 +78,8 @@ type PickerSharedProps = {
   /**
    * 包 trigger+弹层的那层。默认 `w-full`（设置页表单）。
    * composer footer 这种行内并排必须传 `w-auto`：两个 `w-full` 都会按父级 100% 算，叠在一起。
+   * 跟固定宽 label 并排时再加 `min-w-0 flex-1`：`w-full` 作为 flex item 会按父级 100% 算，
+   * 再加 label 就把清空按钮挤出弹窗（被测业务分支踩过）。
    */
   wrapperClassName?: string;
   /** 覆盖弹层宽度等；默认跟 trigger 等宽 `w-(--anchor-width)` */
@@ -120,8 +122,9 @@ const defaultFilterOption = (option: PickerOption, query: string): boolean => {
 };
 
 // px-3 左右对称：文字距左边框 = 箭头距右边框。勾/箭头是内容不是间距。
+// min-w-0：flex 行里长文案默认 min-content，不写会把右侧 X 挤出父容器。
 const TRIGGER_CLASS =
-  "flex h-9 w-full items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:bg-input/30 dark:hover:bg-input/50 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40";
+  "flex h-9 w-full min-w-0 items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:bg-input/30 dark:hover:bg-input/50 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40";
 
 /** 选项行：列表 p-1（4px 框）+ 这里 px-2 → 文字距弹层边 12px，跟 trigger px-3 对齐。
  *  items-center：两行（名称 + id）时星/勾跟整块文字垂直居中，不要顶对齐第一行。 */

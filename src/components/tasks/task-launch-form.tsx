@@ -563,17 +563,18 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
                       setFeatureBranches((prev) => ({ ...prev, [p]: v }))
                     }
                     options={entry?.branches ?? []}
-                    emptyHint="暂无候选，可在上方直接输入业务分支"
+                    emptyHint="暂无候选"
+                    allowCustom={Boolean(entry?.gitMissing)}
                     placeholder={
                       entry?.isRepo === false
                         ? entry.pathMissing
                           ? "路径不存在"
                           : entry.gitMissing
-                            ? "未检测到 git、可手填分支"
+                            ? "未检测到 git、可手填"
                             : "非 git 仓库"
-                        : "选择或填写业务分支"
+                        : "选择业务分支"
                     }
-                    className="min-w-0 flex-1"
+                    wrapperClassName="w-auto min-w-0 flex-1"
                   />
                 </div>
               );

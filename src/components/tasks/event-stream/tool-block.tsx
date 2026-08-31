@@ -439,7 +439,7 @@ const TaskSubagentBlock = ({
     <div
       className={cn(
         // 迷你卡：与普通工具行拉开层次（边框 + 渐变底 + 左侧紫轨）
-        "group/tool overflow-hidden rounded-lg border border-subagent/25",
+        "group/tool min-w-0 max-w-full overflow-hidden rounded-lg border border-subagent/25",
         "bg-gradient-to-br from-subagent/[0.08] via-subagent/[0.02] to-transparent",
         "dark:from-subagent/15 dark:via-subagent/[0.04]",
         nested && "pl-0",
@@ -844,11 +844,11 @@ const TodoToolBlock = ({
     );
 
   return (
-    <div className={cn("group/tool", nested && "pl-0")}>
+    <div className={cn("group/tool w-full min-w-0 max-w-full", nested && "pl-0")}>
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
-        className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+        className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
       >
         <CollapseChevron open={!collapsed} />
         <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-info/15">

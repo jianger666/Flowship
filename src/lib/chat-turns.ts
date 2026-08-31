@@ -9,6 +9,11 @@
  * 粘性状态行文案也在此派生。不碰 events.jsonl、不碰组件。
  */
 
+import {
+  COMPACTION_RUNNING_LABEL,
+  isCompactionInfo,
+  isCompactionRunning,
+} from "@/lib/compaction-display";
 import type { TaskEvent } from "@/lib/types";
 import {
   parseTaskToolArgs,
@@ -261,6 +266,14 @@ export const deriveActiveStatus = (
     // 扫到 user_reply 还没撞上 agent 活动 → 刚发出、等启动
     if (ev.kind === "user_reply") {
       return { label: "正在启动…" };
+    }
+
+    // 自定义 pi 压缩：字已经在屏上，但 agent_settled 还没到——别继续说「正在回复」
+    if (isCompactionInfo(ev)) {
+      if (isCompactionRunning(ev)) {
+        return { label: COMPACTION_RUNNING_LABEL };
+      }
+      continue;
     }
 
     // 未配对 tool_call = 当前在跑的工具

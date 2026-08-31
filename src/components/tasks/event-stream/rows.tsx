@@ -22,6 +22,7 @@ import {
   File as FileIcon,
   Folder,
   Loader2,
+  Minimize2,
   MessageSquareText,
   PencilLine,
   Plug,
@@ -38,6 +39,10 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { Textarea } from "@/components/ui/textarea";
 import { MarkdownText } from "@/components/markdown-text";
 import { SearchHighlightText } from "@/components/ui/search-highlight-text";
+import {
+  isCompactionInfo,
+  isCompactionRunning,
+} from "@/lib/compaction-display";
 import { useOwnerHasSearchHit } from "@/components/ui/pane-search-highlight-context";
 import {
   ImageThumb,
@@ -302,6 +307,54 @@ export const ReconnectingRow = memo(
   },
 );
 ReconnectingRow.displayName = "ReconnectingRow";
+
+// 压缩过程行（pi compaction_* / Cursor SDK summary-*）：跟重连同档。
+// 未结束转圈；后续 done/aborted / error，或 run 已经结束，改为静态。
+export const CompactionRow = memo(
+  ({
+    ev,
+    events,
+    isRunning,
+  }: {
+    ev: TaskEvent;
+    events: TaskEvent[];
+    isRunning: boolean;
+  }) => {
+    const idx = events.findIndex((e) => e.id === ev.id);
+    const settled =
+      !isCompactionRunning(ev) ||
+      !isRunning ||
+      idx < 0 ||
+      events
+        .slice(idx + 1)
+        .some(
+          (e) =>
+            e.kind === "error" ||
+            (isCompactionInfo(e) && e.meta?.status !== "running"),
+        );
+    return (
+      <div
+        className={cn(
+          "flex items-center gap-2 px-1.5 py-1 text-xs",
+          settled ? "text-muted-foreground" : "text-info",
+        )}
+      >
+        {settled ? (
+          <Minimize2 className="size-3.5 shrink-0 opacity-60" />
+        ) : (
+          <Loader2 className="size-3.5 shrink-0 animate-spin" />
+        )}
+        <span className={cn(settled && "opacity-60")}>
+          <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
+        </span>
+        <span className="text-[11px] text-muted-foreground/70">
+          {formatTs(ev.ts)}
+        </span>
+      </div>
+    );
+  },
+);
+CompactionRow.displayName = "CompactionRow";
 
 /** 用户消息气泡：w-fit 短句收窄；max-w + min-w-0 + 内层 w-full wrap-anywhere 防长 URL 撑破 */
 const USER_REPLY_BUBBLE =

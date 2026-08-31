@@ -17,7 +17,7 @@ describe("长内容不撑破视口", () => {
       "src/components/tasks/event-stream/tool-block.tsx",
     );
 
-    expect(toolBlock).toContain("group/tool min-w-0 max-w-full");
+    expect(toolBlock).toContain("group/tool w-full min-w-0 max-w-full");
     expect(toolBlock).toContain(
       "flex w-full min-w-0 cursor-pointer items-center gap-1 text-left",
     );

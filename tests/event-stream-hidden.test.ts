@@ -117,6 +117,15 @@ describe("isHiddenFromEventStream", () => {
     expect(isHiddenFromEventStream(startup)).toBe(false);
     expect(isHiddenFromEventStream(boot)).toBe(false);
     expect(isHiddenFromEventStream(reconnect, { isChat: true })).toBe(false);
+    expect(
+      isHiddenFromEventStream(
+        ev("info", {
+          text: "正在压缩上下文…",
+          meta: { kind: "compaction", status: "running" },
+        }),
+        { isChat: true },
+      ),
+    ).toBe(false);
   });
 
   it("答题卡 / 普通工作过程不藏", () => {
