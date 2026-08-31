@@ -76,11 +76,25 @@ export interface AssistantBufferCtx {
   submitSeen?: boolean;
   /** 固定收尾是否已补发（防重复） */
   fixedSent?: boolean;
-  /** 本回合已提问成功（ask_user 返回 [ASK_SUBMITTED]）：之后模型输出（含工具）全部消音（答题卡即收尾） */
+  /** 本回合已提问成功（ask_user 返回 [ASK_SUBMITTED]）：等 curl 吐出答案前，调查类输出和那条 wait curl 都消音 */
   askSeen?: boolean;
   /** 本轮是否写/改过 artifact（actions/*.md）——交卷时判定「产出是否真的更新」（事实信号、无语义判断） */
   artifactWritten?: boolean;
 }
+
+/** curl stdout 里出现答案 → 同一轮继续，不再消音、不 cancel */
+export const maybeClearAskSeenAfterWaitReply = (
+  ctx: AssistantBufferCtx,
+  msg: { status?: string; result?: unknown },
+): void => {
+  if (!ctx.askSeen || msg.status !== "completed") return;
+  const resStr =
+    typeof msg.result === "string"
+      ? msg.result
+      : stringifyMeta(msg.result ?? {});
+  if (!resStr.includes("[ASK_USER_REPLY]")) return;
+  ctx.askSeen = false;
+};
 
 /**
  * 补发固定收尾（交卷成功才补、一次）。
@@ -407,9 +421,9 @@ export const handleSdkMessage = async (
       const argsAny = (msg.args ?? {}) as Record<string, unknown>;
       const innerToolName =
         typeof argsAny.toolName === "string" ? argsAny.toolName : "";
-      // 已提问成功后：本回合剩余工具全部消音（照常落盘带 muted 标记、审计保留）——
-      // 模型若把宿主 Please continue 当用户消息去调查 / 重问，痕迹留在 events.jsonl、UI 不渲染；
-      // 不走 artifact 面板 / ask 检测等副作用分支。
+      // 已提问、还在等 curl 吐答案：调查类工具和那条 ask-wait curl 都只消音不广播，
+      // 不 run.cancel()。curl 对用户是协议内部步骤，事件流只留答题卡。
+      // 答案进 stdout 之后清 askSeen，同一轮可以再问 / 交卷。
       if (assistantCtx.askSeen) {
         if (msg.status === "running") {
           if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
@@ -435,6 +449,7 @@ export const handleSdkMessage = async (
           await emitToolResult(taskId, msg, stillCurrent, origin, true);
         } else if (msg.status === "completed") {
           await emitToolResult(taskId, msg, stillCurrent, origin, true);
+          maybeClearAskSeenAfterWaitReply(assistantCtx, msg);
         }
         break;
       }
@@ -559,6 +574,7 @@ export const handleSdkMessage = async (
       } else if (msg.status === "completed") {
         // Phase 1：completed 结果落盘（此前完全忽略 → shell/read 输出用户看不见）
         await emitToolResult(taskId, msg, stillCurrent, origin);
+        maybeClearAskSeenAfterWaitReply(assistantCtx, msg);
       }
 
       // ask_user 成功（[ASK_SUBMITTED]）：进入「已提问」状态——之后全部消音（答题卡即收尾）。

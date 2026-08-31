@@ -85,7 +85,8 @@ export const readAppMcpServers = async (): Promise<
 
 /**
  * 运行时有效 MCP 集（V0.13 = fe 自管、不再合并 Cursor）
- * RESERVED 名（flowshipChat）剔除——runtime 强制注入、不允许用户条目顶掉。
+ * RESERVED 名（flowshipChat / custom-user-tools）剔除——系统工具走 SDK customTools，
+ * 不允许用户条目顶掉。
  */
 export const readEffectiveMcpServers = async (): Promise<
   Record<string, McpServerConfig>

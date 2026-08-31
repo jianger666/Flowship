@@ -25,6 +25,20 @@ import type { AskUserQuestion, TaskEvent } from "./types";
  */
 export const ASK_SKIPPED_META_KEY = "askSkipped";
 
+/**
+ * 「等待超过 24 小时、本轮已结束」这一种作废的 meta 标记。
+ * 仍走 `meta.supersededAskId`（了结判定只有一套），这个布尔只额外回答
+ * 「作废原因是不是硬超时」，供 UI 显示「已过期」而不是中性的「已失效」。
+ */
+export const ASK_EXPIRED_META_KEY = "askExpired";
+
+/** 事件流里那条过期标记的文案（UI 会把它折成一行「已过期」，本行不单独渲染） */
+export const ASK_EXPIRED_EVENT_TEXT =
+  "上一组提问已过期（等待超过 24 小时）、无需再回答。";
+
+/** 提交已过期提问时给用户看的一句（接口 409 + toast） */
+export const ASK_EXPIRED_USER_MESSAGE = "这组提问已过期，请在下方继续";
+
 /** 某条 ask 是否已被用户回答（有对应的 ask_user_reply） */
 export const isAskReplied = (events: TaskEvent[], askId: string): boolean =>
   events.some(
@@ -70,6 +84,28 @@ export const isAskSkipMarkerEvent = (ev: TaskEvent): boolean =>
   ev.kind === "info" &&
   typeof ev.meta?.supersededAskId === "string" &&
   ev.meta[ASK_SKIPPED_META_KEY] === true;
+
+/**
+ * 某条 ask 是否是「等待超过 24 小时」作废的。
+ * 是 {@link isAskSuperseded} 的子集——UI 据此把卡片收成一行「已过期」。
+ */
+export const isAskExpired = (events: TaskEvent[], askId: string): boolean =>
+  events.some(
+    (e) =>
+      e.kind === "info" &&
+      typeof e.meta?.supersededAskId === "string" &&
+      e.meta.supersededAskId === askId &&
+      e.meta[ASK_EXPIRED_META_KEY] === true,
+  );
+
+/**
+ * 这条 info 事件就是「等待超时」的作废标记本身吗。
+ * 跟跳过标记一样只滤显示、不滤数据——话由 ask 折叠行说。
+ */
+export const isAskExpireMarkerEvent = (ev: TaskEvent): boolean =>
+  ev.kind === "info" &&
+  typeof ev.meta?.supersededAskId === "string" &&
+  ev.meta[ASK_EXPIRED_META_KEY] === true;
 
 /** 某条 ask 是否已了结（已答 或 已作废）——了结的都不该再弹窗 */
 export const isAskSettled = (events: TaskEvent[], askId: string): boolean =>

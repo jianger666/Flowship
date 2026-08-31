@@ -12,14 +12,14 @@
  * - 一次问完所有问题、全答完才能提交；每题选项 ABCD / 自定义文本 / 各自贴图
  * - 「稍后再补充」：confirm 后 deferred 提交、agent 按 default 推进
  * - 提交快捷键跟设置页偏好（mod-enter 任意焦点 / enter 仅 textarea 内）
- * - 失效态（runStatus=error）：显示警示 + 禁交互（不挡屏、无需 dismiss）
+ * - 失效态（runStatus=error / idle）：显示提示 + 禁交互（不挡屏、无需 dismiss）
  *
- * 提交成功后等 SSE 推 ask_user_reply 事件、findPendingAskEvent 变 null、
- * event-stream 自动切回放卡——本组件不管关闭。
+ * 提交成功后用接口返回的 task 收卡（完成信号由提交者发出）；SSE 仍会推
+ * ask_user_reply，findPendingAskEvent 变 null 是双保险。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, Ban, Loader2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -259,9 +259,15 @@ interface AskUserInlineCardProps {
   task: Task;
   // 当前待答的 ask_user_request 事件（event-stream 分流保证是 findPendingAskEvent 命中的那条）
   ev: TaskEvent;
+  // 提交成功把接口返回的 task 合进页面——完成信号由提交者发出，不单等 SSE
+  onTaskUpdate?: (next: Task) => void;
 }
 
-export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
+export const AskUserInlineCard = ({
+  task,
+  ev,
+  onTaskUpdate,
+}: AskUserInlineCardProps) => {
   const { confirm } = useDialog();
   const submitShortcut = useSubmitShortcut();
 
@@ -277,11 +283,14 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
   const [drafts, setDrafts] = useState<Record<string, AnswerDraft>>({});
   // 提交中：防双击 / 网络重发
   const [submitting, setSubmitting] = useState(false);
-  // 投递中：另一条链（首次提交）正在把答案送 agent、本卡只读等终态事件收起。
-  // 触发：提交超时解锁后用户重试、命中服务端 409 ask_in_flight（见 handleSubmit catch）
+  // 投递中：首次提交的链还在送答案、本卡只读等终态。
+  // 30s 只切只读、不 abort——abort 会让用户以为失败，服务端却可能还在结束上一轮。
   const [inFlight, setInFlight] = useState(false);
   // agent 已断（runStatus=error）：这组 ask 送不达、禁交互 + 引导用输入条唤醒
-  const isStale = task.runStatus === "error";
+  const isDisconnected = task.runStatus === "error";
+  // 24h 硬超时后 run 归 idle，SSE 还没把过期标记推到时先把表单收掉，别 Amber 假等
+  const isExpiredIdle = task.runStatus === "idle";
+  const isStale = isDisconnected || isExpiredIdle;
 
   // askId 切换时清状态；子组件靠 key remount 各自重置
   useEffect(() => {
@@ -300,8 +309,8 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
   );
   const allAnswered = questions.length > 0 && answeredCount === questions.length;
 
-  // 网断时 fetch 可能挂很久不 reject，按钮会永久「提交中…」——超时强制解锁可重试
-  const SUBMIT_UNLOCK_MS = 30_000;
+  // 网断时 fetch 可能挂很久不 reject，按钮会永久「提交中…」——超时改切投递中只读，不掐请求
+  const SUBMIT_IN_FLIGHT_HINT_MS = 30_000;
   // 提交成功/超时的 setTimeout：卸载时清掉，避免卸载后 setSubmitting（审查）
   const submitTimersRef = useRef<number[]>([]);
   const trackTimer = (id: number) => {
@@ -320,20 +329,38 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     [],
   );
 
-  // AbortError：超时解锁已 toast + abort，勿再弹一次错误 toast
-  const isAbortError = (err: unknown): boolean =>
-    (err instanceof DOMException || err instanceof Error) &&
-    err.name === "AbortError";
-
-  // 投递中态：另一条链正在送答案、卡片只读；正常由 SSE 终态事件（ask_user_reply /
-  // supersede）收起，这里给 90s 兑底解锁防事件丢失卡死（比提交超时宽得多：投递链含
-  // 假死检测 + 会话恢复、实测可达数十秒）
+  // 投递中只读：首次提交还在飞（或撞上另一条链的 409）。90s 兑底解锁防事件丢失卡死
   const IN_FLIGHT_UNLOCK_MS = 90_000;
   const markInFlight = () => {
     setSubmitting(false);
     setInFlight(true);
     toast.info("你的回答已在投递中，请勿重复提交，完成后会自动收起");
     trackTimer(window.setTimeout(() => setInFlight(false), IN_FLIGHT_UNLOCK_MS));
+  };
+
+  const applyAskSuccess = (result: {
+    persistWarning?: string;
+    task?: Task;
+  }) => {
+    if (result.persistWarning) {
+      toast.error(`消息已送达但记录保存失败：${result.persistWarning}`);
+    }
+    // 提交者带回的 task 含 ask_user_reply → findPendingAskEvent 立刻变 null、切回放
+    if (result.task) onTaskUpdate?.(result.task);
+    setSubmitting(false);
+    setInFlight(false);
+  };
+
+  const handleAskInFlightError = (err: unknown): boolean => {
+    if (
+      err instanceof ApiRequestError &&
+      err.status === 409 &&
+      err.code === "ask_in_flight"
+    ) {
+      markInFlight();
+      return true;
+    }
+    return false;
   };
 
   const handleSubmit = async () => {
@@ -359,56 +386,23 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     // 各题 `/` 引用的 skill 合并去重（一次 ask-reply 只发一条消息、指引拼一份就够）
     const skillRefs = mergeSkillRefs(questions.map((q) => drafts[q.id]));
     setSubmitting(true);
-    // 超时解锁时 abort 在飞请求，避免迟到响应与用户重试撞成重复回答
-    const ac = new AbortController();
-    const unlockTimer = trackTimer(
-      window.setTimeout(() => {
-        ac.abort();
-        setSubmitting(false);
-        toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
-      }, SUBMIT_UNLOCK_MS),
+    // 超过 30s 只切「投递中」，不 abort——服务端可能还在结束提问后没停的那一轮
+    const hintTimer = trackTimer(
+      window.setTimeout(() => markInFlight(), SUBMIT_IN_FLIGHT_HINT_MS),
     );
     try {
       const askResult = await submitAskReply(task, askId, answers, {
         imagesByQuestion,
         skills: skillRefs.length > 0 ? skillRefs : undefined,
-        signal: ac.signal,
       });
-      // send 后落盘失败——不可忽略提示
-      if (askResult.persistWarning) {
-        toast.error(
-          `消息已送达但记录保存失败：${askResult.persistWarning}`,
-        );
-      }
-      // 提交成功：等 SSE 推 ask_user_reply、findPendingAskEvent 变 null、
-      // event-stream 自动切回放卡——这里不主动收起、避免 race。
-      // SSE 重连间隙另给 15s：卡片可能仍显示「提交中…」
-      clearTrackedTimer(unlockTimer);
-      trackTimer(window.setTimeout(() => setSubmitting(false), 15_000));
+      clearTrackedTimer(hintTimer);
+      applyAskSuccess(askResult);
     } catch (err) {
-      clearTrackedTimer(unlockTimer);
-      if (isAbortError(err)) {
-        setSubmitting(false);
-        return;
-      }
+      clearTrackedTimer(hintTimer);
       if (handleAskInFlightError(err)) return;
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
     }
-  };
-
-  // 首次提交的链还在飞（如假死中止慢链路）：卡片转「投递中」只读态而不是留在可编辑态
-  // 让用户反复撞 409——终态由 SSE 事件收起，见 markInFlight 注释
-  const handleAskInFlightError = (err: unknown): boolean => {
-    if (
-      err instanceof ApiRequestError &&
-      err.status === 409 &&
-      err.code === "ask_in_flight"
-    ) {
-      markInFlight();
-      return true;
-    }
-    return false;
   };
 
   // 「稍后再补充」：confirm → deferred 提交、agent 跳过这组 Q 按 default 推进
@@ -423,33 +417,17 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     });
     if (!ok) return;
     setSubmitting(true);
-    const ac = new AbortController();
-    const unlockTimer = trackTimer(
-      window.setTimeout(() => {
-        ac.abort();
-        setSubmitting(false);
-        toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
-      }, SUBMIT_UNLOCK_MS),
+    const hintTimer = trackTimer(
+      window.setTimeout(() => markInFlight(), SUBMIT_IN_FLIGHT_HINT_MS),
     );
     try {
       const deferResult = await submitAskReply(task, askId, [], {
         deferred: true,
-        signal: ac.signal,
       });
-      // send 后落盘失败——不可忽略提示
-      if (deferResult.persistWarning) {
-        toast.error(
-          `消息已送达但记录保存失败：${deferResult.persistWarning}`,
-        );
-      }
-      clearTrackedTimer(unlockTimer);
-      trackTimer(window.setTimeout(() => setSubmitting(false), 15_000));
+      clearTrackedTimer(hintTimer);
+      applyAskSuccess(deferResult);
     } catch (err) {
-      clearTrackedTimer(unlockTimer);
-      if (isAbortError(err)) {
-        setSubmitting(false);
-        return;
-      }
+      clearTrackedTimer(hintTimer);
       if (handleAskInFlightError(err)) return;
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
@@ -461,8 +439,14 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
   return (
     <div
       // 品牌琥珀强调（2026-07-20 用户实测：中性灰不够醒目、看不出「等你答题」）——
-      // 与「AI 在等你回答」浮标、侧栏琥珀点同属「等你行动」信号族、一眼锁定
-      className="flex flex-col gap-3 rounded-lg border border-brand/40 bg-brand/[0.06] p-3.5"
+      // 与「AI 在等你回答」浮标、侧栏琥珀点同属「等你行动」信号族、一眼锁定。
+      // 过期 / 断开时收掉琥珀，别继续喊「等你行动」。
+      className={cn(
+        "flex flex-col gap-3 rounded-lg border p-3.5",
+        isStale
+          ? "border-border/60 bg-muted/30"
+          : "border-brand/40 bg-brand/[0.06]",
+      )}
       onKeyDown={(e) => {
         // 容器级提交快捷键，只管「焦点不在答题框里」的情况（选项按钮 / 卡片本身）：
         // - 焦点在答题框内 → RichInput 内部已按偏好判定并回调 onSubmit，这里必须让开、否则双提交
@@ -478,9 +462,23 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       }}
     >
       <div className="flex items-center gap-2">
-        <Sparkles className="size-3.5 shrink-0 text-brand" />
-        <span className="text-xs font-medium text-foreground">
-          AI 想跟你确认 {questions.length} 个问题
+        <Sparkles
+          className={cn(
+            "size-3.5 shrink-0",
+            isStale ? "text-muted-foreground" : "text-brand",
+          )}
+        />
+        <span
+          className={cn(
+            "text-xs font-medium",
+            isStale ? "text-muted-foreground" : "text-foreground",
+          )}
+        >
+          {isExpiredIdle
+            ? `AI 提过 ${questions.length} 个问题 · 已过期`
+            : isDisconnected
+              ? `AI 提过 ${questions.length} 个问题`
+              : `AI 想跟你确认 ${questions.length} 个问题`}
         </span>
       </div>
 
@@ -494,10 +492,16 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       )}
 
       {isStale ? (
-        // 失效态：不挡屏、无需 dismiss——提示后用户直接用底部输入条唤醒即可
-        <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-          <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
-          Agent 已断开、这组问题暂时送不达。在底部输入条说句话即可唤醒当前阶段、AI 会接着读历史（含这组问题）继续。
+        // 失效态：不挡屏、无需 dismiss——提示后用户直接用底部输入条继续即可
+        <div className="flex items-start gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+          {isDisconnected ? (
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+          ) : (
+            <Ban className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+          )}
+          {isDisconnected
+            ? "Agent 已断开、这组问题暂时送不达。在底部输入条说句话即可唤醒当前阶段、AI 会接着读历史（含这组问题）继续。"
+            : "这组提问已过期。在下方继续即可。"}
         </div>
       ) : (
         <>

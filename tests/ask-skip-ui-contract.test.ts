@@ -26,22 +26,32 @@ describe("事件流：跳过的提问收成一行", () => {
 
   it("命中 isAskSkipped 时走独立的折叠行、不再渲染整张卡", () => {
     expect(rows).toContain("isAskSkipped");
-    expect(rows).toContain("SkippedAskRow");
+    expect(rows).toContain("CollapsedAskRow");
     expect(rows).toContain("已跳过");
   });
 
   it("折叠行可展开看原问题——事件流是历史、不能把 AI 问过什么抹掉", () => {
     // 展开态渲染原题（共用 lib/ask-pending 的解析、不自己再写一份）
     expect(rows).toContain("extractAskQuestions");
-    const idx = rows.indexOf("const SkippedAskRow");
+    const idx = rows.indexOf("const CollapsedAskRow");
     expect(idx).toBeGreaterThan(0);
-    const body = rows.slice(idx, idx + 2000);
+    const body = rows.slice(idx, idx + 2500);
     expect(body).toContain("setOpen");
     expect(body).toContain("ChevronDown");
   });
 
   it("有真答案时按「已答」显示——answered 优先于 skipped（极窄竞态兜底）", () => {
     expect(rows).toContain("() => !answered && isAskSkipped(");
+  });
+});
+
+describe("事件流：超时过期的提问也收成一行", () => {
+  const rows = read("components", "tasks", "event-stream", "rows.tsx");
+
+  it("命中 isAskExpired 时走同一套折叠行、文案是已过期", () => {
+    expect(rows).toContain("isAskExpired");
+    expect(rows).toContain("已过期");
+    expect(rows).toContain("等待超过 24 小时");
   });
 });
 
@@ -58,24 +68,38 @@ describe("悬浮条 / 推进按钮：跟着同一个判定走", () => {
     expect(stream).toContain("AI 在等你回答");
   });
 
-  it("跳过标记那条 info 不再单独占一行——话由 ask 折叠行说", () => {
+  it("跳过 / 过期标记不单独占一行——统一走事件流隐藏闸", () => {
+    const hidden = read("lib", "event-stream-hidden.ts");
+    expect(hidden).toContain("isAskSkipMarkerEvent");
+    expect(hidden).toContain("isAskExpireMarkerEvent");
+    expect(hidden).toContain("isAskWaitStreamEvent");
+    expect(hidden).toContain("isHiddenFromEventStream");
     const stream = read("components", "tasks", "event-stream.tsx");
-    expect(stream).toContain("isAskSkipMarkerEvent");
-    // 只滤显示：标记仍在 events.jsonl 里，了结判定全靠它
-    expect(stream).toContain("!isAskSkipMarkerEvent(e)");
+    expect(stream).toContain("isHiddenFromEventStream");
+    expect(stream).not.toContain("isAskSkipMarkerEvent");
+    expect(stream).not.toContain("isAskExpireMarkerEvent");
   });
 
   it("canAdvance 的「等提问答案」判定同样只看 findPendingAskEvent", () => {
     const page = read("app", "tasks", "[id]", "page.tsx");
-    expect(page).toContain(
-      'task.runStatus === "awaiting_user" && !!findPendingAskEvent(task.events)',
-    );
+    expect(page).toContain("!!findPendingAskEvent(task.events)");
     expect(page).toContain("!awaitingAskAnswer &&");
+  });
+
+  it("疑似卡住在未答提问时不亮，判定同样只看 findPendingAskEvent", () => {
+    const hint = read("components", "tasks", "suspect-stuck-hint.tsx");
+    expect(hint).toContain("findPendingAskEvent(task.events)");
+    expect(hint).toContain("awaitingAsk");
   });
 
   it("「跟 AI 说」输入条的答题提示也走同一判定", () => {
     const composer = read("components", "tasks", "task-talk-composer.tsx");
     expect(composer).toContain("findPendingAskEvent(task.events)");
+    // 提问期间不要被 runActive 画成停止键，回车 = 顶掉这张卡
+    expect(composer).toContain("runActive && !pendingAsk");
+    expect(composer).not.toContain(
+      'task.runStatus === "awaiting_user" &&',
+    );
   });
 });
 

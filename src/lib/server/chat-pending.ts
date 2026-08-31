@@ -8,19 +8,18 @@
  *
  *   1. **pendingAsks**：ask_user 弹窗登记表（taskId → 当前未答的一组问题 + token）——
  *      ask-reply 路由校验「答案对应的还是当前这组问题」用（防旧弹窗答案串新提问）
- *   2. **notifier / task action handler 注册表**：runner ↔ chat-mcp 的回调桥（方向不变：
- *      task-runner → chat-mcp、chat-mcp 不反向 import runner）
+ *   2. **notifier / task action handler 注册表**：runner ↔ flowship-tools 的回调桥
+ *      （task-runner 注册、flowship-tools 调、本文件不反向 import runner）
  *   3. **buildAgentMessage**：用户操作 → 发给 agent 的消息文本（[NEXT_ACTION] / [USER_MESSAGE]
  *      revise] / [USER_REPLY] 头 + 附件段）——原 formatToolReturnAsText 的瘦身版、信号
  *      字面量与 prompts 的约定由 tests/protocol-signals.test.ts 守护
  *
- * 依赖方向（保证无环）：只依赖 types / protocol-signals、不 import chat-mcp / task-runner。
+ * 依赖方向（保证无环）：只依赖 types / protocol-signals、不 import flowship-tools / task-runner。
  */
-
-import type { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 
 import type { ActionType, PlanBatch } from "../types";
 import { SIGNALS, buildNextActionHead } from "../protocol-signals";
+import { cancelAskWait, resetAskWaitForTest } from "./ask-wait";
 
 // ----------------- 类型 -----------------
 
@@ -51,7 +50,7 @@ export type AwaitingSignal =
       artifactPath?: string;
     }
   | {
-      // agent 调 ask_user：runner 写 ask_user_request 事件 + 切 runStatus=awaiting_user
+      // agent 调 ask_user：runner 写 ask_user_request 事件；同一轮 curl 还在挂，不切 awaiting_user
       kind: "ask_user_request";
       askId: string;
       token: string;
@@ -78,7 +77,7 @@ export type AwaitingNotifier = (
   | AwaitingNotifyOutcome;
 
 // task-scoped「同步 RPC」action（submit_mr / set_feishu_testers / set_plan_batches）——
-// chat-mcp 工具收到调用后查表找 runner 注册的 handler 执行、拿结构化返回值
+// 系统工具收到调用后查表找 runner 注册的 handler 执行、拿结构化返回值
 export type ChatTaskAction =
   | {
       kind: "submit_mr";
@@ -138,31 +137,30 @@ interface ChatMcpGlobalState {
   taskActionHandlers: Map<string, ChatTaskActionHandler>;
   /**
    * taskId → 当前注册 bridge 期望的 caller token（agent 实例身份）。
-   * MCP 工具执行前核对请求携带的 caller；不匹配则拒副作用。
+   * 系统工具执行前核对请求携带的 caller；不匹配则拒副作用。
    */
   expectedCallerTokens: Map<string, string>;
-  sessionTransports: Map<string, WebStandardStreamableHTTPServerTransport>;
 }
 
+// V16：2026-08-28——HTTP chat-mcp 退役，去掉 sessionTransports。
 // V15：2026-07-28——加 takenAsks（区分「答题链摘走」与「重启后孤儿」）。
 // V14：2026-07-18——加 expectedCallerTokens（MCP caller 身份）。
 // V13：2026-07-07 V0.11 wait 协议退役——删 pendingMap / tokenToTask / waitingTasks /
 //      pendingNextActions / unansweredRevises / chatModeTasks / prematureWaitRejects、
 //      新增 pendingAsks（ask 弹窗登记）。bump 强制 dev hot reload 拿全新 state。
 // V12 及更早见 git 历史（wait 协议时代的状态机字段）。
-const GLOBAL_KEY = "__flowshipChatStateV15__";
+const GLOBAL_KEY = "__flowshipChatStateV16__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
   if (!g[GLOBAL_KEY]) {
-    console.log("[chat-mcp] 初始化 globalThis 状态（首次）");
+    console.log("[chat-pending] 初始化 globalThis 状态（首次）");
     g[GLOBAL_KEY] = {
       pendingAsks: new Map(),
       takenAsks: new Map(),
       awaitingNotifiers: new Map(),
       taskActionHandlers: new Map(),
       expectedCallerTokens: new Map(),
-      sessionTransports: new Map(),
     };
   }
   return g[GLOBAL_KEY];
@@ -173,9 +171,6 @@ const takenAsks = getGlobalState().takenAsks;
 const awaitingNotifiers = getGlobalState().awaitingNotifiers;
 const taskActionHandlers = getGlobalState().taskActionHandlers;
 const expectedCallerTokens = getGlobalState().expectedCallerTokens;
-
-// MCP session 表（sessionId → transport）：chat-mcp.ts handleChatMcpRequest 用
-export const sessionTransports = getGlobalState().sessionTransports;
 
 // ----------------- pendingAsks（ask 弹窗登记） -----------------
 
@@ -271,6 +266,7 @@ export const wasAskTakenRecently = (taskId: string, askId: string): boolean => {
 export const __resetPendingAskStateForTest = (): void => {
   pendingAsks.clear();
   takenAsks.clear();
+  resetAskWaitForTest();
 };
 
 /** ask_user 工具 handler 调：登记一组新提问（顶掉旧的、旧弹窗答案会因 token 不符被拒） */
@@ -278,6 +274,8 @@ export const registerPendingAsk = (
   taskId: string,
   opts: { askId: string; questions: AskUserQuestion[]; actionId?: string },
 ): PendingAsk => {
+  const prev = pendingAsks.get(taskId);
+  if (prev) cancelAskWait(taskId, "superseded", prev.askId);
   const ask: PendingAsk = {
     askId: opts.askId,
     token: newAskToken(),
@@ -300,6 +298,7 @@ export const getPendingAsk = (taskId: string): PendingAsk | null =>
 /** 答完 / 作废时清登记 */
 export const clearPendingAsk = (taskId: string): void => {
   markAskTaken(taskId, pendingAsks.get(taskId)?.askId);
+  cancelAskWait(taskId, "cleared", pendingAsks.get(taskId)?.askId);
   pendingAsks.delete(taskId);
   schedulePendingAskMetaSync(taskId);
 };
@@ -377,6 +376,7 @@ export const restorePendingAskIf = (
  */
 export const cancelPending = (taskId: string): boolean => {
   markAskTaken(taskId, pendingAsks.get(taskId)?.askId);
+  cancelAskWait(taskId, "cancelled");
   const deleted = pendingAsks.delete(taskId);
   // 无论内存是否刚删：sync 收敛盘面（覆盖重启后「内存空、meta 仍有孤儿 askId」）
   schedulePendingAskMetaSync(taskId);
@@ -396,6 +396,7 @@ export const cancelPendingIf = (
   if (!cur || cur.askId !== expectedAskId) return false;
   pendingAsks.delete(taskId);
   markAskTaken(taskId, cur.askId);
+  cancelAskWait(taskId, "cancelled", expectedAskId);
   schedulePendingAskMetaSync(taskId);
   return true;
 };
@@ -441,7 +442,7 @@ export const matchExpectedCallerToken = (
 export const getExpectedCallerToken = (taskId: string): string | null =>
   expectedCallerTokens.get(taskId) ?? null;
 
-// ----------------- notifier / handler 注册表（runner ↔ chat-mcp 桥） -----------------
+// ----------------- notifier / handler 注册表（runner ↔ flowship-tools 桥） -----------------
 
 /**
  * 注册 awaiting notifier。
@@ -561,14 +562,14 @@ export const safeNotifyAwaiting = async (
   // submit_work 路径同样先核对——不匹配静默跳过（不启 postCheck）
   if (!matchExpectedCallerToken(taskId, opts.callerToken)) {
     console.warn(
-      `[chat-mcp] safeNotifyAwaiting: caller 不匹配 task=${taskId}、忽略`,
+      `[chat-pending] safeNotifyAwaiting: caller 不匹配 task=${taskId}、忽略`,
     );
     return { status: "mismatch" };
   }
   const notifier = awaitingNotifiers.get(taskId);
   if (!notifier) {
     console.warn(
-      `[chat-mcp] safeNotifyAwaiting: 没找到 task=${taskId} 的 notifier（已注册 ${awaitingNotifiers.size} 个）`,
+      `[chat-pending] safeNotifyAwaiting: 没找到 task=${taskId} 的 notifier（已注册 ${awaitingNotifiers.size} 个）`,
     );
     return { status: "no_notifier" };
   }
@@ -597,7 +598,7 @@ export const safeNotifyAwaiting = async (
     return { status: "accepted" };
   } catch (err) {
     // 兜底：未预期抛错仍传回工具层，避免假「已交卷」
-    console.error("[chat-mcp] awaiting notifier failed:", err);
+    console.error("[chat-pending] awaiting notifier failed:", err);
     return {
       status: "error",
       message: err instanceof Error ? err.message : String(err),
@@ -623,14 +624,14 @@ export const safeNotifyAskUserRequest = async (
   // ask 通知同样核对（登记 pendingAsk 已在工具层先挡）
   if (!matchExpectedCallerToken(taskId, args.callerToken)) {
     console.warn(
-      `[chat-mcp] safeNotifyAskUserRequest: caller 不匹配 task=${taskId}、忽略`,
+      `[chat-pending] safeNotifyAskUserRequest: caller 不匹配 task=${taskId}、忽略`,
     );
     return { status: "mismatch" };
   }
   const notifier = awaitingNotifiers.get(taskId);
   if (!notifier) {
     console.warn(
-      `[chat-mcp] safeNotifyAskUserRequest: 没找到 task=${taskId} 的 notifier（已注册 ${awaitingNotifiers.size} 个）`,
+      `[chat-pending] safeNotifyAskUserRequest: 没找到 task=${taskId} 的 notifier（已注册 ${awaitingNotifiers.size} 个）`,
     );
     return { status: "no_notifier" };
   }
@@ -659,7 +660,7 @@ export const safeNotifyAskUserRequest = async (
     }
     return { status: "accepted" };
   } catch (err) {
-    console.error("[chat-mcp] ask_user_request notifier failed:", err);
+    console.error("[chat-pending] ask_user_request notifier failed:", err);
     return {
       status: "error",
       message: err instanceof Error ? err.message : String(err),

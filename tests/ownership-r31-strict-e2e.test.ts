@@ -397,6 +397,7 @@ describe("R31 / R30-3：task-store 客户端透传 persistWarning", () => {
           JSON.stringify({
             ok: true,
             persistWarning: WARNING,
+            task: { id: "t3" },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         ),
@@ -411,6 +412,7 @@ describe("R31 / R30-3：task-store 客户端透传 persistWarning", () => {
     );
     expect(result.ok).toBe(true);
     expect(result.persistWarning).toBe(WARNING);
+    expect(result.task?.id).toBe("t3");
   });
 });
 

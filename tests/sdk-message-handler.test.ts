@@ -110,7 +110,7 @@ describe("handleSdkMessage 交卷/提问后收尾（交卷后答案照常广播�
       call_id: "call-submit",
       name: "mcp",
       status: "completed",
-      args: { providerIdentifier: "flowshipChat", toolName: "submit_work" },
+      args: { providerIdentifier: "custom-user-tools", toolName: "submit_work" },
       result,
     }) as never;
 
@@ -249,7 +249,7 @@ describe("handleSdkMessage 交卷/提问后收尾（交卷后答案照常广播�
         call_id: "call-ask",
         name: "mcp",
         status: "completed",
-        args: { providerIdentifier: "flowshipChat", toolName: "ask_user" },
+        args: { providerIdentifier: "custom-user-tools", toolName: "ask_user" },
         result: "[ASK_SUBMITTED] 问题组 ask_x 已推送给用户（UI 答题卡）。",
       } as never,
       ctx,
@@ -326,6 +326,110 @@ describe("handleSdkMessage 交卷/提问后收尾（交卷后答案照常广播�
     ).toBe(false);
   });
 
+  it("提问成功后再调 read：只消音、不结束本轮", async () => {
+    const ctx: AssistantBufferCtx = {
+      buffer: "",
+      flush: async () => {},
+      askSeen: false,
+    };
+
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-ask",
+        name: "ask_user",
+        status: "completed",
+        result: "[ASK_SUBMITTED] 问题组 ask_x 已推送给用户（UI 答题卡）。",
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.askSeen).toBe(true);
+
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-read",
+        name: "read",
+        status: "running",
+        args: { path: "/tmp/x" },
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.askSeen).toBe(true);
+    const mutedRead = appendEvent.mock.calls.filter(
+      (c) =>
+        c[1]?.kind === "tool_call" &&
+        c[1]?.meta?.callId === "call-read" &&
+        c[1]?.meta?.muted === true,
+    );
+    expect(mutedRead).toHaveLength(1);
+
+    const ctxWait: AssistantBufferCtx = {
+      buffer: "",
+      flush: async () => {},
+      askSeen: true,
+    };
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-curl",
+        name: "Shell",
+        status: "running",
+        args: {
+          command:
+            'curl -NsS --no-buffer "http://127.0.0.1:8676/api/tasks/t1/ask-wait?token=abc"',
+        },
+      } as never,
+      ctxWait,
+      leaseOk,
+    );
+    expect(ctxWait.askSeen).toBe(true);
+    // 等答案 curl 也消音：对用户是协议内部步骤，事件流只留答题卡
+    const waitCurl = appendEvent.mock.calls.filter(
+      (c) =>
+        c[1]?.kind === "tool_call" &&
+        c[1]?.meta?.callId === "call-curl" &&
+        c[1]?.meta?.muted === true,
+    );
+    expect(waitCurl).toHaveLength(1);
+    expect(
+      writeOwnedEventAndPublish.mock.calls.some(
+        (c) => c[2]?.meta?.callId === "call-curl",
+      ),
+    ).toBe(false);
+  });
+
+  it("ask-wait curl 吐出 [ASK_USER_REPLY] 后清 askSeen，同一轮可再问", async () => {
+    const ctx: AssistantBufferCtx = {
+      buffer: "",
+      flush: async () => {},
+      askSeen: true,
+    };
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-curl-done",
+        name: "Shell",
+        status: "completed",
+        args: {
+          command:
+            'curl -NsS --no-buffer "http://127.0.0.1:8676/api/tasks/t1/ask-wait?token=abc"',
+        },
+        result:
+          "# ask-wait connected\n[ASK_USER_REPLY]\n\nQ1: 能看到吗？\n答：能看到",
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.askSeen).toBe(false);
+  });
+
   it("提问失败（未受理）不消音：模型后续正文仍正常缓冲", async () => {
     const ctx: AssistantBufferCtx = { buffer: "", flush: async () => {}, askSeen: false };
 
@@ -336,7 +440,7 @@ describe("handleSdkMessage 交卷/提问后收尾（交卷后答案照常广播�
         call_id: "call-ask-fail",
         name: "mcp",
         status: "completed",
-        args: { providerIdentifier: "flowshipChat", toolName: "ask_user" },
+        args: { providerIdentifier: "custom-user-tools", toolName: "ask_user" },
         result: "交卷未受理：任务当前没有活跃会话桥、请结束本轮回复",
       } as never,
       ctx,

@@ -713,6 +713,7 @@ export const ChatView = ({
           onStop={handleStop}
           stopping={stopping}
           onPrependEvents={onPrependEvents}
+          onTaskUpdate={onTaskUpdate}
           onRewind={handleRewind}
           pendingLocalReplies={pendingForStream}
           queueBanner={queueBanner}

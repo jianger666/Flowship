@@ -22,6 +22,7 @@ import {
 } from "@/lib/server/chat-pending";
 import { deliverChatAskReply, hasChatSession } from "@/lib/server/chat-runner";
 import { deliverAskReply } from "@/lib/server/task-runner";
+import { fulfillAskWait } from "@/lib/server/ask-wait";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import { getTask } from "@/lib/server/task-fs";
 import {
@@ -149,15 +150,18 @@ export const injectPendingAskText = async (
 
   const paths =
     imageAbsPaths && imageAbsPaths.length > 0 ? imageAbsPaths : undefined;
-  const ok = isChat
-    ? await deliverChatAskReply(task, replyText, paths, bootArgs)
-    : (await deliverAskReply(
-        task,
-        replyText,
-        paths,
-        reqEvent?.actionId,
-        bootArgs,
-      )) === "sent";
+  const viaWait = await fulfillAskWait(taskId, pending.askId, replyText);
+  const ok = viaWait
+    ? true
+    : isChat
+      ? await deliverChatAskReply(task, replyText, paths, bootArgs)
+      : (await deliverAskReply(
+          task,
+          replyText,
+          paths,
+          reqEvent?.actionId,
+          bootArgs,
+        )) === "sent";
   if (!ok) {
     // 会话还活着 = 只是这次忙 → 放回去让人重试；
     // 会话已死且无法唤醒 → 不放回（与 ask-reply 一致：这组问题就此作废、改走 question 通道）

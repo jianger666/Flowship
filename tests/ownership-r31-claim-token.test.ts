@@ -110,9 +110,9 @@ const {
 } = await import("@/lib/server/action-side-effects");
 type ClaimHandle = import("@/lib/server/action-side-effects").ClaimHandle;
 const {
-  dispatchAskUserForTest,
-  dispatchSubmitWorkForTest,
-} = await import("@/lib/server/chat-mcp");
+  dispatchAskUser,
+  dispatchSubmitWork,
+} = await import("@/lib/server/flowship-tools");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
@@ -534,7 +534,7 @@ describe("ownership R31 claim token + ask outcome", () => {
       });
 
       const hang = installHangingFailpoint("mcp.askUser.afterSupersede");
-      const pAsk = dispatchAskUserForTest({
+      const pAsk = dispatchAskUser({
         taskId: id,
         callerToken: tokenA,
         actionId: "act_ship",
@@ -582,7 +582,7 @@ describe("ownership R31 claim token + ask outcome", () => {
         gitToken: "pat-r31-5",
       });
 
-      const result = await dispatchSubmitWorkForTest({
+      const result = await dispatchSubmitWork({
         taskId: id,
         callerToken: tokenB,
       });

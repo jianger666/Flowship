@@ -1,25 +1,21 @@
 "use client";
 
 /**
- * 「疑似卡住」提示（v1.8.x）：agent 活跃运行（runStatus=running）但超过
- * SUSPECT_STUCK_MS 没有任何活跃信号 → 输入框附近给一个只读小提示。
+ * 「疑似卡住」提示：agent 在跑（runStatus=running），但事件流 / 流式输出
+ * 已经超过 5 分钟没有任何更新。判定见 `@/lib/suspect-stuck`。
  *
- * 活跃信号 = 持久事件（task.updatedAt，服务端 ~5s 节流）+ assistant 流式 delta
- * + 工具输出直播（chat 模式）。ask_user / 交卷等待时服务端会把 runStatus 归回
- * awaiting_user、不在判定窗口内，不会误伤。
- *
- * 只提示、不做任何中断动作——长命令静默超过阈值时宁可多一个提示（行内文案已说明）。
- * chat / task 两处输入框共用本组件。
+ * 只提示、不中断。交卷后 runStatus 归 awaiting_user，不在判定窗口。
+ * 提问后 runStatus 仍是 running（等答案靠 curl）——有未答提问也不亮。
  */
 
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { findPendingAskEvent } from "@/lib/ask-pending";
 import type { Task } from "@/lib/types";
+import { isSuspectStuck, latestEventTs } from "@/lib/suspect-stuck";
 
-/** 阈值：正常活跃间隙实测最长 ~40s（工具调用），5 分钟余量足够 */
-export const SUSPECT_STUCK_MS = 5 * 60 * 1000;
 /** 判定轮询间隔（轻量、只在页面开着时跑） */
 const STUCK_TICK_MS = 30 * 1000;
 
@@ -38,43 +34,52 @@ export const SuspectStuckHint = ({
   liveToolOutputs,
   className,
 }: SuspectStuckHintProps) => {
-  const lastActivityAtRef = useRef<number>(Date.now());
+  // 流式 delta / 工具直播没有持久 ts，用收到时刻当活跃锚
+  const lastLiveAtRef = useRef(0);
   const [stuck, setStuck] = useState(false);
-  const anchoredRef = useRef(false);
+  const lastEventAt = latestEventTs(task.events);
+  // 和悬浮条 / 推进按钮同一判定：有未答提问 = 在等你，不是卡住
+  const awaitingAsk = !!findPendingAskEvent(task.events);
 
-  // 持久事件 / task 快照：updatedAt 每有新事件都会前进。
-  // 首帧直接以 updatedAt 为锚——页面打开时任务可能已经静默很久（卡住态要立即亮）
   useEffect(() => {
-    if (!anchoredRef.current) {
-      lastActivityAtRef.current = task.updatedAt;
-      anchoredRef.current = true;
-    } else if (task.updatedAt > lastActivityAtRef.current) {
-      lastActivityAtRef.current = task.updatedAt;
-    }
-  }, [task.updatedAt]);
+    lastLiveAtRef.current = 0;
+  }, [task.id, task.runStatus]);
 
-  // assistant 流式 delta：正在吐字 = 活跃
   useEffect(() => {
-    if (streamingText) lastActivityAtRef.current = Date.now();
+    if (streamingText) lastLiveAtRef.current = Date.now();
   }, [streamingText]);
 
-  // 工具输出直播：长命令持续吐输出 = 活跃（chat 模式才有）
   useEffect(() => {
-    lastActivityAtRef.current = Date.now();
+    if (!liveToolOutputs) return;
+    for (const v of Object.values(liveToolOutputs)) {
+      if (v) {
+        lastLiveAtRef.current = Date.now();
+        return;
+      }
+    }
   }, [liveToolOutputs]);
 
-  // 判定：runStatus 变 running 时重启计时；events 高频变化不重启（只读 runStatus / id）
   useEffect(() => {
     const running = task.runStatus === "running";
     const tick = () => {
       setStuck(
-        running && Date.now() - lastActivityAtRef.current > SUSPECT_STUCK_MS,
+        isSuspectStuck(running, lastEventAt, lastLiveAtRef.current, Date.now(), {
+          awaitingAsk,
+        }),
       );
     };
     tick();
+    if (!running) return;
     const iv = setInterval(tick, STUCK_TICK_MS);
     return () => clearInterval(iv);
-  }, [task.id, task.runStatus]);
+  }, [
+    task.id,
+    task.runStatus,
+    lastEventAt,
+    awaitingAsk,
+    streamingText,
+    liveToolOutputs,
+  ]);
 
   if (!stuck) return null;
 

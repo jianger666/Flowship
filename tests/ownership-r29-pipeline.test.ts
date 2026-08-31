@@ -43,7 +43,7 @@ const {
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
 } = await import("@/lib/server/chat-pending");
-const { dispatchAskUserForTest } = await import("@/lib/server/chat-mcp");
+const { dispatchAskUser } = await import("@/lib/server/flowship-tools");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
@@ -190,7 +190,7 @@ describe("ownership-r29-pipeline（事件 publish / ask 反登记 / seq）", () 
       token,
     );
 
-    const result = await dispatchAskUserForTest({
+    const result = await dispatchAskUser({
       taskId: id,
       callerToken: token,
       actionId: "act_r29",
@@ -218,7 +218,7 @@ describe("ownership-r29-pipeline（事件 publish / ask 反登记 / seq）", () 
     setChatAwaitingNotifier(id, async () => "accepted" as const, tokenA);
 
     // 入口 mismatch：不登记 pending（R24-6 既有）
-    const rejected = await dispatchAskUserForTest({
+    const rejected = await dispatchAskUser({
       taskId: id,
       callerToken: tokenB,
       questions: [{ id: "q1", question: "错 token？", allowText: true }],
@@ -228,7 +228,7 @@ describe("ownership-r29-pipeline（事件 publish / ask 反登记 / seq）", () 
 
     // 合法 token、但 notifier 已清 → register 后 notify 早退 → 反登记
     setChatAwaitingNotifier(id, null);
-    const noNotifier = await dispatchAskUserForTest({
+    const noNotifier = await dispatchAskUser({
       taskId: id,
       callerToken: tokenA,
       questions: [{ id: "q1", question: "notifier 被清？", allowText: true }],

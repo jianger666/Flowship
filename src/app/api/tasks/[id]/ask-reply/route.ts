@@ -21,7 +21,7 @@
  *
  * 1. 校验 task / askId / 没被答过 / pendingAsk 仍是这组问题（token 防旧弹窗答案串新提问）
  * 2. 逐题落盘各自的图、拼接 [ASK_USER_REPLY] 文本（每题答案下内联「本题附图：<basename>」做归属）
- * 3. `agent.send([ASK_USER_REPLY]…)` 续同一会话送达答案（deliverAskReply）
+ * 3. 若 ask-wait curl 已挂上：答案写进 stdout（同一轮继续）。否则 `agent.send([ASK_USER_REPLY]…)` 续会话
  * 4. 写 ask_user_reply 事件（meta 带 askId + answers + deferred + images 扁平数组给前端渲缩略图）+ publish SSE
  * 5. 响应里的 task 现读 getTask（不再迟到刷 running——deliver/consume 内部已有 owner 门控写）
  */
@@ -38,7 +38,13 @@ import type {
   ImageAttachmentInput,
   ImageAttachmentSaved,
 } from "@/lib/server/task-artifacts";
-import { extractAskQuestions, isAskSkipped } from "@/lib/ask-pending";
+import {
+  ASK_EXPIRED_USER_MESSAGE,
+  extractAskQuestions,
+  isAskExpired,
+  isAskSkipped,
+  isAskSuperseded,
+} from "@/lib/ask-pending";
 import {
   clearPendingAsk,
   getPendingAsk,
@@ -54,6 +60,7 @@ import {
   supersedePendingAsks,
   TASK_OP_STALE_HTTP_MESSAGE,
 } from "@/lib/server/task-runner";
+import { fulfillAskWait } from "@/lib/server/ask-wait";
 import {
   deliverChatAskReply,
   hasChatSession,
@@ -285,6 +292,13 @@ const handleAskReply = async (
   // 答案不能再送达（agent 那边已经按新消息继续了），温和拒绝、不走下面的僵尸唤醒
   if (isAskSkipped(task.events, askId)) {
     return errorResponse("这组提问已跳过（你发了新消息）、无需再回答", 409);
+  }
+  if (isAskExpired(task.events, askId)) {
+    return errorResponse(ASK_EXPIRED_USER_MESSAGE, 409);
+  }
+  // 停止 / 换 agent 等中性作废：卡还在是 SSE 滞后，别再走僵尸唤醒
+  if (isAskSuperseded(task.events, askId)) {
+    return errorResponse("这组提问已失效、无需再回答", 409);
   }
 
   const questions = extractAskQuestions(reqEvent.meta);
@@ -713,10 +727,11 @@ const handleAskReply = async (
         410,
       );
     }
-    return errorResponse(
-      `agent 当前没在等问答（task.runStatus=${fresh.runStatus}）`,
-      409,
-    );
+    // idle / 其它：24h 硬超时或会话已关，答题卡不该再 Amber。补过期标记让 SSE 收卡。
+    await supersedePendingAsks(task.id, "等待超过 24 小时", undefined, {
+      expired: true,
+    });
+    return errorResponse(ASK_EXPIRED_USER_MESSAGE, 409);
   }
 
   console.log(
@@ -738,6 +753,22 @@ const handleAskReply = async (
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
+  // 同一轮 curl 已挂上（或秒答后在时限内挂上）：答案写进 stdout，不 send。
+  // 时限内没挂上才走原来的 send，避免和还在路上的 curl 撞车。
+  const viaWait = await fulfillAskWait(task.id, askId, agentText);
+  if (isTaskOpStale(task.id, opGen) && !viaWait) {
+    giveBackPending();
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+  if (viaWait) {
+    keepPendingClaimed();
+    const resumed = await setTaskRunStatusIfRunOwner(
+      task.id,
+      "running",
+      () => !isTaskOpStale(task.id, opGen),
+    );
+    if (resumed) publishTaskStreamEvent(task.id, { kind: "task", task: resumed });
+  } else {
   // V0.11：`agent.send` 送达答案——成功了才写「已答」事件 + publish（顺序关键：先送再落
   // 事件、失败不写、防「用户看到已答、agent 没收到」的假已答）。send 成功即清 pendingAsk。
   // chat → deliverChatAskReply（runningChats）；task → deliverAskReply（agentSessions）
@@ -801,6 +832,8 @@ const handleAskReply = async (
       );
     }
   }
+  }
+
   // 答案已送达（登记在入口就摘走了、无需再清）→ 交出所有权，后面再抛也不许放回
   keepPendingClaimed();
 

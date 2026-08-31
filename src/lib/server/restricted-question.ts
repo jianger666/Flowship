@@ -228,7 +228,7 @@ export const startRestrictedGroupQuestion = (
           apiKey: creds.apiKey,
           model: creds.model,
           // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入。
-          // 刻意不传 mcpServers：chat-tool（交卷 / 提问 / 提 MR）与用户 MCP 一个都不给。
+          // 刻意不传 mcpServers / callerToken：系统工具（交卷 / 提问 / 提 MR）与用户 MCP 一个都不给。
           local: { cwd, settingSources: [] },
         }),
         SDK_CREATE_RESUME_TIMEOUT_MS,

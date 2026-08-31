@@ -14,6 +14,8 @@ import {
 } from "@/lib/custom-effort";
 import {
   buildModelsDevIndex,
+  catalogModelHasImageInput,
+  catalogPiInputModalities,
   lookupCatalogReasoning,
 } from "@/lib/server/models-dev-catalog";
 
@@ -201,6 +203,105 @@ describe("custom-effort / models.dev", () => {
       "off",
       "max",
     ]);
+  });
+
+  it("图像能力：attachment 或 modalities.input 含 image 即标多模态", () => {
+    expect(
+      catalogModelHasImageInput({
+        attachment: true,
+        modalities: { input: ["text"] },
+      }),
+    ).toBe(true);
+    expect(
+      catalogModelHasImageInput({
+        attachment: false,
+        modalities: { input: ["text", "image", "video"] },
+      }),
+    ).toBe(true);
+    expect(
+      catalogModelHasImageInput({
+        attachment: false,
+        modalities: { input: ["text"] },
+      }),
+    ).toBe(false);
+    expect(catalogModelHasImageInput(null)).toBe(false);
+    expect(catalogPiInputModalities(true)).toEqual(["text", "image"]);
+    expect(catalogPiInputModalities(false)).toEqual(["text"]);
+    expect(catalogPiInputModalities(undefined)).toEqual(["text"]);
+  });
+
+  it("glm-5.3-flash 式条目标多模态；纯文本 glm-5.3 不标", () => {
+    const index = buildModelsDevIndex({
+      zai: {
+        models: {
+          "glm-5.3-flash": {
+            attachment: true,
+            modalities: { input: ["text", "image", "video"] },
+          },
+          "glm-5.3": {
+            attachment: false,
+            modalities: { input: ["text"] },
+          },
+        },
+      },
+    });
+    expect(lookupCatalogReasoning(index, "glm-5.3-flash")?.imageInput).toBe(true);
+    expect(lookupCatalogReasoning(index, "glm-5.3")?.imageInput).toBe(false);
+    expect(lookupCatalogReasoning(index, "unknown-local")?.imageInput).toBeUndefined();
+  });
+
+  it("同 id 图像能力 OR：huggingface 纯文本盖不掉官方多模态", () => {
+    const hfThenOfficial = buildModelsDevIndex({
+      huggingface: {
+        models: {
+          "glm-5.3-flash": {
+            attachment: false,
+            modalities: { input: ["text"] },
+            reasoning: true,
+            reasoning_options: [{ type: "effort", values: ["low"] }],
+          },
+        },
+      },
+      zai: {
+        models: {
+          "glm-5.3-flash": {
+            attachment: true,
+            modalities: { input: ["text", "image"] },
+            reasoning: true,
+            reasoning_options: [{ type: "effort", values: ["none", "max"] }],
+          },
+        },
+      },
+    });
+    expect(lookupCatalogReasoning(hfThenOfficial, "glm-5.3-flash")?.imageInput).toBe(
+      true,
+    );
+
+    const officialThenWorse = buildModelsDevIndex({
+      zhipuai: {
+        models: {
+          "glm-5.3-flash": {
+            attachment: false,
+            modalities: { input: ["text"] },
+            reasoning: true,
+            reasoning_options: [{ type: "effort", values: ["high"] }],
+          },
+        },
+      },
+      huggingface: {
+        models: {
+          "glm-5.3-flash": {
+            attachment: true,
+            modalities: { input: ["text", "image"] },
+          },
+        },
+      },
+    });
+    const hit = lookupCatalogReasoning(officialThenWorse, "glm-5.3-flash");
+    expect(hit?.imageInput).toBe(true);
+    // 档位仍跟更高优先级的 zhipuai，不跟 huggingface
+    expect(hit?.providerId).toBe("zhipuai");
+    expect(hit?.effortValues).toEqual(["high"]);
   });
 
   it("thinkingLevelMap：没有的档写 null，有 none 才允许关", () => {

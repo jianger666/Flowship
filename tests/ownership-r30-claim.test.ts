@@ -104,7 +104,7 @@ const {
   tryClaimSideEffect,
 } = await import("@/lib/server/action-side-effects");
 const { mapSubmitWorkNotifyToToolText } = await import(
-  "@/lib/server/chat-mcp"
+  "@/lib/server/flowship-tools"
 );
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {

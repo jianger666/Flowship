@@ -101,7 +101,7 @@ const {
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
 } = await import("@/lib/server/chat-pending");
-const { dispatchAskUserForTest } = await import("@/lib/server/chat-mcp");
+const { dispatchAskUser } = await import("@/lib/server/flowship-tools");
 const { handleSdkMessage } = await import("@/lib/server/sdk-message-handler");
 const { getTask, listTasks } = await import("@/lib/server/task-fs");
 const {
@@ -385,7 +385,7 @@ describe("ownership R24 wave2", () => {
     registerBridgesForTest(task, { callerToken: tokenB });
     expect(getExpectedCallerToken(id)).toBe(tokenB);
 
-    const rejected = await dispatchAskUserForTest({
+    const rejected = await dispatchAskUser({
       taskId: id,
       callerToken: tokenA,
       actionId: "act_shared",
@@ -397,7 +397,7 @@ describe("ownership R24 wave2", () => {
     expect(getPendingAsk(id)).toBeNull();
 
     // B 自己的调用正常
-    const ok = await dispatchAskUserForTest({
+    const ok = await dispatchAskUser({
       taskId: id,
       callerToken: tokenB,
       actionId: "act_shared",

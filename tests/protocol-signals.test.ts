@@ -17,7 +17,7 @@ import {
   SIGNAL_PREFIXES,
   buildNextActionHead,
 } from "@/lib/protocol-signals";
-import { askSubmittedText, mapSubmitWorkNotifyToToolText } from "@/lib/server/chat-mcp";
+import { askSubmittedText, mapSubmitWorkNotifyToToolText } from "@/lib/server/flowship-tools";
 
 const promptsDir = path.resolve(import.meta.dirname, "..", "prompts");
 const superMd = readFileSync(path.join(promptsDir, "_super.md"), "utf-8");
@@ -40,7 +40,7 @@ describe("信号常量 ↔ _super.md 一致性", () => {
   });
 
   it("工具返回头（SUBMITTED / ASK_SUBMITTED / ASK_USER_REPLY）在 _super.md 出现", () => {
-    // 这些头由 chat-mcp 工具返回 / ask-reply 路由拼、_super.md 教 agent 怎么读
+    // 这些头由系统工具返回 / ask-reply 路由拼、_super.md 教 agent 怎么读
     expect(superMd).toContain("[SUBMITTED]");
     expect(superMd).toContain("[ASK_SUBMITTED]");
     expect(superMd).toContain("[ASK_USER_REPLY]");
@@ -181,13 +181,19 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
 });
 
 describe("ask_user 收尾文案（对齐 Cursor SDK、去掉空完成硬限制）", () => {
-  it("askSubmittedText 结束本轮、告知静音、不硬限制输出、不对抗宿主续跑", () => {
-    const text = askSubmittedText("ask_test");
+  it("askSubmittedText 引导前台 curl 等答案、不硬限制输出、不对抗宿主续跑", () => {
+    const text = askSubmittedText(
+      "ask_test",
+      'curl -NsS --no-buffer "http://127.0.0.1:8676/api/tasks/t1/ask-wait?token=abc"',
+    );
     expect(text).not.toContain("不要再输出任何文本");
     expect(text).not.toContain("Please continue");
-    expect(text).toContain("静音");
     expect(text).toContain("[ASK_SUBMITTED]");
     expect(text).toContain("[ASK_USER_REPLY]");
+    expect(text).toContain("ask-wait");
+    expect(text).toContain("前台");
+    expect(text).toContain("86400000");
+    expect(text).not.toContain("wait-ack");
   });
 });
 

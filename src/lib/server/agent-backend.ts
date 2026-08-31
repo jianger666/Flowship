@@ -29,6 +29,7 @@ import { withoutHiddenModelSelection } from "@/lib/model-params";
 import { isCursorProvider } from "@/lib/types";
 
 import type { CustomAgentInput } from "./custom-agent-backend";
+import { withFlowshipSdkCustomTools } from "./flowship-tools";
 import { withCursorJsonlStore } from "./sdk-agent-store";
 import { readSettingsFile } from "./settings-fs";
 
@@ -53,20 +54,43 @@ type CursorCreateInput = Parameters<typeof CursorAgent.create>[0];
 type CursorResumeInput = Parameters<typeof CursorAgent.resume>[1];
 type CursorPromptInput = Parameters<typeof CursorAgent.prompt>[1];
 
-/** facade 额外带本窗口 providerId，传给 SDK 前会剥掉 */
-export type AgentCreateInput = CursorCreateInput & { providerId?: string };
+/** facade 额外字段，传给 SDK 前会剥掉 */
+export type AgentCreateInput = CursorCreateInput & {
+  providerId?: string;
+  /** 正式会话身份；有值才挂系统 customTools。oneshot / 受限答疑不传。 */
+  callerToken?: string;
+};
 export type AgentResumeInput = NonNullable<CursorResumeInput> & {
   providerId?: string;
+  callerToken?: string;
 };
 export type AgentPromptInput = NonNullable<CursorPromptInput> & {
   providerId?: string;
 };
 
-const stripProviderId = <T extends { providerId?: string }>(
+type FacadeExtras = { providerId?: string; callerToken?: string };
+
+const stripFacadeExtras = <T extends FacadeExtras>(
   input: T,
-): { providerId?: string; rest: Omit<T, "providerId"> } => {
-  const { providerId, ...rest } = input;
-  return { providerId, rest };
+): {
+  providerId?: string;
+  callerToken?: string;
+  rest: Omit<T, "providerId" | "callerToken">;
+} => {
+  const { providerId, callerToken, ...rest } = input;
+  return { providerId, callerToken, rest };
+};
+
+/** Cursor 路径：正式会话把系统工具挂进 local.customTools */
+const attachFlowshipTools = <T extends { local?: CursorCreateInput["local"] }>(
+  input: T,
+  callerToken: string | undefined,
+): T => {
+  if (!callerToken) return input;
+  return {
+    ...input,
+    local: withFlowshipSdkCustomTools(input.local, callerToken),
+  };
 };
 
 /** 上下文窗口不给用户选、发给 SDK 前剥掉，走模型默认 */
@@ -141,7 +165,7 @@ export const resolveProviderIdFromDisk = async (task: {
  */
 export const Agent = {
   async create(input: AgentCreateInput): Promise<AgentInstance> {
-    const { providerId, rest } = stripProviderId(input);
+    const { providerId, callerToken, rest } = stripFacadeExtras(input);
     const creds = await resolveBackendCreds(rest.apiKey ?? "", providerId);
     const sanitized = stripHiddenModelParams(rest);
     if (creds.kind === "custom") {
@@ -149,16 +173,19 @@ export const Agent = {
       return createCustomAgent({
         ...sanitized,
         ...creds,
+        callerToken,
       } as CustomAgentInput) as unknown as AgentInstance;
     }
-    return CursorAgent.create(await withCursorJsonlStore(sanitized));
+    return CursorAgent.create(
+      await withCursorJsonlStore(attachFlowshipTools(sanitized, callerToken)),
+    );
   },
 
   async resume(
     agentId: string,
     input: AgentResumeInput,
   ): Promise<AgentInstance> {
-    const { providerId, rest } = stripProviderId(input);
+    const { providerId, callerToken, rest } = stripFacadeExtras(input);
     const creds = await resolveBackendCreds(
       rest.apiKey ?? "",
       providerId,
@@ -170,11 +197,12 @@ export const Agent = {
       return resumeCustomAgent(agentId, {
         ...sanitized,
         ...creds,
+        callerToken,
       } as CustomAgentInput) as unknown as AgentInstance;
     }
     return CursorAgent.resume(
       agentId,
-      await withCursorJsonlStore(sanitized),
+      await withCursorJsonlStore(attachFlowshipTools(sanitized, callerToken)),
     );
   },
 
@@ -182,7 +210,7 @@ export const Agent = {
     prompt: string,
     input: AgentPromptInput,
   ): Promise<Awaited<ReturnType<typeof CursorAgent.prompt>>> {
-    const { providerId, rest } = stripProviderId(input);
+    const { providerId, rest } = stripFacadeExtras(input);
     const creds = await resolveBackendCreds(rest.apiKey ?? "", providerId);
     const sanitized = stripHiddenModelParams(rest);
     if (creds.kind === "custom") {

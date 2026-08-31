@@ -131,11 +131,15 @@ export const mergeTaskEvents = (prev: Task | null, next: Task): Task => {
       !prevIds.has(e.id) &&
       e.ts >= lastTs,
   );
-  return {
-    ...next,
-    events: newer.length > 0 ? [...prev.events, ...newer] : prev.events,
-    eventsTruncated: next.eventsTruncated ?? prev.eventsTruncated,
-  };
+  const events =
+    newer.length > 0 ? [...prev.events, ...newer] : prev.events;
+  const eventsTruncated = next.eventsTruncated ?? prev.eventsTruncated;
+  // 过期快照不得盖运行态：失败 done 若晚于唤醒后的 running 到达，
+  // 会把顶栏打回「失败」、输入条解锁，而 agent 其实已经在跑。
+  if (next.updatedAt < prev.updatedAt) {
+    return { ...prev, events, eventsTruncated };
+  }
+  return { ...next, events, eventsTruncated };
 };
 
 // ----------------- 创建 / 删除 / 配置 patch -----------------
@@ -1163,7 +1167,7 @@ export const submitAskReply = async (
   askId: string,
   answers: AskUserAnswer[],
   // V0.8.3：imagesByQuestion key=questionId、每题各自绑各自的图（图-only 也算已答）
-  // signal：答题卡 30s 超时解锁时 abort，避免旧请求迟到与重试撞重复回答
+  // signal：调用方可中止；答题卡不再用 30s abort（会把还在送的答案掐掉）
   options?: {
     deferred?: boolean;
     imagesByQuestion?: Record<string, ImagePayload[]>;
@@ -1171,7 +1175,7 @@ export const submitAskReply = async (
     skills?: Array<{ name: string; absPath: string }>;
     signal?: AbortSignal;
   },
-): Promise<{ ok: true; persistWarning?: string }> => {
+): Promise<{ ok: true; persistWarning?: string; task?: Task }> => {
   // 只发非空的题图、避免 body 里塞一堆空数组
   const imagesByQuestion = options?.imagesByQuestion
     ? Object.fromEntries(
@@ -1207,13 +1211,16 @@ export const submitAskReply = async (
       }),
     },
   );
-  // 透传 persistWarning
-  const data = await handleJson<{ ok: true; persistWarning?: string }>(res);
+  // 透传 persistWarning；task 给答题卡立刻收起（完成信号由提交者发出，不单等 SSE）
+  const data = await handleJson<{ ok: true; persistWarning?: string; task?: Task }>(
+    res,
+  );
   return {
     ok: true as const,
     ...(typeof data.persistWarning === "string"
       ? { persistWarning: data.persistWarning }
       : {}),
+    ...(data.task ? { task: data.task } : {}),
   };
 };
 

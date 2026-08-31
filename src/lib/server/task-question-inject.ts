@@ -30,7 +30,12 @@ import {
   saveImageAttachments,
   snapshotActionArtifact,
 } from "@/lib/server/task-artifacts";
-import { beginAskSkip, type AskSkipHandle } from "@/lib/server/ask-skip";
+import { findPendingAskEvent } from "@/lib/ask-pending";
+import {
+  beginAskSkip,
+  fulfillAskSkipViaWait,
+  type AskSkipHandle,
+} from "@/lib/server/ask-skip";
 import { startRestrictedGroupQuestion } from "@/lib/server/restricted-question";
 import {
   abortStuckRunForSend,
@@ -59,6 +64,7 @@ import {
   parseAndValidateImages,
   parseAndValidateSkills,
 } from "@/lib/server/route-helpers";
+import type { Task } from "@/lib/types";
 
 export interface TaskQuestionBody {
   text?: string;
@@ -85,7 +91,7 @@ export interface TaskQuestionInjectOptions {
   /**
    * 只答疑模式：需求群里**非任务所有者**发来的消息走这条（写操作只允许本人）。
    * 四处硬拦，不靠 prompt 自觉：
-   * - **绝不复用活会话**：活着的 agent 带完整 playbook + chat-tool MCP + 文件 / shell
+   * - **绝不复用活会话**：活着的 agent 带完整 playbook + 系统工具 + 文件 / shell
    *   权限，`agent.send` 进去等于把全权限交给群里任何人（action 刚跑完 awaiting_ack
    *   时会话常在，恰好也是播报刚发群、同事最可能回话的时刻）
    * - 不带 ackContext：不 snapshot 产物、不把 awaiting_ack 的 action 打回 running
@@ -109,6 +115,40 @@ export interface TaskQuestionInjectOptions {
 
 const MAX_IMAGES = 6;
 const MAX_ATTACHMENTS = 10;
+// skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
+
+/**
+ * 唤醒等到 running 落盘再让 HTTP 返回。
+ * 不能 await 整段 resume——后面还有 worktree / Agent.create，会把输入条卡在 submitting 几分钟。
+ * 测试 mock 若不调 onRunningCommitted、只 resolve，则退回 getTask 快照（旧 mock 仍 200）。
+ */
+const waitUntilResumeRunning = async (
+  resume: (onRunningCommitted: (task: Task) => void) => Promise<void>,
+  taskId: string,
+  fallback: Task,
+): Promise<Task> => {
+  // 已写成 running 的那份快照；回调先于 Agent.create
+  let committed: Task | null = null;
+  // 提前结束 HTTP 的 resolve；phase 1 失败走 reject
+  let settleEarly: ((task: Task) => void) | null = null;
+  let failEarly: ((err: unknown) => void) | null = null;
+  const early = new Promise<Task>((resolve, reject) => {
+    settleEarly = resolve;
+    failEarly = reject;
+  });
+
+  const resumed = resume((task) => {
+    committed = task;
+    settleEarly?.(task);
+  }).then(async () => committed ?? (await getTask(taskId)) ?? fallback);
+
+  // early 先赢时 resumed 仍在飞；phase 1 拒绝才传到 HTTP
+  void resumed.catch((err) => {
+    if (!committed) failEarly?.(err);
+  });
+
+  return Promise.race([early, resumed]);
+};
 // skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
 
 /**
@@ -185,12 +225,19 @@ const runTaskQuestionInject = async (
   // 有 pendingAsk 也不硬拦输入条：用户可绕过答题卡直接说话，那组提问按「隐式跳过」
   // 收口（见下方 beginAskSkip）。旧逻辑「先回答上方提问」在网断 / 会话死后把输入条
   // 和答题卡对锁——只能重新推进（同事反馈）。
+  // 同一轮 curl 还挂着等答案时 run 仍是 running：下面先放行，认领后写进 curl；
+  // 写不进再 409，绝不走 abortStuck 把还在等的 run 杀掉。
+  const pendingAskOpen = !!findPendingAskEvent(task.events);
 
   // run 还在表里：真·干活中 → 409；下面两类只是收尾还没 drain → 等 runner 退出再发。
   // - 已交卷（awaiting_ack）但收尾旁白未完：UI 已放开输入框，runningTasks 还占着
   // - 刚点停止：action 已 cancelled / runStatus 已 idle，但 consume finally 还没
   //   摘 runningTasks——这时 409「正在跑」会让用户停完立刻重发必失败（2026-08-21 实测）
-  if (runningTasks.has(task.id) || task.runStatus === "running") {
+  // - 有未答提问：输入条回车 = 顶掉这张卡，不在这里 409
+  if (
+    (runningTasks.has(task.id) || task.runStatus === "running") &&
+    !pendingAskOpen
+  ) {
     const currentActionId = task.currentActionId;
     const currentWhileRunning = task.actions.find(
       (a) => a.id === currentActionId,
@@ -312,12 +359,40 @@ const runTaskQuestionInject = async (
   const agentText =
     (askSkip?.hint ?? "") + buildSkillDirective(skills) + text;
 
+  // 同一轮 curl 还挂着：跳过正文写进 stdout，本轮继续。写进去了就不要 send。
+  const viaWait = askSkip
+    ? await fulfillAskSkipViaWait(task.id, askSkip, agentText, {
+        imageAbsPaths,
+        attachmentPaths:
+          attachmentPaths.length > 0 ? attachmentPaths : undefined,
+      })
+    : false;
+  if (
+    !viaWait &&
+    pendingAskOpen &&
+    (runningTasks.has(task.id) || task.runStatus === "running")
+  ) {
+    const currentActionId = task.currentActionId;
+    const currentWhileRunning = task.actions.find(
+      (a) => a.id === currentActionId,
+    );
+    const drainStatus = currentWhileRunning?.status;
+    const waitingForDrain =
+      drainStatus === "awaiting_ack" ||
+      drainStatus === "cancelled" ||
+      drainStatus === "error" ||
+      task.runStatus === "idle";
+    if (!waitingForDrain) {
+      return errorResponse("agent 正在跑、等它说完这轮再问", 409);
+    }
+  }
+
   // 用户显式选了模型 → 不续会话（会话模型锁死换不了）；
   // questionOnly（群里非属主）→ 同样不碰活会话：那是属主的全权限 agent（见选项注释）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
   // 两种「不送达」都视为无会话续接意图（走下方分流），不是 stale
   const deliverResult =
-    forceModel || questionOnly
+    viaWait || forceModel || questionOnly
       ? ("no_session" as const)
       : await deliverTaskQuestion(
           task,
@@ -330,10 +405,11 @@ const runTaskQuestionInject = async (
         );
 
   // stale → 409，绝不 fallback one-shot、不写事件、不写 running
-  if (deliverResult === "stale" || isTaskOpStale(task.id, opGen)) {
+  // 同一轮 curl 已经吃到跳过正文：世界变了也别把已写进 stdout 的当没送
+  if (!viaWait && (deliverResult === "stale" || isTaskOpStale(task.id, opGen))) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
-  const sent = deliverResult === "sent";
+  const sent = viaWait || deliverResult === "sent";
 
   // 会话接不回时的分流（V0.11.9 用户拍板「输入条覆盖旧重启、不多一条 action 链」）：
   // - 当前 action 停在半路（error / cancelled / 僵死 running）→ **唤醒模式**：
@@ -365,7 +441,8 @@ const runTaskQuestionInject = async (
   );
 
   // 写事件 / supersede / 置 running 前最后复查（含 useOneShot 窗口）
-  if (isTaskOpStale(task.id, opGen)) {
+  // 同一轮 curl 已吃到跳过正文：不要再因 stale 把已写进 stdout 的当没送
+  if (!viaWait && isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
@@ -379,7 +456,7 @@ const runTaskQuestionInject = async (
   }
 
   // commit 是 await——后再查一次再写「已送达」事件
-  if (isTaskOpStale(task.id, opGen)) {
+  if (!viaWait && isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
@@ -503,28 +580,61 @@ const runTaskQuestionInject = async (
       actionId: task.currentActionId ?? undefined,
       text: "正在唤醒当前阶段…",
     });
-    // 唤醒模式自己管状态（patch action running + runStatus + 事件）；失败标 error 有内部兜底
-    void resumeCurrentActionWithMessage({
-      task,
-      userMessage: agentText,
-      imagePaths: imageAbsPaths,
-      attachmentPaths: attachmentPaths.length > 0 ? attachmentPaths : undefined,
-      apiKey: apiKey!,
-      fallbackModel: fallbackModel!,
-      // 用户显式换的模型：唤醒的新 agent 直接用它跑（V0.13.x、不再锁进只读答疑）
-      forceModel,
-      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
-      opGen,
-    }).catch(async (err) => {
+    // 等到 running 落盘再 200：旧实现 fire-and-forget，HTTP 带回失败态快照，
+    // 详情页输入条不锁，用户再发就被 409「正在跑」。
+    // Agent.create 仍在回调之后继续，不堵在这一枪 HTTP 上。
+    let runningCommitted = false;
+    let resumedTask: Task;
+    try {
+      resumedTask = await waitUntilResumeRunning(
+        (onRunningCommitted) =>
+          resumeCurrentActionWithMessage({
+            task,
+            userMessage: agentText,
+            imagePaths: imageAbsPaths,
+            attachmentPaths:
+              attachmentPaths.length > 0 ? attachmentPaths : undefined,
+            apiKey: apiKey!,
+            fallbackModel: fallbackModel!,
+            // 用户显式换的模型：唤醒的新 agent 直接用它跑（V0.13.x、不再锁进只读答疑）
+            forceModel,
+            gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+            opGen,
+            onRunningCommitted: (next) => {
+              runningCommitted = true;
+              onRunningCommitted(next);
+            },
+          }).catch(async (err) => {
+            if (!runningCommitted) throw err;
+            // 已经 200 过：后面 worktree / create 失败只落事件，不把已返回的 HTTP 改失败
+            console.error(
+              `[question] task=${task.id} 唤醒当前 action 失败：`,
+              err,
+            );
+            await writeEventAndPublish(task.id, {
+              kind: "error",
+              text: `唤醒当前阶段失败：${err instanceof Error ? err.message : String(err)}`,
+            });
+          }),
+        task.id,
+        task,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       console.error(`[question] task=${task.id} 唤醒当前 action 失败：`, err);
-      // 唤醒失败审计事件写+publish 同链（best-effort 吞错）
       await writeEventAndPublish(task.id, {
         kind: "error",
-        text: `唤醒当前阶段失败：${err instanceof Error ? err.message : String(err)}`,
+        text: `唤醒当前阶段失败：${message}`,
       });
-    });
-    const fresh = await getTask(task.id);
-    return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
+      if (
+        message === TASK_OP_STALE_HTTP_MESSAGE ||
+        message.includes("正在停止")
+      ) {
+        return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+      }
+      return errorResponse(`唤醒当前阶段失败：${message}`, 500);
+    }
+    return new Response(JSON.stringify({ ok: true, task: resumedTask }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });

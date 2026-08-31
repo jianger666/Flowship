@@ -72,12 +72,12 @@ import {
   createSdkSummaryDeltaPublisher,
   createShellOutputDeltaPublisher,
 } from "./shell-output-bridge";
-import { getChatMcpUrl } from "./chat-mcp";
 import {
   buildAgentMessage,
   CALLER_MISMATCH_ERROR,
   cancelPending,
   cancelPendingIf,
+  clearAskTakenMark,
   getPendingAsk,
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
@@ -383,11 +383,9 @@ export const runWithTaskSendSerial = <T>(
 
 // ----------------- 配置 -----------------
 
-// task 不主动超时（用户随时可能 24h 后才 ack）
+// 整轮 run 硬顶 24h（ask-wait 挂着等答案也算在内）。超时未答会 expire 提问。
 const TASK_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
-// chat-mcp 在 Agent.mcpServers 里的注册名（agent prompt 里得点明、跟 V0.5 沿用）
-const TASK_TOOL_MCP_NAME = "flowshipChat";
 
 /** 对外保持 task-runner 原路径可 import（实现在 ask-supersede.ts） */
 export { supersedePendingAsks };
@@ -762,8 +760,8 @@ const runWkAdvanceGate = async (
  * V0.6 主推进入口
  *
  * 行为分支：
- *  1. 已有 running entry 在 chat-mcp pendingMap（agent 在待命态 / 等 ack）→ submitNextAction 续接
- *  2. 没 entry（首次启动 / agent 已退出 / 用户选 forceNewAgent）→ Agent.create + 启 Run
+ *  1. 已有保活会话 → agent.send 续接
+ *  2. 没有会话 / 用户选 forceNewAgent → Agent.create
  *
  * 调用方应保证：
  *  - task 已 hydrate（getTask 拿到非 null）
@@ -1518,6 +1516,12 @@ export interface ResumeCurrentActionInput {
    * 缺省则导出入口在进串行队列前同步取。
    */
   opGen?: number;
+  /**
+   * 状态已写成 running 并 publish 之后立刻回调（Agent.create / worktree 之前）。
+   * question 路由用它让 HTTP 在输入条该锁的时候就返回 running 快照；
+   * 缺省不阻塞。回调里不要 throw——后面还要起 agent。
+   */
+  onRunningCommitted?: (task: Task) => void;
 }
 
 export const resumeCurrentActionWithMessage = async (
@@ -1612,6 +1616,15 @@ const resumeCurrentActionCore = async (
     patchedTask.actions.find((a) => a.id === action.id) ?? action;
   publish(fresh.id, { kind: "task", task: patchedTask });
   publish(fresh.id, { kind: "action", action: patchedAction });
+  // 先 publish 再通知 HTTP：同一客户端 SSE 至少已经入队 running 帧。
+  try {
+    input.onRunningCommitted?.(patchedTask);
+  } catch (err) {
+    console.warn(
+      `[task-runner] onRunningCommitted 抛错（忽略）task=${fresh.id}`,
+      err,
+    );
+  }
   let startTask = patchedTask;
 
   // 唤醒当前 Action 也重新确认测试任务所在分支；否则用户在两轮之间手动切仓库，
@@ -2656,13 +2669,10 @@ export const buildSessionBridges = (
         cancelPendingIf(task.id, signal.askId);
         return "stale";
       }
-      const updated = await setTaskRunStatusIfRunOwner(
-        task.id,
-        "awaiting_user",
-        askLease,
-      );
-      if (updated) publish(task.id, { kind: "task", task: updated });
-      // ask 成功路径显式 accepted
+      // 同一轮 curl 还挂着等答案：runStatus 保持 running（shell 确实没结束）。
+      // 输入条能不能打字由 UI 看 pending ask，不靠切 awaiting_user。
+      const fresh = await getTask(task.id);
+      if (fresh && askLease()) publish(task.id, { kind: "task", task: fresh });
       return "accepted";
     }
 
@@ -2910,11 +2920,12 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     // 1) merge MCP（V0.11.1 抽成共用 helper、resume 会话时也要重传 inline MCP）
     const perfMcpStart = Date.now();
     const { mergedMcp, cursorMcpNames, droppedMcp } =
-      await buildMergedMcpForTask(task, callerToken);
+      await buildMergedMcpForTask(task);
     const perfMcpMs = Date.now() - perfMcpStart;
-    const mcpDesc = `Task MCP: ${TASK_TOOL_MCP_NAME}${
-      cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
-    }`;
+    const mcpDesc =
+      cursorMcpNames.length > 0
+        ? `系统工具 + MCP: ${cursorMcpNames.join(", ")}`
+        : "系统工具";
 
     // owner 语境（启动链、claim 前）——admission lease
     await writeOwnedEventAndPublish(
@@ -3049,10 +3060,12 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
                 apiKey,
                 model,
                 providerId: await resolveProviderIdFromDisk(task),
+                callerToken,
                 // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
                 // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills /
                 // inline mcpServers）；曾用 ["project"] 时 chat 未绑目录 cwd=homedir 会把
                 // ~/.cursor MCP 整包漏进 agent（实锤 bug）。
+                // 系统工具由 facade 按 callerToken 挂 local.customTools。
                 local: { cwd: effectiveCwd, settingSources: [] },
                 mcpServers: mergedMcp,
               }),
@@ -4000,6 +4013,8 @@ const consumeSessionRun = async (
   },
 ): Promise<void> => {
   let cancelled = false;
+  // 24h 硬超时：跟用户点停止分开——停止走 stop-task 的中性「已失效」，超时要打 askExpired
+  let hardTimedOut = false;
   let hardTimer: NodeJS.Timeout | null = null;
   // 复用链内预登记的 instanceId（one-shot / internalStart 出链前已 set）；
   // 无预登记则稍后 alloc。比 agentId 精确——resume 同持久化 agent 时 agentId 相同。
@@ -4155,8 +4170,19 @@ const consumeSessionRun = async (
     });
 
     hardTimer = setTimeout(() => {
+      hardTimedOut = true;
       cancelled = true;
+      const pendingAskId = getPendingAsk(task.id)?.askId;
       cancelPending(task.id);
+      // cancelPending 会打 taken 点；超时并没有链在飞，不清掉用户点提交会误进「投递中」
+      if (pendingAskId) clearAskTakenMark(task.id, pendingAskId);
+      // 立刻写作废标记，别等 stream 收尾——否则答题卡还会琥珀亮一会儿
+      void supersedePendingAsks(
+        task.id,
+        "等待超过 24 小时",
+        () => isTaskOpCurrent(opts.opHandle),
+        { expired: true },
+      );
       void run.cancel().catch(() => {
         /* noop */
       });
@@ -4259,6 +4285,15 @@ const consumeSessionRun = async (
       // 不得 finalizeStaleActions 全表扫（会把后继 B 的新 action 一并 cancelled）
       // done 走 publishIfCurrent——B takeover 后失主不发 done envelope
       if (yieldIfSuperseded()) return;
+      // 定时器里已经写过；这里幂等补漏（stream 很快结束、定时器回调还没 await 完）
+      if (hardTimedOut) {
+        await supersedePendingAsks(
+          task.id,
+          "等待超过 24 小时",
+          () => isTaskOpCurrent(opts.opHandle),
+          { expired: true },
+        );
+      }
       await finalizeOwnAction(task.id, opts.errorActionId, "cancelled");
       // 锁内 instanceId CAS——await 期间被接管则不写 idle
       const updated = await setTaskRunStatusIfRunOwner(
@@ -4775,14 +4810,12 @@ const consumeSessionRun = async (
 };
 
 /**
- * V0.11.1：merge 本 task 的 MCP 集合（全局 cursor mcp 按黑名单过滤 + OAuth 注入 +
- * 健康剔除 + 内置 chat-tool）——Agent.create 和 Agent.resume 共用（inline MCP 不随
- * resume 持久化、恢复会话必须重传）。
+ * V0.11.1：merge 本 task 的用户 MCP（全局 cursor mcp 按黑名单过滤 + OAuth 注入 +
+ * 健康剔除）——Agent.create 和 Agent.resume 共用（inline MCP 不随 resume 持久化、
+ * 恢复会话必须重传）。系统工具不再塞进 mcpServers，走 SDK customTools。
  */
 const buildMergedMcpForTask = async (
   task: Task,
-  /** agent 实例 caller——拼进 chat-tool URL ?caller= */
-  callerToken: string,
 ): Promise<{
   mergedMcp: Record<string, McpServerConfig>;
   cursorMcpNames: string[];
@@ -4793,18 +4826,11 @@ const buildMergedMcpForTask = async (
   );
   const { servers: cursorMcp, dropped: droppedMcp } =
     await filterHealthyMcp(enrichedMcp);
-  const mergedMcp: Record<string, McpServerConfig> = {
-    ...cursorMcp,
-    [TASK_TOOL_MCP_NAME]: {
-      type: "http",
-      // 每 agent 独立 URL → SDK 新建独立 MCP session（无老 session 复用）
-      url: getChatMcpUrl(callerToken),
-    },
+  return {
+    mergedMcp: { ...cursorMcp },
+    cursorMcpNames: Object.keys(cursorMcp),
+    droppedMcp,
   };
-  const cursorMcpNames = Object.keys(cursorMcp).filter(
-    (n) => n !== TASK_TOOL_MCP_NAME,
-  );
-  return { mergedMcp, cursorMcpNames, droppedMcp };
 };
 
 /**
@@ -4874,7 +4900,7 @@ export const resumeTaskSession = async (
   try {
     // resume 也发新 caller（新内存 agent 实例 = 新 MCP 身份）
     const callerToken = String(allocTaskRunInstanceId());
-    const { mergedMcp } = await buildMergedMcpForTask(task, callerToken);
+    const { mergedMcp } = await buildMergedMcpForTask(task);
     if (!(await mayResume())) return null;
 
     await writeOwnedEventAndPublish(
@@ -4889,6 +4915,7 @@ export const resumeTaskSession = async (
       Agent.resume(task.sessionAgentId, {
         apiKey: creds.apiKey,
         providerId,
+        callerToken,
         model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
         // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
@@ -5065,7 +5092,7 @@ export const deliverTaskQuestion = async (
  * 起一个**一次性**轻量 Q&A agent 回答（用户拍板「接不回来另起一个没问题」）。
  *
  * 跟正式会话的区别（有意为之）：
- * - 不注入 action playbook / 不装 chat-tool MCP（没有交卷 / 提问 / MR 语义、也调不了）
+ * - 不注入 action playbook / 不挂系统 customTools（没有交卷 / 提问 / MR 语义、也调不了）
  * - 不注册 agentSessions / 不落盘锚点——它只懂答疑、不能被后续「续用推进」误当正式会话
  * - 答完 close、下次再问再起（低频场景、冷启动可接受）
  *

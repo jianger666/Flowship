@@ -20,8 +20,8 @@
  *    + `askSkipped`）+ 置飞书卡片终态。幂等
  * 3. **rollback**（消息没送出去：4xx / 5xx / 抛错）：把登记原样放回，用户还能回去答题
  *
- * 提交点必须**紧贴真实副作用**（本仓铁律）：send 成功 / 入队成功 / 起会话成功之后才
- * commit，绝不在「打算发」的时候先写事件。
+ * 提交点必须**紧贴真实副作用**（本仓铁律）：send 成功 / 入队成功 / 起会话成功 /
+ * 同一轮 ask-wait curl 写成功之后才 commit，绝不在「打算发」的时候先写事件。
  *
  * # 孤儿 ask（内存里没登记、事件却还未了结）
  *
@@ -41,6 +41,7 @@ import {
 } from "@/lib/ask-pending";
 import type { AskUserQuestion, Task } from "@/lib/types";
 
+import { fulfillAskWait } from "./ask-wait";
 import {
   clearAskTakenMark,
   getPendingAsk,
@@ -85,6 +86,8 @@ export interface AskSkipHandle {
   readonly hint: string;
   /** 本轮真的认领到了一组提问吗（单测 / 日志用） */
   readonly claimed: boolean;
+  /** 认领到的 askId；没跳过时为 null（给同一轮 curl 写答案用） */
+  readonly askId: string | null;
   /** 消息已交给 agent → 落作废事件 + 置飞书卡片终态。幂等、绝不抛 */
   commit: () => Promise<void>;
   /** 消息没送出去 → 把登记放回让用户还能答。幂等；已 commit 则什么都不做 */
@@ -94,8 +97,45 @@ export interface AskSkipHandle {
 const NOOP_HANDLE: AskSkipHandle = {
   hint: "",
   claimed: false,
+  askId: null,
   commit: async () => undefined,
   rollback: () => undefined,
+};
+
+/**
+ * 同一轮 ask-wait curl 还挂着时，把「跳过 + 用户新消息」写成 stdout 答案。
+ * 模型在等 `[ASK_USER_REPLY]`，不走 send，避免「上一轮尚未结束」。
+ */
+export const buildAskWaitSkipReply = (
+  agentText: string,
+  extras?: { imageAbsPaths?: string[]; attachmentPaths?: string[] },
+): string => {
+  const parts = [agentText.trimEnd()];
+  if (extras?.imageAbsPaths?.length) {
+    parts.push(`附图：${extras.imageAbsPaths.join("、")}`);
+  }
+  if (extras?.attachmentPaths?.length) {
+    parts.push(`附件：${extras.attachmentPaths.join("、")}`);
+  }
+  const body = `${parts.join("\n")}\n`;
+  return body.startsWith("[ASK_USER_REPLY]")
+    ? body
+    : `[ASK_USER_REPLY]\n${body}`;
+};
+
+/** 认领到提问且 curl 槽还在：把跳过正文写进同一轮。true = 调用方不要再 send / 入队 */
+export const fulfillAskSkipViaWait = async (
+  taskId: string,
+  handle: AskSkipHandle,
+  agentText: string,
+  extras?: { imageAbsPaths?: string[]; attachmentPaths?: string[] },
+): Promise<boolean> => {
+  if (!handle.claimed || !handle.askId) return false;
+  return fulfillAskWait(
+    taskId,
+    handle.askId,
+    buildAskWaitSkipReply(agentText, extras),
+  );
 };
 
 /**
@@ -143,6 +183,7 @@ const makeHandle = (taskId: string, claim: AskSkipClaim): AskSkipHandle => {
   return {
     hint: ASK_SKIP_AGENT_HINT,
     claimed: true,
+    askId: claim.askId,
     commit: async () => {
       if (settled) return;
       settled = true;

@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractAskQuestions,
   findPendingAskEvent,
+  isAskExpired,
   isAskReplied,
   isAskSettled,
   isAskSkipped,
@@ -37,6 +38,9 @@ const supersede = (askId: string) => ev("info", { supersededAskId: askId });
 /** 用户没答、直接发新消息 → 作废的一种，多带一个 askSkipped */
 const skip = (askId: string) =>
   ev("info", { supersededAskId: askId, askSkipped: true });
+/** 24h 硬超时 → 作废的一种，多带一个 askExpired */
+const expire = (askId: string) =>
+  ev("info", { supersededAskId: askId, askExpired: true });
 
 describe("isAskReplied", () => {
   it("有对应 ask_user_reply → true", () => {
@@ -76,6 +80,24 @@ describe("isAskSkipped", () => {
     expect(isAskSuperseded([ask("X"), skip("X")], "X")).toBe(true);
     expect(isAskSettled([ask("X"), skip("X")], "X")).toBe(true);
     expect(findPendingAskEvent([ask("X"), skip("X")])).toBeNull();
+  });
+});
+
+describe("isAskExpired", () => {
+  it("带 askExpired 的作废标记 → true（UI 收成一行「已过期」）", () => {
+    expect(isAskExpired([ask("X"), expire("X")], "X")).toBe(true);
+  });
+  it("普通作废 / 跳过都不算过期 → false", () => {
+    expect(isAskExpired([ask("X"), supersede("X")], "X")).toBe(false);
+    expect(isAskExpired([ask("X"), skip("X")], "X")).toBe(false);
+  });
+  it("过期的是别的 askId → false", () => {
+    expect(isAskExpired([ask("X"), expire("Y")], "X")).toBe(false);
+  });
+  it("过期仍然是「已作废」的一种——了结判定只有一套", () => {
+    expect(isAskSuperseded([ask("X"), expire("X")], "X")).toBe(true);
+    expect(isAskSettled([ask("X"), expire("X")], "X")).toBe(true);
+    expect(findPendingAskEvent([ask("X"), expire("X")])).toBeNull();
   });
 });
 

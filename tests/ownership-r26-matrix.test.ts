@@ -117,7 +117,7 @@ const {
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
 } = await import("@/lib/server/chat-pending");
-const { dispatchAskUserForTest } = await import("@/lib/server/chat-mcp");
+const { dispatchAskUser } = await import("@/lib/server/flowship-tools");
 const {
   clearChatGate,
   endChatLifecycle,
@@ -671,7 +671,7 @@ describe("ownership R26 真实 sink 窗口矩阵", () => {
       registerBridgesForTest(task, { callerToken: tokenA });
 
       const hang = installHangingFailpoint("mcp.askUser.afterSupersede");
-      const pAsk = dispatchAskUserForTest({
+      const pAsk = dispatchAskUser({
         taskId: id,
         callerToken: tokenA,
         actionId: "act_shared",

@@ -353,13 +353,16 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(boundaryAt).toBeGreaterThan(prompt.lastIndexOf("\n# 对方的话"));
     expect(prompt.slice(boundaryAt + 1)).not.toMatch(/\n# /);
 
-    // 旁路 agent 不装 chat-tool / 用户 MCP（交卷、提 MR 这些工具压根不该出现）
+    // 旁路 agent 不挂系统 customTools / 用户 MCP（交卷、提 MR 这些工具压根不该出现）
     const createArg = mockCreate.mock.calls[0]?.[0] as {
       mcpServers?: unknown;
-      local?: { settingSources?: unknown[] };
+      callerToken?: string;
+      local?: { settingSources?: unknown[]; customTools?: unknown };
     };
     expect(createArg.mcpServers).toBeUndefined();
+    expect(createArg.callerToken).toBeUndefined();
     expect(createArg.local?.settingSources).toEqual([]);
+    expect(createArg.local?.customTools).toBeUndefined();
 
     await waitUntil(() => !!lastDone());
   });

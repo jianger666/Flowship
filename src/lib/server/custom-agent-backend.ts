@@ -56,6 +56,7 @@ import { customSdkBaseUrlForFace } from "@/lib/custom-provider-url";
 import type { CustomProviderFormat } from "@/lib/types";
 import { resolveModelFace, type CustomFace } from "@/lib/server/custom-route";
 import {
+  catalogPiInputModalities,
   getModelsDevIndex,
   lookupCatalogReasoning,
 } from "@/lib/server/models-dev-catalog";
@@ -73,7 +74,7 @@ const PROVIDER_ID = "flowship-custom";
 // bash→shell、find→glob、delete/task 由 buildCodingToolDefs 补成 customTools。
 // write/edit/read 另有同名 custom 包装（认 Cursor 字段别名、盖掉 builtin）。
 const NATIVE_TOOLS = ["read", "edit", "write", "grep"];
-// 子 agent 用 pi 原生全套（读/写/跑命令），不带 task / flowshipChat 工具——防递归与副作用
+// 子 agent 用 pi 原生全套（读/写/跑命令），不带 task / 系统工具——防递归与副作用
 const SUBAGENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 // 自定义端点元数据缺省（用户 endpoint 不提供时给合理兜底）
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -114,9 +115,11 @@ export interface CustomAgentInput {
   baseUrl: string;
   format: Format;
   model?: { id: string; params?: Array<{ id: string; value: string }> };
-  local?: { cwd?: string; settingSources?: unknown };
-  // cursor 形状里带 mcpServers；pi 无 MCP、这里接收但忽略
+  local?: { cwd?: string; settingSources?: unknown; customTools?: unknown };
+  // cursor 形状里带 mcpServers；pi 无 MCP、用户 MCP 在这里桥成 customTools
   mcpServers?: unknown;
+  /** 正式会话身份；无值则不挂交卷/提问等系统工具（oneshot / 受限答疑） */
+  callerToken?: string;
 }
 
 /** ProviderConfigInput.models 条目的最小结构（registerProvider 会做结构校验） */
@@ -151,13 +154,15 @@ const buildModelConfig = (
   modelId: string,
   face: CustomFace,
   fields: CatalogFields,
+  imageInput: boolean,
 ): ModelConfigEntry => {
   const entry: ModelConfigEntry = {
     id: modelId,
     name: modelId,
     api: face,
     reasoning: fields.reasoning,
-    input: ["text"],
+    // 目录标明多模态才让 pi 把 read 到的图塞进请求；否则会换成空占位
+    input: catalogPiInputModalities(imageInput),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
@@ -176,6 +181,7 @@ const buildModel = (
   input: CustomAgentInput,
   face: CustomFace,
   fields: CatalogFields,
+  imageInput: boolean,
 ): Model<never> => {
   const model = {
     id: modelId,
@@ -184,7 +190,7 @@ const buildModel = (
     provider: PROVIDER_ID,
     baseUrl: customSdkBaseUrlForFace(input.baseUrl, face),
     reasoning: fields.reasoning,
-    input: ["text"],
+    input: catalogPiInputModalities(imageInput),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
@@ -227,38 +233,28 @@ const buildRuntime = async (
     baseUrl: sdkBase,
     apiKey: input.apiKey,
     api: face,
-    models: [buildModelConfig(modelId, face, fields)],
+    models: [buildModelConfig(modelId, face, fields, Boolean(hit?.imageInput))],
   });
-  return { runtime, model: buildModel(modelId, input, face, fields), thinkingLevel };
+  return {
+    runtime,
+    model: buildModel(modelId, input, face, fields, Boolean(hit?.imageInput)),
+    thinkingLevel,
+  };
 };
 
 // ----------------- Flowship 自有工具桥接（pi customTools） -----------------
 
 /**
- * 从 cursor 形状的 mcpServers 里解 flowshipChat 的 caller token。
- * runner（chat-runner / task-runner）总是把 flowshipChat MCP 塞进 mcpServers、
- * pi 不用 MCP、但借它 URL 里的 `?caller=` 身份给工具 handler 核对（同 MCP 路径口径）。
+ * 用户 MCP 仍走 mcpServers；系统工具不再从 URL ?caller= 解身份，
+ * 由 facade 传入的 callerToken 闭包进 handler。
  */
-const extractCallerToken = (mcpServers: unknown): string | undefined => {
-  if (!mcpServers || typeof mcpServers !== "object") return undefined;
-  const flowshipChat = (mcpServers as Record<string, unknown>).flowshipChat;
-  if (!flowshipChat || typeof flowshipChat !== "object") return undefined;
-  const url = (flowshipChat as { url?: unknown }).url;
-  if (typeof url !== "string") return undefined;
-  try {
-    return new URL(url).searchParams.get("caller") ?? undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-/** 从 mcpServers 里抽用户 MCP（排除我们自己的 flowshipChat、它走 flowship-tools 直连） */
 const extractUserMcpServers = (
   mcpServers: unknown,
 ): Record<string, McpServerConfig> => {
   if (!mcpServers || typeof mcpServers !== "object") return {};
   const out: Record<string, McpServerConfig> = {};
   for (const [name, cfg] of Object.entries(mcpServers as Record<string, unknown>)) {
+    // 旧会话配置里可能残留 HTTP 注入名，系统工具已直连、不桥
     if (name === "flowshipChat") continue;
     if (cfg && typeof cfg === "object") out[name] = cfg as McpServerConfig;
   }
@@ -375,19 +371,24 @@ const buildCustomTools = (
   mcpToolDefs: ToolDefinition[],
   thinkingLevel: ReturnType<typeof thinkingLevelFromParams>,
 ): ToolDefinition[] => [
-  ...flowShipTools.map(
-    (t) =>
-      ({
-        name: t.name,
-        label: t.label,
-        description: t.description,
-        parameters: t.parameters,
-        execute: async (_toolCallId: string, params: unknown) => {
-          const r = await t.handler(params as Record<string, unknown>, callerToken);
-          return { content: r.content, details: undefined };
-        },
-      }) as unknown as ToolDefinition,
-  ),
+  ...(callerToken
+    ? flowShipTools.map(
+        (t) =>
+          ({
+            name: t.name,
+            label: t.label,
+            description: t.description,
+            parameters: t.parameters,
+            execute: async (_toolCallId: string, params: unknown) => {
+              const r = await t.handler(
+                params as Record<string, unknown>,
+                callerToken,
+              );
+              return { content: r.content, details: undefined };
+            },
+          }) as unknown as ToolDefinition,
+      )
+    : []),
   ...buildCodingToolDefs(cwd, (prompt) =>
     runSubagent(prompt, {
       runtime: subagentRuntime,
@@ -674,7 +675,7 @@ export const createCustomAgent = async (
   injectSdkRgPath();
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model, thinkingLevel } = await buildRuntime(input);
-  const callerToken = extractCallerToken(input.mcpServers);
+  const callerToken = input.callerToken;
   const mcp = await bridgeUserMcpServers(input.mcpServers);
   // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
   // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
@@ -709,7 +710,7 @@ export const resumeCustomAgent = async (
   injectSdkRgPath();
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model, thinkingLevel } = await buildRuntime(input);
-  const callerToken = extractCallerToken(input.mcpServers);
+  const callerToken = input.callerToken;
   const mcp = await bridgeUserMcpServers(input.mcpServers);
   // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
   const customTools = buildCustomTools(

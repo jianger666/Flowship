@@ -39,6 +39,11 @@ export type CatalogReasoning = {
   /** 可发给后端的档（effort 原档，或 budget 合成的 high/max）；不含 default */
   effortValues: string[];
   providerId: string;
+  /**
+   * 目录标明接受图像输入。同 id 多来源时 OR 合并——huggingface 常把开源权重标成纯文本，
+   * 不能盖掉 zai / opencode 的多模态条。
+   */
+  imageInput?: boolean;
 };
 
 export type ThinkingLevelMap = Partial<

@@ -21,6 +21,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { glob } from "glob";
 import { stripHostInjectedEnv } from "./host-env";
+import { isAskWaitCommand } from "./ask-wait";
 import {
   Number as TBNumber,
   Object as TBObject,
@@ -40,6 +41,8 @@ const asTool = (d: unknown): ToolDefinition => d as ToolDefinition;
 const DEFAULT_SHELL_TIMEOUT_MS = 60_000;
 const MIN_SHELL_TIMEOUT_MS = 1_000;
 const MAX_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
+/** ask-wait curl 要挂到用户答题，不能夹在 10 分钟上限里 */
+export const ASK_WAIT_SHELL_TIMEOUT_MS = 86_400_000;
 
 /**
  * Node `exec` 的 timeout 是毫秒。模型（Cursor / Claude 习惯）经常传秒：15、30、60。
@@ -52,6 +55,15 @@ export const resolveShellTimeoutMs = (raw: unknown): number => {
   }
   const asMs = raw < 1000 ? raw * 1000 : raw;
   return Math.min(MAX_SHELL_TIMEOUT_MS, Math.max(MIN_SHELL_TIMEOUT_MS, asMs));
+};
+
+/** ask-wait 那条 curl 无视模型给的 120s，按 24h 挂 */
+export const resolveShellTimeoutMsForCommand = (
+  command: string,
+  raw: unknown,
+): number => {
+  if (isAskWaitCommand(command)) return ASK_WAIT_SHELL_TIMEOUT_MS;
+  return resolveShellTimeoutMs(raw);
 };
 
 /**
@@ -210,7 +222,7 @@ const shellTool = (cwd: string): ToolDefinition =>
         workingDirectory?: unknown;
       };
       const command = typeof p.command === "string" ? p.command : "";
-      const timeout = resolveShellTimeoutMs(p.timeout);
+      const timeout = resolveShellTimeoutMsForCommand(command, p.timeout);
       const workCwdRaw =
         typeof p.workingDirectory === "string" ? p.workingDirectory.trim() : "";
       const workCwd = workCwdRaw

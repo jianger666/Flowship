@@ -3,7 +3,7 @@
  *
  * 五条硬拦各配一组「限 / 不限」对照，证明是选项起的作用、不是场景本身走不到：
  * 1. **活会话不复用**：有活会话也绝不 `agent.send`（那是属主的全权限 agent、带完整
- *    playbook + chat-tool MCP + 文件 / shell 权限）——一律落受限答疑旁路
+ *    playbook + 系统工具 + 文件 / shell 权限）——一律落受限答疑旁路
  * 2. awaiting_ack：不带 ackContext（不 snapshot 产物、不把 action 打回 running）
  * 3. 会话已断：只走受限旁路，绝不 resume 唤醒全权限 agent
  * 4. 起的必须是 `startRestrictedGroupQuestion`（只读旁路）、不是属主那条
@@ -296,5 +296,36 @@ describe("会话已断", () => {
     expect(resumeCurrentActionWithMessage).toHaveBeenCalledTimes(1);
     expect(startOneShotQuestion).not.toHaveBeenCalled();
     expect(startRestrictedGroupQuestion).not.toHaveBeenCalled();
+  });
+
+  it("对照（属主）：唤醒 HTTP 等到 running 再 200，不把失败态提前返回", async () => {
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    getTask.mockImplementation(async () => {
+      const t = ackTask();
+      t.runStatus = "error";
+      t.actions[0]!.status = "error";
+      return t;
+    });
+    // Agent.create 还在飞：回调 running 之后故意不 resolve
+    let finishCreate: () => void = () => {};
+    const createHang = new Promise<void>((resolve) => {
+      finishCreate = resolve;
+    });
+    resumeCurrentActionWithMessage.mockImplementation(
+      async (input: { onRunningCommitted?: (task: Task) => void }) => {
+        const running = ackTask();
+        running.runStatus = "running";
+        running.actions[0]!.status = "running";
+        input.onRunningCommitted?.(running);
+        await createHang;
+      },
+    );
+
+    const resp = await handleTaskQuestionInject(TASK_ID, body, {});
+    const data = (await resp.json()) as { ok: boolean; task: Task };
+
+    expect(resp.status).toBe(200);
+    expect(data.task.runStatus).toBe("running");
+    finishCreate();
   });
 });

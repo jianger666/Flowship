@@ -81,6 +81,21 @@ describe("mergeTaskEvents（事件懒加载：本地事件只增不换）", () =
     expect(merged.events).toBe(prev.events);
   });
 
+  it("过期快照不盖运行态（失败 done 晚于唤醒 running）", () => {
+    const prev = makeTask([ev("a", 1)], {
+      runStatus: "running",
+      updatedAt: 20,
+    });
+    const next = makeTask([], {
+      runStatus: "error",
+      updatedAt: 10,
+    });
+    const merged = mergeTaskEvents(prev, next);
+    expect(merged.runStatus).toBe("running");
+    expect(merged.updatedAt).toBe(20);
+    expect(merged.events.map((e) => e.id)).toEqual(["a"]);
+  });
+
   it("过滤非 ephemeral 的 tool_output_delta（不进本地持久 events）", () => {
     const prev = makeTask([ev("a", 1)]);
     const next = makeTask([

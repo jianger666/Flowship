@@ -26,6 +26,22 @@ const base = (
   }) as TaskSummary;
 
 describe("taskStageLine", () => {
+  it("running + hasPendingAsk（同一轮 curl 等答案）→ 待回答", () => {
+    const line = taskStageLine(
+      base({
+        runStatus: "running",
+        lastActionStatus: "running",
+        hasPendingAsk: true,
+      }),
+      0,
+    );
+    expect(line).toEqual({
+      stage: "方案",
+      status: "待回答",
+      tone: "wait",
+    });
+  });
+
   it("真 ask（awaiting_user + hasPendingAsk）→ 待回答", () => {
     const line = taskStageLine(
       base({

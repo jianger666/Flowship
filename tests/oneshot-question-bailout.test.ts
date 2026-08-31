@@ -232,13 +232,16 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
     expect(prompt).not.toContain("只读答疑");
     expect(prompt).not.toContain("禁止新建 / 修改 / 删除任何文件");
 
-    // 一次性 agent 不装 chat-tool / 用户 MCP（交卷、提 MR 这些工具压根不该出现）
+    // 一次性 agent 不挂系统 customTools / 用户 MCP（交卷、提 MR 这些工具压根不该出现）
     const createArg = mockCreate.mock.calls[0]?.[0] as {
       mcpServers?: unknown;
-      local?: { settingSources?: unknown[] };
+      callerToken?: string;
+      local?: { settingSources?: unknown[]; customTools?: unknown };
     };
     expect(createArg.mcpServers).toBeUndefined();
+    expect(createArg.callerToken).toBeUndefined();
     expect(createArg.local?.settingSources).toEqual([]);
+    expect(createArg.local?.customTools).toBeUndefined();
 
     expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
     expect(lastDone()?.ok).toBe(true);

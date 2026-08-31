@@ -1,8 +1,9 @@
 /**
  * models.dev 目录（OpenCode 同源）
  *
- * 自定义 /v1/models 没有 effort 元数据。按模型 id 查这份目录的 reasoning_options，
- * 命中才画档。缓存挂 globalThis，防 Next dev 多 chunk / HMR 各拉一份 4MB JSON。
+ * 自定义 /v1/models 没有 effort / 模态元数据。按模型 id 查这份目录的
+ * reasoning_options 和 modalities.input。缓存挂 globalThis，防 Next dev
+ * 多 chunk / HMR 各拉一份 4MB JSON。
  */
 
 import {
@@ -51,10 +52,10 @@ type CatalogCache = {
 
 const cacheSlot = (): CatalogCache => {
   const g = globalThis as unknown as {
-    __flowshipModelsDev?: CatalogCache;
+    __flowshipModelsDevV2?: CatalogCache;
   };
-  if (!g.__flowshipModelsDev) {
-    g.__flowshipModelsDev = {
+  if (!g.__flowshipModelsDevV2) {
+    g.__flowshipModelsDevV2 = {
       index: new Map(),
       routeIndex: new Map(),
       ts: 0,
@@ -62,8 +63,23 @@ const cacheSlot = (): CatalogCache => {
       inflight: null,
     };
   }
-  return g.__flowshipModelsDev;
+  return g.__flowshipModelsDevV2;
 };
+
+/** models.dev：`attachment: true` 或 `modalities.input` 含 image */
+export const catalogModelHasImageInput = (model: unknown): boolean => {
+  if (!model || typeof model !== "object") return false;
+  const m = model as { attachment?: unknown; modalities?: unknown };
+  if (m.attachment === true) return true;
+  if (!m.modalities || typeof m.modalities !== "object") return false;
+  const input = (m.modalities as { input?: unknown }).input;
+  return Array.isArray(input) && input.some((x) => x === "image");
+};
+
+/** 给 pi Model.input：目录没命中当纯文本，避免往不认图的端点塞 image_url */
+export const catalogPiInputModalities = (
+  imageInput: boolean | null | undefined,
+): Array<"text" | "image"> => (imageInput ? ["text", "image"] : ["text"]);
 
 const consider = (
   index: Map<string, CatalogReasoning>,
@@ -74,7 +90,15 @@ const consider = (
   if (!k) return;
   const prev = index.get(k);
   if (!prev || rankOf(rec.providerId) < rankOf(prev.providerId)) {
-    index.set(k, rec);
+    index.set(k, {
+      ...rec,
+      imageInput: Boolean(rec.imageInput || prev?.imageInput),
+    });
+    return;
+  }
+  // 档位仍跟高优先级来源；图像能力任一来源标了就算
+  if (rec.imageInput && !prev.imageInput) {
+    index.set(k, { ...prev, imageInput: true });
   }
 };
 
@@ -100,6 +124,7 @@ export const buildModelsDevIndex = (
         effortValues: parseCatalogThinkingValues(
           (model as { reasoning_options?: unknown }).reasoning_options,
         ),
+        imageInput: catalogModelHasImageInput(model),
       };
       consider(index, modelId, rec);
       const slash = modelId.lastIndexOf("/");

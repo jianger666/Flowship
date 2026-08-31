@@ -616,11 +616,11 @@ const RegularToolBlockRow = ({
   // detail 行里可点的那一段（不是路径行 → null、整行走原纯文本）
   const detailPath = toolDetailPathSegment(detailLine, filePath);
 
+  // 成功不写 ✓：左边图标已经是 success 色。exit 0 每行都写太吵，只留非 0。
   const statusBits: string[] = [];
-  if (block.status === "success") statusBits.push("✓");
   if (block.status === "error") statusBits.push("✗");
   if (block.status === "interrupted") statusBits.push("已中断");
-  if (block.result?.exitCode != null) {
+  if (block.result?.exitCode != null && block.result.exitCode !== 0) {
     statusBits.push(`exit ${block.result.exitCode}`);
   }
   const dur = formatDuration(block.result?.executionTime);
@@ -654,7 +654,7 @@ const RegularToolBlockRow = ({
   );
 
   return (
-    <div className={cn("group/tool min-w-0 max-w-full", nested && "pl-0")}>
+    <div className={cn("group/tool w-full min-w-0 max-w-full", nested && "pl-0")}>
       <button
         type="button"
         onClick={() => setManualCollapsed(!collapsed)}
@@ -665,11 +665,6 @@ const RegularToolBlockRow = ({
         <span className="shrink-0 font-medium text-[11px] text-foreground/80">
           {block.name}
         </span>
-        {statusBits.length > 0 && block.status !== "running" && (
-          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground/80">
-            {statusBits.join(" · ")}
-          </span>
-        )}
         {collapsed && (liveTail || summary) && (
           <span
             className={cn(
@@ -693,8 +688,15 @@ const RegularToolBlockRow = ({
             className="min-w-0 flex-1 truncate font-mono text-[11px] opacity-80"
           />
         )}
-        <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
-          {formatTs(block.ts)}
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {statusBits.length > 0 && block.status !== "running" && (
+            <span className="text-[11px] tabular-nums text-muted-foreground/80">
+              {statusBits.join(" · ")}
+            </span>
+          )}
+          <span className="text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+            {formatTs(block.ts)}
+          </span>
         </span>
       </button>
 
@@ -704,10 +706,9 @@ const RegularToolBlockRow = ({
           {(detailLine || (!displayOutput && !diff && argsPreview)) && (
             <div
               className={cn(
-                "min-w-0 text-[11px] text-muted-foreground",
-                detailLine
-                  ? "truncate font-mono"
-                  : "whitespace-pre-wrap break-all font-mono",
+                "min-w-0 max-w-full text-[11px] text-muted-foreground",
+                // 展开就是为了看全：折行吃满宽度，不要再 truncate 留一截空白
+                "whitespace-pre-wrap break-all font-mono",
               )}
             >
               {/* detail 打头是文件路径（read 的路径 / edit 的「路径 +N/−M」）→ 路径段可点 */}

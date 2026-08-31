@@ -370,8 +370,8 @@ const pickStr = (
   return undefined;
 };
 
-/** 单行截断（摘要行用） */
-const clipOneLine = (s: string, max = 120): string => {
+/** 单行截断（摘要行用）。上限只防巨型 args 进 DOM；真正裁切交给行上 CSS truncate，按容器宽度吃满。 */
+const clipOneLine = (s: string, max = 500): string => {
   const flat = s.replace(/\s+/g, " ").trim();
   if (flat.length <= max) return flat;
   return `${flat.slice(0, max)}…`;
@@ -1046,7 +1046,7 @@ export const toolBlockFilePath = (block: ToolBlock): string | null => {
  *
  * 两种命中：
  * - detail 以完整路径打头：read = 路径本身、edit = `路径 +N/−M`
- * - 路径超长被 `toolBlockSummary` 的 clipOneLine 截成「前 120 字 + …」——此时
+ * - 路径超长被 `toolBlockSummary` 的 clipOneLine 截成「前缀 + …」——此时
  *   startsWith 不成立（实测业务仓路径动辄 150+ 字），单独认一次「detail 是路径前缀」
  *
  * shell 的 `$ cmd`、args JSON 兜底等一律返 null（调用方渲染纯文本）。

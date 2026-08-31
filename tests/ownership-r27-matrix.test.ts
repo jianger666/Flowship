@@ -101,7 +101,7 @@ const {
   getPendingAsk,
   runTaskAction,
 } = chatPending;
-const { dispatchAskUserForTest } = await import("@/lib/server/chat-mcp");
+const { dispatchAskUser } = await import("@/lib/server/flowship-tools");
 const { clearChatGate, endChatLifecycle, getChatLifecycle } = await import(
   "@/lib/server/chat-gate"
 );
@@ -726,7 +726,7 @@ describe("ownership R27 真实提交点矩阵", () => {
       expect(token).toBeTruthy();
 
       const hang = installOnceHangingFailpoint("mcp.askUser.afterSupersede");
-      const pAskA = dispatchAskUserForTest({
+      const pAskA = dispatchAskUser({
         taskId: id,
         callerToken: token!,
         questions: [
@@ -740,7 +740,7 @@ describe("ownership R27 真实提交点矩阵", () => {
       const askIdA = askA!.askId;
       const tokenA = askA!.token;
 
-      const pAskB = dispatchAskUserForTest({
+      const pAskB = dispatchAskUser({
         taskId: id,
         callerToken: token!,
         questions: [

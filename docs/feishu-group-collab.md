@@ -514,7 +514,7 @@ agent 改完重新交卷），会话断了还会**唤醒**一个全权限 agent 
 
 | 拦点 | 效果 |
 |------|------|
-| **不复用活会话** | 有活会话也不 `agent.send`（那是属主带 playbook + chat-tool MCP + 文件 / shell 权限的 agent） |
+| **不复用活会话** | 有活会话也不 `agent.send`（那是属主带 playbook + 系统工具 + 文件 / shell 权限的 agent） |
 | 不认 `ackContext` | 不 snapshot、不把 `awaiting_ack` 打回 running（不触发重交卷） |
 | `canResume = false` | 会话断了也不 resume 唤醒全权限 agent |
 | **落独立旁路** | 恒走 `restricted-question.startRestrictedGroupQuestion`：受限 prompt（只答疑、禁止新建 / 修改 / 删除文件、禁止有副作用的命令、**不注入**属主版那句「小改动直接改」）、且与 task 运行状态机完全解耦（见下） |
@@ -882,7 +882,7 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 
 - `prompts/action-ship.md` §6：交卷后系统不发、agent 也不要顺手调 `share_to_group`；
   只有用户明说才调
-- `chat-mcp.ts` `share_to_group` describe：「action 交卷后不要顺手调」
+- `flowship-tools.ts` `share_to_group` describe：「action 交卷后不要顺手调」
 
 ## 功能全景
 

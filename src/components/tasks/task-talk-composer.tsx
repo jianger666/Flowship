@@ -10,6 +10,7 @@
  * v1.1.x 起视觉 / 交互统一走 <ConversationComposer>（chat 输入岛同一个组件）：贴图 / 附文件目录 /
  * `/` 唤起 skill / `@` 引用文件 / 顶边拖高；本文件只留业务态（发送通道 / 模型 / 禁用判定 /
  * 运行中停止键）。Cmd/Ctrl+J 聚焦。agent 正在跑时禁用发送、右侧换成 Composer 同款停止键；
+ * 有未答提问时例外：输入条保持可发，回车顶掉这张卡（隐式跳过）。
  * 任务终态整条隐藏。
  */
 
@@ -59,8 +60,9 @@ export const TaskTalkComposer = ({
 }: Props) => {
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
-  // agent 在跑时不可说（发送禁用）；运行中 Composer 右侧换成 spinner + 停止键（对齐 chat）
-  const isRunning = runActive;
+  // 有未答提问时输入条保持可发（回车 = 隐式跳过这张卡），不要被 shell 阻塞画成停止键。
+  const pendingAsk = findPendingAskEvent(task.events);
+  const isRunning = runActive && !pendingAsk;
   const busy = submitting || isRunning;
 
   // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、跟 chat 输入岛同一份实现
@@ -140,7 +142,10 @@ export const TaskTalkComposer = ({
         a.id === task.currentActionId &&
         (a.status === "error" || a.status === "cancelled"),
     );
-  const awaitingAnswer = !halted && !!findPendingAskEvent(task.events);
+  // 跟详情页 awaitingAskAnswer 同口径：只有「还在等回复」才指路答题卡。
+  // 24h 超时后卡已过期，findPendingAskEvent 变 null，别再写「可先答上方提问」。
+  // 同一轮 curl 阻塞时 runStatus 仍是 running，不能再绑 awaiting_user。
+  const awaitingAnswer = !halted && !!pendingAsk;
 
   const handleSubmit = async () => {
     if (!rich.hasContent || busy) return;

@@ -43,7 +43,8 @@ import {
   useStreamFollow,
   type StreamFollowController,
 } from "@/hooks/use-stream-follow";
-import { findPendingAskEvent, isAskSkipMarkerEvent } from "@/lib/ask-pending";
+import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
+import { findPendingAskEvent } from "@/lib/ask-pending";
 import {
   findRenderIndexForEventId,
   normalizeEventStreamSearchQuery,
@@ -95,7 +96,6 @@ import {
 } from "@/lib/tool-display";
 import {
   extractActiveBootStage,
-  isBootStageInfo,
   resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
@@ -103,7 +103,6 @@ import {
   extractUserReplyAttachments,
   extractUserReplyImages,
   formatTs,
-  isChatStartupNoiseInfo,
   mergeAdjacentThinking,
   summarize,
 } from "./event-stream/utils";
@@ -363,6 +362,8 @@ interface Props {
   // v1.0.x 事件懒加载：上拉到顶自动拉更早分页、拉到的事件通过它插到父组件事件列表头部。
   // 不传 = 不启用分页（task.eventsTruncated 也不看）。
   onPrependEvents?: (events: TaskEvent[]) => void;
+  /** 答题卡提交成功：把接口返回的 task 合进页面（完成信号由提交者发出，不单等 SSE） */
+  onTaskUpdate?: (task: Task) => void;
   /** shell 流式输出：callId → 已累积文本（尾部窗口由父组件维护） */
   liveToolOutputs?: Record<string, string>;
   /** P3：回退到 checkpointed user_reply */
@@ -506,22 +507,12 @@ const StreamFloatingBar = ({
   );
 };
 
-/** chat 渲染管线：与 items / loadEarlier prepend 共用同一过滤，避免 firstItemIndex 与可视条数不一致
- *  boot stage info 也在这滤掉（F 批次）——它们只以末尾渐进单行呈现、历史回看无价值
- *  「用户跳过提问」的作废标记两种形态都滤——那句话由 ask 行的折叠态承载，别同话说两遍 */
+/** 渲染管线入口过滤：藏什么只认 isHiddenFromEventStream，别在组件里再写一份 */
 const eventsForStreamRender = (
   events: TaskEvent[],
   isChat: boolean,
-): TaskEvent[] => {
-  // muted 事件 = 交卷 / 提问成功后被平台消音的模型输出（thinking / 正文 / 工具），
-  // 落盘留审计、UI 一律不渲染（live SSE 与回放分页共用此过滤）
-  const base = events.filter(
-    (e) => !isAskSkipMarkerEvent(e) && e.meta?.muted !== true,
-  );
-  return isChat
-    ? base.filter((e) => !isChatStartupNoiseInfo(e) && !isBootStageInfo(e))
-    : base;
-};
+): TaskEvent[] =>
+  events.filter((e) => !isHiddenFromEventStream(e, { isChat }));
 
 /**
  * 共用纯管线：过滤 → thinking 合并 → tool 配对 → 工作过程分组。
@@ -571,6 +562,7 @@ const EventStreamImpl = ({
   stopping,
   variant = "log",
   onPrependEvents,
+  onTaskUpdate,
   liveToolOutputs,
   onRewind,
   pendingLocalReplies,
@@ -579,13 +571,25 @@ const EventStreamImpl = ({
 }: Props) => {
   const isChat = variant === "chat";
 
+  // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
+  // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
+  // 放在 items 之前算：items 构建要用它做「答题卡置底」。
+  const pendingAskEvent = useMemo(
+    () => findPendingAskEvent(task.events),
+    [task.events],
+  );
+
   // 输入框可用 = 父组件传 canReply（没传回退 awaiting_user）；提前算、下面 useRichInput 要用
   const canCompose = canReply ?? task.runStatus === "awaiting_user";
   // 自动聚焦判定：跟 canCompose 同款（chat 下 agent 答完 → canCompose true → focus）
   const isAwaitingUser = canCompose;
-  // 可输入 = 轮到用户说话、或运行中但允许排队（chat）
+  // 提问期间输入条仍可发（回车顶掉当前卡）；chat 运行中还可排队
+  const awaitingAsk = !!pendingAskEvent;
   const composeEnabled =
-    isAwaitingUser || !!(isRunning && allowQueueWhileRunning);
+    isAwaitingUser ||
+    awaitingAsk ||
+    !!(isRunning && allowQueueWhileRunning);
+  const composerRunning = isRunning && !awaitingAsk;
 
   // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、
   // 跟 task「跟 AI 说」条 / 推进弹窗 / 答题卡同一份实现（见 hooks/use-rich-input.ts）
@@ -629,14 +633,6 @@ const EventStreamImpl = ({
     [isChat, task.events],
   );
   const displayedBoot = useStagedBootDisplay(activeBoot);
-
-  // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
-  // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
-  // 放在 items 之前算：items 构建要用它做「答题卡置底」。
-  const pendingAskEvent = useMemo(
-    () => findPendingAskEvent(task.events),
-    [task.events],
-  );
 
   // 渲染管线拆三层（2026-07-28 性能修）。**层次不能合并**：
   // 老实现把 streamingText 放进同一个 useMemo 的 deps，于是每来一个 chunk 都重跑
@@ -857,11 +853,17 @@ const EventStreamImpl = ({
   // doneCallIds 因此不会漏。结论：同样的答案，扫描量从「全量」降到「本轮」。
   // 没有 user_reply（刚建的 chat）时退回全量，那会儿本来也没几条。
   const statusEvents = useMemo(() => {
-    if (!isChat) return task.events;
-    for (let i = task.events.length - 1; i >= 0; i--) {
-      if (task.events[i]!.kind === "user_reply") return task.events.slice(i);
-    }
-    return task.events;
+    const src = !isChat
+      ? task.events
+      : (() => {
+          for (let i = task.events.length - 1; i >= 0; i--) {
+            if (task.events[i]!.kind === "user_reply") {
+              return task.events.slice(i);
+            }
+          }
+          return task.events;
+        })();
+    return src.filter((e) => !isHiddenFromEventStream(e, { isChat }));
   }, [isChat, task.events]);
 
   // 运行中粘性状态行（Batch C）：仅 chat + running；有 streamingText 时 label「正在回复…」正常
@@ -1679,7 +1681,11 @@ const EventStreamImpl = ({
                   // V0.13.x：当前待答的 ask 直接内联答题卡（原模态弹窗淘汰、用户拍板
                   // 「弹窗挡整屏不合理」）；已答 / 已作废走回放卡
                   pendingAskEvent?.id === item.id ? (
-                    <AskUserInlineCard task={task} ev={item} />
+                    <AskUserInlineCard
+                      task={task}
+                      ev={item}
+                      onTaskUpdate={onTaskUpdate}
+                    />
                   ) : (
                     <AskUserRequestRow ev={item} task={task} />
                   )
@@ -1742,22 +1748,24 @@ const EventStreamImpl = ({
             editorKey={task.id}
             onSubmit={handleSend}
             placeholder={
-              composeEnabled
-                ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`
-                : (disabledHint ?? "agent 当前没有等待你回复")
+              awaitingAsk
+                ? "可先答上方提问，也可在此继续说"
+                : composeEnabled
+                  ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`
+                  : (disabledHint ?? "agent 当前没有等待你回复")
             }
             disabled={!composeEnabled}
             submitting={submitting}
             topRow={composerTop}
             leading={composerLeading}
-            running={isRunning}
+            running={composerRunning}
             onStop={onStop}
             stopping={stopping}
-            allowQueueWhileRunning={allowQueueWhileRunning}
+            allowQueueWhileRunning={allowQueueWhileRunning && !awaitingAsk}
             queueBanner={queueBanner}
             className={cn(
               "mx-auto w-full max-w-3xl",
-              !isAwaitingUser && !isRunning && "opacity-70",
+              !isAwaitingUser && !composerRunning && !awaitingAsk && "opacity-70",
             )}
           />
         </div>

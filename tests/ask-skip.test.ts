@@ -18,6 +18,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Task, TaskEvent } from "@/lib/types";
+import {
+  attachAskWaiter,
+  openAskWait,
+  resetAskWaitForTest,
+} from "@/lib/server/ask-wait";
 
 const {
   agentSessions,
@@ -131,7 +136,7 @@ const {
   takePendingAskIf,
   wasAskTakenRecently,
 } = await import("@/lib/server/chat-pending");
-const { ASK_SKIP_AGENT_HINT, beginAskSkip } = await import(
+const { ASK_SKIP_AGENT_HINT, beginAskSkip, buildAskWaitSkipReply } = await import(
   "@/lib/server/ask-skip"
 );
 const { findPendingAskEvent, isAskSkipped } = await import("@/lib/ask-pending");
@@ -202,6 +207,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // 登记表 + 「已被摘走」打点都要清——后者不清会让「孤儿 ask」用例误判成「答题链在飞」
   __resetPendingAskStateForTest();
+  resetAskWaitForTest();
   agentSessions.clear();
   agentSessions.set(TASK_ID, {});
   runningTasks.clear();
@@ -209,6 +215,7 @@ beforeEach(() => {
   getChatLifecycle.mockReturnValue(null);
   deliverTaskQuestion.mockResolvedValue("sent");
   deliverAskReply.mockResolvedValue("sent");
+  resumeCurrentActionWithMessage.mockResolvedValue(undefined);
   writeEventAndPublish.mockResolvedValue({ id: "ev_skip" });
   writeUserEventAndPublishStrict.mockResolvedValue({ id: "e1" });
 });
@@ -223,6 +230,7 @@ describe("ask-skip 协议", () => {
 
     const handle = beginAskSkip(task);
     expect(handle.claimed).toBe(true);
+    expect(handle.askId).toBe(ASK_ID);
     expect(handle.hint).toBe(ASK_SKIP_AGENT_HINT);
     // 认领 = 同步摘走登记：此后答题链看到的就是「没有待答的了」
     expect(getPendingAsk(TASK_ID)).toBeNull();
@@ -276,6 +284,7 @@ describe("ask-skip 协议", () => {
 
     const handle = beginAskSkip(task);
     expect(handle.claimed).toBe(false);
+    expect(handle.askId).toBeNull();
     expect(handle.hint).toBe("");
     await handle.commit();
     expect(skipEvents()).toHaveLength(0);
@@ -387,6 +396,12 @@ describe("chat-pending：打点撤销按 askId 匹配", () => {
     // 又在等人答了 → 跳过 / 答题都该能重新认领
     expect(wasAskTakenRecently(TASK_ID, ASK_ID)).toBe(false);
   });
+
+  it("同一轮 curl 的跳过正文带 [ASK_USER_REPLY] 前缀", () => {
+    expect(buildAskWaitSkipReply("走方案 B")).toBe(
+      "[ASK_USER_REPLY]\n走方案 B\n",
+    );
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -434,6 +449,50 @@ describe("task 模式发新消息 = 跳过提问", () => {
     ).mock.calls[0]?.[1] as { text?: string };
     expect(bubble?.text).toBe(body.text);
     expect(bubble?.text).not.toContain("已跳过");
+  });
+
+  it("同一轮 curl 挂着时输入条回车写进 stdout、不 send", async () => {
+    const token = seedPendingAsk();
+    const running = {
+      ...taskWithAsk(token),
+      runStatus: "running",
+    } as unknown as Task;
+    getTask.mockImplementation(async () => running);
+    runningTasks.set(TASK_ID, {});
+    openAskWait({ taskId: TASK_ID, askId: ASK_ID, token });
+    const chunks: string[] = [];
+    let closed = false;
+    attachAskWaiter(TASK_ID, token, {
+      write: (c) => chunks.push(c),
+      close: () => {
+        closed = true;
+      },
+    });
+
+    const resp = await handleTaskQuestionInject(TASK_ID, body);
+    expect(resp.status).toBe(200);
+    expect(deliverTaskQuestion).not.toHaveBeenCalled();
+    expect(chunks.join("")).toContain("[ASK_USER_REPLY]");
+    expect(chunks.join("")).toContain("已跳过");
+    expect(chunks.join("")).toContain("走方案 B");
+    expect(closed).toBe(true);
+    expect(skipEvents()[0]?.meta.askSkipped).toBe(true);
+    expect(getPendingAsk(TASK_ID)).toBeNull();
+  });
+
+  it("run 还在飞、curl 槽不在 → 409，不 abort，登记放回", async () => {
+    const token = seedPendingAsk();
+    getTask.mockImplementation(async () => ({
+      ...taskWithAsk(token),
+      runStatus: "running",
+    }));
+    runningTasks.set(TASK_ID, {});
+
+    const resp = await handleTaskQuestionInject(TASK_ID, body);
+    expect(resp.status).toBe(409);
+    expect(deliverTaskQuestion).not.toHaveBeenCalled();
+    expect(skipEvents()).toHaveLength(0);
+    expect(getPendingAsk(TASK_ID)?.askId).toBe(ASK_ID);
   });
 
   it("消息没送出去（4xx）→ 登记放回、不写跳过事件", async () => {

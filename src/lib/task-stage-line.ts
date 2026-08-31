@@ -3,6 +3,7 @@
  *
  * 「待回答」必须看 hasPendingAsk（meta.pendingAskId），不能只看
  * awaiting_user + lastActionStatus=running——断掉态同组合、无题可答。
+ * 同一轮 curl 等答案时 runStatus 仍是 running，有 pending ask 也标待回答。
  */
 
 import { actionDisplayLabel } from "@/lib/task-display";
@@ -26,6 +27,9 @@ export const taskStageLine = (
   const stage = task.lastActionType
     ? actionDisplayLabel({ type: task.lastActionType }, "short")
     : "未开始";
+  if (task.hasPendingAsk) {
+    return { stage, status: "待回答", tone: "wait" };
+  }
   if (task.runStatus === "running") {
     return { stage, status: "运行中", tone: "run" };
   }

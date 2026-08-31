@@ -17,11 +17,11 @@
 
 /**
  * ask_user 回合纪律（chat / task 单一源）。
- * 调完工具后结束回复即可；提问后再说的话用户看不见（宿主空完成会续跑、不必硬憋）。
- * 答案以 [ASK_USER_REPLY] 新消息送达、同一会话继续。
+ * 调完工具后立刻前台挂返回里的 curl 等答案；提问后再说的话用户看不见。
+ * 答案出现在 curl 的 stdout（`[ASK_USER_REPLY]`）。没挂上 curl 时服务端会改走 send。
  */
 export const ASK_USER_TURN_LINE =
-  "- 有不确定项 / 要用户选择 → 调 `ask_user` 推答题卡（提问后再说的话用户看不见）→ 结束回复（答案以 `[ASK_USER_REPLY]` 开头的新消息送达）";
+  "- 有不确定项 / 要用户选择 → 调 `ask_user` 推答题卡 → 立刻前台执行工具返回的 curl，直到 stdout 出现 `[ASK_USER_REPLY]`（提问后再说的话用户看不见）";
 
 /**
  * task 模式的「回合纪律」段（曾注入 _super.md；现交卷协议只留 super「核心机制」一处）。
@@ -38,7 +38,7 @@ export const turnDisciplineSection = (): string =>
     "",
     "- 完成一个 action（写完 artifact）→ 调 `submit_work` 交卷 → 拿到 `[SUBMITTED]` 后再说 1-3 句业务结论并结束本轮",
     ASK_USER_TURN_LINE,
-    "- **不要执行任何等待 / 轮询命令**——curl 长轮询、sleep 循环、watch 都不要",
+    "- **不要为交卷执行等待 / 轮询**——sleep / watch / 自己编的 curl 都不要。提问只用 `ask_user` 返回里的那条 curl",
     "- 交卷 / 提问是内部机制、别在正文里提工具名",
   ].join("\n");
 
@@ -56,7 +56,7 @@ export const chatTurnProtocolSection = (): string =>
     "",
     "几个关键：",
     "- **回复正文直接输出**——要查的先查清楚、要写的真写出来（让你写一整篇作文、就把整篇直接输出）。别只说「我先查…我先写…」就结束回复 = 没交付、用户看到的是一句空话。",
-    "- **说完就正常结束回复**——不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）、不要调 `submit_work`（本模式用不到它）。",
+    "- **说完就正常结束回复**——不要为闲聊执行等待 / 轮询（sleep / watch / 自己编的 curl 都不要）；提问只用 `ask_user` 返回里的那条 curl。不要调 `submit_work`（本模式用不到它）。",
     ASK_USER_TURN_LINE,
     "- 内部机制（工具名 / 协议）别在正文里提、直接给用户该看的内容。",
   ].join("\n");

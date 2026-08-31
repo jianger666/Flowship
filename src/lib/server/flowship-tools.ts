@@ -1,20 +1,19 @@
 /**
- * Flowship 自有工具（交卷 / 提问 / 提 MR / 测试人员 / 批次 / 挂 action / 分享群）的
- * 「与传输无关」定义——同一套工具同时供两条链路用：
- *   - cursor 路径：chat-mcp.ts 的 flowshipChat MCP server（zod schema）
- *   - custom 路径：pi 的 customTools（TypeBox schema，见 custom-agent-backend.ts）
+ * Flowship 自有工具（交卷 / 提问 / 提 MR / 测试人员 / 批次 / 挂 action / 分享群）。
  *
- * 工具名必须与 prompt 教的一致（submit_work / ask_user / submit_mr / set_feishu_testers /
- * set_plan_batches / create_custom_action / share_to_group）、sdk-message-handler 也按
- * 这些名字 + 返回文案（[SUBMITTED] / [ASK_SUBMITTED]）判定交卷/提问成功。
+ *   - cursor：`buildSdkCustomTools` → `Agent.create({ local: { customTools } })`
+ *   - custom：pi customTools（TypeBox schema，见 custom-agent-backend.ts）
  *
- * handler 复用 chat-pending 的原语（runTaskAction / safeNotify* / registerPendingAsk）
- * 与 chat-mcp 已导出的同口径分派（dispatchSubmitWorkForTest / dispatchAskUserForTest）、
- * 避免和 MCP 路径逻辑分叉。
+ * 工具名必须与 prompt 教的一致；sdk-message-handler 按名字 +
+ * `[SUBMITTED]` / `[ASK_SUBMITTED]` 判定交卷/提问成功。
+ *
+ * handler 调 chat-pending 原语（runTaskAction / safeNotify* / registerPendingAsk），
+ * 不经 HTTP MCP。
  */
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import type { SDKCustomTool, SDKJsonValue } from "@cursor/sdk";
 // TypeBox 1.x 把这些构造器作为顶层具名导出（会 shadow JS 全局、统一加 TB 前缀）
 import {
   Array as TBArray,
@@ -27,15 +26,16 @@ import {
 
 import {
   CALLER_MISMATCH_ERROR,
+  cancelPendingIf,
   matchExpectedCallerToken,
+  registerPendingAsk,
   runTaskAction,
+  safeNotifyAskUserRequest,
+  safeNotifyAwaiting,
   type AskUserQuestion,
+  type NotifyAwaitingResult,
 } from "./chat-pending";
-import {
-  askSubmittedText,
-  dispatchAskUserForTest,
-  dispatchSubmitWorkForTest,
-} from "./chat-mcp";
+import { buildAskWaitCurl, openAskWait } from "./ask-wait";
 import { createCustomAction } from "./custom-action-fs";
 import { getAppSkillsDir } from "./skills-loader";
 import { getTask } from "./task-fs";
@@ -46,7 +46,7 @@ export interface FlowshipToolDef {
   name: string;
   label: string;
   description: string;
-  /** TypeBox schema（pi customTools 用；cursor 路径仍走 chat-mcp 的 zod） */
+  /** TypeBox schema（pi customTools + Cursor SDK customTools 共用） */
   parameters: unknown;
   handler: (
     args: Record<string, unknown>,
@@ -59,6 +59,142 @@ const text = (t: string): { content: FlowshipToolContent } => ({
 });
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** notify 未送达时提问工具返回（反登记后、非 ASK_SUBMITTED） */
+const ASK_NOTIFY_FAILED_TEXT = "任务已被接管/通知失败、请重试";
+
+const submittedText = (actionId: string): string =>
+  [
+    `[SUBMITTED] action=${actionId} 已交卷，后台在跑检查。现在把要给用户看的话说完（收尾 1-3 句业务结论，答疑该长就长；详情指向产物），然后结束本轮。不要再调本工具、不要轮询、不要复述交卷或提工具名。`,
+  ].join("\n");
+
+const idleWaitText = (): string =>
+  [
+    "[NO_WAIT_NEEDED] 本系统不需要挂起等待：请直接结束本轮回复（正常结束 turn）。",
+    "用户的下一步操作会作为新消息发给你、你会在同一会话里继续。",
+  ].join("\n");
+
+/**
+ * 把 safeNotifyAwaiting 结果映射为 submit_work 工具文案。
+ * 导出供 ownership 测试断言「stale/busy 不是 submitted」。
+ */
+export const mapSubmitWorkNotifyToToolText = (
+  notifyResult: NotifyAwaitingResult,
+  actionId: string,
+): string => {
+  if (notifyResult.status === "error") {
+    return `交卷未受理：${notifyResult.message}`;
+  }
+  if (notifyResult.status === "busy") {
+    return `交卷未受理：${notifyResult.message}`;
+  }
+  if (notifyResult.status === "stale") {
+    return "该 action 已结束/已被后续操作取代、请结束本轮回复";
+  }
+  if (notifyResult.status === "mismatch") {
+    return CALLER_MISMATCH_ERROR;
+  }
+  if (notifyResult.status === "no_notifier") {
+    return "交卷未受理：任务当前没有活跃会话桥（可能已被停止/接管）、请结束本轮回复";
+  }
+  return submittedText(actionId);
+};
+
+/** ask_user 成功返回：答题卡已推；本轮用返回里那条前台 curl 等答案 */
+export const askSubmittedText = (askId: string, waitCurl?: string): string => {
+  const lines = [
+    `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 答题卡）。`,
+    "",
+    "**本轮还没结束。**立刻用一条**前台** shell 执行下面这行（禁止 `&` / nohup / 后台），一直挂到退出。",
+    "- 不要 grep / read / 再调本工具，也不要自己编 URL",
+    "- 这条 shell 的 timeout 填 86400000（毫秒，24 小时），不要用默认 120000",
+    "- 以 `#` 开头的行是空闲输出，忽略；stdout 里出现 `[ASK_USER_REPLY]`（或 `[ASK_USER_REPLY deferred]`）才是答案",
+    "- 拿到答案后在同一轮继续干活。交卷仍然走 `submit_work`，不要为交卷挂 curl",
+  ];
+  if (waitCurl) {
+    lines.push("", waitCurl);
+  }
+  return lines.join("\n");
+};
+
+/** 交卷分派（工具 handler + 测试共用） */
+export const dispatchSubmitWork = async (args: {
+  taskId: string;
+  callerToken: string | undefined;
+  actionId?: string;
+  artifactPath?: string;
+}): Promise<{ text: string }> => {
+  if (!matchExpectedCallerToken(args.taskId, args.callerToken)) {
+    return { text: CALLER_MISMATCH_ERROR };
+  }
+  if (!args.actionId) {
+    const idleNotify = await safeNotifyAwaiting(args.taskId, {
+      callerToken: args.callerToken,
+    });
+    if (idleNotify.status === "mismatch") {
+      return { text: CALLER_MISMATCH_ERROR };
+    }
+    if (
+      idleNotify.status === "stale" ||
+      idleNotify.status === "busy" ||
+      idleNotify.status === "error"
+    ) {
+      return {
+        text: mapSubmitWorkNotifyToToolText(idleNotify, "<idle>"),
+      };
+    }
+    return { text: idleWaitText() };
+  }
+  const notifyResult = await safeNotifyAwaiting(args.taskId, {
+    actionId: args.actionId,
+    artifactPath: args.artifactPath,
+    callerToken: args.callerToken,
+  });
+  if (notifyResult.status === "mismatch") {
+    return { text: CALLER_MISMATCH_ERROR };
+  }
+  return {
+    text: mapSubmitWorkNotifyToToolText(notifyResult, args.actionId),
+  };
+};
+
+/** 提问分派（工具 handler + 测试共用） */
+export const dispatchAskUser = async (args: {
+  taskId: string;
+  callerToken: string | undefined;
+  actionId?: string;
+  questions: AskUserQuestion[];
+}): Promise<{ ok: true; askId: string; waitCurl: string } | { ok: false; error: string }> => {
+  if (!matchExpectedCallerToken(args.taskId, args.callerToken)) {
+    return { ok: false, error: CALLER_MISMATCH_ERROR };
+  }
+  const askId = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const ask = registerPendingAsk(args.taskId, {
+    askId,
+    questions: args.questions,
+    actionId: args.actionId,
+  });
+  const askNotify = await safeNotifyAskUserRequest(args.taskId, {
+    askId,
+    token: ask.token,
+    questions: args.questions,
+    actionId: args.actionId,
+    callerToken: args.callerToken,
+  });
+  if (askNotify.status !== "accepted") {
+    cancelPendingIf(args.taskId, askId);
+    if (askNotify.status === "mismatch") {
+      return { ok: false, error: CALLER_MISMATCH_ERROR };
+    }
+    return { ok: false, error: ASK_NOTIFY_FAILED_TEXT };
+  }
+  openAskWait({ taskId: args.taskId, askId, token: ask.token });
+  return {
+    ok: true,
+    askId,
+    waitCurl: buildAskWaitCurl(args.taskId, ask.token),
+  };
+};
 
 // ----------------- 交卷 submit_work -----------------
 
@@ -78,7 +214,7 @@ const submitWorkDef: FlowshipToolDef = {
     artifact_path: TBOptional(TBString()),
   }),
   handler: async (args, callerToken) => {
-    const r = await dispatchSubmitWorkForTest({
+    const r = await dispatchSubmitWork({
       taskId: str(args.task_id),
       callerToken,
       actionId: str(args.action_id) || undefined,
@@ -96,7 +232,7 @@ const askUserDef: FlowshipToolDef = {
   description: [
     "遇到不确定 / 要用户选择时、把当前轮想问的全部打包成 questions[]、推 UI 答题卡。task / chat 都可用。",
     "每项 { id, question, options?: [{id,label}], allow_text? }；别塞 Other/其他；options 缺省 allow_text 默认 true。",
-    "返回 [ASK_SUBMITTED] 后结束本轮即可；提问后再说会被静音（用户看不见），说不说都行；答案以 [ASK_USER_REPLY] 新消息送达。",
+    "返回 [ASK_SUBMITTED] 后立刻前台执行返回里的 curl（shell timeout 86400000），挂到 stdout 出现 [ASK_USER_REPLY]。不要 grep、不要结束本轮、不要自己编 URL。交卷不要挂 curl。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),
@@ -127,13 +263,13 @@ const askUserDef: FlowshipToolDef = {
         : undefined,
       allowText: q.allow_text !== false,
     }));
-    const r = await dispatchAskUserForTest({
+    const r = await dispatchAskUser({
       taskId: str(args.task_id),
       callerToken,
       actionId: str(args.action_id) || undefined,
       questions,
     });
-    return text(r.ok ? askSubmittedText(r.askId) : r.error);
+    return text(r.ok ? askSubmittedText(r.askId, r.waitCurl) : r.error);
   },
 };
 
@@ -378,7 +514,7 @@ const shareToGroupDef: FlowshipToolDef = {
   },
 };
 
-/** Flowship 自有工具清单（custom provider 的 pi customTools 数据源） */
+/** Flowship 自有工具清单（cursor SDK customTools + pi customTools 共用） */
 export const flowShipTools: FlowshipToolDef[] = [
   submitWorkDef,
   askUserDef,
@@ -388,3 +524,61 @@ export const flowShipTools: FlowshipToolDef[] = [
   createCustomActionDef,
   shareToGroupDef,
 ];
+
+/**
+ * Cursor SDK 把 `local.customTools` 注册成这个合成 MCP server。
+ * 事件流里 `args.providerIdentifier` 会是它（旧会话仍可能是 `flowshipChat`）。
+ */
+export const FLOWSHIP_SDK_CUSTOM_TOOLS_SERVER = "custom-user-tools";
+
+/** TypeBox schema → SDK customTools.inputSchema（纯 JSON Schema） */
+const typeBoxToJsonSchema = (schema: unknown): Record<string, SDKJsonValue> => {
+  const raw = JSON.parse(JSON.stringify(schema)) as unknown;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { type: "object", properties: {} };
+  }
+  return raw as Record<string, SDKJsonValue>;
+};
+
+/**
+ * 给 @cursor/sdk `local.customTools` 用。execute 闭包带 callerToken，
+ * 不再把身份塞进 HTTP MCP URL。oneshot / 受限答疑不要调这个。
+ */
+export const buildSdkCustomTools = (
+  callerToken: string,
+): Record<string, SDKCustomTool> => {
+  const tools: Record<string, SDKCustomTool> = {};
+  for (const t of flowShipTools) {
+    tools[t.name] = {
+      description: t.description,
+      inputSchema: typeBoxToJsonSchema(t.parameters),
+      execute: async (args) => {
+        const r = await t.handler(args, callerToken);
+        return { content: r.content };
+      },
+    };
+  }
+  return tools;
+};
+
+/**
+ * 正式会话：把系统工具挂进 `local.customTools`。已有 customTools 不覆盖。
+ * 无 callerToken（oneshot / 受限答疑）原样返回。
+ */
+export const withFlowshipSdkCustomTools = <T extends object>(
+  local: T | undefined,
+  callerToken: string | undefined,
+): T | (T & { customTools: Record<string, SDKCustomTool> }) => {
+  if (!callerToken) return (local ?? {}) as T;
+  if (
+    local &&
+    "customTools" in local &&
+    (local as { customTools?: unknown }).customTools
+  ) {
+    return local;
+  }
+  return {
+    ...(local ?? {}),
+    customTools: buildSdkCustomTools(callerToken),
+  } as T & { customTools: Record<string, SDKCustomTool> };
+};

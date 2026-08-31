@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ASK_WAIT_SHELL_TIMEOUT_MS,
   formatShellFailureText,
   prepareEditPathArgs,
   prepareGlobArgs,
@@ -8,6 +9,7 @@ import {
   prepareShellArgs,
   prepareWriteArgs,
   resolveShellTimeoutMs,
+  resolveShellTimeoutMsForCommand,
 } from "../src/lib/server/pi-coding-tools";
 
 describe("resolveShellTimeoutMs", () => {
@@ -35,6 +37,15 @@ describe("resolveShellTimeoutMs", () => {
     expect(resolveShellTimeoutMs(2)).toBe(2_000);
     expect(resolveShellTimeoutMs(999)).toBe(10 * 60 * 1000);
     expect(resolveShellTimeoutMs(20 * 60 * 1000)).toBe(10 * 60 * 1000);
+  });
+
+  it("ask-wait curl 无视模型 120s，按 24h 挂", () => {
+    const cmd =
+      'curl -NsS --no-buffer "http://127.0.0.1:8676/api/tasks/t1/ask-wait?token=abc"';
+    expect(resolveShellTimeoutMsForCommand(cmd, 120_000)).toBe(
+      ASK_WAIT_SHELL_TIMEOUT_MS,
+    );
+    expect(resolveShellTimeoutMsForCommand("ls", 120_000)).toBe(120_000);
   });
 });
 

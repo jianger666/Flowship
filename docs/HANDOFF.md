@@ -6,7 +6,7 @@
 
 站在 Cursor SDK 肩膀上的**项目级 AI Harness 平台 · 飞书 story → MR 自动化**。核心是 Harness（缰绳）：每个 action 边界用确定性工具（artifact 落盘 / 必备段 lint / review 只读指纹 / 基底 commit 校验 / MR 门禁 / HITL ack）压住 LLM 非确定性、保证产出可观测、可回退、可复用。
 
-> 产品显示名与 GitHub 仓库名均为 **Flowship**（v1.1.0 起、原「AI工作流」；仓库于 2026-08-03 从 `fe-ai-flow` 改名）。发版链稳定内部标识（appId / userData `fe-ai-flow` / artifactName）永远不改。代码内标识已全面 Flowship 化（v1.1.x：包名 `flowship`、MCP `flowshipChat`、env `FLOWSHIP_*`、globalThis `__flowship*`、localStorage `flowship:*`）；仍保留旧值的仅剩：持久化 marker（`<!--fe-ai-flow-rev-split-->`、`refs/ai-flow/checkpoints`）、退役迁移 key（`fe-ai-flow:settings`）。
+> 产品显示名与 GitHub 仓库名均为 **Flowship**（v1.1.0 起、原「AI工作流」；仓库于 2026-08-03 从 `fe-ai-flow` 改名）。发版链稳定内部标识（appId / userData `fe-ai-flow` / artifactName）永远不改。代码内标识已全面 Flowship 化（v1.1.x：包名 `flowship`、env `FLOWSHIP_*`、globalThis `__flowship*`、localStorage `flowship:*`）；MCP 保留名 `flowshipChat` / `custom-user-tools`（系统工具走 SDK customTools、防用户占用）；仍保留旧值的仅剩：持久化 marker（`<!--fe-ai-flow-rev-split-->`、`refs/ai-flow/checkpoints`）、退役迁移 key（`fe-ai-flow:settings`）。
 
 ## 给 AI 接力的最小上下文
 
@@ -133,7 +133,7 @@ V0.6.26 以前默认「单 SDK Run 跑全 task、forceNewAgent 是例外」、V0
 
 - 用户每次「推进」action → 默认起新 agent + super prompt 冷启动；勾续用 → 对存活会话 `agent.send([NEXT_ACTION ...])` 接力
 - agent 跑完 action → 写完 artifact 后调 `submit_work(action_id)` **交卷**（非阻塞）→ 拿到 `[SUBMITTED]` 后说 1-3 句业务结论并结束 turn（固定横幅在 run 结束补发）→ runner **后台异步**跑后置检查（V0.8.18）、跑完把 action 标 `awaiting_ack`
-- 用户操作以 send 送达：再聊聊 = `send([ACTION_ACK revise]+feedback)`、ask 答案 = `send([ASK_USER_REPLY]…)`；**通过纯服务端落状态**（agent 不需要收信号）
+- 用户操作以 send 送达：再聊聊 = `send([ACTION_ACK revise]+feedback)`、ask 答案优先走提问时挂上的 `/ask-wait` curl（同一轮 stdout），没挂上才 `send([ASK_USER_REPLY]…)`；**通过纯服务端落状态**（agent 不需要收信号）
 - 终结 task → finalize 直接 cancel 活 run + 关会话（不再发 [TASK_DONE] 信号）
 
 **字段热更（V0.6.6、仅续用路径需要）**：super prompt 只在会话启动时构造一次、续用推进时用户在详情页编辑的 `title/role/feishuStoryUrl` 会 stale。runner 在 `agentSessions` record 存启动快照（内存、不落盘）、续用推进时 diff 出变更、**有变才**拼一段 `[TASK_UPDATED]` 注入 `[NEXT_ACTION]` directive（注入后推进快照防重复告知）。
@@ -142,9 +142,9 @@ V0.6.26 以前默认「单 SDK Run 跑全 task、forceNewAgent 是例外」、V0
 
 ```
 Agent.create（每 action 默认新建 / 勾续用复用）
-  → agent.send(prompt) → run 流式消费 → agent 交卷 / 提问后自然结束 turn → run finished
+  → agent.send(prompt) → run 流式消费 → 交卷后自然结束 turn；提问则前台 curl 挂 `/ask-wait` 等答案（没挂上则结束 turn、答案改 send）
   → agent 实例保留在 agentSessions（不 close）
-  → 用户下一步操作（推进续用 / 再聊聊 / ask 答案 / chat 消息）→ agent.send(新消息) → 新 run
+  → 用户下一步操作（推进续用 / 再聊聊 / chat 消息 / 未挂 wait 的 ask 答案）→ agent.send(新消息) → 新 run
   → stop / error / finalize / 换新 agent / 服务重启 → 会话关闭（下次 fresh agent + artifact/events 恢复上下文）
 ```
 
@@ -228,7 +228,7 @@ ship 实现要点：
 
 - **server-side GitLab REST API**：`src/lib/server/gitlab-client.ts` 直接 fetch `/api/v4/projects/:id/merge_requests`、走 PAT (`PRIVATE-TOKEN` header)；**不**依赖 glab CLI / 外部 MCP server
 - **提测目标分支 per-repo（V0.6.7）**：MR target = 该仓的测试分支（`task.repoTestBranches[repoPath]`、建 task 时从设置页快照）、没配回退 `test`；agent 从 super prompt「仓库分支配置」段读、不探 `origin/HEAD`（那是默认主分支、跟提测工作流不符）
-- **PAT 不暴露给 agent**：agent 通过 MCP 工具 `submit_mr` 间接调、server 端凭 settings 闭包的 token 访问 GitLab；MCP 工具返结构化 JSON（`{ ok, mr_url, mr_iid, mr_version }`）
+- **PAT 不暴露给 agent**：agent 通过平台工具 `submit_mr` 间接调、server 端凭 settings 闭包的 token 访问 GitLab；工具返结构化 JSON（`{ ok, mr_url, mr_iid, mr_version }`）
 - **多仓 task 每仓 1 条 MR**：`Task.gitBranches[]` / `Task.mrs[]` / `ActionRecord.sideEffects.mrs[]` 都按 `repoPath` 区分；某仓 `git diff` 为空时 agent 跳过、在 artifact 写跳过原因
 - **同分支累计 commit**：同 `(repoPath, 目标分支)` 多次提交不开新 MR、`version` 累加、保留 `createdAt` 首次值——`upsertMR(taskId, repoPath, { targetBranch, ... })`（v0.8.23 去重键加目标分支、同仓提测 MR→test 和联调 MR→dev 各记各的）
 - **dev（联调）复用同一 GitLab 基建（v0.8.23）**：提 PR 模式跟 ship 共用 `submit_mr` + `MRRecord` + 冲突门禁、唯一区别 target = dev 分支；直推模式不提 MR（本地 merge dev 直推）。详见「最近演进」v0.8.23
@@ -376,7 +376,12 @@ ai-flow-action-hub/
 - **Windows 自更新**：点右上角确认一次后下载完直接 `quitAndInstall`，去掉第二次系统框；`autoInstallOnAppQuit=false`，关应用不再静默卸装。
 - **本版更新**：升完版第一次打开弹 3～5 条人话（`src/lib/whats-new.ts`）；设置页版本号旁可再打开。首次安装只记账不弹。
 - **空对话草稿复用**：chat 没发过消息时，再点新建 / Cmd+N / 切仓再开都回到那条空草稿，不堆空窗口。
-- **对话模型 trigger 常显思考档**：长模型名截断不再吃掉 effort；Default 没写进 params 时也标出来。
+- **唤醒后输入条误开**：失败后再说「请继续」，question 接口曾在写成 running 前就 200 带回失败快照，详情页不锁输入、再发被 409。现等到 running 落盘再返回；过期 done 不得盖回失败态。
+- **答题卡提交**：成功后用接口返回的 task 立刻收卡（不单等 SSE）；超过 30s 只切「投递中」、不 abort 在飞请求。模型提问后仍按正常流程自己结束本轮，再 send 答案。
+- **疑似卡住**：按事件流末条 / 流式输出是否超过 5 分钟没动来判，不再用 `task.updatedAt`（列表节流字段、客户端 append 事件也不 bump），避免 AI 一直在写代码却误报卡住。有未答提问（`findPendingAskEvent`）不亮——提问后 `runStatus` 仍是 running，那是在等你。
+- **系统工具改 SDK customTools**：`ask_user` / `submit_work` 等走 `local.customTools`（合成名 `custom-user-tools`），与 pi 共用 `flowship-tools.ts`。用户 MCP 仍 `mcpServers`。oneshot / 群答疑不传 `callerToken`、不挂这些工具。HTTP `/api/mcp/chat-tool` 与 `chat-mcp.ts` 已删。
+- **自定义模型识图**：pi 不再一律 `input: ["text"]`。按 models.dev 的 `attachment` / `modalities.input` 标图像能力（同 id 多来源 OR，防 huggingface 纯文本条盖掉官方多模态）；`glm-5.3-flash` 这类才能把 `read` 到的图送进请求。目录没命中仍当纯文本。Cursor SDK 路径不改。
+- **ask_user 同一轮等答案**：提问成功后工具立刻返回一条前台 `curl`（`/api/tasks/:id/ask-wait`）。curl 挂上则用户答案写进 stdout、本轮继续；没挂上仍走原来的 `send`。答题卡可点时 curl 往往还没挂上：秒答先压在槽里等 curl（约 15s），挂上立刻写入同一轮；超时才 send，避免「上一轮尚未结束」+ 410 再唤醒新 agent。提问后不 `run.cancel()`、也不把 `runStatus` 切成 awaiting_user——等答案靠 curl 阻塞。底部输入条在未答提问期间仍可打字回车（不换成停止键），等同隐式跳过这张卡：跳过正文写进同一轮 curl，不 send、不入队。自定义模型这条 shell 超时抬到 24h。等答案那条 curl 不进事件流（落盘可审计）：显示过滤收口在 `isHiddenFromEventStream`（muted / 跳过过期标记 / ask-wait shell / 回合内工具 error / chat boot 噪声）。`submit_work` 仍非阻塞，不复活 `wait-ack` / `wait_for_user`。24h 硬超时未答：写作废标记 `askExpired`，答题卡收成一行「已过期」（可展开看原题），悬浮条 / 侧栏待回答熄灭；再提交 toast「这组提问已过期，请在下方继续」。
 - **偏好收口**：菜单栏图标 / 开机自启动 / 插电防休眠进设置→偏好；删掉假的「Agent shell 提速」；Windows 仍可切 Git Bash。
 - **task 提示词去重**：交卷协议只留 `_super.md`「核心机制」+ 关键规则一句指针；各 action playbook 收尾改成「按 super 交卷」。
 - **启动表单 Form/Field**：disabled / invalid 下钻，缺项红字写在标题右侧。
@@ -435,7 +440,7 @@ ai-flow-action-hub/
 | **SDK 本地 agent store（躲开 `~/.cursor` SQLite WAL）** | `src/lib/server/sdk-agent-store.ts` + `src/lib/server/agent-backend.ts` |
 | **chat 模式 UI（V0.6.0.1 新）** | `src/components/tasks/chat-view.tsx` |
 | **chat 模式 API** | `src/app/api/tasks/[id]/chat-reply/route.ts` |
-| MCP server 本体（v0.9.8 瘦身：工具注册 + premature 兜底 + session transport；V0.11 起 wait 协议退役、submit_work / ask_user 非阻塞） | `src/lib/server/chat-mcp.ts` |
+| **系统工具（交卷 / 提问 / 提 MR 等）** | Cursor：`flowship-tools.ts` → SDK `local.customTools`（`agent-backend.ts` 按 `callerToken` 挂上）；pi：同文件桥成 customTools | `src/lib/server/flowship-tools.ts` |
 | pending 等待状态机 + 信号 API（v0.9.8 拆出：pendingMap / ToolReturn / submitXxx / notifier 注册表、routes 与 runner 都从这 import） | `src/lib/server/chat-pending.ts` |
 | 推进 / 终结 路由（V0.13 起 action-ack 退役、approve 由推进时自动认可） | `src/app/api/tasks/[id]/{advance,finalize}/route.ts` |
 | watch-task SSE 路由 | `src/app/api/tasks/[id]/watch-task/route.ts` |
@@ -443,6 +448,7 @@ ai-flow-action-hub/
 | ContextDocsPanel（任务级上下文） | `src/components/tasks/context-docs-panel.tsx` |
 | ask_user 答题卡（V0.13 起内联进事件流、原弹窗退役） | `src/components/tasks/ask-user-inline.tsx` |
 | 事件流主组件 + utils + rows | `src/components/tasks/event-stream{,/utils,/rows}.tsx` |
+| 事件流不渲染闸（muted / 跳过过期 / ask-wait curl / 回合内工具 error / chat boot） | `src/lib/event-stream-hidden.ts` |
 | Artifact 面板（V0.6 适配 ActionRecord） | `src/components/tasks/artifact-panel.tsx` |
 | Artifact 修订模式（词级 diff + 内联渲染） | `src/lib/md-revision.ts` + `src/components/tasks/artifact-revision-view.tsx` |
 | **Action timeline（V0.6 新）** | `src/components/tasks/action-timeline.tsx` |

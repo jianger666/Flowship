@@ -178,6 +178,9 @@ const TaskDetailPage = () => {
   // 必须用 ref 比对「响应是否仍属当前页」，不能只靠 absorbTask 的 useCallback(id)
   const routeIdRef = useRef(id);
   routeIdRef.current = id;
+  // onDone 判断过期快照用：setState 里读不到最新 task
+  const taskRef = useRef<Task | null>(null);
+  taskRef.current = task;
 
   // 统一 terminal sink——SSE task_deleted / watch 410 / 已 hydrate 的 404
   // 只调 commitTaskDeleted（503 unavailable 不进此 sink）
@@ -307,8 +310,7 @@ const TaskDetailPage = () => {
     fixBugDeepLinkConsumedRef.current = token;
     // 与「推进」按钮的 canAdvance 口径对齐：chat 模式 / running / 终态 / 等提问答案不开弹窗
     //（深链不能绕过叠跑推进、也不能绕开未答的 ask）
-    const deepLinkAwaitingAsk =
-      task.runStatus === "awaiting_user" && !!findPendingAskEvent(task.events);
+    const deepLinkAwaitingAsk = !!findPendingAskEvent(task.events);
     const advanceable =
       task.mode !== "chat" &&
       !deepLinkAwaitingAsk &&
@@ -391,8 +393,11 @@ const TaskDetailPage = () => {
       },
       onDone: (t) => {
         clearStreaming();
-        setRunActive(false);
+        const current = taskRef.current;
+        // 过期失败 done 不得解锁：唤醒后 running 已到、迟到的 error 快照会把输入条打开
+        if (current && t.updatedAt < current.updatedAt) return;
         absorbTask(t);
+        if (t.runStatus !== "running") setRunActive(false);
       },
       onAssistantDelta: pushDelta,
       onRestrictedRun: setRestrictedRunActive,
@@ -498,8 +503,7 @@ const TaskDetailPage = () => {
   // AI 提问等答案中（未答 ask 且提问还有人接）：推进藏起来——此时推进会绕开答题打断
   // 会话语境（agent 还在等答案）；用户先答题（或底部输入条说话）后按钮自然恢复。
   // runStatus=error（提问已没人接）不拦、推进是恢复手段。
-  const awaitingAskAnswer =
-    task.runStatus === "awaiting_user" && !!findPendingAskEvent(task.events);
+  const awaitingAskAnswer = !!findPendingAskEvent(task.events);
 
   // 推进按钮：任务非终结态 + agent 不在跑代码 + 不在等提问答案
   //   - idle / error：没活 agent、推进会起新 Run
@@ -1033,6 +1037,7 @@ const TaskDetailPage = () => {
                   // 但它刻意不写 runStatus——必须并进来，否则它跑着的工具全成「已中断」
                   isRunning={runActive || restrictedRunActive}
                   onPrependEvents={handlePrependEvents}
+                  onTaskUpdate={absorbTask}
                 />
               </div>
               {/* 疑似卡住提示：挂在输入条上方，chat / task 共用 SuspectStuckHint */}

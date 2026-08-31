@@ -75,7 +75,7 @@ const { setFailpoint, clearFailpoints } = await import(
   "@/lib/server/failpoints"
 );
 const { getExpectedCallerToken } = await import("@/lib/server/chat-pending");
-const { dispatchAskUserForTest } = await import("@/lib/server/chat-mcp");
+const { dispatchAskUser } = await import("@/lib/server/flowship-tools");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
@@ -218,7 +218,7 @@ describe("R29 chat 旁路共享写", () => {
 
       // 挂在 supersede 后——stop 关会话后 askLease.instanceStillCurrent=false，拒写
       const hang = installHangingFailpoint("mcp.askUser.afterSupersede");
-      const pAsk = dispatchAskUserForTest({
+      const pAsk = dispatchAskUser({
         taskId: TASK_ID,
         callerToken: token,
         questions: [
@@ -266,7 +266,7 @@ describe("R29 chat 旁路共享写", () => {
 
       // 挂在 supersede 后、status 写前——给 forceClear+B 窗口
       const hang = installHangingFailpoint("mcp.askUser.afterSupersede");
-      const pAsk = dispatchAskUserForTest({
+      const pAsk = dispatchAskUser({
         taskId: TASK_ID,
         callerToken: tokenA,
         questions: [
@@ -487,7 +487,7 @@ describe("R29 chat 旁路共享写", () => {
       });
       const token = await waitUntilCallerToken();
 
-      const askOk = await dispatchAskUserForTest({
+      const askOk = await dispatchAskUser({
         taskId: TASK_ID,
         callerToken: token,
         questions: [

@@ -76,7 +76,7 @@ import {
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
-import { beginAskSkip, type AskSkipHandle } from "@/lib/server/ask-skip";
+import { beginAskSkip, fulfillAskSkipViaWait, type AskSkipHandle } from "@/lib/server/ask-skip";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   migrateProviderSettings,
@@ -517,6 +517,59 @@ const runChatReplyInject = async (
     );
   }
   const resumedAsOwner = ownerInstanceId !== null;
+
+  // 同一轮 curl 还挂着等答案：输入条回车 = 顶掉提问，写进 stdout，不要入队。
+  if (askSkip.claimed) {
+    const viaWait = await fulfillAskSkipViaWait(
+      task.id,
+      askSkip,
+      agentText || fallbackText,
+      {
+        imageAbsPaths,
+        attachmentPaths:
+          attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
+      },
+    );
+    if (viaWait) {
+      await askSkip.commit();
+      if (clientItemId) {
+        settleMessageHandedOff(task.id, clientItemId);
+      }
+      let persistWarning: string | undefined;
+      try {
+        const capture = await tryCaptureCheckpoint();
+        const replyEvent = await persistReplyAndCheckpoint(capture);
+        if (replyEvent && clientItemId) {
+          markMessagePersisted(task.id, clientItemId);
+        }
+        if (!replyEvent) {
+          persistWarning = PERSIST_WARNING_DELIVERED;
+          console.error(
+            `[chat-reply] 已送达但持久化失败（ENOENT/未写）task=${task.id}`,
+          );
+        }
+      } catch (persistErr) {
+        console.error(
+          `[chat-reply] 已送达但持久化失败 task=${task.id}:`,
+          persistErr,
+        );
+        persistWarning = PERSIST_WARNING_DELIVERED;
+      }
+      const fresh = await getTask(task.id);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          task: fresh ?? task,
+          autoStarted: false,
+          ...(clientItemId
+            ? { itemId: clientItemId, settled: true, outcome: "delivered" }
+            : {}),
+          ...(persistWarning ? { persistWarning } : {}),
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+  }
 
   // 决定模式（V0.11）：有存活会话且没 run 在跑 → send 续接；否则 → 起新会话
   if (hasChatSession(task.id)) {

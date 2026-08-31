@@ -11,7 +11,11 @@
  */
 
 import type { AskUserQuestion } from "@/lib/types";
-import { isAskSettled } from "@/lib/ask-pending";
+import {
+  ASK_EXPIRED_EVENT_TEXT,
+  ASK_EXPIRED_META_KEY,
+  isAskSettled,
+} from "@/lib/ask-pending";
 import { getTask } from "./task-fs";
 import { writeEventAndPublish } from "./task-stream";
 
@@ -20,12 +24,14 @@ import { writeEventAndPublish } from "./task-stream";
  *
  * @param lease 可选；getTask / 写作废事件用 lease 门控——接管发生在其 IO 内时
  *   旧 A 不再对新世界写作废标记。调用点本波可传 undefined（下一波接线）。
+ * @param opts.expired 24h 硬超时：meta 打 `askExpired`，UI 收成「已过期」而不是中性「已失效」。
  * @returns 最近一条被作废的 ask 的 questions（供重启时断点续传）、没有则空数组。
  */
 export const supersedePendingAsks = async (
   taskId: string,
   reason: string,
   lease?: () => boolean,
+  opts?: { expired?: boolean },
 ): Promise<AskUserQuestion[]> => {
   // 入场前同步 gate——失主直接空返、不读盘不写事件
   if (lease && !lease()) return [];
@@ -47,8 +53,13 @@ export const supersedePendingAsks = async (
       {
         kind: "info",
         actionId: ev.actionId,
-        text: `上一组提问因${reason}失效、无需再回答。`,
-        meta: { supersededAskId: askId },
+        text: opts?.expired
+          ? ASK_EXPIRED_EVENT_TEXT
+          : `上一组提问因${reason}失效、无需再回答。`,
+        meta: {
+          supersededAskId: askId,
+          ...(opts?.expired ? { [ASK_EXPIRED_META_KEY]: true } : {}),
+        },
       },
       lease,
     );

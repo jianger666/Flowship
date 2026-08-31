@@ -104,16 +104,7 @@ export const DEFAULT_EXPANDED_KINDS: ReadonlySet<EventKind> = new Set([
   "user_reply",
 ]);
 
-/**
- * chat 历史噪声：旧版「Chat 任务启动 (model:…)」info。
- * 勿误伤重连 info（meta.kind=reconnecting / reconnected）。
- */
-export const isChatStartupNoiseInfo = (ev: TaskEvent): boolean => {
-  if (ev.kind !== "info") return false;
-  const metaKind = ev.meta?.kind;
-  if (metaKind === "reconnecting" || metaKind === "reconnected") return false;
-  return /^Chat 任务启动/.test(ev.text);
-};
+export { isChatStartupNoiseInfo } from "@/lib/event-stream-hidden";
 
 // 折叠态摘要：把所有换行 / 多空白压成单空格、再 200 字截
 // 历史方案：取首行 + 80 字。问题：thinking / tool_call 首行常常很短

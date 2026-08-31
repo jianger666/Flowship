@@ -55,6 +55,7 @@ import {
 import { useShareToGroup } from "@/hooks/use-share-to-group";
 import {
   extractAskQuestions,
+  isAskExpired,
   isAskSkipped,
   isAskSuperseded,
 } from "@/lib/ask-pending";
@@ -1052,13 +1053,24 @@ interface AskUserRequestRowProps {
 }
 
 /**
- * 「用户没答、直接发新消息」跳过的提问：收成一行灰色细行、点开看原问题。
+ * 「用户没答、直接发新消息」跳过 / 「等待超过 24 小时」过期：收成一行灰色细行、点开看原问题。
  *
  * 为什么不直接从事件流里抹掉（用户拍板）：事件流是历史记录、AI 确实问过，
  * 彻底删掉会让回溯时看不懂 agent 后面那句「按你说的继续」是接着什么说的。
  */
-const SkippedAskRow = ({ ev, count }: { ev: TaskEvent; count: number }) => {
-  // 展开看原问题（默认收起——跳过了就说明用户不关心）
+const CollapsedAskRow = ({
+  ev,
+  count,
+  verdict,
+  hint,
+}: {
+  ev: TaskEvent;
+  count: number;
+  verdict: string;
+  /** 展开后顶上一句原因（过期才写；跳过标题已经够） */
+  hint?: string;
+}) => {
+  // 展开看原问题（默认收起——跳过 / 过期了就说明这组题不再等答）
   const [open, setOpen] = useState(false);
   const questions = useMemo(() => extractAskQuestions(ev.meta), [ev.meta]);
 
@@ -1076,7 +1088,7 @@ const SkippedAskRow = ({ ev, count }: { ev: TaskEvent; count: number }) => {
         )}
         <Ban className="size-3.5 shrink-0" />
         <span className="min-w-0 flex-1 truncate">
-          AI 提过 {count} 个问题 · 已跳过
+          AI 提过 {count} 个问题 · {verdict}
         </span>
         <span className="shrink-0 tabular-nums opacity-70">
           {formatTs(ev.ts)}
@@ -1084,6 +1096,7 @@ const SkippedAskRow = ({ ev, count }: { ev: TaskEvent; count: number }) => {
       </button>
       {open && (
         <div className="flex flex-col gap-1.5 border-t border-border/50 px-2.5 py-2 text-xs text-muted-foreground">
+          {hint && <div>{hint}</div>}
           {questions.length > 0 ? (
             questions.map((q, idx) => (
               <div key={q.id} className="flex items-start gap-2">
@@ -1135,6 +1148,11 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
     () => !answered && isAskSkipped(task.events, askId),
     [answered, task.events, askId],
   );
+  // 24h 硬超时：跟跳过同款折叠行，别再 Amber「等你答」
+  const expired = useMemo(
+    () => !answered && isAskExpired(task.events, askId),
+    [answered, task.events, askId],
+  );
 
   // 问题数量：从 meta.questions 拿、没有就尝试用 text 行数估
   const questionsCount =
@@ -1143,7 +1161,19 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
       : ev.text.split("\n").filter((l) => l.trim().length > 0).length;
 
   if (skipped) {
-    return <SkippedAskRow ev={ev} count={questionsCount} />;
+    return (
+      <CollapsedAskRow ev={ev} count={questionsCount} verdict="已跳过" />
+    );
+  }
+  if (expired) {
+    return (
+      <CollapsedAskRow
+        ev={ev}
+        count={questionsCount}
+        verdict="已过期"
+        hint="等待超过 24 小时，本轮已结束。在下方继续即可。"
+      />
+    );
   }
 
   return (

@@ -30,7 +30,11 @@ interface Props {
 }
 
 export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
-  const [saving, setSaving] = useState(false);
+  // 只在切提供方时锁 UI。切模型 / 思考档也会 PATCH，但不能 disabled：
+  // Picker 在 disabled 时会强制关弹层，请求一结束又按还开着的 open 重开，下拉会闪一下。
+  const [savingProvider, setSavingProvider] = useState(false);
+  // 连点思考档只认最后一次 PATCH，避免乱序回写把 chip 打回上一档
+  const modelSaveGen = useRef(0);
   const { models, fetchModels } = useModels();
   const settings = getSettings();
   const settingsRef = useRef(settings);
@@ -59,12 +63,12 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
     });
   }, [providerId, fetchModels]);
 
-  const busy = task.runStatus === "running" || saving;
+  const busy = task.runStatus === "running" || savingProvider;
   const showProvider = !isProviderSwitchLocked(task);
 
   const handleProviderChange = async (nextId: string) => {
     if (!showProvider || !nextId || nextId === providerId) return;
-    setSaving(true);
+    setSavingProvider(true);
     try {
       const model = defaultModelForProvider(settingsRef.current, nextId);
       const latest = await setTaskProvider(
@@ -77,20 +81,20 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
     } catch (err) {
       toast.error(`切换提供方失败：${(err as Error).message}`);
     } finally {
-      setSaving(false);
+      setSavingProvider(false);
     }
   };
 
   const handleModelChange = async (next: ModelSelection) => {
     if (!next.id?.trim()) return;
-    setSaving(true);
+    const gen = ++modelSaveGen.current;
     try {
       const latest = await setTaskModel(task.id, next);
+      if (gen !== modelSaveGen.current) return;
       onTaskUpdate(latest);
     } catch (err) {
+      if (gen !== modelSaveGen.current) return;
       toast.error(`切换模型失败：${(err as Error).message}`);
-    } finally {
-      setSaving(false);
     }
   };
 

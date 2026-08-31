@@ -15,6 +15,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Task, TaskEvent } from "@/lib/types";
+import {
+  attachAskWaiter,
+  openAskWait,
+  resetAskWaitForTest,
+} from "@/lib/server/ask-wait";
 
 const {
   captureChatCheckpoint,
@@ -184,6 +189,7 @@ const skipEvents = (): Array<Record<string, unknown>> =>
 beforeEach(() => {
   vi.clearAllMocks();
   __resetPendingAskStateForTest();
+  resetAskWaitForTest();
   getChatLifecycle.mockReturnValue(null);
   hasChatSession.mockReturnValue(true);
   getChatRunModel.mockReturnValue(null);
@@ -230,6 +236,28 @@ describe("chat 模式发新消息 = 跳过提问", () => {
     ).mock.calls[0]?.[1] as { text?: string };
     expect(bubble?.text).toBe(BODY.text);
     expect(bubble?.text).not.toContain("已跳过");
+  });
+
+  it("同一轮 curl 挂着时输入条回车写进 stdout、不 send 不入队", async () => {
+    const token = seedPendingAsk();
+    getTask.mockImplementation(async () => chatTask(token));
+    sendChatMessage.mockResolvedValue("busy");
+    openAskWait({ taskId: TASK_ID, askId: ASK_ID, token });
+    const chunks: string[] = [];
+    attachAskWaiter(TASK_ID, token, {
+      write: (c) => chunks.push(c),
+      close: () => undefined,
+    });
+
+    const resp = await handleChatReplyInject(TASK_ID, BODY);
+    expect(resp.status).toBe(200);
+    expect(sendChatMessage).not.toHaveBeenCalled();
+    expect(enqueueChatMessage).not.toHaveBeenCalled();
+    expect(chunks.join("")).toContain("[ASK_USER_REPLY]");
+    expect(chunks.join("")).toContain("已跳过");
+    expect(chunks.join("")).toContain("不用加埋点");
+    expect(skipEvents()[0]?.askSkipped).toBe(true);
+    expect(getPendingAsk(TASK_ID)).toBeNull();
   });
 
   it("排队（202）也算受理 → 排的那条带跳过上下文、跳过标记落地", async () => {

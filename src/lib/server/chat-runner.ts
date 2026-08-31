@@ -37,10 +37,11 @@ import {
   setTaskSessionAgentId,
 } from "./task-fs";
 import { getEventsLogPath } from "./task-fs-core";
-import { getChatMcpUrl } from "./chat-mcp";
 import { maybeGenerateChatTitle } from "./chat-title";
 import {
+  cancelPending,
   cancelPendingIf,
+  clearAskTakenMark,
   getPendingAsk,
   setChatAwaitingNotifier,
 } from "./chat-pending";
@@ -148,11 +149,9 @@ import {
 
 // ----------------- 配置 -----------------
 
-// chat 不主动超时（用户随时可能 24h 后才回一句）
+// 整轮 run 硬顶 24h（ask-wait 挂着等答案也算在内）。超时未答会 expire 提问。
 const CHAT_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
-// chat-mcp 在 Agent.mcpServers 里的注册名（跟 task-runner 同款、agent prompt 里得点明）
-const CHAT_TOOL_MCP_NAME = "flowshipChat";
 
 // chat agent / run 句柄类型（从 SDK Agent.create / agent.send 推导、给 runningChats 占位注册 + cancel 用）
 type ChatAgent = Awaited<ReturnType<typeof Agent.create>>;
@@ -585,7 +584,7 @@ const buildInitialPrompt = (
     "  - 读文件（图片会作为附件给你看）　按内容搜索　按文件名找文件",
     "  - 编辑已有文件　新建 / 整文件覆盖　删除文件　跑 shell 命令（timeout 参数语义见 schema 说明）　分派子任务",
     "",
-    "另外还有用户配置的 MCP 工具（飞书 / github / context7 等），已在你收到的工具列表里、按场景用。",
+    "另外还有平台工具（提问 `ask_user` 等）和用户配置的 MCP 工具（飞书 / github / context7 等），已在你收到的工具列表里、按场景用。",
     "",
   );
   // 仅 win32 注入（PowerShell 语法条再按当前壳判定）——mac 用户不吃无关内容
@@ -910,9 +909,8 @@ export const runChatSession = async (
     }
     if (startedTask) publish(task.id, { kind: "task", task: startedTask });
 
-    // 2) 拼 mcpServers：fe 自管 MCP（按 task 黑名单过滤）+ 我们自己的 chat-tool
-    // （settingSources:[] 不加载任何 .cursor mcp；全局 / 项目 MCP 一律走 fe 自管配置）
-    // 配置里万一也叫 flowshipChat、按我们的为准（直接覆盖）
+    // 2) 拼 mcpServers：fe 自管用户 MCP（按 task 黑名单过滤）。系统工具走 SDK customTools，不走 HTTP MCP。
+    // settingSources:[] 不加载任何 .cursor mcp；全局 / 项目 MCP 一律走 fe 自管配置
     // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
     // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
     publishBootProgress(task.id, "mcp", "正在检查 MCP…");
@@ -927,13 +925,7 @@ export const runChatSession = async (
     const perfMcpMs = Date.now() - perfMcpStart;
     // chat agent 同样带 caller 身份（ask_user 分派层要核）
     const callerToken = String(allocTaskRunInstanceId());
-    const mergedMcp: Record<string, McpServerConfig> = {
-      ...cursorMcp,
-      [CHAT_TOOL_MCP_NAME]: {
-        type: "http",
-        url: getChatMcpUrl(callerToken),
-      },
-    };
+    const mergedMcp: Record<string, McpServerConfig> = { ...cursorMcp };
 
     // MCP 健康探测也要数秒、探测期间被停 / 换主 → 别再往下跑
     // （原「Chat 任务启动」info 已去掉：用户嫌吵，模型信息输入框下方已有）
@@ -1013,9 +1005,11 @@ export const runChatSession = async (
         apiKey,
         model,
         providerId,
+        callerToken,
         // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
         // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
         // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
+        // 系统工具（ask_user / submit_work 等）由 facade 按 callerToken 挂 local.customTools。
         local: {
           // 未绑工作目录（自由对话没选目录）→ cwd 用用户主目录、不用 process.cwd()
           //（打包后 = app 内部目录、对终端用户无意义）。对齐 codex（默认终端 pwd）/
@@ -1212,7 +1206,7 @@ const registerChatNotifier = (
       if (signal.kind === "ask_user_request") {
         // ask lease 含 askId——同 caller 并发/重试的旧 ask（pending map 已被
         // 新 ask 顶掉）在 supersede/event/status 每个 sink 都被拦、UI 与 pending map 不分裂
-        // + 本 instance 仍 current（stop 摘表 / B 换号后拒写 awaiting_user）
+        // + 本 instance 仍 current（stop 摘表 / B 换号后拒写事件）
         const askLease = (): boolean =>
           ctx.callerStillValid() &&
           getPendingAsk(task.id)?.askId === signal.askId &&
@@ -1249,12 +1243,10 @@ const registerChatNotifier = (
           cancelPendingIf(task.id, signal.askId);
           return "stale";
         }
-        const updated = await setTaskRunStatusIfRunOwner(
-          task.id,
-          "awaiting_user",
-          askLease,
-        );
-        if (updated) publish(task.id, { kind: "task", task: updated });
+        // 同一轮 curl 还挂着等答案：runStatus 保持 running（shell 确实没结束）。
+        // 输入条能不能打字由 UI 看 pending ask，不靠切 awaiting_user。
+        const fresh = await getTask(task.id);
+        if (fresh && askLease()) publish(task.id, { kind: "task", task: fresh });
         return "accepted";
       }
       // submit_work 等非 ask 信号：chat 不用交卷、只切 awaiting_user（条件写）
@@ -1335,16 +1327,14 @@ export const resumeChatSession = async (
       await resolveTaskMcpServers(task.disabledMcpServers),
     );
     const { servers: cursorMcp } = await filterHealthyMcp(enrichedMcp);
-    // resume 发新 caller + 重注册 notifier
+    // resume 发新 caller + 重注册 notifier；系统工具走 customTools，用户 MCP 仍 inline
     const callerToken = String(allocTaskRunInstanceId());
-    const mergedMcp: Record<string, McpServerConfig> = {
-      ...cursorMcp,
-      [CHAT_TOOL_MCP_NAME]: { type: "http", url: getChatMcpUrl(callerToken) },
-    };
+    const mergedMcp: Record<string, McpServerConfig> = { ...cursorMcp };
     const agent = await withSdkDeadline(
       Agent.resume(task.sessionAgentId, {
         apiKey: bootArgs.apiKey,
         providerId,
+        callerToken,
         // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
         model: bootArgs.model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
@@ -1880,7 +1870,10 @@ const consumeChatRun = async (
   reconnectAttempt = 0,
 ): Promise<void> => {
   let cancelled = false;
+  // 24h 硬超时：跟用户点停止分开，未答提问打 askExpired（UI「已过期」）
+  let hardTimedOut = false;
   let hardTimer: NodeJS.Timeout | null = null;
+  let ctx!: AssistantBufferCtx;
   const rec = runningChats.get(task.id);
   // 捕获本 run 的 instanceId lease——forceClear/懒重启换新会话后，
   // 旧 run 迟到 yield 的主消息流（thinking/assistant/tool/flush）全部被拦、
@@ -1898,12 +1891,19 @@ const consumeChatRun = async (
   try {
     // 兜底硬超时：24h
     hardTimer = setTimeout(() => {
+      hardTimedOut = true;
       cancelled = true;
+      const pendingAskId = getPendingAsk(task.id)?.askId;
+      cancelPending(task.id);
+      if (pendingAskId) clearAskTakenMark(task.id, pendingAskId);
+      void supersedePendingAsks(task.id, "等待超过 24 小时", chatLease, {
+        expired: true,
+      });
       void run.cancel().catch(() => {});
     }, CHAT_HARD_TIMEOUT_MS);
 
     // 流式消费 + buffer flush：一轮完整回复 → 一条 assistant_message 事件
-    const ctx: AssistantBufferCtx = {
+    ctx = {
       buffer: "",
       flush: async () => {
         // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
@@ -1944,6 +1944,11 @@ const consumeChatRun = async (
     const result = await run.wait();
 
     if (cancelled || externallyCancelled?.() || result.status === "cancelled") {
+      if (hardTimedOut) {
+        await supersedePendingAsks(task.id, "等待超过 24 小时", chatLease, {
+          expired: true,
+        });
+      }
       // cancel 收尾唯一入口——失主（含 forceClear 空窗）no-op
       await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
         task,
@@ -1979,6 +1984,11 @@ const consumeChatRun = async (
     // 用户 stop 后 stream 以异常收场（abort 类）→ 走 cancel 收尾，
     // 绝不落 error 事件 / error 状态覆盖 stop 路由已写的 idle +「用户停止了对话」。
     if (cancelled || externallyCancelled?.()) {
+      if (hardTimedOut) {
+        await supersedePendingAsks(task.id, "等待超过 24 小时", chatLease, {
+          expired: true,
+        });
+      }
       await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
         task,
       });
