@@ -80,6 +80,7 @@ import {
   type ImagePayload,
 } from "@/lib/task-store";
 import { canCommitTaskSnapshot, commitTaskDeleted } from "@/lib/task-terminal";
+import { promoteSidebarChat } from "@/lib/view-memory";
 import {
   isEphemeralToolOutputDelta,
   parseToolOutputDelta,
@@ -463,6 +464,9 @@ export const ChatView = ({
           )
         ) {
           onTaskUpdateRef.current(committed.task);
+        }
+        if (committed.clearDraft) {
+          promoteSidebarChat(operationTaskId);
         }
         return committed.clearDraft;
       };

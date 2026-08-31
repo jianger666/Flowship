@@ -3,7 +3,10 @@
  *
  * 对标 grok-build 会话组织语义（按 cwd/repo 分组 + 置顶手动序）：
  * - chat 按仓库组；task 模式仍走时间桶（不经本模块）
- * - 组内 updatedAt 倒序；仓库组间按「组内最新 updatedAt」倒序；Home（未绑仓）恒最后
+ * - 置顶 → 仓库组 → Home（未绑仓恒最后）
+ * - 对话序是粘性的：不跟 agent 流式 bump 的 updatedAt 走，避免并行时整组对跳。
+ *   组间 / 组内都按同一条 itemOrder（先出现的组在上；组内按该序）。
+ *   空 order 才回落到 updatedAt 倒序（第一次、还没记下粘性序）。
  * - 置顶序存在 view-memory（不污染 task meta）
  */
 
@@ -29,6 +32,40 @@ export const HOME_GROUP_LABEL = "Home";
 export const sortByUpdatedAtDesc = <T extends { updatedAt: number }>(
   items: T[],
 ): T[] => [...items].sort((a, b) => b.updatedAt - a.updatedAt);
+
+/**
+ * 粘性序：order 里靠前的在上。未入序的垫后，再用 updatedAt 倒序当并列。
+ */
+export const sortByStickyOrder = <T extends { id: string; updatedAt: number }>(
+  items: T[],
+  order: readonly string[],
+): T[] => {
+  if (order.length === 0) return sortByUpdatedAtDesc(items);
+  const rank = new Map(order.map((id, i) => [id, i]));
+  return [...items].sort((a, b) => {
+    const ra = rank.get(a.id);
+    const rb = rank.get(b.id);
+    if (ra == null && rb == null) return b.updatedAt - a.updatedAt;
+    if (ra == null) return 1;
+    if (rb == null) return -1;
+    return ra - rb;
+  });
+};
+
+/**
+ * 对齐当前列表：已有 id 相对序不动，已删的丢掉，新出现的插到最前。
+ * 新对话 / 飞书拉起的窗口会出现在顶上；后台 running 不会改序。
+ */
+export const reconcileChatListOrder = (
+  prevOrder: readonly string[],
+  liveIds: readonly string[],
+): string[] => {
+  const live = new Set(liveIds);
+  const kept = prevOrder.filter((id) => live.has(id));
+  const keptSet = new Set(kept);
+  const newcomers = liveIds.filter((id) => !keptSet.has(id));
+  return [...newcomers, ...kept];
+};
 
 /**
  * 组头标签：settings 仓 name（展示名）优先；无匹配则 basename(repoPath)。
@@ -108,12 +145,14 @@ export const movePinnedId = (
 };
 
 /**
- * 构建「按仓库」分组：置顶 → 仓库组（组内最新 updatedAt 倒序）→ Home。
+ * 构建「按仓库」分组：置顶 → 仓库组 → Home。
+ * itemOrder 非空时仓组 / 组内都跟粘性序，不再按 updatedAt 互相比最新。
  */
 export const buildRepoGroups = (
   tasks: TaskSummary[],
   repos: RepoNameLookup,
   pinnedOrder: readonly string[] = [],
+  itemOrder: readonly string[] = [],
 ): SidebarGroup[] => {
   const pinned: TaskSummary[] = [];
   const unbound: TaskSummary[] = [];
@@ -151,18 +190,30 @@ export const buildRepoGroups = (
     });
   }
 
+  const rank = new Map(itemOrder.map((id, i) => [id, i]));
+  const sticky = itemOrder.length > 0;
   const repoGroups = [...repoBuckets.entries()]
     .map(([norm, { path, items }]) => {
-      const sorted = sortByUpdatedAtDesc(items);
+      const sorted = sticky
+        ? sortByStickyOrder(items, itemOrder)
+        : sortByUpdatedAtDesc(items);
       const latest = sorted[0]?.updatedAt ?? 0;
+      const stickyRank = sticky
+        ? Math.min(
+            ...sorted.map((t) => rank.get(t.id) ?? Number.POSITIVE_INFINITY),
+          )
+        : Number.POSITIVE_INFINITY;
       return {
         key: `repo:${norm}` as SidebarGroupKey,
         label: resolveRepoGroupLabel(path, repos),
         items: sorted,
         latest,
+        stickyRank,
       };
     })
-    .sort((a, b) => b.latest - a.latest);
+    .sort((a, b) =>
+      sticky ? a.stickyRank - b.stickyRank : b.latest - a.latest,
+    );
 
   for (const g of repoGroups) {
     groups.push({ key: g.key, label: g.label, items: g.items });
@@ -172,7 +223,9 @@ export const buildRepoGroups = (
     groups.push({
       key: "unbound",
       label: HOME_GROUP_LABEL,
-      items: sortByUpdatedAtDesc(unbound),
+      items: sticky
+        ? sortByStickyOrder(unbound, itemOrder)
+        : sortByUpdatedAtDesc(unbound),
     });
   }
 

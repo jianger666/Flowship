@@ -9,6 +9,7 @@ import {
   HOME_GROUP_LABEL,
   movePinnedId,
   normalizeRepoPath,
+  reconcileChatListOrder,
   repoPathsForGroupCreate,
   resolveRepoGroupLabel,
 } from "@/lib/sidebar-groups";
@@ -107,6 +108,42 @@ describe("buildRepoGroups", () => {
     expect(groups[3]!.items[0]!.id).toBe("u1");
   });
 
+  it("粘性序时组间不跟 updatedAt 对跳，组内也不换位", () => {
+    const groups = buildRepoGroups(
+      [
+        task({
+          id: "a1",
+          title: "A 新活动",
+          updatedAt: 900,
+          repoPaths: ["/repos/a"],
+        }),
+        task({
+          id: "a2",
+          title: "A 旧",
+          updatedAt: 100,
+          repoPaths: ["/repos/a"],
+        }),
+        task({
+          id: "b1",
+          title: "B",
+          updatedAt: 800,
+          repoPaths: ["/repos/b"],
+        }),
+      ],
+      [
+        { path: "/repos/a", name: "仓 A" },
+        { path: "/repos/b", name: "仓 B" },
+      ],
+      [],
+      ["b1", "a2", "a1"],
+    );
+    expect(groups.map((g) => g.key)).toEqual([
+      "repo:/repos/b",
+      "repo:/repos/a",
+    ]);
+    expect(groups[1]!.items.map((t) => t.id)).toEqual(["a2", "a1"]);
+  });
+
   it("置顶序按 pinnedOrder，幽灵 id 忽略", () => {
     const groups = buildRepoGroups(
       [
@@ -164,5 +201,19 @@ describe("applyPinnedOrder / movePinnedId", () => {
     expect(movePinnedId(ids, ids, "b", "down")).toEqual(["a", "c", "b"]);
     expect(movePinnedId(ids, ids, "a", "up")).toEqual(["a", "b", "c"]);
     expect(movePinnedId(ids, ids, "c", "down")).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("reconcileChatListOrder", () => {
+  it("已有相对序不动，新 id 插顶，已删丢掉", () => {
+    expect(reconcileChatListOrder(["a", "b", "c"], ["c", "x", "a"])).toEqual([
+      "x",
+      "a",
+      "c",
+    ]);
+  });
+
+  it("空序时用当前 liveIds（第一次按 recency 冻住）", () => {
+    expect(reconcileChatListOrder([], ["a", "b"])).toEqual(["a", "b"]);
   });
 });

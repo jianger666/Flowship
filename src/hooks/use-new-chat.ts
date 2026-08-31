@@ -25,6 +25,7 @@ import {
   type Task,
   type TaskSummary,
 } from "@/lib/types";
+import { promoteSidebarChat } from "@/lib/view-memory";
 
 export type CreateChatOptions = {
   /** 预绑工作目录；不传或 [] = Home（不绑仓） */
@@ -50,8 +51,10 @@ export const useNewChat = (
           !sameRepoPaths(unused.repoPaths, repoPaths)
         ) {
           const latest = await setTaskRepoPaths(unused.id, repoPaths);
+          promoteSidebarChat(latest.id);
           onCreated(latest);
         } else {
+          promoteSidebarChat(unused.id);
           onCreated(unused);
         }
         return;
@@ -73,6 +76,7 @@ export const useNewChat = (
             ? s.disabledMcpServers
             : undefined,
       });
+      promoteSidebarChat(task.id);
       onCreated(task);
     } catch (err) {
       toast.error(`新建对话失败：${(err as Error).message}`);

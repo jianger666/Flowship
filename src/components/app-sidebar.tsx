@@ -37,16 +37,20 @@ import { getSettings } from "@/lib/local-store";
 import {
   buildRepoGroups,
   movePinnedId,
+  reconcileChatListOrder,
   repoPathsForGroupCreate,
   type SidebarGroup,
 } from "@/lib/sidebar-groups";
 import { setTaskPinned, updateTaskFields } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
 import {
+  loadSidebarChatOrder,
   loadSidebarCollapsedGroups,
   loadSidebarPinnedOrder,
+  saveSidebarChatOrder,
   saveSidebarCollapsedGroups,
   saveSidebarPinnedOrder,
+  SIDEBAR_CHAT_ORDER_EVENT,
 } from "@/lib/view-memory";
 import type { Task, TaskSummary } from "@/lib/types";
 
@@ -139,14 +143,26 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   const [collapsedKeys, setCollapsedKeys] = useState<Set<string>>(() => new Set());
   // 置顶手动序
   const [pinnedOrder, setPinnedOrder] = useState<string[]>([]);
+  // 对话粘性序（组间 + 组内）；空 = 还没 hydrate，buildRepoGroups 回落 updatedAt
+  const [chatOrder, setChatOrder] = useState<string[]>([]);
+  const [orderHydrated, setOrderHydrated] = useState(false);
 
   // 挂载时读 view-memory（SSR 安全：仅客户端）
   useEffect(() => {
     setCollapsedKeys(loadSidebarCollapsedGroups());
     setPinnedOrder(loadSidebarPinnedOrder());
+    setChatOrder(loadSidebarChatOrder());
+    setOrderHydrated(true);
   }, []);
 
-  // 按模式过滤 + 排序（置顶优先 → updatedAt 倒序）
+  useEffect(() => {
+    const onOrder = () => setChatOrder(loadSidebarChatOrder());
+    window.addEventListener(SIDEBAR_CHAT_ORDER_EVENT, onOrder);
+    return () => window.removeEventListener(SIDEBAR_CHAT_ORDER_EVENT, onOrder);
+  }, []);
+
+  // 过滤后的列表。工作台渲染直接用这份（置顶优先 + updatedAt）。
+  // 对话渲染序走 buildRepoGroups(itemOrder)；这里的 updatedAt 序只给 reconcile 当 liveIds 源。
   const sorted = useMemo(() => {
     const filtered = tasks.filter((t) =>
       mode === "chat" ? t.mode === "chat" : (t.mode ?? "task") === "task",
@@ -158,6 +174,23 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       return b.updatedAt - a.updatedAt;
     });
   }, [tasks, mode]);
+
+  // 粘性序对齐当前列表：已有相对位置不动，新窗口插顶，已删丢掉
+  useEffect(() => {
+    if (!orderHydrated || mode !== "chat") return;
+    const liveIds = sorted.map((t) => t.id);
+    setChatOrder((prev) => {
+      const next = reconcileChatListOrder(prev, liveIds);
+      if (
+        next.length === prev.length &&
+        next.every((id, i) => id === prev[i])
+      ) {
+        return prev;
+      }
+      saveSidebarChatOrder(next);
+      return next;
+    });
+  }, [orderHydrated, mode, sorted]);
 
   // 工作台（work）：时间桶；对话（chat）：仓组
   const timeGroups = useMemo(
@@ -172,8 +205,8 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       path: r.path,
       name: r.name,
     }));
-    return buildRepoGroups(sorted, repoLookup, pinnedOrder);
-  }, [mode, sorted, pinnedOrder]);
+    return buildRepoGroups(sorted, repoLookup, pinnedOrder, chatOrder);
+  }, [mode, sorted, pinnedOrder, chatOrder]);
 
   // 新建后即时插入列表 + 跳详情
   const handleCreated = (task: Task | TaskSummary) => {

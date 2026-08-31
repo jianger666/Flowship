@@ -223,3 +223,46 @@ export const saveSidebarPinnedOrder = (ids: readonly string[]) => {
     /* 存储被禁忽略 */
   }
 };
+
+// ---------- 对话侧栏粘性序（跨重启保留） ----------
+//
+// 不跟 meta.updatedAt 走：agent 流式每 5s 节流 bump 一次，并行对话会整组对跳。
+// 粘性序只在新建 / 用户发送时往前顶。侧栏订阅事件刷新，不靠轮询。
+
+const SIDEBAR_CHAT_ORDER_KEY = "flowship:sidebar-chat-order";
+
+/** 同页 promote 后派发，驱动侧栏重读 localStorage */
+export const SIDEBAR_CHAT_ORDER_EVENT = "flowship:sidebar-chat-order";
+
+/** 对话侧栏粘性 id 序（靠前的组 / 行在上） */
+export const loadSidebarChatOrder = (): string[] => {
+  try {
+    const raw = JSON.parse(
+      localStorage.getItem(SIDEBAR_CHAT_ORDER_KEY) ?? "[]",
+    ) as unknown;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((x): x is string => typeof x === "string" && x.length > 0);
+  } catch {
+    return [];
+  }
+};
+
+/** 保存对话侧栏粘性序（整体覆盖） */
+export const saveSidebarChatOrder = (ids: readonly string[]) => {
+  try {
+    localStorage.setItem(SIDEBAR_CHAT_ORDER_KEY, JSON.stringify([...ids]));
+  } catch {
+    /* 存储被禁忽略 */
+  }
+};
+
+/** 用户发送 / 新建：把这条对话顶到粘性序最前，侧栏组也会跟着上来 */
+export const promoteSidebarChat = (id: string): void => {
+  const tid = id.trim();
+  if (!tid) return;
+  const prev = loadSidebarChatOrder();
+  if (prev[0] === tid) return;
+  saveSidebarChatOrder([tid, ...prev.filter((x) => x !== tid)]);
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(SIDEBAR_CHAT_ORDER_EVENT));
+};
