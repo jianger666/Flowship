@@ -18,7 +18,7 @@
  *
  *   running → run 在跑（agent 正在答）
  *   awaiting_user → 会话在、等用户下一条
- *   idle / error → 停止 / 出错（会话已关、下一条消息起新会话、靠 events.jsonl 恢复上下文）
+ *   idle / error → 停止 / 出错（会话已关、下一条优先 resume；失败则起新会话并注入最近几轮对话正文）
  *
  * # 跟 task-runner 的区别（避免误用）
  *
@@ -36,7 +36,13 @@ import {
   setTaskRunStatusIfRunOwner,
   setTaskSessionAgentId,
 } from "./task-fs";
-import { getEventsLogPath } from "./task-fs-core";
+import { getEventsLogPath, readEventsTail } from "./task-fs-core";
+import {
+  formatChatHistorySection,
+  HISTORY_INJECT_SCAN_EVENTS,
+  selectChatHistoryTurns,
+  type ChatHistoryInject,
+} from "@/lib/chat-history-inject";
 import { maybeGenerateChatTitle } from "./chat-title";
 import {
   cancelPending,
@@ -541,7 +547,29 @@ interface InitialUserMessage {
  *
  * 有 firstMessage：直接拼进 prompt、agent 第一 turn 就回答
  * 无 firstMessage：起手等用户发第一句（边界情况）
+ *
+ * historyInject.turns 非空 = 本窗口已有过对话、这次是新会话接续（resume 失败 /
+ * 懒重启）。把最近几轮正文写进 prompt，避免模型把当前句当成新开的第一句。
  */
+const loadChatHistoryInject = async (
+  taskId: string,
+  opts: { skipEventId?: string; skipUserText?: string },
+): Promise<ChatHistoryInject> => {
+  try {
+    const { events, hasMore } = await readEventsTail(
+      taskId,
+      HISTORY_INJECT_SCAN_EVENTS,
+    );
+    const selected = selectChatHistoryTurns(events, opts);
+    if (selected.turns.length === 0) return selected;
+    // 扫描窗口之外可能还有更早的 user/assistant——标 truncated，prompt 指向 events.jsonl
+    return { ...selected, truncated: selected.truncated || hasMore };
+  } catch (err) {
+    console.warn(`[chat-runner] 读接续历史失败 task=${taskId}`, err);
+    return { turns: [], truncated: false };
+  }
+};
+
 const buildInitialPrompt = (
   task: Task,
   skills: SkillEntry[],
@@ -557,6 +585,7 @@ const buildInitialPrompt = (
   companyEnvBriefSection = "",
   /** cursor 后端链路：pi 的 resource-loader 会自动注入仓库 AGENTS.md，cursor 不会，需补一条必读指令 */
   isCursorBackend = false,
+  historyInject: ChatHistoryInject = { turns: [], truncated: false },
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -661,11 +690,22 @@ const buildInitialPrompt = (
   if (companyEnvBriefSection.trim()) {
     lines.push(companyEnvBriefSection.trim(), "");
   }
+  const continuing = historyInject.turns.length > 0;
   lines.push(
-    "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
+    continuing
+      ? "## 任务事件日志（更早细节 / 工具过程）"
+      : "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
     "",
     `  \`${eventsLogPath}\``,
     "",
+  );
+  if (continuing) {
+    lines.push(
+      "最近几轮对话正文已在下方「本窗口已有对话」。工具过程、更早的轮次在这个文件里；需要时再 read 末尾，不要整份贴给用户。",
+      "",
+    );
+  }
+  lines.push(
     renderContextDocsSection(
       task,
       "→ 用户没传上下文文档、按对话内容判断要不要主动调 MCP / read / grep 摸资料。",
@@ -673,20 +713,24 @@ const buildInitialPrompt = (
     "",
   );
 
-  lines.push(...buildOpeningStanceSection(task.id, firstMessage));
+  lines.push(
+    ...buildOpeningStanceSection(task.id, firstMessage, historyInject),
+  );
 
   return lines.join("\n");
 };
 
 /**
- * 起手姿势段：根据有没有首条用户消息分两种
+ * 起手姿势段
  *
- * - 有首条（99% 场景）：直接答用户首条、答完结束回复
- * - 没首条（极少数边界）：直接结束回复、等用户第一条消息（会以新消息送达）
+ * - 没 firstMessage：直接结束、等用户第一句
+ * - 有历史切片：标明接续 + 最近几轮 + 当前这句（不是新窗口第一句）
+ * - 否则：当前这句就是窗口里真正的第一条
  */
 const buildOpeningStanceSection = (
   taskId: string,
-  firstMessage?: InitialUserMessage,
+  firstMessage: InitialUserMessage | undefined,
+  historyInject: ChatHistoryInject,
 ): string[] => {
   void taskId;
   if (!firstMessage) {
@@ -698,14 +742,20 @@ const buildOpeningStanceSection = (
     ];
   }
 
-  const lines: string[] = [
-    "## 用户的第一条消息",
-    "",
+  const lines: string[] = [];
+  if (historyInject.turns.length > 0) {
+    lines.push(...formatChatHistorySection(historyInject));
+    lines.push("## 用户的新消息", "");
+  } else {
+    lines.push("## 用户的第一条消息", "");
+  }
+
+  lines.push(
     firstMessage.text.length > 0
       ? firstMessage.text
       : "(空文本、看下方附件)",
     "",
-  ];
+  );
 
   if (firstMessage.imagePaths && firstMessage.imagePaths.length > 0) {
     lines.push(
@@ -721,7 +771,7 @@ const buildOpeningStanceSection = (
       "",
     );
   }
-  // recency 钉子：钉在用户首条之后、治「只说『我这就写』就结束回复、没真把正文输出」
+  // recency 钉子：钉在用户当前句之后、治「只说『我这就写』就结束回复、没真把正文输出」
   lines.push(
     "把给用户的**完整答案直接写出来**（正常输出、会实时显示）、说完自然结束回复。别只说「我这就写 / 我先查」就结束——要的是成品本身。",
     "",
@@ -740,8 +790,7 @@ export interface RunChatInput {
   model: ModelSelection;
   // 用户首条消息（绝大多数 chat 启动场景都有）、直接拼进 prompt
   firstMessage?: InitialUserMessage;
-  // 首条消息对应的 user_reply 事件 id（chat-reply 启 run 前已写、传进来）。
-  // 历史曾写进「Chat 任务启动」info meta；该 info 已去掉（用户嫌吵），参数保留供兜底定位扩展。
+  // 当前这句对应的 user_reply 事件 id（启 run 前已落盘）。接续注入时用来从切片里去掉这句、避免和「用户的新消息」重复。
   firstMessageEventId?: string;
   /**
    * chat-reply / deliverChatAskReply 启动预约 token。
@@ -772,11 +821,10 @@ export const runChatSession = async (
     apiKey,
     model,
     firstMessage,
-    firstMessageEventId: _firstMessageEventId,
+    firstMessageEventId,
     startToken,
     clientItemId,
   } = input;
-  void _firstMessageEventId;
 
   /** 首条 operation 终态提交（first-outcome-wins；无 id 则 no-op） */
   const settleFirstOp = (
@@ -984,6 +1032,12 @@ export const runChatSession = async (
       return buildGitlabAccessDirective(effectiveHost, dataRoot());
     })();
     gitlabAccessPromise.catch(() => {});
+    // 与 create 并行：新会话才需要切片；resume 成功走 send，根本不进这里
+    const historyPromise = loadChatHistoryInject(task.id, {
+      skipEventId: firstMessageEventId,
+      skipUserText: firstMessage?.text,
+    });
+    historyPromise.catch(() => {});
 
     // 4) 启动 agent + 流式消费
     publishBootProgress(task.id, "create", "正在创建会话…");
@@ -1058,6 +1112,7 @@ export const runChatSession = async (
     const gitlabAccessSection = await gitlabAccessPromise;
     const { loadCompanyEnvBriefSection } = await import("./company-env-fs");
     const companyEnvBriefSection = await loadCompanyEnvBriefSection();
+    const historyInject = await historyPromise;
     const initialPrompt = buildInitialPrompt(
       task,
       skills,
@@ -1068,6 +1123,7 @@ export const runChatSession = async (
       buildLarkCliAuthMissingRule(),
       companyEnvBriefSection,
       isCursorProvider(providerId),
+      historyInject,
     );
     const perfPromptMs = Date.now() - perfPromptStart;
 

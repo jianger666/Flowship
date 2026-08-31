@@ -19,6 +19,7 @@
  * MCP 已桥成 customTools（`mcp-tool-bridge.ts`）；子 agent 用进程内嵌套会话。
  */
 
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type {
   ConversationStep,
@@ -703,6 +704,22 @@ export const createCustomAgent = async (
   return buildAdapter(session, agentId, mcp.closeAll);
 };
 
+/** resume 确定性失败：message 带 code 前缀，日志 / 降级统计可 grep `E_SESSION_` */
+const sessionResumeError = (
+  code: "E_SESSION_MISSING" | "E_SESSION_EMPTY",
+  agentId: string,
+): Error & { code: string } => {
+  const detail =
+    code === "E_SESSION_MISSING"
+      ? "Custom session file missing"
+      : "Custom session empty";
+  const err = new Error(`${code}: ${detail}: ${agentId}`) as Error & {
+    code: string;
+  };
+  err.code = code;
+  return err;
+};
+
 export const resumeCustomAgent = async (
   agentId: string,
   input: CustomAgentInput,
@@ -721,9 +738,16 @@ export const resumeCustomAgent = async (
     mcp.toolDefs,
     thinkingLevel,
   );
-  // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接；
-  // 打开失败（文件被清 / 不兼容）会抛、由调用方按 cursor 的 resume 失败口径降级新会话。
+  // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接。
+  // pi 对缺失文件会静默建空会话（resume「成功」但 messages=[]），随后 send 只有当前句、
+  // 连起手 prompt 都没有。缺文件 / 空会话一律抛，让 chat-inject 降级新会话并注入最近对话。
+  if (!existsSync(agentId)) {
+    throw sessionResumeError("E_SESSION_MISSING", agentId);
+  }
   const sessionManager = SessionManager.open(agentId, piSessionDir(), cwd);
+  if (sessionManager.buildSessionContext().messages.length === 0) {
+    throw sessionResumeError("E_SESSION_EMPTY", agentId);
+  }
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),

@@ -717,8 +717,8 @@ const runChatReplyInject = async (
       const pendingRestartMsg = await checkUpdatePendingRestart();
       if (pendingRestartMsg) return errorResponse(pendingRestartMsg, 409);
 
-      // 模型 / MCP / workdir / 提供方变了 → 懒重启：关旧会话、起新会话（这条消息作首条）、
-      // 历史靠 events.jsonl 续上（buildInitialPrompt 已给 agent eventsLogPath）
+      // 模型 / MCP / workdir / 提供方变了 → 懒重启：关旧会话、起新会话（这条消息作当前句）、
+      // 最近对话正文由 runChatSession 注入起手 prompt，更早的仍可 read events.jsonl
       cancelChatRun(task.id);
       const stopped = await waitForChatToStop(
         task.id,
