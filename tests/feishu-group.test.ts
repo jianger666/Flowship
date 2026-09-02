@@ -17,6 +17,7 @@ import {
   isBotNotInGroupSendError,
   resolveBotDisplayLabel,
   shareToRequirementGroup,
+  composePostShareMarkdown,
   truncateShareContent,
 } from "@/lib/server/feishu-group";
 import {
@@ -1243,5 +1244,81 @@ describe("分享正文口径 / 选中段载荷", () => {
     });
     expect(buildSelectionShareInput("b".repeat(5000))!.content.length).toBe(4001);
     expect(buildSelectionShareInput("   \n  ")).toBeNull();
+  });
+});
+
+describe("format: post / composePostShareMarkdown", () => {
+  it("mentions 搁正文前、空 mentions 原样", () => {
+    expect(composePostShareMarkdown("已提测", [{ openId: "ou_zhang", name: "张三" }])).toBe(
+      '<at user_id="ou_zhang">张三</at>\n已提测',
+    );
+    expect(composePostShareMarkdown("  hello  ")).toBe("hello");
+  });
+
+  it("发 post 不走卡片、不跟 md 文件；mentions 由方法拼 <at>", async () => {
+    const sendPost = vi.fn().mockResolvedValue({
+      chat_id: "oc_exist",
+      message_id: "om_post",
+    });
+    const sendCard = vi.fn();
+    const sendDoc = stubDoc();
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      fetchGroupType: async () => ({ value: "bind", groupId: "oc_exist" }),
+      decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+      sendPost,
+      sendCard,
+      sendDoc,
+    });
+
+    const r = await shareToRequirementGroup(
+      baseTask(),
+      {
+        format: "post",
+        content: "已提测，请验收：\n- MR · crm-web https://example/mr/1",
+        mentions: [{ openId: "ou_zhang", name: "张三" }],
+      },
+      { allowCreate: false },
+    );
+    expect(r).toMatchObject({
+      chatId: "oc_exist",
+      messageId: "om_post",
+      created: false,
+    });
+    expect(r.docMessageId).toBeUndefined();
+    expect(sendCard).not.toHaveBeenCalled();
+    expect(sendDoc).not.toHaveBeenCalled();
+    expect(sendPost).toHaveBeenCalledTimes(1);
+    expect(sendPost.mock.calls[0]).toEqual([
+      "oc_exist",
+      '<at user_id="ou_zhang">张三</at>\n已提测，请验收：\n- MR · crm-web https://example/mr/1',
+    ]);
+  });
+
+  it("post 发 230002 → bot_not_in_group，和卡片同一套码", async () => {
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      fetchGroupType: async () => ({ value: "bind", groupId: "oc_exist" }),
+      decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+      getBotName: async () => "Flowship·甲",
+      sendPost: vi.fn().mockRejectedValue(
+        new LarkApiError("The bot can not be outside the group", {
+          code: 230002,
+        }),
+      ),
+      sendCard: vi.fn(),
+    });
+
+    await expect(
+      shareToRequirementGroup(
+        baseTask(),
+        { format: "post", content: "已提测" },
+        { allowCreate: false },
+      ),
+    ).rejects.toMatchObject({
+      code: "bot_not_in_group",
+      botLabel: "Flowship·甲",
+      chatId: "oc_exist",
+    });
   });
 });

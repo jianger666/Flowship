@@ -6,6 +6,7 @@
  * 1. **ask 卡发群**：agent 调 ask_user → 若开了「问题同步到需求群」且该任务绑了群，
  *    把答题卡也发一份到群（跨角色答题；按钮回调是 card.action.trigger、天然只到属主本机）
  * 2. **回答回群**：群里 @bot 提的问题，agent 这轮的答复攒起来、done 时 @ 提问人发回群。
+ *    走 `post` + `md`（飞书 `text` 不渲染 markdown）；短状态回执仍用纯文本。
  *    攒 / flush **只认事件 origin 与登记 runTag 相等的那一路 run**（token 化投递协议、
  *    见 group-shared）——属主 run 和多位同事的旁路答疑 run 同时在飞也各回各的
  * 3. **推进产物回群**：群内「推进 xxx」跑完，把 action 产物以 share 卡发回群
@@ -51,7 +52,11 @@ import {
   truncateForGroup,
   type PendingGroupReply,
 } from "./group-shared";
-import { sendInteractiveCardToChat, sendTextMessageToChat } from "./lark-api";
+import {
+  sendInteractiveCardToChat,
+  sendPostMarkdownToChat,
+  sendTextMessageToChat,
+} from "./lark-api";
 import type { CardStreamAskQuestion } from "./types";
 
 const LOG = "[feishu-bridge/group-outbound]";
@@ -70,6 +75,8 @@ export interface GroupOutboundDeps {
   resolveSenderName: () => Promise<string>;
   sendAskCard: typeof sendInteractiveCardToChat;
   sendText: typeof sendTextMessageToChat;
+  /** 群答疑正文：post markdown，会渲染粗体 / 代码 / 列表 */
+  sendMarkdown: typeof sendPostMarkdownToChat;
   shareToGroup: (task: Task, input: ShareToGroupInput) => Promise<unknown>;
   rememberAskCard: typeof rememberAskCard;
   isBridgeEnabled: typeof isFeishuChatBridgeEnabled;
@@ -91,6 +98,7 @@ const defaultDeps = (): GroupOutboundDeps => ({
     (await import("@/lib/server/feishu-group")).resolveShareSenderName(),
   sendAskCard: sendInteractiveCardToChat,
   sendText: sendTextMessageToChat,
+  sendMarkdown: sendPostMarkdownToChat,
   shareToGroup: async (task, input) =>
     (await import("@/lib/server/feishu-group")).shareToRequirementGroup(
       task,
@@ -380,7 +388,8 @@ const flushGroupReply = async (
   const body = !ok
     ? "这轮没跑成功、去 Flowship 看看事件流"
     : answer || "已处理完成（这轮没有文字回复）";
-  await deps.sendText(
+  // post md：@ 标签写进 markdown 正文（飞书扩展语法），整段才会渲染 ** / ` / 列表
+  await deps.sendMarkdown(
     entry.chatId,
     `${mentionTag(entry.requesterOpenId, entry.requesterName)} ${truncateForGroup(body)}`,
   );

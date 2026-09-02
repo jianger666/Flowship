@@ -1,5 +1,9 @@
 /**
- * 需求群协作：幂等取/建群 + 分享互动卡片
+ * 需求群协作：幂等取/建群 + 发到需求群
+ *
+ * 「发到这个任务的需求群」只走 {@link shareToRequirementGroup}：卡片分享 / 产物 md /
+ * 提测 IM @ 都是它的不同 `format`，不要再平行开一条发送链。群里回话（答疑回执、
+ * 路由提示）手里已经有 chatId，仍走 lark-api 原语，不绕需求群解析。
  *
  * 权限边界（已实测、不可事后补救）：
  * - bot 建群 ✓、建群时带人（≤50）✓、bot 发消息 ✓
@@ -14,7 +18,7 @@
  * 分享时本机 bot 不在群，走 `bot_not_in_group` 引导弹窗（带准确 bot 名 + 复制），
  * 加完重试即可，一个群只需一次。
  *
- * 「bot 在不在群」采用**事后判定**：直接发卡、发送失败按飞书错误码（230002 一族）
+ * 「bot 在不在群」采用**事后判定**：直接发、发送失败按飞书错误码（230002 一族）
  * 映射成 bot_not_in_group。事前查群成员列表在免审权限下不可行——
  * `GET /im/v1/chats/:id/members` 不收 member_id_type=app_id（field validation failed）、
  * 且接口本身缺 im:chat.members:read scope（实测 99991672），第二次分享必挂。
@@ -42,7 +46,9 @@ import {
   probeSelfInChat,
   sendFileMessageToChat,
   sendInteractiveCardToChat,
+  sendPostMarkdownToChat,
 } from "@/lib/server/feishu-bridge/lark-api";
+import { mentionTag } from "@/lib/server/feishu-bridge/group-shared";
 import {
   describeLarkError,
   isTransientLarkError,
@@ -72,16 +78,33 @@ import {
 /** 分享内容类型（卡片 header 徽标色） */
 export type ShareKind = "artifact" | "message" | "question";
 
+/** 发到需求群的形态：卡片（可跟 md 文件）或一条会渲染的 IM markdown */
+export type ShareFormat = "card" | "post";
+
 export interface ShareLink {
   label: string;
   url: string;
 }
 
+/** 群 IM @ 用的身份——必须是自建应用的 open_id，不是飞书项目 user_key */
+export interface ShareMention {
+  openId: string;
+  name: string;
+}
+
 export interface ShareToGroupInput {
-  kind: ShareKind;
+  /**
+   * 默认 `card`（现有分享 / 播报 / 产物回群）。
+   * `post` = 一条飞书 post markdown，可带 {@link mentions} 做真 @；不建卡片、不跟文件。
+   */
+  format?: ShareFormat;
+  /** `card` 时必填；`post` 忽略。缺省按 `message` 处理。 */
+  kind?: ShareKind;
   title?: string;
   content: string;
   links?: ShareLink[];
+  /** 只对 `format: "post"` 生效：方法按飞书 `<at user_id>` 拼进正文 */
+  mentions?: ShareMention[];
 }
 
 export interface EnsureGroupResult {
@@ -102,11 +125,11 @@ export interface EnsureGroupResult {
 }
 
 export interface ShareToGroupResult extends EnsureGroupResult {
-  /** 卡片消息 id（发不出去就整体失败、这个字段一定有值） */
+  /** 发出去的消息 id（卡片或 post；发不出去就整体失败、这个字段一定有值） */
   messageId: string;
   /**
-   * 整份产物的 md 文件消息 id；只有 kind=artifact 才发。
-   * 缺失 = 没发（非 artifact）或发失败（已降级、卡片仍算发出去了）。
+   * 整份产物的 md 文件消息 id；只有 `format: "card"` 且 kind=artifact 才发。
+   * 缺失 = 没发（非产物卡）或发失败（已降级、卡片仍算发出去了）。
    */
   docMessageId?: string;
 }
@@ -196,6 +219,8 @@ export interface FeishuGroupDeps {
   sendCard: typeof sendInteractiveCardToChat;
   /** 发 md 文件消息（整份产物的正文载体、卡片之后紧跟一条） */
   sendDoc: typeof sendFileMessageToChat;
+  /** `format: "post"`：一条会渲染的 IM markdown（提测 @ / 以后短通知） */
+  sendPost: typeof sendPostMarkdownToChat;
   resolveSenderName: () => Promise<string>;
   warn: (msg: string) => void;
 }
@@ -221,6 +246,7 @@ const defaultDeps = (): FeishuGroupDeps => ({
   sendCard: (chatId, card) => sendInteractiveCardToChat(chatId, card),
   sendDoc: (chatId, filename, content) =>
     sendFileMessageToChat(chatId, filename, content),
+  sendPost: (chatId, markdown) => sendPostMarkdownToChat(chatId, markdown),
   resolveSenderName: () => resolveLocalSenderName(),
   warn: (msg) => console.warn(`[feishu-group] ${msg}`),
 });
@@ -926,15 +952,65 @@ export const buildShareDocFilename = (opts: {
 // ----------------- 分享闭环 -----------------
 
 /**
- * ensure → 发互动卡；发送失败按错误码事后判定「bot 不在群」。
+ * `format: "post"` 的正文：mentions 换成飞书 `<at>` 标签搁在最前。
+ * 卡片不走这条——卡片 markdown 的 @ 语法不同，且分享卡本来就不承担 @ 通知。
+ */
+export const composePostShareMarkdown = (
+  content: string,
+  mentions?: ShareMention[],
+): string => {
+  const tags = (mentions ?? [])
+    .map((m) => mentionTag(m.openId, m.name))
+    .join(" ")
+    .trim();
+  const body = content.trim();
+  if (!tags) return body;
+  if (!body) return tags;
+  return `${tags}\n${body}`;
+};
+
+const parseShareFormat = (raw: ShareToGroupInput["format"]): ShareFormat => {
+  if (raw == null || raw === "card") return "card";
+  if (raw === "post") return "post";
+  throw new FeishuGroupError("invalid_input", "format 必须是 card 或 post");
+};
+
+const parseShareKind = (raw: ShareToGroupInput["kind"]): ShareKind => {
+  const kind = raw ?? "message";
+  if (kind === "artifact" || kind === "message" || kind === "question") {
+    return kind;
+  }
+  throw new FeishuGroupError(
+    "invalid_input",
+    "kind 必须是 artifact / message / question",
+  );
+};
+
+/** 发送失败按错误码事后判定「bot 不在群」——卡片和 post 共用 */
+const rethrowIfBotNotInGroup = async (
+  sendErr: unknown,
+  chatId: string,
+): Promise<never> => {
+  if (isBotNotInGroupSendError(sendErr)) {
+    const botLabel = await resolveBotDisplayLabel();
+    throw new FeishuGroupError(
+      "bot_not_in_group",
+      `群里还没有你的机器人「${botLabel}」，在群设置里添加一次即可`,
+      { botLabel, chatId },
+    );
+  }
+  throw sendErr;
+};
+
+/**
+ * ensure → 按 format 发到需求群；发送失败按错误码事后判定「bot 不在群」。
  *
- * `opts.allowCreate: false` = 只往已有的群发、没群直接抛 `no_group`（自动播报用）。
+ * `opts.allowCreate: false` = 只往已有的群发、没群直接抛 `no_group`（播报 / 提测 @）。
  * `opts.verifyOwnerMembership: true` = 显式分享专用，复用已绑定群前先确认
  * 「本人还在这个群里」，死绑定直接抛 `owner_not_in_group` / `group_unreachable`。
  *
- * kind=artifact 还会**紧跟着发一条 md 文件消息**装全文（卡片本身不再放正文）。
- * 顺序固定「先卡片后文件」：卡片是身份信息、先到先给上下文。文件发失败只 warn、
- * 整体仍算成功——卡片已经在群里了，再抛错会让用户以为什么都没发出去、重复点分享。
+ * `format: "card"`（默认）：互动卡；kind=artifact 再紧跟一条 md 文件装全文。
+ * `format: "post"`：一条 IM markdown，`mentions` 由本函数拼 `<at>`；不建卡片、不跟文件。
  *
  * 返回 { chatId, messageId, created, docMessageId? }。
  */
@@ -943,18 +1019,34 @@ export const shareToRequirementGroup = async (
   input: ShareToGroupInput,
   opts: EnsureGroupOptions = {},
 ): Promise<ShareToGroupResult> => {
+  const format = parseShareFormat(input.format);
   const content = (input.content ?? "").trim();
-  if (!content) {
+  if (!content && !(format === "post" && (input.mentions?.length ?? 0) > 0)) {
     throw new FeishuGroupError("invalid_input", "分享内容不能为空");
-  }
-  if (!["artifact", "message", "question"].includes(input.kind)) {
-    throw new FeishuGroupError("invalid_input", "kind 必须是 artifact / message / question");
   }
 
   try {
-    // allowCreate 原样透传——自动播报靠它拿到「贴着 createChat 的那道闸」
+    // allowCreate 原样透传——自动播报 / 提测 @ 靠它拿到「贴着 createChat 的那道闸」
     const ensured = await ensureRequirementGroup(task, opts);
 
+    if (format === "post") {
+      const markdown = composePostShareMarkdown(content, input.mentions);
+      let sent;
+      try {
+        sent = await getDeps().sendPost(ensured.chatId, markdown);
+      } catch (sendErr) {
+        return await rethrowIfBotNotInGroup(sendErr, ensured.chatId);
+      }
+      return {
+        chatId: ensured.chatId,
+        messageId: sent.message_id,
+        created: ensured.created,
+        ...(ensured.chatName ? { chatName: ensured.chatName } : {}),
+        ...(ensured.membershipUnknown ? { membershipUnknown: true } : {}),
+      };
+    }
+
+    const cardKind = parseShareKind(input.kind);
     const story = await resolveTaskStory(task);
     let requirementName = task.title;
     try {
@@ -970,7 +1062,7 @@ export const shareToRequirementGroup = async (
     const senderName = await getDeps().resolveSenderName();
     const card = buildShareCardJson({
       requirementName,
-      kind: input.kind,
+      kind: cardKind,
       title: input.title,
       content,
       links: input.links,
@@ -986,20 +1078,12 @@ export const shareToRequirementGroup = async (
     try {
       sent = await getDeps().sendCard(ensured.chatId, card);
     } catch (sendErr) {
-      if (isBotNotInGroupSendError(sendErr)) {
-        const botLabel = await resolveBotDisplayLabel();
-        throw new FeishuGroupError(
-          "bot_not_in_group",
-          `群里还没有你的机器人「${botLabel}」，在群设置里添加一次即可`,
-          { botLabel, chatId: ensured.chatId },
-        );
-      }
-      throw sendErr;
+      return await rethrowIfBotNotInGroup(sendErr, ensured.chatId);
     }
 
     // 整份产物：卡片只是索引、正文全在这条 md 文件消息里（不截断）
     const docMessageId =
-      input.kind === "artifact"
+      cardKind === "artifact"
         ? await sendShareDoc(ensured.chatId, requirementName, input.title, content)
         : undefined;
 

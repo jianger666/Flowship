@@ -315,10 +315,11 @@ ai-flow-action-hub/
 
 | 链路 | 模块 | 干什么 |
 |---|---|---|
-| 分享（出）| `feishu-group.ts` + `POST /api/tasks/[id]/share-to-group` + MCP `share_to_group` | 幂等建群 + bind 工作项 + 发卡；`artifact` 走「瘦卡片 + 全文 md 文件」、其余进卡片正文 |
+| 分享（出）| `feishu-group.ts` + `POST /api/tasks/[id]/share-to-group` + MCP `share_to_group` | **发到需求群的唯一收口** `shareToRequirementGroup`：`format: "card"`（默认）幂等建群 + 发卡，`artifact` 再跟全文 md；`format: "post"` 发 IM markdown（可 `mentions` 真 @），不建卡片 |
 | 成员注册表 | `feishu-group-registry.ts` | **建群是唯一能带人 / 带 bot 的时机**（事后拉人缺 scope）——按工作项角色成员邮箱反查，一次把人和他们各自的 bot 带齐 |
 | 回流（入）| `feishu-bridge/group-route.ts` | 群消息 → 任务：三层 @ 过滤 → chat_id 反查本机任务 → 推进命令 / 答题 / 消息注入 |
-| 出向 | `feishu-bridge/group-outbound.ts` | 全局 task 流 tap：ask 卡发群、回答回群、推进产物回群 |
+| 出向 | `feishu-bridge/group-outbound.ts` | 全局 task 流 tap：ask 卡发群、回答回群（`post` markdown）、推进产物回群 |
+| 提测 @ 测试 | `feishu-bridge/group-tester-notify.ts` + 工具 `notify_group_testers` | ship 写完飞书评论后由 agent 调；换 open_id 后走 `shareToRequirementGroup({ format: "post" })`；没群 / bot 不在群返回 skipped，不阻塞 |
 | 自动播报 | `feishu-bridge/group-broadcast.ts` | app 内 action 跑完自动进群（`off` / `ship` / `all` 三档、当前固定 `off`、**绝不建群**）|
 | 共享状态 | `feishu-bridge/group-shared.ts` | 回群登记表 + 产物卡防重 + 选择卡防重 + 群成员名清洗 |
 
@@ -369,6 +370,17 @@ ai-flow-action-hub/
 ## 最近演进（窗口式、保留 2 个子版本）
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
+
+### 未发：提测额外在需求群 @ 测试（2026-09-02）
+
+- 工作项评论 @ 测试仍不推飞书通知。ship 写完评论后 agent 调 `notify_group_testers`，用注册表把测试人员邮箱换成 IM `open_id` 做真 @（会推提及）。
+- 发到需求群统一走 `shareToRequirementGroup`：分享 / 产物是 `format: "card"`，提测 @ 是 `format: "post"` + `mentions`（方法拼 `<at>`）。群回话（答疑回执）手里已有 chatId，仍走 lark-api。
+- 没绑群、本机 bot 不在群、对不上人、MR 有冲突：工具返回 `skipped_*`，不报错、不弹「加机器人」、不阻塞交卷。
+- 不是交卷后系统偷发——和飞书评论同一拍、事件流里能看见这次工具调用。
+
+### 未发：群答疑回群渲染 Markdown（2026-09-02）
+
+- 项目群里 @ 机器人问完，回群走飞书 `post` + `md`（CommonMark / GFM）。以前走纯文本 `--text`，`**粗体**` / `` `代码` `` / 列表会原样显示。短状态回执（推进失败等）仍用纯文本。
 
 ### 未发：环境配置加 SLS（2026-09-02）
 
@@ -439,7 +451,7 @@ ai-flow-action-hub/
 | **团队 wk 流程门禁（2026-07-28：三个挂钩点强制调官方脚本 + 五档降级 + 输出转人话；脚本目录 = 镜像里 `knowledge/skills/global/wk-harness/scripts/`）** | `src/lib/server/wk-gate.ts` + `src/lib/{wk-command,wk-gate-output}.ts` + `src/lib/server/action-checks.ts: checkWkStageGate` + `tests/{wk-gate,wk-gate-output,wk-command,wk-post-stage-hook}.test.ts` |
 | **wk 本机配置 `~/.wk/config.yaml`（键级合并、与不用 Flowship 的同事共用同一份）+ 交付中心探测** | `src/lib/{wk-config,wk-hub}.ts` + `src/lib/server/{wk-config,wk-hub-probe}.ts` + `src/app/api/system/wk-config/{route,probe/route}.ts` + `src/components/settings/wk-harness-card.tsx` + `src/hooks/use-wk-config.ts` + `tests/{wk-config,wk-hub-probe}.test.ts` |
 | **REQ-ID（手填 > 链接派生 > 兜底；`reqIdPatchValue` 是新建表单与编辑弹窗共用的提交判定）** | `src/lib/req-id.ts` + `src/components/tasks/{task-launch-form,edit-task-dialog}.tsx` + `tests/{req-id,req-id-form-contract}.test.ts` |
-| **需求群协作（2026-07-27：建群 / 分享 / 群消息回流 / 群内推进 / 自动播报 / 成员自动注册表）** | `src/lib/server/{feishu-group,feishu-group-registry}.ts` + `src/lib/server/feishu-bridge/group-{route,outbound,broadcast,shared,ask-card,advance-card}.ts` + `src/app/api/tasks/[id]/share-to-group/route.ts` + `src/lib/share-to-group.ts` + `src/hooks/use-share-to-group.tsx` + `src/components/tasks/{share-to-group-dialog,bot-add-guide-dialog}.tsx` + `docs/feishu-group-collab.md` |
+| **需求群协作（2026-07-27：建群 / 分享 / 群消息回流 / 群内推进 / 自动播报 / 成员自动注册表；2026-09-02 提测群 @ 测试）** | `src/lib/server/{feishu-group,feishu-group-registry}.ts` + `src/lib/server/feishu-bridge/group-{route,outbound,broadcast,tester-notify,shared,ask-card,advance-card}.ts` + `src/app/api/tasks/[id]/share-to-group/route.ts` + `src/lib/share-to-group.ts` + `src/hooks/use-share-to-group.tsx` + `src/components/tasks/{share-to-group-dialog,bot-add-guide-dialog}.tsx` + `docs/feishu-group-collab.md` |
 | **受限答疑旁路（非属主群消息、与 task 运行状态机解耦；只读 prompt + 唯一 settle + 事件带 origin）** | `src/lib/server/restricted-question.ts` + `task-stream.ts` 的旁路表 / `restricted_run` 帧 + `tests/{restricted-group-question,restricted-run-signal,task-question-inject-restrict}.test.ts` |
 | **task 模式消息注入链（question 路由抽出的薄壳、群 / p2p / UI 三处复用；非属主传 `restrictToQuestion`）** | `src/lib/server/task-question-inject.ts` |
 | **server 复算「当前可推进 action 清单」（与推进弹窗同一套过滤 / 分组序，群内推进选择卡与模糊匹配的数据源）** | `src/lib/server/advance-options.ts` + `tests/advance-options.test.ts` |

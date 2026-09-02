@@ -265,7 +265,7 @@ submit_mr({
 > ⚠️ **id 体系一律用 user_key（纯数字、不加任何前缀）**——2026-06-12 实测确诊：服务端把 mention 的 id 按 user_key 校验、传 lark_user_id 直接报 `cross tenant`（bytedance.bits.collect_public:userKey cross tenant）、06-09 还能用的 lark_user_id 体系已被封死。
 > 🛑 **绝对不要给 mention 块 id 加 `lark_user_id_` 前缀**——skill 文档举例是坑、实测带前缀报 `no permission`（2026-06-04 确诊）。
 >
-> 🔕 **已知缺陷（2026-06-12 实测、暂无解）**：官方通知链路故障——user_key 体系的评论能发出、@ 蓝色渲染正常、**但被 @ 的人收不到飞书推送**（评论 mention 数据模型已升级成 blockId 引用、只有 UI 手动 @ 能触发通知；AT_USER_BLOCK/user/纯文本各种组合全试过、全不推）。等官方修复。在那之前：评论照发（链接 + @ 渲染仍有展示价值）、artifact §4 注明「通知可能未送达、必要时请用户在飞书 IM 手动知会测试」。
+> 🔕 **已知缺陷（2026-06-12 实测、暂无解）**：官方通知链路故障——user_key 体系的评论能发出、@ 蓝色渲染正常、**但被 @ 的人收不到飞书推送**。评论照发（链接 + @ 渲染仍有展示价值）。**写完评论立刻调 `notify_group_testers({ task_id, action_id })`**：服务端在需求群用 IM `open_id` @ 同一批测试（能对上注册表邮箱的才会 @、会推飞书提及）。没绑群 / 本机 bot 不在群 / 对不上人 → 工具返回 `skipped_*`，记进 artifact，不要报错、不要改调 `share_to_group`、不要重试。
 
 ```bash
 # work_item_id / project_key 优先复用 §2 `url decode` + `project search` 的结果
@@ -291,6 +291,7 @@ meegle comment add \
 - 多仓 task：一条评论里平铺所有 MR 链接、按 repoPath 末段名（如 `crm-web`）标注
 - `feishuTesterUserKeys` 为空数组（用户选了跳过）：评论不加 @ mention 块、notify 两参数省略、只贴链接
 - 飞书评论失败：artifact «§4 飞书评论» 记 ❌ + 错误信息、不阻塞 ship action 完成（用户后续手动补）
+- **需求群 IM @（必做、同本步门禁）**：评论写完（成功或失败都调；有冲突整步跳过时本工具也不调）立刻 `notify_group_testers({ task_id, action_id })`。人从已落库的 `feishuTesterUserKeys` 取、MR 从本轮 `submit_mr` 记录取——你不要传人、不要拼 `open_id`。`feishuTesterUserKeys` 为空：不必调。返回 `outcome` 原样写进 artifact：`sent` = 已 @；`skipped_*` = 没发出去（没群 / bot 不在群 / 对不上 IM 身份等），都不是 ship 失败。
 
 ### 4.5 飞书工作项节点流转（V0.14 状态同步、best-effort）
 
@@ -306,11 +307,11 @@ meegle comment add \
 
 artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完按 super-prompt 交卷。
 
-### 6. 需求群播报（**不用你操心**）
+### 6. 需求群产物（**默认不发**）
 
-提测结果**默认不进**飞书「需求群」——交卷后系统不会自动发，你也不要顺手调 `share_to_group`。
+产物全文**默认不进**飞书「需求群」——你不要顺手调 `share_to_group`。想发完整产物的用户会自己在面板点「分享到群」，或群里点了「推进提测」系统会把产物回群。
 
-**只有用户明确说「发群 / 同步到需求群」时才调**（与 `share_to_group` 工具说明同口径）。想发群的用户会自己在产物面板点「分享到群」。
+提测 @ 测试走 `notify_group_testers`（§4），不要拿 `share_to_group` 代替。
 
 ## MR description 模板
 
@@ -376,6 +377,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完按 super-p
 - 评论 id: <comment add 返的 comment id>
 - 内容预览: <前 200 字>
 - @ 的测试人员: <user_key 列表、或「跳过」>
+- 需求群 IM @: <notify_group_testers 的 outcome，或「未调（无测试人 / 有冲突）」>
 - 状态: ✅ 成功 / ❌ 失败 + 错误信息 / ⏸ 因 MR 冲突跳过（待用户解决后重跑 ship 再评论）
 - ⚠️ 通知送达: 评论已发、但官方通知链路故障（2026-06-12 起）、@ 仅渲染不推送——必要时请在飞书 IM 手动知会测试人员
 
@@ -416,6 +418,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完按 super-p
 - ❌ artifact 没写 `task.feishuTesterUserKeys` 来源（A / C / 沿用、需可审计）
 - ❌ ship 交卷后自动跑下一 action（绝对不、说完结论即结束回复、等用户推进）
 - ❌ 交卷后顺手调 `share_to_group` 把产物发需求群（产物默认不进群——只认用户明说）
+- ❌ 用 `share_to_group` 当提测 @（必须走 `notify_group_testers`；有测试人且 MR 无冲突时漏调）
 - ❌ 飞书评论里 URL 后面追加 `(v1)` / `（v1）` / 任何字符（飞书 IM 会一起 link 化导致 404）
 
 ## 调用礼仪

@@ -457,6 +457,40 @@ export const sendTextMessageToChat = async (
 };
 
 /**
+ * 飞书 `post` 消息的 content JSON：整段走 `md` 标签。
+ * 官方推荐发 Markdown 用这条（CommonMark + GFM）；`text` 类型不会渲染 `**` / `` ` `` / 列表。
+ * `<at user_id="ou_xxx">名</at>` 写进 markdown 正文即可 @，不要再并排塞别的 post 标签
+ *（`md` 必须独占一段）。
+ */
+export const buildPostMarkdownContent = (markdown: string): string =>
+  JSON.stringify({
+    zh_cn: {
+      content: [[{ tag: "md", text: markdown }]],
+    },
+  });
+
+/**
+ * 往群聊发一段会渲染的 Markdown（`--msg-type post`）。
+ * 群里 @ 答疑走这条；短状态回执（推进失败 / 没产物）仍用 {@link sendTextMessageToChat}。
+ */
+export const sendPostMarkdownToChat = async (
+  chatId: string,
+  markdown: string,
+): Promise<SendMessageResult> => {
+  const rec = await runLark([
+    "im",
+    "+messages-send",
+    "--chat-id",
+    chatId,
+    "--msg-type",
+    "post",
+    "--content",
+    buildPostMarkdownContent(markdown),
+  ]);
+  return extractSendResult(rec);
+};
+
+/**
  * 把一段文本以「文件消息」发进群聊（需求群分享的完整产物走这条）。
  *
  * 为什么要先落一次临时盘：lark-cli 的 `--file` 只吃 **cwd 相对路径**——绝对路径和 `..`

@@ -9,6 +9,7 @@ import {
   __resetLarkBinCacheForTest,
   __setLarkExecForTest,
   __setLarkRetryBaseForTest,
+  buildPostMarkdownContent,
   describeLarkCommand,
   fetchChatInfo,
   getBotAppInfo,
@@ -19,6 +20,7 @@ import {
   probeLarkAuthStatus,
   probeSelfInChat,
   runLark,
+  sendPostMarkdownToChat,
   uploadImage,
 } from "@/lib/server/feishu-bridge/lark-api";
 import {
@@ -127,6 +129,56 @@ describe("describeLarkCommand", () => {
     expect(
       describeLarkCommand(["im", "+messages-send", "--chat-id", "oc_x"]),
     ).toBe("im +messages-send");
+  });
+});
+
+describe("sendPostMarkdownToChat", () => {
+  it("buildPostMarkdownContent 整段包进 md 标签", () => {
+    const parsed = JSON.parse(
+      buildPostMarkdownContent("**粗体** `uuid`\n- 一项"),
+    ) as {
+      zh_cn: { content: Array<Array<{ tag: string; text: string }>> };
+    };
+    expect(parsed.zh_cn.content).toEqual([
+      [{ tag: "md", text: "**粗体** `uuid`\n- 一项" }],
+    ]);
+  });
+
+  it("走 --msg-type post --content，不走 --text", async () => {
+    const calls: string[][] = [];
+    __setLarkExecForTest(async (_bin, args) => {
+      calls.push(args);
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          data: { chat_id: "oc_g", message_id: "om_md" },
+        }),
+        stderr: "",
+      };
+    });
+    const sent = await sendPostMarkdownToChat(
+      "oc_g",
+      '<at user_id="ou_x">张三</at> **中性**',
+    );
+    expect(sent).toEqual({ chat_id: "oc_g", message_id: "om_md" });
+    expect(calls[0]?.slice(0, 6)).toEqual([
+      "im",
+      "+messages-send",
+      "--chat-id",
+      "oc_g",
+      "--msg-type",
+      "post",
+    ]);
+    expect(calls[0]).toContain("--content");
+    expect(calls[0]).not.toContain("--text");
+    const contentIdx = calls[0]!.indexOf("--content");
+    const content = JSON.parse(calls[0]![contentIdx + 1]!) as {
+      zh_cn: { content: Array<Array<{ tag: string; text: string }>> };
+    };
+    expect(content.zh_cn.content[0]?.[0]).toEqual({
+      tag: "md",
+      text: '<at user_id="ou_x">张三</at> **中性**',
+    });
   });
 });
 

@@ -37,4 +37,23 @@ describe("buildSdkCustomTools", () => {
   it("合成 MCP 名是 custom-user-tools", () => {
     expect(FLOWSHIP_SDK_CUSTOM_TOOLS_SERVER).toBe("custom-user-tools");
   });
+
+  it("notify_group_testers 与 share_to_group 职责分开", () => {
+    const names = flowShipTools.map((t) => t.name);
+    expect(names).toContain("notify_group_testers");
+    expect(names).toContain("share_to_group");
+    const notify = flowShipTools.find((t) => t.name === "notify_group_testers");
+    const share = flowShipTools.find((t) => t.name === "share_to_group");
+    expect(notify?.description).toContain("不要用 share_to_group 代替");
+    expect(share?.description).toContain("notify_group_testers");
+  });
+
+  it("notify_group_testers caller 不对 → 忽略", async () => {
+    const notify = flowShipTools.find((t) => t.name === "notify_group_testers");
+    const result = await notify!.handler(
+      { task_id: "task-x", action_id: "act-1" },
+      "not-the-owner",
+    );
+    expect(result.content[0]?.text).toContain("接管");
+  });
 });

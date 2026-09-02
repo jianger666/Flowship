@@ -397,6 +397,60 @@ export const parseUserSearchEmail = (
 };
 
 /**
+ * `user search` 多条 → user_key → 邮箱 / 姓名（需求群 @ 测试用）。
+ * 对不上 key 的条目丢掉；邮箱不像邮箱的也丢掉。
+ */
+export const parseUserSearchEmailMap = (
+  resp: unknown,
+): Record<string, { email: string; name?: string }> => {
+  const items: Record<string, unknown>[] = [];
+  const collect = (v: unknown, depth: number): void => {
+    if (depth > 3 || !v || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (item && typeof item === "object" && !Array.isArray(item)) {
+          items.push(item as Record<string, unknown>);
+        }
+      }
+      return;
+    }
+    const rec = v as Record<string, unknown>;
+    for (const key of ["data", "list", "items", "users", "result"]) {
+      if (rec[key] !== undefined) collect(rec[key], depth + 1);
+    }
+    if (items.length === 0 && pickUserEmail(rec)) items.push(rec);
+  };
+  collect(resp, 0);
+  const out: Record<string, { email: string; name?: string }> = {};
+  for (const it of items) {
+    const key = asStr(it.user_key) ?? asStr(it.key);
+    const email = pickUserEmail(it);
+    if (!key || !email) continue;
+    const name = asStr(it.name) ?? asStr(it.name_cn) ?? asStr(it.name_en);
+    out[key] = { email, ...(name ? { name } : {}) };
+  }
+  return out;
+};
+
+/**
+ * 按 user_key 批量换邮箱（增强路径、失败返空对象、不抛）。
+ */
+export const searchUsersByKeys = async (
+  userKeys: string[],
+): Promise<unknown> => {
+  const keys = [
+    ...new Set(userKeys.map((k) => k.trim()).filter(Boolean)),
+  ];
+  if (keys.length === 0) return [];
+  return runMeegle([
+    "user",
+    "search",
+    "--user-keys",
+    JSON.stringify(keys),
+  ]);
+};
+
+/**
  * 当前登录用户的邮箱——**需求群成员注册表的 key**。
  *
  * 必须走 meegle：注册表的另一端（工作项角色成员）给的就是 meegle 侧邮箱，

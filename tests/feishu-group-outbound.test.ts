@@ -78,6 +78,7 @@ const baseDeps = (over: Record<string, unknown> = {}) => ({
     card_id: "c1",
   })),
   sendText: vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" })),
+  sendMarkdown: vi.fn(async () => ({ chat_id: CHAT, message_id: "om_md" })),
   shareToGroup: vi.fn(async () => ({})),
   rememberAskCard: vi.fn(async () => undefined),
   isBridgeEnabled: async () => true,
@@ -229,9 +230,13 @@ describe("ask 卡发群", () => {
 });
 
 describe("回答回群", () => {
-  it("攒 delta → done 时 @ 提问人发回群", async () => {
-    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+  it("攒 delta → done 时 @ 提问人发回群（post markdown，不是纯文本）", async () => {
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    const sendText = vi.fn();
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown, sendText }) as never);
     rememberGroupReply("task-1", {
       chatId: CHAT,
       requesterOpenId: REQUESTER.openId,
@@ -254,26 +259,60 @@ describe("回答回群", () => {
       ok: true,
     });
 
-    expect(sendText).toHaveBeenCalledTimes(1);
-    const body = callArgs(sendText)[1] as string;
+    expect(sendMarkdown).toHaveBeenCalledTimes(1);
+    expect(sendText).not.toHaveBeenCalled();
+    const body = callArgs(sendMarkdown)[1] as string;
     expect(body).toContain('<at user_id="ou_zhang">张三</at>');
     expect(body).toContain("接口预计周五联调");
   });
 
+  it("markdown 标记原样发出去（** / ` / 列表），交给飞书 post md 渲染", async () => {
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
+    rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "question",
+      channel: "owner",
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "assistant_delta",
+      text: "**中性/基准**走 `uuid`\n- 英文\n- 中文",
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: fullTask(),
+      ok: true,
+    });
+    const body = callArgs(sendMarkdown)[1] as string;
+    expect(body).toContain("**中性/基准**");
+    expect(body).toContain("`uuid`");
+    expect(body).toContain("- 英文");
+  });
+
   it("没有登记的任务 done 不回群（不打扰无关任务）", async () => {
     const sendText = vi.fn();
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+    const sendMarkdown = vi.fn();
+    __setGroupOutboundDepsForTest(baseDeps({ sendText, sendMarkdown }) as never);
     await handleGroupOutboundEvent("task-other", {
       kind: "done",
       task: fullTask(),
       ok: true,
     });
     expect(sendText).not.toHaveBeenCalled();
+    expect(sendMarkdown).not.toHaveBeenCalled();
   });
 
   it("跑失败 → 回群说明去 app 看，不发空答案", async () => {
-    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
     rememberGroupReply("task-1", {
       chatId: CHAT,
       requesterOpenId: REQUESTER.openId,
@@ -286,12 +325,15 @@ describe("回答回群", () => {
       task: fullTask(),
       ok: false,
     });
-    expect(callArgs(sendText)[1]).toContain("没跑成功");
+    expect(callArgs(sendMarkdown)[1]).toContain("没跑成功");
   });
 
   it("done 后登记摘掉——同一任务下一轮不再误回群", async () => {
-    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
     rememberGroupReply("task-1", {
       chatId: CHAT,
       requesterOpenId: REQUESTER.openId,
@@ -302,7 +344,7 @@ describe("回答回群", () => {
     const done = { kind: "done" as const, task: fullTask(), ok: true };
     await handleGroupOutboundEvent("task-1", done);
     await handleGroupOutboundEvent("task-1", done);
-    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendMarkdown).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -320,8 +362,12 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
     });
 
   it("旁路答疑在飞时属主 run 的 done 先到 → 登记还在、不发错文", async () => {
-    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    const sendText = vi.fn();
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown, sendText }) as never);
     const handle = rememberRestricted(REQUESTER)!;
 
     // 属主那一轮（app 里点的推进）：delta + done 都不带 origin
@@ -336,6 +382,7 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
     });
 
     // 一个字都不许发给同事，登记原样挂着等自己的 done
+    expect(sendMarkdown).not.toHaveBeenCalled();
     expect(sendText).not.toHaveBeenCalled();
     const [entry] = listGroupReplies("task-1");
     expect(entry).toMatchObject({ token: handle.token, answer: "" });
@@ -352,15 +399,18 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
       ok: true,
       origin: handle.runTag!,
     });
-    expect(sendText).toHaveBeenCalledTimes(1);
-    const body = callArgs(sendText)[1] as string;
+    expect(sendMarkdown).toHaveBeenCalledTimes(1);
+    const body = callArgs(sendMarkdown)[1] as string;
     expect(body).toContain("缓存 5 分钟过期");
     expect(body).not.toContain("属主这轮的产物正文");
   });
 
   it("两条登记并存（属主 + 旁路）各投各的、互不串文", async () => {
-    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
     // 属主在群里问了一句（走属主主链）
     rememberGroupReply("task-1", {
       chatId: CHAT,
@@ -393,9 +443,9 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
       ok: true,
     });
 
-    expect(sendText).toHaveBeenCalledTimes(2);
-    const first = callArgs(sendText, 0)[1] as string;
-    const second = callArgs(sendText, 1)[1] as string;
+    expect(sendMarkdown).toHaveBeenCalledTimes(2);
+    const first = callArgs(sendMarkdown, 0)[1] as string;
+    const second = callArgs(sendMarkdown, 1)[1] as string;
     // 先收口的是旁路那轮：@ 李四、只带同事的答案
     expect(first).toContain("李四");
     expect(first).toContain("同事答案");
@@ -408,8 +458,12 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
   });
 
   it("stop 补发的 done（属主终态 owner、不带 origin）不误 flush 旁路登记", async () => {
-    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    const sendText = vi.fn();
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown, sendText }) as never);
     const handle = rememberRestricted(REQUESTER)!;
 
     // stop-task 收尾无条件补发的那一帧
@@ -419,14 +473,18 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
       ok: true,
     });
 
+    expect(sendMarkdown).not.toHaveBeenCalled();
     expect(sendText).not.toHaveBeenCalled();
     expect(listGroupReplies("task-1")).toHaveLength(1);
     expect(listGroupReplies("task-1")[0]?.token).toBe(handle.token);
   });
 
   it("多位同事先后提问 → 各自 token 各自投递（先答完的先回）", async () => {
-    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
-    __setGroupOutboundDepsForTest(baseDeps({ sendText }) as never);
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
     const a = rememberRestricted({ openId: "ou_a", name: "李四" })!;
     const b = rememberRestricted({ openId: "ou_b", name: "王五" })!;
     expect(a.runTag).not.toBe(b.runTag);
@@ -448,8 +506,8 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
       ok: true,
       origin: b.runTag!,
     });
-    expect(callArgs(sendText, 0)[1] as string).toContain("王五");
-    expect(callArgs(sendText, 0)[1] as string).toContain("答 B");
+    expect(callArgs(sendMarkdown, 0)[1] as string).toContain("王五");
+    expect(callArgs(sendMarkdown, 0)[1] as string).toContain("答 B");
     // A 的登记不受影响
     expect(listGroupReplies("task-1")).toHaveLength(1);
     await handleGroupOutboundEvent("task-1", {
@@ -458,7 +516,7 @@ describe("token 化投递（属主主链 vs 旁路答疑 run）", () => {
       ok: true,
       origin: a.runTag!,
     });
-    expect(callArgs(sendText, 1)[1] as string).toContain("答 A");
+    expect(callArgs(sendMarkdown, 1)[1] as string).toContain("答 A");
   });
 
   it("assistant_message 兜底同样认 origin（旁路的完整消息不进属主登记）", async () => {

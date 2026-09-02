@@ -1,5 +1,5 @@
 /**
- * Flowship 自有工具（交卷 / 提问 / 提 MR / 测试人员 / 批次 / 挂 action / 分享群）。
+ * Flowship 自有工具（交卷 / 提问 / 提 MR / 测试人员 / 批次 / 挂 action / 分享群 / 群 @ 测试）。
  *
  *   - cursor：`buildSdkCustomTools` → `Agent.create({ local: { customTools } })`
  *   - custom：pi customTools（TypeBox schema，见 custom-agent-backend.ts）
@@ -449,6 +449,7 @@ const shareToGroupDef: FlowshipToolDef = {
   description: [
     "把内容以互动卡片发到当前任务关联飞书工作项的需求群。",
     "只在用户明确要求分享 / playbook 编排时调；不要自行滥发。",
+    "提测在需求群 @ 测试人员不要走本工具，用 notify_group_testers。",
     "入参：task_id、content（必填）、title / kind(artifact|message|question) / links([{label,url}]) 可选。",
     "返回 { ok, chatName?, messageId?, docMessageId? } 或 { ok:false, error, code? }——失败如实转告用户、不要自行重试。",
   ].join("\n"),
@@ -514,6 +515,53 @@ const shareToGroupDef: FlowshipToolDef = {
   },
 };
 
+// ----------------- 需求群 @ 测试 notify_group_testers -----------------
+
+const notifyGroupTestersDef: FlowshipToolDef = {
+  name: "notify_group_testers",
+  label: "在需求群 IM @ 测试人员",
+  description: [
+    "提测 playbook：写完飞书项目评论之后调。在已绑定的需求群用 IM @ 同一批测试人员（工作项评论 @ 不推飞书通知，这条会推提及）。",
+    "入参只要 task_id、action_id。人从 task.feishuTesterUserKeys 取、MR 从本 action 的 submit_mr 记录取；不要传 open_id，不要用 share_to_group 代替。",
+    "只允许当前 running 的 ship 调。返回 { ok, outcome }：sent 或 skipped_*（没群 / bot 不在群 / 没人可 @ / 无 MR / 有冲突等）。skipped 不是失败，记进 artifact 即可，不要重试、不要改调 share_to_group。",
+  ].join("\n"),
+  parameters: TBObject({
+    task_id: TBString(),
+    action_id: TBString(),
+  }),
+  handler: async (args, callerToken) => {
+    const taskId = str(args.task_id);
+    const actionId = str(args.action_id);
+    if (!matchExpectedCallerToken(taskId, callerToken)) {
+      return text(CALLER_MISMATCH_ERROR);
+    }
+    const task = await getTask(taskId);
+    if (!task) {
+      return text(JSON.stringify({ ok: false, error: "任务不存在" }));
+    }
+    const action = task.actions.find((a) => a.id === actionId);
+    if (
+      task.currentActionId !== actionId ||
+      !action ||
+      action.status !== "running" ||
+      action.type !== "ship"
+    ) {
+      return text(
+        JSON.stringify({
+          ok: false,
+          error: "notify_group_testers 只允许当前 running 的 ship 调用",
+        }),
+      );
+    }
+    // 动态 import：避开 feishu-group → meegle 的静态依赖（同 share_to_group）
+    const { notifyShipTestersInGroup } = await import(
+      "./feishu-bridge/group-tester-notify"
+    );
+    const outcome = await notifyShipTestersInGroup(task, action);
+    return text(JSON.stringify({ ok: true, outcome }));
+  },
+};
+
 /** Flowship 自有工具清单（cursor SDK customTools + pi customTools 共用） */
 export const flowShipTools: FlowshipToolDef[] = [
   submitWorkDef,
@@ -523,6 +571,7 @@ export const flowShipTools: FlowshipToolDef[] = [
   setPlanBatchesDef,
   createCustomActionDef,
   shareToGroupDef,
+  notifyGroupTestersDef,
 ];
 
 /**

@@ -193,11 +193,11 @@ UI / Agent
             │     ├─（无群 / 用户确认重建）角色成员 email → 注册表反查 → lark POST /im/v1/chats
             │     │        （user_id_list + bot_id_list）+ meegle bind
             │     └─ 并发：bind 前再查，收敛到已有 group_id（重建时不认那条失效 id）
-            ├─ sendInteractiveCardToChat（bridge 建卡 + --chat-id 发送）
-            │     └─ 发送失败：isBotNotInGroupSendError（230002 一族错误码）
-            │        → 抛 bot_not_in_group（带 botLabel）；其它错误照旧 lark_error
-            └─（kind=artifact）sendFileMessageToChat：全文落临时 md → --file 发群
-                  └─ 失败只 warn、不抛（卡片已发出、整体仍成功、无 docMessageId）
+            ├─ format=card（默认）：sendInteractiveCardToChat
+            │     └─ kind=artifact 再 sendFileMessageToChat（全文 md）
+            ├─ format=post：sendPostMarkdownToChat（mentions 拼成 `<at user_id>`）
+            └─ 发送失败：isBotNotInGroupSendError（230002 一族）
+                   → 抛 bot_not_in_group（带 botLabel）；其它错误照旧 lark_error
 ```
 
 ### 复用（不要另起 HTTP 客户端）
@@ -208,6 +208,7 @@ UI / Agent
 | 建卡实体 `createCardEntity` | 同上 |
 | 群聊发卡 `sendInteractiveCardToChat` | 同上（本期新增薄封装） |
 | 群聊发文件 `sendFileMessageToChat` | 同上（临时 md + cwd 相对路径，见「内容形态」） |
+| 群聊发 post markdown `sendPostMarkdownToChat` | 同上（`format: "post"` / 提测 @） |
 | 建群 / bot 展示名 | `createImChat` / `getBotDisplayName`（降级链单一来源） |
 | meegle 串行队列 + 错误三态 | `meegle-cli.ts` |
 | `group_type` 读/bind、工作项名 | `fetchWorkitemGroupType` / `bindWorkitemGroup` / `fetchWorkitemName` |
@@ -377,7 +378,14 @@ describe 里要同步说清内容形态（`artifact` 走 md 文件不截断 / �
 
 ## 内容形态（2026-07-27 用户拍板改版）
 
-分两种，按 `kind` 分流：
+`shareToRequirementGroup` 按 **format** 分流（发到需求群的唯一收口）：
+
+| format | 群里长什么样 | 谁在用 |
+|------|-------------|---------|
+| `card`（默认） | 互动卡片；`kind=artifact` 再跟一条 md 文件 | UI 分享 / MCP `share_to_group` / 自动播报 / 群内推进产物 |
+| `post` | 一条会渲染的 IM markdown；`mentions` 拼成 `<at user_id>` | 提测 @（`notify_group_testers`） |
+
+`card` 再按 `kind` 分流：
 
 | kind | 群里长什么样 | 正文去哪 |
 |------|-------------|---------|
@@ -880,9 +888,11 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 
 播报是**系统行为**、不是 agent 行为。两处指令源必须同口径（现在都是「产物默认不进群」）：
 
-- `prompts/action-ship.md` §6：交卷后系统不发、agent 也不要顺手调 `share_to_group`；
-  只有用户明说才调
-- `flowship-tools.ts` `share_to_group` describe：「action 交卷后不要顺手调」
+- `prompts/action-ship.md` §6：产物默认不进群，agent 不要顺手调 `share_to_group`；
+  只有用户明说才调。提测 @ 走 `notify_group_testers`，不是分享产物。
+- `flowship-tools.ts` `share_to_group` describe：提测 @ 用 `notify_group_testers`，不要走本工具
+
+提测群 @ 反过来是 **agent 行为**（和飞书项目评论同一拍）：playbook §4 写完评论立刻调 `notify_group_testers`，交卷收口不再补发。
 
 ## 功能全景
 
@@ -965,7 +975,7 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 - `tests/advance-options.test.ts`：server 复算的可推进清单与推进弹窗同口径
   （布局顺序显隐 / 分组序 / 日常任务只列自定义 / 关 skill / 团队规范开关 / legacy 滤除）
 - `tests/feishu-group-outbound.test.ts`：ask 卡发群（两个开关 + 未绑群）、回答攒 delta
-  后 @ 提问人回群、done 后登记摘除、推进产物走 share 卡、share 失败降级发文本、
+  后 @ 提问人回群（**post markdown**、不是纯文本）、done 后登记摘除、推进产物走 share 卡、share 失败降级发文本、
   **产物卡先占再发**（播报已占坑就不发第二张 / 发失败退坑）；
   **token 化投递**（属主 done 先到不动旁路登记 / 两条登记并存各投各的 / stop 补发的
   无 origin done 不误 flush / 多位同事各自 token / assistant_message 兜底也认 origin）、
@@ -980,6 +990,8 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 - `tests/feishu-group-broadcast.test.ts`：三档判定、轻量任务 / 桥接关 / 无产物跳过、
   **没绑群不建群**、让位群内推进、防重（含失败退坑、含 flush 已占坑）、
   失败降级成 info 且不抛、MR 按钮只取本 action
+- `tests/feishu-group-tester-notify.test.ts`：提测需求群 @ 测试（注册表换 open_id /
+  没群 / 没人 / 冲突 / bot 不在群静默 / 同一 action 只发一次）；agent 工具 `notify_group_testers` 调这条，交卷不再补发
 - `tests/task-question-inject-restrict.test.ts`：`restrictToQuestion` 五条硬拦各带对照组
   （不复用活会话 / 不带 ackContext 不 snapshot 不打回 running / 会话断不 resume /
   起的是 `startRestrictedGroupQuestion` 不是属主那条 one-shot / **一个字节 runStatus 都不写**）

@@ -624,9 +624,8 @@ export const sanitizeGroupMemberName = (raw: unknown): string => {
 };
 
 /**
- * 飞书文本消息里的 @ 标签。
- * 官方文本消息支持内联 `<at user_id="ou_xxx">名字</at>`；open_id 缺失时退化成纯文本
- * 「@名字」（至少让人看得出在叫谁）。
+ * 飞书 @ 标签：纯文本消息和 post 的 `md` 正文都认 `<at user_id="ou_xxx">名字</at>`。
+ * open_id 缺失时退化成纯文本「@名字」（至少让人看得出在叫谁）。
  */
 export const mentionTag = (openId: string, name: string): string => {
   const display = name.trim() || "你";
