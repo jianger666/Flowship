@@ -4,7 +4,7 @@
  * 「环境配置」节（并入设置页「连接」卡尾部）
  *
  * 折叠小节 + 状态摘要：默认全部收起，一眼扫绿/灰点；点开再编表单。
- * 服务器 / PG / XXL / Nacos / ELK / HTTP API 本质是外部服务凭据，与 API Key / GitLab / 飞书同属「连接」。
+ * 服务器 / PG / XXL / Nacos / ELK / SLS / HTTP API 本质是外部服务凭据，与 API Key / GitLab / 飞书同属「连接」。
  */
 
 import {
@@ -20,6 +20,7 @@ import {
   HardDrive,
   Layers,
   Plus,
+  ScrollText,
   Server,
   Timer,
   Trash2,
@@ -61,6 +62,7 @@ import type {
   CompanyEnvPg,
   CompanyEnvRedis,
   CompanyEnvServer,
+  CompanyEnvSls,
   CompanyEnvXxlJob,
 } from "@/lib/types";
 
@@ -72,6 +74,7 @@ type SectionId =
   | "xxljob"
   | "nacos"
   | "elk"
+  | "sls"
   | "httpApis";
 
 interface CompanyEnvSectionProps {
@@ -84,6 +87,8 @@ interface CompanyEnvSectionProps {
 
 /** 环境字段候选（Combobox 支持自由输入其它值） */
 const ENV_OPTIONS = ["dev", "test", "production"];
+/** 宽到 production 单行能下；弹层 min-w 收在 Combobox 里，这里只定 trigger 宽 */
+const ENV_FIELD_CLASS = "w-36 shrink-0 space-y-0.5";
 
 /** 字段顺序无关的稳定序列化：落盘去重 key 不受对象键顺序影响 */
 const stableKey = (value: unknown): string => {
@@ -154,7 +159,7 @@ const InstanceCardHeader = ({
   env: string;
   onEnvChange: (next: string) => void;
 }) => (
-  <MiniField label="环境" className="w-28 shrink-0 space-y-0.5">
+  <MiniField label="环境" className={ENV_FIELD_CLASS}>
     <Combobox
       value={env}
       onValueChange={onEnvChange}
@@ -389,6 +394,14 @@ const elkSummary = (
   return { configured: true, summary: `${filled.length} 个实例` };
 };
 
+const slsSummary = (
+  rows: CompanyEnvSls[],
+): { configured: boolean; summary: string } => {
+  const filled = rows.filter((s) => s.endpoint.trim() && s.project.trim());
+  if (filled.length === 0) return { configured: false, summary: "未配置" };
+  return { configured: true, summary: `${filled.length} 个实例` };
+};
+
 const httpApiSummary = (
   rows: CompanyEnvHttpApi[],
 ): { configured: boolean; summary: string } => {
@@ -564,6 +577,7 @@ export const CompanyEnvSection = ({
   const redisList = value.redis;
   const nacosList = value.nacos;
   const elkList = value.elk;
+  const slsList = value.sls ?? [];
   const httpApis = value.httpApis ?? [];
 
   const sStat = serverSummary(servers);
@@ -573,6 +587,7 @@ export const CompanyEnvSection = ({
   const xStat = xxlSummary(value.xxljob);
   const nStat = nacosSummary(nacosList);
   const eStat = elkSummary(elkList);
+  const slsStat = slsSummary(slsList);
   const hStat = httpApiSummary(httpApis);
 
   return (
@@ -635,7 +650,7 @@ export const CompanyEnvSection = ({
                   <div className="flex flex-wrap items-end gap-1.5">
                     <MiniField
                       label="环境"
-                      className="w-28 shrink-0 space-y-0.5"
+                      className={ENV_FIELD_CLASS}
                     >
                       <Combobox
                         value={s.env}
@@ -1011,7 +1026,7 @@ export const CompanyEnvSection = ({
                     <div className="flex flex-wrap gap-1.5">
                       <MiniField
                         label="环境"
-                        className="w-28 shrink-0 space-y-0.5"
+                        className={ENV_FIELD_CLASS}
                       >
                         <Combobox
                           value={x.env}
@@ -1293,16 +1308,6 @@ export const CompanyEnvSection = ({
                           className="h-8"
                         />
                       </MiniField>
-                      <MiniField label="Data View">
-                        <Input
-                          value={e.dataView}
-                          onChange={(ev) =>
-                            patchElk({ ...e, dataView: ev.target.value })
-                          }
-                          onBlur={() => persist(value)}
-                          className="h-8 font-mono text-xs"
-                        />
-                      </MiniField>
                     </div>
                   </InstanceCard>
                 );
@@ -1318,6 +1323,110 @@ export const CompanyEnvSection = ({
                     dataView: "",
                   };
                   commit({ ...value, elk: [...elkList, row] });
+                }}
+              />
+            </div>
+          </EnvSection>
+
+          <EnvSection
+            id="sls"
+            icon={ScrollText}
+            title="SLS"
+            configured={slsStat.configured}
+            summary={slsStat.summary}
+            open={openId === "sls"}
+            onToggle={toggle}
+          >
+            <div className="space-y-2">
+              {slsList.map((s, i) => {
+                const patchSls = (next: CompanyEnvSls) =>
+                  patch({
+                    sls: slsList.map((row, j) => (j === i ? next : row)),
+                  });
+                const commitSls = (next: CompanyEnvSls) =>
+                  commit({
+                    ...value,
+                    sls: slsList.map((row, j) => (j === i ? next : row)),
+                  });
+                return (
+                  <InstanceCard key={i}>
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      <InstanceCardHeader
+                        env={s.env}
+                        onEnvChange={(env) => commitSls({ ...s, env })}
+                      />
+                      <MiniField
+                        label="Endpoint"
+                        className="min-w-0 flex-1 space-y-0.5"
+                      >
+                        <Input
+                          value={s.endpoint}
+                          onChange={(ev) =>
+                            patchSls({ ...s, endpoint: ev.target.value })
+                          }
+                          onBlur={() => persist(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <InstanceRowEnd
+                        onRemove={() =>
+                          commit({
+                            ...value,
+                            sls: slsList.filter((_, j) => j !== i),
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField label="Project">
+                        <Input
+                          value={s.project}
+                          onChange={(ev) =>
+                            patchSls({ ...s, project: ev.target.value })
+                          }
+                          onBlur={() => persist(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <MiniField label="AccessKey ID">
+                        <Input
+                          value={s.accessKeyId}
+                          onChange={(ev) =>
+                            patchSls({ ...s, accessKeyId: ev.target.value })
+                          }
+                          onBlur={() => persist(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <MiniField label="AccessKey Secret">
+                        <PasswordInput
+                          value={s.accessKeySecret}
+                          onChange={(ev) =>
+                            patchSls({
+                              ...s,
+                              accessKeySecret: ev.target.value,
+                            })
+                          }
+                          onBlur={() => persist(value)}
+                          autoComplete="off"
+                          className="h-8"
+                        />
+                      </MiniField>
+                    </div>
+                  </InstanceCard>
+                );
+              })}
+              <AddRowButton
+                label="添加实例"
+                onClick={() => {
+                  const row: CompanyEnvSls = {
+                    env: "test",
+                    endpoint: "",
+                    project: "",
+                    accessKeyId: "",
+                    accessKeySecret: "",
+                  };
+                  commit({ ...value, sls: [...slsList, row] });
                 }}
               />
             </div>
@@ -1349,7 +1458,7 @@ export const CompanyEnvSection = ({
                     <div className="flex flex-wrap items-end gap-1.5">
                       <MiniField
                         label="环境"
-                        className="w-28 shrink-0 space-y-0.5"
+                        className={ENV_FIELD_CLASS}
                       >
                         <Combobox
                           value={h.env}

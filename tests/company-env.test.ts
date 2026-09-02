@@ -120,7 +120,11 @@ describe("companyEnvToEnvVars", () => {
     expect(vars.FS_ENV_NACOS_TEST_BASE_URL).toContain("nacos");
     expect(vars.FS_ENV_NACOS_TEST_NAMESPACES).toBe("test\ndev");
     expect(vars.FS_ENV_NACOS_TEST_READONLY).toBe("1");
-    expect(vars.FS_ENV_ELK_TEST_DATA_VIEW).toBe("app-logs-*");
+    expect(vars.FS_ENV_ELK_TEST_BASE_URL).toContain("kibana-test");
+    expect(vars.FS_ENV_SLS_TEST_ENDPOINT).toBe("us-west-1.log.aliyuncs.com");
+    expect(vars.FS_ENV_SLS_TEST_PROJECT).toBe("example-project");
+    expect(vars.FS_ENV_SLS_TEST_ACCESS_KEY_ID).toBe("【填写】");
+    expect(vars.FS_ENV_SLS_TEST_ACCESS_KEY_SECRET).toBe("【填写】");
     expect(vars.FS_ENV_HTTPAPI_TEST_URL).toBe("https://api-test.example.com");
     expect(vars.FS_ENV_HTTPAPI_TEST_NOTE).toContain("/auth/login");
     expect(vars.FS_ENV_HTTPAPI_TEST_2_URL).toBe(
@@ -536,14 +540,16 @@ describe("cloneCompanyEnv", () => {
     expect(copy.nacos[0].namespaces).not.toBe(src.nacos[0].namespaces);
     expect(copy.elk).not.toBe(src.elk);
     expect(copy.elk[0]).not.toBe(src.elk[0]);
+    expect(copy.sls).not.toBe(src.sls);
+    expect(copy.sls[0]).not.toBe(src.sls[0]);
 
     // 改副本不回写源
     copy.pg[0].password = "changed";
     copy.nacos[0].namespaces.push("extra");
-    copy.elk[0].dataView = "changed";
+    copy.sls[0].project = "changed";
     expect(src.pg[0].password).toBe("【填写】");
     expect(src.nacos[0].namespaces).toEqual(["test", "dev"]);
-    expect(src.elk[0].dataView).toBe("app-logs-*");
+    expect(src.sls[0].project).toBe("example-project");
   });
 });
 
@@ -636,7 +642,7 @@ describe("buildCompanyEnvBrief", () => {
     expect(brief).not.toContain("pg-exec");
   });
 
-  it("只配 XXL / Nacos / ELK → 也注入", () => {
+  it("只配 XXL / Nacos / ELK / SLS → 也注入", () => {
     expect(
       buildCompanyEnvBrief(
         {
@@ -689,6 +695,23 @@ describe("buildCompanyEnvBrief", () => {
         "/tmp/fe-data/company-env.json",
       ),
     ).toContain("ELK");
+    const slsBrief = buildCompanyEnvBrief(
+      {
+        ...emptyCompanyEnv(),
+        sls: [
+          {
+            env: "test",
+            endpoint: "us-west-1.log.aliyuncs.com",
+            project: "example-project",
+            accessKeyId: "id-should-not-appear",
+            accessKeySecret: "secret-should-not-appear",
+          },
+        ],
+      },
+      "/tmp/fe-data/company-env.json",
+    );
+    expect(slsBrief).toContain("SLS");
+    expect(slsBrief).not.toContain("secret-should-not-appear");
   });
 
   it("有服务器+子系统 → 含路径与枚举、不含密码 / note", () => {
@@ -705,6 +728,7 @@ describe("buildCompanyEnvBrief", () => {
     );
     expect(brief).toContain("Nacos（只读——只允许读配置、禁止发布修改）");
     expect(brief).toContain("ELK");
+    expect(brief).toContain("SLS");
     expect(brief).toContain("HTTP API");
     expect(brief).toContain("禁止 cat");
     expect(brief).toContain("ssh-exec.mjs");
@@ -902,6 +926,41 @@ describe("companyEnv redis / kafka / appProperties", () => {
     expect(vars.FS_ENV_REDIS_TEST_READONLY).toBe("1");
     // 自定义不进 env 变量（自由格式无规律），只落 json / brief
     expect(vars.FS_ENV_CUSTOM).toBeUndefined();
+  });
+
+  it("SLS：endpoint / project / AK 打平", () => {
+    const env: CompanyEnv = {
+      ...emptyCompanyEnv(),
+      sls: [
+        {
+          env: "test",
+          endpoint: "us-west-1.log.aliyuncs.com",
+          project: "wk-example",
+          accessKeyId: "akid",
+          accessKeySecret: "aksecret",
+        },
+      ],
+    };
+    const vars = companyEnvToEnvVars(env);
+    expect(vars.FS_ENV_SLS_TEST_ENDPOINT).toBe("us-west-1.log.aliyuncs.com");
+    expect(vars.FS_ENV_SLS_TEST_PROJECT).toBe("wk-example");
+    expect(vars.FS_ENV_SLS_TEST_ACCESS_KEY_ID).toBe("akid");
+    expect(vars.FS_ENV_SLS_TEST_ACCESS_KEY_SECRET).toBe("aksecret");
+    expect(vars.FS_ENV_SLS_TEST_LOGSTORES).toBeUndefined();
+    expect(
+      isCompanyEnvConfigured({
+        ...emptyCompanyEnv(),
+        sls: [
+          {
+            env: "test",
+            endpoint: "us-west-1.log.aliyuncs.com",
+            project: "wk-example",
+            accessKeyId: "",
+            accessKeySecret: "",
+          },
+        ],
+      }),
+    ).toBe(true);
   });
 
   it("normalize：旧配置缺 redis / custom 不炸、旧 kafka 键被忽略", () => {

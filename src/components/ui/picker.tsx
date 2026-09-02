@@ -338,8 +338,8 @@ export const Picker: PickerComponent = (props) => {
           side="bottom"
           sideOffset={4}
           className={cn(
-            // 锁死跟 trigger 同宽：只写 w- 不够，内容 min-width:auto 会把层撑宽。
-            // 长文案在选项里最多折两行，再长 hover 出全文（OverflowTooltip）。
+            // 默认跟 trigger 等宽；调用方用 contentClassName 抬 min-w（窄环境框）。
+            // 选项单行省略，超出 hover 出全文（OverflowTooltip）。
             "w-(--anchor-width) min-w-(--anchor-width) max-w-(--anchor-width) overflow-hidden p-0",
             contentClassName,
           )}
@@ -360,7 +360,7 @@ export const Picker: PickerComponent = (props) => {
                   if (target) pick(target);
                 }}
                 placeholder={searchPlaceholder}
-                className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                className="min-w-0 flex-1 truncate bg-transparent text-sm outline-none placeholder:text-muted-foreground"
               />
             </div>
           ) : null}
@@ -403,7 +403,6 @@ export const Picker: PickerComponent = (props) => {
                         ) : labelText != null ? (
                           <OverflowTooltip
                             text={labelText}
-                            lineClamp={2}
                             className="text-sm"
                           />
                         ) : (
@@ -452,7 +451,6 @@ export const Picker: PickerComponent = (props) => {
                     >
                       <OverflowTooltip
                         text={`使用「${customCandidate}」`}
-                        lineClamp={2}
                         className="text-sm"
                       />
                       <CornerDownLeft className="size-4 shrink-0 text-muted-foreground" />

@@ -209,7 +209,11 @@ describe("maybeGenerateChatTitle", () => {
       result: "为对话生成中文标题",
     });
     const cleared = baseTask({ titleAutoPending: undefined });
-    mockUpdateFields.mockResolvedValue(cleared);
+    mockUpdateFields.mockResolvedValue({
+      task: cleared,
+      reposChanged: false,
+      unboundRepoPaths: [],
+    });
 
     maybeGenerateChatTitle("t-chat-1", "key-x", "222");
     await waitUntil(() => mockUpdateFields.mock.calls.length > 0);

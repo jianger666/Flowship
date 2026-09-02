@@ -481,6 +481,12 @@ export const getUniqueRepoDirNames = (repoPaths: string[]): string[] => {
   });
 };
 
+/** 任务仓列表是否同一份（顺序也算、短名去重按序分配） */
+export const sameRepoPathList = (
+  a: readonly string[],
+  b: readonly string[],
+): boolean => a.length === b.length && a.every((p, i) => p === b[i]);
+
 /**
  * 逐仓算「IDE 该打开的项目目录」（V0.12.3、client 用）
  *

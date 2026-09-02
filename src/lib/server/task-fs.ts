@@ -72,7 +72,10 @@ import {
   isWorktreeTask,
   removeTaskWorktrees,
   resolveTaskIsolateWorktree,
+  syncTaskWorktreesToRepoPaths,
+  type WorktreeTaskLike,
 } from "./task-worktrees";
+import { sameRepoPathList } from "@/lib/path-utils";
 import { reapTaskOrphans } from "./kill-orphans";
 import {
   cleanupCheckpointRefsForTask,
@@ -1275,7 +1278,7 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     input.title && input.title.trim() ? input.title.trim() : "未命名任务";
 
   // 去尾斜杠：settings.repos 落盘无尾 /、快照匹配（readonly / scriptRepo）是精确字符串比对，
-  // 带尾 / 会静默匹配空（跟 addRepoPaths / setTaskRepoPaths 同款归一）
+  // 带尾 / 会静默匹配空（跟 setTaskRepoPaths / 整份替换同款归一）
   const trimmedRepoPaths = (input.repoPaths ?? [])
     .map((p) => p.trim().replace(/\/+$/, ""))
     .filter((p) => p.length > 0);
@@ -1839,9 +1842,9 @@ export const recordTurnUsage = async (
 /**
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
- * 只放可安全后改的软配置：title / feishuStoryUrl / repoFeatureBranches。
+ * 只放可安全后改的软配置：title / feishuStoryUrl / repoFeatureBranches / repoPaths。
  * 不在此改 model（SDK Run 启动时绑定、改了只能换新 agent）/ mode（切通路）/
- * repoPaths（副作用大、影响 cwd + 已建分支）/ repoStatus / runStatus / actions。
+ * repoStatus / runStatus / actions。
  *
  * 入参语义：字段为 undefined = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
  */
@@ -1862,12 +1865,10 @@ export interface UpdateTaskFieldsInput {
   reqId?: string | null;
   repoFeatureBranches?: Record<string, string> | null;
   /**
-   * V0.6.28：中途**追加**仓库（只增不删、删仓涉及已建分支 / MR 残留引用、边界多收益低）
-   * - 语义：跟现有 repoPaths 做并集、已存在的忽略；生效于下一个 action（正在跑的 run cwd 已绑死）
-   * - 新仓的 per-repo 快照（线上 / 测试 / dev 分支、命名模板）由前端从
-   *   settings 取好随本字段一起传（settings 在 localStorage、server 读不到、跟建 task 同因）
+   * 任务模式整份替换仓库列表（至少 1 仓）。锁外拆已解绑仓 worktree，CAS 后再写 meta。
+   * 新仓的 per-repo 快照由前端从 settings 取好随行传（server 读不到 localStorage）。
    */
-  addRepoPaths?: string[];
+  repoPaths?: string[];
   /** 仅新增仓的快照、merge 进现有 map（已有仓的 key 忽略、不覆盖建 task 时的固化值） */
   addRepoBaseBranches?: Record<string, string>;
   addRepoTestBranches?: Record<string, string>;
@@ -1875,131 +1876,285 @@ export interface UpdateTaskFieldsInput {
   addRepoBranchTemplates?: Record<string, string>;
 }
 
+export class TaskFieldUpdateError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: 400 | 409,
+  ) {
+    super(message);
+    this.name = "TaskFieldUpdateError";
+  }
+}
+
+export type UpdateTaskFieldsResult = {
+  task: Task;
+  /** 仓列表是否真变了（要关会话、推进时强制新 agent） */
+  reposChanged: boolean;
+  unboundRepoPaths: string[];
+};
+
+const pruneRepoMap = <V,>(
+  current: Record<string, V> | undefined,
+  allowed: Set<string>,
+): Record<string, V> | undefined => {
+  if (!current) return undefined;
+  const next: Record<string, V> = {};
+  for (const [repo, v] of Object.entries(current)) {
+    if (allowed.has(repo)) next[repo] = v;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+};
+
+const mergeNewRepoSnapshots = <V,>(
+  current: Record<string, V> | undefined,
+  incoming: Record<string, V> | undefined,
+  addedSet: Set<string>,
+): Record<string, V> | undefined => {
+  if (!incoming) return current;
+  const merged: Record<string, V> = { ...current };
+  for (const [repo, v] of Object.entries(incoming)) {
+    if (addedSet.has(repo) && v) merged[repo] = v;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+};
+
+const parseNextRepoPaths = (raw: string[]): string[] => {
+  const seen = new Set<string>();
+  const nextPaths: string[] = [];
+  for (const item of raw) {
+    const p = item.trim().replace(/\/+$/, "");
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      nextPaths.push(p);
+    }
+  }
+  if (nextPaths.length === 0) {
+    throw new TaskFieldUpdateError("任务至少绑定一个仓库", 400);
+  }
+  return nextPaths;
+};
+
+/** 标题 / 飞书 / 需求编号：不碰仓列表，阶段 1 锁内即可落盘 */
+const applyNonRepoTaskFields = (
+  meta: TaskMetaV06,
+  input: UpdateTaskFieldsInput,
+): void => {
+  // 标题：空忽略、保持原值（前端已校验非空、这里兜底防误清）
+  if (input.title !== undefined) {
+    const t = input.title.trim();
+    if (t) meta.title = t;
+  }
+
+  // chat 自动标题挂起：false → 删字段；true → 显式置位
+  if (input.titleAutoPending !== undefined) {
+    if (input.titleAutoPending) meta.titleAutoPending = true;
+    else delete meta.titleAutoPending;
+  }
+
+  // 飞书链接：改动时同步「建任务自动生成的那条 url 上下文文档」、否则 agent 读 contextDocs 仍是旧链接、两处漂移
+  // 身份闸门：isolateWorktree / 轻量态只在创建时按「有无 storyUrl」落盘一次，禁止编辑时有↔无切换
+  if (input.feishuStoryUrl !== undefined) {
+    const oldUrl = meta.feishuStoryUrl;
+    const newUrl = input.feishuStoryUrl?.trim() || undefined;
+    const oldHas = !!(oldUrl ?? "").trim();
+    const newHas = !!newUrl;
+    if (oldHas !== newHas) {
+      throw new Error("日常/需求身份创建后不可改、需要请新建任务");
+    }
+    meta.feishuStoryUrl = newUrl;
+    if (oldUrl && oldUrl !== newUrl && newUrl && meta.contextDocs) {
+      const doc = meta.contextDocs.find(
+        (d) => d.type === "url" && d.content === oldUrl,
+      );
+      if (doc) doc.content = newUrl;
+    }
+  }
+
+  // wk 需求编号：null / 空串 / 非法字面 → 删字段（回退派生值）；合法值原样落盘
+  if (input.reqId !== undefined) {
+    const next = normalizeReqId(input.reqId ?? undefined);
+    if (next) meta.reqId = next;
+    else delete meta.reqId;
+  }
+};
+
+/** 被测业务分支：仅 QA 任务可改（跟 createTask 同款清洗） */
+const applyQaFeatureBranches = (
+  meta: TaskMetaV06,
+  input: UpdateTaskFieldsInput,
+): void => {
+  if (input.repoFeatureBranches === undefined || meta.workRole !== "qa") return;
+  if (input.repoFeatureBranches === null) {
+    meta.repoFeatureBranches = undefined;
+  } else {
+    const allowed = new Set(meta.repoPaths);
+    const cleaned: Record<string, string> = {};
+    for (const [repo, branch] of Object.entries(input.repoFeatureBranches)) {
+      const b = branch?.trim();
+      if (allowed.has(repo) && b) cleaned[repo] = b;
+    }
+    meta.repoFeatureBranches =
+      Object.keys(cleaned).length > 0 ? cleaned : undefined;
+  }
+  // 测试任务改 / 清被测业务分支后，旧 gitBranches 不能继续冒充当前配置。
+  // 分支名仍一致的记录保留提交 SHA；变化或清空的记录等下个 Action 重新准备并写入。
+  if (meta.gitBranches) {
+    meta.gitBranches = meta.gitBranches.filter(
+      (info) =>
+        meta.repoFeatureBranches?.[info.repoPath]?.trim() === info.name,
+    );
+    if (meta.gitBranches.length === 0) delete meta.gitBranches;
+  }
+};
+
+/** 仓列表已确认可写：剪 5 张 map + gitBranches + 清会话锚点 */
+const applyRepoReplaceMeta = async (
+  meta: TaskMetaV06,
+  nextPaths: string[],
+  oldPaths: string[],
+  input: UpdateTaskFieldsInput,
+): Promise<string[]> => {
+  const unboundRepoPaths: string[] = [];
+  const newSet = new Set(nextPaths);
+  const addedSet = new Set(nextPaths.filter((p) => !oldPaths.includes(p)));
+  for (const p of oldPaths) {
+    if (!newSet.has(p)) unboundRepoPaths.push(p);
+  }
+  meta.repoPaths = nextPaths;
+  meta.repoBaseBranches = mergeNewRepoSnapshots(
+    pruneRepoMap(meta.repoBaseBranches, newSet),
+    input.addRepoBaseBranches,
+    addedSet,
+  );
+  meta.repoTestBranches = mergeNewRepoSnapshots(
+    pruneRepoMap(meta.repoTestBranches, newSet),
+    input.addRepoTestBranches,
+    addedSet,
+  );
+  meta.repoDevBranches = mergeNewRepoSnapshots(
+    pruneRepoMap(meta.repoDevBranches, newSet),
+    input.addRepoDevBranches,
+    addedSet,
+  );
+  meta.repoBranchTemplates = mergeNewRepoSnapshots(
+    pruneRepoMap(meta.repoBranchTemplates, newSet),
+    input.addRepoBranchTemplates,
+    addedSet,
+  );
+  meta.repoFeatureBranches = pruneRepoMap(meta.repoFeatureBranches, newSet);
+  meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
+  const flags = await snapshotRepoFlagPaths(meta.repoPaths);
+  meta.readonlyRepoPaths = flags.readonly;
+  meta.scriptRepoPaths = flags.script;
+  // gitBranches 跟 featureBranches 解耦：解绑即使没改被测分支也要剪掉该仓记录
+  if (meta.gitBranches) {
+    meta.gitBranches = meta.gitBranches.filter((b) => newSet.has(b.repoPath));
+    if (meta.gitBranches.length === 0) delete meta.gitBranches;
+  }
+  meta.sessionAgentId = undefined;
+  return unboundRepoPaths;
+};
+
+const snapshotWorktreeTaskLike = (meta: TaskMetaV06): WorktreeTaskLike => ({
+  id: meta.id,
+  mode: meta.mode,
+  repoPaths: [...meta.repoPaths],
+  isolateWorktree: meta.isolateWorktree,
+  nonGitRepoPaths: meta.nonGitRepoPaths,
+  readonlyRepoPaths: meta.readonlyRepoPaths,
+  scriptRepoPaths: meta.scriptRepoPaths,
+});
+
+/**
+ * 编辑任务字段。仓列表替换拆成两段锁：阶段 1 快照 old/new 并落非仓字段，
+ * 锁外跑 git 拆/挪（remove/move 各 60s），阶段 2 CAS `repoPaths` 仍是 old 再写仓列表。
+ * git 失败不写仓；CAS 失败 409（worktree 可能已跟上 aborted 的 next，下次 ensure + prune 兜）。
+ */
 export const updateTaskFields = async (
   id: string,
   input: UpdateTaskFieldsInput,
-): Promise<Task | null> =>
-  withTaskLock(id, async () => {
+): Promise<UpdateTaskFieldsResult | null> => {
+  const phase1 = await withTaskLock(id, async () => {
     const meta = await readMetaV06(id);
     if (!meta) return null;
 
-    // 标题：空忽略、保持原值（前端已校验非空、这里兜底防误清）
-    if (input.title !== undefined) {
-      const t = input.title.trim();
-      if (t) meta.title = t;
-    }
+    applyNonRepoTaskFields(meta, input);
 
-    // chat 自动标题挂起：false → 删字段；true → 显式置位
-    if (input.titleAutoPending !== undefined) {
-      if (input.titleAutoPending) meta.titleAutoPending = true;
-      else delete meta.titleAutoPending;
-    }
+    let pending: {
+      oldPaths: string[];
+      nextPaths: string[];
+      taskLike: WorktreeTaskLike;
+    } | null = null;
 
-    // 飞书链接：改动时同步「建任务自动生成的那条 url 上下文文档」、否则 agent 读 contextDocs 仍是旧链接、两处漂移
-    // 身份闸门：isolateWorktree / 轻量态只在创建时按「有无 storyUrl」落盘一次，禁止编辑时有↔无切换
-    if (input.feishuStoryUrl !== undefined) {
-      const oldUrl = meta.feishuStoryUrl;
-      const newUrl = input.feishuStoryUrl?.trim() || undefined;
-      const oldHas = !!(oldUrl ?? "").trim();
-      const newHas = !!newUrl;
-      if (oldHas !== newHas) {
-        throw new Error("日常/需求身份创建后不可改、需要请新建任务");
+    if (input.repoPaths !== undefined) {
+      if (meta.runStatus === "running") {
+        throw new TaskFieldUpdateError("任务正在运行，不能改仓库", 409);
       }
-      meta.feishuStoryUrl = newUrl;
-      if (oldUrl && oldUrl !== newUrl && newUrl && meta.contextDocs) {
-        const doc = meta.contextDocs.find(
-          (d) => d.type === "url" && d.content === oldUrl,
-        );
-        if (doc) doc.content = newUrl;
-      }
-    }
-
-    // wk 需求编号：null / 空串 / 非法字面 → 删字段（回退派生值）；合法值原样落盘
-    if (input.reqId !== undefined) {
-      const next = normalizeReqId(input.reqId ?? undefined);
-      if (next) meta.reqId = next;
-      else delete meta.reqId;
-    }
-
-    // V0.6.28：追加仓库（只增不删、并集语义）——必须在 repoFeatureBranches 清洗之前处理、
-    // 否则同一次请求里「新仓 + 新仓的被测业务分支」会被旧 repoPaths 集合误清掉
-    if (input.addRepoPaths !== undefined) {
-      const existing = new Set(meta.repoPaths);
-      const added = input.addRepoPaths
-        .map((p) => p.trim().replace(/\/+$/, ""))
-        .filter((p) => p && !existing.has(p));
-      if (added.length > 0) {
-        meta.repoPaths = [...meta.repoPaths, ...added];
-        // 新仓的 per-repo 快照 merge 进现有 map：只收新增仓的 key、不覆盖老仓固化值
-        const addedSet = new Set(added);
-        const mergeSnapshot = <V,>(
-          current: Record<string, V> | undefined,
-          incoming: Record<string, V> | undefined,
-        ): Record<string, V> | undefined => {
-          if (!incoming) return current;
-          const merged: Record<string, V> = { ...current };
-          for (const [repo, v] of Object.entries(incoming)) {
-            if (addedSet.has(repo) && v) merged[repo] = v;
-          }
-          return Object.keys(merged).length > 0 ? merged : undefined;
+      const nextPaths = parseNextRepoPaths(input.repoPaths);
+      if (!sameRepoPathList(meta.repoPaths, nextPaths)) {
+        pending = {
+          oldPaths: [...meta.repoPaths],
+          nextPaths,
+          taskLike: snapshotWorktreeTaskLike(meta),
         };
-        meta.repoBaseBranches = mergeSnapshot(
-          meta.repoBaseBranches,
-          input.addRepoBaseBranches,
-        );
-        meta.repoTestBranches = mergeSnapshot(
-          meta.repoTestBranches,
-          input.addRepoTestBranches,
-        );
-        meta.repoDevBranches = mergeSnapshot(
-          meta.repoDevBranches,
-          input.addRepoDevBranches,
-        );
-        meta.repoBranchTemplates = mergeSnapshot(
-          meta.repoBranchTemplates,
-          input.addRepoBranchTemplates,
-        );
-        // 追加仓后重算非 git / 只读 / 脚本仓快照。注意：flag 快照按「当前」settings
-        // 对全部 repoPaths 全量重算（沿用只读快照旧行为）——用户中途在设置页改过
-        // 开关的话、老仓标记也会一并刷新到最新
-        meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
-        const flags = await snapshotRepoFlagPaths(meta.repoPaths);
-        meta.readonlyRepoPaths = flags.readonly;
-        meta.scriptRepoPaths = flags.script;
       }
     }
 
-    // 被测业务分支：仅 QA 任务可改（跟 createTask 同款清洗）
-    if (input.repoFeatureBranches !== undefined && meta.workRole === "qa") {
-      if (input.repoFeatureBranches === null) {
-        meta.repoFeatureBranches = undefined;
-      } else {
-        const allowed = new Set(meta.repoPaths);
-        const cleaned: Record<string, string> = {};
-        for (const [repo, branch] of Object.entries(
-          input.repoFeatureBranches,
-        )) {
-          const b = branch?.trim();
-          if (allowed.has(repo) && b) cleaned[repo] = b;
-        }
-        meta.repoFeatureBranches =
-          Object.keys(cleaned).length > 0 ? cleaned : undefined;
-      }
-      // 测试任务改 / 清被测业务分支后，旧 gitBranches 不能继续冒充当前配置。
-      // 分支名仍一致的记录保留提交 SHA；变化或清空的记录等下个 Action 重新准备并写入。
-      if (meta.workRole === "qa" && meta.gitBranches) {
-        meta.gitBranches = meta.gitBranches.filter(
-          (info) =>
-            meta.repoFeatureBranches?.[info.repoPath]?.trim() === info.name,
-        );
-        if (meta.gitBranches.length === 0) delete meta.gitBranches;
-      }
-    }
+    // 仓列表没变：被测分支现在就能写。仓列表要换时等阶段 2（allowed set 是 next）
+    if (!pending) applyQaFeatureBranches(meta, input);
 
     meta.updatedAt = Date.now();
     await writeMeta(meta);
-    return await hydrateTask(meta);
+    if (!pending) {
+      return {
+        kind: "done" as const,
+        result: {
+          task: await hydrateTask(meta),
+          reposChanged: false,
+          unboundRepoPaths: [] as string[],
+        },
+      };
+    }
+    return { kind: "pending" as const, ...pending };
   });
+
+  if (!phase1) return null;
+  if (phase1.kind === "done") return phase1.result;
+
+  await syncTaskWorktreesToRepoPaths(
+    phase1.taskLike,
+    phase1.oldPaths,
+    phase1.nextPaths,
+  );
+
+  return withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    if (meta.runStatus === "running") {
+      throw new TaskFieldUpdateError("任务正在运行，不能改仓库", 409);
+    }
+    if (!sameRepoPathList(meta.repoPaths, phase1.oldPaths)) {
+      throw new TaskFieldUpdateError(
+        "仓库列表已被其他操作改过，请刷新后重试",
+        409,
+      );
+    }
+    const unboundRepoPaths = await applyRepoReplaceMeta(
+      meta,
+      phase1.nextPaths,
+      phase1.oldPaths,
+      input,
+    );
+    applyQaFeatureBranches(meta, input);
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return {
+      task: await hydrateTask(meta),
+      reposChanged: true,
+      unboundRepoPaths,
+    };
+  });
+};
 
 /**
  * chat 自动标题提交：锁内复查 titleAutoPending，仍为 true 才写标题并清挂起。

@@ -15,6 +15,7 @@ import type {
   CompanyEnvPg,
   CompanyEnvRedis,
   CompanyEnvServer,
+  CompanyEnvSls,
   CompanyEnvXxlJob,
 } from "./types";
 
@@ -27,6 +28,7 @@ export const emptyCompanyEnv = (): CompanyEnv => ({
   xxljob: [],
   nacos: [],
   elk: [],
+  sls: [],
   httpApis: [],
 });
 
@@ -127,7 +129,16 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
       baseUrl: "https://kibana-test.example.com",
       username: "readonly",
       password: "【填写】",
-      dataView: "app-logs-*",
+      dataView: "",
+    },
+  ],
+  sls: [
+    {
+      env: "test",
+      endpoint: "us-west-1.log.aliyuncs.com",
+      project: "example-project",
+      accessKeyId: "【填写】",
+      accessKeySecret: "【填写】",
     },
   ],
   httpApis: [
@@ -263,6 +274,15 @@ const normalizeElk = (o: Record<string, unknown>): CompanyEnvElk => ({
   dataView: asTrimmedString(o.dataView) ?? "",
 });
 
+const normalizeSls = (o: Record<string, unknown>): CompanyEnvSls => ({
+  env: instanceEnv(o),
+  endpoint: asTrimmedString(o.endpoint) ?? "",
+  project: asTrimmedString(o.project) ?? "",
+  accessKeyId: asTrimmedString(o.accessKeyId) ?? "",
+  accessKeySecret:
+    typeof o.accessKeySecret === "string" ? o.accessKeySecret : "",
+});
+
 /**
  * 归一 pg / nacos / elk 这三个多实例小节。
  *
@@ -371,6 +391,7 @@ export const normalizeCompanyEnv = (
     xxljob,
     nacos: normalizeInstanceList(o.nacos, "nacos", warnings, normalizeNacos),
     elk: normalizeInstanceList(o.elk, "elk", warnings, normalizeElk),
+    sls: normalizeInstanceList(o.sls, "sls", warnings, normalizeSls),
     httpApis,
   };
 };
@@ -391,6 +412,7 @@ const isFlowshipCompanyEnvShape = (raw: unknown): boolean => {
     "xxljob" in o ||
     "nacos" in o ||
     "elk" in o ||
+    "sls" in o ||
     "httpApis" in o
   );
 };
@@ -462,6 +484,9 @@ export const buildCompanyEnvBrief = (
   const pgRows = env.pg.filter((p) => p.host.trim());
   const nacosRows = env.nacos.filter((n) => n.baseUrl.trim());
   const elkCount = env.elk.filter((e) => e.baseUrl.trim()).length;
+  const slsCount = env.sls.filter(
+    (s) => s.endpoint.trim() && s.project.trim(),
+  ).length;
 
   const parts: string[] = [];
   if (serverCount > 0) parts.push("服务器");
@@ -506,6 +531,7 @@ export const buildCompanyEnvBrief = (
     );
   }
   if (elkCount > 0) parts.push("ELK");
+  if (slsCount > 0) parts.push("SLS");
   const httpApiCount = (env.httpApis ?? []).filter((h) =>
     h.url.trim(),
   ).length;
@@ -528,7 +554,7 @@ export const buildCompanyEnvBrief = (
 
 /**
  * 核心字段是否已配（推进弹窗缺配置提示用）。
- * 任一：有 host 的服务器 / PG host / XXL baseUrl / Nacos baseUrl / ELK baseUrl / HTTP url。
+ * 任一：有 host 的服务器 / PG host / XXL baseUrl / Nacos baseUrl / ELK baseUrl / SLS endpoint+project / HTTP url。
  */
 export const isCompanyEnvConfigured = (env: CompanyEnv | undefined): boolean => {
   if (!env) return false;
@@ -539,6 +565,7 @@ export const isCompanyEnvConfigured = (env: CompanyEnv | undefined): boolean => 
   if (env.xxljob.some((x) => x.baseUrl.trim())) return true;
   if (env.nacos.some((n) => n.baseUrl.trim())) return true;
   if (env.elk.some((e) => e.baseUrl.trim())) return true;
+  if (env.sls.some((s) => s.endpoint.trim() && s.project.trim())) return true;
   if ((env.httpApis ?? []).some((h) => h.url.trim())) return true;
   return false;
 };
@@ -653,6 +680,15 @@ export const companyEnvToEnvVars = (
     put(out, `${prefix}_DATA_VIEW`, e.dataView.trim());
   }
 
+  const slsCount = new Map<string, number>();
+  for (const s of env.sls) {
+    const prefix = instanceVarPrefix("SLS", s.env, slsCount);
+    put(out, `${prefix}_ENDPOINT`, s.endpoint.trim());
+    put(out, `${prefix}_PROJECT`, s.project.trim());
+    put(out, `${prefix}_ACCESS_KEY_ID`, s.accessKeyId.trim());
+    put(out, `${prefix}_ACCESS_KEY_SECRET`, s.accessKeySecret);
+  }
+
   const httpCount = new Map<string, number>();
   for (const h of env.httpApis ?? []) {
     const seg = envSegment(h.env || "API");
@@ -676,5 +712,6 @@ export const cloneCompanyEnv = (env: CompanyEnv): CompanyEnv => ({
   xxljob: env.xxljob.map((x) => ({ ...x })),
   nacos: env.nacos.map((n) => ({ ...n, namespaces: [...n.namespaces] })),
   elk: env.elk.map((e) => ({ ...e })),
+  sls: (env.sls ?? []).map((s) => ({ ...s })),
   httpApis: (env.httpApis ?? []).map((h) => ({ ...h })),
 });

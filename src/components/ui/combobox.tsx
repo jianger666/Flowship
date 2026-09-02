@@ -13,6 +13,7 @@
 import { useMemo } from "react";
 
 import { Picker } from "@/components/ui/picker";
+import { cn } from "@/lib/utils";
 
 interface ComboboxProps {
   value: string;
@@ -31,6 +32,8 @@ interface ComboboxProps {
   className?: string;
   /** 打在包 trigger 的那层。flex 行里跟固定宽 label 并排必须传 `w-auto min-w-0 flex-1` */
   wrapperClassName?: string;
+  /** 覆盖弹层宽度。默认至少 9rem，避免跟窄 trigger 锁死导致选项 / 搜索框折行。 */
+  contentClassName?: string;
 }
 
 export const Combobox = ({
@@ -45,6 +48,7 @@ export const Combobox = ({
   title,
   className,
   wrapperClassName,
+  contentClassName,
 }: ComboboxProps) => {
   const pickerOptions = useMemo(
     () => options.map((o) => ({ value: o, label: o })),
@@ -66,7 +70,8 @@ export const Combobox = ({
       title={title}
       className={className}
       wrapperClassName={wrapperClassName}
-      searchPlaceholder={allowCustom ? "搜索或输入自定义选项" : "搜索…"}
+      contentClassName={cn("min-w-36 max-w-none", contentClassName)}
+      searchPlaceholder={allowCustom ? "搜索或输入" : "搜索…"}
     />
   );
 };

@@ -370,6 +370,24 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 未发：环境配置加 SLS（2026-09-02）
+
+- 设置页环境配置在 ELK 下面加 **SLS**（endpoint / project / AccessKey），跟 ELK 同款多实例。凭据只进 company-env.json，不进 prompt。Logstore 不配，查询时再 List。
+- ELK 的 Data View 表单已去掉（本仓没有查询脚本读它）；旧配置读盘仍保留该字段。
+
+### 未发：任务可解绑仓库（2026-09-01）
+
+- **编辑任务**可以取消已绑仓库（至少留 1 个）。解绑不删 feature 分支、不关 MR。
+- 服务端整份替换 `repoPaths`：剪掉 5 张 per-repo map，独立按仓剪 `gitBranches`，清会话后下一个 Action 起新 agent。
+- 拆隔离工作区按**解绑前**的仓短名定位（同名仓的 `-2` 后缀）；只读 / 非 git 仓不拆。运行中改仓返回 409。
+- 两段锁：锁内快照 old/new 并落标题等非仓字段 → 锁外 git 拆/挪 → 再进锁 CAS `repoPaths` 仍是 old 才写仓列表。`addRepoPaths` 明确 400「已升级请刷新重试」。
+
+### 未发：测试任务切被测分支（2026-09-01）
+
+- **失败不再留脏工作区**：`prepareTestingTaskBranches` 在 checkout 失败 / 超时后 `reset --hard` 失败仓，并回滚已切成功的仓；`--track -b` 半截建出的本地分支会删掉。复位会 `clean -fd`，半截检出留下的未跟踪新文件（含编译产物）也会清掉。
+- **Maven `target/` 等未跟踪编译产物不挡推进**；真正的源码改动仍拒绝自动切，报错带上具体文件。
+- **git 明细写进事件流**：toast 仍只留第一行，事件流能看到路径 / stderr。checkout 超时从 15s 提到 60s。
+
 ### v1.9.5（2026-08-31）压缩过程行 / 上下文窗口纠偏 / Cursor SDK 1.0.30
 
 - **压缩过程行**：自定义 pi 的 `compaction_start/end` 与 Cursor SDK 的 `summary-started/summary/summary-completed` 走同一套 info（「正在压缩上下文…」→「已压缩上下文」）。压缩不是回合结束，不 flush 正在流的回复。Cursor 只在 SDK 真吐 summary 事件时出过程行，不再按 token 掉档伪造。

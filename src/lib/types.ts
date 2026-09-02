@@ -201,7 +201,7 @@ export const labelTeamCategoryBadge = (
 
 /**
  * 公司环境配置（设置页「环境配置」）
- * 排查类 skill / action 用：服务器 SSH、PG、日志路径、XXL-Job、Nacos、ELK。
+ * 排查类 skill / action 用：服务器 SSH、PG、日志路径、XXL-Job、Nacos、ELK、SLS。
  * 凭据只进 config.json / company-env.json，不进 prompt / 共享库。
  */
 export interface CompanyEnvServer {
@@ -258,7 +258,21 @@ export interface CompanyEnvElk {
   baseUrl: string;
   username: string;
   password: string;
+  /**
+   * 旧 Kibana Data View。本仓没有查询脚本读它，表单已隐藏；
+   * 读盘仍保留，避免已填的旧配置下次保存被抹掉。
+   */
   dataView: string;
+}
+
+/** 阿里云 SLS：GetLogs 用 endpoint + project + AK；Logstore 查询时再 List */
+export interface CompanyEnvSls {
+  env: string;
+  /** 公网接入点，如 us-west-1.log.aliyuncs.com（内网 endpoint 本机连不上） */
+  endpoint: string;
+  project: string;
+  accessKeyId: string;
+  accessKeySecret: string;
 }
 
 /**
@@ -306,6 +320,8 @@ export interface CompanyEnv {
   nacos: CompanyEnvNacos[];
   /** ELK / Kibana 实例（可多套） */
   elk: CompanyEnvElk[];
+  /** 阿里云 SLS 实例（可多套，按环境分） */
+  sls: CompanyEnvSls[];
   /** 业务 HTTP API（可多条） */
   httpApis: CompanyEnvHttpApi[];
 }
@@ -482,7 +498,7 @@ export interface FeAiFlowSettings {
    */
   teamKnowledgeEnabled?: boolean;
   /**
-   * 公司环境配置（服务器 / PG / 日志 / XXL / Nacos / ELK / HTTP API）。
+   * 公司环境配置（服务器 / PG / 日志 / XXL / Nacos / ELK / SLS / HTTP API）。
    * 排查类 action 用；运行时同步到 `<dataRoot>/company-env.json` 供 skill 读。
    */
   companyEnv?: CompanyEnv;

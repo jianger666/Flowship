@@ -19,8 +19,11 @@ process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 import {
   ensureTaskWorktrees,
   getTaskWorkRepoPaths,
+  getTaskWorktreesDir,
   removeTaskWorktrees,
+  syncTaskWorktreesToRepoPaths,
 } from "@/lib/server/task-worktrees";
+import { getUniqueRepoDirNames } from "@/lib/path-utils";
 import { resolveWkWorktreeBranchInfos } from "@/lib/server/wk-source-branch";
 
 const REPO = path.join(TMP_ROOT, "origin-repo");
@@ -464,5 +467,93 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(git(repo, "branch", "--show-current")).toBe("main");
 
     await removeTaskWorktrees(legacyTask);
+  });
+
+  it("同 basename 两仓解绑靠前的：按旧短名拆、剩余仓从 foo-2 挪到 foo", async () => {
+    const repoA = path.join(TMP_ROOT, "a", "app");
+    const repoB = path.join(TMP_ROOT, "b", "app");
+    for (const repo of [repoA, repoB]) {
+      await fs.mkdir(repo, { recursive: true });
+      git(repo, "init", "-b", "main");
+      git(repo, "config", "user.email", "t@t.local");
+      git(repo, "config", "user.name", "t");
+      await fs.writeFile(path.join(repo, "f.txt"), "x\n");
+      git(repo, "add", "-A");
+      git(repo, "commit", "-m", "init");
+    }
+    git(repoA, "checkout", "-b", "feature/unbind-a");
+    git(repoA, "checkout", "main");
+    git(repoB, "checkout", "-b", "feature/unbind-b");
+    git(repoB, "checkout", "main");
+
+    const oldPaths = [repoA, repoB];
+    const task = makeTask({
+      id: "t_1700000000009_samebase",
+      repoPaths: oldPaths,
+      repoBaseBranches: { [repoA]: "main", [repoB]: "main" },
+      gitBranches: [
+        { repoPath: repoA, name: "feature/unbind-a", baseBranch: "main" },
+        { repoPath: repoB, name: "feature/unbind-b", baseBranch: "main" },
+      ],
+    });
+    await markTaskAlive(task.id);
+    await ensureTaskWorktrees(task, () => true, {
+      branchSelection: {
+        kind: "explicit",
+        infos: [
+          { repoPath: repoA, name: "feature/unbind-a", baseBranch: "main" },
+          { repoPath: repoB, name: "feature/unbind-b", baseBranch: "main" },
+        ],
+      },
+    });
+
+    const oldNames = getUniqueRepoDirNames(oldPaths);
+    expect(oldNames).toEqual(["app", "app-2"]);
+    const taskDir = getTaskWorktreesDir(task.id);
+    expect(
+      await fs
+        .stat(path.join(taskDir, "app"))
+        .then(() => true)
+        .catch(() => false),
+    ).toBe(true);
+    expect(
+      await fs
+        .stat(path.join(taskDir, "app-2"))
+        .then(() => true)
+        .catch(() => false),
+    ).toBe(true);
+
+    await fs.writeFile(path.join(taskDir, "app", "wip.txt"), "dirty\n");
+    const sync = await syncTaskWorktreesToRepoPaths(task, oldPaths, [repoB]);
+    expect(sync.unboundRepos).toEqual([repoA]);
+    expect(sync.snapshotRepos).toContain(repoA);
+
+    expect(
+      await fs
+        .stat(path.join(taskDir, "app"))
+        .then(() => true)
+        .catch(() => false),
+    ).toBe(true);
+    expect(
+      await fs
+        .stat(path.join(taskDir, "app-2"))
+        .then(() => true)
+        .catch(() => false),
+    ).toBe(false);
+    expect(git(path.join(taskDir, "app"), "branch", "--show-current")).toBe(
+      "feature/unbind-b",
+    );
+    expect(git(repoA, "log", "feature/unbind-a", "-1", "--oneline")).toMatch(
+      /WIP/,
+    );
+
+    const remaining = makeTask({
+      ...task,
+      repoPaths: [repoB],
+      gitBranches: [
+        { repoPath: repoB, name: "feature/unbind-b", baseBranch: "main" },
+      ],
+    });
+    await removeTaskWorktrees(remaining);
   });
 });

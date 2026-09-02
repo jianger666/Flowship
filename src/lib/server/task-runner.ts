@@ -107,6 +107,7 @@ import {
   WorktreeLeaseLostError,
   type EnsureWorktreesOptions,
 } from "./task-worktrees";
+import { sameRepoPathList } from "@/lib/path-utils";
 import {
   SDK_CREATE_RESUME_TIMEOUT_MS,
   SDK_SEND_TIMEOUT_MS,
@@ -214,6 +215,7 @@ import type {
   ActionType,
   CustomActionDef,
   DevPushMode,
+  GitBranchInfo,
   RepoStatus,
   ReplanMode,
   Task,
@@ -265,6 +267,25 @@ export type SendTaskSessionResult =
 
 /** 路由文案单一来源（question / ask-reply 409） */
 export const TASK_OP_STALE_HTTP_MESSAGE = "正在停止/任务已变更、请重发";
+
+/** 测试任务切分支失败要把 git 明细写进事件流，toast 只留第一行。 */
+const runPrepareTestingTaskBranches = async (
+  task: Task,
+  lease: () => boolean,
+  onLeaseLost?: () => void,
+): Promise<GitBranchInfo[]> => {
+  try {
+    return await prepareTestingTaskBranches(task, lease);
+  } catch (err) {
+    if (err instanceof TestingBranchLeaseLostError) {
+      onLeaseLost?.();
+      throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
+    }
+    const text = err instanceof Error ? err.message : String(err);
+    await writeOwnedEventAndPublish(task.id, lease, { kind: "error", text });
+    throw err;
+  }
+};
 
 /**
  * advance / resume 在关键 await 后复查——stale 方**只抛错让位**，不再补偿写
@@ -1092,18 +1113,10 @@ const advanceTaskCore = async (
       () => !isTaskOpStale(task.id, opGen),
       { kind: "info", text: "正在准备被测业务分支…" },
     );
-    let infos;
-    try {
-      infos = await prepareTestingTaskBranches(
-        task,
-        () => !isTaskOpStale(task.id, opGen),
-      );
-    } catch (err) {
-      if (err instanceof TestingBranchLeaseLostError) {
-        throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
-      }
-      throw err;
-    }
+    const infos = await runPrepareTestingTaskBranches(
+      task,
+      () => !isTaskOpStale(task.id, opGen),
+    );
     for (const info of infos) {
       await upsertGitBranch(
         task.id,
@@ -1188,8 +1201,13 @@ const advanceTaskCore = async (
   // 用户勾「续用当前 agent」（reuseAgent）才续接——除了 ACTION_FRESH_AGENT_DEFAULT 里 true 的
   // action（review = 换人复审铁律）、勾了也压不掉。
   // 自定义 action 恒走内置默认（ACTION_FRESH_AGENT_DEFAULT.custom、定义里不再有 freshAgent 开关）
+  // 仓列表变了（编辑任务解绑 / 加仓）不能续旧会话：旧 agent cwd 指向已拆的 worktree。
+  const sessionRepos = agentSessions.get(task.id)?.repoPaths;
+  // 老会话没记 repoPaths：不能当成「没漂」续旧 cwd。缺字段或列表不一致都强制新 agent。
+  const reposDrifted =
+    !sessionRepos || !sameRepoPathList(sessionRepos, task.repoPaths);
   const effectiveForceNewAgent =
-    !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[actionType];
+    !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[actionType] || reposDrifted;
 
   // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
   //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites 看到的就是
@@ -1633,19 +1651,11 @@ const resumeCurrentActionCore = async (
     isTestingRequirementTask(startTask) &&
     testingTaskConfiguredBranchRepoPaths(startTask).length > 0
   ) {
-    let infos;
-    try {
-      infos = await prepareTestingTaskBranches(
-        startTask,
-        () => isOpOwner(opHandle),
-      );
-    } catch (err) {
-      if (err instanceof TestingBranchLeaseLostError) {
-        releaseTaskOpIf(opHandle);
-        throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
-      }
-      throw err;
-    }
+    const infos = await runPrepareTestingTaskBranches(
+      startTask,
+      () => isOpOwner(opHandle),
+      () => releaseTaskOpIf(opHandle),
+    );
     for (const info of infos) {
       await upsertGitBranch(fresh.id, info, () => isOpOwner(opHandle));
     }
@@ -3143,6 +3153,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               createdAt: Date.now(),
               lastActiveAt: Date.now(),
               startSnapshot: captureTaskFieldsSnapshot(task),
+              repoPaths: [...task.repoPaths],
             };
             if (
               !installSessionIfCurrent(
@@ -4967,6 +4978,7 @@ export const resumeTaskSession = async (
       createdAt: Date.now(),
       lastActiveAt: Date.now(),
       startSnapshot: captureTaskFieldsSnapshot(task),
+      repoPaths: [...task.repoPaths],
     };
 
     // install 前插桩；lease = handle current + 非终态（lifecycle）

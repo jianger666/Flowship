@@ -210,11 +210,10 @@ export const setTaskUiLayout = async (
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
  * 走 PATCH /api/tasks/[id]、字段语义：不传 = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
- * 可改：title / feishuStoryUrl / repoFeatureBranches；mode / model 不在此改
- *（model 是 SDK Run 启动时绑定的硬约束、改了只能换新 agent、走推进 dialog 的模型选择）。
- * V0.6.28：+ addRepoPaths 追加仓库（只增不删、生效于下一个 action）、新仓的
- * per-repo 快照（分支 / 模板 / check 命令）由调用方从 settings 取好随行传。
+ * 可改：title / feishuStoryUrl / repoFeatureBranches / repoPaths（整份替换、至少 1 仓）。
+ * mode / model 不在此改（model 是 SDK Run 启动时绑定的硬约束、改了只能换新 agent）。
  */
+/** 服务端还带 reposChanged / unboundRepoPaths，前端只用 task，这里剥成 Promise<Task> */
 export const updateTaskFields = async (
   id: string,
   patch: {
@@ -223,7 +222,7 @@ export const updateTaskFields = async (
     /** wk 需求编号：传值 = 改、传 null / 空串 = 清空回退派生值 */
     reqId?: string | null;
     repoFeatureBranches?: Record<string, string> | null;
-    addRepoPaths?: string[];
+    repoPaths?: string[];
     addRepoBaseBranches?: Record<string, string>;
     addRepoTestBranches?: Record<string, string>;
     addRepoDevBranches?: Record<string, string>;

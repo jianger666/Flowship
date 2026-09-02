@@ -33,6 +33,8 @@ import {
   setTaskUiLayout,
   taskVisibilityErrorResponse,
   updateTaskFields,
+  TaskFieldUpdateError,
+  appendEvent,
   writeDeleteTombstone,
   writeDeletionJournal,
 } from "@/lib/server/task-fs";
@@ -42,7 +44,7 @@ import {
   taskDir,
 } from "@/lib/server/task-fs-core";
 import { failpoint } from "@/lib/server/failpoints";
-import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
+import { abortRunningCheck, cancelTaskRun, closeTaskSession } from "@/lib/server/task-runner";
 import {
   cancelRestrictedQuestions,
   hasResourceJobs,
@@ -67,6 +69,7 @@ import {
 } from "@/lib/server/chat-gate";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
 import { isValidReqId } from "@/lib/req-id";
+import { WorktreeUnbindError } from "@/lib/server/task-worktrees";
 import { clearActionSideEffects } from "@/lib/server/action-side-effects";
 import {
   cleanupCheckpointRefsFromManifest,
@@ -217,8 +220,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       // wk 需求编号（手填、传 null / 空串 = 清空回退派生值）
       reqId?: string | null;
       repoFeatureBranches?: Record<string, string> | null;
-      // V0.6.28：中途追加仓库（只增不删）+ 新仓的 per-repo 快照（前端从 settings 取好传来）
-      addRepoPaths?: string[];
+      // 任务模式整份替换仓库 + 新仓的 per-repo 快照（前端从 settings 取好传来）
       addRepoBaseBranches?: Record<string, string>;
       addRepoTestBranches?: Record<string, string>;
       addRepoDevBranches?: Record<string, string>;
@@ -346,7 +348,16 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       return NextResponse.json({ task });
     }
 
+    // 老客户端仍发 addRepoPaths（已删的追加语义）——明确 400，别落到「需要 pinned/…之一」
+    if ("addRepoPaths" in body) {
+      return NextResponse.json(
+        { error: "已升级请刷新重试" },
+        { status: 400 },
+      );
+    }
+
     // V0.8：chat 模式选工作目录——替换 repoPaths（必须字符串数组、空数组 = 不绑工作目录）
+    // 任务模式走下面 updateTaskFields 整份替换（剪快照 / 拆 worktree），不能误打这条
     if ("repoPaths" in body) {
       const value = body.repoPaths;
       if (!Array.isArray(value) || !value.every((p) => typeof p === "string")) {
@@ -355,20 +366,25 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           { status: 400 },
         );
       }
-      const task = await setTaskRepoPaths(id, value);
-      if (!task)
+      const current = await getTask(id);
+      if (!current)
         return NextResponse.json({ error: "not_found" }, { status: 404 });
-      return NextResponse.json({ task });
+      if (current.mode === "chat") {
+        const task = await setTaskRepoPaths(id, value);
+        if (!task)
+          return NextResponse.json({ error: "not_found" }, { status: 404 });
+        return NextResponse.json({ task });
+      }
+      // task 模式：不 return，落入编辑字段分支
     }
 
-    // V0.6.6：编辑任务的建任务字段（title / feishuStoryUrl / repoFeatureBranches、可一次传多个）
-    // V0.6.28：+ addRepoPaths 追加仓库（只增不删、新仓快照随行）
+    // V0.6.6：编辑任务的建任务字段（title / feishuStoryUrl / repoFeatureBranches / repoPaths）
     const editKeys = [
       "title",
       "feishuStoryUrl",
       "reqId",
       "repoFeatureBranches",
-      "addRepoPaths",
+      "repoPaths",
     ] as const;
     if (editKeys.some((k) => k in body)) {
       if ("title" in body && typeof body.title !== "string") {
@@ -392,18 +408,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           );
         }
       }
-      if (
-        "addRepoPaths" in body &&
-        !(
-          Array.isArray(body.addRepoPaths) &&
-          body.addRepoPaths.every((p) => typeof p === "string" && p.trim())
-        )
-      ) {
-        return NextResponse.json(
-          { error: "addRepoPaths 必须是非空字符串数组" },
-          { status: 400 },
-        );
-      }
       // 日常/需求身份（有无飞书链接）创建时定死、编辑禁止有↔无；可改具体链接
       if ("feishuStoryUrl" in body) {
         const current = await getTask(id);
@@ -420,7 +424,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
         }
       }
       try {
-        const task = await updateTaskFields(id, {
+        const result = await updateTaskFields(id, {
           title: body.title,
           // 用户手动改名 → 清掉自动标题挂起，避免 SDK 结果事后覆盖用户起的名
           ...(typeof body.title === "string"
@@ -429,16 +433,44 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           feishuStoryUrl: body.feishuStoryUrl,
           reqId: body.reqId,
           repoFeatureBranches: body.repoFeatureBranches,
-          addRepoPaths: body.addRepoPaths,
+          repoPaths: body.repoPaths,
           addRepoBaseBranches: body.addRepoBaseBranches,
           addRepoTestBranches: body.addRepoTestBranches,
           addRepoDevBranches: body.addRepoDevBranches,
           addRepoBranchTemplates: body.addRepoBranchTemplates,
         });
-        if (!task)
+        if (!result)
           return NextResponse.json({ error: "not_found" }, { status: 404 });
-        return NextResponse.json({ task });
+        if (result.reposChanged) {
+          // 锁外关内存会话（锁内写过 sessionAgentId=undefined；close 再清一次无害）
+          closeTaskSession(id, undefined, { reap: false });
+          if (result.unboundRepoPaths.length > 0) {
+            const names = result.unboundRepoPaths.map(
+              (p) => p.split(/[/\\]/).filter(Boolean).pop() ?? p,
+            );
+            await appendEvent(
+              id,
+              {
+                kind: "info",
+                text: `已解绑 ${names.join("、")}，隔离工作区已清理`,
+              },
+              undefined,
+              (event) =>
+                publishTaskStreamEvent(id, { kind: "event", event }),
+            );
+          }
+        }
+        return NextResponse.json({ task: result.task });
       } catch (err) {
+        if (err instanceof TaskFieldUpdateError) {
+          return NextResponse.json(
+            { error: err.message },
+            { status: err.httpStatus },
+          );
+        }
+        if (err instanceof WorktreeUnbindError) {
+          return NextResponse.json({ error: err.message }, { status: 500 });
+        }
         // updateTaskFields 身份闸门抛错 → 透传文案给前端 toast
         if (
           err instanceof Error &&
@@ -457,6 +489,15 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       { status: 400 },
     );
   } catch (err) {
+    if (err instanceof TaskFieldUpdateError) {
+      return NextResponse.json(
+        { error: err.message },
+        { status: err.httpStatus },
+      );
+    }
+    if (err instanceof WorktreeUnbindError) {
+      return NextResponse.json({ error: err.message }, { status: 500 });
+    }
     console.error("[PATCH /api/tasks/[id]] failed", err);
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }

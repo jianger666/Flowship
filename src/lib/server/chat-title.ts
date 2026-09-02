@@ -145,7 +145,7 @@ const runGenerateChatTitle = async (
     const cleared = await updateTaskFields(taskId, {
       titleAutoPending: false,
     });
-    if (cleared) publish(taskId, { kind: "task", task: cleared });
+    if (cleared) publish(taskId, { kind: "task", task: cleared.task });
     return;
   }
   if (outcome.kind === "empty") return;
@@ -157,7 +157,7 @@ const runGenerateChatTitle = async (
     const cleared = await updateTaskFields(taskId, {
       titleAutoPending: false,
     });
-    if (cleared) publish(taskId, { kind: "task", task: cleared });
+    if (cleared) publish(taskId, { kind: "task", task: cleared.task });
     return;
   }
 

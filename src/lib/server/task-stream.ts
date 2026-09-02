@@ -114,6 +114,8 @@ export interface AgentSessionRecord {
   lastActiveAt: number;
   // V0.6.6 热更快照（原挂 RunningTaskRecord、会话跨 run 后归会话所有）
   startSnapshot: TaskFieldsSnapshot;
+  /** 本会话创建时绑定的仓列表；缺省 = 老会话、不据此强制换 agent */
+  repoPaths?: string[];
 }
 
 // V0.8.18：一个 action 正在后台跑的后置 check 句柄（见 task-runner 的 runActionPostCheck）

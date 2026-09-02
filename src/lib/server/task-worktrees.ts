@@ -225,6 +225,45 @@ export const getWorktreesRoot = (): string => path.join(dataRoot(), "worktrees")
 export const getTaskWorktreesDir = (taskId: string): string =>
   path.join(getWorktreesRoot(), taskId);
 
+/**
+ * 解绑 / 改仓时 worktree 目录怎么变（纯函数、按旧列表短名定位）。
+ *
+ * 短名由 getUniqueRepoDirNames 按序分配：["a/foo","b/foo"] → foo / foo-2。
+ * 删掉 a/foo 后新列表 ["b/foo"] 会重算成 foo，但磁盘上还在 foo-2——
+ * 必须先按旧名拆已解绑的，再把仍绑着的仓从旧名挪到新名。
+ */
+export const planWorktreeDirChanges = (
+  oldRepoPaths: string[],
+  newRepoPaths: string[],
+): {
+  remove: Array<{ repoPath: string; dirName: string }>;
+  relocate: Array<{ repoPath: string; fromName: string; toName: string }>;
+} => {
+  const oldNames = getUniqueRepoDirNames(oldRepoPaths);
+  const newNames = getUniqueRepoDirNames(newRepoPaths);
+  const newSet = new Set(newRepoPaths);
+  const remove = oldRepoPaths.flatMap((repoPath, i) =>
+    newSet.has(repoPath) ? [] : [{ repoPath, dirName: oldNames[i]! }],
+  );
+  const oldIndex = new Map(oldRepoPaths.map((p, i) => [p, i] as const));
+  const relocate: Array<{
+    repoPath: string;
+    fromName: string;
+    toName: string;
+  }> = [];
+  for (let i = 0; i < newRepoPaths.length; i++) {
+    const repoPath = newRepoPaths[i]!;
+    const oi = oldIndex.get(repoPath);
+    if (oi === undefined) continue;
+    const fromName = oldNames[oi]!;
+    const toName = newNames[i]!;
+    if (fromName !== toName) {
+      relocate.push({ repoPath, fromName, toName });
+    }
+  }
+  return { remove, relocate };
+};
+
 // 路径归一：反斜杠转正斜杠 + 去尾斜杠（对齐 path-utils 的比较口径）
 const normPath = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, "");
 
@@ -371,16 +410,62 @@ const pathExists = async (p: string): Promise<boolean> => {
 };
 
 /**
+ * `git worktree add` 失败 stderr 是否在说「分支已被某 worktree 占用」。
+ * 英文两套 + 中文常见译法都要认，否则 LANG=zh_CN 时孤儿自愈整段跳过。
+ */
+export const isWorktreeOccupancyStderr = (stderr: string): boolean =>
+  /already checked out|already used by worktree|已经检出|已经被工作区|已由工作区使用/i.test(
+    stderr,
+  );
+
+/**
  * 从 `git worktree add` 失败 stderr 解析占用方路径。
- * 兼容两套文案：`already checked out at '<path>'` /
+ * 英文：`already checked out at '<path>'` /
  * `'<branch>' is already used by worktree at '<path>'`。
+ * 中文 git.po：`已经检出到` / `已经在 'path' 检出`。
  */
 export const parseOccupyingWorktreePath = (stderr: string): string | null => {
-  const m = stderr.match(
+  const patterns = [
     /already (?:checked out|used by worktree) at ['"]?(.+?)['"]?\s*$/im,
-  );
-  const p = m?.[1]?.trim();
-  return p || null;
+    /已经检出到\s*['「"]?(.+?)['」"]?\s*$/im,
+    /已经在\s*['「"](.+?)['」"]\s*检出/im,
+    /已被工作区使用于\s*['"]?(.+?)['"]?\s*$/im,
+    /已经被工作区 ['"](.+?)['"] 使用/im,
+  ];
+  for (const re of patterns) {
+    const m = stderr.match(re);
+    const p = m?.[1]?.trim().replace(/[」'"]+$/, "");
+    if (p) return p;
+  }
+  return null;
+};
+
+/** stderr 里第一对单引号通常是被占用的分支名 */
+const parseQuotedBranchFromStderr = (stderr: string): string | null => {
+  const m = stderr.match(/'([^']+)'/);
+  return m?.[1]?.trim() || null;
+};
+
+/** 文案正则吃不准时，用 `worktree list` 按分支名找占用路径 */
+const findWorktreePathForBranch = async (
+  repoPath: string,
+  branch: string,
+): Promise<string | null> => {
+  const listed = await runGit(repoPath, ["worktree", "list", "--porcelain"]);
+  if (!listed.ok) return null;
+  const want = branch.startsWith("refs/heads/")
+    ? branch
+    : `refs/heads/${branch}`;
+  let currentPath = "";
+  for (const line of listed.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      currentPath = line.slice("worktree ".length).trim();
+    } else if (line.startsWith("branch ") && currentPath) {
+      const ref = line.slice("branch ".length).trim();
+      if (ref === want || ref === branch) return currentPath;
+    }
+  }
+  return null;
 };
 
 /**
@@ -418,8 +503,13 @@ const tryReleaseDeletedTaskOrphan = async (
   repoPath: string,
   stderr: string,
 ): Promise<boolean> => {
-  if (!/already checked out|already used by worktree/i.test(stderr)) return false;
-  const occupying = parseOccupyingWorktreePath(stderr);
+  if (!isWorktreeOccupancyStderr(stderr)) return false;
+  let occupying = parseOccupyingWorktreePath(stderr);
+  // 中文/未知 locale 路径解析失败时，按引号里的分支名去 list 里找占用方
+  if (!occupying) {
+    const branch = parseQuotedBranchFromStderr(stderr);
+    if (branch) occupying = await findWorktreePathForBranch(repoPath, branch);
+  }
   if (!occupying) return false;
   if (!(await isDeletedTaskOrphanWorktree(occupying))) return false;
   console.log(
@@ -712,6 +802,8 @@ const ensureTaskWorktreesInner = async (ctx: {
   await failpoint("ensure.beforeMkdir");
   assertLease();
   await fs.mkdir(getTaskWorktreesDir(task.id), { recursive: true });
+  // 解绑后残留的旧短名目录（活任务开机孤儿扫描扫不到）
+  await pruneUnmappedTaskWorktreeDirs(task);
 
   /** 失主：补偿本轮新建后抛让位错 */
   const yieldAfterCompensate = async (): Promise<never> => {
@@ -1102,7 +1194,7 @@ const ensureTaskWorktreesInner = async (ctx: {
       // 旧文案 `already checked out`；git 2.4x+ 部分场景改成
       // `'<branch>' is already used by worktree at '<path>'`——两套都要认，否则用户看不到中文处置提示。
       //（不提「改用直接在原仓库运行」——isolateWorktree 建完没有入口能改、提了也做不到）
-      const hint = /already checked out|already used by worktree/i.test(added.stderr)
+      const hint = isWorktreeOccupancyStderr(added.stderr)
         ? "——该分支已在原仓库或其它任务的工作区检出：去原仓库把这个分支切走（checkout 别的分支）、或删掉占用它的任务后重试；若本机还开着另一个实例（正式 / test）、检查是否它的工作区占用了该分支"
         : "";
       throw new Error(
@@ -1382,6 +1474,198 @@ export const removeTaskWorktrees = async (
   // 容器目录清空后移除（还有残留就留着、不 force 递归删以防误伤）
   await fs.rmdir(taskDir).catch(() => {});
   return { removedAny, snapshotRepos, snapshotFailedRepos };
+};
+
+/** 用户主动解绑时拆 / 挪 worktree 失败——调用方不得写 meta */
+export class WorktreeUnbindError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreeUnbindError";
+  }
+}
+
+export type SyncTaskWorktreesResult = {
+  unboundRepos: string[];
+  snapshotRepos: string[];
+  snapshotFailedRepos: string[];
+};
+
+/**
+ * 用户主动改仓：按旧短名拆已解绑仓的 worktree，再把仍绑着的仓挪到新短名。
+ * 只读 / 非 git 从没建过 worktree，跳过（候选目录不存在也跳过，绝不对原仓下手）。
+ * WIP 快照失败仍强制拆（对齐 removeTaskWorktrees）。拆 / 挪失败抛错。
+ */
+export const syncTaskWorktreesToRepoPaths = async (
+  t: WorktreeTaskLike,
+  oldRepoPaths: string[],
+  newRepoPaths: string[],
+): Promise<SyncTaskWorktreesResult> => {
+  const oldLike: WorktreeTaskLike = { ...t, repoPaths: oldRepoPaths };
+  const unboundRepos = oldRepoPaths.filter((p) => !newRepoPaths.includes(p));
+  const empty: SyncTaskWorktreesResult = {
+    unboundRepos,
+    snapshotRepos: [],
+    snapshotFailedRepos: [],
+  };
+  if (!isWorktreeTask(oldLike)) return empty;
+
+  const taskDir = getTaskWorktreesDir(t.id);
+  const planned = planWorktreeDirChanges(oldRepoPaths, newRepoPaths);
+  const snapshotRepos: string[] = [];
+  const snapshotFailedRepos: string[] = [];
+
+  const forceRemove = async (
+    repoPath: string,
+    workDir: string,
+  ): Promise<void> => {
+    if (!(await pathExists(workDir))) return;
+    const snap = await snapshotDirtyWorktree(workDir);
+    if (snap === "snapshotted") snapshotRepos.push(repoPath);
+    else if (snap === "failed") {
+      console.warn(
+        `[task-worktrees] 解绑仓 WIP 快照失败、仍强制删除 worktree：${workDir}`,
+      );
+      snapshotFailedRepos.push(repoPath);
+    }
+    const removed = await runGit(
+      repoPath,
+      ["worktree", "remove", "--force", workDir],
+      60_000,
+    );
+    if (!removed.ok) {
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      await runGit(repoPath, ["worktree", "prune"]);
+    }
+    if (await pathExists(workDir)) {
+      throw new WorktreeUnbindError(
+        `无法拆掉隔离工作区 ${workDir}：${removed.stderr || removed.stdout || "目录仍在"}`,
+      );
+    }
+  };
+
+  for (const item of planned.remove) {
+    if (skipsWorktreeIsolation(oldLike, item.repoPath)) continue;
+    await forceRemove(item.repoPath, path.join(taskDir, item.dirName));
+  }
+
+  const moves = planned.relocate.filter(
+    (m) => !skipsWorktreeIsolation(oldLike, m.repoPath),
+  );
+  const pending: Array<{
+    repoPath: string;
+    from: string;
+    to: string;
+  }> = [];
+  for (const m of moves) {
+    const from = path.join(taskDir, m.fromName);
+    const to = path.join(taskDir, m.toName);
+    if (!(await pathExists(from))) continue;
+    pending.push({ repoPath: m.repoPath, from, to });
+  }
+
+  const fromBasenames = new Set(pending.map((m) => path.basename(m.from)));
+  const conflict = pending.some((m) => fromBasenames.has(path.basename(m.to)));
+  const moveOne = async (
+    repoPath: string,
+    from: string,
+    to: string,
+  ): Promise<void> => {
+    const moved = await runGit(repoPath, ["worktree", "move", from, to], 60_000);
+    if (!moved.ok || !(await pathExists(to))) {
+      throw new WorktreeUnbindError(
+        `无法移动隔离工作区 ${from} → ${to}：${moved.stderr || moved.stdout || "目标不存在"}`,
+      );
+    }
+  };
+
+  if (!conflict) {
+    for (const m of pending) {
+      await moveOne(m.repoPath, m.from, m.to);
+    }
+  } else {
+    const stamp = `${process.pid}-${Date.now()}`;
+    const temps: Array<{
+      repoPath: string;
+      temp: string;
+      from: string;
+      to: string;
+    }> = [];
+    try {
+      for (const m of pending) {
+        const temp = `${m.from}.reloc-${stamp}`;
+        await moveOne(m.repoPath, m.from, temp);
+        temps.push({ ...m, temp });
+      }
+      for (const x of temps) {
+        await moveOne(x.repoPath, x.temp, x.to);
+      }
+    } catch (err) {
+      for (const x of temps) {
+        if (await pathExists(x.temp)) {
+          await runGit(x.repoPath, ["worktree", "move", x.temp, x.from], 60_000);
+        }
+      }
+      throw err;
+    }
+  }
+
+  return { unboundRepos, snapshotRepos, snapshotFailedRepos };
+};
+
+/**
+ * 活任务兜底：容器里有、但不在当前短名映射里的子目录（解绑后残留的 foo-2）。
+ * 开机孤儿扫描扫不到活 taskId 目录，所以 ensure 时自己剪。
+ * `.reloc-*` 是两阶段挪目录的临时名，不动（失败回滚后还可能在）。
+ */
+const pruneUnmappedTaskWorktreeDirs = async (
+  t: WorktreeTaskLike,
+): Promise<void> => {
+  if (!isWorktreeTask(t)) return;
+  const taskDir = getTaskWorktreesDir(t.id);
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(taskDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const names = getUniqueRepoDirNames(t.repoPaths);
+  const keep = new Set(
+    t.repoPaths
+      .map((p, i) => (skipsWorktreeIsolation(t, p) ? null : names[i]))
+      .filter((n): n is string => Boolean(n)),
+  );
+  for (const e of entries) {
+    if (!e.isDirectory() || keep.has(e.name)) continue;
+    if (e.name.includes(".reloc-")) continue;
+    const workDir = path.join(taskDir, e.name);
+    let repoPath = "";
+    try {
+      const gitFile = await fs.readFile(path.join(workDir, ".git"), "utf8");
+      const mainGitDir = parseMainGitDirFromPointer(gitFile);
+      if (mainGitDir) repoPath = path.dirname(mainGitDir);
+    } catch {
+      /* 不是 worktree 指针、下面 rm 兜底 */
+    }
+    const snap = await snapshotDirtyWorktree(workDir);
+    if (snap === "failed") {
+      console.warn(
+        `[task-worktrees] 未映射 worktree WIP 快照失败、仍强制删除：${workDir}`,
+      );
+    }
+    if (repoPath) {
+      const removed = await runGit(
+        repoPath,
+        ["worktree", "remove", "--force", workDir],
+        60_000,
+      );
+      if (!removed.ok) {
+        await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+        await runGit(repoPath, ["worktree", "prune"]);
+      }
+    } else {
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
 };
 
 /**

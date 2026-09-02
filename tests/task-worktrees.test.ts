@@ -48,9 +48,11 @@ import {
   isWorktreeTask,
   parseMainGitDirFromPointer,
   parseOccupyingWorktreePath,
+  isWorktreeOccupancyStderr,
   planWorktreeBranchInfos,
   resolveOriginalRepoPath,
   resolveTaskIsolateWorktree,
+  planWorktreeDirChanges,
 } from "@/lib/server/task-worktrees";
 import {
   formatRepoSectionForPrompt,
@@ -422,6 +424,17 @@ describe("getUniqueRepoDirNames / getRepoWorkDirs / formatRepoSection / storyId"
     ]);
   });
 
+  it("解绑同 basename 的靠前仓：按旧短名拆、剩余仓从 foo-2 挪到 foo", () => {
+    const planned = planWorktreeDirChanges(
+      ["/a/foo", "/b/foo"],
+      ["/b/foo"],
+    );
+    expect(planned.remove).toEqual([{ repoPath: "/a/foo", dirName: "foo" }]);
+    expect(planned.relocate).toEqual([
+      { repoPath: "/b/foo", fromName: "foo-2", toName: "foo" },
+    ]);
+  });
+
   it("getRepoWorkDirs：多仓给各自项目根、绝不给公共父目录（IDE 打开用）", () => {
     // 非隔离多仓：workCwd 是公共父（D:/IdeaProjects）、必须逐仓返原仓路径
     expect(
@@ -565,6 +578,27 @@ describe("parseOccupyingWorktreePath（git worktree add 占用路径）", () => 
 
   it("无占用路径文案 → null", () => {
     expect(parseOccupyingWorktreePath("fatal: invalid reference")).toBeNull();
+  });
+
+  it("中文 git：已经检出到", () => {
+    expect(
+      parseOccupyingWorktreePath(
+        "fatal: 'feature/888888' 已经检出到 '/data/worktrees/t_old/origin-repo'",
+      ),
+    ).toBe("/data/worktrees/t_old/origin-repo");
+    expect(
+      isWorktreeOccupancyStderr(
+        "fatal: 'feature/888888' 已经检出到 '/data/worktrees/t_old/origin-repo'",
+      ),
+    ).toBe(true);
+  });
+
+  it("中文 git：已经在 path 检出", () => {
+    expect(
+      parseOccupyingWorktreePath(
+        "fatal: 'feature/x' 已经在 '/data/worktrees/t1/crm-web' 检出",
+      ),
+    ).toBe("/data/worktrees/t1/crm-web");
   });
 });
 

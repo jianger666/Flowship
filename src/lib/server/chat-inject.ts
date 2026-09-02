@@ -478,7 +478,7 @@ const runChatReplyInject = async (
     if (derived) {
       const renamed = await updateTaskFields(task.id, { title: derived });
       if (renamed) {
-        publishTaskStreamEvent(task.id, { kind: "task", task: renamed });
+        publishTaskStreamEvent(task.id, { kind: "task", task: renamed.task });
         task.title = derived;
       }
     }
