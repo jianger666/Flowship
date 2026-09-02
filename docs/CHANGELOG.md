@@ -15,6 +15,24 @@
 
 ---
 
+### v1.9.4（2026-08-27）WK 激活 / Windows 更新对齐 mac / 本版更新弹窗 / 空对话复用
+
+- **启动「激活项目」**：需求任务 + Hub 已配 + 未填 REQ-ID 时可勾选，填语义编码 / 需求方 / 技术 Owner / 上线日，服务端查重再 `activate`，编号回写任务。Token 不进客户端。
+- **Windows 自更新**：点右上角确认一次后下载完直接 `quitAndInstall`，去掉第二次系统框；`autoInstallOnAppQuit=false`，关应用不再静默卸装。
+- **本版更新**：升完版第一次打开弹 3～5 条人话（`src/lib/whats-new.ts`）；设置页版本号旁可再打开。首次安装只记账不弹。
+- **空对话草稿复用**：chat 没发过消息时，再点新建 / Cmd+N / 切仓再开都回到那条空草稿，不堆空窗口。
+- **唤醒后输入条误开**：失败后再说「请继续」，question 接口曾在写成 running 前就 200 带回失败快照，详情页不锁输入、再发被 409。现等到 running 落盘再返回；过期 done 不得盖回失败态。
+- **答题卡提交**：成功后用接口返回的 task 立刻收卡（不单等 SSE）；超过 30s 只切「投递中」、不 abort 在飞请求。模型提问后仍按正常流程自己结束本轮，再 send 答案。
+- **疑似卡住**：按事件流末条 / 流式输出是否超过 5 分钟没动来判，不再用 `task.updatedAt`（列表节流字段、客户端 append 事件也不 bump），避免 AI 一直在写代码却误报卡住。有未答提问（`findPendingAskEvent`）不亮——提问后 `runStatus` 仍是 running，那是在等你。
+- **系统工具改 SDK customTools**：`ask_user` / `submit_work` 等走 `local.customTools`（合成名 `custom-user-tools`），与 pi 共用 `flowship-tools.ts`。用户 MCP 仍 `mcpServers`。oneshot / 群答疑不传 `callerToken`、不挂这些工具。HTTP `/api/mcp/chat-tool` 与 `chat-mcp.ts` 已删。
+- **自定义模型识图**：pi 不再一律 `input: ["text"]`。按 models.dev 的 `attachment` / `modalities.input` 标图像能力（同 id 多来源 OR，防 huggingface 纯文本条盖掉官方多模态）；`glm-5.3-flash` 这类才能把 `read` 到的图送进请求。目录没命中仍当纯文本。Cursor SDK 路径不改。
+- **ask_user 同一轮等答案**：提问成功后工具立刻返回一条前台 `curl`（`/api/tasks/:id/ask-wait`）。curl 挂上则用户答案写进 stdout、本轮继续；没挂上仍走原来的 `send`。答题卡可点时 curl 往往还没挂上：秒答先压在槽里等 curl（约 15s），挂上立刻写入同一轮；超时才 send，避免「上一轮尚未结束」+ 410 再唤醒新 agent。提问后不 `run.cancel()`、也不把 `runStatus` 切成 awaiting_user——等答案靠 curl 阻塞。底部输入条在未答提问期间仍可打字回车（不换成停止键），等同隐式跳过这张卡：跳过正文写进同一轮 curl，不 send、不入队。自定义模型这条 shell 超时抬到 24h。等答案那条 curl 不进事件流（落盘可审计）：显示过滤收口在 `isHiddenFromEventStream`（muted / 跳过过期标记 / ask-wait shell / 回合内工具 error / chat boot 噪声）。`submit_work` 仍非阻塞，不复活 `wait-ack` / `wait_for_user`。24h 硬超时未答：写作废标记 `askExpired`，答题卡收成一行「已过期」（可展开看原题），悬浮条 / 侧栏待回答熄灭；再提交 toast「这组提问已过期，请在下方继续」。
+- **偏好收口**：菜单栏图标 / 开机自启动 / 插电防休眠进设置→偏好；删掉假的「Agent shell 提速」；Windows 仍可切 Git Bash。
+- **task 提示词去重**：交卷协议只留 `_super.md`「核心机制」+ 关键规则一句指针；各 action playbook 收尾改成「按 super 交卷」。
+- **启动表单 Form/Field**：disabled / invalid 下钻，缺项红字写在标题右侧。
+- **侧栏对话序**：按仓库分组保留；组间 / 组内改为粘性序，不再跟 agent 流式 `updatedAt` 对跳。新建或用户发送才把该对话（及其仓组）顶到上面；转圈 / 相对时间仍原地更新。工作台时间桶不变。
+- **chat 新会话接续历史**：resume 失败 / 懒重启 / 空闲回收后起新会话时，把最近至多 12 轮 `user_reply` / `assistant_message` 正文写入起手 prompt（约 12k 字符封顶），标明「接续不是新开」。resume 成功不加。自定义 pi 对缺失 / 空会话文件改为抛错，避免静默空会话只带当前句。
+
 ### v1.9.3（2026-08-26）流式吐字丝滑化
 
 - **流式合帧**：服务端 `assistant_delta` 按 70ms / 240B 合帧；客户端 rAF 合帧 + 自适应平滑追赶。ChatView 与任务详情页共用 `use-smooth-streaming`。
