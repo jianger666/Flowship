@@ -319,7 +319,7 @@ ai-flow-action-hub/
 | 成员注册表 | `feishu-group-registry.ts` | **建群是唯一能带人 / 带 bot 的时机**（事后拉人缺 scope）——按工作项角色成员邮箱反查，一次把人和他们各自的 bot 带齐 |
 | 回流（入）| `feishu-bridge/group-route.ts` | 群消息 → 任务：三层 @ 过滤 → chat_id 反查本机任务 → 推进命令 / 答题 / 消息注入 |
 | 出向 | `feishu-bridge/group-outbound.ts` | 全局 task 流 tap：ask 卡发群、回答回群（`post` markdown）、推进产物回群 |
-| 提测 @ 测试 | `feishu-bridge/group-tester-notify.ts` + 工具 `notify_group_testers` | ship 写完飞书评论后由 agent 调；换 open_id 后走 `shareToRequirementGroup({ format: "post" })`；没群 / bot 不在群返回 skipped，不阻塞 |
+| 提测 @ 测试 | `feishu-bridge/group-tester-notify.ts` + 工具 `notify_group_testers` | ship 写完飞书评论后由 agent 调；只认邮箱走提测通知卡（卡片 `<at email>` 真 @）；没群 / bot 不在群返回 skipped，不阻塞 |
 | 自动播报 | `feishu-bridge/group-broadcast.ts` | app 内 action 跑完自动进群（`off` / `ship` / `all` 三档、当前固定 `off`、**绝不建群**）|
 | 共享状态 | `feishu-bridge/group-shared.ts` | 回群登记表 + 产物卡防重 + 选择卡防重 + 群成员名清洗 |
 
@@ -371,22 +371,22 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v1.9.7（未发布）对话遥控器 / 通用@ / 提测收尾 / OOM 轮换
+
+- **对话遥控器 `/chats` + `/model`**：手机（机器人单聊）看电脑的聊天、切对话、新对话、换模型、搜。直接打字仍续聊当前对话（p2p 原路由不动）；遥控器只给“当前对话指针”配 UI。模型候选 = 默认 1 个 + 星标最多 2 个（设置页现成）+ 【全部模型】（现拉，有在途去重）；新对话默认跟随当前仓库；列表默认只看活跃 + 归档开关；搜只搜标题/仓库/模型（关键词 50 字截断，附件优先、flag 留给下一条纯文本）。卡片 value 只带参数、点击时重算，不做终态 patch；伪造回调有 parse 白名单 + 候选白名单两道（`checkPanelModelId` / `isAllowedPanelRepo`，fail-closed）；`takeAwaitingChatSearch` 热路径先无锁 peek。入口另有 `/help` 面板两颗按钮；聊天框 `/` 指令菜单要去开放平台控制台手动配。
+- **通用 `at: string[]`**：`share_to_group` 加名字/邮箱直 @，卡片正文前拼 `<at email>` 并推送；精确匹配才 @（角色成员 + 注册表现查，打包一次 `user search` 兜底），每次现查不落表；换不出/重名进回执 `at.unresolved`，`artifact` 无正文与 `post` 走 mentions 都回 `unsupported`，不静默吞。超长正文先拼标签再截断（@ 签在最前不断）。
+- **提测链路收尾**：`post + open_id` 降级链删除，只认邮箱（没邮箱进 missed）；MR 按钮 4→10（通用卡 `LINK_BUTTON_MAX` 同步 6→10），超的进正文（提测全列、播报拼进 md 文件）；发送失败退坑可重调一次（成功/超时仍占位防双 @，回 `skipped_duplicate` 说明已发出）。`prompts/action-ship.md` 与 HANDOFF 口径已对齐卡片。
+- **需求群卡片清理**：去掉「查看工作项」按钮（群里人都知道是哪个需求）；`storyUrl` 参数保留但忽略（废弃注释），无生产调用者、`post` 形态标 deprecated 留作储备。
+- **OOM 根治（chat 链）**：会话 input 累计水位 200 万触发轮换（复用懒重启分支，不新增路径；老任务用 total 估算、转一次自愈）；Electron 壳 server 默认 `--max-old-space-size=4096`（已有手工值不动）。缺口：只保 chat，`task-runner` 长 build 暂不轮换；换 SDK 大版本时重校水位口径（input 含/不含 cache 漂移）。
+- **UI**：`FeatureBranchesField` 新建/编辑两处分支行抽共用（`min-w-0` 防长名顶穿）。
+
 ### v1.9.6（2026-09-02）提测群 @ 测试 / 群答疑 markdown / 解绑仓库 / SLS / 测试切分支
 
-- **提测群 @ 测试**：工作项评论 @ 测试仍不推飞书通知。ship 写完评论后 agent 调 `notify_group_testers`，用注册表把测试人员邮箱换成 IM `open_id` 做真 @（会推提及）。发到需求群统一走 `shareToRequirementGroup`：分享 / 产物是 `format: "card"`，提测 @ 是 `format: "post"` + `mentions`（方法拼 `<at>`）。没绑群、本机 bot 不在群、对不上人、MR 有冲突：工具返回 `skipped_*`，不报错、不弹「加机器人」、不阻塞交卷。不是交卷后系统偷发——和飞书评论同一拍、事件流里能看见这次工具调用。
+- **提测群 @ 测试**：工作项评论 @ 测试仍不推飞书通知。ship 写完评论后 agent 调 `notify_group_testers`，只认邮箱发提测通知卡（MR 按钮 + 卡片 `<at email>` 真 @，会推提及；没邮箱的进 missed 名单、不@）。没绑群、本机 bot 不在群、换不出人、MR 有冲突：工具返回 `skipped_*`，不报错、不弹「加机器人」、不阻塞交卷。不是交卷后系统偷发——和飞书评论同一拍、事件流里能看见这次工具调用。
 - **群答疑 markdown**：项目群里 @ 机器人问完，回群走飞书 `post` + `md`（CommonMark / GFM）。以前走纯文本 `--text`，`**粗体**` / `` `代码` `` / 列表会原样显示。短状态回执仍用纯文本。
 - **环境配置加 SLS**：设置页环境配置在 ELK 下面加 SLS（endpoint / project / AccessKey），跟 ELK 同款多实例。凭据只进 company-env.json，不进 prompt。Logstore 不配，查询时再 List。ELK 的 Data View 表单已去掉（本仓没有查询脚本读它）；旧配置读盘仍保留该字段。
 - **任务可解绑仓库**：编辑任务可以取消已绑仓库（至少留 1 个）。解绑不删 feature 分支、不关 MR。服务端整份替换 `repoPaths`：剪掉 5 张 per-repo map，独立按仓剪 `gitBranches`，清会话后下一个 Action 起新 agent。拆隔离工作区按解绑前的仓短名定位；只读 / 非 git 仓不拆。运行中改仓返回 409。
 - **测试任务切被测分支**：`prepareTestingTaskBranches` 在 checkout 失败 / 超时后复位工作区；Maven `target/` 等未跟踪编译产物不挡推进；git 明细写进事件流。checkout 超时从 15s 提到 60s。
-
-### v1.9.5（2026-08-31）压缩过程行 / 上下文窗口纠偏 / Cursor SDK 1.0.30
-
-- **压缩过程行**：自定义 pi 的 `compaction_start/end` 与 Cursor SDK 的 `summary-started/summary/summary-completed` 走同一套 info（「正在压缩上下文…」→「已压缩上下文」）。压缩不是回合结束，不 flush 正在流的回复。Cursor 只在 SDK 真吐 summary 事件时出过程行，不再按 token 掉档伪造。
-- **自定义模型窗口**：`contextWindow` 从 models.dev `limit.context` 读（Spark 是 1M），不再写死 128k；非法值（0 / 负数）丢弃。同 id 多来源窗口补位，防 huggingface 纯文本条盖掉官方窗口。
-- **分支框收口**：Combobox 默认不许手填（`allowCustom=false`），仓库 / 环境分支只认列表；需要手填的调用方显式打开。Picker 外层 `min-w-0`，长名字不撑破表单。
-- **事件流行宽**：待办 / 子代理卡补回 `min-w-0 max-w-full`，长标题不横向撑视口。
-- **`@cursor/sdk` 1.0.26 → 1.0.30**。本地 `cwd` 仍是字符串，不受 1.0.27「去掉 cwd 数组」影响。
-- **随本版发出（1.9.4 tag 之后已合未发）**：系统工具改 SDK customTools + 提问同一轮 curl 等答案；侧栏对话粘性序；新会话接续最近 12 轮正文。
 
 ## 关键文件索引
 

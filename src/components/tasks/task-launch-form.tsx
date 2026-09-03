@@ -20,10 +20,9 @@ import { ChevronDown, ChevronUp, Plug, Rocket } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Tooltip } from "@/components/ui/tooltip";
 import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { ChoiceButton } from "@/components/ui/choice-button";
-import { Combobox } from "@/components/ui/combobox";
+import { FeatureBranchesField } from "@/components/tasks/feature-branches-field";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Field } from "@/components/ui/field";
 import { Form } from "@/components/ui/form";
@@ -541,46 +540,14 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
 
       {/* QA 需求任务：被测业务分支（可后补）；fe/be 不再展示分支字段 */}
       {!isDailyLaunch && userRole === "qa" && repoPaths.length > 0 && (
-        <div className="grid gap-1.5">
-          <Label>被测业务分支（可后补）</Label>
-          <p className="text-xs text-muted-foreground">
-            开发分支还没建立时可以留空，先做需求分析和测试用例；分支就绪后可在任务内编辑补上
-          </p>
-          <div className="grid gap-2">
-            {repoPaths.map((p) => {
-              const repo = repos.find((r) => r.path === p);
-              const entry = branchMap[p];
-              return (
-                <div key={p} className="flex items-center gap-2">
-                  <Tooltip content={repo?.name ?? p}>
-                    <span className="w-28 shrink-0 truncate text-sm text-muted-foreground">
-                      {repo?.name ?? p}
-                    </span>
-                  </Tooltip>
-                  <Combobox
-                    value={featureBranches[p] ?? ""}
-                    onValueChange={(v) =>
-                      setFeatureBranches((prev) => ({ ...prev, [p]: v }))
-                    }
-                    options={entry?.branches ?? []}
-                    emptyHint="暂无候选"
-                    allowCustom={Boolean(entry?.gitMissing)}
-                    placeholder={
-                      entry?.isRepo === false
-                        ? entry.pathMissing
-                          ? "路径不存在"
-                          : entry.gitMissing
-                            ? "未检测到 git、可手填"
-                            : "非 git 仓库"
-                        : "选择业务分支"
-                    }
-                    wrapperClassName="w-auto min-w-0 flex-1"
-                  />
-                </div>
-              );
-            })}
-          </div>
-        </div>
+        <FeatureBranchesField
+          repoPaths={repoPaths}
+          repoNameOf={(p) => repos.find((r) => r.path === p)?.name ?? p}
+          featureBranches={featureBranches}
+          onChange={setFeatureBranches}
+          branchMap={branchMap}
+          hint="开发分支还没建立时可以留空，先做需求分析和测试用例；分支就绪后可在任务内编辑补上"
+        />
       )}
 
       {/* 模型 */}

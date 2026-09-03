@@ -1658,7 +1658,13 @@ export const setTaskSessionAgentId = async (
       if (finalGuard && !finalGuard()) return;
       const meta = await readMetaV06(id);
       if (!meta) return;
-      meta.sessionAgentId = agentId;
+      // 保命轮换水位（2026-09-03 OOM 根治）：锚点换到新 agentId = 全新 SDK 会话
+      // （create/轮换/懒重启），会话级 input 从零起算；resume 不走 set（锚点已对），
+      // 胖会话水位重启不丢；清锚点（undefined）不断水位，下一次 create 会重置。
+      if (meta.sessionAgentId !== agentId) {
+        meta.sessionAgentId = agentId;
+        if (agentId !== undefined) meta.sessionInputTokens = 0;
+      }
       if (finalGuard) {
         // 条件事务——与 clearTaskSessionAgentIdIf 对称
         const prepared = await prepareMetaWrite(meta);
@@ -1818,6 +1824,9 @@ export const recordTurnUsage = async (
     if (!meta) return null;
     const now = Date.now();
     meta.tokenUsage = accumulateTokenUsage(meta.tokenUsage, turn, now);
+    // 保命轮换水位（2026-09-03 OOM 根治）：随每轮记账累加，chat/task 共用入口；阈值见 session-rotate.ts
+    meta.sessionInputTokens =
+      (meta.sessionInputTokens ?? 0) + (turn.inputTokens ?? 0);
 
     const idx = meta.currentActionId
       ? meta.actions.findIndex((a) => a.id === meta.currentActionId)

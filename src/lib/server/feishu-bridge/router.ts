@@ -35,8 +35,10 @@ import {
 import {
   getCurrentChatTaskId,
   getEndedChatTaskIds,
+  peekAwaitingChatSearch,
   removeEndedChatTaskId,
   setCurrentChatTaskId,
+  takeAwaitingChatSearch,
 } from "./bridge-state";
 import { findTaskByMessageId, rememberCardMessage } from "./card-map";
 import {
@@ -1055,6 +1057,8 @@ export const routeInboundMessage = async (
   if (text.trim().startsWith("/")) {
     const cmdResult = await tryCommandOrSkill(msg, text);
     if (cmdResult.kind === "handled") {
+      // 对话遥控器「搜对话」待关键词时来了条命令：按命令办、搜索 intent 作废
+      await takeAwaitingChatSearch().catch(() => false);
       // T8 用户拍板：Get 语义 = 消息真进了 AI——命令词只有 bot 文本回执、
       // 不点表情（skipped 在 reactions 侧本来就不点）
       await emitInjectResult({
@@ -1065,6 +1069,7 @@ export const routeInboundMessage = async (
     }
     // R1-9：命令失败 → failed（不 retryable，用户已收到失败文本）
     if (cmdResult.kind === "handled_failed") {
+      await takeAwaitingChatSearch().catch(() => false);
       const payload: InjectResultPayload = {
         kind: "failed",
         messageId: msg.message_id,
@@ -1088,6 +1093,33 @@ export const routeInboundMessage = async (
       }
     } else {
       text = cmdResult.text;
+    }
+  }
+
+  // 对话遥控器「搜对话」：待关键词时纯文本即搜（动态 import，别拖重依赖进热路径）。
+  // flag 取值即清——搜完/空消息都不留尾巴，后面的正常聊天不受影响。
+  // fast-path：99.9% 为 false，先无锁 peek，不过才连 import 都省了。
+  if (!text.trim().startsWith("/")) {
+    let searching = false;
+    try {
+      searching = await peekAwaitingChatSearch();
+    } catch {
+      searching = false;
+    }
+    if (searching) {
+      const { consumeChatSearchText } = await import("./chats-panel");
+      // 带图/附件不搜：附件走正常注入，搜索 intent 留给下一条纯文本
+      if (
+        await consumeChatSearchText(text, {
+          hasAttachments: parsed.images.length + parsed.attachments.length > 0,
+        })
+      ) {
+        await emitInjectResult({
+          kind: "skipped",
+          messageId: msg.message_id,
+        });
+        return { kind: "skipped", messageId: msg.message_id };
+      }
     }
   }
 

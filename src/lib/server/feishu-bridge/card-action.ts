@@ -267,10 +267,55 @@ export const parseCardButtonValue = (raw: unknown): CardButtonValue | null => {
     return { kind: "end_all" };
   }
   if (v.kind === "cmd") {
-    if (v.command !== "new" && v.command !== "clean" && v.command !== "status") {
+    if (
+      v.command !== "new" &&
+      v.command !== "clean" &&
+      v.command !== "status" &&
+      v.command !== "chats" &&
+      v.command !== "model"
+    ) {
       return null;
     }
     return { kind: "cmd", command: v.command };
+  }
+  if (v.kind === "chats") {
+    if (typeof v.op !== "string") return null;
+    // op 白名单：未知 op 直接丢弃（handler 那层 default 只是兜底，正常到不了）
+    switch (v.op) {
+      case "panel":
+      case "switch":
+      case "list":
+      case "repos":
+      case "repo":
+      case "new":
+      case "new_model":
+      case "create":
+      case "model":
+      case "model_set":
+      case "models_all":
+      case "search_hint":
+        break;
+      default:
+        return null;
+    }
+    const strOrUndef = (x: unknown): string | undefined =>
+      typeof x === "string" ? x : undefined;
+    const boolOrUndef = (x: unknown): boolean | undefined =>
+      typeof x === "boolean" ? x : undefined;
+    const numOrUndef = (x: unknown): number | undefined =>
+      typeof x === "number" && Number.isFinite(x) ? x : undefined;
+    const purpose = strOrUndef(v.purpose);
+    return {
+      kind: "chats",
+      op: v.op,
+      ...(strOrUndef(v.taskId) ? { taskId: strOrUndef(v.taskId) } : {}),
+      ...(numOrUndef(v.page) !== undefined ? { page: numOrUndef(v.page) } : {}),
+      ...(strOrUndef(v.repo) !== undefined ? { repo: strOrUndef(v.repo) } : {}),
+      ...(boolOrUndef(v.archived) !== undefined ? { archived: boolOrUndef(v.archived) } : {}),
+      ...(strOrUndef(v.modelId) ? { modelId: strOrUndef(v.modelId) } : {}),
+      ...(purpose === "switch" || purpose === "new" ? { purpose } : {}),
+      ...(boolOrUndef(v.forNew) !== undefined ? { forNew: boolOrUndef(v.forNew) } : {}),
+    };
   }
   return null;
 };
@@ -832,6 +877,12 @@ const handleCmdAction = async (value: CmdValue): Promise<void> => {
     await execCleanupCard();
     return;
   }
+  if (value.command === "chats" || value.command === "model") {
+    const { showChatsPanel, showModelCard } = await import("./chats-panel");
+    if (value.command === "chats") await showChatsPanel();
+    else await showModelCard();
+    return;
+  }
   await execStatusText();
 };
 
@@ -947,6 +998,12 @@ export const handleCardActionEvent = async (raw: unknown): Promise<void> => {
     }
     if (value.kind === "end_all") {
       await handleEndAllAction(norm.messageId);
+      return;
+    }
+    if (value.kind === "chats") {
+      // 对话遥控器：p2p 本人卡（已过上面的 owner 闸），点击时按最新数据重算、不做终态 patch
+      const { handleChatsCardAction } = await import("./chats-panel");
+      await handleChatsCardAction(value);
       return;
     }
     if (value.kind === "cmd") {

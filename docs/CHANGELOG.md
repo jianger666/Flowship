@@ -15,6 +15,15 @@
 
 ---
 
+### v1.9.5（2026-08-31）压缩过程行 / 上下文窗口纠偏 / Cursor SDK 1.0.30
+
+- **压缩过程行**：自定义 pi 的 `compaction_start/end` 与 Cursor SDK 的 `summary-started/summary/summary-completed` 走同一套 info（「正在压缩上下文…」→「已压缩上下文」）。压缩不是回合结束，不 flush 正在流的回复。Cursor 只在 SDK 真吐 summary 事件时出过程行，不再按 token 掉档伪造。
+- **自定义模型窗口**：`contextWindow` 从 models.dev `limit.context` 读（Spark 是 1M），不再写死 128k；非法值（0 / 负数）丢弃。同 id 多来源窗口补位，防 huggingface 纯文本条盖掉官方窗口。
+- **分支框收口**：Combobox 默认不许手填（`allowCustom=false`），仓库 / 环境分支只认列表；需要手填的调用方显式打开。Picker 外层 `min-w-0`，长名字不撑破表单。
+- **事件流行宽**：待办 / 子代理卡补回 `min-w-0 max-w-full`，长标题不横向撑视口。
+- **`@cursor/sdk` 1.0.26 → 1.0.30**。本地 `cwd` 仍是字符串，不受 1.0.27「去掉 cwd 数组」影响。
+- **随本版发出（1.9.4 tag 之后已合未发）**：系统工具改 SDK customTools + 提问同一轮 curl 等答案；侧栏对话粘性序；新会话接续最近 12 轮正文。
+
 ### v1.9.4（2026-08-27）WK 激活 / Windows 更新对齐 mac / 本版更新弹窗 / 空对话复用
 
 - **启动「激活项目」**：需求任务 + Hub 已配 + 未填 REQ-ID 时可勾选，填语义编码 / 需求方 / 技术 Owner / 上线日，服务端查重再 `activate`，编号回写任务。Token 不进客户端。

@@ -44,8 +44,11 @@ describe("buildSdkCustomTools", () => {
     expect(names).toContain("share_to_group");
     const notify = flowShipTools.find((t) => t.name === "notify_group_testers");
     const share = flowShipTools.find((t) => t.name === "share_to_group");
-    expect(notify?.description).toContain("不要用 share_to_group 代替");
+    expect(notify?.description).toContain("share_to_group");
     expect(share?.description).toContain("notify_group_testers");
+    // failed / 防重语义必须写进描述，否则 agent 拿到 failed 会愣住不知道该不该重试
+    expect(notify?.description).toContain("failed");
+    expect(notify?.description).toContain("skipped_duplicate");
   });
 
   it("notify_group_testers caller 不对 → 忽略", async () => {

@@ -397,12 +397,14 @@ export const parseUserSearchEmail = (
 };
 
 /**
- * `user search` 多条 → user_key → 邮箱 / 姓名（需求群 @ 测试用）。
+ * `user search` 多条 → user_key → 邮箱 / 姓名 / union_id（需求群 @ 测试用）。
  * 对不上 key 的条目丢掉；邮箱不像邮箱的也丢掉。
+ * union_id 取 `out_id`（`on_` 开头、同租户通用）：`lark_user_id`（纯数字）一律不收——
+ * 2026-06-12 起官方按 user_key 体系校验，数字 id 进 IM @ 直接 cross tenant。
  */
 export const parseUserSearchEmailMap = (
   resp: unknown,
-): Record<string, { email: string; name?: string }> => {
+): Record<string, { email: string; name?: string; unionId?: string }> => {
   const items: Record<string, unknown>[] = [];
   const collect = (v: unknown, depth: number): void => {
     if (depth > 3 || !v || typeof v !== "object") return;
@@ -421,13 +423,17 @@ export const parseUserSearchEmailMap = (
     if (items.length === 0 && pickUserEmail(rec)) items.push(rec);
   };
   collect(resp, 0);
-  const out: Record<string, { email: string; name?: string }> = {};
+  const out: Record<string, { email: string; name?: string; unionId?: string }> = {};
   for (const it of items) {
     const key = asStr(it.user_key) ?? asStr(it.key);
     const email = pickUserEmail(it);
     if (!key || !email) continue;
     const name = asStr(it.name) ?? asStr(it.name_cn) ?? asStr(it.name_en);
-    out[key] = { email, ...(name ? { name } : {}) };
+    const rawUnion = asStr(it.out_id) ?? asStr(it.union_id) ?? asStr(it.unionId);
+    // 只收 on_ 开头的 union_id：格式不对（数字 lark_user_id 等）宁可丢掉、走 skipped，也不发一个必死的 @
+    const unionId =
+      rawUnion && /^on_/i.test(rawUnion.trim()) ? rawUnion.trim() : undefined;
+    out[key] = { email, ...(name ? { name } : {}), ...(unionId ? { unionId } : {}) };
   }
   return out;
 };

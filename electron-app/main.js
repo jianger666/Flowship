@@ -263,9 +263,21 @@ const serverNodeBin = () => {
 
 const startServer = () => {
   const serverJs = path.join(serverDir, "server.js");
+  // OOM 止血（2026-09-03 实测：长会话 + 子代理巨型回包常驻内存，默认堆 ~2G 跑 1 小时必爆
+  // `heap out of memory` → server 退出 code=? → 壳弹「服务异常退出」）。server 是独立子进程，
+  // 这里的 NODE_OPTIONS 只影响它，不污染用户 shell / agent 子进程（cap 只设上限、不预分配）。
+  // 已有 max-old-space-size（用户手动调过）则不动，避免覆盖手工值。
+  // TODO：split(" ") 遇到带空格的引用路径会切碎；NODE_OPTIONS 里极少有这种值，先不处理。
+  const serverNodeOptions = (process.env.NODE_OPTIONS ?? "")
+    .split(" ")
+    .filter(Boolean);
+  if (!serverNodeOptions.some((o) => o.includes("max-old-space-size"))) {
+    serverNodeOptions.push("--max-old-space-size=4096");
+  }
   const proc = spawn(serverNodeBin(), [serverJs], {
     env: {
       ...process.env,
+      NODE_OPTIONS: serverNodeOptions.join(" "),
       // 三件套：execPath 当 node 用（含孙进程继承、hooks 依赖）+ 端口 + 数据目录
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(PORT),
@@ -277,7 +289,7 @@ const startServer = () => {
     windowsHide: true,
   });
   serverProc = proc;
-  log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")}`);
+  log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")} nodeOptions=${serverNodeOptions.join(" ") || "（空）"}`);
   // ⚠️ 世代守卫（自更新失败恢复竞态）：stopServer 会先把 serverProc 置 null 再杀、
   // SIGKILL 后不等回收就可能 startServer 拉新的——旧进程迟来的 exit 若无脑
   // serverProc=null / 弹「服务异常退出」、会误杀刚拉起的新 server（serverProc !== proc

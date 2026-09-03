@@ -8,8 +8,8 @@
 /** 卡片 header 配色模板（Hermes 全态：思考 indigo、生成 blue、成功 green、失败 red、等待 orange、停止 grey） */
 export type CardHeaderTemplate = "blue" | "green" | "red" | "orange" | "purple" | "indigo" | "wathet" | "turquoise" | "yellow" | "grey";
 
-/** 控制面板卡快捷按钮对应的命令（等价文本命令：/new 无参 / 直发 /stop / /status） */
-export type PanelCommand = "new" | "clean" | "status";
+/** 控制面板卡快捷按钮对应的命令（等价文本命令） */
+export type PanelCommand = "new" | "clean" | "status" | "chats" | "model";
 
 /** ask_user 选项 / 重试 / 清理卡 / 控制面板按钮内嵌的 value 结构 */
 export type CardButtonValue =
@@ -71,6 +71,40 @@ export type CardButtonValue =
       /** 控制面板快捷按钮——按 command 分发到对应命令流程 */
       kind: "cmd";
       command: PanelCommand;
+    }
+  | {
+      /**
+       * 对话遥控器（/chats 一家）：换对话 / 新对话 / 换模型 / 搜，全走这一种 value。
+       * 卡片只管把参数带回来，过滤/翻页/建对话都在点击时按最新数据重算。
+       */
+      kind: "chats";
+      op:
+        | "panel"
+        | "switch"
+        | "list"
+        | "repos"
+        | "repo"
+        | "new"
+        | "new_model"
+        | "create"
+        | "model"
+        | "model_set"
+        | "models_all"
+        | "search_hint";
+      /** switch / model_set 上下文带的 task */
+      taskId?: string;
+      /** 翻页（list / repos / models_all） */
+      page?: number;
+      /** 仓库 path（repo 筛选 / 新对话选仓） */
+      repo?: string;
+      /** 列表含归档 */
+      archived?: boolean;
+      /** 要切/要建的模型 id */
+      modelId?: string;
+      /** 仓库列表点进去的目的地 */
+      purpose?: "switch" | "new";
+      /** model_set 给新对话用（建对话），不带 = 给现有对话换模型 */
+      forNew?: boolean;
     };
 
 /** 群消息里的一条 @ 记录（官方 mentions 项归一后的形态） */

@@ -62,6 +62,8 @@ import {
   fetchWorkitemName,
   fetchWorkitemRoleMembers,
   MeegleError,
+  parseUserSearchEmailMap,
+  searchUsersByKeys,
   type WorkitemGroupType,
 } from "@/lib/server/meegle-cli";
 import {
@@ -78,7 +80,12 @@ import {
 /** 分享内容类型（卡片 header 徽标色） */
 export type ShareKind = "artifact" | "message" | "question";
 
-/** 发到需求群的形态：卡片（可跟 md 文件）或一条会渲染的 IM markdown */
+/**
+ * 发到需求群的形态：卡片（可跟 md 文件）或一条会渲染的 IM markdown。
+ *
+ * `post` 已无生产调用者（提测已切卡片 `<at email>`，grep 只剩类型与定义）——
+ * 保留仅作降级储备，新需求一律走 `card`，不要再给 `post` 加新调用。
+ */
 export type ShareFormat = "card" | "post";
 
 export interface ShareLink {
@@ -86,10 +93,28 @@ export interface ShareLink {
   url: string;
 }
 
-/** 群 IM @ 用的身份——必须是自建应用的 open_id，不是飞书项目 user_key */
+/** 群 IM @ 用的身份——自建应用的 open_id，或同租户通用的 union_id（union 降级链路）。
+ *
+ * open_id 是应用维度的：注册表里存的是每个人自己应用下的，只在发送应用能解析时才响；
+ * union_id 同租户通用：meegle `user search` 的 out_id（`on_` 开头），不需要对方注册、不要通讯录 scope。
+ * user_key / lark_user_id 在这条路上一律不许出现（后者 2026-06-12 起被官方封死 cross tenant）。 */
 export interface ShareMention {
-  openId: string;
+  /** at user_id 的值 */
+  userId: string;
+  /** 值的种类（拼标签行为不变；日志/排错/测试断言用） */
+  userIdKind: "open_id" | "union_id";
   name: string;
+}
+
+/** 通用 @ 没 @ 出去的原因：查无此人 / 重名 / 当前卡片形态不支持 @ */
+export type AtUnresolvedReason = "not_found" | "ambiguous" | "unsupported";
+
+/** 通用 @ 的解析结果（回执给 AI 看：谁@到了、谁没@到以及为什么） */
+export interface ShareAtResult {
+  /** 实际 @ 出去的请求原名（同一个人多个名字都算、不重复） */
+  notified: string[];
+  /** 没 @ 出去的请求原名 + 原因（不挡发送） */
+  unresolved: Array<{ name: string; reason: AtUnresolvedReason }>;
 }
 
 export interface ShareToGroupInput {
@@ -103,8 +128,17 @@ export interface ShareToGroupInput {
   title?: string;
   content: string;
   links?: ShareLink[];
-  /** 只对 `format: "post"` 生效：方法按飞书 `<at user_id>` 拼进正文 */
+  /**
+   * 只对 `format: "post"` 生效：方法按飞书 `<at user_id>` 拼进正文。
+   * 已废弃（`post` 无生产调用者）：`share_to_group` 工具不暴露它，提测也不再用。
+   */
   mentions?: ShareMention[];
+  /**
+   * 通用 @：名字清单（中文名 / 邮箱都行），卡片正文自动拼 `<at email>` 标签并推送。
+   * 只对 `format: "card"` 的 message / question 生效；artifact 无正文、post 走 mentions，两者传了都进 `unresolved`（reason=unsupported）。
+   * 精确匹配才 @：查无此人 / 重名一律跳过、进回执 `at.unresolved`，不挡发送、不抛。
+   */
+  at?: string[];
 }
 
 export interface EnsureGroupResult {
@@ -132,6 +166,11 @@ export interface ShareToGroupResult extends EnsureGroupResult {
    * 缺失 = 没发（非产物卡）或发失败（已降级、卡片仍算发出去了）。
    */
   docMessageId?: string;
+  /**
+   * 通用 @ 的回执：只有入参带了 `at` 才有。`notified` 是@出去的原名，
+   * `unresolved` 是没@出去的原名 + 原因——AI 据此告诉用户谁没@到，不用猜。
+   */
+  at?: ShareAtResult;
 }
 
 /**
@@ -201,6 +240,19 @@ export interface FeishuGroupDeps {
     workItemId: string,
     projectKey?: string,
   ) => Promise<string[]>;
+  /** 工作项角色成员的名 + 邮箱——通用 @ 按名换邮箱的数据源（精确匹配） */
+  fetchRoleMembersFull: (
+    workItemId: string,
+    projectKey?: string,
+  ) => Promise<Array<{ email: string; name?: string }>>;
+  /** 按名字 / 邮箱批量换人（底层 meegle `user search`，`--user-keys` 照收名字，别被名字误导） */
+  searchUsers: (queries: string[]) => Promise<unknown>;
+  /** `user search` 响应 → 以 user_key 索引的邮箱 / 姓名表 */
+  parseSearchMap: (
+    resp: unknown,
+  ) =>
+    | Record<string, { email: string; name?: string; unionId?: string }>
+    | Promise<Record<string, { email: string; name?: string; unionId?: string }>>;
   /** 需求群成员注册表（团队库共享单文件、本地克隆直读） */
   readMemberRegistry: () => Promise<GroupMemberRegistry>;
   /** 本机身份自动注册（同步返回、后台跑、静默失败） */
@@ -234,6 +286,13 @@ const defaultDeps = (): FeishuGroupDeps => ({
     (await fetchWorkitemRoleMembers(id, key))
       .map((m) => m.email?.trim() ?? "")
       .filter(Boolean),
+  fetchRoleMembersFull: async (id, key) =>
+    (await fetchWorkitemRoleMembers(id, key)).map((m) => ({
+      email: m.email?.trim() ?? "",
+      ...(m.name?.trim() ? { name: m.name.trim() } : {}),
+    })),
+  searchUsers: (queries) => searchUsersByKeys(queries),
+  parseSearchMap: (resp) => parseUserSearchEmailMap(resp),
   readMemberRegistry: () => readGroupMemberRegistry(),
   scheduleSelfRegister: () => scheduleSelfRegistration(),
   decodeUrl: (url) => decodeWorkitemUrl(url),
@@ -795,8 +854,8 @@ const KIND_META: Record<
 
 const CONTENT_MAX = 2000;
 
-/** 调用方链接按钮上限（不含固定的「查看工作项」） */
-const LINK_BUTTON_MAX = 6;
+/** 调用方链接按钮上限（2026-09-03 用户拍板放到 10：多仓一次提 10 个也全列） */
+const LINK_BUTTON_MAX = 10;
 
 /** 正文截断（飞书卡片 markdown 不宜过长） */
 export const truncateShareContent = (
@@ -822,6 +881,7 @@ export const buildShareCardJson = (opts: {
   title?: string;
   content: string;
   links?: ShareLink[];
+  /** 已废弃：需求群内都知道工作项，不再渲染按钮，传了也会被忽略 */
   storyUrl?: string;
   senderName: string;
 }): Record<string, unknown> => {
@@ -863,12 +923,9 @@ export const buildShareCardJson = (opts: {
   };
 
   // 调用方给的链接按钮封顶：产物正文里可能挖出十几条 MR，全挂上卡片会糊成一片。
-  // 「查看工作项」不占这个额度——它是每张卡的固定出口、不能被 MR 挤掉。
+  // 2026-09-03 用户拍板：需求群内分享不再带「查看工作项」（群里人都知道是哪个需求）。
   for (const link of (opts.links ?? []).slice(0, LINK_BUTTON_MAX)) {
     pushLink(link.label || "链接", link.url);
-  }
-  if (opts.storyUrl?.trim()) {
-    pushLink("查看工作项", opts.storyUrl.trim());
   }
   if (buttons.length > 0) {
     // 分割线只在上方真有内容时加——artifact 卡没正文，开头顶一条 hr 是条孤零零的横线
@@ -949,6 +1006,133 @@ export const buildShareDocFilename = (opts: {
   return `${base}.md`;
 };
 
+// ----------------- 通用 @ -----------------
+
+/** 邮箱格式检查（与 tester-notify 侧同口径） */
+const asAtEmail = (raw: unknown): string => {
+  if (typeof raw !== "string") return "";
+  const v = raw.trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : "";
+};
+
+/** 卡片正文里的 @ 标签。飞书会把它渲染成 `@名字` 并推送，后面不要再拼名字。 */
+export const atEmailTag = (email: string): string => `<at email=${email}></at>`;
+
+type AtCandidate = { email: string; name?: string };
+
+/**
+ * 名字 → 邮箱（通用 @ 的公共解析，两阶段、每次现查、不落表）。
+ *
+ * - 传进来的就是邮箱：直接用，不查。
+ * - 第一阶段：工作项角色成员（精确比名字）+ 本地注册表反查（精确比名字），命中唯一邮箱即收。
+ * - 第二阶段：第一阶段没命中的名字，打包调一次 meegle `user search` 再比一轮。
+ * - 精确才 @：一个名字对出 0 个邮箱 → not_found，对出 2+ 个 → ambiguous，一律不@、只报。
+ * - 任何一步挂了（meegle 没登录 / 超时 / 注册表读不到）：当没命中处理，绝不抛、不挡发送。
+ */
+export const resolveShareAts = async (
+  names: string[],
+  story: Pick<ResolvedStory, "workItemId" | "projectKey">,
+): Promise<{ emails: string[]; notified: string[]; unresolved: ShareAtResult["unresolved"] }> => {
+  const notified: string[] = [];
+  const unresolved: ShareAtResult["unresolved"] = [];
+  const byEmail = new Map<string, true>();
+  const emails: string[] = [];
+  const claim = (email: string, name: string): void => {
+    notified.push(name);
+    if (!byEmail.has(email)) {
+      byEmail.set(email, true);
+      emails.push(email);
+    }
+  };
+
+  const seen = new Set<string>();
+  const wanted: string[] = [];
+  for (const raw of names ?? []) {
+    const name = raw?.trim() ?? "";
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const direct = asAtEmail(name);
+    if (direct) {
+      claim(direct, name);
+      continue;
+    }
+    wanted.push(name);
+  }
+  if (wanted.length === 0) return { emails, notified, unresolved };
+
+  let roles: AtCandidate[] = [];
+  try {
+    roles = await getDeps().fetchRoleMembersFull(story.workItemId, story.projectKey);
+  } catch {
+    roles = [];
+  }
+  let registry: GroupMemberRegistry | null = null;
+  try {
+    registry = await getDeps().readMemberRegistry();
+  } catch {
+    registry = null;
+  }
+
+  // 一个名字在三处来源里精确命中的邮箱（去重）。名字比精确相等，邮箱比小写。
+  const collect = (
+    want: string,
+    extra: Record<string, { email: string; name?: string }> = {},
+  ): string[] => {
+    const out: string[] = [];
+    for (const r of roles) {
+      if (r.name?.trim() === want || asAtEmail(r.email) === want.toLowerCase()) {
+        const e = asAtEmail(r.email);
+        if (e) out.push(e);
+      }
+    }
+    if (registry) {
+      for (const [email, entry] of Object.entries(registry.members)) {
+        if (entry.name?.trim() === want) {
+          const e = asAtEmail(email);
+          if (e) out.push(e);
+        }
+      }
+    }
+    for (const v of Object.values(extra)) {
+      if (v.name?.trim() === want || asAtEmail(v.email) === want.toLowerCase()) {
+        const e = asAtEmail(v.email);
+        if (e) out.push(e);
+      }
+    }
+    return [...new Set(out)];
+  };
+
+  const pending: string[] = [];
+  for (const want of wanted) {
+    const hits = collect(want);
+    if (hits.length === 1) claim(hits[0]!, want);
+    else if (hits.length > 1) unresolved.push({ name: want, reason: "ambiguous" });
+    else pending.push(want);
+  }
+  if (pending.length > 0) {
+    // meegle `--user-keys` 单次最多收 20 个：超了切片串调再合并（通用 at 一次 @ 几十人撞得上）。
+    // 片级 try：某片挂了只丢该片、其余照用（全丢比半丢更难排）。
+    let searched: Record<string, { email: string; name?: string }> = {};
+    for (let i = 0; i < pending.length; i += 20) {
+      try {
+        const part = await getDeps().parseSearchMap(
+          await getDeps().searchUsers(pending.slice(i, i + 20)),
+        );
+        searched = { ...searched, ...part };
+      } catch {
+        /* 该片丢掉，继续下一片 */
+      }
+    }
+    for (const want of pending) {
+      const hits = collect(want, searched);
+      if (hits.length === 1) claim(hits[0]!, want);
+      else if (hits.length > 1) unresolved.push({ name: want, reason: "ambiguous" });
+      else unresolved.push({ name: want, reason: "not_found" });
+    }
+  }
+  return { emails, notified, unresolved };
+};
+
 // ----------------- 分享闭环 -----------------
 
 /**
@@ -960,7 +1144,7 @@ export const composePostShareMarkdown = (
   mentions?: ShareMention[],
 ): string => {
   const tags = (mentions ?? [])
-    .map((m) => mentionTag(m.openId, m.name))
+    .map((m) => mentionTag(m.userId, m.name))
     .join(" ")
     .trim();
   const body = content.trim();
@@ -1037,12 +1221,22 @@ export const shareToRequirementGroup = async (
       } catch (sendErr) {
         return await rethrowIfBotNotInGroup(sendErr, ensured.chatId);
       }
+      // post 走 mentions 做 @，通用 `at`（名字）在这里不支持——如实报 unsupported，不静默吞
+      const atNames = [...new Set((input.at ?? []).map((n) => n?.trim()).filter(Boolean))];
       return {
         chatId: ensured.chatId,
         messageId: sent.message_id,
         created: ensured.created,
         ...(ensured.chatName ? { chatName: ensured.chatName } : {}),
         ...(ensured.membershipUnknown ? { membershipUnknown: true } : {}),
+        ...(atNames.length > 0
+          ? {
+              at: {
+                notified: [],
+                unresolved: atNames.map((name) => ({ name, reason: "unsupported" as const })),
+              },
+            }
+          : {}),
       };
     }
 
@@ -1060,13 +1254,30 @@ export const shareToRequirementGroup = async (
     }
 
     const senderName = await getDeps().resolveSenderName();
+    // 通用 @：只在有正文的卡片上拼标签；artifact 无正文渲染不出来，如实报 unsupported
+    const atNames = [...new Set((input.at ?? []).map((n) => n?.trim()).filter(Boolean))];
+    let atResult: ShareAtResult | undefined;
+    let cardContent = content;
+    if (atNames.length > 0) {
+      if (cardKind === "artifact") {
+        atResult = {
+          notified: [],
+          unresolved: atNames.map((name) => ({ name, reason: "unsupported" as const })),
+        };
+      } else {
+        const resolved = await resolveShareAts(atNames, story);
+        atResult = { notified: resolved.notified, unresolved: resolved.unresolved };
+        if (resolved.emails.length > 0) {
+          cardContent = `${resolved.emails.map(atEmailTag).join(" ")}\n${content}`;
+        }
+      }
+    }
     const card = buildShareCardJson({
       requirementName,
       kind: cardKind,
       title: input.title,
-      content,
+      content: cardContent,
       links: input.links,
-      storyUrl: story.storyUrl,
       senderName,
     });
 
@@ -1095,6 +1306,7 @@ export const shareToRequirementGroup = async (
       ...(ensured.chatName ? { chatName: ensured.chatName } : {}),
       ...(ensured.membershipUnknown ? { membershipUnknown: true } : {}),
       ...(docMessageId ? { docMessageId } : {}),
+      ...(atResult ? { at: atResult } : {}),
     };
   } catch (err) {
     throw await mapExternalError(err);

@@ -39,6 +39,7 @@ import { buildAskWaitCurl, openAskWait } from "./ask-wait";
 import { createCustomAction } from "./custom-action-fs";
 import { getAppSkillsDir } from "./skills-loader";
 import { getTask } from "./task-fs";
+import { writeEventAndPublish } from "./task-stream";
 
 export type FlowshipToolContent = Array<{ type: "text"; text: string }>;
 
@@ -450,7 +451,8 @@ const shareToGroupDef: FlowshipToolDef = {
     "把内容以互动卡片发到当前任务关联飞书工作项的需求群。",
     "只在用户明确要求分享 / playbook 编排时调；不要自行滥发。",
     "提测在需求群 @ 测试人员不要走本工具，用 notify_group_testers。",
-    "入参：task_id、content（必填）、title / kind(artifact|message|question) / links([{label,url}]) 可选。",
+    "入参：task_id、content（必填）、title / kind(artifact|message|question) / links([{label,url}]) / at([名字]) 可选。",
+    "at 是通用 @：传中文名或邮箱，卡片正文自动 @ 并推送；精确匹配才@，换不出/重名进返回的 at.unresolved（不挡发送）。artifact 卡无正文、at 会全进 unresolved。",
     "返回 { ok, chatName?, messageId?, docMessageId? } 或 { ok:false, error, code? }——失败如实转告用户、不要自行重试。",
   ].join("\n"),
   parameters: TBObject({
@@ -461,6 +463,7 @@ const shareToGroupDef: FlowshipToolDef = {
     links: TBOptional(
       TBArray(TBObject({ label: TBString(), url: TBString() })),
     ),
+    at: TBOptional(TBArray(TBString())),
   }),
   handler: async (args, callerToken) => {
     const taskId = str(args.task_id);
@@ -488,6 +491,9 @@ const shareToGroupDef: FlowshipToolDef = {
             ? (args.links as Array<{ label: unknown; url: unknown }>).map(
                 (l) => ({ label: str(l.label), url: str(l.url) }),
               )
+            : undefined,
+          at: Array.isArray(args.at)
+            ? (args.at as unknown[]).map((n) => str(n)).filter((n) => n.trim())
             : undefined,
         },
         { verifyOwnerMembership: true },
@@ -521,9 +527,9 @@ const notifyGroupTestersDef: FlowshipToolDef = {
   name: "notify_group_testers",
   label: "在需求群 IM @ 测试人员",
   description: [
-    "提测 playbook：写完飞书项目评论之后调。在已绑定的需求群用 IM @ 同一批测试人员（工作项评论 @ 不推飞书通知，这条会推提及）。",
+    "提测 playbook：写完飞书项目评论之后调。往已绑定的需求群发一张提测通知卡（MR 按钮 + 邮箱 @ 同一批测试人员，能推飞书提及），替代工作项评论 @（评论 @ 不推通知）。",
     "入参只要 task_id、action_id。人从 task.feishuTesterUserKeys 取、MR 从本 action 的 submit_mr 记录取；不要传 open_id，不要用 share_to_group 代替。",
-    "只允许当前 running 的 ship 调。返回 { ok, outcome }：sent 或 skipped_*（没群 / bot 不在群 / 没人可 @ / 无 MR / 有冲突等）。skipped 不是失败，记进 artifact 即可，不要重试、不要改调 share_to_group。",
+    "只允许当前 running 的 ship 调。返回 { ok, outcome }：sent / skipped_*（没群 / bot 不在群 / 没人可换 / 无 MR / 有冲突 / 重复调用等）/ failed（超时或发送失败）。skipped 与 failed 都不是 ship 失败：原样记进 artifact 即可，不要改调 share_to_group。failed 可重调一次：若重调回 skipped_duplicate 说明上一轮实际已发出，不用再试。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),
@@ -557,7 +563,19 @@ const notifyGroupTestersDef: FlowshipToolDef = {
     const { notifyShipTestersInGroup } = await import(
       "./feishu-bridge/group-tester-notify"
     );
-    const outcome = await notifyShipTestersInGroup(task, action);
+    const outcome = await notifyShipTestersInGroup(task, action, {
+      // best-effort 回执：只在还是同一轮 ship 时写进事件流，失主/切 action 就丢掉；
+      // 写失败也不影响已经发出去的 @（writeEventAndPublish 本来就吞错返 null）
+      emitInfo: async (text) => {
+        const fresh = await getTask(taskId);
+        if (!fresh || fresh.currentActionId !== actionId) return;
+        await writeEventAndPublish(taskId, {
+          kind: "info",
+          actionId,
+          text,
+        });
+      },
+    });
     return text(JSON.stringify({ ok: true, outcome }));
   },
 };

@@ -1522,6 +1522,12 @@ export interface Task {
    * 不存 = 这个任务还没跑过 / 埋点上线前的老数据。
    */
   tokenUsage?: TokenUsageRollup;
+  /**
+   * 保命轮换水位（2026-09-03 OOM 根治）：当前 SDK 会话累计 input token。
+   * meta 落盘字段的 hydrate 透传（ counting 口径见 task-fs-core TaskMetaV06）；
+   * 缺 = 老任务，按 0 处理。
+   */
+  sessionInputTokens?: number;
   model?: ModelSelection;
   /**
    * 本窗口绑定的 agent 提供方（`cursor` 或 customProviders.id）。

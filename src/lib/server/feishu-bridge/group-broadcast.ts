@@ -60,8 +60,8 @@ const LOG = "[feishu-bridge/group-broadcast]";
 /** 播报整体超时——超时只是放弃本次播报，收尾方的 claim 不会被长期占住 */
 export const BROADCAST_TIMEOUT_MS = 30_000;
 
-/** 卡片最多挂几个 MR 按钮（多仓 ship 可能一次 4+ 条、群里不需要全列） */
-const MAX_MR_LINKS = 4;
+/** 卡片最多挂几个 MR 按钮（多仓 ship 可能一次 10 条；超了的进正文裸链接，保证不丢） */
+const MAX_MR_LINKS = 10;
 
 /**
  * 播报结果（调用方不消费，单测按它断言分支）。
@@ -145,7 +145,11 @@ export const shouldBroadcastAction = (
  * 只取本 action 自己的 `sideEffects.mrs`——task.mrs 是全历史，
  * 拿它会把上一轮 ship 的旧 MR 也挂到这张卡上。
  */
-export const buildActionMrLinks = (action: ActionRecord): ShareLink[] => {
+/**
+ * 本次 action 产出的全部 MR 链接（不封顶）。
+ * 正文用它全列（方便复制粘贴）；按钮用 {@link buildActionMrLinks} 的封顶版，超的只在正文里，保证不丢。
+ */
+export const buildAllActionMrLinks = (action: ActionRecord): ShareLink[] => {
   const mrs = action.sideEffects?.mrs ?? [];
   const links: ShareLink[] = [];
   for (const mr of mrs) {
@@ -154,10 +158,12 @@ export const buildActionMrLinks = (action: ActionRecord): ShareLink[] => {
     // 仓路径末段当标签（crm-web），拿不到就退回「MR」
     const repoTail = mr.repoPath?.split("/").filter(Boolean).pop();
     links.push({ label: repoTail ? `MR · ${repoTail}` : "MR", url });
-    if (links.length >= MAX_MR_LINKS) break;
   }
   return links;
 };
+
+export const buildActionMrLinks = (action: ActionRecord): ShareLink[] =>
+  buildAllActionMrLinks(action).slice(0, MAX_MR_LINKS);
 
 // ----------------- 播报闭环 -----------------
 
@@ -280,14 +286,24 @@ const runBroadcast = async (
   if (!claimGroupArtifactCard(task.id, action.id)) return "skipped_duplicate";
 
   const label = actionDisplayLabel(action);
+  // 按钮只挂前 N 个（LINK_BUTTON_MAX），超的拼进正文——artifact 正文进 md 文件消息，
+  // 打开文件即见，保证多仓一次出 10+ 条也不静默丢（提测卡同款“按钮 + 正文溢出”）。
+  const links = buildActionMrLinks(action);
+  const overflow = buildAllActionMrLinks(action).slice(links.length);
+  const broadcastContent =
+    overflow.length > 0
+      ? `${content}\n\n---\n按钮只挂前 ${links.length} 个，剩下的 MR（复制粘贴用）：\n${overflow
+          .map((m) => `- ${m.label} ${m.url}`)
+          .join("\n")}`
+      : content;
   try {
     await deps.shareToGroup(
       task,
       {
         kind: "artifact",
         title: label,
-        content,
-        links: buildActionMrLinks(action),
+        content: broadcastContent,
+        links,
       },
       // 后台播报绝不建群（准入闸的第二半、贴在 createChat 紧前）
       { allowCreate: false },

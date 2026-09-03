@@ -110,11 +110,13 @@ export const buildCleanupCardEndedAllJson = (
 
 // ----------------- 控制面板卡（/help） -----------------
 
-/** 面板快捷按钮的 element_id（固定三颗、无需哈希） */
+/** 面板快捷按钮的 element_id（固定、无需哈希） */
 const PANEL_BUTTON_IDS: Record<PanelCommand, string> = {
   new: "btn_cmd_new",
   clean: "btn_cmd_clean",
   status: "btn_cmd_status",
+  chats: "btn_cmd_chats",
+  model: "btn_cmd_model",
 };
 
 const panelButton = (command: PanelCommand, label: string): unknown => {
@@ -142,6 +144,8 @@ export const buildHelpPanelCardJson = (
     { tag: "hr", element_id: "hr_help" },
     // 按钮文案带指令词（2026-07-20 用户拍板）——顺带教用户下次直接打命令
     panelButton("new", "开新对话 /new"),
+    panelButton("chats", "对话遥控器 /chats"),
+    panelButton("model", "换模型 /model"),
     panelButton("clean", "清理对话 /stop"),
     panelButton("status", "桥接状态 /status"),
   ]);

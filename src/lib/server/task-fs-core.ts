@@ -216,6 +216,13 @@ export interface TaskMetaV06 {
   isolateWorktree?: boolean;
   /** V0.11.1：最近一次 agent 会话的 agentId（服务重启后 Agent.resume 续会话、详见 types.ts） */
   sessionAgentId?: string;
+  /**
+   * 保命轮换水位（2026-09-03 OOM 根治）：当前 SDK 会话累计 input token。
+   * - recordTurnUsage 每轮累加；setTaskSessionAgentId 换到新 agentId 时清零
+   *   （create/轮换/懒重启；resume 不走 set，胖会话水位重启不丢）。
+   * - 缺字段（老任务）= 0，阈值见 session-rotate.ts。
+   */
+  sessionInputTokens?: number;
   /** V0.6.14：ship 合并后是否删源分支（缺省保留、详见 types.ts Task.removeSourceBranchOnMerge） */
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户置顶（缺省 false） */
@@ -1168,6 +1175,8 @@ export const assembleTask = (
   disabledMcpServers: meta.disabledMcpServers,
   isolateWorktree: meta.isolateWorktree,
   sessionAgentId: meta.sessionAgentId,
+  // 保命轮换水位透传（2026-09-03 OOM 根治、meta 落盘、见 session-rotate.ts）
+  sessionInputTokens: meta.sessionInputTokens,
   // 计算字段（不落盘）：agent 实际工作目录——隔离 task = worktree cwd、否则 = 原仓库 cwd。
   // client 的「在 IDE 打开工作区 / 复制路径 / 预览」都要它、而 dataRoot 只有 server 知道
   workCwd: getTaskCwd(meta),

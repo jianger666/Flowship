@@ -368,6 +368,49 @@ describe("normalize / parse helpers", () => {
       command: "clean",
     });
     expect(parseCardButtonValue({ kind: "cmd", command: "hack" })).toBeNull();
+    expect(parseCardButtonValue({ kind: "cmd", command: "chats" })).toEqual({
+      kind: "cmd",
+      command: "chats",
+    });
+    expect(parseCardButtonValue({ kind: "cmd", command: "model" })).toEqual({
+      kind: "cmd",
+      command: "model",
+    });
+  });
+
+  it("chats：op 必填、可选字段按类型收、脏字段丢掉", () => {
+    expect(
+      parseCardButtonValue({
+        kind: "chats",
+        op: "switch",
+        taskId: "t1",
+        page: 2,
+        repo: "/repo/a",
+        archived: true,
+        modelId: "m-x",
+        purpose: "new",
+        forNew: true,
+        junk: "x",
+      }),
+    ).toEqual({
+      kind: "chats",
+      op: "switch",
+      taskId: "t1",
+      page: 2,
+      repo: "/repo/a",
+      archived: true,
+      modelId: "m-x",
+      purpose: "new",
+      forNew: true,
+    });
+    expect(parseCardButtonValue({ kind: "chats" })).toBeNull();
+    expect(parseCardButtonValue({ kind: "chats", op: "list", page: "x" })).toEqual({
+      kind: "chats",
+      op: "list",
+    });
+    expect(
+      parseCardButtonValue({ kind: "chats", op: "list", purpose: "hack" }),
+    ).toEqual({ kind: "chats", op: "list" });
   });
 
   it("group_ask：字段齐才认（缺 chatId 判非法）", () => {

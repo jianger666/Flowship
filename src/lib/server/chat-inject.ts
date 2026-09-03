@@ -77,6 +77,11 @@ import {
 } from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
 import { beginAskSkip, fulfillAskSkipViaWait, type AskSkipHandle } from "@/lib/server/ask-skip";
+import {
+  isSessionRotationDue,
+  rotationUsageOf,
+  SESSION_ROTATION_INFO_TEXT,
+} from "@/lib/server/session-rotate";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   migrateProviderSettings,
@@ -590,13 +595,24 @@ const runChatReplyInject = async (
     const providerUnchanged =
       runProvider === null || runProvider === wantProvider;
     const canRestart = hasBootArgs;
+    // 保命轮换（2026-09-03 OOM 根治）：当前 SDK 会话累计 input 超水位 → 不续接、
+    // 走下面懒重启分支关旧建新（起手 prompt 注入近 12 轮摘要、与 resume 失败降级同路）。
+    // 阈值极高正常会话撞不上；队列/drain 语义与切模型懒重启完全一致、不新增路径。
+    // 注：无 bootArgs（canRestart=false）时 unchanged 恒 true，本来也起不了新会话，轮换自然不触发。
+    const rotationDue = isSessionRotationDue(rotationUsageOf(task));
+    if (rotationDue) {
+      console.log(
+        `[chat-reply] task=${task.id} 会话累计 input 超水位、本轮轮换新会话`,
+      );
+    }
     const unchanged =
       !runModel ||
       !canRestart ||
       (modelEquals(runModel, bootArgs!.model!) &&
         mcpUnchanged &&
         reposUnchanged &&
-        providerUnchanged);
+        providerUnchanged &&
+        !rotationDue);
 
     if (unchanged) {
       // 队列非空或 drain 中 → 入队，勿在已排队消息前插队直接 send。
@@ -743,6 +759,13 @@ const runChatReplyInject = async (
         await writeEventAndPublish(task.id, {
           kind: "info",
           text: `已切换到 ${label}，本窗口用新会话继续，上方历史仍保留。`,
+        });
+      }
+      // 保命轮换提示（2026-09-03 OOM 根治）：info 事件在事件流里显示为灰色居中细线、无需 UI 改动
+      if (rotationDue) {
+        await writeEventAndPublish(task.id, {
+          kind: "info",
+          text: SESSION_ROTATION_INFO_TEXT,
         });
       }
     }

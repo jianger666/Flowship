@@ -37,6 +37,11 @@ interface BridgeStateStore {
    * listActiveChatTasks 会过滤掉这些；回复其旧卡片（锚定命中）= 复活（移出集合）。
    */
   endedChatTaskIds: string[];
+  /**
+   * 对话遥控器「搜对话」待关键词：为 true 时下一条纯文本按搜索处理（命令不受影响）。
+   * 读到即清（一次性），空消息也清——免得把后面的正常聊天误吞成搜索。
+   */
+  awaitingChatSearch: boolean;
 }
 
 const emptyStore = (): BridgeStateStore => ({
@@ -45,6 +50,7 @@ const emptyStore = (): BridgeStateStore => ({
   lastInboundAt: 0,
   currentChatTaskId: "",
   endedChatTaskIds: [],
+  awaitingChatSearch: false,
 });
 
 // ----------------- 写队列（挂 globalThis，对齐 enqueueLark） -----------------
@@ -96,6 +102,7 @@ const readStore = async (): Promise<BridgeStateStore> => {
             (x): x is string => typeof x === "string",
           )
         : [],
+      awaitingChatSearch: parsed.awaitingChatSearch === true,
     };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
@@ -198,6 +205,43 @@ export const removeEndedChatTaskId = async (taskId: string): Promise<void> => {
 /** 读「已结束」对话集合 */
 export const getEndedChatTaskIds = async (): Promise<string[]> => {
   return (await readStore()).endedChatTaskIds;
+};
+
+/**
+ * 对话遥控器「搜对话」：下一条纯文本是否按关键词搜。
+ * 取值即清零（读完不管用不用都关），调用方只关心“刚才是不是 true”。
+ */
+export const takeAwaitingChatSearch = async (): Promise<boolean> => {
+  let was = false;
+  await enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    was = store.awaitingChatSearch === true;
+    if (was) await writeStore({ ...store, awaitingChatSearch: false });
+  });
+  return was;
+};
+
+/** 置「搜对话」待关键词（遥控器 search_hint 点后调） */
+export const setAwaitingChatSearch = async (): Promise<void> => {
+  return enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    if (store.awaitingChatSearch) return;
+    await writeStore({ ...store, awaitingChatSearch: true });
+  });
+};
+
+/**
+ * 热路径 fast-path：无锁读一眼 flag（不进写队列、不读两次盘）。
+ * false 占 99.9%——router 先拿它过滤，只有 true 才走 take（串行确认+清零）。
+ * 两次读之间理论上有 TOCTOU（peek 后被别人 take），后果只是多一次无害的 take（返 false），
+ * correctness 靠 take 里的队列串行保证，这里只管省 I/O。
+ */
+export const peekAwaitingChatSearch = async (): Promise<boolean> => {
+  try {
+    return (await readStore()).awaitingChatSearch === true;
+  } catch {
+    return false;
+  }
 };
 
 /** 是否已处理过该 message_id */

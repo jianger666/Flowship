@@ -9,6 +9,7 @@ import { LarkApiError } from "@/lib/server/feishu-bridge/types";
 import type { Task } from "@/lib/types";
 import {
   __setFeishuGroupDepsForTest,
+  atEmailTag,
   buildShareCardJson,
   buildShareDocFilename,
   ensureRequirementGroup,
@@ -16,6 +17,7 @@ import {
   type FeishuGroupDeps,
   isBotNotInGroupSendError,
   resolveBotDisplayLabel,
+  resolveShareAts,
   shareToRequirementGroup,
   composePostShareMarkdown,
   truncateShareContent,
@@ -881,7 +883,7 @@ describe("bot 不在群判定 / shareToRequirementGroup", () => {
     expect(sendCard).toHaveBeenCalled();
     const cardArg = sendCard.mock.calls[0]![1] as Record<string, unknown>;
     expect(JSON.stringify(cardArg)).toContain("测试用户");
-    expect(JSON.stringify(cardArg)).toContain("查看工作项");
+    expect(JSON.stringify(cardArg)).not.toContain("查看工作项");
   });
 
   it("缺飞书链接 → no_story", async () => {
@@ -963,7 +965,7 @@ describe("整份产物：卡片 + md 文件两条消息", () => {
     expect(s).not.toContain("只应出现在 md 文件里的正文");
     expect(s).toContain("登录优化 · 方案");
     expect(s).toContain("来自 测试用户 · Flowship");
-    expect(s).toContain("查看工作项");
+    expect(s).not.toContain("查看工作项");
   });
 
   // 卡片已经在群里了，再抛错会让用户以为没发出去、重复点分享攒重复卡
@@ -1115,7 +1117,7 @@ describe("卡片纯函数", () => {
     expect((card.header as { title: { content: string } }).title.content).toBe(
       "需求X · 提测",
     );
-    expect(JSON.stringify(card)).toContain("查看工作项");
+    expect(JSON.stringify(card)).not.toContain("查看工作项");
     expect(JSON.stringify(card)).toContain("来自 小明 · Flowship");
   });
 
@@ -1153,7 +1155,7 @@ describe("卡片纯函数", () => {
     expect(long.endsWith(".md")).toBe(true);
   });
 
-  it("buildShareCardJson 含 kind / footer / 工作项按钮", () => {
+  it("buildShareCardJson 含 kind / footer、不带工作项按钮", () => {
     const card = buildShareCardJson({
       requirementName: "需求X",
       kind: "question",
@@ -1164,7 +1166,8 @@ describe("卡片纯函数", () => {
     const s = JSON.stringify(card);
     expect(s).toContain("疑问");
     expect(s).toContain("来自 小明 · Flowship");
-    expect(s).toContain("查看工作项");
+    // 2026-09-03：需求群内都知道工作项，storyUrl 传了也忽略
+    expect(s).not.toContain("查看工作项");
     expect((card.header as { template: string }).template).toBe("orange");
   });
 
@@ -1173,7 +1176,7 @@ describe("卡片纯函数", () => {
       requirementName: "需求X",
       kind: "artifact",
       content: "正文",
-      storyUrl: "https://project.feishu.cn/x/story/detail/1",
+      links: [{ label: "MR", url: "https://project.feishu.cn/x/story/detail/1" }],
       senderName: "小明",
     });
     const btn = collectElements(card).find((e) => e.tag === "button");
@@ -1201,7 +1204,7 @@ describe("卡片纯函数", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("链接按钮封顶、但「查看工作项」永远保留", () => {
+  it("链接按钮封顶 10 条、不再带工作项按钮", () => {
     const card = buildShareCardJson({
       requirementName: "需求X",
       kind: "artifact",
@@ -1214,8 +1217,228 @@ describe("卡片纯函数", () => {
       senderName: "小明",
     });
     const buttons = collectElements(card).filter((e) => e.tag === "button");
-    expect(buttons.length).toBe(7); // 6 条链接 + 固定的工作项出口
-    expect(JSON.stringify(card)).toContain("查看工作项");
+    expect(buttons.length).toBe(10);
+    expect(JSON.stringify(card)).not.toContain("查看工作项");
+  });
+});
+
+// 通用 @：名字 → 邮箱现查现拼，精确才 @，换不出只报不挡
+//（提测 @ 是 user_key 直连的老路，不走这里；口径都是卡片 `<at email>`）
+describe("通用 @（at 参数）", () => {
+  const atLookupDeps = (over: Record<string, unknown> = {}) => ({
+    fetchRoleMembersFull: async () => [],
+    readMemberRegistry: async () => emptyGroupMemberRegistry(),
+    searchUsers: vi.fn(async () => []),
+    parseSearchMap: async () => ({}),
+    ...over,
+  });
+
+  const story = { workItemId: "10001", projectKey: "space" };
+
+  it("角色精确命中：拼标签 + 回执 notified", async () => {
+    __setFeishuGroupDepsForTest(
+      atLookupDeps({
+        fetchRoleMembersFull: async () => [
+          { email: "zhang@example.com", name: "张三" },
+        ],
+      }),
+    );
+    const r = await resolveShareAts(["张三"], story);
+    expect(r.emails).toEqual(["zhang@example.com"]);
+    expect(r.notified).toEqual(["张三"]);
+    expect(r.unresolved).toEqual([]);
+    expect(atEmailTag("zhang@example.com")).toBe("<at email=zhang@example.com></at>");
+  });
+
+  it("传的就是邮箱：直接用，一次外部查询都不打", async () => {
+    const searchUsers = vi.fn(async () => []);
+    const fetchRoleMembersFull = vi.fn(async () => []);
+    __setFeishuGroupDepsForTest(
+      atLookupDeps({ searchUsers, fetchRoleMembersFull }),
+    );
+    const r = await resolveShareAts(["zhang@example.com"], story);
+    expect(r.emails).toEqual(["zhang@example.com"]);
+    expect(r.notified).toEqual(["zhang@example.com"]);
+    expect(fetchRoleMembersFull).not.toHaveBeenCalled();
+    expect(searchUsers).not.toHaveBeenCalled();
+  });
+
+  it("角色没有 → 注册表反查命中", async () => {
+    __setFeishuGroupDepsForTest(
+      atLookupDeps({
+        readMemberRegistry: async () =>
+          registryOf({
+            "li@example.com": {
+              openId: "ou_li",
+              botAppId: "cli_x",
+              name: "李四",
+              updatedAt: 1,
+            },
+          }),
+      }),
+    );
+    const r = await resolveShareAts(["李四"], story);
+    expect(r.emails).toEqual(["li@example.com"]);
+    expect(r.notified).toEqual(["李四"]);
+  });
+
+  it("角色/注册表都没有 → 打包调一次 user search 兜底", async () => {
+    const searchUsers = vi.fn(async () => [
+      { user_key: "uk_w", email: "w@example.com", name: "王五" },
+    ]);
+    __setFeishuGroupDepsForTest(
+      atLookupDeps({
+        searchUsers,
+        parseSearchMap: async () => ({
+          uk_w: { email: "w@example.com", name: "王五" },
+        }),
+      }),
+    );
+    const r = await resolveShareAts(["王五"], story);
+    expect(searchUsers).toHaveBeenCalledTimes(1);
+    expect(searchUsers.mock.calls[0]).toEqual([["王五"]]);
+    expect(r.emails).toEqual(["w@example.com"]);
+  });
+
+  it("25 个名字：按 20 切片串调两次再合并，全 @ 上", async () => {
+    const searchUsers = vi.fn(async (qs: string[]) => qs);
+    __setFeishuGroupDepsForTest(
+      atLookupDeps({
+        searchUsers,
+        parseSearchMap: async (resp: unknown) =>
+          Object.fromEntries(
+            (resp as string[]).map((n) => [n, { email: `${n}@x.com`, name: n }]),
+          ),
+      }),
+    );
+    const names = Array.from({ length: 25 }, (_, i) => `人${i}`);
+    const r = await resolveShareAts(names, story);
+    expect(searchUsers).toHaveBeenCalledTimes(2);
+    expect(searchUsers.mock.calls[0]?.[0]).toHaveLength(20);
+    expect(searchUsers.mock.calls[1]?.[0]).toHaveLength(5);
+    expect(r.notified).toEqual(names);
+    expect(r.unresolved).toEqual([]);
+  });
+
+  it("重名 ambiguous / 查无 not_found：不@、只报、不挡别人", async () => {
+    __setFeishuGroupDepsForTest(
+      atLookupDeps({
+        fetchRoleMembersFull: async () => [
+          { email: "a@x.com", name: "同" },
+          { email: "b@x.com", name: "同" },
+          { email: "ok@x.com", name: "好的" },
+        ],
+      }),
+    );
+    const r = await resolveShareAts(["同", "没这个人", "好的"], story);
+    expect(r.emails).toEqual(["ok@x.com"]);
+    expect(r.notified).toEqual(["好的"]);
+    expect(r.unresolved).toEqual([
+      { name: "同", reason: "ambiguous" },
+      { name: "没这个人", reason: "not_found" },
+    ]);
+  });
+
+  it("同一个人两个名字：标签只拼一次，两个原名都算 notified", async () => {
+    __setFeishuGroupDepsForTest(
+      atLookupDeps({
+        fetchRoleMembersFull: async () => [
+          { email: "zhang@example.com", name: "张三" },
+        ],
+        parseSearchMap: async () => ({}),
+      }),
+    );
+    const r = await resolveShareAts(["张三", "zhang@example.com"], story);
+    expect(r.emails).toEqual(["zhang@example.com"]);
+    // 直传的邮箱先收、名字后解析，顺序不定，按集合断言
+    expect(new Set(r.notified)).toEqual(new Set(["张三", "zhang@example.com"]));
+  });
+
+  it("分享卡自动拼 @ 标签：正文最前 + 回执 at", async () => {
+    const sendCard = vi.fn().mockResolvedValue({ message_id: "om_1", card_id: "c1" });
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      fetchGroupType: async () => ({ value: "bind", groupId: "oc_exist" }),
+      decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+      fetchWorkitemName: async () => "登录优化",
+      resolveSenderName: async () => "测试用户",
+      fetchRoleMembersFull: async () => [{ email: "zhang@example.com", name: "张三" }],
+      searchUsers: async () => [],
+      parseSearchMap: async () => ({}),
+      sendCard,
+    });
+    const r = await shareToRequirementGroup(baseTask(), {
+      kind: "message",
+      content: "方案看了",
+      at: ["张三", "没这个人"],
+    });
+    expect(r.at).toEqual({
+      notified: ["张三"],
+      unresolved: [{ name: "没这个人", reason: "not_found" }],
+    });
+    const cardArg = sendCard.mock.calls[0]![1] as Record<string, unknown>;
+    const body = collectElements(cardArg).find((e) => e.element_id === "md_body")!;
+    expect(body.content as string).toContain("<at email=zhang@example.com></at>");
+    expect(body.content as string).toContain("方案看了");
+  });
+
+  it("artifact + at：无正文渲染不出来，全进 unsupported、不查", async () => {
+    const searchUsers = vi.fn(async () => []);
+    const fetchRoleMembersFull = vi.fn(async () => []);
+    const sendCard = vi.fn().mockResolvedValue({ message_id: "om_1", card_id: "c1" });
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      fetchGroupType: async () => ({ value: "bind", groupId: "oc_exist" }),
+      decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+      fetchWorkitemName: async () => "登录优化",
+      resolveSenderName: async () => "测试用户",
+      fetchRoleMembersFull,
+      searchUsers,
+      parseSearchMap: async () => ({}),
+      sendCard,
+      sendDoc: stubDoc(),
+    });
+    const r = await shareToRequirementGroup(baseTask(), {
+      kind: "artifact",
+      title: "方案",
+      content: "全文",
+      at: ["张三"],
+    });
+    expect(r.at).toEqual({
+      notified: [],
+      unresolved: [{ name: "张三", reason: "unsupported" }],
+    });
+    expect(fetchRoleMembersFull).not.toHaveBeenCalled();
+    expect(searchUsers).not.toHaveBeenCalled();
+    const cardArg = sendCard.mock.calls[0]![1] as Record<string, unknown>;
+    expect(JSON.stringify(cardArg)).not.toContain("<at email=");
+  });
+
+  it("超长正文 + @：先拼标签再截断，@签 intact、正文截到 2000", async () => {
+    const sendCard = vi.fn().mockResolvedValue({ message_id: "om_1", card_id: "c1" });
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      fetchGroupType: async () => ({ value: "bind", groupId: "oc_exist" }),
+      decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+      fetchWorkitemName: async () => "登录优化",
+      resolveSenderName: async () => "测试用户",
+      fetchRoleMembersFull: async () => [{ email: "zhang@example.com", name: "张三" }],
+      searchUsers: async () => [],
+      parseSearchMap: async () => ({}),
+      sendCard,
+    });
+    const r = await shareToRequirementGroup(baseTask(), {
+      kind: "message",
+      content: "正文".repeat(2000),
+      at: ["张三"],
+    });
+    expect(r.at?.notified).toEqual(["张三"]);
+    const cardArg = sendCard.mock.calls[0]![1] as Record<string, unknown>;
+    const body = collectElements(cardArg).find((e) => e.element_id === "md_body")!;
+    const text = body.content as string;
+    // 标签在最前、截断不断 @ 签；总长封顶 2000
+    expect(text.startsWith("<at email=zhang@example.com></at>\n")).toBe(true);
+    expect(text.length).toBe(2000);
   });
 });
 
@@ -1249,8 +1472,12 @@ describe("分享正文口径 / 选中段载荷", () => {
 
 describe("format: post / composePostShareMarkdown", () => {
   it("mentions 搁正文前、空 mentions 原样", () => {
-    expect(composePostShareMarkdown("已提测", [{ openId: "ou_zhang", name: "张三" }])).toBe(
+    expect(composePostShareMarkdown("已提测", [{ userId: "ou_zhang", userIdKind: "open_id", name: "张三" }])).toBe(
       '<at user_id="ou_zhang">张三</at>\n已提测',
+    );
+    // union_id 拼标签行为不变（值原样进 user_id）
+    expect(composePostShareMarkdown("已提测", [{ userId: "on_abc", userIdKind: "union_id", name: "李四" }])).toBe(
+      '<at user_id="on_abc">李四</at>\n已提测',
     );
     expect(composePostShareMarkdown("  hello  ")).toBe("hello");
   });
@@ -1276,7 +1503,7 @@ describe("format: post / composePostShareMarkdown", () => {
       {
         format: "post",
         content: "已提测，请验收：\n- MR · crm-web https://example/mr/1",
-        mentions: [{ openId: "ou_zhang", name: "张三" }],
+        mentions: [{ userId: "ou_zhang", userIdKind: "open_id", name: "张三" }],
       },
       { allowCreate: false },
     );

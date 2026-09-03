@@ -19,6 +19,7 @@ const {
   __setGroupBroadcastDepsForTest,
   broadcastActionCompletion,
   buildActionMrLinks,
+  buildAllActionMrLinks,
   shouldBroadcastAction,
 } = await import("@/lib/server/feishu-bridge/group-broadcast");
 
@@ -155,12 +156,12 @@ describe("MR 按钮只取本 action 的副作用", () => {
     ]);
   });
 
-  it("没有副作用 → 空数组（卡片只留「查看工作项」）", () => {
+  it("没有副作用 → 空数组（卡片只留正文和署名）", () => {
     expect(buildActionMrLinks(shipAction())).toEqual([]);
   });
 
-  it("空 url 跳过、最多 4 个", () => {
-    const mrs = Array.from({ length: 6 }, (_, i) => ({
+  it("空 url 跳过、最多 10 个", () => {
+    const mrs = Array.from({ length: 12 }, (_, i) => ({
       repoPath: `/repo/r${i}`,
       mrUrl: `https://gitlab/mr/${i}`,
       mrVersion: 1,
@@ -169,8 +170,23 @@ describe("MR 按钮只取本 action 的副作用", () => {
     }));
     mrs[0].mrUrl = "  ";
     const links = buildActionMrLinks(shipAction({ sideEffects: { mrs } }));
-    expect(links).toHaveLength(4);
+    expect(links).toHaveLength(10);
     expect(links[0]).toEqual({ label: "MR · r1", url: "https://gitlab/mr/1" });
+  });
+
+  it("all 版不封顶、封顶版取前 10（超的溢到正文）", () => {
+    const mrs = Array.from({ length: 12 }, (_, i) => ({
+      repoPath: `/repo/r${i}`,
+      mrUrl: `https://gitlab/mr/${i}`,
+      mrVersion: 1,
+      branch: "b",
+      commitHash: "c",
+    }));
+    const action = shipAction({ sideEffects: { mrs } });
+    expect(buildAllActionMrLinks(action)).toHaveLength(12);
+    const capped = buildActionMrLinks(action);
+    expect(capped).toHaveLength(10);
+    expect(capped[9]).toEqual({ label: "MR · r9", url: "https://gitlab/mr/9" });
   });
 });
 
@@ -203,6 +219,33 @@ describe("播报闭环", () => {
     expect(input.links).toEqual([
       { label: "MR · crm-web", url: "https://gitlab/mr/1" },
     ]);
+  });
+
+  it("12 条 MR：按钮 10 个，超的 2 条拼进正文（播报不静默丢）", async () => {
+    const shareToGroup = vi.fn(async () => ({}));
+    __setGroupBroadcastDepsForTest(baseDeps({ shareToGroup }) as never);
+    const action = shipAction({
+      sideEffects: {
+        mrs: Array.from({ length: 12 }, (_, i) => ({
+          repoPath: `/repo/r${i}`,
+          mrUrl: `https://gitlab/mr/${i}`,
+          mrVersion: 1,
+          branch: "b",
+          commitHash: "c",
+        })),
+      },
+    });
+
+    expect(await broadcastActionCompletion(taskOf(action), action)).toBe("sent");
+    const input = callArgs(shareToGroup)[1] as {
+      content: string;
+      links: Array<{ label: string; url: string }>;
+    };
+    expect(input.links).toHaveLength(10);
+    // 溢出进 md 文件正文：打开文件即见
+    expect(input.content).toContain("剩下的 MR");
+    expect(input.content).toContain("https://gitlab/mr/10");
+    expect(input.content).toContain("https://gitlab/mr/11");
   });
 
   it("ship 档：非提测 action 不播", async () => {

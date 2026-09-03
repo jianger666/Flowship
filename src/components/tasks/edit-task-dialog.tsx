@@ -27,8 +27,7 @@ import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Tooltip } from "@/components/ui/tooltip";
-import { Combobox } from "@/components/ui/combobox";
+import { FeatureBranchesField } from "@/components/tasks/feature-branches-field";
 import {
   Dialog,
   DialogContent,
@@ -299,45 +298,14 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
 
           {/* 被测业务分支：仅测试任务展示（per-repo、当前选中仓） */}
           {testingTask && selectedRepos.length > 0 && (
-            <div className="grid gap-1.5">
-              <Label>被测业务分支（可后补）</Label>
-              <p className="text-xs text-muted-foreground">
-                补上后从下一个 Action 起生效；留空时 AI 只把当前仓库作为结构参考，不视为需求实现
-              </p>
-              <div className="grid gap-2">
-                {selectedRepos.map((p) => {
-                  const entry = branchMap[p];
-                  return (
-                    <div key={p} className="flex items-center gap-2">
-                      <Tooltip content={repoNameOf(p)}>
-                        <span className="w-28 shrink-0 truncate text-sm text-muted-foreground">
-                          {repoNameOf(p)}
-                        </span>
-                      </Tooltip>
-                      <Combobox
-                        value={featureBranches[p] ?? ""}
-                        onValueChange={(v) =>
-                          setFeatureBranches((prev) => ({ ...prev, [p]: v }))
-                        }
-                        options={entry?.branches ?? []}
-                        emptyHint="暂无候选"
-                        allowCustom={Boolean(entry?.gitMissing)}
-                        placeholder={
-                          entry?.isRepo === false
-                            ? entry.pathMissing
-                              ? "路径不存在"
-                              : entry.gitMissing
-                                ? "未检测到 git、可手填"
-                                : "非 git 仓库"
-                            : "选择业务分支"
-                        }
-                        wrapperClassName="w-auto min-w-0 flex-1"
-                      />
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+            <FeatureBranchesField
+              repoPaths={selectedRepos}
+              repoNameOf={repoNameOf}
+              featureBranches={featureBranches}
+              onChange={setFeatureBranches}
+              branchMap={branchMap}
+              hint="补上后从下一个 Action 起生效；留空时 AI 只把当前仓库作为结构参考，不视为需求实现"
+            />
           )}
         </div>
 

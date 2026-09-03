@@ -265,7 +265,7 @@ submit_mr({
 > ⚠️ **id 体系一律用 user_key（纯数字、不加任何前缀）**——2026-06-12 实测确诊：服务端把 mention 的 id 按 user_key 校验、传 lark_user_id 直接报 `cross tenant`（bytedance.bits.collect_public:userKey cross tenant）、06-09 还能用的 lark_user_id 体系已被封死。
 > 🛑 **绝对不要给 mention 块 id 加 `lark_user_id_` 前缀**——skill 文档举例是坑、实测带前缀报 `no permission`（2026-06-04 确诊）。
 >
-> 🔕 **已知缺陷（2026-06-12 实测、暂无解）**：官方通知链路故障——user_key 体系的评论能发出、@ 蓝色渲染正常、**但被 @ 的人收不到飞书推送**。评论照发（链接 + @ 渲染仍有展示价值）。**写完评论立刻调 `notify_group_testers({ task_id, action_id })`**：服务端在需求群用 IM `open_id` @ 同一批测试（能对上注册表邮箱的才会 @、会推飞书提及）。没绑群 / 本机 bot 不在群 / 对不上人 → 工具返回 `skipped_*`，记进 artifact，不要报错、不要改调 `share_to_group`、不要重试。
+> 🔕 **已知缺陷（2026-06-12 实测、暂无解）**：官方通知链路故障——user_key 体系的评论能发出、@ 蓝色渲染正常、**但被 @ 的人收不到飞书推送**。评论照发（链接 + @ 渲染仍有展示价值）。**写完评论立刻调 `notify_group_testers({ task_id, action_id })`**：服务端发提测通知卡、用卡片 `<at email>` @ 同一批测试（有邮箱的才会 @、会推飞书提及；没邮箱的进 missed 名单）。没绑群 / 本机 bot 不在群 / 换不出人 → 工具返回 `skipped_*`，超时或发送失败返回 `failed`（可重调一次；回 `skipped_duplicate` 说明已发出），都记进 artifact，不要报错、不要改调 `share_to_group`。
 
 ```bash
 # work_item_id / project_key 优先复用 §2 `url decode` + `project search` 的结果
@@ -291,7 +291,7 @@ meegle comment add \
 - 多仓 task：一条评论里平铺所有 MR 链接、按 repoPath 末段名（如 `crm-web`）标注
 - `feishuTesterUserKeys` 为空数组（用户选了跳过）：评论不加 @ mention 块、notify 两参数省略、只贴链接
 - 飞书评论失败：artifact «§4 飞书评论» 记 ❌ + 错误信息、不阻塞 ship action 完成（用户后续手动补）
-- **需求群 IM @（必做、同本步门禁）**：评论写完（成功或失败都调；有冲突整步跳过时本工具也不调）立刻 `notify_group_testers({ task_id, action_id })`。人从已落库的 `feishuTesterUserKeys` 取、MR 从本轮 `submit_mr` 记录取——你不要传人、不要拼 `open_id`。`feishuTesterUserKeys` 为空：不必调。返回 `outcome` 原样写进 artifact：`sent` = 已 @；`skipped_*` = 没发出去（没群 / bot 不在群 / 对不上 IM 身份等），都不是 ship 失败。
+- **需求群 IM @（必做、同本步门禁）**：评论写完（成功或失败都调；有冲突整步跳过时本工具也不调）立刻 `notify_group_testers({ task_id, action_id })`。人从已落库的 `feishuTesterUserKeys` 取、MR 从本轮 `submit_mr` 记录取——你不要传人、不要拼 `open_id`。`feishuTesterUserKeys` 为空：不必调。服务端发一张提测通知卡：MR 按钮 + 邮箱 @ 测试人员（卡片 `<at email>` 已证可渲染+推送；没邮箱的进 missed 名单、不@）。返回 `outcome` 原样写进 artifact：`sent` = 已发（服务端同时在事件流写一条「已在需求群 @ 谁」回执）；`skipped_*` = 没发出去（没群 / bot 不在群 / 换不出 IM 身份 / 重复调用等）；`failed` = 超时或发送失败（可重调一次；回 `skipped_duplicate` 说明已发出）。三者都不是 ship 失败。
 
 ### 4.5 飞书工作项节点流转（V0.14 状态同步、best-effort）
 

@@ -39,6 +39,8 @@ import {
  */
 const HELP_TEXT = [
   "/new [消息] — 开新对话（可带首条消息）",
+  "/chats — 对话遥控器（换对话 / 新对话 / 换模型）",
+  "/model — 给当前对话换模型（默认 + 星标 + 全部）",
   "/stop — 弹对话清理卡（结束不要的对话）",
   "/status — 桥接运行状态",
   "/help — 本面板",
@@ -302,11 +304,27 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
  */
 const cmdStop: BridgeCommandHandler = async () => execCleanupCard();
 
+/** /chats → 对话遥控器主卡 */
+const cmdChats: BridgeCommandHandler = async () => {
+  const { showChatsPanel } = await import("./chats-panel");
+  await showChatsPanel();
+  return "handled";
+};
+
+/** /model → 当前对话的模型选择卡（无当前对话时回遥控器） */
+const cmdModel: BridgeCommandHandler = async () => {
+  const { showModelCard } = await import("./chats-panel");
+  await showModelCard();
+  return "handled";
+};
+
 const COMMANDS: Array<[string, BridgeCommandHandler]> = [
   ["help", cmdHelp],
   ["status", cmdStatus],
   ["new", cmdNew],
   ["stop", cmdStop],
+  ["chats", cmdChats],
+  ["model", cmdModel],
 ];
 
 /** 注册四个命令（globalThis 幂等）；启动链由主线调 */
