@@ -22,7 +22,8 @@
  */
 
 import {
-  getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   patchActionAndRunStatusIfOpFresh,
   setTaskRunStatusIfRunOwner,
 } from "@/lib/server/task-fs";
@@ -140,7 +141,7 @@ const waitUntilResumeRunning = async (
   const resumed = resume((task) => {
     committed = task;
     settleEarly?.(task);
-  }).then(async () => committed ?? (await getTask(taskId)) ?? fallback);
+  }).then(async () => committed ?? (await getTaskMeta(taskId)) ?? fallback);
 
   // early 先赢时 resumed 仍在飞；phase 1 拒绝才传到 HTTP
   void resumed.catch((err) => {
@@ -198,7 +199,9 @@ const runTaskQuestionInject = async (
     return errorResponse("text / images / attachments 至少一项非空");
   }
 
-  let task = await getTask(id);
+  // B1：入口只读 meta（actions / runStatus 等状态机字段）；事件只在下面 ask 判定处按需读尾部。
+  // 全量 parse 9MB events.jsonl 是 OOM 峰值主因，而本文件除 ask 判定外零处用 events。
+  let task = await getTaskMeta(id);
   if (!task) return errorResponse("not_found", 404);
 
   // lifecycle 非 null（stopping/deleting/finalizing）一律拒发送 / 唤醒
@@ -227,7 +230,11 @@ const runTaskQuestionInject = async (
   // 和答题卡对锁——只能重新推进（同事反馈）。
   // 同一轮 curl 还挂着等答案时 run 仍是 running：下面先放行，认领后写进 curl；
   // 写不进再 409，绝不走 abortStuck 把还在等的 run 杀掉。
-  const pendingAskOpen = !!findPendingAskEvent(task.events);
+  // B1：ask 判定只看尾部 200 条——未答提问必然在尾部（它阻塞 run 进展，阻塞期间只能追
+  // 加零星事件；重连通知上限 5 条、24h 过期/停止/终结都会直接决议它）。全量读只为找它太贵。
+  const askTail = await getTaskWithTailEvents(id, 200);
+  const askEvents = askTail?.events ?? [];
+  const pendingAskOpen = !!findPendingAskEvent(askEvents);
 
   // run 还在表里：真·干活中 → 409；下面两类只是收尾还没 drain → 等 runner 退出再发。
   // - 已交卷（awaiting_ack）但收尾旁白未完：UI 已放开输入框，runningTasks 还占着
@@ -260,7 +267,7 @@ const runTaskQuestionInject = async (
       if (!stopped) {
         return errorResponse("agent 正在跑、等它说完这轮再问", 409);
       }
-      const fresh = await getTask(id);
+      const fresh = await getTaskMeta(id);
       if (!fresh) return errorResponse("not_found", 404);
       // 等待期间用户可能点了「推进」起了新 action / 新 run：
       // 世界已变、这条消息的语境失效——再校验一次、不满足就让用户重发
@@ -353,7 +360,9 @@ const runTaskQuestionInject = async (
   // 认领必须同步、且赶在下面任何 await 之前——它是与「答题」互斥的那一步
   //（谁先摘到 pendingAsk 谁说了算，见 ask-skip 文件头）。
   // 群里**非属主**的消息不给跳过资格：属主的提问不该被别人一句话作废。
-  const askSkip = questionOnly ? null : beginAskSkip(task);
+  // B1：隐式跳过认领用的事件同样只看尾部（与上面 pendingAskOpen 同一快照语义；
+  // 认领本身走 takePendingAskIf 原子注册，不依赖全量）。
+  const askSkip = questionOnly ? null : beginAskSkip({ ...task, events: askEvents });
   if (askSkip?.claimed) skipRef.handle = askSkip;
   // 事件用用户原文；发给 agent 的带跳过上下文 + skill 指引（三条分流共用）
   const agentText =
@@ -535,7 +544,7 @@ const runTaskQuestionInject = async (
       if (a) publishTaskStreamEvent(task.id, { kind: "action", action: a });
     }
     // 返 null = 已 stale（stop 已接管）——消息已送达 run，task 状态归 stop；仍 200
-    const fresh = await getTask(task.id);
+    const fresh = await getTaskMeta(task.id);
     return new Response(
       JSON.stringify({
         ok: true,
@@ -551,7 +560,7 @@ const runTaskQuestionInject = async (
 
   // send 成功且无需改 ack 状态——直接 200（勿落入下方 one-shot 写 running）
   if (sent) {
-    const fresh = await getTask(task.id);
+    const fresh = await getTaskMeta(task.id);
     return new Response(
       JSON.stringify({
         ok: true,

@@ -27,6 +27,8 @@ const {
   deliverTaskQuestion,
   getChatLifecycle,
   getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   getPendingAsk,
   isTaskOpStale,
   patchActionAndRunStatusIfOpFresh,
@@ -44,12 +46,23 @@ const {
   writeUserEventAndPublishStrict,
 } = vi.hoisted(() => {
   type AnyFn = (...args: never[]) => unknown;
+  // B1：getTaskMeta 只是“不读 events 的 getTask”——与 getTask 同实现，跟着各用例的
+  // mockImplementation 走；tail 读 mock 直接返同一 fixture（生产代码只读它的 .events）。
+  const getTask = vi.fn<AnyFn>();
+  const getTaskMeta = vi.fn<AnyFn>((...args: never[]) =>
+    getTask(...args),
+  );
+  const getTaskWithTailEvents = vi.fn<AnyFn>(
+    async (...args: never[]) => getTask(...args),
+  );
   return {
     agentSessions: new Map<string, unknown>(),
     runningTasks: new Map<string, unknown>(),
     deliverTaskQuestion: vi.fn<AnyFn>(async () => "sent"),
     getChatLifecycle: vi.fn<AnyFn>(() => null),
-    getTask: vi.fn<AnyFn>(),
+    getTask,
+    getTaskMeta,
+    getTaskWithTailEvents,
     getPendingAsk: vi.fn<AnyFn>(() => null),
     isTaskOpStale: vi.fn<AnyFn>(() => false),
     patchActionAndRunStatusIfOpFresh: vi.fn<AnyFn>(async () => null),
@@ -69,6 +82,8 @@ const {
 
 vi.mock("@/lib/server/task-fs", () => ({
   getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   patchActionAndRunStatusIfOpFresh,
   setTaskRunStatusIfRunOwner,
 }));

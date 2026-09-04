@@ -36,7 +36,7 @@ import { dataRoot } from "./data-root";
 import {
   appendAction,
   finalizeStaleAndIdleLocked,
-  getTask,
+  getTaskMeta,
   isCurrentRunningAction,
   patchAction,
   patchActionIfOwner,
@@ -487,7 +487,7 @@ export const closeTaskSession = (
   // 换新 agent（fork）场景传 reap:false——新 agent 马上在同一 worktree 拉 shell、
   // reap 的 2.5s 二次扫会误杀（V0.6.8 老坑、语义沿用）
   if (opts.reap !== false) {
-    void getTask(taskId)
+    void getTaskMeta(taskId)
       .then((t) => {
         if (t) reapTaskOrphans(getTaskWorkRepoPaths(t));
       })
@@ -642,7 +642,7 @@ const runActionPostCheck = (
 
     let postCheck: ActionRecord["postCheck"] | undefined;
     try {
-      const fresh = await getTask(taskId);
+      const fresh = await getTaskMeta(taskId);
       const targetAction = fresh?.actions.find((a) => a.id === actionId);
       if (fresh && targetAction) {
         const result = await runActionCheck(fresh, targetAction);
@@ -669,7 +669,7 @@ const runActionPostCheck = (
     }
 
     // 再确认 action 仍在等 check（没被 stop 标 cancelled / 没被推进改状态）
-    const after = await getTask(taskId);
+    const after = await getTaskMeta(taskId);
     // getTask 这个 await 期间可能被停止 / 推进 abort（杀子进程 + 标 cancelled）→ 落状态前再查一次 owner
     if (!stillOwner()) {
       console.log(
@@ -851,7 +851,7 @@ const finalizeStaleActions = async (
   status: "error" | "cancelled",
   exceptActionId?: string,
 ): Promise<void> => {
-  const fresh = await getTask(taskId);
+  const fresh = await getTaskMeta(taskId);
   if (!fresh) return;
   const stale = fresh.actions.filter(
     (a) =>
@@ -950,7 +950,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
     const lease = (): boolean =>
       isTaskOpCurrent(opHandle) && getChatLifecycle(taskId) === null;
     if (!(await stillPrewarm())) return;
-    const task = await getTask(taskId);
+    const task = await getTaskMeta(taskId);
     if (!task || !isWorktreeTask(task)) return;
     if (!(await stillPrewarm())) return;
     try {
@@ -1124,7 +1124,7 @@ const advanceTaskCore = async (
         () => !isTaskOpStale(task.id, opGen),
       );
     }
-    task = (await getTask(task.id)) ?? task;
+    task = (await getTaskMeta(task.id)) ?? task;
   }
 
   // V0.10：隔离工作区 task → 推进前确定性建 / 复用 worktree（幂等、已存在秒过）。
@@ -1194,7 +1194,7 @@ const advanceTaskCore = async (
         },
       );
     }
-    task = (await getTask(task.id)) ?? task;
+    task = (await getTaskMeta(task.id)) ?? task;
   }
 
   // V0.6.27 默认反转：每 action 默认起新 agent（context 截断是治跑偏的根、artifact 是唯一接力棒）。
@@ -1245,7 +1245,7 @@ const advanceTaskCore = async (
       );
     }
     // 条件失败（stop 已 cancelled / 并发处理）或成功：都重读最新 task 继续
-    task = (await getTask(task.id)) ?? task;
+    task = (await getTaskMeta(task.id)) ?? task;
   }
 
   // 终态 repoStatus 拒推进（须在准入前；盘上 fresh）
@@ -1573,7 +1573,7 @@ const resumeCurrentActionCore = async (
   const opGen = input.opGen!;
   await assertNoUpdatePendingRestart();
   abortRunningCheck(input.task.id);
-  const fresh = await getTask(input.task.id);
+  const fresh = await getTaskMeta(input.task.id);
   if (!fresh) throw new Error("task 不存在、无法唤醒当前 action");
   // 终态拒唤醒（盘上 fresh）
   await assertTaskNotTerminalForAdvance(fresh.id);
@@ -1659,7 +1659,7 @@ const resumeCurrentActionCore = async (
     for (const info of infos) {
       await upsertGitBranch(fresh.id, info, () => isOpOwner(opHandle));
     }
-    startTask = (await getTask(fresh.id)) ?? startTask;
+    startTask = (await getTaskMeta(fresh.id)) ?? startTask;
     await abortIfTaskOpStale(fresh.id, opGen);
   }
 
@@ -1705,7 +1705,7 @@ const resumeCurrentActionCore = async (
         await upsertGitBranch(fresh.id, info, () => isOpOwner(opHandle));
       }
     }
-    startTask = (await getTask(fresh.id)) ?? startTask;
+    startTask = (await getTaskMeta(fresh.id)) ?? startTask;
     await abortIfTaskOpStale(fresh.id, opGen);
   }
 
@@ -1723,7 +1723,7 @@ const resumeCurrentActionCore = async (
         }
       }
       branchCheckoutHint = planned.promptHint;
-      startTask = (await getTask(fresh.id)) ?? startTask;
+      startTask = (await getTaskMeta(fresh.id)) ?? startTask;
     }
     await abortIfTaskOpStale(fresh.id, opGen);
   }
@@ -1815,7 +1815,7 @@ export const finalizeTask = async (
   finalStatus: Extract<RepoStatus, "merged" | "abandoned">,
   reason?: string,
 ): Promise<void> => {
-  const task = await getTask(taskId);
+  const task = await getTaskMeta(taskId);
   if (!task) {
     throw new Error("task 不存在、无法 finalize");
   }
@@ -1877,7 +1877,7 @@ export const finalizeTask = async (
     // V0.x：merged（已合入）时、当前还在等 ack 的 action 标 completed——用户认可了产物才去合 MR、
     //   不该记成 cancelled（abandoned 维持下面的 cancelled：没认可就放弃）。
     if (finalStatus === "merged") {
-      const fresh = await getTask(taskId);
+      const fresh = await getTaskMeta(taskId);
       const cur = fresh?.actions.find(
         (a) => a.id === fresh.currentActionId && a.status === "awaiting_ack",
       );
@@ -2060,7 +2060,7 @@ export class TaskCleanupInProgressError extends Error {
  * - waiting + jobs 归零：invalidate 作废旧 cleanup + 立即解除 quarantine（让位语义保留）
  */
 export const reopenTask = async (taskId: string): Promise<void> => {
-  const task = await getTask(taskId);
+  const task = await getTaskMeta(taskId);
   if (!task) throw new Error("task 不存在、无法恢复");
   if (task.repoStatus !== "merged" && task.repoStatus !== "abandoned") {
     throw new Error("只有已合入 / 已放弃的任务才能恢复");
@@ -2197,7 +2197,7 @@ export const buildSessionBridges = (
       // 起 createMR 前、server 端按 task 权威数据 + 该仓真实 git remote 校验 agent 上报。
       // agent 幻觉 / prompt 被污染 / remote 解析出错时、防它用 server PAT 给越权 project 提 MR。
       // 读 fresh task（闭包 task 是启动时快照、不含本轮 ship 刚 upsert 的 MR、且校验要最新 gitBranches）。
-      const fresh = await getTask(task.id);
+      const fresh = await getTaskMeta(task.id);
       if (!fresh) {
         return { ok: false, error: "task 不存在、无法校验 submit_mr" };
       }
@@ -2528,7 +2528,7 @@ export const buildSessionBridges = (
 
     if (taskAction.kind === "set_feishu_testers") {
       // 结构条件——须是当前 running action（ship 进行中）；验收点名原先无此闸
-      const freshFeishu = await getTask(task.id);
+      const freshFeishu = await getTaskMeta(task.id);
       if (!callerStillValid()) {
         return { ok: false, error: CALLER_MISMATCH_ERROR };
       }
@@ -2681,7 +2681,7 @@ export const buildSessionBridges = (
       }
       // 同一轮 curl 还挂着等答案：runStatus 保持 running（shell 确实没结束）。
       // 输入条能不能打字由 UI 看 pending ask，不靠切 awaiting_user。
-      const fresh = await getTask(task.id);
+      const fresh = await getTaskMeta(task.id);
       if (fresh && askLease()) publish(task.id, { kind: "task", task: fresh });
       return "accepted";
     }
@@ -3487,7 +3487,7 @@ const tryAutoReconnect = async (
     isTaskOpCurrent(opts.opHandle) ? null : "cancelled";
 
   // 任务已终结（用户重连期间 finalize / 删除）不再折腾
-  const fresh = await getTask(task.id);
+  const fresh = await getTaskMeta(task.id);
   {
     const y = yieldIfOpLost();
     if (y) return y;
@@ -3705,7 +3705,7 @@ export const handleRunFailure = async (
       // ② owner 维度失败：绝不 finalize——同 action 后继共享 actionId、
       //    stop 已写 cancelled，都不能被改写。
       if (isOwner()) {
-        const freshAfterNull = await getTask(taskId);
+        const freshAfterNull = await getTaskMeta(taskId);
         const ownAction = freshAfterNull?.actions.find(
           (a) => a.id === errorActionId,
         );
@@ -3753,7 +3753,7 @@ export const handleRunFailure = async (
 
   await failpoint("failure.beforePublish");
 
-  const errored = await getTask(taskId);
+  const errored = await getTaskMeta(taskId);
   if (!isOwner()) return;
   if (errored) publish(taskId, { kind: "done", task: errored, ok: false });
   publish(taskId, { kind: "error", message: eventText });
@@ -3776,7 +3776,7 @@ const restoreRunStatusAfterQuestion = async (
   taskId: string,
   isOwner: () => boolean,
 ): Promise<void> => {
-  const fresh = await getTask(taskId);
+  const fresh = await getTaskMeta(taskId);
   if (!fresh || fresh.runStatus !== "running") return;
   const cur = fresh.actions.find((a) => a.id === fresh.currentActionId);
   const target =
@@ -3933,7 +3933,7 @@ const applyPendingStopIfRequested = async (
     // gen 不匹配且 lifecycle 已释放：owner 收尾已写完，只补 done 解挂 UI
     // 后继已 claim 则不发（失主不得清 B 的 streamingText）
     if (genStale && lifecycle === null) {
-      const fresh = await getTask(task.id);
+      const fresh = await getTaskMeta(task.id);
       publishIfCurrent(task.id, stillCurrentForDone, {
         kind: "done",
         task: fresh ?? task,
@@ -3944,7 +3944,7 @@ const applyPendingStopIfRequested = async (
   }
 
   // 仅 pending：stop 可能已在飞行窗口写完收尾并留下标记——已 idle 则勿再写事件
-  const fresh = await getTask(task.id);
+  const fresh = await getTaskMeta(task.id);
   const own = ownActionId
     ? fresh?.actions.find((a) => a.id === ownActionId)
     : undefined;
@@ -4143,7 +4143,7 @@ const consumeSessionRun = async (
             isTaskOpCurrent(opts.opHandle),
           );
         }
-        const freshQ = await getTask(task.id);
+        const freshQ = await getTaskMeta(task.id);
         // restore/getTask await 后、publish done 前复查
         await failpoint("question.beforeDone");
         if (lostStartOwner()) return;
@@ -4281,7 +4281,7 @@ const consumeSessionRun = async (
             isTaskOpCurrent(opts.opHandle),
           );
         }
-        const freshQ = await getTask(task.id);
+        const freshQ = await getTaskMeta(task.id);
         // await 后复查再发 done
         await failpoint("question.beforeDone");
         if (lostStartOwner()) return;
@@ -4355,7 +4355,7 @@ const consumeSessionRun = async (
     //   - 都没有、最后一个 action 还挂 running → send 追问补交卷（每 action ≤2 次）；
     //     追问仍不交卷 → 标 error + 关会话（语义对齐原 stop-check）
     await failpoint("consume.beforeFinalize");
-    const fresh = await getTask(task.id);
+    const fresh = await getTaskMeta(task.id);
     // 同 action 的后继（resume 双唤醒）接管时 actionId 完全相同、下面的
     // 全局 lastAction 比对识别不了——wait/getTask 的 await 期间 startToken 被
     // 覆盖 → 本 run 的自然结束不做任何业务收尾（不追问、不标 error、不写状态），
@@ -4588,7 +4588,7 @@ const consumeSessionRun = async (
               ].join("\n"),
             },
           );
-          const updated = await getTask(task.id);
+          const updated = await getTaskMeta(task.id);
           if (updated) publish(task.id, { kind: "task", task: updated });
           // 迟到 done(ok=false) 不得清后继 B 的 streaming——publishIfCurrent
           publishIfCurrent(task.id, () => isTaskOpCurrent(opts.opHandle), {
@@ -4638,7 +4638,7 @@ const consumeSessionRun = async (
           ].join("\n"),
         },
       );
-      const updated = await getTask(task.id);
+      const updated = await getTaskMeta(task.id);
       if (updated) publish(task.id, { kind: "task", task: updated });
       // 同上——迟到 done(ok=false) 门控
       publishIfCurrent(task.id, () => isTaskOpCurrent(opts.opHandle), {
@@ -4664,7 +4664,7 @@ const consumeSessionRun = async (
           isTaskOpCurrent(opts.opHandle),
         );
       }
-      const freshQ = await getTask(task.id);
+      const freshQ = await getTaskMeta(task.id);
       // await 后复查再发 done
       await failpoint("question.beforeDone");
       if (lostStartOwner()) return;
@@ -4683,7 +4683,7 @@ const consumeSessionRun = async (
       lastAction.status === "completed" ||
       lastAction.status === "cancelled"
     ) {
-      const freshest = await getTask(task.id);
+      const freshest = await getTaskMeta(task.id);
       if (freshest?.runStatus === "running") {
         const updated = await setTaskRunStatusIfRunOwner(
           task.id,
@@ -4697,7 +4697,7 @@ const consumeSessionRun = async (
       // 交卷 check 已落 awaiting_ack、但收尾旁白当时还在跑 → runStatus 仍是 running。
       // 话说完才切 awaiting_user（系统通知 / 侧栏琥珀点对齐「可以回来看了」）。
       // 检查比旁白慢时，post-check 自己会切 awaiting_user，这里 compare-set 不动。
-      const freshest = await getTask(task.id);
+      const freshest = await getTaskMeta(task.id);
       if (freshest?.runStatus === "running") {
         const updated = await setTaskRunStatusIfRunOwner(
           task.id,
@@ -4710,7 +4710,7 @@ const consumeSessionRun = async (
     }
     // 普通 consume done——getTask/条件写 await 后复查再发；A 的迟到 done 不得清 B 的 streamingText
     await failpoint("consume.beforeDone");
-    const freshDone = await getTask(task.id);
+    const freshDone = await getTaskMeta(task.id);
     publishIfCurrent(
       task.id,
       () => isTaskOpCurrent(opts.opHandle),
@@ -4741,7 +4741,7 @@ const consumeSessionRun = async (
           isTaskOpCurrent(opts.opHandle),
         );
       }
-      const freshQ = await getTask(task.id);
+      const freshQ = await getTaskMeta(task.id);
       await failpoint("question.beforeDone");
       if (lostStartOwner()) return;
       publish(task.id, { kind: "done", task: freshQ ?? task, ok: false });
@@ -5670,7 +5670,7 @@ const sendToTaskSessionBody = async (
           if (shouldRestoreAfterQuestion(entryOpHandle)) {
             await restoreRunStatusAfterQuestion(task.id, isSendSessionOwner);
           }
-          const freshQ = await getTask(task.id);
+          const freshQ = await getTaskMeta(task.id);
           await failpoint("question.beforeDone");
           if (!isTaskOpCurrent(entryOpHandle)) return "stale";
           publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
@@ -5712,7 +5712,7 @@ const sendToTaskSessionBody = async (
         if (shouldRestoreAfterQuestion(entryOpHandle)) {
           await restoreRunStatusAfterQuestion(task.id, isSendSessionOwner);
         }
-        const freshQ = await getTask(task.id);
+        const freshQ = await getTaskMeta(task.id);
         await failpoint("question.beforeDone");
         if (!isTaskOpCurrent(entryOpHandle)) return "stale";
         publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });

@@ -992,7 +992,24 @@ export const sendQueuedChatMessageNow = async (
 /**
  * V0.11.9 任务内「跟 AI 说」：消息送给存活会话（疑问就答 / 要改就改、不新建 action、进度不动）。
  * bootArgs 无脑带上（服务重启 / 空闲回收后靠它 Agent.resume 接回会话）。
+ *
+ * 跨挂载在飞登记：顶栏 工作台/对话 切换会卸载 <TaskTalkComposer>、但 fetch 在飞，
+ * 回调闭包留在旧实例里——回来后新实例 submitting=false、草稿还留着原文，看起来像
+ * 「被取消了」，再按一次就重复发送。这里登记在飞的 promise：remount 时认领显示
+ * submitting；同一 task 已有在飞时直接拒掉新的（防重复发送加重 server 负载）。
  */
+export interface PendingQuestionSend {
+  /** 发送正文（remount 认领后比对用：用户没写新东西才清输入框） */
+  text: string;
+  startedAt: number;
+  promise: Promise<{ task: Task; persistWarning?: string }>;
+}
+const pendingQuestionSends = new Map<string, PendingQuestionSend>();
+/** 当前 task 有没有还在飞的输入条发送（组件挂载认领 submitting / 发送前去重用） */
+export const getPendingQuestionSend = (
+  taskId: string,
+): PendingQuestionSend | undefined => pendingQuestionSends.get(taskId);
+
 export const submitTaskQuestion = async (
   task: Task,
   text: string,
@@ -1004,37 +1021,58 @@ export const submitTaskQuestion = async (
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
 ): Promise<{ task: Task; persistWarning?: string }> => {
-  const s = getSettings();
-  const boot = bootArgsForTask(task, s);
-  const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/question`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text,
-      images: images && images.length > 0 ? images : undefined,
-      attachments:
-        attachments && attachments.length > 0 ? attachments : undefined,
-      skills: skills && skills.length > 0 ? skills : undefined,
-      bootArgs: {
-        apiKey: boot.apiKey,
-        model: boot.model,
-        gitToken: s.gitToken,
-      },
-      forceModel: forceModel?.id?.trim() ? forceModel : undefined,
-    }),
-  });
-  // 透传 persistWarning，调用方 toast（不可静默丢）
-  const data = await handleJson<{
-    ok: true;
+  if (pendingQuestionSends.has(task.id)) {
+    throw new Error("上一条消息还在发送中、稍等它发完再发");
+  }
+  const flight = (async (): Promise<{
     task: Task;
     persistWarning?: string;
-  }>(res);
-  return {
-    task: data.task,
-    ...(typeof data.persistWarning === "string"
-      ? { persistWarning: data.persistWarning }
-      : {}),
-  };
+  }> => {
+    const s = getSettings();
+    const boot = bootArgsForTask(task, s);
+    const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/question`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        images: images && images.length > 0 ? images : undefined,
+        attachments:
+          attachments && attachments.length > 0 ? attachments : undefined,
+        skills: skills && skills.length > 0 ? skills : undefined,
+        bootArgs: {
+          apiKey: boot.apiKey,
+          model: boot.model,
+          gitToken: s.gitToken,
+        },
+        forceModel: forceModel?.id?.trim() ? forceModel : undefined,
+      }),
+    });
+    // 透传 persistWarning，调用方 toast（不可静默丢）
+    const data = await handleJson<{
+      ok: true;
+      task: Task;
+      persistWarning?: string;
+    }>(res);
+    return {
+      task: data.task,
+      ...(typeof data.persistWarning === "string"
+        ? { persistWarning: data.persistWarning }
+        : {}),
+    };
+  })();
+  pendingQuestionSends.set(task.id, {
+    text,
+    startedAt: Date.now(),
+    promise: flight,
+  });
+  try {
+    return await flight;
+  } finally {
+    // 只摘自己登记的那一班：await 期间若已有新发送接替（理论上不会、前置已拦），不动别人的
+    if (pendingQuestionSends.get(task.id)?.promise === flight) {
+      pendingQuestionSends.delete(task.id);
+    }
+  }
 };
 
 /**

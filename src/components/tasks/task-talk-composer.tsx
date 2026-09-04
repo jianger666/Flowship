@@ -35,7 +35,7 @@ import {
   resolveSessionModel,
   talkForceModel,
 } from "@/lib/task-model";
-import { submitTaskQuestion } from "@/lib/task-store";
+import { getPendingQuestionSend, submitTaskQuestion } from "@/lib/task-store";
 import { loadDraft } from "@/lib/view-memory";
 import type { ModelSelection, Task } from "@/lib/types";
 
@@ -109,6 +109,45 @@ export const TaskTalkComposer = ({
     setDraft(draft);
   }, [task.id, setDraft, resetInput]);
 
+  // 跨挂载认领：在飞的发送不随卸载取消（fetch 继续跑、回调闭包留在旧实例）。
+  // 回来后重新挂上回调：显示 submitting + 落 onTaskUpdate；草稿里还是原文
+  // （用户没写新东西）才清输入框，否则留着用户新敲的字。
+  const onTaskUpdateRef = useRef(onTaskUpdate);
+  onTaskUpdateRef.current = onTaskUpdate;
+  const valueRef = useRef(rich.value);
+  valueRef.current = rich.value;
+  const resetRef = useRef(rich.reset);
+  resetRef.current = rich.reset;
+  useEffect(() => {
+    const pending = getPendingQuestionSend(task.id);
+    if (!pending) return;
+    setSubmitting(true);
+    let alive = true;
+    void pending.promise.then(
+      (result) => {
+        if (!alive) return;
+        if (result.persistWarning) {
+          toast.error(
+            `消息已送达但记录保存失败：${result.persistWarning}`,
+          );
+        }
+        onTaskUpdateRef.current(result.task);
+        if (valueRef.current === pending.text) resetRef.current();
+        setPickedModel(resolveSessionModel(result.task) ?? { id: "" });
+      },
+      (err: unknown) => {
+        if (!alive) return;
+        toast.error(err instanceof Error ? err.message : String(err));
+      },
+    ).finally(() => {
+      if (alive) setSubmitting(false);
+    });
+    return () => {
+      alive = false;
+    };
+    // 只在挂载 / 切任务时认领一次：在飞 promise 同一班次内引用稳定
+  }, [task.id]);
+
   // Cmd/Ctrl+J 聚焦输入条（沿用原「再聊聊」快捷键、入口合一后指到这里）
   const focusInput = rich.focus;
   useEffect(() => {
@@ -149,6 +188,11 @@ export const TaskTalkComposer = ({
 
   const handleSubmit = async () => {
     if (!rich.hasContent || busy) return;
+    // 跨挂载去重：上一条还在飞时拒掉（submitTaskQuestion 内有同款前置兜底、这里先给轻提示）
+    if (getPendingQuestionSend(task.id)) {
+      toast.error("上一条消息还在发送中、稍等它发完再发");
+      return;
+    }
     setSubmitting(true);
     try {
       // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、

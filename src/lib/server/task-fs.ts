@@ -1203,6 +1203,26 @@ export const getTask = async (id: string): Promise<Task | null> => {
 };
 
 /**
+ * 轻量读：只要 meta（actions / runStatus / repoStatus / 分支等状态机字段），
+ * 不读 events.jsonl、不读 artifact（B1 OOM 优化）。
+ *
+ * 语义与 getTask 同（boot 闸 + tombstone 闸 + shape 校验），只是 events=[]。
+ * 调用方契约：只做准入 / 状态复查 / publish 快照（SSE 本来就 stripEvents、
+ * 前端 absorbTask 按 id 并集合并）；凡做事件顺序决策的（supersede、ask-skip 认领、
+ * pendingAsk 判定）一律走全量 / tail 读，禁止用它。
+ */
+export const getTaskMeta = async (id: string): Promise<Task | null> => {
+  await ensureBootRecovery();
+  if (!assertTaskReadable(id)) return null;
+  const raw = await readMetaRaw(id);
+  if (!raw) return null;
+  if (!isValidMetaShape(raw)) return null;
+  const task = assembleTask(raw, []);
+  if (!assertTaskReadable(id)) return null;
+  return task;
+};
+
+/**
  * 轻量读盘上 repoStatus（不 hydrate events）——启动副作用边界 / 准入用，
  * 避免 getTask 握着旧 meta 在 hydrate await 期间吃到已终态任务。
  */

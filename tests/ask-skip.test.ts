@@ -31,6 +31,8 @@ const {
   deliverTaskQuestion,
   getChatLifecycle,
   getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   hasChatSession,
   isTaskOpStale,
   patchActionAndRunStatusIfOpFresh,
@@ -50,6 +52,15 @@ const {
   writeUserEventAndPublishStrict,
 } = vi.hoisted(() => {
   type AnyFn = (...args: never[]) => unknown;
+  // B1：getTaskMeta 只是“不读 events 的 getTask”——与 getTask 同实现，跟着各用例的
+  // mockImplementation 走；tail 读 mock 直接返同一 fixture（生产代码只读它的 .events）。
+  const getTask = vi.fn<AnyFn>();
+  const getTaskMeta = vi.fn<AnyFn>((...args: never[]) =>
+    getTask(...args),
+  );
+  const getTaskWithTailEvents = vi.fn<AnyFn>(
+    async (...args: never[]) => getTask(...args),
+  );
   return {
     agentSessions: new Map<string, unknown>(),
     runningTasks: new Map<string, unknown>(),
@@ -57,7 +68,9 @@ const {
     deliverChatAskReply: vi.fn<AnyFn>(async () => true),
     deliverTaskQuestion: vi.fn<AnyFn>(async () => "sent"),
     getChatLifecycle: vi.fn<AnyFn>(() => null),
-    getTask: vi.fn<AnyFn>(),
+    getTask,
+    getTaskMeta,
+    getTaskWithTailEvents,
     hasChatSession: vi.fn<AnyFn>(() => true),
     isTaskOpStale: vi.fn<AnyFn>(() => false),
     patchActionAndRunStatusIfOpFresh: vi.fn<AnyFn>(async () => null),
@@ -79,6 +92,8 @@ const {
 
 vi.mock("@/lib/server/task-fs", () => ({
   getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   patchActionAndRunStatusIfOpFresh,
   setTaskRunStatusIfRunOwner,
   // chat-pending 的 meta 同步走动态 import("./task-fs")——不 mock 会变成未捕获拒绝
