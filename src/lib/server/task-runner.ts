@@ -135,6 +135,12 @@ import { resolveSessionModel } from "@/lib/task-model";
 import { resolveWkWorktreeBranchInfos } from "./wk-source-branch";
 import { setTaskSessionAgentId } from "./task-fs";
 import {
+  isSessionRotationDue,
+  rotationUsageOf,
+  SESSION_ROTATION_INFO_TEXT,
+} from "./session-rotate";
+import { assertHeapOk, HeapPressureError } from "./sdk-store-gc";
+import {
   agentSessions,
   allocTaskRunInstanceId,
   beginTaskStarting,
@@ -1206,8 +1212,20 @@ const advanceTaskCore = async (
   // 老会话没记 repoPaths：不能当成「没漂」续旧 cwd。缺字段或列表不一致都强制新 agent。
   const reposDrifted =
     !sessionRepos || !sameRepoPathList(sessionRepos, task.repoPaths);
+  // task 保命轮换（OOM 根治）：同 action 内追问养胖的链，水位一到强制起新 agent。
+  // 新 agent 走正常 fresh 路径（artifact + 任务元信息就是接力棒），只扔 SDK 会话缓存；
+  // sessionInputTokens 在 setTaskSessionAgentId(新 id) 时清零，见 task-fs。
+  const rotationDue = isSessionRotationDue(rotationUsageOf(task));
+  if (rotationDue) {
+    console.log(
+      `[task-runner] task=${task.id} 会话累计 input 超水位、推进强制起新 agent`,
+    );
+  }
   const effectiveForceNewAgent =
-    !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[actionType] || reposDrifted;
+    !reuseAgent ||
+    ACTION_FRESH_AGENT_DEFAULT[actionType] ||
+    reposDrifted ||
+    rotationDue;
 
   // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
   //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites 看到的就是
@@ -1250,6 +1268,9 @@ const advanceTaskCore = async (
 
   // 终态 repoStatus 拒推进（须在准入前；盘上 fresh）
   await assertTaskNotTerminalForAdvance(task.id);
+
+  // 堆内存门（OOM 根治）：高压直接拒本次推进、保服务不死。友好错误上浮到 UI。
+  assertHeapOk("本次推进");
 
   // 1) 准入条件（V0.6 门槛 1）：host 按任务仓库 remote 现推（多实例不一致会 throw）
   //    脚本仓不参与推导（不 ship、origin 可能挂在别的实例）
@@ -1312,6 +1333,13 @@ const advanceTaskCore = async (
   const { task: taskAfterAppend, action } = created;
   // action 已落盘——此后任何抛错由 finalizeFailedStartIntent 收尾
   ctx.actionId = action.id;
+  // 保命轮换提示：水位强制起新 agent 时给事件流留一条灰字，用户有预期。
+  if (rotationDue) {
+    await writeOwnedEventAndPublish(task.id, () => isOpOwner(opHandle), {
+      kind: "info",
+      text: SESSION_ROTATION_INFO_TEXT,
+    });
+  }
   await failpoint("advance.afterAppend");
   publish(task.id, { kind: "task", task: taskAfterAppend });
   publish(task.id, { kind: "action", action });
@@ -5582,6 +5610,39 @@ const sendToTaskSessionBody = async (
     }
     // drain 期间同 gen claim 也要让位（纯 gen 比对看不见）
     if (entryLost()) return "stale";
+    // 堆内存门：高压直接抛（冒到 UI，不建新 agent——no_session 分流会起新会话、反向加重内存）。
+    // try/finally 会放行 starting 态，安全。调用方用 instanceof HeapPressureError 识别。
+    try {
+      assertHeapOk("本次发送");
+    } catch (err) {
+      if (err instanceof HeapPressureError) throw err;
+      /* 探针失败不挡发送 */
+    }
+    // task 保命轮换：同 action 内追问养胖的链，水位一到关旧链、走 no_session 分流
+    // （唤醒新 agent 原地续同一 action / one-shot），artifact 照常接力。
+    try {
+      const fresh = await getTaskMeta(task.id);
+      if (fresh && isSessionRotationDue(rotationUsageOf(fresh))) {
+        console.log(
+          `[task-runner] task=${task.id} 会话累计 input 超水位、追问转新会话`,
+        );
+        const old = agentSessions.get(task.id);
+        if (old) {
+          closeTaskSession(task.id, old.agentId, {
+            expectedSessionInstanceId: old.instanceId,
+          });
+        }
+        void setTaskSessionAgentId(task.id, undefined);
+        await writeOwnedEventAndPublish(
+          task.id,
+          () => !isTaskOpStale(task.id, opGen),
+          { kind: "info", text: SESSION_ROTATION_INFO_TEXT },
+        );
+        return "no_session";
+      }
+    } catch {
+      /* 探针失败不挡发送 */
+    }
     let session = agentSessions.get(task.id) ?? null;
     // 记下是否本轮 resume 刚登记——失主时必须按 instance 清掉，给 B 干净位子
     let resumedThisCall = false;

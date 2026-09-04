@@ -38,6 +38,7 @@ import {
   type AskSkipHandle,
 } from "@/lib/server/ask-skip";
 import { startRestrictedGroupQuestion } from "@/lib/server/restricted-question";
+import { HeapPressureError } from "@/lib/server/sdk-store-gc";
 import {
   abortStuckRunForSend,
   deliverTaskQuestion,
@@ -400,18 +401,27 @@ const runTaskQuestionInject = async (
   // questionOnly（群里非属主）→ 同样不碰活会话：那是属主的全权限 agent（见选项注释）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
   // 两种「不送达」都视为无会话续接意图（走下方分流），不是 stale
-  const deliverResult =
-    viaWait || forceModel || questionOnly
-      ? ("no_session" as const)
-      : await deliverTaskQuestion(
-          task,
-          agentText,
-          imageAbsPaths,
-          { apiKey, model },
-          ackContext,
-          attachmentPaths.length > 0 ? attachmentPaths : undefined,
-          opGen,
-        );
+  // 内存高压：deliver 内直接抛 HeapPressureError（不建新 agent），转 503 友好提示。
+  let deliverResult: "sent" | "no_session" | "stale" | "send_failed";
+  try {
+    deliverResult =
+      viaWait || forceModel || questionOnly
+        ? ("no_session" as const)
+        : await deliverTaskQuestion(
+            task,
+            agentText,
+            imageAbsPaths,
+            { apiKey, model },
+            ackContext,
+            attachmentPaths.length > 0 ? attachmentPaths : undefined,
+            opGen,
+          );
+  } catch (err) {
+    if (err instanceof HeapPressureError) {
+      return errorResponse(err.message, 503);
+    }
+    throw err;
+  }
 
   // stale → 409，绝不 fallback one-shot、不写事件、不写 running
   // 同一轮 curl 已经吃到跳过正文：世界变了也别把已写进 stdout 的当没送

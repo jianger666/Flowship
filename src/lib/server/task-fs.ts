@@ -77,6 +77,7 @@ import {
 } from "./task-worktrees";
 import { sameRepoPathList } from "@/lib/path-utils";
 import { reapTaskOrphans } from "./kill-orphans";
+import { maybeGcSdkStore } from "./sdk-store-gc";
 import {
   cleanupCheckpointRefsForTask,
   cleanupCheckpointRefsFromManifest,
@@ -864,6 +865,10 @@ const runBootRecovery = async (): Promise<void> => {
 
   // V0.10.1：杀上一次进程遗留的预览 dev server（内存 slot 已丢、进程还占端口）、pidfile 兜底
   await killStalePreview().catch(() => {});
+
+  // 2026-09-04 OOM 根治：SDK JSONL store 瘦身（只删孤儿 agent 行、活的不动）。
+  // 扔后台跑、不挡启动（GC 流式实现，自己不爆堆）；失败内部吞掉。
+  maybeGcSdkStore();
 };
 
 const ensureBootRecovery = async (): Promise<void> => {

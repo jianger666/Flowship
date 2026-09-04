@@ -53,6 +53,7 @@ import {
   wasAskTakenRecently,
   type PendingAsk,
 } from "@/lib/server/chat-pending";
+import { HeapPressureError } from "@/lib/server/sdk-store-gc";
 import {
   deliverAskReply,
   isTaskOpStale,
@@ -799,14 +800,24 @@ const handleAskReply = async (
       );
     }
   } else {
-    const deliverResult = await deliverAskReply(
-      task,
-      agentText,
-      allAbsPaths.length > 0 ? allAbsPaths : undefined,
-      reqEvent.actionId,
-      boot,
-      opGen,
-    );
+    // 内存高压：deliver 内直接抛 HeapPressureError，不唤醒新 agent，转 503。
+    let deliverResult: Awaited<ReturnType<typeof deliverAskReply>>;
+    try {
+      deliverResult = await deliverAskReply(
+        task,
+        agentText,
+        allAbsPaths.length > 0 ? allAbsPaths : undefined,
+        reqEvent.actionId,
+        boot,
+        opGen,
+      );
+    } catch (err) {
+      if (err instanceof HeapPressureError) {
+        giveBackPending();
+        return errorResponse(err.message, 503);
+      }
+      throw err;
+    }
     // stale → 409，登记放回、不记已答、不走 wake
     if (deliverResult === "stale" || isTaskOpStale(task.id, opGen)) {
       giveBackPending();
