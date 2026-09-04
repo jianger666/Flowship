@@ -23,8 +23,8 @@ importers:
         specifier: 1.7.0
         version: 1.7.0(@bufbuild/protobuf@1.10.0)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.0))
       '@cursor/sdk':
-        specifier: ^1.0.30
-        version: 1.0.30
+        specifier: ^1.0.31
+        version: 1.0.31
       '@earendil-works/pi-agent-core':
         specifier: 0.84.2
         version: 0.84.2(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
@@ -507,38 +507,38 @@ packages:
     peerDependencies:
       '@bufbuild/protobuf': ^1.10.0
 
-  '@cursor/sdk-darwin-arm64@1.0.30':
-    resolution: {integrity: sha512-O0w2fLd6jxrvAUOJGsKBs8VSi5OojqqEOMFBzHTHS82wU/DX3ZlizK3czzCXxDKs3l8j/BVQwVCxP9jMFcf41Q==}
+  '@cursor/sdk-darwin-arm64@1.0.31':
+    resolution: {integrity: sha512-i6INDIQhV7xDeFKfND0yr/SOwv4uJthPMfXXvNpZapO+IbJTx30aPzJVMBqdksvDHyn/cekJB/92Jkz+a5K8Ow==}
     cpu: [arm64]
     os: [darwin]
     hasBin: true
 
-  '@cursor/sdk-darwin-x64@1.0.30':
-    resolution: {integrity: sha512-TdjreV7V6gtSKbUaXDarfE1735PES6uzLgLxp42E5kT6EXpjQhKsifdsYOMdsO/RBw166kya/XxG24L/FUfEHA==}
+  '@cursor/sdk-darwin-x64@1.0.31':
+    resolution: {integrity: sha512-vCmrGykwflJNAAr4RVY4UlZ+F0fmUF+WCR8zFzP4Jl1Da2b8Oh1rxrVLbIbleS1/LKsX/OPbTQNRL0SEER95Sg==}
     cpu: [x64]
     os: [darwin]
     hasBin: true
 
-  '@cursor/sdk-linux-arm64@1.0.30':
-    resolution: {integrity: sha512-1+bsmri6vJ2YuqL/SQ6QSx/ymu2eBzjGgT1bTgN47tCzxDgNOKacXtghpx4zdHM5AmOtT+aLXVVxXjStXmNtcA==}
+  '@cursor/sdk-linux-arm64@1.0.31':
+    resolution: {integrity: sha512-BHTwumfhWjTy0k41+KaaXfTm3MGu6WEYU76FmXqc/r1+ynuQroqfBKWyfH4XBcx3uzyaZJQLxNB9BBbs8yHUig==}
     cpu: [arm64]
     os: [linux]
     hasBin: true
 
-  '@cursor/sdk-linux-x64@1.0.30':
-    resolution: {integrity: sha512-5TRAM1xNwVr0Lox2ay5U5h+VY1OeqJLgnS28da7mx+ZkmeAU+hzuUFq2/lcIqoJrp2qBRdUH5WzI44JNtjBKmg==}
+  '@cursor/sdk-linux-x64@1.0.31':
+    resolution: {integrity: sha512-y+ahiKQvEISUn9y6z75jwKjLQkrJ/nY7ehL1Vi9X8zdbjz14fiEtMTICAHccTiTq5cf6dZjXC5QfPdJRat6dhg==}
     cpu: [x64]
     os: [linux]
     hasBin: true
 
-  '@cursor/sdk-win32-x64@1.0.30':
-    resolution: {integrity: sha512-kVjpWmLTFLL131TQm3ytz1HbAeyjBRAHMtr6vyLtbBMuLBb0la5igvt58Xi8mXwekymWXim1+rZj7ZYUO3K1rw==}
+  '@cursor/sdk-win32-x64@1.0.31':
+    resolution: {integrity: sha512-5ti4AwUz8kh5ovM86K/fTiHmVGL6jk1faQkTCX08lcCxFSlUDwpeyhn90pWsbNFQ4Vy2PttqEjanV6895p13eA==}
     cpu: [x64]
     os: [win32]
     hasBin: true
 
-  '@cursor/sdk@1.0.30':
-    resolution: {integrity: sha512-s3gIXfTD3w8ys+KFE81JjjoiJcynkHsf/JCDyXrnbliIac3dkT59hwYZII3XhsT1DlXIfqg+YzSMru6w1CkZow==}
+  '@cursor/sdk@1.0.31':
+    resolution: {integrity: sha512-0SdJQqp5oXn81oJqIVkLpgHih+CL6CAudK83pCsdJyA23AvInSWlMaGpLi+JlrK3efHoswiEhhASs9WpeEz3QQ==}
     engines: {node: '>=22.13'}
 
   '@date-fns/tz@1.5.0':
@@ -1248,11 +1248,12 @@ packages:
   '@napi-rs/wasm-runtime@0.2.12':
     resolution: {integrity: sha512-ZVWUcfwY4E/yPitQJl481FjFo3K22D6qF0DuFH6Y/nbnE11GY5uguDxZMGXPQ8WQ0128MXQD7TnfHyK4oWoIJQ==}
 
-  '@napi-rs/wasm-runtime@1.1.6':
-    resolution: {integrity: sha512-ZLv/JdUfkvOy9eCnnBaGfiO+XimbjebAeO+MRQqD/B+FR1tnRN0tpKSJHRbE8sFfS6aqsXZ67TQjfwfsxULVbg==}
+  '@napi-rs/wasm-runtime@1.2.3':
+    resolution: {integrity: sha512-UMduMbqO5s5zF2NkNacMT/yK5Y5QiKvWr2+50bzIIxFDwVJ2h49b+oyjaCGPhJxd2/gC2x39EHv/gHVuu36x2Q==}
+    engines: {node: ^20.19.0 || ^22.13.0 || >=23.5.0}
     peerDependencies:
-      '@emnapi/core': ^1.7.1
-      '@emnapi/runtime': ^1.7.1
+      '@emnapi/core': ^1.7.1 || ^2.0.0-alpha.4
+      '@emnapi/runtime': ^1.7.1 || ^2.0.0-alpha.4
 
   '@next/env@15.5.20':
     resolution: {integrity: sha512-dXh51Wvddf8daEyBXryZZEe1FdVxEWx9lgaTseLZUtC1XP/W8Wri+Z+VPOElHlByk23CyqHdc2oVByX7wsTWsw==}
@@ -3340,8 +3341,8 @@ packages:
     resolution: {integrity: sha512-CTXd6rk/M3/ULNQj8FBqBWHYBVYybQ3VPBw0xGKFe3tuH7ytT6ACnvzpIQ3UZtB8yvUKC2cXn1a+x+5EVQLovA==}
     engines: {node: '>=14.14'}
 
-  fs-extra@11.3.6:
-    resolution: {integrity: sha512-w8ZNZr2mKIc7qeNaQ9AVPT1+iFaI+Avd4xudVOvdDJ8VytREi1Ft5Ih7hd9jjehod8vAM5GMsfQ/TpPf4EyoEA==}
+  fs-extra@11.4.0:
+    resolution: {integrity: sha512-EQsFzMUJkCKGr1ePqlYADkIUmHW1s3ZXr5Yqy6wbGrfUCphpl2maM/kyOIRA2HpP3AaFQTZXD4ldjek+nccddA==}
     engines: {node: '>=14.14'}
 
   fs-extra@7.0.1:
@@ -4591,8 +4592,8 @@ packages:
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
     hasBin: true
 
-  nanoid@3.3.16:
-    resolution: {integrity: sha512-bzlKTyNJ7+LdGIIwy8ijFpIqEQIvafahV7eYykJ8Cvh42EdJeODoJ6gUJXpQJvej1BddH8OqTXZNE/KfbWAu8Q==}
+  nanoid@3.3.18:
+    resolution: {integrity: sha512-DTg4MJbGMWkfi6VZFdNt2/caMbQy4Ou+Op/hJQvGEWcnVfoA1QA+xzRKAzw9jD6+GVOOeYr/mIcuDSdug6F6+w==}
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
     hasBin: true
 
@@ -4915,8 +4916,8 @@ packages:
     resolution: {integrity: sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==}
     engines: {node: '>=12'}
 
-  picomatch@4.0.5:
-    resolution: {integrity: sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A==}
+  picomatch@4.0.7:
+    resolution: {integrity: sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==}
     engines: {node: '>=12'}
 
   pkce-challenge@5.0.1:
@@ -4957,8 +4958,8 @@ packages:
     resolution: {integrity: sha512-W62t/Se6rA0Az3DfCL0AqJwXuKwBeYg6nOaIgzP+xZ7N5BFCI7DYi1qs6ygUYT6rvfi6t9k65UMLJC+PHZpDAA==}
     engines: {node: ^10 || ^12 || >=14}
 
-  postcss@8.5.22:
-    resolution: {integrity: sha512-KBDEIpLrvpv16pp3K0Fw+UCoZfopFjjgeB+0tA/aaThfEE74kKDLrgg603YvOWJyg3+WYtyq3xYsQWsIyZlPqQ==}
+  postcss@8.5.28:
+    resolution: {integrity: sha512-RRuzqDtt5Y9h3quz5hWhK+TPnsmVs6WwSU6LkJMeY4HstUEDuYTG8UJSdawMRzmzAtV+KEoG8N3Qg2qLy5vM/A==}
     engines: {node: ^10 || ^12 || >=14}
 
   postgres-array@2.0.0:
@@ -6588,22 +6589,22 @@ snapshots:
     dependencies:
       '@bufbuild/protobuf': 1.10.0
 
-  '@cursor/sdk-darwin-arm64@1.0.30':
+  '@cursor/sdk-darwin-arm64@1.0.31':
     optional: true
 
-  '@cursor/sdk-darwin-x64@1.0.30':
+  '@cursor/sdk-darwin-x64@1.0.31':
     optional: true
 
-  '@cursor/sdk-linux-arm64@1.0.30':
+  '@cursor/sdk-linux-arm64@1.0.31':
     optional: true
 
-  '@cursor/sdk-linux-x64@1.0.30':
+  '@cursor/sdk-linux-x64@1.0.31':
     optional: true
 
-  '@cursor/sdk-win32-x64@1.0.30':
+  '@cursor/sdk-win32-x64@1.0.31':
     optional: true
 
-  '@cursor/sdk@1.0.30':
+  '@cursor/sdk@1.0.31':
     dependencies:
       '@bufbuild/protobuf': 1.10.0
       '@connectrpc/connect': 1.7.0(@bufbuild/protobuf@1.10.0)
@@ -6612,11 +6613,11 @@ snapshots:
       '@statsig/js-client': 3.31.0
       zod: 3.25.76
     optionalDependencies:
-      '@cursor/sdk-darwin-arm64': 1.0.30
-      '@cursor/sdk-darwin-x64': 1.0.30
-      '@cursor/sdk-linux-arm64': 1.0.30
-      '@cursor/sdk-linux-x64': 1.0.30
-      '@cursor/sdk-win32-x64': 1.0.30
+      '@cursor/sdk-darwin-arm64': 1.0.31
+      '@cursor/sdk-darwin-x64': 1.0.31
+      '@cursor/sdk-linux-arm64': 1.0.31
+      '@cursor/sdk-linux-x64': 1.0.31
+      '@cursor/sdk-win32-x64': 1.0.31
 
   '@date-fns/tz@1.5.0': {}
 
@@ -6809,7 +6810,7 @@ snapshots:
     dependencies:
       cross-dirname: 0.1.0
       debug: 4.4.3
-      fs-extra: 11.3.6
+      fs-extra: 11.4.0
       minimist: 1.2.8
       postject: 1.0.0-alpha.6
     transitivePeerDependencies:
@@ -7459,7 +7460,7 @@ snapshots:
       '@tybys/wasm-util': 0.10.1
     optional: true
 
-  '@napi-rs/wasm-runtime@1.1.6(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)':
+  '@napi-rs/wasm-runtime@1.2.3(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)':
     dependencies:
       '@emnapi/core': 1.10.0
       '@emnapi/runtime': 1.10.0
@@ -7621,7 +7622,7 @@ snapshots:
     dependencies:
       '@emnapi/core': 1.10.0
       '@emnapi/runtime': 1.10.0
-      '@napi-rs/wasm-runtime': 1.1.6(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)
+      '@napi-rs/wasm-runtime': 1.2.3(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)
     optional: true
 
   '@rolldown/binding-win32-arm64-msvc@1.0.3':
@@ -9761,7 +9762,7 @@ snapshots:
       jsonfile: 6.2.1
       universalify: 2.0.1
 
-  fs-extra@11.3.6:
+  fs-extra@11.4.0:
     dependencies:
       graceful-fs: 4.2.11
       jsonfile: 6.2.1
@@ -11269,7 +11270,7 @@ snapshots:
 
   nanoid@3.3.12: {}
 
-  nanoid@3.3.16: {}
+  nanoid@3.3.18: {}
 
   napi-postinstall@0.3.4: {}
 
@@ -11597,7 +11598,7 @@ snapshots:
 
   picomatch@4.0.4: {}
 
-  picomatch@4.0.5: {}
+  picomatch@4.0.7: {}
 
   pkce-challenge@5.0.1: {}
 
@@ -11647,9 +11648,9 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.1
 
-  postcss@8.5.22:
+  postcss@8.5.28:
     dependencies:
-      nanoid: 3.3.16
+      nanoid: 3.3.18
       picocolors: 1.1.1
       source-map-js: 1.2.1
 
@@ -12813,8 +12814,8 @@ snapshots:
   vite@8.0.16(@types/node@22.19.17)(jiti@2.7.0)(yaml@2.9.0):
     dependencies:
       lightningcss: 1.33.0
-      picomatch: 4.0.5
-      postcss: 8.5.22
+      picomatch: 4.0.7
+      postcss: 8.5.28
       rolldown: 1.0.3
       tinyglobby: 0.2.17
     optionalDependencies:
