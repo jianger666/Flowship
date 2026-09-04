@@ -196,6 +196,22 @@ describe("createRunPerfTracker", () => {
     expect(runLine).toContain("kind=question");
   });
 
+  it("B2：attachRun 带 promptBudgetDropped/Compressed", () => {
+    captureLogs();
+    const tracker = createRunPerfTracker({
+      taskId: "t5",
+      agentId: "a5",
+      runKind: "task-first",
+      promptBytes: 100,
+      promptBudgetDropped: ["contextDocsSection"],
+      promptBudgetCompressed: ["skillsSection"],
+    });
+    tracker.attachRun({ id: "run-b2", requestId: "req-b2" });
+    const runLine = logs.find((l) => l.startsWith("[perf-run]"));
+    expect(runLine).toContain("promptBudgetDropped=contextDocsSection");
+    expect(runLine).toContain("promptBudgetCompressed=skillsSection");
+  });
+
   it("onDelta 内部抛错被吞，不向外抛", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {

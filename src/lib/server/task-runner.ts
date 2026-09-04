@@ -193,7 +193,7 @@ import {
   buildPlanReplanDirective,
   buildResumeActionInstruction,
   buildReviewScopeDirective,
-  buildSuperPrompt,
+  buildSuperPromptWithBudget,
   buildTaskUpdateHint,
   captureTaskFieldsSnapshot,
   loadActionPrompt,
@@ -3198,7 +3198,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               "./company-env-fs"
             );
             const companyEnvBriefSection = await loadCompanyEnvBriefSection();
-            const superPrompt = await buildSuperPrompt(
+            const superPromptBuilt = await buildSuperPromptWithBudget(
               task,
               skills,
               {
@@ -3216,6 +3216,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               buildLarkCliAuthMissingRule(),
               companyEnvBriefSection,
             );
+            const superPrompt = superPromptBuilt.prompt;
             await failpoint("start.afterPrompt");
             const perfPromptMs = Date.now() - perfPromptStart;
 
@@ -3247,6 +3248,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               agentId: created.agentId,
               runKind: "task-first",
               promptBytes,
+              promptBudgetDropped: superPromptBuilt.dropped.map((d) => d.name),
+              promptBudgetCompressed: superPromptBuilt.compressed,
             });
             const run = await withSdkDeadline(
               created.send(superPrompt, {

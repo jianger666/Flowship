@@ -25,6 +25,10 @@ export type RunPerfCtx = {
   /** 调用点语义：task-first / task-followup / question / chat-first 等 */
   runKind: string;
   promptBytes?: number;
+  /** B2：预算裁掉的段名（可回放：段名+省字节见 warn/单测，日志只记名） */
+  promptBudgetDropped?: string[];
+  /** B2：用了压缩版的段名 */
+  promptBudgetCompressed?: string[];
 };
 
 export type RunPerfTracker = {
@@ -203,8 +207,16 @@ export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
         typeof ctx.promptBytes === "number"
           ? ` promptBytes=${ctx.promptBytes}`
           : "";
+      const dropped =
+        ctx.promptBudgetDropped && ctx.promptBudgetDropped.length > 0
+          ? ` promptBudgetDropped=${ctx.promptBudgetDropped.join(",")}`
+          : "";
+      const compressed =
+        ctx.promptBudgetCompressed && ctx.promptBudgetCompressed.length > 0
+          ? ` promptBudgetCompressed=${ctx.promptBudgetCompressed.join(",")}`
+          : "";
       console.log(
-        `[perf-run] ${base} agent=${ctx.agentId} run=${run.id}${req}${bytes}`,
+        `[perf-run] ${base} agent=${ctx.agentId} run=${run.id}${req}${bytes}${dropped}${compressed}`,
       );
     } catch (err) {
       console.warn(`[perf] attachRun 埋点失败 task=${ctx.taskId}`, err);

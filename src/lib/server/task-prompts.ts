@@ -39,6 +39,13 @@ import {
   type SkillEntry,
 } from "./skills-loader";
 import { readAppRulesForPrompt } from "./cursor-config";
+import { listAppRules } from "./app-rules";
+import {
+  applyPromptBudget,
+  PROMPT_BUDGET_BYTES,
+  promptBytesOf,
+  type PromptSection,
+} from "./prompt-budget";
 import { getCustomAction } from "./custom-action-fs";
 import type { AskUserQuestion } from "@/lib/types";
 import type {
@@ -105,6 +112,120 @@ export const buildLarkCliAuthMissingRule = (): string =>
     "## 飞书 CLI（lark-cli）登录兜底",
     `- **身份缺失**（auth status / 业务命令报 identity missing / 未登录）：主动告知用户，并询问是否代为执行登录；用户同意后再走 split-flow（\`auth login --no-wait --json\` → 把 verification_url + 二维码图贴进回复 → 等用户说完成后再 \`--device-code\` 收尾）。`,
   ].join("\n");
+
+// ----------------- prompt 预算裁剪（B2 分级版） -----------------
+// 分级（删除 vs 压缩二分）：L0 永不碰（不压缩不删除）；L1 永不整段删、
+// 只允许 rulesSection 压缩为标题列表（sharedRules 连压缩都不做）；
+// L2 先压缩、还超才删；L3 先砍。顺序 L3 → L2 → 停，超了 fail-open。
+export type SuperPromptBudgetInfo = {
+  prompt: string;
+  dropped: { name: string; savedBytes: number; wasCompressed: boolean }[];
+  compressed: string[];
+  perSectionBytes: Record<string, number>;
+  totalBytes: number;
+  overBudget: boolean;
+  budget: number;
+};
+
+/** skills 压缩版：结构不变、desc 截 100 字（首版不做按 action 过滤） */
+const renderSkillsCompressed = (skills: SkillEntry[]): string => {
+  if (skills.length === 0) return renderSkillsForPrompt(skills);
+  const lines: string[] = [
+    "相对路径解析：SKILL.md 正文里的 `templates/` `references/` `scripts/` 等相对路径都在该 skill `path` 所在目录下、用 `read` 读；`kbRoot` 只用来解析 `knowledge-base/…` 这类库内路径。",
+    "（以下 desc 已因 prompt 预算压缩为 100 字，需要完整版用 read 读对应 SKILL.md）",
+    "",
+  ];
+  for (const s of skills) {
+    const flat = s.description.replace(/\n/g, " ");
+    const short = flat.length > 100 ? `${flat.slice(0, 100)}…` : flat;
+    lines.push(`- **${s.name}**`);
+    lines.push(`  desc: ${short}`);
+    lines.push(`  path: ${s.absPath}`);
+    if (s.kbRoot) lines.push(`  kbRoot: ${s.kbRoot}`);
+  }
+  return lines.join("\n");
+};
+
+/** rules 压缩版：全文→标题列表+按需读路径（拿不到列表就退回截断） */
+const renderRulesCompressed = async (full: string): Promise<string> => {
+  try {
+    const rules = await listAppRules();
+    if (rules.length === 0) return full;
+    return [
+      "（自管规则全文已因 prompt 预算压缩为标题列表，需要哪条用 read 读对应 .mdc 全文）",
+      "",
+      ...rules.map(
+        (r) => `- ${r.name}：${r.bodyPreview || "（空预览）"}（\`${r.absPath}\`）`,
+      ),
+    ].join("\n");
+  } catch {
+    return `${full.slice(0, 2000)}\n（…已因 prompt 预算压缩截断，需要全文读能力页规则配置）`;
+  }
+};
+
+/** contextDocs 压缩版：只留标题索引、正文一律不 inline */
+const renderContextDocsCompact = (task: Task): string => {
+  const docs = task.contextDocs ?? [];
+  if (docs.length === 0) {
+    return [
+      "## 用户提供的上下文文档（0 份）",
+      "",
+      "用户目前没有提供任何上下文文档。",
+      "",
+      "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
+    ].join("\n");
+  }
+  const items = docs.map((doc, i) => {
+    const len = doc.content.trim().length;
+    const label =
+      doc.type === "text"
+        ? `text、${len} 字（正文已压缩未注入）`
+        : doc.type === "image"
+          ? "image、用户截图"
+          : doc.type;
+    return `${i + 1}. **【${doc.title}】**（${label}）`;
+  });
+  return [
+    `## 用户提供的上下文文档（${docs.length} 份，正文已因预算压缩、只留索引）`,
+    "",
+    ...items,
+    "",
+    "→ 需要正文时：text 找用户索取原文或按 task 元信息按需读；url/path 用 MCP / read 拉；截断标记含义读 skill `context-docs-handler`。",
+  ].join("\n");
+};
+
+/** actionHistory 压缩版：只留 id/type/status/artifact 索引、用户指令略去 */
+const renderActionHistoryCompact = (task: Task): string => {
+  const visible = task.actions.filter((a) => !a.excluded);
+  if (visible.length <= 1) return "（这是 task 的第一个 action、无历史）";
+  const lines: string[] = [
+    "以下是已完成 / 进行中的历史 action（已因预算压缩、只留索引，用户指令已略去）：",
+  ];
+  for (const a of visible) {
+    const artifactBit = a.artifactPath ? ` artifact=\`${a.artifactPath}\`` : "";
+    lines.push(`  - \`${a.id}\` n=${a.n} type=${a.type} status=${a.status}${artifactBit}`);
+  }
+  lines.push(
+    "",
+    "需要参考时用 SDK 内置 `read` 工具读 artifactPath（路径相对 task 根、agent cwd 是仓库、用绝对路径如下表）：",
+  );
+  for (const a of visible) {
+    if (!a.artifactPath) continue;
+    lines.push(`  - \`${getActionArtifactPath(task.id, a.n, a.type)}\``);
+  }
+  return lines.join("\n");
+};
+
+/** 通用 2 行压缩（gitlab/lark/companyEnv）：空段/超短段返回 undefined 表示不压缩 */
+const compressToTwoLines = (
+  full: string,
+  hint: string,
+): string | undefined => {
+  if (full.trim().length === 0) return undefined;
+  const lines = full.split("\n");
+  if (lines.length <= 3) return undefined;
+  return [...lines.slice(0, 2), `（…已因 prompt 预算压缩为2行，${hint}）`].join("\n");
+};
 
 
 // ----------------- prompt 模板渲染 -----------------
@@ -255,21 +376,211 @@ const loadCustomActionPlaybook = async (
  * @param firstNextAction 首次启动时、把第一个 [NEXT_ACTION ...] 指令也拼到 prompt 末尾
  *                        让 agent 起 Run 第一动作就是执行用户选的 action
  */
+export type BuildSuperPromptInput = {
+  action: ActionRecord;
+  userInstruction: string;
+  /** v1.1.x：推进弹窗 `/` 引用的 skill 指引段（buildSkillDirective 产出、空串=没引用） */
+  skillDirective?: string;
+  attachedImagePaths?: string[];
+  attachedFilePaths?: string[];
+  branchCheckoutHint?: string;
+  batchDirective?: string;
+  // V0.8.12 A：plan append 硬指令（已分批 task 追加需求时拼进首个 NEXT_ACTION）
+  replanDirective?: string;
+};
+
+/** B2：带预算裁剪的组装（L0/L1 永不整段删、L3→L2 顺序裁、超了 fail-open） */
+export const buildSuperPromptWithBudget = async (
+  task: Task,
+  skills: SkillEntry[],
+  firstNextAction: BuildSuperPromptInput,
+  /**
+   * 飞书 / 设置推导的「用户身份」行（调用方 await resolveUserIdentityForPrompt 后传入）。
+   * 有则插入「任务基本信息」；空串整行不注入。
+   * 已含 `- 发起人：…` 前缀；空串 = 未登录 / 查不到、整行不注入（不塞「（未提供）」）。
+   * 故意不在本函数里打 meegle——保持纯拼装、网络失败不堵模板渲染。
+   */
+  userIdentityLine = "",
+  /**
+   * GitLab 访问段（调用方：settings 有 gitToken 时用 buildGitlabAccessDirective 产出；否则空串）。
+   * 空串 = 整段不注入（renderSuperPromptTemplate 保留字面空）。
+   */
+  gitlabAccessSection = "",
+  /**
+   * lark-cli 身份缺失登录兜底（常驻；调用方用 buildLarkCliAuthMissingRule）。
+   */
+  larkCliAuthSection = "",
+  /**
+   * 公司环境常驻声明（有 servers/PG 实质配置时非空；调用方用 loadCompanyEnvBriefSection）。
+   */
+  companyEnvBriefSection = "",
+  budget: number = PROMPT_BUDGET_BYTES,
+): Promise<SuperPromptBudgetInfo> => {
+  const template = await loadFileSafe(SUPER_PROMPT_FILE);
+  const sharedRules = await loadSharedPrompt(task);
+  // app 自管 rules（能力页 Rules tab、启用中的全文常驻注入）
+  const rulesSection = await readAppRulesForPrompt();
+
+  // 只加载当前 action 的 playbook（后续 action 的指令随 [NEXT_ACTION] 载荷下发）
+  const currentType = firstNextAction.action.type;
+  const currentActionPlaybook = [
+    `### Action: ${currentType}`,
+    "",
+    await loadActionPrompt(firstNextAction.action, task),
+  ].join("\n");
+
+  // 当前已存在的 action history（agent 起 Run 时能看到之前的工作）
+  const actionHistorySection = renderActionHistorySection(task);
+
+  // 第一个 [NEXT_ACTION ...] 指令（含用户指令、附件、branch checkout hint）
+  const firstActionDirective = buildNextActionDirective(firstNextAction);
+
+  const fullSkills = renderSkillsForPrompt(skills);
+  const fullContextDocs = renderContextDocsSection(
+    task,
+    "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
+  );
+  const repoSection = renderRepoSection(task);
+  const repoBranchSection = renderRepoBranchSection(task);
+  const docCount = task.contextDocs?.length ?? 0;
+  const visibleActions = task.actions.filter((a) => !a.excluded);
+  const skillNames = skills.map((s) => s.name);
+
+  const tinyFixed = [
+    task.id,
+    task.title,
+    renderReqIdLine(task),
+    userIdentityLine,
+    renderLightweightDailySection(task),
+    getTaskCwd(task),
+    getEventsLogPath(task.id),
+    getActionsDir(task.id),
+    getTaskWorkspaceDir(task.id),
+    buildWindowsToolDisciplineDirective(),
+  ].join("\n");
+
+  const gitlabCompressed = compressToTwoLines(
+    gitlabAccessSection,
+    "需要完整版读设置页 gitToken 与仓库 origin",
+  );
+  const larkCompressed = compressToTwoLines(
+    larkCliAuthSection,
+    "需要完整版读 lark-shared skill",
+  );
+  const companyCompressed = compressToTwoLines(
+    companyEnvBriefSection,
+    "需要完整版读公司环境配置文件",
+  );
+  const rulesCompressed = await renderRulesCompressed(rulesSection);
+
+  const sections: PromptSection[] = [
+    // L0：永不碰（只计字节）
+    { name: "firstActionDirective", tier: 0, content: firstActionDirective, bytes: promptBytesOf(firstActionDirective) },
+    { name: "currentActionPlaybook", tier: 0, content: currentActionPlaybook, bytes: promptBytesOf(currentActionPlaybook) },
+    { name: "repoSection", tier: 0, content: repoSection, bytes: promptBytesOf(repoSection) },
+    { name: "repoBranchSection", tier: 0, content: repoBranchSection, bytes: promptBytesOf(repoBranchSection) },
+    { name: "taskMetaSmall", tier: 0, content: tinyFixed, bytes: promptBytesOf(tinyFixed) },
+    { name: "templateStatic", tier: 0, content: "", bytes: promptBytesOf(template) },
+    // L1：永不整段删（rules 允许压缩，shared 连压缩都不做）
+    { name: "sharedRules", tier: 1, content: sharedRules, bytes: promptBytesOf(sharedRules) },
+    {
+      name: "rulesSection", tier: 1, content: rulesSection, bytes: promptBytesOf(rulesSection),
+      ...(rulesCompressed !== rulesSection
+        ? { compressedContent: rulesCompressed, compressedBytes: promptBytesOf(rulesCompressed) }
+        : {}),
+    },
+    // L2：先压缩、还超才删
+    {
+      name: "skillsSection", tier: 2, content: fullSkills, bytes: promptBytesOf(fullSkills),
+      compressedContent: renderSkillsCompressed(skills), compressedBytes: promptBytesOf(renderSkillsCompressed(skills)),
+      droppedPlaceholder: `（可用 skill 共 ${skills.length} 个，已因 prompt 预算整段裁剪：${skillNames.join("、") || "无"}；命中场景时用 read 读对应 SKILL.md 拿完整指令）`,
+    },
+    {
+      name: "gitlabAccessSection", tier: 2, content: gitlabAccessSection, bytes: promptBytesOf(gitlabAccessSection),
+      ...(gitlabCompressed !== undefined
+        ? { compressedContent: gitlabCompressed, compressedBytes: promptBytesOf(gitlabCompressed) }
+        : {}),
+      droppedPlaceholder: "（GitLab 访问段已因 prompt 预算裁剪，需要时读设置页 gitToken 与仓库 origin）",
+    },
+    {
+      name: "larkCliAuthSection", tier: 2, content: larkCliAuthSection, bytes: promptBytesOf(larkCliAuthSection),
+      ...(larkCompressed !== undefined
+        ? { compressedContent: larkCompressed, compressedBytes: promptBytesOf(larkCompressed) }
+        : {}),
+      droppedPlaceholder: "（飞书 CLI 登录兜底段已因 prompt 预算裁剪，需要时读 lark-shared skill）",
+    },
+    {
+      name: "companyEnvBriefSection", tier: 2, content: companyEnvBriefSection, bytes: promptBytesOf(companyEnvBriefSection),
+      ...(companyCompressed !== undefined
+        ? { compressedContent: companyCompressed, compressedBytes: promptBytesOf(companyCompressed) }
+        : {}),
+      droppedPlaceholder: "（公司环境声明已因 prompt 预算裁剪，需要时读公司环境配置文件）",
+    },
+    // L3：先砍
+    {
+      name: "contextDocsSection", tier: 3, content: fullContextDocs, bytes: promptBytesOf(fullContextDocs),
+      compressedContent: renderContextDocsCompact(task), compressedBytes: promptBytesOf(renderContextDocsCompact(task)),
+      droppedPlaceholder: `## 用户提供的上下文文档（共 ${docCount} 份，已因 prompt 预算整段裁剪）\n\n→ 需要时向用户索取原文，或按 task 元信息中的标题用 read/MCP 按需拉取。`,
+    },
+    {
+      name: "actionHistorySection", tier: 3, content: actionHistorySection, bytes: promptBytesOf(actionHistorySection),
+      compressedContent: renderActionHistoryCompact(task), compressedBytes: promptBytesOf(renderActionHistoryCompact(task)),
+      droppedPlaceholder: `（历史 action 共 ${visibleActions.length} 个，已因 prompt 预算整段裁剪；需要时用 read 读 ${getActionsDir(task.id)} 下的 <n>-<type>.md）`,
+    },
+  ];
+
+  const decided = applyPromptBudget(sections, budget);
+  if (decided.overBudget) {
+    console.error(
+      `[prompt-budget] task=${task.id} overBudget total=${decided.totalBytes} budget=${budget} ` +
+        `dropped=${decided.dropped.map((d) => `${d.name}(-${d.savedBytes}B)`).join(",") || "none"}`,
+    );
+  }
+  const c = decided.contents;
+  const prompt = renderSuperPromptTemplate(template, {
+    taskId: task.id,
+    taskTitle: task.title,
+    // 需求编号行：用户没填就整行不注入（不猜、不占位、见 renderReqIdLine）
+    reqIdLine: renderReqIdLine(task),
+    // 空串保留字面（renderSuperPromptTemplate 不把 "" 换成「（未提供）」）
+    userIdentityLine,
+    repoSection: c["repoSection"],
+    // 日常轻量态声明（无飞书链接）：全 action 共用一段、正式任务空串
+    lightweightDailySection: renderLightweightDailySection(task),
+    repoBranchSection: c["repoBranchSection"],
+    repoPath: getTaskCwd(task),
+    contextDocsSection: c["contextDocsSection"],
+    gitlabAccessSection: c["gitlabAccessSection"],
+    larkCliAuthSection: c["larkCliAuthSection"],
+    companyEnvBriefSection: c["companyEnvBriefSection"],
+    rulesSection: c["rulesSection"],
+    skillsSection: c["skillsSection"],
+    eventsLogPath: getEventsLogPath(task.id),
+    actionArtifactsDir: getActionsDir(task.id),
+    taskWorkspaceDir: getTaskWorkspaceDir(task.id),
+    sharedRules: c["sharedRules"],
+    actionHistorySection: c["actionHistorySection"],
+    firstActionDirective: c["firstActionDirective"],
+    currentActionPlaybook: c["currentActionPlaybook"],
+    // 仅 win32 非空；mac 注入空串、占位保留字面（同 gitlabAccessSection）
+    windowsToolDiscipline: buildWindowsToolDisciplineDirective(),
+  });
+  return {
+    prompt,
+    dropped: decided.dropped,
+    compressed: decided.compressed,
+    perSectionBytes: decided.perSectionBytes,
+    totalBytes: decided.totalBytes,
+    overBudget: decided.overBudget,
+    budget,
+  };
+};
+
+/** 兼容入口：行为与原来一致（默认预算下组装，超了按分级裁） */
 export const buildSuperPrompt = async (
   task: Task,
   skills: SkillEntry[],
-  firstNextAction: {
-    action: ActionRecord;
-    userInstruction: string;
-    /** v1.1.x：推进弹窗 `/` 引用的 skill 指引段（buildSkillDirective 产出、空串=没引用） */
-    skillDirective?: string;
-    attachedImagePaths?: string[];
-    attachedFilePaths?: string[];
-    branchCheckoutHint?: string;
-    batchDirective?: string;
-    // V0.8.12 A：plan append 硬指令（已分批 task 追加需求时拼进首个 NEXT_ACTION）
-    replanDirective?: string;
-  },
+  firstNextAction: BuildSuperPromptInput,
   /**
    * 飞书 / 设置推导的「用户身份」行（调用方 await resolveUserIdentityForPrompt 后传入）。
    * 有则插入「任务基本信息」；空串整行不注入。
@@ -291,56 +602,16 @@ export const buildSuperPrompt = async (
    */
   companyEnvBriefSection = "",
 ): Promise<string> => {
-  const template = await loadFileSafe(SUPER_PROMPT_FILE);
-  const sharedRules = await loadSharedPrompt(task);
-  // app 自管 rules（能力页 Rules tab、启用中的全文常驻注入）
-  const rulesSection = await readAppRulesForPrompt();
-
-  // 只加载当前 action 的 playbook（后续 action 的指令随 [NEXT_ACTION] 载荷下发）
-  const currentType = firstNextAction.action.type;
-  const currentActionPlaybook = [
-    `### Action: ${currentType}`,
-    "",
-    await loadActionPrompt(firstNextAction.action, task),
-  ].join("\n");
-
-  // 当前已存在的 action history（agent 起 Run 时能看到之前的工作）
-  const actionHistorySection = renderActionHistorySection(task);
-
-  // 第一个 [NEXT_ACTION ...] 指令（含用户指令、附件、branch checkout hint）
-  const firstActionDirective = buildNextActionDirective(firstNextAction);
-
-  return renderSuperPromptTemplate(template, {
-    taskId: task.id,
-    taskTitle: task.title,
-    // 需求编号行：用户没填就整行不注入（不猜、不占位、见 renderReqIdLine）
-    reqIdLine: renderReqIdLine(task),
-    // 空串保留字面（renderSuperPromptTemplate 不把 "" 换成「（未提供）」）
+  const r = await buildSuperPromptWithBudget(
+    task,
+    skills,
+    firstNextAction,
     userIdentityLine,
-    repoSection: renderRepoSection(task),
-    // 日常轻量态声明（无飞书链接）：全 action 共用一段、正式任务空串
-    lightweightDailySection: renderLightweightDailySection(task),
-    repoBranchSection: renderRepoBranchSection(task),
-    repoPath: getTaskCwd(task),
-    contextDocsSection: renderContextDocsSection(
-      task,
-      "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
-    ),
     gitlabAccessSection,
     larkCliAuthSection,
     companyEnvBriefSection,
-    rulesSection,
-    skillsSection: renderSkillsForPrompt(skills),
-    eventsLogPath: getEventsLogPath(task.id),
-    actionArtifactsDir: getActionsDir(task.id),
-    taskWorkspaceDir: getTaskWorkspaceDir(task.id),
-    sharedRules,
-    actionHistorySection,
-    firstActionDirective,
-    currentActionPlaybook,
-    // 仅 win32 非空；mac 注入空串、占位保留字面（同 gitlabAccessSection）
-    windowsToolDiscipline: buildWindowsToolDisciplineDirective(),
-  });
+  );
+  return r.prompt;
 };
 
 // 起 Run 时把已有 action history 一并 inject、agent 知道之前做过啥
