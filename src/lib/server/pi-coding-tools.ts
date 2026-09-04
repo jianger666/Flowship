@@ -5,7 +5,8 @@
  *   read / grep / glob / shell / edit / write / delete / task
  *
  * pi 原生是 read / bash / edit / write / grep / find / ls，其中：
- *   - read / grep / edit / write 名字一致、直接走 pi 原生（在 createAgentSession.tools 里留）
+ *   - read / grep / edit / write 名字一致、用 pi 原生实现包一层同名 custom（只加输出预算
+ *     withModelBudget、不改行数语义；在 createAgentSession.tools 里仍留名，custom 后注册胜出）
  *   - bash → shell、find → glob：这里包成 customTools 重命名（排除 pi 原生的 bash/find）。
  *     shell 的执行内核复用 pi 原生 createLocalBashOperations（detached spawn + 超时/取消
  *     killProcessTree 整树杀），本层只保留薄壳职责：改名、宿主环境变量清洗、超时语义收敛
@@ -30,11 +31,13 @@ import {
 } from "typebox/type";
 import {
   createEditToolDefinition,
+  createGrepToolDefinition,
   createLocalBashOperations,
   createReadToolDefinition,
   createWriteToolDefinition,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { withModelBudget } from "./tool-output-budget";
 
 const asTool = (d: unknown): ToolDefinition => d as ToolDefinition;
 
@@ -190,11 +193,17 @@ const withPrepare = (
   });
 };
 
-/** 盖掉 pi 原生 write/edit/read：同名 customTools 后注册胜出 */
+/**
+ * 盖掉 pi 原生 write/edit/read/grep：同名 customTools 后注册胜出。
+ * grep 跟 prompt 形状一致（pattern/path/glob）、仍走 pi 原生实现（createGrepToolDefinition），
+ * 加同名包装只为套输出预算（withModelBudget）——D1 之前 native grep 是 50KB 上限、这里再收紧到 32KB。
+ * 每项都包 withModelBudget：进模型前截断，事件落盘链不动。
+ */
 export const buildNativeToolAliasWrappers = (cwd: string): ToolDefinition[] => [
-  withPrepare(createWriteToolDefinition(cwd), prepareWriteArgs),
-  withPrepare(createEditToolDefinition(cwd), prepareEditPathArgs),
-  withPrepare(createReadToolDefinition(cwd), prepareReadArgs),
+  withModelBudget(withPrepare(createWriteToolDefinition(cwd), prepareWriteArgs)),
+  withModelBudget(withPrepare(createEditToolDefinition(cwd), prepareEditPathArgs)),
+  withModelBudget(withPrepare(createReadToolDefinition(cwd), prepareReadArgs)),
+  withModelBudget(asTool(createGrepToolDefinition(cwd))),
 ];
 
 // ----------------- shell（= pi 的 bash） -----------------
@@ -419,17 +428,18 @@ const deleteTool = (cwd: string): ToolDefinition =>
   });
 
 /**
- * pi 后端的规范编码工具（shell / glob / delete / task + 盖掉原生 write/edit/read 的别名包装）。
- * grep 形状跟 prompt 一致、仍走 pi 原生。task 子 agent 靠传入的 runSubagent 回调。
+ * pi 后端的规范编码工具（shell / glob / delete / task + 盖掉原生 write/edit/read/grep 的别名包装）。
+ * task 子 agent 靠传入的 runSubagent 回调。自研的 shell/glob/delete/task 全包 withModelBudget
+ *（shell 10MB 收集是真黑洞、task 子 agent 回包无上限）；别名包装里已包过、这里不再重包。
  */
 export const buildCodingToolDefs = (
   cwd: string,
   runSubagent: (prompt: string) => Promise<string>,
 ): ToolDefinition[] => [
-  shellTool(cwd),
-  globTool(cwd),
-  deleteTool(cwd),
-  taskTool(runSubagent),
+  withModelBudget(shellTool(cwd)),
+  withModelBudget(globTool(cwd)),
+  withModelBudget(deleteTool(cwd)),
+  withModelBudget(taskTool(runSubagent)),
   ...buildNativeToolAliasWrappers(cwd),
 ];
 

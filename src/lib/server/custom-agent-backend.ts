@@ -68,6 +68,7 @@ import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
 import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
 import { buildCodingToolDefs, buildNativeToolAliasWrappers } from "./pi-coding-tools";
+import { withModelBudget } from "./tool-output-budget";
 import { loadSkillsForTask } from "./skills-loader";
 import { injectSdkRgPath } from "./sdk-platform-bin";
 
@@ -423,7 +424,8 @@ const buildCustomTools = (
       thinkingLevel,
     }),
   ),
-  ...mcpToolDefs,
+  // D1：MCP 桥接工具回包无上限，全包输出预算；flowShipTools（submit_work/ask_user）输出小、不碰
+  ...mcpToolDefs.map((d) => withModelBudget(d)),
 ];
 
 // ----------------- run 适配器 -----------------
