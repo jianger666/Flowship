@@ -364,6 +364,46 @@ describe("planWkGate 降级判定", () => {
       path.join(REPO, "wk-doc", "requirements", REQ_ID),
     );
   });
+
+  it("首次 repo-design（仓库侧目录不存在）→ active 且 repoDir 已建好，不会在 pull 前就 FAIL", async () => {
+    await setupHappyWorld();
+    // 本地有业务目录、无 Hub（最朴素的本地首次跑）：biz 侧放行，仓库侧也要提前建空目录
+    await expectActive(makeTask(), { skill: "wk-repo-design" });
+    const repoDir = path.join(REPO, "wk-doc", "requirements", REQ_ID);
+    await fs.rm(repoDir, { recursive: true, force: true });
+    expect(
+      await fs
+        .stat(repoDir)
+        .then((s) => s.isDirectory())
+        .catch(() => false),
+    ).toBe(false);
+
+    const retry = await planWkGate(makeTask(), { skill: "wk-repo-design" });
+    if (!retry.applies) throw new Error(`预期 active、实际降级：${retry.reason}`);
+    expect(retry.repoDir).toBe(repoDir);
+    expect((await fs.stat(repoDir)).isDirectory()).toBe(true);
+  });
+
+  it("业务级指令不建仓库侧目录（biz-analyze 不碰 wk-doc）", async () => {
+    await setupHappyWorld();
+    const freshReq = "REQ-NO-REPO-DIR";
+    await fs.mkdir(path.join(DOC_REPO, "requirements", freshReq), {
+      recursive: true,
+    });
+    const repoDir = path.join(REPO, "wk-doc", "requirements", freshReq);
+    await fs.rm(repoDir, { recursive: true, force: true });
+
+    const plan = await expectActive(makeTask({ reqId: freshReq }), {
+      skill: "wk-biz-analyze",
+    });
+    expect(
+      await fs
+        .stat(repoDir)
+        .then((s) => s.isDirectory())
+        .catch(() => false),
+    ).toBe(false);
+    expect(plan.repoDir).toBe(repoDir);
+  });
 });
 
 describe("脚本参数拼装（对齐 command-contract.md）", () => {
@@ -419,6 +459,33 @@ describe("脚本参数拼装（对齐 command-contract.md）", () => {
       "--delivery-repo-name",
       "crm-web",
     ]);
+  });
+
+  it("preflight：关掉 baseline 但配了 Hub，仓库级指令仍带 --delivery-repo-name（project preflight 照样要它）", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "http://127.0.0.1:8088";
+    wkCfg.requireBaseline = false;
+    const plan = await expectActive(makeTask());
+    expect(plan.pullsBaseline).toBe(false);
+    expect(buildPreflightArgs(plan)).toContain("--delivery-repo-name");
+    expect(buildPreflightArgs(plan)).toEqual([
+      "--command",
+      "wk:repo-execute",
+      "--biz-path",
+      plan.bizDir,
+      "--repo-path",
+      plan.repoDir,
+      "--delivery-repo-name",
+      "crm-web",
+    ]);
+  });
+
+  it("preflight：关掉 baseline 且没配 Hub，仓库级指令不带 --delivery-repo-name", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "";
+    wkCfg.requireBaseline = false;
+    const plan = await expectActive(makeTask());
+    expect(buildPreflightArgs(plan)).not.toContain("--delivery-repo-name");
   });
 
   it("preflight：repo-review 只带 repo-path、biz-analyze 只带 biz-path", async () => {
@@ -781,10 +848,11 @@ describe("runWkPostStage（收尾门禁 + 交付同步）", () => {
 // ⚠️ 第二轮双审 P1-2：上一轮把 preflight 压到 10s 时按「纯本地校验」算，
 // 漏了 doc-quality-gate 在 require_baseline 下会内部起 wk-delivery-baseline.py 去 hub 拉产物。
 describe("超时预算（纯本地校验 vs 要去 hub 拉产物）", () => {
-  it("没开 baseline → 本地档 10s", async () => {
+  it("没开 baseline 且没配 Hub → 本地档 10s", async () => {
     await setupHappyWorld();
     const plan = await expectActive(makeTask());
     expect(plan.pullsBaseline).toBe(false);
+    expect(plan.hubBaseUrl).toBe("");
     expect(preflightTimeoutMs(plan)).toBe(10_000);
   });
 
@@ -795,6 +863,24 @@ describe("超时预算（纯本地校验 vs 要去 hub 拉产物）", () => {
     const plan = await expectActive(makeTask());
     expect(plan.pullsBaseline).toBe(true);
     expect(preflightTimeoutMs(plan)).toBe(45_000);
+  });
+
+  it("配了 Hub 的仓库级指令即使关掉 baseline 也走网络（project preflight 单次 POST）→ 同样 45s", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "http://127.0.0.1:8088";
+    wkCfg.requireBaseline = false;
+    const plan = await expectActive(makeTask());
+    expect(plan.pullsBaseline).toBe(false);
+    // 外层只给 10s 会和脚本内 10s 的 urlopen 超时顶着线跑、慢 Hub 下被拦腰砍断
+    expect(preflightTimeoutMs(plan)).toBe(45_000);
+  });
+
+  it("配了 Hub 但业务级指令关掉 baseline → 仍是本地档（project preflight 不带 repo scope，不加码）", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "http://127.0.0.1:8088";
+    wkCfg.requireBaseline = false;
+    const plan = await expectActive(makeTask(), { skill: "wk-biz-confirm" });
+    expect(preflightTimeoutMs(plan)).toBe(10_000);
   });
 
   it("开关开着但没配 hub 地址 → 脚本立刻 FAIL、不走网络，仍是本地档", async () => {

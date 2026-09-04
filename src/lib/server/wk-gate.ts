@@ -66,7 +66,9 @@ const pythonBin = (): string => process.env.FLOWSHIP_PYTHON?.trim() || "python3"
  *
  * ① **纯本地校验** 10s：`doc-quality-gate.py --stage`（`main` 的 stage 分支在读
  *    delivery 配置之前就 return 了、**保证不联网**）、`wk-context-init.py`（写两个 json +
- *    两条 `git config/branch`）、以及没开 baseline 的 preflight。全是 fs 读写、正常几百 ms。
+ *    两条 `git config/branch`）、以及**没配 Hub**的 preflight。全是 fs 读写、正常几百 ms。
+ *    ⚠️ 配了 Hub 的仓库级 preflight 即使关掉 baseline 也会走网络（project preflight
+ *    单次 POST，见 `preflightTimeoutMs`），不属于这一档。
  *
  * ② **preflight 且会去 Hub 拉 baseline** 45s：`doc-quality-gate.py --command` 此时会
  *    `subprocess.run` 起 `wk-delivery-baseline.py --pull`（第二个 python 冷启动），对
@@ -403,9 +405,22 @@ const detectBaselinePull = async (
   );
 };
 
-/** preflight 的超时预算：只有「会拉 baseline」那档要给足网络时间 */
+/**
+ * preflight 的超时预算：会碰 Hub 的两条路都要给足网络时间。
+ *
+ * - `pullsBaseline` 为真 → 走 `wk-delivery-baseline.py --pull`（37~50 次串行 GET），给 45s；
+ * - 配了 Hub 的仓库级指令 → 即使关掉 baseline，`doc-quality-gate.py` 仍会先走
+ *   `wk-delivery-preflight.py` 做 project preflight（单次 POST 到
+ *   `/internal/harness/preflight`，脚本内默认 10s 超时，`require_active_requirement`
+ *   默认开启）。外层只给 10s 会和这一跳顶着线跑、慢 Hub 下被拦腰砍断，
+ *   所以同样给 45s（上限而已：Hub 正常时单次 POST 几百 ms 就回，不会真等 45s；
+ *   Hub 挂死时等的是脚本内 10s 超时后吐出的那句 FAIL，而不是干等 45s）。
+ */
 export const preflightTimeoutMs = (plan: WkGatePlanActive): number =>
-  plan.pullsBaseline ? BASELINE_PULL_TIMEOUT_MS : LOCAL_TIMEOUT_MS;
+  plan.pullsBaseline ||
+  (Boolean(plan.hubBaseUrl) && wkScopeOf(plan.command) === "repo")
+    ? BASELINE_PULL_TIMEOUT_MS
+    : LOCAL_TIMEOUT_MS;
 
 /**
  * 判断本次 action 要不要跑 wk 门禁、要跑的话参数怎么拼。
@@ -463,12 +478,22 @@ export const planWkGate = async (
   // 只有没配 Hub（本地没有 = 真没有）才降级跳过。
   const pullsBaseline = await detectBaselinePull(cfg, repoRoot);
   const bizDir = path.join(cfg.docRepoPath, "requirements", reqId);
+  const repoDir = path.join(repoRoot, "wk-doc", "requirements", reqId);
   const hasBizDir = await dirExists(bizDir);
   if (!hasBizDir && !pullsBaseline) {
     return skip("no-req-dir", missingReqDirMessage(command, reqId, true));
   }
   if (!hasBizDir) {
     await fs.mkdir(bizDir, { recursive: true });
+  }
+  // 仓库级产物目录：规范原意里开了 Hub 的 preflight 是双路径
+  // （delivery-hub-sync.md：`doc-quality-gate.py --command <wk:*> --biz-path ... --repo-path ...`），
+  // repo scope 的三条指令（含 repo-design）都会带 --repo-path 给 baseline 做仓库基线比对。
+  // 而 doc-quality-gate 在拉基线前先判目录存在，首次跑 repo-design 时仓库侧目录本来就没有，
+  // 不提前建空目录就会在 pull 之前就 `FAIL: repo-path does not exist`，远端业务方案再新也拉不下来。
+  // runner 的 hard gate 对 repo-design 只看业务侧，空目录不影响结论；远端有同仓库产物时 pull 会自动填进来。
+  if (wkNeedsRepoPath(command)) {
+    await fs.mkdir(repoDir, { recursive: true });
   }
 
   return {
@@ -478,7 +503,7 @@ export const planWkGate = async (
     reqId,
     docRepoPath: cfg.docRepoPath,
     bizDir,
-    repoDir: path.join(repoRoot, "wk-doc", "requirements", reqId),
+    repoDir,
     repoRoot,
     // 老版本团队库没这个脚本——探不到就整步跳过（硬跑 = python 退 2、
     // 每次推进往事件流刷一条「上下文初始化未完成」的假告警）
@@ -523,15 +548,18 @@ export const buildContextInitArgs = (plan: WkGatePlanActive): string[] => [
  * 传哪些 path 对齐 command hard gate 与 delivery baseline 的合并口径
  * （见 wk-command.ts 的两张表）。
  *
- * repo baseline 的 unit scope 必须和 post-stage sync 一致：sync 以 repoName
+ * repo baseline / project preflight 的 unit scope 必须和 post-stage sync 一致：sync 以 repoName
  * （如 crm-web）发布，preflight 也要显式传同一个名字。否则 baseline 会退到
- * 默认 scope `repo`，拿到另一份同 REQ-ID 的旧产物并误报本地未同步。
+ * 默认 scope `repo`，拿到另一份同 REQ-ID 的旧产物并误报本地未同步；
+ * project preflight（require_active_requirement 默认为开）更会直接报
+ * `requires a matched Unit`。所以只要配了 Hub，仓库级指令都带 repo-name，
+ * 不只看 pullsBaseline（关掉 baseline 时 project preflight 照样要它）。
  */
 export const buildPreflightArgs = (plan: WkGatePlanActive): string[] => {
   const args = ["--command", plan.command];
   if (wkNeedsBizPath(plan.command)) args.push("--biz-path", plan.bizDir);
   if (wkNeedsRepoPath(plan.command)) args.push("--repo-path", plan.repoDir);
-  if (plan.pullsBaseline && wkScopeOf(plan.command) === "repo") {
+  if (plan.hubBaseUrl && wkScopeOf(plan.command) === "repo") {
     args.push("--delivery-repo-name", plan.repoName);
   }
   return args;
