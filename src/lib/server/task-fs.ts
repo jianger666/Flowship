@@ -1850,8 +1850,12 @@ export const recordTurnUsage = async (
     const now = Date.now();
     meta.tokenUsage = accumulateTokenUsage(meta.tokenUsage, turn, now);
     // 保命轮换水位（2026-09-03 OOM 根治）：随每轮记账累加，chat/task 共用入口；阈值见 session-rotate.ts
+    // 2026-09-05：只累加未命中缓存的增量（input - cacheRead）。缓存命中的历史重放不占
+    // 增量内存、堆风险远低于账面数字；全量口径曾让单轮 460 万（94% 命中）的任务每发必转。
+    // 计费口径不受影响（tokenUsage.total 照全量累加）。
     meta.sessionInputTokens =
-      (meta.sessionInputTokens ?? 0) + (turn.inputTokens ?? 0);
+      (meta.sessionInputTokens ?? 0) +
+      Math.max(0, (turn.inputTokens ?? 0) - (turn.cacheReadTokens ?? 0));
 
     const idx = meta.currentActionId
       ? meta.actions.findIndex((a) => a.id === meta.currentActionId)

@@ -18,6 +18,7 @@
  */
 
 import type { Task } from "@/lib/types";
+import { heapPressure } from "./sdk-store-gc";
 
 /** 当前 SDK 会话累计 input 超过此值 → 下轮轮换（同事实测崩时 278 万） */
 export const ROTATE_SESSION_INPUT_TOKENS = 2_000_000;
@@ -37,6 +38,17 @@ export interface RotationUsageLike {
 export const isSessionRotationDue = (u: RotationUsageLike): boolean =>
   (u.sessionInputTokens ?? u.totalInputTokens ?? 0) >=
   ROTATE_SESSION_INPUT_TOKENS;
+
+/**
+ * task 轮换双条件（2026-09-07 矫枉过正修正）：水位超线 **并且** 堆水位过半才转。
+ * 堆不吃紧时链胖点也不折腾用户；85% 的拒单门（见 sdk-store-gc）是最后一道。
+ * heapRatio 可注入（单测锁行为），缺省读实时堆。chat 通路不用这条（沿用旧语义）。
+ */
+export const ROTATE_HEAP_FLOOR = 0.5;
+export const shouldRotateSession = (
+  u: RotationUsageLike,
+  heapRatio: number = heapPressure().ratio,
+): boolean => isSessionRotationDue(u) && heapRatio >= ROTATE_HEAP_FLOOR;
 
 /** 从 Task 取水位输入 */
 export const rotationUsageOf = (

@@ -58,6 +58,10 @@ export const WHATS_NEW: Record<string, string[]> = {
     "同一任务聊太长会自动换新会话续上（一条灰线提示），历史照样能翻",
     "内存吃紧时推进会提示稍后重试，不会整个应用崩掉重开",
   ],
+  "1.9.11": [
+    "解决任务用久变胖、发消息越来越卡的问题，输入框几十秒变成1秒内",
+    "解决Windows装到含空格路径（如E盘）点更新装不上的问题",
+  ],
 };
 
 export const WHATS_NEW_SEEN_KEY = "flowship.whatsNewSeen";

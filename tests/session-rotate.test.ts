@@ -9,8 +9,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   isSessionRotationDue,
+  ROTATE_HEAP_FLOOR,
   ROTATE_SESSION_INPUT_TOKENS,
   rotationUsageOf,
+  shouldRotateSession,
 } from "@/lib/server/session-rotate";
 
 describe("isSessionRotationDue", () => {
@@ -54,6 +56,29 @@ describe("isSessionRotationDue", () => {
         sessionInputTokens: ROTATE_SESSION_INPUT_TOKENS - 1,
       }),
     ).toBe(false);
+  });
+});
+
+describe("shouldRotateSession 双条件（水位 + 堆过半）", () => {
+  const FAT = { sessionInputTokens: 2_788_972 };
+  const THIN = { sessionInputTokens: 300_000 };
+
+  it("超线 + 堆高 → 转", () => {
+    expect(shouldRotateSession(FAT, 0.6)).toBe(true);
+    expect(shouldRotateSession(FAT, ROTATE_HEAP_FLOOR)).toBe(true);
+  });
+
+  it("超线 + 堆低 → 不转（防过矫：堆不吃紧不折腾用户）", () => {
+    expect(shouldRotateSession(FAT, 0.2)).toBe(false);
+    expect(shouldRotateSession(FAT, ROTATE_HEAP_FLOOR - 0.01)).toBe(false);
+  });
+
+  it("没超线 → 堆再高也不转", () => {
+    expect(shouldRotateSession(THIN, 0.9)).toBe(false);
+  });
+
+  it("缺省读实时堆（不注入也能调）", () => {
+    expect(typeof shouldRotateSession(THIN)).toBe("boolean");
   });
 });
 

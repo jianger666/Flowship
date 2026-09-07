@@ -70,6 +70,8 @@ import type { Task } from "@/lib/types";
 
 export interface TaskQuestionBody {
   text?: string;
+  /** 前端回车瞬间 Date.now()：只做耗时打点（clientGap），不参与业务 */
+  clientSentAt?: number;
   images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
   /** 文件 / 目录绝对路径（原生 picker 选的、v1.1.x 任务输入条也能附） */
   attachments?: string[];
@@ -166,10 +168,20 @@ export const handleTaskQuestionInject = async (
 ): Promise<Response> => {
   // 认领句柄由内部创建、外层只负责兜底回滚（用容器传出来，避免把 return 值搞复杂）
   const skipRef: { handle: AskSkipHandle | null } = { handle: null };
+  // 输入框 loading 打点：clientGap=回车→服务端收到，serverMs=服务端处理→回200。
+  // 两段相加≈输入框里压字的时间。只 console，不进事件流。
+  const t0 = Date.now();
+  const clientSentAt =
+    typeof (rawBody as { clientSentAt?: unknown })?.clientSentAt === "number"
+      ? ((rawBody as { clientSentAt: number }).clientSentAt as number)
+      : null;
   try {
     return await runTaskQuestionInject(id, rawBody, options, skipRef);
   } finally {
     skipRef.handle?.rollback();
+    console.log(
+      `[question-timing] task=${id} clientGapMs=${clientSentAt != null ? t0 - clientSentAt : -1} serverMs=${Date.now() - t0}`,
+    );
   }
 };
 

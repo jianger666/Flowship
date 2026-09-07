@@ -140,4 +140,22 @@ describe("recordTurnUsage", () => {
       recordTurnUsage("tu_does_not_exist", usage(1, 1)),
     ).resolves.toBeNull();
   });
+
+  it("水位只累加未命中缓存的增量（高命中轮不推高水位）", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id));
+
+    // 单轮 460 万、94% 命中：水位只涨约 27 万，而不是 460 万
+    await recordTurnUsage(id, {
+      inputTokens: 4613622,
+      outputTokens: 22004,
+      cacheReadTokens: 4342215,
+      cacheWriteTokens: 0,
+      reasoningTokens: 10698,
+    });
+    const meta = await readMetaV06(id);
+    expect(meta?.sessionInputTokens).toBe(4613622 - 4342215);
+    // 计费口径照全量
+    expect(meta?.tokenUsage?.total.inputTokens).toBe(4613622);
+  });
 });

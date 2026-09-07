@@ -1035,6 +1035,8 @@ export const submitTaskQuestion = async (
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
+        // 输入框 loading 打点：回车瞬间戳，后端日志拆路上/服务两段
+        clientSentAt: Date.now(),
         images: images && images.length > 0 ? images : undefined,
         attachments:
           attachments && attachments.length > 0 ? attachments : undefined,

@@ -135,9 +135,9 @@ import { resolveSessionModel } from "@/lib/task-model";
 import { resolveWkWorktreeBranchInfos } from "./wk-source-branch";
 import { setTaskSessionAgentId } from "./task-fs";
 import {
-  isSessionRotationDue,
   rotationUsageOf,
   SESSION_ROTATION_INFO_TEXT,
+  shouldRotateSession,
 } from "./session-rotate";
 import { assertHeapOk, HeapPressureError } from "./sdk-store-gc";
 import {
@@ -1212,10 +1212,11 @@ const advanceTaskCore = async (
   // 老会话没记 repoPaths：不能当成「没漂」续旧 cwd。缺字段或列表不一致都强制新 agent。
   const reposDrifted =
     !sessionRepos || !sameRepoPathList(sessionRepos, task.repoPaths);
-  // task 保命轮换（OOM 根治）：同 action 内追问养胖的链，水位一到强制起新 agent。
-  // 新 agent 走正常 fresh 路径（artifact + 任务元信息就是接力棒），只扔 SDK 会话缓存；
-  // sessionInputTokens 在 setTaskSessionAgentId(新 id) 时清零，见 task-fs。
-  const rotationDue = isSessionRotationDue(rotationUsageOf(task));
+  // task 保命轮换（OOM 根治 + 2026-09-07 双条件防过矫）：增量水位超线 **并且**
+  // 堆过半才强制起新 agent。新 agent 走正常 fresh 路径（artifact + 任务元信息
+  // 就是接力棒），只扔 SDK 会话缓存；sessionInputTokens 在
+  // setTaskSessionAgentId(新 id) 时清零，见 task-fs。
+  const rotationDue = shouldRotateSession(rotationUsageOf(task));
   if (rotationDue) {
     console.log(
       `[task-runner] task=${task.id} 会话累计 input 超水位、推进强制起新 agent`,
@@ -5618,11 +5619,11 @@ const sendToTaskSessionBody = async (
       if (err instanceof HeapPressureError) throw err;
       /* 探针失败不挡发送 */
     }
-    // task 保命轮换：同 action 内追问养胖的链，水位一到关旧链、走 no_session 分流
+    // task 保命轮换：双条件（水位 + 堆过半）到了关旧链、走 no_session 分流
     // （唤醒新 agent 原地续同一 action / one-shot），artifact 照常接力。
     try {
       const fresh = await getTaskMeta(task.id);
-      if (fresh && isSessionRotationDue(rotationUsageOf(fresh))) {
+      if (fresh && shouldRotateSession(rotationUsageOf(fresh))) {
         console.log(
           `[task-runner] task=${task.id} 会话累计 input 超水位、追问转新会话`,
         );
