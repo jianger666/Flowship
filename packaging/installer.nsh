@@ -35,6 +35,44 @@
 ; 指向空路径（「找不到应用」）。electron-updater 固定传 --updated → ${isUpdated}。
 ; 更新路径仍要杀掉 Flowship.exe 本体（不带 /T），清掉隐形 server，避免文件被锁。
 !macro customInit
+  ; E 盘自定义路径含空格兜底（静默更新卸完装不上）：
+  ; electron-updater 传 `/D=E:\Foo Bar\Flowship` 时，Node 在含空格时会自动包一层双引号，
+  ; 而 electron-builder 的 GetDParameter 不去引号 → $INSTDIR 变成 `"E:\..."` → 安装失败，
+  ; 且此时旧目录已被 RMDir。主进程侧已优先用 8.3 短路径（见 win-install-dir.mjs），
+  ; 这里再剥掉 $INSTDIR 首尾引号 + 尾部分隔符，双保险。此时机在 initMultiUser 之后，
+  ; $INSTDIR 已是 注册表 InstallLocation / /D= 合并结果，改这里正好。
+  StrCpy $0 $INSTDIR 1
+  ${if} $0 == '"'
+    StrCpy $INSTDIR $INSTDIR "" 1
+  ${endIf}
+  StrCpy $0 $INSTDIR 1 -1
+  ${if} $0 == '"'
+    StrLen $1 $INSTDIR
+    IntOp $1 $1 - 1
+    StrCpy $INSTDIR $INSTDIR $1 0
+  ${endIf}
+  StrCpy $0 $INSTDIR 1
+  ${if} $0 == "'"
+    StrCpy $INSTDIR $INSTDIR "" 1
+  ${endIf}
+  StrCpy $0 $INSTDIR 1 -1
+  ${if} $0 == "'"
+    StrLen $1 $INSTDIR
+    IntOp $1 $1 - 1
+    StrCpy $INSTDIR $INSTDIR $1 0
+  ${endIf}
+  StrLen $1 $INSTDIR
+  ${if} $1 > 3
+    StrCpy $0 $INSTDIR 1 -1
+    ${if} $0 == "\"
+      IntOp $1 $1 - 1
+      StrCpy $INSTDIR $INSTDIR $1 0
+    ${elseIf} $0 == "/"
+      IntOp $1 $1 - 1
+      StrCpy $INSTDIR $INSTDIR $1 0
+    ${endIf}
+  ${endIf}
+
   ${if} ${isUpdated}
     nsExec::Exec 'taskkill /F /IM "Flowship.exe"'
   ${else}

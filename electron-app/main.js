@@ -41,6 +41,9 @@ import {
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// Windows 自定义安装目录静默更新保护（E 盘含空格路径坑）：/D= 不能带引号，
+// 含空格时优先用 8.3 短路径，详见 ./win-install-dir.mjs
+import { resolveWinInstallDirForUpdater } from "./win-install-dir.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -1726,8 +1729,15 @@ const installWinUpdate = (version) => {
   if (updateState.phase === "installing") return;
   quitting = true;
   setUpdateState({ phase: "installing", version, error: null });
-  // /D= 钉成当前安装目录，避免卸在 A、装到 B 导致快捷方式悬空
-  winAutoUpdater.installDirectory = path.dirname(process.execPath);
+  // /D= 钉成当前安装目录，避免卸在 A、装到 B 导致快捷方式悬空。
+  // E 盘坑：路径含空格时 Node spawn 会自动给 /D= 加引号，而 NSIS 的 GetDParameter
+  // 不去引号 → $INSTDIR 非法 → 旧目录已被 RMDir、新文件装不上。这里优先用 8.3 短路径
+  // （无空格、无需引号）；短路径拿不到则用长路径——新版 installer.nsh customInit 会剥引号兜底。
+  const resolved = resolveWinInstallDirForUpdater();
+  log(
+    `[updater] win 安装目录 raw=${resolved.raw} dir=${resolved.dir} viaShort=${resolved.viaShort}`,
+  );
+  winAutoUpdater.installDirectory = resolved.dir;
   winAutoUpdater.quitAndInstall(true, true);
 };
 
@@ -1739,7 +1749,13 @@ const ensureWinAutoUpdater = async () => {
   winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
   winAutoUpdater.autoInstallOnAppQuit = false; // 退出不偷偷装，只在用户点徽标确认后装
   // 静默升级把 /D= 钉在当前 exe 目录，避免卸旧路径、装到默认路径导致快捷方式悬空
-  winAutoUpdater.installDirectory = path.dirname(process.execPath);
+  // （含空格路径走短路径，见 installWinUpdate；这里先钉一次，安装瞬间会再决议一次）
+  try {
+    winAutoUpdater.installDirectory =
+      resolveWinInstallDirForUpdater().dir;
+  } catch {
+    winAutoUpdater.installDirectory = path.dirname(process.execPath);
+  }
   // 下载进度 → 任务栏进度条 + 页面徽标进度（对齐 mac 的 Dock + 页面双通道）
   winAutoUpdater.on("download-progress", (p) => {
     if (typeof p?.percent !== "number") return;
