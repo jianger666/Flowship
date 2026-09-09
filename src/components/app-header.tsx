@@ -20,7 +20,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Blocks, LayoutDashboard, MessageSquare, PanelLeft, Settings } from "lucide-react";
+import { Blocks, LayoutDashboard, MessageSquare, MessageSquareText, PanelLeft, Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 
@@ -127,7 +127,9 @@ export const AppHeader = ({
   // 中性页（设置 / 能力页）：胶囊两段都不高亮（这两页不属于任一模式）
   const pathname = usePathname();
   const isNeutralPage =
-    pathname.startsWith("/settings") || pathname.startsWith("/actions");
+    pathname.startsWith("/settings") ||
+    pathname.startsWith("/actions") ||
+    pathname.startsWith("/sessions");
 
   useEffect(() => {
     setPlatform(window.__shell?.platform ?? "");
@@ -214,6 +216,23 @@ export const AppHeader = ({
             }
           >
             <Blocks />
+          </Button>
+        </Tooltip>
+        <Tooltip content="会话管理">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="[&_svg:not([class*='size-'])]:size-4.5"
+            nativeButton={false}
+            render={
+              <Link
+                href="/sessions"
+                className="no-underline"
+                aria-label="会话管理"
+              />
+            }
+          >
+            <MessageSquareText />
           </Button>
         </Tooltip>
         <Tooltip content="设置">

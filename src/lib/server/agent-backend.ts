@@ -59,26 +59,37 @@ export type AgentCreateInput = CursorCreateInput & {
   providerId?: string;
   /** 正式会话身份；有值才挂系统 customTools。oneshot / 受限答疑不传。 */
   callerToken?: string;
+  /** 只读轮次：两边走各自原生工具开关（cursor tools 白名单 / pi 白名单），写类工具执行层拒掉 */
+  readOnly?: boolean;
 };
 export type AgentResumeInput = NonNullable<CursorResumeInput> & {
   providerId?: string;
   callerToken?: string;
+  readOnly?: boolean;
 };
 export type AgentPromptInput = NonNullable<CursorPromptInput> & {
   providerId?: string;
 };
 
-type FacadeExtras = { providerId?: string; callerToken?: string };
+type FacadeExtras = {
+  providerId?: string;
+  callerToken?: string;
+  readOnly?: boolean;
+};
+
+/** 只读轮次的两边通用白名单（读类 only；shell / 写类 / 子代理 / MCP 全不给） */
+export const READONLY_BUILTIN_TOOLS = ["read", "grep"] as const;
 
 const stripFacadeExtras = <T extends FacadeExtras>(
   input: T,
 ): {
   providerId?: string;
   callerToken?: string;
-  rest: Omit<T, "providerId" | "callerToken">;
+  readOnly?: boolean;
+  rest: Omit<T, "providerId" | "callerToken" | "readOnly">;
 } => {
-  const { providerId, callerToken, ...rest } = input;
-  return { providerId, callerToken, rest };
+  const { providerId, callerToken, readOnly, ...rest } = input;
+  return { providerId, callerToken, readOnly, rest };
 };
 
 /** Cursor 路径：正式会话把系统工具挂进 local.customTools */
@@ -165,19 +176,28 @@ export const resolveProviderIdFromDisk = async (task: {
  */
 export const Agent = {
   async create(input: AgentCreateInput): Promise<AgentInstance> {
-    const { providerId, callerToken, rest } = stripFacadeExtras(input);
+    const { providerId, callerToken, readOnly, rest } =
+      stripFacadeExtras(input);
     const creds = await resolveBackendCreds(rest.apiKey ?? "", providerId);
-    const sanitized = stripHiddenModelParams(rest);
+    const sanitized = stripHiddenModelParams(
+      readOnly ? { ...rest, tools: [...READONLY_BUILTIN_TOOLS] } : rest,
+    );
+    // readOnly 时不挂系统 customTools（submit_work 等能落盘）：Cursor 的 tools 白名单
+    // 只管内置工具，customTools 走 "mcp" 族——默认按管不住处理，和 pi 对齐（双收敛）。
+    const effectiveCallerToken = readOnly ? undefined : callerToken;
     if (creds.kind === "custom") {
       const { createCustomAgent } = await loadCustomBackend();
       return createCustomAgent({
         ...sanitized,
         ...creds,
-        callerToken,
+        callerToken: effectiveCallerToken,
+        ...(readOnly ? { readOnly: true } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
     return CursorAgent.create(
-      await withCursorJsonlStore(attachFlowshipTools(sanitized, callerToken)),
+      await withCursorJsonlStore(
+        attachFlowshipTools(sanitized, effectiveCallerToken),
+      ),
     );
   },
 
@@ -185,24 +205,32 @@ export const Agent = {
     agentId: string,
     input: AgentResumeInput,
   ): Promise<AgentInstance> {
-    const { providerId, callerToken, rest } = stripFacadeExtras(input);
+    const { providerId, callerToken, readOnly, rest } =
+      stripFacadeExtras(input);
     const creds = await resolveBackendCreds(
       rest.apiKey ?? "",
       providerId,
       agentId,
     );
-    const sanitized = stripHiddenModelParams(rest);
+    const sanitized = stripHiddenModelParams(
+      readOnly ? { ...rest, tools: [...READONLY_BUILTIN_TOOLS] } : rest,
+    );
+    // 同 create：readOnly 不挂系统 customTools（双收敛）。
+    const effectiveCallerToken = readOnly ? undefined : callerToken;
     if (creds.kind === "custom") {
       const { resumeCustomAgent } = await loadCustomBackend();
       return resumeCustomAgent(agentId, {
         ...sanitized,
         ...creds,
-        callerToken,
+        callerToken: effectiveCallerToken,
+        ...(readOnly ? { readOnly: true } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
     return CursorAgent.resume(
       agentId,
-      await withCursorJsonlStore(attachFlowshipTools(sanitized, callerToken)),
+      await withCursorJsonlStore(
+        attachFlowshipTools(sanitized, effectiveCallerToken),
+      ),
     );
   },
 

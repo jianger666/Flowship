@@ -18,7 +18,9 @@ import {
 } from "@/lib/server/chat-checkpoint";
 import {
   beginChatQueueInFlight,
+  drainRemainingChatQueue,
   endChatQueueInFlight,
+  enqueueChatMessage,
   enqueueChatMessageFront,
   getChatQueueGeneration,
   isMessageOperationTerminal,
@@ -338,6 +340,28 @@ export type SendNowDeps = {
   stop: (task: Task) => Promise<unknown>;
   start: typeof startChatFromQueuedMessage;
   getTask: typeof getTask;
+  /** 取剩余队（默认真实实现；单测可 mock 验“其余排队保留”） */
+  drainRest?: typeof drainRemainingChatQueue;
+  /** 塞回剩余队（默认真实实现；单测可 mock 断言顺序） */
+  requeueRest?: (taskId: string, rest: QueuedChatMsg[]) => void;
+};
+
+/** 默认塞回：同 id 原样 append（operation 非终态 → 幂等受理继续排队） */
+const defaultRequeueRest = (taskId: string, rest: QueuedChatMsg[]): void => {
+  for (const m of rest) {
+    enqueueChatMessage(taskId, {
+      itemId: m.itemId,
+      agentText: m.agentText,
+      displayText: m.displayText,
+      imageAbsPaths: m.imageAbsPaths,
+      savedImages: m.savedImages,
+      attachmentAbsPaths: m.attachmentAbsPaths,
+      attachmentMetas: m.attachmentMetas,
+      enqueuedAt: m.enqueuedAt,
+      skipPersistEvent: m.skipPersistEvent,
+      extraMeta: m.extraMeta,
+    });
+  }
 };
 
 const defaultDeps: SendNowDeps = {
@@ -386,11 +410,17 @@ export const sendQueuedChatMessageNow = async (
   const taken = deps.take(taskId, trimmedId);
   if (!taken) return errorResponse("队列中找不到该消息", 404);
 
+  // 其余排队先救出来（stop 清队不波及它们，start 后原样塞回继续排）
+  const drainRest = deps.drainRest ?? drainRemainingChatQueue;
+  const requeueRest = deps.requeueRest ?? defaultRequeueRest;
+  const rest = drainRest(taskId);
+
   try {
     await deps.stop(task);
   } catch (err) {
-    // stop 失败：塞回，避免「已取出却未发出」
+    // stop 失败：目标条放回队首、其余按原顺序跟回，一条不丢
     enqueueChatMessageFront(taskId, taken);
+    requeueRest(taskId, rest);
     throw err;
   }
 
@@ -409,5 +439,11 @@ export const sendQueuedChatMessageNow = async (
     forceClearChatRun(taskId, { keepPersisted: true });
   }
 
-  return deps.start(taskId, taken, validated);
+  // start 成败都把其余排队塞回：成功→跟在目标条后面继续 flush；
+  // 失败→start 内部已把目标条放回队首，其余跟在后面，一条不丢。
+  try {
+    return await deps.start(taskId, taken, validated);
+  } finally {
+    requeueRest(taskId, rest);
+  }
 };

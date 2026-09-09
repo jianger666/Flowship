@@ -116,7 +116,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   }, [settingsRepos, selectedRepos, repoNameOf]);
 
   // v0.9.11：分支候选（测试任务 Combobox 用）
-  const branchMap = useRepoBranches(testingTask ? selectedRepos : []);
+  const branchMap = useRepoBranches(testingTask ? selectedRepos : [], {
+    refresh: true,
+  });
 
   // 需求任务改链接时不可清空（身份闸门）；日常任务不传 feishuStoryUrl；任务至少 1 仓
   const canSubmit =

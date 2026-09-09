@@ -28,6 +28,20 @@ export const REQUIRED_BRIDGE_SCOPES = [
   "im:resource",
 ] as const;
 
+/**
+ * 群功能所需 scope（实测 3 个就够：2026-09-09 用户实锤 `im:chat.group_info:readonly`
+ * 是历史版本，新应用点一键页显示“当前无需开通任何权限”，根本开不了，也不需要——
+ * 有 `im:chat:readonly` 就覆盖它了。之前把 4 个全列进必备，3 个全开完还红 1 个，误导。）
+ * 与 REQUIRED_BRIDGE_SCOPES 分开声明、合并展示：设置页实盘只有一行“权限齐全”
+ * （没有单独的群行），群缺口在同一行内用前缀文案区分
+ * （“群功能缺少（发消息正常）：”），authUrl 一次预填全部缺口。
+ */
+export const REQUIRED_GROUP_SCOPES = [
+  "im:chat:readonly",
+  "im:chat",
+  "im:chat.members:read",
+] as const;
+
 /** send_as_bot 的等价写法（任一命中即视为 send 权限齐） */
 const SEND_SCOPE_EQUIVALENTS = [
   "im:message:send_as_bot",
@@ -130,6 +144,10 @@ const asRecord = (v: unknown): JsonRecord | null =>
 /**
  * 从 GET /application/v6/applications/<id> 响应抽出已授权 scope 名。
  * 官方字段：`data.app.scopes[]` 每项 `{ scope: string, token_types?: string[] }`。
+ *
+ * `token_types` 故意忽略：实盘只见过 `"tenant"` / 缺省两种（单测 fixture 即按实盘写），
+ * 从没见过 user-only 之类的限定值——在见过之前只认 scope 名，不拿未知词汇做绿灯闸。
+ * 若将来出现“探针全绿但报缺 scope”，第一排查点就是该字段（到时把限定值收进准入表）。
  */
 export const extractGrantedScopes = (apiRoot: unknown): string[] => {
   const rec = asRecord(apiRoot);
@@ -173,16 +191,16 @@ export const findMissingScopes = (granted: readonly string[]): string[] => {
 };
 
 /**
- * 权限预填深链（提案 4.4b）：
- * `https://open.feishu.cn/app/<appId>/auth?q=<逗号分隔缺失scope>&op_from=openapi&token_type=tenant`
+ * 一键开通深链（跟 lark-cli 报错里的 console_url 同款）：
+ * `https://open.feishu.cn/page/scope-apply?clientID=<appId>&scopes=<encode 后缺失scope>`
+ * 点开是“确定开通以下权限吗”+蓝色开通键，确认即开。之前用的 `/app/<id>/auth` 要自己勾+发版，绕。
  */
 export const buildScopeAuthUrl = (
   appId: string,
   missingScopes: readonly string[],
 ): string => {
-  // 与飞书 console_url / 提案 4.4b 同形态：q 为逗号分隔、不额外 encode（scope 仅含 [a-z:_]）
-  const q = missingScopes.join(",");
-  return `https://open.feishu.cn/app/${appId}/auth?q=${q}&op_from=openapi&token_type=tenant`;
+  const scopes = encodeURIComponent(missingScopes.join(","));
+  return `https://open.feishu.cn/page/scope-apply?clientID=${appId}&scopes=${scopes}`;
 };
 
 // ----------------- 探测主流程 -----------------
@@ -215,29 +233,72 @@ const probeCli = async (): Promise<ProbeCliCheck> => {
   }
 };
 
+/** 取应用已授权 scope（两组探针共用，一次查询）。抛错语义与原来 probeScopes 一致。 */
+const fetchGrantedScopes = async (): Promise<{
+  appId: string;
+  granted: string[];
+}> => {
+  const info = await getBotAppInfo();
+  const rec = await larkApi(
+    "GET",
+    `/open-apis/application/v6/applications/${encodeURIComponent(info.appId)}`,
+    { params: { lang: "zh_cn" } },
+  );
+  return { appId: info.appId, granted: extractGrantedScopes(rec) };
+};
+
+const checkScopesResult = (
+  appId: string,
+  granted: string[],
+  missing: string[],
+  okDetail: string,
+  missingDetailPrefix: string,
+  /** 缺口后缀：群缺时追加重进补救（与群错误翻译文案统一口径） */
+  missingDetailSuffix = "",
+): ProbeScopesCheck => {
+  const ok = missing.length === 0;
+  return {
+    ok,
+    appId,
+    granted,
+    missing,
+    ...(ok
+      ? { detail: okDetail }
+      : {
+          detail: `${missingDetailPrefix}${missing.join(", ")}${missingDetailSuffix}`,
+          authUrl: buildScopeAuthUrl(appId, missing),
+        }),
+  };
+};
+
+/**
+ * 群缺口的重进补救后缀（设置页“权限齐全”行 detail 用）。
+ * 与群错误翻译 `describeScopeShortage` 统一口径：不断言必须重进，
+ * 只给“开通后仍不好使再重进”分支——实盘是否真要重进尚未定论，两边一致。
+ * 只用于群缺口；纯桥接缺口（发消息/卡片）不需要重进，不加。
+ */
+export const GROUP_SCOPE_REJOIN_SUFFIX =
+  "；若开通后仍不好使，把机器人移出群重进一次";
+
 const probeScopes = async (): Promise<ProbeScopesCheck> => {
   try {
-    const info = await getBotAppInfo();
-    const rec = await larkApi(
-      "GET",
-      `/open-apis/application/v6/applications/${encodeURIComponent(info.appId)}`,
-      { params: { lang: "zh_cn" } },
-    );
-    const granted = extractGrantedScopes(rec);
-    const missing = findMissingScopes(granted);
-    const ok = missing.length === 0;
-    return {
-      ok,
-      appId: info.appId,
+    const { appId, granted } = await fetchGrantedScopes();
+    // 一次性申请全部免审权限：发消息四件套 + 群三件套并集（自建应用租户管理员自助开通，
+    // 无需官方审核；敏感通讯录字段等高级权限不在表内，真缺了只告知不推链接——见 AI 提示词）。
+    // 仍走原来这一行（不新增 UI 行）：detail 列全缺口，authUrl 一次预填全部。
+    const bridgeMissing = findMissingScopes(granted);
+    const groupMissing = (await probeGroupScopes(granted, appId)).missing;
+    const missing = [...bridgeMissing, ...groupMissing];
+    return checkScopesResult(
+      appId,
       granted,
       missing,
-      ...(ok
-        ? { detail: "所需权限已开通" }
-        : {
-            detail: `缺少：${missing.join(", ")}`,
-            authUrl: buildScopeAuthUrl(info.appId, missing),
-          }),
-    };
+      "所需权限已开通",
+      groupMissing.length > 0 && bridgeMissing.length === 0
+        ? "群功能缺少（发消息正常）："
+        : "缺少：",
+      groupMissing.length > 0 ? GROUP_SCOPE_REJOIN_SUFFIX : "",
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // 网络类失败 ≠ 权限缺失：不给「去开通」、不触发首次接入引导（同事实测被误导）
@@ -279,6 +340,26 @@ const probeScopes = async (): Promise<ProbeScopesCheck> => {
       ...fallbackAuth,
     };
   }
+};
+
+/** 群功能权限探针（成员/群信息）。查询失败整体标红但不给误导性缺口（见下 probeBridgeStatus）。单测可直接调。
+ * detail 自带重进补救后缀（与群错误翻译统一口径）；
+ * 注意：probeScopes 合并展示时只取本函数的 missing，本 detail 会被合并行覆盖——
+ * 合并行同样带后缀（见上），两边不会打架。 */
+export const probeGroupScopes = async (
+  granted: string[],
+  appId: string,
+): Promise<ProbeScopesCheck> => {
+  const set = new Set(granted);
+  const missing = REQUIRED_GROUP_SCOPES.filter((s) => !set.has(s));
+  return checkScopesResult(
+    appId,
+    granted,
+    [...missing],
+    "群成员/群信息权限已开通",
+    "缺少（群 @ 解析、问事取数不可用）：",
+    missing.length > 0 ? GROUP_SCOPE_REJOIN_SUFFIX : "",
+  );
 };
 
 const probeCardkit = async (): Promise<ProbeCardkitCheck> => {

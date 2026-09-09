@@ -6,8 +6,9 @@
  * 组卡按用户心智（2026-08-18：模型提供方从「连接」拆成独立一栏）：
  *   模型（Cursor SDK / 自定义两块目录，默认提供方在目录下面）/ 连接（GitLab Token + 飞书集成 + 环境配置）/
  *   团队（wk 流程：WK 产出目录 + Delivery Hub）/
- *   偏好（跳转 IDE + 分支模板 + 提交快捷键 + 续用 Agent）/ 仓库 / 存储。
- * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航六项。
+ *   偏好（跳转 IDE + 分支模板 + 提交快捷键 + 续用 Agent）/ 仓库。
+ * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航五项。
+ * 存储已搬去 /sessions 会话管理（会话 tab + 存储占用 tab），设置不再挂载。
  *
  * - 能力类配置（MCP / Skill / Action）在 /actions 能力页 tab 管理
  * - 旧深链兼容：?focus=api-key → 模型、feishu|git|env → 连接、profile|preference → 偏好、
@@ -51,7 +52,6 @@ import {
   DefaultProviderSection,
 } from "@/components/settings/custom-provider-card";
 import { RepoCard } from "@/components/settings/repo-card";
-import { StorageCard } from "@/components/settings/storage-card";
 import { GitLabSection } from "@/components/settings/git-card";
 import { PreferenceSections } from "@/components/settings/preference-card";
 import { CompanyEnvSection } from "@/components/settings/company-env-card";
@@ -63,14 +63,13 @@ import { useWhatsNew } from "@/components/whats-new-host";
 import { emptyCompanyEnv } from "@/lib/company-env";
 import { hasWhatsNewFor } from "@/lib/whats-new";
 
-// 左侧锚点导航（六组）：id 同 ?focus= 新取值
+// 左侧锚点导航（五组）：id 同 ?focus= 新取值
 const NAV_ITEMS: Array<{ focus: string; label: string }> = [
   { focus: "model", label: "模型" },
   { focus: "connect", label: "连接" },
   { focus: "team", label: "团队" },
   { focus: "prefs", label: "偏好" },
   { focus: "repos", label: "仓库" },
-  { focus: "storage", label: "存储" },
 ];
 
 // 旧 focus 值 → 新分组（全站 settingsUrl("api-key") 等旧跳转不断链）
@@ -173,6 +172,11 @@ const SettingsPage = () => {
     if (!loaded) return;
     const raw = new URLSearchParams(window.location.search).get("focus");
     if (!raw) return;
+    // 存储已并入会话管理：?focus=storage → /sessions
+    if (raw === "storage") {
+      router.replace("/sessions");
+      return;
+    }
     // 能力类 focus 重定向去能力页
     if (CAPABILITY_FOCUS[raw]) {
       router.replace(`/actions?tab=${CAPABILITY_FOCUS[raw]}`);
@@ -445,9 +449,6 @@ const SettingsPage = () => {
             onCommit={handleReposCommit}
           />,
         )}
-
-        {/* ---- 存储 ---- */}
-        {wrapCard("storage", <StorageCard />)}
       </div>
     </div>
   );

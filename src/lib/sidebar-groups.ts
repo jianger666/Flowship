@@ -121,6 +121,9 @@ export const applyPinnedOrder = (
 /**
  * 置顶列表内上/下移一位。返回新 order（仅含仍存在的 pinned id）。
  * 越界 / 找不到 → 返回规范化后的当前序（order 优先、其余按 pinnedIds 原序追加）。
+ *
+ * @deprecated 置顶行内排序 UI 已下线（2026-09-09，箭头跟标题挤在一起被点名去掉）；
+ * 仅单测还在覆盖，生产代码不再调用，不要复活它。
  */
 export const movePinnedId = (
   pinnedIds: readonly string[],

@@ -24,4 +24,14 @@ describe("turn-discipline ask_user 单一源", () => {
     expect(chat).not.toMatch(/别调 `ask_user`/);
     expect(chat).not.toMatch(/chat 模式禁用/);
   });
+
+  it("chat 段含飞书缺权限指引（只推免审、不重试、不静默降级）", () => {
+    const chat = chatTurnProtocolSection();
+    expect(chat).toContain("app_scope_not_applied");
+    expect(chat).toContain("只推免审");
+    expect(chat).toContain("静默降级");
+    // P2：免审举例不得再含群成员（成员列表要审核、只告知）
+    expect(chat).not.toContain("群成员、群信息");
+    expect(chat).toContain("群成员列表");
+  });
 });

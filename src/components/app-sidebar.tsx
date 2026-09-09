@@ -11,17 +11,20 @@
  *
  * 2026-07-20 grok 化再简化（chat 侧）：
  *  - 固定按工作目录/仓库分组（无按状态切换）
- *  - 置顶区手动上/下移（序存 view-memory）；行内重命名
+ *  - 置顶钉住（新置顶追加末尾、无手动排序）；行内重命名
  *  - 组头「+」预绑该仓新建对话（Home = 不绑）
+ *  - 每仓组默认只展 4 条、其余走「展开其余 N 条」；置顶组不限
+ *  - 行尾删除换归档：点即归档、无确认，找回去会话管理页
+ *  - 归档不断序：粘性序按全量对话（含归档）对、组按全量排——归档只藏行，不搬仓库的位置
  *
  * 内容（自上而下）：
  *  - 顶部一栏：对话模式 =「新建对话」；工作台 = 活跃任务小标题
  *  - 全局全文搜索用 Cmd/Ctrl+K
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { ChevronDown, ChevronRight, Loader2, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, ChevronUp, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { TaskListItem } from "@/components/tasks/task-list-item";
@@ -36,12 +39,11 @@ import { useTaskList } from "@/hooks/use-task-list";
 import { getSettings } from "@/lib/local-store";
 import {
   buildRepoGroups,
-  movePinnedId,
   reconcileChatListOrder,
   repoPathsForGroupCreate,
   type SidebarGroup,
 } from "@/lib/sidebar-groups";
-import { setTaskPinned, updateTaskFields } from "@/lib/task-store";
+import { setTaskArchived, setTaskPinned, updateTaskFields } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
 import {
   loadSidebarChatOrder,
@@ -99,6 +101,9 @@ const timeBucketFor = (
   return "earlier";
 };
 
+/** 每仓组默认展示条数，超出走「展开其余 N 条」；置顶组不限 */
+const GROUP_VISIBLE_LIMIT = 4;
+
 type TimeGroup = { key: TimeGroupKey; label: string; items: TaskSummary[] };
 
 /** 置顶优先拆组，组内仍按 updatedAt 倒序（sorted 已排好）——仅 task 模式 */
@@ -128,24 +133,22 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   const router = useRouter();
   const params = useParams<{ id?: string }>();
   const activeId = params?.id;
-  const {
-    tasks,
-    loaded,
-    upsertTask,
-    refresh,
-    deletingIds,
-    deleteTaskById,
-  } = useTaskList();
-  const { confirm, prompt } = useDialog();
+  const { tasks, loaded, upsertTask, refresh, markArchiving, unmarkArchiving } =
+    useTaskList();
+  const { prompt } = useDialog();
   // 当前模式（顶栏胶囊同源）——决定列表过滤 + 顶部按钮形态
   const mode = useAppMode();
   // 折叠中的组 key
   const [collapsedKeys, setCollapsedKeys] = useState<Set<string>>(() => new Set());
-  // 置顶手动序
+  // 置顶手动序（view-memory 持久化；新置顶追加末尾，恢复归档的置顶也回末尾）
   const [pinnedOrder, setPinnedOrder] = useState<string[]>([]);
   // 对话粘性序（组间 + 组内）；空 = 还没 hydrate，buildRepoGroups 回落 updatedAt
   const [chatOrder, setChatOrder] = useState<string[]>([]);
   const [orderHydrated, setOrderHydrated] = useState(false);
+  // 归档中 id（防双击连发）
+  const [archivingIds, setArchivingIds] = useState<Set<string>>(new Set());
+  // 已点「展开其余」的组（默认每组只展 4 条）；置顶组不限、不进这里
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
   // 挂载时读 view-memory（SSR 安全：仅客户端）
   useEffect(() => {
@@ -162,10 +165,12 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   }, []);
 
   // 过滤后的列表。工作台渲染直接用这份（置顶优先 + updatedAt）。
-  // 对话渲染序走 buildRepoGroups(itemOrder)；这里的 updatedAt 序只给 reconcile 当 liveIds 源。
+  // 归档默认在侧栏隐藏、去会话管理页找回。
   const sorted = useMemo(() => {
-    const filtered = tasks.filter((t) =>
-      mode === "chat" ? t.mode === "chat" : (t.mode ?? "task") === "task",
+    const filtered = tasks.filter(
+      (t) =>
+        !t.archived &&
+        (mode === "chat" ? t.mode === "chat" : (t.mode ?? "task") === "task"),
     );
     return [...filtered].sort((a, b) => {
       const ap = a.pinned ? 1 : 0;
@@ -175,12 +180,48 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     });
   }, [tasks, mode]);
 
-  // 粘性序对齐当前列表：已有相对位置不动，新窗口插顶，已删丢掉
+  // 全量对话（含已归档、仅去已删）：粘性序按它对、组顺序也按它排。
+  // 归档只藏行：占位留在序里，仓库组就地不动（2026-09-09 用户实测归档后仓库乱跳）
+  const allChats = useMemo(() => {
+    if (mode !== "chat") return [] as TaskSummary[];
+    return tasks.filter((t) => t.mode === "chat");
+  }, [tasks, mode]);
+
+  const allChatIds = useMemo(
+    () =>
+      [...allChats]
+        .sort((a, b) => {
+          const ap = a.pinned ? 1 : 0;
+          const bp = b.pinned ? 1 : 0;
+          if (ap !== bp) return bp - ap;
+          return b.updatedAt - a.updatedAt;
+        })
+        .map((t) => t.id),
+    [allChats],
+  );
+
+  const archivedChatIds = useMemo(
+    () => new Set(allChats.filter((t) => t.archived).map((t) => t.id)),
+    [allChats],
+  );
+
+  // 粘性序对齐全量对话：已有相对位置不动，新窗口插顶，已删丢掉、归档留占位
   useEffect(() => {
     if (!orderHydrated || mode !== "chat") return;
-    const liveIds = sorted.map((t) => t.id);
     setChatOrder((prev) => {
-      const next = reconcileChatListOrder(prev, liveIds);
+      const prevSet = new Set(prev);
+      let next = reconcileChatListOrder(prev, allChatIds);
+      // 老数据升级：以前掉队的归档 id 回归时沉底，别把组顶上去（只触发一次）
+      const returned = next.filter(
+        (id) => !prevSet.has(id) && archivedChatIds.has(id),
+      );
+      if (returned.length > 0) {
+        const returnedSet = new Set(returned);
+        next = [
+          ...next.filter((id) => !returnedSet.has(id)),
+          ...returned,
+        ];
+      }
       if (
         next.length === prev.length &&
         next.every((id, i) => id === prev[i])
@@ -190,7 +231,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       saveSidebarChatOrder(next);
       return next;
     });
-  }, [orderHydrated, mode, sorted]);
+  }, [orderHydrated, mode, allChatIds, archivedChatIds]);
 
   // 工作台（work）：时间桶；对话（chat）：仓组
   const timeGroups = useMemo(
@@ -205,8 +246,18 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       path: r.path,
       name: r.name,
     }));
-    return buildRepoGroups(sorted, repoLookup, pinnedOrder, chatOrder);
-  }, [mode, sorted, pinnedOrder, chatOrder]);
+    // 组顺序按全量（含归档）定、渲染只取未归档：归档藏行不搬组
+    const orderPos = new Map(
+      buildRepoGroups(allChats, repoLookup, pinnedOrder, chatOrder).map(
+        (g, i) => [g.key, i] as const,
+      ),
+    );
+    return buildRepoGroups(sorted, repoLookup, pinnedOrder, chatOrder).sort(
+      (a, b) =>
+        (orderPos.get(a.key) ?? Number.MAX_SAFE_INTEGER) -
+        (orderPos.get(b.key) ?? Number.MAX_SAFE_INTEGER),
+    );
+  }, [mode, sorted, allChats, pinnedOrder, chatOrder]);
 
   // 新建后即时插入列表 + 跳详情
   const handleCreated = (task: Task | TaskSummary) => {
@@ -223,6 +274,15 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       if (next.has(key)) next.delete(key);
       else next.add(key);
       saveSidebarCollapsedGroups(next);
+      return next;
+    });
+  };
+
+  const toggleGroupExpanded = (key: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   };
@@ -248,14 +308,17 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     }
   };
 
-  const handleMovePinned = useCallback(
-    (taskId: string, direction: "up" | "down") => {
-      const pinnedIds = sorted.filter((t) => t.pinned).map((t) => t.id);
-      const next = movePinnedId(pinnedIds, pinnedOrder, taskId, direction);
-      setPinnedOrder(next);
-      saveSidebarPinnedOrder(next);
-    },
-    [sorted, pinnedOrder],
+  const renderItem = (t: TaskSummary) => (
+    <TaskListItem
+      key={t.id}
+      task={t}
+      active={t.id === activeId}
+      onPin={handlePin}
+      onArchive={handleArchive}
+      // 重命名是 grok 化的 chat 专属入口；task（工作台）行保持改造前无菜单
+      onRename={mode === "chat" ? handleRename : undefined}
+      archiveDisabled={archivingIds.has(t.id)}
+    />
   );
 
   // 侧栏重命名（仅 chat 行有入口）：复用 chat-view 同源 updateTaskFields + prompt
@@ -275,94 +338,109 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     }
   };
 
-  // 删除：确认 → deleteTaskById（锁 id 后立刻离开详情 / 404 幂等）
-  const handleDelete = async (task: TaskSummary) => {
-    // 删除中禁二次点（按钮也会 disabled；这里再挡 confirm 竞态）
-    if (deletingIds.has(task.id)) return;
-    const ok = await confirm({
-      title: "确认删除任务",
-      description: `「${task.title}」将被永久删除、连同 data/tasks/${task.id}/ 整个目录、不可恢复。`,
-      destructive: true,
-      confirmLabel: "确认删除",
-    });
-    if (!ok) return;
+  // 归档：点即归档、无确认；归档后侧栏隐藏，去会话管理页找回/恢复/彻底删除
+  const handleArchive = async (task: TaskSummary) => {
+    if (archivingIds.has(task.id)) return;
+    setArchivingIds((prev) => new Set(prev).add(task.id));
+    // 先乐观、再标记：标记窗口内轮询/SSE 回来的旧快照不得盖掉这一笔
+    upsertTask({ ...task, archived: true });
+    markArchiving(task.id, true);
     try {
-      // ok / not_found 都当成功——幽灵回魂后再删会 404，勿 toast「任务不存在」
-      await deleteTaskById(task.id, {
-        onLocked: () => {
-          // 锁定后立刻离开详情页，避免 DELETE 等待期间 upsertTask 回灌
-          if (activeId === task.id) {
-            router.push(task.mode === "chat" ? "/chats" : "/");
-          }
-        },
-      });
+      const updated = await setTaskArchived(task.id, true);
+      upsertTask(updated);
       setPinnedOrder((prev) => {
         const order = prev.filter((id) => id !== task.id);
         saveSidebarPinnedOrder(order);
         return order;
       });
+      if (activeId === task.id) {
+        router.push(task.mode === "chat" ? "/chats" : "/");
+      }
+      const running = task.runStatus === "running";
+      toast.success(
+        running
+          ? `已归档「${task.title}」、任务仍在后台跑`
+          : `已归档「${task.title}」、可在会话管理找回`,
+        {
+          action: {
+            label: "撤销",
+            onClick: () => {
+              void (async () => {
+                // 恢复方向同样标记：窗口内服务端旧快照（archived:true）不得闪掉刚恢复的行
+                markArchiving(task.id, false);
+                try {
+                  const restored = await setTaskArchived(task.id, false);
+                  upsertTask(restored);
+                  // 恢复归档的置顶时把手动序接回去（跟会话页 restorePinnedOrder 同语义），
+                  // 否则钉还在、序掉到末尾
+                  if (restored.pinned) {
+                    setPinnedOrder((prev) => {
+                      if (prev.includes(task.id)) return prev;
+                      const order = [...prev, task.id];
+                      saveSidebarPinnedOrder(order);
+                      return order;
+                    });
+                  }
+                } catch (err) {
+                  toast.error(`撤销失败：${(err as Error).message}`);
+                } finally {
+                  unmarkArchiving(task.id);
+                }
+              })();
+            },
+          },
+        },
+      );
     } catch (err) {
-      toast.error(`删除失败：${(err as Error).message}`);
+      // 先放行再恢复：标记窗口内恢复性 upsert 会被当旧快照拒掉
+      unmarkArchiving(task.id);
+      upsertTask({ ...task, archived: task.archived });
+      toast.error(`归档失败：${(err as Error).message}`);
       void refresh();
+    } finally {
+      unmarkArchiving(task.id);
+      setArchivingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(task.id);
+        return next;
+      });
     }
   };
 
   const empty = sorted.length === 0;
 
-  const renderItem = (
-    t: TaskSummary,
-    opts?: {
-      pinReorder?: boolean;
-      pinIndex?: number;
-      pinTotal?: number;
-    },
-  ) => (
-    <TaskListItem
-      key={t.id}
-      task={t}
-      active={t.id === activeId}
-      onPin={handlePin}
-      onDelete={handleDelete}
-      // 重命名是 grok 化的 chat 专属入口；task（工作台）行保持改造前无菜单
-      onRename={mode === "chat" ? handleRename : undefined}
-      deleteDisabled={deletingIds.has(t.id)}
-      pinReorder={
-        opts?.pinReorder &&
-        opts.pinIndex !== undefined &&
-        opts.pinTotal !== undefined
-          ? {
-              onMoveUp: () => handleMovePinned(t.id, "up"),
-              onMoveDown: () => handleMovePinned(t.id, "down"),
-              canMoveUp: opts.pinIndex > 0,
-              canMoveDown: opts.pinIndex < opts.pinTotal - 1,
-            }
-          : undefined
-      }
-    />
-  );
-
   const renderChatGroups = (groups: SidebarGroup[]) => (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-3">
       {groups.map((group) => {
         const collapsed = collapsedKeys.has(group.key);
         const isPinned = group.key === "pinned";
         // 置顶无单一 cwd，不展示「+」；仓组 / Home 可预绑新建
         const createPaths = repoPathsForGroupCreate(group);
+        // 非置顶组默认只展 4 条
+        const expanded = expandedGroups.has(group.key);
+        const limited =
+          !isPinned && !expanded && group.items.length > GROUP_VISIBLE_LIMIT;
+        const visibleItems = limited
+          ? group.items.slice(0, GROUP_VISIBLE_LIMIT)
+          : group.items;
+        const hiddenCount = group.items.length - visibleItems.length;
         return (
           <div key={group.key} className="flex flex-col gap-0.5">
-            <div className="flex w-full items-center gap-0.5 rounded-md pr-0.5 hover:bg-muted/40">
+            <div className="group/header flex w-full items-center gap-0.5 px-1 pt-1.5 pb-0.5">
               <button
                 type="button"
                 onClick={() => toggleCollapsed(group.key)}
-                className="flex min-w-0 flex-1 items-center gap-1 rounded-md px-2 pt-1 pb-0.5 text-left text-xs font-medium text-muted-foreground hover:text-foreground"
+                className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 text-left"
                 aria-expanded={!collapsed}
               >
                 {collapsed ? (
-                  <ChevronRight className="size-3 shrink-0 opacity-70" />
+                  <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/60" />
                 ) : (
-                  <ChevronDown className="size-3 shrink-0 opacity-70" />
+                  <ChevronDown className="size-3.5 shrink-0 text-muted-foreground/60" />
                 )}
-                <span className="min-w-0 truncate">{group.label}</span>
+                <span className="min-w-0 truncate text-[13px] font-semibold tracking-wide text-foreground/80 hover:text-foreground">
+                  {group.label}
+                </span>
               </button>
               {createPaths !== null && (
                 <Tooltip content="在此目录新建对话" side="right" delay={200}>
@@ -370,7 +448,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
+                    className="size-5 shrink-0 text-muted-foreground opacity-0 hover:text-foreground group-hover/header:opacity-100 focus-visible:opacity-100"
                     disabled={creatingChat}
                     aria-label="在此目录新建对话"
                     onClick={(e) => {
@@ -383,14 +461,26 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                 </Tooltip>
               )}
             </div>
-            {!collapsed &&
-              group.items.map((t, i) =>
-                renderItem(t, {
-                  pinReorder: isPinned,
-                  pinIndex: i,
-                  pinTotal: group.items.length,
-                }),
-              )}
+            {!collapsed && (
+              <>
+                {visibleItems.map((t) => renderItem(t))}
+                {!isPinned && group.items.length > GROUP_VISIBLE_LIMIT && (
+                  <button
+                    type="button"
+                    onClick={() => toggleGroupExpanded(group.key)}
+                    aria-expanded={expanded}
+                    className="ml-6 flex w-fit items-center gap-1 px-1 py-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:text-foreground"
+                  >
+                    {expanded ? (
+                      <ChevronUp className="size-3 shrink-0" />
+                    ) : (
+                      <ChevronDown className="size-3 shrink-0" />
+                    )}
+                    {expanded ? "收起" : `展开其余 ${hiddenCount} 条`}
+                  </button>
+                )}
+              </>
+            )}
           </div>
         );
       })}

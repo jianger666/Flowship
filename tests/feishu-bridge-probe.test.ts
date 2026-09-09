@@ -11,6 +11,7 @@ import {
   isScopeSatisfied,
   probeBridgeStatus,
   REQUIRED_BRIDGE_SCOPES,
+  REQUIRED_GROUP_SCOPES,
   sendWelcomeMessage,
   WELCOME_TEXT,
 } from "@/lib/server/feishu-bridge/probe";
@@ -100,7 +101,8 @@ describe("scope 工具", () => {
     expect(missing).toEqual(["cardkit:card:write", "im:resource"]);
     const url = buildScopeAuthUrl("cli_abc", missing);
     expect(url).toBe(
-      "https://open.feishu.cn/app/cli_abc/auth?q=cardkit:card:write,im:resource&op_from=openapi&token_type=tenant",
+      "https://open.feishu.cn/page/scope-apply?clientID=cli_abc&scopes=" +
+        encodeURIComponent("cardkit:card:write,im:resource"),
     );
   });
 
@@ -119,7 +121,9 @@ describe("probeBridgeStatus", () => {
     mockedLarkApi.mockResolvedValue({
       data: {
         app: {
-          scopes: REQUIRED_BRIDGE_SCOPES.map((scope) => ({ scope })),
+          scopes: [...REQUIRED_BRIDGE_SCOPES, ...REQUIRED_GROUP_SCOPES].map(
+            (scope) => ({ scope }),
+          ),
         },
       },
     });
@@ -151,10 +155,28 @@ describe("probeBridgeStatus", () => {
       "im:message:send_as_bot",
       "cardkit:card:write",
       "im:resource",
+      ...REQUIRED_GROUP_SCOPES,
     ]);
     expect(status.scopes.authUrl).toBe(
       buildScopeAuthUrl("cli_probe_app", status.scopes.missing),
     );
+  });
+
+  it("P3：只缺群 scope → 群前缀 + 重进后缀（纯桥接缺口不带重进）", async () => {
+    mockedLarkApi.mockResolvedValue({
+      data: {
+        app: {
+          scopes: [...REQUIRED_BRIDGE_SCOPES].map((scope) => ({ scope })),
+        },
+      },
+    });
+    mockedCreateCardEntity.mockResolvedValue({ card_id: "crd_x" });
+
+    const status = await probeBridgeStatus();
+    expect(status.scopes.ok).toBe(false);
+    expect(status.scopes.missing).toEqual([...REQUIRED_GROUP_SCOPES]);
+    expect(status.scopes.detail).toContain("群功能缺少");
+    expect(status.scopes.detail).toContain("若开通后仍不好使");
   });
 
   it("cardkit 探测失败透出 consoleUrl", async () => {

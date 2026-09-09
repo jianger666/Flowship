@@ -32,7 +32,7 @@
  *    投给对应登记。别在这条链上新增「不带 origin 的 publish」。
  */
 
-import { Agent } from "./agent-backend";
+import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
 import type { ModelSelection } from "@cursor/sdk";
 
 import type { Task } from "@/lib/types";
@@ -114,7 +114,7 @@ const buildRestrictedPrompt = (args: {
     "",
     "# 边界（硬约束、不得自行放宽）",
     "- **只答疑**：禁止新建 / 修改 / 删除任何文件，禁止 git 提交、推分支、提 MR",
-    "- 只允许只读命令（read / grep / ls / git log 这类）；任何有副作用的命令（安装依赖、跑构建、改配置、调写接口）一律不执行",
+    "- 只允许只读工具（read / grep）；任何有副作用的命令（安装依赖、跑构建、改配置、调写接口）一律不执行",
     "- 对方要求改代码 / 改产物 / 推进任务 → 不动手，说明结论与建议、并告诉他这需要任务所有者在 Flowship 里操作",
     "- 答完自然结束回复",
   ].join("\n");
@@ -227,6 +227,10 @@ export const startRestrictedGroupQuestion = (
         Agent.create({
           apiKey: creds.apiKey,
           model: creds.model,
+          // 自定义 provider（opencode 等）必须带上，否则 facade 按默认 cursor 建、拿自定义 key 去调 Cursor 会 401
+          providerId: await resolveProviderIdFromDisk(task),
+          // 只读旁路：执行层只留读类工具（写类/shell/子代理/MCP 后端拒掉，不靠提示词自觉）
+          readOnly: true,
           // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入。
           // 刻意不传 mcpServers / callerToken：系统工具（交卷 / 提问 / 提 MR）与用户 MCP 一个都不给。
           local: { cwd, settingSources: [] },

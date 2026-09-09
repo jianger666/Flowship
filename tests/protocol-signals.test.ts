@@ -59,6 +59,36 @@ describe("信号常量 ↔ _super.md 一致性", () => {
     expect(superMd).not.toContain("你不用自己说这句");
   });
 
+  it("〈产出审阅中〉两处说法一致：chat-pending 与 _super.md 都是先交后说", () => {
+    // 2026-09-10 实盘：chat-pending 曾写“先说后交”，与 _super.md 2a-edit/2b 的
+    // “先调 submit_work 重新交卷，拿到回执后再说”完全相反，agent 同一轮看到两句。
+    // 代码真相是两边都不丢字（只有 askSeen 消音），顺序按状态机安全定：先交后说。
+    // 两边互相锁死，下次改一边另一边必红。
+    const chatPendingSrc = readFileSync(
+      path.join(
+        path.resolve(import.meta.dirname, "..", "src", "lib", "server"),
+        "chat-pending.ts",
+      ),
+      "utf-8",
+    );
+    expect(chatPendingSrc).toContain("〈产出审阅中〉");
+    expect(chatPendingSrc).toContain("重新交卷");
+    expect(chatPendingSrc).toContain("[SUBMITTED]");
+    expect(chatPendingSrc).not.toContain("先说后交");
+    expect(chatPendingSrc).not.toContain("先把完整答案");
+    expect(chatPendingSrc).not.toContain("先说的内容会正常显示");
+  });
+
+
+  it("task 提示词含飞书缺权限指引（只推免审、不重试、不静默降级）", () => {
+    expect(superMd).toContain("app_scope_not_applied");
+    expect(superMd).toContain("只推免审");
+    expect(superMd).toContain("静默降级");
+    expect(superMd).not.toContain("wait_for_user");
+    // P2：免审举例不得再含群成员（成员列表要审核、只告知）
+    expect(superMd).not.toContain("群成员、群信息");
+    expect(superMd).toContain("群成员列表");
+  });
 
   it("旧协议残留不该再出现在 _super.md（已退役）", () => {
     for (const legacy of [

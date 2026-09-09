@@ -428,6 +428,18 @@ const deleteTool = (cwd: string): ToolDefinition =>
   });
 
 /**
+ * 只读轮次的 customTools：只要 read/grep 别名包装（输出预算照套）。
+ * shell / glob / delete / task / 写类 / 系统工具 / MCP 全不给——执行层门禁。
+ */
+export const buildReadOnlyToolDefs = (cwd: string): ToolDefinition[] => {
+  const all = buildNativeToolAliasWrappers(cwd);
+  return all.filter((d) => {
+    const name = (d as { name?: unknown }).name;
+    return name === "read" || name === "grep";
+  });
+};
+
+/**
  * pi 后端的规范编码工具（shell / glob / delete / task + 盖掉原生 write/edit/read/grep 的别名包装）。
  * task 子 agent 靠传入的 runSubagent 回调。自研的 shell/glob/delete/task 全包 withModelBudget
  *（shell 10MB 收集是真黑洞、task 子 agent 回包无上限）；别名包装里已包过、这里不再重包。

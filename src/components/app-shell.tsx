@@ -34,11 +34,15 @@ import {
 } from "@/lib/pane-search";
 
 // 页型：board（看板首页、默认展——2026-07-13 用户拍板「和对话保持一致、别切来切去
-// 一收一放」）/ standalone（设置 / 能力页、默认收——这类页有自己的内部导航、任务侧栏
+// 一收一放」）/ standalone（设置 / 能力 / 会话管理页、默认收——这类页有自己的内部导航、任务侧栏
 // 叠上去是双侧栏、用户点名「设置页左边还有侧边栏」）/ detail（其余、默认展）
 const routeType = (pathname: string): "board" | "standalone" | "detail" => {
   if (pathname === "/") return "board";
-  if (pathname.startsWith("/settings") || pathname.startsWith("/actions")) {
+  if (
+    pathname.startsWith("/settings") ||
+    pathname.startsWith("/actions") ||
+    pathname.startsWith("/sessions")
+  ) {
     return "standalone";
   }
   return "detail";

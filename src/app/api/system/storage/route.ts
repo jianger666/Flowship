@@ -4,7 +4,7 @@
  *
  * 返回 data/tasks/ + worktrees/ 的磁盘占用总览：总字节数 + 每个任务的
  * 任务数据 / 工作区分项 + 无对应任务的残留工作区列表。
- * 给设置页「存储」卡片用——app 越用越大（events.jsonl / 上传图片 / artifact /
+ * 给会话管理页用——app 越用越大（events.jsonl / 上传图片 / artifact /
  * 前端仓 node_modules 工作区），用户手动挑着删。
  *
  * 大小统计优先 `du -sk`（mac/linux、秒级扫完数十万文件的 node_modules）；

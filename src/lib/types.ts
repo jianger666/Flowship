@@ -1508,6 +1508,8 @@ export interface Task {
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户手动置顶（排到任务列表最上）。缺省 / undefined = 未置顶。 */
   pinned?: boolean;
+  /** 会话管理：归档后默认在侧栏隐藏，到会话管理页找回/恢复。缺省 / undefined = 未归档。 */
+  archived?: boolean;
   /**
    * 当前未答 ask_user 的 askId（落盘、app 重启不丢）。
    * - 有值 = 真在等用户答题（侧栏「待回答」/ 详情答题卡权威源之一）

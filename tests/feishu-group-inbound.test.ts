@@ -1513,3 +1513,278 @@ describe("buildGroupAskCardJson", () => {
     expect(JSON.stringify(card)).not.toContain("group_ask");
   });
 });
+
+// ----------------- 出问登记关联消费 -----------------
+
+const {
+  __resetOutboundRegistryForTest,
+  matchCorrelatedAnswer,
+  registerOutboundQuestion,
+} = await import("@/lib/server/feishu-bridge/group-outbound-registry");
+const { agentSessions } = await import("@/lib/server/task-stream");
+const { __setLarkExecForTest } = await import(
+  "@/lib/server/feishu-bridge/lark-api"
+);
+
+const TAOZI = "ou_taozi";
+const taoziMsg = (
+  overrides: Partial<FeishuInboundMessage> = {},
+): FeishuInboundMessage =>
+  groupMsg({
+    sender_id: TAOZI,
+    sender_name: "桃子哥",
+    content: "@Flowship 学号 EAA5E7",
+    ...overrides,
+  });
+const regQ = (over: Record<string, unknown> = {}) => {
+  const r = registerOutboundQuestion({
+    taskId: "task-1",
+    chatId: CHAT,
+    messageId: "om_q1",
+    target: TAOZI,
+    keywords: ["学号"],
+    ...over,
+  });
+  expect(r.ok).toBe(true);
+};
+const injectOptsOf = (fn: unknown, i = 0): Record<string, unknown> =>
+  (callArgs(fn, i)[2] ?? {}) as Record<string, unknown>;
+const injectMetaOf = (fn: unknown, i = 0): Record<string, unknown> =>
+  ((callArgs(fn, i)[1] as { text: string } | undefined) &&
+  (injectOptsOf(fn, i).userReplyMetaExtra as Record<string, unknown>)) ??
+  {};
+
+describe("出问登记关联消费", () => {
+  afterEach(() => {
+    __resetOutboundRegistryForTest();
+    agentSessions.delete("task-1");
+    __setLarkExecForTest(null);
+  });
+
+  it("命中+活会话 → 属主语义注入并即焚（唯一的非属主写路径例外）", async () => {
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+
+    const r1 = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r1).toMatchObject({ kind: "sent", taskId: "task-1" });
+    expect(injectOptsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: false,
+      correlatedAnswer: true,
+    });
+    expect(injectMetaOf(handleTaskQuestionInject)).toMatchObject({
+      correlatedAnswer: "om_q1",
+    });
+
+    // 同一条再来一次：登记已焚 → 落回只读
+    const r2 = await routeGroupInboundMessage(
+      taoziMsg({ message_id: "om_g2" }),
+      ctx,
+    );
+    expect(r2).toMatchObject({ kind: "sent" });
+    expect(injectOptsOf(handleTaskQuestionInject, 1)).toMatchObject({
+      restrictToQuestion: true,
+    });
+    expect(injectOptsOf(handleTaskQuestionInject, 1)).not.toHaveProperty(
+      "correlatedAnswer",
+    );
+  });
+
+  it("P1：昵称改成目标 ID 字样也消费不了登记（昵称不做判定）", async () => {
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+
+    // 攻击者：sender_id 是自己的 ou，昵称改成目标的 ou_taozi，关键词也带上
+    const r = await routeGroupInboundMessage(
+      taoziMsg({
+        message_id: "om_evil",
+        sender_id: "ou_attacker",
+        sender_name: TAOZI,
+        content: "@Flowship 学号 EAA5E7",
+      }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    // 没进关联：普通只读语义，不带 correlatedAnswer
+    expect(injectOptsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: true,
+    });
+    expect(injectOptsOf(handleTaskQuestionInject)).not.toHaveProperty(
+      "correlatedAnswer",
+    );
+    // 登记没被烧：真答案后到仍能自动消费
+    expect(
+      matchCorrelatedAnswer({
+        taskId: "task-1",
+        chatId: CHAT,
+        senderIds: [TAOZI],
+        text: "学号 EAA5E7",
+      }),
+    ).not.toBeNull();
+  });
+
+  it("会话不在 → 只读呈现（restrictToQuestion:true + 留痕，不自动唤醒）", async () => {
+    regQ();
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+
+    const r = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r).toMatchObject({ kind: "sent" });
+    expect(injectOptsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: true,
+    });
+    expect(injectMetaOf(handleTaskQuestionInject)).toMatchObject({
+      correlatedAnswer: "om_q1",
+    });
+  });
+
+  it("chat 模式不进关联（直接拒，非属主无通道）", async () => {
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    const handleTaskQuestionInject = vi.fn();
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        listTasks: async () => [taskSummary({ mode: "chat" })],
+        getTask: async () => fullTask({ mode: "chat" }),
+        handleTaskQuestionInject,
+      }) as never,
+    );
+    const r = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r).toMatchObject({
+      kind: "skipped",
+      error: GROUP_CHAT_NOT_OWNER,
+    });
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+  });
+
+  it("属主不查关联（属主本来就是全权限，不打标）", async () => {
+    regQ();
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+
+    const r = await routeGroupInboundMessage(
+      groupMsg({ content: "@Flowship 学号 EAA5E7" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    expect(injectOptsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: false,
+    });
+    expect(injectOptsOf(handleTaskQuestionInject)).not.toHaveProperty(
+      "correlatedAnswer",
+    );
+  });
+
+  it("202 排队不 burn（没跑起来就别消费登记）", async () => {
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 202 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+
+    const r = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r).toMatchObject({ kind: "queued" });
+    // 登记还在：三门依然命中
+    expect(
+      matchCorrelatedAnswer({
+        taskId: "task-1",
+        chatId: CHAT,
+        senderIds: [TAOZI],
+        text: "学号 EAA5E7",
+      }),
+    ).not.toBeNull();
+  });
+
+  it("空@指回卡片 → 取回拼装后注入（正文含卡片结论）", async () => {
+    regQ();
+    __setLarkExecForTest(async () => ({
+      stdout: JSON.stringify({
+        ok: true,
+        data: {
+          messages: [
+            {
+              content: "<card>\n学号 EAA5E7，COMPLETED\n</card>",
+              msg_type: "interactive",
+            },
+          ],
+        },
+      }),
+      stderr: "",
+    }));
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+
+    const r = await routeGroupInboundMessage(
+      taoziMsg({ content: "@Flowship", reply_to: "om_card" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    const [, body] = callArgs(handleTaskQuestionInject) as [
+      string,
+      { text: string },
+    ];
+    expect(body.text).toContain("EAA5E7");
+    expect(injectMetaOf(handleTaskQuestionInject)).toMatchObject({
+      refSourceMessageId: "om_card",
+    });
+  });
+});
+
+describe("unsupported 文案分叉（在途登记才让对方补发文字）", () => {
+  const unsupportedCtx = {
+    parseContent: async () => ({
+      text: "",
+      images: [],
+      attachments: [],
+      unsupported: "暂不支持该消息类型",
+    }),
+    loadBootContext: async () => ({ apiKey: "sk-test", model: { id: "m1" } }),
+  };
+
+  afterEach(() => {
+    __resetOutboundRegistryForTest();
+  });
+
+  it("有在途登记 → 回请补发文字版", async () => {
+    regQ();
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ sendTextToChat }) as never,
+    );
+    const r = await routeGroupInboundMessage(taoziMsg(), unsupportedCtx);
+    expect(r).toMatchObject({ kind: "failed" });
+    expect(callArgs(sendTextToChat)[1]).toContain("补发文字版");
+  });
+
+  it("没登记 → 原样回不支持", async () => {
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ sendTextToChat }) as never,
+    );
+    const r = await routeGroupInboundMessage(taoziMsg(), unsupportedCtx);
+    expect(r).toMatchObject({ kind: "failed" });
+    // 回执自带 @ 发送方的标签，只断言文案本身
+    expect(callArgs(sendTextToChat)[1]).toContain("暂不支持该消息类型");
+    expect(callArgs(sendTextToChat)[1]).not.toContain("补发文字版");
+  });
+});

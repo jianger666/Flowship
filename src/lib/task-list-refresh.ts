@@ -42,3 +42,40 @@ export const rememberSuccessfulDeletedId = (
     set.delete(oldest);
   }
 };
+
+/**
+ * 归档中快照守卫（纯函数）：标记窗口内，只收与目标方向一致的快照。
+ * 归档窗口（expectArchived=true）只收 archived:true；恢复窗口只收非 true
+ * （恢复落盘用 delete，提交态是 undefined；旧快照 archived:true 才要拦）。
+ * true = 拒收这条 upsert。
+ */
+export const shouldRejectArchiveSnapshot = (
+  id: string,
+  archived: boolean | undefined,
+  pendingArchives: ReadonlyMap<string, boolean>,
+): boolean => {
+  const expected = pendingArchives.get(id);
+  if (expected === undefined) return false;
+  return (archived === true) !== expected;
+};
+
+/**
+ * refresh 提交后叠加：标记中 id 的服务端旧快照强制按目标方向保留（其它字段取服务端最新）。
+ */
+export const applyPendingArchives = (
+  list: TaskSummary[],
+  pendingArchives: ReadonlyMap<string, boolean>,
+): TaskSummary[] => {
+  if (pendingArchives.size === 0) return list;
+  return list.map((t) => {
+    const expected = pendingArchives.get(t.id);
+    if (expected === undefined) return t;
+    if (expected && !t.archived) return { ...t, archived: true };
+    if (!expected && t.archived) {
+      const { archived: _drop, ...rest } = t;
+      void _drop;
+      return rest;
+    }
+    return t;
+  });
+};

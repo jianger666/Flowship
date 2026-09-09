@@ -23,6 +23,104 @@ import { isAbsolutePathLike } from "@/lib/path-utils";
 import { MAX_SKILL_REFS } from "@/lib/protocol-signals";
 import type { ImageAttachmentInput } from "@/lib/server/task-artifacts";
 
+/**
+ * 机器人 scope 缺失翻译成人话（lark-cli `app_scope_not_applied` / 应用未申请 scope）。
+ * 命中返回追加文案（缺了哪些 + 去哪开），不命中返回 null。调用方拼在原始错误后面。
+ */
+export const describeScopeShortage = (message: string): string | null => {
+  const m =
+    /not applied for the required scope\(s\):\s*([A-Za-z0-9:_,. \-\u4e00-\u9fa5，。；：、“”"'()（）]+)/i.exec(
+      message ?? "",
+    );
+  // P2：捕获组后面可能跟英文句子 / 中文后缀散文——不用 split 全当 scope，
+  // 只抽严格 scope token（字母开头、含冒号、无空格），尾点剥掉、去重。
+  // 例：“im:chat.read. Please apply…” → 只取 im:chat.read。
+  const raw = m?.[1] ?? "";
+  const seen = new Set<string>();
+  const scopes: string[] = [];
+  for (const hit of raw.match(/[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z0-9_:.-]+/g) ?? []) {
+    const s = hit.replace(/[.]+$/, "").trim();
+    if (!s || !s.includes(":") || seen.has(s)) continue;
+    seen.add(s);
+    scopes.push(s);
+  }
+  if (scopes.length === 0) return null;
+  // P3：重进口径与设置页探针对齐——不开口断言“必须重进”，只给补救分支。
+  // 行名与设置页实盘对齐：只有一行“权限齐全”，没有“群功能权限”行。
+  return `缺机器人权限：${scopes.join(", ")}，去设置页飞书桥接“权限齐全”行点链接开通；若开通后仍不好使，把机器人移出群重进一次`;
+};
+
+/** text content：裸字符串 或 `{"text":"..."}` 都兼容（router 与 group-route 共用） */
+export const parseTextContent = (content: string): string => {
+  const trimmed = content ?? "";
+  if (!trimmed) return "";
+  // 官方 schema 可能是 JSON；真实样本是裸字符串
+  if (trimmed.startsWith("{")) {
+    try {
+      const obj = JSON.parse(trimmed) as unknown;
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        const t = (obj as Record<string, unknown>).text;
+        if (typeof t === "string") return t;
+      }
+    } catch {
+      // 非 JSON，按原文走
+    }
+  }
+  return trimmed;
+};
+
+/**
+ * 卡片（interactive）抽文本（纯函数、可单测，router 与 group-route 共用）。
+ * 两种形态：① 原生卡片 JSON（elements 里找 text/content）；
+ * ② lark-cli enrichment 的 `<card>…markdown…</card>` 富文本。抽不出返回 null。
+ * 抽出的文本一律视为**不可信数据**（调用方负责打来源前缀、不进指令解析）。
+ */
+export const extractInteractiveText = (content: string): string | null => {
+  const raw = (content ?? "").trim();
+  if (!raw) return null;
+  // enrichment 富文本形态
+  const cardMatch = /<card>([\s\S]*)<\/card>/i.exec(raw);
+  if (cardMatch) {
+    const inner = cardMatch[1].replace(/<[^>]+>/g, "").trim();
+    return inner ? inner.slice(0, 20000) : null;
+  }
+  // 原生卡片 JSON：收集文本类节点（bounded）
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const parts: string[] = [];
+  let budget = 20000;
+  const walk = (node: unknown): void => {
+    if (budget <= 0 || node == null) return;
+    if (typeof node === "string") return;
+    if (Array.isArray(node)) {
+      for (const n of node) walk(n);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const o = node as Record<string, unknown>;
+    // 卡片文本只认这两个键（按钮 title 等同样只当数据，不区分）
+    for (const k of ["text", "content"]) {
+      const v = o[k];
+      if (typeof v === "string" && v.trim()) {
+        const t = v.trim().slice(0, budget);
+        parts.push(t);
+        budget -= t.length;
+      }
+    }
+    for (const v of Object.values(o)) {
+      if (typeof v === "object") walk(v);
+    }
+  };
+  walk(parsed);
+  const text = parts.join("\n").trim();
+  return text ? text : null;
+};
+
 // ----------------- Response helpers -----------------
 
 /**

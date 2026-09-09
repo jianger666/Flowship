@@ -129,16 +129,56 @@ export const normalizeInboundEvent = (
     "";
   if (!messageId) return null;
 
-  const sender =
+  // sender 归一化（官方形态 event.sender + event.message，enrichment 扁平形态只有顶层 sender）：
+  // 优先级 msgObj.sender > nested.sender > 顶层扁平。bot 消息的 sender 形态不定
+  //（open_id / app_id / open_bot_id），防御性全取，判定侧多格比对。
+  const parseSenderShape = (
+    s: Record<string, unknown> | null,
+  ): { id: string; type: string; appId: string; botOpenId: string } => {
+    const out = { id: "", type: "user", appId: "", botOpenId: "" };
+    if (!s) return out;
+    if (typeof s.id === "string") out.id = s.id;
+    if (s.sender_id && typeof s.sender_id === "object") {
+      const sid = s.sender_id as {
+        open_id?: unknown;
+        app_id?: unknown;
+        user_id?: unknown;
+      };
+      if (typeof sid.open_id === "string") out.id = sid.open_id;
+      else if (typeof sid.user_id === "string") out.id = sid.user_id;
+      else if (typeof sid.app_id === "string") out.id = sid.app_id;
+      if (typeof sid.app_id === "string") out.appId = sid.app_id;
+    }
+    if (typeof s.sender_type === "string" && s.sender_type) {
+      out.type = s.sender_type;
+    }
+    if (typeof s.open_bot_id === "string" && s.open_bot_id) {
+      out.botOpenId = s.open_bot_id;
+    }
+    if (typeof s.app_id === "string" && s.app_id) out.appId = s.app_id;
+    const idType = typeof s.id_type === "string" ? s.id_type : "";
+    if (idType === "app_id" && typeof s.id === "string" && s.id) {
+      out.appId = s.id;
+      // app 身份的 open_id 另给：sender_id 这一格优先 open 命名空间（见下）
+    }
+    return out;
+  };
+  const msgSender =
     msgObj.sender && typeof msgObj.sender === "object"
       ? (msgObj.sender as Record<string, unknown>)
       : null;
-  let senderId = "";
-  if (typeof o.sender_id === "string") senderId = o.sender_id;
-  else if (sender && typeof sender.id === "string") senderId = sender.id;
-  else if (sender && sender.sender_id && typeof sender.sender_id === "object") {
-    const sid = sender.sender_id as { open_id?: unknown };
-    if (typeof sid.open_id === "string") senderId = sid.open_id;
+  const nestedSender =
+    nested && nested.sender && typeof nested.sender === "object"
+      ? (nested.sender as Record<string, unknown>)
+      : null;
+  const sender = msgSender ?? nestedSender;
+  const shape = parseSenderShape(sender);
+  let senderId = shape.id;
+  // 顶层扁平兜底（enrichment CLI 形态）
+  if (!senderId && typeof o.sender_id === "string") senderId = o.sender_id;
+  let senderType = shape.type;
+  if (typeof o.sender_type === "string" && o.sender_type) {
+    senderType = o.sender_type;
   }
 
   let content = "";
@@ -178,9 +218,14 @@ export const normalizeInboundEvent = (
       (typeof o.message_type === "string" && o.message_type) ||
       "",
     sender_id: senderId,
+    ...(senderType !== "user" ? { sender_type: senderType } : {}),
+    ...(shape.appId ? { sender_app_id: shape.appId } : {}),
+    ...(shape.botOpenId ? { sender_bot_open_id: shape.botOpenId } : {}),
     sender_name:
       (typeof o.sender_name === "string" && o.sender_name) ||
-      (sender && typeof sender.name === "string" && sender.name) ||
+      (typeof (msgSender ?? nestedSender)?.name === "string"
+        ? ((msgSender ?? nestedSender)?.name as string)
+        : undefined) ||
       (nested &&
         typeof (nested as { sender_name?: unknown }).sender_name === "string" &&
         (nested as { sender_name: string }).sender_name) ||
@@ -196,6 +241,10 @@ export const normalizeInboundEvent = (
     parent_id:
       (typeof msgObj.parent_id === "string" && msgObj.parent_id) ||
       (typeof o.parent_id === "string" && o.parent_id) ||
+      undefined,
+    reply_to:
+      (typeof msgObj.reply_to === "string" && msgObj.reply_to) ||
+      (typeof o.reply_to === "string" && o.reply_to) ||
       undefined,
     timestamp: typeof o.timestamp === "string" ? o.timestamp : undefined,
   };

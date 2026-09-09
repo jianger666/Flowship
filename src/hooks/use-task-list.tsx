@@ -47,7 +47,9 @@ import {
 import {
   canCommitTaskListRefresh,
   filterTaskListAfterRefresh,
+  applyPendingArchives,
   rememberSuccessfulDeletedId,
+  shouldRejectArchiveSnapshot,
 } from "@/lib/task-list-refresh";
 import {
   canCommitTaskSnapshot,
@@ -73,6 +75,13 @@ interface TaskListContextValue {
     id: string,
     options?: { onLocked?: () => void },
   ) => Promise<DeleteTaskResult>;
+  /**
+   * 归档中标记：归档是“改字段”不是“删行”，pendingDeletes 那套盖不上。
+   * 带目标方向（归档 true / 恢复 false）：标记窗口内（服务端还没写完），与目标反向的
+   * 旧快照不得盖掉乐观更新；同向提交态照常放行。失败必须 unmark + refresh。
+   */
+  markArchiving: (id: string, expectArchived: boolean) => void;
+  unmarkArchiving: (id: string) => void;
 }
 
 const TaskListContext = createContext<TaskListContextValue | null>(null);
@@ -107,6 +116,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   );
   // pendingDeletes：DELETE 等待窗口内（running 可等 8s）refresh 不得把任务加回
   const pendingDeletesRef = useRef<Set<string>>(new Set());
+  // pendingArchives：归档/恢复等待窗口内，反向旧快照不得盖掉乐观更新（值=目标方向）
+  const pendingArchivesRef = useRef<Map<string, boolean>>(new Map());
   // refresh 请求世代——DELETE 成功时推进，作废任何更早启动的在飞 refresh
   const refreshEpochRef = useRef(0);
   // 已成功删除 id（进程内有界 Set）——过滤迟到 refresh 里残留的已删任务
@@ -122,6 +133,14 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     setDeletingIds(new Set(pendingDeletesRef.current));
   }, []);
 
+  const markArchiving = useCallback((id: string, expectArchived: boolean) => {
+    pendingArchivesRef.current.set(id, expectArchived);
+  }, []);
+
+  const unmarkArchiving = useCallback((id: string) => {
+    pendingArchivesRef.current.delete(id);
+  }, []);
+
   const refresh = useCallback(async () => {
     // 捕获发起时 epoch；响应到达时若已推进则整响应丢弃
     const startEpoch = refreshEpochRef.current;
@@ -131,12 +150,16 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
         return;
       }
       // 再滤 sticky terminal（跨 tab task_deleted 与 epoch 双保险）
+      // 归档中 id：服务端旧快照archived:false 不得覆盖，强制按已归档保留（其它字段取服务端最新）
       setTasks(
-        filterTaskListAfterRefresh(
-          list,
-          pendingDeletesRef.current,
-          successfulDeletedIdsRef.current,
-        ).filter((t) => !isTaskTerminalDeleted(t.id)),
+        applyPendingArchives(
+          filterTaskListAfterRefresh(
+            list,
+            pendingDeletesRef.current,
+            successfulDeletedIdsRef.current,
+          ).filter((t) => !isTaskTerminalDeleted(t.id)),
+          pendingArchivesRef.current,
+        ),
       );
     } catch (err) {
       // 侧栏静默（不 toast 刷屏）；首页 / 详情页自己的拉取会暴露错误
@@ -197,6 +220,17 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     if (!canCommitTaskSnapshot(summary.id)) return;
     if (pendingDeletesRef.current.has(summary.id)) return;
     if (successfulDeletedIdsRef.current.has(summary.id)) return;
+    // 归档中：旧快照（archived:false，多为轮询/SSE 在服务端写完前回来）不得盖掉乐观更新；
+    // 已提交态（archived:true）照常放行，保证服务端其它新字段能落地
+    if (
+      shouldRejectArchiveSnapshot(
+        summary.id,
+        summary.archived,
+        pendingArchivesRef.current,
+      )
+    ) {
+      return;
+    }
     setTasks((prev) => {
       const idx = prev.findIndex((t) => t.id === summary.id);
       if (idx < 0) return [summary, ...prev];
@@ -248,6 +282,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
         removeTask,
         deletingIds,
         deleteTaskById,
+        markArchiving,
+        unmarkArchiving,
       }}
     >
       {children}

@@ -123,7 +123,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   const [defaultModelId, setDefaultModelId] = useState("");
   const { models: availableModels, fetchModels } = useModels();
-  const branchMap = useRepoBranches(repoPaths);
+  const branchMap = useRepoBranches(repoPaths, { refresh: true });
   const [submitting, setSubmitting] = useState(false);
   // 点启动后才出现的字段校验（Field.error，warning 色）
   const [fieldErrors, setFieldErrors] = useState<

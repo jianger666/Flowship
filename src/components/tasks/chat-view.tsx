@@ -272,16 +272,18 @@ export const ChatView = ({
 
       onEventAppendRef.current(ev);
     },
-    // 整队作废 → reducer 记 failed
+    // 整队作废 → reducer 记 failed（静默清占位，气泡消失本身就是反馈）。
+    // 只有磁盘写入失败这种真事故才弹；stop / 立即发送清掉的不打扰。
     onQueueFailed: (itemIds, reason) => {
       dispatchChatOp(task.id, { type: "queue_failed", itemIds });
-      // cancelled = 用户主动操作（队列面板删除 / 停止取消）——不是事故、不弹 error
-      if (itemIds.length > 0 && reason !== "cancelled") {
-        // reason 不止 persist_failed——文案按语义区分
+      if (
+        itemIds.length > 0 &&
+        (reason === "persist_failed" || reason === "flush_error")
+      ) {
         toast.error(
           reason === "persist_failed"
             ? `${itemIds.length} 条消息因磁盘写入失败未发送`
-            : `${itemIds.length} 条排队消息未送达、请重新发送`,
+            : `${itemIds.length} 条排队消息发送失败、请重新发送`,
         );
       }
     },
@@ -294,28 +296,14 @@ export const ChatView = ({
         outcome,
       });
     },
-    // 重连 bootstrap → 含 operationSnapshot，ghost 不写 delivered
+    // 重连 bootstrap → 含 operationSnapshot，ghost 不写 delivered（静默对齐、不弹）
     onQueueState: (serverItemIds, recentSettled, operationSnapshot) => {
-      const before = pendingLocalRepliesRef.current.filter(
-        (p) => !shouldHideLocalPlaceholder(p),
-      ).length;
-      const result = dispatchChatOp(task.id, {
+      dispatchChatOp(task.id, {
         type: "queue_state",
         serverItemIds,
         recentSettled,
         operationSnapshot,
       });
-      // 仍算「活跃排队」：未 persisted 且非 retryable uncertain
-      const after = result.state.pending.filter(
-        (p) =>
-          !shouldHideLocalPlaceholder(p) &&
-          !p.networkUncertain &&
-          p.terminalKnowledge !== "unknown",
-      ).length;
-      const cleared = before - after;
-      if (cleared > 0) {
-        toast.message(`已清除 ${cleared} 条失效的排队占位`);
-      }
     },
     // task 快照提交前验 sticky terminal（卸载后迟到回调也不复活）
     onTaskUpdate: (t) => {
@@ -327,18 +315,12 @@ export const ChatView = ({
       setLiveToolOutputs({});
       setRunActive(false);
       const remaining = pendingLocalRepliesRef.current.length;
-      // done_clear 只清已有明确终态；无终态保持 uncertain/persisted
+      // done_clear 只清已有明确终态；无终态保持 uncertain/persisted（静默、不弹）
       if (
         remaining > 0 &&
         (t.runStatus === "idle" || t.runStatus === "error")
       ) {
-        const result = dispatchChatOp(task.id, { type: "done_clear" });
-        const n = (result.clearedIds ?? []).length;
-        if (n > 0) {
-          toast.message(
-            `会话已结束，已清除 ${n} 条已确认终态的排队占位`,
-          );
-        }
+        dispatchChatOp(task.id, { type: "done_clear" });
       } else {
         const active = pendingLocalRepliesRef.current.filter(
           (p) => !shouldHideLocalPlaceholder(p),
@@ -621,6 +603,52 @@ export const ChatView = ({
     [confirm, task.id],
   );
 
+  // C：待发送气泡直改 / 直删（服务端队列 + 本地 ledger 乐观更新）。
+  // 成功 / 已发出都静默（气泡变化本身就是反馈）；真失败才弹 error。
+  const handleEditPending = useCallback(
+    async (itemId: string, newText: string): Promise<boolean> => {
+      try {
+        const { updateChatQueueItem } = await import("@/lib/task-store");
+        const updated = await updateChatQueueItem(task.id, itemId, newText);
+        setPendingLocalReplies((prev) =>
+          prev.map((p) =>
+            (p.itemId ?? p.id) === itemId
+              ? { ...p, displayText: updated.displayText, text: updated.displayText }
+              : p,
+          ),
+        );
+        return true;
+      } catch (err) {
+        const msg = (err as Error).message;
+        // 已发出就静默删掉本地占位、对齐现实（正式气泡已在事件流）
+        if (msg.includes("找不到") || msg.includes("404")) {
+          dispatchChatOp(task.id, { type: "queue_failed", itemIds: [itemId] });
+        } else {
+          toast.error(`更新失败：${msg}`);
+        }
+        return false;
+      }
+    },
+    [task.id],
+  );
+
+  const handleDeletePending = useCallback(
+    (itemId: string) => {
+      void (async () => {
+        try {
+          const { removeChatQueueItems } = await import("@/lib/task-store");
+          await removeChatQueueItems(task.id, [itemId]);
+        } catch (err) {
+          toast.error(`删除失败：${(err as Error).message}`);
+          return;
+        }
+        // SSE queue_failed 会再清一次、幂等无害；先乐观清、气泡立刻消失
+        dispatchChatOp(task.id, { type: "queue_failed", itemIds: [itemId] });
+      })();
+    },
+    [task.id],
+  );
+
   // P5：running 时仍可排队发送；仅 isSubmitting 短暂锁
   const canReply = !isSubmitting;
 
@@ -722,6 +750,8 @@ export const ChatView = ({
           pendingLocalReplies={pendingForStream}
           queueBanner={queueBanner}
           allowQueueWhileRunning
+          onEditPending={handleEditPending}
+          onDeletePending={handleDeletePending}
           composerLeading={
             <ChatProviderModelPicker task={task} onTaskUpdate={onTaskUpdate} />
           }

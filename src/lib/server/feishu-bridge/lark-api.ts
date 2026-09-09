@@ -885,6 +885,69 @@ export const downloadMessageResource = async (
   }
 };
 
+/**
+ * `+messages-mget` 回包解析（纯函数）。字段名锁死：`data.messages[].content / msg_type`
+ * （16:03 线上实包实证；`messages` 列表接口走的是 `data.items`，别混）。
+ */
+export const parseMgetMessages = (
+  rec: unknown,
+): Array<{ content: string; msgType: string }> => {
+  const raw = rec as { data?: unknown } | null | undefined;
+  const data =
+    raw?.data !== undefined
+      ? (raw.data as Record<string, unknown>)
+      : (rec as Record<string, unknown>);
+  const msgs = Array.isArray(data?.messages)
+    ? (data.messages as Array<Record<string, unknown>>)
+    : [];
+  return msgs.map((m) => ({
+    content: typeof m.content === "string" ? m.content : "",
+    msgType:
+      typeof m.msg_type === "string"
+        ? m.msg_type
+        : typeof m.message_type === "string"
+          ? (m.message_type as string)
+          : "",
+  }));
+};
+
+/**
+ * 按 message_id 单条取消息正文（关联消费：空 @ 指回卡片时把被指内容取回来）。
+ * best-effort：bot 身份先试（群历史同身份曾 230027），失败再试 user，
+ * 都失败返回 null（调用方按原逻辑走，不抛、不重试——15s race 只截返回，
+ * 底下 runLark 仍占进程级串行队列直到自身 30s 超时；重试只会越堵越死）。interactive 原样返回 content，
+ * 由调用方跑 extractInteractiveText。
+ */
+export const fetchInboundMessageText = async (
+  messageId: string,
+  /** 调用方超时预算ms：默认 15s。入向串行链上的 best-effort 路径传小值（如 5s）——
+   * 取不到就按原逻辑走（fail-closed），别把全链（含属主 p2p）堵在后面等。 */
+  timeoutMs = 15_000,
+): Promise<{ text: string; msgType: string } | null> => {
+  if (!messageId) return null;
+  // 入向串行链上跑：总耗时封顶，超时/失败一律 null（调用方按原逻辑走，不抛）。
+  const timeout = new Promise<null>((r) =>
+    setTimeout(() => r(null), timeoutMs),
+  );
+  const work = (async () => {
+    for (const as of ["bot", "user"] as const) {
+      try {
+        const rec = await runLark(
+          ["im", "+messages-mget", "--message-ids", messageId],
+          { as },
+        );
+        const first = parseMgetMessages(rec)[0];
+        if (!first || !first.content) return null;
+        return { text: first.content, msgType: first.msgType };
+      } catch {
+        // 换下一种身份再试；都失败由外层返回 null
+      }
+    }
+    return null;
+  })();
+  return Promise.race([work, timeout]);
+};
+
 /** 给消息加表情回执 */
 export const addReaction = async (
   messageId: string,

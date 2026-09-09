@@ -8,7 +8,7 @@
  *   - Skill：技能（自管可增删改、可从 Cursor 导入、对话创建）
  *   - MCP：MCP servers（条目化管理 + 健康 / OAuth + 从 Cursor 导入）
  *   - Rules：规则
- * 设置页只留「设置」（凭据 / 模型 / 仓库 / 偏好 / 存储）、能力配置都在这。
+ * 设置页只留「设置」（凭据 / 模型 / 仓库 / 偏好）、能力配置都在这。
  *
  * tab 状态走 ?tab=action|skills|mcp|rules（深链可用）。
  */

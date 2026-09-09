@@ -181,6 +181,20 @@ export const setTaskPinned = async (
   return data.task;
 };
 
+// 会话管理：归档 / 取消归档（PATCH /api/tasks/[id]）
+export const setTaskArchived = async (
+  id: string,
+  archived: boolean,
+): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived }),
+  });
+  const data = await handleJson<{ task: Task }>(res);
+  return data.task;
+};
+
 export const setTaskDisabledMcpServers = async (
   id: string,
   disabled: string[] | null,
@@ -294,14 +308,17 @@ export const setTaskRepoPaths = async (
 /**
  * V0.8：读某仓工作目录的本地 git 分支状态（GET /api/tasks/[id]/branches）
  * 带 repoPath = task 模式按仓；缺省 = chat 单仓。非 git 仓返回 isRepo=false。
+ * opts.refresh：先最佳努力 git fetch 再列（分支下拉用；后台节流刷新别开）。
  */
 export const fetchTaskBranches = async (
   id: string,
   repoPath?: string,
+  opts?: { refresh?: boolean },
 ): Promise<GitBranchState> => {
-  const q = repoPath
-    ? `?repoPath=${encodeURIComponent(repoPath)}`
-    : "";
+  const params = new URLSearchParams();
+  if (repoPath) params.set("repoPath", repoPath);
+  if (opts?.refresh) params.set("refresh", "1");
+  const q = params.size > 0 ? `?${params.toString()}` : "";
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(id)}/branches${q}`,
   );
@@ -984,6 +1001,27 @@ export const sendQueuedChatMessageNow = async (
   );
   const data = await handleJson<{ ok: true; task: Task }>(res);
   return { task: data.task };
+};
+
+/**
+ * 排队消息原地改文本：编辑后仍在原位置、不改变顺序。
+ * 空文本 / 已发出的条会抛错（调用方 toast 展示）。
+ */
+export const updateChatQueueItem = async (
+  taskId: string,
+  itemId: string,
+  text: string,
+): Promise<ChatQueueItem> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/chat-queue`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ itemId, text }),
+    },
+  );
+  const data = await handleJson<{ ok: true; item: ChatQueueItem }>(res);
+  return data.item;
 };
 
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道

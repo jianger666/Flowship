@@ -149,6 +149,8 @@ interface PendingLocalItem {
   text: string;
   /** HTTP 不确定时为 true（与 network 轴对齐） */
   uncertain?: boolean;
+  /** 对应服务端 queue itemId（直改 / 直删用） */
+  itemId?: string;
 }
 
 /**
@@ -377,7 +379,12 @@ interface Props {
     displayText: string;
     /** HTTP 不确定 */
     uncertain?: boolean;
+    /** 对应服务端 queue itemId（直改 / 直删用） */
+    itemId?: string;
   }>;
+  /** C：待发送气泡直改 / 直删（父组件接 task-store + ledger） */
+  onEditPending?: (itemId: string, newText: string) => Promise<boolean | void>;
+  onDeletePending?: (itemId: string) => void;
   /** P5：排队条文案 / 节点（渲染在 composer 上方） */
   queueBanner?: ReactNode;
   /** P5：运行中仍可排队发送 */
@@ -570,6 +577,8 @@ const EventStreamImpl = ({
   pendingLocalReplies,
   queueBanner,
   allowQueueWhileRunning,
+  onEditPending,
+  onDeletePending,
 }: Props) => {
   const isChat = variant === "chat";
 
@@ -675,6 +684,7 @@ const EventStreamImpl = ({
           id: p.id,
           text: p.displayText,
           uncertain: p.uncertain,
+          itemId: p.itemId ?? p.id,
         }),
       ),
     ];
@@ -1656,6 +1666,9 @@ const EventStreamImpl = ({
                     text={item.text}
                     uncertain={item.uncertain}
                     ownerId={item.id}
+                    itemId={item.itemId}
+                    onEdit={onEditPending}
+                    onDelete={onDeletePending}
                   />
                 ) : item.kind === "__work_group__" ? (
                   <WorkGroupRow

@@ -580,6 +580,61 @@ const notifyGroupTestersDef: FlowshipToolDef = {
   },
 };
 
+// ----------------- 群出问登记 expect_group_reply -----------------
+
+const expectGroupReplyDef: FlowshipToolDef = {
+  name: "expect_group_reply",
+  label: "登记群里问出去的问题（等 bot 回结论）",
+  description: [
+    "在需求群里 @ 某个 bot 要数据之后调（如 @桃子哥 要 COMPLETED 学号）。登记后对方在窗口期内的回复会被当成答案数据送回本任务（只读呈现；会话活着则自动喂给会话当数据）。",
+    "前置要求：群里那条必须带真 @（手写 <at user_id=\"ou_xxx\"> 标签的 text 消息；分享卡片的 at 只认人、@机器人不会亮，对方可能收不到提醒）。对方 open_id 先用成员列表查，查不到就问用户要。",
+    "调用时机：群消息发出去、拿到 send 回执的 message_id 后立刻调。message_id 取回执里的 message_id（om_xxx）；target 必须是 @ 标签里的 user_id/open_id（ou_xxx / cli_xxx，原样抄）。不知道 id 时不许填显示名凑合（填了直接拒单——群昵称随手可改，精确相等防不住改名冒充）：先用成员列表查（群成员详情里能看到 ou_xxx），查不到就问用户要；keywords 必填 1-5 个（答案里必须含的字眼，如 学号，大小写不敏感），没有就不建登记。",
+    "不调 = 对方回来只走普通只读答疑，不会当答案数据消费。有效期 30 分钟，一问一答、消费即焚。",
+  ].join("\n"),
+  parameters: TBObject({
+    task_id: TBString(),
+    message_id: TBString(),
+    target: TBString(),
+    keywords: TBArray(TBString()),
+  }),
+  handler: async (args, callerToken) => {
+    const taskId = str(args.task_id);
+    // 失败形状统一 JSON（模型侧只 parse 一支；纯文本分支曾让调用方漏处理）
+    if (!matchExpectedCallerToken(taskId, callerToken)) {
+      return text(JSON.stringify({ ok: false, error: CALLER_MISMATCH_ERROR }));
+    }
+    const task = await getTask(taskId);
+    if (!task) {
+      return text(JSON.stringify({ ok: false, error: "任务不存在" }));
+    }
+    const { registerOutboundQuestion } = await import(
+      "./feishu-bridge/group-outbound-registry"
+    );
+    const keywords = Array.isArray(args.keywords)
+      ? (args.keywords as unknown[]).map((k) => str(k)).filter((k) => k.trim())
+      : [];
+    // 群 ID 能反查就写死（跨群同目标不串味）；查不到放空、靠 target+窗口+要素判定
+    let chatId = "";
+    try {
+      const { getBoundGroupChatId } = await import("./feishu-group");
+      chatId = (await getBoundGroupChatId(task)) ?? "";
+    } catch {
+      // 查不到不挡登记
+    }
+    const r = registerOutboundQuestion({
+      taskId,
+      chatId,
+      messageId: str(args.message_id),
+      target: str(args.target),
+      keywords,
+    });
+    if (!r.ok) return text(JSON.stringify({ ok: false, error: r.error }));
+    return text(
+      JSON.stringify({ ok: true, hint: "已登记，对方窗口期内的含要素回复会当答案数据送回" }),
+    );
+  },
+};
+
 /** Flowship 自有工具清单（cursor SDK customTools + pi customTools 共用） */
 export const flowShipTools: FlowshipToolDef[] = [
   submitWorkDef,
@@ -590,6 +645,7 @@ export const flowShipTools: FlowshipToolDef[] = [
   createCustomActionDef,
   shareToGroupDef,
   notifyGroupTestersDef,
+  expectGroupReplyDef,
 ];
 
 /**

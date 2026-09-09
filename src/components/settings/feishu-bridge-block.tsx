@@ -317,12 +317,14 @@ export const FeishuBridgeBlock = ({
                     ) : undefined
                   }
                 />
-                {/* 新机器人首次接入：权限没开齐时补「消息订阅」入口——
-                    订阅状态探测不到（CLI 连上了也可能没配订阅）、跟权限同批配置最顺手；
-                    权限齐了就收起、不常驻打扰 */}
+                {/* 新机器人首次接入引导：订阅状态探测不到，只能当一次性指引。
+                    之前只要权限没齐就常驻红——已配好事件、收消息都通了还红，误导。
+                    改为只在“从没收到过消息”时才出现，收到过就收起、不常驻打扰 */}
                 {!status?.scopes?.ok &&
                   !status?.scopes?.networkError &&
-                  status?.scopes?.appId && (
+                  status?.scopes?.appId &&
+                  !status?.runtime?.lastInboundAt &&
+                  !status?.runtime?.everInbound && (
                     <CheckRow
                       ok={false}
                       title="消息订阅"

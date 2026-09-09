@@ -65,13 +65,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
   const repoPath = new URL(req.url).searchParams.get("repoPath")?.trim() || null;
+  const refresh = new URL(req.url).searchParams.get("refresh") === "1";
   const { dir, worktreeMissing } = resolveWorkDir(task, repoPath);
   if (!dir) {
     return NextResponse.json({
       state: { isRepo: false, current: null, branches: [] },
     });
   }
-  const state = await readGitBranchState(dir);
+  const state = await readGitBranchState(dir, { refresh });
   if (worktreeMissing) state.worktreeMissing = true;
   return NextResponse.json({ state });
 };

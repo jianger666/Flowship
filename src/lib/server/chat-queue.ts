@@ -1027,6 +1027,56 @@ export const promoteQueuedChatMessage = (
 };
 
 /**
+ * 原地改排队条文本（队列面板编辑 / 待发送气泡直改）。
+ * 只动还在队列里、尚未 dequeue 的条目；in-flight 改不动（已在发送路上）。
+ * displayText 全量替换；agentText 保留 skill 前缀：若旧 agentText 以旧 displayText
+ * 结尾则替换后缀，否则替换首次出现，兜底直接用新文本。
+ * @returns 更新后快照；队里没有该 itemId → null
+ */
+export const updateQueuedChatMessage = (
+  taskId: string,
+  itemId: string,
+  newDisplayText: string,
+): ChatQueueItemSnapshot | null => {
+  const text = newDisplayText.trim();
+  if (!itemId || !text) return null;
+  const map = queues();
+  const cur = map.get(taskId);
+  if (!cur || cur.length === 0) return null;
+  const idx = cur.findIndex((m) => m.itemId === itemId);
+  if (idx < 0) return null;
+  const old = cur[idx]!;
+  let agentText = old.agentText;
+  if (agentText === old.displayText) {
+    agentText = text;
+  } else if (agentText.endsWith(old.displayText)) {
+    agentText = agentText.slice(0, agentText.length - old.displayText.length) + text;
+  } else if (old.displayText && agentText.includes(old.displayText)) {
+    agentText = agentText.replace(old.displayText, text);
+  } else {
+    agentText = text;
+  }
+  const next = [...cur];
+  next[idx] = { ...old, displayText: text, agentText };
+  map.set(taskId, next);
+  return { itemId, displayText: text, enqueuedAt: old.enqueuedAt };
+};
+
+/**
+ * 一次性取出剩余全部排队消息（不 settle / 不 publish / 不动 generation）。
+ *
+ * 供「立即发送」在 stop 之前把队里其它条救出来——stop 的 failQueuedItems 会作废
+ * 整队；不救的话点一条立即发送、其余排队全变“未送达”（用户实测 4 条丢 3 条）。
+ * 取出的条 operation 保持原状（非终态），稍后同 id 原样塞回可继续排队。
+ */
+export const drainRemainingChatQueue = (taskId: string): QueuedChatMsg[] => {
+  const map = queues();
+  const cur = map.get(taskId) ?? [];
+  map.delete(taskId);
+  return [...cur];
+};
+
+/**
  * 按 itemId 取出一条排队消息（不 settle failed / 不 publish queue_failed）。
  *
  * 供「立即发送」在 stop 清队之前把目标条救出走——stop 的 failQueuedItems 会作废

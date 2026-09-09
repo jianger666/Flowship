@@ -131,6 +131,12 @@ export interface FeishuInboundMessage {
   message_type: string;
   /** 发送人 open_id（ou_xxx） */
   sender_id: string;
+  /** 发送人身份：user / app(bot) / 缺省当 user（只读补拉链路用） */
+  sender_type?: string;
+  /** 发送方 app_id（cli_xxx，bot 消息才有；live 事件 sender 形态不定、缺了即空） */
+  sender_app_id?: string;
+  /** 发送方机器人 open_id（ou_xxx，bot 消息才有；关联判定时与 sender_id 二选一） */
+  sender_bot_open_id?: string;
   /** 发送人姓名（enrichment 有时带；缺则由成员映射表兜底） */
   sender_name?: string;
   /** 群消息里被 @ 的人（p2p 无）——判「有没有 @ 本机 bot」用 */
@@ -140,6 +146,8 @@ export interface FeishuInboundMessage {
   /** 用户「回复」某条消息时的根消息 id——用于 card-map 锚定 */
   root_id?: string;
   parent_id?: string;
+  /** 被回复的消息 id（enrichment 形态；关联消费取被指内容用） */
+  reply_to?: string;
   timestamp?: string;
 }
 

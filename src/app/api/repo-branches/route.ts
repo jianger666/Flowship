@@ -6,8 +6,10 @@
  * v0.9.11 设置页仓库分支字段 / 测试任务被测分支的下拉数据源。
  *
  * 跟 /api/tasks/[id]/branches 的差异：那边做 checkout（写操作）、路径必须走 task 权威数据防越权；
- * 这边纯只读列 refs（for-each-ref 不改任何状态）、且设置页配仓库时 task 还不存在、
+ * 这边默认只读列 refs（for-each-ref 不改任何状态）、且设置页配仓库时 task 还不存在、
  * 必须按前端传的路径查——本机单用户桌面 app、只读操作接受任意绝对路径可接受。
+ * 注意：`refresh=1` 时先跑 `git fetch --prune`，会动 remote-tracking refs（含 prune），
+ * 不是纯只读——只是不动工作区文件；调用方节流（见 useRepoBranches / BranchSwitcher 5 分钟窗）。
  */
 
 import { NextResponse } from "next/server";
@@ -28,6 +30,8 @@ export const GET = async (req: Request) => {
       { status: 400 },
     );
   }
-  const result = await listRepoBranches(path);
+  const result = await listRepoBranches(path, {
+    refresh: new URL(req.url).searchParams.get("refresh") === "1",
+  });
   return NextResponse.json(result);
 };

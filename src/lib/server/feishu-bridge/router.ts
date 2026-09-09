@@ -21,6 +21,10 @@ import { readSettingsFile } from "@/lib/server/settings-fs";
 import { listSkillsWithSource } from "@/lib/server/app-skills";
 import { matchLongestSkillName } from "@/lib/skill-token";
 import { isValidModel } from "@/lib/server/route-helpers";
+import {
+  extractInteractiveText,
+  parseTextContent,
+} from "@/lib/server/route-helpers";
 import { defaultModelForProvider, isCursorProvider, type TaskSummary } from "@/lib/types";
 import {
   findCustomProvider,
@@ -277,20 +281,9 @@ const tryParseJson = (s: string): unknown => {
   }
 };
 
-/** text content：裸字符串 或 `{"text":"..."}` 都兼容 */
-export const parseTextContent = (content: string): string => {
-  const trimmed = content ?? "";
-  if (!trimmed) return "";
-  // 官方 schema 可能是 JSON；真实样本是裸字符串
-  if (trimmed.startsWith("{")) {
-    const obj = tryParseJson(trimmed);
-    if (obj && typeof obj === "object" && !Array.isArray(obj)) {
-      const t = (obj as Record<string, unknown>).text;
-      if (typeof t === "string") return t;
-    }
-  }
-  return trimmed;
-};
+/** text content：裸字符串 或 `{"text":"..."}` 都兼容（实现见 route-helpers，group-route 共用；
+ * 旧引用 `import { parseTextContent } from "./router"` 由文件末尾重导出兼容） */
+export { parseTextContent } from "@/lib/server/route-helpers";
 
 const mimeFromExt = (p: string): string => {
   const ext = path.extname(p).toLowerCase();
@@ -625,6 +618,19 @@ export const parseInboundContent = async (
     const md = await extractMarkdownImages(msg.message_id, msg.content);
     const mf = await extractMarkdownFiles(msg.message_id, md.text);
     return { text: mf.text, images: md.images, attachments: mf.attachments };
+  }
+
+  if (type === "interactive") {
+    // 卡片消息（常是别的 bot 回的结论）：抽正文走 text 同链路；抽不出才 unsupported。
+    // 卡片引用形态（仅 card_id、无正文）抽不出 → 回退 unsupported，由调用方决定是否单条取详情。
+    const text = extractInteractiveText(msg.content);
+    if (text) return { text, images: [], attachments: [] };
+    return {
+      text: "",
+      images: [],
+      attachments: [],
+      unsupported: "暂不支持该消息类型",
+    };
   }
 
   return {

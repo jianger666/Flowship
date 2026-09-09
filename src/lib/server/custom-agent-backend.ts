@@ -67,7 +67,11 @@ import { mcpDisplayName } from "@/lib/mcp-tool-name";
 import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
 import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
-import { buildCodingToolDefs, buildNativeToolAliasWrappers } from "./pi-coding-tools";
+import {
+  buildCodingToolDefs,
+  buildNativeToolAliasWrappers,
+  buildReadOnlyToolDefs,
+} from "./pi-coding-tools";
 import { withModelBudget } from "./tool-output-budget";
 import { loadSkillsForTask } from "./skills-loader";
 import { injectSdkRgPath } from "./sdk-platform-bin";
@@ -125,6 +129,8 @@ export interface CustomAgentInput {
   mcpServers?: unknown;
   /** 正式会话身份；无值则不挂交卷/提问等系统工具（oneshot / 受限答疑） */
   callerToken?: string;
+  /** 只读轮次：白名单只留读类 customTools（read/grep），shell/写类/子代理/MCP 全不给 */
+  readOnly?: boolean;
 }
 
 /** ProviderConfigInput.models 条目的最小结构（registerProvider 会做结构校验） */
@@ -721,18 +727,24 @@ export const createCustomAgent = async (
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model, thinkingLevel } = await buildRuntime(input);
   const callerToken = input.callerToken;
-  const mcp = await bridgeUserMcpServers(input.mcpServers);
+  const readOnly = input.readOnly === true;
+  const mcp = readOnly
+    ? { toolDefs: [] as never[], closeAll: async () => {} }
+    : await bridgeUserMcpServers(input.mcpServers);
   // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
   // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
   // 全部过滤掉，模型只看到 read/edit/write/grep。
-  const customTools = buildCustomTools(
-    callerToken,
-    cwd,
-    runtime,
-    model,
-    mcp.toolDefs,
-    thinkingLevel,
-  );
+  // 只读轮次：白名单 + customTools 双收敛到读类（执行层门禁，见 buildReadOnlyToolDefs）。
+  const customTools = readOnly
+    ? buildReadOnlyToolDefs(cwd)
+    : buildCustomTools(
+        callerToken,
+        cwd,
+        runtime,
+        model,
+        mcp.toolDefs,
+        thinkingLevel,
+      );
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
@@ -740,7 +752,9 @@ export const createCustomAgent = async (
     modelRuntime: runtime,
     model,
     thinkingLevel,
-    tools: [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
+    tools: readOnly
+      ? ["read", "grep"]
+      : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
     customTools,
     sessionManager: SessionManager.create(cwd, piSessionDir()),
   });
@@ -772,16 +786,22 @@ export const resumeCustomAgent = async (
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model, thinkingLevel } = await buildRuntime(input);
   const callerToken = input.callerToken;
-  const mcp = await bridgeUserMcpServers(input.mcpServers);
+  const readOnly = input.readOnly === true;
+  const mcp = readOnly
+    ? { toolDefs: [] as never[], closeAll: async () => {} }
+    : await bridgeUserMcpServers(input.mcpServers);
   // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
-  const customTools = buildCustomTools(
-    callerToken,
-    cwd,
-    runtime,
-    model,
-    mcp.toolDefs,
-    thinkingLevel,
-  );
+  // 只读轮次双收敛到读类（执行层门禁）。
+  const customTools = readOnly
+    ? buildReadOnlyToolDefs(cwd)
+    : buildCustomTools(
+        callerToken,
+        cwd,
+        runtime,
+        model,
+        mcp.toolDefs,
+        thinkingLevel,
+      );
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接。
   // pi 对缺失文件会静默建空会话（resume「成功」但 messages=[]），随后 send 只有当前句、
   // 连起手 prompt 都没有。缺文件 / 空会话一律抛，让 chat-inject 降级新会话并注入最近对话。
@@ -799,7 +819,9 @@ export const resumeCustomAgent = async (
     modelRuntime: runtime,
     model,
     thinkingLevel,
-    tools: [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
+    tools: readOnly
+      ? ["read", "grep"]
+      : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
     customTools,
     sessionManager,
   });

@@ -227,6 +227,8 @@ export interface TaskMetaV06 {
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户置顶（缺省 false） */
   pinned?: boolean;
+  /** 会话管理：归档后侧栏默认隐藏（缺省 false） */
+  archived?: boolean;
   /**
    * 当前未答 ask_user 的 askId（落盘、app 重启不丢）。
    * 与内存 pendingAsks 同步写/清；老任务无此字段 = 无 pending ask。
@@ -1185,6 +1187,7 @@ export const assembleTask = (
   taskDirPath: taskDir(meta.id),
   removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
   pinned: meta.pinned,
+  archived: meta.archived,
   pendingAskId: meta.pendingAskId,
   createdAt: meta.createdAt,
   updatedAt: meta.updatedAt,
@@ -1241,6 +1244,7 @@ export const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
     pinned: meta.pinned,
+    archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
     model: meta.model,

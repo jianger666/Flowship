@@ -15,6 +15,7 @@ import {
   listQueuedChatMessages,
   promoteQueuedChatMessage,
   removeQueuedChatMessages,
+  updateQueuedChatMessage,
 } from "@/lib/server/chat-queue";
 import { sendQueuedChatMessageNow } from "@/lib/server/chat-queue-send-now";
 import { errorResponse } from "@/lib/server/route-helpers";
@@ -84,6 +85,39 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
   const ok = promoteQueuedChatMessage(id, itemId);
   if (!ok) return errorResponse("队列中找不到该消息", 404);
   return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+};
+
+/** 原地改文本：编辑后仍在原位置排队（body: { itemId, text }） */
+export const PUT = async (req: Request, { params }: Ctx) => {
+  const { id } = await params;
+  const task = await getTask(id);
+  if (!task) return errorResponse("not_found", 404);
+
+  let itemId: string;
+  let text: string;
+  try {
+    const body = (await req.json()) as { itemId?: unknown; text?: unknown };
+    if (typeof body.itemId !== "string" || !body.itemId.trim()) {
+      return errorResponse("itemId 必须是非空字符串");
+    }
+    if (typeof body.text !== "string" || !body.text.trim()) {
+      return errorResponse("text 不能为空");
+    }
+    if (body.text.trim().length > 20000) {
+      return errorResponse("text 过长（最多 20000 字）");
+    }
+    itemId = body.itemId.trim();
+    text = body.text.trim();
+  } catch {
+    return errorResponse("请求体不是合法 JSON");
+  }
+
+  const updated = updateQueuedChatMessage(id, itemId, text);
+  if (!updated) return errorResponse("队列中找不到该消息（可能已发出）", 404);
+  return new Response(JSON.stringify({ ok: true, item: updated }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

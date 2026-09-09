@@ -1792,18 +1792,37 @@ export const syncTaskPendingAskId = async (
   }
 };
 
-// V0.8 侧栏：置顶 / 取消置顶（排到任务列表最上）。不动 updatedAt（置顶与活跃度无关）。
-export const setTaskPinned = async (
+// 置顶 / 归档的唯一落盘实现：单锁单写（读-改-写一次完成）。
+// updatedAt 语义：只动 pinned 不 bump（置顶与活跃度无关）；动了 archived 才 bump。
+// 下面的单字段入口是薄壳、转调这里——改语义只改这一处。
+export const setTaskPinArchive = async (
   id: string,
-  pinned: boolean,
+  flags: { pinned?: boolean; archived?: boolean },
 ): Promise<Task | null> =>
   withTaskLock(id, async () => {
     const meta = await readMetaV06(id);
     if (!meta) return null;
-    meta.pinned = pinned;
+    if (typeof flags.pinned === "boolean") meta.pinned = flags.pinned;
+    if (typeof flags.archived === "boolean") {
+      if (flags.archived) meta.archived = true;
+      else delete meta.archived;
+      meta.updatedAt = Date.now();
+    }
     await writeMeta(meta);
     return await hydrateTask(meta);
   });
+
+// V0.8 侧栏：置顶 / 取消置顶（排到任务列表最上）。薄壳、实现见 setTaskPinArchive。
+export const setTaskPinned = async (
+  id: string,
+  pinned: boolean,
+): Promise<Task | null> => setTaskPinArchive(id, { pinned });
+
+// 会话管理：归档 / 取消归档。薄壳、实现见 setTaskPinArchive。
+export const setTaskArchived = async (
+  id: string,
+  archived: boolean,
+): Promise<Task | null> => setTaskPinArchive(id, { archived });
 
 export const setTaskUiLayout = async (
   id: string,

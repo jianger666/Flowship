@@ -11,8 +11,8 @@
  * 不再走 promote + stop（stop 会 failQueuedItems 清整队、含刚置顶那条）。
  */
 
-import { useState } from "react";
-import { ChevronDown, Loader2, Trash2, Zap } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Check, ChevronRight, Loader2, Pencil, Trash2, X, Zap } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -29,6 +29,7 @@ import {
   fetchChatQueue,
   removeChatQueueItems,
   sendQueuedChatMessageNow,
+  updateChatQueueItem,
   type ChatQueueItem,
 } from "@/lib/task-store";
 import type { Task } from "@/lib/types";
@@ -51,10 +52,14 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(new Set());
   // 「立即发送」飞行中的 itemId 集合（防连点）
   const [sendingNow, setSendingNow] = useState<ReadonlySet<string>>(new Set());
+  // 行内编辑态：itemId → 草稿文本（null = 不在编辑）
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  // A：排队从无到有、每次都自动弹开（用户要常驻感知；关了等下一轮 0→N 再弹）
+  const prevCountRef = useRef(0);
 
-  const handleOpenChange = (next: boolean) => {
-    setOpen(next);
-    if (!next) return;
+  const refreshQueue = () => {
     setLoading(true);
     void fetchChatQueue(taskId)
       .then(setItems)
@@ -65,14 +70,30 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
       .finally(() => setLoading(false));
   };
 
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next);
+    if (!next) return;
+    refreshQueue();
+  };
+
+  // 排队从无到有（上一拍 0、这一拍 N）→ 自动弹开；队内 1→2 不重复弹、不打断编辑
+  useEffect(() => {
+    const prev = prevCountRef.current;
+    prevCountRef.current = queuedCount;
+    if (prev <= 0 && queuedCount > 0) {
+      setOpen(true);
+      refreshQueue();
+    }
+    if (queuedCount <= 0) setEditingId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queuedCount]);
+
   const handleDelete = (itemId: string) => {
     setDeleting((prev) => new Set(prev).add(itemId));
     void removeChatQueueItems(taskId, [itemId])
-      .then((removedIds) => {
-        if (removedIds.length === 0) {
-          // 队里已经没有它了（多半刚被发出）——刷新列表对齐现实
-          toast.message("该消息已发出、无法删除");
-        }
+      // 排队操作静默：成功只改列表（用户看得见行消失），
+      // 已发出删不到也只对齐列表、不弹；真失败才弹 error。
+      .then(() => {
         setItems((prev) =>
           prev ? prev.filter((it) => it.itemId !== itemId) : prev,
         );
@@ -120,18 +141,53 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
       });
   };
 
+  /**
+   * 行内编辑保存：PUT 原地改文本（仍在原位置排队）。
+   * 成功 / 空文本都静默（行内状态本身就是反馈）；真失败才弹 error。
+   */
+  const handleSaveEdit = (itemId: string) => {
+    const text = editDraft.trim();
+    if (!text) return;
+    setSavingEdit(true);
+    void updateChatQueueItem(taskId, itemId, text)
+      .then((updated) => {
+        setItems((prev) =>
+          prev
+            ? prev.map((it) =>
+                it.itemId === itemId
+                  ? { ...it, displayText: updated.displayText }
+                  : it,
+              )
+            : prev,
+        );
+        setEditingId(null);
+      })
+      .catch((err) => {
+        toast.error(`更新失败：${(err as Error).message}`);
+      })
+      .finally(() => setSavingEdit(false));
+  };
+
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger
         render={
           <button
             type="button"
-            className="mx-2.5 mb-1.5 flex cursor-pointer items-center gap-1.5 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/60"
+            title="点击管理排队消息（可编辑 / 删除 / 立即发送）"
+            className="mx-2.5 mb-1.5 flex cursor-pointer items-center gap-2 rounded-full border border-primary/30 bg-primary/10 px-3 py-1.5 text-left text-xs font-medium text-foreground shadow-sm transition-colors hover:bg-primary/15"
           >
-            <span className="min-w-0 flex-1 truncate">
-              已排队 {queuedCount} 条，将在当前回复完成后发送
+            <span className="relative flex size-2 shrink-0">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/50" />
+              <span className="relative inline-flex size-2 rounded-full bg-primary" />
             </span>
-            <ChevronDown className="size-3 shrink-0 opacity-60" />
+            <span className="inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-primary-foreground">
+              {queuedCount}
+            </span>
+            <span className="min-w-0 flex-1 truncate">
+              条排队中 · 点击管理
+            </span>
+            <ChevronRight className="size-3.5 shrink-0 opacity-70" />
           </button>
         }
       />
@@ -146,6 +202,52 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
             {items.map((it) => {
               const busy =
                 deleting.has(it.itemId) || sendingNow.has(it.itemId);
+              const isEditing = editingId === it.itemId;
+              if (isEditing) {
+                return (
+                  <li key={it.itemId} className="rounded-md bg-muted/40 px-1.5 py-1">
+                    <textarea
+                      value={editDraft}
+                      onChange={(e) => setEditDraft(e.target.value)}
+                      rows={2}
+                      autoFocus
+                      disabled={savingEdit}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                          e.preventDefault();
+                          handleSaveEdit(it.itemId);
+                        }
+                        if (e.key === "Escape") setEditingId(null);
+                      }}
+                      className="w-full resize-none rounded border border-border bg-background px-2 py-1 text-xs outline-none focus:border-primary"
+                    />
+                    <div className="mt-1 flex items-center justify-end gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setEditingId(null)}
+                        disabled={savingEdit}
+                        aria-label="取消编辑"
+                        className="flex size-6 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                      >
+                        <X className="size-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleSaveEdit(it.itemId)}
+                        disabled={savingEdit}
+                        aria-label="保存编辑"
+                        className="flex size-6 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                      >
+                        {savingEdit ? (
+                          <Loader2 className="size-3 animate-spin" />
+                        ) : (
+                          <Check className="size-3" />
+                        )}
+                      </button>
+                    </div>
+                  </li>
+                );
+              }
               return (
                 <li
                   key={it.itemId}
@@ -154,6 +256,22 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
                   <Tooltip content={it.displayText}>
                     <span className="min-w-0 flex-1 truncate text-xs">
                       {summarize(it.displayText) || "（纯附件消息）"}
+                    </span>
+                  </Tooltip>
+                  <Tooltip content="编辑这条排队消息">
+                    <span className="inline-flex">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingId(it.itemId);
+                          setEditDraft(it.displayText);
+                        }}
+                        disabled={busy}
+                        aria-label="编辑"
+                        className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                      >
+                        <Pencil className="size-3" />
+                      </button>
                     </span>
                   </Tooltip>
                   <Tooltip content="立即发送（打断当前回复）">

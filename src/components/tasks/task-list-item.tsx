@@ -4,7 +4,7 @@
  * 侧栏 / 欢迎页共用的「任务行」（V0.8 侧栏导航）
  *
  * 精简一行：行首指示 + 标题（truncate + hover tooltip 补全）。
- * 当前任务高亮（左侧强调竖条 + 底色）。行尾 hover 出「置顶 / 删除」操作；
+ * 当前任务高亮（左侧强调竖条 + 底色）。行尾 hover 出「置顶 / 归档」操作；
  * 已置顶时置顶按钮常显高亮（既是状态标记、又是取消入口）。
  *
  * 行首指示按 runStatus 三态切换（复用同一个槽位、不回到「满屏色点」）：
@@ -26,15 +26,13 @@
 import Link from "next/link";
 import { useCallback, useSyncExternalStore } from "react";
 import {
-  ChevronDown,
-  ChevronUp,
+  Archive,
   ListTodo,
   Loader2,
   MessageCircle,
   MoreHorizontal,
   Pencil,
   Pin,
-  Trash2,
 } from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
@@ -128,43 +126,33 @@ const LeadingIndicator = ({
   );
 };
 
-/** 置顶区手动重排（按钮式、不引拖拽库） */
-export type PinReorderControls = {
-  onMoveUp: () => void;
-  onMoveDown: () => void;
-  canMoveUp: boolean;
-  canMoveDown: boolean;
-};
-
+/** 置顶重排已下线（2026-09-09）：行内上/下移箭头跟标题/时间挤在一起、首行 disabled 态还会常显半透明，\n * 用户点名去掉；置顶只保留钉住语义、新置顶追加末尾，序仍走 view-memory。 */
 interface TaskListItemProps {
   task: TaskSummary;
   active?: boolean;
   // 点击导航后回调（侧栏可借此做收起等；不传则纯跳转）
   onNavigate?: () => void;
-  // 传则行尾 hover 出删除按钮（二次确认由调用方处理）
-  onDelete?: (task: TaskSummary) => void;
-  // 删除中禁用（防双击连发 / DELETE 等待窗口内再点）
-  deleteDisabled?: boolean;
+  // 传则行尾 hover 出归档按钮（点即归档、无确认，找回去会话管理页）
+  onArchive?: (task: TaskSummary) => void;
+  // 归档中禁用（防双击连发）
+  archiveDisabled?: boolean;
   // 传则行尾出置顶按钮（已置顶常显高亮、未置顶 hover 出；切换由调用方处理）
   onPin?: (task: TaskSummary) => void;
   // 侧栏重命名（菜单「重命名」；双击入口已砍——误触且会先导航）；不传则无入口
   onRename?: (task: TaskSummary) => void;
-  // 置顶区内上/下移；仅置顶组分发
-  pinReorder?: PinReorderControls;
 }
 
 export const TaskListItem = ({
   task,
   active,
   onNavigate,
-  onDelete,
-  deleteDisabled,
+  onArchive,
+  archiveDisabled,
   onPin,
   onRename,
-  pinReorder,
 }: TaskListItemProps) => {
   const hasMenu = !!onRename;
-  const hasActions = !!(onPin || onDelete || hasMenu || pinReorder);
+  const hasActions = !!(onPin || onArchive || hasMenu);
   // 订阅已读：打开详情 markTaskSeen 后本行立刻重算、熄灭琥珀点
   const seenAt = useTaskSeenAt(task.id);
   // v1.0：task 行的「阶段 · 状态」监控行（chat 行为 null）
@@ -172,19 +160,11 @@ export const TaskListItem = ({
   // 相对时间副行仅 chat 行（grok 化）；task 行保持工作台原样——静息单行只标题、不占空间
   const subtitle = task.mode === "chat" ? formatRelative(task.updatedAt) : null;
 
-  // 行尾按钮数决定右 padding（避免标题被盖）
-  const actionCount =
-    (pinReorder ? 2 : 0) + (onPin ? 1 : 0) + (hasMenu ? 1 : 0) + (onDelete ? 1 : 0);
+  // 行尾按钮数决定右 padding（避免标题被盖）。按钮最多 3 个（置顶/菜单/归档），
+  // >=4 分支走不到，已清理，只留 >=3。
+  const actionCount = (onPin ? 1 : 0) + (hasMenu ? 1 : 0) + (onArchive ? 1 : 0);
   const prClass =
-    actionCount >= 5
-      ? "pr-28"
-      : actionCount >= 4
-        ? "pr-24"
-        : actionCount >= 3
-          ? "pr-20"
-          : hasActions
-            ? "pr-14"
-            : "pr-2";
+    actionCount >= 3 ? "pr-20" : hasActions ? "pr-14" : "pr-2";
 
   return (
     <div className="group/item relative">
@@ -241,38 +221,6 @@ export const TaskListItem = ({
       )}
       {hasActions && (
         <div className="absolute inset-y-0 right-1 my-auto flex h-6 items-center gap-0.5">
-          {pinReorder && (
-            <>
-              <Tooltip content="上移">
-                <span className="inline-flex">
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={pinReorder.onMoveUp}
-                    disabled={!pinReorder.canMoveUp}
-                    aria-label={`上移 ${task.title}`}
-                    className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
-                  >
-                    <ChevronUp className="size-3.5" />
-                  </Button>
-                </span>
-              </Tooltip>
-              <Tooltip content="下移">
-                <span className="inline-flex">
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={pinReorder.onMoveDown}
-                    disabled={!pinReorder.canMoveDown}
-                    aria-label={`下移 ${task.title}`}
-                    className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
-                  >
-                    <ChevronDown className="size-3.5" />
-                  </Button>
-                </span>
-              </Tooltip>
-            </>
-          )}
           {onPin && (
             <Tooltip content={task.pinned ? "取消置顶" : "置顶"}>
               <Button
@@ -318,18 +266,18 @@ export const TaskListItem = ({
               </DropdownMenuContent>
             </DropdownMenu>
           )}
-          {onDelete && (
-            <Tooltip content="删除任务">
+          {onArchive && (
+            <Tooltip content="归档">
               <span className="inline-flex">
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  onClick={() => onDelete(task)}
-                  disabled={deleteDisabled}
-                  aria-label={`删除任务 ${task.title}`}
-                  className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-50"
+                  onClick={() => onArchive(task)}
+                  disabled={archiveDisabled}
+                  aria-label={`归档 ${task.title}`}
+                  className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-50"
                 >
-                  <Trash2 className="size-3.5" />
+                  <Archive className="size-3.5" />
                 </Button>
               </span>
             </Tooltip>

@@ -362,32 +362,129 @@ const USER_REPLY_BUBBLE =
 const USER_REPLY_TEXT =
   "w-full min-w-0 wrap-anywhere whitespace-pre-wrap text-sm leading-relaxed";
 
-/** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中）——用户消息、跟正式气泡同样右对齐 */
+/** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中）——用户消息、跟正式气泡同样右对齐
+ * C：hover 出编辑 / 删除，直达队列操作，不用经过 banner 面板 */
 export const PendingLocalReplyRow = memo(
   ({
     text,
     uncertain,
     ownerId,
+    itemId,
+    onEdit,
+    onDelete,
   }: {
     text: string;
     uncertain?: boolean;
     ownerId: string;
-  }) => (
-    <div className="ml-auto flex w-fit max-w-[85%] min-w-0 items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
-      <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-      <div
-        className={cn(
-          USER_REPLY_TEXT,
-          "flex-1 text-muted-foreground",
-        )}
-      >
-        <span className="mb-0.5 block text-[11px] tracking-wide">
-          {uncertain ? "发送状态未知、正在确认…" : "待发送"}
-        </span>
-        <SearchHighlightText ownerId={ownerId} field="extra0" text={text} />
+    /** 对应服务端 queue itemId（有它才可编辑 / 删除） */
+    itemId?: string;
+    onEdit?: (itemId: string, newText: string) => Promise<boolean | void>;
+    onDelete?: (itemId: string) => void;
+  }) => {
+    const [editing, setEditing] = useState(false);
+    const [draft, setDraft] = useState(text);
+    const [saving, setSaving] = useState(false);
+    const editable = !!itemId && !!onEdit && !uncertain;
+    const deletable = !!itemId && !!onDelete && !uncertain;
+    // 同步外部文本更新（队列面板改了、气泡跟着变）
+    useEffect(() => {
+      if (!editing) setDraft(text);
+    }, [text, editing]);
+    const save = () => {
+      const next = draft.trim();
+      if (!next || !itemId || !onEdit) return;
+      if (next === text) {
+        setEditing(false);
+        return;
+      }
+      setSaving(true);
+      void Promise.resolve(onEdit(itemId, next))
+        .then((ok) => {
+          if (ok === false) return;
+          setEditing(false);
+        })
+        .finally(() => setSaving(false));
+    };
+    return (
+      <div className="group ml-auto flex w-fit max-w-[85%] min-w-0 items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70 transition-opacity hover:opacity-100">
+        <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+        <div className={cn(USER_REPLY_TEXT, "flex-1 text-muted-foreground")}>
+          <span className="mb-0.5 flex items-center gap-2 text-[11px] tracking-wide">
+            <span>{uncertain ? "发送状态未知、正在确认…" : "待发送"}</span>
+            {!uncertain && (editable || deletable) && (
+              <span className="ml-auto hidden items-center gap-0.5 group-hover:inline-flex">
+                {editable && (
+                  <button
+                    type="button"
+                    title="编辑这条排队消息"
+                    aria-label="编辑排队消息"
+                    onClick={() => {
+                      setDraft(text);
+                      setEditing(true);
+                    }}
+                    className="flex size-5 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <PencilLine className="size-3" />
+                  </button>
+                )}
+                {deletable && (
+                  <button
+                    type="button"
+                    title="从队列删除"
+                    aria-label="删除排队消息"
+                    onClick={() => onDelete?.(itemId!)}
+                    className="flex size-5 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-destructive"
+                  >
+                    <Ban className="size-3" />
+                  </button>
+                )}
+              </span>
+            )}
+          </span>
+          {editing ? (
+            <span className="block">
+              <Textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                rows={2}
+                autoFocus
+                disabled={saving}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    save();
+                  }
+                  if (e.key === "Escape") {
+                    setEditing(false);
+                    setDraft(text);
+                  }
+                }}
+                className="w-full resize-none text-xs"
+              />
+              <span className="mt-1 flex justify-end gap-1">
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  disabled={saving}
+                  onClick={() => {
+                    setEditing(false);
+                    setDraft(text);
+                  }}
+                >
+                  取消
+                </Button>
+                <Button size="xs" disabled={saving || !draft.trim()} onClick={save}>
+                  {saving ? "保存中…" : "保存"}
+                </Button>
+              </span>
+            </span>
+          ) : (
+            <SearchHighlightText ownerId={ownerId} field="extra0" text={text} />
+          )}
+        </div>
       </div>
-    </div>
-  ),
+    );
+  },
 );
 PendingLocalReplyRow.displayName = "PendingLocalReplyRow";
 

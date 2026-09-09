@@ -174,6 +174,8 @@
 
    ⚠️ **工具名不带 `_file` 后缀**：不是 `edit_file` / `read_file` / `write_file`、就是 `edit` / `read` / `write`。SDK 没有 `_file` 后缀的工具、调用会失败。写 artifact 的工具用法见「跨 action 共享规范」§1（第一次写前先 `read` `artifact-writer` skill）。
 
+6. **飞书权限缺失时找用户开通**：调飞书相关命令（lark-cli 等）若报权限不足（`app_scope_not_applied`、应用没申请 scope）或用户身份缺失（`token_missing`、未登录）——不要反复重试同一条：把缺的 scope 原样列出来问用户去开通，只推免审的常规权限（发消息、收消息、群信息、卡片这类）；群成员列表（`im:chat:members:read`）要审核、只告知不催（仅“我在不在群”可查）；看不懂的、要审核的只告知、不催。用户说开了 / 登上了再重跑。**更不许静默降级凑合**：比如拿不到对方 open_id 就发纯文本名字代替真 `@`——对方收不到提醒，等于没问，这种情况必须先停下来问用户要 open_id 或去开权限，发出去再补救没有意义。
+
 ## ask_user：action 内打包提问（单次内打包、无次数上限、按内容收敛）
 
 action 写完 artifact 初稿后、如果有不确定项、把当前轮想问的**全部打包**成 questions[] 调 `ask_user`、UI 弹 modal 让用户答完整组再继续。

@@ -154,4 +154,106 @@ describe("sendQueuedChatMessageNow 编排", () => {
     expect(startedMsg?.skipPersistEvent).toBe(true);
     expect(startedMsg?.agentText).toBe("prebuilt with skill");
   });
+
+  it("其余排队保留：stop 前救出、start 后原样塞回（顺序不变）", async () => {
+    const taken = makeMsg({ itemId: "cq_target" });
+    const rest = [
+      makeMsg({ itemId: "cq_a", displayText: "a" }),
+      makeMsg({ itemId: "cq_b", displayText: "b" }),
+    ];
+    let requeued: QueuedChatMsg[] = [];
+    let stoppedAfterDrain: QueuedChatMsg[] | null = null;
+    const deps: SendNowDeps = {
+      getTask: vi.fn(async () => makeTask("t_keep")),
+      take: vi.fn(() => taken),
+      drainRest: vi.fn(() => {
+        // drain 发生在 take 之后、stop 之前
+        return [...rest];
+      }),
+      requeueRest: vi.fn((_: string, msgs: QueuedChatMsg[]) => {
+        requeued = [...msgs];
+      }),
+      stop: vi.fn(async () => {
+        // stop 时队里已没有其余条（被救出去了）——靠 drain 顺序保证
+        stoppedAfterDrain = [];
+        return { hadAgent: true, task: makeTask("t_keep") };
+      }),
+      start: vi.fn(async () => new Response("{}", { status: 202 })),
+    };
+
+    const res = await sendQueuedChatMessageNow(
+      "t_keep",
+      "cq_target",
+      validBoot,
+      deps,
+    );
+    expect(res.status).toBe(202);
+    expect(deps.drainRest).toHaveBeenCalledWith("t_keep");
+    expect(stoppedAfterDrain).toEqual([]);
+    // start 之后塞回、顺序不变
+    expect(requeued.map((m) => m.itemId)).toEqual(["cq_a", "cq_b"]);
+    expect(requeued[0]?.displayText).toBe("a");
+  });
+
+  it("stop 抛错 → 目标条回队首、其余跟回，一条不丢", async () => {
+    const taken = makeMsg({ itemId: "cq_target" });
+    const rest = [makeMsg({ itemId: "cq_a" })];
+    const requeued: string[] = [];
+    const deps: SendNowDeps = {
+      getTask: vi.fn(async () => makeTask("t_stopfail")),
+      take: vi.fn(() => taken),
+      drainRest: vi.fn(() => [...rest]),
+      requeueRest: vi.fn((_: string, msgs: QueuedChatMsg[]) => {
+        requeued.push(...msgs.map((m) => m.itemId));
+      }),
+      stop: vi.fn(async () => {
+        throw new Error("stop boom");
+      }),
+      start: vi.fn(async () => new Response("unreached", { status: 500 })),
+    };
+    // 真实 enqueueChatMessageFront 会写全局 map（fake task 无副作用）；
+    // 这里只断言其余队走了 requeue、start 没被调到
+    await expect(
+      sendQueuedChatMessageNow("t_stopfail", "cq_target", validBoot, deps),
+    ).rejects.toThrow("stop boom");
+    expect(deps.start).not.toHaveBeenCalled();
+    expect(requeued).toEqual(["cq_a"]);
+  });
+
+  it("真实队列：同 id 塞回被幂等受理、队里只剩其余条", async () => {
+    const { enqueueChatMessage, listQueuedChatMessages, clearChatQueue } =
+      await import("@/lib/server/chat-queue");
+    const tid = `t_real_${Date.now()}`;
+    clearChatQueue(tid);
+    const seed = ["one", "two", "three"].map((t, i) =>
+      enqueueChatMessage(tid, {
+        itemId: `cq_real_${i}`,
+        agentText: t,
+        displayText: t,
+        enqueuedAt: Date.now(),
+      }),
+    );
+    expect(seed.every((r) => r.ok)).toBe(true);
+    const deps: SendNowDeps = {
+      getTask: vi.fn(async () => makeTask(tid)),
+      // take/drain/requeue 走默认真实实现，只 mock 掉 stop（不真清）与 start
+      stop: vi.fn(async () => ({ hadAgent: true, task: makeTask(tid) })),
+      start: vi.fn(async () => new Response("{}", { status: 202 })),
+      take: (await import("@/lib/server/chat-queue")).takeQueuedChatMessage,
+    };
+    // 目标取中间那条
+    const res = await sendQueuedChatMessageNow(
+      tid,
+      "cq_real_1",
+      validBoot,
+      deps,
+    );
+    expect(res.status).toBe(202);
+    // 队里剩下 one/three，顺序不变；two 被 start 消费
+    expect(listQueuedChatMessages(tid).map((m) => m.itemId)).toEqual([
+      "cq_real_0",
+      "cq_real_2",
+    ]);
+    clearChatQueue(tid);
+  });
 });

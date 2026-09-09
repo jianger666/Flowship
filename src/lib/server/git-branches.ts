@@ -30,11 +30,34 @@ const dirExists = async (dir: string): Promise<boolean> => {
 };
 
 /**
+ * 最佳努力更新远端 refs（2026-09：测试同事搜不到研发刚推的分支——之前只读本地已知 refs）。
+ *
+ * 约束：
+ * - `GIT_TERMINAL_PROMPT=0`：没配好凭据时直接失败、不弹输入框把 server 挂住
+ * - 20s 超时兜底（没配 ssh key 的机器上 ssh 也可能等输入）
+ * - 失败一律吞掉返回 false：离线 / 无 remote / 鉴权失败都降级用本地 refs，下拉框不受影响
+ */
+export const fetchRemoteRefs = async (dir: string): Promise<boolean> => {
+  if (!dir) return false;
+  try {
+    await execFileAsync("git", ["fetch", "--prune"], {
+      cwd: dir,
+      timeout: 20_000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
  * 读某目录的本地 git 分支状态。
  * 非 git 仓 / 命令失败 → isRepo=false（调用方据此隐藏分支选择器）。
  */
 export const readGitBranchState = async (
   dir: string,
+  opts?: { refresh?: boolean },
 ): Promise<GitBranchState> => {
   const empty: GitBranchState = { isRepo: false, current: null, branches: [] };
   if (!dir) return empty;
@@ -46,16 +69,36 @@ export const readGitBranchState = async (
       { cwd: dir, timeout: 10_000 },
     );
     const current = head.trim();
-    // 本地分支列表：refname:short 只出名字（不带 * 前缀）、按最近提交倒序更顺手
+    // refresh：先更新远端 refs（研发刚推的分支不 fetch 本地根本没有）
+    if (opts?.refresh) await fetchRemoteRefs(dir);
+    // 本地 + 远端混列、去重（origin/ 前缀去掉）：刚 fetch 回来的远端分支也能切——
+    // git checkout 对纯远端名会自动建本地跟踪分支（--guess），列表里有就能选中
     const { stdout: list } = await execFileAsync(
       "git",
-      ["branch", "--format=%(refname:short)", "--sort=-committerdate"],
+      [
+        "for-each-ref",
+        "refs/heads",
+        "refs/remotes",
+        "--format=%(refname)",
+        "--sort=-committerdate",
+      ],
       { cwd: dir, timeout: 10_000 },
     );
-    const branches = list
-      .split("\n")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+    const seen = new Set<string>();
+    for (const line of list.split("\n")) {
+      const ref = line.trim();
+      if (!ref) continue;
+      if (ref.startsWith("refs/heads/")) {
+        seen.add(ref.slice("refs/heads/".length));
+      } else if (ref.startsWith("refs/remotes/")) {
+        const rest = ref.slice("refs/remotes/".length);
+        const idx = rest.indexOf("/");
+        const name = idx >= 0 ? rest.slice(idx + 1) : null;
+        // origin/HEAD 是符号引用、跳过
+        if (name && name !== "HEAD") seen.add(name);
+      }
+    }
+    const branches = [...seen];
     return {
       isRepo: true,
       current: current && current !== "HEAD" ? current : null,
@@ -71,12 +114,18 @@ export const readGitBranchState = async (
  *
  * 跟 readGitBranchState 的区别：线上 / test / develop 这类长期分支本地常常没 checkout 过、
  * 只列本地分支会缺——所以一并列 refs/remotes、去掉 remote 名前缀后合并。
- * 不主动 git fetch（慢 + 可能要凭据）、用本地已知的 refs。前端 Combobox 只从这份列表选，搜不到不造新值。
+ * 默认不主动 git fetch（慢 + 可能要凭据）、用本地已知的 refs；调用方传
+ * refresh: true 时先最佳努力 fetch 一次（失败降级本地、不抛）。前端 Combobox 只从这份列表选，搜不到不造新值。
  */
-export const listRepoBranches = async (dir: string): Promise<RepoBranchList> => {
+export const listRepoBranches = async (
+  dir: string,
+  opts?: { refresh?: boolean },
+): Promise<RepoBranchList> => {
   const empty: RepoBranchList = { isRepo: false, branches: [] };
   if (!dir) return empty;
   try {
+    // refresh：先更新远端 refs（研发刚推的分支不 fetch 本地根本没有）
+    if (opts?.refresh) await fetchRemoteRefs(dir);
     // 一条命令混列本地 + 远端、按最近提交倒序（活跃分支排前面、两类场景都顺手）
     const { stdout } = await execFileAsync(
       "git",

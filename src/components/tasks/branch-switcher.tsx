@@ -24,6 +24,7 @@ import {
   ChevronDown,
   GitBranch,
   Loader2,
+  RefreshCw,
   Search,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -37,6 +38,7 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { checkoutTaskBranch, fetchTaskBranches } from "@/lib/task-store";
 import { isTestingRequirementTask } from "@/lib/testing-task";
 import type { GitBranchState, Task } from "@/lib/types";
+import { normalizeRepoPath } from "@/lib/sidebar-groups";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -48,15 +50,22 @@ interface Props {
   warning?: string;
 }
 
-/** 未拉取前先用 task 记录的静态分支兜底（gitBranches 优先、测试任务用 repoFeatureBranches） */
+/** 未拉取前先用 task 记录的静态分支兜底（gitBranches 优先、测试任务用 repoFeatureBranches）。
+ * 路径比对与侧栏分组共用 normalizeRepoPath（去尾斜杠 + 小写），否则 mac 上同仓两写法
+ * 分到一组、chip 兜底却认成两个仓，fallback 拿不到显示“游离 HEAD”。 */
 const staticBranchOf = (task: Task, repoPath: string): string | null => {
-  const norm = (s: string) => s.replace(/\/+$/, "");
   const git = task.gitBranches?.find(
-    (b) => norm(b.repoPath) === norm(repoPath),
+    (b) => normalizeRepoPath(b.repoPath) === normalizeRepoPath(repoPath),
   );
   if (git?.name) return git.name;
   if (isTestingRequirementTask(task)) {
-    const feature = task.repoFeatureBranches?.[repoPath]?.trim();
+    // key 同样规范化比对（与上面同因）
+    const hit = Object.keys(task.repoFeatureBranches ?? {}).find(
+      (k) => normalizeRepoPath(k) === normalizeRepoPath(repoPath),
+    );
+    const feature = (
+      hit ? task.repoFeatureBranches?.[hit] : undefined
+    )?.trim();
     if (feature) return feature;
   }
   return null;
@@ -66,10 +75,22 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
   const [state, setState] = useState<GitBranchState | null>(null);
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 远端拉取中（打开下拉自动拉一次 + 底部手动按钮；后台节流刷新不带 fetch）
+  const [refreshing, setRefreshing] = useState(false);
+  // 列表加载失败信息：有它才说明「不是没分支、是没拉到」，给重试入口用
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   // 分支状态刷新节流（运行中 task.updatedAt 高频变化，git 读取不跟着每事件刷）
   const lastFetchAtRef = useRef(0);
+  // 打开自动远端 fetch 节流：同一任务同仓 5 分钟内拉过就不再打远端（弱网下每次打开转半天），
+  // 手动「拉取最新分支」按钮不受限；研发刚推分支的场景点一次按钮即可
+  const lastRefreshRef = useRef<{
+    taskId: string;
+    repo: string | undefined;
+    at: number;
+  } | null>(null);
+  const REFRESH_THROTTLE_MS = 5 * 60 * 1000;
   const lastTaskIdRef = useRef<string | undefined>(undefined);
 
   const running = task.runStatus === "running";
@@ -87,18 +108,44 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
     // worktree 中途从 detached 变成正式分支时 chip 必须跟上（曾实测一直停在「游离 HEAD」）
     if (!switchedTask && now - lastFetchAtRef.current < 2000) return;
     lastFetchAtRef.current = now;
-    if (switchedTask) setState(null);
+    if (switchedTask) {
+      setState(null);
+      setLoadError(null);
+    }
     void fetchTaskBranches(task.id, repoPath)
       .then((s) => {
-        if (alive) setState(s);
+        if (alive) {
+          setState(s);
+          setLoadError(null);
+        }
       })
-      .catch(() => {
-        if (alive) setState(null);
+      .catch((err) => {
+        if (alive) {
+          setState(null);
+          setLoadError(err instanceof Error ? err.message : String(err));
+        }
       });
     return () => {
       alive = false;
     };
   }, [task.id, task.runStatus, task.updatedAt, repoPath]);
+
+  // 打开下拉 / 点刷新按钮时拉远端（后台节流刷新不带 fetch，别每几秒打一次远端）
+  const handleRefresh = async (silent: boolean) => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const s = await fetchTaskBranches(task.id, repoPath, { refresh: true });
+      setState(s);
+      setLoadError(null);
+      // 手动拉过也记一次，省得紧接着打开再打一遍
+      lastRefreshRef.current = { taskId: task.id, repo: repoPath, at: Date.now() };
+    } catch (err) {
+      if (!silent) toast.error(`拉取最新分支失败：${(err as Error).message}`);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const filtered = useMemo(() => {
     const all = state?.branches ?? [];
@@ -106,7 +153,44 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
     return q ? all.filter((b) => b.toLowerCase().includes(q)) : all;
   }, [state?.branches, query]);
 
-  // select（chat）：确认是 git 仓才显示；chip（task）：有静态兜底时也显示（如 worktree 未建）
+  // select（chat）：确认是 git 仓才显示完整下拉；加载失败时给重试入口——
+  // 空闲任务 updatedAt 不变、effect 不重跑，失败一次就永远隐身，必须留个手柄。
+  // chip（task）：有静态兜底时也显示（如 worktree 未建）
+  if (variant === "select" && !state?.isRepo && loadError) {
+    return (
+      <Tooltip content={`分支列表加载失败（${loadError}），点重试`}>
+        <span className="inline-flex min-w-0">
+          <button
+            type="button"
+            onClick={() => void handleRefresh(false)}
+            disabled={refreshing}
+            className="flex h-7 max-w-56 items-center gap-1.5 rounded-lg border border-dashed border-input bg-transparent px-2.5 text-xs text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {refreshing ? (
+              <Loader2 className="size-3.5 shrink-0 animate-spin" />
+            ) : (
+              <GitBranch className="size-3.5 shrink-0" />
+            )}
+            <span className="flex-1 text-left">分支加载失败，重试</span>
+          </button>
+        </span>
+      </Tooltip>
+    );
+  }
+  if (variant === "select" && !state && !loadError) {
+    // 加载期占位：refresh 先 fetch（最长 20s），整块 return null 会让表单布局跳一下
+    return (
+      <span className="inline-flex min-w-0">
+        <span
+          aria-hidden
+          className="flex h-7 max-w-56 items-center gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-xs text-muted-foreground"
+        >
+          <GitBranch className="size-3.5 shrink-0 animate-pulse" />
+          <span className="h-3 w-20 animate-pulse rounded bg-muted" />
+        </span>
+      </span>
+    );
+  }
   if (variant === "select" ? !state?.isRepo : state && !state.isRepo && !fallback) {
     return null;
   }
@@ -136,6 +220,19 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
     if (next) {
       setQuery("");
       requestAnimationFrame(() => searchRef.current?.focus());
+      // 打开即拉远端：研发刚推的分支不 fetch 本地根本没有；同任务同仓 5 分钟内拉过则跳过
+      const now = Date.now();
+      const last = lastRefreshRef.current;
+      if (
+        last &&
+        last.taskId === task.id &&
+        last.repo === repoPath &&
+        now - last.at < REFRESH_THROTTLE_MS
+      ) {
+        return;
+      }
+      lastRefreshRef.current = { taskId: task.id, repo: repoPath, at: now };
+      void handleRefresh(true);
     }
   };
 
@@ -230,7 +327,8 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
                     <li key={b}>
                       <button
                         type="button"
-                        disabled={saving}
+                        // 拉取中禁切：静默 fetch --prune（最长 20s）和 checkout 同目录并发会撞 index.lock
+                        disabled={saving || refreshing}
                         onClick={() => void handleCheckout(b)}
                         className={cn(
                           "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50",
@@ -252,6 +350,22 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
                 })
               )}
             </ul>
+            <div className="flex items-center gap-2 border-t px-2.5 py-2">
+              <button
+                type="button"
+                onClick={() => void handleRefresh(false)}
+                disabled={refreshing || saving}
+                className="flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={cn("size-3.5", refreshing && "animate-spin")}
+                />
+                {refreshing ? "正在拉取…" : "拉取最新分支"}
+              </button>
+              <span className="text-[11px] text-muted-foreground/70">
+                含远端新分支
+              </span>
+            </div>
           </>
         )}
       </PopoverContent>

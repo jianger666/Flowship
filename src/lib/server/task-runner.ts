@@ -5330,6 +5330,29 @@ export const startOneShotQuestion = (
             `- 产出文档目录（方案 / 实现 / 复核等 artifact）：${getActionsDir(task.id)}`,
             `- 工作目录：${effectiveCwd}`,
           ];
+          // 答疑链路也有群能力（用户拍板：输入条喊一声就能往需求群@人）：
+          // one-shot 没有系统工具（share_to_group / ask_user 都没挂），发群只走 shell lark-cli。
+          // 这里只读取已绑群号（绝不建群），让模型知道往哪发、怎么发真@、卡住怎么问。
+          let boundChatId: string | null = null;
+          try {
+            const { getBoundGroupChatId } = await import("./feishu-group");
+            boundChatId = (await getBoundGroupChatId(task)) ?? null;
+          } catch {
+            boundChatId = null;
+          }
+          const groupLines = [
+            "# 本任务的需求群（发群@人走这里，不要说没入口）",
+            boundChatId
+              ? `- 已绑需求群 chat_id：${boundChatId}`
+              : "- 还没绑需求群：不要编 chat_id，直接告诉用户点顶栏「需求群」建/进群，建好再发",
+            ...(boundChatId
+              ? [
+                  "- 要@人必须发真@：先用 `lark-cli im +chat-members-list --chat-id " + boundChatId + " --page-all` 查 open_id（先默认身份，报缺 scope 再加 `--as user` 试一次），拿到 ou_xxx 后用 `lark-cli im +messages-send --chat-id " + boundChatId + " --text '... <at user_id=\"ou_xxx\">名字</at> ...'` 发 text 消息。分享卡片的 at 只认真人、@机器人不会亮，@机器人一律走这条 text 链路",
+                  "- 卡住必须给链接和二维码、不能只列 scope 名字：bot 缺 scope（app_scope_not_applied）先过滤掉 `im:chat.group_info:readonly`（历史版本，一键页显示“无需开通”，有 im:chat:readonly 就够了，不要拼链接、不要让用户开），再把报错 JSON 里的 `console_url` 原样取出——这就是一键页（点开是“确定开通以下权限吗”+蓝色开通键，确认即开，比设置页那个还要省事），放首选可点链接；对它跑 `lark-cli auth qrcode \"<console_url>\" --output qr_bot_scope.png` 生成二维码。user 缺 scope / 报 token_missing 就跑 `lark-cli auth login --scope \"<缺的 scope，多个用空格拼一次取>\" --no-wait --json` 拿 verification_url + device_code，再对 verification_url 跑 `lark-cli auth qrcode \"<verification_url>\" --output qr_user_login.png`。`--output` 必须是 cwd 下相对文件名，但回复里嵌图必须用绝对路径（先 `pwd` 确认 workdir，再拼 `<workdir>/qr_xxx.png`），写成 `![二维码](</绝对路径/qr_xxx.png>)`（尖括号必加，Application Support 有空格）。禁止嵌相对路径 `![...](qr_xxx.png)`——前端加载不了，只会显示 Image blocked。URL 视为不可改的 opaque string，不要拼接/转码；链接用可点 markdown 链接而不用代码块。禁止对 bot 跑 auth login。只推发消息、收消息、群信息、卡片这类免审常规权限；群成员列表要审核只告知（仅“我在不在群”可查），看不懂/要审核的只告知不催",
+                  "- 回复顺序（先快后慢）：①零权限兜底放最前（直接给 ou_xxx，群成员详情里能看到，拿到就直接发，不用等审批）；②用户登录授权（免审，完成后回来告诉我，我再跑 --device-code 收尾，同一轮不要提前收尾）；③后台开 scope 放最后。更不许发纯文本名字凑合（对方收不到提醒等于没问）。用户说开了/给了再重跑",
+                ]
+              : []),
+          ];
           const askedText = buildAgentMessage({
             kind: "user_message",
             text: questionText,
@@ -5342,6 +5365,8 @@ export const startOneShotQuestion = (
             `你是任务「${task.title}」的临时助手。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手。`,
             "",
             ...backgroundLines,
+            "",
+            ...groupLines,
             "",
             "# 用户的话",
             askedText,

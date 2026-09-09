@@ -25,10 +25,10 @@ import {
   recoverDeletedTaskArtifacts,
   removeDeletionJournal,
   rollbackDeletionJournalIfTaskDirRemains,
+  setTaskPinArchive,
   setTaskDisabledMcpServers,
   setTaskModel,
   setTaskProvider,
-  setTaskPinned,
   setTaskRepoPaths,
   setTaskUiLayout,
   taskVisibilityErrorResponse,
@@ -208,6 +208,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
     const { id } = await params;
     const body = (await req.json()) as {
       pinned?: boolean;
+      archived?: boolean;
       disabledMcpServers?: string[] | null;
       uiLayout?: { artifactPanelSize?: number } | null;
       // V0.6.24：chat 模式切模型（持久化 task.model、下一个 run 生效）
@@ -227,8 +228,35 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       addRepoBranchTemplates?: Record<string, string>;
     };
 
-    if (typeof body.pinned === "boolean") {
-      const task = await setTaskPinned(id, body.pinned);
+    // pinned / archived 同一次 PATCH 可一起传（2026-09-09：早返只生效第一个的坑已填；
+    // 单锁单写，避免读-写-读-写中间的删任务竞态）。但它俩不和其它字段同发——
+    // 混发会被静默吞（早返），这里直接 400，比丢数据强；调用方本就单用途单发。
+    if (typeof body.pinned === "boolean" || typeof body.archived === "boolean") {
+      const mixed = [
+        "disabledMcpServers",
+        "uiLayout",
+        "model",
+        "repoPaths",
+        "title",
+        "feishuStoryUrl",
+        "reqId",
+        "repoFeatureBranches",
+        "addRepoBaseBranches",
+        "addRepoTestBranches",
+        "addRepoDevBranches",
+        "addRepoBranchTemplates",
+        "provider",
+      ].some((k) => k in body);
+      if (mixed) {
+        return NextResponse.json(
+          { error: "pinned / archived 请单独发，不和其它字段同一次 PATCH" },
+          { status: 400 },
+        );
+      }
+      const task = await setTaskPinArchive(id, {
+        pinned: body.pinned,
+        archived: body.archived,
+      });
       if (!task)
         return NextResponse.json({ error: "not_found" }, { status: 404 });
       return NextResponse.json({ task });
@@ -484,7 +512,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
 
     return NextResponse.json(
       {
-        error: "需要 pinned / disabledMcpServers / uiLayout / 编辑字段 之一",
+        error: "需要 pinned / archived / disabledMcpServers / uiLayout / 编辑字段 之一",
       },
       { status: 400 },
     );
