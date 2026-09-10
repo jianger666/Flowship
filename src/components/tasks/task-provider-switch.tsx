@@ -17,6 +17,7 @@ import {
   resolveTaskProvider,
 } from "@/lib/agent-provider";
 import { getSettings } from "@/lib/local-store";
+import { clearTalkOverride } from "@/lib/talk-model-override";
 import { setTaskProvider } from "@/lib/task-store";
 import {
   CURSOR_PROVIDER_ID,
@@ -77,6 +78,8 @@ export const TaskProviderSwitch = ({
         nextId,
         model.id.trim() ? model : undefined,
       );
+      // 模型 id 两家不通用：清掉说话条粘住的旧覆盖，防拿上一家的 id 往新提供方发
+      clearTalkOverride(task.id);
       onTaskUpdate(latest);
       toast.success(
         "已切换提供方，下次推进用新会话继续（精细上下文已丢，worktree 文件还在）",

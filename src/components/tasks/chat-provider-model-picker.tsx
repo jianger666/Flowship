@@ -18,6 +18,7 @@ import {
   resolveTaskProvider,
 } from "@/lib/agent-provider";
 import { getSettings } from "@/lib/local-store";
+import { clearTalkOverride } from "@/lib/talk-model-override";
 import { setTaskModel, setTaskProvider } from "@/lib/task-store";
 import {
   CURSOR_PROVIDER_ID,
@@ -96,6 +97,8 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
         nextId,
         model.id.trim() ? model : undefined,
       );
+      // 模型 id 两家不通用：清掉说话条粘住的旧覆盖，防拿上一家的 id 往新提供方发
+      clearTalkOverride(task.id);
       onTaskUpdate(latest);
       pull(nextId);
       if (task.sessionAgentId?.trim()) {

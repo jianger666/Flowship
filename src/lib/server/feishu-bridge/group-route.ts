@@ -47,6 +47,7 @@ import {
   runningTasks,
 } from "@/lib/server/task-stream";
 
+import { resolveSessionModel } from "@/lib/task-model";
 import { injectPendingAskText } from "./ask-inject";
 import {
   burnCorrelatedEntry,
@@ -539,7 +540,8 @@ const startGroupAdvanceAction = async (args: {
     return { ok: false, error: "缺 apiKey / model" };
   }
   // 模型沿用任务上次用的（群里没法选模型）；任务没记过就用设置页默认
-  const model = task.model ?? boot.model;
+  // 跟说话条同口径：最近 action.agentModel → task.model → boot 默认，防建任务旧模型残留
+  const model = resolveSessionModel(task) ?? task.model ?? boot.model;
 
   // 推进恒由**属主主链**跑（advanceTask 起的是 task 自己的 run）→ owner 通道：
   // 认那条链上不带 origin 的 delta / done

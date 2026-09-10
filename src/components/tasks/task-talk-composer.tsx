@@ -38,6 +38,15 @@ import {
 import { getPendingQuestionSend, submitTaskQuestion } from "@/lib/task-store";
 import { loadDraft } from "@/lib/view-memory";
 import type { ModelSelection, Task } from "@/lib/types";
+import {
+  clearTalkOverride,
+  loadTalkOverride,
+  saveTalkOverride,
+} from "@/lib/talk-model-override";
+
+// 说话条手动选模型：粘住语义（用户选了 Gemini 就一直是 Gemini，直到用户再手动切、
+// 切提供方、或推进链变了才跟上）。one-shot 问答不进 action 链、不改 action.agentModel，
+// 所以不能像以前那样发完就重置回会话模型——否则每发一条都要重选一次。
 
 interface Props {
   task: Task;
@@ -73,18 +82,57 @@ export const TaskTalkComposer = ({
     disabled: busy,
   });
 
-  // 展示当前推进实际在用的模型（最近 action.agentModel → task.model）。
-  // 说话条里改了只覆盖接下来这一条；新推进换模型或切任务时再跟上。
-  const [pickedModel, setPickedModel] = useState<ModelSelection>(
-    () => resolveSessionModel(task) ?? { id: "" },
+  // 展示模型：用户手动覆盖优先（粘住），否则跟当前推进实际在用的模型
+  //（最近 action.agentModel → task.model）。action 链任何变化（新 action / 唤醒改模型，
+  // 含同模型的新 action，上下文变了就跟新会话）或切提供方才清掉覆盖；
+  // 单纯问答（one-shot，不改 actions、不改提供方）不清——不然每条都要重选。
+  const [overrideModel, setOverrideModel] = useState<ModelSelection | null>(
+    () => loadTalkOverride(task.id),
   );
   const sessionModel = resolveSessionModel(task) ?? { id: "" };
-  const sessionKey = modelSelectionKey(sessionModel);
-  const sessionModelRef = useRef(sessionModel);
-  sessionModelRef.current = sessionModel;
+  const pickedModel = overrideModel ?? sessionModel;
+  const handleModelChange = (next: ModelSelection): void => {
+    // 选回跟会话一致 = 回到干净态（下次走会话复用）；否则记住覆盖
+    if (
+      !next.id.trim() ||
+      modelSelectionKey(next) === modelSelectionKey(sessionModel)
+    ) {
+      setOverrideModel(null);
+      saveTalkOverride(task.id, null);
+    } else {
+      setOverrideModel(next);
+      saveTalkOverride(task.id, next);
+    }
+  };
+  // 会话归属签名：action 链（currentActionId + 每个 action 的模型指纹）+ 提供方。
+  // 单纯问答只加 events，签名不变；新推进 / 唤醒改模型 / 切提供方（清锚点）签名必变。
+  const actionSig = useMemo(
+    () =>
+      `${task.provider ?? ""}|${task.sessionAgentId ?? ""}|${task.currentActionId ?? ""}|${task.actions
+        .map(
+          (a) =>
+            `${a.id}:${a.n}:${modelSelectionKey(a.agentModel)}`,
+        )
+        .join(",")}`,
+    [task.actions, task.currentActionId, task.provider, task.sessionAgentId],
+  );
+  const actionSigRef = useRef(actionSig);
+  const taskIdRef = useRef(task.id);
   useEffect(() => {
-    setPickedModel(sessionModelRef.current);
-  }, [task.id, sessionKey]);
+    // 切任务：换载对应任务的覆盖
+    if (taskIdRef.current !== task.id) {
+      taskIdRef.current = task.id;
+      actionSigRef.current = actionSig;
+      setOverrideModel(loadTalkOverride(task.id));
+      return;
+    }
+    // 同一任务里签名变了 = 推进换了 action / 唤醒改了模型 / 切了提供方，跟上新会话
+    if (actionSigRef.current !== actionSig) {
+      actionSigRef.current = actionSig;
+      setOverrideModel(null);
+      clearTalkOverride(task.id);
+    }
+  }, [task.id, actionSig]);
   const { models, fetchModels } = useModels();
   useEffect(() => {
     const s = getSettings();
@@ -133,7 +181,7 @@ export const TaskTalkComposer = ({
         }
         onTaskUpdateRef.current(result.task);
         if (valueRef.current === pending.text) resetRef.current();
-        setPickedModel(resolveSessionModel(result.task) ?? { id: "" });
+        // 粘住语义：不重置覆盖。action 链变了上面的 actionSig effect 会自己跟上。
       },
       (err: unknown) => {
         if (!alive) return;
@@ -215,8 +263,8 @@ export const TaskTalkComposer = ({
       }
       onTaskUpdate(result.task);
       rich.reset();
-      // 覆盖只对这一条生效；发完回到当前推进模型（说话条不改 action.agentModel）
-      setPickedModel(resolveSessionModel(result.task) ?? { id: "" });
+      // 粘住语义：one-shot 问答不改 actions，覆盖留着下条继续用；
+      // 唤醒改了 action 模型的，actionSig effect 会清覆盖跟上新会话。
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -247,7 +295,7 @@ export const TaskTalkComposer = ({
             <ModelSelect
               models={models}
               selection={pickedModel}
-              onChange={setPickedModel}
+              onChange={handleModelChange}
               disabled={busy}
               variant="compact"
               emptyPlaceholder="选择模型"

@@ -59,6 +59,7 @@ import {
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
+import { resolveSessionModel } from "@/lib/task-model";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
@@ -339,7 +340,11 @@ const runTaskQuestionInject = async (
     body.forceModel && typeof body.forceModel.id === "string"
       ? { id: body.forceModel.id, params: body.forceModel.params }
       : undefined;
-  const fallbackModel = forceModel ?? model;
+  // 跟说话条同口径：最近 action.agentModel → task.model → 客户端 boot.model。
+  // 只用 boot.model 会拿建任务时的旧模型（如 grok），跟输入条显示的 Composer 对不上。
+  const sessionModel = resolveSessionModel(task);
+  const sessionModelValid = sessionModel?.id?.trim() ? sessionModel : undefined;
+  const fallbackModel = forceModel ?? sessionModelValid ?? model;
 
   // 审查发现：awaiting_ack 时先 snapshot、再因缺 bootArgs 400 → 审阅产物版本被白白污染。
   // 校验提到 snapshot 前：能送达（内存有会话且未 forceModel）或有唤醒凭据；不过直接 400。

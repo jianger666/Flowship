@@ -21,6 +21,7 @@ import {
   isCursorProvider,
 } from "@/lib/types";
 import { getSettings } from "@/lib/local-store";
+import { resolveSessionModel } from "@/lib/task-model";
 
 export interface ActiveModelCreds {
   apiKey: string;
@@ -325,17 +326,30 @@ export const hasActiveModelCreds = (): boolean => {
 };
 
 export const bootArgsForTask = (
-  task: { provider?: string; sessionAgentId?: string; model?: ModelSelection },
+  task: {
+    provider?: string;
+    sessionAgentId?: string;
+    model?: ModelSelection;
+    actions?: Parameters<typeof resolveSessionModel>[0]["actions"];
+  },
   settings: FeAiFlowSettings = getSettings(),
 ): { apiKey: string; model: ModelSelection; providerId: AgentProviderId } => {
   const providerId = resolveTaskProvider(task, settings);
   const creds = getModelCredsForProvider(settings, providerId);
   const fallback = defaultModelForProvider(settings, providerId);
-  const model = task.model?.id?.trim()
-    ? task.model
-    : fallback.id.trim()
-      ? fallback
-      : { id: "" };
+  // 跟说话条 / runner 同口径：最近 action.agentModel → task.model → 设置页默认。
+  // 只读 task.model 会拿建任务时的旧模型（如 grok），跟输入条显示的 Composer 对不上。
+  const sessionModel = resolveSessionModel({
+    model: task.model,
+    actions: task.actions ?? [],
+  });
+  const model = sessionModel?.id?.trim()
+    ? sessionModel
+    : task.model?.id?.trim()
+      ? task.model
+      : fallback.id.trim()
+        ? fallback
+        : { id: "" };
   return { apiKey: creds.apiKey, model, providerId };
 };
 
