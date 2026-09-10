@@ -235,6 +235,7 @@ import {
 import {
   findCustomProvider,
   isApiKeyFieldPresent,
+  isSameProvider,
   migrateProviderSettings,
   resolveTaskProvider,
   sessionMatchesProvider,
@@ -1222,11 +1223,33 @@ const advanceTaskCore = async (
       `[task-runner] task=${task.id} 会话累计 input 超水位、推进强制起新 agent`,
     );
   }
-  const effectiveForceNewAgent =
+  let effectiveForceNewAgent =
     !reuseAgent ||
     ACTION_FRESH_AGENT_DEFAULT[actionType] ||
     reposDrifted ||
     rotationDue;
+
+  // V2a 复用防线（审稿必查）：切提供方后内存旧会话还在。
+  // 下轮用户若勾着「续用当前 agent」，不拦就会往旧提供方的会话里 send（拿旧凭据干活）。
+  // 只认阳性信号：会话记了 providerId 且跟当前对不上 → 关旧会话、强制 fresh，无视 reuse 勾选。
+  // 没记 providerId 的老会话不猜（锚点缺失也可能是正常空闲态，乱 fresh 会打断复用单测与正常续接）；
+  // 切提供方时 setTaskProvider 会同步关掉内存旧会话，所以老会话也漏不掉。
+  {
+    const memSession = agentSessions.get(task.id);
+    const memProviderId = memSession?.providerId;
+    if (memSession && memProviderId) {
+      const currentProviderId = await resolveProviderIdFromDisk(task);
+      if (!isSameProvider(memProviderId, currentProviderId)) {
+        console.warn(
+          `[task-runner] task=${task.id} 提供方已切（${memProviderId}→${currentProviderId}）、复用强制 fresh`,
+        );
+        closeTaskSession(task.id, memSession.agentId, {
+          expectedSessionInstanceId: memSession.instanceId,
+        });
+        effectiveForceNewAgent = true;
+      }
+    }
+  }
 
   // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
   //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites 看到的就是
@@ -3094,11 +3117,13 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             const perfCreateStart = Date.now();
             // SDK local 无 env 透传 → 启动前把 companyEnv 同步到固定路径供 skill 读
             await syncCompanyEnvFileFromSettings();
+            // V2a：记下本会话绑定的提供方，切提供方后复用防线靠它（对不上强制 fresh）。
+            const createdProviderId = await resolveProviderIdFromDisk(task);
             const created = await withSdkDeadline(
               Agent.create({
                 apiKey,
                 model,
-                providerId: await resolveProviderIdFromDisk(task),
+                providerId: createdProviderId,
                 callerToken,
                 // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
                 // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills /
@@ -3183,6 +3208,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               lastActiveAt: Date.now(),
               startSnapshot: captureTaskFieldsSnapshot(task),
               repoPaths: [...task.repoPaths],
+              providerId: createdProviderId,
             };
             if (
               !installSessionIfCurrent(
@@ -5011,6 +5037,7 @@ export const resumeTaskSession = async (
       lastActiveAt: Date.now(),
       startSnapshot: captureTaskFieldsSnapshot(task),
       repoPaths: [...task.repoPaths],
+      providerId,
     };
 
     // install 前插桩；lease = handle current + 非终态（lifecycle）

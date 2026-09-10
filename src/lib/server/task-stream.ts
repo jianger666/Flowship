@@ -116,6 +116,11 @@ export interface AgentSessionRecord {
   startSnapshot: TaskFieldsSnapshot;
   /** 本会话创建时绑定的仓列表；缺省 = 老会话、不据此强制换 agent */
   repoPaths?: string[];
+  /**
+   * 本会话创建时绑定的提供方 id（V2a：task 切提供方后复用防线用）。
+   * 缺省 = 老会话（V2a 前建的）、按落盘锚点逻辑兼容，不据此强制换 agent。
+   */
+  providerId?: string;
 }
 
 // V0.8.18：一个 action 正在后台跑的后置 check 句柄（见 task-runner 的 runActionPostCheck）

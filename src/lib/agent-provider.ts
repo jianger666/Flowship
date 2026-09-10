@@ -168,15 +168,49 @@ export const findCustomProvider = (
   settings?.customProviders?.find((p) => p.id === id);
 
 /**
- * 提供方能不能再切：只允许新建 chat、且还没发过消息（没有会话锚点）。
- * 任务创建时在表单里选定，一旦建好就不能再切；chat 发出第一条后也不能再切。
+ * 切提供方准入的最小任务面（前后端同款、直接传整个 task/meta，现场推 currentAction）。
+ * 传散状态容易前后端漂移，别拆开传 runStatus/currentActionStatus/repoStatus。
  */
-export const isProviderSwitchLocked = (task: {
+export interface ProviderSwitchTaskLike {
   mode?: string;
+  runStatus?: string;
+  repoStatus?: string;
   sessionAgentId?: string;
-}): boolean => {
-  if (task.mode !== "chat") return true;
-  return Boolean(task.sessionAgentId?.trim());
+  currentActionId?: string | null;
+  actions?: Array<{ id: string; status: string }>;
+}
+
+/** 当前步骤是否占着会话（running/awaiting_ack 都算活，error/completed/cancelled 算终）。 */
+const hasLiveAction = (task: ProviderSwitchTaskLike): boolean => {
+  const cur = (task.actions ?? []).find((a) => a.id === task.currentActionId);
+  return cur?.status === "running" || cur?.status === "awaiting_ack";
+};
+
+/**
+ * 提供方能不能再切（V2a：chat 空闲可切；task 空闲可切、running/活步骤/终态锁）。
+ * - chat：runStatus running → 锁；其余放行（有锚点也行，切时清锚点、下轮 create）。
+ * - task：runStatus running → 锁；repoStatus merged/abandoned → 锁；
+ *   当前 action 为 running/awaiting_ack → 锁（注意这是 action 状态、不是 runStatus）；
+ *   runStatus idle/awaiting_user/error + 无活步骤 → 放行（error 正是换家重试的场景）。
+ * 不做原生 resume、不做自动故障转移，切即丢精细上下文。
+ */
+export const isProviderSwitchLocked = (task: ProviderSwitchTaskLike): boolean => {
+  if (task.mode !== "chat" && task.mode !== "task") return true;
+  if (task.runStatus === "running") return true;
+  if (task.mode === "chat") return false;
+  if (task.repoStatus === "merged" || task.repoStatus === "abandoned")
+    return true;
+  if (hasLiveAction(task)) return true;
+  return false;
+};
+
+/**
+ * 内存会话的提供方跟当前提供方是不是同一家。
+ * cursor 家不分 id；自定义按条目 id 精确比（两条自定义锚点同形、这里必须按 id 比）。
+ */
+export const isSameProvider = (a: string, b: string): boolean => {
+  if (isCursorProvider(a) && isCursorProvider(b)) return true;
+  return a === b;
 };
 
 /** pi 会话落在 dataRoot/pi-sessions，Cursor 的 agentId 是 UUID */

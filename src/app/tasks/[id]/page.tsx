@@ -48,6 +48,7 @@ import { useSmoothStreaming } from "@/components/tasks/use-smooth-streaming";
 import { EventStream } from "@/components/tasks/event-stream";
 import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
+import { TaskProviderSwitch } from "@/components/tasks/task-provider-switch";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskUtilityActions } from "@/components/tasks/task-utility-actions";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
@@ -923,6 +924,12 @@ const TaskDetailPage = () => {
           )}
           <ContextDocsPanel task={task} onTaskUpdate={absorbTask} />
           <TaskMcpPanel task={task} onTaskUpdate={absorbTask} />
+          {/* V2a：task 空闲手动切提供方（running/流式窗口禁用，后端再判；只留消息+文件+worktree） */}
+          <TaskProviderSwitch
+            task={task}
+            runActive={runActive || restrictedRunActive}
+            onTaskUpdate={absorbTask}
+          />
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
           <div className="h-4 w-px shrink-0 bg-border" />

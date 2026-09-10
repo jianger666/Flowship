@@ -2256,7 +2256,11 @@ export const setTaskModel = async (
 
 /**
  * 本窗口切提供方（可同时改写默认模型）。跟切模型同款：只落盘、下一轮启动才生效。
- * 任务创建后、chat 发过消息后拒绝。
+ * V2a：chat 空闲可切；task 空闲可切（idle/awaiting_user/error + 无活步骤），
+ * running/活步骤（running/awaiting_ack，注意是 action 状态）/终态（merged/abandoned）禁切。
+ * 切必须清 sessionAgentId（两条自定义锚点同形分不清，禁拿 B 凭据 resume A 会话）、
+ * 模型必须跟新提供方走（不留上一家 id）。水位不手清（下次 create 重置）。
+ * 不做原生 resume、不做自动故障转移。内存旧会话由下轮 advance 复用防线强制 fresh。
  */
 export const setTaskProvider = async (
   id: string,
@@ -2266,12 +2270,21 @@ export const setTaskProvider = async (
   withTaskLock(id, async () => {
     const meta = await readMetaV06(id);
     if (!meta) return null;
+    // 硬约束 1：running 中禁止切（前端 disabled/latch 只是体验，后端必须再判）。
+    if (meta.runStatus === "running") {
+      throw new Error("正在运行中，不能切换提供方");
+    }
     if (isProviderSwitchLocked(meta)) {
-      throw new Error(
-        meta.mode === "chat"
-          ? "已发送过消息，不能切换提供方"
-          : "任务创建后不能切换提供方",
+      const cur = (meta.actions ?? []).find(
+        (a) => a.id === meta.currentActionId,
       );
+      if (meta.repoStatus === "merged" || meta.repoStatus === "abandoned") {
+        throw new Error("任务已终态，不能切换提供方");
+      }
+      if (cur?.status === "running" || cur?.status === "awaiting_ack") {
+        throw new Error("当前步骤运行中，不能切换提供方，等停下来再切");
+      }
+      throw new Error("当前状态不能切换提供方");
     }
     const prev = meta.provider?.trim() || "cursor";
     meta.provider = provider;
@@ -2280,6 +2293,15 @@ export const setTaskProvider = async (
       // 两条自定义之间 sessionMatchesProvider 分不出来（都是 pi 锚点），
       // 切提供方必须丢掉旧会话，下一轮 Agent.create，禁止 resume 到别人的 HTTP 上。
       meta.sessionAgentId = undefined;
+      // 内存旧会话也在（空闲常驻），光清落盘锚点不够：下轮勾着「续用」会直接往旧会话 send。
+      // 这里同步关掉（动态 import 避开 task-fs↔task-runner 静态循环）；
+      // advance 的复用防线（比对会话 providerId）是第二道，专防没走这里的老会话。
+      try {
+        const { closeTaskSession } = await import("./task-runner");
+        closeTaskSession(id, undefined, { reap: false });
+      } catch {
+        /* 内存本就没会话时啥也不干，下轮本来就是 fresh */
+      }
       // 模型跟新提供方走：没配默认就清空，不能留上一家的 id
       meta.model = nextModel;
     } else if (nextModel) {

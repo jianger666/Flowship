@@ -1,13 +1,15 @@
 "use client";
 
 /**
- * 对话 footer：空对话可切提供方；发过消息后只留模型。切了只 PATCH，下条消息懒重启。
+ * 对话 footer：chat 空闲可切提供方（发过消息也行）、running 禁切。切了只 PATCH，下条消息懒重启。
+ * V1 只做“能切 + 提示丢精细上下文”，不做交接摘要、不做自动故障转移。
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { ProviderModelPicker } from "@/components/ui/provider-model-picker";
+import { useDialog } from "@/hooks/use-dialog";
 import { useModels } from "@/hooks/use-models";
 import {
   getModelCredsForProvider,
@@ -64,10 +66,28 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
   }, [providerId, fetchModels]);
 
   const busy = task.runStatus === "running" || savingProvider;
+  // V1：chat 空闲就露提供方（发过消息也行）；running 由 busy 禁掉，后端再判一次。
   const showProvider = !isProviderSwitchLocked(task);
+  const { confirm } = useDialog();
 
   const handleProviderChange = async (nextId: string) => {
     if (!showProvider || !nextId || nextId === providerId) return;
+    // 硬约束 1：running 中禁止切，前端先拦（后端 setTaskProvider 还会再判）。
+    if (task.runStatus === "running") {
+      toast.error("正在运行中，不能切换提供方，等停下来再切");
+      return;
+    }
+    // 有过会话锚点 = 发过消息：切即丢精细上下文，先让用户亲口确认。
+    if (task.sessionAgentId?.trim()) {
+      const ok = await confirm({
+        title: "切换提供方？",
+        description:
+          "会丢掉当前会话的精细上下文（tool 调用历史），只保留界面上的消息记录和磁盘文件，下条消息用新提供方重新开始。",
+        confirmLabel: "确认切换",
+        cancelLabel: "再想想",
+      });
+      if (!ok) return;
+    }
     setSavingProvider(true);
     try {
       const model = defaultModelForProvider(settingsRef.current, nextId);
@@ -78,6 +98,9 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
       );
       onTaskUpdate(latest);
       pull(nextId);
+      if (task.sessionAgentId?.trim()) {
+        toast.success("已切换提供方，下条消息用新会话继续（精细上下文已丢）");
+      }
     } catch (err) {
       toast.error(`切换提供方失败：${(err as Error).message}`);
     } finally {

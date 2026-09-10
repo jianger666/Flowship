@@ -303,7 +303,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       return NextResponse.json({ ok: true });
     }
 
-    // 空对话可切提供方；任务已创建 / chat 已发过则 409
+    // V2a：chat/任务空闲可切，running/活步骤/终态则 409（后端 setTaskProvider 再判一次）。
     if ("provider" in body) {
       const p = body.provider;
       if (typeof p !== "string" || !p.trim() || p.length > 80) {

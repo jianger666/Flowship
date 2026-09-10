@@ -110,19 +110,86 @@ describe("migrateProviderSettings", () => {
 });
 
 describe("isProviderSwitchLocked", () => {
-  it("空对话还能切，发过消息（有会话锚点）就锁", () => {
+  it("chat 空闲可切（发过消息也行）、running 才锁", () => {
     expect(isProviderSwitchLocked({ mode: "chat" })).toBe(false);
     expect(isProviderSwitchLocked({ mode: "chat", sessionAgentId: "" })).toBe(
       false,
     );
     expect(
       isProviderSwitchLocked({ mode: "chat", sessionAgentId: "uuid-1" }),
+    ).toBe(false);
+    expect(
+      isProviderSwitchLocked({
+        mode: "chat",
+        sessionAgentId: "uuid-1",
+        runStatus: "running",
+      }),
     ).toBe(true);
   });
 
-  it("任务模式创建后就锁", () => {
-    expect(isProviderSwitchLocked({ mode: "task" })).toBe(true);
+  it("task 空闲可切（含 error 重试）、running/活步骤/终态锁", () => {
+    // idle 无步骤 → 放行
+    expect(
+      isProviderSwitchLocked({ mode: "task", runStatus: "idle" }),
+    ).toBe(false);
+    // awaiting_user + 终态步骤 → 放行
+    expect(
+      isProviderSwitchLocked({
+        mode: "task",
+        runStatus: "awaiting_user",
+        currentActionId: "a1",
+        actions: [{ id: "a1", status: "completed" }],
+      }),
+    ).toBe(false);
+    // error + 终态步骤 → 放行（换家重试场景）
+    expect(
+      isProviderSwitchLocked({
+        mode: "task",
+        runStatus: "error",
+        currentActionId: "a1",
+        actions: [{ id: "a1", status: "error" }],
+      }),
+    ).toBe(false);
+    // running → 锁
+    expect(
+      isProviderSwitchLocked({ mode: "task", runStatus: "running" }),
+    ).toBe(true);
+    // action running（注意是 action 状态、不是 runStatus）→ 锁
+    expect(
+      isProviderSwitchLocked({
+        mode: "task",
+        runStatus: "awaiting_user",
+        currentActionId: "a1",
+        actions: [{ id: "a1", status: "running" }],
+      }),
+    ).toBe(true);
+    // action awaiting_ack → 锁
+    expect(
+      isProviderSwitchLocked({
+        mode: "task",
+        runStatus: "awaiting_user",
+        currentActionId: "a1",
+        actions: [{ id: "a1", status: "awaiting_ack" }],
+      }),
+    ).toBe(true);
+    // 终态任务 → 锁
+    expect(
+      isProviderSwitchLocked({ mode: "task", repoStatus: "merged" }),
+    ).toBe(true);
+    expect(
+      isProviderSwitchLocked({ mode: "task", repoStatus: "abandoned" }),
+    ).toBe(true);
     expect(isProviderSwitchLocked({})).toBe(true);
+  });
+});
+
+describe("isSameProvider", () => {
+  it("cursor 家不分 id、自定义按条目 id 精确比", async () => {
+    const { isSameProvider } = await import("@/lib/agent-provider");
+    expect(isSameProvider("cursor", "cursor")).toBe(true);
+    expect(isSameProvider("cp_a", "cp_a")).toBe(true);
+    expect(isSameProvider("cp_a", "cp_b")).toBe(false);
+    expect(isSameProvider("cursor", "cp_a")).toBe(false);
   });
 });
 
