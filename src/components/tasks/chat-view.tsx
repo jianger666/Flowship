@@ -684,10 +684,13 @@ export const ChatView = ({
     return null;
   })();
 
-  // D 批次：排队条可点开小面板（列排队消息 + 行内删除 / 立即发送）、组件见 chat-queue-banner
+  // D 批次：排队条可点开小面板（列排队消息 + 行内删除 / 立即发送）、组件见 chat-queue-banner。
+  // 条子只在 run SES alive 时才挂：“排队” = 在当前回复后面等着。
+  // 空闲时发的消息只是直发在途（输入框 loading + 待发送气泡已经表达了），
+  // 也算一条“排队中”纯属误导——之前恢复/直发 loading 闪条子就是这么来的。
   const queueBanner =
-    queuedCount != null && queuedCount > 0 ? (
-      <ChatQueueBanner task={task} queuedCount={queuedCount} />
+    runActive && queuedCount != null && queuedCount > 0 ? (
+      <ChatQueueBanner key={task.id} task={task} queuedCount={queuedCount} />
     ) : null;
 
   return (

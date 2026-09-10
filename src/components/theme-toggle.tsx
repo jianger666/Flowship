@@ -12,6 +12,7 @@ import { useTheme } from "next-themes";
 import { Monitor, Moon, Sun, type LucideIcon } from "lucide-react";
 
 import { buttonVariants } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Popover,
   PopoverContent,
@@ -47,12 +48,15 @@ export const ThemeToggle = () => {
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        aria-label="切换主题"
-        className={cn(buttonVariants({ variant: "ghost", size: "icon" }))}
-      >
-        <TriggerIcon className="size-4.5" />
-      </PopoverTrigger>
+      {/* 顶栏其它图标都有 Tooltip hover 提示，主题按钮补一个保持统一 */}
+      <Tooltip content="切换主题">
+        <PopoverTrigger
+          aria-label="切换主题"
+          className={cn(buttonVariants({ variant: "ghost", size: "icon" }))}
+        >
+          <TriggerIcon className="size-4.5" />
+        </PopoverTrigger>
+      </Tooltip>
       <PopoverContent align="end" className="w-40 space-y-0.5 p-1.5">
         {THEME_OPTIONS.map(({ value, label, icon: Icon }) => {
           // 仅在 mounted 后高亮、否则 SSR 会把 system 当默认全亮

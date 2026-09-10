@@ -58,31 +58,49 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
   const [savingEdit, setSavingEdit] = useState(false);
   // A：排队从无到有、每次都自动弹开（用户要常驻感知；关了等下一轮 0→N 再弹）
   const prevCountRef = useRef(0);
+  // 请求代际：自动弹开飞行中用户手动关了面板，回来的非空不许再顶开（违背意图）
+  const reqRef = useRef(0);
+  // 拉取失败标记：失败与空队是两回事，面板文案要分开（之前失败也显示“队列已空”，误导）
+  const [loadError, setLoadError] = useState(false);
 
-  const refreshQueue = () => {
+  const loadQueue = (openWhenNonEmpty: boolean) => {
+    const myReq = ++reqRef.current;
     setLoading(true);
+    setLoadError(false);
     void fetchChatQueue(taskId)
-      .then(setItems)
+      .then((list) => {
+        if (reqRef.current !== myReq) return; // 过期回包（切 task / 手动关后）直接丢
+        setItems(list);
+        // 自动弹开专用：队里真有东西才开。本地 pending 可能是刚发出的在途
+        // （会话恢复/重连时常见），空队弹开只剩一句“队列已空”，尴尬。
+        if (openWhenNonEmpty && list.length > 0) setOpen(true);
+      })
       .catch((err) => {
+        if (reqRef.current !== myReq) return;
         toast.error(`拉取队列失败：${(err as Error).message}`);
         setItems(null);
+        setLoadError(true);
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (reqRef.current === myReq) setLoading(false);
+      });
   };
 
+  const refreshQueue = () => loadQueue(false);
+
   const handleOpenChange = (next: boolean) => {
+    reqRef.current++; // 手动开关作废在飞的自动弹开
     setOpen(next);
     if (!next) return;
     refreshQueue();
   };
 
-  // 排队从无到有（上一拍 0、这一拍 N）→ 自动弹开；队内 1→2 不重复弹、不打断编辑
+  // 排队从无到有（上一拍 0、这一拍 N）→ 先拉快照、有货才弹；队内 1→2 不重复弹、不打断编辑
   useEffect(() => {
     const prev = prevCountRef.current;
     prevCountRef.current = queuedCount;
     if (prev <= 0 && queuedCount > 0) {
-      setOpen(true);
-      refreshQueue();
+      loadQueue(true);
     }
     if (queuedCount <= 0) setEditingId(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -193,8 +211,12 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
       />
       <PopoverContent align="start" className="w-80 p-2">
         <div className="mb-1.5 px-1 text-xs font-medium">排队中的消息</div>
-        {loading && items === null ? (
+        {loading && items === null && !loadError ? (
           <LoadingState variant="inline" className="px-1" />
+        ) : loadError && items === null ? (
+          <div className="px-1 py-2 text-xs text-destructive">
+            队列拉取失败，稍后重新点条子再试
+          </div>
         ) : !items || items.length === 0 ? (
           <EmptyHint size="sm">队列已空（可能刚被发出或删除）</EmptyHint>
         ) : (
