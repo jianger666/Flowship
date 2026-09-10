@@ -68,6 +68,10 @@ export const WHATS_NEW: Record<string, string[]> = {
     "AI 回复时发的消息会排队显示，可编辑、删除或立即发送",
     "飞书桥接权限检查更准，缺权限会告诉你点哪里开通",
   ],
+  "1.9.13": [
+    "对话和任务都能中途换模型提供方了，一家欠费可以切另一家接着干（聊天记录和文件都在）",
+    "会话管理页顶上的占用数字跟着筛选走了，切进行中/已归档不再都显示同一个总数",
+  ],
 };
 
 export const WHATS_NEW_SEEN_KEY = "flowship.whatsNewSeen";

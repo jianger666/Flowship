@@ -247,6 +247,12 @@ const SessionsPage = () => {
     return [...rows].sort((a, b) => b.updatedAt - a.updatedAt);
   }, [tasks, filter, modeFilter, query, sort, sizeById, storage]);
 
+  // 顶上总量跟着当前筛选项走（状态/类型/搜索），别用全量 totalBytes
+  const visibleBytes = useMemo(
+    () => visible.reduce((s, t) => s + (sizeById.get(t.id)?.total ?? 0), 0),
+    [visible, sizeById],
+  );
+
   // 快捷选中：点击时现算，不 memo——memo  deps 里 Date.now() 是冻住的，页面开几小时
   // 阈值就不动（刚满 30 天的进不来）。finished 本与时间无关，同样只点击时用，顺手一起改。
   const getFinishedTasks = () =>
@@ -259,6 +265,7 @@ const SessionsPage = () => {
     tasks.filter(
       (t) => t.mode === "chat" && Date.now() - t.updatedAt > CHAT_STALE_MS,
     );
+  const getArchivedTasks = () => tasks.filter((t) => t.archived);
 
   const togglePick = (key: string) => {
     if (deleting) return;
@@ -627,7 +634,7 @@ const SessionsPage = () => {
             <span>
               共 {visible.length} 个
               {storage
-                ? ` · 占用 ${formatBytes(storage.totalBytes)}`
+                ? ` · 占用 ${formatBytes(visibleBytes)}`
                 : " · 占用扫描中…"}
               {staleList.length > 0 && ` · ${staleList.length} 个残留工作区`}
             </span>
@@ -665,6 +672,15 @@ const SessionsPage = () => {
                 onClick={() => pickAll(getStaleChats().map((t) => t.id))}
               >
                 选中 30 天未活跃（{getStaleChats().length}）
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 bg-card text-xs"
+                disabled={getArchivedTasks().length === 0 || !!deleting}
+                onClick={() => pickAll(getArchivedTasks().map((t) => t.id))}
+              >
+                选中已归档（{getArchivedTasks().length}）
               </Button>
               {picked.size > 0 && (
                 <Button
