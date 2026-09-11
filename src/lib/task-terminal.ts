@@ -15,6 +15,13 @@ import {
   rememberSuccessfulDeletedId,
   SUCCESSFUL_DELETED_IDS_MAX,
 } from "@/lib/task-list-refresh";
+import { clearTalkOverride } from "@/lib/talk-model-override";
+import {
+  clearAttachmentSnapshot,
+  clearLastWork,
+  getLastWorkId,
+  saveDraft,
+} from "@/lib/view-memory";
 
 type TaskTerminalStore = {
   /** sticky：同 id 删除后永不因迟到 200 解除 */
@@ -252,6 +259,17 @@ export const subscribeTaskTerminalList = (
 export const commitTaskDeleted = (taskId: string): void => {
   if (!taskId) return;
   rememberTaskTerminalDeleted(taskId);
+  // 任务物理删除：顺手清说话条的模型覆盖（归档不走这里、覆盖保留，恢复后还能用）
+  clearTalkOverride(taskId);
+  // 输入条附件快照同理：chat（reply）和工作台（talk）两个 scope 都清，
+  // 不然删掉任务的图要等 20 个新快照顶掉或 reload 才走
+  clearAttachmentSnapshot("reply", taskId);
+  clearAttachmentSnapshot("talk", taskId);
+  // 正文草稿同理（文字虽小、删了也不该留僵尸 key）
+  saveDraft("reply", taskId, "");
+  saveDraft("talk", taskId, "");
+  // 上次的工作台记忆若正好是这个任务 → 退回看板，避免下次切回来闪一下已删空态
+  if (getLastWorkId() === taskId) clearLastWork();
   // 同步通知：与 remember 同临界区语义（单线程事件循环）
   for (const listener of getStore().listListeners) {
     try {

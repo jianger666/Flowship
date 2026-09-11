@@ -15,9 +15,15 @@ import { FeishuBoard } from "@/components/feishu/feishu-board";
 import { SetupChecklist, useSetupGate } from "@/components/setup-checklist";
 import { LoadingState } from "@/components/ui/loading-state";
 import { markShellContentReady } from "@/lib/shell-ready";
+import { rememberWorkBoard } from "@/lib/view-memory";
 
 const HomePage = () => {
   const gate = useSetupGate();
+
+  // 记住「上次在甘特」：从对话切回工作台时回到甘特、而不是被拽到老任务
+  useEffect(() => {
+    rememberWorkBoard();
+  }, []);
 
   // 开屏一屏到底（v1.1.x）：就绪清单是「真实内容」、渲出来即通知壳收 splash；
   // 看板分支的通知由 FeishuBoard 在数据首渲时发（等内容、不是等外壳）

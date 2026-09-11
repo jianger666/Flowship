@@ -28,6 +28,12 @@ import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import type { ImagePayload } from "@/lib/task-store";
+import {
+  loadAttachmentSnapshot,
+  updateAttachmentSnapshot,
+  type DraftScope,
+  type SnapshotImage,
+} from "@/lib/view-memory";
 
 // 图片白名单（跟后端 task-fs.ts 的 ALLOWED_IMAGE_MIME 保持一致）
 const DEFAULT_ALLOWED_MIMES = new Set([
@@ -64,6 +70,11 @@ export interface UseImageAttachOptions {
   maxImages?: number;
   // 覆盖默认单图 size 上限
   maxBytesPerImage?: number;
+  /**
+   * 附件快照持久化（切页/切任务不丢图）。不传 = 不持久化——
+   * 弹窗 / 答题卡这类「关掉就该没了」的输入不该留快照。
+   */
+  persist?: { scope: DraftScope; id: string } | null;
 }
 
 export interface UseImageAttachReturn {
@@ -78,8 +89,10 @@ export interface UseImageAttachReturn {
 
   // 移除指定 id 的图（点缩略图右上角 X 触发）
   removeImage: (id: string) => void;
-  // 清空所有附图（提交成功后 / dialog 关闭时调）
-  reset: () => void;
+  // 整单替换（切任务回来时从快照恢复用；默认同步写穿快照，restore() 传 skipPersist 做 0 写恢复）
+  replaceAll: (images: PendingImage[], opts?: { skipPersist?: boolean }) => void;
+  // 清空所有附图（提交成功后 / dialog 关闭时调；restore() 传 skipPersist 只清 UI 不碰快照）
+  reset: (opts?: { skipPersist?: boolean }) => void;
   // 触发隐藏 input file 的 click（绑附图按钮 onClick）
   triggerFilePicker: () => void;
 
@@ -116,14 +129,70 @@ const stripDataUrlPrefix = (dataUrl: string): string => {
 const newPendingId = (): string =>
   `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
+// 快照存的是无 File 的精简形态（File 不可序列化、且发送只用得到 name）；
+// dataUrl 不存、用时现拼（跟 data 是同一份 base64，存双份最坏翻倍）。
+// 恢复时合成空 File 占位（content 从不用它、只读 name/type）。
+const toStored = (p: PendingImage): SnapshotImage => ({
+  id: p.id,
+  data: p.data,
+  mimeType: p.mimeType,
+  filename: p.file?.name ?? "",
+});
+
+const fromStored = (s: SnapshotImage): PendingImage => {
+  const dataUrl = `data:${s.mimeType};base64,${s.data}`;
+  return {
+    id: s.id,
+    file: new File([], s.filename, { type: s.mimeType }),
+    dataUrl,
+    data: s.data,
+    mimeType: s.mimeType,
+  };
+};
+
+/** 快照形态转回 PendingImage（useRichInput.restore 用；File 合成空占位即可） */
+export const snapshotImagesToPending = (
+  images: SnapshotImage[],
+): PendingImage[] => images.map(fromStored);
+
+// 读快照恢复图片列表；无快照 / 无 persist 返回空（跟以前行为一致）
+const restoreImages = (
+  persist: { scope: DraftScope; id: string } | null,
+): PendingImage[] => {
+  if (!persist) return [];
+  const snap = loadAttachmentSnapshot(persist.scope, persist.id);
+  if (!snap || snap.images.length === 0) return [];
+  return snap.images.map(fromStored);
+};
+
+// 快照写穿：只换 images、paths 原样保留（走原子更新，跟 paths 侧互不覆盖）
+const persistImages = (
+  persist: { scope: DraftScope; id: string } | null,
+  images: PendingImage[],
+): void => {
+  if (!persist) return;
+  updateAttachmentSnapshot(persist.scope, persist.id, (prev) => ({
+    images: images.map(toStored),
+    paths: prev?.paths ?? [],
+  }));
+};
+
 export const useImageAttach = (
   options?: UseImageAttachOptions,
 ): UseImageAttachReturn => {
   const maxImages = options?.maxImages ?? DEFAULT_MAX_IMAGES;
   const maxBytesPerImage = options?.maxBytesPerImage ?? DEFAULT_MAX_IMAGE_BYTES;
+  const persist = options?.persist ?? null;
+  // 当前快照 key 的同步镜像：addFiles 跨 await（读文件）后回来可能已切任务——
+  // 用调用时刻的 key 写快照、用「key 没变」守 setState，迟到的图只进快照不串屏
+  const persistRef = useRef(persist);
+  persistRef.current = persist;
 
-  // 待发送的图片附件列表（粘贴 / 拖拽 / 选文件三种途径添进来）
-  const [images, setImages] = useState<PendingImage[]>([]);
+  // 待发送的图片附件列表（粘贴 / 拖拽 / 选文件三种途径添进来）；
+  // 有 persist 时初值从快照恢复（切页/切任务回来图还在）
+  const [images, setImages] = useState<PendingImage[]>(() =>
+    restoreImages(persist),
+  );
   // images 的同步镜像：addFiles 异步读文件、合并前读 ref 拿最新列表（闭包里的 images 可能陈旧）；
   // 也让 toast 副作用留在回调里、不进 setState updater（updater 必须纯、StrictMode 双调会弹两次，
   // 同 use-path-attach 的 pathsRef 套路）
@@ -144,6 +213,10 @@ export const useImageAttach = (
   const addFiles = async (files: File[]) => {
     if (options?.disabled) return;
     if (files.length === 0) return;
+    // 调用时刻的快照 key：读文件是 async，回来时用户可能已切任务——
+    // 快照写调用时刻的 key、setState 只在 key 没变时做，迟到的图不串屏
+    const snapScope = persistRef.current?.scope;
+    const snapId = persistRef.current?.id;
     const additions: PendingImage[] = [];
     // 本次输入内的去重键（base64 内容）：同一张图多条 item 只取第一条
     const batchSeen = new Set<string>();
@@ -183,7 +256,13 @@ export const useImageAttach = (
     // 合并串行化：同一时刻只有一个合并读/写 imagesRef、再 setImages 绝对列表——
     // 既保并发粘贴不互相覆盖，又不把副作用写进 setState updater
     mergeLockRef.current = mergeLockRef.current.then(() => {
-      const current = imagesRef.current;
+      // 合并基准：有快照 key 时以调用时刻那份快照为准（切任务后 imagesRef 可能已是新任务的）；
+      // 无 key（弹窗类）沿用原 imagesRef 逻辑
+      const hasSnapKey = !!snapScope && !!snapId;
+      const current: PendingImage[] =
+        hasSnapKey && snapScope && snapId
+          ? (loadAttachmentSnapshot(snapScope, snapId)?.images.map(fromStored) ?? [])
+          : imagesRef.current;
       // 对已附图按内容去重：同一张图已经挂着就不重复占名额
       const existing = new Set(current.map((p) => p.data));
       const fresh = additions.filter((a) => !existing.has(a.data));
@@ -199,8 +278,18 @@ export const useImageAttach = (
         return;
       }
       const next = current.concat(kept);
-      imagesRef.current = next;
-      setImages(next);
+      // 切任务后回来的迟到合并：只写旧任务快照、不碰当前屏幕（防串任务）
+      const stillCurrent =
+        !hasSnapKey ||
+        (persistRef.current?.scope === snapScope &&
+          persistRef.current?.id === snapId);
+      if (stillCurrent) {
+        imagesRef.current = next;
+        setImages(next);
+      }
+      if (hasSnapKey && snapScope && snapId) {
+        persistImages({ scope: snapScope, id: snapId }, next);
+      }
       if (fresh.length > room) {
         toast.warning(
           `图太多、超出上限 ${maxImages} 张、已截断到 ${kept.length} 张`,
@@ -215,15 +304,33 @@ export const useImageAttach = (
     const next = imagesRef.current.filter((p) => p.id !== id);
     imagesRef.current = next;
     setImages(next);
+    const p = persistRef.current;
+    if (p) persistImages(p, next);
   };
+
+  // 整单替换（切任务回来时从快照恢复用；默认同步写穿快照，restore() 传 skipPersist 做 0 写恢复）
+  const replaceAll = useCallback(
+    (images: PendingImage[], opts?: { skipPersist?: boolean }) => {
+      const p = persistRef.current;
+      imagesRef.current = images;
+      setImages(images);
+      if (!opts?.skipPersist && p) persistImages(p, images);
+    },
+    [],
+  );
 
   // useCallback（稳定引用）：调用方要把它放进 useEffect 依赖（切 task 时清附件），
   // 每次 render 换个新函数会让那个 effect 每帧都跑一遍、把用户正在打的内容清掉
-  //（use-path-attach 的回调同理，全是稳定引用）
-  const reset = useCallback(() => {
+  //（use-path-attach 的回调同理，全是稳定引用）。
+  // 有 persist 时同步写穿空快照（保留 paths 那半）：快照==state 的不变式由本 hook自己保证，
+  // 不依赖调用方“记得调 rich.reset”。restore() 恢复时传 skipPersist、只清 UI 不碰快照
+  //（快照已提前读出来了，写穿是多余的 0 写优化 + 不污染 LRU）。
+  const reset = useCallback((opts?: { skipPersist?: boolean }) => {
     imagesRef.current = [];
     setImages([]);
     setIsDragging(false);
+    const p = persistRef.current;
+    if (!opts?.skipPersist && p) persistImages(p, []);
   }, []);
 
   const triggerFilePicker = () => {
@@ -301,6 +408,7 @@ export const useImageAttach = (
     fileInputRef,
     maxImages,
     removeImage,
+    replaceAll,
     reset,
     triggerFilePicker,
     onPaste,

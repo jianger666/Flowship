@@ -14,14 +14,20 @@
 
   ; 自更新：旧卸载器可能已经删掉快捷方式，keepShortcuts 也只 rename 不改目标。
   ; 装完强制写回指向当前 $INSTDIR 里的 exe，避免桌面图标「找不到应用」。
+  ; v1.9.13：$appExe 不存在（新文件没写进去、旧目录已被清空的半截状态）时绝不重建——
+  ; 否则快捷方式会被指向一个不存在的 exe，比“旧快捷方式悬空”更难排查。
   ${if} ${isUpdated}
-    CreateShortCut "$newDesktopLink" "$appExe" "" "$appExe" 0 "" "" "${APP_DESCRIPTION}"
-    ClearErrors
-    WinShell::SetLnkAUMI "$newDesktopLink" "${APP_ID}"
-    CreateShortCut "$newStartMenuLink" "$appExe" "" "$appExe" 0 "" "" "${APP_DESCRIPTION}"
-    ClearErrors
-    WinShell::SetLnkAUMI "$newStartMenuLink" "${APP_ID}"
-    System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
+    ${if} ${FileExists} "$appExe"
+      CreateShortCut "$newDesktopLink" "$appExe" "" "$appExe" 0 "" "" "${APP_DESCRIPTION}"
+      ClearErrors
+      WinShell::SetLnkAUMI "$newDesktopLink" "${APP_ID}"
+      CreateShortCut "$newStartMenuLink" "$appExe" "" "$appExe" 0 "" "" "${APP_DESCRIPTION}"
+      ClearErrors
+      WinShell::SetLnkAUMI "$newStartMenuLink" "${APP_ID}"
+      System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
+    ${else}
+      DetailPrint "skip shortcut rewrite: $appExe missing"
+    ${endIf}
   ${endIf}
 !macroend
 

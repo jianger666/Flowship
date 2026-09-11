@@ -112,6 +112,60 @@ const removeFilesByExt = async (dir, ext) => {
   }
 };
 
+// Windows 安装慢瘦身（v1.9.13）：node_modules 里 1.5 万散文件逐个落盘 + Defender 逐个扫
+// 是安装进度条卡死的真凶。Node 运行时只会加载 .js/.mjs/.cjs/.json/.node，
+// 类型声明（.d.ts）/ 文档（.md）/ 测试与示例目录生产环境永远用不到——剪掉，
+// 实测约减 1/3 文件数。只动 node_modules：.next / prompts / skills / scripts 不碰。
+// 白名单思路太脆（漏一个运行时读的资源就炸），用黑名单：删“确定无用”的。
+const PRUNE_FILE_RES = [
+  /\.d\.([cm]?ts)$/, // 类型声明（ts/mts/cts 的声明变体；纯 .ts 源码保留、防极端包）
+  /\.md$/, /\.markdown$/, /\.tsbuildinfo$/, /\.map$/, // .map：后补的运行时包没过全局瘦身、这里兜
+]; // 注意：LICENSE 类文件故意不删（合规要求），反正没几个。
+const PRUNE_DIR_NAMES = new Set([
+  "__tests__", "test", "tests", "docs", "example", "examples",
+  "coverage", ".github",
+]);
+
+const pruneNodeModulesJunk = async (nodeModulesDir) => {
+  let removedFiles = 0;
+  let removedBytes = 0;
+  let removedDirs = 0;
+  const walk = async (dir) => {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isSymbolicLink()) continue; // pnpm 链接拓扑不动（只处理实体）
+      if (e.isDirectory()) {
+        // Windows 路径大小写不敏感，Test/Docs 会漏网
+        if (PRUNE_DIR_NAMES.has(e.name.toLowerCase())) {
+          await fs.rm(p, { recursive: true, force: true }).catch(() => {});
+          removedDirs++;
+          continue;
+        }
+        await walk(p);
+      } else if (e.isFile() && PRUNE_FILE_RES.some((re) => re.test(e.name))) {
+        try {
+          removedBytes += (await fs.stat(p)).size;
+        } catch {
+          // stat 失败不影响删除
+        }
+        await fs.rm(p, { force: true }).catch(() => {});
+        removedFiles++;
+      }
+    }
+  };
+  await walk(nodeModulesDir);
+  // MB 只算了文件、目录按个数报：文案分开写，免得把“删了多少”读成“省了多少字节”
+  console.log(
+    `[assemble] 瘦身：删垃圾文件 ${removedFiles} 个（文件约 ${(removedBytes / 1048576).toFixed(1)}MB）+ 垃圾目录 ${removedDirs} 个`,
+  );
+};
+
 // pnpm 会把 optionalDependencies 也建成 node_modules 内层 symlink；不随包时目标不存在，
 // 断链进包会让 mac codesign --verify 报 No such file。打包前清掉这类链接。
 const removeBrokenSymlinks = async (dir) => {
@@ -286,4 +340,16 @@ export const assembleServerLayout = async (rootDir, destDir) => {
 
   // 兜底：剪掉未随包的 optional 依赖断链，避免 mac codesign --verify 失败
   await removeBrokenSymlinks(destDir);
+  // Windows 安装慢瘦身：剪 node_modules 垃圾文件（类型声明/文档/测试目录）
+  await pruneNodeModulesJunk(path.join(destDir, "node_modules"));
+  // 瘦身冒烟：黑名单删错了这里直接炸、不带病进安装包（server 起不来比包大 10MB 严重得多）
+  for (const critical of [
+    "server.js",
+    path.join(".next", "BUILD_ID"),
+    path.join("node_modules", "next", "package.json"),
+  ]) {
+    if (!(await exists(path.join(destDir, critical)))) {
+      throw new Error(`[assemble] 瘦身后缺关键文件 ${critical}、拒绝产出`);
+    }
+  }
 };

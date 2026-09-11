@@ -15,7 +15,7 @@
 import { Suspense, use, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Rocket } from "lucide-react";
+import { ChevronLeft, Rocket } from "lucide-react";
 
 import { TaskLaunchForm } from "@/components/tasks/task-launch-form";
 import { WorkitemDetail } from "@/components/feishu/workitem-detail";
@@ -52,11 +52,11 @@ const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) =
 
   return (
     <div className="mx-auto flex h-full w-full max-w-3xl flex-col gap-5 overflow-y-auto px-6 py-5">
-      {/* 顶部：返回看板 */}
+      {/* 顶部：返回工作台 */}
       <div className="flex items-center gap-3">
         <Button variant="ghost" size="sm" onClick={() => router.push("/")} className="gap-1 px-2">
-          <ArrowLeft className="size-4" />
-          看板
+          <ChevronLeft className="size-4" />
+          返回
         </Button>
         <Separator orientation="vertical" className="h-4" />
         <span className="text-sm text-muted-foreground">工作项预览</span>

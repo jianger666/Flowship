@@ -76,7 +76,6 @@ import { getSubmitShortcutHint } from "@/lib/submit-shortcut";
 import { fetchEarlierEvents, type ImagePayload } from "@/lib/task-store";
 import {
   getScrollAnchor,
-  loadDraft,
   saveScrollAnchor,
 } from "@/lib/view-memory";
 import type { Task, TaskEvent } from "@/lib/types";
@@ -611,6 +610,7 @@ const EventStreamImpl = ({
     disabled: !composeEnabled,
   });
   const setDraft = rich.setValue;
+  const restoreDraft = rich.restore;
   const inputRef = rich.focusRef;
 
   // 个人偏好的提交快捷键（placeholder 提示用；提交判定在 Composer 内部）
@@ -1109,15 +1109,16 @@ const EventStreamImpl = ({
   const taskIdRef = useRef(task.id);
   taskIdRef.current = task.id;
 
-  // 切 task 重置分页状态 + 换载对应草稿 + 重开滚动恢复闸 + 清 sticky 轮次头
+  // 切 task 重置分页状态 + 换载对应输入（hook 的初值只在 mount 时读一次、详情页内导航不重挂）
   useEffect(() => {
     pagedOnceRef.current = false;
     loadingEarlierRef.current = false;
     setFirstItemIndex(FIRST_INDEX_BASE);
     setHasMoreEarlier(false);
     setLoadingEarlier(false);
-    // 切 task 换载对应草稿（hook 的初值只在 mount 时读一次、详情页内导航不重挂）
-    setDraft(loadDraft("reply", task.id));
+    // 切 task 换载对应输入：正文草稿 + 图/路径快照一起回来（restore 内部先读后装，
+    // 不会像老的两段式那样把空串写回存储抹掉目标草稿）
+    restoreDraft();
     // 重开初始定位闸；跟随态**不在这里**改——它跟初始定位是同一个决定，
     // 统一由下面的渲染期 latch 出（effect 跑在渲染之后，在这里置 true 会把
     // 同一帧刚按锚点恢复出来的「非贴底」冲掉）
@@ -1129,7 +1130,7 @@ const EventStreamImpl = ({
     if (root) root.classList.add("hidden");
     const textEl = stickyTextRef.current;
     if (textEl) textEl.textContent = "";
-  }, [task.id, setDraft]);
+  }, [task.id, restoreDraft]);
   // eventsTruncated 就绪（refresh / SSE bootstrap 都可能晚于 mount）时同步分页开关（升降都跟）；
   // 已经拉过页就不再被它改（本地分页状态才是准的）
   useEffect(() => {

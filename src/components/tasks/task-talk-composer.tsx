@@ -36,7 +36,6 @@ import {
   talkForceModel,
 } from "@/lib/task-model";
 import { getPendingQuestionSend, submitTaskQuestion } from "@/lib/task-store";
-import { loadDraft } from "@/lib/view-memory";
 import type { ModelSelection, Task } from "@/lib/types";
 import {
   clearTalkOverride,
@@ -106,9 +105,12 @@ export const TaskTalkComposer = ({
   };
   // 会话归属签名：action 链（currentActionId + 每个 action 的模型指纹）+ 提供方。
   // 单纯问答只加 events，签名不变；新推进 / 唤醒改模型 / 切提供方（清锚点）签名必变。
+  // 拼之前按 n 排序：签名只跟内容有关、跟服务端返回顺序无关（防乱序误清覆盖）。
+  // n 缺失按 0、同 n 按 id 二次比较——排序永不退化成输入顺序。
   const actionSig = useMemo(
     () =>
-      `${task.provider ?? ""}|${task.sessionAgentId ?? ""}|${task.currentActionId ?? ""}|${task.actions
+      `${task.provider ?? ""}|${task.sessionAgentId ?? ""}|${task.currentActionId ?? ""}|${[...task.actions]
+        .sort((a, b) => (a.n ?? 0) - (b.n ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
         .map(
           (a) =>
             `${a.id}:${a.n}:${modelSelectionKey(a.agentModel)}`,
@@ -145,17 +147,13 @@ export const TaskTalkComposer = ({
     }
   }, [models.length, fetchModels, task]);
 
-  // 切 task 时整条输入态重置再换载对应草稿（详情页在不同任务间导航时组件可能不重挂）。
-  // 必须 reset() 全清、不能只清路径附件：贴好的截图 / 已引用的 skill 会跟着串到下一个
-  // 任务的会话里（用户在 A 任务贴图没发就切走、回头在 B 任务发送就把 A 的图发过去了）
-  const setDraft = rich.setValue;
-  const resetInput = rich.reset;
+  // 切 task 时整条输入态换载对应任务的持久化（详情页在不同任务间导航时组件可能不重挂）。
+  // restore() 读回正文草稿 + 图/路径快照：各任务的输入互不串（key 按 task 隔离），
+  // 切走的任务的内容留在快照里、切回来还在；只有发送成功才真正清空（rich.reset）。
+  const restoreDraft = rich.restore;
   useEffect(() => {
-    // 先读后清：reset() 会把空串写回草稿存储，读晚了就把目标任务的草稿抹掉了
-    const draft = loadDraft("talk", task.id);
-    resetInput();
-    setDraft(draft);
-  }, [task.id, setDraft, resetInput]);
+    restoreDraft();
+  }, [task.id, restoreDraft]);
 
   // 跨挂载认领：在飞的发送不随卸载取消（fetch 继续跑、回调闭包留在旧实例）。
   // 回来后重新挂上回调：显示 submitting + 落 onTaskUpdate；草稿里还是原文

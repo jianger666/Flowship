@@ -30,6 +30,8 @@ import { UpdateBadge } from "@/components/update-badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useAppMode, type AppMode } from "@/hooks/use-app-mode";
+import { useTaskList } from "@/hooks/use-task-list";
+import { getLastWorkId, getLastWorkKind } from "@/lib/view-memory";
 import {
   syncTitleBarOverlayTheme,
   type TitleBarOverlayTheme,
@@ -60,13 +62,15 @@ interface AppHeaderProps {
 
 /**
  * 胶囊双模式切换（v1.0 界面重构核心）：顶栏居中、点段切模式——
- * 工作台 → `/`（飞书看板 + task 类任务）、对话 → `/chats`（chat 类任务落点）。
+ * 工作台 → 上次视图（任务 / 甘特，有记忆时）/ `/`（无记忆兜底）、对话 → `/chats`。
  * 当前模式由 URL 推导（useAppMode）、不是本地 state——刷新 / 直开链接不漂移。
  * 中性页（设置 / 能力页）两段都不高亮（用户点名「设置页里为啥工作台 active」）。
  */
 const ModeSwitch = ({ mode }: { mode: AppMode | null }) => {
   const router = useRouter();
   const pathname = usePathname();
+  // 校验「上次任务」是否还有效（被删 / 归档就别跳、回甘特）——侧栏本来就订着这份列表
+  const { tasks, loaded } = useTaskList();
   const segments: Array<{ key: AppMode; label: string; icon: React.ReactNode; href: string }> = [
     { key: "work", label: "工作台", icon: <LayoutDashboard className="size-4" />, href: "/" },
     { key: "chat", label: "对话", icon: <MessageSquare className="size-4" />, href: "/chats" },
@@ -85,7 +89,7 @@ const ModeSwitch = ({ mode }: { mode: AppMode | null }) => {
             role="tab"
             aria-selected={active}
             onClick={() => {
-              // 工作台：模式含任务详情，但「家」是甘特——已高亮再点一次仍回 `/`
+              // 工作台：已在工作台模式里再点一次 = 回甘特「家」
               // （用户实测：详情里点工作台期望回看板，旧 guard 直接吞掉点击）
               if (active && s.key === "work") {
                 if (pathname !== "/") router.push("/");
@@ -93,6 +97,27 @@ const ModeSwitch = ({ mode }: { mode: AppMode | null }) => {
               }
               // 对话：再点会 /chats → Loading → replace 回同一详情，整页闪一下，保持 no-op
               if (active) return;
+              // 从对话 / 中性页切回工作台：恢复上次离开时的视图（跟对话模式对称、
+              // 用户拍板「在任务就回任务、在甘特就回甘特」）；没记忆 / 任务被删 / 已归档才回 `/`
+              if (s.key === "work") {
+                if (getLastWorkKind() === "task") {
+                  const lastId = getLastWorkId();
+                  if (lastId) {
+                    if (!loaded) {
+                      // 列表还没回来先信记忆、详情页自己会兜底（无效 id 显示空态回工作台）
+                      router.push(`/tasks/${lastId}`);
+                      return;
+                    }
+                    const t = tasks.find((x) => x.id === lastId);
+                    if (t && !t.archived && (t.mode ?? "task") === "task") {
+                      router.push(`/tasks/${lastId}`);
+                      return;
+                    }
+                  }
+                }
+                router.push("/");
+                return;
+              }
               router.push(s.href);
             }}
             className={cn(

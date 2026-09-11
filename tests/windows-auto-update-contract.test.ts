@@ -33,11 +33,13 @@ describe("Windows 自动更新安装器不会被 Flowship 自己杀掉", () => {
     },
   );
 
-  it("自更新装完强制重建桌面 / 开始菜单快捷方式", () => {
+  it("自更新装完强制重建桌面 / 开始菜单快捷方式（文件没落地时不乱指）", () => {
     const body = macroBody("customInstall");
     expect(body).toContain("${if} ${isUpdated}");
     expect(body).toContain('CreateShortCut "$newDesktopLink" "$appExe"');
     expect(body).toContain('CreateShortCut "$newStartMenuLink" "$appExe"');
+    // v1.9.13：$appExe 不存在时跳过重建（半截安装不把快捷方式指向空路径）
+    expect(body).toContain('${if} ${FileExists} "$appExe"');
   });
 
   it("仍以静默安装并强制拉起新版本，退出时按 server PID 精确清理；退出不再自动装", () => {
@@ -67,5 +69,23 @@ describe("Windows 自定义安装目录（E 盘含空格）静默更新不删完
     expect(kill).toBeGreaterThan(dequote);
     expect(body).toContain("StrCpy $INSTDIR $INSTDIR");
     expect(body).toContain("$INSTDIR");
+  });
+});
+
+describe("Windows 静默更新 Temp 兜底（v1.9.13、D 盘用户更新完人没了）", () => {
+  it("主进程拒绝往 Temp/old-install 里装：先验目录、拒绝时不置 quitting", () => {
+    expect(main).toContain("isUnsafeWinInstallDir");
+    expect(main).toContain("拒绝静默更新");
+    // 拒绝路径走手动下载，不进 quitAndInstall；放行后才 quitting=true
+    const guard = main.indexOf("isUnsafeWinInstallDir(resolved.dir)");
+    const quitting = main.indexOf("quitting = true", guard);
+    const install = main.indexOf("quitAndInstall(true, true)", guard);
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(quitting).toBeGreaterThan(guard);
+    expect(install).toBeGreaterThan(quitting);
+  });
+
+  it("静默安装前发系统通知打预防针（黑屏几分钟别杀进程）", () => {
+    expect(main).toContain("正在安装更新");
   });
 });

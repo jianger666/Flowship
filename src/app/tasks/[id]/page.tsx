@@ -26,6 +26,7 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
+  ChevronLeft,
   Flag,
   Loader2,
   Pencil,
@@ -110,7 +111,7 @@ import {
   getRepoShortNames,
   getUniqueRepoDirNames,
 } from "@/lib/path-utils";
-import { markTaskSeen, rememberLastChat } from "@/lib/view-memory";
+import { markTaskSeen, rememberLastChat, rememberLastWork } from "@/lib/view-memory";
 import type {
   ActionRecord,
   ActionType,
@@ -277,9 +278,12 @@ const TaskDetailPage = () => {
     task?.actions.length,
   ]);
 
-  // 记住「最后浏览的对话」（v1.1.x）：胶囊切回「对话」时 /chats 优先落它、不是最近活跃那条
+  // 记住「最后浏览的对话 / 工作台任务」（v1.1.x）：胶囊切回对应模式时优先落它
+  // 对话 → /chats 落最后对话；工作台 → 胶囊落最后任务、而不是每次都回甘特
   useEffect(() => {
-    if (task?.mode === "chat") rememberLastChat(task.id);
+    if (!task?.id) return;
+    if (task.mode === "chat") rememberLastChat(task.id);
+    else rememberLastWork(task.id);
   }, [task?.id, task?.mode]);
 
   // 已读上报（v1.1.x「待确认」已读即清）：正在看这个任务 = 交卷动静都算已读、
@@ -784,7 +788,22 @@ const TaskDetailPage = () => {
             <div className="min-w-0">
               {/* min-w-0：让 h1 的 truncate 真正生效——否则长标题撑满、把后面的状态
                   badge（已带 shrink-0）挤到溢出 / 换行。标题省略、状态 badge 始终同一行。 */}
-              <div className="flex min-w-0 items-center gap-2">
+              <div className="flex min-w-0 items-center gap-1.5">
+                {/* 面包屑返回：工作台 / 标题——跟 workitems 预览页同语义、零高度成本；
+                    胶囊再点一次回甘特留着当老手快捷键 */}
+                <Tooltip content="回工作台">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => router.push("/")}
+                    aria-label="回工作台"
+                    className="shrink-0 gap-0.5 px-1.5 text-muted-foreground hover:text-foreground"
+                  >
+                    <ChevronLeft className="size-4" />
+                    返回
+                  </Button>
+                </Tooltip>
+                <span className="shrink-0 text-muted-foreground/50">/</span>
                 {/* 详情页顶栏标题档：与 chat 详情页（chat-view）同一规格、见 ui-conventions */}
                 <h1 className="min-w-0 truncate text-sm font-medium tracking-tight">
                   {task.title}

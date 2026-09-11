@@ -181,18 +181,26 @@ export interface ProviderSwitchTaskLike {
   actions?: Array<{ id: string; status: string }>;
 }
 
-/** 当前步骤是否占着会话（running/awaiting_ack 都算活，error/completed/cancelled 算终）。 */
-const hasLiveAction = (task: ProviderSwitchTaskLike): boolean => {
+/** 当前步骤是否真在跑（只有 running 算活）。
+ *
+ * 注意 awaiting_ack 不算活：去掉手动「通过」按钮后、action 会在 awaiting_ack
+ * 停留到下次推进（推进时隐式认可），run 早已结束、没有活会话——此时锁死会导致
+ * task 模式几乎永远切不了提供方（v1.9.14 用户实测）。切的安全由三处兜底：
+ * setTaskProvider 清 sessionAgentId 锚点、复用时提供方对不上强制 fresh、
+ * 交卷后流式尾巴由 runStatus=running + 详情页 runActive latch + 后端复判覆盖。
+ */
+const hasRunningAction = (task: ProviderSwitchTaskLike): boolean => {
   const cur = (task.actions ?? []).find((a) => a.id === task.currentActionId);
-  return cur?.status === "running" || cur?.status === "awaiting_ack";
+  return cur?.status === "running";
 };
 
 /**
- * 提供方能不能再切（V2a：chat 空闲可切；task 空闲可切、running/活步骤/终态锁）。
+ * 提供方能不能再切（V2a：chat 空闲可切；task 空闲可切、running/终态锁）。
  * - chat：runStatus running → 锁；其余放行（有锚点也行，切时清锚点、下轮 create）。
  * - task：runStatus running → 锁；repoStatus merged/abandoned → 锁；
- *   当前 action 为 running/awaiting_ack → 锁（注意这是 action 状态、不是 runStatus）；
- *   runStatus idle/awaiting_user/error + 无活步骤 → 放行（error 正是换家重试的场景）。
+ *   当前 action 为 running → 锁（注意这是 action 状态、不是 runStatus）；
+ *   awaiting_ack 不锁（run 已结束、等的是人审阅不是 agent 干活，见 hasRunningAction）；
+ *   runStatus idle/awaiting_user/error + 无运行中步骤 → 放行（error 正是换家重试的场景）。
  * 不做原生 resume、不做自动故障转移，切即丢精细上下文。
  */
 export const isProviderSwitchLocked = (task: ProviderSwitchTaskLike): boolean => {
@@ -201,7 +209,7 @@ export const isProviderSwitchLocked = (task: ProviderSwitchTaskLike): boolean =>
   if (task.mode === "chat") return false;
   if (task.repoStatus === "merged" || task.repoStatus === "abandoned")
     return true;
-  if (hasLiveAction(task)) return true;
+  if (hasRunningAction(task)) return true;
   return false;
 };
 

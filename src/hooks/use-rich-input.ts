@@ -13,6 +13,10 @@
  *   <RichInput {...rich.bind} onSubmit={...} placeholder={...} />
  *   提交：const { text, images, attachments, skillRefs } = rich.payload();
  *   成功后：rich.reset();
+ *   切任务不重挂时：rich.restore()（读回正文草稿 + 附件快照）。
+ *
+ * 持久化规则：有 draft = 常驻输入位，正文进 sessionStorage、图/路径进内存快照，
+ * 切页/切任务回来全在；无 draft = 弹窗类，关掉就没、不留任何东西。
  *
  * `@` 引用 / ↑ 历史不在本 hook——它们读 ComposerSessionProvider（调用方注入 task 上下文）。
  */
@@ -24,6 +28,7 @@ import { useSlashSkills, type SlashSkillsApi } from "@/components/slash-skills";
 import type { ComposerFocusHandle } from "@/components/rich-input";
 import {
   useImageAttach,
+  snapshotImagesToPending,
   type UseImageAttachReturn,
 } from "@/hooks/use-image-attach";
 import { usePathAttach, type UsePathAttachReturn } from "@/hooks/use-path-attach";
@@ -32,7 +37,13 @@ import {
   buildRichInputPayload,
   type RichInputPayload,
 } from "@/lib/rich-input-payload";
-import { loadDraft, saveDraft, type DraftScope } from "@/lib/view-memory";
+import {
+  clearAttachmentSnapshot,
+  loadAttachmentSnapshot,
+  loadDraft,
+  saveDraft,
+  type DraftScope,
+} from "@/lib/view-memory";
 
 export type { RichInputPayload };
 
@@ -77,6 +88,12 @@ export interface UseRichInputReturn {
   payload: () => RichInputPayload;
   /** 提交成功 / 切上下文时清空（草稿、图、路径、slash 菜单态） */
   reset: () => void;
+  /**
+   * 从持久化恢复（正文草稿 + 附件快照）：切任务不重挂时由调用方 effect 调，
+   * 代替「reset 再 setDraft」的两段式（后者会先把空串写回存储、有抹掉目标草稿的窗口）。
+   * 无 draft 选项时是空操作。
+   */
+  restore: () => void;
   /** 直接摊给 <RichInput> / <ConversationComposer> 的输入侧 props */
   bind: {
     value: string;
@@ -105,15 +122,21 @@ export const useRichInput = (
   } = options;
   const draftScope = draft?.scope;
   const draftId = draft?.id;
+  // 附件快照 key：跟正文草稿同 key（scope + task），无 draft = 弹窗类、不持久化
+  const persist = useMemo(
+    () =>
+      draftScope && draftId ? { scope: draftScope, id: draftId } : null,
+    [draftScope, draftId],
+  );
 
   // 正文草稿（有 draft 选项时从 sessionStorage 复原）
   const [value, setValueState] = useState(() =>
     draftScope && draftId ? loadDraft(draftScope, draftId) : "",
   );
-  // 图附件（粘贴 / 拖拽 / 按钮）
-  const attach = useImageAttach({ disabled, maxImages });
-  // 文件 / 目录路径附件（原生 picker + 粘贴长文本落盘）
-  const pathAttach = usePathAttach();
+  // 图附件（粘贴 / 拖拽 / 按钮）；有 persist 时切页/切任务不丢
+  const attach = useImageAttach({ disabled, maxImages, persist });
+  // 文件 / 目录路径附件（原生 picker + 粘贴长文本落盘）；同上
+  const pathAttach = usePathAttach({ persist });
   // 编辑器聚焦句柄（自动聚焦 / slash 补全后回落光标）
   const focusRef = useRef<ComposerFocusHandle | null>(null);
   // value 的同步镜像：updater 形式要读「最新值」、又不能把 saveDraft 副作用塞进 setState updater
@@ -174,12 +197,49 @@ export const useRichInput = (
   const attachReset = attach.reset;
   const pathReset = pathAttach.reset;
   const slashReset = slash.reset;
+  const attachReplace = attach.replaceAll;
+  const pathReplace = pathAttach.replaceAll;
   const reset = useCallback(() => {
     setValue("");
     attachReset();
     pathReset();
     slashReset();
-  }, [setValue, attachReset, pathReset, slashReset]);
+    // 发送成功才清快照：切任务/切页走 restore()、快照要留着回来用
+    if (persist) clearAttachmentSnapshot(persist.scope, persist.id);
+  }, [setValue, attachReset, pathReset, slashReset, persist]);
+
+  // 从持久化恢复全文（正文 + 图 + 路径）：切任务不重挂、mount 初值读不到新任务时调。
+  // 跟 reset 的区别：不清快照、只读出来装回去；正文直接设 state（值本来就来自存储、
+  // 不走 setValue，避免多余的写回）。引用稳定、可进调用方 effect 依赖。
+  // 0 写恢复：快照已提前读出来，reset/replace 全传 skipPersist、只动 UI state——
+  // 不碰 Map、不污染 LRU、不建空条目（空即删是第二道防线）。读必须在清之前，
+  // reset 默认会写穿空快照（先读后清的顺序不能反）。
+  const restore = useCallback(() => {
+    if (!draftScope || !draftId) return;
+    const text = loadDraft(draftScope, draftId);
+    const snap = loadAttachmentSnapshot(draftScope, draftId);
+    attachReset({ skipPersist: true });
+    pathReset({ skipPersist: true });
+    slashReset();
+    valueRef.current = text;
+    setValueState(text);
+    if (snap) {
+      if (snap.images.length > 0) {
+        attachReplace(snapshotImagesToPending(snap.images), {
+          skipPersist: true,
+        });
+      }
+      if (snap.paths.length > 0) pathReplace([...snap.paths], { skipPersist: true });
+    }
+  }, [
+    draftScope,
+    draftId,
+    attachReset,
+    pathReset,
+    slashReset,
+    attachReplace,
+    pathReplace,
+  ]);
 
   const pickPaths = pathAttach.pickPaths;
   const addPastedText = pathAttach.addPastedText;
@@ -236,6 +296,7 @@ export const useRichInput = (
     pathAttach,
     payload,
     reset,
+    restore,
     bind,
   };
 };

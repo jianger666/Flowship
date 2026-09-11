@@ -5,7 +5,8 @@
  * - sessionStorage：最后浏览的对话 / 输入草稿 / 看板时间范围——重启 app 即忘（符合预期、
  *   不产生陈旧状态）；Electron 单窗口、session 生命周期 = app 生命周期
  * - localStorage：输入条拖过的高度 / 侧栏分组折叠与置顶序——用户的全局偏好、跨重启保留
- * - 模块级内存 Map：事件流滚动锚点——SPA 路由切换组件会卸载、但模块常驻；reload 即忘无妨
+ * - 模块级内存 Map：事件流滚动锚点 / 输入条附件快照（图 File 对象不可序列化、也不进配额）——
+ *   SPA 路由切换组件会卸载、但模块常驻；reload 即忘无妨
  */
 
 // SSR / 存储被禁时兜底 null（客户端组件在 server 也会跑一遍首渲）
@@ -30,6 +31,46 @@ export const rememberLastChat = (taskId: string) => {
 export const getLastChatId = (): string | null =>
   ss()?.getItem(LAST_CHAT_KEY) ?? null;
 
+// ---------- 最后浏览的工作台视图（胶囊切回「工作台」时恢复它：任务 or 甘特） ----------
+
+const LAST_WORK_KEY = "flowship:last-work-id";
+const LAST_WORK_KIND_KEY = "flowship:last-work-kind";
+
+/** 记住「最后浏览的工作台任务」task id；切到对话再切回时按 kind 决定回任务还是甘特 */
+export const rememberLastWork = (taskId: string) => {
+  const s = ss();
+  if (!s) return;
+  s.setItem(LAST_WORK_KEY, taskId);
+  s.setItem(LAST_WORK_KIND_KEY, "task");
+};
+
+/** 记住「最后停在甘特」；切到对话再切回时回到甘特、而不是被拽到老任务 */
+export const rememberWorkBoard = () => {
+  ss()?.setItem(LAST_WORK_KIND_KEY, "board");
+};
+
+/** 读回最后浏览的工作台任务 task id；没记过或存储不可用返回 null */
+export const getLastWorkId = (): string | null =>
+  ss()?.getItem(LAST_WORK_KEY) ?? null;
+
+/** 读回上次离开工作台时是在任务还是甘特；没记过返回 null（首进按甘特） */
+export const getLastWorkKind = (): "board" | "task" | null => {
+  const v = ss()?.getItem(LAST_WORK_KIND_KEY);
+  return v === "board" || v === "task" ? v : null;
+};
+
+/**
+ * 清掉工作台任务记忆、退回看板（删任务时调）。
+ * 不清的话：下次点工作台胶囊、`loaded=false` 会乐观跳到已删 id，
+ * 详情页闪一下空态才回甘特——多余的一跳。
+ */
+export const clearLastWork = () => {
+  const s = ss();
+  if (!s) return;
+  s.removeItem(LAST_WORK_KEY);
+  s.setItem(LAST_WORK_KIND_KEY, "board");
+};
+
 // ---------- 输入草稿（按 task 记、发送后清；打了半段切页不丢） ----------
 
 // scope 区分同一 task 的多个输入位（chat 事件流输入岛 / 任务「跟 AI 说」条）
@@ -49,6 +90,121 @@ export const saveDraft = (scope: DraftScope, taskId: string, text: string) => {
   if (!s) return;
   if (text) s.setItem(draftKey(scope, taskId), text);
   else s.removeItem(draftKey(scope, taskId));
+};
+
+// ---------- 输入条附件快照（图 + 路径、切页/切任务不丢） ----------
+//
+// 为什么不用 sessionStorage：图附件是 File / base64 dataUrl（单图 10MB、上限 6 张），
+// 序列化进 storage 必爆 5MB 配额；File 对象根本不可序列化。模块级内存 Map 跟
+// 滚动锚点同策略：SPA 切页组件卸载但模块常驻、回来照样在；reload 即忘（正文不受影响、
+// 仍走上面的 sessionStorage）。key 按 scope + task 隔离——A 任务的图绝不串进 B。
+
+export interface SnapshotImage {
+  id: string;
+  // 只存裸 base64 + mime：dataUrl 用时现拼（`data:${mime};base64,${data}`），
+  // 不存双份——6 张×10MB×20 快照的最坏内存直接翻倍（v1.9.13 review P0）。
+  data: string;
+  mimeType: string;
+  filename: string;
+}
+
+export interface ComposerAttachmentSnapshot {
+  images: SnapshotImage[];
+  paths: string[];
+}
+
+// 防无限膨胀：个数 + 字节双 cap（base64 按字符≈字节估，路径同理）。
+// 20 个是“切页/切任务记一个”的经验值；100MB 兜底病态大图（6 张×10MB 全满也只占一小半）。
+const ATTACH_SNAP_COUNT_CAP = 20;
+let attachSnapBytesCap = 100 * 1024 * 1024;
+
+// key = 输入位：key 里已有 scope + taskId，不再另拼前缀
+const attachmentSnapshots = new Map<string, ComposerAttachmentSnapshot>();
+
+const attachSnapKey = (scope: DraftScope, id: string): string =>
+  `${scope}:${id}`;
+
+const attachmentSnapBytes = (snap: ComposerAttachmentSnapshot): number =>
+  snap.images.reduce((n, im) => n + im.data.length, 0) +
+  snap.paths.reduce((n, p) => n + p.length, 0);
+
+/** 测试专用：调字节 cap（默认 100MB，单测里调小验淘汰逻辑） */
+export const __setAttachmentSnapBytesCapForTests = (bytes: number): void => {
+  attachSnapBytesCap = bytes;
+};
+
+// 淘汰最老的，直到个数/字节都达标；protectKey（刚写入的）永远不被挤掉
+// （单条超 cap 的极端情况就留着它、不死循环）
+const evictAttachmentSnapshots = (protectKey: string): void => {
+  const totalBytes = (): number => {
+    let n = 0;
+    for (const snap of attachmentSnapshots.values()) n += attachmentSnapBytes(snap);
+    return n;
+  };
+  while (attachmentSnapshots.size > ATTACH_SNAP_COUNT_CAP) {
+    const oldest = attachmentSnapshots.keys().next().value;
+    if (oldest === undefined || oldest === protectKey) break;
+    attachmentSnapshots.delete(oldest);
+  }
+  while (totalBytes() > attachSnapBytesCap) {
+    const oldest = attachmentSnapshots.keys().next().value;
+    if (oldest === undefined || oldest === protectKey) break;
+    attachmentSnapshots.delete(oldest);
+  }
+};
+
+/**
+ * 原子更新附件快照（图和路径两边都走它，不要各自 load+save）。
+ *
+ * 背景：addFiles 读文件（async）和 picker 选路径（~1s）都会跨 await，
+ * 两边各读一份旧值再全量 save，后写的会把先写的吃掉。这里 updater 在同步临界区里
+ * 跑（单线程、无 await 可插队），天然原子。
+ *
+ * 空即删：updater 返回空快照（图和路径都没了）时直接删条目、不存空占位——
+ * 否则 restore() 每次切任务都会给无附件的任务建空条目，连逛 20 个空任务就把
+ * 有图的挤出 cap；删到最后一张/一条同理。rich.reset 照常调 clear，不受影响。
+ */
+export const updateAttachmentSnapshot = (
+  scope: DraftScope,
+  id: string,
+  updater: (
+    prev: ComposerAttachmentSnapshot | undefined,
+  ) => ComposerAttachmentSnapshot,
+): void => {
+  const key = attachSnapKey(scope, id);
+  const next = updater(attachmentSnapshots.get(key));
+  if (next.images.length === 0 && next.paths.length === 0) {
+    attachmentSnapshots.delete(key);
+    return;
+  }
+  // 删了重插 = 顶到最新（LRU 语义：刚动过的最后被淘汰）
+  attachmentSnapshots.delete(key);
+  attachmentSnapshots.set(key, next);
+  evictAttachmentSnapshots(key);
+};
+
+/** 存输入条附件快照（每次增删图/路径都直写；发送成功后由调用方 clear） */
+export const saveAttachmentSnapshot = (
+  scope: DraftScope,
+  id: string,
+  snap: ComposerAttachmentSnapshot,
+): void => {
+  updateAttachmentSnapshot(scope, id, () => snap);
+};
+
+/** 读输入条附件快照；没记过返回 undefined */
+export const loadAttachmentSnapshot = (
+  scope: DraftScope,
+  id: string,
+): ComposerAttachmentSnapshot | undefined =>
+  attachmentSnapshots.get(attachSnapKey(scope, id));
+
+/** 清输入条附件快照（发送成功后调；切任务/切页不调——回来还要） */
+export const clearAttachmentSnapshot = (
+  scope: DraftScope,
+  id: string,
+): void => {
+  attachmentSnapshots.delete(attachSnapKey(scope, id));
 };
 
 // ---------- 事件流滚动锚点（离开时视口顶部的事件 id；贴底则回来照常落底） ----------

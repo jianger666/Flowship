@@ -127,7 +127,7 @@ describe("isProviderSwitchLocked", () => {
     ).toBe(true);
   });
 
-  it("task 空闲可切（含 error 重试）、running/活步骤/终态锁", () => {
+  it("task 空闲可切（含 error 重试、awaiting_ack 审阅态）、running/终态锁", () => {
     // idle 无步骤 → 放行
     expect(
       isProviderSwitchLocked({ mode: "task", runStatus: "idle" }),
@@ -163,7 +163,9 @@ describe("isProviderSwitchLocked", () => {
         actions: [{ id: "a1", status: "running" }],
       }),
     ).toBe(true);
-    // action awaiting_ack → 锁
+    // action awaiting_ack → 放行（run 已结束、等的是人审阅；去掉「通过」按钮后
+    // action 会在此停留到下次推进，再锁就永远切不了。交卷后流式尾巴由 runStatus /
+    // runActive 覆盖，不靠这个锁）
     expect(
       isProviderSwitchLocked({
         mode: "task",
@@ -171,7 +173,7 @@ describe("isProviderSwitchLocked", () => {
         currentActionId: "a1",
         actions: [{ id: "a1", status: "awaiting_ack" }],
       }),
-    ).toBe(true);
+    ).toBe(false);
     // 终态任务 → 锁
     expect(
       isProviderSwitchLocked({ mode: "task", repoStatus: "merged" }),

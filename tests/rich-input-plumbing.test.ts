@@ -233,4 +233,20 @@ describe("useRichInput.reset 完整性（源码契约）", () => {
     expect(body).toContain("pathReset()");
     expect(body).toContain("slashReset()");
   });
+
+  it("restore 是 0 写恢复：先读后清、reset/replace 全走 skipPersist", () => {
+    const body = source.slice(source.indexOf("const restore = useCallback"));
+    // 先读（loadDraft/loadAttachmentSnapshot）再清（attachReset/pathReset）——顺序反了会抹快照
+    const readAt = Math.min(
+      body.indexOf("loadDraft("),
+      body.indexOf("loadAttachmentSnapshot("),
+    );
+    const clearAt = body.indexOf("attachReset({");
+    expect(readAt).toBeGreaterThanOrEqual(0);
+    expect(clearAt).toBeGreaterThan(readAt);
+    // 四个调用全带 skipPersist：只动 UI state、不碰 Map、不污染 LRU
+    expect(body).toContain("attachReset({ skipPersist: true })");
+    expect(body).toContain("pathReset({ skipPersist: true })");
+    expect(body).toContain("skipPersist: true,");
+  });
 });

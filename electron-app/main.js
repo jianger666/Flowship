@@ -43,7 +43,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 // Windows 自定义安装目录静默更新保护（E 盘含空格路径坑）：/D= 不能带引号，
 // 含空格时优先用 8.3 短路径，详见 ./win-install-dir.mjs
-import { resolveWinInstallDirForUpdater } from "./win-install-dir.mjs";
+import { resolveWinInstallDirForUpdater, isUnsafeWinInstallDir } from "./win-install-dir.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -1724,11 +1724,9 @@ let winAutoUpdater = null;
 // 时不传会弹完整安装向导、与「点了立即更新」预期不符）、isForceRunAfter=true 装完自动拉起。
 // server 清理不在这做：quitAndInstall 内部走 app.quit() → before-quit 已同步 taskkill /T
 // 连树杀（蓝军 P0：若在这提前杀、quitAndInstall 失败不退出时 app 就成了没后端的僵尸）。
-const installWinUpdate = (version) => {
+const installWinUpdate = async (version) => {
   if (!winAutoUpdater) return;
   if (updateState.phase === "installing") return;
-  quitting = true;
-  setUpdateState({ phase: "installing", version, error: null });
   // /D= 钉成当前安装目录，避免卸在 A、装到 B 导致快捷方式悬空。
   // E 盘坑：路径含空格时 Node spawn 会自动给 /D= 加引号，而 NSIS 的 GetDParameter
   // 不去引号 → $INSTDIR 非法 → 旧目录已被 RMDir、新文件装不上。这里优先用 8.3 短路径
@@ -1737,7 +1735,46 @@ const installWinUpdate = (version) => {
   log(
     `[updater] win 安装目录 raw=${resolved.raw} dir=${resolved.dir} viaShort=${resolved.viaShort}`,
   );
+  // Temp 兜底（v1.9.13）：当前进程在 NSIS 备份里跑（上次失败残留、Temp 里直接点的 exe）
+  // 时静默更新会往 Temp 里装、Temp 一清人就没了——此时绝不 quitAndInstall，
+  // 让用户手动重装（注意：quitting 必须在放行后才置位，否则拒绝后 app 成僵尸）。
+  // 同理：目录里连当前 exe 都没有（上次失败已被清空），也拒绝，避免叠加破坏。
+  const unsafeReason = isUnsafeWinInstallDir(resolved.dir);
+  const exeExists = (() => {
+    try {
+      return existsSync(path.join(resolved.dir, path.basename(process.execPath)));
+    } catch {
+      return false;
+    }
+  })();
+  if (unsafeReason || !exeExists) {
+    const reason = unsafeReason || "安装目录里找不到当前程序（可能上次更新已清空目录）";
+    log(`[updater] win 拒绝静默更新：${reason} dir=${resolved.dir}`);
+    setUpdateState({ phase: "available", version, error: reason });
+    dialog.showErrorBox(
+      "自动更新失败",
+      `${reason}。\n\n已取消本次自动更新，避免损坏你的安装。今晚去发布页手动下载安装包、重装到原目录即可（数据不受影响）。`,
+    );
+    void shell.openExternal(RELEASE_LATEST_URL);
+    return;
+  }
+  // 静默装要黑屏好几分钟（1.5 万散文件逐个落盘），先给个系统通知打预防针、
+  // 否则用户以为卡死去杀进程，正好杀在“旧的已搬走、新的没写完”中间（D 盘用户翻车实录）。
+  // 发完等 1.5s 再 quit：Windows Toast 是系统托管、quit 后还在 Action Center，
+  // 但发完立刻退、快机器上 Toast 可能根本来不及渲染出来。
+  try {
+    new Notification({
+      title: `正在安装更新 v${version}`,
+      body: "后台静默安装约需几分钟（文件较多），请勿手动结束进程，装完会自动重启。",
+      ...(process.platform === "win32" ? { icon: resolveNotifyIcon() } : {}),
+    }).show();
+  } catch {
+    // 通知发不出不挡更新
+  }
+  quitting = true;
+  setUpdateState({ phase: "installing", version, error: null });
   winAutoUpdater.installDirectory = resolved.dir;
+  await sleep(1500);
   winAutoUpdater.quitAndInstall(true, true);
 };
 

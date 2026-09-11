@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   getWinShortPathSync,
+  isUnsafeWinInstallDir,
   normalizeWinInstallDir,
   resolveWinInstallDirForUpdater,
 } from "../electron-app/win-install-dir.mjs";
@@ -93,5 +94,60 @@ describe("resolveWinInstallDirForUpdater", () => {
     );
     expect(r.dir).toBe("E:\\My Apps\\Flowship");
     expect(r.viaShort).toBe(false);
+  });
+});
+
+describe("isUnsafeWinInstallDir", () => {
+  const TMP = "C:\\Users\\wukong123\\AppData\\Local\\Temp";
+
+  it("正常自定义目录放行（D 盘无空格也不误杀）", () => {
+    expect(isUnsafeWinInstallDir("D:\\dev\\Flowship", "win32", TMP)).toBeNull();
+    expect(isUnsafeWinInstallDir("E:\\My Apps\\Flowship", "win32", TMP)).toBeNull();
+    expect(isUnsafeWinInstallDir("C:\\Users\\a\\AppData\\Local\\Flowship", "win32", TMP)).toBeNull();
+  });
+
+  it("Temp 下的 NSIS 备份目录拒绝（用户翻车实录：nsrDC26.tmp\\old-install）", () => {
+    expect(
+      isUnsafeWinInstallDir(`${TMP}\\nsrDC26.tmp\\old-install`, "win32", TMP),
+    ).not.toBeNull();
+    expect(
+      isUnsafeWinInstallDir(`${TMP}\\nsrDC26.tmp\\old-install\\Flowship.exe`, "win32", TMP),
+    ).not.toBeNull();
+  });
+
+  it("大小写/斜杠混用也拦得住", () => {
+    expect(
+      isUnsafeWinInstallDir("c:/users/wukong123/appdata/local/temp/NSA1B2.tmp/OLD-INSTALL", "win32", TMP),
+    ).not.toBeNull();
+  });
+
+  it("用户正常目录不误杀（ns*.tmp 只在 Temp 下才算）", () => {
+    // nsutils 有 ns 前缀但不是 *.tmp 形态 → 放行
+    expect(
+      isUnsafeWinInstallDir("D:\\nsutils\\Flowship", "win32", TMP),
+    ).toBeNull();
+    // Temp 外的 ns*.tmp 是用户自己的正常目录（NSIS 临时目录一定在 %TEMP% 里）→ 放行；
+    // 之前保守照拦会误杀 D:\nsBackup.tmp 这类正常安装目录（review 指出正则根本区分不开）。
+    expect(
+      isUnsafeWinInstallDir("D:\\nsBackup.tmp\\Flowship", "win32", TMP),
+    ).toBeNull();
+    // Temp 下的 ns*.tmp（即使没有 old-install）→ 照拦
+    expect(
+      isUnsafeWinInstallDir(`${TMP}\\nsrDC26.tmp\\Flowship.exe`, "win32", TMP),
+    ).not.toBeNull();
+    // old-install 名字独特、全局拦（Temp 外也拦）
+    expect(
+      isUnsafeWinInstallDir("D:\\apps\\old-install\\Flowship", "win32", TMP),
+    ).not.toBeNull();
+  });
+
+  it("Temp 根目录本身也要拦（别只拦两层）", () => {
+    expect(isUnsafeWinInstallDir(TMP, "win32", TMP)).not.toBeNull();
+    expect(isUnsafeWinInstallDir(`${TMP}\\Flowship.exe`, "win32", TMP)).not.toBeNull();
+  });
+
+  it("空目录拒绝", () => {
+    expect(isUnsafeWinInstallDir("", "win32", TMP)).not.toBeNull();
+    expect(isUnsafeWinInstallDir("   ", "win32", TMP)).not.toBeNull();
   });
 });
