@@ -2,8 +2,9 @@
  * 旁路只读守卫（review P0 的回归护栏）：坏人用例必须被执行层拒绝。
  *
  * 钉三件事：
- * 1. 只读 shell 默认拒绝：rm / git / curl / ssh-exec / 写 SQL / 命令拼接 / 目录逃逸，
- *    只放 pg-exec SELECT（无 --config、SQL 独占引号参数）和本地查看命令（cwd 内）。
+ * 1. 只读 shell 默认拒绝：rm / git 写操作 / curl / ssh-exec / 跑脚本 / 写 SQL / 命令拼接 / 目录逃逸，
+ *    只放 pg-exec SELECT（无 --config、SQL 独占引号参数）、本地查看命令（cwd 内）和 git 只读动词
+ *   （status/log/diff/show/branch/rev-parse，看改动看分支；-C/--no-index/--output 等逃逸 flag 照拒）。
  * 2. 凭据文件读不到：read 读 company-env.json / config.json（数据目录）必须拒绝；
  *    shell 里 cat 它们同样拒绝；grep / glob 基址钳在工作目录（含本任务目录）内。
  * 3. 好人场景不断：SELECT、tail 日志、ls、cwd 内 read/grep 照常放行。
@@ -64,14 +65,21 @@ const execShell = async (command: string, workingDirectory?: string): Promise<st
 };
 
 describe("只读 shell：坏人用例一律拒绝", () => {
-  it("rm / git / curl / node 野脚本直接拒", () => {
+  it("rm / git 写操作 / curl / node 野脚本直接拒", () => {
     for (const cmd of [
       "rm -rf /",
       "rm ./hello.txt",
       "git push origin main",
-      "git log --oneline",
+      "git checkout main",
+      "git pull",
+      "git merge main",
+      "git -C /tmp status",
+      "git --git-dir=/tmp/x.git status",
+      "git diff --no-index /etc/passwd app.log",
+      "git log --output=/tmp/x.log --oneline",
       "curl http://example.com",
       "node evil.js",
+      "bash deploy.sh",
       "npm install foo",
     ]) {
       expect(check(cmd).ok, cmd).toBe(false);
@@ -141,6 +149,23 @@ describe("只读 shell：好人场景放行", () => {
     expect(check("cat hello.txt").ok).toBe(true);
     expect(check("grep -rn hello .").ok).toBe(true);
     expect(check("ls", ".").ok).toBe(true);
+  });
+
+  it("git 只读查看放行：status/log/diff/show/branch/rev-parse", () => {
+    for (const cmd of [
+      "git status --short",
+      "git log --oneline -5",
+      "git --no-pager log --oneline -5",
+      "git diff main...HEAD --stat",
+      "git show HEAD --stat",
+      "git branch -a",
+      "git rev-parse HEAD",
+    ]) {
+      expect(check(cmd).ok, cmd).toBe(true);
+    }
+    // 光杆 git / 非只读动词照拒
+    expect(check("git").ok).toBe(false);
+    expect(check("git stash").ok).toBe(false);
   });
 
   it("def 级 pwd 真跑通（守卫→全量实现链路不断）", async () => {

@@ -322,7 +322,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
   });
 
   // ─────────────────────────────────────────────────────────────
-  // 2. 旁路 prompt 与白名单口径一致（不要写东西，其他都可以做）
+  // 2. 旁路 prompt 与白名单口径一致（三条红线：不动代码、不动脚本、线上分支找属主，红线之外放行）
   // ─────────────────────────────────────────────────────────────
   it("prompt 只有提示词约束、一句“可以改”的措辞都不注入", async () => {
     const id = alloc();
@@ -337,11 +337,14 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     const prompt = bot.send.mock.calls[0]?.[0] as string;
     expect(prompt).toContain("答疑助手");
-    // 核心只有一句：不是属主就不要写东西
-    expect(prompt).toContain("不要写东西");
+    // 核心是三条红线：不动代码、不动脚本、线上分支相关先找属主确认
+    expect(prompt).toContain("不动代码");
+    expect(prompt).toContain("不动脚本");
+    expect(prompt).toContain("线上分支");
     expect(prompt).toContain("新建 / 修改 / 删除任何文件");
-    // 其他事情都可以做，但只读 shell 的真实能力：只读 SELECT，不调接口
-    expect(prompt).toContain("其他事情都可以做");
+    expect(prompt).toContain("pg-exec 除外");
+    // 红线之外放行，但只读 shell 的真实能力：只读 SELECT，不调接口
+    expect(prompt).toContain("红线之外都可以干");
     expect(prompt).toContain("只读 SELECT");
     expect(prompt).not.toContain("调接口");
     // 旁路不同步凭据文件：prompt 里不许出现凭据文件路径（脱敏声明无路径、无 --config）。
@@ -362,7 +365,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(prompt.slice(boundaryAt + 1)).not.toMatch(/\n# /);
 
     // 旁路 agent 执行层白名单 + 不挂系统 customTools（无 callerToken 就没有交卷 / 提 MR 身份）；
-    // 写操作提示词里再拦一道（不要写东西），两边口径一致。
+    // 红线提示词里再拦一道（不动代码/不动脚本/线上分支找属主），执行层兜底、两边口径一致。
     const createArg = mockCreate.mock.calls[0]?.[0] as {
       tools?: unknown;
       mcpServers?: unknown;

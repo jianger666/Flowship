@@ -428,6 +428,23 @@ const READONLY_SAFE_BINS = new Set([
   "echo",
 ]);
 
+/**
+ * 旁路 git 只读动词：答疑看改动、看分支用。不碰工作树、不碰远端。
+ * checkout/switch/push/pull/merge 等写操作不在表里、天然拒绝；
+ * 线上分支相关（切/合/推 main、master、production 这类）以提示词为准、让模型找属主确认。
+ */
+const READONLY_GIT_VERBS = new Set([
+  "status",
+  "log",
+  "diff",
+  "show",
+  "branch",
+  "rev-parse",
+]);
+/** git 逃逸 / 落盘 flag：一律拒绝（-C 换目录、--git-dir/--work-tree 指到仓外、--no-index 可读任意文件、--output 落盘写文件） */
+const GIT_BANNED_FLAG_RE =
+  /^(-C|--git-dir($|=)|--work-tree($|=)|--no-index($|=)|--output($|=))/;
+
 /** pg-exec 脚本 token（node 后跟的脚本名，防 evil.js 等冒充） */
 const PG_EXEC_TOKEN_RE = /(^|\s|["'])((?:\S*\/)?pg-exec\.mjs)(?=[\s"']|$)/;
 /** 写 SQL 关键字（与 scripts/pg-exec.mjs 的 WRITE_RE 同口径，旁路实例是否只读都拦） */
@@ -520,7 +537,7 @@ const SQL_UNQUOTED_DENY = new Set(["&", "|", "`"]);
 const hasSmuggledExecution = (s: string): boolean => s.includes("`") || s.includes("$(");
 
 const READONLY_SHELL_DENY_SUFFIX =
-  "旁路只读 shell 只允许：pg-exec 只读查询（SELECT），或 ls、cat、tail、head、grep、wc、pwd、echo 本地查看（工作目录内）。改东西、跑构建、调远程、发请求找任务所有者。";
+  "旁路只读 shell 只允许：pg-exec 只读查询（SELECT）、ls/cat/tail/head/grep/wc/pwd/echo 本地查看（工作目录内）、git 只读查看（status/log/diff/show/branch/rev-parse）。改代码、跑脚本、调远程、发请求、动线上分支找任务所有者。";
 
 export interface ReadonlyShellCheck {
   ok: boolean;
@@ -531,8 +548,9 @@ export interface ReadonlyShellCheck {
 
 /**
  * 旁路只读 shell 校验（纯函数、可单测；默认拒绝）。
- * 允许：① ask-wait 平台等待 curl（共用链路防误伤）；② pg-exec 只读查询；
- * ③ 单条本地查看命令（文件参数钳在 cwd 内）。其余一律拒绝并给跑法。
+ * 允许：① pg-exec 只读查询；② 单条本地查看命令（文件参数钳在 cwd 内）；
+ * ③ git 只读动词（status/log/diff/show/branch/rev-parse，看改动看分支）。
+ * 其余一律拒绝并给跑法（ask-wait 刻意不放：子串匹配等于万能钥匙，见下）。
  */
 export const validateReadonlyShellCommand = (
   cwd: string,
@@ -628,6 +646,24 @@ export const validateReadonlyShellCommand = (
     };
   }
   const bin = path.basename(tokens[0] ?? "");
+  // ---- git 只读查看：看改动、看分支；写操作不在动词表里、天然拒绝 ----
+  if (bin === "git") {
+    if (tokens.some((t) => GIT_BANNED_FLAG_RE.test(t))) {
+      return {
+        ok: false,
+        reason:
+          "旁路只读：git 禁止 -C / --git-dir / --work-tree / --no-index / --output（防目录逃逸、任意文件读取与落盘）。",
+      };
+    }
+    const verb = tokens.slice(1).find((t) => t && !t.startsWith("-"));
+    if (!verb || !READONLY_GIT_VERBS.has(verb)) {
+      return {
+        ok: false,
+        reason: `旁路只读：git 只允许 ${[...READONLY_GIT_VERBS].join(" / ")}（只读查看）。改分支、推代码、动线上分支找任务所有者。`,
+      };
+    }
+    return { ok: true, workCwd, timeoutMs };
+  }
   if (!READONLY_SAFE_BINS.has(bin)) {
     return { ok: false, reason: `旁路只读：不允许跑 ${tokens[0] ?? ""}。${READONLY_SHELL_DENY_SUFFIX}` };
   }
