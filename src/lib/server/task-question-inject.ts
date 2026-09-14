@@ -706,7 +706,7 @@ const runTaskQuestionInject = async (
     await writeEventAndPublish(task.id, {
       kind: "info",
       actionId: task.currentActionId ?? undefined,
-      text: "正在启动只读答疑 agent（群里非任务所有者的提问）…",
+      text: "正在启动答疑 agent（群里非任务所有者的提问）…",
     });
     startRestrictedGroupQuestion({
       task,

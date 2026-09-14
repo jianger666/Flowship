@@ -322,9 +322,9 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
   });
 
   // ─────────────────────────────────────────────────────────────
-  // 2. 受限 prompt 真只读（user_message 封装那段尾巴会让指令自相矛盾）
+  // 2. 旁路 prompt 与白名单口径一致（不要写东西，其他都可以做）
   // ─────────────────────────────────────────────────────────────
-  it("prompt 只有硬约束、一句「可以改」的措辞都不注入", async () => {
+  it("prompt 只有提示词约束、一句“可以改”的措辞都不注入", async () => {
     const id = alloc();
     await seedAckedTask(id);
     installOwnerSession(id);
@@ -336,10 +336,18 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     await waitUntil(() => bot.send.mock.calls.length === 1);
 
     const prompt = bot.send.mock.calls[0]?.[0] as string;
-    expect(prompt).toContain("只读答疑");
-    expect(prompt).toContain("禁止新建 / 修改 / 删除任何文件");
-    expect(prompt).toContain("有副作用的命令");
-    // 属主版那几句放行措辞 + user_message 封装那段固定行为约束，一个字都不许漏进来
+    expect(prompt).toContain("答疑助手");
+    // 核心只有一句：不是属主就不要写东西
+    expect(prompt).toContain("不要写东西");
+    expect(prompt).toContain("新建 / 修改 / 删除任何文件");
+    // 其他事情都可以做，但只读 shell 的真实能力：只读 SELECT，不调接口
+    expect(prompt).toContain("其他事情都可以做");
+    expect(prompt).toContain("只读 SELECT");
+    expect(prompt).not.toContain("调接口");
+    // 旁路不同步凭据文件：prompt 里不许出现凭据文件路径（脱敏声明无路径、无 --config）。
+    // 注意是带反引号的路径引用形式：脱敏声明里“禁止读取 company-env.json”这句纯文字可以留。
+    expect(prompt).not.toContain("company-env.json`");
+    expect(prompt).not.toContain("--config");
     expect(prompt).not.toContain("直接改");
     expect(prompt).not.toContain("直接动手");
     expect(prompt).not.toContain("才动手");
@@ -348,17 +356,21 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(prompt).not.toContain("submit_work");
     expect(prompt).not.toContain("submit_mr");
 
-    // 「# 边界」必须是最后一段：硬约束后面不许再跟任何别的指令段
+    // 「# 边界」必须是最后一段：约束后面不许再跟任何别的指令段
     const boundaryAt = prompt.lastIndexOf("\n# 边界");
     expect(boundaryAt).toBeGreaterThan(prompt.lastIndexOf("\n# 对方的话"));
     expect(prompt.slice(boundaryAt + 1)).not.toMatch(/\n# /);
 
-    // 旁路 agent 不挂系统 customTools / 用户 MCP（交卷、提 MR 这些工具压根不该出现）
+    // 旁路 agent 执行层白名单 + 不挂系统 customTools（无 callerToken 就没有交卷 / 提 MR 身份）；
+    // 写操作提示词里再拦一道（不要写东西），两边口径一致。
     const createArg = mockCreate.mock.calls[0]?.[0] as {
+      tools?: unknown;
       mcpServers?: unknown;
       callerToken?: string;
       local?: { settingSources?: unknown[]; customTools?: unknown };
     };
+    // Cursor 路：白名单只留读操作，写类工具执行层直接不给
+    expect(createArg.tools).toEqual(["read", "grep"]);
     expect(createArg.mcpServers).toBeUndefined();
     expect(createArg.callerToken).toBeUndefined();
     expect(createArg.local?.settingSources).toEqual([]);

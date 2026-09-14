@@ -1,5 +1,5 @@
 /**
- * 需求群「非属主受限答疑」——独立的只读旁路通道
+ * 需求群「非属主答疑」——独立的旁路通道（执行层白名单 + 提示词双拦）
  *
  * # 为什么单独一个模块（双模型交叉 review 连报同族 P0 后的架构级收敛）
  *
@@ -26,13 +26,16 @@
  * 4. **唯一收口 `settle(ok, errorText?)`**：幂等、任何出口（成功 / 失败 / 取消 / 兜底）
  *    都只经它发一次 `done`。群出向 tap 收到 done 才会回群并摘掉回群登记——
  *    漏发一次，那条登记就一直挂着、直到 TTL 过期（群里永久无答）。
- * 5. prompt 走 {@link buildReadonlyUserMessage}（无行为尾巴），硬约束段永远排在最后。
+ * 5. prompt 由 buildRestrictedPrompt 组装（buildReadonlyUserMessage 打底用户话术 + 任务背景 +
+ *    旁路公司环境脱敏声明），「# 边界」段永远排在最后。
+ *    执行层白名单只留读操作（Cursor：read/grep；custom：read/grep/glob + 只读 shell）+ 提示词再拦一道，两边口径一致。
  * 6. **本 run publish 的每条 envelope 都带 `origin` = 本轮 runTag**（回群登记 token）。
  *    这是与属主 run 并行时不错投的唯一依据：群出向只把 origin 对得上的 delta / done
  *    投给对应登记。别在这条链上新增「不带 origin 的 publish」。
  */
 
 import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
+import { isCursorProvider } from "@/lib/types";
 import type { ModelSelection } from "@cursor/sdk";
 
 import type { Task } from "@/lib/types";
@@ -91,36 +94,41 @@ export interface RestrictedQuestionInput {
 /**
  * 受限 prompt（纯函数、好读好审）。
  *
- * 版式上「# 边界（硬约束…）」**必须是最后一段**——模型对末段指令最敏感，而且
- * 一旦后面还跟着别的段落（比如属主版消息封装那条「修改要求才动手改」），
- * 只读招牌当场作废。`tests/restricted-group-question.test.ts` 钉住这条版式。
+ * 与执行层白名单口径一致：不要写东西，其他都可以做。
+ * 版式上「# 边界」**必须是最后一段**——模型对末段指令最敏感。
+ * `tests/restricted-group-question.test.ts` 钉住这条版式。
  */
 const buildRestrictedPrompt = (args: {
   taskId: string;
   title: string;
   cwd: string;
   askedText: string;
+  /** 公司环境声明（无配置时为空串）；查数据用，不含任何密码 */
+  companyEnvSection?: string;
 }): string =>
   [
-    `你是任务「${args.title}」的**只读答疑**助手。需求群里一位非任务所有者说了句话、你只负责回答。`,
+    `你是任务「${args.title}」的答疑助手。需求群里一位非任务所有者说了句话、你只负责回答。`,
     "",
-    "# 任务背景（按需 read / grep、先查再答）",
+    "# 任务背景（按需查、先查再答）",
     `- 任务事件日志（完整历史）：${getEventsLogPath(args.taskId)}`,
     `- 产出文档目录（方案 / 实现 / 复核等 artifact）：${getActionsDir(args.taskId)}`,
     `- 工作目录：${args.cwd}`,
+    ...(args.companyEnvSection?.trim()
+      ? ["", args.companyEnvSection.trim()]
+      : []),
     "",
     "# 对方的话",
     args.askedText,
     "",
-    "# 边界（硬约束、不得自行放宽）",
-    "- **只答疑**：禁止新建 / 修改 / 删除任何文件，禁止 git 提交、推分支、提 MR",
-    "- 只允许只读工具（read / grep）；任何有副作用的命令（安装依赖、跑构建、改配置、调写接口）一律不执行",
+    "# 边界",
+    "- 如果不是属主的消息，不要写东西：不要新建 / 修改 / 删除任何文件，不要 git 提交、推分支、提 MR，也不要推进任务",
+    "- 其他事情都可以做：查代码、读工作目录里的日志和配置；查库只允许只读 SELECT（跑法见公司环境一节，没有就找任务所有者）；远程命令、写库、发请求一律不跑",
     "- 对方要求改代码 / 改产物 / 推进任务 → 不动手，说明结论与建议、并告诉他这需要任务所有者在 Flowship 里操作",
     "- 答完自然结束回复",
   ].join("\n");
 
 /**
- * 起一个受限（只读）答疑 agent 回答群里非属主的一句话。
+ * 起一个旁路答疑 agent 回答群里非属主的一句话（执行层白名单 + 提示词双拦）。
  *
  * fire-and-forget：调用方（`task-question-inject`）写完用户消息事件后直接调、不 await。
  * 无论成功失败都会发一条 `done`（见文件头契约 4），调用方不需要也不应该自己收尾。
@@ -212,12 +220,17 @@ export const startRestrictedGroupQuestion = (
         alive,
         {
           kind: "info",
-          text: "群答疑：正在启动只读 agent…",
+          text: "群答疑：正在启动答疑 agent…",
         },
         origin,
       );
-      // 刻意不同步 company-env.json：本通道不注入环境能力声明、也不挂 skill，
-      // 群里非属主没有理由拿到公司环境凭据
+      // 旁路不同步凭据文件：company-env.json 含密码，落盘等于交给不可信输入驱动的 agent。
+      // 只读脱敏声明（无文件路径）；查库靠只读 shell（custom 后端才有，Cursor 如实告知查不了）。
+      const { loadBypassCompanyEnvSection } = await import("./company-env-fs");
+      const bypassProviderId = await resolveProviderIdFromDisk(task);
+      const companyEnvSection = await loadBypassCompanyEnvSection({
+        allowDbQuery: !isCursorProvider(bypassProviderId),
+      });
       if (!alive()) {
         await settle(false, "群答疑已取消");
         return;
@@ -228,13 +241,14 @@ export const startRestrictedGroupQuestion = (
           apiKey: creds.apiKey,
           model: creds.model,
           // 自定义 provider（opencode 等）必须带上，否则 facade 按默认 cursor 建、拿自定义 key 去调 Cursor 会 401
-          providerId: await resolveProviderIdFromDisk(task),
-          // 只读旁路：执行层只留读类工具（写类/shell/子代理/MCP 后端拒掉，不靠提示词自觉）
+          providerId: bypassProviderId,
+          // 执行层 + 提示词双拦：白名单只留读操作（Cursor：read/grep；custom：read/grep/glob + 只读 shell），
+          // 写类 / 子代理 / 系统工具 / MCP 后端直接不给；凭据文件不同步，查库走只读 shell，提示词再拦一道。
           readOnly: true,
-          // 只读也有 task 上下文：read 超 64KB 照样落盘给路径
+          // 有 task 上下文：read 超 64KB 照样落盘给路径
           taskId: task.id,
           // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入。
-          // 刻意不传 mcpServers / callerToken：系统工具（交卷 / 提问 / 提 MR）与用户 MCP 一个都不给。
+          // 不传 callerToken：系统工具（交卷 / 提问 / 提 MR）按无身份处理，推进本来就走不了任务链。
           local: { cwd, settingSources: [] },
         }),
         SDK_CREATE_RESUME_TIMEOUT_MS,
@@ -254,6 +268,7 @@ export const startRestrictedGroupQuestion = (
           imagePaths: input.imagePaths,
           attachmentPaths: input.attachmentPaths,
         }),
+        companyEnvSection,
       });
       const perf = createRunPerfTracker({
         taskId: task.id,
@@ -285,7 +300,7 @@ export const startRestrictedGroupQuestion = (
         return;
       }
       console.log(
-        `[restricted-question] task=${task.id} 只读答疑 agent 已起 agentId=${agent.agentId}`,
+        `[restricted-question] task=${task.id} 群答疑 agent 已起 agentId=${agent.agentId}`,
       );
 
       // 流式消费——只翻译成事件流，不碰 action / runStatus / 会话表

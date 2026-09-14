@@ -9,6 +9,7 @@
 import path from "node:path";
 
 import {
+  buildBypassCompanyEnvSection,
   cloneCompanyEnv,
   emptyCompanyEnv,
   normalizeCompanyEnv,
@@ -37,6 +38,29 @@ export const loadCompanyEnvBriefSection = async (): Promise<string> => {
       path.join(process.cwd(), "scripts", "ssh-exec.mjs"),
       path.join(process.cwd(), "scripts", "pg-exec.mjs"),
     );
+  } catch {
+    return "";
+  }
+};
+
+/**
+ * 旁路（群非属主答疑）专用：只读脱敏声明，不同步凭据文件（review P0-2）。
+ *
+ * 以前这里调 syncCompanyEnvFileFromSettings 把含密码的 company-env.json 落盘，
+ * 而旁路手里有 read + shell，等于把 PG / SSH 凭据交给了不可信输入驱动的 agent。
+ * 现在只给无路径声明：查库靠只读 shell（allowDbQuery 才给跑法），绝不出现文件路径。
+ */
+export const loadBypassCompanyEnvSection = async (opts?: {
+  allowDbQuery?: boolean;
+}): Promise<string> => {
+  try {
+    const result = await readSettingsFile();
+    if (result.status !== "ok") return "";
+    const env = normalizeCompanyEnv(result.settings.companyEnv);
+    return buildBypassCompanyEnvSection(env, {
+      pgExecPath: path.join(process.cwd(), "scripts", "pg-exec.mjs"),
+      allowDbQuery: opts?.allowDbQuery,
+    });
   } catch {
     return "";
   }

@@ -1,8 +1,9 @@
 /**
  * 只读门禁接线用例（review P0-1 的回归护栏）。
  *
- * readOnly 必须双收敛：Cursor 走 `tools` 白名单 + 不挂系统 customTools；
- * pi 走 `buildReadOnlyToolDefs` 只留读包装。以后有人把任一半改松，用例先红。
+ * 只读 = 不推进、不改东西；查数据（pg-exec SELECT、读日志）算读操作，允许。
+ * readOnly 双收敛：Cursor 走 `tools` 白名单 + 不挂系统 customTools；
+ * pi 走 `buildReadOnlyToolDefs`（read/grep/glob/shell，写类/子代理/MCP 不给）。
  */
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
@@ -70,7 +71,7 @@ describe("Agent.create readOnly（Cursor 路）", () => {
 });
 
 describe("pi buildReadOnlyToolDefs", () => {
-  it("只留 read/grep，无 shell/写类/子代理/MCP", async () => {
+  it("只留读操作 read/grep/glob/shell，无写类/子代理/MCP", async () => {
     const { buildReadOnlyToolDefs } = await import(
       "@/lib/server/pi-coding-tools"
     );
@@ -79,6 +80,6 @@ describe("pi buildReadOnlyToolDefs", () => {
       .map((d) => (d as { name?: unknown }).name)
       .filter((n) => typeof n === "string")
       .sort();
-    expect(names).toEqual(["grep", "read"]);
+    expect(names).toEqual(["glob", "grep", "read", "shell"]);
   });
 });

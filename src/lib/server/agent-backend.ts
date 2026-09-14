@@ -82,7 +82,11 @@ type FacadeExtras = {
   taskId?: string;
 };
 
-/** 只读轮次的两边通用白名单（读类 only；shell / 写类 / 子代理 / MCP 全不给） */
+/**
+ * Cursor 内置白名单（read/grep only，无 shell；查库走不了，需要查数找任务所有者）。
+ * pi custom 白名单见 pi-coding-tools.READONLY_CUSTOM_TOOL_NAMES（read/grep/glob + 只读 shell）。
+ * 两边共同点：写类 / 子代理 / 系统工具 / MCP 全不给。
+ */
 export const READONLY_BUILTIN_TOOLS = ["read", "grep"] as const;
 
 const stripFacadeExtras = <T extends FacadeExtras>(

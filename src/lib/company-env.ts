@@ -553,6 +553,57 @@ export const buildCompanyEnvBrief = (
 };
 
 /**
+ * 旁路（群非属主答疑）专用公司环境声明：脱敏、无凭据文件路径（review P0-2 的回归护栏）。
+ *
+ * 与 buildCompanyEnvBrief 的区别：① 不带 company-env.json 绝对路径（旁路不同步该文件，
+ * 给了路径等于教它去读）；② pg-exec 跑法不带 --config（只读 shell 禁止该 flag，走默认路径）；
+ * ③ 不带 SSH 跑法（只读 shell 一律拒绝远程命令）；④ 无 shell 的后端（Cursor）如实告知查不了库。
+ * 只列子系统名 + 可用 PG 环境名，绝不写入密码 / note 正文 / 完整连接信息。
+ */
+export const buildBypassCompanyEnvSection = (
+  env: CompanyEnv | null | undefined,
+  opts?: { pgExecPath?: string; allowDbQuery?: boolean },
+): string => {
+  if (!env) return "";
+  if (!isCompanyEnvConfigured(env)) return "";
+  const pgEnvs = [
+    ...new Set(
+      env.pg
+        .filter((p) => p.host.trim())
+        .map((p) => p.env.trim())
+        .filter(Boolean),
+    ),
+  ];
+  const parts: string[] = [];
+  if (env.servers.some((s) => s.host.trim())) parts.push("服务器（旁路不跑远程命令）");
+  if (pgEnvs.length > 0) parts.push(`PostgreSQL（只读 SELECT，可用环境：${pgEnvs.join("、")}）`);
+  if (env.redis.some((r) => r.host.trim())) parts.push("Redis");
+  if (env.xxljob.some((x) => x.baseUrl.trim())) {
+    parts.push(isXxljobReadonly(env.xxljob) ? "XXL-Job（只读）" : "XXL-Job");
+  }
+  if (env.nacos.some((n) => n.baseUrl.trim())) parts.push("Nacos（只读）");
+  if (env.elk.some((e) => e.baseUrl.trim())) parts.push("ELK");
+  if (env.sls.some((s) => s.endpoint.trim() && s.project.trim())) parts.push("SLS");
+  if ((env.httpApis ?? []).some((h) => h.url.trim())) parts.push("HTTP API");
+  const customNames = env.custom.map((c) => c.name.trim()).filter(Boolean);
+  if (customNames.length > 0) parts.push(`自定义（${customNames.join("、")}）`);
+  if (parts.length === 0) return "";
+  const lines = ["## 公司环境（旁路只读）", `已填：${parts.join("、")}。`];
+  if (pgEnvs.length > 0) {
+    if (opts?.allowDbQuery) {
+      const pgExec = opts?.pgExecPath?.trim() || "pg-exec.mjs";
+      lines.push(
+        `查库走只读 shell：\`node "${pgExec}" --env <环境名> -- 'SELECT ...'\`（只允许 SELECT，实例是否只读都一样；SQL 独占一个带引号参数；禁止 --config）。`,
+      );
+    } else {
+      lines.push("本轮没有 shell，查不了库：基于代码和任务历史回答，需要查数请找任务所有者。");
+    }
+  }
+  lines.push("禁止读取 company-env.json / config.json 凭据文件；不要打印密码；特殊用法问任务所有者。");
+  return lines.join("\n");
+};
+
+/**
  * 核心字段是否已配（推进弹窗缺配置提示用）。
  * 任一：有 host 的服务器 / PG host / XXL baseUrl / Nacos baseUrl / ELK baseUrl / SLS endpoint+project / HTTP url。
  */
