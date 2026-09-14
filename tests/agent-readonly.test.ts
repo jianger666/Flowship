@@ -71,7 +71,7 @@ describe("Agent.create readOnly（Cursor 路）", () => {
 });
 
 describe("pi buildReadOnlyToolDefs", () => {
-  it("只留读操作 read/grep/glob/shell，无写类/子代理/MCP", async () => {
+  it("只留 read/grep/glob/shell/merge_test_mr，无写类/子代理/MCP", async () => {
     const { buildReadOnlyToolDefs } = await import(
       "@/lib/server/pi-coding-tools"
     );
@@ -80,6 +80,7 @@ describe("pi buildReadOnlyToolDefs", () => {
       .map((d) => (d as { name?: unknown }).name)
       .filter((n) => typeof n === "string")
       .sort();
-    expect(names).toEqual(["glob", "grep", "read", "shell"]);
+    // shell=只读校验版（含跑仓内脚本），merge_test_mr=服务端执行、只合 test 分支
+    expect(names).toEqual(["glob", "grep", "merge_test_mr", "read", "shell"]);
   });
 });

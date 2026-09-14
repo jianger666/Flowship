@@ -39,6 +39,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { withModelBudget, type ModelBudgetSpill } from "./tool-output-budget";
+import { buildMergeTestMrTool } from "./bypass-merge-mr";
 
 const asTool = (d: unknown): ToolDefinition => d as ToolDefinition;
 
@@ -536,8 +537,86 @@ const HEAD_UNQUOTED_DENY = new Set([";", "&", "|", ">", "<", "`", "\n", "\r", "$
 const SQL_UNQUOTED_DENY = new Set(["&", "|", "`"]);
 const hasSmuggledExecution = (s: string): boolean => s.includes("`") || s.includes("$(");
 
+/** 旁路可跑的脚本入口：node / bash / sh（跑仓内文件）、npm / pnpm（只放 run|test，跑 package 脚本） */
+const SCRIPT_RUN_BINS = new Set(["node", "bash", "sh"]);
+const PKG_RUN_BINS = new Set(["npm", "pnpm"]);
+/** 内联代码执行一律拒绝：-e / --eval / -c 等于把代码写进命令里跑，不再是“跑仓库文件” */
+const SCRIPT_INLINE_FLAG_RE = /^(-[ec]|--eval($|=))/;
+/**
+ * 部署/发布/上线类脚本名：能跑也不给，非属主跑发版必须先找属主确认。
+ * 按段匹配（deploy.sh 拦、product-list.js 不拦），只是绊马索、不是证明，见 checkBypassRunScript 注释。
+ */
+const SCRIPT_DEPLOY_NAME_RE =
+  /(^|[-_.])(deploy|publish|release|prod|production|online)($|[-_.])|发版|上线/i;
+
+/**
+ * 仓库脚本执行校验：能跑不能改。
+ * node/bash/sh 的第一个非 flag 参数必须是工作目录内的脚本文件（相对路径、防逃逸、防 $ 展开偷换）；
+ * npm/pnpm 只放 run|test（脚本名同样过部署发布检查）。
+ * 防不住脚本自身的行为——脚本是仓库代码、跑起来就是用户权限；部署发布类靠名字拦截 +
+ * 提示词先确认，真有人拿测试脚本干坏事，兜底靠的是无写工具 + 无凭据 + 事件流留痕。
+ */
+const checkBypassRunScript = (
+  root: string,
+  cwd: string,
+  bin: string,
+  tokens: string[],
+): { ok: boolean; reason?: string } => {
+  if (tokens.some((t) => SCRIPT_INLINE_FLAG_RE.test(t))) {
+    return {
+      ok: false,
+      reason: "旁路只读：不允许 -e / --eval / -c 内联代码（只跑仓库里的脚本文件，改文件找任务所有者）。",
+    };
+  }
+  if (PKG_RUN_BINS.has(bin)) {
+    const verb = tokens[1] ?? "";
+    if (verb !== "run" && verb !== "test") {
+      return {
+        ok: false,
+        reason: `旁路只读：${bin} 只允许 run / test（跑 package 脚本）。装包、发包、删包找任务所有者。`,
+      };
+    }
+    if (verb === "run") {
+      const name = tokens.slice(2).find((t) => t && !t.startsWith("-"));
+      if (!name) return { ok: false, reason: `旁路只读：${bin} run 必须给脚本名。` };
+      if (SCRIPT_DEPLOY_NAME_RE.test(name)) {
+        return {
+          ok: false,
+          reason: "旁路只读：部署/发布/上线类脚本先找任务所有者确认（脚本名命中发版关键字）。",
+        };
+      }
+    }
+    return { ok: true };
+  }
+  // node / bash / sh：第一个非 flag 参数必须是工作目录内的脚本文件
+  const script = tokens.slice(1).find((t) => t && !t.startsWith("-"));
+  if (!script) return { ok: false, reason: `旁路只读：${bin} 必须给工作目录内的脚本文件。` };
+  if (script.startsWith("~")) {
+    return { ok: false, reason: "旁路只读：脚本文件只能是工作目录内的相对路径。" };
+  }
+  // 与文件参数同理：引号包着 shell 照样展开，脚本路径里出现一律拒绝（传给脚本的 argv 不管）
+  if (script.includes("$") || script.includes("`") || script.includes("$(")) {
+    return { ok: false, reason: "旁路只读：脚本路径里不允许 $环境变量 / `...` / $(...)。" };
+  }
+  const abs = path.isAbsolute(script) ? path.normalize(script) : path.resolve(cwd, script);
+  if (abs !== root && !abs.startsWith(root + path.sep)) {
+    return { ok: false, reason: `旁路只读：脚本文件只能在工作目录内（${script} 越界）。` };
+  }
+  if (isBypassBlockedReadPath(abs)) {
+    return { ok: false, reason: `旁路只读：凭据文件不允许碰。${BYPASS_GUARD_HINT}` };
+  }
+  if (SCRIPT_DEPLOY_NAME_RE.test(path.basename(script))) {
+    return {
+      ok: false,
+      reason:
+        "旁路只读：部署/发布/上线类脚本（deploy/publish/release 等）先找任务所有者确认，自己不跑。",
+    };
+  }
+  return { ok: true };
+};
+
 const READONLY_SHELL_DENY_SUFFIX =
-  "旁路只读 shell 只允许：pg-exec 只读查询（SELECT）、ls/cat/tail/head/grep/wc/pwd/echo 本地查看（工作目录内）、git 只读查看（status/log/diff/show/branch/rev-parse）。改代码、跑脚本、调远程、发请求、动线上分支找任务所有者。";
+  "旁路只读 shell 只允许：pg-exec 只读查询（SELECT）、ls/cat/tail/head/grep/wc/pwd/echo 本地查看（工作目录内）、git 只读查看（status/log/diff/show/branch/rev-parse）、跑仓库脚本（node/bash/sh + 工作目录内文件、npm/pnpm run|test，部署发布类除外）。不改文件、不碰线上分支，部署发布/合线上 MR 找任务所有者。";
 
 export interface ReadonlyShellCheck {
   ok: boolean;
@@ -549,7 +628,8 @@ export interface ReadonlyShellCheck {
 /**
  * 旁路只读 shell 校验（纯函数、可单测；默认拒绝）。
  * 允许：① pg-exec 只读查询；② 单条本地查看命令（文件参数钳在 cwd 内）；
- * ③ git 只读动词（status/log/diff/show/branch/rev-parse，看改动看分支）。
+ * ③ git 只读动词（status/log/diff/show/branch/rev-parse，看改动看分支）；
+ * ④ 仓库脚本执行（node/bash/sh 跑仓内文件、npm/pnpm run|test，能跑不能改，部署发布类照拒）。
  * 其余一律拒绝并给跑法（ask-wait 刻意不放：子串匹配等于万能钥匙，见下）。
  */
 export const validateReadonlyShellCommand = (
@@ -664,6 +744,12 @@ export const validateReadonlyShellCommand = (
     }
     return { ok: true, workCwd, timeoutMs };
   }
+  // ---- 仓库脚本执行：能跑不能改（只跑工作目录内的 repo 文件；部署发布类照拒）----
+  if (SCRIPT_RUN_BINS.has(bin) || PKG_RUN_BINS.has(bin)) {
+    const r = checkBypassRunScript(root, cwd, bin, tokens);
+    if (!r.ok) return { ok: false, reason: r.reason ?? READONLY_SHELL_DENY_SUFFIX };
+    return { ok: true, workCwd, timeoutMs };
+  }
   if (!READONLY_SAFE_BINS.has(bin)) {
     return { ok: false, reason: `旁路只读：不允许跑 ${tokens[0] ?? ""}。${READONLY_SHELL_DENY_SUFFIX}` };
   }
@@ -707,7 +793,7 @@ const readonlyShellTool = (cwd: string): ToolDefinition => {
     name: "shell",
     label: "跑命令（只读）",
     description:
-      "旁路只读 shell：只允许 pg-exec 只读查询（SELECT），或 ls、cat、tail、head、grep、wc、pwd、echo 本地查看（工作目录内）。不允许拼接/管道/重定向，不允许改文件、跑构建、调远程、发请求。timeout 为秒，默认 60。",
+      "旁路 shell（能跑不能改）：pg-exec 只读查询（SELECT）；ls/cat/tail/head/grep/wc/pwd/echo 本地查看（工作目录内）；git 只读查看（status/log/diff/show/branch/rev-parse）；跑仓库脚本（node/bash/sh + 工作目录内文件，npm/pnpm run|test）。不允许拼接/管道/重定向，不改文件，不跑部署发布类脚本，不调远程、不发请求，线上分支相关找任务所有者。合 test MR 调 merge_test_mr。timeout 为秒，默认 60。",
     execute: async (...args: unknown[]) => {
       const params = (args[1] ?? {}) as {
         command?: unknown;
@@ -860,8 +946,9 @@ const deleteTool = (cwd: string): ToolDefinition =>
   });
 
 /**
- * 只读轮次的 customTools：read（凭据文件守卫 + 目录钳制）/ grep·glob（基址钳制）+ 只读 shell（纯函数白名单校验）。
- * 只读 = 不推进、不改东西；查数据（pg-exec SELECT、读本地日志）是读操作，允许。
+ * 只读轮次的 customTools：read（凭据文件守卫 + 目录钳制）/ grep·glob（基址钳制）+ 只读 shell
+ *（纯函数白名单校验：查数据、看改动、跑仓内脚本）+ merge_test_mr（服务端执行、只合 test 分支）。
+ * 不推进、不改文件；查数据（pg-exec SELECT、读本地日志）、跑测试查看脚本是允许的操作。
  * 写类（write/edit/delete）、子代理 task、系统工具、MCP 全不给；裸 shell 不给，只给校验版。
  * 白名单数组（custom-agent-backend 的 tools 白名单与这里保持一致）。
  */
@@ -870,6 +957,7 @@ export const READONLY_CUSTOM_TOOL_NAMES = [
   "grep",
   "glob",
   "shell",
+  "merge_test_mr",
 ] as const;
 export const buildReadOnlyToolDefs = (
   cwd: string,
@@ -885,6 +973,8 @@ export const buildReadOnlyToolDefs = (
     withModelBudget(withBypassGuard(grep, checkBypassSearchBase(cwd, taskId)), spill),
     withModelBudget(withBypassGuard(globTool(cwd), checkBypassSearchBase(cwd, taskId)), spill),
     withModelBudget(readonlyShellTool(cwd), spill),
+    // 合 test MR：服务端执行（token 不出服务端），目标分支守卫见 bypass-merge-mr
+    withModelBudget(buildMergeTestMrTool(), spill),
   ];
 };
 

@@ -322,7 +322,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
   });
 
   // ─────────────────────────────────────────────────────────────
-  // 2. 旁路 prompt 与白名单口径一致（三条红线：不动代码、不动脚本、线上分支找属主，红线之外放行）
+  // 2. 旁路 prompt 与白名单口径一致（三条红线：不改文件、能跑不能发、线上分支找属主；test MR 可合，红线之外放行）
   // ─────────────────────────────────────────────────────────────
   it("prompt 只有提示词约束、一句“可以改”的措辞都不注入", async () => {
     const id = alloc();
@@ -337,12 +337,12 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     const prompt = bot.send.mock.calls[0]?.[0] as string;
     expect(prompt).toContain("答疑助手");
-    // 核心是三条红线：不动代码、不动脚本、线上分支相关先找属主确认
-    expect(prompt).toContain("不动代码");
-    expect(prompt).toContain("不动脚本");
+    // 核心是三条红线：不改文件、能跑不能发、线上分支相关先找属主确认；test MR 可合
+    expect(prompt).toContain("不改文件");
+    expect(prompt).toContain("能跑不能发");
     expect(prompt).toContain("线上分支");
-    expect(prompt).toContain("新建 / 修改 / 删除任何文件");
-    expect(prompt).toContain("pg-exec 除外");
+    expect(prompt).toContain("新建 / 修改 / 删除");
+    expect(prompt).toContain("merge_test_mr");
     // 红线之外放行，但只读 shell 的真实能力：只读 SELECT，不调接口
     expect(prompt).toContain("红线之外都可以干");
     expect(prompt).toContain("只读 SELECT");
@@ -365,7 +365,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(prompt.slice(boundaryAt + 1)).not.toMatch(/\n# /);
 
     // 旁路 agent 执行层白名单 + 不挂系统 customTools（无 callerToken 就没有交卷 / 提 MR 身份）；
-    // 红线提示词里再拦一道（不动代码/不动脚本/线上分支找属主），执行层兜底、两边口径一致。
+    // 红线提示词里再拦一道（不改文件/能跑不能发/线上分支找属主），执行层兜底、两边口径一致。
     const createArg = mockCreate.mock.calls[0]?.[0] as {
       tools?: unknown;
       mcpServers?: unknown;

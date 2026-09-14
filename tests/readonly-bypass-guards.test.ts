@@ -2,9 +2,11 @@
  * 旁路只读守卫（review P0 的回归护栏）：坏人用例必须被执行层拒绝。
  *
  * 钉三件事：
- * 1. 只读 shell 默认拒绝：rm / git 写操作 / curl / ssh-exec / 跑脚本 / 写 SQL / 命令拼接 / 目录逃逸，
- *    只放 pg-exec SELECT（无 --config、SQL 独占引号参数）、本地查看命令（cwd 内）和 git 只读动词
- *   （status/log/diff/show/branch/rev-parse，看改动看分支；-C/--no-index/--output 等逃逸 flag 照拒）。
+ * 1. 只读 shell 默认拒绝：rm / git 写操作 / curl / ssh-exec / 内联代码 / 写 SQL / 命令拼接 / 目录逃逸，
+ *    只放 pg-exec SELECT（无 --config、SQL 独占引号参数）、本地查看命令（cwd 内）、git 只读动词
+ *   （status/log/diff/show/branch/rev-parse，看改动看分支；-C/--no-index/--output 等逃逸 flag 照拒）
+ *    和仓库脚本执行（node/bash/sh + 工作目录内文件、npm/pnpm run|test；-e/-c 内联、仓外路径、
+ *    部署发布类脚本名照拒；合 MR 不走 shell，走服务端 merge_test_mr）。
  * 2. 凭据文件读不到：read 读 company-env.json / config.json（数据目录）必须拒绝；
  *    shell 里 cat 它们同样拒绝；grep / glob 基址钳在工作目录（含本任务目录）内。
  * 3. 好人场景不断：SELECT、tail 日志、ls、cwd 内 read/grep 照常放行。
@@ -78,7 +80,8 @@ describe("只读 shell：坏人用例一律拒绝", () => {
       "git diff --no-index /etc/passwd app.log",
       "git log --output=/tmp/x.log --oneline",
       "curl http://example.com",
-      "node evil.js",
+      // node evil.js 按“能跑不能改”已放行（仓内文件，见下个用例）；这里只钉真坏人
+      "node /tmp/evil.js",
       "bash deploy.sh",
       "npm install foo",
     ]) {
@@ -149,6 +152,43 @@ describe("只读 shell：好人场景放行", () => {
     expect(check("cat hello.txt").ok).toBe(true);
     expect(check("grep -rn hello .").ok).toBe(true);
     expect(check("ls", ".").ok).toBe(true);
+  });
+
+  it("仓库脚本：能跑不能改（仓内文件放行，内联/逃逸/发版类拒绝）", () => {
+    for (const cmd of [
+      "node scripts/check.js",
+      "node ./scripts/check.js --env test",
+      "bash scripts/test.sh",
+      "sh run.sh",
+      "npm run test",
+      "npm test",
+      "pnpm test",
+      "pnpm run check",
+    ]) {
+      expect(check(cmd).ok, cmd).toBe(true);
+    }
+    for (const cmd of [
+      // 内联代码 = 把代码写进命令里跑，不再是“跑仓库文件”
+      "node -e 'process.exit(1)'",
+      'node --eval="1+1"',
+      "bash -c 'ls'",
+      // 仓外脚本一律拒
+      "node /tmp/evil.js",
+      "node ../evil.js",
+      "bash ~/x.sh",
+      'node "$HOME/x.js"',
+      // 部署/发布/上线类脚本名照拒（先找属主确认）
+      "bash scripts/deploy.sh",
+      "node scripts/publish.js",
+      "npm run deploy",
+      "pnpm run release",
+      // 装包/发包/下包执行：不是跑仓库脚本
+      "npm install foo",
+      "npx create-foo",
+      "yarn test",
+    ]) {
+      expect(check(cmd).ok, cmd).toBe(false);
+    }
   });
 
   it("git 只读查看放行：status/log/diff/show/branch/rev-parse", () => {
