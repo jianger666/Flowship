@@ -52,8 +52,13 @@ export type GroupReplyChannel = "owner" | "restricted";
 export interface PendingGroupReply {
   /** 回哪个群 */
   chatId: string;
-  /** 发起人 open_id（回群时 @ 他） */
+  /** 发起人 open_id（回群时 @ 他；发起人是机器人时必须 false，否则 @ 回去就和对方机器人成环） */
   requesterOpenId: string;
+  /**
+   * 回群时要不要 @ 发起人。缺省 true（人类提问保持原有提醒体验）。
+   * false = 只发正文不 @——发起人是机器人时用，不 @ 它的自动化就不会被触发。
+   */
+  atRequester?: boolean;
   /** 发起人姓名（@ 标签展示名 / 事件 meta） */
   requesterName: string;
   /**
@@ -420,6 +425,52 @@ export const takeGroupReplyByToken = (
 /** 单测重置全部登记 */
 export const __resetGroupReplyStateForTest = (): void => {
   getState().byTask.clear();
+  __resetBypassLoopForTest();
+};
+
+// ----------------- 机器人互 @ 熔断 -----------------
+//
+// 两个机器人互 @ 成环（江涛 CLI 案）的断路器：只数非属主 @ 消息，不拦属主。
+// 短窗口内连续 N 轮 → 冷却一段时间，期间非属主 @ 消息静默跳过（不回群里任何话——
+// 回一句 @ 就会给对方机器人续上）、只在 Flowship 事件流里留一条熔断说明。
+// 内存态：进程重启清零，可接受（环本来就跑在进程活着的时候）。
+/** 熔断滑动窗口：窗口内非属主 @ 消息达到这么多轮就跳闸 */
+export const BYPASS_LOOP_WINDOW_MS = 10 * 60 * 1000;
+export const BYPASS_LOOP_MAX_ROUNDS = 5;
+/** 跳闸后静默多久（属主消息不受影响、且会清零计数） */
+export const BYPASS_LOOP_COOLDOWN_MS = 10 * 60 * 1000;
+type BypassLoopState = { rounds: number[]; cooldownUntil: number };
+const bypassLoopByTask = new Map<string, BypassLoopState>();
+export const __resetBypassLoopForTest = (): void => {
+  bypassLoopByTask.clear();
+};
+/** 属主在群里说话了 = 人在场，清零（机器人对答模式被打破） */
+export const resetBypassLoop = (taskId: string): void => {
+  if (taskId) bypassLoopByTask.delete(taskId);
+};
+/**
+ * 记一轮非属主 @ 消息。tripped=本轮跳闸（调用方静默跳过 + 写一条应用事件），
+ * cooled=冷却中（静默跳过，不再写事件）。now 参数只给单测用。
+ */
+export const recordBypassLoopAttempt = (
+  taskId: string,
+  now: number = Date.now(),
+): { tripped: boolean; cooled: boolean } => {
+  const idle = { tripped: false, cooled: false };
+  if (!taskId) return idle;
+  let st = bypassLoopByTask.get(taskId);
+  if (!st) {
+    st = { rounds: [], cooldownUntil: 0 };
+    bypassLoopByTask.set(taskId, st);
+  }
+  st.rounds = st.rounds.filter((t) => now - t < BYPASS_LOOP_WINDOW_MS);
+  if (now < st.cooldownUntil) return { tripped: false, cooled: true };
+  st.rounds.push(now);
+  if (st.rounds.length >= BYPASS_LOOP_MAX_ROUNDS) {
+    st.cooldownUntil = now + BYPASS_LOOP_COOLDOWN_MS;
+    return { tripped: true, cooled: false };
+  }
+  return idle;
 };
 
 // ----------------- 产物卡防重（自动播报 / 群内推进出向共用一张表） -----------------

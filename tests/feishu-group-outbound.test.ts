@@ -1309,3 +1309,68 @@ describe("truncateForGroup", () => {
     expect(t).toContain("Flowship");
   });
 });
+
+describe("回群 @ 抑制（机器人互@防环）", () => {
+  it("发起人是机器人（atRequester=false）→ 回群不 @，只发正文", async () => {
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    const sendText = vi.fn();
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown, sendText }) as never);
+    const h = rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: "ou_otherbot",
+      requesterName: "江涛CLI",
+      kind: "question",
+      channel: "restricted",
+      atRequester: false,
+    })!;
+    await handleGroupOutboundEvent("task-1", {
+      kind: "assistant_delta",
+      text: "埋点已确认上报",
+      origin: h.runTag!,
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: fullTask(),
+      ok: true,
+      origin: h.runTag!,
+    });
+    expect(sendMarkdown).toHaveBeenCalledTimes(1);
+    expect(sendText).not.toHaveBeenCalled();
+    const body = callArgs(sendMarkdown)[1] as string;
+    expect(body).toContain("埋点已确认上报");
+    // 不 @：对方机器人的自动化靠 @ 触发，不 @ 就不会续上循环
+    expect(body).not.toContain("<at");
+  });
+
+  it("缺省（人类提问）→ 照常 @ 提醒", async () => {
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
+    const h = rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "question",
+      channel: "restricted",
+    })!;
+    await handleGroupOutboundEvent("task-1", {
+      kind: "assistant_delta",
+      text: "接口预计周五联调",
+      origin: h.runTag!,
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: fullTask(),
+      ok: true,
+      origin: h.runTag!,
+    });
+    const body = callArgs(sendMarkdown)[1] as string;
+    expect(body).toContain('<at user_id="ou_zhang">张三</at>');
+    expect(body).toContain("接口预计周五联调");
+  });
+});

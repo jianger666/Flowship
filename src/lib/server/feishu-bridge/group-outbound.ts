@@ -388,11 +388,14 @@ const flushGroupReply = async (
   const body = !ok
     ? "这轮没跑成功、去 Flowship 看看事件流"
     : answer || "已处理完成（这轮没有文字回复）";
+  // 发起人是机器人时不 @（atRequester=false）：它的自动化靠 @ 触发，@ 回去就和它成环。
+  // 人类提问保持原样 @ 提醒。
+  const head =
+    entry.atRequester === false
+      ? ""
+      : `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
   // post md：@ 标签写进 markdown 正文（飞书扩展语法），整段才会渲染 ** / ` / 列表
-  await deps.sendMarkdown(
-    entry.chatId,
-    `${mentionTag(entry.requesterOpenId, entry.requesterName)} ${truncateForGroup(body)}`,
-  );
+  await deps.sendMarkdown(entry.chatId, `${head}${truncateForGroup(body)}`);
 };
 
 /**

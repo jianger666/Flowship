@@ -26,6 +26,9 @@ const {
   GROUP_CHAT_NOT_OWNER,
   GROUP_RESTRICTED_QUESTION_RUNNING,
   GROUP_TASK_RUNNING,
+  isGroupBotSender,
+  SKIP_GROUP_BOT_SENDER,
+  SKIP_GROUP_LOOP_BREAKER,
   handleGroupAdvancePick,
   hasAnyMention,
   isGroupChatMessage,
@@ -44,8 +47,12 @@ const {
 const {
   __resetGroupAdvancePickForTest,
   __resetGroupReplyStateForTest,
+  BYPASS_LOOP_MAX_ROUNDS,
+  BYPASS_LOOP_WINDOW_MS,
   listGroupReplies,
   mentionTag,
+  recordBypassLoopAttempt,
+  resetBypassLoop,
   sanitizeGroupMemberName,
 } = await import("@/lib/server/feishu-bridge/group-shared");
 
@@ -1786,5 +1793,158 @@ describe("unsupported 文案分叉（在途登记才让对方补发文字）", (
     // 回执自带 @ 发送方的标签，只断言文案本身
     expect(callArgs(sendTextToChat)[1]).toContain("暂不支持该消息类型");
     expect(callArgs(sendTextToChat)[1]).not.toContain("补发文字版");
+  });
+});
+
+// ----------------- 机器人互 @ 防环（江涛 CLI 案） -----------------
+
+describe("机器人发件人直拦", () => {
+  it("isGroupBotSender：显式非 user / bot open_id / app_id 算机器人，缺省算人", () => {
+    expect(isGroupBotSender({})).toBe(false);
+    expect(isGroupBotSender({ sender_type: "user" })).toBe(false);
+    expect(isGroupBotSender({ sender_type: "app" })).toBe(true);
+    expect(isGroupBotSender({ sender_bot_open_id: "ou_otherbot" })).toBe(true);
+    expect(isGroupBotSender({ sender_app_id: "cli_other" })).toBe(true);
+  });
+
+  const botDeps = () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
+    );
+    return { handleTaskQuestionInject, sendTextToChat };
+  };
+
+  it("机器人 @bot → 静默跳过：不回群、不注入、不登记", async () => {
+    const { handleTaskQuestionInject, sendTextToChat } = botDeps();
+    const r = await routeGroupInboundMessage(
+      otherMsg({
+        message_id: "om_bot1",
+        sender_type: "app",
+        content: "@Flowship 埋点查了吗",
+      }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "skipped", error: SKIP_GROUP_BOT_SENDER });
+    // 静默是关键：回群里任何话都会 @ 对方机器人续上循环
+    expect(sendTextToChat).not.toHaveBeenCalled();
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(listGroupReplies("task-1")).toHaveLength(0);
+  });
+
+  it("sender_bot_open_id 的同样拦", async () => {
+    const { handleTaskQuestionInject, sendTextToChat } = botDeps();
+    const r = await routeGroupInboundMessage(
+      otherMsg({
+        message_id: "om_bot2",
+        sender_bot_open_id: "ou_otherbot",
+        content: "@Flowship 埋点查了吗",
+      }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "skipped", error: SKIP_GROUP_BOT_SENDER });
+    expect(sendTextToChat).not.toHaveBeenCalled();
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+  });
+
+  it("人类照常走（sender_type 缺省/user 都算人）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    const r = await routeGroupInboundMessage(
+      otherMsg({ message_id: "om_human", content: "@Flowship 埋点查了吗" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("互@熔断", () => {
+  it("纯函数：窗口内连发跳闸、冷却中不再计数、窗口外清零、属主清零", () => {
+    const t = "task-loop-unit";
+    const at = (ms: number) => recordBypassLoopAttempt(t, 1_000_000 + ms);
+    expect(at(0)).toEqual({ tripped: false, cooled: false });
+    expect(at(1000)).toEqual({ tripped: false, cooled: false });
+    expect(at(2000)).toEqual({ tripped: false, cooled: false });
+    expect(at(3000)).toEqual({ tripped: false, cooled: false });
+    // 第 5 轮跳闸
+    expect(at(4000)).toEqual({ tripped: true, cooled: false });
+    // 冷却中：不再计数、不重复跳闸
+    expect(at(5000)).toEqual({ tripped: false, cooled: true });
+    resetBypassLoop(t);
+    expect(at(6000)).toEqual({ tripped: false, cooled: false });
+  });
+
+  it("纯函数：窗口外的旧轮次不计数", () => {
+    const t = "task-loop-window";
+    recordBypassLoopAttempt(t, 0);
+    recordBypassLoopAttempt(t, 1000);
+    recordBypassLoopAttempt(t, 2000);
+    recordBypassLoopAttempt(t, 3000);
+    // 隔了一个窗口之后再来 4 轮也不该跳闸
+    const base = BYPASS_LOOP_WINDOW_MS + 10_000;
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS - 1; i++) {
+      expect(recordBypassLoopAttempt(t, base + i * 1000)).toEqual({
+        tripped: false,
+        cooled: false,
+      });
+    }
+  });
+
+  it("路由层：连续多轮非属主 @ → 跳闸后静默（不回群），属主出现后恢复", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
+    );
+    const ask = (id: string) =>
+      routeGroupInboundMessage(
+        otherMsg({ message_id: id, content: "@Flowship 埋点查了吗" }),
+        ctx,
+      );
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS - 1; i++) {
+      const r = await ask(`om_s${i}`);
+      expect(r).toMatchObject({ kind: "sent" });
+    }
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
+      BYPASS_LOOP_MAX_ROUNDS - 1,
+    );
+    // 第 N 轮跳闸：静默，不回群里任何话
+    const tripped = await ask(`om_s${BYPASS_LOOP_MAX_ROUNDS - 1}`);
+    expect(tripped).toMatchObject({
+      kind: "skipped",
+      error: SKIP_GROUP_LOOP_BREAKER,
+    });
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
+      BYPASS_LOOP_MAX_ROUNDS - 1,
+    );
+    expect(sendTextToChat).not.toHaveBeenCalled();
+    // 冷却中继续静默
+    const cooled = await ask("om_sX");
+    expect(cooled).toMatchObject({
+      kind: "skipped",
+      error: SKIP_GROUP_LOOP_BREAKER,
+    });
+    // 属主出现 = 人在场，清零并恢复
+    const owner = await routeGroupInboundMessage(
+      groupMsg({ message_id: "om_owner", content: "@Flowship 我来看看" }),
+      ctx,
+    );
+    expect(owner).toMatchObject({ kind: "sent" });
+    const after = await ask("om_sY");
+    expect(after).toMatchObject({ kind: "sent" });
   });
 });
