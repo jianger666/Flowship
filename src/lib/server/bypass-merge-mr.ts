@@ -166,10 +166,23 @@ export const buildMergeTestMrTool = (): ToolDefinition =>
           details: undefined,
         };
       }
-      const r = await mergeTestMrForBypass(mrUrl);
-      return {
-        content: [{ type: "text", text: r.text }],
-        details: { ok: r.ok },
-      };
+      // P1：链路里任何意外抛错都收成一句人话，别让 agent 看到工具异常
+      try {
+        const r = await mergeTestMrForBypass(mrUrl);
+        return {
+          content: [{ type: "text", text: r.text }],
+          details: { ok: r.ok },
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `合 test MR 失败：${err instanceof Error ? err.message : String(err)}，请找任务所有者确认。`,
+            },
+          ],
+          details: { ok: false },
+        };
+      }
     },
   }) as unknown as ToolDefinition;

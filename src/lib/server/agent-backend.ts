@@ -83,9 +83,9 @@ type FacadeExtras = {
 };
 
 /**
- * Cursor 内置白名单（read/grep only，无 shell、无 merge_test_mr；要跑命令/查库/合 test MR 找任务所有者）。
- * pi custom 白名单见 pi-coding-tools.READONLY_CUSTOM_TOOL_NAMES（read/grep/glob + 只读 shell + 合 test MR）。
- * 两边共同点：写类 / 子代理 / 系统工具 / MCP 全不给，凭据文件都不同步。
+ * Cursor 内置白名单（read/grep only）。注：旁路已改 honor-system，两端默认全开、不接白名单；
+ * READONLY_BUILTIN_TOOLS / pi-coding-tools.READONLY_CUSTOM_TOOL_NAMES（含 merge_test_mr）当前无人接线，
+ * 留作单元覆盖，哪天收紧直接接回去。
  */
 export const READONLY_BUILTIN_TOOLS = ["read", "grep"] as const;
 

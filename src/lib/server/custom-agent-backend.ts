@@ -753,8 +753,8 @@ export const createCustomAgent = async (
   // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
   // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
   // 全部过滤掉，模型只看到 read/edit/write/grep。
-  // 只读轮次：白名单 + customTools 双收敛（read/grep/glob/只读shell/合test-MR，写类不给；
-  // 执行层门禁，见 buildReadOnlyToolDefs；凭据文件不同步，见 restricted-question）。
+  // 只读轮次：白名单 + customTools 双收敛（read/grep/glob/只读shell/合test-MR，写类不给）。
+  // 注：旁路 honor-system 后不再传 readOnly，此分支当前无人接线，留作收紧时直接用。
   const customTools = readOnly
     ? buildReadOnlyToolDefs(
         cwd,
@@ -815,7 +815,7 @@ export const resumeCustomAgent = async (
     ? { toolDefs: [] as never[], closeAll: async () => {} }
     : await bridgeUserMcpServers(input.mcpServers);
   // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
-  // 只读轮次双收敛（read/grep/glob/只读shell/合test-MR，执行层门禁，见 buildReadOnlyToolDefs）。
+  // 只读分支同上，当前无人接线（旁路 honor-system 不传 readOnly），留作收紧时直接用。
   const customTools = readOnly
     ? buildReadOnlyToolDefs(
         cwd,

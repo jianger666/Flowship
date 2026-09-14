@@ -165,6 +165,7 @@ describe("只读 shell：好人场景放行", () => {
       "sh run.sh",
       "npm run test",
       "npm test",
+      "npm --silent run test",
       "pnpm test",
       "pnpm run check",
     ]) {

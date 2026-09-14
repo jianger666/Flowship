@@ -569,7 +569,8 @@ const checkBypassRunScript = (
     };
   }
   if (PKG_RUN_BINS.has(bin)) {
-    const verb = tokens[1] ?? "";
+    // P2：verb 取第一个非 flag token（npm --silent run test 这类常用写法 tokens[1] 是 flag）
+    const verb = tokens.slice(1).find((t) => t && !t.startsWith("-")) ?? "";
     if (verb !== "run" && verb !== "test") {
       return {
         ok: false,
@@ -577,7 +578,9 @@ const checkBypassRunScript = (
       };
     }
     if (verb === "run") {
-      const name = tokens.slice(2).find((t) => t && !t.startsWith("-"));
+      const name = tokens
+        .slice(tokens.indexOf(verb) + 1)
+        .find((t) => t && !t.startsWith("-"));
       if (!name) return { ok: false, reason: `旁路只读：${bin} run 必须给脚本名。` };
       if (SCRIPT_DEPLOY_NAME_RE.test(name)) {
         return {
@@ -951,6 +954,7 @@ const deleteTool = (cwd: string): ToolDefinition =>
  * 不推进、不改文件；查数据（pg-exec SELECT、读本地日志）、跑测试查看脚本是允许的操作。
  * 写类（write/edit/delete）、子代理 task、系统工具、MCP 全不给；裸 shell 不给，只给校验版。
  * 白名单数组（custom-agent-backend 的 tools 白名单与这里保持一致）。
+ * 注：旁路 honor-system 后不再走本数组（两端默认全开），此处转单元覆盖留着，哪天收紧直接接回去。
  */
 export const READONLY_CUSTOM_TOOL_NAMES = [
   "read",

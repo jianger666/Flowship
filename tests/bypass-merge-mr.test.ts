@@ -142,6 +142,25 @@ describe("全流程：只合 test 目标", () => {
     expect(r.text).toContain("任务所有者");
   });
 
+  it("P1：纯流程抛错上抛、execute 层负责收（契约钉死）", async () => {
+    mockedGetMR.mockRejectedValue(new Error("boom-conn"));
+    await expect(mergeTestMrForBypass(MR_URL)).rejects.toThrow("boom-conn");
+  });
+
+  it("P1：execute 层抛错也收话术（含找属主）", async () => {
+    mockedGetMR.mockRejectedValue(new Error("boom-conn"));
+    const defs = buildReadOnlyToolDefs(CWD, { taskId: "t1" });
+    const tool = defs.find(
+      (d) => (d as { name?: unknown }).name === "merge_test_mr",
+    ) as unknown as {
+      execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const out = await tool.execute("call-1", { mrUrl: MR_URL });
+    const text = out.content.map((c) => c.text).join("\n");
+    expect(text).toContain("合 test MR 失败");
+    expect(text).toContain("任务所有者");
+  });
+
   it("详情拉取失败 → 不合", async () => {
     mockedGetMR.mockResolvedValue({ ok: false, error: "404 Not Found" });
     const r = await mergeTestMrForBypass(MR_URL);
