@@ -13,7 +13,7 @@
  * 1. **不碰 task 运行态**：不写 `runStatus`、不占 `runningTasks`、不动属主 `agentSessions`。
  *    受限答疑不是 task 的 action run——写了 running 就会让顶栏「停止」键冒出来，而它走的是
  *    `stopTaskAgent` 核弹路径（awaiting_ack 的 plan/review 一律标 cancelled + 关属主会话）。
- * 2. **prompt 讲规矩、工具默认全开**：# 边界只放三条红线（不改文件/能跑不能发/线上分支找属主）+ test MR 可合；
+ * 2. **prompt 讲规矩、工具默认全开**：# 边界只放三条红线（不改文件/部署发布上线与线上分支找属主/其余放行）；
  *    Agent.create 不传 tools 白名单（两端默认全开），只保留身份隔离（无 callerToken、无 customTools）。
  * 3. **失败必收口**：起不来时写 error 事件 + 发 `done(ok=false)`——群出向 tap 靠这条 done
  *    回「这轮没跑成功」并摘掉回群登记，缺了它登记一直挂着、下一轮无关的 done 会错 @ 人。
@@ -338,13 +338,12 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     const prompt = bot.send.mock.calls[0]?.[0] as string;
     expect(prompt).toContain("答疑助手");
-    // 极简三行：红线 + test MR + 收尾，不许加戏
+    // 极简两行：红线 + 收尾，不许加戏
     expect(prompt).toContain("三条红线");
     expect(prompt).toContain("不改任何文件");
     expect(prompt).toContain("先找属主确认");
     expect(prompt).toContain("其余都可以干");
-    expect(prompt).toContain("test MR");
-    expect(prompt).toContain("只读 SELECT");
+    expect(prompt).not.toContain("test MR");
     // 特制执行层已摘掉：prompt 里不许再提只读白名单专用工具
     expect(prompt).not.toContain("merge_test_mr");
     expect(prompt).not.toContain("只读 shell");

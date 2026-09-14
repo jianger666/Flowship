@@ -94,7 +94,7 @@ export interface RestrictedQuestionInput {
 /**
  * 受限 prompt（纯函数、好读好审）。
  *
- * 旁路政策（极简）：三条红线 + test MR 可合 + 查库只读，工具默认全开，规矩只写提示词。
+ * 旁路政策（极简两行）：三条红线，工具默认全开，规矩只写提示词。线上分支以设置页配置为准。
  * 版式上「# 边界」**必须是最后一段**——模型对末段指令最敏感。
  * `tests/restricted-group-question.test.ts` 钉住这条版式。
  */
@@ -121,8 +121,7 @@ const buildRestrictedPrompt = (args: {
     args.askedText,
     "",
     "# 边界",
-    "- 非属主答疑，三条红线：不改任何文件；部署、发布、上线与线上分支（main、master、production 这类）先找属主确认；其余都可以干",
-    "- test MR（目标为测试分支）可以直接合，有问题（线上分支/已关闭/冲突/失败）就让对方找属主；查库只读 SELECT",
+    "- 非属主答疑，三条红线：不改任何文件；部署、发布、上线与线上分支先找属主确认；其余都可以干",
     "- 答完自然结束回复",
   ].join("\n");
 
