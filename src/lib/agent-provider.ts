@@ -345,15 +345,24 @@ export const bootArgsForTask = (
   const providerId = resolveTaskProvider(task, settings);
   const creds = getModelCredsForProvider(settings, providerId);
   const fallback = defaultModelForProvider(settings, providerId);
+  // 老任务口径缝：raw provider 为空 + 启发式判 custom（pi 锚点），旧 actions 和 task.model 全是
+  // cursor 时代 id，认哪个都是拿 cursor id 调自定义地址 400。fail-closed：两个都不认，直接用新家
+  // 设置页默认（没配就空 id，交给上层报“请选择模型”，比莫名其妙 400 强）。哨兵只保切过家的任务，
+  // 没切过家直接推进的老任务走的就是这条路。
+  const rawProvider = task.provider?.trim() || null;
+  const heuristicCustom = !rawProvider && !isCursorProvider(providerId);
   // 跟说话条 / runner 同口径：最近 action.agentModel → task.model → 设置页默认。
   // 只读 task.model 会拿建任务时的旧模型（如 grok），跟输入条显示的 Composer 对不上。
-  const sessionModel = resolveSessionModel({
-    model: task.model,
-    actions: task.actions ?? [],
-  });
+  const sessionModel = heuristicCustom
+    ? undefined
+    : resolveSessionModel({
+        model: task.model,
+        actions: task.actions ?? [],
+        provider: task.provider,
+      });
   const model = sessionModel?.id?.trim()
     ? sessionModel
-    : task.model?.id?.trim()
+    : !heuristicCustom && task.model?.id?.trim()
       ? task.model
       : fallback.id.trim()
         ? fallback

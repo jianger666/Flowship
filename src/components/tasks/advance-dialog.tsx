@@ -79,6 +79,7 @@ import { ProviderModelPicker } from "@/components/ui/provider-model-picker";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useModels } from "@/hooks/use-models";
+import { useProviderSwitch } from "@/hooks/use-provider-switch";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { buildActionInstructionHistory } from "@/lib/composer-history";
 import { getSettings } from "@/lib/local-store";
@@ -112,6 +113,7 @@ import {
   isLightweightDailyTask,
 } from "@/lib/lightweight-task";
 import { resolveSessionModel } from "@/lib/task-model";
+import { prepareRunArgs } from "@/lib/run-args";
 import {
   flowMutexBuiltinDisabledReason,
   flowMutexWkDisabledReason,
@@ -365,6 +367,12 @@ interface Props {
   onOpenChange: (open: boolean) => void;
   task: Task;
   /**
+   * 提供方切换后立刻同步页面 task（P1-4）：setTaskProvider 落盘成功、推进 POST
+   * 还没发时页面 task 还是旧家；POST 一旦失败（凭据/网络），不 absorb 就会
+   * “服务端新家、UI 旧家”，下次操作全错乱。成功推进后父组件还会再 absorb 一次。
+   */
+  onTaskUpdate: (next: Task) => void;
+  /**
    * 外部预填（收件箱「改bug」入口深链用）：指令 + 可选预选 custom action。
    * customActionId 在可选列表里才选中；列表没有（被删/隐藏）则只预填指令。
    * 只用一次——父组件应在关闭后清掉，避免下次手动打开仍带旧预填。
@@ -381,6 +389,8 @@ interface Props {
     reuseAgent: boolean;
     // 用户在 dialog 里临时挑的模型；只在起新 agent 时传、续接场景父组件用默认
     model?: ModelSelection;
+    // 弹窗内换了提供方时带上切后的 task（父组件用它算新家的凭据、不再读旧 task.provider）
+    switchedTask?: Task;
     // 指令配的截图附件（选填、贴图说明改哪）
     images?: ImagePayload[];
     // 指令里 `/` 唤起的 skill 引用（选填）——指引由服务端拼进 agent 消息、不落进指令原文
@@ -405,6 +415,7 @@ export const AdvanceDialog = ({
   open,
   onOpenChange,
   task,
+  onTaskUpdate,
   onSubmit,
   submitting,
   prefill,
@@ -488,6 +499,22 @@ export const AdvanceDialog = ({
   // 起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
   // 仅起新 agent（默认）时透传给父组件、勾续用时 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
+  // 推进时用的提供方：默认跟 task 走；弹窗内可换，提交时先切后推、本次直接用新的跑
+  // （输入条是另一入口，都走 useProviderSwitch，确认/清覆盖/toast 同一套）
+  const [pickedProvider, setPickedProvider] = useState<string>("");
+  // 打开瞬间的 task 家：providerChanged 跟它比，不跟实时 task prop 比——
+  // 弹窗开着时 SSE 推了新 task（别处切了提供方等），跟实时值比会在用户没动手时误触发。
+  const openProviderRef = useRef<string>("");
+  // 本 render 的 task 家（getSettings 非响应式，每 render 现读；open 快照走上面的 ref）
+  const taskProvider = resolveTaskProvider(task, getSettings());
+  // 弹窗内换提供方的切换动作：共用 hook；成功后立刻 absorb（P1-4），
+  // 成功 toast 文案按推进场景走（“本次推进即用…”而不是“下条消息…”）。
+  const { switchProvider, saving: switchingProvider } = useProviderSwitch({
+    taskId: task.id,
+    sessionAgentId: task.sessionAgentId,
+    onSwitched: onTaskUpdate,
+    nextStepHint: "本次推进即用新会话继续",
+  });
   // V0.6.1：ship 准入 UI 软提示用、dialog 打开时从 settings 快照 Token（host 按仓库现推）
   const [gitToken, setGitToken] = useState<string | undefined>();
   // 从 task 仓库 remote 推导 host（跟 server resolveEffectiveGitHost 对齐）。
@@ -582,6 +609,10 @@ export const AdvanceDialog = ({
     // → 当次 getSettings().defaultModel 兜底（含 params）。settings 在这里读、保证拿到最新设置页默认模型。
     const s = getSettings();
     const providerId = resolveTaskProvider(taskRef.current, s);
+    // 提供方跟 task 对齐（SSE 推 task 不会重跑本 effect、弹窗内手切的不被盖掉）；
+    // 打开瞬间的家另存 ref，providerChanged 跟快照比、不跟实时 prop 比（P1-5）
+    openProviderRef.current = providerId;
+    setPickedProvider(providerId);
     // v0.9.11：「续用当前 Agent」默认勾选走设置页偏好（缺省 false = 每 action 新 agent）；dialog 内仍可临时切
     setReuseAgent(s.reuseAgentDefault ?? false);
     setPickedModel(
@@ -693,17 +724,31 @@ export const AdvanceDialog = ({
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
+  // 按 pickedProvider 拉（不用 task.provider）：弹窗内换提供方后列表跟着换新家；
+  // fetchModels 缓存未命中会先清旧列表、不把上一家的模型留在下拉里误选。
   useEffect(() => {
-    if (!open) return;
+    if (!open || !pickedProvider) return;
     const s = getSettings();
-    const providerId = resolveTaskProvider(task, s);
-    if (hasModelCredsForProvider(s, providerId) && availableModels.length === 0) {
-      void fetchModels({
-        ...getModelCredsForProvider(s, providerId),
-        provider: providerId,
-      });
-    }
-  }, [open, availableModels.length, fetchModels, task]);
+    if (!hasModelCredsForProvider(s, pickedProvider)) return;
+    void fetchModels({
+      ...getModelCredsForProvider(s, pickedProvider),
+      provider: pickedProvider,
+    });
+  }, [open, pickedProvider, fetchModels]);
+
+  // 弹窗内换提供方：模型回到新家的默认、续用自动关（续接旧会话无意义、
+  // 服务端遇到跨家复用也会强制 fresh），模型列表由上面的 effect 按新家重拉。
+  const handleProviderChange = useCallback(
+    (nextId: string) => {
+      if (!nextId || nextId === pickedProvider) return;
+      setPickedProvider(nextId);
+      setPickedModel(
+        defaultModelForProvider(getSettings(), nextId) ?? { id: "" },
+      );
+      setReuseAgent(false);
+    },
+    [pickedProvider],
+  );
 
   // dialog 打开时拉自定义 action 列表 + knowledge skill 名（团队规范开关过滤用）
   // + 已关闭自管 skill 名（推进面板隐藏挂它的自建 action）；拉失败静默清空、不挡内置 action。
@@ -1062,8 +1107,14 @@ export const AdvanceDialog = ({
     selectedCustomActionId,
     customById,
   ]);
+  // 弹窗内是否换了提供方（跟打开瞬间的快照比，不跟实时 task prop 比）：
+  // 换了 = 提交时先切后推、续用不可选
+  const providerChanged =
+    pickedProvider !== "" &&
+    pickedProvider !== (openProviderRef.current || taskProvider);
+
   const canSubmit = useMemo(() => {
-    if (submitting) return false;
+    if (submitting || switchingProvider) return false;
     // v0.9.12：无选中（全部 action 被隐藏）不能提交
     if (!actionType) return false;
     if (disabledReason) return false;
@@ -1081,6 +1132,7 @@ export const AdvanceDialog = ({
     return true;
   }, [
     submitting,
+    switchingProvider,
     disabledReason,
     actionType,
     selectedCustomActionId,
@@ -1169,12 +1221,47 @@ export const AdvanceDialog = ({
     if (!canSubmit || !actionType) return;
     // 富输入四件套：正文（`/skill`、`@文件` 以原文内联其中）+ 图 + 路径附件 + skill 引用
     const { text, images, attachments, skillRefs } = rich.payload();
+    // 弹窗内换了提供方：先切后推（共用 hook：有锚点确认、清覆盖、toast），
+    // 切完立刻 absorb（成功后 UI 即新家，POST 失败也不回退显示）。
+    // 顺序不能反：切是 PATCH 落盘，推是 POST 起 run，先落盘后起 run 才能跑到新家。
+    // providerChanged 跟打开快照比（UI 用、保守）；needSwitch 跟当前值比（提交用、精确）：
+    // 弹窗开着时别处已切到同一家并 SSE 推过来，就不再切一次（免得多弹一次确认框）。
+    const needSwitch =
+      providerChanged &&
+      pickedProvider !== resolveTaskProvider(task, getSettings());
+    let switchedTask: Task | undefined;
+    if (needSwitch) {
+      // 新家的凭据先验：把用户刚挑的模型带上（task.model 还是旧家的，不能拿它验新家；helper 内部 toast）
+      if (
+        !prepareRunArgs({
+          ...task,
+          provider: pickedProvider,
+          model: pickedModel.id ? pickedModel : task.model,
+        })
+      )
+        return;
+      const switchModel =
+        pickedModel.id?.trim()
+          ? pickedModel
+          : defaultModelForProvider(getSettings(), pickedProvider);
+      switchedTask =
+        (await switchProvider(
+          pickedProvider,
+          switchModel?.id?.trim() ? switchModel : undefined,
+        )) ?? undefined;
+      if (!switchedTask) return;
+    }
+    // 本次是否真切了家（needSwitch 精确值）：切了 = 必然新会话，模型透传用户刚挑的
+    const effectiveReuse = needSwitch ? false : reuseAgent;
     await onSubmit({
       actionType,
       userInstruction: text,
-      reuseAgent,
+      // 换了提供方 = 必然新会话（续用旧会话无意义，续接开关此时已禁用，这里再兜一道）
+      reuseAgent: effectiveReuse,
       // 只在起新 agent（默认）时透传模型选择、续接走 task.model
-      model: !reuseAgent && pickedModel.id ? pickedModel : undefined,
+      model: !effectiveReuse && pickedModel.id ? pickedModel : undefined,
+      // 弹窗内换了提供方时带上切后的 task（父组件用它算新家的凭据）
+      switchedTask,
       // 截图附件（选填）、后端落盘后把路径注入 agent prompt
       images,
       // skill 指引由服务端拼进 agent 消息（不进 action.userInstruction、不污染历史）
@@ -1462,7 +1549,7 @@ export const AdvanceDialog = ({
             )}
           </div>
 
-          {/* 续用开关 + 模型选择合并视觉块；续用时模型区收起（续接 Run 不能换模型） */}
+          {/* 续用开关 + 提供方/模型选择合并视觉块；续用时模型区收起（续接 Run 不能换模型） */}
           <div className="rounded-md border bg-muted/30 px-3 py-2">
             <div className="flex items-center justify-between gap-2">
               <label
@@ -1471,13 +1558,29 @@ export const AdvanceDialog = ({
               >
                 续用当前 Agent
               </label>
-              <Switch
-                id="advance-reuse-agent"
-                checked={reuseAgent}
-                onCheckedChange={setReuseAgent}
-                disabled={submitting}
-              />
+              <Tooltip
+                content={
+                  providerChanged
+                    ? "换了提供方、只能起新会话，续用不可选"
+                    : "默认每 action 起新会话，勾上则续接当前会话"
+                }
+              >
+                <span className="inline-flex">
+                  <Switch
+                    id="advance-reuse-agent"
+                    checked={reuseAgent}
+                    onCheckedChange={setReuseAgent}
+                    disabled={submitting || switchingProvider || providerChanged}
+                  />
+                </span>
+              </Tooltip>
             </div>
+            {/* 换了提供方：明示本次推进的新家 + 上下文代价（顶栏 chip 是弹窗确认，这里是行内提示） */}
+            {providerChanged && (
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                本次推进将换到新提供方（精细上下文不保留，只留消息记录 + 磁盘文件），续用不可选
+              </p>
+            )}
 
             {/* 展开 / 收起走 grid-rows 0fr↔1fr 过渡：高度平滑变化、弹窗不猛跳；
                 收起时 inert 挡 tab 焦点（视觉隐藏但仍挂载、状态不丢） */}
@@ -1494,12 +1597,12 @@ export const AdvanceDialog = ({
                 <div className="mt-2 border-t border-border/60 pt-2">
                   <ProviderModelPicker
                     variant="full"
-                    showProvider={false}
-                    providerId={resolveTaskProvider(task, getSettings())}
+                    providerId={pickedProvider || taskProvider}
+                    onProviderChange={handleProviderChange}
                     models={availableModels}
                     selection={pickedModel}
                     onModelChange={setPickedModel}
-                    disabled={submitting}
+                    disabled={submitting || switchingProvider}
                     emptyPlaceholder="选择模型"
                   />
                 </div>

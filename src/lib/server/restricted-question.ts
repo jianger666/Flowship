@@ -231,6 +231,8 @@ export const startRestrictedGroupQuestion = (
           providerId: await resolveProviderIdFromDisk(task),
           // 只读旁路：执行层只留读类工具（写类/shell/子代理/MCP 后端拒掉，不靠提示词自觉）
           readOnly: true,
+          // 只读也有 task 上下文：read 超 64KB 照样落盘给路径
+          taskId: task.id,
           // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入。
           // 刻意不传 mcpServers / callerToken：系统工具（交卷 / 提问 / 提 MR）与用户 MCP 一个都不给。
           local: { cwd, settingSources: [] },

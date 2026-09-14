@@ -17,9 +17,10 @@ export const LIGHTWEIGHT_DAILY_PROMPT_DIRECTIVE =
 
 /**
  * 已隔离工作区时不要再注入「原仓当前分支」——两条会打架。
- * 判定与 isWorktreeTask 同口径，不 import task-worktrees（那边有 server 专用依赖）。
+ * 判定与服务端 isWorktreeTask（task-worktrees.ts）同口径，不 import 那边（有 server 专用依赖）。
+ * 改规则时两边一起改：服务端 isWorktreeTask ↔ 这里 isWorktreeTaskLike。
  */
-const isIsolatedWorktreeLike = (t: {
+export const isWorktreeTaskLike = (t: {
   mode?: string;
   isolateWorktree?: boolean;
   repoPaths?: string[];
@@ -27,6 +28,8 @@ const isIsolatedWorktreeLike = (t: {
   t.mode !== "chat" &&
   t.isolateWorktree === true &&
   (t.repoPaths?.length ?? 0) > 0;
+
+const isIsolatedWorktreeLike = isWorktreeTaskLike;
 
 /** super prompt 段：轻量态才非空；正式任务 / 已隔离工作区返空串 */
 export const renderLightweightDailySection = (t: {

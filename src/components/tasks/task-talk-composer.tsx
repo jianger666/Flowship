@@ -19,15 +19,20 @@ import { toast } from "sonner";
 
 import { ConversationComposer } from "@/components/conversation-composer";
 import { ComposerSessionProvider } from "@/components/composer-session";
+import { Tooltip } from "@/components/ui/tooltip";
 import { buildInputHistory } from "@/lib/composer-history";
 import { ModelSelect } from "@/components/ui/model-select";
+import { Picker } from "@/components/ui/picker";
 import { useModels } from "@/hooks/use-models";
+import { useProviderSwitch } from "@/hooks/use-provider-switch";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { findPendingAskEvent } from "@/lib/ask-pending";
 import { getSettings } from "@/lib/local-store";
 import {
   getModelCredsForProvider,
   hasModelCredsForProvider,
+  isProviderSwitchLocked,
+  listProviderOptions,
   resolveTaskProvider,
 } from "@/lib/agent-provider";
 import {
@@ -35,8 +40,15 @@ import {
   resolveSessionModel,
   talkForceModel,
 } from "@/lib/task-model";
-import { getPendingQuestionSend, submitTaskQuestion } from "@/lib/task-store";
-import type { ModelSelection, Task } from "@/lib/types";
+import {
+  getPendingQuestionSend,
+  submitTaskQuestion,
+} from "@/lib/task-store";
+import {
+  CURSOR_PROVIDER_ID,
+  type ModelSelection,
+  type Task,
+} from "@/lib/types";
 import {
   clearTalkOverride,
   loadTalkOverride,
@@ -90,7 +102,35 @@ export const TaskTalkComposer = ({
   );
   const sessionModel = resolveSessionModel(task) ?? { id: "" };
   const pickedModel = overrideModel ?? sessionModel;
+  // 输入条换提供方（跟推进弹窗、对话同一套 hook：有锚点先确认、清覆盖、toast）。
+  // 切完把本地覆盖也清掉（只清 storage 不够，state 里还留着旧家的 id）。
+  const { switchProvider, saving: savingProvider } = useProviderSwitch({
+    taskId: task.id,
+    sessionAgentId: task.sessionAgentId,
+    onSwitched: (latest) => {
+      setOverrideModel(null);
+      onTaskUpdate(latest);
+    },
+  });
+  const providerId = resolveTaskProvider(task, getSettings());
+  const providerLocked = isProviderSwitchLocked(task);
+  // busy（含流式尾巴 latch isRunning）/ providerLocked 是交集关系：压成一道判，文案按是否真在跑区分。
+  // savingProvider（切家中）单独静默返回——连点防抖，不打扰。
+  const handleProviderChange = async (nextId: string): Promise<void> => {
+    if (!nextId || nextId === providerId || savingProvider) return;
+    if (busy || providerLocked) {
+      toast.error(
+        isRunning || task.runStatus === "running"
+          ? "正在运行中，不能切换提供方，等停下来再切"
+          : "当前步骤运行中，不能切换提供方，等停下来再切",
+      );
+      return;
+    }
+    await switchProvider(nextId);
+  };
   const handleModelChange = (next: ModelSelection): void => {
+    // 切家中模型列表还是旧家的：挡掉快捷键等非点击入口（下拉 disabled 挡点击），防旧家 id 粘到新家上下条 400
+    if (savingProvider) return;
     // 选回跟会话一致 = 回到干净态（下次走会话复用）；否则记住覆盖
     if (
       !next.id.trim() ||
@@ -107,13 +147,14 @@ export const TaskTalkComposer = ({
   // 单纯问答只加 events，签名不变；新推进 / 唤醒改模型 / 切提供方（清锚点）签名必变。
   // 拼之前按 n 排序：签名只跟内容有关、跟服务端返回顺序无关（防乱序误清覆盖）。
   // n 缺失按 0、同 n 按 id 二次比较——排序永不退化成输入顺序。
+  // agentProvider 也拼进去：纯补戳（不改状态、只记跑在哪家）也算会话归属变化。
   const actionSig = useMemo(
     () =>
       `${task.provider ?? ""}|${task.sessionAgentId ?? ""}|${task.currentActionId ?? ""}|${[...task.actions]
         .sort((a, b) => (a.n ?? 0) - (b.n ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
         .map(
           (a) =>
-            `${a.id}:${a.n}:${modelSelectionKey(a.agentModel)}`,
+            `${a.id}:${a.n}:${modelSelectionKey(a.agentModel)}:${a.agentProvider ?? ""}`,
         )
         .join(",")}`,
     [task.actions, task.currentActionId, task.provider, task.sessionAgentId],
@@ -136,16 +177,17 @@ export const TaskTalkComposer = ({
     }
   }, [task.id, actionSig]);
   const { models, fetchModels } = useModels();
+  // 模型列表按当前提供方拉（跟推进弹窗同款）：切家后必须重拉，不然下拉里还是上一家的。
+  // 不加 models.length 守卫——守卫会拦住切家后的重拉；effect 只跟 task.id + providerId，
+  // SSE 推 task（引用变、值不变）不会重跑。fetchModels 自带 abort 上一班 + 缓存，重复进可接受。
   useEffect(() => {
     const s = getSettings();
-    const providerId = resolveTaskProvider(task, s);
-    if (hasModelCredsForProvider(s, providerId) && models.length === 0) {
-      void fetchModels({
-        ...getModelCredsForProvider(s, providerId),
-        provider: providerId,
-      });
-    }
-  }, [models.length, fetchModels, task]);
+    if (!hasModelCredsForProvider(s, providerId)) return;
+    void fetchModels({
+      ...getModelCredsForProvider(s, providerId),
+      provider: providerId,
+    });
+  }, [task.id, providerId, fetchModels]);
 
   // 切 task 时整条输入态换载对应任务的持久化（详情页在不同任务间导航时组件可能不重挂）。
   // restore() 读回正文草稿 + 图/路径快照：各任务的输入互不串（key 按 task 隔离），
@@ -290,11 +332,25 @@ export const TaskTalkComposer = ({
           disabled={busy}
           submitting={submitting}
           leading={
-            <ModelSelect
+            <span className="flex min-w-0 items-center gap-1.5">
+              <Tooltip content="切换提供方（丢精细上下文，只留消息记录 + 磁盘文件 + worktree）">
+                <span className="inline-flex w-auto max-w-36 shrink-0">
+                  <Picker
+                    value={providerId || CURSOR_PROVIDER_ID}
+                    onChange={(id) => void handleProviderChange(id)}
+                    options={listProviderOptions(getSettings())}
+                    disabled={busy || savingProvider || providerLocked}
+                    className="h-7 min-w-0 w-auto max-w-28 text-xs"
+                    wrapperClassName="w-auto"
+                    contentClassName="w-56 min-w-56 max-w-64"
+                  />
+                </span>
+              </Tooltip>
+              <ModelSelect
               models={models}
               selection={pickedModel}
               onChange={handleModelChange}
-              disabled={busy}
+              disabled={busy || savingProvider}
               variant="compact"
               emptyPlaceholder="选择模型"
               providerId={resolveTaskProvider(task, getSettings())}
@@ -313,6 +369,7 @@ export const TaskTalkComposer = ({
                 }
               }}
             />
+            </span>
           }
           // 运行中：右侧动作组原地换成 spinner + 红停止键（Composer 同款、与 chat 对齐；无排队）
           running={isRunning}

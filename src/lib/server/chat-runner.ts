@@ -1060,6 +1060,7 @@ export const runChatSession = async (
         model,
         providerId,
         callerToken,
+        taskId: task.id,
         // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
         // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
         // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
@@ -1391,6 +1392,7 @@ export const resumeChatSession = async (
         apiKey: bootArgs.apiKey,
         providerId,
         callerToken,
+        taskId: task.id,
         // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
         model: bootArgs.model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）

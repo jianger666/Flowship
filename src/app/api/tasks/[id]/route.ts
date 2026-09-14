@@ -44,7 +44,7 @@ import {
   taskDir,
 } from "@/lib/server/task-fs-core";
 import { failpoint } from "@/lib/server/failpoints";
-import { abortRunningCheck, cancelTaskRun, closeTaskSession } from "@/lib/server/task-runner";
+import { abortRunningCheck, archiveTaskWithCleanup, cancelTaskRun, closeTaskSession } from "@/lib/server/task-runner";
 import {
   cancelRestrictedQuestions,
   hasResourceJobs,
@@ -253,9 +253,23 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           { status: 400 },
         );
       }
+      // 归档走 archiveTaskWithCleanup：task 模式同步停机 + 清 worktree（分支保留、恢复后重建）；
+      // 纯置顶沿用原子翻标记。archived + pinned 同发时先清后补 pin，非原子：
+      // 中间隔一次 SSE/轮询，旧快照可能盖掉 pin，靠前端 markArchiving 窗口兜底（概率小、可接受）。
+      if (typeof body.archived === "boolean") {
+        const archivedTask = await archiveTaskWithCleanup(id, body.archived);
+        if (!archivedTask)
+          return NextResponse.json({ error: "not_found" }, { status: 404 });
+        if (typeof body.pinned === "boolean" && body.pinned !== archivedTask.pinned) {
+          const pinnedTask = await setTaskPinArchive(id, { pinned: body.pinned });
+          if (!pinnedTask)
+            return NextResponse.json({ error: "not_found" }, { status: 404 });
+          return NextResponse.json({ task: pinnedTask });
+        }
+        return NextResponse.json({ task: archivedTask });
+      }
       const task = await setTaskPinArchive(id, {
         pinned: body.pinned,
-        archived: body.archived,
       });
       if (!task)
         return NextResponse.json({ error: "not_found" }, { status: 404 });

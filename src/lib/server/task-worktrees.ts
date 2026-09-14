@@ -154,7 +154,8 @@ export interface WorktreeTaskLike {
 
 // ----------------- 纯函数：判定 + 路径映射 -----------------
 
-/** 本 task 是否走隔离工作区（只描述物理隔离，不参与主流程 / 分支所有权判断） */
+/** 本 task 是否走隔离工作区（只描述物理隔离，不参与主流程 / 分支所有权判断）。
+ * 前端同口径镜像见 lib/lightweight-task.ts isWorktreeTaskLike（归档确认/toast 用），改规则时两边一起改。 */
 export const isWorktreeTask = (t: WorktreeTaskLike): boolean =>
   t.mode !== "chat" &&
   t.isolateWorktree === true &&

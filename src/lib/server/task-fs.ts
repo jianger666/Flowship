@@ -61,7 +61,8 @@ import type {
 import { accumulateTokenUsage } from "@/lib/token-usage";
 import { normalizeReqId } from "@/lib/req-id";
 import { mrTargetBranchOf } from "@/lib/task-display";
-import { modelForProviderSwitch, isProviderSwitchLocked } from "@/lib/agent-provider";
+import { modelForProviderSwitch, isProviderSwitchLocked, sessionAgentIdLooksCustom } from "@/lib/agent-provider";
+import { stampActionsProviderForSwitch, LEGACY_UNKNOWN_PROVIDER } from "@/lib/task-model";
 import {
   cleanupOrphanTaskWorktrees,
   computeNonGitRepoPaths,
@@ -2281,24 +2282,43 @@ export const setTaskProvider = async (
       if (meta.repoStatus === "merged" || meta.repoStatus === "abandoned") {
         throw new Error("任务已终态，不能切换提供方");
       }
-      if (cur?.status === "running" || cur?.status === "awaiting_ack") {
+      // 注意：这里只剩 running 分支。awaiting_ack 不锁（run 已结束，等的是人审阅）——
+      // 外层 isProviderSwitchLocked 同口径，awaiting_ack 根本进不来；之前里层写着
+      // awaiting_ack 是死代码，删了别加回来（想收紧先改外层，保持两处同口径）。
+      if (cur?.status === "running") {
         throw new Error("当前步骤运行中，不能切换提供方，等停下来再切");
       }
       throw new Error("当前状态不能切换提供方");
     }
-    const prev = meta.provider?.trim() || "cursor";
+    // prev 缺省 cursor：从没定过提供方的老任务按旧口径（展示层 resolveTaskProvider 同口径）。
+    // 补戳的 prev 则分三种（见 LEGACY_UNKNOWN_PROVIDER）：已知旧家用旧家；
+    // 未知旧家看会话锚点——pi-sessions 形态说明跑过自定义，猜 cursor 会在切回时反向 400，
+    // 改打哨兵（任何新家都跳过、回退新家默认）；无锚点则是 cursor 时代的老任务，猜 cursor 是事实。
+    const prevKnown = meta.provider?.trim() || null;
+    const prev = prevKnown ?? "cursor";
+    const stampPrev =
+      prevKnown ??
+      (meta.sessionAgentId && sessionAgentIdLooksCustom(meta.sessionAgentId)
+        ? LEGACY_UNKNOWN_PROVIDER
+        : "cursor");
     meta.provider = provider;
     const nextModel = modelForProviderSwitch(model);
     if (prev !== provider) {
+      // 给无戳历史补旧家戳（当前 action 及之前所有）：切家后 resolveSessionModel
+      // 认得出这些 action 是上一家的、自动回退 task.model（刚落盘的新家默认）。
+      // 已有戳的不覆盖；下次本家的新 action 落新戳后自愈。
+      stampActionsProviderForSwitch(meta.actions, stampPrev);
       // 两条自定义之间 sessionMatchesProvider 分不出来（都是 pi 锚点），
       // 切提供方必须丢掉旧会话，下一轮 Agent.create，禁止 resume 到别人的 HTTP 上。
       meta.sessionAgentId = undefined;
       // 内存旧会话也在（空闲常驻），光清落盘锚点不够：下轮勾着「续用」会直接往旧会话 send。
       // 这里同步关掉（动态 import 避开 task-fs↔task-runner 静态循环）；
+      // 用默认 reap（带孤儿进程二次扫）：切家后没有马上 fork，新会话是用户下次推进/发消息才起，
+      // 不存在“误杀新 shell”的窗口；旧会话的子 shell 孤儿必须现在收，否则漏到 boot 孤儿扫描才清。
       // advance 的复用防线（比对会话 providerId）是第二道，专防没走这里的老会话。
       try {
         const { closeTaskSession } = await import("./task-runner");
-        closeTaskSession(id, undefined, { reap: false });
+        closeTaskSession(id, undefined);
       } catch {
         /* 内存本就没会话时啥也不干，下轮本来就是 fresh */
       }
@@ -2357,6 +2377,8 @@ export const appendAction = async (
     type: ActionType;
     userInstruction: string;
     agentModel?: ModelSelection;
+    /** 跑这个 action 时的提供方（advance 按创建瞬间 task.provider 快照；空=未知、不记） */
+    agentProvider?: string;
     /** V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build 传、空=自由改动不计进度） */
     requestedBatchIds?: string[];
     /** V0.8.x：plan 重跑时如何合并批次 */
@@ -2401,6 +2423,8 @@ export const appendAction = async (
       // V0.10：隔离 task 快照的是 worktree cwd（artifact 相对路径基准就是 worktree）
       cwd: getTaskCwd(meta),
       agentModel: input.agentModel,
+      // 跑在哪家：resolveSessionModel 只认同家的 action 模型（切家后旧 id 在新家无效）
+      agentProvider: input.agentProvider,
       // V0.6.23：仅 build 带值（其它 action 为 undefined、JSON.stringify 自动忽略）
       requestedBatchIds:
         input.requestedBatchIds && input.requestedBatchIds.length > 0
@@ -2524,11 +2548,12 @@ export const setTaskRunStatus = async (
  *
  * @param exceptActionId 排除某 action（advance force-new 不用本函数；预留给对称 API）
  * @param toStatus 非终态收尾成 cancelled（stop/finalize）或 error
+ * @param leaveAwaitingAck 只收 running、awaiting_ack 保留（归档用；与 exceptActionId 组合时 except 优先命中）
  * @returns 收尾后 hydrate 的 Task（事件文案 / publish 用）；meta 不存在 → null
  */
 export const finalizeStaleAndIdleLocked = async (
   taskId: string,
-  opts?: { exceptActionId?: string; toStatus?: "cancelled" | "error" },
+  opts?: { exceptActionId?: string; toStatus?: "cancelled" | "error"; leaveAwaitingAck?: boolean },
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     const meta = await readMetaV06(taskId);
@@ -2537,6 +2562,8 @@ export const finalizeStaleAndIdleLocked = async (
     const now = Date.now();
     meta.actions = meta.actions.map((a) => {
       if (opts?.exceptActionId && a.id === opts.exceptActionId) return a;
+      // 归档场景：只收 running，awaiting_ack 留给恢复后继续 ack（agent 已结束、无活资源）
+      if (a.status === "awaiting_ack" && opts?.leaveAwaitingAck) return a;
       if (a.status !== "running" && a.status !== "awaiting_ack") return a;
       return {
         ...a,

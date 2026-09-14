@@ -1339,6 +1339,9 @@ const advanceTaskCore = async (
       type: actionType,
       userInstruction,
       agentModel: model,
+      // 跑在哪家快照：只记确定的（task.provider 为空不记、不猜）；
+      // 切家后旧 action 认得出来，resolveSessionModel 自动回退新家默认
+      agentProvider: task.provider?.trim() || undefined,
       // V0.6.23：仅 build 带批次选择（其它 action 不传、appendAction 内部空数组也归 undefined）
       requestedBatchIds: actionType === "build" ? requestedBatchIds : undefined,
       replanMode: actionType === "plan" ? replanMode : undefined,
@@ -2083,6 +2086,74 @@ export const finalizeTask = async (
   } finally {
     endChatLifecycle(taskId, "finalizing");
   }
+};
+
+/**
+ * 归档任务并清理隔离工作区（V1.1：归档不再只是藏行）。
+ *
+ * 语义对齐 finalizeTask 的清理段、但不碰 repoStatus（developing 保持）：
+ *   1) 停活 agent/旁路答疑 → 等真停（防边写边删）
+ *   2) running action → cancelled（awaiting_ack 保留、恢复后仍可 ack；无 running 时只把 runStatus 顺手回 idle）
+ *   3) 停预览 → WIP 快照后删 worktree（feature 分支保留在原仓库）
+ *   4) 落 archived 标记 + 清理事件；取消归档不重建、下次推进自动重建。
+ *
+ * 非 worktree 任务（chat / 未绑仓）直接翻标记、不进清理。
+ * best-effort：清理失败只 log + 事件提醒、不挡归档主流程（boot 孤儿扫描兜底）。
+ */
+export const archiveTaskWithCleanup = async (
+  taskId: string,
+  archived: boolean,
+): Promise<Task | null> => {
+  const { setTaskPinArchive } = await import("./task-fs");
+  // false 分支只是翻标记、不重建 worktree（下次推进重建）；别在这里加“恢复即重建”，会拖慢取消归档并引入并发写竞态。
+  if (!archived) {
+    return await setTaskPinArchive(taskId, { archived: false });
+  }
+  const task = await getTaskMeta(taskId);
+  if (!task) return null;
+  // 非任务模式 / 非隔离工作区任务：只翻标记（chat 沿用“后台继续跑”语义）
+  if (task.mode === "chat" || !isWorktreeTask(task)) {
+    return await setTaskPinArchive(taskId, { archived: true });
+  }
+  // 有活就停：与 finalize 同协议（cancel 只是发信号、下面等真停再删）。
+  // 注意不删 pendingStopRequests：cancel 在 Agent.create→runningTasks.set 窗口走的是“记标记让启动链自裁”分支，
+  // 紧接着删等于亲手掐信号——迟到的 create 会注册成功又不自裁，然后边写边删。留着它，迟到链自裁时自己消费，
+  // 下次推进 claim 后也会消费（advance afterClaim），归档后无新启动、留着无害。finalize 敢删是因为终态不再启动。
+  cancelTaskRun(taskId);
+  cancelRestrictedQuestions(taskId);
+  // 两个 wait 相互独立、失败都吞，并行等（串行最长挂 16s，归档 PATCH 一直悬着体验差）
+  await Promise.all([
+    waitForTaskToStop(taskId, 8000).catch(() => {}),
+    waitForRestrictedQuestionsToStop(taskId, 8000).catch(() => {}),
+  ]);
+  // 只收 running、awaiting_ack 留给恢复后 ack；顺带把问一问留下的 running 状态回 idle
+  await finalizeStaleAndIdleLocked(taskId, { toStatus: "cancelled", leaveAwaitingAck: true }).catch(() => null);
+  try {
+    await stopPreviewsForTask(taskId);
+  } catch (err) {
+    console.warn(`[task-runner] archiveTask: 停预览失败（忽略）task=${taskId}`, err);
+  }
+  const removed = await removeTaskWorktrees(task).catch((err) => {
+    console.warn(`[task-runner] archiveTask: 清理 worktree 失败 task=${taskId}`, err);
+    return null;
+  });
+  if (removed?.removedAny || (removed?.snapshotFailedRepos.length ?? 0) > 0) {
+    const repoTail = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+    const snapshotNote =
+      removed && removed.snapshotRepos.length > 0
+        ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
+        : "";
+    const failedNote =
+      removed && removed.snapshotFailedRepos.length > 0
+        ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
+        : "";
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：归档清理 owner 无条件语义
+    await writeEventAndPublish(taskId, {
+      kind: "info",
+      text: `已归档并清理任务隔离工作区（feature 分支保留在原仓库、取消归档后下次推进会自动重建${snapshotNote}${failedNote}）`,
+    });
+  }
+  return await setTaskPinArchive(taskId, { archived: true });
 };
 
 /**
@@ -3125,6 +3196,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
                 model,
                 providerId: createdProviderId,
                 callerToken,
+                taskId: task.id,
                 // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
                 // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills /
                 // inline mcpServers）；曾用 ["project"] 时 chat 未绑目录 cwd=homedir 会把
@@ -4985,6 +5057,7 @@ export const resumeTaskSession = async (
         apiKey: creds.apiKey,
         providerId,
         callerToken,
+        taskId: task.id,
         model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
         // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
@@ -5333,6 +5406,7 @@ export const startOneShotQuestion = (
               apiKey: creds.apiKey,
               model: creds.model,
               providerId: await resolveProviderIdFromDisk(task),
+              taskId: task.id,
               // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
               local: { cwd: effectiveCwd, settingSources: [] },
             }),

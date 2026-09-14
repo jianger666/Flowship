@@ -37,7 +37,7 @@ import {
   createWriteToolDefinition,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { withModelBudget } from "./tool-output-budget";
+import { withModelBudget, type ModelBudgetSpill } from "./tool-output-budget";
 
 const asTool = (d: unknown): ToolDefinition => d as ToolDefinition;
 
@@ -198,12 +198,16 @@ const withPrepare = (
  * grep 跟 prompt 形状一致（pattern/path/glob）、仍走 pi 原生实现（createGrepToolDefinition），
  * 加同名包装只为套输出预算（withModelBudget）——D1 之前 native grep 是 50KB 上限、这里再收紧到 32KB。
  * 每项都包 withModelBudget：进模型前截断，事件落盘链不动。
+ * spill 有 taskId → 超预算全量落盘 + 后缀给路径（V2）；无 → V1 后缀。
  */
-export const buildNativeToolAliasWrappers = (cwd: string): ToolDefinition[] => [
-  withModelBudget(withPrepare(createWriteToolDefinition(cwd), prepareWriteArgs)),
-  withModelBudget(withPrepare(createEditToolDefinition(cwd), prepareEditPathArgs)),
-  withModelBudget(withPrepare(createReadToolDefinition(cwd), prepareReadArgs)),
-  withModelBudget(asTool(createGrepToolDefinition(cwd))),
+export const buildNativeToolAliasWrappers = (
+  cwd: string,
+  spill?: ModelBudgetSpill,
+): ToolDefinition[] => [
+  withModelBudget(withPrepare(createWriteToolDefinition(cwd), prepareWriteArgs), spill),
+  withModelBudget(withPrepare(createEditToolDefinition(cwd), prepareEditPathArgs), spill),
+  withModelBudget(withPrepare(createReadToolDefinition(cwd), prepareReadArgs), spill),
+  withModelBudget(asTool(createGrepToolDefinition(cwd)), spill),
 ];
 
 // ----------------- shell（= pi 的 bash） -----------------
@@ -431,8 +435,11 @@ const deleteTool = (cwd: string): ToolDefinition =>
  * 只读轮次的 customTools：只要 read/grep 别名包装（输出预算照套）。
  * shell / glob / delete / task / 写类 / 系统工具 / MCP 全不给——执行层门禁。
  */
-export const buildReadOnlyToolDefs = (cwd: string): ToolDefinition[] => {
-  const all = buildNativeToolAliasWrappers(cwd);
+export const buildReadOnlyToolDefs = (
+  cwd: string,
+  spill?: ModelBudgetSpill,
+): ToolDefinition[] => {
+  const all = buildNativeToolAliasWrappers(cwd, spill);
   return all.filter((d) => {
     const name = (d as { name?: unknown }).name;
     return name === "read" || name === "grep";
@@ -447,12 +454,13 @@ export const buildReadOnlyToolDefs = (cwd: string): ToolDefinition[] => {
 export const buildCodingToolDefs = (
   cwd: string,
   runSubagent: (prompt: string) => Promise<string>,
+  spill?: ModelBudgetSpill,
 ): ToolDefinition[] => [
-  withModelBudget(shellTool(cwd)),
-  withModelBudget(globTool(cwd)),
-  withModelBudget(deleteTool(cwd)),
-  withModelBudget(taskTool(runSubagent)),
-  ...buildNativeToolAliasWrappers(cwd),
+  withModelBudget(shellTool(cwd), spill),
+  withModelBudget(globTool(cwd), spill),
+  withModelBudget(deleteTool(cwd), spill),
+  withModelBudget(taskTool(runSubagent), spill),
+  ...buildNativeToolAliasWrappers(cwd, spill),
 ];
 
 /** 供 subagent 提示 / 其它处复用：规范编码工具名清单（含原生同名 + 这里补的） */

@@ -302,6 +302,82 @@ const writeToolOutputAtomic = async (
   }
 };
 
+/**
+ * 模型截断层（tool-output-budget V2）落真实全量：与 UI 共用同一个文件
+ * `tool-outputs/<callId>.txt`——模型后缀里的绝对路径和 UI「查看完整输出」指向同一份全文。
+ *
+ * 时序保证：withModelBudget 在 `execute` 返回前 await 本函数，所以后到的
+ * buildToolResultMeta 一定能看到完整文件（不会读到半截）。失败返回 null、
+ * 调用方降级成 V1 后缀（缩小范围重取），绝不拖垮工具执行。
+ */
+export const spillModelFullOutput = async (
+  taskId: string,
+  callId: string,
+  full: string,
+): Promise<{ absPath: string; relPath: string } | null> => {
+  const rel = toolOutputRelPath(callId);
+  const abs = path.join(taskDir(taskId), rel);
+  try {
+    await writeToolOutputAtomic(abs, full);
+    // best-effort 清旧文件（超 200 / 50MB），与 persistTruncatedOutput 同策略
+    void pruneToolOutputsDir(taskId);
+    return { absPath: abs, relPath: rel };
+  } catch (err) {
+    console.warn(
+      `[tool-result] 模型全量落盘失败 task=${taskId} callId=${callId}`,
+      err,
+    );
+    return null;
+  }
+};
+
+/**
+ * execute 返回对象 → 落盘绝对路径（同进程内引用直连）。
+ *
+ * 用途（P2-2 fast path）：buildToolResultMeta 收到的是 execute 返回值的同一引用
+ * （pi 会话事件 → SDKMessage → emitToolResult 全程传引用、不序列化），有映射就不用
+ * 靠「outputText 长度猜有没有落盘」、省掉 8~64KB 频段每次一次 stat miss。
+ * 引用丢失（exotic）时 lookup 返回 undefined，调用方回退长度门 + 读盘兜底——
+ * 映射永远只是加速，不承载正确性。value 是我们自己写的落盘路径，非外部输入。
+ */
+const modelSpillByResult = new WeakMap<object, string>();
+
+export const registerModelSpillResult = (
+  result: object,
+  absPath: string,
+): void => {
+  modelSpillByResult.set(result, absPath);
+};
+
+export const modelSpillPathForResult = (result: unknown): string | undefined =>
+  typeof result === "object" && result !== null
+    ? modelSpillByResult.get(result)
+    : undefined;
+
+/**
+ * 读模型截断层落的真实全量；缺文件 → null（走老 persistTruncatedOutput 兜底）。
+ * 其它读错也当 null（UI 降级展示截断版，不挡事件落盘）。
+ */
+export const readSpilledModelOutput = async (
+  taskId: string,
+  callId: string,
+): Promise<string | null> => {
+  try {
+    return await fs.readFile(
+      path.join(taskDir(taskId), toolOutputRelPath(callId)),
+      "utf-8",
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn(
+        `[tool-result] 读模型全量落盘失败 task=${taskId} callId=${callId}`,
+        err,
+      );
+    }
+    return null;
+  }
+};
+
 /** 超限时写全量到 tool-outputs/；返回截断后的 output + 标记 */
 export const persistTruncatedOutput = async (
   taskId: string,
@@ -344,6 +420,47 @@ type BuildArgs = {
   msgStatus: string;
 };
 
+/**
+ * 按绝对路径读落盘文件：只认「本次调用应有的那个文件」，对不上直接 null。
+ * （映射 value 是我们自己写的，理论上恒对得上；这里是防呆——文件名只由
+ * sanitize 后的 callId 决定，拼不出目录穿越。）
+ */
+const readSpillFileAbs = async (
+  absPath: string,
+  taskId: string,
+  callId: string,
+): Promise<string | null> => {
+  if (absPath !== path.join(taskDir(taskId), toolOutputRelPath(callId))) {
+    return null;
+  }
+  try {
+    return await fs.readFile(absPath, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn(
+        `[tool-result] 读模型全量落盘失败 task=${taskId} callId=${callId}`,
+        err,
+      );
+    }
+    return null;
+  }
+};
+
+/** 落盘全文 → UI 用的 8KB 预览定稿（防御：文件理论上恒超 8KB，矮了就原样给） */
+const previewOfSpilled = (
+  spilled: string,
+  callId: string,
+): { output: string; truncated?: boolean; fullPath?: string } => {
+  if (utf8ByteLength(spilled) <= TOOL_RESULT_OUTPUT_LIMIT) {
+    return { output: spilled };
+  }
+  return {
+    output: truncateToLimit(spilled, TOOL_RESULT_OUTPUT_LIMIT),
+    truncated: true,
+    fullPath: toolOutputRelPath(callId),
+  };
+};
+
 /** 组装 tool_result meta（含截断落盘副作用） */
 export const buildToolResultMeta = async (
   input: BuildArgs,
@@ -365,12 +482,41 @@ export const buildToolResultMeta = async (
   const status = resolveToolResultStatus(input.msgStatus, name, input.result);
   // 抽文本按 SDK 原始工具名（shell/read/edit…）；MCP 走 stringify 兜底
   const outputText = extractToolOutputText(input.rawName, input.result);
+  // V2 fast path：同一引用直连落盘路径（P2-2）——8~64KB 频段（如 read 到的源码文件）
+  // 不截断不落盘，老长度门每次都要 stat miss 一次；有映射直接读盘做预览。
+  const knownSpill = modelSpillPathForResult(input.result);
+  if (knownSpill !== undefined) {
+    const spilled = await readSpillFileAbs(knownSpill, input.taskId, input.callId);
+    if (spilled !== null) {
+      return finishMeta(input, name, status, previewOfSpilled(spilled, input.callId));
+    }
+    // 掉盘（被 prune/手删）→ 继续走下面老路兜底
+  }
+  // V2：模型截断层已把工具真实全量落盘（tool-outputs/<callId>.txt）→ UI 直接复用同一份
+  // 全文做 8KB 预览，绝不覆盖（覆盖会把真实全量洗成 32KB 截断版）。落盘只发生在原文超
+  // 32KB 时，此时 outputText（32KB+后缀）必超 8KB——小输出跳过这次 stat，省一次磁盘 IO。
+  if (utf8ByteLength(outputText) > TOOL_RESULT_OUTPUT_LIMIT) {
+    const spilled = await readSpilledModelOutput(input.taskId, input.callId);
+    if (spilled !== null) {
+      return finishMeta(input, name, status, previewOfSpilled(spilled, input.callId));
+    }
+  }
   const persisted = await persistTruncatedOutput(
     input.taskId,
     input.callId,
     outputText,
   );
+  return finishMeta(input, name, status, persisted);
+};
 
+/** output 定稿后补 shell/edit/write 附加字段（V2 复用落盘与老 persist 共用） */
+const finishMeta = (
+  input: BuildArgs,
+  name: string,
+  status: ToolResultStatus,
+  persisted: { output: string; truncated?: boolean; fullPath?: string },
+): ToolResultMeta => {
+  const argsRec = asRecord(input.args) ?? {};
   const meta: ToolResultMeta = {
     callId: input.callId,
     name,

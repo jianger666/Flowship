@@ -49,7 +49,6 @@ import { useSmoothStreaming } from "@/components/tasks/use-smooth-streaming";
 import { EventStream } from "@/components/tasks/event-stream";
 import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
-import { TaskProviderSwitch } from "@/components/tasks/task-provider-switch";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskUtilityActions } from "@/components/tasks/task-utility-actions";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
@@ -556,12 +555,17 @@ const TaskDetailPage = () => {
     replanMode?: "append" | "rebuild";
     // V0.9：自定义 action 指向的定义 id（advance-dialog 仅 custom 时给值）
     customActionId?: string;
+    // 弹窗内换了提供方时带上切后的 task（用它算新家的凭据、不再读旧 task.provider）
+    switchedTask?: Task;
   }) => {
     setStarting(true);
     try {
+      // 弹窗内换了提供方 = setTaskProvider 已落盘，用切后的 task 算凭据和分支；
+      // 没换就是原 task。fetch 的 id 不变（同一任务）。
+      const t = input.switchedTask ?? task;
       // 统一走 prepareRunArgs：apiKey + model（task.model || settings.defaultModel）
       // MCP 由 server 端读 cursor 配置、不在此传。校验失败 helper 内部 toast.error、返 null
-      const args = prepareRunArgs(task);
+      const args = prepareRunArgs(t);
       if (!args) return;
       // input.model 仅起新 agent 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
       const model = input.model?.id ? input.model : args.model;
@@ -572,7 +576,7 @@ const TaskDetailPage = () => {
       const repoBaseBranches: Record<string, string> = {};
       const repoTestBranches: Record<string, string> = {};
       const repoDevBranches: Record<string, string> = {};
-      for (const p of task.repoPaths) {
+      for (const p of t.repoPaths) {
         const repo = settings.repos.find((r) => r.path === p);
         if (!repo) continue;
         const ob = repo.onlineBranch?.trim();
@@ -583,7 +587,7 @@ const TaskDetailPage = () => {
         if (db) repoDevBranches[p] = db;
       }
 
-      const res = await fetch(`/api/tasks/${task.id}/advance`, {
+      const res = await fetch(`/api/tasks/${t.id}/advance`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -943,12 +947,7 @@ const TaskDetailPage = () => {
           )}
           <ContextDocsPanel task={task} onTaskUpdate={absorbTask} />
           <TaskMcpPanel task={task} onTaskUpdate={absorbTask} />
-          {/* V2a：task 空闲手动切提供方（running/流式窗口禁用，后端再判；只留消息+文件+worktree） */}
-          <TaskProviderSwitch
-            task={task}
-            runActive={runActive || restrictedRunActive}
-            onTaskUpdate={absorbTask}
-          />
+          {/* 提供方切换已搬进底部输入条 + 推进弹窗，顶栏不再放（用户拍板） */}
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
           <div className="h-4 w-px shrink-0 bg-border" />
@@ -1098,6 +1097,7 @@ const TaskDetailPage = () => {
         }}
         task={task}
         prefill={advancePrefill}
+        onTaskUpdate={absorbTask}
         onSubmit={handleAdvance}
         submitting={starting}
       />

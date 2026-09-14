@@ -520,6 +520,8 @@ describe("ownership R23 wave1", () => {
       createdAt: Date.now(),
       lastActiveAt: Date.now(),
       startSnapshot: { title: task.title },
+      // advance 复用要求会话记 repoPaths（防旧 cwd 漂移强制 fresh）：测试任务无仓库，两边都 [] 才算没漂
+      repoPaths: [],
     });
 
     await advanceTask({

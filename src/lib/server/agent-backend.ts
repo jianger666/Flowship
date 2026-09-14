@@ -61,12 +61,16 @@ export type AgentCreateInput = CursorCreateInput & {
   callerToken?: string;
   /** 只读轮次：两边走各自原生工具开关（cursor tools 白名单 / pi 白名单），写类工具执行层拒掉 */
   readOnly?: boolean;
+  /** 任务 id：只给 custom 后端做超预算全量落盘用，Cursor 路径剥掉、不下发 */
+  taskId?: string;
 };
 export type AgentResumeInput = NonNullable<CursorResumeInput> & {
   providerId?: string;
   callerToken?: string;
   readOnly?: boolean;
-};
+  /** 同 create：只给 custom 后端落盘用 */
+  taskId?: string;
+}; 
 export type AgentPromptInput = NonNullable<CursorPromptInput> & {
   providerId?: string;
 };
@@ -75,6 +79,7 @@ type FacadeExtras = {
   providerId?: string;
   callerToken?: string;
   readOnly?: boolean;
+  taskId?: string;
 };
 
 /** 只读轮次的两边通用白名单（读类 only；shell / 写类 / 子代理 / MCP 全不给） */
@@ -86,10 +91,11 @@ const stripFacadeExtras = <T extends FacadeExtras>(
   providerId?: string;
   callerToken?: string;
   readOnly?: boolean;
-  rest: Omit<T, "providerId" | "callerToken" | "readOnly">;
+  taskId?: string;
+  rest: Omit<T, "providerId" | "callerToken" | "readOnly" | "taskId">;
 } => {
-  const { providerId, callerToken, readOnly, ...rest } = input;
-  return { providerId, callerToken, readOnly, rest };
+  const { providerId, callerToken, readOnly, taskId, ...rest } = input;
+  return { providerId, callerToken, readOnly, taskId, rest };
 };
 
 /** Cursor 路径：正式会话把系统工具挂进 local.customTools */
@@ -176,7 +182,7 @@ export const resolveProviderIdFromDisk = async (task: {
  */
 export const Agent = {
   async create(input: AgentCreateInput): Promise<AgentInstance> {
-    const { providerId, callerToken, readOnly, rest } =
+    const { providerId, callerToken, readOnly, taskId, rest } =
       stripFacadeExtras(input);
     const creds = await resolveBackendCreds(rest.apiKey ?? "", providerId);
     const sanitized = stripHiddenModelParams(
@@ -192,6 +198,7 @@ export const Agent = {
         ...creds,
         callerToken: effectiveCallerToken,
         ...(readOnly ? { readOnly: true } : {}),
+        ...(taskId ? { taskId } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
     return CursorAgent.create(
@@ -205,7 +212,7 @@ export const Agent = {
     agentId: string,
     input: AgentResumeInput,
   ): Promise<AgentInstance> {
-    const { providerId, callerToken, readOnly, rest } =
+    const { providerId, callerToken, readOnly, taskId, rest } =
       stripFacadeExtras(input);
     const creds = await resolveBackendCreds(
       rest.apiKey ?? "",
@@ -224,6 +231,7 @@ export const Agent = {
         ...creds,
         callerToken: effectiveCallerToken,
         ...(readOnly ? { readOnly: true } : {}),
+        ...(taskId ? { taskId } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
     return CursorAgent.resume(

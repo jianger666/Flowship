@@ -1006,6 +1006,15 @@ export interface ActionRecord {
   agentModel?: ModelSelection;
 
   /**
+   * 跑这个 action 时用的提供方 id（v1.9.16 起写入：advance 创建时按当时 task.provider 快照）。
+   * - 用途：resolveSessionModel「最近 action 模型优先」只在同提供方下成立——切家后旧 action 的
+   *   模型 id 在新家无效，必须回退 task.model（切时落盘的新家默认）。缺失 = 老数据，按旧口径直接认。
+   * - 只记确定的事实：创建时 task.provider 为空不写（不猜）；切提供方时给所有无戳历史补记旧家
+   *   （见 setTaskProvider 内 stampActionsProviderForSwitch，不是只补当前一条），已有的戳不覆盖。
+   */
+  agentProvider?: string;
+
+  /**
    * artifact 修订快照清单（V0.5.12 沿用、V0.6 由 phase 维度改 action 维度）
    * - 用户「再聊聊」前后端先 snapshot 当前 artifact、复制到 actions/.revisions/<actionId>/<ISO>.md
    * - 每条 action 上限 10、GC 删最老

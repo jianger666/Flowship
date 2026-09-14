@@ -72,7 +72,7 @@ import {
   buildNativeToolAliasWrappers,
   buildReadOnlyToolDefs,
 } from "./pi-coding-tools";
-import { withModelBudget } from "./tool-output-budget";
+import { withModelBudget, type ModelBudgetSpill } from "./tool-output-budget";
 import { loadSkillsForTask } from "./skills-loader";
 import { injectSdkRgPath } from "./sdk-platform-bin";
 
@@ -129,6 +129,11 @@ export interface CustomAgentInput {
   mcpServers?: unknown;
   /** 正式会话身份；无值则不挂交卷/提问等系统工具（oneshot / 受限答疑） */
   callerToken?: string;
+  /**
+   * 任务 id：透传给 withModelBudget 做超预算全量落盘（V2）。
+   * 无值（title 生成等 oneshot）→ V1 后缀，不落盘。
+   */
+  taskId?: string;
   /** 只读轮次：白名单只留读类 customTools（read/grep），shell/写类/子代理/MCP 全不给 */
   readOnly?: boolean;
 }
@@ -348,6 +353,7 @@ const runSubagent = async (
     model: Model<never>;
     cwd: string;
     thinkingLevel: ReturnType<typeof thinkingLevelFromParams>;
+    taskId?: string;
   },
 ): Promise<string> => {
   const { session } = await createAgentSession({
@@ -357,7 +363,12 @@ const runSubagent = async (
     modelRuntime: opts.runtime,
     model: opts.model,
     tools: [...SUBAGENT_TOOLS],
-    customTools: buildNativeToolAliasWrappers(opts.cwd),
+    // 内层同样落盘（同 task 配额），文件名加 sub- 前缀防与父会话 callId 撞车；
+    // 内层工具调用不进父会话事件流，落盘只给模型读
+    customTools: buildNativeToolAliasWrappers(
+      opts.cwd,
+      opts.taskId ? { taskId: opts.taskId, filePrefix: "sub-" } : undefined,
+   ),
     thinkingLevel: opts.thinkingLevel,
     // 子 agent 不落会话文件（一次性）
     sessionManager: SessionManager.inMemory(opts.cwd),
@@ -403,9 +414,13 @@ const buildCustomTools = (
   subagentModel: Model<never>,
   mcpToolDefs: ToolDefinition[],
   thinkingLevel: ReturnType<typeof thinkingLevelFromParams>,
-): ToolDefinition[] => [
-  ...(callerToken
-    ? flowShipTools.map(
+  taskId?: string,
+): ToolDefinition[] => {
+  // V2 落盘配置：全工具共用（编码工具 + MCP 桥接）；无 taskId → V1 后缀
+  const spill: ModelBudgetSpill | undefined = taskId ? { taskId } : undefined;
+  return [
+    ...(callerToken
+      ? flowShipTools.map(
         (t) =>
           ({
             name: t.name,
@@ -422,17 +437,20 @@ const buildCustomTools = (
           }) as unknown as ToolDefinition,
       )
     : []),
-  ...buildCodingToolDefs(cwd, (prompt) =>
-    runSubagent(prompt, {
-      runtime: subagentRuntime,
-      model: subagentModel,
-      cwd,
-      thinkingLevel,
-    }),
-  ),
-  // D1：MCP 桥接工具回包无上限，全包输出预算；flowShipTools（submit_work/ask_user）输出小、不碰
-  ...mcpToolDefs.map((d) => withModelBudget(d)),
-];
+    ...buildCodingToolDefs(cwd, (prompt) =>
+      runSubagent(prompt, {
+        runtime: subagentRuntime,
+        model: subagentModel,
+        cwd,
+        thinkingLevel,
+        taskId,
+      }),
+      spill,
+    ),
+    // D1：MCP 桥接工具回包无上限，全包输出预算；flowShipTools（submit_work/ask_user）输出小、不碰
+    ...mcpToolDefs.map((d) => withModelBudget(d, spill)),
+  ];
+};
 
 // ----------------- run 适配器 -----------------
 
@@ -736,7 +754,10 @@ export const createCustomAgent = async (
   // 全部过滤掉，模型只看到 read/edit/write/grep。
   // 只读轮次：白名单 + customTools 双收敛到读类（执行层门禁，见 buildReadOnlyToolDefs）。
   const customTools = readOnly
-    ? buildReadOnlyToolDefs(cwd)
+    ? buildReadOnlyToolDefs(
+        cwd,
+        input.taskId ? { taskId: input.taskId } : undefined,
+      )
     : buildCustomTools(
         callerToken,
         cwd,
@@ -744,6 +765,7 @@ export const createCustomAgent = async (
         model,
         mcp.toolDefs,
         thinkingLevel,
+        input.taskId,
       );
   const { session } = await createAgentSession({
     cwd,
@@ -793,7 +815,10 @@ export const resumeCustomAgent = async (
   // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
   // 只读轮次双收敛到读类（执行层门禁）。
   const customTools = readOnly
-    ? buildReadOnlyToolDefs(cwd)
+    ? buildReadOnlyToolDefs(
+        cwd,
+        input.taskId ? { taskId: input.taskId } : undefined,
+      )
     : buildCustomTools(
         callerToken,
         cwd,
@@ -801,6 +826,7 @@ export const resumeCustomAgent = async (
         model,
         mcp.toolDefs,
         thinkingLevel,
+        input.taskId,
       );
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接。
   // pi 对缺失文件会静默建空会话（resume「成功」但 messages=[]），随后 send 只有当前句、

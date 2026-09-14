@@ -132,6 +132,22 @@ const modelLabelOf = (models: ModelOption[], id: string): string => {
   return m ? modelName(m) : id;
 };
 
+/**
+ * 输入条 trigger 用的短标签：窄面板下长 id（custom 常见 20+ 字符）会把整排挤爆。
+ * 有展示名用展示名；超长中间截断、头尾都留（同家尾部常撞车如 deepseek-chat-v4，
+ * 前缀才是区分度，只留尾部会长得一模一样），完整 id 放 trigger 的 tooltip（见 renderTrigger）。
+ * 阈值 24：composer-2.5 这类不动；截断 12+省略号+11，同长度。
+ */
+const COMPACT_LABEL_MAX = 24;
+export const compactModelLabel = (
+  models: ModelOption[],
+  id: string,
+): string => {
+  const full = modelLabelOf(models, id);
+  if (full.length <= COMPACT_LABEL_MAX) return full;
+  return `${full.slice(0, 12)}…${full.slice(-11)}`;
+};
+
 interface Props {
   models: ModelOption[];
   selection: ModelSelection;
@@ -368,26 +384,35 @@ export const ModelSelect = ({
             }
           : undefined
       }
-      renderTrigger={() => (
-        <span
-          className={cn(
-            "flex min-w-0 flex-1 items-center text-left",
-            !selection.id && "text-muted-foreground",
-          )}
-        >
-          <span className="min-w-0 truncate">
-            {selection.id
-              ? modelLabelOf(models, selection.id)
-              : emptyPlaceholder}
-          </span>
-          {thinkingLabel ? (
-            <span className="shrink-0 text-muted-foreground">
-              {" · "}
-              {thinkingLabel}
+      renderTrigger={() => {
+        const triggerInner = (
+          <span
+            className={cn(
+              "flex min-w-0 flex-1 items-center text-left",
+              !selection.id && "text-muted-foreground",
+            )}
+          >
+            <span className="min-w-0 truncate">
+              {selection.id
+                ? compactModelLabel(models, selection.id)
+                : emptyPlaceholder}
             </span>
-          ) : null}
-        </span>
-      )}
+            {thinkingLabel ? (
+              <span className="shrink-0 text-muted-foreground">
+                {" · "}
+                {thinkingLabel}
+              </span>
+            ) : null}
+          </span>
+        );
+        // 空态（无 id）不包 Tooltip：content 本来就是 undefined，还挂 hover 监听弹空泡纯属浪费
+        if (!selection.id) return triggerInner;
+        return (
+          <Tooltip content={modelLabelOf(models, selection.id)}>
+            {triggerInner}
+          </Tooltip>
+        );
+      }}
       footer={paramFooter}
     />
   );

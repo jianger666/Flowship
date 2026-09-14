@@ -44,6 +44,7 @@ import {
   type SidebarGroup,
 } from "@/lib/sidebar-groups";
 import { setTaskArchived, setTaskPinned, updateTaskFields } from "@/lib/task-store";
+import { isWorktreeTaskLike } from "@/lib/lightweight-task";
 import { cn } from "@/lib/utils";
 import {
   loadSidebarChatOrder,
@@ -135,7 +136,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   const activeId = params?.id;
   const { tasks, loaded, upsertTask, refresh, markArchiving, unmarkArchiving } =
     useTaskList();
-  const { prompt } = useDialog();
+  const { prompt, confirm } = useDialog();
   // 当前模式（顶栏胶囊同源）——决定列表过滤 + 顶部按钮形态
   const mode = useAppMode();
   // 折叠中的组 key
@@ -338,9 +339,21 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     }
   };
 
-  // 归档：点即归档、无确认；归档后侧栏隐藏，去会话管理页找回/恢复/彻底删除
+  // 归档：idle 点即归档；running 先确认（worktree 任务归档会停机 + 清 worktree），归档后侧栏隐藏，去会话管理页找回/恢复/彻底删除
+  // 清理口径与服务端 archiveTaskWithCleanup 一致：isWorktreeTaskLike（task-worktrees.ts isWorktreeTask 的前端同口径）
   const handleArchive = async (task: TaskSummary) => {
     if (archivingIds.has(task.id)) return;
+    const willCleanup = isWorktreeTaskLike(task);
+    if (task.runStatus === "running") {
+      const ok = await confirm({
+        title: "当前任务还在执行",
+        description: willCleanup
+          ? "归档会停止 agent 并清理隔离工作区（分支保留，取消归档后下次推进会自动重建），是否继续归档？"
+          : "归档后任务仍在后台跑，是否继续归档？",
+        confirmLabel: "归档",
+      });
+      if (!ok) return;
+    }
     setArchivingIds((prev) => new Set(prev).add(task.id));
     // 先乐观、再标记：标记窗口内轮询/SSE 回来的旧快照不得盖掉这一笔
     upsertTask({ ...task, archived: true });
@@ -358,9 +371,13 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       }
       const running = task.runStatus === "running";
       toast.success(
-        running
+        running && !willCleanup
           ? `已归档「${task.title}」、任务仍在后台跑`
-          : `已归档「${task.title}」、可在会话管理找回`,
+          : running
+            ? `已归档「${task.title}」、已停止并清理隔离工作区`
+            : willCleanup
+              ? `已归档「${task.title}」、已清理隔离工作区`
+              : `已归档「${task.title}」、可在会话管理找回`,
         {
           action: {
             label: "撤销",
