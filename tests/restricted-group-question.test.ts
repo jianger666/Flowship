@@ -338,28 +338,26 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     const prompt = bot.send.mock.calls[0]?.[0] as string;
     expect(prompt).toContain("答疑助手");
-    // 核心是三条红线：不改文件、能跑不能发、线上分支相关先找属主确认；test MR 可合
-    expect(prompt).toContain("不改文件");
-    expect(prompt).toContain("能跑不能发");
-    expect(prompt).toContain("线上分支");
-    expect(prompt).toContain("新建 / 修改 / 删除");
-    expect(prompt).toContain("test MR 可以合");
+    // 极简三行：红线 + test MR + 收尾，不许加戏
+    expect(prompt).toContain("三条红线");
+    expect(prompt).toContain("不改任何文件");
+    expect(prompt).toContain("先找属主确认");
+    expect(prompt).toContain("其余都可以干");
+    expect(prompt).toContain("test MR");
+    expect(prompt).toContain("只读 SELECT");
     // 特制执行层已摘掉：prompt 里不许再提只读白名单专用工具
     expect(prompt).not.toContain("merge_test_mr");
     expect(prompt).not.toContain("只读 shell");
-    // 红线之外放行，但只读 shell 的真实能力：只读 SELECT，不调接口
-    expect(prompt).toContain("红线之外都可以干");
-    expect(prompt).toContain("只读 SELECT");
     expect(prompt).not.toContain("调接口");
-    // 旁路不同步凭据文件：prompt 里不许出现凭据文件路径（脱敏声明无路径、无 --config）。
-    // 注意是带反引号的路径引用形式：脱敏声明里“禁止读取 company-env.json”这句纯文字可以留。
+    // honor-system 下公司环境是全量同步的；本用例未配公司环境，所以路径/--config 不该出现
+    //（配了的场景全量声明里本来就有路径，这是“全开”接受的代价）。
     expect(prompt).not.toContain("company-env.json`");
     expect(prompt).not.toContain("--config");
     expect(prompt).not.toContain("直接改");
     expect(prompt).not.toContain("直接动手");
     expect(prompt).not.toContain("才动手");
     expect(prompt).not.toContain("动手改");
-    // 交卷 / 提 MR 这类推进语义同样不该出现在只读通道
+    // 交卷 / 提 MR 这类推进语义同样不该出现在旁路通道
     expect(prompt).not.toContain("submit_work");
     expect(prompt).not.toContain("submit_mr");
 
