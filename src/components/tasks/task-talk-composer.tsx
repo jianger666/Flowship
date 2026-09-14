@@ -332,43 +332,45 @@ export const TaskTalkComposer = ({
           disabled={busy}
           submitting={submitting}
           leading={
-            <span className="flex min-w-0 items-center gap-1.5">
+            <span className="flex min-w-0 flex-1 items-center gap-1.5">
               <Tooltip content="切换提供方（丢精细上下文，只留消息记录 + 磁盘文件 + worktree）">
-                <span className="inline-flex w-auto max-w-36 shrink-0">
+                <span className="inline-flex w-auto max-w-24 shrink-0">
                   <Picker
                     value={providerId || CURSOR_PROVIDER_ID}
                     onChange={(id) => void handleProviderChange(id)}
                     options={listProviderOptions(getSettings())}
                     disabled={busy || savingProvider || providerLocked}
-                    className="h-7 min-w-0 w-auto max-w-28 text-xs"
-                    wrapperClassName="w-auto"
+                    className="h-7 min-w-0 w-auto max-w-24 text-xs"
+                    wrapperClassName="w-auto min-w-0 max-w-full"
                     contentClassName="w-56 min-w-56 max-w-64"
                   />
                 </span>
               </Tooltip>
-              <ModelSelect
-              models={models}
-              selection={pickedModel}
-              onChange={handleModelChange}
-              disabled={busy || savingProvider}
-              variant="compact"
-              emptyPlaceholder="选择模型"
-              providerId={resolveTaskProvider(task, getSettings())}
-              onOpenChange={(open) => {
-                if (!open) return;
-                const s = getSettings();
-                const providerId = resolveTaskProvider(task, s);
-                if (
-                  hasModelCredsForProvider(s, providerId) &&
-                  models.length === 0
-                ) {
-                  void fetchModels({
-                    ...getModelCredsForProvider(s, providerId),
-                    provider: providerId,
-                  });
-                }
-              }}
-            />
+              <span className="min-w-0 flex-1">
+                <ModelSelect
+                  models={models}
+                  selection={pickedModel}
+                  onChange={handleModelChange}
+                  disabled={busy || savingProvider}
+                  variant="compact"
+                  emptyPlaceholder="选择模型"
+                  providerId={resolveTaskProvider(task, getSettings())}
+                  onOpenChange={(open) => {
+                    if (!open) return;
+                    const s = getSettings();
+                    const providerId = resolveTaskProvider(task, s);
+                    if (
+                      hasModelCredsForProvider(s, providerId) &&
+                      models.length === 0
+                    ) {
+                      void fetchModels({
+                        ...getModelCredsForProvider(s, providerId),
+                        provider: providerId,
+                      });
+                    }
+                  }}
+                />
+              </span>
             </span>
           }
           // 运行中：右侧动作组原地换成 spinner + 红停止键（Composer 同款、与 chat 对齐；无排队）

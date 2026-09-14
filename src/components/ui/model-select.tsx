@@ -134,18 +134,19 @@ const modelLabelOf = (models: ModelOption[], id: string): string => {
 
 /**
  * 输入条 trigger 用的短标签：窄面板下长 id（custom 常见 20+ 字符）会把整排挤爆。
- * 有展示名用展示名；超长中间截断、头尾都留（同家尾部常撞车如 deepseek-chat-v4，
- * 前缀才是区分度，只留尾部会长得一模一样），完整 id 放 trigger 的 tooltip（见 renderTrigger）。
- * 阈值 24：composer-2.5 这类不动；截断 12+省略号+11，同长度。
+ * 有展示名用展示名；超长只留头部（同家尾部常撞车如 deepseek-chat-v4，版本号更是噪音），
+ * 完整 id 放 trigger 的 tooltip（见 renderTrigger）。
+ * 阈值 18：composer-2.5 这类不动；超长取前 15 字 + 省略号。
  */
-const COMPACT_LABEL_MAX = 24;
+const COMPACT_LABEL_MAX = 18;
+const COMPACT_LABEL_HEAD = 15;
 export const compactModelLabel = (
   models: ModelOption[],
   id: string,
 ): string => {
   const full = modelLabelOf(models, id);
   if (full.length <= COMPACT_LABEL_MAX) return full;
-  return `${full.slice(0, 12)}…${full.slice(-11)}`;
+  return `${full.slice(0, COMPACT_LABEL_HEAD)}…`;
 };
 
 interface Props {
@@ -317,9 +318,9 @@ export const ModelSelect = ({
       placeholder={emptyPlaceholder}
       searchPlaceholder="搜索模型…"
       className={
-        variant === "compact" ? "h-7 min-w-0 w-auto max-w-64 text-xs" : undefined
+        variant === "compact" ? "h-7 min-w-0 w-auto max-w-48 text-xs" : undefined
       }
-      wrapperClassName={variant === "compact" ? "w-auto" : undefined}
+      wrapperClassName={variant === "compact" ? "w-auto min-w-0 max-w-full" : undefined}
       contentClassName={variant === "compact" ? "w-72 min-w-72 max-w-72" : undefined}
       emptyHint={
         models.length === 0 ? (
@@ -392,13 +393,13 @@ export const ModelSelect = ({
               !selection.id && "text-muted-foreground",
             )}
           >
-            <span className="min-w-0 truncate">
+            <span className="min-w-0 flex-1 truncate">
               {selection.id
                 ? compactModelLabel(models, selection.id)
                 : emptyPlaceholder}
             </span>
             {thinkingLabel ? (
-              <span className="shrink-0 text-muted-foreground">
+              <span className="max-w-20 shrink-0 truncate text-muted-foreground">
                 {" · "}
                 {thinkingLabel}
               </span>
@@ -407,11 +408,11 @@ export const ModelSelect = ({
         );
         // 空态（无 id）不包 Tooltip：content 本来就是 undefined，还挂 hover 监听弹空泡纯属浪费
         if (!selection.id) return triggerInner;
-        return (
-          <Tooltip content={modelLabelOf(models, selection.id)}>
-            {triggerInner}
-          </Tooltip>
-        );
+        // hover 显示完整模型名 + 思考档（输入条只显示短名，完整信息这里看）
+        const fullTip = thinkingLabel
+          ? `${modelLabelOf(models, selection.id)} · ${thinkingLabel}`
+          : modelLabelOf(models, selection.id);
+        return <Tooltip content={fullTip}>{triggerInner}</Tooltip>;
       }}
       footer={paramFooter}
     />

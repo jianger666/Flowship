@@ -62,8 +62,8 @@ export const ProviderModelPicker = ({
       onChange={(id) => onProviderChange?.(id)}
       options={options}
       disabled={disabled}
-      className="h-7 min-w-0 w-auto max-w-36 text-xs"
-      wrapperClassName="w-auto"
+      className="h-7 min-w-0 w-auto max-w-24 text-xs"
+      wrapperClassName="w-auto min-w-0 max-w-full"
       contentClassName="w-56 min-w-56 max-w-64"
     />
   );
@@ -82,23 +82,27 @@ export const ProviderModelPicker = ({
     />
   );
 
+  const providerName = providerDisplayName(settings, providerId);
   const providerEl = showHint ? (
     <Tooltip
       content={`本窗口用这个提供方，设置页默认是 ${providerDisplayName(settings, settingsDefault)}`}
     >
-      <span className="inline-flex w-auto max-w-36 shrink-0">{providerPicker}</span>
+      <span className="inline-flex w-auto max-w-24 shrink-0">{providerPicker}</span>
     </Tooltip>
   ) : (
-    providerPicker
+    // 长提供方名会被 max-w-24 截断，hover 给全名（与模型 pill 的完整名 tooltip 同理）
+    <Tooltip content={providerName}>
+      <span className="inline-flex w-auto max-w-24 shrink-0">{providerPicker}</span>
+    </Tooltip>
   );
 
   const pickerRow = showProvider ? (
-    <div className="flex min-w-0 items-center gap-1.5">
-      <div className="w-auto max-w-36 shrink-0">{providerEl}</div>
-      <div className="min-w-0">{modelSelect}</div>
+    <div className="flex min-w-0 flex-1 items-center gap-1.5">
+      <div className="w-auto max-w-24 shrink-0">{providerEl}</div>
+      <div className="min-w-0 flex-1">{modelSelect}</div>
     </div>
   ) : (
-    <div className="min-w-0">{modelSelect}</div>
+    <div className="min-w-0 flex-1">{modelSelect}</div>
   );
 
   if (compact) return pickerRow;
