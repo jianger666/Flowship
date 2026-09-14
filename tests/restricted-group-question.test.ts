@@ -13,7 +13,8 @@
  * 1. **不碰 task 运行态**：不写 `runStatus`、不占 `runningTasks`、不动属主 `agentSessions`。
  *    受限答疑不是 task 的 action run——写了 running 就会让顶栏「停止」键冒出来，而它走的是
  *    `stopTaskAgent` 核弹路径（awaiting_ack 的 plan/review 一律标 cancelled + 关属主会话）。
- * 2. **prompt 真只读**：只有硬约束，一句允许改动的措辞都不注入（含 user_message 封装尾巴）。
+ * 2. **prompt 讲规矩、工具默认全开**：# 边界只放三条红线（不改文件/能跑不能发/线上分支找属主）+ test MR 可合；
+ *    Agent.create 不传 tools 白名单（两端默认全开），只保留身份隔离（无 callerToken、无 customTools）。
  * 3. **失败必收口**：起不来时写 error 事件 + 发 `done(ok=false)`——群出向 tap 靠这条 done
  *    回「这轮没跑成功」并摘掉回群登记，缺了它登记一直挂着、下一轮无关的 done 会错 @ 人。
  */
@@ -322,7 +323,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
   });
 
   // ─────────────────────────────────────────────────────────────
-  // 2. 旁路 prompt 与白名单口径一致（三条红线：不改文件、能跑不能发、线上分支找属主；test MR 可合，红线之外放行）
+  // 2. 旁路 prompt 讲规矩 + 工具默认全开（内部 honor-system，不接执行层白名单）
   // ─────────────────────────────────────────────────────────────
   it("prompt 只有提示词约束、一句“可以改”的措辞都不注入", async () => {
     const id = alloc();
@@ -342,7 +343,10 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(prompt).toContain("能跑不能发");
     expect(prompt).toContain("线上分支");
     expect(prompt).toContain("新建 / 修改 / 删除");
-    expect(prompt).toContain("merge_test_mr");
+    expect(prompt).toContain("test MR 可以合");
+    // 特制执行层已摘掉：prompt 里不许再提只读白名单专用工具
+    expect(prompt).not.toContain("merge_test_mr");
+    expect(prompt).not.toContain("只读 shell");
     // 红线之外放行，但只读 shell 的真实能力：只读 SELECT，不调接口
     expect(prompt).toContain("红线之外都可以干");
     expect(prompt).toContain("只读 SELECT");
@@ -365,15 +369,16 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(prompt.slice(boundaryAt + 1)).not.toMatch(/\n# /);
 
     // 旁路 agent 执行层白名单 + 不挂系统 customTools（无 callerToken 就没有交卷 / 提 MR 身份）；
-    // 红线提示词里再拦一道（不改文件/能跑不能发/线上分支找属主），执行层兜底、两边口径一致。
+    // 工具默认全开：不传 tools 白名单（Cursor 标准工具集 / pi 全量编码工具）；
+    // 身份照旧隔离（无 callerToken、无 customTools），审计靠事件流。
     const createArg = mockCreate.mock.calls[0]?.[0] as {
       tools?: unknown;
       mcpServers?: unknown;
       callerToken?: string;
       local?: { settingSources?: unknown[]; customTools?: unknown };
     };
-    // Cursor 路：白名单只留读操作，写类工具执行层直接不给
-    expect(createArg.tools).toEqual(["read", "grep"]);
+    // honor-system：执行层不限，规矩只在提示词里
+    expect(createArg.tools).toBeUndefined();
     expect(createArg.mcpServers).toBeUndefined();
     expect(createArg.callerToken).toBeUndefined();
     expect(createArg.local?.settingSources).toEqual([]);

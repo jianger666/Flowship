@@ -1,6 +1,8 @@
 /**
  * 旁路合 test MR（bypass-merge-mr）：test 分支专用、线上分支与未知分支默认拒绝。
  *
+ * 注：旁路已改 honor-system（提示词-only），本工具当前未接线，转为单元覆盖留着。
+ *
  * 钉四件事：
  * 1. 目标分支守卫（纯函数）：测试分支放行、线上分支拒绝、其余拒绝；
  * 2. 全流程只合 test 目标：MR 详情 target=qa → 调 mergeMR；target=master/feat-x/closed → 不调；

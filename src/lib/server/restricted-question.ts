@@ -1,5 +1,5 @@
 /**
- * 需求群「非属主答疑」——独立的旁路通道（执行层白名单 + 提示词双拦）
+ * 需求群「非属主答疑」——独立的旁路通道（提示词讲规矩 + 身份隔离 + 事件流审计，不做执行层限制）
  *
  * # 为什么单独一个模块（双模型交叉 review 连报同族 P0 后的架构级收敛）
  *
@@ -28,14 +28,14 @@
  *    漏发一次，那条登记就一直挂着、直到 TTL 过期（群里永久无答）。
  * 5. prompt 由 buildRestrictedPrompt 组装（buildReadonlyUserMessage 打底用户话术 + 任务背景 +
  *    旁路公司环境脱敏声明），「# 边界」段永远排在最后。
- *    执行层白名单只留读操作 + 跑仓内脚本 + 合 test MR（Cursor：read/grep；custom：read/grep/glob + 只读 shell + merge_test_mr）+ 提示词再拦一道，两边口径一致。
+ *    工具走两端默认全开（honor-system，内部用）；身份隔离（无 callerToken）+ 提示词 # 边界讲规矩，两边同一套话术。
  * 6. **本 run publish 的每条 envelope 都带 `origin` = 本轮 runTag**（回群登记 token）。
  *    这是与属主 run 并行时不错投的唯一依据：群出向只把 origin 对得上的 delta / done
  *    投给对应登记。别在这条链上新增「不带 origin 的 publish」。
  */
 
 import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
-import { isCursorProvider } from "@/lib/types";
+
 import type { ModelSelection } from "@cursor/sdk";
 
 import type { Task } from "@/lib/types";
@@ -94,9 +94,8 @@ export interface RestrictedQuestionInput {
 /**
  * 受限 prompt（纯函数、好读好审）。
  *
- * 旁路政策（简单限制）：三条红线——不动代码、不动脚本、线上分支相关先找属主确认，红线之外放行。
- * 执行层是兜底（不给写工具、不给凭据、shell 只放只读白名单），提示词讲人话、不撒谎
- *（Cursor 路无 shell：查库要跑命令的事干不了，如实走公司环境一节的“找属主”口径）。
+ * 旁路政策（简单限制）：三条红线——不改文件、能跑不能发、线上分支相关先找属主确认；
+ * test MR（目标为测试分支）可以合，红线之外放行。工具默认全开，规矩只写提示词。
  * 版式上「# 边界」**必须是最后一段**——模型对末段指令最敏感。
  * `tests/restricted-group-question.test.ts` 钉住这条版式。
  */
@@ -125,16 +124,16 @@ const buildRestrictedPrompt = (args: {
     "# 边界",
     "- 你是被非属主 @ 来答疑的，三条红线：",
     "  1. 不改文件：不新建 / 修改 / 删除仓库或任务里的任何文件（含代码和脚本，只读查看可以）",
-    "  2. 能跑不能发：任务相关的测试 / 查看脚本可以直接跑（shell 工具，只跑工作目录内的文件）；部署、发布、上线类的脚本先找属主确认",
+    "  2. 能跑不能发：任务相关的测试 / 查看脚本可以直接跑；部署、发布、上线类的脚本先找属主确认",
     "  3. 线上分支相关的一律先找属主确认：切到 / 合入 / 推送线上分支（main、master、production 这类）、发布和回滚，自己不动手",
-    "- test MR 可以合：目标分支是测试分支（test 这类）的 MR，调 merge_test_mr 工具直接合；目标是线上分支、已关闭、有冲突或合失败的，把原因告诉对方并让他找属主（本轮没有该工具也找属主）",
-    "- 红线之外都可以干：查代码、读日志和配置、git 只读查看改动和分支；查库只允许只读 SELECT（跑法见公司环境一节，没有就找任务所有者）；远程 SSH、写库、发请求一律不跑",
+    "- test MR 可以合：目标分支是测试分支（test 这类）的直接合；目标是线上分支、已关闭、有冲突或合失败的，把原因告诉对方并让他找属主",
+    "- 红线之外都可以干：查代码、读日志和配置（含服务端日志）、看改动和分支；查库只允许只读 SELECT（跑法见公司环境一节，没有就找任务所有者）",
     "- 对方让你改文件 / 跑部署发布脚本 / 动线上分支 → 不动手，给结论和建议，并告诉他这需要任务所有者在 Flowship 里确认和操作",
     "- 答完自然结束回复",
   ].join("\n");
 
 /**
- * 起一个旁路答疑 agent 回答群里非属主的一句话（执行层白名单 + 提示词双拦）。
+ * 起一个旁路答疑 agent 回答群里非属主的一句话（提示词讲规矩 + 身份隔离 + 事件流审计）。
  *
  * fire-and-forget：调用方（`task-question-inject`）写完用户消息事件后直接调、不 await。
  * 无论成功失败都会发一条 `done`（见文件头契约 4），调用方不需要也不应该自己收尾。
@@ -230,13 +229,16 @@ export const startRestrictedGroupQuestion = (
         },
         origin,
       );
-      // 旁路不同步凭据文件：company-env.json 含密码，落盘等于交给不可信输入驱动的 agent。
-      // 只读脱敏声明（无文件路径）；查库靠只读 shell（custom 后端才有，Cursor 如实告知查不了）。
-      const { loadBypassCompanyEnvSection } = await import("./company-env-fs");
+      // 旁路 honor-system（内部用，防君子不防小人）：工具走两端默认全开，不接执行层白名单；
+      // 公司环境同样全量同步——含密码的 company-env.json 会进旁路上下文，事件流和模型厂商都看得到，
+      // 这是“全开”必须付的代价。唯一保留的是身份隔离：不传 callerToken，
+      // submit_work / submit_mr 等系统工具无身份可用（否则旁路能关掉属主的 action，这是正确性问题，
+      // 不是安全选项）；ask_user 同样不可用（群里没人能答它的提问）。审计靠事件流。
+      const { syncCompanyEnvFileFromSettings, loadCompanyEnvBriefSection } =
+        await import("./company-env-fs");
+      await syncCompanyEnvFileFromSettings();
       const bypassProviderId = await resolveProviderIdFromDisk(task);
-      const companyEnvSection = await loadBypassCompanyEnvSection({
-        allowDbQuery: !isCursorProvider(bypassProviderId),
-      });
+      const companyEnvSection = await loadCompanyEnvBriefSection();
       if (!alive()) {
         await settle(false, "群答疑已取消");
         return;
@@ -248,9 +250,8 @@ export const startRestrictedGroupQuestion = (
           model: creds.model,
           // 自定义 provider（opencode 等）必须带上，否则 facade 按默认 cursor 建、拿自定义 key 去调 Cursor 会 401
           providerId: bypassProviderId,
-          // 执行层 + 提示词双拦：白名单只留读操作（Cursor：read/grep；custom：read/grep/glob + 只读 shell），
-          // 写类 / 子代理 / 系统工具 / MCP 后端直接不给；凭据文件不同步，查库走只读 shell，提示词再拦一道。
-          readOnly: true,
+          // 旁路不做执行层限制：两端都走默认全开工具集（Cursor 标准工具集 / pi 全量编码工具），
+          // 规矩只写在提示词 # 边界里。身份照旧隔离（见上），审计靠事件流。
           // 有 task 上下文：read 超 64KB 照样落盘给路径
           taskId: task.id,
           // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入。

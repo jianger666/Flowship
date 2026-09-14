@@ -1,6 +1,9 @@
 /**
  * 旁路只读守卫（review P0 的回归护栏）：坏人用例必须被执行层拒绝。
  *
+ * 注：旁路已改 honor-system（提示词-only），本文件转为 validateReadonlyShellCommand 等纯函数 + def 的
+ * 单元覆盖，当前旁路运行时不再接线。留着：哪天想收紧，接回去就行，不用重写。
+ *
  * 钉三件事：
  * 1. 只读 shell 默认拒绝：rm / git 写操作 / curl / ssh-exec / 内联代码 / 写 SQL / 命令拼接 / 目录逃逸，
  *    只放 pg-exec SELECT（无 --config、SQL 独占引号参数）、本地查看命令（cwd 内）、git 只读动词
