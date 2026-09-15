@@ -667,7 +667,9 @@ const EventStreamImpl = ({
     [task.events],
   );
   const showQaPanel = showGroupQa && groupQaRounds.length > 0;
-  // 进行中轮次 → tab 上亮蓝点（主流程里它完全隐身，不给提示用户不知道有人问了，review P1-4）
+  // 进行中轮次 → tab 上亮蓝点（主流程里它完全隐身，不给提示用户不知道有人问了，review P1-4）。
+  // 已知局限：answering 按快照时间算，无新事件就不重算——崩溃打断的那轮蓝点会常亮到下个事件到来。
+  // 故意的：这组件有过输入卡顿 perf 坑，不加分钟级 tick；下个事件（属主说句话）到就灭。
   const groupQaAnswering = groupQaRounds.some((r) => r.answering);
 
   // 第二层：未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的

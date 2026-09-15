@@ -67,7 +67,10 @@ export interface QueuedGroupQuestion {
   enqueuedAt: number;
 }
 const groupQuestionQueues = new Map<string, QueuedGroupQuestion[]>();
-/** 入队（满了返回 queued:false，调用方落回忙线拒收）。now 参数只给单测用 */
+/**
+ * 入队（满了返回 queued:false，调用方落回忙线拒收）。now 参数只给单测用。
+ * 先懒清过期（review A）：TTL 是 shift 时才丢的，不先清会拿死槽位误拒新问题。
+ */
 export const enqueueGroupQuestion = (
   taskId: string,
   entry: Omit<QueuedGroupQuestion, "enqueuedAt">,
@@ -78,6 +81,11 @@ export const enqueueGroupQuestion = (
   if (!q) {
     q = [];
     groupQuestionQueues.set(taskId, q);
+  } else if (q.length > 0) {
+    // filter 永远返回新数组：无条件写回，否则 push 进空气（review 三轮实测抓包）
+    const kept = q.filter((e) => now - e.enqueuedAt < GROUP_QUESTION_QUEUE_TTL_MS);
+    groupQuestionQueues.set(taskId, kept);
+    q = kept;
   }
   if (q.length >= GROUP_QUESTION_QUEUE_MAX)
     return { queued: false, position: q.length };
@@ -551,6 +559,26 @@ export const __resetBypassLoopForTest = (): void => {
 export const resetBypassLoop = (taskId: string): void => {
   if (taskId) bypassLoopByTask.delete(taskId);
 };
+/** 单测 peek：某 task 熔断表里还有哪些发送人（断言清理用） */
+export const __getBypassLoopSendersForTest = (taskId: string): string[] => [
+  ...(bypassLoopByTask.get(taskId)?.bySender.keys() ?? []),
+];
+
+/**
+ * per-task 节流：同一 key 一分钟内只放行一次（review D：身份服务抖时 warn 刷屏）。
+ * now 参数只给单测用。
+ */
+const throttleMarks = new Map<string, number>();
+export const throttleOncePerMinute = (key: string, now: number = Date.now()): boolean => {
+  const last = throttleMarks.get(key);
+  if (last !== undefined && now - last < 60_000) return false;
+  throttleMarks.set(key, now);
+  return true;
+};
+export const __resetThrottleForTest = (): void => {
+  throttleMarks.clear();
+};
+
 /** 只看不记：冷却中吗（排队 draining 用，不消耗计数） */
 export const isBypassLoopCooling = (
   taskId: string,
@@ -578,6 +606,13 @@ export const recordBypassLoopAttempt = (
     bypassLoopByTask.set(taskId, st);
   }
   if (now < st.cooldownUntil) return { tripped: false, cooled: true };
+  // 顺手清别人的过期数组（review B）：量小，一次 Map 遍历无压力，不清会越积越大
+  for (const [id, arr] of st.bySender) {
+    if (id === senderId) continue;
+    const kept = arr.filter((t) => now - t < BYPASS_LOOP_WINDOW_MS);
+    if (kept.length === 0) st.bySender.delete(id);
+    else st.bySender.set(id, kept);
+  }
   const rounds = (st.bySender.get(senderId) ?? []).filter(
     (t) => now - t < BYPASS_LOOP_WINDOW_MS,
   );

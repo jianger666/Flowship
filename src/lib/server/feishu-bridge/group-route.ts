@@ -77,6 +77,7 @@ import {
   rememberGroupReply,
   recordBypassLoopAttempt,
   resetBypassLoop,
+  throttleOncePerMinute,
   restoreGroupReply,
   shiftGroupQuestionQueue,
   unshiftGroupQuestionQueue,
@@ -1092,12 +1093,21 @@ const injectGroupMessage = async (args: {
  * 串行 guard：done 与 action 帧可能连着到，重入只跑一份。
  */
 const questionPumpRunning = new Set<string>();
+// guard 撞车登记：inbound pump 还在 await inject 时，done 的 pump 不丢机会，
+// 当前这轮 finally 里补一圈（无定时器，review G 二轮；循环本来就会 drenar 队，
+// 补圈只覆盖“判空后、清 guard 前”那个微秒窗口）。
+const questionPumpWanted = new Set<string>();
 export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
-  if (!taskId || questionPumpRunning.has(taskId)) return;
+  if (!taskId) return;
+  if (questionPumpRunning.has(taskId)) {
+    questionPumpWanted.add(taskId);
+    return;
+  }
   if (isBypassLoopCooling(taskId)) return;
   questionPumpRunning.add(taskId);
   try {
     for (;;) {
+      if (isBypassLoopCooling(taskId)) return;
       const head = shiftGroupQuestionQueue(taskId);
       if (!head) return;
       const r = await injectGroupMessage({
@@ -1126,6 +1136,10 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
     }
   } finally {
     questionPumpRunning.delete(taskId);
+    if (questionPumpWanted.delete(taskId)) {
+      // 有人在本轮里求过泵：补一圈（guard 已空，进来就走主路；递归深度实际为 1）
+      await pumpGroupQuestionQueue(taskId);
+    }
   }
 };
 
@@ -1207,7 +1221,10 @@ export const routeGroupInboundMessage = async (
   if (!!ownerOpenId && msg.sender_id === ownerOpenId) {
     resetBypassLoop(taskId);
   } else if (!ownerOpenId) {
-    console.warn(`${LOG} 属主身份不可用、熔断计数跳过（fail-open）task=${taskId}`);
+    // 节流：身份服务抖时每条 @ 都 warn 会把日志淹了（review D）
+    if (throttleOncePerMinute(`loop-failopen:${taskId}`)) {
+      console.warn(`${LOG} 属主身份不可用、熔断计数跳过（fail-open）task=${taskId}`);
+    }
   } else {
     const loop = recordBypassLoopAttempt(taskId, msg.sender_id);
     if (loop.tripped || loop.cooled) {

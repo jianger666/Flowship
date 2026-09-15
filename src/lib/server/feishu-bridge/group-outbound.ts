@@ -403,10 +403,17 @@ const flushGroupReply = async (
     entry.atRequester === false
       ? ""
       : `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
-  // 先发后记：发送炸了外层吞掉、汇总也不写，tab 与群一致（都静默），
-  // 原因查主流程 error 事件。反过来（先记后发）tab 会躺着群里没收到的答案，更误导（review P2-7）。
-  await deps.sendMarkdown(entry.chatId, `${head}${truncateForGroup(body)}`);
+  // 发送炸了也写汇总（review C 二轮）：外层整段吞异常，不写 tab 与群就两边全静默、没处查。
+  // ok:false + 失败正文进 tab，原因仍查主流程 error 事件。take 先摘，写两次不可能 duplicate。
+  let sendOk = true;
+  try {
+    await deps.sendMarkdown(entry.chatId, `${head}${truncateForGroup(body)}`);
+  } catch (err) {
+    sendOk = false;
+    warn(`回答回群发送失败 task=${taskId}`, err);
+  }
   // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
+  // 发送炸了也记（ok:false）：答案躺 tab 里至少能复制，不至于两边全静默。
   // publish 不带 origin：投不进任何登记、不触发回群。
   if (entry.runTag) {
     await writeEventAndPublish(
@@ -418,8 +425,8 @@ const flushGroupReply = async (
         ...(entry.sourceMessageId
           ? { questionMessageId: entry.sourceMessageId }
           : {}),
-        answer,
-        ok,
+        answer: sendOk ? answer : body,
+        ok: sendOk && ok,
       }),
     );
   }

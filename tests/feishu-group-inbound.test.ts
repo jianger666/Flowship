@@ -44,7 +44,9 @@ const {
 } = await import("@/lib/server/feishu-bridge/group-route");
 
 const {
+  __getBypassLoopSendersForTest,
   __resetGroupAdvancePickForTest,
+  __resetThrottleForTest,
   __resetGroupReplyStateForTest,
   BYPASS_LOOP_MAX_ROUNDS,
   BYPASS_LOOP_WINDOW_MS,
@@ -57,6 +59,7 @@ const {
   recordBypassLoopAttempt,
   resetBypassLoop,
   sanitizeGroupMemberName,
+  throttleOncePerMinute,
 } = await import("@/lib/server/feishu-bridge/group-shared");
 
 const { buildGroupAskCardJson } = await import(
@@ -2258,5 +2261,88 @@ describe("排队边界", () => {
     } finally {
       unregisterRestrictedQuestion("task-1", inFlight);
     }
+  });
+});
+
+describe("review 三轮：过期占位/多sender清理/节流/补泵", () => {
+  it("A：入队先清过期，死槽不占位", async () => {
+    const { enqueueGroupQuestion: enq } = await import(
+      "@/lib/server/feishu-bridge/group-shared"
+    );
+    const old = Date.now() - GROUP_QUESTION_QUEUE_TTL_MS - 1000;
+    const entry = {
+      messageId: "om_old",
+      chatId: CHAT,
+      text: "过期问题",
+      parsed: { text: "过期问题", images: [], attachments: [] } as never,
+      requester: { openId: "ou_li", name: "李四" },
+      boot: { apiKey: "k", model: { id: "m" } },
+    };
+    for (let i = 0; i < GROUP_QUESTION_QUEUE_MAX; i++) {
+      expect(enq("task-1", { ...entry, messageId: `om_old${i}` }, old).queued).toBe(
+        true,
+      );
+    }
+    // 全是过期槽：新问题得到位子，而不是被误拒
+    const r = enq("task-1", { ...entry, messageId: "om_new" });
+    expect(r.queued).toBe(true);
+    expect(groupQuestionQueueLength("task-1")).toBe(1);
+  });
+
+  it("B：顺手清掉别人的过期数组，不越积越大", () => {
+    const t = "task-cleanup-unit";
+    const base = 1_000_000;
+    recordBypassLoopAttempt(t, "ou_stale", base);
+    recordBypassLoopAttempt(t, "ou_fresh", base + BYPASS_LOOP_WINDOW_MS + 1000);
+    // 实现细节：记录 fresh 时把 stale 的过期数组删掉
+    expect(__getBypassLoopSendersForTest(t)).toEqual(["ou_fresh"]);
+  });
+
+  it("D：同一 key 一分钟内只放行一次", () => {
+    __resetThrottleForTest();
+    expect(throttleOncePerMinute("k1", 0)).toBe(true);
+    expect(throttleOncePerMinute("k1", 59_999)).toBe(false);
+    expect(throttleOncePerMinute("k1", 60_000)).toBe(true);
+    expect(throttleOncePerMinute("k2", 59_999)).toBe(true);
+  });
+
+  it("G：guard 撞车不丢机会，当前轮 finally 里补一圈且不重复注入", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    const { enqueueGroupQuestion: enq } = await import(
+      "@/lib/server/feishu-bridge/group-shared"
+    );
+    const { pumpGroupQuestionQueue: pump } = await import(
+      "@/lib/server/feishu-bridge/group-route"
+    );
+    // 卡住注入，让两轮 pump 撞上 guard
+    let release!: () => void;
+    const gate = new Promise<Response>((r) => {
+      release = () => r(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    handleTaskQuestionInject.mockImplementationOnce(() => gate);
+    enq("task-1", {
+      messageId: "om_g1",
+      chatId: CHAT,
+      text: "排队的问题",
+      parsed: { text: "排队的问题", images: [], attachments: [] } as never,
+      requester: { openId: "ou_li", name: "李四" },
+      boot: { apiKey: "k", model: { id: "m" } },
+    });
+    const p1 = pump("task-1");
+    // 等第一轮真进到 inject 里卡住，再让第二轮撞 guard（只登记补泵，不并跑）
+    const deadline = Date.now() + 5000;
+    while (handleTaskQuestionInject.mock.calls.length < 1) {
+      if (Date.now() > deadline) throw new Error("首轮 pump 一直没进到 inject");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await pump("task-1");
+    release();
+    await p1;
+    // 队首只被注入一次（补圈发现队空就回，不重复）
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
   });
 });
