@@ -355,7 +355,12 @@ const flushGroupAdvanceReply = async (
   // 与自动播报共用同一张产物卡防重表、先占再发（占坑同步、中间零 await）。
   // 占不到 = 播报侧已经在发同一份产物：上面 takeGroupReply 已把登记摘走、
   // 它的预筛会扑空并照发，这里再发就是群里两张一模一样的卡（P2-1）。
-  if (!claimGroupArtifactCard(taskId, actionId)) return;
+  // 但发起人还等着交代：卡片那边不 @ 人（artifact 无正文拼不上 @），这里补一句
+  // 轻提醒（review 十一轮-1）。能到这里的都是属主本人（路由层 + 回调层双验），@ 没事。
+  if (!claimGroupArtifactCard(taskId, actionId)) {
+    await deps.sendText(entry.chatId, `${at} 刚交卷，产物见上卡`);
+    return;
+  }
   try {
     await deps.shareToGroup(task, {
       kind: "artifact",

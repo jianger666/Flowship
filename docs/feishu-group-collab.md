@@ -864,7 +864,7 @@ runActionPostCheck（后台、独立 check 租约）
 | 3 | 该 task 有 `advance` 群回流登记 + `advanceResultToGroup` 开 | `skipped_group_reply` | 让位给 `group-outbound`，绝不发两张卡 |
 | 4 | 桥接总开关关 | `skipped_bridge_off` | 与出向同口径 |
 | 5 | 无 artifact / 读不到 / 空 | `skipped_no_content` | 不发空卡 |
-| 6 | **工作项还没绑需求群 / 查群失败** | `skipped_no_group` | **播报绝不建群**，见下 |
+| 6 | **工作项还没绑需求群 / 查群失败** | `skipped_no_group` | **播报绝不建群**，见下。绑群前已出的产物卡**不会补播**（去 app 看；绑群成功后只播新增终态，不翻旧账——review 十一轮-2，要补播就另立项） |
 | 7 | 已发过（防重表命中） | `skipped_duplicate` | 见下 |
 | — | share 抛错（含 `bot_not_in_group`） | `failed` | warn 日志 + 事件流一条 info「群播报失败：xxx」 |
 | — | 整体超 30s | `failed` | 不长期占着收尾方的 postcheck claim |

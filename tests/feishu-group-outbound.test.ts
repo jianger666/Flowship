@@ -598,6 +598,39 @@ describe("推进产物回群", () => {
     ).toContain("复核报告");
   });
 
+  it("播报抢占占坑 → 发起人收到一句交代（卡片不 @ 人，不能让他干等，review 十一轮-1）", async () => {
+    const shareToGroup = vi.fn(async () => ({}));
+    const sendText = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_t" }));
+    __setGroupOutboundDepsForTest(
+      baseDeps({
+        shareToGroup,
+        sendText,
+        getTask: async () => taskWithAction(),
+      }) as never,
+    );
+    // 播报侧先占坑：done flush 占不到
+    expect(claimGroupArtifactCard("task-1", "act-9")).toBe(true);
+    rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "advance",
+      actionId: "act-9",
+      channel: "owner",
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: taskWithAction(),
+      ok: true,
+    });
+    // 卡没发第二遍，但发起人被 @ 了一句交代
+    expect(shareToGroup).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const body = callArgs(sendText)[1] as string;
+    expect(body).toContain("刚交卷，产物见上卡");
+    expect(body).toContain('<at user_id="ou_zhang">张三</at>');
+  });
+
   // 设置页「群内推进结果回群」已砍（2026-07-28）：固定开。群里点了推进却看不到结果、
   // 这功能就废了——不 mock 开关、直接接生产读取点锁死
   it("固定策略：接真实读取点 → 群内推进产物照常回群", async () => {
