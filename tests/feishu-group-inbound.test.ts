@@ -27,7 +27,6 @@ const {
   GROUP_RESTRICTED_QUESTION_RUNNING,
   GROUP_TASK_RUNNING,
   isGroupBotSender,
-  SKIP_GROUP_BOT_SENDER,
   SKIP_GROUP_LOOP_BREAKER,
   handleGroupAdvancePick,
   hasAnyMention,
@@ -1821,36 +1820,39 @@ describe("机器人发件人直拦", () => {
     return { handleTaskQuestionInject, sendTextToChat };
   };
 
-  it("机器人 @bot → 静默跳过：不回群、不注入、不登记", async () => {
-    const { handleTaskQuestionInject, sendTextToChat } = botDeps();
+  // 对方机器人是来送结果的，必须照常处理（拦掉就收不到了）；防环靠“回群不 @ 它”+ 熔断。
+  // （江涛 CLI 案：它的“全部已上报✅”必须进得来，我方回确认时不 @ 它，循环自然就断了。）
+  it("机器人 @bot → 照常注入答疑，但登记不 @ 它（atRequester=false）", async () => {
+    const { handleTaskQuestionInject } = botDeps();
     const r = await routeGroupInboundMessage(
       otherMsg({
         message_id: "om_bot1",
         sender_type: "app",
-        content: "@Flowship 埋点查了吗",
+        content: "@Flowship 8 个埋点今日均已上报",
       }),
       ctx,
     );
-    expect(r).toMatchObject({ kind: "skipped", error: SKIP_GROUP_BOT_SENDER });
-    // 静默是关键：回群里任何话都会 @ 对方机器人续上循环
-    expect(sendTextToChat).not.toHaveBeenCalled();
-    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
-    expect(listGroupReplies("task-1")).toHaveLength(0);
+    expect(r).toMatchObject({ kind: "sent" });
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    expect(soleGroupReply()).toMatchObject({
+      kind: "question",
+      atRequester: false,
+    });
   });
 
-  it("sender_bot_open_id 的同样拦", async () => {
-    const { handleTaskQuestionInject, sendTextToChat } = botDeps();
+  it("sender_bot_open_id 的同样：处理、但不 @", async () => {
+    const { handleTaskQuestionInject } = botDeps();
     const r = await routeGroupInboundMessage(
       otherMsg({
         message_id: "om_bot2",
         sender_bot_open_id: "ou_otherbot",
-        content: "@Flowship 埋点查了吗",
+        content: "@Flowship 8 个埋点今日均已上报",
       }),
       ctx,
     );
-    expect(r).toMatchObject({ kind: "skipped", error: SKIP_GROUP_BOT_SENDER });
-    expect(sendTextToChat).not.toHaveBeenCalled();
-    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ kind: "sent" });
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    expect(soleGroupReply()).toMatchObject({ atRequester: false });
   });
 
   it("人类照常走（sender_type 缺省/user 都算人）", async () => {

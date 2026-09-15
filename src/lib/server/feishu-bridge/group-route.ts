@@ -5,7 +5,7 @@
  *
  *   群消息
  *     ├─ 没 @ 本机 bot            → 忽略（防刷屏；群里日常聊天不该惊动 agent）
- *     ├─ 发件人是其它机器人       → 静默跳过（回一句 @ 就会和对方机器人互 @ 成环，江涛 CLI 案）
+ *     ├─ 发件人是其它机器人       → 照常答疑、但回群不 @ 它（@ 回去就和对方机器人成环，江涛 CLI 案）
  *     ├─ chat_id 反查不到本机任务 → 群里回一句「本机没有关联此需求的任务」
  *     ├─ 「推进」（无 action 名） → 回 action 选择卡（每个人的 action 和顺序都
  *     │                             不一样、不替用户猜「下一步」；属主点按钮开跑）
@@ -103,8 +103,6 @@ const LOG = "[feishu-bridge/group-route]";
 
 /** 过滤跳过原因（与 router 的 SKIP_* 同族、inbound 据此决定不推进 p2p 游标） */
 export const SKIP_GROUP_NO_MENTION = "群消息未 @ 本机 bot";
-/** 其它机器人发的 @（江涛 CLI 这类）：回了就会 @ 回去、两边机器人互 @ 成环，必须静默跳过 */
-export const SKIP_GROUP_BOT_SENDER = "群消息来自其它机器人（防机器人互@成环）";
 /** 熔断跳闸 / 冷却中：静默跳过（回群里任何话都会给对方机器人续上，只在 Flowship 事件流留痕） */
 export const SKIP_GROUP_LOOP_BREAKER = "群答疑熔断中（疑似机器人互@）、静默跳过";
 /**
@@ -1087,15 +1085,6 @@ export const routeGroupInboundMessage = async (
     return { kind: "skipped", messageId, error: SKIP_GROUP_SELF };
   }
 
-  // 其它机器人发的 @（江涛 CLI 案）——回了就会 @ 它，它的自动化又 @ 回来，没完没了。
-  // 静默跳过：不能回群里任何话（连“收到”都不行，那也会 @ 它续上），只打日志。
-  if (isGroupBotSender(msg)) {
-    console.warn(
-      `${LOG} 机器人发件人跳过 chat=${msg.chat_id} sender=${msg.sender_id} bot_open_id=${msg.sender_bot_open_id ?? ""} app_id=${msg.sender_app_id ?? ""}`,
-    );
-    return { kind: "skipped", messageId, error: SKIP_GROUP_BOT_SENDER };
-  }
-
   // 2) 只响应 @ 了本机 bot 的群消息
   if (!matchesBotMention(msg, { openId: botOpenId, appName })) {
     return { kind: "skipped", messageId, error: SKIP_GROUP_NO_MENTION };
@@ -1244,8 +1233,8 @@ export const routeGroupInboundMessage = async (
     // 登记侧已只收 ou_/cli_ 形态，但把昵称改成 `ou_xxx` 字样仍能精确命中目标 ID，
     // 窗口+要素在群内可见拦不住、即焚还会废掉真答案的自动消费。所以昵称只做展示，永不做判定。
     senderIds: [msg.sender_id, msg.sender_bot_open_id, msg.sender_app_id],
-    // 能到这里的发件人已过机器人直拦（见上），这一格恒 false，纵深防御：万一直拦被绕过，
-    // 回群至少不 @ 对方机器人，不会和它成环。
+    // 发起人是机器人 → 回群不 @ 它（它的自动化靠 @ 触发，@ 回去就和它成环，江涛 CLI 案）。
+    // 机器人发的消息必须照常处理（对方机器人是来送结果的，拦掉就收不到了），只在回群时去 @。
     ...(isGroupBotSender(msg) ? { requesterIsBot: true as const } : {}),
     ...(refSource ? { refSource } : {}),
   });
