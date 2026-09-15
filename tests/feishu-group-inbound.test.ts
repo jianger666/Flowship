@@ -208,6 +208,8 @@ beforeEach(() => {
   __resetGroupChatCacheForTest();
   __resetGroupReplyStateForTest();
   __resetGroupAdvancePickForTest();
+  // 节流表也清（review 五轮-6：别靠下次真时间 record 顺手扫，排查 flaky 省心）
+  __resetThrottleForTest();
 });
 
 afterEach(() => {
@@ -2437,5 +2439,44 @@ describe("review 四轮：清扫/补泵循环/回放抛错", () => {
     ];
     expect(body.text).toContain("第二条");
     expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+});
+
+describe("review 五轮：回放抛错回执", () => {
+  it("回放注入抛错 → 回一句没接住 + 队空（不卡队，汇总进 tab 由 builder 单测覆盖）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        sendTextToChat,
+        getTask: async () => {
+          throw new Error("db-gone");
+        },
+      }) as never,
+    );
+    const shared = await import("@/lib/server/feishu-bridge/group-shared");
+    const { pumpGroupQuestionQueue: pump } = await import(
+      "@/lib/server/feishu-bridge/group-route"
+    );
+    shared.enqueueGroupQuestion("task-1", {
+      messageId: "om_f1",
+      chatId: CHAT,
+      text: "注定抛错的问题",
+      parsed: { text: "注定抛错的问题", images: [], attachments: [] } as never,
+      requester: { openId: "ou_li", name: "李四" },
+      boot: { apiKey: "k", model: { id: "m" } },
+    });
+    await pump("task-1");
+    // @ 请求人回一句，而不是两边全静默
+    expect(sendTextToChat).toHaveBeenCalledTimes(1);
+    expect(callArgs(sendTextToChat)[1]).toContain("没接住");
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
   });
 });

@@ -634,10 +634,10 @@ export const recordBypassLoopAttempt = (
     st = { bySender: new Map(), cooldownUntil: 0 };
     bypassLoopByTask.set(taskId, st);
   }
-  if (now < st.cooldownUntil) return { tripped: false, cooled: true };
-  // 全表搭车清扫（review 四轮-1）：过期 sender 数组删、空 task 整项删（任务删了也不留），
-  // 节流表同批清。群消息是人类速度，一轮全扫无压力；量小，不另起定时器。
+  // 清扫放 cooled 判定之前（review 五轮-4）：全员冷却时也不饿死，节流表照清。
+  // 冷却中的 task 条目跳过不删（cooldown 必须留着），其余过期全清。
   sweepBypassLoopState(now);
+  if (now < st.cooldownUntil) return { tripped: false, cooled: true };
   // 注意：上面可能把本 task 也扫掉（全过期），下面 get 不到就重建——语义不变
   st = bypassLoopByTask.get(taskId);
   if (!st) {

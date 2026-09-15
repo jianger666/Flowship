@@ -40,6 +40,7 @@ import type {
 } from "@/lib/server/advance-options";
 import { getPendingAsk } from "@/lib/server/chat-pending";
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
+import { buildGroupQaSummaryEvent } from "@/lib/group-qa";
 import { handleTaskQuestionInject } from "@/lib/server/task-question-inject";
 import { getTask, listTasks } from "@/lib/server/task-fs";
 import { advanceTask } from "@/lib/server/task-runner";
@@ -1105,10 +1106,11 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
   }
   questionPumpRunning.add(taskId);
   try {
-    // 冷却判定只在这里（入口 + 每圈同一处，语义一处改一处，review 四轮-2）
+    // 冷却判定只在这里（入口 + 每圈同一处；忙/冷却是 break 走 while 条件，
+    // 不直接 return——直接 return 会留 stale Wanted（review 五轮-3）
     do {
       questionPumpWanted.delete(taskId);
-      if (isBypassLoopCooling(taskId)) return;
+      if (isBypassLoopCooling(taskId)) break;
       for (;;) {
         const head = shiftGroupQuestionQueue(taskId);
         if (!head) break;
@@ -1130,9 +1132,32 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
             fromPump: true,
           });
         } catch (err) {
+          // 回放注入抛错：写 ok:false 汇总（tab 看得到）+ 没冷却才回一句（review 五轮-2，
+          // 呼应 outbound 失败轮进 tab；冷却中回群等于给对方机器人续命，一律静默）。
+          // origin 随机：投不进任何登记。
+          const errText = err instanceof Error ? err.message : String(err);
           console.warn(
-            `${LOG} 排队回放注入抛错、继续下一条 task=${taskId} message=${head.messageId}：`,
-            err instanceof Error ? err.message : err,
+            `${LOG} 排队回放注入抛错 task=${taskId} message=${head.messageId}：`,
+            errText,
+          );
+          if (!isBypassLoopCooling(taskId)) {
+            await replyToGroup(head.chatId, "这条没接住，麻烦重问", {
+              openId: head.requester.openId,
+              name: head.requester.name,
+            });
+          }
+          await writeOwnedEventAndPublish(
+            taskId,
+            () => true,
+            buildGroupQaSummaryEvent({
+              runTag: `pumpfail:${head.messageId}`,
+              askerOpenId: head.requester.openId,
+              askerName: head.requester.name,
+              questionMessageId: head.messageId,
+              answer: `回放注入失败：${errText}`,
+              ok: false,
+            }),
+            `pump-fail-${Date.now().toString(36)}`,
           );
           continue;
         }
@@ -1143,7 +1168,7 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
             r.error === GROUP_RESTRICTED_QUESTION_RUNNING)
         ) {
           unshiftGroupQuestionQueue(taskId, head);
-          return;
+          break;
         }
         // sent/failed/其它 skip：本轮已收口（失败路径注入链自己回过群），继续下一条
       }

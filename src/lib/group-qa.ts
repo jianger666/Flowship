@@ -182,7 +182,21 @@ export const collectGroupQaRounds = (
     }
   }
   const pairedQuestions = new Set<TaskEvent>();
-  // 群消息 id 反查表（no_pending 兜底配对）：feishuMessageId → 问题事件
+  const pairOne = (s: GroupQaSummaryMeta, q: TaskEvent | undefined) => {
+    if (q) pairedQuestions.add(q);
+  };
+  // 第一轮：runTag 精确配对
+  const pendingFallback: GroupQaSummaryMeta[] = [];
+  const findByRunTag = (
+    s: GroupQaSummaryMeta,
+  ): TaskEvent | undefined => byRunTag.get(s.runTag)?.q;
+  for (const { s } of summaries) {
+    const q = findByRunTag(s);
+    if (q) pairOne(s, q);
+    else pendingFallback.push(s);
+  }
+  // 第二轮：群消息 id 兜底（no_pending 落回旁路时问题没 runTag）。
+  // 反查表建在精确配对之后、只含未配对问题——顺序一改也不脆（review 五轮-5）。
   const byFeishuMessageId = new Map<string, TaskEvent>();
   for (const ev of events) {
     if (isGroupQuestionEventAny(ev) && !pairedQuestions.has(ev)) {
@@ -193,15 +207,17 @@ export const collectGroupQaRounds = (
   const findQuestionFor = (
     s: GroupQaSummaryMeta,
   ): TaskEvent | undefined => {
-    const direct = byRunTag.get(s.runTag)?.q;
+    const direct = findByRunTag(s);
     if (direct) return direct;
     if (!s.questionMessageId) return undefined;
-    const cand = byFeishuMessageId.get(s.questionMessageId);
-    // 已被 runTag 配对的问题不抢（一个问题只归一轮）
-    if (cand && !pairedQuestions.has(cand)) return cand;
-    return undefined;
+    // 表里只剩未配对问题，这里不可能抢到别人的（一个问题只归一轮）
+    return byFeishuMessageId.get(s.questionMessageId);
   };
+  for (const s of pendingFallback) {
+    pairOne(s, findQuestionFor(s));
+  }
   for (const { ev: sev, s } of summaries) {
+    // 上面两轮已配好对；这里复用同一判定纯读结果（幂等：Set.add 重复加无影响）
     const q = findQuestionFor(s);
     if (q) pairedQuestions.add(q);
     const qMeta = q ? metaOf(q) : null;
