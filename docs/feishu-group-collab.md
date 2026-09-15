@@ -500,6 +500,8 @@ group-outbound.handleGroupOutboundEvent
 | 1 | `mentions` 命中**机器人自己的** open_id（`GET /open-apis/bot/v3/info`，缓存） | 一次 CLI 往返 / 进程 |
 | 2 | `mentions` 缺失（CLI 扁平 schema 不一定下发）→ 正文字面 `@<应用名>` | 零 IO |
 
+群里字面提到 `@应用名` 也可能唤醒机器人（CLI 部署、mentions 缺失时字面 @ 是唯一的 @ 信号、宁可误答不可漏答——收紧会误伤“@Flowship帮我查”这种后面没空格的真 @，所以不收紧）。
+
 ⚠️ 机器人被 @ 时 mention 里的是**机器人自己的 open_id**，不是 `BotAppInfo.ownerOpenId`
 （那是应用 owner = 本人）。两者别混。
 

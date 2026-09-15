@@ -278,7 +278,7 @@ export const stripMentions = (text: string, names: string[]): string => {
   // 模型看到一串 ou_ 开头的机器 id，还以为 @ 了两个人）。有名字的留个 @Name（知道还圈了谁），
   // 空名字的整段丢掉；剩下的 `@应用名` 走下面原有逻辑。
   let out = text.replace(/<at user_id="[^"]*">([^<]*)<\/at>/g, (_, name: string) =>
-    name.trim() ? `@${name.trim()}` : " ",
+    name.trim() ? `@${name.trim()}` : "",
   );
   for (const raw of names) {
     const n = raw.trim();

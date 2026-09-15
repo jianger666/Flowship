@@ -291,6 +291,11 @@ describe("群消息判定 / @ 过滤", () => {
       stripMentions('<at user_id="ou_bot">Flowship</at> 查一下', ["Flowship"]),
     ).toBe("查一下");
   });
+
+  it("空名 <at> 两处统一成 \"\"（十五轮 P3：首轮 P2-5 遗留，tab 那边是对的）", () => {
+    // 中间无空格时最能看出差别：补 " " 会凭空造出 "A B"，统一成 "" 才是 "AB"
+    expect(stripMentions('A<at user_id="ou_x"></at>B', [])).toBe("AB");
+  });
 });
 
 describe("命令解析", () => {
