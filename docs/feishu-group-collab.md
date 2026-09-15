@@ -696,9 +696,9 @@ chat-runner / stop 有二十来个 done 出口，全量贯通 run id 的收益�
 
 | 清理链 | 对 `question` | 对 `advance` |
 |--------|---------------|--------------|
-| 租约到期（`pruneTask`） | 直接摘 | 只推给出向钩子判定 |
+| 租约到期（`pruneTask`） | 摘 + 出向钩子写 `ok:false` 汇总进 tab（群里不回） | 只推给出向钩子判定 |
 | 属主单格覆盖（`rememberGroupReply`） | 后到覆盖先到 | 不被 question 顶掉；被**下一轮 advance** 顶掉时回群补一句（见下） |
-| 容量上限（同上） | 丢最老的 | **永不挤掉**（只丢非 advance 的最老那条） |
+| 容量上限（同上） | 丢最老的 + 同上写汇总 | **永不挤掉**（只丢非 advance 的最老那条） |
 | 失败回滚（`restoreGroupReply`） | 租约过期就不放回 | **无条件放回**——放回后到期自有收口协议接手，不在回滚路径上顺手静默摘 |
 
 到期判定归 `group-outbound.reviewExpiredGroupAdvance`（group-shared 是同步纯状态、

@@ -251,6 +251,20 @@ export const GROUP_REPLY_MAX_PER_TASK = 8;
  */
 export type GroupAdvanceExpiryHandler = (taskId: string, token: string) => void;
 
+/** question 登记被静默摘掉的原因：expired = 2h 到期 / evicted = 超 8 条被挤 */
+export type GroupQuestionDroppedReason = "expired" | "evicted";
+/**
+ * 「这条 question 登记没等到收口就被摘了」的通知钩子——由出向层注册。
+ * advance 到期有收口协议三选一，question 只有“摘”：频率极低（2h 挂起的 run、
+ * 8 路并发答疑），摘时写一条 ok:false 汇总进 tab、群里不再回（2h 前的 @ 再弹
+ * 出来更吓人）。没注册时静默摘（老行为）。
+ */
+export type GroupQuestionDroppedHandler = (
+  taskId: string,
+  dropped: PendingGroupReply,
+  reason: GroupQuestionDroppedReason,
+) => void;
+
 // V4：登记从「createdAt + 死 TTL」改成可续租的 expiresAt（第六轮双审 P1-1）
 const STATE_KEY = "__flowshipFeishuGroupReplyStateV4__";
 
@@ -260,12 +274,19 @@ type GroupReplyState = {
   seq: number;
   /** advance 租约到点时的收口钩子（见 {@link GroupAdvanceExpiryHandler}） */
   onAdvanceExpiry: GroupAdvanceExpiryHandler | null;
+  /** question 登记被静默摘掉时的通知钩子（见 {@link GroupQuestionDroppedHandler}） */
+  onQuestionDropped: GroupQuestionDroppedHandler | null;
 };
 
 const getState = (): GroupReplyState => {
   const g = globalThis as unknown as Record<string, GroupReplyState | undefined>;
   if (!g[STATE_KEY]) {
-    g[STATE_KEY] = { byTask: new Map(), seq: 0, onAdvanceExpiry: null };
+    g[STATE_KEY] = {
+      byTask: new Map(),
+      seq: 0,
+      onAdvanceExpiry: null,
+      onQuestionDropped: null,
+    };
   }
   return g[STATE_KEY]!;
 };
@@ -275,6 +296,13 @@ export const setGroupAdvanceExpiryHandler = (
   handler: GroupAdvanceExpiryHandler | null,
 ): void => {
   getState().onAdvanceExpiry = handler;
+};
+
+/** 注册 / 注销 question 掉落通知钩子（传 null 注销） */
+export const setGroupQuestionDroppedHandler = (
+  handler: GroupQuestionDroppedHandler | null,
+): void => {
+  getState().onQuestionDropped = handler;
 };
 
 const newReplyToken = (state: GroupReplyState): string => {
@@ -299,11 +327,13 @@ const newReplyToken = (state: GroupReplyState): string => {
  *（{@link GROUP_ADVANCE_EXPIRY_REVIEW_MS}），再把判定推给出向钩子。
  */
 const pruneTask = (taskId: string, now = Date.now()): PendingGroupReply[] => {
-  const { byTask, onAdvanceExpiry } = getState();
+  const { byTask, onAdvanceExpiry, onQuestionDropped } = getState();
   const list = byTask.get(taskId);
   if (!list) return [];
   /** 本轮到期、需要出向层判定的推进登记 */
   const toReview: string[] = [];
+  /** 本轮到期被摘的 question 登记（出向层给它们写 ok:false 汇总，十六轮 P3） */
+  const dropped: PendingGroupReply[] = [];
   for (let i = list.length - 1; i >= 0; i--) {
     const entry = list[i]!;
     if (now <= entry.expiresAt) continue;
@@ -313,10 +343,12 @@ const pruneTask = (taskId: string, now = Date.now()): PendingGroupReply[] => {
       continue;
     }
     list.splice(i, 1);
+    dropped.push(entry);
   }
   if (list.length === 0) byTask.delete(taskId);
   // 钩子会回调进本模块（peek / renew / take）——等这张表稳定了再叫
   for (const token of toReview) onAdvanceExpiry?.(taskId, token);
+  for (const entry of dropped) onQuestionDropped?.(taskId, entry, "expired");
   return byTask.get(taskId) ?? [];
 };
 
@@ -404,7 +436,10 @@ export const rememberGroupReply = (
     const idx = list.findIndex((e) => e.kind !== "advance");
     // 全是 advance（属主单格、正常到不了这里）——宁可超一格也不丢产物
     if (idx < 0) break;
-    list.splice(idx, 1);
+    const [evicted] = list.splice(idx, 1);
+    // 挤掉也别静默吞：这轮的回答此后无处投递，tab 里会残半轮“回答中”——
+    // 推给出向钩子写 ok:false 汇总（十六轮 P3，和到期摘同口径）
+    if (evicted) state.onQuestionDropped?.(taskId, evicted, "evicted");
   }
   return { token, previous, runTag };
 };

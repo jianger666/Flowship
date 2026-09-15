@@ -52,8 +52,10 @@ import {
   releaseGroupArtifactCard,
   renewGroupReply,
   setGroupAdvanceExpiryHandler,
+  setGroupQuestionDroppedHandler,
   takeGroupReplyByToken,
   truncateForGroup,
+  type GroupQuestionDroppedReason,
   type PendingGroupReply,
 } from "./group-shared";
 import {
@@ -518,6 +520,44 @@ export const reviewExpiredGroupAdvance = async (
   }
 };
 
+/**
+ * question 登记没等到收口就被摘了（2h 到期 / 超 8 条被挤）→ 写一条 ok:false 汇总。
+ *
+ * 对应 advance 的收口回执，但只写 tab、不回群：2h 前的 @ 此刻再弹出来更吓人。
+ * runTag 沿用登记的（restricted 旁路 = 问题事件 restrictedRunTag，精确配对）；
+ * 属主通道没有 runTag，用 `dropped:<token>` 另起 + questionMessageId 兜底配对。
+ * 整段吞异常——这是收尾补偿，绝不能影响主链（对外可测）。
+ */
+export const handleDroppedQuestionReply = (
+  taskId: string,
+  dropped: PendingGroupReply,
+  reason: GroupQuestionDroppedReason,
+): void => {
+  if (dropped.kind !== "question") return;
+  void (async () => {
+    try {
+      await writeEventAndPublish(
+        taskId,
+        buildGroupQaSummaryEvent({
+          runTag: dropped.runTag ?? `dropped:${dropped.token}`,
+          askerOpenId: dropped.requesterOpenId,
+          askerName: dropped.requesterName,
+          ...(dropped.sourceMessageId
+            ? { questionMessageId: dropped.sourceMessageId }
+            : {}),
+          answer:
+            reason === "expired"
+              ? "这条群问题等太久没拿到回答（登记已过期），麻烦重问"
+              : "群问题太多、这条被挤掉没等到回答，麻烦重问",
+          ok: false,
+        }),
+      );
+    } catch (err) {
+      warn(`掉落问题汇总 task=${taskId}`, err);
+    }
+  })();
+};
+
 // ----------------- 事件分发 -----------------
 
 /** 处理单条流事件（对外可测）；整段吞异常 */
@@ -613,6 +653,8 @@ export const ensureFeishuGroupOutboundRegistered = (): void => {
   setGroupAdvanceExpiryHandler((taskId, token) => {
     void reviewExpiredGroupAdvance(taskId, token);
   });
+  // question 登记被静默摘掉时写 ok:false 汇总（只进 tab、不回群，十六轮 P3）
+  setGroupQuestionDroppedHandler(handleDroppedQuestionReply);
   reg.unsub = subscribeAllTaskStreams((taskId, ev) => {
     const prev = reg.chains.get(taskId) ?? Promise.resolve();
     reg.chains.set(
@@ -631,5 +673,6 @@ export const __resetGroupOutboundForTest = (): void => {
   reg.registered = false;
   reg.chains.clear();
   setGroupAdvanceExpiryHandler(null);
+  setGroupQuestionDroppedHandler(null);
   bridgeEnabledCache = null;
 };

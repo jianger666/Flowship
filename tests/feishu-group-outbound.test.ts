@@ -9,6 +9,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Task } from "@/lib/types";
 
+// 掉落汇总写 tab 走真实落盘太重——mock 掉，只断言写了什么（十六轮 P3）
+const writeEventAndPublish = vi.hoisted(() =>
+  vi.fn(async () => ({ id: "ev_mock" })),
+);
+
+vi.mock("@/lib/server/task-stream", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/server/task-stream")>();
+  return { ...actual, writeEventAndPublish };
+});
+
 process.env.FLOWSHIP_DATA_DIR = path.join(
   os.tmpdir(),
   `feishu-group-outbound-${Date.now()}`,
@@ -20,6 +31,7 @@ const {
   __setGroupOutboundDepsForTest,
   askOptsFromGroupEvent,
   ensureFeishuGroupOutboundRegistered,
+  handleDroppedQuestionReply,
   handleGroupOutboundEvent,
   reviewExpiredGroupAdvance,
 } = await import("@/lib/server/feishu-bridge/group-outbound");
@@ -39,6 +51,7 @@ const {
   peekGroupReplyByToken,
   rememberGroupReply,
   restoreGroupReply,
+  setGroupQuestionDroppedHandler,
   truncateForGroup,
 } = await import("@/lib/server/feishu-bridge/group-shared");
 
@@ -109,6 +122,7 @@ beforeEach(() => {
   __resetGroupReplyStateForTest();
   __resetGroupArtifactCardDedupForTest();
   __resetGroupAdvancePickForTest();
+  writeEventAndPublish.mockClear();
 });
 
 afterEach(() => {
@@ -1403,6 +1417,162 @@ describe("登记表本身（并存 / 回滚 / 容量 / 过期）", () => {
       restoreGroupReply("task-1", b);
 
       expect(listGroupReplies("task-1")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("掉落问题汇总（十六轮 P3）", () => {
+  const questionEntry = (over: Record<string, unknown> = {}) => ({
+    chatId: CHAT,
+    requesterOpenId: "ou_x",
+    requesterName: "同事甲",
+    kind: "question",
+    answer: "",
+    createdAt: Date.now(),
+    expiresAt: Date.now() + GROUP_REPLY_TTL_MS,
+    token: "tok-1",
+    runTag: "tok-1",
+    sourceMessageId: "om_q1",
+    ...over,
+  });
+
+  const summaryOf = (i = 0) =>
+    (
+      callArgs(writeEventAndPublish, i)[1] as {
+        text: string;
+        meta: { groupQaSummary: Record<string, unknown> };
+      }
+    ).meta.groupQaSummary;
+
+  // fire-and-forget 的 handler 落盘前先排干微任务（纯 Promise、不吃假时钟）
+  const flushDropped = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  it("到期摘 question → 通知钩子带 expired", () => {
+    const seen: Array<{ name: string; reason: string }> = [];
+    setGroupQuestionDroppedHandler((_taskId, dropped, reason) => {
+      seen.push({ name: dropped.requesterName, reason });
+    });
+    try {
+      vi.useFakeTimers();
+      try {
+        rememberGroupReply("task-1", {
+          chatId: CHAT,
+          requesterOpenId: "ou_x",
+          requesterName: "同事甲",
+          kind: "question",
+          channel: "restricted",
+        });
+        vi.advanceTimersByTime(GROUP_REPLY_TTL_MS + 1000);
+        expect(listGroupReplies("task-1")).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(seen).toEqual([{ name: "同事甲", reason: "expired" }]);
+    } finally {
+      setGroupQuestionDroppedHandler(null);
+    }
+  });
+
+  it("超限挤掉 question → 通知钩子带 evicted（挤的是最老那条）", () => {
+    const seen: Array<{ name: string; reason: string }> = [];
+    setGroupQuestionDroppedHandler((_taskId, dropped, reason) => {
+      seen.push({ name: dropped.requesterName, reason });
+    });
+    try {
+      for (let i = 0; i < GROUP_REPLY_MAX_PER_TASK + 1; i++) {
+        rememberGroupReply("task-1", {
+          chatId: CHAT,
+          requesterOpenId: "ou_x",
+          requesterName: `同事${i}`,
+          kind: "question",
+          channel: "restricted",
+        });
+      }
+      expect(seen).toEqual([{ name: "同事0", reason: "evicted" }]);
+    } finally {
+      setGroupQuestionDroppedHandler(null);
+    }
+  });
+
+  it("掉落处理：restricted 按 runTag 配对、写 ok:false、群里零发送", async () => {
+    const sendText = vi.fn();
+    const sendMarkdown = vi.fn();
+    __setGroupOutboundDepsForTest(
+      baseDeps({ sendText, sendMarkdown }) as never,
+    );
+    handleDroppedQuestionReply("task-1", questionEntry() as never, "expired");
+    await flushDropped();
+    expect(writeEventAndPublish).toHaveBeenCalledTimes(1);
+    expect(callArgs(writeEventAndPublish)[0]).toBe("task-1");
+    expect(summaryOf()).toMatchObject({
+      runTag: "tok-1",
+      askerOpenId: "ou_x",
+      askerName: "同事甲",
+      questionMessageId: "om_q1",
+      ok: false,
+    });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendMarkdown).not.toHaveBeenCalled();
+  });
+
+  it("掉落处理：属主通道没有 runTag → dropped:<token> 另起、靠群消息 id 配对", async () => {
+    handleDroppedQuestionReply(
+      "task-1",
+      questionEntry({ token: "tok-2", runTag: null }) as never,
+      "evicted",
+    );
+    await flushDropped();
+    expect(summaryOf()).toMatchObject({
+      runTag: "dropped:tok-2",
+      questionMessageId: "om_q1",
+      ok: false,
+    });
+  });
+
+  it("掉落处理：advance 不归这条管（收口协议另有去处）", async () => {
+    handleDroppedQuestionReply(
+      "task-1",
+      questionEntry({ kind: "advance" }) as never,
+      "expired",
+    );
+    await flushDropped();
+    expect(writeEventAndPublish).not.toHaveBeenCalled();
+  });
+
+  it("bootstrap 注册后：过期 question 自动落 ok:false 汇总、群里不回", async () => {
+    vi.useFakeTimers();
+    try {
+      const sendText = vi.fn(async () => ({
+        chat_id: CHAT,
+        message_id: "om_t",
+      }));
+      const sendMarkdown = vi.fn(async () => ({
+        chat_id: CHAT,
+        message_id: "om_m",
+      }));
+      __setGroupOutboundDepsForTest(
+        baseDeps({ sendText, sendMarkdown }) as never,
+      );
+      ensureFeishuGroupOutboundRegistered();
+      rememberGroupReply("task-1", {
+        chatId: CHAT,
+        requesterOpenId: "ou_x",
+        requesterName: "同事甲",
+        kind: "question",
+        sourceMessageId: "om_q9",
+        channel: "restricted",
+      });
+      vi.advanceTimersByTime(GROUP_REPLY_TTL_MS + 1000);
+      expect(listGroupReplies("task-1")).toHaveLength(0);
+      await flushDropped();
+      expect(writeEventAndPublish).toHaveBeenCalledTimes(1);
+      expect(summaryOf()).toMatchObject({ ok: false });
+      expect(sendText).not.toHaveBeenCalled();
+      expect(sendMarkdown).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
