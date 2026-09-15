@@ -2555,3 +2555,150 @@ describe("review 六轮：回执不@机器人/中途跳闸停drain", () => {
     expect(groupQuestionQueueLength("task-1")).toBe(1);
   });
 });
+
+describe("review 八轮：回执不@机器人/过期有交代/带图不排", () => {
+  const quadDeps = () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
+    );
+    return { handleTaskQuestionInject, sendTextToChat };
+  };
+  const entry = (id: string, text: string) => ({
+    messageId: id,
+    chatId: CHAT,
+    text,
+    parsed: { text, images: [], attachments: [] } as never,
+    requester: { openId: "ou_li", name: "李四" },
+    boot: { apiKey: "k", model: { id: "m" } },
+  });
+
+  it("机器人入队 ack 不 @（跳闸前每轮 @ 回去等于续命）", async () => {
+    const { handleTaskQuestionInject, sendTextToChat } = quadDeps();
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion("task-1", inFlight);
+    try {
+      const r = await routeGroupInboundMessage(
+        otherMsg({
+          message_id: "om_botq",
+          sender_type: "app",
+          content: "@Flowship 埋点查了吗",
+        }),
+        ctx,
+      );
+      expect(r).toMatchObject({ kind: "queued" });
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+      expect(sendTextToChat).toHaveBeenCalledTimes(1);
+      const body = callArgs(sendTextToChat)[1] as string;
+      expect(body).toContain("排队");
+      expect(body).not.toContain("<at");
+    } finally {
+      unregisterRestrictedQuestion("task-1", inFlight);
+    }
+  });
+
+  it("过期丢弃有交代：回一句超时作废（pump-shift 路径）", async () => {
+    const { handleTaskQuestionInject, sendTextToChat } = quadDeps();
+    const { enqueueGroupQuestion: enq } = await import(
+      "@/lib/server/feishu-bridge/group-shared"
+    );
+    const { pumpGroupQuestionQueue: pump } = await import(
+      "@/lib/server/feishu-bridge/group-route"
+    );
+    // 只 seed 一个过期的（再 seed 新的会先触发入队 prune，走另一条回执路径，见下个用例）
+    const old = Date.now() - GROUP_QUESTION_QUEUE_TTL_MS - 1000;
+    enq("task-1", entry("om_stale", "过期的问题"), old);
+    await pump("task-1");
+    const texts = sendTextToChat.mock.calls.map((c) => String((c as unknown[])[1]));
+    expect(texts.some((t) => t.includes("超时作废"))).toBe(true);
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+
+  it("入队 prune 掉过期也回执（路由层，时间穿越）", async () => {
+    const { sendTextToChat } = quadDeps();
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion("task-1", inFlight);
+    try {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(1_000_000);
+        const a = await routeGroupInboundMessage(
+          otherMsg({ message_id: "om_wa", content: "@Flowship A问题" }),
+          ctx,
+        );
+        expect(a).toMatchObject({ kind: "queued" });
+        // 跳到 TTL 之后再问：A 过期被清、B 入队，A 要收到超时作废
+        vi.setSystemTime(1_000_000 + GROUP_QUESTION_QUEUE_TTL_MS + 1000);
+        const b = await routeGroupInboundMessage(
+          otherMsg({ message_id: "om_wb", content: "@Flowship B问题" }),
+          ctx,
+        );
+        expect(b).toMatchObject({ kind: "queued" });
+        const texts = sendTextToChat.mock.calls.map((c) =>
+          String((c as unknown[])[1]),
+        );
+        expect(texts.some((t) => t.includes("超时作废"))).toBe(true);
+        expect(texts.some((t) => t.includes("排队"))).toBe(true);
+        expect(groupQuestionQueueLength("task-1")).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      unregisterRestrictedQuestion("task-1", inFlight);
+    }
+  });
+
+  it("冷却中过期丢弃静默（回群等于续命）", async () => {
+    const { sendTextToChat } = quadDeps();
+    const { enqueueGroupQuestion: enq } = await import(
+      "@/lib/server/feishu-bridge/group-shared"
+    );
+    const { pumpGroupQuestionQueue: pump } = await import(
+      "@/lib/server/feishu-bridge/group-route"
+    );
+    // 直接把熔断跳闸（同一发送人攒满），再 pump
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      recordBypassLoopAttempt("task-1", "ou_bot", Date.now() + i);
+    }
+    const old = Date.now() - GROUP_QUESTION_QUEUE_TTL_MS - 1000;
+    enq("task-1", entry("om_cold", "冷却中的过期问题"), old);
+    await pump("task-1");
+    expect(sendTextToChat).not.toHaveBeenCalled();
+    // 冷却中连 pump 入口都进不去，过期条目原样躺着、冷却过后的 pump 再清
+    expect(groupQuestionQueueLength("task-1")).toBe(1);
+  });
+
+  it("带图不排队：base64 不进内存队，直接忙线拒收", async () => {
+    const { handleTaskQuestionInject } = quadDeps();
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion("task-1", inFlight);
+    try {
+      const r = await routeGroupInboundMessage(
+        otherMsg({ message_id: "om_img", content: "@Flowship 看下这张图" }),
+        {
+          ...ctx,
+          parseContent: async () => ({
+            text: "@Flowship 看下这张图",
+            images: [{ data: "aGVsbG8=", mimeType: "image/png" }],
+            attachments: [],
+          }),
+        },
+      );
+      expect(r).toMatchObject({
+        kind: "skipped",
+        error: GROUP_RESTRICTED_QUESTION_RUNNING,
+      });
+      expect(groupQuestionQueueLength("task-1")).toBe(0);
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    } finally {
+      unregisterRestrictedQuestion("task-1", inFlight);
+    }
+  });
+});

@@ -75,36 +75,38 @@ export const enqueueGroupQuestion = (
   taskId: string,
   entry: Omit<QueuedGroupQuestion, "enqueuedAt">,
   now: number = Date.now(),
-): { queued: boolean; position: number } => {
-  if (!taskId) return { queued: false, position: 0 };
-  let q = groupQuestionQueues.get(taskId);
-  if (!q) {
-    q = [];
-    groupQuestionQueues.set(taskId, q);
-  } else if (q.length > 0) {
-    // filter 永远返回新数组：无条件写回，否则 push 进空气（review 三轮实测抓包）
-    const kept = q.filter((e) => now - e.enqueuedAt < GROUP_QUESTION_QUEUE_TTL_MS);
-    // 和 shift 对齐：丢过期打一行 warn，排查时两边对得上（review 四轮-4）
-    if (kept.length !== q.length) {
-      console.warn(
-        `[feishu-bridge/group-shared] 入队清掉 ${q.length - kept.length} 个过期排队 task=${taskId}`,
-      );
-    }
-    groupQuestionQueues.set(taskId, kept);
-    q = kept;
+): { queued: boolean; position: number; ejected: QueuedGroupQuestion[] } => {
+  const none = { queued: false, position: 0, ejected: [] as QueuedGroupQuestion[] };
+  if (!taskId) return none;
+  // filter 永远返回新数组：无条件写回，否则 push 进空气（review 三轮实测抓包）。
+  // 被清掉的过期条目如数返回——调用方负责告诉用户“超时作废”，不能悄悄吞
+  //（review 八轮-2；和 shift 的 warn 对齐，排查时两边对得上）。
+  const prev = groupQuestionQueues.get(taskId) ?? [];
+  const ejected = prev.filter((e) => now - e.enqueuedAt >= GROUP_QUESTION_QUEUE_TTL_MS);
+  const q = prev.filter((e) => now - e.enqueuedAt < GROUP_QUESTION_QUEUE_TTL_MS);
+  if (ejected.length > 0) {
+    console.warn(
+      `[feishu-bridge/group-shared] 入队清掉 ${ejected.length} 个过期排队 task=${taskId}`,
+    );
   }
+  groupQuestionQueues.set(taskId, q);
   if (q.length >= GROUP_QUESTION_QUEUE_MAX)
-    return { queued: false, position: q.length };
+    return { queued: false, position: q.length, ejected };
   q.push({ ...entry, enqueuedAt: now });
-  return { queued: true, position: q.length };
+  return { queued: true, position: q.length, ejected };
 };
-/** 取队首（跳过 TTL 过期的，静默丢弃；空返回 null）。now 参数只给单测用 */
+/**
+ * 取队首。过期的一并丢弃并如数返回（调用方负责告诉用户“超时作废”，不能静默——
+ * 入队 ack 承诺过“答完就答你”，见 pump；review 八轮-2）。now 参数只给单测用。
+ */
 export const shiftGroupQuestionQueue = (
   taskId: string,
   now: number = Date.now(),
-): QueuedGroupQuestion | null => {
+): { head: QueuedGroupQuestion | null; expired: QueuedGroupQuestion[] } => {
+  const empty = { head: null, expired: [] as QueuedGroupQuestion[] };
   const q = groupQuestionQueues.get(taskId);
-  if (!q) return null;
+  if (!q) return empty;
+  const expired: QueuedGroupQuestion[] = [];
   while (q.length > 0) {
     const head = q[0];
     if (!head) {
@@ -113,6 +115,7 @@ export const shiftGroupQuestionQueue = (
     }
     if (now - head.enqueuedAt >= GROUP_QUESTION_QUEUE_TTL_MS) {
       q.shift();
+      expired.push(head);
       console.warn(
         `[feishu-bridge/group-shared] 排队问题过期丢弃 task=${taskId} message=${head.messageId}`,
       );
@@ -120,10 +123,10 @@ export const shiftGroupQuestionQueue = (
     }
     q.shift();
     if (q.length === 0) groupQuestionQueues.delete(taskId);
-    return head;
+    return { head, expired };
   }
   groupQuestionQueues.delete(taskId);
-  return null;
+  return { head: null, expired };
 };
 /** 放回队首（pump 时还忙：静默等下一轮 draining，不回群） */
 export const unshiftGroupQuestionQueue = (

@@ -447,6 +447,17 @@ export const resolveTaskIdByGroupChat = async (
 
 // ----------------- 回群小工具 -----------------
 
+/**
+ * 群回执 @ 谁：发起人是机器人就不 @（它的自动化靠 @ 触发，@ 回去就续环，江涛 CLI 案）。
+ * 入队 ack / 忙线 / 拒绝 / pump 回执一路共用这一个（review 八轮-1：pumpfail 同款逻辑外溢，
+ * 跳闸前每轮 @ 回去等于帮对方凑次数）。
+ */
+const groupReplyMention = (
+  requesterIsBot: boolean | undefined,
+  requester: { openId: string; name: string },
+): { openId: string; name: string } | undefined =>
+  requesterIsBot ? undefined : { openId: requester.openId, name: requester.name };
+
 const replyToGroup = async (
   chatId: string,
   text: string,
@@ -852,7 +863,11 @@ const injectGroupMessage = async (args: {
   const { taskId, chatId, requester, messageId, parsed, isOwner } = args;
   const task = await deps.getTask(taskId);
   if (!task) {
-    await replyToGroup(chatId, "任务已不存在", requester);
+    await replyToGroup(
+      chatId,
+      "任务已不存在",
+      groupReplyMention(args.requesterIsBot, requester),
+    );
     return { kind: "failed", messageId, error: "任务不存在" };
   }
 
@@ -878,11 +893,22 @@ const injectGroupMessage = async (args: {
     // 排队（只收非属主 task 型普通问题）：忙线拒收改成攒起来，前一个答完就答它。
     // 属主 / chat 型 / 答 pendingAsk / 关联回执不排——属主用 app 当主通道，关联数据有时效性。
     // pump 回放时（fromPump）不再二次入队：还忙就静默等下一轮 draining。
-    if (!args.fromPump && !isOwner && task.mode !== "chat" && !feedIntoSession) {
+    // 带图不排：图片 base64 进队要在内存躺到 TTL，图多沉；图重发成本低，直接忙线拒收（review 八轮-3）
+    const queueable =
+      !args.fromPump &&
+      !isOwner &&
+      task.mode !== "chat" &&
+      !feedIntoSession &&
+      parsed.images.length === 0;
+    if (queueable) {
       // 启动凭据拿不到就不排：回放必失败还占一次循环，不如直接忙线拒收（review P2-6）
       const boot = await args.loadBootContext().catch(() => null);
       if (!boot) {
-        await replyToGroup(chatId, busyReason, requester);
+        await replyToGroup(
+          chatId,
+          busyReason,
+          groupReplyMention(args.requesterIsBot, requester),
+        );
         return { kind: "skipped", messageId, taskId, error: busyReason };
       }
       const pushed = enqueueGroupQuestion(taskId, {
@@ -895,17 +921,36 @@ const injectGroupMessage = async (args: {
         ...(args.requesterIsBot ? { requesterIsBot: true as const } : {}),
         boot,
       });
+      // 入队时清掉的过期问题：人家收到过 ack，不能悄悄吞，一人回一句（review 八轮-2）。
+      // 冷却中静默（回群等于续命），机器人不 @——和 pump 里同一口径。
+      if (pushed.ejected.length > 0 && !isBypassLoopCooling(taskId)) {
+        for (const e of pushed.ejected) {
+          await replyToGroup(
+            e.chatId,
+            "久等了，超时作废，麻烦重问",
+            groupReplyMention(e.requesterIsBot, e.requester),
+          );
+        }
+      }
       if (pushed.queued) {
         const waiting =
           pushed.position <= 1
             ? "当前这轮答完就答你"
             : `前面还有 ${pushed.position - 1} 个问题，答完就答你`;
-        await replyToGroup(chatId, `收到，在排队了，${waiting}`, requester);
+        await replyToGroup(
+          chatId,
+          `收到，在排队了，${waiting}`,
+          groupReplyMention(args.requesterIsBot, requester),
+        );
         return { kind: "queued", messageId, taskId, text: args.text || undefined };
       }
       // 满了 → 落回忙线拒收（原口径）
     }
-    await replyToGroup(chatId, busyReason, requester);
+    await replyToGroup(
+      chatId,
+      busyReason,
+      groupReplyMention(args.requesterIsBot, requester),
+    );
     return { kind: "skipped", messageId, taskId, error: busyReason };
   }
 
@@ -914,7 +959,11 @@ const injectGroupMessage = async (args: {
   // 送进属主那个全权限会话。宁可拒收，也不临时造一个半吊子受限通道。
   // 答 pendingAsk 不受此限：那是 agent 主动发问、跨角色作答正是本功能的意义。
   if (!hasPendingAsk && !isOwner && task.mode === "chat") {
-    await replyToGroup(chatId, GROUP_CHAT_NOT_OWNER, requester);
+    await replyToGroup(
+      chatId,
+      GROUP_CHAT_NOT_OWNER,
+      groupReplyMention(args.requesterIsBot, requester),
+    );
     return { kind: "skipped", messageId, taskId, error: GROUP_CHAT_NOT_OWNER };
   }
 
@@ -1112,7 +1161,18 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
       questionPumpWanted.delete(taskId);
       if (isBypassLoopCooling(taskId)) break;
       for (;;) {
-        const head = shiftGroupQuestionQueue(taskId);
+        const { head, expired } = shiftGroupQuestionQueue(taskId);
+        // 过期丢弃要给用户交代（入队时承诺过“答完就答你”）：队里最多 3 条刷不了屏；
+        // 冷却中静默（回群等于续命），机器人不 @（review 八轮-1/八轮-2）。
+        if (expired.length > 0 && !isBypassLoopCooling(taskId)) {
+          for (const e of expired) {
+            await replyToGroup(
+              e.chatId,
+              "久等了，超时作废，麻烦重问",
+              groupReplyMention(e.requesterIsBot, e.requester),
+            );
+          }
+        }
         if (!head) break;
         // 长 drain 中途也看冷却：await inject 期间并发跳闸了，剩下的不再答、放回队首
         // （review 六轮-3；和入口是同一语义，注释统一写在这里）
@@ -1366,9 +1426,14 @@ export const routeGroupInboundMessage = async (
   const isOwner = !!ownerOpenId && msg.sender_id === ownerOpenId;
   const cmd = parseGroupCommand(effectiveText);
   if (cmd.kind === "advance") {
-    // 别人 @ 你的 bot 推进你的任务 → 拒（推进 = 起 agent、烧额度、改任务状态）
+    // 别人 @ 你的 bot 推进你的任务 → 拒（推进 = 起 agent、烧额度、改任务状态）。
+    // 发起人是机器人同样不 @（和问答通道同理，@ 回去就续环）。
     if (!isOwner) {
-      await replyToGroup(msg.chat_id, GROUP_ADVANCE_NOT_OWNER, requester);
+      await replyToGroup(
+        msg.chat_id,
+        GROUP_ADVANCE_NOT_OWNER,
+        groupReplyMention(isGroupBotSender(msg), requester),
+      );
       return { kind: "skipped", messageId, taskId, error: GROUP_ADVANCE_NOT_OWNER };
     }
     return runGroupAdvance({
