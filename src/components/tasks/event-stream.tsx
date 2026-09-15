@@ -675,6 +675,11 @@ const EventStreamImpl = ({
     onGroupQaVisibleChange?.(showQaPanel);
     return () => onGroupQaVisibleChange?.(false);
   }, [showQaPanel, onGroupQaVisibleChange]);
+  // 进出 QA tab 时 Virtuoso 会卸载/重挂：range 起点缓存清掉，下一次 rangeChanged
+  // 才不会因「同 startIndex 短路」跳过 sticky 重算（否则切回事件流粘顶头状态是旧的）。
+  useEffect(() => {
+    lastRangeStartRef.current = null;
+  }, [showQaPanel]);
   // 进行中轮次 → tab 上亮蓝点（主流程里它完全隐身，不给提示用户不知道有人问了，review P1-4）。
   // 已知局限：answering 按快照时间算，无新事件就不重算——崩溃打断的那轮蓝点会常亮到下个事件到来。
   // 故意的：这组件有过输入卡顿 perf 坑，不加分钟级 tick；下个事件（属主说句话）到就灭。
@@ -1558,7 +1563,10 @@ const EventStreamImpl = ({
         )}
         {/* E1 sticky 轮次头：默认 hidden，rangeChanged 里命令式显隐（见 applyStickyTurn）。
             chat / task 都启用：task 事件流里用户也会直接发消息提问（user_reply）、
-            回滚看历史时同样需要「回到最近提问」的锚 */}
+            回滚看历史时同样需要「回到最近提问」的锚。
+            群问答 tab 下不渲染：它是事件流的轮次锚，浮在只读 QA 列表上会挡住首行
+            （QA 有自己的独立滚动容器，rangeChanged 早已停发，sticky 会卡在旧文案）。 */}
+        {!showQaPanel && (
         <div
           ref={stickyRootRef}
           className="pointer-events-none absolute inset-x-0 top-0 z-10 hidden"
@@ -1589,9 +1597,12 @@ const EventStreamImpl = ({
               </Tooltip>
             </div>
           </div>
+        )}
         {/* 底部悬浮层：回到最新（带新增条数）+ 未答提问提示条。
             显隐由子组件自己订阅跟随态，主组件不参与（滚动路径零重渲）。
-            key 挂 task.id：详情页内切任务不重挂 EventStream、计数基线得跟着重来 */}
+            key 挂 task.id：详情页内切任务不重挂 EventStream、计数基线得跟着重来
+            群问答 tab 下不渲染：计数口径是事件流的，浮在 QA 上文不对题。 */}
+        {!showQaPanel && (
         <StreamFloatingBar
           key={task.id}
           follow={follow}
@@ -1601,6 +1612,7 @@ const EventStreamImpl = ({
           onJumpToAsk={jumpToPendingAsk}
           onBackToBottom={backToBottom}
         />
+        )}
         {showQaPanel ? (
           <GroupQaPanel rounds={groupQaRounds} />
         ) : items.length === 0 ? (
