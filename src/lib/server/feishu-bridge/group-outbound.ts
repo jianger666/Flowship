@@ -47,6 +47,8 @@ import {
   mentionTag,
   peekGroupReply,
   peekGroupReplyByToken,
+  releaseGroupAdvancePick,
+  releaseGroupAdvancePickByAction,
   releaseGroupArtifactCard,
   renewGroupReply,
   setGroupAdvanceExpiryHandler,
@@ -336,6 +338,11 @@ const flushGroupAdvanceReply = async (
   // 按 token 摘——那段 await 里属主那格可能已换成下一轮推进的登记
   const entry = takeGroupReplyByToken(taskId, pending.token);
   if (!entry) return;
+  // 收口放坑：这轮跑完了，同卡允许再点别的按钮（十四轮 P2）。开关关不关都放——
+  // 坑防的是“重复开跑”，开关管的是“回不回群”，两回事。直放 pickId + 按 action 兜底
+  //（老登记没 pickId、只靠 bind 补记的那种）。
+  if (entry.advancePickId) releaseGroupAdvancePick(entry.advancePickId);
+  if (entry.actionId) releaseGroupAdvancePickByAction(taskId, entry.actionId);
   if (!(await deps.isAdvanceResultToGroupEnabled())) return;
 
   const at = mentionTag(entry.requesterOpenId, entry.requesterName);
@@ -497,6 +504,9 @@ export const reviewExpiredGroupAdvance = async (
     }
     const taken = takeGroupReplyByToken(taskId, token);
     if (!taken) return;
+    // 到期摘也放坑：这条登记再也等不到收口了，卡不能跟着白锁（同 flush 口径）
+    if (taken.advancePickId) releaseGroupAdvancePick(taken.advancePickId);
+    if (taken.actionId) releaseGroupAdvancePickByAction(taskId, taken.actionId);
     // 开关关掉 = 用户本就不要推进结果回群，那也不必回执
     if (!(await deps.isAdvanceResultToGroupEnabled())) return;
     await deps.sendText(

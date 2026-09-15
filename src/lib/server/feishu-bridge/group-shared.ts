@@ -178,6 +178,12 @@ export interface PendingGroupReply {
   kind: "question" | "advance";
   /** advance：本次推进的 action id（done 时按它取 artifact） */
   actionId?: string;
+  /**
+   * advance：这次推进占的是哪张选择卡的坑（pickId）。收口时按它放坑——
+   * 同一张卡跑完 A 还能再点 B，不用等 24h 过期（十四轮 P2）。
+   * 打字直推没有卡，缺省就行。
+   */
+  advancePickId?: string;
   /** 累积的本轮回答文本（assistant_delta / assistant_message 攒） */
   answer: string;
   createdAt: number;
@@ -738,7 +744,19 @@ const ADVANCE_PICK_TTL_MS = 24 * 60 * 60 * 1000;
 /** 状态挂 globalThis：dev route-chunk / HMR 分裂时也只有一份（对齐 bridge 其它单例） */
 const ADVANCE_PICK_KEY = "__flowshipGroupAdvancePickV1__";
 
-type AdvancePickMap = Map<string, { label: string; at: number }>;
+type AdvancePickMap = Map<
+  string,
+  {
+    label: string;
+    at: number;
+    /** 出卡时的 task（收口按 task+action 放坑、顺带防跨任务串坑） */
+    taskId?: string;
+    /** 按钮带的 actionKey（builtin type 或自定义定义 id，展示/排查用） */
+    actionKey?: string;
+    /** advanceTask 返回后补记的记录 id（收口按它找坑，见 bind） */
+    actionId?: string;
+  }
+>;
 
 const getAdvancePickMap = (): AdvancePickMap => {
   const g = globalThis as unknown as Record<string, AdvancePickMap | undefined>;
@@ -753,10 +771,14 @@ export const newGroupAdvancePickId = (): string =>
 /**
  * 同步原子占坑：这张选择卡还没人点过才占上。
  * 占不到时带回先占者的 action 展示名（回「已在跑 X」用）。
+ *
+ * taskId/actionKey 一起记进去：收口时按 task+action 放坑（同卡跑完 A 还能点 B），
+ * 不记也能占（老调用/单测兼容），只是收口时只能靠登记里的 pickId 直放。
  */
 export const claimGroupAdvancePick = (
   pickId: string,
   label: string,
+  opts?: { taskId?: string; actionKey?: string },
 ): { ok: true } | { ok: false; startedLabel: string } => {
   if (!pickId) return { ok: true };
   const now = Date.now();
@@ -767,7 +789,12 @@ export const claimGroupAdvancePick = (
   }
   const existing = m.get(pickId);
   if (existing) return { ok: false, startedLabel: existing.label };
-  m.set(pickId, { label, at: now });
+  m.set(pickId, {
+    label,
+    at: now,
+    ...(opts?.taskId ? { taskId: opts.taskId } : {}),
+    ...(opts?.actionKey ? { actionKey: opts.actionKey } : {}),
+  });
   return { ok: true };
 };
 
@@ -775,6 +802,39 @@ export const claimGroupAdvancePick = (
 export const releaseGroupAdvancePick = (pickId: string): void => {
   if (!pickId) return;
   getAdvancePickMap().delete(pickId);
+};
+
+/**
+ * 补记「pick↔记录 id」映射（advanceTask 返回后调）。
+ *
+ * claim 时只有 `taskId + actionKey`（按钮 value 的 builtin key/自定义定义 id），
+ * 收口时登记里只有 `actionId`（记录 id）——两边对不上，中间就靠这一笔补记连起来。
+ */
+export const bindGroupAdvancePickAction = (
+  pickId: string,
+  actionId: string,
+): void => {
+  if (!pickId || !actionId) return;
+  const entry = getAdvancePickMap().get(pickId);
+  if (entry) entry.actionId = actionId;
+};
+
+/**
+ * 收口放坑：同 task 同 action 的那次占坑删掉，同卡就能再点别的按钮。
+ * 按 actionId 找坑（claim 时记的 taskId 只做二次确认、防极端串坑）。
+ * actionId 为空直接 no-op——打字直推没占坑、没补记 id 的登记也别误伤别人的坑。
+ */
+export const releaseGroupAdvancePickByAction = (
+  taskId: string,
+  actionId: string,
+): void => {
+  if (!actionId) return;
+  const m = getAdvancePickMap();
+  for (const [k, v] of m) {
+    if (v.actionId !== actionId) continue;
+    if (v.taskId && taskId && v.taskId !== taskId) continue;
+    m.delete(k);
+  }
 };
 
 /** 单测重置占坑表 */

@@ -25,8 +25,12 @@ const {
 } = await import("@/lib/server/feishu-bridge/group-outbound");
 
 const {
+  __resetGroupAdvancePickForTest,
+  bindGroupAdvancePickAction,
+  releaseGroupAdvancePickByAction,
   __resetGroupArtifactCardDedupForTest,
   __resetGroupReplyStateForTest,
+  claimGroupAdvancePick,
   claimGroupArtifactCard,
   GROUP_REPLY_MAX_PER_TASK,
   GROUP_REPLY_TTL_MS,
@@ -104,6 +108,7 @@ const askEvent = (meta: Record<string, unknown>) =>
 beforeEach(() => {
   __resetGroupReplyStateForTest();
   __resetGroupArtifactCardDedupForTest();
+  __resetGroupAdvancePickForTest();
 });
 
 afterEach(() => {
@@ -112,6 +117,7 @@ afterEach(() => {
   __setGroupOutboundDepsForTest(null);
   __resetGroupReplyStateForTest();
   __resetGroupArtifactCardDedupForTest();
+  __resetGroupAdvancePickForTest();
 });
 
 // assistant_delta 是每 token 一发：不缓存的话一轮回答要读几百次 config.json
@@ -629,6 +635,76 @@ describe("推进产物回群", () => {
     const body = callArgs(sendText)[1] as string;
     expect(body).toContain("刚交卷，产物见上卡");
     expect(body).toContain('<at user_id="ou_zhang">张三</at>');
+  });
+
+  it("收口放选择卡坑：同卡跑完 A 还能再点 B（十四轮 P2）", async () => {
+    const shareToGroup = vi.fn(async () => ({}));
+    __setGroupOutboundDepsForTest(
+      baseDeps({ shareToGroup, getTask: async () => taskWithAction() }) as never,
+    );
+    // 属主点卡跑 A：占坑 + 登记带 pick↔action
+    expect(
+      claimGroupAdvancePick("pick-1", "复核", {
+        taskId: "task-1",
+        actionKey: "review",
+      }),
+    ).toEqual({ ok: true });
+    rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "advance",
+      actionId: "act-9",
+      advancePickId: "pick-1",
+      channel: "owner",
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: taskWithAction(),
+      ok: true,
+    });
+    expect(shareToGroup).toHaveBeenCalledTimes(1);
+    // A 跑完放坑：同卡点 B 不再回“已在跑”
+    expect(
+      claimGroupAdvancePick("pick-1", "出方案", {
+        taskId: "task-1",
+        actionKey: "plan",
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("pick↔记录 id 映射：按 action 放坑、跨任务不串坑", async () => {
+    // claim 只知道 taskId+actionKey（按钮 value），收口只知道 actionId（记录 id）
+    expect(
+      claimGroupAdvancePick("pick-2", "复核", {
+        taskId: "task-1",
+        actionKey: "review",
+      }),
+    ).toEqual({ ok: true });
+    bindGroupAdvancePickAction("pick-2", "act-99");
+    // 没放之前同卡再点照样拦
+    expect(
+      claimGroupAdvancePick("pick-2", "出方案", {
+        taskId: "task-1",
+        actionKey: "plan",
+      }),
+    ).toEqual({ ok: false, startedLabel: "复核" });
+    // 跨任务的放坑不误伤
+    releaseGroupAdvancePickByAction("task-other", "act-99");
+    expect(
+      claimGroupAdvancePick("pick-2", "出方案", {
+        taskId: "task-1",
+        actionKey: "plan",
+      }),
+    ).toEqual({ ok: false, startedLabel: "复核" });
+    // 同 task 同 action 放坑后可重选
+    releaseGroupAdvancePickByAction("task-1", "act-99");
+    expect(
+      claimGroupAdvancePick("pick-2", "出方案", {
+        taskId: "task-1",
+        actionKey: "plan",
+      }),
+    ).toEqual({ ok: true });
   });
 
   // 设置页「群内推进结果回群」已砍（2026-07-28）：固定开。群里点了推进却看不到结果、

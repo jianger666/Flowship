@@ -65,6 +65,7 @@ import {
   buildGroupAdvanceCardJson,
 } from "./group-advance-card";
 import {
+  bindGroupAdvancePickAction,
   claimGroupAdvancePick,
   GROUP_MEMBER_FALLBACK_NAME,
   markGroupBotIdentityUsable,
@@ -596,7 +597,9 @@ const startGroupAdvanceAction = async (args: {
   requester: { openId: string; name: string };
   instruction: string;
   loadBootContext: GroupRouteCtx["loadBootContext"];
-}): Promise<{ ok: true } | { ok: false; error: string }> => {
+  /** 选择卡点按钮来的才带：收口时按它放坑，同卡跑完还能点别的按钮 */
+  advancePickId?: string;
+}): Promise<{ ok: true; actionId: string } | { ok: false; error: string }> => {
   const { task, target, chatId, requester } = args;
   const boot = await args.loadBootContext();
   if (!boot) {
@@ -615,6 +618,7 @@ const startGroupAdvanceAction = async (args: {
     requesterName: requester.name,
     kind: "advance",
     channel: "owner",
+    ...(args.advancePickId ? { advancePickId: args.advancePickId } : {}),
   });
   try {
     const { action } = await deps.advanceTask({
@@ -627,10 +631,16 @@ const startGroupAdvanceAction = async (args: {
       opGen: getTaskOpGeneration(task.id),
     });
     setGroupReplyActionId(task.id, replyHandle, action.id);
+    // pick↔记录 id 补记：claim 时只有 taskId+actionKey、收口时只有 actionId，靠它连起来
+    if (args.advancePickId) bindGroupAdvancePickAction(args.advancePickId, action.id);
+    // 被顶掉的老推进登记再也收不到收口了——它的卡坑也一起放掉，否则那张卡白锁 24h
+    //（新一轮在飞，同卡再点仍会被前置闸拦，放坑只恢复“可点”，不恢复“可跑”）
+    const prevPick = replyHandle?.previous?.advancePickId;
+    if (prevPick) releaseGroupAdvancePick(prevPick);
     // 顶掉的那条推进登记再也收不到产物 / 失败回执了——先给它的发起人交代一句，再回受理
     await notifySupersededGroupAdvance(replyHandle);
     await replyToGroup(chatId, `已开始跑 ${target.label}`, requester);
-    return { ok: true };
+    return { ok: true, actionId: action.id };
   } catch (err) {
     // 没起来就别挂着登记（否则下一轮无关的 done 会误把结果发进群）；
     // 只回滚自己那次——这段 await 里可能已有别的群消息登记了新的等待回群
@@ -798,12 +808,16 @@ export const handleGroupAdvancePick = async (
     return;
   }
 
-  // 2) 同卡防重复点击（占坑同步、中间零 await）
+  // 2) 同卡防重复点击（占坑同步、中间零 await；先验属主再占坑，顺序别动——
+  // bot 点卡连坑都摸不到。pickId 为空直接放行：老卡片没 pickId 的兼容口）
   const fallbackLabel = isBuiltinAdvanceAction(value.actionKey)
     ? (ACTION_LABEL[value.actionKey] ?? value.actionKey)
     : ACTION_LABEL.custom;
   const label = value.label?.trim() || fallbackLabel;
-  const claim = claimGroupAdvancePick(value.pickId, label);
+  const claim = claimGroupAdvancePick(value.pickId, label, {
+    taskId: value.taskId,
+    actionKey: value.actionKey,
+  });
   if (!claim.ok) {
     await replyToGroup(value.chatId, `已在跑 ${claim.startedLabel}`, clicker);
     return;
@@ -827,7 +841,10 @@ export const handleGroupAdvancePick = async (
     requester: clicker,
     instruction: "（来自需求群推进选择卡）",
     loadBootContext,
+    ...(value.pickId ? { advancePickId: value.pickId } : {}),
   });
+  // 成功不放坑：坑留到收口（flush/到期摘）再放——同卡跑完才能点别的按钮；
+  // 失败才当场退坑，同卡允许重选
   if (!started.ok) releaseGroupAdvancePick(value.pickId);
 };
 
