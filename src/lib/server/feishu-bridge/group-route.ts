@@ -40,7 +40,7 @@ import type {
 } from "@/lib/server/advance-options";
 import { getPendingAsk } from "@/lib/server/chat-pending";
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
-import { buildGroupQaSummaryEvent } from "@/lib/group-qa";
+import { buildGroupQaSummaryEvent, cleanGroupQuestionText } from "@/lib/group-qa";
 import { handleTaskQuestionInject } from "@/lib/server/task-question-inject";
 import { getTask, listTasks } from "@/lib/server/task-fs";
 import { advanceTask } from "@/lib/server/task-runner";
@@ -1114,6 +1114,12 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
       for (;;) {
         const head = shiftGroupQuestionQueue(taskId);
         if (!head) break;
+        // 长 drain 中途也看冷却：await inject 期间并发跳闸了，剩下的不再答、放回队首
+        // （review 六轮-3；和入口是同一语义，注释统一写在这里）
+        if (isBypassLoopCooling(taskId)) {
+          unshiftGroupQuestionQueue(taskId, head);
+          break;
+        }
         // inject 主路都 catch 转 failed 了，但 replyToGroup 炸了还是会抛：
         //  per-item 兜住，失败这条认栽继续下一条，别卡住整队（review 四轮-3）
         let r;
@@ -1141,10 +1147,14 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
             errText,
           );
           if (!isBypassLoopCooling(taskId)) {
-            await replyToGroup(head.chatId, "这条没接住，麻烦重问", {
-              openId: head.requester.openId,
-              name: head.requester.name,
-            });
+            // 发起人是机器人就不 @（和主路 atRequester:false 同理，@ 回去就续环，review 六轮-1）
+            await replyToGroup(
+              head.chatId,
+              "这条没接住，麻烦重问",
+              head.requesterIsBot
+                ? undefined
+                : { openId: head.requester.openId, name: head.requester.name },
+            );
           }
           await writeOwnedEventAndPublish(
             taskId,
@@ -1154,7 +1164,8 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
               askerOpenId: head.requester.openId,
               askerName: head.requester.name,
               questionMessageId: head.messageId,
-              answer: `回放注入失败：${errText}`,
+              // tab 里别留无头轮：带上原问截断（review 六轮-5）
+              answer: `原问“${cleanGroupQuestionText(head.text).slice(0, 80)}”回放失败：${errText}`,
               ok: false,
             }),
             `pump-fail-${Date.now().toString(36)}`,

@@ -181,9 +181,13 @@ export const collectGroupQaRounds = (
       ensure(strOf(metaOf(ev).restrictedRunTag)).q = ev;
     }
   }
+  // 配对记账：runTag → 问题事件（undefined = 汇总落单）。后面出轮次只读账，
+  // 不再各自判定——判定函数读“活表”会被删键影响（review 六轮-4 踩过），账是静态快照。
+  const pairedBySummary = new Map<string, TaskEvent | undefined>();
   const pairedQuestions = new Set<TaskEvent>();
   const pairOne = (s: GroupQaSummaryMeta, q: TaskEvent | undefined) => {
     if (q) pairedQuestions.add(q);
+    pairedBySummary.set(s.runTag, q);
   };
   // 第一轮：runTag 精确配对
   const pendingFallback: GroupQaSummaryMeta[] = [];
@@ -204,22 +208,19 @@ export const collectGroupQaRounds = (
       if (mid && !byFeishuMessageId.has(mid)) byFeishuMessageId.set(mid, ev);
     }
   }
-  const findQuestionFor = (
-    s: GroupQaSummaryMeta,
-  ): TaskEvent | undefined => {
-    const direct = findByRunTag(s);
-    if (direct) return direct;
-    if (!s.questionMessageId) return undefined;
-    // 表里只剩未配对问题，这里不可能抢到别人的（一个问题只归一轮）
-    return byFeishuMessageId.get(s.questionMessageId);
-  };
   for (const s of pendingFallback) {
-    pairOne(s, findQuestionFor(s));
+    // 中间这轮只为先占位：runTag 配对的问题先进账，反查表建表时自动排除它们。
+    const q =
+      s.questionMessageId !== undefined
+        ? byFeishuMessageId.get(s.questionMessageId)
+        : undefined;
+    pairOne(s, q);
+    // 配对成功就从表里删：两个汇总撞同一个群消息 id（重试/双写）时，后到的不再复用
+    // 同一个问题（review 六轮-4）
+    if (q && s.questionMessageId) byFeishuMessageId.delete(s.questionMessageId);
   }
   for (const { ev: sev, s } of summaries) {
-    // 上面两轮已配好对；这里复用同一判定纯读结果（幂等：Set.add 重复加无影响）
-    const q = findQuestionFor(s);
-    if (q) pairedQuestions.add(q);
+    const q = pairedBySummary.get(s.runTag);
     const qMeta = q ? metaOf(q) : null;
     rounds.push({
       key: s.runTag,

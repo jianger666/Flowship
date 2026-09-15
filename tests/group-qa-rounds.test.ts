@@ -317,3 +317,38 @@ describe("汇总事件", () => {
     ).toBe(true);
   });
 });
+
+describe("配对去重（review 六轮-4）", () => {
+  it("两个汇总撞同一个群消息 id：问题只归第一轮，第二轮无头展示", () => {
+    const q = {
+      kind: "user_reply",
+      id: "q9",
+      ts: 1000,
+      text: "是对的吗",
+      meta: { source: "feishu_group", feishuMessageId: "om_dup" },
+    } as never;
+    const s = (id: string, runTag: string, answer: string) =>
+      ({
+        kind: "info",
+        id,
+        ts: 2000,
+        text: "x",
+        meta: {
+          groupQaSummary: {
+            runTag,
+            askerOpenId: "ou_a",
+            askerName: "A",
+            questionMessageId: "om_dup",
+            answer,
+            ok: true,
+          },
+        },
+      }) as never;
+    const rounds = collectGroupQaRounds([q, s("s1", "tokA", "答A"), s("s2", "tokB", "答B")], 9999999999999);
+    // 问题只出现一次（第二轮无头，不复用）
+    const withQ = rounds.filter((r: { questionText: string }) => r.questionText !== "");
+    expect(withQ).toHaveLength(1);
+    expect(withQ[0]!.key).toBe("tokA");
+    expect(rounds).toHaveLength(2);
+  });
+});

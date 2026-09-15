@@ -2480,3 +2480,78 @@ describe("review 五轮：回放抛错回执", () => {
     expect(handleTaskQuestionInject).not.toHaveBeenCalled();
   });
 });
+
+describe("review 六轮：回执不@机器人/中途跳闸停drain", () => {
+  it("pumpfail 回执：发起人是机器人就不 @（和主路 atRequester 同口径）", async () => {
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(baseDeps({ sendTextToChat }) as never);
+    const shared = await import("@/lib/server/feishu-bridge/group-shared");
+    const { pumpGroupQuestionQueue: pump } = await import(
+      "@/lib/server/feishu-bridge/group-route"
+    );
+    // inject 直接抛（getTask 炸），走 pump catch 回执路径
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        sendTextToChat,
+        getTask: async () => {
+          throw new Error("db-gone");
+        },
+      }) as never,
+    );
+    shared.enqueueGroupQuestion("task-1", {
+      messageId: "om_botfail",
+      chatId: CHAT,
+      text: "机器人问的",
+      parsed: { text: "机器人问的", images: [], attachments: [] } as never,
+      requester: { openId: "ou_otherbot", name: "对方机器人" },
+      requesterIsBot: true,
+      boot: { apiKey: "k", model: { id: "m" } },
+    });
+    await pump("task-1");
+    expect(sendTextToChat).toHaveBeenCalledTimes(1);
+    const body = callArgs(sendTextToChat)[1] as string;
+    expect(body).toContain("没接住");
+    // 不 @：对方靠 @ 触发，@ 回去就续环
+    expect(body).not.toContain("<at");
+  });
+
+  it("长 drain 中途跳闸：剩下的放回队首停掉，不答完（review 六轮-3）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    const shared = await import("@/lib/server/feishu-bridge/group-shared");
+    const { pumpGroupQuestionQueue: pump } = await import(
+      "@/lib/server/feishu-bridge/group-route"
+    );
+    const entry = (id: string, text: string) => ({
+      messageId: id,
+      chatId: CHAT,
+      text,
+      parsed: { text, images: [], attachments: [] } as never,
+      requester: { openId: "ou_li", name: "李四" },
+      boot: { apiKey: "k", model: { id: "m" } },
+    });
+    shared.enqueueGroupQuestion("task-1", entry("om_d1", "第一条"));
+    shared.enqueueGroupQuestion("task-1", entry("om_d2", "第二条"));
+    // 卡住第一条的注入，期间把熔断跳闸（同一发送人攒满）
+    let release!: () => void;
+    const gate = new Promise<Response>((r) => {
+      release = () => r(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    handleTaskQuestionInject.mockImplementationOnce(() => gate);
+    const p = pump("task-1");
+    await Promise.resolve();
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      shared.recordBypassLoopAttempt("task-1", "ou_bot", Date.now() + i);
+    }
+    release();
+    await p;
+    // 第一条答了，第二条没答（放回队首，下次冷却过再说）
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    expect(groupQuestionQueueLength("task-1")).toBe(1);
+  });
+});

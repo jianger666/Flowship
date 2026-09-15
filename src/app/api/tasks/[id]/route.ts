@@ -60,6 +60,7 @@ import {
 } from "@/lib/server/task-stream";
 import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
 import { cleanupChatQueueState, failQueuedItems } from "@/lib/server/chat-queue";
+import { clearGroupQuestionQueue } from "@/lib/server/feishu-bridge/group-shared";
 import {
   beginChatLifecycle,
   cancelChatStart,
@@ -637,6 +638,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 旁路的受限群答疑不在 runningTasks / runningChats 里（刻意解耦）——
     // 删任务要删目录，它必须一起叫停，否则会往被删掉的 cwd 里继续跑
     cancelRestrictedQuestions(id);
+    // 群问答排队同理：条目带 boot.apiKey，任务没了必须清、不然永久躺内存（review 六轮-2）
+    clearGroupQuestionQueue(id);
     // 删任务清队也走唯一终态 sink——已 202 的排队消息发 queue_failed（deleted）、
     // 前端按 itemId 清占位（原裸 clearChatQueue 会留幽灵 pending）
     failQueuedItems(id, { reason: "deleted" });
