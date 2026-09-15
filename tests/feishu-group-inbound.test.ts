@@ -2346,3 +2346,96 @@ describe("review 三轮：过期占位/多sender清理/节流/补泵", () => {
     expect(groupQuestionQueueLength("task-1")).toBe(0);
   });
 });
+
+describe("review 四轮：清扫/补泵循环/回放抛错", () => {
+  it("record 搭车清扫：过期 task 整项删、节流表同批清", async () => {
+    const shared = await import("@/lib/server/feishu-bridge/group-shared");
+    const base = 1_000_000;
+    recordBypassLoopAttempt("task-dead", "ou_gone", base);
+    expect(shared.__getBypassLoopTaskCountForTest()).toBeGreaterThanOrEqual(1);
+    // 另一个 task 的一次记录触发全表清扫（窗口外 + 节流过期）
+    throttleOncePerMinute("sweep-k", base);
+    recordBypassLoopAttempt("task-live", "ou_now", base + BYPASS_LOOP_WINDOW_MS + 1000);
+    expect(shared.__getBypassLoopTaskCountForTest()).toBe(1);
+    expect(shared.__getBypassLoopSendersForTest("task-live")).toEqual(["ou_now"]);
+    // 节流 mark 同批被清：同一 key 新窗口又能放行
+    expect(throttleOncePerMinute("sweep-k", base + BYPASS_LOOP_WINDOW_MS + 1001)).toBe(
+      true,
+    );
+  });
+
+  it("入队清过期打 warn（和 shift 对齐，排查对得上）", async () => {
+    const shared = await import("@/lib/server/feishu-bridge/group-shared");
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const old = Date.now() - GROUP_QUESTION_QUEUE_TTL_MS - 1000;
+      shared.enqueueGroupQuestion(
+        "task-1",
+        {
+          messageId: "om_stale",
+          chatId: CHAT,
+          text: "过期问题",
+          parsed: { text: "过期问题", images: [], attachments: [] } as never,
+          requester: { openId: "ou_li", name: "李四" },
+          boot: { apiKey: "k", model: { id: "m" } },
+        },
+        old,
+      );
+      shared.enqueueGroupQuestion("task-1", {
+        messageId: "om_fresh",
+        chatId: CHAT,
+        text: "新问题",
+        parsed: { text: "新问题", images: [], attachments: [] } as never,
+        requester: { openId: "ou_li", name: "李四" },
+        boot: { apiKey: "k", model: { id: "m" } },
+      });
+      expect(
+        spy.mock.calls.some((c) => String(c[0]).includes("入队清掉 1 个过期排队")),
+      ).toBe(true);
+      expect(groupQuestionQueueLength("task-1")).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("回放注入抛错：认栽继续下一条，不卡住整队", async () => {
+    let getTaskCalls = 0;
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        getTask: async () => {
+          getTaskCalls++;
+          if (getTaskCalls === 1) throw new Error("db-gone");
+          return fullTask({ runStatus: "idle" });
+        },
+      }) as never,
+    );
+    const shared = await import("@/lib/server/feishu-bridge/group-shared");
+    const { pumpGroupQuestionQueue: pump } = await import(
+      "@/lib/server/feishu-bridge/group-route"
+    );
+    const entry = (id: string, text: string) => ({
+      messageId: id,
+      chatId: CHAT,
+      text,
+      parsed: { text, images: [], attachments: [] } as never,
+      requester: { openId: "ou_li", name: "李四" },
+      boot: { apiKey: "k", model: { id: "m" } },
+    });
+    shared.enqueueGroupQuestion("task-1", entry("om_e1", "第一条（注入抛错）"));
+    shared.enqueueGroupQuestion("task-1", entry("om_e2", "第二条（正常）"));
+    // 抛了也不炸：pump 正常返回
+    await pump("task-1");
+    // 第一条认栽丢弃，第二条正常注入
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    const [, body] = handleTaskQuestionInject.mock.calls[0] as unknown as [
+      string,
+      { text: string },
+    ];
+    expect(body.text).toContain("第二条");
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+});

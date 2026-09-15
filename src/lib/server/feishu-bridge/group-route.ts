@@ -1094,7 +1094,7 @@ const injectGroupMessage = async (args: {
  */
 const questionPumpRunning = new Set<string>();
 // guard 撞车登记：inbound pump 还在 await inject 时，done 的 pump 不丢机会，
-// 当前这轮 finally 里补一圈（无定时器，review G 二轮；循环本来就会 drenar 队，
+// 当前这轮结束后再补圈（无定时器、无递归，review G 三轮；循环本来就会 drain 队，
 // 补圈只覆盖“判空后、清 guard 前”那个微秒窗口）。
 const questionPumpWanted = new Set<string>();
 export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
@@ -1103,43 +1103,53 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
     questionPumpWanted.add(taskId);
     return;
   }
-  if (isBypassLoopCooling(taskId)) return;
   questionPumpRunning.add(taskId);
   try {
-    for (;;) {
+    // 冷却判定只在这里（入口 + 每圈同一处，语义一处改一处，review 四轮-2）
+    do {
+      questionPumpWanted.delete(taskId);
       if (isBypassLoopCooling(taskId)) return;
-      const head = shiftGroupQuestionQueue(taskId);
-      if (!head) return;
-      const r = await injectGroupMessage({
-        taskId,
-        chatId: head.chatId,
-        text: head.text,
-        parsed: head.parsed,
-        requester: head.requester,
-        isOwner: false,
-        loadBootContext: async () => head.boot,
-        messageId: head.messageId,
-        senderIds: head.senderIds,
-        ...(head.requesterIsBot ? { requesterIsBot: true as const } : {}),
-        fromPump: true,
-      });
-      // 还在忙 → 放回队首等下一轮 draining（静默，不回群，避免 @ 续循环）
-      if (
-        r.kind === "skipped" &&
-        (r.error === GROUP_TASK_RUNNING ||
-          r.error === GROUP_RESTRICTED_QUESTION_RUNNING)
-      ) {
-        unshiftGroupQuestionQueue(taskId, head);
-        return;
+      for (;;) {
+        const head = shiftGroupQuestionQueue(taskId);
+        if (!head) break;
+        // inject 主路都 catch 转 failed 了，但 replyToGroup 炸了还是会抛：
+        //  per-item 兜住，失败这条认栽继续下一条，别卡住整队（review 四轮-3）
+        let r;
+        try {
+          r = await injectGroupMessage({
+            taskId,
+            chatId: head.chatId,
+            text: head.text,
+            parsed: head.parsed,
+            requester: head.requester,
+            isOwner: false,
+            loadBootContext: async () => head.boot,
+            messageId: head.messageId,
+            senderIds: head.senderIds,
+            ...(head.requesterIsBot ? { requesterIsBot: true as const } : {}),
+            fromPump: true,
+          });
+        } catch (err) {
+          console.warn(
+            `${LOG} 排队回放注入抛错、继续下一条 task=${taskId} message=${head.messageId}：`,
+            err instanceof Error ? err.message : err,
+          );
+          continue;
+        }
+        // 还在忙 → 放回队首等下一轮 draining（静默，不回群，避免 @ 续循环）
+        if (
+          r.kind === "skipped" &&
+          (r.error === GROUP_TASK_RUNNING ||
+            r.error === GROUP_RESTRICTED_QUESTION_RUNNING)
+        ) {
+          unshiftGroupQuestionQueue(taskId, head);
+          return;
+        }
+        // sent/failed/其它 skip：本轮已收口（失败路径注入链自己回过群），继续下一条
       }
-      // sent/failed/其它 skip：本轮已收口（失败路径注入链自己回过群），继续下一条
-    }
+    } while (questionPumpWanted.delete(taskId));
   } finally {
     questionPumpRunning.delete(taskId);
-    if (questionPumpWanted.delete(taskId)) {
-      // 有人在本轮里求过泵：补一圈（guard 已空，进来就走主路；递归深度实际为 1）
-      await pumpGroupQuestionQueue(taskId);
-    }
   }
 };
 

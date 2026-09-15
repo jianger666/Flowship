@@ -84,6 +84,12 @@ export const enqueueGroupQuestion = (
   } else if (q.length > 0) {
     // filter 永远返回新数组：无条件写回，否则 push 进空气（review 三轮实测抓包）
     const kept = q.filter((e) => now - e.enqueuedAt < GROUP_QUESTION_QUEUE_TTL_MS);
+    // 和 shift 对齐：丢过期打一行 warn，排查时两边对得上（review 四轮-4）
+    if (kept.length !== q.length) {
+      console.warn(
+        `[feishu-bridge/group-shared] 入队清掉 ${q.length - kept.length} 个过期排队 task=${taskId}`,
+      );
+    }
     groupQuestionQueues.set(taskId, kept);
     q = kept;
   }
@@ -563,17 +569,40 @@ export const resetBypassLoop = (taskId: string): void => {
 export const __getBypassLoopSendersForTest = (taskId: string): string[] => [
   ...(bypassLoopByTask.get(taskId)?.bySender.keys() ?? []),
 ];
+/** 单测 peek：熔断表里还剩几个 task（断言整项清理用） */
+export const __getBypassLoopTaskCountForTest = (): number =>
+  bypassLoopByTask.size;
 
 /**
  * per-task 节流：同一 key 一分钟内只放行一次（review D：身份服务抖时 warn 刷屏）。
  * now 参数只给单测用。
  */
 const throttleMarks = new Map<string, number>();
+/** 节流窗口（和下面的懒清扫共用，别 hardcode 两处） */
+export const THROTTLE_WINDOW_MS = 60_000;
 export const throttleOncePerMinute = (key: string, now: number = Date.now()): boolean => {
   const last = throttleMarks.get(key);
-  if (last !== undefined && now - last < 60_000) return false;
+  if (last !== undefined && now - last < THROTTLE_WINDOW_MS) return false;
   throttleMarks.set(key, now);
   return true;
+};
+/**
+ * 全表清扫（record 搭车调用）：各 task 过期 sender 数组删、空 task 整项删
+ * （冷却中的空 task 也删——cooldownUntil 已过才到这里，见调用方先行判定）、
+ * 节流表过期 marks 删。
+ */
+export const sweepBypassLoopState = (now: number = Date.now()): void => {
+  for (const [taskId, st] of bypassLoopByTask) {
+    if (now < st.cooldownUntil) continue;
+    for (const [id, arr] of st.bySender) {
+      if (arr.some((t) => now - t < BYPASS_LOOP_WINDOW_MS)) continue;
+      st.bySender.delete(id);
+    }
+    if (st.bySender.size === 0) bypassLoopByTask.delete(taskId);
+  }
+  for (const [key, ts] of throttleMarks) {
+    if (now - ts >= THROTTLE_WINDOW_MS) throttleMarks.delete(key);
+  }
 };
 export const __resetThrottleForTest = (): void => {
   throttleMarks.clear();
@@ -606,12 +635,14 @@ export const recordBypassLoopAttempt = (
     bypassLoopByTask.set(taskId, st);
   }
   if (now < st.cooldownUntil) return { tripped: false, cooled: true };
-  // 顺手清别人的过期数组（review B）：量小，一次 Map 遍历无压力，不清会越积越大
-  for (const [id, arr] of st.bySender) {
-    if (id === senderId) continue;
-    const kept = arr.filter((t) => now - t < BYPASS_LOOP_WINDOW_MS);
-    if (kept.length === 0) st.bySender.delete(id);
-    else st.bySender.set(id, kept);
+  // 全表搭车清扫（review 四轮-1）：过期 sender 数组删、空 task 整项删（任务删了也不留），
+  // 节流表同批清。群消息是人类速度，一轮全扫无压力；量小，不另起定时器。
+  sweepBypassLoopState(now);
+  // 注意：上面可能把本 task 也扫掉（全过期），下面 get 不到就重建——语义不变
+  st = bypassLoopByTask.get(taskId);
+  if (!st) {
+    st = { bySender: new Map(), cooldownUntil: 0 };
+    bypassLoopByTask.set(taskId, st);
   }
   const rounds = (st.bySender.get(senderId) ?? []).filter(
     (t) => now - t < BYPASS_LOOP_WINDOW_MS,
