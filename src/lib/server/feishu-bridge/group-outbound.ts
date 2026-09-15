@@ -26,8 +26,10 @@ import type { ShareToGroupInput } from "@/lib/server/feishu-group";
 import { getActionArtifactPath } from "@/lib/server/task-fs-core";
 import {
   subscribeAllTaskStreams,
+  writeEventAndPublish,
   type TaskStreamEvent,
 } from "@/lib/server/task-stream";
+import { buildGroupQaSummaryEvent } from "@/lib/group-qa";
 import { getTask } from "@/lib/server/task-fs";
 import { ACTION_LABEL, type Task } from "@/lib/types";
 
@@ -395,6 +397,23 @@ const flushGroupReply = async (
   const body = !ok
     ? "这轮没跑成功、去 Flowship 看看事件流"
     : answer || "已处理完成（这轮没有文字回复）";
+  // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
+  // publish 不带 origin：投不进任何登记、不触发回群。
+  if (entry.runTag) {
+    await writeEventAndPublish(
+      taskId,
+      buildGroupQaSummaryEvent({
+        runTag: entry.runTag,
+        askerOpenId: entry.requesterOpenId,
+        askerName: entry.requesterName,
+        ...(entry.sourceMessageId
+          ? { questionMessageId: entry.sourceMessageId }
+          : {}),
+        answer,
+        ok,
+      }),
+    );
+  }
   // 发起人是机器人时不 @（atRequester=false）：它的自动化靠 @ 触发，@ 回去就和它成环。
   // 人类提问保持原样 @ 提醒。
   const head =

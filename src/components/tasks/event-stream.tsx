@@ -45,6 +45,7 @@ import {
 } from "@/hooks/use-stream-follow";
 import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
 import { findPendingAskEvent } from "@/lib/ask-pending";
+import { collectGroupQaRounds } from "@/lib/group-qa";
 import {
   findRenderIndexForEventId,
   normalizeEventStreamSearchQuery,
@@ -118,6 +119,7 @@ import {
   ToolBlockRow,
   ToolVerbGroupRow,
 } from "./event-stream/tool-block";
+import { GroupQaPanel } from "./group-qa-panel";
 import { ActiveStatusLine } from "./event-stream/active-status-line";
 import { WorkGroupRow } from "./event-stream/work-group";
 import { AskUserInlineCard } from "./ask-user-inline";
@@ -653,10 +655,18 @@ const EventStreamImpl = ({
   //
   // 第一层：只吃真实事件（滤噪声 → thinking 合并 → tool 配对 → 工作过程分组）。
   // isRunning=false 时 coerce 脏 running 工具 →「已中断」（chat / task 共用）
+  // 群问答 tab：有旁路问答轮次时才出现；切过去只读呈现，主流程事件流不受影响
+  const [showGroupQa, setShowGroupQa] = useState(false);
   const baseItems = useMemo(
     () => buildStreamItems(task.events, isChat, isRunning),
     [task.events, isChat, isRunning],
   );
+  // 群问答轮次（原始事件聚合，不走主流程过滤管线；chat 形态无群桥接不展示）
+  const groupQaRounds = useMemo(
+    () => collectGroupQaRounds(task.events ?? []),
+    [task.events],
+  );
+  const showQaPanel = showGroupQa && groupQaRounds.length > 0;
 
   // 第二层：未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的
   // 漏网），渲染层兜底保证答题卡不被顶走（纯显示排序、数据不动、2026-07-23 用户实测痛点）。
@@ -1467,7 +1477,36 @@ const EventStreamImpl = ({
           inputRef={searchInputRef}
           placeholder="搜索 AI 回复…"
           ariaLabel="搜索 AI 回复"
-          leading={<span className="flex-1">事件流</span>}
+          leading={
+            <span className="flex flex-1 items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setShowGroupQa(false)}
+                className={cn(
+                  "text-xs",
+                  !showQaPanel
+                    ? "font-medium text-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                事件流
+              </button>
+              {!isChat && groupQaRounds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowGroupQa(true)}
+                  className={cn(
+                    "text-xs tabular-nums",
+                    showQaPanel
+                      ? "font-medium text-foreground"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  群问答（{groupQaRounds.length}）
+                </button>
+              )}
+            </span>
+          }
           className="h-10 shrink-0 border-b px-4"
         />
       )}
@@ -1541,7 +1580,9 @@ const EventStreamImpl = ({
           onJumpToAsk={jumpToPendingAsk}
           onBackToBottom={backToBottom}
         />
-        {items.length === 0 ? (
+        {showQaPanel ? (
+          <GroupQaPanel rounds={groupQaRounds} />
+        ) : items.length === 0 ? (
           <div
             className={cn(
               "p-4 text-xs text-muted-foreground",

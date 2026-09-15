@@ -143,4 +143,29 @@ describe("isHiddenFromEventStream", () => {
       false,
     );
   });
+
+  it("群问答 tab 的内容主流程默认隐藏（非属主群问题 + 轮次汇总）", () => {
+    // 非属主群问题（带配对键）：藏，切 tab 看
+    expect(
+      isHiddenFromEventStream(
+        ev("user_reply", {
+          meta: { source: "feishu_group", restrictedRunTag: "tok1" },
+        }),
+      ),
+    ).toBe(true);
+    // 轮次汇总：藏
+    expect(
+      isHiddenFromEventStream(
+        ev("info", {
+          meta: { groupQaSummary: { runTag: "tok1" } },
+        }),
+      ),
+    ).toBe(true);
+    // 属主群消息（无 runTag）：留在主流程
+    expect(
+      isHiddenFromEventStream(
+        ev("user_reply", { meta: { source: "feishu_group" } }),
+      ),
+    ).toBe(false);
+  });
 });

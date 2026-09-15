@@ -937,6 +937,8 @@ const injectGroupMessage = async (args: {
     chatId,
     requesterOpenId: requester.openId,
     requesterName: requester.name,
+    // UI 群问答 tab 配对备用（见 sourceMessageId 注释）
+    sourceMessageId: messageId,
     // 发起人是机器人 → 回群不 @（它的自动化靠 @ 触发，@ 回去就成环）
     ...(args.requesterIsBot ? { atRequester: false as const } : {}),
     kind: "question",
@@ -979,6 +981,7 @@ const injectGroupMessage = async (args: {
           chatId,
           requesterOpenId: requester.openId,
           requesterName: requester.name,
+          sourceMessageId: messageId,
           kind: "question",
           channel: "restricted",
         });
@@ -993,6 +996,10 @@ const injectGroupMessage = async (args: {
     feishuMessageId: messageId,
     groupChatId: chatId,
     groupSender: requester.name,
+    // 群问答 UI 聚合键：提问人稳定 id（sender_name 经常拿不到，只能看到“群成员”）；
+    // restrictedRunTag = 这轮旁路回答汇总事件的配对键（属主通道没有，进不了群问答 tab）
+    groupSenderOpenId: requester.openId,
+    ...(restrictedRunTag ? { restrictedRunTag } : {}),
     // 关联命中留痕：事件流里能看出这条是托办事项的回执（出问 message_id）
     ...(correlated
       ? { correlatedAnswer: correlated.entry.messageId }

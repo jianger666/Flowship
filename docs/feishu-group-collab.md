@@ -555,14 +555,28 @@ prompt 就是同一段指令里既写「禁止改」又写「才动手改」，�
 因此它能与属主的活会话并行跑（action 交卷后会话是刻意保留的，而那正是产物刚播报
 进群、同事最可能回话的窗口）。
 
-它唯一的登记是 task-stream 的 `registerRestrictedQuestion` 轻量表，服务三件事：
+它唯一的登记是 task-stream 的 `registerRestrictedQuestion` 轻量表，服务五件事：
 
 1. **终态叫停**：DELETE / `finalizeTask` 要删 worktree → `cancelRestrictedQuestions(taskId)`
    （它不在 `runningTasks` 里，`cancelTaskRun` 够不着）
-2. **群侧串行**：`isTaskBusyForGroupMessage`（普通消息）与 `checkTaskAdvanceable`
-   （群内推进 / 选择卡）都拒在飞——同一 worktree 上并排起几个 agent 既烧额度又抢 IO，
-   群里也只有一条对话线索。⚠️ 只在**群入向**这一侧串，不是 task 运行态判定
-3. **UI 运行态信号**：表变化即 publish `restricted_run` 帧（active = 表里还有没有），
+2. **群侧串行 + 排队**：`groupMessageBusyReason`（普通消息）与 `checkTaskAdvanceable`
+   （群内推进 / 选择卡）都看在飞——同一 worktree 上并排起几个 agent 既烧额度又抢 IO，
+   群里也只有一条对话线索。⚠️ 只在**群入向**这一侧串，不是 task 运行态判定。
+   串行 ≠ 丢弃：非属主 task 型普通问题忙时进排队（`group-shared`，最多攒 3 个、
+   10 分钟过期，满了落回忙线拒收），前一轮 done / 属主动作终态 / 新消息到达时
+   `pumpGroupQuestionQueue` draining。draining 还忙就放回队首（静默，不回群）。
+3. **机器人互 @ 防环**（江涛 CLI 案，两边都是 Flowship、收到 @ 就答、答完 @ 回去）：
+   - 对方机器人发的 @ 照常处理（它是来送结果的，拦掉就收不到了），
+     但回群不 @ 它（登记 `atRequester: false`，flush 只发正文）——对方靠 @ 触发，
+     不 @ 就哑火，查完确认一轮即收；
+   - 伪装成人的 CLI（user 身份发消息）入向认不出，靠熔断：10 分钟内连续 5 轮
+     非属主 @ 就跳闸，冷却 10 分钟（静默跳过 + 整队丢弃，只在 Flowship 事件流留痕），
+     属主出现清零。
+4. **群问答 tab**：问题事件（`meta.restrictedRunTag`）←→ 轮次汇总事件
+   （`meta.groupQaSummary.runTag`，flush 时写一行）配对，备用键群消息 id。
+   主流程默认隐藏这两类（`isHiddenFromEventStream`），任务内“群问答”tab 按轮次
+   列表展示（时间 / 谁问的 / 一行回答，含 open_id），点开展示问答全文。
+5. **UI 运行态信号**：表变化即 publish `restricted_run` 帧（active = 表里还有没有），
    `watch-task` bootstrap 也按表补一帧。任务详情页把它并进 `isRunning`——否则旁路
    agent 跑着的长 shell / 子代理写进事件流后，会因 `runStatus !== "running"` 被
    `coerceStaleRunningTools` 判成脏数据、渲染成灰色「已中断」（第四轮双审 P1-2）

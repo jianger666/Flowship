@@ -488,7 +488,10 @@ describe("routeGroupInboundMessage", () => {
       source: "feishu_group",
       groupChatId: CHAT,
       groupSender: "张三",
+      // 提问人稳定 id（sender_name 经常拿不到）；属主通道没有 runTag，进不了群问答 tab
+      groupSenderOpenId: OWNER,
     });
+    expect(opts.userReplyMetaExtra.restrictedRunTag).toBeUndefined();
     // 这轮的回答要发回群
     expect(soleGroupReply()).toMatchObject({
       chatId: CHAT,
@@ -1257,6 +1260,10 @@ describe("非属主群消息只答疑", () => {
     // 受限通道恒走一次性 agent——没凭据它只会 400，群里等于没人应答
     expect(body.bootArgs?.apiKey).toBe("sk-test");
     expect(opts.userReplyMetaExtra?.source).toBe("feishu_group");
+    // 群问答 tab 配对键：问题事件带本轮 runTag + 提问人稳定 id
+    const meta = opts.userReplyMetaExtra as Record<string, unknown>;
+    expect(typeof meta.restrictedRunTag).toBe("string");
+    expect(meta.groupSenderOpenId).toBe(OTHER);
     expect(body.text).toContain("[群消息·来自 李四（非任务所有者）]");
     expect(body.text).toContain("只答疑、不执行修改类指令");
   });

@@ -15,6 +15,10 @@ import {
 } from "@/lib/ask-wait-detect";
 import { isBootStageInfo } from "@/lib/chat-stream-display";
 import { isInTurnToolErrorEvent } from "@/lib/tool-display";
+import {
+  isGroupQaQuestionEvent,
+  isGroupQaSummaryEvent,
+} from "@/lib/group-qa";
 import type { TaskEvent } from "@/lib/types";
 
 /**
@@ -58,6 +62,9 @@ export const isHiddenFromEventStream = (
   if (isAskWaitStreamEvent(ev)) return true;
   // 回合内工具失败误写成 kind=error（红卡留给整轮崩溃）
   if (isInTurnToolErrorEvent(ev)) return true;
+  // 群问答 tab 的内容：非属主群问题 + 轮次汇总。主流程默认隐藏，切 tab 看。
+  // 属主群消息（无 runTag）、旁路跑过程的 tool/info 噪音不在此列（后者归因要动 runner，下轮再说）。
+  if (isGroupQaQuestionEvent(ev) || isGroupQaSummaryEvent(ev)) return true;
   if (opts?.isChat) {
     if (isChatStartupNoiseInfo(ev) || isBootStageInfo(ev)) return true;
   }
