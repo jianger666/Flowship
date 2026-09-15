@@ -533,12 +533,16 @@ export const __resetGroupReplyStateForTest = (): void => {
 // 短窗口内连续 N 轮 → 冷却一段时间，期间非属主 @ 消息静默跳过（不回群里任何话——
 // 回一句 @ 就会给对方机器人续上）、只在 Flowship 事件流里留一条熔断说明。
 // 内存态：进程重启清零，可接受（环本来就跑在进程活着的时候）。
-/** 熔断滑动窗口：窗口内非属主 @ 消息达到这么多轮就跳闸 */
+/** 熔断滑动窗口：窗口内同一发送人 @ 消息达到这么多轮就跳闸（多人群问不累计） */
 export const BYPASS_LOOP_WINDOW_MS = 10 * 60 * 1000;
 export const BYPASS_LOOP_MAX_ROUNDS = 5;
 /** 跳闸后静默多久（属主消息不受影响、且会清零计数） */
 export const BYPASS_LOOP_COOLDOWN_MS = 10 * 60 * 1000;
-type BypassLoopState = { rounds: number[]; cooldownUntil: number };
+type BypassLoopState = {
+  /** 按发送人分组的时间戳（review P1-1：5 个同事各问一句是正常忙群，只有同一个 id 连刷才是环） */
+  bySender: Map<string, number[]>;
+  cooldownUntil: number;
+};
 const bypassLoopByTask = new Map<string, BypassLoopState>();
 export const __resetBypassLoopForTest = (): void => {
   bypassLoopByTask.clear();
@@ -556,24 +560,30 @@ export const isBypassLoopCooling = (
   return !!st && now < st.cooldownUntil;
 };
 /**
- * 记一轮非属主 @ 消息。tripped=本轮跳闸（调用方静默跳过 + 写一条应用事件），
- * cooled=冷却中（静默跳过，不再写事件）。now 参数只给单测用。
+ * 记一轮非属主 @ 消息（调用方已排除属主）。tripped=本轮跳闸（调用方静默跳过 +
+ * 写一条应用事件），cooled=冷却中（静默跳过，不再写事件）。
+ * senderId 为空按 fail-open 不计（身份都拿不到，@ 判定本身也已不可靠，记了也是误伤）。
+ * now 参数只给单测用。
  */
 export const recordBypassLoopAttempt = (
   taskId: string,
+  senderId?: string,
   now: number = Date.now(),
 ): { tripped: boolean; cooled: boolean } => {
   const idle = { tripped: false, cooled: false };
-  if (!taskId) return idle;
+  if (!taskId || !senderId) return idle;
   let st = bypassLoopByTask.get(taskId);
   if (!st) {
-    st = { rounds: [], cooldownUntil: 0 };
+    st = { bySender: new Map(), cooldownUntil: 0 };
     bypassLoopByTask.set(taskId, st);
   }
-  st.rounds = st.rounds.filter((t) => now - t < BYPASS_LOOP_WINDOW_MS);
   if (now < st.cooldownUntil) return { tripped: false, cooled: true };
-  st.rounds.push(now);
-  if (st.rounds.length >= BYPASS_LOOP_MAX_ROUNDS) {
+  const rounds = (st.bySender.get(senderId) ?? []).filter(
+    (t) => now - t < BYPASS_LOOP_WINDOW_MS,
+  );
+  rounds.push(now);
+  st.bySender.set(senderId, rounds);
+  if (rounds.length >= BYPASS_LOOP_MAX_ROUNDS) {
     st.cooldownUntil = now + BYPASS_LOOP_COOLDOWN_MS;
     return { tripped: true, cooled: false };
   }

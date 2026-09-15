@@ -667,6 +667,8 @@ const EventStreamImpl = ({
     [task.events],
   );
   const showQaPanel = showGroupQa && groupQaRounds.length > 0;
+  // 进行中轮次 → tab 上亮蓝点（主流程里它完全隐身，不给提示用户不知道有人问了，review P1-4）
+  const groupQaAnswering = groupQaRounds.some((r) => r.answering);
 
   // 第二层：未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的
   // 漏网），渲染层兜底保证答题卡不被顶走（纯显示排序、数据不动、2026-07-23 用户实测痛点）。
@@ -781,8 +783,14 @@ const EventStreamImpl = ({
     null,
   );
 
+  // 切 task 回事件流（群问答 tab 是任务内视图，别串台）；搜一激活也切回（搜索只查主流程）
+  // review P2-8：搜的时候停在 QA tab 里容易懵。
+  useEffect(() => {
+    setShowGroupQa(false);
+  }, [task.id]);
   const activateStreamSearch = useCallback(() => {
     setActivePaneSearchScope("event-stream");
+    setShowGroupQa(false);
     setSearchActive(true);
     searchInputRef.current?.focus();
     requestAnimationFrame(() => {
@@ -1496,13 +1504,16 @@ const EventStreamImpl = ({
                   type="button"
                   onClick={() => setShowGroupQa(true)}
                   className={cn(
-                    "text-xs tabular-nums",
+                    "flex items-center gap-1 text-xs tabular-nums",
                     showQaPanel
                       ? "font-medium text-foreground"
                       : "text-muted-foreground hover:text-foreground",
                   )}
                 >
                   群问答（{groupQaRounds.length}）
+                  {groupQaAnswering && (
+                    <span className="inline-block size-1.5 animate-pulse rounded-full bg-blue-500" />
+                  )}
                 </button>
               )}
             </span>

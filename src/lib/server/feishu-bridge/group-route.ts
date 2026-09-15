@@ -877,7 +877,12 @@ const injectGroupMessage = async (args: {
     // 属主 / chat 型 / 答 pendingAsk / 关联回执不排——属主用 app 当主通道，关联数据有时效性。
     // pump 回放时（fromPump）不再二次入队：还忙就静默等下一轮 draining。
     if (!args.fromPump && !isOwner && task.mode !== "chat" && !feedIntoSession) {
+      // 启动凭据拿不到就不排：回放必失败还占一次循环，不如直接忙线拒收（review P2-6）
       const boot = await args.loadBootContext().catch(() => null);
+      if (!boot) {
+        await replyToGroup(chatId, busyReason, requester);
+        return { kind: "skipped", messageId, taskId, error: busyReason };
+      }
       const pushed = enqueueGroupQuestion(taskId, {
         messageId,
         chatId,
@@ -886,7 +891,7 @@ const injectGroupMessage = async (args: {
         requester,
         senderIds: args.senderIds,
         ...(args.requesterIsBot ? { requesterIsBot: true as const } : {}),
-        boot: boot ?? null,
+        boot,
       });
       if (pushed.queued) {
         const waiting =
@@ -1194,17 +1199,17 @@ export const routeGroupInboundMessage = async (
     return { kind: "skipped", messageId, error: SKIP_GROUP_NO_TASK };
   }
 
-  // 4.25) 到达顺带 draining：队里有攒的且此刻空闲，先答旧的（FIFO），再处理当前这条
-  // （兜底 done/终态帧丢失的极端情况；空队一次 Map 查询秒回，冷却中直接让过）
-  await pumpGroupQuestionQueue(taskId);
-
   // 4.5) 机器人互 @ 熔断：伪装成人的对方机器人（user 身份发消息的 CLI）入向拦不住，
-  // 只能数“非属主 @ 消息短时间连发”来断。属主出现说明人在场，清零。
+  // 按发送人分组计数——同一个 id 短时间连刷才断，多人群问不累计（review P1-1）。
+  // 属主出现说明人在场，清零。属主身份拿不到时 fail-open 不计（@ 判定本身已不可靠）。
   // 跳闸 / 冷却中一律静默跳过——回群里任何话都会给对方机器人续上。
+  // 注意顺序：熔断在 draining 之前，“先断再说”，跳闸当轮不再放行队首（review P1-2）。
   if (!!ownerOpenId && msg.sender_id === ownerOpenId) {
     resetBypassLoop(taskId);
+  } else if (!ownerOpenId) {
+    console.warn(`${LOG} 属主身份不可用、熔断计数跳过（fail-open）task=${taskId}`);
   } else {
-    const loop = recordBypassLoopAttempt(taskId);
+    const loop = recordBypassLoopAttempt(taskId, msg.sender_id);
     if (loop.tripped || loop.cooled) {
       if (loop.tripped) {
         // 跳闸整队丢弃：排队的问题一并作废（麻烦重问），否则冷却里攒一堆过期答案
@@ -1215,7 +1220,7 @@ export const routeGroupInboundMessage = async (
           () => true,
           {
             kind: "info",
-            text: `群答疑熔断：10 分钟内连续 ${BYPASS_LOOP_MAX_ROUNDS} 轮非属主问答（疑似机器人互 @），已暂停回群 10 分钟${dropped > 0 ? `（排队中的 ${dropped} 个问题一并丢弃，麻烦重问）` : ""}。属主消息不受影响，去群里看下是不是两个机器人在对答。`,
+            text: `群答疑熔断：同一发送人 10 分钟内连续 ${BYPASS_LOOP_MAX_ROUNDS} 轮 @ 提问（疑似机器人互 @），已暂停回群 10 分钟${dropped > 0 ? `（排队中的 ${dropped} 个问题一并丢弃，麻烦重问）` : ""}。属主消息不受影响，去群里看下是不是两个机器人在对答。`,
           },
           `loop-breaker-${Date.now().toString(36)}`,
         );
@@ -1226,6 +1231,10 @@ export const routeGroupInboundMessage = async (
       return { kind: "skipped", messageId, taskId, error: SKIP_GROUP_LOOP_BREAKER };
     }
   }
+
+  // 4.25) 到达顺带 draining：队里有攒的且此刻空闲，先答旧的（FIFO），再处理当前这条
+  // （兜底 done/终态帧丢失的极端情况；空队一次 Map 查询秒回，冷却中直接让过）
+  await pumpGroupQuestionQueue(taskId);
 
   // 5) 解析正文（图 / 文件下载复用 p2p 那套）
   let parsed: ParsedInboundContent;

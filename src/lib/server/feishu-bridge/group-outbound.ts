@@ -397,6 +397,15 @@ const flushGroupReply = async (
   const body = !ok
     ? "这轮没跑成功、去 Flowship 看看事件流"
     : answer || "已处理完成（这轮没有文字回复）";
+  // 发起人是机器人时不 @（atRequester=false）：它的自动化靠 @ 触发，@ 回去就和它成环。
+  // 人类提问保持原样 @ 提醒。
+  const head =
+    entry.atRequester === false
+      ? ""
+      : `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
+  // 先发后记：发送炸了外层吞掉、汇总也不写，tab 与群一致（都静默），
+  // 原因查主流程 error 事件。反过来（先记后发）tab 会躺着群里没收到的答案，更误导（review P2-7）。
+  await deps.sendMarkdown(entry.chatId, `${head}${truncateForGroup(body)}`);
   // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
   // publish 不带 origin：投不进任何登记、不触发回群。
   if (entry.runTag) {
@@ -414,14 +423,6 @@ const flushGroupReply = async (
       }),
     );
   }
-  // 发起人是机器人时不 @（atRequester=false）：它的自动化靠 @ 触发，@ 回去就和它成环。
-  // 人类提问保持原样 @ 提醒。
-  const head =
-    entry.atRequester === false
-      ? ""
-      : `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
-  // post md：@ 标签写进 markdown 正文（飞书扩展语法），整段才会渲染 ** / ` / 列表
-  await deps.sendMarkdown(entry.chatId, `${head}${truncateForGroup(body)}`);
 };
 
 /**

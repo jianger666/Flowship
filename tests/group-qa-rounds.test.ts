@@ -75,6 +75,8 @@ describe("展示小件", () => {
     expect(
       cleanGroupQuestionText('<at user_id="ou_y">江涛</at> 这个对吗'),
     ).toBe("@江涛 这个对吗");
+    // [Bug] 这类正常内容不许吃（review P2-5）
+    expect(cleanGroupQuestionText("[Bug] 埋点没上报")).toBe("[Bug] 埋点没上报");
   });
 
   it("一行回答：首个非空行、120 字封顶", () => {
@@ -86,6 +88,34 @@ describe("展示小件", () => {
 
   it("时间带日期（跨天轮次只看 HH:mm 会串）", () => {
     expect(formatGroupQaTs(NOW)).toMatch(/\d{2}-\d{2} \d{2}:\d{2}/);
+  });
+});
+
+describe("汇总时间回退（review P1-3）", () => {
+  it("问题被裁只剩汇总：用汇总自己的时间，不沉底", () => {
+    const rounds = collectGroupQaRounds(
+      [
+        ev({
+          kind: "info",
+          id: "s9",
+          ts: 9000,
+          text: "x",
+          meta: {
+            groupQaSummary: {
+              runTag: "tok9",
+              askerOpenId: "ou_a",
+              askerName: "A",
+              answer: "答",
+              ok: true,
+            },
+          },
+        }),
+      ],
+      NOW,
+    );
+    expect(rounds).toHaveLength(1);
+    // 用汇总自己的时间（9000），而不是沉底的 0
+    expect(rounds[0]).toMatchObject({ key: "tok9", ts: 9000 });
   });
 });
 

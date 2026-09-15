@@ -92,13 +92,14 @@ const isGroupQuestionEventAny = (ev: TaskEvent): boolean =>
 /**
  * 提问正文去噪（展示用）：剥 [群消息·来自…] 前缀与飞书原生 <at> 标签残留。
  * 有名字的 @ 留个 @Name（知道还圈了谁），空名字的整段丢掉。
+ * 前缀只认 [群消息 开头——`[Bug] xxx` 这类正常内容不许吃（review P2-5）。
  */
 export const cleanGroupQuestionText = (text: string): string =>
   text
     .replace(/<at user_id="[^"]*">([^<]*)<\/at>/g, (_, name: string) =>
       name.trim() ? `@${name.trim()}` : "",
     )
-    .replace(/^\[[^\]\n]*\](——[^\n]*)?\n?/, "")
+    .replace(/^\[群消息[^\]\n]*\](——[^\n]*)?\n?/, "")
     .replace(/[ \t]{2,}/g, " ")
     .trim();
 
@@ -200,13 +201,14 @@ export const collectGroupQaRounds = (
     if (cand && !pairedQuestions.has(cand)) return cand;
     return undefined;
   };
-  for (const { s } of summaries) {
+  for (const { ev: sev, s } of summaries) {
     const q = findQuestionFor(s);
     if (q) pairedQuestions.add(q);
     const qMeta = q ? metaOf(q) : null;
     rounds.push({
       key: s.runTag,
-      ts: q?.ts ?? 0,
+      // 问题被裁掉 / 只剩汇总时回退汇总自己的时间，别沉底（review P1-3）
+      ts: q?.ts ?? sev.ts,
       askerName:
         strOf(s.askerName) ||
         (qMeta ? strOf(qMeta.groupSender) : "") ||

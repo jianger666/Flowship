@@ -1892,9 +1892,9 @@ describe("机器人发件人直拦", () => {
 });
 
 describe("互@熔断", () => {
-  it("纯函数：窗口内连发跳闸、冷却中不再计数、窗口外清零、属主清零", () => {
+  it("纯函数：同一发送人窗口内连发跳闸、冷却中不再计数、窗口外清零、属主清零", () => {
     const t = "task-loop-unit";
-    const at = (ms: number) => recordBypassLoopAttempt(t, 1_000_000 + ms);
+    const at = (ms: number) => recordBypassLoopAttempt(t, "ou_bot", 1_000_000 + ms);
     expect(at(0)).toEqual({ tripped: false, cooled: false });
     expect(at(1000)).toEqual({ tripped: false, cooled: false });
     expect(at(2000)).toEqual({ tripped: false, cooled: false });
@@ -1907,16 +1907,36 @@ describe("互@熔断", () => {
     expect(at(6000)).toEqual({ tripped: false, cooled: false });
   });
 
+  it("纯函数：多人群问不累计（review P1-1），空发送人 fail-open", () => {
+    const t = "task-loop-multi";
+    // 5 个不同人各问一句：不跳闸
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      expect(recordBypassLoopAttempt(t, `ou_human${i}`, 1_000_000 + i * 1000)).toEqual({
+        tripped: false,
+        cooled: false,
+      });
+    }
+    // 空发送人不计
+    expect(recordBypassLoopAttempt(t, "", 1_000_000)).toEqual({
+      tripped: false,
+      cooled: false,
+    });
+    expect(recordBypassLoopAttempt("", "ou_x", 1_000_000)).toEqual({
+      tripped: false,
+      cooled: false,
+    });
+  });
+
   it("纯函数：窗口外的旧轮次不计数", () => {
     const t = "task-loop-window";
-    recordBypassLoopAttempt(t, 0);
-    recordBypassLoopAttempt(t, 1000);
-    recordBypassLoopAttempt(t, 2000);
-    recordBypassLoopAttempt(t, 3000);
+    recordBypassLoopAttempt(t, "ou_bot", 0);
+    recordBypassLoopAttempt(t, "ou_bot", 1000);
+    recordBypassLoopAttempt(t, "ou_bot", 2000);
+    recordBypassLoopAttempt(t, "ou_bot", 3000);
     // 隔了一个窗口之后再来 4 轮也不该跳闸
     const base = BYPASS_LOOP_WINDOW_MS + 10_000;
     for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS - 1; i++) {
-      expect(recordBypassLoopAttempt(t, base + i * 1000)).toEqual({
+      expect(recordBypassLoopAttempt(t, "ou_bot", base + i * 1000)).toEqual({
         tripped: false,
         cooled: false,
       });
@@ -2113,5 +2133,130 @@ describe("群问答排队", () => {
     expect(texts).toHaveLength(2);
     expect(texts[0]).toContain("之前排队的问题");
     expect(texts[1]).toContain("新问题");
+  });
+});
+
+describe("熔断分组计数（review P1-1/P1-2）", () => {
+  const stormDeps = () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
+    );
+    return { handleTaskQuestionInject, sendTextToChat };
+  };
+
+  it("5 个不同人各问一句不跳闸（正常忙群）", async () => {
+    const { handleTaskQuestionInject } = stormDeps();
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      const r = await routeGroupInboundMessage(
+        otherMsg({
+          message_id: `om_m${i}`,
+          sender_id: `ou_human${i}`,
+          sender_name: `同事${i}`,
+          content: "@Flowship 这个接口什么时候好",
+        }),
+        ctx,
+      );
+      expect(r).toMatchObject({ kind: "sent" });
+    }
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
+      BYPASS_LOOP_MAX_ROUNDS,
+    );
+  });
+
+  it("属主身份拿不到时 fail-open 不计（不误伤）", async () => {
+    const { handleTaskQuestionInject } = stormDeps();
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        getBotAppInfo: async () => ({ appId: "cli_self", ownerOpenId: "" }),
+      }) as never,
+    );
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      const r = await routeGroupInboundMessage(
+        otherMsg({ message_id: `om_o${i}`, content: "@Flowship 在吗" }),
+        ctx,
+      );
+      expect(r).toMatchObject({ kind: "sent" });
+    }
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
+      BYPASS_LOOP_MAX_ROUNDS,
+    );
+  });
+
+  it("跳闸当轮先断再泵：队首不被放行、整队丢弃（review P1-2）", async () => {
+    const { handleTaskQuestionInject } = stormDeps();
+    const { enqueueGroupQuestion: enq } = await import(
+      "@/lib/server/feishu-bridge/group-shared"
+    );
+    // 同一发送人连发到跳闸线下沿
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS - 1; i++) {
+      await routeGroupInboundMessage(
+        otherMsg({ message_id: `om_p${i}`, content: "@Flowship 在吗" }),
+        ctx,
+      );
+    }
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
+      BYPASS_LOOP_MAX_ROUNDS - 1,
+    );
+    // 跳闸瞬间队里正好有 1 个排队的：旧顺序会先放行它再清队，新顺序直接整队丢弃
+    enq("task-1", {
+      messageId: "om_q0",
+      chatId: CHAT,
+      text: "排队的问题",
+      parsed: { text: "排队的问题", images: [], attachments: [] } as never,
+      requester: { openId: "ou_li", name: "李四" },
+      boot: { apiKey: "sk-test", model: { id: "m1" } },
+    });
+    const tripped = await routeGroupInboundMessage(
+      otherMsg({ message_id: "om_trip2", content: "@Flowship 在吗" }),
+      ctx,
+    );
+    expect(tripped).toMatchObject({
+      kind: "skipped",
+      error: SKIP_GROUP_LOOP_BREAKER,
+    });
+    // 队首没被放行（inject 没多调），整队已丢弃
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
+      BYPASS_LOOP_MAX_ROUNDS - 1,
+    );
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+});
+
+describe("排队边界", () => {
+  it("启动凭据拿不到就不排（回放必失败，不如忙线拒收，review P2-6）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
+    );
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion("task-1", inFlight);
+    try {
+      const r = await routeGroupInboundMessage(
+        otherMsg({ message_id: "om_nb", content: "@Flowship 在吗" }),
+        { ...ctx, loadBootContext: async () => null },
+      );
+      expect(r).toMatchObject({
+        kind: "skipped",
+        error: GROUP_RESTRICTED_QUESTION_RUNNING,
+      });
+      expect(groupQuestionQueueLength("task-1")).toBe(0);
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    } finally {
+      unregisterRestrictedQuestion("task-1", inFlight);
+    }
   });
 });
