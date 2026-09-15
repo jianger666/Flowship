@@ -20,6 +20,7 @@ process.env.FLOWSHIP_DATA_DIR = path.join(
 
 const {
   __resetGroupChatCacheForTest,
+  invalidateGroupChatCache,
   __setGroupRouteDepsForTest,
   GROUP_ADVANCE_NOT_OWNER,
   GROUP_ADVANCE_SUPERSEDED,
@@ -413,6 +414,69 @@ describe("resolveTaskIdByGroupChat", () => {
     );
     expect(await resolveTaskIdByGroupChat(CHAT)).toBeNull();
     expect(getBoundGroupChatId).not.toHaveBeenCalled();
+  });
+
+  it("解绑后命中失效：活体校验不问旧账，直接重扫（review 十三轮-1）", async () => {
+    const listTasks = vi.fn(async () => [taskSummary()]);
+    let bound: string | null = CHAT;
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        listTasks,
+        getTask: async () => fullTask(),
+        getBoundGroupChatId: async () => bound,
+      }) as never,
+    );
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-1");
+    // 飞书侧解绑（写钩子拦不住）：命中必须自己验出来
+    bound = "oc_other";
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBeNull();
+    // 旧命中已删：触发了重扫，而不是沿用缓存
+    expect(listTasks).toHaveBeenCalledTimes(2);
+  });
+
+  it("换绑到 B：旧命中作废，重扫路由到新任务", async () => {
+    const taskB = taskSummary({ id: "task-2", title: "任务B" });
+    let boundA: string | null = CHAT;
+    const listTasks = vi.fn(async () => [taskSummary()]);
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        listTasks,
+        getTask: async () => fullTask(),
+        getBoundGroupChatId: async () => boundA,
+      }) as never,
+    );
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-1");
+    // 群换绑到 B：A 解绑、B 接上
+    boundA = "oc_other";
+    listTasks.mockResolvedValue([taskB]);
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        listTasks,
+        // 按 id 回不同任务（命中校验拿旧 task 查旧绑定， scanning 拿新 task 查新绑定）
+        getTask: async (id: string) =>
+          id === "task-2" ? fullTask({ id: "task-2", title: "任务B" }) : fullTask(),
+        getBoundGroupChatId: async (t: { id?: string }) =>
+          t?.id === "task-2" ? CHAT : "oc_other",
+      }) as never,
+    );
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-2");
+  });
+
+  it("绑定写入后整清缓存：新绑群立刻可路由（review 十三轮-2）", async () => {
+    const listTasks = vi.fn(async () => [taskSummary()]);
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        listTasks,
+        getTask: async () => fullTask(),
+        getBoundGroupChatId: async () => CHAT,
+      }) as never,
+    );
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-1");
+    expect(listTasks).toHaveBeenCalledTimes(1);
+    // 模拟绑定写入后的整清：下一次直接重扫，不吃 10 分钟旧命中
+    invalidateGroupChatCache();
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-1");
+    expect(listTasks).toHaveBeenCalledTimes(2);
   });
 });
 

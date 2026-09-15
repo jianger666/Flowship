@@ -479,10 +479,16 @@ group-outbound.handleGroupOutboundEvent
 
 飞书没有「按群反查工作项」的开放接口，所以反查方向是**本机任务 → 它绑定的群**：
 
-1. 命中缓存（`chatId → taskId`，10 分钟）→ 直接用（仍确认 task 还在，防已删）
+1. 命中缓存（`chatId → taskId`，10 分钟）→ 直接用，但仍活体校验绑定
+   （`getBoundGroupChatId(task) === chatId`）：删任务 / 解绑 / 换绑一次读全覆盖，
+   读炸 fail-open 沿用旧命中（review 十三轮-1；换绑解绑常发生在飞书侧，写钩子拦不住）
 2. 未命中缓存（60 秒负缓存）→ 扫本机任务：有 `feishuStoryUrl` 且非终态、按
-   `updatedAt` 倒序取前 20 条 → 逐个 `getBoundGroupChatId`（只读 `group_type`、**绝不建群**）
+   `updatedAt` 倒序取前 20 条 → 逐个 `getBoundGroupChatId`（只读 `group_type`、**绝不建群**）。
+   非归档任务超 20 个也会挤窗口：排 21 名开外的绑定群发消息直接“没关联”——
+   动一下任务（`updatedAt` 一 bump 就进窗口）即自愈，任务量碰不到，先认账（review 十三轮-3）
 3. 扫描顺带缓存所有查到的 (群, task) 对——之后别的群消息大概率直接命中
+4. 绑定写入（新建群 bind）后整清缓存——新绑群 60 秒内 @ 不再撞负缓存说“没关联”
+   （review 十三轮-2，和第 1 条同一个钩子语义：写后失效 + 读时验）
 
 负缓存是必需的：无关群的刷屏否则每条都触发一轮全量 meegle 扫描。
 

@@ -769,6 +769,12 @@ export const ensureRequirementGroup = async (
     try {
       await getDeps().bindGroup(story.workItemId, story.projectKey, myChatId);
       await warnIfBindDidNotStick(story, myChatId);
+      // 绑定变了：群反查缓存整清（换绑前的旧映射也在里面；review 十三轮-1/十三轮-2，
+      // 新绑群 60 秒内 @ 不再撞 miss 说“没关联”）。放 try 里：bind 炸了也清，重扫兜底。
+      // 动态 import：group-route 静态边太重（连着 task-runner），运行时再连。
+      await import("@/lib/server/feishu-bridge/group-route")
+        .then((m) => m.invalidateGroupChatCache())
+        .catch(() => {});
     } catch (bindErr) {
       getDeps().warn(
         `bind 失败（群已建好、本次卡片照发）：工作项 ${story.workItemId} ← ${myChatId}：${

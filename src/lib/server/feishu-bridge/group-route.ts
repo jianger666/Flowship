@@ -379,11 +379,19 @@ const getChatTaskCache = (): ChatTaskCache => {
   return g[CHAT_TASK_CACHE_KEY]!;
 };
 
-/** 单测 / 群绑定变更后清缓存 */
-export const __resetGroupChatCacheForTest = (): void => {
+/**
+ * 群绑定变更后清缓存（换绑 / 解绑 / 新建群 bind 后调；调用方见 feishu-group）。
+ * 绑定极少变，全清最省心——换绑前的旧映射也在里面，一起作废。
+ */
+export const invalidateGroupChatCache = (): void => {
   const c = getChatTaskCache();
   c.hits.clear();
   c.misses.clear();
+};
+
+/** 单测 / 群绑定变更后清缓存（生产入口见 invalidateGroupChatCache） */
+export const __resetGroupChatCacheForTest = (): void => {
+  invalidateGroupChatCache();
 };
 
 /**
@@ -402,8 +410,17 @@ export const resolveTaskIdByGroupChat = async (
 
   const hit = cache.hits.get(chatId);
   if (hit && now - hit.at < POSITIVE_TTL_MS) {
-    // task 可能已被删——命中也要确认还在，否则清缓存重扫
-    if (await deps.getTask(hit.taskId)) return hit.taskId;
+    // 命中也要活体校验：删任务 / 解绑 / 换绑都会让缓存撒谎，一次读全覆盖
+    //（review 十三轮-1；换绑解绑经常发生在飞书侧，写钩子拦不住，只能读时验）。
+    // 读炸了 fail-open 沿用旧命中（抖一下不断流）；明确对不上才删了重扫。
+    let fresh = false;
+    try {
+      const task = await deps.getTask(hit.taskId);
+      fresh = !!task && ((await deps.getBoundGroupChatId(task)) === chatId);
+    } catch {
+      fresh = true;
+    }
+    if (fresh) return hit.taskId;
     cache.hits.delete(chatId);
   }
   const missAt = cache.misses.get(chatId);
