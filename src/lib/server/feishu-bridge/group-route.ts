@@ -266,7 +266,12 @@ export const matchesBotMention = (
 
 /** 剥掉正文里的 @ 占位（`@_user_1`）与 `@应用名`，留下真正的指令文本 */
 export const stripMentions = (text: string, names: string[]): string => {
-  let out = text;
+  // 先剥飞书原生 `<at user_id>` 标签（江涛 CLI 案：@ 本机 bot 的标签以原文残留进 prompt，
+  // 模型看到一串 ou_ 开头的机器 id，还以为 @ 了两个人）。有名字的留个 @Name（知道还圈了谁），
+  // 空名字的整段丢掉；剩下的 `@应用名` 走下面原有逻辑。
+  let out = text.replace(/<at user_id="[^"]*">([^<]*)<\/at>/g, (_, name: string) =>
+    name.trim() ? `@${name.trim()}` : " ",
+  );
   for (const raw of names) {
     const n = raw.trim();
     if (!n) continue;

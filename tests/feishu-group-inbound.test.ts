@@ -266,6 +266,21 @@ describe("群消息判定 / @ 过滤", () => {
     expect(stripMentions("@Flowship 推进 复核", ["Flowship"])).toBe("推进 复核");
     expect(stripMentions("@_user_1 这个怎么办", [])).toBe("这个怎么办");
   });
+
+  it("stripMentions 剥掉飞书原生 <at> 标签（江涛 CLI 案：ou_ 残留会让模型以为 @ 了两个人）", () => {
+    // @ 本机 bot 的空名标签：整段丢掉（mention 数组已命中，文本里是纯噪音）
+    expect(
+      stripMentions('<at user_id="ou_9546"></at> 正在查埋点', ["Flowship"]),
+    ).toBe("正在查埋点");
+    // @ 别人的：留个 @Name，知道还圈了谁，但 user_id 不进 prompt
+    expect(
+      stripMentions('<at user_id="ou_abc">江涛</at> 这个埋点对吗', ["Flowship"]),
+    ).toBe("@江涛 这个埋点对吗");
+    // 自己的有名标签：先转 @Name 再被应用名剥掉
+    expect(
+      stripMentions('<at user_id="ou_bot">Flowship</at> 查一下', ["Flowship"]),
+    ).toBe("查一下");
+  });
 });
 
 describe("命令解析", () => {
