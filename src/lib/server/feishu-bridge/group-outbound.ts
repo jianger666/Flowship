@@ -83,6 +83,11 @@ export interface GroupOutboundDeps {
   isAskToGroupEnabled: typeof isAskToGroupEnabled;
   isAdvanceResultToGroupEnabled: typeof isAdvanceResultToGroupEnabled;
   readArtifact: (absPath: string) => Promise<string>;
+  /**
+   * 排队 draining（答完 / 动作终态后泵一次，空队秒回）。group-route 的实现、
+   * 这里动态 import（出向挂在 bootstrap 启动链上，静态连边会成环，见下注释）。
+   */
+  pumpGroupQuestionQueue: (taskId: string) => Promise<void>;
 }
 
 /**
@@ -109,6 +114,8 @@ const defaultDeps = (): GroupOutboundDeps => ({
   isAskToGroupEnabled,
   isAdvanceResultToGroupEnabled,
   readArtifact: (absPath) => fs.readFile(absPath, "utf-8"),
+  pumpGroupQuestionQueue: (taskId) =>
+    import("./group-route").then((m) => m.pumpGroupQuestionQueue(taskId)),
 });
 
 let deps: GroupOutboundDeps = defaultDeps();
@@ -491,13 +498,24 @@ export const handleGroupOutboundEvent = async (
       return;
     }
     if (ev.kind === "done") {
-      await flushGroupReply(taskId, runTag, ev.ok);
+      try {
+        await flushGroupReply(taskId, runTag, ev.ok);
+      } finally {
+        // 上一轮答完 → 泵排队（空队秒回；还忙就放回队首等下一轮）。
+        // 放 finally：回群发送炸了也不能把排队饿死（外层整段吞异常）。
+        await deps.pumpGroupQuestionQueue(taskId);
+      }
       return;
     }
     // action 落终态（后置检查把 awaiting_ack 落盘）才是「推进跑完」的真信号——
     // done 是 turn 级的、agent 中途 ask_user 也会发（见 resolveAdvancePhase）
     if (ev.kind === "task" || ev.kind === "action") {
-      await flushGroupAdvanceOnActionUpdate(taskId);
+      try {
+        await flushGroupAdvanceOnActionUpdate(taskId);
+      } finally {
+        // 属主动作有进展 → 顺手泵一次排队（忙就放回，不打扰）
+        await deps.pumpGroupQuestionQueue(taskId);
+      }
       return;
     }
     if (ev.kind !== "event") return;

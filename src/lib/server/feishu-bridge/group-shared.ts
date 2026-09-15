@@ -38,6 +38,99 @@
  * 一条事件都没有），别把它当保活的主手段。
  */
 
+import type { ParsedInboundContent } from "./router";
+
+// ----------------- 群问答排队 -----------------
+//
+// task 型群问答一次只答一个（防刷屏 + 省额度），忙时后来问题不再忙线拒收、而是攒起来：
+// 前一轮 done / 属主动作终态 / 新消息到达时 draining，前一个答完就答它。
+// 属主 / chat 型 / 答 pendingAsk / 关联回执不排（属主用 app 当主通道，关联数据有时效性）。
+// 有界：最多攒这么多，满了落回忙线拒收；TTL 过期静默丢弃；熔断跳闸时整队丢弃。
+/** 队里最多攒几个（不含正在答的那个） */
+export const GROUP_QUESTION_QUEUE_MAX = 3;
+/** 排队超过这么久还没轮到就丢弃（答案过期了，不如重问） */
+export const GROUP_QUESTION_QUEUE_TTL_MS = 10 * 60 * 1000;
+/** 排队中的一个群问题：injectGroupMessage 入参的子集 + 启动凭据快照 */
+export interface QueuedGroupQuestion {
+  messageId: string;
+  chatId: string;
+  text: string;
+  parsed: ParsedInboundContent;
+  requester: { openId: string; name: string };
+  senderIds?: Array<string | undefined>;
+  requesterIsBot?: boolean;
+  /** 入队时解析好的启动凭据（复用调用方 ctx，不从 router 引运行时） */
+  boot: {
+    apiKey: string;
+    model: { id: string; params?: Array<{ id: string; value: string }> };
+  } | null;
+  enqueuedAt: number;
+}
+const groupQuestionQueues = new Map<string, QueuedGroupQuestion[]>();
+/** 入队（满了返回 queued:false，调用方落回忙线拒收）。now 参数只给单测用 */
+export const enqueueGroupQuestion = (
+  taskId: string,
+  entry: Omit<QueuedGroupQuestion, "enqueuedAt">,
+  now: number = Date.now(),
+): { queued: boolean; position: number } => {
+  if (!taskId) return { queued: false, position: 0 };
+  let q = groupQuestionQueues.get(taskId);
+  if (!q) {
+    q = [];
+    groupQuestionQueues.set(taskId, q);
+  }
+  if (q.length >= GROUP_QUESTION_QUEUE_MAX)
+    return { queued: false, position: q.length };
+  q.push({ ...entry, enqueuedAt: now });
+  return { queued: true, position: q.length };
+};
+/** 取队首（跳过 TTL 过期的，静默丢弃；空返回 null）。now 参数只给单测用 */
+export const shiftGroupQuestionQueue = (
+  taskId: string,
+  now: number = Date.now(),
+): QueuedGroupQuestion | null => {
+  const q = groupQuestionQueues.get(taskId);
+  if (!q) return null;
+  while (q.length > 0) {
+    const head = q[0];
+    if (!head) {
+      q.shift();
+      continue;
+    }
+    if (now - head.enqueuedAt >= GROUP_QUESTION_QUEUE_TTL_MS) {
+      q.shift();
+      console.warn(
+        `[feishu-bridge/group-shared] 排队问题过期丢弃 task=${taskId} message=${head.messageId}`,
+      );
+      continue;
+    }
+    q.shift();
+    if (q.length === 0) groupQuestionQueues.delete(taskId);
+    return head;
+  }
+  groupQuestionQueues.delete(taskId);
+  return null;
+};
+/** 放回队首（pump 时还忙：静默等下一轮 draining，不回群） */
+export const unshiftGroupQuestionQueue = (
+  taskId: string,
+  entry: QueuedGroupQuestion,
+): void => {
+  if (!taskId) return;
+  const q = groupQuestionQueues.get(taskId) ?? [];
+  q.unshift(entry);
+  groupQuestionQueues.set(taskId, q);
+};
+/** 清空（熔断跳闸时整队丢弃）：返回丢掉的条数 */
+export const clearGroupQuestionQueue = (taskId: string): number => {
+  const q = groupQuestionQueues.get(taskId);
+  groupQuestionQueues.delete(taskId);
+  return q?.length ?? 0;
+};
+/** 当前队长（排查 / 单测用） */
+export const groupQuestionQueueLength = (taskId: string): number =>
+  groupQuestionQueues.get(taskId)?.length ?? 0;
+
 /**
  * 一条登记等的是**哪一路 run** 的流事件。
  *
@@ -426,6 +519,7 @@ export const takeGroupReplyByToken = (
 export const __resetGroupReplyStateForTest = (): void => {
   getState().byTask.clear();
   __resetBypassLoopForTest();
+  groupQuestionQueues.clear();
 };
 
 // ----------------- 机器人互 @ 熔断 -----------------
@@ -447,6 +541,14 @@ export const __resetBypassLoopForTest = (): void => {
 /** 属主在群里说话了 = 人在场，清零（机器人对答模式被打破） */
 export const resetBypassLoop = (taskId: string): void => {
   if (taskId) bypassLoopByTask.delete(taskId);
+};
+/** 只看不记：冷却中吗（排队 draining 用，不消耗计数） */
+export const isBypassLoopCooling = (
+  taskId: string,
+  now: number = Date.now(),
+): boolean => {
+  const st = bypassLoopByTask.get(taskId);
+  return !!st && now < st.cooldownUntil;
 };
 /**
  * 记一轮非属主 @ 消息。tripped=本轮跳闸（调用方静默跳过 + 写一条应用事件），

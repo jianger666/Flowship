@@ -1374,3 +1374,40 @@ describe("回群 @ 抑制（机器人互@防环）", () => {
     expect(body).toContain("接口预计周五联调");
   });
 });
+
+describe("排队 draining", () => {
+  it("done / action 帧后泵一次排队", async () => {
+    const pumpGroupQuestionQueue = vi.fn(async () => {});
+    __setGroupOutboundDepsForTest(
+      baseDeps({ pumpGroupQuestionQueue }) as never,
+    );
+    // 上一轮答完 → 泵（有登记才进分支，这是出向 tap 的既有预筛）
+    const h = rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "question",
+      channel: "restricted",
+    })!;
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: fullTask(),
+      ok: true,
+      origin: h.runTag!,
+    });
+    expect(pumpGroupQuestionQueue).toHaveBeenCalledWith("task-1");
+    // action 帧：属主动作有进展就顺手泵
+    rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "question",
+      channel: "owner",
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "action",
+      action: { id: "act-1", status: "running" },
+    } as never);
+    expect(pumpGroupQuestionQueue).toHaveBeenCalledTimes(2);
+  });
+});

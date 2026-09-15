@@ -71,10 +71,15 @@ import {
   newGroupAdvancePickId,
   releaseGroupAdvancePick,
   BYPASS_LOOP_MAX_ROUNDS,
+  clearGroupQuestionQueue,
+  enqueueGroupQuestion,
+  isBypassLoopCooling,
   rememberGroupReply,
   recordBypassLoopAttempt,
   resetBypassLoop,
   restoreGroupReply,
+  shiftGroupQuestionQueue,
+  unshiftGroupQuestionQueue,
   retagGroupReplyToRestricted,
   sanitizeGroupMemberName,
   setGroupReplyActionId,
@@ -806,9 +811,11 @@ export const handleGroupAdvancePick = async (
  * 视觉预期。chat 模式自带排队（202 回执），不拦。
  *
  * 旁路答疑也算「在飞」：它刻意不写 runStatus / 不占 runningTasks（与 task 运行态解耦），
- * 但同一个 worktree 上并排起好几个只读 agent 既烧额度又抢 IO，群里也只有一条对话线索。
+ * 但同一个 worktree 上并排起好几个 agent 既烧额度又抢 IO，群里也只有一条对话线索。
  * 投递安全本身已由登记的 token 协议保证（多条并存各回各的、见 group-shared），
  * 这道闸纯粹是**群侧串行**；⛔ 不反过来把旁路表接进 runStatus / 停止键 / app 侧准入。
+ * 串行 ≠ 丢弃：非属主 task 型普通问题忙时进排队（group-shared，最多攒 3 个、10 分钟过期），
+ * 前一轮 done / 属主动作终态 / 新消息到达时 draining，前一个答完就答它。
  */
 const groupMessageBusyReason = (task: Task): string | null => {
   if (task.mode === "chat") return null;
@@ -837,6 +844,8 @@ const injectGroupMessage = async (args: {
   requesterIsBot?: boolean;
   /** 空 @ 取回的被指消息（来源打标用，不做判定） */
   refSource?: { messageId: string };
+  /** 排队回放：忙时不再二次入队，静默等下一轮 draining */
+  fromPump?: boolean;
 }): Promise<InjectResultPayload> => {
   const { taskId, chatId, requester, messageId, parsed, isOwner } = args;
   const task = await deps.getTask(taskId);
@@ -864,6 +873,31 @@ const injectGroupMessage = async (args: {
   const hasPendingAsk = !!deps.getPendingAsk(taskId);
   const busyReason = hasPendingAsk ? null : groupMessageBusyReason(task);
   if (busyReason) {
+    // 排队（只收非属主 task 型普通问题）：忙线拒收改成攒起来，前一个答完就答它。
+    // 属主 / chat 型 / 答 pendingAsk / 关联回执不排——属主用 app 当主通道，关联数据有时效性。
+    // pump 回放时（fromPump）不再二次入队：还忙就静默等下一轮 draining。
+    if (!args.fromPump && !isOwner && task.mode !== "chat" && !feedIntoSession) {
+      const boot = await args.loadBootContext().catch(() => null);
+      const pushed = enqueueGroupQuestion(taskId, {
+        messageId,
+        chatId,
+        text: args.text,
+        parsed,
+        requester,
+        senderIds: args.senderIds,
+        ...(args.requesterIsBot ? { requesterIsBot: true as const } : {}),
+        boot: boot ?? null,
+      });
+      if (pushed.queued) {
+        const waiting =
+          pushed.position <= 1
+            ? "当前这轮答完就答你"
+            : `前面还有 ${pushed.position - 1} 个问题，答完就答你`;
+        await replyToGroup(chatId, `收到，在排队了，${waiting}`, requester);
+        return { kind: "queued", messageId, taskId, text: args.text || undefined };
+      }
+      // 满了 → 落回忙线拒收（原口径）
+    }
     await replyToGroup(chatId, busyReason, requester);
     return { kind: "skipped", messageId, taskId, error: busyReason };
   }
@@ -1040,6 +1074,49 @@ const injectGroupMessage = async (args: {
   };
 };
 
+/**
+ * 排队 draining：restricted done / 属主动作终态 / 新消息到达时由出向调。
+ * 队首还忙 → 放回队首静默等下一轮（不回群）；冷却中 → 不动（熔断跳闸时已整队丢弃）。
+ * 串行 guard：done 与 action 帧可能连着到，重入只跑一份。
+ */
+const questionPumpRunning = new Set<string>();
+export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
+  if (!taskId || questionPumpRunning.has(taskId)) return;
+  if (isBypassLoopCooling(taskId)) return;
+  questionPumpRunning.add(taskId);
+  try {
+    for (;;) {
+      const head = shiftGroupQuestionQueue(taskId);
+      if (!head) return;
+      const r = await injectGroupMessage({
+        taskId,
+        chatId: head.chatId,
+        text: head.text,
+        parsed: head.parsed,
+        requester: head.requester,
+        isOwner: false,
+        loadBootContext: async () => head.boot,
+        messageId: head.messageId,
+        senderIds: head.senderIds,
+        ...(head.requesterIsBot ? { requesterIsBot: true as const } : {}),
+        fromPump: true,
+      });
+      // 还在忙 → 放回队首等下一轮 draining（静默，不回群，避免 @ 续循环）
+      if (
+        r.kind === "skipped" &&
+        (r.error === GROUP_TASK_RUNNING ||
+          r.error === GROUP_RESTRICTED_QUESTION_RUNNING)
+      ) {
+        unshiftGroupQuestionQueue(taskId, head);
+        return;
+      }
+      // sent/failed/其它 skip：本轮已收口（失败路径注入链自己回过群），继续下一条
+    }
+  } finally {
+    questionPumpRunning.delete(taskId);
+  }
+};
+
 // ----------------- 入口 -----------------
 
 /**
@@ -1110,6 +1187,10 @@ export const routeGroupInboundMessage = async (
     return { kind: "skipped", messageId, error: SKIP_GROUP_NO_TASK };
   }
 
+  // 4.25) 到达顺带 draining：队里有攒的且此刻空闲，先答旧的（FIFO），再处理当前这条
+  // （兜底 done/终态帧丢失的极端情况；空队一次 Map 查询秒回，冷却中直接让过）
+  await pumpGroupQuestionQueue(taskId);
+
   // 4.5) 机器人互 @ 熔断：伪装成人的对方机器人（user 身份发消息的 CLI）入向拦不住，
   // 只能数“非属主 @ 消息短时间连发”来断。属主出现说明人在场，清零。
   // 跳闸 / 冷却中一律静默跳过——回群里任何话都会给对方机器人续上。
@@ -1119,13 +1200,15 @@ export const routeGroupInboundMessage = async (
     const loop = recordBypassLoopAttempt(taskId);
     if (loop.tripped || loop.cooled) {
       if (loop.tripped) {
+        // 跳闸整队丢弃：排队的问题一并作废（麻烦重问），否则冷却里攒一堆过期答案
+        const dropped = clearGroupQuestionQueue(taskId);
         // 应用事件只写一条：origin 随机，保证投不进任何回群登记（见 group-shared token 协议）
         await writeOwnedEventAndPublish(
           taskId,
           () => true,
           {
             kind: "info",
-            text: `群答疑熔断：10 分钟内连续 ${BYPASS_LOOP_MAX_ROUNDS} 轮非属主问答（疑似机器人互 @），已暂停回群 10 分钟。属主消息不受影响，去群里看下是不是两个机器人在对答。`,
+            text: `群答疑熔断：10 分钟内连续 ${BYPASS_LOOP_MAX_ROUNDS} 轮非属主问答（疑似机器人互 @），已暂停回群 10 分钟${dropped > 0 ? `（排队中的 ${dropped} 个问题一并丢弃，麻烦重问）` : ""}。属主消息不受影响，去群里看下是不是两个机器人在对答。`,
           },
           `loop-breaker-${Date.now().toString(36)}`,
         );

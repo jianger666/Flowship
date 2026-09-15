@@ -26,6 +26,7 @@ const {
   GROUP_CHAT_NOT_OWNER,
   GROUP_RESTRICTED_QUESTION_RUNNING,
   GROUP_TASK_RUNNING,
+  pumpGroupQuestionQueue,
   isGroupBotSender,
   SKIP_GROUP_LOOP_BREAKER,
   handleGroupAdvancePick,
@@ -48,6 +49,11 @@ const {
   __resetGroupReplyStateForTest,
   BYPASS_LOOP_MAX_ROUNDS,
   BYPASS_LOOP_WINDOW_MS,
+  clearGroupQuestionQueue,
+  enqueueGroupQuestion,
+  GROUP_QUESTION_QUEUE_MAX,
+  GROUP_QUESTION_QUEUE_TTL_MS,
+  groupQuestionQueueLength,
   listGroupReplies,
   mentionTag,
   recordBypassLoopAttempt,
@@ -1115,9 +1121,11 @@ describe("回群登记的并发安全", () => {
       ctx,
     );
 
-    expect(b).toMatchObject({ kind: "skipped", error: GROUP_TASK_RUNNING });
+    // 忙线改排队：B 不再被拒，而是攒起来、A 答完就答它
+    expect(b).toMatchObject({ kind: "queued" });
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
-    expect(callArgs(sendTextToChat)[1]).toContain(GROUP_TASK_RUNNING);
+    expect(callArgs(sendTextToChat)[1]).toContain("排队");
+    expect(groupQuestionQueueLength("task-1")).toBe(1);
     // 关键断言：A 的登记没被 B 顶掉 / 清掉，这轮回答仍会 @ 张三回群
     expect(soleGroupReply()).toMatchObject({
       requesterOpenId: OWNER,
@@ -1126,9 +1134,9 @@ describe("回群登记的并发安全", () => {
     });
   });
 
-  it("受限群答疑在飞时同样拒 B——它不写 runStatus，串行只能靠旁路表", async () => {
+  it("受限群答疑在飞时 B 进排队——串行但不丢（第五轮双审 P2-2 改排队）", async () => {
     // 非属主的受限答疑与 task 运行状态机完全解耦：runStatus 一直是 idle、
-    // runningTasks 也是空的 → 群侧串行只能查旁路表。
+    // runningTasks 也是空的 → 群侧串行只能查旁路表。忙时不再拒收，攒起来等 draining。
     // （投递安全不靠这道闸：旁路登记可以并存、各按自己的 token 投递）
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
@@ -1159,16 +1167,10 @@ describe("回群登记的并发安全", () => {
         otherMsg({ message_id: "om_rb", content: "@Flowship 顺便看下埋点" }),
         ctx,
       );
-      // 拒信说的是「答疑还在跑」而不是「任务正在跑」——旁路不写 runStatus，
-      // 此刻 task 明明是 idle（第五轮双审 P2-2）
-      expect(b).toMatchObject({
-        kind: "skipped",
-        error: GROUP_RESTRICTED_QUESTION_RUNNING,
-      });
-      expect(callArgs(sendTextToChat)[1]).toContain(
-        GROUP_RESTRICTED_QUESTION_RUNNING,
-      );
+      expect(b).toMatchObject({ kind: "queued" });
+      expect(callArgs(sendTextToChat)[1]).toContain("排队");
       expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+      expect(groupQuestionQueueLength("task-1")).toBe(1);
       // A 的登记还在——B 没能顶掉它
       expect(soleGroupReply()).toMatchObject({
         requesterOpenId: OTHER,
@@ -1963,5 +1965,148 @@ describe("互@熔断", () => {
     expect(owner).toMatchObject({ kind: "sent" });
     const after = await ask("om_sY");
     expect(after).toMatchObject({ kind: "sent" });
+  });
+});
+
+// ----------------- 群问答排队 -----------------
+
+describe("群问答排队", () => {
+  const queueDeps = () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        sendTextToChat,
+        getTask: async () => fullTask({ runStatus: "idle" }),
+      }) as never,
+    );
+    return { handleTaskQuestionInject, sendTextToChat };
+  };
+  const ask = (id: string, content = "@Flowship 埋点查了吗") =>
+    routeGroupInboundMessage(otherMsg({ message_id: id, content }), ctx);
+  const injectedTexts = (
+    fn: ReturnType<typeof vi.fn>,
+  ): string[] =>
+    fn.mock.calls.map(
+      (c) => ((c as unknown[][])[1] as { text?: string })?.text ?? "",
+    );
+
+  it("FIFO：前一轮跑完 pump，排队的按序注入", async () => {
+    const { handleTaskQuestionInject } = queueDeps();
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion("task-1", inFlight);
+    try {
+      expect(await ask("om_q1", "@Flowship 第一个问题")).toMatchObject({
+        kind: "queued",
+      });
+      expect(await ask("om_q2", "@Flowship 第二个问题")).toMatchObject({
+        kind: "queued",
+      });
+      expect(groupQuestionQueueLength("task-1")).toBe(2);
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    } finally {
+      unregisterRestrictedQuestion("task-1", inFlight);
+    }
+    // 上一轮跑完 → pump 按入队顺序注入
+    await pumpGroupQuestionQueue("task-1");
+    const texts = injectedTexts(handleTaskQuestionInject);
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toContain("第一个问题");
+    expect(texts[1]).toContain("第二个问题");
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+
+  it("队满（3 个）→ 落回忙线拒收", async () => {
+    const { handleTaskQuestionInject, sendTextToChat } = queueDeps();
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion("task-1", inFlight);
+    try {
+      for (let i = 0; i < GROUP_QUESTION_QUEUE_MAX; i++) {
+        const r = await ask(`om_f${i}`);
+        expect(r).toMatchObject({ kind: "queued" });
+      }
+      expect(groupQuestionQueueLength("task-1")).toBe(GROUP_QUESTION_QUEUE_MAX);
+      const overflow = await ask("om_overflow");
+      expect(overflow).toMatchObject({
+        kind: "skipped",
+        error: GROUP_RESTRICTED_QUESTION_RUNNING,
+      });
+      expect(callArgs(sendTextToChat).length).toBeGreaterThan(0);
+      expect(
+        callArgs(sendTextToChat, sendTextToChat.mock.calls.length - 1)[1],
+      ).toContain(GROUP_RESTRICTED_QUESTION_RUNNING);
+      expect(groupQuestionQueueLength("task-1")).toBe(GROUP_QUESTION_QUEUE_MAX);
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    } finally {
+      unregisterRestrictedQuestion("task-1", inFlight);
+    }
+  });
+
+  it("TTL 过期 → pump 时静默丢弃、不注入", async () => {
+    queueDeps();
+    enqueueGroupQuestion(
+      "task-1",
+      {
+        messageId: "om_old",
+        chatId: CHAT,
+        text: "过期问题",
+        parsed: { text: "过期问题", images: [], attachments: [] } as never,
+        requester: { openId: "ou_li", name: "李四" },
+        boot: null,
+      },
+      Date.now() - GROUP_QUESTION_QUEUE_TTL_MS - 1000,
+    );
+    const { handleTaskQuestionInject } = queueDeps();
+    await pumpGroupQuestionQueue("task-1");
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+
+  it("熔断跳闸 → 整队丢弃", async () => {
+    const { handleTaskQuestionInject } = queueDeps();
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion("task-1", inFlight);
+    try {
+      // 队满 3 个（第 4 个忙线拒收），第 5 次尝试触发跳闸、整队丢弃
+      for (let i = 0; i < GROUP_QUESTION_QUEUE_MAX; i++) {
+        expect(await ask(`om_t${i}`)).toMatchObject({ kind: "queued" });
+      }
+      expect(groupQuestionQueueLength("task-1")).toBe(GROUP_QUESTION_QUEUE_MAX);
+      expect(await ask("om_t3")).toMatchObject({ kind: "skipped" });
+      const tripped = await ask("om_trip");
+      expect(tripped).toMatchObject({
+        kind: "skipped",
+        error: SKIP_GROUP_LOOP_BREAKER,
+      });
+      expect(groupQuestionQueueLength("task-1")).toBe(0);
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    } finally {
+      unregisterRestrictedQuestion("task-1", inFlight);
+    }
+  });
+
+  it("新消息到达顺带 draining：先答旧的，再处理当前的", async () => {
+    const { handleTaskQuestionInject } = queueDeps();
+    enqueueGroupQuestion("task-1", {
+      messageId: "om_prev",
+      chatId: CHAT,
+      text: "之前排队的问题",
+      parsed: { text: "之前排队的问题", images: [], attachments: [] } as never,
+      requester: { openId: "ou_li", name: "李四" },
+      boot: null,
+    });
+    // 此刻没在飞：新消息先触发 pump（答旧的），再正常注入自己
+    const r = await ask("om_new", "@Flowship 新问题");
+    expect(r).toMatchObject({ kind: "sent" });
+    const texts = injectedTexts(handleTaskQuestionInject);
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toContain("之前排队的问题");
+    expect(texts[1]).toContain("新问题");
   });
 });
