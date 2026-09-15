@@ -1444,3 +1444,30 @@ describe("排队 draining", () => {
     expect(pumpGroupQuestionQueue).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("review 十二轮：问群卡无群 warn", () => {
+  it("没绑群静默跳过，只打 warn 不写事件", async () => {
+    const { sendAskCardToGroup } = await import(
+      "@/lib/server/feishu-bridge/group-outbound"
+    );
+    const sendAskCard = vi.fn();
+    __setGroupOutboundDepsForTest(
+      baseDeps({
+        sendAskCard,
+        getBoundGroupChatId: async () => null,
+      }) as never,
+    );
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await sendAskCardToGroup(fullTask(), "ask-1", [
+        { id: "q1", question: "选哪个？" },
+      ]);
+      expect(sendAskCard).not.toHaveBeenCalled();
+      expect(
+        spy.mock.calls.some((c) => String(c[0]).includes("问群卡无群跳过")),
+      ).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

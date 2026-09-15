@@ -202,7 +202,11 @@ export const sendAskCardToGroup = async (
   questions: CardStreamAskQuestion[],
 ): Promise<void> => {
   const chatId = await deps.getBoundGroupChatId(task);
-  if (!chatId) return;
+  // 无群静默跳过：只打 warn 不写事件（问群卡高频，事件流别脏；和播报 skipped_no_group 同口径，review 十二轮-1）
+  if (!chatId) {
+    warn("问群卡无群跳过", `task=${task.id} ask=${askId}`);
+    return;
+  }
   let senderName = "Flowship";
   try {
     senderName = await deps.resolveSenderName();
