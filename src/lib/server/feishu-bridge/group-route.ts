@@ -1131,6 +1131,8 @@ const injectGroupMessage = async (args: {
     // 202 = 排队中（chat 队列）——这条消息**没有**对应的 run 开跑，登记留着只会被
     // 下一轮无关的 done 收走、把别人的回答 @ 给他（第五轮双审 P1-B）。摘掉登记、
     // 群里只给受理回执，结果去 app 看。
+    // 注：task 通道不产 202（只有 chat-inject 回 202，已核对），此分支是防御性保留——
+    // 万一哪天 task 也回 202，这里同样正确（先摘登记再回执），别当死分支删了。
     if (resp.status === 202) {
       restoreGroupReply(taskId, replyHandle);
       await replyToGroup(
@@ -1488,7 +1490,9 @@ export const routeGroupInboundMessage = async (
   return injectGroupMessage({
     taskId,
     chatId: msg.chat_id,
-    text: effectiveText,
+    // 纯图/纯附件 @ 进来正文是空的：给一句兜底，和 pendingAsk 路径的 "(附图/附件)" 对齐
+    //（review 十轮-3；到这里时上面空消息门已保证三者至少其一非空）
+    text: effectiveText || "(附图/附件)",
     parsed,
     requester,
     isOwner,

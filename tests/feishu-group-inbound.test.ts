@@ -1550,7 +1550,9 @@ describe("buildGroupAskCardJson", () => {
 // ----------------- 出问登记关联消费 -----------------
 
 const {
+  __getCorrelatedTaskCountForTest,
   __resetOutboundRegistryForTest,
+  clearCorrelatedEntries,
   matchCorrelatedAnswer,
   registerOutboundQuestion,
 } = await import("@/lib/server/feishu-bridge/group-outbound-registry");
@@ -2798,5 +2800,52 @@ describe("review 九轮：失败回执不@机器人/no_pending补登记/占格�
       (e) => e.kind === "question" && e.runTag !== null,
     );
     expect(fallbackEntry?.atRequester).toBe(false);
+  });
+});
+
+describe("review 十轮：关联表清壳/图片兜底", () => {
+  it("burn 到空整项删，不留空壳", async () => {
+    const { burnCorrelatedEntry } = await import(
+      "@/lib/server/feishu-bridge/group-outbound-registry"
+    );
+    regQ({ messageId: "om_k1" });
+    expect(__getCorrelatedTaskCountForTest()).toBe(1);
+    burnCorrelatedEntry("task-1", "om_k1");
+    expect(__getCorrelatedTaskCountForTest()).toBe(0);
+  });
+
+  it("clearCorrelatedEntries 按 task 整项清（删任务链调用它）", async () => {
+    regQ({ messageId: "om_k2" });
+    regQ({ messageId: "om_k3", taskId: "task-9" });
+    expect(__getCorrelatedTaskCountForTest()).toBe(2);
+    clearCorrelatedEntries("task-1");
+    expect(__getCorrelatedTaskCountForTest()).toBe(1);
+    // 别的 task 不受影响
+    clearCorrelatedEntries("task-9");
+    expect(__getCorrelatedTaskCountForTest()).toBe(0);
+  });
+
+  it("纯图 @：普通路径拼附图兜底，和 pendingAsk 对齐", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    const r = await routeGroupInboundMessage(
+      otherMsg({ message_id: "om_imgonly", content: "@Flowship" }),
+      {
+        ...ctx,
+        parseContent: async () => ({
+          text: "",
+          images: [{ data: "aGVsbG8=", mimeType: "image/png" }],
+          attachments: [],
+        }),
+      },
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    const [, body] = callArgs(handleTaskQuestionInject) as [
+      string,
+      { text: string },
+    ];
+    expect(body.text).toContain("(附图/附件)");
   });
 });

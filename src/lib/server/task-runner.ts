@@ -191,6 +191,7 @@ import {
 import { failpoint } from "./failpoints";
 import { finalizeOpenToolCalls } from "./finalize-open-tools";
 import { broadcastActionCompletion } from "./feishu-bridge/group-broadcast";
+import { clearCorrelatedEntries } from "./feishu-bridge/group-outbound-registry";
 import { clearGroupQuestionQueue } from "./feishu-bridge/group-shared";
 import {
   buildBatchDirective,
@@ -1893,6 +1894,7 @@ export const finalizeTask = async (
     cancelRestrictedQuestions(taskId);
     // 群问答排队同清：条目带 boot.apiKey，终态不留（review 六轮-2）
     clearGroupQuestionQueue(taskId);
+    clearCorrelatedEntries(taskId);
     // 同 stopTaskAgent：无活 run 时 cancelTaskRun 会写入 pendingStopRequests，终结后必须清掉
     pendingStopRequests.delete(taskId);
     console.log(
@@ -2126,6 +2128,7 @@ export const archiveTaskWithCleanup = async (
   cancelRestrictedQuestions(taskId);
   // 归档同清排队：休眠任务的问题不等它醒，醒了重问（条目带 boot.apiKey，不留内存）
   clearGroupQuestionQueue(taskId);
+  clearCorrelatedEntries(taskId);
   // 两个 wait 相互独立、失败都吞，并行等（串行最长挂 16s，归档 PATCH 一直悬着体验差）
   await Promise.all([
     waitForTaskToStop(taskId, 8000).catch(() => {}),

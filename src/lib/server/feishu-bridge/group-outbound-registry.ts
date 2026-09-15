@@ -48,6 +48,9 @@ const getRegistry = (): Map<string, OutboundQuestionEntry[]> => {
 /** 单测：看某 task 还有几条登记（含过期，用于断言读时清理） */
 export const __countOutboundForTest = (taskId: string): number =>
   getRegistry().get(taskId)?.length ?? 0;
+/** 单测：注册表里还剩几个 task 的键（断言空壳清理：删 task/烧空后应为 0） */
+export const __getCorrelatedTaskCountForTest = (): number =>
+  getRegistry().size;
 
 /** 单测隔离 */
 export const __resetOutboundRegistryForTest = (): void => { const g = globalThis as unknown as Record<
@@ -91,17 +94,29 @@ export const hasPendingOutbound = (args: {
   );
 };
 
-/** 清掉 task 下的过期条目（读时顺手清，长跑进程不堆积） */
+/**
+ * 清掉 task 下的过期条目（读时顺手清，长跑进程不堆积）。
+ * 空了就整项删（review 十轮-1）：`set(taskId, [])` 留空壳，千级任务慢慢攒。
+ */
 const pruneExpired = (
   taskId: string,
   now: number,
   list: OutboundQuestionEntry[],
 ): OutboundQuestionEntry[] => {
   const live = list.filter((e) => now - e.createdAt < e.ttlMs);
-  if (live.length !== list.length) {
+  if (live.length === 0) {
+    getRegistry().delete(taskId);
+  } else if (live.length !== list.length) {
     getRegistry().set(taskId, live);
   }
   return live;
+};
+/**
+ * 按 task 整项清（删任务/终结/归档链调用：条目虽没秘密，空壳也别留）。
+ * 和熔断表、排队同一套路（review 十轮-1）。
+ */
+export const clearCorrelatedEntries = (taskId: string): void => {
+  if (taskId) getRegistry().delete(taskId);
 };
 
 /** 登记一条出问（要素必填；同 messageId 幂等覆盖） */
@@ -207,10 +222,12 @@ export const matchCorrelatedAnswer = (args: {
   return hit ? { entry: hit } : null;
 };
 
-/** 消费即焚（命中后调用；幂等） */
+/** 消费即焚（命中后调用；幂等）。烧空就整项删，不留空壳（review 十轮-1） */
 export const burnCorrelatedEntry = (taskId: string, messageId: string): void => {
   const reg = getRegistry();
   const list = reg.get(taskId);
   if (!list) return;
-  reg.set(taskId, list.filter((e) => e.messageId !== messageId));
+  const live = list.filter((e) => e.messageId !== messageId);
+  if (live.length === 0) reg.delete(taskId);
+  else reg.set(taskId, live);
 };
