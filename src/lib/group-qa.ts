@@ -280,6 +280,12 @@ export const collectGroupQaRounds = (
   for (const ev of events) {
     if (isGroupQuestionEventAny(ev) && !isGroupQaQuestionEvent(ev)) {
       if (pairedQuestions.has(ev)) continue;
+      // 推进占格的问题跳过：它没 runTag 也没法配对，放任 temporal 会把推进过程的
+      // 只言片语 scooped 当答案、造幻影历史轮（review 九轮-3）。主流程里它照常展示。
+      if (metaOf(ev).advancePreempted === true) {
+        flushLegacy();
+        continue;
+      }
       flushLegacy();
       openLegacy = ev;
       legacyAnswers.set(ev, []);

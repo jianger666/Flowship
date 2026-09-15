@@ -352,3 +352,33 @@ describe("配对去重（review 六轮-4）", () => {
     expect(rounds).toHaveLength(2);
   });
 });
+
+describe("推进占格不造幻影（review 九轮-3）", () => {
+  const legacyQ = (id: string, ts: number, text: string, extraMeta: Record<string, unknown> = {}) =>
+    ({
+      kind: "user_reply",
+      id,
+      ts,
+      text,
+      meta: { source: "feishu_group", groupSender: "群成员", ...extraMeta },
+    }) as never;
+  const ans = (id: string, ts: number, text: string) =>
+    ({ kind: "assistant_message", id, ts, text }) as never;
+
+  it("占格问题跳过 temporal 配对：推进过程的只言片语不进 tab", () => {
+    const rounds = collectGroupQaRounds(
+      [
+        legacyQ("q1", 1000, "群问题"),
+        ans("a1", 1500, "群回答"),
+        // 推进在飞时来的群问题：没 runTag，但打了占格标
+        legacyQ("q2", 2000, "推进期间的问题", { advancePreempted: true }),
+        ans("a2", 2500, "推进过程的只言片语"),
+      ],
+      NOW,
+    );
+    // q1 正常成轮；q2 不开轮；a2 无处可去（不污染 q1，q1 在 q2 到达时已收口）
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0]).toMatchObject({ questionText: "群问题" });
+    expect(rounds[0]!.answerText).toBe("群回答");
+  });
+});

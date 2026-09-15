@@ -2702,3 +2702,101 @@ describe("review 八轮：回执不@机器人/过期有交代/带图不排", () 
     }
   });
 });
+
+describe("review 九轮：失败回执不@机器人/no_pending补登记/占格不造幻影", () => {
+  const quadDeps = () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
+    );
+    return { handleTaskQuestionInject, sendTextToChat };
+  };
+  const botMsg = (overrides = {}) =>
+    otherMsg({ sender_type: "app", ...overrides });
+
+  it("pendingAsk 失败回执：bot 发起人不 @（review 九轮-1 之 1025）", async () => {
+    const { sendTextToChat } = quadDeps();
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        sendTextToChat,
+        getPendingAsk: () => ({ askId: "ask-1", questions: [] }),
+        injectPendingAskText: vi.fn(async () => ({
+          ok: false as const,
+          error: "答案写挂了",
+        })),
+      }) as never,
+    );
+    const r = await routeGroupInboundMessage(
+      botMsg({ message_id: "om_paf", content: "@Flowship 用方案 B" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "failed" });
+    expect(sendTextToChat).toHaveBeenCalledTimes(1);
+    const body = callArgs(sendTextToChat)[1] as string;
+    expect(body).toContain("答案写挂了");
+    expect(body).not.toContain("<at");
+  });
+
+  it("不支持的消息类型：bot 发起人不 @（review 九轮-1 之 1382）", async () => {
+    const { sendTextToChat } = quadDeps();
+    const r = await routeGroupInboundMessage(
+      botMsg({ message_id: "om_unsup" }),
+      {
+        ...ctx,
+        parseContent: async () => ({
+          text: "",
+          images: [],
+          attachments: [],
+          unsupported: "暂不支持该消息类型",
+        }),
+      },
+    );
+    expect(r).toMatchObject({ kind: "failed" });
+    const texts = sendTextToChat.mock.calls.map((c) => String((c as unknown[])[1]));
+    expect(texts.some((t) => t.includes("暂不支持"))).toBe(true);
+    expect(texts.every((t) => !t.includes("<at"))).toBe(true);
+  });
+
+  it("no_pending 落回补登记：bot 发起人带 atRequester=false（review 九轮-2）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        getPendingAsk: () => ({ askId: "ask-1", questions: [] }),
+        injectPendingAskText: vi.fn(async () => ({
+          ok: false as const,
+          reason: "no_pending" as const,
+          error: "没有待答提问",
+        })),
+      }) as never,
+    );
+    const { rememberGroupReply, listGroupReplies } = await import(
+      "@/lib/server/feishu-bridge/group-shared"
+    );
+    // 推进登记占住属主格：no_pending 落回时改挂无门，只能补一条 restricted 登记
+    rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: OWNER,
+      requesterName: "张三",
+      kind: "advance",
+      channel: "owner",
+    });
+    const r = await routeGroupInboundMessage(
+      botMsg({ message_id: "om_np", content: "@Flowship 埋点查了吗" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    const fallbackEntry = listGroupReplies("task-1").find(
+      (e) => e.kind === "question" && e.runTag !== null,
+    );
+    expect(fallbackEntry?.atRequester).toBe(false);
+  });
+});

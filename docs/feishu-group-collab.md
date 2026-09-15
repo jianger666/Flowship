@@ -565,6 +565,10 @@ prompt 就是同一段指令里既写「禁止改」又写「才动手改」，�
    串行 ≠ 丢弃：非属主 task 型普通问题忙时进排队（`group-shared`，最多攒 3 个、
    10 分钟过期，满了落回忙线拒收），前一轮 done / 属主动作终态 / 新消息到达时
    `pumpGroupQuestionQueue` draining。draining 还忙就放回队首（静默，不回群）。
+   三条用户可见语义（review 九轮-4）：带图不排队（base64 常驻内存，图重发就行，
+   直接忙线拒收）；过期丢弃必回一句“超时作废”（入队 prune 和 pump-shift 两条路都有）；
+   回放注入抛错回一句“没接住”+ 写 `ok:false` 汇总。机器人发起人一律不 @（`atRequester`），
+   推进占格导致没登记的问题打 `advancePreempted` 标、不进 legacy 配对（主流程留痕）。
 3. **机器人互 @ 防环**（江涛 CLI 案，两边都是 Flowship、收到 @ 就答、答完 @ 回去）：
    - 对方机器人发的 @ 照常处理（它是来送结果的，拦掉就收不到了），
      但回群不 @ 它（登记 `atRequester: false`，flush 只发正文）——对方靠 @ 触发，

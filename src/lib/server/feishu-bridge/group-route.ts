@@ -1019,10 +1019,14 @@ const injectGroupMessage = async (args: {
       if (correlated) burnCorrelatedEntry(taskId, correlated.entry.messageId);
       return { kind: "sent", messageId, taskId };
     }
-    // no_pending 竞态（刚被别人答掉）→ 落普通消息；其它失败回群
+    // no_pending 竞态（刚被别人答掉）→ 落普通消息；其它失败回群（机器人不 @，review 九轮-1）
     if (askResult.reason !== "no_pending") {
       restoreGroupReply(taskId, replyHandle);
-      await replyToGroup(chatId, askResult.error, requester);
+      await replyToGroup(
+        chatId,
+        askResult.error,
+        groupReplyMention(args.requesterIsBot, requester),
+      );
       return { kind: "failed", messageId, taskId, error: askResult.error };
     }
     // 竞态落回普通消息：非属主这条会走旁路 run，登记得跟着改挂到它的 token 上，
@@ -1038,6 +1042,9 @@ const injectGroupMessage = async (args: {
           requesterOpenId: requester.openId,
           requesterName: requester.name,
           sourceMessageId: messageId,
+          // 首登记那行 spread 原样带上（review 九轮-2）：发起人是机器人时回群不 @，
+          // 否则这条窄窗口（pendingAsk 刚被答掉 + 推进占格）撞上的 bot 问题 flush 就 @ 它
+          ...(args.requesterIsBot ? { atRequester: false as const } : {}),
           kind: "question",
           channel: "restricted",
         });
@@ -1056,6 +1063,10 @@ const injectGroupMessage = async (args: {
     // restrictedRunTag = 这轮旁路回答汇总事件的配对键（属主通道没有，进不了群问答 tab）
     groupSenderOpenId: requester.openId,
     ...(restrictedRunTag ? { restrictedRunTag } : {}),
+    // 推进占格导致没拿到登记（replyHandle 为 null）：问题照常注入、回答回不来群。
+    // legacy 配对跳过这类问题——否则推进 run 的只言片语会被 scooped 当答案，造幻影历史轮
+    //（review 九轮-3）。主流程显隐不变（留痕反而对，属主该看见推进期间有人问了）。
+    ...(!replyHandle && viaRestrictedRun ? { advancePreempted: true as const } : {}),
     // 关联命中留痕：事件流里能看出这条是托办事项的回执（出问 message_id）
     ...(correlated
       ? { correlatedAnswer: correlated.entry.messageId }
@@ -1107,7 +1118,11 @@ const injectGroupMessage = async (args: {
     // scope 缺失翻译成人话（缺哪些 + 去哪开），拼在原始错误后面
     const hint = describeScopeShortage(rawError);
     const error = hint ? `${rawError}（${hint}）` : `注入异常：${rawError}`;
-    await replyToGroup(chatId, error, requester);
+    await replyToGroup(
+      chatId,
+      error,
+      groupReplyMention(args.requesterIsBot, requester),
+    );
     // 基础设施类失败可重试——inbound 不 mark、等补拉重投
     return { kind: "failed", messageId, taskId, error, retryable: true };
   }
@@ -1118,7 +1133,11 @@ const injectGroupMessage = async (args: {
     // 群里只给受理回执，结果去 app 看。
     if (resp.status === 202) {
       restoreGroupReply(taskId, replyHandle);
-      await replyToGroup(chatId, "收到，排队处理中、结果去 Flowship 看", requester);
+      await replyToGroup(
+        chatId,
+        "收到，排队处理中、结果去 Flowship 看",
+        groupReplyMention(args.requesterIsBot, requester),
+      );
       return { kind: "queued", messageId, taskId, text: args.text || undefined };
     }
     // 一问一答：关联登记在这里消费掉（送达即焚，复读不再自动消费）
@@ -1127,7 +1146,11 @@ const injectGroupMessage = async (args: {
   }
   restoreGroupReply(taskId, replyHandle);
   const error = await readInjectError(resp);
-  await replyToGroup(chatId, error, requester);
+  await replyToGroup(
+    chatId,
+    error,
+    groupReplyMention(args.requesterIsBot, requester),
+  );
   return {
     kind: "failed",
     messageId,
@@ -1315,7 +1338,11 @@ export const routeGroupInboundMessage = async (
   // 4) chat_id → 本机任务
   const taskId = await resolveTaskIdByGroupChat(msg.chat_id);
   if (!taskId) {
-    await replyToGroup(msg.chat_id, "本机没有关联此需求的任务", requester);
+    await replyToGroup(
+      msg.chat_id,
+      "本机没有关联此需求的任务",
+      groupReplyMention(isGroupBotSender(msg), requester),
+    );
     return { kind: "skipped", messageId, error: SKIP_GROUP_NO_TASK };
   }
 
@@ -1365,7 +1392,11 @@ export const routeGroupInboundMessage = async (
     parsed = await ctx.parseContent(msg);
   } catch (err) {
     const error = `解析消息失败：${err instanceof Error ? err.message : String(err)}`;
-    await replyToGroup(msg.chat_id, error, requester);
+    await replyToGroup(
+      msg.chat_id,
+      error,
+      groupReplyMention(isGroupBotSender(msg), requester),
+    );
     return { kind: "failed", messageId, taskId, error, retryable: true };
   }
   if (parsed.unsupported) {
@@ -1379,7 +1410,11 @@ export const routeGroupInboundMessage = async (
     const reply = awaited
       ? "收到图片结论，请补发文字版（当前只收文本结论）"
       : parsed.unsupported;
-    await replyToGroup(msg.chat_id, reply, requester);
+    await replyToGroup(
+      msg.chat_id,
+      reply,
+      groupReplyMention(isGroupBotSender(msg), requester),
+    );
     return { kind: "failed", messageId, taskId, error: reply };
   }
 
