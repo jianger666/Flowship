@@ -178,6 +178,11 @@ export interface PendingGroupReply {
    */
   token: string;
   /**
+   * 入向群消息 id（UI 群问答 tab 配对备用：user_reply meta.feishuMessageId == 它）。
+   * flush 写汇总事件时原样带过去， temporal 配对兜底（no_pending 竞态落回旁路时问题事件没有 runTag）。
+   */
+  sourceMessageId?: string;
+  /**
    * **唯一投递判据**：只有 `origin` 等于它的流事件才能攒进本条登记 / flush 它。
    * - `null`  = 属主主链（那条链上的事件不带 origin）
    * - 非 null = 旁路 run 的 token（恒等于本条登记自己的 token）
