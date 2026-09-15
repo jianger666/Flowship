@@ -369,6 +369,8 @@ interface Props {
   onPrependEvents?: (events: TaskEvent[]) => void;
   /** 答题卡提交成功：把接口返回的 task 合进页面（完成信号由提交者发出，不单等 SSE） */
   onTaskUpdate?: (task: Task) => void;
+  /** 群问答 tab 显隐变化（父页面据此隐藏底部输入条：只读 tab 下输入框会误导） */
+  onGroupQaVisibleChange?: (visible: boolean) => void;
   /** shell 流式输出：callId → 已累积文本（尾部窗口由父组件维护） */
   liveToolOutputs?: Record<string, string>;
   /** P3：回退到 checkpointed user_reply */
@@ -573,6 +575,7 @@ const EventStreamImpl = ({
   variant = "log",
   onPrependEvents,
   onTaskUpdate,
+  onGroupQaVisibleChange,
   liveToolOutputs,
   onRewind,
   pendingLocalReplies,
@@ -667,6 +670,11 @@ const EventStreamImpl = ({
     [task.events],
   );
   const showQaPanel = showGroupQa && groupQaRounds.length > 0;
+  // 群问答是只读 tab：通知父页面隐藏底部输入条（否则输入框会误导用户在此发言）
+  useEffect(() => {
+    onGroupQaVisibleChange?.(showQaPanel);
+    return () => onGroupQaVisibleChange?.(false);
+  }, [showQaPanel, onGroupQaVisibleChange]);
   // 进行中轮次 → tab 上亮蓝点（主流程里它完全隐身，不给提示用户不知道有人问了，review P1-4）。
   // 已知局限：answering 按快照时间算，无新事件就不重算——崩溃打断的那轮蓝点会常亮到下个事件到来。
   // 故意的：这组件有过输入卡顿 perf 坑，不加分钟级 tick；下个事件（属主说句话）到就灭。

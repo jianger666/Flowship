@@ -168,6 +168,8 @@ const TaskDetailPage = () => {
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
+  // 群问答 tab 可见时隐藏底部输入条（只读 tab 下输入框会误导用户在此发言）
+  const [groupQaVisible, setGroupQaVisible] = useState(false);
   // V0.6.6「编辑任务」dialog 开关（改角色 / 标题 / 飞书链接 / 模型 / 工作分支）
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
@@ -1063,6 +1065,7 @@ const TaskDetailPage = () => {
                   isRunning={runActive || restrictedRunActive}
                   onPrependEvents={handlePrependEvents}
                   onTaskUpdate={absorbTask}
+                  onGroupQaVisibleChange={setGroupQaVisible}
                 />
               </div>
               {/* 疑似卡住提示：挂在输入条上方，chat / task 共用 SuspectStuckHint */}
@@ -1071,14 +1074,17 @@ const TaskDetailPage = () => {
                 streamingText={streamingText}
                 className="shrink-0 px-6 py-1.5"
               />
-              {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文） */}
-              <TaskTalkComposer
-                task={task}
-                onTaskUpdate={absorbTask}
-                onStop={() => void handleStop()}
-                stopping={stopping}
-                runActive={runActive}
-              />
+              {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文）
+                  群问答 tab 可见时隐藏：只读 tab 下输入框会误导用户在此发言 */}
+              {groupQaVisible ? null : (
+                <TaskTalkComposer
+                  task={task}
+                  onTaskUpdate={absorbTask}
+                  onStop={() => void handleStop()}
+                  stopping={stopping}
+                  runActive={runActive}
+                />
+              )}
             </aside>
           </ResizablePanel>
         </ResizablePanelGroup>
