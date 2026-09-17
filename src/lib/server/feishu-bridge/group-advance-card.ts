@@ -44,6 +44,22 @@ export const buildGroupAdvanceCardJson = (
   const elements: unknown[] = [];
   let buttonCount = 0;
   let truncated = false;
+  // 同卡内按钮文案去重：label 前 20 字相同时点之前分不出来（value 里 actionKey 不同）。
+  // 截断的加省略号提示；重名的加序号后缀。
+  const usedButtonLabels = new Set<string>();
+  const buttonLabel = (label: string): string => {
+    const base = label.slice(0, 20) || "推进";
+    const shown = label.length > 20 ? `${base}…` : base;
+    if (!usedButtonLabels.has(shown)) {
+      usedButtonLabels.add(shown);
+      return shown;
+    }
+    let i = 2;
+    while (usedButtonLabels.has(`${shown}(${i})`)) i++;
+    const named = `${shown}(${i})`;
+    usedButtonLabels.add(named);
+    return named;
+  };
 
   for (const group of input.groups) {
     if (group.options.length === 0) continue;
@@ -74,7 +90,7 @@ export const buildGroupAdvanceCardJson = (
       elements.push({
         tag: "button",
         element_id: `gadv_b${buttonCount}`,
-        text: { tag: "plain_text", content: opt.label.slice(0, 20) || "推进" },
+        text: { tag: "plain_text", content: buttonLabel(opt.label) },
         type: "default",
         size: "medium",
         width: "default",

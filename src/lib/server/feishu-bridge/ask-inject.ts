@@ -191,6 +191,8 @@ export const injectPendingAskText = async (
         answers,
         source: "feishu",
         ...(answeredBy ? { answeredBy } : {}),
+        // 注：收口靠 kind === "ask_user_reply"（见 group-qa legacy 边界，任何答复都是边界），
+        // 这里不打 pendingAskAnswer 标记——打了也没人查，反而误导后人以为收口靠它。
         ...(savedImages.length > 0 ? { images: savedImages } : {}),
       },
     });

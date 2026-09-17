@@ -348,6 +348,70 @@ describe("回答回群", () => {
     expect(callArgs(sendMarkdown)[1]).toContain("没跑成功");
   });
 
+  it("失败轮 tab 存群里看到的正文（不存半截输出）", async () => {
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
+    const h = rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "question",
+      channel: "restricted",
+      sourceMessageId: "om_q1",
+    })!;
+    await handleGroupOutboundEvent("task-1", {
+      kind: "assistant_delta",
+      text: "半截输出",
+      origin: h.runTag!,
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: fullTask(),
+      ok: false,
+      origin: h.runTag!,
+    });
+    const summary = (
+      callArgs(writeEventAndPublish)[1] as {
+        meta: { groupQaSummary: Record<string, unknown> };
+      }
+    ).meta.groupQaSummary;
+    expect(summary.ok).toBe(false);
+    expect(summary.answer).toContain("没跑成功");
+    expect(summary.answer).not.toContain("半截输出");
+  });
+
+  it("空回答轮 tab 存 fallback（不留空白轮）", async () => {
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
+    const h = rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: REQUESTER.openId,
+      requesterName: REQUESTER.name,
+      kind: "question",
+      channel: "restricted",
+      sourceMessageId: "om_q2",
+    })!;
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: fullTask(),
+      ok: true,
+      origin: h.runTag!,
+    });
+    const summary = (
+      callArgs(writeEventAndPublish)[1] as {
+        meta: { groupQaSummary: Record<string, unknown> };
+      }
+    ).meta.groupQaSummary;
+    expect(summary.ok).toBe(true);
+    expect(summary.answer).toContain("已处理完成");
+  });
+
   it("done 后登记摘掉——同一任务下一轮不再误回群", async () => {
     const sendMarkdown = vi.fn(async () => ({
       chat_id: CHAT,
@@ -1589,8 +1653,8 @@ describe("truncateForGroup", () => {
   });
 });
 
-describe("回群 @ 抑制（机器人互@防环）", () => {
-  it("发起人是机器人（atRequester=false）→ 回群不 @，只发正文", async () => {
+describe("回群 @（机器人问机器人真 @ 回去，吃掉后静默防环）", () => {
+  it("机器人提问 → 回答真 @ 它（一轮结束靠发起方吃掉静默，兜底靠熔断）", async () => {
     const sendMarkdown = vi.fn(async () => ({
       chat_id: CHAT,
       message_id: "om_md",
@@ -1603,7 +1667,6 @@ describe("回群 @ 抑制（机器人互@防环）", () => {
       requesterName: "江涛CLI",
       kind: "question",
       channel: "restricted",
-      atRequester: false,
     })!;
     await handleGroupOutboundEvent("task-1", {
       kind: "assistant_delta",
@@ -1620,8 +1683,8 @@ describe("回群 @ 抑制（机器人互@防环）", () => {
     expect(sendText).not.toHaveBeenCalled();
     const body = callArgs(sendMarkdown)[1] as string;
     expect(body).toContain("埋点已确认上报");
-    // 不 @：对方机器人的自动化靠 @ 触发，不 @ 就不会续上循环
-    expect(body).not.toContain("<at");
+    // 真 @：发起方登记等答案、吃掉后静默，正常一轮结束
+    expect(body).toContain("<at");
   });
 
   it("缺省（人类提问）→ 照常 @ 提醒", async () => {

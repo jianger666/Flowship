@@ -415,12 +415,9 @@ const flushGroupReply = async (
   const body = !ok
     ? "这轮没跑成功、去 Flowship 看看事件流"
     : answer || "已处理完成（这轮没有文字回复）";
-  // 发起人是机器人时不 @（atRequester=false）：它的自动化靠 @ 触发，@ 回去就和它成环。
-  // 人类提问保持原样 @ 提醒。
-  const head =
-    entry.atRequester === false
-      ? ""
-      : `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
+  // 回答真 @ 提问人（含机器人）：发起方登记等答案、吃掉后静默，正常一轮结束；
+  // 即时系统回执仍不 @ 机器人（group-route 的 groupReplyMention），兜底靠互 @ 熔断。
+  const head = `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
   // 发送炸了也写汇总（review C 二轮）：外层整段吞异常，不写 tab 与群就两边全静默、没处查。
   // ok:false + 失败正文进 tab，原因仍查主流程 error 事件。take 先摘，写两次不可能 duplicate。
   let sendOk = true;
@@ -432,6 +429,8 @@ const flushGroupReply = async (
   }
   // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
   // 发送炸了也记（ok:false）：答案躺 tab 里至少能复制，不至于两边全静默。
+  // 存群里看到的那一行：成功且有正文才存原样，失败/空回答/发送炸全存 body——
+  // tab 才是“群里没拿到也能复制”，和 ok 对齐。
   // publish 不带 origin：投不进任何登记、不触发回群。
   if (entry.runTag) {
     await writeEventAndPublish(
@@ -443,7 +442,7 @@ const flushGroupReply = async (
         ...(entry.sourceMessageId
           ? { questionMessageId: entry.sourceMessageId }
           : {}),
-        answer: sendOk ? answer : body,
+        answer: sendOk && ok && answer ? answer : body,
         ok: sendOk && ok,
       }),
     );

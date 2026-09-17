@@ -19,6 +19,7 @@ import {
   Array as TBArray,
   Boolean as TBBoolean,
   Enum as TBEnum,
+  Number as TBNumber,
   Object as TBObject,
   Optional as TBOptional,
   String as TBString,
@@ -584,18 +585,20 @@ const notifyGroupTestersDef: FlowshipToolDef = {
 
 const expectGroupReplyDef: FlowshipToolDef = {
   name: "expect_group_reply",
-  label: "登记群里问出去的问题（等 bot 回结论）",
+  label: "登记群里问出去的问题（等对方回结论）",
   description: [
-    "在需求群里 @ 某个 bot 要数据之后调（如 @桃子哥 要 COMPLETED 学号）。登记后对方在窗口期内的回复会被当成答案数据送回本任务（只读呈现；会话活着则自动喂给会话当数据）。",
+    "在需求群里 @ 谁要数据之后调（如 @同事 要学号、@另一台机器人要结论）。登记后对方在窗口期（默认 2 小时）内的回复会被当成答案数据送回本任务（只读呈现；会话活着则自动喂给会话当数据，吃掉后群里不再回）。",
     "前置要求：群里那条必须带真 @（手写 <at user_id=\"ou_xxx\"> 标签的 text 消息；分享卡片的 at 只认人、@机器人不会亮，对方可能收不到提醒）。对方 open_id 先用成员列表查，查不到就问用户要。",
-    "调用时机：群消息发出去、拿到 send 回执的 message_id 后立刻调。message_id 取回执里的 message_id（om_xxx）；target 必须是 @ 标签里的 user_id/open_id（ou_xxx / cli_xxx，原样抄）。不知道 id 时不许填显示名凑合（填了直接拒单——群昵称随手可改，精确相等防不住改名冒充）：先用成员列表查（群成员详情里能看到 ou_xxx），查不到就问用户要；keywords 必填 1-5 个（答案里必须含的字眼，如 学号，大小写不敏感），没有就不建登记。",
-    "不调 = 对方回来只走普通只读答疑，不会当答案数据消费。有效期 30 分钟，一问一答、消费即焚。",
+    "调用时机：先登记再发——查到对方 open_id 后先调本工具占位（message_id 随手填个唯一串，每次换一个，如 pending-1、pending-2，别复用同一个占位串——同串会被当成同一条去重），再去群里发真 @ 消息；对方秒回也漏不掉。若已发出，拿到回执立刻补登（同目标只留最新，重复登无害）。message_id 取回执里的 message_id（om_xxx）只用于对账，不参与判定；target 必须是 @ 标签里的 user_id/open_id（ou_xxx / cli_xxx，原样抄）。不知道 id 时不许填显示名凑合（填了直接拒单——群昵称随手可改，精确相等防不住改名冒充）：先用成员列表查（群成员详情里能看到 ou_xxx），查不到就问用户要；keywords/about 都是备注（1-5 个关键词或一句话在等什么事，给模型看，不做硬拦）。",
+    "不调 = 对方回来只走普通只读答疑，不会当答案数据消费。有效期默认 2 小时（一问一答、消费即焚；ttl_minutes 可改，单位分钟）；一次只等一件事，上一个没回来先别问下一个；内容不够最多补问一次，补问前需重新登记；占位后尽快发真 @（占位传 ttl_minutes: 10，发出后再补登正式登记），别留长时间空窗。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),
     message_id: TBString(),
     target: TBString(),
-    keywords: TBArray(TBString()),
+    keywords: TBOptional(TBArray(TBString())),
+    about: TBOptional(TBString()),
+    ttl_minutes: TBOptional(TBNumber()),
   }),
   handler: async (args, callerToken) => {
     const taskId = str(args.task_id);
@@ -613,7 +616,10 @@ const expectGroupReplyDef: FlowshipToolDef = {
     const keywords = Array.isArray(args.keywords)
       ? (args.keywords as unknown[]).map((k) => str(k)).filter((k) => k.trim())
       : [];
-    // 群 ID 能反查就写死（跨群同目标不串味）；查不到放空、靠 target+窗口+要素判定
+    const about = str(args.about);
+    // ttl 分钟数先收原始值，具体换算等下面 OUTBOUND_QUESTION_TTL_MS 到手再做（单一数据源）。
+    const ttlMinutesRaw = args.ttl_minutes;
+    // 群 ID 能反查就写死（跨群同目标不串味）；查不到放空、靠 target+窗口判定
     let chatId = "";
     try {
       const { getBoundGroupChatId } = await import("./feishu-group");
@@ -627,10 +633,23 @@ const expectGroupReplyDef: FlowshipToolDef = {
       messageId: str(args.message_id),
       target: str(args.target),
       keywords,
+      ...(about.trim() ? { about: about.trim() } : {}),
+      // 占位传小的 ttl（如 10 分钟），正式问不传（默认 2 小时）；非法值回落默认，不断登记。
+      ...(typeof ttlMinutesRaw === "number" &&
+      Number.isFinite(ttlMinutesRaw) &&
+      ttlMinutesRaw > 0
+        ? { ttlMs: Math.min(ttlMinutesRaw, 24 * 60) * 60 * 1000 }
+        : {}),
     });
     if (!r.ok) return text(JSON.stringify({ ok: false, error: r.error }));
+    // 同目标覆盖要可见：hint 里带被顶掉的旧登记，对不上时查无对证变有据可查。
     return text(
-      JSON.stringify({ ok: true, hint: "已登记，对方窗口期内的含要素回复会当答案数据送回" }),
+      JSON.stringify({
+        ok: true,
+        hint:
+          "已登记，对方窗口期内的回复会当答案数据送回（吃掉后群里不再回）" +
+          (r.replaced ? `（已覆盖同目标旧登记 ${r.replaced}）` : ""),
+      }),
     );
   },
 };

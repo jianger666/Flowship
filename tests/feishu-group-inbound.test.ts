@@ -33,6 +33,7 @@ const {
   hasAnyMention,
   isGroupChatMessage,
   matchAdvanceOption,
+  listAdvanceOptionCandidates,
   matchesBotMention,
   parseGroupCommand,
   resolveActionAlias,
@@ -275,6 +276,10 @@ describe("群消息判定 / @ 过滤", () => {
   it("stripMentions 剥掉 @应用名 与 @_user_N 占位", () => {
     expect(stripMentions("@Flowship 推进 复核", ["Flowship"])).toBe("推进 复核");
     expect(stripMentions("@_user_1 这个怎么办", [])).toBe("这个怎么办");
+    // 只剥第一次：邮箱/引用原文里的同名串留着，不误伤
+    expect(stripMentions("@Flowship 查 admin@Flowship", ["Flowship"])).toBe(
+      "查 admin@Flowship",
+    );
   });
 
   it("stripMentions 剥掉飞书原生 <at> 标签（江涛 CLI 案：ou_ 残留会让模型以为 @ 了两个人）", () => {
@@ -348,6 +353,32 @@ describe("命令解析", () => {
     ];
     expect(matchAdvanceOption("周报", ambiguous)).toBeNull();
     expect(matchAdvanceOption("随便写的", options)).toBeNull();
+  });
+
+  it("listAdvanceOptionCandidates：精确命中返空、多义全列、无命中返空", () => {
+    const options = advanceGroups().flatMap((g) => g.options);
+    // 精确命中不用选
+    expect(listAdvanceOptionCandidates("周报生成", options)).toEqual([]);
+    // 唯一模糊命中也归 match 直跑，候选集照样给（调用方按 match 先行）
+    expect(listAdvanceOptionCandidates("周报", options).map((o) => o.key)).toEqual([
+      "app:weekly-report",
+    ]);
+    const ambiguous = [
+      ...options,
+      {
+        key: "app:weekly-review",
+        label: "周报复盘",
+        actionType: "custom" as const,
+        customActionId: "app:weekly-review",
+        skill: "weekly-review",
+      },
+    ];
+    expect(listAdvanceOptionCandidates("周报", ambiguous).map((o) => o.key)).toEqual([
+      "app:weekly-report",
+      "app:weekly-review",
+    ]);
+    expect(listAdvanceOptionCandidates("随便写的", options)).toEqual([]);
+    expect(listAdvanceOptionCandidates("", options)).toEqual([]);
   });
 });
 
@@ -483,6 +514,31 @@ describe("resolveTaskIdByGroupChat", () => {
     expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-1");
     expect(listTasks).toHaveBeenCalledTimes(2);
   });
+
+  it("listTasks 炸了 → null + 写负缓存（outage 期不每条都全量扫）", async () => {
+    const listTasks = vi.fn(async () => {
+      throw new Error("meegle down");
+    });
+    __setGroupRouteDepsForTest(baseDeps({ listTasks }) as never);
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBeNull();
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBeNull();
+    expect(listTasks).toHaveBeenCalledTimes(1);
+  });
+
+  it("单个绑定读取抖 → 跳过该候选继续扫（不穿出整条链）", async () => {
+    const taskB = taskSummary({ id: "task-2", title: "任务B" });
+    const getBoundGroupChatId = vi.fn(async (t: { id?: string }) => {
+      if (t?.id === "task-1") throw new Error("flaky");
+      return CHAT;
+    });
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        listTasks: async () => [taskSummary(), taskB],
+        getBoundGroupChatId,
+      }) as never,
+    );
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-2");
+  });
 });
 
 // ----------------- 入向路由 -----------------
@@ -536,6 +592,39 @@ describe("routeGroupInboundMessage", () => {
     expect(r).toMatchObject({ kind: "skipped", error: SKIP_GROUP_NO_TASK });
     expect(inject).not.toHaveBeenCalled();
     expect(callArgs(sendTextToChat)[1]).toContain("本机没有关联此需求的任务");
+  });
+
+  it("未绑定群连 @ → 按 chat 节流，窗内只回第一句（防无表 ping-pong）", async () => {
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        sendTextToChat,
+        getBoundGroupChatId: async () => null,
+      }) as never,
+    );
+    const r1 = await routeGroupInboundMessage(groupMsg({ message_id: "om_u1" }), ctx);
+    const r2 = await routeGroupInboundMessage(groupMsg({ message_id: "om_u2" }), ctx);
+    expect(r1).toMatchObject({ kind: "skipped", error: SKIP_GROUP_NO_TASK });
+    expect(r2).toMatchObject({ kind: "skipped", error: SKIP_GROUP_NO_TASK });
+    // 窗内只回第一句
+    expect(sendTextToChat).toHaveBeenCalledTimes(1);
+    expect(callArgs(sendTextToChat)[1]).toContain("打开一下该任务再试");
+  });
+
+  it("取 openId 炸了 → 和 AppInfo 同一个失败信封（failed + retryable）", async () => {
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        getBotOpenId: async () => {
+          throw new Error("info blown");
+        },
+      }) as never,
+    );
+    const r = await routeGroupInboundMessage(groupMsg(), ctx);
+    expect(r).toMatchObject({ kind: "failed", retryable: true });
+    expect(String((r as { error?: unknown }).error)).toContain("无法获取 bot 身份");
   });
 
   it("普通提问 → 回灌 task 注入链、正文带来源前缀、登记回群", async () => {
@@ -940,6 +1029,79 @@ describe("群内推进", () => {
     });
     expect(callArgs(sendTextToChat)[1]).toContain("已开始跑 周报生成");
   });
+
+  it("「推进 <多义>」→ 回候选清单让用户挑（2~4 个）", async () => {
+    const advanceTask = vi.fn();
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    const groups = advanceGroups();
+    groups[1]!.options.push({
+      key: "app:weekly-review",
+      label: "周报复盘",
+      actionType: "custom",
+      customActionId: "app:weekly-review",
+      skill: "weekly-review",
+    });
+    __setGroupRouteDepsForTest(
+      baseDeps({ advanceTask, sendTextToChat, listAdvanceOptions: async () => groups }) as never,
+    );
+    const r = await routeGroupInboundMessage(
+      groupMsg({ content: "@Flowship 推进 周报", message_id: "om_amb" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "failed", taskId: "task-1" });
+    expect(advanceTask).not.toHaveBeenCalled();
+    const reply = callArgs(sendTextToChat)[1] as string;
+    expect(reply).toContain("周报生成");
+    expect(reply).toContain("周报复盘");
+    expect(reply).not.toContain("没认出");
+  });
+
+  it("「推进 <无命中>」→ 照旧回 USAGE", async () => {
+    const advanceTask = vi.fn();
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ advanceTask, sendTextToChat }) as never,
+    );
+    const r = await routeGroupInboundMessage(
+      groupMsg({ content: "@Flowship 推进 随便写的", message_id: "om_nohit" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "failed", taskId: "task-1" });
+    expect(advanceTask).not.toHaveBeenCalled();
+    expect(callArgs(sendTextToChat)[1]).toContain("没认出");
+  });
+
+  it("清单读失败 → 回读取失败让重试（不冤枉用户没打对名）", async () => {
+    const advanceTask = vi.fn();
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        advanceTask,
+        sendTextToChat,
+        listAdvanceOptions: async () => {
+          throw new Error("disk blown");
+        },
+      }) as never,
+    );
+    const r = await routeGroupInboundMessage(
+      groupMsg({ content: "@Flowship 推进 周报生成", message_id: "om_listerr" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "failed", taskId: "task-1" });
+    expect(advanceTask).not.toHaveBeenCalled();
+    const reply = callArgs(sendTextToChat)[1] as string;
+    expect(reply).toContain("读取可推进 action 失败");
+    expect(reply).not.toContain("没认出");
+  });
 });
 
 // ----------------- 推进选择卡（构建 + 按钮回调） -----------------
@@ -982,6 +1144,37 @@ describe("buildGroupAdvanceCardJson", () => {
     const buttonCount = (s.match(/"tag":"button"/g) ?? []).length;
     expect(buttonCount).toBe(20);
     expect(s).toContain(GROUP_ADVANCE_OVERFLOW_HINT);
+  });
+
+  it("按钮文案去重：前 20 字重名加序号、超长加省略号", () => {
+    const card = buildGroupAdvanceCardJson({
+      requirementName: "登录优化",
+      taskId: "task-1",
+      chatId: CHAT,
+      pickId: "pick-3",
+      groups: [
+        {
+          key: "custom",
+          label: "自定义",
+          options: [
+            { key: "app:a", label: "修复单测", actionType: "custom" as const },
+            { key: "app:b", label: "修复单测", actionType: "custom" as const },
+            {
+              key: "app:c",
+              label: "这是一个超过二十个字的超长动作名称用来验证截断",
+              actionType: "custom" as const,
+            },
+          ],
+        },
+      ],
+      senderName: "张三",
+    });
+    const s = JSON.stringify(card);
+    // 重名不再长得一样
+    expect(s).toContain("修复单测");
+    expect(s).toContain("修复单测(2)");
+    // 超长截断有省略号提示
+    expect(s).toContain("…");
   });
 });
 
@@ -1090,6 +1283,42 @@ describe("handleGroupAdvancePick（选择卡按钮回调）", () => {
     expect(
       (callArgs(advanceTask)[0] as { customActionId?: string }).customActionId,
     ).toBeUndefined();
+  });
+
+  it("取身份炸了 → 回群请重试（点卡的不可能是机器人，无续环风险）", async () => {
+    const advanceTask = vi.fn();
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        advanceTask,
+        sendTextToChat,
+        getBotAppInfo: async () => {
+          throw new Error("identity blown");
+        },
+      }) as never,
+    );
+    await handleGroupAdvancePick(pickValue, OWNER, loadBootContext);
+    expect(advanceTask).not.toHaveBeenCalled();
+    expect(callArgs(sendTextToChat)[1]).toContain("点一下重试");
+  });
+
+  it("老卡无 pickId → 按 action 互斥，双击只跑一轮", async () => {
+    const advanceTask = vi.fn(async () => ({ action: { id: "act-l" } }));
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({ advanceTask, sendTextToChat }) as never,
+    );
+    const legacy = { ...pickValue, pickId: "" };
+    await handleGroupAdvancePick(legacy, OWNER, loadBootContext);
+    await handleGroupAdvancePick(legacy, OWNER, loadBootContext);
+    expect(advanceTask).toHaveBeenCalledTimes(1);
+    expect(callArgs(sendTextToChat, 1)[1]).toContain("已在跑");
   });
 });
 
@@ -1682,6 +1911,8 @@ describe("出问登记关联消费", () => {
     expect(injectMetaOf(handleTaskQuestionInject)).toMatchObject({
       correlatedAnswer: "om_q1",
     });
+    // 吃掉后静默：不建回群登记，群里不再回
+    expect(soleGroupReply()).toBeNull();
 
     // 同一条再来一次：登记已焚 → 落回只读
     const r2 = await routeGroupInboundMessage(
@@ -1695,6 +1926,38 @@ describe("出问登记关联消费", () => {
     expect(injectOptsOf(handleTaskQuestionInject, 1)).not.toHaveProperty(
       "correlatedAnswer",
     );
+  });
+
+  it("命中+活会话+主链正忙 → 绕过忙线直接喂会话（与答 pendingAsk 同口径，不拒绝不排队）", async () => {
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        getTask: async () => fullTask({ runStatus: "running" }),
+        listTasks: async () => [taskSummary({ runStatus: "running" })],
+      }) as never,
+    );
+    // bot 秒回撞上主链还没跑完：等的是这份数据，不新起 agent，直接送进活会话
+    const r = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r).toMatchObject({ kind: "sent", taskId: "task-1" });
+    expect(injectOptsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: false,
+      correlatedAnswer: true,
+    });
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    // 登记已消费：复读不再命中
+    expect(
+      matchCorrelatedAnswer({
+        taskId: "task-1",
+        chatId: CHAT,
+        senderIds: [TAOZI],
+        text: "学号 EAA5E7",
+      }),
+    ).toBeNull();
   });
 
   it("P1：昵称改成目标 ID 字样也消费不了登记（昵称不做判定）", async () => {
@@ -1918,9 +2181,9 @@ describe("机器人发件人直拦", () => {
     return { handleTaskQuestionInject, sendTextToChat };
   };
 
-  // 对方机器人是来送结果的，必须照常处理（拦掉就收不到了）；防环靠“回群不 @ 它”+ 熔断。
-  // （江涛 CLI 案：它的“全部已上报✅”必须进得来，我方回确认时不 @ 它，循环自然就断了。）
-  it("机器人 @bot → 照常注入答疑，但登记不 @ 它（atRequester=false）", async () => {
+  // 对方机器人是来送结果的，必须照常处理（拦掉就收不到了）；回答真 @ 回去，
+  // 发起方吃掉后静默，正常一轮结束；兜底靠互 @ 熔断。
+  it("机器人 @bot → 照常注入答疑，回答真 @ 回去（一轮结束靠吃掉静默）", async () => {
     const { handleTaskQuestionInject } = botDeps();
     const r = await routeGroupInboundMessage(
       otherMsg({
@@ -1934,11 +2197,12 @@ describe("机器人发件人直拦", () => {
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
     expect(soleGroupReply()).toMatchObject({
       kind: "question",
-      atRequester: false,
     });
+    // atRequester 已退役：新登记根本不置该字段（undefined），显式 true 也不许
+    expect(soleGroupReply()?.atRequester).toBeUndefined();
   });
 
-  it("sender_bot_open_id 的同样：处理、但不 @", async () => {
+  it("sender_bot_open_id 的同样：处理、回答真 @ 回去", async () => {
     const { handleTaskQuestionInject } = botDeps();
     const r = await routeGroupInboundMessage(
       otherMsg({
@@ -1950,7 +2214,8 @@ describe("机器人发件人直拦", () => {
     );
     expect(r).toMatchObject({ kind: "sent" });
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
-    expect(soleGroupReply()).toMatchObject({ atRequester: false });
+    // 同上：退役字段保持缺省
+    expect(soleGroupReply()?.atRequester).toBeUndefined();
   });
 
   it("人类照常走（sender_type 缺省/user 都算人）", async () => {
@@ -2553,7 +2818,7 @@ describe("review 五轮：回放抛错回执", () => {
 });
 
 describe("review 六轮：回执不@机器人/中途跳闸停drain", () => {
-  it("pumpfail 回执：发起人是机器人就不 @（和主路 atRequester 同口径）", async () => {
+  it("pumpfail 回执：发起人是机器人就不 @（和 groupReplyMention 同口径）", async () => {
     const sendTextToChat = vi.fn(async () => ({
       chat_id: CHAT,
       message_id: "om_r",
@@ -2834,7 +3099,7 @@ describe("review 九轮：失败回执不@机器人/no_pending补登记/占格�
     expect(texts.every((t) => !t.includes("<at"))).toBe(true);
   });
 
-  it("no_pending 落回补登记：bot 发起人带 atRequester=false（review 九轮-2）", async () => {
+  it("no_pending 落回补登记：回答真 @ 回去", async () => {
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );
@@ -2868,7 +3133,7 @@ describe("review 九轮：失败回执不@机器人/no_pending补登记/占格�
     const fallbackEntry = listGroupReplies("task-1").find(
       (e) => e.kind === "question" && e.runTag !== null,
     );
-    expect(fallbackEntry?.atRequester).toBe(false);
+    expect(fallbackEntry?.atRequester).toBeUndefined();
   });
 });
 
@@ -2916,5 +3181,243 @@ describe("review 十轮：关联表清壳/图片兜底", () => {
       { text: string },
     ];
     expect(body.text).toContain("(附图/附件)");
+  });
+});
+
+describe("熔断指数退避（P1）", () => {
+  it("反复跳闸冷却 10→20→40 分钟、封顶 2 小时", async () => {
+    const shared = await import("@/lib/server/feishu-bridge/group-shared");
+    const t = "task-loop-backoff";
+    const T0 = 10_000_000;
+    // 首跳：5 连发
+    for (let i = 0; i < 4; i++)
+      expect(shared.recordBypassLoopAttempt(t, "ou_bot", T0 + i * 1000)).toEqual({
+        tripped: false,
+        cooled: false,
+      });
+    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T0 + 4000)).toEqual({
+      tripped: true,
+      cooled: false,
+    });
+    expect(shared.getBypassLoopTripInfo(t)).toMatchObject({
+      tripCount: 1,
+      cooldownMs: 10 * 60 * 1000,
+    });
+    // 冷却过后（11 分钟）再 5 连发 → 第 2 次，冷却翻倍
+    const T1 = T0 + 11 * 60 * 1000;
+    for (let i = 0; i < 4; i++)
+      expect(shared.recordBypassLoopAttempt(t, "ou_bot", T1 + i * 1000)).toEqual({
+        tripped: false,
+        cooled: false,
+      });
+    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T1 + 4000)).toEqual({
+      tripped: true,
+      cooled: false,
+    });
+    expect(shared.getBypassLoopTripInfo(t)).toMatchObject({
+      tripCount: 2,
+      cooldownMs: 20 * 60 * 1000,
+    });
+    // 冷却中不再计数
+    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T1 + 5000)).toEqual({
+      tripped: false,
+      cooled: true,
+    });
+    // 长时间无跳闸（2 小时后）回到首跳档
+    const T2 = T1 + 3 * 60 * 60 * 1000;
+    for (let i = 0; i < 4; i++)
+      shared.recordBypassLoopAttempt(t, "ou_bot", T2 + i * 1000);
+    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T2 + 4000)).toEqual({
+      tripped: true,
+      cooled: false,
+    });
+    expect(shared.getBypassLoopTripInfo(t)).toMatchObject({
+      tripCount: 1,
+      cooldownMs: 10 * 60 * 1000,
+    });
+    shared.resetBypassLoop(t);
+  });
+});
+
+describe("熔断登记豁免（P2-3）", () => {
+  afterEach(() => {
+    __resetOutboundRegistryForTest();
+  });
+  it("有在途登记的目标连发不计数：追问补问不被自家熔断掐死", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    // 同一目标连发 6 轮：无豁免第 5 轮就跳闸，有豁免全放行。
+    // 注意关联命中送达即焚，每轮前重登（模拟每次追问都有在途登记）。
+    for (let i = 0; i < 6; i++) {
+      regQ();
+      const r = await routeGroupInboundMessage(
+        taoziMsg({ message_id: `om_ex${i}`, content: "@Flowship 学号 EAA5E7" }),
+        ctx,
+      );
+      expect(r).toMatchObject({ kind: "sent" });
+    }
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(6);
+  });
+  it("豁免只跳计数不跳冷却：冷却中即使有登记也静默", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    // 先无登记连发跳闸（同一发送人 TAOZI）
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      await routeGroupInboundMessage(
+        taoziMsg({ message_id: `om_trip${i}`, content: "@Flowship 在吗" }),
+        ctx,
+      );
+    }
+    // 冷却中：即使此刻有在途登记，也照旧静默、不回群
+    regQ();
+    const r = await routeGroupInboundMessage(
+      taoziMsg({ message_id: "om_cooled", content: "@Flowship 学号 EAA5E7" }),
+      ctx,
+    );
+    expect(r).toMatchObject({
+      kind: "skipped",
+      error: SKIP_GROUP_LOOP_BREAKER,
+    });
+  });
+});
+
+describe("冷却放行静默消费（P2：禁声不禁食）", () => {
+  afterEach(() => {
+    __resetOutboundRegistryForTest();
+    agentSessions.delete("task-1");
+  });
+  it("冷却中被等目标回话 + 会话在场 → 喂会话放行（数据不丢）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    // 先无登记连发跳闸（同一发送人）
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      await routeGroupInboundMessage(
+        taoziMsg({ message_id: `om_ct${i}`, content: "@Flowship 在吗" }),
+        ctx,
+      );
+    }
+    // 冷却中：被等目标回话 + 会话在场 → 放行喂会话（replyHandle=null，零输出）
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    const r = await routeGroupInboundMessage(
+      taoziMsg({ message_id: "om_cfeed", content: "@Flowship 学号 EAA5E7" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    expect(injectOptsOf(handleTaskQuestionInject, 4)).toMatchObject({
+      restrictToQuestion: false,
+      correlatedAnswer: true,
+    });
+  });
+  it("冷却中有人回 agent 的追问 → pendingAsk 答复放行", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const injectPendingAskText = vi.fn(async () => ({ ok: true as const }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        getPendingAsk: () => ({ askId: "ask1" }),
+        injectPendingAskText,
+      }) as never,
+    );
+    // 先连发跳闸（pending 开着也不影响计数）
+    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
+      await routeGroupInboundMessage(
+        otherMsg({ message_id: `om_pt${i}`, content: "@Flowship 在吗" }),
+        ctx,
+      );
+    }
+    // 冷却中：pendingAsk 答复放行（burn + sent，零输出）
+    const r = await routeGroupInboundMessage(
+      otherMsg({ message_id: "om_pans", content: "@Flowship 选第一个" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "sent" });
+    expect(injectPendingAskText).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe("关联回执提示词与优先级（P2-1/P2-2）", () => {
+  afterEach(() => {
+    __resetOutboundRegistryForTest();
+    agentSessions.delete("task-1");
+  });
+  it("P2-1：prefix 拼上在等什么（about 优先，其次 keywords）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    regQ({ about: "COMPLETED 学号" });
+    agentSessions.set("task-1", {} as never);
+    const r = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r).toMatchObject({ kind: "sent" });
+    const [, body] = callArgs(handleTaskQuestionInject) as [
+      string,
+      { text: string },
+    ];
+    expect(body.text).toContain("在等：COMPLETED 学号");
+    expect(body.text).toContain("补问前需重新登记");
+    // feed 路不回群：讲结论不带“回复”二字
+    expect(body.text).toContain("直接讲结论、不复述");
+    expect(body.text).not.toContain("回复只讲结论");
+  });
+  it("P3-2：readonly 路（会话不在）保留“回复只讲结论”（照常回群）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    regQ({ about: "COMPLETED 学号" });
+    // 会话不在 → 只读呈现，回群照常，讲结论带“回复”二字
+    const r = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r).toMatchObject({ kind: "sent" });
+    const [, body] = callArgs(handleTaskQuestionInject) as [
+      string,
+      { text: string },
+    ];
+    expect(body.text).toContain("回复只讲结论、不复述");
+  });
+  it("P2-1：无 about 时回落 keywords，再无回落见上文", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    await routeGroupInboundMessage(taoziMsg(), ctx);
+    const [, body] = callArgs(handleTaskQuestionInject) as [
+      string,
+      { text: string },
+    ];
+    expect(body.text).toContain("在等：学号");
+  });
+  it("P2-2：feed 命中时跳过 pendingAsk 分支（专答赢泛问，不一文答两问）", async () => {
+    const handleTaskQuestionInject = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const injectPendingAskText = vi.fn(async () => ({ ok: true as const }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        getPendingAsk: () => ({ askId: "ask1" }),
+        injectPendingAskText,
+      }) as never,
+    );
+    regQ();
+    agentSessions.set("task-1", {} as never);
+    const r = await routeGroupInboundMessage(taoziMsg(), ctx);
+    expect(r).toMatchObject({ kind: "sent" });
+    // 专答走 feed，没进 pendingAsk
+    expect(injectPendingAskText).not.toHaveBeenCalled();
+    expect(injectOptsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: false,
+      correlatedAnswer: true,
+    });
   });
 });

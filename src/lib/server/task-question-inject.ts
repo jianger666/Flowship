@@ -117,7 +117,7 @@ export interface TaskQuestionInjectOptions {
    */
   restrictedRunTag?: string;
   /**
-   * 关联回执（出问登记三硬门已过）：以属主语义注入当数据，但与普通属主消息两处不同——
+   * 关联回执（出问登记两门已过）：以属主语义注入当数据，但与普通属主消息两处不同——
    * ① 不认领 askSkip（不许外部回执顶掉属主的待答提问）；② 正文包不可信数据头。
    * 只由 group-route 在 correlated 命中且活会话在场时置 true。
    */

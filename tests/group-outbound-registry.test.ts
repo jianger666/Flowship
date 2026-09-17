@@ -1,5 +1,5 @@
 /**
- * 群出问登记：三硬门（发件人 / 窗口期 / 必含要素）+ fail-closed + 一问一答即焚
+ * 群出问登记：简化两门（发件人 / 窗口期）+ 关键词仅备注 + 一问一答即焚
  */
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -24,7 +24,7 @@ const reg = () =>
   });
 
 describe("registerOutboundQuestion", () => {
-  it("要素必填：没有 keywords 不建登记（fail-closed）", () => {
+  it("关键词可选：没有 keywords 也能登记（内容够不够由模型判断）", () => {
     const r = registerOutboundQuestion({
       taskId: "t1",
       chatId: "oc_1",
@@ -32,15 +32,15 @@ describe("registerOutboundQuestion", () => {
       target: "ou_taozi",
       keywords: [],
     });
-    expect(r.ok).toBe(false);
+    expect(r.ok).toBe(true);
     expect(
       matchCorrelatedAnswer({
         taskId: "t1",
         chatId: "oc_1",
         senderIds: ["ou_taozi"],
-        text: "学号 EAA5E7",
+        text: "这边结论如下",
       }),
-    ).toBeNull();
+    ).not.toBeNull();
   });
 
   it("taskId / messageId / target 缺一即拒", () => {
@@ -57,7 +57,7 @@ describe("registerOutboundQuestion", () => {
 });
 
 describe("matchCorrelatedAnswer", () => {
-  it("三门全过才命中", () => {
+  it("两门全过即命中（发件人 + 窗口期，不看关键词）", () => {
     expect(reg().ok).toBe(true);
     const hit = matchCorrelatedAnswer({
       taskId: "t1",
@@ -91,7 +91,7 @@ describe("matchCorrelatedAnswer", () => {
     expect(hit?.entry.messageId).toBe("om_q1");
   });
 
-  it("缺要素 → 不命中（fail-closed；闲聊含一半也不行）", () => {
+  it("关键词不做判定：换个说法也命中（够不够由模型判断）", () => {
     registerOutboundQuestion({
       taskId: "t1",
       chatId: "oc_1",
@@ -104,9 +104,9 @@ describe("matchCorrelatedAnswer", () => {
         taskId: "t1",
         chatId: "oc_1",
         senderIds: ["ou_taozi"],
-        text: "学号 EAA5E7",
+        text: "SID 是 EAA5E7，结论如上",
       }),
-    ).toBeNull();
+    ).not.toBeNull();
   });
 
   it("过期 → 不命中", () => {
@@ -154,7 +154,7 @@ describe("matchCorrelatedAnswer", () => {
     ).toBeNull();
   });
 
-  it("同目标多问取最新（就近配对）", () => {
+  it("同目标多问只留最新（一次只等一件事，登记侧收敛）", () => {
     registerOutboundQuestion({
       taskId: "t1",
       chatId: "oc_1",
@@ -178,6 +178,53 @@ describe("matchCorrelatedAnswer", () => {
     expect(hit?.entry.messageId).toBe("om_new");
   });
 
+  it("空串通配收敛：未绑定占位后绑定补登，不留幽灵占位；跨群并行不受影响", () => {
+    registerOutboundQuestion({
+      taskId: "t1",
+      chatId: "",
+      messageId: "om_placeholder",
+      target: "ou_taozi",
+    });
+    const r = registerOutboundQuestion({
+      taskId: "t1",
+      chatId: "oc_1",
+      messageId: "om_formal",
+      target: "ou_taozi",
+    });
+    expect(r).toEqual({ ok: true, replaced: "om_placeholder" });
+    // 正式烧掉后占位不复活：任何群都命中不了
+    burnCorrelatedEntry("t1", "om_formal");
+    expect(
+      matchCorrelatedAnswer({
+        taskId: "t1",
+        chatId: "oc_1",
+        senderIds: ["ou_taozi"],
+        text: "无关闲聊",
+      }),
+    ).toBeNull();
+    // 跨群并行：两个具体串不同，各留各的
+    registerOutboundQuestion({
+      taskId: "t1",
+      chatId: "oc_a",
+      messageId: "om_a",
+      target: "ou_taozi",
+    });
+    registerOutboundQuestion({
+      taskId: "t1",
+      chatId: "oc_b",
+      messageId: "om_b",
+      target: "ou_taozi",
+    });
+    expect(
+      matchCorrelatedAnswer({
+        taskId: "t1",
+        chatId: "oc_b",
+        senderIds: ["ou_taozi"],
+        text: "结论",
+      })?.entry.messageId,
+    ).toBe("om_b");
+  });
+
   it("chatId 为空的登记跨群放行——行为锁定（查不到绑定群时的降级，串味口子已知）", () => {
     registerOutboundQuestion({
       taskId: "t1",
@@ -186,7 +233,7 @@ describe("matchCorrelatedAnswer", () => {
       target: "ou_taozi",
       keywords: ["学号"],
     });
-    // 为空 = 不做群隔离：同 target 不同群会串，fail-closed 靠发件人+窗口+要素三门兜着
+    // 为空 = 不做群隔离：同 target 不同群会串，发件人+窗口两门兜着（内部群可接受）
     const hit = matchCorrelatedAnswer({
       taskId: "t1",
       chatId: "oc_other",
@@ -277,6 +324,25 @@ describe("keywords 上限显式报错（不静默截断）", () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("最多 5 个");
+  });
+
+  it("单条超长截断到 30 字：脏数据别入库，拼接处不再二次截断", () => {
+    const r = registerOutboundQuestion({
+      taskId: "t1",
+      chatId: "oc_1",
+      messageId: "om_q1",
+      target: "ou_taozi",
+      keywords: [`学${"号".repeat(300)}`],
+    });
+    expect(r.ok).toBe(true);
+    const hit = matchCorrelatedAnswer({
+      taskId: "t1",
+      chatId: "oc_1",
+      senderIds: ["ou_taozi"],
+      text: "结论",
+    });
+    expect(hit?.entry.keywords).toHaveLength(1);
+    expect(hit?.entry.keywords[0]?.length).toBeLessThanOrEqual(30);
   });
 });
 

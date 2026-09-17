@@ -162,11 +162,11 @@ export type GroupReplyChannel = "owner" | "restricted";
 export interface PendingGroupReply {
   /** 回哪个群 */
   chatId: string;
-  /** 发起人 open_id（回群时 @ 他；发起人是机器人时必须 false，否则 @ 回去就和对方机器人成环） */
+  /** 发起人 open_id（回群时 @ 他） */
   requesterOpenId: string;
   /**
-   * 回群时要不要 @ 发起人。缺省 true（人类提问保持原有提醒体验）。
-   * false = 只发正文不 @——发起人是机器人时用，不 @ 它的自动化就不会被触发。
+   * 回群时要不要 @ 发起人。缺省 true（人类和机器人提问都 @；发起方吃掉后静默，一轮结束）。
+   * false = 只发正文不 @——保留字段，兼容旧登记/旧单测，新登记不再置 false。
    */
   atRequester?: boolean;
   /** 发起人姓名（@ 标签展示名 / 事件 meta） */
@@ -588,18 +588,30 @@ export const __resetGroupReplyStateForTest = (): void => {
 // ----------------- 机器人互 @ 熔断 -----------------
 //
 // 两个机器人互 @ 成环（江涛 CLI 案）的断路器：只数非属主 @ 消息，不拦属主。
-// 短窗口内连续 N 轮 → 冷却一段时间，期间非属主 @ 消息静默跳过（不回群里任何话——
+// 短窗口内连续 N 轮 → 冷却一段时间（首跳 10 分钟，反复跳闸指数退避 10→20→40…封顶 2 小时），
+// 期间非属主 @ 消息静默跳过（不回群里任何话——
 // 回一句 @ 就会给对方机器人续上）、只在 Flowship 事件流里留一条熔断说明。
 // 内存态：进程重启清零，可接受（环本来就跑在进程活着的时候）。
 /** 熔断滑动窗口：窗口内同一发送人 @ 消息达到这么多轮就跳闸（多人群问不累计） */
 export const BYPASS_LOOP_WINDOW_MS = 10 * 60 * 1000;
 export const BYPASS_LOOP_MAX_ROUNDS = 5;
-/** 跳闸后静默多久（属主消息不受影响、且会清零计数） */
+/** 跳闸后静默多久：首跳 10 分钟（属主消息不受影响、且会清零计数） */
 export const BYPASS_LOOP_COOLDOWN_MS = 10 * 60 * 1000;
+/** 指数退避基数（= 首跳冷却）与封顶：同一 task 短时间内反复跳闸 10→20→40 分钟…封顶 2 小时 */
+export const BYPASS_LOOP_COOLDOWN_BASE_MS = BYPASS_LOOP_COOLDOWN_MS;
+export const BYPASS_LOOP_COOLDOWN_MAX_MS = 2 * 60 * 60 * 1000;
+/** 多久没再跳闸算翻篇、计数清零（和封顶对齐：2 小时无跳闸回到首跳档） */
+export const BYPASS_LOOP_TRIP_RESET_MS = 2 * 60 * 60 * 1000;
 type BypassLoopState = {
   /** 按发送人分组的时间戳（review P1-1：5 个同事各问一句是正常忙群，只有同一个 id 连刷才是环） */
   bySender: Map<string, number[]>;
   cooldownUntil: number;
+  /** 本 task 累计跳闸次数（属主出现清零；长时间无跳闸 sweep 清零） */
+  tripCount: number;
+  /** 上次跳闸时间（退避档位用） */
+  lastTripAt: number;
+  /** 上次跳闸的冷却时长（消息文案用） */
+  lastCooldownMs: number;
 };
 const bypassLoopByTask = new Map<string, BypassLoopState>();
 export const __resetBypassLoopForTest = (): void => {
@@ -613,7 +625,8 @@ export const resetBypassLoop = (taskId: string): void => {
 export const __getBypassLoopSendersForTest = (taskId: string): string[] => [
   ...(bypassLoopByTask.get(taskId)?.bySender.keys() ?? []),
 ];
-/** 单测 peek：熔断表里还剩几个 task（断言整项清理用） */
+/** 单测 peek：熔断表里还剩几个 task（断言整项清理用）。
+ * 注：含退避留档（bySender 已空、档位未翻篇的空壳）——断言“真干净”用 senders 或 tripCount，别只看这个数。 */
 export const __getBypassLoopTaskCountForTest = (): number =>
   bypassLoopByTask.size;
 
@@ -642,7 +655,12 @@ export const sweepBypassLoopState = (now: number = Date.now()): void => {
       if (arr.some((t) => now - t < BYPASS_LOOP_WINDOW_MS)) continue;
       st.bySender.delete(id);
     }
-    if (st.bySender.size === 0) bypassLoopByTask.delete(taskId);
+    // 退避计数保留：bySender 空了但最近跳过闸（2 小时内），留着档位给下次指数退避；
+    // 长时间无跳闸才整项删、回到首跳档。
+    if (st.bySender.size === 0) {
+      if (st.lastTripAt > 0 && now - st.lastTripAt < BYPASS_LOOP_TRIP_RESET_MS) continue;
+      bypassLoopByTask.delete(taskId);
+    }
   }
   for (const [key, ts] of throttleMarks) {
     if (now - ts >= THROTTLE_WINDOW_MS) throttleMarks.delete(key);
@@ -675,7 +693,7 @@ export const recordBypassLoopAttempt = (
   if (!taskId || !senderId) return idle;
   let st = bypassLoopByTask.get(taskId);
   if (!st) {
-    st = { bySender: new Map(), cooldownUntil: 0 };
+    st = { bySender: new Map(), cooldownUntil: 0, tripCount: 0, lastTripAt: 0, lastCooldownMs: 0 };
     bypassLoopByTask.set(taskId, st);
   }
   // 清扫放 cooled 判定之前（review 五轮-4）：全员冷却时也不饿死，节流表照清。
@@ -683,9 +701,10 @@ export const recordBypassLoopAttempt = (
   sweepBypassLoopState(now);
   if (now < st.cooldownUntil) return { tripped: false, cooled: true };
   // 注意：上面可能把本 task 也扫掉（全过期），下面 get 不到就重建——语义不变
+  // （退避计数在 2 小时内会留着，翻篇了才重建回首跳档）
   st = bypassLoopByTask.get(taskId);
   if (!st) {
-    st = { bySender: new Map(), cooldownUntil: 0 };
+    st = { bySender: new Map(), cooldownUntil: 0, tripCount: 0, lastTripAt: 0, lastCooldownMs: 0 };
     bypassLoopByTask.set(taskId, st);
   }
   const rounds = (st.bySender.get(senderId) ?? []).filter(
@@ -694,11 +713,36 @@ export const recordBypassLoopAttempt = (
   rounds.push(now);
   st.bySender.set(senderId, rounds);
   if (rounds.length >= BYPASS_LOOP_MAX_ROUNDS) {
-    st.cooldownUntil = now + BYPASS_LOOP_COOLDOWN_MS;
+    // 指数退避：短时间内反复跳闸 10→20→40…封顶 2 小时，野聊 duty-cycle 压到接近零；
+    // 人类 10 分钟连 @5 次本就少见，连跳两次几乎不可能是人，误伤可忽略。
+    const tripCount =
+      st.lastTripAt > 0 && now - st.lastTripAt < BYPASS_LOOP_TRIP_RESET_MS
+        ? st.tripCount + 1
+        : 1;
+    const cooldownMs = Math.min(
+      BYPASS_LOOP_COOLDOWN_BASE_MS * 2 ** (tripCount - 1),
+      BYPASS_LOOP_COOLDOWN_MAX_MS,
+    );
+    st.tripCount = tripCount;
+    st.lastTripAt = now;
+    st.lastCooldownMs = cooldownMs;
+    st.cooldownUntil = now + cooldownMs;
     return { tripped: true, cooled: false };
   }
   return idle;
 };
+
+/** 跳闸信息（文案用）：第几次 + 这次静默多久；没跳过返回 null */
+export const getBypassLoopTripInfo = (
+  taskId: string,
+): { tripCount: number; cooldownMs: number } | null => {
+  const st = bypassLoopByTask.get(taskId);
+  if (!st || st.tripCount <= 0) return null;
+  return { tripCount: st.tripCount, cooldownMs: st.lastCooldownMs };
+};
+/** 单测 peek：某 task 累计跳闸几次（退避档位断言用） */
+export const __getBypassLoopTripCountForTest = (taskId: string): number =>
+  bypassLoopByTask.get(taskId)?.tripCount ?? 0;
 
 // ----------------- 产物卡防重（自动播报 / 群内推进出向共用一张表） -----------------
 //

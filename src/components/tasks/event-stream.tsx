@@ -680,6 +680,16 @@ const EventStreamImpl = ({
   useEffect(() => {
     lastRangeStartRef.current = null;
   }, [showQaPanel]);
+  // agent 正好 ask_user 时自动切回事件流：QA 是只读 tab，问答卡+提示条+输入框全藏，
+  // 用户盯着 QA 页收不到任何信号、agent 干等。只在 null→有 的上升沿切一次；
+  // 之后用户爱看哪看哪（ask 等人期间最可能要翻 QA 再回追问，不能每次点 QA 都被踢回）。
+  const prevHadPendingAskRef = useRef(false);
+  useEffect(() => {
+    const has = !!pendingAskEvent;
+    const rose = has && !prevHadPendingAskRef.current;
+    prevHadPendingAskRef.current = has;
+    if (rose && showQaPanel) setShowGroupQa(false);
+  }, [pendingAskEvent, showQaPanel]);
   // 进行中轮次 → tab 上亮蓝点（主流程里它完全隐身，不给提示用户不知道有人问了，review P1-4）。
   // 已知局限：answering 按快照时间算，无新事件就不重算——崩溃打断的那轮蓝点会常亮到下个事件到来。
   // 故意的：这组件有过输入卡顿 perf 坑，不加分钟级 tick；下个事件（属主说句话）到就灭。

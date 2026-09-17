@@ -90,15 +90,18 @@ const isGroupQuestionEventAny = (ev: TaskEvent): boolean =>
   ev.kind === "user_reply" && metaOf(ev).source === "feishu_group";
 
 /**
- * 提问正文去噪（展示用）：剥 [群消息·来自…] 前缀与飞书原生 <at> 标签残留。
+ * 提问正文去噪（展示用）：剥 [群消息·来自…] 前缀、全角关联回执前缀与飞书原生 <at> 标签残留。
  * 有名字的 @ 留个 @Name（知道还圈了谁），空名字的整段丢掉。
- * 前缀只认 [群消息 开头——`[Bug] xxx` 这类正常内容不许吃（review P2-5）。
+ * 前缀只认 [群消息 / ［群里托办事项 开头——`[Bug] xxx` 这类正常内容不许吃（review P2-5）。
+ * 全角这行必须剥：readonly 关联轮进 tab，首行不能是内部指令（提示词外泄）。
+ * 配行不配括号：about 是自由文本、里面可能有 `］`，配到第一个括号就收会剩半截指令；前缀恒占首行，行尾即边界。
  */
 export const cleanGroupQuestionText = (text: string): string =>
   text
     .replace(/<at user_id="[^"]*">([^<]*)<\/at>/g, (_, name: string) =>
       name.trim() ? `@${name.trim()}` : "",
     )
+    .replace(/^［群里托办事项[^\n]*\n?/, "")
     .replace(/^\[群消息[^\]\n]*\](——[^\n]*)?\n?/, "")
     .replace(/[ \t]{2,}/g, " ")
     .trim();
@@ -154,6 +157,20 @@ export const formatGroupQaTs = (ts: number): string => {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 };
 
+/**
+ * 不进 tab 配对的问题事件：推进占格 / 关联回执喂会话（都没 runTag，进 temporal 就是幻影轮）。
+ * legacy 第二遍与兜底反查表共用这一个，保持一致（防御性对齐：哪天汇总链路一改，
+ * 兜底也不会把汇总配到占格/回执问题上）。主流程显隐不受影响。
+ */
+const isQaExcludedQuestion = (ev: TaskEvent): boolean => {
+  const m = metaOf(ev);
+  return (
+    m.advancePreempted === true ||
+    m.correlatedAnswer === true ||
+    typeof m.correlatedAnswer === "string"
+  );
+};
+
 export const collectGroupQaRounds = (
   events: TaskEvent[],
   now: number = Date.now(),
@@ -204,6 +221,8 @@ export const collectGroupQaRounds = (
   const byFeishuMessageId = new Map<string, TaskEvent>();
   for (const ev of events) {
     if (isGroupQuestionEventAny(ev) && !pairedQuestions.has(ev)) {
+      // 脏问题不进兜底表（和 legacy 同一个谓词，见 isQaExcludedQuestion）
+      if (isQaExcludedQuestion(ev)) continue;
       const mid = strOf(metaOf(ev).feishuMessageId);
       if (mid && !byFeishuMessageId.has(mid)) byFeishuMessageId.set(mid, ev);
     }
@@ -232,7 +251,7 @@ export const collectGroupQaRounds = (
         "群成员",
       askerOpenId:
         strOf(s.askerOpenId) || (qMeta ? strOf(qMeta.groupSenderOpenId) : ""),
-      questionText: q ? cleanGroupQuestionText(strOf(q.text)) : "",
+      questionText: q ? cleanGroupQuestionText(strOf(q.text)) : "（未知问题）",
       answerText: strOf(s.answer),
       ok: s.ok !== false,
       answering: false,
@@ -280,16 +299,22 @@ export const collectGroupQaRounds = (
   for (const ev of events) {
     if (isGroupQuestionEventAny(ev) && !isGroupQaQuestionEvent(ev)) {
       if (pairedQuestions.has(ev)) continue;
-      // 推进占格的问题跳过：它没 runTag 也没法配对，放任 temporal 会把推进过程的
-      // 只言片语 scooped 当答案、造幻影历史轮（review 九轮-3）。主流程里它照常展示。
-      if (metaOf(ev).advancePreempted === true) {
+      // 推进占格 / 关联回执喂会话都不进 temporal 配对：它们没 runTag，
+      // 放任 temporal 会把属主会话的只言片语 scooped 当答案、造幻影历史轮
+      // （advancePreempted=review 九轮-3；correlatedAnswer=本轮补齐）。
+      // 主流程里它们照常展示，只是不进 tab。
+      // 注：pendingAskAnswer 标记已退役（ask-inject 不再写）——收口靠 kind === "ask_user_reply"，
+      // 任何答复都是边界，不要再找这个标记。
+      if (isQaExcludedQuestion(ev)) {
         flushLegacy();
         continue;
       }
       flushLegacy();
       openLegacy = ev;
       legacyAnswers.set(ev, []);
-    } else if (ev.kind === "user_reply") {
+    } else if (ev.kind === "user_reply" || ev.kind === "ask_user_reply") {
+      // ask_user_reply 也是边界：pendingAsk 答复（群代答/属主自答）之后的主会话只言片语，
+      // 不许再 scooped 进之前未收口的历史问题。
       flushLegacy();
     } else if (ev.kind === "assistant_message" && openLegacy) {
       const t = strOf(ev.text).trim();

@@ -1,15 +1,17 @@
 /**
- * 群出问登记（bot 回执关联消费用）。
+ * 群出问登记（bot 回执关联消费用，内部简化版）。
  *
- * 背景：任务在需求群里 @ 某个 bot 要数据（如 @桃子哥 要 COMPLETED 学号），对方回来
- * 的结论要能以“答案数据”身份回到任务。约束（用户拍板）：一视同仁单通道、无受信
- * 名单、无全量补拉、判定全硬规则（发件人 / 窗口期 / 必含要素），fail-closed。
+ * 背景：任务在需求群里 @ 谁要数据（如 @同事 要学号、@另一台机器人要结论），对方回来
+ * 的结论要能以“答案数据”身份回到任务。内部使用、机制从简：只认两门——
+ * ① 发件人 == 被问目标（服务端下发的稳定 ID）；② 窗口期内（默认 2 小时）。
+ * 关键词不再硬拦（留着仅作备注/兼容）：内容够不够、是不是想要的答案由模型判断，
+ * 不够最多补问一次（补问前需重新登记，登记已耗）；命中后静默吃进会话、群里不再回（吃掉就闭嘴，防环）。
+ * 一次只等一件事：同任务同群同目标只留最新登记。
  *
- * 登记来源：agent 在群里问完后调 `expect_group_reply` 显式登记（message_id 取发问
- * send 的回执、target 取 @ 的目标、keywords 必填）。没有登记 = 不消费，只走现有
- * 非属主只读链路。
+ * 登记来源：agent 在群里问完后调 `expect_group_reply` 显式登记。没有登记 = 不消费，
+ * 只走现有非属主只读链路。
  *
- * 进程级内存表（重启即忘，TTL 本来就短）；去重 + 一问一答即焚由调用方
+ * 进程级内存表（重启即忘）；去重 + 一问一答即焚由调用方
  * （group-route）执行，这里只做存取与匹配。
  */
 
@@ -20,20 +22,22 @@ export interface OutboundQuestionEntry {
   messageId: string;
   /**
    * 被问目标的稳定身份：只收飞书服务端命名空间的 ID（`ou_xxx` / `cli_xxx`，@ 标签里的
-   * user_id 原样抄）。显示名不许进登记——群昵称是用户随手可改的自由文本（P1），
+   * user_id 原样抄）。显示名不许进登记——群昵称是用户随手可改的自由文本，
    * 进来就是可伪造的匹配格，登记时直接拒单。
    */
   target: string;
-  /** 必含要素（1-5 个，如「学号」；回复正文必须全部包含才消费，不分大小写） */
+  /** 备注用关键词（可选，不做判定；内容是否够用由模型判断） */
   keywords: string[];
+  /** 在等什么事（一句话备注，给模型看，不做判定） */
+  about?: string;
   /** 登记时间（Date.now()） */
   createdAt: number;
-  /** 有效期 ms（默认 30 分钟） */
+  /** 有效期 ms（默认 2 小时） */
   ttlMs: number;
 }
 
 const REGISTRY_KEY = "__flowshipGroupOutboundRegistryV1__";
-export const OUTBOUND_QUESTION_TTL_MS = 30 * 60 * 1000;
+export const OUTBOUND_QUESTION_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_ENTRIES_PER_TASK = 20;
 
 const getRegistry = (): Map<string, OutboundQuestionEntry[]> => {
@@ -119,21 +123,23 @@ export const clearCorrelatedEntries = (taskId: string): void => {
   if (taskId) getRegistry().delete(taskId);
 };
 
-/** 登记一条出问（要素必填；同 messageId 幂等覆盖） */
+/** 登记一条出问（同 messageId 幂等覆盖；同任务同群同目标只留最新，一次只等一件事） */
 export const registerOutboundQuestion = (entry: {
   taskId: string;
   chatId: string;
   messageId: string;
   target: string;
-  keywords: string[];
+  keywords?: string[];
+  about?: string;
   ttlMs?: number;
-}): { ok: true } | { ok: false; error: string } => {
+}): { ok: true; replaced?: string } | { ok: false; error: string } => {
   const taskId = entry.taskId.trim();
   const messageId = entry.messageId.trim();
   const target = entry.target.trim();
   const keywords = (entry.keywords ?? [])
-    .map((k) => k.trim())
+    .map((k) => k.trim().slice(0, 30))
     .filter(Boolean);
+  // 单条 30 字封顶（和“关键词”体裁匹配）：超长只可能是误粘，脏数据别入库，拼接处不再二次截断。
   if (!taskId || !messageId || !target) {
     return { ok: false, error: "taskId / messageId / target 均必填" };
   }
@@ -145,10 +151,7 @@ export const registerOutboundQuestion = (entry: {
         "target 必须是对方的飞书 ID（ou_xxx / cli_xxx，原样抄 @ 标签里的 user_id；填显示名不建登记——群昵称可改名冒充）。不知道 id 就去成员列表查，查不到问用户要",
     };
   }
-  // 要素必填：没有就不建登记（fail-closed，默认抽关键词已被评审否掉）
-  if (keywords.length === 0) {
-    return { ok: false, error: "keywords 必填（1-5 个），没有就不建登记" };
-  }
+  // 关键词仅备注：没有也能登记（内容够不够由模型判断，不硬拦）
   // 超 5 个直接报错：静默截断会让 agent 以为全登上了，缺的那个要素永远不中、查无对证
   if (keywords.length > 5) {
     return {
@@ -166,18 +169,35 @@ export const registerOutboundQuestion = (entry: {
     messageId,
     target,
     keywords,
+    ...(typeof entry.about === "string" && entry.about.trim()
+      ? { about: entry.about.trim().slice(0, 200) }
+      : {}),
     createdAt: now,
     ttlMs:
       typeof entry.ttlMs === "number" && entry.ttlMs > 0
         ? entry.ttlMs
         : OUTBOUND_QUESTION_TTL_MS,
   };
-  const deduped = live.filter((e) => e.messageId !== messageId);
+  // 同 messageId 覆盖 + 同任务同群同目标只留最新（一次只等一件事，多问串行）。
+  // 空串当通配（和 match/hasPending 一致：未绑定时占位的空 chatId 能命中任何群）——
+  // 未绑定占位后绑定补登正式，同目标两条不再并存，正式烧掉后不留幽灵占位。
+  // 跨群并行（两个具体串不同）不受影响。
+  // 同目标覆盖是静默的：把被顶掉的旧 messageId 带回去，调用方写进 hint，丢也要丢得可见。
+  // 通配谓词抽共用：查找与删除走同一口径，别再分叉。
+  const sameTarget = (e: { target: string; chatId: string }): boolean =>
+    norm(e.target) === norm(target) &&
+    (!e.chatId || !next.chatId || (e.chatId || "") === next.chatId);
+  const replaced = live.find(
+    (e) => e.messageId !== messageId && sameTarget(e),
+  )?.messageId;
+  const deduped = live.filter(
+    (e) => e.messageId !== messageId && !sameTarget(e),
+  );
   deduped.push(next);
   // 同目标同窗口只留最新（多问同目标的歧义按此收敛）
   deduped.sort((a, b) => a.createdAt - b.createdAt);
   reg.set(taskId, deduped.slice(-MAX_ENTRIES_PER_TASK));
-  return { ok: true };
+  return replaced ? { ok: true as const, replaced } : { ok: true as const };
 };
 
 export interface CorrelatedMatch {
@@ -185,38 +205,36 @@ export interface CorrelatedMatch {
 }
 
 /**
- * 三硬门匹配（全代码判定，无模型参与）：
+ * 简化匹配（内部用）：只认两门，全代码判定，无模型参与——
  * ① 发件人 == 被问目标——只比三格服务端下发的稳定 ID
- *   （sender_id / bot open_id / app_id，任一命中）。发送人昵称不参与比对（P1：
- *    昵称是用户可改的自由文本，改名即能精确命中；连把昵改成 `ou_xxx` 形态都防——
+ *   （sender_id / bot open_id / app_id，任一命中）。发送人昵称不参与比对
+ *    （昵称是用户可改的自由文本，改名即能精确命中；连把昵改成 `ou_xxx` 形态都防——
  *    调用方根本不传昵称这一格）；
- * ② 窗口期内；
- * ③ 正文含全部必含要素（大小写不敏感）。
- * text 调用方负责拼好（正文 + 取回的被指消息正文）；匹配成功由调用方即焚。
+ * ② 窗口期内（默认 2 小时）。
+ * 关键词/备注不做判定：内容是不是想要的答案、够不够干活由模型判断，不够最多补问一次。
+ * text 是历史参数：两门拆除后不再参与判定，保留只防 breaking（调用方传了也直接忽略）；
+ * 清理时连调用方的拼串一起删。匹配成功由调用方即焚，吃掉后不再回群。
  */
 export const matchCorrelatedAnswer = (args: {
   taskId: string;
   chatId: string;
   senderIds: Array<string | undefined>;
-  text: string;
+  text?: string;
   now?: number;
 }): CorrelatedMatch | null => {
   const now = args.now ?? Date.now();
-  // 读时顺手清过期（只在写时清，长跑进程会只增不减）
+  // 读写都清过期：读时 pruneExpired 顺手清，写时落盘前过滤；空了整项删，不留空壳。
   const list = pruneExpired(args.taskId, now, getRegistry().get(args.taskId) ?? []);
   const want = new Set(
     (args.senderIds ?? []).map((s) => norm(s ?? "")).filter(Boolean),
   );
   if (want.size === 0) return null;
-  const body = (args.text ?? "").toLowerCase();
-  // 同目标多问：按时间就近（取最后一个命中的）
+  // 同目标多问：正常只会剩最新一条（登记侧已收敛），兜底取最后一个命中的
   let hit: OutboundQuestionEntry | null = null;
   for (const e of list) {
     if (e.chatId && e.chatId !== args.chatId) continue;
     if (now - e.createdAt >= e.ttlMs) continue;
     if (!want.has(norm(e.target))) continue;
-    const ok = e.keywords.every((k) => body.includes(k.toLowerCase()));
-    if (!ok) continue;
     hit = e;
   }
   return hit ? { entry: hit } : null;
