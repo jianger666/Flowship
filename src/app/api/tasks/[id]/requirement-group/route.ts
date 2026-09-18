@@ -1,14 +1,16 @@
 /**
  * /api/tasks/[id]/requirement-group
  *
- * GET：只读当前绑定（绝不建群）→ { ok: true, bound: null | { chatId, chatName?,
- *   ownerStillIn?, membershipUnknown?, unreachable? } }。需求群设置弹窗的“当前绑定”卡用。
- * POST：只建/取需求群（不发卡片）：ensureRequirementGroup → 回 { chatId, chatName?, created }。
+ * GET：只读当前关联（绝不建群）→ { ok: true, bound: null | { chatId, chatName?,
+ *   source, ownerStillIn?, membershipUnknown?, unreachable? } }。需求群设置弹窗用。
+ * POST：只建/取本任务关联的群（不发卡片）：ensureRequirementGroup（本任务优先、
+ *   项目群只读回落、新建经 persistLocalGroup 记本任务，工作项碰都不碰）→
+ *   回 { ok: true, chatId, created, source, chatName?, membershipUnknown?, task }。
  *
  * Body: { recreateFrom? } —— 与 share-to-group 同款死绑定重建口令。
  */
 
-import { getTask } from "@/lib/server/task-fs";
+import { getTask, setTaskGroupAssociation } from "@/lib/server/task-fs";
 import {
   describeBoundRequirementGroup,
   ensureRequirementGroup,
@@ -110,14 +112,21 @@ export const POST = async (req: Request, { params }: Ctx) => {
       verifyOwnerMembership: true,
       allowCreate: true,
       ...(recreateFrom ? { recreateFrom } : {}),
+      // 新群只记本任务本地（工作项碰都不碰）
+      persistLocalGroup: (chatId, chatName) =>
+        setTaskGroupAssociation(id, { chatId, chatName }).then(() => {}),
     });
+    // 落盘后重读：把最新的任务（含本地群关联）带回去，调用方直接刷 UI
+    const updated = await getTask(id);
     return new Response(
       JSON.stringify({
         ok: true,
         chatId: result.chatId,
         created: result.created,
+        source: result.source,
         ...(result.chatName ? { chatName: result.chatName } : {}),
         ...(result.membershipUnknown ? { membershipUnknown: true } : {}),
+        ...(updated ? { task: updated } : {}),
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );

@@ -1468,6 +1468,15 @@ export interface Task {
   repoBranchTemplates?: Record<string, string>;
   feishuStoryUrl?: string;
   /**
+   * 本任务关联的飞书群（任务本地关联、只归这个任务）。
+   * - 有值 = 分享/播报/群回流全走这个群，飞书项目工作项的绑定碰都不碰（只读做默认）。
+   * - 空 = 回落读工作项 `group_type` 的项目群（只读、从不写）。
+   * - 用户在需求群弹窗里“自动创建/绑定已有群”写入，“取消关联”清空。
+   */
+  feishuGroupChatId?: string;
+  /** 本任务关联群的群名快照（展示用，真名以读群接口为准） */
+  feishuGroupChatName?: string;
+  /**
    * 团队 wk-harness 规范的需求编号（**只认用户手填、系统不派生**、见 `req-id.ts`）。
    * - 新建表单 / 详情页编辑弹窗都能填、两处输入框都默认留空
    * - 空 / 未填 → 这个 task 就是没有 REQ-ID：wk 门禁跳过、prompt 不注入这一行

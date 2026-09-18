@@ -1007,7 +1007,7 @@ const TaskDetailPage = () => {
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
           <div className="h-4 w-px shrink-0 bg-border" />
-          <TaskUtilityActions task={task} />
+          <TaskUtilityActions task={task} onTaskUpdate={absorbTask} />
         </div>
         {/* 提测收件箱提醒条：本需求（feishuStoryUrl 对应工作项）有未读待测 MR 时挂出 */}
         <MrInboxTaskBanner feishuStoryUrl={task.feishuStoryUrl} className="mt-3" />

@@ -1,13 +1,18 @@
 "use client";
 
 /**
- * 需求群设置弹窗：当前绑定可视 + 自动创建/复用 vs 手动绑定已有群。
+ * 需求群设置弹窗：当前关联可视 + 自动创建/复用 vs 手动绑定已有群。
+ *
+ * 模型（一句话）：一个任务同一时间只关联一个群，分享/播报/群回流全走它。
+ * 关联存在任务本地：自动创建、手动绑定、重建都只写本任务，飞书项目工作项的
+ * 群绑定碰都不碰（没关联时回落读项目群默认，也只是读）。
  *
  * 入口是任务头「需求群」按钮（TaskUtilityActions）。点开不直接动作，先把现状摆出来：
- * - 当前绑定卡：群名 + 群 ID（可复制）+ 状态（正常 / 你已不在群 / 群已失效 / 未确认）
+ * - 当前关联卡：群名 + 群 ID（可复制）+ 状态（正常 / 你已不在群里 / 群已失效 / 未确认）
  * - 双模式：自动创建（幂等复用/新建）/ 手动绑定（粘贴 oc_xxx）
+ * - 已有关联时可“取消关联”，回到项目群默认。
  *
- * 换绑是覆盖写，旧群立即失效（播报/回流都跟新群走），所以覆盖时有显式 warning，
+ * 换关联是覆盖写，旧群立即收不到本任务的消息，所以覆盖时有显式 warning，
  * 主键走 destructive。所有业务失败都做内联展示（可改完重试），不只 toast 了事。
  */
 
@@ -28,21 +33,26 @@ import { Input } from "@/components/ui/input";
 import { useDialog } from "@/hooks/use-dialog";
 import {
   bindRequirementGroup,
+  clearRequirementGroupBind,
   ensureRequirementGroup,
   getRequirementGroupStatus,
 } from "@/lib/task-store";
+import type { Task } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   taskId: string;
+  /** 关联变更后把服务端回的最新任务刷回页面（不经过它页面里的任务就是旧的） */
+  onTaskUpdate: (task: Task) => void;
 }
 
 type Mode = "auto" | "manual";
 type Bound = {
   chatId: string;
   chatName?: string;
+  source: "task" | "project";
   ownerStillIn?: boolean;
   membershipUnknown?: boolean;
   unreachable?: boolean;
@@ -58,10 +68,10 @@ const extractChatId = (raw: string): string | null => {
 };
 const countChatIds = (raw: string): number => (raw ?? "").match(CHAT_ID_PATTERN)?.length ?? 0;
 
-export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) => {
+export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdate }: Props) => {
   const { confirm } = useDialog();
   const [mode, setMode] = useState<Mode>("auto");
-  // 当前绑定
+  // 当前关联
   const [statusLoading, setStatusLoading] = useState(false);
   const [bound, setBound] = useState<Bound | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -77,11 +87,14 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
   // 飞行态
   const [autoBusy, setAutoBusy] = useState(false);
   const [bindBusy, setBindBusy] = useState(false);
+  const [clearing, setClearing] = useState(false);
   // 两个复制按钮各记各的：共用一个 bool 会让没点的那个也短暂变 ✅，用户会误以为复制错了东西
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const busy = autoBusy || bindBusy;
+  const busy = autoBusy || bindBusy || clearing;
   // loadStatus 并发防守：弹窗开着切任务会重载，迟到的旧任务响应不得覆盖新任务的绑定卡
   const loadSeqRef = useRef(0);
+  const onTaskUpdateRef = useRef(onTaskUpdate);
+  onTaskUpdateRef.current = onTaskUpdate;
 
   const resetTransient = useCallback(() => {
     setFieldError(null);
@@ -99,18 +112,30 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
       const r = await getRequirementGroupStatus(taskId);
       if (seq !== loadSeqRef.current) return;
       if (r.ok) {
-        setBound(r.bound);
+        const b = r.bound;
+        setBound(
+          b
+            ? {
+                chatId: b.chatId,
+                ...(b.chatName ? { chatName: b.chatName } : {}),
+                source: b.source === "task" ? "task" : "project",
+                ...(b.ownerStillIn !== undefined ? { ownerStillIn: b.ownerStillIn } : {}),
+                ...(b.membershipUnknown ? { membershipUnknown: true as const } : {}),
+                ...(b.unreachable ? { unreachable: true as const } : {}),
+              }
+            : null,
+        );
       } else {
         if (r.code === "no_story") {
           setNoStory(true);
           setBound(null);
         } else {
-          setStatusError(r.error || "读取当前绑定失败");
+          setStatusError(r.error || "读取当前关联失败");
         }
       }
     } catch (err) {
       if (seq !== loadSeqRef.current) return;
-      setStatusError(err instanceof Error ? err.message : "读取当前绑定失败");
+      setStatusError(err instanceof Error ? err.message : "读取当前关联失败");
     } finally {
       if (seq === loadSeqRef.current) setStatusLoading(false);
     }
@@ -151,7 +176,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
   );
 
   const runAuto = useCallback(async () => {
-    if (autoBusy || bindBusy) return;
+    if (busy) return;
     resetTransient();
     setAutoBusy(true);
     try {
@@ -161,11 +186,12 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
           setAutoError("需求群创建成功但缺少群 id");
           return;
         }
-        // 与 runBind 同款：membershipUnknown 别丢，没确认本人在群里必须告诉用户去看一眼
+        // membershipUnknown 别丢，没确认本人在群里必须告诉用户去看一眼
         const base = r.created
           ? (r.chatName ? `已建群「${r.chatName}」` : "已建需求群")
           : r.chatName ? `需求群「${r.chatName}」已就绪` : "需求群已就绪";
         toast.success(r.membershipUnknown ? `${base}，但没确认你在群里，进群看一眼` : base);
+        if (r.task) onTaskUpdateRef.current(r.task);
         onOpenChange(false);
         return;
       }
@@ -179,13 +205,13 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
     } finally {
       setAutoBusy(false);
     }
-  }, [autoBusy, bindBusy, onOpenChange, resetTransient, taskId]);
+  }, [busy, onOpenChange, resetTransient, taskId]);
 
   const runRebuild = useCallback(async () => {
-    if (!rebuild || autoBusy || bindBusy) return;
+    if (!rebuild || busy) return;
     const ok = await confirm({
       title: rebuild.chatName ? `你已不在「${rebuild.chatName}」` : "你已不在原来的需求群",
-      description: "重建一个需求群？旧绑定会被覆盖。",
+      description: "重建一个需求群？只记本任务，飞书项目上的群绑定不受影响。",
       confirmLabel: "重新建群",
     });
     if (!ok) return;
@@ -195,6 +221,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
       const r = await ensureRequirementGroup(taskId, { recreateFrom: rebuild.chatId });
       if (r.ok) {
         toast.success(r.chatName ? `已建群「${r.chatName}」` : "已建需求群");
+        if (r.task) onTaskUpdateRef.current(r.task);
         onOpenChange(false);
         return;
       }
@@ -207,10 +234,10 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
     } finally {
       setAutoBusy(false);
     }
-  }, [autoBusy, bindBusy, confirm, onOpenChange, rebuild, resetTransient, taskId]);
+  }, [busy, confirm, onOpenChange, rebuild, resetTransient, taskId]);
 
   const runBind = useCallback(async () => {
-    if (bindBusy || autoBusy) return;
+    if (busy) return;
     setFieldError(null);
     setBindError(null);
     setBindBotLabel(null);
@@ -233,18 +260,18 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
       setFieldError(
         bound.unreachable
           ? "这个群已失效，换一个有效的群 ID"
-          : "这个群已经是当前绑定的群，不用重复绑定",
+          : "这个群已经是当前关联的群，不用重复绑定",
       );
       return;
     }
-    // 覆盖写二次确认：旧群立即失效，不是可以随手点的操作
+    // 覆盖写二次确认：旧群立即收不到本任务的消息，不是可以随手点的操作
     if (bound) {
       const ok = await confirm({
-        title: "确认换绑？",
+        title: "确认换关联的群？",
         description: bound.chatName
-          ? `将从「${bound.chatName}」换到 ${parsed}，旧群不再接收播报，群里 @ 机器人会提示没关联。`
-          : `将换到 ${parsed}，旧群不再接收播报，群里 @ 机器人会提示没关联。`,
-        confirmLabel: "确认换绑",
+          ? `本任务将从「${bound.chatName}」换到 ${parsed}，旧群不再收到本任务的消息。飞书项目上的群绑定不受影响。`
+          : `本任务将换到 ${parsed}，旧群不再收到本任务的消息。飞书项目上的群绑定不受影响。`,
+        confirmLabel: "确认更换",
         destructive: true,
       });
       if (!ok) return;
@@ -257,12 +284,13 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
         if (r.membershipUnknown) {
           toast.success(
             r.chatName
-              ? `已绑定到「${r.chatName}」，但没确认你在群里，进群看一眼`
-              : `已绑定到 ${r.chatId}，但没确认你在群里，进群看一眼`,
+              ? `已关联到「${r.chatName}」，但没确认你在群里，进群看一眼`
+              : `已关联到 ${r.chatId}，但没确认你在群里，进群看一眼`,
           );
         } else {
-          toast.success(r.chatName ? `已绑定到「${r.chatName}」` : `已绑定到 ${r.chatId}`);
+          toast.success(r.chatName ? `已关联到「${r.chatName}」` : `已关联到 ${r.chatId}`);
         }
+        onTaskUpdateRef.current(r.task);
         onOpenChange(false);
         return;
       }
@@ -275,24 +303,47 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
         setBindError(r.error);
         return;
       }
-      setBindError(r.error || "换绑失败");
+      setBindError(r.error || "绑定失败");
     } catch (err) {
-      setBindError(err instanceof Error ? `换绑失败：${err.message}` : "换绑失败");
+      setBindError(err instanceof Error ? `绑定失败：${err.message}` : "绑定失败");
     } finally {
       setBindBusy(false);
     }
-  }, [autoBusy, bindBusy, bound, confirm, manualInput, onOpenChange, taskId]);
+  }, [bound, busy, confirm, manualInput, onOpenChange, taskId]);
+
+  const runClear = useCallback(async () => {
+    if (!bound || busy) return;
+    const ok = await confirm({
+      title: "取消关联？",
+      description: "取消后回到项目群默认。飞书项目上的群绑定不受影响。",
+      confirmLabel: "取消关联",
+      destructive: true,
+    });
+    if (!ok) return;
+    setClearing(true);
+    try {
+      const r = await clearRequirementGroupBind(taskId);
+      // cleared=false 只可能发生在竞态（按钮只在 source=task 时渲染）：如实报，不谎报成功
+      toast.success(r.cleared ? "已取消关联，回到项目群默认" : "本来就没有手动关联，已经是项目群默认");
+      onTaskUpdateRef.current(r.task);
+      onOpenChange(false);
+    } catch (err) {
+      toast.error(err instanceof Error ? `取消关联失败：${err.message}` : "取消关联失败");
+    } finally {
+      setClearing(false);
+    }
+  }, [bound, busy, confirm, onOpenChange, taskId]);
 
   // rebuild 存在时自动模式的主按钮即重建：再跑一遍不带 recreateFrom 的 runAuto 只会
   // 又撞回 needGroupRebuild、白转一圈，所以不给用户留第二个“该点哪个”的选择
   const primary = mode === "auto"
     ? rebuild
       ? { label: "重新建群并绑定", onClick: runRebuild, loading: autoBusy, destructive: true as const }
-      : { label: bound ? "自动进入需求群" : "自动创建并绑定", onClick: runAuto, loading: autoBusy, destructive: false as const }
-    : { label: isOverwrite ? "确认换绑" : "绑定到这个群", onClick: runBind, loading: bindBusy, destructive: isOverwrite };
+      : { label: bound ? "进入需求群" : "自动创建并关联", onClick: runAuto, loading: autoBusy, destructive: false as const }
+    : { label: isOverwrite ? "确认更换" : "绑定到这个群", onClick: runBind, loading: bindBusy, destructive: isOverwrite };
 
   const manualConfirmDisabled =
-    bindBusy || autoBusy || !manualInput.trim() || isSameAsBound || noStory;
+    busy || !manualInput.trim() || isSameAsBound || noStory;
 
   return (
     <Dialog open={open} onOpenChange={close} disablePointerDismissal>
@@ -300,14 +351,14 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
         <DialogHeader>
           <DialogTitle>需求群</DialogTitle>
           <DialogDescription>
-            分享、自动播报、群里 @ 回任务都走这里绑的群。换绑后旧群立即失效。
+            分享、自动播报、群里 @ 回任务都走这里关联的群。换关联后旧群立即收不到本任务的消息。
           </DialogDescription>
         </DialogHeader>
 
-        {/* 当前绑定 */}
+        {/* 当前关联 */}
         <div className="rounded-md border bg-muted/40 p-2.5">
           {statusLoading ? (
-            <p className="text-sm text-muted-foreground">正在读取当前绑定…</p>
+            <p className="text-sm text-muted-foreground">正在读取当前关联…</p>
           ) : noStory ? (
             <p className="text-sm text-muted-foreground">当前任务未关联飞书工作项，无法使用需求群。</p>
           ) : statusError ? (
@@ -318,12 +369,12 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
               </Button>
             </div>
           ) : !bound ? (
-            <p className="text-sm text-muted-foreground">还没绑定需求群，选下面一种方式绑定。</p>
+            <p className="text-sm text-muted-foreground">还没关联需求群，选下面一种方式关联。</p>
           ) : (
             <div className="flex flex-col gap-1.5">
               <div className="flex min-w-0 items-center justify-between gap-2">
                 <span className="min-w-0 truncate text-sm font-medium">
-                  {bound.chatName?.trim() || "已绑定的需求群"}
+                  {bound.chatName?.trim() || "已关联的需求群"}
                 </span>
                 {bound.unreachable ? (
                   <span className="shrink-0 rounded-full bg-destructive/10 px-2 py-0.5 text-xs text-destructive">群已失效</span>
@@ -342,18 +393,32 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
                   复制群 ID
                 </Button>
               </div>
+              <div className="flex min-w-0 items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">
+                  {bound.source === "task" ? "本任务已关联" : "项目群默认（未手动关联）"}
+                </span>
+                {bound.source === "task" && (
+                  <Button
+                    type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-xs text-muted-foreground"
+                    disabled={busy} onClick={() => void runClear()}
+                  >
+                    {clearing ? <Loader2 className="size-3 animate-spin" /> : null}
+                    取消关联
+                  </Button>
+                )}
+              </div>
               {bound.unreachable && (
-                <p className="text-xs text-muted-foreground">原群已不在（解散/失效），用下面“自动创建”重建，或手动绑一个新群。</p>
+                <p className="text-xs text-muted-foreground">原群已不在（解散/失效），用下面“自动创建”重建，或手动关联一个新群。</p>
               )}
               {bound.ownerStillIn === false && !bound.unreachable && (
-                <p className="text-xs text-muted-foreground">你已不在当前绑定的群里，分享会发进你看不见的群。先回群，或换绑/重建。</p>
+                <p className="text-xs text-muted-foreground">你已不在当前关联的群里，分享会发进你看不见的群。先回群，或换关联/重建。</p>
               )}
             </div>
           )}
         </div>
 
         {/* 双模式 */}
-        <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="绑定方式">
+        <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="关联方式">
           <button
             type="button"
             role="radio"
@@ -366,7 +431,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
             )}
           >
             <span className="block text-sm font-medium">自动创建</span>
-            <span className="mt-0.5 block text-xs text-muted-foreground">按工作项建群并绑定，首建自动拉入相关人</span>
+            <span className="mt-0.5 block text-xs text-muted-foreground">按工作项建群并关联到本任务，首建自动拉入相关人</span>
           </button>
           <button
             type="button"
@@ -380,7 +445,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
             )}
           >
             <span className="block text-sm font-medium">绑定已有群</span>
-            <span className="mt-0.5 block text-xs text-muted-foreground">把工作项指向你指定的群</span>
+            <span className="mt-0.5 block text-xs text-muted-foreground">把本任务指向你指定的群</span>
           </button>
         </div>
 
@@ -397,15 +462,15 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
               onKeyDown={(e) => { if (e.key === "Enter" && !manualConfirmDisabled) { e.preventDefault(); void runBind(); } }}
             />
             {parsedInputId && !isSameAsBound && (
-              <p className="font-mono text-xs text-muted-foreground">将绑定：{parsedInputId}</p>
+              <p className="font-mono text-xs text-muted-foreground">将关联：{parsedInputId}</p>
             )}
             {fieldError && <p className="text-xs text-destructive">{fieldError}</p>}
             {isSameAsBound && !fieldError && (
-              <p className="text-xs text-muted-foreground">这个群已经是当前绑定的群，不用重复绑定。</p>
+              <p className="text-xs text-muted-foreground">这个群已经是当前关联的群，不用重复绑定。</p>
             )}
             {isOverwrite && !fieldError && (
               <p className="text-xs text-destructive">
-                换绑后{bound?.chatName ? `「${bound.chatName}」` : "旧群"}不再接收播报，旧群里 @ 机器人会提示没关联。
+                关联后{bound?.chatName ? `「${bound.chatName}」` : "旧群"}不再收到本任务的消息。
               </p>
             )}
             {bindError && <p className="text-xs text-destructive">{bindError}</p>}
@@ -424,7 +489,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
             <p className="text-xs text-muted-foreground">
               群 ID 获取：在飞书里打开目标群 → 点群头像进群设置 → 右下角“复制群 ID”。支持粘整段文本（自动提取 oc_ 开头那段，一次只贴一个群的 ID）。
             </p>
-            <p className="text-xs text-muted-foreground">换绑前确认你的机器人已在目标群里，否则首次分享会提示手动添加。</p>
+            <p className="text-xs text-muted-foreground">绑定前确认你的机器人已在目标群里，否则首次分享会提示手动添加。</p>
           </div>
         )}
 
@@ -434,7 +499,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId }: Props) =>
             {rebuild && (
               <div className="rounded-md border border-destructive/30 bg-destructive/5 p-2">
                 <p className="text-xs">
-                  {rebuild.chatName ? `你已不在「${rebuild.chatName}」` : "你已不在原来的需求群"}，分享会发进你看不见的群。点右下角“重新建群并绑定”，旧绑定会被覆盖。
+                  {rebuild.chatName ? `你已不在「${rebuild.chatName}」` : "你已不在原来的需求群"}，分享会发进你看不见的群。点右下角“重新建群并绑定”，只记本任务。
                 </p>
               </div>
             )}

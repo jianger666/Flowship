@@ -437,7 +437,7 @@ describe("resolveTaskIdByGroupChat", () => {
     expect(listTasks).toHaveBeenCalledTimes(1);
   });
 
-  it("终态任务 / 无飞书链接的任务不参与扫描", async () => {
+  it("终态任务 / 无飞书链接且无本地关联的任务不参与扫描", async () => {
     const getBoundGroupChatId = vi.fn(async () => CHAT);
     __setGroupRouteDepsForTest(
       baseDeps({
@@ -450,6 +450,20 @@ describe("resolveTaskIdByGroupChat", () => {
     );
     expect(await resolveTaskIdByGroupChat(CHAT)).toBeNull();
     expect(getBoundGroupChatId).not.toHaveBeenCalled();
+  });
+
+  // 口径与 getBound/describe 对齐：本任务群关联不需要工作项链接，
+  // 没链接但有本地关联的任务同样参与扫描（否则绑了群也 @ 不回来）
+  it("无飞书链接但有本地关联 → 照常参与扫描", async () => {
+    const getBoundGroupChatId = vi.fn(async () => CHAT);
+    const listTasks = vi.fn(async () => [
+      taskSummary({ id: "task-1", feishuStoryUrl: undefined, feishuGroupChatId: CHAT }),
+    ]);
+    __setGroupRouteDepsForTest(
+      baseDeps({ listTasks, getTask: async () => fullTask(), getBoundGroupChatId }) as never,
+    );
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-1");
+    expect(getBoundGroupChatId).toHaveBeenCalled();
   });
 
   it("解绑后命中失效：活体校验不问旧账，直接重扫（review 十三轮-1）", async () => {

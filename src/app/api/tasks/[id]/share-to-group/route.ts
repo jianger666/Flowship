@@ -11,10 +11,10 @@
  *      （bot_not_in_group / owner_not_in_group / group_unreachable 等结构化字段）
  *
  * `recreateFrom` = 用户在「你已不在原需求群」引导里确认重建时回传的那条失效 chatId：
- * 跳过复用、重建群并覆盖工作项绑定。只有用户显式确认过才会带，agent / 播报都不带。
+ * 跳过复用、重建群并记本任务本地（工作项碰都不碰）。只有用户显式确认过才会带，agent / 播报都不带。
  */
 
-import { getTask } from "@/lib/server/task-fs";
+import { getTask, setTaskGroupAssociation } from "@/lib/server/task-fs";
 import {
   FeishuGroupError,
   shareToRequirementGroup,
@@ -130,17 +130,24 @@ export const POST = async (req: Request, { params }: Ctx) => {
         links: links.length > 0 ? links : undefined,
       },
       {
-        // 显式分享：目标读者就是发起人本人，他看不见 = 这次分享没有意义 → 复用绑定前先校验
+        // 显式分享：目标读者就是发起人本人，他看不见 = 这次分享没有意义 → 复用关联前先校验
         verifyOwnerMembership: true,
         ...(recreateFrom ? { recreateFrom } : {}),
+        // 分享时顺手建的群只记本任务本地（工作项碰都不碰）
+        persistLocalGroup: (chatId, chatName) =>
+          setTaskGroupAssociation(id, { chatId, chatName }).then(() => {}),
       },
     );
+    // 分享时可能新建并落盘了本地关联：把最新任务带回去。调用方目前不消费（弹窗下次打开
+    // 自愈重读），先回、后人要用直接取，不用再改路由。
+    const updated = await getTask(id);
     return new Response(
       JSON.stringify({
         ok: true,
         chatId: result.chatId,
         messageId: result.messageId,
         created: result.created,
+        ...(updated ? { task: updated } : {}),
         // 回执带群名：前端 toast 说清「发到哪个群了」
         ...(result.chatName ? { chatName: result.chatName } : {}),
         // 「本人在不在群」没查出来（scope / 网络）——照常发了，但把不确定性透出去

@@ -208,6 +208,13 @@ export interface TaskMetaV06 {
   /** V0.6.7：per-repo 有效命名模板快照（build 渲染分支名用） */
   repoBranchTemplates?: Record<string, string>;
   feishuStoryUrl?: string;
+  /**
+   * 本任务关联的飞书群 chat_id（任务本地关联，详见 types.ts Task.feishuGroupChatId）。
+   * 落盘字段（looseObject schema 透传）；空/缺 = 回落读项目群。
+   */
+  feishuGroupChatId?: string;
+  /** 本任务关联群的群名快照（展示用） */
+  feishuGroupChatName?: string;
   /** 手填的 wk 需求编号（详见 types.ts Task.reqId；空 = 这个 task 没有 REQ-ID） */
   reqId?: string;
   contextDocs?: TaskContextDoc[];
@@ -1172,6 +1179,8 @@ export const assembleTask = (
   repoDevBranches: meta.repoDevBranches,
   repoBranchTemplates: meta.repoBranchTemplates,
   feishuStoryUrl: meta.feishuStoryUrl,
+  feishuGroupChatId: meta.feishuGroupChatId,
+  feishuGroupChatName: meta.feishuGroupChatName,
   reqId: meta.reqId,
   contextDocs: meta.contextDocs,
   disabledMcpServers: meta.disabledMcpServers,
@@ -1241,6 +1250,9 @@ export const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     feishuTesterUserKeys: meta.feishuTesterUserKeys,
     repoPaths: meta.repoPaths,
     feishuStoryUrl: meta.feishuStoryUrl,
+    // 本任务群关联进摘要：群回流按摘要扫任务（省得为反查读全量事件），缺了本地关联就不可见
+    feishuGroupChatId: meta.feishuGroupChatId,
+    feishuGroupChatName: meta.feishuGroupChatName,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
     pinned: meta.pinned,

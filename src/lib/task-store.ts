@@ -1420,6 +1420,8 @@ export type ShareToGroupResult =
       created: boolean;
       /** 「本人还在不在群」没查出来（scope / 网络）——已照常发出 */
       membershipUnknown?: boolean;
+      /** 分享时新建了本地关联才有：最新任务（调用方目前不消费，弹窗下次打开自愈） */
+      task?: Task;
     }
   | {
       ok: false;
@@ -1505,6 +1507,7 @@ export const shareToGroup = async (
     messageId?: unknown;
     created?: unknown;
     membershipUnknown?: unknown;
+    task?: unknown;
   };
   if (ok.ok !== true) {
     throw new ApiRequestError("分享响应异常", res.status || 500);
@@ -1516,6 +1519,7 @@ export const shareToGroup = async (
     messageId: typeof ok.messageId === "string" ? ok.messageId : "",
     created: ok.created === true,
     membershipUnknown: ok.membershipUnknown === true,
+    ...((ok.task as Task | undefined) ? { task: ok.task as Task } : {}),
   };
 };
 
@@ -1526,7 +1530,11 @@ export type EnsureRequirementGroupResult =
       chatId: string;
       chatName?: string;
       created: boolean;
+      /** 本次用的关联来源：本任务自带，还是项目群默认 */
+      source: "task" | "project";
       membershipUnknown?: boolean;
+      /** 落盘后重读的最新任务（含本地群关联），调用方直接刷 UI */
+      task?: Task;
     }
   | {
       ok: false;
@@ -1595,7 +1603,9 @@ export const ensureRequirementGroup = async (
     chatId?: unknown;
     chatName?: unknown;
     created?: unknown;
+    source?: unknown;
     membershipUnknown?: unknown;
+    task?: unknown;
   };
   if (ok.ok !== true) {
     throw new ApiRequestError("需求群响应异常", res.status || 500);
@@ -1605,15 +1615,21 @@ export const ensureRequirementGroup = async (
     chatId: typeof ok.chatId === "string" ? ok.chatId : "",
     chatName: typeof ok.chatName === "string" ? ok.chatName : undefined,
     created: ok.created === true,
+    // source 缺失默认按 project 归一（服务端同版本必带，这里只防版本错位；
+    // 保守方向：不确定的状态下藏起“取消关联”，不给破坏性动作）
+    source: ok.source === "task" ? "task" : "project",
     membershipUnknown: ok.membershipUnknown === true,
+    ...((ok.task as Task | undefined) ? { task: ok.task as Task } : {}),
   };
 };
 
-/** 当前绑定的只读快照（需求群设置弹窗“当前绑定”卡用；无绑定 bound 为 null） */
+/** 当前关联的只读快照（需求群设置弹窗“当前绑定”卡用；无关联 bound 为 null） */
 export interface RequirementGroupStatus {
   bound: null | {
     chatId: string;
     chatName?: string;
+    /** 关联来源：本任务自带，还是项目群默认 */
+    source: "task" | "project";
     ownerStillIn?: boolean;
     membershipUnknown?: boolean;
     unreachable?: boolean;
@@ -1661,7 +1677,7 @@ export const getRequirementGroupStatus = async (
   return { ok: true, bound: b };
 };
 
-/** 手动换绑结果：成功带新绑定；失败带 code 供弹窗内联引导 */
+/** 手动换绑结果：成功带新关联 + 最新任务；失败带 code 供弹窗内联引导 */
 export type BindRequirementGroupResult =
   | {
       ok: true;
@@ -1670,6 +1686,7 @@ export type BindRequirementGroupResult =
       overwritten: boolean;
       previousChatId?: string;
       membershipUnknown?: boolean;
+      task: Task;
     }
   | {
       ok: false;
@@ -1733,8 +1750,9 @@ export const bindRequirementGroup = async (
     overwritten?: unknown;
     previousChatId?: unknown;
     membershipUnknown?: unknown;
+    task?: unknown;
   };
-  if (ok.ok !== true || typeof ok.chatId !== "string") {
+  if (ok.ok !== true || typeof ok.chatId !== "string" || !ok.task) {
     throw new ApiRequestError("需求群响应异常", res.status || 500);
   }
   return {
@@ -1744,5 +1762,52 @@ export const bindRequirementGroup = async (
     overwritten: ok.overwritten === true,
     ...(typeof ok.previousChatId === "string" ? { previousChatId: ok.previousChatId } : {}),
     ...(ok.membershipUnknown === true ? { membershipUnknown: true as const } : {}),
+    task: ok.task as Task,
+  };
+};
+
+/**
+ * 取消本任务自带的群关联（回落读项目群默认）。成功带最新任务；
+ * 本来就没自带关联也算成功（cleared=false）。HTTP / 解析失败抛 ApiRequestError。
+ */
+export const clearRequirementGroupBind = async (
+  taskId: string,
+): Promise<{ ok: true; cleared: boolean; chatId?: string; task: Task }> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/requirement-group/bind`,
+    { method: "DELETE" },
+  );
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ApiRequestError(`HTTP ${res.status}`, res.status);
+  }
+  if (!res.ok) {
+    const err =
+      typeof data === "object" && data !== null && "error" in data
+        ? (data as { error?: unknown })
+        : {};
+    throw new ApiRequestError(
+      typeof err.error === "string" && err.error.trim()
+        ? err.error.trim()
+        : `取消关联失败（HTTP ${res.status}）`,
+      res.status,
+    );
+  }
+  const ok = data as {
+    ok?: unknown;
+    cleared?: unknown;
+    chatId?: unknown;
+    task?: unknown;
+  };
+  if (ok.ok !== true || !ok.task) {
+    throw new ApiRequestError("需求群响应异常", res.status || 500);
+  }
+  return {
+    ok: true,
+    cleared: ok.cleared === true,
+    ...(typeof ok.chatId === "string" ? { chatId: ok.chatId } : {}),
+    task: ok.task as Task,
   };
 };

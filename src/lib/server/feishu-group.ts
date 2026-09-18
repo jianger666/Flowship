@@ -9,6 +9,10 @@
  * - bot 建群 ✓、建群时带人（≤50）✓、bot 发消息 ✓
  * - 事后拉人 / 拉 bot ✗、用户身份发消息 ✗
  *
+ * 关联模型（任务本地关联，项目群只读不写）：本任务自带的群关联（`task.feishuGroupChatId`）
+ * 优先；没有才回落读工作项 `group_type` 的项目群。自动创建 / 手动绑定的群都只记本任务本地，
+ * 工作项的绑定永远不写——别加回来，加回来就是在改全组共享的东西。
+ *
  * 接入形态：建群时按「需求群成员自动注册表」（`feishu-group-registry`、团队库共享
  * 单文件）把工作项角色成员和他们各自的 bot 一次带齐——每台 Flowship 自动把自己的
  * email → open_id / bot app_id 写进注册表，建群方按 meegle 给的角色成员 email 反查。
@@ -55,7 +59,6 @@ import {
   LarkApiError,
 } from "@/lib/server/feishu-bridge/types";
 import {
-  bindWorkitemGroup,
   decodeWorkitemUrl,
   fetchMyIdentity,
   fetchWorkitemGroupType,
@@ -141,10 +144,28 @@ export interface ShareToGroupInput {
   at?: string[];
 }
 
+/** 任务关联群的来源：本任务自带的关联，还是项目群默认（只读回落） */
+export type GroupAssocSource = "task" | "project";
+
+/**
+ * 读本任务自带的群关联（任务本地字段，不碰工作项）。
+ * 有值 = 分享/播报/回流全走这个群；空 = 回落读项目群默认。
+ */
+export const getTaskLocalGroup = (
+  task: Pick<Task, "feishuGroupChatId" | "feishuGroupChatName">,
+): { chatId: string; chatName?: string } | null => {
+  const id = task.feishuGroupChatId?.trim();
+  if (!id) return null;
+  const name = task.feishuGroupChatName?.trim();
+  return { chatId: id, ...(name ? { chatName: name } : {}) };
+};
+
 export interface EnsureGroupResult {
   chatId: string;
-  /** 本次是否由本机新建了群（并发收敛到别人的群时为 false） */
+  /** 本次是否由本机新建了群（复用已有关联时为 false） */
   created: boolean;
+  /** 本次用的关联来源：本任务自带，还是项目群默认 */
+  source: GroupAssocSource;
   /**
    * 群名（读到才有）——回执里的「已发到「XXX需求群」」就靠它。
    * **只放真实读到的名字**：按 `<需求名>需求群` 反推出来的名字在群被改过名时是错的，
@@ -188,7 +209,7 @@ export class FeishuGroupError extends Error {
     | "lark_error"
     | "bot_not_in_group"
     /**
-     * 工作项上的绑定还在，但**发起人本人已经不在那个群里**（退群 / 被踢 / 换群）。
+     * 当前关联的群还在，但**发起人本人已经不在那个群里**（退群 / 被踢 / 换群）。
      * bot 还在群里 → 卡片发得出去 → 用户看不到任何东西还以为分享成功了（P0）。
      * 前端据此弹「重新建群」引导。
      */
@@ -226,11 +247,6 @@ export interface FeishuGroupDeps {
     workItemId: string,
     projectKey?: string,
   ) => Promise<WorkitemGroupType | null>;
-  bindGroup: (
-    workItemId: string,
-    projectKey: string | undefined,
-    groupId: string,
-  ) => Promise<void>;
   fetchWorkitemName: (
     workItemId: string,
     projectKey?: string,
@@ -279,8 +295,9 @@ export interface FeishuGroupDeps {
 
 const defaultDeps = (): FeishuGroupDeps => ({
   // 一律包一层箭头：避免模块顶层求值时碰到 const TDZ，也方便单测覆盖
+  // 工作项 group_type 只读不写（任务关联群存任务本地，见 getTaskLocalGroup）——
+  // 这里刻意没有 bind 入口，别加回来，加回来就是在改全组共享的项目群绑定。
   fetchGroupType: (id, key) => fetchWorkitemGroupType(id, key),
-  bindGroup: (id, key, groupId) => bindWorkitemGroup(id, key, groupId),
   fetchWorkitemName: (id, key) => fetchWorkitemName(id, key),
   fetchRoleMemberEmails: async (id, key) =>
     (await fetchWorkitemRoleMembers(id, key))
@@ -577,9 +594,9 @@ interface BoundGroupHealth {
 }
 
 /**
- * 复用工作项上已绑定的群之前，校验它对**发起人本人**还有没有意义。
+ * 复用当前关联的群之前，校验它对**发起人本人**还有没有意义（本任务自带关联 / 项目群回落都走这里）。
  *
- * 治的是这个 P0：用户退了那个群（或被踢 / 群被解散换群），但工作项上的 bind 还指着它，
+ * 治的是这个 P0：用户退了那个群（或被踢 / 群被解散换群），但关联还指着它，
  * 而 bot 仍在群里 → 卡片发得出去 → 前端提示「分享成功」→ 用户什么都看不到。
  *
  * 两层探测，都**绝不主动抛**（除非确诊死绑定）：
@@ -653,22 +670,32 @@ export interface EnsureGroupOptions {
    */
   verifyOwnerMembership?: boolean;
   /**
-   * 用户已确认失效的群 id：跳过复用、直接重建并覆盖 bind。
-   *
-   * 走的是同一条建群链（幂等 / 拉人 / bind 全复用），只在两处认这个 id：
-   * ① 复用快路径对它视而不见；② bind 前的并发收敛不把它当「别人抢先建好的群」
-   *（否则重建会原地收敛回那条死绑定、白建一个群）。
+   * 用户已确认失效的群 id：复用快路径对它视而不见，直接走建群重建。
+   * 只对**当前仍是这一条**的关联生效；期间已经被换成别的群就当普通复用（照常校验）。
    */
   recreateFrom?: string;
+  /**
+   * 建群成功后的本地落盘（调用方注入：`setTaskGroupAssociation` 的薄包）。
+   *
+   * feishu-group 不静态 import task-fs（依赖图太重，沿用 group-route 动态连接的同款理由），
+   * 所以建群链只负责建、不管存。走到建群却没传这个 = 调用方 bug，直接抛内部错误——
+   * 绝不能吞：群建好了没存住，下次又建一个，攒的全是没人进得去的孤儿群。
+   */
+  persistLocalGroup?: (
+    chatId: string,
+    chatName: string | undefined,
+  ) => Promise<void>;
 }
 
 /**
- * 幂等取/建需求群。
- * 1) 读 group_type → 已有 group_id：先过一道可用性校验（`verifyOwnerMembership`），
+ * 幂等取/建本任务关联的群。
+ * 1) 本任务自带的关联优先：过一道可用性校验（`verifyOwnerMembership`），
  *    本人已不在群 / 群没了就抛结构化错误让前端引导重建，否则直接返回
- * 2) 无群（或用户确认重建）→ bot 建群（带发起人 + 注册表命中的角色成员和他们的 bot）
- *    （`allowCreate: false` 时到此为止、抛 `no_group`）
- * 3) bind 前再读一次防并发双建；若已被别人 bind，用别人的群并 warning
+ * 2) 无本地关联 → 回落读工作项 `group_type` 的项目群（**只读**，从不写）
+ * 3) 都没有（或用户确认重建）→ bot 建群（带发起人 + 注册表命中的角色成员和他们的 bot）
+ *    并经 `persistLocalGroup` 存到本任务（`allowCreate: false` 时到此为止、抛 `no_group`）
+ *
+ * 项目群绑定永远不动：新建的群只记在任务本地，别人的机器、别人的任务不受影响。
  */
 export const ensureRequirementGroup = async (
   task: Task,
@@ -678,18 +705,42 @@ export const ensureRequirementGroup = async (
   getDeps().scheduleSelfRegister();
   try {
     const story = await resolveTaskStory(task);
+    // 用户已在引导弹窗里确认「我不在这个群、重建一个」——只对**当前仍是这一条**的
+    // 关联生效；期间已经被换成别的群就当普通复用（照常校验），别白建一个
+    const staleId = opts.recreateFrom?.trim() || undefined;
+
+    // —— 1) 本任务自带的关联优先（飞书项目碰都不碰） ——
+    const local = getTaskLocalGroup(task);
+    if (local && local.chatId !== staleId) {
+      const health = opts.verifyOwnerMembership
+        ? await inspectBoundGroup(local.chatId)
+        : {};
+      if (health.dead) throw health.dead;
+      return {
+        chatId: local.chatId,
+        created: false,
+        source: "task" as const,
+        // 新读到的真名优先，读不到回落任务上存的快照
+        ...((health.chatName ?? local.chatName)
+          ? { chatName: (health.chatName ?? local.chatName)! }
+          : {}),
+        ...(health.membershipUnknown ? { membershipUnknown: true } : {}),
+      };
+    }
+    if (local && staleId === local.chatId) {
+      getDeps().warn(`按用户确认重建需求群：丢弃本任务失效关联 ${local.chatId}`);
+    }
+
+    // —— 2) 回落读项目群（只读） ——
     const existing = await getDeps().fetchGroupType(
       story.workItemId,
       story.projectKey,
     );
     const existingId = existing?.groupId?.trim();
-    // 用户已在引导弹窗里确认「我不在这个群、重建一个」——只对**当前仍是这一条**的
-    // 绑定生效；期间已经被换成别的群就当普通复用（照常校验），别白建一个
-    const staleId = opts.recreateFrom?.trim() || undefined;
     if (existingId && (existing?.value === "auto" || existing?.value === "bind")) {
       if (staleId === existingId) {
         getDeps().warn(
-          `按用户确认重建需求群：工作项 ${story.workItemId} 丢弃失效绑定 ${existingId}`,
+          `按用户确认重建需求群：跳过失效的项目群 ${existingId}（只跳过、不改工作项）`,
         );
       } else {
         const health = opts.verifyOwnerMembership
@@ -699,6 +750,7 @@ export const ensureRequirementGroup = async (
         return {
           chatId: existingId,
           created: false,
+          source: "project" as const,
           ...(health.chatName ? { chatName: health.chatName } : {}),
           ...(health.membershipUnknown ? { membershipUnknown: true } : {}),
         };
@@ -742,79 +794,32 @@ export const ensureRequirementGroup = async (
     });
     const myChatId = created.chat_id;
 
-    // bind 前再查一次——别人可能刚 bind 完
-    const again = await getDeps().fetchGroupType(
-      story.workItemId,
-      story.projectKey,
-    );
-    const racedId = again?.groupId?.trim();
-    if (
-      racedId &&
-      racedId !== myChatId &&
-      // 重建时那条死绑定还挂在工作项上是意料之中的，不是「别人抢先建好了」——
-      // 认了就会原地收敛回去、白建一个群，用户点了「重新建群」却什么都没变
-      racedId !== staleId &&
-      (again?.value === "auto" || again?.value === "bind")
-    ) {
-      getDeps().warn(
-        `并发双建收敛：工作项 ${story.workItemId} 已 bind ${racedId}，丢弃本机新建群 ${myChatId}`,
-      );
-      return { chatId: racedId, created: false };
-    }
-
-    // bind 抛错**不能**把已经建好的群一起丢掉：群在飞书那边已经存在、人也拉进去了，
-    // 抛出去只会让用户看到「分享失败」→ 重试 → 再建一个 → 攒孤儿群（回读校验那条
-    // 静默失败路径踩过同一个坑）。所以吞错 + warn，照常返回本次新建的群、卡片发得出去；
-    // bind 没落地的后果（下次分享读不到绑定、会再建一个群）由这条 warn 讲清楚。
-    try {
-      await getDeps().bindGroup(story.workItemId, story.projectKey, myChatId);
-      await warnIfBindDidNotStick(story, myChatId);
-      // 绑定变了：群反查缓存整清（换绑前的旧映射也在里面；review 十三轮-1/十三轮-2，
-      // 新绑群 60 秒内 @ 不再撞 miss 说“没关联”）。放 try 里：bind 炸了也清，重扫兜底。
-      // 动态 import：group-route 静态边太重（连着 task-runner），运行时再连。
-      await import("@/lib/server/feishu-bridge/group-route")
-        .then((m) => m.invalidateGroupChatCache())
-        .catch(() => {});
-    } catch (bindErr) {
-      getDeps().warn(
-        `bind 失败（群已建好、本次卡片照发）：工作项 ${story.workItemId} ← ${myChatId}：${
-          bindErr instanceof Error ? bindErr.message : String(bindErr)
-        }——下次分享读不到绑定会再建一个群，请检查飞书项目「拉群方式选择」字段写权限`,
+    // 新群只记本任务本地（工作项碰都不碰）：存不住 = 下次又建一个攒孤儿群，
+    // 所以 persist 缺失/失败直接抛，不吞（与当年保工作项 bind 的吞错正好反过来——
+    // 那时群是全组共享的、吞了卡还能发出去；现在群只归本任务，没存住就是没关联上）。
+    const persist = opts.persistLocalGroup;
+    if (!persist) {
+      throw new FeishuGroupError(
+        "lark_error",
+        "内部错误：建群成功但没有本地持久化入口",
       );
     }
+    await persist(myChatId, chatName);
+    // 关联变了：群反查缓存整清（旧映射也在里面；review 十三轮-1/十三轮-2，
+    // 新关联群 60 秒内 @ 不再撞 miss 说“没关联”）。
+    // 动态 import：group-route 静态边太重（连着 task-runner），运行时再连。
+    // 清缓存失败要留痕（否则“旧群还能 @ 回任务”一段时间，极难排查）。
+    await import("@/lib/server/feishu-bridge/group-route")
+      .then((m) => m.invalidateGroupChatCache())
+      .catch((cacheErr) => {
+        getDeps().warn(
+          `关联群后清群反查缓存失败（旧群 @ 可能一段时间内仍指向本任务）chat=${myChatId}：${errText(cacheErr)}`,
+        );
+      });
     // 刚建的群名是本机拼的、无需再查一次；建群人自己必在群里，不用校验
-    return { chatId: myChatId, created: true, chatName };
+    return { chatId: myChatId, created: true, chatName, source: "task" as const };
   } catch (err) {
     throw await mapExternalError(err);
-  }
-};
-
-/**
- * bind 后回读校验——**只 warn、不抛**（群已经建好、卡还得发出去）。
- *
- * 为什么必须回读：meegle `workitem update` 对写失败**一声不吭**（2026-07-27 实测：
- * 传不存在的 field_key、传畸形 group_id，返回都是 `{"mcp_result":""}` 且工作项纹丝不动）。
- * bind 悄悄没写进去 → 下次分享读不到群 → 又建一个 → 攒出一堆没人进得去的孤儿群
- *（用户那个测试工作项就攒出了 2 个同名需求群）。回读把这条静默失败打进日志。
- */
-const warnIfBindDidNotStick = async (
-  story: ResolvedStory,
-  chatId: string,
-): Promise<void> => {
-  try {
-    const after = await getDeps().fetchGroupType(
-      story.workItemId,
-      story.projectKey,
-    );
-    if (after?.groupId?.trim() === chatId) return;
-    getDeps().warn(
-      `bind 回读未生效：工作项 ${story.workItemId} 期望 ${chatId}、实际 ${after?.groupId?.trim() || "空"}（value=${after?.value ?? "无"}）——下次分享会再建一个群，请检查飞书项目「拉群方式选择」字段写权限`,
-    );
-  } catch (err) {
-    // 回读本身失败只是少一条诊断信息，绝不能因此把已经建好的群判失败
-    getDeps().warn(
-      `bind 回读失败（不影响本次分享）：${err instanceof Error ? err.message : String(err)}`,
-    );
   }
 };
 
@@ -860,60 +865,82 @@ export interface BindExistingGroupResult extends EnsureGroupResult {
 export interface BoundGroupStatus {
   chatId: string;
   chatName?: string;
-  /** 本人还在当前绑定的群里（fail-open 查不出时为 undefined） */
+  /** 当前关联的来源：本任务自带，还是项目群默认（只读回落） */
+  source: GroupAssocSource;
+  /** 本人还在当前关联的群里（fail-open 查不出时为 undefined） */
   ownerStillIn?: boolean;
   /** 本人在不在群没查出来——展示“未确认”态，不阻断换绑 */
   membershipUnknown?: boolean;
-  /** 绑定指向的群已不在（解散 / chat_id 失效） */
+  /** 关联指向的群已不在（解散 / chat_id 失效） */
   unreachable?: boolean;
 }
 
 /**
- * 只读描述当前绑定（绝不建群、不 bind）——需求群设置弹窗的“当前绑定”卡用。
+ * 只读描述当前关联（绝不建群、不写任何东西）——需求群设置弹窗的“当前绑定”卡用。
  *
  * 与 getBoundGroupChatId 的分工：那个是回流热路径的轻量 id 查询（失败返 null）；
  * 这个是用户主动打开设置时的一次性富查询（群名 + 本人在不在群），失败 fail-open
  * 尽量返回（群名读不到就不带，本人在不在查不出就标 membershipUnknown）。
- * 无绑定返回 null；未关联工作项时抛 `no_story`（前端据此展示“未关联工作项”态）。
+ * 本任务无自带关联、项目群也没有 → 返回 null；
+ * 未关联工作项时抛 `no_story`（前端据此展示“未关联工作项”态）。
  */
 export const describeBoundRequirementGroup = async (
-  task: Pick<Task, "feishuStoryUrl">,
+  task: Pick<Task, "feishuStoryUrl" | "feishuGroupChatId" | "feishuGroupChatName">,
 ): Promise<BoundGroupStatus | null> => {
   getDeps().scheduleSelfRegister();
-  const story = await resolveTaskStory(task);
-  let existing: WorkitemGroupType | null;
-  try {
-    existing = await getDeps().fetchGroupType(story.workItemId, story.projectKey);
-  } catch (err) {
-    throw await mapExternalError(err);
-  }
-  const id = existing?.groupId?.trim();
-  if (!id || (existing?.value !== "auto" && existing?.value !== "bind")) {
-    return null;
+  // 本任务自带的关联优先——它不需要工作项，清掉飞书链接后本地关联照常可读可取消，
+  // 不留隐形状态（口径与 getBoundGroupChatId 对齐：本地免 story，只有项目回落才要 story）。
+  const local = getTaskLocalGroup(task);
+  let id: string | undefined;
+  let source: GroupAssocSource;
+  let snapshotName: string | undefined;
+  if (local) {
+    id = local.chatId;
+    source = "task";
+    snapshotName = local.chatName;
+  } else {
+    const story = await resolveTaskStory(task);
+    let existing: WorkitemGroupType | null;
+    try {
+      existing = await getDeps().fetchGroupType(story.workItemId, story.projectKey);
+    } catch (err) {
+      throw await mapExternalError(err);
+    }
+    const pid = existing?.groupId?.trim();
+    if (!pid || (existing?.value !== "auto" && existing?.value !== "bind")) {
+      return null;
+    }
+    id = pid;
+    source = "project";
   }
   let chatName: string | undefined;
   try {
     chatName = (await getDeps().fetchChatInfo(id)).name?.trim() || undefined;
   } catch (err) {
     if (isChatGoneError(err)) {
-      return { chatId: id, unreachable: true };
+      return { chatId: id, source, unreachable: true };
     }
-    getDeps().warn(`读当前绑定群信息失败 chat=${id}：${errText(err)}`);
+    getDeps().warn(`读当前关联群信息失败 chat=${id}：${errText(err)}`);
   }
-  const named = chatName ? { chatName } : {};
+  // 真名优先，读不到回落任务上存的快照（仅 task 来源有）
+  const named = (chatName ?? snapshotName) ? { chatName: (chatName ?? snapshotName)! } : {};
   try {
     const inside = await getDeps().probeSelfInChat(id);
-    return { chatId: id, ...named, ownerStillIn: inside };
+    return { chatId: id, source, ...named, ownerStillIn: inside };
   } catch (err) {
-    getDeps().warn(`没查出本人还在不在当前绑定群 chat=${id}：${errText(err)}`);
-    return { chatId: id, ...named, membershipUnknown: true };
+    getDeps().warn(`没查出本人还在不在当前关联群 chat=${id}：${errText(err)}`);
+    return { chatId: id, source, ...named, membershipUnknown: true };
   }
 };
 
 /**
- * 手动换绑到一个**已有的群**：同群短路 → 校验目标群 → `bind` 覆盖工作项 → 清群反查缓存。
+ * 手动关联到一个**已有的群**：同群短路 → 校验目标群 → 经 `persist` 存到本任务 → 清群反查缓存。
  *
- * 0. 同群重复绑直接返回（`overwritten: false`，零飞书调用、不写 meegle）——
+ * 工作项碰都不碰：只读本任务自带关联做比对，不读更不写 `group_type`。
+ * 因此“与项目群默认相同”也会落成一条本地副本（多一次写、无害：同 id 行为完全一致；
+ * 不为此多读一次 meegle）。
+ *
+ * 0. 同群重复绑直接返回（`overwritten: false`，零飞书调用、不写任何东西）——
  *    放最前：重复绑连目标群校验都不该跑，否则机器人不在群时会误报 `bot_not_in_group`，
  *    明明什么都不用做。代价是这条返回不带群名（省一次读群调用），前端 toast 用群 ID 展示。
  * 1. `fetchChatInfo`（bot 身份）：群不存在/已解散 → `invalid_input`；bot 不在群 →
@@ -927,26 +954,23 @@ export const describeBoundRequirementGroup = async (
  *    与分享链路 `inspectBoundGroup` 的“宁可漏检”不同）；只有网络抖动等未知错误才
  *    标 `membershipUnknown` 照常绑。
  *
- * bind 写失败**必须抛**（与 ensure 不同：这里没有“已建好的群”要保，写不进去就是没换成，
- * 吞错只会让用户以为换好了）。写完回读校验 + 清群反查缓存（新旧映射一起作废）。
+ * `persist` 失败**必须抛**（没存住就是没关联上，吞了只会让用户以为换好了）。
+ * 调用方（bind route）负责 persist 落盘 + 回读最新 task。
  */
 export const bindExistingRequirementGroup = async (
   task: Task,
   rawChatId: unknown,
+  persist: (chatId: string, chatName: string | undefined) => Promise<void>,
 ): Promise<BindExistingGroupResult> => {
   getDeps().scheduleSelfRegister();
   try {
-    const story = await resolveTaskStory(task);
+    await resolveTaskStory(task);
     const chatId = extractBindChatId(rawChatId);
-    const existing = await getDeps().fetchGroupType(story.workItemId, story.projectKey);
-    const existingId =
-      existing?.value === "auto" || existing?.value === "bind"
-        ? (existing?.groupId?.trim() || undefined)
-        : undefined;
+    const local = getTaskLocalGroup(task);
 
     // 同群重复绑：零副作用短路（见头注释 0）
-    if (existingId === chatId) {
-      return { chatId, created: false, overwritten: false };
+    if (local?.chatId === chatId) {
+      return { chatId, created: false, source: "task" as const, overwritten: false };
     }
 
     let chatName: string | undefined;
@@ -1005,8 +1029,8 @@ export const bindExistingRequirementGroup = async (
     }
     const unknown = membershipUnknown ? { membershipUnknown: true as const } : {};
 
-    await getDeps().bindGroup(story.workItemId, story.projectKey, chatId);
-    await warnIfBindDidNotStick(story, chatId);
+    // 只记本任务本地（工作项碰都不碰）；存不住直接抛，不吞
+    await persist(chatId, chatName);
     // 换绑前后旧映射必须作废：失败要留痕（否则“旧群还能 @ 回任务”一段时间，极难排查）
     await import("@/lib/server/feishu-bridge/group-route")
       .then((m) => m.invalidateGroupChatCache())
@@ -1015,11 +1039,13 @@ export const bindExistingRequirementGroup = async (
           `换绑后清群反查缓存失败（旧群 @ 可能一段时间内仍指向本任务）chat=${chatId}：${errText(cacheErr)}`,
         );
       });
+    const previous = local?.chatId;
     return {
       chatId,
       created: false,
-      overwritten: !!existingId,
-      ...(existingId ? { previousChatId: existingId } : {}),
+      source: "task" as const,
+      overwritten: !!previous,
+      ...(previous ? { previousChatId: previous } : {}),
       ...named,
       ...unknown,
     };
@@ -1029,18 +1055,42 @@ export const bindExistingRequirementGroup = async (
 };
 
 /**
- * **只读**取工作项已绑定的需求群 id（绝不建群）。
+ * 取消本任务自带的群关联（回落读项目群默认）。工作项碰都不碰。
+ * 清掉本地字段 + 清群反查缓存（旧映射作废）。任务本来就没自带关联时直接返回 `false`。
+ */
+export const clearTaskGroupAssociation = async (
+  task: Task,
+  clear: () => Promise<void>,
+): Promise<{ cleared: boolean; chatId?: string }> => {
+  const local = getTaskLocalGroup(task);
+  if (!local) return { cleared: false };
+  await clear();
+  await import("@/lib/server/feishu-bridge/group-route")
+    .then((m) => m.invalidateGroupChatCache())
+    .catch((cacheErr) => {
+      getDeps().warn(
+        `取消关联后清群反查缓存失败 chat=${local.chatId}：${errText(cacheErr)}`,
+      );
+    });
+  return { cleared: true, chatId: local.chatId };
+};
+
+/**
+ * **只读**取本任务关联的群 id（绝不建群、不写任何东西）。
  *
- * 与 ensureRequirementGroup 的分工：ensure 是「分享时保证有群」（可能建群 + bind、
- * 有副作用）；本函数是「群消息回流反查 chatId ↔ task」用的纯查询——回流链每条群消息
+ * 本任务自带的关联优先；没有才回落读工作项的项目群（只读）。
+ * 与 ensureRequirementGroup 的分工：ensure 是「分享时保证有群」（可能建群、有副作用）；
+ * 本函数是「群消息回流反查 chatId ↔ task」用的纯查询——回流链每条群消息
  * 都会走，绝不能顺手建群。任何失败（无飞书链接 / meegle 挂）一律返 null、不抛。
  */
 export const getBoundGroupChatId = async (
-  task: Pick<Task, "feishuStoryUrl">,
+  task: Pick<Task, "feishuStoryUrl" | "feishuGroupChatId" | "feishuGroupChatName">,
 ): Promise<string | null> => {
   // 群消息回流 / 播报 gate 都会走这里 = 本机在用群协作 → 顺带确保自己在注册表里
   // （同步零 IO 快路径，本进程注册到位后直接 return）
   getDeps().scheduleSelfRegister();
+  const local = getTaskLocalGroup(task);
+  if (local) return local.chatId;
   try {
     const story = await resolveTaskStory(task);
     const existing = await getDeps().fetchGroupType(
@@ -1443,6 +1493,7 @@ export const shareToRequirementGroup = async (
         chatId: ensured.chatId,
         messageId: sent.message_id,
         created: ensured.created,
+        source: ensured.source,
         ...(ensured.chatName ? { chatName: ensured.chatName } : {}),
         ...(ensured.membershipUnknown ? { membershipUnknown: true } : {}),
         ...(atNames.length > 0
@@ -1518,6 +1569,7 @@ export const shareToRequirementGroup = async (
       chatId: ensured.chatId,
       messageId: sent.message_id,
       created: ensured.created,
+      source: ensured.source,
       // 回执带群名：用户一眼能看出「发到哪个群了」——这条本身就能让发错群暴露出来
       ...(ensured.chatName ? { chatName: ensured.chatName } : {}),
       ...(ensured.membershipUnknown ? { membershipUnknown: true } : {}),

@@ -266,7 +266,7 @@ const runBroadcast = async (
 
   // —— 准入闸（第一半：同步预筛）：必须已经有需求群 ——
   //
-  // shareToRequirementGroup 内部是 ensureRequirementGroup（没群就**建群 + 拉人 + bind**）。
+  // shareToRequirementGroup 内部是 ensureRequirementGroup（没群就**建群 + 拉人 + 记本任务本地**，工作项碰都不碰）。
   // 那是「用户显式分享」才该有的动作；自动播报是后台行为，不能因为跑完一个 action
   // 就悄悄给全组人拉个群（P2-3）。这里只读绑定、没群直接放弃、连 info 都不写
   //（没群不是异常、是这个需求还没人开始群协作）。

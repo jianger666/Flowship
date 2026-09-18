@@ -1308,7 +1308,8 @@ export interface WorkitemGroupType {
 }
 
 /**
- * 读工作项 `group_type`（只取拉群字段，不走 detail 全量缓存——bind 后要立刻再读）。
+ * 读工作项 `group_type`（只取拉群字段，不走 detail 全量缓存）。
+ * 纯回落读：任务无自带关联时才看它，从不往回写。
  */
 export const fetchWorkitemGroupType = async (
   workItemId: string,
@@ -1328,29 +1329,11 @@ export const fetchWorkitemGroupType = async (
 };
 
 /**
- * bind 现有群到工作项：`field_value` 必须是 stringified JSON，
- * 写协议 `{"type":"bind","group_id":"oc_xxx"}`（判别键是 type，不是 value）。
+ * ~~bind 现有群到工作项~~已删除（任务关联只记本任务本地，不写工作项）：
+ * 写协议留档：`field_value` 是 stringified JSON `{"type":"bind","group_id":"oc_xxx"}`
+ * （判别键是 type，不是 value），经 `meegle workitem update --fields` 写入。
+ * 如将来要恢复写工作项，把下面的实现加回来——但先想清楚：那是在改全组共享的东西。
  */
-export const bindWorkitemGroup = async (
-  workItemId: string,
-  projectKey: string | undefined,
-  groupId: string,
-): Promise<void> => {
-  const fieldValue = JSON.stringify({ type: "bind", group_id: groupId });
-  const fields = JSON.stringify([
-    { field_key: "group_type", field_value: fieldValue },
-  ]);
-  const args = [
-    "workitem",
-    "update",
-    "--work-item-id",
-    workItemId,
-    "--fields",
-    fields,
-  ];
-  if (projectKey) args.push("--project-key", projectKey);
-  await runMeegle(args);
-};
 
 /**
  * 拉工作项名称（需求群群名 `<需求名>需求群` 的来源）。只取 name 一个字段。

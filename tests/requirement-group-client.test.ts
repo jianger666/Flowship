@@ -26,19 +26,29 @@ const stubFetch = (status: number, payload: unknown) => {
 };
 
 describe("ensureRequirementGroup 响应归一", () => {
-  it("成功带回 chatId / chatName / created", async () => {
+  it("成功带回 chatId / chatName / created / source", async () => {
     stubFetch(200, {
       ok: true,
       chatId: "oc_x",
       chatName: "登录优化需求群",
       created: true,
+      source: "task",
     });
     await expect(ensureRequirementGroup("t1")).resolves.toEqual({
       ok: true,
       chatId: "oc_x",
       chatName: "登录优化需求群",
       created: true,
+      source: "task",
       membershipUnknown: false,
+    });
+  });
+
+  it("服务端没带 source → 默认按 project 归一（保守：藏起取消关联）", async () => {
+    stubFetch(200, { ok: true, chatId: "oc_x", created: false });
+    await expect(ensureRequirementGroup("t1")).resolves.toMatchObject({
+      ok: true,
+      source: "project",
     });
   });
 

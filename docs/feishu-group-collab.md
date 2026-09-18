@@ -12,7 +12,7 @@
 
 前后端测试各自在 Flowship 上跑同一飞书项目工作项的任务。任意角色一键把产物 / 疑问分享到「需求群」：
 
-- **首个分享者**触发建群（幂等）并 bind 到工作项 `group_type`；建群时按「成员自动注册表」
+- **首个分享者**触发建群（幂等）并记到**本任务本地**（工作项 `group_type` 只读做默认、永远不写）；建群时按「成员自动注册表」
   一次带齐工作项角色成员和他们各自的 bot（没注册的人跳过、事后手动加）
 - **后来者**若 bot 不在群（他没被注册表带进来）→ 引导弹窗手动加一次；加完即可直接发
 - 发送人是各自的 bot（每人 Flowship 配自己的飞书自建应用，lark-cli 双身份）
@@ -167,7 +167,7 @@ ensureRequirementGroup（无群分支）
 
 | 角色 | 动作 |
 |------|------|
-| 建群人 A | 点分享 → 自动建群（A + 注册表命中的人和 bot）+ bind 工作项 |
+| 建群人 A | 点分享 → 自动建群（A + 注册表命中的人和 bot）+ 记本任务本地 |
 | 未命中的 B | 点分享 → 发卡失败（230002 一族）→ 409 `bot_not_in_group` → 引导弹窗（bot 名 + 复制 + 三步）→ 群设置里加 B 的 bot → 点「已添加，重试发送」原样重发 |
 
 引导弹窗要给**准确**的机器人名：`GET /open-apis/bot/v3/info` 的 `app_name`
@@ -187,12 +187,12 @@ UI / Agent
             │
             ├─ ensureRequirementGroup
             │     ├─ scheduleSelfRegistration（后台把本机身份写进注册表、静默失败）
-            │     ├─ meegle workitem get group_type
-            │     ├─（有群、显式分享）inspectBoundGroup：取群名 + 判本人还在不在
+            │     ├─ 本任务自带关联优先（inspectBoundGroup：取群名 + 判本人还在不在）
             │     │        → 不在 → owner_not_in_group / group_unreachable（前端引导重建）
-            │     ├─（无群 / 用户确认重建）角色成员 email → 注册表反查 → lark POST /im/v1/chats
-            │     │        （user_id_list + bot_id_list）+ meegle bind
-            │     └─ 并发：bind 前再查，收敛到已有 group_id（重建时不认那条失效 id）
+            │     ├─ 无本地关联 → 回落读 meegle workitem get group_type（只读）
+            │     └─（无群 / 用户确认重建）角色成员 email → 注册表反查 → lark POST /im/v1/chats
+            │              （user_id_list + bot_id_list）→ 经 persistLocalGroup 记本任务本地
+            │              （工作项碰都不碰，所以没有跨机器的并发收敛问题）
             ├─ format=card（默认）：sendInteractiveCardToChat
             │     └─ kind=artifact 再 sendFileMessageToChat（全文 md）
             ├─ format=post：sendPostMarkdownToChat（mentions 拼成 `<at user_id>`）
@@ -211,7 +211,7 @@ UI / Agent
 | 群聊发 post markdown `sendPostMarkdownToChat` | 同上（`format: "post"` / 提测 @） |
 | 建群 / bot 展示名 | `createImChat` / `getBotDisplayName`（降级链单一来源） |
 | meegle 串行队列 + 错误三态 | `meegle-cli.ts` |
-| `group_type` 读/bind、工作项名 | `fetchWorkitemGroupType` / `bindWorkitemGroup` / `fetchWorkitemName` |
+| `group_type` 只读回落、工作项名 | `fetchWorkitemGroupType`（只读） / `fetchWorkitemName`（`bindWorkitemGroup` 已停用：任务关联只记本地，不写工作项） |
 | 工作项角色成员（邮箱清单） | `fetchWorkitemRoleMembers`（复用 `fetchWorkitemDetail` 的全量查询 + 进程缓存） |
 | 本人邮箱 / 本机 lark 身份 | `fetchMyEmail`（meegle）/ `getLarkLocalIdentity`（`auth status`） |
 | 成员注册表读 / 写 / 挑人 | `feishu-group-registry.ts` |
@@ -242,22 +242,20 @@ UI / Agent
 **依赖方向**：`feishu-group-registry` 读写都**动态** `import("./team-library")`——
 建群链路很热，不能把那张重依赖图静态挂上去；git 命令一条都不在 registry 里自己拼。
 
-## `group_type` 读写协议（不对称）
+## `group_type` 协议（只读回落；写已停用）
 
 | | 判别键 | 示例 |
 |--|--------|------|
 | **读** | `value` | `{ value: "bind", label: "绑定现有群", group_id: "oc_xxx" }` |
-| **写** | `type` | `{"type":"bind","group_id":"oc_xxx"}`（整段 stringified 进 `field_value`） |
+| ~~写~~ | ~~`type`~~ | ~~已停用：任务关联只记本任务本地，不写工作项（写命令留档，勿用）~~ |
 
-- `auto` / `bind`：通常有 `group_id` → 直接用
-- `disabled`：无群 → 走建群 + bind
+- `auto` / `bind`：通常有 `group_id` → 回落默认直接用
+- `disabled`：无群 → 走建群记本任务本地
 
-命令：
+命令（读）：
 
 ```bash
 meegle workitem get --work-item-id <id> --fields '["group_type"]' --project-key <key>
-meegle workitem update --work-item-id <id> --project-key <key> \
-  --fields '[{"field_key":"group_type","field_value":"{\"type\":\"bind\",\"group_id\":\"oc_xxx\"}"}]'
 ```
 
 ## 姓名从哪来
@@ -273,8 +271,8 @@ meegle workitem update --work-item-id <id> --project-key <key> \
 
 ## 需求群死绑定（2026-07-28 用户实测 P0）
 
-**症状**：用户退掉了那个需求群（同族：被踢 / 群解散 / 换群），但工作项上的 `group_type`
-还 bind 着它，**bot 仍在群里** → `ensureRequirementGroup` 第一步读到 bind 就直接复用 →
+**症状**：用户退掉了那个需求群（同族：被踢 / 群解散 / 换群），但当前关联
+还指着它，**bot 仍在群里** → `ensureRequirementGroup` 复用关联 →
 `sendCard` 成功 → 前端提示「分享成功」→ **用户什么都看不到**。
 
 「bot 在不在群」那套**事后判定**在这里失效：发送成功恰恰是症状本身。所以
@@ -302,44 +300,49 @@ meegle workitem update --work-item-id <id> --project-key <key> \
 分享 → 409 owner_not_in_group（chatId + chatName）
      → 前端 useDialog().confirm「你已不在「XXX需求群」／重建一个需求群再发？」
      → 确认 → 原样重发、body 带 recreateFrom = 那条失效 chatId
-     → ensureRequirementGroup 跳过复用 → 建群 + bind 覆盖
+     → ensureRequirementGroup 跳过复用 → 建群记本任务本地（工作项不动）
 ```
 
-### 手动换绑（绑定已有群）
+### 任务本地关联（绑定已有群 / 自动创建 / 取消关联）
 
-任务头「需求群」点开是设置弹窗（`RequirementGroupDialog`）：顶部当前绑定卡
-（群名 + 群 ID 可复制 + 正常/不在群/已失效/未确认四态），下面双模式二选一。
+一个任务同一时间只关联一个群，分享/播报/群回流全走它。关联存在任务本地
+（`task.feishuGroupChatId`）：自动创建、手动绑定、重建、取消都只读写本任务，
+飞书项目工作项的 `group_type` 只读做默认、永远不写。
 
-- 自动创建：原来的 `ensureRequirementGroup` 幂等复用/新建，死绑定走内联“重新建群”
-- 手动绑定：粘贴群 ID（`oc_` 开头，支持粘整段文本自动提取），`bindExistingRequirementGroup`
-  校验目标群（群存在 → 本人在群 → `bind` 覆盖 → 清群反查缓存）后再写。覆盖写有二次确认
-  + 旧群失效 warning；机器人不在目标群走 `bot_not_in_group` 内联引导（复制机器人名 +
-  加完重试）；本人在不在查不出时标 `membershipUnknown` 照常绑，不阻断。
+任务头「需求群」点开是设置弹窗（`RequirementGroupDialog`）：顶部当前关联卡
+（群名 + 群 ID 可复制 + 正常/不在群/已失效/未确认四态 + 来源：本任务已关联 /
+项目群默认），下面双模式二选一。
+
+- 自动创建：`ensureRequirementGroup` 幂等复用（本任务关联优先 → 项目群回落）/
+  新建（记本任务本地），死绑定走内联“重新建群”
+- 手动绑定：粘贴群 ID（`oc_` 开头，支持粘整段文本自动提取，一次只认一个），
+  `bindExistingRequirementGroup` 校验目标群（群存在 → 本人在群 → 经 `persist`
+  存本任务 → 清群反查缓存）。覆盖写有二次确认 + 旧群收不到本任务消息的 warning；
+  机器人不在目标群走 `bot_not_in_group` 内联引导（复制机器人名 + 加完重试）；
+  本人在不在查不出时标 `membershipUnknown` 照常绑，不阻断。
+- 取消关联：清掉本任务自带关联，回落读项目群默认（`DELETE requirement-group/bind`）。
 - 群 ID 获取示意写死在输入框下方：在飞书里打开目标群 → 点群头像进群设置 →
   右下角“复制群 ID”。
 
-接口：`GET requirement-group` 只读当前绑定（绝不建群）；
-`POST requirement-group/bind` 做手动换绑。分享/播报/回流全读 `group_type`，
-换绑后自动跟新群走，旧群 @ 回“没关联”。
+接口：`GET requirement-group` 只读当前关联（绝不建群）；
+`POST requirement-group` 建/取（新建经 `persistLocalGroup` 记本任务，顺带回最新 task）；
+`POST requirement-group/bind` 做手动关联（回最新 task）；
+`DELETE requirement-group/bind` 取消关联。`getBoundGroupChatId` 本任务优先、
+项目群回落——播报、回流、agent 提示词全自动跟新关联走，旧群 @ 回“没关联”。
 
-`recreateFrom` 在**两处**被认，少一处重建就白做：
-
-1. 复用快路径对它视而不见（否则原地又复用了那条死绑定）
-2. bind 前的并发收敛不把它当「别人抢先建好的群」（否则收敛回死绑定、白建一个群）
-
-只对「**当前仍是这一条**绑定」生效：期间已被换成别的群 → 当普通复用、照常校验，不重建。
-真有别人抢先 bind 了**另一个**群 → 并发收敛照旧生效。
+`recreateFrom` 只对「**当前仍是这一条**关联」生效：复用快路径对它视而不见
+（否则原地又复用了那条死绑定）；期间已被换成别的群 → 当普通复用、照常校验，不重建。
 重建**没有 agent 入口**——`recreateFrom` 只由用户在 UI 引导里确认后回传。
+（旧版还有“bind 前并发收敛”第二处，已随“不写工作项”删除：没有共享写就没有什么可收敛的。）
 
-## 幂等 / 并发策略
+## 幂等策略（无并发收敛：关联只记本任务本地）
 
-1. 读 `group_type` → 已有 `group_id`（auto/bind）→ **过一道死绑定校验**（显式分享才跑，
-   见上）→ 直接返回，`created=false`
-2. 无群 → bot `POST /im/v1/chats`（群名 `<需求名>需求群`、`user_id_list` = 发起人 +
-   注册表命中的角色成员、`bot_id_list` = 命中者的 bot；一个都没命中就只有发起人）
-3. **bind 前再读一次**
-   - 若已被别人 bind → 用别人的 `group_id`，本机新建群记 `console.warn`，`created=false`
-   - 否则 `workitem update` bind 本机群，`created=true`
+1. 本任务自带关联 → **过一道死绑定校验**（显式分享才跑，见上）→ 直接返回，`created=false`
+2. 无本地关联 → 读 `group_type`（只读回落）→ 有 `group_id`（auto/bind）→ 同上校验 →
+   直接返回，`created=false`、`source: "project"`
+3. 都没有 → bot `POST /im/v1/chats`（群名 `<需求名>需求群`、`user_id_list` = 发起人 +
+   注册表命中的角色成员、`bot_id_list` = 命中者的 bot；一个都没命中就只有发起人）→
+   经 `persistLocalGroup` 记本任务本地，`created=true`
 4. 分享时直接发卡（无任何事前 bot 检测）；发送失败按飞书错误码判定——
    230002（bot 不在群）一族命中即返回 `bot_not_in_group`（带 `botLabel`），
    码集合与报文关键词兜底见 `feishu-group.isBotNotInGroupSendError`
@@ -897,11 +900,11 @@ runActionPostCheck（后台、独立 check 租约）
 
 ## 铁律：播报不建群
 
-`shareToRequirementGroup` 内部是 `ensureRequirementGroup`——没群会**建群 + bind 工作项**。
-那是「用户显式点分享」才该有的副作用；自动播报是后台行为，不能因为跑完一个 action
-就替用户开一个群、还把 `group_type` 写进工作项（全组都看得见）。
+`shareToRequirementGroup` 内部是 `ensureRequirementGroup`——没群会**建群记本任务本地**
+（工作项碰都不碰）。那是「用户显式点分享」才该有的副作用；自动播报是后台行为，
+不能因为跑完一个 action 就替用户开一个群。
 
-所以播报路径先过 `getBoundGroupChatId`（**只读 `group_type`、不建群**）：没绑群直接
+所以播报路径先过 `getBoundGroupChatId`（**只读、不建群**）：没关联群直接
 `skipped_no_group`，连 info 事件都不写（没群不是异常，只是这个需求还没人开始群协作）。
 建群的口子只留给显式分享（API / MCP `share_to_group` / UI 分享按钮）。
 
@@ -974,8 +977,9 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 全部 mock 外部调用（**禁止真建群 / 真发消息 / 真起 agent**）。
 
 - `tests/feishu-group.test.ts`：幂等查群、**建群按注册表拉人拉 bot**（全命中 / 部分未命中
-  留痕 / 角色查询挂降级只拉发起人 / 没命中不塞空 `bot_id_list`）、进群协作即触发自动注册、
-  并发双建收敛、群名回落、**发卡失败按错误码判 bot 不在群**（230002 一族命中带准确
+  留痕 / 角色查询挂降级只拉发起人 / 没命中不塞空 `bot_id_list`）、新建群经 persist 记本地
+  （落盘失败直接抛、漏传 persist 走到建群抛内部错误）、建后下一次直接复用本地、
+  进群协作即触发自动注册、群名回落、**发卡失败按错误码判 bot 不在群**（230002 一族命中带准确
   `botLabel`、无关错误照旧 lark_error）、**bot 名三级降级**（bot/v3/info → 应用名 → app_id）；
   **内容形态**：artifact 卡片不含正文 / 先卡片后文件（文件名 + 全文不截断）/
   **md 文件发失败只降级 warn、整体仍成功** / 选中段（message）只发卡不发文件 /
@@ -984,8 +988,13 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
   照常发且回执带真实群名 / 查不出来 → `membershipUnknown` + 照常发 + 留痕 /
   不开 `verifyOwnerMembership` 时探针一次都不调 / 群解散 → `group_unreachable` /
   读群名失败是缺 scope 或网络抖时**不判死**）；
-  **重建**（`recreateFrom` 跳过复用 + bind 覆盖 + 二次读到老绑定不收敛回去 + 不再问一遍 /
-  绑定已被换群时不重建走正常校验 / 真有别人抢先 bind 仍收敛）。
+  **重建**（`recreateFrom` 跳过失效关联 + 建新群记本地 + 不再问一遍 /
+  关联已被换成别的群时不重建、走正常校验复用）。
+- `tests/feishu-group-bind.test.ts`：`extractBindChatId`（多段直接错、不猜第一个）、
+  本地关联读写（`getTaskLocalGroup` 空值归一）、手动关联只写本任务（校验通过经 persist
+  落盘 + 工作项连读都不读 / 同群短路零调用 / 覆盖返回旧本地 id / 目标群非法-bot不在群-
+  本人不在群-鉴权失败一律不落盘 / persist 失败直接抛）、取消关联、`describe` 本地优先 +
+  项目群回落 + 各 fail-open 分支。
   ⚠️ 新增「分享 artifact」的用例必须桩掉 `sendDoc`——默认实现会真落临时盘 + 起 lark-cli
 - `tests/feishu-bridge-lark-api.test.ts`：**瞬时失败重试**（幂等 GET 重试后成功 /
   传输错误只落 stderr 也认得出 / **写操作撞 EOF 一次都不重试** / 写操作挂在取 token

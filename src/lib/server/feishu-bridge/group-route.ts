@@ -457,13 +457,22 @@ export const resolveTaskIdByGroupChat = async (
   const missAt = cache.misses.get(chatId);
   if (missAt && now - missAt < NEGATIVE_TTL_MS) return null;
 
-  let candidates: Array<{ id: string; feishuStoryUrl?: string }> = [];
+  // 候选要带上本任务群关联字段：getBoundGroupChatId 本任务优先，没有它本地关联的群永远扫不到
+  let candidates: Array<{
+    id: string;
+    feishuStoryUrl?: string;
+    feishuGroupChatId?: string;
+    feishuGroupChatName?: string;
+  }> = [];
   try {
     const all = await deps.listTasks();
     candidates = all
       .filter(
         (t) =>
-          (t.feishuStoryUrl ?? "").trim().length > 0 &&
+          // 有链接或有本任务群关联即可（口径与 getBound/describe 对齐：
+          // 本地关联不需要工作项，只剩链接一条会漏掉“绑了群但没链接”的任务）
+          ((t.feishuStoryUrl ?? "").trim().length > 0 ||
+            (t.feishuGroupChatId ?? "").trim().length > 0) &&
           t.repoStatus !== "merged" &&
           t.repoStatus !== "abandoned" &&
           // 归档任务退出群回流：侧栏都藏了群里还回话心智对不上；且归档会 bump

@@ -2128,6 +2128,36 @@ const snapshotWorktreeTaskLike = (meta: TaskMetaV06): WorktreeTaskLike => ({
  * 锁外跑 git 拆/挪（remove/move 各 60s），阶段 2 CAS `repoPaths` 仍是 old 再写仓列表。
  * git 失败不写仓；CAS 失败 409（worktree 可能已跟上 aborted 的 next，下次 ensure + prune 兜）。
  */
+/**
+ * 写本任务关联的飞书群（任务本地关联，项目群碰都不碰）。
+ *
+ * - 传 `{ chatId, chatName? }` = 关联到这个群（自动创建/手动绑定/重建都走这里落盘）。
+ * - 传 `null` = 取消关联，回落读项目群默认。
+ * - 锁内 read-modify-write + 刷 `updatedAt`（群回流按 updatedAt 倒序扫任务，刚绑的优先）。
+ *   刷时间是刻意的：跟 `updateTaskFields` 改标题/链接同口径——用户刚动手就算已读，
+ *   详情页 `markTaskSeen` 会清侧栏琥珀点、列表按最近排序会顶上来，都是“刚操作过”的正常表现。
+ * - 返回 hydrate 后的最新 Task（调用方直接拿去刷 UI，不用再读一次）。
+ */
+export const setTaskGroupAssociation = async (
+  id: string,
+  assoc: { chatId: string; chatName?: string } | null,
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    if (assoc) {
+      meta.feishuGroupChatId = assoc.chatId;
+      if (assoc.chatName?.trim()) meta.feishuGroupChatName = assoc.chatName.trim();
+      else delete meta.feishuGroupChatName;
+    } else {
+      delete meta.feishuGroupChatId;
+      delete meta.feishuGroupChatName;
+    }
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return hydrateTask(meta);
+  });
+
 export const updateTaskFields = async (
   id: string,
   input: UpdateTaskFieldsInput,

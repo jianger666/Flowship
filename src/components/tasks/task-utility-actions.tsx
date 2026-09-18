@@ -22,9 +22,11 @@ const BTN_CLS = "h-6 shrink-0 gap-1 px-1.5 text-xs text-muted-foreground hover:t
 
 interface Props {
   task: Task;
+  /** 群关联变更后把最新任务刷回页面 */
+  onTaskUpdate?: (task: Task) => void;
 }
 
-export const TaskUtilityActions = ({ task }: Props) => {
+export const TaskUtilityActions = ({ task, onTaskUpdate }: Props) => {
   const [openingTaskDir, setOpeningTaskDir] = useState(false);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   // 需求任务才显示「需求群」（日常轻量任务无飞书工作项）
@@ -75,6 +77,7 @@ export const TaskUtilityActions = ({ task }: Props) => {
           open={groupDialogOpen}
           onOpenChange={setGroupDialogOpen}
           taskId={task.id}
+          onTaskUpdate={onTaskUpdate ?? (() => {})}
         />
       )}
       {taskDirPath && (

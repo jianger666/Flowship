@@ -80,18 +80,16 @@ const baseTask = (over: Partial<Task> = {}): Task =>
   }) as Task;
 
 describe("ensureRequirementGroup", () => {
-  it("幂等查群：已有 bind group_id → 直接返回 created=false", async () => {
+  it("幂等查群：项目群 bind group_id → 直接返回（只读不写）", async () => {
     const fetchGroupType = vi.fn().mockResolvedValue({
       value: "bind",
       groupId: "oc_exist",
     });
     const createChat = vi.fn();
-    const bindGroup = vi.fn();
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       fetchGroupType,
       createChat,
-      bindGroup,
       decodeUrl: async () => ({
         workItemId: "10001",
         simpleName: "space",
@@ -99,28 +97,22 @@ describe("ensureRequirementGroup", () => {
     });
 
     const r = await ensureRequirementGroup(baseTask());
-    expect(r).toEqual({ chatId: "oc_exist", created: false });
+    expect(r).toEqual({ chatId: "oc_exist", created: false, source: "project" });
     expect(createChat).not.toHaveBeenCalled();
-    expect(bindGroup).not.toHaveBeenCalled();
   });
 
   it("注册表没人命中：建群只拉发起人本人、不带 bot_id_list", async () => {
     const warnings: string[] = [];
-    const fetchGroupType = vi
-      .fn()
-      .mockResolvedValueOnce({ value: "disabled" })
-      .mockResolvedValueOnce({ value: "disabled" })
-      // 第三次 = bind 后回读（meegle 写失败不报错，只能靠回读发现）
-      .mockResolvedValueOnce({ value: "bind", groupId: "oc_mine" });
+    // 新语义只读工作项一次（无 bind、无回读）；多余的 once 值留着无害
+    const fetchGroupType = vi.fn().mockResolvedValueOnce({ value: "disabled" });
     const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_mine" });
-    const bindGroup = vi.fn().mockResolvedValue(undefined);
+    const persistLocalGroup = vi.fn().mockResolvedValue(undefined);
     const fetchWorkitemName = vi.fn().mockResolvedValue("登录优化");
 
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       fetchGroupType,
       createChat,
-      bindGroup,
       fetchWorkitemName,
       warn: (m) => warnings.push(m),
       getBotInfo: async () => ({
@@ -134,10 +126,11 @@ describe("ensureRequirementGroup", () => {
       }),
     });
 
-    const r = await ensureRequirementGroup(baseTask());
+    const r = await ensureRequirementGroup(baseTask(), { persistLocalGroup });
     expect(r).toEqual({
       chatId: "oc_mine",
       created: true,
+      source: "task",
       // 新建群的名字是本机拼的 → 回执直接带上，不用再查一次
       chatName: "登录优化需求群",
     });
@@ -146,8 +139,8 @@ describe("ensureRequirementGroup", () => {
       name: "登录优化需求群",
       userIdList: ["ou_me"],
     });
-    expect(bindGroup).toHaveBeenCalledWith("10001", "space", "oc_mine");
-    // 回读对上了就不该有告警
+    // 新群只记本任务本地，工作项碰都不碰
+    expect(persistLocalGroup).toHaveBeenCalledWith("oc_mine", "登录优化需求群");
     expect(warnings).toEqual([]);
   });
 
@@ -171,20 +164,17 @@ describe("ensureRequirementGroup", () => {
           // pm 没配 bot、无法确认 open_id 所属应用 → 跳过本人
           "pm@x.com": { openId: "ou_pm", botAppId: "", updatedAt: 1 },
         }),
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "bind", groupId: "oc_team" }),
+      fetchGroupType: vi.fn().mockResolvedValueOnce({ value: "disabled" }),
       createChat,
-      bindGroup: async () => undefined,
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
       warn: (m) => warnings.push(m),
     });
 
-    await ensureRequirementGroup(baseTask());
+    await ensureRequirementGroup(baseTask(), {
+      persistLocalGroup: async () => undefined,
+    });
     expect(fetchRoleMemberEmails).toHaveBeenCalledWith("10001", "space");
     expect(createChat).toHaveBeenCalledWith({
       name: "登录优化需求群",
@@ -200,6 +190,7 @@ describe("ensureRequirementGroup", () => {
     const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_part" });
     const warnings: string[] = [];
 
+    const persistLocalGroup = vi.fn().mockResolvedValue(undefined);
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       fetchRoleMemberEmails: async () => ["dev@x.com", "stranger@x.com"],
@@ -207,20 +198,15 @@ describe("ensureRequirementGroup", () => {
         registryOf({
           "dev@x.com": { openId: "ou_dev", botAppId: "cli_dev", updatedAt: 1 },
         }),
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "bind", groupId: "oc_part" }),
+      fetchGroupType: vi.fn().mockResolvedValueOnce({ value: "disabled" }),
       createChat,
-      bindGroup: async () => undefined,
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
       warn: (m) => warnings.push(m),
     });
 
-    const r = await ensureRequirementGroup(baseTask());
+    const r = await ensureRequirementGroup(baseTask(), { persistLocalGroup });
     expect(r.created).toBe(true);
     expect(createChat).toHaveBeenCalledWith({
       name: "登录优化需求群",
@@ -241,23 +227,21 @@ describe("ensureRequirementGroup", () => {
       fetchRoleMemberEmails: async () => {
         throw new Error("meegle CLI 未安装");
       },
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "bind", groupId: "oc_degraded" }),
+      fetchGroupType: vi.fn().mockResolvedValueOnce({ value: "disabled" }),
       createChat,
-      bindGroup: async () => undefined,
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
       warn: (m) => warnings.push(m),
     });
 
-    const r = await ensureRequirementGroup(baseTask());
+    const r = await ensureRequirementGroup(baseTask(), {
+      persistLocalGroup: async () => undefined,
+    });
     expect(r).toEqual({
       chatId: "oc_degraded",
       created: true,
+      source: "task",
       chatName: "登录优化需求群",
     });
     expect(createChat).toHaveBeenCalledWith({
@@ -280,64 +264,42 @@ describe("ensureRequirementGroup", () => {
     expect(scheduleSelfRegister).toHaveBeenCalled();
   });
 
-  // meegle workitem update 对写失败一声不吭（2026-07-27 实测：畸形 group_id 也返回
-  // `{"mcp_result":""}`）→ 不回读的话每次分享都会再建一个进不去的孤儿群
-  it("bind 静默没写进去：回读发现后告警、但不挡本次分享", async () => {
-    const warnings: string[] = [];
+  // 新群只记本任务本地：persist 落盘失败 = 没关联上，必须抛、不吞。
+  // 吞了用户会看到「分享成功」→ 下次又建一个 → 攒的全是没人进得去的孤儿群。
+  it("persist 落盘失败：直接抛错（不吞、不谎报成功）", async () => {
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" }),
+      fetchGroupType: vi.fn().mockResolvedValueOnce({ value: "disabled" }),
       createChat: async () => ({ chat_id: "oc_mine" }),
-      bindGroup: async () => undefined,
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
-      warn: (m) => warnings.push(m),
     });
 
-    const r = await ensureRequirementGroup(baseTask());
-    expect(r).toEqual({
-      chatId: "oc_mine",
-      created: true,
-      chatName: "登录优化需求群",
-    });
-    expect(warnings.some((w) => w.includes("bind 回读未生效"))).toBe(true);
+    await expect(
+      ensureRequirementGroup(baseTask(), {
+        persistLocalGroup: async () => {
+          throw new Error("meta.json 写盘失败");
+        },
+      }),
+    ).rejects.toThrow("meta.json 写盘失败");
   });
 
-  // bind 抛错时若把异常冒上去：用户看到「分享失败」→ 重试 → 又建一个群 → 攒孤儿群
-  it("bind 抛错：群已建好就照常返回（吞错 + 告警，绝不丢已建的群）", async () => {
-    const warnings: string[] = [];
-    const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_mine" });
+  // 调用方漏传 persist 又走到建群 = bug：抛内部错误，别把没存住的群当成功返回
+  it("没传 persist 走到建群 → 抛内部错误（防孤儿群）", async () => {
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" }),
-      createChat,
-      bindGroup: async () => {
-        throw new Error("meegle 超时");
-      },
+      fetchGroupType: async () => ({ value: "disabled" }),
+      createChat: async () => ({ chat_id: "oc_mine" }),
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
-      warn: (m) => warnings.push(m),
     });
 
-    const r = await ensureRequirementGroup(baseTask());
-    expect(r).toEqual({
-      chatId: "oc_mine",
-      created: true,
-      chatName: "登录优化需求群",
+    await expect(ensureRequirementGroup(baseTask())).rejects.toMatchObject({
+      name: "FeishuGroupError",
+      code: "lark_error",
     });
-    // 后果讲清楚：下次分享读不到绑定会再建一个
-    expect(
-      warnings.some((w) => w.includes("bind 失败") && w.includes("再建一个群")),
-    ).toBe(true);
   });
 
   // 自动播报的准入闸第二半：预筛之后、真建群之前群可能已被解绑（TOCTOU）
@@ -368,27 +330,19 @@ describe("ensureRequirementGroup", () => {
 
     expect(
       await ensureRequirementGroup(baseTask(), { allowCreate: false }),
-    ).toEqual({ chatId: "oc_exist", created: false });
+    ).toEqual({ chatId: "oc_exist", created: false, source: "project" });
     expect(createChat).not.toHaveBeenCalled();
   });
 
-  it("并发双建收敛：bind 前发现别人已 bind → 用别人的群", async () => {
-    const warnings: string[] = [];
-    const fetchGroupType = vi
-      .fn()
-      .mockResolvedValueOnce({ value: "disabled" })
-      .mockResolvedValueOnce({
-        value: "bind",
-        groupId: "oc_theirs",
-      });
-    const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_orphan" });
-    const bindGroup = vi.fn();
-
+  // 新语义没有共享写：关联只记本任务本地，不存在“别人抢先 bind 要收敛”的情况。
+  // 建的新群记本地后，下一次直接复用本地，连工作项都不再读。
+  it("新建群记本地后：下一次直接复用本地关联", async () => {
+    const fetchGroupType = vi.fn().mockResolvedValueOnce({ value: "disabled" });
+    const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_mine" });
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       fetchGroupType,
       createChat,
-      bindGroup,
       fetchWorkitemName: async () => "需求A",
       getBotInfo: async () => ({
         appId: "cli_self",
@@ -398,25 +352,35 @@ describe("ensureRequirementGroup", () => {
         workItemId: "10001",
         simpleName: "space",
       }),
-      warn: (m) => warnings.push(m),
     });
 
-    const r = await ensureRequirementGroup(baseTask());
-    expect(r).toEqual({ chatId: "oc_theirs", created: false });
-    expect(bindGroup).not.toHaveBeenCalled();
-    expect(warnings.some((w) => w.includes("oc_orphan"))).toBe(true);
+    const t = baseTask();
+    const first = await ensureRequirementGroup(t, {
+      persistLocalGroup: async (chatId, chatName) => {
+        t.feishuGroupChatId = chatId;
+        if (chatName) t.feishuGroupChatName = chatName;
+      },
+    });
+    expect(first).toMatchObject({ chatId: "oc_mine", created: true, source: "task" });
+
+    const second = await ensureRequirementGroup(t);
+    expect(second).toMatchObject({
+      chatId: "oc_mine",
+      created: false,
+      source: "task",
+      chatName: "需求A需求群",
+    });
+    // 第二次连工作项都没读（一次创建 + 一次本地复用 = 总共只读一次）
+    expect(fetchGroupType).toHaveBeenCalledTimes(1);
+    expect(createChat).toHaveBeenCalledTimes(1);
   });
 
   it("拿不到发起人 open_id → 人也不带、照样建群（不因此挡住分享）", async () => {
     const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_solo" });
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" }),
+      fetchGroupType: vi.fn().mockResolvedValueOnce({ value: "disabled" }),
       createChat,
-      bindGroup: vi.fn().mockResolvedValue(undefined),
       fetchWorkitemName: async () => "Solo",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "" }),
       decodeUrl: async () => ({
@@ -425,7 +389,9 @@ describe("ensureRequirementGroup", () => {
       }),
     });
 
-    const r = await ensureRequirementGroup(baseTask());
+    const r = await ensureRequirementGroup(baseTask(), {
+      persistLocalGroup: async () => undefined,
+    });
     expect(r.created).toBe(true);
     expect(createChat).toHaveBeenCalledWith({
       name: "Solo需求群",
@@ -437,12 +403,8 @@ describe("ensureRequirementGroup", () => {
     const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_t" });
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" }),
+      fetchGroupType: vi.fn().mockResolvedValueOnce({ value: "disabled" }),
       createChat,
-      bindGroup: vi.fn().mockResolvedValue(undefined),
       fetchWorkitemName: async () => undefined,
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({
@@ -451,7 +413,9 @@ describe("ensureRequirementGroup", () => {
       }),
     });
 
-    await ensureRequirementGroup(baseTask());
+    await ensureRequirementGroup(baseTask(), {
+      persistLocalGroup: async () => undefined,
+    });
     expect(createChat).toHaveBeenCalledWith({
       name: "登录优化需求群",
       userIdList: ["ou_me"],
@@ -596,23 +560,17 @@ describe("死绑定检测（本人已不在需求群）", () => {
 
 // 用户现在完全卡死：死绑定会让每次分享都静默发进他看不见的群，必须有重建出口
 describe("重建需求群（recreateFrom）", () => {
-  it("确认重建 → 跳过复用、建新群、bind 覆盖；二次读到的老绑定不把它收敛回去", async () => {
+  it("确认重建 → 跳过本任务失效关联、建新群记本地（工作项碰都不碰）", async () => {
     const warnings: string[] = [];
-    // 三次读 group_type：入口 / bind 前防并发 / bind 后回读——全都还是那条死绑定
-    const fetchGroupType = vi
-      .fn()
-      .mockResolvedValueOnce({ value: "bind", groupId: "oc_dead" })
-      .mockResolvedValueOnce({ value: "bind", groupId: "oc_dead" })
-      .mockResolvedValueOnce({ value: "bind", groupId: "oc_fresh" });
+    const fetchGroupType = vi.fn();
     const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_fresh" });
-    const bindGroup = vi.fn().mockResolvedValue(undefined);
+    const persistLocalGroup = vi.fn().mockResolvedValue(undefined);
     const probeSelfInChat = vi.fn();
 
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       fetchGroupType,
       createChat,
-      bindGroup,
       probeSelfInChat,
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
@@ -620,17 +578,22 @@ describe("重建需求群（recreateFrom）", () => {
       warn: (m) => warnings.push(m),
     });
 
-    const r = await ensureRequirementGroup(baseTask(), {
-      verifyOwnerMembership: true,
-      recreateFrom: "oc_dead",
-    });
+    const r = await ensureRequirementGroup(
+      baseTask({ feishuGroupChatId: "oc_dead" }),
+      {
+        verifyOwnerMembership: true,
+        recreateFrom: "oc_dead",
+        persistLocalGroup,
+      },
+    );
 
     expect(r).toEqual({
       chatId: "oc_fresh",
       created: true,
+      source: "task",
       chatName: "登录优化需求群",
     });
-    expect(bindGroup).toHaveBeenCalledWith("10001", "space", "oc_fresh");
+    expect(persistLocalGroup).toHaveBeenCalledWith("oc_fresh", "登录优化需求群");
     // 用户已经确认过了，别再问一遍「你在不在那个群」
     expect(probeSelfInChat).not.toHaveBeenCalled();
     expect(warnings.some((w) => w.includes("按用户确认重建"))).toBe(true);
@@ -657,35 +620,37 @@ describe("重建需求群（recreateFrom）", () => {
     expect(r).toEqual({
       chatId: "oc_other",
       created: false,
+      source: "project",
       chatName: "新需求群",
     });
     expect(createChat).not.toHaveBeenCalled();
     expect(probeSelfInChat).toHaveBeenCalledWith("oc_other");
   });
 
-  // 重建过程中真有别人抢先建好并 bind 了另一个群 → 那条并发收敛照旧生效
-  it("重建期间别人抢先 bind 了另一个群 → 仍收敛到别人的群", async () => {
-    const fetchGroupType = vi
-      .fn()
-      .mockResolvedValueOnce({ value: "bind", groupId: "oc_dead" })
-      .mockResolvedValueOnce({ value: "bind", groupId: "oc_theirs" });
-    const bindGroup = vi.fn();
+  // 本任务关联失效 + 项目群也没有可用绑定 → 建新群记本地；工作项只读一次确认回落路径
+  it("重建：本任务失效且项目群无绑定 → 建新群记本地", async () => {
+    const fetchGroupType = vi.fn().mockResolvedValueOnce({ value: "disabled" });
+    const persistLocalGroup = vi.fn().mockResolvedValue(undefined);
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       fetchGroupType,
-      createChat: async () => ({ chat_id: "oc_orphan" }),
-      bindGroup,
+      createChat: async () => ({ chat_id: "oc_fresh" }),
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
     });
 
-    const r = await ensureRequirementGroup(baseTask(), {
-      verifyOwnerMembership: true,
-      recreateFrom: "oc_dead",
-    });
-    expect(r).toEqual({ chatId: "oc_theirs", created: false });
-    expect(bindGroup).not.toHaveBeenCalled();
+    const r = await ensureRequirementGroup(
+      baseTask({ feishuGroupChatId: "oc_dead" }),
+      {
+        verifyOwnerMembership: true,
+        recreateFrom: "oc_dead",
+        persistLocalGroup,
+      },
+    );
+    expect(r).toMatchObject({ chatId: "oc_fresh", created: true, source: "task" });
+    expect(persistLocalGroup).toHaveBeenCalledWith("oc_fresh", "登录优化需求群");
+    expect(fetchGroupType).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -845,12 +810,8 @@ describe("bot 不在群判定 / shareToRequirementGroup", () => {
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       sendDoc: stubDoc(),
-      fetchGroupType: vi
-        .fn()
-        .mockResolvedValueOnce({ value: "disabled" })
-        .mockResolvedValueOnce({ value: "disabled" }),
+      fetchGroupType: vi.fn().mockResolvedValueOnce({ value: "disabled" }),
       createChat: async () => ({ chat_id: "oc_new" }),
-      bindGroup: async () => undefined,
       fetchWorkitemName: async () => "需求B",
       getBotInfo: async () => ({
         appId: "cli_self",
@@ -865,16 +826,21 @@ describe("bot 不在群判定 / shareToRequirementGroup", () => {
       resolveSenderName: async () => "测试用户",
     });
 
-    const r = await shareToRequirementGroup(baseTask(), {
-      kind: "artifact",
-      title: "方案",
-      content: "正文内容",
-      links: [{ label: "MR", url: "https://example.com/mr/1" }],
-    });
+    const r = await shareToRequirementGroup(
+      baseTask(),
+      {
+        kind: "artifact",
+        title: "方案",
+        content: "正文内容",
+        links: [{ label: "MR", url: "https://example.com/mr/1" }],
+      },
+      { persistLocalGroup: async () => undefined },
+    );
     expect(r).toEqual({
       chatId: "oc_new",
       messageId: "om_1",
       created: true,
+      source: "task",
       // 回执带群名：前端 toast 说清「发到哪个群了」
       chatName: "需求B需求群",
       // artifact 分享同时发了正文 md 文件
@@ -935,6 +901,7 @@ describe("整份产物：卡片 + md 文件两条消息", () => {
       chatId: "oc_exist",
       messageId: "om_card",
       created: false,
+      source: "project",
       docMessageId: "om_doc",
     });
     expect(sendDoc).toHaveBeenCalledWith(
@@ -992,6 +959,7 @@ describe("整份产物：卡片 + md 文件两条消息", () => {
       chatId: "oc_exist",
       messageId: "om_card",
       created: false,
+      source: "project",
     });
     expect(r.docMessageId).toBeUndefined();
     expect(warnings.some((w) => w.includes("完整产物发送失败"))).toBe(true);
