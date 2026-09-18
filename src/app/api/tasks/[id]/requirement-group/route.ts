@@ -1,14 +1,16 @@
 /**
- * POST /api/tasks/[id]/requirement-group
+ * /api/tasks/[id]/requirement-group
  *
- * 只建/取需求群（不发卡片）：ensureRequirementGroup → 回 { chatId, chatName?, created }。
- * 前端「需求群」按钮用：成功后用 applink 打开飞书客户端。
+ * GET：只读当前绑定（绝不建群）→ { ok: true, bound: null | { chatId, chatName?,
+ *   ownerStillIn?, membershipUnknown?, unreachable? } }。需求群设置弹窗的“当前绑定”卡用。
+ * POST：只建/取需求群（不发卡片）：ensureRequirementGroup → 回 { chatId, chatName?, created }。
  *
  * Body: { recreateFrom? } —— 与 share-to-group 同款死绑定重建口令。
  */
 
 import { getTask } from "@/lib/server/task-fs";
 import {
+  describeBoundRequirementGroup,
   ensureRequirementGroup,
   FeishuGroupError,
 } from "@/lib/server/feishu-group";
@@ -24,20 +26,30 @@ interface PostBody {
   recreateFrom?: string;
 }
 
-/** 前端有引导的「预期内失败」→ 409，不当异常刷日志 */
-const GUIDED_CODES = new Set<FeishuGroupError["code"]>([
+/**
+ * POST 的预期内失败 → 409（`ensure` 复用已绑定群时真会抛这两码，前端弹重建引导）。
+ * GET 不走这套：`describeBound` 只读状态、死绑定以状态对象返回（`unreachable` /
+ * `ownerStillIn: false`），从不抛这两码——GET 的错误只有 no_story / 鉴权 / 权限 / 502。
+ */
+const POST_GUIDED_CODES = new Set<FeishuGroupError["code"]>([
   "owner_not_in_group",
   "group_unreachable",
 ]);
+/** GET 没有 409 引导：死绑定以状态对象返回，错误只剩通码映射 */
+const GET_GUIDED_CODES: ReadonlySet<FeishuGroupError["code"]> = new Set();
 
-const groupErrorResponse = (taskId: string, err: FeishuGroupError): Response => {
-  if (!GUIDED_CODES.has(err.code)) {
+const groupErrorResponse = (
+  taskId: string,
+  err: FeishuGroupError,
+  guided: ReadonlySet<FeishuGroupError["code"]> = POST_GUIDED_CODES,
+): Response => {
+  if (!guided.has(err.code)) {
     console.error(
       `[requirement-group] task=${taskId} code=${err.code}:`,
       err.message,
     );
   }
-  const httpStatus = GUIDED_CODES.has(err.code)
+  const httpStatus = guided.has(err.code)
     ? 409
     : err.code === "no_story" || err.code === "invalid_input"
       ? 400
@@ -55,6 +67,24 @@ const groupErrorResponse = (taskId: string, err: FeishuGroupError): Response => 
     }),
     { status: httpStatus, headers: { "Content-Type": "application/json" } },
   );
+};
+
+export const GET = async (_req: Request, { params }: Ctx) => {
+  const { id } = await params;
+  const task = await getTask(id);
+  if (!task) return errorResponse("not_found", 404);
+  try {
+    const bound = await describeBoundRequirementGroup(task);
+    return new Response(JSON.stringify({ ok: true, bound }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    if (err instanceof FeishuGroupError)
+      return groupErrorResponse(id, err, GET_GUIDED_CODES);
+    console.error(`[requirement-group] task=${id} 读绑定失败:`, err);
+    return errorResponse(err instanceof Error ? err.message : String(err), 500);
+  }
 };
 
 export const POST = async (req: Request, { params }: Ctx) => {

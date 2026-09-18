@@ -47,7 +47,7 @@ export const ErrorCard = ({
   const [detailOpen, setDetailOpen] = useState(false);
   // 重试飞行中：按钮 spinner + 禁用，防连点发两条
   const [retrying, setRetrying] = useState(false);
-  // 重试能力由 ChatView 通过 Context 注入；log 形态（task 详情页）没有 Provider = 不显示
+  // 重试能力由上层通过 Context 注入（chat 是 ChatView、task 是详情页）；没有 Provider = 不显示
   const streamActions = useStreamActions();
 
   const detail =

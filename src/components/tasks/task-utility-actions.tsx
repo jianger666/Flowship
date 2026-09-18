@@ -13,7 +13,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
-import { useRequirementGroup } from "@/hooks/use-requirement-group";
+import { RequirementGroupDialog } from "@/components/tasks/requirement-group-dialog";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import type { Task } from "@/lib/types";
 
@@ -26,8 +26,7 @@ interface Props {
 
 export const TaskUtilityActions = ({ task }: Props) => {
   const [openingTaskDir, setOpeningTaskDir] = useState(false);
-  const [ensuringGroup, setEnsuringGroup] = useState(false);
-  const { runEnsureGroup } = useRequirementGroup();
+  const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   // 需求任务才显示「需求群」（日常轻量任务无飞书工作项）
   const showRequirementGroup = !isLightweightDailyTask(task);
   const taskDirPath = task.taskDirPath?.trim() ?? "";
@@ -59,28 +58,24 @@ export const TaskUtilityActions = ({ task }: Props) => {
   return (
     <>
       {showRequirementGroup && (
-        <Tooltip content="创建或加入需求群">
+        <Tooltip content="需求群设置（自动创建 / 绑定已有群）">
           <Button
             variant="ghost"
             size="sm"
             className={BTN_CLS}
-            disabled={ensuringGroup}
-            onClick={() => {
-              if (ensuringGroup) return;
-              setEnsuringGroup(true);
-              void runEnsureGroup(task.id).finally(() =>
-                setEnsuringGroup(false),
-              );
-            }}
+            onClick={() => setGroupDialogOpen(true)}
           >
-            {ensuringGroup ? (
-              <Loader2 className="size-3 animate-spin" />
-            ) : (
-              <Users className="size-3" />
-            )}
+            <Users className="size-3" />
             需求群
           </Button>
         </Tooltip>
+      )}
+      {showRequirementGroup && (
+        <RequirementGroupDialog
+          open={groupDialogOpen}
+          onOpenChange={setGroupDialogOpen}
+          taskId={task.id}
+        />
       )}
       {taskDirPath && (
         <Tooltip content="在文件管理器打开任务文件夹">

@@ -7,7 +7,7 @@
  * （只有那里握着 ledger / 提交锁 / prepareRunArgs）。逐层往下传 prop 要动 event-stream
  * 的 props 与 itemContent——沿用 ComposerSessionProvider 同款做法：Context 注入。
  *
- * 无 Provider（如 task 详情页的 log 形态）时能力自动关闭、按钮不渲染。
+ * 无 Provider 时能力自动关闭、按钮不渲染（task 详情页、chat 页各自在上层注入）。
  */
 
 import { createContext, useContext, type ReactNode } from "react";

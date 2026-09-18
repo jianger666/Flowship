@@ -305,6 +305,23 @@ meegle workitem update --work-item-id <id> --project-key <key> \
      → ensureRequirementGroup 跳过复用 → 建群 + bind 覆盖
 ```
 
+### 手动换绑（绑定已有群）
+
+任务头「需求群」点开是设置弹窗（`RequirementGroupDialog`）：顶部当前绑定卡
+（群名 + 群 ID 可复制 + 正常/不在群/已失效/未确认四态），下面双模式二选一。
+
+- 自动创建：原来的 `ensureRequirementGroup` 幂等复用/新建，死绑定走内联“重新建群”
+- 手动绑定：粘贴群 ID（`oc_` 开头，支持粘整段文本自动提取），`bindExistingRequirementGroup`
+  校验目标群（群存在 → 本人在群 → `bind` 覆盖 → 清群反查缓存）后再写。覆盖写有二次确认
+  + 旧群失效 warning；机器人不在目标群走 `bot_not_in_group` 内联引导（复制机器人名 +
+  加完重试）；本人在不在查不出时标 `membershipUnknown` 照常绑，不阻断。
+- 群 ID 获取示意写死在输入框下方：在飞书里打开目标群 → 点群头像进群设置 →
+  右下角“复制群 ID”。
+
+接口：`GET requirement-group` 只读当前绑定（绝不建群）；
+`POST requirement-group/bind` 做手动换绑。分享/播报/回流全读 `group_type`，
+换绑后自动跟新群走，旧群 @ 回“没关联”。
+
 `recreateFrom` 在**两处**被认，少一处重建就白做：
 
 1. 复用快路径对它视而不见（否则原地又复用了那条死绑定）

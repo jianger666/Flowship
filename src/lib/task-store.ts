@@ -1608,3 +1608,141 @@ export const ensureRequirementGroup = async (
     membershipUnknown: ok.membershipUnknown === true,
   };
 };
+
+/** 当前绑定的只读快照（需求群设置弹窗“当前绑定”卡用；无绑定 bound 为 null） */
+export interface RequirementGroupStatus {
+  bound: null | {
+    chatId: string;
+    chatName?: string;
+    ownerStillIn?: boolean;
+    membershipUnknown?: boolean;
+    unreachable?: boolean;
+  };
+}
+
+/**
+ * 只读当前绑定（绝不建群）。业务失败不抛（未关联工作项也当错误返，由弹窗展示）；
+ * HTTP / 解析失败抛 ApiRequestError。
+ */
+export const getRequirementGroupStatus = async (
+  taskId: string,
+): Promise<
+  | { ok: true; bound: RequirementGroupStatus["bound"] }
+  | { ok: false; error: string; code?: string }
+> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/requirement-group`,
+    { method: "GET" },
+  );
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ApiRequestError(`HTTP ${res.status}`, res.status);
+  }
+  if (!res.ok) {
+    const err =
+      typeof data === "object" && data !== null && "error" in data
+        ? (data as { error?: unknown; code?: unknown })
+        : {};
+    const msg =
+      typeof err.error === "string" && err.error.trim()
+        ? err.error.trim()
+        : `读取绑定失败（HTTP ${res.status}）`;
+    return {
+      ok: false,
+      error: msg,
+      ...(typeof err.code === "string" ? { code: err.code } : {}),
+    };
+  }
+  const ok = data as { ok?: unknown; bound?: unknown };
+  if (ok.ok !== true) throw new ApiRequestError("需求群响应异常", res.status || 500);
+  const b = (ok.bound ?? null) as RequirementGroupStatus["bound"];
+  return { ok: true, bound: b };
+};
+
+/** 手动换绑结果：成功带新绑定；失败带 code 供弹窗内联引导 */
+export type BindRequirementGroupResult =
+  | {
+      ok: true;
+      chatId: string;
+      chatName?: string;
+      overwritten: boolean;
+      previousChatId?: string;
+      membershipUnknown?: boolean;
+    }
+  | {
+      ok: false;
+      error: string;
+      code?: string;
+      botLabel?: string;
+      chatId?: string;
+      chatName?: string;
+    };
+
+/**
+ * 手动换绑到已有群。业务失败不抛（弹窗按 code 内联展示）；
+ * HTTP / 解析失败抛 ApiRequestError。
+ */
+export const bindRequirementGroup = async (
+  taskId: string,
+  chatId: string,
+): Promise<BindRequirementGroupResult> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/requirement-group/bind`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chatId }),
+    },
+  );
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ApiRequestError(`HTTP ${res.status}`, res.status);
+  }
+  if (!res.ok) {
+    const err =
+      typeof data === "object" && data !== null && "error" in data
+        ? (data as {
+            error?: unknown;
+            code?: unknown;
+            botLabel?: unknown;
+            chatId?: unknown;
+            chatName?: unknown;
+          })
+        : {};
+    const msg =
+      typeof err.error === "string" && err.error.trim()
+        ? err.error.trim()
+        : `换绑失败（HTTP ${res.status}）`;
+    return {
+      ok: false,
+      error: msg,
+      ...(typeof err.code === "string" ? { code: err.code } : {}),
+      ...(typeof err.botLabel === "string" ? { botLabel: err.botLabel } : {}),
+      ...(typeof err.chatId === "string" ? { chatId: err.chatId } : {}),
+      ...(typeof err.chatName === "string" ? { chatName: err.chatName } : {}),
+    };
+  }
+  const ok = data as {
+    ok?: unknown;
+    chatId?: unknown;
+    chatName?: unknown;
+    overwritten?: unknown;
+    previousChatId?: unknown;
+    membershipUnknown?: unknown;
+  };
+  if (ok.ok !== true || typeof ok.chatId !== "string") {
+    throw new ApiRequestError("需求群响应异常", res.status || 500);
+  }
+  return {
+    ok: true,
+    chatId: ok.chatId,
+    ...(typeof ok.chatName === "string" ? { chatName: ok.chatName } : {}),
+    overwritten: ok.overwritten === true,
+    ...(typeof ok.previousChatId === "string" ? { previousChatId: ok.previousChatId } : {}),
+    ...(ok.membershipUnknown === true ? { membershipUnknown: true as const } : {}),
+  };
+};

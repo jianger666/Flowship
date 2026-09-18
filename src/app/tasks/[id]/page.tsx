@@ -47,6 +47,11 @@ import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
 import { useSmoothStreaming } from "@/components/tasks/use-smooth-streaming";
 import { EventStream } from "@/components/tasks/event-stream";
+import { StreamActionsProvider } from "@/components/tasks/event-stream/stream-actions";
+import {
+  buildResendPayload,
+  findLastUserReply,
+} from "@/components/tasks/event-stream/resend-payload";
 import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
@@ -85,13 +90,17 @@ import {
 import {
   fetchTask,
   finalizeTask,
+  getPendingQuestionSend,
   mergeTaskEvents,
   reopenTask,
   setActionExcluded,
   setTaskUiLayout,
   stopTask,
+  submitTaskQuestion,
   type ImagePayload,
 } from "@/lib/task-store";
+import { resolveSessionModel, talkForceModel } from "@/lib/task-model";
+import { loadTalkOverride } from "@/lib/talk-model-override";
 import {
   canCommitTaskSnapshot,
   commitTaskDeleted,
@@ -462,6 +471,51 @@ const TaskDetailPage = () => {
     if (typeof v === "number" && v >= 10 && v <= 90) return v;
     return 70;
   }, [task?.uiLayout?.artifactPanelSize]);
+
+  // 事件流行内动作（错误卡「重试」）：与 chat 的 ChatView 同语义——把最后一条用户消息
+  // 原样再发（图 / 路径附件 / skill 引用一起带回），走任务统一消息通道 submitTaskQuestion。
+  // task 详情页之前没包 StreamActionsProvider，所以错误卡的重试按钮从不渲染；
+  // 能力住在这里（手里有 task + absorbTask），靠 Context 注入给深层的错误卡。
+  // 模型跟说话条对齐：手动覆盖（粘住）优先，否则跟会话模型一致时不传 forceModel。
+  // （hooks 必须在早返回前，所以放这里；task 为 null 时 value 里空转即可）
+  const taskRetryActions = useMemo(
+    () => ({
+      onRetryLastMessage: async () => {
+        if (!task) return;
+        if (task.repoStatus === "merged" || task.repoStatus === "abandoned") {
+          toast.error("任务已终态，不能再发送");
+          return;
+        }
+        const last = findLastUserReply(task.events);
+        if (!last) return;
+        if (getPendingQuestionSend(task.id)) {
+          toast.error("上一条消息还在发送中、稍等它发完再发");
+          return;
+        }
+        try {
+          const payload = await buildResendPayload(task.id, last);
+          if (payload.imagesPartial) toast.warning("部分附图未能重发");
+          const session = resolveSessionModel(task);
+          const picked = loadTalkOverride(task.id) ?? session ?? { id: "" };
+          const result = await submitTaskQuestion(
+            task,
+            payload.text,
+            payload.images,
+            talkForceModel(picked, session),
+            payload.attachments,
+            payload.skillRefs,
+          );
+          if (result.persistWarning) {
+            toast.error(`消息已送达但记录保存失败：${result.persistWarning}`);
+          }
+          absorbTask(result.task);
+        } catch (err) {
+          toast.error(err instanceof Error ? err.message : String(err));
+        }
+      },
+    }),
+    [task, absorbTask],
+  );
 
   // V0.5.10：debounce 写 task.uiLayout
   const writeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1055,6 +1109,9 @@ const TaskDetailPage = () => {
                   的确定高度容器、否则总高超 100%、事件流滚不到底（V0.11.9 加输入条时踩过） */}
               <div className="min-h-0 flex-1">
                 {/* hideReplyComposer=true：任务模式回复走底部 TaskTalkComposer、不用 EventStream 内置输入框 */}
+                {/* StreamActionsProvider：错误卡「重试」的能力注入（与 chat 的 ChatView 同款），
+                    没有它 task 的错误卡不显示重试 */}
+                <StreamActionsProvider value={taskRetryActions}>
                 <EventStream
                   task={task}
                   streamingText={streamingText}
@@ -1067,6 +1124,7 @@ const TaskDetailPage = () => {
                   onTaskUpdate={absorbTask}
                   onGroupQaVisibleChange={setGroupQaVisible}
                 />
+                </StreamActionsProvider>
               </div>
               {/* 疑似卡住提示：挂在输入条上方，chat / task 共用 SuspectStuckHint */}
               <SuspectStuckHint

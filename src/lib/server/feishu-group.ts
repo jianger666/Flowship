@@ -819,6 +819,216 @@ const warnIfBindDidNotStick = async (
 };
 
 /**
+ * 手动换绑：从用户粘贴的任意文本里提取 `oc_` 开头的群 ID。
+ *
+ * 用户是从飞书群设置里复制的，粘过来的可能是纯 `oc_xxx`、也可能是带前后空格 /
+ * “群ID：oc_xxx” / 整条群分享链接。命中恰好 1 个才认；0 个或 ≥2 个都抛
+ * `invalid_input`（前端据此做输入框内联报错，不进全局 toast）——粘了
+ * “从 oc_A 换到 oc_B”这种话术不猜第一个，一猜就可能绑错群。
+ *
+ * ⚠️ 正则与前端 `requirement-group-dialog.tsx` 里的 `CHAT_ID_PATTERN` 是同一份拷贝
+ * （client 不能 import server 模块，只能复制）：字符集 = `oc_` 后跟字母数字
+ * （飞书 chat_id 实测形状，暂未见下划线/连字符）；两边改动时必须同步，否则
+ * 前端回显的“将绑定”与服务端实际绑的会不一致。
+ */
+export const extractBindChatId = (raw: unknown): string => {
+  const text = typeof raw === "string" ? raw : "";
+  const hits = text.match(/oc_[A-Za-z0-9]+/g) ?? [];
+  if (hits.length > 1) {
+    throw new FeishuGroupError(
+      "invalid_input",
+      "检测到多个群 ID，一次只贴目标群的一段",
+    );
+  }
+  const hit = hits[0];
+  if (!hit) {
+    throw new FeishuGroupError(
+      "invalid_input",
+      "没找到 oc_ 开头的群 ID，请检查是否复制完整（群设置右下角“复制群 ID”）",
+    );
+  }
+  return hit;
+};
+
+export interface BindExistingGroupResult extends EnsureGroupResult {
+  /** 本次是否覆盖了旧绑定（无旧绑定 / 同群重复绑为 false） */
+  overwritten: boolean;
+  /** 被覆盖掉的旧群 id（overwritten 为 true 时一定有） */
+  previousChatId?: string;
+}
+
+export interface BoundGroupStatus {
+  chatId: string;
+  chatName?: string;
+  /** 本人还在当前绑定的群里（fail-open 查不出时为 undefined） */
+  ownerStillIn?: boolean;
+  /** 本人在不在群没查出来——展示“未确认”态，不阻断换绑 */
+  membershipUnknown?: boolean;
+  /** 绑定指向的群已不在（解散 / chat_id 失效） */
+  unreachable?: boolean;
+}
+
+/**
+ * 只读描述当前绑定（绝不建群、不 bind）——需求群设置弹窗的“当前绑定”卡用。
+ *
+ * 与 getBoundGroupChatId 的分工：那个是回流热路径的轻量 id 查询（失败返 null）；
+ * 这个是用户主动打开设置时的一次性富查询（群名 + 本人在不在群），失败 fail-open
+ * 尽量返回（群名读不到就不带，本人在不在查不出就标 membershipUnknown）。
+ * 无绑定返回 null；未关联工作项时抛 `no_story`（前端据此展示“未关联工作项”态）。
+ */
+export const describeBoundRequirementGroup = async (
+  task: Pick<Task, "feishuStoryUrl">,
+): Promise<BoundGroupStatus | null> => {
+  getDeps().scheduleSelfRegister();
+  const story = await resolveTaskStory(task);
+  let existing: WorkitemGroupType | null;
+  try {
+    existing = await getDeps().fetchGroupType(story.workItemId, story.projectKey);
+  } catch (err) {
+    throw await mapExternalError(err);
+  }
+  const id = existing?.groupId?.trim();
+  if (!id || (existing?.value !== "auto" && existing?.value !== "bind")) {
+    return null;
+  }
+  let chatName: string | undefined;
+  try {
+    chatName = (await getDeps().fetchChatInfo(id)).name?.trim() || undefined;
+  } catch (err) {
+    if (isChatGoneError(err)) {
+      return { chatId: id, unreachable: true };
+    }
+    getDeps().warn(`读当前绑定群信息失败 chat=${id}：${errText(err)}`);
+  }
+  const named = chatName ? { chatName } : {};
+  try {
+    const inside = await getDeps().probeSelfInChat(id);
+    return { chatId: id, ...named, ownerStillIn: inside };
+  } catch (err) {
+    getDeps().warn(`没查出本人还在不在当前绑定群 chat=${id}：${errText(err)}`);
+    return { chatId: id, ...named, membershipUnknown: true };
+  }
+};
+
+/**
+ * 手动换绑到一个**已有的群**：同群短路 → 校验目标群 → `bind` 覆盖工作项 → 清群反查缓存。
+ *
+ * 0. 同群重复绑直接返回（`overwritten: false`，零飞书调用、不写 meegle）——
+ *    放最前：重复绑连目标群校验都不该跑，否则机器人不在群时会误报 `bot_not_in_group`，
+ *    明明什么都不用做。代价是这条返回不带群名（省一次读群调用），前端 toast 用群 ID 展示。
+ * 1. `fetchChatInfo`（bot 身份）：群不存在/已解散 → `invalid_input`；bot 不在群 →
+ *    `bot_not_in_group`（带准确 bot 名，前端引导先加机器人再绑）；其它失败走通用映射。
+ *    ⚠️ `bot_not_in_group` 的码表（230002 一族）是按**发消息失败**实测的，读群信息接口
+ *    机器人不在群时是否同码**尚未真机验证**——若实测码不同，真机上会走到 502 通用错误
+ *    而不是 409 引导。验证后把真实 code 补到 `BOT_NOT_IN_GROUP_LARK_CODES` 并更新此处注释。
+ * 2. `probeSelfInChat`（user 身份）：本人不在目标群 → `owner_not_in_group` 直接拦
+ *   （否则一绑就是新的死绑定）；鉴权/权限失败（user 未登录、缺 scope）→ 按
+ *    `lark_not_authed` / `lark_permission` 直接抛（换绑是用户主动操作，拦一下是对的，
+ *    与分享链路 `inspectBoundGroup` 的“宁可漏检”不同）；只有网络抖动等未知错误才
+ *    标 `membershipUnknown` 照常绑。
+ *
+ * bind 写失败**必须抛**（与 ensure 不同：这里没有“已建好的群”要保，写不进去就是没换成，
+ * 吞错只会让用户以为换好了）。写完回读校验 + 清群反查缓存（新旧映射一起作废）。
+ */
+export const bindExistingRequirementGroup = async (
+  task: Task,
+  rawChatId: unknown,
+): Promise<BindExistingGroupResult> => {
+  getDeps().scheduleSelfRegister();
+  try {
+    const story = await resolveTaskStory(task);
+    const chatId = extractBindChatId(rawChatId);
+    const existing = await getDeps().fetchGroupType(story.workItemId, story.projectKey);
+    const existingId =
+      existing?.value === "auto" || existing?.value === "bind"
+        ? (existing?.groupId?.trim() || undefined)
+        : undefined;
+
+    // 同群重复绑：零副作用短路（见头注释 0）
+    if (existingId === chatId) {
+      return { chatId, created: false, overwritten: false };
+    }
+
+    let chatName: string | undefined;
+    try {
+      chatName = (await getDeps().fetchChatInfo(chatId)).name?.trim() || undefined;
+    } catch (err) {
+      if (isChatGoneError(err)) {
+        throw new FeishuGroupError(
+          "invalid_input",
+          "这个群不存在或已解散，请检查群 ID 是否复制完整",
+          { chatId },
+        );
+      }
+      if (isBotNotInGroupSendError(err)) {
+        const botLabel = await resolveBotDisplayLabel();
+        throw new FeishuGroupError(
+          "bot_not_in_group",
+          `你的机器人「${botLabel}」还不在这个群里，先在群设置里把它加进群再绑定`,
+          { botLabel, chatId },
+        );
+      }
+      throw await mapExternalError(err);
+    }
+    const named = chatName ? { chatName } : {};
+
+    let membershipUnknown = false;
+    try {
+      if (!(await getDeps().probeSelfInChat(chatId))) {
+        throw new FeishuGroupError(
+          "owner_not_in_group",
+          chatName
+            ? `你还不在「${chatName}」里，先加入这个群再绑定`
+            : "你还不在这个群里，先加入这个群再绑定",
+          { chatId, ...named },
+        );
+      }
+    } catch (err) {
+      if (err instanceof FeishuGroupError) throw err;
+      // 鉴权/权限失败直接抛（401/403 引导补登录/补权限），不吞成“照常绑”：
+      // user 身份没登录、缺 scope 时绑过去就是新的死绑定，用户主动操作拦一下是对的。
+      // 口径与 `mapExternalError` 对齐：permission 看结构化字段，未登录看报错措辞
+      // （与 `NOT_AUTHED_MESSAGE` 同步，改一处同步另一处）。网络抖动等未知错误才 fail-open。
+      if (err instanceof LarkApiError && (err.permissionViolations || err.consoleUrl)) {
+        throw await mapExternalError(err);
+      }
+      if (
+        err instanceof LarkApiError &&
+        /not logged|auth login|unauthorized|identity missing|no local token|未登录/i.test(
+          err.message ?? "",
+        )
+      ) {
+        throw await mapExternalError(err);
+      }
+      getDeps().warn(`没查出本人在不在目标群、本次照常绑 chat=${chatId}：${errText(err)}`);
+      membershipUnknown = true;
+    }
+    const unknown = membershipUnknown ? { membershipUnknown: true as const } : {};
+
+    await getDeps().bindGroup(story.workItemId, story.projectKey, chatId);
+    await warnIfBindDidNotStick(story, chatId);
+    // 换绑前后旧映射必须作废：失败要留痕（否则“旧群还能 @ 回任务”一段时间，极难排查）
+    await import("@/lib/server/feishu-bridge/group-route")
+      .then((m) => m.invalidateGroupChatCache())
+      .catch((cacheErr) => {
+        getDeps().warn(
+          `换绑后清群反查缓存失败（旧群 @ 可能一段时间内仍指向本任务）chat=${chatId}：${errText(cacheErr)}`,
+        );
+      });
+    return {
+      chatId,
+      created: false,
+      overwritten: !!existingId,
+      ...(existingId ? { previousChatId: existingId } : {}),
+      ...named,
+      ...unknown,
+    };
+  } catch (err) {
+    throw await mapExternalError(err);
+  }
+};
+
+/**
  * **只读**取工作项已绑定的需求群 id（绝不建群）。
  *
  * 与 ensureRequirementGroup 的分工：ensure 是「分享时保证有群」（可能建群 + bind、
