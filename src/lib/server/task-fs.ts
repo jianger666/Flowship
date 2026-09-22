@@ -78,6 +78,7 @@ import {
 } from "./task-worktrees";
 import { sameRepoPathList } from "@/lib/path-utils";
 import { reapTaskOrphans } from "./kill-orphans";
+import { maybeFireMidRunRotation, rotationUsageOf } from "./session-rotate";
 import { maybeGcSdkStore } from "./sdk-store-gc";
 import {
   cleanupCheckpointRefsForTask,
@@ -1862,8 +1863,8 @@ export const setTaskUiLayout = async (
 export const recordTurnUsage = async (
   taskId: string,
   turn: TurnTokenUsage,
-): Promise<Task | null> =>
-  withTaskLock(taskId, async () => {
+): Promise<Task | null> => {
+  const task = await withTaskLock(taskId, async () => {
     // meta 损坏时 readMetaV06 会抛——埋点场景一律降级成「不记账」
     const meta = await readMetaV06(taskId).catch(() => null);
     if (!meta) return null;
@@ -1896,6 +1897,11 @@ export const recordTurnUsage = async (
     await writeMeta(meta);
     return assembleTask(meta, []);
   });
+  // run 内水位探针（2026-09-22 自动压缩续接）：记账即查水位、锁外触发（cancel 不进任务锁）。
+  // 未登记触发器（chat / run 空窗）= no-op，注册表见 session-rotate。
+  if (task) maybeFireMidRunRotation(taskId, rotationUsageOf(task));
+  return task;
+};
 
 /**
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）

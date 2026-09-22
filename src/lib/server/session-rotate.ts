@@ -57,3 +57,50 @@ export const rotationUsageOf = (
   sessionInputTokens: task.sessionInputTokens,
   totalInputTokens: task.tokenUsage?.total.inputTokens,
 });
+
+// ---------------- run 内水位触发器（2026-09-22 自动压缩续接） ----------------
+//
+// 边界轮换只在 action / send 边界查水位，一个 action 内部连跑上百个工具调用照样
+// 会把会话滚爆（同事实测单 run 增量 278 万后 OOM）。这里补 run 内的探针：
+//   - 消费点：task-fs.recordTurnUsage（记账即查、chat/task 共用入口）
+//   - 触发回调：task-runner 的 consumeSessionRun 在 run.wait 前登记（拿到 run 才能 cancel）
+//   - chat 不登记（懒重启已兜底）、无登记 = no-op
+// 判定复用 shouldRotateSession 双条件（水位 + 堆过半、防过矫语义与边界轮换一致）。
+
+export type MidRunRotationTrigger = () => void;
+
+const midRunRotationTriggers = new Map<string, MidRunRotationTrigger>();
+
+export const registerMidRunRotationTrigger = (
+  taskId: string,
+  fn: MidRunRotationTrigger,
+): void => {
+  midRunRotationTriggers.set(taskId, fn);
+};
+
+/** 注销按 identity——并发 / 递归 consume 交错时不误摘后继登记的那条 */
+export const unregisterMidRunRotationTrigger = (
+  taskId: string,
+  fn: MidRunRotationTrigger,
+): void => {
+  if (midRunRotationTriggers.get(taskId) === fn) {
+    midRunRotationTriggers.delete(taskId);
+  }
+};
+
+/**
+ * 记账点调用：水位到了就触发（无登记 = no-op）。绝不 throw（埋点场景不许反伤记账）。
+ * heapRatio 可注入（单测锁行为），缺省读实时堆。
+ */
+export const maybeFireMidRunRotation = (
+  taskId: string,
+  usage: RotationUsageLike,
+  heapRatio: number = heapPressure().ratio,
+): void => {
+  try {
+    if (!shouldRotateSession(usage, heapRatio)) return;
+    midRunRotationTriggers.get(taskId)?.();
+  } catch {
+    /* 触发失败不挡记账 */
+  }
+};

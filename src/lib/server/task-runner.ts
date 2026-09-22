@@ -89,6 +89,7 @@ import {
 import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
 import { validateSubmitMr } from "./submit-mr-guard";
 import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
+import { shouldDisposeAfterAction } from "./mem-governance";
 import { assertNoUpdatePendingRestart } from "./update-pending";
 import { reapTaskOrphans } from "./kill-orphans";
 import { syncCompanyEnvFileFromSettings } from "./company-env-fs";
@@ -135,9 +136,11 @@ import { resolveSessionModel } from "@/lib/task-model";
 import { resolveWkWorktreeBranchInfos } from "./wk-source-branch";
 import { setTaskSessionAgentId } from "./task-fs";
 import {
+  registerMidRunRotationTrigger,
   rotationUsageOf,
   SESSION_ROTATION_INFO_TEXT,
   shouldRotateSession,
+  unregisterMidRunRotationTrigger,
 } from "./session-rotate";
 import { assertHeapOk, HeapPressureError } from "./sdk-store-gc";
 import {
@@ -509,7 +512,11 @@ export const closeTaskSession = (
 //
 // 每个未终结任务的 agent 子进程会随会话常驻；空闲超 TTL 自动 close（keepPersisted——
 // sessionAgentId 还在、用户下次操作 Agent.resume 无缝接回、体感无差）。
-const SESSION_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
+// mem-governance① [设计决策]：空闲 TTL 2h → 12min。2h 常驻 × N 会话是 OOM 乘法器的宿主侧一半；
+// 12min 内追问走热会话（零延迟），超期走 Agent.resume 从持久化 checkpoint 接回（1~2s）。
+// sweeper 每 10min 扫一次 → 空闲会话实际存活 12~22min（TTL + 扫描间隔），注释按区间写。
+// 不做 60~90s 宽限期（按体感后续再补）。宽限期内的内存上限仍有界，见开工清单。
+const SESSION_IDLE_TTL_MS = 12 * 60 * 1000;
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 const SESSION_SWEEPER_KEY = "__flowshipSessionSweeperV1__";
 {
@@ -4145,6 +4152,30 @@ const buildSubmitWorkFollowup = (last: {
     .filter(Boolean)
     .join("\n");
 
+// ---------------- 自动压缩续接（2026-09-22 最简版） ----------------
+//
+// 做法：run 内记账点（recordTurnUsage）探到水位 → 触发器回调 cancel 本 run →
+// settled 分支灰线 + 关旧会话 + 「输入条唤醒当前 action」同款接力（新 agent 原地续跑）。
+// 「压缩」= 扔掉旧会话缓存、真相源（events.jsonl / artifact 目录）指向给新 agent 按需
+// 回读——不调摘要模型，没有模型选型 / 产出校验 / 迭代合并一整串（LLM 摘要是后续增量）。
+//
+// 次数上限防「一转就超、无限转」风暴：同一 action 最多自动续接 3 次、超限不再触发
+// （维持旧行为）。Map 按 task/action 键累积、进程生命周期内无 delete 会随任务数增长，
+// 故设上限兜底（超限清最旧，见 fireMidRunRotation），不依赖“自然有界”。
+const MID_RUN_ROTATION_MAX = 3;
+const MID_RUN_ROTATION_MAP_MAX = 500;
+const midRunRotationCounts = new Map<string, number>();
+
+/** 自动压缩续接的接力消息：指向真相源、让新 agent 按需回读（代替 LLM 摘要） */
+const buildMidRunRotationRelayMessage = (task: Task): string =>
+  [
+    "（系统：上一轮执行因上下文过长已自动截断续接，这是正常压缩、不是错误，不必向用户说明。）",
+    "接着完成当前 Action、做完照常交卷。别重复已完成的工作、细节按需回读：",
+    `- 任务事件日志（完整历史）：${getEventsLogPath(task.id)}`,
+    `- 已交 artifact 目录（先看已有什么）：${getActionsDir(task.id)}`,
+    `- 工作目录：${getTaskCwd(task)}`,
+  ].join("\n");
+
 const consumeSessionRun = async (
   task: Task,
   agent: AgentInstance,
@@ -4162,6 +4193,8 @@ const consumeSessionRun = async (
   },
 ): Promise<void> => {
   let cancelled = false;
+  // run 内水位触发的自动压缩续接标记（fireMidRunRotation 置位、cancelled 分流消费）
+  let rotationRequested = false;
   // 24h 硬超时：跟用户点停止分开——停止走 stop-task 的中性「已失效」，超时要打 askExpired
   let hardTimedOut = false;
   let hardTimer: NodeJS.Timeout | null = null;
@@ -4204,7 +4237,9 @@ const consumeSessionRun = async (
    * abortStuck 会保留同一 session instance 给后继，expectedSessionInstanceId 仍匹配
    * → 误关共享 session。关会话只能由仍持有该 session 的当前 runner / 主动换主方执行。
    */
-  const closeMySession = (): void => {
+  const closeMySession = (opts?: { keepPersisted?: boolean }): void => {
+    // mem-governance① [设计决策]：keepPersisted=true = 堆上 SDK runtime 立即 dispose、
+    // 落盘 sessionAgentId 保留，下次操作 Agent.resume 接回。缺省 false = 连锚点一起清（真结束语义）。
     if (mySessionInstanceId === undefined) {
       try {
         agent.close();
@@ -4215,6 +4250,7 @@ const consumeSessionRun = async (
     }
     closeTaskSession(task.id, agent.agentId, {
       expectedSessionInstanceId: mySessionInstanceId,
+      keepPersisted: opts?.keepPersisted,
     });
   };
 
@@ -4387,8 +4423,57 @@ const consumeSessionRun = async (
       hardTimer = null;
     }
 
-    const result = await run.wait();
+    // 自动压缩续接：run.wait 期间登记水位触发器（记账点回调见 task-fs.recordTurnUsage）。
+    // questionRun 不登记（短问答、边界轮换已够）；注销按 identity、不误摘后继。
+    const fireMidRunRotation = (): void => {
+      if (rotationRequested) return; // 已触发过（多轮陆续超线）不重复计次
+      const key = opts.errorActionId ?? task.id;
+      // P2-2：Map 有界兜底——满 500 格时清最旧（key 按 task/action 累积，无 delete 会慢泄漏）
+      if (!midRunRotationCounts.has(key)) {
+        while (midRunRotationCounts.size >= MID_RUN_ROTATION_MAP_MAX) {
+          const oldest = midRunRotationCounts.keys().next().value;
+          if (oldest === undefined) break;
+          midRunRotationCounts.delete(oldest);
+        }
+      }
+      const used = midRunRotationCounts.get(key) ?? 0;
+      if (used >= MID_RUN_ROTATION_MAX) {
+        console.warn(
+          `[task-runner] task=${task.id} run 内轮换已达上限 ${MID_RUN_ROTATION_MAX}、不再自动续接`,
+        );
+        return;
+      }
+      midRunRotationCounts.set(key, used + 1);
+      rotationRequested = true;
+      console.log(
+        `[task-runner] task=${task.id} run 内水位超线、自动压缩续接（第 ${used + 1}/${MID_RUN_ROTATION_MAX} 次）`,
+      );
+      void run.cancel().catch(() => {
+        /* noop */
+      });
+    };
+    if (!opts.questionRun) {
+      registerMidRunRotationTrigger(task.id, fireMidRunRotation);
+    }
+    const result = await run.wait().finally(() => {
+      if (!opts.questionRun) {
+        unregisterMidRunRotationTrigger(task.id, fireMidRunRotation);
+      }
+    });
     await failpoint("consume.afterWait");
+    // P3-1：run 恰好自然完成瞬间触发 rotation → run.cancel() 是 noop，计数白扣一次，这里回退
+    // 脚注：显式排除 hardTimedOut（它恒置 cancelled=true，这里双保险；24h 超时恰逢触发的概率趋近于零）
+    if (
+      rotationRequested &&
+      !cancelled &&
+      !hardTimedOut &&
+      result.status !== "cancelled"
+    ) {
+      const key = opts.errorActionId ?? task.id;
+      const used = midRunRotationCounts.get(key) ?? 0;
+      if (used > 0) midRunRotationCounts.set(key, used - 1);
+      rotationRequested = false;
+    }
 
     if (cancelled || result.status === "cancelled") {
       // 5s 强清后 B 已接管——不得 finalize / 写 idle / 关 B 的会话
@@ -4408,6 +4493,45 @@ const consumeSessionRun = async (
           });
         }
         return;
+      }
+      // 自动压缩续接（2026-09-22）：run 内水位触发的 cancel 不落 cancelled 收尾——
+      // 灰线 + 关旧会话 + 「输入条唤醒当前 action」同款接力（新 agent 原地续跑、artifact 接力）。
+      // 用户停止 / 硬超时并发（cancelled / hardTimedOut）与换主（superseded）走正常收尾。
+      if (rotationRequested && !cancelled && !hardTimedOut) {
+        if (yieldIfSuperseded()) return;
+        if (lostStartOwner()) return;
+        // 凭据走服务端兜底（本路径没有 client bootArgs、同自动重连）；缺凭据落回普通 cancel 收尾
+        const creds = await readServerCreds(task);
+        if (isApiKeyFieldPresent(creds.apiKey) && creds.model) {
+          closeMySession();
+          await writeOwnedEventAndPublish(
+            task.id,
+            () => isTaskOpCurrent(opts.opHandle),
+            { kind: "info", text: SESSION_ROTATION_INFO_TEXT },
+          );
+          const freshMeta = (await getTaskMeta(task.id)) ?? task;
+          void resumeCurrentActionWithMessage({
+            task: freshMeta,
+            userMessage: buildMidRunRotationRelayMessage(freshMeta),
+            apiKey: creds.apiKey,
+            fallbackModel: creds.model,
+            gitToken: creds.gitToken,
+          }).catch(async (err) => {
+            console.error(
+              `[task-runner] task=${task.id} 自动压缩续接失败`,
+              err,
+            );
+            // eslint-disable-next-line no-restricted-syntax -- detached catch（fire-and-forget）：resume 的 claimTaskOp 已换主、opts.opHandle 的 lease 闭包必 no-op，只能裸写事件
+            await writeEventAndPublish(task.id, {
+              kind: "error",
+              text: "自动压缩续接失败、请在底部输入条说句话唤醒本阶段继续",
+            });
+          });
+          return;
+        }
+        console.warn(
+          `[task-runner] task=${task.id} 自动压缩续接缺凭据、按普通 cancel 收尾`,
+        );
       }
       // 问一问的 run 被停：只是不想听它说了——action / 会话都不动、runStatus 归回等待位
       // gen stale 或已非 owner 时勿 restore
@@ -4811,7 +4935,10 @@ const consumeSessionRun = async (
     }
 
     // 正常结束：交卷已入 check 管道（awaiting_ack / awaiting_user 由 check、notifier 落）、
-    // 或 ask 在等答案。会话保留、用户下一步操作 send 续接。
+    // 或 ask 在等答案。
+    // mem-governance① [设计决策]：action 已终态（completed / cancelled）且无 pending
+    // 追问/ask/check 在飞 → 堆上会话即用即还（keepPersisted=true，锚点保留、下次
+    // Agent.resume 接回）。有 pending 则保留热会话等答案。questionRun 不动。
     // 兜底：最后 action 已终态（completed / cancelled / error）而 runStatus 还挂 running → 归 idle
     // 共享状态写一律锁内 owner 条件写
     // 同 action 后继已 claim → 兜底写也让位（iOwnRunner 在接管早期分不出）
@@ -4854,6 +4981,20 @@ const consumeSessionRun = async (
       () => isTaskOpCurrent(opts.opHandle),
       { kind: "done", task: freshDone ?? task, ok: true },
     );
+    // mem-governance① [设计决策]：正常结束 + action 终态 + 无 pending → 即用即还。
+    // [待实验] dispose 三级（agent/executor/store）是否真释放由实验 A heap 快照判定；
+    // 若 store 级残留，这里只能释放 agent/executor，②仍必要。
+    // P1-1：判定收敛到 mem-governance.shouldDisposeAfterAction（单测锁定的契约），禁止内联复刻。
+    if (
+      shouldDisposeAfterAction({
+        lastActionStatus: lastAction?.status,
+        askPending,
+        checkInFlight,
+        questionRun: opts.questionRun ?? false,
+      })
+    ) {
+      closeMySession({ keepPersisted: true });
+    }
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
     if (opts.questionRun) {

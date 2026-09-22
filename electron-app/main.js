@@ -271,11 +271,45 @@ const startServer = () => {
   // 这里的 NODE_OPTIONS 只影响它，不污染用户 shell / agent 子进程（cap 只设上限、不预分配）。
   // 已有 max-old-space-size（用户手动调过）则不动，避免覆盖手工值。
   // TODO：split(" ") 遇到带空格的引用路径会切碎；NODE_OPTIONS 里极少有这种值，先不处理。
+  // mem-governance③ [设计决策]：恒带堆上限 + 崩溃取证。漏带旧路径实测 2.5GB 即崩。
+  // ③只抬天花板、不改变增长曲线形状；取证 report 含 transcript 级数据，落盘到数据目录并只留最近 5 份。
+  // P3-2：report-directory 落地 + 启动时轮转（默认落 cwd、无界累积）。
   const serverNodeOptions = (process.env.NODE_OPTIONS ?? "")
     .split(" ")
     .filter(Boolean);
   if (!serverNodeOptions.some((o) => o.includes("max-old-space-size"))) {
     serverNodeOptions.push("--max-old-space-size=4096");
+  }
+  for (const flag of [
+    "--report-on-fatalerror",
+    "--report-uncaught-exception",
+  ]) {
+    if (!serverNodeOptions.includes(flag)) serverNodeOptions.push(flag);
+  }
+  // P3-2：report 落盘目录指到数据目录 + 只留最近 5 份（best-effort，失败不挡启动）
+  const nodeReportDir = path.join(
+    app.getPath("userData"),
+    "data",
+    "diagnostics",
+    "node-reports",
+  );
+  try {
+    mkdirSync(nodeReportDir, { recursive: true });
+    const keepReports = 5;
+    const allReports = readdirSync(nodeReportDir)
+      .filter((f) => f.endsWith(".json"))
+      .sort();
+    for (const victim of allReports.slice(
+      0,
+      Math.max(0, allReports.length - keepReports),
+    )) {
+      void fs.unlink(path.join(nodeReportDir, victim)).catch(() => {});
+    }
+  } catch {
+    /* 轮转失败不挡启动 */
+  }
+  if (!serverNodeOptions.some((o) => o.includes("report-directory"))) {
+    serverNodeOptions.push(`--report-directory=${nodeReportDir}`);
   }
   const proc = spawn(serverNodeBin(), [serverJs], {
     env: {

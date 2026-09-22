@@ -301,8 +301,9 @@ const closeChatSession = (
   return true;
 };
 
-// V0.11.1：chat 会话空闲回收（同 task-runner sweeper、TTL 2h、resume 兜恢复）
-const CHAT_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
+// mem-governance① [设计决策]：chat 空闲 TTL 2h → 12min（同 task-runner 口径）。
+// 超期走 Agent.resume 接回，体感为 1~2s 冷启动。
+const CHAT_IDLE_TTL_MS = 12 * 60 * 1000;
 const CHAT_SWEEPER_KEY = "__flowshipChatSweeperV1__";
 {
   const g = globalThis as unknown as Record<string, NodeJS.Timeout | undefined>;
