@@ -1162,6 +1162,7 @@ const resumeConsumersAfterInstall = async (): Promise<void> => {
   await syncBridgeRuntime();
 };
 
+// 注意：顶层注册——r35/r36/r37 的 kill-orphans mock 是稀疏的，加新顶层调用需同步更新那三处 mock
 registerBinaryUser(LARK_CLI_BINARY_USER, {
   suspend: suspendConsumersForInstall,
   resume: resumeConsumersAfterInstall,

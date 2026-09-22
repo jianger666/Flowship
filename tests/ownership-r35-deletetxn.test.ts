@@ -53,6 +53,9 @@ vi.mock("@/lib/server/skills-loader", () => ({
 }));
 vi.mock("@/lib/server/kill-orphans", () => ({
   reapTaskOrphans: vi.fn(),
+  // inbound.ts 顶层会调 registerBinaryUser（CLI 覆盖安装登记），mock 里必须有，否则 import 期就炸
+  registerBinaryUser: vi.fn(),
+  LARK_CLI_BINARY_USER: "lark-cli",
 }));
 vi.mock("@/lib/server/action-checks", () => ({
   runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
