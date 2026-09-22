@@ -18,6 +18,8 @@ import {
   registerManagedChild,
   unregisterManagedChild,
   stopAllManagedChildren,
+  registerBinaryUser,
+  LARK_CLI_BINARY_USER,
 } from "@/lib/server/kill-orphans";
 
 import {
@@ -969,15 +971,21 @@ const syncKeepAwake = async (bridgeOn: boolean): Promise<void> => {
   else rt.keepAwake.stop();
 };
 
+/** 安装 hold：suspend 后 resume 前为 true，30s 轮询见此直接返回（防中途重拉锁住 exe） */
+let upgradeHoldForInstall = false;
+
 /**
  * 读开关：开 → 确保 consumers + keep-awake；关 → 全停。
  * 幂等；dev 热重载靠 globalThis 单例不双跑。
+ * 升级 hold 期间（安装链 suspend 后、resume 前）直接返回——防 30s 轮询中途重拉
+ * 把正要覆盖的 exe 重新锁住（Windows 在跑的 exe 盖不掉，见 feishu-cli 安装链）。
  */
 export const syncBridgeRuntime = async (): Promise<void> => {
   const rt = getRuntime();
   if (rt.syncing) return;
   rt.syncing = true;
   try {
+    if (upgradeHoldForInstall) return;
     ensureExitHook();
     const enabled = await isFeishuChatBridgeEnabled();
     await syncKeepAwake(enabled);
@@ -1120,9 +1128,41 @@ export const ensureBridgeRuntimePolling = (): void => {
 
 /** 单测重置 runtime（不停 keep-awake 外部） */
 export const __resetBridgeRuntimeForTest = async (): Promise<void> => {
+  upgradeHoldForInstall = false;
   await stopBridgeRuntime();
   const rt = getRuntime();
   rt.consumers.clear();
   rt.lastOverallError = undefined;
   rt.syncing = false;
 };
+
+// ----------------- 二进制占用登记（Windows 覆盖安装用） -----------------
+
+/** 安装前：优雅停掉全部 consumer（stopConsumer 不触发重启），并 hold 住轮询；
+ * 返回已停 eventKey（供安装日志）。失败时先复位 hold 再抛——否则 30s 轮询
+ * 永久直接返回、桥接直到重启都是死的（P0 教训）。 */
+const suspendConsumersForInstall = async (): Promise<string[]> => {
+  upgradeHoldForInstall = true;
+  try {
+    const stopped: string[] = [];
+    for (const spec of CONSUMER_SPECS) {
+      await stopConsumer(ensureHandle(spec));
+      stopped.push(spec.eventKey);
+    }
+    return stopped;
+  } catch (err) {
+    upgradeHoldForInstall = false;
+    throw err;
+  }
+};
+
+/** 安装后：放开 hold 并重拉（新二进制生效；失败抛给 resumeBinaryUsers 兜） */
+const resumeConsumersAfterInstall = async (): Promise<void> => {
+  upgradeHoldForInstall = false;
+  await syncBridgeRuntime();
+};
+
+registerBinaryUser(LARK_CLI_BINARY_USER, {
+  suspend: suspendConsumersForInstall,
+  resume: resumeConsumersAfterInstall,
+});

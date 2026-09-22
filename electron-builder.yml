@@ -77,9 +77,9 @@ nsis:
   # 但 electron-updater 自更新仍走静默（/S）、升级体验不变。
   oneClick: false
   allowToChangeInstallationDirectory: true
-  # 差分更新（v1.9.13）：老用户自更新只下载变化块（几十 MB），不用每次全量下 112MB。
-  # 首装仍是全量；存量老客户端升上来第一次还是全量、之后才差分。
-  differentialPackage: true
+  # 差分更新已下线：静默链路稳定前只走全量包（~112MB），少一个失败变量；
+  # 全量 + 注册表原路径 + 失败可见恢复，比省几十 MB 流量重要。
+  # TODO(win-update)：静默零事故跑两个版本后评估重开。
   # 仍 per-user 装到用户目录、不强制管理员权限 / UAC
   perMachine: false
   deleteAppDataOnUninstall: false

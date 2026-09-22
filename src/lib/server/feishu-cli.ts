@@ -30,6 +30,12 @@ import { pipeline } from "node:stream/promises";
 
 import { dataRoot, renameWithRetry } from "./data-root";
 import { enqueueMeegle } from "./meegle-queue";
+import {
+  suspendBinaryUsers,
+  resumeBinaryUsers,
+  LARK_CLI_BINARY_USER,
+  MEEGLE_BINARY_USER,
+} from "./kill-orphans";
 
 const execFileAsync = promisify(execFile);
 
@@ -216,14 +222,68 @@ const fetchNpmLatestMeta = async (pkg: string): Promise<NpmLatestMeta> => {
 
 // 二进制原子就位（CR-05）：先拷到 bin 目录内的临时名、chmod 后 rename 到最终名
 // （同目录 rename 原子）——安装失败绝不把已装好的旧版本覆盖成半截。
-// Windows rename 覆盖在跑/被杀软扫描的 exe 会 EPERM/EBUSY——走 renameWithRetry 短退避重试
-const installBinaryAtomic = async (src: string, dest: string): Promise<void> => {
+// Windows 在跑的 exe 盖不掉（常驻 event consume / 孤儿 daemon 持有镜像）：
+// ① 安装链先优雅停占用方（suspendBinaryUsers）；② 这里 rename 仍 EPERM/EBUSY 时，
+// 按镜像名强制清一次再试（killImageOnLock）；③ 还不行就抛，旧版本不受损。
+/** Windows 文件锁错误（在跑/被扫描都会报这三个码之一） */
+const isFileLockError = (err: unknown): boolean => {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code === "EPERM" || code === "EACCES" || code === "EBUSY";
+};
+
+/** Windows 按镜像名强制结束（安装 fallback 用，best-effort、不抛） */
+const killImageBestEffort = async (image: string): Promise<void> => {
+  if (!isWin) return;
+  try {
+    await execFileAsync("taskkill", ["/F", "/IM", image]);
+  } catch {
+    // 不存在 / 杀不掉都忽略——rename 重试会给出最终结论
+  }
+  // 给句柄释放一点传播时间（taskkill 返回时文件锁未必已松开）
+  await new Promise((r) => setTimeout(r, 300));
+};
+
+/**
+ * Windows 覆盖安装编排：停占用 → 换二进制 → 重拉（P0：suspend 必须在 try 内，
+ * 停失败也走 finally resume 复位 hold，否则桥接被永久 hold 住直到重启）。
+ * @param win 是否 Windows 行为（默认当前平台；单测可注入）
+ */
+export const withBinarySuspended = async <T>(
+  binName: string,
+  fn: (stopped: string[]) => Promise<T>,
+  opts: { win?: boolean } = {},
+): Promise<T> => {
+  const win = opts.win ?? isWin;
+  let stopped: string[] = [];
+  try {
+    if (win) stopped = await suspendBinaryUsers(binName);
+    return await fn(stopped);
+  } finally {
+    if (win) await resumeBinaryUsers(binName);
+  }
+};
+
+const installBinaryAtomic = async (
+  src: string,
+  dest: string,
+  opts: { killImageOnLock?: string; onLockedFallback?: () => void } = {},
+): Promise<void> => {
   await fs.mkdir(path.dirname(dest), { recursive: true });
   const staged = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     await fs.copyFile(src, staged);
     if (!isWin) await fs.chmod(staged, 0o755);
-    await renameWithRetry(staged, dest);
+    try {
+      await renameWithRetry(staged, dest);
+    } catch (err) {
+      if (opts.killImageOnLock && isWin && isFileLockError(err)) {
+        opts.onLockedFallback?.();
+        await killImageBestEffort(opts.killImageOnLock);
+        await renameWithRetry(staged, dest);
+      } else {
+        throw err;
+      }
+    }
   } catch (err) {
     await fs.rm(staged, { force: true }).catch(() => {});
     throw err;
@@ -280,7 +340,17 @@ const installLarkCli = async (log: (line: string) => void): Promise<void> => {
     const found = await findFileRecursive(staging, binName);
     if (!found) throw new Error(`解包后找不到 ${binName}`);
     // staging + 同目录 rename 原子就位——失败不碰已装旧版
-    await installBinaryAtomic(found, larkCliBin());
+    // Windows：先优雅停常驻 consumer（不断桥、只停占用），装完重拉新二进制；
+    // 非 win 原子替换在跑进程无碍，保持零打扰。
+    await withBinarySuspended(LARK_CLI_BINARY_USER, async (stopped) => {
+      await installBinaryAtomic(found, larkCliBin(), {
+        killImageOnLock: "lark-cli.exe",
+        onLockedFallback: () =>
+          log(
+            `旧版本进程仍在占用（已停 ${stopped.join(",") || "无"}），按镜像名强制清理后重试…`,
+          ),
+      });
+    });
     log(`lark-cli v${version} 安装完成`);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -324,7 +394,14 @@ const installMeegle = async (log: (line: string) => void): Promise<void> => {
     } catch {
       throw new Error(`meegle 包里没有当前平台二进制：${binName}`);
     }
-    await installBinaryAtomic(src, meegleBin());
+    // meegle 无常驻占用（短命令队列），挂起外壳现在是 no-op；
+    // 锁住时靠 killImageOnLock 兜底（与 lark-cli 同策略）。
+    await withBinarySuspended(MEEGLE_BINARY_USER, async () => {
+      await installBinaryAtomic(src, meegleBin(), {
+        killImageOnLock: "meegle.exe",
+        onLockedFallback: () => log("旧版本进程仍在占用，强制清理后重试…"),
+      });
+    });
     log(`meegle v${version} 安装完成`);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});

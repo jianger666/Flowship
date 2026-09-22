@@ -25,6 +25,16 @@
       ClearErrors
       WinShell::SetLnkAUMI "$newStartMenuLink" "${APP_ID}"
       System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
+      ; 新安装器标记：$appExe 存在才落 `.silent-update-ok`，主进程凭它才敢静默更新。
+      ; 半截安装（旧目录已清空、新文件没写全、$appExe 缺失）绝不落标记——
+      ; 否则下次门禁被半截目录骗过、直接静默往坏目录里装。
+      ClearErrors
+      FileOpen $0 "$INSTDIR\.silent-update-ok" w
+      ${IfNot} ${Errors}
+        FileWrite $0 "1"
+        FileClose $0
+      ${EndIf}
+      ClearErrors
     ${else}
       DetailPrint "skip shortcut rewrite: $appExe missing"
     ${endIf}
@@ -41,12 +51,9 @@
 ; 指向空路径（「找不到应用」）。electron-updater 固定传 --updated → ${isUpdated}。
 ; 更新路径仍要杀掉 Flowship.exe 本体（不带 /T），清掉隐形 server，避免文件被锁。
 !macro customInit
-  ; E 盘自定义路径含空格兜底（静默更新卸完装不上）：
-  ; electron-updater 传 `/D=E:\Foo Bar\Flowship` 时，Node 在含空格时会自动包一层双引号，
-  ; 而 electron-builder 的 GetDParameter 不去引号 → $INSTDIR 变成 `"E:\..."` → 安装失败，
-  ; 且此时旧目录已被 RMDir。主进程侧已优先用 8.3 短路径（见 win-install-dir.mjs），
-  ; 这里再剥掉 $INSTDIR 首尾引号 + 尾部分隔符，双保险。此时机在 initMultiUser 之后，
-  ; $INSTDIR 已是 注册表 InstallLocation / /D= 合并结果，改这里正好。
+  ; $INSTDIR 归一化（历史 E 盘含空格坑的残留防线）：主进程已不再传 /D=，
+  ; $INSTDIR 即注册表 InstallLocation 原样、一般不带引号；这里保留剥首尾引号 +
+  ; 尾部分隔符（此时机在 initMultiUser 之后，正好），防注册表值被第三方改出花样。
   StrCpy $0 $INSTDIR 1
   ${if} $0 == '"'
     StrCpy $INSTDIR $INSTDIR "" 1
@@ -79,8 +86,12 @@
     ${endIf}
   ${endIf}
 
+  ; 更新路径不杀任何进程：主进程 before-quit 已按 server PID 精确清理；按镜像名杀
+  ; 分不清主程序 / server 子进程（同一个 exe 镜像），/T 更会顺手杀掉 electron-updater
+  ; 派生的本安装器（旧目录已删、新文件没写完 = 更新完 App 没了）。只有用户手动安装
+  ; （本安装器不是 Flowship 的子进程）才需要清隐形孤儿 server。
   ${if} ${isUpdated}
-    nsExec::Exec 'taskkill /F /IM "Flowship.exe"'
+    DetailPrint "update path: skip taskkill (main process owns PID cleanup)"
   ${else}
     nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
   ${endIf}
@@ -89,8 +100,10 @@
 ; 手动卸载同款 /T 清理。升级时新安装器会给旧卸载器传 --updated：只杀 Flowship.exe
 ; 本体、不带 /T，避免沿进程树反杀新安装器。
 !macro customUnInit
+  ; 更新中旧卸载器绝不碰进程：它是新安装器拉起的，按名杀（尤其 /T）极易误伤
+  ; 正在装新文件的父进程；主进程退出时自清 server，不需要卸载器插手。
   ${if} ${isUpdated}
-    nsExec::Exec 'taskkill /F /IM "Flowship.exe"'
+    DetailPrint "uninstall for update: skip taskkill (owner cleans up)"
   ${else}
     nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
   ${endIf}

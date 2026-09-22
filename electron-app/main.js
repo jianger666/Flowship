@@ -39,11 +39,18 @@ import {
   writeFileSync,
 } from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-// Windows 自定义安装目录静默更新保护（E 盘含空格路径坑）：/D= 不能带引号，
-// 含空格时优先用 8.3 短路径，详见 ./win-install-dir.mjs
-import { resolveWinInstallDirForUpdater, isUnsafeWinInstallDir } from "./win-install-dir.mjs";
+// Windows 静默更新门禁：不再传 /D=（注册表 InstallLocation 为准，含空格路径引号
+// bug 整个类别消失）；Temp 兜底见 ./win-install-dir.mjs，标记门禁 + 墓碑见 ./win-update-guard.mjs
+import { isUnsafeWinInstallDir } from "./win-install-dir.mjs";
+import {
+  WIN_UPDATE_ATTEMPT_FILE,
+  buildWinUpdateAttempt,
+  classifyWinUpdateAttempt,
+  hasSilentUpdateMarker,
+} from "./win-update-guard.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -389,12 +396,16 @@ const stopServer = async () => {
   }
 };
 
-// 轮询 server 直到 HTTP 200（上限默认 30s）
-const waitForReady = async (timeoutMs = 30_000) => {
+// 轮询 server 直到 HTTP 200（上限默认 60s：冷盘 + Defender 下 30s 会误杀慢机器）
+// 轮询 /api/readyz（零业务静态探针）：只证明 HTTP 栈起来，不跑首页渲染——
+// 之前轮 `/` 把"监听起来"和"首页渲完"混在一起，首页稍慢就被误判成 server 没起。
+const waitForReady = async (timeoutMs = 60_000) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(BASE_URL, { signal: AbortSignal.timeout(2000) });
+      const res = await fetch(`${BASE_URL}/api/readyz`, {
+        signal: AbortSignal.timeout(2000),
+      });
       if (res.ok) return true;
     } catch {
       // 还没起来、继续等
@@ -402,6 +413,25 @@ const waitForReady = async (timeoutMs = 30_000) => {
     await sleep(400);
   }
   return false;
+};
+
+// 首次启动标记：Windows 下冷盘 + Defender 首扫 + 未签名 SmartScreen，server 首次起床
+// 经常超过常规超时。标记落 userData，第一次就绪后写，之后走常规超时。
+const firstBootDoneFile = () =>
+  path.join(app.getPath("userData"), "first-boot-done");
+const isFirstBoot = () => {
+  try {
+    return !existsSync(firstBootDoneFile());
+  } catch {
+    return false;
+  }
+};
+const markFirstBootDone = () => {
+  try {
+    writeFileSync(firstBootDoneFile(), JSON.stringify({ ts: Date.now() }));
+  } catch {
+    // 写不进下次还按首次对待，无害
+  }
 };
 
 // ---------- 窗口（含尺寸记忆） ----------
@@ -1761,33 +1791,47 @@ let winAutoUpdater = null;
 const installWinUpdate = async (version) => {
   if (!winAutoUpdater) return;
   if (updateState.phase === "installing") return;
-  // /D= 钉成当前安装目录，避免卸在 A、装到 B 导致快捷方式悬空。
-  // E 盘坑：路径含空格时 Node spawn 会自动给 /D= 加引号，而 NSIS 的 GetDParameter
-  // 不去引号 → $INSTDIR 非法 → 旧目录已被 RMDir、新文件装不上。这里优先用 8.3 短路径
-  // （无空格、无需引号）；短路径拿不到则用长路径——新版 installer.nsh customInit 会剥引号兜底。
-  const resolved = resolveWinInstallDirForUpdater();
+  // 不传 /D=：NSIS 用注册表 InstallLocation（electron-updater 默认行为）。
+  // 曾手动钉 /D= 保"卸装同目录"，但 Node 给含空格路径自动加引号、旧 NSIS 取参不去引号
+  // → $INSTDIR 非法 → 旧目录已删、新文件写不进（更新完 App 没了）。注册表路径原样可用；
+  // 挪过目录的极少数用户顶多装出第二份（快捷方式重写兜底），不丢 App。
+  const exeDir = path.dirname(process.execPath);
   log(
-    `[updater] win 安装目录 raw=${resolved.raw} dir=${resolved.dir} viaShort=${resolved.viaShort}`,
+    `[updater] win 安装目录 dir=${exeDir} exe=${path.basename(process.execPath)}`,
   );
   // Temp 兜底（v1.9.13）：当前进程在 NSIS 备份里跑（上次失败残留、Temp 里直接点的 exe）
   // 时静默更新会往 Temp 里装、Temp 一清人就没了——此时绝不 quitAndInstall，
   // 让用户手动重装（注意：quitting 必须在放行后才置位，否则拒绝后 app 成僵尸）。
   // 同理：目录里连当前 exe 都没有（上次失败已被清空），也拒绝，避免叠加破坏。
-  const unsafeReason = isUnsafeWinInstallDir(resolved.dir);
+  const unsafeReason = isUnsafeWinInstallDir(exeDir);
   const exeExists = (() => {
     try {
-      return existsSync(path.join(resolved.dir, path.basename(process.execPath)));
+      return existsSync(path.join(exeDir, path.basename(process.execPath)));
     } catch {
       return false;
     }
   })();
   if (unsafeReason || !exeExists) {
     const reason = unsafeReason || "安装目录里找不到当前程序（可能上次更新已清空目录）";
-    log(`[updater] win 拒绝静默更新：${reason} dir=${resolved.dir}`);
+    log(`[updater] win 拒绝静默更新：${reason} dir=${exeDir}`);
     setUpdateState({ phase: "available", version, error: reason });
     dialog.showErrorBox(
       "自动更新失败",
       `${reason}。\n\n已取消本次自动更新，避免损坏你的安装。今晚去发布页手动下载安装包、重装到原目录即可（数据不受影响）。`,
+    );
+    void shell.openExternal(RELEASE_LATEST_URL);
+    return;
+  }
+  // 新安装器标记门禁：没标记 = 当前文件是旧版本装的，旧卸载器可能有 /T 误杀安装器
+  // 或 /D= 引号 bug → 这次必须手动过渡（去发布页装一次），装完标记落地、之后恢复静默。
+  // 这是自愈的：与具体版本号无关，标记在就放行、不在就手动一次。
+  if (!hasSilentUpdateMarker(exeDir, existsSync)) {
+    const reason = "当前安装是旧版本装的，不支持本次静默更新（旧卸载器有已知缺陷）";
+    log(`[updater] win 拒绝静默更新：${reason} dir=${exeDir}`);
+    setUpdateState({ phase: "available", version, error: reason });
+    dialog.showErrorBox(
+      "需要手动更新一次",
+      `${reason}。\n\n去发布页手动下载安装包、装到原目录即可（数据不受影响）。装完这一次，之后的自动更新恢复正常。`,
     );
     void shell.openExternal(RELEASE_LATEST_URL);
     return;
@@ -1807,7 +1851,16 @@ const installWinUpdate = async (version) => {
   }
   quitting = true;
   setUpdateState({ phase: "installing", version, error: null });
-  winAutoUpdater.installDirectory = resolved.dir;
+  // 更新墓碑：quitAndInstall 前写，启动时核销。静默装黑盒无回调，下次启动版本没变
+  // = 死半路了 → 弹框请手动装（不再无声消失）。写不进顶多少一次失败提示，不挡更新。
+  try {
+    await fs.writeFile(
+      path.join(app.getPath("userData"), WIN_UPDATE_ATTEMPT_FILE),
+      JSON.stringify(buildWinUpdateAttempt(version)),
+    );
+  } catch {
+    /* 忽略 */
+  }
   await sleep(1500);
   winAutoUpdater.quitAndInstall(true, true);
 };
@@ -1819,14 +1872,7 @@ const ensureWinAutoUpdater = async () => {
   winAutoUpdater = updater.autoUpdater;
   winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
   winAutoUpdater.autoInstallOnAppQuit = false; // 退出不偷偷装，只在用户点徽标确认后装
-  // 静默升级把 /D= 钉在当前 exe 目录，避免卸旧路径、装到默认路径导致快捷方式悬空
-  // （含空格路径走短路径，见 installWinUpdate；这里先钉一次，安装瞬间会再决议一次）
-  try {
-    winAutoUpdater.installDirectory =
-      resolveWinInstallDirForUpdater().dir;
-  } catch {
-    winAutoUpdater.installDirectory = path.dirname(process.execPath);
-  }
+  // 不设 installDirectory：用注册表 InstallLocation（见 installWinUpdate 注释）。
   // 下载进度 → 任务栏进度条 + 页面徽标进度（对齐 mac 的 Dock + 页面双通道）
   winAutoUpdater.on("download-progress", (p) => {
     if (typeof p?.percent !== "number") return;
@@ -2019,6 +2065,17 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")} protocol=${PROTOCOL_SCHEME}`);
+    // 机器快照（启动慢定位用：内存/CPU 不够的机器冷启动天然慢，先排除硬件因素）
+    try {
+      const cpus = os.cpus();
+      log(
+        `[main] machine platform=${os.platform()} arch=${os.arch()} release=${os.release()} ` +
+          `cpu=${cpus.length}x${cpus[0]?.model?.trim() || "?"} ` +
+          `memTotal=${Math.round(os.totalmem() / 1073741824)}G memFree=${Math.round(os.freemem() / 1073741824)}G`,
+      );
+    } catch {
+      /* 快照失败不挡启动 */
+    }
     // mac 自定义应用菜单：默认菜单的 File→Close（Cmd+W）走 close 事件、会撞上
     // 「点 X = 二次确认退出」——把 Cmd+W 改绑「收进托盘」；其余菜单保留系统 role
     //（editMenu 必须保留、否则 Cmd+C/V 全失效）
@@ -2063,6 +2120,37 @@ if (!app.requestSingleInstanceLock()) {
     } catch (err) {
       log(`[updater] 启动清扫异常（忽略）${err?.message || err}`);
     }
+    // Windows 更新墓碑核销（静默装无回调、靠它把"无声消失"变"可见失败"）
+    if (process.platform === "win32" && app.isPackaged) {
+      try {
+        const attemptFile = path.join(app.getPath("userData"), WIN_UPDATE_ATTEMPT_FILE);
+        let attempt = null;
+        try {
+          attempt = JSON.parse(await fs.readFile(attemptFile, "utf8"));
+        } catch {
+          attempt = null;
+        }
+        const outcome = classifyWinUpdateAttempt(attempt, app.getVersion(), isNewer);
+        // 成败都销墓碑（失败已弹框告知，不每启动 nag 一次）
+        if (outcome !== "none") {
+          await fs.rm(attemptFile, { force: true }).catch(() => {});
+        }
+        if (outcome === "success") {
+          log(`[updater] 上次更新已生效 v${app.getVersion()}（墓碑已销）`);
+        } else if (outcome === "failed") {
+          const want = attempt?.version || "新版本";
+          log(`[updater] 上次更新死半路：目标 v${want}、当前 v${app.getVersion()}`);
+          setUpdateState({ phase: "available", version: want, error: "上次静默安装未完成" });
+          dialog.showErrorBox(
+            "上次更新没有装上",
+            `目标 v${want} 没装上、当前还是 v${app.getVersion()}。\n\n请去发布页手动下载安装包、装到原目录（数据不受影响）。`,
+          );
+          void shell.openExternal(RELEASE_LATEST_URL);
+        }
+      } catch (err) {
+        log(`[updater] 墓碑核销异常（忽略）${err?.message || err}`);
+      }
+    }
     // server 布局缺失（dev 没组包 / 打包配置坏了）直接明错、不静默
     try {
       await fs.access(path.join(serverDir, "server.js"));
@@ -2089,7 +2177,47 @@ if (!app.requestSingleInstanceLock()) {
     startServer();
     void setupAutoUpdate();
 
-    if (await waitForReady()) {
+    // 首次启动给足时间（150s），常规 60s；超时后 server 还活着 = 只是慢（不是挂了），
+    // 给"继续等待"而不是直接判死刑——之前一次性 30s 是 Windows 首次必现启动超时的根因。
+    const firstBoot = isFirstBoot();
+    const bootTimeoutMs = firstBoot ? 150_000 : 60_000;
+    log(`[main] 等 server 就绪（timeout=${bootTimeoutMs} firstBoot=${firstBoot})`);
+    const bootWaitStart = Date.now();
+    const bootElapsedS = (): string =>
+      ((Date.now() - bootWaitStart) / 1000).toFixed(1);
+    let serverReady = await waitForReady(bootTimeoutMs);
+    log(`[main] 首轮等待${serverReady ? "命中" : "超时"}、累计 ${bootElapsedS()}s`);
+    while (
+      !serverReady &&
+      serverProc &&
+      serverProc.exitCode === null &&
+      !serverProc.killed
+    ) {
+      log("[main] server 还活着但没就绪，问用户继续等还是退出");
+      const { response } = await dialog.showMessageBox({
+        type: "info",
+        title: "正在启动",
+        message: "内部服务还在启动中（首次启动或安全软件扫描时会比较慢）",
+        detail: "点「继续等待」再等 2 分钟；点「退出」放弃本次启动。",
+        buttons: ["继续等待", "退出"],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (response !== 0) break;
+      const roundStart = Date.now();
+      serverReady = await waitForReady(120_000);
+      log(
+        `[main] 续等一轮${serverReady ? "命中" : "超时"}、本轮 ${((Date.now() - roundStart) / 1000).toFixed(1)}s、累计 ${bootElapsedS()}s`,
+      );
+    }
+    if (serverReady) {
+      markFirstBootDone();
+      log(`[main] server 就绪、轮询耗时 ${((Date.now() - bootWaitStart) / 1000).toFixed(1)}s`);
+      // 就绪后预热（fire-and-forget，5s 超时防半死 server 挂住 socket）：登录 shell 合并 / 迁移 / 组库 sync / 目录预热
+      // 本来全挤在启动窗口抢冷盘，已搬到这里（见 boot-warmup.ts + /api/boot-warmup）。
+      void fetch(`${BASE_URL}/api/boot-warmup`, {
+        signal: AbortSignal.timeout(5_000),
+      }).catch(() => {});
       // R1-14：兜底触发飞书桥接 bootstrap（依赖 route 模块加载副作用）。
       // 壳 ready 后主动 GET 一次 status；首页未请求 /api/tasks 的 headless/Tray
       // 静默场景也能起 consumer。失败静默——桥接探测失败不影响开窗。
@@ -2105,10 +2233,20 @@ if (!app.requestSingleInstanceLock()) {
         setTimeout(() => revealMainWindow("timeout"), 8_000);
       }
     } else {
+      const serverState = !serverProc
+        ? "gone"
+        : serverProc.killed
+          ? "killed"
+          : serverProc.exitCode === null
+            ? `alive pid=${serverProc.pid}`
+            : `exited code=${serverProc.exitCode}`;
+      log(`[main] server 未就绪、放弃启动（累计等待 ${bootElapsedS()}s, server=${serverState})`);
       closeSplashWindow();
       dialog.showErrorBox(
         "启动超时",
-        "内部服务 30 秒内没有就绪、请关闭应用重试。",
+        process.platform === "win32"
+          ? "内部服务多次等待仍没有就绪。\n\n首次启动时安全软件全盘扫描会很慢，可重开再试；仍不行请检查是否有残留进程占用端口后重试。"
+          : "内部服务多次等待仍没有就绪、请关闭应用重试。",
       );
       quitting = true;
       await stopServer();

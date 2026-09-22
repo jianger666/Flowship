@@ -259,3 +259,76 @@ export const stopAllManagedChildren = async (): Promise<void> => {
     }),
   );
 };
+
+// ----------------- 二进制占用方登记（Windows 覆盖安装用） -----------------
+
+/**
+ * Windows 不能覆盖正在运行的 exe：安装/升级前先优雅停掉占用方、装完再拉起。
+ * 占用方（飞书桥接 consumers）在 inbound.ts 登记；安装链（feishu-cli.ts）调用。
+ * 放这里是因为双方都已依赖本模块（本文件零 import），无循环 import 风险。
+ */
+export const LARK_CLI_BINARY_USER = "lark-cli";
+export const MEEGLE_BINARY_USER = "meegle";
+
+export type BinaryUserHooks = {
+  /**
+   * 优雅停掉所有占用该二进制的常驻进程，返回已停标识（供日志）。
+   * 抛错 → 安装链 abort（旧版本不受损）；调用方必须 finally resume 复位 hold。
+   */
+  suspend: () => Promise<string[]>;
+  /** 重拉占用进程（新二进制生效；失败只 warn、30s 轮询会再兜） */
+  resume: () => Promise<void>;
+};
+
+const BINARY_USERS_KEY = "__flowshipBinaryUsersV1__";
+
+const getBinaryUsersMap = (): Map<string, BinaryUserHooks> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, BinaryUserHooks> | undefined
+  >;
+  if (!g[BINARY_USERS_KEY]) g[BINARY_USERS_KEY] = new Map();
+  return g[BINARY_USERS_KEY]!;
+};
+
+/** 占用方登记（模块加载时一次，幂等按名覆盖） */
+export const registerBinaryUser = (
+  binName: string,
+  hooks: BinaryUserHooks,
+): void => {
+  getBinaryUsersMap().set(binName, hooks);
+};
+
+/** 单测清理（生产只注册不注销） */
+export const __clearBinaryUsersForTest = (): void => {
+  getBinaryUsersMap().clear();
+};
+
+/**
+ * 停掉占用方（未登记 = 无常驻占用，直接过，返回空）。
+ * suspend 抛错 → 调用方必须 abort 安装并 finally resume（复位 hold）。
+ */
+export const suspendBinaryUsers = async (
+  binName: string,
+): Promise<string[]> => {
+  const hooks = getBinaryUsersMap().get(binName);
+  if (!hooks) return [];
+  return hooks.suspend();
+};
+
+/**
+ * 重拉占用方（best-effort：失败只 warn，轮询/下次 sync 会再兜）。
+ * 二进制已替换，resume 失败不回滚、不抛。
+ */
+export const resumeBinaryUsers = async (binName: string): Promise<void> => {
+  const hooks = getBinaryUsersMap().get(binName);
+  if (!hooks) return;
+  try {
+    await hooks.resume();
+  } catch (err) {
+    console.warn(
+      `[kill-orphans] 重拉二进制占用方失败 bin=${binName}（轮询会再兜）:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+};

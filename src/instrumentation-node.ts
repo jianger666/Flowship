@@ -6,6 +6,9 @@
  */
 
 export const registerNode = (): void => {
+  console.log(
+    `[boot] instrumentation uptime=${Math.round(process.uptime() * 1000)}ms`,
+  );
   // 防重复注册：dev HMR / 多次 register 时 listener 会累积、触发 MaxListenersExceededWarning
   // 跟 chat-mcp 一样用 globalThis 挂单例标记
   const g = globalThis as typeof globalThis & {
@@ -46,89 +49,32 @@ export const registerNode = (): void => {
     }
   }
 
-  // PATH 补全（注入必须立刻发生、不能等登录 shell 探测：探测最长 10s、期间起的
-  // agent 会缺 meegle / rg；login 合并是去重保序 + pin 已注入前缀）：
-  // 1) 内置飞书 CLI（lark-cli / meegle）bin
-  // 2) SDK 平台包里的 rg（自定义提供方 pi grep 用、避免 GitHub 下载）
-  // 3) mac GUI 启动继承 launchd 精简 PATH、缺 nvm/homebrew/yarn——异步合并登录 shell PATH
+  // PATH 补全前半段（pin 前缀）：内置飞书 CLI bin + SDK 平台包 rg。
+  // 后半段登录 shell 合并（spawn shell 最长 10s）已搬到就绪后预热（见 boot-warmup.ts）——
+  // 启动窗口只留 pin、不抢冷盘；合并仍在 pin 之后（去重保序），顺序没变。
   void import("./lib/server/feishu-cli").then((m) => m.injectFeishuCliPath());
   void import("./lib/server/sdk-platform-bin").then((m) => m.injectSdkRgPath());
-  void import("./lib/server/login-shell-path").then((m) =>
-    m.mergeLoginShellPath(),
-  );
 
   // P0-02：启动幂等收紧密钥文件权限（config.json 0600 / mcp-oauth 0700+0600）
   // 失败只 warn、不阻断启动；日志不含文件内容
   void import("./lib/server/settings-fs").then((m) => m.hardenConfigFilePerms());
   void import("./lib/server/mcp-oauth").then((m) => m.hardenMcpOAuthPerms());
 
-  // M2：清历史 task meta 里 repoBranchTemplates 的 {username} 残留（幂等、失败不阻断启动）
-  void import("./lib/server/migrate-username-templates")
-    .then((m) => m.migrateUsernameBranchTemplates())
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] username 模板迁移失败（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
+  // 非生产兜底（pnpm dev:web / 纯 node 起服）：没有 Electron 壳调 /api/boot-warmup，
+  // 不兜的话 dev 下迁移/预置/组库同步/目录预热全丢。setImmediate 让出启动窗口，
+  // 语义与壳触发一致；预热模块之前就在本包图里（刚从上面搬走），无新打包风险。
+  if (process.env.NODE_ENV !== "production") {
+    setImmediate(() => {
+      void import("./lib/server/boot-warmup")
+        .then((m) => m.runBootWarmup())
+        .catch((err) => {
+          console.warn(
+            "[instrumentation] dev 预热触发失败（不阻断）:",
+            err instanceof Error ? err.message : err,
+          );
+        });
     });
-
-  // 自定义 action → skill 托管迁移（幂等）须在预置安装前跑、把旧 builtin-fix-bug 迁成 app:fix-bug；
-  // 再 ensureBuiltinFixBugPreset。错误各自捕获、不阻断启动（链式串行、禁止并行竞态）。
-  void import("./lib/server/custom-action-fs")
-    .then((m) => m.migrateCustomActionsToSkillHosted())
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] custom-actions → skill 托管迁移失败（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
-    })
-    .then(() => import("./lib/server/preset-actions"))
-    .then((m) => m.ensureBuiltinFixBugPreset())
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] 预置改bug 安装失败（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
-    });
-
-  // Windows：按设置把 SHELL 指到 Git Bash（绕开 SDK PowerShell 挂死 bug）；失败不阻断启动
-  void import("./lib/server/agent-shell")
-    .then((m) => m.applyAgentShellPreference())
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] 应用 Agent shell 偏好失败（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
-    });
-
-  // 组共享库：启动自动 sync（没配 gitToken 内部静默跳过；失败只 warn）
-  // 注：cleanup-fe-hooks 挂在 task-runner 非启动链，故同步挂在本 instrumentation 启动 fire-and-forget 段
-  void import("./lib/server/team-library")
-    .then((m) => m.syncTeamLibrary({ silentWithoutToken: true }))
-    .then((r) => {
-      if (r.skipped) return;
-      if (!r.ok) {
-        console.warn("[instrumentation] 组共享库 sync 失败:", r.error);
-      }
-    })
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] 组共享库 sync 异常（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
-    });
-
-  // models.dev 目录预热（fire-and-forget）：目录约 4MB、现拉最长 20s——启动时异步拉好，
-  // 之后首次自定义 provider 调用 / 打开设置页即命中 24h 缓存。refreshIndexes 内部
-  // 自带失败冷却 + 空表兜底（离线也不影响启动），这里只兜动态 import 本身的失败。
-  void import("./lib/server/models-dev-catalog")
-    .then((m) => m.getModelsDevIndex())
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] models.dev 目录预热失败（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
-    });
+  }
 
   // ⚠️ 飞书桥接 bootstrap **不能**挂这里（2026-07-19 dev 冒烟踩过）：
   // bridge 模块图经 router/card-action → chat-inject → chat-runner 静态引到 @cursor/sdk，
