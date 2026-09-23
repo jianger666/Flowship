@@ -302,6 +302,112 @@ describe("parseInboundContent 文件消息双形态", () => {
   });
 });
 
+describe("parseInboundContent 视频消息 media", () => {
+  const tmpFiles: string[] = [];
+
+  afterEach(async () => {
+    __setRouterDepsForTest(null);
+    for (const p of tmpFiles.splice(0)) {
+      await fs.unlink(p).catch(() => undefined);
+    }
+  });
+
+  const makeTmpPng = async (): Promise<string> => {
+    const p = path.join(os.tmpdir(), `feishu-cover-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+    const buf = Buffer.alloc(64, 1);
+    buf.write("\x89PNG\r\n\x1a\n", 0);
+    await fs.writeFile(p, buf);
+    tmpFiles.push(p);
+    return p;
+  };
+
+  const makeTmpVideo = async (): Promise<string> => {
+    const p = path.join(os.tmpdir(), `feishu-video-${Date.now()}-${Math.random().toString(36).slice(2)}.bin`);
+    await fs.writeFile(p, "video-content");
+    tmpFiles.push(p);
+    return p;
+  };
+
+  it("JSON 双 key → 封面进 images、视频本体进 attachments", async () => {
+    const cover = await makeTmpPng();
+    const video = await makeTmpVideo();
+    const downloaded: Array<{ key: string; type: string }> = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key, type) => {
+          downloaded.push({ key, type });
+          return type === "image" ? cover : video;
+        },
+      }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({
+          file_key: "file_v3_video_key",
+          image_key: "img_v3_cover_key",
+        }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(downloaded).toEqual([
+      { key: "img_v3_cover_key", type: "image" },
+      { key: "file_v3_video_key", type: "file" },
+    ]);
+    expect(parsed.images).toHaveLength(1);
+    expect(parsed.attachments).toHaveLength(1);
+    expect(path.basename(parsed.attachments[0]!)).toBe("video.mp4");
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
+  it("无封面 image_key → 只有视频附件、照样可收", async () => {
+    const video = await makeTmpVideo();
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => video }));
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({ file_key: "file_v3_video_only" }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.images).toHaveLength(0);
+    expect(parsed.attachments).toHaveLength(1);
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
+  it("封面下载失败 → 视频照收、不整单报错", async () => {
+    const video = await makeTmpVideo();
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, _key, type) => {
+          if (type === "image") throw new Error("cover 404");
+          return video;
+        },
+      }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({
+          file_key: "file_v3_video_key",
+          image_key: "img_v3_cover_key",
+        }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.images).toHaveLength(0);
+    expect(parsed.attachments).toHaveLength(1);
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
+  it("无 file_key → unsupported（保持诚实报错）", async () => {
+    const parsed = await parseInboundContent(
+      baseMsg({ message_type: "media", content: "什么都不是" }),
+    );
+    expect(parsed.unsupported).toBe("视频消息缺少 file_key");
+  });
+});
+
 describe("isActiveChatTask", () => {
   it("mode=chat + developing + 2h 内 = 活跃", () => {
     const t = mockTask();

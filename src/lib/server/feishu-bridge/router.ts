@@ -620,6 +620,54 @@ export const parseInboundContent = async (
     return { text: mf.text, images: md.images, attachments: mf.attachments };
   }
 
+  if (type === "media") {
+    // 视频消息：content JSON {"file_key":"file_v3_…","image_key":"img_v3_…"}。
+    // 封面图 → images（agent 看得见）；视频本体 → attachments（50MB 上限复用文件链路）。
+    const obj = tryParseJson(msg.content) as Record<string, unknown> | null;
+    const fileKey =
+      (obj && typeof obj.file_key === "string" && obj.file_key) || "";
+    const imageKey =
+      (obj && typeof obj.image_key === "string" && obj.image_key) || "";
+    if (!fileKey) {
+      return {
+        text: "",
+        images: [],
+        attachments: [],
+        unsupported: "视频消息缺少 file_key",
+      };
+    }
+    const images: ParsedInboundContent["images"] = [];
+    if (imageKey) {
+      try {
+        const abs = await deps.downloadMessageResource(
+          msg.message_id,
+          imageKey,
+          "image",
+        );
+        const img = await fileToBase64Image(abs);
+        if (img) images.push(img);
+      } catch (err) {
+        console.warn(
+          "[feishu-bridge/router] 视频封面下载失败:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    const r = await downloadFileAttachment(
+      msg.message_id,
+      fileKey,
+      "video.mp4",
+    );
+    if ("error" in r) {
+      return { text: "", images, attachments: [], unsupported: r.error };
+    }
+    return {
+      text: "收到一段视频（封面见附图，完整视频见附件）",
+      images,
+      attachments: [r.path],
+    };
+  }
+
   if (type === "interactive") {
     // 卡片消息（常是别的 bot 回的结论）：抽正文走 text 同链路；抽不出才 unsupported。
     // 卡片引用形态（仅 card_id、无正文）抽不出 → 回退 unsupported，由调用方决定是否单条取详情。
