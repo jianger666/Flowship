@@ -54,10 +54,10 @@ jobs:
         run: node scripts/experiment-b.mjs
       - name: fault injection（公理测试可执行化）
         run: |
-          ./node_modules/.bin/jiti scripts/fault-injection/fault-x10-transcript.mjs
-          ./node_modules/.bin/jiti scripts/fault-injection/fault-leak-ladder.mjs
-          ./node_modules/.bin/jiti scripts/fault-injection/fault-seq-fencing.mjs
-          ./node_modules/.bin/jiti scripts/fault-injection/fault-kill-midtool.mjs
-          ./node_modules/.bin/jiti scripts/fault-injection/fault-doublekill.mjs
+          pnpm exec jiti scripts/fault-injection/fault-x10-transcript.mjs
+          pnpm exec jiti scripts/fault-injection/fault-leak-ladder.mjs
+          pnpm exec jiti scripts/fault-injection/fault-seq-fencing.mjs
+          pnpm exec jiti scripts/fault-injection/fault-kill-midtool.mjs
+          pnpm exec jiti scripts/fault-injection/fault-doublekill.mjs
       - name: worker 契约测试
         run: pnpm vitest run tests/mem-governance.test.ts tests/mem-governance-v31.test.ts tests/worker-epoch.test.ts tests/worker-v31.test.ts tests/session-rotate.test.ts tests/gitlab-mock-proxy.test.ts tests/worker-facade.test.ts
