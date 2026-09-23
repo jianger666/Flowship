@@ -166,6 +166,24 @@ const runChatReplyInject = async (
 
   const text = parsed.text?.trim() ?? "";
 
+  // 发送预处理耗时取证（2026-09-23：回车→user_reply 落盘 10 分钟级等待，预处理黑盒）。
+  // 各重型 await 自报耗时（>3s warn）；汇总行在最外层 finally 打一次。
+  // 日志进 packaged main.log（userData/logs），事件流零噪音。
+  const sendT0 = Date.now();
+  const sendMarks: string[] = [];
+  const sendTimed = async <T>(stage: string, p: Promise<T>): Promise<T> => {
+    const t = Date.now();
+    try {
+      return await p;
+    } finally {
+      const ms = Date.now() - t;
+      sendMarks.push(`${stage}=${ms}ms`);
+      if (ms > 3000) {
+        console.warn(`[chat-reply] 慢阶段 task=${id} stage=${stage} ${ms}ms`);
+      }
+    }
+  };
+
   // 校验 images
   const imagesResult = parseAndValidateImages(
     parsed.images,
@@ -378,9 +396,15 @@ const runChatReplyInject = async (
     capture: CaptureCheckpointResult,
   ) => {
     const checkpointed = capture.ok;
-    const replyEvent = await persistUserReply(checkpointed);
+    const replyEvent = await sendTimed(
+      "persistUserReply",
+      persistUserReply(checkpointed),
+    );
     if (replyEvent && checkpointed) {
-      await persistCheckpointForReply(task.id, replyEvent.id, capture);
+      await sendTimed(
+        "persistCheckpoint",
+        persistCheckpointForReply(task.id, replyEvent.id, capture),
+      );
     }
     return replyEvent;
   };
@@ -512,13 +536,16 @@ const runChatReplyInject = async (
     typeof bootArgs.apiKey === "string" &&
     isValidModel(bootArgs.model)
   ) {
-    ownerInstanceId = await resumeChatSession(
-      task,
-      {
-        apiKey: bootArgs.apiKey,
-        model: bootArgs.model,
-      },
-      { claimRun: true },
+    ownerInstanceId = await sendTimed(
+      "resumeChatSession",
+      resumeChatSession(
+        task,
+        {
+          apiKey: bootArgs.apiKey,
+          model: bootArgs.model,
+        },
+        { claimRun: true },
+      ),
     );
   }
   const resumedAsOwner = ownerInstanceId !== null;
@@ -542,7 +569,7 @@ const runChatReplyInject = async (
       }
       let persistWarning: string | undefined;
       try {
-        const capture = await tryCaptureCheckpoint();
+        const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
         const replyEvent = await persistReplyAndCheckpoint(capture);
         if (replyEvent && clientItemId) {
           markMessagePersisted(task.id, clientItemId);
@@ -630,16 +657,19 @@ const runChatReplyInject = async (
       let sentOk = false;
       try {
         // 快照必须在 agent.send 之前（send 后 consume 即可能改文件）
-        const capture = await tryCaptureCheckpoint();
+        const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
         // ownerInstanceId：owner 实例精确匹配才跳过 runActive 早退；
         // checkpoint 期间被 stop 摘除 / forceClear 换新实例 → send 内按
         // cancelled / owner_invalid 收敛（取消是终态、绝不能当可重试故障）
-        const sent = await sendChatMessage(
-          task,
-          agentText || fallbackText,
-          imageAbsPaths,
-          attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
-          ownerInstanceId !== null ? { ownerInstanceId } : undefined,
+        const sent = await sendTimed(
+          "sendChatMessage",
+          sendChatMessage(
+            task,
+            agentText || fallbackText,
+            imageAbsPaths,
+            attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
+            ownerInstanceId !== null ? { ownerInstanceId } : undefined,
+          ),
         );
         if (sent === "sent") {
           sentOk = true;
@@ -736,9 +766,9 @@ const runChatReplyInject = async (
       // 模型 / MCP / workdir / 提供方变了 → 懒重启：关旧会话、起新会话（这条消息作当前句）、
       // 最近对话正文由 runChatSession 注入起手 prompt，更早的仍可 read events.jsonl
       cancelChatRun(task.id);
-      const stopped = await waitForChatToStop(
-        task.id,
-        CHAT_RESTART_STOP_TIMEOUT_MS,
+      const stopped = await sendTimed(
+        "waitForChatToStop",
+        waitForChatToStop(task.id, CHAT_RESTART_STOP_TIMEOUT_MS),
       );
       if (!stopped) {
         console.warn(
@@ -883,7 +913,7 @@ const runChatReplyInject = async (
           await failpoint("chatReply.afterQueuePriorityPersist");
         } else {
           // 队首尚未落事件 → 先快照再按队首字段写 user_reply（形状对齐 persistUserReply）
-          const capture = await tryCaptureCheckpoint();
+          const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
           // 测试可在 checkpoint 后挂起——此时 queue_state 必须仍含 head id
           await failpoint("chatReply.afterQueuePriorityCheckpoint");
           // checkpoint 可能很慢——落 user_reply 之前必须复查，绝不为已删任务写气泡
@@ -1008,7 +1038,7 @@ const runChatReplyInject = async (
     }
 
     // 确定会起新会话 → 先快照再落 user_reply（runner 要 firstMessageEventId 锚定本轮回答义务）
-    const capture = await tryCaptureCheckpoint();
+    const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
     // checkpoint 窗口是 stop/DELETE 高频命中区——落 user_reply 前必须复查
     if (!isChatStartLeaseValid(task.id, startToken)) {
       return leaseAbortedResponse();
@@ -1150,6 +1180,15 @@ const runChatReplyInject = async (
     }
   }
   } finally {
+    // 发送预处理耗时汇总（单行，快照/恢复/send/落盘各节耗时一目了然）
+    try {
+      const total = Date.now() - sendT0;
+      const line = `[chat-reply] send timings task=${id} total=${total}ms ${sendMarks.join(" ")}`;
+      if (total > 10000) console.warn(line + "（超 10s，疑似发送卡顿）");
+      else console.log(line);
+    } catch {
+      /* 取证日志不得影响主流程 */
+    }
     // MessageOperation handle 统一出口（transfer / terminal / release+staged 回滚）
     opHandle?.finalize();
   }
