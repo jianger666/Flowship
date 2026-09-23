@@ -406,6 +406,79 @@ describe("parseInboundContent 视频消息 media", () => {
     );
     expect(parsed.unsupported).toBe("视频消息缺少 file_key");
   });
+
+  it("大视频（>50MB 稀疏文件）→ 抽帧进 images、原文件删除、不 unsupported", async () => {
+    const cover = await makeTmpPng();
+    // 稀疏文件：stat 报 60MB、实际不占盘
+    const big = path.join(os.tmpdir(), `feishu-bigvideo-${Date.now()}.bin`);
+    const fh = await fs.open(big, "w");
+    await fh.truncate(60 * 1024 * 1024);
+    await fh.close();
+    tmpFiles.push(big);
+    const frame = await makeTmpPng();
+    const previews: Array<{ abs: string }> = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, _key, type) =>
+          type === "image" ? cover : big,
+        extractVideoPreview: async (abs: string) => {
+          previews.push({ abs });
+          return { framePaths: [frame], durationSec: 125 };
+        },
+      }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({
+          file_key: "file_v3_big_video",
+          image_key: "img_v3_cover_key",
+        }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    // 封面 + 1 抽帧
+    expect(parsed.images).toHaveLength(2);
+    expect(parsed.attachments).toHaveLength(0);
+    expect(parsed.text).toContain("2分05秒");
+    expect(parsed.text).toContain("60MB");
+    expect(parsed.text).toContain("过大");
+    // 抽帧拿到的是下载到的原文件、且原文件已被删除
+    expect(previews).toHaveLength(1);
+    await expect(fs.access(big)).rejects.toThrow();
+    tmpFiles.push(frame);
+  });
+
+  it("大视频 + 无 ffmpeg（preview null）→ 封面 + 文字交代、照样收下", async () => {
+    const cover = await makeTmpPng();
+    const big = path.join(os.tmpdir(), `feishu-bigvideo2-${Date.now()}.bin`);
+    const fh = await fs.open(big, "w");
+    await fh.truncate(2 * 1024 * 1024 * 1024);
+    await fh.close();
+    tmpFiles.push(big);
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, _key, type) =>
+          type === "image" ? cover : big,
+        extractVideoPreview: async () => null,
+      }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({
+          file_key: "file_v3_huge_video",
+          image_key: "img_v3_cover_key",
+        }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.images).toHaveLength(1);
+    expect(parsed.attachments).toHaveLength(0);
+    expect(parsed.text).toContain("2.0GB");
+    expect(parsed.text).toContain("过大");
+    await expect(fs.access(big)).rejects.toThrow();
+  });
 });
 
 describe("isActiveChatTask", () => {

@@ -46,6 +46,10 @@ import {
 } from "./bridge-state";
 import { findTaskByMessageId, rememberCardMessage } from "./card-map";
 import {
+  defaultExtractVideoPreview,
+  type VideoPreview,
+} from "./video-frames";
+import {
   downloadMessageResource,
   getBotAppInfo,
   larkApi,
@@ -219,6 +223,8 @@ type RouterDeps = {
   readSettingsFile: typeof readSettingsFile;
   listSkillsWithSource: typeof listSkillsWithSource;
   prewarmTaskWorkspace: typeof prewarmTaskWorkspace;
+  /** 大视频抽帧预览（best-effort，失败返回 null，调用方退化处理） */
+  extractVideoPreview: typeof defaultExtractVideoPreview;
 };
 
 let deps: RouterDeps = {
@@ -236,6 +242,7 @@ let deps: RouterDeps = {
   readSettingsFile,
   listSkillsWithSource,
   prewarmTaskWorkspace,
+  extractVideoPreview: defaultExtractVideoPreview,
 };
 
 /** 单测替换依赖；传 null 恢复 */
@@ -258,6 +265,7 @@ export const __setRouterDepsForTest = (
       readSettingsFile,
       listSkillsWithSource,
       prewarmTaskWorkspace,
+      extractVideoPreview: defaultExtractVideoPreview,
     };
     return;
   }
@@ -337,15 +345,13 @@ const extractFileRef = (
 };
 
 /**
- * 下载文件 key → 落盘为附件路径（改回原文件名 + 50MB 校验）。
- * file 分支与 text/post 的 markdown 文件链接共用。
+ * 已下载文件落附件：改名 + 50MB 上限（file / media 共用）。
+ * 下载文件 key → 落盘为附件路径的入口见 downloadFileAttachment。
  */
-const downloadFileAttachment = async (
-  messageId: string,
-  fileKey: string,
+const finalizeAttachment = async (
+  abs: string,
   fileName: string,
 ): Promise<{ path: string } | { error: string }> => {
-  const abs = await deps.downloadMessageResource(messageId, fileKey, "file");
   // 下载产物可能无扩展名——尽量保留原文件名
   const dest = path.join(path.dirname(abs), fileName.replace(/[/\\]/g, "_"));
   let finalPath = abs;
@@ -369,6 +375,35 @@ const downloadFileAttachment = async (
     };
   }
   return { path: finalPath };
+};
+
+/**
+ * 下载文件 key → 落盘为附件路径（改回原文件名 + 50MB 校验）。
+ * file 分支与 text/post 的 markdown 文件链接共用。
+ */
+const downloadFileAttachment = async (
+  messageId: string,
+  fileKey: string,
+  fileName: string,
+): Promise<{ path: string } | { error: string }> => {
+  const abs = await deps.downloadMessageResource(messageId, fileKey, "file");
+  return finalizeAttachment(abs, fileName);
+};
+
+/** 大视频交代文案用：字节 → MB/GB（一档小数） */
+const formatByteSize = (bytes: number): string => {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+  }
+  return `${Math.max(1, Math.round(bytes / (1024 * 1024)))}MB`;
+};
+
+/** 大视频交代文案用：秒 → X分Y秒 / X秒（取不到时长返回空） */
+const formatVideoDuration = (sec: number | null): string => {
+  if (sec === null || !(sec > 0)) return "";
+  const s = Math.round(sec);
+  if (s < 60) return `${s}秒`;
+  return `${Math.floor(s / 60)}分${String(s % 60).padStart(2, "0")}秒`;
 };
 
 /** text/post 正文里的 markdown 文件链接 → 下载进 attachments、剥掉占位 */
@@ -622,7 +657,9 @@ export const parseInboundContent = async (
 
   if (type === "media") {
     // 视频消息：content JSON {"file_key":"file_v3_…","image_key":"img_v3_…"}。
-    // 封面图 → images（agent 看得见）；视频本体 → attachments（50MB 上限复用文件链路）。
+    // 封面图 → images（agent 看得见）；视频本体分档：
+    // - ≤50MB → attachments（完整文件）；
+    // - 超限（几个 GB 的视频）→ 抽帧预览 + 删原文件 + 文字交代，不回 unsupported。
     const obj = tryParseJson(msg.content) as Record<string, unknown> | null;
     const fileKey =
       (obj && typeof obj.file_key === "string" && obj.file_key) || "";
@@ -637,6 +674,16 @@ export const parseInboundContent = async (
       };
     }
     const images: ParsedInboundContent["images"] = [];
+    let totalBytes = 0;
+    const pushImage = async (abs: string): Promise<void> => {
+      if (images.length >= MAX_IMAGES) return;
+      const img = await fileToBase64Image(abs);
+      if (!img) return;
+      const approx = Math.floor((img.data.length * 3) / 4);
+      if (totalBytes + approx > MAX_TOTAL_IMAGE_BYTES) return;
+      totalBytes += approx;
+      images.push(img);
+    };
     if (imageKey) {
       try {
         const abs = await deps.downloadMessageResource(
@@ -644,8 +691,7 @@ export const parseInboundContent = async (
           imageKey,
           "image",
         );
-        const img = await fileToBase64Image(abs);
-        if (img) images.push(img);
+        await pushImage(abs);
       } catch (err) {
         console.warn(
           "[feishu-bridge/router] 视频封面下载失败:",
@@ -653,18 +699,69 @@ export const parseInboundContent = async (
         );
       }
     }
-    const r = await downloadFileAttachment(
-      msg.message_id,
-      fileKey,
-      "video.mp4",
-    );
-    if ("error" in r) {
-      return { text: "", images, attachments: [], unsupported: r.error };
+    let abs: string;
+    try {
+      abs = await deps.downloadMessageResource(
+        msg.message_id,
+        fileKey,
+        "file",
+      );
+    } catch (err) {
+      return {
+        text: "",
+        images,
+        attachments: [],
+        unsupported: `视频下载失败：${err instanceof Error ? err.message : String(err)}`,
+      };
     }
+    let size = 0;
+    try {
+      size = (await fs.stat(abs)).size;
+    } catch (err) {
+      await fs.unlink(abs).catch(() => undefined);
+      return {
+        text: "",
+        images,
+        attachments: [],
+        unsupported: `视频校验失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (size <= MAX_FILE_BYTES) {
+      const r = await finalizeAttachment(abs, "video.mp4");
+      if ("error" in r) {
+        return { text: "", images, attachments: [], unsupported: r.error };
+      }
+      return {
+        text: "收到一段视频（封面见附图，完整视频见附件）",
+        images,
+        attachments: [r.path],
+      };
+    }
+    // 大视频：抽帧预览（best-effort）+ 删原文件 + 文字交代
+    let preview: VideoPreview | null = null;
+    try {
+      preview = await deps.extractVideoPreview(abs);
+    } catch (err) {
+      console.warn(
+        "[feishu-bridge/router] 视频抽帧失败:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    await fs.unlink(abs).catch(() => undefined);
+    if (preview) {
+      for (const fp of preview.framePaths) {
+        try {
+          await pushImage(fp);
+        } finally {
+          await fs.unlink(fp).catch(() => undefined);
+        }
+      }
+    }
+    const dur = formatVideoDuration(preview?.durationSec ?? null);
     return {
-      text: "收到一段视频（封面见附图，完整视频见附件）",
+      text: `收到一段${dur}视频（文件约${formatByteSize(size)}，过大未下载完整文件，画面见附图）`,
       images,
-      attachments: [r.path],
+      attachments: [],
     };
   }
 
