@@ -662,10 +662,18 @@ export const parseInboundContent = async (
     // - 超限（几个 GB 的视频）→ 抽帧预览 + 删原文件 + 文字交代，不回 unsupported。
     const obj = tryParseJson(msg.content) as Record<string, unknown> | null;
     const fileKey =
-      (obj && typeof obj.file_key === "string" && obj.file_key) || "";
+      (obj && typeof obj.file_key === "string" && obj.file_key) ||
+      // enrichment 渲染兜底（file 分支 T4 实证：consumer 下发 <file key="…"/> 而非 JSON）
+      extractFileRef(msg.content)?.fileKey ||
+      "";
     const imageKey =
       (obj && typeof obj.image_key === "string" && obj.image_key) || "";
     if (!fileKey) {
+      // 记下真实形态、方便以后补双形态兼容
+      console.warn(
+        "[feishu-bridge/router] media 缺少 file_key、content 前 200 字:",
+        msg.content.slice(0, 200),
+      );
       return {
         text: "",
         images: [],
@@ -685,18 +693,22 @@ export const parseInboundContent = async (
       images.push(img);
     };
     if (imageKey) {
+      // 封面转完 base64 即删：bridge 目录无 TTL，不删会堆积（image/post 分支同病，另案跟进）
+      let coverAbs: string | null = null;
       try {
-        const abs = await deps.downloadMessageResource(
+        coverAbs = await deps.downloadMessageResource(
           msg.message_id,
           imageKey,
           "image",
         );
-        await pushImage(abs);
+        await pushImage(coverAbs);
       } catch (err) {
         console.warn(
           "[feishu-bridge/router] 视频封面下载失败:",
           err instanceof Error ? err.message : err,
         );
+      } finally {
+        if (coverAbs) await fs.unlink(coverAbs).catch(() => undefined);
       }
     }
     let abs: string;
@@ -707,11 +719,18 @@ export const parseInboundContent = async (
         "file",
       );
     } catch (err) {
+      // 回执脱敏：原始异常可能带英文/路径，只给用户一句话，细节打 warn
+      console.warn(
+        "[feishu-bridge/router] 视频下载失败:",
+        msg.message_id,
+        fileKey,
+        err instanceof Error ? err.message : String(err),
+      );
       return {
         text: "",
         images,
         attachments: [],
-        unsupported: `视频下载失败：${err instanceof Error ? err.message : String(err)}`,
+        unsupported: "视频下载失败，请稍后重试",
       };
     }
     let size = 0;
@@ -758,8 +777,12 @@ export const parseInboundContent = async (
       }
     }
     const dur = formatVideoDuration(preview?.durationSec ?? null);
+    // 附图可能一张没推进去（预算闸全拦）：没图就不写“画面见附图”，别撒谎
+    const hasView = images.length > 0;
     return {
-      text: `收到一段${dur}视频（文件约${formatByteSize(size)}，过大未下载完整文件，画面见附图）`,
+      text: hasView
+        ? `收到一段${dur}视频（文件约${formatByteSize(size)}，过大未下载完整文件，画面见附图）`
+        : `收到一段${dur}视频（文件约${formatByteSize(size)}，过大未下载完整文件）`,
       images,
       attachments: [],
     };

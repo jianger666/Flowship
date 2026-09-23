@@ -7,6 +7,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -34,7 +35,7 @@ const runBin = (
     );
   });
 
-/** PATH 找不到时再试的固定位置（mac brew / linux 系） */
+/** PATH 找不到时再试的固定位置（mac brew / linux 系；Windows 只走 PATH，找不到就退化） */
 const BIN_SEARCH_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
 
 const findBin = async (name: string): Promise<string | null> => {
@@ -56,16 +57,27 @@ const findBin = async (name: string): Promise<string | null> => {
   return null;
 };
 
+// 进程级缓存：每次大视频都跑 2~8 次 -version 太贵；路径中途不会变
+let binsCache: Promise<{
+  ffmpeg: string;
+  ffprobe: string;
+} | null> | null = null;
+
 export const findFfmpegBins = async (): Promise<{
   ffmpeg: string;
   ffprobe: string;
 } | null> => {
-  const [ffmpeg, ffprobe] = await Promise.all([
-    findBin("ffmpeg"),
-    findBin("ffprobe"),
-  ]);
-  if (!ffmpeg || !ffprobe) return null;
-  return { ffmpeg, ffprobe };
+  if (!binsCache) {
+    binsCache = (async () => {
+      const [ffmpeg, ffprobe] = await Promise.all([
+        findBin("ffmpeg"),
+        findBin("ffprobe"),
+      ]);
+      if (!ffmpeg || !ffprobe) return null;
+      return { ffmpeg, ffprobe };
+    })();
+  }
+  return binsCache;
 };
 
 export const probeVideoDurationSec = async (
@@ -114,31 +126,39 @@ export const extractVideoFrame = async (
   outPath: string,
 ): Promise<boolean> => {
   try {
-    await runBin(
-      ffmpegBin,
-      [
-        "-y",
-        "-v",
-        "error",
-        "-ss",
-        String(sec),
-        "-i",
-        absPath,
-        "-frames:v",
-        "1",
-        "-q:v",
-        "5",
-        "-vf",
-        "scale=640:-1",
-        outPath,
-      ],
-      30000,
-    );
+    await runBin(ffmpegBin, frameArgs(absPath, sec, outPath), 30000);
     return true;
   } catch {
+    // 失败时 ffmpeg 可能已建出 0 字节 outPath——删掉，别在 tmpdir 堆积
+    await fs.unlink(outPath).catch(() => undefined);
     return false;
   }
 };
+
+/**
+ * 抽帧参数纯函数（单测锁定 H.264 偶数尺寸：
+ * `scale=640:-1` 在竖屏视频上算出奇数高度会抽帧失败，必须用 `-2`）。
+ */
+export const frameArgs = (
+  absPath: string,
+  sec: number,
+  outPath: string,
+): string[] => [
+  "-y",
+  "-v",
+  "error",
+  "-ss",
+  String(sec),
+  "-i",
+  absPath,
+  "-frames:v",
+  "1",
+  "-q:v",
+  "5",
+  "-vf",
+  "scale=640:-2",
+  outPath,
+];
 
 export const defaultExtractVideoPreview = async (
   absPath: string,

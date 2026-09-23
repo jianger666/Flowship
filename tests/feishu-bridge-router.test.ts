@@ -400,11 +400,90 @@ describe("parseInboundContent 视频消息 media", () => {
     tmpFiles.push(parsed.attachments[0]!);
   });
 
+  it("封面转完即删：bridge 目录无 TTL，不堆积 dl-* 小图", async () => {
+    const cover = await makeTmpPng();
+    const video = await makeTmpVideo();
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, _key, type) =>
+          type === "image" ? cover : video,
+      }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({
+          file_key: "file_v3_video_key",
+          image_key: "img_v3_cover_key",
+        }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.images).toHaveLength(1);
+    await expect(fs.access(cover)).rejects.toThrow();
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
+  it("enrichment `<file key/>` 形态兜底 file_key（file 分支 T4 同款）", async () => {
+    const video = await makeTmpVideo();
+    const downloaded: Array<{ key: string; type: string }> = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key, type) => {
+          downloaded.push({ key, type });
+          return video;
+        },
+      }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: '<file key="file_v3_enrich_key" name="现场.mp4"/>',
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(downloaded).toEqual([{ key: "file_v3_enrich_key", type: "file" }]);
+    expect(parsed.attachments).toHaveLength(1);
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
   it("无 file_key → unsupported（保持诚实报错）", async () => {
     const parsed = await parseInboundContent(
       baseMsg({ message_type: "media", content: "什么都不是" }),
     );
     expect(parsed.unsupported).toBe("视频消息缺少 file_key");
+  });
+
+  it("抽帧一张没推进去 → 文案不写画面见附图", async () => {
+    const cover = await makeTmpPng();
+    const big = path.join(os.tmpdir(), `feishu-bigvideo3-${Date.now()}.bin`);
+    const fh = await fs.open(big, "w");
+    await fh.truncate(60 * 1024 * 1024);
+    await fh.close();
+    tmpFiles.push(big);
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, _key, type) =>
+          type === "image" ? cover : big,
+        // 模拟帧全被预算闸拦：返回空帧列表但有时长
+        extractVideoPreview: async () => ({ framePaths: [], durationSec: 61 }),
+      }),
+    );
+    // 封面也删掉，逼出 images 为空
+    await fs.unlink(cover).catch(() => undefined);
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({
+          file_key: "file_v3_big_video",
+          image_key: "img_v3_cover_key",
+        }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.images).toHaveLength(0);
+    expect(parsed.text).toContain("1分01秒");
+    expect(parsed.text).not.toContain("画面见附图");
   });
 
   it("大视频（>50MB 稀疏文件）→ 抽帧进 images、原文件删除、不 unsupported", async () => {

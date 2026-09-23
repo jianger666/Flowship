@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   extractVideoFrame,
+  frameArgs,
   previewTimestamps,
   probeVideoDurationSec,
 } from "../src/lib/server/feishu-bridge/video-frames";
@@ -25,6 +26,14 @@ describe("previewTimestamps", () => {
     for (let i = 1; i < ts.length; i++) {
       expect(ts[i]!).toBeGreaterThan(ts[i - 1]!);
     }
+  });
+});
+
+describe("frameArgs", () => {
+  it("H.264 偶数尺寸：竖屏用 scale=640:-2 不用 -1", () => {
+    const args = frameArgs("/tmp/v.mp4", 1, "/tmp/f.jpg");
+    expect(args).toContain("scale=640:-2");
+    expect(args.join(" ")).not.toContain("640:-1");
   });
 });
 
