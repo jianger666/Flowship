@@ -569,7 +569,7 @@ const runChatReplyInject = async (
       }
       let persistWarning: string | undefined;
       try {
-        const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
+        const capture = await sendTimed("checkpoint#askwait", tryCaptureCheckpoint());
         const replyEvent = await persistReplyAndCheckpoint(capture);
         if (replyEvent && clientItemId) {
           markMessagePersisted(task.id, clientItemId);
@@ -657,7 +657,7 @@ const runChatReplyInject = async (
       let sentOk = false;
       try {
         // 快照必须在 agent.send 之前（send 后 consume 即可能改文件）
-        const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
+        const capture = await sendTimed("checkpoint#send", tryCaptureCheckpoint());
         // ownerInstanceId：owner 实例精确匹配才跳过 runActive 早退；
         // checkpoint 期间被 stop 摘除 / forceClear 换新实例 → send 内按
         // cancelled / owner_invalid 收敛（取消是终态、绝不能当可重试故障）
@@ -913,7 +913,7 @@ const runChatReplyInject = async (
           await failpoint("chatReply.afterQueuePriorityPersist");
         } else {
           // 队首尚未落事件 → 先快照再按队首字段写 user_reply（形状对齐 persistUserReply）
-          const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
+          const capture = await sendTimed("checkpoint#queue", tryCaptureCheckpoint());
           // 测试可在 checkpoint 后挂起——此时 queue_state 必须仍含 head id
           await failpoint("chatReply.afterQueuePriorityCheckpoint");
           // checkpoint 可能很慢——落 user_reply 之前必须复查，绝不为已删任务写气泡
@@ -1038,7 +1038,7 @@ const runChatReplyInject = async (
     }
 
     // 确定会起新会话 → 先快照再落 user_reply（runner 要 firstMessageEventId 锚定本轮回答义务）
-    const capture = await sendTimed("checkpoint", tryCaptureCheckpoint());
+    const capture = await sendTimed("checkpoint#newsession", tryCaptureCheckpoint());
     // checkpoint 窗口是 stop/DELETE 高频命中区——落 user_reply 前必须复查
     if (!isChatStartLeaseValid(task.id, startToken)) {
       return leaseAbortedResponse();
@@ -1180,12 +1180,13 @@ const runChatReplyInject = async (
     }
   }
   } finally {
-    // 发送预处理耗时汇总（单行，快照/恢复/send/落盘各节耗时一目了然）
+    // 发送预处理耗时汇总（单行，快照/恢复/send/落盘各节耗时一目了然）。
+    // main.log 减负：>10s warn、>1s info，1s 内正常发送不记行（慢阶段各自 warn 已覆盖）。
     try {
       const total = Date.now() - sendT0;
       const line = `[chat-reply] send timings task=${id} total=${total}ms ${sendMarks.join(" ")}`;
       if (total > 10000) console.warn(line + "（超 10s，疑似发送卡顿）");
-      else console.log(line);
+      else if (total > 1000) console.log(line);
     } catch {
       /* 取证日志不得影响主流程 */
     }

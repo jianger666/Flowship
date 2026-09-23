@@ -57,7 +57,9 @@ const findBin = async (name: string): Promise<string | null> => {
   return null;
 };
 
-// 进程级缓存：每次大视频都跑 2~8 次 -version 太贵；路径中途不会变
+// 进程级缓存：每次大视频都跑 2~8 次 -version 太贵；路径中途不会变。
+// 注意 null 也缓存：机器后装 ffmpeg 要重启进程才生效（可接受，无 reset helper——
+// 目前没有单测覆盖 findFfmpegBins，需要时再加）。
 let binsCache: Promise<{
   ffmpeg: string;
   ffprobe: string;
