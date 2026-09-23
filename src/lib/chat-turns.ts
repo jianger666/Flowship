@@ -89,6 +89,28 @@ const MEMBER_KINDS = new Set<string>([
   "__tool_verb_group__",
 ]);
 
+/**
+ * 启动链 info 进组（2026-09-23、用户嫌每次发消息刷 6 行）：
+ * 唤醒 / 已唤醒 / 准备工作区 / 启动 agent / MCP 跳过——纯过程噪音、与 thinking 同档，
+ * 收进工作过程组（跑着展开、完事收起）。后端事件不动，只收前端展示。
+ * 「用户停止了…」「本次新增…批次」「已回复」等操作反馈不在此列、继续独立平铺。
+ */
+const BOOT_INFO_PREFIXES: readonly string[] = [
+  "正在唤醒当前阶段",
+  "已唤醒当前",
+  "正在准备工作区",
+  "正在启动 agent",
+];
+
+export const isBootInfoText = (text: unknown): boolean => {
+  if (typeof text !== "string" || text.length === 0) return false;
+  if (BOOT_INFO_PREFIXES.some((p) => text.startsWith(p))) return true;
+  return text.includes("不可用的 MCP");
+};
+
+export const isBootInfoItem = (it: StreamRenderItem): boolean =>
+  it.kind === "info" && isBootInfoText((it as TaskEvent).text);
+
 // error 事件已不进组（见 MEMBER_KINDS）、组内只可能剩「工具执行失败」这一种错
 const memberHasError = (it: StreamRenderItem): boolean => {
   if (it.kind === "__tool_block__") {
@@ -126,8 +148,8 @@ const buildWorkGroup = (members: StreamRenderItem[]): WorkGroupItem => {
 };
 
 /**
- * 线性扫产组：连续过程项（thinking / 工具）收进同一组；
- * 任何非过程项（user_reply / assistant_message / error / ask_* / info / 未知）
+ * 线性扫产组：连续过程项（thinking / 工具 / 启动链 info）收进同一组；
+ * 任何非过程项（user_reply / assistant_message / error / ask_* / 非启动类 info / 未知）
  * 独立输出并隔断组。单成员也成组（统一渲染路径）。O(n)。
  */
 export const groupChatRenderItems = (
@@ -145,7 +167,7 @@ export const groupChatRenderItems = (
   };
 
   for (const it of items) {
-    if (MEMBER_KINDS.has(it.kind)) {
+    if (MEMBER_KINDS.has(it.kind) || isBootInfoItem(it)) {
       buf.push(it);
       continue;
     }

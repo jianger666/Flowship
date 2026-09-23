@@ -16,6 +16,7 @@ import { usePaneSearchHighlight } from "@/components/ui/pane-search-highlight-co
 import { useStreamFollowContext } from "@/hooks/use-stream-follow";
 import {
   PROCESSING_PLACEHOLDER_LABEL,
+  isBootInfoItem,
   type WorkGroupItem,
 } from "@/lib/chat-turns";
 import { formatDurationCoarse } from "@/lib/duration-display";
@@ -176,6 +177,10 @@ const WorkGroupRowImpl = ({
 
   // 折叠且 running / 处理中：右侧一眼活动，组头要极淡不抢戏
   let runningTail: string | null = null;
+  // 全启动链成员（唤醒/工作区/agent/MCP 跳过）→ 标题写「启动过程」别写「工作过程」
+  const allBoot =
+    group.members.length > 0 &&
+    group.members.every((m) => isBootInfoItem(m));
   if (!expanded) {
     if (group.hasRunning) runningTail = lastRunningName(group.members);
     else if (showProcessingPlaceholder) {
@@ -191,7 +196,7 @@ const WorkGroupRowImpl = ({
         className="flex h-7 w-full cursor-pointer items-center gap-1.5 rounded px-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:bg-muted/30 hover:text-muted-foreground"
       >
         <CollapseChevron open={expanded} />
-        <span className="shrink-0">工作过程</span>
+        <span className="shrink-0">{allBoot ? "启动过程" : "工作过程"}</span>
         <span className="shrink-0 tabular-nums">· {group.stepCount} 步</span>
         {group.hasRunning ? (
           <Loader2 className="size-3 shrink-0 animate-spin text-info" />
