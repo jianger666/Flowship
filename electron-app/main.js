@@ -2183,7 +2183,7 @@ if (!app.requestSingleInstanceLock()) {
     const bootTimeoutMs = firstBoot ? 150_000 : 60_000;
     log(`[main] 等 server 就绪（timeout=${bootTimeoutMs} firstBoot=${firstBoot})`);
     const bootWaitStart = Date.now();
-    const bootElapsedS = (): string =>
+    const bootElapsedS = () =>
       ((Date.now() - bootWaitStart) / 1000).toFixed(1);
     let serverReady = await waitForReady(bootTimeoutMs);
     log(`[main] 首轮等待${serverReady ? "命中" : "超时"}、累计 ${bootElapsedS()}s`);

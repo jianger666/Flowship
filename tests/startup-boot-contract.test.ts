@@ -1,14 +1,19 @@
 /** 启动超时链路契约：一次性 30s 曾导致 Windows 首次启动必现"启动超时"。 */
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-const main = readFileSync(
-  path.resolve(import.meta.dirname, "..", "electron-app/main.js"),
-  "utf8",
-);
+const mainJsPath = path.resolve(import.meta.dirname, "..", "electron-app/main.js");
+const main = readFileSync(mainJsPath, "utf8");
 
 describe("启动超时不再一刀切（首次冷启动给足时间）", () => {
+  it("electron-app/main.js 是纯 JS ESM，不能夹带 TS 语法（node --check 必须通过）", () => {
+    expect(() => {
+      execFileSync(process.execPath, ["--check", mainJsPath], { encoding: "utf8" });
+    }).not.toThrow();
+  });
+
   it("默认超时 60s、首次 150s，不再是 30s 一次性", () => {
     expect(main).toContain("timeoutMs = 60_000");
     expect(main).toContain("150_000 : 60_000");
