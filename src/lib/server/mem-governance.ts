@@ -1,11 +1,14 @@
 /**
- * 内存治理契约（mem-governance v2 开工清单配套）。
+ * 内存治理契约（mem-governance v2 开工清单配套 + v3.1 Worker 进程隔离终版）。
  *
  * 本文件只放**纯函数 + 常量**（无 SDK 依赖、无副作用），供 ①③ 直接用、② 落契约：
  * - ① 即用即还判定：shouldDisposeAfterAction（task-runner 正常结束路径调用）
  * - ② 意图日志幂等键 / 事件去重键：落成可直接写成代码接口的粒度
  * - ② 恢复侧跨表校验：isCheckpointUsable（sqlite 只保单事务原子，跨表需校验+回退）
  * - ② 内置工具拦截点：BUILTIN_TOOL_INTERCEPT（实验 B 检查项，包不住则意图日志不可写）
+ * - v3.1（Worker 进程隔离终版 + 封版纪要）：§3 双 guard / §3.4 整机顶公式 /
+ *   §4 双限额 / §5.1 intent 标记与 at-most-once / §6 接力预算 / §7 epoch 去重与 fencing
+ *   全部为纯契约；涉及文件 IO 的 epoch 派发实现见 `worker-epoch.ts`（按 stateRoot 独立）。
  *
  * 档位标注（终审口径）：每条结论标 [源码证据 / 设计决策 / 待实验] 之一。
  */
@@ -159,4 +162,252 @@ export const isSideEffectInterceptCovered = (
   if (opts.bashDisabledOrAdopted === true) return true;
   const byTool = new Map(results.map((r) => [r.tool, r.interceptable]));
   return byTool.get("bash") === true;
+};
+
+// ================ v3.1 Worker 进程隔离（终版 + 封版纪要） ================
+// 约定：以下全部为纯契约（无 IO、无 SDK 依赖）。文件 IO 的 epoch 派发见 worker-epoch.ts。
+
+/** [设计决策] 空闲 TTL 唯一常数：worker 空闲 reaping 与会话 TTL 对齐，消除错位窗（封版纪要修订三3）。 */
+export const IDLE_TTL_MINUTES = SESSION_IDLE_TTL_MINUTES;
+
+/** [设计决策] worker 空闲 reaping TTL（= IDLE_TTL，单点收敛，改一处即全改）。 */
+export const WORKER_IDLE_REAP_MINUTES = IDLE_TTL_MINUTES;
+
+// ---------- §3.2 触发判定：双 guard（绝对值 + 比例）+ RSS 线 ----------
+
+/** [设计决策] worker old-space 绝对值水位（spawn 上限 1536 下良定义，实验 A 校准）。 */
+export const WORKER_OLD_SPACE_SOFT_BYTES = 1.2 * 1024 * 1024 * 1024;
+export const WORKER_OLD_SPACE_HARD_BYTES = 1.5 * 1024 * 1024 * 1024;
+
+/** [设计决策] old-space 占 heap_size_limit 比例 guard（防他日改上限忘改阈值 + 主进程侧主力）。 */
+export const WORKER_HEAP_RATIO_SOFT = 0.6 as const;
+export const WORKER_HEAP_RATIO_HARD = 0.8 as const;
+
+/**
+ * [设计决策] 进程 RSS 水位（native / sqlite cache / Buffer 不在 old-space 内，必须单列）。
+ * 初值 = old-space 阈值 ×1.3 / ×1.5，实验 A 校准。[待实验]
+ */
+export const WORKER_RSS_SOFT_BYTES = 2.0 * 1024 * 1024 * 1024;
+export const WORKER_RSS_HARD_BYTES = 2.3 * 1024 * 1024 * 1024;
+
+export type WorkerMemoryLevel = "normal" | "soft" | "hard";
+
+export interface WorkerMemorySample {
+  /** V8 old-space 已用（worker 自报） */
+  oldSpaceBytes: number;
+  /** old-space / heap_size_limit（worker 自报，缺省用绝对值判定） */
+  heapRatio?: number;
+  /** 进程 RSS（worker 自报 + 主进程仲裁） */
+  rssBytes: number;
+}
+
+/**
+ * [设计决策] 双 guard 任一命中即触发：三条线各算档位，取最高。
+ * 纯函数，单测锁行为。
+ */
+export const classifyWorkerMemory = (s: WorkerMemorySample): WorkerMemoryLevel => {
+  const levels: WorkerMemoryLevel[] = [];
+  levels.push(
+    s.oldSpaceBytes >= WORKER_OLD_SPACE_HARD_BYTES
+      ? "hard"
+      : s.oldSpaceBytes >= WORKER_OLD_SPACE_SOFT_BYTES
+        ? "soft"
+        : "normal",
+  );
+  if (typeof s.heapRatio === "number") {
+    levels.push(
+      s.heapRatio >= WORKER_HEAP_RATIO_HARD
+        ? "hard"
+        : s.heapRatio >= WORKER_HEAP_RATIO_SOFT
+          ? "soft"
+          : "normal",
+    );
+  }
+  levels.push(
+    s.rssBytes >= WORKER_RSS_HARD_BYTES
+      ? "hard"
+      : s.rssBytes >= WORKER_RSS_SOFT_BYTES
+        ? "soft"
+        : "normal",
+  );
+  if (levels.includes("hard")) return "hard";
+  if (levels.includes("soft")) return "soft";
+  return "normal";
+};
+
+// ---------- §3.4 整机内存顶（A1-全局） ----------
+
+/** [设计决策] MAX_WORKERS 硬顶（再多也不 spawn，进队列排队）。 */
+export const MAX_WORKERS_HARD_CAP = 4 as const;
+
+/** [设计决策] 系统余量初值 1.5G（实验 A 校准；RESERVE 含 Next server + Electron 预算 + 余量）。 */
+export const SYSTEM_RESERVE_BYTES = 1.5 * 1024 * 1024 * 1024;
+
+export interface MaxWorkersInput {
+  totalMemBytes: number;
+  reserveBytes: number;
+  workerHardBytes?: number;
+  hardCap?: number;
+}
+
+/**
+ * [设计决策] 动态公式（封版纪要修订三2）：
+ * MAX_WORKERS = max(1, min(4, floor((total - reserve) / workerHard)))。
+ * 下限 1 保证小内存机器至少能跑一个 worker；上取整溢出/负数时同样保底 1。
+ */
+export const resolveMaxWorkers = (input: MaxWorkersInput): number => {
+  const workerHard = input.workerHardBytes ?? WORKER_RSS_HARD_BYTES;
+  const cap = input.hardCap ?? MAX_WORKERS_HARD_CAP;
+  if (!(workerHard > 0)) return 1;
+  const usable = input.totalMemBytes - input.reserveBytes;
+  const byMem = Math.floor(usable / workerHard);
+  if (!Number.isFinite(byMem)) return 1;
+  return Math.max(1, Math.min(cap, byMem));
+};
+
+/** [设计决策] 整机公式：TOTAL_RSS_LIMIT = MAIN_PROC_RSS + MAX_WORKERS × WORKER_RSS_HARD。 */
+export const buildTotalRssLimit = (args: {
+  mainProcRssBytes: number;
+  maxWorkers: number;
+  workerHardBytes?: number;
+}): number =>
+  args.mainProcRssBytes +
+  args.maxWorkers * (args.workerHardBytes ?? WORKER_RSS_HARD_BYTES);
+
+// ---------- §4 重启阶梯：续接双限额 ----------
+
+/** [设计决策] 每 action ≤3 次自动续接。 */
+export const ROTATION_MAX_PER_ACTION = 3 as const;
+/** [设计决策] 每 task 每小时 ≤6 次（初值，实验校准）。 */
+export const ROTATION_MAX_PER_TASK_PER_HOUR = 6 as const;
+/** [设计决策] 单 task 计数超 50 即整 task 降级（防单 task 挤爆全局 500 额度）。 */
+export const ROTATION_TASK_TOTAL_CAP = 50 as const;
+
+export interface RotationAllowanceInput {
+  actionCount: number;
+  taskHourCount: number;
+  taskTotalCount: number;
+}
+
+export type RotationDenyReason = "action-cap" | "hour-cap" | "task-cap";
+
+/**
+ * [设计决策] 双限额任一超限即降级为「停止自动续接、提示用户手动唤醒」。
+ * 自然完成回退计数由调用方负责（防白扣），本函数只判当前值。
+ */
+export const isRotationAllowed = (
+  input: RotationAllowanceInput,
+): { allowed: boolean; reason?: RotationDenyReason } => {
+  if (input.actionCount >= ROTATION_MAX_PER_ACTION)
+    return { allowed: false, reason: "action-cap" };
+  if (input.taskHourCount >= ROTATION_MAX_PER_TASK_PER_HOUR)
+    return { allowed: false, reason: "hour-cap" };
+  if (input.taskTotalCount >= ROTATION_TASK_TOTAL_CAP)
+    return { allowed: false, reason: "task-cap" };
+  return { allowed: true };
+};
+
+// ---------- §5.1 意图日志：at-most-once + 幂等标记 ----------
+
+/** [设计决策] 外发消息幂等标记格式（feishu-message / notify 共用，人工比对用）。 */
+export const INTENT_REF_MARKER_PREFIX = "[ref:" as const;
+
+export const buildIntentRefMarker = (intentId: string): string =>
+  `${INTENT_REF_MARKER_PREFIX}${intentId}]`;
+
+/** [设计决策] 无查询 API 的 kind 一律 at-most-once（宁漏勿重，产品决策——封版纪要修订二1）。 */
+export const INTENT_AT_MOST_ONCE_KINDS = [
+  "feishu-message",
+  "notify",
+] as const;
+
+export type AtMostOnceKind = (typeof INTENT_AT_MOST_ONCE_KINDS)[number];
+
+export const isAtMostOnceKind = (kind: SideEffectIntent["kind"]): boolean =>
+  (INTENT_AT_MOST_ONCE_KINDS as readonly string[]).includes(kind);
+
+/**
+ * [设计决策] 恢复策略：at-most-once 的 kind 查不到/对不上 → 标 abandoned 人工，不自动重试；
+ * external-api 对方不支持幂等键透传 → 同样 abandoned、不自动重试。
+ */
+export const shouldAutoRetryIntent = (args: {
+  kind: SideEffectIntent["kind"];
+  verifiedAbsent: boolean;
+}): boolean => {
+  // 只有「确认对方没收到」才允许重试；不确定时 at-most-once 的一律不重发。
+  if (!args.verifiedAbsent) return false;
+  if (isAtMostOnceKind(args.kind)) return false;
+  return true;
+};
+
+// ---------- §6 切段续接：接力消息硬预算 ----------
+
+/** [设计决策] 接力消息硬预算 ≤8k token，超限触发二级摘要。 */
+export const RELAY_BUDGET_TOKENS = 8000 as const;
+
+export const isRelayOverBudget = (tokens: number): boolean =>
+  tokens > RELAY_BUDGET_TOKENS;
+
+// ---------- §7 epoch + fencing（纯侧；IO 见 worker-epoch.ts） ----------
+
+/** [设计决策] epoch 文件名（按 stateRoot 独立存放，跨 workspace 互不影响——封版纪要修订一）。 */
+export const WORKER_EPOCH_FILENAME = "worker-epoch.json" as const;
+
+export interface WorkerEpochDoc {
+  epoch: number;
+}
+
+/** 纯函数：解析 epoch 文件内容；缺失/损坏 → 0（调用方据此从 1 开始派发）。 */
+export const parseWorkerEpoch = (raw: string | null | undefined): number => {
+  if (!raw) return 0;
+  try {
+    const doc = JSON.parse(raw) as Partial<WorkerEpochDoc>;
+    const n = typeof doc.epoch === "number" ? Math.floor(doc.epoch) : NaN;
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+};
+
+/** 纯函数：下一 epoch（当前 +1，下限 1）。 */
+export const nextWorkerEpoch = (current: number): number =>
+  (Number.isFinite(current) && current >= 0 ? Math.floor(current) : 0) + 1;
+
+/**
+ * [设计决策] fencing：同 stateRoot 内，写请求的 epoch 小于当前落盘 epoch → 拒绝
+ * （旧 worker 假死复活后的一切写被挡掉，杜绝双跑双写）。跨 workspace 不比较。
+ */
+export const isWriteFenced = (args: {
+  writeEpoch: number;
+  currentEpoch: number;
+}): boolean => args.writeEpoch < args.currentEpoch;
+
+/** [设计决策] IPC 事件去重键（含 epoch，同 workspace 语义；不依赖 SDK seq 语义）。 */
+export const buildEventDedupKeyWithEpoch = (
+  agentId: string,
+  runId: string,
+  epoch: number,
+  localSeq: number,
+): string => `${agentId}:${runId}:${epoch}:${localSeq}`;
+
+// ---------- §5.2 四档拦截点（实验 B 优先级最高的一问） ----------
+
+export type InterceptTier = "a-hook" | "b-override" | "c-path-shim" | "d-residual";
+
+export interface InterceptTierInput {
+  hasHook: boolean;
+  hasToolOverride: boolean;
+  pathInjectionEffective: boolean;
+}
+
+/**
+ * [待实验] 四档判定：(a) hook → 包 hook；(b) override → wrapper 路线成立；
+ * (c) PATH 注入生效 → PATH shim 成立；(d) 都没有 → 残余风险升级，用户拍板。
+ * 判定只影响路线选择，不影响「无覆盖不许静默跳过」的硬约束。
+ */
+export const decideInterceptTier = (input: InterceptTierInput): InterceptTier => {
+  if (input.hasHook) return "a-hook";
+  if (input.hasToolOverride) return "b-override";
+  if (input.pathInjectionEffective) return "c-path-shim";
+  return "d-residual";
 };

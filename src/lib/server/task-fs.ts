@@ -78,7 +78,8 @@ import {
 } from "./task-worktrees";
 import { sameRepoPathList } from "@/lib/path-utils";
 import { reapTaskOrphans } from "./kill-orphans";
-import { maybeFireMidRunRotation, rotationUsageOf } from "./session-rotate";
+import { getWorkerMemorySample, maybeFireMidRunRotation, probeWorkerRotation, rotationUsageOf } from "./session-rotate";
+import { isWorkerIsolationEnabled } from "./worker-mode";
 import { maybeGcSdkStore } from "./sdk-store-gc";
 import {
   cleanupCheckpointRefsForTask,
@@ -871,6 +872,15 @@ const runBootRecovery = async (): Promise<void> => {
   // 2026-09-04 OOM 根治：SDK JSONL store 瘦身（只删孤儿 agent 行、活的不动）。
   // 扔后台跑、不挡启动（GC 流式实现，自己不爆堆）；失败内部吞掉。
   maybeGcSdkStore();
+
+  // v3.1 接线层 B1：worker 隔离翻转恢复钩子（常驻，默认零行为变化——
+  // flag 关直接返回；flag 开但真 deps 未注册只扫描不执行，见 worker-flip）。
+  try {
+    const { recoverWithRegistered } = await import("./worker-flip");
+    await recoverWithRegistered([...liveTaskIds]);
+  } catch (err) {
+    console.warn("[task-fs] boot recovery: worker-flip 恢复钩子异常（已吞）:", err);
+  }
 };
 
 const ensureBootRecovery = async (): Promise<void> => {
@@ -1899,8 +1909,38 @@ export const recordTurnUsage = async (
   });
   // run 内水位探针（2026-09-22 自动压缩续接）：记账即查水位、锁外触发（cancel 不进任务锁）。
   // 未登记触发器（chat / run 空窗）= no-op，注册表见 session-rotate。
-  if (task) maybeFireMidRunRotation(taskId, rotationUsageOf(task));
+  // v3.1 接线层收尾线②：flag 开 → worker 样本新路径（无样本回落老路径）；关 → 老路径逐字节不变。
+  if (task) {
+    if (isWorkerIsolationEnabled()) {
+      fireWorkerIsolationProbe(taskId, task);
+    } else {
+      maybeFireMidRunRotation(taskId, rotationUsageOf(task));
+    }
+  }
   return task;
+};
+
+/**
+ * 收尾线②探针实现：有 worker 样本走双 guard + 双限额新路径；
+ * 无样本回落老路径（fail-safe：样本没流过来时保护不缺席）。
+ * 超限降级记 warn（提示用户手动唤醒由触发回调的消费方负责——与老路径同语义）。
+ */
+const fireWorkerIsolationProbe = (taskId: string, task: Task): void => {
+  try {
+    const sample = getWorkerMemorySample(taskId);
+    if (!sample) {
+      maybeFireMidRunRotation(taskId, rotationUsageOf(task));
+      return;
+    }
+    const r = probeWorkerRotation(taskId, task.currentActionId, sample);
+    if (r.denyReason) {
+      console.warn(
+        `[task-fs] worker 轮换达限 task=${taskId} reason=${r.denyReason}、停止自动续接（手动唤醒）`,
+      );
+    }
+  } catch {
+    /* 探针绝不反伤记账 */
+  }
 };
 
 /**

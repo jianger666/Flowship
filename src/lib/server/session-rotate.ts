@@ -18,6 +18,8 @@
  */
 
 import type { Task } from "@/lib/types";
+import type { WorkerMemorySample } from "./mem-governance";
+import { classifyWorkerMemory, isRotationAllowed } from "./mem-governance";
 import { heapPressure } from "./sdk-store-gc";
 
 /** 当前 SDK 会话累计 input 超过此值 → 下轮轮换（同事实测崩时 278 万） */
@@ -67,7 +69,13 @@ export const rotationUsageOf = (
 //   - chat 不登记（懒重启已兜底）、无登记 = no-op
 // 判定复用 shouldRotateSession 双条件（水位 + 堆过半、防过矫语义与边界轮换一致）。
 
-export type MidRunRotationTrigger = () => void;
+export type WorkerRotationAction = "none" | "soft" | "hard";
+
+/**
+ * run 内轮换触发器。参数为触发档位（soft=等收尾、hard=工具间隙截断）；
+ * 存量注册方（无参）保持兼容——少参数函数可赋值给多参数签名。
+ */
+export type MidRunRotationTrigger = (action?: WorkerRotationAction) => void;
 
 const midRunRotationTriggers = new Map<string, MidRunRotationTrigger>();
 
@@ -103,4 +111,151 @@ export const maybeFireMidRunRotation = (
   } catch {
     /* 触发失败不挡记账 */
   }
+};
+
+// ---------------- v3.1 §3.2：堆/RSS 水位独立触发（加法，不改存量语义） ----------------
+//
+// 存量 shouldRotateSession = token 水位 AND 堆过半（防过矫）。v3.1 终版要求堆/RSS
+// 水位独立可触发（token 降级为日志参考）。本函数是新触发器实现，调用方（worker
+// 模式接线）在 recordTurnUsage 探针处按 worker 上报的 sample 调用；存量路径不动，
+// 等实验 A 校准常数 + 热路径接线时再切换。单测锁行为。
+// WorkerRotationAction 类型见上（run 内水位触发器一节，与 MidRunRotationTrigger 同处）。
+
+/** 纯函数：worker 内存样本 → 轮换动作（soft=等 run 收尾重启，hard=工具间隙截断）。 */
+export const workerRotationActionFor = (sample: WorkerMemorySample): WorkerRotationAction => {
+  const level = classifyWorkerMemory(sample);
+  return level === "hard" ? "hard" : level === "soft" ? "soft" : "none";
+};
+
+/**
+ * worker 模式记账点调用：sample 命中软/硬线即触发已登记的回调。绝不 throw。
+ */
+export const maybeFireWorkerRotation = (
+  taskId: string,
+  sample: WorkerMemorySample,
+): WorkerRotationAction => {
+  try {
+    const action = workerRotationActionFor(sample);
+    if (action !== "none") midRunRotationTriggers.get(taskId)?.(action);
+    return action;
+  } catch {
+    return "none";
+  }
+};
+
+// ---------- v3.1 接线层：worker 样本注册 + 双限额计数 ----------
+//
+// worker 自监控上报经 IPC 到主进程后调 reportWorkerMemorySample 登记最新样本；
+// recordTurnUsage 探针（flag 开）读样本走新路径，无样本回落老路径（fail-safe）。
+// 计数器与 task-runner 存量 midRunRotationCounts 相互独立（新路径切段走新计数，
+// 老路径计数不动），双限额任一超限即降级提示用户。
+
+const workerSamples = new Map<string, WorkerMemorySample>();
+
+/** worker 自上报中继调用（绝不 throw）。 */
+export const reportWorkerMemorySample = (taskId: string, sample: WorkerMemorySample): void => {
+  try {
+    workerSamples.set(taskId, sample);
+  } catch {
+    /* 埋点不许反伤 */
+  }
+};
+
+export const getWorkerMemorySample = (taskId: string): WorkerMemorySample | null => {
+  try {
+    return workerSamples.get(taskId) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+export const clearWorkerMemorySamples = (): void => {
+  workerSamples.clear();
+};
+
+/** ③修复：task 换代时清旧样本（防旧 task 样本残留误触发）。单测隔离亦用此。 */
+export const clearWorkerMemorySample = (taskId: string): void => {
+  try {
+    workerSamples.delete(taskId);
+  } catch {
+    /* 埋点不许反伤 */
+  }
+};
+
+interface RotationCounters {
+  perAction: Map<string, number>;
+  perTaskHour: Map<string, { windowStart: number; count: number }>;
+  perTaskTotal: Map<string, number>;
+}
+
+const counters: RotationCounters = {
+  perAction: new Map(),
+  perTaskHour: new Map(),
+  perTaskTotal: new Map(),
+};
+
+const HOUR_MS = 3600 * 1000;
+const COUNTERS_MAX = 500;
+
+const evictCounters = (): void => {
+  for (const m of [counters.perAction, counters.perTaskHour, counters.perTaskTotal] as const) {
+    while (m.size > COUNTERS_MAX) {
+      const oldest = m.keys().next();
+      if (oldest.done) break;
+      m.delete(oldest.value);
+    }
+  }
+};
+
+export interface WorkerRotationProbeResult {
+  action: WorkerRotationAction;
+  fired: boolean;
+  denyReason?: string;
+}
+
+/**
+ * flag 开的探针实现：样本缺失 → {none, fired:false}（调用方回落老路径）；
+ * 命中软/硬线 → 双限额检查 → 允许则计数+触发回调（含档位），超限则降级不触发。
+ * 自然完成回退计数由调用方负责（另见 clearWorkerRotationCounters 测后清理）。
+ */
+export const probeWorkerRotation = (
+  taskId: string,
+  actionId: string | null | undefined,
+  sample: WorkerMemorySample | null,
+  now = Date.now(),
+): WorkerRotationProbeResult => {
+  try {
+    if (!sample) return { action: "none", fired: false };
+    const action = workerRotationActionFor(sample);
+    if (action === "none") return { action, fired: false };
+    const actionKey = actionId ?? taskId;
+    const hour = counters.perTaskHour.get(taskId);
+    const hourCount = hour && now - hour.windowStart < HOUR_MS ? hour.count : 0;
+    const allowed = isRotationAllowed({
+      actionCount: counters.perAction.get(actionKey) ?? 0,
+      taskHourCount: hourCount,
+      taskTotalCount: counters.perTaskTotal.get(taskId) ?? 0,
+    });
+    if (!allowed.allowed) {
+      return { action, fired: false, denyReason: allowed.reason };
+    }
+    counters.perAction.set(actionKey, (counters.perAction.get(actionKey) ?? 0) + 1);
+    counters.perTaskTotal.set(taskId, (counters.perTaskTotal.get(taskId) ?? 0) + 1);
+    if (hour && now - hour.windowStart < HOUR_MS) {
+      hour.count += 1;
+    } else {
+      counters.perTaskHour.set(taskId, { windowStart: now, count: 1 });
+    }
+    evictCounters();
+    midRunRotationTriggers.get(taskId)?.(action);
+    return { action, fired: true };
+  } catch {
+    return { action: "none", fired: false };
+  }
+};
+
+export const clearWorkerRotationCounters = (): void => {
+  counters.perAction.clear();
+  counters.perTaskHour.clear();
+  counters.perTaskTotal.clear();
 };

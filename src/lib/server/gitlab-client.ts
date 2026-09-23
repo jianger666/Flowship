@@ -242,6 +242,18 @@ const findOpenMR = async (
 };
 
 /**
+ * §5.1 反查 API（worker-flip merge-request handler 用）：按 source→target 查 open MR。
+ * 薄导出，语义与 findOpenMR 一致：{ok:true,mr} / {ok:true,mr:null}（确认没有）/
+ * {ok:false}（查询失败——调用方按 abandoned 处理，不当成「没有」）。
+ */
+export const queryOpenMR = async (
+  input: Pick<
+    CreateMRInput,
+    "config" | "projectPath" | "sourceBranch" | "targetBranch"
+  >,
+): Promise<FindOpenMRResult> => findOpenMR(input);
+
+/**
  * 创建 MR（V0.6.1.1 起幂等：撞 409「已有同分支 open MR」时自动复用现有 MR、不当失败）
  *
  * 失败常见原因：
