@@ -149,13 +149,13 @@ describe("parseInboundContent markdown 图提取", () => {
   });
 
   it("超过 6 张图只下载前 6 张（超限降级）", async () => {
-    const png = await makePng();
     const keys: string[] = [];
     __setRouterDepsForTest(
       baseRouterDeps({
+        // 生产每个 key 独立下载成不同文件（代码转完即删）——mock 也按 key 建独立文件
         downloadMessageResource: async (_mid, key) => {
           keys.push(key);
-          return png;
+          return makePng();
         },
       }),
     );
@@ -299,6 +299,8 @@ describe("parseInboundContent 文件消息双形态", () => {
     );
     expect(parsed.unsupported).toBeUndefined();
     expect(parsed.images).toHaveLength(1);
+    // 原图转完即删，不堆积
+    await expect(fs.access(p)).rejects.toThrow();
   });
 });
 

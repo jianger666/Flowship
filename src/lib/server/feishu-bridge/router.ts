@@ -480,7 +480,13 @@ const extractMarkdownImages = async (
     if (images.length >= MAX_IMAGES) break;
     try {
       const abs = await deps.downloadMessageResource(messageId, key, "image");
-      const img = await fileToBase64Image(abs);
+      // 转完即删：bridge 目录无 TTL，不删会堆积 dl-* 小图
+      let img: { data: string; mimeType: string; filename: string } | null;
+      try {
+        img = await fileToBase64Image(abs);
+      } finally {
+        await fs.unlink(abs).catch(() => undefined);
+      }
       if (!img) continue;
       const approx = Math.floor((img.data.length * 3) / 4);
       if (totalBytes + approx > MAX_TOTAL_IMAGE_BYTES) continue;
@@ -535,6 +541,8 @@ export const parseInboundContent = async (
       "image",
     );
     const img = await fileToBase64Image(abs);
+    // 转完即删：bridge 目录无 TTL
+    await fs.unlink(abs).catch(() => undefined);
     if (!img) {
       return {
         text: "",
@@ -607,7 +615,13 @@ export const parseInboundContent = async (
               key,
               "image",
             );
-            const img = await fileToBase64Image(abs);
+            // 转完即删：bridge 目录无 TTL
+            let img: { data: string; mimeType: string; filename: string } | null;
+            try {
+              img = await fileToBase64Image(abs);
+            } finally {
+              await fs.unlink(abs).catch(() => undefined);
+            }
             if (img) {
               const approx = Math.floor((img.data.length * 3) / 4);
               if (totalBytes + approx <= MAX_TOTAL_IMAGE_BYTES) {
@@ -693,7 +707,7 @@ export const parseInboundContent = async (
       images.push(img);
     };
     if (imageKey) {
-      // 封面转完 base64 即删：bridge 目录无 TTL，不删会堆积（image/post 分支同病，另案跟进）
+      // 封面转完 base64 即删：bridge 目录无 TTL（image/post 分支同笔一起收）
       let coverAbs: string | null = null;
       try {
         coverAbs = await deps.downloadMessageResource(
