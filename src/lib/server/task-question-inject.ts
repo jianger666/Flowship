@@ -631,6 +631,7 @@ const runTaskQuestionInject = async (
       kind: "info",
       actionId: task.currentActionId ?? undefined,
       text: "正在唤醒当前阶段…",
+      meta: { subkind: "boot" },
     });
     // 等到 running 落盘再 200：旧实现 fire-and-forget，HTTP 带回失败态快照，
     // 详情页输入条不锁，用户再发就被 409「正在跑」。

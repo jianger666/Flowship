@@ -993,6 +993,7 @@ export const runChatSession = async (
     if (droppedMcp.length > 0) {
       await writeOwnedEventAndPublish(task.id, isStartCurrent, {
         kind: "info",
+        meta: { subkind: "boot" },
         text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
           .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
           .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,

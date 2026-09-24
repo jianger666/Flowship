@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   groupChatRenderItems,
+  groupHasBootWarn,
   isBootInfoItem,
   isBootInfoText,
   isWorkGroup,
@@ -72,6 +73,37 @@ describe("isBootInfoItem", () => {
       ts: 1,
     } as StreamRenderItem;
     expect(isBootInfoItem(tool)).toBe(false);
+  });
+});
+
+describe("isBootInfoItem 机器字段优先", () => {
+  it("meta.subkind=boot + 任意文案 → 进组（后端改字不怕）", () => {
+    const item = ev({
+      id: "b",
+      kind: "info",
+      text: "以后改成任何文案都不怕",
+      meta: { subkind: "boot" },
+    });
+    expect(isBootInfoItem(item)).toBe(true);
+    const out = groupChatRenderItems([
+      ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+      { ...item, ts: 2 },
+    ]);
+    expect(out.map((x) => x.kind)).toEqual(["user_reply", "__work_group__"]);
+  });
+
+  it("无字段的历史事件 → 回退中文匹配照样收", () => {
+    expect(isBootInfoItem(boot("b1", BOOT_TEXTS[0]!))).toBe(true);
+  });
+});
+
+describe("groupHasBootWarn", () => {
+  it("含警告行 → true；纯过程行 → false", () => {
+    expect(
+      groupHasBootWarn([boot("b0", BOOT_TEXTS[0]!), boot("b4", BOOT_TEXTS[4]!)]),
+    ).toBe(true);
+    expect(groupHasBootWarn([boot("b0", BOOT_TEXTS[0]!)])).toBe(false);
+    expect(groupHasBootWarn([])).toBe(false);
   });
 });
 

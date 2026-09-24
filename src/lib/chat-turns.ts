@@ -94,6 +94,9 @@ const MEMBER_KINDS = new Set<string>([
  * 唤醒 / 已唤醒 / 准备工作区 / 启动 agent / MCP 跳过——纯过程噪音、与 thinking 同档，
  * 收进工作过程组（跑着展开、完事收起）。后端事件不动，只收前端展示。
  * 「用户停止了…」「本次新增…批次」「已回复」等操作反馈不在此列、继续独立平铺。
+ *
+ * 约定（2026-09-24，review 立约）：新增过程类 info 必须带 `meta.subkind` 机器字段、
+ * 前端只认字段；中文前缀匹配仅兼容无字段的历史事件，别再加新前缀。
  */
 const BOOT_INFO_PREFIXES: readonly string[] = [
   "正在唤醒当前阶段",
@@ -108,8 +111,24 @@ export const isBootInfoText = (text: unknown): boolean => {
   return text.includes("不可用的 MCP");
 };
 
-export const isBootInfoItem = (it: StreamRenderItem): boolean =>
-  it.kind === "info" && isBootInfoText((it as TaskEvent).text);
+export const isBootInfoItem = (it: StreamRenderItem): boolean => {
+  if (it.kind !== "info") return false;
+  const ev = it as TaskEvent;
+  // 首选机器字段；历史事件无字段，回退中文匹配
+  if (ev.meta?.subkind === "boot") return true;
+  return isBootInfoText(ev.text);
+};
+
+/** 组内含 ⚠️ 警告行（MCP 跳过等）——组头挂标，折叠也不吞提示 */
+export const groupHasBootWarn = (
+  members: readonly StreamRenderItem[],
+): boolean =>
+  members.some(
+    (m) =>
+      m.kind === "info" &&
+      typeof (m as TaskEvent).text === "string" &&
+      (m as TaskEvent).text.includes("⚠️"),
+  );
 
 // error 事件已不进组（见 MEMBER_KINDS）、组内只可能剩「工具执行失败」这一种错
 const memberHasError = (it: StreamRenderItem): boolean => {

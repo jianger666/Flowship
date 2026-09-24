@@ -16,6 +16,7 @@ import { usePaneSearchHighlight } from "@/components/ui/pane-search-highlight-co
 import { useStreamFollowContext } from "@/hooks/use-stream-follow";
 import {
   PROCESSING_PLACEHOLDER_LABEL,
+  groupHasBootWarn,
   isBootInfoItem,
   type WorkGroupItem,
 } from "@/lib/chat-turns";
@@ -181,6 +182,8 @@ const WorkGroupRowImpl = ({
   const allBoot =
     group.members.length > 0 &&
     group.members.every((m) => isBootInfoItem(m));
+  // 警告标：MCP 跳过等 ⚠️ 行被折叠时组头留标，不吞提示（默认仍收起）
+  const hasBootWarn = groupHasBootWarn(group.members);
   if (!expanded) {
     if (group.hasRunning) runningTail = lastRunningName(group.members);
     else if (showProcessingPlaceholder) {
@@ -197,6 +200,14 @@ const WorkGroupRowImpl = ({
       >
         <CollapseChevron open={expanded} />
         <span className="shrink-0">{allBoot ? "启动过程" : "工作过程"}</span>
+        {hasBootWarn && (
+          <span
+            className="shrink-0"
+            title="含警告（多为 MCP 跳过），展开查看"
+          >
+            ⚠️
+          </span>
+        )}
         <span className="shrink-0 tabular-nums">· {group.stepCount} 步</span>
         {group.hasRunning ? (
           <Loader2 className="size-3 shrink-0 animate-spin text-info" />

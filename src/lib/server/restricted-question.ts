@@ -206,6 +206,7 @@ export const startRestrictedGroupQuestion = (
         {
           kind: "info",
           text: "群答疑：正在准备工作区…",
+          meta: { subkind: "boot" },
         },
         origin,
       );

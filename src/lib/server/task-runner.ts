@@ -1160,7 +1160,11 @@ const advanceTaskCore = async (
       await writeOwnedEventAndPublish(
         task.id,
         () => !isTaskOpStale(task.id, opGen),
-        { kind: "info", text: "正在准备工作区…" },
+        {
+          kind: "info",
+          text: "正在准备工作区…",
+          meta: { subkind: "boot" },
+        },
       );
       if (upcomingWkCommand && resolveFlowLock(task.actions) === null) {
         branchSelection = { kind: "detached" };
@@ -1737,7 +1741,12 @@ const resumeCurrentActionCore = async (
       kind: "info",
       actionId: action.id,
       text: `已唤醒当前 ${actionDisplayLabel(action)} 阶段（n=${action.n}）、新 agent 接手继续`,
-      meta: { resumedActionId: action.id, actionType: action.type, n: action.n },
+      meta: {
+        resumedActionId: action.id,
+        actionType: action.type,
+        n: action.n,
+        subkind: "boot",
+      },
     },
   );
   await abortIfTaskOpStale(fresh.id, opGen);
@@ -1750,7 +1759,7 @@ const resumeCurrentActionCore = async (
       await writeOwnedEventAndPublish(
         fresh.id,
         () => isOpOwner(opHandle),
-        { kind: "info", actionId: action.id, text: "正在准备工作区…" },
+        { kind: "info", actionId: action.id, text: "正在准备工作区…", meta: { subkind: "boot" } },
       );
       ensured = await ensureTaskWorktrees(startTask, () => isOpOwner(opHandle), {
         deferDepClone: true,
@@ -3087,6 +3096,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         kind: "info",
         actionId: action.id,
         text: `正在启动 agent…（model: ${model.id}、${mcpDesc}）`,
+        meta: { subkind: "boot" },
       },
     );
 
@@ -3099,6 +3109,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         {
           kind: "info",
           actionId: action.id,
+          meta: { subkind: "boot" },
           text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
             .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
             .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
@@ -5499,7 +5510,7 @@ export const startOneShotQuestion = (
       await writeOwnedEventAndPublish(
         task.id,
         () => isTaskOpCurrent(oneshotOpHandle),
-        { kind: "info", text: "正在准备工作区…" },
+        { kind: "info", text: "正在准备工作区…", meta: { subkind: "boot" } },
       );
       try {
         await ensureWorkspaceReady(task, () => isTaskOpCurrent(oneshotOpHandle), {
@@ -5574,7 +5585,7 @@ export const startOneShotQuestion = (
           await writeOwnedEventAndPublish(
             task.id,
             () => isTaskOpCurrent(oneshotOpHandle),
-            { kind: "info", text: "正在启动 agent…" },
+            { kind: "info", text: "正在启动 agent…", meta: { subkind: "boot" } },
           );
           // SDK local 无 env 透传 → 启动前同步 company-env.json
           await syncCompanyEnvFileFromSettings();
