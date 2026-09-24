@@ -137,7 +137,9 @@ const waitUntilResumeRunning = async (
   resume: (onRunningCommitted: (task: Task) => void) => Promise<void>,
   taskId: string,
   fallback: Task,
+  onDone?: (ms: number) => void,
 ): Promise<Task> => {
+  const t0 = Date.now();
   // 已写成 running 的那份快照；回调先于 Agent.create
   let committed: Task | null = null;
   // 提前结束 HTTP 的 resolve；phase 1 失败走 reject
@@ -158,8 +160,15 @@ const waitUntilResumeRunning = async (
     if (!committed) failEarly?.(err);
   });
 
-  return Promise.race([early, resumed]);
+  try {
+    return await Promise.race([early, resumed]);
+  } finally {
+    onDone?.(Date.now() - t0);
+  }
 };
+
+/** 发送预处理分节计时收集器（外层拼进 question-timing 行） */
+export type QuestionSendTiming = (entry: string) => void;
 // skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
 
 /**
@@ -177,17 +186,22 @@ export const handleTaskQuestionInject = async (
   const skipRef: { handle: AskSkipHandle | null } = { handle: null };
   // 输入框 loading 打点：clientGap=回车→服务端收到，serverMs=服务端处理→回200。
   // 两段相加≈输入框里压字的时间。只 console，不进事件流。
+  // 分节 marks 由内层 sendTimed 收集（2026-09-24：56s 级预处理黑盒取证）。
+  const sendMarks: string[] = [];
+  const timing = (entry: string): void => {
+    sendMarks.push(entry);
+  };
   const t0 = Date.now();
   const clientSentAt =
     typeof (rawBody as { clientSentAt?: unknown })?.clientSentAt === "number"
       ? ((rawBody as { clientSentAt: number }).clientSentAt as number)
       : null;
   try {
-    return await runTaskQuestionInject(id, rawBody, options, skipRef);
+    return await runTaskQuestionInject(id, rawBody, options, skipRef, timing);
   } finally {
     skipRef.handle?.rollback();
     console.log(
-      `[question-timing] task=${id} clientGapMs=${clientSentAt != null ? t0 - clientSentAt : -1} serverMs=${Date.now() - t0}`,
+      `[question-timing] task=${id} clientGapMs=${clientSentAt != null ? t0 - clientSentAt : -1} serverMs=${Date.now() - t0} ${sendMarks.join(" ")}`,
     );
   }
 };
@@ -197,8 +211,22 @@ const runTaskQuestionInject = async (
   rawBody: unknown,
   options: TaskQuestionInjectOptions,
   skipRef: { handle: AskSkipHandle | null },
+  timing?: QuestionSendTiming,
 ): Promise<Response> => {
   const body = (rawBody ?? {}) as TaskQuestionBody;
+  // 分节计时（2026-09-24 取证）：重型 await 自报耗时（>3s warn），外层拼进 question-timing 行
+  const sendTimed = async <T>(stage: string, p: Promise<T>): Promise<T> => {
+    const t = Date.now();
+    try {
+      return await p;
+    } finally {
+      const ms = Date.now() - t;
+      timing?.(`${stage}=${ms}ms`);
+      if (ms > 3000) {
+        console.warn(`[question] 慢阶段 task=${id} stage=${stage} ${ms}ms`);
+      }
+    }
+  };
   // 只答疑（群里非属主）：下面三处按它剪掉写路径——活会话送达 / ackContext / resume 唤醒
   const questionOnly = options.restrictToQuestion === true;
 
@@ -252,7 +280,7 @@ const runTaskQuestionInject = async (
   // 写不进再 409，绝不走 abortStuck 把还在等的 run 杀掉。
   // B1：ask 判定只看尾部 200 条——未答提问必然在尾部（它阻塞 run 进展，阻塞期间只能追
   // 加零星事件；重连通知上限 5 条、24h 过期/停止/终结都会直接决议它）。全量读只为找它太贵。
-  const askTail = await getTaskWithTailEvents(id, 200);
+  const askTail = await sendTimed("tailEvents", getTaskWithTailEvents(id, 200));
   const askEvents = askTail?.events ?? [];
   const pendingAskOpen = !!findPendingAskEvent(askEvents);
 
@@ -276,13 +304,13 @@ const runTaskQuestionInject = async (
       drainStatus === "error" ||
       task.runStatus === "idle";
     if (waitingForDrain) {
-      let stopped = await waitForTaskToStop(task.id, 20_000);
+      let stopped = await sendTimed("drainWait", waitForTaskToStop(task.id, 20_000));
       if (!stopped) {
         // 排空超时 = run 假死（stop 后收尾卡住、runningTasks 永不摘除）——
         // 与 sendToTaskSessionBody 同款假死恢复：强清占位再试短 drain。
         // 否则一次卡死的收尾会让输入条永久 409「正在跑」（2026-08-24 实测）
-        await abortStuckRunForSend(task.id);
-        stopped = await waitForTaskToStop(task.id, 2_000);
+        await sendTimed("abortStuck", abortStuckRunForSend(task.id));
+        stopped = await sendTimed("drainWait2", waitForTaskToStop(task.id, 2_000));
       }
       if (!stopped) {
         return errorResponse("agent 正在跑、等它说完这轮再问", 409);
@@ -315,7 +343,7 @@ const runTaskQuestionInject = async (
   let savedImages: Awaited<ReturnType<typeof saveImageAttachments>> | undefined;
   if (images.length > 0) {
     try {
-      savedImages = await saveImageAttachments(task.id, images);
+      savedImages = await sendTimed("saveImages", saveImageAttachments(task.id, images));
       imageAbsPaths = savedImages.map((s) => s.absPath);
     } catch (err) {
       return errorResponse(
@@ -404,11 +432,14 @@ const runTaskQuestionInject = async (
 
   // 同一轮 curl 还挂着：跳过正文写进 stdout，本轮继续。写进去了就不要 send。
   const viaWait = askSkip
-    ? await fulfillAskSkipViaWait(task.id, askSkip, agentText, {
-        imageAbsPaths,
-        attachmentPaths:
-          attachmentPaths.length > 0 ? attachmentPaths : undefined,
-      })
+    ? await sendTimed(
+        "askSkipWait",
+        fulfillAskSkipViaWait(task.id, askSkip, agentText, {
+          imageAbsPaths,
+          attachmentPaths:
+            attachmentPaths.length > 0 ? attachmentPaths : undefined,
+        }),
+      )
     : false;
   if (
     !viaWait &&
@@ -440,14 +471,17 @@ const runTaskQuestionInject = async (
     deliverResult =
       viaWait || forceModel || questionOnly
         ? ("no_session" as const)
-        : await deliverTaskQuestion(
-            task,
-            agentText,
-            imageAbsPaths,
-            { apiKey, model },
-            ackContext,
-            attachmentPaths.length > 0 ? attachmentPaths : undefined,
-            opGen,
+        : await sendTimed(
+            "deliver",
+            deliverTaskQuestion(
+              task,
+              agentText,
+              imageAbsPaths,
+              { apiKey, model },
+              ackContext,
+              attachmentPaths.length > 0 ? attachmentPaths : undefined,
+              opGen,
+            ),
           );
   } catch (err) {
     if (err instanceof HeapPressureError) {
@@ -517,7 +551,9 @@ const runTaskQuestionInject = async (
   // - !sent（resume/oneshot、start 前）：失败 → 5xx、不继续、不清 pending
   let persistWarning: string | undefined;
   try {
-    const wrote = await writeUserEventAndPublishStrict(task.id, {
+    const wrote = await sendTimed(
+      "persistUserReply",
+      writeUserEventAndPublishStrict(task.id, {
       kind: "user_reply",
       actionId: task.currentActionId ?? undefined,
       text: text || "(用户附了图片 / 文件提问)",
@@ -531,7 +567,8 @@ const runTaskQuestionInject = async (
         // 桥接来源标记（需求群回流带 source / 提问人）——放最后、允许覆盖上面的展示字段
         ...(options.userReplyMetaExtra ?? {}),
       },
-    });
+      }),
+    );
     if (!wrote) {
       if (sent) {
         persistWarning = PERSIST_WARNING_DELIVERED;
@@ -638,6 +675,15 @@ const runTaskQuestionInject = async (
     // Agent.create 仍在回调之后继续，不堵在这一枪 HTTP 上。
     let runningCommitted = false;
     let resumedTask: Task;
+    // 唤醒耗时取证：onDone 记 resumeUntilRunning（含 worktree/Agent.create 在途）
+    const recordResumeMs = (ms: number): void => {
+      timing?.(`resumeUntilRunning=${ms}ms`);
+      if (ms > 3000) {
+        console.warn(
+          `[question] 慢阶段 task=${task.id} stage=resumeUntilRunning ${ms}ms`,
+        );
+      }
+    };
     try {
       resumedTask = await waitUntilResumeRunning(
         (onRunningCommitted) =>
@@ -671,6 +717,7 @@ const runTaskQuestionInject = async (
           }),
         task.id,
         task,
+        recordResumeMs,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
