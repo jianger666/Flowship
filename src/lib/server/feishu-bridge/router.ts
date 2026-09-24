@@ -540,9 +540,13 @@ export const parseInboundContent = async (
       imageKey,
       "image",
     );
-    const img = await fileToBase64Image(abs);
-    // 转完即删：bridge 目录无 TTL
-    await fs.unlink(abs).catch(() => undefined);
+    // 转完即删：bridge 目录无 TTL（与 markdown/post 分支同手法，try/finally 防读失败漏删）
+    let img: { data: string; mimeType: string; filename: string } | null;
+    try {
+      img = await fileToBase64Image(abs);
+    } finally {
+      await fs.unlink(abs).catch(() => undefined);
+    }
     if (!img) {
       return {
         text: "",
