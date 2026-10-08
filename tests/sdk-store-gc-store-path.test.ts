@@ -38,6 +38,11 @@ import {
 const NOW = 1_800_000_000_000;
 const DAY = 86_400_000;
 
+// 端到端用例要先用 SDK 原实现预写一整个库（几十次文件追加 / 重写）。Windows（NTFS + Defender 实时扫描）上
+// 每次文件操作几十毫秒，单个用例本来就要 3~6 秒（CI 压测里最慢 9.3 秒），卡在默认 5 秒超时的边缘会随机误报
+// ——纯慢，不是数据问题（放宽超时后同一批压测 0 失败，断言失败从未出现）。30 秒仍足以暴露死锁 / 无限重试。
+vi.setConfig({ testTimeout: 30_000 });
+
 afterEach(() => {
   vi.restoreAllMocks();
   cleanupTmps();
