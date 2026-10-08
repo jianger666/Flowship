@@ -77,6 +77,15 @@ jobs:
             const r = JSON.parse(fs.readFileSync("vitest-related.json", "utf8"));
             const per = r.testResults.map(f => f.name.split(/[\\/]/).pop() + "=" + f.assertionResults.filter(t => t.status === "passed").length + "/" + f.assertionResults.length).join("  ");
             console.log("::notice title=相关测试汇总 ${{ runner.os }}::文件 " + r.testResults.length + " 个，用例 " + r.numTotalTests + "，通过 " + r.numPassedTests + "，失败 " + r.numFailedTests + "，跳过 " + r.numPendingTests + "；明细 " + per);
+            const esc = s => s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+            const noAnsi = s => String(s).replace(/\u001b\[[0-9;]*m/g, "");
+            for (const f of r.testResults) {
+              for (const t of f.assertionResults) {
+                if (t.status !== "failed") continue;
+                const msg = noAnsi((t.failureMessages || []).join("\n---\n")).slice(0, 1600);
+                console.log("::error title=失败用例 ${{ runner.os }}::" + esc(f.name.split(/[\\/]/).pop() + " :: " + t.fullName + "\n" + msg));
+              }
+            }
           '
 
       - name: 类型检查（仅 Linux）
