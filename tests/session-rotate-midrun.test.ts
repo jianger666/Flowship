@@ -7,16 +7,26 @@
  *   - 未登记 = no-op 不炸
  *   - 注销按 identity（并发 / 递归 consume 交错不误摘后继登记的那条）
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   maybeFireMidRunRotation,
   registerMidRunRotationTrigger,
   ROTATE_SESSION_INPUT_TOKENS,
+  TOKEN_WATERMARK_ENV,
   unregisterMidRunRotationTrigger,
 } from "@/lib/server/session-rotate";
 
 const overWater = { sessionInputTokens: ROTATE_SESSION_INPUT_TOKENS + 1 };
+
+// 2026-10-08 起 token 水位默认关闭。触发器语义的用例在「总开关开启」下跑（回滚路径的行为锁）；
+// 默认关闭的行为见文件末尾专门的 describe（内层 beforeEach 会把开关覆盖回关）。
+beforeEach(() => {
+  vi.stubEnv(TOKEN_WATERMARK_ENV, "1");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("maybeFireMidRunRotation", () => {
   it("水位到 + 堆过半 → 触发（重复 fire 去重由调用方 latch 负责）", () => {
@@ -76,5 +86,22 @@ describe("maybeFireMidRunRotation", () => {
     unregisterMidRunRotationTrigger("t-id", a);
     maybeFireMidRunRotation("t-id", overWater, 0.9);
     expect(firedA).toBe(1);
+  });
+});
+
+describe("默认关闭（2026-10-08）：记账点不再因 token 累计触发 run 内轮换", () => {
+  beforeEach(() => {
+    vi.stubEnv(TOKEN_WATERMARK_ENV, ""); // 覆盖顶层的开启
+  });
+
+  it("累计远超线 + 堆很高也不触发", () => {
+    let fired = 0;
+    const fn = () => {
+      fired += 1;
+    };
+    registerMidRunRotationTrigger("t-off", fn);
+    maybeFireMidRunRotation("t-off", { sessionInputTokens: 50_000_000 }, 0.99);
+    expect(fired).toBe(0);
+    unregisterMidRunRotationTrigger("t-off", fn);
   });
 });

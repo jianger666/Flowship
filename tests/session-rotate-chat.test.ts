@@ -7,10 +7,13 @@
  *
  * mock 骨架抄 ask-skip-chat.test.ts（chat-inject 同一张依赖图）。
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Task } from "@/lib/types";
-import { SESSION_ROTATION_INFO_TEXT } from "@/lib/server/session-rotate";
+import {
+  SESSION_ROTATION_INFO_TEXT,
+  TOKEN_WATERMARK_ENV,
+} from "@/lib/server/session-rotate";
 
 let sessionAlive = true;
 
@@ -197,10 +200,16 @@ const body = {
   bootArgs: { apiKey: "k", model: { id: "grok-4.6" } },
 };
 
-describe("chat 保命轮换", () => {
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe("chat 保命轮换（token 水位总开关开启时的原语义）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionAlive = true;
+    // 2026-10-08 起 token 水位默认关闭；这里验证打开后决策链仍与原语义一致（回滚路径）
+    vi.stubEnv(TOKEN_WATERMARK_ENV, "1");
   });
 
   it("胖会话：关旧 + 落灰线 + 起新会话，不走 send 续接", async () => {
@@ -233,5 +242,39 @@ describe("chat 保命轮换", () => {
       thinTask.id,
       expect.objectContaining({ text: SESSION_ROTATION_INFO_TEXT }),
     );
+  });
+});
+
+describe("token 水位默认关闭（2026-10-08）：不再因累计 token 轮换", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionAlive = true;
+    vi.stubEnv(TOKEN_WATERMARK_ENV, ""); // 缺省 / 空 = 关
+  });
+
+  const expectContinued = (task: Task): void => {
+    // 照常 send 续接：旧会话不关、不落灰线、不起新会话
+    expect(sendChatMessage).toHaveBeenCalled();
+    expect(cancelChatRun).not.toHaveBeenCalled();
+    expect(runChatSession).not.toHaveBeenCalled();
+    expect(writeEventAndPublish).not.toHaveBeenCalledWith(
+      task.id,
+      expect.objectContaining({ text: SESSION_ROTATION_INFO_TEXT }),
+    );
+  };
+
+  it("累计 210 万的胖会话（原来必转）现在照常续接", async () => {
+    getTask.mockResolvedValue(fatTask);
+    const resp = await handleChatReplyInject(fatTask.id, body);
+    expect([200, 202]).toContain(resp.status);
+    expectContinued(fatTask);
+  });
+
+  it("只超 50 万速度水位的会话（原来必转）现在照常续接", async () => {
+    const midTask: Task = { ...thinTask, sessionInputTokens: 800_000 };
+    getTask.mockResolvedValue(midTask);
+    const resp = await handleChatReplyInject(midTask.id, body);
+    expect([200, 202]).toContain(resp.status);
+    expectContinued(midTask);
   });
 });

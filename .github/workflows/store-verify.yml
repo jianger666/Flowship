@@ -1,0 +1,74 @@
+name: store-verify
+
+# 临时验证分支专用（ci/store-verify-*）：在 Linux / macOS / Windows 三平台跑
+# 「checkpoint store 提速 + GC 走公共 API + token 水位默认关」相关测试。
+# 目的：补上本机无法覆盖的真实 NTFS / Defender / CRLF 验证（release.yml 里的
+# Windows runner 只打包、不跑测试）。不进主线，验证完整个分支可丢弃。
+
+on:
+  push:
+    branches: ["ci/store-verify-**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 版本从 package.json 的 packageManager 字段读（与 release.yml 一致）
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 环境信息
+        run: |
+          echo "os=${{ runner.os }} arch=${{ runner.arch }}"
+          node -v
+          pnpm -v
+          git --version
+          git config --get core.autocrlf || echo "core.autocrlf=(unset)"
+
+      # 本次改动直接相关的测试：三平台都必须全绿
+      - name: 相关测试（三平台）
+        run: >-
+          pnpm exec vitest run --reporter=verbose
+          tests/fast-checkpoint-store.test.ts
+          tests/sdk-agent-store-wiring.test.ts
+          tests/sdk-store-gc-store-path.test.ts
+          tests/sdk-store-gc.test.ts
+          tests/sdk-agent-store.test.ts
+          tests/session-rotate.test.ts
+          tests/session-rotate-chat.test.ts
+          tests/session-rotate-midrun.test.ts
+
+      - name: 类型检查（仅 Linux）
+        if: runner.os == 'Linux'
+        run: pnpm typecheck
+
+      # 全量测试仅作回归参考（Linux）：既有用例若本就有平台差异，不应拖红本次结论
+      - name: 全量测试（仅 Linux，参考）
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: pnpm exec vitest run
