@@ -236,7 +236,19 @@ const getRunnerState = (): TaskRunnerGlobalState => {
     };
   }
   const state = g[TASK_RUNNER_GLOBAL_KEY]!;
-  // hot-reload 兜底：旧 chunk 可能写出缺字段 / Set 形态的半残 state
+  // 全字段兜底，两类来源都靠它：
+  // 1. hot-reload：旧 chunk 可能写出缺字段 / Set 形态的半残 state；
+  // 2. task-op（无环叶子模块）先于本模块被触达时，opGlobals() 会先建一个只带 ownership 字段的空壳——
+  //    上面「key 不存在才完整初始化」对它不生效，下面这 5 个字段若不补，模块顶层缓存的
+  //    runningTasks / agentSessions 等就是 undefined（任何 .get/.set 直接 TypeError）。
+  // 铁律：只补缺失、永不替换已有的合法 Map/Set（task-op 与本模块都缓存了引用，替换即分叉）。
+  if (!(state.runningTasks instanceof Map)) state.runningTasks = new Map();
+  if (!(state.agentSessions instanceof Map)) state.agentSessions = new Map();
+  if (!(state.subscribers instanceof Map)) state.subscribers = new Map();
+  if (!(state.forkPendingTasks instanceof Set)) {
+    state.forkPendingTasks = new Set();
+  }
+  if (!(state.runningChecks instanceof Map)) state.runningChecks = new Map();
   state.startingTasks = coerceStartingMap(
     state.startingTasks as Map<string, number> | Set<string> | undefined,
   );
