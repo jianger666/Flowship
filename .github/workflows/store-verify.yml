@@ -4,6 +4,8 @@ name: store-verify
 # 「checkpoint store 提速 + GC 走公共 API + token 水位默认关」相关测试。
 # 目的：补上本机无法覆盖的真实 NTFS / Defender / CRLF 验证（release.yml 里的
 # Windows runner 只打包、不跑测试）。不进主线，验证完整个分支可丢弃。
+#
+# 结果统一用 ::notice / ::error 注解输出（匿名可在 job 页直接看到，不依赖需要登录的日志）。
 
 on:
   push:
@@ -53,7 +55,7 @@ jobs:
       # 本次改动直接相关的测试：三平台都必须全绿
       - name: 相关测试（三平台）
         run: >-
-          pnpm exec vitest run --reporter=verbose
+          pnpm exec vitest run --reporter=verbose --reporter=json --outputFile.json=vitest-related.json
           tests/fast-checkpoint-store.test.ts
           tests/sdk-agent-store-wiring.test.ts
           tests/sdk-store-gc-store-path.test.ts
@@ -63,12 +65,73 @@ jobs:
           tests/session-rotate-chat.test.ts
           tests/session-rotate-midrun.test.ts
 
+      - name: 相关测试汇总（注解）
+        if: always()
+        run: |
+          node -e '
+            const fs = require("fs");
+            if (!fs.existsSync("vitest-related.json")) {
+              console.log("::error title=相关测试汇总 ${{ runner.os }}::没有生成 JSON 结果（vitest 未正常结束）");
+              process.exit(0);
+            }
+            const r = JSON.parse(fs.readFileSync("vitest-related.json", "utf8"));
+            const per = r.testResults.map(f => f.name.split(/[\\/]/).pop() + "=" + f.assertionResults.filter(t => t.status === "passed").length + "/" + f.assertionResults.length).join("  ");
+            console.log("::notice title=相关测试汇总 ${{ runner.os }}::文件 " + r.testResults.length + " 个，用例 " + r.numTotalTests + "，通过 " + r.numPassedTests + "，失败 " + r.numFailedTests + "，跳过 " + r.numPendingTests + "；明细 " + per);
+          '
+
       - name: 类型检查（仅 Linux）
         if: runner.os == 'Linux'
         run: pnpm typecheck
 
-      # 全量测试仅作回归参考（Linux）：既有用例若本就有平台差异，不应拖红本次结论
-      - name: 全量测试（仅 Linux，参考）
-        if: runner.os == 'Linux'
+  # Linux 全量：本次分支 vs main 基线，同环境对照，判断失败是「老问题」还是「本次引入」
+  full-linux:
+    name: full (ubuntu, ${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 本次分支
+            ref: ""
+          - label: main 基线
+            ref: main
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 全量 vitest（${{ matrix.label }}）
         continue-on-error: true
-        run: pnpm exec vitest run
+        run: pnpm exec vitest run --reporter=json --outputFile.json=vitest-full.json
+
+      - name: 全量结果汇总（注解）
+        if: always()
+        run: |
+          node -e '
+            const fs = require("fs");
+            if (!fs.existsSync("vitest-full.json")) {
+              console.log("::error title=全量汇总 ${{ matrix.label }}::没有生成 JSON 结果");
+              process.exit(0);
+            }
+            const r = JSON.parse(fs.readFileSync("vitest-full.json", "utf8"));
+            const cwd = process.cwd() + "/";
+            const bad = [];
+            for (const f of r.testResults) {
+              const fails = f.assertionResults.filter(t => t.status === "failed");
+              for (const t of fails) bad.push(f.name.replace(cwd, "") + " :: " + t.fullName);
+              if (f.status === "failed" && !fails.length) bad.push(f.name.replace(cwd, "") + " :: (文件级失败) " + String(f.message || "").split("\n")[0].slice(0, 160));
+            }
+            const esc = s => s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+            console.log("::notice title=全量汇总 ${{ matrix.label }}::文件 " + r.testResults.length + "，用例 " + r.numTotalTests + "，通过 " + r.numPassedTests + "，失败 " + r.numFailedTests + "，跳过 " + r.numPendingTests);
+            if (bad.length) console.log("::error title=失败清单 ${{ matrix.label }}（" + bad.length + " 项）::" + esc(bad.join("\n")));
+          '
