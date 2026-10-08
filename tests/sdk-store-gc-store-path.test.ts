@@ -385,6 +385,77 @@ describe("gcSdkStoreOnce：store 路径端到端", () => {
     expect(await blobsOnDisk(ref, "agent-dead1")).toEqual([]);
   });
 
+  // 回归：CI 压测里 Ubuntu / macOS 各 3/18 次、上一轮 Windows 1 次失败的真实竞态。
+  // create 在 `fd.appendFile` 之后还要 close + fsync + 更新索引，最后才标记 touched；这段 I/O 窗口里文件中
+  // 已经有这个新 agent 的行，读侧（GC 的 agentIds → catchUp）能追赶到它，它没有 agents 行、不在活名单、
+  // 也还没被 touched → 被当成幽灵孤儿，连刚写的 blob 一起清掉（数据丢失）。
+  // 这里把窗口撑开成确定性的：卡在第一次 fsync，让 GC 的 plan 在窗口里跑完，再放行 create。
+  it("create 已追加进文件、还没返回时被 GC 撞上：新 agent 的 blob 不能被当幽灵孤儿清掉", async () => {
+    quiet();
+    const { ref, handle } = await buildWorld();
+
+    const proto = Object.getPrototypeOf(handle.fast!) as {
+      syncFile: () => Promise<void>;
+    };
+    const realSync = proto.syncFile;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let landed!: () => void;
+    const onDisk = new Promise<void>((r) => {
+      landed = r;
+    });
+    let first = true;
+    const syncSpy = vi
+      .spyOn(proto, "syncFile")
+      .mockImplementation(async function (this: unknown) {
+        if (first) {
+          first = false;
+          landed(); // 此刻 fd.appendFile 已完成：文件里已有这一行，create 还卡在 fsync 上
+          await gate;
+        }
+        return realSync.call(this);
+      });
+    // GC 在 plan 之后第一个会调的 API 是 runEvents.delete：这时 plan 一定已经在窗口里完成，再放行 create
+    const realDel = handle.store.runEvents.delete.bind(handle.store.runEvents);
+    const delSpy = vi
+      .spyOn(handle.store.runEvents, "delete")
+      .mockImplementation((...a: Parameters<typeof realDel>) => {
+        release();
+        return realDel(...a);
+      });
+    const safety = setTimeout(() => release(), 5_000); // 兜底：任何意外都别把测试挂死
+
+    try {
+      const w = handle.store.checkpoints.create({
+        agentId: "agent-new-x",
+        blobId: "nx",
+        data: blobData(7),
+      });
+      await onDisk;
+      const stats = await gcSdkStoreOnce({ handle, minBytes: 1, now: NOW });
+      await w;
+
+      expect(stats.skipped).toBeUndefined();
+      // 新 agent 的 blob 必须还在
+      expect(
+        sameBytes(
+          await ref.checkpoints.get({ agentId: "agent-new-x", blobId: "nx" }),
+          blobData(7),
+        ),
+      ).toBe(true);
+      // 真孤儿照清：保护不能变成「什么都不删」
+      expect(await blobsOnDisk(ref, "agent-dead1")).toEqual([]);
+      expect(await blobsOnDisk(ref, "agent-ghost")).toEqual([]);
+    } finally {
+      clearTimeout(safety);
+      release();
+      syncSpy.mockRestore();
+      delSpy.mockRestore();
+    }
+  });
+
   it("中途失败可重入：agents 行最后删，下一轮接着把孤儿清干净", async () => {
     quiet();
     const { ref, handle } = await buildWorld();

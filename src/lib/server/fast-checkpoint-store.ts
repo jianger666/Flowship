@@ -431,7 +431,10 @@ export class FastCheckpoints implements LocalAgentStoreCheckpoints {
     };
   }
 
-  /** 本实例写过（create / update 成功）的 agentId。GC 据此保护「刚创建、meta 还没落盘」的会话 */
+  /**
+   * 本实例请求写过（create / update 一调用就同步标记，早于任何字节落盘；写失败也留着）的 agentId。
+   * GC 据此保护「刚创建、meta 还没落盘」的会话。必须「保护先于可见」，见 create 里的说明。
+   */
   touchedAgentIds(): ReadonlySet<string> {
     return this.touched;
   }
@@ -835,6 +838,11 @@ export class FastCheckpoints implements LocalAgentStoreCheckpoints {
     readonly data: Uint8Array;
   }): Promise<void> {
     const { agentId, blobId, data } = input;
+    // 「受保护」必须先于「可见」：文件里出现这个 agent 的第一个字节起（appendFile 之后、close / fsync
+    // 期间），读侧（GC 的 agentIds → catchUp）就能从文件追赶到它。若等 create 完成才标记，GC 会把这个
+    // 「在索引里、没有 agents 行、不在活名单」的新 agent 当幽灵孤儿，连刚写的 blob 一起清掉。
+    // 所以入队前同步标记；写失败也留着——只是多保护一个 agent，不会多删任何数据。
+    this.touched.add(agentId);
     return this.enqueue(async () => {
       let idx = await this.ensure();
       await this.catchUp();
@@ -846,7 +854,6 @@ export class FastCheckpoints implements LocalAgentStoreCheckpoints {
       }
       await this.append(idx, agentId, blobId, data);
       this.counters.creates += 1;
-      this.touched.add(agentId);
     });
   }
 
@@ -856,6 +863,7 @@ export class FastCheckpoints implements LocalAgentStoreCheckpoints {
     readonly data: Uint8Array;
   }): Promise<void> {
     const { agentId, blobId, data } = input;
+    this.touched.add(agentId); // 同 create：保护先于可见，入队前同步标记
     return this.enqueue(async () => {
       await this.ensure();
       await this.catchUp();
@@ -877,13 +885,11 @@ export class FastCheckpoints implements LocalAgentStoreCheckpoints {
       if (Buffer.compare(cur, next) === 0) {
         // blob 是内容寻址的：同 id 同内容，重写没有意义。SDK 原实现这里会整文件重写
         this.counters.updateNoop += 1;
-        this.touched.add(agentId);
         return;
       }
       this.counters.updateWrite += 1;
       const line = this.encodeLine(agentId, blobId, next);
       await this.rewrite((k) => (k === key ? line : undefined));
-      this.touched.add(agentId);
     });
   }
 

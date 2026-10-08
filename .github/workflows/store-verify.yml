@@ -90,14 +90,21 @@ jobs:
 
       # 偶发失败复现：同一批最可疑的测试，重复 + 并行（制造 CPU / 磁盘争抢）多跑几轮。
       # 背景：上一轮 Windows 曾有 1 个用例失败、下一轮同样代码又全绿——要分清是测试时序不稳还是实现缺陷。
-      - name: 压力复现（重复 + 并行）
+      # A 组：默认 5s 超时（与日常门禁一致）；B 组：放宽到 60s，把「纯慢」和「真失败」分开看。
+      - name: 压力复现（重复 + 并行；A 组默认超时、B 组 60s）
         if: always()
         run: |
           mkdir -p stress-out
           FILES="tests/sdk-store-gc-store-path.test.ts tests/fast-checkpoint-store.test.ts tests/sdk-store-gc.test.ts tests/sdk-agent-store-wiring.test.ts"
-          for round in 1 2 3 4 5 6; do
+          for round in 1 2 3 4 5; do
             for k in 1 2 3; do
-              ( pnpm exec vitest run --reporter=json --outputFile.json=stress-out/r-$round-$k.json $FILES > stress-out/log-$round-$k.txt 2>&1 || true ) &
+              ( pnpm exec vitest run --reporter=json --outputFile.json=stress-out/r-a-$round-$k.json $FILES > stress-out/log-a-$round-$k.txt 2>&1 || true ) &
+            done
+            wait
+          done
+          for round in 1 2 3; do
+            for k in 1 2 3; do
+              ( pnpm exec vitest run --testTimeout=60000 --reporter=json --outputFile.json=stress-out/r-b-$round-$k.json $FILES > stress-out/log-b-$round-$k.txt 2>&1 || true ) &
             done
             wait
           done

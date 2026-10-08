@@ -581,7 +581,7 @@ describe("并发与队列语义", () => {
     expect(await oracle.get({ agentId: A, blobId: "b191" })).toBeNull();
   }, 60_000);
 
-  it("touchedAgentIds：只含本实例成功写过的 agent；agentIds() 含索引里全部", async () => {
+  it("touchedAgentIds：只含本实例写过的 agent；agentIds() 含索引里全部", async () => {
     const dir = mkTmp();
     await seed(mkFast(dir, sdk), 3, "old-agent"); // 上一个「进程」写的
     const cp = mkFast(dir, sdk);
@@ -590,6 +590,25 @@ describe("并发与队列语义", () => {
     await cp.create({ agentId: "new-agent", blobId: "n", data: Buffer.from("1") }).catch(() => undefined);
     expect([...cp.touchedAgentIds()].sort()).toEqual(["new-agent"]);
     expect((await cp.agentIds()).sort()).toEqual(["new-agent", "old-agent"]);
+  });
+
+  // 「保护先于可见」：文件里出现这个 agent 的第一个字节起，GC 就能从文件追赶到它，所以 touched 必须在
+  // 请求一进来（同步，早于入队 / 落盘）就标记。等写完才标记会让 GC 把刚创建的新 agent 当幽灵孤儿清掉。
+  it("touchedAgentIds：create / update 一调用就同步标记（早于落盘），写失败也留着", async () => {
+    const dir = mkTmp();
+    const cp = mkFast(dir, sdk);
+
+    const p1 = cp.create({ agentId: "new-agent", blobId: "n", data: Buffer.from("1") });
+    expect(cp.touchedAgentIds().has("new-agent")).toBe(true); // 同步：任务还没跑
+    await p1;
+
+    // update 一个不存在的 blob 会失败；agent 仍被保护（只会多保护、不会多删），但不进索引
+    const p2 = cp.update({ agentId: "upd-agent", blobId: "x", data: Buffer.from("2") });
+    expect(cp.touchedAgentIds().has("upd-agent")).toBe(true);
+    await expect(p2).rejects.toThrow(/not found/);
+
+    expect([...cp.touchedAgentIds()].sort()).toEqual(["new-agent", "upd-agent"]);
+    expect(await cp.agentIds()).toEqual(["new-agent"]);
   });
 });
 

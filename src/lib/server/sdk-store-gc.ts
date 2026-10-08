@@ -34,6 +34,7 @@ import type {
 } from "@cursor/sdk";
 
 import { dataRoot } from "./data-root";
+import { withRetry, type RetryOptions } from "./fast-checkpoint-store";
 import {
   getSdkStoreHandle,
   SDK_AGENT_STORE_DIRNAME,
@@ -240,6 +241,8 @@ export interface GcOptions {
   now?: number;
   /** 覆盖 store 列表分页大小（单测用，验证多页能翻完） */
   pageSize?: number;
+  /** 覆盖文件路径里 rename 的重试参数（单测注入平台 / 免真等；生产不传） */
+  retry?: RetryOptions;
 }
 
 /**
@@ -325,7 +328,9 @@ const gcByFiles = async (opts?: GcOptions): Promise<GcStats> => {
           out.on("error", rej);
         });
       }
-      await fs.rename(tmp, p);
+      // Windows：杀毒 / 索引器 / 云同步会随机占住目标文件（EPERM / EBUSY），稍等就好——退避重试；
+      // POSIX 上只重试句柄耗尽类，真权限错误不白等。耗尽预算仍失败 = 抛给外层 fail-open（原文件没动）
+      await withRetry(() => fs.rename(tmp, p), opts?.retry);
       bytesAfter += (await fs.stat(p)).size;
       if (f === CHECKPOINTS) {
         cpBefore = total;
