@@ -17,6 +17,7 @@ import type { ConversationStep, InteractionUpdate, Run } from "@cursor/sdk";
 import { normalizeToolName } from "./normalize-tool-name";
 import { recordTurnUsage } from "./task-fs";
 import { publish } from "./task-stream";
+import { appendTimingLog } from "./timing-log";
 import { normalizeTurnUsage } from "@/lib/token-usage";
 
 export type RunPerfCtx = {
@@ -103,6 +104,12 @@ const persistTurnUsage = (taskId: string, rawUsage: unknown): void => {
 export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
   // 上一被记录事件的时间——算 gap（事件间隔），定位「空窗」卡顿
   let lastEventAt = Date.now();
+  // send 发起时刻——首 token 打点用。按本模块使用契约（send 前 create、塞进
+  // SendOptions、send 返回后 attach），firstTokenMs = send 发起→首 token，
+  // 不含 resume/排队；和 question-timing 的 agentSend 对账时可直接相减
+  // （firstTokenMs - agentSend ≈ 受理后纯模型计算）。
+  const sendStartedAt = Date.now();
+  let firstTokenLogged = false;
   const toolStartedAt = new Map<string, { name: string; at: number }>();
   const base = `task=${ctx.taskId} kind=${ctx.runKind}`;
 
@@ -116,6 +123,23 @@ export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
   const onDelta = (args: { update: InteractionUpdate }): void => {
     try {
       const update = args.update;
+      // 首 token 打点（流式 content 类 delta 不计入常规埋点、但首个要记）：
+      // firstTokenMs=send 发起→模型首个输出，减去 agentSend 受理耗时即纯模型计算。
+      // 镜像进文件（first-delta.log），与 question-timings 行对账。
+      if (
+        !firstTokenLogged &&
+        (update.type === "text-delta" ||
+          update.type === "thinking-delta" ||
+          update.type === "token-delta")
+      ) {
+        // 首 token 打点只进文件（first-delta.log），不打 console：
+        // 高频流式 delta 零 [perf-] 日志是单测锁定的契约（run-perf.test.ts）。
+        firstTokenLogged = true;
+        const ms = Date.now() - sendStartedAt;
+        appendTimingLog("first-delta.log", [
+          `${new Date().toISOString()} [perf-first] ${base} firstTokenMs=${ms} type=${update.type}`,
+        ]);
+      }
       if (IGNORED_DELTA_TYPES.has(update.type)) return;
 
       if (update.type === "tool-call-started") {

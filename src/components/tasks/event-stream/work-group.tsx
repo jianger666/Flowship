@@ -143,7 +143,14 @@ const WorkGroupRowImpl = ({
   // null = 未手动干预，跟随 autoExpanded；boolean = 用户点过，以手动为准
   const [manual, setManual] = useState<boolean | null>(null);
 
-  const autoExpanded = group.hasRunning || !!isRunningTail;
+  // 全启动链成员（唤醒/工作区/agent/MCP 跳过）→ 标题写「启动过程」别写「工作过程」。
+  // 启动组永不自动展开（2026-09-24）：4 行 boot 提示运行时全弹出来太吵；
+  // 组头本来就带 live 状态（runningTail 显示当前阶段 + 转圈），折叠零信息损失，
+  // 警告靠 ⚠️ 标，想看点开展开。手动点过 / 搜索命中照常展开。
+  const allBoot =
+    group.members.length > 0 &&
+    group.members.every((m) => isBootInfoItem(m));
+  const autoExpanded = !allBoot && (group.hasRunning || !!isRunningTail);
 
   // 自动收起的「防打扰」闸（2026-07-28、用户实测「自动折叠也感觉怪」）：
   // 判定见 shouldPinWorkGroupOpen（纯函数、可单测）。
@@ -178,10 +185,6 @@ const WorkGroupRowImpl = ({
 
   // 折叠且 running / 处理中：右侧一眼活动，组头要极淡不抢戏
   let runningTail: string | null = null;
-  // 全启动链成员（唤醒/工作区/agent/MCP 跳过）→ 标题写「启动过程」别写「工作过程」
-  const allBoot =
-    group.members.length > 0 &&
-    group.members.every((m) => isBootInfoItem(m));
   // 警告标：MCP 跳过等 ⚠️ 行被折叠时组头留标，不吞提示（默认仍收起）
   const hasBootWarn = groupHasBootWarn(group.members);
   if (!expanded) {

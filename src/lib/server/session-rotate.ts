@@ -25,6 +25,15 @@ import { heapPressure } from "./sdk-store-gc";
 /** 当前 SDK 会话累计 input 超过此值 → 下轮轮换（同事实测崩时 278 万） */
 export const ROTATE_SESSION_INPUT_TOKENS = 2_000_000;
 
+/**
+ * 速度水位（2026-09-24）：只管发送快慢，不管保命。
+ * 会话累计 input 超过此值 → 下轮轮换（受理回到小上下文基线）。
+ * 与内存水位（2M）解耦：后者防 OOM 谁也不许调；这个只关受理快慢和 token 花费。
+ * 只认 sessionInputTokens（新锚点清零的那路）——绝不用 totalInputTokens 兜底，
+ * 否则老任务一辈子 total 巨大、每条都转，死循环。缺字段 = 不转（fail-safe）。
+ */
+export const ROTATE_PERF_INPUT_TOKENS = 500_000;
+
 /** 轮换时落盘的 info 事件文案（事件流里显示为灰色居中细线、无需 UI 改动） */
 export const SESSION_ROTATION_INFO_TEXT =
   "上下文过长，已自动压缩续接，本窗口用新会话继续，上方历史仍保留。";
@@ -40,6 +49,10 @@ export interface RotationUsageLike {
 export const isSessionRotationDue = (u: RotationUsageLike): boolean =>
   (u.sessionInputTokens ?? u.totalInputTokens ?? 0) >=
   ROTATE_SESSION_INPUT_TOKENS;
+
+/** 纯函数：速度水位到了返 true。只认 sessionInputTokens（见 ROTATE_PERF_INPUT_TOKENS 注释）。 */
+export const isPerfRotationDue = (u: RotationUsageLike): boolean =>
+  (u.sessionInputTokens ?? 0) >= ROTATE_PERF_INPUT_TOKENS;
 
 /**
  * task 轮换双条件（2026-09-07 矫枉过正修正）：水位超线 **并且** 堆水位过半才转。

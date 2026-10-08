@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev:web": "node scripts/dev-web.mjs",
+    "dev:web:live": "node scripts/dev-web.mjs --live",
     "start": "node scripts/dev-open.mjs",
     "serve": "next build && node scripts/dev-open.mjs start",
     "build": "next build",

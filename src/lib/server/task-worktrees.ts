@@ -23,6 +23,14 @@ import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { failpoint } from "./failpoints";
+// ownership 快照与活跃态读无环叶子模块（静态 import 不构环——
+// 之前动态 import ./task-stream 躲环，在 Turbopack dev 下会拿到半初始化
+// namespace 报 `snapshotTaskOp is not a function`）。
+import {
+  hasTaskAgentSession,
+  isTaskRunning,
+  snapshotTaskOp,
+} from "./task-op";
 import {
   beginResourceJob,
   endResourceJob,
@@ -613,9 +621,7 @@ export const ensureTaskWorktrees = async (
     const assertLease = (): void => {
       if (!lease()) throw new WorktreeLeaseLostError();
     };
-    // 入场 ownership 快照——失主补偿比对用。
-    // 动态 import 避 task-worktrees → task-stream → task-fs → task-worktrees 静态环。
-    const { snapshotTaskOp } = await import("./task-stream");
+    // 入场 ownership 快照——失主补偿比对用（静态 import 自 ./task-op，见文件头）。
     const entryHandle = snapshotTaskOp(task.id);
     const selection = opts?.branchSelection ?? defaultBranchSelection(task);
     const infos =
@@ -706,10 +712,7 @@ const compensateRemoveCreatedWorktrees = async (
   // 补偿本身是资源事务——登记 job 让 stop/finalize/DELETE join 看得见
   const compensateJob = beginResourceJob(task.id);
   try {
-    // 动态 import 避静态环
-    const { snapshotTaskOp, runningTasks, agentSessions } = await import(
-      "./task-stream"
-    );
+    // 快照与活跃态读 ./task-op 叶子模块（静态 import，见文件头）。
 
     /** 现查：后继已 claim / 活跃 → 本仓不得删 */
     const hasSuccessorNow = (): boolean => {
@@ -718,7 +721,7 @@ const compensateRemoveCreatedWorktrees = async (
         fresh.claimSeq !== entryHandle.claimSeq ||
         (fresh.opId != null && fresh.opId !== entryHandle.opId);
       const hasActiveSuccessor =
-        runningTasks.has(task.id) || agentSessions.has(task.id);
+        isTaskRunning(task.id) || hasTaskAgentSession(task.id);
       return hasSuccessorClaim || hasActiveSuccessor;
     };
 
@@ -732,7 +735,7 @@ const compensateRemoveCreatedWorktrees = async (
         if (hasSuccessorNow()) {
           const fresh = snapshotTaskOp(task.id);
           console.warn(
-            `[task-worktrees] 失主补偿跳过仓 ${repoPath}——后继已 claim/活跃（task=${task.id} claimSeq ${entryHandle.claimSeq}→${fresh.claimSeq} opId ${entryHandle.opId}→${fresh.opId} running=${runningTasks.has(task.id)} session=${agentSessions.has(task.id)}）、留孤儿给当前 owner/finalize`,
+            `[task-worktrees] 失主补偿跳过仓 ${repoPath}——后继已 claim/活跃（task=${task.id} claimSeq ${entryHandle.claimSeq}→${fresh.claimSeq} opId ${entryHandle.opId}→${fresh.opId} running=${isTaskRunning(task.id)} session=${hasTaskAgentSession(task.id)}）、留孤儿给当前 owner/finalize`,
           );
           continue;
         }

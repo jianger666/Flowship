@@ -27,6 +27,7 @@ import {
   patchActionAndRunStatusIfOpFresh,
   setTaskRunStatusIfRunOwner,
 } from "@/lib/server/task-fs";
+import { appendTimingLog } from "./timing-log";
 import {
   saveImageAttachments,
   snapshotActionArtifact,
@@ -200,9 +201,12 @@ export const handleTaskQuestionInject = async (
     return await runTaskQuestionInject(id, rawBody, options, skipRef, timing);
   } finally {
     skipRef.handle?.rollback();
-    console.log(
-      `[question-timing] task=${id} clientGapMs=${clientSentAt != null ? t0 - clientSentAt : -1} serverMs=${Date.now() - t0} ${sendMarks.join(" ")}`,
-    );
+    const serverMs = Date.now() - t0;
+    const line = `[question-timing] task=${id} clientGapMs=${clientSentAt != null ? t0 - clientSentAt : -1} serverMs=${serverMs} ${sendMarks.join(" ")}`;
+    console.log(line);
+    // 文件镜像：全量记（>1s 才记会漏掉“飞快但用户说慢了”的对账——2026-09-24 两条都回了
+    // 却只看到一条日志的教训）。文件有 512KB/300 行上限，量级可忽略。
+    appendTimingLog("question-timings.log", [`${new Date().toISOString()} ${line}`]);
   }
 };
 
@@ -481,6 +485,7 @@ const runTaskQuestionInject = async (
               ackContext,
               attachmentPaths.length > 0 ? attachmentPaths : undefined,
               opGen,
+              timing,
             ),
           );
   } catch (err) {

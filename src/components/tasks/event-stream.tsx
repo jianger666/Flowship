@@ -76,6 +76,10 @@ import {
 import { getSubmitShortcutHint } from "@/lib/submit-shortcut";
 import { fetchEarlierEvents, type ImagePayload } from "@/lib/task-store";
 import {
+  restoreOptimisticDraft,
+  runOptimisticSubmit,
+} from "@/lib/optimistic-submit";
+import {
   getScrollAnchor,
   saveScrollAnchor,
 } from "@/lib/view-memory";
@@ -1435,23 +1439,33 @@ const EventStreamImpl = ({
   // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
   const sendingLockRef = useRef(false);
   // 取草稿 → 发送 → 成功清空
+  // 提交模式走公共 runOptimisticSubmit（与 task 输入条同一份）：
+  // 快照 payload 后立刻 reset（气泡靠 SSE user_reply 补），失败才恢复正文+路径。
   const submitVia = (send: typeof onUserReply) => {
     if (!send || sendingLockRef.current) return;
     // 文本 / 图 / 路径至少有一个、纯空消息不发
     if (!rich.hasContent) return;
     // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
-    const { text, images, attachments, skillRefs } = rich.payload();
+    const snap = rich.payload();
     sendingLockRef.current = true;
-    void (async () => {
-      try {
-        const result = await send(text, images, attachments, skillRefs);
-        // 仅成功（200/202 → true）后清空；prepareRunArgs null / 失败保留草稿+附件
-        if (result === false) return;
-        rich.reset();
-      } finally {
-        sendingLockRef.current = false;
-      }
-    })();
+    void runOptimisticSubmit({
+      payload: snap,
+      reset: () => rich.reset(),
+      restore: (p) =>
+        restoreOptimisticDraft(
+          p,
+          (t) => rich.setValue(t),
+          (paths) => rich.pathAttach.replaceAll(paths),
+          (imgs) => rich.attach.replaceAll(imgs),
+        ),
+      // 占位走父级 ledger，不过这里。onUserReply 可同步可异步，包一层统一成 Promise。
+      send: () =>
+        Promise.resolve(send(snap.text, snap.images, snap.attachments, snap.skillRefs)),
+      // 返 false=失败（恢复草稿）；成功靠 SSE user_reply 补气泡
+      isFailure: (result) => result === false,
+    }).finally(() => {
+      sendingLockRef.current = false;
+    });
   };
   const handleSend = () => submitVia(onUserReply);
 

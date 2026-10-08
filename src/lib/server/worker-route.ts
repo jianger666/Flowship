@@ -148,10 +148,13 @@ export const placeWorkerForTask = async (
   // 握手失败回滚本轮订阅（不留孤儿监听），调用方 catch 后降级老路径。
   if (rec.fresh) {
     try {
-      await awaitWorkerReady(manager, rec.workspace, rec.epoch, input.readyTimeoutMs ?? 10000);
+      await awaitWorkerReady(manager, rec.workspace, rec.epoch, input.readyTimeoutMs ?? workerReadyTimeoutMs());
     } catch (err) {
       unsub();
       workspaceSubscriptions.delete(input.workspace);
+      // 坏进程必须摘除——否则下次 spawn 复用同一个坏 worker（fresh=false 跳过握手），
+      // 次次发送都撞墙超时。摘除后下次重起 fresh，有机会一次接上。
+      try { manager.drop(rec.workspace); } catch { /* best-effort */ }
       throw err;
     }
   }
@@ -165,6 +168,15 @@ export const placeWorkerForTask = async (
 };
 
 /**
+ * worker ready 握手超时：默认 4000ms。冷启动慢机误杀会变多，
+ * 可用 FLOWSHIP_WORKER_READY_TIMEOUT_MS 覆盖（毫秒）。
+ */
+export const workerReadyTimeoutMs = (): number => {
+  const v = Number(process.env.FLOWSHIP_WORKER_READY_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 4000;
+};
+
+/**
  * ready 握手：订阅等该 workspace+epoch 的首份自上报（worker-entry 启动即报），超时抛错走降级。
  * 无存量预查——调用点只在 rec.fresh（新建）时调；复用沿用首次落位结论（见 placeWorkerForTask）。
  */
@@ -172,7 +184,7 @@ export const awaitWorkerReady = async (
   manager: WorkerManager,
   workspace: string,
   epoch: number,
-  timeoutMs = 10000,
+  timeoutMs = workerReadyTimeoutMs(),
 ): Promise<void> => {
   // 只订阅等首份自上报（无存量预查——调用点仅在 rec.fresh 新建时调，复用沿用首次落位结论）。
   await new Promise<void>((resolve, reject) => {

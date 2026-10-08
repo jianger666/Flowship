@@ -181,6 +181,37 @@ const TaskDetailPage = () => {
   const [groupQaVisible, setGroupQaVisible] = useState(false);
   // V0.6.6「编辑任务」dialog 开关（改角色 / 标题 / 飞书链接 / 模型 / 工作分支）
   const [editDialogOpen, setEditDialogOpen] = useState(false);
+  // 任务输入条乐观占位行（HTTP 回来前事件流先出半透明气泡；按 taskId+nonce 隔离，
+  // 同文案连发不互撤）
+  const [pendingTalkRows, setPendingTalkRows] = useState<
+    Array<{
+      taskId: string;
+      nonce: string;
+      text: string;
+      displayText: string;
+      at: number;
+    }>
+  >([]);
+  const addTalkPending = useCallback(
+    (p: { taskId: string; nonce: string; text: string; displayText: string }) => {
+      setPendingTalkRows((prev) => {
+        // 同 nonce 幂等（跨挂载认领重加不叠行）；顺手清掉别的任务的残留
+        const rest = prev.filter(
+          (r) => r.taskId !== p.taskId || r.nonce !== p.nonce,
+        );
+        return [...rest, { ...p, at: Date.now() }];
+      });
+    },
+    [],
+  );
+  const removeTalkPending = useCallback(
+    (p: { taskId: string; nonce: string }) => {
+      setPendingTalkRows((prev) =>
+        prev.filter((r) => r.taskId !== p.taskId || r.nonce !== p.nonce),
+      );
+    },
+    [],
+  );
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
   // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
@@ -1116,6 +1147,18 @@ const TaskDetailPage = () => {
                   task={task}
                   streamingText={streamingText}
                   hideReplyComposer
+                  // 任务输入条乐观占位：只喂当前任务的行。
+                  // 状态收成一个：uncertain=false 即“发送中”单态（半透明+时钟、与真气泡区分即可）。
+                  // uncertain=true 的“发送状态未知、正在确认…”留给 chat 那边真正的 202 排队语义——
+                  // 这里单飞行 POST，失败本就有 toast+恢复，挂 19 秒“未知”纯属吓人。
+                  pendingLocalReplies={pendingTalkRows
+                    .filter((r) => r.taskId === task.id)
+                    .map((r) => ({
+                      id: r.nonce,
+                      text: r.text,
+                      displayText: r.displayText,
+                      uncertain: false,
+                    }))}
                   // 必传：漏了会让运行中的长 shell / subagent 被当成脏数据渲染成「已中断」。
                   // 旁路答疑（需求群非属主提问）同样在往这条流里写工具事件、
                   // 但它刻意不写 runStatus——必须并进来，否则它跑着的工具全成「已中断」
@@ -1141,6 +1184,8 @@ const TaskDetailPage = () => {
                   onStop={() => void handleStop()}
                   stopping={stopping}
                   runActive={runActive}
+                  onPendingAdd={addTalkPending}
+                  onPendingRemove={removeTalkPending}
                 />
               )}
             </aside>

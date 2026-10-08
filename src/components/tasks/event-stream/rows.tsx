@@ -362,7 +362,8 @@ const USER_REPLY_BUBBLE =
 const USER_REPLY_TEXT =
   "w-full min-w-0 wrap-anywhere whitespace-pre-wrap text-sm leading-relaxed";
 
-/** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中）——用户消息、跟正式气泡同样右对齐
+/** 本地排队占位气泡（半透明 + 时钟）——用户消息、跟正式气泡同样右对齐
+ * 状态收成一个：“发送中”（uncertain 只控制编辑/删除可用性，不再分文案）
  * C：hover 出编辑 / 删除，直达队列操作，不用经过 banner 面板 */
 export const PendingLocalReplyRow = memo(
   ({
@@ -410,7 +411,7 @@ export const PendingLocalReplyRow = memo(
         <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
         <div className={cn(USER_REPLY_TEXT, "flex-1 text-muted-foreground")}>
           <span className="mb-0.5 flex items-center gap-2 text-[11px] tracking-wide">
-            <span>{uncertain ? "发送状态未知、正在确认…" : "待发送"}</span>
+            <span>发送中…</span>
             {!uncertain && (editable || deletable) && (
               <span className="ml-auto hidden items-center gap-0.5 group-hover:inline-flex">
                 {editable && (

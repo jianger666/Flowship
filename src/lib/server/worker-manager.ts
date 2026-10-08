@@ -142,6 +142,20 @@ export class WorkerManager {
     return out;
   }
 
+  /** 坏 worker 回收：ready 握手超时 / 自上报对不上 epoch 时调——SIGTERM 并摘除，
+   * 下次 spawn 重新起 fresh（不复用坏进程）。复用坏进程是输入框次次 30-50s 的主因。 */
+  drop(workspace: string): boolean {
+    const rec = this.workers.get(workspace);
+    if (!rec) return false;
+    try {
+      rec.proc.kill("SIGTERM");
+    } catch {
+      /* best-effort */
+    }
+    this.workers.delete(workspace);
+    return true;
+  }
+
   /**
    * 准入：已存在直接 ok；否则先 reap 空闲，满员（达到 maxWorkers）或
    * 超全局软线（总 RSS >= 主进程 + 存量 worker 按软线估算）都进队列排队。

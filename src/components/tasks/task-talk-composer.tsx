@@ -45,6 +45,11 @@ import {
   submitTaskQuestion,
 } from "@/lib/task-store";
 import {
+  allocPendingNonce,
+  restoreOptimisticDraft,
+  runOptimisticSubmit,
+} from "@/lib/optimistic-submit";
+import {
   CURSOR_PROVIDER_ID,
   type ModelSelection,
   type Task,
@@ -69,6 +74,15 @@ interface Props {
   stopping?: boolean;
   // 父级锁存的 run 进行中状态（latch 到 done 才松、跨过 awaiting_ack 的流式窗口）
   runActive?: boolean;
+  /** 乐观气泡：发送即在事件流占位（HTTP 回来前用户先看到自己的消息） */
+  onPendingAdd?: (p: {
+    taskId: string;
+    text: string;
+    displayText: string;
+    nonce: string;
+  }) => void;
+  /** 占位清除（成功靠 SSE 真气泡接替、失败直接撤） */
+  onPendingRemove?: (p: { taskId: string; nonce: string }) => void;
 }
 
 export const TaskTalkComposer = ({
@@ -77,6 +91,8 @@ export const TaskTalkComposer = ({
   onStop,
   stopping = false,
   runActive = false,
+  onPendingAdd,
+  onPendingRemove,
 }: Props) => {
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
@@ -202,6 +218,11 @@ export const TaskTalkComposer = ({
   // （用户没写新东西）才清输入框，否则留着用户新敲的字。
   const onTaskUpdateRef = useRef(onTaskUpdate);
   onTaskUpdateRef.current = onTaskUpdate;
+  // 认领 effect 内调（挂载时回调 identity 稳定、读最新 props）
+  const onPendingAddRef = useRef(onPendingAdd);
+  onPendingAddRef.current = onPendingAdd;
+  const onPendingRemoveRef = useRef(onPendingRemove);
+  onPendingRemoveRef.current = onPendingRemove;
   const valueRef = useRef(rich.value);
   valueRef.current = rich.value;
   const resetRef = useRef(rich.reset);
@@ -210,6 +231,15 @@ export const TaskTalkComposer = ({
     const pending = getPendingQuestionSend(task.id);
     if (!pending) return;
     setSubmitting(true);
+    // 跨挂载认领：在飞的发送占位行一起认回来（新 nonce 行），落定再撤。
+    const claimTaskId = task.id;
+    const claimNonce = allocPendingNonce();
+    onPendingAddRef.current?.({
+      taskId: claimTaskId,
+      text: pending.text,
+      displayText: pending.text,
+      nonce: claimNonce,
+    });
     let alive = true;
     void pending.promise.then(
       (result) => {
@@ -228,6 +258,7 @@ export const TaskTalkComposer = ({
         toast.error(err instanceof Error ? err.message : String(err));
       },
     ).finally(() => {
+      onPendingRemoveRef.current?.({ taskId: claimTaskId, nonce: claimNonce });
       if (alive) setSubmitting(false);
     });
     return () => {
@@ -282,19 +313,52 @@ export const TaskTalkComposer = ({
       return;
     }
     setSubmitting(true);
+    // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、
+    // AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」上下文。
+    // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
+    // payload 快照在 runOptimisticSubmit 调用处取（snap），失败恢复用同一份。
     try {
-      // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、
-      // AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」上下文。
-      // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
-      const { text, images, attachments, skillRefs } = rich.payload();
-      const result = await submitTaskQuestion(
-        task,
-        text,
-        images,
-        talkForceModel(pickedModel, resolveSessionModel(task)),
-        attachments,
-        skillRefs,
-      );
+      // 输入框秒清 + 乐观占位走公共 runOptimisticSubmit（与 chat 输入岛同一模式）：
+      // 快照 payload 后立刻 reset，气泡靠 SSE 补；失败才恢复正文+路径。
+      // question POST 含 resume，长会话下要等一两分钟，之前输入框全程占着正文被当成“卡死”。
+      const snap = rich.payload();
+      const outcome = await runOptimisticSubmit({
+        payload: snap,
+        reset: () => rich.reset(),
+        restore: (p) =>
+          restoreOptimisticDraft(
+            p,
+            (t) => rich.setValue(t),
+            (paths) => rich.pathAttach.replaceAll(paths),
+            (imgs) => rich.attach.replaceAll(imgs),
+          ),
+        pendingKey: {
+          taskId: task.id,
+          text: snap.text,
+          displayText: snap.text,
+          nonce: allocPendingNonce(),
+        },
+        onPendingAdd,
+        onPendingRemove,
+        send: () =>
+          submitTaskQuestion(
+            task,
+            snap.text,
+            snap.images,
+            talkForceModel(pickedModel, resolveSessionModel(task)),
+            snap.attachments,
+            snap.skillRefs,
+          ),
+      });
+      if (!outcome.ok) {
+        toast.error(
+          outcome.error instanceof Error
+            ? outcome.error.message
+            : String(outcome.error ?? "发送失败"),
+        );
+        return;
+      }
+      const result = outcome.result;
       // send 后落盘失败——不可忽略提示
       if (result.persistWarning) {
         toast.error(
@@ -302,11 +366,8 @@ export const TaskTalkComposer = ({
         );
       }
       onTaskUpdate(result.task);
-      rich.reset();
       // 粘住语义：one-shot 问答不改 actions，覆盖留着下条继续用；
       // 唤醒改了 action 模型的，actionSig effect 会清覆盖跟上新会话。
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setSubmitting(false);
     }

@@ -79,10 +79,13 @@ import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
 import { beginAskSkip, fulfillAskSkipViaWait, type AskSkipHandle } from "@/lib/server/ask-skip";
 import {
   isSessionRotationDue,
+  isPerfRotationDue,
   rotationUsageOf,
   SESSION_ROTATION_INFO_TEXT,
 } from "@/lib/server/session-rotate";
 import { buildSkillDirective } from "@/lib/protocol-signals";
+import { appendTimingLog } from "./timing-log";
+import { heapPressure } from "./sdk-store-gc";
 import {
   migrateProviderSettings,
   providerDisplayName,
@@ -171,6 +174,9 @@ const runChatReplyInject = async (
   // 日志进 packaged main.log（userData/logs），事件流零噪音。
   const sendT0 = Date.now();
   const sendMarks: string[] = [];
+  // 同步镜像进文件日志（dataRoot/logs/chat-reply-timings.log）——
+  // dev 终端 agent 够不着，落盘后可直接读文件取证，不再让人肉贴日志。
+  const sendSlowLines: string[] = [];
   const sendTimed = async <T>(stage: string, p: Promise<T>): Promise<T> => {
     const t = Date.now();
     try {
@@ -179,7 +185,9 @@ const runChatReplyInject = async (
       const ms = Date.now() - t;
       sendMarks.push(`${stage}=${ms}ms`);
       if (ms > 3000) {
-        console.warn(`[chat-reply] 慢阶段 task=${id} stage=${stage} ${ms}ms`);
+        const warn = `[chat-reply] 慢阶段 task=${id} stage=${stage} ${ms}ms`;
+        console.warn(warn);
+        sendSlowLines.push(`${new Date().toISOString()} ${warn}`);
       }
     }
   };
@@ -626,11 +634,19 @@ const runChatReplyInject = async (
     // 走下面懒重启分支关旧建新（起手 prompt 注入近 12 轮摘要、与 resume 失败降级同路）。
     // 阈值极高正常会话撞不上；队列/drain 语义与切模型懒重启完全一致、不新增路径。
     // 注：无 bootArgs（canRestart=false）时 unchanged 恒 true，本来也起不了新会话，轮换自然不触发。
-    const rotationDue = isSessionRotationDue(rotationUsageOf(task));
+    // 2026-09-24 加速度水位：只认 sessionInputTokens（老任务 total 再大也不误杀）。
+    const rotationDue =
+      isSessionRotationDue(rotationUsageOf(task)) ||
+      isPerfRotationDue(rotationUsageOf(task));
     if (rotationDue) {
       console.log(
         `[chat-reply] task=${task.id} 会话累计 input 超水位、本轮轮换新会话`,
       );
+      // 轮换频率取证（速度水位校准用）：记 rotation.log，终端 console 照打。
+      // mem/perf 双旗 + 堆值：>2M 时两边都满足，不记分不清 50 万灵不灵。
+      appendTimingLog("rotation.log", [
+        `${new Date().toISOString()} [rotation] task=${task.id} via=chat-lazy-restart mem=${isSessionRotationDue(rotationUsageOf(task))} perf=${isPerfRotationDue(rotationUsageOf(task))} heap=${heapPressure().ratio.toFixed(2)} sessionInputTokens=${rotationUsageOf(task).sessionInputTokens ?? -1}`,
+      ]);
     }
     const unchanged =
       !runModel ||
@@ -1187,6 +1203,11 @@ const runChatReplyInject = async (
       const line = `[chat-reply] send timings task=${id} total=${total}ms ${sendMarks.join(" ")}`;
       if (total > 10000) console.warn(line + "（超 10s，疑似发送卡顿）");
       else if (total > 1000) console.log(line);
+      // 文件镜像：全量记（question 侧同理：>1s 门限会漏对账）。
+      appendTimingLog("chat-reply-timings.log", [
+        `${new Date().toISOString()} ${line}`,
+        ...sendSlowLines,
+      ]);
     } catch {
       /* 取证日志不得影响主流程 */
     }

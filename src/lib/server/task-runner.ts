@@ -138,13 +138,15 @@ import { resolveSessionModel } from "@/lib/task-model";
 import { resolveWkWorktreeBranchInfos } from "./wk-source-branch";
 import { setTaskSessionAgentId } from "./task-fs";
 import {
+  isPerfRotationDue,
   registerMidRunRotationTrigger,
   rotationUsageOf,
   SESSION_ROTATION_INFO_TEXT,
   shouldRotateSession,
   unregisterMidRunRotationTrigger,
 } from "./session-rotate";
-import { assertHeapOk, HeapPressureError } from "./sdk-store-gc";
+import { appendTimingLog } from "./timing-log";
+import { assertHeapOk, HeapPressureError, heapPressure } from "./sdk-store-gc";
 import {
   agentSessions,
   allocTaskRunInstanceId,
@@ -1232,11 +1234,19 @@ const advanceTaskCore = async (
   // 堆过半才强制起新 agent。新 agent 走正常 fresh 路径（artifact + 任务元信息
   // 就是接力棒），只扔 SDK 会话缓存；sessionInputTokens 在
   // setTaskSessionAgentId(新 id) 时清零，见 task-fs。
-  const rotationDue = shouldRotateSession(rotationUsageOf(task));
+  // 2026-09-24 加速度水位：只认 sessionInputTokens（老任务 total 再大也不误杀），
+  // run 内探针（mid-run）不动，只收边界这两处。
+  const rotationDue =
+    shouldRotateSession(rotationUsageOf(task)) ||
+    isPerfRotationDue(rotationUsageOf(task));
   if (rotationDue) {
     console.log(
       `[task-runner] task=${task.id} 会话累计 input 超水位、推进强制起新 agent`,
     );
+    // 轮换频率取证（速度水位校准用）。mem/perf 双旗 + 堆值见 rotation.log 注释。
+    appendTimingLog("rotation.log", [
+      `${new Date().toISOString()} [rotation] task=${task.id} via=advance-force-new mem=${shouldRotateSession(rotationUsageOf(task))} perf=${isPerfRotationDue(rotationUsageOf(task))} heap=${heapPressure().ratio.toFixed(2)} sessionInputTokens=${rotationUsageOf(task).sessionInputTokens ?? -1}`,
+    ]);
   }
   let effectiveForceNewAgent =
     !reuseAgent ||
@@ -5404,6 +5414,8 @@ export const deliverTaskQuestion = async (
   attachmentPaths?: string[],
   /** 路由入场 admission token；缺省则 send 入口同步取 */
   opGen?: number,
+  /** 分节计时收集器（question-timing 行透出 resume/agentSend 子阶段） */
+  timing?: (entry: string) => void,
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
     task,
@@ -5415,8 +5427,8 @@ export const deliverTaskQuestion = async (
       ackContext,
     }),
     ackContext
-      ? { creds, errorActionId: ackContext.actionId, opGen }
-      : { creds, questionRun: true, opGen },
+      ? { creds, errorActionId: ackContext.actionId, opGen, timing }
+      : { creds, questionRun: true, opGen, timing },
   );
 
 /**
@@ -5868,6 +5880,8 @@ const sendToTaskSession = async (
     runKind?: string;
     /** 调用方入场 opGen；缺省则本函数在进串行队列前同步取 */
     opGen?: number;
+    /** 分节计时收集器（deliver 子阶段透出给 question-timing） */
+    timing?: (entry: string) => void;
   } = {},
 ): Promise<SendTaskSessionResult> => {
   // admission 在进 runWithTaskSendSerial 之前同步捕获——
@@ -5893,6 +5907,8 @@ const sendToTaskSessionBody = async (
     opGen?: number;
     /** 由导出入口在进串行队列前拍好，禁止出队后自取 */
     entryOpHandle: TaskOpHandle;
+    /** 分节计时收集器（deliver 子阶段透出给 question-timing） */
+    timing?: (entry: string) => void;
   },
 ): Promise<SendTaskSessionResult> => {
   // 由 sendToTaskSession 入口传入（禁止出队后自取 opGen / observer）
@@ -5935,12 +5951,21 @@ const sendToTaskSessionBody = async (
     }
     // task 保命轮换：双条件（水位 + 堆过半）到了关旧链、走 no_session 分流
     // （唤醒新 agent 原地续同一 action / one-shot），artifact 照常接力。
+    // 2026-09-24 加速度水位（同上，只认 sessionInputTokens）。
     try {
       const fresh = await getTaskMeta(task.id);
-      if (fresh && shouldRotateSession(rotationUsageOf(fresh))) {
+      if (
+        fresh &&
+        (shouldRotateSession(rotationUsageOf(fresh)) ||
+          isPerfRotationDue(rotationUsageOf(fresh)))
+      ) {
         console.log(
           `[task-runner] task=${task.id} 会话累计 input 超水位、追问转新会话`,
         );
+        // 轮换频率取证（速度水位校准用）：记 rotation.log，终端 console 照打。
+        appendTimingLog("rotation.log", [
+          `${new Date().toISOString()} [rotation] task=${task.id} via=question-boundary mem=${shouldRotateSession(rotationUsageOf(fresh))} perf=${isPerfRotationDue(rotationUsageOf(fresh))} heap=${heapPressure().ratio.toFixed(2)} sessionInputTokens=${rotationUsageOf(fresh).sessionInputTokens ?? -1}`,
+        ]);
         const old = agentSessions.get(task.id);
         if (old) {
           closeTaskSession(task.id, old.agentId, {
@@ -5961,10 +5986,26 @@ const sendToTaskSessionBody = async (
     let session = agentSessions.get(task.id) ?? null;
     // 记下是否本轮 resume 刚登记——失主时必须按 instance 清掉，给 B 干净位子
     let resumedThisCall = false;
+    // deliver 子阶段计时（question-timing 行透出 resume/agentSend 各自耗时）。
+    // 传 thunk 而非已执行的 promise：参数求值时调用已跑到首个 await，
+    // 直接传 promise 会少算同步前缀（ms 级，但对账要准）。
+    const markTimed = async <T>(stage: string, thunk: () => Promise<T>): Promise<T> => {
+      if (!opts.timing) return await thunk();
+      const t = Date.now();
+      try {
+        return await thunk();
+      } finally {
+        opts.timing(`${stage}=${Date.now() - t}ms`);
+      }
+    };
     if (!session && opts.creds) {
-      session = await resumeTaskSession(task, opts.creds, {
-        opHandle: entryOpHandle,
-      });
+      // creds 先接出来：thunk 闭包里 narrowing 会丢，直接读 opts.creds 过不了类型。
+      const creds = opts.creds;
+      session = await markTimed("resumeTaskSession", () =>
+        resumeTaskSession(task, creds, {
+          opHandle: entryOpHandle,
+        }),
+      );
       resumedThisCall = !!session;
     }
     if (!session) {
@@ -6014,22 +6055,24 @@ const sendToTaskSessionBody = async (
         runKind,
         promptBytes: Buffer.byteLength(text, "utf-8"),
       });
-      run = await withSdkDeadline(
-        agent.send(text, {
-          onDelta: composeOnDelta(
-            perfTracker.onDelta,
-            // 续接 / 问一问 send 绑入场 opHandle
-            createShellOutputDeltaPublisher(task.id, () =>
-              isTaskOpCurrent(entryOpHandle),
+      run = await markTimed("agentSend", () =>
+        withSdkDeadline(
+          agent.send(text, {
+            onDelta: composeOnDelta(
+              perfTracker.onDelta,
+              // 续接 / 问一问 send 绑入场 opHandle
+              createShellOutputDeltaPublisher(task.id, () =>
+                isTaskOpCurrent(entryOpHandle),
+              ),
+              createSdkSummaryDeltaPublisher(task.id, () =>
+                isTaskOpCurrent(entryOpHandle),
+              ),
             ),
-            createSdkSummaryDeltaPublisher(task.id, () =>
-              isTaskOpCurrent(entryOpHandle),
-            ),
-          ),
-          onStep: perfTracker.onStep,
-        }),
-        SDK_SEND_TIMEOUT_MS,
-        "agent.send",
+            onStep: perfTracker.onStep,
+          }),
+          SDK_SEND_TIMEOUT_MS,
+          "agent.send",
+        ),
       );
       perfTracker.attachRun(run);
     } catch (err) {
