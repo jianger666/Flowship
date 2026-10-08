@@ -2543,6 +2543,9 @@ type ActionPatchFields = Partial<
     | "postCheck"
     | "sideEffects"
     | "agentModel"
+    // 写回 agentModel 必须连戳一起改（task-model.planResumeModel），否则
+    // resolveSessionModel 的跨家守卫会把刚写回的新家模型当旧家的跳过
+    | "agentProvider"
     | "excluded"
     | "artifactUpdatedAt"
     | "planBatches"

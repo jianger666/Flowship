@@ -80,6 +80,21 @@ export const stampActionsProviderForSwitch = (
 };
 
 /**
+ * 这条 action 记的提供方戳，跟当前提供方对得上吗？
+ * - 当前提供方没定（task.provider 为空）→ 无从比较，认
+ * - action 无戳（v1.9.16 前的老数据）→ 按旧口径认
+ * resolveSessionModel 的同家过滤与唤醒选模型（planResumeModel）共用这一处——
+ * 展示口径和服务端口径只许有一份判定，别再各写各的（v1.9.26 线上就分叉过一次）。
+ */
+export const actionProviderMatches = (
+  action: Pick<ActionRecord, "agentProvider">,
+  provider: string | null | undefined,
+): boolean => {
+  const current = provider?.trim();
+  return !current || !action.agentProvider || action.agentProvider === current;
+};
+
+/**
  * 当前推进实际在用的模型：最近 action.agentModel → task.model。
  * 都不存在时返 undefined（说话条空态「选择模型」、服务端再兜 settings）。
  *
@@ -95,7 +110,7 @@ export const resolveSessionModel = (
   if (provider && task.actions?.length) {
     // 同家过滤后复用 latestActionAgentModel，别手写第二遍“取最大 n”（改排序规则只改一处）
     const m = latestActionAgentModel(
-      task.actions.filter((a) => !a.agentProvider || a.agentProvider === provider),
+      task.actions.filter((a) => actionProviderMatches(a, provider)),
     );
     if (m?.id?.trim()) return m;
   } else {
@@ -104,4 +119,62 @@ export const resolveSessionModel = (
   }
   if (task.model?.id?.trim()) return task.model;
   return undefined;
+};
+
+const usableModel = (
+  m: ModelSelection | undefined,
+): ModelSelection | undefined => (m?.id?.trim() ? m : undefined);
+
+export interface ResumeModelPlan {
+  /** 唤醒的新 agent 实际用的模型 */
+  model: ModelSelection;
+  /**
+   * 非 null = 要 patch 到被唤醒的 action 上（模型 + 提供方戳一起写，不许只写一半）。
+   * agentProvider 仅在当前提供方已定时才带键——带 undefined 会被 patch 展开成抹掉已有戳。
+   */
+  writeBack: Pick<ActionRecord, "agentModel" | "agentProvider"> | null;
+}
+
+/**
+ * 唤醒当前 action 时：用哪个模型、要不要把它连同提供方戳写回 action。
+ *
+ * 选模型：forceModel（用户显式选的，必是当前家）→ 同家的 action.agentModel →
+ * task.model（切家时落盘的新家默认）→ 调用方兜底。异家戳的 action.agentModel 跳过：
+ * 旧家模型 id 在当前家无效，拿去起 agent 会 400（跟 resolveSessionModel 同一道跨家守卫）。
+ *
+ * 写回（action.agentModel 是说话条展示的单一来源）：模型变了要写；戳跟当前家对不上也要写——
+ * 这是 v1.9.26 线上的坑：切过家的老任务里 action 带旧家戳，用户在说话条换成新家模型唤醒，
+ * 只写 agentModel 不改戳，resolveSessionModel 就把刚写回的新家模型当旧家的跳过，
+ * 说话条回退显示 task.model（实际在跑的仍是用户选的）。
+ * 已被污染的老任务（新家模型 + 旧家戳）从数据上分不出它是不是真旧家模型：没手选时按
+ * 「跟说话条显示一致」回退 task.model 并把戳订正过来；用户重选一次模型即可换回想要的。
+ * 老数据（无戳）/ 当前家未定：不凭空补戳，行为同旧口径。
+ */
+export const planResumeModel = (input: {
+  forceModel?: ModelSelection;
+  action: Pick<ActionRecord, "agentModel" | "agentProvider">;
+  task: Pick<Task, "model" | "provider">;
+  fallbackModel: ModelSelection;
+}): ResumeModelPlan => {
+  const { forceModel, action, task, fallbackModel } = input;
+  const provider = task.provider?.trim() || undefined;
+  const model =
+    usableModel(forceModel) ??
+    (actionProviderMatches(action, provider)
+      ? usableModel(action.agentModel)
+      : undefined) ??
+    usableModel(task.model) ??
+    fallbackModel;
+  const modelChanged =
+    modelSelectionKey(model) !== modelSelectionKey(action.agentModel);
+  const stampStale =
+    !!provider && !!action.agentProvider && action.agentProvider !== provider;
+  if (!modelChanged && !stampStale) return { model, writeBack: null };
+  return {
+    model,
+    writeBack: {
+      agentModel: model,
+      ...(provider ? { agentProvider: provider } : {}),
+    },
+  };
 };

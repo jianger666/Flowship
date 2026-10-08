@@ -134,7 +134,7 @@ import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
 import { getCustomAction } from "./custom-action-fs";
 import { wkCommandForAction } from "@/lib/wk-command";
 import { resolveFlowLock } from "@/lib/flow-mutex";
-import { resolveSessionModel } from "@/lib/task-model";
+import { planResumeModel, resolveSessionModel } from "@/lib/task-model";
 import { resolveWkWorktreeBranchInfos } from "./wk-source-branch";
 import { setTaskSessionAgentId } from "./task-fs";
 import {
@@ -1604,7 +1604,7 @@ export interface ResumeCurrentActionInput {
   /** 用户随消息附的文件 / 目录绝对路径（v1.1.x 任务输入条也能附路径） */
   attachmentPaths?: string[];
   apiKey: string;
-  /** 模型优先级：forceModel → action.agentModel → task.model → 这里的兜底（bootArgs.model） */
+  /** 模型优先级：forceModel → 同家 action.agentModel → task.model → 这里的兜底（bootArgs.model） */
   fallbackModel: ModelSelection;
   /** 用户在输入条显式选的模型（V0.13.x：换模型唤醒、最高优先——用户意图就是换个模型继续干） */
   forceModel?: ModelSelection;
@@ -1824,23 +1824,25 @@ const resumeCurrentActionCore = async (
   // 模型：用户显式选的（forceModel）最优先——V0.13.x 修「换模型说话被锁进只读答疑」：
   // 换模型唤醒 = 用户想换个模型继续干活；没显式选才沿用该 action 当初的 agentModel
   //（唤醒是「接着干」、不该悄悄换模型）、再退 task.model、最后兜 bootArgs 默认
-  const model =
-    input.forceModel?.id?.trim()
-      ? input.forceModel
-      : startAction.agentModel?.id?.trim()
-        ? startAction.agentModel
-        : startTask.model?.id?.trim()
-          ? startTask.model
-          : input.fallbackModel;
+  // 选哪个、要不要连提供方戳一起写回，统一走 planResumeModel——跟说话条的
+  // resolveSessionModel 同一道跨家守卫（异家戳的旧模型 id 不拿来起新家 agent）。
+  const { model, writeBack } = planResumeModel({
+    forceModel: input.forceModel,
+    action: startAction,
+    task: startTask,
+    fallbackModel: input.fallbackModel,
+  });
 
   // 把本次实际启动的模型写回 action.agentModel：换模型唤醒（forceModel）跟当初的
   // agentModel 不同、不写回的话说话条会一直显示该 action 当初的旧模型、
   // 与实际在跑的模型不符（task-model.resolveSessionModel 以 agentModel 为单一来源）。
-  if (JSON.stringify(model) !== JSON.stringify(startAction.agentModel)) {
+  // 模型和 agentProvider 戳必须一起写：只写模型的话，切过家的老任务里旧家戳会让
+  // 刚写回的新家模型被跨家守卫跳过，说话条照样回退成 task.model（v1.9.26 线上实录）。
+  if (writeBack) {
     const modelPatched = await patchActionIfOwner(
       fresh.id,
       action.id,
-      { agentModel: model },
+      writeBack,
       () => isOpOwner(opHandle),
     );
     if (modelPatched) {
