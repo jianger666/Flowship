@@ -88,6 +88,24 @@ jobs:
             }
           '
 
+      # 偶发失败复现：同一批最可疑的测试，重复 + 并行（制造 CPU / 磁盘争抢）多跑几轮。
+      # 背景：上一轮 Windows 曾有 1 个用例失败、下一轮同样代码又全绿——要分清是测试时序不稳还是实现缺陷。
+      - name: 压力复现（重复 + 并行）
+        if: always()
+        run: |
+          mkdir -p stress-out
+          FILES="tests/sdk-store-gc-store-path.test.ts tests/fast-checkpoint-store.test.ts tests/sdk-store-gc.test.ts tests/sdk-agent-store-wiring.test.ts"
+          for round in 1 2 3 4 5 6; do
+            for k in 1 2 3; do
+              ( pnpm exec vitest run --reporter=json --outputFile.json=stress-out/r-$round-$k.json $FILES > stress-out/log-$round-$k.txt 2>&1 || true ) &
+            done
+            wait
+          done
+
+      - name: 压力复现汇总（注解）
+        if: always()
+        run: node .github/scripts/stress-summary.cjs stress-out
+
       - name: 类型检查（仅 Linux）
         if: runner.os == 'Linux'
         run: pnpm typecheck
