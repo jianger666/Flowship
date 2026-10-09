@@ -32,7 +32,6 @@ import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { dataRoot } from "./data-root";
-import { isWorkerIsolationEnabled } from "./worker-mode";
 
 import {
   appendAction,
@@ -68,6 +67,7 @@ import {
 import { evaluateWkAdvanceGate } from "./wk-gate";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
 import { createRunPerfTracker } from "./run-perf";
+import { notePrep } from "./run-prep-notes";
 import {
   composeOnDelta,
   createSdkSummaryDeltaPublisher,
@@ -87,11 +87,10 @@ import {
   type AwaitingNotifier,
   type ChatTaskActionHandler,
 } from "./chat-pending";
-import { getMRMergeStatus, closeOpenMR } from "./gitlab-client";
+import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
 import { validateSubmitMr } from "./submit-mr-guard";
 import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
 import { shouldDisposeAfterAction } from "./mem-governance";
-import { createMRWithIntent } from "./worker-flip";
 import { assertNoUpdatePendingRestart } from "./update-pending";
 import { reapTaskOrphans } from "./kill-orphans";
 import { syncCompanyEnvFileFromSettings } from "./company-env-fs";
@@ -2453,9 +2452,7 @@ export const buildSessionBridges = (
           };
         }
 
-        const result = await createMRWithIntent({
-          taskId: task.id,
-          actionId: mr.actionId,
+        const result = await createMR({
           config: { host: gitHost, token: gitToken },
           projectPath: mr.projectPath,
           sourceBranch: mr.sourceBranch,
@@ -3092,7 +3089,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
     // 1) merge MCP（V0.11.1 抽成共用 helper、resume 会话时也要重传 inline MCP）
     const perfMcpStart = Date.now();
-    const { mergedMcp, cursorMcpNames, droppedMcp } =
+    const { mergedMcp, cursorMcpNames, droppedMcp, mcpStats } =
       await buildMergedMcpForTask(task);
     const perfMcpMs = Date.now() - perfMcpStart;
     const mcpDesc =
@@ -3230,30 +3227,6 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             const perfCreateStart = Date.now();
             // SDK local 无 env 透传 → 启动前把 companyEnv 同步到固定路径供 skill 读
             await syncCompanyEnvFileFromSettings();
-            // v3.1 收尾线①路由分叉（facade 拥有落位）：此处只注册 flip 全配真实现
-            // （git host 现推 + 会话 token 快照，供恢复反查；失败自吞，绝不 crash 启动链）。
-            // SDK 落位 + 寄宿走 agent-backend facade（flag 开才进 worker，关零变化）。
-            if (isWorkerIsolationEnabled()) {
-              try {
-                const { buildTaskFlipDeps } = await import("./worker-route");
-                const { registerFlipDeps } = await import("./worker-flip");
-                registerFlipDeps(
-                  buildTaskFlipDeps({
-                    gitHost: await resolveEffectiveGitHost(
-                      task.repoPaths,
-                      task.scriptRepoPaths,
-                    ).catch(() => null),
-                    gitToken,
-                    workDir: effectiveCwd,
-                  }),
-                );
-              } catch (err) {
-                console.warn(
-                  `[task-runner] flip deps 注册失败（恢复走默认分支） task=${task.id}:`,
-                  err instanceof Error ? err.message : String(err),
-                );
-              }
-            }
             // V2a：记下本会话绑定的提供方，切提供方后复用防线靠它（对不上强制 fresh）。
             const createdProviderId = await resolveProviderIdFromDisk(task);
             const created = await withSdkDeadline(
@@ -3435,12 +3408,24 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
             const perfSendStart = Date.now();
             const promptBytes = Buffer.byteLength(superPrompt, "utf-8");
+            // 受理前各阶段耗时 + MCP 探活统计 → 并进本 run 的汇总记录（run-perf.jsonl）
+            notePrep(task.id, {
+              stages: {
+                workspace: perfWorkspaceMs,
+                mcp: perfMcpMs,
+                create: perfCreateMs,
+                prompt: perfPromptMs,
+              },
+              mcp: mcpStats,
+              tags: { path: "create" },
+            });
             // SDK onDelta/onStep 细粒度耗时（thinking / tool / step / turn）——与下方 start-chain 汇总互补
             const perfTracker = createRunPerfTracker({
               taskId: task.id,
               agentId: created.agentId,
               runKind: "task-first",
               promptBytes,
+              model,
               promptBudgetDropped: superPromptBuilt.dropped.map((d) => d.name),
               promptBudgetCompressed: superPromptBuilt.compressed,
             });
@@ -5161,16 +5146,22 @@ const buildMergedMcpForTask = async (
   mergedMcp: Record<string, McpServerConfig>;
   cursorMcpNames: string[];
   droppedMcp: Awaited<ReturnType<typeof filterHealthyMcp>>["dropped"];
+  /** 探活缓存命中 / 等待统计（观测用；测试里 mock 的 filterHealthyMcp 没有这个字段） */
+  mcpStats: Awaited<ReturnType<typeof filterHealthyMcp>>["stats"];
 }> => {
   const enrichedMcp = await enrichMcpServersWithOAuth(
     await resolveTaskMcpServers(task.disabledMcpServers),
   );
-  const { servers: cursorMcp, dropped: droppedMcp } =
-    await filterHealthyMcp(enrichedMcp);
+  const {
+    servers: cursorMcp,
+    dropped: droppedMcp,
+    stats: mcpStats,
+  } = await filterHealthyMcp(enrichedMcp);
   return {
     mergedMcp: { ...cursorMcp },
     cursorMcpNames: Object.keys(cursorMcp),
     droppedMcp,
+    mcpStats,
   };
 };
 

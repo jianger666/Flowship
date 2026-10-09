@@ -33,9 +33,12 @@ const cp = async (src, dest) => {
 // 不进 standalone node_modules → 缺包时 SDK 连 API key exchange 直接 fetch failed
 // （本地 electron:dist:test 打的包踩过、chat 全 status=error）。
 // CI 在目标平台 job 用 npm install 补（release.yml）；本地打包走这里补「当前平台」包。
+// isolated 下要铺两处链接：① .pnpm 内 @cursor/sdk 的兄弟链接（Node require 用）；
+// ② 顶层 node_modules/@cursor/sdk-<平台>（SDK 的 platform-package-locator 只认这里，见函数内第 3 步）。
 // 仅处理 pnpm symlink 拓扑（本地 isolated）；hoisted 平铺（CI ubuntu build）无 .pnpm、
 // 跳过交 CI 补——对 CI 零影响。
-const addSdkPlatformPackage = async (rootDir, destDir) => {
+// export 仅为单测（tests/assemble-server-platform-pkg.test.ts）直接构造 pnpm 夹具调用。
+export const addSdkPlatformPackage = async (rootDir, destDir) => {
   const destPnpm = path.join(destDir, "node_modules", ".pnpm");
   if (!(await exists(destPnpm))) return; // hoisted 布局（CI）、交 CI npm install 补
 
@@ -92,6 +95,25 @@ const addSdkPlatformPackage = async (rootDir, destDir) => {
       linkPath,
     );
   }
+  // 3. 顶层 node_modules/@cursor/sdk-<平台> 也要有链接，指向实体。
+  //    SDK 的 platform-package-locator 定位 tree-sitter（shell 命令分析）/ rg / cursorsandbox（沙箱 helper）
+  //    时不走 require 解析：从入口脚本（server.js）所在目录起逐级向上找
+  //    `node_modules/@cursor/sdk-<平台>/<相对路径>`（@cursor/sdk dist/cjs/index.js；1.0.31 与 1.0.37 算法一致）。
+  //    第 2 步的兄弟链接只服务 Node 的 require、locator 看不到它；hoisted（CI）平台包本来就在顶层，
+  //    所以只有本机 isolated 包缺——缺了三者全部定位失败，shell 命令分析静默降级为 parsingFailed
+  //    （日志 `tree-sitter natives are unavailable`）、rg / 沙箱不可用。
+  //    相对路径必须从「链接所在目录」算起，别写死层数（同 addRuntimePackage 的 scoped 链接）。
+  const topLink = path.join(destDir, "node_modules", "@cursor", platformPkg);
+  const entityPkgDir = path.join(
+    destPnpm,
+    `@cursor+${platformPkg}@${version}`,
+    "node_modules",
+    "@cursor",
+    platformPkg,
+  );
+  await fs.mkdir(path.dirname(topLink), { recursive: true });
+  await fs.rm(topLink, { force: true, recursive: true }).catch(() => {});
+  await fs.symlink(path.relative(path.dirname(topLink), entityPkgDir), topLink);
   console.log(`[assemble] 已补 SDK 平台包 @cursor/${platformPkg}@${version}`);
 };
 
@@ -233,8 +255,9 @@ const locatePkgEntity = async (rootDir, pkgName, searchDir) => {
  * 脚本运行时包不在 Next 模块图里、file tracing 追不到，按依赖树显式补进 standalone。
  * 只补 dependencies：ssh2 的 cpu-features / nan 是 optionalDependencies，
  * 运行时 require 有 try/catch 降级、不随包（省掉原生二进制体积）。
+ * export 仅为单测（tests/assemble-server-scoped-links.test.ts）直接构造 pnpm 夹具调用。
  */
-const addRuntimePackage = async (
+export const addRuntimePackage = async (
   rootDir,
   destDir,
   pkgName,
@@ -270,10 +293,20 @@ const addRuntimePackage = async (
     const linkPath = path.join(destDir, "node_modules", pkgName);
     await fs.mkdir(path.dirname(linkPath), { recursive: true });
     await fs.rm(linkPath, { force: true, recursive: true }).catch(() => {});
-    await fs.symlink(
-      path.join(".pnpm", info.pnpmName, "node_modules", pkgName),
-      linkPath,
+    // 相对路径必须从「链接所在目录」算起：scoped 包（@scope/name）的链接在 node_modules/@scope/ 下、
+    // 比非 scoped 多一层目录。曾经写死 ".pnpm/…"，scoped 包指到 node_modules/@scope/.pnpm/…（不存在），
+    // 断链后被下面 assembleServerLayout 的 removeBrokenSymlinks 清掉——顶层 @earendil-works/* 等全丢，
+    // pi 后端运行时 MODULE_NOT_FOUND（本机 isolated 打包踩过；CI 用 hoisted 不走这个分支所以没暴露）。
+    // 非 scoped 包（ssh2 / pg）算出来仍是 ".pnpm/…"，产物与修复前逐字节一致。
+    const entityPkgDir = path.join(
+      destDir,
+      "node_modules",
+      ".pnpm",
+      info.pnpmName,
+      "node_modules",
+      pkgName,
     );
+    await fs.symlink(path.relative(path.dirname(linkPath), entityPkgDir), linkPath);
   }
   console.log(`[assemble] 已补运行时包 ${pkgName}`);
 };

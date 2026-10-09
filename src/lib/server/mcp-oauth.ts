@@ -542,7 +542,7 @@ export const clearMcpOAuth = async (serverName: string): Promise<void> =>
  * 返回 AUTHORIZED。refresh 失败（refresh_token 也废了）会继续走授权流（redirectToAuthorization）、
  * 返回 REDIRECT——headless 下无意义、这里只认 AUTHORIZED、其余返 null 等用户重新授权。
  */
-const getValidAccessToken = async (
+const resolveValidAccessToken = async (
   serverName: string,
   serverUrl: string,
 ): Promise<string | null> => {
@@ -576,6 +576,44 @@ const getValidAccessToken = async (
     console.error(`[mcp-oauth] ${serverName} refresh 失败`, err);
   }
   return null;
+};
+
+// ---- 续期合并（single-flight）----
+// 同一 server 并发的「读记录 → 过期 → refresh」合并成一次。
+// 为什么：过期后每个并发调用各自走 auth() 就会各打一次 refresh 请求。在 refresh-token 轮换
+// （每次刷新使旧 refresh_token 作废）的服务端上，后到的那次会 invalid_grant、auth() 转去走授权流，
+// 本次拿不到 token（MCP 被当成未授权剔除），严重时刚落盘的新 token 也会被覆盖——用户得重新授权。
+// 两个 run 同时发送本来就会撞上；v1.9.28 起「聚焦输入框就预热探活」会让并发更常见，所以必须合并。
+// key 含归一后的 URL：同名 server 改绑了新地址的不能共用（URL 强校验的结果不同）。
+// 挂 globalThis：dev HMR / 多 chunk 各持一份 module 变量会让合并失效（同 OAUTH_LOCKS_KEY）。
+const REFRESH_INFLIGHT_KEY = "__flowshipMcpOAuthRefreshInflightV1__";
+type RefreshInflightMap = Map<string, Promise<string | null>>;
+
+const getRefreshInflight = (): RefreshInflightMap => {
+  const g = globalThis as unknown as Record<
+    string,
+    RefreshInflightMap | undefined
+  >;
+  if (!g[REFRESH_INFLIGHT_KEY]) g[REFRESH_INFLIGHT_KEY] = new Map();
+  return g[REFRESH_INFLIGHT_KEY]!;
+};
+
+const getValidAccessToken = (
+  serverName: string,
+  serverUrl: string,
+): Promise<string | null> => {
+  const inflight = getRefreshInflight();
+  const key = `${serverName}\n${normalizeServerUrl(serverUrl)}`;
+  const running = inflight.get(key);
+  if (running) return running;
+  const p: Promise<string | null> = resolveValidAccessToken(
+    serverName,
+    serverUrl,
+  ).finally(() => {
+    if (inflight.get(key) === p) inflight.delete(key);
+  });
+  inflight.set(key, p);
+  return p;
 };
 
 /**

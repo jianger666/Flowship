@@ -1,41 +1,44 @@
 name: sdk-gate
 
-# v3.1 §9 CI 门：@cursor/sdk 变更自动重跑实验 B 断言 + worker 契约测试。
-# A3 的持续化落法：SDK 升级红灯阻塞合入。
+# @cursor/sdk 变更（或改了依赖它的读写格式 / 读取语义的本地 store、GC、会话轮换代码）时，自动重跑对拍测试。
+# 这些测试都拿 SDK 原实现当标准答案（原实现写、我们读；我们写、原实现读），
+# SDK 升级后文件格式或读取语义一变，这里先红；红灯阻塞合入。
+#
+# 2026-10-09：原先这里还有 worker 契约测试 / 故障注入 / experiment-b 三步，
+# 随 worker 隔离整体删除（experiment-b 只是打印版本的占位脚本，从未真正断言过什么）。
 
 on:
   push:
     paths:
       - "package.json"
       - "pnpm-lock.yaml"
-      - "src/lib/server/worker-*.ts"
-      - "src/lib/server/mem-governance.ts"
-      - "src/lib/server/intent-*.ts"
-      - "src/lib/server/bash-policy.ts"
-      - "src/lib/server/session-rotate.ts"
-      - "scripts/experiment-*.mjs"
-      - "scripts/fault-injection/**"
-      - "tests/worker-*.test.ts"
-      - "src/lib/server/worker-*.ts"
       - "src/lib/server/agent-backend.ts"
-      - "tests/mem-governance*.test.ts"
-      - "tests/gitlab-mock-proxy.test.ts"
+      # 本地 checkpoint store（FastCheckpoints）/ GC / 会话轮换：改它们必须重跑对应契约测试。
+      # 测试文件也算触发条件，否则「悄悄改弱断言」不会被门禁发现。
+      - "src/lib/server/fast-checkpoint-store.ts"
+      - "src/lib/server/sdk-agent-store.ts"
+      - "src/lib/server/sdk-store-gc.ts"
+      - "src/lib/server/session-rotate.ts"
+      - "tests/fast-checkpoint-*.test.ts"
+      - "tests/helpers/fast-store-helpers.ts"
+      - "tests/sdk-agent-store*.test.ts"
+      - "tests/sdk-store-gc*.test.ts"
+      - "tests/session-rotate*.test.ts"
   pull_request:
     paths:
       - "package.json"
       - "pnpm-lock.yaml"
-      - "src/lib/server/worker-*.ts"
-      - "src/lib/server/mem-governance.ts"
-      - "src/lib/server/intent-*.ts"
-      - "src/lib/server/bash-policy.ts"
-      - "src/lib/server/session-rotate.ts"
-      - "scripts/experiment-*.mjs"
-      - "scripts/fault-injection/**"
-      - "tests/worker-*.test.ts"
-      - "src/lib/server/worker-*.ts"
       - "src/lib/server/agent-backend.ts"
-      - "tests/mem-governance*.test.ts"
-      - "tests/gitlab-mock-proxy.test.ts"
+      # 同 push 段：本地 checkpoint store / GC / 会话轮换
+      - "src/lib/server/fast-checkpoint-store.ts"
+      - "src/lib/server/sdk-agent-store.ts"
+      - "src/lib/server/sdk-store-gc.ts"
+      - "src/lib/server/session-rotate.ts"
+      - "tests/fast-checkpoint-*.test.ts"
+      - "tests/helpers/fast-store-helpers.ts"
+      - "tests/sdk-agent-store*.test.ts"
+      - "tests/sdk-store-gc*.test.ts"
+      - "tests/session-rotate*.test.ts"
 
 jobs:
   sdk-gate:
@@ -50,14 +53,6 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: experiment-b（四档 + 版本锁定）
-        run: node scripts/experiment-b.mjs
-      - name: fault injection（公理测试可执行化）
-        run: |
-          pnpm exec jiti scripts/fault-injection/fault-x10-transcript.mjs
-          pnpm exec jiti scripts/fault-injection/fault-leak-ladder.mjs
-          pnpm exec jiti scripts/fault-injection/fault-seq-fencing.mjs
-          pnpm exec jiti scripts/fault-injection/fault-kill-midtool.mjs
-          pnpm exec jiti scripts/fault-injection/fault-doublekill.mjs
-      - name: worker 契约测试
-        run: pnpm vitest run tests/mem-governance.test.ts tests/mem-governance-v31.test.ts tests/worker-epoch.test.ts tests/worker-v31.test.ts tests/session-rotate.test.ts tests/gitlab-mock-proxy.test.ts tests/worker-facade.test.ts
+      # 只在 Linux 跑；Windows 语义靠测试里的故障注入模拟，真机行为需要三平台 CI 另行验证。
+      - name: checkpoint store / GC / 会话轮换测试
+        run: pnpm vitest run tests/fast-checkpoint-store.test.ts tests/fast-checkpoint-agent-ops.test.ts tests/sdk-agent-store-wiring.test.ts tests/sdk-agent-store.test.ts tests/sdk-store-gc.test.ts tests/sdk-store-gc-store-path.test.ts tests/sdk-store-gc-heal.test.ts tests/session-rotate.test.ts tests/session-rotate-chat.test.ts tests/session-rotate-midrun.test.ts

@@ -66,6 +66,7 @@ import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { createRunPerfTracker } from "./run-perf";
+import { notePrep } from "./run-prep-notes";
 import {
   composeOnDelta,
   createSdkSummaryDeltaPublisher,
@@ -969,8 +970,11 @@ export const runChatSession = async (
     );
     // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
     // filterHealthyMcp 走 TTL 缓存（ok/fail 各 5min）——跨会话复用、热路径可秒过
-    const { servers: cursorMcp, dropped: droppedMcp } =
-      await filterHealthyMcp(enrichedMcp);
+    const {
+      servers: cursorMcp,
+      dropped: droppedMcp,
+      stats: mcpStats,
+    } = await filterHealthyMcp(enrichedMcp);
     const perfMcpMs = Date.now() - perfMcpStart;
     // chat agent 同样带 caller 身份（ask_user 分派层要核）
     const callerToken = String(allocTaskRunInstanceId());
@@ -1151,11 +1155,18 @@ export const runChatSession = async (
     const perfSendStart = Date.now();
     const promptBytes = Buffer.byteLength(initialPrompt, "utf-8");
     publishBootProgress(task.id, "send", "正在发送首包…");
+    // 受理前各阶段耗时 + MCP 探活统计 → 并进本 run 的汇总记录（run-perf.jsonl）
+    notePrep(task.id, {
+      stages: { mcp: perfMcpMs, create: perfCreateMs, prompt: perfPromptMs },
+      mcp: mcpStats,
+      tags: { path: "create" },
+    });
     const perfTracker = createRunPerfTracker({
       taskId: task.id,
       agentId: agent.agentId,
       runKind: "chat-first",
       promptBytes,
+      model,
     });
     run = await withSdkDeadline(
       agent.send(initialPrompt, {
@@ -1382,13 +1393,17 @@ export const resumeChatSession = async (
       return null;
     }
     // inline MCP 不随 resume 持久化、重传（同 runChatSession 的 merge 逻辑）
+    const perfMcpStart = Date.now();
     const enrichedMcp = await enrichMcpServersWithOAuth(
       await resolveTaskMcpServers(task.disabledMcpServers),
     );
-    const { servers: cursorMcp } = await filterHealthyMcp(enrichedMcp);
+    const { servers: cursorMcp, stats: mcpStats } =
+      await filterHealthyMcp(enrichedMcp);
+    const perfMcpMs = Date.now() - perfMcpStart;
     // resume 发新 caller + 重注册 notifier；系统工具走 customTools，用户 MCP 仍 inline
     const callerToken = String(allocTaskRunInstanceId());
     const mergedMcp: Record<string, McpServerConfig> = { ...cursorMcp };
+    const perfResumeStart = Date.now();
     const agent = await withSdkDeadline(
       Agent.resume(task.sessionAgentId, {
         apiKey: bootArgs.apiKey,
@@ -1411,6 +1426,7 @@ export const resumeChatSession = async (
       SDK_CREATE_RESUME_TIMEOUT_MS,
       "Agent.resume",
     );
+    const perfResumeMs = Date.now() - perfResumeStart;
     // Agent.resume 成功后、runningChats.set 之前的同步复查：
     // await 期间 rewind / 并发 resume / stop(cancelChatStart) 可能已抢占——放弃挂载
     if (
@@ -1454,6 +1470,12 @@ export const resumeChatSession = async (
       },
     });
     registerChatNotifier(task, callerToken, instanceId);
+    // resume 的两段耗时（MCP 探活 / Agent.resume）+ 探活统计 → 并进紧随其后那次 send 的汇总记录
+    notePrep(task.id, {
+      stages: { mcp: perfMcpMs, resume: perfResumeMs },
+      mcp: mcpStats,
+      tags: { path: "resume" },
+    });
     console.log(
       `[chat-runner] task=${task.id} 会话已恢复（Agent.resume agentId=${agent.agentId}、instance=#${instanceId}${opts.claimRun ? "、已认领首发" : ""}）`,
     );
@@ -1703,6 +1725,7 @@ const runReconnectAttempt = async (
       agentId: rec.agent.agentId,
       runKind: "chat-reconnect",
       promptBytes: Buffer.byteLength(reconnectPrompt, "utf-8"),
+      model: rec.model,
     });
     // 认领已在 resume 注册时完成（runActive=true），勿等 send 后再置——
     // 否则 flush / 并发 send 可插在 reconnect prompt 之前（ 点名的晚置位窗口）
@@ -2201,6 +2224,7 @@ export const sendChatMessage = async (
       agentId: rec.agent.agentId,
       runKind: "chat-followup",
       promptBytes: Buffer.byteLength(prompt, "utf-8"),
+      model: rec.model,
     });
     run = await withSdkDeadline(
       rec.agent.send(prompt, {

@@ -23,6 +23,7 @@ import {
   nativeImage,
   nativeTheme,
   Notification,
+  powerSaveBlocker,
   shell,
   Tray,
 } from "electron";
@@ -51,6 +52,8 @@ import {
   classifyWinUpdateAttempt,
   hasSilentUpdateMarker,
 } from "./win-update-guard.mjs";
+// 防后台节流实验开关（v1.9.28、默认关）：纯函数在 ./app-nap.mjs（单测直接 import）
+import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -68,6 +71,44 @@ const PROTOCOL_SCHEME = IS_TEST ? "flowship-test" : "flowship";
 const PORT = Number(process.env.FLOWSHIP_PORT) || (IS_TEST ? 8776 : 8876);
 const HOST = "127.0.0.1";
 const BASE_URL = `http://${HOST}:${PORT}`;
+
+// ── 防后台节流实验开关（v1.9.28、默认关）──────────────────────────────
+// 假设：窗口被遮挡 / 最小化 / 系统判定空闲时，macOS App Nap 与 Chromium 后台节流会拖慢
+// 渲染进程的定时器 / rAF（流式渲染追赶）和主进程定时器、造成「切回来第一条消息」偏慢。
+// 没有数据证明——所以只做实验开关：开启 = 渲染进程 backgroundThrottling=false +
+// powerSaveBlocker('prevent-app-suspension')；代价是后台耗电略增（不阻止显示器休眠）。
+// 是否有收益由 run-perf.jsonl 的 appNap 字段做 A/B 对比。
+// 开启（重启生效）：userData 下建空文件 PREVENT_APP_NAP，或环境变量 FLOWSHIP_PREVENT_APP_NAP=1。
+let appNapModeCache = null;
+const getAppNapMode = () => {
+  if (!appNapModeCache) {
+    appNapModeCache = resolveAppNapMode(
+      process.env,
+      existsSync(path.join(app.getPath("userData"), APP_NAP_MARKER)),
+    );
+  }
+  return appNapModeCache;
+};
+
+let appNapBlockerId = null;
+const applyAppNapGuard = () => {
+  const mode = getAppNapMode();
+  if (!mode.enabled) {
+    log(
+      `[main] 防后台节流实验=关（默认）；开启：在 userData 下建空文件 ${APP_NAP_MARKER} 或设 FLOWSHIP_PREVENT_APP_NAP=1，重启生效`,
+    );
+    return;
+  }
+  try {
+    appNapBlockerId = powerSaveBlocker.start("prevent-app-suspension");
+    log(
+      `[main] 防后台节流实验=开（来源=${mode.source}） powerSaveBlocker id=${appNapBlockerId} ` +
+        `started=${powerSaveBlocker.isStarted(appNapBlockerId)} 渲染进程 backgroundThrottling=false`,
+    );
+  } catch (err) {
+    log(`[main] 防后台节流启动失败（不影响使用）：${err?.message || err}`);
+  }
+};
 
 // 站内 URL 必须按 origin 精确比对——`url.startsWith(BASE_URL)` 会被
 // `http://127.0.0.1:8876@evil/` / `:88760/` / `.attacker.tld/` 前缀绕过（审查发现）
@@ -327,6 +368,10 @@ const startServer = () => {
       PORT: String(PORT),
       HOSTNAME: HOST,
       FLOWSHIP_DATA_DIR: path.join(app.getPath("userData"), "data"),
+      // 观测用：run 汇总记录（run-perf.jsonl）带上版本与防节流实验开关状态，
+      // 用于 A/B 对比「空闲后首发 / TTFT」是否因此改善
+      FLOWSHIP_APP_VERSION: app.getVersion(),
+      FLOWSHIP_PREVENT_APP_NAP: getAppNapMode().enabled ? "1" : "0",
     },
     // cwd 不用管：standalone server.js 启动时自己 process.chdir(__dirname)
     stdio: ["ignore", "pipe", "pipe"],
@@ -903,6 +948,9 @@ const createWindow = async () => {
       // 原生文件选择器 IPC 通道（v0.7.14）——页面附文件 / 附目录走主进程
       // dialog.showOpenDialog、秒弹 + 自动聚焦、替代 osascript ~1s 冷启动
       preload: path.join(__dirname, "preload.cjs"),
+      // 防后台节流实验（默认关 = Electron 默认的 true）：开启后窗口被遮挡 / 最小化时
+      // 渲染进程不降频、流式渲染与 SSE 读取不被节流
+      backgroundThrottling: !getAppNapMode().enabled,
     },
   });
   if (st?.maximized) mainWindow.maximize();
@@ -2065,6 +2113,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")} protocol=${PROTOCOL_SCHEME}`);
+    applyAppNapGuard();
     // 机器快照（启动慢定位用：内存/CPU 不够的机器冷启动天然慢，先排除硬件因素）
     try {
       const cpus = os.cpus();
@@ -2279,6 +2328,14 @@ if (!app.requestSingleInstanceLock()) {
   // 也先置 quitting，同一门控不会误拦。
   app.on("before-quit", (event) => {
     quitting = true;
+    if (appNapBlockerId !== null) {
+      try {
+        powerSaveBlocker.stop(appNapBlockerId);
+      } catch {
+        /* 退出路径不挡 */
+      }
+      appNapBlockerId = null;
+    }
     if (serverProc) {
       try {
         if (process.platform === "win32") {

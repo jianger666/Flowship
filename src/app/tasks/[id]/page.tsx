@@ -71,6 +71,8 @@ import { Separator } from "@/components/ui/separator";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskList } from "@/hooks/use-task-list";
+import { useTaskWarmup } from "@/hooks/use-task-warmup";
+import { useUiPerfReporter } from "@/hooks/use-ui-perf-reporter";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { findPendingAskEvent } from "@/lib/ask-pending";
 import { isEphemeralToolOutputDelta } from "@/lib/tool-display";
@@ -406,6 +408,13 @@ const TaskDetailPage = () => {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task?.id, task?.currentActionId, task?.actions.length]);
+
+  // v1.9.28：进入页面 / 窗口回到前台 / 聚焦输入框时后台预热（探活缓存 + 会话存储预读），
+  // 让首条消息少等一轮冷启动。页面级只挂这一处（chat / task 两种模式都渲染本页）
+  useTaskWarmup(task?.id);
+  // v1.9.28：前端流畅度观测（长任务 / 慢交互 / 回前台追赶 / 页面规模）→ ui-perf.jsonl，
+  // 只在有信号时上报、没信号时低频抽样；任何失败都静默、不影响页面
+  useUiPerfReporter(task?.id);
 
   // ---- 自动 watch SSE ----
   // V0.6.0.1：chat 模式 task 走 ChatView 内部自己的 useTaskWatch（避免父子两份订阅重复 setTask）

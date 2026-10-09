@@ -7,7 +7,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   collectLiveAgentIds,
@@ -177,5 +177,139 @@ describe("gcSdkStoreOnce 端到端（tmp 库）", () => {
     const { root } = await mkTmpStore();
     const got = await collectLiveAgentIds(path.join(root, "tasks"));
     expect(got?.has("agent-live-1")).toBe(true);
+  });
+});
+
+// 文件路径用 `.gc-tmp` 写完再 rename 覆盖原文件。Windows 上杀毒 / 索引器 / 云同步会随机占住目标
+// 文件，rename 报 EPERM / EBUSY——这是瞬态的，稍等就好；以前直接抛出，整轮 GC 白跑。
+describe("gcByFiles：rename 的 Windows 重试", () => {
+  const eperm = (): Error =>
+    Object.assign(new Error("EPERM: operation not permitted, rename"), {
+      code: "EPERM",
+    });
+  const cpPathOf = (store: string): string =>
+    path.join(store, "checkpoints.ndjson");
+
+  it("Windows：目标文件被占用（EPERM）→ 退避重试，最终 GC 成功", async () => {
+    const { store } = await mkTmpStore();
+    const realRename = fs.rename.bind(fs);
+    let injected = 0;
+    const spy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(from).endsWith(".gc-tmp") && injected < 2) {
+        injected += 1;
+        throw eperm();
+      }
+      return realRename(from, to);
+    });
+    const sleeps: number[] = [];
+    try {
+      const stats = await gcSdkStoreOnce({
+        dir: store,
+        minBytes: 1,
+        retry: {
+          platform: "win32",
+          sleep: async (ms) => {
+            sleeps.push(ms);
+          },
+        },
+      });
+      expect(stats.skipped).toBeUndefined();
+      expect(stats.via).toBe("files");
+      expect(injected).toBe(2); // 注入的两次失败都被重试消化掉
+      expect(sleeps).toHaveLength(2); // 每次失败后退避一次
+      const cp = await fs.readFile(cpPathOf(store), "utf-8");
+      expect(cp).toContain("keep-1");
+      expect(cp).not.toContain("drop-1");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("POSIX：EPERM 是真权限问题 → 不重试不等待，本轮 fail-open 跳过、原文件不动", async () => {
+    const { store } = await mkTmpStore();
+    const before = await fs.readFile(cpPathOf(store), "utf-8");
+    let calls = 0;
+    const spy = vi.spyOn(fs, "rename").mockImplementation(async () => {
+      calls += 1;
+      throw eperm();
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sleeps: number[] = [];
+    try {
+      const stats = await gcSdkStoreOnce({
+        dir: store,
+        minBytes: 1,
+        retry: {
+          platform: "linux",
+          sleep: async (ms) => {
+            sleeps.push(ms);
+          },
+        },
+      });
+      expect(stats.skipped).toBe("error");
+      expect(calls).toBe(1);
+      expect(sleeps).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      warn.mockRestore();
+    }
+    expect(await fs.readFile(cpPathOf(store), "utf-8")).toBe(before);
+  });
+
+  it("Windows：一直被占用、预算耗尽 → 重试有限，抛给外层 fail-open，原文件不动", async () => {
+    const { store } = await mkTmpStore();
+    const before = await fs.readFile(cpPathOf(store), "utf-8");
+    let calls = 0;
+    const spy = vi.spyOn(fs, "rename").mockImplementation(async () => {
+      calls += 1;
+      throw eperm();
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sleeps: number[] = [];
+    try {
+      const stats = await gcSdkStoreOnce({
+        dir: store,
+        minBytes: 1,
+        retry: {
+          platform: "win32",
+          budgetMs: 60,
+          sleep: async (ms) => {
+            sleeps.push(ms);
+          },
+        },
+      });
+      expect(stats.skipped).toBe("error");
+      expect(calls).toBeGreaterThan(1); // 确实重试过
+      expect(calls).toBeLessThan(20); // 且不是无限重试
+      expect(sleeps).toHaveLength(calls - 1);
+    } finally {
+      spy.mockRestore();
+      warn.mockRestore();
+    }
+    expect(await fs.readFile(cpPathOf(store), "utf-8")).toBe(before);
+  });
+});
+
+// 备份是删数据前的最后一道保险：备份目录建不出来就必须整轮跳过，不能"忽略失败继续删"。
+// 备份只有一种失败方式（mkdir 备份目录失败；单文件拷贝失败被 catch 吞掉），mock mkdir 即可，不依赖文件权限、跨平台。
+describe("备份失败 → 不动手", () => {
+  it("files 路径：备份目录建不出来 → 跳过（backup-failed），四份 ndjson 一个字节都不动", async () => {
+    const { store } = await mkTmpStore();
+    const names = ["checkpoints.ndjson", "runs.ndjson", "agents.ndjson", "run_events.ndjson"];
+    const before = await Promise.all(names.map((n) => fs.readFile(path.join(store, n))));
+    const realMkdir = fs.mkdir.bind(fs) as (...a: unknown[]) => Promise<unknown>;
+    const spy = vi.spyOn(fs, "mkdir").mockImplementation(((...a: unknown[]) =>
+      String(a[0]).includes(".gc-backup-")
+        ? Promise.reject(Object.assign(new Error("EACCES: simulated"), { code: "EACCES" }))
+        : realMkdir(...a)) as never);
+    try {
+      const stats = await gcSdkStoreOnce({ dir: store, minBytes: 1 });
+      expect(stats.skipped).toBe("backup-failed");
+    } finally {
+      spy.mockRestore();
+    }
+    for (const [i, n] of names.entries()) {
+      expect(Buffer.compare(await fs.readFile(path.join(store, n)), before[i])).toBe(0);
+    }
   });
 });

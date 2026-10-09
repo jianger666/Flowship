@@ -84,6 +84,7 @@ import {
   SESSION_ROTATION_INFO_TEXT,
 } from "@/lib/server/session-rotate";
 import { buildSkillDirective } from "@/lib/protocol-signals";
+import { notePrep } from "./run-prep-notes";
 import { appendTimingLog } from "./timing-log";
 import { heapPressure } from "./sdk-store-gc";
 import {
@@ -174,6 +175,9 @@ const runChatReplyInject = async (
   // 日志进 packaged main.log（userData/logs），事件流零噪音。
   const sendT0 = Date.now();
   const sendMarks: string[] = [];
+  // 同一份阶段耗时的结构化版本：受理前并进本 run 的汇总记录（run-perf.jsonl），
+  // 让「回车 → 首 token」整条链路在一行里就能看清（见 run-prep-notes）
+  const sendStages: Record<string, number> = {};
   // 同步镜像进文件日志（dataRoot/logs/chat-reply-timings.log）——
   // dev 终端 agent 够不着，落盘后可直接读文件取证，不再让人肉贴日志。
   const sendSlowLines: string[] = [];
@@ -184,6 +188,7 @@ const runChatReplyInject = async (
     } finally {
       const ms = Date.now() - t;
       sendMarks.push(`${stage}=${ms}ms`);
+      sendStages[stage] = (sendStages[stage] ?? 0) + ms;
       if (ms > 3000) {
         const warn = `[chat-reply] 慢阶段 task=${id} stage=${stage} ${ms}ms`;
         console.warn(warn);
@@ -677,6 +682,12 @@ const runChatReplyInject = async (
         // ownerInstanceId：owner 实例精确匹配才跳过 runActive 早退；
         // checkpoint 期间被 stop 摘除 / forceClear 换新实例 → send 内按
         // cancelled / owner_invalid 收敛（取消是终态、绝不能当可重试故障）
+        // 受理前各阶段耗时（resume / checkpoint / 存图 …）并进本 run 的汇总记录；
+        // 必须在 sendChatMessage 被调用（= 创建 perf tracker）之前记
+        notePrep(task.id, {
+          stages: { ...sendStages, preSend: Date.now() - sendT0 },
+          tags: { via: "inject" },
+        });
         const sent = await sendTimed(
           "sendChatMessage",
           sendChatMessage(

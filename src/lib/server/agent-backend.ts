@@ -31,7 +31,6 @@ import { isCursorProvider } from "@/lib/types";
 import type { CustomAgentInput } from "./custom-agent-backend";
 import { withFlowshipSdkCustomTools } from "./flowship-tools";
 import { withCursorJsonlStore } from "./sdk-agent-store";
-import { isWorkerIsolationEnabled } from "./worker-mode";
 import { readSettingsFile } from "./settings-fs";
 
 /** 与 @cursor/sdk 的 Agent.create 返回类型一致（下游类型零改动） */
@@ -209,39 +208,6 @@ export const Agent = {
     const withTools = await withCursorJsonlStore(
       attachFlowshipTools(sanitized, effectiveCallerToken),
     );
-    // v3.1 选项 A 翻转：flag 开 → worker 寄宿（落位+握手+manifest 重建+RPC 回调）；
-    // 任一步失败 catch 降级老路径。关 → 下一行逐字节不变。
-    if (isWorkerIsolationEnabled()) {
-      try {
-        const {
-          createWorkerHostedAgent,
-          extractToolManifest,
-          stripFunctionsForIpc,
-        } = await import("./worker-facade");
-        const local = (withTools as { local?: { customTools?: Record<string, { description?: unknown; inputSchema?: unknown }>; cwd?: unknown } }).local;
-        const manifest = extractToolManifest(local?.customTools);
-        const stripped = stripFunctionsForIpc(withTools as unknown as Record<string, unknown>);
-        const strippedLocal = (stripped as { local?: Record<string, unknown> }).local;
-        if (strippedLocal) delete strippedLocal.customTools;
-        const cwd =
-          typeof local?.cwd === "string" && local.cwd ? local.cwd : (taskId ?? "default");
-        return (await createWorkerHostedAgent({
-          sdkInput: stripped,
-          manifest,
-          callerToken: effectiveCallerToken,
-          taskId,
-          workspace: cwd,
-          gitHost: null,
-          gitToken: undefined,
-          workDir: typeof cwd === "string" ? cwd : "default",
-        })) as unknown as AgentInstance;
-      } catch (err) {
-        console.warn(
-          "[agent-backend] worker 寄宿失败、降级本进程创建:",
-          err instanceof Error ? err.message : String(err),
-        );
-      }
-    }
     return CursorAgent.create(withTools);
   },
 
@@ -274,38 +240,6 @@ export const Agent = {
     const withToolsResume = await withCursorJsonlStore(
       attachFlowshipTools(sanitized, effectiveCallerToken),
     );
-    if (isWorkerIsolationEnabled()) {
-      try {
-        const {
-          resumeWorkerHostedAgent,
-          extractToolManifest,
-          stripFunctionsForIpc,
-        } = await import("./worker-facade");
-        const local = (withToolsResume as { local?: { customTools?: Record<string, { description?: unknown; inputSchema?: unknown }>; cwd?: unknown } }).local;
-        const manifest = extractToolManifest(local?.customTools);
-        const stripped = stripFunctionsForIpc(withToolsResume as unknown as Record<string, unknown>);
-        const strippedLocal = (stripped as { local?: Record<string, unknown> }).local;
-        if (strippedLocal) delete strippedLocal.customTools;
-        const cwd =
-          typeof local?.cwd === "string" && local.cwd ? local.cwd : (taskId ?? "default");
-        return (await resumeWorkerHostedAgent({
-          agentId,
-          sdkInput: stripped,
-          manifest,
-          callerToken: effectiveCallerToken,
-          taskId,
-          workspace: cwd,
-          gitHost: null,
-          gitToken: undefined,
-          workDir: typeof cwd === "string" ? cwd : "default",
-        })) as unknown as AgentInstance;
-      } catch (err) {
-        console.warn(
-          "[agent-backend] worker 恢复失败、降级本进程恢复:",
-          err instanceof Error ? err.message : String(err),
-        );
-      }
-    }
     return CursorAgent.resume(agentId, withToolsResume);
   },
 

@@ -24,6 +24,18 @@ export const registerNode = (): void => {
     );
   });
 
+  // 事件循环延迟 / 利用率 / GC 采样（每秒一个点；run 汇总记录取「send→结束」窗口，
+  // 慢秒另落 loop-lag.jsonl）。用来区分「UI 卡」是模型 / 网络慢、还是服务端主线程被占住。
+  // 幂等、unref 定时器、开销可忽略；失败只 warn——观测不能影响启动。
+  void import("./lib/server/loop-lag")
+    .then((m) => m.startLoopLagSampler())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 事件循环采样启动失败（不阻断）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+
   // test 实例的 lark-cli 配置隔离（2026-07-19 用户拍板）：
   // lark-cli 默认读全局 ~/.lark-cli/config.json——test 和正式会绑同一个飞书机器人、
   // 事件互抢。test 实例把配置目录指到独立目录（绑独立机器人）；

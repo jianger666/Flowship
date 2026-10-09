@@ -1,8 +1,8 @@
 /**
  * chat 会话保命轮换（2026-09-03 OOM 根治：最小可用版）
  *
- * 背景：@cursor/sdk（1.0.30）local-agent 无客户端自动压缩，后端即便压也只省模型窗口、
- * 不释放我们 server 堆。单 chat 窗口连跑 9 个子代理后累计 input 278 万、单轮 56 万，
+ * 背景（2026-09-03 的判断；其中「SDK 无自动压缩」已于 2026-10-08 更正，见文末）：
+ * 单 chat 窗口连跑 9 个子代理后累计 input 278 万、单轮 56 万，
  * 堆到 ~2.4G 就 `heap out of memory` → 整个 server 进程没（实测）。
  *
  * 解法：水位一到，下轮消息走已有的「懒重启」分支（关旧建新 + 起手 prompt 注入近 12 轮
@@ -15,11 +15,27 @@
  * 为什么只看「会话累计」、不看「单轮」：
  * 转完后 `tokenUsage.last` 还是转前那轮的旧值（新轮没跑完）——若拿单轮做触发，
  * 下轮检查会看到 stale 的 56 万而无限连转。会话累计在新建锚点时清零，无此问题。
+ *
+ * ── 2026-10-08：token 水位（50 万速度水位 + 200 万保命水位）默认关闭 ──
+ * 更正：SDK 有自动摘要 / 压缩（含带 auto|manual 触发标记的 preCompact 钩子，1.0.31 与
+ * 1.0.37 实现一致），只是相关事件在 SDK 的 onDelta 里被故意过滤，Flowship 事件流看不到——
+ * 看不到不等于没有。
+ * 真正让会话「越聊越卡 / 内存暴涨」的是 SDK JSONL store 的 checkpoints：每次 get/create/
+ * update/list 整份读入、整文件重写，内存放大约 28 倍（见 fast-checkpoint-store.ts），
+ * 已在 store 层修掉。而本文件的水位看的 sessionInputTokens 是「累计发送量」——每个工具步骤
+ * 都会重发整段上下文，单个 run 就能累计上千万——与上下文大小 / 堆占用只是间接相关，
+ * 触发一次就轮换一次 = AI 失忆。所以两道 token 水位一并关闭，不再因 token 累计量轮换。
+ * 回滚：设环境变量 FLOWSHIP_TOKEN_WATERMARK=1 后重启，原行为（阈值常量不变）整体恢复。
+ * 没动的：基于真实堆占用的 85% 拒单门（sdk-store-gc 的 assertHeapOk）——它看的是真实内存，
+ * 不是 token 累计。
+ *
+ * ── 2026-10-09：worker 隔离整体删除 ──
+ * 原先这里还有一套「worker 内存样本 → 软 / 硬线 → 双限额 → 触发 run 内轮换」的新路径
+ * （workerRotationActionFor / probeWorkerRotation 等），随 worker 子系统一并删除；
+ * run 内轮换只剩下面 maybeFireMidRunRotation 这一条（token 水位 AND 堆过半）。
  */
 
 import type { Task } from "@/lib/types";
-import type { WorkerMemorySample } from "./mem-governance";
-import { classifyWorkerMemory, isRotationAllowed } from "./mem-governance";
 import { heapPressure } from "./sdk-store-gc";
 
 /** 当前 SDK 会话累计 input 超过此值 → 下轮轮换（同事实测崩时 278 万） */
@@ -45,13 +61,32 @@ export interface RotationUsageLike {
   totalInputTokens?: number;
 }
 
-/** 纯函数：水位到了返 true。缺字段（老任务）→ 用 total 估算，再缺 = 不转。 */
-export const isSessionRotationDue = (u: RotationUsageLike): boolean =>
-  (u.sessionInputTokens ?? u.totalInputTokens ?? 0) >=
-  ROTATE_SESSION_INPUT_TOKENS;
+/** token 水位总开关环境变量。仅显式 `1` / `true` 开启，缺省 = 关。 */
+export const TOKEN_WATERMARK_ENV = "FLOWSHIP_TOKEN_WATERMARK" as const;
 
-/** 纯函数：速度水位到了返 true。只认 sessionInputTokens（见 ROTATE_PERF_INPUT_TOKENS 注释）。 */
+/** 两道 token 水位（速度 50 万 / 保命 200 万）是否启用。默认关闭，原因见文件头。 */
+export const isTokenWatermarkEnabled = (
+  env: Record<string, string | undefined> = process.env,
+): boolean => {
+  const v = (env[TOKEN_WATERMARK_ENV] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+};
+
+/**
+ * 水位到了返 true（总开关关闭时恒 false）。缺字段（老任务）→ 用 total 估算，再缺 = 不转。
+ * 除总开关外是纯函数。
+ */
+export const isSessionRotationDue = (u: RotationUsageLike): boolean =>
+  isTokenWatermarkEnabled() &&
+  (u.sessionInputTokens ?? u.totalInputTokens ?? 0) >=
+    ROTATE_SESSION_INPUT_TOKENS;
+
+/**
+ * 速度水位到了返 true（总开关关闭时恒 false）。
+ * 只认 sessionInputTokens（见 ROTATE_PERF_INPUT_TOKENS 注释）。
+ */
 export const isPerfRotationDue = (u: RotationUsageLike): boolean =>
+  isTokenWatermarkEnabled() &&
   (u.sessionInputTokens ?? 0) >= ROTATE_PERF_INPUT_TOKENS;
 
 /**
@@ -82,13 +117,8 @@ export const rotationUsageOf = (
 //   - chat 不登记（懒重启已兜底）、无登记 = no-op
 // 判定复用 shouldRotateSession 双条件（水位 + 堆过半、防过矫语义与边界轮换一致）。
 
-export type WorkerRotationAction = "none" | "soft" | "hard";
-
-/**
- * run 内轮换触发器。参数为触发档位（soft=等收尾、hard=工具间隙截断）；
- * 存量注册方（无参）保持兼容——少参数函数可赋值给多参数签名。
- */
-export type MidRunRotationTrigger = (action?: WorkerRotationAction) => void;
+/** run 内轮换触发器（无参回调；由 task-runner 在拿到 run 之后登记）。 */
+export type MidRunRotationTrigger = () => void;
 
 const midRunRotationTriggers = new Map<string, MidRunRotationTrigger>();
 
@@ -124,151 +154,4 @@ export const maybeFireMidRunRotation = (
   } catch {
     /* 触发失败不挡记账 */
   }
-};
-
-// ---------------- v3.1 §3.2：堆/RSS 水位独立触发（加法，不改存量语义） ----------------
-//
-// 存量 shouldRotateSession = token 水位 AND 堆过半（防过矫）。v3.1 终版要求堆/RSS
-// 水位独立可触发（token 降级为日志参考）。本函数是新触发器实现，调用方（worker
-// 模式接线）在 recordTurnUsage 探针处按 worker 上报的 sample 调用；存量路径不动，
-// 等实验 A 校准常数 + 热路径接线时再切换。单测锁行为。
-// WorkerRotationAction 类型见上（run 内水位触发器一节，与 MidRunRotationTrigger 同处）。
-
-/** 纯函数：worker 内存样本 → 轮换动作（soft=等 run 收尾重启，hard=工具间隙截断）。 */
-export const workerRotationActionFor = (sample: WorkerMemorySample): WorkerRotationAction => {
-  const level = classifyWorkerMemory(sample);
-  return level === "hard" ? "hard" : level === "soft" ? "soft" : "none";
-};
-
-/**
- * worker 模式记账点调用：sample 命中软/硬线即触发已登记的回调。绝不 throw。
- */
-export const maybeFireWorkerRotation = (
-  taskId: string,
-  sample: WorkerMemorySample,
-): WorkerRotationAction => {
-  try {
-    const action = workerRotationActionFor(sample);
-    if (action !== "none") midRunRotationTriggers.get(taskId)?.(action);
-    return action;
-  } catch {
-    return "none";
-  }
-};
-
-// ---------- v3.1 接线层：worker 样本注册 + 双限额计数 ----------
-//
-// worker 自监控上报经 IPC 到主进程后调 reportWorkerMemorySample 登记最新样本；
-// recordTurnUsage 探针（flag 开）读样本走新路径，无样本回落老路径（fail-safe）。
-// 计数器与 task-runner 存量 midRunRotationCounts 相互独立（新路径切段走新计数，
-// 老路径计数不动），双限额任一超限即降级提示用户。
-
-const workerSamples = new Map<string, WorkerMemorySample>();
-
-/** worker 自上报中继调用（绝不 throw）。 */
-export const reportWorkerMemorySample = (taskId: string, sample: WorkerMemorySample): void => {
-  try {
-    workerSamples.set(taskId, sample);
-  } catch {
-    /* 埋点不许反伤 */
-  }
-};
-
-export const getWorkerMemorySample = (taskId: string): WorkerMemorySample | null => {
-  try {
-    return workerSamples.get(taskId) ?? null;
-  } catch {
-    return null;
-  }
-};
-
-export const clearWorkerMemorySamples = (): void => {
-  workerSamples.clear();
-};
-
-/** ③修复：task 换代时清旧样本（防旧 task 样本残留误触发）。单测隔离亦用此。 */
-export const clearWorkerMemorySample = (taskId: string): void => {
-  try {
-    workerSamples.delete(taskId);
-  } catch {
-    /* 埋点不许反伤 */
-  }
-};
-
-interface RotationCounters {
-  perAction: Map<string, number>;
-  perTaskHour: Map<string, { windowStart: number; count: number }>;
-  perTaskTotal: Map<string, number>;
-}
-
-const counters: RotationCounters = {
-  perAction: new Map(),
-  perTaskHour: new Map(),
-  perTaskTotal: new Map(),
-};
-
-const HOUR_MS = 3600 * 1000;
-const COUNTERS_MAX = 500;
-
-const evictCounters = (): void => {
-  for (const m of [counters.perAction, counters.perTaskHour, counters.perTaskTotal] as const) {
-    while (m.size > COUNTERS_MAX) {
-      const oldest = m.keys().next();
-      if (oldest.done) break;
-      m.delete(oldest.value);
-    }
-  }
-};
-
-export interface WorkerRotationProbeResult {
-  action: WorkerRotationAction;
-  fired: boolean;
-  denyReason?: string;
-}
-
-/**
- * flag 开的探针实现：样本缺失 → {none, fired:false}（调用方回落老路径）；
- * 命中软/硬线 → 双限额检查 → 允许则计数+触发回调（含档位），超限则降级不触发。
- * 自然完成回退计数由调用方负责（另见 clearWorkerRotationCounters 测后清理）。
- */
-export const probeWorkerRotation = (
-  taskId: string,
-  actionId: string | null | undefined,
-  sample: WorkerMemorySample | null,
-  now = Date.now(),
-): WorkerRotationProbeResult => {
-  try {
-    if (!sample) return { action: "none", fired: false };
-    const action = workerRotationActionFor(sample);
-    if (action === "none") return { action, fired: false };
-    const actionKey = actionId ?? taskId;
-    const hour = counters.perTaskHour.get(taskId);
-    const hourCount = hour && now - hour.windowStart < HOUR_MS ? hour.count : 0;
-    const allowed = isRotationAllowed({
-      actionCount: counters.perAction.get(actionKey) ?? 0,
-      taskHourCount: hourCount,
-      taskTotalCount: counters.perTaskTotal.get(taskId) ?? 0,
-    });
-    if (!allowed.allowed) {
-      return { action, fired: false, denyReason: allowed.reason };
-    }
-    counters.perAction.set(actionKey, (counters.perAction.get(actionKey) ?? 0) + 1);
-    counters.perTaskTotal.set(taskId, (counters.perTaskTotal.get(taskId) ?? 0) + 1);
-    if (hour && now - hour.windowStart < HOUR_MS) {
-      hour.count += 1;
-    } else {
-      counters.perTaskHour.set(taskId, { windowStart: now, count: 1 });
-    }
-    evictCounters();
-    midRunRotationTriggers.get(taskId)?.(action);
-    return { action, fired: true };
-  } catch {
-    return { action: "none", fired: false };
-  }
-};
-
-export const clearWorkerRotationCounters = (): void => {
-  counters.perAction.clear();
-  counters.perTaskHour.clear();
-  counters.perTaskTotal.clear();
 };

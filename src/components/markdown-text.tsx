@@ -36,6 +36,7 @@ import "streamdown/styles.css";
 import { cn } from "@/lib/utils";
 import { useSearchFieldGlobalOffset } from "@/components/ui/pane-search-highlight-context";
 import { rehypeSearchHighlight } from "@/lib/rehype-search-highlight";
+import { streamingCodePlugin } from "@/lib/streaming-code-highlighter";
 import { MarkdownLink } from "@/components/markdown-link";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -59,6 +60,13 @@ import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 
 // 插件实例全局一份（Shiki 高亮器有初始化开销、别每次 render 新建）
 const STREAMDOWN_PLUGINS = { code, mermaid, math, cjk };
+// 流式中专用：代码块限频高亮。上游每帧把整块代码重新分词（缓存键含 length、增长中必 miss），
+// 代码密集的回复里占主线程 ~40%；这里文字照常逐帧增长、只把「上色」摊薄（见 throttled-code-plugin.ts）。
+// 流式结束后（streaming=false）换回上游插件：命中其缓存、即时补全最终配色。
+const STREAMDOWN_STREAMING_PLUGINS = {
+  ...STREAMDOWN_PLUGINS,
+  code: streamingCodePlugin,
+};
 // Shiki 主题对（浅 / 深）——跟站内 next-themes 的 .light/.dark 对齐
 const SHIKI_THEME: [ThemeInput, ThemeInput] = ["github-light", "github-dark"];
 // remark 插件：**必须带上 Streamdown 内置的 defaultRemarkPlugins（含 remark-gfm）**——
@@ -255,7 +263,7 @@ const MarkdownTextImpl = ({
       // 流式末尾闪烁光标（caret 无默认、不显式传就没光标）
       caret={streaming ? "block" : undefined}
       shikiTheme={SHIKI_THEME}
-      plugins={STREAMDOWN_PLUGINS}
+      plugins={streaming ? STREAMDOWN_STREAMING_PLUGINS : STREAMDOWN_PLUGINS}
       remarkPlugins={REMARK_PLUGINS}
       rehypePlugins={rehypePlugins}
       components={components}
