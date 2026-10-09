@@ -289,3 +289,27 @@ describe("gcByFiles：rename 的 Windows 重试", () => {
     expect(await fs.readFile(cpPathOf(store), "utf-8")).toBe(before);
   });
 });
+
+// 备份是删数据前的最后一道保险：备份目录建不出来就必须整轮跳过，不能"忽略失败继续删"。
+// 备份只有一种失败方式（mkdir 备份目录失败；单文件拷贝失败被 catch 吞掉），mock mkdir 即可，不依赖文件权限、跨平台。
+describe("备份失败 → 不动手", () => {
+  it("files 路径：备份目录建不出来 → 跳过（backup-failed），四份 ndjson 一个字节都不动", async () => {
+    const { store } = await mkTmpStore();
+    const names = ["checkpoints.ndjson", "runs.ndjson", "agents.ndjson", "run_events.ndjson"];
+    const before = await Promise.all(names.map((n) => fs.readFile(path.join(store, n))));
+    const realMkdir = fs.mkdir.bind(fs) as (...a: unknown[]) => Promise<unknown>;
+    const spy = vi.spyOn(fs, "mkdir").mockImplementation(((...a: unknown[]) =>
+      String(a[0]).includes(".gc-backup-")
+        ? Promise.reject(Object.assign(new Error("EACCES: simulated"), { code: "EACCES" }))
+        : realMkdir(...a)) as never);
+    try {
+      const stats = await gcSdkStoreOnce({ dir: store, minBytes: 1 });
+      expect(stats.skipped).toBe("backup-failed");
+    } finally {
+      spy.mockRestore();
+    }
+    for (const [i, n] of names.entries()) {
+      expect(Buffer.compare(await fs.readFile(path.join(store, n)), before[i])).toBe(0);
+    }
+  });
+});

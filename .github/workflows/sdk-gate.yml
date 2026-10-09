@@ -20,6 +20,16 @@ on:
       - "src/lib/server/agent-backend.ts"
       - "tests/mem-governance*.test.ts"
       - "tests/gitlab-mock-proxy.test.ts"
+      # 本地 checkpoint store（FastCheckpoints）/ GC / 会话轮换：改它们必须重跑对应契约测试。
+      # 测试文件也算触发条件，否则「悄悄改弱断言」不会被门禁发现。
+      - "src/lib/server/fast-checkpoint-store.ts"
+      - "src/lib/server/sdk-agent-store.ts"
+      - "src/lib/server/sdk-store-gc.ts"
+      - "tests/fast-checkpoint-store*.test.ts"
+      - "tests/helpers/fast-store-helpers.ts"
+      - "tests/sdk-agent-store*.test.ts"
+      - "tests/sdk-store-gc*.test.ts"
+      - "tests/session-rotate*.test.ts"
   pull_request:
     paths:
       - "package.json"
@@ -36,6 +46,15 @@ on:
       - "src/lib/server/agent-backend.ts"
       - "tests/mem-governance*.test.ts"
       - "tests/gitlab-mock-proxy.test.ts"
+      # 同 push 段：本地 checkpoint store / GC / 会话轮换
+      - "src/lib/server/fast-checkpoint-store.ts"
+      - "src/lib/server/sdk-agent-store.ts"
+      - "src/lib/server/sdk-store-gc.ts"
+      - "tests/fast-checkpoint-store*.test.ts"
+      - "tests/helpers/fast-store-helpers.ts"
+      - "tests/sdk-agent-store*.test.ts"
+      - "tests/sdk-store-gc*.test.ts"
+      - "tests/session-rotate*.test.ts"
 
 jobs:
   sdk-gate:
@@ -61,3 +80,7 @@ jobs:
           pnpm exec jiti scripts/fault-injection/fault-doublekill.mjs
       - name: worker 契约测试
         run: pnpm vitest run tests/mem-governance.test.ts tests/mem-governance-v31.test.ts tests/worker-epoch.test.ts tests/worker-v31.test.ts tests/session-rotate.test.ts tests/gitlab-mock-proxy.test.ts tests/worker-facade.test.ts
+      # 单独一步：失败时一眼看出是 store / GC / 轮换这一组，而不是 worker 契约。
+      # 只在 Linux 跑；Windows 语义靠测试里的故障注入模拟，真机行为需要三平台 CI 另行验证。
+      - name: checkpoint store / GC / 会话轮换测试
+        run: pnpm vitest run tests/fast-checkpoint-store.test.ts tests/sdk-agent-store-wiring.test.ts tests/sdk-agent-store.test.ts tests/sdk-store-gc.test.ts tests/sdk-store-gc-store-path.test.ts tests/session-rotate-chat.test.ts tests/session-rotate-midrun.test.ts

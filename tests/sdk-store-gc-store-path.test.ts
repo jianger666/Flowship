@@ -547,3 +547,26 @@ describe("gcSdkStoreOnce：跳过分支与路径选择", () => {
     expect(viaNull.via).toBe("files");
   });
 });
+
+// 与 sdk-store-gc.test.ts 里 files 路径的同名用例成对：GC 有两处 backup-failed 分支（files / store），各自要被锁住。
+describe("备份失败 → 不动手", () => {
+  it("store 路径：备份目录建不出来 → 跳过（backup-failed），四份 ndjson 字节不动，孤儿还在", async () => {
+    quiet();
+    const { dir, ref, handle } = await buildWorld();
+    const names = ["checkpoints.ndjson", "runs.ndjson", "agents.ndjson", "run_events.ndjson"];
+    const before = names.map((n) => fs.readFileSync(path.join(dir, n)));
+    const realMkdir = fs.promises.mkdir.bind(fs.promises) as (...a: unknown[]) => Promise<unknown>;
+    vi.spyOn(fs.promises, "mkdir").mockImplementation(((...a: unknown[]) =>
+      String(a[0]).includes(".gc-backup-")
+        ? Promise.reject(Object.assign(new Error("EACCES: simulated"), { code: "EACCES" }))
+        : realMkdir(...a)) as never); // afterEach 里的 vi.restoreAllMocks 会还原
+
+    const stats = await gcSdkStoreOnce({ handle, minBytes: 1, now: NOW });
+
+    expect(stats.skipped).toBe("backup-failed");
+    names.forEach((n, i) => {
+      expect(Buffer.compare(fs.readFileSync(path.join(dir, n)), before[i])).toBe(0);
+    });
+    expect((await blobsOnDisk(ref, "agent-dead1")).length).toBe(4); // 孤儿还在：什么都没删
+  });
+});

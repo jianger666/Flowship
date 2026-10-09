@@ -5,8 +5,11 @@
  *   1. 差分对拍：同一串随机操作分别打到 SDK 与 FastCheckpoints，逐步比较结果，最后比较文件**字节**；
  *   2. 文件格式双向互操作（新写旧读 / 旧写新读 / 交替写）；
  *   3. 文件尾形态与异常行（半行 / 缺换行 / 损坏行 / CRLF / 重复键 / 非 ASCII id / 跨块大行 / 短读）；
- *   4. 并发与队列语义、耐久性（每次 create 恰好 fsync 一次且不在追加句柄上）。
- * 故障注入（Windows 语义）见 fast-checkpoint-store-faults.test.ts。
+ *   4. 并发与队列语义、耐久性（每次 create 恰好 fsync 一次且不在追加句柄上）；
+ *   5. append 失败回滚与并发读者（close / fsync 失败窗口内，读侧 catchUp 不能让内存与文件脱节）；
+ *   6. 平台硬化与单写者护栏：瞬态错误退避重试、rewrite 失败回退与调用顺序、双实例行为。
+ * Windows 语义靠 faultyFs 在任意平台注入模拟（追加句柄无写权限、EPERM / EBUSY 瞬态占用），
+ * 真机行为以 CI 的 Windows job 为准。
  */
 import fs from "node:fs";
 
@@ -21,12 +24,15 @@ import {
   faultyFs,
   fileOf,
   loadSdk,
+  mkErr,
   mkFast,
   mkTmp,
   rng,
   sameBytes,
   sdkReaderOk,
   seed,
+  tmpFileOf,
+  type FaultHooks,
   type Sdk,
 } from "./helpers/fast-store-helpers";
 
@@ -38,6 +44,23 @@ afterAll(cleanupTmps);
 
 const readRaw = (dir: string): Buffer =>
   fs.existsSync(fileOf(dir)) ? fs.readFileSync(fileOf(dir)) : Buffer.alloc(0);
+
+type Cp = ReturnType<typeof mkFast>;
+const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+/** 文件里的非空行（按 \n 切） */
+const fileLines = (dir: string): string[] =>
+  readRaw(dir)
+    .toString("utf8")
+    .split("\n")
+    .filter((l) => l.length > 0);
+const parses = (l: string): boolean => {
+  try {
+    JSON.parse(l);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 // ───────────────────────────── 1. 差分对拍 ─────────────────────────────
 
@@ -622,5 +645,434 @@ describe("耐久性", () => {
     expect(log.syncs.every((s) => s.flags === "r+")).toBe(true);
     expect(log.truncates.length).toBe(0);
     expect(await allBlobsOk(mkFast(dir, sdk), 5)).toBe(true);
+  });
+});
+
+// ───────────────────────────── 5. append 失败回滚 vs 并发读者 ─────────────────────────────
+
+/**
+ * 回滚只改文件、不改内存。写者「整行已落盘、登记索引之前」失败（close / fsync 报错）时，窗口内的并发读者
+ * （GC 的 agentIds()、list()、get 未命中——都不进写队列）的 catchUp 会把这一行并进索引、并推进 size / seen。
+ * 写者随后把文件截回去，内存却留着幽灵条目、size 比文件长：之后每次 create 都 tail mismatch，重试同内容
+ * 报 already exists，直到重启。回滚后内存状态必须以文件为准。
+ */
+describe("append 失败回滚与并发读者", () => {
+  type FailAt = "fsync" | "close";
+  type Reader = "none" | "list" | "agentIds" | "get-miss";
+  const listAll = (cp: Cp) => cp.list({ filter: { agentIds: [A], limit: 1000 } });
+
+  /** 在「写者整行已落盘、尚未登记索引」的窗口内插入一个并发读者，然后让写者报 EIO */
+  const mkRig = (dir: string, failAt: FailAt, reader: Reader) => {
+    const st = { armed: false, fired: 0, blobsBefore: -1, blobsAfter: -1 };
+    // cp 在下面才创建：钩子是闭包，等写者真的失败时才会执行，那时 cp 早已初始化
+    const inWindow = async (): Promise<void> => {
+      st.fired += 1;
+      st.blobsBefore = cp.getStats().blobs;
+      if (reader === "list") await listAll(cp);
+      else if (reader === "agentIds") await cp.agentIds();
+      else if (reader === "get-miss") await cp.get({ agentId: A, blobId: "no-such-blob" });
+      st.blobsAfter = cp.getStats().blobs;
+    };
+    const { fs: fsx } = faultyFs({
+      wrapFd: (fd, meta) => ({
+        ...fd,
+        sync: async () => {
+          if (failAt !== "fsync" || !st.armed) return fd.sync();
+          st.armed = false;
+          await inWindow();
+          throw mkErr("EIO");
+        },
+        close: async () => {
+          if (failAt !== "close" || meta.flags !== "a" || !st.armed) return fd.close();
+          st.armed = false;
+          await fd.close(); // 句柄确实关了，只是 close 报告失败（NFS 写回错误的形态）
+          await inWindow();
+          throw mkErr("EIO");
+        },
+      }),
+    });
+    const cp: Cp = mkFast(dir, sdk, { fs: fsx });
+    return { cp, st };
+  };
+
+  const cases = (["fsync", "close"] as const).flatMap((f) =>
+    (["list", "agentIds", "get-miss", "none"] as const).map((r): [FailAt, Reader] => [f, r]),
+  );
+
+  it.each(cases)(
+    "%s 失败 + 并发读者 %s：回滚后内存与文件一致，后续 create 不卡死",
+    async (failAt, reader) => {
+      const dir = mkTmp();
+      const { cp, st } = mkRig(dir, failAt, reader);
+      await cp.create({ agentId: A, blobId: "b0", data: blobData(0) });
+      const bytesBefore = readRaw(dir).length;
+
+      st.armed = true;
+      await expect(cp.create({ agentId: A, blobId: "b1", data: blobData(1) })).rejects.toThrow(/EIO/);
+
+      // 前置条件（不满足说明这条用例没测到该场景，而不是被测代码有问题）：注入确实触发；
+      // 读者确实在失败窗口内把写者刚落盘、尚未登记的那一行并进了索引（none 变体则没有读者）。
+      expect(st.fired).toBe(1);
+      expect(st.blobsAfter).toBe(st.blobsBefore + (reader === "none" ? 0 : 1));
+
+      const symptoms = {
+        文件相对失败前多出的字节: readRaw(dir).length - bytesBefore,
+        失败后的list: (await listAll(cp)).items,
+        create新blob: await cp.create({ agentId: A, blobId: "b2", data: blobData(2) }).then(() => "ok", msg),
+        重试同一个blob: await cp.create({ agentId: A, blobId: "b1", data: blobData(1) }).then(() => "ok", msg),
+      };
+      expect(symptoms).toEqual({
+        文件相对失败前多出的字节: 0,
+        失败后的list: ["b0"],
+        create新blob: "ok",
+        重试同一个blob: "ok",
+      });
+
+      expect(await allBlobsOk(cp, 3)).toBe(true);
+      expect(await allBlobsOk(mkFast(dir, sdk), 3)).toBe(true); // 冷启动重扫的结果与热状态一致
+      expect(await sdkReaderOk(dir, sdk, 3)).toBe(true); // SDK 原实现读同一文件也一致
+    },
+  );
+
+  it("磁盘写满（写到一半报错）+ 并发读者：读者碰到的是半行、不并进索引；回滚后正常", async () => {
+    const dir = mkTmp();
+    let armed = false;
+    let blobsSeenByReader = -1;
+    const { fs: fsx } = faultyFs({
+      wrapFd: (fd, meta) => ({
+        ...fd,
+        appendFile: async (d) => {
+          if (meta.flags !== "a" || !armed) return fd.appendFile(d);
+          armed = false;
+          await fd.appendFile(d.subarray(0, d.length >> 1)); // 只写了一半
+          await listAll(cp);
+          blobsSeenByReader = cp.getStats().blobs;
+          throw mkErr("ENOSPC");
+        },
+      }),
+    });
+    const cp: Cp = mkFast(dir, sdk, { fs: fsx }); // 钩子里引用它：同上，调用时已初始化
+    await cp.create({ agentId: A, blobId: "b0", data: blobData(0) });
+    const bytesBefore = readRaw(dir).length;
+
+    armed = true;
+    await expect(cp.create({ agentId: A, blobId: "b1", data: blobData(1) })).rejects.toThrow(/ENOSPC/);
+    expect(blobsSeenByReader).toBe(1); // 前置条件：读者碰到的是半行，没把它当条目
+    expect(readRaw(dir).length).toBe(bytesBefore);
+
+    await cp.create({ agentId: A, blobId: "b1", data: blobData(1) });
+    await cp.create({ agentId: A, blobId: "b2", data: blobData(2) });
+    expect(await allBlobsOk(cp, 3)).toBe(true);
+    expect(await sdkReaderOk(dir, sdk, 3)).toBe(true);
+  });
+
+  it("回滚本身也失败（truncate 报错）：丢弃索引，下一次写重扫、截掉残行后自愈", async () => {
+    const dir = mkTmp();
+    let failAppend = false;
+    let failTruncate = false;
+    let truncateFailures = 0;
+    const { fs: fsx } = faultyFs({
+      wrapFd: (fd, meta) => ({
+        ...fd,
+        appendFile: async (d) => {
+          if (meta.flags !== "a" || !failAppend) return fd.appendFile(d);
+          failAppend = false;
+          await fd.appendFile(d.subarray(0, d.length >> 1)); // 写了半行
+          throw mkErr("ENOSPC");
+        },
+        truncate: async (len) => {
+          if (!failTruncate) return fd.truncate(len);
+          failTruncate = false;
+          truncateFailures += 1;
+          throw mkErr("EIO");
+        },
+      }),
+    });
+    const cp = mkFast(dir, sdk, { fs: fsx });
+    await cp.create({ agentId: A, blobId: "b0", data: blobData(0) });
+    const bytesBefore = readRaw(dir).length;
+
+    failAppend = true;
+    failTruncate = true;
+    await expect(cp.create({ agentId: A, blobId: "b1", data: blobData(1) })).rejects.toThrow(/ENOSPC/);
+    // 前置条件：回滚确实失败了，残行还留在文件里
+    expect(truncateFailures).toBe(1);
+    expect(readRaw(dir).length).toBeGreaterThan(bytesBefore);
+
+    const symptoms = {
+      create新blob: await cp.create({ agentId: A, blobId: "b2", data: blobData(2) }).then(() => "ok", msg),
+      文件里全是完整行: fileLines(dir).every(parses),
+      行数: fileLines(dir).length,
+    };
+    expect(symptoms).toEqual({ create新blob: "ok", 文件里全是完整行: true, 行数: 2 });
+
+    await cp.create({ agentId: A, blobId: "b1", data: blobData(1) });
+    expect(await allBlobsOk(cp, 3)).toBe(true);
+    expect(await sdkReaderOk(dir, sdk, 3)).toBe(true);
+  });
+
+  it("在途 catchUp 跨越回滚 + 重建：读者读到的整行不能回写 size / seen（修复依赖 doCatchUp 的 index / epoch 检查）", async () => {
+    const dir = mkTmp();
+    let armed = false;
+    let holdNextReaderClose = false;
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let markParked!: () => void;
+    const parked = new Promise<void>((r) => (markParked = r));
+    let reader!: Promise<string[]>;
+
+    const { fs: fsx } = faultyFs({
+      wrapFd: (fd, meta) => ({
+        ...fd,
+        sync: async () => {
+          if (!armed) return fd.sync();
+          armed = false;
+          holdNextReaderClose = true;
+          reader = cp.agentIds(); // 此刻整行已落盘：读者会 scan 到它，并停在 close 前
+          await parked;
+          throw mkErr("EIO");
+        },
+        close: async () => {
+          if (meta.flags === "r" && holdNextReaderClose) {
+            holdNextReaderClose = false;
+            markParked(); // 扫描结果（含 b1 那一行）已就绪，还没返回给 doCatchUp
+            await released;
+          }
+          return fd.close();
+        },
+      }),
+    });
+    const cp: Cp = mkFast(dir, sdk, { fs: fsx }); // 钩子里引用它：调用时已初始化
+
+    await cp.create({ agentId: A, blobId: "b0", data: blobData(0) });
+    const bytesBefore = readRaw(dir).length;
+
+    armed = true;
+    await expect(cp.create({ agentId: A, blobId: "b1", data: blobData(1) })).rejects.toThrow(/EIO/);
+
+    // 前置条件：文件已回滚；别的调用方（get 命中，不 catchUp）先触发了重建，size / seen 已按回滚后的真实文件重置；
+    // 读者还停在 close 前，手里握着旧扫描结果
+    expect(readRaw(dir).length).toBe(bytesBefore);
+    expect(await cp.get({ agentId: A, blobId: "b0" })).not.toBeNull();
+    expect(cp.getStats().blobs).toBe(1);
+
+    release();
+    await reader;
+
+    // 读者的结果必须被丢弃：否则 size / seen 被推到文件尾之外，后续 create 又 tail mismatch。
+    // 注意顺序：必须先让别处触发重建、再放行读者——重建会重置 size / seen，放行得太早会被随后的 load() 覆盖，污染就暴露不出来。
+    await cp.create({ agentId: A, blobId: "b2", data: blobData(2) });
+    await cp.create({ agentId: A, blobId: "b1", data: blobData(1) });
+    expect(await allBlobsOk(cp, 3)).toBe(true);
+    expect(await allBlobsOk(mkFast(dir, sdk), 3)).toBe(true);
+    expect(await sdkReaderOk(dir, sdk, 3)).toBe(true);
+  });
+});
+
+// ───────────────────────────── 6. 平台硬化与单写者护栏 ─────────────────────────────
+
+describe("平台硬化：瞬态错误退避重试", () => {
+  /** 抖动系数恒为 1.0：退避序列精确可断言（10 → 20 → 40…） */
+  const noJitter = (): number => 0.5;
+  /** 记录退避等待、不真等 */
+  const mkSleeper = () => {
+    const slept: number[] = [];
+    return {
+      slept,
+      sleep: async (ms: number): Promise<void> => {
+        slept.push(ms);
+      },
+    };
+  };
+  const first = { agentId: A, blobId: "b0", data: blobData(0) };
+  const delB1 = { filter: { agentIds: [A], blobIds: ["b1"] } };
+
+  it("Windows：open 遇瞬态 EPERM（杀毒 / 索引器占用）→ 指数退避重试，最终成功", async () => {
+    const dir = mkTmp();
+    let busy = 3;
+    const { slept, sleep } = mkSleeper();
+    const { fs: fsx, log } = faultyFs({
+      open: (_file, flags) => (flags === "a" && busy-- > 0 ? { code: "EPERM" } : null),
+    });
+    const cp = mkFast(dir, sdk, { fs: fsx, platform: "win32", sleep, random: noJitter });
+    await cp.create(first);
+    expect(slept).toEqual([10, 20, 40]);
+    expect(log.opens.filter((o) => o.flags === "a").length).toBe(4); // 3 次被拒 + 1 次成功
+    expect(await allBlobsOk(mkFast(dir, sdk), 1)).toBe(true);
+  });
+
+  it("POSIX：open 遇 EPERM 是真权限错误 → 不重试不等待，原样抛出", async () => {
+    const { slept, sleep } = mkSleeper();
+    const { fs: fsx, log } = faultyFs({
+      open: (_file, flags) => (flags === "a" ? { code: "EPERM" } : null),
+    });
+    const cp = mkFast(mkTmp(), sdk, { fs: fsx, platform: "linux", sleep });
+    await expect(cp.create(first)).rejects.toMatchObject({ code: "EPERM" });
+    expect(slept).toEqual([]);
+    expect(log.opens.filter((o) => o.flags === "a").length).toBe(1);
+  });
+
+  it("重试预算耗尽：不无限重试，抛出原始错误码", async () => {
+    const { slept, sleep } = mkSleeper();
+    const { fs: fsx } = faultyFs({
+      open: (_file, flags) => (flags === "a" ? { code: "EBUSY" } : null),
+    });
+    const cp = mkFast(mkTmp(), sdk, {
+      fs: fsx,
+      platform: "win32",
+      sleep,
+      budgetMs: 100,
+      random: noJitter,
+    });
+    await expect(cp.create(first)).rejects.toMatchObject({ code: "EBUSY" });
+    expect(slept.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(100); // 一直重试到预算用完才放弃
+    expect(slept.length).toBeLessThan(10); // 而不是无限重试
+  });
+
+  it("rewrite 的 rename 遇瞬态 EPERM（Windows）→ 重试后成功，数据正确、tmp 不残留", async () => {
+    const dir = mkTmp();
+    await seed(mkFast(dir, sdk), 5);
+    let busy = 2;
+    const { slept, sleep } = mkSleeper();
+    const { fs: fsx, log } = faultyFs({
+      rename: () => (busy-- > 0 ? { code: "EPERM" } : null),
+    });
+    const cp = mkFast(dir, sdk, { fs: fsx, platform: "win32", sleep, random: noJitter });
+    await cp.delete(delB1);
+    expect(log.renames).toBe(3); // 2 次被拒 + 1 次成功
+    expect(slept).toEqual([10, 20]);
+    expect(await cp.get({ agentId: A, blobId: "b1" })).toBeNull();
+    for (const i of [0, 2, 3, 4]) {
+      expect(sameBytes(await cp.get({ agentId: A, blobId: `b${i}` }), blobData(i))).toBe(true);
+    }
+    expect(fs.existsSync(tmpFileOf(dir))).toBe(false);
+  });
+
+  it("rewrite 的 rename 彻底失败：清理 tmp，原文件字节与索引原样，之后仍可正常读写", async () => {
+    const dir = mkTmp();
+    await seed(mkFast(dir, sdk), 5);
+    const before = readRaw(dir);
+    let fail = true;
+    const { fs: fsx } = faultyFs({ rename: () => (fail ? { code: "EIO" } : null) });
+    const cp = mkFast(dir, sdk, { fs: fsx });
+
+    await expect(cp.delete(delB1)).rejects.toThrow(/EIO/);
+    expect(fs.existsSync(tmpFileOf(dir))).toBe(false); // tmp 不残留
+    expect(Buffer.compare(readRaw(dir), before)).toBe(0); // 原文件一个字节没动
+    expect(await allBlobsOk(cp, 5)).toBe(true); // 索引也原样：b1 还在
+
+    fail = false;
+    await cp.delete(delB1);
+    expect(await cp.get({ agentId: A, blobId: "b1" })).toBeNull();
+    for (const i of [0, 2, 3, 4]) {
+      expect(sameBytes(await cp.get({ agentId: A, blobId: `b${i}` }), blobData(i))).toBe(true);
+    }
+  });
+
+  it("rewrite 的顺序：先 fsync tmp，再关掉自己的全部句柄，最后才 rename（Windows 占用目标文件会让 rename 失败）", async () => {
+    const dir = mkTmp();
+    await seed(mkFast(dir, sdk), 5);
+    const events: string[] = [];
+    let openNow = 0;
+    let openAtRename = -1;
+    const hooks: FaultHooks = {
+      rename: () => {
+        events.push("rename");
+        openAtRename = openNow;
+        return null;
+      },
+    };
+    const { fs: fsx } = faultyFs(hooks);
+    // faultyFs 每次 open 才读 hooks.wrapFd，所以可以在拿到 fsx 之后再挂
+    hooks.wrapFd = (fd, meta) => {
+      openNow += 1;
+      let closed = false;
+      const tag = meta.file.endsWith(".compact-tmp") ? "tmp" : "main";
+      return {
+        ...fd,
+        sync: async () => {
+          events.push(`sync:${tag}`);
+          return fd.sync();
+        },
+        close: async () => {
+          if (!closed) {
+            closed = true;
+            openNow -= 1;
+          }
+          return fd.close();
+        },
+      };
+    };
+    const cp = mkFast(dir, sdk, { fs: fsx });
+    await cp.delete(delB1);
+
+    expect(events.indexOf("sync:tmp")).toBeGreaterThanOrEqual(0); // 重写后的内容确实 fsync 过
+    expect(events.indexOf("sync:tmp")).toBeLessThan(events.indexOf("rename")); // 且先于 rename
+    expect(openAtRename).toBe(0); // rename 那一刻，自己没有任何句柄还开着
+  });
+});
+
+describe("单写者护栏与多实例", () => {
+  it("别人往文件尾追加了半行 → create 抛 tail mismatch，且一个字节都不去动对方的数据", async () => {
+    const dir = mkTmp();
+    const cp = mkFast(dir, sdk);
+    await cp.create({ agentId: A, blobId: "b0", data: blobData(0) });
+    fs.appendFileSync(fileOf(dir), '{"agentId":"other","blobId":"x","dataB'); // 别的进程写到一半
+    const before = readRaw(dir);
+
+    await expect(cp.create({ agentId: A, blobId: "b1", data: blobData(1) })).rejects.toThrow(
+      /tail mismatch/,
+    );
+    expect(Buffer.compare(readRaw(dir), before)).toBe(0);
+  });
+
+  it("双实例：对方已创建的 key，本实例 create 必须报 already exists（create 前先追赶）", async () => {
+    const dir = mkTmp();
+    const x = mkFast(dir, sdk);
+    const y = mkFast(dir, sdk);
+    await x.warmUp();
+    await y.warmUp(); // 两边先各自建好索引：之后 y 看不到 x 的新写入，除非主动追赶
+
+    await x.create({ agentId: A, blobId: "dup", data: Buffer.from("from-x") });
+    await expect(
+      y.create({ agentId: A, blobId: "dup", data: Buffer.from("from-y") }),
+    ).rejects.toThrow(/already exists/);
+    expect(fileLines(dir).length).toBe(1); // 文件里这个 key 只有一行
+  });
+
+  it("双实例纯追加交替写：互不覆盖，两个实例与一个冷启动实例都读到全部", async () => {
+    const dir = mkTmp();
+    const x = mkFast(dir, sdk);
+    const y = mkFast(dir, sdk);
+    await x.create({ agentId: "ax", blobId: "b0", data: blobData(0) });
+    await y.create({ agentId: "ay", blobId: "b0", data: blobData(1) });
+    await x.create({ agentId: "ax", blobId: "b1", data: blobData(2) });
+    await y.create({ agentId: "ay", blobId: "b1", data: blobData(3) });
+
+    const want: Array<[string, string, Buffer]> = [
+      ["ax", "b0", blobData(0)],
+      ["ay", "b0", blobData(1)],
+      ["ax", "b1", blobData(2)],
+      ["ay", "b1", blobData(3)],
+    ];
+    const oracle = new sdk.JsonlLocalAgentStore(dir).checkpoints;
+    for (const reader of [x, y, mkFast(dir, sdk), oracle]) {
+      for (const [agentId, blobId, data] of want) {
+        expect(sameBytes(await reader.get({ agentId, blobId }), data)).toBe(true);
+      }
+    }
+    expect(fileLines(dir).length).toBe(4);
+    expect(fileLines(dir).every(parses)).toBe(true);
+  });
+
+  it("复合键无歧义：('ab','c') 与 ('a','bc') 是两个不同的 blob", async () => {
+    const dir = mkTmp();
+    const cp = mkFast(dir, sdk);
+    await cp.create({ agentId: "ab", blobId: "c", data: Buffer.from("1") });
+    await cp.create({ agentId: "a", blobId: "bc", data: Buffer.from("2") });
+    for (const reader of [cp, mkFast(dir, sdk), new sdk.JsonlLocalAgentStore(dir).checkpoints]) {
+      expect(sameBytes(await reader.get({ agentId: "ab", blobId: "c" }), Buffer.from("1"))).toBe(true);
+      expect(sameBytes(await reader.get({ agentId: "a", blobId: "bc" }), Buffer.from("2"))).toBe(true);
+    }
   });
 });

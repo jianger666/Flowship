@@ -817,14 +817,21 @@ export class FastCheckpoints implements LocalAgentStoreCheckpoints {
       return;
     } catch (err) {
       if (started) {
-        // 可能已经写进去一部分：这是我们自己刚写的半行（单写者、在写队列内），回滚到追加之前。
-        // 回滚也失败 → 丢弃索引，下次访问整体重扫（重扫会识别并截掉半行）
+        // 可能已经写进去一部分，甚至整行都落盘了、只是 close / fsync 报错：这是我们自己刚写的行
+        // （单写者、在写队列内），先把文件回滚到追加之前。
+        // 但回滚只改文件、不改内存：失败窗口内，并发读者（GC 的 agentIds()、list()、get 未命中，
+        // 都不进写队列）的 catchUp 可能已经把这一行并进索引、并推进了 size / seen。文件被截回去后，
+        // 内存里就剩一个幽灵条目、size 比文件长，之后每次 create 都 tail mismatch、重试同内容报
+        // already exists，直到重启。所以无论回滚成不成功，都丢弃索引、下次访问整体重扫，
+        // 内存状态一律以文件为准（重扫也会识别并截掉回滚失败留下的半行）。
+        // 失败路径罕见，重扫代价可接受（实测 80~110MB 的文件约 30ms）。
         try {
           await this.truncateTo(before);
         } catch {
-          this.index = null;
-          this.epoch += 1;
+          // 回滚失败：残留的半行由重扫识别、下次追加前截掉
         }
+        this.index = null;
+        this.epoch += 1;
       }
       throw err;
     } finally {
