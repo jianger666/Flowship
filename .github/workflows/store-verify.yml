@@ -90,8 +90,10 @@ jobs:
 
       # 偶发失败复现：同一批最可疑的测试，重复 + 并行（制造 CPU / 磁盘争抢）多跑几轮。
       # 背景：上一轮 Windows 曾有 1 个用例失败、下一轮同样代码又全绿——要分清是测试时序不稳还是实现缺陷。
-      # A 组：默认 5s 超时（与日常门禁一致）；B 组：放宽到 60s，把「纯慢」和「真失败」分开看。
-      - name: 压力复现（重复 + 并行；A 组默认超时、B 组 60s）
+      # A 组：默认 5s 超时（与日常门禁一致）；B 组：放宽到 60s，把「纯慢」和「真失败」分开看；
+      # C 组（探针）：全局超时压到 3s，专门找「吃全局超时、却在这台机器上要 3 秒以上」的用例（离 5s 默认线余量不足 40%）。
+      # 有显式 / 文件级超时的用例不受影响，所以 C 组也能证明「放宽过的用例确实被放宽了」；它的超时命中只是候选清单、不是缺陷。
+      - name: 压力复现（重复 + 并行；A 组默认超时、B 组 60s、C 组 3s 探针）
         if: always()
         run: |
           mkdir -p stress-out
@@ -105,6 +107,12 @@ jobs:
           for round in 1 2 3; do
             for k in 1 2 3; do
               ( pnpm exec vitest run --testTimeout=60000 --reporter=json --outputFile.json=stress-out/r-b-$round-$k.json $FILES > stress-out/log-b-$round-$k.txt 2>&1 || true ) &
+            done
+            wait
+          done
+          for round in 1 2; do
+            for k in 1 2 3; do
+              ( pnpm exec vitest run --testTimeout=3000 --reporter=json --outputFile.json=stress-out/r-c-$round-$k.json $FILES > stress-out/log-c-$round-$k.txt 2>&1 || true ) &
             done
             wait
           done

@@ -193,6 +193,9 @@ describe("openSdkStore：与 SDK 原实现互操作", () => {
     expect(sameBytes(await again!.store.checkpoints.get({ agentId: A, blobId: "b20" }), blobData(20))).toBe(true);
   });
 
+  // 要先写 50 个 checkpoint（每个都是一次真实的追加 + fsync）。Windows（NTFS + Defender 实时扫描）上 fsync 很慢，
+  // CI 里这条稳定要 4 秒多（macOS 约 1.6 秒），贴着默认 5 秒超时，换台慢点的机器就会随机误报——纯慢，不是逻辑问题。
+  // 同文件其余用例最多写 20 个，余量充足，所以只放宽这一条；30 秒仍足以暴露死锁 / 无限重试。
   it("worker IPC 的 JSON 往返：不抛，checkpoints 只留标识、不序列化内部状态", async () => {
     quiet();
     const dir = mkTmp();
@@ -202,7 +205,7 @@ describe("openSdkStore：与 SDK 原实现互操作", () => {
     const back = JSON.parse(json) as { checkpoints: unknown };
     expect(back.checkpoints).toEqual({ kind: "fast-checkpoints", file: fileOf(dir) });
     expect(json.length).toBeLessThan(2000);
-  });
+  }, 30_000);
 });
 
 describe("getSdkStoreHandle：进程级单例", () => {
