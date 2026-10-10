@@ -16,10 +16,16 @@
  *    （finished / error / cancelled）为准——以 turn-ended 为准会把失败的 run 误记成 ok；
  *    turn-ended 只在没有终态回调 / 回调迟迟不来时兜底。
  *
+ * 3. 2026-10-10：吐字节奏（相邻 text / thinking delta 的到达间隔直方图，见 stream-cadence.ts）
+ *    就记在 onDelta 这条热路径上——运行时是等事件落盘后才发下一条，这里量到的间隔就是用户看到的
+ *    吐字间隔；run 结束时随汇总记录的 `cadence` 字段落盘。
+ *
  * 契约：高频流式 delta 零 [perf-] 日志、零额外分配（run-perf.test.ts 锁定）；
  * 汇总的构建 / 写盘全程火忘、永不抛、永不阻塞 onDelta（它是同步签名）。
  */
+import fs from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 
 import type { ConversationStep, InteractionUpdate, Run } from "@cursor/sdk";
 
@@ -153,6 +159,20 @@ const bumpActiveRuns = (delta: 1 | -1): void => {
 };
 
 const round1 = (n: number): number => Math.round(n * 10) / 10;
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+/** 文件大小（MB，两位小数）；文件不存在 / 读不到 → undefined（观测不能因为它抛） */
+const fileSizeMB = async (
+  dir: string,
+  name: string,
+): Promise<number | undefined> => {
+  try {
+    const st = await fs.stat(path.join(dir, name));
+    return round2(st.size / 1048576);
+  } catch {
+    return undefined;
+  }
+};
 
 type EnvSnapshot = { store?: StoreSnapshot; proc?: ProcSnapshot };
 type EnvProvider = (
@@ -186,18 +206,35 @@ const defaultEnvProvider: EnvProvider = async (agentId, fromMs, toMs) => {
   try {
     // 动态 import + 只看不开：观测绝不能因为要写一行记录而触发 store 打开
     const { peekSdkStoreHandle } = await import("./sdk-agent-store");
+    const { RUN_EVENTS_FILENAME } = await import("./sdk-store-quarantine");
     const handle = await peekSdkStoreHandle();
     if (handle) {
       const total = handle.fast?.getStats();
       const mine = handle.fast?.agentStats(agentId);
+      const mem = handle.memoryRunEvents?.getStats();
+      // memory：体积取内存里保留的 payload；file（回退开关）：取文件大小——
+      // 文件涨大正是「每条事件整文件读写」的病根，要能在记录里直接看到
+      const evMB =
+        mem !== undefined
+          ? round2(mem.retainedChars / 1048576)
+          : handle.runEvents === "file"
+            ? await fileSizeMB(handle.dir, RUN_EVENTS_FILENAME)
+            : undefined;
+      const runsMB = await fileSizeMB(handle.dir, "runs.ndjson");
       store = {
         mode: handle.mode,
+        runEvents: handle.runEvents,
         ...(total
           ? { blobs: total.blobs, mb: round1(total.bytes / 1048576) }
           : {}),
         ...(mine
           ? { agentBlobs: mine.blobs, agentMB: round1(mine.bytes / 1048576) }
           : {}),
+        ...(evMB !== undefined ? { evMB } : {}),
+        ...(mem
+          ? { evCount: mem.retainedEvents, evTrimmed: mem.trimmedEvents }
+          : {}),
+        ...(runsMB !== undefined ? { runsMB } : {}),
       };
     }
   } catch {
@@ -367,7 +404,20 @@ export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
           `${new Date().toISOString()} [perf-first] ${base} firstTokenMs=${ms} type=${update.type}`,
         ]);
       }
+      // 吐字节奏：正文 / 思考 delta 的到达间隔进直方图。热路径——只做数值运算，
+      // 不分配对象、零日志（run-perf.test.ts 锁定）；运行时是等事件落盘后才发下一条，
+      // 所以这里量到的间隔 = 用户实际看到的吐字间隔（见 stream-cadence.ts 头注释）
+      if (update.type === "text-delta") {
+        acc.textDelta(Date.now());
+        return;
+      }
+      if (update.type === "thinking-delta") {
+        acc.thinkingDelta(Date.now());
+        return;
+      }
       if (IGNORED_DELTA_TYPES.has(update.type)) return;
+      // 其余事件（工具调用 / 步骤 / 轮次…）断开连续段：之后的空窗是模型 / 工具在忙，不算「吐字不顺」
+      acc.breakStream();
 
       if (update.type === "tool-call-started") {
         const { now, gap } = markEvent();

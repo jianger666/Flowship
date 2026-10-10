@@ -18,10 +18,12 @@ import {
   PROCESSING_PLACEHOLDER_LABEL,
   groupHasBootWarn,
   isBootInfoItem,
+  isLiveThinkingEvent,
   type WorkGroupItem,
 } from "@/lib/chat-turns";
 import { formatDurationCoarse } from "@/lib/duration-display";
 import { shouldPinWorkGroupOpen } from "@/lib/scroll-follow";
+import { THINKING_LIVE_LABEL, thinkingTextToLine } from "@/lib/thinking-live";
 import {
   isToolBlock,
   isToolVerbGroup,
@@ -188,8 +190,16 @@ const WorkGroupRowImpl = ({
   // 警告标：MCP 跳过等 ⚠️ 行被折叠时组头留标，不吞提示（默认仍收起）
   const hasBootWarn = groupHasBootWarn(group.members);
   if (!expanded) {
-    if (group.hasRunning) runningTail = lastRunningName(group.members);
-    else if (showProcessingPlaceholder) {
+    const tailMember = group.members[group.members.length - 1];
+    if (isLiveThinkingEvent(tailMember)) {
+      // 正在思考：折叠时组头也说「思考中 · 最近一行」，别让用户以为卡住
+      const line = thinkingTextToLine(tailMember.text);
+      runningTail = line
+        ? `${THINKING_LIVE_LABEL} · ${line}`
+        : THINKING_LIVE_LABEL;
+    } else if (group.hasRunning) {
+      runningTail = lastRunningName(group.members);
+    } else if (showProcessingPlaceholder) {
       runningTail = PROCESSING_PLACEHOLDER_LABEL;
     }
   }

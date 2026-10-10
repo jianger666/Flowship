@@ -286,6 +286,63 @@ describe("snapshotRepoTree / restoreRepoTree", () => {
     },
     GIT_IT_TIMEOUT_MS,
   );
+
+  it(
+    "多仓快照结果严格按入参顺序（并行不能按完成先后汇总），每仓 treeOid 与单仓快照一致",
+    async () => {
+      // 两个仓内容不同 → treeOid 不同，顺序错了一眼能看出来
+      await fs.writeFile(path.join(REPO2, "tracked.txt"), "repo2-only\n");
+      const solo1 = await snapshotRepoTree(REPO);
+      const solo2 = await snapshotRepoTree(REPO2);
+      if ("error" in solo1 || "error" in solo2) throw new Error("单仓快照失败");
+      expect(solo1.treeOid).not.toBe(solo2.treeOid);
+
+      const fwd = await captureChatCheckpoint([REPO, REPO2]);
+      expect(fwd.ok).toBe(true);
+      expect(fwd.warnings).toEqual([]);
+      expect(fwd.repoSnapshots).toEqual([
+        { repoPath: REPO, treeOid: solo1.treeOid },
+        { repoPath: REPO2, treeOid: solo2.treeOid },
+      ]);
+      expect(Object.keys(fwd.elapsedMsByRepo).sort()).toEqual([REPO, REPO2].sort());
+
+      // 反序入参 → 结果跟着反序（repoPaths 的第一项是 cwd，顺序有语义）
+      const rev = await captureChatCheckpoint([REPO2, REPO]);
+      expect(rev.repoSnapshots.map((s) => s.repoPath)).toEqual([REPO2, REPO]);
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+
+  it(
+    "多仓里夹一个非 git 目录：只那一仓进 warnings，其余仍按序拿到快照",
+    async () => {
+      const notRepo = path.join(TMP_ROOT, "not-a-repo");
+      await fs.mkdir(notRepo, { recursive: true });
+      const r = await captureChatCheckpoint([REPO, notRepo, REPO2]);
+      expect(r.ok).toBe(true);
+      expect(r.repoSnapshots.map((s) => s.repoPath)).toEqual([REPO, REPO2]);
+      expect(r.warnings).toHaveLength(1);
+      expect(r.warnings[0]).toContain(notRepo);
+      // 失败的那仓也有耗时记录（口径与串行时一致）
+      expect(r.elapsedMsByRepo[notRepo]).toBeTypeOf("number");
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+
+  it("多仓快照必须并行：串行会让绑 N 个仓的 chat 每次发送多等 (N-1)×~0.4s（源码契约）", async () => {
+    // 并行性靠起子进程的实际耗时不可稳定断言（execFile 在模块加载时就被 promisify 捕获、
+    // 没法在测试里注入延迟），退而守源码形状：captureChatCheckpoint 内部是 Promise.all，
+    // 而不是对每个仓 await snapshotRepoTree 的 for 循环
+    const src = await fs.readFile(
+      path.join(__dirname, "../src/lib/server/chat-checkpoint.ts"),
+      "utf8",
+    );
+    const start = src.indexOf("export const captureChatCheckpoint");
+    expect(start).toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf("\n};", start));
+    expect(body).toContain("Promise.all(");
+    expect(body).not.toMatch(/for \(const repoPath of paths\)\s*\{\s*const t0[\s\S]*?await snapshotRepoTree/);
+  });
 });
 
 describe("rewind_points.jsonl 读写与保留策略", () => {

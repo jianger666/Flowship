@@ -18,7 +18,11 @@ import type {
 } from "@cursor/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { openSdkStore, type SdkStoreHandle } from "@/lib/server/sdk-agent-store";
+import {
+  openSdkStore,
+  SDK_RUN_EVENTS_ENV,
+  type SdkStoreHandle,
+} from "@/lib/server/sdk-agent-store";
 import {
   GC_GRACE_MS,
   gcSdkStoreOnce,
@@ -40,8 +44,9 @@ const DAY = 86_400_000;
 
 // 端到端用例要先用 SDK 原实现预写一整个库（几十次文件追加 / 重写）。Windows（NTFS + Defender 实时扫描）上
 // 每次文件操作几十毫秒，单个用例本来就要 3~6 秒（CI 压测里最慢 9.3 秒），卡在默认 5 秒超时的边缘会随机误报
-// ——纯慢，不是数据问题（放宽超时后同一批压测 0 失败，断言失败从未出现）。30 秒仍足以暴露死锁 / 无限重试。
-vi.setConfig({ testTimeout: 30_000 });
+// ——纯慢，不是数据问题（放宽超时后同一批压测 0 失败，断言失败从未出现）。
+// 60 秒（约为实测最慢 9.3 秒的 6.5 倍，更慢的机器 / 杀毒扫描叠加时也留有余量）仍足以暴露死锁 / 无限重试。
+vi.setConfig({ testTimeout: 60_000 });
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -242,7 +247,15 @@ const writeLive = (root: string, ids: string[]): void => {
  *  zombie    不在活名单、1 天前、status=running      → 清（崩溃遗留的僵尸）
  *  ghost     只有 checkpoints、没有 agents / runs 行 → 清
  */
-const buildWorld = async (): Promise<World> => {
+/**
+ * 默认用 `file` 的 run_events（SDK 自带落盘实现）：这批用例验证的是 GC 对「落盘 run_events」的
+ * 清理 / 自愈 / 备份语义（回滚配置，以及升级前遗留的老库）。默认的内存版见文件末尾的专项用例。
+ */
+const FILE_RUN_EVENTS = { [SDK_RUN_EVENTS_ENV]: "file" } as const;
+
+const buildWorld = async (
+  env: Record<string, string | undefined> = FILE_RUN_EVENTS,
+): Promise<World> => {
   const root = mkTmp();
   const dir = path.join(root, "sdk-agent-store");
   fs.mkdirSync(dir, { recursive: true });
@@ -255,7 +268,7 @@ const buildWorld = async (): Promise<World> => {
   await populate(ref, "agent-zombie", NOW - DAY, 4, "running");
   await seed(ref.checkpoints, 3, "agent-ghost");
   writeLive(root, ["agent-live"]);
-  const handle = await openSdkStore(dir, {});
+  const handle = await openSdkStore(dir, env);
   if (!handle || handle.mode !== "fast") throw new Error("测试前置：应是 fast 句柄");
   return { root, dir, ref, handle };
 };
@@ -315,6 +328,35 @@ describe("gcSdkStoreOnce：store 路径端到端", () => {
     const sdk = await loadSdk();
     const bakStore = new sdk.JsonlLocalAgentStore(path.join(dir, bak!));
     expect((await blobsOnDisk(bakStore, "agent-dead1")).length).toBe(4);
+  });
+
+  it("默认（run_events 内存版）：旧 run_events.ndjson 已归档，GC 照常清 agents / runs / checkpoints、不抛、不跳过", async () => {
+    quiet();
+    const { dir, ref, handle } = await buildWorld({});
+    expect(handle.runEvents).toBe("memory");
+    // 建库时 SDK 原实现写的事件文件，在开 store 时已被挪进 .quarantine
+    expect(fs.existsSync(path.join(dir, "run_events.ndjson"))).toBe(false);
+    const archived = fs
+      .readdirSync(path.join(dir, ".quarantine"))
+      .filter((n) => n.startsWith("run_events-"));
+    expect(archived).toHaveLength(1);
+
+    // 本进程里这批 agent 的 run 事件只在内存：GC 之前先喂几条，确认删除路径走得通
+    await handle.store.runEvents.append({ runId: "run-agent-dead1", eventType: "t", payload: 1 });
+    await handle.store.runEvents.append({ runId: "run-agent-live", eventType: "t", payload: 1 });
+
+    const stats = await gcSdkStoreOnce({ handle, minBytes: 1, now: NOW });
+    expect(stats.skipped).toBeUndefined();
+    expect(stats.via).toBe("store");
+    expect(stats.orphanAgents).toBe(4);
+    expect(await agentIdsOnDisk(ref)).toEqual(["agent-live", "agent-recent"]);
+    expect(await runAgentsOnDisk(ref)).toEqual(["agent-live", "agent-recent"]);
+    // 孤儿 run 的内存事件被清，活 run 的保留
+    expect((await handle.store.runEvents.list({ runId: "run-agent-dead1" })).items).toEqual([]);
+    expect((await handle.store.runEvents.list({ runId: "run-agent-live" })).items).toHaveLength(1);
+    // SDK 的 runs.delete 内部会碰一下旧文件路径：最多是个空文件，绝不会再长出内容
+    const f = path.join(dir, "run_events.ndjson");
+    expect(fs.existsSync(f) ? fs.statSync(f).size : 0).toBe(0);
   });
 
   it("列表分页很小（每页 2 条）也要翻完整：结果与默认分页一致", async () => {

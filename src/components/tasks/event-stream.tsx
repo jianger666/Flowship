@@ -87,6 +87,8 @@ import type { Task, TaskEvent } from "@/lib/types";
 import { insertBeforeTrailingCompaction, isCompactionInfo } from "@/lib/compaction-display";
 
 import {
+  TURN_WRAP_UP_STATUS,
+  attachLiveThinking,
   deriveActiveStatus,
   groupChatRenderItems,
   shouldShowProcessingPlaceholder,
@@ -100,7 +102,14 @@ import {
   type StreamRenderItem,
 } from "@/lib/tool-display";
 import {
+  hasInflightPending,
+  shouldShowSendLoading,
+  type PendingBubbleMode,
+} from "@/lib/chat-pending-display";
+import { thinkingTextToLine, type LiveThinking } from "@/lib/thinking-live";
+import {
   extractActiveBootStage,
+  hasActiveTurnWrapUp,
   resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
@@ -154,6 +163,8 @@ interface PendingLocalItem {
   text: string;
   /** HTTP 不确定时为 true（与 network 轴对齐） */
   uncertain?: boolean;
+  /** 展示分类（lib/chat-pending-display） */
+  mode?: PendingBubbleMode;
   /** 对应服务端 queue itemId（直改 / 直删用） */
   itemId?: string;
 }
@@ -264,8 +275,18 @@ const BootStageRow = ({ text }: { text: string }) => (
 );
 
 /**
- * 启动空窗进度（批 B 前端档）：server 暂无分阶段 info 事件时，
- * 用已等待秒数 + 文案轮换粗估（准备环境→创建会话→发送消息）。
+ * 发出消息后、AI 开口前的空窗进度（没有服务端分阶段信息时的兜底）。
+ *
+ * 有真实阶段（新建会话 mcp / create / send、续聊恢复 resume / send）时由 BootStageRow 说真话、
+ * 压制本行；走到这里 = 会话是热的（或阶段还没到），只剩「把消息交给模型 → 等首个 token」。
+ * 所以不再按秒数编「创建会话…」「发送消息…」这类实际没发生的阶段（热会话续聊从没创建过会话）。
+ *
+ * 占位气泡（inflight）→ user_reply 落盘 → 等首 token 全程是同一个 `__loading__` 项（同 key），
+ * 本组件不重挂载、「已等待 Ns」从按下回车起连续计时。
+ *
+ * 模型一开始思考，这一行就会被工作过程流程里「进行中的那条 thinking 行」取代
+ * （见 attachLiveThinking）——2026-10-10 实测模型第 6s 就在想了，
+ * 这里却一直写「等待模型响应… 已等待 62s」。
  */
 const PendingRow = () => {
   // 挂载起算的已等待秒数
@@ -277,8 +298,7 @@ const PendingRow = () => {
     }, 500);
     return () => window.clearInterval(id);
   }, []);
-  const phase =
-    elapsed < 3 ? "准备环境…" : elapsed < 8 ? "创建会话…" : "发送消息…";
+  const phase = elapsed < 3 ? "准备环境…" : "等待模型响应…";
   return (
     <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
       <Loader2 className="size-3.5 animate-spin" />
@@ -377,6 +397,15 @@ interface Props {
   onGroupQaVisibleChange?: (visible: boolean) => void;
   /** shell 流式输出：callId → 已累积文本（尾部窗口由父组件维护） */
   liveToolOutputs?: Record<string, string>;
+  /**
+   * 思考实时态：thinking_delta 帧累积出的本段思考原文 + 事件 id + 起点时刻（父组件维护，只给 chat 用）。
+   * null / undefined = 没在思考。
+   * 思考段要攒到结束才落 thinking 事件，期间靠它合成一条「进行中的 thinking 事件」并进工作过程流程
+   * （attachLiveThinking，由已有的思考行渲染）、并让状态行说「思考中」，
+   * 而不是让用户对着「等待模型响应…」干等。
+   * 服务端 ≤250ms 才发一帧，所以对象身份变得不频繁；EventStream 本来就要随它重渲。
+   */
+  liveThinking?: LiveThinking | null;
   /** P3：回退到 checkpointed user_reply */
   onRewind?: (eventId: string) => void;
   /** P5：本地排队占位气泡（displayText 与服务端 user_reply 文案对齐） */
@@ -386,6 +415,11 @@ interface Props {
     displayText: string;
     /** HTTP 不确定 */
     uncertain?: boolean;
+    /**
+     * 展示分类（lib/chat-pending-display）：inflight = 立即发送途中（正式气泡 + 底部进度行）、
+     * queued = 排队中；缺省 = 旧样式「发送中…」（uncertain / task 模式占位）
+     */
+    mode?: PendingBubbleMode;
     /** 对应服务端 queue itemId（直改 / 直删用） */
     itemId?: string;
   }>;
@@ -581,6 +615,7 @@ const EventStreamImpl = ({
   onTaskUpdate,
   onGroupQaVisibleChange,
   liveToolOutputs,
+  liveThinking,
   onRewind,
   pendingLocalReplies,
   queueBanner,
@@ -648,9 +683,22 @@ const EventStreamImpl = ({
   // 启动进度渐进单行的「最小停留」缓冲（2026-07-20 用户实测：MCP/建会话两阶段
   // 太快、一闪而过像丢了——每个阶段至少停 BOOT_STAGE_MIN_MS、按序补播；
   // agent 真活动到达（activeBoot=null）时立即清、不为动画拖住真内容）
+  //
+  // 思考一开始（实时帧到了）启动阶段行就该让位：冷续聊的「正在发送…」在事件流里要等
+  // agent 活动事件落盘才会清，而 thinking 事件要整段思考结束才落——不压的话会对着
+  // 「正在发送…」干等整段思考。用布尔做依赖：liveThinking 每 250ms 变一次，
+  // 别让它拖着 extractActiveBootStage 反复重扫事件。
+  const isThinkingLive = liveThinking != null;
+  // 状态行用的「最近一行」：从累积原文派生、不另存一份 state。
+  // null = 没在思考；"" = 在思考但还没有可展示的行（与 deriveActiveStatus 的约定一致）
+  const thinkingLine = useMemo(
+    () => (liveThinking ? thinkingTextToLine(liveThinking.text) : null),
+    [liveThinking],
+  );
   const activeBoot = useMemo(
-    () => (isChat ? extractActiveBootStage(task.events) : null),
-    [isChat, task.events],
+    () =>
+      isChat && !isThinkingLive ? extractActiveBootStage(task.events) : null,
+    [isChat, isThinkingLive, task.events],
   );
   const displayedBoot = useStagedBootDisplay(activeBoot);
 
@@ -714,17 +762,32 @@ const EventStreamImpl = ({
     return next;
   }, [baseItems, pendingAskEvent]);
 
+  // 有「立即发送途中」的占位（刚按回车、user_reply 还没落盘）：气泡按正式消息显示，
+  // 「在等什么」由列表末尾的进度行说明（取代旧的虚线「发送中…」气泡）
+  const hasInflight = useMemo(
+    () => isChat && hasInflightPending(pendingLocalReplies),
+    [isChat, pendingLocalReplies],
+  );
+
   // 第三层：追加 pending / streaming / loading / boot 虚拟项（不参与分组）。
   // 只有这层跟着 chunk 变、而它产出的新身份只有末尾那一两个虚拟项。
   const items: RenderItem[] = useMemo(() => {
+    // 正在进行的思考：合成一条 thinking 事件、并进工作过程流程的流尾，由已有的思考行渲染
+    // （落盘后同 id 的真实 thinking 事件接替它、是同一个节点）。
+    // 正文已经在流（streamingText）就不再是思考态——兜住实时帧晚于正文到达的竞态。
+    // 放在这一层而不是 baseItems：它随思考实时帧变、不能拖着整条分组管线重算；
+    // attachLiveThinking 只改流尾一项、前面的项引用不变，memo 的成员行不会被击穿
+    const live = isChat && isRunning && !streamingText ? liveThinking : null;
+    const flow = live ? attachLiveThinking(orderedItems, live) : orderedItems;
     const withPending: RenderItem[] = [
-      ...orderedItems,
+      ...flow,
       ...(pendingLocalReplies ?? []).map(
         (p): PendingLocalItem => ({
           kind: "__pending_local__",
           id: p.id,
           text: p.displayText,
           uncertain: p.uncertain,
+          mode: p.mode,
           itemId: p.itemId ?? p.id,
         }),
       ),
@@ -738,6 +801,8 @@ const EventStreamImpl = ({
         text: streamingText,
       });
     }
+    // 流程里已经有「正在思考」这一行 = 模型已经在干活：不再叠启动阶段行 / 「等待模型响应…」
+    if (live) return withPending;
     // F 批次：启动链进度（正在检查 MCP / 创建会话 / 发送首包）——
     // 渐进单行（经最小停留缓冲挨个切换）；agent 活动后整组消失。
     // 有活跃 boot 行时它就是进度指示、压制通用 __loading__ 占位。
@@ -770,7 +835,10 @@ const EventStreamImpl = ({
       last.kind !== "__tool_verb_group__" &&
       last.kind !== "__work_group__" &&
       last.kind === "user_reply";
-    if (isRunning && lastIsUser) {
+    // 两段共用同一个 __loading__ 项（同 id → 占位落盘交接时不重挂载、「已等待 Ns」不清零）：
+    // ① 已按回车、user_reply 还没落盘（inflight 占位）——此时 runStatus 可能还没 running；
+    // ② 已受理、user_reply 已落盘、AI 还没动静（原有）。
+    if (shouldShowSendLoading({ isRunning, lastIsUser, hasInflight })) {
       return [...withPending, { kind: "__loading__", id: "__loading__" }];
     }
     return withPending;
@@ -780,7 +848,9 @@ const EventStreamImpl = ({
     isRunning,
     isChat,
     pendingLocalReplies,
+    hasInflight,
     displayedBoot,
+    liveThinking,
   ]);
 
   // 「N 条新内容」的计量单位（回到最新按钮）：工作过程组按**成员**摊开算。
@@ -928,16 +998,38 @@ const EventStreamImpl = ({
     return src.filter((e) => !isHiddenFromEventStream(e, { isChat }));
   }, [isChat, task.events]);
 
-  // 运行中粘性状态行（Batch C）：仅 chat + running；有 streamingText 时 label「正在回复…」正常
-  const activeStatus = useMemo(
-    () =>
-      isChat && isRunning
-        ? deriveActiveStatus(statusEvents, liveToolOutputs, {
-            streaming: !!streamingText,
-          })
-        : null,
-    [isChat, isRunning, statusEvents, liveToolOutputs, streamingText],
+  // 回复已完整落盘、SDK 还在收尾（server 在 turn-ended 后 3s 仍没收尾才发提示）。
+  // 单独成 memo、只跟事件走：粘性状态行那层的依赖里不许挂全量事件（liveToolOutputs
+  // 每个 delta 一个新引用，见 event-stream-scroll-contract），判定结果收成一个布尔再传进去
+  const turnWrapUp = useMemo(
+    () => isChat && hasActiveTurnWrapUp(task.events),
+    [isChat, task.events],
   );
+
+  // 运行中粘性状态行（Batch C）：仅 chat + running；有 streamingText 时 label「正在回复…」正常
+  const activeStatus = useMemo(() => {
+    if (!isChat || !isRunning) return null;
+    // 刚按回车、user_reply 还没落盘：列表末尾已有「准备环境…」进度行；
+    // 此时 statusEvents 还停在上一轮，回扫会闪出上一轮的「正在回复…」——不并存
+    if (hasInflight) return null;
+    // 回复已写完、只剩 SDK 在收尾存档：别再闪「正在回复…」让人对着已写完的回复干等，
+    // 告诉他可以读了
+    if (turnWrapUp) return TURN_WRAP_UP_STATUS;
+    return deriveActiveStatus(statusEvents, liveToolOutputs, {
+      streaming: !!streamingText,
+      // 思考进行中：落盘的 thinking 事件要等整段结束才有，不靠它状态行会一直说「处理中…」
+      thinking: thinkingLine,
+    });
+  }, [
+    isChat,
+    isRunning,
+    hasInflight,
+    turnWrapUp,
+    statusEvents,
+    liveToolOutputs,
+    streamingText,
+    thinkingLine,
+  ]);
 
   // 轮次分割判定用的 kind 序列。挂 orderedItems 不挂 items：虚拟项一律追加在尾部、
   // 且都不是 user_reply，越界读回 undefined、shouldShowTurnDivider 自然返回 false，
@@ -1764,6 +1856,7 @@ const EventStreamImpl = ({
                   <PendingLocalReplyRow
                     text={item.text}
                     uncertain={item.uncertain}
+                    mode={item.mode}
                     ownerId={item.id}
                     itemId={item.itemId}
                     onEdit={onEditPending}

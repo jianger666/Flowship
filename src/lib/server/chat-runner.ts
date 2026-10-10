@@ -65,6 +65,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { dataRoot } from "./data-root";
+import { publishBootProgress } from "./boot-progress";
+import { appendPerfRecord } from "./perf-journal";
 import { createRunPerfTracker } from "./run-perf";
 import { notePrep } from "./run-prep-notes";
 import {
@@ -508,26 +510,64 @@ const publish = (taskId: string, ev: TaskStreamEvent): void => {
   publishTaskStreamEvent(taskId, ev);
 };
 
+// 启动链 ephemeral 进度（publishBootProgress）已抽到 ./boot-progress：
+// chat-inject 的续聊（resume）路径也要发，不必为此再让 chat-runner 多导出一个函数。
+
 /**
- * 启动链 ephemeral 进度（不落盘）。id 前缀 ephemeral_boot_，meta.stage 供前端 loading 行。
- * 发送完成后前端自然清 loading；这里只推阶段、不 appendEvent。
+ * 回合已结束（SDK 发了 turn-ended、回复已完整落盘）却迟迟没收尾时的提示门槛。
+ * 正常 turn-ended → FINISHED 约 0.3s（SDK 在存 checkpoint）；超过它就是异常空窗，
+ * 此时用户只看到「回复完了、还在转圈」——给个明确信号，别让他干等。
  */
-const publishBootProgress = (
-  taskId: string,
-  stage: "mcp" | "create" | "send",
-  text: string,
-): void => {
+const TURN_WRAP_UP_NOTICE_MS = 3_000;
+
+/**
+ * 回合结束后的收尾提示（ephemeral、不落盘）：meta.turnWrapUp 供前端
+ * lib/chat-stream-display.hasActiveTurnWrapUp 识别；run 一结束前端自然清掉。
+ */
+const publishTurnWrapUp = (taskId: string, lease: () => boolean): void => {
+  if (!lease()) return;
   publish(taskId, {
     kind: "event",
     event: {
-      id: `ephemeral_boot_${stage}_${Date.now()}`,
+      id: `ephemeral_wrapup_${Date.now()}`,
       ts: Date.now(),
       kind: "info",
-      text,
-      // bootStage：前端「渐进单行」判定标（lib/chat-stream-display.isBootStageInfo）
-      meta: { stage, bootStage: true },
+      text: "回复已完成，正在保存会话…",
+      meta: { turnWrapUp: true },
     },
   });
+};
+
+/**
+ * 「回合结束 → SDK 真正收尾」的异常取证（turn-wrapup.jsonl）：
+ * 收尾慢（>3s）/ SDK 重放过（usage>1）/ 丢过重放消息才记；正常 ~0.3s 不写，零噪音。
+ * perf-report 据此回答「重复回复 / 迟迟不结束」到底还发不发生、发生时卡多久。
+ */
+const noteTurnWrapUp = (
+  taskId: string,
+  agentId: string | undefined,
+  c: AssistantBufferCtx | undefined,
+  streamEndedAt: number | undefined,
+): void => {
+  if (!c || c.turnEndedAt === undefined) return;
+  const settledAfterMs = (streamEndedAt ?? Date.now()) - c.turnEndedAt;
+  const d = c.replayDropped;
+  const dropped = d ? d.thinking + d.assistant : 0;
+  const replayed = (c.turnEndedCount ?? 0) > 1;
+  if (settledAfterMs <= TURN_WRAP_UP_NOTICE_MS && !replayed && dropped === 0) {
+    return;
+  }
+  appendPerfRecord("turn-wrapup.jsonl", {
+    taskId,
+    ...(agentId ? { agentId } : {}),
+    settledAfterMs,
+    turnEndedCount: c.turnEndedCount ?? 1,
+    ...(d ? { replayDropped: d } : {}),
+  });
+  console.warn(
+    `[chat-runner] task=${taskId} 回合结束后 ${settledAfterMs}ms SDK 才收尾` +
+      `（turn-ended×${c.turnEndedCount ?? 1}、丢弃重放 thinking=${d?.thinking ?? 0} assistant=${d?.assistant ?? 0}）`,
+  );
 };
 
 // 本地第二套 writeEventAndPublish 实现已删——统一走 task-stream 的
@@ -1957,6 +1997,9 @@ const consumeChatRun = async (
   let hardTimedOut = false;
   let hardTimer: NodeJS.Timeout | null = null;
   let ctx!: AssistantBufferCtx;
+  // 回合结束后 SDK 迟迟不收尾时的「回复已完成」提示定时器 + SDK 流真正结束的时刻（取证用）
+  let wrapUpTimer: NodeJS.Timeout | null = null;
+  let streamEndedAt: number | undefined;
   const rec = runningChats.get(task.id);
   // 捕获本 run 的 instanceId lease——forceClear/懒重启换新会话后，
   // 旧 run 迟到 yield 的主消息流（thinking/assistant/tool/flush）全部被拦、
@@ -2000,6 +2043,17 @@ const consumeChatRun = async (
           text: trimmed,
         });
       },
+      // 回合结束后的重放保护：usage 到达即落盘回复，其后 SDK stall 重放的 thinking / assistant 丢弃
+      // （为什么只丢事件不 cancel、为什么 task 不开，见 AssistantBufferCtx.dropAfterTurnEnded）
+      dropAfterTurnEnded: true,
+      onTurnEnded: () => {
+        if (wrapUpTimer) return;
+        wrapUpTimer = setTimeout(() => {
+          wrapUpTimer = null;
+          publishTurnWrapUp(task.id, chatLease);
+        }, TURN_WRAP_UP_NOTICE_MS);
+        wrapUpTimer.unref?.();
+      },
     };
 
     // 打点：send 受理到首个流事件（≈首 token）的等待——量化「首包预填」开销
@@ -2016,6 +2070,7 @@ const consumeChatRun = async (
       // chat 主消息流接 instanceId lease（缺省 opHandle ≠ 永远 current 的语义已删）
       await handleSdkMessage(task.id, msg, ctx, chatLease);
     }
+    streamEndedAt = Date.now();
     await flushThinkingBuffer(task.id, ctx, chatLease);
     await ctx.flush();
 
@@ -2090,6 +2145,12 @@ const consumeChatRun = async (
     if (!handled) {
       await handleChatRunFailure(task, err, myInstanceId);
     }
+  } finally {
+    if (wrapUpTimer) {
+      clearTimeout(wrapUpTimer);
+      wrapUpTimer = null;
+    }
+    noteTurnWrapUp(task.id, rec?.agentId, ctx, streamEndedAt);
   }
 };
 

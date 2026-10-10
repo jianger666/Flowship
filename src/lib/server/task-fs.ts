@@ -1507,15 +1507,25 @@ const lastMetaTouchAt = new Map<string, number>();
  */
 export const appendEvent = async (
   taskId: string,
-  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq"> & {
+    /**
+     * 预先指定的事件 id；缺省 / 空串才现生成。
+     * 目前只有一处用：thinking 事件复用思考实时帧里已经告诉前端的 id（见 flushThinkingBuffer）。
+     * 调用方自己保证唯一（用 newEventId() 生成、一个 id 只落一条）。
+     */
+    id?: string;
+  },
   lease?: () => boolean,
   onCommitted?: (event: TaskEvent) => void,
 ): Promise<TaskEvent | null> => {
   if (!(await exists(path.join(taskDir(taskId), META_FILE)))) return null;
+  // id 单独拆出来再 spread：显式写成 `id: undefined` 的入参也不会把生成的 id 覆盖成 undefined；
+  // 键顺序（id, ts, …）与改前一致，events.jsonl 的行格式不变
+  const { id: presetId, ...rest } = ev;
   const event: TaskEvent = {
-    id: newEventId(),
+    id: presetId || newEventId(),
     ts: Date.now(),
-    ...ev,
+    ...rest,
   };
   // 写行 + onCommitted（publish）同进 per-task append 链
   // 非 ENOENT 错误由 appendEventLineUnlocked 原样抛出（透传、不吞）

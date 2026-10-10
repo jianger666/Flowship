@@ -431,3 +431,92 @@ describe("观测故障绝不影响主流程", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 });
+
+describe("吐字节奏（cadence）进汇总记录", () => {
+  const textDelta = (t: Tracker): void => feed(t, { type: "text-delta", text: "字" });
+
+  it("text-delta 的到达间隔进记录；高频 delta 零 [perf-] 日志；工具调用断开连续段（工具空窗不计）", async () => {
+    vi.useFakeTimers({ now: 2_000_000 });
+    const t = mk();
+    const run = mkRun();
+    t.attachRun(run);
+
+    const logCalls = (): number => vi.mocked(console.log).mock.calls.length;
+    const before = logCalls();
+    // 第一段：20 条、每条间隔 33ms → 19 个间隔
+    for (let i = 0; i < 20; i += 1) {
+      textDelta(t);
+      await vi.advanceTimersByTimeAsync(33);
+    }
+    // 契约：高频流式 delta 零 [perf-] 日志（首 token 打点只进文件，不打 console）
+    expect(logCalls()).toBe(before);
+
+    // 模型去调工具了：连续段断开，这 20 秒不是「吐字不顺」
+    feed(t, { type: "tool-call-started", callId: "c1", toolCall: { type: "read", args: {} } });
+    await vi.advanceTimersByTimeAsync(20_000);
+    feed(t, {
+      type: "tool-call-completed",
+      callId: "c1",
+      toolCall: { type: "read", args: {}, result: { status: "success", value: {} } },
+    });
+
+    // 第二段：5 条、每条间隔 200ms → 4 个间隔
+    for (let i = 0; i < 5; i += 1) {
+      textDelta(t);
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    run.fire("finished");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(records).toHaveLength(1);
+    expect(records[0].cadence?.text).toMatchObject({
+      n: 19 + 4,
+      max: 200,
+      over100: 4,
+      over250: 0,
+    });
+    expect(records[0].cadence?.thinking).toBeUndefined();
+  });
+
+  it("思考 delta 单独成组；shell 输出 / token 用量等其它高频 delta 不断开连续段", async () => {
+    vi.useFakeTimers({ now: 3_000_000 });
+    const t = mk();
+    const run = mkRun();
+    t.attachRun(run);
+
+    feed(t, { type: "thinking-delta", text: "a" });
+    await vi.advanceTimersByTimeAsync(100);
+    feed(t, { type: "token-delta", tokens: 5 }); // 被忽略类：不断开
+    feed(t, { type: "shell-output-delta", event: { chunk: "x" } }); // 同上
+    feed(t, { type: "thinking-delta", text: "b" });
+    await vi.advanceTimersByTimeAsync(100);
+    feed(t, { type: "thinking-delta", text: "c" });
+    run.fire("finished");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(records[0].cadence).toEqual({
+      thinking: { n: 2, p50: 100, p95: 100, max: 100, over100: 0, over250: 0 },
+    });
+  });
+
+  it("没有流式 delta 的 run：记录里没有 cadence 键", async () => {
+    const t = mk();
+    const run = mkRun();
+    t.attachRun(run);
+    run.fire("finished");
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect("cadence" in records[0]).toBe(false);
+  });
+
+  it("store 快照里的 run_events 实现 / 体积字段原样并入记录（file 模式 + 大文件 = 吐字被钉住的病根）", async () => {
+    __setRunPerfEnvProviderForTests(async () => ({
+      store: { mode: "fast", runEvents: "file", evMB: 18.54, runsMB: 0.19 },
+    }));
+    const t = mk();
+    const run = mkRun();
+    t.attachRun(run);
+    run.fire("finished");
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(records[0].store).toEqual({ mode: "fast", runEvents: "file", evMB: 18.54, runsMB: 0.19 });
+  });
+});

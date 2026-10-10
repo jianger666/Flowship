@@ -244,6 +244,8 @@ describe("buildRunRecord", () => {
     acc.thinking(500);
     acc.step(900);
     acc.usage({ inputTokens: 1, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, reasoningTokens: 5 });
+    acc.textDelta(START + 40);
+    acc.textDelta(START + 70);
     const rec = buildRunRecord({
       now: START + 2_000,
       ctx: {
@@ -265,20 +267,39 @@ describe("buildRunRecord", () => {
       idleBeforeMs: 5,
       warmedAgoMs: 6,
       env: {
-        store: { mode: "fast", blobs: 1, mb: 1, agentBlobs: 1, agentMB: 1 },
+        store: {
+          mode: "fast",
+          blobs: 1,
+          mb: 1,
+          agentBlobs: 1,
+          agentMB: 1,
+          runEvents: "memory",
+          evMB: 1,
+          evCount: 1,
+          evTrimmed: 1,
+          runsMB: 1,
+        },
         proc: { rssMB: 1, heapMB: 1, load1: 1, uptimeS: 1, activeRuns: 1, eldP99Max: 1, eldMax: 1, eluAvg: 1, slowSeconds: 1, gcMax: 1, gcCount: 1 },
       },
       runtime: { platform: "darwin", version: "1.9.28", appNap: true },
     });
     expect(Object.keys(rec).sort()).toEqual(
       [
-        "acceptMs", "agentId", "appNap", "firstDeltaMs", "firstDeltaType", "firstToolMs",
+        "acceptMs", "agentId", "appNap", "cadence", "firstDeltaMs", "firstDeltaType", "firstToolMs",
         "idleBeforeMs", "kind", "mcp", "model", "modelParams", "outcome", "platform", "prep",
         "promptBudgetDropped", "promptBytes", "proc", "requestId", "runId", "stepMsMax",
         "stepMsSum", "steps", "store", "tags", "taskId", "thinkingMs", "thinkingSegments",
         "tokens", "toolCount", "toolErrors", "tools", "totalMs", "ts", "ttftMs", "v",
         "version", "warmedAgoMs",
       ].sort(),
+    );
+    // store / cadence 的子字段也锁白名单：只有枚举名与数字，没有任何路径 / 正文
+    expect(Object.keys(rec.store ?? {}).sort()).toEqual(
+      ["agentBlobs", "agentMB", "blobs", "evCount", "evMB", "evTrimmed", "mb", "mode", "runEvents", "runsMB"].sort(),
+    );
+    expect(Object.keys(rec.cadence ?? {})).toEqual(["text"]);
+    expect(Object.keys(rec.cadence?.text ?? {}).sort()).toEqual(
+      ["max", "n", "over100", "over250", "p50", "p95"].sort(),
     );
   });
 
@@ -293,5 +314,56 @@ describe("buildRunRecord", () => {
       }),
     );
     expect(JSON.stringify(rec).length).toBeLessThan(4096);
+  });
+});
+
+describe("吐字节奏（cadence）", () => {
+  const rec = (acc: ReturnType<typeof createRunAccumulator>, end = START + 60_000) =>
+    buildRunRecord(baseInput({ snap: acc.snapshot(end) }));
+
+  it("正文 delta 的间隔进记录；没有任何 delta 的 run 没有 cadence 键（不是空对象）", () => {
+    const acc = createRunAccumulator(START);
+    expect("cadence" in rec(acc)).toBe(false);
+
+    acc.textDelta(START + 100);
+    acc.textDelta(START + 133);
+    acc.textDelta(START + 166);
+    const r = rec(acc);
+    expect(r.cadence).toEqual({
+      text: { n: 2, p50: 33, p95: 33, max: 33, over100: 0, over250: 0 },
+    });
+  });
+
+  it("工具调用等事件断开连续段：断开前后的空窗不计入吐字间隔", () => {
+    const acc = createRunAccumulator(START);
+    acc.textDelta(START + 100);
+    acc.textDelta(START + 130);
+    acc.breakStream();
+    acc.textDelta(START + 30_000); // 工具跑了半分钟
+    acc.textDelta(START + 30_030);
+    const c = rec(acc).cadence?.text;
+    expect(c).toMatchObject({ n: 2, max: 30, over100: 0, over250: 0 });
+  });
+
+  it("思考 delta 单独成组；正文与思考交替时切换那一下不记", () => {
+    const acc = createRunAccumulator(START);
+    acc.thinkingDelta(START + 10);
+    acc.thinkingDelta(START + 110);
+    acc.textDelta(START + 5_000);
+    acc.textDelta(START + 5_030);
+    const c = rec(acc).cadence;
+    expect(c?.thinking).toMatchObject({ n: 1, max: 100 });
+    expect(c?.text).toMatchObject({ n: 1, max: 30 });
+  });
+
+  it("记录体积：带 cadence 的满填重度 run 仍 < 4KB", () => {
+    const acc = createRunAccumulator(START);
+    for (let i = 0; i < 40; i++) acc.toolDone(`mcp:server.tool_${i}`, 123, "success", 100);
+    for (let i = 0; i < 500; i++) acc.textDelta(START + i * 40);
+    for (let i = 0; i < 500; i++) acc.thinkingDelta(START + 100_000 + i * 90);
+    const r = rec(acc, START + 200_000);
+    expect(r.cadence?.text?.n).toBe(499);
+    expect(r.cadence?.thinking?.n).toBe(499);
+    expect(JSON.stringify(r).length).toBeLessThan(4096);
   });
 });

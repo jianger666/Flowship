@@ -16,6 +16,11 @@ import {
   setTaskRunStatus,
   updateTaskFields,
 } from "@/lib/server/task-fs";
+import {
+  BOOT_TEXT_RESUME,
+  BOOT_TEXT_SEND,
+  publishBootProgress,
+} from "@/lib/server/boot-progress";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import {
   deriveChatTitleFromMessage,
@@ -536,6 +541,8 @@ const runChatReplyInject = async (
   // claim 是实例化 token——保存 resume 返回的 instanceId，后续 owner send /
   // release 都必须带它精确匹配，防止越权操作 stop/forceClear 后换上来的新实例。
   let ownerInstanceId: number | null = null;
+  // 冷路径里与 resume 并行跑的发送前快照（见下面 resume 分支）。非冷路径恒为 null
+  let earlyCapture: Promise<CaptureCheckpointResult> | null = null;
   // 自定义允许空 Key（本地无鉴权端点）；只要求 bootArgs 结构合法，不要用 truthy 挡空串
   const hasBootArgs =
     !!bootArgs &&
@@ -549,6 +556,24 @@ const runChatReplyInject = async (
     typeof bootArgs.apiKey === "string" &&
     isValidModel(bootArgs.model)
   ) {
+    // 冷路径（空闲回收 / 重启后恢复）~1.5–2.3s：别让用户对着气泡干等，报真实阶段。
+    // 会话还热着（内存里有）的续聊没有阶段可说（0.3–0.7s 就受理），不进这个分支
+    publishBootProgress(task.id, "resume", BOOT_TEXT_RESUME);
+    // 发送前快照只看 task.repoPaths、与会话无关——和 resume 同时开跑，把 ~0.4s 藏进 resume 的
+    // 1.4–2.6s 里（原先两者串行、冷发送白等一遍）。「快照在 agent.send 之前」的不变式不变：
+    // unchanged 分支仍在 send 前 await 它。
+    // 永不 reject：resume 失败 / 让位 / 走了别的分支时没人 await 它，不能留 unhandled rejection；
+    // 用不上就白打一次（只读 git、不碰真实 index / 工作区，无副作用）。
+    // 失败按「不带 checkpointed」降级（与 captureChatCheckpoint「失败不挡发消息」的约定一致）
+    earlyCapture = sendTimed("checkpoint#early", tryCaptureCheckpoint()).catch(
+      (err): CaptureCheckpointResult => {
+        console.warn(
+          `[chat-reply] 并行快照失败 task=${task.id}:`,
+          err instanceof Error ? err.message : err,
+        );
+        return { ok: false, repoSnapshots: [], elapsedMsByRepo: {}, warnings: [] };
+      },
+    );
     ownerInstanceId = await sendTimed(
       "resumeChatSession",
       resumeChatSession(
@@ -677,8 +702,17 @@ const runChatReplyInject = async (
       // try/catch：resume→send 之间任一 throw 必须释放认领；send 成功后勿释放（已是真 run）。
       let sentOk = false;
       try {
-        // 快照必须在 agent.send 之前（send 后 consume 即可能改文件）
-        const capture = await sendTimed("checkpoint#send", tryCaptureCheckpoint());
+        // 刚恢复完会话：下一步是快照 + 把消息交给 SDK（~0.3–0.5s + 受理）。
+        // 热路径（没走过 resume）这一步太快、不报，免得一闪而过
+        if (resumedAsOwner) {
+          publishBootProgress(task.id, "send", BOOT_TEXT_SEND);
+        }
+        // 快照必须在 agent.send 之前（send 后 consume 即可能改文件）。
+        // 冷路径：已经和 resume 并行跑过，这里等的只是残余（多半是现成结果）；热路径现打
+        const capture = await sendTimed(
+          "checkpoint#send",
+          earlyCapture ?? tryCaptureCheckpoint(),
+        );
         // ownerInstanceId：owner 实例精确匹配才跳过 runActive 早退；
         // checkpoint 期间被 stop 摘除 / forceClear 换新实例 → send 内按
         // cancelled / owner_invalid 收敛（取消是终态、绝不能当可重试故障）

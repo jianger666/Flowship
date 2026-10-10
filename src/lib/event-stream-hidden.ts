@@ -13,7 +13,7 @@ import {
   isAskWaitCommand,
   toolArgsLookLikeAskWait,
 } from "@/lib/ask-wait-detect";
-import { isBootStageInfo } from "@/lib/chat-stream-display";
+import { isBootStageInfo, isTurnWrapUpInfo } from "@/lib/chat-stream-display";
 import { isInTurnToolErrorEvent } from "@/lib/tool-display";
 import {
   isGroupQaQuestionEvent,
@@ -66,7 +66,14 @@ export const isHiddenFromEventStream = (
   // 属主群消息（无 runTag）、旁路跑过程的 tool/info 噪音不在此列（后者归因要动 runner，下轮再说）。
   if (isGroupQaQuestionEvent(ev) || isGroupQaSummaryEvent(ev)) return true;
   if (opts?.isChat) {
-    if (isChatStartupNoiseInfo(ev) || isBootStageInfo(ev)) return true;
+    // 启动进度 / 回合收尾提示：都是 ephemeral 的「状态」，由底部状态行单独呈现，不进事件流
+    if (
+      isChatStartupNoiseInfo(ev) ||
+      isBootStageInfo(ev) ||
+      isTurnWrapUpInfo(ev)
+    ) {
+      return true;
+    }
   }
   return false;
 };

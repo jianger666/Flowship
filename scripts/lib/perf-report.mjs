@@ -7,6 +7,7 @@
  * - warmup.jsonl    每次预热（窗口聚焦 / 输入框聚焦触发）的结果
  * - loop-lag.jsonl  Node 事件循环「慢秒」（某一秒内单次阻塞 ≥500ms）
  * - ui-perf.jsonl   渲染进程上报：长任务 / 慢交互 / 回前台追赶 / 页面规模
+ * - turn-wrapup.jsonl  chat 回合已结束、SDK 却迟迟不收尾 / 重放过时才记一条（正常收尾不写）
  *
  * 这里只有纯函数（buildReport / renderText / 文件读取），CLI 在 scripts/perf-report.mjs。
  * 隐私：这些日志本来就不含 prompt / 命令 / 路径，报告也只输出数字、枚举与工具名。
@@ -20,6 +21,7 @@ export const LOG_FILES = {
   ui: "ui-perf.jsonl",
   warmup: "warmup.jsonl",
   lag: "loop-lag.jsonl",
+  wrapup: "turn-wrapup.jsonl",
 };
 
 /**
@@ -284,7 +286,111 @@ const scaleSection = (runs) => ({
   byAgentSize: byKey(runs, (r) => scaleBucket(r.store?.agentMB), SCALE_BUCKETS),
   promptBytes: dist(col(runs, (r) => r.promptBytes)),
   agentMB: dist(col(runs, (r) => r.store?.agentMB)),
+  // SDK 每次读 run 状态都整文件解析 runs.ndjson：涨到数 MB 会成为下一个「每条事件 O(文件大小)」瓶颈
+  runsMB: dist(col(runs, (r) => r.store?.runsMB)),
+  // run_events 的体积：file（回退开关、SDK 落盘）= 文件大小，越大每条事件越慢；memory = 内存里保留的 payload
+  runEventsFileMB: dist(
+    col(
+      runs.filter((r) => r.store?.runEvents === "file"),
+      (r) => r.store?.evMB,
+    ),
+  ),
+  runEventsMemoryMB: dist(
+    col(
+      runs.filter((r) => r.store?.runEvents === "memory"),
+      (r) => r.store?.evMB,
+    ),
+  ),
 });
+
+/** 吐字「被钉住」的阈值：整轮 p50 间隔 ≥ 150ms（SDK 原生约 30 条/秒 ≈ 33ms） */
+export const CADENCE_PINNED_P50_MS = 150;
+
+/**
+ * 吐字节奏（run 记录里的 cadence.text / cadence.thinking：相邻同类 delta 的到达间隔，ms）。
+ * 每个 run 自带 p50 / p95；跨 run 汇总两种口径：
+ * - 每轮分布：各 run 的 p50 / p95 的分布（看「典型的一轮」）
+ * - 条数加权：全部间隔里 >100ms / >250ms 的占比（看「用户所有吐字里有多少是卡的」）
+ * 按 run_events 实现（store.runEvents）分组对照：内存实现 vs SDK 落盘一眼可见；
+ * SDK 落盘再按文件体积分桶，直接看「越大越慢」。旧版本的记录没有 cadence，自然被排除。
+ * @param {any[]} runs
+ */
+const cadenceStats = (rs, key) => {
+  const gaps = sum(col(rs, (r) => r.cadence[key].n));
+  return {
+    runs: rs.length,
+    gaps,
+    p50: dist(col(rs, (r) => r.cadence[key].p50)),
+    p95: dist(col(rs, (r) => r.cadence[key].p95)),
+    maxGap: dist(col(rs, (r) => r.cadence[key].max)),
+    slowShare: gaps > 0 ? sum(col(rs, (r) => r.cadence[key].over100)) / gaps : undefined,
+    stallShare: gaps > 0 ? sum(col(rs, (r) => r.cadence[key].over250)) / gaps : undefined,
+    pinnedRuns: rs.filter((r) => r.cadence[key].p50 >= CADENCE_PINNED_P50_MS).length,
+  };
+};
+
+const hasCadence = (r, key) =>
+  r.cadence &&
+  typeof r.cadence === "object" &&
+  r.cadence[key] &&
+  finite(r.cadence[key].n) &&
+  r.cadence[key].n > 0;
+
+const cadenceSection = (runs) => {
+  const text = runs.filter((r) => hasCadence(r, "text"));
+  const thinking = runs.filter((r) => hasCadence(r, "thinking"));
+  const group = (rs, keyFn, order) => {
+    const groups = groupBy(rs, keyFn);
+    const keys = order ?? [...groups.keys()].sort();
+    return keys
+      .filter((k) => groups.has(k))
+      .map((k) => ({ key: k, ...cadenceStats(groups.get(k), "text") }));
+  };
+  return {
+    text: text.length > 0 ? cadenceStats(text, "text") : undefined,
+    thinking: thinking.length > 0 ? cadenceStats(thinking, "thinking") : undefined,
+    byRunEvents: group(text, (r) => r.store?.runEvents ?? "未知", ["memory", "file", "未知"]),
+    fileBySize: group(
+      text.filter((r) => r.store?.runEvents === "file"),
+      (r) => scaleBucket(r.store?.evMB),
+      SCALE_BUCKETS,
+    ),
+  };
+};
+
+/** 回合结束后超过这个时长才收尾，用户就会明显感到「回复完了还在转圈」 */
+export const WRAPUP_SLOW_MS = 5_000;
+
+/**
+ * 回合收尾（turn-wrapup.jsonl：chat 回合已结束，但 SDK 迟迟没收尾 / 重放过 / 我们拦过重放消息才记一条）。
+ * 回答「回复完了还转圈 / 同一句话被回复两遍」今天还发不发生、发生时卡多久：
+ * - 分母 = 同期 chat run 数；正常收尾（~0.3s）不写记录，所以占比 = 异常收尾率
+ * - 重放 = SDK 在同一条流上发了不止一条 turn-ended（usage>1）
+ * - outcome=ok 的 chat run：turn-ended 后 2s 内没等到终态回调、由埋点兜底收口——与本表交叉印证
+ * @param {any[]} wrapups
+ * @param {any[]} runs
+ */
+const wrapUpSection = (wrapups, runs) => {
+  const chatRuns = runs.filter((r) => typeof r.kind === "string" && r.kind.startsWith("chat-"));
+  const settled = col(wrapups, (w) => w.settledAfterMs);
+  const dropped = wrapups
+    .map((w) => w.replayDropped)
+    .filter((d) => d && typeof d === "object");
+  const dsum = (key) => sum(col(dropped, (d) => d[key]));
+  return {
+    records: wrapups.length,
+    chatRuns: chatRuns.length,
+    share: chatRuns.length > 0 ? wrapups.length / chatRuns.length : undefined,
+    settledMs: dist(settled),
+    slow: settled.filter((x) => x > WRAPUP_SLOW_MS).length,
+    replayed: wrapups.filter((w) => finite(w.turnEndedCount) && w.turnEndedCount > 1).length,
+    droppedThinking: dsum("thinking"),
+    droppedAssistant: dsum("assistant"),
+    droppedChars: dsum("assistantChars"),
+    droppedToolCalls: dsum("toolCalls"),
+    okChatRuns: chatRuns.filter((r) => r.outcome === "ok").length,
+  };
+};
 
 const napLabel = (v) => (v === true ? "开" : v === false ? "关" : "未知");
 const napSection = (runs) => byKey(runs, (r) => napLabel(r.appNap), ["关", "开", "未知"]);
@@ -392,7 +498,7 @@ const uiSection = (ui, runs) => {
 // ───────── 主入口 ─────────
 
 /**
- * @param {{ run?: object[], ui?: object[], warmup?: object[], lag?: object[] }} input 已解析的记录
+ * @param {{ run?: object[], ui?: object[], warmup?: object[], lag?: object[], wrapup?: object[] }} input 已解析的记录
  * @param {{ sinceMs?: number, taskId?: string, minSamples?: number, parseErrors?: number, now?: number }} [opts]
  */
 export const buildReport = (input, opts = {}) => {
@@ -408,10 +514,11 @@ export const buildReport = (input, opts = {}) => {
   const runs = (input.run ?? []).filter((r) => keep(r, true));
   const ui = (input.ui ?? []).filter((r) => keep(r, true));
   const warmups = (input.warmup ?? []).filter((r) => keep(r, true));
+  const wrapups = (input.wrapup ?? []).filter((r) => keep(r, true));
   // loop-lag 是进程级、没有 taskId：只按时间过滤
   const lag = (input.lag ?? []).filter((r) => keep(r, false));
 
-  const times = [...runs, ...ui, ...warmups, ...lag]
+  const times = [...runs, ...ui, ...warmups, ...lag, ...wrapups]
     .map((r) => Date.parse(r.ts))
     .filter(finite);
   const versions = {};
@@ -449,7 +556,13 @@ export const buildReport = (input, opts = {}) => {
             to: new Date(Math.max(...times)).toISOString(),
           }
         : undefined,
-      counts: { run: runs.length, ui: ui.length, warmup: warmups.length, lag: lag.length },
+      counts: {
+        run: runs.length,
+        ui: ui.length,
+        warmup: warmups.length,
+        lag: lag.length,
+        wrapup: wrapups.length,
+      },
       versions,
       minSamples,
       filter: { taskId: opts.taskId, sinceMs: opts.sinceMs },
@@ -465,6 +578,8 @@ export const buildReport = (input, opts = {}) => {
     tools: toolSection(runs),
     loop: loopSection(runs, lag),
     scale: scaleSection(runs),
+    cadence: cadenceSection(runs),
+    wrapUp: wrapUpSection(wrapups, runs),
     appNap: napSection(runs),
     ui: uiSection(ui, runs),
     warnings,
@@ -518,7 +633,7 @@ export const renderText = (report) => {
   L.push(`Flowship 性能报告（生成于 ${report.meta.generatedAt}）`);
   const c = report.meta.counts;
   L.push(
-    `数据：run ${c.run} 条 · 预热 ${c.warmup} 条 · 事件循环慢秒 ${c.lag} 条 · 前端上报 ${c.ui} 条` +
+    `数据：run ${c.run} 条 · 预热 ${c.warmup} 条 · 事件循环慢秒 ${c.lag} 条 · 前端上报 ${c.ui} 条 · 回合收尾异常 ${c.wrapup ?? 0} 条` +
       (report.meta.range ? `\n范围：${report.meta.range.from} → ${report.meta.range.to}` : ""),
   );
   L.push(
@@ -646,6 +761,69 @@ export const renderText = (report) => {
       L.push(`  防节流=${g.key}：信号窗口 ${g.windows}、长任务 ${g.longTaskN} 次（≥250ms ${g.longTaskN250}）、慢交互 ${g.slowInputN} 次`);
     }
   }
+
+  h("十、吐字节奏（相邻正文 delta 的到达间隔；p50 ≈ 30–50ms 且 >100ms 占比低 = 流畅）");
+  const ca = report.cadence;
+  /** 一组 cadence 统计的三行 */
+  const cadenceLines = (indent, s) => {
+    L.push(`${indent}每轮 p50 ${D(s.p50, min)}`);
+    L.push(`${indent}每轮 p95 ${D(s.p95, min)}`);
+    L.push(
+      `${indent}全部 ${s.gaps} 个间隔里：>100ms 占 ${pct(s.slowShare)}、>250ms 占 ${pct(s.stallShare)}；` +
+        `整轮被钉住（p50 ≥ ${CADENCE_PINNED_P50_MS}ms）的 run：${s.pinnedRuns}/${s.runs}；每轮最长间隔 ${D(s.maxGap, min)}`,
+    );
+  };
+  if (!ca.text) {
+    L.push("  无数据（记录来自没有该字段的旧版本，或还没有跑过流式回复）");
+  } else {
+    L.push(`  全部 run：n=${ca.text.runs}${ca.text.runs < min ? "（样本少）" : ""}`);
+    cadenceLines("      ", ca.text);
+    const label = { memory: "内存实现（默认）", file: "SDK 落盘（回退开关）", 未知: "未知（旧版本记录）" };
+    L.push("", "  ▸ 按 run_events 实现");
+    for (const g of ca.byRunEvents) {
+      L.push(`  [${label[g.key] ?? g.key}] n=${g.runs}${g.runs < min ? "（样本少）" : ""}`);
+      cadenceLines("      ", g);
+    }
+    if (ca.fileBySize.length > 0) {
+      L.push("", "  ▸ SDK 落盘实现：按 run_events 文件体积（每条事件整文件读写，越大越慢）");
+      for (const g of ca.fileBySize) {
+        L.push(`  [${g.key}] n=${g.runs}${g.runs < min ? "（样本少）" : ""}`);
+        cadenceLines("      ", g);
+      }
+    }
+  }
+  if (ca.thinking) {
+    L.push(
+      "",
+      `  ▸ 思考 delta（不在界面流式展示，仅作存储 / 事件循环压力的旁证）：n=${ca.thinking.runs}；每轮 p50 ${D(ca.thinking.p50, min)}；` +
+        `>100ms 占 ${pct(ca.thinking.slowShare)}`,
+    );
+  }
+  const sc = report.scale;
+  L.push(
+    "",
+    `  ▸ 相关体积：runs.ndjson ${D(sc.runsMB, min, (v) => `${v.toFixed(2)}MB`)}`,
+    `              run_events（SDK 落盘）${D(sc.runEventsFileMB, min, (v) => `${v.toFixed(2)}MB`)}；run_events（内存保留）${D(sc.runEventsMemoryMB, min, (v) => `${v.toFixed(2)}MB`)}`,
+  );
+
+  h("十一、回合收尾（回复已完整后 SDK 迟迟不结束 / 同一句话被回复两遍；只在异常时才有记录）");
+  const wu = report.wrapUp;
+  if (wu.chatRuns === 0 && wu.records === 0) {
+    L.push("  无数据（还没有 chat run，或记录来自没有该日志的旧版本）");
+  } else {
+    L.push(
+      `  同期 chat run ${wu.chatRuns} 个，其中回合结束后收尾异常（>3s / SDK 重放 / 拦过重放消息）${wu.records} 个（${pct(wu.share)}）；` +
+        `SDK 重放（同一条流多个 turn-ended）${wu.replayed} 个；回合结束后 >${WRAPUP_SLOW_MS / 1000}s 才收尾 ${wu.slow} 个`,
+    );
+    L.push(`  回合结束 → SDK 收尾 ${D(wu.settledMs, min)}`);
+    L.push(
+      `  已拦截的重放：thinking ${wu.droppedThinking} 条、正文 ${wu.droppedAssistant} 条（${wu.droppedChars} 字，没有重复上屏）；` +
+        `重放里带的工具调用 ${wu.droppedToolCalls} 次（不拦、仅计数）`,
+    );
+    L.push(
+      `  交叉印证：chat run 里 outcome=ok（turn-ended 后 2s 内没等到终态回调、由埋点兜底收口）${wu.okChatRuns} 个`,
+    );
+  }
   L.push("");
   return L.join("\n");
 };
@@ -682,17 +860,24 @@ export const readJsonl = async (dir, base) => {
   return { records, errors };
 };
 
-/** 读全部四类日志 */
+/** 读全部五类日志 */
 export const loadLogs = async (dir) => {
-  const [run, ui, warmup, lag] = await Promise.all([
+  const [run, ui, warmup, lag, wrapup] = await Promise.all([
     readJsonl(dir, LOG_FILES.run),
     readJsonl(dir, LOG_FILES.ui),
     readJsonl(dir, LOG_FILES.warmup),
     readJsonl(dir, LOG_FILES.lag),
+    readJsonl(dir, LOG_FILES.wrapup),
   ]);
   return {
-    input: { run: run.records, ui: ui.records, warmup: warmup.records, lag: lag.records },
-    parseErrors: run.errors + ui.errors + warmup.errors + lag.errors,
+    input: {
+      run: run.records,
+      ui: ui.records,
+      warmup: warmup.records,
+      lag: lag.records,
+      wrapup: wrapup.records,
+    },
+    parseErrors: run.errors + ui.errors + warmup.errors + lag.errors + wrapup.errors,
   };
 };
 

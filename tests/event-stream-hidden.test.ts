@@ -128,6 +128,20 @@ describe("isHiddenFromEventStream", () => {
     ).toBe(false);
   });
 
+  it("回合收尾提示（meta.turnWrapUp）：chat 里不进事件流，由底部状态行单独呈现", () => {
+    const wrapUp = ev("info", {
+      text: "回复已完成，正在保存会话…",
+      meta: { turnWrapUp: true },
+    });
+    expect(isHiddenFromEventStream(wrapUp, { isChat: true })).toBe(true);
+    // 同样的话如果不是这个 meta 打的标，就是普通 info，照常显示
+    expect(
+      isHiddenFromEventStream(ev("info", { text: "回复已完成，正在保存会话…" }), {
+        isChat: true,
+      }),
+    ).toBe(false);
+  });
+
   it("答题卡 / 普通工作过程不藏", () => {
     expect(
       isHiddenFromEventStream(

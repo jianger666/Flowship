@@ -20,9 +20,20 @@
  * `getSdkStoreHandle()` 的 globalThis 单例获取；GC 等任何要碰 checkpoints 的代码也必须
  * 经这个句柄（见 sdk-store-gc.ts），不得绕过它直接读写 `checkpoints.ndjson`。
  *
+ * ── run_events 内存化（2026-10-10）──
+ * 上面「其余三份小文件」的前提被证伪了：SDK 1.0.37 的本地运行时把每条流式消息都经
+ * `runEvents.append` 落盘、`run.stream()` 再经 `runEvents.list` 读回来——run_events 是吐字的
+ * 传输通道，而 SDK 自带实现每次 append / list 都整文件读入 + 逐行 JSON.parse（append 还整文件重写），
+ * 18.5MB 时单次 append 243ms、阻塞事件循环、吐字被钉死在每秒个位数事件、主线程常年 85%+。
+ * 所以 runEvents 这一层也替换掉：`memory-run-events.ts`（内存、O(1)，Flowship 不读历史事件，
+ * 详见该文件头注释）。首次打开时旧的 `run_events.ndjson` 被挪进 `.quarantine/`（可逆）。
+ * agents / runs 两个小文件仍用 SDK 自带实现。
+ *
  * 一键回退（任一即可，重启生效）：
  *   - 环境变量 `FLOWSHIP_SDK_STORE=sdk`；
  *   - 在 `<dataRoot>/sdk-agent-store/` 下新建空文件 `USE_SDK_STORE`（桌面包用户最方便）。
+ *   上面两个回退的是整个 store（checkpoints + run_events 都回到 SDK 自带实现）。只回退 run_events：
+ *   - 环境变量 `FLOWSHIP_SDK_RUN_EVENTS=file`，或 store 目录下新建空文件 `USE_SDK_RUN_EVENTS`。
  * 预热（建索引）失败时自动回退到 SDK 自带实现——此时尚无任何写入，回退是安全的。
  *
  * 单例挂 globalThis：dev HMR / 多 route chunk 不能各 new 一份，resume 要对上同一目录。
@@ -35,6 +46,8 @@ import type { LocalAgentStore } from "@cursor/sdk";
 
 import { dataRoot, ensurePrivateDir } from "./data-root";
 import { FastCheckpoints } from "./fast-checkpoint-store";
+import { MemoryRunEvents } from "./memory-run-events";
+import { archiveLegacyRunEvents } from "./sdk-store-quarantine";
 
 export const SDK_AGENT_STORE_DIRNAME = "sdk-agent-store";
 
@@ -62,6 +75,27 @@ export const resolveSdkStoreMode = (
   return markerExists ? "sdk" : "fast";
 };
 
+/** 回退开关（只管 run_events）：环境变量。`file` = 用 SDK 自带的落盘实现；`memory` = 强制内存版。 */
+export const SDK_RUN_EVENTS_ENV = "FLOWSHIP_SDK_RUN_EVENTS" as const;
+/** 回退开关（只管 run_events）：store 目录下存在此文件名的文件 = 用 SDK 自带的落盘实现。 */
+export const SDK_RUN_EVENTS_MARKER = "USE_SDK_RUN_EVENTS" as const;
+
+export type RunEventsMode = "memory" | "file";
+
+/**
+ * 纯函数：决定 run_events 用哪套实现。口径与 `resolveSdkStoreMode` 一致：
+ * 环境变量显式值优先；其余（含拼写错误）看标记文件；都没有 = memory。
+ */
+export const resolveRunEventsMode = (
+  env: Record<string, string | undefined>,
+  markerExists: boolean,
+): RunEventsMode => {
+  const v = (env[SDK_RUN_EVENTS_ENV] ?? "").trim().toLowerCase();
+  if (v === "file") return "file";
+  if (v === "memory") return "memory";
+  return markerExists ? "file" : "memory";
+};
+
 export interface SdkStoreHandle {
   /** 传给 SDK 的 `local.store` */
   readonly store: LocalAgentStore;
@@ -70,6 +104,10 @@ export interface SdkStoreHandle {
   readonly dir: string;
   /** 仅 mode === "fast" 有值：GC 经它读「本进程写过的 agent」，checkpoints 的删除也走 `store.checkpoints` */
   readonly fast: FastCheckpoints | null;
+  /** run_events 的实现：memory = MemoryRunEvents；file = SDK 自带落盘实现 */
+  readonly runEvents: RunEventsMode;
+  /** 仅 runEvents === "memory" 有值：遥测（run 汇总里记事件条数 / 内存）经它读 */
+  readonly memoryRunEvents: MemoryRunEvents | null;
 }
 
 type JsonlCtor = typeof CursorSdk.JsonlLocalAgentStore;
@@ -140,17 +178,25 @@ export const openSdkStore = async (
     env,
     await fileExists(path.join(dir, SDK_STORE_MARKER)),
   );
+  const sdkOnly = (): SdkStoreHandle => ({
+    store: base,
+    mode: "sdk",
+    dir,
+    fast: null,
+    runEvents: "file",
+    memoryRunEvents: null,
+  });
   if (mode === "sdk") {
     console.log(
       `[sdk-store] 使用 SDK 自带 JSONL store（开关回退：${SDK_STORE_ENV}=sdk 或 ${SDK_STORE_MARKER} 标记文件）`,
     );
-    return { store: base, mode: "sdk", dir, fast: null };
+    return sdkOnly();
   }
   if (!sdk.compose || !sdk.paginate) {
     console.warn(
       "[sdk-store] 当前 @cursor/sdk 缺少 composeLocalAgentStore / paginateCheckpointBlobIds，回退 SDK 自带实现",
     );
-    return { store: base, mode: "sdk", dir, fast: null };
+    return sdkOnly();
   }
 
   const fast = new FastCheckpoints(dir, sdk.paginate);
@@ -164,15 +210,54 @@ export const openSdkStore = async (
   } catch (err) {
     // 预热只读文件、没有任何写入，丢弃实例回退到 SDK 自带实现是安全的
     console.warn("[sdk-store] fast 预热失败，回退 SDK 自带实现：", err);
-    return { store: base, mode: "sdk", dir, fast: null };
+    return sdkOnly();
   }
-  const store = sdk.compose({
-    agents: base.agents,
-    checkpoints: fast,
-    runs: base.runs,
-    runEvents: base.runEvents,
-  });
-  return { store, mode: "fast", dir, fast };
+
+  const runEventsMode = resolveRunEventsMode(
+    env,
+    await fileExists(path.join(dir, SDK_RUN_EVENTS_MARKER)),
+  );
+  const memoryRunEvents =
+    runEventsMode === "memory" ? new MemoryRunEvents() : null;
+
+  let store: LocalAgentStore;
+  try {
+    store = sdk.compose({
+      agents: base.agents,
+      checkpoints: fast,
+      runs: base.runs,
+      runEvents: memoryRunEvents ?? base.runEvents,
+    });
+  } catch (err) {
+    // SDK 升级后 compose 还在、行为却变了并抛错：和预热失败同理——此时尚无任何写入，
+    // 丢弃 fast 实例回退 SDK 自带实现是安全的。总好过让每一次创建 agent 都抛错。
+    console.warn("[sdk-store] composeLocalAgentStore 失败，回退 SDK 自带实现：", err);
+    return sdkOnly();
+  }
+
+  if (memoryRunEvents) {
+    // compose 成功之后才动磁盘：上面任何一步回退到 SDK 自带实现时，旧文件都还在原处
+    const archived = await archiveLegacyRunEvents(dir);
+    console.log(
+      `[sdk-store] run_events 使用内存实现（SDK 自带实现每条事件整文件读写，吐字会被拖慢）` +
+        (archived.status === "archived"
+          ? `；旧 run_events.ndjson ${mb(archived.bytes ?? 0)}MB 已归档到 ${archived.file}`
+          : "") +
+        `（回退：${SDK_RUN_EVENTS_ENV}=file 或在 ${dir} 下建空文件 ${SDK_RUN_EVENTS_MARKER}，重启生效）`,
+    );
+  } else {
+    console.log(
+      `[sdk-store] run_events 使用 SDK 自带落盘实现（开关：${SDK_RUN_EVENTS_ENV}=file / ${SDK_RUN_EVENTS_MARKER}）`,
+    );
+  }
+  return {
+    store,
+    mode: "fast",
+    dir,
+    fast,
+    runEvents: runEventsMode,
+    memoryRunEvents,
+  };
 };
 
 type G = typeof globalThis & {

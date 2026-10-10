@@ -867,10 +867,19 @@ export const captureChatCheckpoint = async (
   const elapsedMsByRepo: Record<string, number> = {};
   const warnings: string[] = [];
 
-  for (const repoPath of paths) {
-    const t0 = Date.now();
-    const snap = await snapshotRepoTree(repoPath);
-    elapsedMsByRepo[repoPath] = Date.now() - t0;
+  // 多仓并行：每个仓一份独立的临时 index、互不碰真实 index / 工作区，没有串行的理由；
+  // 串行时绑 N 个仓的 chat 每次发送都要多等 (N-1)×~0.4s（这段在 agent.send 之前、用户干等）。
+  // 汇总严格按入参顺序（不是完成先后）——repoSnapshots 的顺序会落进 rewind 点、
+  // 与 task.repoPaths 的「第一项是 cwd」语义对齐
+  const results = await Promise.all(
+    paths.map(async (repoPath) => {
+      const t0 = Date.now();
+      const snap = await snapshotRepoTree(repoPath);
+      return { repoPath, snap, ms: Date.now() - t0 };
+    }),
+  );
+  for (const { repoPath, snap, ms } of results) {
+    elapsedMsByRepo[repoPath] = ms;
     if ("error" in snap) {
       warnings.push(`${repoPath}: ${snap.error}`);
       continue;

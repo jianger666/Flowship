@@ -54,6 +54,8 @@ import {
 } from "./win-update-guard.mjs";
 // 防后台节流实验开关（v1.9.28、默认关）：纯函数在 ./app-nap.mjs（单测直接 import）
 import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
+// NODE_OPTIONS 取值含空格时的引用（崩溃取证目录在 macOS 的「Application Support」下）：./node-options.mjs
+import { quoteNodeOptionValue } from "./node-options.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -318,7 +320,9 @@ const startServer = () => {
   // `heap out of memory` → server 退出 code=? → 壳弹「服务异常退出」）。server 是独立子进程，
   // 这里的 NODE_OPTIONS 只影响它，不污染用户 shell / agent 子进程（cap 只设上限、不预分配）。
   // 已有 max-old-space-size（用户手动调过）则不动，避免覆盖手工值。
-  // TODO：split(" ") 遇到带空格的引用路径会切碎；NODE_OPTIONS 里极少有这种值，先不处理。
+  // split(" ") + join(" ") 对单空格分隔是无损的：用户自带的带引号取值（`--x="a b"`）被切成两段、
+  // 再用同一个空格接回，原样保留。**我们自己追加**的取值若含空格必须用 quoteNodeOptionValue 加引号，
+  // 否则 Node 只取空格前那一截（report-directory 曾因此落到不存在的目录、取证报告写不出来）。
   // mem-governance③ [设计决策]：恒带堆上限 + 崩溃取证。漏带旧路径实测 2.5GB 即崩。
   // ③只抬天花板、不改变增长曲线形状；取证 report 含 transcript 级数据，落盘到数据目录并只留最近 5 份。
   // P3-2：report-directory 落地 + 启动时轮转（默认落 cwd、无界累积）。
@@ -357,7 +361,9 @@ const startServer = () => {
     /* 轮转失败不挡启动 */
   }
   if (!serverNodeOptions.some((o) => o.includes("report-directory"))) {
-    serverNodeOptions.push(`--report-directory=${nodeReportDir}`);
+    serverNodeOptions.push(
+      `--report-directory=${quoteNodeOptionValue(nodeReportDir)}`,
+    );
   }
   const proc = spawn(serverNodeBin(), [serverJs], {
     env: {

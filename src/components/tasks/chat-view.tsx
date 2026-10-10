@@ -50,6 +50,8 @@ import {
   subscribeChatOp,
 } from "@/lib/chat-op-ledger";
 import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
+import { classifyPendingBubble } from "@/lib/chat-pending-display";
+import { appendThinkingText, type LiveThinking } from "@/lib/thinking-live";
 import { buildInputHistory } from "@/lib/composer-history";
 import {
   allocClientChatQueueItemId,
@@ -126,6 +128,34 @@ export const ChatView = ({
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
   // （Codex 式平滑追赶 + rAF 合帧逻辑在 use-smooth-streaming.ts，与任务详情页共用）
   const { streamingText, pushDelta, clearStreaming } = useSmoothStreaming();
+  // 思考实时态（thinking_delta 帧）：累积本段思考原文，交给事件流合成一条「进行中的
+  // thinking 事件」放进工作过程流程，由已有的思考行渲染。落盘后那条 thinking 事件与它同 id
+  // （服务端预定），是同一个 React 节点——用户点开着读的内容不会被收起。
+  // 为什么需要：一段思考要攒到结束才落一条 thinking 事件，期间事件流纹丝不动——
+  // 实测一段 65s 的思考（模型第 6s 就开始了）让界面干写了 70s「等待模型响应…」。
+  // null = 没在思考。ref 与 state 同步更新：ref 让 clear 能先判空挡掉（见下）。
+  // 服务端已 250ms 节流，这里不必再合帧。
+  const [thinkingLive, setThinkingLive] = useState<LiveThinking | null>(null);
+  const thinkingRef = useRef<LiveThinking | null>(null);
+  const clearThinkingLive = useCallback(() => {
+    // ref 判空先挡掉：落盘事件 / assistant_delta 每条都会走到这里，绝大多数时候没在思考
+    if (thinkingRef.current === null) return;
+    thinkingRef.current = null;
+    setThinkingLive(null);
+  }, []);
+  const pushThinkingDelta = useCallback((text: string, id: string) => {
+    const prev = thinkingRef.current;
+    // 同一段（id 相同）才累积；id 变了 = 新的一段——上一段没来得及清掉的文本不能接在前面
+    const sameSegment = prev !== null && prev.id === id;
+    const next: LiveThinking = {
+      id,
+      text: appendThinkingText(sameSegment ? prev.text : "", text),
+      // 起点 = 收到本段首帧的时刻，同一段内不变（合成事件的 ts、行上 hover 显示的时间）
+      since: sameSegment ? prev.since : Date.now(),
+    };
+    thinkingRef.current = next;
+    setThinkingLive(next);
+  }, []);
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -149,6 +179,12 @@ export const ChatView = ({
   // 与 pending 同步：onDone 需读最新值（避免闭包陈旧）
   const pendingLocalRepliesRef = useRef(pendingLocalReplies);
   pendingLocalRepliesRef.current = pendingLocalReplies;
+  // itemId → 提交那一刻 run 是否已在跑（true = 排队消息）。登记时写、渲染时读；
+  // 只有事件处理器写它，写完紧跟的 ledger dispatch 会触发重渲染，读到的一定是新值
+  const queuedAtSubmitRef = useRef<Map<string, boolean>>(new Map());
+  // run 进行中 latch 的 ref 镜像（handleUserReply 不把 runActive 放进依赖，免得每次 run 状态变化重建回调）
+  const runActiveRef = useRef(false);
+  runActiveRef.current = runActive;
   // settled / outcomes 用 ref（不触发渲染）；与 pending 组成完整 ledger
   const opSettledRef = useRef<string[]>([]);
   const opOutcomesRef = useRef<ChatOpState["outcomes"]>({});
@@ -208,16 +244,20 @@ export const ChatView = ({
   // 切 task：清 streaming 等 UI 态；订阅当前 task ledger
   useEffect(() => {
     clearStreaming();
+    // 上个任务的「思考中」不能串到新任务
+    clearThinkingLive();
     // 切走时作废旧提交锁，避免 A finally 误清 B、也避免 UI 锁残留
     submitTokenRef.current = null;
     setIsSubmitting(false);
     setStopping(false);
     setLiveToolOutputs({});
     setRunActive(false);
+    // 排队快照只对「本次挂载内登记的占位」有意义；切走后丢掉，免得越攒越多
+    queuedAtSubmitRef.current = new Map();
     // 立即投影当前 ledger，再订阅后续 dispatch
     applyLedgerToUi(getChatOpLedger(task.id));
     return subscribeChatOp(task.id, applyLedgerToUi);
-  }, [task.id, applyLedgerToUi, clearStreaming]);
+  }, [task.id, applyLedgerToUi, clearStreaming, clearThinkingLive]);
 
   // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松开——
   // 交卷后（awaiting_ack）run 还在流式吐消息时、输入框 loading 不会提前关掉。
@@ -225,10 +265,23 @@ export const ChatView = ({
     if (task.runStatus === "running") setRunActive(true);
   }, [task.runStatus]);
 
-  // 是否渲染本地占位只看 persistence（与 terminal/network 轴正交）
+  // 是否渲染本地占位只看 persistence（与 terminal/network 轴正交）；
+  // 展示分类 mode（立即发送 / 排队 / 状态不明）见 lib/chat-pending-display：
+  // 排队与否取「提交那一刻 run 是否在跑」的快照（登记时记入 queuedAtSubmitRef），
+  // 不能渲染时看 runActive——受理（running）早于 user_reply 落盘，会把立即发送误判成排队、气泡来回闪。
+  // 没登记过的占位（刷新页面后从 sessionStorage 恢复的）才退回「当前 run 是否在跑」兜底。
   const pendingForStream = useMemo(
-    () => pendingLocalReplies.filter((p) => !shouldHideLocalPlaceholder(p)),
-    [pendingLocalReplies],
+    () =>
+      pendingLocalReplies
+        .filter((p) => !shouldHideLocalPlaceholder(p))
+        .map((p) => ({
+          ...p,
+          mode: classifyPendingBubble({
+            uncertain: p.uncertain,
+            queued: queuedAtSubmitRef.current.get(p.itemId) ?? runActive,
+          }),
+        })),
+    [pendingLocalReplies, runActive],
   );
 
   useTaskWatch(task.id, {
@@ -246,6 +299,11 @@ export const ChatView = ({
       }
       // 双保险：其它 ephemeral 也不落盘
       if (isEphemeralToolOutputDelta(ev)) return;
+
+      // 任何落盘事件到达 = 这段思考已经有正式内容（thinking 事件本身 / 紧随的工具 / 正文）
+      // 或新一轮开始（user_reply）——实时「思考中」到此为止。服务端保证实时帧不会晚于
+      // 它之后的落盘事件到达（段结束先丢尾巴再落盘），所以这里清了不会被幽灵帧复活
+      clearThinkingLive();
 
       // tool_result 到达 → 清掉该 callId 的直播缓冲（最终 output 在 meta）
       if (ev.kind === "tool_result") {
@@ -312,6 +370,7 @@ export const ChatView = ({
     },
     onDone: (t) => {
       clearStreaming();
+      clearThinkingLive();
       setLiveToolOutputs({});
       setRunActive(false);
       const remaining = pendingLocalRepliesRef.current.length;
@@ -330,7 +389,12 @@ export const ChatView = ({
       if (!canCommitTaskSnapshot(t.id)) return;
       onTaskUpdateRef.current(t);
     },
-    onAssistantDelta: pushDelta,
+    // 正文开始流 = 思考结束了：先清「思考中」再拼字（ref 判空、几乎零成本）
+    onAssistantDelta: (text) => {
+      clearThinkingLive();
+      pushDelta(text);
+    },
+    onThinkingDelta: pushThinkingDelta,
     // msg 已是 runner 拼好的可读文案（「Chat agent 异常：…」），别再套一层
     // 「watch 出错」——那会误导成 SSE 断了，实际是 agent 挂了
     onErrorMessage: (msg) => toast.error(msg),
@@ -338,6 +402,7 @@ export const ChatView = ({
     // task_deleted / watch 410 → 清 pending/streaming + ledger，再走统一 sink
     onTaskDeleted: (deletedId) => {
       clearStreaming();
+      clearThinkingLive();
       setLiveToolOutputs({});
       dispatchChatOp(deletedId, { type: "clear_all" });
       clearChatOpLedger(deletedId);
@@ -385,7 +450,11 @@ export const ChatView = ({
       let clientItemId =
         reuseUncertain?.itemId ?? allocClientChatQueueItemId();
 
+      // 提交这一刻 run 是否已在跑：是 → 这条是排队消息（别在渲染时再判，见 pendingForStream 注释）
+      const queuedNow =
+        task.runStatus === "running" || runActiveRef.current;
       const registerOp = (itemId: string) => {
+        queuedAtSubmitRef.current.set(itemId, queuedNow);
         dispatchChatOp(operationTaskId, {
           type: "register",
           op: {
@@ -528,6 +597,7 @@ export const ChatView = ({
     try {
       const latest = await stopTask(task.id);
       clearStreaming();
+      clearThinkingLive();
       // stop 后只清已有明确终态；其余等 queue_failed / message_op
       const result = dispatchChatOp(task.id, { type: "done_clear" });
       if (canCommitTaskSnapshot(latest.id)) {
@@ -545,7 +615,7 @@ export const ChatView = ({
     } finally {
       setStopping(false);
     }
-  }, [task.id, clearStreaming]);
+  }, [task.id, clearStreaming, clearThinkingLive]);
 
   const handleStop = useCallback(async () => {
     await stopAgentCore();
@@ -740,6 +810,7 @@ export const ChatView = ({
           variant="chat"
           streamingText={streamingText}
           liveToolOutputs={liveToolOutputs}
+          liveThinking={thinkingLive}
           onUserReply={handleUserReply}
           canReply={canReply}
           submitting={isSubmitting}

@@ -10,12 +10,16 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FastCheckpoints } from "@/lib/server/fast-checkpoint-store";
+import { MemoryRunEvents } from "@/lib/server/memory-run-events";
 import {
   __resetSdkStoreHandleForTests,
   getSdkStoreHandle,
   openSdkStore,
+  resolveRunEventsMode,
   resolveSdkStoreMode,
   SDK_AGENT_STORE_DIRNAME,
+  SDK_RUN_EVENTS_ENV,
+  SDK_RUN_EVENTS_MARKER,
   SDK_STORE_ENV,
   SDK_STORE_MARKER,
   withCursorJsonlStore,
@@ -36,6 +40,7 @@ import {
 
 const prevDataDir = process.env.FLOWSHIP_DATA_DIR;
 const prevMode = process.env[SDK_STORE_ENV];
+const prevRunEventsMode = process.env[SDK_RUN_EVENTS_ENV];
 
 /** 吞掉启动日志（避免测试输出噪声），需要断言告警时用返回值 */
 const quiet = () => ({
@@ -45,6 +50,7 @@ const quiet = () => ({
 
 beforeEach(() => {
   delete process.env[SDK_STORE_ENV];
+  delete process.env[SDK_RUN_EVENTS_ENV];
   __resetSdkStoreHandleForTests();
 });
 
@@ -55,6 +61,8 @@ afterEach(() => {
   else process.env.FLOWSHIP_DATA_DIR = prevDataDir;
   if (prevMode === undefined) delete process.env[SDK_STORE_ENV];
   else process.env[SDK_STORE_ENV] = prevMode;
+  if (prevRunEventsMode === undefined) delete process.env[SDK_RUN_EVENTS_ENV];
+  else process.env[SDK_RUN_EVENTS_ENV] = prevRunEventsMode;
   cleanupTmps();
 });
 
@@ -75,15 +83,36 @@ describe("resolveSdkStoreMode 真值表", () => {
   });
 });
 
+describe("resolveRunEventsMode 真值表", () => {
+  it.each([
+    [{}, false, "memory"],
+    [{}, true, "file"],
+    [{ [SDK_RUN_EVENTS_ENV]: "file" }, false, "file"],
+    [{ [SDK_RUN_EVENTS_ENV]: " FILE " }, false, "file"],
+    [{ [SDK_RUN_EVENTS_ENV]: "file" }, true, "file"],
+    [{ [SDK_RUN_EVENTS_ENV]: "memory" }, true, "memory"], // 显式 memory 压过标记文件
+    [{ [SDK_RUN_EVENTS_ENV]: "memory" }, false, "memory"],
+    [{ [SDK_RUN_EVENTS_ENV]: "" }, true, "file"],
+    [{ [SDK_RUN_EVENTS_ENV]: "typo" }, false, "memory"], // 拼写错误忽略，不当成回退
+    [{ [SDK_RUN_EVENTS_ENV]: "typo" }, true, "file"],
+  ] as const)("env=%j marker=%s → %s", (env, marker, want) => {
+    expect(resolveRunEventsMode(env, marker)).toBe(want);
+  });
+});
+
 describe("openSdkStore：模式选择与回退", () => {
-  it("默认：checkpoints 换成 FastCheckpoints，其余三份仍是 SDK 自带实现", async () => {
+  it("默认：checkpoints 换成 FastCheckpoints、run_events 换成内存实现，agents / runs 仍是 SDK 自带实现", async () => {
     quiet();
     const dir = mkTmp();
     const h = await openSdkStore(dir, {});
     expect(h?.mode).toBe("fast");
     expect(h?.fast).toBeInstanceOf(FastCheckpoints);
     expect(h?.store.checkpoints).toBe(h?.fast);
+    expect(h?.runEvents).toBe("memory");
+    expect(h?.memoryRunEvents).toBeInstanceOf(MemoryRunEvents);
+    expect(h?.store.runEvents).toBe(h?.memoryRunEvents);
     expect(h?.store.agents).not.toBeInstanceOf(FastCheckpoints);
+    expect(h?.store.runs).not.toBeInstanceOf(MemoryRunEvents);
     expect(h?.dir).toBe(dir);
   });
 
@@ -95,6 +124,10 @@ describe("openSdkStore：模式选择与回退", () => {
     expect(h?.fast).toBeNull();
     expect(h?.store.checkpoints).not.toBeInstanceOf(FastCheckpoints);
     expect(warmUp).not.toHaveBeenCalled();
+    // 整体回退：run_events 也回到 SDK 自带的落盘实现
+    expect(h?.runEvents).toBe("file");
+    expect(h?.memoryRunEvents).toBeNull();
+    expect(h?.store.runEvents).not.toBeInstanceOf(MemoryRunEvents);
   });
 
   it("标记文件 USE_SDK_STORE 存在：用 SDK 自带实现（桌面包的一键回退）", async () => {
@@ -131,11 +164,136 @@ describe("openSdkStore：模式选择与回退", () => {
   });
 });
 
-describe("openSdkStore：与 SDK 原实现互操作", () => {
-  it("四个子 store 都可用，落盘内容 SDK 原实现全部读得到", async () => {
+describe("openSdkStore：run_events 内存化与旧文件归档", () => {
+  const legacyFile = (dir: string): string => path.join(dir, "run_events.ndjson");
+  const legacyContent =
+    '{"runId":"old-run","seq":1,"offset":"1","eventType":"run_stream_event","payload":{"x":1},"payloadRef":null,"idempotencyKey":null,"createdAt":"2026-10-09T00:00:00.000Z"}\n' +
+    '{"runId":"old-run","seq":2,"offset":"2","eventType":"run_stream_event","payload":{"x":2},"payloadRef":null,"idempotencyKey":null,"createdAt":"2026-10-09T00:00:01.000Z"}\n';
+  const quarantined = (dir: string): string[] => {
+    try {
+      return fs.readdirSync(path.join(dir, ".quarantine"));
+    } catch {
+      return [];
+    }
+  };
+
+  it("默认：旧 run_events.ndjson 被挪进 .quarantine（内容不变）；新事件只在内存里，不再落盘", async () => {
     quiet();
     const dir = mkTmp();
+    fs.writeFileSync(legacyFile(dir), legacyContent);
+
     const h = await openSdkStore(dir, {});
+    expect(h?.runEvents).toBe("memory");
+
+    expect(fs.existsSync(legacyFile(dir))).toBe(false);
+    const archived = quarantined(dir).filter((n) => n.startsWith("run_events-"));
+    expect(archived).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dir, ".quarantine", archived[0]), "utf8")).toBe(legacyContent);
+
+    // 经 store 读写 run 事件：内存里正常，且不会再把文件建出来 / 写大
+    for (let i = 0; i < 20; i++) {
+      await h!.store.runEvents.append({ runId: "r1", eventType: "run_stream_event", payload: { i } });
+    }
+    const page = await h!.store.runEvents.list({ runId: "r1", afterOffset: "17" });
+    expect(page.items.map((x) => x.seq)).toEqual([18, 19, 20]);
+    expect(fs.existsSync(legacyFile(dir)) ? fs.statSync(legacyFile(dir)).size : 0).toBe(0);
+  });
+
+  it("没有旧文件的新库：不建旁路目录", async () => {
+    quiet();
+    const dir = mkTmp();
+    await openSdkStore(dir, {});
+    expect(fs.existsSync(path.join(dir, ".quarantine"))).toBe(false);
+  });
+
+  it("环境变量 file / 标记文件 USE_SDK_RUN_EVENTS：run_events 回到 SDK 自带落盘实现，旧文件原样不动", async () => {
+    quiet();
+    for (const via of ["env", "marker"] as const) {
+      const dir = mkTmp();
+      fs.writeFileSync(legacyFile(dir), legacyContent);
+      if (via === "marker") fs.writeFileSync(path.join(dir, SDK_RUN_EVENTS_MARKER), "");
+
+      const h = await openSdkStore(dir, via === "env" ? { [SDK_RUN_EVENTS_ENV]: "file" } : {});
+      expect(h?.mode, via).toBe("fast"); // checkpoints 仍是 fast
+      expect(h?.runEvents, via).toBe("file");
+      expect(h?.memoryRunEvents, via).toBeNull();
+      expect(h?.store.runEvents, via).not.toBeInstanceOf(MemoryRunEvents);
+      expect(fs.readFileSync(legacyFile(dir), "utf8"), via).toBe(legacyContent);
+      expect(quarantined(dir), via).toEqual([]);
+
+      // 回退后的 run 事件走 SDK 实现、真的落盘
+      await h!.store.runEvents.append({ runId: "new-run", eventType: "t", payload: 1 });
+      const sdk = await loadSdk();
+      const ref = new sdk.JsonlLocalAgentStore(dir);
+      expect((await ref.runEvents.list({ runId: "new-run" })).items, via).toHaveLength(1);
+      expect((await ref.runEvents.list({ runId: "old-run" })).items, via).toHaveLength(2);
+    }
+  });
+
+  it("整体回退（FLOWSHIP_SDK_STORE=sdk）：旧文件同样不动", async () => {
+    quiet();
+    const dir = mkTmp();
+    fs.writeFileSync(legacyFile(dir), legacyContent);
+    const h = await openSdkStore(dir, { [SDK_STORE_ENV]: "sdk" });
+    expect(h?.runEvents).toBe("file");
+    expect(fs.readFileSync(legacyFile(dir), "utf8")).toBe(legacyContent);
+    expect(quarantined(dir)).toEqual([]);
+  });
+
+  it("预热失败回退 SDK 自带实现：旧文件还在原处（归档只在 compose 成功之后才动磁盘）", async () => {
+    quiet();
+    vi.spyOn(FastCheckpoints.prototype, "warmUp").mockRejectedValueOnce(new Error("boom"));
+    const dir = mkTmp();
+    fs.writeFileSync(legacyFile(dir), legacyContent);
+
+    const h = await openSdkStore(dir, {});
+    expect(h?.mode).toBe("sdk");
+    expect(h?.runEvents).toBe("file");
+    expect(fs.readFileSync(legacyFile(dir), "utf8")).toBe(legacyContent);
+    expect(quarantined(dir)).toEqual([]);
+  });
+
+  it("切回 file 模式不会崩：归档之后文件不存在，SDK 实现当空库读写", async () => {
+    quiet();
+    const dir = mkTmp();
+    fs.writeFileSync(legacyFile(dir), legacyContent);
+    await openSdkStore(dir, {}); // 默认：归档
+    const back = await openSdkStore(dir, { [SDK_RUN_EVENTS_ENV]: "file" });
+    expect((await back!.store.runEvents.list({ runId: "old-run" })).items).toEqual([]);
+    await back!.store.runEvents.append({ runId: "x", eventType: "t", payload: 1 });
+    expect((await back!.store.runEvents.list({ runId: "x" })).items).toHaveLength(1);
+  });
+
+  it("GC 的删除路径：经组合后的 store 删 run / agent，不会重新生成大文件，也不抛", async () => {
+    quiet();
+    const dir = mkTmp();
+    fs.writeFileSync(legacyFile(dir), legacyContent);
+    const h = await openSdkStore(dir, {});
+    const { store } = h!;
+    const now = Date.now();
+    await store.agents.create({
+      agent: { agentId: "ag-1", cwd: "/w", status: "idle", createdAt: now, updatedAt: now },
+    });
+    await store.runs.create({
+      run: { runId: "r1", agentId: "ag-1", turnNumber: 1, status: "finished", createdAt: now, updatedAt: now },
+    });
+    await store.runEvents.append({ runId: "r1", eventType: "t", payload: 1 });
+
+    // 与 sdk-store-gc.ts 一致：先 runEvents.delete（内存版），再 runs.delete（SDK 自带 runs，内部会去删它那份文件里的事件）
+    await store.runEvents.delete({ filter: { runIds: ["r1"] } });
+    await expect(store.runs.delete({ filter: { agentIds: ["ag-1"] } })).resolves.toBeUndefined();
+    await expect(store.agents.delete({ filter: { agentIds: ["ag-1"] } })).resolves.toBeUndefined();
+    expect(await store.runEvents.list({ runId: "r1" })).toEqual({ items: [] });
+    // SDK 的 runs.delete 顺手建的空文件无所谓，但不会有内容
+    expect(fs.existsSync(legacyFile(dir)) ? fs.statSync(legacyFile(dir)).size : 0).toBe(0);
+  });
+});
+
+describe("openSdkStore：与 SDK 原实现互操作", () => {
+  it("四个子 store 都可用，落盘内容 SDK 原实现全部读得到（run_events 用落盘实现）", async () => {
+    quiet();
+    const dir = mkTmp();
+    const h = await openSdkStore(dir, { [SDK_RUN_EVENTS_ENV]: "file" });
     expect(h?.mode).toBe("fast");
     const { store } = h!;
     const now = Date.now();
@@ -203,8 +361,9 @@ describe("openSdkStore：与 SDK 原实现互操作", () => {
     const h = await openSdkStore(dir, {});
     await seed(h!.store.checkpoints, 50);
     const json = JSON.stringify(h!.store);
-    const back = JSON.parse(json) as { checkpoints: unknown };
+    const back = JSON.parse(json) as { checkpoints: unknown; runEvents: unknown };
     expect(back.checkpoints).toEqual({ kind: "fast-checkpoints", file: fileOf(dir) });
+    expect(back.runEvents).toEqual({ kind: "memory-run-events" });
     expect(json.length).toBeLessThan(2000);
   }, 30_000);
 });

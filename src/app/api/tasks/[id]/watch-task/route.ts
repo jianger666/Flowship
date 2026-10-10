@@ -208,6 +208,15 @@ export const GET = async (req: Request, { params }: Ctx) => {
           case "assistant_delta":
             send({ type: "assistant_delta", text: ev.text });
             break;
+          // 思考实时帧（纯内存、不落盘）：思考进行中让 UI 把「进行中的 thinking 行」画进流程；
+          // eventId 与这段思考落盘后的事件 id 一致
+          case "thinking_delta":
+            send({
+              type: "thinking_delta",
+              text: ev.text,
+              eventId: ev.eventId,
+            });
+            break;
           // 队列整队失败控制帧（纯内存、不落盘）
           case "queue_failed":
             send({

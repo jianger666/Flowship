@@ -145,3 +145,31 @@ export const extractActiveBootStage = (
   }
   return null;
 };
+
+// ---------- 回合收尾提示（回复已完整，SDK 还在收尾） ----------
+
+/**
+ * 是否是「回复已完成、SDK 还在收尾」的 ephemeral 提示 info。
+ * server 端 chat-runner.publishTurnWrapUp 打的 meta.turnWrapUp：
+ * turn-ended（回复已完整落盘）之后 3 秒 SDK 仍没收尾才发，不落盘、reload 后天然消失。
+ */
+export const isTurnWrapUpInfo = (
+  ev: Pick<TaskEvent, "kind" | "meta">,
+): boolean => ev.kind === "info" && ev.meta?.turnWrapUp === true;
+
+/**
+ * 当前是不是「回复已完成、等 SDK 收尾」态：尾部连续的 info 里有收尾提示。
+ *
+ * 只往回跳过 info：撞到任何非 info 事件（又有工具 / 正文 / 新的用户消息 / 增量）
+ * 就说明回合又动起来了或是新一轮，旧提示作废。所以最坏只扫尾部那一小段 info，
+ * 在 liveToolOutputs 每个 delta 都触发重算的路径上也是 O(1)。
+ * 调用方只在 isRunning 时用；run 一结束整行自然消失。
+ */
+export const hasActiveTurnWrapUp = (events: readonly TaskEvent[]): boolean => {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]!;
+    if (isTurnWrapUpInfo(ev)) return true;
+    if (ev.kind !== "info") return false;
+  }
+  return false;
+};

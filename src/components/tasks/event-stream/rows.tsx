@@ -64,7 +64,9 @@ import {
   isAskSkipped,
   isAskSuperseded,
 } from "@/lib/ask-pending";
+import type { PendingBubbleMode } from "@/lib/chat-pending-display";
 import { shouldCollapseUserMessage } from "@/lib/chat-stream-display";
+import { isLiveThinkingMeta } from "@/lib/chat-turns";
 import { formatDurationPrecise } from "@/lib/duration-display";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
@@ -72,6 +74,7 @@ import { pathBasename } from "@/lib/path-utils";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { useJumpIde, useSubmitShortcut } from "@/hooks/use-settings";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
+import { THINKING_TEXT_MAX, thinkingTextToLine } from "@/lib/thinking-live";
 import { isInTurnToolErrorEvent } from "@/lib/tool-display";
 import {
   JUMP_IDE_LABEL,
@@ -200,11 +203,15 @@ const ProcessEventRow = ({
   isThinking,
   onToggle,
 }: ProcessEventRowProps) => {
+  // 进行中的思考（chat-turns 的 attachLiveThinking 合成、带 meta.live）：和落盘后的思考行是
+  // 同一个组件、同一个外观，只多一个转圈。落盘事件没有这个标记，转圈随之消失。
+  const isLive = isLiveThinkingMeta(ev);
   // 思考耗时：SDK 给的 thinking_duration_ms，mergeAdjacentThinking 已把连续几段累加好。
   // 工具块 / 工作过程组都显示耗时，唯独思考一直没显示（Claude Code / Cursor 都有「Thought for 12s」）
-  const thinkingDuration = isThinking
-    ? formatDurationPrecise(ev.meta?.durationMs)
-    : null;
+  // 进行中不显示：耗时要等这段思考结束才有；并进已落盘思考行时 meta 里带的还是上一段的耗时，
+  // 显示出来会误导
+  const thinkingDuration =
+    isThinking && !isLive ? formatDurationPrecise(ev.meta?.durationMs) : null;
   return (
   <div className="group/proc">
     <button
@@ -217,6 +224,9 @@ const ProcessEventRow = ({
         {renderEventIcon(ev.kind)}
       </span>
       <span className="shrink-0 text-[11px]">{EVENT_LABEL[ev.kind]}</span>
+      {isLive && (
+        <Loader2 className="size-3 shrink-0 animate-spin text-info" />
+      )}
       {thinkingDuration && (
         <span className="shrink-0 tabular-nums text-[11px] opacity-80">
           · {thinkingDuration}
@@ -259,6 +269,12 @@ const ProcessEventRow = ({
               ev.meta?.notice === true && "whitespace-pre-wrap",
             )}
           >
+            {isLive && ev.meta?.liveTruncated === true && (
+              <div className="mb-1 text-[11px] not-italic text-muted-foreground/60">
+                （进行中的这一段只显示最近 {THINKING_TEXT_MAX / 10_000}{" "}
+                万字，思考结束后显示完整内容）
+              </div>
+            )}
             <SearchHighlightText
               ownerId={ev.id}
               field="body"
@@ -362,13 +378,18 @@ const USER_REPLY_BUBBLE =
 const USER_REPLY_TEXT =
   "w-full min-w-0 wrap-anywhere whitespace-pre-wrap text-sm leading-relaxed";
 
-/** 本地排队占位气泡（半透明 + 时钟）——用户消息、跟正式气泡同样右对齐
- * 状态收成一个：“发送中”（uncertain 只控制编辑/删除可用性，不再分文案）
- * C：hover 出编辑 / 删除，直达队列操作，不用经过 banner 面板 */
+/** 本地占位气泡——用户消息、跟正式气泡同样右对齐。三种样子（见 lib/chat-pending-display）：
+ * - mode="inflight"：刚按下回车、正在把消息交给 SDK → **正式气泡外观**（和落盘后的真气泡
+ *   同款几何 / 底色 / 边框，占位 → 真气泡无视觉跳变），不写「发送中…」；
+ *   等待由列表末尾的进度行（准备环境… / 正在恢复对话… / 正在发送…）说明
+ * - mode="queued"：上一轮还在跑、这条排在后面 → 半透明虚线 + 时钟 + 「排队中…」
+ * - mode 缺省：发送状态未知（uncertain）/ task 模式占位 → 旧样式「发送中…」，如实说在等
+ * C：hover 出编辑 / 删除，直达队列操作，不用经过 banner 面板（inflight 不给：它不在队列里） */
 export const PendingLocalReplyRow = memo(
   ({
     text,
     uncertain,
+    mode,
     ownerId,
     itemId,
     onEdit,
@@ -376,6 +397,7 @@ export const PendingLocalReplyRow = memo(
   }: {
     text: string;
     uncertain?: boolean;
+    mode?: PendingBubbleMode;
     ownerId: string;
     /** 对应服务端 queue itemId（有它才可编辑 / 删除） */
     itemId?: string;
@@ -406,12 +428,21 @@ export const PendingLocalReplyRow = memo(
         })
         .finally(() => setSaving(false));
     };
+    if (mode === "inflight") {
+      return (
+        <div className={USER_REPLY_BUBBLE}>
+          <div className={USER_REPLY_TEXT}>
+            <SearchHighlightText ownerId={ownerId} field="extra0" text={text} />
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="group ml-auto flex w-fit max-w-[85%] min-w-0 items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70 transition-opacity hover:opacity-100">
         <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
         <div className={cn(USER_REPLY_TEXT, "flex-1 text-muted-foreground")}>
           <span className="mb-0.5 flex items-center gap-2 text-[11px] tracking-wide">
-            <span>发送中…</span>
+            <span>{mode === "queued" ? "排队中…" : "发送中…"}</span>
             {!uncertain && (editable || deletable) && (
               <span className="ml-auto hidden items-center gap-0.5 group-hover:inline-flex">
                 {editable && (
@@ -682,7 +713,13 @@ const EventRowImpl = ({
   // 折叠态文本：摘要、不让超长
   // 展开态：原样 ev.text；batch 模式下展开走 batch 列表
   // batch 模式 summary 追加「×N」后缀、用户一眼看到「这 N 条都是同种工具调用」
-  const summary = batch ? `${summarize(ev.text)} ×${batchCount}` : summarize(ev.text);
+  // 进行中的思考（attachLiveThinking 合成、meta.live）摘要取「最新一行」而不是开头：
+  // summarize 取开头，一段 65s 的长思考整段期间这一行纹丝不动、看着像卡死
+  const summary = isLiveThinkingMeta(ev)
+    ? thinkingTextToLine(ev.text)
+    : batch
+        ? `${summarize(ev.text)} ×${batchCount}`
+        : summarize(ev.text);
   const processRow = (
     <ProcessEventRow
       ev={ev}

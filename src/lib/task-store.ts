@@ -455,6 +455,8 @@ interface SSEEnvelope {
     | "done"
     | "error"
     | "assistant_delta"
+    /** 思考实时增量（纯内存、不落盘）：只用来显示「思考中」+ 最近一行 */
+    | "thinking_delta"
     /** 队列整队失败控制帧 */
     | "queue_failed"
     /** bootstrap 队列存活快照 */
@@ -472,6 +474,8 @@ interface SSEEnvelope {
   ok?: boolean;
   message?: string;
   text?: string;
+  /** thinking_delta 帧：这段思考落盘后那条 thinking 事件的 id */
+  eventId?: string;
   itemIds?: string[];
   reason?: string;
   /** bootstrap queue_state 有界终态 ledger */
@@ -528,6 +532,14 @@ export interface TaskStreamCallbacks {
    * 上层维护「当前 streaming text」、收到本回调时累加、收到 onEvent(assistant_message) 时清空
    */
   onAssistantDelta?: (text: string) => void;
+  /**
+   * 思考实时增量（纯内存、不落盘）。一段思考要攒到结束才落一条 thinking 事件，
+   * 期间靠这一帧让 UI 知道「模型在思考」。上层把它累积成本段原文（画成工作过程里
+   * 「进行中的那条 thinking 行」），收到任何落盘事件 / assistant_delta / done 时清掉。
+   * eventId = 这段思考落盘后那条 thinking 事件的 id，同一段内每帧相同、落盘时复用——
+   * 上层用它把进行中的行与落盘后的行对成同一个节点；id 变了就是新的一段。
+   */
+  onThinkingDelta?: (text: string, eventId: string) => void;
   /**
    * 队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
    */
@@ -648,6 +660,14 @@ export const watchTaskStream = async (
             typeof env.text === "string"
           ) {
             callbacks.onAssistantDelta?.(env.text);
+          } else if (
+            env.type === "thinking_delta" &&
+            typeof env.text === "string" &&
+            // 没有 id 的帧没法和落盘行对上、还会让合成行的 React key 冲突——当无效帧丢掉
+            typeof env.eventId === "string" &&
+            env.eventId.length > 0
+          ) {
+            callbacks.onThinkingDelta?.(env.text, env.eventId);
           } else if (
             env.type === "queue_failed" &&
             Array.isArray(env.itemIds)

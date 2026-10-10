@@ -49,20 +49,22 @@ import {
   SDK_AGENT_STORE_DIRNAME,
   type SdkStoreHandle,
 } from "./sdk-agent-store";
+import {
+  pruneQuarantine,
+  QUARANTINE_DIRNAME,
+  quarantineFileName,
+  RUN_EVENTS_FILENAME,
+} from "./sdk-store-quarantine";
 
 const CHECKPOINTS = "checkpoints.ndjson";
 const RUNS = "runs.ndjson";
 const AGENTS = "agents.ndjson";
-const RUN_EVENTS = "run_events.ndjson";
+const RUN_EVENTS = RUN_EVENTS_FILENAME;
 
 /** 文件超过此大小才值得动（小库不动，避免无谓重写） */
 export const GC_MIN_CHECKPOINTS_BYTES = 50 * 1024 * 1024;
 /** 备份最多留几份（成功即删旧，只防当轮写坏） */
 const KEEP_BACKUPS = 1;
-/** run_events 自愈：被隔离的坏记录原文放这个子目录（SDK 只读固定文件名，不会扫到它） */
-const QUARANTINE_DIRNAME = ".quarantine";
-/** 旁路文件最多留几份（坏记录原文只作取证用，不无限堆） */
-const KEEP_QUARANTINE = 5;
 /**
  * 新建 / 刚活动过的 agent 不当孤儿：SDK 先落 agents 行 / checkpoint，Flowship 稍后才把
  * sessionAgentId 写进 meta.json，这个窗口里它不在活名单里。只看时间、不看 status——
@@ -311,20 +313,6 @@ const writeLine = async (out: fsSync.WriteStream, line: string): Promise<void> =
   });
 };
 
-const pruneQuarantine = async (qDir: string): Promise<void> => {
-  try {
-    // 文件名带 13 位毫秒时间戳，字典序即时间序
-    const names = (await fs.readdir(qDir))
-      .filter((n) => n.startsWith("run_events-") && n.endsWith(".ndjson"))
-      .sort();
-    while (names.length > KEEP_QUARANTINE) {
-      await fs.rm(path.join(qDir, names.shift()!), { force: true });
-    }
-  } catch {
-    /* best-effort */
-  }
-};
-
 const sameStat = (a: fsSync.Stats, b: fsSync.Stats): boolean =>
   a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
 
@@ -370,7 +358,7 @@ export const healRunEventsFile = async (
     // 第二遍：同样「延迟一条」——读完后剩下的那条就是尾行，无条件原样写回（坏也不动）。
     const qDir = path.join(dir, QUARANTINE_DIRNAME);
     await fs.mkdir(qDir, { recursive: true, mode: 0o700 });
-    const qFinal = path.join(qDir, `run_events-${opts?.now ?? Date.now()}.ndjson`);
+    const qFinal = path.join(qDir, quarantineFileName(opts?.now ?? Date.now()));
     tmp = `${file}.heal-tmp`;
     qTmp = `${qFinal}.tmp`;
     const main = openOut(tmp, before.mode & 0o777);
@@ -394,8 +382,10 @@ export const healRunEventsFile = async (
     quar.end();
     await Promise.all([finished(main), finished(quar)]);
 
-    // 并发保护：宁可本轮不修，也不覆盖别人的写入。剩下的窗口（这次 stat 到 rename 之间）是微秒级，
-    // 而且 run_events 在本地模式下几乎不写（实测一整天没增长过）。
+    // 并发保护：宁可本轮不修，也不覆盖别人的写入。剩下的窗口（这次 stat 到 rename 之间）是微秒级。
+    // （2026-10-10 更正：此前这里写的「run_events 几乎不写」被证伪——SDK 1.0.37 每条流式消息都写。
+    //  现在默认用内存版 run_events（见 memory-run-events.ts），旧文件已归档、不会再被追加；
+    //  只有显式回退到 SDK 自带落盘实现时才会有并发写，此时靠上面的 size/mtime/inode 复查兜底。）
     await opts?.beforeRename?.();
     if (!sameStat(before, await fs.stat(file))) {
       console.warn("[sdk-store-gc] run_events 自愈放弃：处理期间文件被改动，下一轮再试");

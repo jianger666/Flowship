@@ -12,6 +12,7 @@
  */
 import type { McpProbeStats } from "./mcp-probe";
 import type { PrepNotes } from "./run-prep-notes";
+import { createStreamCadence, type CadenceSnapshot } from "./stream-cadence";
 
 export type RunOutcome =
   | "ok"
@@ -62,6 +63,22 @@ export interface StoreSnapshot {
   mb?: number;
   agentBlobs?: number;
   agentMB?: number;
+  /**
+   * run_events 实现：memory = 进程内存（默认；流式消息的进程内传输通道，不落盘）；
+   * file = SDK 自带落盘（回退开关）——每条事件整文件读写，文件大了吐字会被钉在个位数条/秒
+   */
+  runEvents?: string;
+  /** run_events 体积（MB）：memory = 当前保留的 payload 体积；file = 文件大小 */
+  evMB?: number;
+  /** memory 实现当前保留的事件条数（全部 run 合计；已读且闲置 5 分钟的会被回收） */
+  evCount?: number;
+  /** memory 实现自进程启动累计回收的事件条数 */
+  evTrimmed?: number;
+  /**
+   * runs.ndjson 体积（MB）：SDK 每次读 run 状态都整文件解析（现网 195KB ≈ 1.2ms/次），
+   * 涨到数 MB 会成为下一个「每条事件 O(文件大小)」瓶颈——先放进观测，涨起来就能提前看到
+   */
+  runsMB?: number;
 }
 
 export interface RunPerfRecord {
@@ -102,6 +119,11 @@ export interface RunPerfRecord {
   toolErrors: number;
   tools: Record<string, ToolAgg>;
   tokens?: TokenAgg;
+  /**
+   * 吐字节奏：相邻两条同类 delta 的到达间隔分布（ms；text = 正文、thinking = 思考；
+   * 跨工具调用 / 思考切换的空窗不计）。判读见 stream-cadence.ts 头注释
+   */
+  cadence?: CadenceSnapshot;
   promptBytes?: number;
   promptBudgetDropped?: string[];
 
@@ -145,11 +167,24 @@ export const createRunAccumulator = (startedAt: number) => {
   let toolErrors = 0;
   const tools = new Map<string, ToolAgg>();
   let tokens: TokenAgg | undefined;
+  const cadence = createStreamCadence();
 
   return {
     /** send 返回（Run 受理）时调；只认第一次 */
     accepted(at: number): void {
       if (acceptedAt === undefined) acceptedAt = at;
+    },
+    /** 一条 text-delta 到达（热路径：只做数值运算、零日志） */
+    textDelta(at: number): void {
+      cadence.text(at);
+    },
+    /** 一条 thinking-delta 到达（热路径：只做数值运算、零日志） */
+    thinkingDelta(at: number): void {
+      cadence.thinking(at);
+    },
+    /** 非高频事件（工具调用 / 步骤 / 轮次…）：断开吐字节奏的连续段 */
+    breakStream(): void {
+      cadence.breakSegment();
     },
     /** 任一流式 content 类 delta；只认第一个 */
     token(type: string, at: number): void {
@@ -235,6 +270,7 @@ export const createRunAccumulator = (startedAt: number) => {
         toolErrors,
         tools: Object.fromEntries(tools) as Record<string, ToolAgg>,
         tokens,
+        cadence: cadence.snapshot(),
       };
     },
   };
@@ -326,6 +362,7 @@ export const buildRunRecord = (i: BuildRecordInput): RunPerfRecord => {
     toolErrors: snap.toolErrors,
     tools: snap.tools,
     tokens: nonEmpty(snap.tokens),
+    cadence: snap.cadence,
     promptBytes: num(ctx.promptBytes),
     promptBudgetDropped: nonEmpty(ctx.promptBudgetDropped),
     prep: stages,

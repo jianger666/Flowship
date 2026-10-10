@@ -62,9 +62,13 @@ const main = async () => {
   }
   const { input, parseErrors } = await loadLogs(dir);
   const total =
-    input.run.length + input.ui.length + input.warmup.length + input.lag.length;
+    input.run.length +
+    input.ui.length +
+    input.warmup.length +
+    input.lag.length +
+    (input.wrapup?.length ?? 0);
   if (total === 0) {
-    console.error(`在 ${dir} 下没有读到任何观测日志（run-perf.jsonl / ui-perf.jsonl / warmup.jsonl / loop-lag.jsonl）。`);
+    console.error(`在 ${dir} 下没有读到任何观测日志（run-perf.jsonl / ui-perf.jsonl / warmup.jsonl / loop-lag.jsonl / turn-wrapup.jsonl）。`);
     console.error("提示：观测日志从 v1.9.28 起才有；用 --dir 指向别处，或确认 App 已升级并发过消息。");
     process.exit(1);
   }

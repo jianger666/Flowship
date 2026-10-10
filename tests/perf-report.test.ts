@@ -361,6 +361,125 @@ describe("事件循环 / 会话规模 / 防后台节流 A-B", () => {
   });
 });
 
+describe("吐字节奏", () => {
+  /** 一个 run 的 cadence.text：p50 / p95 / over100 / n 可调 */
+  const cad = (p50: number, over100: number, n = 100, over250 = 0) => ({
+    text: { n, p50, p95: Math.round(p50 * 1.3), max: p50 * 4, over100, over250 },
+  });
+
+  it("旧版本的记录（没有 cadence）：text 为 undefined、分组为空，不抛；渲染提示无数据", () => {
+    const rep = buildReport({ run: [run(), run({ cadence: {} }), run({ cadence: { text: { n: 0 } } })] });
+    expect(rep.cadence.text).toBeUndefined();
+    expect(rep.cadence.thinking).toBeUndefined();
+    expect(rep.cadence.byRunEvents).toEqual([]);
+    expect(rep.cadence.fileBySize).toEqual([]);
+    expect(renderText(rep)).toContain("■ 十、");
+    expect(renderText(rep)).toContain("无数据（记录来自没有该字段的旧版本");
+  });
+
+  it("条数加权占比 + 每轮分布 + 整轮被钉住（p50 ≥ 150ms）的 run 数", () => {
+    const rep = buildReport({
+      run: [
+        run({ cadence: cad(35, 1, 400) }), // 流畅
+        run({ cadence: cad(200, 100, 100, 33) }), // 整轮被钉住
+      ],
+    });
+    const t = rep.cadence.text;
+    if (!t) throw new Error("cadence.text 缺失");
+    expect(t.runs).toBe(2);
+    expect(t.gaps).toBe(500);
+    expect(t.slowShare).toBeCloseTo((1 + 100) / 500, 6);
+    expect(t.stallShare).toBeCloseTo(33 / 500, 6);
+    expect(t.pinnedRuns).toBe(1);
+    expect(t.p50.n).toBe(2);
+    expect(t.p50.p50).toBeCloseTo(117.5, 6); // 两个 run 的 p50（35 / 200）线性插值
+  });
+
+  it("按 run_events 实现分组（memory / file / 未知，固定顺序）：A/B 对照一眼可见", () => {
+    const rep = buildReport({
+      run: [
+        run({ cadence: cad(35, 1), store: { mode: "fast", runEvents: "memory" } }),
+        run({ cadence: cad(33, 0), store: { mode: "fast", runEvents: "memory" } }),
+        run({ cadence: cad(200, 100), store: { mode: "fast", runEvents: "file", evMB: 18.5 } }),
+        run({ cadence: cad(190, 98) }), // 旧版本没有 store.runEvents
+      ],
+    });
+    const g = rep.cadence.byRunEvents;
+    expect(g.map((x: { key: string }) => x.key)).toEqual(["memory", "file", "未知"]);
+    expect(g[0]).toMatchObject({ runs: 2, pinnedRuns: 0 });
+    expect(g[0].slowShare).toBeCloseTo(1 / 200, 6);
+    expect(g[1]).toMatchObject({ runs: 1, pinnedRuns: 1 });
+    expect(g[1].slowShare).toBeCloseTo(100 / 100, 6);
+    expect(g[2]).toMatchObject({ runs: 1, pinnedRuns: 1 });
+  });
+
+  it("SDK 落盘实现按 run_events 文件体积分桶（越大越慢）；memory 的 run 不进这一组", () => {
+    const file = (evMB: number | undefined, p50: number) =>
+      run({ cadence: cad(p50, 50), store: { mode: "fast", runEvents: "file", ...(evMB === undefined ? {} : { evMB }) } });
+    const rep = buildReport({
+      run: [
+        file(0.5, 40),
+        file(3, 70),
+        file(18.5, 200),
+        file(25, 260),
+        file(undefined, 90),
+        run({ cadence: cad(33, 0), store: { mode: "fast", runEvents: "memory", evMB: 0.4 } }),
+      ],
+    });
+    const b = rep.cadence.fileBySize;
+    expect(b.map((x: { key: string }) => x.key)).toEqual(["<1MB", "1–5MB", "5–20MB", "≥20MB", "未知"]);
+    expect(b.map((x: { runs: number }) => x.runs)).toEqual([1, 1, 1, 1, 1]);
+    expect(b.map((x: { p50: { p50: number } }) => x.p50.p50)).toEqual([40, 70, 200, 260, 90]);
+  });
+
+  it("思考 delta 单独汇总；只有思考没有正文时 text 仍为 undefined", () => {
+    const rep = buildReport({
+      run: [run({ cadence: { thinking: { n: 50, p50: 100, p95: 125, max: 900, over100: 20, over250: 2 } } })],
+    });
+    expect(rep.cadence.text).toBeUndefined();
+    expect(rep.cadence.thinking).toMatchObject({ runs: 1, gaps: 50 });
+    expect(rep.cadence.thinking?.slowShare).toBeCloseTo(20 / 50, 6);
+  });
+
+  it("相关体积：runs.ndjson 与 run_events（file / memory 分开，不混算）", () => {
+    const rep = buildReport({
+      run: [
+        run({ store: { mode: "fast", runEvents: "file", evMB: 18.5, runsMB: 0.19 } }),
+        run({ store: { mode: "fast", runEvents: "memory", evMB: 0.4, runsMB: 0.2 } }),
+        run({ store: { mode: "fast", runEvents: "memory", evMB: 0.6, runsMB: 0.21 } }),
+      ],
+    });
+    expect(rep.scale.runsMB.n).toBe(3);
+    expect(rep.scale.runEventsFileMB).toMatchObject({ n: 1, max: 18.5 });
+    expect(rep.scale.runEventsMemoryMB).toMatchObject({ n: 2, max: 0.6 });
+  });
+
+  it("文本渲染：新一节含内存 / 落盘分组与体积分桶，没有 undefined / NaN", () => {
+    const rep = buildReport({
+      run: [
+        run({ cadence: cad(35, 1), store: { mode: "fast", runEvents: "memory", evMB: 0.4, runsMB: 0.2 } }),
+        run({ cadence: cad(200, 100, 100, 33), store: { mode: "fast", runEvents: "file", evMB: 18.5, runsMB: 0.19 } }),
+      ],
+    });
+    const text = renderText(rep);
+    expect(text).toContain("■ 十、吐字节奏");
+    expect(text).toContain("[内存实现（默认）]");
+    expect(text).toContain("[SDK 落盘（回退开关）]");
+    expect(text).toContain("按 run_events 文件体积");
+    expect(text).toContain("整轮被钉住");
+    const section = text.slice(text.indexOf("■ 十、"));
+    expect(section).not.toMatch(/undefined|NaN/);
+  });
+
+  it("报告只回显白名单统计：cadence 里夹带的未知字段不会出现在输出里", () => {
+    const rep = buildReport({
+      run: [run({ cadence: { text: { ...cad(35, 1).text, secret: "TOPSECRET" }, leak: "TOPSECRET" } })],
+    });
+    expect(JSON.stringify(rep)).not.toContain("TOPSECRET");
+    expect(renderText(rep)).not.toContain("TOPSECRET");
+  });
+});
+
 describe("前端流畅度", () => {
   it("心跳间隔常量与采集器默认值一致（估算口径依赖它）", () => {
     expect(UI_HEARTBEAT_EVERY).toBe(DEFAULT_HEARTBEAT_EVERY);
@@ -487,6 +606,115 @@ describe("前端流畅度", () => {
   });
 });
 
+describe("回合收尾（turn-wrapup：回复完整后 SDK 迟迟不结束 / 重复回复）", () => {
+  const wrap = (over: Record<string, unknown> = {}) => ({
+    ts: iso(0),
+    taskId: "t_1",
+    settledAfterMs: 4000,
+    turnEndedCount: 1,
+    ...over,
+  });
+  const chatRuns = () => [
+    run({ kind: "chat-followup", outcome: "finished" }),
+    run({ kind: "chat-followup", outcome: "finished" }),
+    run({ kind: "chat-first", outcome: "ok" }),
+    run({ kind: "chat-reconnect", outcome: "finished" }),
+    // 不是 chat：不进分母
+    run({ kind: "task-first", outcome: "ok" }),
+    run({ kind: "question", outcome: "ok" }),
+  ];
+
+  it("分母只算 chat run；重放 / 慢收尾 / 拦截数各自汇总", () => {
+    const r = buildReport({
+      run: chatRuns(),
+      wrapup: [
+        wrap({ settledAfterMs: 3500 }),
+        wrap({
+          settledAfterMs: 120_000,
+          turnEndedCount: 2,
+          replayDropped: { thinking: 3, assistant: 2, assistantChars: 800, toolCalls: 0 },
+        }),
+        wrap({
+          settledAfterMs: 6000,
+          replayDropped: { thinking: 1, assistant: 0, assistantChars: 0, toolCalls: 2 },
+        }),
+      ],
+    });
+    const w = r.wrapUp;
+    expect(w.chatRuns).toBe(4);
+    expect(w.records).toBe(3);
+    expect(w.share).toBeCloseTo(0.75);
+    expect(w.replayed).toBe(1);
+    expect(w.slow).toBe(2); // > 5s：120s 与 6s（3.5s 不算）
+    expect(w.settledMs.n).toBe(3);
+    expect(w.settledMs.max).toBe(120_000);
+    expect(w.droppedThinking).toBe(4);
+    expect(w.droppedAssistant).toBe(2);
+    expect(w.droppedChars).toBe(800);
+    expect(w.droppedToolCalls).toBe(2);
+    expect(w.okChatRuns).toBe(1); // 只数 chat 里 outcome=ok 的（task-first / question 的 ok 不算）
+    expect(r.meta.counts.wrapup).toBe(3);
+  });
+
+  it("没有记录：records=0、分母照常，share 为 0；损坏字段不崩", () => {
+    const r = buildReport({
+      run: chatRuns(),
+      wrapup: [
+        wrap({ settledAfterMs: "x", turnEndedCount: "2", replayDropped: "bad" }),
+        wrap({ settledAfterMs: Number.NaN, replayDropped: null }),
+      ],
+    });
+    expect(r.wrapUp.records).toBe(2);
+    expect(r.wrapUp.settledMs).toEqual({ n: 0 });
+    expect(r.wrapUp.replayed).toBe(0);
+    expect(r.wrapUp.droppedChars).toBe(0);
+
+    const none = buildReport({ run: chatRuns() });
+    expect(none.wrapUp.records).toBe(0);
+    expect(none.wrapUp.share).toBe(0);
+  });
+
+  it("--task / --since 同样过滤 wrapup", () => {
+    const input = {
+      run: [run({ kind: "chat-followup" })],
+      wrapup: [
+        wrap({ taskId: "t_a", ts: iso(-2 * 86_400_000) }),
+        wrap({ taskId: "t_a", ts: iso(0) }),
+        wrap({ taskId: "t_b", ts: iso(0) }),
+      ],
+    };
+    expect(buildReport(input, { taskId: "t_a" }).wrapUp.records).toBe(2);
+    expect(buildReport(input, { sinceMs: T0 - 3_600_000 }).wrapUp.records).toBe(2);
+    expect(
+      buildReport(input, { taskId: "t_a", sinceMs: T0 - 3_600_000 }).wrapUp.records,
+    ).toBe(1);
+  });
+
+  it("文本报告有第十一节，数据行带回合收尾条数；没有 chat run 时明确说无数据", () => {
+    const text = renderText(
+      buildReport({
+        run: chatRuns(),
+        wrapup: [
+          wrap({
+            settledAfterMs: 90_000,
+            turnEndedCount: 2,
+            replayDropped: { thinking: 2, assistant: 1, assistantChars: 300, toolCalls: 0 },
+          }),
+        ],
+      }),
+    );
+    expect(text).toContain("回合收尾异常 1 条");
+    expect(text).toContain("■ 十一、回合收尾");
+    expect(text).toContain("SDK 重放（同一条流多个 turn-ended）1 个");
+    expect(text).toContain("正文 1 条（300 字，没有重复上屏）");
+    expect(text).toContain("outcome=ok");
+
+    const empty = renderText(buildReport({}));
+    expect(empty).toContain("■ 十一、回合收尾");
+    expect(empty).toContain("还没有 chat run");
+  });
+});
+
 describe("过滤与提示", () => {
   it("--since 按 ts 过滤（含 loop-lag）；缺 ts / 非法 ts 的记录被过滤掉", () => {
     const r = buildReport(
@@ -505,7 +733,7 @@ describe("过滤与提示", () => {
       { run: [run({ taskId: "t_a" }), run({ taskId: "t_b" })], warmup: [{ ts: iso(0), taskId: "t_b", status: "warmed", totalMs: 1 }], ui: [ui({ taskId: "t_a" }), ui({ taskId: "t_b" })] },
       { taskId: "t_a" },
     );
-    expect(r.meta.counts).toEqual({ run: 1, ui: 1, warmup: 0, lag: 0 });
+    expect(r.meta.counts).toEqual({ run: 1, ui: 1, warmup: 0, lag: 0, wrapup: 0 });
   });
 
   it("提示：样本少 / 异常收口占比 / 混合版本 / 解析失败", () => {
@@ -527,7 +755,7 @@ describe("过滤与提示", () => {
 
   it("空输入不抛，并明确提示没有 run 记录", () => {
     const r = buildReport({});
-    expect(r.meta.counts).toEqual({ run: 0, ui: 0, warmup: 0, lag: 0 });
+    expect(r.meta.counts).toEqual({ run: 0, ui: 0, warmup: 0, lag: 0, wrapup: 0 });
     expect(r.warnings.join("\n")).toContain("没有 run 记录");
     const text = renderText(r);
     expect(text).toContain("没有 run 记录");
@@ -547,9 +775,9 @@ describe("文本渲染", () => {
       ui: [ui({ taskId: "t_1", heapMB: 120, domNodes: 4000 })],
     });
 
-  it("九个小节标题齐全；样本少的分组有标注", () => {
+  it("十个小节标题齐全；样本少的分组有标注", () => {
     const text = renderText(full());
-    for (const h of ["一、", "二、", "三、", "四、", "五、", "六、", "七、", "八、", "九、"]) {
+    for (const h of ["一、", "二、", "三、", "四、", "五、", "六、", "七、", "八、", "九、", "十、"]) {
       expect(text).toContain(`■ ${h}`);
     }
     expect(text).toContain("（样本少）");
@@ -617,13 +845,18 @@ describe("日志读取与参数解析", () => {
     expect(await readJsonl(dir, "nope.jsonl")).toEqual({ records: [], errors: 0 });
   });
 
-  it("loadLogs：四类日志各读各的、错误数合计", async () => {
+  it("loadLogs：五类日志各读各的、错误数合计", async () => {
     const dir = await mkTmp();
     await writeFile(path.join(dir, "run-perf.jsonl"), jsonl([run()]) + "oops\n");
     await writeFile(path.join(dir, "loop-lag.jsonl"), jsonl([{ ts: iso(0), max: 600 }]) + "oops\n");
+    await writeFile(
+      path.join(dir, "turn-wrapup.jsonl"),
+      jsonl([{ ts: iso(0), taskId: "t_1", settledAfterMs: 5000, turnEndedCount: 2 }]),
+    );
     const { input, parseErrors } = await loadLogs(dir);
     expect(input.run).toHaveLength(1);
     expect(input.lag).toHaveLength(1);
+    expect(input.wrapup).toHaveLength(1);
     expect(input.ui).toHaveLength(0);
     expect(input.warmup).toHaveLength(0);
     expect(parseErrors).toBe(2);

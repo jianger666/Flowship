@@ -10,7 +10,9 @@ import {
   USER_MSG_COLLAPSE_CHARS,
   USER_MSG_COLLAPSE_LINES,
   extractActiveBootStage,
+  hasActiveTurnWrapUp,
   isBootStageInfo,
+  isTurnWrapUpInfo,
   resolveStickyTurn,
   shouldCollapseUserMessage,
   shouldShowTurnDivider,
@@ -210,5 +212,77 @@ describe("extractActiveBootStage（渐进单行归并）", () => {
     ];
     expect(extractActiveBootStage(events)).toBeNull();
     expect(extractActiveBootStage([])).toBeNull();
+  });
+});
+
+/** 回合收尾提示 info（server chat-runner.publishTurnWrapUp 形状） */
+const wrapUpEv = (): TaskEvent =>
+  ev("info", {
+    id: `ephemeral_wrapup_${seq + 1}`,
+    text: "回复已完成，正在保存会话…",
+    meta: { turnWrapUp: true },
+  });
+
+describe("isTurnWrapUpInfo / hasActiveTurnWrapUp（回复已完整、SDK 还在收尾）", () => {
+  it("只认 meta.turnWrapUp 的 info；同 meta 的非 info、普通 info 都不算", () => {
+    expect(isTurnWrapUpInfo(wrapUpEv())).toBe(true);
+    expect(isTurnWrapUpInfo(ev("info", { text: "随便一条" }))).toBe(false);
+    expect(
+      isTurnWrapUpInfo(ev("assistant_message", { meta: { turnWrapUp: true } })),
+    ).toBe(false);
+    expect(
+      isTurnWrapUpInfo(ev("info", { meta: { turnWrapUp: "yes" } })),
+    ).toBe(false);
+  });
+
+  it("回复落盘后收到提示：是收尾态", () => {
+    const events = [
+      ev("user_reply"),
+      ev("thinking"),
+      ev("assistant_message"),
+      wrapUpEv(),
+    ];
+    expect(hasActiveTurnWrapUp(events)).toBe(true);
+  });
+
+  it("提示后面又有 info（压缩 / 重连等）仍是收尾态：只跳过 info", () => {
+    const events = [
+      ev("assistant_message"),
+      wrapUpEv(),
+      ev("info", { meta: { kind: "sdk_summary" } }),
+    ];
+    expect(hasActiveTurnWrapUp(events)).toBe(true);
+  });
+
+  it("提示之后又有工具 / 正文 / 新用户消息：回合又动起来了或是新一轮，旧提示作废", () => {
+    for (const next of [
+      ev("tool_call"),
+      ev("tool_result"),
+      ev("assistant_message"),
+      ev("thinking"),
+      ev("user_reply"),
+      ev("tool_output_delta"),
+      ev("error"),
+    ]) {
+      expect(
+        hasActiveTurnWrapUp([ev("assistant_message"), wrapUpEv(), next]),
+      ).toBe(false);
+    }
+  });
+
+  it("没有提示（含历史回看——ephemeral 不落盘）/ 空事件：不是收尾态", () => {
+    expect(
+      hasActiveTurnWrapUp([ev("user_reply"), ev("assistant_message")]),
+    ).toBe(false);
+    expect(hasActiveTurnWrapUp([])).toBe(false);
+  });
+
+  it("尾部全是 info 但没有提示：扫到非 info 即止，不会误判更早的提示", () => {
+    const events = [
+      wrapUpEv(), // 更早一轮的提示（理论上 run 结束后就该没了）
+      ev("assistant_message"),
+      ev("info", { text: "x" }),
+    ];
+    expect(hasActiveTurnWrapUp(events)).toBe(false);
   });
 });

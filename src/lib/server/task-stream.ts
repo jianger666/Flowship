@@ -44,6 +44,9 @@ export const stringifyMeta = (v: unknown): string => {
 //   - done: agent run 终止（运行时层、跟 task 业务终态独立）
 //   - error: 顶层错误（用于显示 toast）
 //   - assistant_delta: assistant_message 流式 chunk、UI 拼接打字效果
+//   - thinking_delta: 思考进行中的实时增量（纯内存、不落盘；UI 把它累积成工作过程里「进行中的
+//     那条 thinking 行」，思考段落盘后的 thinking 事件才是正式内容，id 与帧里的 eventId 一致）。
+//     只给属主主链发、没有 origin
 //   - queue_failed: 队列整队失败控制帧（纯内存、不落盘）
 //   - restricted_run: 旁路只读答疑 run 的活跃度信号（纯内存、不落盘、不进 runStatus）
 //   - task_deleted: DELETE 逻辑删除提交后通知既有 watcher 关流（纯内存、不落盘）
@@ -60,6 +63,12 @@ export type TaskStreamEvent =
   | { kind: "done"; task: Task; ok: boolean; origin?: string }
   | { kind: "error"; message: string }
   | { kind: "assistant_delta"; text: string; origin?: string }
+  // 思考实时帧：一段思考要攒到结束才落一条 thinking 事件，期间界面只剩「等待模型响应…」——
+  // 实测一段 65s 的思考（模型第 6s 就开始了）让用户干等 70s。这一帧让「思考中」实时可见。
+  // eventId = 这段思考落盘后那条 thinking 事件的 id：服务端在段内第一个 chunk 时预先定好、
+  // 落盘时原样复用。前端据此把「进行中的思考行」和落盘后的行对成同一个 React 节点——
+  // 用户正点开着读的内容不会在落盘那一刻被重挂载收起。
+  | { kind: "thinking_delta"; text: string; eventId: string }
   | { kind: "queue_failed"; itemIds: string[]; reason: string }
   // MessageOperation 终态帧（纯内存、不落盘）——client ledger 成功/失败终态的实时来源
   | { kind: "message_op"; itemId: string; phase?: string; outcome?: string }
@@ -641,7 +650,8 @@ export const PERSIST_FAIL_RETRY_MESSAGE = "消息保存失败、请重试" as co
 export const writeOwnedEventAndPublish = async (
   taskId: string,
   lease: () => boolean,
-  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
+  // id 可选：预先指定（thinking 事件复用实时帧里的 eventId）；缺省现生成，见 appendEvent
+  ev: Omit<TaskEvent, "id" | "ts" | "seq"> & { id?: string },
   origin?: string,
 ): Promise<TaskEvent | null> => {
   try {

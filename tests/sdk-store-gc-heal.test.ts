@@ -23,7 +23,11 @@ import type {
 } from "@cursor/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { openSdkStore, type SdkStoreHandle } from "@/lib/server/sdk-agent-store";
+import {
+  openSdkStore,
+  SDK_RUN_EVENTS_ENV,
+  type SdkStoreHandle,
+} from "@/lib/server/sdk-agent-store";
 import { gcSdkStoreOnce, healRunEventsFile } from "@/lib/server/sdk-store-gc";
 
 import { cleanupTmps, loadSdk, mkTmp, seed } from "./helpers/fast-store-helpers";
@@ -347,7 +351,9 @@ const buildWorld = async (): Promise<World> => {
   const tasks = path.join(root, "tasks", "t0");
   fs.mkdirSync(tasks, { recursive: true });
   fs.writeFileSync(path.join(tasks, "meta.json"), JSON.stringify({ sessionAgentId: "agent-live" }));
-  const handle = await openSdkStore(dir, {});
+  // run_events 用 SDK 自带落盘实现：这组用例复现的是线上「落盘文件中间坏一行」的故障（老库 / 回滚配置）。
+  // 默认的内存版会在开 store 时把整个旧文件归档走，见 sdk-agent-store-wiring.test.ts / sdk-store-gc-store-path.test.ts。
+  const handle = await openSdkStore(dir, { [SDK_RUN_EVENTS_ENV]: "file" });
   if (!handle || handle.mode !== "fast") throw new Error("测试前置：应是 fast 句柄");
   return { root, dir, ref, handle };
 };

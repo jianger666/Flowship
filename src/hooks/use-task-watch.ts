@@ -73,6 +73,11 @@ export interface UseTaskWatchCallbacks {
   onTaskUpdate?: (task: Task) => void;
   onActionUpdate?: (action: ActionRecord) => void;
   onAssistantDelta?: (text: string) => void;
+  /**
+   * 思考实时增量（纯内存、不落盘）——chat 用它在思考进行中把「进行中的 thinking 行」画进流程。
+   * eventId = 这段思考落盘后那条 thinking 事件的 id（同一段内不变、id 变了 = 新的一段）
+   */
+  onThinkingDelta?: (text: string, eventId: string) => void;
   onDone?: (task: Task, ok: boolean) => void;
   // SSE envelope 里的 error 帧（服务端主动发的协议错误）
   onErrorMessage?: (message: string) => void;
@@ -179,6 +184,10 @@ export const useTaskWatch = (
           onAssistantDelta: (text) => {
             if (cancelled) return;
             callbacksRef.current.onAssistantDelta?.(text);
+          },
+          onThinkingDelta: (text, eventId) => {
+            if (cancelled) return;
+            callbacksRef.current.onThinkingDelta?.(text, eventId);
           },
           onDone: (t, ok) => {
             if (cancelled) return;

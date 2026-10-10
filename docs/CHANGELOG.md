@@ -15,6 +15,23 @@
 
 ---
 
+### v1.9.7（2026-09-03）对话遥控器 / 通用@ / 提测收尾 / OOM 轮换
+
+- **对话遥控器 `/chats` + `/model`**：手机（机器人单聊）看电脑的聊天、切对话、新对话、换模型、搜。直接打字仍续聊当前对话（p2p 原路由不动）；遥控器只给“当前对话指针”配 UI。模型候选 = 默认 1 个 + 星标最多 2 个（设置页现成）+ 【全部模型】（现拉，有在途去重）；新对话默认跟随当前仓库；列表默认只看活跃 + 归档开关；搜只搜标题/仓库/模型（关键词 50 字截断，附件优先、flag 留给下一条纯文本）。卡片 value 只带参数、点击时重算，不做终态 patch；伪造回调有 parse 白名单 + 候选白名单两道（`checkPanelModelId` / `isAllowedPanelRepo`，fail-closed）；`takeAwaitingChatSearch` 热路径先无锁 peek。入口另有 `/help` 面板两颗按钮；聊天框 `/` 指令菜单要去开放平台控制台手动配。
+- **通用 `at: string[]`**：`share_to_group` 加名字/邮箱直 @，卡片正文前拼 `<at email>` 并推送；精确匹配才 @（角色成员 + 注册表现查，打包一次 `user search` 兜底），每次现查不落表；换不出/重名进回执 `at.unresolved`，`artifact` 无正文与 `post` 走 mentions 都回 `unsupported`，不静默吞。超长正文先拼标签再截断（@ 签在最前不断）。
+- **提测链路收尾**：`post + open_id` 降级链删除，只认邮箱（没邮箱进 missed）；MR 按钮 4→10（通用卡 `LINK_BUTTON_MAX` 同步 6→10），超的进正文（提测全列、播报拼进 md 文件）；发送失败退坑可重调一次（成功/超时仍占位防双 @，回 `skipped_duplicate` 说明已发出）。`prompts/action-ship.md` 与 HANDOFF 口径已对齐卡片。
+- **需求群卡片清理**：去掉「查看工作项」按钮（群里人都知道是哪个需求）；`storyUrl` 参数保留但忽略（废弃注释），无生产调用者、`post` 形态标 deprecated 留作储备。
+- **OOM 根治（chat 链）**：会话 input 累计水位 200 万触发轮换（复用懒重启分支，不新增路径；老任务用 total 估算、转一次自愈）；Electron 壳 server 默认 `--max-old-space-size=4096`（已有手工值不动）。缺口：只保 chat，`task-runner` 长 build 暂不轮换；换 SDK 大版本时重校水位口径（input 含/不含 cache 漂移）。**〔v1.9.28 起该水位默认关闭，见「SDK 本地存储与会话规模治理」〕**
+- **UI**：`FeatureBranchesField` 新建/编辑两处分支行抽共用（`min-w-0` 防长名顶穿）。
+
+### v1.9.6（2026-09-02）提测群 @ 测试 / 群答疑 markdown / 解绑仓库 / SLS / 测试切分支
+
+- **提测群 @ 测试**：工作项评论 @ 测试仍不推飞书通知。ship 写完评论后 agent 调 `notify_group_testers`，只认邮箱发提测通知卡（MR 按钮 + 卡片 `<at email>` 真 @，会推提及；没邮箱的进 missed 名单、不@）。没绑群、本机 bot 不在群、换不出人、MR 有冲突：工具返回 `skipped_*`，不报错、不弹「加机器人」、不阻塞交卷。不是交卷后系统偷发——和飞书评论同一拍、事件流里能看见这次工具调用。
+- **群答疑 markdown**：项目群里 @ 机器人问完，回群走飞书 `post` + `md`（CommonMark / GFM）。以前走纯文本 `--text`，`**粗体**` / `` `代码` `` / 列表会原样显示。短状态回执仍用纯文本。
+- **环境配置加 SLS**：设置页环境配置在 ELK 下面加 SLS（endpoint / project / AccessKey），跟 ELK 同款多实例。凭据只进 company-env.json，不进 prompt。Logstore 不配，查询时再 List。ELK 的 Data View 表单已去掉（本仓没有查询脚本读它）；旧配置读盘仍保留该字段。
+- **任务可解绑仓库**：编辑任务可以取消已绑仓库（至少留 1 个）。解绑不删 feature 分支、不关 MR。服务端整份替换 `repoPaths`：剪掉 5 张 per-repo map，独立按仓剪 `gitBranches`，清会话后下一个 Action 起新 agent。拆隔离工作区按解绑前的仓短名定位；只读 / 非 git 仓不拆。运行中改仓返回 409。
+- **测试任务切被测分支**：`prepareTestingTaskBranches` 在 checkout 失败 / 超时后复位工作区；Maven `target/` 等未跟踪编译产物不挡推进；git 明细写进事件流。checkout 超时从 15s 提到 60s。
+
 ### v1.9.5（2026-08-31）压缩过程行 / 上下文窗口纠偏 / Cursor SDK 1.0.30
 
 - **压缩过程行**：自定义 pi 的 `compaction_start/end` 与 Cursor SDK 的 `summary-started/summary/summary-completed` 走同一套 info（「正在压缩上下文…」→「已压缩上下文」）。压缩不是回合结束，不 flush 正在流的回复。Cursor 只在 SDK 真吐 summary 事件时出过程行，不再按 token 掉档伪造。

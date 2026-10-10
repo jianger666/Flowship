@@ -6,6 +6,7 @@ import {
   isLatestErrorEvent,
   isWorkGroup,
   PROCESSING_PLACEHOLDER_LABEL,
+  TURN_WRAP_UP_STATUS,
   shouldShowProcessingPlaceholder,
   type WorkGroupItem,
 } from "../src/lib/chat-turns";
@@ -600,6 +601,32 @@ describe("deriveActiveStatus", () => {
         { streaming: true },
       ),
     ).toEqual({ label: "正在回复…" });
+  });
+
+  it("settled 只属于回合收尾提示：deriveActiveStatus 自己永远不产出静态打勾态", () => {
+    // 回合收尾提示由 server 的 turn-ended 信号驱动、在 UI 层单独注入（TURN_WRAP_UP_STATUS），
+    // 普通的回扫推断必须仍是会闪烁的「进行中」文案——否则没写完的回复会被打上勾
+    expect(TURN_WRAP_UP_STATUS).toEqual({
+      label: "回复已完成",
+      detail: "正在保存会话…",
+      settled: true,
+    });
+    const samples: TaskEvent[][] = [
+      [ev({ id: "u", kind: "user_reply", text: "hi" })],
+      [
+        ev({ id: "u", kind: "user_reply", text: "hi" }),
+        ev({ id: "a", kind: "assistant_message", text: "回复" }),
+      ],
+      [
+        ev({ id: "u", kind: "user_reply", text: "hi" }),
+        ev({ id: "t", kind: "thinking", text: "想" }),
+      ],
+    ];
+    for (const events of samples) {
+      expect(deriveActiveStatus(events)?.settled).toBeUndefined();
+      expect(deriveActiveStatus(events, undefined, { streaming: true })?.settled)
+        .toBeUndefined();
+    }
   });
 });
 
