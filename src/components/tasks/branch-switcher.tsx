@@ -15,6 +15,11 @@
  *
  * 弹层：可选顶部警告（warning prop）+ 搜索 + 分支列表 + checkout。
  * 约束：running 时禁用（后端也会 409 兜底）；切分支不改 task 字段、只动 git 工作区。
+ *
+ * 被其他工作树占用的分支（state.occupied：任务隔离工作区 / 手动 git worktree add 的目录，
+ * 含「主仓占着 main」）：git 不让同一分支同时检出到两处，点了只会拿到一条 fatal。
+ * 所以这些行置灰、名字下面写明占在哪，hover 的 Tooltip 给完整路径和处理办法——
+ * 而不是列成普通可点项、点完才 toast 一段 git 原文（还随系统语言变）。
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -35,6 +40,11 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Tooltip } from "@/components/ui/tooltip";
+import {
+  occupantOf,
+  occupiedBranchHint,
+  occupiedBranchMessage,
+} from "@/lib/git-branch-occupancy";
 import { checkoutTaskBranch, fetchTaskBranches } from "@/lib/task-store";
 import { isTestingRequirementTask } from "@/lib/testing-task";
 import type { GitBranchState, Task } from "@/lib/types";
@@ -323,28 +333,62 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
               ) : (
                 filtered.map((b) => {
                   const selected = b === state?.current;
-                  return (
-                    <li key={b}>
-                      <button
-                        type="button"
-                        // 拉取中禁切：静默 fetch --prune（最长 20s）和 checkout 同目录并发会撞 index.lock
-                        disabled={saving || refreshing}
-                        onClick={() => void handleCheckout(b)}
+                  // 被其他工作树占着：git 不让同一分支同时检出到两处、点了只会报 fatal，
+                  // 所以不可点并写明原因。当前分支服务端本就不算占用，这里再挡一层只是防御。
+                  const occupant = selected
+                    ? undefined
+                    : occupantOf(state?.occupied, b);
+                  const row = (
+                    <button
+                      type="button"
+                      // 拉取中禁切：静默 fetch --prune（最长 20s）和 checkout 同目录并发会撞 index.lock
+                      disabled={saving || refreshing}
+                      // 占用态用 aria-disabled、不用原生 disabled：原生禁用的按钮收不到 hover / 焦点，
+                      // 挂在它上面的 Tooltip（完整路径 + 怎么办）就出不来；点击由下面的守卫挡掉
+                      aria-disabled={occupant ? true : undefined}
+                      onClick={() => {
+                        if (occupant) return;
+                        void handleCheckout(b);
+                      }}
+                      className={cn(
+                        "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                        // 占用行不 hover 高亮：高亮等于暗示「可点」
+                        occupant
+                          ? "cursor-not-allowed text-muted-foreground"
+                          : "hover:bg-accent",
+                        selected && "bg-selected text-selected-foreground",
+                      )}
+                    >
+                      <Check
                         className={cn(
-                          "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50",
-                          selected && "bg-selected text-selected-foreground",
+                          "mt-0.5 size-3.5 shrink-0",
+                          selected ? "opacity-100" : "opacity-0",
                         )}
-                      >
-                        <Check
-                          className={cn(
-                            "mt-0.5 size-3.5 shrink-0",
-                            selected ? "opacity-100" : "opacity-0",
-                          )}
-                        />
-                        <span className="min-w-0 flex-1 wrap-anywhere font-mono">
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="block wrap-anywhere font-mono">
                           {b}
                         </span>
-                      </button>
+                        {occupant && (
+                          <span className="mt-0.5 block text-[11px] leading-snug">
+                            {occupiedBranchHint(occupant)}
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                  );
+                  return (
+                    <li key={b}>
+                      {occupant ? (
+                        <Tooltip
+                          content={occupiedBranchMessage(b, occupant)}
+                          side="right"
+                        >
+                          {row}
+                        </Tooltip>
+                      ) : (
+                        row
+                      )}
                     </li>
                   );
                 })

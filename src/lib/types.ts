@@ -1112,6 +1112,23 @@ export interface GitBranchState {
   branches: string[];
   /** task 隔离 worktree 尚未建好（任务未启动 / worktree 已清）——只读提示、禁止切换 */
   worktreeMissing?: boolean;
+  /**
+   * 被「其他工作树」占着的分支（分支名 → 占用者）；没有占用时缺省。
+   * git 不允许同一分支同时在两个工作树检出，这些分支在当前目录切不过去——
+   * 选择器据此置灰并说明原因。当前工作树自己的分支不算占用。
+   */
+  occupied?: Record<string, GitBranchOccupant>;
+}
+
+/**
+ * 占着某个分支的「其他工作树」（任务隔离工作区 / 手动 `git worktree add` 的目录）。
+ * 读自 `git worktree list --porcelain`、不解析任何随语言变化的报错文案。
+ */
+export interface GitBranchOccupant {
+  /** 占用该分支的工作树目录（Windows 下已把 git 吐的正斜杠转成反斜杠） */
+  path: string;
+  /** 该目录已不存在（被手动删了、git 里还留着登记）——要 `git worktree prune` 才能释放分支 */
+  missing: boolean;
 }
 
 /**
