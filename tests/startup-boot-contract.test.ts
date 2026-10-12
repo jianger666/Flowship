@@ -10,6 +10,10 @@ const firstBoot = readFileSync(
   path.resolve(import.meta.dirname, "..", "electron-app/first-boot.mjs"),
   "utf8",
 );
+const securityProbe = readFileSync(
+  path.resolve(import.meta.dirname, "..", "electron-app/security-products.mjs"),
+  "utf8",
+);
 
 describe("启动超时不再一刀切（首次冷启动给足时间）", () => {
   it("electron-app/main.js 是纯 JS ESM，不能夹带 TS 语法（node --check 必须通过）", () => {
@@ -19,7 +23,9 @@ describe("启动超时不再一刀切（首次冷启动给足时间）", () => {
   });
 
   it("默认超时 60s、首次 150s，不再是 30s 一次性（取值在 first-boot.mjs、壳里只调用）", () => {
-    expect(main).toContain("timeoutMs = 60_000");
+    // waitForReady 的默认值引用 REGULAR_BOOT_TIMEOUT_MS，不再另写一个 60_000（合并前评审小项：两处定义会悄悄脱节）
+    expect(main).toContain("timeoutMs = REGULAR_BOOT_TIMEOUT_MS");
+    expect(main).not.toContain("timeoutMs = 60_000");
     expect(main).toContain("pickBootTimeoutMs(firstBoot)");
     expect(firstBoot).toContain("FIRST_BOOT_TIMEOUT_MS = 150_000");
     expect(firstBoot).toContain("REGULAR_BOOT_TIMEOUT_MS = 60_000");
@@ -43,9 +49,15 @@ describe("启动超时不再一刀切（首次冷启动给足时间）", () => {
     const probe = main.indexOf("void logSecurityProducts()");
     expect(ready).toBeGreaterThanOrEqual(0);
     expect(probe).toBeGreaterThan(ready);
-    // 只读 SecurityCenter2、10s 超时自杀
-    expect(main).toContain("root/SecurityCenter2");
-    expect(main).toContain("timeout: 10_000");
+    // 只读 SecurityCenter2、10s 超时自杀；脚本与解析在 security-products.mjs（有单测）
+    expect(main).toContain("SECURITY_PROBE_SCRIPT");
+    expect(main).toContain("timeout: SECURITY_PROBE_TIMEOUT_MS");
+    expect(main).toContain("parseSecurityProbe(err, stdout)");
+    expect(main).toContain("describeSecurityProbe(probe)");
+    expect(securityProbe).toContain("root/SecurityCenter2");
+    expect(securityProbe).toContain("SECURITY_PROBE_TIMEOUT_MS = 10_000");
+    // 壳里不再内联 PowerShell 命令（直接打印 displayName 会被 OEM 代码页弄乱码）
+    expect(main).not.toContain("Get-CimInstance");
     expect(main).toContain('path.join(app.getPath("userData"), "logs")');
   });
 

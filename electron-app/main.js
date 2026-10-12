@@ -61,10 +61,18 @@ import {
 import { MIN_TEMP_FREE_MB, checkUpdateTempSpace, formatFreeGB } from "./disk-space.mjs";
 // 首次启动判定（标记按版本记、更新后的第一次启动同样按「首次」给宽限）：纯函数在 ./first-boot.mjs
 import {
+  REGULAR_BOOT_TIMEOUT_MS,
   buildFirstBootMarker,
   pickBootTimeoutMs,
   shouldTreatAsFirstBoot,
 } from "./first-boot.mjs";
+// 杀软清单探测（脚本 + 解析，PowerShell 输出 Base64 避开 OEM 代码页乱码）：纯函数在 ./security-products.mjs
+import {
+  SECURITY_PROBE_SCRIPT,
+  SECURITY_PROBE_TIMEOUT_MS,
+  describeSecurityProbe,
+  parseSecurityProbe,
+} from "./security-products.mjs";
 // 防后台节流实验开关（v1.9.28、默认关）：纯函数在 ./app-nap.mjs（单测直接 import）
 import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
 // NODE_OPTIONS 取值含空格时的引用（崩溃取证目录在 macOS 的「Application Support」下）：./node-options.mjs
@@ -225,32 +233,21 @@ const diskFreeGB = (dir) => formatFreeGB(dir, statfsSync);
 // 启动慢到什么程度才去查杀软清单（常规机器 server 就绪 <2s，超过 30s 基本只能是 IO / 杀软在拦）
 const SLOW_BOOT_PROBE_MS = 30_000;
 
-// Windows 安全中心登记的杀软清单（WMI SecurityCenter2；Server 版 Windows 没有这个命名空间、取不到就记「没取到」）。
+// Windows 安全中心登记的杀软清单（WMI SecurityCenter2）。
 // 只在「启动偏慢」时跑一次、后台、10s 超时；纯取证、结果只进日志、不影响任何行为。
+// 脚本与解析在 ./security-products.mjs：PowerShell 输出 Base64（stdout 走 OEM 代码页、中文杀软名会乱码），
+// 并把「没登记 / 查询失败（如 Server 版没有该命名空间）/ 超时 / 拉不起 PowerShell」分开记，日志才能回答「为什么没清单」。
 const logSecurityProducts = async () => {
   if (process.platform !== "win32") return;
-  const out = await new Promise((resolve) => {
+  const probe = await new Promise((resolve) => {
     execFile(
       "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | ForEach-Object { $_.displayName }",
-      ],
-      { windowsHide: true, timeout: 10_000 },
-      (err, stdout) => resolve(err ? "" : String(stdout)),
+      ["-NoProfile", "-NonInteractive", "-Command", SECURITY_PROBE_SCRIPT],
+      { windowsHide: true, timeout: SECURITY_PROBE_TIMEOUT_MS },
+      (err, stdout) => resolve(parseSecurityProbe(err, stdout)),
     );
   });
-  const names = [
-    ...new Set(
-      out
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .filter(Boolean),
-    ),
-  ];
-  log(`[main] 启动偏慢（>${SLOW_BOOT_PROBE_MS / 1000}s）时的杀软清单：${names.join("、") || "（没取到）"}`);
+  log(`[main] 启动偏慢（>${SLOW_BOOT_PROBE_MS / 1000}s）时的杀软清单：${describeSecurityProbe(probe)}`);
 };
 
 // ---------- 端口冲突处理 ----------
@@ -497,10 +494,11 @@ const stopServer = async () => {
   }
 };
 
-// 轮询 server 直到 HTTP 200（上限默认 60s：冷盘 + Defender 下 30s 会误杀慢机器）
+// 轮询 server 直到 HTTP 200（上限默认 = 常规启动超时 REGULAR_BOOT_TIMEOUT_MS：冷盘 + Defender 下 30s 会误杀慢机器；
+// 取值只在 first-boot.mjs 定义一处，这里不再另写一个 60_000）
 // 轮询 /api/readyz（零业务静态探针）：只证明 HTTP 栈起来，不跑首页渲染——
 // 之前轮 `/` 把"监听起来"和"首页渲完"混在一起，首页稍慢就被误判成 server 没起。
-const waitForReady = async (timeoutMs = 60_000) => {
+const waitForReady = async (timeoutMs = REGULAR_BOOT_TIMEOUT_MS) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
