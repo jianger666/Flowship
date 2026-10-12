@@ -49,12 +49,16 @@ import { fileURLToPath } from "node:url";
 import { isUnsafeWinInstallDir } from "./win-install-dir.mjs";
 import {
   WIN_UPDATE_ATTEMPT_FILE,
+  buildSpaceBlockedMessage,
+  buildUpdateFailedMessage,
   buildWinUpdateAttempt,
   classifyWinUpdateAttempt,
+  findInstallerAbort,
   hasSilentUpdateMarker,
 } from "./win-update-guard.mjs";
-// 磁盘剩余空间换算（预检 / 日志共用、statfs 注入以便在 Mac 上单测）：纯函数在 ./disk-space.mjs
-import { formatFreeGB } from "./disk-space.mjs";
+// 磁盘剩余空间换算 + 静默更新预检（statfs 注入以便在 Mac 上单测）：纯函数在 ./disk-space.mjs。
+// 预检阈值 MIN_TEMP_FREE_MB 是唯一的 JS 侧来源（弹框文案也读它），与 installer.nsh 的 define 由测试对账。
+import { MIN_TEMP_FREE_MB, checkUpdateTempSpace, formatFreeGB } from "./disk-space.mjs";
 // 首次启动判定（标记按版本记、更新后的第一次启动同样按「首次」给宽限）：纯函数在 ./first-boot.mjs
 import {
   buildFirstBootMarker,
@@ -1943,6 +1947,18 @@ const installWinUpdate = async (version) => {
     void shell.openExternal(RELEASE_LATEST_URL);
     return;
   }
+  // 磁盘空间预检（与安装器 .onInit 同口径同阈值，见 disk-space.mjs）：安装器那道预检只在「主进程已退出、
+  // 静默安装没有界面」之后才生效——用户只会看到 App 消失。所以在 quitting = true 之前先量：不够就当场
+  // 弹框、什么都不动（App 继续开着、版本不变）。不开发布页：手动装同样要这些空间，送过去只会重蹈覆辙。
+  // 量不到（UNC 等）放行；这一道是补充不是替代——还没有这道门禁的旧客户端仍全靠安装器那一道。
+  const tmpSpace = checkUpdateTempSpace(os.tmpdir(), statfsSync);
+  if (!tmpSpace.enough) {
+    const blocked = buildSpaceBlockedMessage(tmpSpace);
+    log(`[updater] win 拒绝静默更新：${blocked.reason} tmp=${os.tmpdir()}`);
+    setUpdateState({ phase: "available", version, error: blocked.reason });
+    dialog.showErrorBox(blocked.title, blocked.body);
+    return;
+  }
   // 静默装要黑屏好几分钟（1.5 万散文件逐个落盘），先给个系统通知打预防针、
   // 否则用户以为卡死去杀进程，正好杀在“旧的已搬走、新的没写完”中间（D 盘用户翻车实录）。
   // 发完等 1.5s 再 quit：Windows Toast 是系统托管、quit 后还在 Action Center，
@@ -2272,11 +2288,25 @@ if (!app.requestSingleInstanceLock()) {
           const want = attempt?.version || "新版本";
           log(`[updater] 上次更新死半路：目标 v${want}、当前 v${app.getVersion()}`);
           setUpdateState({ phase: "available", version: want, error: "上次静默安装未完成" });
-          dialog.showErrorBox(
-            "上次更新没有装上",
-            `目标 v${want} 没装上、当前还是 v${app.getVersion()}。\n\n请去发布页手动下载安装包、装到原目录（数据不受影响）。\n\n常见原因：系统盘（临时目录所在盘）剩余空间不足 800MB、杀毒软件拦截。安装过程记录在：\n${path.join(app.getPath("userData"), "logs", "installer.log")}`,
-          );
-          void shell.openExternal(RELEASE_LATEST_URL);
+          // 读安装器日志找「预检拦截」记录（安装器只写 ASCII，latin1 解码不丢字节；只扫尾部 64KB）：
+          // 有 → 空间不足的针对性文案、先让用户清理；没有 → 通用文案（空间与杀软并列、清理在前）。
+          const installerLogPath = path.join(app.getPath("userData"), "logs", "installer.log");
+          let installerLogText = "";
+          try {
+            installerLogText = (await fs.readFile(installerLogPath, "latin1")).slice(-65536);
+          } catch {
+            // 日志不存在 / 读不了 → 当通用失败处理
+          }
+          const failedMsg = buildUpdateFailedMessage({
+            wantVersion: want,
+            currentVersion: app.getVersion(),
+            abort: findInstallerAbort(installerLogText, want),
+            tempFreeMB: checkUpdateTempSpace(os.tmpdir(), statfsSync).freeMB,
+            minTempFreeMB: MIN_TEMP_FREE_MB,
+            installerLogPath,
+          });
+          dialog.showErrorBox(failedMsg.title, failedMsg.body);
+          if (failedMsg.offerReleasePage) void shell.openExternal(RELEASE_LATEST_URL);
         }
       } catch (err) {
         log(`[updater] 墓碑核销异常（忽略）${err?.message || err}`);

@@ -11,7 +11,9 @@ import { describe, expect, it } from "vitest";
 import {
   BYTES_PER_GB,
   BYTES_PER_MB,
+  MIN_TEMP_FREE_MB,
   bytesToMB,
+  checkUpdateTempSpace,
   formatFreeGB,
   formatGB,
   freeBytes,
@@ -101,5 +103,54 @@ describe("formatGB / formatFreeGB：给人看的日志数字", () => {
 
   it("bigint 入参也能算（statfsSync 带 bigint:true 时）", () => {
     expect(formatFreeGB("/x", fakeStatfs(262_144n, 4096n))).toBe("1.0");
+  });
+});
+
+/** 造一个「恰好剩 bytes 字节」的假 statfs（bsize=1 让块数 = 字节数） */
+const fakeFreeBytes = (bytes: number) => fakeStatfs(bytes, 1);
+
+describe("checkUpdateTempSpace：静默更新预检口径 = 安装器 .onInit（向下取整到 MB、严格小于才拦、量不到放行）", () => {
+  it("阈值边界：差 1 字节到 800MB → 拦；恰好 800MB → 放；多 1MB → 放", () => {
+    expect(checkUpdateTempSpace("/t", fakeFreeBytes(800 * MB - 1))).toEqual({
+      enough: false,
+      freeMB: 799,
+      minMB: MIN_TEMP_FREE_MB,
+    });
+    expect(checkUpdateTempSpace("/t", fakeFreeBytes(800 * MB))).toEqual({
+      enough: true,
+      freeMB: 800,
+      minMB: MIN_TEMP_FREE_MB,
+    });
+    expect(checkUpdateTempSpace("/t", fakeFreeBytes(801 * MB)).enough).toBe(true);
+  });
+
+  it("空间极小 / 为 0 → 拦（0 是「真的没空间」，不是「量不到」）", () => {
+    expect(checkUpdateTempSpace("/t", fakeFreeBytes(0))).toMatchObject({ enough: false, freeMB: 0 });
+    expect(checkUpdateTempSpace("/t", fakeFreeBytes(10 * MB))).toMatchObject({ enough: false, freeMB: 10 });
+  });
+
+  it("量不到（statfs 抛错 / 数值异常）→ 放行并给 freeMB=null，由安装器兜底；绝不因为量不准把人挡在更新之外", () => {
+    const boom = () => {
+      throw new Error("ENOENT");
+    };
+    expect(checkUpdateTempSpace("/t", boom)).toEqual({ enough: true, freeMB: null, minMB: MIN_TEMP_FREE_MB });
+    expect(checkUpdateTempSpace("/t", fakeStatfs(Number.NaN))).toMatchObject({ enough: true, freeMB: null });
+  });
+
+  it("阈值可注入；默认值就是 MIN_TEMP_FREE_MB", () => {
+    expect(checkUpdateTempSpace("/t", fakeFreeBytes(1000 * MB), 2048)).toMatchObject({
+      enough: false,
+      minMB: 2048,
+    });
+    expect(checkUpdateTempSpace("/t", fakeFreeBytes(1000 * MB)).minMB).toBe(MIN_TEMP_FREE_MB);
+  });
+
+  it("量的是调用方给的目录（主进程传 os.tmpdir()、不是安装目录）", () => {
+    const seen: string[] = [];
+    checkUpdateTempSpace("C:\\Users\\me\\AppData\\Local\\Temp", (d) => {
+      seen.push(d);
+      return { bavail: 1, bsize: 1 };
+    });
+    expect(seen).toEqual(["C:\\Users\\me\\AppData\\Local\\Temp"]);
   });
 });

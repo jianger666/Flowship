@@ -3,13 +3,15 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { BYTES_PER_MB } from "../electron-app/disk-space.mjs";
+import { BYTES_PER_MB, MIN_TEMP_FREE_MB } from "../electron-app/disk-space.mjs";
+import { findInstallerAbort } from "../electron-app/win-update-guard.mjs";
 
 const read = (relativePath: string): string =>
   readFileSync(path.resolve(import.meta.dirname, "..", relativePath), "utf8");
 
 const installer = read("packaging/installer.nsh");
 const main = read("electron-app/main.js");
+const guard = read("electron-app/win-update-guard.mjs");
 
 const macroBody = (name: string): string => {
   // 宏名后允许带参数列表（如 `!macro flowshipLog MSG`）
@@ -70,7 +72,9 @@ describe("Windows 不再传 /D=（注册表路径为准，引号 bug 类别消�
     expect(main).toContain("WIN_UPDATE_ATTEMPT_FILE");
     expect(main).toContain("buildWinUpdateAttempt");
     expect(main).toContain("classifyWinUpdateAttempt");
-    expect(main).toContain("上次更新没有装上");
+    // 失败弹框的文案在 win-update-guard.mjs（纯函数、有单测），壳里只负责取数据、弹框
+    expect(main).toContain("buildUpdateFailedMessage");
+    expect(guard).toContain("上次更新没有装上");
   });
 
   it("customInstall 落新安装器标记（静默门禁的另一半）：手动安装 / 自动更新都写、且只在 $appExe 存在时写", () => {
@@ -211,9 +215,92 @@ describe("Windows 安装诊断日志 + 静默更新预检（v1.9.30）", () => {
     const installIdx = main.indexOf("winAutoUpdater.quitAndInstall(true, true)");
     expect(logIdx).toBeGreaterThanOrEqual(0);
     expect(installIdx).toBeGreaterThan(logIdx);
-    const tombstone = main.indexOf("上次更新没有装上");
-    expect(tombstone).toBeGreaterThanOrEqual(0);
-    expect(main.slice(tombstone, tombstone + 600)).toContain("installer.log");
+  });
+
+  it("主进程预检：在标记门禁之后、通知与 quitting = true 之前；不够只弹框返回——不开发布页、不置 quitting、不写墓碑", () => {
+    // 合并前评审 #2：存量用户被安装器静默 Abort 后「App 消失」，新客户端要在退出之前就把人拦在原地
+    const start = main.indexOf("const installWinUpdate = async");
+    const end = main.indexOf("winAutoUpdater.quitAndInstall(true, true)");
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const fn = main.slice(start, end);
+    const markerGate = fn.indexOf("hasSilentUpdateMarker(exeDir");
+    const spaceGate = fn.indexOf("checkUpdateTempSpace(os.tmpdir(), statfsSync)");
+    const notify = fn.indexOf("new Notification(");
+    // 匹配语句本身（行首缩进 + 分号结尾）；注释里提到「quitting = true」不能算
+    const quit = fn.search(/^\s*quitting = true;/m);
+    const tombstone = fn.indexOf("WIN_UPDATE_ATTEMPT_FILE");
+    expect(markerGate).toBeGreaterThanOrEqual(0);
+    expect(spaceGate).toBeGreaterThan(markerGate);
+    expect(notify).toBeGreaterThan(spaceGate); // 先量、再打「正在安装更新」的预防针
+    expect(quit).toBeGreaterThan(notify);
+    expect(tombstone).toBeGreaterThan(quit);
+    const gate = fn.slice(spaceGate, notify);
+    expect(gate).toContain("if (!tmpSpace.enough)");
+    expect(gate).toContain('setUpdateState({ phase: "available"');
+    expect(gate).toContain("dialog.showErrorBox(");
+    expect(gate).toContain("return;");
+    // 手动装同样要这些空间：不把人送去发布页；拒绝时 app 必须继续活着
+    expect(gate).not.toContain("RELEASE_LATEST_URL");
+    expect(gate).not.toContain("quitting");
+  });
+
+  it("阈值单一来源：JS 常量与 NSIS define 对账；弹框读常量、不再各写一个「800MB」", () => {
+    // 合并前评审小项：弹框里的 800MB 与 NSIS 的 FLOWSHIP_MIN_TEMP_FREE_MB 是两处硬编码，包体增长要靠人肉同步
+    const nsis = Number(installer.match(/!define FLOWSHIP_MIN_TEMP_FREE_MB (\d+)/)?.[1] ?? Number.NaN);
+    expect(MIN_TEMP_FREE_MB).toBe(nsis);
+    expect(main).toContain("minTempFreeMB: MIN_TEMP_FREE_MB");
+    expect(main).not.toMatch(/\b800\s*MB/i);
+    expect(guard).not.toMatch(/\b800\s*MB/i);
+  });
+
+  it("ABORT 日志行与主进程解析器对账：用安装器源码里的真实模板渲染出日志行，findInstallerAbort 必须读回数字", () => {
+    // 写入端（NSIS）与读取端（findInstallerAbort）各改各的最容易悄悄脱节：手写一行样例只能证明解析器自洽，
+    // 这里从 installer.nsh 取 flowshipLog 的落盘模板和 ABORT 文案模板，渲染后喂给解析器。
+    const fileWrite = macroBody("flowshipLog").match(/FileWrite \$R8 "([^"]*)"/)?.[1];
+    const abortTpl = installer.match(/!insertmacro flowshipLog "(ABORT [^"]*)"/)?.[1];
+    expect(fileWrite, "flowshipLog 里应有 FileWrite $R8 \"…\"").toBeDefined();
+    expect(abortTpl, "customInit 里应有 ABORT 日志行").toBeDefined();
+    const render = (tpl: string, vars: Record<string, string>): string =>
+      tpl
+        .replace(/\$\\r/g, "\r")
+        .replace(/\$\\n/g, "\n")
+        .replace(/\$\{(\w+)\}|\$(\w+)/g, (_m, a: string | undefined, b: string | undefined) => {
+          const name = (a ?? b) as string;
+          return name in vars ? vars[name] : `<<未绑定 ${name}>>`;
+        });
+    const msg = render(abortTpl as string, {
+      VERSION: "1.9.31",
+      "2": "512",
+      FLOWSHIP_MIN_TEMP_FREE_MB: String(MIN_TEMP_FREE_MB),
+    });
+    const line = render(fileWrite as string, { R7: "1760000000", MSG: msg });
+    expect(line).not.toContain("<<未绑定");
+    expect(findInstallerAbort(line, "1.9.31")).toEqual({ freeMB: 512, minMB: MIN_TEMP_FREE_MB });
+  });
+
+  it("墓碑弹框读 installer.log 找预检拦截记录；文案由 buildUpdateFailedMessage 决定，只在 offerReleasePage 时才开发布页", () => {
+    const start = main.indexOf('} else if (outcome === "failed") {');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = main.indexOf("墓碑核销异常", start);
+    expect(end).toBeGreaterThan(start);
+    const block = main.slice(start, end);
+    const read = block.indexOf('"installer.log"');
+    const build = block.indexOf("buildUpdateFailedMessage({");
+    const find = block.indexOf("findInstallerAbort(installerLogText, want)");
+    const show = block.indexOf("dialog.showErrorBox(failedMsg.title, failedMsg.body)");
+    const open = block.indexOf("if (failedMsg.offerReleasePage) void shell.openExternal(RELEASE_LATEST_URL)");
+    for (const [name, i] of Object.entries({ read, build, find, show, open })) {
+      expect(i, `墓碑弹框缺少 ${name}`).toBeGreaterThanOrEqual(0);
+    }
+    // 先读日志 → 把解析结果作为 abort 实参传给文案构造 → 弹框 → 按 offerReleasePage 决定是否开发布页
+    expect(build).toBeGreaterThan(read);
+    expect(find).toBeGreaterThan(build);
+    expect(find).toBeLessThan(block.indexOf("});", build));
+    expect(show).toBeGreaterThan(find);
+    expect(open).toBeGreaterThan(show);
+    // 不能再无条件开发布页（有 ABORT 时让人去手动装 = 往同样缺空间的路上送）
+    expect(block.match(/openExternal\(RELEASE_LATEST_URL\)/g)).toHaveLength(1);
   });
 });
 

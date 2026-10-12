@@ -41,3 +41,29 @@ export const formatFreeGB = (dir, statfs) => {
   const bytes = freeBytes(dir, statfs);
   return bytes === null ? "?" : formatGB(bytes);
 };
+
+/**
+ * 静默更新需要的 %TEMP% 所在盘剩余空间（MB）。
+ *
+ * 唯一的 JS 侧来源——主进程预检、弹框文案都读它，不再各写一个 "800"；
+ * packaging/installer.nsh 的 FLOWSHIP_MIN_TEMP_FREE_MB 必须与它相等（测试对账，包体增长要改两处时
+ * 漏一处会红）。
+ * 由来（v1.9.29 实测包）：7z 载荷 118MB 先落到 %TEMP%，再解压 447MB，峰值约 565MB，留余量取 800MB。
+ */
+export const MIN_TEMP_FREE_MB = 800;
+
+/**
+ * 静默更新预检：%TEMP% 所在盘够不够装。
+ * 口径与安装器 .onInit 完全一致：向下取整到 MB、严格小于阈值才算不够；量不到（UNC / 无权限）放行，
+ * 交给安装器兜底——宁可少拦也不能在量不准时把人挡在更新之外。
+ * @param {string} tmpDir 一般传 os.tmpdir()
+ * @param {(dir: string) => { bavail: number | bigint, bsize: number | bigint }} statfs 可注入
+ * @param {number} [minMB]
+ * @returns {{ enough: boolean, freeMB: number | null, minMB: number }}
+ */
+export const checkUpdateTempSpace = (tmpDir, statfs, minMB = MIN_TEMP_FREE_MB) => {
+  const bytes = freeBytes(tmpDir, statfs);
+  if (bytes === null) return { enough: true, freeMB: null, minMB };
+  const freeMB = bytesToMB(bytes);
+  return { enough: freeMB >= minMB, freeMB, minMB };
+};
