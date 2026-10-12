@@ -113,14 +113,31 @@ describe("Windows 安装诊断日志 + 静默更新预检（v1.9.30）", () => {
     expect(body.match(/Pop \$R[789]/g)).toHaveLength(3);
   });
 
-  it("日志内容只含 ASCII：Unicode 安装器的 FileWrite 按系统 ANSI 代码页落盘、中文会乱码", () => {
+  it("日志只含 ASCII 且路径只记盘符：FileWrite 按系统 ANSI 代码页（简中 = GBK）落盘、读取端按 UTF-8 解码，中文用户名路径必乱码", () => {
+    // 合并前评审 #4：原先的测试只校验模板字面量，而日志里写了 $INSTDIR / $TEMP，运行时的值保证不了
     const messages = [...installer.matchAll(/!insertmacro flowshipLog "([^"]*)"/g)].map(
       (m) => m[1],
     );
-    expect(messages.length).toBeGreaterThanOrEqual(3);
+    // init / ABORT / WARN / DECLINED / CONTINUE / done
+    expect(messages.length).toBeGreaterThanOrEqual(6);
     for (const msg of messages) {
       expect(msg, `日志文案含非 ASCII：${msg}`).toMatch(/^[\x20-\x7e]*$/);
+      // 变量白名单：版本 / 阈值常量 / $0-$9 寄存器；其余（$INSTDIR $TEMP $APPDATA …）一律可能带中文路径
+      for (const v of msg.matchAll(/\$\{(\w+)\}|\$(\w+)/g)) {
+        const name = (v[1] ?? v[2]) as string;
+        const ok =
+          name === "VERSION" || name === "FLOWSHIP_MIN_TEMP_FREE_MB" || /^[0-9]$/.test(name);
+        expect(ok, `日志 "${msg}" 引用了 $${name}：可能是含中文的完整路径`).toBe(true);
+      }
     }
+    // 寄存器里放的只是盘符（前 2 个字符，如 "E:"），完整路径由 UTF-8 的 main.log 提供
+    const init = nsisCode(macroBody("customInit"));
+    const install = nsisCode(macroBody("customInstall"));
+    expect(init).toContain("StrCpy $4 $INSTDIR 2");
+    expect(init).toContain("StrCpy $5 $TEMP 2");
+    expect(init).toContain("instDrive=$4 tempDrive=$5");
+    expect(install).toContain("StrCpy $4 $INSTDIR 2");
+    expect(install).toContain("instDrive=$4");
   });
 
   it("init 行在 customInit、done 行在 customInstall（done 带总耗时 / 标记结果，才能区分「没装完」和「装完了」）", () => {
@@ -128,6 +145,7 @@ describe("Windows 安装诊断日志 + 静默更新预检（v1.9.30）", () => {
     const install = macroBody("customInstall");
     expect(init).toContain('!insertmacro flowshipLog "init v${VERSION}');
     expect(init).toContain("tempFreeMB=");
+    expect(init).toContain("instDrive=");
     expect(install).toContain('!insertmacro flowshipLog "done v${VERSION}');
     expect(install).toContain("elapsedSec=$3");
     expect(install).toContain("marker=$1");
@@ -141,7 +159,7 @@ describe("Windows 安装诊断日志 + 静默更新预检（v1.9.30）", () => {
     expect(installer.slice(guard, decl)).not.toContain("!endif");
   });
 
-  it("预检：仅自动更新、量 %TEMP% 所在盘、低于阈值 Abort；量不到（?）放行", () => {
+  it("预检（自动更新）：量 %TEMP% 所在盘、低于阈值静默 Abort；量不到（?）放行", () => {
     const body = nsisCode(macroBody("customInit"));
     expect(body).toContain('GetDiskFreeSpaceEx(t "$TEMP"');
     // 未知空间的默认值必须在 GetDiskFreeSpaceEx 之后赋（调用的输出寄存器会覆盖 $2）
@@ -153,19 +171,83 @@ describe("Windows 安装诊断日志 + 静默更新预检（v1.9.30）", () => {
     expect(guard, "预检条件应为 isUpdated && 已知 && 低于阈值").toBeGreaterThanOrEqual(0);
     const below = body.indexOf("${andIf} $2 < ${FLOWSHIP_MIN_TEMP_FREE_MB}", guard);
     expect(below).toBeGreaterThan(guard);
-    // 恰好一个 Abort、且在上面这个守卫里；手动安装路径不 Abort（人在屏幕前、不靠退出来保护）
-    expect(body.match(/\bAbort\b/g)).toHaveLength(1);
-    expect(body.indexOf("Abort")).toBeGreaterThan(below);
-    expect(body.slice(guard, body.indexOf("Abort"))).toContain('flowshipLog "ABORT v${VERSION}');
+    // 这个守卫块里恰好一个 Abort 与一条 ABORT 日志（手动安装的弹框 / 取消在下面单独测）
+    const autoEnd = body.indexOf("${endIf}", guard);
+    const autoBlock = body.slice(guard, autoEnd);
+    expect(autoBlock.match(/\bAbort\b/g)).toHaveLength(1);
+    expect(autoBlock).toContain('flowshipLog "ABORT v${VERSION}');
+    // 自动更新是静默的：这个块里绝不能有 MessageBox（没界面、会把更新卡死在对话框上）
+    expect(autoBlock).not.toContain("MessageBox");
   });
 
-  it("预检在任何破坏性操作之前：早于 customInit 里的 taskkill；旧卸载器在安装段才跑（.onInit 的 Abort = 旧版本原样保留）", () => {
+  it("预检（手动安装）：量到且不够才弹框、默认「否」；静默 / 自动更新 / 量不到都不弹；选「是」继续、选「否」Abort 且旧版本没动", () => {
+    // 合并前评审 #2：installSection.nsh 无条件调用 uninstallOldVersion，手动覆盖安装同样会先搬走旧文件，
+    // 而安装向导不会告诉用户是空间的问题——只会在装到一半时看到失败页
     const body = nsisCode(macroBody("customInit"));
-    const abort = body.search(/^\s*Abort\s*$/m);
+    const guard = body.indexOf(
+      '${ifNot} ${isUpdated}\n  ${andIfNot} ${Silent}\n  ${andIf} $2 != "?"\n  ${andIf} $2 < ${FLOWSHIP_MIN_TEMP_FREE_MB}',
+    );
+    expect(guard, "手动预检条件应为 !isUpdated && !Silent && 已知 && 低于阈值").toBeGreaterThanOrEqual(0);
+    const end = body.indexOf("${endIf}", guard);
+    const block = body.slice(guard, end);
+
+    // 全 customInit 只有一个 MessageBox，且就在这个守卫块里
+    expect(body.match(/MessageBox/g)).toHaveLength(1);
+    const mb = block.match(/MessageBox (\S+) "([^"]*)" \/SD IDYES IDYES (\w+)/);
+    expect(mb, '应为 `MessageBox <flags> "文案" /SD IDYES IDYES <label>`').not.toBeNull();
+    const [, flags, text, label] = mb as RegExpMatchArray;
+    // 是 / 否按钮 + 警告图标 + 默认「否」（回车 / 空格 = 取消）
+    expect(flags.split("|").sort()).toEqual(["MB_DEFBUTTON2", "MB_ICONEXCLAMATION", "MB_YESNO"]);
+    // 文案：盘符 $5、剩余 MB $2、阈值取常量（不写死）、给出可执行的建议
+    expect(text).toContain("$5");
+    expect(text).toContain("$2");
+    expect(text).toContain("${FLOWSHIP_MIN_TEMP_FREE_MB}");
+    expect(text).toContain("清理");
+    expect(text).not.toMatch(/\b800\b/);
+
+    // 顺序：WARN 日志 → 弹框 → DECLINED 日志 → 出栈 → Abort → 标签 → CONTINUE 日志
+    const warn = block.indexOf('flowshipLog "WARN v${VERSION}');
+    const box = block.indexOf("MessageBox");
+    const declined = block.indexOf('flowshipLog "DECLINED v${VERSION}');
+    const abort = block.search(/^\s*Abort\s*$/m);
+    const labelAt = block.indexOf(`${label}:`);
+    const cont = block.indexOf('flowshipLog "CONTINUE v${VERSION}');
+    for (const [name, i] of Object.entries({ warn, box, declined, abort, labelAt, cont })) {
+      expect(i, `手动预检块缺少 ${name}`).toBeGreaterThanOrEqual(0);
+    }
+    expect(box).toBeGreaterThan(warn);
+    expect(declined).toBeGreaterThan(box);
+    expect(abort).toBeGreaterThan(declined);
+    // 选「是」跳过 Abort：标签必须在 Abort【之后】，否则选「是」也会退出（或 Abort 形同虚设）
+    expect(labelAt).toBeGreaterThan(abort);
+    expect(cont).toBeGreaterThan(labelAt);
+    expect(block.match(/\bAbort\b/g)).toHaveLength(1);
+  });
+
+  it("预检的栈纪律：customInit 进栈 4 个寄存器、每条退出路径（含两个 Abort）都按 LIFO 出栈", () => {
+    const body = nsisCode(macroBody("customInit"));
+    expect(body.match(/^\s*Push \$[2-5]$/gm)).toHaveLength(4);
+    // 两个 Abort 前都是 Pop $5 / $4 / $3 / $2；加上正常出口一份，共 3 份 × 4 次
+    expect(body.match(/Pop \$5\n\s*Pop \$4\n\s*Pop \$3\n\s*Pop \$2\n\s*Abort/g)).toHaveLength(2);
+    // Int64Op 的结果出栈（`Pop $2` 取除法结果）不是寄存器还原，先剔掉再数
+    const restores = body.replace(/System::Int64Op \$1 \/ \d+\n\s*Pop \$2/, "");
+    expect(restores.match(/^\s*Pop \$[2-5]$/gm)).toHaveLength(12);
+    expect(body.match(/\bAbort\b/g)).toHaveLength(2);
+    // customInstall 同样对称（新增 $4）
+    const install = nsisCode(macroBody("customInstall"));
+    expect(install.match(/^\s*Push \$\d$/gm)).toHaveLength(5);
+    expect(install.match(/^\s*Pop \$\d$/gm)).toHaveLength(5);
+  });
+
+  it("预检在任何破坏性操作之前：弹框与每个 Abort 都早于 customInit 里的 taskkill；旧卸载器在安装段才跑（.onInit 的 Abort = 旧版本原样保留）", () => {
+    const body = nsisCode(macroBody("customInit"));
     const kill = body.indexOf("nsExec::Exec 'taskkill");
-    expect(abort).toBeGreaterThanOrEqual(0);
-    expect(kill).toBeGreaterThan(abort);
-    // 安装目录归一化在日志 / 预检之前（日志里记的 instdir 是归一化后的真实目录）
+    expect(kill).toBeGreaterThanOrEqual(0);
+    const aborts = [...body.matchAll(/^\s*Abort\s*$/gm)].map((m) => m.index as number);
+    expect(aborts).toHaveLength(2);
+    for (const a of aborts) expect(kill).toBeGreaterThan(a);
+    expect(kill).toBeGreaterThan(body.indexOf("MessageBox"));
+    // 安装目录归一化在日志 / 预检之前（日志里记的盘符是归一化后的真实目录）
     expect(body.lastIndexOf("StrCpy $INSTDIR $INSTDIR $1 0")).toBeLessThan(
       body.indexOf("!insertmacro flowshipLog"),
     );

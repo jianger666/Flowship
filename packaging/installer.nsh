@@ -13,17 +13,23 @@
 ; 事后既不知道装到哪一步、也不知道耗时多久、更不知道当时盘上还剩多少空间。
 ; 这里在 %APPDATA%\fe-ai-flow\logs\installer.log（与壳的 main.log 同目录、
 ; 「导出诊断包」会一并带上）追加几行最小记录：
-;   init  = 安装器启动（版本 / 是否自动更新 / 安装目录 / %TEMP% 所在盘剩余空间）
-;   done  = 文件落盘完成（总耗时秒 / 主程序是否在 / 标记是否写成）
-;   ABORT = 静默更新预检不过、主动退出（此时旧版本一个文件都没动）
-; 只写 ASCII：FileWrite 在 Unicode 安装器里按系统 ANSI 代码页落盘，中文会变乱码。
+;   init      = 安装器启动（版本 / 是否自动更新 / 安装目录与 %TEMP% 的盘符 / %TEMP% 所在盘剩余空间）
+;   done      = 文件落盘完成（总耗时秒 / 主程序是否在 / 标记是否写成 / 安装目录盘符）
+;   ABORT     = 静默更新预检不过、主动退出（此时旧版本一个文件都没动）
+;   WARN      = 手动安装预检不过、弹框问用户（CONTINUE = 用户选了继续；DECLINED = 取消、旧版本没动）
+; 只写 ASCII、路径只记盘符（StrCpy $N $INSTDIR 2 → "E:"）：FileWrite 在 Unicode 安装器里按系统 ANSI
+; 代码页（简体中文是 GBK）落盘，而读取端（诊断包 / 主进程）按 UTF-8 解码——中文用户名路径必乱码。
+; 完整的安装目录由 main.log（UTF-8）提供。
 ; 写不进去（没权限 / 目录建不出来）一律静默忽略，绝不影响安装本身。
 ;
 ; 预检阈值 800MB 的由来（v1.9.29 实测包）：7z 载荷 118MB 先落到 %TEMP%，再解压 447MB 到
 ; %TEMP%\...\7z-out，最后整树拷到安装目录（electron-builder 的 extractUsing7za 两遍落盘）。
 ; 峰值约 565MB 压在 %TEMP% 所在盘（多数人是 C 盘，选 D 盘装的人恰恰常因为 C 盘小）。
-; 旧卸载器在更新时先把旧文件搬走再删——此后空间不够就是「旧的没了、新的没装全」，
-; 而静默安装没有任何提示。所以在 .onInit 里（任何破坏性操作之前）先量，不够就退出。
+; 旧卸载器在升级时先把旧文件搬走再删——此后空间不够就是「旧的没了、新的没装全」。
+; 这一步在手动安装（覆盖旧版）和自动更新里一视同仁（installSection.nsh 无条件调用 uninstallOldVersion），
+; 区别只在有没有人能看到提示：自动更新静默、没界面 → 直接 Abort；手动安装 → 弹框让用户选，默认「否」。
+; 所以在 .onInit 里（任何破坏性操作之前）先量。
+; 阈值与主进程预检共用一个数：electron-app/disk-space.mjs 的 MIN_TEMP_FREE_MB（测试对账，改一处漏一处会红）。
 !define FLOWSHIP_MIN_TEMP_FREE_MB 800
 
 !ifndef BUILD_UNINSTALLER
@@ -59,6 +65,7 @@
   Push $1
   Push $2
   Push $3
+  Push $4
   System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
   nsExec::Exec 'ie4uinit.exe -show'
 
@@ -107,7 +114,10 @@
   System::Call 'kernel32::GetTickCount()i.r3'
   IntOp $3 $3 - $flowshipInitTick
   IntOp $3 $3 / 1000
-  !insertmacro flowshipLog "done v${VERSION} updated=$2 marker=$1 elapsedSec=$3 instdir=$INSTDIR"
+  ; 只记盘符（见文件开头：路径含中文时 ANSI 落盘、读取端会乱码）
+  StrCpy $4 $INSTDIR 2
+  !insertmacro flowshipLog "done v${VERSION} updated=$2 marker=$1 elapsedSec=$3 instDrive=$4"
+  Pop $4
   Pop $3
   Pop $2
   Pop $1
@@ -159,13 +169,14 @@
     ${endIf}
   ${endIf}
 
-  ; 诊断记录 + 静默更新预检（见文件开头「安装诊断日志」一节）。
-  ; 此刻 .onInit 还没做任何破坏性操作（旧卸载器要等安装段才跑），所以 Abort = 旧版本原样保留；
-  ; 主进程已经 quit，下次手动打开时「更新墓碑」会发现版本没变、弹框请手动安装。
+  ; 诊断记录 + 磁盘空间预检（见文件开头「安装诊断日志」一节）。
+  ; 此刻 .onInit 还没做任何破坏性操作（旧卸载器要等安装段才跑），所以 Abort = 旧版本原样保留。
   System::Call 'kernel32::GetTickCount()i.r0'
   StrCpy $flowshipInitTick $0
   Push $2
   Push $3
+  Push $4
+  Push $5
   ; GetDiskFreeSpaceEx(目录, 调用者可用字节, 总字节, 总空闲字节)：取不到（UNC 等）返回 0、当未知处理。
   ; ⚠️ 三个输出寄存器 $1/$2/$3 都会被这次调用覆盖，所以「未知」的默认值必须在调用之后再赋。
   System::Call 'kernel32::GetDiskFreeSpaceEx(t "$TEMP", *l .r1, *l .r2, *l .r3) i .r0'
@@ -179,15 +190,44 @@
   ${else}
     StrCpy $3 "0"
   ${endIf}
-  !insertmacro flowshipLog "init v${VERSION} updated=$3 instdir=$INSTDIR temp=$TEMP tempFreeMB=$2"
+  ; 日志里的路径只记盘符（前 2 个字符，如 "E:"）：见文件开头，完整路径含中文会乱码。
+  StrCpy $4 $INSTDIR 2
+  StrCpy $5 $TEMP 2
+  !insertmacro flowshipLog "init v${VERSION} updated=$3 instDrive=$4 tempDrive=$5 tempFreeMB=$2"
+  ; 自动更新（静默、没界面）：不够就直接退出。主进程已经 quit，下次手动打开时「更新墓碑」会发现
+  ; 版本没变、读本日志里的 ABORT 弹框说明空间不足。
   ${if} ${isUpdated}
   ${andIf} $2 != "?"
   ${andIf} $2 < ${FLOWSHIP_MIN_TEMP_FREE_MB}
     !insertmacro flowshipLog "ABORT v${VERSION} tempFreeMB=$2 < ${FLOWSHIP_MIN_TEMP_FREE_MB} old install untouched"
+    Pop $5
+    Pop $4
     Pop $3
     Pop $2
     Abort
   ${endIf}
+  ; 手动安装（有界面、人在屏幕前）：覆盖安装同样会先搬走旧文件，但安装向导不会告诉用户是空间的问题——
+  ; 装到一半没空间了只会看到一个失败页。所以量到且不够时先问一句：默认「否」（回车 / 空格 = 取消），
+  ; 选「是」才继续（用户知道风险，日志留 CONTINUE 便于事后排查）。
+  ; 量不到（?）、静默安装（/S 无界面可问）、自动更新（上面已处理）都不弹。
+  ; /SD IDYES：万一在没有桌面的环境里跑，按「继续」走，等价于改动前的行为、不会把安装卡死在对话框上。
+  ${ifNot} ${isUpdated}
+  ${andIfNot} ${Silent}
+  ${andIf} $2 != "?"
+  ${andIf} $2 < ${FLOWSHIP_MIN_TEMP_FREE_MB}
+    !insertmacro flowshipLog "WARN v${VERSION} tempFreeMB=$2 < ${FLOWSHIP_MIN_TEMP_FREE_MB} asking user"
+    MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2 "临时文件所在的磁盘 $5 仅剩约 $2 MB 可用空间，低于安装所需的 ${FLOWSHIP_MIN_TEMP_FREE_MB} MB。$\n$\n空间不足时安装可能中途失败；若是覆盖安装，旧版本会先被移除，失败后程序将无法使用（任务数据不受影响）。$\n$\n建议先清理该磁盘（清空回收站、删除临时文件），再重新运行本安装程序。$\n$\n是否仍要继续安装？" /SD IDYES IDYES flowshipSpaceContinue
+    !insertmacro flowshipLog "DECLINED v${VERSION} user cancelled, old install untouched"
+    Pop $5
+    Pop $4
+    Pop $3
+    Pop $2
+    Abort
+    flowshipSpaceContinue:
+    !insertmacro flowshipLog "CONTINUE v${VERSION} user chose to install anyway"
+  ${endIf}
+  Pop $5
+  Pop $4
   Pop $3
   Pop $2
 
