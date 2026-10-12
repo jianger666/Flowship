@@ -37,6 +37,7 @@ import {
   readdirSync,
   existsSync,
   readFileSync,
+  statfsSync,
   writeFileSync,
 } from "node:fs";
 import net from "node:net";
@@ -52,6 +53,12 @@ import {
   classifyWinUpdateAttempt,
   hasSilentUpdateMarker,
 } from "./win-update-guard.mjs";
+// 首次启动判定（标记按版本记、更新后的第一次启动同样按「首次」给宽限）：纯函数在 ./first-boot.mjs
+import {
+  buildFirstBootMarker,
+  pickBootTimeoutMs,
+  shouldTreatAsFirstBoot,
+} from "./first-boot.mjs";
 // 防后台节流实验开关（v1.9.28、默认关）：纯函数在 ./app-nap.mjs（单测直接 import）
 import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
 // NODE_OPTIONS 取值含空格时的引用（崩溃取证目录在 macOS 的「Application Support」下）：./node-options.mjs
@@ -202,6 +209,49 @@ const execFileP = (cmd, args) =>
       resolve(err ? "" : String(stdout)),
     );
   });
+
+// 目录所在盘的剩余空间（GB、一位小数）；取不到记 "?"。
+// Windows「装不上 / 更新后 App 没了 / 启动慢」常和系统盘快满有关（安装峰值要在 %TEMP% 所在盘
+// 落约 565MB），日志里留个底，事后才能证实或排除这条线索。
+const diskFreeGB = (dir) => {
+  try {
+    const s = statfsSync(dir);
+    return ((Number(s.bavail) * Number(s.bsize)) / 1073741824).toFixed(1);
+  } catch {
+    return "?";
+  }
+};
+
+// 启动慢到什么程度才去查杀软清单（常规机器 server 就绪 <2s，超过 30s 基本只能是 IO / 杀软在拦）
+const SLOW_BOOT_PROBE_MS = 30_000;
+
+// Windows 安全中心登记的杀软清单（WMI SecurityCenter2；Server 版 Windows 没有这个命名空间、取不到就记「没取到」）。
+// 只在「启动偏慢」时跑一次、后台、10s 超时；纯取证、结果只进日志、不影响任何行为。
+const logSecurityProducts = async () => {
+  if (process.platform !== "win32") return;
+  const out = await new Promise((resolve) => {
+    execFile(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | ForEach-Object { $_.displayName }",
+      ],
+      { windowsHide: true, timeout: 10_000 },
+      (err, stdout) => resolve(err ? "" : String(stdout)),
+    );
+  });
+  const names = [
+    ...new Set(
+      out
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  ];
+  log(`[main] 启动偏慢（>${SLOW_BOOT_PROBE_MS / 1000}s）时的杀软清单：${names.join("、") || "（没取到）"}`);
+};
 
 // ---------- 端口冲突处理 ----------
 
@@ -467,19 +517,26 @@ const waitForReady = async (timeoutMs = 60_000) => {
 };
 
 // 首次启动标记：Windows 下冷盘 + Defender 首扫 + 未签名 SmartScreen，server 首次起床
-// 经常超过常规超时。标记落 userData，第一次就绪后写，之后走常规超时。
+// 经常超过常规超时。标记落 userData，server 就绪后写，之后走常规超时。
+// v1.9.30：标记里记版本号——更新后的第一次启动也是「冷」的（全新的未签名 exe + 9.6k 个刚写盘的
+// 新文件，杀软眼里和全新安装没区别），之前全局一次性标记会让它只拿到常规 60s。判定见 ./first-boot.mjs。
 const firstBootDoneFile = () =>
   path.join(app.getPath("userData"), "first-boot-done");
 const isFirstBoot = () => {
+  let raw = null;
   try {
-    return !existsSync(firstBootDoneFile());
+    raw = readFileSync(firstBootDoneFile(), "utf8");
   } catch {
-    return false;
+    raw = null; // 文件不存在 = 全新安装
   }
+  return shouldTreatAsFirstBoot(raw, app.getVersion());
 };
 const markFirstBootDone = () => {
   try {
-    writeFileSync(firstBootDoneFile(), JSON.stringify({ ts: Date.now() }));
+    writeFileSync(
+      firstBootDoneFile(),
+      JSON.stringify(buildFirstBootMarker(app.getVersion())),
+    );
   } catch {
     // 写不进下次还按首次对待，无害
   }
@@ -1916,6 +1973,12 @@ const installWinUpdate = async (version) => {
     /* 忽略 */
   }
   await sleep(1500);
+  // 拉起安装器前的现场（v1.9.30）：安装目录 / %TEMP% 所在盘剩余空间。安装器自己的预检
+  // 看的是同一个盘，两边对得上才能判断「预检拦下」还是「别的原因」。
+  log(
+    `[updater] win quitAndInstall(silent) 目标 v${version} 当前 v${app.getVersion()} ` +
+      `installFree=${diskFreeGB(exeDir)}G tmpFree=${diskFreeGB(os.tmpdir())}G`,
+  );
   winAutoUpdater.quitAndInstall(true, true);
 };
 
@@ -1924,6 +1987,15 @@ const ensureWinAutoUpdater = async () => {
   // electron-updater 是 CJS、ESM 下走 default 再解构最稳
   const { default: updater } = await import("electron-updater");
   winAutoUpdater = updater.autoUpdater;
+  // 把 electron-updater 自己的日志接进 main.log（v1.9.30）。它默认只写 console，打包后没终端、
+  // 全部丢失——「查到哪个版本 / 从哪下载 / 装包路径 / 以什么参数拉起安装器」这些更新排障最关键的
+  // 事实，之前一条都留不下。只接 info/warn/error（debug 太吵，且它对 debug 是可选调用）。
+  const fmtUpdaterLog = (m) => (m instanceof Error ? m.stack || m.message : String(m));
+  winAutoUpdater.logger = {
+    info: (m) => log(`[electron-updater] ${fmtUpdaterLog(m)}`),
+    warn: (m) => log(`[electron-updater] WARN ${fmtUpdaterLog(m)}`),
+    error: (m) => log(`[electron-updater] ERROR ${fmtUpdaterLog(m)}`),
+  };
   winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
   winAutoUpdater.autoInstallOnAppQuit = false; // 退出不偷偷装，只在用户点徽标确认后装
   // 不设 installDirectory：用注册表 InstallLocation（见 installWinUpdate 注释）。
@@ -2128,6 +2200,14 @@ if (!app.requestSingleInstanceLock()) {
           `cpu=${cpus.length}x${cpus[0]?.model?.trim() || "?"} ` +
           `memTotal=${Math.round(os.totalmem() / 1073741824)}G memFree=${Math.round(os.freemem() / 1073741824)}G`,
       );
+      // 磁盘 + 启动参数（v1.9.30）：安装器拉起的首启带 --updated / --force-run；
+      // 盘剩余空间用来排除「系统盘快满」这条线索。
+      log(
+        `[main] disk install=${path.dirname(process.execPath)} free=${diskFreeGB(path.dirname(process.execPath))}G ` +
+          `tmp=${os.tmpdir()} free=${diskFreeGB(os.tmpdir())}G ` +
+          `userData free=${diskFreeGB(app.getPath("userData"))}G ` +
+          `argv=${process.argv.slice(1).join(" ") || "（无）"}`,
+      );
     } catch {
       /* 快照失败不挡启动 */
     }
@@ -2198,7 +2278,7 @@ if (!app.requestSingleInstanceLock()) {
           setUpdateState({ phase: "available", version: want, error: "上次静默安装未完成" });
           dialog.showErrorBox(
             "上次更新没有装上",
-            `目标 v${want} 没装上、当前还是 v${app.getVersion()}。\n\n请去发布页手动下载安装包、装到原目录（数据不受影响）。`,
+            `目标 v${want} 没装上、当前还是 v${app.getVersion()}。\n\n请去发布页手动下载安装包、装到原目录（数据不受影响）。\n\n常见原因：系统盘（临时目录所在盘）剩余空间不足 800MB、杀毒软件拦截。安装过程记录在：\n${path.join(app.getPath("userData"), "logs", "installer.log")}`,
           );
           void shell.openExternal(RELEASE_LATEST_URL);
         }
@@ -2235,7 +2315,7 @@ if (!app.requestSingleInstanceLock()) {
     // 首次启动给足时间（150s），常规 60s；超时后 server 还活着 = 只是慢（不是挂了），
     // 给"继续等待"而不是直接判死刑——之前一次性 30s 是 Windows 首次必现启动超时的根因。
     const firstBoot = isFirstBoot();
-    const bootTimeoutMs = firstBoot ? 150_000 : 60_000;
+    const bootTimeoutMs = pickBootTimeoutMs(firstBoot);
     log(`[main] 等 server 就绪（timeout=${bootTimeoutMs} firstBoot=${firstBoot})`);
     const bootWaitStart = Date.now();
     const bootElapsedS = () =>
@@ -2267,7 +2347,12 @@ if (!app.requestSingleInstanceLock()) {
     }
     if (serverReady) {
       markFirstBootDone();
-      log(`[main] server 就绪、轮询耗时 ${((Date.now() - bootWaitStart) / 1000).toFixed(1)}s`);
+      const bootElapsedMs = Date.now() - bootWaitStart;
+      log(`[main] server 就绪、轮询耗时 ${(bootElapsedMs / 1000).toFixed(1)}s`);
+      // 启动偏慢（>30s）时顺手记下机器上的杀软清单：冷启动只读 ~430 个文件、服务端 CPU 不到 1s，
+      // 慢几乎只可能慢在「首次读文件被拦下来扫」，有清单才能把「某某杀软」和「慢」对上号。
+      // 就绪之后才查（不跟启动抢 CPU / 磁盘）、后台跑、超时 10s 自杀。
+      if (bootElapsedMs > SLOW_BOOT_PROBE_MS) void logSecurityProducts();
       // 就绪后预热（fire-and-forget，5s 超时防半死 server 挂住 socket）：登录 shell 合并 / 迁移 / 组库 sync / 目录预热
       // 本来全挤在启动窗口抢冷盘，已搬到这里（见 boot-warmup.ts + /api/boot-warmup）。
       void fetch(`${BASE_URL}/api/boot-warmup`, {
@@ -2300,7 +2385,7 @@ if (!app.requestSingleInstanceLock()) {
       dialog.showErrorBox(
         "启动超时",
         process.platform === "win32"
-          ? "内部服务多次等待仍没有就绪。\n\n首次启动时安全软件全盘扫描会很慢，可重开再试；仍不行请检查是否有残留进程占用端口后重试。"
+          ? `内部服务多次等待仍没有就绪。\n\n首次启动时安全软件全盘扫描会很慢，可重开再试；仍不行请检查是否有残留进程占用端口后重试。\n\n反馈问题时请把这个文件夹整个发给开发者（里面有启动日志和安装日志）：\n${path.join(app.getPath("userData"), "logs")}`
           : "内部服务多次等待仍没有就绪、请关闭应用重试。",
       );
       quitting = true;

@@ -5,6 +5,7 @@
  * - 版本 / 平台 / Node 信息
  * - IDE 探测结果（探到哪个可执行文件、「在 IDE 打开没反应」类问题一眼定位）
  * - 配置概要（**脱敏**：apiKey / gitToken 只留前 6 位 + 长度、MCP 配置只留 server 名）
+ * - installer.log（Windows 安装器每次安装 / 自动更新写的几行：耗时 / 剩余空间 / 预检结果；没有则不出现）
  * - main.log 尾部（壳 + server 全部输出都在这份里、默认取最后 ~300KB）
  *
  * 落地位置：~/Downloads（找不到回退数据目录）、文件名带时间戳不互相覆盖。
@@ -19,6 +20,10 @@ import { listIdeToolsDetailed } from "./ide-tools";
 
 // main.log 尾部截取量——太大发飞书费劲、300KB 足够覆盖最近几小时
 const LOG_TAIL_BYTES = 300 * 1024;
+
+// installer.log（Windows 安装器每次安装 / 自动更新追加几行，与 main.log 同目录）：
+// 总共才几 KB，64KB 只是防被写爆的兜底，取尾部即可
+const INSTALLER_LOG_TAIL_BYTES = 64 * 1024;
 
 // 秘钥脱敏：留前 6 位 + 总长度（足够对上「配没配 / 配的是不是那把」、不泄漏本体）
 const maskSecret = (v: unknown): string => {
@@ -66,23 +71,46 @@ const readSanitizedConfig = async (): Promise<string> => {
   }
 };
 
+// 读文件尾部 maxBytes 字节（文件不存在 / 读不了会抛、由调用方决定怎么呈现）
+const readFileTail = async (file: string, maxBytes: number): Promise<string> => {
+  const stat = await fs.stat(file);
+  const start = Math.max(0, stat.size - maxBytes);
+  const fh = await fs.open(file, "r");
+  try {
+    const buf = Buffer.alloc(stat.size - start);
+    await fh.read(buf, 0, buf.length, start);
+    return buf.toString("utf8");
+  } finally {
+    await fh.close();
+  }
+};
+
+// 壳日志目录：dataRoot = <userData>/data、日志在 <userData>/logs
+const shellLogsDir = (): string => path.join(dataRoot(), "..", "logs");
+
 // 读 main.log 尾部（壳把 server stdout 也写进这份、一份日志全覆盖）
 const readMainLogTail = async (): Promise<string> => {
-  // dataRoot = <userData>/data、日志在 <userData>/logs/main.log
-  const logPath = path.join(dataRoot(), "..", "logs", "main.log");
+  const logPath = path.join(shellLogsDir(), "main.log");
   try {
-    const stat = await fs.stat(logPath);
-    const start = Math.max(0, stat.size - LOG_TAIL_BYTES);
-    const fh = await fs.open(logPath, "r");
-    try {
-      const buf = Buffer.alloc(stat.size - start);
-      await fh.read(buf, 0, buf.length, start);
-      return buf.toString("utf8");
-    } finally {
-      await fh.close();
-    }
+    return await readFileTail(logPath, LOG_TAIL_BYTES);
   } catch (err) {
     return `（main.log 读取失败：${logPath}、${err instanceof Error ? err.message : String(err)}——dev 模式没有壳日志属正常）`;
+  }
+};
+
+/**
+ * 读 installer.log 尾部：Windows 安装器每次安装 / 自动更新写几行（init / done / ABORT，含耗时与剩余空间）。
+ * 「更新后 App 没了 / 装到一半」这类黑盒问题靠它定位。文件不存在（mac / 没走过新安装器）返回 null、
+ * 诊断包里就不出现这一节，不制造「读取失败」的噪声。
+ */
+export const readInstallerLogTail = async (): Promise<string | null> => {
+  try {
+    return await readFileTail(
+      path.join(shellLogsDir(), "installer.log"),
+      INSTALLER_LOG_TAIL_BYTES,
+    );
+  } catch {
+    return null;
   }
 };
 
@@ -92,10 +120,11 @@ const readMainLogTail = async (): Promise<string> => {
  * @returns 落盘绝对路径
  */
 export const exportDiagnostics = async (appVersion?: string): Promise<string> => {
-  const [ideTools, config, logTail] = await Promise.all([
+  const [ideTools, config, logTail, installerLog] = await Promise.all([
     listIdeToolsDetailed(),
     readSanitizedConfig(),
     readMainLogTail(),
+    readInstallerLogTail(),
   ]);
 
   const content = [
@@ -113,6 +142,13 @@ export const exportDiagnostics = async (appVersion?: string): Promise<string> =>
     "===== 配置概要（已脱敏） =====",
     config,
     "",
+    ...(installerLog === null
+      ? []
+      : [
+          `===== installer.log（Windows 安装 / 自动更新记录，最后 ${Math.round(INSTALLER_LOG_TAIL_BYTES / 1024)}KB；ts 是 Unix 秒） =====`,
+          installerLog,
+          "",
+        ]),
     `===== main.log 尾部（最后 ${Math.round(LOG_TAIL_BYTES / 1024)}KB） =====`,
     logTail,
   ].join("\n");

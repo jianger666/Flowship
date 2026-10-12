@@ -8,15 +8,87 @@
 ;   2. ie4uinit -show —— Win10/11 重建图标缓存（best-effort、失败无害）
 ; 注：任务栏「固定」的图标是用户级缓存、个别机器仍需取消固定再重新固定一次。
 
+; ===== 安装诊断日志 + 静默更新预检（v1.9.30）=====
+; 为什么：Windows 用户「更新后 App 没了 / 安装卡住 / 装到一半」是黑盒——静默安装没有任何界面，
+; 事后既不知道装到哪一步、也不知道耗时多久、更不知道当时盘上还剩多少空间。
+; 这里在 %APPDATA%\fe-ai-flow\logs\installer.log（与壳的 main.log 同目录、
+; 「导出诊断包」会一并带上）追加几行最小记录：
+;   init  = 安装器启动（版本 / 是否自动更新 / 安装目录 / %TEMP% 所在盘剩余空间）
+;   done  = 文件落盘完成（总耗时秒 / 主程序是否在 / 标记是否写成）
+;   ABORT = 静默更新预检不过、主动退出（此时旧版本一个文件都没动）
+; 只写 ASCII：FileWrite 在 Unicode 安装器里按系统 ANSI 代码页落盘，中文会变乱码。
+; 写不进去（没权限 / 目录建不出来）一律静默忽略，绝不影响安装本身。
+;
+; 预检阈值 800MB 的由来（v1.9.29 实测包）：7z 载荷 118MB 先落到 %TEMP%，再解压 447MB 到
+; %TEMP%\...\7z-out，最后整树拷到安装目录（electron-builder 的 extractUsing7za 两遍落盘）。
+; 峰值约 565MB 压在 %TEMP% 所在盘（多数人是 C 盘，选 D 盘装的人恰恰常因为 C 盘小）。
+; 旧卸载器在更新时先把旧文件搬走再删——此后空间不够就是「旧的没了、新的没装全」，
+; 而静默安装没有任何提示。所以在 .onInit 里（任何破坏性操作之前）先量，不够就退出。
+!define FLOWSHIP_MIN_TEMP_FREE_MB 800
+
+!ifndef BUILD_UNINSTALLER
+  ; 安装器启动时的 GetTickCount，用来在 customInstall 里算总耗时
+  Var flowshipInitTick
+!endif
+
+; 追加一行日志："[ts=<unix 秒>] <MSG>"。全程保护寄存器（Push/Pop），失败不报错。
+!macro flowshipLog MSG
+  Push $R7
+  Push $R8
+  Push $R9
+  ReadEnvStr $R9 "APPDATA"
+  ${if} $R9 != ""
+    ${StdUtils.Time} $R7
+    CreateDirectory "$R9\fe-ai-flow\logs"
+    ClearErrors
+    FileOpen $R8 "$R9\fe-ai-flow\logs\installer.log" a
+    ${IfNot} ${Errors}
+      FileSeek $R8 0 END
+      FileWrite $R8 "[ts=$R7] ${MSG}$\r$\n"
+      FileClose $R8
+    ${EndIf}
+    ClearErrors
+  ${endIf}
+  Pop $R9
+  Pop $R8
+  Pop $R7
+!macroend
+
 !macro customInstall
+  Push $0
+  Push $1
+  Push $2
+  Push $3
   System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
   nsExec::Exec 'ie4uinit.exe -show'
+
+  ; 新安装器标记 `.silent-update-ok`：主进程凭它才敢静默更新（旧版本装的目录没有它、
+  ; 旧卸载器有已知缺陷，必须先手动装一次过渡）。
+  ; v1.9.30：手动安装也必须落标记。之前只在 ${isUpdated}（自动更新）分支里写——
+  ; 而手动装的人从来不走那条路径，于是门禁永远拒绝他们、弹的「手动更新一次」装完还是没标记，
+  ; 死循环（大多数 Windows 用户都是手动装的，这就是「更新总是有问题」）。
+  ; 仍然要求 $appExe 存在：半截安装（旧目录已清空、新文件没写全、$appExe 缺失）绝不落标记，
+  ; 否则下次门禁被半截目录骗过、直接静默往坏目录里装。
+  StrCpy $1 "no-appExe"
+  ${if} ${FileExists} "$appExe"
+    StrCpy $1 "marker-write-failed"
+    ClearErrors
+    FileOpen $0 "$INSTDIR\.silent-update-ok" w
+    ${IfNot} ${Errors}
+      FileWrite $0 "${VERSION}"
+      FileClose $0
+      StrCpy $1 "ok"
+    ${EndIf}
+    ClearErrors
+  ${endIf}
 
   ; 自更新：旧卸载器可能已经删掉快捷方式，keepShortcuts 也只 rename 不改目标。
   ; 装完强制写回指向当前 $INSTDIR 里的 exe，避免桌面图标「找不到应用」。
   ; v1.9.13：$appExe 不存在（新文件没写进去、旧目录已被清空的半截状态）时绝不重建——
   ; 否则快捷方式会被指向一个不存在的 exe，比“旧快捷方式悬空”更难排查。
+  StrCpy $2 "0"
   ${if} ${isUpdated}
+    StrCpy $2 "1"
     ${if} ${FileExists} "$appExe"
       CreateShortCut "$newDesktopLink" "$appExe" "" "$appExe" 0 "" "" "${APP_DESCRIPTION}"
       ClearErrors
@@ -25,20 +97,21 @@
       ClearErrors
       WinShell::SetLnkAUMI "$newStartMenuLink" "${APP_ID}"
       System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
-      ; 新安装器标记：$appExe 存在才落 `.silent-update-ok`，主进程凭它才敢静默更新。
-      ; 半截安装（旧目录已清空、新文件没写全、$appExe 缺失）绝不落标记——
-      ; 否则下次门禁被半截目录骗过、直接静默往坏目录里装。
-      ClearErrors
-      FileOpen $0 "$INSTDIR\.silent-update-ok" w
-      ${IfNot} ${Errors}
-        FileWrite $0 "1"
-        FileClose $0
-      ${EndIf}
-      ClearErrors
     ${else}
       DetailPrint "skip shortcut rewrite: $appExe missing"
     ${endIf}
   ${endIf}
+
+  ; 完成记录：总耗时 = 安装器启动（customInit）到文件全部落盘的秒数。
+  ; 注意：手动安装包含用户在向导页（选目录 / 点下一步）停留的时间；静默更新才是纯安装耗时。
+  System::Call 'kernel32::GetTickCount()i.r3'
+  IntOp $3 $3 - $flowshipInitTick
+  IntOp $3 $3 / 1000
+  !insertmacro flowshipLog "done v${VERSION} updated=$2 marker=$1 elapsedSec=$3 instdir=$INSTDIR"
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
 !macroend
 
 ; 手动安装器启动时先清残留进程（同事实测「安装一直卡住、提示 Flowship 无法关闭」的根因）：
@@ -85,6 +158,38 @@
       StrCpy $INSTDIR $INSTDIR $1 0
     ${endIf}
   ${endIf}
+
+  ; 诊断记录 + 静默更新预检（见文件开头「安装诊断日志」一节）。
+  ; 此刻 .onInit 还没做任何破坏性操作（旧卸载器要等安装段才跑），所以 Abort = 旧版本原样保留；
+  ; 主进程已经 quit，下次手动打开时「更新墓碑」会发现版本没变、弹框请手动安装。
+  System::Call 'kernel32::GetTickCount()i.r0'
+  StrCpy $flowshipInitTick $0
+  Push $2
+  Push $3
+  ; GetDiskFreeSpaceEx(目录, 调用者可用字节, 总字节, 总空闲字节)：取不到（UNC 等）返回 0、当未知处理。
+  ; ⚠️ 三个输出寄存器 $1/$2/$3 都会被这次调用覆盖，所以「未知」的默认值必须在调用之后再赋。
+  System::Call 'kernel32::GetDiskFreeSpaceEx(t "$TEMP", *l .r1, *l .r2, *l .r3) i .r0'
+  StrCpy $2 "?"
+  ${if} $0 != 0
+    System::Int64Op $1 / 1048576
+    Pop $2
+  ${endIf}
+  ${if} ${isUpdated}
+    StrCpy $3 "1"
+  ${else}
+    StrCpy $3 "0"
+  ${endIf}
+  !insertmacro flowshipLog "init v${VERSION} updated=$3 instdir=$INSTDIR temp=$TEMP tempFreeMB=$2"
+  ${if} ${isUpdated}
+  ${andIf} $2 != "?"
+  ${andIf} $2 < ${FLOWSHIP_MIN_TEMP_FREE_MB}
+    !insertmacro flowshipLog "ABORT v${VERSION} tempFreeMB=$2 < ${FLOWSHIP_MIN_TEMP_FREE_MB} old install untouched"
+    Pop $3
+    Pop $2
+    Abort
+  ${endIf}
+  Pop $3
+  Pop $2
 
   ; 更新路径不杀任何进程：主进程 before-quit 已按 server PID 精确清理；按镜像名杀
   ; 分不清主程序 / server 子进程（同一个 exe 镜像），/T 更会顺手杀掉 electron-updater
