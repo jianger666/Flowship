@@ -62,7 +62,9 @@ describe("启动超时不再一刀切（首次冷启动给足时间）", () => {
   it("诊断日志：机器快照 + 磁盘剩余 + 启动参数 + 每轮耗时 + 失败总结（两次启动对比用）", () => {
     expect(main).toContain("[main] machine platform=");
     expect(main).toContain("[main] disk install=");
-    expect(main).toContain("statfsSync(dir)");
+    // 换算在 disk-space.mjs（有单测）；壳里只注入 statfsSync、不再内联除数
+    expect(main).toContain("formatFreeGB(dir, statfsSync)");
+    expect(main).not.toContain("/ 1073741824).toFixed");
     expect(main).toContain("argv=");
     expect(main).toContain("首轮等待");
     expect(main).toContain("续等一轮");

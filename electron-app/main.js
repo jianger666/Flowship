@@ -53,6 +53,8 @@ import {
   classifyWinUpdateAttempt,
   hasSilentUpdateMarker,
 } from "./win-update-guard.mjs";
+// 磁盘剩余空间换算（预检 / 日志共用、statfs 注入以便在 Mac 上单测）：纯函数在 ./disk-space.mjs
+import { formatFreeGB } from "./disk-space.mjs";
 // 首次启动判定（标记按版本记、更新后的第一次启动同样按「首次」给宽限）：纯函数在 ./first-boot.mjs
 import {
   buildFirstBootMarker,
@@ -213,14 +215,8 @@ const execFileP = (cmd, args) =>
 // 目录所在盘的剩余空间（GB、一位小数）；取不到记 "?"。
 // Windows「装不上 / 更新后 App 没了 / 启动慢」常和系统盘快满有关（安装峰值要在 %TEMP% 所在盘
 // 落约 565MB），日志里留个底，事后才能证实或排除这条线索。
-const diskFreeGB = (dir) => {
-  try {
-    const s = statfsSync(dir);
-    return ((Number(s.bavail) * Number(s.bsize)) / 1073741824).toFixed(1);
-  } catch {
-    return "?";
-  }
-};
+// 单位换算在 ./disk-space.mjs（纯函数 + 单测）：这里不再内联——差 1024 倍的写错没人看得出来。
+const diskFreeGB = (dir) => formatFreeGB(dir, statfsSync);
 
 // 启动慢到什么程度才去查杀软清单（常规机器 server 就绪 <2s，超过 30s 基本只能是 IO / 杀软在拦）
 const SLOW_BOOT_PROBE_MS = 30_000;

@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { BYTES_PER_MB } from "../electron-app/disk-space.mjs";
+
 const read = (relativePath: string): string =>
   readFileSync(path.resolve(import.meta.dirname, "..", relativePath), "utf8");
 
@@ -172,6 +174,33 @@ describe("Windows 安装诊断日志 + 静默更新预检（v1.9.30）", () => {
     expect(threshold).toBeGreaterThanOrEqual(118 + 447);
     // 也别设成吓人的大数（会把空间其实够的人误拦成「永远手动更新」）
     expect(threshold).toBeLessThanOrEqual(2048);
+  });
+
+  it("单位换算：NSIS 把字节除以 1048576 得 MB，与 JS 侧 BYTES_PER_MB 同源（错一位 = 几乎所有人被拦 / 预检形同虚设）", () => {
+    // 合并前评审：这一处原先零测试保护——改成 `/ 1073741824`（GB）或 `/ 1024`（KB）测试仍全绿
+    const body = nsisCode(macroBody("customInit"));
+    const divisor = body.match(/System::Int64Op \$1 \/ (\d+)/)?.[1];
+    expect(divisor, "未找到 `System::Int64Op $1 / <除数>`").toBeDefined();
+    expect(Number(divisor)).toBe(BYTES_PER_MB);
+    // 结果必须落进 $2（后面的日志与阈值比较都读它）
+    const op = body.indexOf("System::Int64Op $1 /");
+    expect(body.slice(op, op + 80)).toContain("Pop $2");
+    // 量的是「调用者可用空间」（第一个输出寄存器 $1），不是总容量 / 总空闲
+    expect(body).toContain('GetDiskFreeSpaceEx(t "$TEMP", *l .r1, *l .r2, *l .r3)');
+  });
+
+  it("耗时起点：customInit 记下 GetTickCount、customInstall 用它求差并换成秒（漏赋值 elapsedSec 会是垃圾值）", () => {
+    const init = nsisCode(macroBody("customInit"));
+    const install = nsisCode(macroBody("customInstall"));
+    const tick = init.indexOf("GetTickCount()i.r0");
+    const assign = init.indexOf("StrCpy $flowshipInitTick $0");
+    expect(tick).toBeGreaterThanOrEqual(0);
+    // 先取 tick、再赋给 $flowshipInitTick（反过来赋的是上一条指令留下的旧值）
+    expect(assign).toBeGreaterThan(tick);
+    expect(install).toContain("GetTickCount()i.r3");
+    expect(install).toContain("IntOp $3 $3 - $flowshipInitTick");
+    // 毫秒 → 秒
+    expect(install).toContain("IntOp $3 $3 / 1000");
   });
 
   it("主进程：electron-updater 日志接进 main.log、拉起安装器前记磁盘现场、墓碑弹框指向 installer.log", () => {
