@@ -278,3 +278,171 @@ electron-updater 的 logger 只接 info / warn / error 是安全的、首启标�
 
 需要强调的是：处置里新增的 NSIS `MessageBox` 与 PowerShell 脚本**同样落在只有真机才能验证的运行时上**（评审指出的风险类型并没有因此消失）——它们有契约测试 + 变异验证防回退，
 也能通过真实 makensis `-WX` 编译，但弹框是否真的弹出、默认按钮、取消后旧版本是否完好，仍以 §8 的 E2 为准。
+
+## 10. 慢机器取证日志速查（测试包 1.9.30-localtest.3 起）
+
+背景：同事的机器「安装慢 + 启动慢」，没有 Windows 真机实测数据，只能靠一次安装 + 一次启动把能想到的证据全留在日志里。
+诊断包（设置页「导出诊断包」）由 **server** 生成：只有 server 也是新版时才带 `installer.log`。
+**localtest 测试包只替换了 Electron 壳（asar），server 仍是官方 v1.9.29，所以导出的诊断包没有 `installer.log`**（2026-10-13 第一份回传日志已证实）——
+要拿安装阶段的证据，必须让对方直接发 `%APPDATA%\fe-ai-flow\logs\installer.log`；启动卡死进不了设置页时，打包整个 `logs\` 文件夹。
+`main.log` 只取最后 300KB，所以**装完第一次启动后别先用很久**；但也**不要一进主界面就导出**：
+`[boot] timeline / requests / gpu / procs` 在亮窗后 6s 写，随后是杀软清单，最后才是 PowerShell 环境探测（`[boot] env …`，最长 20s）。
+**亮窗后至少等 1 分钟再导出**，否则 `env` 那几行（Defender 实时防护 / 磁盘介质 / 电源）会缺（第一份日志就是亮窗后 21s 导出，缺了）。
+
+### 10.1 installer.log（NSIS 写，纯 ASCII）
+
+| 行 | 字段 | 怎么读 |
+|---|---|---|
+| `init` | `tempFreeMB` | %TEMP% 所在盘剩余空间（MB） |
+| `begin` | `waitSec` / `prevVer` | 向导停留秒数（**不是**安装慢）/ 覆盖安装时的旧版本号，全新安装为 `-` |
+| `fsprobe inst` / `fsprobe tmp` | `files` `createMs` `delMs` `freeMB` `err` | 安装前在目标盘建、删一批小文件（≤60 个或 ≤1.5s）。**单价 = createMs / files**；9657 个文件的下限 ≈ 单价 × 9657。`inst` 是安装目录所在盘、`tmp` 是 %TEMP% 所在盘。`err=1` = 连第一个文件都建不出来。`delMs` 对应旧版本卸载要删 ~9.6k 个文件的成本 |
+| `uninstalled` | `uninstSec` `code` | 旧版本移除耗时 / 旧卸载器退出码 |
+| `phases` | `waitSec` `probeSec` `uninstSec` `extractSec` | **四段相加 = `done` 行的 `elapsedSec`**。`extractSec` 大 = 慢在写新文件（杀软 / 磁盘）；`uninstSec` 大 = 慢在删旧文件 |
+
+经验值（待真机校准，不是结论）：正常 SSD + 仅 Defender 的机器 `createMs/files` 应在个位数毫秒；若是几十毫秒，9657 个文件就是几分钟，基本就是「杀软 on-access 扫描 + 机械盘」。
+
+### 10.2 main.log（Electron 壳写，带 `[boot]` 前缀的是本轮新增）
+
+| 行 | 内容 | 怎么读 |
+|---|---|---|
+| `[boot] timeline …` | `appReady` `splash` `winCreated` `serverSpawn` `serverReady` `domReady` `loadDone` `reveal` `prefetchDone`，每个形如 `12.3s(+4.5)` | 距**主进程启动**的秒数，括号内是距上一个里程碑的差。**`appReady` 本身 = 点图标到我们第一行代码跑起来**（Flowship.exe 232MB 被杀软扫描 + Chromium 初始化）。`serverSpawn→serverReady` = server 冷启动；`serverReady→reveal` = 首页冷读与渲染 |
+| `[boot] mainLoop maxLag=…` | 主线程被占住的最长毫秒 / 卡顿次数 | 大 = 主进程里有同步调用被杀软拦住（窗口会「无响应」） |
+| `[boot] requests …` + `req-slow #N` | 首页加载期间本机请求：并发峰值、`ttfb` 分位、最慢的 8 个（只含路径） | `ttfb` 高 = server 端慢（冷读路由模块）；`total≫ttfb` = 传输慢；`PENDING` = 一直没回来 |
+| `[boot] readProbe cold … \| warm …` | 串行读 16 个启动文件：冷读 vs 热读的单文件平均 / p95 / 最大 | **冷 / 热的比值 = 杀软 + 磁盘对「首次读文件」的拦截成本**；冷读平均 × 434（读到就绪的文件数）≈ 串行冷读的总成本 |
+| `[main] prefetch files=… avgPerFile=…` | 并发预读的汇总 | `avgPerFile` 含排队，只是上界；预读 `elapsed` 与 `serverSpawn→serverReady` 对比，可看预读是否真的缩短了冷启动 |
+| `[boot] gpu …` / `[boot] procs …` | GPU 特性状态 / 各进程 CPU 与内存 | `gpu_compositing=disabled_software` 等 = 走软件渲染；某进程 CPU 长期很高 = 谁在抢 |
+| `[main] 杀软清单（trigger=…）` | 安全中心登记的杀软 | 首次启动必记（`trigger=first-boot`），慢启动（>30s）也会记（`slow-boot`），同一次运行只记一次 |
+| `[boot] env defender …` | Defender 是否启用 / **实时防护** / on-access / 运行模式 | `rtp=False` 或 `mode=Passive`（被第三方杀软接管）会改变解读 |
+| `[boot] env disk X: media=… bus=…` | 安装目录 / 用户数据 / 临时目录所在盘的介质 | `media=HDD` = 机械盘（~1 万个小文件的创建与首次读天然慢）；`Unspecified` 常见于虚拟机 |
+| `[boot] env cpu / machine / power / battery` | CPU 当前 vs 最大频率、整机型号、电源计划、是否电池供电 | `PowerSaver` 或 `on-battery` = 可能被降频。**`cur` / `max` 来自 `Win32_Processor`，新款 Intel 上常只返回基础频率（i7-13620H 实测 `cur=max=2400MHz` = 基础频率），不能单独当降频证据**，只看电源计划与是否供电 |
+
+### 10.3 验证状态
+
+- 单测 / 契约测试 / 变异验证见 `tests/boot-diag*.test.ts`、`tests/env-probe.test.ts`、`tests/boot-prefetch.test.ts`、`tests/win-install-phases-contract.test.ts`；
+- `env-probe` 的 PowerShell 脚本：已用 PowerShell 7.4 的语法解析器验证 0 语法错误，并用**模拟 cmdlet**完整执行过（笔记本电池供电 / 台式机 / Defender 不可用 / 磁盘取不到四种分支）、
+  输出被生产解析器正确解码。**但没在真实 Windows PowerShell 5.1 上执行过**，cmdlet 的真实属性名（如 `AMRunningMode`、`MediaType`）靠文档，任何一行取不到只会在日志里变成 `… unavailable <异常名>`，不影响其它行；
+- NSIS `fsprobe` / `begin` / `uninstalled` / `phases`：`1.9.30-localtest.3` 编译通过（makensis `-WX`，警告 0），且 **2026-10-13 已在 Windows 真机跑通**（见 §10.4：无乱码、`err=0`、四段相加 = `elapsedSec`、`tempFreeMB` 与 `main.log` 的 `tmp free` 吻合）；
+- `webRequest` 请求记录器只挂无回调的通知事件（`onSendHeaders` / `onResponseStarted` / `onCompleted` / `onErrorOccurred`），不拦截、不延迟任何请求。
+
+### 10.4 第一份回传日志（2026-10-13，同一台 Win11 / i7-13620H / 40G / 装在 E: 盘、仅 Defender）
+
+同一台机器、两次「安装后的第一次启动」（均 `firstBoot=true`）：
+
+| 指标 | v1.9.29 官方包（11:29） | 1.9.30-localtest.3（13:54） |
+|---|---|---|
+| server `Ready in` | 25.3s | 2.8s |
+| server 启动到 `instrumentation` | 21.7s | 2.6s |
+| 主进程判定 server 就绪 | 30.0s | 3.7s |
+| 判定就绪 → 页面 `did-finish-load` | 约 29.5s | 约 8.6s |
+| 亮窗（距主进程启动） | 约 60s | 13.0s |
+
+- `readProbe`：冷读单文件均值 42.6ms（p95 284ms）/ 热读 0.58ms，比值约 73 倍。预读 997 个文件耗时 7.1s、`avgPerFile=56.8ms`，与冷读单价接近 → 8 并发几乎线性提速，说明瓶颈是**每个文件首次访问的延迟**（符合杀软 on-access 扫描的特征），不是磁盘吞吐。
+- **不是受控对照**：v1.9.29 是**装完 5 秒后**启动（安装 11:25:37→11:29:03、启动 11:29:08），localtest.3 是**装完 78 秒后**才启动（安装 13:51:38→13:52:47、启动 13:54:05）。刚装完时 Defender 很可能还在后台扫那 ~9.6k 个新写入的文件，会拖慢前者；所以 25.3s→2.8s **不能全算预读的功劳**。要定论：同一个包、重装后**装完立刻启动**，一次设 `FLOWSHIP_NO_PREFETCH=1`、一次不设，对比 `Ready in`。
+- 仍没解释的部分：判定就绪 → `did-finish-load` 还有 8.6s，请求记录器只保留 ttfb / 总耗时（慢请求只有 `/api/feishu/board`、`/api/mr-inbox` 等亮窗后才发的接口），定位不到这段。
+- 缺失：`installer.log`（见上，要手动取）、`[boot] env …`（导出太早，见上）。所以「**安装慢**」目前没有任何数据，Defender 实时防护状态与磁盘介质也未确认。
+
+**installer.log（同一台机器，localtest.3 覆盖安装 v1.9.29，手动安装）**
+
+```
+begin  waitSec=3 prevVer=1.9.29
+fsprobe inst(E:) files=60 createMs=31 delMs=0   freeMB=284741 err=0
+fsprobe tmp (C:) files=60 createMs=32 delMs=15  freeMB=191067 err=0
+uninstalled uninstSec=46 code=0
+done elapsedSec=63      phases waitSec=3 probeSec=0 uninstSec=46 extractSec=14
+```
+
+- 日志本身可信：无乱码、`err=0`、`3+0+46+14=63=elapsedSec`、`tempFreeMB=191062`（186.6G）与 `main.log` 的 `tmp free=186.3G` 吻合。
+- **这台机器上创建文件不慢**：单价 ≈ 0.52ms/文件（E:、C: 一样），9657 个文件的下限只有 ~5s；实测 `extractSec=14s`（含解压与写内容）。所以 `fsprobe` 的假设「建小文件慢」在这台机器上**不成立**。
+- **覆盖安装的 63s 里 46s（73%）是移除旧版本**。真实卸载单价 4.76ms/文件，是探针里删除单价（tmp 盘 0.25ms）的约 19 倍，但两者不可直接比（探针删的是空目录里的 60 个小文件，真实卸载是深层目录 + 大文件 + 旧卸载器自身的启动 / 进程检查开销）；`uninstSec` 里删文件与卸载器自身开销各占多少，这份日志分不开。
+- 全新安装没有这一段（`prevVer=-`），所以同事说的「点完下一步要等很久」很可能只发生在覆盖安装上——需要确认他当时是不是覆盖安装。
+- `init` 每次安装都记了两行（相隔 6~8s），v1.9.29 官方安装器也是，所以不是新代码引入的；【推断】是安装器自己重启了一次。第一行 `init` 到 `done` 比 `phases` 的总和多 6s（69s vs 63s），这 6s 不在任何一段里。
+- `waitSec=3`：用户在向导页只停了 3s。对比 v1.9.29 的 `elapsedSec=197`——它**包含**向导停留（旧安装器没有 `begin`），无法拆开，所以「197s → 63s」**不能**当成优化效果。
+
+**`[boot] env …`（第二份日志，亮窗后等了 1 分钟以上才导出，env 探测在亮窗后 ~12s 写完）**
+
+```
+env defender av=True rtp=True onAccess=True mode=Normal tamper=True sigAgeDays=0
+env disk E: media=SSD bus=NVMe health=Healthy   env disk C: media=SSD bus=NVMe health=Healthy
+env power plan=Balanced   env battery on-ac charge=98%   env machine mfr=LENOVO model=83CK
+```
+
+- 排除：磁盘（两个盘都是健康的 NVMe SSD）、电源（插电 + Balanced）、内存（40G）。
+- 唯一在场的杀软是 Defender，**实时防护与 on-access 都开着**、模式 Normal（没被第三方杀软接管）、病毒库当天最新。
+- 结合 §10.4 的「首次读 42.6ms vs 再读 0.58ms」：**最符合的解释是 Defender on-access 对每个文件首次访问的拦截延迟**。【推断】——没做过「加排除项」的对照，不能写成实锤。
+
+**同一台机器第三次启动（localtest.3 第二次打开，非首次启动、没有预读）**
+
+| 启动 | server `Ready in` | 亮窗 |
+|---|---|---|
+| v1.9.29 官方，装完 5s 后首次启动 | 25.3s | 约 60s |
+| localtest.3，装完 78s 后首次启动（预读开） | 2.8s | 13.0s |
+| localtest.3，第二次打开（热） | 1.0s | **3.9s** |
+
+- 热启动 3.9s 是这台机器的下限；首次启动在有预读的情况下仍比热启动多 ~9s（13.0 vs 3.9），这是「首次访问文件」的剩余成本。
+- 首次启动里「server 就绪 → 页面加载完」多出的 8.6s，热启动只要 1.9s；多出的 ~6.7s 同样是首次访问的成本，请求记录器没法再细分。
+
+**覆盖安装慢（`uninstSec=46`）的最强假设：旧卸载器把文件「跨盘搬」到了 C: 的 %TEMP%（2026-10-13，待真机验证）**
+
+- 机制（官方模板 `uninstaller.nsh` 的 `un.atomicRMDir`，旧版本升级时一定走——`uninstallOldVersion` 每次都传 `--updated`）：
+  对安装目录里的**每个文件**执行 `Rename "$INSTDIR\…" "$PLUGINSDIR\old-install\…"`。`$PLUGINSDIR` 在旧卸载器进程的 `%TEMP%`。
+  这台机器装在 **E:**、`%TEMP%` 在 **C:**（`installer.log` 里 `instDrive=E: tempDrive=C:`）→ 每个 `Rename` 是**跨盘移动 = 复制 + 删除**，447MB / 9657 个文件被写到 C: 再删掉，退出时 `$PLUGINSDIR` 又整个删一遍。
+  装在 C: 的人是同盘重命名（只改元数据），没有这个成本。
+- 量级吻合：`uninstSec / extractSec = 46 / 14 ≈ 3.3`——跨盘搬 = 读 + 写 C: + 删 E: + 退出时删 C:，比解压多出的操作量就是这个量级。
+- 这条同时解释了 §3.2 的「非 C 盘装、更新后 App 被删」：旧文件要整份落到 C:，C: 空间不够就半截失败。
+- **验证（不改代码）— 第一次做法无效，已更正**：
+  - ❌ 在普通 `cmd` 里 `set TEMP=E:\tmp` 再启动安装器（2026-10-13 14:2x 实测无效）：`installer.log` 里第一个 `init` 是 `tempDrive=E:`，
+    **第二个 `init` 又变回 `tempDrive=C:`**，`fsprobe tmp` 的 `freeMB=190641` 也是 C: 盘。安装器每次都会**重新拉起一个提权的自己**（每次安装都有两行 `init`、相隔 6~9s，v1.9.29 官方安装器也是），
+    真正执行安装的是提权后的第二个进程，它拿到的是系统给的全新环境变量，**不继承 cmd 里设的 `TEMP`**。这次 `uninstSec=34`（原 46）、`extractSec=12`（原 14）只是同机两次安装的自然波动（约 15~25%），不能当证据。
+  - ✅ 正确做法：从**管理员 cmd**（右键「以管理员身份运行」）里 `set TEMP=E:\tmp` / `set TMP=E:\tmp` 再启动安装器——已经是管理员就不会再拉起提权的自己，环境变量才传得到干活的进程。
+    **有效性自检**：新增日志里 `fsprobe tmp … freeMB` 应≈E: 盘剩余（约 28 万 MB）而不是 C: 的（约 19 万 MB）。
+  - 判读：`uninstSec` ≲ 15（原 34~46）→ 假设成立。修法：安装器在调用旧卸载器前把 `TMP/TEMP` 临时指到**安装盘上一个可写目录**，卸载完立刻还原（不能一直留着：安装完启动 App 会继承它）。
+    **必须在「真正执行安装的那个（提权）进程」里设**，不能只在外层进程设。同时顺带消除「非 C 盘更新吃 C: 空间」。
+  - 基本不变 → 假设不成立，慢在别处，再做 Defender 排除项对照（见上）。
+  - **管理员 cmd 实测结果 + ABA 对照（2026-10-13，同一台机器连续四次覆盖安装 localtest.3 → localtest.3）**：
+
+    | 次序 | 启动方式 | TEMP 所在盘 | uninstSec | extractSec | elapsedSec | 有效性自检 |
+    |---|---|---|---|---|---|---|
+    | ① | 普通双击 | C: | 46 | 14 | 63 | — |
+    | ② | 普通 cmd + set TEMP（**无效**，见上） | C: | 34 | 12 | 49 | 第二个 init 回到 `tempDrive=C:` |
+    | ③ | **管理员 cmd** + set TEMP=E:\tmp | **E:** | **16** | 9 | 28 | 单行 `init`、`tempDrive=E:`、`fsprobe tmp freeMB=284748`（=E: 盘） |
+    | ④ | 普通双击（对照，回到默认） | C: | **30** | 10 | 43 | 双 `init`、`tempDrive=C:`、`fsprobe tmp freeMB=190832`（=C: 盘） |
+
+    **结论：TEMP 在 C: 还是安装盘，直接决定旧版本移除耗时——假设得到确证（单样本、同机 ABA）。**
+    - ③→④ 只把 TEMP 从 E: 换回 C:，`extractSec` 几乎不变（9→10）、`waitSec` 都是 2，机器状态基本一致，但 `uninstSec` 从 16 跳回 30（+14s，近乎翻倍）。此前担心的「机器变热」混杂被这一对排除：热状态下 C: 基线稳定在 30~34（②④），E: 为 16。
+    - 量化：热状态下 TEMP 跨盘约占 `uninstSec` 的一半（14~18s）；首次那次 46 里另有约 12~16s 是冷缓存开销（46→30~34），与 TEMP 无关。TEMP 指到安装盘后仍剩 ~16s 的下限（旧卸载器启动 + 删 $PLUGINSDIR 里 9657 个文件 + Defender），这部分改 TEMP 消不掉。
+    - 边界：E: 侧只有一次有效样本（C: 侧 ①②④ 为 46/34/30，同状态下波动约 ±10%，远小于 16 与 30 的差距）；「是 Rename 跨盘 = 复制+删除」这一机制是读官方 `un.atomicRMDir` 推出的，数据与之一致，但没有直接观测到文件被搬。实验本身只证明了「TEMP 盘不同 → uninstSec 不同」。
+    - 下一步：修法见下（新安装器在调用旧卸载器前把 TMP/TEMP 临时指到安装盘、卸载完还原，且必须在提权后的那个进程里设）。预期热状态下每次覆盖安装省 ~14s（本机 43→~28s），冷状态、C: 更慢 / 更满的机器收益更大，且消除「非 C 盘更新吃 C: 空间」。
+    - 另：`fsprobe inst createMs` 从 31 降到 0 再回到 15（E: 盘、与 TEMP 无关），`GetTickCount` 粒度约 15ms，只能说「没变慢」，不要过度解读。
+- 注意：旧卸载器是**已装在用户机器上的旧版本的**，改不了；只能由**新安装器在调用它之前**设好环境变量。所以这个修法对「v1.9.29 → 新版」的升级也立刻生效。
+
+### 10.5 修复：旧卸载器的 TEMP 临时指到旧安装目录所在盘（2026-10-13，`1.9.30-localtest.4`，待真机验证）
+
+> ⚠️ 与 §10.4 一样：**只在 macOS 上做了 makensis `-WX` 编译 + 字符串级契约测试**（`tests/win-install-tmp-redirect-contract.test.ts`），运行时行为（环境变量是否真被旧卸载器继承、`uninstSec` 是否真降下来）【待验证】。
+> 测试包：`dist/win-localtest/fe-ai-flow-1.9.30-localtest.4-tmpfix-win-x64.exe`（makensis `-WX` 编译通过；构建参数与 localtest.3 完全一致——`useZip`、同一份 prepackaged 载荷，只有 `installer.nsh` 不同，所以与 §10.4 的数字可直接对比。本次没有再解压产物头部核对字符串，编译通过 + 契约测试是目前仅有的证据）。
+
+**改了什么**（`packaging/installer.nsh`，宏 `flowshipTmpRedirect` / `flowshipTmpRestore`）：
+
+- 覆盖安装、且旧安装目录（注册表 `InstallLocation`）是 `X:\…` 盘符路径、且与当前 `%TEMP%` 不同盘时，在 `<X>:\.flowship-tmp` 建一个隐藏目录、真写一个文件验证可写，然后把**本进程**的 `TEMP` / `TMP` 指过去；
+  旧卸载器由 `ExecWait`（`CreateProcess`）拉起、继承这份环境，它的 `$PLUGINSDIR\old-install` 就落在旧安装目录同一块盘上，`Rename` 回到「只改元数据」。
+- 旧卸载器退出后（官方流程必经的 `customUnInstallCheck`，在错误标志存进 `$1` 之后、任何 `Quit` / `Return` 之前）立刻还原 `TEMP` / `TMP`，并在**退出码为 0** 时整目录删掉；失败时保留目录（里面可能是旧文件的唯一副本）。
+- 设置时机：**静默安装 / 自动更新**在 `customInit` 末尾（所有 `Abort` 分支之后）；**手动安装**在 begin 页（用户点「安装」那一刻）。两处都是各进程自己设——安装器会拉起提权的自己，新进程拿到全新环境，外层设的传不过去（§10.4 第一次实验踩过）。
+- 任何一步不满足都**不改**（行为与改动前一致），原因写在日志 `tmpredirect` 行的 `result=`：`fresh-install`（全新安装）、`same-drive`（装在 C:，本来就同盘）、`not-drive-path`（UNC 等）、`mkdir-failed` / `write-failed`（目标盘根目录不可写）、`already`。
+
+**为什么目录建在「旧安装目录所在盘的根」**：与 §10.4 实测有效的 `E:\tmp` 同形；用旧安装目录而非向导里新选的目录，因为旧卸载器搬的是旧目录里的文件（官方 `uninstallOldVersion` 读的是注册表 `InstallLocation`）。
+
+**预期收益**（来自 §10.4 的同机 ABA，不是新实测）：热状态下 `uninstSec` 30 → ~16，覆盖安装总耗时 43 → ~28s（−35%）；冷状态约 63 → 45~50s。~16s 是下限（旧卸载器启动 + 删 `$PLUGINSDIR` 里 9657 个文件 + Defender）。装在 C: 的用户**没有变化**。
+
+**验证（看 `installer.log`，一次覆盖安装就够）**：
+
+| 看什么 | 期望 |
+|---|---|
+| `tmpredirect … result=applied tempDrive=C: oldDrive=E:` | 生效。若是 `write-failed` / `mkdir-failed`，说明那块盘根目录没权限，这次数字不能当结论 |
+| `tmprestore … dir=removed` | 清理干净、环境已还原。`dir=kept` 说明旧卸载器退出码非 0，去看 `uninstalled … code=` |
+| `uninstalled … uninstSec=` | 热状态下应在 ~16 左右（§10.4 里 TEMP 在 C: 时是 30~46） |
+| 装完安装目录所在盘根目录 | 不应残留 `.flowship-tmp`（隐藏目录，需要显示隐藏文件才看得到） |
+
+**已知边界**：
+
+- 手动安装用户点「安装」前取消、或静默更新里用户拒绝 UAC，可能在旧安装目录所在盘根留下一个**空的隐藏目录** `.flowship-tmp`（下次覆盖安装会复用并清掉）。
+- 解压阶段（`extractSec` 9~14s）不受这条影响：§10.4 里 `useZip` 包的解压直接写目标目录，不经 `%TEMP%`；官方 7z 包会经 `$PLUGINSDIR\7z-out`（`%TEMP%` 所在盘）多一遍落盘，是另一条可优化项，本次没动。
+- `legacy HKCU → HKLM` 迁移时官方会再拉一次旧卸载器（`uninstallOldVersion HKEY_CURRENT_USER`），那一次走默认 `%TEMP%`，没有加速也不受影响。
