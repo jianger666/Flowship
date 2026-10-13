@@ -66,6 +66,32 @@ import {
   pickBootTimeoutMs,
   shouldTreatAsFirstBoot,
 } from "./first-boot.mjs";
+// 首次启动并行预读（把 server 串行冷读的「N×L」摊成并发，清单由构建期录好）：纯函数在 ./boot-prefetch.mjs
+import {
+  BOOT_MANIFEST_FILENAME,
+  formatPrefetchSummary,
+  formatReadProbe,
+  parseBootManifest,
+  runPrefetch,
+  runReadProbe,
+  shouldPrefetch,
+} from "./boot-prefetch.mjs";
+// 启动诊断（时间线 / 主线程卡顿 / 首页请求明细）与 Windows 机器环境取证（盘介质 / Defender / 电源）：
+// 都只观察不改行为，结果在首页亮出后一次性写进 main.log；纯函数在 ./boot-diag.mjs、./env-probe.mjs
+import {
+  createBootTimeline,
+  createLagMonitor,
+  createRequestRecorder,
+  formatLagSummary,
+  formatRequestSummary,
+} from "./boot-diag.mjs";
+import {
+  ENV_PROBE_TIMEOUT_MS,
+  buildEnvProbeScript,
+  describeEnvProbe,
+  driveLetterOf,
+  parseEnvProbe,
+} from "./env-probe.mjs";
 // 杀软清单探测（脚本 + 解析，PowerShell 输出 Base64 避开 OEM 代码页乱码）：纯函数在 ./security-products.mjs
 import {
   SECURITY_PROBE_SCRIPT,
@@ -237,8 +263,12 @@ const SLOW_BOOT_PROBE_MS = 30_000;
 // 只在「启动偏慢」时跑一次、后台、10s 超时；纯取证、结果只进日志、不影响任何行为。
 // 脚本与解析在 ./security-products.mjs：PowerShell 输出 Base64（stdout 走 OEM 代码页、中文杀软名会乱码），
 // 并把「没登记 / 查询失败（如 Server 版没有该命名空间）/ 超时 / 拉不起 PowerShell」分开记，日志才能回答「为什么没清单」。
-const logSecurityProducts = async () => {
+// 幂等：「启动偏慢」和「首次启动的启动报告」两条路径都会调，同一次运行只查一次。
+let securityProbeStarted = false;
+const logSecurityProducts = async (why = "slow-boot") => {
   if (process.platform !== "win32") return;
+  if (securityProbeStarted) return;
+  securityProbeStarted = true;
   const probe = await new Promise((resolve) => {
     execFile(
       "powershell.exe",
@@ -247,7 +277,107 @@ const logSecurityProducts = async () => {
       (err, stdout) => resolve(parseSecurityProbe(err, stdout)),
     );
   });
-  log(`[main] 启动偏慢（>${SLOW_BOOT_PROBE_MS / 1000}s）时的杀软清单：${describeSecurityProbe(probe)}`);
+  log(`[main] 杀软清单（trigger=${why}、慢启动阈值 ${SLOW_BOOT_PROBE_MS / 1000}s）：${describeSecurityProbe(probe)}`);
+};
+
+// ---------- 启动诊断（只观察、不改行为） ----------
+// 为什么：Windows 慢机器的「启动慢 / 首页慢」要分清慢在 Electron 自己起来、server 冷启动、还是首页冷读，
+// 光靠几条零散日志做不到。这里统一用「距主进程启动的秒数」打里程碑，首页亮出后 6s 一次性出报告。
+// 报告写 main.log（[boot] 前缀；诊断包带 main.log 尾部）。纯函数与单测在 ./boot-diag.mjs、./env-probe.mjs。
+const bootTimeline = createBootTimeline();
+const lagMonitor = createLagMonitor();
+const requestRecorder = createRequestRecorder();
+// 首页亮出后多久出报告：留一小段让亮窗后的首批数据请求也进统计
+const BOOT_REPORT_DELAY_MS = 6_000;
+let bootReportScheduled = false;
+let bootReported = false;
+// 本次是否「首次启动」（whenReady 里赋值；报告里带上，区分冷 / 热启动的数据）
+let bootIsFirst = false;
+
+// 只挂「被动通知」类事件（onSendHeaders / onResponseStarted / onCompleted / onErrorOccurred 都没有回调、
+// 不会拦截或延迟任何请求）；刻意不用 onBeforeRequest（它要主进程回调放行，会给每个请求加一次往返）。
+const installRequestRecorder = () => {
+  try {
+    const ses = mainWindow?.webContents?.session;
+    if (!ses) return;
+    const filter = { urls: [`${BASE_URL}/*`] };
+    ses.webRequest.onSendHeaders(filter, (d) => requestRecorder.start(d.id, d.url, d.resourceType));
+    ses.webRequest.onResponseStarted(filter, (d) =>
+      requestRecorder.responseStarted(d.id, d.statusCode, d.fromCache),
+    );
+    ses.webRequest.onCompleted(filter, (d) => requestRecorder.finish(d.id));
+    ses.webRequest.onErrorOccurred(filter, (d) => requestRecorder.finish(d.id, { error: d.error }));
+  } catch (err) {
+    log(`[boot] 请求记录器安装失败（忽略）：${err?.message || err}`);
+  }
+};
+
+// Windows 机器环境（盘是 SSD 还是机械盘 / Defender 实时防护 / 电源计划 / CPU 频率 / 电池）。
+// 后台、10~20s 超时自杀、只读。非 Windows 直接返回。
+const logEnvProbe = async () => {
+  if (process.platform !== "win32") return;
+  const drives = [
+    ...new Set(
+      [process.execPath, app.getPath("userData"), os.tmpdir()].map(driveLetterOf).filter(Boolean),
+    ),
+  ];
+  const result = await new Promise((resolve) => {
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", buildEnvProbeScript({ drives })],
+      { windowsHide: true, timeout: ENV_PROBE_TIMEOUT_MS },
+      (err, stdout) => resolve(parseEnvProbe(err, stdout)),
+    );
+  });
+  for (const line of describeEnvProbe(result)) log(`[boot] env ${line}`);
+};
+
+// 一次性启动报告（首页亮出后 BOOT_REPORT_DELAY_MS 触发）。每一块各自 try/catch：任何一块出错不影响其它块。
+const emitBootReport = async (revealSource) => {
+  if (bootReported) return;
+  bootReported = true;
+  lagMonitor.stop();
+  log(`[boot] timeline firstBoot=${bootIsFirst} revealSource=${revealSource ?? "?"} ${bootTimeline.summary()}`);
+  try {
+    log(`[boot] ${formatLagSummary(lagMonitor.snapshot())}`);
+  } catch {
+    /* 取证失败不挡任何事 */
+  }
+  try {
+    for (const line of formatRequestSummary(requestRecorder.snapshot())) log(`[boot] ${line}`);
+  } catch {
+    /* 同上 */
+  }
+  try {
+    const gpu = app.getGPUFeatureStatus();
+    log(
+      `[boot] gpu ${Object.entries(gpu)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ")}`,
+    );
+  } catch {
+    /* 同上 */
+  }
+  try {
+    const procs = app
+      .getAppMetrics()
+      .map(
+        (m) =>
+          `${m.type}:cpu=${(m.cpu?.percentCPUUsage ?? 0).toFixed(1)}%/mem=${Math.round((m.memory?.workingSetSize ?? 0) / 1024)}MB`,
+      )
+      .join(" ");
+    log(`[boot] procs ${procs}`);
+  } catch {
+    /* 同上 */
+  }
+  // 以下是 PowerShell 取证：放在页面亮出之后、串行跑，不跟首页渲染抢 CPU / 磁盘。
+  // 杀软清单：启动没超过慢阈值时原来不查，但「首次启动」要有它才能把杀软和慢对上号。
+  try {
+    if (bootIsFirst) await logSecurityProducts("first-boot");
+    await logEnvProbe();
+  } catch (err) {
+    log(`[boot] 环境取证异常（忽略）：${err?.message || err}`);
+  }
 };
 
 // ---------- 端口冲突处理 ----------
@@ -431,6 +561,7 @@ const startServer = () => {
     windowsHide: true,
   });
   serverProc = proc;
+  bootTimeline.mark("serverSpawn");
   log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")} nodeOptions=${serverNodeOptions.join(" ") || "（空）"}`);
   // ⚠️ 世代守卫（自更新失败恢复竞态）：stopServer 会先把 serverProc 置 null 再杀、
   // SIGKILL 后不等回收就可能 startServer 拉新的——旧进程迟来的 exit 若无脑
@@ -651,9 +782,17 @@ let mainRevealed = false;
 const revealMainWindow = (source) => {
   if (mainRevealed) return;
   mainRevealed = true;
-  log(`[main] reveal 主窗（source=${source ?? "?"}）`);
+  // 距主进程启动的秒数：把「点图标 → 窗口能用」拆成日志里可读的一段（server 就绪那行只覆盖其中一部分，
+  // 就绪后首页首次渲染同样在读冷文件、实测可再占十几秒）
+  log(`[main] reveal 主窗（source=${source ?? "?"}、距主进程启动 ${process.uptime().toFixed(1)}s）`);
+  bootTimeline.mark("reveal");
   if (mainWindow && !mainWindow.isVisible()) mainWindow.show();
   closeSplashWindow();
+  // 首页亮出后一段时间出启动报告（时间线 / 主线程卡顿 / 首页请求明细 / GPU / 环境取证）
+  if (!bootReportScheduled) {
+    bootReportScheduled = true;
+    setTimeout(() => void emitBootReport(source), BOOT_REPORT_DELAY_MS);
+  }
 };
 
 // 页面首页真实内容渲出来（看板 / 就绪清单）→ 此刻切换、启动全程一屏 splash 到底
@@ -2200,6 +2339,9 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(async () => {
+    // 里程碑基准 = 主进程启动；appReady 的数值本身 = 点图标到我们第一行代码跑起来（含 exe 被扫描 / Chromium 初始化）
+    bootTimeline.mark("appReady");
+    lagMonitor.start();
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")} protocol=${PROTOCOL_SCHEME}`);
     applyAppNapGuard();
     // 机器快照（启动慢定位用：内存/CPU 不够的机器冷启动天然慢，先排除硬件因素）
@@ -2220,6 +2362,49 @@ if (!app.requestSingleInstanceLock()) {
       );
     } catch {
       /* 快照失败不挡启动 */
+    }
+    // 首次启动并行预读：越早越好（后面还有更新清扫 / 端口检查 / 开窗要走），fire-and-forget、
+    // 失败只记日志、绝不挡启动。只在 Windows + 首次启动（全新安装 / 刚更新）才跑，见 ./boot-prefetch.mjs。
+    // firstBoot 在这里就算好、后面的超时选择复用同一个值（标记要等 server 就绪才写，中途不会变）。
+    const firstBoot = isFirstBoot();
+    bootIsFirst = firstBoot;
+    if (
+      shouldPrefetch({
+        platform: process.platform,
+        firstBoot,
+        env: process.env,
+      })
+    ) {
+      void (async () => {
+        try {
+          const raw = await fs
+            .readFile(path.join(serverDir, BOOT_MANIFEST_FILENAME), "utf8")
+            .catch(() => null);
+          const manifest = parseBootManifest(raw);
+          if (!manifest) {
+            log("[main] prefetch 跳过：没有可用的启动清单");
+            return;
+          }
+          // 先串行量一把冷读 / 热读的单文件延迟（最多 1.5s）：预读统计里的 avgPerFile 含并发排队、只是上界，
+          // 这组数据才是「这台机器首次读一个文件到底要多久」。探针失败不影响后面的预读。
+          try {
+            const probe = await runReadProbe({ serverDir, files: manifest.files });
+            log(`[boot] readProbe ${formatReadProbe(probe)}`);
+          } catch (err) {
+            log(`[boot] readProbe 异常（忽略）${err?.message || err}`);
+          }
+          const stats = await runPrefetch({ serverDir, files: manifest.files });
+          log(`[main] prefetch ${formatPrefetchSummary(stats)}`);
+        } catch (err) {
+          log(`[main] prefetch 异常（忽略）${err?.message || err}`);
+        } finally {
+          bootTimeline.mark("prefetchDone");
+        }
+      })();
+    } else {
+      log(
+        `[main] prefetch 未启用（platform=${process.platform} firstBoot=${firstBoot} disabled=${process.env.FLOWSHIP_NO_PREFETCH === "1"}）`,
+      );
     }
     // mac 自定义应用菜单：默认菜单的 File→Close（Cmd+W）走 close 事件、会撞上
     // 「点 X = 二次确认退出」——把 Cmd+W 改绑「收进托盘」；其余菜单保留系统 role
@@ -2329,7 +2514,10 @@ if (!app.requestSingleInstanceLock()) {
 
     // splash 先亮（boot 期间唯一可见窗口、跟主窗同尺寸同位置）、主窗 hidden 待页面就绪
     createSplashWindow(nativeTheme.shouldUseDarkColors, await loadWindowState());
+    bootTimeline.mark("splash");
     await createWindow();
+    bootTimeline.mark("winCreated");
+    installRequestRecorder();
     if (!IS_MAC || readMenuBarIconVisible()) {
       createTray();
     }
@@ -2338,7 +2526,6 @@ if (!app.requestSingleInstanceLock()) {
 
     // 首次启动给足时间（150s），常规 60s；超时后 server 还活着 = 只是慢（不是挂了），
     // 给"继续等待"而不是直接判死刑——之前一次性 30s 是 Windows 首次必现启动超时的根因。
-    const firstBoot = isFirstBoot();
     const bootTimeoutMs = pickBootTimeoutMs(firstBoot);
     log(`[main] 等 server 就绪（timeout=${bootTimeoutMs} firstBoot=${firstBoot})`);
     const bootWaitStart = Date.now();
@@ -2370,6 +2557,7 @@ if (!app.requestSingleInstanceLock()) {
       );
     }
     if (serverReady) {
+      bootTimeline.mark("serverReady");
       markFirstBootDone();
       const bootElapsedMs = Date.now() - bootWaitStart;
       log(`[main] server 就绪、轮询耗时 ${(bootElapsedMs / 1000).toFixed(1)}s`);
@@ -2390,7 +2578,9 @@ if (!app.requestSingleInstanceLock()) {
       if (mainWindow) {
         // loadURL 前显式复位；did-start-loading 也会再置 false（双保险）
         pageLoaded = false;
+        mainWindow.webContents.once("dom-ready", () => bootTimeline.mark("domReady"));
         await mainWindow.loadURL(BASE_URL);
+        bootTimeline.mark("loadDone");
         // 兜底：页面没调 app-content-ready（老缓存页 / 页面异常 / 直落非首页路由）
         // 也不能永远黑着——加载完成 8s 内没收到信号就强制亮
         log("[main] loadURL 完成、等页面 content-ready（8s 兜底）");
