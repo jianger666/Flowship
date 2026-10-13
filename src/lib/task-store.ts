@@ -26,6 +26,8 @@ import {
   type NewTaskInput,
   type PreviewSlotStatus,
   type Task,
+  type TaskChangeFileDiff,
+  type TaskChanges,
   type TaskEvent,
   type TaskSummary,
 } from "./types";
@@ -343,6 +345,36 @@ export const checkoutTaskBranch = async (
   });
   const data = await handleJson<{ ok: true; state: GitBranchState }>(res);
   return data.state;
+};
+
+/**
+ * task 代码改动清单（GET /api/tasks/[id]/changes）：各仓相对基线改了哪些文件 + 增删行数（不含 patch）。
+ * 轻量、可轮询；chat / 未启动的任务返回空 repos。
+ */
+export const fetchTaskChanges = async (id: string): Promise<TaskChanges> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/changes`, {
+    cache: "no-store",
+  });
+  const data = await handleJson<{ changes: TaskChanges }>(res);
+  return data.changes;
+};
+
+/** 单个文件相对基线的 unified diff（GET /api/tasks/[id]/changes/file、按需拉） */
+export const fetchTaskChangeFileDiff = async (
+  id: string,
+  file: { repoPath: string; path: string; oldPath?: string },
+): Promise<TaskChangeFileDiff> => {
+  const params = new URLSearchParams({
+    repoPath: file.repoPath,
+    path: file.path,
+  });
+  if (file.oldPath) params.set("oldPath", file.oldPath);
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(id)}/changes/file?${params.toString()}`,
+    { cache: "no-store" },
+  );
+  const data = await handleJson<{ file: TaskChangeFileDiff }>(res);
+  return data.file;
 };
 
 // ----------------- MCP 配置读取（V0.13 独立化：servers = fe 自管有效集） -----------------

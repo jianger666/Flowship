@@ -1149,6 +1149,90 @@ export interface RepoBranchList {
   pathMissing?: boolean;
 }
 
+// ----------------- 任务代码改动预览（task 模式、前后端共用） -----------------
+
+/** 一个文件相对基线的变更类型（重命名带 oldPath、未跟踪新文件按 added 算） */
+export type TaskChangeStatus = "added" | "modified" | "deleted" | "renamed";
+
+export interface TaskChangeFile {
+  /** 相对仓根的路径（git 吐的正斜杠） */
+  path: string;
+  /** 仅 renamed：重命名前的路径 */
+  oldPath?: string;
+  status: TaskChangeStatus;
+  /** 新增行数；二进制 / 过大未统计 = null */
+  added: number | null;
+  /** 删除行数；二进制 = null */
+  removed: number | null;
+  binary: boolean;
+  /** 未跟踪的新文件（还没 git add；git diff 看不到、由服务端单独补） */
+  untracked: boolean;
+  /** 磁盘上的绝对路径（跳 IDE 用；deleted 文件已不在盘上、前端不要拿它跳） */
+  absolutePath: string;
+}
+
+/**
+ * 改动基线：
+ * - merge-base：HEAD 与「线上分支」的分叉点——任务分支上自己的提交 + 未提交改动都算「本任务的改动」
+ * - head：找不到线上分支时的降级，只能看 HEAD 之后的未提交改动
+ */
+export interface TaskRepoChangeBase {
+  kind: "merge-base" | "head";
+  /** 展示用的参照名：origin/main / main / HEAD */
+  label: string;
+  /** 基线 commit 的短 sha（展示用） */
+  shortSha: string;
+}
+
+/** 该仓读不到改动的原因（可用时缺省） */
+export type TaskRepoChangesUnavailable =
+  | "dir_missing"
+  | "not_git"
+  | "no_head"
+  | "git_error";
+
+export interface TaskRepoChanges {
+  /** 原仓路径（task.repoPaths 里的值；接口按它定位仓） */
+  repoPath: string;
+  shortName: string;
+  /** 实际读 git 的工作目录（隔离 task = worktree） */
+  workDir: string;
+  /**
+   * 任务是否在隔离 worktree 里干活；
+   * false = 直接在原仓：展示的是「当前分支」的整体改动，含任务开始前该分支已有的提交和未提交内容
+   */
+  isolated: boolean;
+  unavailable?: TaskRepoChangesUnavailable;
+  /** 当前分支；detached HEAD = null */
+  branch: string | null;
+  base: TaskRepoChangeBase | null;
+  /** 当前分支就是线上分支本身（只会有未提交 / 未推送的改动） */
+  onBaseBranch?: boolean;
+  files: TaskChangeFile[];
+  /** files 里列出的全部文件的合计（files 被截断时仍按全量算） */
+  totals: { files: number; added: number; removed: number };
+  /** 文件数超过上限、files 只列了前一部分 */
+  filesTruncated?: boolean;
+  /** 未跟踪文件清单读取失败 / 超限、新文件可能没列全 */
+  untrackedSkipped?: boolean;
+}
+
+export interface TaskChanges {
+  repos: TaskRepoChanges[];
+  totals: { files: number; added: number; removed: number };
+}
+
+/** 单个文件的 unified diff（按需拉取） */
+export interface TaskChangeFileDiff {
+  /** unified diff 文本；binary / tooLarge 时为空串 */
+  diff: string;
+  /** 服务端按字节上限截断过 */
+  truncated: boolean;
+  binary: boolean;
+  /** diff 大到连读都放弃了——前端提示去 IDE 看 */
+  tooLarge?: boolean;
+}
+
 export interface GitBranchInfo {
   /**
    * V0.6.1：关联到 task.repoPaths 里的某个仓、多仓 task 时区分用

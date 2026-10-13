@@ -55,6 +55,7 @@ import {
 import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
+import { TaskChangesPanel } from "@/components/tasks/task-changes-panel";
 import { TaskUtilityActions } from "@/components/tasks/task-utility-actions";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
@@ -1046,6 +1047,9 @@ const TaskDetailPage = () => {
           {/* 提供方切换已搬进底部输入条 + 推进弹窗，顶栏不再放（用户拍板） */}
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
+          {/* 代码改动预览：各仓相对线上分支的净改动（数据直接读 git、不用再开 IDE 翻）；
+              key=task.id：切任务时清掉上一个任务的清单 / 选中态 */}
+          <TaskChangesPanel key={task.id} task={task} />
           <div className="h-4 w-px shrink-0 bg-border" />
           <TaskUtilityActions task={task} onTaskUpdate={absorbTask} />
         </div>

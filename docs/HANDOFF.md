@@ -693,6 +693,20 @@ ai-flow-action-hub/
 - **发版前提醒（评审提的，仍有效）**：`src/lib/whats-new.ts` 文案草稿要先给用户看、说行才能打 tag；这批改动大半是 Windows 安装 / 启动路径（NSIS、磁盘预检、更新守卫），单测覆盖不到真实安装器，**需要 Windows 真机各跑一遍：全新安装 / 覆盖安装 / 低磁盘空间**。
 - **已发 v1.9.30（2026-10-13）**：用户确认文案与范围后发版。**只带 review 过的文件**；同一工作区里别人在做的「任务页代码改动预览」（`TaskChangesPanel` / `task-changes.ts` / `/api/tasks/[id]/changes` 等，未提交）**没带**。发版范围在干净 worktree 里复验：`tsc` 0、`eslint` 0、全量 vitest 365 个文件 / 4979 个用例通过。⚠ 发版时 `1.9.30-localtest.4` 的「旧卸载器 TEMP 同盘提速」（RCA §10.5）**仍是「待真机验证」**（用户知情后确认发）——发出后第一件事是在装在非 C 盘的 Windows 上覆盖装一次，看 `installer.log` 的 `tmpredirect result=applied` / `tmprestore dir=removed` / `uninstSec`。
 
+#### v1.9.31：任务页「代码改动」预览（用户要求「看 AI 改了什么、不用开 IDE」，2026-10-13）
+
+- **是什么**：task 模式页顶栏（`BatchProgress` 后面）多一个「改动 N +a −r」按钮，点开右侧非模态 Sheet：左边按仓分组的文件清单、右边选中文件的 diff（复用 `tool-block.tsx` 导出的 `InlineDiff`，新行号可点跳 IDE）。chat / 没启动（无 `workCwd`）/ 全是非 git·只读仓的任务不挂入口。
+- **文件**：`src/lib/server/task-changes.ts`（git 读取层，纯函数解析 + `execFile`）、`src/app/api/tasks/[id]/changes/route.ts`（清单）、`.../changes/file/route.ts`（单文件 diff，按需拉）、`src/hooks/use-task-changes.ts`（拉取 + 运行中轮询）、`src/components/tasks/task-changes-panel.tsx`（UI）；类型在 `types.ts`「任务代码改动预览」段，拉取函数在 `task-store.ts`。
+- **为什么直接问 git、不聚合事件流里的 edit diff**：同一文件改多次事件流只能叠加、看不到净改动；工具 diff 服务端截断过；shell 里 sed / mv / 脚本生成的改动、用户在 IDE 里的改动事件流根本没有。
+- **基线 = HEAD 与「线上分支」的 merge-base**。线上分支依次取 `task.gitBranches[].baseBranch` → `task.repoBaseBranches[repoPath]`（设置页快照）→ `origin/HEAD`；远端引用（`origin/<name>`）优先、本地分支兜底；都没有降级成 HEAD（只看未提交，UI 标注）。**非隔离任务（直接在原仓里干活）走同一套**：每次实时读 HEAD、不存快照，所以中途切分支（分支切换器允许）自动跟着走；展示的是「当前分支的整体改动」，含任务开始前该分支已有的提交和未提交内容（UI 有说明）；当前就在线上分支本身时标 `onBaseBranch`（只剩未提交 / 未推送）。
+- **约束（改它之前先看）**：全程只读——`GIT_OPTIONAL_LOCKS=0`（git diff 默认会机会性刷新 index、与 agent 的 git 操作抢 `index.lock`），不 `git add -N`、不碰 index，未跟踪文件的 diff 由我们自己合成（测试断言 index 文件字节不变）；`execFile` 不走 shell，路径一律在 `--` 之后并开 `--literal-pathspecs`；接口不接受前端传工作目录（从 task 权威数据算），`path` / `oldPath` 必须是仓内相对路径（`sanitizeRepoRelPath`），分支名走白名单（`-` 开头 / 含 `..` 的忽略）；未跟踪文件只有确实「未跟踪且未被 ignore」才读盘（读不到 `.env`），符号链接只展示链接目标、不跟随；单仓失败只让该仓带 `unavailable`，不影响其他仓。
+- **上限**：清单最多 500 个文件（`filesTruncated`，totals 仍按全量）；未跟踪文件最多逐个数 200 个、单个 ≤1MB；单文件 diff 返回 ≤400KB（按行截断）、git 输出 >8MB 放弃（`tooLarge`）；未跟踪清单读失败 / 超限只标 `untrackedSkipped`。
+- **刷新**：挂载 / run 状态变化 / 面板打开立刻拉；agent 运行中轮询（面板开着 4s、关着 10s，页面不可见跳过）；运行中选中文件的 diff 每次清单刷新都静默重拉（不信缓存）。**成本**：每次轮询每个仓约 10 个 git 子进程，本机（macOS）单仓实测 ~70ms；Windows + Defender 会更慢，嫌卡就调大 `use-task-changes.ts` 的 `POLL_CLOSED_MS`。
+- **测试**：`tests/task-changes.integration.test.ts`（真 git：带空格路径的隔离 worktree + 非隔离原仓，覆盖已提交 / 暂存 / 未暂存 / 重命名 / 删除 / 二进制 / 未跟踪 / 被 ignore / 中文文件名 / 符号链接 / 路径逃逸 / pathspec 魔法 / 超限截断 / 中途切分支 / 游离 HEAD）。
+- **验证**：`tsc` / `eslint` 0；全量 vitest 全绿；另用本仓库当「非隔离任务」实跑：基线认成 `origin/main`、清单与 `git status` 一致。⚠ **没在浏览器里看过界面**（顶栏按钮位置、面板布局、diff 渲染只读了代码）；Windows 上没跑过。
+- **已知边界**：已归档 / 工作区被清理的任务按钮仍在、点开提示「工作区目录不存在」；非隔离任务若本地线上分支很旧（长期没 fetch），merge-base 会很早、清单会混进别人的提交（500 上限兜底、UI 说明了范围）；`git diff` 若遇用户配置的 `textconv` 过滤器会执行它（只关了 `--no-ext-diff`）。
+- **回退**：删上面 5 个新文件 + `tests/task-changes.integration.test.ts`，还原 `page.tsx`（顶栏那 4 行）、`task-store.ts`、`types.ts`（对应段）、`tool-block.tsx`（`InlineDiff` 的 export 与两个 className 参数）。
+
 ### v1.9.29（2026-10-10）吐字不流畅的根因：run_events 内存化 / 吐字节奏观测
 
 > 起因：用户升级到 v1.9.28 后反馈「吐字还是不太流畅」。排查结论：**不是前端渲染，是 SDK 的 run_events 落盘实现把流式消息钉死在个位数条/秒**。同类症状第二次出现（上一次是 checkpoints，见 v1.9.28）——SDK 的 JSONL store 每个子 store 都是「整文件读 + 整文件重写」，凡是在流式热路径上的都会随文件变大线性变慢。

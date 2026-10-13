@@ -139,17 +139,27 @@ const DiffLine = ({
   );
 };
 
-const InlineDiff = ({
+/**
+ * 干净 diff 块。事件流内联（edit 工具）和任务「代码改动」面板共用。
+ * 默认 `max-h-64` 滚动；面板里由外层滚动、传 `scrollClassName="max-h-none"` 取消高度上限。
+ */
+export const InlineDiff = ({
   diff,
   truncated,
   linker,
   filePath,
+  className,
+  scrollClassName,
 }: {
   diff: string;
   truncated?: boolean;
   /** 有 linker + filePath 时新行号可点、跳 IDE 对应行 */
   linker?: IdePathLinker;
   filePath?: string | null;
+  /** 外层容器追加 class（默认已带 mt-1.5） */
+  className?: string;
+  /** 内层滚动区追加 class（靠 cn 覆盖默认的 max-h-64，如传 max-h-none） */
+  scrollClassName?: string;
 }) => {
   const lines = useMemo(() => parseUnifiedDiff(diff), [diff]);
   return (
@@ -158,9 +168,14 @@ const InlineDiff = ({
     <CopyableBlock
       text={diff}
       label="复制 diff"
-      className="mt-1.5 min-w-0 max-w-full"
+      className={cn("mt-1.5 min-w-0 max-w-full", className)}
     >
-      <div className="max-h-64 w-full max-w-full overflow-auto rounded-md border border-border bg-card">
+      <div
+        className={cn(
+          "max-h-64 w-full max-w-full overflow-auto rounded-md border border-border bg-card",
+          scrollClassName,
+        )}
+      >
         {/* min-w-max：横滚内容宽 = 最长行，行级 diff 高亮铺满整行（否则背景只到容器宽、右侧无底色） */}
         <div className="min-w-max">
           {lines.map((line, i) => (
