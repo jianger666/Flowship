@@ -18,11 +18,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   attachLiveThinking,
+  autoEventCollapsed,
   groupChatRenderItems,
   isLiveThinkingEvent,
   isLiveThinkingMeta,
   isWorkGroup,
   shouldShowProcessingPlaceholder,
+  toggleEventCollapsed,
   type ChatRenderItem,
   type WorkGroupItem,
 } from "../src/lib/chat-turns";
@@ -271,24 +273,26 @@ describe("attachLiveThinking：不扰动其它东西", () => {
 });
 
 describe("合成事件的标记（ProcessEventRow 据此多画转圈、摘要取最新一行）", () => {
-  it("追加的新成员带 meta.live；没超上限就没有 liveTruncated", () => {
+  it("追加的新成员带 meta.live；meta 里只有这一个标记", () => {
     const items = groupChatRenderItems([user, tool()]);
     const step = lastGroup(attachLiveThinking(items, live())).members.at(-1) as TaskEvent;
     expect(step.meta?.live).toBe(true);
-    expect(step.meta?.liveTruncated).toBeUndefined();
+    expect(step.meta).toEqual({ live: true });
   });
 
-  it("原文超过前端保留上限：带 liveTruncated（展开区顶部据此提示）；并进末尾思考时同样带", () => {
+  it("原文很长（到了前端保留上限）meta 也不变：实时区只展示尾部、不再提示「仅显示最近」，没有随长度变的字段", () => {
+    // 旧实现：超上限时多带一个 liveTruncated，展开区顶部据此写「仅显示最近 N 字」。
+    // 新实现里实时区本来就只滚动展示尾部（落盘后才是全文），这个提示没有意义、字段随之去掉。
     const long = "x".repeat(THINKING_TEXT_MAX);
     const appended = lastGroup(
       attachLiveThinking(groupChatRenderItems([user, tool()]), live({ text: long })),
     ).members.at(-1) as TaskEvent;
-    expect(appended.meta?.liveTruncated).toBe(true);
+    expect(appended.meta).toEqual({ live: true });
 
     const merged = lastGroup(
       attachLiveThinking(groupChatRenderItems([user, think1]), live({ text: long })),
     ).members[0] as TaskEvent;
-    expect(merged.meta?.liveTruncated).toBe(true);
+    expect(merged.meta).toEqual({ live: true });
   });
 
   it("isLiveThinkingMeta / isLiveThinkingEvent：只认合成的那条", () => {
@@ -311,7 +315,7 @@ describe("合成事件的标记（ProcessEventRow 据此多画转圈、摘要取
       isLiveThinkingMeta(ev({ id: "x", kind: "info", text: "x", meta: { live: true } })),
     ).toBe(false);
     // 只认布尔 true：磁盘上的事件 meta 是任意 JSON，不能让「碰巧有个真值」的 live 字段
-    // 把一条落盘的思考当成进行中的（那样它会永远转圈、摘要永远取最新一行、耗时永远不显示）
+    // 把一条落盘的思考当成进行中的（那样它会永远转圈、永远被强制展开成实时区、耗时永远不显示）
     for (const bogus of ["true", "yes", 1, {}, [], false, 0, null]) {
       expect(
         isLiveThinkingMeta(
@@ -358,5 +362,84 @@ describe("与「处理中…」占位的关系", () => {
         lastMemberKind: lastKind,
       }),
     ).toBe(false);
+  });
+});
+
+describe("事件行折叠态：进行中的思考自动展开、落盘回默认折叠、用户手动永远优先", () => {
+  // rows.tsx 的 EventRowImpl 里这套状态机的纯逻辑部分（组件本身在 node 环境跑不起来）：
+  //   initial = 首次渲染时锁定的默认值（思考不在 DEFAULT_EXPANDED_KINDS → 默认折叠 = true）
+  //   manual  = 用户手动选择（null = 没动过）
+  //   isLive  = 这条事件当前是不是进行中的合成思考（落盘后同 id 的真实事件没有这个标记）
+  const view = (s: { manual: boolean | null; initial: boolean }, isLive: boolean) =>
+    s.manual ?? autoEventCollapsed(isLive, s.initial);
+
+  describe("autoEventCollapsed（用户没动过时）", () => {
+    it("进行中的思考：不论默认值是什么都展开——它存在的意义就是让人看到它在想什么", () => {
+      expect(autoEventCollapsed(true, true)).toBe(false);
+      expect(autoEventCollapsed(true, false)).toBe(false);
+    });
+
+    it("其余：用首次渲染时锁定的默认值", () => {
+      expect(autoEventCollapsed(false, true)).toBe(true);
+      expect(autoEventCollapsed(false, false)).toBe(false);
+    });
+  });
+
+  describe("toggleEventCollapsed（点一下折叠箭头）", () => {
+    it("没有手动态：基于自动态翻转", () => {
+      expect(toggleEventCollapsed(null, false)).toBe(true); // 现在是展开 → 收起
+      expect(toggleEventCollapsed(null, true)).toBe(false); // 现在是收起 → 展开
+    });
+
+    it("有手动态：基于手动态翻转，自动态不参与", () => {
+      expect(toggleEventCollapsed(true, false)).toBe(false);
+      expect(toggleEventCollapsed(true, true)).toBe(false);
+      expect(toggleEventCollapsed(false, false)).toBe(true);
+      expect(toggleEventCollapsed(false, true)).toBe(true);
+    });
+
+    it("连点两下回到原来看到的状态（不论从自动态还是手动态出发）", () => {
+      for (const auto of [true, false]) {
+        const once = toggleEventCollapsed(null, auto);
+        expect(toggleEventCollapsed(once, auto)).toBe(auto);
+      }
+    });
+  });
+
+  describe("时间线：同一个节点（同 id）从进行中走到落盘", () => {
+    it("用户没动过：进行中展开成实时区 → 落盘后回到默认折叠", () => {
+      const s = { manual: null, initial: true };
+      expect(view(s, true)).toBe(false); // 进行中：展开
+      expect(view(s, false)).toBe(true); // 落盘：收起（思考行默认折叠）
+    });
+
+    it("用户在进行中点了收起：落盘后仍收起；之后再点才展开", () => {
+      let manual = toggleEventCollapsed(null, autoEventCollapsed(true, true));
+      expect(manual).toBe(true);
+      expect(view({ manual, initial: true }, true)).toBe(true);
+      expect(view({ manual, initial: true }, false)).toBe(true);
+
+      manual = toggleEventCollapsed(manual, autoEventCollapsed(false, true));
+      expect(manual).toBe(false);
+      expect(view({ manual, initial: true }, false)).toBe(false);
+    });
+
+    it("用户在落盘后才点开：保持展开，不会被任何自动态刷掉", () => {
+      const manual = toggleEventCollapsed(null, autoEventCollapsed(false, true));
+      expect(manual).toBe(false);
+      expect(view({ manual, initial: true }, false)).toBe(false);
+    });
+
+    it("落盘的普通思考行（从来不是进行中）：默认折叠、点开展开，与改动前一致", () => {
+      const s = { manual: null as boolean | null, initial: true };
+      expect(view(s, false)).toBe(true);
+      s.manual = toggleEventCollapsed(s.manual, autoEventCollapsed(false, s.initial));
+      expect(view(s, false)).toBe(false);
+    });
+
+    it("默认展开的事件（assistant_message 等，initial = false）不受影响", () => {
+      const s = { manual: null as boolean | null, initial: false };
+      expect(view(s, false)).toBe(false);
+    });
   });
 });

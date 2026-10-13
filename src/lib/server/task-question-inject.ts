@@ -481,7 +481,13 @@ const runTaskQuestionInject = async (
               task,
               agentText,
               imageAbsPaths,
-              { apiKey, model },
+              {
+                apiKey,
+                model,
+                // 恢复会话时 submit_mr 桥要用（与下面唤醒分支同口径）；
+                // 入口没带也不要紧——resumeTaskSession 会回落服务端 config.json
+                gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+              },
               ackContext,
               attachmentPaths.length > 0 ? attachmentPaths : undefined,
               opGen,

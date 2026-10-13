@@ -20,6 +20,8 @@ const {
   restorePendingAskIf,
   takePendingAskIf,
   getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   hasChatSession,
   publishTaskStreamEvent,
   resumeCurrentActionWithMessage,
@@ -39,6 +41,8 @@ const {
     restorePendingAskIf: vi.fn<AnyFn>(),
     takePendingAskIf: vi.fn<AnyFn>(),
     getTask: vi.fn<AnyFn>(),
+    getTaskMeta: vi.fn<AnyFn>(),
+    getTaskWithTailEvents: vi.fn<AnyFn>(),
     hasChatSession: vi.fn<AnyFn>(() => true),
     publishTaskStreamEvent: vi.fn<AnyFn>(),
     resumeCurrentActionWithMessage: vi.fn<AnyFn>(async () => undefined),
@@ -50,7 +54,12 @@ const {
   };
 });
 
-vi.mock("@/lib/server/task-fs", () => ({ getTask, setTaskRunStatusIfRunOwner }));
+vi.mock("@/lib/server/task-fs", () => ({
+  getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
+  setTaskRunStatusIfRunOwner,
+}));
 vi.mock("@/lib/server/task-artifacts", () => ({ saveImageAttachments }));
 vi.mock("@/lib/server/chat-pending", () => ({
   clearPendingAsk,
@@ -163,6 +172,8 @@ beforeEach(() => {
   agentSessions.clear();
   agentSessions.set(TASK_ID, {});
   getTask.mockImplementation(async () => askTask());
+  getTaskMeta.mockImplementation(async () => askTask());
+  getTaskWithTailEvents.mockImplementation(async () => askTask());
   const pendingAsk = {
     askId: ASK_ID,
     token: "tok-1",

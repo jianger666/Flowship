@@ -16,7 +16,7 @@ import {
   checkoutGitBranch,
   readGitBranchState,
 } from "@/lib/server/git-branches";
-import { getTask } from "@/lib/server/task-fs";
+import { getTaskMeta } from "@/lib/server/task-fs";
 import { getRepoWorkDirs } from "@/lib/path-utils";
 import type { Task } from "@/lib/types";
 
@@ -62,7 +62,8 @@ const resolveWorkDir = (
 
 export const GET = async (req: Request, { params }: Ctx) => {
   const { id } = await params;
-  const task = await getTask(id);
+  // 只读 repoPaths / worktree 等 meta 字段，不整文件 parse 事件日志
+  const task = await getTaskMeta(id);
   if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
   const repoPath = new URL(req.url).searchParams.get("repoPath")?.trim() || null;
   const refresh = new URL(req.url).searchParams.get("refresh") === "1";
@@ -89,7 +90,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (!branch) {
     return NextResponse.json({ error: "branch 必填" }, { status: 400 });
   }
-  const task = await getTask(id);
+  const task = await getTaskMeta(id);
   if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
   const repoPath = body.repoPath?.trim() || null;
   if (

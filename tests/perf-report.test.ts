@@ -713,6 +713,35 @@ describe("回合收尾（turn-wrapup：回复完整后 SDK 迟迟不结束 / 重
     expect(empty).toContain("■ 十一、回合收尾");
     expect(empty).toContain("还没有 chat run");
   });
+
+  // 2026-10-12 起不再丢重放（整套撤掉）：新记录里没有 replayDropped，「已拦截…没有重复上屏」
+  // 会变成一排 0 + 一句与事实相反的话。这一行只在读到 v1.9.29 期间的历史记录时才该出现
+  it("没有历史拦截数据：不印「已拦截 / 没有重复上屏」；读到 v1.9.29 的历史记录才印并标注", () => {
+    const fresh = renderText(
+      buildReport({
+        run: chatRuns(),
+        wrapup: [wrap({ settledAfterMs: 90_000, turnEndedCount: 3 })],
+      }),
+    );
+    expect(fresh).toContain("SDK 重放（同一条流多个 turn-ended）1 个");
+    expect(fresh).not.toContain("已拦截的重放");
+    expect(fresh).not.toContain("没有重复上屏");
+
+    const legacy = renderText(
+      buildReport({
+        run: chatRuns(),
+        wrapup: [
+          wrap({
+            settledAfterMs: 90_000,
+            turnEndedCount: 2,
+            replayDropped: { thinking: 2, assistant: 1, assistantChars: 300, toolCalls: 0 },
+          }),
+        ],
+      }),
+    );
+    expect(legacy).toContain("v1.9.29 期间的历史记录");
+    expect(legacy).toContain("正文 1 条（300 字，没有重复上屏）");
+  });
 });
 
 describe("过滤与提示", () => {

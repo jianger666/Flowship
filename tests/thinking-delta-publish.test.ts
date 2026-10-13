@@ -9,7 +9,7 @@
  * 这里钉死实时帧的语义：
  *   - 首个 chunk 立刻发（零延迟）、其后每 250ms 最多一帧（带期间攒的增量、一个字不丢）；
  *   - 段结束（任何非 thinking 消息 / 落盘 / run 结束）→ 没发的尾巴直接丢，下一段重新「立即发」；
- *   - 旁路答疑（origin）/ 已提问消音（askSeen）/ 回合结束后的重放 / lease 失主 → 不发；
+ *   - 旁路答疑（origin）/ 已提问消音（askSeen）/ lease 失主 → 不发；
  *   - 落盘仍是「一段一条 thinking 事件、带完整文本」，不受实时帧影响；
  *   - eventId：一段思考的第一个 chunk 就预定好落盘事件的 id，每帧都带、落盘时复用——
  *     前端据此把「进行中的思考行」和落盘行对成同一个 React 节点（点开着读的不会被收起）。
@@ -203,16 +203,16 @@ describe("handleSdkMessage thinking_delta 实时帧", () => {
     expect(persistedThinking()).toEqual(["AB"]);
   });
 
-  it("task 模式（没开重放保护）usage 到来也算段结束：排队的尾巴不再补发", async () => {
-    // usage 在 task 模式不冲 thinking（要等 run 结束才落盘），不经过 flushThinkingBuffer——
+  it("usage 到来也算段结束：排队的尾巴不再补发", async () => {
+    // usage 只计数、不冲 thinking（要等下一个事件 / run 结束才落盘），不经过 flushThinkingBuffer——
     // 这种路径只靠 handleSdkMessage 入口的「非 thinking 消息即丢尾巴」兜底
-    const ctx = mkCtx(); // dropAfterTurnEnded 未设置
+    const ctx = mkCtx();
     await handleSdkMessage(TASK, thinkingMsg("A"), ctx, leaseOk);
     await handleSdkMessage(TASK, thinkingMsg("B"), ctx, leaseOk); // 排队
     await handleSdkMessage(TASK, usageMsg(), ctx, leaseOk);
     vi.advanceTimersByTime(THINKING_DELTA_INTERVAL_MS * 4);
     expect(thinkingFrames()).toEqual(["A"]);
-    // 没落盘（task 模式 usage 不冲）——说明确实没经过 flushThinkingBuffer
+    // 没落盘（usage 不冲）——说明确实没经过 flushThinkingBuffer
     expect(persistedThinking()).toEqual([]);
   });
 
@@ -242,15 +242,14 @@ describe("handleSdkMessage thinking_delta 实时帧", () => {
     expect(thinkingFrames()).toEqual([]);
   });
 
-  it("回合结束后的重放（dropAfterTurnEnded + usage 之后）不发：重放内容本来就不上屏", async () => {
-    const ctx = mkCtx({ dropAfterTurnEnded: true });
+  it("usage 之后又来的思考照常发帧：不再把「重放」当成该丢的东西（2026-10-12 撤掉丢重放）", async () => {
+    const ctx = mkCtx();
     await handleSdkMessage(TASK, thinkingMsg("正常思考"), ctx, leaseOk);
-    await handleSdkMessage(TASK, usageMsg(), ctx, leaseOk); // turn-ended
+    await handleSdkMessage(TASK, usageMsg(), ctx, leaseOk); // turn-ended：只计数
     publishIfCurrent.mockClear();
 
-    await handleSdkMessage(TASK, thinkingMsg("SDK 重放的思考"), ctx, leaseOk);
-    vi.advanceTimersByTime(THINKING_DELTA_INTERVAL_MS * 2);
-    expect(thinkingFrames()).toEqual([]);
+    await handleSdkMessage(TASK, thinkingMsg("SDK 又跑一轮的思考"), ctx, leaseOk);
+    expect(thinkingFrames()).toEqual(["SDK 又跑一轮的思考"]); // 新一段的首个 chunk 立刻发
   });
 
   it("lease 失主（run 已被新一轮取代）：排队的帧到点不发", async () => {
@@ -419,17 +418,6 @@ describe("thinking_delta 的 eventId：实时帧预定的 id 与落盘事件是�
     expect(ids).toHaveLength(2);
     expect(ids[1]).toBeTruthy();
     expect(ids[1]).not.toBe(firstId);
-  });
-
-  it("回合结束后重放的思考（dropAfterTurnEnded）不预定 id——它既不发帧也不落盘", async () => {
-    const ctx = mkCtx({ dropAfterTurnEnded: true });
-    await handleSdkMessage(TASK, thinkingMsg("正常思考"), ctx, leaseOk);
-    await handleSdkMessage(TASK, usageMsg(), ctx, leaseOk); // turn-ended：落盘并清零
-    expect(ctx.thinkingEventId).toBeUndefined();
-
-    await handleSdkMessage(TASK, thinkingMsg("SDK 重放的思考"), ctx, leaseOk);
-    expect(ctx.thinkingEventId).toBeUndefined();
-    expect(thinkingFrameIds()).toHaveLength(1); // 只有正常那一段的帧
   });
 
   it("run 交接：旧 run 没来得及清节流状态时，新 run 的帧带它自己预定的 id（不沿用旧 run 的）", async () => {

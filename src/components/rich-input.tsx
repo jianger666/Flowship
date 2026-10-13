@@ -272,13 +272,21 @@ export const RichInput = ({
         onPasteLongText={onPasteLongText}
       />
 
-      {/* footer：左 slot + 右动作组（附件按钮 + 外壳传的发送 / 停止） */}
-      <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-0.5">
+      {/* footer：左 slot + 右动作组（附件按钮 + 外壳传的发送 / 停止）。
+          flex-wrap：左 slot 带保底宽度（basis-58 = 232px ≈ 提供方 96 + 间距 6 + 模型保底 128），
+          主区窄到放不下「左保底 + 右动作组 122px」时右组折到第二行靠右，而不是互相压住 */}
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-2.5 pb-2 pt-0.5">
         {/* `*:min-w-0` 与 DialogContent 同款兜底：slot 里塞的控件（模型选择器等）默认
             min-width:auto = 内容宽、窗口变窄时会顶穿本容器压到右侧动作组上。放开下限、
-            让控件内部的 truncate 生效——新加 leading 内容不必再各自记得加 */}
-        <div className="flex min-w-0 items-center *:min-w-0">{leading}</div>
-        <div className="flex shrink-0 items-center gap-0.5">
+            让控件内部的 truncate 生效。⚠ 它只管 slot 的直接子节点——更深处的 <button>
+            （width:auto = shrink-to-fit）要自己 max-w-full，见 model-select.tsx。
+            无 leading 时不渲染：空 slot 的 basis 也会参与折行判定、白白多出一行 */}
+        {leading ? (
+          <div className="flex min-w-0 flex-1 basis-58 items-center *:min-w-0">
+            {leading}
+          </div>
+        ) : null}
+        <div className="ml-auto flex shrink-0 items-center gap-0.5">
           {showAttachActions && attach && (
             <Tooltip content="附图（也支持粘贴 / 拖拽）">
               <span className="inline-flex">

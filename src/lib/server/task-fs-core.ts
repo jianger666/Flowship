@@ -647,9 +647,109 @@ export const readEventsTail = async (
 };
 
 /**
- * 流式向前扫：取 cursor（beforeId）之前紧邻的一页更早事件（时间正序）。
- * 只在内存里保留 page 大小的滑动窗口，找到锚点即停、不把整文件解析成数组。
- * 锚点不存在 → { events: [], hasMore: false }（与旧路由语义一致）。
+ * 文件内**反向**逐行扫描：从 fromPos（不含）往文件头方向，按行从右到左回调。
+ * 回调拿到「整行字节（不含 \n）」和「该行行首的文件偏移」，返回 false 即停止。
+ * 按字节找 \n 再整行 decode——不会被块边界切断 UTF-8 多字节字符；跨块的长行靠 carry 拼接。
+ */
+const scanLinesBackward = async (
+  fh: import("node:fs/promises").FileHandle,
+  fromPos: number,
+  onLine: (line: Buffer, lineStart: number) => boolean,
+): Promise<void> => {
+  let pos = fromPos;
+  // 更靠文件尾一侧、尚未与更早块拼成「行首」的碎片（跨块行）；它在文件里的起点恒为 pos
+  let carry = Buffer.alloc(0);
+  while (pos > 0) {
+    const toRead = Math.min(EVENTS_TAIL_CHUNK, pos);
+    pos -= toRead;
+    const buf = Buffer.allocUnsafe(toRead);
+    const { bytesRead } = await fh.read(buf, 0, toRead, pos);
+    const data = Buffer.concat([buf.subarray(0, bytesRead), carry]);
+    let end = data.length;
+    for (let i = data.length - 1; i >= 0; i--) {
+      if (data[i] !== 0x0a) continue;
+      if (!onLine(data.subarray(i + 1, end), pos + i + 1)) return;
+      end = i;
+    }
+    carry = data.subarray(0, end);
+  }
+  // 文件第一行（行首偏移 0）
+  if (carry.length > 0) onLine(carry, 0);
+};
+
+/**
+ * 「事件 id → 它所在行的行首字节偏移」的小缓存，给连续上拉翻页用。
+ *
+ * 翻页是从最新往最旧一页接一页：下一页的锚点 = 上一页的第一条事件，我们刚刚扫过它、知道偏移，
+ * 直接 seek 过去即可，不必再从文件尾重新扫到锚点。缓存只是**提示**：用之前必校验
+ * （该偏移是行首、且那一行 parse 出来的 id 确实是锚点），对不上（文件被 rewind 重写等）就退回扫描，
+ * 所以不会因为缓存陈旧而翻出错的页。
+ */
+const ANCHOR_OFFSET_CACHE_MAX = 256;
+const anchorOffsetCache = new Map<string, number>();
+const anchorKey = (taskId: string, eventId: string): string =>
+  `${taskId}\u0000${eventId}`;
+const rememberAnchorOffset = (
+  taskId: string,
+  eventId: string,
+  offset: number,
+): void => {
+  const k = anchorKey(taskId, eventId);
+  anchorOffsetCache.delete(k); // 重新插入 = 最近使用
+  anchorOffsetCache.set(k, offset);
+  while (anchorOffsetCache.size > ANCHOR_OFFSET_CACHE_MAX) {
+    const oldest = anchorOffsetCache.keys().next().value;
+    if (oldest === undefined) break;
+    anchorOffsetCache.delete(oldest);
+  }
+};
+
+/** 校验缓存的偏移：是行首，且这一行就是锚点事件 */
+const verifyAnchorOffset = async (
+  fh: import("node:fs/promises").FileHandle,
+  size: number,
+  offset: number,
+  eventId: string,
+): Promise<boolean> => {
+  if (offset < 0 || offset >= size) return false;
+  if (offset > 0) {
+    const one = Buffer.allocUnsafe(1);
+    const { bytesRead } = await fh.read(one, 0, 1, offset - 1);
+    if (bytesRead !== 1 || one[0] !== 0x0a) return false;
+  }
+  // 从 offset 往后读到第一个 \n（或文件尾）。一行事件通常几百字节、但也可能是 MB 级的大行：
+  // 块大小从 2KB 起步、逐次翻倍到 EVENTS_TAIL_CHUNK——常见情况只读一小块，大行也不会读成碎片
+  let line = Buffer.alloc(0);
+  let pos = offset;
+  let chunkSize = 2048;
+  while (pos < size) {
+    const toRead = Math.min(chunkSize, size - pos);
+    chunkSize = Math.min(chunkSize * 2, EVENTS_TAIL_CHUNK);
+    const buf = Buffer.allocUnsafe(toRead);
+    const { bytesRead } = await fh.read(buf, 0, toRead, pos);
+    if (bytesRead === 0) break;
+    const chunk = buf.subarray(0, bytesRead);
+    const nl = chunk.indexOf(0x0a);
+    if (nl >= 0) {
+      line = Buffer.concat([line, chunk.subarray(0, nl)]);
+      break;
+    }
+    line = Buffer.concat([line, chunk]);
+    pos += bytesRead;
+  }
+  return parseEventLineBuf(line)?.id === eventId;
+};
+
+/**
+ * 取 cursor（beforeId）之前紧邻的一页更早事件（时间正序）。
+ *
+ * **反向**读：翻历史总是从最新往旧翻，所以从文件尾往回找锚点、再往前收一页——IO 量跟「锚点离文件尾多远」
+ * 同阶，而不是（旧实现）永远从文件头流式扫到锚点（翻最近几页也要读几乎整个文件）。
+ * 连续翻页时下一页的锚点偏移已知（见 anchorOffsetCache），直接 seek，每页只读一页的量。
+ * 语义与旧实现逐字节一致：返回原始行解析出的事件（不做 thinking 收口）、坏行 / 半行跳过、
+ * hasMore = 锚点之前还有更早的有效事件、锚点不存在 → { events: [], hasMore: false }。
+ * 前提：事件 id 在文件内唯一（appendEvent 契约「一个 id 只落一条」）——反向扫命中的是最后一次出现，
+ * 旧实现命中第一次出现，唯一时两者等价。
  */
 export const readEventsBefore = async (
   id: string,
@@ -662,34 +762,57 @@ export const readEventsBefore = async (
   const p = path.join(taskDir(id), EVENTS_FILE);
   if (!(await exists(p))) return { events: [], hasMore: false };
 
-  const stream = createReadStream(p, { encoding: "utf-8" });
-  const rl = createInterface({ input: stream, crlfDelay: Infinity });
-
-  const window: TaskEvent[] = [];
-  let discarded = false;
-  let found = false;
-
+  const fh = await fs.open(p, "r");
   try {
-    for await (const line of rl) {
-      const ev = parseEventLine(line);
-      if (!ev) continue;
-      if (ev.id === beforeId) {
-        found = true;
-        break;
-      }
-      window.push(ev);
-      if (window.length > page) {
-        window.shift();
-        discarded = true;
+    const { size } = await fh.stat();
+    if (size === 0) return { events: [], hasMore: false };
+
+    // 缓存命中且校验通过：直接从锚点行首往前收；否则从文件尾往回找锚点
+    let startPos = size;
+    let anchorFound = false;
+    let anchorStart = -1;
+    const cached = anchorOffsetCache.get(anchorKey(id, beforeId));
+    if (cached !== undefined) {
+      if (await verifyAnchorOffset(fh, size, cached, beforeId)) {
+        startPos = cached;
+        anchorFound = true;
+        anchorStart = cached;
+      } else {
+        anchorOffsetCache.delete(anchorKey(id, beforeId));
       }
     }
-  } finally {
-    rl.close();
-    stream.destroy();
-  }
 
-  if (!found) return { events: [], hasMore: false };
-  return { events: window, hasMore: discarded };
+    // 倒序收集：collected[0] = 紧邻锚点之前的那条。多收 1 条只为判 hasMore
+    const collected: Array<{ ev: TaskEvent; start: number }> = [];
+    await scanLinesBackward(fh, startPos, (lineBuf, lineStart) => {
+      const ev = parseEventLineBuf(lineBuf);
+      if (!ev) return true; // 空行 / 崩溃半行 / 坏 JSON
+      if (!anchorFound) {
+        if (ev.id === beforeId) {
+          anchorFound = true;
+          anchorStart = lineStart;
+        }
+        return true;
+      }
+      collected.push({ ev, start: lineStart });
+      return collected.length <= page;
+    });
+
+    if (!anchorFound) return { events: [], hasMore: false };
+    rememberAnchorOffset(id, beforeId, anchorStart);
+
+    const hasMore = collected.length > page;
+    const pageItems = hasMore ? collected.slice(0, page) : collected;
+    // 这一页最旧的一条 = 下一页的锚点：记下它的行首偏移，连续上拉直接 seek
+    const oldest = pageItems[pageItems.length - 1];
+    if (oldest) rememberAnchorOffset(id, oldest.ev.id, oldest.start);
+    return {
+      events: pageItems.map((x) => x.ev).reverse(),
+      hasMore,
+    };
+  } finally {
+    await fh.close();
+  }
 };
 
 /**

@@ -16,7 +16,7 @@ import { NextResponse } from "next/server";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import { errorResponse } from "@/lib/server/route-helpers";
 import { getRepoPreviewCommand } from "@/lib/server/settings-fs";
-import { getTask } from "@/lib/server/task-fs";
+import { getTaskMeta } from "@/lib/server/task-fs";
 import { getTaskWorkRepoPaths } from "@/lib/server/task-worktrees";
 import {
   getPreviewStatus,
@@ -42,7 +42,8 @@ export const POST = async (req: Request) => {
     return errorResponse("缺少 taskId / repoPath");
   }
 
-  const task = await getTask(taskId);
+  // 只用 repoPaths / repoStatus / title 等 meta 字段，不必整文件 parse 事件日志
+  const task = await getTaskMeta(taskId);
   if (!task) return errorResponse("task 不存在", 404);
   // finalize 清理窗内 / 终态任务拒起预览——finalize 会 stopPreviews 后
   // removeTaskWorktrees，此窗口起的新 dev server 会变成 cwd 已删的孤儿进程

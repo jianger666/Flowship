@@ -425,6 +425,11 @@ export const ArtifactPanel = ({
   // 初始 true：组件（含按 action.id remount）一挂载就要拉产物、
   // 首帧直接走「加载产物…」、不闪上一个 action 的内容、也不误显「没有产物」。
   const [contentLoading, setContentLoading] = useState(true);
+  // 拉产物失败文案（null = 无错）。失败 ≠ 没有产物：以前请求失败（断网 / 5xx）退避重试耗尽后
+  // 只 console.warn、落到 !currentArtifact 分支显示「没有产物」，把「没拉到」说成「不存在」。
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // 强制重拉产物（失败态「重试」按钮递增）
+  const [loadRetryKey, setLoadRetryKey] = useState(0);
   // revision 列表
   const [revisions, setRevisions] = useState<ArtifactRevision[]>([]);
   // 对比基准时间戳（默认最新快照 =「上次」）
@@ -571,6 +576,7 @@ export const ArtifactPanel = ({
       try {
         const data = await fetchActionRevisions(taskId, action.id);
         if (cancelled) return;
+        setLoadError(null);
         setCurrentArtifact(data.current);
         setRevisions(data.revisions);
         setCompareFromTs((cur) => {
@@ -606,6 +612,10 @@ export const ArtifactPanel = ({
           willRetry = true;
           retryTimer = setTimeout(() => void load(), delay);
         }
+        // 没有后续重试了 = 这次是最终失败：落错误态（有旧正文时面板仍显示旧正文、不受影响）
+        if (!willRetry) {
+          setLoadError(err instanceof Error ? err.message : "加载产物失败");
+        }
       } finally {
         if (!cancelled && !willRetry) setContentLoading(false);
       }
@@ -624,6 +634,7 @@ export const ArtifactPanel = ({
     action.status,
     action.artifactPath,
     action.artifactUpdatedAt,
+    loadRetryKey,
   ]);
 
   // 修订开启时拉对比两端全文
@@ -674,6 +685,10 @@ export const ArtifactPanel = ({
 
   const handleDiffRetry = useCallback(() => {
     setDiffRetryKey((k) => k + 1);
+  }, []);
+
+  const handleLoadRetry = useCallback(() => {
+    setLoadRetryKey((k) => k + 1);
   }, []);
 
   const hasUnseen = useMemo(
@@ -930,7 +945,7 @@ export const ArtifactPanel = ({
             <>
               <span className="mx-2 h-4 w-px shrink-0 bg-border/60" />
               <Tooltip content={currentArtifact.filename}>
-                <span className="flex min-w-0 items-center text-muted-foreground/80">
+                <span className="flex min-w-0 items-center text-muted-foreground">
                   <span className="min-w-0 truncate font-mono text-[11px]">
                     {currentArtifact.filename}
                   </span>
@@ -1101,14 +1116,29 @@ export const ArtifactPanel = ({
             <div className="shrink-0 px-6 pt-4">{postCheckBanner}</div>
           )}
           <div className="flex flex-1 items-center justify-center px-6 text-center">
-            <div className="text-sm text-muted-foreground">
-              <div className="mb-2 flex justify-center">
-                <FileText className="size-8 opacity-40" />
+            {loadError ? (
+              // 拉取失败 ≠ 没有产物：说清楚是「没拉到」、给重试（与下方修订对比失败态同一套样式）
+              <div className="flex flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+                <p>加载产物失败：{loadError}</p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleLoadRetry}
+                >
+                  重试
+                </Button>
               </div>
-              {action.status === "running"
-                ? `${actionTitle} 正在生成产物…`
-                : `${actionTitle} 没有产物`}
-            </div>
+            ) : (
+              <div className="text-sm text-muted-foreground">
+                <div className="mb-2 flex justify-center">
+                  <FileText className="size-8 opacity-40" />
+                </div>
+                {action.status === "running"
+                  ? `${actionTitle} 正在生成产物…`
+                  : `${actionTitle} 没有产物`}
+              </div>
+            )}
           </div>
         </div>
       ) : (

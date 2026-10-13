@@ -362,7 +362,9 @@ const cadenceSection = (runs) => {
 export const WRAPUP_SLOW_MS = 5_000;
 
 /**
- * 回合收尾（turn-wrapup.jsonl：chat 回合已结束，但 SDK 迟迟没收尾 / 重放过 / 我们拦过重放消息才记一条）。
+ * 回合收尾（turn-wrapup.jsonl：chat 回合已结束，但 SDK 迟迟没收尾 / 在同一条流上又跑了一轮才记一条）。
+ * `replayDropped` 只存在于 v1.9.29 期间写下的历史记录里（那版会丢重放，2026-10-12 整套撤掉、
+ * 现在重放照常上屏），保留读取只为能解读旧数据。
  * 回答「回复完了还转圈 / 同一句话被回复两遍」今天还发不发生、发生时卡多久：
  * - 分母 = 同期 chat run 数；正常收尾（~0.3s）不写记录，所以占比 = 异常收尾率
  * - 重放 = SDK 在同一条流上发了不止一条 turn-ended（usage>1）
@@ -812,14 +814,17 @@ export const renderText = (report) => {
     L.push("  无数据（还没有 chat run，或记录来自没有该日志的旧版本）");
   } else {
     L.push(
-      `  同期 chat run ${wu.chatRuns} 个，其中回合结束后收尾异常（>3s / SDK 重放 / 拦过重放消息）${wu.records} 个（${pct(wu.share)}）；` +
+      `  同期 chat run ${wu.chatRuns} 个，其中回合结束后收尾异常（>3s / SDK 重放）${wu.records} 个（${pct(wu.share)}）；` +
         `SDK 重放（同一条流多个 turn-ended）${wu.replayed} 个；回合结束后 >${WRAPUP_SLOW_MS / 1000}s 才收尾 ${wu.slow} 个`,
     );
     L.push(`  回合结束 → SDK 收尾 ${D(wu.settledMs, min)}`);
-    L.push(
-      `  已拦截的重放：thinking ${wu.droppedThinking} 条、正文 ${wu.droppedAssistant} 条（${wu.droppedChars} 字，没有重复上屏）；` +
-        `重放里带的工具调用 ${wu.droppedToolCalls} 次（不拦、仅计数）`,
-    );
+    // 现在重放照常上屏、不再有「拦截」；这一行只在读到 v1.9.29 期间的历史记录时才出现
+    if (wu.droppedThinking + wu.droppedAssistant + wu.droppedToolCalls > 0) {
+      L.push(
+        `  （v1.9.29 期间的历史记录，该机制已撤掉）已拦截的重放：thinking ${wu.droppedThinking} 条、正文 ${wu.droppedAssistant} 条（${wu.droppedChars} 字，没有重复上屏）；` +
+          `重放里带的工具调用 ${wu.droppedToolCalls} 次（不拦、仅计数）`,
+      );
+    }
     L.push(
       `  交叉印证：chat run 里 outcome=ok（turn-ended 后 2s 内没等到终态回调、由埋点兜底收口）${wu.okChatRuns} 个`,
     );

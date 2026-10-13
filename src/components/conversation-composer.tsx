@@ -53,7 +53,10 @@ export interface ConversationComposerProps {
   placeholder?: string;
   /** 整体禁用：编辑器 + 附件动作 + 发送（停止键不受它管） */
   disabled?: boolean;
-  /** 请求飞行中：发送键转圈（跟 running 的区别：这是「提交这条」的短暂态） */
+  /**
+   * 请求飞行中：常态「发送」键转圈（跟 running 的区别：这是「提交这条」的短暂态）。
+   * 运行态（running）下「排队发送」键只灰掉防连点、不转圈——转圈 + 停止键已经在左边了。
+   */
   submitting?: boolean;
   /**
    * 聚焦句柄（调用方做自动聚焦 / Cmd+J）。
@@ -150,7 +153,9 @@ export const ConversationComposer = ({
   const showUnbound =
     !!session?.showUnboundBanner && (session.repoPaths?.length ?? 0) === 0;
 
-  // 发送键：运行态排队发送与常态发送共用（title 文案不同）
+  // 发送键：运行态排队发送与常态发送共用（title 文案不同）。
+  // 转圈只属于常态「发送」：运行态左边已经有转圈 + 停止键，提交飞行中旁边的「排队发送」
+  // 只灰掉防连点、不再转第二个圈——否则回车后（输入框按运行态画）仍是一副「loading」的样子。
   const sendButton = (label: "发送" | "排队发送") => (
     <Tooltip content={`${label}（${getSubmitShortcutTitle(submitShortcut)}）`}>
       <span className="inline-flex">
@@ -162,7 +167,7 @@ export const ConversationComposer = ({
           className="ml-1 size-7 rounded-lg p-0"
           aria-label={label}
         >
-          {submitting ? (
+          {submitting && label === "发送" ? (
             <Loader2 className="size-4 animate-spin" />
           ) : (
             <ArrowUp className="size-4" />
@@ -271,7 +276,8 @@ export const ConversationComposer = ({
       trailing={
         running ? (
           <>
-            <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+            {/* running = info（项目约定：进行中只用 text-info，跟状态行 / 组头 spinner 同色） */}
+            <Loader2 className="size-3.5 animate-spin text-info" />
             <Tooltip content="停止生成（中断 agent）">
               <span className="inline-flex">
                 <Button

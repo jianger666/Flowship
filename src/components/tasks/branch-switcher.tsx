@@ -406,7 +406,7 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
                 />
                 {refreshing ? "正在拉取…" : "拉取最新分支"}
               </button>
-              <span className="text-[11px] text-muted-foreground/70">
+              <span className="text-[11px] text-muted-foreground">
                 含远端新分支
               </span>
             </div>

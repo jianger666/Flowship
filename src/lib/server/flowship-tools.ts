@@ -710,6 +710,8 @@ export const buildSdkCustomTools = (
 export const withFlowshipSdkCustomTools = <T extends object>(
   local: T | undefined,
   callerToken: string | undefined,
+  /** 与系统工具一起挂的额外工具（如 `subagent`）；只在这里挂系统工具时才带上 */
+  extraTools?: Record<string, SDKCustomTool>,
 ): T | (T & { customTools: Record<string, SDKCustomTool> }) => {
   if (!callerToken) return (local ?? {}) as T;
   if (
@@ -721,6 +723,6 @@ export const withFlowshipSdkCustomTools = <T extends object>(
   }
   return {
     ...(local ?? {}),
-    customTools: buildSdkCustomTools(callerToken),
+    customTools: { ...buildSdkCustomTools(callerToken), ...(extraTools ?? {}) },
   } as T & { customTools: Record<string, SDKCustomTool> };
 };

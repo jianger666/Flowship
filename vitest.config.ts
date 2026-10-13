@@ -16,6 +16,10 @@ export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
     environment: "node",
+    // 每个测试文件 import 被测模块之前先隔离环境：剔除宿主注入变量、FLOWSHIP_DATA_DIR 指向临时目录。
+    // agent shell 会继承正式数据目录，没有这一步，任何测试一 import task-fs 就可能触发惰性的
+    // boot-recovery 去改正式数据（2026-10-09 事故，见 tests/helpers/hermetic-env.ts）
+    setupFiles: ["./tests/setup/hermetic-env.ts"],
     // 默认满核并发下 Git 真实 IO / 计时测试会随机超时（T6），固定 maxWorkers 保证门禁可重复
     maxWorkers: 4,
   },

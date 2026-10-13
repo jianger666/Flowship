@@ -170,7 +170,8 @@
    - `edit`：**改已存在的文件**（args `{ path, oldText, newText, replaceAll? }` 或 `{ path, edits: [{ oldText, newText }, ...] }`）
    - `write`：**创建新文件 / 整文件覆盖**（args `{ path, fileText, returnFileContentAfterWrite? }`）
    - `delete`：删文件（args `{ path }`）
-   - `task`：分派子任务
+   - `task`：分派子任务（args `{ prompt, description?, subagentType?, model?, effort? }`；子 agent 看不到当前对话，prompt 要写全背景；`model` 省略 = 沿用当前模型，没被明确要求时不要另填）。`effort`（思考档）、`subagentType: "explore"`（只读）、`model: "list"`（列出当前 provider 可选模型和各自的 effort 档）；填了无效的 model / effort 会报错并列出可选项，照提示改即可
+   - `subagent`（仅 Cursor；MCP 工具，server 为 `custom-user-tools`）：与 `task` 同参同语义，**需要指定 `model` / `effort` 时用它**——Cursor 原生 `task` 不能选模型（固定 composer 系）。不需要指定模型时用哪个都行；同一轮里可以并行发起多个
 
    ⚠️ **工具名不带 `_file` 后缀**：不是 `edit_file` / `read_file` / `write_file`、就是 `edit` / `read` / `write`。SDK 没有 `_file` 后缀的工具、调用会失败。写 artifact 的工具用法见「跨 action 共享规范」§1（第一次写前先 `read` `artifact-writer` skill）。
 

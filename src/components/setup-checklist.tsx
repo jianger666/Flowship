@@ -159,7 +159,7 @@ const StepRow = ({
       <div className={cn("text-sm font-medium", done && "text-muted-foreground")}>
         {title}
       </div>
-      <div className="text-xs text-muted-foreground/80">{hint}</div>
+      <div className="text-xs text-muted-foreground">{hint}</div>
     </div>
     {!done && (
       <Link

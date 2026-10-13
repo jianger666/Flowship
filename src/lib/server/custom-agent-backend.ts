@@ -63,9 +63,20 @@ import {
   lookupCatalogReasoning,
 } from "@/lib/server/models-dev-catalog";
 import { mcpDisplayName } from "@/lib/mcp-tool-name";
+import {
+  catalogFromModelOptions,
+  formatModelCatalog,
+  resolveSubagentModel,
+  SubagentUsageError,
+  subagentNeedsCatalog,
+  wantsModelList,
+  type ModelCatalogEntry,
+  type SubagentRequest,
+} from "@/lib/subagent-spec";
 
 import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
+import { listModelOptions } from "./model-catalog";
 import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
 import {
   buildCodingToolDefs,
@@ -84,6 +95,8 @@ const PROVIDER_ID = "flowship-custom";
 const NATIVE_TOOLS = ["read", "edit", "write", "grep"];
 // 子 agent 用 pi 原生全套（读/写/跑命令），不带 task / 系统工具——防递归与副作用
 const SUBAGENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+// subagentType=explore：真只读（不给 bash / edit / write）
+const SUBAGENT_READONLY_TOOLS = ["read", "grep", "find", "ls"];
 // 自定义端点元数据缺省（用户 endpoint 不提供时给合理兜底）。
 // 窗口优先用 models.dev limit.context；缺目录才 12.8 万。muse-spark 实际 1M，
 // 写死 12.8 万会过早 overflow，压完剩余输出配额被卡死、界面上看不到回复。
@@ -346,36 +359,119 @@ const bridgeUserMcpServers = async (
   };
 };
 
-/** 进程内嵌套子会话：给 task 工具用——起一个只带编码工具的子 agent、跑完返最终文本 */
-const runSubagent = async (
-  prompt: string,
-  opts: {
-    runtime: Awaited<ReturnType<typeof ModelRuntime.create>>;
-    model: Model<never>;
-    cwd: string;
-    thinkingLevel: ReturnType<typeof thinkingLevelFromParams>;
-    taskId?: string;
-  },
+type PiRuntime = Awaited<ReturnType<typeof ModelRuntime.create>>;
+
+/** 父会话的模型上下文：沿用模型时直接复用 runtime，换模型 / 换 effort 才按 input 重建 */
+export interface SubagentParent {
+  input: CustomAgentInput;
+  runtime: PiRuntime;
+  model: Model<never>;
+  thinkingLevel: ReturnType<typeof thinkingLevelFromParams>;
+}
+
+/**
+ * 子代理可选模型清单（当前 provider）。拿不到（端点没有 /models、超时）就返回 null——
+ * 此时不校验 model id（自定义端点常有清单外的可用 id），不能因为列清单失败拦掉子任务。
+ */
+const loadSubagentCatalog = async (
+  input: CustomAgentInput,
+): Promise<ModelCatalogEntry[] | null> => {
+  try {
+    const options = await listModelOptions({
+      kind: "custom",
+      apiKey: input.apiKey,
+      baseUrl: input.baseUrl,
+      format: input.format,
+    });
+    return catalogFromModelOptions(options);
+  } catch (err) {
+    console.warn(
+      "[custom-agent] 子代理模型清单拿不到、跳过校验：",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+};
+
+/**
+ * 进程内嵌套子会话：给 task 工具用——起一个子 agent、跑完返最终文本。
+ *
+ * - 模型 / effort：缺省沿用父会话；显式指定则在**当前 provider** 内解析（见 subagent-spec），
+ *   无效直接抛 SubagentUsageError，不静默回退。
+ * - subagentType=explore 只给 read / grep / find / ls（真只读）；general 才有 bash / edit / write。
+ * - signal 取消时中止子会话（父会话被停后子会话不再空转烧 token）。
+ * - 子会话自己的模型失败（鉴权 / 模型名被端点拒 / 5xx）不吞成「无输出」，抛出去让父模型看到原因。
+ * 子 agent 不带 task / 系统工具——防递归与副作用。
+ */
+export const runPiSubagent = async (
+  req: SubagentRequest,
+  signal: AbortSignal | undefined,
+  ctx: { parent: SubagentParent; cwd: string; taskId?: string },
 ): Promise<string> => {
+  const { parent, cwd, taskId } = ctx;
+  const parentSel = {
+    id: parent.input.model?.id?.trim() || "default",
+    params: parent.input.model?.params,
+  };
+
+  const catalog = subagentNeedsCatalog(req)
+    ? await loadSubagentCatalog(parent.input)
+    : null;
+  if (wantsModelList(req.model)) {
+    return catalog
+      ? `当前模型：${parentSel.id}\n可选模型（当前 provider）：\n${formatModelCatalog(catalog)}`
+      : "拿不到当前 provider 的模型清单（端点没有 /models 或请求失败）；可直接填模型 id，或省略 model 沿用当前模型。";
+  }
+  const resolved = resolveSubagentModel(req, parentSel, catalog);
+  if (!resolved.ok) throw new SubagentUsageError(resolved.error);
+
+  // 沿用模型且没覆盖 effort → 复用父 runtime（省一次构建）；否则按解析结果重建
+  const child =
+    resolved.inherited && !resolved.effort
+      ? {
+          runtime: parent.runtime,
+          model: parent.model,
+          thinkingLevel: parent.thinkingLevel,
+        }
+      : await buildRuntime({ ...parent.input, model: resolved.model });
+  // effort 被 pi 侧丢掉（目录不认这档）就不能假装生效了
+  if (resolved.effort && child.thinkingLevel === undefined) {
+    throw new SubagentUsageError(
+      `模型「${resolved.model.id}」的思考档目录里不认 effort=「${resolved.effort}」，不会生效；换一档或去掉 effort。`,
+    );
+  }
+  if (signal?.aborted) throw new Error("子任务已取消");
+
   const { session } = await createAgentSession({
-    cwd: opts.cwd,
+    cwd,
     agentDir: piAgentDir(),
-    resourceLoader: await buildResourceLoader(opts.cwd),
-    modelRuntime: opts.runtime,
-    model: opts.model,
-    tools: [...SUBAGENT_TOOLS],
+    resourceLoader: await buildResourceLoader(cwd),
+    modelRuntime: child.runtime,
+    model: child.model,
+    tools:
+      req.subagentType === "explore"
+        ? [...SUBAGENT_READONLY_TOOLS]
+        : [...SUBAGENT_TOOLS],
     // 内层同样落盘（同 task 配额），文件名加 sub- 前缀防与父会话 callId 撞车；
     // 内层工具调用不进父会话事件流，落盘只给模型读
     customTools: buildNativeToolAliasWrappers(
-      opts.cwd,
-      opts.taskId ? { taskId: opts.taskId, filePrefix: "sub-" } : undefined,
-   ),
-    thinkingLevel: opts.thinkingLevel,
+      cwd,
+      taskId ? { taskId, filePrefix: "sub-" } : undefined,
+    ),
+    thinkingLevel: child.thinkingLevel,
     // 子 agent 不落会话文件（一次性）
-    sessionManager: SessionManager.inMemory(opts.cwd),
+    sessionManager: SessionManager.inMemory(cwd),
   });
+  const onAbort = () => {
+    void Promise.resolve(session.abort()).catch(() => {});
+  };
   try {
+    signal?.addEventListener("abort", onAbort, { once: true });
+    // 创建期间可能已被取消（上面的 aborted 检查与监听挂上之间有 await）
+    if (signal?.aborted) onAbort();
     let result = "";
+    // 用对象承接：闭包里赋值，直接 let 会被 TS 窄化成 null
+    const fail: { prompt: string | null } = { prompt: null };
     await new Promise<void>((resolve) => {
       const unsub = session.subscribe((ev) => {
         if (ev.type === "message_update") {
@@ -389,13 +485,29 @@ const runSubagent = async (
           resolve();
         }
       });
-      void session.prompt(prompt).catch(() => {
+      void session.prompt(req.prompt).catch((err) => {
+        fail.prompt = err instanceof Error ? err.message : String(err);
         unsub();
         resolve();
       });
     });
-    return result.trim();
+    if (signal?.aborted) throw new Error("子任务已取消");
+    const text = result.trim();
+    // pi 把 API 失败写在 assistant 消息里、prompt() 不抛；只认最后一条 assistant
+    const failure =
+      fail.prompt ??
+      settleErrorFromTranscript(
+        session.state.messages,
+        session.state.errorMessage?.trim() ?? null,
+      );
+    if (failure) {
+      throw new Error(
+        text ? `${failure}\n（子任务中途失败，已产出的部分内容：）\n${text}` : failure,
+      );
+    }
+    return text;
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     try {
       session.dispose();
     } catch {
@@ -406,15 +518,13 @@ const runSubagent = async (
 
 /**
  * Flowship 自有工具 + 规范编码工具 → pi ToolDefinition[]。
- * 编码工具（shell/glob/delete/task）由 buildCodingToolDefs 提供、task 的 runSubagent 闭包绑好 runtime/model/cwd。
+ * 编码工具（shell/glob/delete/task）由 buildCodingToolDefs 提供、task 的 runSubagent 闭包绑好父会话模型上下文 / cwd。
  */
 const buildCustomTools = (
   callerToken: string | undefined,
   cwd: string,
-  subagentRuntime: Awaited<ReturnType<typeof ModelRuntime.create>>,
-  subagentModel: Model<never>,
+  parent: SubagentParent,
   mcpToolDefs: ToolDefinition[],
-  thinkingLevel: ReturnType<typeof thinkingLevelFromParams>,
   taskId?: string,
 ): ToolDefinition[] => {
   // V2 落盘配置：全工具共用（编码工具 + MCP 桥接）；无 taskId → V1 后缀
@@ -438,14 +548,9 @@ const buildCustomTools = (
           }) as unknown as ToolDefinition,
       )
     : []),
-    ...buildCodingToolDefs(cwd, (prompt) =>
-      runSubagent(prompt, {
-        runtime: subagentRuntime,
-        model: subagentModel,
-        cwd,
-        thinkingLevel,
-        taskId,
-      }),
+    ...buildCodingToolDefs(
+      cwd,
+      (req, signal) => runPiSubagent(req, signal, { parent, cwd, taskId }),
       spill,
     ),
     // D1：MCP 桥接工具回包无上限，全包输出预算；flowShipTools（submit_work/ask_user）输出小、不碰
@@ -763,10 +868,8 @@ export const createCustomAgent = async (
     : buildCustomTools(
         callerToken,
         cwd,
-        runtime,
-        model,
+        { input, runtime, model, thinkingLevel },
         mcp.toolDefs,
-        thinkingLevel,
         input.taskId,
       );
   const { session } = await createAgentSession({
@@ -824,10 +927,8 @@ export const resumeCustomAgent = async (
     : buildCustomTools(
         callerToken,
         cwd,
-        runtime,
-        model,
+        { input, runtime, model, thinkingLevel },
         mcp.toolDefs,
-        thinkingLevel,
         input.taskId,
       );
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接。

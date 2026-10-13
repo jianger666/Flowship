@@ -65,7 +65,11 @@ import {
   captureReadonlyRepoBaselines,
 } from "./action-checks";
 import { evaluateWkAdvanceGate } from "./wk-gate";
-import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
+import {
+  buildRunNotFinishedError,
+  isRetryableRunError,
+  summarizeRunFailure,
+} from "./sdk-error";
 import { createRunPerfTracker } from "./run-perf";
 import { notePrep } from "./run-prep-notes";
 import {
@@ -115,6 +119,7 @@ import {
   SDK_SEND_TIMEOUT_MS,
   withSdkDeadline,
 } from "./sdk-deadline";
+import { CANCEL_WAIT_GRACE_MS, createCancelEscape } from "./run-wait";
 import { loadSkillsForTask, type SkillEntry } from "./skills-loader";
 import {
   resolveTaskMcpServers,
@@ -2348,10 +2353,20 @@ export const buildSessionBridges = (
       if (!callerStillValid()) {
         return { ok: false, error: CALLER_MISMATCH_ERROR };
       }
-      if (!gitHost || !gitToken) {
+      // Host / Token 分开报：合在一句还写着「ship 准入应该已被拦」，会把排查带去错的方向
+      //（2026-10-08 真实事故：设置页 Token 一直在，是会话恢复时没把它带进桥的快照）。
+      if (!gitHost) {
         return {
           ok: false,
-          error: "task 启动时没拿到 GitLab Host / Token、ship 准入应该已被拦、不应该走到这里",
+          error:
+            "没能从任务仓库的 origin remote 推出 GitLab Host（仓库没配 origin、或 origin 不是 GitLab 地址）、无法提 MR",
+        };
+      }
+      if (!gitToken) {
+        return {
+          ok: false,
+          error:
+            "当前会话里没有 GitLab Token（设置页可能已经填了、是会话启动 / 恢复时没带进来）、无法提 MR。请到设置页确认 Token 已填写，再点「推进」重开会话（别勾「续用当前 Agent」）",
         };
       }
       // 起 createMR 前、server 端按 task 权威数据 + 该仓真实 git remote 校验 agent 上报。
@@ -3614,6 +3629,44 @@ const readServerCreds = async (task: Task): Promise<SessionCreds> => {
   }
 };
 
+/**
+ * 只读 config.json 里的 gitToken（会话恢复的兜底）。
+ * 读不到 / JSON 坏 / 字段缺失 / 全空白 → undefined，从不抛：调用方当「没有」处理，
+ * 真要提 MR 时由 submit_mr 桥给出明确报错。
+ * 不复用 readServerCreds：那个要解析提供方设置、还会因缺 apiKey 提前返空，这里只要一个字段。
+ */
+export const readServerGitToken = async (): Promise<string | undefined> => {
+  try {
+    const raw = await fs.readFile(
+      path.join(dataRoot(), "config.json"),
+      "utf-8",
+    );
+    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    const token = typeof cfg.gitToken === "string" ? cfg.gitToken.trim() : "";
+    return token || undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * 会话恢复时要装进 submit_mr 桥的 GitLab Token：入口随 bootArgs 带来的优先（trim 后非空），
+ * 缺了回落服务端 config.json。
+ *
+ * 为什么必须在 resumeTaskSession 里兜底：桥闭包持有的是**会话期不可变的快照**，
+ * 恢复时漏了，这个会话里之后每次 submit_mr 都失败、也不会自愈（要等会话被重建）。
+ * 入口并不都带 Token——飞书群里属主发消息 / 飞书答 ask 的 bootArgs 根本没有 gitToken，
+ * 任务页输入条也只是「前端带了才有」。会话空闲 12 分钟就会被回收，所以这条路径是高频的。
+ */
+export const resolveSessionGitToken = async (
+  creds: Pick<SessionCreds, "gitToken">,
+  readFallback: () => Promise<string | undefined> = readServerGitToken,
+): Promise<string | undefined> => {
+  const given = creds.gitToken?.trim();
+  if (given) return given;
+  return (await readFallback())?.trim() || undefined;
+};
+
 // 可中断 sleep（1s 分片）：重连退避期间用户点「停止」要立即生效、返回 true = 被取消
 const sleepWithCancel = async (
   ms: number,
@@ -4234,6 +4287,13 @@ const consumeSessionRun = async (
   // 24h 硬超时：跟用户点停止分开——停止走 stop-task 的中性「已失效」，超时要打 askExpired
   let hardTimedOut = false;
   let hardTimer: NodeJS.Timeout | null = null;
+  // run.cancel() 发出后 wait() 迟迟不返回的逃生口（每个发 cancel 的地方都要 arm）：
+  // 以前流结束后 wait 无任何上限，SDK 在 wait 上挂死会让任务永远「运行中」、停止键也救不回来
+  const cancelEscape = createCancelEscape(CANCEL_WAIT_GRACE_MS, () => {
+    console.warn(
+      `[task-runner] task=${task.id} run.cancel 后 wait() 超过 ${CANCEL_WAIT_GRACE_MS / 1000}s 未返回、按已取消收尾`,
+    );
+  });
   // 复用链内预登记的 instanceId（one-shot / internalStart 出链前已 set）；
   // 无预登记则稍后 alloc。比 agentId 精确——resume 同持久化 agent 时 agentId 相同。
   const preRegistered = runningTasks.get(task.id);
@@ -4387,6 +4447,7 @@ const consumeSessionRun = async (
         void run.cancel().catch(() => {
           /* noop */
         });
+        cancelEscape.arm();
       },
     });
 
@@ -4407,6 +4468,7 @@ const consumeSessionRun = async (
       void run.cancel().catch(() => {
         /* noop */
       });
+      cancelEscape.arm();
     }, TASK_HARD_TIMEOUT_MS);
 
     // 流式消费
@@ -4454,10 +4516,9 @@ const consumeSessionRun = async (
       await assistantCtx.flush();
     }
 
-    if (hardTimer) {
-      clearTimeout(hardTimer);
-      hardTimer = null;
-    }
+    // 注意：硬超时计时器**不在这里清**——它要一直罩到 run.wait() 返回（见下方 finally），
+    // 否则 stream 结束后 wait 若挂死就没有任何上限。wait 返回 / 抛错后必须清，
+    // 否则 24h 后它会对一个早已结束的 run 误写「等待超过 24 小时」作废标记。
 
     // 自动压缩续接：run.wait 期间登记水位触发器（记账点回调见 task-fs.recordTurnUsage）。
     // questionRun 不登记（短问答、边界轮换已够）；注销按 identity、不误摘后继。
@@ -4487,11 +4548,17 @@ const consumeSessionRun = async (
       void run.cancel().catch(() => {
         /* noop */
       });
+      cancelEscape.arm();
     };
     if (!opts.questionRun) {
       registerMidRunRotationTrigger(task.id, fireMidRunRotation);
     }
-    const result = await run.wait().finally(() => {
+    const result = await cancelEscape.wait(run).finally(() => {
+      if (hardTimer) {
+        clearTimeout(hardTimer);
+        hardTimer = null;
+      }
+      cancelEscape.dispose();
       if (!opts.questionRun) {
         unregisterMidRunRotationTrigger(task.id, fireMidRunRotation);
       }
@@ -4631,8 +4698,10 @@ const consumeSessionRun = async (
         typeof result.result === "string" && result.result.trim()
           ? `: ${result.result.slice(0, 200)}`
           : "";
-      throw new Error(
+      // SDK 的终态错误（result.error）作 cause 保留——不再只剩一段被截断的 dump 文本
+      throw buildRunNotFinishedError(
         `agent run status=${result.status}${inlineResult}${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
+        result,
       );
     }
 
@@ -5033,6 +5102,7 @@ const consumeSessionRun = async (
     }
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
+    cancelEscape.dispose();
     if (opts.questionRun) {
       // 失主不发「答疑失败」error / done envelope；写前再复查
       if (lostStartOwner()) return;
@@ -5233,6 +5303,9 @@ export const resumeTaskSession = async (
     // resume 也发新 caller（新内存 agent 实例 = 新 MCP 身份）
     const callerToken = String(allocTaskRunInstanceId());
     const { mergedMcp } = await buildMergedMcpForTask(task);
+    // submit_mr 桥的 Token 快照：入口没带就回落服务端 config.json（见 resolveSessionGitToken）。
+    // 放在 Agent.resume 之前：这一步是纯读盘，下面的 mayResume / CAS / install 复查照常兜住它的 await。
+    const gitToken = await resolveSessionGitToken(creds);
     if (!(await mayResume())) return null;
 
     await writeOwnedEventAndPublish(
@@ -5288,7 +5361,7 @@ export const resumeTaskSession = async (
 
     // 只构造 bridge——注册延到 installSessionIfCurrent
     const bridges = buildSessionBridges(task, {
-      gitToken: creds.gitToken,
+      gitToken,
       callerToken,
     });
     // resume 出的新内存实例拿新 instanceId（持久化 agentId 可能与旧 A 相同）

@@ -31,6 +31,7 @@ import {
 import { ChatMcpPicker } from "@/components/tasks/chat-mcp-picker";
 import { ChatQueueBanner } from "@/components/tasks/chat-queue-banner";
 import { useSmoothStreaming } from "./use-smooth-streaming";
+import { useSmoothThinking } from "./use-smooth-thinking";
 import { EventStream } from "@/components/tasks/event-stream";
 import { StreamActionsProvider } from "@/components/tasks/event-stream/stream-actions";
 import {
@@ -50,8 +51,17 @@ import {
   subscribeChatOp,
 } from "@/lib/chat-op-ledger";
 import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
-import { classifyPendingBubble } from "@/lib/chat-pending-display";
-import { appendThinkingText, type LiveThinking } from "@/lib/thinking-live";
+import {
+  classifyPendingBubble,
+  decideChatStop,
+  settleStopIntent,
+} from "@/lib/chat-pending-display";
+import {
+  advanceLiveThinking,
+  applyThinkingSnapshot,
+  type LiveThinking,
+  type ThinkingSnapshot,
+} from "@/lib/thinking-live";
 import { buildInputHistory } from "@/lib/composer-history";
 import {
   allocClientChatQueueItemId,
@@ -134,7 +144,9 @@ export const ChatView = ({
   // 为什么需要：一段思考要攒到结束才落一条 thinking 事件，期间事件流纹丝不动——
   // 实测一段 65s 的思考（模型第 6s 就开始了）让界面干写了 70s「等待模型响应…」。
   // null = 没在思考。ref 与 state 同步更新：ref 让 clear 能先判空挡掉（见下）。
-  // 服务端已 250ms 节流，这里不必再合帧。
+  // 服务端已 250ms 节流，这里不必再合帧——但 250ms 一批直接上屏就是「一顿一顿」，
+  // 所以交给下面的 useSmoothThinking 摊成逐帧匀速吐出（thinkingLive 是「到达了多少」，
+  // smoothThinking 是「显示了多少」；事件流只看后者）。
   const [thinkingLive, setThinkingLive] = useState<LiveThinking | null>(null);
   const thinkingRef = useRef<LiveThinking | null>(null);
   const clearThinkingLive = useCallback(() => {
@@ -144,18 +156,25 @@ export const ChatView = ({
     setThinkingLive(null);
   }, []);
   const pushThinkingDelta = useCallback((text: string, id: string) => {
-    const prev = thinkingRef.current;
-    // 同一段（id 相同）才累积；id 变了 = 新的一段——上一段没来得及清掉的文本不能接在前面
-    const sameSegment = prev !== null && prev.id === id;
-    const next: LiveThinking = {
-      id,
-      text: appendThinkingText(sameSegment ? prev.text : "", text),
-      // 起点 = 收到本段首帧的时刻，同一段内不变（合成事件的 ts、行上 hover 显示的时间）
-      since: sameSegment ? prev.since : Date.now(),
-    };
+    // 累积规则（同段拼接 / 换段重置 / 累计字数 / 起点时刻）在 advanceLiveThinking，
+    // 这里只管 state 与 ref。起点 = 收到本段首帧的时刻（合成事件的 ts、状态行「思考中 · 12s」的起点）
+    const next = advanceLiveThinking(thinkingRef.current, id, text, Date.now());
     thinkingRef.current = next;
     setThinkingLive(next);
   }, []);
+  // 每次（重）连接 bootstrap 末尾的「进行中思考」快照（2026-10-13）：
+  //   - 对象 = 此刻正在思考、带服务端已发出的文本——切到别的对话再切回（本组件重挂）、
+  //     SSE 断流重连后，据此重建 / 对齐实时态、**接着往下长**，而不是只剩重连后新到的字、从头重新吐；
+  //   - null = 没在思考，清掉本地可能残留的（断线期间这段思考已经结束了）。
+  // 合并规则（同段不回退 / 换段重建 / 已有的字不重演）在 applyThinkingSnapshot；
+  // 没变化就不 setState（同一引用）——重连时快照与本地一致是常态
+  const applySnapshot = useCallback((snap: ThinkingSnapshot | null) => {
+    const next = applyThinkingSnapshot(thinkingRef.current, snap, Date.now());
+    if (next === thinkingRef.current) return;
+    thinkingRef.current = next;
+    setThinkingLive(next);
+  }, []);
+  const smoothThinking = useSmoothThinking(thinkingLive);
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -163,6 +182,9 @@ export const ChatView = ({
   const submitTokenRef = useRef<string | null>(null);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
+  // 受理前点过停止（提交还在飞、服务端还没接住这条消息）：先登记在这里、提交一落地再兑现。
+  // 直接停会撞热路径「发送前快照」窗口里没占位的竞态——停止后 AI 又被重新拉起来（见 decideChatStop）。
+  const stopAfterSubmitRef = useRef(false);
   // run 进行中锁：runStatus 交卷后会从 running → awaiting_ack、但 run 还在流式吐消息；
   // 用 latch 把「输入框 loading」保持到 run 真正结束（done 事件）再放开。
   const [runActive, setRunActive] = useState(false);
@@ -250,6 +272,8 @@ export const ChatView = ({
     submitTokenRef.current = null;
     setIsSubmitting(false);
     setStopping(false);
+    // 上个任务登记的「提交落地后再停」不能带到新任务（否则新任务的第一条消息一落地就被停掉）
+    stopAfterSubmitRef.current = false;
     setLiveToolOutputs({});
     setRunActive(false);
     // 排队快照只对「本次挂载内登记的占位」有意义；切走后丢掉，免得越攒越多
@@ -285,7 +309,7 @@ export const ChatView = ({
   );
 
   useTaskWatch(task.id, {
-    onEvent: (ev) => {
+    onEvent: (ev, meta) => {
       // ephemeral shell delta：不进持久 events，按 callId 累积到运行中工具块
       const delta = parseToolOutputDelta(ev);
       if (delta) {
@@ -302,8 +326,12 @@ export const ChatView = ({
 
       // 任何落盘事件到达 = 这段思考已经有正式内容（thinking 事件本身 / 紧随的工具 / 正文）
       // 或新一轮开始（user_reply）——实时「思考中」到此为止。服务端保证实时帧不会晚于
-      // 它之后的落盘事件到达（段结束先丢尾巴再落盘），所以这里清了不会被幽灵帧复活
-      clearThinkingLive();
+      // 它之后的落盘事件到达（段结束先丢尾巴再落盘），所以这里清了不会被幽灵帧复活。
+      // 例外：bootstrap 回放的历史事件（meta.replay）不算「刚发生」——每次（重）连接都会把尾部
+      // 历史重新读一遍，若也当作「这段思考结束了」，就会把同页重连时本地正在长的思考清零、
+      // 之后从第一个字重新吐（2026-10-13 用户反馈）。思考是否真的结束了，由紧随其后的
+      // thinking_snapshot 对齐（null = 已结束、清；对象 = 仍在、接着长）
+      if (!meta?.replay) clearThinkingLive();
 
       // tool_result 到达 → 清掉该 callId 的直播缓冲（最终 output 在 meta）
       if (ev.kind === "tool_result") {
@@ -395,6 +423,7 @@ export const ChatView = ({
       pushDelta(text);
     },
     onThinkingDelta: pushThinkingDelta,
+    onThinkingSnapshot: applySnapshot,
     // msg 已是 runner 拼好的可读文案（「Chat agent 异常：…」），别再套一层
     // 「watch 出错」——那会误导成 SSE 断了，实际是 agent 挂了
     onErrorMessage: (msg) => toast.error(msg),
@@ -416,8 +445,9 @@ export const ChatView = ({
     },
   }, true);
 
-  // 用户回复：允许 running 时入队（P5）；返回 false = 失败（调用方保留草稿）
-  const handleUserReply = useCallback(
+  // 用户回复：允许 running 时入队（P5）；返回 false = 失败（调用方保留草稿）。
+  // 这是「提交」本体；对外的 handleUserReply 在它外面多包了一层「兑现受理前点过的停止」（见 handleStop 附近）
+  const submitUserReply = useCallback(
     async (
       text: string,
       images?: ImagePayload[],
@@ -617,9 +647,52 @@ export const ChatView = ({
     }
   }, [task.id, clearStreaming, clearThinkingLive]);
 
+  // 停止键。提交还在飞、服务端还没受理这条消息时不能直接停（见 decideChatStop）：
+  // 只登记意图并让停止键立刻转圈（「停止中」），等提交落地（下面的 handleUserReply）再兑现。
+  // 读 ref 不读 state：回调保持稳定，且 ref 与提交锁 / run latch 同步更新、不会读到上一帧的值。
   const handleStop = useCallback(async () => {
+    const mode = decideChatStop({
+      submitting: submitTokenRef.current !== null,
+      runActive: runActiveRef.current,
+    });
+    if (mode === "after_submit") {
+      stopAfterSubmitRef.current = true;
+      setStopping(true);
+      return;
+    }
     await stopAgentCore();
   }, [stopAgentCore]);
+
+  // 对外的「发送」：提交本体 + 提交落地后兑现受理前点过的停止。
+  // 没发出去（被拒 / 状态不明）不 stop——没有 run 可停，只收掉停止键的「停止中」，
+  // 草稿由调用方保留、用户可重发；任务已删同理（stop 只会 404 弹一条多余的错）。
+  const handleUserReply = useCallback(
+    async (
+      text: string,
+      images?: ImagePayload[],
+      attachments?: string[],
+      skillRefs?: Array<{ name: string; absPath: string }>,
+    ): Promise<boolean> => {
+      const accepted = await submitUserReply(
+        text,
+        images,
+        attachments,
+        skillRefs,
+      );
+      const settlement = settleStopIntent({
+        pending: stopAfterSubmitRef.current,
+        accepted,
+        alive: canCommitTaskSnapshot(task.id),
+      });
+      if (settlement !== "none") {
+        stopAfterSubmitRef.current = false;
+        if (settlement === "stop") await stopAgentCore();
+        else setStopping(false);
+      }
+      return accepted;
+    },
+    [submitUserReply, stopAgentCore, task.id],
+  );
 
   // 重命名对话
   const handleRename = useCallback(async () => {
@@ -810,7 +883,7 @@ export const ChatView = ({
           variant="chat"
           streamingText={streamingText}
           liveToolOutputs={liveToolOutputs}
-          liveThinking={thinkingLive}
+          liveThinking={smoothThinking}
           onUserReply={handleUserReply}
           canReply={canReply}
           submitting={isSubmitting}

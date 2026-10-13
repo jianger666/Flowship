@@ -38,6 +38,12 @@ import {
   createWriteToolDefinition,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import {
+  parseSubagentRequest,
+  SUBAGENT_TOOL_DESCRIPTION,
+  SubagentUsageError,
+  type SubagentRequest,
+} from "@/lib/subagent-spec";
 import { withModelBudget, type ModelBudgetSpill } from "./tool-output-budget";
 import { buildMergeTestMrTool } from "./bypass-merge-mr";
 
@@ -867,44 +873,53 @@ const globTool = (cwd: string): ToolDefinition =>
 
 // ----------------- task（子 agent 分派、进程内嵌套会话） -----------------
 
-const taskTool = (runSubagent: (prompt: string) => Promise<string>): ToolDefinition =>
+/**
+ * 子 agent 执行回调：入参已解析好（prompt / 类型 / 原始 model / effort），
+ * signal 是父工具调用的取消信号（父会话被停时中止子会话）。
+ * 用法错误（model / effort 无效）抛 SubagentUsageError，其它异常算子会话失败。
+ */
+export type SubagentRunner = (
+  request: SubagentRequest,
+  signal: AbortSignal | undefined,
+) => Promise<string>;
+
+/** 描述文案与 Cursor 的 `subagent` 共用（subagent-spec），两边行为一致 */
+export const TASK_TOOL_DESCRIPTION = SUBAGENT_TOOL_DESCRIPTION;
+
+const taskTool = (runSubagent: SubagentRunner): ToolDefinition =>
   asTool({
     name: "task",
     label: "分派子任务",
-    description:
-      "把一段独立子任务交给一个全新的子 agent 完成、返回其最终结果。用于把大任务拆小、隔离上下文。",
+    description: TASK_TOOL_DESCRIPTION,
     parameters: TBObject({
       prompt: TBString(),
       description: TBOptional(TBString()),
       subagentType: TBOptional(TBString()),
       model: TBOptional(TBString()),
+      effort: TBOptional(TBString()),
     }),
-    execute: async (_toolCallId: string, params: unknown) => {
-      const p = params as { prompt?: unknown };
-      const prompt = typeof p.prompt === "string" ? p.prompt.trim() : "";
-      if (!prompt) {
-        return {
-          content: [{ type: "text", text: "task 的 prompt 不能为空" }],
-          details: undefined,
-        };
-      }
+    execute: async (
+      _toolCallId: string,
+      params: unknown,
+      signal?: AbortSignal,
+    ) => {
+      const parsed = parseSubagentRequest(params);
+      // 抛错 = pi 标成工具错误（isError）、message 原样回给模型；
+      // 之前这里把错误当普通文本返回、界面上显示「成功」
+      if (!parsed.ok) throw new SubagentUsageError(parsed.error);
+      let out: string;
       try {
-        const out = await runSubagent(prompt);
-        return {
-          content: [{ type: "text", text: out || "(子任务无输出)" }],
-          details: undefined,
-        };
+        out = await runSubagent(parsed.request, signal);
       } catch (err) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `子任务失败：${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          details: undefined,
-        };
+        if (err instanceof SubagentUsageError) throw err;
+        throw new Error(
+          `子任务失败：${err instanceof Error ? err.message : String(err)}`,
+        );
       }
+      return {
+        content: [{ type: "text", text: out || "(子任务无输出)" }],
+        details: undefined,
+      };
     },
   });
 
@@ -989,7 +1004,7 @@ export const buildReadOnlyToolDefs = (
  */
 export const buildCodingToolDefs = (
   cwd: string,
-  runSubagent: (prompt: string) => Promise<string>,
+  runSubagent: SubagentRunner,
   spill?: ModelBudgetSpill,
 ): ToolDefinition[] => [
   withModelBudget(shellTool(cwd), spill),

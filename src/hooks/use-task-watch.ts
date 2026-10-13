@@ -48,6 +48,7 @@ import { useEffect, useRef } from "react";
 import {
   ApiRequestError,
   watchTaskStream,
+  type TaskEventMeta,
   type TaskStreamCallbacks,
 } from "@/lib/task-store";
 import {
@@ -57,6 +58,7 @@ import {
   resolveWatchReconnectPolicy,
   WATCH_CLEAN_RECONNECT_DELAY_MS,
 } from "@/lib/task-terminal";
+import type { ThinkingSnapshot } from "@/lib/thinking-live";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
 
 export {
@@ -69,7 +71,11 @@ export {
 } from "@/lib/task-terminal";
 
 export interface UseTaskWatchCallbacks {
-  onEvent?: (ev: TaskEvent) => void;
+  /**
+   * 落盘事件。meta.replay === true = 每次（重）连接 bootstrap 回放的历史尾部事件，不是刚发生的——
+   * 不能据此认为「这段思考 / 流式回复结束了」。实时事件不传 meta
+   */
+  onEvent?: (ev: TaskEvent, meta?: TaskEventMeta) => void;
   onTaskUpdate?: (task: Task) => void;
   onActionUpdate?: (action: ActionRecord) => void;
   onAssistantDelta?: (text: string) => void;
@@ -78,6 +84,11 @@ export interface UseTaskWatchCallbacks {
    * eventId = 这段思考落盘后那条 thinking 事件的 id（同一段内不变、id 变了 = 新的一段）
    */
   onThinkingDelta?: (text: string, eventId: string) => void;
+  /**
+   * 进行中思考的快照：每次（重）连接 bootstrap 末尾恰好一帧。对象 = 此刻正在思考（带已发出的文本，
+   * 前端接着长、不从头吐）；null = 没在思考（清掉本地残留的实时态）
+   */
+  onThinkingSnapshot?: (snapshot: ThinkingSnapshot | null) => void;
   onDone?: (task: Task, ok: boolean) => void;
   // SSE envelope 里的 error 帧（服务端主动发的协议错误）
   onErrorMessage?: (message: string) => void;
@@ -169,9 +180,11 @@ export const useTaskWatch = (
         // 收到 task_deleted / 410 / hydrated-404 后不再重连
         let gotTaskDeleted = false;
         const sseCallbacks: TaskStreamCallbacks = {
-          onEvent: (ev) => {
+          onEvent: (ev, meta) => {
             if (cancelled) return;
-            callbacksRef.current.onEvent?.(ev);
+            // meta 原样透传（回放才有）；没有时仍按单参数调，保持实时事件的调用形状不变
+            if (meta) callbacksRef.current.onEvent?.(ev, meta);
+            else callbacksRef.current.onEvent?.(ev);
           },
           onTaskUpdate: (t) => {
             if (cancelled) return;
@@ -188,6 +201,10 @@ export const useTaskWatch = (
           onThinkingDelta: (text, eventId) => {
             if (cancelled) return;
             callbacksRef.current.onThinkingDelta?.(text, eventId);
+          },
+          onThinkingSnapshot: (snapshot) => {
+            if (cancelled) return;
+            callbacksRef.current.onThinkingSnapshot?.(snapshot);
           },
           onDone: (t, ok) => {
             if (cancelled) return;

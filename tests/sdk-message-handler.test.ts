@@ -550,6 +550,32 @@ describe("handleSdkMessage task 工具 args 短字段前置 + 截断", () => {
     expect(parsed?.prompt?.length ?? 0).toBeGreaterThan(500);
   });
 
+  it("name=task、prompt 超长、effort 在尾部 → effort 不会被截掉（徽标 = 实际思考档）", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "task",
+        call_id: "call_task_effort",
+        status: "running",
+        args: {
+          description: "跑子代理",
+          prompt: "P".repeat(3000),
+          subagentType: "general",
+          model: "gpt-5",
+          effort: "high",
+        },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+
+    const args = toolCallEvents()[0]?.meta?.args;
+    const parsed = parseTaskToolArgs(args as string);
+    expect(parsed?.model).toBe("gpt-5");
+    expect(parsed?.effort).toBe("high");
+  });
+
   it("非 task 工具 args 截断仍是 500 上限", async () => {
     const longVal = "x".repeat(600);
     await handleSdkMessage(
@@ -602,6 +628,138 @@ describe("handleSdkMessage task 工具 args 短字段前置 + 截断", () => {
     expect(parsed!.length).toBe(40);
     expect(parsed![0]?.content).toContain("Task 1:");
     expect(parsed![39]?.content).toContain("Task 40:");
+  });
+});
+
+describe("handleSdkMessage：Cursor 的 subagent 自定义工具（MCP 外壳）改写成 task", () => {
+  // 形状来自 2026-10-13 真实 Cursor SDK 运行（composer-2.5 父 → claude-sonnet-5-5 子）
+  const subagentArgs = {
+    providerIdentifier: "custom-user-tools",
+    toolName: "subagent",
+    args: {
+      prompt: "In one short sentence, say which AI model you are.",
+      model: "claude-sonnet-5-5",
+      effort: "low",
+      description: "Report exact model name",
+    },
+  };
+
+  it("running：事件名是 task、args 是扁平真入参 → 卡片能解析出 model / effort", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_1",
+        status: "running",
+        args: subagentArgs,
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const ev = toolCallEvents()[0];
+    expect(ev?.meta?.name).toBe("task");
+    // 不再带 MCP 外壳字段（innerToolName 是给 MCP 工具识别用的）
+    expect(ev?.meta?.innerToolName).toBeUndefined();
+    const parsed = parseTaskToolArgs(ev?.meta?.args as string);
+    expect(parsed?.model).toBe("claude-sonnet-5-5");
+    expect(parsed?.effort).toBe("low");
+    expect(parsed?.description).toBe("Report exact model name");
+    expect(ev?.meta?.args).not.toContain("custom-user-tools");
+  });
+
+  it("running：prompt 很长也不会把尾部的 model / effort 截掉（走 task 的短字段前置）", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_long",
+        status: "running",
+        args: {
+          ...subagentArgs,
+          args: { prompt: "P".repeat(3000), description: "d", subagentType: "general", model: "claude-sonnet-5-5", effort: "high" },
+        },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const parsed = parseTaskToolArgs(toolCallEvents()[0]?.meta?.args as string);
+    expect(parsed?.model).toBe("claude-sonnet-5-5");
+    expect(parsed?.effort).toBe("high");
+  });
+
+  it("completed：结果拆掉 MCP 信封、以 task 名落 tool_result（卡片里是纯文本）", async () => {
+    const { buildToolResultMeta } = await import("@/lib/server/tool-result-persist");
+    const build = vi.mocked(buildToolResultMeta);
+    build.mockClear();
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_done",
+        status: "completed",
+        args: subagentArgs,
+        result: {
+          status: "success",
+          value: { content: [{ text: { text: "我是 Claude Sonnet 5.5。" } }], isError: false },
+        },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    expect(build).toHaveBeenCalledTimes(1);
+    const input = build.mock.calls[0][0] as unknown as Record<string, unknown>;
+    expect(input.rawName).toBe("task");
+    expect(input.result).toBe("我是 Claude Sonnet 5.5。");
+    expect(input.msgStatus).toBe("completed");
+    expect((input.args as Record<string, unknown>).model).toBe("claude-sonnet-5-5");
+    expect(toolResultEvents()).toHaveLength(1);
+  });
+
+  it("completed 且工具回了 isError：落成 error（卡片标红，用法错误 / 子任务失败不会显示成功）", async () => {
+    const { buildToolResultMeta } = await import("@/lib/server/tool-result-persist");
+    const build = vi.mocked(buildToolResultMeta);
+    build.mockClear();
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_err",
+        status: "completed",
+        args: subagentArgs,
+        result: {
+          status: "success",
+          value: { content: [{ text: { text: "子代理模型无效：当前 provider 没有「x」" } }], isError: true },
+        },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const input = build.mock.calls[0][0] as unknown as Record<string, unknown>;
+    expect(input.msgStatus).toBe("error");
+    expect(input.result).toContain("子代理模型无效");
+  });
+
+  it("别的 MCP 工具（如 ask_user）一律不动：事件名仍是 mcp、外壳字段还在", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_other_mcp",
+        status: "running",
+        args: { providerIdentifier: "custom-user-tools", toolName: "share_to_group", args: { content: "hi" } },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const ev = toolCallEvents()[0];
+    expect(ev?.meta?.name).toBe("mcp");
+    expect(ev?.meta?.innerToolName).toBe("share_to_group");
+    expect(ev?.meta?.args).toContain("custom-user-tools");
   });
 });
 
@@ -694,14 +852,14 @@ describe("handleSdkMessage 自定义 pi 压缩", () => {
 });
 
 /**
- * 回合结束后的重放保护（chat 开 dropAfterTurnEnded）。
+ * usage（= SDK 的 turn-ended）只计数，不改变任何消息的处理。
  *
- * 对应线上现象：回复完整出现后，对话迟迟不结束，过一会儿 AI 又把同一句话回复一遍。
- * 机理（main.log + 探针实测）：SDK 的 turn-ended（= 一条 usage）先于 checkpoint 持久化到达；
- * 迟迟收不到 FINISHED 时 SDK 无进展检测取消 attempt、从 checkpoint 重放，同一条流上再来一轮
- * thinking / assistant / usage。这里钉死：首条 usage 就落盘回复，其后的重放不再上屏。
+ * 背景：v1.9.29 曾在首条 usage 就落盘回复，并把其后同一条流上的 thinking / 回复当「重放」丢掉。
+ * 2026-10-12 整套撤掉——被丢的文字既不上屏也不落盘，事后无法核对有没有误杀；而多出来的回合
+ * 基本是 SDK 的连接重试（重新生成，不是原文重复）。现在只保留计数（turn-wrapup.jsonl 取证用）。
+ * 这里钉死「usage 之后的一切照常处理、一个字不丢」，防止谁再把丢弃加回来。
  */
-describe("handleSdkMessage 回合结束后的重放保护（usage = turn-ended）", () => {
+describe("handleSdkMessage usage（= turn-ended）只计数，其后的消息照常处理", () => {
   beforeEach(() => {
     writeOwnedEventAndPublish.mockClear();
     appendEvent.mockClear();
@@ -727,7 +885,7 @@ describe("handleSdkMessage 回合结束后的重放保护（usage = turn-ended�
     }) as never;
 
   /** 模拟 consumeChatRun 的 ctx：flush 把 buffer 写成一条 assistant_message 并清空 */
-  const mkCtx = (over: Partial<AssistantBufferCtx> = {}): AssistantBufferCtx => {
+  const mkCtx = (): AssistantBufferCtx => {
     const ctx: AssistantBufferCtx = {
       buffer: "",
       flush: vi.fn(async () => {
@@ -740,8 +898,6 @@ describe("handleSdkMessage 回合结束后的重放保护（usage = turn-ended�
           });
         }
       }),
-      dropAfterTurnEnded: true,
-      ...over,
     };
     return ctx;
   };
@@ -751,122 +907,68 @@ describe("handleSdkMessage 回合结束后的重放保护（usage = turn-ended�
       .map((c) => c[2])
       .filter((e): e is WrittenEvent => e != null && e.kind === kind);
 
-  it("首条 usage 到达即落盘回复（不等 run 结束）并通知 onTurnEnded；usage 本身不产生事件", async () => {
-    const onTurnEnded = vi.fn();
-    const ctx = mkCtx({ onTurnEnded });
-    await handleSdkMessage("task-1", thinkingMsg("想一想"), ctx, leaseOk);
+  it("usage 本身不产生事件、不提前落盘：只记条数与首条到达时刻", async () => {
+    const ctx = mkCtx();
     await handleSdkMessage("task-1", assistantMsg("你好，"), ctx, leaseOk);
     await handleSdkMessage("task-1", assistantMsg("世界"), ctx, leaseOk);
-    // 还没 turn-ended：正文只在 buffer 里，没落盘
-    expect(eventsOf("assistant_message")).toHaveLength(0);
-
     const before = Date.now();
     await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
 
-    expect(eventsOf("assistant_message").map((e) => e.text)).toEqual(["你好，世界"]);
-    expect(eventsOf("thinking").map((e) => e.text)).toEqual(["想一想"]);
-    expect(ctx.buffer).toBe("");
-    expect(onTurnEnded).toHaveBeenCalledTimes(1);
+    expect(writeOwnedEventAndPublish).not.toHaveBeenCalled();
+    expect(ctx.flush).not.toHaveBeenCalled();
+    // 回复还在缓冲里，等下一个事件 / run 结束才落盘（与 usage 出现之前一样）
+    expect(ctx.buffer).toBe("你好，世界");
     expect(ctx.turnEndedCount).toBe(1);
     expect(ctx.turnEndedAt).toBeGreaterThanOrEqual(before);
-    // usage 只是计量信号：除了冲出已有内容，不额外写任何事件
-    expect(writeOwnedEventAndPublish).toHaveBeenCalledTimes(2);
   });
 
-  it("本回合只有 thinking、没有正文：usage 也会把 thinking 冲出去", async () => {
+  it("usage 之后又来的 thinking / 正文 / 工具调用照常处理：全部落盘，一个字不丢", async () => {
     const ctx = mkCtx();
-    await handleSdkMessage("task-1", thinkingMsg("只想不说"), ctx, leaseOk);
-    expect(eventsOf("thinking")).toHaveLength(0);
-    await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
-    expect(eventsOf("thinking").map((e) => e.text)).toEqual(["只想不说"]);
-    expect(eventsOf("assistant_message")).toHaveLength(0);
-  });
-
-  it("turn-ended 之后重放的 thinking / assistant 被丢弃：不累 buffer、不落盘，只计数；onTurnEnded 只触发一次", async () => {
-    const onTurnEnded = vi.fn();
-    const ctx = mkCtx({ onTurnEnded });
     await handleSdkMessage("task-1", assistantMsg("第一遍回复"), ctx, leaseOk);
     await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
-    expect(eventsOf("assistant_message")).toHaveLength(1);
-    writeOwnedEventAndPublish.mockClear();
 
-    // SDK stall 重放：thinking + 一整段重复正文 + 第二条 usage
+    // SDK 在同一条流上又跑了一轮：thinking + 正文 + 工具调用 + 正文 + 第二条 usage，最后流结束再冲一次
     await handleSdkMessage("task-1", thinkingMsg("重新想"), ctx, leaseOk);
-    await handleSdkMessage("task-1", assistantMsg("第一遍回复"), ctx, leaseOk);
+    await handleSdkMessage("task-1", assistantMsg("第二遍回复"), ctx, leaseOk);
+    await handleSdkMessage("task-1", shellRunning("call-replay"), ctx, leaseOk);
+    await handleSdkMessage("task-1", assistantMsg("重放里的收尾"), ctx, leaseOk);
     await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
-    // consumeChatRun 在流结束时还会再冲一次 thinking / flush——这里也不应该吐出重复内容
     await ctx.flush();
 
-    expect(ctx.buffer).toBe("");
-    expect(ctx.thinkingBuffer ?? "").toBe("");
-    expect(writeOwnedEventAndPublish).not.toHaveBeenCalled();
-    expect(ctx.replayDropped).toEqual({
-      thinking: 1,
-      assistant: 1,
-      assistantChars: "第一遍回复".length,
-      toolCalls: 0,
-    });
-    expect(ctx.turnEndedCount).toBe(2);
-    expect(onTurnEnded).toHaveBeenCalledTimes(1);
-  });
-
-  it("重放里的工具调用不丢（用户得看到真有动作在发生），只计数", async () => {
-    const ctx = mkCtx();
-    await handleSdkMessage("task-1", assistantMsg("回复"), ctx, leaseOk);
-    await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
-    writeOwnedEventAndPublish.mockClear();
-
-    await handleSdkMessage("task-1", shellRunning("call-replay"), ctx, leaseOk);
-    expect(toolCallEvents()).toHaveLength(1);
-    expect(ctx.replayDropped?.toolCalls).toBe(1);
-    // 工具之后的正文是重放里的新增内容吗？无法判断 → 仍按规则丢（回合已经结束）
-    await handleSdkMessage("task-1", assistantMsg("重放正文"), ctx, leaseOk);
-    expect(ctx.buffer).toBe("");
-    expect(ctx.replayDropped?.assistant).toBe(1);
-  });
-
-  it("回合结束前的 tool_call / thinking / assistant 完全不受影响（usage 之前没有任何丢弃）", async () => {
-    const ctx = mkCtx();
-    await handleSdkMessage("task-1", thinkingMsg("先想"), ctx, leaseOk);
-    await handleSdkMessage("task-1", shellRunning("call-1"), ctx, leaseOk);
-    await handleSdkMessage("task-1", assistantMsg("中间说明"), ctx, leaseOk);
-    await handleSdkMessage("task-1", shellRunning("call-2"), ctx, leaseOk);
-    await handleSdkMessage("task-1", assistantMsg("最终回复"), ctx, leaseOk);
-    await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
-
-    expect(eventsOf("thinking")).toHaveLength(1);
-    expect(toolCallEvents()).toHaveLength(2);
     expect(eventsOf("assistant_message").map((e) => e.text)).toEqual([
-      "中间说明",
-      "最终回复",
+      "第一遍回复",
+      "第二遍回复",
+      "重放里的收尾",
     ]);
-    expect(ctx.replayDropped).toBeUndefined();
+    expect(eventsOf("thinking").map((e) => e.text)).toEqual(["重新想"]);
+    expect(toolCallEvents()).toHaveLength(1);
+    // 计数照常：turn-wrapup.jsonl 靠它记「SDK 又跑了一轮」
+    expect(ctx.turnEndedCount).toBe(2);
   });
 
-  it("没开 dropAfterTurnEnded（task 模式）：usage 只计数，不提前落盘，其后正文照常累积", async () => {
-    const flush = vi.fn(async () => {});
-    const onTurnEnded = vi.fn();
-    const ctx: AssistantBufferCtx = { buffer: "", flush, onTurnEnded };
-    await handleSdkMessage("task-1", assistantMsg("交卷前"), ctx, leaseOk);
-    await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
-    expect(flush).not.toHaveBeenCalled();
-    expect(onTurnEnded).not.toHaveBeenCalled();
-
-    await handleSdkMessage("task-1", assistantMsg("交卷后续跑"), ctx, leaseOk);
-    await handleSdkMessage("task-1", thinkingMsg("续跑思考"), ctx, leaseOk);
-    expect(ctx.buffer).toBe("交卷前交卷后续跑");
-    expect(ctx.thinkingBuffer).toBe("续跑思考");
-    expect(ctx.turnEndedCount).toBe(1);
-    expect(ctx.replayDropped).toBeUndefined();
+  it("多条 usage：turnEndedCount 累加，turnEndedAt 只记首条", async () => {
+    const ctx = mkCtx();
+    const now = vi.spyOn(Date, "now");
+    try {
+      now.mockReturnValue(1_000);
+      await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
+      now.mockReturnValue(2_000);
+      await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
+      now.mockReturnValue(3_000);
+      await handleSdkMessage("task-1", usageMsg(), ctx, leaseOk);
+    } finally {
+      now.mockRestore();
+    }
+    expect(ctx.turnEndedCount).toBe(3);
+    expect(ctx.turnEndedAt).toBe(1_000);
   });
 
-  it("lease 已失效（run 已被替换）：usage 不落盘、不计数、不通知", async () => {
-    const onTurnEnded = vi.fn();
-    const ctx = mkCtx({ onTurnEnded });
+  it("lease 已失效（run 已被替换）：usage 不计数、不写事件", async () => {
+    const ctx = mkCtx();
     ctx.buffer = "旧 run 的残留";
     await handleSdkMessage("task-1", usageMsg(), ctx, () => false);
     expect(ctx.turnEndedCount).toBeUndefined();
-    expect(onTurnEnded).not.toHaveBeenCalled();
+    expect(ctx.turnEndedAt).toBeUndefined();
     expect(writeOwnedEventAndPublish).not.toHaveBeenCalled();
   });
 });

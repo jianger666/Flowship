@@ -16,8 +16,20 @@
  *   tests/thinking-delta-stream-integration.test.ts  真实发布通路（65s / 1111 条 chunk）
  *   tests/append-event-preset-id.test.ts        真实 appendEvent 尊重预设 id
  *   tests/thinking-delta-dispatch.test.ts       客户端 SSE 分发（缺 id 的帧丢弃）
- *   tests/chat-turns-live-thinking.test.ts      合成事件并入流程、与落盘后同构
- *   tests/thinking-live.test.ts                 前端纯函数 + 状态行推导
+ *   tests/chat-turns-live-thinking.test.ts      合成事件并入流程、与落盘后同构；事件行折叠态
+ *   tests/thinking-live.test.ts                 前端纯函数（累积 / 累计坐标 / 吐字切片）+ 状态行推导
+ *   tests/smooth-reveal.test.ts                 匀速吐字算法（含 250ms 批量到达的模拟）
+ *   tests/thinking-smooth-ui-contract.test.ts   平滑 hook / 实时文本区组件的接线契约
+ *
+ * 2026-10-13 起多一条「快照」支链（重连 / 重挂不从头吐）：
+ *   sdk-message-handler（已发出的原文窗口 → getLiveThinkingSnapshot）→ watch-task 路由（订阅后同步读快照、
+ *   bootstrap 末尾 thinking_snapshot 帧、tail 事件 replay 标记）→ task-store 解析 → use-task-watch 透传
+ *   → chat-view（applyThinkingSnapshot 合并、回放事件不清实时态）→ use-smooth-thinking（从下限起步 / 回前台跳到最新）。
+ * 同样是漏一环就静默失效（切回对话照旧从第一个字重新长），行为测试：
+ *   tests/thinking-live-snapshot.test.ts        服务端快照存储（只含已发出的 / 截尾 / 段结束 / 失主 / 旁路不碰主链）
+ *   tests/watch-task-thinking-snapshot.test.ts  真实路由：帧序 / replay / 订阅与快照不重不漏（挂起 bootstrap 的 race）/ 端到端
+ *   tests/thinking-snapshot-dispatch.test.ts    客户端分发（无效帧丢弃 / replay 只认严格 true）
+ *   tests/thinking-snapshot.test.ts             前端纯函数（合并规则 / 下限 / 回前台跳到最新）+ 重挂 / 重连 / 回前台模拟
  */
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -39,6 +51,10 @@ const workGroup = read("components", "tasks", "event-stream", "work-group.tsx");
 const rows = read("components", "tasks", "event-stream", "rows.tsx");
 const eventUtils = read("components", "tasks", "event-stream", "utils.tsx");
 const handler = read("lib", "server", "sdk-message-handler.ts");
+
+/** 去掉注释后的源码：断言「某两处之间没有 await」时不被解释它为什么不能有的注释干扰 */
+const stripComments = (source: string): string =>
+  source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 
 /** 从 `marker` 处起按配对符号截出完整片段（只检查某个回调 / useMemo 的内部，而不是整份文件） */
 const sliceBalanced = (
@@ -92,9 +108,13 @@ describe("thinking_delta 链路：每一环都在（漏一环 = 静默失效）"
     );
   });
 
-  it("chat-view：订阅帧、把状态传给 EventStream", () => {
+  it("chat-view：订阅帧；事件流吃的是「平滑后」的值（直接传 thinkingLive = 回到 250ms 一批的整块跳变）", () => {
     expect(chatView).toContain("onThinkingDelta: pushThinkingDelta");
-    expect(chatView).toContain("liveThinking={thinkingLive}");
+    expect(chatView).toContain(
+      "const smoothThinking = useSmoothThinking(thinkingLive);",
+    );
+    expect(chatView).toContain("liveThinking={smoothThinking}");
+    expect(chatView).not.toContain("liveThinking={thinkingLive}");
   });
 });
 
@@ -106,21 +126,27 @@ describe("服务端发送口径：只给属主主链、思考段结束必须丢�
     );
   });
 
-  it("入口：任何非 thinking 消息到来都丢掉没发的尾巴（否则实时帧可能晚于落盘事件到达、复活「思考中」）", () => {
+  it("入口：属主主链上任何非 thinking 消息到来都丢掉没发的尾巴（否则实时帧可能晚于落盘事件到达、复活「思考中」）；旁路答疑（origin）的消息不算——节流状态 / 快照按 taskId 共享、属于主链，旁路一说话就清会误伤主链正在进行的思考", () => {
     expect(handler).toContain(
+      'if (msg.type !== "thinking" && !origin) discardPendingThinkingDeltas(taskId);',
+    );
+    // 旧写法（旁路也清）不能回来
+    expect(handler).not.toContain(
       'if (msg.type !== "thinking") discardPendingThinkingDeltas(taskId);',
     );
   });
 
-  it("flushThinkingBuffer：开头就丢尾巴，且在 `!text` 早退之前（run 结束路径也要清定时器）", () => {
+  it("flushThinkingBuffer：开头就丢尾巴，且在 `!text` 早退之前（run 结束路径也要清定时器）；旁路（origin）收尾不丢——它从不发实时帧，清了只会误伤主链", () => {
     const bodyStart = handler.indexOf("export const flushThinkingBuffer = async (");
     expect(bodyStart, "找不到 flushThinkingBuffer").toBeGreaterThanOrEqual(0);
     // 函数很短，截一段足够覆盖到早退那一行
     const body = handler.slice(bodyStart, bodyStart + 1800);
-    const discardAt = body.indexOf("discardPendingThinkingDeltas(taskId)");
+    const discardAt = body.indexOf("if (!origin) discardPendingThinkingDeltas(taskId);");
     const earlyReturnAt = body.indexOf("if (!text) return;");
     expect(discardAt).toBeGreaterThanOrEqual(0);
     expect(earlyReturnAt).toBeGreaterThan(discardAt);
+    // 不带 origin 门的无条件 discard 不能回来
+    expect(body).not.toMatch(/(^|\n)\s*discardPendingThinkingDeltas\(taskId\);/);
   });
 
   it("flushThinkingBuffer：预定的 id 在早退 / lease 检查之前取走并清零（空段、失主都不能把 id 漏给下一段），落盘时复用", () => {
@@ -153,15 +179,22 @@ describe("服务端发送口径：只给属主主链、思考段结束必须丢�
 
 describe("chat-view 清理时机：落盘事件 / 正文 / 结束都要清「思考中」", () => {
   it("onEvent：在 ephemeral 早退之后清（落盘事件 = 这段思考有了正式内容或新一轮开始）", () => {
-    const onEvent = sliceBalanced(chatView, "onEvent: (ev) => {", "{");
+    const onEvent = sliceBalanced(chatView, "onEvent: (ev, meta) => {", "{");
     const ephemeralAt = onEvent.indexOf("if (isEphemeralToolOutputDelta(ev)) return;");
     const clearAt = onEvent.indexOf("clearThinkingLive();");
     expect(ephemeralAt).toBeGreaterThanOrEqual(0);
     expect(clearAt).toBeGreaterThan(ephemeralAt);
   });
 
+  it("onEvent：只有「刚发生」的落盘事件才清实时态——bootstrap 回放的历史尾部（meta.replay）不清（每次重连都会把尾部历史重读一遍，当成「这段思考结束了」就把同页重连时本地正在长的思考清零、从第一个字重新吐）", () => {
+    const onEvent = sliceBalanced(chatView, "onEvent: (ev, meta) => {", "{");
+    expect(onEvent).toContain("if (!meta?.replay) clearThinkingLive();");
+    // 回调里只此一处清思考：再多一处无条件的 = 回放事件也清了
+    expect(onEvent.match(/clearThinkingLive\(\);/g)).toHaveLength(1);
+  });
+
   it("onEvent：清实时态与追加落盘事件在同一个同步回调里、且清在前（同批渲染 → 合成行直接换成同 id 的落盘行，没有空档）", () => {
-    const onEvent = sliceBalanced(chatView, "onEvent: (ev) => {", "{");
+    const onEvent = sliceBalanced(chatView, "onEvent: (ev, meta) => {", "{");
     const clearAt = onEvent.indexOf("clearThinkingLive();");
     const appendAt = onEvent.indexOf("onEventAppendRef.current(ev);");
     expect(clearAt).toBeGreaterThanOrEqual(0);
@@ -201,18 +234,18 @@ describe("chat-view 清理时机：落盘事件 / 正文 / 结束都要清「思
   });
 });
 
-describe("chat-view 状态：段 id + 累积原文 + 起点时刻", () => {
-  it("state 是 LiveThinking（id + text + since）；同一段（id 相同）才累积，id 变了 = 新的一段、不接在上一段后面", () => {
+describe("chat-view 状态：段 id + 累积原文 + 累计字数 + 起点时刻", () => {
+  it("state 是 LiveThinking；累积走 advanceLiveThinking（同段拼接 / 换段重置 / 累计字数 / 起点——规则在纯函数里逐条单测）", () => {
     expect(chatView).toContain("useState<LiveThinking | null>(null)");
     expect(chatView).toContain(
       "const pushThinkingDelta = useCallback((text: string, id: string) => {",
     );
-    expect(chatView).toContain("const sameSegment = prev !== null && prev.id === id;");
     expect(chatView).toContain(
-      'appendThinkingText(sameSegment ? prev.text : "", text)',
+      "advanceLiveThinking(thinkingRef.current, id, text, Date.now())",
     );
-    // 起点只在本段首帧取一次，同一段内不变（合成事件的 ts）
-    expect(chatView).toContain("since: sameSegment ? prev.since : Date.now()");
+    // 旧的就地累积不能回来：它只拼 text、不记累计字数 total，吐字平滑用的坐标就乱了
+    expect(chatView).not.toContain("appendThinkingText(");
+    expect(chatView).not.toContain("sameSegment");
   });
 });
 
@@ -240,12 +273,18 @@ describe("展示：思考是流程里一条真正的 thinking 行，由已有的
     expect(loadingAt).toBeGreaterThan(liveReturnAt);
   });
 
-  it("工作过程组折叠时：组头也说「思考中 · 最近一行」（别让用户把收起的组当成卡住），优先于「最近在跑的工具名」", () => {
+  it("工作过程组折叠时：组头不摘思考原文（原文在展开区、状态行已说「思考中」），但仍显式占住进行中思考的分支、优先于「最近在跑的工具名」", () => {
     const body = sliceBalanced(workGroup, "if (!expanded) {", "{");
     expect(body).toContain("isLiveThinkingEvent(tailMember)");
-    expect(body).toContain("thinkingTextToLine(tailMember.text)");
-    // 文案模板本身：「思考中 · 最近一行」（光有 THINKING_LIVE_LABEL 出现在别处挡不住改成只显示最近一行）
-    expect(body).toContain("`${THINKING_LIVE_LABEL} · ${line}`");
+    const liveBranch = body.slice(
+      body.indexOf("isLiveThinkingEvent(tailMember)"),
+      body.indexOf("group.hasRunning"),
+    );
+    // 显式置空：别落到下面「最近 running 工具名」上去说一个早已结束的工具
+    expect(liveBranch).toContain("runningTail = null;");
+    // 不再摘原文：旧实现在这里用 thinkingTextToLine 取最近一行、拼成「思考中 · …」
+    expect(workGroup).not.toContain("thinkingTextToLine");
+    expect(workGroup).not.toContain("THINKING_LIVE_LABEL");
     expect(body.indexOf("isLiveThinkingEvent(tailMember)")).toBeLessThan(
       body.indexOf("group.hasRunning"),
     );
@@ -265,17 +304,55 @@ describe("展示：思考是流程里一条真正的 thinking 行，由已有的
     );
   });
 
-  it("已有的思考行：进行中折叠摘要取最新一行（summarize 取开头，长思考整段不动、像卡死）", () => {
-    expect(rows).toMatch(
-      /const summary = isLiveThinkingMeta\(ev\)\s*\?\s*thinkingTextToLine\(ev\.text\)/,
+  it("已有的思考行：进行中展开成实时文本区（LiveThinkingTail），落盘后才是全文——不再是折叠行里逐字左滑的摘要", () => {
+    const procStart = rows.indexOf("const ProcessEventRow = ({");
+    const procEnd = rows.indexOf("// V0.13.x「重连中」过程行");
+    expect(procStart, "找不到 ProcessEventRow").toBeGreaterThanOrEqual(0);
+    expect(procEnd).toBeGreaterThan(procStart);
+    const proc = rows.slice(procStart, procEnd);
+    const liveAt = proc.indexOf(") : isLive ? (");
+    const tailAt = proc.indexOf("<LiveThinkingTail text={ev.text} />");
+    const fullAt = proc.indexOf("<SearchHighlightText");
+    expect(liveAt).toBeGreaterThanOrEqual(0);
+    expect(tailAt).toBeGreaterThan(liveAt);
+    // 全文渲染在实时区分支之后：进行中的行不走全文（全文随吐字变高，会把后面的行一路顶下去）
+    expect(fullAt).toBeGreaterThan(tailAt);
+    expect(rows).toContain(
+      'import { LiveThinkingTail } from "./live-thinking-tail";',
     );
   });
 
-  it("已有的思考行：进行中原文被截掉前面时，展开区顶部提示", () => {
-    expect(rows).toContain("isLive && ev.meta?.liveTruncated === true");
+  it("已有的思考行：进行中的思考没有折叠摘要（旧实现取「最新一行」，每个新字让整行左滑一格）；也没有「仅显示最近」提示（实时区本来就只展示尾部）", () => {
+    expect(rows).toMatch(/const summary = isLiveRow\s*\?\s*""\s*:/);
+    expect(rows).not.toContain("thinkingTextToLine");
+    expect(rows).not.toContain("liveTruncated");
+    expect(rows).not.toContain("THINKING_TEXT_MAX");
   });
 
-  it("默认折叠：思考不在 DEFAULT_EXPANDED_KINDS 里——进行中的思考和落盘后的思考行一样默认收起、点开才看全文", () => {
+  it("折叠态走纯函数（手动优先 / 首次渲染锁定默认值）：进行中自动展开、落盘回默认折叠、用户手动选择不被刷掉", () => {
+    expect(rows).toContain(
+      "const [initialCollapsed] = useState(defaultCollapsed);",
+    );
+    expect(rows).toContain(
+      "const [manualCollapsed, setManualCollapsed] = useState<boolean | null>(null);",
+    );
+    expect(rows).toContain(
+      "const autoCollapsed = autoEventCollapsed(isLiveRow, initialCollapsed);",
+    );
+    expect(rows).toContain("const collapsed = manualCollapsed ?? autoCollapsed;");
+    expect(rows).toContain(
+      "setManualCollapsed((m) => toggleEventCollapsed(m, autoCollapsed))",
+    );
+    // 搜索命中要强制展开：写进手动态（之后用户再点才收起）
+    expect(rows).toContain("if (hasSearchHit) setManualCollapsed(false);");
+    // 旧写法：collapsed 是个被首次渲染锁死的 state，进行中的思考永远是折叠的
+    expect(rows).not.toContain(
+      "const [collapsed, setCollapsed] = useState(defaultCollapsed);",
+    );
+    expect(rows).not.toContain("setCollapsed(");
+  });
+
+  it("默认折叠：思考不在 DEFAULT_EXPANDED_KINDS 里——落盘后的思考行默认收起、点开才看全文（进行中的由 autoEventCollapsed 自动展开）", () => {
     const m = eventUtils.match(
       /DEFAULT_EXPANDED_KINDS: ReadonlySet<EventKind> = new Set\(\[([\s\S]*?)\]\)/,
     );
@@ -283,18 +360,50 @@ describe("展示：思考是流程里一条真正的 thinking 行，由已有的
     expect(m![1]).not.toContain('"thinking"');
   });
 
-  it("状态行：deriveActiveStatus 吃从原文派生的最近一行，且它在 memo 依赖里（漏了就一直是旧文案）", () => {
-    expect(eventStream).toContain("thinkingTextToLine(liveThinking.text)");
+  it("状态行：deriveActiveStatus 只吃计时起点、不吃原文（原文在组内思考行里，上下各摆一遍就是重复），起点在 memo 依赖里", () => {
+    // 取原始值（number）而不是整个 liveThinking 对象：起点整段思考内不变，状态行不跟着每帧重算
+    expect(eventStream).toContain(
+      "const thinkingSince = liveThinking ? liveThinking.since : null;",
+    );
     const activeStatus = sliceBalanced(
       eventStream,
       "const activeStatus = useMemo",
       "(",
     );
-    expect(activeStatus).toContain("thinking: thinkingLine");
-    expect(activeStatus).toMatch(/streamingText,\s*thinkingLine,\s*\]/);
+    expect(activeStatus).toMatch(
+      /streaming: isStreamingText,[\s\S]*?\bthinkingSince,\s*\}\);/,
+    );
+    // 漏了依赖：换了一段新的思考，状态行的计时不重置
+    expect(activeStatus).toMatch(
+      /isStreamingText,\s*thinkingSince,\s*tailHasProgressRow,\s*\]/,
+    );
+    // 旧实现：从原文派生「最近一行」传进状态行
+    expect(eventStream).not.toContain("thinkingTextToLine");
+    expect(activeStatus).not.toContain("thinkingLine");
+    // 不挂整个对象（逐帧变）、不挂 streamingText 本身（逐帧变）：状态行不该逐帧换新对象
+    expect(activeStatus).not.toMatch(/\bliveThinking\b/);
+    expect(activeStatus).not.toMatch(/\bstreamingText\b/);
     // 既有契约不能破：状态行仍吃本轮切片、不挂全量 task.events
     expect(activeStatus).toContain("statusEvents");
     expect(activeStatus).not.toContain("task.events");
+  });
+
+  it("「正在启动…」让位：流尾已有进度行时状态行不并存；判定只取 items 尾项的布尔（items 逐帧变，状态行不跟着重算）", () => {
+    const tail = sliceBalanced(
+      eventStream,
+      "const tailHasProgressRow = useMemo",
+      "(",
+    );
+    expect(tail).toContain("isLoadingItem(last) || isBootStageItem(last)");
+    expect(tail).toMatch(/\[items\]/);
+    const activeStatus = sliceBalanced(
+      eventStream,
+      "const activeStatus = useMemo",
+      "(",
+    );
+    expect(activeStatus).toContain(
+      "if (status?.yieldToTail && tailHasProgressRow) return null;",
+    );
   });
 
   it("启动阶段行：思考一开始就让位（冷续聊的「正在发送…」不能挂满整段思考）；依赖用布尔、不用整个对象", () => {
@@ -322,5 +431,109 @@ describe("展示：思考是流程里一条真正的 thinking 行，由已有的
     expect(eventStream).not.toContain("thinkingLine={");
     expect(workGroup).not.toContain("thinkingLine");
     expect(workGroup).toContain("const ProcessingPlaceholderRow = () => (");
+  });
+});
+
+describe("进行中思考的快照（2026-10-13「切窗口再切回来思考又从第一个字开始吐」）：每一环都在", () => {
+  it("服务端：快照只含「已发出」的——publish 成功才累积、且累积在 publish 之后（发帧那一刻才失主的字，订阅者没收到过）", () => {
+    const send = sliceBalanced(
+      handler,
+      "const sendThinkingDelta = (taskId: string, st: ThinkingThrottle): void => {",
+      "{",
+    );
+    const publishAt = send.indexOf("const published = publishIfCurrent(");
+    const guardAt = send.indexOf("if (!published) return;");
+    const sinceAt = send.indexOf("if (st.sentTotal === 0) st.since = st.lastSentAt;");
+    const textAt = send.indexOf("st.sent = appendThinkingText(st.sent, text);");
+    const totalAt = send.indexOf("st.sentTotal += text.length;");
+    expect(publishAt).toBeGreaterThanOrEqual(0);
+    expect(guardAt).toBeGreaterThan(publishAt);
+    // 首帧时刻要在累计数自增之前记（用 sentTotal === 0 判断「第一帧」）
+    expect(sinceAt).toBeGreaterThan(guardAt);
+    expect(textAt).toBeGreaterThan(sinceAt);
+    expect(totalAt).toBeGreaterThan(textAt);
+  });
+
+  it("服务端：getLiveThinkingSnapshot——没发过任何一帧 → null；读取时重估 lease，失主就清掉（别把已死的思考当进行中告诉新订阅者）", () => {
+    const start = handler.indexOf("export const getLiveThinkingSnapshot = (");
+    expect(start, "找不到 getLiveThinkingSnapshot").toBeGreaterThanOrEqual(0);
+    const body = handler.slice(start, start + 900);
+    expect(body).toContain("if (!st || st.sentTotal === 0) return null;");
+    const leaseAt = body.indexOf("if (!st.lease()) {");
+    const discardAt = body.indexOf("discardPendingThinkingDeltas(taskId);");
+    expect(leaseAt).toBeGreaterThanOrEqual(0);
+    expect(discardAt).toBeGreaterThan(leaseAt);
+    // 快照字段口径：eventId / 已发出原文窗口 / 累计数 / 首帧时刻
+    expect(body).toContain("eventId: st.eventId,");
+    expect(body).toContain("text: st.sent,");
+    expect(body).toContain("total: st.sentTotal,");
+    expect(body).toContain("since: st.since,");
+  });
+
+  it("路由：订阅与读快照同步配对——getLiveThinkingSnapshot 紧跟 subscribeTaskStream、在第一个 await 之前（隔了 await = 期间的帧既进快照又进 buffer，前端文本被重复一遍）", () => {
+    const subAt = watchRoute.indexOf("subscribeTaskStream(id,");
+    const snapAt = watchRoute.indexOf("const thinkingSnap = getLiveThinkingSnapshot(id);");
+    const awaitAt = watchRoute.indexOf("await getTaskWithTailEvents(");
+    expect(subAt).toBeGreaterThanOrEqual(0);
+    expect(snapAt).toBeGreaterThan(subAt);
+    expect(awaitAt).toBeGreaterThan(snapAt);
+    // 订阅与读快照之间不能有 await（去掉注释再判：注释里解释「为什么不能有」会含 await 字样）
+    expect(stripComments(watchRoute.slice(subAt, snapAt))).not.toContain("await");
+  });
+
+  it("路由：bootstrap 回放的 tail 事件带 replay:true；实时分发的 event 帧不带（前端据此区分「重读旧账」与「刚发生」）", () => {
+    expect(watchRoute).toContain('send({ type: "event", event: ev, replay: true });');
+    expect(watchRoute).toContain('send({ type: "event", event: ev.event });');
+  });
+
+  it("路由：快照帧无条件发（对象或 null）——在 restricted_run 之后、buffer 回放之前；tail 里已有这段思考的落盘事件则发 null（别复活幽灵「思考中」）", () => {
+    const restrictedAt = watchRoute.indexOf("active: hasRestrictedQuestionInFlight(id),");
+    const sendAt = watchRoute.indexOf('send({ type: "thinking_snapshot", live: liveSnap });');
+    const replayAt = watchRoute.indexOf("bootstrapping = false;");
+    expect(restrictedAt).toBeGreaterThanOrEqual(0);
+    expect(sendAt).toBeGreaterThan(restrictedAt);
+    expect(replayAt).toBeGreaterThan(sendAt);
+    expect(watchRoute).toContain("!tailEvents.some((e) => e.id === thinkingSnap.eventId)");
+    // 快照帧不能被条件包住：没在思考也要发 live:null，前端才知道清残留
+    expect(watchRoute.slice(watchRoute.lastIndexOf("const liveSnap"), sendAt)).not.toMatch(
+      /if \(thinkingSnap\)/,
+    );
+  });
+
+  it("客户端解析：task-store 认 thinking_snapshot、无效帧丢弃不回调；event 帧只有 replay 严格为 true 才带 meta", () => {
+    expect(taskStore).toContain('| "thinking_snapshot"');
+    expect(taskStore).toContain('env.type === "thinking_snapshot"');
+    expect(taskStore).toContain("if (snap !== undefined) callbacks.onThinkingSnapshot?.(snap);");
+    expect(taskStore).toContain("if (env.replay === true) {");
+    expect(taskStore).toContain("callbacks.onEvent?.(env.event, { replay: true });");
+    expect(taskStore).toContain(
+      "onThinkingSnapshot?: (snapshot: ThinkingSnapshot | null) => void;",
+    );
+    expect(taskStore).toContain("onEvent?: (ev: TaskEvent, meta?: TaskEventMeta) => void;");
+  });
+
+  it("hook 透传：onThinkingSnapshot 与 onEvent 的 meta 都接到 callbacksRef（漏了 = 回调静默收不到）", () => {
+    expect(useTaskWatch).toContain("callbacksRef.current.onThinkingSnapshot?.(snapshot)");
+    expect(useTaskWatch).toContain("callbacksRef.current.onEvent?.(ev, meta)");
+    expect(useTaskWatch).toContain(
+      "onThinkingSnapshot?: (snapshot: ThinkingSnapshot | null) => void;",
+    );
+    expect(useTaskWatch).toContain("onEvent?: (ev: TaskEvent, meta?: TaskEventMeta) => void;");
+  });
+
+  it("chat-view：订阅快照；合并走 applyThinkingSnapshot、没变化（同一引用）不 setState", () => {
+    expect(chatView).toContain("onThinkingSnapshot: applySnapshot");
+    const apply = sliceBalanced(
+      chatView,
+      "const applySnapshot = useCallback((snap: ThinkingSnapshot | null) => {",
+      "{",
+    );
+    expect(apply).toContain("applyThinkingSnapshot(thinkingRef.current, snap, Date.now())");
+    const sameAt = apply.indexOf("if (next === thinkingRef.current) return;");
+    const setAt = apply.indexOf("setThinkingLive(next);");
+    expect(sameAt).toBeGreaterThanOrEqual(0);
+    expect(setAt).toBeGreaterThan(sameAt);
+    // ref 与 state 同步更新（ref 让后面的 clear / push 读到最新）
+    expect(apply).toContain("thinkingRef.current = next;");
   });
 });

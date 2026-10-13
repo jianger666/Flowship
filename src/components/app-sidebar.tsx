@@ -455,7 +455,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                 ) : (
                   <ChevronDown className="size-3.5 shrink-0 text-muted-foreground/60" />
                 )}
-                <span className="min-w-0 truncate text-[13px] font-semibold tracking-wide text-foreground/80 hover:text-foreground">
+                <span className="min-w-0 truncate text-[13px] font-semibold tracking-wide text-foreground">
                   {group.label}
                 </span>
               </button>
@@ -486,7 +486,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                     type="button"
                     onClick={() => toggleGroupExpanded(group.key)}
                     aria-expanded={expanded}
-                    className="ml-6 flex w-fit items-center gap-1 px-1 py-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:text-foreground"
+                    className="ml-6 flex w-fit items-center gap-1 px-1 py-1 text-left text-[11px] text-muted-foreground transition-colors hover:text-foreground"
                   >
                     {expanded ? (
                       <ChevronUp className="size-3 shrink-0" />

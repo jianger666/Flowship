@@ -44,6 +44,12 @@ import {
   type StreamFollowController,
 } from "@/hooks/use-stream-follow";
 import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
+import {
+  rhythmPaddingBottom,
+  rhythmPaddingTop,
+  rhythmTier,
+  type RhythmFacts,
+} from "@/lib/event-stream-rhythm";
 import { findPendingAskEvent } from "@/lib/ask-pending";
 import { collectGroupQaRounds } from "@/lib/group-qa";
 import {
@@ -69,11 +75,12 @@ import {
   setActivePaneSearchScope,
 } from "@/lib/pane-search";
 import {
-  FOLLOW_PIN_THRESHOLD,
+  VIRTUOSO_NEVER_AT_BOTTOM,
   countNewItems,
   nextNewItemsBaseline,
 } from "@/lib/scroll-follow";
 import { getSubmitShortcutHint } from "@/lib/submit-shortcut";
+import { fetchEarlierBatch } from "@/lib/earlier-events";
 import { fetchEarlierEvents, type ImagePayload } from "@/lib/task-store";
 import {
   restoreOptimisticDraft,
@@ -87,7 +94,6 @@ import type { Task, TaskEvent } from "@/lib/types";
 import { insertBeforeTrailingCompaction, isCompactionInfo } from "@/lib/compaction-display";
 
 import {
-  TURN_WRAP_UP_STATUS,
   attachLiveThinking,
   deriveActiveStatus,
   groupChatRenderItems,
@@ -103,13 +109,13 @@ import {
 } from "@/lib/tool-display";
 import {
   hasInflightPending,
+  shouldShowComposerRunning,
   shouldShowSendLoading,
   type PendingBubbleMode,
 } from "@/lib/chat-pending-display";
-import { thinkingTextToLine, type LiveThinking } from "@/lib/thinking-live";
+import type { LiveThinking } from "@/lib/thinking-live";
 import {
   extractActiveBootStage,
-  hasActiveTurnWrapUp,
   resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
@@ -142,7 +148,7 @@ import { pathBasename } from "@/lib/path-utils";
   // streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
 // kind 用未出现在 EventKind 里的字面量、做 discriminated union 区分
 // 这样 streamingText 不再走 Footer / Component slot、而是直接进 data 数组、
-// followOutput 跟着它的追加触发滚动、不用单独 ref 控制
+// 跟随控制器的贴底跟着它的追加触发、不用单独 ref 控制
 interface StreamingItem {
   kind: "__streaming__";
   id: string;
@@ -269,7 +275,7 @@ const useStagedBootDisplay = (
 
 const BootStageRow = ({ text }: { text: string }) => (
   <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
-    <Loader2 className="size-3.5 animate-spin" />
+    <Loader2 className="size-3.5 animate-spin text-info" />
     <span>{text}</span>
   </div>
 );
@@ -301,11 +307,11 @@ const PendingRow = () => {
   const phase = elapsed < 3 ? "准备环境…" : "等待模型响应…";
   return (
     <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
-      <Loader2 className="size-3.5 animate-spin" />
+      <Loader2 className="size-3.5 animate-spin text-info" />
       <span>
         {phase}
         {elapsed > 0 && (
-          <span className="ml-1.5 opacity-70">已等待 {elapsed}s</span>
+          <span className="ml-1.5 tabular-nums">已等待 {elapsed}s</span>
         )}
       </span>
     </div>
@@ -439,22 +445,40 @@ interface Props {
 // 这是用户实测踩过的性能坑（输入卡顿 / [Violation] message handler took XXXms）
 // Virtuoso firstItemIndex 起始基数（prepend 分页时递减、官方要求保持正数——取个够大的）
 const FIRST_INDEX_BASE = 1_000_000;
-// 上拉一页拉多少条
-const EARLIER_PAGE_SIZE = 300;
 
 // Virtuoso context 形状（Header 靠它拿「正在拉更早」状态、组件本身保持模块级稳定引用）
 interface StreamListContext {
   loadingEarlier: boolean;
+  /** 上一次上拉失败：Virtuoso 不会再自动触发，顶部给手动重试 */
+  earlierFailed: boolean;
+  onRetryEarlier: () => void;
 }
 
-// 顶部「加载更早…」细行：仅分页请求飞行中显示
-const EarlierLoadingHeader = ({ context }: { context?: StreamListContext }) =>
-  context?.loadingEarlier ? (
-    <div className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground">
-      <Loader2 className="size-3.5 animate-spin" />
-      加载更早…
-    </div>
-  ) : null;
+// 顶部「加载更早…」细行：分页请求飞行中显示；失败后换成可点的重试
+const EarlierLoadingHeader = ({ context }: { context?: StreamListContext }) => {
+  if (context?.loadingEarlier) {
+    return (
+      <div className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground">
+        <Loader2 className="size-3.5 animate-spin" />
+        加载更早…
+      </div>
+    );
+  }
+  if (context?.earlierFailed) {
+    return (
+      <div className="flex items-center justify-center py-2 text-xs">
+        <button
+          type="button"
+          onClick={context.onRetryEarlier}
+          className="rounded-md px-2 py-1 text-muted-foreground underline-offset-2 hover:bg-muted hover:text-foreground hover:underline"
+        >
+          加载更早失败，点击重试
+        </button>
+      </div>
+    );
+  }
+  return null;
+};
 
 const VIRTUOSO_COMPONENTS = { Header: EarlierLoadingHeader };
 
@@ -643,7 +667,14 @@ const EventStreamImpl = ({
     isAwaitingUser ||
     awaitingAsk ||
     !!(isRunning && allowQueueWhileRunning);
-  const composerRunning = isRunning && !awaitingAsk;
+  // 输入框按运行态画（停止键）：run 在跑，或回车后提交还在飞（服务端还没受理、isRunning 尚为假）。
+  // 后者气泡已是正式消息、列表末尾是「准备环境…」，输入框不能还只是一个转圈的发送键、停不了
+  // （实测这段窗口热路径 1.3–2.7s、冷路径 4.5–6.7s）。判定与停止语义见 lib/chat-pending-display。
+  const composerRunning = shouldShowComposerRunning({
+    isRunning,
+    submitting: !!submitting,
+    awaitingAsk,
+  });
 
   // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、
   // 跟 task「跟 AI 说」条 / 推进弹窗 / 答题卡同一份实现（见 hooks/use-rich-input.ts）
@@ -659,10 +690,14 @@ const EventStreamImpl = ({
 
   // 个人偏好的提交快捷键（placeholder 提示用；提交判定在 Composer 内部）
   const submitShortcutHint = getSubmitShortcutHint(useSubmitShortcut());
-  // Virtuoso 句柄：流式增长时手动 scrollToIndex 贴底（见下方跟随 effect）
+  // Virtuoso 句柄：搜索命中 / 提问锚点这类「跳到某一项」用 scrollToIndex；
+  // 跟随最新的贴底不走它（见下方 scrollToBottom 与跟随控制器）
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
-  // 贴底动作：index:"LAST" 比 items.length-1 稳（分页 firstItemIndex 下不用管索引空间）；
-  // behavior 恒 "auto"——流式期间用 smooth 会跟下一次滚动互相打断（见 followOutput 注释）
+  // 贴底的**兜底**动作：只有控制器拿不到滚动容器时才会被调——挂载后控制器自己直接写 scrollTop。
+  // 不用 Virtuoso 的 scrollToIndex 做日常贴底：它有条内容一直增长就永不结束、又没法取消的重试链，
+  // 用户上滚后仍会被它每 ~100ms 拉回底部（2026-10-12 实测，见 scroll-follow 文件头第 4 条）。
+  // index:"LAST" 比 items.length-1 稳（分页 firstItemIndex 下不用管索引空间）；
+  // behavior 恒 "auto"——流式期间用 smooth 会跟下一次滚动互相打断
   const scrollToBottom = useCallback(() => {
     virtuosoRef.current?.scrollToIndex({
       index: "LAST",
@@ -686,15 +721,13 @@ const EventStreamImpl = ({
   //
   // 思考一开始（实时帧到了）启动阶段行就该让位：冷续聊的「正在发送…」在事件流里要等
   // agent 活动事件落盘才会清，而 thinking 事件要整段思考结束才落——不压的话会对着
-  // 「正在发送…」干等整段思考。用布尔做依赖：liveThinking 每 250ms 变一次，
+  // 「正在发送…」干等整段思考。用布尔做依赖：liveThinking 逐帧在变（吐字平滑后每帧最多一次），
   // 别让它拖着 extractActiveBootStage 反复重扫事件。
   const isThinkingLive = liveThinking != null;
-  // 状态行用的「最近一行」：从累积原文派生、不另存一份 state。
-  // null = 没在思考；"" = 在思考但还没有可展示的行（与 deriveActiveStatus 的约定一致）
-  const thinkingLine = useMemo(
-    () => (liveThinking ? thinkingTextToLine(liveThinking.text) : null),
-    [liveThinking],
-  );
+  // 状态行「思考中 · 12s」只要一个计时起点——不要原文：原文已经在工作过程组的思考行里滚动展示，
+  // 状态行再带一遍就是上下重复（2026-10-12 用户截图）。取原始值（number）而不是整个对象：
+  // 起点在整段思考内不变，状态行不跟着每帧重算。null = 没在思考
+  const thinkingSince = liveThinking ? liveThinking.since : null;
   const activeBoot = useMemo(
     () =>
       isChat && !isThinkingLive ? extractActiveBootStage(task.events) : null,
@@ -998,13 +1031,15 @@ const EventStreamImpl = ({
     return src.filter((e) => !isHiddenFromEventStream(e, { isChat }));
   }, [isChat, task.events]);
 
-  // 回复已完整落盘、SDK 还在收尾（server 在 turn-ended 后 3s 仍没收尾才发提示）。
-  // 单独成 memo、只跟事件走：粘性状态行那层的依赖里不许挂全量事件（liveToolOutputs
-  // 每个 delta 一个新引用，见 event-stream-scroll-contract），判定结果收成一个布尔再传进去
-  const turnWrapUp = useMemo(
-    () => isChat && hasActiveTurnWrapUp(task.events),
-    [isChat, task.events],
-  );
+  // 流尾是不是一行进度（「等待模型响应…」/ 启动阶段）。是 = 它已经在说「还在等」，
+  // 状态行的「正在启动…」就别再说一遍（同一件事上下各一句，和思考原文重复是一个毛病）。
+  // 只取布尔：items 逐 chunk / 逐帧在变，别让状态行跟着重算
+  const tailHasProgressRow = useMemo(() => {
+    const last = items[items.length - 1];
+    return !!last && (isLoadingItem(last) || isBootStageItem(last));
+  }, [items]);
+  // 正文是否已经在流：只取布尔——streamingText 逐帧变，状态行没必要逐帧重算、逐帧换新对象
+  const isStreamingText = !!streamingText;
 
   // 运行中粘性状态行（Batch C）：仅 chat + running；有 streamingText 时 label「正在回复…」正常
   const activeStatus = useMemo(() => {
@@ -1012,24 +1047,35 @@ const EventStreamImpl = ({
     // 刚按回车、user_reply 还没落盘：列表末尾已有「准备环境…」进度行；
     // 此时 statusEvents 还停在上一轮，回扫会闪出上一轮的「正在回复…」——不并存
     if (hasInflight) return null;
-    // 回复已写完、只剩 SDK 在收尾存档：别再闪「正在回复…」让人对着已写完的回复干等，
-    // 告诉他可以读了
-    if (turnWrapUp) return TURN_WRAP_UP_STATUS;
-    return deriveActiveStatus(statusEvents, liveToolOutputs, {
-      streaming: !!streamingText,
-      // 思考进行中：落盘的 thinking 事件要等整段结束才有，不靠它状态行会一直说「处理中…」
-      thinking: thinkingLine,
+    const status = deriveActiveStatus(statusEvents, liveToolOutputs, {
+      streaming: isStreamingText,
+      // 思考进行中：落盘的 thinking 事件要等整段结束才有，不靠它状态行会一直说「处理中…」。
+      // 只传计时起点、不传原文——原文在工作过程组的思考行里，不上下各摆一遍
+      thinkingSince,
     });
+    // 「正在启动…」让位：流尾已经有一行进度时，状态行不再并存（见 tailHasProgressRow）
+    if (status?.yieldToTail && tailHasProgressRow) return null;
+    return status;
   }, [
     isChat,
     isRunning,
     hasInflight,
-    turnWrapUp,
     statusEvents,
     liveToolOutputs,
-    streamingText,
-    thinkingLine,
+    isStreamingText,
+    thinkingSince,
+    tailHasProgressRow,
   ]);
+
+  // 状态行这一帧会不会真的画出来：与下方渲染条件（!hideReplyComposer && activeStatus）同口径。
+  // 画出来时它已经在说「正在分析 X 的结果 · 12s」，工作过程组尾的「处理中…」据此让位，
+  // 不再同一句废话上下各说一遍；task 形态没有状态行，组尾仍兜底
+  const statusLineVisible = !hideReplyComposer && !!activeStatus;
+
+  // 状态行槽位：运行期间（含刚按回车、还没 running 的那一小段）始终占住 h-7 的位置。
+  // 状态行有 / 无（让位给流尾进度行、两种状态切换的间隙）时，输入框和事件流可视区高度不变——
+  // 不预留的话，状态行每出没一次，输入框就整体上下跳 28px、事件流底部跟着伸缩。
+  const reserveStatusSlot = isChat && (isRunning || hasInflight || !!submitting);
 
   // 轮次分割判定用的 kind 序列。挂 orderedItems 不挂 items：虚拟项一律追加在尾部、
   // 且都不是 user_reply，越界读回 undefined、shouldShowTurnDivider 自然返回 false，
@@ -1237,6 +1283,8 @@ const EventStreamImpl = ({
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   // 拉取飞行中（顶部小 spinner、渲染用）
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  // 上一次拉取失败（顶部显示手动重试；下一次开拉时清掉）
+  const [earlierFailed, setEarlierFailed] = useState(false);
   // 同步重入闸（state 版有一帧延迟、startReached 同帧可双进 → firstItemIndex 多减）
   const loadingEarlierRef = useRef(false);
   // 是否已经拉过至少一页（防 SSE 重连把 eventsTruncated 重新置 true 时误重开分页）
@@ -1255,6 +1303,7 @@ const EventStreamImpl = ({
     setFirstItemIndex(FIRST_INDEX_BASE);
     setHasMoreEarlier(false);
     setLoadingEarlier(false);
+    setEarlierFailed(false);
     // 切 task 换载对应输入：正文草稿 + 图/路径快照一起回来（restore 内部先读后装，
     // 不会像老的两段式那样把空串写回存储抹掉目标草稿）
     restoreDraft();
@@ -1276,51 +1325,66 @@ const EventStreamImpl = ({
     if (!pagedOnceRef.current) setHasMoreEarlier(!!task.eventsTruncated);
   }, [task.eventsTruncated]);
 
-  // 上拉到顶：拉上一页、prepend + firstItemIndex 同步递减（同一次 React batch、滚动不跳）
+  // 上拉到顶：拉更早的事件、prepend + firstItemIndex 同步递减（同一次 React batch、滚动不跳）。
+  //
+  // ⚠️ 一次上拉必须「顶部多出至少一条可见条目、或历史读完」才算完（fetchEarlierBatch）：
+  // 分页按原始事件条数切、渲染按回合折叠，一整页事件可能全是最顶上那个工作过程组的成员——
+  // 这样 prepend 后条目数不变 → firstItemIndex 不变 → Virtuoso 的 startReached（按第一项序号
+  // distinctUntilChanged）不会再触发，用户停在 scrollTop=0 就再也翻不动了（2026-10-13 用户反馈）。
   const loadEarlier = async () => {
     if (loadingEarlierRef.current || !hasMoreEarlier || !onPrependEvents) return;
-    const anchor = latestEventsRef.current[0];
-    if (!anchor) return;
+    if (!latestEventsRef.current[0]) return;
     // 闭包捕获当次 task.id；await 后与当前 props 比对，不一致则丢弃（审查：快切串任务）
     const requestedTaskId = task.id;
     loadingEarlierRef.current = true;
     setLoadingEarlier(true);
+    setEarlierFailed(false);
     try {
-      const { events: older, hasMore } = await fetchEarlierEvents(
-        requestedTaskId,
-        anchor.id,
-        EARLIER_PAGE_SIZE,
-      );
-      if (taskIdRef.current !== requestedTaskId) return;
-      pagedOnceRef.current = true;
-      // 先按当前本地事件去重（飞行期间本地可能已合入部分重叠事件、
-      // 用原始 older 算差值会虚高 → firstItemIndex 多减 → 滚动错位）
-      const cur = latestEventsRef.current;
-      const known = new Set(cur.map((e) => e.id));
-      const fresh = older.filter((e) => !known.has(e.id));
-      if (fresh.length > 0) {
-        // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对 /
-        // chat 工作组跨页合并——必须与 items 同一套 buildStreamItems 算前后条数差值
-        const beforeItems = buildStreamItems(cur, isChat, isRunning);
-        const afterItems = buildStreamItems(
-          [...fresh, ...cur],
-          isChat,
-          isRunning,
-        );
-        const beforeLen = beforeItems.length;
-        const afterLen = afterItems.length;
-        // 非贴底时 prepend 会让 contentCount 变大，须同步抬高基线以免误报「N 条新内容」
-        if (!follow.isFollowing()) {
-          prependBaselineBumpRef.current +=
-            countStreamContentUnits(afterItems) -
-            countStreamContentUnits(beforeItems);
+      for (;;) {
+        const batch = await fetchEarlierBatch({
+          getCurrent: () => latestEventsRef.current,
+          fetchPage: (beforeId, limit) =>
+            fetchEarlierEvents(requestedTaskId, beforeId, limit),
+          // 与 items useMemo / 下面的 firstItemIndex 差值同一个函数
+          countItems: (evs) =>
+            buildStreamItems(evs as TaskEvent[], isChat, isRunning).length,
+          isCancelled: () => taskIdRef.current !== requestedTaskId,
+        });
+        if (!batch || taskIdRef.current !== requestedTaskId) return;
+        pagedOnceRef.current = true;
+        // 再按提交时刻的本地事件去重一次（飞行期间本地可能已合入部分重叠事件、
+        // 用原始 older 算差值会虚高 → firstItemIndex 多减 → 滚动错位）
+        const cur = latestEventsRef.current;
+        const known = new Set(cur.map((e) => e.id));
+        const fresh = batch.fresh.filter((e) => !known.has(e.id));
+        if (fresh.length > 0) {
+          // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对 /
+          // chat 工作组跨页合并——必须与 items 同一套 buildStreamItems 算前后条数差值
+          const beforeItems = buildStreamItems(cur, isChat, isRunning);
+          const afterItems = buildStreamItems(
+            [...fresh, ...cur],
+            isChat,
+            isRunning,
+          );
+          const beforeLen = beforeItems.length;
+          const afterLen = afterItems.length;
+          // 非贴底时 prepend 会让 contentCount 变大，须同步抬高基线以免误报「N 条新内容」
+          if (!follow.isFollowing()) {
+            prependBaselineBumpRef.current +=
+              countStreamContentUnits(afterItems) -
+              countStreamContentUnits(beforeItems);
+          }
+          onPrependEvents(fresh);
+          setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
         }
-        onPrependEvents(fresh);
-        setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
+        setHasMoreEarlier(batch.hasMore);
+        // 有进展 / 读完就收工；否则（一批全并进了已有条目、还有更早的）提交后接着拉
+        if (batch.progressed || !batch.hasMore) break;
       }
-      setHasMoreEarlier(hasMore);
     } catch (err) {
       if (taskIdRef.current !== requestedTaskId) return;
+      // 失败后 Virtuoso 不会再触发 startReached（第一项序号没变），顶部给手动重试入口
+      setEarlierFailed(true);
       toast.error(`加载更早事件失败：${(err as Error).message}`);
     } finally {
       if (taskIdRef.current === requestedTaskId) {
@@ -1355,13 +1419,16 @@ const EventStreamImpl = ({
   // 为什么需要它——react-virtuoso 的 followOutput 只在 data **条数**变化时触发滚动，
   // 对「最后一项内容增高」无感；而流式回复是往同一个 `__streaming__` 虚拟 item 的
   // text 里追加、条数不变，所以光靠 followOutput 流式期间不会跟随。
+  // （2026-10-12 起连 followOutput 也不传了：它会启动没法取消的 scrollToIndex 重试链，
+  // 用户上滚后还被拉回底部。条数变化的贴底也由这里接管。）
   //
   // 为什么把条数变化也一起收进来——除了流式追加，还有一堆「不改条数但改高度」的路径
   // 会让贴底态漂掉：工作过程组 run 结束自动收起、Streamdown 的 Shiki / Mermaid 异步
   // 渲染完成、图片 / 代码块布局回填。统一在这里 rAF 合批重新贴底、一帧最多滚一次，
-  // 比逐条打补丁稳。控制器内部还会先看「是不是已经贴着了」、贴着就不空跑。
+  // 比逐条打补丁稳（Virtuoso 报总高变化的那一路见 onTotalHeightChanged）。
+  // 控制器内部还会先看「是不是已经贴着了」、贴着就不空跑。
   //
-  // useEffect（非 layout）跑在 Virtuoso 测完新高度之后、scrollToIndex 才能命中真底部。
+  // useEffect（非 layout）跑在 Virtuoso 测完新高度之后、贴底才能命中真底部。
   useEffect(() => {
     if (!follow.isFollowing()) return;
     follow.requestScrollToBottom();
@@ -1392,6 +1459,13 @@ const EventStreamImpl = ({
   const backToBottom = useCallback(() => {
     follow.setFollowing(true);
     follow.requestScrollToBottom();
+  }, [follow]);
+
+  // Virtuoso 报「总高变了」：跟随中就补一次贴底。它是 followOutput 的替代——后者只在条数变化时触发、
+  // 还会启动一条没法取消的 scrollToIndex 重试链（见下方 Virtuoso 的 prop 注释）；
+  // 这里只发出「请贴底」的请求，真正写不写 scrollTop 由控制器按跟随态 + 距底判定
+  const onTotalHeightChanged = useCallback(() => {
+    if (follow.isFollowing()) follow.requestScrollToBottom();
   }, [follow]);
 
   // Cmd/Ctrl+End 回到最新（对齐 Claude Code 的 scroll:bottom）。
@@ -1561,8 +1635,8 @@ const EventStreamImpl = ({
   };
   const handleSend = () => submitVia(onUserReply);
 
-  // chat 形态间距：对话消息（AI / 用户 / streaming / ask_user）之间留大段落感、
-  // 连续过程行（thinking / tool / info / 工作组）紧凑堆叠成一组
+  // 对话类 item（AI / 用户 / streaming / ask_user）：回合节奏里「一段新的话」的开头。
+  // 各档间距的数值与理由在 lib/event-stream-rhythm（组间大、组内小，chat / task 同一套）
   const isConversational = (it: RenderItem): boolean => {
     if (isStreamingItem(it)) return true;
     if (isLoadingItem(it)) return false;
@@ -1578,6 +1652,15 @@ const EventStreamImpl = ({
       it.kind === "ask_user_request"
     );
   };
+
+  // 节奏档所需的两个事实：是不是对话、是不是过程层的「行」（工作过程组 / 工具块）
+  const rhythmFacts = (it: RenderItem): RhythmFacts => ({
+    talk: isConversational(it),
+    process:
+      it.kind === "__work_group__" ||
+      it.kind === "__tool_block__" ||
+      it.kind === "__tool_verb_group__",
+  });
 
   return (
     // 跟随控制器透给深层子树：工作过程组的「自动折叠」要看用户是不是在翻历史
@@ -1643,7 +1726,7 @@ const EventStreamImpl = ({
                 >
                   群问答（{groupQaRounds.length}）
                   {groupQaAnswering && (
-                    <span className="inline-block size-1.5 animate-pulse rounded-full bg-blue-500" />
+                    <span className="inline-block size-1.5 animate-pulse rounded-full bg-info" />
                   )}
                 </button>
               )}
@@ -1703,8 +1786,14 @@ const EventStreamImpl = ({
                       });
                     }
                   }}
-                  className="pointer-events-auto flex w-full cursor-pointer items-center rounded-b-md border-x border-b border-border/40 bg-background/75 px-3 py-1.5 text-left text-xs text-muted-foreground backdrop-blur transition-colors hover:text-foreground"
+                  // 事件流 v2：不透明底 + 完整边 + 轻阴影。旧版 bg-background/75 + backdrop-blur
+                  // 实测挡不住下面的正文（半透明条上叠着正文第一行、两行字糊在一起）——
+                  // 浮在内容之上的东西必须是实心面，才读得出「这是浮层、不是正文」
+                  className="pointer-events-auto flex w-full cursor-pointer items-center gap-2 rounded-b-lg border-x border-b border-border bg-background px-3 py-1.5 text-left text-xs text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
                 >
+                  <span className="shrink-0 font-medium text-foreground">
+                    本轮提问
+                  </span>
                   <span
                     ref={stickyTextRef}
                     className="min-w-0 flex-1 truncate"
@@ -1755,15 +1844,20 @@ const EventStreamImpl = ({
             computeItemKey={(_idx, item) => item.id}
             firstItemIndex={firstItemIndex}
             startReached={() => void loadEarlier()}
-            context={{ loadingEarlier }}
+            context={{
+              loadingEarlier,
+              earlierFailed,
+              onRetryEarlier: () => void loadEarlier(),
+            }}
             components={VIRTUOSO_COMPONENTS}
             // 滚动容器交给跟随控制器接手势（滚轮 / 触摸 / 键盘 / 拖滚动条）
             scrollerRef={attachScrollerRef}
-            // 条数变化时的跟随：跟不跟由控制器说了算（Virtuoso 自己的 isAtBottom 只看
-            // 几何、看不出「用户刚往上翻」）。behavior 必须是 "auto"——
-            // 老实现这里用 smooth，跟流式那条瞬时滚同时存在：smooth 动画滚到一半被
-            // 下一次瞬时滚打断，视觉上就是抖。现在两条路径统一走 auto + rAF 合批。
-            followOutput={() => (follow.isFollowing() ? "auto" : false)}
+            // 不传 followOutput（2026-10-12）：它在条数变化时让 Virtuoso 自己 scrollToIndex("LAST")，
+            // 函数形式下跟不跟完全由返回值决定、跟 isAtBottom 无关；而每次 scrollToIndex 都会启动
+            // 一条「内容在长就永不结束、又没法取消」的重试链，用户上滚后还会每 ~100ms 把人拉回底部
+            // （实测：流式第一个 chunk 让条数 +1、触发它，这条链一直活到用户滚轮之后）。
+            // 条数 / 高度变化后的贴底统一由控制器负责：items 变了走下方的跟随 effect，
+            // 总高变了走 totalListHeightChanged
             // v1.1.x 滚动位置记忆：滚动时持续记「视口顶部第一条事件 id + 是否跟随」、
             // 切走再切回按它恢复（虚拟 item __streaming__/__loading__ 不作锚点）
             rangeChanged={(range) => {
@@ -1783,12 +1877,14 @@ const EventStreamImpl = ({
                 atBottom: follow.isFollowing(),
               });
             }}
-            // 跟 FOLLOW_PIN_THRESHOLD 同一口径：Virtuoso 内部的贴底判定和我们的
-            // 「回到底部就恢复跟随」保持一致，省得两套阈值各判各的。
-            // 注意它已经**不再**兼职「防流式增高误判」——那件事现在由控制器的
-            // 用户意图检测负责，跟距离无关（老实现塞 120px 就是为了兼职、副作用是
-            // 用户小幅上滚被无视、下一个 chunk 又给拽回底部）
-            atBottomThreshold={FOLLOW_PIN_THRESHOLD}
+            // 底部带 = 永远不算「在底部」（2026-10-12）：Virtuoso 有两条不问我们跟随态的自动贴底
+            // （内容增高掉出底部带 / 视口变矮），都拿它的 atBottom 当闸门；带宽给任何正数，
+            // 用户往回滚 <= 带宽就仍在带内、下一个 chunk 撑高内容就被拽回（实测滚轮上滚 30px 后 49ms 弹回）。
+            // 跟随时的贴底由控制器负责（直接写 scrollTop，见 use-stream-follow）、视口变矮由它的
+            // ResizeObserver 接手——原因与细节见 scroll-follow 的 VIRTUOSO_NEVER_AT_BOTTOM
+            atBottomThreshold={VIRTUOSO_NEVER_AT_BOTTOM}
+            // 总高变了（新项测完高度 / 流式增高 / 异步内容回填）：跟随中补一次贴底
+            totalListHeightChanged={onTotalHeightChanged}
             // 视口外预渲染余量：快滚时先露白再补齐同样被感知成「抖」
             increaseViewportBy={VIEWPORT_OVERSCAN}
             // 初始定位：默认末尾（直接看最新事件）；有非贴底离开的锚点则恢复到那条（v1.1.x）
@@ -1810,18 +1906,16 @@ const EventStreamImpl = ({
                 className={cn(
                   "min-w-0 max-w-full px-4",
                   isChat && "mx-auto w-full max-w-3xl px-6",
-                  isChat
-                    ? idx === 0
-                      ? "pt-6"
-                      : isConversational(item)
-                        ? "pt-6"
-                        : isConversational(items[idx - 1])
-                          ? "pt-4"
-                          : "pt-0.5"
-                    : idx === 0
-                      ? "pt-4"
-                      : "pt-3",
-                  idx === items.length - 1 && (isChat ? "pb-6" : "pb-4"),
+                  // 回合节奏（chat / task 同一套）：组间大、组内小——说了一句话 + 它接着干的活读成一组
+                  rhythmPaddingTop(
+                    variant,
+                    rhythmTier(
+                      idx,
+                      rhythmFacts(item),
+                      idx > 0 ? rhythmFacts(items[idx - 1]) : null,
+                    ),
+                  ),
+                  idx === items.length - 1 && rhythmPaddingBottom(variant),
                 )}
               >
                 {/* A3 每轮分割线：用户消息 = 新一轮开始、上方细线 + 轮次时间（第一轮不画） */}
@@ -1835,7 +1929,7 @@ const EventStreamImpl = ({
                       aria-hidden
                     >
                       <div className="h-px w-16 bg-gradient-to-r from-transparent to-border" />
-                      <span className="rounded-full bg-muted/50 px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground/70">
+                      <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
                         {formatTs(item.ts)}
                       </span>
                       <div className="h-px w-16 bg-gradient-to-l from-transparent to-border" />
@@ -1877,6 +1971,7 @@ const EventStreamImpl = ({
                       hasRunning: item.hasRunning,
                       hasStreamingText: !!streamingText,
                       lastMemberKind: item.members[item.members.length - 1]?.kind,
+                      statusLineVisible,
                     })}
                   />
                 ) : isToolBlock(item) ? (
@@ -1945,9 +2040,11 @@ const EventStreamImpl = ({
         <div className="shrink-0 px-6 pb-5 pt-1">
           {/* 运行中粘性状态行：挂 Composer 上方，turn 结束（非 running）自然消失 */}
           <div className="mx-auto w-full max-w-3xl">
-            {activeStatus && (
-              <ActiveStatusLine status={activeStatus} />
-            )}
+            {/* 槽位：运行期间始终占住 h-7（ActiveStatusLine 自己也是 h-7、不叠加），
+                状态行出没不带着输入框上下跳 */}
+            <div className={reserveStatusSlot ? "h-7" : undefined}>
+              {activeStatus && <ActiveStatusLine status={activeStatus} />}
+            </div>
             {/* 疑似卡住提示：与 task 详情页输入条共用同一组件 */}
             <SuspectStuckHint
               task={task}

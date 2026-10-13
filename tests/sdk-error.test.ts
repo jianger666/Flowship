@@ -9,9 +9,18 @@
  * 识别只靠正则 + error 字段、肉眼难保证不误判（裸 error vs 带 inline 详情 / 带 stream message /
  * 带 code），所以喂典型错误串测边界、锁住「连接断」与「真错」的分界。
  */
+import fs from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { summarizeRunFailure } from "@/lib/server/sdk-error";
+import {
+  buildRunNotFinishedError,
+  extractSdkErrorBits,
+  isRetryableRunError,
+  matchSdkGiveUp,
+  SDK_GIVE_UP_RULES,
+  summarizeRunFailure,
+} from "@/lib/server/sdk-error";
 
 // 「裸 status=error 无诊断」友好文案（连接断 / 额度用完无法区分、兼列两种原因）
 const DROP_TEXT =
@@ -131,4 +140,177 @@ describe("summarizeRunFailure", () => {
     const r = summarizeRunFailure(msg, new Error(msg));
     expect(r.isConnectionDrop).toBe(true);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Bug #3：SDK 自己「放弃」本轮的终态报错
+// ---------------------------------------------------------------------------
+//
+// 事故（2026-10-08/09，claude-sonnet-5-5 [max] 的长回合）：事件流里连着出现两张红卡——
+//   ① `SDK ERROR：Agent turn stopped after repeated resume attempts made no progress`
+//   ② `Chat agent 异常：agent run status=error --- SDK stream error message --- … --- SDK result dump --- {…}`
+// ② 是一整坨英文 + JSON dump，没人看得懂；而且它没被识别成任何一类，既无友好文案、也没有显式的「不自动重连」。
+// 下面的原文取自事故现场的 events.jsonl（run id / requestId 换成了假的）。
+
+const noProgressRaw =
+  "agent run status=error\n--- SDK stream error message ---\nAgent turn stopped after repeated resume attempts made no progress\n--- SDK result dump ---\n" +
+  '{"id":"run-00000000-fake","requestId":"00000000-fake","status":"error","error":{"message":"Agent turn stopped after repeated resume attempts made no progress"},"model":{"id":"claude-sonnet-5-5","params":[{"id":"reasoning_effort","value":"max"}]},"durationMs":1579061,"usage":{"inputTokens":7749027,"outputTokens":177066,"totalTokens":15675020}}';
+
+const connFailedStreamRaw =
+  'agent run status=error\n--- SDK stream error message ---\nConnection failed repeatedly\n--- SDK result dump ---\n{"id":"run-x","status":"error","error":{"message":"Connection failed repeatedly"}}';
+
+describe("summarizeRunFailure · SDK 自己放弃本轮（Bug #3）", () => {
+  it("1. 事故原文（no progress）→ 友好文案；原文一字不丢地留在 detail", () => {
+    const r = summarizeRunFailure(noProgressRaw, new Error(noProgressRaw));
+    expect(r.isSdkGiveUp).toBe(true);
+    // 不是「裸连接断」：那一类有「重试通常可恢复」的承诺，这里不能混
+    expect(r.isConnectionDrop).toBe(false);
+    expect(r.text).toContain("断线续接");
+    expect(r.text).toContain("发一条消息即可接着继续");
+    // 看得懂的话里不再出现英文 dump
+    expect(r.text).not.toContain("agent run status=");
+    expect(r.text).not.toContain("SDK result dump");
+    // 排查线索不丢：原始串完整保留（错误卡「诊断详情」可展开看）
+    expect(r.detail).toBe(noProgressRaw);
+  });
+
+  it("2. 「重复回答」的善后提示：别混着看、以最后一个完整版本为准（文案里要有）", () => {
+    const r = summarizeRunFailure(noProgressRaw, new Error(noProgressRaw));
+    expect(r.text).toContain("多遍回答");
+    expect(r.text).toContain("最后一个完整的版本");
+  });
+
+  it("3. Connection failed repeatedly（stream message 形态 / inline 形态）→ 友好文案", () => {
+    const inline = "agent run status=error: Connection failed repeatedly";
+    for (const raw of [connFailedStreamRaw, inline]) {
+      const r = summarizeRunFailure(raw, new Error(raw));
+      expect(r.isSdkGiveUp, raw).toBe(true);
+      expect(r.isConnectionDrop, raw).toBe(false);
+      expect(r.text, raw).toContain("连续多次连接失败");
+      expect(r.detail, raw).toBe(raw);
+    }
+  });
+
+  it("4. 大小写不敏感（SDK 改了首字母大小写也认）", () => {
+    expect(matchSdkGiveUp("CONNECTION FAILED REPEATEDLY")?.id).toBe(
+      "connection-failed",
+    );
+    expect(
+      matchSdkGiveUp("agent turn stopped after repeated resume attempts made no progress")
+        ?.id,
+    ).toBe("no-progress");
+  });
+
+  it("5. 错误对象带 SDK 字段（code / cause）→ 仍给友好文案，字段照旧拼进 detail", () => {
+    const err = Object.assign(new Error(noProgressRaw), { code: "internal" });
+    const r = summarizeRunFailure(noProgressRaw, err);
+    expect(r.isSdkGiveUp).toBe(true);
+    expect(r.detail).toContain("SDK error fields");
+    expect(r.detail).toContain("internal");
+  });
+
+  it("6. 不误伤：普通报错 / 裸连接断 / 额度类都不算「SDK 放弃」", () => {
+    const cases = [
+      "agent run status=error: model overloaded",
+      "agent run status=error\n--- SDK stream error message ---\nrate limit exceeded\n--- SDK result dump ---\n{}",
+      taskBareDrop,
+      "agent run status=error",
+      "fetch failed",
+      "Cannot read properties of undefined (reading 'foo')",
+    ];
+    for (const raw of cases) {
+      expect(matchSdkGiveUp(raw), raw).toBeNull();
+      expect(summarizeRunFailure(raw, new Error(raw)).isSdkGiveUp, raw).toBe(
+        false,
+      );
+    }
+  });
+
+  it("7. 规则表自检：id 不重复、文案非空、都不依赖「为什么续接」这种没有证据的断言", () => {
+    const ids = SDK_GIVE_UP_RULES.map((r) => r.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const rule of SDK_GIVE_UP_RULES) {
+      expect(rule.text.length).toBeGreaterThan(20);
+      // 根因（服务端 / 网络 / 停滞检测）目前无公开钩子可区分——文案里不许写死某一种
+      expect(rule.text).not.toMatch(/因为|由于|sonnet|限流|额度/i);
+    }
+  });
+});
+
+describe("isRetryableRunError · SDK 自己放弃的一律不自动重连（Bug #3）", () => {
+  it("1. no progress / Connection failed repeatedly → 不重连", () => {
+    expect(isRetryableRunError(noProgressRaw, new Error(noProgressRaw))).toBe(
+      false,
+    );
+    expect(
+      isRetryableRunError(connFailedStreamRaw, new Error(connFailedStreamRaw)),
+    ).toBe(false);
+  });
+
+  it("2. 即使同时带网络类关键字 / SDK 自标 isRetryable，也不重连（显式否决、不靠正则碰巧不匹配）", () => {
+    const withNetwork =
+      "agent run status=error: Connection failed repeatedly (fetch failed, ECONNRESET)";
+    expect(isRetryableRunError(withNetwork, new Error(withNetwork))).toBe(false);
+
+    const err = Object.assign(new Error(noProgressRaw), { isRetryable: true });
+    expect(isRetryableRunError(noProgressRaw, err)).toBe(false);
+    // attempt 也不改变结论
+    expect(isRetryableRunError(noProgressRaw, err, 1)).toBe(false);
+  });
+
+  it("3. 对照：否决只针对这两句，其它该重连的照旧重连", () => {
+    // 裸连接断
+    expect(isRetryableRunError(taskBareDrop, new Error(taskBareDrop))).toBe(true);
+    // 网络类关键字
+    const net = "agent run status=error: fetch failed";
+    expect(isRetryableRunError(net, new Error(net))).toBe(true);
+    // SDK 自标可重试
+    const flagged = Object.assign(new Error("boom"), { isRetryable: true });
+    expect(isRetryableRunError("boom", flagged)).toBe(true);
+    // 认证错照旧不重连
+    const auth = "unauthenticated";
+    expect(isRetryableRunError(auth, new Error(auth))).toBe(false);
+  });
+});
+
+describe("buildRunNotFinishedError · 保留 SDK 的终态错误作 cause（Bug #3）", () => {
+  it("result.error 存在 → 作为 cause 挂上，message 原样", () => {
+    const sdkError = { message: "Agent turn stopped …", code: "internal" };
+    const err = buildRunNotFinishedError("agent run status=error", {
+      error: sdkError,
+    });
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("agent run status=error");
+    expect(err.cause).toBe(sdkError);
+  });
+
+  it("没有 result.error → 不挂 cause（不凭空造一个）", () => {
+    const err = buildRunNotFinishedError("agent run status=error", {});
+    expect("cause" in err).toBe(false);
+  });
+
+  it("cause 不是 Error 实例 → extractSdkErrorBits 不读它，既有的连接断判定不被改变", () => {
+    // 裸 status=error 且 SDK 的 error 里没有任何内容：仍然是「裸连接断」
+    const bare = buildRunNotFinishedError(taskBareDrop, {
+      error: { message: "" },
+    });
+    expect(extractSdkErrorBits(bare)).toEqual({});
+    expect(summarizeRunFailure(bare.message, bare).isConnectionDrop).toBe(true);
+    expect(isRetryableRunError(bare.message, bare)).toBe(true);
+  });
+});
+
+describe("接线契约 · 两个 runner 的非 finished 抛错都走 buildRunNotFinishedError", () => {
+  const REPO = path.resolve(import.meta.dirname, "..");
+  const read = (rel: string): string =>
+    fs.readFileSync(path.join(REPO, rel), "utf-8");
+
+  it.each(["src/lib/server/chat-runner.ts", "src/lib/server/task-runner.ts"])(
+    "%s：不再裸 `throw new Error(\\`agent run status=…`",
+    (rel) => {
+      const src = read(rel);
+      expect(src).toMatch(/throw buildRunNotFinishedError\(\s*`agent run status=/);
+      expect(src).not.toMatch(/throw new Error\(\s*`agent run status=/);
+    },
+  );
 });

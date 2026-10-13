@@ -166,7 +166,7 @@ export const McpCard = ({
                     <div
                       className={cn(
                         "min-w-0 flex-1 truncate text-sm",
-                        isDisabled && "text-muted-foreground/60 line-through",
+                        isDisabled && "text-muted-foreground line-through",
                       )}
                     >
                       {name}

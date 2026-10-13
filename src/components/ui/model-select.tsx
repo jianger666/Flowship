@@ -104,7 +104,7 @@ export const ModelQuickPicks = ({
   if (starredIds.length === 0) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      <span className="shrink-0 text-[11px] text-muted-foreground/70">常用</span>
+      <span className="shrink-0 text-[11px] text-muted-foreground">常用</span>
       {starredIds.map((id) => {
         const m = models.find((x) => x.id === id);
         return (
@@ -317,10 +317,14 @@ export const ModelSelect = ({
       disabled={disabled}
       placeholder={emptyPlaceholder}
       searchPlaceholder="搜索模型…"
+      // compact（输入框底栏）：上限 12rem 放在 wrapper、trigger 自己 max-w-full 跟 wrapper 走。
+      // trigger 是 <button>，width:auto 按 shrink-to-fit 算、下限 = 内容 min-content（nowrap 文案
+      // 即全宽）——祖先每层 min-w-0 也收不住它，窗口一窄就顶穿父级压到右侧动作组上
+      // （2026-10-12 Chrome 实测：窗口 640 压 60px、560 压 140px）。max-w-full 才让内部 truncate 生效。
       className={
-        variant === "compact" ? "h-7 min-w-0 w-auto max-w-48 text-xs" : undefined
+        variant === "compact" ? "h-7 min-w-0 w-auto max-w-full text-xs" : undefined
       }
-      wrapperClassName={variant === "compact" ? "w-auto min-w-0 max-w-full" : undefined}
+      wrapperClassName={variant === "compact" ? "w-auto min-w-0 max-w-48" : undefined}
       contentClassName={variant === "compact" ? "w-72 min-w-72 max-w-72" : undefined}
       emptyHint={
         models.length === 0 ? (

@@ -14,11 +14,8 @@ import {
   isCompactionInfo,
   isCompactionRunning,
 } from "@/lib/compaction-display";
-import {
-  THINKING_LIVE_LABEL,
-  THINKING_TEXT_MAX,
-  type LiveThinking,
-} from "@/lib/thinking-live";
+import { formatDurationCoarse } from "@/lib/duration-display";
+import { THINKING_LIVE_LABEL, type LiveThinking } from "@/lib/thinking-live";
 import type { TaskEvent } from "@/lib/types";
 import {
   parseTaskToolArgs,
@@ -51,33 +48,67 @@ export type WorkGroupItem = {
 export type ChatRenderItem = StreamRenderItem | WorkGroupItem;
 
 export type ActiveStatus = {
-  /** 主文案：当前工具「正在执行 shell」/ thinking 首行截断 /「处理中…」/「正在回复…」 */
+  /**
+   * 主文案：当前工具「正在执行 shell」/「思考中」/
+   * 工具刚跑完等模型下一步「正在分析 read 的结果」（说不清是哪个工具时退回「处理中…」）/「正在回复…」
+   */
   label: string;
-  /** 可选细节：工具摘要 / liveOutput 尾行（单行截断 ~80 字） */
+  /**
+   * 可选细节：工具摘要 / liveOutput 尾行（单行截断 ~80 字）。
+   * 思考没有 detail——思考原文在工作过程组的思考行里展示，这里再带一遍就是上下各一行同样的字。
+   */
   detail?: string;
   /**
-   * 「已经说完、只剩收尾」：静态展示（打勾、不闪烁、不带脉冲点）。
-   * 动画会让用户以为 AI 还在写；这个态的意思恰恰是「可以读了」。
+   * 这一步从何时开始（毫秒时间戳）。有值 = 状态行等了一会儿后显示「· 12s」并逐秒走字，
+   * 让人随时能回答「已经等了多久、是不是卡住了」。
+   *
+   * 给四类有这个需要的空窗：工具执行中 / 子代理 / 工具跑完等模型下一步 / 思考中
+   * （思考的起点是收到首帧的时刻；一段思考可长达一分多钟，原文又不在这里展示，计时是唯一的进度感）。
+   * 刚发消息的启动阶段由列表里的 PendingRow 计时（「已等待 Ns」）、
+   * 正文有流式文字——这些都不在这里重复计时。
    */
-  settled?: boolean;
+  sinceTs?: number;
+  /**
+   * 「让位」标记：这一状态的信息，在列表末尾已经有一行进度行（PendingRow / BootStageRow）
+   * 在说的时候，状态行就不再画，免得上下各说一遍「在启动」。
+   *
+   * 只是**可以**让位，不是一定让位：调用方（event-stream）看到流尾确有进度行才让；
+   * 没有（比如启动链 info 已收进折叠的「启动过程」组、流里没有任何动态指示）时状态行是唯一的
+   * 「还在跑」信号，必须照常画。判定放在调用方、不放在这里，是因为这里看不到渲染出来的流尾。
+   */
+  yieldToTail?: boolean;
 };
+
+/** 工具都跑完、下一句还没出来：空等挂在这一句，不挂在 write 上（也是说不清上一个工具时的兜底文案） */
+export const PROCESSING_PLACEHOLDER_LABEL = "处理中…";
 
 /**
- * 回合已结束（回复完整落盘）但 SDK 迟迟没收尾（等 checkpoint 持久化等）时的状态行。
- * 替代之前一直闪烁的「正在回复…」——那会让用户对着一个其实已写完的回复干等。
+ * 工具跑完、模型还没给出下一步时的状态行文案：「正在分析 read 的结果」。
+ * 只描述「在消化上一个工具的结果」，不断言更细的阶段（推理 / 排队 / SDK 重试从这里分不出来）。
  */
-export const TURN_WRAP_UP_STATUS: ActiveStatus = {
-  label: "回复已完成",
-  detail: "正在保存会话…",
-  settled: true,
-};
+export const analyzingToolLabel = (toolName: string): string =>
+  `正在分析 ${toolName} 的结果`;
 
-/** 工具都跑完、下一句还没出来：空等挂在这一句，不挂在 write 上 */
-export const PROCESSING_PLACEHOLDER_LABEL = "处理中…";
+/** 状态行等够这么久才显示秒数：瞬时工具（读个文件）一闪而过时，别跟着闪一下数字 */
+export const STATUS_ELAPSED_SHOW_AFTER_MS = 3000;
+
+/**
+ * 已等待毫秒 → 状态行里的「12s」/「2m14s」；不到显示门槛返回 null（不渲染）。
+ * 口径与工作过程组头一致（formatDurationCoarse，秒级）。
+ */
+export const formatStatusElapsed = (elapsedMs: number): string | null =>
+  elapsedMs < STATUS_ELAPSED_SHOW_AFTER_MS
+    ? null
+    : formatDurationCoarse(elapsedMs);
 
 /**
  * 工作过程组末尾要不要挂「处理中…」。
  * 本组已是流尾、没有还在跑的工具、正文还没开始流；末成员是 thinking 时思考行本身就是进度，不再叠一行。
+ *
+ * `statusLineVisible`：输入框上方的粘性状态行这一帧确实会画出来（chat 形态且有状态文案）。
+ * 此时它已经在说「正在分析 X 的结果 · 12s」，组尾再转一圈「处理中…」就是同一句废话说两遍
+ * （Bug 记录 #5 的现象描述：工作过程组末尾和输入框上方各有一遍「处理中…」）——让位给状态行。
+ * task 形态没有状态行，仍由组尾这一行兜底。
  */
 export const shouldShowProcessingPlaceholder = (input: {
   isRunning: boolean;
@@ -85,10 +116,12 @@ export const shouldShowProcessingPlaceholder = (input: {
   hasRunning: boolean;
   hasStreamingText: boolean;
   lastMemberKind?: string;
+  statusLineVisible?: boolean;
 }): boolean => {
   if (!input.isRunning || !input.isLastItem) return false;
   if (input.hasRunning || input.hasStreamingText) return false;
   if (input.lastMemberKind === "thinking") return false;
+  if (input.statusLineVisible) return false;
   return true;
 };
 
@@ -97,13 +130,10 @@ export const isWorkGroup = (it: ChatRenderItem): it is WorkGroupItem =>
 
 /**
  * 进行中思考的合成 meta：`live` 标记这条 thinking 是前端合成的（不落盘、不在 task.events 里），
- * ProcessEventRow 据此多画一个转圈、折叠摘要取最新一行、不显示耗时（耗时落盘后才有）；
- * `liveTruncated` = 原文超过前端保留上限、前面的被截掉了（展开区顶部给提示）。
+ * ProcessEventRow 据此多画一个转圈、默认展开成实时文本区（落盘后回到默认折叠）、不显示耗时
+ * （耗时落盘后才有）。
  */
-const liveThinkingMeta = (live: LiveThinking): Record<string, unknown> =>
-  live.text.length >= THINKING_TEXT_MAX
-    ? { live: true, liveTruncated: true }
-    : { live: true };
+const LIVE_THINKING_META: Readonly<Record<string, unknown>> = { live: true };
 
 /**
  * 这条事件是不是「进行中的思考」（attachLiveThinking 合成的那条）。
@@ -114,11 +144,33 @@ export const isLiveThinkingMeta = (
   ev: Pick<TaskEvent, "kind" | "meta">,
 ): boolean => ev.kind === "thinking" && ev.meta?.live === true;
 
-/** 同上，但入参是渲染项、带类型守卫（折叠组头取末成员文本用） */
+/** 同上，但入参是渲染项、带类型守卫（折叠组头判断末成员是不是进行中的思考用） */
 export const isLiveThinkingEvent = (
   it: ChatRenderItem | undefined,
 ): it is TaskEvent =>
   !!it && it.kind === "thinking" && isLiveThinkingMeta(it as TaskEvent);
+
+/**
+ * 事件行没被用户动过时的折叠态：进行中的思考自动展开成实时文本区，其余用首次渲染时锁定的默认值。
+ *
+ * 为什么进行中的思考要自动展开：它存在的意义就是让人看到「正在想什么」。折叠成一行摘要的话，
+ * 摘要只能取最新一行，每来一个字整行左滑一格，没法跟读（2026-10-12 用户反馈「思考吐字很机械」）。
+ * 为什么其余的用「首次渲染时锁定」的默认值：落盘后同 id 的思考行是同一个节点——
+ * live 标记一没，这里自然回到默认折叠；而 isDefaultVisible 之后怎么变都不该把用户的阅读状态刷掉。
+ */
+export const autoEventCollapsed = (
+  isLive: boolean,
+  initialCollapsed: boolean,
+): boolean => (isLive ? false : initialCollapsed);
+
+/**
+ * 用户点一下折叠箭头后的手动态：基于「他当前看到的」翻转——有手动态按手动态，否则按自动态。
+ * 手动态一旦有了就一直优先于自动态（live 落盘、默认值变化都不会把用户的选择刷掉）。
+ */
+export const toggleEventCollapsed = (
+  manual: boolean | null,
+  auto: boolean,
+): boolean => !(manual ?? auto);
 
 /**
  * 把「正在进行的思考」画进流程——作为一条真正的 thinking 成员，由已有的思考行渲染。
@@ -147,7 +199,7 @@ export const attachLiveThinking = (
   live: LiveThinking,
 ): readonly ChatRenderItem[] => {
   const last = items[items.length - 1];
-  const meta = liveThinkingMeta(live);
+  const meta = { ...LIVE_THINKING_META };
   const step: TaskEvent = {
     id: live.id,
     ts: live.since,
@@ -414,6 +466,24 @@ const summarizeToolCallArgs = (ev: TaskEvent): string | undefined => {
 };
 
 /**
+ * 基础状态 + 它是不是「空等」类。
+ * 空等类（刚发消息等启动 / 工具跑完等模型 / 已落盘的思考刚结束 / 正文还没开始）会被思考实时态盖掉；
+ * 其余（工具在跑 / 子代理 / 压缩）有更具体的信息，不能盖。
+ * 用显式标记而不是按 label 文案判等——文案现在带工具名、不再是一个固定集合。
+ */
+type StatusBase = { status: ActiveStatus; idle: boolean };
+
+const idleBase = (status: ActiveStatus): StatusBase => ({ status, idle: true });
+const busyBase = (status: ActiveStatus): StatusBase => ({ status, idle: false });
+
+/** 事件 ts → 状态的起点时间戳（缺省 / 脏值 → 不带 sinceTs，状态行就不走字） */
+const sinceOf = (ev: TaskEvent): Pick<ActiveStatus, "sinceTs"> =>
+  Number.isFinite(ev.ts) ? { sinceTs: ev.ts } : {};
+
+/** 状态行里工具名的最大长度（MCP 工具名可以很长，别把整行顶满） */
+const ANALYZING_NAME_MAX = 28;
+
+/**
  * 粘性状态行文案：从尾部回扫最近的 agent 活动。
  * 调用方只在 isRunning 时调用；本函数不判断 running。
  * `streaming`：正文已经在流，工具刚跑完也改口「正在回复…」，别停在「处理中…」。
@@ -424,34 +494,64 @@ const deriveActiveStatusBase = (
   events: readonly TaskEvent[],
   liveToolOutputs?: Record<string, string>,
   opts?: { streaming?: boolean },
-): ActiveStatus | null => {
+): StatusBase | null => {
   if (events.length === 0) return null;
 
-  const waitingAfterTools = (): ActiveStatus =>
-    opts?.streaming
-      ? { label: "正在回复…" }
-      : { label: PROCESSING_PLACEHOLDER_LABEL };
-
-  // 先收集已完成的 callId（有对应 tool_result）
+  // 先收集：已完成的 callId（有对应 tool_result）、各 callId 的工具名、出现过的 tool_call callId
   const doneCallIds = new Set<string>();
+  const toolNameByCallId = new Map<string, string>();
+  const calledIds: string[] = [];
   for (const ev of events) {
-    if (ev.kind !== "tool_result") continue;
     const cid = getCallId(ev);
-    if (cid) doneCallIds.add(cid);
+    if (!cid) continue;
+    if (ev.kind === "tool_result") {
+      doneCallIds.add(cid);
+    } else if (ev.kind === "tool_call") {
+      calledIds.push(cid);
+      if (typeof ev.meta?.name === "string" && ev.meta.name) {
+        toolNameByCallId.set(cid, ev.meta.name);
+      }
+    }
   }
+  // 并行工具：还有 tool_call 没配上 result 时，「上一个工具」说不清——退回泛称、不乱点名
+  const hasUnpairedToolCall = calledIds.some((cid) => !doneCallIds.has(cid));
+
+  /** 工具跑完、下一句还没出来（ev = 触发这次判定的 tool_result / 已完成的 tool_call） */
+  const waitingAfterTools = (ev: TaskEvent): StatusBase => {
+    // 正文已经在流：改口「正在回复…」，别停在「处理中…」
+    if (opts?.streaming) return idleBase({ label: "正在回复…" });
+    const since = sinceOf(ev);
+    const rawName =
+      typeof ev.meta?.name === "string" && ev.meta.name
+        ? ev.meta.name
+        : toolNameByCallId.get(getCallId(ev));
+    if (!rawName || hasUnpairedToolCall) {
+      return idleBase({ label: PROCESSING_PLACEHOLDER_LABEL, ...since });
+    }
+    return idleBase({
+      label: analyzingToolLabel(clipDetail(rawName, ANALYZING_NAME_MAX)),
+      ...since,
+    });
+  };
 
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i]!;
 
-    // 扫到 user_reply 还没撞上 agent 活动 → 刚发出、等启动
+    // 扫到 user_reply 还没撞上 agent 活动 → 刚发出、等启动。
+    // 不带 sinceTs：这一段由列表里的 PendingRow 计时（「已等待 Ns」），状态行不再重复走一遍字。
+    // 正文已经在流（assistant_message 要整段说完才落盘，期间事件尾还是 user_reply）：
+    // 是在回复、不是在启动——不然正文在屏上一个字一个字出，输入框上方却写着「正在启动…」。
+    // 流尾有进度行时可让位（yieldToTail，见 ActiveStatus）：PendingRow / BootStageRow 已经在说同一件事
     if (ev.kind === "user_reply") {
-      return { label: "正在启动…" };
+      return opts?.streaming
+        ? idleBase({ label: "正在回复…" })
+        : idleBase({ label: "正在启动…", yieldToTail: true });
     }
 
     // 自定义 pi 压缩：字已经在屏上，但 agent_settled 还没到——别继续说「正在回复」
     if (isCompactionInfo(ev)) {
       if (isCompactionRunning(ev)) {
-        return { label: COMPACTION_RUNNING_LABEL };
+        return busyBase({ label: COMPACTION_RUNNING_LABEL });
       }
       continue;
     }
@@ -461,88 +561,89 @@ const deriveActiveStatusBase = (
       const cid = getCallId(ev);
       if (cid && doneCallIds.has(cid)) {
         // 已完成的 tool_call：等下一轮模型（交卷 / 结论 / 下一个工具）
-        return waitingAfterTools();
+        return waitingAfterTools(ev);
       }
       const name = getToolName(ev);
+      const since = sinceOf(ev);
       // task 子代理特殊文案
       if (name.toLowerCase() === "task") {
         const taskArgs = parseTaskToolArgs(getArgs(ev));
         const detail = taskArgs?.description
           ? clipDetail(taskArgs.description)
           : undefined;
-        return { label: "子代理工作中", detail };
+        return busyBase({ label: "子代理工作中", detail, ...since });
       }
       const live = cid && liveToolOutputs ? liveToolOutputs[cid] : undefined;
       const detail = live?.trim()
         ? lastLineClipped(live)
         : summarizeToolCallArgs(ev);
-      return {
+      return busyBase({
         label: `正在执行 ${name}`,
         detail,
-      };
+        ...since,
+      });
     }
 
     // 已完成的 tool_result：等下一轮模型，不是已经在写回复
     if (ev.kind === "tool_result") {
-      return waitingAfterTools();
+      return waitingAfterTools(ev);
     }
 
     // ephemeral 增量不参与判定
     if (ev.kind === "tool_output_delta") continue;
 
+    // 已落盘的 thinking = 这一段思考刚结束、下一个事件还没来（紧接着是工具调用 / 正文）。
+    // 不带 detail：它的原文就在上面工作过程组的思考行里（折叠摘要），再摘一行放这里是同一句话说两遍。
+    // 算「空等」类（idle）：紧跟着又开始新一段思考时，让实时态（带计时）盖掉它；
+    // 正文已经在流则改口「正在回复…」——此时正文在屏上、思考早就结束了
     if (ev.kind === "thinking") {
-      const detail = ev.text.trim() ? lastLineClipped(ev.text) : undefined;
-      return { label: "思考中", detail };
+      return idleBase({
+        label: opts?.streaming ? "正在回复…" : THINKING_LIVE_LABEL,
+      });
     }
 
     if (ev.kind === "assistant_message") {
-      return { label: "正在回复…" };
+      return idleBase({ label: "正在回复…" });
     }
 
     // error 也算明确活动收尾 → 正在回复（调用方仍在 running 时少见）
     if (ev.kind === "error") {
-      return { label: "正在回复…" };
+      return idleBase({ label: "正在回复…" });
     }
 
     // info / ask_* / 其它 → 继续往前扫
   }
 
   // 全是 info 之类、没有任何 user/agent 信号
-  return { label: "正在回复…" };
+  return idleBase({ label: "正在回复…" });
 };
-
-/**
- * 只有这些「空等」文案会被实时思考盖掉：
- * 工具在跑 / 子代理 / 压缩有更具体的信息，不能盖；已落盘的「思考中」本来就对。
- */
-const IDLE_WAIT_LABELS: ReadonlySet<string> = new Set([
-  "正在启动…",
-  PROCESSING_PLACEHOLDER_LABEL,
-  "正在回复…",
-]);
 
 /**
  * 粘性状态行文案（含思考实时态）。
  *
- * `thinking`：思考实时帧聚合出的「最近一行」——null / undefined = 没在思考；
- * "" = 在思考但还没有可展示的行（只显示「思考中」不带细节）。
+ * `thinkingSince`：这一段实时思考的起点（毫秒时间戳，收到首帧的时刻）——null / undefined = 没在思考。
+ * 只要「在思考 + 从何时起」，不要原文：原文在工作过程组的思考行里展示，状态行再带就是上下重复。
  *
  * 为什么需要它：已落盘的 thinking 事件要等整段思考**结束**才有，deriveActiveStatusBase
  * 扫到它时思考已经完了；思考进行中（实测一段可长达 65s）事件流尾部还是 user_reply /
  * tool_result，状态行只能说「正在启动…」「处理中…」，用户以为卡死。
+ * 带上起点是为了走字：原文不在这里展示后，「思考中 · 12s」就是状态行里唯一的进度感。
  */
 export const deriveActiveStatus = (
   events: readonly TaskEvent[],
   liveToolOutputs?: Record<string, string>,
-  opts?: { streaming?: boolean; thinking?: string | null },
+  opts?: { streaming?: boolean; thinkingSince?: number | null },
 ): ActiveStatus | null => {
   const base = deriveActiveStatusBase(events, liveToolOutputs, opts);
-  const thinking = opts?.thinking;
-  if (thinking == null || !base) return base;
-  // 正文已经在流 = 在回复、不是在思考（thinking 此时本应已被清掉，这里兜竞态）
-  if (opts?.streaming) return base;
-  if (!IDLE_WAIT_LABELS.has(base.label)) return base;
-  return thinking
-    ? { label: THINKING_LIVE_LABEL, detail: thinking }
+  if (!base) return null;
+  const since = opts?.thinkingSince;
+  if (since == null) return base.status;
+  // 正文已经在流 = 在回复、不是在思考（实时态此时本应已被清掉，这里兜竞态）
+  if (opts?.streaming) return base.status;
+  // 只盖「空等」类；工具在跑 / 子代理 / 压缩有更具体的信息，不能盖
+  if (!base.idle) return base.status;
+  // 脏值（NaN 等）退化成不带计时的「思考中」，别让走字显示 NaNs
+  return Number.isFinite(since)
+    ? { label: THINKING_LIVE_LABEL, sinceTs: since }
     : { label: THINKING_LIVE_LABEL };
 };

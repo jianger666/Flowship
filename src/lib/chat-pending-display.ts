@@ -16,6 +16,8 @@
  * 立即发送路径里 agent.send 受理（runStatus→running）早于 user_reply 落盘，
  * 中间有几十~几百 ms「占位还在、isRunning 已为真」的窗口——渲染时判定会把立即发送误判成排队、
  * 气泡样式来回闪。
+ *
+ * 同一个空窗里输入框一侧（运行态外观 / 停止键语义）的判定也收在本文件末尾。
  */
 
 export type PendingBubbleMode = "inflight" | "queued";
@@ -49,3 +51,66 @@ export const shouldShowSendLoading = (s: {
   lastIsUser: boolean;
   hasInflight: boolean;
 }): boolean => (s.isRunning && s.lastIsUser) || s.hasInflight;
+
+// ---------------------------------------------------------------------------
+// 同一个「发出后空窗」里，输入框这一侧的状态（2026-10-12）
+//
+// 空窗 = 回车 → 服务端把消息交给 SDK 受理（受理后才发布 runStatus=running）。
+// 实测（chat-reply-timings.log）：热路径要先打发送前快照 0.3–0.7s、再 agent.send 受理 1–3s，
+// 合计 1.3–2.7s；冷路径还要 resume，4.5–6.7s。
+//
+// v1.9.29 把气泡改成了「正式气泡 + 列表末尾准备环境…」，界面在说「AI 已经在处理了」，
+// 但输入框仍绑在 HTTP 请求上：只有一个转圈的发送键、没有停止键——两处表达自相矛盾，
+// 而且这几秒里用户想停也停不了。下面三个函数收口这一侧。
+// ---------------------------------------------------------------------------
+
+/**
+ * 输入框右侧是否按「运行态」画（转圈 + 红色停止键 + 排队发送）。
+ *
+ * 提交飞行期间（submitting）也算：气泡已是正式消息，输入框就别再装作「还在发送」。
+ * 有待答提问时照旧不画运行态——那时回车 = 隐式跳过提问，输入条要保持可发。
+ */
+export const shouldShowComposerRunning = (s: {
+  /** run 进行中 latch（runStatus 进过 running，done 事件才松开） */
+  isRunning: boolean;
+  /** 本地提交飞行中（sendChatReply 的 HTTP 还没返回） */
+  submitting: boolean;
+  awaitingAsk: boolean;
+}): boolean => (s.isRunning || s.submitting) && !s.awaitingAsk;
+
+/**
+ * 点停止键：现在就停，还是等这次提交落地再停。
+ *
+ * 受理前直接停会撞一个服务端竞态：热路径（会话在内存）发送前快照期间还没有任何占位，
+ * 这时 stop 把会话关了，随后 sendChatMessage 发现无会话（no_session）、落到「起新会话」
+ * 并重新领一个 lease——用户点了停止，AI 却被重新拉起来，消息还被重放。
+ * 冷路径（claim / startToken）和 agent.send 受理期间（共享取消闭包）都有兜底，唯独这一段没有。
+ *
+ * 判据：提交还在飞、且服务端还没受理。受理的信号是 runStatus 发布 running（runActive 随之为真）：
+ * 之后 run 已被取消闭包持有，stop 是确定的。排队发送（run 本来就在跑）时 runActive 已真 → 直接停。
+ */
+export type ChatStopMode = "now" | "after_submit";
+export const decideChatStop = (s: {
+  submitting: boolean;
+  runActive: boolean;
+}): ChatStopMode => (s.submitting && !s.runActive ? "after_submit" : "now");
+
+/**
+ * 提交落地后，怎么处理「受理前点过的停止」：
+ * - none：没登记过，什么都不做；
+ * - stop：消息已被服务端接住、任务还在——现在兑现这次停止；
+ * - release：消息没发出去（被拒 / 状态不明）或任务已没了——没有 run 可停，
+ *   只把停止键的「停止中」外观收掉（草稿由调用方保留，用户可重发；不落一条多余的「用户停止了对话」）。
+ */
+export type StopIntentSettlement = "none" | "stop" | "release";
+export const settleStopIntent = (s: {
+  /** 受理前是否登记过停止意图 */
+  pending: boolean;
+  /** 这次提交是否落地（消息已被服务端接住） */
+  accepted: boolean;
+  /** 任务还在（没被删 / 没被切走） */
+  alive: boolean;
+}): StopIntentSettlement => {
+  if (!s.pending) return "none";
+  return s.accepted && s.alive ? "stop" : "release";
+};

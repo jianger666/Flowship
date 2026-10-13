@@ -430,7 +430,7 @@ const GroupSection = ({
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
           {ACTION_GROUP_LABEL[groupKey]}
         </span>
-        <span className="shrink-0 tabular-nums text-xs text-muted-foreground/70">
+        <span className="shrink-0 tabular-nums text-xs text-muted-foreground">
           {keys.length}
         </span>
         <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">

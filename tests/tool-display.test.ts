@@ -366,7 +366,17 @@ describe("parseTaskToolArgs", () => {
       description: "修登录态",
       prompt: "请排查 auth cookie\n第二行",
       model: "fast",
+      effort: null,
     });
+  });
+
+  it("effort 与 model 一起解析（对象 / JSON / 残缺流式前缀三种形态）", () => {
+    const full = { description: "d", prompt: "p", model: "gpt-5", effort: "high" };
+    expect(parseTaskToolArgs(full)).toEqual(full);
+    expect(parseTaskToolArgs(JSON.stringify(full))).toEqual(full);
+    expect(
+      parseTaskToolArgs('{"description":"d","model":"gpt-5","effort":"hi')?.effort,
+    ).toBe("hi");
   });
 
   it("接受已解析对象", () => {
@@ -375,7 +385,12 @@ describe("parseTaskToolArgs", () => {
         description: "读代码",
         prompt: "扫 src/",
       }),
-    ).toEqual({ description: "读代码", prompt: "扫 src/", model: null });
+    ).toEqual({
+      description: "读代码",
+      prompt: "扫 src/",
+      model: null,
+      effort: null,
+    });
   });
 
   it("残缺流式 JSON 前缀安全抠字段", () => {
@@ -392,6 +407,7 @@ describe("parseTaskToolArgs", () => {
       description: "半成品任务",
       prompt: null,
       model: null,
+      effort: null,
     });
   });
 

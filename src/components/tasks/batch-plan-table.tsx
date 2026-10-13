@@ -81,7 +81,7 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
                   <div>{b.rawId}</div>
                   {/* 追加场景标来源：这批是第几次方案引入的 */}
                   {multiSource && (
-                    <div className="mt-0.5 text-[11px] text-muted-foreground/70">
+                    <div className="mt-0.5 text-[11px] text-muted-foreground">
                       #{b.sourceActionN}
                     </div>
                   )}

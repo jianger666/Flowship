@@ -180,7 +180,7 @@ export const TaskListItem = ({
           prClass,
           active
             ? "bg-selected font-medium text-selected-foreground"
-            : "text-foreground/75 hover:bg-muted/50 hover:text-foreground",
+            : "text-foreground hover:bg-muted/50",
         )}
       >
         {/* 行首指示：runStatus（运行中 / 等你回复）优先、否则类型图标——顶对齐两行 */}
@@ -203,7 +203,7 @@ export const TaskListItem = ({
           {/* task 活跃态：阶段 · 状态；其余单行只标题 */}
           {stageLine && (
             <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">
-              <span className="min-w-0 truncate text-muted-foreground/70">
+              <span className="min-w-0 truncate text-muted-foreground">
                 {stageLine.stage}
               </span>
               <span className="text-muted-foreground/40">·</span>
@@ -215,7 +215,7 @@ export const TaskListItem = ({
       {/* chat 相对时间：吸行尾右侧（与 hover 按钮同槽——hover 时按钮浮现、时间隐去），
           不挤标题宽度（标题的右 padding 本来就为按钮槽留好了） */}
       {subtitle && (
-        <span className="pointer-events-none absolute inset-y-0 right-2 my-auto flex h-4 items-center text-[11px] tabular-nums text-muted-foreground/50 transition-opacity group-hover/item:opacity-0 group-has-[[data-popup-open]]/item:opacity-0">
+        <span className="pointer-events-none absolute inset-y-0 right-2 my-auto flex h-4 items-center text-[11px] tabular-nums text-muted-foreground transition-opacity group-hover/item:opacity-0 group-has-[[data-popup-open]]/item:opacity-0">
           {subtitle}
         </span>
       )}

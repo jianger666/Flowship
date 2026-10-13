@@ -87,8 +87,8 @@ const ActionChip = ({
       >
         <span
           className={cn(
-            "text-[11px] text-muted-foreground/80",
-            isSelected && "text-foreground/70",
+            "text-[11px] text-muted-foreground",
+            isSelected && "text-foreground",
           )}
         >
           #{action.n}
@@ -141,7 +141,7 @@ const ActionChip = ({
 
 const EllipsisChip = ({ title }: { title: string }) => (
   <Tooltip content={title}>
-    <span className="inline-flex h-7 items-center rounded px-1.5 text-xs text-muted-foreground/60">
+    <span className="inline-flex h-7 items-center rounded px-1.5 text-xs text-muted-foreground">
       …
     </span>
   </Tooltip>

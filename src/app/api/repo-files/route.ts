@@ -16,7 +16,7 @@ import {
   REPO_FILES_Q_MAX_LEN,
   searchTaskRepoFiles,
 } from "@/lib/server/repo-files";
-import { getTask } from "@/lib/server/task-fs";
+import { getTaskMeta } from "@/lib/server/task-fs";
 
 export const runtime = "nodejs";
 
@@ -39,7 +39,8 @@ export const GET = async (req: Request) => {
     return errorResponse(`q 最长 ${REPO_FILES_Q_MAX_LEN} 字符`);
   }
 
-  const task = await getTask(taskId);
+  // `@` 联想每个按键都会来一次：只需要 repoPaths，读 meta 即可，别每次整文件 parse 事件日志
+  const task = await getTaskMeta(taskId);
   if (!task) {
     return errorResponse("任务不存在", 404);
   }

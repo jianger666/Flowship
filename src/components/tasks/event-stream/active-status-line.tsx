@@ -3,64 +3,63 @@
 /**
  * 运行中粘性状态行（CHAT-REDESIGN Batch B）
  *
- * Composer 上方一行：当前步骤 label + 可选 detail。
- * globals.css 无现成 shimmer keyframes，本组件内联 @keyframes，避免为单行动画改全局。
- * 纯展示、无内部状态；Batch C 接线挂 Composer。
+ * Composer 上方一行：当前步骤 label + 可选已等待秒数 + 可选 detail。
+ * 动效收敛（事件流 v2）：整行只有 label 的 shimmer 一处在动——左边的点是静态 info 色点
+ * （旧版这里还有一个脉冲点，加上组头 / 成员 spinner 同屏三四处同时在动，抢注意力）。
+ * shimmer 的 keyframes 在 globals.css（.status-shimmer），prefers-reduced-motion 下整体静态。
  *
- * `status.settled`（回复已完整、只剩 SDK 收尾）走静态打勾版：不闪烁、不带脉冲点——
- * 动画会让人以为 AI 还在写，而这个态的意思恰恰是「可以读了」。
+ * 唯一的内部状态是「已等待」走字：status 带 sinceTs（工具执行中 / 子代理 / 工具跑完等模型）时，
+ * 每秒刷新一次、等够 3 秒才显示「· 12s」，让人随时能回答「等了多久、是不是卡住了」。
+ * 没有 sinceTs 的状态（启动 / 思考 / 回复 / 压缩）不起定时器、整个组件仍是纯展示。
  */
 
-import { Check } from "lucide-react";
+import { useEffect, useState } from "react";
 
-import type { ActiveStatus } from "@/lib/chat-turns";
+import { type ActiveStatus, formatStatusElapsed } from "@/lib/chat-turns";
 import { cn } from "@/lib/utils";
 
-/** 组件级 keyframes 名：避免与全局动画撞名 */
-const SHIMMER_ANIM = "active-status-shimmer";
+/** 走字刷新间隔：秒级显示，1s 足够，比 PendingRow 的 500ms 省一半重渲染 */
+const ELAPSED_TICK_MS = 1000;
 
-const SettledStatusLine = ({ status }: { status: ActiveStatus }) => (
-  <div
-    className="flex h-7 min-w-0 items-center gap-2 px-1 text-xs text-muted-foreground"
-    role="status"
-  >
-    <Check className="size-3.5 shrink-0 text-success" aria-hidden />
-    <span className="shrink-0">{status.label}</span>
-    {status.detail ? (
-      <span className="min-w-0 flex-1 truncate text-muted-foreground/70">
-        {status.detail}
-      </span>
-    ) : null}
-  </div>
-);
+/**
+ * 距 sinceTs 已过去的毫秒数；sinceTs 缺省 = 这一步不计时（返回 null、不起定时器）。
+ * sinceTs 变化 = 换了一步（比如一个工具跑完、下一个开始），立刻按新起点重算、重新开始走字。
+ */
+const useElapsedMs = (sinceTs: number | undefined): number | null => {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (sinceTs === undefined) return;
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), ELAPSED_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [sinceTs]);
+  // 本机时钟和事件 ts 理论上同源，但容许轻微回拨 / 先于落盘的差值：钳到 0
+  return sinceTs === undefined ? null : Math.max(0, now - sinceTs);
+};
 
 export const ActiveStatusLine = ({ status }: { status: ActiveStatus }) => {
-  if (status.settled) return <SettledStatusLine status={status} />;
+  const elapsedMs = useElapsedMs(status.sinceTs);
+  const elapsed = elapsedMs === null ? null : formatStatusElapsed(elapsedMs);
   return (
     <div className="flex h-7 min-w-0 items-center gap-2 px-1 text-xs">
-      {/* 内联 keyframes：globals 无 shimmer，不改全局文件 */}
-      <style>{`
-      @keyframes ${SHIMMER_ANIM} {
-        0% { background-position: 200% center; }
-        100% { background-position: -200% center; }
-      }
-    `}</style>
-      {/* 左侧动效点：细小脉冲，不抢 label shimmer */}
-      <span
-        className="size-1.5 shrink-0 rounded-full bg-foreground/50 animate-pulse"
-        aria-hidden
-      />
+      {/* 静态 info 色点（running = info）：不动，动效留给 label 的 shimmer */}
+      <span className="size-1.5 shrink-0 rounded-full bg-info" aria-hidden />
       <span
         className={cn(
-          "shrink-0 bg-gradient-to-r from-muted-foreground via-foreground to-muted-foreground",
+          "status-shimmer shrink-0 bg-gradient-to-r from-muted-foreground via-foreground to-muted-foreground",
           "bg-[length:200%_100%] bg-clip-text text-transparent",
         )}
-        style={{ animation: `${SHIMMER_ANIM} 2s linear infinite` }}
       >
         {status.label}
       </span>
+      {elapsed ? (
+        // tabular-nums：数字等宽，逐秒走字时不抖动后面的 detail
+        <span className="shrink-0 tabular-nums text-muted-foreground">
+          · {elapsed}
+        </span>
+      ) : null}
       {status.detail ? (
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground/70">
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
           {status.detail}
         </span>
       ) : null}

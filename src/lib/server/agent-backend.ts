@@ -28,6 +28,12 @@ import {
 import { withoutHiddenModelSelection } from "@/lib/model-params";
 import { isCursorProvider } from "@/lib/types";
 
+import { CURSOR_SUBAGENT_TOOL_NAME } from "@/lib/cursor-subagent-display";
+
+import {
+  createCursorSubagentLinkForSession,
+  type SubagentLink,
+} from "./cursor-subagent";
 import type { CustomAgentInput } from "./custom-agent-backend";
 import { withFlowshipSdkCustomTools } from "./flowship-tools";
 import { withCursorJsonlStore } from "./sdk-agent-store";
@@ -102,15 +108,36 @@ const stripFacadeExtras = <T extends FacadeExtras>(
   return { providerId, callerToken, readOnly, taskId, rest };
 };
 
-/** Cursor 路径：正式会话把系统工具挂进 local.customTools */
-const attachFlowshipTools = <T extends { local?: CursorCreateInput["local"] }>(
+/**
+ * Cursor 路径：正式会话把系统工具挂进 local.customTools。
+ * 同时挂 `subagent`（能指定模型 / effort 的子代理，原生 task 做不到）——只在挂系统工具时
+ * 才有（oneshot / 受限答疑 / 只读轮次没有 callerToken，也就没有子代理）。
+ * 返回的 link 要在 agent 创建后 `attach(agent)`，把父 run 的取消联动到子 run。
+ */
+const attachFlowshipTools = <
+  T extends {
+    local?: CursorCreateInput["local"];
+    apiKey?: string;
+    model?: CursorCreateInput["model"];
+  },
+>(
   input: T,
   callerToken: string | undefined,
-): T => {
-  if (!callerToken) return input;
+): { input: T; subagent: SubagentLink | undefined } => {
+  if (!callerToken) return { input, subagent: undefined };
+  const subagent = createCursorSubagentLinkForSession({
+    apiKey: input.apiKey ?? "",
+    parentModel: input.model,
+    cwd: input.local?.cwd,
+  });
   return {
-    ...input,
-    local: withFlowshipSdkCustomTools(input.local, callerToken),
+    input: {
+      ...input,
+      local: withFlowshipSdkCustomTools(input.local, callerToken, {
+        [CURSOR_SUBAGENT_TOOL_NAME]: subagent.tool,
+      }),
+    },
+    subagent,
   };
 };
 
@@ -205,10 +232,10 @@ export const Agent = {
         ...(taskId ? { taskId } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
-    const withTools = await withCursorJsonlStore(
-      attachFlowshipTools(sanitized, effectiveCallerToken),
-    );
-    return CursorAgent.create(withTools);
+    const attached = attachFlowshipTools(sanitized, effectiveCallerToken);
+    const withTools = await withCursorJsonlStore(attached.input);
+    const agent = await CursorAgent.create(withTools);
+    return attached.subagent ? attached.subagent.attach(agent) : agent;
   },
 
   async resume(
@@ -237,10 +264,12 @@ export const Agent = {
         ...(taskId ? { taskId } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
-    const withToolsResume = await withCursorJsonlStore(
-      attachFlowshipTools(sanitized, effectiveCallerToken),
-    );
-    return CursorAgent.resume(agentId, withToolsResume);
+    const attachedResume = attachFlowshipTools(sanitized, effectiveCallerToken);
+    const withToolsResume = await withCursorJsonlStore(attachedResume.input);
+    const agent = await CursorAgent.resume(agentId, withToolsResume);
+    return attachedResume.subagent
+      ? attachedResume.subagent.attach(agent)
+      : agent;
   },
 
   async prompt(

@@ -242,7 +242,7 @@ const CustomProviderRow = ({
           <span
             className={cn(
               "truncate text-xs",
-              ready ? "text-foreground/80" : "text-muted-foreground",
+              ready ? "text-foreground" : "text-muted-foreground",
             )}
           >
             {summary}

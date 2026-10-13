@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  analyzingToolLabel,
   deriveActiveStatus,
+  formatStatusElapsed,
   groupChatRenderItems,
   isLatestErrorEvent,
   isWorkGroup,
   PROCESSING_PLACEHOLDER_LABEL,
-  TURN_WRAP_UP_STATUS,
   shouldShowProcessingPlaceholder,
+  STATUS_ELAPSED_SHOW_AFTER_MS,
   type WorkGroupItem,
 } from "../src/lib/chat-turns";
 import type { StreamRenderItem, ToolBlock, ToolVerbGroup } from "../src/lib/tool-display";
@@ -405,9 +407,11 @@ describe("deriveActiveStatus", () => {
       [ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }), call],
       { cid1: "line1\nline2 final out" },
     );
+    // sinceTs = 这条 tool_call 的 ts：状态行据此显示「已执行多久」
     expect(withLive).toEqual({
       label: "正在执行 shell",
       detail: "line2 final out",
+      sinceTs: 2,
     });
 
     const noLive = deriveActiveStatus([
@@ -418,7 +422,7 @@ describe("deriveActiveStatus", () => {
     expect(noLive?.detail).toMatch(/pnpm lint/);
   });
 
-  it("thinking 尾 → 思考中 + 末行截断", () => {
+  it("thinking 尾 → 思考中（不带原文：原文在组内思考行里，状态行再摘一行就是上下重复）", () => {
     const status = deriveActiveStatus([
       ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
       ev({
@@ -429,10 +433,10 @@ describe("deriveActiveStatus", () => {
       }),
     ]);
     expect(status?.label).toBe("思考中");
-    expect(status?.detail).toBe("第二行很长的思考内容");
+    expect(status?.detail).toBeUndefined();
   });
 
-  it("纯 assistant → 正在回复…；已完成工具 → 处理中…", () => {
+  it("纯 assistant → 正在回复…；已完成工具 → 正在分析 read 的结果（带起点时间）", () => {
     expect(
       deriveActiveStatus([
         ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
@@ -462,7 +466,8 @@ describe("deriveActiveStatus", () => {
         },
       }),
     ]);
-    expect(done).toEqual({ label: PROCESSING_PLACEHOLDER_LABEL });
+    // 等待从「工具结果落盘」(ts=3) 算起，不是从 tool_call (ts=2) 算起——工具自己的耗时不算进空等
+    expect(done).toEqual({ label: "正在分析 read 的结果", sinceTs: 3 });
   });
 
   it("正文已在流时，已完成工具改口正在回复…", () => {
@@ -488,12 +493,12 @@ describe("deriveActiveStatus", () => {
     });
   });
 
-  it("user_reply 后无活动 → 正在启动…", () => {
+  it("user_reply 后无活动 → 正在启动…（带让位标记：流尾有进度行时状态行不再重复说）", () => {
     expect(
       deriveActiveStatus([
         ev({ id: "u", kind: "user_reply", text: "刚发", ts: 1 }),
       ]),
-    ).toEqual({ label: "正在启动…" });
+    ).toEqual({ label: "正在启动…", yieldToTail: true });
 
     // 尾部只有 info，再往前是 user_reply
     expect(
@@ -501,7 +506,7 @@ describe("deriveActiveStatus", () => {
         ev({ id: "u", kind: "user_reply", text: "刚发", ts: 1 }),
         ev({ id: "i", kind: "info", text: "boot", ts: 2 }),
       ]),
-    ).toEqual({ label: "正在启动…" });
+    ).toEqual({ label: "正在启动…", yieldToTail: true });
   });
 
   it("task 子代理工具 → 子代理工作中 + description", () => {
@@ -525,6 +530,7 @@ describe("deriveActiveStatus", () => {
     expect(status).toEqual({
       label: "子代理工作中",
       detail: "排查 auth",
+      sinceTs: 2,
     });
   });
 
@@ -603,30 +609,131 @@ describe("deriveActiveStatus", () => {
     ).toEqual({ label: "正在回复…" });
   });
 
-  it("settled 只属于回合收尾提示：deriveActiveStatus 自己永远不产出静态打勾态", () => {
-    // 回合收尾提示由 server 的 turn-ended 信号驱动、在 UI 层单独注入（TURN_WRAP_UP_STATUS），
-    // 普通的回扫推断必须仍是会闪烁的「进行中」文案——否则没写完的回复会被打上勾
-    expect(TURN_WRAP_UP_STATUS).toEqual({
-      label: "回复已完成",
-      detail: "正在保存会话…",
-      settled: true,
+  describe("工具跑完等模型：点名上一个工具 + 带起点时间（原来只有一句「处理中…」）", () => {
+    const user = ev({ id: "u", kind: "user_reply", text: "q", ts: 1 });
+    const call = (id: string, callId: string, name: string, ts: number) =>
+      ev({ id, kind: "tool_call", text: `调用 ${name}`, ts, meta: { callId, name, args: "{}" } });
+    const result = (id: string, callId: string, name: string | undefined, ts: number) =>
+      ev({
+        id,
+        kind: "tool_result",
+        text: "完成",
+        ts,
+        meta: { callId, ...(name ? { name } : {}), status: "success" },
+      });
+
+    it("串行多个工具：点名最后一个、起点是它的结果落盘时刻（更早已配对的不干扰）", () => {
+      const status = deriveActiveStatus([
+        user,
+        call("c1", "a", "grep", 2),
+        result("r1", "a", "grep", 3),
+        call("c2", "b", "read", 10),
+        result("r2", "b", "read", 14),
+      ]);
+      expect(status).toEqual({ label: "正在分析 read 的结果", sinceTs: 14 });
     });
-    const samples: TaskEvent[][] = [
-      [ev({ id: "u", kind: "user_reply", text: "hi" })],
-      [
-        ev({ id: "u", kind: "user_reply", text: "hi" }),
-        ev({ id: "a", kind: "assistant_message", text: "回复" }),
-      ],
-      [
-        ev({ id: "u", kind: "user_reply", text: "hi" }),
-        ev({ id: "t", kind: "thinking", text: "想" }),
-      ],
-    ];
-    for (const events of samples) {
-      expect(deriveActiveStatus(events)?.settled).toBeUndefined();
-      expect(deriveActiveStatus(events, undefined, { streaming: true })?.settled)
-        .toBeUndefined();
-    }
+
+    it("tool_result 缺 name 时按 callId 回查 tool_call 的工具名", () => {
+      const status = deriveActiveStatus([
+        user,
+        call("c1", "a", "shell", 2),
+        result("r1", "a", undefined, 9),
+      ]);
+      expect(status).toEqual({ label: "正在分析 shell 的结果", sinceTs: 9 });
+    });
+
+    it("连工具名都没有 → 退回「处理中…」兜底，但仍带起点时间", () => {
+      const status = deriveActiveStatus([
+        user,
+        ev({ id: "r1", kind: "tool_result", text: "完成", ts: 7, meta: { callId: "z" } }),
+      ]);
+      expect(status).toEqual({ label: PROCESSING_PLACEHOLDER_LABEL, sinceTs: 7 });
+    });
+
+    it("并行工具：还有 tool_call 没配上结果时说不清是哪个——不乱点名，退回「处理中…」", () => {
+      const status = deriveActiveStatus([
+        user,
+        call("c1", "a", "read", 2),
+        call("c2", "b", "grep", 3),
+        result("r1", "a", "read", 5),
+      ]);
+      // 尾部扫到 read 的结果就停；grep 还没回来 → 点 read 会误导（其实还在等 grep）
+      expect(status).toEqual({ label: PROCESSING_PLACEHOLDER_LABEL, sinceTs: 5 });
+    });
+
+    it("工具名过长按 28 字截断（MCP 工具名可以很长，别把整行顶满）", () => {
+      const longName = "mcp__some_server__" + "get_document_blocks_".repeat(4);
+      const status = deriveActiveStatus([
+        user,
+        call("c1", "a", longName, 2),
+        result("r1", "a", longName, 3),
+      ]);
+      expect(status?.label.startsWith("正在分析 ")).toBe(true);
+      expect(status?.label.endsWith("… 的结果")).toBe(true);
+      // 「正在分析 」+ 28 字 + 「…」+「 的结果」
+      expect(status!.label.length).toBeLessThanOrEqual(5 + 28 + 1 + 4);
+    });
+
+    it("起点时间只给三类空窗：启动 / 思考 / 回复 / 压缩都不带（不重复计时）", () => {
+      const noSince = (events: TaskEvent[], streaming = false) => {
+        const s = deriveActiveStatus(events, undefined, { streaming });
+        expect(s).not.toBeNull();
+        expect(s).not.toHaveProperty("sinceTs");
+      };
+      noSince([user]);
+      noSince([user, ev({ id: "t", kind: "thinking", text: "想", ts: 2 })]);
+      noSince([user, ev({ id: "a", kind: "assistant_message", text: "答", ts: 2 })]);
+      noSince(
+        [
+          user,
+          ev({
+            id: "c",
+            kind: "info",
+            text: "正在压缩上下文…",
+            ts: 2,
+            meta: { kind: "compaction", status: "running" },
+          }),
+        ],
+        true,
+      );
+      // 正文已在流时，工具刚跑完改口「正在回复…」，同样不带
+      noSince([user, call("c1", "a", "read", 2), result("r1", "a", "read", 3)], true);
+    });
+
+    it("事件 ts 是脏值（NaN / 缺省）→ 不带 sinceTs，状态行就不走字（不显示 NaNs）", () => {
+      const status = deriveActiveStatus([
+        user,
+        call("c1", "a", "read", 2),
+        { ...result("r1", "a", "read", 3), ts: Number.NaN },
+      ]);
+      expect(status).toEqual({ label: "正在分析 read 的结果" });
+      expect(status).not.toHaveProperty("sinceTs");
+    });
+
+    it("文案出口只有 analyzingToolLabel 一个（改措辞不用满仓库找）", () => {
+      expect(analyzingToolLabel("read")).toBe("正在分析 read 的结果");
+    });
+  });
+});
+
+describe("formatStatusElapsed：状态行走字秒数", () => {
+  it("不到门槛（3s）一律不显示：瞬时工具别闪数字", () => {
+    expect(STATUS_ELAPSED_SHOW_AFTER_MS).toBe(3000);
+    expect(formatStatusElapsed(0)).toBeNull();
+    expect(formatStatusElapsed(1000)).toBeNull();
+    expect(formatStatusElapsed(2999)).toBeNull();
+  });
+
+  it("够门槛后按秒级口径：3s / 12s / 59s / 1m0s / 2m14s", () => {
+    expect(formatStatusElapsed(3000)).toBe("3s");
+    expect(formatStatusElapsed(12_000)).toBe("12s");
+    expect(formatStatusElapsed(59_000)).toBe("59s");
+    expect(formatStatusElapsed(60_000)).toBe("1m0s");
+    expect(formatStatusElapsed(134_000)).toBe("2m14s");
+  });
+
+  it("脏值（NaN）不显示", () => {
+    expect(formatStatusElapsed(Number.NaN)).toBeNull();
   });
 });
 
@@ -659,5 +766,18 @@ describe("shouldShowProcessingPlaceholder", () => {
     expect(shouldShowProcessingPlaceholder({ ...on, isRunning: false })).toBe(
       false,
     );
+  });
+
+  it("输入框上方的状态行已经画出来 → 组尾让位（同一句「处理中」不上下各说一遍）", () => {
+    expect(
+      shouldShowProcessingPlaceholder({ ...on, statusLineVisible: true }),
+    ).toBe(false);
+  });
+
+  it("没有状态行（task 形态 / 隐藏输入区）→ 组尾仍兜底；缺省按没有状态行算", () => {
+    expect(
+      shouldShowProcessingPlaceholder({ ...on, statusLineVisible: false }),
+    ).toBe(true);
+    expect(shouldShowProcessingPlaceholder(on)).toBe(true);
   });
 });

@@ -24,7 +24,7 @@
 
 > 注意：8776 是「测试桌面包」的端口、**不是**独立网页服务。想网页热更请走 `pnpm dev:web`（8676），不要直接用 8876（正式包占用）或去碰打包。
 
-> ⚠️ agent shell 环境坑：宿主（Electron）拉起 app-server 时注入了 `ELECTRON_RUN_AS_NODE=1`、`PORT`、`HOSTNAME`、`FLOWSHIP_DATA_DIR`、`__NEXT_PRIVATE_STANDALONE_CONFIG` 等变量。带着这些裸启动 Electron 二进制 / `open xxx.app` 会静默秒退（被当纯 node 跑）、`next build/dev` 会报 `generate is not a function`。shell 工具已统一走 `stripHostInjectedEnv()` 清洗（见 `src/lib/server/host-env.ts`）；自写脚本要 spawn 子进程时也应传清洗后的 env，参考 `scripts/electron-test-restart.mjs` 的 `cleanEnv()`。
+> ⚠️ agent shell 环境坑：宿主（Electron）拉起 app-server 时注入了 `ELECTRON_RUN_AS_NODE=1`、`PORT`、`HOSTNAME`、`FLOWSHIP_DATA_DIR`、`__NEXT_PRIVATE_STANDALONE_CONFIG` 等变量。带着这些裸启动 Electron 二进制 / `open xxx.app` 会静默秒退（被当纯 node 跑）、`next build/dev` 会报 `generate is not a function`。`stripHostInjectedEnv()`（见 `src/lib/server/host-env.ts`）**只清洗了 pi provider 的 shell 工具**；**Cursor provider 的本地 agent shell 由 Cursor SDK 内部拉起，SDK（1.0.37）没有给本地 agent 的 env 选项，会原样继承 server 的整份 env**——实测 `PORT=8876`、`HOSTNAME`、`FLOWSHIP_DATA_DIR=<正式数据目录>`、`__NEXT_PRIVATE_*` 都在。所以在 Cursor 会话的 shell 里，凡是会碰数据目录 / 端口的命令（`next dev/build`、起服务、手写脚本）先清：`env -u ELECTRON_RUN_AS_NODE -u FLOWSHIP_DATA_DIR -u FLOWSHIP_PORT -u PORT -u HOSTNAME -u __NEXT_PRIVATE_STANDALONE_CONFIG -u __NEXT_PRIVATE_ORIGIN -u NEXT_DEPLOYMENT_ID <命令>`。**vitest 不用自己清**：`tests/setup/hermetic-env.ts` 在每个测试 worker 起跑前把数据目录指到临时目录并剔掉这些变量，`task-fs` 的 `ensureBootRecovery` 另有运行时防线（VITEST 下数据目录若是正式 userData 就拒绝执行 boot-recovery，判定见 `src/lib/server/app-data-dir.ts`），跑测试不会再改到正式数据里的任务状态。自写脚本要 spawn 子进程时也应传清洗后的 env，参考 `scripts/electron-test-restart.mjs` 的 `cleanEnv()`。
 
 ### 默认：网页热更新（最快）
 

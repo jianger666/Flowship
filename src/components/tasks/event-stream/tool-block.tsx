@@ -12,7 +12,6 @@ import { memo, useMemo, useState } from "react";
 import {
   Bot,
   Check,
-  ChevronRight,
   Circle,
   CircleSlash,
   FileCode2,
@@ -57,12 +56,17 @@ import {
   type ToolBlock,
   type ToolVerbGroup,
 } from "@/lib/tool-display";
+import {
+  CollapseChevron,
+  PROCESS_BODY_RAIL,
+  PROCESS_ROW_BUTTON,
+} from "./stream-style";
 import { formatTs } from "./utils";
 
 // ---------- 干净 diff 视图（解析层 parseUnifiedDiff；双列行号 + 无 @@ 原文）----------
 
 const DIFF_LINE_NUM_CLASS =
-  "w-8 shrink-0 select-none pr-1 text-right tabular-nums text-muted-foreground/50";
+  "w-8 shrink-0 select-none pr-1 text-right tabular-nums text-muted-foreground";
 
 /**
  * diff 行号格。给了 linker + filePath 的那一列可点、跳 IDE 对应行。
@@ -108,7 +112,7 @@ const DiffLine = ({
     return (
       <div className="flex select-none items-center gap-2 px-2 py-1">
         <div className="h-px flex-1 border-t border-dashed border-border/60" />
-        <span className="text-[11px] leading-none text-muted-foreground/50">
+        <span className="text-[11px] leading-none text-muted-foreground">
           ⋯
         </span>
         <div className="h-px flex-1 border-t border-dashed border-border/60" />
@@ -156,7 +160,7 @@ const InlineDiff = ({
       label="复制 diff"
       className="mt-1.5 min-w-0 max-w-full"
     >
-      <div className="max-h-64 w-full max-w-full overflow-auto rounded-md border border-border/60 bg-muted/20">
+      <div className="max-h-64 w-full max-w-full overflow-auto rounded-md border border-border bg-card">
         {/* min-w-max：横滚内容宽 = 最长行，行级 diff 高亮铺满整行（否则背景只到容器宽、右侧无底色） */}
         <div className="min-w-max">
           {lines.map((line, i) => (
@@ -172,17 +176,6 @@ const InlineDiff = ({
     </CopyableBlock>
   );
 };
-
-// ---------- chevron：统一旋转动效 ----------
-
-const CollapseChevron = ({ open }: { open: boolean }) => (
-  <ChevronRight
-    className={cn(
-      "size-3 shrink-0 opacity-50 transition-transform duration-150",
-      open && "rotate-90",
-    )}
-  />
-);
 
 // ---------- 单工具块 ----------
 
@@ -345,20 +338,16 @@ const ExpandedEmptyPlaceholder = ({
 }) => {
   if (status === "running") {
     return (
-      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80">
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
         <Loader2 className="size-3 shrink-0 animate-spin" />
         <span>等待输出…</span>
       </div>
     );
   }
   if (status === "interrupted") {
-    return (
-      <div className="text-[11px] text-muted-foreground/70">已中断</div>
-    );
+    return <div className="text-[11px] text-muted-foreground">已中断</div>;
   }
-  return (
-    <div className="text-[11px] text-muted-foreground/70">无输出</div>
-  );
+  return <div className="text-[11px] text-muted-foreground">无输出</div>;
 };
 
 /**
@@ -449,6 +438,7 @@ const TaskSubagentBlock = ({
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
+          aria-expanded={!collapsed}
           className="flex w-full cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-subagent/[0.08] hover:text-foreground"
         >
           <CollapseChevron open={!collapsed} />
@@ -458,22 +448,29 @@ const TaskSubagentBlock = ({
           <span className="shrink-0 rounded-sm bg-subagent/15 px-1.5 py-px text-[11px] font-semibold tracking-wide text-subagent">
             子代理
           </span>
-          <span className="min-w-0 shrink truncate text-[11px] font-medium text-foreground/90">
+          <span className="min-w-0 shrink truncate text-[11px] font-medium text-foreground">
             {title}
           </span>
-          {/* 模型徽标：args.model 有值才显示；历史缺 model 不硬造 */}
+          {/* 模型徽标：args.model 有值才显示；历史缺 model 不硬造。
+              effort 同理。徽标显示的是模型传的入参：pi 的 task 校验不过会整个调用报错
+              （卡片是错误态、没起子会话），所以非错误态卡片上的徽标 = 实际生效值 */}
           {taskArgs?.model && (
-            <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-subagent/90">
+            <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-subagent">
               {taskArgs.model}
+            </span>
+          )}
+          {taskArgs?.effort && (
+            <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-muted-foreground">
+              {taskArgs.effort}
             </span>
           )}
           {statusIcon}
           {collapsed && liveTail && (
-            <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">
+            <span className="min-w-0 flex-1 truncate text-[11px]">
               {liveTail}
             </span>
           )}
-          <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+          <span className="ml-auto shrink-0 text-[11px] tabular-nums opacity-0 transition-opacity group-hover/tool:opacity-100 group-focus-within/tool:opacity-100">
             {formatTs(block.ts)}
           </span>
         </button>
@@ -482,7 +479,7 @@ const TaskSubagentBlock = ({
           <div className="space-y-2.5 px-3 pb-3 pt-0.5">
             {/* 任务书 */}
             <div className="space-y-1">
-              <div className="text-[11px] font-medium tracking-wide text-subagent/80">
+              <div className="text-[11px] font-medium tracking-wide text-subagent">
                 任务书
               </div>
               {prompt ? (
@@ -504,17 +501,17 @@ const TaskSubagentBlock = ({
                   )}
                 </div>
               ) : (
-                <div className="text-[11px] text-muted-foreground/70">无任务书</div>
+                <div className="text-[11px] text-muted-foreground">无任务书</div>
               )}
             </div>
 
             {/* 产出：完成态 markdown；running 用 pre 防流式闪烁 */}
             <div className="space-y-1">
-              <div className="text-[11px] font-medium tracking-wide text-subagent/80">
+              <div className="text-[11px] font-medium tracking-wide text-subagent">
                 产出
               </div>
               {block.status === "running" && !displayOutput ? (
-                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80">
+                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
                   <Loader2 className="size-3 shrink-0 animate-spin text-info" />
                   <span>运行中…</span>
                 </div>
@@ -542,7 +539,8 @@ const TaskSubagentBlock = ({
                             {outputBody}
                           </pre>
                         ) : (
-                          <div className="text-xs leading-relaxed text-foreground/90 [&_.prose]:text-xs">
+                          // --prose-code-size：这个容器是 12px 档，代码块跟着降一档（默认 14px 会比周围正文还大）
+                          <div className="text-xs leading-relaxed text-foreground [--prose-code-size:0.75rem] [&_.prose]:text-xs">
                             <MarkdownText text={outputBody ?? ""} baseDir={markdownBaseDir} />
                           </div>
                         )}
@@ -658,17 +656,18 @@ const RegularToolBlockRow = ({
       <button
         type="button"
         onClick={() => setManualCollapsed(!collapsed)}
-        className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+        aria-expanded={!collapsed}
+        className={PROCESS_ROW_BUTTON}
       >
         <CollapseChevron open={!collapsed} />
         <ToolBlockIcon block={block} />
-        <span className="shrink-0 font-medium text-[11px] text-foreground/80">
+        <span className="shrink-0 font-medium text-foreground">
           {block.name}
         </span>
         {collapsed && (liveTail || summary) && (
           <span
             className={cn(
-              "min-w-0 flex-1 truncate text-[11px] opacity-80",
+              "min-w-0 flex-1 truncate",
               // shell 命令 / 路径用 mono，一眼可辨
               (block.name.toLowerCase() === "shell" ||
                 block.name.toLowerCase() === "edit" ||
@@ -685,23 +684,28 @@ const RegularToolBlockRow = ({
           <IdePathLink
             linker={linker}
             path={block.result.filePath}
-            className="min-w-0 flex-1 truncate font-mono text-[11px] opacity-80"
+            className="min-w-0 flex-1 truncate font-mono"
           />
         )}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           {statusBits.length > 0 && block.status !== "running" && (
-            <span className="text-[11px] tabular-nums text-muted-foreground/80">
+            <span className="text-[11px] tabular-nums text-muted-foreground">
               {statusBits.join(" · ")}
             </span>
           )}
-          <span className="text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+          <span className="text-[11px] tabular-nums opacity-0 transition-opacity group-hover/tool:opacity-100 group-focus-within/tool:opacity-100">
             {formatTs(block.ts)}
           </span>
         </span>
       </button>
 
       {!collapsed && (
-        <div className="ml-5 mt-1 min-w-0 max-w-full space-y-1.5 border-l border-border/50 pl-3">
+        <div
+          className={cn(
+            "ml-5 mt-1 min-w-0 max-w-full space-y-1.5",
+            PROCESS_BODY_RAIL,
+          )}
+        >
           {/* 一层：可读命令 / 路径；无 detailLine 时用 args 截断兜底 */}
           {(detailLine || (!displayOutput && !diff && argsPreview)) && (
             <div
@@ -784,7 +788,7 @@ const RegularToolBlockRow = ({
                   label="复制输出"
                   className="mt-1"
                 >
-                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border bg-card p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
                     {fullText ?? displayOutput}
                   </pre>
                 </CopyableBlock>
@@ -848,7 +852,8 @@ const TodoToolBlock = ({
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
-        className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+        aria-expanded={!collapsed}
+        className={PROCESS_ROW_BUTTON}
       >
         <CollapseChevron open={!collapsed} />
         <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-info/15">
@@ -857,17 +862,15 @@ const TodoToolBlock = ({
         <span className="shrink-0 rounded-sm bg-info/15 px-1.5 py-px text-[11px] font-semibold tracking-wide text-info">
           待办
         </span>
-        <span className="min-w-0 flex-1 truncate text-[11px] tabular-nums opacity-80">
-          {summary}
-        </span>
+        <span className="min-w-0 flex-1 truncate tabular-nums">{summary}</span>
         {statusIcon}
-        <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+        <span className="ml-auto shrink-0 text-[11px] tabular-nums opacity-0 transition-opacity group-hover/tool:opacity-100 group-focus-within/tool:opacity-100">
           {formatTs(block.ts)}
         </span>
       </button>
 
       {!collapsed && (
-        <ul className="ml-5 mt-1 space-y-1 border-l border-border/50 pl-3">
+        <ul className={cn("ml-5 mt-1 space-y-1", PROCESS_BODY_RAIL)}>
           {todos.map((item, i) => (
             <TodoToolItemRow key={i} item={item} />
           ))}
@@ -891,7 +894,7 @@ const TodoToolItemRow = ({ item }: { item: TodoItem }) => {
           className={cn(
             "min-w-0 flex-1 truncate text-xs leading-5",
             done && "text-muted-foreground line-through",
-            cancelled && "text-muted-foreground/70 line-through",
+            cancelled && "text-muted-foreground line-through",
             active && "font-medium text-foreground",
             !done && !cancelled && !active && "text-muted-foreground",
           )}
@@ -920,11 +923,11 @@ const TodoStatusIcon = ({ status }: { status: TodoItem["status"] }) => {
   }
   if (status === "cancelled") {
     return (
-      <CircleSlash className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/60" />
+      <CircleSlash className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
     );
   }
   // pending：空心圈
-  return <Circle className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/50" />;
+  return <Circle className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />;
 };
 
 const ToolBlockRowImpl = (props: ToolBlockRowProps) => {
@@ -957,19 +960,18 @@ const ToolVerbGroupRowImpl = ({
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
-        className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground/70 transition-colors hover:bg-muted/40 hover:text-muted-foreground"
+        aria-expanded={!collapsed}
+        className={PROCESS_ROW_BUTTON}
       >
         <CollapseChevron open={!collapsed} />
-        <Check className="size-3.5 shrink-0 text-success/80" />
-        <span className="min-w-0 flex-1 truncate text-[11px]">
-          {verbGroupLabel(group)}
-        </span>
-        <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/verb:opacity-60">
+        <Check className="size-3.5 shrink-0 text-success" />
+        <span className="min-w-0 flex-1 truncate">{verbGroupLabel(group)}</span>
+        <span className="ml-auto shrink-0 text-[11px] tabular-nums opacity-0 transition-opacity group-hover/verb:opacity-100 group-focus-within/verb:opacity-100">
           {formatTs(group.ts)}
         </span>
       </button>
       {!collapsed && (
-        <div className="ml-5 mt-0.5 space-y-0.5 border-l border-border/40 pl-2">
+        <div className="ml-5 mt-0.5 space-y-0.5 border-l border-border pl-2">
           {group.members.map((m) => (
             <ToolBlockRow
               key={m.id}

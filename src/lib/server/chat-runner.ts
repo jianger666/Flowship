@@ -101,12 +101,17 @@ import { resolveEffectiveGitHost } from "./gitlab-host";
 import { readSettingsFile } from "./settings-fs";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
-import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
+import {
+  buildRunNotFinishedError,
+  isRetryableRunError,
+  summarizeRunFailure,
+} from "./sdk-error";
 import {
   SDK_CREATE_RESUME_TIMEOUT_MS,
   SDK_SEND_TIMEOUT_MS,
   withSdkDeadline,
 } from "./sdk-deadline";
+import { CANCEL_WAIT_GRACE_MS, createCancelEscape } from "./run-wait";
 import { finalizeOpenToolCalls } from "./finalize-open-tools";
 import {
   allocTaskRunInstanceId,
@@ -514,34 +519,17 @@ const publish = (taskId: string, ev: TaskStreamEvent): void => {
 // chat-inject 的续聊（resume）路径也要发，不必为此再让 chat-runner 多导出一个函数。
 
 /**
- * 回合已结束（SDK 发了 turn-ended、回复已完整落盘）却迟迟没收尾时的提示门槛。
- * 正常 turn-ended → FINISHED 约 0.3s（SDK 在存 checkpoint）；超过它就是异常空窗，
- * 此时用户只看到「回复完了、还在转圈」——给个明确信号，别让他干等。
+ * 「回合结束 → SDK 真正收尾」的慢收尾门槛。正常 turn-ended → FINISHED 约 0.3s（SDK 在存 checkpoint）；
+ * 超过它就是异常空窗，记一条 turn-wrapup.jsonl 取证。
  */
-const TURN_WRAP_UP_NOTICE_MS = 3_000;
-
-/**
- * 回合结束后的收尾提示（ephemeral、不落盘）：meta.turnWrapUp 供前端
- * lib/chat-stream-display.hasActiveTurnWrapUp 识别；run 一结束前端自然清掉。
- */
-const publishTurnWrapUp = (taskId: string, lease: () => boolean): void => {
-  if (!lease()) return;
-  publish(taskId, {
-    kind: "event",
-    event: {
-      id: `ephemeral_wrapup_${Date.now()}`,
-      ts: Date.now(),
-      kind: "info",
-      text: "回复已完成，正在保存会话…",
-      meta: { turnWrapUp: true },
-    },
-  });
-};
+const TURN_WRAP_UP_SLOW_MS = 3_000;
 
 /**
  * 「回合结束 → SDK 真正收尾」的异常取证（turn-wrapup.jsonl）：
- * 收尾慢（>3s）/ SDK 重放过（usage>1）/ 丢过重放消息才记；正常 ~0.3s 不写，零噪音。
- * perf-report 据此回答「重复回复 / 迟迟不结束」到底还发不发生、发生时卡多久。
+ * 收尾慢（>3s）/ SDK 在同一条流上又跑了一轮（usage>1）才记；正常 ~0.3s 不写，零噪音。
+ * **只观测，不干预**：不丢重放的消息、不给用户打提示——v1.9.29 做过（丢重放 + 静态「回复已完成，
+ * 正在保存会话…」），2026-10-12 按用户决定整套撤掉，原因见 docs/HANDOFF.md。
+ * perf-report 据此回答「重复回复 / 迟迟不结束」到底发生得多频、卡多久。
  */
 const noteTurnWrapUp = (
   taskId: string,
@@ -551,22 +539,16 @@ const noteTurnWrapUp = (
 ): void => {
   if (!c || c.turnEndedAt === undefined) return;
   const settledAfterMs = (streamEndedAt ?? Date.now()) - c.turnEndedAt;
-  const d = c.replayDropped;
-  const dropped = d ? d.thinking + d.assistant : 0;
-  const replayed = (c.turnEndedCount ?? 0) > 1;
-  if (settledAfterMs <= TURN_WRAP_UP_NOTICE_MS && !replayed && dropped === 0) {
-    return;
-  }
+  const turns = c.turnEndedCount ?? 1;
+  if (settledAfterMs <= TURN_WRAP_UP_SLOW_MS && turns <= 1) return;
   appendPerfRecord("turn-wrapup.jsonl", {
     taskId,
     ...(agentId ? { agentId } : {}),
     settledAfterMs,
-    turnEndedCount: c.turnEndedCount ?? 1,
-    ...(d ? { replayDropped: d } : {}),
+    turnEndedCount: turns,
   });
   console.warn(
-    `[chat-runner] task=${taskId} 回合结束后 ${settledAfterMs}ms SDK 才收尾` +
-      `（turn-ended×${c.turnEndedCount ?? 1}、丢弃重放 thinking=${d?.thinking ?? 0} assistant=${d?.assistant ?? 0}）`,
+    `[chat-runner] task=${taskId} 回合结束后 ${settledAfterMs}ms SDK 才收尾（turn-ended×${turns}）`,
   );
 };
 
@@ -1996,9 +1978,15 @@ const consumeChatRun = async (
   // 24h 硬超时：跟用户点停止分开，未答提问打 askExpired（UI「已过期」）
   let hardTimedOut = false;
   let hardTimer: NodeJS.Timeout | null = null;
+  // run.cancel() 发出后 wait() 迟迟不返回的逃生口（每个发 cancel 的地方都要 arm），
+  // 否则流结束后 wait 挂死会让对话永远「运行中」、停止键也救不回来
+  const cancelEscape = createCancelEscape(CANCEL_WAIT_GRACE_MS, () => {
+    console.warn(
+      `[chat-runner] task=${task.id} run.cancel 后 wait() 超过 ${CANCEL_WAIT_GRACE_MS / 1000}s 未返回、按已取消收尾`,
+    );
+  });
   let ctx!: AssistantBufferCtx;
-  // 回合结束后 SDK 迟迟不收尾时的「回复已完成」提示定时器 + SDK 流真正结束的时刻（取证用）
-  let wrapUpTimer: NodeJS.Timeout | null = null;
+  // SDK 流真正结束的时刻（turn-wrapup 取证用）
   let streamEndedAt: number | undefined;
   const rec = runningChats.get(task.id);
   // 捕获本 run 的 instanceId lease——forceClear/懒重启换新会话后，
@@ -2012,6 +2000,7 @@ const consumeChatRun = async (
     rec.cancel = () => {
       cancelled = true;
       void run.cancel().catch(() => {});
+      cancelEscape.arm();
     };
   }
   try {
@@ -2026,6 +2015,7 @@ const consumeChatRun = async (
         expired: true,
       });
       void run.cancel().catch(() => {});
+      cancelEscape.arm();
     }, CHAT_HARD_TIMEOUT_MS);
 
     // 流式消费 + buffer flush：一轮完整回复 → 一条 assistant_message 事件
@@ -2042,17 +2032,6 @@ const consumeChatRun = async (
           kind: "assistant_message",
           text: trimmed,
         });
-      },
-      // 回合结束后的重放保护：usage 到达即落盘回复，其后 SDK stall 重放的 thinking / assistant 丢弃
-      // （为什么只丢事件不 cancel、为什么 task 不开，见 AssistantBufferCtx.dropAfterTurnEnded）
-      dropAfterTurnEnded: true,
-      onTurnEnded: () => {
-        if (wrapUpTimer) return;
-        wrapUpTimer = setTimeout(() => {
-          wrapUpTimer = null;
-          publishTurnWrapUp(task.id, chatLease);
-        }, TURN_WRAP_UP_NOTICE_MS);
-        wrapUpTimer.unref?.();
       },
     };
 
@@ -2074,12 +2053,15 @@ const consumeChatRun = async (
     await flushThinkingBuffer(task.id, ctx, chatLease);
     await ctx.flush();
 
-    if (hardTimer) {
-      clearTimeout(hardTimer);
-      hardTimer = null;
-    }
-
-    const result = await run.wait();
+    // 硬超时计时器要一直罩到 wait() 返回（流结束后 wait 若挂死才有上限）；
+    // wait 返回 / 抛错后必须清，否则 24h 后会对已结束的 run 误写「等待超过 24 小时」
+    const result = await cancelEscape.wait(run).finally(() => {
+      if (hardTimer) {
+        clearTimeout(hardTimer);
+        hardTimer = null;
+      }
+      cancelEscape.dispose();
+    });
 
     if (cancelled || externallyCancelled?.() || result.status === "cancelled") {
       if (hardTimedOut) {
@@ -2100,10 +2082,12 @@ const consumeChatRun = async (
         : "";
       // dump 完整 result（对齐 task-runner）：运行时可能藏未声明字段、落 dump 供事后定位
       const resultDump = stringifyMeta(result).slice(0, 1500);
-      throw new Error(
+      // SDK 的终态错误（result.error）作 cause 保留——不再只剩一段被截断的 dump 文本
+      throw buildRunNotFinishedError(
         `agent run status=${result.status}${
           result.result ? `: ${result.result.slice(0, 200)}` : ""
         }${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
+        result,
       );
     }
 
@@ -2119,6 +2103,7 @@ const consumeChatRun = async (
     });
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
+    cancelEscape.dispose();
     // 用户 stop 后 stream 以异常收场（abort 类）→ 走 cancel 收尾，
     // 绝不落 error 事件 / error 状态覆盖 stop 路由已写的 idle +「用户停止了对话」。
     if (cancelled || externallyCancelled?.()) {
@@ -2146,10 +2131,6 @@ const consumeChatRun = async (
       await handleChatRunFailure(task, err, myInstanceId);
     }
   } finally {
-    if (wrapUpTimer) {
-      clearTimeout(wrapUpTimer);
-      wrapUpTimer = null;
-    }
     noteTurnWrapUp(task.id, rec?.agentId, ctx, streamEndedAt);
   }
 };

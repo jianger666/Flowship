@@ -246,7 +246,7 @@ export const McpToggleList = ({
                 <span
                   className={cn(
                     "truncate font-mono text-xs",
-                    isDisabled && "text-muted-foreground/60 line-through",
+                    isDisabled && "text-muted-foreground line-through",
                   )}
                 >
                   {name}

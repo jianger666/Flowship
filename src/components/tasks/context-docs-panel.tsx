@@ -242,7 +242,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                     </Button>
                   </Tooltip>
                   <span className="truncate min-w-0">{detailDoc.title}</span>
-                  <span className="text-[11px] uppercase text-muted-foreground/60 shrink-0">
+                  <span className="text-[11px] uppercase text-muted-foreground shrink-0">
                     {detailDoc.type}
                   </span>
                 </DialogTitle>
@@ -369,7 +369,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                           </span>
                         </button>
                       </Tooltip>
-                      <span className="text-[11px] uppercase text-muted-foreground/60 shrink-0">
+                      <span className="text-[11px] uppercase text-muted-foreground shrink-0">
                         {doc.type}
                       </span>
                       <Tooltip content="删除">
@@ -403,7 +403,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
             onDragLeave={attach.onDragLeave}
             onDrop={attach.onDrop}
           >
-            <div className="flex items-center gap-2 text-xs font-medium text-foreground/80">
+            <div className="flex items-center gap-2 text-xs font-medium text-foreground">
               <Plus className="size-3.5" />
               添加新文档
             </div>

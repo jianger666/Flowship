@@ -217,7 +217,10 @@ const AskQuestionItem = ({
                 >
                   {letter}
                 </span>
-                <span className="wrap-break-word pt-px">{opt.label}</span>
+                {/* min-w-0：按钮是 flex、这个 span 是 flex 子项，默认 min-width:auto——
+                    选项里一整串不可断的字段名 / 路径 / URL 会把它撑得比按钮还宽，
+                    再多的 wrap-break-word 也没法让它收缩换行（题干同款写法见上） */}
+                <span className="min-w-0 wrap-break-word pt-px">{opt.label}</span>
               </ChoiceButton>
             );
           })}

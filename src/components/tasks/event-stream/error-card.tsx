@@ -12,6 +12,11 @@
  * destructive 边框 + 底衬给足视觉权重，原始诊断可展开，一键复制整份，
  * 当轮失败还能直接重试（= 把最后一条用户消息原样再发）。
  * 回合内工具失败（grep 挂了、run 还在继续）不走这张卡，见 isInTurnToolErrorEvent。
+ *
+ * 事件流 v2 分两档视觉权重：「当轮失败」（最新一条 error 且 agent 没在跑）保持整块 destructive
+ * 底衬——这是用户此刻要处理的；其余翻篇的历史错误降成中性白卡 + 3px 红色左线，只留「这里挂过」的
+ * 记号。旧版每条错误都是整块粉底，一个断过好几次的会话整屏发红，真正要处理的那条反而淹没。
+ * 没加 role="alert"：事件流是虚拟列表，卡片每次滚进视口都会重新挂载，live region 会反复播报。
  */
 
 import { useState } from "react";
@@ -58,12 +63,11 @@ export const ErrorCard = ({
     ? `${ev.text}\n\n${DETAIL_HEADING}\n${detail}`
     : ev.text;
 
-  // 只有「当轮失败」给重试：重试发的是最后一条用户消息，翻历史时点旧错误上的重试
-  // 会把今天最后那条消息重发出去、完全不是用户预期
-  const canRetry =
-    !!streamActions?.onRetryLastMessage &&
-    !runActive &&
-    isLatestErrorEvent(events, ev.id);
+  // 「当轮失败」= 最新一条 error 且 agent 没在跑：视觉上整块 destructive、并且只有它给重试——
+  // 重试发的是最后一条用户消息，翻历史时点旧错误上的重试会把今天最后那条消息重发出去、
+  // 完全不是用户预期
+  const isCurrent = !runActive && isLatestErrorEvent(events, ev.id);
+  const canRetry = !!streamActions?.onRetryLastMessage && isCurrent;
 
   const handleRetry = () => {
     if (retrying || !streamActions?.onRetryLastMessage) return;
@@ -78,9 +82,19 @@ export const ErrorCard = ({
   };
 
   return (
-    <div className="mt-1.5 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+    <div
+      className={cn(
+        "mt-1.5 rounded-md border p-3",
+        isCurrent
+          ? "border-destructive/40 bg-destructive/5"
+          : "border-border border-l-[3px] border-l-destructive bg-card",
+      )}
+    >
       <div className="flex items-start gap-2">
-        <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+        <CircleAlert
+          aria-hidden
+          className="mt-0.5 size-4 shrink-0 text-destructive"
+        />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="text-xs font-medium text-destructive">
@@ -128,7 +142,7 @@ export const ErrorCard = ({
           </div>
           {detailOpen && hasDetail && (
             // 诊断串常含无空格长 JSON / 路径：wrap-anywhere + 限高滚动，别把卡片撑爆
-            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded border border-border/60 bg-background/60 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground wrap-anywhere">
+            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded border border-border bg-background p-2 font-mono text-[11px] leading-relaxed text-muted-foreground wrap-anywhere">
               {detail}
             </pre>
           )}

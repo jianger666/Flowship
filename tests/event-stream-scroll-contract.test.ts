@@ -19,6 +19,13 @@ const read = (...segments: string[]): string =>
 
 const eventStream = read("components", "tasks", "event-stream.tsx");
 const workGroup = read("components", "tasks", "event-stream", "work-group.tsx");
+const followHook = read("hooks", "use-stream-follow.ts");
+
+/** 剥掉注释再查代码本身（注释里要解释「为什么不用 X」，不该因此误报） */
+const stripComments = (source: string): string =>
+  source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 /**
  * 从 `marker` 处起按配对符号截出完整片段（只检查某个 useMemo 的依赖数组 /
@@ -48,7 +55,21 @@ const sliceBalanced = (
 describe("贴底跟随：用户上滚意图 > 几何阈值", () => {
   it("不再用大阈值兼职「防流式增高误判」（120px 会把用户的小幅上滚一起吞掉）", () => {
     expect(eventStream).not.toContain("atBottomThreshold={120}");
-    expect(eventStream).toContain("atBottomThreshold={FOLLOW_PIN_THRESHOLD}");
+  });
+
+  it("Virtuoso 的底部带永远不算「在底部」——带宽给任何正数，它自己的「内容增高就贴底」都会把往回滚的人拽回去", () => {
+    // 48（= 恢复跟随的判定线）和 4（它的默认值）都实测弹回过：
+    // 滚轮上滚 30px 后 49ms 就被它 scrollTo 回底部，而此刻我们的跟随态明明是 false
+    expect(eventStream).toContain("atBottomThreshold={VIRTUOSO_NEVER_AT_BOTTOM}");
+    expect(eventStream).not.toContain("atBottomThreshold={FOLLOW_PIN_THRESHOLD}");
+  });
+
+  it("调试 / 实验开关不许带进产品代码", () => {
+    expect(eventStream).not.toContain("TEMP-EXPERIMENT");
+    expect(eventStream).not.toContain("TEMP-DEBUG");
+    expect(eventStream).not.toContain("__EXP");
+    // Virtuoso 的 logLevel 会把每次 props 更新 / 每次滚动都打到控制台
+    expect(eventStream).not.toContain("logLevel=");
   });
 
   it("滚动容器必须挂给跟随控制器——漏了手势检测整个静默失效、又退回「一滚就被拽回底」", () => {
@@ -72,10 +93,31 @@ describe("贴底跟随：用户上滚意图 > 几何阈值", () => {
 });
 
 describe("自动滚只有一套：统一 auto、不留 smooth", () => {
-  it("followOutput 不返回 smooth——smooth 动画会被流式的瞬时滚打断、视觉上就是抖", () => {
-    const followOutput = sliceBalanced(eventStream, "followOutput=", "{");
-    expect(followOutput).not.toContain("smooth");
-    expect(followOutput).toContain("follow.isFollowing()");
+  it("不给 Virtuoso 传 followOutput——它在条数变化时自己 scrollToIndex，启动的重试链没法取消、用户上滚后还把人拉回底部", () => {
+    // 实测：流式第一个 chunk 让条数 +1 就触发它，链一直活到用户滚轮之后。
+    // 只查 JSX prop 形式（注释里要解释为什么不传）
+    expect(eventStream).not.toContain("followOutput=");
+  });
+
+  it("条数 / 总高变化后的贴底走控制器：跟随 effect + totalListHeightChanged，都只发「请贴底」的请求", () => {
+    expect(eventStream).toContain("totalListHeightChanged={onTotalHeightChanged}");
+    const handler = sliceBalanced(
+      eventStream,
+      "const onTotalHeightChanged = useCallback",
+      "(",
+    );
+    // 只在跟随态发请求；真正写不写 scrollTop 由控制器按跟随态 + 距底判定
+    expect(handler).toContain("follow.isFollowing()");
+    expect(handler).toContain("follow.requestScrollToBottom()");
+    expect(handler).not.toContain("scrollToIndex");
+    expect(handler).not.toContain("scrollTop");
+  });
+
+  it("跟随 effect 是条数 / 流式文本 / 运行态变化后贴底的入口：三个依赖缺一不可，且只在跟随态发请求", () => {
+    // 允许格式化差异（空白 / 换行），不允许少依赖、少闸门
+    expect(eventStream).toMatch(
+      /useEffect\(\(\) => \{\s*if \(!follow\.isFollowing\(\)\) return;\s*follow\.requestScrollToBottom\(\);\s*\}, \[follow, items, streamingText, isRunning\]\);/,
+    );
   });
 
   it("贴底动作只有 scrollToBottom 一个出口、且走控制器的 rAF 合批", () => {
@@ -84,6 +126,50 @@ describe("自动滚只有一套：统一 auto、不留 smooth", () => {
       eventStream.match(/scrollToIndex\(\{[^}]*"LAST"/g) ?? [];
     expect(lastScrolls).toHaveLength(1);
     expect(eventStream).toContain("follow.requestScrollToBottom()");
+  });
+});
+
+describe("贴底不走 Virtuoso 的 scrollToIndex（它的重试链内容一直在长就不会结束、也没法取消）", () => {
+  it("控制器自己写 scrollTop、代码里不出现 scrollToIndex", () => {
+    // 每次 scrollToIndex 都会盯列表 150ms、期间列表又变就重滚一遍再盯——流式时每 80ms 变一次，
+    // 链永不结束；用户上滚后我们早不再发起贴底，链还在每 ~100ms 把人拉回底部（实测）
+    const code = stripComments(followHook);
+    expect(code).not.toContain("scrollToIndex");
+    expect(code).toContain("scroller.scrollTop = scroller.scrollHeight");
+  });
+
+  it("贴底帧的第一件事是看跟随态——用户一上滚、这条链当场作废", () => {
+    const schedulePin = sliceBalanced(
+      followHook,
+      "const schedulePin = (progress: { stable: number; budget: number }) => {",
+      "{",
+    );
+    const body = schedulePin.slice(schedulePin.indexOf("requestAnimationFrame"));
+    expect(body.indexOf("if (!following) return;")).toBeGreaterThan(0);
+    // 必须排在任何写 scrollTop / 调贴底动作之前
+    expect(body.indexOf("if (!following) return;")).toBeLessThan(
+      body.indexOf("scroller.scrollTop ="),
+    );
+    expect(body.indexOf("if (!following) return;")).toBeLessThan(
+      body.indexOf("scrollToBottomRef.current()"),
+    );
+  });
+
+  it("跟随态翻成 false 时取消已排队的帧", () => {
+    const setFollowing = sliceBalanced(
+      followHook,
+      "const setFollowing = (next: boolean) => {",
+      "{",
+    );
+    expect(setFollowing).toContain("cancelPin()");
+  });
+
+  it("组件里 scrollToIndex 只剩「跳到某一项」的用途（搜索命中 / 提问锚点 / 回到本轮开头）+ 一个兜底贴底", () => {
+    // 兜底那一处是 "LAST"；其余都带具体 index（idx），语义是用户主动跳转
+    const all = eventStream.match(/scrollToIndex\(\{/g) ?? [];
+    const last = eventStream.match(/scrollToIndex\(\{[^}]*"LAST"/g) ?? [];
+    expect(last).toHaveLength(1);
+    expect(all.length - last.length).toBe(3);
   });
 });
 

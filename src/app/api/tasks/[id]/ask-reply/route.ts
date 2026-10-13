@@ -31,6 +31,8 @@ import path from "node:path";
 import type { AskUserAnswer, AskUserQuestion } from "@/lib/types";
 import {
   getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   setTaskRunStatusIfRunOwner,
 } from "@/lib/server/task-fs";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
@@ -41,6 +43,7 @@ import type {
 import {
   ASK_EXPIRED_USER_MESSAGE,
   extractAskQuestions,
+  hasAskRequestEvent,
   isAskExpired,
   isAskSkipped,
   isAskSuperseded,
@@ -119,6 +122,10 @@ interface PostBody {
 }
 
 // 单题最多附 6 张图；全部题加起来最多 12 张（防一次答超多题各塞满图把 agent context 撑爆）
+/** 入口判定读的尾部事件条数（与 task-question-inject 的 B1 窗口同值） */
+const ASK_DECISION_TAIL = 200;
+/** 响应里带回的尾部事件条数（与任务页首屏 EVENT_TAIL 同值；客户端只吸收本地末尾之后的新事件） */
+const RESPONSE_EVENT_TAIL = 300;
 const MAX_IMAGES_PER_QUESTION = 6;
 const MAX_IMAGES_TOTAL = 12;
 // skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
@@ -249,8 +256,16 @@ const handleAskReply = async (
     }
   }
 
-  const task = await getTask(id);
-  if (!task) return errorResponse("not_found", 404);
+  // 入口判定（reqEvent / 已答 / 已跳过 / 已过期 / 已作废）只需要这组 ask 的事件：它的请求事件在尾部，
+  // 后续的答 / 跳过 / 作废标记只会追加在它之后，所以尾部窗口里要么全有、要么都没有。
+  // 全量 parse 大对话的 events.jsonl 每次答题都要付一遍（本路由还有 3 处后续读盘）——先读尾部；
+  // 请求事件不在窗口里（用户答的是很早以前的旧弹窗）再退回全量读，保持原判定语义。
+  const tailTask = await getTaskWithTailEvents(id, ASK_DECISION_TAIL);
+  if (!tailTask) return errorResponse("not_found", 404);
+  const task =
+    tailTask.eventsTruncated && !hasAskRequestEvent(tailTask.events, askId)
+      ? ((await getTask(id)) ?? tailTask)
+      : tailTask;
 
   // lifecycle 非 null（stopping/deleting/finalizing）一律拒送达 / 唤醒
   {
@@ -602,7 +617,9 @@ const handleAskReply = async (
           );
         });
     }
-    const fresh = await getTask(task.id);
+    // 响应里的 task 只给客户端「收起答题卡」用：客户端 mergeTaskEvents 只吸收本地末尾之后的新事件、
+    // 更早的一律丢弃，所以只带尾部（含刚落盘的 ask_user_reply）即可，不必再全量读一遍
+    const fresh = await getTaskWithTailEvents(task.id, RESPONSE_EVENT_TAIL);
     return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -628,7 +645,8 @@ const handleAskReply = async (
       });
     }
 
-    const fresh = (await getTask(id)) ?? task;
+    // 这里只看 runStatus（状态机字段）——不需要事件，读 meta 即可
+    const fresh = (await getTaskMeta(id)) ?? task;
 
     // 这组 ask 已被顶替（task 有别的新提问在等）/ agent 还在跑 / **会话还活着**（V0.11：
     // 交卷后 run 自然结束、agent 空闲等用户是健康态）——都**不是僵尸、不能误杀任务**
@@ -885,7 +903,9 @@ const handleAskReply = async (
   // run 快速结束会先归位 awaiting_user/idle；再刷会把已结束 run 写回永久 running
   // （正常结束不 bump gen，旧闭包仍 true）。running 由 sendToTaskSessionBody 受理成功后
   // 在 consume 启动前 owner 门控写入（本路由不再碰）。
-  const freshTask = (await getTask(task.id)) ?? task;
+  // 响应只带尾部事件（理由同上：客户端只吸收本地末尾之后的新事件）
+  const freshTask =
+    (await getTaskWithTailEvents(task.id, RESPONSE_EVENT_TAIL)) ?? task;
 
   return new Response(
     JSON.stringify({

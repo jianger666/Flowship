@@ -216,7 +216,7 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
               >
                 {d.isMonthStart || i === 0 ? `${d.month}/${d.date}` : d.date}
               </span>
-              <span className={cn("text-muted-foreground/60", d.isToday && "text-primary/80")}>
+              <span className={cn("text-muted-foreground", d.isToday && "text-primary")}>
                 {d.isToday ? "今" : d.weekday}
               </span>
             </div>
@@ -331,7 +331,7 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                   <span
                     className={cn(
                       "min-w-0 truncate text-[11px]",
-                      row.isSub ? "text-foreground/80" : "text-muted-foreground",
+                      row.isSub ? "text-foreground" : "text-muted-foreground",
                     )}
                   >
                     {label}

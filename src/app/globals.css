@@ -363,6 +363,20 @@
     opacity: 1;
   }
 }
+/* 事件流状态行 label 的 shimmer（事件流 v2：从 active-status-line 的内联 <style> 迁入全局——
+   每次渲染都往 DOM 塞一个 <style> 节点既浪费、也没法被 prefers-reduced-motion 统一管住）。
+   渐变底色 + bg-clip-text 的样式类留在组件里，这里只管动画本身。 */
+@keyframes status-shimmer {
+  0% {
+    background-position: 200% center;
+  }
+  100% {
+    background-position: -200% center;
+  }
+}
+.status-shimmer {
+  animation: status-shimmer 2s linear infinite;
+}
 @media (prefers-reduced-motion: reduce) {
   .brand-current {
     animation: none;
@@ -376,6 +390,56 @@
     animation: none;
     opacity: 1;
   }
+  /* 事件流 v2：「减少动态效果」= 脉冲 / shimmer 一律静态，状态只靠文字 + 色点传达。
+     shimmer 文字去掉渐变回纯色（否则停在渐变某一帧，左浅右深很怪） */
+  .animate-pulse {
+    animation: none;
+  }
+  .status-shimmer {
+    animation: none;
+    background-image: none;
+    color: var(--foreground);
+  }
+}
+
+/* ---------- prose 取色走站内语义 token（事件流 v2） ----------
+   @tailwindcss/typography 默认的 gray 色板（body #364153 / bold #101828，色相 ≈ 260°、彩度是站内
+   中性灰的 3~4 倍）让 AI 正文在一圈中性灰 UI 里显「蓝灰」（8676 实测 computed
+   rgb(54,65,83)，而 --foreground 是 rgb(21,23,27)）。这里把 prose 变量全部接到语义 token：
+   token 自带 light / dark 取值，所以 invert 变量也指向同一组——dark:prose-invert 切换之后
+   值不变，不会又被覆盖回 gray-300。
+   pre-bg / pre-code 故意不动：见下方「Streamdown + Shiki 双主题接法」，代码块底/字交给 Shiki。 */
+.prose {
+  --tw-prose-body: var(--foreground);
+  --tw-prose-headings: var(--foreground);
+  --tw-prose-lead: var(--muted-foreground);
+  --tw-prose-links: var(--foreground);
+  --tw-prose-bold: var(--foreground);
+  --tw-prose-counters: var(--muted-foreground);
+  --tw-prose-bullets: var(--muted-foreground);
+  --tw-prose-hr: var(--border);
+  --tw-prose-quotes: var(--foreground);
+  --tw-prose-quote-borders: var(--border);
+  --tw-prose-captions: var(--muted-foreground);
+  --tw-prose-kbd: var(--foreground);
+  --tw-prose-code: var(--foreground);
+  --tw-prose-th-borders: var(--border);
+  --tw-prose-td-borders: var(--border);
+  --tw-prose-invert-body: var(--foreground);
+  --tw-prose-invert-headings: var(--foreground);
+  --tw-prose-invert-lead: var(--muted-foreground);
+  --tw-prose-invert-links: var(--foreground);
+  --tw-prose-invert-bold: var(--foreground);
+  --tw-prose-invert-counters: var(--muted-foreground);
+  --tw-prose-invert-bullets: var(--muted-foreground);
+  --tw-prose-invert-hr: var(--border);
+  --tw-prose-invert-quotes: var(--foreground);
+  --tw-prose-invert-quote-borders: var(--border);
+  --tw-prose-invert-captions: var(--muted-foreground);
+  --tw-prose-invert-kbd: var(--foreground);
+  --tw-prose-invert-code: var(--foreground);
+  --tw-prose-invert-th-borders: var(--border);
+  --tw-prose-invert-td-borders: var(--border);
 }
 
 /* 框一体化（2026-07-20 用户拍板「语言标签放框内、别在外面占空间」）：
@@ -404,13 +468,23 @@
 }
 /* 代码块内层（padding 在 code-block-body 包裹层上、不在 pre 上）：
    2026-07-20 用户实测再调：字号提到与聊天正文一致（0.875rem）、行距收紧、
-   内衬上下收一档（之前「字小 + 间距大」观感差）；边框已上移到外壳、body 归零 */
+   内衬上下收一档（之前「字小 + 间距大」观感差）；边框已上移到外壳、body 归零。
+   字号走 --prose-code-size（默认 14px）：12px 档的容器（工具块产出）把它设成 0.75rem，
+   代码块跟着降一档，不会比周围正文还大 */
 .prose [data-streamdown="code-block-body"] {
   padding: 0.5rem 0.75rem;
-  font-size: 0.875rem;
+  font-size: var(--prose-code-size, 0.875rem);
   line-height: 1.5;
   border: none;
   border-radius: 0;
+}
+/* pre / code 必须显式继承 body 的字号（2026-10-12 补）：typography 的 .prose-sm 对 pre、code
+   各乘一次 .857em，body 上的 0.875rem 只管到容器——里面的文字实际是 14 → 12 → 10.29px
+   （8676 浏览器实测），违反字号阶梯「不许 10px」，也一直没兑现上面 2026-07-20 的拍板。 */
+.prose [data-streamdown="code-block-body"] pre,
+.prose [data-streamdown="code-block-body"] code {
+  font-size: inherit;
+  line-height: inherit;
 }
 /* typography 的 .prose pre 自带 padding（≈0.857em）、与 code-block-body 的内衬叠加成
    双层留白（用户实测「间距太大」的另一半来源）——归零、留白单源在 body 上 */

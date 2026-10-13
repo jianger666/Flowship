@@ -28,6 +28,18 @@
  *   否则 getTask 到 subscribe 之间产生的事件既不在快照里、也进不了 buffer（真丢）。
  *   快照发完后用 sentEventIds 去重回放 buffer，再转直通；快照 tail 的 event id
  *   也预先写入 sentEventIds，保证不丢不重。
+ *
+ * 进行中思考的快照（2026-10-13，帧 `thinking_snapshot`）：
+ *   thinking_delta 是纯内存帧、从不回放；前端的实时思考态又只活在组件本地 state 里——
+ *   切到别的对话再切回（组件重挂）、SSE 断流重连，新订阅者只能从「订阅之后的第一帧」开始，
+ *   之前累积的几千字全丢、文本区从第一个字重新长（用户反馈「切窗口再切回来思考又从头吐」）。
+ *   所以 bootstrap 末尾**无条件**补一帧：live = 对象（此刻正在思考，带已发出的文本 / 累计数 / 首帧时刻）
+ *   或 null（没在思考——前端据此清掉本地残留）。
+ *   - 订阅与读快照**同步配对**（中间没有 await）：快照 = 订阅那一刻之前已发出的全部，
+ *     之后的帧都进 buffer、在快照后面回放，不重不漏；
+ *   - 这段思考的落盘事件已经在 tail 里 → 发 live:null（思考其实已结束，别复活幽灵「思考中」）；
+ *   - bootstrap 回放的历史 event 帧带 `replay: true`：前端不能把「重新读一遍旧账」当成
+ *     「刚发生了一个落盘事件 = 这段思考结束了」而清掉刚从快照接上的实时态。
  */
 
 import {
@@ -35,6 +47,7 @@ import {
   listMessageOperationSnapshot,
   listRecentSettled,
 } from "@/lib/server/chat-queue";
+import { getLiveThinkingSnapshot } from "@/lib/server/sdk-message-handler";
 import {
   getTaskVisibility,
   getTaskWithTailEvents,
@@ -94,6 +107,12 @@ export const GET = async (req: Request, { params }: Ctx) => {
     }
     liveDispatch?.(ev);
   });
+
+  // 紧跟订阅、**同步**读进行中思考的快照——这两步之间不能有任何 await：
+  // 快照 = 订阅那一刻之前已发出的全部；之后发的每一帧都进 buffered、bootstrap 完在快照后面回放。
+  // 一旦隔了 await（比如挪到下面读完磁盘之后再读），期间发的帧会既进快照又进 buffer，
+  // 前端按「快照 + 增量」重建就会把那段文字重复一遍
+  const thinkingSnap = getLiveThinkingSnapshot(id);
 
   // 幂等清理：ReadableStream.cancel / req.signal abort / closeStream 都可能触发，防 double-clean
   const cleanup = () => {
@@ -259,7 +278,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
         });
         for (const ev of tailEvents) {
           rememberEventId(ev.id);
-          send({ type: "event", event: ev });
+          // replay：这是重新读一遍的旧账、不是刚发生的事（前端据此不清实时思考态）
+          send({ type: "event", event: ev, replay: true });
         }
         // bootstrap 附带 queue itemIds（旧字段兼容）+
         // 完整 operationSnapshot（含 accepting/persisted，关闭 ghost→delivered 窗口）+
@@ -277,6 +297,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
           type: "restricted_run",
           active: hasRestrictedQuestionInFlight(id),
         });
+        // 进行中思考的快照：无条件发一帧（对象 = 接着长；null = 没在思考、前端清残留）。
+        // 这段思考的落盘事件已经在 tail 里 = 思考其实结束了（节流状态还没来得及清），发 null 防幽灵
+        const liveSnap =
+          thinkingSnap &&
+          !tailEvents.some((e) => e.id === thinkingSnap.eventId)
+            ? thinkingSnap
+            : null;
+        send({ type: "thinking_snapshot", live: liveSnap });
       } catch (err) {
         console.error("[watch-task] bootstrap failed:", err);
       }

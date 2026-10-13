@@ -48,25 +48,25 @@ const RoundRow = memo(function RoundRow({
               "min-w-0 flex-1 truncate text-xs",
               round.answerText
                 ? "text-muted-foreground"
-                : "text-muted-foreground/60 italic",
+                : "text-muted-foreground italic",
             )}
           >
             {oneLine}
           </span>
         </span>
         {round.legacy && (
-          <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">
+          <span className="shrink-0 rounded bg-muted px-1 text-[11px] text-muted-foreground">
             历史
           </span>
         )}
         {!round.ok && round.answerText && (
-          <span className="shrink-0 rounded bg-destructive/10 px-1 text-[10px] text-destructive">
+          <span className="shrink-0 rounded bg-destructive/10 px-1 text-[11px] text-destructive">
             失败
           </span>
         )}
         <span
           className={cn(
-            "shrink-0 text-[10px] text-muted-foreground transition-transform",
+            "shrink-0 text-[11px] text-muted-foreground transition-transform",
             expanded && "rotate-90",
           )}
         >
@@ -76,7 +76,7 @@ const RoundRow = memo(function RoundRow({
       {expanded && (
         <div className="space-y-2 px-4 pb-3 pl-4">
           {round.askerOpenId && (
-            <div className="text-[10px] tabular-nums text-muted-foreground/70">
+            <div className="text-[11px] tabular-nums text-muted-foreground">
               {round.askerOpenId}
             </div>
           )}
@@ -88,7 +88,7 @@ const RoundRow = memo(function RoundRow({
           {round.answerText ? (
             <MarkdownText text={round.answerText} />
           ) : (
-            <div className="text-xs text-muted-foreground/60 italic">
+            <div className="text-xs text-muted-foreground italic">
               {round.answering ? "正在回答…" : "未收到回答"}
             </div>
           )}

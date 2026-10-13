@@ -131,6 +131,23 @@ export const findPendingAskEvent = (events: TaskEvent[]): TaskEvent | null => {
   return null;
 };
 
+/**
+ * 事件窗口里有没有这个 askId 的 ask_user_request。
+ * ask-reply 先只读尾部事件做判定；窗口里找不到请求事件（用户答的是很早以前的旧弹窗）时
+ * 调用方据此退回全量读——答 / 跳过 / 作废标记都追加在请求事件之后，所以窗口里有请求事件，
+ * 它们就必然也在窗口里，判定与全量读一致。
+ */
+export const hasAskRequestEvent = (
+  events: TaskEvent[],
+  askId: string,
+): boolean =>
+  events.some(
+    (ev) =>
+      ev.kind === "ask_user_request" &&
+      typeof ev.meta?.askId === "string" &&
+      ev.meta.askId === askId,
+  );
+
 /** 读一条 ask_user_request 事件的 askId（缺 / 类型不对返 null） */
 export const askIdOfEvent = (ev: TaskEvent): string | null =>
   typeof ev.meta?.askId === "string" && ev.meta.askId ? ev.meta.askId : null;

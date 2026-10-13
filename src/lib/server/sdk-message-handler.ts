@@ -17,6 +17,8 @@ import {
   compactionEventMeta,
   compactionEventText,
 } from "@/lib/compaction-display";
+import { toSubagentDisplayCall } from "@/lib/cursor-subagent-display";
+import { appendThinkingText } from "@/lib/thinking-live";
 
 import { appendEvent, getTask, patchActionIfOwner } from "./task-fs";
 import { newEventId } from "./task-fs-core";
@@ -46,8 +48,10 @@ export const flushThinkingBuffer = async (
   origin?: string,
 ): Promise<void> => {
   // 这段思考结束：没发出去的实时帧尾巴直接丢（紧跟着落盘的 thinking 事件带完整文本）。
-  // 放在最前、不受下面 `!text` 早退影响——run 结束路径也经过这里，保证不留残余定时器
-  discardPendingThinkingDeltas(taskId);
+  // 放在最前、不受下面 `!text` 早退影响——run 结束路径也经过这里，保证不留残余定时器。
+  // 旁路答疑（origin）run 不丢：节流状态 / 快照是按 taskId 共享的、属于属主主链，
+  // 旁路从不发实时帧（见 thinking 分支），它收尾时清一下只会误伤主链正在进行的思考
+  if (!origin) discardPendingThinkingDeltas(taskId);
   const text = ctx.thinkingBuffer ?? "";
   const durationMs = ctx.thinkingDurationMs;
   // 预定的事件 id 跟 buffer 一起取走并清零：本段到此为止，下一段重新预定。
@@ -105,63 +109,20 @@ export interface AssistantBufferCtx {
   artifactWritten?: boolean;
 
   /**
-   * 回合结束后的重放保护（只有 chat 开；task 有「交卷后宿主塞续跑」语义，保持原行为）。
+   * 本 run 收到的 usage（= SDK 的 turn-ended）条数。一次 agent.send 只该有一条；>1 说明 SDK 在同一条流上
+   * 又跑了一轮（连接重试 / 续接，内容是重新生成的，不是原文重复）。
+   * **只计数，不改变任何消息的处理**——观测用（turn-wrapup.jsonl）。
    *
-   * 背景（实测）：一次 agent.send = 一个 turn，SDK 只在回合末发**一条** usage（= turn-ended）。
-   * 回合结束后同一条流上又来 thinking / assistant，是 SDK 的无进展检测（stall）
-   * 取消了「迟迟不收尾」的 attempt、从 checkpoint 重放同一请求——内容和第一遍重复，
-   * 用户看到的就是「回复完了、转圈很久、又回复一遍」。
-   *
-   * 开启后：usage 到达即把回复落盘（不再等下一个事件 / run 结束才落），其后的 thinking / assistant 丢弃。
-   *
-   * ⚠️ 只丢事件、绝不因此 run.cancel()：turn-ended 到达时本轮**还没写进 checkpoint**
+   * ⚠️ 不要在 usage 之后丢 thinking / 回复：被丢的文字既不上屏也不落盘，事后无法核对有没有误杀
+   * （v1.9.29 做过、2026-10-12 按用户决定整套撤掉，见 docs/HANDOFF.md）。
+   * ⚠️ 也不要因此 run.cancel()：turn-ended 到达时本轮**还没写进 checkpoint**
    * （要等 SDK 把 checkpoint 存完发 FINISHED，正常 ~0.3s），此时 cancel 会让这一轮从 AI 记忆里消失
    * （2026-10 探针实测：cancel 后同实例 / resume 后追问都「没看到你让我记住的内容」）。
    */
-  dropAfterTurnEnded?: boolean;
-  /** 本 run 收到的 usage（turn-ended）条数；>1 说明 SDK 重放过 */
   turnEndedCount?: number;
   /** 首条 usage 到达时刻（ms epoch），用来量「回合结束 → SDK 真正收尾」的延迟 */
   turnEndedAt?: number;
-  /** 回合结束之后被丢弃 / 计数的重放消息（观测用，不落事件流） */
-  replayDropped?: {
-    thinking: number;
-    assistant: number;
-    assistantChars: number;
-    /** 重放里出现工具调用：不丢（用户得看到真有动作），只计数 + 告警 */
-    toolCalls: number;
-  };
-  /** 首条 usage 落盘完回复之后回调——chat consume 在这里起「回复已完成、收尾中」提示的定时器 */
-  onTurnEnded?: () => void;
 }
-
-/** 本 run 是否已过回合结束、且开了重放保护 */
-const isAfterTurnEnd = (ctx: AssistantBufferCtx): boolean =>
-  ctx.dropAfterTurnEnded === true && (ctx.turnEndedCount ?? 0) >= 1;
-
-/** 记一次回合结束后的重放消息；本 run 第一次出现时告警一行（后续只计数，免得刷屏） */
-const noteReplayDropped = (
-  taskId: string,
-  ctx: AssistantBufferCtx,
-  kind: "thinking" | "assistant" | "toolCalls",
-  chars = 0,
-): void => {
-  const d = (ctx.replayDropped ??= {
-    thinking: 0,
-    assistant: 0,
-    assistantChars: 0,
-    toolCalls: 0,
-  });
-  const first = d.thinking + d.assistant + d.toolCalls === 0;
-  d[kind] += 1;
-  if (kind === "assistant") d.assistantChars += chars;
-  if (!first) return;
-  console.warn(
-    kind === "toolCalls"
-      ? `[sdk-message-handler] task=${taskId} turn-ended 之后同一条流又出现工具调用（SDK 重放中带动作），不丢弃、仅计数`
-      : `[sdk-message-handler] task=${taskId} turn-ended 之后同一条流又来了 ${kind}（疑似 SDK 无进展重放），已丢弃、不落盘不上屏`,
-  );
-};
 
 /** curl stdout 里出现答案 → 同一轮继续，不再消音、不 cancel */
 export const maybeClearAskSeenAfterWaitReply = (
@@ -264,9 +225,9 @@ const isUpdateTodosToolName = (name: string): boolean => {
 };
 
 /**
- * task 工具：短字段（description / model / subagentType）前置再 stringify。
- * 原始键序常是 description→prompt→subagentType→model，prompt 动辄 500+，
- * 默认 truncate(500) 会把尾部 model 永久截掉 → 前端徽标永远拿不到。
+ * task 工具：短字段（description / model / effort / subagentType）前置再 stringify。
+ * 原始键序常是 description→prompt→subagentType→model→effort，prompt 动辄 500+，
+ * 默认 truncate(500) 会把尾部 model / effort 永久截掉 → 前端徽标永远拿不到。
  *
  * updateTodos：放大截断上限（见 TODO_TOOL_ARGS_TRUNCATE_MAX）。
  */
@@ -281,9 +242,16 @@ const stringifyToolCallArgs = (
     !Array.isArray(args)
   ) {
     const raw = args as Record<string, unknown>;
-    const { description, model, subagentType, prompt, ...rest } = raw;
+    const { description, model, effort, subagentType, prompt, ...rest } = raw;
     // JSON.stringify 按插入序；undefined 值的键自动跳过
-    const reordered = { description, model, subagentType, prompt, ...rest };
+    const reordered = {
+      description,
+      model,
+      effort,
+      subagentType,
+      prompt,
+      ...rest,
+    };
     return {
       argsStr: stringifyMeta(reordered),
       truncateMax: TASK_TOOL_ARGS_TRUNCATE_MAX,
@@ -455,7 +423,8 @@ const enqueueAssistantDelta = (
 //
 // leading + trailing 节流：
 //   - 一段思考的首个 chunk 立刻发（零延迟——痛点就是「开始响应」看不见）；
-//   - 之后每 250ms 最多一帧，带这期间攒下的增量（UI 只取最近一行，用不着高帧率；
+//   - 之后每 250ms 最多一帧，带这期间攒下的增量（前端 use-smooth-thinking 会把一批摊成
+//     逐帧匀速吐出、观感不依赖服务端帧率，所以用不着高帧率；
 //     实测一段 65s 思考有 1111 条 token 级 chunk，逐条发会把 SSE / setState 拉满）；
 //   - 段结束（任何非 thinking 消息到达 / 落盘 / run 结束）→ 直接丢掉没发的尾巴：
 //     紧跟着落盘的 thinking 事件带完整文本，前端收到它就清实时态，再补一帧只是白发，
@@ -473,6 +442,28 @@ interface ThinkingThrottle {
   lease: () => boolean;
   /** 本段思考预定的落盘事件 id（随每一帧带给前端） */
   eventId: string;
+  /**
+   * 本段已**发出**（publish 成功）的原文窗口——尾部至多 THINKING_TEXT_MAX 字，与前端同一个截尾口径。
+   * 新订阅者 bootstrap 的快照来源（见 getLiveThinkingSnapshot）。只含已发出的：还在 pending 里的尾巴
+   * 发出时才进来，否则 bootstrap 之后的那一帧会把它重复一遍。
+   */
+  sent: string;
+  /** 本段累计已发出的字符数（含 sent 前面被截掉的部分） */
+  sentTotal: number;
+  /** 本段首帧发出的时刻（ms epoch；0 = 还没发过） */
+  since: number;
+}
+
+/**
+ * 进行中那一段思考的快照（watch-task 新订阅者 bootstrap 时补发，帧名 thinking_snapshot）。
+ * 字段口径：eventId = 落盘后那条 thinking 事件的预定 id；text = 已发出原文的尾部窗口；
+ * total = 累计已发出字符数（含被截掉的前缀）；since = 首帧发出的时刻。
+ */
+export interface LiveThinkingSnapshot {
+  eventId: string;
+  text: string;
+  total: number;
+  since: number;
 }
 
 const THINKING_THROTTLE_MAP_KEY = "__flowshipThinkingDeltaThrottle__";
@@ -496,20 +487,58 @@ const sendThinkingDelta = (taskId: string, st: ThinkingThrottle): void => {
     return;
   }
   st.lastSentAt = Date.now();
-  publishIfCurrent(taskId, st.lease, {
+  const published = publishIfCurrent(taskId, st.lease, {
     kind: "thinking_delta",
     text,
     eventId: st.eventId,
   });
+  // 没发出去（发帧这一刻 lease 才失主）的字不进快照——快照 = 订阅者「本该已经收到」的全部
+  if (!published) return;
+  if (st.sentTotal === 0) st.since = st.lastSentAt;
+  st.sent = appendThinkingText(st.sent, text);
+  st.sentTotal += text.length;
 };
 
-/** 一段思考结束：清定时器、丢掉没发的尾巴、重置节流（下一段首个 chunk 重新「立即发」）。同步、幂等 */
+/**
+ * 一段思考结束：清定时器、丢掉没发的尾巴、重置节流（下一段首个 chunk 重新「立即发」）。同步、幂等。
+ * 快照与节流状态同生共死（同一个对象）：段结束 = 没有进行中的思考 = 没有快照。
+ */
 export const discardPendingThinkingDeltas = (taskId: string): void => {
   const map = getThinkingThrottleMap();
   const st = map.get(taskId);
   if (!st) return;
   if (st.timer) clearTimeout(st.timer);
   map.delete(taskId);
+};
+
+/**
+ * 此刻进行中那一段思考的快照；没有（没在思考 / 还没发出过任何一帧 / run 已失主）→ null。
+ *
+ * 为什么有它（2026-10-13 用户反馈「首轮思考很长，我切窗口再切回来，思考好像又是从第一个字开始吐」）：
+ * thinking_delta 是纯内存帧、从不回放，前端的实时态又只活在 ChatView 的本地 state 里——
+ * 切到别的对话再切回（组件重挂）、SSE 断流重连，新订阅者都只能从「订阅之后的第一帧」开始，
+ * 之前累积的几千字全没了、文本区从头重新长。watch-task 路由在 bootstrap 里据此补一帧快照。
+ *
+ * 同步、零副作用（失主时顺手清状态除外）——路由要「订阅」与「读快照」之间没有任何 await，
+ * 这样快照 = 订阅那一刻之前已发出的全部，之后的帧都进 buffer，不重不漏。
+ * 读取时重估 lease：run 被取消 / 换了新实例 / 已结束而节流状态没被清（异常路径）时，
+ * 不能把一个已经死掉的思考当作进行中告诉新订阅者（幽灵「思考中」）。
+ */
+export const getLiveThinkingSnapshot = (
+  taskId: string,
+): LiveThinkingSnapshot | null => {
+  const st = getThinkingThrottleMap().get(taskId);
+  if (!st || st.sentTotal === 0) return null;
+  if (!st.lease()) {
+    discardPendingThinkingDeltas(taskId);
+    return null;
+  }
+  return {
+    eventId: st.eventId,
+    text: st.sent,
+    total: st.sentTotal,
+    since: st.since,
+  };
 };
 
 const enqueueThinkingDelta = (
@@ -525,6 +554,9 @@ const enqueueThinkingDelta = (
     lastSentAt: 0,
     lease,
     eventId,
+    sent: "",
+    sentTotal: 0,
+    since: 0,
   };
   map.set(taskId, st);
   st.lease = lease;
@@ -547,7 +579,7 @@ const enqueueThinkingDelta = (
  */
 export const handleSdkMessage = async (
   taskId: string,
-  msg: SDKMessage,
+  rawMsg: SDKMessage,
   assistantCtx: AssistantBufferCtx,
   /**
    * 失主则整条消息丢弃（含 thinking /
@@ -561,6 +593,10 @@ export const handleSdkMessage = async (
    */
   origin?: string,
 ): Promise<void> => {
+  // Cursor 的 `subagent` 自定义工具（MCP 外壳）改写成与 pi / 原生同形的 `task`，
+  // 子代理卡片、状态行、model / effort 徽标才认得出；其它消息原样（同一引用）
+  const msg: SDKMessage =
+    rawMsg.type === "tool_call" ? toSubagentDisplayCall(rawMsg) : rawMsg;
   // 入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
   const stillCurrent = lease;
   if (!stillCurrent()) return;
@@ -568,8 +604,10 @@ export const handleSdkMessage = async (
   //（assistant 分支不冲：连续文本 chunk 要合并进同一帧）
   if (msg.type !== "assistant") flushPendingAssistantDeltas(taskId);
   // 思考实时帧同理：任何非 thinking 消息到来 = 这段思考结束了，没发的尾巴不再发
-  //（thinking 自己的分支不能丢——连续 chunk 要在节流窗口里合帧）
-  if (msg.type !== "thinking") discardPendingThinkingDeltas(taskId);
+  //（thinking 自己的分支不能丢——连续 chunk 要在节流窗口里合帧）。
+  // 旁路答疑（origin）run 的消息不算：节流状态 / 快照是按 taskId 共享的、属于属主主链，
+  // 旁路自己从不发实时帧，它一说话就清会把主链正在进行的思考（和快照）误伤掉
+  if (msg.type !== "thinking" && !origin) discardPendingThinkingDeltas(taskId);
 
   /** 本轮统一 sink：lease + origin 一次绑好，下面各分支只管事件内容 */
   const writeEv = (
@@ -604,25 +642,14 @@ export const handleSdkMessage = async (
 
   switch (msg.type) {
     case "usage": {
-      // turn-ended：回复已经完整。首条时把它落盘，让 UI 立刻从流式气泡转成正式消息，
-      // 不必等 SDK 把 checkpoint 存完发 FINISHED（正常 ~0.3s；异常时可能几十秒~几分钟）
+      // turn-ended（SDK 每个回合末发一条）：只计数，不改变任何消息的处理。
+      // 同一条流上出现第 2 条及以后的 usage = SDK 又跑了一轮，由 turn-wrapup.jsonl 记下来观测
       assistantCtx.turnEndedCount = (assistantCtx.turnEndedCount ?? 0) + 1;
-      if (assistantCtx.turnEndedCount === 1) {
-        assistantCtx.turnEndedAt = Date.now();
-        if (assistantCtx.dropAfterTurnEnded) {
-          await flushThinkingBuffer(taskId, assistantCtx, stillCurrent, origin);
-          await assistantCtx.flush();
-          assistantCtx.onTurnEnded?.();
-        }
-      }
+      if (assistantCtx.turnEndedCount === 1) assistantCtx.turnEndedAt = Date.now();
       break;
     }
 
     case "thinking": {
-      if (isAfterTurnEnd(assistantCtx)) {
-        noteReplayDropped(taskId, assistantCtx, "thinking");
-        break;
-      }
       await assistantCtx.flush();
       if (!stillCurrent()) return;
       const chunk = typeof msg.text === "string" ? msg.text : "";
@@ -650,10 +677,6 @@ export const handleSdkMessage = async (
     }
 
     case "tool_call": {
-      // 重放里带工具调用：不丢（用户得看到真有动作在发生），只计数 + 告警
-      if (isAfterTurnEnd(assistantCtx) && msg.status === "running") {
-        noteReplayDropped(taskId, assistantCtx, "toolCalls");
-      }
       await flushThinkingBuffer(taskId, assistantCtx, stillCurrent, origin);
       await assistantCtx.flush();
       if (!stillCurrent()) return;
@@ -839,18 +862,6 @@ export const handleSdkMessage = async (
     }
 
     case "assistant": {
-      // 回合结束后又来的正文 = SDK 重放，丢（不累 buffer、不推打字机帧、不落盘）
-      if (isAfterTurnEnd(assistantCtx)) {
-        let dropped = 0;
-        const replayBlocks = msg.message?.content;
-        if (Array.isArray(replayBlocks)) {
-          for (const block of replayBlocks) {
-            if (block.type === "text" && block.text) dropped += block.text.length;
-          }
-        }
-        noteReplayDropped(taskId, assistantCtx, "assistant", dropped);
-        break;
-      }
       await flushThinkingBuffer(taskId, assistantCtx, stillCurrent, origin);
       if (!stillCurrent()) return;
       // 畸形 SDK 消息可能缺 message / content 非数组 → 直接跳过，避免 TypeError 打崩整轮 run

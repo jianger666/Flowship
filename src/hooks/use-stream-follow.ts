@@ -10,16 +10,34 @@
  * 1. **跟随态是 ref 不是 state**：滚动是热路径，setState 会把整个 EventStream
  *    重渲一遍（几百条 item 的 itemContent 全部重建）；需要跟着变的只有
  *    「AI 在等你回答」悬浮条那一颗子树 → 走 useSyncExternalStore 订阅。
- * 2. **贴底动作 rAF 合批**：SSE 每秒能推几十个 chunk，逐个同步调 scrollToIndex
- *    会把 Virtuoso 的滚动状态机反复重启；一帧最多滚一次、且已经贴底就不空跑。
+ * 2. **贴底动作 rAF 合批 + 自己复查**：SSE 每秒能推几十个 chunk，逐个同步写 scrollTop
+ *    会白白重排；一帧最多贴一次、已经贴底就不动。贴完还会再盯几帧（Virtuoso 渲染新露出的项、
+ *    测完高度后总高会变），连续几帧都贴着才收工；用户一上滚（跟随态翻 false）这条链当场停。
+ *    **不走 Virtuoso 的 scrollToIndex、也不给它传 followOutput**：它们启动的重试链在内容一直
+ *    增长时永不结束、又没有取消接口，用户上滚后仍会每 ~100ms 把人拉回底部
+ *    （2026-10-12 实测，见 scroll-follow 文件头第 4 条）。
  * 3. **notify 走微任务**：初始定位恢复要在渲染期写跟随态，同步 notify 会触发
  *    React「在渲染中更新另一个组件」告警。
+ * 4. **恢复跟随只认「用户往下翻」**（2026-10-12）：手势监听记下最近一次往下翻输入的时间
+ *    （滚轮 / 触摸 / ↓ PageDown End / 点滚动条轨道），scroll 回调里再看本次 scrollTop 是不是
+ *    在变大——输入没过期 + 朝底部走 + 进贴底带，三样齐了才恢复。浏览器平滑滚动动画的后续帧、
+ *    Virtuoso 的补偿 scrollBy 都是「朝底部、进了带」的程序化滚动，没有往下翻输入就骗不了它
+ *    （用户实测的「往回滚一点又弹回底部」）。
+ * 5. **视口高度变化要补一条贴底**：composer 变高 / 窗口缩放时视口变矮，原先靠 Virtuoso 自己的
+ *    「视口变矮就贴底」路径；那条路径跟「内容增高就贴底」共用一个闸门、被我们一起关掉了
+ *    （见 scroll-follow 的 VIRTUOSO_NEVER_AT_BOTTOM），这里用 ResizeObserver 补回来、受跟随态约束。
  */
 
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from "react";
 
 import {
+  DOWN_INTENT_TTL_MS,
+  PIN_SETTLE_MAX_FRAMES,
+  PIN_SETTLE_STABLE_FRAMES,
   distanceFromBottom,
+  isDownIntentKey,
+  isDownIntentTouch,
+  isDownIntentWheel,
   isEditableTarget,
   isScrollbarPointer,
   isUpIntentKey,
@@ -35,7 +53,7 @@ export interface StreamFollowController {
   isFollowing: () => boolean;
   /** 直接改跟随态（初始定位恢复 / 切 task 重置用） */
   setFollowing: (next: boolean) => void;
-  /** 请求贴底：rAF 合批、一帧最多一次、已贴底则不动 */
+  /** 请求贴底：rAF 合批、一帧最多一次、已贴底则不动；贴完再复查几帧、用户上滚即停 */
   requestScrollToBottom: () => void;
   /** 订阅跟随态翻转（useSyncExternalStore） */
   subscribe: (onChange: () => void) => () => void;
@@ -44,15 +62,18 @@ export interface StreamFollowController {
   dispose: () => void;
 }
 
-/** 已经贴到这个距离内就不用再滚了——省掉一次 Virtuoso 滚动状态机空转 */
+/** 已经贴到这个距离内就不用再写 scrollTop 了（同时是复查时「这一帧贴着了」的判定） */
 const ALREADY_AT_BOTTOM_EPS = 1;
 
 /**
  * 控制器工厂（export 供单测直接构造；组件侧一律走下面的 useStreamFollow）。
- * 不接 scroller 时只有「跟随态 + rAF 合批」两件事可用，正好是能在 node 里测的部分。
+ * @param scrollToBottomRef 只在**没有滚动容器可写**时（单测 / Window 滚动）才用的兜底贴底动作；
+ *   挂上 scroller 之后控制器自己写 scrollTop、不再调它。
  */
 export const createStreamFollowController = (
   scrollToBottomRef: { current: () => void },
+  /** 时间源（单测注入、判「往下翻」输入是否还在有效期内） */
+  now: () => number = () => performance.now(),
 ): StreamFollowController => {
   /** 唯一事实源：当前是否跟随最新。初始 true（进来就在底部看最新） */
   let following = true;
@@ -68,27 +89,50 @@ export const createStreamFollowController = (
   let draggingScrollbar = false;
   /** 触摸起点 Y（判断手指往下拖 = 往上翻历史） */
   let touchStartY = 0;
+  /** 上一次 scroll 事件时的 scrollTop（挂上时取当前值）：本次相减得滚动方向 */
+  let lastScrollTop = 0;
+  /** 最近一次用户「往下翻」输入的时间：恢复跟随要求它还在有效期内（程序化滚动没有输入） */
+  let downIntentAt = Number.NEGATIVE_INFINITY;
 
   const notify = () => {
     for (const listener of listeners) listener();
   };
 
+  /** 取消还没执行的贴底 / 复查帧 */
+  const cancelPin = () => {
+    if (scrollRaf === null) return;
+    cancelAnimationFrame(scrollRaf);
+    scrollRaf = null;
+  };
+
   const setFollowing = (next: boolean) => {
     if (next === following) return;
     following = next;
+    // 用户离开底部：还没执行的贴底 / 复查作废（帧回调里还会再看一眼跟随态，双保险）
+    if (!next) cancelPin();
     // 微任务通知：允许渲染期写入（初始定位恢复）而不触发 React 跨组件更新告警
     queueMicrotask(notify);
   };
 
-  /** 用「当前几何 + 是否有上滚意图」跑一次状态机 */
-  const evaluate = (userIntentUp: boolean) => {
+  /** 用「当前几何 + 上滚意图 + 往下翻输入 + 本次滚动方向」跑一次状态机 */
+  const evaluate = (
+    userIntentUp: boolean,
+    userIntentDown: boolean,
+    scrollDelta: number,
+  ) => {
     if (!scroller) return;
     setFollowing(
       nextFollowing(following, {
         distanceFromBottom: distanceFromBottom(scroller),
         userIntentUp,
+        userIntentDown,
+        scrollDelta,
       }),
     );
+  };
+
+  const markDownIntent = () => {
+    downIntentAt = now();
   };
 
   // ---------- DOM 监听 ----------
@@ -96,13 +140,20 @@ export const createStreamFollowController = (
   // 手势触发时浏览器还没滚，几何是旧的，此刻判会误判。
 
   const onScroll = () => {
+    if (!scroller) return;
     const intent = intentUp || draggingScrollbar;
     intentUp = false;
-    evaluate(intent);
+    // 每个 scroll 事件都要更新基准（不能只在挂上时记一次）：用户先上滚很远、再往下滚回来时，
+    // 「往下」是相对上一帧而言的
+    const top = scroller.scrollTop;
+    const scrollDelta = top - lastScrollTop;
+    lastScrollTop = top;
+    evaluate(intent, now() - downIntentAt <= DOWN_INTENT_TTL_MS, scrollDelta);
   };
 
   const onWheel = (e: WheelEvent) => {
     if (isUpIntentWheel(e.deltaY)) intentUp = true;
+    else if (isDownIntentWheel(e.deltaY)) markDownIntent();
   };
 
   const onTouchStart = (e: TouchEvent) => {
@@ -112,6 +163,7 @@ export const createStreamFollowController = (
   const onTouchMove = (e: TouchEvent) => {
     const y = e.touches[0]?.clientY ?? 0;
     if (isUpIntentTouch(y - touchStartY)) intentUp = true;
+    else if (isDownIntentTouch(y - touchStartY)) markDownIntent();
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -120,6 +172,7 @@ export const createStreamFollowController = (
       return;
     }
     if (isUpIntentKey(e.key)) intentUp = true;
+    else if (isDownIntentKey(e.key)) markDownIntent();
   };
 
   const onPointerDown = (e: PointerEvent) => {
@@ -127,12 +180,52 @@ export const createStreamFollowController = (
     if (!scroller || e.target !== scroller) return;
     if (isScrollbarPointer(e.offsetX, scroller.clientWidth)) {
       draggingScrollbar = true;
+      // 点轨道翻页可能是往下翻：松手后的动画帧要能把人带回贴底（拖动期间仍按上滚意图算）
+      markDownIntent();
     }
   };
 
   const onPointerUp = () => {
     draggingScrollbar = false;
   };
+
+  /**
+   * 排一帧「贴底 + 复查」。progress 跨帧共用：
+   * - stable：已经连续几帧看到贴着了（够 PIN_SETTLE_STABLE_FRAMES 才收工）
+   * - budget：还剩几帧可盯（内容一直在长时不无限续命）
+   */
+  const schedulePin = (progress: { stable: number; budget: number }) => {
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = null;
+      // 用户已经离开底部：这条链到此为止——上滚之后绝不再动他
+      if (!following) return;
+      // 没有滚动容器可写（单测 / Window 滚动）：退回外部给的贴底动作，做一次就算
+      if (!scroller) {
+        scrollToBottomRef.current();
+        return;
+      }
+      if (distanceFromBottom(scroller) <= ALREADY_AT_BOTTOM_EPS) {
+        // 贴着了：再盯几帧——Virtuoso 刚渲染的新项测完高度后总高可能又变、把距底拉开
+        progress.stable += 1;
+        if (progress.stable >= PIN_SETTLE_STABLE_FRAMES) return;
+      } else {
+        progress.stable = 0;
+        // 浏览器会把过大的值夹到最大可滚位置
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+      progress.budget -= 1;
+      if (progress.budget > 0) schedulePin(progress);
+    });
+  };
+
+  const requestScrollToBottom = () => {
+    // 已经有一条链在跑（排着队 / 复查中）：合并进去，它每帧都会重新看几何
+    if (scrollRaf !== null) return;
+    schedulePin({ stable: 0, budget: PIN_SETTLE_MAX_FRAMES });
+  };
+
+  /** 视口高度观察者（原因见 attachScroller 里的说明） */
+  let viewportObserver: ResizeObserver | null = null;
 
   const detach = () => {
     if (!scroller) return;
@@ -143,6 +236,8 @@ export const createStreamFollowController = (
     scroller.removeEventListener("keydown", onKeyDown);
     scroller.removeEventListener("pointerdown", onPointerDown);
     window.removeEventListener("pointerup", onPointerUp);
+    viewportObserver?.disconnect();
+    viewportObserver = null;
     scroller = null;
   };
 
@@ -153,6 +248,7 @@ export const createStreamFollowController = (
     detach();
     if (!next) return;
     scroller = next;
+    lastScrollTop = next.scrollTop;
     // 全部 passive：我们只观察、不 preventDefault，别拖慢原生滚动
     scroller.addEventListener("scroll", onScroll, { passive: true });
     scroller.addEventListener("wheel", onWheel, { passive: true });
@@ -162,19 +258,21 @@ export const createStreamFollowController = (
     scroller.addEventListener("pointerdown", onPointerDown, { passive: true });
     // pointerup 挂 window：拖着滚动条把鼠标移出容器再松手也能收尾
     window.addEventListener("pointerup", onPointerUp, { passive: true });
-  };
-
-  const requestScrollToBottom = () => {
-    if (scrollRaf !== null) return;
-    scrollRaf = requestAnimationFrame(() => {
-      scrollRaf = null;
-      if (!following) return;
-      // 已经贴着了就别调——每次 scrollToIndex 都会重启 Virtuoso 的滚动状态机
-      if (scroller && distanceFromBottom(scroller) <= ALREADY_AT_BOTTOM_EPS) {
-        return;
-      }
-      scrollToBottomRef.current();
-    });
+    // 视口高度变化（composer 变高 / 窗口缩放）：跟随中就重新贴底。
+    // Virtuoso 自己有一条「视口变矮 → 贴底」的路径，但它跟「内容增高自动贴底」共用同一个
+    // atBottomThreshold 判定、被我们一起关掉了（原因见 scroll-follow 的 VIRTUOSO_NEVER_AT_BOTTOM），
+    // 这里补回来——并且受跟随态闸门约束，用户在翻历史时不动他。
+    // 只认高度变化：宽度变化是重排、不是「视口变矮」；observe 的首次回调高度没变、天然被滤掉
+    if (typeof ResizeObserver !== "undefined") {
+      let lastClientHeight = next.clientHeight;
+      viewportObserver = new ResizeObserver(() => {
+        const height = next.clientHeight;
+        if (height === lastClientHeight) return;
+        lastClientHeight = height;
+        if (following) requestScrollToBottom();
+      });
+      viewportObserver.observe(next);
+    }
   };
 
   return {
@@ -189,8 +287,7 @@ export const createStreamFollowController = (
     getSnapshot: () => following,
     dispose: () => {
       detach();
-      if (scrollRaf !== null) cancelAnimationFrame(scrollRaf);
-      scrollRaf = null;
+      cancelPin();
       listeners.clear();
     },
   };
@@ -198,7 +295,8 @@ export const createStreamFollowController = (
 
 /**
  * 建一个跟随控制器（每个事件流实例一个、引用恒定）。
- * @param scrollToBottom 真正执行贴底的动作（Virtuoso scrollToIndex），
+ * @param scrollToBottom 没有滚动容器可写时的兜底贴底动作（Virtuoso scrollToIndex）；
+ *   挂上 scroller 后控制器自己写 scrollTop、不会调它。
  *   由调用方提供、内部 ref 化取最新，避免控制器绑死某一版闭包。
  */
 export const useStreamFollow = (

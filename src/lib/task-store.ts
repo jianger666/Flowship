@@ -16,6 +16,7 @@ import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { bootArgsForTask } from "./agent-provider";
 import { getSettings } from "./local-store";
+import type { ThinkingSnapshot } from "./thinking-live";
 import {
   type ActionRecord,
   type ArtifactRevision,
@@ -455,8 +456,13 @@ interface SSEEnvelope {
     | "done"
     | "error"
     | "assistant_delta"
-    /** 思考实时增量（纯内存、不落盘）：只用来显示「思考中」+ 最近一行 */
+    /** 思考实时增量（纯内存、不落盘）：只用来显示进行中的思考（实时文本区 + 「思考中 · 计时」） */
     | "thinking_delta"
+    /**
+     * 进行中思考的快照（bootstrap 末尾无条件一帧）：live 为对象 = 此刻正在思考、带已发出的文本；
+     * null = 没在思考。让重新订阅的前端接着长、而不是从头开始
+     */
+    | "thinking_snapshot"
     /** 队列整队失败控制帧 */
     | "queue_failed"
     /** bootstrap 队列存活快照 */
@@ -476,6 +482,15 @@ interface SSEEnvelope {
   text?: string;
   /** thinking_delta 帧：这段思考落盘后那条 thinking 事件的 id */
   eventId?: string;
+  /** event 帧：true = bootstrap 回放的历史尾部事件（不是刚发生的）；实时事件不带这个字段 */
+  replay?: boolean;
+  /** thinking_snapshot 帧：进行中思考的快照；null = 没在思考。字段按「不可信输入」逐项校验 */
+  live?: {
+    eventId?: unknown;
+    text?: unknown;
+    total?: unknown;
+    since?: unknown;
+  } | null;
   itemIds?: string[];
   reason?: string;
   /** bootstrap queue_state 有界终态 ledger */
@@ -494,6 +509,33 @@ interface SSEEnvelope {
   /** restricted_run 帧：旁路答疑此刻在不在飞 */
   active?: boolean;
 }
+
+/** onEvent 的附加信息：只在 bootstrap 回放的历史事件上才有（实时事件不传第二个参数） */
+export interface TaskEventMeta {
+  replay: true;
+}
+
+/**
+ * thinking_snapshot 帧的 live 字段 → ThinkingSnapshot：
+ *   - null → null（明确的「没在思考」）；
+ *   - 字段齐全且类型对（eventId 非空串、text 字符串、total 有限非负数、since 有限数）→ 快照；
+ *   - 其它（缺字段 / 类型不对 / 缺 live）→ undefined（无效帧，调用方丢弃）。
+ * 线上字段叫 eventId（与 thinking_delta 帧一致），前端内部叫 id（与 LiveThinking.id 一致）。
+ */
+const parseThinkingSnapshot = (
+  live: SSEEnvelope["live"] | undefined,
+): ThinkingSnapshot | null | undefined => {
+  if (live === null) return null;
+  if (typeof live !== "object" || live === undefined) return undefined;
+  const { eventId, text, total, since } = live;
+  if (typeof eventId !== "string" || eventId.length === 0) return undefined;
+  if (typeof text !== "string") return undefined;
+  if (typeof total !== "number" || !Number.isFinite(total) || total < 0) {
+    return undefined;
+  }
+  if (typeof since !== "number" || !Number.isFinite(since)) return undefined;
+  return { id: eventId, text, total, since };
+};
 
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
   const dataLines = frame
@@ -521,7 +563,12 @@ const parseSseEvent = (frame: string): SSEEnvelope | null => {
  * 多个 tab 同时 watch 都行、互不干扰。
  */
 export interface TaskStreamCallbacks {
-  onEvent?: (ev: TaskEvent) => void;
+  /**
+   * 落盘事件。meta.replay === true = bootstrap 回放的历史尾部事件（重连 / 重挂时前端重新读一遍的旧账），
+   * **不是**刚发生的事——上层不能据此判断「这段思考 / 流式回复结束了」（会把重连后从快照接上的实时态清掉）。
+   * 实时事件不传第二个参数。
+   */
+  onEvent?: (ev: TaskEvent, meta?: TaskEventMeta) => void;
   onTaskUpdate?: (task: Task) => void;
   onActionUpdate?: (action: ActionRecord) => void;
   onDone?: (task: Task, ok: boolean) => void;
@@ -540,6 +587,14 @@ export interface TaskStreamCallbacks {
    * 上层用它把进行中的行与落盘后的行对成同一个节点；id 变了就是新的一段。
    */
   onThinkingDelta?: (text: string, eventId: string) => void;
+  /**
+   * 进行中思考的快照（每次连接 bootstrap 末尾恰好一帧）：
+   *   - 对象 = 此刻正在思考，带服务端已发出的文本窗口 / 累计字符数 / 首帧时刻——
+   *     上层用它重建（或对齐）实时态，**接着往下长**，不从头吐；
+   *   - null = 此刻没在思考——上层清掉本地可能残留的实时态。
+   * 无效帧（字段缺失 / 类型不对）直接丢弃、不回调：宁可不动本地状态，也别拿脏数据覆盖它。
+   */
+  onThinkingSnapshot?: (snapshot: ThinkingSnapshot | null) => void;
   /**
    * 队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
    */
@@ -641,7 +696,13 @@ export const watchTaskStream = async (
         const env = parseSseEvent(frame);
         if (env) {
           if (env.type === "event" && env.event) {
-            callbacks.onEvent?.(env.event);
+            // 只有 replay 严格等于 true（布尔）才算回放；其它任何值（含字符串 "true"）都当实时事件。
+            // 回放时才传第二个参数——实时事件的调用形状（单参数）保持不变
+            if (env.replay === true) {
+              callbacks.onEvent?.(env.event, { replay: true });
+            } else {
+              callbacks.onEvent?.(env.event);
+            }
           } else if (env.type === "task" && env.task) {
             // 合法 bootstrap task 帧：先发 connection-established，再转发 task
             if (!connectionEstablished) {
@@ -668,6 +729,10 @@ export const watchTaskStream = async (
             env.eventId.length > 0
           ) {
             callbacks.onThinkingDelta?.(env.text, env.eventId);
+          } else if (env.type === "thinking_snapshot") {
+            // 无效帧丢弃（undefined）：不动本地状态；null / 合法对象才回调
+            const snap = parseThinkingSnapshot(env.live);
+            if (snap !== undefined) callbacks.onThinkingSnapshot?.(snap);
           } else if (
             env.type === "queue_failed" &&
             Array.isArray(env.itemIds)

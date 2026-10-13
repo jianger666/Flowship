@@ -104,6 +104,8 @@ export interface RunFailureSummary {
   // 是否「裸 status=error 无诊断」类（连接断 or 额度用完、二者 SDK 层无法区分）——
   // 调用方据此决定要不要加「失败 / 异常」前缀
   isConnectionDrop: boolean;
+  // 命中「SDK 自己放弃了」类终态报错（见 SDK_GIVE_UP_RULES）：text 是友好文案、这类绝不自动重连
+  isSdkGiveUp: boolean;
   // 完整原始诊断串（message + SDK 字段、始终算出）。连接断 / 额度时 text 是友好文案、
   // 但 detail 仍保留原始——调用方落进 error event 的 meta、事后可从 events.jsonl 直接定位、
   // 不必翻 app console。这也是排查「额度 vs 连接断」唯一能留下的线索（SDK 公开 API 不暴露 errorCode）。
@@ -117,6 +119,66 @@ export interface RunFailureSummary {
 // 引导用户自行确认额度、不把额度用完误导成纯网络问题。
 const BARE_RUN_DROP_TEXT =
   "本轮异常结束——可能是长连接断开（等待太久 / 网络·代理中断 / 电脑休眠），也可能是 Cursor 额度·用量已用完。请先确认账号额度；额度正常多为连接断开、重新发起本轮通常可恢复。";
+
+/**
+ * SDK 自己「放弃」本轮的终态报错（Bug #3）。
+ *
+ * 这两句都出自 @cursor/sdk 内部（Flowship 代码里没有），随后 run.wait() 返回 status=error：
+ * - "Agent turn stopped after repeated resume attempts made no progress"
+ *   SDK 内部有一层自动续接——连接异常时它不报错，而是从最近的检查点重发（检查点之后的内容会被
+ *   重新生成）；连续多次续接都「收到了流数据、却没产生新检查点」就抛这句放弃。
+ *   2026-10 起在 claude-sonnet-5-5 [max] 的长回合里实测出现，报错前常伴随同一问题的多遍回答。
+ * - "Connection failed repeatedly"
+ *   SDK 传输层连续多次连接失败后放弃。
+ *
+ * 共同点：SDK 内部已经自己重试 / 续接过很多次才放弃。Flowship 再自动重连一轮多半只会再来一遍
+ * （续接会让模型把检查点之后的内容重新生成，用户看到的是又一遍重复回答、还白烧 token），
+ * 所以：① 给一句看得懂的话，原始诊断照旧落 meta.detail（错误卡可展开）；
+ * ② isRetryableRunError 一律判否，绝不自动重连。
+ *
+ * 文案只陈述报错本身的意思，不断言「为什么续接」——根因（服务端 / 网络 / 停滞检测）目前
+ * 仍没有公开钩子可区分，不在文案里编。
+ */
+export interface SdkGiveUpRule {
+  /** 规则标识（单测 / 日志用） */
+  id: "no-progress" | "connection-failed";
+  re: RegExp;
+  /** 给用户看的文案 */
+  text: string;
+}
+
+export const SDK_GIVE_UP_RULES: readonly SdkGiveUpRule[] = [
+  {
+    id: "no-progress",
+    re: /repeated resume attempts made no progress/i,
+    text: "SDK 在断线续接时连续多次都没能继续（没有存下新进度），已放弃本轮。已生成的内容保留在上方，其中若有同一问题的多遍回答，请别混着看、以最后一个完整的版本为准；发一条消息即可接着继续。",
+  },
+  {
+    id: "connection-failed",
+    re: /connection failed repeatedly/i,
+    text: "SDK 连续多次连接失败，已放弃本轮（网络或服务端不稳）。已生成的内容保留在上方；稍后发一条消息即可接着继续。",
+  },
+];
+
+/** 命中「SDK 自己放弃了」类终态报错就回规则，否则 null。 */
+export const matchSdkGiveUp = (rawMessage: string): SdkGiveUpRule | null =>
+  SDK_GIVE_UP_RULES.find((r) => r.re.test(rawMessage)) ?? null;
+
+/**
+ * run 以非 finished 收场（status=error / expired …）时抛的 Error。
+ *
+ * 比裸 `new Error(message)` 多保留一样东西：SDK 给的终态错误（`result.error`）作 `cause`——
+ * handleRunFailure 的 console.error 会连 [cause] 一起打进 main.log，事后不必只靠
+ * 被 slice(1500) 截断的 dump 串去定位。cause 不是 Error 实例，extractSdkErrorBits 不会读它，
+ * 所以不改变任何既有的「连接断 / 真错」判定。
+ */
+export const buildRunNotFinishedError = (
+  message: string,
+  result: { error?: unknown },
+): Error =>
+  result.error
+    ? new Error(message, { cause: result.error })
+    : new Error(message);
 
 /**
  * 把 run 失败归一成「给用户看的事件文案」+ 始终算出的原始 detail。
@@ -149,6 +211,9 @@ export const isRetryableRunError = (
   attempt?: number,
 ): boolean => {
   const summary = summarizeRunFailure(rawMessage, err);
+  // SDK 自己已经重试 / 续接多次才放弃——我们再重连一轮多半只会再重放一遍，最先判否
+  //（即使同时带 isRetryable / 网络类关键字也不重连）
+  if (summary.isSdkGiveUp) return false;
   if (summary.isConnectionDrop) return true;
   const bits = extractSdkErrorBits(err);
   if (bits.isRetryable === true) return true;
@@ -173,6 +238,16 @@ export const summarizeRunFailure = (
   const bits = extractSdkErrorBits(err);
   // 始终算原始诊断、落 meta（连接断 / 额度时 UI 显示友好文案、但原始细节不丢）
   const detail = buildSdkErrorMessage(rawMessage, err);
+  // SDK 自己放弃本轮：一句看得懂的话；原始串（含 SDK error fields）照旧在 detail 里
+  const giveUp = matchSdkGiveUp(rawMessage);
+  if (giveUp) {
+    return {
+      isConnectionDrop: false,
+      isSdkGiveUp: true,
+      text: giveUp.text,
+      detail,
+    };
+  }
   // 三道闸全过才算「裸 status=error 无诊断」：①裸 status 形态 ②err 无 code/cause（保守：有 code
   // 先当真错留详情、含 14 UNAVAILABLE / 4 DEADLINE 这类会走详情分支、属可接受 false-negative）
   // ③dump 里没塞诊断字段。误吞比漏报更伤、所以宁可少判、不可吞掉 RCA 线索。
@@ -182,7 +257,12 @@ export const summarizeRunFailure = (
     !dumpHasDiagnostic(rawMessage);
   if (isConnectionDrop) {
     // 「通常可恢复」不写死「即可恢复」——resume 可能因后端已清 run 失败、不过度承诺（reviewAI P2）。
-    return { isConnectionDrop: true, text: BARE_RUN_DROP_TEXT, detail };
+    return {
+      isConnectionDrop: true,
+      isSdkGiveUp: false,
+      text: BARE_RUN_DROP_TEXT,
+      detail,
+    };
   }
-  return { isConnectionDrop: false, text: detail, detail };
+  return { isConnectionDrop: false, isSdkGiveUp: false, text: detail, detail };
 };

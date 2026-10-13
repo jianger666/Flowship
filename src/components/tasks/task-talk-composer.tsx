@@ -394,6 +394,8 @@ export const TaskTalkComposer = ({
           submitting={submitting}
           leading={
             <span className="flex min-w-0 flex-1 items-center gap-1.5">
+              {/* 收缩契约与 ProviderModelPicker（compact）一致：提供方 96px 不让位、
+                  模型保底 min-w-32；放不下由 RichInput footer 折行（basis-58 = 两个保底之和） */}
               <Tooltip content="切换提供方（丢精细上下文，只留消息记录 + 磁盘文件 + worktree）">
                 <span className="inline-flex w-auto max-w-24 shrink-0">
                   <Picker
@@ -407,7 +409,7 @@ export const TaskTalkComposer = ({
                   />
                 </span>
               </Tooltip>
-              <span className="min-w-0 flex-1">
+              <span className="min-w-32 flex-1">
                 <ModelSelect
                   models={models}
                   selection={pickedModel}

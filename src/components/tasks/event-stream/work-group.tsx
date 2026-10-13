@@ -10,9 +10,10 @@
  */
 
 import { memo, useMemo, useRef, useState } from "react";
-import { ChevronRight, Loader2, X } from "lucide-react";
+import { Loader2, TriangleAlert, X } from "lucide-react";
 
 import { usePaneSearchHighlight } from "@/components/ui/pane-search-highlight-context";
+import { Tooltip } from "@/components/ui/tooltip";
 import { useStreamFollowContext } from "@/hooks/use-stream-follow";
 import {
   PROCESSING_PLACEHOLDER_LABEL,
@@ -23,7 +24,6 @@ import {
 } from "@/lib/chat-turns";
 import { formatDurationCoarse } from "@/lib/duration-display";
 import { shouldPinWorkGroupOpen } from "@/lib/scroll-follow";
-import { THINKING_LIVE_LABEL, thinkingTextToLine } from "@/lib/thinking-live";
 import {
   isToolBlock,
   isToolVerbGroup,
@@ -33,6 +33,7 @@ import type { Task, TaskEvent } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { EventRow } from "./rows";
+import { CollapseChevron, PROCESS_ROW_BUTTON } from "./stream-style";
 import { ToolBlockRow, ToolVerbGroupRow } from "./tool-block";
 
 // ---------- 耗时 / 活动摘要 ----------
@@ -100,24 +101,13 @@ const WorkGroupMember = ({
   );
 };
 
-// ---------- 组头 chevron（与 ToolBlockRow 同款旋转） ----------
-
-const CollapseChevron = ({ open }: { open: boolean }) => (
-  <ChevronRight
-    className={cn(
-      "size-3 shrink-0 opacity-50 transition-transform duration-150",
-      open && "rotate-90",
-    )}
-  />
-);
-
 // ---------- WorkGroupRow ----------
 
 /** 工具都完成后的空等：转圈挂在这一行，不让 write 一直像没结束 */
 const ProcessingPlaceholderRow = () => (
-  <div className="flex w-full min-w-0 items-center gap-1.5 px-1 py-0.5 text-xs text-muted-foreground">
+  <div className="flex w-full min-w-0 items-center gap-1.5 px-1.5 py-1 text-xs text-muted-foreground">
     <Loader2 className="size-3.5 shrink-0 animate-spin text-info" />
-    <span className="text-[11px]">{PROCESSING_PLACEHOLDER_LABEL}</span>
+    <span>{PROCESSING_PLACEHOLDER_LABEL}</span>
   </div>
 );
 
@@ -192,11 +182,10 @@ const WorkGroupRowImpl = ({
   if (!expanded) {
     const tailMember = group.members[group.members.length - 1];
     if (isLiveThinkingEvent(tailMember)) {
-      // 正在思考：折叠时组头也说「思考中 · 最近一行」，别让用户以为卡住
-      const line = thinkingTextToLine(tailMember.text);
-      runningTail = line
-        ? `${THINKING_LIVE_LABEL} · ${line}`
-        : THINKING_LIVE_LABEL;
+      // 正在思考：组头不摘思考原文。原文在展开区的思考行里滚动展示、状态行已说「思考中 · 12s」，
+      // 折叠态的组头（本来就有转圈）再摘一行就是第三处重复，而且那一行每个新字都在变。
+      // 显式占住这个分支：别落到下面「最近 running 工具名」上去说一个早已结束的工具
+      runningTail = null;
     } else if (group.hasRunning) {
       runningTail = lastRunningName(group.members);
     } else if (showProcessingPlaceholder) {
@@ -209,21 +198,31 @@ const WorkGroupRowImpl = ({
       <button
         type="button"
         onClick={() => setManual(!expanded)}
-        className="flex h-7 w-full cursor-pointer items-center gap-1.5 rounded px-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:bg-muted/30 hover:text-muted-foreground"
+        aria-expanded={expanded}
+        className={cn(PROCESS_ROW_BUTTON, "h-7 py-0")}
       >
         <CollapseChevron open={expanded} />
-        <span className="shrink-0">{allBoot ? "启动过程" : "工作过程"}</span>
+        <span className="shrink-0 font-medium">
+          {allBoot ? "启动过程" : "工作过程"}
+        </span>
         {hasBootWarn && (
-          <span
-            className="shrink-0"
-            title="含警告（多为 MCP 跳过），展开查看"
-          >
-            ⚠️
-          </span>
+          // 原来是 emoji ⚠️ + 原生 title：emoji 不跟主题走、原生 title 违反 Hover 提示规范
+          <Tooltip content="含警告（多为 MCP 跳过），展开查看">
+            <span className="inline-flex shrink-0">
+              <TriangleAlert
+                aria-label="含警告"
+                className="size-3 text-warning"
+              />
+            </span>
+          </Tooltip>
         )}
         <span className="shrink-0 tabular-nums">· {group.stepCount} 步</span>
         {group.hasRunning ? (
-          <Loader2 className="size-3 shrink-0 animate-spin text-info" />
+          // 动效收敛（每屏同时在动的元素 ≤ 1~2 个）：展开时成员行（当前在跑的工具 / 实时思考）
+          // 自己会转，底部状态行还有 shimmer，组头再转一个就是同屏三处。折叠时才由组头替成员转圈。
+          expanded ? null : (
+            <Loader2 className="size-3 shrink-0 animate-spin text-info" />
+          )
         ) : (
           // 同秒完成（<1s）不显示「0s」——空字符串时整段不渲染
           formatGroupDuration(group.startTs, group.endTs) && (
@@ -239,14 +238,14 @@ const WorkGroupRowImpl = ({
           />
         )}
         {runningTail && (
-          <span className="min-w-0 flex-1 truncate font-mono opacity-80">
+          <span className="min-w-0 flex-1 truncate font-mono">
             {runningTail}
           </span>
         )}
       </button>
 
       {expanded && (
-        <div className="ml-2 mt-0.5 min-w-0 max-w-full space-y-0.5 border-l border-border/40 pl-2.5">
+        <div className="ml-2 mt-0.5 min-w-0 max-w-full space-y-0.5 border-l border-border pl-2.5">
           {group.members.map((m) => (
             <WorkGroupMember
               key={m.id}

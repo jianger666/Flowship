@@ -101,6 +101,38 @@ export const MARKDOWN_PROSE_DOCUMENT = cn(
   "prose-code:before:content-none prose-code:after:content-none",
   "min-w-0 wrap-break-word",
 );
+
+/** chat 变体的正文字号档，见 MarkdownTextProps.size */
+export type MarkdownTextSize = "default" | "reply";
+
+/**
+ * 对话正文档（ui-conventions「字号阶梯」的 15px）。
+ *
+ * ⚠ 必须落在 **prose 元素自己**身上，包在外层 div 上无效：typography 的 `.prose-sm` 在 prose 元素上
+ * 自带 `font-size:.875rem; line-height:1.714`，外层的 `text-[15px] leading-7` 只会被它盖掉——
+ * 2026-07-21 立 15px 起 AI 正文实际一直是 14px / 24px，2026-10-12 浏览器实测才发现。
+ * 所以 AI 回复一律传 `<MarkdownText size="reply">`；外层 wrapper 可以继续写这个常量
+ * （给 wrapper 里非 prose 的元素用），但正文字号不靠它。
+ */
+export const MARKDOWN_REPLY_TEXT = "text-[15px] leading-7";
+
+/**
+ * reply 档在 prose 元素上加的类：正文 15px / leading-7 + 行内 code 钉 12px。
+ * prose-sm 里行内 code 是 `.857em`，基准从 14px 抬到 15px 后会变 12.86px——落在字号阶梯
+ * （15 / 14 / 12 / 11）之外，所以钉回 `text-xs`。选择器 `:not(pre)>code` 只命中行内 code，
+ * 代码块里的 `pre > code` 不受影响（它由 globals.css 管）。
+ */
+const REPLY_PROSE_CLASS = cn(MARKDOWN_REPLY_TEXT, "[&_:not(pre)>code]:text-xs");
+
+/**
+ * 路径类行内 code（可点开的文件路径）的字号：默认 `0.85em`（14px 基准下 ≈ 12px）；
+ * reply 档（15px 基准）下 em 派生会落到 12.75px（阶梯外），钉 `text-xs`。
+ */
+const PATH_CODE_SIZE: Record<MarkdownTextSize, string> = {
+  default: "text-[0.85em]",
+  reply: "text-xs",
+};
+
 // remarkCodeReference 插入的出处行：`path · L12-34`
 const CODE_REF_CAPTION_SEP = " · L";
 
@@ -119,6 +151,7 @@ const parseCodeRefCaption = (
 
 const buildMarkdownComponents = (
   linker: LocalFilePathLinker,
+  size: MarkdownTextSize,
 ): Components =>
   ({
     a: MarkdownLink,
@@ -145,7 +178,7 @@ const buildMarkdownComponents = (
               linker={linker}
               parsedPath={parsed.path}
               segments={parsed.segments}
-              className="text-[0.85em]"
+              className={PATH_CODE_SIZE[size]}
             />
           );
         }
@@ -153,7 +186,9 @@ const buildMarkdownComponents = (
           return (
             <Tooltip content={text}>
               <span className="min-w-0 max-w-full" {...rest}>
-                <span className="font-mono text-[0.85em] text-foreground">{text}</span>
+                <span className={cn("font-mono text-foreground", PATH_CODE_SIZE[size])}>
+                  {text}
+                </span>
               </span>
             </Tooltip>
           );
@@ -163,7 +198,10 @@ const buildMarkdownComponents = (
             linker={linker}
             path={pathText}
             line={line}
-            linkClassName="font-mono text-[0.85em] text-info underline-offset-2 hover:underline"
+            linkClassName={cn(
+              "font-mono text-info underline-offset-2 hover:underline",
+              PATH_CODE_SIZE[size],
+            )}
           >
             {caption?.display ?? pathDisplayLabel(resolved.absolute)}
           </LocalFileLink>
@@ -181,6 +219,13 @@ interface MarkdownTextProps {
   baseDir?: string;
   /** chat = 事件流密度；document = 产物栏 / 预览弹窗文档面（同 MARKDOWN_PROSE_DOCUMENT） */
   variant?: "chat" | "document";
+  /**
+   * 正文字号档（只对 variant="chat" 生效）：
+   * - default：14px（prose-sm 原值）——问答卡、工具产出等次要面
+   * - reply：对话正文 15px / leading-7（{@link MARKDOWN_REPLY_TEXT}）——**AI 回复**一律用这档；
+   *   流式占位与定稿必须同档，否则流式结束换成正式行时整段文字会跳一下
+   */
+  size?: MarkdownTextSize;
   /** 外层 prose 容器额外 class */
   className?: string;
   /** 栏内搜索：事件 / 产物 ownerId（与 PaneSearchHighlightContext 或显式 props 配合） */
@@ -198,6 +243,7 @@ const MarkdownTextImpl = ({
   streaming,
   baseDir,
   variant = "chat",
+  size = "default",
   className,
   searchOwnerId,
   searchField = "body",
@@ -207,8 +253,8 @@ const MarkdownTextImpl = ({
 }: MarkdownTextProps) => {
   const linker = useLocalFilePathLinker(baseDir);
   const components = useMemo(
-    () => buildMarkdownComponents(linker),
-    [linker],
+    () => buildMarkdownComponents(linker, size),
+    [linker, size],
   );
   // Application Support 等路径带空格：裸 markdown 图 destination 会被截断，包 <> 后再解析
   const displayText = useMemo(
@@ -253,6 +299,7 @@ const MarkdownTextImpl = ({
             "prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0",
             "prose-headings:mt-2 prose-headings:mb-1",
             "prose-code:before:content-none prose-code:after:content-none",
+            size === "reply" && REPLY_PROSE_CLASS,
           ],
       className,
     )}

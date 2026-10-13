@@ -44,7 +44,8 @@ import {
   parseAndValidateSkills,
 } from "@/lib/server/route-helpers";
 import {
-  getTask,
+  getTaskMeta,
+  getTaskWithTailEvents,
   setTaskRemoveSourceBranchOnMerge,
 } from "@/lib/server/task-fs";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
@@ -58,6 +59,9 @@ import {
   type DevPushMode,
   type ReplanMode,
 } from "@/lib/types";
+
+/** 响应里带回的尾部事件条数（与任务页首屏 EVENT_TAIL 同值） */
+const RESPONSE_EVENT_TAIL = 300;
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -209,7 +213,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  const task = await getTask(id);
+  // 只读 meta：本路由与 advanceTask 都不读 task.events（状态机字段才是判定依据），
+  // 不必为每次推进整文件 parse 事件日志
+  const task = await getTaskMeta(id);
   if (!task) return errorResponse("not_found", 404);
 
   // lifecycle 非 null（stopping/deleting/finalizing）一律拒推进
@@ -296,7 +302,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
 
     // 重新读 task（advanceTask 内部已 publish、这里只为返最新 snapshot）
-    const fresh = await getTask(task.id);
+    // 响应只带尾部事件：客户端 mergeTaskEvents 只吸收本地末尾之后的新事件、更早的一律丢弃
+    const fresh = await getTaskWithTailEvents(task.id, RESPONSE_EVENT_TAIL);
     return new Response(
       JSON.stringify({ ok: true, task: fresh ?? task, action }),
       { status: 200, headers: { "Content-Type": "application/json" } },

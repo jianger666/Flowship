@@ -411,7 +411,7 @@ export const PreferenceSections = ({
             <code className="font-mono">{"{taskTitle}"}</code>{" "}
             <code className="font-mono">{"{date:MM-dd}"}</code>
             ；预览：
-            <code className="font-mono text-foreground/80">{preview}</code>
+            <code className="font-mono text-foreground">{preview}</code>
           </>
         }
         control={

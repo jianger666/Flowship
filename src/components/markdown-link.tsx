@@ -49,7 +49,7 @@ export const MarkdownLink = ({
   if (!href || !CLICKABLE.test(href)) {
     return (
       <Tooltip content={href}>
-        <span className="font-mono text-[0.9em] text-foreground/80">
+        <span className="font-mono text-[0.9em] text-foreground">
           {children}
         </span>
       </Tooltip>

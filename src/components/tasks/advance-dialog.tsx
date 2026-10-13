@@ -1190,10 +1190,13 @@ export const AdvanceDialog = ({
         selected={selectedBatchIds.includes(b.effectiveId)}
         onClick={() => toggleBatch(b.effectiveId)}
         disabled={submitting}
-        className="flex flex-col items-start gap-0.5"
+        className="flex min-w-0 flex-col items-start gap-0.5"
       >
         <div className="flex w-full items-center gap-1.5">
-          <span className="min-w-0 truncate text-xs font-medium">{b.title}</span>
+          {/* 标题单行省略；被截断时悬停看全文（批次标题是用户挑批次的主要依据） */}
+          <span className="min-w-0 truncate text-xs font-medium" title={b.title}>
+            {b.title}
+          </span>
           <Badge variant="outline" size="xs">
             #{b.sourceActionN}
           </Badge>
@@ -1208,7 +1211,9 @@ export const AdvanceDialog = ({
             </Badge>
           )}
         </div>
-        <span className="min-w-0 truncate text-[11px] text-muted-foreground">
+        {/* max-w-full：父级 items-start 下，列方向 flex 的子项宽度 = fit-content（nowrap 文本的整句宽），
+            min-w-0 管不到横向，必须再封顶到父宽，truncate 才截得到 */}
+        <span className="max-w-full min-w-0 truncate text-[11px] text-muted-foreground">
           {b.rawId} · {TEST_STRATEGY_LABEL[b.testStrategy]}
           {b.taskRefs.length > 0 ? ` · ${b.taskRefs.join(" / ")}` : ""}
         </span>
@@ -1410,9 +1415,12 @@ export const AdvanceDialog = ({
           </div>
 
           {/* V0.6.23：build 分批——plan 拆了批次时让用户挑本次做哪几批（默认勾未完成的、不勾的不动）
-              有批次时高度会明显高于六个无附加内置 action；不硬兜底（批次数量不定），接受增高 */}
+              有批次时高度会明显高于六个无附加内置 action；不硬兜底（批次数量不定），接受增高。
+              三层 grid（区块 / 批次列表 / 疑似重复框）都必须写 grid-cols-1：只写 `grid` 时隐式列是 auto，
+              列宽会被 nowrap 的长标题撑到比弹窗内容区还宽，truncate 永远截不到、「全选」和 #N 徽标也被挤出弹窗；
+              grid-cols-1 = minmax(0,1fr)，列宽最小为 0。DialogContent 的 *:min-w-0 只管直接子元素、管不到这几层 */}
           {actionType === "build" && hasBatches && (
-            <div className="grid gap-1.5">
+            <div className="grid grid-cols-1 gap-1.5">
               {batchProgress.latestPlanMissingBatches && (
                 <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 px-3 py-2 text-xs text-warning">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
@@ -1440,10 +1448,10 @@ export const AdvanceDialog = ({
                   {allBatchesSelected ? "取消全选" : "全选"}
                 </Button>
               </div>
-              <div className="grid gap-2">
+              <div className="grid grid-cols-1 gap-2">
                 {normalBatches.map(renderBatchChoice)}
                 {duplicateBatches.length > 0 && (
-                  <div className="grid gap-1.5 rounded-md border border-dashed bg-muted/20 p-2">
+                  <div className="grid grid-cols-1 gap-1.5 rounded-md border border-dashed bg-muted/20 p-2">
                     <div className="text-[11px] text-muted-foreground">
                       疑似重复批次（请核对后再选）
                     </div>
@@ -1502,7 +1510,7 @@ export const AdvanceDialog = ({
               <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
                 <label
                   htmlFor="advance-remove-source"
-                  className="flex-1 cursor-pointer text-xs font-medium text-foreground/80"
+                  className="flex-1 cursor-pointer text-xs font-medium text-foreground"
                 >
                   合并后删除源分支
                 </label>
@@ -1554,7 +1562,7 @@ export const AdvanceDialog = ({
             <div className="flex items-center justify-between gap-2">
               <label
                 htmlFor="advance-reuse-agent"
-                className="flex-1 cursor-pointer text-xs font-medium text-foreground/80"
+                className="flex-1 cursor-pointer text-xs font-medium text-foreground"
               >
                 续用当前 Agent
               </label>

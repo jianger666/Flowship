@@ -86,6 +86,7 @@ import {
   resolveCheckpointRefManifestForDelete,
   type CheckpointRefManifest,
 } from "./chat-checkpoint";
+import { isAppUserDataPath } from "./app-data-dir";
 import { dataRoot } from "./data-root";
 import { readSettingsFile } from "./settings-fs";
 import {
@@ -877,6 +878,17 @@ const ensureBootRecovery = async (): Promise<void> => {
   const g = globalThis as unknown as Record<string, Promise<void> | undefined>;
   if (g[RECOVERY_FLAG]) {
     await g[RECOVERY_FLAG];
+    return;
+  }
+  // 测试进程摸到桌面包的数据目录：恢复动作（把 running 的聊天标 error / 清 worktree / 杀预览进程 /
+  // GC SDK store）全是破坏性的，一律不做。正常情况下 vitest 的 setupFiles 已把 FLOWSHIP_DATA_DIR
+  // 隔离到临时目录、根本走不到这里；这是第二层——隔离被绕过（换了配置、某个测试显式指向真实目录）
+  // 时的最后一道闸（2026-10-09 事故：agent shell 继承了正式数据目录，跑测试误标了别的聊天）。
+  if (process.env.VITEST && isAppUserDataPath(DATA_DIR)) {
+    console.warn(
+      `[task-fs] boot recovery 已跳过：测试进程指向了桌面包的数据目录（${DATA_DIR}），不动用户的真实数据`,
+    );
+    g[RECOVERY_FLAG] = Promise.resolve();
     return;
   }
   const promise = runBootRecovery().catch((err) => {

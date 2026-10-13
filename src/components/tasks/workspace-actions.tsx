@@ -220,7 +220,7 @@ export const WorkspaceActions = ({ task }: Props) => {
     if (mine && mine.exited) {
       return (
         <>
-          <span className="inline-flex items-center gap-1 px-1 text-xs text-destructive/80">
+          <span className="inline-flex items-center gap-1 px-1 text-xs text-destructive">
             <span className="size-1.5 rounded-full bg-destructive/80" />
             已退出
           </span>

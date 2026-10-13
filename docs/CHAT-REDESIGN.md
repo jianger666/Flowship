@@ -52,10 +52,13 @@
   loadEarlier 的 prepend 差值换同一管线、间距 / sticky 轮次头 / turn 分割线兼容
   （`shouldShowTurnDivider` 的「此前有轮」判定加 `__work_group__`）、
   info 细线化（rows.tsx chat 分支）、状态行挂 Composer 上方、正文排版微调
-- task(log) 形态零改动：所有新行为挂 `variant === "chat"` 分支
+- ~~task(log) 形态零改动：所有新行为挂 `variant === "chat"` 分支~~
+  **2026-10-12 解除**：用户拍板「task 和 chat 保持一致」。事件流 v2 让 task(log) 的 AI 回复 / 用户消息
+  并入 chat 的共用渲染分支，过程层样式（折叠箭头 / 行按钮 / 引导线）抽到 `event-stream/stream-style.tsx`
+  两形态共用（见 `docs/HANDOFF.md`「事件流 v2」）。非对话类事件（里程碑 / 答题回执 / 行动指引）仍是 log 卡片。
 
 ## 不做的事
 
 - 不动 events.jsonl 数据结构（分组是渲染前纯函数变换）
-- 不动 task 模式事件流
+- ~~不动 task 模式事件流~~（2026-10-12 解除，同上：事件流 v2 把 task 事件流的对话外观与 chat 对齐）
 - 不做「消息 fork / 编辑历史」（架构 append-only）

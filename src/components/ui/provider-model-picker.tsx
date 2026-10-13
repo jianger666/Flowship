@@ -96,13 +96,18 @@ export const ProviderModelPicker = ({
     </Tooltip>
   );
 
+  // 输入框底栏窄屏：模型保底 128px（至少认得出是哪个模型），提供方保持 96px 不让位——
+  // 压成「C…」没有信息量。再窄就由 RichInput footer 折行（它的 basis-58 = 这两个保底之和）。
+  // compact 才保底：full 表单（推进弹窗 / 建任务）宽度充足，不需要。
+  const modelSlotClass = compact ? "min-w-32 flex-1" : "min-w-0 flex-1";
+
   const pickerRow = showProvider ? (
     <div className="flex min-w-0 flex-1 items-center gap-1.5">
       <div className="w-auto max-w-24 shrink-0">{providerEl}</div>
-      <div className="min-w-0 flex-1">{modelSelect}</div>
+      <div className={modelSlotClass}>{modelSelect}</div>
     </div>
   ) : (
-    <div className="min-w-0 flex-1">{modelSelect}</div>
+    <div className={modelSlotClass}>{modelSelect}</div>
   );
 
   if (compact) return pickerRow;

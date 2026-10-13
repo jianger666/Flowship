@@ -100,8 +100,12 @@ describe("错误：独立平铺成 destructive 卡", () => {
 });
 
 describe("hover 动作条：MessageActionBar 单一来源", () => {
-  it("三处消息块都用公共件（chat AI / log AI / chat 用户）", () => {
-    expect(countOf(rows, "<MessageActionBar")).toBeGreaterThanOrEqual(3);
+  it("对话类消息块都用公共件（AI 回复 chat / log 共用一处渲染 + 用户消息一处）", () => {
+    // 事件流 v2 之前是三处 JSX（chat AI / log AI / chat 用户）；task(log) 的 AI 回复并入 chat 的
+    // 共用分支后只剩两处——覆盖的场景没少：log 的 AI 回复现在就是走 AI 那一处。
+    expect(countOf(rows, "<MessageActionBar")).toBeGreaterThanOrEqual(2);
+    // 回归闸：log 不许再长出自己的第二套对话行（旧 log 卡片里的写法）
+    expect(rows).not.toContain("isAssistant && <MessageActionBar");
   });
 
   it("宿主容器都挂 MESSAGE_ACTION_HOST（hover 显形 + 定位靠它）", () => {
@@ -126,10 +130,11 @@ describe("hover 动作条：MessageActionBar 单一来源", () => {
     expect(offenders.map((f) => path.relative(srcDir, f))).toEqual([]);
   });
 
-  it("log 形态补上复制：chat / log 共用同一份 assistantActions", () => {
-    expect(countOf(rows, "actions={assistantActions}")).toBeGreaterThanOrEqual(
-      2,
-    );
+  it("log 形态补上复制：chat / log 的 AI 回复走同一个分支、同一份 assistantActions", () => {
+    // 共用分支的入口：chat 全进；log 只放 assistant / user 两种对话类事件进来
+    expect(rows).toContain('if (variant === "chat" || isAssistant || isUser)');
+    // 动作条只有一处在用 assistantActions——没有第二份拷贝（v2 之前 chat / log 各写一处、≥2）
+    expect(countOf(rows, "actions={assistantActions}")).toBe(1);
     const idx = rows.indexOf("const assistantActions");
     expect(idx).toBeGreaterThan(0);
     const body = rows.slice(idx, idx + 1200);

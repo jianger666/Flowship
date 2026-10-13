@@ -291,7 +291,7 @@ const EnvSection = ({
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-sm font-medium">{title}</span>
         {subtitle && (
-          <span className="truncate text-[11px] font-normal text-muted-foreground/70">
+          <span className="truncate text-[11px] font-normal text-muted-foreground">
             {subtitle}
           </span>
         )}
@@ -307,7 +307,7 @@ const EnvSection = ({
         <span
           className={cn(
             "truncate text-xs",
-            configured ? "text-foreground/80" : "text-muted-foreground",
+            configured ? "text-foreground" : "text-muted-foreground",
           )}
         >
           {summary}
