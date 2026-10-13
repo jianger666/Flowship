@@ -145,6 +145,20 @@ describe("启动报告：首页亮出后一次性、每块互不影响", () => {
     expect(callers).toBe(1);
   });
 
+  it("环境取证只在「首次启动 / 这次启动偏慢」时跑：过 decideEnvProbe 门禁、用亮窗时刻与慢阈值判定，跳过时留一行日志", () => {
+    // 不能无条件每次启动都拉 PowerShell：应用没签名，公司电脑的杀软 / EDR 可能报警
+    expect(body).toMatch(/const envProbe = decideEnvProbe\(\{[\s\S]*?\}\);/);
+    expect(body).toContain("firstBoot: bootIsFirst");
+    expect(body).toContain('revealSeconds: bootTimeline.get("reveal")');
+    expect(body).toContain("slowMs: SLOW_BOOT_PROBE_MS");
+    // 真正的调用只挂在门禁分支上
+    expect(body).toMatch(/if \(envProbe\.run\) await logEnvProbe\(\);/);
+    expect(body).not.toMatch(/(?<!if \(envProbe\.run\) )await logEnvProbe\(\)/);
+    // 跳过 / 触发各留一行，日志里才分得清「没跑」和「没查到」
+    expect(body).toContain("[boot] env 探测跳过");
+    expect(body).toContain("[boot] env 探测 trigger=");
+  });
+
   it("杀软探测幂等（慢启动路径与首次启动路径同一次运行只查一次），原有的慢启动调用语句一字不改", () => {
     expect(main).toContain("let securityProbeStarted = false;");
     expect(main).toMatch(/if \(securityProbeStarted\) return;\s*securityProbeStarted = true;/);

@@ -88,6 +88,7 @@ import {
 import {
   ENV_PROBE_TIMEOUT_MS,
   buildEnvProbeScript,
+  decideEnvProbe,
   describeEnvProbe,
   driveLetterOf,
   parseEnvProbe,
@@ -374,7 +375,23 @@ const emitBootReport = async (revealSource) => {
   // 杀软清单：启动没超过慢阈值时原来不查，但「首次启动」要有它才能把杀软和慢对上号。
   try {
     if (bootIsFirst) await logSecurityProducts("first-boot");
-    await logEnvProbe();
+    // 机器环境取证只在「首次启动 / 这次启动偏慢」时跑（判定见 env-probe.mjs 的 decideEnvProbe）：
+    // 应用没签名，正常启动每次都拉起 PowerShell 容易被公司电脑的杀软 / EDR 报警，而且那时拿到数据也没用。
+    // 跳过时留一行，日志里才分得清「没跑」和「没查到」。
+    const envProbe = decideEnvProbe({
+      firstBoot: bootIsFirst,
+      revealSeconds: bootTimeline.get("reveal"),
+      slowMs: SLOW_BOOT_PROBE_MS,
+    });
+    if (process.platform === "win32") {
+      const revealS = bootTimeline.get("reveal");
+      log(
+        envProbe.run
+          ? `[boot] env 探测 trigger=${envProbe.why}`
+          : `[boot] env 探测跳过（非首次启动、亮窗 ${Number.isFinite(revealS) ? revealS.toFixed(1) : "?"}s 未超过慢阈值 ${SLOW_BOOT_PROBE_MS / 1000}s）`,
+      );
+    }
+    if (envProbe.run) await logEnvProbe();
   } catch (err) {
     log(`[boot] 环境取证异常（忽略）：${err?.message || err}`);
   }

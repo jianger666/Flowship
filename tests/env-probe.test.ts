@@ -7,12 +7,53 @@ import { describe, expect, it } from "vitest";
 import {
   ENV_PROBE_TIMEOUT_MS,
   buildEnvProbeScript,
+  decideEnvProbe,
   describeEnvProbe,
   driveLetterOf,
   parseEnvProbe,
 } from "../electron-app/env-probe.mjs";
 
 const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
+
+describe("decideEnvProbe：只在首次启动 / 启动偏慢时跑 PowerShell 取证", () => {
+  const SLOW_MS = 30_000;
+
+  it("首次启动一定跑（不管亮窗多快）", () => {
+    expect(decideEnvProbe({ firstBoot: true, revealSeconds: 2, slowMs: SLOW_MS })).toEqual({
+      run: true,
+      why: "first-boot",
+    });
+    // 首次启动但亮窗时刻没记到，也照跑
+    expect(decideEnvProbe({ firstBoot: true, revealSeconds: undefined, slowMs: SLOW_MS }).run).toBe(true);
+  });
+
+  it("非首次启动：亮窗用时超过慢阈值才跑；刚好等于阈值不算慢（与杀软清单的 > 一致）", () => {
+    expect(decideEnvProbe({ firstBoot: false, revealSeconds: 30.5, slowMs: SLOW_MS })).toEqual({
+      run: true,
+      why: "slow-boot",
+    });
+    expect(decideEnvProbe({ firstBoot: false, revealSeconds: 30, slowMs: SLOW_MS }).run).toBe(false);
+  });
+
+  it("非首次启动、正常快：不跑（不去惊动杀软 / EDR）", () => {
+    expect(decideEnvProbe({ firstBoot: false, revealSeconds: 3.2, slowMs: SLOW_MS })).toEqual({
+      run: false,
+      why: "normal-boot",
+    });
+  });
+
+  it("非首次启动、亮窗用时拿不到 / 是脏值：按「不慢」处理，不跑", () => {
+    for (const bad of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY, "40" as unknown as number]) {
+      expect(decideEnvProbe({ firstBoot: false, revealSeconds: bad, slowMs: SLOW_MS }).run).toBe(false);
+    }
+  });
+
+  it("firstBoot 必须严格是 true（脏值不当首次）", () => {
+    expect(
+      decideEnvProbe({ firstBoot: "yes" as unknown as boolean, revealSeconds: 1, slowMs: SLOW_MS }).run,
+    ).toBe(false);
+  });
+});
 
 describe("driveLetterOf", () => {
   it("取盘符并大写；UNC / 相对路径 / 空 / 非字符串 → null", () => {

@@ -53,6 +53,30 @@ describe("产物拉取失败的 UI 契约", () => {
     expect(src).toMatch(/action\.artifactUpdatedAt,\s*loadRetryKey,\s*\]\)/);
   });
 
+  it("点重试有加载态：load 一开头就置 loading，且「加载产物…」分支排在错误 / 空态分支之前", () => {
+    // 重试 = loadRetryKey++ → effect 重跑 → load()；错误态（loadError）重试期间不会清，
+    // 靠渲染分支顺序让 loading 盖住它——顺序反了就变成「点了没反应」
+    const loadStart = src.lastIndexOf("const load = async () => {", src.indexOf("await fetchActionRevisions"));
+    expect(loadStart).toBeGreaterThan(0);
+    const head = src.slice(loadStart, src.indexOf("await fetchActionRevisions"));
+    expect(head).toContain("setContentLoading(true)");
+
+    const loadingIdx = src.indexOf("contentLoading && !currentArtifact ? (");
+    const emptyIdx = src.indexOf("!currentArtifact ? (", loadingIdx + 40);
+    expect(loadingIdx).toBeGreaterThan(0);
+    expect(emptyIdx).toBeGreaterThan(loadingIdx);
+    expect(src.slice(loadingIdx, emptyIdx)).toContain("加载产物…");
+  });
+
+  it("修订对比重试同理：load 开头置 diffLoading 并清 diffError，重试键在依赖里", () => {
+    const start = src.indexOf("const data = await fetchActionDiff(");
+    expect(start).toBeGreaterThan(0);
+    const head = src.slice(src.lastIndexOf("const load = async () => {", start), start);
+    expect(head).toContain("setDiffLoading(true)");
+    expect(head).toContain("setDiffError(null)");
+    expect(src).toMatch(/compareFromTs, taskId, action\.id, diffRetryKey\]/);
+  });
+
   it("空态分支：loadError 优先于「没有产物」，且带重试按钮", () => {
     const emptyStart = src.indexOf("!currentArtifact ? (");
     expect(emptyStart).toBeGreaterThan(0);

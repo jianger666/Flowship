@@ -69,6 +69,14 @@ describe("event-stream 上拉分页接线", () => {
     expect(loadEarlier).toContain("onPrependEvents(fresh)");
   });
 
+  it("prepend 之后同步预置 latestEventsRef（多批循环的下一批不再读到旧的第一条、重复请求刚拉的页）", () => {
+    // latestEventsRef 平时只在渲染时更新；循环里下一批在 onPrependEvents 之后立刻开始，
+    // fetchEarlierBatch 开头同步读 getCurrent()[0] 当游标——不预置就会读到 prepend 之前的第一条
+    expect(loadEarlier).toMatch(
+      /onPrependEvents\(fresh\);[\s\S]{0,200}latestEventsRef\.current\s*=\s*\[\.\.\.fresh,\s*\.\.\.cur\]/,
+    );
+  });
+
   it("切走任务后丢弃迟到结果（取消钩子 + 提交前复查）", () => {
     expect(loadEarlier).toMatch(/isCancelled:\s*\(\)\s*=>\s*taskIdRef\.current\s*!==\s*requestedTaskId/);
     expect(loadEarlier).toMatch(/taskIdRef\.current\s*!==\s*requestedTaskId\)\s*return/);

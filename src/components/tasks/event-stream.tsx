@@ -1375,6 +1375,11 @@ const EventStreamImpl = ({
               countStreamContentUnits(beforeItems);
           }
           onPrependEvents(fresh);
+          // 循环里下一批紧接着就开始、要拿「最新的第一条」当游标：latestEventsRef 平时只在渲染时更新，
+          // 这里同步预置成已 prepend 的列表——否则下一批开头读到的还是旧的第一条，
+          // 会把刚拉到的这一页再请求一次（按 id 去重不出错，只是白多一次请求）。
+          // 下一次渲染会用真实的 task.events 覆盖它，不会有偏差。
+          latestEventsRef.current = [...fresh, ...cur];
           setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
         }
         setHasMoreEarlier(batch.hasMore);

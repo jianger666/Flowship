@@ -467,8 +467,10 @@ export const runPiSubagent = async (
   };
   try {
     signal?.addEventListener("abort", onAbort, { once: true });
-    // 创建期间可能已被取消（上面的 aborted 检查与监听挂上之间有 await）
-    if (signal?.aborted) onAbort();
+    // 创建期间可能已被取消（上面的 aborted 检查与监听挂上之间有 await）。
+    // 不能在这里调 session.abort()：prompt() 还没开始，abort 是空操作，子代理会照常把整轮跑完。
+    // 直接抛错、不往下走到 prompt（这里到 prompt 之间没有 await，不会再漏窗口）；finally 会 dispose 会话。
+    if (signal?.aborted) throw new Error("子任务已取消");
     let result = "";
     // 用对象承接：闭包里赋值，直接 let 会被 TS 窄化成 null
     const fail: { prompt: string | null } = { prompt: null };

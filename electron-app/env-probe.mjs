@@ -21,6 +21,29 @@ export const ENV_PROBE_TIMEOUT_MS = 20_000;
 /** 最多探测几个盘（安装目录 / 用户数据目录 / 临时目录，去重后通常 1~2 个）。 */
 const MAX_DRIVES = 4;
 
+/**
+ * 这一次启动要不要跑环境取证（只决定「跑不跑」，跑什么见 buildEnvProbeScript）。
+ *
+ * 只在两种情况下跑：
+ * - 首次启动（全新安装 / 刚更新 / 刚重装，按版本判定）：对杀软来说 exe 与 ~1 万个新文件都没见过，
+ *   慢启动最集中、也最需要「这台机器是什么环境」来解读；
+ * - 这次启动本身偏慢（亮窗用时超过 slowMs）：非首次却慢，正是要查「盘 / 电源 / Defender」的时候。
+ * 其余正常启动不拉起 PowerShell：应用没签名，公司电脑上的杀软 / EDR 可能对「未签名程序反复拉起
+ * PowerShell」报警，而正常启动拿到这些数据也没有用。
+ *
+ * 亮窗用时拿不到（缺失 / 非有限）按「不慢」处理：没有证据说慢，就不去惊动杀软。
+ *
+ * @param {{ firstBoot: boolean, revealSeconds?: number | null, slowMs: number }} p
+ *   revealSeconds：亮窗时刻距主进程启动的秒数（boot 时间线的 reveal 里程碑）
+ * @returns {{ run: boolean, why: "first-boot" | "slow-boot" | "normal-boot" }}
+ */
+export const decideEnvProbe = ({ firstBoot, revealSeconds, slowMs }) => {
+  if (firstBoot === true) return { run: true, why: "first-boot" };
+  const slow =
+    typeof revealSeconds === "number" && Number.isFinite(revealSeconds) && revealSeconds * 1000 > slowMs;
+  return slow ? { run: true, why: "slow-boot" } : { run: false, why: "normal-boot" };
+};
+
 /** 取路径的盘符（"C:\\x" → "C"）；不是盘符路径（UNC / 空）返回 null。 */
 export const driveLetterOf = (p) =>
   typeof p === "string" && /^[A-Za-z]:/.test(p) ? p[0].toUpperCase() : null;
