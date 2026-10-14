@@ -57,7 +57,9 @@ import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskChangesPanel } from "@/components/tasks/task-changes-panel";
 import { TaskUtilityActions } from "@/components/tasks/task-utility-actions";
+import { TalkQueueBanner } from "@/components/tasks/talk-queue-banner";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
+import type { TalkQueueItem } from "@/lib/talk-queue";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -182,6 +184,8 @@ const TaskDetailPage = () => {
   const [stopping, setStopping] = useState(false);
   // 群问答 tab 可见时隐藏底部输入条（只读 tab 下输入框会误导用户在此发言）
   const [groupQaVisible, setGroupQaVisible] = useState(false);
+  // task 模式待送达队列（SSE talk_queue 帧维护整份快照；切任务清空，新任务 bootstrap 会补发）
+  const [talkQueue, setTalkQueue] = useState<TalkQueueItem[]>([]);
   // V0.6.6「编辑任务」dialog 开关（改角色 / 标题 / 飞书链接 / 模型 / 工作分支）
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   // 任务输入条乐观占位行（HTTP 回来前事件流先出半透明气泡；按 taskId+nonce 隔离，
@@ -247,6 +251,7 @@ const TaskDetailPage = () => {
     setSelectedActionId(null);
     // 旁路在飞是 per-task 信号（新任务的 bootstrap 会补发它自己的值）
     setRestrictedRunActive(false);
+    setTalkQueue([]);
     setRunActive(false);
   }, [id, clearStreaming]);
 
@@ -457,6 +462,7 @@ const TaskDetailPage = () => {
       },
       onAssistantDelta: pushDelta,
       onRestrictedRun: setRestrictedRunActive,
+      onTalkQueue: setTalkQueue,
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
       onWatchException: (err) => toast.error(`watch 异常：${err.message}`),
       onTaskDeleted: handleTaskDeleted,
@@ -1191,6 +1197,8 @@ const TaskDetailPage = () => {
               {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文）
                   群问答 tab 可见时隐藏：只读 tab 下输入框会误导用户在此发言 */}
               {groupQaVisible ? null : (
+                <>
+                <TalkQueueBanner taskId={task.id} talkQueue={talkQueue} />
                 <TaskTalkComposer
                   task={task}
                   onTaskUpdate={absorbTask}
@@ -1200,6 +1208,7 @@ const TaskDetailPage = () => {
                   onPendingAdd={addTalkPending}
                   onPendingRemove={removeTalkPending}
                 />
+                </>
               )}
             </aside>
           </ResizablePanel>

@@ -69,6 +69,7 @@ import {
   parseAndValidateSkills,
 } from "@/lib/server/route-helpers";
 import type { Task } from "@/lib/types";
+import { enqueueTalkMessage } from "@/lib/server/task-talk-queue";
 
 export interface TaskQuestionBody {
   text?: string;
@@ -123,6 +124,19 @@ export interface TaskQuestionInjectOptions {
    * 只由 group-route 在 correlated 命中且活会话在场时置 true。
    */
   correlatedAnswer?: boolean;
+  /**
+   * agent 真在跑时入队而非 409（仅 app 输入条 / 属主群消息 / 托办回执用；只答疑旁路不走这里）。
+   * 入队后 202 `{ queued: true }`，由 task-talk-queue 在 task 空闲后串行重放。
+   * 重放时必须清掉，防止 drain 遇到「刚好又忙」再入队死循环。
+   */
+  queueIfBusy?: {
+    source: "app" | "group_owner" | "group_reply";
+    senderName?: string;
+    senderIsBot?: boolean;
+    preview?: string;
+    /** 幂等键（app 前端生成；同键重复入队只算一条） */
+    clientItemId?: string;
+  };
 }
 
 const MAX_IMAGES = 6;
@@ -251,6 +265,36 @@ const runTaskQuestionInject = async (
     return errorResponse("text / images / attachments 至少一项非空");
   }
 
+  /**
+   * agent 真在跑（不是收尾 drain 窗口）时：带 queueIfBusy 就入队返回 202，否则调用方仍 409。
+   * 只答疑旁路（questionOnly）永远不进这条队——它走群模块自己的排队。
+   */
+  const tryQueueWhenBusy = (): Response | null => {
+    if (questionOnly || !options.queueIfBusy) return null;
+    const qOpt = options.queueIfBusy;
+    const r = enqueueTalkMessage(id, {
+      source: qOpt.source,
+      rawBody,
+      options: { ...options, queueIfBusy: undefined },
+      senderName: qOpt.senderName,
+      senderIsBot: qOpt.senderIsBot,
+      preview: qOpt.preview,
+      clientItemId: qOpt.clientItemId,
+    });
+    if (!r.ok) {
+      return errorResponse("排队已满（最多 10 条），等当前这轮跑完再发", 409);
+    }
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        queued: true,
+        itemId: r.itemId,
+        position: r.position,
+      }),
+      { status: 202, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
   // B1：入口只读 meta（actions / runStatus 等状态机字段）；事件只在下面 ask 判定处按需读尾部。
   // 全量 parse 9MB events.jsonl 是 OOM 峰值主因，而本文件除 ask 判定外零处用 events。
   let task = await getTaskMeta(id);
@@ -338,6 +382,8 @@ const runTaskQuestionInject = async (
       }
       task = fresh;
     } else {
+      const queued = tryQueueWhenBusy();
+      if (queued) return queued;
       return errorResponse("agent 正在跑、等它说完这轮再问", 409);
     }
   }
@@ -461,6 +507,8 @@ const runTaskQuestionInject = async (
       drainStatus === "error" ||
       task.runStatus === "idle";
     if (!waitingForDrain) {
+      const queued = tryQueueWhenBusy();
+      if (queued) return queued;
       return errorResponse("agent 正在跑、等它说完这轮再问", 409);
     }
   }

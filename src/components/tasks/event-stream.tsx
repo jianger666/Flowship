@@ -51,7 +51,7 @@ import {
   type RhythmFacts,
 } from "@/lib/event-stream-rhythm";
 import { findPendingAskEvent } from "@/lib/ask-pending";
-import { collectGroupQaRounds } from "@/lib/group-qa";
+import { collectGroupQaRounds, pickRoundsNeedingOwner } from "@/lib/group-qa";
 import {
   findRenderIndexForEventId,
   normalizeEventStreamSearchQuery,
@@ -779,6 +779,11 @@ const EventStreamImpl = ({
   // 已知局限：answering 按快照时间算，无新事件就不重算——崩溃打断的那轮蓝点会常亮到下个事件到来。
   // 故意的：这组件有过输入卡顿 perf 坑，不加分钟级 tick；下个事件（属主说句话）到就灭。
   const groupQaAnswering = groupQaRounds.some((r) => r.answering);
+  // 答疑 agent 标了「需属主确认」的轮次数（24h 内）：tab 上亮 brand 点，群里有事等属主拍板时不至于没人发现。
+  const groupQaNeedsOwnerCount = useMemo(
+    () => pickRoundsNeedingOwner(groupQaRounds).length,
+    [groupQaRounds],
+  );
 
   // 第二层：未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的
   // 漏网），渲染层兜底保证答题卡不被顶走（纯显示排序、数据不动、2026-07-23 用户实测痛点）。
@@ -1733,6 +1738,12 @@ const EventStreamImpl = ({
                   {groupQaAnswering && (
                     <span className="inline-block size-1.5 animate-pulse rounded-full bg-info" />
                   )}
+                  {groupQaNeedsOwnerCount > 0 && (
+                    <span
+                      className="inline-block size-1.5 rounded-full bg-brand"
+                      title={`有 ${groupQaNeedsOwnerCount} 件事等你在群问答里拍板`}
+                    />
+                  )}
                 </button>
               )}
             </span>
@@ -1824,7 +1835,7 @@ const EventStreamImpl = ({
         />
         )}
         {showQaPanel ? (
-          <GroupQaPanel rounds={groupQaRounds} />
+          <GroupQaPanel rounds={groupQaRounds} events={task.events} />
         ) : items.length === 0 ? (
           <div
             className={cn(

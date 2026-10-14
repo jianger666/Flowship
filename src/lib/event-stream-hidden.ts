@@ -16,6 +16,7 @@ import {
 import { isBootStageInfo } from "@/lib/chat-stream-display";
 import { isInTurnToolErrorEvent } from "@/lib/tool-display";
 import {
+  groupRunTagOf,
   isGroupQaQuestionEvent,
   isGroupQaSummaryEvent,
 } from "@/lib/group-qa";
@@ -63,8 +64,13 @@ export const isHiddenFromEventStream = (
   // 回合内工具失败误写成 kind=error（红卡留给整轮崩溃）
   if (isInTurnToolErrorEvent(ev)) return true;
   // 群问答 tab 的内容：非属主群问题 + 轮次汇总。主流程默认隐藏，切 tab 看。
-  // 属主群消息（无 runTag）、旁路跑过程的 tool/info 噪音不在此列（后者归因要动 runner，下轮再说）。
+  // 属主群消息（无 runTag）不在此列。
   if (isGroupQaQuestionEvent(ev) || isGroupQaSummaryEvent(ev)) return true;
+  // 答疑旁路 run 的过程事件（meta.groupRun = runTag，不论 kind）：归「群问答」tab 的「查看过程」，
+  // 不混进属主自己的会话。error 也在此列——它是别人提问触发的旁路 run 失败，不是属主自己运行的错误，
+  // 属主主流不该被它吹爆（失败本身 tab 里该轮有「失败」标 + 过程里有 error 行）。
+  // 「属主自己运行的错误永远可见」的既有原则不受影响：属主主链的事件不会带 groupRun。
+  if (groupRunTagOf(ev) !== "") return true;
   if (opts?.isChat) {
     // 启动进度：ephemeral 的「状态」，由底部状态行单独呈现，不进事件流
     if (isChatStartupNoiseInfo(ev) || isBootStageInfo(ev)) {

@@ -11,12 +11,43 @@
  *
  * 问无答（有问没配到答）：30 分钟内算“回答中”，更早的 static 展示为“未收到回答”
  * （多半是强关 / 崩溃打断的那轮）。
+ *
+ * 2026-10-14 群协作 v2：汇总事件新增可选字段（askerIsBot / noReply / needsOwner / mentioned /
+ * startedAt / durationMs，契约见 server/feishu-bridge/group-contract.ts 末尾），旧数据没有、
+ * 一律向后兼容；答疑旁路 run 的每条过程事件带 meta.groupRun = runTag，归「群问答」tab 的
+ * 「查看过程」，主事件流默认隐藏（见 event-stream-hidden）。
+ * 前端不 import server 目录（无先例），所以 groupRun 的 key 在这里自己写一份。
  */
 
 import type { TaskEvent } from "@/lib/types";
 
+/**
+ * 答疑旁路 run 过程事件的 meta key：值 = 该轮 runTag。
+ * 与 group-contract.ts 的 GROUP_RUN_META_KEY 保持一致（前端不 import server 目录，故自留一份）。
+ */
+export const GROUP_RUN_META_KEY = "groupRun";
+
+/**
+ * 2026-10-14 新增的可选字段（服务端 flush 时写；旧数据没有，读出时缺 / 类型不对都当没有）。
+ * 与 group-contract.ts 的 GroupQaSummaryExtra 保持一致。
+ */
+export interface GroupQaSummaryExtraMeta {
+  /** 提问人是机器人（UI 打「机器人」徽标） */
+  askerIsBot?: boolean;
+  /** 这轮 agent 选择了 NO_REPLY（群里没发任何东西；answer 里存 agent 原话供审计） */
+  noReply?: boolean;
+  /** agent 标记的「需属主确认」说明（UI 顶部醒目提示） */
+  needsOwner?: string;
+  /** 最终真 @ 了谁（名字列表） */
+  mentioned?: string[];
+  /** 本轮开始时间（ms） */
+  startedAt?: number;
+  /** 本轮用时（ms） */
+  durationMs?: number;
+}
+
 /** 汇总事件 meta.groupQaSummary 的形状（flush 时写，见 group-outbound） */
-export interface GroupQaSummaryMeta {
+export interface GroupQaSummaryMeta extends GroupQaSummaryExtraMeta {
   runTag: string;
   askerOpenId: string;
   askerName: string;
@@ -40,6 +71,16 @@ export interface GroupQaRound {
   ok: boolean;
   answering: boolean;
   legacy: boolean;
+  /** 提问人是机器人（汇总缺值时兜底看问题事件的 groupSenderIsBot；老数据 undefined） */
+  askerIsBot?: boolean;
+  /** agent 选择了不回复（老数据 undefined，UI 只认 === true） */
+  noReply?: boolean;
+  /** 需属主确认的说明（非空才有；老数据 undefined） */
+  needsOwner?: string;
+  /** 最终真 @ 了谁（名字；老数据 undefined） */
+  mentioned?: string[];
+  startedAt?: number;
+  durationMs?: number;
 }
 
 /** 有问无答多久还算“回答中” */
@@ -49,6 +90,48 @@ const metaOf = (ev: TaskEvent): Record<string, unknown> =>
   (ev.meta ?? {}) as Record<string, unknown>;
 
 const strOf = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** 新增可选字段的容错读法：缺 / 类型不对一律当没有（返 undefined） */
+const boolOpt = (v: unknown): boolean | undefined =>
+  typeof v === "boolean" ? v : undefined;
+const nonEmptyStrOpt = (v: unknown): string | undefined => {
+  if (typeof v !== "string") return undefined;
+  const t = v.trim();
+  return t || undefined;
+};
+const msOpt = (v: unknown): number | undefined =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+/** 名字列表：滤掉非字符串 / 空串；整体不是数组或滤完为空 = 没有 */
+const nameListOpt = (v: unknown): string[] | undefined => {
+  if (!Array.isArray(v)) return undefined;
+  const out = v
+    .filter((x): x is string => typeof x === "string")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  return out.length > 0 ? out : undefined;
+};
+
+/** 把可选字段收成「只带有值的 key」，写盘 / 读出共用，避免到处是 `undefined` 键 */
+const compactExtra = (e: GroupQaSummaryExtraMeta): GroupQaSummaryExtraMeta => {
+  const out: GroupQaSummaryExtraMeta = {};
+  if (e.askerIsBot !== undefined) out.askerIsBot = e.askerIsBot;
+  if (e.noReply !== undefined) out.noReply = e.noReply;
+  if (e.needsOwner !== undefined) out.needsOwner = e.needsOwner;
+  if (e.mentioned !== undefined) out.mentioned = e.mentioned;
+  if (e.startedAt !== undefined) out.startedAt = e.startedAt;
+  if (e.durationMs !== undefined) out.durationMs = e.durationMs;
+  return out;
+};
+
+const readExtra = (s: Record<string, unknown>): GroupQaSummaryExtraMeta =>
+  compactExtra({
+    askerIsBot: boolOpt(s.askerIsBot),
+    noReply: boolOpt(s.noReply),
+    needsOwner: nonEmptyStrOpt(s.needsOwner),
+    mentioned: nameListOpt(s.mentioned),
+    startedAt: msOpt(s.startedAt),
+    durationMs: msOpt(s.durationMs),
+  });
 
 /**
  * 非属主群问题（带配对键 restrictedRunTag 的才进 tab；属主群消息、
@@ -82,6 +165,7 @@ export const readGroupQaSummary = (ev: TaskEvent): GroupQaSummaryMeta | null => 
       strOf(s.questionMessageId) || undefined,
     answer: strOf(s.answer),
     ok: s.ok !== false,
+    ...readExtra(s),
   };
 };
 
@@ -106,8 +190,8 @@ export const cleanGroupQuestionText = (text: string): string =>
     .replace(/[ \t]{2,}/g, " ")
     .trim();
 
-/** 汇总事件入参（flush 组装，UI 只读消费） */
-export interface GroupQaSummaryInput {
+/** 汇总事件入参（flush 组装，UI 只读消费）；可选字段见 {@link GroupQaSummaryExtraMeta} */
+export interface GroupQaSummaryInput extends GroupQaSummaryExtraMeta {
   runTag: string;
   askerOpenId: string;
   askerName: string;
@@ -122,9 +206,14 @@ export interface GroupQaSummaryInput {
  */
 export const buildGroupQaSummaryEvent = (input: GroupQaSummaryInput) => {
   const name = input.askerName || "群成员";
+  // noReply：answer 里存的是 agent 原话（如 NO_REPLY），摘要行不能把它当回答念出来
+  const summary =
+    input.noReply === true
+      ? "（已读、无需回复）"
+      : oneLineAnswer(input.answer) || "（空回答）";
   return {
     kind: "info" as const,
-    text: `群问答 · ${name}：${oneLineAnswer(input.answer) || "（空回答）"}`,
+    text: `群问答 · ${name}：${summary}`,
     meta: {
       groupQaSummary: {
         runTag: input.runTag,
@@ -135,6 +224,8 @@ export const buildGroupQaSummaryEvent = (input: GroupQaSummaryInput) => {
           : {}),
         answer: input.answer,
         ok: input.ok,
+        // 写盘同样过一遍校验：入参类型不对（JS 调用方 / 服务端传了脏值）不落盘，读出端就不必猜
+        ...readExtra(input as unknown as Record<string, unknown>),
       },
     },
   };
@@ -256,6 +347,16 @@ export const collectGroupQaRounds = (
       ok: s.ok !== false,
       answering: false,
       legacy: false,
+      // 新字段透传；askerIsBot 汇总没写时兜底看问题事件（服务端若在入向事件上标了 groupSenderIsBot）
+      ...compactExtra({
+        askerIsBot:
+          s.askerIsBot ?? (qMeta ? boolOpt(qMeta.groupSenderIsBot) : undefined),
+        noReply: s.noReply,
+        needsOwner: s.needsOwner,
+        mentioned: s.mentioned,
+        startedAt: s.startedAt,
+        durationMs: s.durationMs,
+      }),
     });
   }
   // 有问无答（新代码也会有：强关 / 崩溃打断的那轮）
@@ -271,6 +372,7 @@ export const collectGroupQaRounds = (
         ok: false,
         answering: now - q.ts < GROUP_QA_ANSWERING_RECENT_MS,
         legacy: false,
+        ...compactExtra({ askerIsBot: boolOpt(metaOf(q).groupSenderIsBot) }),
       });
       pairedQuestions.add(q);
     }
@@ -293,6 +395,9 @@ export const collectGroupQaRounds = (
         answers.length === 0 &&
         now - openLegacy.ts < GROUP_QA_ANSWERING_RECENT_MS,
       legacy: true,
+      ...compactExtra({
+        askerIsBot: boolOpt(metaOf(openLegacy).groupSenderIsBot),
+      }),
     });
     openLegacy = null;
   };
@@ -324,4 +429,135 @@ export const collectGroupQaRounds = (
   flushLegacy();
   rounds.sort((a, b) => b.ts - a.ts);
   return rounds;
+};
+
+/** 「待你决定」的时间窗：超过这么久的待确认不再顶在 tab 顶部（没有「已处理」状态可记，不设窗会永远吵） */
+export const GROUP_QA_NEEDS_OWNER_RECENT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 需要属主拍板的轮次：needsOwner 非空、且在时间窗内（默认 24h），按问题时间从新到旧。
+ * 纯函数、不改入参；tab 顶部「待你决定」区与标签上的红点都吃它。
+ * 第二参数可选（不破坏契约签名）：测试注入 now / 调窗口。
+ */
+export const pickRoundsNeedingOwner = (
+  rounds: GroupQaRound[],
+  opts?: { now?: number; maxAgeMs?: number },
+): GroupQaRound[] => {
+  const now = opts?.now ?? Date.now();
+  const maxAge = opts?.maxAgeMs ?? GROUP_QA_NEEDS_OWNER_RECENT_MS;
+  return rounds
+    .filter(
+      (r) =>
+        typeof r.needsOwner === "string" &&
+        r.needsOwner.trim() !== "" &&
+        now - r.ts <= maxAge,
+    )
+    .sort((a, b) => b.ts - a.ts);
+};
+
+// ----------------- 答疑 run 的过程事件（「查看过程」折叠块的数据源） -----------------
+
+/** 事件属于哪一轮答疑旁路 run（meta.groupRun 非空字符串）；不是则 "" */
+export const groupRunTagOf = (ev: TaskEvent): string => {
+  const v = metaOf(ev)[GROUP_RUN_META_KEY];
+  return typeof v === "string" ? v.trim() : "";
+};
+
+/** 「查看过程」最多列几条（超出显示「还有 n 条」） */
+export const GROUP_RUN_STEPS_LIMIT = 30;
+
+export interface GroupRunStep {
+  id: string;
+  ts: number;
+  /** reply = agent 旁白 / 回复；tool = 工具调用；error = 失败 */
+  kind: "reply" | "tool" | "error";
+  /** kind=tool 时的工具名 */
+  tool?: string;
+  /** reply / error：首行文本；tool：参数摘要（可能为空串） */
+  text: string;
+}
+
+const clipLine = (s: string, max: number): string => {
+  const line = s.replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+};
+
+/** 参数里最能说明「它在干嘛」的字段，按优先级挑第一个字符串 */
+const TOOL_ARG_KEYS = [
+  "command",
+  "cmd",
+  "path",
+  "file_path",
+  "filePath",
+  "pattern",
+  "query",
+  "url",
+  "description",
+] as const;
+
+/**
+ * 工具调用的参数摘要：args 是（可能被截断的）JSON 字符串。
+ * 先按常见字段挑一个；解析不了 / 没有这些字段就把原串压成一行。
+ */
+export const summarizeGroupRunToolArgs = (args: unknown): string => {
+  if (typeof args !== "string" || !args.trim()) return "";
+  // 落盘截断后缀形如 …(truncated 123 chars)，剥了才 parse 得动
+  const cleaned = args.replace(/…\(truncated \d+ chars\)$/, "").trim();
+  try {
+    const v: unknown = JSON.parse(cleaned);
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const o = v as Record<string, unknown>;
+      for (const k of TOOL_ARG_KEYS) {
+        const x = o[k];
+        if (typeof x === "string" && x.trim()) return clipLine(x, 100);
+      }
+    }
+  } catch {
+    // 非 JSON（截断 / 脏数据）→ 走兜底
+  }
+  return clipLine(cleaned, 100);
+};
+
+/**
+ * 某一轮答疑 run 的过程精简列表：assistant_message（首行）/ tool_call（工具名 + 参数摘要）/ error。
+ * thinking / tool_result / info 不列——「查看过程」是让属主快速扫一眼它干了啥，不是回放。
+ * 按事件落盘顺序；`steps` 最多 limit 条，`total` 是真实总数（调用方用 total - steps.length 显示「还有 n 条」）。
+ */
+export const collectGroupRunSteps = (
+  events: readonly TaskEvent[],
+  runTag: string,
+  limit: number = GROUP_RUN_STEPS_LIMIT,
+): { steps: GroupRunStep[]; total: number } => {
+  const all: GroupRunStep[] = [];
+  if (!runTag) return { steps: all, total: 0 };
+  for (const ev of events) {
+    if (groupRunTagOf(ev) !== runTag) continue;
+    if (ev.kind === "assistant_message") {
+      const text = clipLine(
+        strOf(ev.text).split("\n").find((l) => l.trim()) ?? "",
+        160,
+      );
+      if (text) all.push({ id: ev.id, ts: ev.ts, kind: "reply", text });
+    } else if (ev.kind === "tool_call") {
+      const m = metaOf(ev);
+      const tool = strOf(m.name) || "tool";
+      all.push({
+        id: ev.id,
+        ts: ev.ts,
+        kind: "tool",
+        tool,
+        text: summarizeGroupRunToolArgs(m.args),
+      });
+    } else if (ev.kind === "error") {
+      all.push({
+        id: ev.id,
+        ts: ev.ts,
+        kind: "error",
+        text:
+          clipLine(strOf(ev.text).split("\n").find((l) => l.trim()) ?? "", 160) ||
+          "出错了",
+      });
+    }
+  }
+  return { steps: all.slice(0, Math.max(0, limit)), total: all.length };
 };

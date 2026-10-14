@@ -17,6 +17,7 @@ import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 import { bootArgsForTask } from "./agent-provider";
 import { getSettings } from "./local-store";
 import type { ThinkingSnapshot } from "./thinking-live";
+import type { TalkQueueItem } from "./talk-queue";
 import {
   type ActionRecord,
   type ArtifactRevision,
@@ -503,6 +504,8 @@ interface SSEEnvelope {
     | "message_op"
     /** 旁路（受限群答疑）run 在飞与否——不写 runStatus，运行态只能靠这一帧 */
     | "restricted_run"
+    /** task 模式待送达队列快照（纯内存） */
+    | "talk_queue"
     /** 任务已逻辑删除，客户端应停订阅、勿重连 */
     | "task_deleted";
   event?: TaskEvent;
@@ -540,6 +543,15 @@ interface SSEEnvelope {
   taskId?: string;
   /** restricted_run 帧：旁路答疑此刻在不在飞 */
   active?: boolean;
+  /** talk_queue 帧：待送达队列条目（逐字段校验后才交给回调） */
+  items?: Array<{
+    id?: unknown;
+    source?: unknown;
+    senderName?: unknown;
+    senderIsBot?: unknown;
+    preview?: unknown;
+    createdAt?: unknown;
+  }>;
 }
 
 /** onEvent 的附加信息：只在 bootstrap 回放的历史事件上才有（实时事件不传第二个参数） */
@@ -657,6 +669,8 @@ export interface TaskStreamCallbacks {
    * UI 拿它跟 runStatus 一起算「运行中」，否则那些工具块会被判成脏数据渲染「已中断」。
    */
   onRestrictedRun?: (active: boolean) => void;
+  /** talk_queue——task 模式待送达队列整份快照 */
+  onTalkQueue?: (items: TalkQueueItem[]) => void;
   /**
    * task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
    */
@@ -825,6 +839,17 @@ export const watchTaskStream = async (
           ) {
             // 旁路答疑在飞与否（运行态信号、不进 task.runStatus）
             callbacks.onRestrictedRun?.(env.active);
+          } else if (env.type === "talk_queue" && Array.isArray(env.items)) {
+            // 整份快照替换；字段不合法的条目丢掉，别让一条脏数据把横幅渲染炸了
+            const parsed = env.items.filter(
+              (e): e is TalkQueueItem =>
+                !!e &&
+                typeof e.id === "string" &&
+                typeof e.source === "string" &&
+                typeof e.preview === "string" &&
+                typeof e.createdAt === "number",
+            );
+            callbacks.onTalkQueue?.(parsed);
           } else if (
             env.type === "task_deleted" &&
             typeof env.taskId === "string"
@@ -1141,8 +1166,48 @@ export const updateChatQueueItem = async (
   return data.item;
 };
 
+// ----------------- task 模式待送达队列 -----------------
+
+export type { TalkQueueItem } from "./talk-queue";
+
+/** 删除排队中的条目；返回实际被移除的 id（已送出的删不到） */
+export const removeTalkQueueItems = async (
+  taskId: string,
+  itemIds: string[],
+): Promise<string[]> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/talk-queue`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ itemIds }),
+    },
+  );
+  const data = await handleJson<{ ok: true; removedIds: string[] }>(res);
+  return data.removedIds;
+};
+
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道
 //（服务端按 awaiting_ack 自动附「重新交卷」上下文）；approve 由推进时自动认可承担。
+
+/** 直接送达的结果 */
+export type SubmittedTaskQuestion = {
+  task: Task;
+  persistWarning?: string;
+  queued?: false;
+};
+/** queueIfBusy 下 agent 正在跑时 202 入队的结果（此刻没送达，送达时由 user_reply 事件出现） */
+export type QueuedTaskQuestion = {
+  queued: true;
+  itemId: string;
+  position: number;
+};
+export type SubmitTaskQuestionResult = SubmittedTaskQuestion | QueuedTaskQuestion;
+/** submitTaskQuestion 的可选项：agent 正在跑时服务端入队（202）而非 409；clientItemId 做入队幂等 */
+export interface SubmitTaskQuestionOpts {
+  queueIfBusy?: boolean;
+  clientItemId?: string;
+}
 
 /**
  * V0.11.9 任务内「跟 AI 说」：消息送给存活会话（疑问就答 / 要改就改、不新建 action、进度不动）。
@@ -1157,7 +1222,7 @@ export interface PendingQuestionSend {
   /** 发送正文（remount 认领后比对用：用户没写新东西才清输入框） */
   text: string;
   startedAt: number;
-  promise: Promise<{ task: Task; persistWarning?: string }>;
+  promise: Promise<SubmitTaskQuestionResult>;
 }
 const pendingQuestionSends = new Map<string, PendingQuestionSend>();
 /** 当前 task 有没有还在飞的输入条发送（组件挂载认领 submitting / 发送前去重用） */
@@ -1165,7 +1230,7 @@ export const getPendingQuestionSend = (
   taskId: string,
 ): PendingQuestionSend | undefined => pendingQuestionSends.get(taskId);
 
-export const submitTaskQuestion = async (
+const submitTaskQuestionImpl = async (
   task: Task,
   text: string,
   images?: ImagePayload[],
@@ -1175,14 +1240,12 @@ export const submitTaskQuestion = async (
   attachments?: string[],
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
-): Promise<{ task: Task; persistWarning?: string }> => {
+  opts?: SubmitTaskQuestionOpts,
+): Promise<SubmitTaskQuestionResult> => {
   if (pendingQuestionSends.has(task.id)) {
     throw new Error("上一条消息还在发送中、稍等它发完再发");
   }
-  const flight = (async (): Promise<{
-    task: Task;
-    persistWarning?: string;
-  }> => {
+  const flight = (async (): Promise<SubmitTaskQuestionResult> => {
     const s = getSettings();
     const boot = bootArgsForTask(task, s);
     const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/question`, {
@@ -1202,6 +1265,10 @@ export const submitTaskQuestion = async (
           gitToken: s.gitToken,
         },
         forceModel: forceModel?.id?.trim() ? forceModel : undefined,
+        ...(opts?.queueIfBusy ? { queueIfBusy: true } : {}),
+        ...(opts?.clientItemId?.trim()
+          ? { clientItemId: opts.clientItemId.trim() }
+          : {}),
       }),
     });
     // 透传 persistWarning，调用方 toast（不可静默丢）
@@ -1209,7 +1276,17 @@ export const submitTaskQuestion = async (
       ok: true;
       task: Task;
       persistWarning?: string;
+      queued?: boolean;
+      itemId?: string;
+      position?: number;
     }>(res);
+    if (data.queued === true) {
+      return {
+        queued: true,
+        itemId: String(data.itemId ?? ""),
+        position: Number(data.position ?? 0),
+      };
+    }
     return {
       task: data.task,
       ...(typeof data.persistWarning === "string"
@@ -1231,6 +1308,32 @@ export const submitTaskQuestion = async (
     }
   }
 };
+
+/**
+ * 对外签名：不传 queueIfBusy 时服务端只会 200 或报错、永远不会排队，
+ * 返回类型保持原来的 `{ task }`——存量调用方（错误卡重试等）不必处理 queued 分支。
+ */
+interface SubmitTaskQuestionFn {
+  (
+    task: Task,
+    text: string,
+    images?: ImagePayload[],
+    forceModel?: ModelSelection,
+    attachments?: string[],
+    skills?: Array<{ name: string; absPath: string }>,
+    opts?: { queueIfBusy?: false; clientItemId?: string },
+  ): Promise<SubmittedTaskQuestion>;
+  (
+    task: Task,
+    text: string,
+    images: ImagePayload[] | undefined,
+    forceModel: ModelSelection | undefined,
+    attachments: string[] | undefined,
+    skills: Array<{ name: string; absPath: string }> | undefined,
+    opts: SubmitTaskQuestionOpts,
+  ): Promise<SubmitTaskQuestionResult>;
+}
+export const submitTaskQuestion = submitTaskQuestionImpl as SubmitTaskQuestionFn;
 
 /**
  * V0.6 任务终态控制（用户在 ack dialog 选「合入」/「abandon」）

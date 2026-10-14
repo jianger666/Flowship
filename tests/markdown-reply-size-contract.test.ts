@@ -92,7 +92,8 @@ describe("AI 回复三处都用 reply 档，次要面不放大", () => {
   it("其它 MarkdownText 调用方（问答卡 / 群问答 / 工具产出）不传 reply：它们是次要面、保持 14px / 12px", () => {
     for (const rel of [
       "src/components/tasks/ask-user-inline.tsx",
-      "src/components/tasks/group-qa-panel.tsx",
+      // 群问答的 MarkdownText 在拆出来的单轮卡片里（面板本身不再直接渲染 markdown）
+      "src/components/tasks/group-qa-round-card.tsx",
       "src/components/tasks/event-stream/tool-block.tsx",
     ]) {
       const tags = markdownTags(read(rel));

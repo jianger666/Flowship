@@ -28,7 +28,6 @@ const {
   GROUP_RESTRICTED_QUESTION_RUNNING,
   pumpGroupQuestionQueue,
   isGroupBotSender,
-  SKIP_GROUP_LOOP_BREAKER,
   handleGroupAdvancePick,
   hasAnyMention,
   isGroupChatMessage,
@@ -46,20 +45,15 @@ const {
 } = await import("@/lib/server/feishu-bridge/group-route");
 
 const {
-  __getBypassLoopSendersForTest,
   __resetGroupAdvancePickForTest,
   __resetThrottleForTest,
   __resetGroupReplyStateForTest,
-  BYPASS_LOOP_MAX_ROUNDS,
-  BYPASS_LOOP_WINDOW_MS,
   enqueueGroupQuestion,
   GROUP_QUESTION_QUEUE_MAX,
   GROUP_QUESTION_QUEUE_TTL_MS,
   groupQuestionQueueLength,
   listGroupReplies,
   mentionTag,
-  recordBypassLoopAttempt,
-  resetBypassLoop,
   sanitizeGroupMemberName,
   throttleOncePerMinute,
 } = await import("@/lib/server/feishu-bridge/group-shared");
@@ -2196,7 +2190,7 @@ describe("机器人发件人直拦", () => {
   };
 
   // 对方机器人是来送结果的，必须照常处理（拦掉就收不到了）；回答真 @ 回去，
-  // 发起方吃掉后静默，正常一轮结束；兜底靠互 @ 熔断。
+  // 发起方吃掉后静默，正常一轮结束（熔断已移除）。
   it("机器人 @bot → 照常注入答疑，回答真 @ 回去（一轮结束靠吃掉静默）", async () => {
     const { handleTaskQuestionInject } = botDeps();
     const r = await routeGroupInboundMessage(
@@ -2243,108 +2237,6 @@ describe("机器人发件人直拦", () => {
     );
     expect(r).toMatchObject({ kind: "sent" });
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("互@熔断", () => {
-  it("纯函数：同一发送人窗口内连发跳闸、冷却中不再计数、窗口外清零、属主清零", () => {
-    const t = "task-loop-unit";
-    const at = (ms: number) => recordBypassLoopAttempt(t, "ou_bot", 1_000_000 + ms);
-    expect(at(0)).toEqual({ tripped: false, cooled: false });
-    expect(at(1000)).toEqual({ tripped: false, cooled: false });
-    expect(at(2000)).toEqual({ tripped: false, cooled: false });
-    expect(at(3000)).toEqual({ tripped: false, cooled: false });
-    // 第 5 轮跳闸
-    expect(at(4000)).toEqual({ tripped: true, cooled: false });
-    // 冷却中：不再计数、不重复跳闸
-    expect(at(5000)).toEqual({ tripped: false, cooled: true });
-    resetBypassLoop(t);
-    expect(at(6000)).toEqual({ tripped: false, cooled: false });
-  });
-
-  it("纯函数：多人群问不累计（review P1-1），空发送人 fail-open", () => {
-    const t = "task-loop-multi";
-    // 5 个不同人各问一句：不跳闸
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      expect(recordBypassLoopAttempt(t, `ou_human${i}`, 1_000_000 + i * 1000)).toEqual({
-        tripped: false,
-        cooled: false,
-      });
-    }
-    // 空发送人不计
-    expect(recordBypassLoopAttempt(t, "", 1_000_000)).toEqual({
-      tripped: false,
-      cooled: false,
-    });
-    expect(recordBypassLoopAttempt("", "ou_x", 1_000_000)).toEqual({
-      tripped: false,
-      cooled: false,
-    });
-  });
-
-  it("纯函数：窗口外的旧轮次不计数", () => {
-    const t = "task-loop-window";
-    recordBypassLoopAttempt(t, "ou_bot", 0);
-    recordBypassLoopAttempt(t, "ou_bot", 1000);
-    recordBypassLoopAttempt(t, "ou_bot", 2000);
-    recordBypassLoopAttempt(t, "ou_bot", 3000);
-    // 隔了一个窗口之后再来 4 轮也不该跳闸
-    const base = BYPASS_LOOP_WINDOW_MS + 10_000;
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS - 1; i++) {
-      expect(recordBypassLoopAttempt(t, "ou_bot", base + i * 1000)).toEqual({
-        tripped: false,
-        cooled: false,
-      });
-    }
-  });
-
-  it("路由层：连续多轮非属主 @ → 跳闸后静默（不回群），属主出现后恢复", async () => {
-    const handleTaskQuestionInject = vi.fn(
-      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
-    );
-    const sendTextToChat = vi.fn(async () => ({
-      chat_id: CHAT,
-      message_id: "om_r",
-    }));
-    __setGroupRouteDepsForTest(
-      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
-    );
-    const ask = (id: string) =>
-      routeGroupInboundMessage(
-        otherMsg({ message_id: id, content: "@Flowship 埋点查了吗" }),
-        ctx,
-      );
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS - 1; i++) {
-      const r = await ask(`om_s${i}`);
-      expect(r).toMatchObject({ kind: "sent" });
-    }
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
-      BYPASS_LOOP_MAX_ROUNDS - 1,
-    );
-    // 第 N 轮跳闸：静默，不回群里任何话
-    const tripped = await ask(`om_s${BYPASS_LOOP_MAX_ROUNDS - 1}`);
-    expect(tripped).toMatchObject({
-      kind: "skipped",
-      error: SKIP_GROUP_LOOP_BREAKER,
-    });
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
-      BYPASS_LOOP_MAX_ROUNDS - 1,
-    );
-    expect(sendTextToChat).not.toHaveBeenCalled();
-    // 冷却中继续静默
-    const cooled = await ask("om_sX");
-    expect(cooled).toMatchObject({
-      kind: "skipped",
-      error: SKIP_GROUP_LOOP_BREAKER,
-    });
-    // 属主出现 = 人在场，清零并恢复
-    const owner = await routeGroupInboundMessage(
-      groupMsg({ message_id: "om_owner", content: "@Flowship 我来看看" }),
-      ctx,
-    );
-    expect(owner).toMatchObject({ kind: "sent" });
-    const after = await ask("om_sY");
-    expect(after).toMatchObject({ kind: "sent" });
   });
 });
 
@@ -2402,7 +2294,7 @@ describe("群问答排队", () => {
     expect(groupQuestionQueueLength("task-1")).toBe(0);
   });
 
-  it("队满（3 个）→ 落回忙线拒收", async () => {
+  it("队满（GROUP_QUESTION_QUEUE_MAX = 10 个）→ 落回忙线拒收", async () => {
     const { handleTaskQuestionInject, sendTextToChat } = queueDeps();
     const inFlight = { cancelled: false, cancel: () => {} };
     registerRestrictedQuestion("task-1", inFlight);
@@ -2448,29 +2340,6 @@ describe("群问答排队", () => {
     expect(groupQuestionQueueLength("task-1")).toBe(0);
   });
 
-  it("熔断跳闸 → 整队丢弃", async () => {
-    const { handleTaskQuestionInject } = queueDeps();
-    const inFlight = { cancelled: false, cancel: () => {} };
-    registerRestrictedQuestion("task-1", inFlight);
-    try {
-      // 队满 3 个（第 4 个忙线拒收），第 5 次尝试触发跳闸、整队丢弃
-      for (let i = 0; i < GROUP_QUESTION_QUEUE_MAX; i++) {
-        expect(await ask(`om_t${i}`)).toMatchObject({ kind: "queued" });
-      }
-      expect(groupQuestionQueueLength("task-1")).toBe(GROUP_QUESTION_QUEUE_MAX);
-      expect(await ask("om_t3")).toMatchObject({ kind: "skipped" });
-      const tripped = await ask("om_trip");
-      expect(tripped).toMatchObject({
-        kind: "skipped",
-        error: SKIP_GROUP_LOOP_BREAKER,
-      });
-      expect(groupQuestionQueueLength("task-1")).toBe(0);
-      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
-    } finally {
-      unregisterRestrictedQuestion("task-1", inFlight);
-    }
-  });
-
   it("新消息到达顺带 draining：先答旧的，再处理当前的", async () => {
     const { handleTaskQuestionInject } = queueDeps();
     enqueueGroupQuestion("task-1", {
@@ -2488,100 +2357,6 @@ describe("群问答排队", () => {
     expect(texts).toHaveLength(2);
     expect(texts[0]).toContain("之前排队的问题");
     expect(texts[1]).toContain("新问题");
-  });
-});
-
-describe("熔断分组计数（review P1-1/P1-2）", () => {
-  const stormDeps = () => {
-    const handleTaskQuestionInject = vi.fn(
-      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
-    );
-    const sendTextToChat = vi.fn(async () => ({
-      chat_id: CHAT,
-      message_id: "om_r",
-    }));
-    __setGroupRouteDepsForTest(
-      baseDeps({ handleTaskQuestionInject, sendTextToChat }) as never,
-    );
-    return { handleTaskQuestionInject, sendTextToChat };
-  };
-
-  it("5 个不同人各问一句不跳闸（正常忙群）", async () => {
-    const { handleTaskQuestionInject } = stormDeps();
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      const r = await routeGroupInboundMessage(
-        otherMsg({
-          message_id: `om_m${i}`,
-          sender_id: `ou_human${i}`,
-          sender_name: `同事${i}`,
-          content: "@Flowship 这个接口什么时候好",
-        }),
-        ctx,
-      );
-      expect(r).toMatchObject({ kind: "sent" });
-    }
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
-      BYPASS_LOOP_MAX_ROUNDS,
-    );
-  });
-
-  it("属主身份拿不到时 fail-open 不计（不误伤）", async () => {
-    const { handleTaskQuestionInject } = stormDeps();
-    __setGroupRouteDepsForTest(
-      baseDeps({
-        handleTaskQuestionInject,
-        getBotAppInfo: async () => ({ appId: "cli_self", ownerOpenId: "" }),
-      }) as never,
-    );
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      const r = await routeGroupInboundMessage(
-        otherMsg({ message_id: `om_o${i}`, content: "@Flowship 在吗" }),
-        ctx,
-      );
-      expect(r).toMatchObject({ kind: "sent" });
-    }
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
-      BYPASS_LOOP_MAX_ROUNDS,
-    );
-  });
-
-  it("跳闸当轮先断再泵：队首不被放行、整队丢弃（review P1-2）", async () => {
-    const { handleTaskQuestionInject } = stormDeps();
-    const { enqueueGroupQuestion: enq } = await import(
-      "@/lib/server/feishu-bridge/group-shared"
-    );
-    // 同一发送人连发到跳闸线下沿
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS - 1; i++) {
-      await routeGroupInboundMessage(
-        otherMsg({ message_id: `om_p${i}`, content: "@Flowship 在吗" }),
-        ctx,
-      );
-    }
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
-      BYPASS_LOOP_MAX_ROUNDS - 1,
-    );
-    // 跳闸瞬间队里正好有 1 个排队的：旧顺序会先放行它再清队，新顺序直接整队丢弃
-    enq("task-1", {
-      messageId: "om_q0",
-      chatId: CHAT,
-      text: "排队的问题",
-      parsed: { text: "排队的问题", images: [], attachments: [] } as never,
-      requester: { openId: "ou_li", name: "李四" },
-      boot: { apiKey: "sk-test", model: { id: "m1" } },
-    });
-    const tripped = await routeGroupInboundMessage(
-      otherMsg({ message_id: "om_trip2", content: "@Flowship 在吗" }),
-      ctx,
-    );
-    expect(tripped).toMatchObject({
-      kind: "skipped",
-      error: SKIP_GROUP_LOOP_BREAKER,
-    });
-    // 队首没被放行（inject 没多调），整队已丢弃
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(
-      BYPASS_LOOP_MAX_ROUNDS - 1,
-    );
-    expect(groupQuestionQueueLength("task-1")).toBe(0);
   });
 });
 
@@ -2641,15 +2416,6 @@ describe("review 三轮：过期占位/多sender清理/节流/补泵", () => {
     expect(groupQuestionQueueLength("task-1")).toBe(1);
   });
 
-  it("B：顺手清掉别人的过期数组，不越积越大", () => {
-    const t = "task-cleanup-unit";
-    const base = 1_000_000;
-    recordBypassLoopAttempt(t, "ou_stale", base);
-    recordBypassLoopAttempt(t, "ou_fresh", base + BYPASS_LOOP_WINDOW_MS + 1000);
-    // 实现细节：记录 fresh 时把 stale 的过期数组删掉
-    expect(__getBypassLoopSendersForTest(t)).toEqual(["ou_fresh"]);
-  });
-
   it("D：同一 key 一分钟内只放行一次", () => {
     __resetThrottleForTest();
     expect(throttleOncePerMinute("k1", 0)).toBe(true);
@@ -2700,20 +2466,19 @@ describe("review 三轮：过期占位/多sender清理/节流/补泵", () => {
 });
 
 describe("review 四轮：清扫/补泵循环/回放抛错", () => {
-  it("record 搭车清扫：过期 task 整项删、节流表同批清", async () => {
+  it("sweepThrottleMarks：只清过期的节流 marks，未过期的保留", async () => {
     const shared = await import("@/lib/server/feishu-bridge/group-shared");
     const base = 1_000_000;
-    recordBypassLoopAttempt("task-dead", "ou_gone", base);
-    expect(shared.__getBypassLoopTaskCountForTest()).toBeGreaterThanOrEqual(1);
-    // 另一个 task 的一次记录触发全表清扫（窗口外 + 节流过期）
-    throttleOncePerMinute("sweep-k", base);
-    recordBypassLoopAttempt("task-live", "ou_now", base + BYPASS_LOOP_WINDOW_MS + 1000);
-    expect(shared.__getBypassLoopTaskCountForTest()).toBe(1);
-    expect(shared.__getBypassLoopSendersForTest("task-live")).toEqual(["ou_now"]);
-    // 节流 mark 同批被清：同一 key 新窗口又能放行
-    expect(throttleOncePerMinute("sweep-k", base + BYPASS_LOOP_WINDOW_MS + 1001)).toBe(
-      true,
-    );
+    shared.throttleOncePerMinute("sweep-old", base);
+    shared.throttleOncePerMinute("sweep-fresh", base + shared.THROTTLE_WINDOW_MS - 1);
+    shared.sweepThrottleMarks(base + shared.THROTTLE_WINDOW_MS + 1);
+    // old 已清：同一时刻又能放行；fresh 仍在窗口内：被节流
+    expect(
+      shared.throttleOncePerMinute("sweep-old", base + shared.THROTTLE_WINDOW_MS + 2),
+    ).toBe(true);
+    expect(
+      shared.throttleOncePerMinute("sweep-fresh", base + shared.THROTTLE_WINDOW_MS + 2),
+    ).toBe(false);
   });
 
   it("入队清过期打 warn（和 shift 对齐，排查对得上）", async () => {
@@ -2831,8 +2596,8 @@ describe("review 五轮：回放抛错回执", () => {
   });
 });
 
-describe("review 六轮：回执不@机器人/中途跳闸停drain", () => {
-  it("pumpfail 回执：发起人是机器人就不 @（和 groupReplyMention 同口径）", async () => {
+describe("review 六轮：回放抛错回执对机器人静默", () => {
+  it("pumpfail 回执：发起人是机器人 → 整条静默（和 groupReplyMention 同口径）", async () => {
     const sendTextToChat = vi.fn(async () => ({
       chat_id: CHAT,
       message_id: "om_r",
@@ -2861,52 +2626,14 @@ describe("review 六轮：回执不@机器人/中途跳闸停drain", () => {
       boot: { apiKey: "k", model: { id: "m" } },
     });
     await pump("task-1");
-    expect(sendTextToChat).toHaveBeenCalledTimes(1);
-    const body = callArgs(sendTextToChat)[1] as string;
-    expect(body).toContain("没接住");
-    // 不 @：对方靠 @ 触发，@ 回去就续环
-    expect(body).not.toContain("<at");
+    // 对方靠 @ 触发，回什么都可能续环：整条静默，队列照常清空
+    expect(sendTextToChat).not.toHaveBeenCalled();
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
   });
 
-  it("长 drain 中途跳闸：剩下的放回队首停掉，不答完（review 六轮-3）", async () => {
-    const handleTaskQuestionInject = vi.fn(
-      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
-    );
-    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
-    const shared = await import("@/lib/server/feishu-bridge/group-shared");
-    const { pumpGroupQuestionQueue: pump } = await import(
-      "@/lib/server/feishu-bridge/group-route"
-    );
-    const entry = (id: string, text: string) => ({
-      messageId: id,
-      chatId: CHAT,
-      text,
-      parsed: { text, images: [], attachments: [] } as never,
-      requester: { openId: "ou_li", name: "李四" },
-      boot: { apiKey: "k", model: { id: "m" } },
-    });
-    shared.enqueueGroupQuestion("task-1", entry("om_d1", "第一条"));
-    shared.enqueueGroupQuestion("task-1", entry("om_d2", "第二条"));
-    // 卡住第一条的注入，期间把熔断跳闸（同一发送人攒满）
-    let release!: () => void;
-    const gate = new Promise<Response>((r) => {
-      release = () => r(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    });
-    handleTaskQuestionInject.mockImplementationOnce(() => gate);
-    const p = pump("task-1");
-    await Promise.resolve();
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      shared.recordBypassLoopAttempt("task-1", "ou_bot", Date.now() + i);
-    }
-    release();
-    await p;
-    // 第一条答了，第二条没答（放回队首，下次冷却过再说）
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
-    expect(groupQuestionQueueLength("task-1")).toBe(1);
-  });
 });
 
-describe("review 八轮：回执不@机器人/过期有交代/带图不排", () => {
+describe("review 八轮：回执对机器人静默/过期有交代/带图不排", () => {
   const quadDeps = () => {
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
@@ -2929,7 +2656,7 @@ describe("review 八轮：回执不@机器人/过期有交代/带图不排", () 
     boot: { apiKey: "k", model: { id: "m" } },
   });
 
-  it("机器人入队 ack 不 @（跳闸前每轮 @ 回去等于续命）", async () => {
+  it("机器人入队 ack 整条静默（照常入队，不回群）", async () => {
     const { handleTaskQuestionInject, sendTextToChat } = quadDeps();
     const inFlight = { cancelled: false, cancel: () => {} };
     registerRestrictedQuestion("task-1", inFlight);
@@ -2944,10 +2671,8 @@ describe("review 八轮：回执不@机器人/过期有交代/带图不排", () 
       );
       expect(r).toMatchObject({ kind: "queued" });
       expect(handleTaskQuestionInject).not.toHaveBeenCalled();
-      expect(sendTextToChat).toHaveBeenCalledTimes(1);
-      const body = callArgs(sendTextToChat)[1] as string;
-      expect(body).toContain("排队");
-      expect(body).not.toContain("<at");
+      expect(groupQuestionQueueLength("task-1")).toBe(1);
+      expect(sendTextToChat).not.toHaveBeenCalled();
     } finally {
       unregisterRestrictedQuestion("task-1", inFlight);
     }
@@ -3005,24 +2730,28 @@ describe("review 八轮：回执不@机器人/过期有交代/带图不排", () 
     }
   });
 
-  it("冷却中过期丢弃静默（回群等于续命）", async () => {
-    const { sendTextToChat } = quadDeps();
+  it("机器人发起的排队过期：pump 丢弃时整条静默（人类才回「超时作废」）", async () => {
+    const { handleTaskQuestionInject, sendTextToChat } = quadDeps();
     const { enqueueGroupQuestion: enq } = await import(
       "@/lib/server/feishu-bridge/group-shared"
     );
     const { pumpGroupQuestionQueue: pump } = await import(
       "@/lib/server/feishu-bridge/group-route"
     );
-    // 直接把熔断跳闸（同一发送人攒满），再 pump
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      recordBypassLoopAttempt("task-1", "ou_bot", Date.now() + i);
-    }
     const old = Date.now() - GROUP_QUESTION_QUEUE_TTL_MS - 1000;
-    enq("task-1", entry("om_cold", "冷却中的过期问题"), old);
+    enq(
+      "task-1",
+      {
+        ...entry("om_bot_stale", "机器人的过期问题"),
+        requester: { openId: "ou_otherbot", name: "对方机器人" },
+        requesterIsBot: true,
+      },
+      old,
+    );
     await pump("task-1");
     expect(sendTextToChat).not.toHaveBeenCalled();
-    // 冷却中连 pump 入口都进不去，过期条目原样躺着、冷却过后的 pump 再清
-    expect(groupQuestionQueueLength("task-1")).toBe(1);
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
   });
 
   it("带图不排队：base64 不进内存队，直接忙线拒收", async () => {
@@ -3053,7 +2782,7 @@ describe("review 八轮：回执不@机器人/过期有交代/带图不排", () 
   });
 });
 
-describe("review 九轮：失败回执不@机器人/no_pending补登记/占格不造幻影", () => {
+describe("review 九轮：失败回执对机器人静默/no_pending补登记/占格不造幻影", () => {
   const quadDeps = () => {
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
@@ -3070,7 +2799,7 @@ describe("review 九轮：失败回执不@机器人/no_pending补登记/占格�
   const botMsg = (overrides = {}) =>
     otherMsg({ sender_type: "app", ...overrides });
 
-  it("pendingAsk 失败回执：bot 发起人不 @（review 九轮-1 之 1025）", async () => {
+  it("pendingAsk 失败回执：bot 发起人整条静默（不再回群）", async () => {
     const { sendTextToChat } = quadDeps();
     __setGroupRouteDepsForTest(
       baseDeps({
@@ -3087,13 +2816,34 @@ describe("review 九轮：失败回执不@机器人/no_pending补登记/占格�
       ctx,
     );
     expect(r).toMatchObject({ kind: "failed" });
+    // 系统回执对机器人发件人整条静默：一条都不发
+    expect(sendTextToChat).not.toHaveBeenCalled();
+  });
+
+  it("pendingAsk 失败回执：人类发起人照常回一句并带 @", async () => {
+    const { sendTextToChat } = quadDeps();
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        sendTextToChat,
+        getPendingAsk: () => ({ askId: "ask-1", questions: [] }),
+        injectPendingAskText: vi.fn(async () => ({
+          ok: false as const,
+          error: "答案写挂了",
+        })),
+      }) as never,
+    );
+    const r = await routeGroupInboundMessage(
+      otherMsg({ message_id: "om_paf_h", content: "@Flowship 用方案 B" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "failed" });
     expect(sendTextToChat).toHaveBeenCalledTimes(1);
     const body = callArgs(sendTextToChat)[1] as string;
     expect(body).toContain("答案写挂了");
-    expect(body).not.toContain("<at");
+    expect(body).toContain("<at");
   });
 
-  it("不支持的消息类型：bot 发起人不 @（review 九轮-1 之 1382）", async () => {
+  it("不支持的消息类型：bot 发起人整条静默（不再回群）", async () => {
     const { sendTextToChat } = quadDeps();
     const r = await routeGroupInboundMessage(
       botMsg({ message_id: "om_unsup" }),
@@ -3108,9 +2858,7 @@ describe("review 九轮：失败回执不@机器人/no_pending补登记/占格�
       },
     );
     expect(r).toMatchObject({ kind: "failed" });
-    const texts = sendTextToChat.mock.calls.map((c) => String((c as unknown[])[1]));
-    expect(texts.some((t) => t.includes("暂不支持"))).toBe(true);
-    expect(texts.every((t) => !t.includes("<at"))).toBe(true);
+    expect(sendTextToChat).not.toHaveBeenCalled();
   });
 
   it("no_pending 落回补登记：回答真 @ 回去", async () => {
@@ -3198,71 +2946,16 @@ describe("review 十轮：关联表清壳/图片兜底", () => {
   });
 });
 
-describe("熔断指数退避（P1）", () => {
-  it("反复跳闸冷却 10→20→40 分钟、封顶 2 小时", async () => {
-    const shared = await import("@/lib/server/feishu-bridge/group-shared");
-    const t = "task-loop-backoff";
-    const T0 = 10_000_000;
-    // 首跳：5 连发
-    for (let i = 0; i < 4; i++)
-      expect(shared.recordBypassLoopAttempt(t, "ou_bot", T0 + i * 1000)).toEqual({
-        tripped: false,
-        cooled: false,
-      });
-    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T0 + 4000)).toEqual({
-      tripped: true,
-      cooled: false,
-    });
-    expect(shared.getBypassLoopTripInfo(t)).toMatchObject({
-      tripCount: 1,
-      cooldownMs: 10 * 60 * 1000,
-    });
-    // 冷却过后（11 分钟）再 5 连发 → 第 2 次，冷却翻倍
-    const T1 = T0 + 11 * 60 * 1000;
-    for (let i = 0; i < 4; i++)
-      expect(shared.recordBypassLoopAttempt(t, "ou_bot", T1 + i * 1000)).toEqual({
-        tripped: false,
-        cooled: false,
-      });
-    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T1 + 4000)).toEqual({
-      tripped: true,
-      cooled: false,
-    });
-    expect(shared.getBypassLoopTripInfo(t)).toMatchObject({
-      tripCount: 2,
-      cooldownMs: 20 * 60 * 1000,
-    });
-    // 冷却中不再计数
-    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T1 + 5000)).toEqual({
-      tripped: false,
-      cooled: true,
-    });
-    // 长时间无跳闸（2 小时后）回到首跳档
-    const T2 = T1 + 3 * 60 * 60 * 1000;
-    for (let i = 0; i < 4; i++)
-      shared.recordBypassLoopAttempt(t, "ou_bot", T2 + i * 1000);
-    expect(shared.recordBypassLoopAttempt(t, "ou_bot", T2 + 4000)).toEqual({
-      tripped: true,
-      cooled: false,
-    });
-    expect(shared.getBypassLoopTripInfo(t)).toMatchObject({
-      tripCount: 1,
-      cooldownMs: 10 * 60 * 1000,
-    });
-    shared.resetBypassLoop(t);
-  });
-});
-
-describe("熔断登记豁免（P2-3）", () => {
+describe("关联回执连续追问", () => {
   afterEach(() => {
     __resetOutboundRegistryForTest();
   });
-  it("有在途登记的目标连发不计数：追问补问不被自家熔断掐死", async () => {
+  it("有在途登记的目标连发 6 轮：每轮都放行（追问补问不被拦）", async () => {
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );
     __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
-    // 同一目标连发 6 轮：无豁免第 5 轮就跳闸，有豁免全放行。
+    // 同一目标连发 6 轮每轮都放行。
     // 注意关联命中送达即焚，每轮前重登（模拟每次追问都有在途登记）。
     for (let i = 0; i < 6; i++) {
       regQ();
@@ -3274,49 +2967,19 @@ describe("熔断登记豁免（P2-3）", () => {
     }
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(6);
   });
-  it("豁免只跳计数不跳冷却：冷却中即使有登记也静默", async () => {
-    const handleTaskQuestionInject = vi.fn(
-      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
-    );
-    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
-    // 先无登记连发跳闸（同一发送人 TAOZI）
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      await routeGroupInboundMessage(
-        taoziMsg({ message_id: `om_trip${i}`, content: "@Flowship 在吗" }),
-        ctx,
-      );
-    }
-    // 冷却中：即使此刻有在途登记，也照旧静默、不回群
-    regQ();
-    const r = await routeGroupInboundMessage(
-      taoziMsg({ message_id: "om_cooled", content: "@Flowship 学号 EAA5E7" }),
-      ctx,
-    );
-    expect(r).toMatchObject({
-      kind: "skipped",
-      error: SKIP_GROUP_LOOP_BREAKER,
-    });
-  });
 });
 
-describe("冷却放行静默消费（P2：禁声不禁食）", () => {
+describe("关联回执 / pendingAsk 答复放行", () => {
   afterEach(() => {
     __resetOutboundRegistryForTest();
     agentSessions.delete("task-1");
   });
-  it("冷却中被等目标回话 + 会话在场 → 喂会话放行（数据不丢）", async () => {
+  it("被等目标回话 + 会话在场 → 喂会话放行（correlatedAnswer，数据不丢）", async () => {
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );
     __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
-    // 先无登记连发跳闸（同一发送人）
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      await routeGroupInboundMessage(
-        taoziMsg({ message_id: `om_ct${i}`, content: "@Flowship 在吗" }),
-        ctx,
-      );
-    }
-    // 冷却中：被等目标回话 + 会话在场 → 放行喂会话（replyHandle=null，零输出）
+    // 被等目标回话 + 会话在场 → 放行喂会话（replyHandle=null，零输出）
     regQ();
     agentSessions.set("task-1", {} as never);
     const r = await routeGroupInboundMessage(
@@ -3324,12 +2987,12 @@ describe("冷却放行静默消费（P2：禁声不禁食）", () => {
       ctx,
     );
     expect(r).toMatchObject({ kind: "sent" });
-    expect(injectOptsOf(handleTaskQuestionInject, 4)).toMatchObject({
+    expect(injectOptsOf(handleTaskQuestionInject, 0)).toMatchObject({
       restrictToQuestion: false,
       correlatedAnswer: true,
     });
   });
-  it("冷却中有人回 agent 的追问 → pendingAsk 答复放行", async () => {
+  it("有人回 agent 的追问 → pendingAsk 答复放行", async () => {
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );
@@ -3341,20 +3004,13 @@ describe("冷却放行静默消费（P2：禁声不禁食）", () => {
         injectPendingAskText,
       }) as never,
     );
-    // 先连发跳闸（pending 开着也不影响计数）
-    for (let i = 0; i < BYPASS_LOOP_MAX_ROUNDS; i++) {
-      await routeGroupInboundMessage(
-        otherMsg({ message_id: `om_pt${i}`, content: "@Flowship 在吗" }),
-        ctx,
-      );
-    }
-    // 冷却中：pendingAsk 答复放行（burn + sent，零输出）
+    // pendingAsk 答复放行（burn + sent，零输出）
     const r = await routeGroupInboundMessage(
       otherMsg({ message_id: "om_pans", content: "@Flowship 选第一个" }),
       ctx,
     );
     expect(r).toMatchObject({ kind: "sent" });
-    expect(injectPendingAskText).toHaveBeenCalledTimes(5);
+    expect(injectPendingAskText).toHaveBeenCalledTimes(1);
   });
 });
 

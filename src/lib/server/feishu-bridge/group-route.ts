@@ -557,6 +557,19 @@ const readInjectError = async (resp: Response): Promise<string> => {
   return `注入失败（HTTP ${resp.status}）`;
 };
 
+/**
+ * 注入返回的 202 是不是 task 待送达队列的受理（body 带 `queued: true`）。
+ * 光看 status 不够：chat 队列的 202 / 旧口径的 task 202 没有这个标记，仍走原防御回执。
+ */
+const isTalkQueuedResponse = async (resp: Response): Promise<boolean> => {
+  try {
+    const data = (await resp.clone().json()) as { queued?: unknown };
+    return data?.queued === true;
+  } catch {
+    return false;
+  }
+};
+
 // ----------------- 群内推进 -----------------
 
 /** 一次推进的目标（内置 / 自定义归一后的形态） */
@@ -1012,8 +1025,14 @@ const injectGroupMessage = async (args: {
   // 答 pendingAsk / 吃关联回执都走 send 进活会话、跑着也能答——两者都是会话在等的数据，
   // 不新起 agent、不占工作区；只有「普通消息」受正在跑的限制
   const hasPendingAsk = !!deps.getPendingAsk(taskId);
-  const busyReason =
+  const rawBusyReason =
     hasPendingAsk || feedIntoSession ? null : groupMessageBusyReason(task);
+  // 属主 task 型主链正忙：不在群侧拒收，交给注入链入 task 待送达队列（见下方 queueIfBusy）。
+  // 只豁免「主链在跑」；旁路答疑在飞仍按原口径拒（那条是群侧串行闸、不是主链排队）。
+  const busyReason =
+    isOwner && task.mode !== "chat" && rawBusyReason === GROUP_TASK_RUNNING
+      ? null
+      : rawBusyReason;
   if (busyReason) {
     // 排队（只收非属主 task 型普通问题）：忙线拒收改成攒起来，前一个答完就答它。
     // 属主 / chat 型 / 答 pendingAsk / 关联回执不排——属主用 app 当主通道，关联数据有时效性。
@@ -1245,6 +1264,23 @@ const injectGroupMessage = async (args: {
               // 关联命中喂会话是唯一的例外（出问登记两门已过，且活会话在场）。
               restrictToQuestion: !useOwnerInject,
               ...(correlated ? { correlatedAnswer: true } : {}),
+              // 属主本人的话 / 托办回执：agent 正在跑时入 task 待送达队列（202）而不是 409 丢掉
+              //（回执丢了就是真实案例：对接后端机器人时用户觉得「没有排队机制」）。
+              // 非属主的只读答疑旁路走群模块自己的队列，不传。
+              ...(isOwner || feedIntoSession
+                ? {
+                    queueIfBusy: {
+                      source: feedIntoSession
+                        ? ("group_reply" as const)
+                        : ("group_owner" as const),
+                      senderName: requester.name,
+                      senderIsBot: args.requesterIsBot,
+                      preview:
+                        args.text.replace(/\s+/g, " ").trim().slice(0, 120) ||
+                        "(附图/附件)",
+                    },
+                  }
+                : {}),
               // 旁路 run 的事件身份 = 上面这条登记的 token（回答只投给它）
               ...(restrictedRunTag ? { restrictedRunTag } : {}),
             },
@@ -1269,10 +1305,24 @@ const injectGroupMessage = async (args: {
     // 202 = 排队中（chat 队列）——这条消息**没有**对应的 run 开跑，登记留着只会被
     // 下一轮无关的 done 收走、把别人的回答 @ 给他（第五轮双审 P1-B）。摘掉登记、
     // 群里只给受理回执，结果去 app 看。
-    // 注：task 通道不产 202（只有 chat-inject 回 202，已核对），此分支是防御性保留——
-    // 万一哪天 task 也回 202，这里同样正确（先摘登记再回执），别当死分支删了。
+    // 注：task 通道带 queueIfBusy 时回 `{ queued: true }` 的 202（task 待送达队列、见下面 task 分支）；
+    // 其余 202（chat-inject 的 chat 队列 / 无标记的 task 202）走后面原回执，行为不变。
     if (resp.status === 202) {
       restoreGroupReply(taskId, replyHandle);
+      // task 模式 + `queued: true` = 进了 task 待送达队列（没有 run 开跑，登记已在上面摘掉）：
+      // 属主的话回一句「这轮跑完就处理」；托办回执本来就不回群，保持静默。
+      // 关联登记入队时就 burn：文本已存进队列、重放不再需要它，留着反而会被下一句复读二次消费。
+      if (task.mode !== "chat" && (await isTalkQueuedResponse(resp))) {
+        if (correlated) burnCorrelatedEntry(taskId, correlated.entry.messageId);
+        if (!feedIntoSession) {
+          await replyToGroup(
+            chatId,
+            "收到，当前这轮跑完就处理",
+            groupReplyMention(args.requesterIsBot, requester),
+          );
+        }
+        return { kind: "queued", messageId, taskId, text: args.text || undefined };
+      }
       await replyToGroup(
         chatId,
         "收到，排队处理中、结果去 Flowship 看",

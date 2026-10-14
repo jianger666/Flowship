@@ -53,6 +53,7 @@ import {
   getTaskWithTailEvents,
 } from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
+import { buildTalkQueueSnapshot } from "@/lib/server/task-talk-queue";
 import {
   hasRestrictedQuestionInFlight,
   type TaskStreamEvent,
@@ -258,6 +259,9 @@ export const GET = async (req: Request, { params }: Ctx) => {
           case "restricted_run":
             send({ type: "restricted_run", active: ev.active });
             break;
+          case "talk_queue":
+            send({ type: "talk_queue", items: ev.items });
+            break;
           // DELETE 逻辑删除提交 → 通知客户端并关流
           case "task_deleted":
             send({ type: "task_deleted", taskId: ev.taskId });
@@ -297,6 +301,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
           type: "restricted_run",
           active: hasRestrictedQuestionInFlight(id),
         });
+        send({ type: "talk_queue", items: buildTalkQueueSnapshot(id) });
         // 进行中思考的快照：无条件发一帧（对象 = 接着长；null = 没在思考、前端清残留）。
         // 这段思考的落盘事件已经在 tail 里 = 思考其实结束了（节流状态还没来得及清），发 null 防幽灵
         const liveSnap =

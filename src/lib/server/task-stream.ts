@@ -18,6 +18,7 @@ import type { TaskFieldsSnapshot } from "./task-prompts";
 // 仅 type-only——action-side-effects 不反向依赖本模块，无运行时环
 import type { ClaimHandle } from "./action-side-effects";
 import type { TaskOwnershipState } from "./task-op";
+import type { TalkQueueItem } from "@/lib/talk-queue";
 
 // ----------------- 工具截断 -----------------
 
@@ -74,6 +75,8 @@ export type TaskStreamEvent =
   | { kind: "message_op"; itemId: string; phase?: string; outcome?: string }
   // 旁路（受限群答疑）run 在飞与否——前端据此决定工具块还该不该转圈（见 P1-2 注释）
   | { kind: "restricted_run"; active: boolean }
+  /** task 模式待送达队列快照（纯内存、不落盘；bootstrap 补发当前值） */
+  | { kind: "talk_queue"; items: TalkQueueItem[] }
   | { kind: "task_deleted"; taskId: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;

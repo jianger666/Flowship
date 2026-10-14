@@ -9,7 +9,8 @@
  *
  * v1.1.x 起视觉 / 交互统一走 <ConversationComposer>（chat 输入岛同一个组件）：贴图 / 附文件目录 /
  * `/` 唤起 skill / `@` 引用文件 / 顶边拖高；本文件只留业务态（发送通道 / 模型 / 禁用判定 /
- * 运行中停止键）。Cmd/Ctrl+J 聚焦。agent 正在跑时禁用发送、右侧换成 Composer 同款停止键；
+ * 运行中停止键）。Cmd/Ctrl+J 聚焦。agent 正在跑时仍可打字、回车 = 排队（服务端 202 入 task 待送达队列，
+ * 这轮跑完自动送达），右侧换成 Composer 同款停止键 + 排队发送键；
  * 有未答提问时例外：输入条保持可发，回车顶掉这张卡（隐式跳过）。
  * 任务终态整条隐藏。
  */
@@ -99,6 +100,7 @@ export const TaskTalkComposer = ({
   // 有未答提问时输入条保持可发（回车 = 隐式跳过这张卡），不要被 shell 阻塞画成停止键。
   const pendingAsk = findPendingAskEvent(task.events);
   const isRunning = runActive && !pendingAsk;
+  // 运行中仍允许打字排队：输入区只被 submitting 锁；busy 另管模型 / 提供方切换（跑着不能换）
   const busy = submitting || isRunning;
 
   // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、跟 chat 输入岛同一份实现
@@ -106,7 +108,7 @@ export const TaskTalkComposer = ({
     taskId: task.id,
     draft: { scope: "talk", id: task.id },
     maxImages: 6,
-    disabled: busy,
+    disabled: submitting,
   });
 
   // 展示模型：用户手动覆盖优先（粘住），否则跟当前推进实际在用的模型
@@ -244,6 +246,11 @@ export const TaskTalkComposer = ({
     void pending.promise.then(
       (result) => {
         if (!alive) return;
+        if (result.queued) {
+          toast.success("已排队，当前这轮跑完自动发送");
+          if (valueRef.current === pending.text) resetRef.current();
+          return;
+        }
         if (result.persistWarning) {
           toast.error(
             `消息已送达但记录保存失败：${result.persistWarning}`,
@@ -306,13 +313,15 @@ export const TaskTalkComposer = ({
   const awaitingAnswer = !halted && !!pendingAsk;
 
   const handleSubmit = async () => {
-    if (!rich.hasContent || busy) return;
+    if (!rich.hasContent || submitting) return;
     // 跨挂载去重：上一条还在飞时拒掉（submitTaskQuestion 内有同款前置兜底、这里先给轻提示）
     if (getPendingQuestionSend(task.id)) {
       toast.error("上一条消息还在发送中、稍等它发完再发");
       return;
     }
     setSubmitting(true);
+    // 运行中发送 = 排队：服务端 queueIfBusy 入队返 202，不做乐观气泡（送达时才由 user_reply 事件出现）
+    const queueMode = isRunning;
     // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、
     // AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」上下文。
     // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
@@ -332,14 +341,18 @@ export const TaskTalkComposer = ({
             (paths) => rich.pathAttach.replaceAll(paths),
             (imgs) => rich.attach.replaceAll(imgs),
           ),
-        pendingKey: {
-          taskId: task.id,
-          text: snap.text,
-          displayText: snap.text,
-          nonce: allocPendingNonce(),
-        },
-        onPendingAdd,
-        onPendingRemove,
+        ...(queueMode
+          ? {}
+          : {
+              pendingKey: {
+                taskId: task.id,
+                text: snap.text,
+                displayText: snap.text,
+                nonce: allocPendingNonce(),
+              },
+              onPendingAdd,
+              onPendingRemove,
+            }),
         send: () =>
           submitTaskQuestion(
             task,
@@ -348,6 +361,7 @@ export const TaskTalkComposer = ({
             talkForceModel(pickedModel, resolveSessionModel(task)),
             snap.attachments,
             snap.skillRefs,
+            { queueIfBusy: queueMode },
           ),
       });
       if (!outcome.ok) {
@@ -359,6 +373,10 @@ export const TaskTalkComposer = ({
         return;
       }
       const result = outcome.result;
+      if (result.queued) {
+        toast.success("已排队，当前这轮跑完自动发送");
+        return;
+      }
       // send 后落盘失败——不可忽略提示
       if (result.persistWarning) {
         toast.error(
@@ -388,9 +406,11 @@ export const TaskTalkComposer = ({
           placeholder={
             awaitingAnswer
               ? "可先答上方提问，也可在此继续说"
-              : "想改、想问、贴图、/ 唤起 skill、@ 引用文件（⌘/Ctrl+J）"
+              : isRunning
+                ? "AI 正在跑，回车排队，跑完自动发送…"
+                : "想改、想问、贴图、/ 唤起 skill、@ 引用文件（⌘/Ctrl+J）"
           }
-          disabled={busy}
+          disabled={submitting}
           submitting={submitting}
           leading={
             <span className="flex min-w-0 flex-1 items-center gap-1.5">
@@ -436,8 +456,9 @@ export const TaskTalkComposer = ({
               </span>
             </span>
           }
-          // 运行中：右侧动作组原地换成 spinner + 红停止键（Composer 同款、与 chat 对齐；无排队）
+          // 运行中：右侧动作组换成 spinner + 红停止键，旁边留「排队发送」（回车同效）
           running={isRunning}
+          allowQueueWhileRunning
           onStop={onStop}
           stopping={stopping}
         />

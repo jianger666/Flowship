@@ -20,6 +20,7 @@ import { promises as fs } from "node:fs";
 import type { ModelSelection } from "@cursor/sdk";
 
 import { isAbsolutePathLike } from "@/lib/path-utils";
+import { sanitizeInboundCardText } from "@/lib/server/feishu-bridge/inbound-card-sanitize";
 import { MAX_SKILL_REFS } from "@/lib/protocol-signals";
 import type { ImageAttachmentInput } from "@/lib/server/task-artifacts";
 
@@ -75,13 +76,20 @@ export const parseTextContent = (content: string): string => {
  * ② lark-cli enrichment 的 `<card>…markdown…</card>` 富文本。抽不出返回 null。
  * 抽出的文本一律视为**不可信数据**（调用方负责打来源前缀、不进指令解析）。
  */
-export const extractInteractiveText = (content: string): string | null => {
+export const extractInteractiveText = (
+  content: string,
+  opts?: { resolveOpenId?: (id: string) => string | undefined },
+): string | null => {
   const raw = (content ?? "").trim();
   if (!raw) return null;
   // enrichment 富文本形态
   const cardMatch = /<card>([\s\S]*)<\/card>/i.exec(raw);
   if (cardMatch) {
-    const inner = cardMatch[1].replace(/<[^>]+>/g, "").trim();
+    // 先净化再剥 tag：面板里的推理文本可能含 `<` `>`，先剥 tag 会跨行误吞面板外正文；
+    // ▶/▲ 标记与 tag 语法无关，先净化最稳。截断放净化之后，避免面板占满额度挤掉正文。
+    const inner = sanitizeInboundCardText(cardMatch[1], opts)
+      .replace(/<[^>]+>/g, "")
+      .trim();
     return inner ? inner.slice(0, 20000) : null;
   }
   // 原生卡片 JSON：收集文本类节点（bounded）
@@ -103,6 +111,8 @@ export const extractInteractiveText = (content: string): string | null => {
     }
     if (typeof node !== "object") return;
     const o = node as Record<string, unknown>;
+    // 折叠面板按定义是过程细节（思考 / 工具执行），整棵子树不读
+    if (o.tag === "collapsible_panel") return;
     // 卡片文本只认这两个键（按钮 title 等同样只当数据，不区分）
     for (const k of ["text", "content"]) {
       const v = o[k];
@@ -117,8 +127,8 @@ export const extractInteractiveText = (content: string): string | null => {
     }
   };
   walk(parsed);
-  const text = parts.join("\n").trim();
-  return text ? text : null;
+  const text = sanitizeInboundCardText(parts.join("\n"), opts);
+  return text ? text.slice(0, 20000) : null;
 };
 
 // ----------------- Response helpers -----------------

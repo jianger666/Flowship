@@ -35,6 +35,7 @@ import {
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Tooltip } from "@/components/ui/tooltip";
 import { Textarea } from "@/components/ui/textarea";
 import { MARKDOWN_REPLY_TEXT, MarkdownText } from "@/components/markdown-text";
@@ -72,6 +73,7 @@ import {
   toggleEventCollapsed,
 } from "@/lib/chat-turns";
 import { formatDurationPrecise } from "@/lib/duration-display";
+import { cleanGroupQuestionText } from "@/lib/group-qa";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { pathBasename } from "@/lib/path-utils";
@@ -954,7 +956,18 @@ const EventRowImpl = ({
         );
       }
       // 折叠判定纯逻辑在 lib/chat-stream-display（可单测）；行数阈值与 line-clamp-8 对应
-      const userCollapsible = shouldCollapseUserMessage(ev.text);
+      // 飞书群里属主自己的消息（source=feishu_group）：喂给 agent 的内部前缀
+      // （`[群消息·来自 X]` / 全角托办回执头）不是写给人看的，展示去噪正文 + 发言人名。
+      // 只改展示：重发 / 编辑仍用原 ev.text（前缀是给 agent 的上下文，原样重发语义才对）。
+      const isGroupMsg = ev.meta?.source === "feishu_group";
+      const groupSender =
+        isGroupMsg && typeof ev.meta?.groupSender === "string"
+          ? ev.meta.groupSender.trim()
+          : "";
+      const displayText = isGroupMsg
+        ? cleanGroupQuestionText(ev.text) || ev.text
+        : ev.text;
+      const userCollapsible = shouldCollapseUserMessage(displayText);
       const bubble = (
         // 右对齐收窄块（Codex 风、A1）：ml-auto + max-w 85%；min-w-0 + wrap-anywhere 防长 URL 撑破
         <div className={cn(MESSAGE_ACTION_HOST, USER_REPLY_BUBBLE)}>
@@ -994,13 +1007,27 @@ const EventRowImpl = ({
               </span>
             </div>
           )}
+          {isGroupMsg && (
+            <div className="mb-1.5 flex items-center gap-1">
+              <span className="inline-flex items-center gap-1 rounded-sm bg-info/15 px-1.5 py-0.5 text-[11px] font-medium text-info">
+                <MessageSquareText className="size-3" />
+                {groupSender ? `飞书群 · ${groupSender}` : "来自飞书群"}
+              </span>
+              {/* 机器人标只认服务端明写的 groupSenderIsBot；没写就不显示（不猜） */}
+              {ev.meta?.groupSenderIsBot === true && (
+                <Badge variant="secondary" size="xs">
+                  机器人
+                </Badge>
+              )}
+            </div>
+          )}
           <div
             className={cn(
               USER_REPLY_TEXT,
               userCollapsible && !userExpanded && "line-clamp-8",
             )}
           >
-            <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
+            <SearchHighlightText ownerId={ev.id} field="body" text={displayText} />
           </div>
           {userCollapsible && (
             <button

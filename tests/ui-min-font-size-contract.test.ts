@@ -35,12 +35,14 @@ describe("UI 字号下限 ≥ 11px", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("群问答面板（曾违规处）的文字不再叠透明度", () => {
-    const text = readFileSync(
-      path.join(SRC, "components/tasks/group-qa-panel.tsx"),
-      "utf-8",
-    );
-    expect(text).not.toMatch(/text-muted-foreground\/\d+/);
+  it("群问答面板（曾违规处）及其单轮卡片的文字不再叠透明度", () => {
+    for (const rel of [
+      "components/tasks/group-qa-panel.tsx",
+      "components/tasks/group-qa-round-card.tsx",
+    ]) {
+      const text = readFileSync(path.join(SRC, rel), "utf-8");
+      expect(text, rel).not.toMatch(/text-muted-foreground\/\d+/);
+    }
   });
 
   it("任务列表行的阶段 / 时间文字不再叠透明度（装饰分隔点与图标除外）", () => {

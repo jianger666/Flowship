@@ -34,6 +34,7 @@ import {
 } from "./task-stream";
 import { cancelChatRun } from "./chat-runner";
 import { failQueuedItems } from "./chat-queue";
+import { clearTalkQueue } from "./task-talk-queue";
 import {
   beginChatLifecycle,
   cancelChatStart,
@@ -133,6 +134,8 @@ const runStopTaskAgent = async (
     const hadAgent = cancelTaskRun(id) || cancelChatRun(id);
     // 停止清队走唯一 sink（queue_failed + recentSettled），禁止直调 clear
     failQueuedItems(id, { reason: "stopped" });
+    // 用户点停止：清掉输入条排的队，群来源保留、空闲后照常送达
+    clearTalkQueue(id, { onlySources: ["app"] });
     // 撤销启动 lease（标 cancelled），owner 在 checkpoint 窗口内复查失效后中止；
     // 不用 clearChatGate——不能清正在进行的 rewind 门闩（rewind 侧 finally 自己 endChatRewind）
     cancelChatStart(id);

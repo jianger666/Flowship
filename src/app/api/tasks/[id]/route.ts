@@ -62,6 +62,7 @@ import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
 import { cleanupChatQueueState, failQueuedItems } from "@/lib/server/chat-queue";
 import { clearCorrelatedEntries } from "@/lib/server/feishu-bridge/group-outbound-registry";
 import { clearGroupQuestionQueue } from "@/lib/server/feishu-bridge/group-shared";
+import { clearTalkQueue } from "@/lib/server/task-talk-queue";
 import {
   beginChatLifecycle,
   cancelChatStart,
@@ -641,6 +642,7 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     cancelRestrictedQuestions(id);
     // 群问答排队同理：条目带 boot.apiKey，任务没了必须清、不然永久躺内存（review 六轮-2）
     clearGroupQuestionQueue(id);
+    clearTalkQueue(id);
     // 出问关联表同清：空壳也不留（review 十轮-1，和熔断表、排队同一套路）
     clearCorrelatedEntries(id);
     // 删任务清队也走唯一终态 sink——已 202 的排队消息发 queue_failed（deleted）、

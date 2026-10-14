@@ -168,4 +168,57 @@ describe("isHiddenFromEventStream", () => {
       ),
     ).toBe(false);
   });
+  it("答疑旁路 run 的过程事件（meta.groupRun 非空串）主流程隐藏，不论 kind", () => {
+    for (const kind of [
+      "thinking",
+      "assistant_message",
+      "tool_call",
+      "tool_result",
+      "info",
+    ] as const) {
+      expect(
+        isHiddenFromEventStream(ev(kind, { meta: { groupRun: "tok1" } })),
+        kind,
+      ).toBe(true);
+    }
+    // chat 形态同样隐藏
+    expect(
+      isHiddenFromEventStream(
+        ev("assistant_message", { meta: { groupRun: "tok1" } }),
+        { isChat: true },
+      ),
+    ).toBe(true);
+  });
+
+  it("答疑 run 的 error（含无 callId 的整轮崩溃）也隐藏；属主自己的 error 照旧可见", () => {
+    expect(
+      isHiddenFromEventStream(
+        ev("error", { text: "答疑 run 崩了", meta: { groupRun: "tok1" } }),
+      ),
+    ).toBe(true);
+    // 既有原则不破：无 groupRun 的整轮崩溃永远可见
+    expect(isHiddenFromEventStream(ev("error", { text: "整轮崩了" }))).toBe(
+      false,
+    );
+    expect(
+      isHiddenFromEventStream(ev("error", { meta: { other: "x" } })),
+    ).toBe(false);
+  });
+
+  it("groupRun 空串 / 纯空白 / 非字符串不算答疑 run，照常显示", () => {
+    for (const v of ["", "   ", 1, true, null, {}, ["tok1"]]) {
+      expect(
+        isHiddenFromEventStream(ev("assistant_message", { meta: { groupRun: v } })),
+        JSON.stringify(v),
+      ).toBe(false);
+    }
+  });
+
+  it("key 精确匹配：大小写不同的 key（grouprun）不算", () => {
+    expect(
+      isHiddenFromEventStream(
+        ev("assistant_message", { meta: { grouprun: "tok1" } }),
+      ),
+    ).toBe(false);
+  });
 });
