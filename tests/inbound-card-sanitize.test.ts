@@ -148,3 +148,41 @@ describe("sanitizeInboundCardText / extractInteractiveText", () => {
     expect(t).toBe("y".repeat(20000));
   });
 });
+
+describe("真实群历史形态：<card> 外壳 + <at> 标签", () => {
+  it("lark-cli 历史里的 <card> 外壳被拆掉，外壳内的页脚也能剥（页脚不再被 </card> 挡成「非文末」）", () => {
+    const raw = `<card>
+**模型** · 已切换
+这条是正文。
+---
+claude-sonnet-5-5-300k-xhigh · 2s
+</card>`;
+    const t = sanitizeInboundCardText(raw);
+    expect(t).toBe("**模型** · 已切换\n这条是正文。");
+    expect(t).not.toContain("<card>");
+    expect(t).not.toContain("claude-sonnet");
+  });
+
+  it("按钮行在 </card> 之前也能剥", () => {
+    expect(sanitizeInboundCardText("<card>\n已启动审查\n[✕ 关闭]\n</card>")).toBe("已启动审查");
+  });
+
+  it("<at user_id=...></at> 空标签 → 按 resolver 还原名字；解析不出 → @某成员", () => {
+    const raw = `<at user_id="ou_18518a65e71237f52e7905e1f7af51c4"></at> 这轮没跑成功`;
+    expect(
+      sanitizeInboundCardText(raw, {
+        resolveOpenId: (id) => (id.startsWith("ou_1851") ? "安若流年" : undefined),
+      }),
+    ).toBe("@安若流年 这轮没跑成功");
+    expect(sanitizeInboundCardText(raw)).toBe("@某成员 这轮没跑成功");
+  });
+
+  it("<at> 标签自带名字 → 直接用；all → @所有人", () => {
+    expect(
+      replaceOpenIdPlaceholders(
+        `<at user_id="ou_x">李安</at> 和 <at user_id="all"></at> 请看`,
+        () => undefined,
+      ),
+    ).toBe("@李安 和 @所有人 请看");
+  });
+});

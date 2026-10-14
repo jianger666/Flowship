@@ -146,10 +146,13 @@ export const createShellOutputDeltaPublisher = (
  * `summary-completed` 再落完成行。start/end 串行写，避免火忘乱序。
  *
  * @param lease 绑 instanceId / opHandle——失主丢弃迟到 summary 事件
+ * @param origin 旁路答疑 run 的身份 token（属主主链不传）：压缩 info 事件也要带上它，
+ *   才会被打 `meta.groupRun` 一起折叠进「群答疑」那一行，不漏到主流里
  */
 export const createSdkSummaryDeltaPublisher = (
   taskId: string,
   lease: () => boolean,
+  origin?: string,
 ): ((args: { update: InteractionUpdate }) => void) => {
   // 暂存最近一次 summary 文本字数（summary update 通常先于 summary-completed）
   let lastSummaryChars: number | undefined;
@@ -165,11 +168,16 @@ export const createSdkSummaryDeltaPublisher = (
     writeChain = writeChain
       .then(async () => {
         if (!lease()) return;
-        await writeOwnedEventAndPublish(taskId, lease, {
-          kind: "info",
-          text: event.text,
-          meta: event.meta,
-        });
+        await writeOwnedEventAndPublish(
+          taskId,
+          lease,
+          {
+            kind: "info",
+            text: event.text,
+            meta: event.meta,
+          },
+          origin,
+        );
       })
       .catch((err) => {
         console.warn(`[sdk-summary] task=${taskId} 写事件失败:`, err);

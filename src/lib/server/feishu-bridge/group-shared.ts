@@ -254,8 +254,32 @@ export interface PendingGroupReply {
    * 打字直推没有卡，缺省就行。
    */
   advancePickId?: string;
-  /** 累积的本轮回答文本（assistant_delta / assistant_message 攒） */
+  /**
+   * 提问人是不是机器人（group-route 入向判定后传进来）。
+   * 出向据此决定：失败 / 空回答时机器人提问人静默（不让两个机器人互 @ 成环）、
+   * 回复协议里「没写 @ 时要不要自动补 @提问人」。缺省 = 真人。
+   */
+  requesterIsBot?: boolean;
+  /**
+   * 累积的「当前这一段」回答文本（assistant_delta / assistant_message 攒）。
+   * 语义是**最后一次工具调用之后的那段文字**——每遇到本 run 的 tool_call 就收段
+   *（见 {@link closeGroupReplySegment}），中途「我先查一下…」之类旁白不进群。
+   */
   answer: string;
+  /**
+   * 上一个被工具调用截断的非空段落。flush 时 `answer` 为空（最后一次工具调用后
+   * agent 没再说话）就退回它，免得「答案写在工具调用之前」时整轮空回答。
+   */
+  lastSegment: string;
+  /** 登记时刻（汇总事件算 durationMs 用）；与 createdAt 同值、语义独立 */
+  startedAt: number;
+  /**
+   * 已被 tool_call 收段、但对应 `assistant_message` 落盘版还没到的段落文本（trim 后）。
+   * 落盘版晚到时按它认出「这是已收段落的重复」丢掉，不让它被当成新一段的开头。
+   */
+  awaitingMessages?: string[];
+  /** 当前段的 `assistant_message` 落盘版是否已经见过（见过 = 收段时不必再等它） */
+  answerMessageSeen?: boolean;
   createdAt: number;
   /**
    * 租约到期时刻（墙钟）。登记时 = `createdAt + GROUP_REPLY_TTL_MS`。
@@ -464,7 +488,15 @@ export const rememberGroupReply = (
   taskId: string,
   entry: Omit<
     PendingGroupReply,
-    "answer" | "createdAt" | "expiresAt" | "token" | "runTag"
+    | "answer"
+    | "lastSegment"
+    | "startedAt"
+    | "awaitingMessages"
+    | "answerMessageSeen"
+    | "createdAt"
+    | "expiresAt"
+    | "token"
+    | "runTag"
   > & { channel: GroupReplyChannel },
 ): GroupReplyHandle | null => {
   if (!taskId || !entry.chatId) return null;
@@ -493,6 +525,8 @@ export const rememberGroupReply = (
   list.push({
     ...rest,
     answer: "",
+    lastSegment: "",
+    startedAt: now,
     createdAt: now,
     expiresAt: now + GROUP_REPLY_TTL_MS,
     token,
@@ -627,6 +661,72 @@ export const appendGroupReplyAnswer = (
   // 有 delta 就说明这一路还活着——顺手续租（纯等待期另由过期收口协议兜底）
   entry.expiresAt = Date.now() + GROUP_REPLY_TTL_MS;
 };
+
+/** awaitingMessages 的容量（极端长链路里的工具调用数上限，防无限涨） */
+const AWAITING_MESSAGES_MAX = 50;
+
+/**
+ * 本 run 又调了一次工具 → 当前段结束：非空就存进 `lastSegment`、`answer` 清空。
+ *
+ * 为什么要分段：答疑回复原先是整轮所有文字拼在一起，「我先查一下…」旁白和英文残句
+ * 全发给了外部同事。现在只认「最后一次工具调用之后」的那段。
+ *
+ * 事件真实顺序（sdk-message-handler）：tool_call 消息进来先冲 delta、再 `assistantCtx.flush()`
+ * 落 assistant_message，最后才写 tool_call 事件——即 delta* → assistant_message → tool_call，
+ * 此时当前段的落盘版早已见过（answerMessageSeen）。万一落盘版晚于 tool_call 到达，
+ * 这里把收掉的段落文本记进 awaitingMessages，{@link acceptGroupReplyMessage} 凭它认出重复。
+ * 只认 runTag 对得上的那条——属主 run 的工具调用绝不截断同事的答疑段落。
+ */
+export const closeGroupReplySegment = (
+  taskId: string,
+  runTag: string | null,
+): void => {
+  const entry = peekGroupReply(taskId, runTag);
+  if (!entry || entry.kind !== "question") return;
+  const seg = entry.answer.trim();
+  if (!seg) return;
+  entry.lastSegment = seg;
+  entry.answer = "";
+  if (!entry.answerMessageSeen) {
+    const waiting = entry.awaitingMessages ?? [];
+    waiting.push(seg);
+    if (waiting.length > AWAITING_MESSAGES_MAX) waiting.shift();
+    entry.awaitingMessages = waiting;
+  }
+  entry.answerMessageSeen = false;
+};
+
+/**
+ * `assistant_message`（同一段文字的落盘版）进来：
+ * 1. 是某个已收段落的晚到重复 → 消费掉那条记录、丢弃；
+ * 2. 当前段已有 delta → 就是当前段的落盘版，丢弃（并记「已见」）；
+ * 3. 当前段还是空的（没收到 delta）→ 用它兜底追加。
+ * 第 1 条必须排在第 2 条之前：下一段的 delta 可能已经开始攒，不先认重复就会被
+ * 「answer 非空」那条误当成当前段的落盘版吞掉标记。
+ */
+export const acceptGroupReplyMessage = (
+  taskId: string,
+  runTag: string | null,
+  text: string,
+): void => {
+  const entry = peekGroupReply(taskId, runTag);
+  const t = text?.trim();
+  if (!entry || !t) return;
+  const waiting = entry.awaitingMessages;
+  const idx = waiting ? waiting.indexOf(t) : -1;
+  if (waiting && idx >= 0) {
+    waiting.splice(idx, 1);
+    return;
+  }
+  entry.answerMessageSeen = true;
+  if (entry.answer.trim()) return;
+  appendGroupReplyAnswer(taskId, runTag, text);
+};
+
+/** 这条登记最终该发的文本：当前段，空则退回上一非空段 */
+export const finalGroupReplyText = (
+  entry: Pick<PendingGroupReply, "answer" | "lastSegment">,
+): string => entry.answer.trim() || (entry.lastSegment ?? "").trim();
 
 /**
  * 取出并摘掉指定 token 的那条登记（无则 null）。
@@ -949,7 +1049,7 @@ export const mentionTag = (openId: string, name: string): string => {
   return `<at user_id="${id}">${display}</at>`;
 };
 
-/** 群消息正文上限——群里不适合刷屏，长回答截断并提示去 app 看全文 */
+/** 群消息正文上限——群里不适合刷屏，长回答截断（尾巴不提 Flowship：群里的外部同事没有它） */
 export const GROUP_TEXT_MAX = 1200;
 
 export const truncateForGroup = (
@@ -958,5 +1058,5 @@ export const truncateForGroup = (
 ): string => {
   const t = text.trim();
   if (t.length <= max) return t;
-  return `${t.slice(0, max)}…（内容较长、完整结果见 Flowship）`;
+  return `${t.slice(0, max)}…（内容较长，后半已省略）`;
 };

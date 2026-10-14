@@ -29,9 +29,15 @@
  * 5. prompt 由 buildRestrictedPrompt 组装（buildReadonlyUserMessage 打底用户话术 + 任务背景 +
  *    旁路公司环境脱敏声明），「# 边界」段永远排在最后。
  *    工具走两端默认全开（honor-system，内部用）；身份隔离（无 callerToken）+ 提示词 # 边界讲规矩，两边同一套话术。
+ *    有 `groupContext` 时再多拼三段上下文（群里有谁 / 任务状态快照 / 群里最近聊天）+ 回复规矩，
+ *    段落格式化见 feishu-bridge/group-answer-context.ts；拉取整体硬超时 3 秒、失败降级为空，不拖慢起 agent。
+ *    答疑 agent 每个问题都是全新的、没有记忆——这些就是它对「群里刚发生了什么」的全部认知。
  * 6. **本 run publish 的每条 envelope 都带 `origin` = 本轮 runTag**（回群登记 token）。
  *    这是与属主 run 并行时不错投的唯一依据：群出向只把 origin 对得上的 delta / done
  *    投给对应登记。别在这条链上新增「不带 origin 的 publish」。
+ *    origin 同时让 `writeOwnedEventAndPublish` 把事件落盘打上 `meta.groupRun`（UI 据此折叠整轮），
+ *    所以本 run 写的**每一类**事件（thinking / assistant_message / tool_call / tool_result / info / error）
+ *    都必须带 origin——漏一类，那类事件就会漏到属主的主事件流里。
  */
 
 import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
@@ -40,7 +46,12 @@ import type { ModelSelection } from "@cursor/sdk";
 
 import type { Task } from "@/lib/types";
 
-import { buildReadonlyUserMessage } from "./chat-pending";
+import { buildReadonlyUserMessage, getPendingAsk } from "./chat-pending";
+import {
+  buildTaskStateSnapshot,
+  formatRecentChatSection,
+  formatRosterSection,
+} from "./feishu-bridge/group-answer-context";
 import { createRunPerfTracker } from "./run-perf";
 import { summarizeRunFailure } from "./sdk-error";
 import {
@@ -89,7 +100,157 @@ export interface RestrictedQuestionInput {
    * 否则会被当成属主主链、错投进属主那条登记。
    */
   runTag?: string;
+  /**
+   * 群上下文（可选）：有它才给答疑 agent 拼「群里都有谁 / 任务状态快照 / 群里最近聊天 / 回复规矩」，
+   * 没有（老调用方 / 单测）时 prompt 与旧版完全一致。
+   * chatId 缺失的调用方就别传——没有群就无从拉 roster / 历史。
+   */
+  groupContext?: RestrictedGroupContext;
 }
+
+/** 本轮提问所在的群 + 提问人（来自群入向 meta：groupChatId / groupSender* / feishuMessageId） */
+export interface RestrictedGroupContext {
+  chatId: string;
+  requester: { openId: string; name: string; isBot: boolean };
+  /** 本轮问题自己的 message_id——最近聊天里要排除它（它已单独放在「# 对方的话」里） */
+  questionMessageId?: string;
+}
+
+/** 群上下文各段的内容（已格式化的中文行）；某段为空数组 = 该段省略 */
+interface GroupPromptSections {
+  roster: string[];
+  state: string[];
+  chat: string[];
+  /** `buildGroupReplyRules` 的输出 */
+  replyRules: string[];
+}
+
+/**
+ * 拉群上下文每一项的硬超时。整组是 Promise.all 同时起跑，所以**整体**最多也就等这么久——
+ * 上下文是锦上添花，绝不能拖慢起 agent、更不能让答疑起不来。
+ */
+export const GROUP_CONTEXT_TIMEOUT_MS = 3000;
+
+/** 跑 fn，超时 / 抛错都降级成 fallback；计时器必清（不留悬挂 timer） */
+const softTimeout = async <T>(
+  fn: () => Promise<T> | T,
+  fallback: T,
+  ms: number = GROUP_CONTEXT_TIMEOUT_MS,
+): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve()
+        .then(fn)
+        .catch(() => fallback),
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+/** 只在第一次调用时才真 import，之后复用同一个 promise */
+const lazyImport = <T>(load: () => Promise<T>): (() => Promise<T>) => {
+  let p: Promise<T> | undefined;
+  return () => (p ??= load());
+};
+
+/**
+ * 并行拉 roster / 最近聊天 / 属主身份 / 自己的身份 / 出问登记 / 排队数，格式化成 prompt 各段。
+ *
+ * 契约：**永不抛错、整体最多等 {@link GROUP_CONTEXT_TIMEOUT_MS}**；任何一项拿不到只是那一段变少。
+ * feishu-bridge 的模块一律动态 import——restricted-question 是 task 链的基础模块，
+ * 不让它在加载期静态连上飞书桥（避免成环，也不拖累与群无关的调用方 / 单测）。
+ */
+const loadGroupPromptSections = async (
+  task: Task,
+  gc: RestrictedGroupContext,
+): Promise<GroupPromptSections> => {
+  // 每个模块只 import 一次、各项共用同一个 promise（别让并行的 8 项各自重复动态 import 同一模块）
+  const rosterMod = lazyImport(() => import("./feishu-bridge/group-roster"));
+  const larkMod = lazyImport(() => import("./feishu-bridge/lark-api"));
+  const [roster, history, identity, selfOpenId, selfName, waiting, queued, rules] =
+    await Promise.all([
+      softTimeout(async () => (await rosterMod()).fetchGroupRoster(gc.chatId), null),
+      softTimeout(
+        async () => (await rosterMod()).fetchRecentGroupMessages(gc.chatId, 15),
+        [],
+      ),
+      softTimeout(async () => (await larkMod()).getLarkLocalIdentity(), null),
+      softTimeout(async () => (await larkMod()).getBotOpenId(), null),
+      softTimeout(async () => (await larkMod()).getBotDisplayName(), null),
+      // 任务此刻在等群里谁回话（出问登记）；名字先用 roster / learned 查，查不到下面再兜底
+      softTimeout(async () => {
+        const reg = await import("./feishu-bridge/group-outbound-registry");
+        const lookup = (await rosterMod()).lookupGroupMemberName;
+        return reg
+          .listLiveOutboundQuestions(task.id)
+          .filter((e) => !e.chatId || e.chatId === gc.chatId)
+          .map((e) => ({
+            target: e.target,
+            name: lookup(gc.chatId, e.target) ?? "",
+            about: e.about,
+            expiresAt: e.createdAt + e.ttlMs,
+          }));
+      }, []),
+      softTimeout(async () => {
+        const m = await import("./feishu-bridge/group-shared");
+        return m.groupQuestionQueueLength(task.id);
+      }, 0),
+      softTimeout(async () => {
+        const m = await import("./feishu-bridge/group-reply-protocol");
+        return m.buildGroupReplyRules({ requesterIsBot: gc.requester.isBot });
+      }, [] as string[]),
+    ]);
+
+  const members = roster?.members ?? [];
+  const nameOf = (openId: string): string | undefined =>
+    members.find((m) => m.openId === openId)?.name || undefined;
+
+  // 属主 = 本机登录的飞书用户；名字 CLI 没给就用 roster 里的
+  const ownerName = identity?.userName || (identity ? nameOf(identity.openId) : "");
+  const owner =
+    identity && ownerName
+      ? { openId: identity.openId, name: ownerName }
+      : undefined;
+
+  // 当前正在等的那条提问：内存里的 pendingAsk，不读盘（events.jsonl 动辄上万行）
+  const pendingAsk = getPendingAsk(task.id);
+  const pendingAskText = pendingAsk
+    ? pendingAsk.questions.map((q) => q.question).join("；")
+    : undefined;
+
+  return {
+    roster: formatRosterSection({
+      members,
+      selfOpenId: selfOpenId ?? undefined,
+      selfName: selfName ?? undefined,
+      owner,
+      requester: gc.requester,
+    }),
+    state: buildTaskStateSnapshot(task, {
+      pendingAskText,
+      waitingFor: waiting.map((w) => ({
+        // 名字 roster 里也查不到就退回 id，至少让 agent 知道「在等某个具体对象」
+        name: w.name || nameOf(w.target) || w.target,
+        about: w.about,
+        expiresAt: w.expiresAt,
+      })),
+      queuedGroupQuestions: queued,
+      ownerName: owner?.name,
+    }),
+    chat: formatRecentChatSection(history, {
+      excludeMessageId: gc.questionMessageId,
+      resolveName: nameOf,
+      selfOpenId: selfOpenId ?? undefined,
+      selfName: selfName ?? undefined,
+    }),
+    replyRules: rules,
+  };
+};
 
 /**
  * 受限 prompt（纯函数、好读好审）。
@@ -105,10 +266,28 @@ const buildRestrictedPrompt = (args: {
   askedText: string;
   /** 公司环境声明（无配置时为空串）；查数据用，不含任何密码 */
   companyEnvSection?: string;
-}): string =>
-  [
-    `你是任务「${args.title}」的答疑助手。需求群里一位非任务所有者说了句话、你只负责回答。`,
+  /** 群上下文各段；缺省 = 旧版 prompt（老调用方 / 单测） */
+  groupSections?: GroupPromptSections;
+}): string => {
+  const g = args.groupSections;
+  const section = (heading: string, body: string[]): string[] =>
+    body.length > 0 ? [heading, ...body, ""] : [];
+  return [
+    g
+      ? `你是任务「${args.title}」的宿主（任务属主）在需求群里的分身，群里一位非任务所有者说了句话，你只负责回答。`
+      : `你是任务「${args.title}」的答疑助手。需求群里一位非任务所有者说了句话、你只负责回答。`,
     "",
+    // 群上下文三段（顺序：谁在群里 → 任务现状 → 刚聊了什么）；缺的段整段省略
+    ...(g
+      ? [
+          ...section("# 你是谁、群里有谁", g.roster),
+          ...section(
+            "# 任务当前状态（快照；要细节再去读下面的文件）",
+            g.state,
+          ),
+          ...section("# 群里最近的聊天（旧→新）", g.chat),
+        ]
+      : []),
     "# 任务背景（按需查、先查再答）",
     `- 任务事件日志（完整历史）：${getEventsLogPath(args.taskId)}`,
     `- 产出文档目录（方案 / 实现 / 复核等 artifact）：${getActionsDir(args.taskId)}`,
@@ -120,10 +299,18 @@ const buildRestrictedPrompt = (args: {
     "# 对方的话",
     args.askedText,
     "",
+    // 回复协议（NO_REPLY / @ 规则 / 需属主确认标记）；排在「边界」之前——边界必须是最后一段
+    ...(g ? section("# 回复规矩", g.replyRules) : []),
     "# 边界",
     "- 非属主答疑，三条红线：不改任何文件；部署、发布、上线与线上分支先找属主确认；其余都可以干",
     "- 答完自然结束回复",
+    ...(g
+      ? [
+          "- 需要属主拍板的事不要替他答应，用「回复规矩」里的「需属主确认」标记转给他",
+        ]
+      : []),
   ].join("\n");
+};
 
 /**
  * 起一个旁路答疑 agent 回答群里非属主的一句话（提示词讲规矩 + 身份隔离 + 事件流审计）。
@@ -200,6 +387,14 @@ export const startRestrictedGroupQuestion = (
         return;
       }
 
+      // 群上下文（roster / 最近聊天 / 身份）与准备工作区 / 建会话**并行**拉：整体硬超时 3 秒、
+      // 失败降级为空、永不抛错——不拖慢起 agent。没有 groupContext 的老调用方不拉
+      const groupSectionsPromise: Promise<GroupPromptSections | undefined> =
+        input.groupContext
+          ? loadGroupPromptSections(task, input.groupContext).catch(
+              () => undefined,
+            )
+          : Promise.resolve(undefined);
       await writeOwnedEventAndPublish(
         task.id,
         alive,
@@ -260,6 +455,13 @@ export const startRestrictedGroupQuestion = (
         return;
       }
 
+      // 群上下文早在 Agent.create 之前就已并行起跑——这里只是收结果（最多再等到 3 秒硬超时那一刻）
+      const groupSections = await groupSectionsPromise;
+      if (!alive()) {
+        await settle(false, "群答疑已取消");
+        return;
+      }
+
       const prompt = buildRestrictedPrompt({
         taskId: task.id,
         title: task.title,
@@ -270,6 +472,7 @@ export const startRestrictedGroupQuestion = (
           attachmentPaths: input.attachmentPaths,
         }),
         companyEnvSection,
+        groupSections,
       });
       const perf = createRunPerfTracker({
         taskId: task.id,
@@ -282,7 +485,7 @@ export const startRestrictedGroupQuestion = (
           onDelta: composeOnDelta(
             perf.onDelta,
             createShellOutputDeltaPublisher(task.id, alive),
-            createSdkSummaryDeltaPublisher(task.id, alive),
+            createSdkSummaryDeltaPublisher(task.id, alive, origin),
           ),
           onStep: perf.onStep,
         }),

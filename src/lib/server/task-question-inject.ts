@@ -38,7 +38,10 @@ import {
   fulfillAskSkipViaWait,
   type AskSkipHandle,
 } from "@/lib/server/ask-skip";
-import { startRestrictedGroupQuestion } from "@/lib/server/restricted-question";
+import {
+  startRestrictedGroupQuestion,
+  type RestrictedGroupContext,
+} from "@/lib/server/restricted-question";
 import { HeapPressureError } from "@/lib/server/sdk-store-gc";
 import {
   abortStuckRunForSend,
@@ -138,6 +141,29 @@ export interface TaskQuestionInjectOptions {
     clientItemId?: string;
   };
 }
+
+/**
+ * 把群入向写进 `userReplyMetaExtra` 的来源标记还原成答疑旁路要的 groupContext。
+ * 缺 `groupChatId` 返回 undefined（没有群就拉不了 roster / 历史，旁路按旧 prompt 走）。
+ * 值一律按 unknown 防御式取——meta 是自由 Record，别信类型。
+ */
+export const buildRestrictedGroupContext = (
+  meta: Record<string, unknown> | undefined,
+): RestrictedGroupContext | undefined => {
+  const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+  const chatId = str(meta?.groupChatId);
+  if (!chatId) return undefined;
+  const questionMessageId = str(meta?.feishuMessageId);
+  return {
+    chatId,
+    requester: {
+      openId: str(meta?.groupSenderOpenId),
+      name: str(meta?.groupSender),
+      isBot: meta?.groupSenderIsBot === true,
+    },
+    ...(questionMessageId ? { questionMessageId } : {}),
+  };
+};
 
 const MAX_IMAGES = 6;
 const MAX_ATTACHMENTS = 10;
@@ -823,6 +849,8 @@ const runTaskQuestionInject = async (
       creds: { apiKey: apiKey!, model: fallbackModel! },
       // 事件身份：这轮回答只投给群侧这条登记（属主 run 的事件进不来、反之亦然）
       runTag: options.restrictedRunTag,
+      // 群上下文（roster / 最近聊天 / 回复规矩）的入参来自群入向写的 meta；缺 chatId 就不传
+      groupContext: buildRestrictedGroupContext(options.userReplyMetaExtra),
     });
     return new Response(JSON.stringify({ ok: true, task }), {
       status: 200,

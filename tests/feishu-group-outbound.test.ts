@@ -102,6 +102,10 @@ const baseDeps = (over: Record<string, unknown> = {}) => ({
   isAskToGroupEnabled: async () => true,
   isAdvanceResultToGroupEnabled: async () => true,
   readArtifact: async () => "# 复核报告\n\n没发现问题",
+  // 答疑回复收口要查群成员 / 属主 / 机器人 open_id——默认依赖会真起 lark-cli，这里一律桩掉
+  fetchRoster: async () => ({ members: [] }),
+  resolveOwner: async () => undefined,
+  getSelfOpenId: async () => null,
   ...over,
 });
 
@@ -327,7 +331,9 @@ describe("回答回群", () => {
     expect(sendMarkdown).not.toHaveBeenCalled();
   });
 
-  it("跑失败 → 回群说明去 app 看，不发空答案", async () => {
+  // 新语义（2026-10-14）：外部同事没有 Flowship，「去 Flowship 看事件流」对他毫无意义，
+  // 还会把对端机器人的上下文带偏；真人只收一句中性提示，机器人提问人什么都不发。
+  it("跑失败（真人提问）→ 回一句中性提示、真 @ 提问人，不提 Flowship / 事件流", async () => {
     const sendMarkdown = vi.fn(async () => ({
       chat_id: CHAT,
       message_id: "om_md",
@@ -345,7 +351,10 @@ describe("回答回群", () => {
       task: fullTask(),
       ok: false,
     });
-    expect(callArgs(sendMarkdown)[1]).toContain("没跑成功");
+    const body = callArgs(sendMarkdown)[1] as string;
+    expect(body).toContain('<at user_id="ou_zhang">张三</at>');
+    expect(body).toContain("这轮我没答上来，麻烦再 @ 我一次");
+    expect(body).not.toMatch(/Flowship|事件流/);
   });
 
   it("失败轮 tab 存群里看到的正文（不存半截输出）", async () => {
@@ -379,11 +388,12 @@ describe("回答回群", () => {
       }
     ).meta.groupQaSummary;
     expect(summary.ok).toBe(false);
-    expect(summary.answer).toContain("没跑成功");
+    // 真人提问人：tab 存群里实际发出去的那句提示（@ 标签还原成 @名字）
+    expect(summary.answer).toContain("这轮我没答上来");
     expect(summary.answer).not.toContain("半截输出");
   });
 
-  it("空回答轮 tab 存 fallback（不留空白轮）", async () => {
+  it("空回答轮 tab 存实际发出的提示（不留空白轮）", async () => {
     const sendMarkdown = vi.fn(async () => ({
       chat_id: CHAT,
       message_id: "om_md",
@@ -409,7 +419,9 @@ describe("回答回群", () => {
       }
     ).meta.groupQaSummary;
     expect(summary.ok).toBe(true);
-    expect(summary.answer).toContain("已处理完成");
+    // 旧文案「已处理完成（这轮没有文字回复）」对外部同事像在糊弄；改成让对方再问一次
+    expect(summary.answer).toContain("这轮我没整理出回复");
+    expect(callArgs(sendMarkdown)[1]).toContain("这轮我没整理出回复，麻烦再 @ 我一次");
   });
 
   it("done 后登记摘掉——同一任务下一轮不再误回群", async () => {
@@ -1644,27 +1656,41 @@ describe("掉落问题汇总（十六轮 P3）", () => {
 });
 
 describe("truncateForGroup", () => {
-  it("超长截断并提示去 app 看全文", () => {
+  it("超长截断，尾巴不提 Flowship（群里的外部同事没有它）", () => {
     expect(truncateForGroup("短回答")).toBe("短回答");
     const long = "a".repeat(1500);
     const t = truncateForGroup(long);
     expect(t.length).toBeLessThan(long.length);
-    expect(t).toContain("Flowship");
+    expect(t).toContain("后半已省略");
+    expect(t).not.toContain("Flowship");
   });
 });
 
-describe("回群 @（机器人问机器人真 @ 回去，吃掉后静默防环）", () => {
-  it("机器人提问 → 回答真 @ 它（一轮结束靠发起方吃掉静默，兜底靠熔断）", async () => {
+// 旧语义「机器人提问也无条件真 @ 回去」已废：两个机器人互 @ 成环跑了 9 轮。
+// 现在机器人提问人没被 agent 写 @ 就不补，想让它看见得 agent 自己写 `@名字`（协议第 4 条）。
+describe("回群 @（机器人提问人：不自动补 @，agent 自己写才真 @）", () => {
+  const botRoster = {
+    fetchRoster: async () => ({
+      members: [
+        { openId: "ou_otherbot", name: "江涛CLI", kind: "bot" as const },
+      ],
+    }),
+  };
+
+  it("机器人提问 + agent 没写 @ → 原文照发、不补真 @（有意防环）", async () => {
     const sendMarkdown = vi.fn(async () => ({
       chat_id: CHAT,
       message_id: "om_md",
     }));
     const sendText = vi.fn();
-    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown, sendText }) as never);
+    __setGroupOutboundDepsForTest(
+      baseDeps({ sendMarkdown, sendText, ...botRoster }) as never,
+    );
     const h = rememberGroupReply("task-1", {
       chatId: CHAT,
       requesterOpenId: "ou_otherbot",
       requesterName: "江涛CLI",
+      requesterIsBot: true,
       kind: "question",
       channel: "restricted",
     })!;
@@ -1682,9 +1708,40 @@ describe("回群 @（机器人问机器人真 @ 回去，吃掉后静默防环�
     expect(sendMarkdown).toHaveBeenCalledTimes(1);
     expect(sendText).not.toHaveBeenCalled();
     const body = callArgs(sendMarkdown)[1] as string;
-    expect(body).toContain("埋点已确认上报");
-    // 真 @：发起方登记等答案、吃掉后静默，正常一轮结束
-    expect(body).toContain("<at");
+    expect(body).toBe("埋点已确认上报");
+    expect(body).not.toContain("<at");
+  });
+
+  it("机器人提问 + agent 自己写了 @名字 → 真 @", async () => {
+    const sendMarkdown = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_md",
+    }));
+    __setGroupOutboundDepsForTest(
+      baseDeps({ sendMarkdown, ...botRoster }) as never,
+    );
+    const h = rememberGroupReply("task-1", {
+      chatId: CHAT,
+      requesterOpenId: "ou_otherbot",
+      requesterName: "江涛CLI",
+      requesterIsBot: true,
+      kind: "question",
+      channel: "restricted",
+    })!;
+    await handleGroupOutboundEvent("task-1", {
+      kind: "assistant_delta",
+      text: "@江涛CLI 埋点已确认上报",
+      origin: h.runTag!,
+    });
+    await handleGroupOutboundEvent("task-1", {
+      kind: "done",
+      task: fullTask(),
+      ok: true,
+      origin: h.runTag!,
+    });
+    expect(callArgs(sendMarkdown)[1]).toContain(
+      '<at user_id="ou_otherbot">江涛CLI</at>',
+    );
   });
 
   it("缺省（人类提问）→ 照常 @ 提醒", async () => {

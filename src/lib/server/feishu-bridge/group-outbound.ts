@@ -5,7 +5,9 @@
  *
  * 1. **ask 卡发群**：agent 调 ask_user → 若开了「问题同步到需求群」且该任务绑了群，
  *    把答题卡也发一份到群（跨角色答题；按钮回调是 card.action.trigger、天然只到属主本机）
- * 2. **回答回群**：群里 @bot 提的问题，agent 这轮的答复攒起来、done 时 @ 提问人发回群。
+ * 2. **回答回群**：群里 @bot 提的问题，只攒「最后一次工具调用之后」那段文字，done 时按
+ *    回复协议（group-reply-protocol）落地：agent 可选择 NO_REPLY 不发、`@名字` 换成真 @。
+ *    机器人提问人失败 / 空回答一律静默（防两个机器人互 @ 成环）。
  *    走 `post` + `md`（飞书 `text` 不渲染 markdown）；短状态回执仍用纯文本。
  *    攒 / flush **只认事件 origin 与登记 runTag 相等的那一路 run**（token 化投递协议、
  *    见 group-shared）——属主 run 和多位同事的旁路答疑 run 同时在飞也各回各的
@@ -40,9 +42,14 @@ import {
 } from "./bridge-config";
 import { rememberAskCard } from "./card-map";
 import { buildGroupAskCardJson } from "./group-ask-card";
+import type { GroupMember } from "./group-contract";
+import { parseGroupReply } from "./group-reply-protocol";
 import {
+  acceptGroupReplyMessage,
   appendGroupReplyAnswer,
   claimGroupArtifactCard,
+  closeGroupReplySegment,
+  finalGroupReplyText,
   hasGroupReplies,
   mentionTag,
   peekGroupReply,
@@ -94,6 +101,15 @@ export interface GroupOutboundDeps {
    * 这里动态 import（出向挂在 bootstrap 启动链上，静态连边会成环，见下注释）。
    */
   pumpGroupQuestionQueue: (taskId: string) => Promise<void>;
+  /**
+   * 群成员名单（回复协议把 `@名字` 换成真 @ 的唯一来源）。只用 `.members`；
+   * 拿不到 / 超时按空处理（照常发、只是不带真 @）。
+   */
+  fetchRoster: (chatId: string) => Promise<{ members: GroupMember[] }>;
+  /** 任务属主 = 本机登录用户；拿不到返 undefined（`@宿主` 不解析、「需属主确认」降级成纯文本） */
+  resolveOwner: () => Promise<{ openId: string; name: string } | undefined>;
+  /** 本机机器人自己的 open_id（协议保证绝不 @ 自己）；拿不到返 null / undefined */
+  getSelfOpenId: () => Promise<string | null | undefined>;
 }
 
 /**
@@ -122,6 +138,16 @@ const defaultDeps = (): GroupOutboundDeps => ({
   readArtifact: (absPath) => fs.readFile(absPath, "utf-8"),
   pumpGroupQuestionQueue: (taskId) =>
     import("./group-route").then((m) => m.pumpGroupQuestionQueue(taskId)),
+  // roster / lark-api 的身份接口同样走动态 import：它们的依赖链比出向厚，
+  // 静态连边会让只 mock 出向依赖的单测在 import 阶段就拉起整串（同上注释）
+  fetchRoster: async (chatId) =>
+    (await import("./group-roster")).fetchGroupRoster(chatId),
+  resolveOwner: async () => {
+    const id = await (await import("./lark-api")).getLarkLocalIdentity();
+    if (!id?.openId) return undefined;
+    return { openId: id.openId, name: id.userName ?? "" };
+  },
+  getSelfOpenId: async () => (await import("./lark-api")).getBotOpenId(),
 });
 
 let deps: GroupOutboundDeps = defaultDeps();
@@ -388,6 +414,271 @@ const flushGroupAdvanceReply = async (
   }
 };
 
+// ----------------- 答疑回复（question 登记）的出向落地 -----------------
+//
+// 旧设计的坑（2026-10-14 对接后端机器人「安若流年」）：整轮文字全发 + 无条件真 @ 回提问人 +
+// 失败时 @ 一句「去 Flowship 看事件流」→ 两个机器人互 @ 成环、对端上下文被带偏。
+// 现在系统只忠实落地答疑 agent 的决定（回不回 / @ 谁，协议见 group-contract），
+// 自己不再替它加戏：机器人提问人失败 / 空回答一律静默，群里绝不出现「Flowship / 事件流」。
+
+/** 真人提问人：这轮跑失败时发给群的中性提示（外部同事没有 Flowship，别让他去看事件流） */
+const GROUP_FAIL_HINT = "这轮我没答上来，麻烦再 @ 我一次";
+/** 真人提问人：这轮跑成功但没有任何文字时的提示 */
+const GROUP_EMPTY_HINT = "这轮我没整理出回复，麻烦再 @ 我一次";
+/** 机器人提问人时群里不发、只进「群问答」tab 的审计文案（tab 在属主的 Flowship 里，可以提 ta） */
+const BOT_FAIL_NOTE = "这轮没跑成功（提问方是机器人，群里未回复）";
+const BOT_EMPTY_NOTE = "这轮没有文字回复（提问方是机器人，群里未回复）";
+
+/** 单条群消息字数上限 / 最多发几条 */
+export const GROUP_REPLY_CHUNK_MAX = 1800;
+export const GROUP_REPLY_MAX_CHUNKS = 3;
+const GROUP_REPLY_OMITTED_TAIL = "（内容较长，后半已省略）";
+
+/** roster / 属主 / 机器人 open_id 每个外部调用的硬超时：慢一点就当没有，绝不拖住回群 */
+const EXTERNAL_LOOKUP_TIMEOUT_MS = 3_000;
+
+const withTimeout = async <T>(
+  label: string,
+  op: () => Promise<T>,
+  fallback: T,
+): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(op),
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => {
+          warn(`${label} 超时`, `${EXTERNAL_LOOKUP_TIMEOUT_MS}ms`);
+          resolve(fallback);
+        }, EXTERNAL_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (err) {
+    warn(label, err);
+    return fallback;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+/**
+ * 一段文本里的 `max` 位置不能落在 `<at ...>名字</at>` 中间：切断标签群里就是一堆乱码。
+ * 落在标签里就把切点挪到标签起点（标签在开头无处可挪就放弃、照原位切）。
+ */
+const avoidSplittingAtTag = (text: string, cut: number): number => {
+  const open = text.lastIndexOf("<at", cut - 1);
+  if (open <= 0) return cut;
+  const close = text.indexOf("</at>", open);
+  return close >= 0 && close + "</at>".length > cut ? open : cut;
+};
+
+/** 单段超长：优先在句号 / 换行处切，找不到再硬切（不切断 at 标签） */
+const hardSplit = (text: string, max: number): string[] => {
+  const out: string[] = [];
+  let rest = text.trim();
+  while (rest.length > max) {
+    const window = rest.slice(0, max);
+    let cut = -1;
+    for (let i = window.length - 1; i >= Math.floor(max / 2); i--) {
+      if ("\n。！？!?；;".includes(window[i]!)) {
+        cut = i + 1;
+        break;
+      }
+    }
+    if (cut < 0) {
+      // 英文句点要求后面跟空白，免得切在小数点 / 域名里
+      for (let i = window.length - 2; i >= Math.floor(max / 2); i--) {
+        if (window[i] === "." && /\s/.test(window[i + 1]!)) {
+          cut = i + 1;
+          break;
+        }
+      }
+    }
+    if (cut < 0) cut = max;
+    cut = avoidSplittingAtTag(rest, cut);
+    out.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) out.push(rest);
+  return out.filter(Boolean);
+};
+
+/**
+ * 答疑回复切块：按段落（空行）贪心装进每条 ≤ `GROUP_REPLY_CHUNK_MAX` 的消息，
+ * 单段超长按句号 / 换行硬切；最多 `GROUP_REPLY_MAX_CHUNKS` 条，还装不下的在最后一条末尾
+ * 注明「后半已省略」。**不提 Flowship**——收到的是外部同事 / 机器人，他们没有它。
+ * 真 @ 只在 text 里原有的位置（协议已把 @ 放在开头 / 正文里），后续块不再补 @。
+ */
+export const splitGroupReplyChunks = (
+  text: string,
+  maxLen = GROUP_REPLY_CHUNK_MAX,
+  maxChunks = GROUP_REPLY_MAX_CHUNKS,
+): string[] => {
+  const t = text.trim();
+  if (!t) return [];
+  if (t.length <= maxLen) return [t];
+  const pieces = t
+    .split(/\n[ \t]*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .flatMap((p) => (p.length > maxLen ? hardSplit(p, maxLen) : [p]));
+  const chunks: string[] = [];
+  let cur = "";
+  for (const p of pieces) {
+    if (!cur) {
+      cur = p;
+    } else if (cur.length + 2 + p.length <= maxLen) {
+      cur = `${cur}\n\n${p}`;
+    } else {
+      chunks.push(cur);
+      cur = p;
+    }
+  }
+  if (cur) chunks.push(cur);
+  if (chunks.length <= maxChunks) return chunks;
+  const kept = chunks.slice(0, maxChunks);
+  kept[maxChunks - 1] = `${kept[maxChunks - 1]}\n${GROUP_REPLY_OMITTED_TAIL}`;
+  return kept;
+};
+
+/** tab 里存的答案：把 `<at user_id="ou_x">名字</at>` 还原成 `@名字`（tab 不渲染飞书标签） */
+const atTagsToPlain = (text: string): string =>
+  text.replace(/<at\b[^>]*>([\s\S]*?)<\/at>/gi, (_m, name: string) =>
+    name.trim() ? `@${name.trim()}` : "",
+  );
+
+/**
+ * question 登记收口（已 take）：按「最终段 + 回复协议」决定群里发什么、tab 记什么。
+ * 整条链外部 IO（roster / 属主 / 机器人 open_id）各自 3s 硬超时 + 退化成空，
+ * 绝不让它们阻塞或拖垮回群；整段仍在 handleGroupOutboundEvent 的 try/catch 里。
+ */
+const flushQuestionReply = async (
+  taskId: string,
+  entry: PendingGroupReply,
+  ok: boolean,
+): Promise<void> => {
+  const askerIsBot = entry.requesterIsBot === true;
+  const askerName = entry.requesterName.trim();
+  const at = mentionTag(entry.requesterOpenId, entry.requesterName);
+  const finalText = finalGroupReplyText(entry);
+
+  let toSend: string[] = [];
+  let recorded = "";
+  let noReply = false;
+  let needsOwner: string | undefined;
+  let mentioned: string[] = [];
+
+  if (!ok) {
+    // 失败：机器人提问人一个字都不发（对端把群消息当上下文，发了就是污染 + 可能再触发它回话）
+    if (askerIsBot) {
+      recorded = BOT_FAIL_NOTE;
+    } else {
+      toSend = [`${at} ${GROUP_FAIL_HINT}`];
+      recorded = `${askerName ? `@${askerName} ` : ""}${GROUP_FAIL_HINT}`;
+      mentioned = [askerName || "你"];
+    }
+  } else if (!finalText) {
+    if (askerIsBot) {
+      recorded = BOT_EMPTY_NOTE;
+    } else {
+      toSend = [`${at} ${GROUP_EMPTY_HINT}`];
+      recorded = `${askerName ? `@${askerName} ` : ""}${GROUP_EMPTY_HINT}`;
+      mentioned = [askerName || "你"];
+    }
+  } else {
+    const [members, owner, selfOpenId] = await Promise.all([
+      withTimeout(
+        "roster",
+        async () => (await deps.fetchRoster(entry.chatId)).members ?? [],
+        [] as GroupMember[],
+      ),
+      withTimeout("属主身份", () => deps.resolveOwner(), undefined),
+      withTimeout("机器人 open_id", () => deps.getSelfOpenId(), null),
+    ]);
+    const parsed = parseGroupReply(finalText, {
+      members,
+      ...(owner?.openId ? { owner } : {}),
+      requester: {
+        openId: entry.requesterOpenId,
+        name: entry.requesterName,
+        isBot: askerIsBot,
+      },
+      ...(selfOpenId ? { selfOpenId } : {}),
+    });
+    if (parsed.kind === "silent") {
+      // agent 自己选择不回：群里零消息；原话存 tab 供审计
+      noReply = true;
+      recorded = finalText;
+    } else {
+      toSend = splitGroupReplyChunks(parsed.text);
+      recorded = atTagsToPlain(toSend.join("\n\n"));
+      mentioned = parsed.mentions.map((m) => m.name);
+      needsOwner = parsed.needsOwner;
+    }
+  }
+
+  // 发送炸了也写汇总（review C 二轮）：外层整段吞异常，不写 tab 与群就两边全静默、没处查。
+  // take 先摘，写两次不可能 duplicate。多块发送遇到第一个失败就停（后面的没有意义）。
+  let sendOk = true;
+  for (const chunk of toSend) {
+    try {
+      // 不再拼 head：该有的 @ 已经在 text 里（协议自动补 / agent 自己写的）
+      await deps.sendMarkdown(entry.chatId, chunk);
+    } catch (err) {
+      sendOk = false;
+      warn(`回答回群发送失败 task=${taskId}`, err);
+      break;
+    }
+  }
+
+  // 需属主确认：写主事件流 info（不带 origin、不带 groupRun / groupQaSummary，
+  // 不被 event-stream-hidden 的现有规则藏掉），属主在 app 里能一眼看到待办。
+  // 发群失败也要写——属主需要知道有人在等他。
+  if (needsOwner) {
+    try {
+      await writeEventAndPublish(taskId, {
+        kind: "info",
+        text: `群里有事等你拍板（来自 ${askerName || "群成员"}）：${needsOwner}`,
+        meta: {
+          groupNeedsOwner: {
+            runTag: entry.runTag ?? "",
+            askerName: askerName || "群成员",
+            askerOpenId: entry.requesterOpenId,
+            note: needsOwner,
+          },
+        },
+      });
+    } catch (err) {
+      warn(`写需属主确认事件 task=${taskId}`, err);
+    }
+  }
+
+  // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
+  // 发送炸了也记（ok:false）：答案躺 tab 里至少能复制，不至于两边全静默。
+  // publish 不带 origin：投不进任何登记、不触发回群。
+  if (entry.runTag) {
+    await writeEventAndPublish(
+      taskId,
+      buildGroupQaSummaryEvent({
+        runTag: entry.runTag,
+        askerOpenId: entry.requesterOpenId,
+        askerName: entry.requesterName,
+        ...(entry.sourceMessageId
+          ? { questionMessageId: entry.sourceMessageId }
+          : {}),
+        answer: recorded,
+        ok: sendOk && ok,
+        askerIsBot,
+        ...(noReply ? { noReply: true } : {}),
+        ...(needsOwner ? { needsOwner } : {}),
+        ...(mentioned.length > 0 ? { mentioned } : {}),
+        startedAt: entry.startedAt,
+        durationMs: Math.max(0, Date.now() - entry.startedAt),
+      }),
+    );
+  }
+};
+
 /**
  * done 时把这一轮的结果发回群（question 走文本、advance 走 share 卡）。
  *
@@ -411,42 +702,7 @@ const flushGroupReply = async (
 
   const entry = takeGroupReplyByToken(taskId, pending.token);
   if (!entry) return;
-  const answer = entry.answer.trim();
-  const body = !ok
-    ? "这轮没跑成功、去 Flowship 看看事件流"
-    : answer || "已处理完成（这轮没有文字回复）";
-  // 回答真 @ 提问人（含机器人）：发起方登记等答案、吃掉后静默，正常一轮结束；
-  // 即时系统回执仍不 @ 机器人（group-route 的 groupReplyMention），兜底靠互 @ 熔断。
-  const head = `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
-  // 发送炸了也写汇总（review C 二轮）：外层整段吞异常，不写 tab 与群就两边全静默、没处查。
-  // ok:false + 失败正文进 tab，原因仍查主流程 error 事件。take 先摘，写两次不可能 duplicate。
-  let sendOk = true;
-  try {
-    await deps.sendMarkdown(entry.chatId, `${head}${truncateForGroup(body)}`);
-  } catch (err) {
-    sendOk = false;
-    warn(`回答回群发送失败 task=${taskId}`, err);
-  }
-  // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
-  // 发送炸了也记（ok:false）：答案躺 tab 里至少能复制，不至于两边全静默。
-  // 存群里看到的那一行：成功且有正文才存原样，失败/空回答/发送炸全存 body——
-  // tab 才是“群里没拿到也能复制”，和 ok 对齐。
-  // publish 不带 origin：投不进任何登记、不触发回群。
-  if (entry.runTag) {
-    await writeEventAndPublish(
-      taskId,
-      buildGroupQaSummaryEvent({
-        runTag: entry.runTag,
-        askerOpenId: entry.requesterOpenId,
-        askerName: entry.requesterName,
-        ...(entry.sourceMessageId
-          ? { questionMessageId: entry.sourceMessageId }
-          : {}),
-        answer: sendOk && ok && answer ? answer : body,
-        ok: sendOk && ok,
-      }),
-    );
-  }
+  await flushQuestionReply(taskId, entry, ok);
 };
 
 /**
@@ -609,12 +865,16 @@ export const handleGroupOutboundEvent = async (
       await handleAskUserRequest(taskId, ev.event.meta);
       return;
     }
+    // 本 run 又调了工具 → 当前段收成「上一段」，答案只认最后一次工具调用之后的文字。
+    // pi 与 Cursor SDK 两条后端的工具调用经 sdk-message-handler 统一落成 kind=tool_call
+    if (ev.event.kind === "tool_call") {
+      closeGroupReplySegment(taskId, runTag);
+      return;
+    }
     if (ev.event.kind === "assistant_message") {
-      // delta 已攒过就别重复追加（完整消息是同一段文字的落盘版）
-      const entry = peekGroupReply(taskId, runTag);
-      if (entry && !entry.answer.trim() && ev.event.text) {
-        appendGroupReplyAnswer(taskId, runTag, ev.event.text);
-      }
+      // delta 已攒过就别重复追加（完整消息是同一段文字的落盘版）；
+      // 晚于 tool_call 到达的落盘版由登记里的「待认领段落」去重，见 acceptGroupReplyMessage
+      acceptGroupReplyMessage(taskId, runTag, ev.event.text);
     }
   } catch (err) {
     warn(`处理事件 task=${taskId}`, err);

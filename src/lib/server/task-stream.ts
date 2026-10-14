@@ -648,17 +648,36 @@ export const PERSIST_FAIL_RETRY_MESSAGE = "消息保存失败、请重试" as co
  * publish 同样进 append 链（与 writeEventAndPublish 同序协议）。
  *
  * @param origin 旁路 run 的身份 token（属主主链不传）——见 TaskStreamEvent.origin。
- *   只挂在 publish 出去的 envelope 上、不落盘（events.jsonl 里没有这个字段）。
+ *   挂在 publish 出去的 envelope 上；同时（默认）把它写进事件 `meta.groupRun` 落盘，
+ *   UI 据此把答疑旁路 run 的整轮事件从主流折叠掉（见 group-contract.ts 的 GROUP_RUN_META_KEY）。
+ * @param opts.tagGroupRun 传 false = 只用 origin 防「误投进回群登记」、**不**打 groupRun 标。
+ *   审计结论（2026-10-14）：传 origin 的调用方共三类——
+ *   ① restricted-question 本体（info / error）② sdk-message-handler（thinking / assistant_message /
+ *   tool_call / tool_result / info，origin 由 restricted-question 透传，属主主链不传）：这两类就是答疑 run
+ *   的事件，该打标；③ group-route 排队回放失败写的 ok:false 汇总（origin 是随机串、只为防投递）：
+ *   它是要在群问答 tab / 主流里看见的汇总，不能被折叠，必须传 `{ tagGroupRun: false }`。
  */
 export const writeOwnedEventAndPublish = async (
   taskId: string,
   lease: () => boolean,
-  // id 可选：预先指定（thinking 事件复用实时帧里的 eventId）；缺省现生成，见 appendEvent
+  // id 可选：预先指定（thinking 事件复用实时帧里的 eventId），缺省现生成，见 appendEvent
   ev: Omit<TaskEvent, "id" | "ts" | "seq"> & { id?: string },
   origin?: string,
+  opts?: { tagGroupRun?: boolean },
 ): Promise<TaskEvent | null> => {
+  // 与 feishu-bridge/group-contract.ts 的 GROUP_RUN_META_KEY 保持一致：
+  // task-stream 是服务端基础模块，不反向依赖 feishu-bridge，所以这里写字面量
+  const GROUP_RUN_KEY = "groupRun";
+  const toWrite =
+    origin && opts?.tagGroupRun !== false
+      ? {
+          ...ev,
+          // 事件自带的 meta 字段一个都不覆盖（含调用方自己已写了 groupRun 的情况）
+          meta: { [GROUP_RUN_KEY]: origin, ...(ev.meta ?? {}) },
+        }
+      : ev;
   try {
-    return await appendEvent(taskId, ev, lease, (event) => {
+    return await appendEvent(taskId, toWrite, lease, (event) => {
       publish(taskId, { kind: "event", event, ...(origin ? { origin } : {}) });
     });
   } catch (err) {

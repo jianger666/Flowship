@@ -7,6 +7,14 @@
  * 这里只保留对方「真正说的话」。
  */
 
+// lark-cli 历史接口把他人机器人卡片渲染成 `<card>…</card>` 外壳；页脚因此不在「文末」、剥不掉
+const CARD_OPEN_RE = /^\s*<card(\s[^>]*)?>\s*/;
+const CARD_CLOSE_RE = /\s*<\/card>\s*$/;
+
+/** 去掉最外层 `<card>` / `</card>` 外壳（只剥首尾，正文里碰巧出现的不动）。 */
+export const unwrapCardShell = (text: string): string =>
+  text.replace(CARD_OPEN_RE, "").replace(CARD_CLOSE_RE, "");
+
 const PANEL_HEAD_RE = /^\s*[▶▼](\s|$)/;
 const PANEL_END_RE = /^\s*▲\s*$/;
 
@@ -87,6 +95,8 @@ export const stripCardFooter = (text: string): string => {
 
 // 已带名字：@李安(ou_dd96…) / @李安（ou_dd96…）
 const NAMED_OPEN_ID_RE = /@([^\s@()（）]+)[(（]ou_[^)）\s]*[)）]/g;
+// 富文本 at 标签：<at user_id="ou_xxx">名字</at>（名字可能为空——我们自己发的就是空标签）
+const AT_TAG_RE = /<at\s+user_id="([^"]*)"\s*>([^<]*)<\/at>/g;
 // 裸占位：@ou_ + 20 位以上字母数字
 const BARE_OPEN_ID_RE = /@(ou_[0-9a-zA-Z]{20,})/g;
 
@@ -99,6 +109,18 @@ export const replaceOpenIdPlaceholders = (
   resolve: (openId: string) => string | undefined,
 ): string =>
   text
+    .replace(AT_TAG_RE, (_m, id: string, inner: string) => {
+      const shown = inner.trim().replace(/^@/, "");
+      if (shown) return `@${shown}`;
+      if (id === "all") return "@所有人";
+      let name: string | undefined;
+      try {
+        name = resolve(id)?.trim();
+      } catch {
+        name = undefined;
+      }
+      return `@${name ? name.replace(/^@/, "") : "某成员"}`;
+    })
     .replace(NAMED_OPEN_ID_RE, "@$1")
     .replace(BARE_OPEN_ID_RE, (_m, openId: string) => {
       let name: string | undefined;
@@ -110,12 +132,12 @@ export const replaceOpenIdPlaceholders = (
       return `@${name ? name.replace(/^@/, "") : "某成员"}`;
     });
 
-/** 组合：剥面板 → 剥页脚 → 换 open_id → trim；都剥空返回 ""。 */
+/** 组合：拆 `<card>` 外壳 → 剥面板 → 剥页脚 → 换 open_id / at 标签 → trim；都剥空返回 ""。 */
 export const sanitizeInboundCardText = (
   raw: string,
   opts?: { resolveOpenId?: (openId: string) => string | undefined },
 ): string => {
-  const noPanel = stripAgentPanels(raw ?? "");
+  const noPanel = stripAgentPanels(unwrapCardShell(raw ?? ""));
   const noFooter = stripCardFooter(noPanel);
   return replaceOpenIdPlaceholders(
     noFooter,

@@ -240,6 +240,20 @@ export const matchCorrelatedAnswer = (args: {
   return hit ? { entry: hit } : null;
 };
 
+/**
+ * 列出某任务当前仍在有效期内的出问登记（只读副本，旧→新）。
+ * 给群答疑 agent 的「任务状态快照」用：让它知道任务此刻在等群里谁回话，
+ * 不至于把「在等某人」说成「在等属主」。读时顺手清过期（同 matchCorrelatedAnswer）。
+ */
+export const listLiveOutboundQuestions = (
+  taskId: string,
+  now: number = Date.now(),
+): OutboundQuestionEntry[] =>
+  pruneExpired(taskId, now, getRegistry().get(taskId) ?? []).map((e) => ({
+    ...e,
+    keywords: [...e.keywords],
+  }));
+
 /** 消费即焚（命中后调用；幂等）。烧空就整项删，不留空壳（review 十轮-1） */
 export const burnCorrelatedEntry = (taskId: string, messageId: string): void => {
   const reg = getRegistry();
