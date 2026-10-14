@@ -45,11 +45,13 @@ import type { ParsedInboundContent } from "./router";
 // task 型群问答一次只答一个（防刷屏 + 省额度），忙时后来问题不再忙线拒收、而是攒起来：
 // 前一轮 done / 属主动作终态 / 新消息到达时 draining，前一个答完就答它。
 // 属主 / chat 型 / 答 pendingAsk / 关联回执不排（属主用 app 当主通道，关联数据有时效性）。
-// 有界：最多攒这么多，满了落回忙线拒收；TTL 过期静默丢弃；熔断跳闸时整队丢弃。
+// 有界：最多攒这么多，满了落回忙线拒收；TTL 过期丢弃（发件人是人才回一句，机器人静默）。
+// 同一条消息（message_id）重复入队（飞书重投 / 重放）只算一次。
+// 队列变化会通知订阅者（task-talk-queue 据此把「群里排队中」推给 UI）。
 /** 队里最多攒几个（不含正在答的那个） */
-export const GROUP_QUESTION_QUEUE_MAX = 3;
-/** 排队超过这么久还没轮到就丢弃（答案过期了，不如重问） */
-export const GROUP_QUESTION_QUEUE_TTL_MS = 10 * 60 * 1000;
+export const GROUP_QUESTION_QUEUE_MAX = 10;
+/** 排队超过这么久还没轮到就丢弃（属主长任务可能跑很久，30 分钟内都还算有效） */
+export const GROUP_QUESTION_QUEUE_TTL_MS = 30 * 60 * 1000;
 /** 排队中的一个群问题：injectGroupMessage 入参的子集 + 启动凭据快照 */
 export interface QueuedGroupQuestion {
   messageId: string;
@@ -67,6 +69,46 @@ export interface QueuedGroupQuestion {
   enqueuedAt: number;
 }
 const groupQuestionQueues = new Map<string, QueuedGroupQuestion[]>();
+
+/** UI 用的队列只读视图（不含图片 / 启动凭据） */
+export interface GroupQuestionQueueViewItem {
+  id: string;
+  senderName: string;
+  senderIsBot: boolean;
+  /** 问题正文预览（已截断） */
+  preview: string;
+  createdAt: number;
+}
+const groupQueueListeners = new Set<(taskId: string) => void>();
+/** 订阅队列变化（入队 / 出队 / 过期 / 清空）；返回取消订阅函数。监听器抛错只吞、不影响队列 */
+export const subscribeGroupQuestionQueue = (
+  listener: (taskId: string) => void,
+): (() => void) => {
+  groupQueueListeners.add(listener);
+  return () => {
+    groupQueueListeners.delete(listener);
+  };
+};
+const notifyGroupQueueChanged = (taskId: string): void => {
+  for (const l of groupQueueListeners) {
+    try {
+      l(taskId);
+    } catch (err) {
+      console.warn("[feishu-bridge/group-shared] 群队列订阅者抛错：", err);
+    }
+  }
+};
+/** 当前排队中的群问题（FIFO、队首在前）；不剔除过期条目——过期由入队 / pump 时清理并通知 */
+export const listGroupQuestionQueueView = (
+  taskId: string,
+): GroupQuestionQueueViewItem[] =>
+  (groupQuestionQueues.get(taskId) ?? []).map((e) => ({
+    id: e.messageId,
+    senderName: e.requester.name,
+    senderIsBot: !!e.requesterIsBot,
+    preview: e.text.replace(/\s+/g, " ").trim().slice(0, 120),
+    createdAt: e.enqueuedAt,
+  }));
 /**
  * 入队（满了返回 queued:false，调用方落回忙线拒收）。now 参数只给单测用。
  * 先懒清过期（review A）：TTL 是 shift 时才丢的，不先清会拿死槽位误拒新问题。
@@ -90,9 +132,18 @@ export const enqueueGroupQuestion = (
     );
   }
   groupQuestionQueues.set(taskId, q);
-  if (q.length >= GROUP_QUESTION_QUEUE_MAX)
+  // 同一 message_id 已在队里：幂等，不重复入队（飞书重投 / 重放）
+  const dupIdx = q.findIndex((e) => e.messageId === entry.messageId);
+  if (dupIdx >= 0) {
+    if (ejected.length > 0) notifyGroupQueueChanged(taskId);
+    return { queued: true, position: dupIdx + 1, ejected };
+  }
+  if (q.length >= GROUP_QUESTION_QUEUE_MAX) {
+    if (ejected.length > 0) notifyGroupQueueChanged(taskId);
     return { queued: false, position: q.length, ejected };
+  }
   q.push({ ...entry, enqueuedAt: now });
+  notifyGroupQueueChanged(taskId);
   return { queued: true, position: q.length, ejected };
 };
 /**
@@ -123,9 +174,11 @@ export const shiftGroupQuestionQueue = (
     }
     q.shift();
     if (q.length === 0) groupQuestionQueues.delete(taskId);
+    notifyGroupQueueChanged(taskId);
     return { head, expired };
   }
   groupQuestionQueues.delete(taskId);
+  if (expired.length > 0) notifyGroupQueueChanged(taskId);
   return { head: null, expired };
 };
 /** 放回队首（pump 时还忙：静默等下一轮 draining，不回群） */
@@ -137,12 +190,29 @@ export const unshiftGroupQuestionQueue = (
   const q = groupQuestionQueues.get(taskId) ?? [];
   q.unshift(entry);
   groupQuestionQueues.set(taskId, q);
+  notifyGroupQueueChanged(taskId);
 };
-/** 清空（熔断跳闸时整队丢弃）：返回丢掉的条数 */
+/** 清空（任务删除 / 终结时整队丢弃）：返回丢掉的条数 */
 export const clearGroupQuestionQueue = (taskId: string): number => {
   const q = groupQuestionQueues.get(taskId);
   groupQuestionQueues.delete(taskId);
-  return q?.length ?? 0;
+  const n = q?.length ?? 0;
+  if (n > 0) notifyGroupQueueChanged(taskId);
+  return n;
+};
+/** 按 message_id 摘掉一条排队中的群问题（UI「取消」）；摘到返回 true */
+export const removeGroupQuestionFromQueue = (
+  taskId: string,
+  messageId: string,
+): boolean => {
+  const q = groupQuestionQueues.get(taskId);
+  if (!q) return false;
+  const idx = q.findIndex((e) => e.messageId === messageId);
+  if (idx < 0) return false;
+  q.splice(idx, 1);
+  if (q.length === 0) groupQuestionQueues.delete(taskId);
+  notifyGroupQueueChanged(taskId);
+  return true;
 };
 /** 当前队长（排查 / 单测用） */
 export const groupQuestionQueueLength = (taskId: string): number =>
@@ -581,57 +651,17 @@ export const takeGroupReplyByToken = (
 /** 单测重置全部登记 */
 export const __resetGroupReplyStateForTest = (): void => {
   getState().byTask.clear();
-  __resetBypassLoopForTest();
   groupQuestionQueues.clear();
 };
 
-// ----------------- 机器人互 @ 熔断 -----------------
+// ----------------- 通用节流（回群提示 / 日志防刷） -----------------
 //
-// 两个机器人互 @ 成环（江涛 CLI 案）的断路器：只数非属主 @ 消息，不拦属主。
-// 短窗口内连续 N 轮 → 冷却一段时间（首跳 10 分钟，反复跳闸指数退避 10→20→40…封顶 2 小时），
-// 期间非属主 @ 消息静默跳过（不回群里任何话——
-// 回一句 @ 就会给对方机器人续上）、只在 Flowship 事件流里留一条熔断说明。
-// 内存态：进程重启清零，可接受（环本来就跑在进程活着的时候）。
-/** 熔断滑动窗口：窗口内同一发送人 @ 消息达到这么多轮就跳闸（多人群问不累计） */
-export const BYPASS_LOOP_WINDOW_MS = 10 * 60 * 1000;
-export const BYPASS_LOOP_MAX_ROUNDS = 5;
-/** 跳闸后静默多久：首跳 10 分钟（属主消息不受影响、且会清零计数） */
-export const BYPASS_LOOP_COOLDOWN_MS = 10 * 60 * 1000;
-/** 指数退避基数（= 首跳冷却）与封顶：同一 task 短时间内反复跳闸 10→20→40 分钟…封顶 2 小时 */
-export const BYPASS_LOOP_COOLDOWN_BASE_MS = BYPASS_LOOP_COOLDOWN_MS;
-export const BYPASS_LOOP_COOLDOWN_MAX_MS = 2 * 60 * 60 * 1000;
-/** 多久没再跳闸算翻篇、计数清零（和封顶对齐：2 小时无跳闸回到首跳档） */
-export const BYPASS_LOOP_TRIP_RESET_MS = 2 * 60 * 60 * 1000;
-type BypassLoopState = {
-  /** 按发送人分组的时间戳（review P1-1：5 个同事各问一句是正常忙群，只有同一个 id 连刷才是环） */
-  bySender: Map<string, number[]>;
-  cooldownUntil: number;
-  /** 本 task 累计跳闸次数（属主出现清零；长时间无跳闸 sweep 清零） */
-  tripCount: number;
-  /** 上次跳闸时间（退避档位用） */
-  lastTripAt: number;
-  /** 上次跳闸的冷却时长（消息文案用） */
-  lastCooldownMs: number;
-};
-const bypassLoopByTask = new Map<string, BypassLoopState>();
-export const __resetBypassLoopForTest = (): void => {
-  bypassLoopByTask.clear();
-};
-/** 属主在群里说话了 = 人在场，清零（机器人对答模式被打破） */
-export const resetBypassLoop = (taskId: string): void => {
-  if (taskId) bypassLoopByTask.delete(taskId);
-};
-/** 单测 peek：某 task 熔断表里还有哪些发送人（断言清理用） */
-export const __getBypassLoopSendersForTest = (taskId: string): string[] => [
-  ...(bypassLoopByTask.get(taskId)?.bySender.keys() ?? []),
-];
-/** 单测 peek：熔断表里还剩几个 task（断言整项清理用）。
- * 注：含退避留档（bySender 已空、档位未翻篇的空壳）——断言“真干净”用 senders 或 tripCount，别只看这个数。 */
-export const __getBypassLoopTaskCountForTest = (): number =>
-  bypassLoopByTask.size;
+// 原「机器人互 @ 熔断」已整体移除：互 @ 成环不再靠计数拦截，改由两件事从源头掐——
+// ① 系统回执（忙线 / 排队 / 失败）对机器人发件人一律静默，不给对方的上下文喂噪音；
+// ② 答疑 agent 自己按提示词判断该不该回、@ 谁，没话可说就输出 NO_REPLY（见 group-outbound）。
 
 /**
- * per-task 节流：同一 key 一分钟内只放行一次（review D：身份服务抖时 warn 刷屏）。
+ * per-key 节流：同一 key 一分钟内只放行一次（身份服务抖时 warn / 提示不刷屏）。
  * now 参数只给单测用。
  */
 const throttleMarks = new Map<string, number>();
@@ -643,25 +673,8 @@ export const throttleOncePerMinute = (key: string, now: number = Date.now()): bo
   throttleMarks.set(key, now);
   return true;
 };
-/**
- * 全表清扫（record 搭车调用）：各 task 过期 sender 数组删、空 task 整项删
- * （冷却中的空 task 也删——cooldownUntil 已过才到这里，见调用方先行判定）、
- * 节流表过期 marks 删。
- */
-export const sweepBypassLoopState = (now: number = Date.now()): void => {
-  for (const [taskId, st] of bypassLoopByTask) {
-    if (now < st.cooldownUntil) continue;
-    for (const [id, arr] of st.bySender) {
-      if (arr.some((t) => now - t < BYPASS_LOOP_WINDOW_MS)) continue;
-      st.bySender.delete(id);
-    }
-    // 退避计数保留：bySender 空了但最近跳过闸（2 小时内），留着档位给下次指数退避；
-    // 长时间无跳闸才整项删、回到首跳档。
-    if (st.bySender.size === 0) {
-      if (st.lastTripAt > 0 && now - st.lastTripAt < BYPASS_LOOP_TRIP_RESET_MS) continue;
-      bypassLoopByTask.delete(taskId);
-    }
-  }
+/** 节流表清扫（过期 marks 删）：调用方在低频路径上搭车触发，不另起定时器 */
+export const sweepThrottleMarks = (now: number = Date.now()): void => {
   for (const [key, ts] of throttleMarks) {
     if (now - ts >= THROTTLE_WINDOW_MS) throttleMarks.delete(key);
   }
@@ -669,80 +682,6 @@ export const sweepBypassLoopState = (now: number = Date.now()): void => {
 export const __resetThrottleForTest = (): void => {
   throttleMarks.clear();
 };
-
-/** 只看不记：冷却中吗（排队 draining 用，不消耗计数） */
-export const isBypassLoopCooling = (
-  taskId: string,
-  now: number = Date.now(),
-): boolean => {
-  const st = bypassLoopByTask.get(taskId);
-  return !!st && now < st.cooldownUntil;
-};
-/**
- * 记一轮非属主 @ 消息（调用方已排除属主）。tripped=本轮跳闸（调用方静默跳过 +
- * 写一条应用事件），cooled=冷却中（静默跳过，不再写事件）。
- * senderId 为空按 fail-open 不计（身份都拿不到，@ 判定本身也已不可靠，记了也是误伤）。
- * now 参数只给单测用。
- */
-export const recordBypassLoopAttempt = (
-  taskId: string,
-  senderId?: string,
-  now: number = Date.now(),
-): { tripped: boolean; cooled: boolean } => {
-  const idle = { tripped: false, cooled: false };
-  if (!taskId || !senderId) return idle;
-  let st = bypassLoopByTask.get(taskId);
-  if (!st) {
-    st = { bySender: new Map(), cooldownUntil: 0, tripCount: 0, lastTripAt: 0, lastCooldownMs: 0 };
-    bypassLoopByTask.set(taskId, st);
-  }
-  // 清扫放 cooled 判定之前（review 五轮-4）：全员冷却时也不饿死，节流表照清。
-  // 冷却中的 task 条目跳过不删（cooldown 必须留着），其余过期全清。
-  sweepBypassLoopState(now);
-  if (now < st.cooldownUntil) return { tripped: false, cooled: true };
-  // 注意：上面可能把本 task 也扫掉（全过期），下面 get 不到就重建——语义不变
-  // （退避计数在 2 小时内会留着，翻篇了才重建回首跳档）
-  st = bypassLoopByTask.get(taskId);
-  if (!st) {
-    st = { bySender: new Map(), cooldownUntil: 0, tripCount: 0, lastTripAt: 0, lastCooldownMs: 0 };
-    bypassLoopByTask.set(taskId, st);
-  }
-  const rounds = (st.bySender.get(senderId) ?? []).filter(
-    (t) => now - t < BYPASS_LOOP_WINDOW_MS,
-  );
-  rounds.push(now);
-  st.bySender.set(senderId, rounds);
-  if (rounds.length >= BYPASS_LOOP_MAX_ROUNDS) {
-    // 指数退避：短时间内反复跳闸 10→20→40…封顶 2 小时，野聊 duty-cycle 压到接近零；
-    // 人类 10 分钟连 @5 次本就少见，连跳两次几乎不可能是人，误伤可忽略。
-    const tripCount =
-      st.lastTripAt > 0 && now - st.lastTripAt < BYPASS_LOOP_TRIP_RESET_MS
-        ? st.tripCount + 1
-        : 1;
-    const cooldownMs = Math.min(
-      BYPASS_LOOP_COOLDOWN_BASE_MS * 2 ** (tripCount - 1),
-      BYPASS_LOOP_COOLDOWN_MAX_MS,
-    );
-    st.tripCount = tripCount;
-    st.lastTripAt = now;
-    st.lastCooldownMs = cooldownMs;
-    st.cooldownUntil = now + cooldownMs;
-    return { tripped: true, cooled: false };
-  }
-  return idle;
-};
-
-/** 跳闸信息（文案用）：第几次 + 这次静默多久；没跳过返回 null */
-export const getBypassLoopTripInfo = (
-  taskId: string,
-): { tripCount: number; cooldownMs: number } | null => {
-  const st = bypassLoopByTask.get(taskId);
-  if (!st || st.tripCount <= 0) return null;
-  return { tripCount: st.tripCount, cooldownMs: st.lastCooldownMs };
-};
-/** 单测 peek：某 task 累计跳闸几次（退避档位断言用） */
-export const __getBypassLoopTripCountForTest = (taskId: string): number =>
-  bypassLoopByTask.get(taskId)?.tripCount ?? 0;
 
 // ----------------- 产物卡防重（自动播报 / 群内推进出向共用一张表） -----------------
 //

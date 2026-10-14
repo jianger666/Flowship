@@ -5,7 +5,8 @@
  *
  *   群消息
  *     ├─ 没 @ 本机 bot            → 忽略（防刷屏；群里日常聊天不该惊动 agent）
- *     ├─ 发件人是其它机器人       → 照常答疑、回答真 @ 回去（发起方吃掉后静默，一轮结束；兜底靠熔断）
+ *     ├─ 发件人是其它机器人       → 照常答疑；回答由 agent 按提示词自己决定 @ 谁 / 是否回（NO_REPLY）；
+ *     │                             系统回执（忙线 / 排队 / 失败）对机器人整条静默、不污染它的上下文
  *     ├─ chat_id 反查不到本机任务 → 群里回一句「本机没有关联此需求的任务」
  *     ├─ 「推进」（无 action 名） → 回 action 选择卡（每个人的 action 和顺序都
  *     │                             不一样、不替用户猜「下一步」；属主点按钮开跑）
@@ -24,11 +25,9 @@
  * - 唯一的例外：出问登记命中（两门：发件人==被问目标 / 窗口期内，
  *   且属主活会话在场）→ 以属主语义进会话当数据、群里不再回（见 injectGroupMessage 的 feedIntoSession；
  *   会话不在不自动唤醒，走只读）。
- * - 机器人互 @ 熔断（group-shared）：短窗口内非属主
- *   @ 消息连发 5 轮 → 冷却 10 分钟起（反复跳闸指数退避、封顶 2 小时；有在途出问登记的目标豁免计数）
- *   （静默跳过、只在 Flowship 事件流留痕）；属主出现清零。
- *   机器人问机器人时回答真 @ 回去（发起方登记等答案、吃掉后静默，正常一轮结束；
- *   兜底靠熔断）。
+ * - 机器人互 @ 防环：**不再计数熔断**。改由两条规矩从源头掐——
+ *   ① 系统回执对机器人整条静默（replyToGroup 的 mention=null），不给对方上下文喂噪音；
+ *   ② 答疑 agent 的提示词里写明「谁该 @ / 什么时候不用回」，没话可说输出 NO_REPLY（出向不发）。
  *
  * 依赖方向：只从 router **type-only** import（避免 router ↔ group-route 运行时成环）；
  * 需要 router 拥有的 parseInboundContent / loadBridgeBootContext 由 router 以 ctx 传入。
@@ -75,15 +74,9 @@ import {
   mentionTag,
   newGroupAdvancePickId,
   releaseGroupAdvancePick,
-  BYPASS_LOOP_MAX_ROUNDS,
-  clearGroupQuestionQueue,
   enqueueGroupQuestion,
-  getBypassLoopTripInfo,
-  isBypassLoopCooling,
   rememberGroupReply,
-  recordBypassLoopAttempt,
-  resetBypassLoop,
-  sweepBypassLoopState,
+  sweepThrottleMarks,
   throttleOncePerMinute,
   restoreGroupReply,
   shiftGroupQuestionQueue,
@@ -116,8 +109,6 @@ const LOG = "[feishu-bridge/group-route]";
 
 /** 过滤跳过原因（与 router 的 SKIP_* 同族、inbound 据此决定不推进 p2p 游标） */
 export const SKIP_GROUP_NO_MENTION = "群消息未 @ 本机 bot";
-/** 熔断跳闸 / 冷却中：静默跳过（回群里任何话都会给对方机器人续上，只在 Flowship 事件流留痕） */
-export const SKIP_GROUP_LOOP_BREAKER = "群答疑熔断中（疑似机器人互@）、静默跳过";
 /**
  * 发送人是不是机器人（自家 bot 另有 SKIP_GROUP_SELF 判定，这里只认“别人家的”）。
  * sender_type 显式非 user，或带 bot open_id / app_id（类型注释写明：这两格只有 bot 消息才有）。
@@ -518,21 +509,30 @@ export const resolveTaskIdByGroupChat = async (
 // ----------------- 回群小工具 -----------------
 
 /**
- * 即时系统回执 @ 谁：发起人是机器人就不 @（忙线/排队/拒绝/失败这类系统回执 @ 回去会误触发对方自动化；
- * agent 的正式回答走 outbound flush，真 @ 回去）。
+ * 即时系统回执 @ 谁：发起人是机器人 → `null`（= 整条回执**不发**）。
+ *
+ * 为什么不是「不 @ 但照发」：对方机器人会把群里的每句话（含我们的「忙线 / 排队 / 失败」）
+ * 当作对话内容喂回它自己的上下文，一句「去 xx 看事件流」就能把它带偏、越跑越远
+ * （2026-10-14 花果排课：对接后端机器人时被带偏的真实案例）。系统回执对机器人没有价值，
+ * 一律静默；真要回答它的问题，走 outbound 的正式回答（agent 自己决定说什么、@ 谁）。
  * 入队 ack / 忙线 / 拒绝 / pump 回执一路共用这一个。
  */
 const groupReplyMention = (
   requesterIsBot: boolean | undefined,
   requester: { openId: string; name: string },
-): { openId: string; name: string } | undefined =>
-  requesterIsBot ? undefined : { openId: requester.openId, name: requester.name };
+): { openId: string; name: string } | null =>
+  requesterIsBot ? null : { openId: requester.openId, name: requester.name };
 
 const replyToGroup = async (
   chatId: string,
   text: string,
-  mention?: { openId: string; name: string },
+  /** null = 对方是机器人、系统回执静默丢弃（见 groupReplyMention）；undefined = 不 @ 照发 */
+  mention?: { openId: string; name: string } | null,
 ): Promise<void> => {
+  if (mention === null) {
+    console.log(`${LOG} 系统回执对机器人静默 chat=${chatId} text=${text.slice(0, 40)}`);
+    return;
+  }
   const body = mention
     ? `${mentionTag(mention.openId, mention.name)} ${text}`
     : text;
@@ -1049,8 +1049,8 @@ const injectGroupMessage = async (args: {
         boot,
       });
       // 入队时清掉的过期问题：人家收到过 ack，不能悄悄吞，一人回一句（review 八轮-2）。
-      // 冷却中静默（回群等于续命），机器人不 @——和 pump 里同一口径。
-      if (pushed.ejected.length > 0 && !isBypassLoopCooling(taskId)) {
+      // 机器人发件人的回执整条静默（groupReplyMention）——和 pump 里同一口径。
+      if (pushed.ejected.length > 0) {
         for (const e of pushed.ejected) {
           await replyToGroup(
             e.chatId,
@@ -1302,7 +1302,7 @@ const injectGroupMessage = async (args: {
 
 /**
  * 排队 draining：restricted done / 属主动作终态 / 新消息到达时由出向调。
- * 队首还忙 → 放回队首静默等下一轮（不回群）；冷却中 → 不动（熔断跳闸时已整队丢弃）。
+ * 队首还忙 → 放回队首静默等下一轮（不回群）。
  * 串行 guard：done 与 action 帧可能连着到，重入只跑一份。
  */
 const questionPumpRunning = new Set<string>();
@@ -1318,16 +1318,13 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
   }
   questionPumpRunning.add(taskId);
   try {
-    // 冷却判定只在这里（入口 + 每圈同一处；忙/冷却是 break 走 while 条件，
-    // 不直接 return——直接 return 会留 stale Wanted（review 五轮-3）
+    // 忙是 break 走 while 条件、不直接 return——直接 return 会留 stale Wanted（review 五轮-3）
     do {
       questionPumpWanted.delete(taskId);
-      if (isBypassLoopCooling(taskId)) break;
       for (;;) {
         const { head, expired } = shiftGroupQuestionQueue(taskId);
-        // 过期丢弃要给用户交代（入队时承诺过“答完就答你”）：队里最多 3 条刷不了屏；
-        // 冷却中静默（回群等于续命），机器人不 @（review 八轮-1/八轮-2）。
-        if (expired.length > 0 && !isBypassLoopCooling(taskId)) {
+        // 过期丢弃要给用户交代（入队时承诺过“答完就答你”）；机器人发件人整条静默（review 八轮-1/八轮-2）。
+        if (expired.length > 0) {
           for (const e of expired) {
             await replyToGroup(
               e.chatId,
@@ -1337,12 +1334,6 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
           }
         }
         if (!head) break;
-        // 长 drain 中途也看冷却：await inject 期间并发跳闸了，剩下的不再答、放回队首
-        // （review 六轮-3；和入口是同一语义，注释统一写在这里）
-        if (isBypassLoopCooling(taskId)) {
-          unshiftGroupQuestionQueue(taskId, head);
-          break;
-        }
         // inject 主路都 catch 转 failed 了，但 replyToGroup 炸了还是会抛：
         //  per-item 兜住，失败这条认栽继续下一条，别卡住整队（review 四轮-3）
         let r;
@@ -1361,24 +1352,18 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
             fromPump: true,
           });
         } catch (err) {
-          // 回放注入抛错：写 ok:false 汇总（tab 看得到）+ 没冷却才回一句（review 五轮-2，
-          // 呼应 outbound 失败轮进 tab；冷却中回群等于给对方机器人续命，一律静默）。
-          // origin 随机：投不进任何登记。
+          // 回放注入抛错：写 ok:false 汇总（tab 看得到）+ 回一句（人类才回，机器人静默；review 五轮-2，
+          // 呼应 outbound 失败轮进 tab）。origin 随机：投不进任何登记。
           const errText = err instanceof Error ? err.message : String(err);
           console.warn(
             `${LOG} 排队回放注入抛错 task=${taskId} message=${head.messageId}：`,
             errText,
           );
-          if (!isBypassLoopCooling(taskId)) {
-            // 发起人是机器人就不 @（和 groupReplyMention 同理：系统回执不 @ 机器人，@ 回去会误触发对方自动化）
-            await replyToGroup(
-              head.chatId,
-              "这条没接住，麻烦重问",
-              head.requesterIsBot
-                ? undefined
-                : { openId: head.requester.openId, name: head.requester.name },
-            );
-          }
+          await replyToGroup(
+            head.chatId,
+            "这条没接住，麻烦重问",
+            groupReplyMention(head.requesterIsBot, head.requester),
+          );
           await writeOwnedEventAndPublish(
             taskId,
             () => true,
@@ -1480,11 +1465,10 @@ export const routeGroupInboundMessage = async (
   // 4) chat_id → 本机任务
   const taskId = await resolveTaskIdByGroupChat(msg.chat_id);
   if (!taskId) {
-    // 无 task 无熔断表：未绑定群里披 user 皮的机器人 1:1 ping-pong（@ 回去即续命）退避断不了，
-    // 按 chat 节流，窗内只回第一句，其余静默；人类 @ 错群顶多晚看到一句提示。
+    // 未绑定群：按 chat 节流，窗内只回第一句，其余静默；机器人发件人整条静默（groupReplyMention）。
     // 文案半句活路：任务存在但被挤出 20 任务扫描窗口时，去 app 碰一下任务比解绑重绑管用。
-    // 搭车清扫：这条路不经过 record，节流表 GC 靠这里触发一行（和 record 里同一套）。
-    sweepBypassLoopState();
+    // 搭车清扫：节流表 GC 靠这里触发一行。
+    sweepThrottleMarks();
     if (throttleOncePerMinute(`no-task:${msg.chat_id}`)) {
       await replyToGroup(
         msg.chat_id,
@@ -1495,81 +1479,8 @@ export const routeGroupInboundMessage = async (
     return { kind: "skipped", messageId, error: SKIP_GROUP_NO_TASK };
   }
 
-  // 4.5) 机器人互 @ 熔断：伪装成人的对方机器人（user 身份发消息的 CLI）入向拦不住，
-  // 按发送人分组计数——同一个 id 短时间连刷才断，多人群问不累计（review P1-1）。
-  // 属主出现说明人在场，清零。属主身份拿不到时 fail-open 不计（@ 判定本身已不可靠）。
-  // 跳闸 / 冷却中静默跳过——回群里任何话都会给对方机器人续上；
-  // 唯一的例外是静默消费（关联喂会话 / pendingAsk 答复本来就不回群，放行不会续环）：冷却=禁声不禁食。
-  // 注意顺序：熔断在 draining 之前，“先断再说”，跳闸当轮不再放行队首（review P1-2）。
-  if (!!ownerOpenId && msg.sender_id === ownerOpenId) {
-    resetBypassLoop(taskId);
-  } else if (!ownerOpenId) {
-    // 节流：身份服务抖时每条 @ 都 warn 会把日志淹了（review D）
-    if (throttleOncePerMinute(`loop-failopen:${taskId}`)) {
-      console.warn(`${LOG} 属主身份不可用、熔断计数跳过（fail-open）task=${taskId}`);
-    }
-  } else if (isBypassLoopCooling(taskId)) {
-    // 冷却=禁声不禁食：下面两条路本来就零输出，放行不会给对方机器人续上——
-    // ① 关联回执喂会话（replyHandle=null，吃掉静默）；② pendingAsk 答复（burn + sent）。
-    // ① 必须会话在场才放（会话不在会落只读 @，等于开喇叭）；
-    // 残留窄窗口认下来：放行后 pending 恰好被别人消费掉（no_pending 落回只读 @）——三条件叠满才撞。
-    const senderIds = [msg.sender_id, msg.sender_bot_open_id, msg.sender_app_id];
-    const silentFeed =
-      hasPendingOutbound({ taskId, chatId: msg.chat_id, senderIds }) &&
-      agentSessions.has(taskId);
-    if (!silentFeed && !deps.getPendingAsk(taskId)) {
-      console.warn(
-        `${LOG} 互@熔断跳过 task=${taskId} chat=${msg.chat_id} sender=${msg.sender_id} tripped=false (cooling)`,
-      );
-      return { kind: "skipped", messageId, taskId, error: SKIP_GROUP_LOOP_BREAKER };
-    }
-    // 放行 log 节流（一分钟一条，和 loop-failopen 同口径；节流只管 log，不管放行）。
-    if (throttleOncePerMinute(`loop-cooling-feed:${taskId}`)) {
-      console.warn(
-        `${LOG} 熔断冷却中放行静默消费 task=${taskId} chat=${msg.chat_id} sender=${msg.sender_id}`,
-      );
-    }
-    // 放行：冷却中不计数，直接往下走（pump 内冷却判定照旧，只影响排队）。
-  } else if (
-    hasPendingOutbound({
-      taskId,
-      chatId: msg.chat_id,
-      senderIds: [msg.sender_id, msg.sender_bot_open_id, msg.sender_app_id],
-    })
-  ) {
-    // 有在途登记的目标豁免计数：等来的答案不是环燃料，我方追问/补问不该被自家熔断掐死。
-    // （冷却已在上面先行判定，这里只跳过计数。）
-    // 等价依赖：hasPendingOutbound（sender+窗口）≡ matchCorrelatedAnswer（sender+窗口，text 已无关）——
-    // 若哪天关键词 gate 回归，豁免会放行“sender 对但内容不对”的消息，改匹配门时同步改这里。
-  } else {
-    const loop = recordBypassLoopAttempt(taskId, msg.sender_id);
-    if (loop.tripped || loop.cooled) {
-      if (loop.tripped) {
-        // 跳闸整队丢弃：排队的问题一并作废（麻烦重问），否则冷却里攒一堆过期答案
-        const dropped = clearGroupQuestionQueue(taskId);
-        const trip = getBypassLoopTripInfo(taskId);
-        const cooldownMin = trip ? Math.round(trip.cooldownMs / 60000) : 10;
-        const tripNote = trip && trip.tripCount > 1 ? `（第 ${trip.tripCount} 次跳闸）` : "";
-        // 应用事件只写一条：origin 随机，保证投不进任何回群登记（见 group-shared token 协议）
-        await writeOwnedEventAndPublish(
-          taskId,
-          () => true,
-          {
-            kind: "info",
-            text: `群答疑熔断：同一发送人 10 分钟内连续 ${BYPASS_LOOP_MAX_ROUNDS} 轮 @ 提问（疑似机器人互 @），已暂停回群 ${cooldownMin} 分钟${tripNote}${dropped > 0 ? `（排队中的 ${dropped} 个问题一并丢弃，麻烦重问）` : ""}。属主消息不受影响，去群里看下是不是两个机器人在对答。`,
-          },
-          `loop-breaker-${Date.now().toString(36)}`,
-        );
-      }
-      console.warn(
-        `${LOG} 互@熔断跳过 task=${taskId} chat=${msg.chat_id} sender=${msg.sender_id} tripped=${loop.tripped}`,
-      );
-      return { kind: "skipped", messageId, taskId, error: SKIP_GROUP_LOOP_BREAKER };
-    }
-  }
-
   // 4.25) 到达顺带 draining：队里有攒的且此刻空闲，先答旧的（FIFO），再处理当前这条
-  // （兜底 done/终态帧丢失的极端情况；空队一次 Map 查询秒回，冷却中直接让过）
+  // （兜底 done/终态帧丢失的极端情况；空队一次 Map 查询秒回）
   await pumpGroupQuestionQueue(taskId);
 
   // 5) 解析正文（图 / 文件下载复用 p2p 那套）
