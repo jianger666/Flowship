@@ -496,6 +496,183 @@ describe("createCardStream", () => {
     }
   });
 
+  // S08-02：已了结的 ask 不能被后续整包 PUT 复活
+  it("ask 已置态（settle）后 finalize 整包 PUT 不再带按钮、问题区保留终态说明", async () => {
+    const { settleAskCards } = await import(
+      "@/lib/server/feishu-bridge/ask-card-settle"
+    );
+    const { __resetAskCardSettleForTest } = await import(
+      "@/lib/server/feishu-bridge/ask-settle-state"
+    );
+    __resetAskCardSettleForTest();
+    const taskId = "task_settled";
+    const questions = [
+      {
+        id: "q1",
+        question: "选哪个？",
+        options: [
+          { id: "a", label: "A" },
+          { id: "b", label: "B" },
+        ],
+      },
+    ];
+    try {
+      const stream = createCardStream(taskId, { title: "t", openId: "ou" });
+      await stream.start();
+      await stream.appendAskUser({ askId: "ask_s", questions });
+
+      // 用户在别处（app / 群 / 飞书点按钮）答完：ask-card-settle 把按钮从卡上删掉
+      const patched = await settleAskCards({
+        taskId,
+        askId: "ask_s",
+        questions,
+        noteByQuestion: { q1: "已选择：A" },
+        fallbackNote: "（未回答）",
+        hintNote: "这组提问已回答、无需再答",
+      });
+      expect(patched).toBe(1);
+
+      // 之后 run 继续、finalize 做整包 PUT
+      updateCardEntity.mockClear();
+      await stream.finalize({ ok: true, durationMs: 1000 });
+
+      const cardJson = (
+        updateCardEntity.mock.calls as unknown as Array<
+          [
+            string,
+            {
+              body: {
+                elements: Array<{
+                  tag?: string;
+                  element_id?: string;
+                  content?: string;
+                }>;
+              };
+            },
+          ]
+        >
+      ).at(-1)![1];
+      const els = cardJson.body.elements;
+      // 按钮不复活
+      expect(els.some((e) => e.tag === "button")).toBe(false);
+      // 问题区带终态说明、提示行换成已答说明
+      expect(
+        els.some(
+          (e) =>
+            typeof e.content === "string" &&
+            e.content.includes("**选哪个？**") &&
+            e.content.includes("已选择：A"),
+        ),
+      ).toBe(true);
+      expect(els.some((e) => e.content === "这组提问已回答、无需再答")).toBe(
+        true,
+      );
+      // 元素仍在分割线之前（位置不变）
+      const hrIdx = els.findIndex((e) => e.element_id === "main_divider");
+      const qIdx = els.findIndex((e) => e.content?.includes("已选择：A"));
+      expect(qIdx).toBeGreaterThanOrEqual(0);
+      expect(qIdx).toBeLessThan(hrIdx);
+    } finally {
+      __resetAskCardSettleForTest();
+    }
+  });
+
+  // R3-02：占坑释放 ≠ 终态视图清除
+  it("settle patch 全失败（占坑被释放）后整包 PUT 仍不带按钮；finalize 后视图被回收", async () => {
+    const { settleAskCards } = await import(
+      "@/lib/server/feishu-bridge/ask-card-settle"
+    );
+    const {
+      __askCardSettleSizeForTest,
+      __resetAskCardSettleForTest,
+      getAskCardSettledView,
+      isAskCardSettled,
+    } = await import("@/lib/server/feishu-bridge/ask-settle-state");
+    __resetAskCardSettleForTest();
+    const taskId = "task_release_keep_view";
+    const questions = [
+      {
+        id: "q1",
+        question: "选哪个？",
+        options: [
+          { id: "a", label: "A" },
+          { id: "b", label: "B" },
+        ],
+      },
+    ];
+    try {
+      const stream = createCardStream(taskId, { title: "t", openId: "ou" });
+      await stream.start();
+      await stream.appendAskUser({ askId: "ask_r", questions });
+
+      // 用户在别处答完了，但飞书 patch 失败：settle 一张卡都没置成 → 释放占坑
+      batchUpdateCard.mockRejectedValueOnce(new Error("lark 挂了"));
+      const patched = await settleAskCards({
+        taskId,
+        askId: "ask_r",
+        questions,
+        noteByQuestion: { q1: "已选择：A" },
+        fallbackNote: "（未回答）",
+        hintNote: "这组提问已回答、无需再答",
+      });
+      expect(patched).toBe(0);
+      // 占坑已释放（允许重试）……
+      expect(isAskCardSettled(taskId, "ask_r")).toBe(false);
+      // ……但终态视图还在
+      expect(getAskCardSettledView(taskId, "ask_r")).not.toBeNull();
+
+      // 之后 finalize 整包 PUT：按钮不能复活
+      updateCardEntity.mockClear();
+      await stream.finalize({ ok: true, durationMs: 1000 });
+      const els = (
+        updateCardEntity.mock.calls as unknown as Array<
+          [
+            string,
+            {
+              body: {
+                elements: Array<{ tag?: string; content?: string }>;
+              };
+            },
+          ]
+        >
+      ).at(-1)![1].body.elements;
+      expect(els.some((e) => e.tag === "button")).toBe(false);
+      expect(els.some((e) => e.content?.includes("已选择：A"))).toBe(true);
+
+      // 流式卡 finalize 后不会再整包 PUT：视图回收、登记表不留尾巴（防泄漏）
+      expect(getAskCardSettledView(taskId, "ask_r")).toBeNull();
+      expect(__askCardSettleSizeForTest()).toBe(0);
+    } finally {
+      __resetAskCardSettleForTest();
+    }
+  });
+
+  it("ask 未置态时 finalize 整包 PUT 仍带按钮（回归：不误伤待答卡）", async () => {
+    const { __resetAskCardSettleForTest } = await import(
+      "@/lib/server/feishu-bridge/ask-settle-state"
+    );
+    __resetAskCardSettleForTest();
+    const stream = createCardStream("task_unsettled", {
+      title: "t",
+      openId: "ou",
+    });
+    await stream.start();
+    await stream.appendAskUser({
+      askId: "ask_u",
+      questions: [
+        { id: "q1", question: "？", options: [{ id: "a", label: "A" }] },
+      ],
+    });
+    updateCardEntity.mockClear();
+    await stream.finalize({ ok: true, durationMs: 1000 });
+    const cardJson = (
+      updateCardEntity.mock.calls as unknown as Array<
+        [string, { body: { elements: Array<{ tag?: string }> } }]
+      >
+    ).at(-1)![1];
+    expect(cardJson.body.elements.some((e) => e.tag === "button")).toBe(true);
+  });
+
   // R1-4：stopped 终态灰卡
   it("finalize outcome=stopped → grey「已停止」", async () => {
     const stream = createCardStream("task_stop", { title: "t", openId: "ou" });

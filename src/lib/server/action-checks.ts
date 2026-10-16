@@ -48,6 +48,7 @@ import { getActionArtifactPath } from "./task-fs-core";
 import {
   getTaskCwd,
   getTaskWorkRepoPaths,
+  isTaskNonGitRepo,
   isTaskReadonlyRepo,
 } from "./task-worktrees";
 import { planWkGateForAction, runWkPostStage } from "./wk-gate";
@@ -237,6 +238,34 @@ const checkPlan = async (
 
 // ----------------- review -----------------
 
+/**
+ * 从 review artifact 抠「基底 commit」声明的 hash 列表（纯函数、导出供测试）。
+ * - 单仓（multiRepo=false）：沿用旧口径、只取「基底 commit」那一行的第一个 7-40 位 hex
+ * - 多仓（multiRepo=true）：取「基底 commit」条目整块（该行 + 其后缩进子项 / 表格行、
+ *   到下一个标题或顶层 bullet 为止）里出现的全部 hex，逐仓 HEAD 只要命中其中之一即算声明过
+ * 没写 / 抠不到 → 空数组。
+ */
+export const extractDeclaredBaseCommits = (
+  content: string,
+  multiRepo: boolean,
+): string[] => {
+  if (!multiRepo) {
+    const m = content.match(/基底\s*commit[^\n]*?([0-9a-f]{7,40})/i);
+    return m ? [m[1]] : [];
+  }
+  const lines = content.split("\n");
+  const start = lines.findIndex((l) => /基底\s*commit/i.test(l));
+  if (start < 0) return [];
+  const block = [lines[start]];
+  for (let i = start + 1; i < lines.length && i < start + 40; i++) {
+    // 下一个标题 / 顶层 bullet = 本条目结束
+    if (/^#{1,6}\s/.test(lines[i]) || /^[-*]\s/.test(lines[i])) break;
+    block.push(lines[i]);
+  }
+  const tokens = block.join("\n").match(/\b[0-9a-f]{7,40}\b/gi) ?? [];
+  return [...new Set(tokens)];
+};
+
 const checkReview = async (
   task: Task,
   action: ActionRecord,
@@ -292,14 +321,31 @@ const checkReview = async (
   }
 
   // 基底 commit 一致性检查（V0.6 门槛 2）
-  // V0.10：隔离 task 的 cwd = worktree（agent 实际干活的地方、HEAD 在这里才是对的）
-  const cwd = getTaskCwd(task);
-  try {
-    await fs.access(path.join(cwd, ".git"));
-  } catch {
+  // 逐仓校验（审查加固）：旧版只看 getTaskCwd 的 `.git`——多仓任务 cwd 是公共父目录、通常没有 `.git`，
+  // 整段检查直接放行。现改为按 getTaskWorkRepoPaths（隔离 task = worktree、非隔离 = 原仓）逐仓判定：
+  // - 非 git 仓（快照 nonGitRepoPaths / 路径下无 `.git`）：无 HEAD 可比、跳过
+  // - 只读仓：允许 pull / 切提测分支、HEAD 会合法变动（同 diffReadonlyRepoState 口径）、不进基底检查
+  const gitWorkPaths: string[] = [];
+  {
+    const workPaths = getTaskWorkRepoPaths(task);
+    for (let i = 0; i < workPaths.length; i++) {
+      const origPath = task.repoPaths[i];
+      if (isTaskNonGitRepo(task, origPath) || isTaskReadonlyRepo(task, origPath)) {
+        continue;
+      }
+      try {
+        await fs.access(path.join(workPaths[i], ".git"));
+        gitWorkPaths.push(workPaths[i]);
+      } catch {
+        // 无 .git：非 git 仓、跳过
+      }
+    }
+  }
+  if (gitWorkPaths.length === 0) {
     return {
       passed: true,
-      details: "review artifact 必备段 + bug 复审段齐全（非 git 仓、跳过基底 commit 检查）",
+      details:
+        "review artifact 必备段 + bug 复审段齐全（无可校验的可写 git 仓、跳过基底 commit 检查）",
     };
   }
 
@@ -307,29 +353,33 @@ const checkReview = async (
   // runner 在此 re-run git rev-parse HEAD、跟 artifact 声明的基底比对（防 agent 拿错 checkout / 编造基底）。
   // ⚠️ 旧正则找的是「git rev-parse hash: <x>」这种字面、跟骨架「基底 commit：`<x>`」对不上 = 死代码、从不命中。
   // 注：review 不动工作树、不做 `git diff | sha256sum`（骨架无 diff hash 字段、强加 = prompt↔code 漂移）。
-  const baseMatch = content.match(/基底\s*commit[^\n]*?([0-9a-f]{7,40})/i);
-  if (!baseMatch) {
-    return {
-      passed: true,
-      details:
-        "review artifact 必备段 + bug 复审段齐全（artifact 未声明基底 commit、跳过一致性检查）",
-    };
-  }
-  const declaredBase = baseMatch[1];
-  const gs = await runShell("git", ["rev-parse", "HEAD"], cwd);
-  if (gs.exitCode !== 0) {
-    return {
-      passed: true,
-      details:
-        "review 必备段 + bug 复审段齐全（git rev-parse HEAD 跑失败、跳过基底 commit 一致性）",
-    };
-  }
-  const realBase = gs.stdout.trim();
-  // 容忍短 hash：声明值是真值前缀、或反之（agent 可能写 7-12 位短 hash）
-  if (!realBase.startsWith(declaredBase) && !declaredBase.startsWith(realBase)) {
+  // 有可写 git 仓却没声明基底 commit = 无法证明 review 基于正确 checkout → 拒绝、要求补写（不再放行）。
+  const declaredBases = extractDeclaredBaseCommits(content, gitWorkPaths.length > 1);
+  if (declaredBases.length === 0) {
     return {
       passed: false,
-      details: `review artifact 声明的基底 commit ${declaredBase} 跟实际 HEAD ${realBase} 不一致（agent 可能拿错 checkout / 编造基底）`,
+      details:
+        gitWorkPaths.length > 1
+          ? `review artifact 未声明基底 commit：本 task 有 ${gitWorkPaths.length} 个可写 git 仓、请在「总评」的「基底 commit」条目下逐仓列出 \`git rev-parse HEAD\` 真值（仓：${gitWorkPaths.join(", ")}）`
+          : "review artifact 未声明基底 commit：请在「总评」补写「- **基底 commit**：`<git rev-parse HEAD 真值>`」（runner 要用它校验 review 基于正确 checkout）",
+    };
+  }
+  const mismatched: string[] = [];
+  for (const repoPath of gitWorkPaths) {
+    const gs = await runShell("git", ["rev-parse", "HEAD"], repoPath);
+    // git rev-parse 自身跑失败（空仓无 HEAD / git 不可用）= 环境问题、该仓无法比对、不拦
+    if (gs.exitCode !== 0) continue;
+    const realBase = gs.stdout.trim();
+    // 容忍短 hash：声明值是真值前缀、或反之（agent 可能写 7-12 位短 hash）
+    const ok = declaredBases.some(
+      (d) => realBase.startsWith(d) || d.startsWith(realBase),
+    );
+    if (!ok) mismatched.push(`${repoPath}（实际 HEAD ${realBase}）`);
+  }
+  if (mismatched.length > 0) {
+    return {
+      passed: false,
+      details: `review artifact 声明的基底 commit ${declaredBases.join(", ")} 跟实际 HEAD 不一致：${mismatched.join("；")}（agent 可能拿错 checkout / 编造基底；多仓需逐仓列出各自 HEAD）`,
     };
   }
 

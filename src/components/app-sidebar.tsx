@@ -13,7 +13,8 @@
  *  - 固定按工作目录/仓库分组（无按状态切换）
  *  - 置顶钉住（新置顶追加末尾、无手动排序）；行内重命名
  *  - 组头「+」预绑该仓新建对话（Home = 不绑）
- *  - 每仓组默认只展 4 条、其余走「展开其余 N 条」；置顶组不限
+ *  - 每仓组默认只展 4 条、其余走「展开其余 N 条」；置顶组不限；
+ *    当前打开的对话始终露出（超限也展、所在组折叠则自动展开、行滚进可视区）
  *  - 行尾删除换归档：点即归档、无确认，找回去会话管理页
  *  - 归档不断序：粘性序按全量对话（含归档）对、组按全量排——归档只藏行，不搬仓库的位置
  *
@@ -22,7 +23,7 @@
  *  - 全局全文搜索用 Cmd/Ctrl+K
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { ChevronDown, ChevronRight, ChevronUp, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
@@ -39,8 +40,10 @@ import { useTaskList } from "@/hooks/use-task-list";
 import { getSettings } from "@/lib/local-store";
 import {
   buildRepoGroups,
+  pickVisibleGroupItems,
   reconcileChatListOrder,
   repoPathsForGroupCreate,
+  scrollDeltaToReveal,
   type SidebarGroup,
 } from "@/lib/sidebar-groups";
 import { setTaskArchived, setTaskPinned, updateTaskFields } from "@/lib/task-store";
@@ -260,6 +263,61 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     );
   }, [mode, sorted, allChats, pinnedOrder, chatOrder]);
 
+  // 当前打开的对话落在哪个组（对话模式）；不在列表里（归档 / 还没 upsert）= undefined
+  const activeGroupKey = useMemo(
+    () =>
+      activeId
+        ? chatGroups.find((g) => g.items.some((t) => t.id === activeId))?.key
+        : undefined,
+    [chatGroups, activeId],
+  );
+
+  // 打开 / 新建的对话所在组若是折叠的 → 自动展开，不然对话开着、侧栏里却看不到它。
+  // 只在「当前对话 / 它所在的组」变化时触发（deps 不含 collapsedKeys）：
+  // 用户之后手动把当前组折起来不会被立刻弹开
+  useEffect(() => {
+    if (!activeGroupKey) return;
+    setCollapsedKeys((prev) => {
+      if (!prev.has(activeGroupKey)) return prev;
+      const next = new Set(prev);
+      next.delete(activeGroupKey);
+      saveSidebarCollapsedGroups(next);
+      return next;
+    });
+  }, [activeId, activeGroupKey]);
+
+  // 当前行滚进侧栏可视区：新建对话落在 Home 组（恒在最底）、切到下方仓组的对话时，
+  // 行在可视区外，用户看到的就是「侧栏里没有它」。只滚 nav 自己（不用 scrollIntoView、
+  // 免得连带滚动外层）；同一对话 + 同一组只滚一次，用户自己再滚走不拉回来
+  const navRef = useRef<HTMLElement | null>(null);
+  const revealedKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    // 收起态（宽度 0）量不准，等展开后 open 变化再来
+    if (!open || !loaded || !activeId) return;
+    const key = `${activeId}|${activeGroupKey ?? ""}`;
+    if (revealedKeyRef.current === key) return;
+    const nav = navRef.current;
+    if (!nav) return;
+    const row = Array.from(
+      nav.querySelectorAll<HTMLElement>("[data-task-id]"),
+    ).find((el) => el.dataset.taskId === activeId);
+    // 行还没渲染（刚建的对话等 upsert / 组折叠中）：不记 key，依赖变了再试
+    if (!row) return;
+    revealedKeyRef.current = key;
+    const navRect = nav.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const delta = scrollDeltaToReveal(navRect, rowRect);
+    if (delta !== 0) nav.scrollTop += delta;
+  }, [
+    open,
+    loaded,
+    activeId,
+    activeGroupKey,
+    sorted,
+    collapsedKeys,
+    expandedGroups,
+  ]);
+
   // 新建后即时插入列表 + 跳详情
   const handleCreated = (task: Task | TaskSummary) => {
     upsertTask(task);
@@ -435,12 +493,15 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
         const createPaths = repoPathsForGroupCreate(group);
         // 非置顶组默认只展 4 条
         const expanded = expandedGroups.has(group.key);
-        const limited =
-          !isPinned && !expanded && group.items.length > GROUP_VISIBLE_LIMIT;
-        const visibleItems = limited
-          ? group.items.slice(0, GROUP_VISIBLE_LIMIT)
-          : group.items;
-        const hiddenCount = group.items.length - visibleItems.length;
+        // 当前打开的对话即使排在第 4 条之后也要露出来（见 pickVisibleGroupItems）
+        const { visible: visibleItems, hiddenCount } = pickVisibleGroupItems(
+          group.items,
+          {
+            limit: isPinned ? Number.POSITIVE_INFINITY : GROUP_VISIBLE_LIMIT,
+            expanded,
+            activeId,
+          },
+        );
         return (
           <div key={group.key} className="flex flex-col gap-0.5">
             <div className="group/header flex w-full items-center gap-0.5 px-1 pt-1.5 pb-0.5">
@@ -481,21 +542,24 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
             {!collapsed && (
               <>
                 {visibleItems.map((t) => renderItem(t))}
-                {!isPinned && group.items.length > GROUP_VISIBLE_LIMIT && (
-                  <button
-                    type="button"
-                    onClick={() => toggleGroupExpanded(group.key)}
-                    aria-expanded={expanded}
-                    className="ml-6 flex w-fit items-center gap-1 px-1 py-1 text-left text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-                  >
-                    {expanded ? (
-                      <ChevronUp className="size-3 shrink-0" />
-                    ) : (
-                      <ChevronDown className="size-3 shrink-0" />
-                    )}
-                    {expanded ? "收起" : `展开其余 ${hiddenCount} 条`}
-                  </button>
-                )}
+                {/* 当前对话被露出后可能已无隐藏项（刚好超限 1 条）：此时没有可展开的，不渲染 */}
+                {!isPinned &&
+                  group.items.length > GROUP_VISIBLE_LIMIT &&
+                  (expanded || hiddenCount > 0) && (
+                    <button
+                      type="button"
+                      onClick={() => toggleGroupExpanded(group.key)}
+                      aria-expanded={expanded}
+                      className="ml-6 flex w-fit items-center gap-1 px-1 py-1 text-left text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      {expanded ? (
+                        <ChevronUp className="size-3 shrink-0" />
+                      ) : (
+                        <ChevronDown className="size-3 shrink-0" />
+                      )}
+                      {expanded ? "收起" : `展开其余 ${hiddenCount} 条`}
+                    </button>
+                  )}
               </>
             )}
           </div>
@@ -540,7 +604,10 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
         </div>
 
         {/* 列表滚动区 */}
-        <nav className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+        <nav
+          ref={navRef}
+          className="min-h-0 flex-1 overflow-y-auto px-2 pb-2"
+        >
           {!loaded ? (
             <LoadingState variant="inline" className="block px-3 py-2" />
           ) : empty ? (

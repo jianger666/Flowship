@@ -17,8 +17,14 @@ import {
 } from "@/lib/server/feishu-bridge/group-shared";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import { getTaskMeta } from "@/lib/server/task-fs";
+import {
+  fingerprintTaskQuestionBody,
+  TASK_INJECT_BUSY_CODE,
+  TASK_INJECT_PHASE_STOPPING,
+} from "@/lib/server/task-inject-shared";
 import type { TaskQuestionInjectOptions } from "@/lib/server/task-question-inject";
 import {
+  agentSessions,
   publishTaskStreamEvent,
   runningTasks,
   writeEventAndPublish,
@@ -42,8 +48,14 @@ export type TalkQueueStoredItem = {
   senderIsBot?: boolean;
   preview: string;
   createdAt: number;
-  /** 幂等键：app clientItemId / 群 message_id */
+  /** 幂等键：app clientItemId（群来源目前不传） */
   dedupeKey?: string;
+  /**
+   * 入队时正文的指纹（与空闲直送的去重 key 同口径，见 task-inject-shared）。只在带 dedupeKey 时记。
+   * 去重 = dedupeKey 与指纹**都**相同：同 id 不同正文是另一条消息、不能被当重复吞掉（K2-04）；
+   * 直送成功后也据此摘掉同一条（K2-05）。
+   */
+  bodyFingerprint?: string;
 };
 
 type TalkQueueGlobalState = {
@@ -130,14 +142,41 @@ const ensureDrainTimer = (taskId: string): void => {
   st.drainTimers.set(taskId, timer);
 };
 
-const isBusy409 = async (res: Response): Promise<boolean> => {
-  if (res.status !== 409) return false;
+/**
+ * stop 的清队语义里**被清掉**的来源——与 stop-task.ts 的 `clearTalkQueue(id, { onlySources: ["app"] })`
+ * 同口径（改一边必须改另一边；真实 stop 的行为由 tests/talk-queue-clear-callsites.test.ts 守住）。
+ * 群来源（group_owner / group_reply）保留、空闲后照常送达。
+ */
+const STOP_CLEARED_SOURCES: readonly TalkQueueOwnedSource[] = ["app"];
+
+/**
+ * 重放得到的 409 分三类：
+ * - `busy`：还忙 / 会自己恢复 → 放回队首等下一轮；
+ * - `stopping`：任务**正在停止**（stop 收尾窗口，也是会自己恢复的一类，第八轮 L3-02）→ 放回还是丢弃
+ *   看来源（见 drainOnce）；
+ * - `other`：别的原因 → 丢弃并写 info。
+ *
+ * 认**结构化标记**（`code: "task_busy"`，注入链给会自己恢复的 409 打；停止中另带 `phase: "stopping"`）——
+ * 文案是给人看的、会改，判忙不能靠它：此前只认「正在跑 / 等它说完」子串，在途等待超时的「还在处理中」
+ * 认不出，被当非忙丢弃（第七轮 K2-03）。**文案子串仍保留作兜底**（老调用方 / 测试替身只回文案、不带 code
+ * 时仍认得；只认「正在跑 / 等它说完」，**不**认「正在停止」——停止中靠 phase 标记）。
+ */
+type ReplayConflict = "busy" | "stopping" | "other";
+const classifyReplayConflict = async (res: Response): Promise<ReplayConflict> => {
+  if (res.status !== 409) return "other";
   try {
-    const data = (await res.clone().json()) as { error?: unknown };
+    const data = (await res.clone().json()) as {
+      error?: unknown;
+      code?: unknown;
+      phase?: unknown;
+    };
+    if (data.code === TASK_INJECT_BUSY_CODE) {
+      return data.phase === TASK_INJECT_PHASE_STOPPING ? "stopping" : "busy";
+    }
     const msg = typeof data.error === "string" ? data.error : "";
-    return msg.includes("正在跑") || msg.includes("等它说完");
+    return msg.includes("正在跑") || msg.includes("等它说完") ? "busy" : "other";
   } catch {
-    return false;
+    return "other";
   }
 };
 
@@ -208,6 +247,20 @@ const drainOnce = async (taskId: string): Promise<void> => {
   publishSnapshot(taskId);
 
   try {
+    // 托办回执（group_reply）入队时只在「活会话在场」才被当数据喂回会话——群侧的承诺是
+    // 会话不在就不自动唤醒、不拉起全权限 agent（见 group-route 文件头）。可它是在 agent
+    // 正跑时入的队、到这里已隔了一整轮：典型是用户点了停止（会话被关、action 标 cancelled，
+    // 群来源按设计保留），此时注入链会走唤醒分支，外部机器人的回执就把刚停下的 agent 叫醒了。
+    // 所以重放前必须再判一次会话；不在就丢弃并写 info（不静默，属主能在事件流看到去向）。
+    // 只管 group_reply：属主本人的话（app / group_owner）本来就允许在空闲时唤醒。
+    if (item.source === "group_reply" && !agentSessions.has(taskId)) {
+      await discardWithInfo(
+        taskId,
+        "会话已断开，托办回执不会自动唤醒 agent",
+        item.preview,
+      );
+      return;
+    }
     const { handleTaskQuestionInject } = await import(
       "@/lib/server/task-question-inject"
     );
@@ -227,8 +280,20 @@ const drainOnce = async (taskId: string): Promise<void> => {
       replayOptions,
     );
     if (res.ok || res.status === 202) return;
-    if (await isBusy409(res)) {
-      // 仍在跑（竞态）：放回队首等下一轮，保持 FIFO
+    const conflict = await classifyReplayConflict(res);
+    if (conflict === "stopping" && STOP_CLEARED_SOURCES.includes(item.source)) {
+      // 重放恰好落在 stop 收尾窗口：这一条早被 shift 出队，stop 的清队（在 await 之后才跑）清不到它。
+      // stop 要清的来源（app）在这里等价地丢掉——放回队首的话，stop 结束后会被重放成一次用户点了停止
+      // 之后的意外新 run。群来源（stop 保留的）走下面的放回，stop 结束后照常送达。写 info 不静默。
+      await discardWithInfo(
+        taskId,
+        "任务被停止，输入条排的队已按停止清除",
+        item.preview,
+      );
+      return;
+    }
+    if (conflict !== "other") {
+      // 仍在跑 / 正在停止的群来源（竞态）：放回队首等下一轮，保持 FIFO
       putBackToHead(taskId, item);
       return;
     }
@@ -289,14 +354,19 @@ export type EnqueueTalkMessageInput = {
 
 export type EnqueueTalkMessageResult =
   | { ok: true; itemId: string; position: number; duplicate?: true }
-  | { ok: false; reason: "full" };
+  | { ok: false; reason: "full" | "closing" };
 
-/** 入队；满队返回 reason=full */
+/** 入队；满队返回 reason=full，任务正在停止 / 删除 / 终结返回 reason=closing */
 export const enqueueTalkMessage = (
   taskId: string,
   input: EnqueueTalkMessageInput,
 ): EnqueueTalkMessageResult => {
   if (!taskId) return { ok: false, reason: "full" };
+  // 调用方（task-question-inject）入口查过一次 lifecycle，可到入队之间还隔着读尾部事件的
+  // await：这段时间里 stop / DELETE / finalize 的清队调用可能已经跑完，晚到的在途请求
+  // 再入队就会把用户刚取消的输入条复活，或给已删 / 已终结的任务留下带启动凭据的条目。
+  // 入队这一刻同步复查是本模块唯一能做的一道闸；opGen 要调用方传进来才判得了。
+  if (getChatLifecycle(taskId) !== null) return { ok: false, reason: "closing" };
   const st = getState();
   let q = st.queues.get(taskId);
   if (!q) {
@@ -305,8 +375,16 @@ export const enqueueTalkMessage = (
   }
 
   const dedupeKey = input.clientItemId?.trim() || undefined;
+  // 去重 = id 与正文指纹都相同（与空闲直送的去重 key 同口径）：只比 id 的话，同 id 带新正文的
+  // 一条会被当「重复」静默吞掉——回 202 成功、队里留的却是旧正文，用户的新内容凭空消失（K2-04）。
+  // 客户端正常只在内容一致时复用 id（talk-send-attempt），所以这条只防异常 / 旧客户端 / 恶意。
+  const bodyFingerprint = dedupeKey
+    ? fingerprintTaskQuestionBody(input.rawBody)
+    : undefined;
   if (dedupeKey) {
-    const idx = q.findIndex((e) => e.dedupeKey === dedupeKey);
+    const idx = q.findIndex(
+      (e) => e.dedupeKey === dedupeKey && e.bodyFingerprint === bodyFingerprint,
+    );
     if (idx >= 0) {
       publishSnapshot(taskId);
       return {
@@ -334,7 +412,7 @@ export const enqueueTalkMessage = (
     ...(input.senderIsBot ? { senderIsBot: true } : {}),
     preview: input.preview?.trim() || previewFromBody(input.rawBody),
     createdAt: Date.now(),
-    ...(dedupeKey ? { dedupeKey } : {}),
+    ...(dedupeKey && bodyFingerprint ? { dedupeKey, bodyFingerprint } : {}),
   };
   q.push(item);
   ensureDrainTimer(taskId);
@@ -386,6 +464,37 @@ export const removeTalkQueueItems = (
     publishSnapshot(taskId);
     stopDrainTimerIfIdle(taskId);
   }
+  return removed;
+};
+
+/**
+ * 摘掉队列里与 (clientItemId, 正文指纹) 都相同的条目（同步、无 await）。返回摘掉几条。
+ *
+ * 为什么要有（K2-05）：同一条消息先排了队（202，响应丢了），客户端用同一个 id 重发、恰好 agent 已空闲
+ * → 直送成功。直送登记的「已送达」只留 2 分钟，而队列项能躺 30 分钟：直送起的新 run 把 drain 挡住
+ * 超过 2 分钟后，队列项重放时已送达表早已过期、查不到，同一句话就第二次注入。所以直送 200 的那一刻
+ * 就把队里同一条摘掉——不靠「已送达表还没过期」这个会过期的前提。
+ *
+ * 指纹也要相同：同 id 不同正文是另一条消息（K2-04），它没送达过，不能被顺手摘掉。
+ * 不碰 group_question（群模块自己的队列，不带 clientItemId）。
+ */
+export const removeTalkQueueItemsByDedupe = (
+  taskId: string,
+  clientItemId: string,
+  bodyFingerprint: string,
+): number => {
+  const st = getState();
+  const q = st.queues.get(taskId);
+  if (!q || q.length === 0) return 0;
+  const keep = q.filter(
+    (e) => !(e.dedupeKey === clientItemId && e.bodyFingerprint === bodyFingerprint),
+  );
+  const removed = q.length - keep.length;
+  if (removed === 0) return 0;
+  if (keep.length === 0) st.queues.delete(taskId);
+  else st.queues.set(taskId, keep);
+  publishSnapshot(taskId);
+  stopDrainTimerIfIdle(taskId);
   return removed;
 };
 

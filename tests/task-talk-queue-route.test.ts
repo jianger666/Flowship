@@ -13,9 +13,10 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-talk-q-route-"));
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
-const mockInject = vi.fn(
-  async (..._args: unknown[]) =>
-    new Response(JSON.stringify({ ok: true }), { status: 200 }),
+// 显式给 mock 签名：下面要读 mock.calls[n][2]（第三参 = 透传的 options），
+// 实现体不用入参，写成 `(..._args)` 会触发 no-unused-vars warning
+const mockInject = vi.fn<(...args: unknown[]) => Promise<Response>>(
+  async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
 );
 vi.mock("@/lib/server/task-question-inject", () => ({
   handleTaskQuestionInject: (...args: unknown[]) => mockInject(...args),

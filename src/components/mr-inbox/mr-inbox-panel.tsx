@@ -28,7 +28,7 @@ import {
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
-import { Tooltip } from "@/components/ui/tooltip";
+import { OverflowTooltip, Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -53,6 +53,10 @@ import {
 } from "@/lib/fix-bug-advance";
 import { getSettings } from "@/lib/local-store";
 import {
+  describeIgnoredEntry,
+  type IgnoredEntry,
+} from "@/lib/mr-inbox-ignored-meta";
+import {
   buildStoryUrlFromBug,
   inboxGroupsVisibleForRole,
   type InboxGroupId,
@@ -60,6 +64,7 @@ import {
 } from "@/lib/mr-inbox";
 import { formatRelative } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
+import { resolveTaskLookup } from "@/lib/workitem-link";
 
 interface MrInboxPanelProps {
   /** 只显示指定工作项的待测 MR（任务详情提醒条） */
@@ -193,27 +198,142 @@ const IgnoreButton = ({ onIgnore }: { onIgnore: () => void }) => (
   </Button>
 );
 
-/** 三组行共用：确认 → ignoreItem → toast */
+/** 三组行共用：确认 → ignoreItem → toast（带「撤销」，S13-19：忽略不再是无法恢复的永久操作） */
 const useIgnoreHandler = (url: string) => {
-  const { ignoreItem } = useMrInbox();
+  const { ignoreItem, restoreIgnored } = useMrInbox();
   const { confirm } = useDialog();
   return async () => {
     const ok = await confirm({
       title: "忽略此条？",
-      description: "忽略后不再出现在收件箱。",
+      description: "忽略后不再出现在收件箱（可在面板底部「已忽略」里恢复）。",
       destructive: true,
       confirmLabel: "忽略",
     });
     if (!ok) return;
     try {
-      await ignoreItem(url);
-      toast.success("已忽略");
+      const snapshot = await ignoreItem(url);
+      toast.success("已忽略", {
+        // 限时撤销入口；常驻恢复入口见面板底部「已忽略」
+        duration: 8000,
+        action: {
+          label: "撤销",
+          onClick: () => {
+            void restoreIgnored(snapshot)
+              .then(() => toast.success("已撤销忽略"))
+              .catch((err) =>
+                toast.error(
+                  `撤销失败：${err instanceof Error ? err.message : String(err)}`,
+                ),
+              );
+          },
+        },
+      });
     } catch (err) {
       toast.error(
         `忽略失败：${err instanceof Error ? err.message : String(err)}`,
       );
     }
   };
+};
+
+/**
+ * 常驻「已忽略(N)」入口：折叠区块，列出已忽略条目 + 「恢复」（复用 restoreIgnored → DELETE /ignore）。
+ * 旧数据没存标题时回落显示 url。数据来自 GET /api/mr-inbox/ignore，忽略 / 恢复后按 ignoredRev 重拉。
+ */
+const IgnoredSection = () => {
+  const { restoreIgnored, ignoredRev } = useMrInbox();
+  const [items, setItems] = useState<IgnoredEntry[]>([]);
+  const [open, setOpen] = useState(false);
+  const [restoringUrl, setRestoringUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/mr-inbox/ignore");
+        if (!res.ok) return;
+        const body = (await res.json()) as { items?: IgnoredEntry[] };
+        if (!cancelled && Array.isArray(body.items)) setItems(body.items);
+      } catch {
+        // 列表只是辅助入口、拉不到就当没有
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ignoredRev]);
+
+  if (items.length === 0) return null;
+
+  const handleRestore = async (url: string) => {
+    setRestoringUrl(url);
+    try {
+      await restoreIgnored({ url });
+      toast.success("已恢复");
+    } catch (err) {
+      toast.error(
+        `恢复失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setRestoringUrl(null);
+    }
+  };
+
+  return (
+    <section className="flex flex-col border-t pt-1">
+      <button
+        type="button"
+        className="flex w-full cursor-pointer items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <EyeOff className="size-3.5" />
+        已忽略
+        <span className="font-normal tabular-nums">({items.length})</span>
+        <ChevronDown
+          className={cn("ml-auto size-3.5 transition-transform", open && "rotate-180")}
+        />
+      </button>
+      {open && (
+        <ul className="px-1">
+          {items.map((it) => {
+            const { title, sub } = describeIgnoredEntry(it);
+            return (
+              <li
+                key={it.url}
+                className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted/50"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex text-xs">
+                    <OverflowTooltip text={title} />
+                  </div>
+                  {sub && (
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      {sub}
+                    </div>
+                  )}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+                  disabled={restoringUrl !== null}
+                  onClick={() => void handleRestore(it.url)}
+                >
+                  {restoringUrl === it.url ? (
+                    <RefreshCw className="size-3 animate-spin" />
+                  ) : (
+                    <Undo2 className="size-3" />
+                  )}
+                  恢复
+                </Button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
 };
 
 const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
@@ -357,7 +477,7 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
  */
 const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
   const { setSeen, listBugTransitions, transitionBug } = useMrInbox();
-  const { tasks } = useTaskList();
+  const { tasks, loaded: tasksLoaded } = useTaskList();
   const { confirm } = useDialog();
   const router = useRouter();
   const handleIgnore = useIgnoreHandler(entry.bugUrl);
@@ -426,6 +546,12 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
             extractFeishuStoryId(t.feishuStoryUrl) === storyId,
         )
       : undefined;
+    // 任务列表首次加载完成前 tasks 是空的、hit 必然为空：此时不能当「没有对应任务」去引导新建
+    // （会为已有任务重复建一个）。没有 storyId 时本来就没法匹配，与列表是否就绪无关
+    if (storyId && resolveTaskLookup(tasksLoaded, hit) === "pending") {
+      toast.info("任务列表还在加载，稍等一下再点");
+      return;
+    }
     if (!hit) {
       // 死路打通（2026-07-14）：原来只 toast「找不到对应任务」就没下文了——
       // 线上 bug 的 story 任务早已合并归档、这是常态而非异常。改为引导新建改bug任务。
@@ -860,7 +986,7 @@ export const MrInboxPanel = ({
   filterWorkItemId,
   className,
 }: MrInboxPanelProps) => {
-  const { data, refreshing, refresh, markAllSeen } = useMrInbox();
+  const { data, refreshing, scanError, refresh, markAllSeen } = useMrInbox();
   // 「全部已读」请求进行中（按钮 disabled + 转圈、防双击）
   const [markingAll, setMarkingAll] = useState(false);
 
@@ -974,6 +1100,24 @@ export const MrInboxPanel = ({
         </div>
       </div>
 
+      {/* S13-05：扫描失败时保留上一次成功的列表，只在列表上方挂错误条 */}
+      {data?.status === "ok" && scanError && (
+        <div
+          role="status"
+          className="mx-3 mb-2 rounded-md bg-warning/10 px-2.5 py-1.5 text-xs text-warning"
+        >
+          最近一次扫描失败（下方为上次结果）：{scanError}——
+          <button
+            type="button"
+            className="cursor-pointer underline hover:text-foreground"
+            onClick={() => void refresh({ force: true })}
+            disabled={refreshing}
+          >
+            重试
+          </button>
+        </div>
+      )}
+
       {data?.status === "ok" && data.gitTokenConfigured === false && showMr && (
         <div className="mx-3 mb-2 rounded-md bg-muted/60 px-2.5 py-1.5 text-xs text-muted-foreground">
           未配置 GitLab Token、仅展示 MR 链接——
@@ -1064,6 +1208,8 @@ export const MrInboxPanel = ({
               ))}
             </GroupSection>
           )}
+          {/* 完整面板才出；任务详情条（filter 模式）不占位 */}
+          {isFullPanel && <IgnoredSection />}
         </div>
       )}
     </div>

@@ -19,6 +19,7 @@ import type { BoardItem } from "@/components/feishu/feishu-board";
 import { Button } from "@/components/ui/button";
 import { DateRangePicker, type DayRange } from "@/components/ui/date-range-picker";
 import { Tooltip } from "@/components/ui/tooltip";
+import { useTodayStart } from "@/hooks/use-today-start";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -61,11 +62,8 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
   // 窗口天数（含首尾）
   const span = Math.max(1, Math.round((range.to - range.from) / DAY_MS) + 1);
 
-  const today0 = useMemo(() => {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d.getTime();
-  }, []);
+  // 今天 0 点：过零点自动更新（原来 useMemo([]) 只在挂载时算一次，页面开过夜今天线就停在昨天）
+  const today0 = useTodayStart();
   const todayIdx = Math.floor((today0 - windowStart) / DAY_MS);
   const todayVisible = todayIdx >= 0 && todayIdx < span;
 

@@ -661,19 +661,8 @@ const groupVerbRuns = (items: StreamRenderItem[]): StreamRenderItem[] => {
   return out;
 };
 
-/** unified diff 统计 +N/-M */
-export const countDiffStats = (
-  diff: string,
-): { added: number; removed: number } => {
-  let added = 0;
-  let removed = 0;
-  for (const line of diff.split("\n")) {
-    if (line.startsWith("+++") || line.startsWith("---")) continue;
-    if (line.startsWith("+")) added += 1;
-    else if (line.startsWith("-")) removed += 1;
-  }
-  return { added, removed };
-};
+/** unified diff 的逐行分类（见 walkUnifiedDiff） */
+type DiffLineKind = "header" | "hunk" | "add" | "del" | "context";
 
 /**
  * 干净 diff 视图的一行（对齐 Cursor IDE：双列行号 + 无文件头/@@ 原文）。
@@ -690,7 +679,96 @@ export type DiffViewLine = {
 };
 
 /** @@ -a,b +c,d @@ … —— 后面函数上下文忽略；b/d 可省略（默认 1） */
-const HUNK_HEADER_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+/**
+ * unified diff 逐行分类的唯一实现（countDiffStats / parseUnifiedDiff 共用，口径不会漂移）。
+ *
+ * 难点：文件头 `--- a/f` / `+++ b/f` 与「内容行」前缀撞车——被删的 `-- sql 注释`、markdown 的 `---`
+ * 分隔线、被加的 `++i;` 在 diff 里分别是 `--- sql 注释` / `----` / `+++i;`，
+ * 若一见 `---`/`+++` 前缀就当文件头跳过，这些真实增删行会被漏数、从视图里消失、后续行号还错位。
+ * 所以**只在 hunk 正文之外**才认文件头：靠 `@@ -a,b +c,d @@` 的行数计数知道正文何时结束；
+ * 计数对不上（截断 / 无 hunk 头）时，再用「`--- ` 后紧跟 `+++ ` 再跟 `@@`」的三行模式兜底识别下一个文件的头。
+ * `diff --git` / `index ` 不带 +/-/空格前缀，任何位置都无歧义。
+ *
+ * visit 的第三个参数仅 hunk 行有值（合法 @@ 的正则匹配，残缺 @@ 为 null）。
+ */
+const walkUnifiedDiff = (
+  diff: string,
+  visit: (
+    kind: DiffLineKind,
+    raw: string,
+    hunk: RegExpMatchArray | null,
+  ) => void,
+): void => {
+  const rows = diff.split("\n");
+  // 当前 hunk 正文还剩多少旧 / 新行没读（都为 0 = 不在 hunk 正文里）
+  let oldRemain = 0;
+  let newRemain = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const raw = rows[i];
+
+    // 文件头 / git 元信息：文件名已在 UI 标题展示，这里纯重复 → 跳过
+    if (raw.startsWith("diff --git") || raw.startsWith("index ")) {
+      oldRemain = 0;
+      newRemain = 0;
+      visit("header", raw, null);
+      continue;
+    }
+    if (raw.startsWith("--- ") || raw.startsWith("+++ ")) {
+      const inBody = oldRemain > 0 || newRemain > 0;
+      const nextFileHeader =
+        raw.startsWith("--- ") &&
+        !!rows[i + 1]?.startsWith("+++ ") &&
+        !!rows[i + 2]?.startsWith("@@");
+      if (!inBody || nextFileHeader) {
+        oldRemain = 0;
+        newRemain = 0;
+        visit("header", raw, null);
+        continue;
+      }
+      // 在 hunk 正文里 → 它就是被删 / 被加的内容行，落到下面的 +/- 分支
+    }
+
+    if (raw.startsWith("@@")) {
+      const m = raw.match(HUNK_HEADER_RE);
+      // 行数省略 = 1；残缺 @@ → 不认正文计数
+      oldRemain = m ? (m[2] === undefined ? 1 : Number(m[2])) : 0;
+      newRemain = m ? (m[4] === undefined ? 1 : Number(m[4])) : 0;
+      visit("hunk", raw, m);
+      continue;
+    }
+
+    if (raw.startsWith("+")) {
+      newRemain = Math.max(0, newRemain - 1);
+      visit("add", raw, null);
+    } else if (raw.startsWith("-")) {
+      oldRemain = Math.max(0, oldRemain - 1);
+      visit("del", raw, null);
+    } else {
+      // 合法上下文以空格开头（空串 = 被编辑器剥了尾空格的空上下文行）；其余（\ No newline…）不计数
+      if (raw.startsWith(" ") || raw === "") {
+        oldRemain = Math.max(0, oldRemain - 1);
+        newRemain = Math.max(0, newRemain - 1);
+      }
+      visit("context", raw, null);
+    }
+  }
+};
+
+/** unified diff 统计 +N/-M */
+export const countDiffStats = (
+  diff: string,
+): { added: number; removed: number } => {
+  let added = 0;
+  let removed = 0;
+  walkUnifiedDiff(diff, (kind) => {
+    if (kind === "add") added += 1;
+    else if (kind === "del") removed += 1;
+  });
+  return { added, removed };
+};
 
 /**
  * 把 SDK unified diff 解析成可渲染行：剥文件头、递推行号、hunk 只留分隔标记。
@@ -704,68 +782,59 @@ export const parseUnifiedDiff = (diff: string): DiffViewLine[] => {
   let oldLine: number | undefined;
   let newLine: number | undefined;
 
-  for (const raw of diff.split("\n")) {
-    // 文件头 / git 元信息：文件名已在 UI 标题展示，这里纯重复 → 跳过
-    if (
-      raw.startsWith("--- ") ||
-      raw.startsWith("+++ ") ||
-      raw.startsWith("diff --git") ||
-      raw.startsWith("index ")
-    ) {
-      continue;
-    }
-
-    if (raw.startsWith("@@")) {
-      const m = raw.match(HUNK_HEADER_RE);
-      if (m) {
-        oldLine = Number(m[1]);
-        newLine = Number(m[2]);
-      } else {
-        // 残缺 @@（截断尾部常见）→ 后续变更行不再瞎编行号
-        oldLine = undefined;
-        newLine = undefined;
+  walkUnifiedDiff(diff, (kind, raw, hunk) => {
+    switch (kind) {
+      case "header":
+        return;
+      case "hunk":
+        if (hunk) {
+          oldLine = Number(hunk[1]);
+          newLine = Number(hunk[3]);
+        } else {
+          // 残缺 @@（截断尾部常见）→ 后续变更行不再瞎编行号
+          oldLine = undefined;
+          newLine = undefined;
+        }
+        out.push({ kind: "hunk", text: "" });
+        return;
+      case "add": {
+        const entry: DiffViewLine = { kind: "add", text: raw.slice(1) };
+        if (newLine !== undefined) {
+          entry.newLine = newLine;
+          newLine += 1;
+        }
+        out.push(entry);
+        return;
       }
-      out.push({ kind: "hunk", text: "" });
-      continue;
-    }
-
-    if (raw.startsWith("+")) {
-      const entry: DiffViewLine = { kind: "add", text: raw.slice(1) };
-      if (newLine !== undefined) {
-        entry.newLine = newLine;
-        newLine += 1;
+      case "del": {
+        const entry: DiffViewLine = { kind: "del", text: raw.slice(1) };
+        if (oldLine !== undefined) {
+          entry.oldLine = oldLine;
+          oldLine += 1;
+        }
+        out.push(entry);
+        return;
       }
-      out.push(entry);
-      continue;
-    }
-
-    if (raw.startsWith("-")) {
-      const entry: DiffViewLine = { kind: "del", text: raw.slice(1) };
-      if (oldLine !== undefined) {
-        entry.oldLine = oldLine;
-        oldLine += 1;
+      case "context": {
+        // 合法上下文以空格开头；其余（\ No newline…、截断残行等）当非法 → 行号缺省、不递推
+        if (raw.startsWith(" ")) {
+          const entry: DiffViewLine = { kind: "context", text: raw.slice(1) };
+          if (oldLine !== undefined) {
+            entry.oldLine = oldLine;
+            oldLine += 1;
+          }
+          if (newLine !== undefined) {
+            entry.newLine = newLine;
+            newLine += 1;
+          }
+          out.push(entry);
+          return;
+        }
+        out.push({ kind: "context", text: raw });
+        return;
       }
-      out.push(entry);
-      continue;
     }
-
-    // 合法上下文以空格开头；其余（\ No newline…、截断残行等）当非法 → 行号缺省、不递推
-    if (raw.startsWith(" ")) {
-      const entry: DiffViewLine = { kind: "context", text: raw.slice(1) };
-      if (oldLine !== undefined) {
-        entry.oldLine = oldLine;
-        oldLine += 1;
-      }
-      if (newLine !== undefined) {
-        entry.newLine = newLine;
-        newLine += 1;
-      }
-      out.push(entry);
-      continue;
-    }
-
-    out.push({ kind: "context", text: raw });
-  }
+  });
 
   return out;
 };

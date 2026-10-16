@@ -43,6 +43,7 @@ import { useTaskList } from "@/hooks/use-task-list";
 import { isModCombo } from "@/lib/keyboard-shortcuts";
 import type { TaskMode } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { isImeComposing } from "@/lib/ime";
 
 const DEBOUNCE_MS = 300;
 
@@ -302,7 +303,7 @@ export const SearchDialog = ({
   };
 
   const onListKeyDown = (e: KeyboardEvent<HTMLElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    if (isImeComposing(e)) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setActiveIndex((i) => {

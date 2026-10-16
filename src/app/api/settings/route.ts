@@ -8,11 +8,14 @@
  */
 import { NextResponse } from "next/server";
 
+import { syncGitTokenEnv } from "@/lib/server/git-token-env";
+import { pinTrustedGitHostFromSettings } from "@/lib/server/gitlab-host";
 import { errorResponse } from "@/lib/server/route-helpers";
 import { invalidateMrInboxCache } from "@/lib/server/mr-inbox-scanner";
 import {
   maskSettingsSecrets,
   putSettingsFile,
+  validateSettingsPayload,
 } from "@/lib/server/settings-fs";
 import { DEFAULT_MEEGLE_PROJECT } from "@/lib/types";
 
@@ -26,6 +29,11 @@ export const runtime = "nodejs";
  * CR-08：读改写串行化在 settings-fs.putSettingsFile（globalThis 写链）——
  * 两个快速 PUT 不会乱序互相覆盖。
  * 读失败（error）拒绝写入，避免用客户端缓存覆盖损坏但可能可修复的原文件。
+ * F6-02 / 第六轮：请求体必须是「完整配置对象」——同时带 apiKey（字符串）/ defaultModel（对象）/ repos（数组），
+ * 缺任一或类型不对 → 400（见 validateSettingsPayload；清 key 是「完整对象 + apiKey 置空串」）。
+ * 覆盖写之前 putSettingsFile 会把当前可解析的配置备份成 config.json.bak；若这次写会清空「凭据与列表类」配置
+ * （apiKey / gitToken / repos / mcpServers / customProviders 的 key / companyEnv 子系统；开关、星标等偏好不算，见 shrunkSettingsKeys），
+ * 还会先把收缩前的完整配置留成 config.json.bak.shrink（只被下一次收缩写覆盖、普通保存不碰）。
  */
 
 /** 从 settings 对象抠 meegleProject.key（缺 / 坏 → 默认悟空 key） */
@@ -44,8 +52,10 @@ export const PUT = async (req: Request): Promise<Response> => {
   } catch {
     return errorResponse("无效的请求体", 400);
   }
-  if (!body || typeof body !== "object") {
-    return errorResponse("配置必须是对象", 400);
+  // 只认「完整配置对象」：整对象覆盖语义下，`{}` / `{ repos: [] }` 这类残缺体会清空配置、`[]` 会写坏配置文件
+  const invalid = validateSettingsPayload(body);
+  if (invalid) {
+    return errorResponse(invalid, 400);
   }
   try {
     // RMW 整段在 settings-fs 写链内（审查：锁只包 write 锁不住 route 侧合并）
@@ -55,9 +65,30 @@ export const PUT = async (req: Request): Promise<Response> => {
         "[/api/settings] PUT 拒绝：config.json 不可读:",
         result.reason,
       );
-      return errorResponse("settings_unreadable", 500);
+      // reason 不含文件内容（见 readSettingsFile），设置页据此给出明确提示、且不再自动重试
+      return NextResponse.json(
+        { error: "settings_unreadable", reason: result.reason },
+        { status: 500 },
+      );
     }
     const { settings: guarded, previous } = result;
+    // GitLab token 同步进 process.env（agent shell 靠 $FLOWSHIP_GITLAB_TOKEN 取，见 git-token-env.ts）：
+    // 每次保存都同步（改了 / 清空都立即生效，新起的 shell 就是新值）；用 guarded（掩码兜底后的盘上真值）、
+    // 不能用 body——body 里可能是脱敏展示串。同步操作、失败不会挡保存。
+    syncGitTokenEnv(guarded.gitToken);
+    // 可信时机：用户刚改完 token / 仓库，是纯用户动作、没有 agent 介入——把仓库 origin 推出的
+    // GitLab host 固定为 PAT 的可信目的地（首次绑定；已固定 / 配了白名单则不动）。
+    // 有 token 才固定；失败只 warn、绝不挡保存（pinTrustedGitHostFromSettings 本身不抛，这里再兜一层）。
+    if (typeof guarded.gitToken === "string" && guarded.gitToken.trim()) {
+      try {
+        await pinTrustedGitHostFromSettings(guarded, "settings");
+      } catch (err) {
+        console.warn(
+          "[/api/settings] 固定可信 GitLab host 失败（配置已保存）:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
     // 默认空间 key 变了 → 收件箱缓存作废（否则仍显示旧空间扫到的条目）
     const oldKey = meegleProjectKeyOf(previous?.meegleProject);
     const newKey = meegleProjectKeyOf(guarded.meegleProject);

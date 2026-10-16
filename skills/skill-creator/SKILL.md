@@ -10,9 +10,17 @@ name + description 索引、场景匹配时才读全文——所以 **descriptio
 
 ## 写到哪（按顺序判定）
 
-1. 环境变量 `FE_AI_FLOW_DATA_DIR` 存在 → 写到 `$FE_AI_FLOW_DATA_DIR/skills/<skill名>/`
-2. 当前工作目录本身就叫 `skills`（「AI 帮建」入口开的对话）→ 直接在当前目录下建 `<skill名>/`
-3. 都不满足 → 先 `echo $FE_AI_FLOW_DATA_DIR` 确认、再问用户
+**不要只依赖环境变量**：部分 provider（如 pi）的 agent shell 会故意剥掉 `FLOWSHIP_DATA_DIR`，此时它为空。
+
+1. **prompt 里的「自管 skill 目录」行**：可用 skill 清单段首有一行 `自管 skill 目录……：<绝对路径>/skills/<skill名>/SKILL.md`，直接按它写到 `<该绝对路径的 skills/ 目录>/<skill名>/`（最可靠）
+2. 环境变量 `FLOWSHIP_DATA_DIR` 非空 → 写到 `$FLOWSHIP_DATA_DIR/skills/<skill名>/`
+3. 当前工作目录本身就叫 `skills`（「AI 帮建」入口开的对话）→ 直接在当前目录下建 `<skill名>/`
+4. 从 prompt 里出现的数据目录路径上溯（如 `…/data/tasks/<任务id>/…`、`…/data/config.json` → 取 `…/data/`），再拼 `skills/<skill名>/`
+5. 以上都拿不到 → 默认数据目录兜底（先 `ls` 确认存在再用，正式包为 `fe-ai-flow`、测试包 / `pnpm dev:web` 为 `fe-ai-flow-test`）：
+   - macOS：`~/Library/Application Support/fe-ai-flow/data/skills/`
+   - Windows：`%APPDATA%\fe-ai-flow\data\skills\`
+   - Linux：`~/.config/fe-ai-flow/data/skills/`
+   存在多个候选或拿不准就问用户，不要猜着写。
 
 ⚠️ 不要写到 `~/.cursor/skills/`（那是 Cursor IDE 的目录、本平台已独立管理自己的 skill）。
 

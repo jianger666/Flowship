@@ -41,6 +41,9 @@
  *   全收不到（实测：ask 弹窗答完永远卡「提交中」）。现在只有 done 里的 task 是业务终态
  *   （merged / abandoned、服务端也只在这种情况关流）才停止订阅、其余照常保持 / 重连。
  * - 已 hydrate watcher 的 404→deleted；503 unavailable 持续重试（不终止）。
+ * - **重试预算耗尽不再静默停更**：连续 6 次建连失败（约 22s 退避）后进入「休眠待重连」——
+ *   提示一次（带 resume 句柄供「重连」按钮）、之后靠 online / 页面回可见 / 60s 兜底（仅可见且在线）
+ *   自动重连，唤醒后预算清零；页面隐藏时不重试。
  */
 
 import { useEffect, useRef } from "react";
@@ -58,6 +61,13 @@ import {
   resolveWatchReconnectPolicy,
   WATCH_CLEAN_RECONNECT_DELAY_MS,
 } from "@/lib/task-terminal";
+import {
+  applyReconnectDecision,
+  createDormantWaiter,
+  freshWatchBudget,
+  stepDormantNotice,
+  withBootstrapNotice,
+} from "@/lib/watch-reconnect";
 import type { ThinkingSnapshot } from "@/lib/thinking-live";
 import type { TalkQueueItem } from "@/lib/talk-queue";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
@@ -67,6 +77,8 @@ export {
   resolveWatchCleanEof,
   resolveWatchReconnectPolicy,
   WATCH_CLEAN_RECONNECT_DELAY_MS,
+  WATCH_DORMANT_RETRY_INTERVAL_MS,
+  shouldResumeWatch,
   WATCH_MAX_TRANSIENT_FAILURES,
   WATCH_UNAVAILABLE_BACKOFF_CAP_MS,
 } from "@/lib/task-terminal";
@@ -95,7 +107,20 @@ export interface UseTaskWatchCallbacks {
   onErrorMessage?: (message: string) => void;
   // watchTaskStream 自己 throw 出来的异常（HTTP 4xx / 网络断 / 解析错）
   // AbortError 已被 hook 内部吞掉、不会触发这个回调
-  onWatchException?: (err: Error) => void;
+  // resume 仅在「重试预算耗尽、已进入休眠」时给：调用方可在提示里挂「重连」按钮，点了立即重连
+  // （不点也会在网络恢复 / 页面回到前台 / 低频兜底时自动重连，不会静默停更）
+  onWatchException?: (err: Error, resume?: () => void) => void;
+  /**
+   * 休眠待重连结束：连接重新建立（自动 / 手动唤醒成功），或 hook 卸载 / 切换任务时回调。
+   * 调用方在这里撤掉 onWatchException 里挂的常驻「重连」提示。没休眠过不回调。
+   * taskId 取自 hook 内闭包（切换任务的 cleanup 里 callbacksRef 已指向新 render，别在回调里读当前 task）。
+   */
+  onWatchDormantEnd?: (taskId: string) => void;
+  /**
+   * 每个连接的第一帧 task 快照（= 服务端 bootstrap，权威）。重连 / 休眠唤醒后同样会来，
+   * 调用方用它校准「只靠 done 事件释放」的本地 latch（见 reconcileRunActive）。
+   */
+  onBootstrapSnapshot?: (t: Task) => void;
   /** queue_failed 控制帧 → 按 itemIds 清 / 标错 pending */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
   /** bootstrap queue_state + operationSnapshot */
@@ -169,19 +194,47 @@ export const useTaskWatch = (
         }, ms);
       });
 
+    // 退避预算耗尽后的「休眠待重连」状态机在 lib/watch-reconnect.ts（可单测）：
+    // 唤醒源 online / 页面回可见 / 低频兜底定时（仅可见且在线才生效）/ 用户点「重连」，唤醒后预算清零
+    const waiter = createDormantWaiter();
+    let dormant = false;
+    const endDormantNotice = (event: "connected" | "teardown") => {
+      const step = stepDormantNotice(dormant, event);
+      dormant = step.dormant;
+      if (step.dismiss) callbacksRef.current.onWatchDormantEnd?.(taskId);
+    };
+
+    const decisionCtx = {
+      isCancelled: () => cancelled,
+      delay,
+      waiter,
+      notify: (err: Error, resume?: () => void) =>
+        callbacksRef.current.onWatchException?.(err, resume),
+      onDormant: () => {
+        dormant = stepDormantNotice(dormant, "enter").dormant;
+      },
+    };
+
     // 自动重连循环：被动断流就退避后重连；只有「任务业务终态的 done」/ deleted 才停
     // enabled=true 隐含已 hydrate——404 可安全当物理删除完成
     const loop = async () => {
       // 两类计数独立——503 不兑换成一次即终止的网络错误预算
-      let unavailableAttempts = 0;
-      let transientFailures = 0;
-      let unavailableNotified = false; // unavailable 达阈值后只 toast 一次
+      // unavailableNotified：unavailable 达阈值后只 toast 一次
+      const budget = freshWatchBudget();
       while (!cancelled) {
         // 本次连接是否收到「终态 done」（task merged/abandoned、服务端随即关流）——
         // 回合级 done（V0.11 每轮 run 结束都发）不算、流保持 / 断了照常重连
         let gotTerminalDone = false;
         // 收到 task_deleted / 410 / hydrated-404 后不再重连
         let gotTaskDeleted = false;
+        const forwardTaskUpdate = (t: Task) => {
+          callbacksRef.current.onTaskUpdate?.(t);
+        };
+        // 先转发、再对本连接第一帧（bootstrap 快照）补一个校准回调
+        const bootstrapAwareTaskUpdate = withBootstrapNotice(
+          forwardTaskUpdate,
+          (t) => callbacksRef.current.onBootstrapSnapshot?.(t),
+        );
         const sseCallbacks: TaskStreamCallbacks = {
           onEvent: (ev, meta) => {
             if (cancelled) return;
@@ -191,7 +244,7 @@ export const useTaskWatch = (
           },
           onTaskUpdate: (t) => {
             if (cancelled) return;
-            callbacksRef.current.onTaskUpdate?.(t);
+            bootstrapAwareTaskUpdate(t);
           },
           onActionUpdate: (a) => {
             if (cancelled) return;
@@ -255,9 +308,9 @@ export const useTaskWatch = (
           // 首个合法 bootstrap task 帧即清零——不等流 EOF；
           // 否则「成功建连后 reader 抛错」会把上轮 transient 累加到本轮
           onConnectionEstablished: () => {
-            unavailableAttempts = 0;
-            transientFailures = 0;
-            unavailableNotified = false;
+            Object.assign(budget, freshWatchBudget());
+            // 休眠后重连成功：撤掉常驻的「重连」提示
+            endDormantNotice("connected");
           },
         };
 
@@ -269,34 +322,19 @@ export const useTaskWatch = (
           );
           // 只有 established 后 clean EOF 才清 epoch；
           // bootstrap 前空流走 retryable 预算（与 fetch reject 同账）
-          const eof = resolveWatchCleanEof({
-            established,
-            unavailableAttempts,
-            transientFailures,
-            unavailableNotified,
-          });
+          const eof = resolveWatchCleanEof({ established, ...budget });
           if (eof.kind === "epoch_reset") {
-            unavailableAttempts = eof.nextUnavailableAttempts;
-            transientFailures = eof.nextTransientFailures;
-            unavailableNotified = eof.nextUnavailableNotified;
-          } else {
-            const decision = eof.decision;
-            if (decision.action === "terminate_exhausted") {
-              if (!cancelled && decision.notifyException) {
-                callbacksRef.current.onWatchException?.(
-                  new Error("SSE 流在建立前关闭"),
-                );
-              }
-              return;
-            }
-            if (decision.action === "retry") {
-              unavailableAttempts = decision.nextUnavailableAttempts;
-              transientFailures = decision.nextTransientFailures;
-              unavailableNotified = decision.nextUnavailableNotified;
-              await delay(decision.delayMs);
-              if (cancelled) return;
-              continue;
-            }
+            budget.unavailableAttempts = eof.nextUnavailableAttempts;
+            budget.transientFailures = eof.nextTransientFailures;
+            budget.unavailableNotified = eof.nextUnavailableNotified;
+          } else if (eof.decision.action !== "terminate_deleted") {
+            const outcome = await applyReconnectDecision(eof.decision, {
+              budget,
+              error: new Error("SSE 流在建立前关闭"),
+              ...decisionCtx,
+            });
+            if (outcome === "stop") return;
+            continue;
           }
         } catch (err) {
           if (
@@ -317,9 +355,7 @@ export const useTaskWatch = (
 
           const decision = resolveWatchReconnectPolicy({
             kind,
-            unavailableAttempts,
-            transientFailures,
-            unavailableNotified,
+            ...budget,
           });
 
           if (decision.action === "terminate_deleted") {
@@ -327,21 +363,15 @@ export const useTaskWatch = (
             if (!cancelled && !isTaskTerminalDeleted(taskId)) {
               callbacksRef.current.onTaskDeleted?.(taskId);
             }
-          } else if (decision.action === "terminate_exhausted") {
-            if (!cancelled && decision.notifyException) {
-              callbacksRef.current.onWatchException?.(err as Error);
-            }
-            return;
           } else {
-            unavailableAttempts = decision.nextUnavailableAttempts;
-            transientFailures = decision.nextTransientFailures;
-            unavailableNotified = decision.nextUnavailableNotified;
-            if (!cancelled && decision.notifyException) {
-              callbacksRef.current.onWatchException?.(err as Error);
-            }
-            // unavailable / 未达上限的 retryable：静默退避后继续 loop
-            await delay(decision.delayMs);
-            if (cancelled) return;
+            // retry：unavailable / 未达上限的 retryable 静默退避；terminate_exhausted：
+            // 提示一次 → 休眠待重连（而非静默放弃）→ 被唤醒后预算清零重新来
+            const outcome = await applyReconnectDecision(decision, {
+              budget,
+              error: err as Error,
+              ...decisionCtx,
+            });
+            if (outcome === "stop") return;
             continue;
           }
         }
@@ -360,6 +390,9 @@ export const useTaskWatch = (
       cancelled = true;
       ctrl.abort();
       clearBackoff();
+      // 休眠中卸载 / 切换任务：拆监听 / 定时器并让挂起的 loop 退出，同时撤掉常驻的「重连」提示
+      waiter.resume(false);
+      endDormantNotice("teardown");
     };
   }, [taskId, enabled, reconnectKey]);
 };

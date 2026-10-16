@@ -107,6 +107,11 @@ const { clearChatGate, endChatLifecycle } = await import(
 const { handleTaskQuestionInject, buildRestrictedGroupContext } = await import(
   "@/lib/server/task-question-inject"
 );
+// facade 会把 omitGitToken / callerToken 这类「facade 自己的字段」剥掉再交给 SDK，
+// 所以 mockCreate（SDK 入口）看不到它们；要断言旁路有没有声明，得在 facade 入口（真实调用方调的那个）旁路观察，
+// 同时 callThrough，保持原有「真 facade → 假 SDK」的链路不变
+const { Agent: FacadeAgent } = await import("@/lib/server/agent-backend");
+const facadeCreateSpy = vi.spyOn(FacadeAgent, "create");
 const { registerPendingAsk, clearPendingAsk } = await import(
   "@/lib/server/chat-pending"
 );
@@ -264,6 +269,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
   beforeEach(() => {
     mockCreate.mockReset();
+    facadeCreateSpy.mockClear();
     seen = [];
   });
 
@@ -403,6 +409,16 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(createArg.tools).toBeUndefined();
     expect(createArg.mcpServers).toBeUndefined();
     expect(createArg.callerToken).toBeUndefined();
+    // N3-01：旁路必须显式声明「别把 GitLab PAT 放进 agent 子进程环境」（pi 下由 pi-coding-tools 摘；
+    // 不能靠「无 callerToken」推断——属主的 one-shot 提问也没有 callerToken、却要保留 token）。
+    // 在 facade 入口断言：SDK 入口（createArg）已被 facade 剥掉这类字段，看不到
+    const facadeArg = facadeCreateSpy.mock.calls[0]?.[0] as
+      | { omitGitToken?: boolean; callerToken?: string }
+      | undefined;
+    expect(facadeArg?.omitGitToken).toBe(true);
+    expect(facadeArg?.callerToken).toBeUndefined();
+    // 标记不能漏进 SDK 入参
+    expect(createArg).not.toHaveProperty("omitGitToken");
     expect(createArg.local?.settingSources).toEqual([]);
     expect(createArg.local?.customTools).toBeUndefined();
 

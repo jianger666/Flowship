@@ -285,6 +285,39 @@ describe("tool-display merge / GB 折叠规则", () => {
     ].join("\n");
     expect(countDiffStats(diff)).toEqual({ added: 2, removed: 1 });
   });
+
+  it("countDiffStats：内容行恰好以 -- / ++ 开头不被当文件头漏数（S11-01）", () => {
+    // 删除 `-- sql 注释`（diff 里是 `--- sql 注释`）、删除 markdown `---`（`----`）、新增 `++i;`（`+++i;` 无空格）、
+    // 新增 `++ x`（`+++ x`）——都是真实增删行
+    const diff = [
+      "--- a/f.sql",
+      "+++ b/f.sql",
+      "@@ -1,4 +1,3 @@",
+      " keep",
+      "--- sql 注释",
+      "----",
+      "+++i;",
+      "+++ x",
+      "+tail",
+    ].join("\n");
+    expect(countDiffStats(diff)).toEqual({ added: 3, removed: 2 });
+  });
+
+  it("countDiffStats：多文件 diff 的第二个文件头仍被正确跳过", () => {
+    const diff = [
+      "--- a/a.ts",
+      "+++ b/a.ts",
+      "@@ -1,1 +1,1 @@",
+      "-a",
+      "+A",
+      "--- a/b.ts",
+      "+++ b/b.ts",
+      "@@ -1,1 +1,2 @@",
+      " b",
+      "+B",
+    ].join("\n");
+    expect(countDiffStats(diff)).toEqual({ added: 2, removed: 1 });
+  });
 });
 
 describe("toolBlockSummary 人类可读解析", () => {
@@ -525,6 +558,67 @@ describe("parseUnifiedDiff", () => {
       newLine: 21,
       text: "y",
     });
+  });
+
+  it("内容行以 -- / ++ 开头：保留为 del / add、行号不错位（S11-01）", () => {
+    const diff = [
+      "--- a/f.sql",
+      "+++ b/f.sql",
+      "@@ -10,4 +10,3 @@",
+      " keep",
+      "--- sql 注释",
+      "----",
+      "+++i;",
+      "+tail",
+    ].join("\n");
+    const lines = parseUnifiedDiff(diff);
+    expect(lines).toEqual([
+      { kind: "hunk", text: "" },
+      { kind: "context", oldLine: 10, newLine: 10, text: "keep" },
+      { kind: "del", oldLine: 11, text: "-- sql 注释" },
+      { kind: "del", oldLine: 12, text: "---" },
+      { kind: "add", newLine: 11, text: "++i;" },
+      { kind: "add", newLine: 12, text: "tail" },
+    ]);
+  });
+
+  it("多文件 diff：hunk 正文结束后的下一个 ---/+++ 头照常剥掉", () => {
+    const diff = [
+      "--- a/a.ts",
+      "+++ b/a.ts",
+      "@@ -1 +1 @@",
+      "-a",
+      "+A",
+      "--- a/b.ts",
+      "+++ b/b.ts",
+      "@@ -5 +5 @@",
+      "-b",
+      "+B",
+    ].join("\n");
+    const lines = parseUnifiedDiff(diff);
+    expect(lines.map((l) => l.kind)).toEqual([
+      "hunk",
+      "del",
+      "add",
+      "hunk",
+      "del",
+      "add",
+    ]);
+    expect(lines[4]).toEqual({ kind: "del", oldLine: 5, text: "b" });
+  });
+
+  it("hunk 行数对不上（截断）时，三行模式仍能认出下一个文件头", () => {
+    const diff = [
+      "@@ -1,9 +1,9 @@",
+      "-a",
+      "+A",
+      "--- a/b.ts",
+      "+++ b/b.ts",
+      "@@ -5 +5 @@",
+      "-b",
+    ].join("\n");
+    const lines = parseUnifiedDiff(diff);
+    expect(lines.map((l) => l.kind)).toEqual(["hunk", "del", "add", "hunk", "del"]);
   });
 
   it("截断残行 / 空输入容错", () => {

@@ -27,6 +27,14 @@
  */
 
 import { Agent } from "./agent-backend";
+import { getSubagentParentModel } from "./subagent-parent-model";
+import {
+  formatBackgroundSubagentMessage,
+  formatBackgroundSubagentNotice,
+  getSubagentSessionControl,
+  onBackgroundSubagentSettled,
+  type BackgroundSubagentEvent,
+} from "./subagent-background";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import {
@@ -37,6 +45,7 @@ import {
   setTaskSessionAgentId,
 } from "./task-fs";
 import { getEventsLogPath, readEventsTail } from "./task-fs-core";
+import { redactSecretsInText } from "./event-secret-redact";
 import {
   formatChatHistorySection,
   HISTORY_INJECT_SCAN_EVENTS,
@@ -98,6 +107,11 @@ import {
   renderScriptRepoDirective,
 } from "./task-prompts";
 import { resolveEffectiveGitHost } from "./gitlab-host";
+import { syncGitTokenEnvFromSettingsResult } from "./git-token-env";
+import {
+  pinTrustedGitHostIfAbsent,
+  resolveGitHostForPrompt,
+} from "./trusted-git-host";
 import { readSettingsFile } from "./settings-fs";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
@@ -145,6 +159,8 @@ import {
   getChatQueueCount,
   getChatQueueGeneration,
   isMessageOperationTerminal,
+  listQueuedChatMessages,
+  markChatSystemClose,
   markMessagePersisted,
   settleMessageFailed,
   settleMessageHandedOff,
@@ -202,7 +218,71 @@ interface RunningChatRecord {
   repoPaths: string[];
   // 本会话启动时绑定的提供方（cursor / 某条自定义 id）。切提供方必开新会话，禁止跨后端 resume。
   providerId: string;
+  /**
+   * 本轮在消费的 run 句柄（consumeChatRun 接管时置、流结束 / 下一轮 send 起手清）。
+   * 「立即发送」用它 steer 插话——只有 Cursor 本地 run 带 steer；claim / 冷启动占位期为 undefined。
+   */
+  currentRun?: ChatRun;
+  /** 冲刷本轮已缓冲的半截 assistant 文本（插话落 user_reply 前调、保事件顺序）；consumeChatRun 置 */
+  flushAssistant?: () => Promise<void>;
+  /**
+   * 本实例是被「非用户意图」摘出表的（自动重连 / error 收尾 / 懒重启强清，不是用户停止）。
+   * 为什么挂在 rec 上：在飞的 steerChatRun 手里握着 rec 引用，实例摘表后仍读得到它，
+   * 据此把「系统换掉了实例」和「用户停止」两种都表现为 `!stillCurrent` 的情形分开——
+   * 前者消息没送达也没被用户撤销、必须重排，后者才记 stopped。
+   * 统一由 closeChatSession 在 reason 为 reconnect / error / restart 时置
+   *（见 markChatInstanceReplacedByReconnect）；名字沿用「ByReconnect」只是历史原因。
+   */
+  replacedByReconnect?: boolean;
+  /**
+   * 本实例被系统摘出表时的原因（reconnect / error / restart），与 replacedByReconnect 同时置。
+   * 为什么要记：在飞的后台结果 steer 落定为 replaced 后，要按原因决定这批结果的去处——
+   * 只有 reconnect（同一持久化 agent 的续接）才暂存给新实例，error / restart 一律作废并写「未送达」。
+   * 先到先得（同一实例只会被摘一次，重连链先显式标一次、closeChatSession 再标一次，原因相同）。
+   */
+  replacedReason?: ChatCloseReason;
+  /**
+   * 「立即发送」steer 在飞的消息（itemId → 用户看到的原文）：send-now 在 take 之后就经 registerInflightSteer 登记
+   * （覆盖 take → steerChatRun 起手之间的 await 空窗），有了定论由它注销；调用方没提前登记时 steerChatRun 自己登记、落定即注销。
+   * 为什么要有：这条消息已被 take 出队列、又刻意不占 in-flight 槽（steer 可能挂很久，不能卡住链式 flush），
+   * error 收尾清队时就看不见它——它在界面上是「已落盘未送达」的悬空条，既不会重排、也不会进「未送达」提示。
+   * 有了这张登记，error 收尾能把它和队里其它消息一并判失败、并入同一条提示。
+   */
+  inflightSteers?: Map<string, string>;
+  /**
+   * 对本实例「在跑的这一轮」发起取消时登记的关闭原因（cancelChatRun 的 opts.reason）。
+   * 为什么要有：run 的取消是异步收尾的——cancel 只给 run 一个信号，真正摘会话发生在稍后的
+   * finalizeChatRunIfCurrent(cancelled) 里，关闭原因得在两者之间带过去；缺省 = 用户停止。
+   * 之后若用户又点了停止（cancelChatRun 不带 reason）会把它清掉，用户意图优先。
+   */
+  pendingCloseReason?: ChatCloseReason;
+  /**
+   * cancelChatRun 发 run.cancel() **之前**数下来的「在跑的后台子代理」数（只在 pendingCloseReason 非用户时记）。
+   * 为什么要有：父 run 的 cancel 经 wrapRunWithCancelLink 会同步联动取消子代理，等异步收尾走到
+   * closeChatSession 时 backgroundRunning() 早已归零——只在关会话时现数，「懒重启取消」永远数到 0、仍然静默。
+   */
+  pendingCloseBackground?: number;
+  /** 在飞 steer 对「被重连替换」的订阅（steerChatRun 登记、落定即注销）；置标记时同步触发 */
+  replacedWaiters?: Set<() => void>;
 }
+
+/**
+ * 摘实例（非用户意图）时调：打「被系统换掉」标记，并立刻唤醒在飞的 steer。
+ * 现由 closeChatSession 在 reason=reconnect / error / restart 时统一调用（重连链摘 stale 实例前也会显式调一次）。
+ * 为什么要唤醒而不只打标：断流后 steer / run.wait 在真实 SDK 里是拒绝还是挂起没验证过，
+ * 全挂起时 steerChatRun 永远不落定，消息会卡在「已落盘未送达」的悬空态。
+ */
+const markChatInstanceReplacedByReconnect = (
+  rec: RunningChatRecord,
+  reason: ChatCloseReason,
+): void => {
+  rec.replacedByReconnect = true;
+  rec.replacedReason ??= reason;
+  const waiters = rec.replacedWaiters;
+  if (!waiters) return;
+  rec.replacedWaiters = undefined;
+  for (const wake of waiters) wake();
+};
 
 interface ChatRunnerGlobalState {
   // taskId → 运行中的 chat 控制对象
@@ -215,6 +295,34 @@ interface ChatRunnerGlobalState {
   drainingQueues: Set<string>;
   /** RunningChatRecord.instanceId 发号器（进程内单调、hot reload 也不回退） */
   nextChatInstanceId: number;
+  /**
+   * taskId → 攒着还没送进主 AI 的后台子代理结果（已套好框的消息正文）。
+   * 主 AI 忙、又插不进当前这一轮时（pi 外的冷启动 / 收尾空窗 / steer 被退回）先攒在这，
+   * 这一轮收尾时由 drainBackgroundResults 送出；会话关闭即作废（自动重连摘实例是例外：见下一项）。
+   */
+  pendingBackgroundResults: Map<string, string[]>;
+  /**
+   * taskId → 自动重连摘实例时暂存的后台子代理结果（已到达、还没送进主 AI 的那部分）。
+   * 为什么单独一张表：摘实例走 closeChatSession，它会清 pendingBackgroundResults；而重连的新实例
+   * 是同一个持久化 agent 的续接，这些结果对它仍然有效，不能跟着坏实例一起丢。
+   * 新实例接回（send 受理）后由 restoreStashedBackgroundResults 放回待送队列；
+   * 重连放弃 / 被停止 / 回退则清掉并给用户一句「未送达」，不留给以后的任何会话。
+   */
+  stashedBackgroundResults: Map<string, StashedBackgroundResults>;
+}
+
+/** 重连窗口里暂存的后台结果 */
+interface StashedBackgroundResults {
+  /** 暂存时所属会话的 agentId：放回时核对，对不上（换了别的会话）就不送 */
+  agentId: string;
+  results: string[];
+  /**
+   * 时效计时器（{@link STASHED_BACKGROUND_RESULTS_TTL_MS}）：暂存的正常出口只有「重连接回 → 放回」与
+   * 「链尾 / 回退 → 清掉并提示」两条；这是兜底——任何原因让重连链没走到收尾（异常、未覆盖的出口）时，
+   * 暂存不会无限期留着、更不会被日后某次同 agentId 的重连当成「自己的结果」送出。
+   * unref：不拖住进程退出。
+   */
+  expiryTimer?: NodeJS.Timeout;
 }
 
 // 跟 task-runner 一样、状态挂 globalThis 避免 dev hot reload 拆分
@@ -230,7 +338,17 @@ const getRunnerState = (): ChatRunnerGlobalState => {
       runningChats: new Map(),
       drainingQueues: new Set(),
       nextChatInstanceId: 1,
+      pendingBackgroundResults: new Map(),
+      stashedBackgroundResults: new Map(),
     };
+  }
+  // hot-reload：旧 state 可能缺 pendingBackgroundResults（后台子代理后加的字段）
+  if (!g[CHAT_RUNNER_GLOBAL_KEY]!.pendingBackgroundResults) {
+    g[CHAT_RUNNER_GLOBAL_KEY]!.pendingBackgroundResults = new Map();
+  }
+  // hot-reload：旧 state 可能缺 stashedBackgroundResults（重连暂存后加的字段）
+  if (!g[CHAT_RUNNER_GLOBAL_KEY]!.stashedBackgroundResults) {
+    g[CHAT_RUNNER_GLOBAL_KEY]!.stashedBackgroundResults = new Map();
   }
   // hot-reload：旧 state 可能缺 drainingQueues（V2 后加的字段）
   if (!g[CHAT_RUNNER_GLOBAL_KEY]!.drainingQueues) {
@@ -245,6 +363,8 @@ const getRunnerState = (): ChatRunnerGlobalState => {
 
 const runningChats = getRunnerState().runningChats;
 const drainingQueues = getRunnerState().drainingQueues;
+const pendingBackgroundResults = getRunnerState().pendingBackgroundResults;
+const stashedBackgroundResults = getRunnerState().stashedBackgroundResults;
 
 /** 每次 runningChats.set 前取号：同一持久化 agentId 的两个内存实例也绝不同号 */
 const allocChatInstanceId = (): number => getRunnerState().nextChatInstanceId++;
@@ -261,6 +381,186 @@ export const isChatQueueDraining = (taskId: string): boolean =>
 export const hasChatSession = (taskId: string): boolean =>
   runningChats.has(taskId);
 
+// ----------------- 关会话时的后台子代理善后（取消提示 / 结果暂存） -----------------
+
+/**
+ * 关会话的原因。为什么要有：agent.close() 经 wrapAgentWithCancelLink 会取消在跑的后台子代理，
+ * 用户主动停止之外的几种关闭（自动重连摘实例 / error 收尾 / 懒重启 / 编辑回退）此前对用户完全静默。
+ * 缺省 `user` = 现行行为（不额外提示）：stop 路径自己已写「用户停止了对话」，不能再重复写一遍。
+ */
+export type ChatCloseReason =
+  | "user"
+  | "reconnect"
+  | "error"
+  | "restart"
+  | "rewind";
+
+/** 非用户主动的关闭原因 → 事件流里「因 X」的 X */
+const CHAT_CLOSE_REASON_LABEL: Record<Exclude<ChatCloseReason, "user">, string> = {
+  reconnect: "自动重连替换会话",
+  error: "对话出错收尾",
+  restart: "会话重启",
+  rewind: "回退对话",
+};
+
+/**
+ * 给用户一句真实的「后台子代理结果没送到主 AI」。
+ * 到达时那行提示只说「将转交」（见 formatBackgroundSubagentNotice），没送成就要在这里补一句实话。
+ * 不用 owned sink：调用时会话已关 / 重连链已结束，无实例可绑 lease（同清队通知的豁免口径）。
+ * fire-and-forget：writeEventAndPublish 自己吞错，调用方（含同步的 closeChatSession）不必等。
+ */
+const noticeBackgroundResultsDropped = (
+  taskId: string,
+  count: number,
+  why: string,
+): void => {
+  if (count <= 0) return;
+  // eslint-disable-next-line no-restricted-syntax -- 豁免：系统通知（会话已关、无实例可绑）
+  void writeEventAndPublish(taskId, {
+    kind: "info",
+    text: `${count} 条后台子代理的结果未送达主 AI（${why}）`,
+  });
+};
+
+/**
+ * 暂存后台结果（见 {@link ChatRunnerGlobalState.stashedBackgroundResults}），按 agentId 绑定。
+ * where=front 用于 steer 被判 replaced 的那一批：它们比当前暂存里的更早到达，放前面保持先后。
+ * 已有的暂存属于别的 agentId（理论上不会）就不混着送：旧的作废并提示。
+ */
+const stashBackgroundResults = (
+  taskId: string,
+  agentId: string,
+  results: string[],
+  where: "front" | "back" = "back",
+): void => {
+  if (results.length === 0) return;
+  const old = stashedBackgroundResults.get(taskId);
+  if (old) clearStashExpiry(old);
+  if (old && old.agentId !== agentId) {
+    noticeBackgroundResultsDropped(
+      taskId,
+      old.results.length,
+      "它们所属的会话已被替换",
+    );
+  }
+  const kept = old && old.agentId === agentId ? old.results : [];
+  const entry: StashedBackgroundResults = {
+    agentId,
+    results: where === "front" ? [...results, ...kept] : [...kept, ...results],
+  };
+  // 每次（再）暂存都从头计时：时效衡量的是「这批结果在等一个出口」的时间
+  armStashExpiry(taskId, entry);
+  stashedBackgroundResults.set(taskId, entry);
+};
+
+/** （重新）给一份暂存挂时效计时器；已有的先清掉 */
+const armStashExpiry = (
+  taskId: string,
+  entry: StashedBackgroundResults,
+): void => {
+  if (entry.expiryTimer) clearTimeout(entry.expiryTimer);
+  entry.expiryTimer = setTimeout(() => {
+    // 只处理「自己」：期间已被放回 / 清掉 / 换成了别的暂存就什么都不做
+    if (stashedBackgroundResults.get(taskId) !== entry) return;
+    stashedBackgroundResults.delete(taskId);
+    noticeBackgroundResultsDropped(
+      taskId,
+      entry.results.length,
+      "暂存超时，没等到可送的会话",
+    );
+  }, STASHED_BACKGROUND_RESULTS_TTL_MS);
+  entry.expiryTimer.unref?.();
+};
+
+/**
+ * 自动重连每开始一次尝试就给暂存续期（第八轮 L5-02）：重连链最坏要 5 次尝试，退避合计 59 秒，
+ * 每次尝试里 Agent.resume 最长 180 秒（SDK_CREATE_RESUME_TIMEOUT_MS）、send 最长 120 秒——
+ * 5 次 resume 都挂到超时时整条链约 16 分钟，超过一份固定 10 分钟 TTL。
+ * 固定 TTL 只从首次暂存起算，链还在走时就会先到点写「暂存超时」，之后重连成功反而找不到暂存。
+ * 续期后 TTL 衡量的是「单次尝试」的时长而不是整条链；链真正走完（放回 / 放弃）仍由各自出口清掉。
+ * 没有暂存 / 已被清掉 = 空操作。
+ */
+const renewStashExpiry = (taskId: string): void => {
+  const stash = stashedBackgroundResults.get(taskId);
+  if (stash) armStashExpiry(taskId, stash);
+};
+
+const clearStashExpiry = (stash: StashedBackgroundResults): void => {
+  if (stash.expiryTimer) clearTimeout(stash.expiryTimer);
+  stash.expiryTimer = undefined;
+};
+
+/**
+ * 重连的新实例接回后，把暂存的结果放回它的待送队列（由这一轮收尾的 drainBackgroundResults 送出）。
+ * 先从暂存里删再放回：同一条结果只会存在于一处，不会被送两次。
+ * agentId 对不上 = 接回的不是发起它们的那个会话，不送。
+ */
+const restoreStashedBackgroundResults = (
+  taskId: string,
+  rec: RunningChatRecord,
+): void => {
+  const stash = stashedBackgroundResults.get(taskId);
+  if (!stash) return;
+  stashedBackgroundResults.delete(taskId);
+  clearStashExpiry(stash);
+  if (stash.agentId !== rec.agentId) {
+    noticeBackgroundResultsDropped(
+      taskId,
+      stash.results.length,
+      "重连接回的不是发起它们的会话",
+    );
+    return;
+  }
+  pendingBackgroundResults.set(taskId, [
+    ...stash.results,
+    ...(pendingBackgroundResults.get(taskId) ?? []),
+  ]);
+};
+
+/**
+ * 暂存时效（毫秒）。见 {@link StashedBackgroundResults.expiryTimer}；测试用 fake timers 推进它。
+ * 从「最近一次暂存 / 最近一次重连尝试开始」起算（{@link renewStashExpiry}），不是从首次暂存起算整条重连链。
+ */
+export const STASHED_BACKGROUND_RESULTS_TTL_MS = 10 * 60 * 1000;
+
+/** 仅供测试：读当前暂存（拷贝，不含计时器） */
+export const __stashedBackgroundResultsSnapshotForTest = (
+  taskId: string,
+): { agentId: string; results: string[] } | undefined => {
+  const s = stashedBackgroundResults.get(taskId);
+  return s ? { agentId: s.agentId, results: [...s.results] } : undefined;
+};
+
+/** 仅供测试：直接造一份暂存（等价于重连摘实例时的暂存），用来验时效 */
+export const __stashBackgroundResultsForTest = (
+  taskId: string,
+  agentId: string,
+  results: string[],
+): void => stashBackgroundResults(taskId, agentId, results);
+
+/** 重连链已经没有可送的会话了（放弃 / 被停止 / 让位 / 回退）：清掉暂存，如实告诉用户 */
+const discardStashedBackgroundResults = (taskId: string, why: string): void => {
+  const stash = stashedBackgroundResults.get(taskId);
+  if (!stash) return;
+  stashedBackgroundResults.delete(taskId);
+  clearStashExpiry(stash);
+  noticeBackgroundResultsDropped(taskId, stash.results.length, why);
+};
+
+/**
+ * 删任务：静默清掉该任务暂存的后台结果（连同时效计时器）。
+ * 与 {@link discardStashedBackgroundResults} 的区别是不写「未送达」提示：任务已删、没有人在看事件流，
+ * 往被删掉的任务目录里写事件还可能把目录又建出来；不清的话 10 分钟后计时器到点就会这么干。
+ */
+export const discardStashedBackgroundResultsForDeletedTask = (
+  taskId: string,
+): void => {
+  const stash = stashedBackgroundResults.get(taskId);
+  if (!stash) return;
+  stashedBackgroundResults.delete(taskId);
+  clearStashExpiry(stash);
+};
+
 /**
  * V0.11：关掉一个 chat 会话（agent close + 删记录）、best-effort。
  * expectedInstanceId 传了就只在「当前会话确实是那个内存实例」时才关（异步收尾路径防误关新会话）；
@@ -271,12 +571,25 @@ export const hasChatSession = (taskId: string): boolean =>
  *
  * 落盘锚点改条件清（clearTaskSessionAgentIdIf）——expected=本次关的 agentId，
  * extraGuard=内存无后继 chat 会话；`!rec` 禁止裸清（迟到 fire-and-forget 不得抹 B 锚点）。
+ *
+ * reason（缺省 user = 现行行为）：非用户主动的关闭（见 {@link ChatCloseReason}）会在 agent.close()
+ * 触发 cancelAll 之前同步读「在跑的后台子代理数」，>0 就给事件流写一句「因 X，取消了 N 个后台子代理」。
+ * 攒着没送出去的后台结果：reason=reconnect 时暂存给新实例（见 stashBackgroundResults），其余一律作废并写「未送达」。
  * @returns 是否真的关了一个会话
  */
 const closeChatSession = (
   taskId: string,
   expectedInstanceId?: number,
-  opts: { keepPersisted?: boolean } = {},
+  opts: {
+    keepPersisted?: boolean;
+    reason?: ChatCloseReason;
+    /**
+     * 调用方在「同一同步段内、紧挨着本次关闭之前」自己清了队时，传清队**之前**读到的队列 generation
+     * （见 {@link markChatSystemClose}）。没清队（forceClear / 重连 / 空闲回收）省略。
+     * 只在 reason 为 reconnect / error / restart 时有意义。
+     */
+    queueGenerationBeforeClear?: number;
+  } = {},
 ): boolean => {
   const rec = runningChats.get(taskId);
   if (!rec) {
@@ -290,6 +603,56 @@ const closeChatSession = (
   // 摘表前记下本次要关的 agentId（占位期为空串 → 条件清 naturally no-op）
   const agentIdToClear = rec.agentId;
   runningChats.delete(taskId);
+  // 非用户意图的摘表（重连 / error 收尾 / 懒重启强清）：在飞的「立即发送」steer 没送达、用户也没撤销，
+  // 必须落成 replaced 走重排，而不是 !stillCurrent → cancelled → failed(stopped)。
+  // 放在 agent.close() 之前、与摘表之间无 await：close 会把 steer 拒掉，那一刻 steer 必须已能读到标记；
+  // 同时唤醒在飞的 steer——真实 SDK 在摘表后 steer / run.wait 是拒绝还是挂起没验证过，别指望它们自己落定。
+  // 用户停止（reason 缺省 / user）与回退（rewind，消息属于被回退掉的上下文）不打标。
+  if (
+    opts.reason === "reconnect" ||
+    opts.reason === "error" ||
+    opts.reason === "restart"
+  ) {
+    // 先记「系统清队前 / 摘表时的队列 generation」再唤醒 steer：取消 / error 收尾总是先清队、再在同一同步段里走到这，
+    // 被唤醒的 steer 落定后据此区分「系统自己清的队」与「之前 / 之后用户停止 / 回退清的队」（见 markChatSystemClose）
+    markChatSystemClose(taskId, opts.queueGenerationBeforeClear);
+    markChatInstanceReplacedByReconnect(rec, opts.reason);
+  }
+  // 会话没了：后台子代理随 close 一并取消。非用户主动的关闭让用户看得见——
+  // 读数必须在 agent.close() 之前（close 经 wrapAgentWithCancelLink 触发 cancelAll）、同步完成
+  const closeLabel =
+    opts.reason && opts.reason !== "user"
+      ? CHAT_CLOSE_REASON_LABEL[opts.reason]
+      : undefined;
+  // 与 cancelChatRun 取消前记下的数取大：run 的取消已先一步把子代理停了，现数会漏（见 pendingCloseBackground）
+  const cancelledBackground = closeLabel
+    ? Math.max(
+        getSubagentSessionControl(rec.agent)?.backgroundRunning() ?? 0,
+        rec.pendingCloseBackground ?? 0,
+      )
+    : 0;
+  if (closeLabel && cancelledBackground > 0) {
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：系统通知（会话已关、无实例可绑）
+    void writeEventAndPublish(taskId, {
+      kind: "info",
+      text: `因${closeLabel}，取消了 ${cancelledBackground} 个后台子代理`,
+    });
+  }
+  // 攒着没投出去的结果：自动重连摘实例是同一持久化 agent 的续接，结果暂存给新实例（按 agentId 绑定）；
+  // 其余原因会话就此作废，如实告诉用户没送到（到达时的提示只说「将转交」）
+  const undelivered = pendingBackgroundResults.get(taskId);
+  pendingBackgroundResults.delete(taskId);
+  if (undelivered && undelivered.length > 0) {
+    if (opts.reason === "reconnect" && agentIdToClear) {
+      stashBackgroundResults(taskId, agentIdToClear, undelivered);
+    } else {
+      noticeBackgroundResultsDropped(
+        taskId,
+        undelivered.length,
+        closeLabel ?? "会话已关闭",
+      );
+    }
+  }
   setChatAwaitingNotifier(taskId, null);
   if (rec.agent) {
     try {
@@ -320,6 +683,10 @@ const CHAT_SWEEPER_KEY = "__flowshipChatSweeperV1__";
       const now = Date.now();
       for (const [taskId, rec] of runningChats) {
         if (rec.runActive) continue;
+        // 还有后台子代理在跑：会话不能回收（关会话会把它们一并取消）
+        if ((getSubagentSessionControl(rec.agent)?.backgroundRunning() ?? 0) > 0) {
+          continue;
+        }
         if (now - rec.lastActiveAt > CHAT_IDLE_TTL_MS) {
           console.log(`[chat-runner] 会话空闲回收 task=${taskId}（可 resume 接回）`);
           closeChatSession(taskId, rec.instanceId, { keepPersisted: true });
@@ -342,16 +709,35 @@ const CHAT_SWEEPER_KEY = "__flowshipChatSweeperV1__";
  * 自动重连的「backoff → resume → send」窗口内表里可能没有 record，
  * 此时用户 stop 也必须让重连停下——先给 reconnect 停止闭包发信号（有 record 时
  * 同样发：reconnect 的 claim record cancel 只摘实例、不通知在退避里的重试者）。
+ *
+ * @param opts.reason 关闭原因，缺省 = 用户停止（现行行为、不额外提示）。非用户意图的调用方
+ *   （懒重启：切模型 / MCP / workdir / 提供方）必须传，否则被取消的后台子代理对用户完全静默、
+ *   在飞的「立即发送」steer 也会被误记成用户停止。
+ *   run 在跑时 cancel 只是发信号，真正摘会话在收尾里——原因先登记在 record 上（pendingCloseReason）带过去。
  */
-export const cancelChatRun = (taskId: string): boolean => {
+export const cancelChatRun = (
+  taskId: string,
+  opts: { reason?: ChatCloseReason } = {},
+): boolean => {
   const reconnectStop = getReconnectStops().get(taskId);
   if (reconnectStop) reconnectStop();
   const rec = runningChats.get(taskId);
   if (!rec) return !!reconnectStop;
   if (rec.runActive) {
+    // 不带 reason 也要赋值（清成 undefined）：之前登记过「懒重启」、随后用户又点了停止，用户意图优先
+    rec.pendingCloseReason = opts.reason;
+    // 必须在 rec.cancel() 之前数：run.cancel 会同步联动取消后台子代理，之后再数就是 0。
+    // 与已登记的数取大——同一轮被重复取消时，第二次数到的是已被第一次取消掉的 0
+    rec.pendingCloseBackground =
+      opts.reason && opts.reason !== "user"
+        ? Math.max(
+            rec.pendingCloseBackground ?? 0,
+            getSubagentSessionControl(rec.agent)?.backgroundRunning() ?? 0,
+          )
+        : undefined;
     rec.cancel();
   } else {
-    closeChatSession(taskId);
+    closeChatSession(taskId, undefined, { reason: opts.reason });
   }
   return true;
 };
@@ -407,7 +793,7 @@ export const forceClearChatRun = (
   taskId: string,
   opts: { keepPersisted?: boolean } = {},
 ): void => {
-  closeChatSession(taskId, undefined, opts);
+  closeChatSession(taskId, undefined, { ...opts, reason: "restart" });
   // cancelled 槽只在被 owner 消费时删——forceClear（懒重启换新）后
   // 旧 claim 的标记已无消费者，顺手清防泄漏；旧 owner 迟到 send 会按实例不匹配
   // 收敛为 owner_invalid（同为终态 409、语义仍正确）
@@ -422,7 +808,9 @@ export const forceClearChatRun = (
 export const closeChatSessionUnconditional = (taskId: string): void => {
   // rewind 关会话清队走唯一 sink（有门闩路径也统一）
   failQueuedItems(taskId, { reason: "rewound" });
-  closeChatSession(taskId);
+  // 回退丢掉了旧对话：重连窗口里暂存的后台结果属于被回退的上下文，不能留给以后的会话
+  discardStashedBackgroundResults(taskId, "回退对话");
+  closeChatSession(taskId, undefined, { reason: "rewind" });
 };
 
 /** 当前 chat 是否有 run 在消费（rewind 前 409 闸门） */
@@ -915,7 +1303,7 @@ export const runChatSession = async (
 
   // cancel 收尾：统一走 finalize（失主 / forceClear 空窗一律 no-op）
   const finishCancelled = async (): Promise<void> => {
-    await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
+    await finalizeChatRunSafely(task.id, myInstanceId, "cancelled", {
       task,
     });
   };
@@ -1057,7 +1445,14 @@ export const runChatSession = async (
           task.repoPaths,
           task.scriptRepoPaths,
         )) ?? undefined;
-      return buildGitlabAccessDirective(effectiveHost, dataRoot());
+      // 可信时机：本会话 agent 还没拿到任何 prompt（首条 send 要 await 本 promise），
+      // 此刻读到的 origin 还没被它动过——固定为 PAT 的可信 host（已固定则不改，见 trusted-git-host.ts）。
+      if (effectiveHost) pinTrustedGitHostIfAbsent(effectiveHost, "session");
+      // host 展示可信 host：origin 被篡改时别让提示词教 agent 把 token 发过去
+      const gitTrust = resolveGitHostForPrompt(effectiveHost);
+      return buildGitlabAccessDirective(gitTrust.host, dataRoot(), {
+        untrustedOriginHost: gitTrust.untrustedOriginHost,
+      });
     })();
     gitlabAccessPromise.catch(() => {});
     // 与 create 并行：新会话才需要切片；resume 成功走 send，根本不进这里
@@ -1074,6 +1469,9 @@ export const runChatSession = async (
     const { syncCompanyEnvFileFromSettings } = await import("./company-env-fs");
     await syncCompanyEnvFileFromSettings();
     const settingsResult = await readSettingsFile();
+    // 同理把 GitLab token 放进 process.env 给 agent shell（SDK 本地 agent 继承 server env）：
+    // 「GitLab 访问」提示让 agent 引用 $FLOWSHIP_GITLAB_TOKEN、不再读 config.json。必须先于 Agent.create。
+    syncGitTokenEnvFromSettingsResult(settingsResult);
     const providerSettings = migrateProviderSettings(
       settingsResult.status === "ok" ? settingsResult.settings : {},
     );
@@ -1089,6 +1487,8 @@ export const runChatSession = async (
         providerId,
         callerToken,
         taskId: task.id,
+        // chat 会话：subagent 工具开后台运行（用户插话时自动转后台、后台结果送回本会话）
+        backgroundSubagents: true,
         // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
         // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
         // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
@@ -1396,6 +1796,8 @@ export const resumeChatSession = async (
   if (startToken === null) return null;
   try {
     const settingsResult = await readSettingsFile();
+    // 恢复出的 agent 同样靠 $FLOWSHIP_GITLAB_TOKEN 调 GitLab API（见 runChatSession 同名注释）
+    syncGitTokenEnvFromSettingsResult(settingsResult);
     const providerSettings = migrateProviderSettings(
       settingsResult.status === "ok" ? settingsResult.settings : {},
     );
@@ -1432,6 +1834,7 @@ export const resumeChatSession = async (
         providerId,
         callerToken,
         taskId: task.id,
+        backgroundSubagents: true,
         // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
         model: bootArgs.model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
@@ -1687,6 +2090,8 @@ const runReconnectAttempt = async (
         `——map 空/失主，preamble 不落盘`,
     );
   }
+  // 每次尝试开始就给暂存的后台结果续期（第八轮 L5-02，见 renewStashExpiry）
+  renewStashExpiry(task.id);
   if (await sleepWithCancel(RECONNECT_BACKOFF_MS[attempt - 1], isCancelled)) {
     return false;
   }
@@ -1707,7 +2112,17 @@ const runReconnectAttempt = async (
   }
   // 只关坏实例（instanceId 门控）、永不误关新会话；锚点 keepPersisted 供下一轮 resume
   if (staleInstanceId !== undefined) {
-    closeChatSession(task.id, staleInstanceId, { keepPersisted: true });
+    // 摘表前先打「被重连替换」标记（与 close 之间无 await）：在飞的「立即发送」steer 靠它
+    // 区分「实例被重连换掉、消息没送达」与「用户停止」——前者要重排队，后者才作废。
+    // 能走到这里说明退避期间没被用户停止（sleepWithCancel 已返回 false），所以这次摘表不是用户意图。
+    // cur 与 stale 不是同一实例的情形上面已让位 return，这里 cur 要么是 stale、要么表已空（无可标）。
+    if (cur) markChatInstanceReplacedByReconnect(cur, "reconnect");
+    // reason=reconnect：关闭内部在清 pending 之前把「已到达、还没送给主 AI」的后台结果暂存给新实例
+    // （退避窗口里完成的子代理结果原先在这里随会话一起丢了），并在 agent.close() 取消仍在跑的后台子代理前给用户留一句
+    closeChatSession(task.id, staleInstanceId, {
+      keepPersisted: true,
+      reason: "reconnect",
+    });
   }
   const creds = await readServerChatCreds(fresh);
   if (!creds) return false;
@@ -1790,6 +2205,11 @@ const runReconnectAttempt = async (
       );
       return true;
     }
+    // 新实例已就位、send 已受理且没被停止 / 替换：把摘实例时暂存的后台结果放回它的待送队列，
+    // 由本轮收尾的 drainBackgroundResults 送出。放在 send 受理之后而不是 resume 之后：
+    // 此前任何失败 / 停止出口都还没碰过暂存——它要么继续留给下一次重连、要么由链尾（consumeChatRun）统一清掉，
+    // 不会出现「已放回新实例又随僵尸实例被关而静默丢掉」
+    restoreStashedBackgroundResults(task.id, curAfterSend);
     // owner 语境（重连链、send 后已验实例）——claimedInstanceId lease
     await writeOwnedEventAndPublish(
       task.id,
@@ -1811,7 +2231,11 @@ const runReconnectAttempt = async (
     // 勿只清 runActive 留下 idle 会话进退避——第三方 chat-reply 会当可用会话
     // 起 run，重试醒来再无条件 close「当前会话」会把用户刚起的 run 关掉。
     // 立即按 instanceId 摘出表（keepPersisted 留锚点），退避窗口内无可被占用的 idle 会话。
-    closeChatSession(task.id, rec.instanceId, { keepPersisted: true });
+    // reason=reconnect：这个新实例在 resume→send 的空窗里若又收到了后台结果，同样暂存给下一次重连
+    closeChatSession(task.id, rec.instanceId, {
+      keepPersisted: true,
+      reason: "reconnect",
+    });
     return tryChatAutoReconnect(
       fresh,
       sendErr,
@@ -1880,6 +2304,8 @@ const finalizeChatRunIfCurrent = async (
       ok: true,
     });
     void flushChatQueue(taskId);
+    // 这一轮结束期间到达、没来得及插进去的后台子代理结果：现在送（空闲则唤醒一轮）
+    void drainBackgroundResults(taskId);
     return true;
   }
 
@@ -1892,12 +2318,19 @@ const finalizeChatRunIfCurrent = async (
     );
     if (!isCurrent()) return false;
     // cancelled 清队走唯一 sink（queue_failed + recentSettled）
+    // 清队前的 generation 要带给 closeChatSession（打「系统关会话」标记用）：同步相邻、中间不得 await
+    const queueGenerationBeforeClear = getChatQueueGeneration(taskId);
     failQueuedItems(taskId, { reason: "cancelled" });
     // P0：取消收尾保留落盘 sessionAgentId——停止 / 立即发送打断后，下条消息
     // 优先 Agent.resume 续接原会话（对齐错误分支口径），不再被动靠 events
     // 回放丢上下文。真正清锚点只剩 rewind（closeChatSessionUnconditional）、
     // 提供方不一致（resumeChatSession 内条件清）与 DELETE 收尾。
-    const closed = closeChatSession(taskId, instanceId, { keepPersisted: true });
+    // reason 取 cancelChatRun 登记的原因（懒重启等非用户意图的取消）；缺省 = 用户停止
+    const closed = closeChatSession(taskId, instanceId, {
+      keepPersisted: true,
+      reason: rec.pendingCloseReason,
+      queueGenerationBeforeClear,
+    });
     if (!closed) return false;
     if (cancelledTask) publish(taskId, { kind: "task", task: cancelledTask });
     publish(taskId, {
@@ -1931,11 +2364,19 @@ const finalizeChatRunIfCurrent = async (
   );
   if (!isCurrent()) return false;
   // error 清队走唯一 sink（queue_failed + recentSettled）
-  failQueuedItems(taskId, { reason: "error" });
+  // 必须与下面 closeChatSession 同步相邻（中间不得 await）：否则 await 窗口里新入队的
+  // 消息会在摘表后无人 drain。给用户的「未送达」提示等收尾发布完再落（见文末）。
+  const queueGenerationBeforeClear = getChatQueueGeneration(taskId);
+  const dropped = failQueuedItemsCapturingTexts(taskId, "error");
   // error 收尾：关内存会话，但保留落盘 sessionAgentId——模型/区域等不可重试错
   // 并不代表持久化 agent 坏了；下条消息走既有「模式 2 resume → 失败降级模式 3」。
   // stop / forceClear / rewind 仍走无 keepPersisted 的清锚点路径。
-  const closed = closeChatSession(taskId, instanceId, { keepPersisted: true });
+  // reason=error：出错收尾不是用户主动停的，仍在跑的后台子代理会随 close 被取消——让用户看得见
+  const closed = closeChatSession(taskId, instanceId, {
+    keepPersisted: true,
+    reason: "error",
+    queueGenerationBeforeClear,
+  });
   if (!closed) return false;
   // 关会话后不再 await getTask——避免空窗里 B 已启动却仍 publish done 清其 streaming
   if (errorTask) publish(taskId, { kind: "task", task: errorTask });
@@ -1945,6 +2386,221 @@ const finalizeChatRunIfCurrent = async (
     ok: false,
   });
   publish(taskId, { kind: "error", message: eventText });
+  await noticeQueuedItemsDropped(taskId, dropped);
+  return true;
+};
+
+/** 被清队丢弃的排队消息：count 含拿不到文本的条（如已出队的 in-flight 条），items 只含有文本的条 */
+type DroppedQueueItems = {
+  count: number;
+  items: Array<{ itemId: string; text: string }>;
+};
+
+/** 提示文本里每条消息的摘要上限（字符） */
+const DROPPED_NOTICE_SNIPPET_MAX = 80;
+/** 提示文本里最多列几条 */
+const DROPPED_NOTICE_LIST_MAX = 5;
+/** meta.droppedTexts 里单条完整文本的上限（字符）——只存文本，附件 / 图片绝不放进来 */
+const DROPPED_META_TEXT_MAX = 2000;
+
+const truncateChars = (s: string, max: number): string => {
+  const chars = Array.from(s);
+  return chars.length > max ? `${chars.slice(0, max).join("")}…` : s;
+};
+
+/**
+ * 清队前取排队消息文本快照 → 走唯一 sink failQueuedItems（对外语义不变）。
+ * failQueuedItems 会 take + clear 队列，之后就拿不到文本了，所以快照必须在它之前、同步取。
+ * 仅 displayText（用户看到的原文），不碰 agentText / 图片 / 附件路径。
+ */
+const failQueuedItemsCapturingTexts = (
+  taskId: string,
+  reason: "error" | "cancelled",
+): DroppedQueueItems => {
+  const textById = new Map(
+    listQueuedChatMessages(taskId).map((m) => [m.itemId, m.displayText]),
+  );
+  // error 收尾：「立即发送」steer 在飞的消息（已出队、不占 in-flight 槽）和队里其它消息同命运——
+  // 一并判失败（原因 error）、并入同一条「未送达」提示。调用方都已确认本实例仍是当前实例（isCurrent），
+  // 此刻表里的就是正在收尾的这个 record；快照必须在 closeChatSession 唤醒 steer 之前取（调用方保证同步相邻）。
+  // cancelled 不并入：用户停止 / 懒重启由 steer 落定后的 stopped / 重排自己收尾。
+  const inflightSteers =
+    reason === "error" ? runningChats.get(taskId)?.inflightSteers : undefined;
+  const extraItemIds: string[] = [];
+  if (inflightSteers) {
+    for (const [itemId, displayText] of inflightSteers) {
+      if (textById.has(itemId)) continue;
+      extraItemIds.push(itemId);
+      textById.set(itemId, displayText);
+    }
+  }
+  const failedIds = failQueuedItems(taskId, {
+    reason,
+    ...(extraItemIds.length > 0 ? { extraItemIds } : {}),
+  });
+  const items: DroppedQueueItems["items"] = [];
+  for (const itemId of failedIds) {
+    const text = textById.get(itemId);
+    // 必须在这里（截断之前）脱敏：落盘前全局那道脱敏按「完整的精确值」匹配，
+    // noticeQueuedItemsDropped 的摘要 / droppedTexts 先截断再落盘，凭据一旦横跨截断点就只剩半截前缀，
+    // 精确匹配命不中、前缀原样写进 events.jsonl 并推给所有订阅者。先脱敏再截断，截断最多切到占位符。
+    if (typeof text === "string") {
+      items.push({ itemId, text: redactSecretsInText(text) });
+    }
+  }
+  return { count: failedIds.length, items };
+};
+
+/**
+ * run 出错清队后的用户可见提示。
+ * why：error 清队（failQueuedItems reason=error）前端是「静默清占位」——气泡消失、
+ * 不弹 toast（见 chat-view.onQueueFailed 只对 persist_failed / flush_error 弹），
+ * 用户看不出排队的话被丢了。落一条 info 事件（持久、断线重连也看得到）。
+ * 提示里附每条被丢消息的摘要（用户要重发得知道发的是什么）；完整文本放 meta.droppedTexts
+ * 供前端回填。
+ * 不用 owned sink：调用时会话已摘表、无实例可绑（同 flushChatQueue 清队通知的豁免口径）。
+ */
+const noticeQueuedItemsDropped = async (
+  taskId: string,
+  dropped: DroppedQueueItems,
+): Promise<void> => {
+  if (dropped.count <= 0) return;
+  try {
+    const listed = dropped.items.slice(0, DROPPED_NOTICE_LIST_MAX);
+    let text = `本轮出错，${dropped.count} 条排队消息未送达、请重新发送`;
+    if (listed.length > 0) {
+      const lines = listed.map(
+        (it) =>
+          `- ${truncateChars(it.text.replace(/\s+/g, " ").trim(), DROPPED_NOTICE_SNIPPET_MAX)}`,
+      );
+      text += `：\n${lines.join("\n")}`;
+      if (dropped.count > listed.length) text += `\n…等 ${dropped.count} 条`;
+    }
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：清队系统通知（会话已关、无实例可绑）
+    await writeEventAndPublish(taskId, {
+      kind: "info",
+      text,
+      ...(dropped.items.length > 0
+        ? {
+            meta: {
+              droppedItemIds: dropped.items.map((it) => it.itemId),
+              droppedTexts: dropped.items.map((it) =>
+                truncateChars(it.text, DROPPED_META_TEXT_MAX),
+              ),
+            },
+          }
+        : {}),
+    });
+  } catch (err) {
+    console.warn(`[chat-runner] task=${taskId} 清队通知失败:`, err);
+  }
+};
+
+/**
+ * finalizeChatRunIfCurrent 的兜底包装：收尾自身抛错（落盘 EIO / ENOSPC 等）时，
+ * 绝不能让 runActive 闩锁 + 会话留在表里——runActive=true 的会话永远假 busy，
+ * 新消息只入队无人 drain，空闲回收 sweeper 也会跳过它。
+ * 抛错时仅在「本实例仍是当前主」才兜底：清队 + 摘会话（保留锚点）+ 发 done 让前端收 streaming。
+ * runStatus 若因同一个 IO 故障没写成，留给下次启动的 boot-recovery。
+ */
+const finalizeChatRunSafely = async (
+  taskId: string,
+  instanceId: number,
+  outcome: FinalizeChatOutcome,
+  ctx: FinalizeChatRunCtx,
+): Promise<boolean> => {
+  try {
+    return await finalizeChatRunIfCurrent(taskId, instanceId, outcome, ctx);
+  } catch (finErr) {
+    console.error(
+      `[chat-runner] task=${taskId} 收尾(${outcome})抛错、兜底释放会话闩锁:`,
+      finErr,
+    );
+    const curRec = runningChats.get(taskId);
+    if (curRec?.instanceId !== instanceId) return false;
+    const queueGenerationBeforeClear = getChatQueueGeneration(taskId);
+    const dropped = failQueuedItemsCapturingTexts(
+      taskId,
+      outcome === "cancelled" ? "cancelled" : "error",
+    );
+    closeChatSession(taskId, instanceId, {
+      keepPersisted: true,
+      queueGenerationBeforeClear,
+      // cancelled 兜底 = 用户停止（或 cancelChatRun 登记了非用户原因，如懒重启，与 cancelled 收尾同口径）；
+      // 其余是收尾自己出错（落盘 EIO 等），与 error 收尾同口径
+      reason:
+        outcome === "cancelled" ? (curRec.pendingCloseReason ?? "user") : "error",
+    });
+    publish(taskId, { kind: "done", task: ctx.task, ok: outcome !== "error" });
+    if (outcome !== "cancelled") {
+      await noticeQueuedItemsDropped(taskId, dropped);
+    }
+    return false;
+  }
+};
+
+/**
+ * 自动重连放弃（次数耗尽 / 不可重试 / 凭据缺失）后的收尾。
+ *
+ * 为什么不能走 finalizeChatRunIfCurrent：重连在退避前已把坏实例摘表
+ * （runReconnectAttempt → closeChatSession(stale)），收尾的实例 CAS 必然落空，
+ * 旧实现 handleChatRunFailure 因此整段 no-op——runStatus 永远停在 running、
+ * 没有 error 事件、排队消息既没发也没通知。
+ *
+ * 授权：表内必须没有任何会话（有就是用户退避期间新起的实例 B，绝不碰）；
+ * runStatus 只回滚「running」（stop 已写 idle / B 已接管则拒写）。
+ * @returns true = 已收尾
+ */
+const finalizeReconnectGaveUp = async (
+  task: Task,
+  err: unknown,
+): Promise<boolean> => {
+  const taskId = task.id;
+  const noOwnerInMemory = (): boolean => !runningChats.has(taskId);
+  if (!noOwnerInMemory()) return false;
+  invalidateMcpProbeCache();
+  // 先闭合未配对 tool_call（与 finalizeChatRunIfCurrent 同口径、同 helper）：
+  // 流到一半断线的工具调用不会再有完成帧，不补终态就在事件流里永远转圈。
+  // 幂等、写前复查 lease；与「盘上是不是 running」无关——这些工具这轮已经死了。
+  await finalizeOpenToolCalls(taskId, noOwnerInMemory);
+  if (!noOwnerInMemory()) return false;
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  const failure = summarizeRunFailure(message, err);
+  const eventText = `自动重连失败、会话已中断：${failure.text}`;
+  // 先做带 expected=running 的条件写：盘上已不是 running（用户 stop 写了 idle /
+  // boot recovery 已标 error / 任务已删）→ 返回 null，此时不落 error 事件、不 publish、
+  // 不清队（stop 路径已自己清过队、发过 done），避免「已停止的任务凭空多一条自动重连失败」。
+  // 写盘 await 期间若 B 起来了，owner 门闩会拒写。
+  const errorTask = await setTaskRunStatusIfRunOwner(
+    taskId,
+    "error",
+    noOwnerInMemory,
+    undefined,
+    "running",
+  );
+  if (!noOwnerInMemory()) return false;
+  if (!errorTask) {
+    console.warn(
+      `[chat-runner] task=${taskId} 自动重连放弃时任务已不是 running，跳过 error 事件 / 发布`,
+    );
+    return false;
+  }
+  // 状态已落 error：事件写失败（EIO 等）不能挡住后面的清队 / done，否则前端 streaming 卡住
+  try {
+    await writeOwnedEventAndPublish(taskId, noOwnerInMemory, {
+      kind: "error",
+      text: eventText,
+      meta: { detail: failure.detail },
+    });
+  } catch (writeErr) {
+    console.error(`[chat-runner] task=${taskId} 重连放弃 error 事件落盘失败:`, writeErr);
+  }
+  if (!noOwnerInMemory()) return false;
+  const dropped = failQueuedItemsCapturingTexts(taskId, "error");
+  publish(taskId, { kind: "task", task: errorTask });
+  publish(taskId, { kind: "done", task: errorTask, ok: false });
+  publish(taskId, { kind: "error", message: eventText });
+  await noticeQueuedItemsDropped(taskId, dropped);
   return true;
 };
 
@@ -1958,7 +2614,7 @@ const handleChatRunFailure = async (
   console.error("[chat-runner] task", task.id, "failed:", err);
   // 无 instance 哨兵 -1：CAS 永不匹配，避免无门控裸收尾
   const instanceId = expectedInstanceId ?? -1;
-  await finalizeChatRunIfCurrent(task.id, instanceId, "error", { task, err });
+  await finalizeChatRunSafely(task.id, instanceId, "error", { task, err });
 };
 
 /**
@@ -1997,6 +2653,8 @@ const consumeChatRun = async (
     runningChats.get(task.id)?.instanceId === myInstanceId;
   if (rec) {
     rec.runActive = true;
+    // 「立即发送」steer 插话要用的本轮句柄（流结束后清，见下）
+    rec.currentRun = run;
     rec.cancel = () => {
       cancelled = true;
       void run.cancel().catch(() => {});
@@ -2021,6 +2679,8 @@ const consumeChatRun = async (
     // 流式消费 + buffer flush：一轮完整回复 → 一条 assistant_message 事件
     ctx = {
       buffer: "",
+      // 子代理卡片徽标要显示「沿用」的实际模型（只有 Cursor 路径挂了 subagent 才取得到）
+      subagentParentModel: getSubagentParentModel(rec?.agent),
       flush: async () => {
         // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
         flushPendingAssistantDeltas(task.id);
@@ -2034,6 +2694,13 @@ const consumeChatRun = async (
         });
       },
     };
+    if (rec) {
+      // 插话前冲刷：先 thinking 再 assistant，对齐流内顺序
+      rec.flushAssistant = async () => {
+        await flushThinkingBuffer(task.id, ctx, chatLease);
+        await ctx.flush();
+      };
+    }
 
     // 打点：send 受理到首个流事件（≈首 token）的等待——量化「首包预填」开销
     const perfStreamStart = Date.now();
@@ -2050,6 +2717,11 @@ const consumeChatRun = async (
       await handleSdkMessage(task.id, msg, ctx, chatLease);
     }
     streamEndedAt = Date.now();
+    // 流已结束：这一轮不再能插话（steer 只对在跑的 run 有意义）
+    if (rec && rec.currentRun === run) {
+      rec.currentRun = undefined;
+      rec.flushAssistant = undefined;
+    }
     await flushThinkingBuffer(task.id, ctx, chatLease);
     await ctx.flush();
 
@@ -2070,7 +2742,7 @@ const consumeChatRun = async (
         });
       }
       // cancel 收尾唯一入口——失主（含 forceClear 空窗）no-op
-      await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
+      await finalizeChatRunSafely(task.id, myInstanceId, "cancelled", {
         task,
       });
       return;
@@ -2098,12 +2770,19 @@ const consumeChatRun = async (
     );
 
     // 自然 finished 也必须查 instance——旧实现完全不查、空窗可覆盖 B
-    await finalizeChatRunIfCurrent(task.id, myInstanceId, "finished", {
+    await finalizeChatRunSafely(task.id, myInstanceId, "finished", {
       task,
     });
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
     cancelEscape.dispose();
+    // 流异常中断：这一轮的 run 句柄已经是死的，不能再被 steer。
+    // 为什么在这里清：currentRun 只在流「正常走完」时清；抛错走 catch → 自动重连，
+    // 坏实例会在首次退避（2s）里仍挂在表内（runActive=true、currentRun 仍指向断流的 run），
+    // canSteerChatRun 会误判可插话——「立即发送」把消息塞给死 run，要么挂着、
+    // 要么等重连摘掉坏实例后被判「会话被摘除」静默记 stopped。清掉后调用方回退「打断重发」。
+    // 只清 currentRun（canSteerChatRun 的唯一判据）；flushAssistant 保留，半截回复仍可冲刷。
+    if (rec && rec.currentRun === run) rec.currentRun = undefined;
     // 用户 stop 后 stream 以异常收场（abort 类）→ 走 cancel 收尾，
     // 绝不落 error 事件 / error 状态覆盖 stop 路由已写的 idle +「用户停止了对话」。
     if (cancelled || externallyCancelled?.()) {
@@ -2112,7 +2791,7 @@ const consumeChatRun = async (
           expired: true,
         });
       }
-      await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
+      await finalizeChatRunSafely(task.id, myInstanceId, "cancelled", {
         task,
       });
       return;
@@ -2127,8 +2806,25 @@ const consumeChatRun = async (
       () => cancelled || !!externallyCancelled?.(),
       myInstanceId >= 0 ? myInstanceId : undefined,
     );
+    // 重连链已走完（接管成功 / 放弃 / 被停止 / 让位）。接管成功时暂存的后台结果早已放回新实例；
+    // 还留在暂存里的就是没等到可送会话的（放弃 / 停止 / 让位）——不留给以后的任何会话，
+    // 清掉并如实告诉用户。fire-and-forget、不 await：不给下面的收尾路径平添一个时序点
+    discardStashedBackgroundResults(
+      task.id,
+      handled ? "会话已被停止或替换" : "自动重连未能恢复会话",
+    );
     if (!handled) {
-      await handleChatRunFailure(task, err, myInstanceId);
+      // 重连放弃时坏实例已被重连链摘表（表空）：实例 CAS 的常规收尾必然落空、
+      // 状态会永远停在 running——走专用收尾（见 finalizeReconnectGaveUp）。
+      // 表内仍是本实例（首轮就判不可重试等、未进退避）仍走常规 error 收尾；
+      // 表内是别的实例 = 用户新起的 run，两条路径都不碰。
+      const slotGone = myInstanceId >= 0 && !runningChats.has(task.id);
+      if (slotGone) {
+        console.error("[chat-runner] task", task.id, "自动重连放弃:", err);
+        await finalizeReconnectGaveUp(task, err);
+      } else {
+        await handleChatRunFailure(task, err, myInstanceId);
+      }
     }
   } finally {
     noteTurnWrapUp(task.id, rec?.agentId, ctx, streamEndedAt);
@@ -2156,6 +2852,288 @@ export type SendChatMessageResult =
   | "busy"
   | "no_session"
   | "send_failed";
+
+/**
+ * 把一条用户消息拼成喂给 agent 的最终文本：正文 + 附件段
+ * （图走 read 转 vision、路径自己 read/grep）。
+ * 普通 send 与「立即发送」steer 共用——两条路径喂给模型的文本必须一致。
+ */
+export const composeChatPrompt = (
+  text: string,
+  imagePaths?: string[],
+  attachmentPaths?: string[],
+): string => {
+  const lines: string[] = [text];
+  if (imagePaths && imagePaths.length > 0) {
+    lines.push(
+      "",
+      "[ATTACHED_IMAGES] 用户附了以下图片、请用 `read` 工具逐一读取（会转成 vision、你能直接看到图像内容）：",
+      ...imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
+    );
+  }
+  if (attachmentPaths && attachmentPaths.length > 0) {
+    lines.push(
+      "",
+      "[ATTACHED_PATHS] 用户附了以下文件 / 目录路径、按需用 `read` / `grep` / `glob` 读取：",
+      ...attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
+    );
+  }
+  return lines.join("\n");
+};
+
+/** steer 的结果（见 {@link steerChatRun}） */
+export type SteerChatResult =
+  /** 这一轮已经收下这条消息——调用方视为 handedOff */
+  | "delivered"
+  /** 没被这一轮收下（run 刚好结束 / SDK 要求按普通后续消息发）——调用方排队当下一轮 */
+  | "followup"
+  /** run 被用户停止 / 会话被摘除（非系统换实例）/ 超过 STEER_TOTAL_TIMEOUT_MS 仍未落定——消息作废 */
+  | "cancelled"
+  /**
+   * 实例被系统换掉（自动重连 / error 收尾 / 懒重启强清）、这条 steer 没确认送达，用户并没有停止——
+   * 调用方按「至少一次」重排队为 followup（宁可重复一条、也不静默丢用户的话）。
+   */
+  | "replaced";
+
+/** steerChatRun 的可选参数 */
+export type SteerChatOpts = {
+  settleGraceMs?: number;
+  totalTimeoutMs?: number;
+  /**
+   * 「立即发送」的那条排队消息（itemId + 用户看到的原文）：在飞期间登记到会话记录上，
+   * 供 error 收尾把它和队里其它消息一并判失败 / 计入「未送达」提示。后台结果 steer 等不带。
+   */
+  item?: { itemId: string; displayText: string };
+  /**
+   * 超过总期限仍未落定时回调（先于返回 cancelled）。给了就表示**调用方自己负责向用户说明**，
+   * 本函数不再写那条面向「用户插话」的通用提示（措辞是「一条插话…」，对后台子代理结果这类不是用户说的话不贴切）。
+   * 后台结果批（drainBackgroundResults）用它按自己的口径写「未送达」。
+   */
+  onTimeout?: () => void;
+};
+
+/** run 结束后再等 steer 落定的宽限；超时就按 run 终态收尾，不让「立即发送」永远悬着 */
+const STEER_SETTLE_GRACE_MS = 5000;
+
+/**
+ * 一次 steer 从发出到落定的总期限。
+ * 为什么要有：steer 要等「这一轮真正收下」才 resolve；主 AI 卡在跑得很久的工具里、run 又一直不结束时，
+ * 既不 resolve / reject，STEER_SETTLE_GRACE_MS 也不会起算（它从 run 结束才开始计）——
+ * 「立即发送」会永远悬在「已落盘未送达」，消息在界面上既没送达也没失败。
+ * 取 30 分钟：要长于绝大多数前台长工具（构建 / 测试 / 子代理），避免把还会被收下的插话误判失败，
+ * 又远短于整轮 24h 硬顶——到期按失败处理（返回 cancelled）并在事件流里如实说明。
+ */
+export const STEER_TOTAL_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * 把本轮已缓冲的半截回复先落成 assistant_message（best-effort，失败只告警）。
+ * assistant 文本是按「一段」缓冲、遇到工具调用 / 收尾才写盘的；插话的 user_reply
+ * 直接落盘——不先冲，半截话会排到用户插话「后面」，读起来像 AI 先听见了再说。
+ */
+export const flushChatAssistantBuffer = async (
+  taskId: string,
+): Promise<void> => {
+  const flush = runningChats.get(taskId)?.flushAssistant;
+  if (!flush) return;
+  try {
+    await flush();
+  } catch (err) {
+    console.warn(`[chat-runner] 插话前冲刷半截回复失败 task=${taskId}:`, err);
+  }
+};
+
+/**
+ * 当前能不能把一条消息「顶」进正在跑的这一轮。
+ * 条件：有会话、run 在消费、拿得到本轮 run 句柄且它支持 steer（只有 Cursor 本地 run
+ * 有；pi 自研后端 / 冷启动占位 / 刚收尾的空窗都没有——调用方回退到旧的「打断重发」）。
+ */
+export const canSteerChatRun = (taskId: string): boolean => {
+  if (isChatRewindInProgress(taskId)) return false;
+  const rec = runningChats.get(taskId);
+  if (!rec || !rec.runActive || !rec.currentRun) return false;
+  return typeof rec.currentRun.steer === "function";
+};
+
+/**
+ * 把消息插进正在跑的这一轮（Codex / Cursor IDE 的「插话」语义）：不停止、不重开会话，
+ * AI 在当前步骤（工具调用 / 一段输出）结束后读到它并转向。
+ *
+ * ⚠️ `run.steer()` 要等「这一轮真正收下这条消息」才 resolve——主 AI 卡在一个跑得很久的
+ * 工具里时，要等工具返回（实测）。所以本函数可能挂很久，调用方必须 fire-and-forget、
+ * 靠 message_op 推送收尾，绝不能让 HTTP 请求同步等它。
+ *
+ * 失败 / 异常一律降级 followup（消息不丢、按下一轮发）；run 被用户停止 → cancelled；
+ * 实例被自动重连换掉（用户没停）→ replaced，调用方按「至少一次」重排队。
+ * 调用方在写 user_reply 之前应先 {@link flushChatAssistantBuffer}，事件顺序才是
+ * 「AI 说了半句 → 用户插话」。
+ */
+export const steerChatRun = async (
+  taskId: string,
+  prompt: string,
+  opts?: SteerChatOpts,
+): Promise<SteerChatResult> => {
+  // 在飞期间把这条消息登记到会话记录上（error 收尾清队时要能看见它，见 RunningChatRecord.inflightSteers）；
+  // 落定（任何出口，含抛错）即注销。登记与注销都绑定「steer 开始时的那个 record」。
+  const item = opts?.item;
+  const registeredOn = item ? runningChats.get(taskId) : undefined;
+  // 调用方已经提前登记过（registerInflightSteer，第八轮 L5-01）：登记与注销都归它管，这里不重复、也不替它注销——
+  // 否则 steer 一落定本函数就把条目删了，到调用方处理结果（重排 / 记终态）之间的几个微任务里，error 收尾又看不见这条消息。
+  const preRegistered =
+    !!item && !!registeredOn?.inflightSteers?.has(item.itemId);
+  if (item && registeredOn && !preRegistered) {
+    (registeredOn.inflightSteers ??= new Map()).set(item.itemId, item.displayText);
+  }
+  try {
+    return await steerChatRunInner(taskId, prompt, opts);
+  } finally {
+    if (item && registeredOn && !preRegistered) {
+      registeredOn.inflightSteers?.delete(item.itemId);
+    }
+  }
+};
+
+/**
+ * 在「take 之后、steerChatRun 起手之前」就把一条「立即发送」steer 的消息登记到当前会话记录上（第八轮 L5-01）。
+ *
+ * 为什么要有：这条消息已被 take 出队、又不占 in-flight 槽；take 之后还要 await 冲半截回复 / 落 user_reply / 检查点，
+ * steerChatRun 的登记要等这些都做完才发生。这段空窗里 error 收尾清队，消息既不在队里、也不在 inflightSteers，
+ * 就会被记成 failed(stopped)、也不进「N 条未送达」提示。提前登记后 error 收尾能把它和队里其它消息一并判失败。
+ *
+ * 绑定「登记时的那个 record」；没有会话（空窗里已被摘）返回空操作。返回的注销函数幂等，调用方在这条消息有了定论
+ * （送达 / 重排 / 记终态 / 提前返回）之后调用。steerChatRun 见到已登记的条目不会再重复登记 / 注销。
+ */
+export const registerInflightSteer = (
+  taskId: string,
+  item: { itemId: string; displayText: string },
+): (() => void) => {
+  const rec = runningChats.get(taskId);
+  if (!rec) return () => {};
+  (rec.inflightSteers ??= new Map()).set(item.itemId, item.displayText);
+  return () => {
+    rec.inflightSteers?.delete(item.itemId);
+  };
+};
+
+const steerChatRunInner = async (
+  taskId: string,
+  prompt: string,
+  opts?: SteerChatOpts,
+): Promise<SteerChatResult> => {
+  const settleGraceMs = opts?.settleGraceMs ?? STEER_SETTLE_GRACE_MS;
+  const totalTimeoutMs = opts?.totalTimeoutMs ?? STEER_TOTAL_TIMEOUT_MS;
+  const rec = runningChats.get(taskId);
+  const run = rec?.currentRun;
+  if (!rec || !run || typeof run.steer !== "function") return "followup";
+  const instanceId = rec.instanceId;
+
+  let steerPromise: Promise<
+    { kind: "outcome"; outcome: string } | { kind: "error"; err: unknown }
+  >;
+  try {
+    steerPromise = run.steer(prompt).then(
+      (outcome) => ({ kind: "outcome" as const, outcome }),
+      (err: unknown) => ({ kind: "error" as const, err }),
+    );
+  } catch (err) {
+    console.warn(`[chat-runner] steer task=${taskId} 同步抛错、降级排队:`, err);
+    return "followup";
+  }
+
+  // run 先结束（自然收尾 / 被停止）：steer 本该很快落定，给个宽限、超时按 run 终态收尾
+  const grace: { timer: NodeJS.Timeout | null; done: boolean } = {
+    timer: null,
+    done: false,
+  };
+  const endedFirst = run
+    .wait()
+    .then(
+      (r) => r.status as string,
+      () => "error",
+    )
+    .then(
+      (status) =>
+        new Promise<{ kind: "ended"; status: string }>((resolve) => {
+          if (grace.done) return;
+          grace.timer = setTimeout(
+            () => resolve({ kind: "ended", status }),
+            settleGraceMs,
+          );
+        }),
+    );
+
+  // 实例被自动重连换掉：断流后 steer / wait 是拒绝还是挂起没验证过，别指望它们一定落定——
+  // 重连链摘实例时（markChatInstanceReplacedByReconnect）直接唤醒本次等待
+  let wakeReplaced!: () => void;
+  const replacedFirst = new Promise<{ kind: "replaced" }>((resolve) => {
+    wakeReplaced = () => resolve({ kind: "replaced" });
+  });
+  (rec.replacedWaiters ??= new Set()).add(wakeReplaced);
+
+  // 总期限：steer / run.wait / 摘表唤醒三条路都没落定时的最后兜底（见 STEER_TOTAL_TIMEOUT_MS）
+  const total: { timer: NodeJS.Timeout | null } = { timer: null };
+  const timedOutFirst = new Promise<{ kind: "timeout" }>((resolve) => {
+    total.timer = setTimeout(() => resolve({ kind: "timeout" }), totalTimeoutMs);
+  });
+
+  const settled = await Promise.race([
+    steerPromise,
+    endedFirst,
+    replacedFirst,
+    timedOutFirst,
+  ]);
+  grace.done = true;
+  if (grace.timer) clearTimeout(grace.timer);
+  if (total.timer) clearTimeout(total.timer);
+  rec.replacedWaiters?.delete(wakeReplaced);
+
+  const stillCurrent = runningChats.get(taskId)?.instanceId === instanceId;
+  // 摘表的是系统（重连 / error 收尾 / 懒重启，而非用户停止）：先于一切「会话被摘除 → cancelled」判断，
+  // 否则消息既没送达、用户也没撤销，却被记成 failed(stopped) 静默丢掉
+  const replacedByReconnect = rec.replacedByReconnect === true;
+  if (settled.kind === "replaced") return "replaced";
+  if (settled.kind === "timeout") {
+    if (replacedByReconnect) return "replaced";
+    console.warn(
+      `[chat-runner] steer task=${taskId} 超过 ${Math.round(totalTimeoutMs / 1000)}s 仍未落定、按失败处理`,
+    );
+    if (opts?.onTimeout) {
+      // 调用方（后台结果批）自己说明——见 SteerChatOpts.onTimeout
+      opts.onTimeout();
+      return "cancelled";
+    }
+    // 不带用户原文（user_reply 气泡已在，且原文可能含敏感内容）；owned sink——会话已换人就不写了
+    await writeOwnedEventAndPublish(
+      taskId,
+      () => runningChats.get(taskId)?.instanceId === instanceId,
+      {
+        kind: "info",
+        text:
+          `一条插话等了 ${Math.max(1, Math.round(totalTimeoutMs / 60_000))} 分钟仍没被这一轮收下，按失败处理（没有重发）；` +
+          "若 AI 稍后仍读到它，会按这条插话继续，不想要可以停止本轮",
+      },
+    );
+    return "cancelled";
+  }
+  if (settled.kind === "outcome") {
+    if (settled.outcome === "complete_delivered") return "delivered";
+    // "revert_to_followup"：SDK 明确说这条没被收下、按普通后续消息发
+    if (stillCurrent) return "followup";
+    return replacedByReconnect ? "replaced" : "cancelled";
+  }
+  if (settled.kind === "error") {
+    console.warn(
+      `[chat-runner] steer task=${taskId} 失败、降级排队:`,
+      settled.err,
+    );
+    if (stillCurrent) return "followup";
+    return replacedByReconnect ? "replaced" : "cancelled";
+  }
+  // ended：run 已结束但 steer 迟迟没落定
+  if (replacedByReconnect) return "replaced";
+  return settled.status === "cancelled" || !stillCurrent
+    ? "cancelled"
+    : "followup";
+};
 
 /**
  * 把用户新消息发给存活的 chat 会话（`agent.send`）、消费产生的新 run。
@@ -2225,6 +3203,13 @@ export const sendChatMessage = async (
   // 立刻占位；send 抛错时清回 false（consumeChatRun 入口置 true 保持幂等）
   // owner 认领场景：已是 true，再赋一次幂等
   rec.runActive = true;
+  // 上一轮的句柄已失效；新 run 由 consumeChatRun 接管时再置
+  rec.currentRun = undefined;
+  rec.flushAssistant = undefined;
+  // 上一轮遗留的关闭原因作废：cancel 时那一轮若恰好已自然结束、会话留了下来，
+  // 它不能串到这一轮（例如 24h 硬超时的取消会被误标成「会话重启」）
+  rec.pendingCloseReason = undefined;
+  rec.pendingCloseBackground = undefined;
 
   // `agent.send()` 是 await 点——用户可在 promise pending 期间 stop。
   // claim 型 record 的 cancel 会摘除实例（resolve 后表复查可见）；但普通 record 的
@@ -2241,26 +3226,9 @@ export const sendChatMessage = async (
     cancelBeforeSend();
   };
 
-  // 组消息：正文 + 附件段（图走 read 转 vision、路径自己 read/grep）
-  const lines: string[] = [text];
-  if (imagePaths && imagePaths.length > 0) {
-    lines.push(
-      "",
-      "[ATTACHED_IMAGES] 用户附了以下图片、请用 `read` 工具逐一读取（会转成 vision、你能直接看到图像内容）：",
-      ...imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
-    );
-  }
-  if (attachmentPaths && attachmentPaths.length > 0) {
-    lines.push(
-      "",
-      "[ATTACHED_PATHS] 用户附了以下文件 / 目录路径、按需用 `read` / `grep` / `glob` 读取：",
-      ...attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
-    );
-  }
-
   let run: ChatRun;
   try {
-    const prompt = lines.join("\n");
+    const prompt = composeChatPrompt(text, imagePaths, attachmentPaths);
     const perfTracker = createRunPerfTracker({
       taskId: task.id,
       agentId: rec.agent.agentId,
@@ -2293,7 +3261,13 @@ export const sendChatMessage = async (
   } catch (err) {
     rec.runActive = false;
     console.error(`[chat-runner] sendChatMessage: task=${task.id} send 失败`, err);
-    closeChatSession(task.id, rec.instanceId);
+    // 用户 stop 导致的抛错按用户主动关；其余是 send 自己失败，仍在跑的后台子代理会被取消——让用户看得见
+    // ⚠️ 这条 reason=error 的关闭**不是** run 出错收尾：它不清队、不并入 inflightSteers（那是 finalize error / 兜底做的）。
+    // 理论上此刻没有活 run（runActive 刚被置 false），在飞的「立即发送」steer 只可能是上一轮刚结束、宽限内未落定的——
+    // 它会被唤醒为 replaced、由 requeueAsFollowup 重排回队首（至少一次），**不会**像 run 出错收尾那样记 failed(error)
+    closeChatSession(task.id, rec.instanceId, {
+      reason: cancelledDuringSend ? "user" : "error",
+    });
     // send pending 期间被用户 stop、随后 send 又抛错 → 终态 cancelled，
     // 绝不能返 send_failed 让 chat-reply 落 mode 2 把消息重放出去
     if (cancelledDuringSend) {
@@ -2502,7 +3476,22 @@ export const deliverChatAskReply = async (
 export const flushChatQueue = async (taskId: string): Promise<void> => {
   // 与 rewind begin→复查 draining 配对：门闩已占则绝不 dequeue，避免「队列已空
   // → rewind 复查放行」与随后 checkpoint/send 并发
-  if (isChatRewindInProgress(taskId)) return;
+  if (isChatRewindInProgress(taskId)) {
+    // 只 return 会把这次触发吞掉：门闩占着时队列非空，rewind 的锁内复查必因「仍有排队」
+    // 拒绝回退、释放门闩——之后再没人 flush，就剩「会话空闲 + 队列非空 + 无人 drain」，
+    // 已 202 的排队消息永远不发（run 收尾链式 flush / steer 落 followup 的补 flush 都会撞上）。
+    // 与 releaseChatRunClaim 同款：等门闩解除后补 drain（回退成功会清队，补 drain 自然 no-op）。
+    // 仅「会话在 + run 空闲 + 队列非空」才补：无会话时队列归启动状态机，补 drain 会误清；
+    // run 仍活跃时等它自己收尾的链式 flush。
+    if (
+      getChatQueueCount(taskId) > 0 &&
+      hasChatSession(taskId) &&
+      !isChatRunActive(taskId)
+    ) {
+      scheduleQueueDrainAfterGate(taskId);
+    }
+    return;
+  }
 
   // per-task 单 owner drain——非 owner 直接返回，防双 drain 并发 dequeue
   // 破坏 FIFO / 两个 finally 提前清 draining 标记。Node 单线程：同步
@@ -2740,6 +3729,200 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
   }
 };
 
+// ----------------- 后台子代理结果投递 -----------------
+
+/**
+ * 后台子代理收尾 → 把结果作为一条消息送回主 AI（见 subagent-background）。
+ *  - 事件流先落一行给用户看的提示（正文只交给主 AI、由它转述，避免长输出刷屏）。
+ *    这行落在结果真正进 send 之前，所以只说「将转交」、不能说「已交给」；之后若没送成
+ *    （会话关了 / 重连放弃 / 被停止）由关会话 / 重连链尾另写一句「未送达」，不留假提示；
+ *  - 主 AI 空闲：唤醒一轮（sendChatMessage，不落用户气泡——这不是用户说的话）；
+ *  - 主 AI 在忙：能 steer 就插进当前这一轮，否则攒着、这一轮收尾时再送。
+ * 被取消的（停止 / 关会话 / 删任务）没人要结果，直接丢。
+ */
+const deliverBackgroundSubagentResult = async (
+  taskId: string,
+  evt: BackgroundSubagentEvent,
+): Promise<void> => {
+  if (evt.status === "cancelled") return;
+  const rec = runningChats.get(taskId);
+  // 会话已不是发起它的那个（关了 / 换了新实例）：结果送给新会话只会让它莫名其妙
+  if (!rec || (evt.parentAgentId && rec.agentId !== evt.parentAgentId)) {
+    console.warn(
+      `[chat-runner] 后台子代理 ${evt.jobId} 收尾时会话已不在 task=${taskId}、结果丢弃`,
+    );
+    return;
+  }
+  const instanceId = rec.instanceId;
+  try {
+    await writeOwnedEventAndPublish(
+      taskId,
+      () => runningChats.get(taskId)?.instanceId === instanceId,
+      { kind: "info", text: formatBackgroundSubagentNotice(evt) },
+    );
+  } catch (err) {
+    console.warn(`[chat-runner] 后台子代理提示落盘失败 task=${taskId}:`, err);
+  }
+  // 落提示是 await：期间会话可能被关 / 被换（用户停止、回退、重启、重连摘实例）。closeChatSession 清的是
+  // 「那一刻」的待送队列，这条还没入队、清不到；这里若照常入队就成了孤儿，会被同一持久化 agent
+  // （agentId 相同，按 agentId 拦不住）的下一个新会话在收尾时送出。所以入队前按 instanceId 复核发起它的实例还在，
+  // 不在就如实写「未送达」（到达提示因 owner 失效多半也没落，用户至少看到这一句）。
+  if (runningChats.get(taskId)?.instanceId !== instanceId) {
+    noticeBackgroundResultsDropped(taskId, 1, "会话已关闭");
+    return;
+  }
+  const list = pendingBackgroundResults.get(taskId) ?? [];
+  list.push(formatBackgroundSubagentMessage(evt));
+  pendingBackgroundResults.set(taskId, list);
+  await drainBackgroundResults(taskId);
+};
+
+/**
+ * 把攒着的后台子代理结果送进主 AI（一次合并成一条消息）。
+ * 幂等、可重复调：没东西 / 没会话直接返回；送不出去的放回去等下一次（这一轮收尾会再调）。
+ */
+export const drainBackgroundResults = async (taskId: string): Promise<void> => {
+  const rec = runningChats.get(taskId);
+  const queued = pendingBackgroundResults.get(taskId);
+  if (!rec || !queued || queued.length === 0) return;
+  // rewind 门闩中：回退若成功，会话马上被关、攒着的随之作废（closeChatSession 会如实提示），别往里送。
+  // 但回退也可能最终被拒（找不到检查点 / 仍有排队 / 恢复失败…）：门闩释放后会话仍在且空闲，
+  // 此后没有任何 run 收尾会再调本函数，结果就卡在「已提示将转交、却永远不送」。
+  // 所以会话空闲时等门闩解除后补一次（同 flushChatQueue 撞门闩的口径；run 还在跑则等它自己的收尾 drain）。
+  if (isChatRewindInProgress(taskId)) {
+    if (!rec.runActive) scheduleQueueDrainAfterGate(taskId);
+    return;
+  }
+
+  const putBack = (batch: string[]): void => {
+    // 会话期间被关了（closeChatSession 已清掉这个 key）就别再复活——但这批已经落过「将转交」的提示，
+    // 不能就此悄悄没了：如实补一句「未送达」
+    if (runningChats.get(taskId)?.instanceId !== rec.instanceId) {
+      noticeBackgroundResultsDropped(taskId, batch.length, "会话已关闭");
+      return;
+    }
+    const cur = pendingBackgroundResults.get(taskId) ?? [];
+    pendingBackgroundResults.set(taskId, [...batch, ...cur]);
+  };
+  const SEP = "\n\n---\n\n";
+
+  if (rec.runActive) {
+    // 忙：能 steer 就插进当前这一轮（AI 当前步骤结束后读到），否则等这一轮收尾（finalize 会再调本函数）
+    if (!canSteerChatRun(taskId)) return;
+    const batch = queued.splice(0);
+    // 总期限（STEER_TOTAL_TIMEOUT_MS）内主 AI 一直没收下：steerChatRun 返回 cancelled，但这和「会话被停止 / 关闭」不是一回事——
+    // 会话与这一轮都还在，SDK 之后仍可能读到这批结果。措辞要如实：不写「已被停止或关闭」，
+    // 也不沿用面向用户插话的「一条插话…」（这批不是用户说的话），由这里按后台结果的口径写
+    const steerState = { timedOut: false };
+    const outcome = await steerChatRun(taskId, batch.join(SEP), {
+      onTimeout: () => {
+        steerState.timedOut = true;
+      },
+    });
+    // replaced（实例被自动重连换掉、用户没停）：steer 没确认送达，这批结果不能丢——
+    // 它们是已经完成的子代理的产出，对重连接回的新实例（同一持久化 agent 的续接）仍然有效。
+    // 这里先前直接 return 丢掉，与「窗口内完成」同属结果丢失。暂存给重连链，新实例接回后放回待送队列、
+    // 由那一轮收尾的 drain 送出；重连放弃 / 被停止则由链尾清掉并提示「未送达」。
+    // 按旧实例（本函数起手拿到的 rec）的 agentId 绑定，绝不送进别的会话；排在已暂存的前面（它们更早到达）。
+    // 与用户消息的「至少一次」重排（chat-queue-send-now 的 requeueAsFollowup）互不相干：一个走队列、一个走暂存。
+    //
+    // ⚠️ 只有 reason=reconnect 才暂存：replaced 还包括 error 收尾 / 懒重启——它们没有「新实例接回」这一步，
+    // 暂存永远等不到出口（用户只在到达时看到过「将转交」，之后一声不响），日后任何同 agentId 的重连
+    //（持久化 agent 的 id 跨会话不变）还会把这些陈旧结果当成自己的投进去。这两种按 closeChatSession 的口径作废并写「未送达」。
+    if (outcome === "replaced") {
+      const replacedReason = rec.replacedReason;
+      if (replacedReason === "reconnect" && rec.agentId) {
+        stashBackgroundResults(taskId, rec.agentId, batch, "front");
+      } else {
+        noticeBackgroundResultsDropped(
+          taskId,
+          batch.length,
+          replacedReason && replacedReason !== "user"
+            ? CHAT_CLOSE_REASON_LABEL[replacedReason]
+            : "会话已被替换",
+        );
+      }
+      return;
+    }
+    if (outcome === "delivered") return;
+    // cancelled：没人要了，作废。出错收尾（含 sendChatMessage send 抛错的 error 关闭）/ 懒重启 / 自动重连摘实例
+    // 不在这里（那几种是 replaced，走上面）；这里是用户停止 / 回退 / 删任务 / 总期限内没被收下。
+    // 但这批已经 splice 出队、到达时也落过「将转交」，只有本函数手里还拿着它——
+    // closeChatSession 清的 pending 里没有它，不在这里说一句就是悄悄没了。
+    // 超时与「会话被关」要分开说（见上面 steerState.timedOut）；其余原因这里分不出（steerChatRun 只回 cancelled）
+    if (outcome === "cancelled") {
+      noticeBackgroundResultsDropped(
+        taskId,
+        batch.length,
+        steerState.timedOut
+          ? `等了 ${Math.max(1, Math.round(STEER_TOTAL_TIMEOUT_MS / 60_000))} 分钟仍没被这一轮收下；会话还在，若 AI 稍后仍读到会照常使用`
+          : "会话已被停止或关闭",
+      );
+      return;
+    }
+    putBack(batch);
+    // 退回的原因多半是这一轮刚好结束：空闲了就直接唤醒，别等不会再来的收尾
+    if (!isChatRunActive(taskId)) void drainBackgroundResults(taskId);
+    return;
+  }
+
+  // 空闲：唤醒一轮
+  const batch = queued.splice(0);
+  // 这批已 splice 出队、到达时也落过「将转交」，只有本函数手里拿着它：读任务抛错（meta 半写 / EIO）时
+  // 不能让异常把它带走——外层只会 console.warn，用户就以为交给了主 AI，实际悄悄没了。如实补一句「未送达」
+  let task: Task | null;
+  try {
+    task = await getTask(taskId);
+  } catch (err) {
+    console.warn(`[chat-runner] 唤醒送后台结果前读任务失败 task=${taskId}:`, err);
+    noticeBackgroundResultsDropped(taskId, batch.length, "读取任务失败");
+    return;
+  }
+  // 任务已删除 / tombstone：没有人在看这条事件流了，不再提示
+  if (!task) return;
+  const sent = await sendChatMessage(task, batch.join(SEP));
+  if (sent === "sent") return;
+  if (sent === "cancelled" || sent === "owner_invalid" || sent === "no_session") {
+    // 会话没了 / 被停止：结果作废，同样如实告诉用户没送到
+    noticeBackgroundResultsDropped(taskId, batch.length, "会话已关闭或被停止");
+    return;
+  }
+  // busy / send_failed：放回去，等下一次（别人的 run 收尾时会再调）
+  putBack(batch);
+  // 例外：busy 是因为 rewind 门闩恰好在上面 getTask 的 await 里占上了——回退若被拒，没有 run 收尾会再调本函数，
+  // 等门闩解除后补一次。仅「放回成功（同一实例仍在）+ 空闲」才补：会话已关就轮不到它，run 在跑则等它的收尾 drain
+  if (
+    isChatRewindInProgress(taskId) &&
+    runningChats.get(taskId)?.instanceId === rec.instanceId &&
+    !isChatRunActive(taskId)
+  ) {
+    scheduleQueueDrainAfterGate(taskId);
+  }
+};
+
+{
+  // 订阅一次（hot reload 先注销旧的，免得重复投递）
+  const KEY = "__flowshipChatBackgroundSubagentUnsub__";
+  const g = globalThis as unknown as Record<string, (() => void) | undefined>;
+  g[KEY]?.();
+  g[KEY] = onBackgroundSubagentSettled((taskId, evt) => {
+    void deliverBackgroundSubagentResult(taskId, evt).catch((err) => {
+      console.warn(
+        `[chat-runner] 后台子代理结果投递失败 task=${taskId}:`,
+        err,
+      );
+    });
+  });
+}
+
+/**
+ * 用户插话（「立即发送」steer）时调：把主 AI 正在前台等的子代理全部转后台，
+ * 它那个阻塞的工具调用立刻返回，主 AI 马上能读到用户的话。返回转了几个（无会话 / 不支持 = 0）。
+ */
+export const detachChatForegroundSubagents = (taskId: string): number =>
+  getSubagentSessionControl(runningChats.get(taskId)?.agent)?.detachForeground() ??
+  0;
+
 // ----------------- 释放认领后等 rewind 门闩再补 drain -----------------
 
 /**
@@ -2749,6 +3932,9 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
  * 若 rewind 最终成功，closeChatSessionUnconditional 已清队，补 drain 自然 no-op；
  * 若 rewind 被拒绝（队列非空正是拒因），补 drain 把已 202 的排队消息发出去——
  * 否则 session idle && queue>0 && !draining 永久悬空。
+ *
+ * 门闩解除后顺带补一次后台子代理结果的 drain（drainBackgroundResults 撞门闩同样只能 return）：
+ * 先 flush 用户排队的话、再送结果——与收尾时 `flushChatQueue` 先于 `drainBackgroundResults` 同序。
  *
  * 同 task 已有 deferred drain 在等则去重 return，防叠加轮询。
  */
@@ -2783,6 +3969,7 @@ const scheduleQueueDrainAfterGate = (taskId: string): void => {
         await new Promise((r) => setTimeout(r, DEFERRED_DRAIN_POLL_MS));
       }
       await flushChatQueue(taskId);
+      await drainBackgroundResults(taskId);
     } catch (err) {
       console.warn(
         `[chat-runner] scheduleQueueDrainAfterGate task=${taskId} 失败:`,

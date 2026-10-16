@@ -639,6 +639,11 @@ describe("executeChatRewind 事务回滚与门闩", () => {
           "utf-8",
         );
         expect(eventsAfter).not.toBe(eventsBefore);
+        // 前滚路径也要如实回报保留条数（客户端据此截断本地窗口）
+        expect(res.keptEventCount).toBe(
+          eventsAfter.split("\n").filter(Boolean).length,
+        );
+        expect(res.truncatedEventCount).toBeGreaterThan(0);
 
         // 目标点已消费移除；pre_rewind 安全点保留
         const points = await readRewindPoints(TASK_ID);

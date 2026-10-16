@@ -28,7 +28,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("body 不是合法 JSON");
   }
 
-  // 输入条运行中也能发：queueIfBusy 只认严格的 true，clientItemId 做入队幂等（前端重试不重复排）
+  // 输入条运行中也能发：queueIfBusy 只认严格的 true，clientItemId 做入队幂等（前端重试不重复排）。
+  // 空闲直送路径的幂等不在这里做：body 原样透传，注入链入口按 (task, clientItemId, 正文指纹)
+  // 同步登记「处理中」——并发重发等第一次的结果、送达后重试命中回 200 `deduped:true`、
+  // 失败则撤销登记让重试真正再注入（见 task-question-inject 的空闲直送幂等：在途 / 已送达两张表）
   const b = (body ?? {}) as { queueIfBusy?: unknown; clientItemId?: unknown };
   const clientItemId =
     typeof b.clientItemId === "string" && b.clientItemId.trim()

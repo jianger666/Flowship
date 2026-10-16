@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   catalogFromModelOptions,
+  currentEffortValue,
   findEffortParam,
   formatModelCatalog,
+  isInheritModelArg,
   MODEL_LIST_MAX,
   normalizeSubagentType,
   parseSubagentRequest,
@@ -436,6 +438,103 @@ describe("Cursor 模型的 effort 参数 id 不统一", () => {
       const r = resolveSubagentModel({ model, effort: "high" }, { id: "claude-sonnet-5-5" }, cat);
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toContain("没有 effort");
+    }
+  });
+});
+
+describe("parseSubagentRequest · resume", () => {
+  it("resume 字段：trim；空串 / 纯空白 / 非字符串 = 没填", () => {
+    const get = (resume: unknown) => {
+      const r = parseSubagentRequest({ prompt: "x", resume });
+      if (!r.ok) throw new Error("应解析成功");
+      return r.request.resume;
+    };
+    expect(get("  agent-1  ")).toBe("agent-1");
+    expect(get("")).toBeUndefined();
+    expect(get("   ")).toBeUndefined();
+    expect(get(42)).toBeUndefined();
+    expect(get(undefined)).toBeUndefined();
+  });
+
+  it("resume 不影响 prompt 必填（接着做也得说清楚做什么）", () => {
+    expect(parseSubagentRequest({ resume: "agent-1" }).ok).toBe(false);
+  });
+});
+
+describe("parseSubagentRequest · run_in_background", () => {
+  const get = (v: Record<string, unknown>) => {
+    const r = parseSubagentRequest({ prompt: "x", ...v });
+    if (!r.ok) throw new Error("应解析成功");
+    return r.request.runInBackground;
+  };
+
+  it("布尔 true / false 原样收；字符串 \"true\" / \"False\"（模型常把布尔写成字符串）也认", () => {
+    expect(get({ run_in_background: true })).toBe(true);
+    expect(get({ run_in_background: false })).toBe(false);
+    expect(get({ run_in_background: " TRUE " })).toBe(true);
+    expect(get({ run_in_background: "False" })).toBe(false);
+  });
+
+  it("驼峰别名 runInBackground 也认；蛇形优先", () => {
+    expect(get({ runInBackground: true })).toBe(true);
+    expect(get({ run_in_background: false, runInBackground: true })).toBe(false);
+  });
+
+  it("没填 / 乱填（数字、其它字符串、null）= undefined，不当成 true", () => {
+    expect(get({})).toBeUndefined();
+    expect(get({ run_in_background: 1 })).toBeUndefined();
+    expect(get({ run_in_background: "yes" })).toBeUndefined();
+    expect(get({ run_in_background: null })).toBeUndefined();
+  });
+});
+
+describe("currentEffortValue（卡片徽标：当前思考档）", () => {
+  it("取档位型参数的值（reasoning_effort / effort / thinking 都认）", () => {
+    expect(currentEffortValue([{ id: "reasoning_effort", value: "high" }])).toBe("high");
+    expect(currentEffortValue([{ id: "effort", value: "low" }])).toBe("low");
+    expect(currentEffortValue([{ id: "thinking", value: "medium" }])).toBe("medium");
+  });
+
+  it("大小写 / 空白不敏感；同时有多个按优先级取、跳过取不出值的", () => {
+    expect(currentEffortValue([{ id: " Reasoning_Effort ", value: " High " }])).toBe("High");
+    expect(
+      currentEffortValue([
+        { id: "reasoning_effort", value: "default" },
+        { id: "thinking", value: "low" },
+      ]),
+    ).toBe("low");
+  });
+
+  it("开关（true / false）、default、空串、没有该参数、没有参数 → undefined（不硬造档位）", () => {
+    expect(currentEffortValue([{ id: "thinking", value: "true" }])).toBeUndefined();
+    expect(currentEffortValue([{ id: "thinking", value: "false" }])).toBeUndefined();
+    expect(currentEffortValue([{ id: "reasoning_effort", value: "default" }])).toBeUndefined();
+    expect(currentEffortValue([{ id: "reasoning_effort", value: "  " }])).toBeUndefined();
+    expect(currentEffortValue([{ id: "fast", value: "true" }])).toBeUndefined();
+    expect(currentEffortValue([])).toBeUndefined();
+    expect(currentEffortValue(undefined)).toBeUndefined();
+  });
+});
+
+describe("isInheritModelArg（与 resolveSubagentModel 的「沿用」同口径）", () => {
+  it("缺省 / null / 空串 / inherit（不分大小写、可带空白）算沿用", () => {
+    for (const v of [undefined, null, "", "   ", "inherit", " Inherit ", "INHERIT"]) {
+      expect(isInheritModelArg(v)).toBe(true);
+    }
+  });
+
+  it("具体模型 id、list、非字符串（数字等）不算", () => {
+    for (const v of ["claude-sonnet-5-5", "list", "composer-2.5", 3, {}, []]) {
+      expect(isInheritModelArg(v)).toBe(false);
+    }
+  });
+
+  it("与 resolveSubagentModel 对 inherit 的判定一致", () => {
+    for (const model of [undefined, "", "inherit", "INHERIT", "gpt-5"]) {
+      const resolved = resolveSubagentModel({ model }, PARENT, CATALOG);
+      if (!resolved.ok) throw new Error("应解析成功");
+      // 缺省 / 空 / inherit → inherited；写成与父同 id 也是 inherited，但那不属于「model 参数缺省」
+      if (isInheritModelArg(model)) expect(resolved.inherited).toBe(true);
     }
   });
 });

@@ -137,3 +137,98 @@ describe("toSubagentDisplayCall", () => {
     expect(toSubagentDisplayCall(other)).toBe(other);
   });
 });
+
+describe("toSubagentDisplayCall · 徽标显示实际生效的模型 / 思考档", () => {
+  const PARENT = {
+    id: "claude-sonnet-5-5",
+    params: [
+      { id: "reasoning_effort", value: "high" },
+      { id: "fast", value: "false" },
+    ],
+  };
+  const call = (inner: Record<string, unknown>) => ({
+    ...running,
+    args: { ...running.args, args: inner },
+  });
+  const badge = (inner: Record<string, unknown>, parentModel: typeof PARENT | undefined = PARENT) => {
+    const out = toSubagentDisplayCall(call(inner), { parentModel });
+    return out.args as Record<string, unknown>;
+  };
+
+  it("model 缺省 / inherit：显示父会话实际模型；effort 没填：显示父会话当前思考档", () => {
+    for (const model of [undefined, "inherit", " INHERIT ", ""]) {
+      expect(badge({ prompt: "p", ...(model === undefined ? {} : { model }) })).toMatchObject({
+        prompt: "p",
+        model: "claude-sonnet-5-5",
+        effort: "high",
+      });
+    }
+  });
+
+  it("显式写了别的模型：model 原样；effort 没填也不套父会话的档（那是另一个模型自己的默认）", () => {
+    const a = badge({ prompt: "p", model: "composer-2.5" });
+    expect(a.model).toBe("composer-2.5");
+    expect(a).not.toHaveProperty("effort");
+  });
+
+  it("显式写了 effort：原样（那就是实际值）", () => {
+    expect(badge({ prompt: "p", model: "inherit", effort: "low" })).toMatchObject({
+      model: "claude-sonnet-5-5",
+      effort: "low",
+    });
+    expect(badge({ prompt: "p", model: "composer-2.5", effort: "max" })).toMatchObject({
+      model: "composer-2.5",
+      effort: "max",
+    });
+  });
+
+  it("写成与父同 id：算沿用，effort 没填就补父会话当前档", () => {
+    expect(badge({ prompt: "p", model: "Claude-Sonnet-5-5" })).toMatchObject({
+      model: "Claude-Sonnet-5-5",
+      effort: "high",
+    });
+  });
+
+  it("effort=default 当没填；父会话没有档位型参数（只有开关）→ 不硬造 effort", () => {
+    expect(badge({ prompt: "p", effort: "default" })).toMatchObject({ effort: "high" });
+    const noEffort = badge(
+      { prompt: "p" },
+      { id: "composer-2.5", params: [{ id: "fast", value: "true" }] },
+    );
+    expect(noEffort.model).toBe("composer-2.5");
+    expect(noEffort).not.toHaveProperty("effort");
+  });
+
+  it("resume 调用不改写：接着的是之前那个子代理，它当初用什么这里不知道，不硬造", () => {
+    const out = badge({ prompt: "p", resume: "agent-1" });
+    expect(out).toEqual({ prompt: "p", resume: "agent-1" });
+  });
+
+  it("不传 ctx / 没有父模型：行为与之前完全一样（徽标是原始入参）", () => {
+    const raw = { prompt: "p", model: "inherit" };
+    expect(toSubagentDisplayCall(call(raw)).args).toEqual(raw);
+    expect(toSubagentDisplayCall(call(raw), {}).args).toEqual(raw);
+    expect(toSubagentDisplayCall(call(raw), { parentModel: undefined }).args).toEqual(raw);
+  });
+
+  it("只改展示副本：原消息 / 原 args 对象一个字不动", () => {
+    const msg = call({ prompt: "p", model: "inherit" });
+    const snapshot = JSON.parse(JSON.stringify(msg));
+    toSubagentDisplayCall(msg, { parentModel: PARENT });
+    expect(msg).toEqual(snapshot);
+  });
+
+  it("completed 的 result 拆文本照旧，且不影响徽标改写", () => {
+    const out = toSubagentDisplayCall(
+      { ...call({ prompt: "p" }), status: "completed", result: envelope("答案") },
+      { parentModel: PARENT },
+    );
+    expect(out.result).toBe("答案");
+    expect((out.args as Record<string, unknown>).model).toBe("claude-sonnet-5-5");
+  });
+
+  it("不是 subagent 的消息：带 ctx 也原样返回（同一个引用）", () => {
+    const shell = { name: "shell", args: { command: "ls" } };
+    expect(toSubagentDisplayCall(shell, { parentModel: PARENT })).toBe(shell);
+  });
+});

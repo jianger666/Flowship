@@ -32,6 +32,33 @@ export const emptyCompanyEnv = (): CompanyEnv => ({
   httpApis: [],
 });
 
+/**
+ * 「添加」按钮落盘的默认行本来就带的字段，不算用户填了内容：
+ * env（默认 `"test"`）、port / db / readonly / namespaces（默认端口 / 库号 / 只读开关 / 空列表）。
+ * 注意 env 的默认值是 `"test"` 而不是空串——所以 env **必须**在这里豁免：漏掉它，刚点「添加」的默认行就成了「有内容」。
+ */
+const COMPANY_ENV_DEFAULT_ROW_FIELDS: ReadonlySet<string> = new Set([
+  "env",
+  "port",
+  "db",
+  "readonly",
+  "namespaces",
+]);
+
+/**
+ * 条目是否「空白行」（刚点「添加」、还没填任何文本字段）：只要主机 / 用户 / 密码 / 密钥 / 名称等任一文本字段
+ * 非空（trim 后）就不是；env / port / db / readonly / namespaces 是默认带的、不算（见 COMPANY_ENV_DEFAULT_ROW_FIELDS）。
+ *
+ * 两处共用同一份判定（改这里就是同时改两处，不要各抄一份名单）：
+ * - 设置页 company-env-card 的删除确认（空白行删除不弹确认，S13-14）；
+ * - 服务端 settings-fs 的收缩判定（添加再删掉空白行不算「子系统被清空」，否则这一来一回就把好的 `.bak.shrink` 顶掉）。
+ */
+export const isBlankCompanyEnvRow = (row: object): boolean =>
+  !Object.entries(row).some(
+    ([k, v]) =>
+      !COMPANY_ENV_DEFAULT_ROW_FIELDS.has(k) && typeof v === "string" && v.trim() !== "",
+  );
+
 export type CompanyEnvServerIssue = "missing-env" | "missing-user";
 
 /** 已填 host 的服务器必须同时有 env 和 user，否则 ssh-exec 无法选中 / 连接 */
@@ -42,6 +69,20 @@ export const findCompanyEnvServerIssue = (
   if (missingEnv) return "missing-env";
   const missingUser = env.servers.find((s) => s.host.trim() && !s.user.trim());
   if (missingUser) return "missing-user";
+  return null;
+};
+
+/**
+ * 单台服务器的缺项判定（设置页行内提示用，S13-02）。
+ * 只提示、不拦保存：缺 env / user 的服务器落盘后运行时只是「不注入对应字段」、不会出错，
+ * 之前把它做成「整份配置拒绝落盘」会连带阻断其它小节（PG / Redis…）的保存。
+ */
+export const findCompanyEnvServerRowIssue = (
+  s: Pick<CompanyEnvServer, "host" | "env" | "user">,
+): CompanyEnvServerIssue | null => {
+  if (!s.host.trim()) return null;
+  if (!s.env.trim()) return "missing-env";
+  if (!s.user.trim()) return "missing-user";
   return null;
 };
 

@@ -390,7 +390,9 @@ export const PreferenceSections = ({
           control={
             <Switch
               checked={agentShellGitBash}
-              disabled={!gitBashPath}
+              // S13-18：关闭始终可用——已开启但探测不到 Git Bash（卸载 / 路径变了）时也能关掉；
+              // 仅「打开」才要求探测到
+              disabled={!agentShellGitBash && !gitBashPath}
               onCheckedChange={(v) => {
                 // 等落盘 + server apply SHELL 完成，再刷新「当前」展示
                 void Promise.resolve(onAgentShellGitBashChange(v)).then(() =>

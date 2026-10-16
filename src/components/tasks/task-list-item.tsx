@@ -167,7 +167,8 @@ export const TaskListItem = ({
     actionCount >= 3 ? "pr-20" : hasActions ? "pr-14" : "pr-2";
 
   return (
-    <div className="group/item relative">
+    // data-task-id：侧栏据此把「当前打开的行」滚进可视区（见 app-sidebar 的滚动定位）
+    <div className="group/item relative" data-task-id={task.id}>
       {/* 当前任务：左侧 2px 强调竖条（对标 Cursor / Linear 的 active 指示） */}
       {active && (
         <span className="absolute inset-y-1 left-0 z-10 w-0.5 rounded-full bg-primary" />

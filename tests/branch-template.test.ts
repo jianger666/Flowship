@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   findUnknownPlaceholders,
+  guardRepoBranchTemplates,
   isSafeBranchName,
   renderBranchName,
   sanitizeBranchName,
@@ -90,5 +91,53 @@ describe("isSafeBranchName / sanitizeBranchName", () => {
 
   it("sanitizeBranchName 分段清洗并保留 /", () => {
     expect(sanitizeBranchName("a;b/c d")).toBe("a-b/c-d");
+  });
+});
+
+describe("guardRepoBranchTemplates（S13-01：其它保存动作不能把坏模板带进落盘）", () => {
+  const persisted = [
+    { path: "/a", name: "a", branchTemplate: "feature/{storyId}" },
+    { path: "/b", name: "b" },
+  ];
+
+  it("草稿含字面量 {yyMMdd} 的仓 → 落盘值回退旧模板、blocked 报出该仓", () => {
+    const draft = [
+      { path: "/a", name: "a-renamed", branchTemplate: "feat/{yyMMdd}" },
+      { path: "/b", name: "b" },
+    ];
+    const { repos, blocked } = guardRepoBranchTemplates(draft, persisted);
+    expect(blocked).toEqual(["/a"]);
+    // 其它字段（改名）照常落盘、只有坏模板被顶替
+    expect(repos[0]).toMatchObject({
+      name: "a-renamed",
+      branchTemplate: "feature/{storyId}",
+    });
+    expect(repos[1]).toBe(draft[1]);
+  });
+
+  it("旧值不存在（新仓 / 原本没配）→ 回落 undefined（用全局模板）", () => {
+    const { repos, blocked } = guardRepoBranchTemplates(
+      [{ path: "/b", name: "b", branchTemplate: "x/{yyMMdd}" }],
+      persisted,
+    );
+    expect(blocked).toEqual(["/b"]);
+    expect(repos[0].branchTemplate).toBeUndefined();
+  });
+
+  it("旧值自己也非法（历史脏数据）→ 不沿用、清空", () => {
+    const { repos } = guardRepoBranchTemplates(
+      [{ path: "/a", name: "a", branchTemplate: "{bad}" }],
+      [{ path: "/a", name: "a", branchTemplate: "{old-bad}" }],
+    );
+    expect(repos[0].branchTemplate).toBeUndefined();
+  });
+
+  it("全部合法 → 原样返回、blocked 为空", () => {
+    const draft = [
+      { path: "/a", name: "a", branchTemplate: "feat/{date:yyMMdd}-{taskTitle}" },
+    ];
+    const { repos, blocked } = guardRepoBranchTemplates(draft, persisted);
+    expect(blocked).toEqual([]);
+    expect(repos[0]).toBe(draft[0]);
   });
 });

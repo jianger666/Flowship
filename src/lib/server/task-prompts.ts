@@ -21,6 +21,8 @@ import {
 } from "./task-fs-core";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
+import { detectAgentShellKind, type AgentShellKind } from "./agent-shell";
+import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 import { formatRepoSectionForPrompt } from "@/lib/path-utils";
 import { resolveReqId } from "@/lib/req-id";
 import {
@@ -35,6 +37,7 @@ import {
 import { renderLightweightDailySection } from "@/lib/lightweight-task";
 import {
   readSkillBodyByName,
+  renderAppSkillsDirHint,
   renderSkillsForPrompt,
   type SkillEntry,
 } from "./skills-loader";
@@ -83,22 +86,53 @@ const NULL_PLACEHOLDER = "（未提供）";
  * 运行时注入「GitLab 访问」说明（settings 配了 gitToken 才注入）。
  * host 空时用「（host 见仓库 origin）」兜底；顺带钉死内置飞书 CLI 路径。
  * lark-cli 身份缺失规则见 buildLarkCliAuthMissingRule（task/chat 常驻注入、不绑 gitToken）。
+ *
+ * token 走环境变量 `FLOWSHIP_GITLAB_TOKEN`（server 在会话启动前写进 process.env、agent shell 继承，
+ * 见 git-token-env.ts）：agent 命令里只引用变量、不再 `jq` 去读 config.json——这样 token 值
+ * 不出现在命令文本里，也不用让 agent 打开含 apiKey / 公司环境密码的 config.json。
+ * 用法写在第一条 bullet（prompt 预算压缩只保留标题 + 前两行，见 compressToTwoLines）。
+ *
+ * @param opts.untrustedOriginHost 仓库 origin 指向的 host 与可信 host 不一致时传入（见
+ *   trusted-git-host.resolveGitHostForPrompt）：此时 gitHost 应是可信 host，文案加警告、禁止向 origin 地址发 token。
+ * @param opts.shellKind agent shell 种类（缺省探测当前平台）；PowerShell 补 `$env:` 写法。
  */
 export const buildGitlabAccessDirective = (
   gitHost: string | null | undefined,
   dataRootPath: string,
+  opts: {
+    untrustedOriginHost?: string;
+    shellKind?: AgentShellKind;
+  } = {},
 ): string => {
+  const untrusted = opts.untrustedOriginHost?.trim() ?? "";
   const host =
     typeof gitHost === "string" && gitHost.trim().length > 0
       ? gitHost.trim()
-      : "（host 见仓库 origin）";
+      : untrusted
+        ? "（可信 host 未能确定）"
+        : "（host 见仓库 origin）";
+  const shellKind = opts.shellKind ?? detectAgentShellKind();
+  const isPowerShell = shellKind === "PowerShell";
+  // bash / zsh / Git Bash 用 `$VAR`；PowerShell 的 curl 是 Invoke-WebRequest 别名，要写 curl.exe
+  const tokenRef = isPowerShell
+    ? `$env:${GITLAB_TOKEN_ENV_NAME}`
+    : `"$${GITLAB_TOKEN_ENV_NAME}"`;
+  const curlExample = isPowerShell
+    ? `curl.exe -s -H "PRIVATE-TOKEN: $env:${GITLAB_TOKEN_ENV_NAME}" "https://<host>/api/v4/projects/<url 编码的 project 路径>/merge_requests/<iid>"`
+    : `curl -s -H "PRIVATE-TOKEN: $${GITLAB_TOKEN_ENV_NAME}" "https://<host>/api/v4/projects/<url 编码的 project 路径>/merge_requests/<iid>"`;
+  const untrustedWarning = untrusted
+    ? `⚠️ 仓库 origin 指向的 GitLab 地址（${untrusted}）与 Flowship 绑定的可信 GitLab 不一致（origin 可能被改动）：**绝不要**向该地址发任何带 token 的请求；GitLab API 只对上面的 host 发起，并把这个异常告诉用户。`
+    : "";
+  // 内置 CLI 安装位置写进 prompt：agent shell 是登录壳、PATH 可能被 rc / 沙箱重置——
+  // `meegle` 报 command not found 时 agent 没有回退信息、会去 app bundle 里瞎翻浪费几轮
+  //（2026-07-16 用户实测）。跨平台统一此目录、Windows 下带 .exe 后缀。
   // 内置 CLI 安装位置写进 prompt：agent shell 是登录壳、PATH 可能被 rc / 沙箱重置——
   // `meegle` 报 command not found 时 agent 没有回退信息、会去 app bundle 里瞎翻浪费几轮
   //（2026-07-16 用户实测）。跨平台统一此目录、Windows 下带 .exe 后缀。
   const toolsBin = path.join(dataRootPath, "tools", "bin");
   return [
     "## GitLab 访问",
-    `- 系统已配置 GitLab（host: ${host}）；API 凭证在 \`${dataRootPath}/config.json\` 的 **gitToken 字段**（PRIVATE-TOKEN header）——用 jq/node 只取该字段、**不要 cat 整个文件**（里面还有其它密钥）。`,
+    `- 系统已配置 GitLab（host: ${host}）；API 凭证已放进环境变量 \`${GITLAB_TOKEN_ENV_NAME}\`（PRIVATE-TOKEN header）——命令里直接引用 \`${tokenRef}\`，如 \`${curlExample}\`；**不要**打开数据目录里的 config.json 找 token（里面还有其它密钥），**不要** echo / printenv / env / set 打印该变量，也别把它写进文件、脚本、commit 或 MR 描述（命令文本和输出会落进事件日志与会话存储）。${untrustedWarning}`,
     `- 读操作（查 MR / diff / pipeline）随便用；写操作只做任务明确要求的；绝不 merge MR / 删远程分支。内置 meegle / lark-cli 在 \`${toolsBin}\`——shell 直调报 command not found 就用该目录绝对路径、不要去别处找；不必预先跑 auth status 探测。`,
   ].join("\n");
 };
@@ -132,6 +166,7 @@ const renderSkillsCompressed = (skills: SkillEntry[]): string => {
   if (skills.length === 0) return renderSkillsForPrompt(skills);
   const lines: string[] = [
     "相对路径解析：SKILL.md 正文里的 `templates/` `references/` `scripts/` 等相对路径都在该 skill `path` 所在目录下、用 `read` 读；`kbRoot` 只用来解析 `knowledge-base/…` 这类库内路径。",
+    renderAppSkillsDirHint(),
     "（以下 desc 已因 prompt 预算压缩为 100 字，需要完整版用 read 读对应 SKILL.md）",
     "",
   ];
@@ -461,7 +496,7 @@ export const buildSuperPromptWithBudget = async (
 
   const gitlabCompressed = compressToTwoLines(
     gitlabAccessSection,
-    "需要完整版读设置页 gitToken 与仓库 origin",
+    `GitLab token 在环境变量 ${GITLAB_TOKEN_ENV_NAME}（命令里直接引用、不要读 config.json、不要打印），host 见仓库 origin`,
   );
   const larkCompressed = compressToTwoLines(
     larkCliAuthSection,
@@ -500,7 +535,7 @@ export const buildSuperPromptWithBudget = async (
       ...(gitlabCompressed !== undefined
         ? { compressedContent: gitlabCompressed, compressedBytes: promptBytesOf(gitlabCompressed) }
         : {}),
-      droppedPlaceholder: "（GitLab 访问段已因 prompt 预算裁剪，需要时读设置页 gitToken 与仓库 origin）",
+      droppedPlaceholder: `（GitLab 访问段已因 prompt 预算裁剪：GitLab API 凭证在环境变量 ${GITLAB_TOKEN_ENV_NAME}，命令里直接引用即可，不要读 config.json、不要打印；host 见仓库 origin）`,
     },
     {
       name: "larkCliAuthSection", tier: 2, content: larkCliAuthSection, bytes: promptBytesOf(larkCliAuthSection),
@@ -686,7 +721,7 @@ const renderRepoSection = (task: Task): string => {
     ...branchLines,
     "  - 任务分支已由系统检出好——**禁止自己 checkout / 切换分支**、也不要 cd 到原仓库目录去改代码",
     "  - git 命令（diff / add / commit / push / fetch）在 worktree 里照常用、跟原仓库共享同一 git 数据库",
-    "  - 依赖：系统会尽量把原仓库现成的依赖目录（node_modules / vendor / Pods）克隆过来；克隆不了 / 其它生态（如 Python venv）时、需要跑安装 / 构建 / 测试前先自行装依赖（按仓库的包管理器来、如 pnpm install / pip venv）",
+    "  - 依赖：系统会在后台尽量把原仓库现成的依赖目录（node_modules / vendor / Pods，monorepo 含各子包的 node_modules）克隆过来；设置页给仓库配了「依赖初始化命令」时、克隆不了会改为执行它。克隆是**整目录原子落位**的——进行中 `node_modules` 不存在属正常、别此时自己 install 去抢；没有克隆 / 克隆失败 / 其它生态（如 Python venv）时、需要跑安装 / 构建 / 测试前先自行装依赖（按仓库的包管理器来、如 pnpm install / pip venv）。若末尾带「依赖准备状态」提示、以它为准",
   ].join("\n");
 };
 

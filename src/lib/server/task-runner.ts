@@ -29,6 +29,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
+import { getSubagentParentModel } from "./subagent-parent-model";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { dataRoot } from "./data-root";
@@ -102,6 +103,7 @@ import {
   stopPreviewsForTask,
 } from "./preview-manager";
 import {
+  buildDepPrepareHint,
   cloneMissingTaskDepDirs,
   ensureTaskWorktrees,
   getTaskCwd,
@@ -111,8 +113,10 @@ import {
   removeTaskWorktrees,
   resolveOriginalRepoPath,
   WorktreeLeaseLostError,
+  type DepPrepareEntry,
   type EnsureWorktreesOptions,
 } from "./task-worktrees";
+import { summarizeDepDirs } from "./worktree-deps";
 import { sameRepoPathList } from "@/lib/path-utils";
 import {
   SDK_CREATE_RESUME_TIMEOUT_MS,
@@ -125,6 +129,16 @@ import {
   resolveTaskMcpServers,
 } from "./cursor-config";
 import { resolveEffectiveGitHost } from "./gitlab-host";
+import {
+  syncGitTokenEnv,
+  syncGitTokenEnvFromSettingsResult,
+} from "./git-token-env";
+import { readSettingsFile, type SettingsReadResult } from "./settings-fs";
+import {
+  assertTrustedGitHost,
+  pinTrustedGitHostIfAbsent,
+  resolveGitHostForPrompt,
+} from "./trusted-git-host";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import {
   prepareTestingTaskBranches,
@@ -988,6 +1002,10 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
         // 新任务只预热物理隔离；首个主流程 action 再决定由 Flowship 还是 WK 绑定分支。
         branchSelection:
           task.actions.length === 0 ? { kind: "detached" } : undefined,
+        // 预热全程握着 runAdvanceExclusive：依赖初始化命令（最长 15 分钟）若在这里同步跑，
+        // 「建完任务立刻推进」会被卡满一个超时。秒级克隆照做；命令留给推进后 internalStartAgent
+        // 的后台补齐（kickoffDeferredDepClone → cloneMissingTaskDepDirs）去跑，不占推进锁。
+        skipDepSetup: true,
       });
 
       // worktree add 返回后再复查——终态后不 upsert、不写 info
@@ -1005,15 +1023,20 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
         }
       }
       if (ensured.createdRepos.length > 0) {
-        const cloneNote =
-          ensured.clonedDeps.length > 0
-            ? `；依赖目录已从原仓库秒级克隆（${ensured.clonedDeps
-                .map(
-                  (c) =>
-                    `${c.repoPath.split("/").filter(Boolean).pop() ?? c.repoPath}: ${c.dirs.join(" + ")}`,
-                )
-                .join("、")}）`
-            : "";
+        const clonedText = describeClonedDirs(ensured.clonedDeps);
+        const setupNotes = ensured.clonedDeps
+          .filter((c) => c.setup)
+          .map(
+            (c) =>
+              `${repoTail(c.repoPath)} 依赖初始化命令${c.setup?.ok ? "已执行完成" : "执行失败（agent 可自行 install）"}`,
+          );
+        const cloneNote = [
+          clonedText ? `依赖目录已从原仓库秒级克隆（${clonedText}）` : "",
+          ...setupNotes,
+        ]
+          .filter(Boolean)
+          .map((s) => `；${s}`)
+          .join("");
         // 事件写带 lease——失主不落盘
         await writeOwnedEventAndPublish(
           task.id,
@@ -2372,6 +2395,27 @@ export const buildSessionBridges = (
             "当前会话里没有 GitLab Token（设置页可能已经填了、是会话启动 / 恢复时没带进来）、无法提 MR。请到设置页确认 Token 已填写，再点「推进」重开会话（别勾「续用当前 Agent」）",
         };
       }
+      // PAT 只发往可信 host：gitHost 来自仓库 origin remote，而 remote 在 agent 可写的 `.git/config`
+      // （worktree 与主仓共享）里——被提示注入的 agent 可以 `git remote set-url origin https://evil/…`
+      // 再调 submit_mr，不拦 PAT 就发给攻击者了（S02-03 / S03-03）。放在 validateSubmitMr 之前：
+      // validateSubmitMr 的 project_path 对账读的是同一份被篡改的 remote，拦不住 host 层面的替换。
+      // 失败不会有任何网络请求（createMR 在更后面，且 gitlab-client 内还有一道兜底）。
+      try {
+        assertTrustedGitHost(gitHost);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        if (!callerStillValid()) {
+          return { ok: false, error: CALLER_MISMATCH_ERROR };
+        }
+        // 写一条事件让用户看得见（这是安全拦截、不能只留在 agent 的工具结果里）
+        await writeOwnedEventAndPublish(task.id, callerStillValid, {
+          kind: "error",
+          actionId: taskAction.actionId,
+          text: `提测被拦截（${taskAction.repoPath}）：${reason}`,
+          meta: { repoPath: taskAction.repoPath },
+        });
+        return { ok: false, error: reason };
+      }
       // 起 createMR 前、server 端按 task 权威数据 + 该仓真实 git remote 校验 agent 上报。
       // agent 幻觉 / prompt 被污染 / remote 解析出错时、防它用 server PAT 给越权 project 提 MR。
       // 读 fresh task（闭包 task 是启动时快照、不含本轮 ship 刚 upsert 的 MR、且校验要最新 gitBranches）。
@@ -2983,8 +3027,21 @@ export const ensureWorkspaceReady = async (
 };
 
 /**
+ * 依赖准备结果 → 事件流文案（prewarm / 后台补齐共用）。
+ * 克隆：`repo: node_modules + 子包 node_modules ×3`；初始化命令另列、成败分开说。
+ */
+const repoTail = (repoPath: string): string =>
+  repoPath.split("/").filter(Boolean).pop() ?? repoPath;
+
+const describeClonedDirs = (entries: DepPrepareEntry[]): string =>
+  entries
+    .filter((c) => c.dirs.length > 0)
+    .map((c) => `${repoTail(c.repoPath)}: ${summarizeDepDirs(c.dirs)}`)
+    .join("、");
+
+/**
  * 依赖目录后台克隆（与 Agent.create 重叠）。
- * 无缺失秒过不刷事件；有克隆才落完成 info。失主静默。
+ * 无缺失秒过不刷事件；有克隆才落完成 info；配了依赖初始化命令并执行了则另落一条成败事件。失主静默。
  */
 const kickoffDeferredDepClone = (
   task: Task,
@@ -2995,19 +3052,27 @@ const kickoffDeferredDepClone = (
     try {
       const cloned = await cloneMissingTaskDepDirs(task, lease);
       if (cloned.length === 0) return;
-      await writeEventAndPublish(
-        task.id,
-        {
-          kind: "info",
-          text: `依赖目录已后台克隆完成（${cloned
-            .map(
-              (c) =>
-                `${c.repoPath.split("/").filter(Boolean).pop() ?? c.repoPath}: ${c.dirs.join(" + ")}`,
-            )
-            .join("、")}）`,
-        },
-        lease,
-      );
+      const clonedText = describeClonedDirs(cloned);
+      if (clonedText) {
+        await writeEventAndPublish(
+          task.id,
+          { kind: "info", text: `依赖目录已后台克隆完成（${clonedText}）` },
+          lease,
+        );
+      }
+      for (const c of cloned) {
+        if (!c.setup) continue;
+        await writeEventAndPublish(
+          task.id,
+          {
+            kind: "info",
+            text: c.setup.ok
+              ? `依赖初始化命令执行完成（${repoTail(c.repoPath)}：${c.setup.command}）`
+              : `⚠️ 依赖初始化命令执行失败（${repoTail(c.repoPath)}：${c.setup.command}），agent 可自行 install：${c.setup.detail ?? ""}`,
+          },
+          lease,
+        );
+      }
     } catch (err) {
       if (err instanceof WorktreeLeaseLostError) return;
       console.warn(
@@ -3072,6 +3137,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       }
       throw err;
     }
+    // 依赖准备状态提示（克隆中 / 初始化命令 / 锁文件漂移）——必须在 kickoff 之前算：
+    // 此刻「缺失」才等价于「即将后台克隆」；纯读盘、失败返 undefined 不挡启动
+    const depPrepareHint = await buildDepPrepareHint(task);
     // worktree 就绪后后台补依赖（与后续 MCP/create 重叠）
     kickoffDeferredDepClone(task, workspaceLease);
     // V1：ensure 可能用 stale task 重建了已删目录——立刻发现作废则不再 create
@@ -3083,6 +3151,16 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     const effectiveGitHost =
       (await resolveEffectiveGitHost(task.repoPaths, task.scriptRepoPaths)) ??
       undefined;
+    // 可信时机：本会话的 agent 还没起（Agent.create 在后面），此刻读到的 origin 还没被它动过——
+    // 把 host 固定为 PAT 的可信目的地（首次绑定；已固定则不改）。之后 submit_mr / 收件箱等出站
+    // 一律拿目标 host 跟它比（trusted-git-host.ts）。更早的时机是启动 / 设置保存，这里是第三道。
+    if (effectiveGitHost) {
+      pinTrustedGitHostIfAbsent(effectiveGitHost, "session");
+    }
+    // token 走环境变量给 agent shell（不再让 agent 去读 config.json，见 git-token-env.ts）。
+    // 必须在 Agent.create 之前：SDK 本地 agent 的 shell 继承 server 的 process.env。
+    // 入口没带 token 时回落服务端 config.json（与 resume 同口径），避免「入口没带」把已配置的 env 清掉。
+    await syncSessionGitTokenEnv({ gitToken });
 
     // advance 在步骤 4 只 snapshot 一次 activeRun——one-shot 可能在
     // 那之后、走到这里之前才完成 send 预登记。持 opHandle 的正式启动意图
@@ -3373,10 +3451,14 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             const perfPromptStart = Date.now();
             const skills = await skillsPromise;
             const userIdentityLine = await identityPromise;
-            // settings 配了 gitToken 才注入「GitLab 访问」段（给 agent 铺正路读 config.json）
+            // settings 配了 gitToken 才注入「GitLab 访问」段（token 走环境变量，agent 不读 config.json）。
+            // host 展示可信 host：origin 被篡改成别的地址时，别让提示词教 agent 把 token 发过去。
+            const gitTrust = resolveGitHostForPrompt(effectiveGitHost);
             const gitlabAccessSection =
               gitToken && gitToken.trim().length > 0
-                ? buildGitlabAccessDirective(effectiveGitHost, dataRoot())
+                ? buildGitlabAccessDirective(gitTrust.host, dataRoot(), {
+                    untrustedOriginHost: gitTrust.untrustedOriginHost,
+                  })
                 : "";
             const { loadCompanyEnvBriefSection } = await import(
               "./company-env-fs"
@@ -3391,7 +3473,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
                 skillDirective,
                 attachedImagePaths,
                 attachedFilePaths,
-                branchCheckoutHint,
+                // 依赖准备提示与分支检出提示同走「末尾提示」位（无则不加）
+                branchCheckoutHint:
+                  [branchCheckoutHint, depPrepareHint]
+                    .filter((s): s is string => !!s && s.trim().length > 0)
+                    .join("\n\n") || undefined,
                 batchDirective,
                 replanDirective,
               },
@@ -3668,6 +3754,31 @@ export const resolveSessionGitToken = async (
   const given = creds.gitToken?.trim();
   if (given) return given;
   return (await readFallback())?.trim() || undefined;
+};
+
+/**
+ * 会话启动 / 恢复时把 GitLab Token 同步进 process.env（给 agent shell 引用 `$FLOWSHIP_GITLAB_TOKEN`）。
+ *
+ * 为什么不能再写 `syncGitTokenEnv(await resolveSessionGitToken(...))`：
+ * 这个变量是**进程级全局**，所有并行 task / chat 的 agent shell 共用；而 `readServerGitToken` 会把
+ * 「读失败」（权限 / 被杀软占用的 EBUSY / JSON 读到一半）和「确定没有」都吞成 undefined，
+ * 于是一次瞬时读失败就会把变量 delete 掉——正在跑的**别的会话**下一条命令就拿不到凭据（401）。
+ * 所以这里按三态处理，与 chat-runner / instrumentation 用的 `syncGitTokenEnvFromSettingsResult` 同口径：
+ *   - 入口带了 token → 直接用（不读盘）；
+ *   - 没带 → 读 config.json：ok → 以盘上为准；missing → 确定没有、清掉；**error → 不动 env**。
+ * 提 MR 的桥快照仍走 `resolveSessionGitToken`（读失败时拿不到 = undefined，由 submit_mr 给明确报错，行为不变）。
+ * 必须在 Agent.create / resume 之前调：SDK 本地 agent 的 shell 在拉起时继承 server 的 process.env。
+ */
+export const syncSessionGitTokenEnv = async (
+  creds: Pick<SessionCreds, "gitToken">,
+  read: () => Promise<SettingsReadResult> = readSettingsFile,
+): Promise<void> => {
+  const given = creds.gitToken?.trim();
+  if (given) {
+    syncGitTokenEnv(given);
+    return;
+  }
+  syncGitTokenEnvFromSettingsResult(await read());
 };
 
 // 可中断 sleep（1s 分片）：重连退避期间用户点「停止」要立即生效、返回 true = 被取消
@@ -4477,6 +4588,8 @@ const consumeSessionRun = async (
     // 流式消费
     const assistantCtx: AssistantBufferCtx = {
       buffer: "",
+      // 子代理卡片徽标要显示「沿用」的实际模型（只有 Cursor 路径挂了 subagent 才取得到）
+      subagentParentModel: getSubagentParentModel(agent),
       flush: async () => {
         // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
         flushPendingAssistantDeltas(task.id);
@@ -5309,6 +5422,10 @@ export const resumeTaskSession = async (
     // submit_mr 桥的 Token 快照：入口没带就回落服务端 config.json（见 resolveSessionGitToken）。
     // 放在 Agent.resume 之前：这一步是纯读盘，下面的 mayResume / CAS / install 复查照常兜住它的 await。
     const gitToken = await resolveSessionGitToken(creds);
+    // 同一份 token 也放进 process.env 给 agent shell 用（恢复出的 agent 靠它调 GitLab API、不读 config.json）。
+    // 在 mayResume 复查之前就同步：resolve 出的就是「设置页当前值」、与是否让位无关，且必须先于 Agent.resume。
+    // 不直接 syncGitTokenEnv(gitToken)：gitToken 为 undefined 可能只是读盘瞬时失败，会把并行会话的 env 清掉
+    await syncSessionGitTokenEnv(creds);
     if (!(await mayResume())) return null;
 
     await writeOwnedEventAndPublish(
@@ -5838,21 +5955,37 @@ export const startOneShotQuestion = (
         },
       );
       // restore 前复查 handle；instanceId 用本地变量（不从全局表读 B）
-      if (
-        !isTaskOpCurrent(oneshotOpHandle) ||
-        oneshotInstanceId === undefined
-      ) {
-        return;
-      }
+      if (!isTaskOpCurrent(oneshotOpHandle)) return;
       const myId = oneshotInstanceId;
+      // ⚠️ runningTasks 是在 send 成功之后才预登记的：Agent.create / send 抛错、
+      // 或受理前（ensureWorkspaceReady 等）抛错时表里根本没有本实例——
+      // 旧谓词要求「表里已是本实例」必为 false，任务就永远停在 running。
+      // 现在：表里没有任何 run（本 one-shot 从未登记 / 已被 consume 清掉）→ 这个
+      // running 是调用方为本次 one-shot 写的、由我归位；表里有占位则仅当它是本实例才动，
+      // 否则是后继 B 的 run、碰了就是踩后继。
+      const isRestoreOwner = (): boolean => {
+        if (!isTaskOpCurrent(oneshotOpHandle)) return false;
+        const cur = runningTasks.get(task.id);
+        if (!cur) return true;
+        return myId !== undefined && cur.instanceId === myId;
+      };
       const restored = await setTaskRunStatusIfRunOwner(
         task.id,
         prevRunStatus,
-        () =>
-          isTaskOpCurrent(oneshotOpHandle) &&
-          runningTasks.get(task.id)?.instanceId === myId,
+        isRestoreOwner,
+        undefined,
+        // 只回滚「调用方为本次 one-shot 写的那个 running」；盘上已不是 running
+        // 说明中途有人接管过，不许覆盖
+        "running",
       );
       if (restored) publish(task.id, { kind: "task", task: restored });
+      // 与 bailOutWithoutRun 对齐：补发 done(ok=false)——群出向 tap 收到 done 才会把
+      // 「这轮没跑成功」回群并摘掉 rememberGroupReply 登记；只恢复状态不发 done，
+      // 登记会一直挂着、被下一轮无关的 done 错 @。
+      // 仍是当前 op 且表里没有别的 run 占位才发（有占位 = 后继 B / 本实例 consume 自己收尾）。
+      if (isTaskOpCurrent(oneshotOpHandle) && !runningTasks.has(task.id)) {
+        publish(task.id, { kind: "done", task: restored ?? task, ok: false });
+      }
     } finally {
       try {
         agentBox.current?.close();

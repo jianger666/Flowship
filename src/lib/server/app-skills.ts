@@ -176,14 +176,41 @@ export const listSkillsWithSource = async (
   return out.sort((a, b) => a.name.localeCompare(b.name));
 };
 
+const normRepoPath = (p: string): string =>
+  String(p ?? "").trim().replace(/[/\\]+$/, "");
+
+/**
+ * 在列表里挑出要读的那条：name 必须一致；可选 source 消歧同名多来源；
+ * 可选 repoPath 消歧「多个仓有同名项目级 skill」（S13-06：原来永远命中第一个仓）。
+ * 未指定的维度按列表顺序取首个命中。
+ */
+export const pickSkillHit = <
+  T extends { name: string; source: SkillSource; repoPath?: string },
+>(
+  all: T[],
+  name: string,
+  source?: SkillSource,
+  repoPath?: string,
+): T | undefined => {
+  const repo = repoPath ? normRepoPath(repoPath) : "";
+  return all.find(
+    (s) =>
+      s.name === name &&
+      (!source || s.source === source) &&
+      (!repo || (s.repoPath !== undefined && normRepoPath(s.repoPath) === repo)),
+  );
+};
+
 /**
  * 按名读任意已知来源 skill 的 SKILL.md 全文（只读详情 / 编辑共用）。
- * 可选 source 消歧同名；未指定时按列表顺序取首个命中。
+ * 可选 source 消歧同名；可选 repoPath 在多个仓同名项目级 skill 时指定仓；
+ * 未指定时按列表顺序取首个命中。
  * 名字必须落在 listSkillsWithSource 结果内——防任意路径读。
  */
 export const readSkillContentByName = async (
   name: string,
   source?: SkillSource,
+  repoPath?: string,
 ): Promise<string | null> => {
   if (!isSafeSkillName(name)) return null;
   // 项目级源也要能查到（设置页「查看」用）：带已登记仓根路径；读失败退化为非项目源
@@ -203,9 +230,7 @@ export const readSkillContentByName = async (
     // 忽略
   }
   const all = await listSkillsWithSource({ repoPaths });
-  const hit = source
-    ? all.find((s) => s.name === name && s.source === source)
-    : all.find((s) => s.name === name);
+  const hit = pickSkillHit(all, name, source, repoPath);
   if (!hit) return null;
   try {
     return await fs.readFile(hit.absPath, "utf-8");

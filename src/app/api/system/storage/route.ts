@@ -9,6 +9,10 @@
  *
  * 大小统计优先 `du -sk`（mac/linux、秒级扫完数十万文件的 node_modules）；
  * 失败或 Windows 回退 Node 递归 walk。工作区目录逐任务并发限 4。
+ *
+ * 只枚举 data/tasks/ 与 data/worktrees/ 下的**目录**，不枚举数据根：数据根里的 config.json 同族文件
+ * （.bak / .bak.shrink / .corrupt-<ts> / .tmp.*）含明文旧凭据，既不列出、也不计入占用——
+ * 日后若要扩展到数据根，必须整族排除（行为钉在 tests/settings-backup-exclusion.test.ts）。
  */
 
 import { execFile } from "node:child_process";
@@ -183,7 +187,8 @@ export const GET = async () => {
     try {
       const wtDirents = await fs.readdir(worktreesRoot, { withFileTypes: true });
       const staleIds = wtDirents
-        .filter((d) => d.isDirectory() && !liveIds.has(d.name))
+        // 点开头的是内部中转目录（如依赖克隆的 .dep-clone-tmp）、不是任务残留：别列给用户删
+        .filter((d) => d.isDirectory() && !d.name.startsWith(".") && !liveIds.has(d.name))
         .map((d) => d.name);
       const staleSizes = await mapPool(staleIds, WORKTREE_SIZE_CONCURRENCY, async (id) =>
         dirSize(path.join(worktreesRoot, id)),

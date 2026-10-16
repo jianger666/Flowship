@@ -31,6 +31,7 @@ import {
   updateCustomAction,
 } from "@/lib/server/custom-action-fs";
 import { usableCustomActions } from "@/lib/action-layout";
+import { withSettingsWriteLock } from "@/lib/server/settings-fs";
 import { getAppSkillsDir } from "@/lib/server/skills-loader";
 
 beforeAll(async () => {
@@ -378,6 +379,59 @@ describe("迁移 custom-actions → skill 托管", () => {
       "app:layout-skill",
       "app:fix-bug",
     ]);
+    expect(cfg.actionLayout.hidden).toEqual(["app:layout-skill"]);
+  });
+
+  it("remap actionLayout 的读改写进 settings 写链：与并发 PUT 不互相丢更新", async () => {
+    await seedSkill("layout-skill");
+    const cfgPath = path.join(TMP_ROOT, "config.json");
+    await fs.writeFile(
+      cfgPath,
+      JSON.stringify({
+        theme: "dark",
+        actionLayout: {
+          order: ["plan", "my-old", "builtin-fix-bug"],
+          hidden: ["my-old"],
+        },
+      }),
+      "utf-8",
+    );
+    const oldDir = path.join(TMP_ROOT, "custom-actions", "my-old");
+    await fs.mkdir(oldDir, { recursive: true });
+    await fs.writeFile(
+      path.join(oldDir, "ACTION.md"),
+      `---\nlabel: 布局测\nskill: layout-skill\ncreatedAt: 1\nupdatedAt: 1\n---\n`,
+      "utf-8",
+    );
+
+    // 模拟一次正在进行的 PUT：持有 settings 写锁、在锁内把别的字段改掉（布局字段仍是旧 id）
+    let migrating: Promise<unknown> | undefined;
+    await withSettingsWriteLock(async () => {
+      migrating = migrateCustomActionsToSkillHosted();
+      // 给迁移足够时间走到 remap（有锁就停在拿锁处；没锁就已经读了旧 config 并写回）
+      await new Promise((r) => setTimeout(r, 300));
+      await fs.writeFile(
+        cfgPath,
+        JSON.stringify({
+          theme: "light",
+          actionLayout: {
+            order: ["plan", "my-old", "builtin-fix-bug"],
+            hidden: ["my-old"],
+          },
+        }),
+        "utf-8",
+      );
+    });
+    await migrating;
+
+    const cfg = JSON.parse(await fs.readFile(cfgPath, "utf-8")) as {
+      theme: string;
+      actionLayout: { order: string[]; hidden: string[] };
+    };
+    // PUT 的改动没被迁移用旧快照覆盖掉
+    expect(cfg.theme).toBe("light");
+    // 迁移的 remap 也没被 PUT 的旧布局盖掉
+    expect(cfg.actionLayout.order).toContain("app:layout-skill");
     expect(cfg.actionLayout.hidden).toEqual(["app:layout-skill"]);
   });
 

@@ -30,6 +30,8 @@ const {
   getTask,
   hasChatSession,
   isChatRunActive,
+  releaseChatRunClaim,
+  resumeChatSession,
   runChatSession,
   sendChatMessage,
   setTaskRunStatus,
@@ -58,6 +60,8 @@ const {
     getTask: vi.fn<AnyFn>(),
     hasChatSession: vi.fn<AnyFn>(() => true),
     isChatRunActive: vi.fn<AnyFn>(() => true),
+    releaseChatRunClaim: vi.fn<AnyFn>(),
+    resumeChatSession: vi.fn<AnyFn>(async () => null),
     runChatSession: vi.fn<AnyFn>(async () => undefined),
     sendChatMessage: vi.fn<AnyFn>(async () => "sent"),
     setTaskRunStatus: vi.fn<AnyFn>(),
@@ -89,8 +93,8 @@ vi.mock("@/lib/server/chat-runner", () => ({
   hasChatSession,
   isChatQueueDraining: vi.fn(() => false),
   isChatRunActive,
-  releaseChatRunClaim: vi.fn(),
-  resumeChatSession: vi.fn(async () => null),
+  releaseChatRunClaim,
+  resumeChatSession,
   runChatSession,
   sendChatMessage,
   waitForChatToStop: vi.fn(async () => true),
@@ -196,6 +200,7 @@ beforeEach(() => {
   getChatQueueCount.mockReturnValue(0);
   sendChatMessage.mockResolvedValue("sent");
   isChatRunActive.mockReturnValue(true);
+  resumeChatSession.mockResolvedValue(null);
   tryReserveChatStart.mockReturnValue(1);
   writeEventAndPublish.mockResolvedValue({ id: "ev_skip" });
   writeUserEventAndPublishStrict.mockResolvedValue({ id: "e1" });
@@ -258,6 +263,27 @@ describe("chat 模式发新消息 = 跳过提问", () => {
     expect(chunks.join("")).toContain("不用加埋点");
     expect(skipEvents()[0]?.askSkipped).toBe(true);
     expect(getPendingAsk(TASK_ID)).toBeNull();
+  });
+
+  it("S12-01：冷恢复成 owner 后走 curl 回写 → 返回前必须释放 claim（不留假 busy 的 idle 会话）", async () => {
+    const token = seedPendingAsk();
+    // 内存无会话 + 有落盘锚点 → 先 resume 认领（claimRun），resume 返回 claim 实例号 7
+    getTask.mockImplementation(
+      async () => ({ ...chatTask(token), sessionAgentId: "agent_x" }) as unknown as Task,
+    );
+    hasChatSession.mockReturnValue(false);
+    resumeChatSession.mockResolvedValue(7);
+    openAskWait({ taskId: TASK_ID, askId: ASK_ID, token });
+    attachAskWaiter(TASK_ID, token, {
+      write: () => undefined,
+      close: () => undefined,
+    });
+
+    const resp = await handleChatReplyInject(TASK_ID, BODY);
+    expect(resp.status).toBe(200);
+    // 回写 stdout 这条路不会再 sendChatMessage，认领不释放 runActive 就永远 true
+    expect(sendChatMessage).not.toHaveBeenCalled();
+    expect(releaseChatRunClaim).toHaveBeenCalledWith(TASK_ID, 7);
   });
 
   it("排队（202）也算受理 → 排的那条带跳过上下文、跳过标记落地", async () => {

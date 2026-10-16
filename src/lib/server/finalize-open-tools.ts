@@ -25,6 +25,12 @@ export type OpenToolCall = {
   callId: string;
   name: string;
   actionId?: string;
+  /**
+   * 这条 tool_call 属于哪一轮群答疑旁路 run（`meta.groupRun` = runTag）；属主自己的工具没有。
+   * 补写的终态必须带回同一个标——旁路事件整条链靠它被 UI 折进「群问答」tab，
+   * 漏了标，call 被藏、result 却露在属主主流里，成了一块孤儿「已中断」。
+   */
+  groupRun?: string;
 };
 
 /**
@@ -52,10 +58,14 @@ export const collectOpenToolCalls = (
       typeof ev.meta?.name === "string" && ev.meta.name.trim()
         ? ev.meta.name
         : "tool";
+    // 判定口径与 UI 的 groupRunTagOf 一致（非空字符串才算），server 侧不反向 import src/lib/group-qa
+    const rawTag = ev.meta?.groupRun;
+    const groupRun = typeof rawTag === "string" ? rawTag.trim() : "";
     open.push({
       callId: cid,
       name,
       actionId: ev.actionId,
+      ...(groupRun ? { groupRun } : {}),
     });
   }
   return open;
@@ -83,17 +93,24 @@ export const finalizeOpenToolCalls = async (
   let written = 0;
   for (const tool of open) {
     if (!lease()) break;
-    const ev = await writeOwnedEventAndPublish(taskId, lease, {
-      kind: "tool_result",
-      text: `工具已中断 ${tool.name}`,
-      ...(tool.actionId ? { actionId: tool.actionId } : {}),
-      meta: {
-        callId: tool.callId,
-        name: tool.name,
-        status: "interrupted",
-        output: "",
+    const ev = await writeOwnedEventAndPublish(
+      taskId,
+      lease,
+      {
+        kind: "tool_result",
+        text: `工具已中断 ${tool.name}`,
+        ...(tool.actionId ? { actionId: tool.actionId } : {}),
+        meta: {
+          callId: tool.callId,
+          name: tool.name,
+          status: "interrupted",
+          output: "",
+        },
       },
-    });
+      // 旁路遗留的 call：走和旁路 run 自己一样的写盘路径（origin = runTag，sink 据此打 meta.groupRun
+      // 并让 publish 信封带 origin，群出向不会把它误当属主 run 的事件）；属主自己的工具不传
+      tool.groupRun,
+    );
     if (ev) written += 1;
   }
   if (written > 0) {

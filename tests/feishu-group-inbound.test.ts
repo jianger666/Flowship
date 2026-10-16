@@ -561,6 +561,33 @@ describe("resolveTaskIdByGroupChat", () => {
     );
     expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-2");
   });
+
+  // S09-02：多个任务绑同一个群时，路由必须确定——一律归「最近更新」的那个，
+  // 不能因为「别的群的消息先触发了一次扫描」就让较老的任务把缓存顶掉、串到旧任务
+  it("多任务绑同一群：别的群触发扫描后，本群仍路由到最近更新的任务（不被较老任务覆盖）", async () => {
+    const OTHER_CHAT = "oc_other_group";
+    const now = Date.now();
+    const newer = taskSummary({ id: "task-new", updatedAt: now });
+    const older = taskSummary({ id: "task-old", updatedAt: now - 10_000 });
+    const oldest = taskSummary({ id: "task-other", updatedAt: now - 20_000 });
+    const boundOf: Record<string, string> = {
+      "task-new": CHAT,
+      "task-old": CHAT,
+      "task-other": OTHER_CHAT,
+    };
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        // 故意乱序给：路由自己按 updatedAt 倒序
+        listTasks: async () => [older, oldest, newer],
+        getTask: async (id: string) => fullTask({ id }),
+        getBoundGroupChatId: async (t: { id: string }) => boundOf[t.id] ?? null,
+      }) as never,
+    );
+    // 先由别的群的消息触发扫描——扫描顺带会缓存沿途所有 (群, 任务)
+    expect(await resolveTaskIdByGroupChat(OTHER_CHAT)).toBe("task-other");
+    // 本群：最近更新的 task-new 胜出，而不是后扫到的 task-old
+    expect(await resolveTaskIdByGroupChat(CHAT)).toBe("task-new");
+  });
 });
 
 // ----------------- 入向路由 -----------------
@@ -2466,8 +2493,16 @@ describe("群问答排队", () => {
     );
     return { handleTaskQuestionInject, sendTextToChat };
   };
-  const ask = (id: string, content = "@Flowship 埋点查了吗") =>
-    routeGroupInboundMessage(otherMsg({ message_id: id, content }), ctx);
+  // senderId：G3-02 后同一发送人最多占 2 个排队槽——要攒满整队（10 个）得换不同发送人
+  const ask = (id: string, content = "@Flowship 埋点查了吗", senderId?: string) =>
+    routeGroupInboundMessage(
+      otherMsg({
+        message_id: id,
+        content,
+        ...(senderId ? { sender_id: senderId, sender_name: senderId } : {}),
+      }),
+      ctx,
+    );
   const injectedTexts = (
     fn: ReturnType<typeof vi.fn>,
   ): string[] =>
@@ -2506,7 +2541,8 @@ describe("群问答排队", () => {
     registerRestrictedQuestion("task-1", inFlight);
     try {
       for (let i = 0; i < GROUP_QUESTION_QUEUE_MAX; i++) {
-        const r = await ask(`om_f${i}`);
+        // 每条换一个发送人：这里测的是「整队满」，不是「单发送人槽位满」
+        const r = await ask(`om_f${i}`, undefined, `ou_fill_${i}`);
         expect(r).toMatchObject({ kind: "queued" });
       }
       expect(groupQuestionQueueLength("task-1")).toBe(GROUP_QUESTION_QUEUE_MAX);
@@ -3161,7 +3197,9 @@ describe("关联回执连续追问", () => {
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );
     __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
-    // 同一目标连发 6 轮每轮都放行。
+    // 同一目标连发 6 轮每轮都放行：第七轮 K2-01——命中出问登记的关联回执只计总限额、不计个人限额
+    // （个人限额 4 次只管普通提问）。这里没有活会话、回执走只读旁路起 run，但不该被个人额度拦；
+    // 总限额与「回执不占个人额度」的细节见 group-bypass-r7.test.ts。
     // 注意关联命中送达即焚，每轮前重登（模拟每次追问都有在途登记）。
     for (let i = 0; i < 6; i++) {
       regQ();

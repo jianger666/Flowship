@@ -27,6 +27,7 @@ import {
   checkFixBugPreset,
   reinstallFixBugPreset,
 } from "@/lib/fix-bug-advance";
+import { safeHttpUrl } from "@/lib/workitem-link";
 import type { Task } from "@/lib/types";
 
 const ManualLaunchInner = () => {
@@ -39,8 +40,9 @@ const ManualLaunchInner = () => {
   // 收件箱「改bug」引流参数（无参 = 纯手动建任务、行为不变）
   const fixBug = sp.get("fixBug") === "1";
   const bugName = sp.get("name") ?? "";
-  const prefillUrl = sp.get("url") ?? "";
-  const bugUrl = sp.get("bugUrl") ?? "";
+  // query 里的链接会进 href / 落盘到任务：只放行 http(s)，拒绝 javascript: / data: 等
+  const prefillUrl = safeHttpUrl(sp.get("url"));
+  const bugUrl = safeHttpUrl(sp.get("bugUrl"));
   const storyName = sp.get("storyName") ?? undefined;
   const isFixBugFlow = fixBug && !!bugUrl;
 

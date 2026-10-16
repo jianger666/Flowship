@@ -44,6 +44,7 @@ const {
   __resetGroupReplyStateForTest,
   claimGroupAdvancePick,
   claimGroupArtifactCard,
+  enqueueGroupQuestion,
   GROUP_REPLY_MAX_PER_TASK,
   GROUP_REPLY_TTL_MS,
   hasGroupAdvanceReplyFor,
@@ -1808,6 +1809,114 @@ describe("排队 draining", () => {
       action: { id: "act-1", status: "running" },
     } as never);
     expect(pumpGroupQuestionQueue).toHaveBeenCalledTimes(2);
+  });
+
+  // G3-01：非属主的排队问题不建登记、属主在 app 里发起的 run 也没有登记——
+  // 预筛若只认「有登记」，这两路 done / 动作终态帧永远到不了泵，排队的人只能等下一条群 @ 或 30 分钟超时。
+  describe("G3-01：无登记 + 群问题队列非空也要泵", () => {
+    const queued = () =>
+      enqueueGroupQuestion("task-1", {
+        messageId: "om_wait",
+        chatId: CHAT,
+        text: "排队等答的问题",
+        parsed: { text: "排队等答的问题", images: [], attachments: [] } as never,
+        requester: { openId: "ou_li", name: "李四" },
+        boot: { apiKey: "k", model: { id: "m" } },
+      });
+
+    it("无登记 + 队列非空：done / task / action 帧都泵", async () => {
+      const pumpGroupQuestionQueue = vi.fn(async () => {});
+      __setGroupOutboundDepsForTest(
+        baseDeps({ pumpGroupQuestionQueue }) as never,
+      );
+      expect(queued().queued).toBe(true);
+      // 前提：此刻确实没有任何回群登记（属主 app 里发起的 run 就是这个状态）
+      expect(listGroupReplies("task-1")).toHaveLength(0);
+
+      await handleGroupOutboundEvent("task-1", {
+        kind: "done",
+        task: fullTask(),
+        ok: true,
+      } as never);
+      expect(pumpGroupQuestionQueue).toHaveBeenCalledTimes(1);
+      expect(pumpGroupQuestionQueue).toHaveBeenLastCalledWith("task-1");
+
+      await handleGroupOutboundEvent("task-1", {
+        kind: "task",
+        task: fullTask(),
+      } as never);
+      expect(pumpGroupQuestionQueue).toHaveBeenCalledTimes(2);
+
+      await handleGroupOutboundEvent("task-1", {
+        kind: "action",
+        action: { id: "act-1", status: "awaiting_ack" },
+      } as never);
+      expect(pumpGroupQuestionQueue).toHaveBeenCalledTimes(3);
+    });
+
+    it("无登记 + 队列为空：done 帧不泵（预筛仍挡掉与群无关的任务）", async () => {
+      const pumpGroupQuestionQueue = vi.fn(async () => {});
+      const isBridgeEnabled = vi.fn(async () => true);
+      __setGroupOutboundDepsForTest(
+        baseDeps({ pumpGroupQuestionQueue, isBridgeEnabled }) as never,
+      );
+      await handleGroupOutboundEvent("task-1", {
+        kind: "done",
+        task: fullTask(),
+        ok: true,
+      } as never);
+      expect(pumpGroupQuestionQueue).not.toHaveBeenCalled();
+      // 预筛是同步零 IO 的：连桥接开关都不该去读
+      expect(isBridgeEnabled).not.toHaveBeenCalled();
+    });
+
+    it("队列非空也只放行 done / task / action：delta 与 tool_call 帧仍被预筛挡掉、不读开关", async () => {
+      const pumpGroupQuestionQueue = vi.fn(async () => {});
+      const isBridgeEnabled = vi.fn(async () => true);
+      __setGroupOutboundDepsForTest(
+        baseDeps({ pumpGroupQuestionQueue, isBridgeEnabled }) as never,
+      );
+      queued();
+      for (let i = 0; i < 20; i++) {
+        await handleGroupOutboundEvent("task-1", {
+          kind: "assistant_delta",
+          text: `块${i}`,
+        } as never);
+      }
+      await handleGroupOutboundEvent("task-1", {
+        kind: "event",
+        event: {
+          id: "e_tool",
+          seq: 1,
+          at: Date.now(),
+          kind: "tool_call",
+          text: "ls",
+        },
+      } as never);
+      await handleGroupOutboundEvent("task-1", {
+        kind: "talk_queue",
+        items: [],
+      } as never);
+      expect(pumpGroupQuestionQueue).not.toHaveBeenCalled();
+      expect(isBridgeEnabled).not.toHaveBeenCalled();
+    });
+
+    it("桥接总开关关掉时，队列非空也不泵（与其余群链同口径）", async () => {
+      const pumpGroupQuestionQueue = vi.fn(async () => {});
+      __setGroupOutboundDepsForTest(
+        baseDeps({
+          pumpGroupQuestionQueue,
+          isBridgeEnabled: async () => false,
+        }) as never,
+      );
+      queued();
+      await handleGroupOutboundEvent("task-1", {
+        kind: "done",
+        task: fullTask(),
+        ok: true,
+      } as never);
+      expect(pumpGroupQuestionQueue).not.toHaveBeenCalled();
+    });
   });
 });
 

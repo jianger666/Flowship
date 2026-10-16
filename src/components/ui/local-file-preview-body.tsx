@@ -7,13 +7,14 @@
  * 为「还没打开的预览」支付 webpack 编译 200+ 语言高亮。首次 open 才 dynamic 加载。
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { MarkdownText } from "@/components/markdown-text";
 import { canPreviewInSheet, type LocalFileKind } from "@/lib/local-file-kind";
 import { pathBasename } from "@/lib/path-utils";
+import { sanitizePreviewHtml } from "@/lib/preview-html-sanitize";
 
 export interface LocalFilePreviewPayload {
   kind: LocalFileKind;
@@ -61,6 +62,13 @@ export const LocalFilePreviewBody = ({
       if (revoked) URL.revokeObjectURL(revoked);
     };
   }, [data]);
+
+  // docx / xlsx 的 HTML 渲染前再净化一次（纵深防御：server 已净化、净化器幂等；
+  // 防止别的来源 / 旧缓存 / 以后新增的 html 字段绕过 server 那一层直达 dangerouslySetInnerHTML）
+  const safeHtml = useMemo(
+    () => (data?.html ? sanitizePreviewHtml(data.html) : ""),
+    [data?.html],
+  );
 
   if (loading) {
     return (
@@ -118,8 +126,8 @@ export const LocalFilePreviewBody = ({
     return (
       <div
         className="prose prose-sm dark:prose-invert max-w-none min-w-0 overflow-x-auto"
-        // mammoth / sheetjs 输出的是受控 HTML 片段
-        dangerouslySetInnerHTML={{ __html: data.html }}
+        // mammoth / sheetjs 输出不保证安全：已过白名单净化器（preview-html-sanitize）
+        dangerouslySetInnerHTML={{ __html: safeHtml }}
       />
     );
   }

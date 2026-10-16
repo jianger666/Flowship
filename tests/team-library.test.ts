@@ -284,6 +284,9 @@ describe("buildAuthedGitArgs", () => {
     expect(helperValues[1]).toContain(`$${GIT_TOKEN_ENV}`);
     // 大 push（镜像 5M+）防 GitLab HTTP 500
     expect(args).toContain("http.postBuffer=157286400");
+    // 不跟随重定向：inline helper 不看 host，跟随跨 host 的 302 会把 PAT 交给别的 host
+    // （真实泄漏 / 修复验证见 tests/gitlab-client-redirect.test.ts 的真 git 用例）
+    expect(args).toContain("http.followRedirects=false");
   });
 });
 
@@ -353,6 +356,35 @@ describe("parseGitLabRepoUrl", () => {
   it("非法 URL / 空 path → null", () => {
     expect(parseGitLabRepoUrl("not-a-url")).toBeNull();
     expect(parseGitLabRepoUrl("https://gitlab.example.com/")).toBeNull();
+  });
+
+  // P3：host 取 URL.host（非默认端口保留、默认端口不显示）。丢掉端口会让可信 host 校验把
+  // 「同机另一个端口的服务」当成同一个 host，REST 请求也会被发往 443 而不是仓库真正的端口
+  it.each([
+    // https 默认 443：省略 / 显式都不显示端口
+    ["https://gitlab.corp.com/g/r.git", "gitlab.corp.com"],
+    ["https://gitlab.corp.com:443/g/r.git", "gitlab.corp.com"],
+    // 非默认端口保留（含 https 下的 80）
+    ["https://gitlab.corp.com:8443/g/r.git", "gitlab.corp.com:8443"],
+    ["https://gitlab.corp.com:80/g/r.git", "gitlab.corp.com:80"],
+    // http：默认 80 不显示、443 要显示（URL.host 语义）
+    ["http://gitlab.corp.com/g/r.git", "gitlab.corp.com"],
+    ["http://gitlab.corp.com:8080/g/r.git", "gitlab.corp.com:8080"],
+    ["http://gitlab.corp.com:443/g/r.git", "gitlab.corp.com:443"],
+    // userinfo 不进 host；大小写交给 URL 规范化
+    ["https://oauth2:glpat-FAKE@GitLab.Corp.com:8443/g/r.git", "gitlab.corp.com:8443"],
+    // IPv6 字面量
+    ["https://[::1]:8443/g/r.git", "[::1]:8443"],
+    ["https://[::1]/g/r.git", "[::1]"],
+  ])("host 保留非默认端口：%j → %j", (url, host) => {
+    expect(parseGitLabRepoUrl(url)).toEqual({ host, projectPath: "g/r" });
+  });
+
+  it("ssh:// 的端口是 ssh 自己的端口、不是 HTTPS 端口：host 只取主机名", () => {
+    expect(parseGitLabRepoUrl("ssh://git@gitlab.corp.com:2222/g/r.git")).toEqual({
+      host: "gitlab.corp.com",
+      projectPath: "g/r",
+    });
   });
 });
 
@@ -999,7 +1031,8 @@ describe("scanSensitiveFiles / 敏感上传闸", () => {
           "postgresql://admin:DbPassw0rd!@db.example.com:5432/app",
           "https://user:HttpPass99@example.com/path",
           "db.example.com:5432:mydb:admin:PgPassHunter2",
-          "AUTH_TOKEN=aB3dE5fG7hI9jK1lM2nOpQr",
+          // 键名不敏感（SESSION_ID）才会走高熵规则；AUTH_TOKEN 这类带前缀的敏感键名已归 credential-key
+          "SESSION_ID=aB3dE5fG7hI9jK1lM2nOpQr",
         ].join("\n"),
       },
     ]);
@@ -1040,6 +1073,201 @@ describe("scanSensitiveFiles / 敏感上传闸", () => {
           // hash 语境长 hex 不报高熵
           "sha256:abcdef0123456789abcdef0123456789ab",
           "commit: deadbeefdeadbeefdeadbeefdeadbeef",
+        ].join("\n"),
+      },
+    ]);
+    expect(hits).toEqual([]);
+  });
+
+  it("S07-02：JSON 形态的 key（键名带收尾引号）与带前缀的键名要命中", () => {
+    const scan = (content: string) =>
+      scanSensitiveFiles([{ path: "skills/fe/demo/cfg.json", content }]);
+    for (const line of [
+      '  "api_key": "RealKeyValue99",',
+      '{"token":"RealTokenValue99"}',
+      '  "password" : "RealPassw0rd",',
+      '  "apiKey": "RealKeyValue99"',
+      "GITHUB_TOKEN=RealTokenValue99",
+      "DB_PASSWORD: RealPassw0rd",
+      "client_secret = 'RealSecretValue'",
+      '  "x-api-key": "RealKeyValue99"',
+    ]) {
+      const hits = scan(line);
+      expect(hits.map((h) => h.kind), line).toContain("credential-key");
+      for (const h of hits) {
+        expect(h.snippet, line).toContain("***");
+        expect(h.snippet, line).not.toMatch(/Real(Key|Token|Passw0rd|Secret)/);
+      }
+    }
+  });
+
+  it("S07-02：JSON / 带前缀键名的占位符、计数配置、结构值不误报", () => {
+    const hits = scanSensitiveFiles([
+      {
+        path: "skills/fe/tpl/cfg.json",
+        content: [
+          '  "api_key": "your-api-key",',
+          '  "token": "<token>",',
+          '  "password": "${DB_PASSWORD}",',
+          '  "secret": "",',
+          '  "secrets": {',
+          '  "tokens": [',
+          '  "password": "string",',
+          "  token: string;",
+          '  "max_tokens": 4096,',
+          "max_tokens: 4096",
+          "token_count=12",
+          "GITHUB_TOKEN=$GITHUB_TOKEN",
+          "DB_PASSWORD=【填写】",
+        ].join("\n"),
+      },
+    ]);
+    expect(hits).toEqual([]);
+  });
+
+  it("R4-05：camelCase / PascalCase / snake / kebab / 大写下划线键名都命中", () => {
+    const scan = (content: string) =>
+      scanSensitiveFiles([{ path: "skills/fe/demo/cfg.json", content }]);
+    for (const line of [
+      '  "accessToken": "RealTokenValue99",',
+      "appSecret = 'RealSecretValue99'",
+      '{"clientSecret":"RealSecretValue99"}',
+      '  "privateKey": "RealPrivateValue99"',
+      "refreshToken: RealRefreshValue99",
+      "AccessToken=RealTokenValue99",
+      "dbPassword: RealPassw0rd99",
+      "ApiKey = RealApiKeyValue99",
+      "APIKey: RealApiKeyValue99",
+      "x-access-token: RealTokenValue99",
+      "AWS_SECRET_ACCESS_KEY=RealSecretValue99",
+      "private-key: RealPrivateValue99",
+      "config.db.password = RealPassw0rd99",
+      "'password' => 'RealPassw0rd99'",
+      "authToken: RealTokenValue99",
+      // 弱敏感词（auth / credential）：值像口令（≥8、字母+数字）才报
+      "auth: Ab12Cd34Ef56",
+      '"credential": "Ab12Cd34Ef56"',
+    ]) {
+      const hits = scan(line);
+      expect(hits.map((h) => h.kind), line).toContain("credential-key");
+      for (const h of hits) {
+        expect(h.snippet, line).toContain("***");
+        expect(h.snippet, line).not.toMatch(/Real[A-Za-z]+\d{2}|Ab12Cd34/);
+      }
+    }
+  });
+
+  it("R4-05：一行多个键的 JSON 逐对扫描（敏感键不在行首 / 有多个敏感键）", () => {
+    const scan = (content: string) =>
+      scanSensitiveFiles([{ path: "skills/fe/demo/cfg.json", content }]);
+
+    const one = scan('{"name":"x","apiKey":"RealKeyValue99","id":1}');
+    expect(one.map((h) => h.kind)).toEqual(["credential-key"]);
+    expect(one[0]!.snippet).toBe("apiKey=Rea***");
+
+    // 多个敏感键：每个都要报，不是只报第一个
+    const two = scan(
+      '{"user":"u","password":"RealPassw0rd99","accessToken":"RealTokenValue99","note":"ok"}',
+    );
+    expect(two.map((h) => h.snippet)).toEqual([
+      "password=Rea***",
+      "accessToken=Rea***",
+    ]);
+
+    // 第一个敏感键是占位符 / 计数，不能遮住后面真正的密文
+    const masked = scan(
+      '{"token":"<token>","max_tokens":4096,"clientSecret":"RealSecretValue99"}',
+    );
+    expect(masked.map((h) => h.snippet)).toEqual(["clientSecret=Rea***"]);
+
+    // 一行 .env 风格（分号 / 逗号分隔）
+    const inline = scan("host=db1; password=RealPassw0rd99; port=5432");
+    expect(inline.map((h) => h.snippet)).toEqual(["password=Rea***"]);
+
+    // 值是整体消费的：字符串内容里的 `token: x` 不是键值对
+    expect(scan('{"note":"set token: RealTokenValue99 later"}')).toEqual([]);
+  });
+
+  it("R4-05：按词边界判断、不是子串（tokenizer / author / secretary 不误报）", () => {
+    const hits = scanSensitiveFiles([
+      {
+        path: "skills/fe/demo/cfg.json",
+        content: [
+          '  "tokenizer": "bert-base-cased",',
+          "tokenizer: RealLookingValue99",
+          '  "author": "chenlujiang1990",',
+          "author=Zhang-San-Wei-1990",
+          '  "secretary": "Li-Si-Wang-Wu-2020",',
+          "keyboard: Qwerty123456",
+          "monkey_patch: Abc12345678",
+          "passenger: Abc12345678",
+          "authority: Abc12345678",
+          // 弱敏感词的值不像口令（纯字母 / 太短）
+          "auth: basic",
+          "auth: oauth2",
+          '"credential": "none"',
+          // 计数 / 布尔配置
+          '  "maxTokens": 4096,',
+          "tokenCount = 12",
+          "useToken: true",
+          // 键名指向路径 / 名称而非密文本身
+          "token_file: ~/.tok-store",
+          "passwordUrl: https://example.com/reset",
+          "secretName: my-app-secret-store",
+          // 类型 / 结构
+          '  "accessToken": "string",',
+          "  clientSecret: string;",
+          '  "privateKey": {',
+          // 占位符 / 变量 / 模板插值
+          '  "appSecret": "<your-app-secret>",',
+          "refreshToken: ${REFRESH_TOKEN}",
+          "accessToken: ${{ secrets.ACCESS_TOKEN }}",
+          "clientSecret: {{ .Values.clientSecret }}",
+          "apiKey: process.env.API_KEY",
+        ].join("\n"),
+      },
+    ]);
+    expect(hits).toEqual([]);
+  });
+
+  it("S07-02：平台令牌值形态（sk- / ghp_ / glpat- / xox*- / AKIA / Bearer）无键名也命中", () => {
+    const cases: Array<[string, string]> = [
+      ["use key sk-proj-Ab12Cd34Ef56Gh78Ij90Kl12 in the header", "sk-"],
+      ["use ghp_Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78 here", "ghp_"],
+      // 下面 glpat- 夹具拆成两段拼接：运行时字符串不变，但源码里没有完整令牌形态，避免 GitHub push protection 把测试夹具当真密钥拦下
+      ["curl with PRIVATE-TOKEN glpat-" + "AbCd1234EfGh5678IjKl", "glpat-"],
+      ["slack xoxb-123456789012-abcdefABCDEF", "xox"],
+      ["aws AKIAIOSFODNN7EXAMPLE", "AKIA"],
+      ["Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc123def456", "Bearer"],
+      ["curl -H 'Authorization: Bearer abcDEF1234567890abcdef'", "Bearer"],
+      // 注释行里贴的也要拦
+      ["# ghp_Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78", "ghp_"],
+    ];
+    for (const [line, tag] of cases) {
+      const hits = scanSensitiveFiles([{ path: "skills/fe/demo/README.md", content: line }]);
+      expect(hits.length, line).toBeGreaterThan(0);
+      expect(hits.every((h) => h.kind === "known-token"), line).toBe(true);
+      expect(hits[0]!.snippet, line).toContain(tag);
+      expect(hits[0]!.snippet, line).toContain("***");
+      // 只露前 3 位，绝不回传完整原值
+      expect(hits[0]!.snippet, line).not.toMatch(/Ab12Cd34|abc123def|EXAMPLE|abcDEF1234/);
+    }
+  });
+
+  it("S07-02：令牌形态的正常文本不误报（slug / 占位符 / 变量引用）", () => {
+    const hits = scanSensitiveFiles([
+      {
+        path: "skills/fe/demo/README.md",
+        content: [
+          "running task-force-assessment-long-name and risk-assessment-framework-docs",
+          "key format is sk-your-key-here, e.g. sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "Authorization: Bearer <token>",
+          "Authorization: Bearer ${GITHUB_TOKEN}",
+          "Authorization: Bearer YOUR_ACCESS_TOKEN_HERE",
+          "Bearer authentication-scheme-description-text",
+          "use ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx as placeholder",
+          "sk-this-is-a-kebab-case-slug-with-no-digits",
+          "AKIA is the prefix of AWS access key ids",
         ].join("\n"),
       },
     ]);

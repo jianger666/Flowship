@@ -11,16 +11,19 @@
  *     -- 之后的整条 SQL 必须作为单个带引号的参数传入。
  *
  * 凭据从 company-env.json 读取，**不进命令行 / 日志 / 输出 JSON**。
- * 实例 readonly（缺省 true）时硬挡写语句（INSERT/UPDATE/DELETE/DDL 等）。
+ * 实例 readonly（缺省 true）时：静态扫描挡写语句 + 多语句，并在库侧 `BEGIN READ ONLY` +
+ * extended protocol（单语句）强制只读；readonly:false 的实例行为不变。
  *
  * 输出：JSON `{ ok, stdout, stderr, exitCode, rowCount?, error? }`；
  * stdout 是 rows 的 JSON 文本。环境变量 `PG_EXEC_CONFIG` 覆盖配置路径（测试用）。
  */
 
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { Client } = require("pg");
@@ -29,8 +32,205 @@ const CONNECT_TIMEOUT_MS = 15_000;
 const QUERY_TIMEOUT_MS = 60_000;
 const OUTPUT_CAP = 200_000;
 
+// ---- 只读 SQL 静态门（与 src/lib/server/sql-readonly-guard.ts 同逻辑；本脚本要单文件分发，故内联一份）----
+// 旧实现先正则剥注释再扫关键字，`SELECT '--'; DROP TABLE t` 可绕过。现改词法扫描：按 PostgreSQL 规则
+// 识别注释（块注释可嵌套）/ 单引号串（仅 E'..' 认反斜杠转义）/ 双引号标识符 / 美元引用串并抹掉，
+// 再扫写关键字、数顶层语句数（只放单条）。这只是第一道防线；实例 readonly 时另在库侧强制只读（见 main）。
+/**
+ * 写类关键字（含 `SELECT … INTO new_table` 的 INTO）。
+ * `COMMENT` 只认「语句开头的 `COMMENT ON`」：`comment` 是极常见的业务表 / 列名（非保留字），裸写 `\bCOMMENT\b` 会把
+ * `SELECT comment FROM t` 误拒成「写」，不锚定的 `COMMENT\s+ON` 又会把 `… JOIN comment ON …`（联接条件）误拒（H4-09）；
+ * 而 COMMENT 语句文法只有 `COMMENT ON …` 一种形态、且只能做语句的第一个词（两词间只有空白 / 已抹掉的注释），
+ * 所以锚在「整段开头或某个 `;` 之后（中间只有空白）」不会放过真 COMMENT 语句；多条语句本来就先被 `statements > 1` 拒掉。
+ * 与 src/lib/server/sql-readonly-guard.ts 的 WRITE_SQL_RE 必须保持同步。
+ */
 const WRITE_RE =
-  /\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|CREATE|ALTER|GRANT|REVOKE|COPY|VACUUM|REINDEX|CLUSTER|REFRESH|CALL|DO|LOCK|COMMENT)\b/i;
+  /(?:^|;)\s*COMMENT\s+ON\b|\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|CREATE|ALTER|GRANT|REVOKE|COPY|VACUUM|REINDEX|CLUSTER|REFRESH|CALL|DO|LOCK|INTO)\b/i;
+
+/**
+ * 带副作用 / 越权的函数名（匹配「标识符 + 可选空白 + `(`」，大小写不敏感，`schema.` 前缀自然覆盖）。
+ * 旁路对 readonly:false 实例没有库侧只读兜底，这些函数在只读事务里也能生效（终止连接、睡眠 DoS、
+ * 读服务器文件、改 GUC 解除只读…）或会执行任意 SQL 文本（query_to_xml / dblink），故一律拒。
+ */
+const SIDE_EFFECT_FN_NAMES = [
+  "pg_terminate_backend",
+  "pg_cancel_backend",
+  "pg_sleep\\w*",
+  "pg_\\w*advisory\\w*",
+  "setval",
+  "nextval",
+  "set_config",
+  "lo_\\w+",
+  "lowrite",
+  "pg_read_\\w+",
+  "pg_ls_\\w+",
+  "pg_stat_file",
+  "pg_file_\\w+",
+  "pg_reload_conf",
+  "pg_rotate_logfile",
+  "pg_notify",
+  "pg_stat_reset\\w*",
+  "pg_logical_\\w+",
+  "pg_replication_\\w+",
+  "pg_create_\\w+",
+  "pg_drop_\\w+",
+  "pg_copy_\\w+",
+  "pg_promote",
+  "pg_switch_wal",
+  "pg_wal_replay_\\w+",
+  "pg_backup_\\w+",
+  "pg_start_backup",
+  "pg_stop_backup",
+  "pg_import_system_collations",
+  "dblink\\w*",
+  "query_to_xml\\w*",
+  "table_to_xml\\w*",
+  "cursor_to_xml\\w*",
+  "schema_to_xml\\w*",
+  "database_to_xml\\w*",
+  "ts_stat",
+];
+const SIDE_EFFECT_FN_RE = new RegExp(
+  `(?<![A-Za-z0-9_$\\u0080-\\uffff])(?:${SIDE_EFFECT_FN_NAMES.join("|")})\\s*\\(`,
+  "i",
+);
+
+const isIdentChar = (c) =>
+  c !== undefined && /[A-Za-z0-9_$\u0080-\uffff]/.test(c);
+
+const DOLLAR_TAG_RE = /^\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/;
+
+export const scanSql = (input) => {
+  const sql = String(input);
+  let code = "";
+  let callCode = "";
+  let i = 0;
+  let unterminated = false;
+  let unicodeIdent = false;
+  while (i < sql.length) {
+    const c = sql[i];
+    const n = sql[i + 1];
+    // 行注释
+    if (c === "-" && n === "-") {
+      // PostgreSQL 词法里 \r 与 \n 都是行尾：`--<CR>; DROP` 的 `;` 已在注释之外
+      const eol = sql.slice(i).search(/[\r\n]/);
+      i = eol < 0 ? sql.length : i + eol;
+      code += " ";
+      callCode += " ";
+      continue;
+    }
+    // 块注释（PostgreSQL 允许嵌套）
+    if (c === "/" && n === "*") {
+      let depth = 1;
+      i += 2;
+      while (i < sql.length && depth > 0) {
+        if (sql[i] === "/" && sql[i + 1] === "*") {
+          depth++;
+          i += 2;
+        } else if (sql[i] === "*" && sql[i + 1] === "/") {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      if (depth > 0) unterminated = true;
+      code += " ";
+      callCode += " ";
+      continue;
+    }
+    // 单引号串：只有 E'..' 才把反斜杠当转义（standard_conforming_strings 默认 on，普通串里 `\` 是字面）
+    if (c === "'") {
+      const prev = sql[i - 1];
+      const escapeString =
+        (prev === "E" || prev === "e") && !isIdentChar(sql[i - 2]);
+      i++;
+      let closed = false;
+      while (i < sql.length) {
+        if (escapeString && sql[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i++;
+          closed = true;
+          break;
+        }
+        i++;
+      }
+      if (!closed) unterminated = true;
+      code += "''";
+      callCode += "''";
+      continue;
+    }
+    // 双引号标识符（`""` 为转义）
+    if (c === '"') {
+      if (sql[i - 1] === "&" && /[Uu]/.test(sql[i - 2] ?? "") && !isIdentChar(sql[i - 3])) {
+        unicodeIdent = true;
+      }
+      i++;
+      let closed = false;
+      let name = "";
+      while (i < sql.length) {
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') {
+            name += '"';
+            i += 2;
+            continue;
+          }
+          i++;
+          closed = true;
+          break;
+        }
+        name += sql[i];
+        i++;
+      }
+      if (!closed) unterminated = true;
+      code += '""';
+      callCode += ` ${name.replace(/[^A-Za-z0-9_$\u0080-\uffff]/g, "_")}`;
+      continue;
+    }
+    // 美元引用串 $tag$ ... $tag$（`a$b` 这类标识符内的 $ 不算起始）
+    if (c === "$" && !isIdentChar(sql[i - 1])) {
+      const m = DOLLAR_TAG_RE.exec(sql.slice(i));
+      if (m) {
+        const tag = m[0];
+        const end = sql.indexOf(tag, i + tag.length);
+        if (end < 0) {
+          unterminated = true;
+          i = sql.length;
+        } else {
+          i = end + tag.length;
+        }
+        code += "''";
+        callCode += "''";
+        continue;
+      }
+    }
+    code += c;
+    callCode += c;
+    i++;
+  }
+  const statements = code.split(";").filter((s) => s.trim().length > 0).length;
+  return { code, callCode, statements, unterminated, unicodeIdent };
+};
+
+/** 只读 SQL 判定：单条、词法闭合、无写类关键字才放行 */
+export const checkReadonlySql = (sql) => {
+  const scan = scanSql(sql);
+  if (scan.unterminated) return { ok: false, reason: "unterminated" };
+  if (scan.statements === 0) return { ok: false, reason: "empty" };
+  if (scan.statements > 1) return { ok: false, reason: "multi" };
+  if (WRITE_RE.test(scan.code)) return { ok: false, reason: "write" };
+  if (scan.unicodeIdent || SIDE_EFFECT_FN_RE.test(scan.callCode)) {
+    return { ok: false, reason: "func" };
+  }
+  return { ok: true };
+};
 
 const defaultDataDir = () => {
   if (process.platform === "darwin") {
@@ -81,12 +281,12 @@ const readPgInstances = async (configPath) => {
     .filter((p) => p.host.trim());
 };
 
-/** 去掉注释后再扫写关键字，避免 `-- INSERT` 注释误伤；WITH … INSERT 仍能拦住 */
-const isWriteSql = (sql) => {
-  const stripped = String(sql)
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/--[^\n]*/g, " ");
-  return WRITE_RE.test(stripped);
+const READONLY_REJECT_REASON = {
+  multi: "只允许单条语句（禁止用分号拼多条）",
+  unterminated: "SQL 里的引号 / 注释 / $$ 没有闭合",
+  empty: "SQL 为空",
+  write: "禁止 INSERT/UPDATE/DELETE/DDL/SELECT INTO",
+  func: "禁止带副作用 / 越权的函数（pg_terminate_backend、pg_sleep、setval/nextval、pg_read_file、lo_*、dblink、set_config 等）",
 };
 
 const ALLOWED_FLAGS = new Set(["config", "env", "user", "database"]);
@@ -209,9 +409,14 @@ const main = async () => {
     return;
   }
 
-  if (entry.readonly && isWriteSql(args.sql)) {
-    fail("该实例只读，只允许 SELECT / 只读查询（禁止 INSERT/UPDATE/DELETE/DDL）");
-    return;
+  if (entry.readonly) {
+    const verdict = checkReadonlySql(args.sql);
+    if (!verdict.ok) {
+      fail(
+        `该实例只读，只允许单条 SELECT / 只读查询（${READONLY_REJECT_REASON[verdict.reason]}）`,
+      );
+      return;
+    }
   }
 
   const database = args.database || entry.user || "postgres";
@@ -227,7 +432,22 @@ const main = async () => {
 
   try {
     await client.connect();
-    const result = await client.query(args.sql);
+    let result;
+    if (entry.readonly) {
+      // 库侧强制只读（不依赖上面的静态扫描）：
+      // ① BEGIN READ ONLY：写操作 / DDL 由服务端拒绝；
+      // ② extended protocol（Parse/Bind）：服务端只接受单条语句，`a; b`、`COMMIT; DROP ...`、
+      //    `SET TRANSACTION READ WRITE; ...` 这类多语句拼接直接报错——用户语句里即使有
+      //    COMMIT / SET ... READ WRITE，也是本事务里的最后一条、之后没有可执行的写。
+      await client.query("BEGIN READ ONLY");
+      try {
+        result = await client.query({ text: args.sql, queryMode: "extended" });
+      } finally {
+        await client.query("ROLLBACK").catch(() => {});
+      }
+    } else {
+      result = await client.query(args.sql);
+    }
     const rows = Array.isArray(result?.rows) ? result.rows : [];
     const stdout = capText(JSON.stringify(rows, null, 2));
     console.log(
@@ -248,6 +468,18 @@ const main = async () => {
   }
 };
 
-main().catch((err) => {
-  fail(`脚本异常：${err instanceof Error ? err.message : String(err)}`);
-});
+// 仅当被 `node pg-exec.mjs` 直接执行时才跑 main（被测试 import 判定函数时不连库、不读 argv）
+const isDirectRun = () => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+};
+
+if (isDirectRun()) {
+  main().catch((err) => {
+    fail(`脚本异常：${err instanceof Error ? err.message : String(err)}`);
+  });
+}

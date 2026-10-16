@@ -58,7 +58,11 @@ import {
   waitForRestrictedQuestionsToStop,
   waitForTaskToStop,
 } from "@/lib/server/task-stream";
-import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
+import {
+  cancelChatRun,
+  discardStashedBackgroundResultsForDeletedTask,
+  waitForChatToStop,
+} from "@/lib/server/chat-runner";
 import { cleanupChatQueueState, failQueuedItems } from "@/lib/server/chat-queue";
 import { clearCorrelatedEntries } from "@/lib/server/feishu-bridge/group-outbound-registry";
 import { clearGroupQuestionQueue } from "@/lib/server/feishu-bridge/group-shared";
@@ -698,6 +702,9 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // queue generation 只增不删——删任务时一并清，
     // 防长跑进程 Map 积键（须在 waitForChatToStop 之后、活跃 drain 已退出）
     cleanupChatQueueState(id);
+    // 重连窗口里暂存的后台子代理结果（带 10 分钟时效计时器）同清：任务没了，到点那条「暂存超时」提示
+    // 只会往已删掉的任务目录里写事件。静默清（不写「未送达」——没有人在看这条事件流了）
+    discardStashedBackgroundResultsForDeletedTask(id);
 
     // quarantine 场景——先 prepared→tombstone→committed，再 HTTP 200；
     // deleting lifecycle 保持到后台物理删完；job 归零后再清 refs + deleteTask（refs 失败留 journal）。

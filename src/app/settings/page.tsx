@@ -19,7 +19,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, CircleAlert } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -36,6 +36,8 @@ import { Separator } from "@/components/ui/separator";
 import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
 import { useApiKeyInfo } from "@/hooks/use-api-key-info";
+import { getSettings } from "@/lib/local-store";
+import { describeSettingsUnreadable } from "@/lib/settings-unreadable";
 import {
   CURSOR_PROVIDER_ID,
   DEFAULT_MEEGLE_PROJECT,
@@ -93,7 +95,7 @@ const CAPABILITY_FOCUS: Record<string, string> = {
 const SettingsPage = () => {
   const router = useRouter();
   const { openCurrent: openWhatsNew } = useWhatsNew();
-  const { settings, loaded, update, saveFieldValue } = useSettings();
+  const { settings, loaded, unreadable, update, saveFieldValue } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
   // API Key 归属信息（Cursor.me）——拉模型时顺便拉、展示在 Key 下面
   const { info: apiKeyInfo, fetchInfo } = useApiKeyInfo();
@@ -110,6 +112,8 @@ const SettingsPage = () => {
     (apiKey: string, options?: { manual?: boolean }) => {
       if (!apiKey.trim()) {
         void fetchModels({ provider: CURSOR_PROVIDER_ID, apiKey: "" }, options);
+        // S13-15：清空 key 也要清掉账号信息块（否则上一把 key 的姓名 / 邮箱一直挂着）
+        void fetchInfo("", options);
         return;
       }
       void fetchModels({ provider: CURSOR_PROVIDER_ID, apiKey }, options);
@@ -119,6 +123,9 @@ const SettingsPage = () => {
   );
 
   const handleApiKeyCommit = (value: string) => {
+    // S13-15：值没变（只是点进去又点出来）不重复 PUT、不重复拉模型 / 账号信息；
+    // 上次保存失败时 getSettings() 已回滚成旧值，这里仍视为有变化、会重试
+    if (value === getSettings().apiKey) return;
     saveFieldValue("apiKey", value);
     pullCursorModels(value);
   };
@@ -225,6 +232,12 @@ const SettingsPage = () => {
     return <LoadingState variant="hero" />;
   }
 
+  // config.json 读取阶段就不可读：settings 此时只是默认值，渲染表单会误导用户以为配置丢了、
+  // 还会诱导去改——改了也存不进去。所以只在顶部给明确原因，卡片区整体不渲染
+  const unreadableText = unreadable
+    ? describeSettingsUnreadable(unreadable.reason)
+    : null;
+
   // 返回 = 回来路（任务详情 / 首页都可能）、无历史（直开 /settings）兜底回首页
   const handleBack = () => {
     if (window.history.length > 1) router.back();
@@ -300,6 +313,35 @@ const SettingsPage = () => {
           </div>
         </div>
 
+        {unreadable && unreadableText && (
+          <div
+            role="alert"
+            className="rounded-md border border-destructive/40 bg-destructive/5 p-3"
+          >
+            <div className="flex items-start gap-2">
+              <CircleAlert
+                aria-hidden
+                className="mt-0.5 size-4 shrink-0 text-destructive"
+              />
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="text-sm font-medium text-foreground">
+                  {unreadableText.headline}
+                </div>
+                <div className="text-sm leading-relaxed text-muted-foreground">
+                  {unreadableText.detail}
+                </div>
+                {unreadable.reason && (
+                  <div className="font-mono text-xs break-all text-muted-foreground">
+                    原因：{unreadable.reason}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!unreadable && (
+          <>
         {/* ---- 模型：提供方 + 凭据 + 默认模型 ---- */}
         {wrapCard(
           "model",
@@ -448,6 +490,8 @@ const SettingsPage = () => {
             onChange={(next) => update("repos", next)}
             onCommit={handleReposCommit}
           />,
+        )}
+          </>
         )}
       </div>
     </div>

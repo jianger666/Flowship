@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  GROUP_NEEDS_OWNER_RE,
   GROUP_NO_REPLY_TOKEN,
   type GroupMember,
 } from "@/lib/server/feishu-bridge/group-contract";
@@ -298,15 +297,42 @@ describe("parseGroupReply · 需属主确认", () => {
     expect(r.text).toBe(
       `这个要宿主确认，已转告\n${tag("ou_owner", "曾进有")} 需要你确认：接口是否改成分页`,
     );
-    expect(r.text).not.toMatch(GROUP_NEEDS_OWNER_RE);
+    // 输出里不再含标记：把输出再喂一遍解析器，不会再识别出标记（第七轮 K4-11：原来用已删除的契约正则 GROUP_NEEDS_OWNER_RE 断言）
+    expect(parseGroupReply(r.text, mk({ requester: bot })).needsOwner).toBeUndefined();
     expect(r.text).not.toContain("[[");
     expect(r.mentions).toEqual([{ openId: "ou_owner", name: "曾进有" }]);
   });
 
-  it("补了属主 @ 就不再补提问人（真人提问也一样）", () => {
+  // G1-05：prompt 对真人提问人承诺「正文里不用写 @，系统会自动 @ 他」；文档第 4 条的条件是
+  // 「**正文**没有任何真 @」——系统自己补的属主确认行不算正文，否则等着答案的人反而收不到通知
+  it("真人提问、正文没有 @：属主确认行补的 @ 不算正文，提问人照补（G1-05）", () => {
     const r = parseGroupReply(`先这样\n${mark("要不要上线")}`, mk());
-    expect(r.mentions.map((m) => m.openId)).toEqual(["ou_owner"]);
+    expect(r.text).toBe(
+      `${tag("ou_zhang", "张三")} 先这样\n${tag("ou_owner", "曾进有")} 需要你确认：要不要上线`,
+    );
+    // mentions 顺序与 text 里的出现顺序一致
+    expect(r.mentions.map((m) => m.openId)).toEqual(["ou_zhang", "ou_owner"]);
+  });
+
+  it("真人提问、正文自己已 @ 了别人：不补提问人（契约第 4 条原样）", () => {
+    const r = parseGroupReply(`问下 @李安\n${mark("要不要上线")}`, mk());
     expect(r.text.startsWith(tag("ou_zhang", "张三"))).toBe(false);
+    expect(r.mentions.map((m) => m.openId)).toEqual(["ou_an", "ou_owner"]);
+  });
+
+  it("机器人提问 + 标记：仍不补提问人（有意防环）", () => {
+    const r = parseGroupReply(`先这样\n${mark("要不要上线")}`, mk({ requester: bot }));
+    expect(r.mentions.map((m) => m.openId)).toEqual(["ou_owner"]);
+    expect(r.text).not.toContain("ou_anruo");
+  });
+
+  it("提问人本身就是属主：确认行已 @ 他，不再给他补第二个", () => {
+    const r = parseGroupReply(
+      `先这样\n${mark("要不要上线")}`,
+      mk({ requester: { openId: "ou_owner", name: "曾进有", isBot: false } }),
+    );
+    expect(r.text.split('<at user_id="ou_owner"').length - 1).toBe(1);
+    expect(r.mentions.map((m) => m.openId)).toEqual(["ou_owner"]);
   });
 
   it("正文已 @ 过属主：不重复 @，说明行用纯文本前缀", () => {
@@ -353,8 +379,10 @@ describe("parseGroupReply · 需属主确认", () => {
 
   it("说明压空白、截断到 200 字", () => {
     const long = "字".repeat(300);
+    // 说明里换行用单个 \n：闭合符在同一段（空行分隔）内找；说明里夹空行也能闭合，但有条件（闭合符在行尾、离起头 600 字内……，
+    // 见 tests/group-reply-protocol-r7.test.ts 的 K4-05③），这条用例考的是截断，不借这个条件
     const r = parseGroupReply(
-      `ok\n${mark(`  前面\n\n  有  空白 ${long}`)}`,
+      `ok\n${mark(`  前面\n  有  空白 ${long}`)}`,
       mk({ requester: bot }),
     );
     expect(r.needsOwner?.startsWith("前面 有 空白 ")).toBe(true);
@@ -465,11 +493,16 @@ describe("buildGroupReplyRules", () => {
         expect(all).toContain("Flowship");
       });
 
-      it("示例标记写法能被契约正则识别", () => {
+      // 第七轮 K4-11：原来用契约正则 `GROUP_NEEDS_OWNER_RE` 判示例行，现已删除、改走真实的解析入口。
+      // 并且示例行**不能被包在反引号里**——解析器（K4-05②）把行内代码 / 围栏里的标记当示例、不触发，
+      // 模型照抄带反引号的示例行就会让标记原样发群、属主没被 @。
+      it("示例标记行原样喂给真实解析器能被识别（不是被包在代码里的示例）", () => {
         const markLine = lines.find((l) => l.includes("[[需属主确认"));
         expect(markLine).toBeTruthy();
-        const m = GROUP_NEEDS_OWNER_RE.exec(markLine ?? "");
-        expect(m?.[1]).toContain("一句话说明");
+        const r = parseGroupReply(markLine ?? "", mk({ requester: bot }));
+        expect(r.needsOwner).toContain("一句话说明");
+        expect(r.mentions.map((m) => m.openId)).toEqual(["ou_owner"]);
+        expect(r.text).not.toContain("[[");
       });
     });
   }

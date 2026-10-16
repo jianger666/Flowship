@@ -31,6 +31,7 @@ import { Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { SkillToken } from "@/components/ui/skill-token";
 import { parseSkillTokens, SLASH_RE } from "@/lib/skill-token";
+import { isImeComposing } from "@/lib/ime";
 
 // 对外 re-export：调用方仍可从本模块拿解析 API（Composer 既有 import 路径不断）
 export {
@@ -296,7 +297,7 @@ export const useSlashSkills = (opts: {
     (e: KeyboardEvent): boolean => {
       if (!menuOpen) return false;
       // IME 组合输入中（中文选词的 Enter / ↑↓）不归菜单——否则输入法候选操作被吞
-      if ((e.nativeEvent as globalThis.KeyboardEvent).isComposing) return false;
+      if (isImeComposing(e)) return false;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setActiveIndex((i) => (i + 1) % filtered.length);

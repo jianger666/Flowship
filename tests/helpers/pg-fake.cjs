@@ -14,13 +14,20 @@ const dumpOpts = (opts) => {
   }
 };
 
-const dumpSql = (sql) => {
+// 事务控制语句（pg-exec 只读实例会包 BEGIN READ ONLY / ROLLBACK）只进 queries 流水、不覆盖 sql
+const TX_CONTROL_RE = /^(BEGIN READ ONLY|ROLLBACK)$/;
+
+const dumpSql = (sql, queryMode) => {
   const dump = process.env.PG_FAKE_DUMP;
   if (!dump) return;
   try {
     const raw = fs.readFileSync(dump, "utf8");
     const obj = raw.trim() ? JSON.parse(raw) : {};
-    obj.sql = sql;
+    obj.queries = [...(obj.queries ?? []), { sql, queryMode: queryMode ?? "simple" }];
+    if (!TX_CONTROL_RE.test(sql)) {
+      obj.sql = sql;
+      obj.queryMode = queryMode ?? "simple";
+    }
     fs.writeFileSync(dump, JSON.stringify(obj));
   } catch {
     // dump 失败不阻塞
@@ -38,8 +45,12 @@ class FakeClient {
     }
     return Promise.resolve();
   }
-  query(sql) {
-    dumpSql(sql);
+  query(input) {
+    // 兼容 query(text) 与 query({ text, queryMode })
+    const sql = typeof input === "string" ? input : input.text;
+    const queryMode = typeof input === "string" ? "simple" : input.queryMode;
+    dumpSql(sql, queryMode);
+    if (TX_CONTROL_RE.test(sql)) return Promise.resolve({ rows: [], rowCount: null });
     if (process.env.PG_FAKE_MODE === "query-fail") {
       return Promise.reject(new Error("relation \"nope\" does not exist"));
     }

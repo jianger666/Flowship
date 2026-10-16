@@ -14,6 +14,8 @@
  * - hasUnsaved：dirty 任一为 true（用于离页提示）
  * - update / saveFieldValue：更新草稿（文本框输入用）/ 落盘某字段（编辑即保存）
  * - loaded：是否完成首次 config 初始化（避免 SSR/hydrate 闪空）
+ * - unreadable：config.json 读取阶段就不可读（损坏 / 权限等）时的 reason；非 null 时暂停保存、
+ *   设置页只展示错误提示（settings 此时是默认值、不是用户的配置）
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -22,15 +24,29 @@ import { toast } from "sonner";
 import {
   DEFAULT_SETTINGS,
   getSettings,
+  getSettingsUnreadable,
   initSettings,
-  saveSettings,
+  saveSettingsDetailed,
 } from "@/lib/local-store";
+import {
+  createSaveRetrier,
+  saveWithRetry,
+  type SaveRetrier,
+} from "@/lib/save-retry";
+import {
+  describeSettingsUnreadable,
+  type SettingsUnreadable,
+} from "@/lib/settings-unreadable";
 import type {
   FeAiFlowSettings,
   JumpIde,
   RepoConfig,
   SubmitShortcut,
 } from "@/lib/types";
+
+/** 服务端 4xx 拒绝保存（如校验不过的 400）：这类失败重试不会成功，所以文案不能说「将自动重试」 */
+const rejectedToast = (status: number): string =>
+  `保存失败：服务端拒绝了这次修改（HTTP ${status}）、不会自动重试。请检查输入后再改一次该项`;
 
 // RepoConfig 稳定序列化比较：字段顺序固定、可选字段缺省归一空串（CR-09）。
 // 加新字段时记得补这里——漏了该字段的编辑不会触发 dirty。
@@ -43,6 +59,7 @@ const repoConfigCanonical = (r: RepoConfig): string =>
     r.devBranch ?? "",
     r.branchTemplate ?? "",
     r.previewCommand ?? "",
+    r.setupCommand ?? "",
     // boolean 开关缺省归一 false（修：原先漏 readonly、切开关不触发 dirty）
     r.readonly ?? false,
     r.scriptRepo ?? false,
@@ -97,6 +114,7 @@ export interface UseSettingsResult {
   settings: FeAiFlowSettings;
   savedSettings: FeAiFlowSettings;
   loaded: boolean;
+  unreadable: SettingsUnreadable | null;
   dirty: Record<SettingsField, boolean>;
   hasUnsaved: boolean;
   update: <K extends SettingsField>(key: K, value: FeAiFlowSettings[K]) => void;
@@ -254,6 +272,13 @@ export const useSettings = (): UseSettingsResult => {
   // 是否已从 config 初始化灌过初值；防止 SSR 渲染时闪现空表单
   const [loaded, setLoaded] = useState(false);
 
+  // config.json 在读取阶段就不可读（损坏 / 权限等）：此时 settings 只是默认值、不是用户的配置，
+  // 保存必须暂停（local-store 本来也会拒绝整对象 PUT），否则 UI 会照常提示「将自动重试」而重试永远不会成功
+  const [unreadable, setUnreadable] = useState<SettingsUnreadable | null>(null);
+  // 给异步回调读最新值（saveFieldValue 是每次渲染新建的闭包）
+  const unreadableRef = useRef(unreadable);
+  unreadableRef.current = unreadable;
+
   // 首次挂载：先 await 配置初始化（读 config.json）、再灌进草稿态
   useEffect(() => {
     let alive = true;
@@ -262,6 +287,7 @@ export const useSettings = (): UseSettingsResult => {
       const s = getSettings();
       setSettings(s);
       setSavedSettings(s);
+      setUnreadable(getSettingsUnreadable());
       setLoaded(true);
     });
     return () => {
@@ -331,9 +357,10 @@ export const useSettings = (): UseSettingsResult => {
     [settings, savedSettings]
   );
 
+  // 不可读时没有任何东西能存：不再算「有未保存修改」，免得离页还被 beforeunload 拦一道
   const hasUnsaved = useMemo(
-    () => Object.values(dirty).some(Boolean),
-    [dirty]
+    () => !unreadable && Object.values(dirty).some(Boolean),
+    [dirty, unreadable]
   );
 
   // 通用字段更新工具：只改草稿、不写 config.json
@@ -341,6 +368,11 @@ export const useSettings = (): UseSettingsResult => {
     key: K,
     value: FeAiFlowSettings[K]
   ) => {
+    // 草稿被改了：该字段待办的自动重试作废。否则「保存失败 → 用户在框里改回旧值 → blur」时，
+    // 因新值与落盘一致，调用方（apiKey 的早返回 / company-env 的 lastSaved 去重）不会再发起保存、
+    // 也就没人 cancel 重试，退避后失败的新值会被写盘、与输入框里看到的不一致。
+    // 只丢待办、不 bump 世代：repo-card 先落盘安全版再 update 草稿，安全版若失败仍要排重试
+    retrierRef.current?.dropPending(key);
     setSettings((prev) => ({ ...prev, [key]: value }));
   };
 
@@ -352,19 +384,60 @@ export const useSettings = (): UseSettingsResult => {
   // CR-08：await 服务端 config.json 写结果——成功才把字段标「已保存」（savedSettings）、
   // 失败 toast（原实现 500 也静默当成功、重启后修改凭空消失）。草稿态先行更新（乐观）。
   // 不弹 success toast：编辑即存高频、刷屏没意义、仅失败时提示
+  // S13-03：保存失败后的自动重试器（惰性建一次；字段级退避重试、新保存作废旧重试、卸载时补跑）
+  const retrierRef = useRef<SaveRetrier | null>(null);
+  const getRetrier = (): SaveRetrier => {
+    if (!retrierRef.current) {
+      retrierRef.current = createSaveRetrier({
+        onRecovered: () => toast.success("配置已自动重试保存成功"),
+        onGiveUp: () =>
+          toast.error("配置多次重试仍未能保存、请检查磁盘 / 服务后再改一次该项"),
+        // 重试那一次才被服务端 4xx 拒绝（如配置已被别处改成校验不过的形态）：同一份内容再重试没有意义
+        onRejected: (_key, status) => toast.error(rejectedToast(status)),
+      });
+    }
+    return retrierRef.current;
+  };
+  // 卸载（离开设置页）：待重试的字段立即各补跑一次，免得草稿随组件一起丢
+  useEffect(
+    () => () => {
+      retrierRef.current?.flush();
+    },
+    [],
+  );
+
   const saveFieldValue = <K extends SettingsField>(
     key: K,
     value: FeAiFlowSettings[K],
   ): Promise<boolean> => {
+    // 不可读：不改草稿、不落盘、不排自动重试（它不是瞬时故障、重试永远成功不了）。
+    // 设置页此时不渲染表单、正常走不到这里，这是兜底
+    if (unreadableRef.current) {
+      toast.error(describeSettingsUnreadable(unreadableRef.current.reason).headline);
+      return Promise.resolve(false);
+    }
     const next: FeAiFlowSettings = { ...getSettings(), [key]: value };
     setSettings((prev) => ({ ...prev, [key]: value }));
-    return saveSettings(next).then((ok) => {
-      if (ok) {
-        setSavedSettings((prev) => ({ ...prev, [key]: value }));
-      } else {
-        // 保存失败：savedSettings 不动 → 字段保持 dirty、离页仍会拦截提示
-        toast.error("保存失败：配置没能写入 config.json、请重试");
-      }
+    // 作废旧重试 + 失败登记重试都交给 saveWithRetry：它按世代判断「期间是否有同字段的新保存」，
+    // V1 的 PUT 在路上时用户又存了 V2，V1 晚失败就不会再排重试（否则退避后用旧值覆盖 V2）
+    // 走带状态码的 saveSettingsDetailed：4xx（服务端明确拒绝）不排重试，5xx / 网络错误才重试
+    return saveWithRetry({
+      retrier: getRetrier(),
+      key,
+      first: () => saveSettingsDetailed(next),
+      retry: async () => {
+        // 重试用「落盘最新」做 base、只覆盖本字段（同首次保存）
+        const res = await saveSettingsDetailed({ ...getSettings(), [key]: value });
+        if (res.ok) setSavedSettings((prev) => ({ ...prev, [key]: value }));
+        return res;
+      },
+      // 保存失败：savedSettings 不动 → 字段保持 dirty、离页仍会拦截提示；
+      // 并登记自动重试——之前失败后草稿再没人去存、只能等用户碰巧再改一次
+      onFailed: () => toast.error("保存失败：配置没能写入 config.json、将自动重试"),
+      // 被服务端 4xx 拒绝：不会重试，提示不能再说「将自动重试」
+      onRejected: (status) => toast.error(rejectedToast(status)),
+    }).then((ok) => {
+      if (ok) setSavedSettings((prev) => ({ ...prev, [key]: value }));
       return ok;
     });
   };
@@ -390,6 +463,7 @@ export const useSettings = (): UseSettingsResult => {
     settings,
     savedSettings,
     loaded,
+    unreadable,
     dirty,
     hasUnsaved,
     update,

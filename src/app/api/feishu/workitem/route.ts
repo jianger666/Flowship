@@ -5,6 +5,7 @@
  * 工作项详情（V0.14 预览页 + 任务详情融合用）：
  * - 传 id（+可选 project）直接查
  * - 传 url 先本地 decode 出 id 再查（任务详情页只存了 feishuStoryUrl、走这条）
+ * - 详情带 5 分钟进程内缓存；`refresh=1` 先失效这条再查（手动刷新用）
  */
 
 import { NextResponse } from "next/server";
@@ -12,6 +13,7 @@ import { NextResponse } from "next/server";
 import {
   decodeWorkitemUrl,
   fetchWorkitemDetail,
+  invalidateWorkitemDetailCache,
   MeegleError,
 } from "@/lib/server/meegle-cli";
 
@@ -34,6 +36,9 @@ export const GET = async (req: Request) => {
     }
     if (!id) {
       return NextResponse.json({ status: "error", message: "缺 id 或 url" }, { status: 400 });
+    }
+    if (u.searchParams.get("refresh") === "1") {
+      invalidateWorkitemDetailCache(id, project);
     }
     const detail = await fetchWorkitemDetail(id, project);
     return NextResponse.json({ status: "ok", id, project, detail });

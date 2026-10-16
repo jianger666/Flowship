@@ -122,6 +122,21 @@ describe("pg-exec CLI", () => {
     expect(JSON.stringify(write.result)).not.toContain("pw-");
   });
 
+  it("只读实例：\\r 结尾注释后的分号、副作用函数 → 不连库", async () => {
+    for (const sql of [
+      "SELECT 1 --\r; DROP TABLE t",
+      "SELECT pg_terminate_backend(1)",
+      'SELECT pg_catalog."pg_sleep"(100)',
+    ]) {
+      const r = await run(["--env", "test", "--", sql]);
+      expect(r.result.ok, sql).toBe(false);
+      expect(r.result.error, sql).toContain("只读");
+      expect(r.dump, sql).toBeNull();
+    }
+    const ok = await run(["--env", "test", "--", "SELECT 'pg_sleep(1)' AS s"]);
+    expect(ok.result.ok).toBe(true);
+  });
+
   it("只读：注释里的 INSERT 不误伤，WITH … INSERT 仍拦住", async () => {
     const comment = await run([
       "--env",
@@ -139,6 +154,60 @@ describe("pg-exec CLI", () => {
     ]);
     expect(cte.result.ok).toBe(false);
     expect(cte.result.error).toContain("只读");
+  });
+
+  it("只读：SELECT '--'; DROP TABLE t 等绕过 / 多语句不连库就拒", async () => {
+    for (const sql of [
+      "SELECT '--'; DROP TABLE t",
+      "SELECT 1; SELECT 2",
+      "COMMIT; DROP TABLE t",
+      "SET TRANSACTION READ WRITE; DELETE FROM t",
+    ]) {
+      const { result, dump } = await run(["--env", "test", "--", sql]);
+      expect(result.ok, sql).toBe(false);
+      expect(result.error, sql).toContain("只读");
+      expect(dump, sql).toBeNull();
+      expect(JSON.stringify(result)).not.toContain("pw-");
+    }
+  });
+
+  it("只读：库侧 BEGIN READ ONLY 包裹 + extended protocol 单语句、结束 ROLLBACK", async () => {
+    const { result, dump } = await run([
+      "--env",
+      "test",
+      "--",
+      "WITH x AS (SELECT 1 AS a) SELECT * FROM x -- 注释",
+    ]);
+    expect(result.ok).toBe(true);
+    const queries = dump?.queries as Array<{ sql: string; queryMode: string }>;
+    expect(queries.map((q) => q.sql)).toEqual([
+      "BEGIN READ ONLY",
+      "WITH x AS (SELECT 1 AS a) SELECT * FROM x -- 注释",
+      "ROLLBACK",
+    ]);
+    // 用户语句必须走 extended（服务端拒多语句）；事务控制走 simple
+    expect(queries[1].queryMode).toBe("extended");
+  });
+
+  it("只读：查询失败也要 ROLLBACK", async () => {
+    const { result, dump } = await run(["--env", "test", "--", "SELECT 1"], {
+      PG_FAKE_MODE: "query-fail",
+    });
+    expect(result.ok).toBe(false);
+    const queries = dump?.queries as Array<{ sql: string }>;
+    expect(queries[queries.length - 1].sql).toBe("ROLLBACK");
+  });
+
+  it("可写实例（readonly:false）行为不变：simple protocol、无事务包裹、多语句不拦", async () => {
+    const { result, dump } = await run([
+      "--env",
+      "dev",
+      "--",
+      "SELECT 1; SELECT 2",
+    ]);
+    expect(result.ok).toBe(true);
+    const queries = dump?.queries as Array<{ sql: string; queryMode: string }>;
+    expect(queries).toEqual([{ sql: "SELECT 1; SELECT 2", queryMode: "simple" }]);
   });
 
   it("可写实例允许 INSERT", async () => {

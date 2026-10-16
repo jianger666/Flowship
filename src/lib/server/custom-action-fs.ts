@@ -24,7 +24,7 @@ import {
   parseSkillFile,
   scanSkillsDir,
 } from "./skills-loader";
-import { readSettingsFile } from "./settings-fs";
+import { readSettingsFile, withSettingsWriteLock } from "./settings-fs";
 // 路径 + 白名单零依赖（不 import team-library、防循环）
 import {
   getTeamLibraryKnowledgeSkillsDir,
@@ -1083,8 +1083,16 @@ export const migrateCustomActionsToSkillHosted = async (): Promise<{
   return slot.promise;
 };
 
-/** 读改写 config.json 的 actionLayout（直接 writePrivateFileAtomic、避免嵌套死锁） */
-const remapLayoutInSettings = async (
+/**
+ * 读改写 config.json 的 actionLayout。整段 RMW 必须进 settings 写链：这里读到的是整份 settings，
+ * 不加锁时与并发的设置 PUT 交错——要么迁移用旧快照把 PUT 刚存的别的字段盖回去，要么 PUT 用旧布局盖掉 remap。
+ * 迁移在开机预热和每次列表读取时都会跑，正好撞上启动初期的设置保存。
+ * 锁内直接 writePrivateFileAtomic、不调 writeSettingsFileAtomic（同链嵌套会死锁）。
+ */
+const remapLayoutInSettings = (idMap: Record<string, string>): Promise<void> =>
+  withSettingsWriteLock(() => remapLayoutInSettingsLocked(idMap));
+
+const remapLayoutInSettingsLocked = async (
   idMap: Record<string, string>,
 ): Promise<void> => {
   const result = await readSettingsFile();

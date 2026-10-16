@@ -80,6 +80,7 @@ import { listModelOptions } from "./model-catalog";
 import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
 import {
   buildCodingToolDefs,
+  buildGitTokenFreeBashTool,
   buildNativeToolAliasWrappers,
   buildReadOnlyToolDefs,
   READONLY_CUSTOM_TOOL_NAMES,
@@ -150,6 +151,12 @@ export interface CustomAgentInput {
   taskId?: string;
   /** 只读轮次：白名单只留读类 customTools（read/grep），shell/写类/子代理/MCP 全不给 */
   readOnly?: boolean;
+  /**
+   * 本会话的 shell / 子代理 bash 不继承 FLOWSHIP_GITLAB_TOKEN（需求群非属主答疑旁路传 true，N3-01）。
+   * 显式标记而不是「无 callerToken」推断：属主的 one-shot 同样无 callerToken、却该保留 token。
+   * 只对 pi provider 有效；Cursor provider 的 shell 继承 server env、摘不掉（见 git-token-env.ts）。
+   */
+  omitGitToken?: boolean;
 }
 
 /** ProviderConfigInput.models 条目的最小结构（registerProvider 会做结构校验） */
@@ -454,10 +461,17 @@ export const runPiSubagent = async (
         : [...SUBAGENT_TOOLS],
     // 内层同样落盘（同 task 配额），文件名加 sub- 前缀防与父会话 callId 撞车；
     // 内层工具调用不进父会话事件流，落盘只给模型读
-    customTools: buildNativeToolAliasWrappers(
-      cwd,
-      taskId ? { taskId, filePrefix: "sub-" } : undefined,
-    ),
+    customTools: [
+      // 父会话要求不带 GitLab token（旁路，omitGitToken）：general 子代理的原生 bash 也得摘，
+      // 否则 `task` → 子代理 `printenv` 就绕过了父会话 shell 工具的摘除（同名 customTool 盖掉原生 bash）
+      ...(parent.input.omitGitToken === true && req.subagentType !== "explore"
+        ? [buildGitTokenFreeBashTool(cwd)]
+        : []),
+      ...buildNativeToolAliasWrappers(
+        cwd,
+        taskId ? { taskId, filePrefix: "sub-" } : undefined,
+      ),
+    ],
     thinkingLevel: child.thinkingLevel,
     // 子 agent 不落会话文件（一次性）
     sessionManager: SessionManager.inMemory(cwd),
@@ -554,6 +568,8 @@ const buildCustomTools = (
       cwd,
       (req, signal) => runPiSubagent(req, signal, { parent, cwd, taskId }),
       spill,
+      // 旁路（无 GitLab 凭证）：shell 摘 token；子代理 bash 在 runPiSubagent 里同口径摘
+      { omitGitToken: parent.input.omitGitToken === true },
     ),
     // D1：MCP 桥接工具回包无上限，全包输出预算；flowShipTools（submit_work/ask_user）输出小、不碰
     ...mcpToolDefs.map((d) => withModelBudget(d, spill)),

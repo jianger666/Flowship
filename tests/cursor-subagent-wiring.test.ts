@@ -89,12 +89,58 @@ describe("Agent.create / resume（Cursor 路）：subagent 的挂载范围", () 
     expect(customToolsOf(mockResume.mock.calls[1][1])).toBeUndefined();
   });
 
-  it("不碰父会话原有的内置工具配置：不加 disallowedTools（原生 task 照旧并存）", async () => {
+  it("挂了 subagent 就关掉 SDK 原生 task（原生 task 本地固定 composer 系、选不了模型）；不动 tools 白名单", async () => {
     mockCreate.mockClear();
     await Agent.create({ ...baseInput, callerToken: "tok" } as never);
     const arg = mockCreate.mock.calls[0][0] as Record<string, unknown>;
-    expect(arg).not.toHaveProperty("disallowedTools");
+    expect(arg.disallowedTools).toEqual(["task"]);
     expect(arg).not.toHaveProperty("tools");
+  });
+
+  it("resume 也要关（disallowedTools 不持久化：只在 create 传、恢复的会话就会重新长出原生 task）", async () => {
+    mockResume.mockClear();
+    await Agent.resume("agent-x", { ...baseInput, callerToken: "tok" } as never);
+    const arg = mockResume.mock.calls[0][1] as Record<string, unknown>;
+    expect(arg.disallowedTools).toEqual(["task"]);
+  });
+
+  it("调用方已有的 disallowedTools 保留、只补 task；已含 task 不重复", async () => {
+    mockCreate.mockClear();
+    await Agent.create({
+      ...baseInput,
+      callerToken: "tok",
+      disallowedTools: ["shell"],
+    } as never);
+    await Agent.create({
+      ...baseInput,
+      callerToken: "tok",
+      disallowedTools: ["task", "shell"],
+    } as never);
+    expect((mockCreate.mock.calls[0][0] as Record<string, unknown>).disallowedTools).toEqual([
+      "shell",
+      "task",
+    ]);
+    expect((mockCreate.mock.calls[1][0] as Record<string, unknown>).disallowedTools).toEqual([
+      "task",
+      "shell",
+    ]);
+  });
+
+  it("没挂 subagent 的会话（无 callerToken / 只读）：原生 task 不动——没有替代品就不能去掉", async () => {
+    mockCreate.mockClear();
+    mockResume.mockClear();
+    await Agent.create({ ...baseInput } as never);
+    await Agent.create({ ...baseInput, callerToken: "tok", readOnly: true } as never);
+    await Agent.resume("agent-x", { ...baseInput } as never);
+    await Agent.resume("agent-x", { ...baseInput, callerToken: "tok", readOnly: true } as never);
+    for (const arg of [
+      mockCreate.mock.calls[0][0],
+      mockCreate.mock.calls[1][0],
+      mockResume.mock.calls[0][1],
+      mockResume.mock.calls[1][1],
+    ] as Array<Record<string, unknown>>) {
+      expect(arg).not.toHaveProperty("disallowedTools");
+    }
   });
 });
 
@@ -105,6 +151,16 @@ describe("Agent.create / resume：取消联动已装到返回的 agent 上", () 
     const run = await agent.send("hi");
     await run.cancel();
     expect(parentCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("包装后的父 agent 能查到父模型（事件流卡片徽标用）；没挂 subagent 的查不到", async () => {
+    const { getSubagentParentModel } = await import("@/lib/server/subagent-parent-model");
+    const wrapped = await Agent.create({ ...baseInput, callerToken: "tok" } as never);
+    expect(getSubagentParentModel(wrapped)).toEqual({ id: "composer-2.5" });
+    const resumed = await Agent.resume("agent-x", { ...baseInput, callerToken: "tok" } as never);
+    expect(getSubagentParentModel(resumed)).toEqual({ id: "composer-2.5" });
+    const bare = await Agent.create({ ...baseInput } as never);
+    expect(getSubagentParentModel(bare)).toBeUndefined();
   });
 
   it("没有 callerToken 的 agent 不被包装（返回的就是 SDK 给的那个对象）", async () => {

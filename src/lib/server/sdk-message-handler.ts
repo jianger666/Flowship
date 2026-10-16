@@ -22,6 +22,7 @@ import { appendThinkingText } from "@/lib/thinking-live";
 
 import { appendEvent, getTask, patchActionIfOwner } from "./task-fs";
 import { newEventId } from "./task-fs-core";
+import { redactSecretsInText } from "./event-secret-redact";
 import { failpoint } from "./failpoints";
 import {
   publish,
@@ -98,6 +99,15 @@ export interface AssistantBufferCtx {
    * 旁路答疑的 flush 取不到主链的 id，不会出现两条事件同 id。
    */
   thinkingEventId?: string;
+  /**
+   * 父会话当前模型（Cursor 路径、挂了 `subagent` 才有）。子代理卡片的 model / effort 徽标用它把
+   * 模型随手写的 `inherit` 换成实际生效的模型 / 思考档——tool_call 的 args 只在 running 时落盘一次，
+   * 只能在这里（写事件之前）改，事后补不了。
+   */
+  subagentParentModel?: {
+    id: string;
+    params?: Array<{ id: string; value: string }>;
+  };
   sdkErrorMessage?: string;
   /** 本回合已交卷成功：之后模型输出（答案）照常广播、固定收尾延到 run 结束 */
   submitSeen?: boolean;
@@ -535,7 +545,8 @@ export const getLiveThinkingSnapshot = (
   }
   return {
     eventId: st.eventId,
-    text: st.sent,
+    // 快照由 watch-task 直接 send、不经 publish——对累积文本再脱敏（也补上凭据被切在相邻两帧的情形）
+    text: redactSecretsInText(st.sent),
     total: st.sentTotal,
     since: st.since,
   };
@@ -596,7 +607,11 @@ export const handleSdkMessage = async (
   // Cursor 的 `subagent` 自定义工具（MCP 外壳）改写成与 pi / 原生同形的 `task`，
   // 子代理卡片、状态行、model / effort 徽标才认得出；其它消息原样（同一引用）
   const msg: SDKMessage =
-    rawMsg.type === "tool_call" ? toSubagentDisplayCall(rawMsg) : rawMsg;
+    rawMsg.type === "tool_call"
+      ? toSubagentDisplayCall(rawMsg, {
+          parentModel: assistantCtx.subagentParentModel,
+        })
+      : rawMsg;
   // 入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
   const stillCurrent = lease;
   if (!stillCurrent()) return;

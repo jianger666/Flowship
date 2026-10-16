@@ -257,6 +257,54 @@ describe("read / grep / glob：凭据文件拦、工作区放行", () => {
     expect(isBypassBlockedReadPath(path.join(CWD, "hello.txt"))).toBe(false);
   });
 
+  it("isBypassBlockedReadPath：config.json 的备份（.bak / .corrupt-*）同样含明文凭据，一并拦", () => {
+    const dataDir = path.dirname(CONFIG_ABS);
+    expect(isBypassBlockedReadPath(path.join(dataDir, "config.json.bak"))).toBe(true);
+    expect(isBypassBlockedReadPath(path.join(dataDir, "config.json.corrupt-1789000000000"))).toBe(true);
+    // 精确到数据目录根：不连坐名字相近的别的文件，也不连坐工作区里的同名文件
+    expect(isBypassBlockedReadPath(path.join(dataDir, "config.json.bak.txt"))).toBe(false);
+    expect(isBypassBlockedReadPath(path.join(dataDir, "config.jsonx"))).toBe(false);
+    expect(isBypassBlockedReadPath(path.join(CWD, "config.json.bak"))).toBe(false);
+    expect(isBypassBlockedReadPath(path.join(CWD, "config.json.corrupt-1"))).toBe(false);
+  });
+
+  it("isBypassBlockedReadPath：收缩备份 .bak.shrink 与原子写临时文件 .tmp.* 也含凭据，一并拦", () => {
+    const dataDir = path.dirname(CONFIG_ABS);
+    for (const name of [
+      "config.json.bak.shrink",
+      "config.json.tmp.4242.abcdef",
+      "config.json.bak.tmp.4242.abcdef",
+      "config.json.bak.shrink.tmp.4242.abcdef",
+    ]) {
+      expect(isBypassBlockedReadPath(path.join(dataDir, name)), name).toBe(true);
+    }
+    // 不连坐：名字像但不是这一族的
+    expect(isBypassBlockedReadPath(path.join(dataDir, "config.json.shrink"))).toBe(false);
+    expect(isBypassBlockedReadPath(path.join(dataDir, "config.json.tmpx"))).toBe(false);
+    expect(isBypassBlockedReadPath(path.join(CWD, "config.json.bak.shrink"))).toBe(false);
+  });
+
+  it("isBypassBlockedReadPath：数据目录环境变量带尾斜杠 / 含 `..` 段时，config.json 及备份仍被拦（回归）", () => {
+    const dataDir = path.dirname(CONFIG_ABS);
+    const prev = process.env.FLOWSHIP_DATA_DIR;
+    try {
+      for (const raw of [
+        `${dataDir}${path.sep}`,
+        path.join(dataDir, "sub", ".."),
+        `${dataDir}${path.sep}${path.sep}`,
+      ]) {
+        process.env.FLOWSHIP_DATA_DIR = raw;
+        for (const name of ["config.json", "config.json.bak", "config.json.bak.shrink"]) {
+          expect(isBypassBlockedReadPath(path.join(dataDir, name)), `${raw} / ${name}`).toBe(true);
+        }
+        expect(isBypassBlockedReadPath(path.join(CWD, "config.json"))).toBe(false);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.FLOWSHIP_DATA_DIR;
+      else process.env.FLOWSHIP_DATA_DIR = prev;
+    }
+  });
+
   it("clampBypassBasePath：数据目录根进不来，本任务目录和 cwd 放行", () => {
     expect(clampBypassBasePath(CWD, path.join(TMP_ROOT, "data"), "t1").ok).toBe(false);
     expect(clampBypassBasePath(CWD, ".", "t1").ok).toBe(true);

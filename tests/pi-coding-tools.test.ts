@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ASK_WAIT_SHELL_TIMEOUT_MS,
+  buildCodingToolDefs,
   formatShellFailureText,
   prepareEditPathArgs,
   prepareGlobArgs,
@@ -11,6 +12,7 @@ import {
   resolveShellTimeoutMs,
   resolveShellTimeoutMsForCommand,
 } from "../src/lib/server/pi-coding-tools";
+import { SubagentUsageError } from "../src/lib/subagent-spec";
 
 describe("resolveShellTimeoutMs", () => {
   it("未传 / 非法值用默认 60 秒", () => {
@@ -121,5 +123,78 @@ describe("Cursor 参数别名 → pi 规范字段", () => {
         newText: "b",
       }),
     ).toEqual({ path: "/y.ts", oldText: "a", newText: "b" });
+  });
+});
+
+describe("task（pi 子代理）：resume 只有 Cursor 路径的 subagent 支持", () => {
+  const taskTool = (runner: (...a: never[]) => Promise<string>) => {
+    const def = buildCodingToolDefs(process.cwd(), runner as never).find(
+      (d) => (d as { name?: unknown }).name === "task",
+    );
+    if (!def) throw new Error("缺少 task 工具");
+    return def as unknown as {
+      parameters: { properties?: Record<string, unknown> };
+      execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<{
+        content: Array<{ text: string }>;
+      }>;
+    };
+  };
+
+  it("带 resume：抛 SubagentUsageError（pi 标成工具错误）、一句话说清楚，不静默当成新任务跑", async () => {
+    const runner = vi.fn(async () => "不该被调用");
+    const err = await taskTool(runner)
+      .execute("t1", { prompt: "接着做", resume: "agent-1" })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(SubagentUsageError);
+    expect((err as Error).message).toContain("不支持 resume");
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("带 run_in_background=true：抛 SubagentUsageError、不静默同步跑（pi 的子任务没有后台）", async () => {
+    const runner = vi.fn(async () => "不该被调用");
+    for (const flag of [true, "true"]) {
+      const err = await taskTool(runner)
+        .execute("t1", { prompt: "后台干", run_in_background: flag })
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      expect(err).toBeInstanceOf(SubagentUsageError);
+      expect((err as Error).message).toContain("不支持 run_in_background");
+    }
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("run_in_background=false / 没填照常同步跑", async () => {
+    const runner = vi.fn(async () => "同步结果");
+    for (const extra of [{}, { run_in_background: false }]) {
+      const out = await taskTool(runner).execute("t1", { prompt: "干活", ...extra });
+      expect(out.content[0].text).toBe("同步结果");
+    }
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it("不带 resume（含空串 / 纯空白）照常跑，交给 runner 的请求里没有 resume", async () => {
+    const runner = vi.fn(async (req: { resume?: string }) => {
+      void req;
+      return "子任务结果";
+    });
+    for (const resume of [undefined, "", "   "]) {
+      const out = await taskTool(runner as never).execute("t1", {
+        prompt: "干活",
+        ...(resume === undefined ? {} : { resume }),
+      });
+      expect(out.content[0].text).toBe("子任务结果");
+    }
+    expect(runner).toHaveBeenCalledTimes(3);
+    for (const call of runner.mock.calls) expect(call[0].resume).toBeUndefined();
+  });
+
+  it("pi 的入参 schema 不含 resume（不向模型宣传做不到的能力）", () => {
+    const props = taskTool(vi.fn(async () => "")).parameters.properties ?? {};
+    expect(Object.keys(props)).not.toContain("resume");
   });
 });

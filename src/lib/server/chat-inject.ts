@@ -590,16 +590,31 @@ const runChatReplyInject = async (
 
   // 同一轮 curl 还挂着等答案：输入条回车 = 顶掉提问，写进 stdout，不要入队。
   if (askSkip.claimed) {
-    const viaWait = await fulfillAskSkipViaWait(
-      task.id,
-      askSkip,
-      agentText || fallbackText,
-      {
-        imageAbsPaths,
-        attachmentPaths:
-          attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
-      },
-    );
+    // 本请求若刚 resume 成 owner（claimRun 已置 runActive=true），走 curl 回写这条路
+    // 不会再 sendChatMessage——认领不释放 = 刚恢复的 idle 会话永远假 busy（后续消息只入队、
+    // 空闲回收也跳过）。抛错 / 成功回写两条出口都要在返回前释放；
+    // viaWait=false 才继续往下走 owner send，认领留给后面的 send / catch 处理。
+    let viaWait: boolean;
+    try {
+      viaWait = await fulfillAskSkipViaWait(
+        task.id,
+        askSkip,
+        agentText || fallbackText,
+        {
+          imageAbsPaths,
+          attachmentPaths:
+            attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
+        },
+      );
+    } catch (err) {
+      if (ownerInstanceId !== null) {
+        releaseChatRunClaim(task.id, ownerInstanceId);
+      }
+      throw err;
+    }
+    if (viaWait && ownerInstanceId !== null) {
+      releaseChatRunClaim(task.id, ownerInstanceId);
+    }
     if (viaWait) {
       await askSkip.commit();
       if (clientItemId) {
@@ -826,7 +841,9 @@ const runChatReplyInject = async (
 
       // 模型 / MCP / workdir / 提供方变了 → 懒重启：关旧会话、起新会话（这条消息作当前句）、
       // 最近对话正文由 runChatSession 注入起手 prompt，更早的仍可 read events.jsonl
-      cancelChatRun(task.id);
+      // reason 必须带：close 时据此把「被连带取消的后台子代理」如实告诉用户（缺省 user = 静默，
+      // 但这里不是用户点的停止）
+      cancelChatRun(task.id, { reason: "restart" });
       const stopped = await sendTimed(
         "waitForChatToStop",
         waitForChatToStop(task.id, CHAT_RESTART_STOP_TIMEOUT_MS),

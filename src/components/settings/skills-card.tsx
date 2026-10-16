@@ -83,8 +83,10 @@ export const SkillsCard = () => {
 
   const { status: teamStatus, refresh: refreshTeam } = useTeamLibrary(true);
 
-  // 全部来源 skill（null = 加载中）
+  // 全部来源 skill（null = 加载中 / 首次加载失败）
   const [skills, setSkills] = useState<SkillRow[] | null>(null);
+  // 列表读取失败提示（S13-08：失败不能当成「没有 skill」；已有列表时保留旧列表只 toast）
+  const [loadError, setLoadError] = useState<string | null>(null);
   // Cursor 全局可导入清单
   const [cursorGlobal, setCursorGlobal] = useState<CursorGlobalSkill[]>([]);
   // 自管 skills 目录（对话创建 cwd）
@@ -123,11 +125,15 @@ export const SkillsCard = () => {
           ReturnType<typeof fetchCustomActions>
         >),
       ]);
-      const data = (await skillsRes.json()) as {
+      const data = (await skillsRes.json().catch(() => null)) as {
         skills?: SkillRow[];
         cursorGlobal?: CursorGlobalSkill[];
         appSkillsDir?: string;
-      };
+        error?: string;
+      } | null;
+      if (!skillsRes.ok || !data) {
+        throw new Error(data?.error ?? `HTTP ${skillsRes.status}`);
+      }
       // 被 custom action 挂载的 skill 名（自管行亮「action」tag；team 源由 server 填）
       const mounted = new Set(
         actionsRes
@@ -143,11 +149,12 @@ export const SkillsCard = () => {
       );
       setCursorGlobal(data.cursorGlobal ?? []);
       setAppSkillsDir(data.appSkillsDir ?? "");
+      setLoadError(null);
     } catch (err) {
-      toast.error(
-        `读取 skills 失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-      setSkills([]);
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`读取 skills 失败：${message}`);
+      // 不动 skills：已有列表就保留、首次失败 skills 仍是 null → 走错误态（带重试）
+      setLoadError(message);
     }
   }, []);
 
@@ -197,10 +204,12 @@ export const SkillsCard = () => {
   const fetchSkillContent = async (
     name: string,
     source: SkillRow["source"],
+    repoPath?: string,
   ): Promise<string | null> => {
     try {
+      // 多个仓同名项目级 skill：带上仓根、server 按 name+source+repo 精确读
       const res = await fetch(
-        `/api/skills/content?name=${encodeURIComponent(name)}&source=${encodeURIComponent(source)}`,
+        `/api/skills/content?name=${encodeURIComponent(name)}&source=${encodeURIComponent(source)}${repoPath ? `&repo=${encodeURIComponent(repoPath)}` : ""}`,
         { cache: "no-store" },
       );
       const data = (await res.json()) as { content?: string; error?: string };
@@ -223,8 +232,12 @@ export const SkillsCard = () => {
     setDialog({ kind: "edit", name, content });
   };
 
-  const openView = async (name: string, source: SkillRow["source"]) => {
-    const content = await fetchSkillContent(name, source);
+  const openView = async (
+    name: string,
+    source: SkillRow["source"],
+    repoPath?: string,
+  ) => {
+    const content = await fetchSkillContent(name, source, repoPath);
     if (content === null) return;
     setDialog({ kind: "view", name, content });
   };
@@ -266,15 +279,9 @@ export const SkillsCard = () => {
     });
     if (!ok) return;
     try {
-      for (const action of mounted) {
-        try {
-          await deleteCustomActionReq(action.id);
-        } catch (err) {
-          toast.error(
-            `删除 action「${action.label}」失败：${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      }
+      // S13-07：先删 skill、成功后再摘挂载的 action——
+      // 原顺序「先删 action 再删 skill」在 skill 删除失败（权限 / 占用 / 网络）时会留下
+      // 「skill 还在、挂载 action 没了」的半残状态，用户的推进入口白白丢失
       const params = new URLSearchParams({ name, source: row.source });
       if (row.repoPath) params.set("repo", row.repoPath);
       const res = await fetch(`/api/skills?${params.toString()}`, {
@@ -284,8 +291,20 @@ export const SkillsCard = () => {
         const data = (await res.json().catch(() => null)) as {
           error?: string;
         } | null;
+        // skill 没删掉：挂载的 action 原样保留
         toast.error(data?.error ?? "删除失败");
         return;
+      }
+      // skill 已删：自管源的挂载壳（.flowship-action.json）本就在 skill 目录里、通常已随目录消失；
+      // 这里补一刀幂等摘除、失败只提示（skill 已删、不能再回滚）
+      for (const action of mounted) {
+        try {
+          await deleteCustomActionReq(action.id);
+        } catch (err) {
+          toast.error(
+            `skill 已删除，但 action「${action.label}」摘除失败：${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
       // 成功：列表行消失自表达，不 toast
       void refresh();
@@ -536,13 +555,13 @@ export const SkillsCard = () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ names: dirNames }),
       });
-      const data = (await res.json()) as {
+      const data = (await res.json().catch(() => null)) as {
         imported?: string[];
         failed?: Array<{ name: string; error: string }>;
         error?: string;
-      };
-      if (!res.ok) {
-        toast.error(data.error ?? "导入失败");
+      } | null;
+      if (!res.ok || !data) {
+        toast.error(data?.error ?? `导入失败（HTTP ${res.status}）`);
         return;
       }
       if ((data.imported?.length ?? 0) > 0) {
@@ -553,6 +572,11 @@ export const SkillsCard = () => {
       }
       setDialog(null);
       void refresh();
+    } catch (err) {
+      // 网络断 / 服务端崩：保留导入对话框、让用户可重试
+      toast.error(
+        `导入失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setRequest((prev) => ({ ...prev, busy: false }));
     }
@@ -740,7 +764,21 @@ export const SkillsCard = () => {
           </div>
         </div>
 
-        {skills === null || !settingsLoaded ? (
+        {skills === null && loadError ? (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 px-3 py-2 text-sm">
+            <span className="min-w-0 truncate text-destructive">
+              读取失败：{loadError}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => void refresh()}
+            >
+              重试
+            </Button>
+          </div>
+        ) : skills === null || !settingsLoaded ? (
           <LoadingState variant="inline" />
         ) : (
           <div className="flex gap-3">
@@ -770,7 +808,9 @@ export const SkillsCard = () => {
               onMirror={() => void handleMirror()}
               busyName={busyName}
               onEdit={(name) => void openEdit(name)}
-              onView={(name, source) => void openView(name, source)}
+              onView={(name, source, repoPath) =>
+                void openView(name, source, repoPath)
+              }
               onDelete={(row) => void handleDelete(row)}
               onToggleManageable={(row, enabled) =>
                 void handleToggleManageable(row, enabled)
@@ -807,6 +847,11 @@ export const SkillsCard = () => {
               toast.success(`已保存「${name}」`);
               setDialog(null);
               void refresh();
+            } catch (err) {
+              // 网络断 / 服务端崩：保留编辑对话框里的草稿、让用户可重试
+              toast.error(
+                `保存失败：${err instanceof Error ? err.message : String(err)}`,
+              );
             } finally {
               setRequest((prev) => ({ ...prev, busy: false }));
             }

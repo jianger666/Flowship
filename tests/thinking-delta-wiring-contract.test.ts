@@ -463,9 +463,12 @@ describe("进行中思考的快照（2026-10-13「切窗口再切回来思考又
     const discardAt = body.indexOf("discardPendingThinkingDeltas(taskId);");
     expect(leaseAt).toBeGreaterThanOrEqual(0);
     expect(discardAt).toBeGreaterThan(leaseAt);
-    // 快照字段口径：eventId / 已发出原文窗口 / 累计数 / 首帧时刻
+    // 快照字段口径：eventId / 已发出文本窗口 / 累计数 / 首帧时刻
+    // 快照不经 publish、直接由 watch-task send，所以文本这里必须再脱敏一道
+    // （行为见 tests/event-secret-redact.test.ts「凭据被切在相邻两帧」；这里只钉「没有裸 st.sent 出去」）
     expect(body).toContain("eventId: st.eventId,");
-    expect(body).toContain("text: st.sent,");
+    expect(body).toContain("text: redactSecretsInText(st.sent),");
+    expect(body).not.toContain("text: st.sent,");
     expect(body).toContain("total: st.sentTotal,");
     expect(body).toContain("since: st.since,");
   });

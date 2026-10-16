@@ -23,6 +23,7 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { REPO_FILES_Q_MAX_LEN } from "@/lib/repo-files-shared";
 import { cn } from "@/lib/utils";
 import { Tooltip } from "@/components/ui/tooltip";
+import { isImeComposing } from "@/lib/ime";
 
 /** 光标前「正在打 @」：行首或空白后的 @partial（partial 可含 `/`、可空） */
 export const AT_RE = /(^|\s)@([^\s:]*)$/;
@@ -191,7 +192,7 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
   const onKeyDown = useCallback(
     (e: KeyboardEvent): boolean => {
       if (!menuOpen) return false;
-      if ((e.nativeEvent as globalThis.KeyboardEvent).isComposing) return false;
+      if (isImeComposing(e)) return false;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         if (filtered.length === 0) return true;

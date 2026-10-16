@@ -10,7 +10,8 @@ const {
   sendTextMessageToChat,
   updateCardEntity,
   getPendingAsk,
-  clearPendingAsk,
+  takePendingAskIf,
+  restorePendingAskIf,
   deliverChatAskReply,
   hasChatSession,
   handleChatReplyInject,
@@ -32,6 +33,7 @@ const {
   execStatusText,
   injectPendingAskText,
   handleGroupAdvancePick,
+  fulfillAskWait,
 } = vi.hoisted(() => {
   type AnyFn = (...args: never[]) => unknown;
   return {
@@ -47,7 +49,8 @@ const {
     })),
     updateCardEntity: vi.fn<AnyFn>(async () => undefined),
     getPendingAsk: vi.fn<AnyFn>(),
-    clearPendingAsk: vi.fn<AnyFn>(),
+    takePendingAskIf: vi.fn<AnyFn>(),
+    restorePendingAskIf: vi.fn<AnyFn>(() => true),
     deliverChatAskReply: vi.fn<AnyFn>(),
     hasChatSession: vi.fn<AnyFn>(() => true),
     handleChatReplyInject: vi.fn<AnyFn>(),
@@ -69,8 +72,14 @@ const {
     execStatusText: vi.fn<AnyFn>(async () => "handled"),
     injectPendingAskText: vi.fn<AnyFn>(async () => ({ ok: true })),
     handleGroupAdvancePick: vi.fn<AnyFn>(async () => undefined),
+    fulfillAskWait: vi.fn<AnyFn>(async () => false),
   };
 });
+
+// ask-wait 槽：默认「没有挂着的 curl」（false → 走 deliver）；个别用例改成 true 验同一轮写入
+vi.mock("@/lib/server/ask-wait", () => ({
+  fulfillAskWait,
+}));
 
 vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   getBotAppInfo,
@@ -82,7 +91,8 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
 
 vi.mock("@/lib/server/chat-pending", () => ({
   getPendingAsk,
-  clearPendingAsk,
+  takePendingAskIf,
+  restorePendingAskIf,
 }));
 
 vi.mock("@/lib/server/chat-runner", () => ({
@@ -253,6 +263,12 @@ beforeEach(() => {
     },
   ]);
   getPendingAsk.mockReturnValue(pendingAsk);
+  // 摘除：askId 对得上才摘到（真并发语义见 feishu-bridge-card-action-ask-race.test.ts）
+  takePendingAskIf.mockImplementation(((_t: string, askId: string) => {
+    const cur = getPendingAsk() as { askId?: string } | null;
+    return cur && cur.askId === askId ? cur : null;
+  }) as never);
+  restorePendingAskIf.mockReturnValue(true);
   getTask.mockResolvedValue(chatTask);
   deliverChatAskReply.mockResolvedValue(true);
   loadBridgeBootContext.mockResolvedValue({
@@ -278,6 +294,7 @@ beforeEach(() => {
   stopTaskAgent.mockResolvedValue(undefined);
   updateCardEntity.mockResolvedValue(undefined);
   injectPendingAskText.mockResolvedValue({ ok: true });
+  fulfillAskWait.mockResolvedValue(false);
 });
 
 afterEach(() => {
@@ -469,6 +486,21 @@ describe("group_ask（需求群答题）", () => {
 
   it("先到先得：已被答掉（无 pending）→ 不投递、群里回「已经有人回答了」", async () => {
     getPendingAsk.mockReturnValue(null);
+    // 「已经有人回答了」只在事件流里真有 ask_user_reply 时才成立（M5-03：取消 / 跳过 / 过期
+    // 之后点旧卡走的是别的文案，见文件末尾「点旧卡的失效反馈按真实原因分流」）
+    getTask.mockResolvedValue({
+      ...chatTask,
+      events: [
+        ...chatTask.events,
+        {
+          id: "ev_reply",
+          kind: "ask_user_reply",
+          createdAt: Date.now(),
+          text: "",
+          meta: { askId: "ask-1" },
+        },
+      ],
+    });
     await handleCardActionEvent({
       operator_id: OTHER,
       message_id: "om_card",
@@ -693,7 +725,7 @@ describe("handleCardActionEvent", () => {
     expect(String(replyText)).toContain("答：方案 A");
     expect(String(replyText)).toContain("答：（未回答）");
 
-    expect(clearPendingAsk).toHaveBeenCalledWith("task-1");
+    expect(takePendingAskIf).toHaveBeenCalledWith("task-1", "ask-1", "tok");
     expect(writeUserEventAndPublishStrict).toHaveBeenCalledWith(
       "task-1",
       expect.objectContaining({
@@ -707,7 +739,116 @@ describe("handleCardActionEvent", () => {
     expect(batchUpdateCard).toHaveBeenCalled();
     const actionsJson = JSON.stringify(batchUpdateCard.mock.calls);
     expect(actionsJson).toContain("已选择：方案 A");
-    expect(actionsJson).toContain("delete_elements");
+    // 多题卡（本用例的 pendingAsk 是两题）不渲染选项按钮——结算不能对不存在的按钮 id 发
+    // delete_elements（M5-01）；删按钮只对单题卡成立，见下一条
+    expect(actionsJson).not.toContain("delete_elements");
+  });
+
+  it("ask 命中（单题卡）：置态时删掉这张卡真实渲染的选项按钮", async () => {
+    const single = { ...pendingAsk, questions: [pendingAsk.questions[0]!] };
+    getPendingAsk.mockReturnValue(single);
+    takePendingAskIf.mockImplementation(((_t: string, askId: string) =>
+      askId === single.askId ? single : null) as never);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      action_value: JSON.stringify(askValue),
+    });
+
+    const calls = batchUpdateCard.mock.calls as unknown as Array<
+      [string, Array<{ action: string; params: { element_ids?: string[] } }>]
+    >;
+    const deleted = calls
+      .flatMap((c) => c[1])
+      .filter((a) => a.action === "delete_elements")
+      .flatMap((a) => a.params.element_ids ?? []);
+    // 两个选项 → 两颗按钮
+    expect(deleted).toHaveLength(2);
+  });
+
+  it("ask-wait 槽还挂着 curl：答案写进同一轮、不走 deliver（不会被判 busy）、其余收口照常", async () => {
+    fulfillAskWait.mockResolvedValue(true);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      action_value: askValue,
+    });
+
+    expect(fulfillAskWait).toHaveBeenCalledTimes(1);
+    const [taskId, askId, text] = fulfillAskWait.mock.calls[0]!;
+    expect(taskId).toBe("task-1");
+    expect(askId).toBe("ask-1");
+    expect(String(text)).toContain("答：方案 A");
+    expect(deliverChatAskReply).not.toHaveBeenCalled();
+    // 送达后的收口与 deliver 路径一致：清 pending + 落 ask_user_reply + 卡片置已选
+    expect(takePendingAskIf).toHaveBeenCalledWith("task-1", "ask-1", "tok");
+    expect(writeUserEventAndPublishStrict).toHaveBeenCalledWith(
+      "task-1",
+      expect.objectContaining({ kind: "ask_user_reply" }),
+    );
+    expect(JSON.stringify(batchUpdateCard.mock.calls)).toContain(
+      "已选择：方案 A",
+    );
+  });
+
+  it("ask-wait 槽没有 curl（返回 false）→ 回落 deliverChatAskReply", async () => {
+    fulfillAskWait.mockResolvedValue(false);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      action_value: askValue,
+    });
+
+    expect(fulfillAskWait).toHaveBeenCalledTimes(1);
+    expect(deliverChatAskReply).toHaveBeenCalledTimes(1);
+  });
+
+  it("入口读到 pending、摘除时已被别处了结（take 返回 null）→ 失效反馈、不投递不落事件", async () => {
+    takePendingAskIf.mockReturnValue(null);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      action_value: askValue,
+    });
+
+    expect(fulfillAskWait).not.toHaveBeenCalled();
+    expect(deliverChatAskReply).not.toHaveBeenCalled();
+    expect(writeUserEventAndPublishStrict).not.toHaveBeenCalled();
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      OWNER,
+      expect.stringContaining("已失效或已回答"),
+    );
+  });
+
+  it("投递失败 + 会话还活着 → 把摘走的那组放回（可重试）", async () => {
+    deliverChatAskReply.mockResolvedValue(false);
+    hasChatSession.mockReturnValue(true);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      action_value: askValue,
+    });
+
+    expect(restorePendingAskIf).toHaveBeenCalledWith("task-1", pendingAsk);
+    expect(writeUserEventAndPublishStrict).not.toHaveBeenCalled();
+  });
+
+  it("投递失败 + 会话已死 → 不放回（这组问题作废）", async () => {
+    deliverChatAskReply.mockResolvedValue(false);
+    hasChatSession.mockReturnValue(false);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      action_value: askValue,
+    });
+
+    expect(restorePendingAskIf).not.toHaveBeenCalled();
   });
 
   it("askId 不匹配 → 失效提示 + bot 私聊，不投递", async () => {
@@ -723,13 +864,19 @@ describe("handleCardActionEvent", () => {
     });
 
     expect(deliverChatAskReply).not.toHaveBeenCalled();
+    // 槽位里是另一组提问、事件流里也没人答过这组 → 如实说「已失效」（被新提问取代），
+    // 而不是笼统的「已回答」（M5-03；中性说法只留给「拿不准」的情形）
     expect(sendTextMessage).toHaveBeenCalledWith(
       OWNER,
-      expect.stringContaining("已失效或已回答"),
+      expect.stringContaining("已失效"),
+    );
+    expect(sendTextMessage).not.toHaveBeenCalledWith(
+      OWNER,
+      expect.stringContaining("已回答"),
     );
     expect(batchUpdateCard).toHaveBeenCalled();
     const actionsJson = JSON.stringify(batchUpdateCard.mock.calls);
-    expect(actionsJson).toContain("已失效或已回答");
+    expect(actionsJson).toContain("该问题已失效");
   });
 
   it("value 对象形态与字符串形态均可", async () => {
@@ -934,6 +1081,135 @@ describe("清理卡 / 控制面板按钮", () => {
       action_value: { kind: "cmd", command: "new" },
     });
     expect(execNewChatNoArgs).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M5-03(c)：点旧卡的失效反馈只在「确实有人回答了」时才说「已经有人回答了」。
+// 取消 / 顶替 / 重启 / 跳过 / 过期后点旧卡，旧文案一律说「已经有人回答了」是错的。
+// 真相取自事件流（ask_user_reply = 答；supersededAskId 标记 = 跳过 / 过期 / 作废）。
+// ---------------------------------------------------------------------------
+describe("点旧卡的失效反馈按真实原因分流（M5-03）", () => {
+  const requestEv = {
+    id: "ev_req",
+    kind: "ask_user_request",
+    ts: Date.now(),
+    actionId: "act-1",
+    meta: { askId: "ask-1" },
+  };
+  const taskWith = (...events: Array<Record<string, unknown>>) => ({
+    ...chatTask,
+    events: [requestEv, ...events],
+  });
+  const replyEv = {
+    id: "ev_reply",
+    kind: "ask_user_reply",
+    ts: Date.now(),
+    text: "",
+    meta: { askId: "ask-1" },
+  };
+  const markerEv = (extra: Record<string, unknown> = {}) => ({
+    id: "ev_marker",
+    kind: "info",
+    ts: Date.now(),
+    text: "",
+    meta: { supersededAskId: "ask-1", ...extra },
+  });
+
+  const clickGroup = (): Promise<void> =>
+    handleCardActionEvent({
+      operator_id: OTHER,
+      message_id: "om_card",
+      chat_id: groupAskValue.chatId,
+      action_value: JSON.stringify(groupAskValue),
+    });
+  const clickOwner = (): Promise<void> =>
+    handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      action_value: JSON.stringify(askValue),
+    });
+
+  const groupMsg = (): string =>
+    String(sendTextMessageToChat.mock.calls[0]![1]);
+  const ownerMsg = (): string => String(sendTextMessage.mock.calls[0]![1]);
+  const buttonPatchJson = (): string => JSON.stringify(batchUpdateCard.mock.calls);
+
+  describe("群答题卡", () => {
+    beforeEach(() => {
+      getPendingAsk.mockReturnValue(null);
+    });
+
+    it("有 ask_user_reply → 「已经有人回答了」（唯一允许这句的情形）+ 按钮换成「已回答」", async () => {
+      getTask.mockResolvedValue(taskWith(replyEv));
+      await clickGroup();
+      expect(groupMsg()).toContain("已经有人回答了");
+      expect(buttonPatchJson()).toContain("该问题已回答");
+    });
+
+    it.each([
+      ["跳过", "已跳过", markerEv({ askSkipped: true })],
+      ["过期", "已过期", markerEv({ askExpired: true })],
+      ["取消 / 停止 / 重启 / 顶替", "已失效", markerEv()],
+    ])("%s → 不再说「已经有人回答了」，如实说「%s」", async (_n, word, marker) => {
+      getTask.mockResolvedValue(taskWith(marker));
+      await clickGroup();
+      expect(groupMsg()).not.toContain("有人回答");
+      expect(groupMsg()).toContain(word);
+      expect(buttonPatchJson()).toContain(`该问题${word}`);
+    });
+
+    it("槽位里已是别的 askId（被新提问顶掉）且没人答过 → 「已失效」、不说有人回答", async () => {
+      getPendingAsk.mockReturnValue({ ...pendingAsk, askId: "ask-2" });
+      getTask.mockResolvedValue(taskWith());
+      await clickGroup();
+      expect(groupMsg()).not.toContain("有人回答");
+      expect(groupMsg()).toContain("已失效");
+    });
+
+    it("没有任何了结证据（重启后登记丢了）→ 中性「已失效或已被回答」，不断言有人回答", async () => {
+      getTask.mockResolvedValue(taskWith());
+      await clickGroup();
+      expect(groupMsg()).not.toContain("已经有人回答了");
+      expect(groupMsg()).toContain("已失效或已被回答");
+    });
+
+    it("读不到 task（getTask 抛错）→ 降级成中性文案、点击处理不抛", async () => {
+      getTask.mockRejectedValue(new Error("磁盘炸了"));
+      await expect(clickGroup()).resolves.toBeUndefined();
+      expect(groupMsg()).not.toContain("已经有人回答了");
+    });
+  });
+
+  describe("私聊答题卡（属主）", () => {
+    beforeEach(() => {
+      getPendingAsk.mockReturnValue(null);
+    });
+
+    it("有 ask_user_reply → 「已回答」", async () => {
+      getTask.mockResolvedValue(taskWith(replyEv));
+      await clickOwner();
+      expect(ownerMsg()).toContain("已回答");
+      expect(ownerMsg()).not.toContain("已失效");
+    });
+
+    it.each([
+      ["跳过", "已跳过", markerEv({ askSkipped: true })],
+      ["过期", "已过期", markerEv({ askExpired: true })],
+      ["取消 / 停止 / 重启 / 顶替", "已失效", markerEv()],
+    ])("%s → 如实说「%s」、不再笼统说「已失效或已回答」", async (_n, word, marker) => {
+      getTask.mockResolvedValue(taskWith(marker));
+      await clickOwner();
+      expect(ownerMsg()).toContain(word);
+      expect(ownerMsg()).not.toContain("已失效或已回答");
+      expect(buttonPatchJson()).toContain(`该问题${word}`);
+    });
+
+    it("没有任何了结证据 → 沿用原中性文案「已失效或已回答」", async () => {
+      getTask.mockResolvedValue(taskWith());
+      await clickOwner();
+      expect(ownerMsg()).toContain("已失效或已回答");
+    });
   });
 });
 

@@ -7,7 +7,8 @@
  * 让模型下一轮自己改对；实际生效什么，调用方拿到的就是什么。
  *
  * 范围（用户拍板）：只能选**当前 provider** 的模型；缺省 / inherit = 沿用当前模型
- *（含当前的思考档）。fast 变体不在代码里拦，继续靠 .cursor 规则约束。
+ *（含当前的思考档）。fast 变体不在代码里拦，也不再有规则约束
+ * （原 `.cursor/rules/subagent-no-fast.mdc` 已按用户要求删除）；选不选 fast 由模型 / 用户自行决定。
  */
 
 import {
@@ -37,6 +38,16 @@ export interface SubagentRequest {
   model?: string;
   /** 原始 effort 入参：空 / default = 不覆盖 */
   effort?: string;
+  /**
+   * 接着之前某个子代理继续（它上次返回的 agentId）。**只有 Cursor 的 `subagent` 工具支持**；
+   * pi 的 `task` 入参里没有这个字段，收到也会明确拒绝（见 pi-coding-tools），不静默忽略。
+   */
+  resume?: string;
+  /**
+   * 后台运行：立刻返回、子代理在后台干活，做完把结果作为一条消息送回给调用方。
+   * **只有 Cursor 的 `subagent` 工具在 chat 会话里支持**；pi 的 `task` 与非 chat 会话收到会明确拒绝，不静默忽略。
+   */
+  runInBackground?: boolean;
 }
 
 export interface ModelParamValue {
@@ -80,6 +91,16 @@ const str = (v: unknown): string | undefined => {
   if (typeof v !== "string") return undefined;
   const t = v.trim();
   return t ? t : undefined;
+};
+
+/** 模型偶尔把布尔写成字符串；只认明确的 true / false，其余当没填 */
+const bool = (v: unknown): boolean | undefined => {
+  if (v === true || v === false) return v;
+  if (typeof v !== "string") return undefined;
+  const t = v.trim().toLowerCase();
+  if (t === "true") return true;
+  if (t === "false") return false;
+  return undefined;
 };
 
 /**
@@ -127,6 +148,8 @@ export const parseSubagentRequest = (
       subagentType: normalizeSubagentType(p.subagentType),
       model: str(p.model),
       effort: str(p.effort),
+      resume: str(p.resume),
+      runInBackground: bool(p.run_in_background ?? p.runInBackground),
     },
   };
 };
@@ -324,3 +347,27 @@ export const resolveSubagentModel = (
     },
   };
 };
+
+/**
+ * 模型参数里「当前思考档」的取值（只给展示用：子代理卡片的 effort 徽标）。
+ * 开关（true / false）、default、没有这个参数 → undefined（不硬造一个档位）。
+ */
+export const currentEffortValue = (
+  params: readonly ModelParamValue[] | undefined,
+): string | undefined => {
+  for (const wanted of EFFORT_PARAM_PRIORITY) {
+    const p = (params ?? []).find((x) => x.id.trim().toLowerCase() === wanted);
+    if (!p) continue;
+    const v = p.value.trim();
+    if (!v || isDefaultThinkingValue(v) || isBooleanValue(v)) continue;
+    return v;
+  }
+  return undefined;
+};
+
+/** model 入参是不是「沿用父会话」（缺省 / 空 / inherit）；与 resolveSubagentModel 同口径 */
+export const isInheritModelArg = (model: unknown): boolean =>
+  model === undefined ||
+  model === null ||
+  (typeof model === "string" &&
+    (model.trim() === "" || model.trim().toLowerCase() === "inherit"));

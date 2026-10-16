@@ -20,6 +20,7 @@ import {
 } from "@/lib/server/mr-inbox-scanner";
 import { errorResponse } from "@/lib/server/route-helpers";
 import { readSettingsFile } from "@/lib/server/settings-fs";
+import { assertTrustedGitHost } from "@/lib/server/trusted-git-host";
 
 export const runtime = "nodejs";
 
@@ -53,6 +54,13 @@ export const POST = async (req: Request) => {
       "MR 所属 GitLab 不在已配置仓库允许列表、拒绝合并",
       400,
     );
+  }
+  // allowlist 来自仓库 origin（agent 可写）——再对照首次绑定的可信 host / config 白名单，
+  // 不一致就拒绝、不带 PAT 出站（trusted-git-host.ts）
+  try {
+    assertTrustedGitHost(parsed.host);
+  } catch (err) {
+    return errorResponse(err instanceof Error ? err.message : String(err), 400);
   }
 
   try {

@@ -236,6 +236,47 @@ export const buildRepoGroups = (
 };
 
 /**
+ * 仓组默认只展前 limit 条（其余走「展开其余 N 条」）；但**正在看的那条**若落在被收起的
+ * 尾部，也得露出来——侧栏里看不到当前对话，用户就只能绕去会话管理找（2026-10-15 实测）。
+ * 已展开 / 条数没超限 → 全展；limit 传 Infinity = 不限（置顶组）。
+ * 露出的当前条追加在前 limit 条之后，hiddenCount 只算仍被藏起来的。
+ */
+export const pickVisibleGroupItems = <T extends { id: string }>(
+  items: readonly T[],
+  opts: { limit: number; expanded: boolean; activeId?: string },
+): { visible: T[]; hiddenCount: number } => {
+  if (opts.expanded || items.length <= opts.limit) {
+    return { visible: [...items], hiddenCount: 0 };
+  }
+  const head = items.slice(0, opts.limit);
+  const active = opts.activeId
+    ? items.find((t) => t.id === opts.activeId)
+    : undefined;
+  const visible = active && !head.includes(active) ? [...head, active] : head;
+  return { visible, hiddenCount: items.length - visible.length };
+};
+
+/**
+ * 把某行滚进可视区所需的 scrollTop 增量（纯函数，坐标同一坐标系即可）。
+ * 已完整在视口内 → 0；在上方 → 负数；在下方 → 正数；pad 为露出后留的边距。
+ * 行比视口还高时优先对齐顶部。
+ */
+export const scrollDeltaToReveal = (
+  view: { top: number; bottom: number },
+  row: { top: number; bottom: number },
+  pad = 8,
+): number => {
+  if (row.top < view.top) return row.top - view.top - pad;
+  if (row.bottom > view.bottom) {
+    const down = row.bottom - view.bottom + pad;
+    // 行比视口高：别把顶部滚出去
+    const maxDown = row.top - view.top - pad;
+    return Math.max(0, Math.min(down, maxDown));
+  }
+  return 0;
+};
+
+/**
  * 组头「+」预绑工作目录：
  * - 仓组 → [该组路径]（取组内首条的 repoPaths[0]）
  * - Home → []（不绑）

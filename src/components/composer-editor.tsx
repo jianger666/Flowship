@@ -71,6 +71,7 @@ import { isDoubleEsc } from "@/lib/keyboard-shortcuts";
 import type { SubmitShortcut } from "@/lib/types";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 import { shouldConvertPasteToAttachment } from "@/lib/paste-text-attach";
+import { isImeComposing } from "@/lib/ime";
 
 /** 与旧 textarea 排版对齐，拖高 / placeholder 视觉不变 */
 const COMPOSER_EDITOR_CLASS =
@@ -150,7 +151,7 @@ const shouldSubmitNative = (
 ): boolean => {
   if (event.key !== "Enter") return false;
   // 中文 IME 选词 Enter 不能当发送
-  if (event.isComposing) return false;
+  if (isImeComposing(event)) return false;
   if (shortcut === "enter") {
     return !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey;
   }
@@ -550,7 +551,7 @@ const SlashAtAndSubmitPlugin = ({
     return editor.registerCommand(
       KEY_ENTER_COMMAND,
       (event) => {
-        if (event?.isComposing) return false;
+        if (event && isImeComposing(event)) return false;
         const s = slashRef.current;
         if (s?.menuOpen && event) {
           event.preventDefault();

@@ -16,6 +16,7 @@ import path from "node:path";
 
 import { getPendingAsk } from "@/lib/server/chat-pending";
 import { dataRoot } from "@/lib/server/data-root";
+import { redactSecretsInText } from "@/lib/server/event-secret-redact";
 import { getTask } from "@/lib/server/task-fs";
 import { taskDir } from "@/lib/server/task-fs-core";
 import {
@@ -1111,7 +1112,8 @@ const handleAssistantDelta = (
   if (!text) return;
   const wasEmpty = turn.answerText.trim().length === 0;
   // sdk-message-handler：assistant_delta.text 是增量 chunk，不是全量快照
-  turn.answerText += text;
+  // 对累积正文再脱敏：delta 在 publish 已按帧滤过，这里补上凭据被切在相邻两帧的跨帧情形
+  turn.answerText = redactSecretsInText(turn.answerText + text);
   const snapshot = turn.answerText;
   withCard(taskId, turn, (card) => {
     card.pushAnswer(snapshot);

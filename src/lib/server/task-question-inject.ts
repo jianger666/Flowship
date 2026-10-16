@@ -22,6 +22,11 @@
  */
 
 import {
+  fingerprintTaskQuestionBody,
+  TASK_INJECT_BUSY_CODE,
+  TASK_INJECT_PHASE_STOPPING,
+} from "@/lib/server/task-inject-shared";
+import {
   getTaskMeta,
   getTaskWithTailEvents,
   patchActionAndRunStatusIfOpFresh,
@@ -62,7 +67,10 @@ import {
   writeEventAndPublish,
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
-import { getChatLifecycle } from "@/lib/server/chat-gate";
+import {
+  getChatLifecycle,
+  type ChatLifecyclePhase,
+} from "@/lib/server/chat-gate";
 import { resolveSessionModel } from "@/lib/task-model";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
@@ -72,12 +80,27 @@ import {
   parseAndValidateSkills,
 } from "@/lib/server/route-helpers";
 import type { Task } from "@/lib/types";
-import { enqueueTalkMessage } from "@/lib/server/task-talk-queue";
+import {
+  enqueueTalkMessage,
+  removeTalkQueueItemsByDedupe,
+} from "@/lib/server/task-talk-queue";
 
 export interface TaskQuestionBody {
   text?: string;
   /** 前端回车瞬间 Date.now()：只做耗时打点（clientGap），不参与业务 */
   clientSentAt?: number;
+  /**
+   * 发送幂等键（app 输入条生成，失败重试复用同一个）。两条路径都按 **(id + 正文指纹)** 去重：
+   * - 排队路径：靠它在队列里去重（同 id 同正文 = 重复、回同一个 itemId；同 id 不同正文是新消息，
+   *   各排各的）；
+   * - 空闲直送（200）路径：靠下面的在途 / 已送达两张表（key = task + id + 正文指纹）：
+   *   同 key 的并发重发等第一次的结果（成功 → deduped、失败 → 自己重试）；送达成功后再来
+   *   只回 200 `{ deduped: true }`（带首次的 persistWarning）、不再注入。同 id 不同正文
+   *   不算重复、按新消息处理。
+   * 直送成功时还会顺手摘掉队列里同 (id, 正文) 的那一项——已送达表只留 2 分钟、短于队列等待，
+   * 不摘的话队列项等 delivered 过期后重放就是双注入。不带则两条路径都不做幂等。
+   */
+  clientItemId?: string;
   images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
   /** 文件 / 目录绝对路径（原生 picker 选的、v1.1.x 任务输入条也能附） */
   attachments?: string[];
@@ -165,6 +188,54 @@ export const buildRestrictedGroupContext = (
   };
 };
 
+/**
+ * stop / DELETE / finalize 收尾窗口的拒收文案——入口 lifecycle 闸与入队前的复查共用，
+ * 免得两处各写一份、日后改一边漏一边。reopening 等其余相位与 stopping 同口径「稍后再试」；
+ * 传 null（lifecycle 已放开、但队列仍判 closing 的兜底）也落到「稍后再试」。
+ */
+const lifecycleBlockedMessage = (life: string | null): string =>
+  life === "deleting"
+    ? "任务正在删除"
+    : life === "finalizing"
+      ? "正在终结、请稍后再试"
+      : "正在停止、请稍后再试";
+
+/**
+ * 「停止中」的 409（第八轮 L3-02）：stop 收尾结束后 lifecycle 自己放开，属于会自己恢复的一类——
+ * 带 `code: "task_busy"`（队列重放据此放回队首）+ `phase: "stopping"`（队列据此区分来源：stop 的清队语义是
+ * 只清 app 来源、群来源保留，所以 app 来源重放遇它**不放回**，见 task-talk-queue 的 drainOnce）。
+ * 文案由调用方给（lifecycle 闸与 stale 检查点各沿用自己原来的文案，不改）。
+ */
+const stoppingResponse = (message: string): Response =>
+  new Response(
+    JSON.stringify({
+      error: message,
+      code: TASK_INJECT_BUSY_CODE,
+      phase: TASK_INJECT_PHASE_STOPPING,
+    }),
+    { status: 409, headers: { "Content-Type": "application/json" } },
+  );
+
+/**
+ * lifecycle 阻塞（stop / DELETE / finalize / reopen 收尾窗口）的 409：只有 `stopping` 打标记；
+ * deleting / finalizing / reopening 重放也不会好，不打（见 task-inject-shared 的 TASK_INJECT_BUSY_CODE）。
+ * 传 null（lifecycle 已放开）落到「稍后再试」文案、不打标记。
+ */
+const lifecycleBlockedResponse = (life: ChatLifecyclePhase | null): Response =>
+  life === "stopping"
+    ? stoppingResponse(lifecycleBlockedMessage(life))
+    : errorResponse(lifecycleBlockedMessage(life), 409);
+
+/**
+ * 「任务状态刚变化 / 正在停止请重发」类 stale 409（opGen 被 bump 或 lifecycle 非 null——见 isTaskOpStale）。
+ * **调用瞬间** lifecycle 仍是 stopping 才打标记（stop 窗口里：收尾结束后可再试）；lifecycle 已放开 = stop 已完成、
+ * 世界已变（opGen 变了），重放也不是「稍后就好」，不打。文案保持 TASK_OP_STALE_HTTP_MESSAGE 不变。
+ */
+const staleResponse = (taskId: string): Response =>
+  getChatLifecycle(taskId) === "stopping"
+    ? stoppingResponse(TASK_OP_STALE_HTTP_MESSAGE)
+    : errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+
 const MAX_IMAGES = 6;
 const MAX_ATTACHMENTS = 10;
 // skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
@@ -208,6 +279,262 @@ const waitUntilResumeRunning = async (
   }
 };
 
+/**
+ * 空闲直送幂等（G4-02 → P3-C）：key = (taskId, clientItemId, 正文指纹)，两张表。
+ *
+ * 为什么要有：排队路径靠队列里的 dedupeKey 去重，可 agent 空闲时直送 200 没有任何幂等——
+ * 响应丢了（网络抖动 / 超时）后前端用同一个 clientItemId 重发，同一句话会被再注入一次。
+ *
+ * **已送达表**（delivered）：送达成功（200）之后登记，之后同 key 重发回 200 `deduped:true`。
+ * 有界：TTL 2 分钟（重试窗口远小于此，过期自然释放）+ 上限 200 条（超出挤最老的）。
+ * Map 迭代序 = 登记时间序，所以过期 / 挤出都只从头部删。
+ * **TTL 短于队列等待（30 分钟）是已知的**：所以直送 200 之后要**同步摘掉队列里同 (id, 正文) 的那一项**
+ * （第七轮 K2-05，见 handleTaskQuestionInject 的 claim.deliver 处）——否则「排队 → 响应丢了 → 空闲后
+ * 重发直送成功 → 直送起的新 run 把 drain 挡住 > 2 分钟」之后，队列重放时 delivered 已过期、同一句话
+ * 被再注入一遍。只摘 id **与指纹都相同**的：同 id 不同正文是另一条消息，没送达过就不能摘。
+ *
+ * **在途表**（inflight，P3-C）：入口、任何 await 之前**同步**登记「处理中」。只在 200 之后登记
+ * 的话，第一次还挂在底层注入上、响应没回时，重发的第二次（或队列重放）表里查不到、照样注入——
+ * agent 收到两遍。规则：
+ * - 同 key 后到者**不立刻回 deduped**（第一次若随后失败，这条消息就丢了），而是等第一次 settle：
+ *   成功 → 回 deduped（带首次的 persistWarning）；失败 → 登记已撤销，回到入口判定、自己走一遍；
+ *   多个等待者醒来也是逐个同步判定，只有第一个拿到登记、其余继续等它；
+ * - 失败（非 200 / 抛错 / opGen 复查拒 / closing 409 / 202 入队）一律在外层 finally 撤销登记，
+ *   不登记为已送达——客户端重试复用 clientItemId 的前提就是「没送出去的能再注入」；
+ * - 防泄漏：在途项超过 INFLIGHT_STALE_MS 视为僵死（底层 await 永不返回）。**判僵死 / 接管只发生在
+ *   「清扫」那一刻**——任何带 clientItemId 的入口走到 decideDedupe 时顺手清扫头部的僵死项（摘掉 +
+ *   settle 为失败），此后到达的同 key 请求才会拿到登记、接管；**已经在等的后来者自己不会判僵死**，
+ *   它们要么被别的请求的清扫唤醒（醒来回到判定、可接管），要么一直等到 INFLIGHT_WAIT_MAX_MS 回 409。
+ *   等待者超时回 409 是**不接管**：第一次可能仍会成功，接管 = 双注入，409 让客户端稍后重试
+ *   （届时要么已送达 → deduped，要么已撤销 → 正常注入）。这条 409 带 `code: "task_busy"`
+ *   （见 TASK_INJECT_BUSY_CODE）：队列重放遇它要放回队首、而不是当「非忙」丢弃（第七轮 K2-03）；
+ * - 在途表与已送达表分开：容量淘汰只作用于后者，在途项不会被误挤。
+ *
+ * 挂 globalThis：dev HMR / 多 chunk 下模块级 Map 会分裂（同 task-talk-queue / chat-gate 做法）。
+ */
+export const DELIVERED_DEDUPE_TTL_MS = 2 * 60 * 1000;
+export const DELIVERED_DEDUPE_MAX = 200;
+/**
+ * 在途项僵死阈值。一次正常发送最慢是等 drain（≤22s）+ 唤醒 resume 到 running 落盘，远小于它；
+ * 取 5 分钟：太短会把慢但仍活着的第一次误判僵死（接管 = 双注入），太长则卡死时用户要干等。
+ */
+export const INFLIGHT_STALE_MS = 5 * 60 * 1000;
+/** 等待者等第一次 settle 的上限（总计，含失败后回到判定再等的轮次） */
+export const INFLIGHT_WAIT_MAX_MS = 60 * 1000;
+/** 等待超时的 409 文案（客户端稍后用同一个 clientItemId 重试即可） */
+export const INFLIGHT_BUSY_HTTP_MESSAGE =
+  "同一条消息上一次发送还在处理中、请稍后再试";
+
+/**
+ * 「忙、稍后再试」类 409：带结构化标记 `code: "task_busy"`（队列重放据此放回队首，不靠文案子串，
+ * 见 task-inject-shared 的 TASK_INJECT_BUSY_CODE）。只给会自己恢复的忙类用——agent 还在跑、
+ * 同一条消息上一次发送还在处理中；**停止中**也会自己恢复，但另走 {@link stoppingResponse}（同样带 task_busy、
+ * 多一个 `phase: "stopping"` 供队列分流来源）。删除 / 终结中 / reopening、stop 已完成后的状态已变、队列已满、
+ * chat 型不是忙，别走这里。
+ */
+const busyResponse = (message: string): Response =>
+  errorResponse(message, 409, { code: TASK_INJECT_BUSY_CODE });
+const DEDUPE_GLOBAL_KEY = "__flowshipTaskQuestionDedupeV2__";
+
+/** 在途项的结局：成功带首次的 persistWarning；失败 = 登记已撤销（或被判僵死清扫） */
+type InflightOutcome = { ok: true; persistWarning?: string } | { ok: false };
+
+interface InflightEntry {
+  startedAt: number;
+  settled: Promise<InflightOutcome>;
+  settle: (outcome: InflightOutcome) => void;
+}
+
+interface DeliveredRecord {
+  at: number;
+  /** 首次送达但 user_reply 落盘失败的告警：deduped 响应回放，免得响应丢了告警也跟着丢 */
+  persistWarning?: string;
+}
+
+interface DedupeState {
+  delivered: Map<string, DeliveredRecord>;
+  inflight: Map<string, InflightEntry>;
+}
+
+const getDedupeState = (): DedupeState => {
+  const g = globalThis as unknown as Record<
+    string,
+    Partial<DedupeState> | undefined
+  >;
+  if (!g[DEDUPE_GLOBAL_KEY]) g[DEDUPE_GLOBAL_KEY] = {};
+  const state = g[DEDUPE_GLOBAL_KEY]!;
+  // hot-reload 兜底：旧 chunk 可能写出缺字段的半残 state
+  if (!(state.delivered instanceof Map)) state.delivered = new Map();
+  if (!(state.inflight instanceof Map)) state.inflight = new Map();
+  return state as DedupeState;
+};
+
+const dedupeKeyOf = (
+  taskId: string,
+  itemId: string,
+  fingerprint: string,
+): string => `${taskId}\u0000${itemId}\u0000${fingerprint}`;
+
+/**
+ * 请求正文指纹（见 task-inject-shared 的详细注释）：已搬到叶子模块——排队路径的去重与「直送成功后摘队」
+ * 也要用同一口径，task-talk-queue 不能反向静态引本文件（成环）。这里再导出一份，老 import 路径不变。
+ */
+export { fingerprintTaskQuestionBody };
+
+/** 从头部摘掉已过期的（插入序即时间序，遇到第一个没过期的就可停） */
+const pruneDelivered = (
+  entries: Map<string, DeliveredRecord>,
+  now: number,
+): void => {
+  for (const [key, rec] of entries) {
+    if (now - rec.at < DELIVERED_DEDUPE_TTL_MS) break;
+    entries.delete(key);
+  }
+};
+
+/**
+ * 清扫僵死在途项（插入序 = startedAt 序，遇到第一个没僵死的就可停）。
+ * 摘掉的同时 settle 为失败：还在等它的后来者醒来重新判定（接管或等新的登记者）。
+ * 被摘掉的那次若日后真的返回，由 claim 的 token 比较保证不会误删接管者的登记。
+ */
+const pruneInflight = (
+  inflight: Map<string, InflightEntry>,
+  now: number,
+): void => {
+  for (const [key, entry] of inflight) {
+    if (now - entry.startedAt < INFLIGHT_STALE_MS) break;
+    inflight.delete(key);
+    entry.settle({ ok: false });
+  }
+};
+
+/** 取请求体里的幂等键；缺 / 非字符串 / 全空白 = 不做幂等（与排队路径同口径） */
+const deliveredDedupeIdOf = (rawBody: unknown): string | undefined => {
+  const v = (rawBody as { clientItemId?: unknown } | null | undefined)
+    ?.clientItemId;
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+};
+
+const rememberDelivered = (key: string, persistWarning?: string): void => {
+  const entries = getDedupeState().delivered;
+  const now = Date.now();
+  // 先删再放：重复登记要挪到队尾，才能保持「迭代序 = 登记时间序」
+  entries.delete(key);
+  entries.set(key, { at: now, ...(persistWarning ? { persistWarning } : {}) });
+  pruneDelivered(entries, now);
+  while (entries.size > DELIVERED_DEDUPE_MAX) {
+    const oldest = entries.keys().next().value;
+    if (oldest === undefined) break;
+    entries.delete(oldest);
+  }
+};
+
+/** 在途登记句柄：外层拿到它 = 本次请求是这个 key 的唯一处理者 */
+interface InflightClaim {
+  /** 200 送达：转「已送达」（带 persistWarning）并唤醒等待者；已 settle 则 no-op */
+  deliver: (persistWarning?: string) => void;
+  /** 没送达（非 200 / 抛错 / 入队 / 400…）：撤销登记并唤醒等待者；已 settle 则 no-op */
+  release: () => void;
+}
+
+const claimInflight = (key: string, now: number): InflightClaim => {
+  const { inflight } = getDedupeState();
+  let settle!: (outcome: InflightOutcome) => void;
+  const settled = new Promise<InflightOutcome>((resolve) => {
+    settle = resolve;
+  });
+  const entry: InflightEntry = { startedAt: now, settled, settle };
+  inflight.set(key, entry);
+  let finished = false;
+  const finish = (outcome: InflightOutcome): void => {
+    if (finished) return;
+    finished = true;
+    // 只摘自己的登记：本次若已被判僵死、清扫后由接管者重新登记，迟到的结局不能误删它
+    if (inflight.get(key) === entry) inflight.delete(key);
+    // 成功一律登记已送达（含已被接管的僵死者——它确实送达了，后来的重发该去重）
+    if (outcome.ok) rememberDelivered(key, outcome.persistWarning);
+    entry.settle(outcome);
+  };
+  return {
+    deliver: (persistWarning) => finish({ ok: true, persistWarning }),
+    release: () => finish({ ok: false }),
+  };
+};
+
+type DedupeVerdict =
+  | { kind: "delivered"; persistWarning?: string }
+  | { kind: "wait"; entry: InflightEntry }
+  | { kind: "claim"; claim: InflightClaim };
+
+/**
+ * 同步判定（中间没有任何 await——这是「并发安全」的全部依据：JS 单线程下，
+ * 多个等待者同时醒来也是逐个判定，第一个拿到登记、后面的看到在途就继续等）。
+ */
+const decideDedupe = (key: string): DedupeVerdict => {
+  const { delivered, inflight } = getDedupeState();
+  const now = Date.now();
+  pruneDelivered(delivered, now);
+  pruneInflight(inflight, now);
+  const rec = delivered.get(key);
+  if (rec && now - rec.at < DELIVERED_DEDUPE_TTL_MS) {
+    return { kind: "delivered", persistWarning: rec.persistWarning };
+  }
+  const live = inflight.get(key);
+  if (live) return { kind: "wait", entry: live };
+  return { kind: "claim", claim: claimInflight(key, now) };
+};
+
+/** 等在途项 settle，最多 timeoutMs；timer 一律清掉（不留悬挂定时器） */
+const awaitInflight = async (
+  entry: InflightEntry,
+  timeoutMs: number,
+): Promise<InflightOutcome | "timeout"> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  try {
+    return await Promise.race([entry.settled, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+/** 命中「已送达」的响应：回 task 是因为前端成功分支要读 data.task；任务已删则如实 404 */
+const dedupedResponse = async (
+  id: string,
+  persistWarning: string | undefined,
+): Promise<Response> => {
+  const existing = await getTaskMeta(id);
+  if (!existing) return errorResponse("not_found", 404);
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      deduped: true,
+      task: existing,
+      ...(persistWarning ? { persistWarning } : {}),
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+};
+
+/** 测试钩子：当前去重表里的 key 快照（只含 key——表里不存原文） */
+export const __taskQuestionDedupeSnapshotForTest = (): {
+  delivered: string[];
+  inflight: string[];
+} => {
+  const { delivered, inflight } = getDedupeState();
+  return { delivered: [...delivered.keys()], inflight: [...inflight.keys()] };
+};
+
+/** 测试钩子：清空两张表（在途项 settle 为失败，免得遗留等待者） */
+export const __resetTaskQuestionDedupeForTest = (): void => {
+  const { delivered, inflight } = getDedupeState();
+  delivered.clear();
+  for (const entry of inflight.values()) entry.settle({ ok: false });
+  inflight.clear();
+};
+
 /** 发送预处理分节计时收集器（外层拼进 question-timing 行） */
 export type QuestionSendTiming = (entry: string) => void;
 // skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
@@ -237,9 +564,92 @@ export const handleTaskQuestionInject = async (
     typeof (rawBody as { clientSentAt?: unknown })?.clientSentAt === "number"
       ? ((rawBody as { clientSentAt: number }).clientSentAt as number)
       : null;
+  // 本次请求持有的在途登记（见 decideDedupe）；外层 finally 兜底撤销，防抛错 / 早退泄漏
+  let claim: InflightClaim | null = null;
+  // 带幂等键时记下 (id, 正文指纹)：直送 200 之后据此摘掉队列里同一条（K2-05，见 claim.deliver 处）
+  let dedupeIdentity: { itemId: string; fingerprint: string } | null = null;
+  // 内层把「送达但落盘失败」的告警带出来：登记已送达时一并存下、deduped 响应回放
+  const outcome: { persistWarning?: string } = {};
   try {
-    return await runTaskQuestionInject(id, rawBody, options, skipRef, timing);
+    // 空闲直送幂等（G4-02 / P3-C）：入口、任何 await 之前同步判定——
+    // - 已送达过的 (task, clientItemId, 正文) → 直接回 200 + deduped，不再注入；
+    // - 同 key 还在途 → 等第一次的结果（成功 → deduped；失败 → 回到这里自己处理）；
+    // - 否则登记「处理中」、继续往下走。
+    // 放在最外层、所有校验之前——命中说明这条已经被受理过，不该再被后续状态（忙 / 停止中）
+    // 改判成 409 / 202。
+    const dedupeId = deliveredDedupeIdOf(rawBody);
+    if (dedupeId) {
+      const fingerprint = fingerprintTaskQuestionBody(rawBody);
+      dedupeIdentity = { itemId: dedupeId, fingerprint };
+      const key = dedupeKeyOf(id, dedupeId, fingerprint);
+      // 等待者的 admission：到达时同步取。等待期间 stop / DELETE 整个跑完（opGen 已 bump、
+      // lifecycle 已放开）后，等待者醒来不得拿新 opGen 冒充新意图去重试——那会把用户刚取消的
+      // 输入复活（与 tryQueueWhenBusy 的入队前复查同理）。
+      const arrivalGen = getTaskOpGeneration(id);
+      const deadline = Date.now() + INFLIGHT_WAIT_MAX_MS;
+      for (;;) {
+        const verdict = decideDedupe(key);
+        if (verdict.kind === "claim") {
+          claim = verdict.claim;
+          break;
+        }
+        if (verdict.kind === "delivered") {
+          timing("dedupe=hit");
+          return await dedupedResponse(id, verdict.persistWarning);
+        }
+        timing("dedupe=wait");
+        const remaining = deadline - Date.now();
+        const settled =
+          remaining > 0
+            ? await awaitInflight(verdict.entry, remaining)
+            : ("timeout" as const);
+        if (settled === "timeout") {
+          return busyResponse(INFLIGHT_BUSY_HTTP_MESSAGE);
+        }
+        if (settled.ok) {
+          timing("dedupe=hit-after-wait");
+          return await dedupedResponse(id, settled.persistWarning);
+        }
+        // 第一次没送出去（登记已撤销）：stop 在等待期间跑完则作废，否则回到判定自己处理
+        if (isTaskOpStale(id, arrivalGen)) {
+          const life = getChatLifecycle(id);
+          return life !== null
+            ? lifecycleBlockedResponse(life)
+            : errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+        }
+      }
+    }
+    const res = await runTaskQuestionInject(
+      id,
+      rawBody,
+      options,
+      skipRef,
+      timing,
+      outcome,
+    );
+    // 只认 200 = 真送达（202 入队由队列自己的 dedupeKey 管，4xx / 5xx 没送出去更不能登记）：
+    // 200 → 在途转已送达；其余 → 撤销在途、不登记（finally 兜底同样撤销，release 幂等）。
+    // 此处到 return 之间没有 await，不会留下「已返回但还挂在在途」的窗口。
+    if (claim) {
+      if (res.status === 200) {
+        claim.deliver(outcome.persistWarning);
+        // 同一条已经送达：同步摘掉队列里同 (id, 正文) 的那一项（K2-05）。已送达表只留 2 分钟、
+        // 短于队列等待；不摘，直送起的新 run 把 drain 挡住超过 2 分钟后，队列重放时 delivered 已过期、
+        // 同一句话会再注入一遍。只在 200 真送达后摘（失败 / 202 入队那条队列项是它唯一的活路）；
+        // 队列重放自己走到这里时，那一项早在 drainOnce 里被 shift 掉了，摘不到、无副作用。
+        if (dedupeIdentity) {
+          removeTalkQueueItemsByDedupe(
+            id,
+            dedupeIdentity.itemId,
+            dedupeIdentity.fingerprint,
+          );
+        }
+      } else claim.release();
+    }
+    return res;
   } finally {
+    // 先于一切收尾：抛错 / 早退路径都靠它撤销在途登记并唤醒等待者（deliver 过则 no-op）
+    (claim as InflightClaim | null)?.release();
     skipRef.handle?.rollback();
     const serverMs = Date.now() - t0;
     const line = `[question-timing] task=${id} clientGapMs=${clientSentAt != null ? t0 - clientSentAt : -1} serverMs=${serverMs} ${sendMarks.join(" ")}`;
@@ -256,6 +666,8 @@ const runTaskQuestionInject = async (
   options: TaskQuestionInjectOptions,
   skipRef: { handle: AskSkipHandle | null },
   timing?: QuestionSendTiming,
+  /** 出参：送达但 user_reply 落盘失败时写入 persistWarning（供外层登记 / deduped 回放） */
+  outcome?: { persistWarning?: string },
 ): Promise<Response> => {
   const body = (rawBody ?? {}) as TaskQuestionBody;
   // 分节计时（2026-09-24 取证）：重型 await 自报耗时（>3s warn），外层拼进 question-timing 行
@@ -295,8 +707,19 @@ const runTaskQuestionInject = async (
    * agent 真在跑（不是收尾 drain 窗口）时：带 queueIfBusy 就入队返回 202，否则调用方仍 409。
    * 只答疑旁路（questionOnly）永远不进这条队——它走群模块自己的排队。
    */
-  const tryQueueWhenBusy = (): Response | null => {
+  const tryQueueWhenBusy = (admissionOpGen: number): Response | null => {
     if (questionOnly || !options.queueIfBusy) return null;
+    // 入队前同步复查 opGen + lifecycle。入口只在 getTaskMeta 之后查过一次，到这里之间隔着
+    // 读尾部事件 / 存图 / 等跳过认领等 await：stop / DELETE / finalize 可能在这段时间里**整个跑完**
+    //（opGen 已 bump、清队已执行、lifecycle 已放开）——此时 enqueueTalkMessage 内的 lifecycle
+    // 复查看到的是干净状态、照单全收，把用户刚取消的输入条（连同 bootArgs.apiKey）复活进队列。
+    // opGen 只有本函数的调用方持有，所以必须在这里判。lifecycle 仍在收尾时给更具体的文案。
+    if (isTaskOpStale(id, admissionOpGen)) {
+      const life = getChatLifecycle(id);
+      return life !== null
+        ? lifecycleBlockedResponse(life)
+        : errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    }
     const qOpt = options.queueIfBusy;
     const r = enqueueTalkMessage(id, {
       source: qOpt.source,
@@ -308,6 +731,12 @@ const runTaskQuestionInject = async (
       clientItemId: qOpt.clientItemId,
     });
     if (!r.ok) {
+      // closing = 入队这一刻任务正在 stop / 删除 / 终结，和「队列满」是两回事：
+      // 说「排队已满」会让用户干等腾位置，实际该稍后重发（任务删了则根本发不了）。
+      // 状态码与入口 lifecycle 闸一致用 409（状态冲突、非请求本身有误）
+      if (r.reason === "closing") {
+        return lifecycleBlockedResponse(getChatLifecycle(id));
+      }
       return errorResponse("排队已满（最多 10 条），等当前这轮跑完再发", 409);
     }
     return new Response(
@@ -330,13 +759,7 @@ const runTaskQuestionInject = async (
   {
     const life = getChatLifecycle(id);
     if (life !== null) {
-      const msg =
-        life === "deleting"
-          ? "任务正在删除"
-          : life === "finalizing"
-            ? "正在终结、请稍后再试"
-            : "正在停止、请稍后再试";
-      return errorResponse(msg, 409);
+      return lifecycleBlockedResponse(life);
     }
   }
 
@@ -387,7 +810,7 @@ const runTaskQuestionInject = async (
         stopped = await sendTimed("drainWait2", waitForTaskToStop(task.id, 2_000));
       }
       if (!stopped) {
-        return errorResponse("agent 正在跑、等它说完这轮再问", 409);
+        return busyResponse("agent 正在跑、等它说完这轮再问");
       }
       const fresh = await getTaskMeta(id);
       if (!fresh) return errorResponse("not_found", 404);
@@ -408,9 +831,9 @@ const runTaskQuestionInject = async (
       }
       task = fresh;
     } else {
-      const queued = tryQueueWhenBusy();
+      const queued = tryQueueWhenBusy(opGen);
       if (queued) return queued;
-      return errorResponse("agent 正在跑、等它说完这轮再问", 409);
+      return busyResponse("agent 正在跑、等它说完这轮再问");
     }
   }
 
@@ -430,7 +853,7 @@ const runTaskQuestionInject = async (
 
   // 长 await（存图）后复查——stop 期间不得继续 fallback / 写 running
   if (isTaskOpStale(task.id, opGen)) {
-    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    return staleResponse(task.id);
   }
 
   const rawKey = body.bootArgs?.apiKey;
@@ -481,7 +904,7 @@ const runTaskQuestionInject = async (
 
   // snapshot 长 await 后再查
   if (isTaskOpStale(task.id, opGen)) {
-    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    return staleResponse(task.id);
   }
 
   // 有待答提问时用户直接说话 = **隐式跳过**这组提问。
@@ -533,9 +956,9 @@ const runTaskQuestionInject = async (
       drainStatus === "error" ||
       task.runStatus === "idle";
     if (!waitingForDrain) {
-      const queued = tryQueueWhenBusy();
+      const queued = tryQueueWhenBusy(opGen);
       if (queued) return queued;
-      return errorResponse("agent 正在跑、等它说完这轮再问", 409);
+      return busyResponse("agent 正在跑、等它说完这轮再问");
     }
   }
 
@@ -578,7 +1001,7 @@ const runTaskQuestionInject = async (
   // stale → 409，绝不 fallback one-shot、不写事件、不写 running
   // 同一轮 curl 已经吃到跳过正文：世界变了也别把已写进 stdout 的当没送
   if (!viaWait && (deliverResult === "stale" || isTaskOpStale(task.id, opGen))) {
-    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    return staleResponse(task.id);
   }
   const sent = viaWait || deliverResult === "sent";
 
@@ -614,7 +1037,7 @@ const runTaskQuestionInject = async (
   // 写事件 / supersede / 置 running 前最后复查（含 useOneShot 窗口）
   // 同一轮 curl 已吃到跳过正文：不要再因 stale 把已写进 stdout 的当没送
   if (!viaWait && isTaskOpStale(task.id, opGen)) {
-    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    return staleResponse(task.id);
   }
 
   // 用户绕开答题卡直接在输入条说话 = 那组提问就此跳过（send：agent 收到新消息就继续了；
@@ -628,7 +1051,7 @@ const runTaskQuestionInject = async (
 
   // commit 是 await——后再查一次再写「已送达」事件
   if (!viaWait && isTaskOpStale(task.id, opGen)) {
-    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    return staleResponse(task.id);
   }
 
   // 用户原文 strict 落盘
@@ -679,6 +1102,9 @@ const runTaskQuestionInject = async (
       return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
     }
   }
+
+  // 送达但落盘失败的告警交给外层：登记已送达时一并存下，响应丢了后的 deduped 重发也能带上
+  if (persistWarning && outcome) outcome.persistWarning = persistWarning;
 
   // oneshot：落盘成功后再落跳过（失败路径不得提交、登记要能放回）
   if (!sent && useOneShot) {
@@ -741,7 +1167,7 @@ const runTaskQuestionInject = async (
 
   if (canResume) {
     if (isTaskOpStale(task.id, opGen)) {
-      return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+      return staleResponse(task.id);
     }
     // 唤醒也是「消息已被受理」——先落跳过标记再起新 agent。
     // 顺序不能反：resumeCurrentActionWithMessage 内部会 supersedePendingAsks，
@@ -815,7 +1241,7 @@ const runTaskQuestionInject = async (
         message === TASK_OP_STALE_HTTP_MESSAGE ||
         message.includes("正在停止")
       ) {
-        return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+        return staleResponse(task.id);
       }
       return errorResponse(`唤醒当前阶段失败：${message}`, 500);
     }
@@ -833,7 +1259,7 @@ const runTaskQuestionInject = async (
   // 409 让群入向按 token 回滚回群登记并回一句失败，比起了个跑在删除中目录里的 agent 好。
   if (questionOnly) {
     if (isTaskOpStale(task.id, opGen)) {
-      return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+      return staleResponse(task.id);
     }
     // 受理即可见：fire-and-forget 前先落进度，避免「接口 200 后长时间无动静」
     await writeEventAndPublish(task.id, {
@@ -860,7 +1286,7 @@ const runTaskQuestionInject = async (
 
   // one-shot「先写 running 再 start」窗口——写 running 前最后复查
   if (isTaskOpStale(task.id, opGen)) {
-    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    return staleResponse(task.id);
   }
 
   // 裸 setTaskRunStatus → terminal-aware 条件事务。
@@ -876,7 +1302,7 @@ const runTaskQuestionInject = async (
     expectedWaitingStatus,
   );
   if (!updated) {
-    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    return staleResponse(task.id);
   }
   publishTaskStreamEvent(task.id, { kind: "task", task: updated });
 

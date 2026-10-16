@@ -5,17 +5,23 @@
  * 不碰真实 SDK：子 agent / 模型目录都是注入的假依赖。真实 SDK 下的行为（Sonnet 5.5 + effort 真的生效、
  * 取消 58ms 内子 shell 进程消失、取消后同一 agent 下一轮照常、resume 路径）见 docs/HANDOFF.md 的实测记录。
  */
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  __resetSubagentResumablesForTests,
+  __resumableChildIdsForTests,
   createCursorSubagentLink,
   CURSOR_SUBAGENT_DESCRIPTION,
   CURSOR_SUBAGENT_READONLY_TOOLS,
+  formatSubagentTrailer,
+  RESUMABLE_CHILDREN_PER_PARENT_MAX,
+  withNativeTaskDisabled,
   type CursorSubagentDeps,
   type SubagentChildAgent,
   type SubagentChildRun,
 } from "@/lib/server/cursor-subagent";
-import type { ModelCatalogEntry } from "@/lib/subagent-spec";
+import { getSubagentParentModel } from "@/lib/server/subagent-parent-model";
+import { SUBAGENT_INPUT_JSON_SCHEMA, type ModelCatalogEntry } from "@/lib/subagent-spec";
 
 // ----------------- 假依赖 -----------------
 
@@ -80,15 +86,23 @@ const fakeRun = (o: FakeRunOpts = {}) => {
 };
 
 const makeDeps = (
-  over: Partial<CursorSubagentDeps> & { run?: FakeRunOpts; sendDelay?: Promise<void>; createDelay?: Promise<void> } = {},
+  over: Partial<CursorSubagentDeps> & {
+    run?: FakeRunOpts;
+    sendDelay?: Promise<void>;
+    createDelay?: Promise<void>;
+    /** 子 agent 带 agentId（child-1 / child-2…）并提供 resumeChild——resume 相关用例用；缺省不带，结果不含尾注 */
+    withIds?: boolean;
+    /** resumeChild 抛这个错（模拟 SDK 里找不到那个 agent） */
+    resumeError?: string;
+  } = {},
 ) => {
   const runs: ReturnType<typeof fakeRun>[] = [];
   const children: Array<SubagentChildAgent & { close: ReturnType<typeof vi.fn>; send: ReturnType<typeof vi.fn> }> = [];
   const loadCatalog = vi.fn(async () => CATALOG);
-  const createChild = vi.fn(async (opts: { model?: unknown; explore: boolean }) => {
-    void opts; // 形参只为让 mock.calls 带类型
-    if (over.createDelay) await over.createDelay;
+  let seq = 0;
+  const makeChild = (agentId: string | undefined) => {
     const child = {
+      ...(agentId ? { agentId } : {}),
       send: vi.fn(async () => {
         if (over.sendDelay) await over.sendDelay;
         const r = fakeRun(over.run);
@@ -99,15 +113,36 @@ const makeDeps = (
     };
     children.push(child);
     return child;
+  };
+  const createChild = vi.fn(async (opts: { model?: unknown; explore: boolean }) => {
+    void opts; // 形参只为让 mock.calls 带类型
+    if (over.createDelay) await over.createDelay;
+    seq += 1;
+    return makeChild(over.withIds ? `child-${seq}` : undefined);
   });
+  const resumeChild = vi.fn(
+    async (opts: { agentId: string; model?: unknown; explore: boolean }) => {
+      void opts;
+      if (over.resumeError) throw new Error(over.resumeError);
+      return makeChild(opts.agentId);
+    },
+  );
   const deps: CursorSubagentDeps = {
     parentModel: { id: "composer-2.5", params: [{ id: "fast", value: "false" }] },
     loadCatalog,
     createChild,
+    ...(over.withIds ? { resumeChild } : {}),
     ...(over.parentModel !== undefined ? { parentModel: over.parentModel } : {}),
     ...(over.loadCatalog ? { loadCatalog: over.loadCatalog } : {}),
   };
-  return { deps, loadCatalog: over.loadCatalog ?? loadCatalog, createChild, runs, children };
+  return {
+    deps,
+    loadCatalog: over.loadCatalog ?? loadCatalog,
+    createChild,
+    resumeChild,
+    runs,
+    children,
+  };
 };
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
@@ -123,15 +158,27 @@ const call = async (
 // ----------------- 工具本身 -----------------
 
 describe("subagent 工具定义", () => {
-  it("描述写明与原生 task 的区别、可并行；schema 含 model / effort / subagentType", () => {
+  it("描述写明可并行、可 resume；不再提原生 task（它已被关掉）；schema 含 model / effort / subagentType / resume", () => {
     const { deps } = makeDeps();
     const { tool } = createCursorSubagentLink(deps);
     expect(tool.description).toBe(CURSOR_SUBAGENT_DESCRIPTION);
-    expect(CURSOR_SUBAGENT_DESCRIPTION).toContain("原生 task");
+    expect(CURSOR_SUBAGENT_DESCRIPTION).not.toContain("原生");
     expect(CURSOR_SUBAGENT_DESCRIPTION).toContain("并行");
+    expect(CURSOR_SUBAGENT_DESCRIPTION).toContain("resume");
     const props = (tool.inputSchema as { properties: Record<string, unknown> }).properties;
-    expect(Object.keys(props).sort()).toEqual(["description", "effort", "model", "prompt", "subagentType"]);
+    expect(Object.keys(props).sort()).toEqual([
+      "description",
+      "effort",
+      "model",
+      "prompt",
+      "resume",
+      "subagentType",
+    ]);
     expect((tool.inputSchema as { required: string[] }).required).toEqual(["prompt"]);
+  });
+
+  it("共享 schema（pi task 也用）不含 resume——resume 是 Cursor 路径独有的", () => {
+    expect(Object.keys(SUBAGENT_INPUT_JSON_SCHEMA.properties)).not.toContain("resume");
   });
 
   it("explore 白名单只有读 / 搜", () => {
@@ -679,5 +726,371 @@ describe("attach：把父 run 的取消联动到子 run", () => {
     const link = createCursorSubagentLink(deps);
     const agent = { send: vi.fn(async () => undefined) };
     await expect(link.attach(agent).send()).resolves.toBeUndefined();
+  });
+});
+
+// ----------------- resume：接着之前的子代理 -----------------
+
+/** 一个只带 agentId 的假父 agent（attach 用它的 id 给登记表分桶） */
+const parentOf = (agentId: string) => ({
+  agentId,
+  send: vi.fn(async () => ({ cancel: vi.fn(async () => {}) })),
+  close: vi.fn(),
+});
+
+/** 建 link 并 attach 到名为 parentId 的假父 agent（登记表的桶 key = 这个 id） */
+const linkFor = (deps: CursorSubagentDeps, parentId: string) => {
+  const link = createCursorSubagentLink(deps);
+  link.attach(parentOf(parentId));
+  return link;
+};
+
+describe("resume：成功结果给 id、之后能接着做", () => {
+  beforeEach(() => __resetSubagentResumablesForTests());
+
+  it("子 agent 有 agentId：结果末尾给 id + 实际模型 + 怎么 resume；没有 agentId 则一个字不加", async () => {
+    const plain = makeDeps();
+    expect(await call(createCursorSubagentLink(plain.deps), { prompt: "x" })).toEqual({
+      text: "ok",
+      isError: false,
+    });
+
+    const { deps } = makeDeps({ withIds: true });
+    const out = await call(linkFor(deps, "P1"), { prompt: "x" });
+    expect(out.isError).toBe(false);
+    expect(out.text.startsWith("ok\n\n[子代理 child-1 · composer-2.5 (fast=false)]")).toBe(true);
+    expect(out.text).toContain('resume="child-1"');
+  });
+
+  it("resume：沿用当初的模型 / 思考档，不再拉目录、不另起新 agent；提示词送给原来那个子 agent", async () => {
+    const { deps, createChild, resumeChild, loadCatalog, children } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    await call(link, { prompt: "第一次", model: "claude-sonnet-5-5", effort: "low" });
+    const catalogLoads = vi.mocked(loadCatalog).mock.calls.length;
+    expect(catalogLoads).toBeGreaterThan(0); // 第一次要拉目录才能解析 effort
+
+    const out = await call(link, { prompt: "接着改", resume: "child-1" });
+    expect(out.isError).toBe(false);
+    expect(createChild).toHaveBeenCalledTimes(1); // 没有另起
+    expect(vi.mocked(loadCatalog).mock.calls.length).toBe(catalogLoads); // resume 不再拉
+    expect(resumeChild).toHaveBeenCalledWith({
+      agentId: "child-1",
+      model: { id: "claude-sonnet-5-5", params: [{ id: "reasoning_effort", value: "low" }] },
+      explore: false,
+    });
+    expect(children[1].send).toHaveBeenCalledWith("接着改");
+    expect(children[1].close).toHaveBeenCalled(); // 用完照常关
+    expect(out.text).toContain("[子代理 child-1 · claude-sonnet-5-5 (reasoning_effort=low)]");
+  });
+
+  it("explore 的只读属性沿用：resume 时 explore 原样再传（SDK 的 tools 白名单不持久化）", async () => {
+    const { deps, resumeChild } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    await call(link, { prompt: "查", subagentType: "explore" });
+    await call(link, { prompt: "再查", resume: "child-1" });
+    expect(resumeChild.mock.calls[0][0].explore).toBe(true);
+    // 显式再写一遍同类型也行
+    await call(link, { prompt: "再查", resume: "child-1", subagentType: "explore" });
+    expect(resumeChild.mock.calls[1][0].explore).toBe(true);
+  });
+
+  it("父会话没显式选模型：登记的就是「SDK 默认」，resume 也不替它编模型", async () => {
+    const { deps, resumeChild } = makeDeps({ withIds: true });
+    const link = linkFor({ ...deps, parentModel: undefined }, "P1");
+    const first = await call(link, { prompt: "x" });
+    expect(first.text).toContain("[子代理 child-1 · SDK 默认模型]");
+    await call(link, { prompt: "y", resume: "child-1" });
+    expect(resumeChild.mock.calls[0][0].model).toBeUndefined();
+  });
+
+  it("resume 成功后依然可以继续 resume（多轮追问）", async () => {
+    const { deps, resumeChild } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    await call(link, { prompt: "1" });
+    for (let i = 0; i < 3; i++) {
+      const out = await call(link, { prompt: `追问${i}`, resume: "child-1" });
+      expect(out.isError).toBe(false);
+    }
+    expect(resumeChild).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("resume：入参校验——填错直接报错，不静默当成新任务", () => {
+  beforeEach(() => __resetSubagentResumablesForTests());
+
+  it("不认识的 id：isError、不创建新子代理（模型要自己决定另起）", async () => {
+    const { deps, createChild, resumeChild } = makeDeps({ withIds: true });
+    const out = await call(linkFor(deps, "P1"), { prompt: "x", resume: "child-404" });
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("找不到子代理");
+    expect(out.text).toContain("另起");
+    expect(createChild).not.toHaveBeenCalled();
+    expect(resumeChild).not.toHaveBeenCalled();
+  });
+
+  it("不能接别的父会话派出的子代理（登记按父 agentId 分桶，不是任意 id 都能接）", async () => {
+    const a = makeDeps({ withIds: true });
+    await call(linkFor(a.deps, "P-A"), { prompt: "x" });
+    expect(__resumableChildIdsForTests("P-A")).toEqual(["child-1"]);
+
+    const b = makeDeps({ withIds: true });
+    const out = await call(linkFor(b.deps, "P-B"), { prompt: "x", resume: "child-1" });
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("找不到子代理");
+    expect(b.resumeChild).not.toHaveBeenCalled();
+  });
+
+  it("同一个父 agentId 的新 link（会话被恢复成新实例）能接着之前派出的子代理", async () => {
+    const a = makeDeps({ withIds: true });
+    await call(linkFor(a.deps, "P-A"), { prompt: "x" });
+
+    const again = makeDeps({ withIds: true });
+    const out = await call(linkFor(again.deps, "P-A"), { prompt: "接着", resume: "child-1" });
+    expect(out.isError).toBe(false);
+    expect(again.resumeChild).toHaveBeenCalledTimes(1);
+  });
+
+  it("resume 时 model / effort 不能改（填了就报错）；model=inherit 等于没填、允许", async () => {
+    const { deps, resumeChild } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    await call(link, { prompt: "x" });
+
+    for (const extra of [{ model: "claude-sonnet-5-5" }, { effort: "low" }, { model: "list" }]) {
+      const out = await call(link, { prompt: "y", resume: "child-1", ...extra });
+      expect(out.isError).toBe(true);
+      expect(out.text).toContain("不能改");
+    }
+    expect(resumeChild).not.toHaveBeenCalled();
+
+    const ok = await call(link, { prompt: "y", resume: "child-1", model: "inherit" });
+    expect(ok.isError).toBe(false);
+  });
+
+  it("resume 时 subagentType 与当初不一致 → 报错；没填 / 一致 → 通过", async () => {
+    const { deps } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    await call(link, { prompt: "x", subagentType: "explore" });
+    const bad = await call(link, { prompt: "y", resume: "child-1", subagentType: "general" });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toContain("subagentType");
+    expect((await call(link, { prompt: "y", resume: "child-1" })).isError).toBe(false);
+
+    // 反过来：当初是可读写的，不能 resume 成只读
+    await call(link, { prompt: "z" }); // child-2（general）
+    const bad2 = await call(link, { prompt: "y", resume: "child-2", subagentType: "explore" });
+    expect(bad2.isError).toBe(true);
+  });
+
+  it("resume 传空串 / 纯空白 = 没传 = 新建一个", async () => {
+    const { deps, createChild, resumeChild } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    await call(link, { prompt: "x", resume: "   " });
+    expect(createChild).toHaveBeenCalledTimes(1);
+    expect(resumeChild).not.toHaveBeenCalled();
+  });
+
+  it("环境不支持 resume（没提供 resumeChild）：明确报错，且不卡死登记", async () => {
+    const { deps } = makeDeps({ withIds: true });
+    const { resumeChild: _drop, ...noResume } = deps;
+    void _drop;
+    const link = linkFor(noResume, "P1");
+    await call(link, { prompt: "x" });
+    for (let i = 0; i < 2; i++) {
+      const out = await call(link, { prompt: "y", resume: "child-1" });
+      expect(out.isError).toBe(true);
+      expect(out.text).toContain("不支持 resume"); // 两次都是这条——busy 没有残留成「还在运行」
+    }
+  });
+});
+
+describe("resume：并发 / 失败 / 取消", () => {
+  beforeEach(() => __resetSubagentResumablesForTests());
+
+  it("同一个子代理同时只允许一个 run：并发 resume 第二个被拒，跑完后又能接", async () => {
+    const { deps } = makeDeps({ withIds: true });
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const slow = {
+      ...deps,
+      resumeChild: vi.fn(async (o: { agentId: string }) => ({
+        agentId: o.agentId,
+        send: vi.fn(async () => {
+          await gate;
+          return fakeRun();
+        }),
+        close: vi.fn(),
+      })),
+    };
+    const link = linkFor(slow, "P1");
+    await call(link, { prompt: "x" });
+
+    const first = call(link, { prompt: "a", resume: "child-1" }); // 同步占位
+    const second = await call(link, { prompt: "b", resume: "child-1" });
+    expect(second.isError).toBe(true);
+    expect(second.text).toContain("还在运行");
+
+    release();
+    expect((await first).isError).toBe(false);
+    expect((await call(link, { prompt: "c", resume: "child-1" })).isError).toBe(false);
+  });
+
+  it("SDK 里接不上那个 agent：报错 + 忘掉这条登记（下次直接是「找不到」），提示另起", async () => {
+    const { deps } = makeDeps({ withIds: true, resumeError: "agent not found" });
+    const link = linkFor(deps, "P1");
+    await call(link, { prompt: "x" });
+    expect(__resumableChildIdsForTests("P1")).toEqual(["child-1"]);
+
+    const out = await call(link, { prompt: "y", resume: "child-1" });
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("agent not found");
+    expect(out.text).toContain("另起");
+    expect(__resumableChildIdsForTests("P1")).toEqual([]);
+    expect((await call(link, { prompt: "y", resume: "child-1" })).text).toContain("找不到子代理");
+  });
+
+  it("失败 / 取消的子任务不登记（状态不确定，不鼓励接着做），也不给 id", async () => {
+    const failing = makeDeps({ withIds: true, run: { status: "error", error: { message: "boom" } } });
+    const out = await call(linkFor(failing.deps, "P1"), { prompt: "x" });
+    expect(out.isError).toBe(true);
+    expect(out.text).not.toContain("child-1");
+    expect(__resumableChildIdsForTests("P1")).toEqual([]);
+
+    const hang = makeDeps({ withIds: true, run: { hangUntilCancel: true } });
+    const link = linkFor(hang.deps, "P2");
+    const p = call(link, { prompt: "x" });
+    await vi.waitFor(() => expect(hang.runs).toHaveLength(1));
+    await link.cancelAll();
+    await p;
+    expect(__resumableChildIdsForTests("P2")).toEqual([]);
+  });
+
+  it("resume 的那一轮失败：已登记的保留（之前成功的上下文还在），busy 释放、能再接", async () => {
+    const { deps } = makeDeps({ withIds: true });
+    const failingResume = {
+      ...deps,
+      resumeChild: vi
+        .fn()
+        .mockImplementationOnce(async (o: { agentId: string }) => ({
+          agentId: o.agentId,
+          send: vi.fn(async () => fakeRun({ status: "error", error: { message: "boom" } })),
+          close: vi.fn(),
+        }))
+        .mockImplementation(async (o: { agentId: string }) => ({
+          agentId: o.agentId,
+          send: vi.fn(async () => fakeRun()),
+          close: vi.fn(),
+        })),
+    };
+    const link = linkFor(failingResume, "P1");
+    await call(link, { prompt: "x" });
+    const bad = await call(link, { prompt: "y", resume: "child-1" });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toContain("boom");
+    expect(__resumableChildIdsForTests("P1")).toEqual(["child-1"]);
+    expect((await call(link, { prompt: "z", resume: "child-1" })).isError).toBe(false);
+  });
+
+  it("resume 出来的子 run 同样被 cancelAll 取消；取消后还能再接", async () => {
+    const { deps } = makeDeps({ withIds: true });
+    const hangRuns: ReturnType<typeof fakeRun>[] = [];
+    const hanging = {
+      ...deps,
+      resumeChild: vi
+        .fn()
+        .mockImplementationOnce(async (o: { agentId: string }) => ({
+          agentId: o.agentId,
+          send: vi.fn(async () => {
+            const r = fakeRun({ hangUntilCancel: true });
+            hangRuns.push(r);
+            return r;
+          }),
+          close: vi.fn(),
+        }))
+        .mockImplementation(async (o: { agentId: string }) => ({
+          agentId: o.agentId,
+          send: vi.fn(async () => fakeRun()),
+          close: vi.fn(),
+        })),
+    };
+    const link = linkFor(hanging, "P1");
+    await call(link, { prompt: "x" });
+
+    const p = call(link, { prompt: "y", resume: "child-1" });
+    await vi.waitFor(() => expect(hangRuns).toHaveLength(1));
+    await link.cancelAll();
+    expect((await p).text).toBe("子任务已取消");
+    expect(hangRuns[0].cancel).toHaveBeenCalledTimes(1);
+    expect((await call(link, { prompt: "z", resume: "child-1" })).isError).toBe(false);
+  });
+});
+
+describe("resume：登记表容量上限", () => {
+  beforeEach(() => __resetSubagentResumablesForTests());
+
+  it(`每个父会话最多记 ${RESUMABLE_CHILDREN_PER_PARENT_MAX} 个，超出淘汰最久没用的`, async () => {
+    const { deps } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    for (let i = 0; i < RESUMABLE_CHILDREN_PER_PARENT_MAX + 1; i++) {
+      await call(link, { prompt: `t${i}` });
+    }
+    const ids = __resumableChildIdsForTests("P1");
+    expect(ids).toHaveLength(RESUMABLE_CHILDREN_PER_PARENT_MAX);
+    expect(ids).not.toContain("child-1"); // 最老的被淘汰
+    expect(ids).toContain(`child-${RESUMABLE_CHILDREN_PER_PARENT_MAX + 1}`);
+  });
+
+  it("resume 过的会刷新为最近使用（不会因为是最早建的就先被淘汰）", async () => {
+    const { deps } = makeDeps({ withIds: true });
+    const link = linkFor(deps, "P1");
+    for (let i = 0; i < RESUMABLE_CHILDREN_PER_PARENT_MAX; i++) await call(link, { prompt: `t${i}` });
+    await call(link, { prompt: "再用一下最老的", resume: "child-1" });
+    await call(link, { prompt: "再来一个新的" }); // 挤掉最久没用的 = child-2
+    const ids = __resumableChildIdsForTests("P1");
+    expect(ids).toContain("child-1");
+    expect(ids).not.toContain("child-2");
+  });
+});
+
+describe("withNativeTaskDisabled / formatSubagentTrailer", () => {
+  it("补上 task；已有的保留、不重复、不改入参", () => {
+    expect(withNativeTaskDisabled(undefined)).toEqual(["task"]);
+    expect(withNativeTaskDisabled([])).toEqual(["task"]);
+    const src = ["shell"] as never[];
+    expect(withNativeTaskDisabled(src)).toEqual(["shell", "task"]);
+    expect(src).toEqual(["shell"]);
+    expect(withNativeTaskDisabled(["task", "shell"] as never[])).toEqual(["task", "shell"]);
+  });
+
+  it("尾注：带 id、模型（含思考档）、resume 用法；没模型 = SDK 默认", () => {
+    const t = formatSubagentTrailer({
+      agentId: "agent-9",
+      model: { id: "m", params: [{ id: "effort", value: "high" }] },
+    });
+    expect(t).toContain("agent-9");
+    expect(t).toContain("m (effort=high)");
+    expect(t).toContain('resume="agent-9"');
+    expect(formatSubagentTrailer({ agentId: "a" })).toContain("SDK 默认模型");
+  });
+});
+
+describe("attach：登记父会话模型（卡片徽标用）", () => {
+  it("attach 返回的（被包装的）父 agent 能查到父模型；原对象 / 别的对象查不到", () => {
+    const { deps } = makeDeps();
+    const link = createCursorSubagentLink(deps);
+    const raw = parentOf("P1");
+    const wrapped = link.attach(raw);
+    expect(getSubagentParentModel(wrapped)).toEqual(deps.parentModel);
+    expect(getSubagentParentModel(raw)).toBeUndefined();
+    expect(getSubagentParentModel(parentOf("P2"))).toBeUndefined();
+    expect(getSubagentParentModel(undefined)).toBeUndefined();
+    expect(getSubagentParentModel("str")).toBeUndefined();
+  });
+
+  it("父会话没显式选模型：查到的是 undefined（但不抛）", () => {
+    const { deps } = makeDeps();
+    const link = createCursorSubagentLink({ ...deps, parentModel: undefined });
+    expect(getSubagentParentModel(link.attach(parentOf("P1")))).toBeUndefined();
   });
 });

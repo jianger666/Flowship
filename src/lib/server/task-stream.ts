@@ -12,6 +12,7 @@
  * 跨进程状态挂 globalThis（避免 Next.js dev hot reload 拆 chunk 时分裂）。
  */
 
+import { redactCopyIfHit, redactSecretsInText } from "./event-secret-redact";
 import { appendEvent } from "./task-fs";
 import type { Task, TaskEvent, ActionRecord } from "@/lib/types";
 import type { TaskFieldsSnapshot } from "./task-prompts";
@@ -525,7 +526,51 @@ export const subscribeAllTaskStreams = (
   };
 };
 
-export const publish = (taskId: string, ev: TaskStreamEvent): void => {
+/**
+ * 实时推流前的凭据脱敏（R1-01）：增量帧不经 appendEventLine（瞬时推送 / 延迟合并后才落盘），
+ * agent 读 config.json / company-env.json 取出（或误打印）的 gitToken / apiKey / 公司环境密码会在屏幕上、飞书回流里实时明文显示。
+ * publish 是 SSE（per-task 订阅）与全局 tap（飞书 outbound / 群回流）的唯一扇出点，在这里统一滤。
+ *
+ * - `assistant_delta` / `thinking_delta` / `error`：文本字段精确值替换；
+ * - ephemeral 事件帧（`tool_output_delta`、boot 进度等，id 以 `ephemeral_` 开头）：
+ *   命中才深拷贝脱敏（调用方可能还握着原对象）；
+ * - 落盘事件帧（`event`）已在 appendEventLine 脱敏，这里不重复扫；
+ * - 其余帧（task / action / done …）不是文本流，不处理。
+ * 未命中 / 没配凭据：返回同一个对象，零拷贝。局限见 event-secret-redact.ts 头注释
+ *（token 被切在两个相邻增量帧里时单帧无法匹配）。
+ */
+const redactStreamEvent = (ev: TaskStreamEvent): TaskStreamEvent => {
+  switch (ev.kind) {
+    case "assistant_delta":
+    case "thinking_delta": {
+      const text = redactSecretsInText(ev.text);
+      return text === ev.text ? ev : { ...ev, text };
+    }
+    case "error": {
+      const message = redactSecretsInText(ev.message);
+      return message === ev.message ? ev : { ...ev, message };
+    }
+    case "event": {
+      const e = ev.event;
+      if (e.kind !== "tool_output_delta" && !e.id.startsWith("ephemeral_")) {
+        return ev;
+      }
+      const safe = redactCopyIfHit(e);
+      return safe === e ? ev : { ...ev, event: safe };
+    }
+    default:
+      return ev;
+  }
+};
+
+export const publish = (taskId: string, rawEv: TaskStreamEvent): void => {
+  // 脱敏失败绝不能挡推流（凭据文件读不到时 redact 内部已吞错；这里兜底防意外抛出）
+  let ev = rawEv;
+  try {
+    ev = redactStreamEvent(rawEv);
+  } catch (err) {
+    console.error("[task-stream] 推流脱敏失败、按原帧推送:", err);
+  }
   const set = subscribers.get(taskId);
   if (set && set.size > 0) {
     for (const listener of set) {

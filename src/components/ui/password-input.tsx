@@ -41,6 +41,8 @@ export const PasswordInput = ({
           className="size-8 shrink-0"
           onClick={() => setShow((s) => !s)}
           tabIndex={-1}
+          aria-label={show ? "隐藏密码" : "显示密码"}
+          aria-pressed={show}
         >
           {show ? <EyeOff /> : <Eye />}
         </Button>

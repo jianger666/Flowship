@@ -84,6 +84,23 @@ export const runBootWarmup = (): void => {
       );
     });
 
+  // 可信 GitLab host 首次绑定（TOFU，见 trusted-git-host.ts）：本进程里还没有任何 agent 跑过，
+  // 是升级用户（已配 token、从没固定过）最早的可信时机——从设置里各仓 origin 推 host 固定下来。
+  // 已固定 / 配了 gitHostAllowlist / 多仓分属不同实例 → 内部直接跳过；失败只 warn、不阻断。
+  // 放在组共享库 sync 之前触发：两者互不依赖，但固定越早越好。
+  void Promise.all([import("./settings-fs"), import("./gitlab-host")])
+    .then(async ([settingsFs, gitlabHost]) => {
+      const result = await settingsFs.readSettingsFile();
+      if (result.status !== "ok") return;
+      await gitlabHost.pinTrustedGitHostFromSettings(result.settings, "boot");
+    })
+    .catch((err) => {
+      console.warn(
+        "[boot-warmup] 固定可信 GitLab host 失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+
   // 组共享库：启动自动 sync（没配 gitToken 内部静默跳过；失败只 warn）
   void import("./team-library")
     .then((m) => m.syncTeamLibrary({ silentWithoutToken: true }))

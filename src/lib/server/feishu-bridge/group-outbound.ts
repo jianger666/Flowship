@@ -40,6 +40,7 @@ import {
   isAskToGroupEnabled,
   isFeishuChatBridgeEnabled,
 } from "./bridge-config";
+import { parseAskVoidMarker, settleAskCardsOnVoidMarker } from "./ask-stale";
 import { rememberAskCard } from "./card-map";
 import { buildGroupAskCardJson } from "./group-ask-card";
 import type { GroupMember } from "./group-contract";
@@ -50,6 +51,7 @@ import {
   claimGroupArtifactCard,
   closeGroupReplySegment,
   finalGroupReplyText,
+  groupQuestionQueueLength,
   hasGroupReplies,
   mentionTag,
   peekGroupReply,
@@ -182,6 +184,59 @@ export const __setGroupOutboundDepsForTest = (
   deps = partial ? { ...defaultDeps(), ...partial } : defaultDeps();
   // 换了依赖 = 缓存里那个值来自上一套 mock，必须作废
   bridgeEnabledCache = null;
+};
+
+// ----------------- done 后的排空重试 -----------------
+
+/**
+ * done 帧上 pump 撞见「还在忙」时的短延迟重试间隔（逐次补一圈，用完即止）。
+ *
+ * 为什么需要：task-runner 先 publish done、**之后**才 `await finalizeOpenToolCalls` 并 `runningTasks.delete`，
+ * 而 pump 判「忙」用的是 `runningTasks.has(id) || runStatus === "running"`——done 帧上立刻 pump，
+ * 多半落在这个收尾窗口里：队首被静默放回，之后没有任何帧再触发排空，排队的同事只能等下一条群 @
+ * 或 30 分钟后收到「超时作废」。这里不去改 task-runner 的收尾顺序（它牵着一堆 lease / 闩锁语义），
+ * 只在出向侧补几次重试把窗口盖住；真有新 run 接着跑就一直忙，重试用完即停、等那个 run 自己的 done。
+ */
+export const GROUP_PUMP_RETRY_DELAYS_MS = [300, 1_200, 4_000] as const;
+
+/** 有重试链在跑的 task（同一 task 同时只留一条链，连着来的 done 帧不堆定时器） */
+const pumpRetryActive = new Set<string>();
+const pumpRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+const armPumpRetries = (taskId: string): void => {
+  if (pumpRetryActive.has(taskId)) return;
+  if (groupQuestionQueueLength(taskId) === 0) return;
+  pumpRetryActive.add(taskId);
+  let step = 0;
+  const arm = (): void => {
+    const timer = setTimeout(() => {
+      pumpRetryTimers.delete(taskId);
+      void (async () => {
+        try {
+          await deps.pumpGroupQuestionQueue(taskId);
+        } catch (err) {
+          // 排空失败不抛：下一圈 / 下一个 done 帧还会再来
+          console.warn(`${LOG} done 后排空重试失败 task=${taskId}：`, err);
+        }
+        step += 1;
+        if (step < GROUP_PUMP_RETRY_DELAYS_MS.length && groupQuestionQueueLength(taskId) > 0) {
+          arm();
+        } else {
+          pumpRetryActive.delete(taskId);
+        }
+      })();
+    }, GROUP_PUMP_RETRY_DELAYS_MS[step]);
+    // 不拦进程退出
+    timer.unref?.();
+    pumpRetryTimers.set(taskId, timer);
+  };
+  arm();
+};
+
+const clearPumpRetries = (): void => {
+  for (const timer of pumpRetryTimers.values()) clearTimeout(timer);
+  pumpRetryTimers.clear();
+  pumpRetryActive.clear();
 };
 
 // ----------------- ask 卡发群 -----------------
@@ -822,9 +877,28 @@ export const handleGroupOutboundEvent = async (
 ): Promise<void> => {
   try {
     const isAsk = ev.kind === "event" && ev.event.kind === "ask_user_request";
-    // 相关性预筛（同步、零 IO）：除 ask 外，只有「有登记等着回群」的任务才需要处理。
+    // ask 作废标记（取消 / 顶替 / 停止 / 重启 / 过期 / 跳过都会写）：旧卡要跟着置终态（M5-03）。
+    // 放在本 tap 而不是 chat-pending / runner：标记事件本来就经 writeEventAndPublish fanout 到这里，
+    // 不动 ask 登记的原子摄取状态机；而且本 tap 同时覆盖 chat / task 两种任务、与有没有群无关
+    // （私聊流式卡的承载卡也由同一个收口点按 card-map 反查）
+    const isAskVoid =
+      ev.kind === "event" && parseAskVoidMarker(ev.event) !== null;
+    // 相关性预筛（同步、零 IO）：除 ask / 作废标记外，只有「有登记等着回群」的任务才需要处理。
     // assistant_delta 是每 token 一发的高频事件——绝不能每条都去读一次 config.json。
-    if (!isAsk && !hasGroupReplies(taskId)) return;
+    // 例外（G3-01）：群问题排队非空时 done / task / action 帧也算相关。排队的非属主问题
+    // 不建回群登记、属主在 app 里发起的 run 也没有登记——只认登记的话，这些 run 一结束
+    // 就没人触发排空，排队的同事要等下一条群 @ 或 30 分钟后收到「超时作废」。
+    // 只放行这三种低频的终态 / 进展帧；assistant_delta / event 仍被预筛拦掉（每 token 一发）。
+    const isPumpFrame =
+      ev.kind === "done" || ev.kind === "task" || ev.kind === "action";
+    if (
+      !isAsk &&
+      !isAskVoid &&
+      !hasGroupReplies(taskId) &&
+      !(isPumpFrame && groupQuestionQueueLength(taskId) > 0)
+    ) {
+      return;
+    }
     // 桥接总开关关掉时整条群链不跑（与 p2p 出向同口径）；带 8s 缓存、别每个 delta 读盘
     if (!(await isBridgeEnabledCached())) return;
 
@@ -844,7 +918,12 @@ export const handleGroupOutboundEvent = async (
       } finally {
         // 上一轮答完 → 泵排队（空队秒回；还忙就放回队首等下一轮）。
         // 放 finally：回群发送炸了也不能把排队饿死（外层整段吞异常）。
-        await deps.pumpGroupQuestionQueue(taskId);
+        try {
+          await deps.pumpGroupQuestionQueue(taskId);
+        } finally {
+          // pump 此刻多半还撞在 task-runner 的收尾窗口里（见 GROUP_PUMP_RETRY_DELAYS_MS）：队列没清空就补重试
+          armPumpRetries(taskId);
+        }
       }
       return;
     }
@@ -863,6 +942,12 @@ export const handleGroupOutboundEvent = async (
 
     if (ev.event.kind === "ask_user_request") {
       await handleAskUserRequest(taskId, ev.event.meta);
+      return;
+    }
+    if (isAskVoid) {
+      await settleAskCardsOnVoidMarker(taskId, ev.event, (id) =>
+        deps.getTask(id),
+      );
       return;
     }
     // 本 run 又调了工具 → 当前段收成「上一段」，答案只认最后一次工具调用之后的文字。
@@ -931,6 +1016,7 @@ export const __resetGroupOutboundForTest = (): void => {
   reg.unsub = null;
   reg.registered = false;
   reg.chains.clear();
+  clearPumpRetries();
   setGroupAdvanceExpiryHandler(null);
   setGroupQuestionDroppedHandler(null);
   bridgeEnabledCache = null;

@@ -1,8 +1,9 @@
 /**
- * GET /api/skills/content?name=<n>&source=<optional>
+ * GET /api/skills/content?name=<n>&source=<optional>&repo=<optional>
  * → 读已知来源 skill 的 SKILL.md 全文（编辑 dialog + 只读详情共用）
  *
  * source 可选：同名多来源时消歧；不传则取 listSkillsWithSource 首个命中。
+ * repo 可选：多个仓有同名项目级 skill 时指定仓根（必须是设置里已登记的仓，查不到即 404）。
  * 名字必须落在已知列表内——防任意路径读。
  */
 
@@ -37,7 +38,8 @@ export const GET = async (req: Request) => {
     }
     source = rawSource as SkillSource;
   }
-  const content = await readSkillContentByName(name, source);
+  const repo = url.searchParams.get("repo")?.trim() || undefined;
+  const content = await readSkillContentByName(name, source, repo);
   if (content === null) {
     return errorResponse(
       source

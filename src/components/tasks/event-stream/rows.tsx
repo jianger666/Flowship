@@ -38,7 +38,11 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip } from "@/components/ui/tooltip";
 import { Textarea } from "@/components/ui/textarea";
-import { MARKDOWN_REPLY_TEXT, MarkdownText } from "@/components/markdown-text";
+import {
+  MARKDOWN_LOG_REPLY_TEXT,
+  MARKDOWN_REPLY_TEXT,
+  MarkdownText,
+} from "@/components/markdown-text";
 import { SearchHighlightText } from "@/components/ui/search-highlight-text";
 import {
   isCompactionInfo,
@@ -75,6 +79,7 @@ import {
 import { formatDurationPrecise } from "@/lib/duration-display";
 import { cleanGroupQuestionText } from "@/lib/group-qa";
 import { getIdeAnchorProps } from "@/lib/ide-open";
+import { isImeComposing } from "@/lib/ime";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { pathBasename } from "@/lib/path-utils";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
@@ -161,10 +166,10 @@ const StreamingAssistantRowImpl = ({
         <span>AI 回复中…</span>
       </div>
       {/* 流式过程按 markdown 渲染、Streamdown 未闭合块平滑处理；
-          字号 / 行高跟正式 AI 回复同一档（size="reply"，收尾换成正式行时不跳） */}
-      <div className={MARKDOWN_REPLY_TEXT}>
+          字号 / 行高跟正式 AI 回复同一档（log 右栏窄 = 14px / 24px，收尾换成正式行时不跳） */}
+      <div className={MARKDOWN_LOG_REPLY_TEXT}>
         <MarkdownText
-          size="reply"
+          size="default"
           text={text}
           streaming
           baseDir={baseDir}
@@ -503,6 +508,9 @@ export const PendingLocalReplyRow = memo(
                 autoFocus
                 disabled={saving}
                 onKeyDown={(e) => {
+                  // 输入法选词期间的 Enter / Esc 归输入法：Enter 是「选定候选词」不是保存，
+                  // Esc 是「取消组合」不是放弃编辑（误判会把没打完的消息直接存走 / 丢掉）
+                  if (isImeComposing(e)) return;
                   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                     e.preventDefault();
                     save();
@@ -547,6 +555,7 @@ const EventRowImpl = ({
   task,
   variant = "log",
   onResend,
+  onEditInPlace,
   onRegenerate,
   onRewind,
   onQuote,
@@ -560,10 +569,23 @@ const EventRowImpl = ({
   variant?: "log" | "chat";
   // v1.0：chat「最后一条用户消息」的重发 / 原地编辑（手动停止 / 断网后想改一下重说）——
   // hover 出两个 icon：↻ 原样重发、✎ 原地编辑后发；都是「发一条新消息到末尾」（架构是
-  // 持久会话 append-only、做不了 ChatGPT 那种 fork 截断）；只有最后一条用户消息才传（父组件把关）
+  // 持久会话 append-only、做不了 ChatGPT 那种 fork 截断）；只有最后一条用户消息才传（父组件把关）。
+  // 〔更新〕chat 现在另有 onEditInPlace（下）：编辑任意一条、替换这条及之后的对话；本 prop 只剩「原样重发」
+  // 与没接 onEditInPlace 时的旧编辑语义
   // 第二参 sourceEv：重发时带回原 meta.images / attachments（批 B）
   // 返回 false = 发送失败（编辑态保持）；true / void = 成功可关编辑
   onResend?: (
+    text: string,
+    sourceEv?: TaskEvent,
+  ) => boolean | void | Promise<boolean | void>;
+  /**
+   * chat 任意一条用户消息的「原地编辑」（Codex / Cursor IDE 式）：编辑后这条消息及之后的对话被
+   * 替换、从这里重新跑（父组件负责 确认 → 停当前回复 → 回退 → 发送）。
+   * 传了它：编辑入口对每条用户消息都出现、编辑态的「发送」走它；没传：退回 onResend 的旧语义
+   * （只有最后一条、编辑后作为新消息追加到末尾、原消息保留）。
+   * 返回 false = 没成功（编辑态保持）；true / void = 成功。
+   */
+  onEditInPlace?: (
     text: string,
     sourceEv?: TaskEvent,
   ) => boolean | void | Promise<boolean | void>;
@@ -622,24 +644,32 @@ const EventRowImpl = ({
     }
   };
 
+  // 编辑入口：优先原地编辑（任意一条用户消息）；没有就退回「编辑后追加」（只有最后一条）
+  const editHandler = onEditInPlace ?? onResend;
+
   // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留
   useEffect(() => {
-    if (!onResend) setEditing(false);
-  }, [onResend]);
+    if (!editHandler) setEditing(false);
+  }, [editHandler]);
 
-  const runResend = async (
+  const runHandler = async (
+    handler: typeof onResend,
     text: string,
     sourceEv?: TaskEvent,
   ): Promise<boolean> => {
-    if (!onResend || resendLockRef.current) return false;
+    if (!handler || resendLockRef.current) return false;
     resendLockRef.current = true;
     try {
-      const result = await onResend(text, sourceEv);
+      const result = await handler(text, sourceEv);
       return result !== false;
     } finally {
       resendLockRef.current = false;
     }
   };
+  const runResend = (text: string, sourceEv?: TaskEvent) =>
+    runHandler(onResend, text, sourceEv);
+  const runEdit = (text: string, sourceEv?: TaskEvent) =>
+    runHandler(editHandler, text, sourceEv);
 
   // 附件 chip 的跳转 IDE（设置页可切 Cursor / IDEA）
   const jumpIde = useJumpIde();
@@ -839,7 +869,11 @@ const EventRowImpl = ({
       return (
         <div
           ref={assistantContainerRef}
-          className={cn(MESSAGE_ACTION_HOST, MARKDOWN_REPLY_TEXT)}
+          className={cn(
+            MESSAGE_ACTION_HOST,
+            // chat 宽列 15px / 28px；task(log) 右栏窄 14px / 24px（流式占位同档，收尾不跳）
+            isLog ? MARKDOWN_LOG_REPLY_TEXT : MARKDOWN_REPLY_TEXT,
+          )}
           onMouseUp={onAssistantMouseUp}
         >
           {isLog && (
@@ -877,7 +911,7 @@ const EventRowImpl = ({
                 />
               )}
               <MarkdownText
-                size="reply"
+                size={isLog ? "default" : "reply"}
                 text={ev.text}
                 baseDir={markdownBaseDir}
                 searchOwnerId={ev.id}
@@ -892,15 +926,16 @@ const EventRowImpl = ({
     // 用户消息：右对齐实心气泡 + 附件；最后一条 hover 右上角出「重发 / 编辑」两 icon（v1.0）
     if (isUser) {
       // 原地编辑态：气泡整体换成 textarea + 取消 / 发送（对齐 ChatGPT / Claude 的编辑交互；
-      // 语义是「编辑后作为新消息发到末尾」、原消息保留、不是 fork）
-      if (editing && onResend) {
+      // 语义是「编辑后作为新消息发到末尾」、原消息保留、不是 fork；
+      // 〔更新〕父组件传了 onEditInPlace 时改为「替换这条及之后的对话」，见 editHandler）
+      if (editing && editHandler) {
         const trimmed = editDraft.trim();
         const submitEdit = () => {
           if (!trimmed || editSubmitting) return;
           setEditSubmitting(true);
           void (async () => {
             try {
-              const ok = await runResend(trimmed, ev);
+              const ok = await runEdit(trimmed, ev);
               if (ok) setEditing(false);
             } finally {
               setEditSubmitting(false);
@@ -986,10 +1021,12 @@ const EventRowImpl = ({
                 label: "原样重发这条消息",
                 onClick: () => void runResend(ev.text, ev),
               },
-              onResend && {
+              editHandler && {
                 key: "edit",
                 icon: <PencilLine className="size-3" />,
-                label: "编辑后重发（原消息保留）",
+                label: onEditInPlace
+                  ? "编辑（之后的对话会被替换）"
+                  : "编辑后重发（原消息保留）",
                 onClick: () => {
                   setEditDraft(ev.text);
                   setEditing(true);

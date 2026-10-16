@@ -20,6 +20,12 @@ import type {
   UserRole,
 } from "./types";
 import { migrateProviderSettings } from "./agent-provider";
+import { sanitizeRepoShellCommand } from "./repo-shell-command";
+import {
+  SettingsUnreadableError,
+  parseSettingsUnreadable,
+  type SettingsUnreadable,
+} from "./settings-unreadable";
 import {
   emptyActionLayout,
   normalizeCollapsedGroups,
@@ -195,9 +201,13 @@ export const normalizeSettings = (
     .filter((r): r is NonNullable<typeof r> & object => !!r && typeof r === "object")
     .map((r) => {
       // 只读 / 脚本仓开关：只认显式 true、其它（缺省 / 脏值）当关
-      const row = r as FeAiFlowSettings["repos"][number];
+      const row = { ...(r as FeAiFlowSettings["repos"][number]) };
+      // setupCommand 单行 / 限长归一（previewCommand 保持原样、不动）
+      const setupCommand = sanitizeRepoShellCommand(row.setupCommand);
+      delete row.setupCommand;
       return {
         ...row,
+        ...(setupCommand !== undefined ? { setupCommand } : {}),
         readonly: row.readonly === true ? true : undefined,
         scriptRepo: row.scriptRepo === true ? true : undefined,
       };
@@ -291,12 +301,30 @@ let initPromise: Promise<void> | null = null;
 // 最近一次 init 是否成功灌过权威 config.json。
 // 失败时 cache 保持 DEFAULT_SETTINGS——禁止用它整对象 PUT 覆盖磁盘。
 let initSucceeded = false;
+// 最近一次 init 是否因 config.json 不可读（GET /full 返回 500 settings_unreadable）失败，及其 reason。
+// 设置页据此显示明确错误、暂停保存，而不是一份会误导人的空表单；init 成功 / 换了别的失败则清空。
+// 只管读取阶段：运行中途某次 PUT 才撞上 unreadable 可能是瞬时错误，不在这里记粘性状态。
+let loadUnreadable: SettingsUnreadable | null = null;
+
+export const getSettingsUnreadable = (): SettingsUnreadable | null =>
+  loadUnreadable;
 
 // 同步读缓存（签名不变、prepareRunArgs 等 9 处调用方一律不用改）
 export const getSettings = (): FeAiFlowSettings => cache;
 
+/** PUT /api/settings 收到非 2xx：携带 HTTP 状态码（message 仍是服务端的 error 文案 / `HTTP <状态码>`，保持 `instanceof Error` 兼容） */
+class SettingsPutError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "SettingsPutError";
+    this.status = status;
+  }
+}
+
 /**
  * PUT config.json（CR-08：非 2xx 一律 throw——原实现 500 也静默当成功、重启后修改凭空消失）。
+ * 抛出的 SettingsPutError 带状态码，saveSettingsDetailed 据此让设置页区分「重试可能成功」与「被拒绝」。
  * 响应里的 settings 脱敏后不再需要回填 mcpServers（server 不再在 PUT 后改写该字段）。
  */
 const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
@@ -313,7 +341,7 @@ const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
     } catch {
       // 错误体不是 JSON、用状态码兜底
     }
-    throw new Error(message);
+    throw new SettingsPutError(message, res.status);
   }
 };
 
@@ -341,12 +369,16 @@ export const initSettings = (): Promise<void> => {
       // 非 2xx（含 500 settings_unreadable）必须 throw——不得用默认值整包 PUT 覆盖磁盘
       if (!res.ok) {
         let detail = `HTTP ${res.status}`;
+        let errBody: { error?: string } | null = null;
         try {
-          const errBody = (await res.json()) as { error?: string };
-          if (errBody?.error) detail = errBody.error;
+          errBody = (await res.json()) as { error?: string } | null;
         } catch {
           // 错误体非 JSON、用状态码兜底
         }
+        // config.json 损坏 / 读不了：单独成类，catch 里据此记状态（reason 服务端保证不含文件内容）
+        const unreadable = parseSettingsUnreadable(errBody);
+        if (unreadable) throw new SettingsUnreadableError(unreadable.reason);
+        if (errBody?.error) detail = errBody.error;
         throw new Error(`GET ${API_FULL} ${detail}`);
       }
       const data = (await res.json()) as {
@@ -364,6 +396,7 @@ export const initSettings = (): Promise<void> => {
         throw new Error("GET full settings 响应形状异常（缺 exists）");
       }
       initSucceeded = true;
+      loadUnreadable = null;
     } catch (err) {
       console.warn(
         "[local-store] config.json 初始化失败、暂用默认设置、下次再试",
@@ -372,6 +405,9 @@ export const initSettings = (): Promise<void> => {
       // 失败态：cache 回到默认拷贝、拒绝后续整对象 PUT
       cache = cloneDefaultSettings();
       initSucceeded = false;
+      // 只有「config.json 不可读」才记状态；网络 / 其它失败不误报成它
+      loadUnreadable =
+        err instanceof SettingsUnreadableError ? { reason: err.reason } : null;
       initPromise = null; // 失败清空、允许下次重试
     }
   })();
@@ -381,20 +417,29 @@ export const initSettings = (): Promise<void> => {
 // CR-08：客户端写队列——连续快速保存串行落盘、后发请求不可能被先发的整对象覆盖
 let writeQueue: Promise<void> = Promise.resolve();
 
+export interface SaveSettingsResult {
+  ok: boolean;
+  /**
+   * 失败时服务端的 HTTP 状态码：4xx = 服务端明确拒绝（重试没有意义），5xx = 写盘失败 / 暂时不可读（可能重试成功）。
+   * 网络断 / 超时 / 初始化未成功这类没有响应的失败没有它。
+   */
+  status?: number;
+}
+
 /**
- * 写设置（CR-08 起 async：await 权威文件 config.json 写成功才算成功）
- *
- * @returns true=服务端 config.json 落盘成功；false=写失败（500 / 网络断 / 磁盘只读）。
- *          调用方据此决定是否把字段标成「已保存」+ toast。
- *          内存 cache 同步更新（乐观、getSettings 立即可读）。
+ * 写设置（CR-08 起 async：await 权威文件 config.json 写成功才算成功），失败时带上 HTTP 状态码。
+ * 设置页的自动重试要靠它区分「重试可能成功」（5xx / 网络错误）和「重试永远不会成功」（400 这类校验被拒）。
+ * 内存 cache 同步更新（乐观、getSettings 立即可读），失败回滚。
  */
-export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => {
+export const saveSettingsDetailed = async (
+  next: FeAiFlowSettings,
+): Promise<SaveSettingsResult> => {
   // 乐观更新前记下旧 cache；PUT 失败时回滚，避免内存与磁盘分叉
   const prev = cache;
   cache = next;
-  if (!isBrowser()) return false;
-  // 初始化未成功时先重试一次真实 GET；仍失败则拒绝 PUT（返 false，
-  // 调用方如 use-settings 已有 toast.error——保持 Promise<boolean> 签名、不抛错）
+  if (!isBrowser()) return { ok: false };
+  // 初始化未成功时先重试一次真实 GET；仍失败则拒绝 PUT（返失败、不带状态码，
+  // 调用方如 use-settings 已有 toast.error——不抛错）
   if (!initSucceeded) {
     await initSettings();
     if (!initSucceeded) await initSettings(); // 再试一次（失败会清空 initPromise）
@@ -404,7 +449,7 @@ export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => 
       );
       // 仍是本次乐观值才回滚（并发后续 save 已覆盖则不动）
       if (cache === next) cache = prev;
-      return false;
+      return { ok: false };
     }
     // 重试成功后 init 可能用服务端值盖掉了 cache——写回用户本次意图再落盘
     cache = next;
@@ -418,13 +463,24 @@ export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => 
   );
   try {
     await attempt;
-    return true;
+    return { ok: true };
   } catch (err) {
     console.error("[local-store] 写 config.json 失败", err);
     if (cache === next) cache = prev;
-    return false;
+    return { ok: false, status: err instanceof SettingsPutError ? err.status : undefined };
   }
 };
+
+/**
+ * 写设置（CR-08 起 async：await 权威文件 config.json 写成功才算成功）
+ *
+ * @returns true=服务端 config.json 落盘成功；false=写失败（500 / 网络断 / 磁盘只读）。
+ *          调用方据此决定是否把字段标成「已保存」+ toast。
+ *          内存 cache 同步更新（乐观、getSettings 立即可读）。
+ *          需要区分失败原因（要不要自动重试）的调用方用 saveSettingsDetailed。
+ */
+export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> =>
+  (await saveSettingsDetailed(next)).ok;
 
 // ----------------- 每提供方常用模型（下拉里点星钉住、最多 2 个） -----------------
 

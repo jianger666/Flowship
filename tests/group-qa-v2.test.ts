@@ -13,6 +13,7 @@ import {
   buildGroupQaSummaryEvent,
   collectGroupQaRounds,
   collectGroupRunSteps,
+  GROUP_QA_ANSWERING_RECENT_MS,
   GROUP_QA_NEEDS_OWNER_RECENT_MS,
   GROUP_RUN_META_KEY,
   GROUP_RUN_STEPS_LIMIT,
@@ -507,5 +508,108 @@ describe("collectGroupRunSteps（查看过程）", () => {
     expect(collectGroupRunSteps(events, "")).toEqual({ steps: [], total: 0 });
     expect(collectGroupRunSteps(events, "zzz")).toEqual({ steps: [], total: 0 });
     expect(collectGroupRunSteps([], "a")).toEqual({ steps: [], total: 0 });
+  });
+});
+
+// G4-01：有问无答轮次的 round.key 必须就是 runTag——卡片「查看过程」拿 round.key 当 runTag 过滤
+// meta.groupRun，key 一旦是别的形状（曾是 `open-<事件id>`）就永远匹配不上。
+// 用真实形态的事件序列：问题 = group-route 写的 user_reply（meta.restrictedRunTag）、
+// 过程事件 = 旁路 run 经 writeOwnedEventAndPublish 落盘（meta.groupRun = 同一个 runTag）。
+describe("有问无答轮次的「查看过程」（G4-01）", () => {
+  const RUN = "grp_tok_open_1";
+  const question = (id: string, ts: number, runTag: string) =>
+    ev({
+      kind: "user_reply",
+      id,
+      ts,
+      text: '[群消息·来自 李四（非任务所有者）]——只答疑\n<at user_id="ou_bot"></at> 埋点查了吗',
+      meta: {
+        source: "feishu_group",
+        feishuMessageId: `om_${id}`,
+        groupChatId: "oc_x",
+        groupSender: "李四",
+        groupSenderOpenId: "ou_li",
+        restrictedRunTag: runTag,
+      },
+    });
+  const proc = (
+    id: string,
+    ts: number,
+    kind: TaskEvent["kind"],
+    runTag: string,
+    text: string,
+    meta: Record<string, unknown> = {},
+  ) => ev({ kind, id, ts, text, meta: { groupRun: runTag, ...meta } });
+  /** 一轮旁路 run 的过程：旁白 + 一次 Shell 调用（含 tool_result 与 thinking 这两类不列的） */
+  const processOf = (runTag: string, t0: number): TaskEvent[] => [
+    proc(`${runTag}_th`, t0 + 1, "thinking", runTag, "想一想"),
+    proc(`${runTag}_a1`, t0 + 2, "assistant_message", runTag, "我先查一下埋点"),
+    proc(`${runTag}_tc`, t0 + 3, "tool_call", runTag, "调用 Shell:ls", {
+      callId: "c1",
+      name: "Shell",
+      args: JSON.stringify({ command: "ls src" }),
+    }),
+    proc(`${runTag}_tr`, t0 + 4, "tool_result", runTag, "a.ts", { callId: "c1" }),
+  ];
+
+  it("进行中（近 30 分钟、没汇总）：用 round.key 能取到过程步骤", () => {
+    const t0 = NOW - 60_000;
+    const events = [question("q1", t0, RUN), ...processOf(RUN, t0)];
+    const rounds = collectGroupQaRounds(events, NOW);
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0]).toMatchObject({ answering: true, legacy: false });
+    const { steps, total } = collectGroupRunSteps(events, rounds[0]!.key);
+    expect(total).toBe(2);
+    expect(steps.map((s) => [s.kind, s.tool, s.text])).toEqual([
+      ["reply", undefined, "我先查一下埋点"],
+      ["tool", "Shell", "ls src"],
+    ]);
+  });
+
+  it("被打断 / 汇总缺失（陈旧、没汇总）：同样能看到过程", () => {
+    const t0 = NOW - GROUP_QA_ANSWERING_RECENT_MS - 5_000;
+    const events = [question("q2", t0, RUN), ...processOf(RUN, t0)];
+    const rounds = collectGroupQaRounds(events, NOW);
+    expect(rounds[0]).toMatchObject({ answering: false, ok: false, answerText: "" });
+    expect(collectGroupRunSteps(events, rounds[0]!.key).total).toBe(2);
+  });
+
+  it("汇总落地后 key 不变：同一轮从「回答中」到「已答」展开状态 / DOM id 不丢", () => {
+    const t0 = NOW - 60_000;
+    const open = [question("q3", t0, RUN), ...processOf(RUN, t0)];
+    const before = collectGroupQaRounds(open, NOW);
+    const after = collectGroupQaRounds(
+      [
+        ...open,
+        asEvent({
+          runTag: RUN,
+          askerOpenId: "ou_li",
+          askerName: "李四",
+          answer: "查了，都上报了",
+          ok: true,
+        }),
+      ],
+      NOW,
+    );
+    expect(after).toHaveLength(1);
+    expect(after[0]!.key).toBe(before[0]!.key);
+    expect(collectGroupRunSteps(open, after[0]!.key).total).toBe(2);
+  });
+
+  it("多轮并存：每轮 key 各自等于自己的 runTag，过程互不串", () => {
+    const t0 = NOW - 120_000;
+    const events = [
+      question("qa", t0, "tokA"),
+      ...processOf("tokA", t0),
+      question("qb", t0 + 10_000, "tokB"),
+      proc("tokB_a1", t0 + 10_001, "assistant_message", "tokB", "B 的旁白"),
+    ];
+    const rounds = collectGroupQaRounds(events, NOW);
+    expect(rounds.map((r) => r.key).sort()).toEqual(["tokA", "tokB"]);
+    expect(collectGroupRunSteps(events, "tokA").total).toBe(2);
+    const b = rounds.find((r) => r.key === "tokB")!;
+    expect(collectGroupRunSteps(events, b.key).steps.map((s) => s.text)).toEqual([
+      "B 的旁白",
+    ]);
   });
 });

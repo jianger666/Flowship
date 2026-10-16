@@ -306,11 +306,14 @@ describe("task(log) 与 chat 对话外观统一", () => {
     );
     expect(streaming).not.toContain("border-info");
     expect(streaming).not.toContain("bg-info/5");
-    // chat / log 两个分支各一处：外层 wrapper 走共享常量，且各自的 MarkdownText 传 size="reply"——
+    // chat / log 两个分支各一处：外层 wrapper 走共享常量（chat 15px、log 右栏 14px），
+    // MarkdownText 各自传同档的 size（chat reply / log default）——
     // 字号必须落在 prose 元素上（只包外层 div 会被 prose-sm 盖掉，详见 markdown-reply-size-contract），
     // 保证收尾换成正式行时文字不跳
-    expect(countOf(streaming, "className={MARKDOWN_REPLY_TEXT}")).toBe(2);
-    expect(streaming.match(/<MarkdownText\s+size="reply"/g) ?? []).toHaveLength(2);
+    expect(countOf(streaming, "className={MARKDOWN_REPLY_TEXT}")).toBe(1);
+    expect(countOf(streaming, "className={MARKDOWN_LOG_REPLY_TEXT}")).toBe(1);
+    expect(streaming.match(/<MarkdownText\s+size="reply"/g) ?? []).toHaveLength(1);
+    expect(streaming.match(/<MarkdownText\s+size="default"/g) ?? []).toHaveLength(1);
     expect(streaming).toContain("animate-spin text-info");
   });
 
@@ -341,6 +344,14 @@ describe("task(log) 与 chat 对话外观统一", () => {
       "});",
     );
     expect(facts).toContain("talk: isConversational(it)");
+    // 组间分隔线要的两个事实：AI 平铺正文（含流式）/ 用户这一侧的话（气泡 + 待发送 + 提问卡）
+    expect(facts).toContain(
+      'aiText: isStreamingItem(it) || it.kind === "assistant_message"',
+    );
+    for (const kind of ['"user_reply"', '"ask_user_request"']) {
+      expect(facts).toContain(kind);
+    }
+    expect(facts).toContain("isPendingLocalItem(it)");
     for (const kind of [
       '"__work_group__"',
       '"__tool_block__"',
@@ -348,6 +359,31 @@ describe("task(log) 与 chat 对话外观统一", () => {
     ]) {
       expect(facts).toContain(kind);
     }
+  });
+
+  it("组间分隔线接线：tier / facts 只算一次、线落在留白正中、两端渐隐（不是整宽实线）、纯装饰不拦指针", () => {
+    const wrapper = between(
+      eventStream,
+      "itemContent={(absIdx, item) => {",
+      // 源码已去注释：wrapper + 分隔线 + A3 轮次胶囊都在这一段里，到各行渲染分发（流式行）为止
+      "{isStreamingItem(item) ? (",
+    );
+    // 同一份 tier 同时喂给 padding 和分隔线判定——两边各算一遍迟早会算岔
+    expect(wrapper).toContain("const tier = rhythmTier(idx, facts, prevFacts);");
+    expect(wrapper).toContain("rhythmPaddingTop(variant, tier)");
+    expect(wrapper).toContain(
+      "rhythmShowsGroupDivider(tier, facts, prevFacts)",
+    );
+    // 只有画线的那条才 relative（线是绝对定位、以本容器 padding 盒为基准）
+    expect(wrapper).toContain('showGroupDivider && "relative"');
+    // 线本体：渐隐两端（markdown hr 是整宽实线，用户 2026-07-20 实测「太像」）、不拦指针、对读屏隐藏
+    expect(wrapper).toContain("RHYTHM_GROUP_DIVIDER_TOP");
+    expect(wrapper).toContain(
+      "pointer-events-none absolute h-px bg-gradient-to-r from-transparent via-border to-transparent",
+    );
+    expect(wrapper).toContain("aria-hidden");
+    // 横向与内容区同边距：log px-4、chat px-6
+    expect(wrapper).toContain('isChat ? "inset-x-6" : "inset-x-4"');
   });
 });
 

@@ -11,6 +11,7 @@ import {
   companyEnvToEnvVars,
   emptyCompanyEnv,
   findCompanyEnvServerIssue,
+  findCompanyEnvServerRowIssue,
   isCompanyEnvConfigured,
   normalizeCompanyEnv,
   parseCompanyEnvImport,
@@ -68,6 +69,23 @@ describe("findCompanyEnvServerIssue", () => {
         ...emptyCompanyEnv(),
         servers: [{ env: "", host: "", port: 22, user: "", password: "" }],
       }),
+    ).toBeNull();
+  });
+});
+
+describe("findCompanyEnvServerRowIssue（S13-02：行内提示、不拦保存）", () => {
+  it("已填主机缺 env / user → 对应缺项；空 host 行不提示", () => {
+    expect(
+      findCompanyEnvServerRowIssue({ host: "10.0.0.1", env: "", user: "root" }),
+    ).toBe("missing-env");
+    expect(
+      findCompanyEnvServerRowIssue({ host: "10.0.0.1", env: "test", user: " " }),
+    ).toBe("missing-user");
+    expect(
+      findCompanyEnvServerRowIssue({ host: "", env: "", user: "" }),
+    ).toBeNull();
+    expect(
+      findCompanyEnvServerRowIssue({ host: "h", env: "test", user: "u" }),
     ).toBeNull();
   });
 });

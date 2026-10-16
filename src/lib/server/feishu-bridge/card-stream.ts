@@ -11,6 +11,10 @@
 
 import { getPendingAsk } from "@/lib/server/chat-pending";
 
+import {
+  dropAskCardSettledView,
+  getAskCardSettledView,
+} from "./ask-settle-state";
 import { rememberAskCard, rememberCardMessage } from "./card-map";
 import { flushCardSeqToDisk, nextCardSequence } from "./card-seq";
 import {
@@ -100,6 +104,51 @@ export const askOptionElementId = (
   questionId: string,
   optionId: string,
 ): string => `b${shortHash(`${askId}|${questionId}|${optionId}`)}`;
+
+/**
+ * 这组提问的卡片上**是否渲染选项按钮**——私聊流式卡（buildAskElements）、群答题卡
+ * （group-ask-card.buildGroupAskCardJson）与结算（ask-card-settle）共用的**唯一判据**。
+ *
+ * 为什么抽出来：review P1#5 约定「多题卡不出按钮」（一点即整组提交、未点题会被填「（未回答）」
+ * 误推进）。这条规则原先在两个构造器里各写了一遍 `questions.length === 1`，而结算那头不认它、
+ * 对多题卡也照样往「按钮 id」上发 delete_elements——飞书对不存在的 element_id 行为不可靠
+ *（可能整批 batch_update 报错 → 问题区 / 提示行也没换成终态，卡片停在「等待回答」）。
+ * 三处共用同一个函数 + 契约测试对真实构造器产物对账，规则以后只能改一处。
+ */
+export const askRendersOptionButtons = (
+  questions: ReadonlyArray<unknown>,
+): boolean => questions.length === 1;
+
+/**
+ * 这组提问的卡片上**实际渲染过的**选项按钮 element_id（结算只许删这些）。
+ * 多题卡不渲染按钮 → 空数组；单题卡 → 每个选项一颗。
+ * 与两个构造器的产物逐个 id 对齐由 tests/ask-card-settle-element-contract.test.ts 钉死。
+ */
+export const askRenderedOptionElementIds = (
+  askId: string,
+  questions: ReadonlyArray<{
+    id: string;
+    options?: ReadonlyArray<{ id: string }>;
+  }>,
+): string[] => {
+  if (!askRendersOptionButtons(questions)) return [];
+  return questions.flatMap((q) =>
+    (q.options ?? []).map((opt) => askOptionElementId(askId, q.id, opt.id)),
+  );
+};
+
+/**
+ * 私聊流式卡的答题提示行（「直接回复消息作答」）element_id——终态渲染时换成已答说明。
+ * 导出给 ask-card-settle：置态 patch 必须按「这张卡真有的那个 id」发（群答题卡的提示行
+ * 是 `md_gask_hint`、不是它），见 ask-card-settle.hintElementIdOf。
+ */
+export const ASK_HINT_ELEMENT_ID = "md_ask_hint";
+
+/** appendedElements 的一条：一次 append 的元素；ask 条目额外带原始题目（终态渲染用） */
+type AppendedEntry = {
+  ask?: CardStreamAppendAskOpts;
+  elements: unknown[];
+};
 
 /** 可注入计时器（单测加速） */
 type TimerFn = (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -374,11 +423,12 @@ export const createCardStream = (
    */
   let footerText = "";
   /**
-   * 已通过 batch_update 插入的 ask/retry 元素快照。
-   * 全量 PUT（headerDirty / finalize）必须带上，否则飞书会抹掉按钮（R1-1）。
+   * 已通过 batch_update 插入的 ask/retry 元素快照（按追加顺序，ask 条目带原始题目）。
+   * 全量 PUT（headerDirty / finalize）必须带上，否则飞书会抹掉按钮（R1-1）；
+   * 但 ask 已了结（答完 / 跳过）的条目要渲染成终态、不能把按钮带回来（见 renderAppendedElements）。
    * 非流式模式下 append 只记入此处，finalize 并入整卡。
    */
-  let appendedElements: unknown[] = [];
+  let appendedElements: AppendedEntry[] = [];
 
   /** 自 start 后未 flush 的新增字符数（过程+正文合计增量） */
   let pendingChars = 0;
@@ -446,6 +496,41 @@ export const createCardStream = (
     answerFlushed = canonicalAnswer();
   };
 
+  /**
+   * 把 appendedElements 渲染成整包 PUT 要带的元素。
+   * ask 条目若已被 ask-card-settle 置过终态（app 答 / 飞书点按钮 / 群里打字 / 跳过），
+   * 按终态视图渲染（问题 markdown 带说明、无按钮、提示行换成已答说明）——
+   * 否则整包 PUT 会用 append 时的快照把已 settle 的按钮「复活」，用户能再点一次。
+   */
+  const renderAppendedElements = (): unknown[] | undefined => {
+    if (appendedElements.length === 0) return undefined;
+    const out: unknown[] = [];
+    for (const entry of appendedElements) {
+      const view = entry.ask
+        ? getAskCardSettledView(taskId, entry.ask.askId)
+        : null;
+      if (!entry.ask || !view) {
+        out.push(...entry.elements);
+        continue;
+      }
+      for (const q of entry.ask.questions) {
+        const elementId = askQuestionElementId(entry.ask.askId, q.id);
+        const note = view.noteByQuestion?.[q.id] ?? view.fallbackNote;
+        out.push({
+          tag: "markdown",
+          element_id: elementId,
+          content: `**${q.question}**\n\n${note}`,
+        });
+      }
+      out.push({
+        tag: "markdown",
+        element_id: ASK_HINT_ELEMENT_ID,
+        content: view.hintNote,
+      });
+    }
+    return out;
+  };
+
   const rebuildCardJson = (streamingMode = true): Record<string, unknown> =>
     buildStreamingCardJson({
       title,
@@ -458,7 +543,7 @@ export const createCardStream = (
       // 流式中 footer 空 → spinner；等待/完成 / 非流式终态由 footerText 定稿
       footerText:
         footerText || (streamingMode ? streamingFooterSpinner() : ""),
-      extraElements: appendedElements.length > 0 ? appendedElements : undefined,
+      extraElements: renderAppendedElements(),
       streamingMode,
     });
 
@@ -570,8 +655,9 @@ export const createCardStream = (
   ): unknown[] => {
     const elements: unknown[] = [];
     // review P1#5：一点即整组提交、未点题填「（未回答）」会误推进——
-    // 仅单题渲染选项按钮；多题只列 markdown + 提示走入向文字 ask-reply
-    const singleQuestion = askOpts.questions.length === 1;
+    // 仅单题渲染选项按钮；多题只列 markdown + 提示走入向文字 ask-reply。
+    // 「渲不渲按钮」与结算「删哪些按钮」共用 askRendersOptionButtons，不许各写一份
+    const renderButtons = askRendersOptionButtons(askOpts.questions);
     for (const q of askOpts.questions) {
       elements.push({
         tag: "markdown",
@@ -579,7 +665,7 @@ export const createCardStream = (
         element_id: askQuestionElementId(askOpts.askId, q.id),
         content: `**${q.question}**`,
       });
-      if (singleQuestion && q.options?.length) {
+      if (renderButtons && q.options?.length) {
         for (const opt of q.options) {
           const value: CardButtonValue = {
             kind: "ask",
@@ -611,8 +697,8 @@ export const createCardStream = (
     // T7 用户反馈：按钮之外也提示可直接打字答（单题按钮下同样给一行小字）
     elements.push({
       tag: "markdown",
-      element_id: "md_ask_hint",
-      content: singleQuestion
+      element_id: ASK_HINT_ELEMENT_ID,
+      content: renderButtons
         ? "<font color='grey'>没有合适选项？直接回复消息作答</font>"
         : "<font color='grey'>请直接回复文字作答</font>",
     });
@@ -773,7 +859,7 @@ export const createCardStream = (
       template = "orange";
       footerText = "等待选择";
       // 记住元素：后续全量 PUT / 非流式 finalize 整卡都带上（R1-1a）
-      appendedElements = [...appendedElements, ...elements];
+      appendedElements = [...appendedElements, { ask: askOpts, elements }];
 
       // 给 card-map 补上 ask 索引：这组提问从别处了结（app 答题卡 / 群里作答 /
       // 用户直接发新消息跳过）时，ask-card-settle 靠它反查到本卡做终态 patch。
@@ -831,7 +917,7 @@ export const createCardStream = (
           behaviors: [{ type: "callback", value }],
         },
       ];
-      appendedElements = [...appendedElements, ...elements];
+      appendedElements = [...appendedElements, { elements }];
 
       // 非流式：只记状态，finalize 并入整卡
       if (!streamingEnabled) return;
@@ -857,6 +943,16 @@ export const createCardStream = (
         warnFail("appendRetryButton", err);
       }
     });
+  };
+
+  /**
+   * finalize 之后本流不会再整包 PUT（所有写入口都挡 finalized）——它承载的 ask 终态视图用完了，
+   * 丢掉防登记表只增不减。占坑标记不动（继续挡重复置态、靠 TTL 过期）。
+   */
+  const dropSettledViews = (): void => {
+    for (const entry of appendedElements) {
+      if (entry.ask) dropAskCardSettledView(taskId, entry.ask.askId);
+    }
   };
 
   const finalize = async (
@@ -932,7 +1028,7 @@ export const createCardStream = (
         finalized = true;
         headerDirty = false;
       }
-    });
+    }).finally(dropSettledViews);
   };
 
   return {

@@ -22,7 +22,11 @@ const TMP_ROOT = path.join(os.tmpdir(), `fe-fingerprint-it-${Date.now()}`);
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 // 动态 import：等 DATA_DIR 冻结到 TMP 后再加载
-const { computeWorktreeFingerprint, runActionCheck } = await import(
+const {
+  computeWorktreeFingerprint,
+  runActionCheck,
+  extractDeclaredBaseCommits,
+} = await import(
   "@/lib/server/action-checks"
 );
 const { getActionArtifactPath } = await import("@/lib/server/task-fs-core");
@@ -238,6 +242,119 @@ describe("必备段标题锚定（审查加固）", () => {
     );
     const result = await runActionCheck(task, action);
     expect(result.passed).toBe(true);
+  });
+});
+
+describe("review 基底 commit 逐仓校验（S02-01 / S02-02）", () => {
+  const REPO2 = path.join(TMP_ROOT, "repo2");
+  let head1 = "";
+  let head2 = "";
+
+  /** 骨架齐全的 review artifact，基底 commit 条目由调用方决定（undefined = 不写该条） */
+  const reviewArtifact = (baseBlock?: string): string => `# 复核：x
+
+## 总评
+
+- **建议结论**：可交付
+${baseBlock ?? ""}
+## 跟飞书需求对照
+
+| 飞书需求项 | 来源 | 本次是否覆盖 |
+|---|---|---|
+| 导出 | story | ✅ |
+
+## bug 复审
+
+未发现高置信 bug
+`;
+
+  const run = async (
+    n: number,
+    repoPaths: string[],
+    artifact: string,
+  ): Promise<{ passed: boolean; details: string }> => {
+    const { task, action } = makeTaskAction("review", n, repoPaths[0]);
+    task.repoPaths = repoPaths;
+    await writeArtifact(task.id, n, "review", artifact);
+    return runActionCheck(task, action);
+  };
+
+  beforeAll(async () => {
+    head1 = git("rev-parse", "HEAD");
+    await fs.mkdir(REPO2, { recursive: true });
+    const g2 = (...args: string[]): string =>
+      execFileSync("git", args, { cwd: REPO2, encoding: "utf8" }).trim();
+    g2("init", "-b", "main");
+    g2("config", "user.email", "t@t.local");
+    g2("config", "user.name", "t");
+    await fs.writeFile(path.join(REPO2, "b.txt"), "world\n");
+    g2("add", "-A");
+    g2("commit", "-m", "init2");
+    head2 = g2("rev-parse", "HEAD");
+  });
+
+  it("单 git 仓：未声明基底 commit → 拒绝并提示补写（旧版直接放行）", async () => {
+    const r = await run(20, [REPO], reviewArtifact());
+    expect(r.passed).toBe(false);
+    expect(r.details).toMatch(/未声明基底 commit/);
+  });
+
+  it("单 git 仓：声明正确基底 → 通过；声明错误 → 拒绝", async () => {
+    const ok = await run(
+      21,
+      [REPO],
+      reviewArtifact(`- **基底 commit**：\`${head1}\`\n`),
+    );
+    expect(ok.passed).toBe(true);
+    const bad = await run(
+      22,
+      [REPO],
+      reviewArtifact("- **基底 commit**：`0123456789abcdef0123456789abcdef01234567`\n"),
+    );
+    expect(bad.passed).toBe(false);
+    expect(bad.details).toMatch(/不一致/);
+  });
+
+  it("多 git 仓（cwd = 无 .git 的公共父目录）：未声明基底 → 拒绝", async () => {
+    const r = await run(23, [REPO, REPO2], reviewArtifact());
+    expect(r.passed).toBe(false);
+    expect(r.details).toMatch(/未声明基底 commit/);
+    expect(r.details).toMatch(/逐仓/);
+  });
+
+  it("多 git 仓：只声明一个仓的基底 → 另一个仓对不上、拒绝", async () => {
+    const r = await run(
+      24,
+      [REPO, REPO2],
+      reviewArtifact(`- **基底 commit**：\`${head1}\`\n`),
+    );
+    expect(r.passed).toBe(false);
+    expect(r.details).toContain(REPO2);
+  });
+
+  it("多 git 仓：逐仓列出各自基底 → 通过", async () => {
+    const r = await run(
+      25,
+      [REPO, REPO2],
+      reviewArtifact(
+        `- **基底 commit**：\n  - repo：\`${head1}\`\n  - repo2：\`${head2}\`\n`,
+      ),
+    );
+    expect(r.passed).toBe(true);
+  });
+
+  it("extractDeclaredBaseCommits：单仓取首个、多仓取整块", () => {
+    expect(
+      extractDeclaredBaseCommits("- **基底 commit**：`abcdef1` 与 `1234567`", false),
+    ).toEqual(["abcdef1"]);
+    expect(
+      extractDeclaredBaseCommits(
+        "- **基底 commit**：\n  - a：`abcdef1`\n  - b：`1234567`\n- **建议结论**：`fedcba9`",
+        true,
+      ),
+    ).toEqual(["abcdef1", "1234567"]);
+    expect(extractDeclaredBaseCommits("没有这个字段", true)).toEqual([]);
+    expect(extractDeclaredBaseCommits("没有这个字段", false)).toEqual([]);
   });
 });
 

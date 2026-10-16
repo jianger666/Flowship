@@ -216,8 +216,9 @@ describe("chat 保命轮换（token 水位总开关开启时的原语义）", ()
     getTask.mockResolvedValue(fatTask);
     const resp = await handleChatReplyInject(fatTask.id, body);
     expect([200, 202]).toContain(resp.status);
-    // 旧会话被关（走懒重启分支、不是模型切换）
-    expect(cancelChatRun).toHaveBeenCalledWith(fatTask.id);
+    // 旧会话被关（走懒重启分支、不是模型切换）；必须带 reason: "restart"——
+    // 否则 close 时走「用户停止」的静默口径，被连带取消的后台子代理不会给用户任何提示（F4-03）
+    expect(cancelChatRun).toHaveBeenCalledWith(fatTask.id, { reason: "restart" });
     // 灰线落盘
     expect(writeEventAndPublish).toHaveBeenCalledWith(
       fatTask.id,

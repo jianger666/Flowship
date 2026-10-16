@@ -92,7 +92,7 @@ describe("task-talk-queue 入队", () => {
     mockInject.mockReset();
   });
 
-  it("FIFO、满队、clientItemId 幂等", () => {
+  it("FIFO、满队、clientItemId 幂等（id + 正文指纹都相同才算重复）", () => {
     const taskId = "tq-enq-1";
     const r1 = enqueueTalkMessage(taskId, {
       source: "app",
@@ -104,15 +104,28 @@ describe("task-talk-queue 入队", () => {
     if (!r1.ok) return;
     expect(r1.position).toBe(1);
 
+    // 同 id 同正文（trim 后一致、clientSentAt 这类每次重试都变的字段不参与）= 重试重发 → 重复
     const dup = enqueueTalkMessage(taskId, {
+      source: "app",
+      rawBody: { text: " a ", clientSentAt: 123 },
+      options: {},
+      clientItemId: "c1",
+    });
+    expect(dup).toMatchObject({ ok: true, position: 1, duplicate: true });
+    expect(dup.ok && dup.itemId).toBe(r1.itemId);
+
+    // 同 id 不同正文 = 另一条消息（K2-04）：老行为是静默当重复吞掉、用户的新内容凭空消失
+    const other = enqueueTalkMessage(taskId, {
       source: "app",
       rawBody: { text: "a2" },
       options: {},
       clientItemId: "c1",
     });
-    expect(dup).toMatchObject({ ok: true, position: 1, duplicate: true });
+    expect(other).toMatchObject({ ok: true, position: 2 });
+    expect(other).not.toHaveProperty("duplicate");
+    expect(other.ok && other.itemId).not.toBe(r1.itemId);
 
-    for (let i = 2; i <= TALK_QUEUE_MAX; i++) {
+    for (let i = 3; i <= TALK_QUEUE_MAX; i++) {
       expect(
         enqueueTalkMessage(taskId, {
           source: "app",
@@ -254,6 +267,52 @@ describe("task-talk-queue drain", () => {
     mockInject.mockResolvedValueOnce(
       new Response(JSON.stringify({ error: "not_found" }), {
         status: 404,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await __tickTalkQueueDrainForTest(taskId);
+    expect(listTalkQueue(taskId)).toHaveLength(0);
+    const events = await readEvents(taskId);
+    expect(events.some((e) => e.kind === "info" && e.text?.includes("没送出去"))).toBe(
+      true,
+    );
+  });
+
+  it("409 带结构化忙标记 code=task_busy：文案里没有「正在跑」也回队首、不丢（K2-03 契约）", async () => {
+    const taskId = "tq-drain-busy-code";
+    await mkTask(taskId);
+    enqueueTalkMessage(taskId, {
+      source: "app",
+      rawBody: { text: "keep-me" },
+      options: {},
+    });
+    // 文案故意不含「正在跑 / 等它说完」：判忙只能靠标记（真实场景 = 在途等待超时的「还在处理中」）
+    mockInject.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: "同一条消息上一次发送还在处理中、请稍后再试", code: "task_busy" }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await __tickTalkQueueDrainForTest(taskId);
+    expect(mockInject).toHaveBeenCalledTimes(1);
+    expect(listTalkQueue(taskId)).toHaveLength(1);
+    const events = await readEvents(taskId);
+    expect(events.some((e) => e.kind === "info" && e.text?.includes("没送出去"))).toBe(
+      false,
+    );
+  });
+
+  it("409 既无忙标记、文案也不是忙类（停止中 / 状态已变）：仍丢弃并写 info（对照）", async () => {
+    const taskId = "tq-drain-nonbusy-409";
+    await mkTask(taskId);
+    enqueueTalkMessage(taskId, {
+      source: "app",
+      rawBody: { text: "gone" },
+      options: {},
+    });
+    mockInject.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "任务正在停止，稍后再试" }), {
+        status: 409,
         headers: { "Content-Type": "application/json" },
       }),
     );

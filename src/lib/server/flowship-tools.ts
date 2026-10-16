@@ -454,6 +454,7 @@ const shareToGroupDef: FlowshipToolDef = {
     "提测在需求群 @ 测试人员不要走本工具，用 notify_group_testers。",
     "入参：task_id、content（必填）、title / kind(artifact|message|question) / links([{label,url}]) / at([名字]) 可选。",
     "at 是通用 @：传中文名或邮箱，卡片正文自动 @ 并推送；精确匹配才@，换不出/重名进返回的 at.unresolved（不挡发送）。artifact 卡无正文、at 会全进 unresolved。",
+    "本工具只往任务已绑定的需求群发，不会自动建群：任务还没绑群时返回 code=no_group，把 error 原文转告用户（需先在任务页飞书协作入口创建/绑定需求群）。",
     "返回 { ok, chatName?, messageId?, docMessageId? } 或 { ok:false, error, code? }——失败如实转告用户、不要自行重试。",
   ].join("\n"),
   parameters: TBObject({

@@ -10,7 +10,11 @@
  * 卡片实体不同、id 撞不上；答完置态的 patch 也就能跟 p2p 走同一套 helper。
  */
 
-import { askOptionElementId, askQuestionElementId } from "./card-stream";
+import {
+  askOptionElementId,
+  askQuestionElementId,
+  askRendersOptionButtons,
+} from "./card-stream";
 import type { CardButtonValue, CardStreamAskQuestion } from "./types";
 
 /** 群答题卡「还能不能答」的说明行 element_id（答完置态时整行替换） */
@@ -37,7 +41,8 @@ export const buildGroupAskCardJson = (
   input: GroupAskCardInput,
 ): Record<string, unknown> => {
   const elements: unknown[] = [];
-  const singleQuestion = input.questions.length === 1;
+  // 「渲不渲按钮」与结算「删哪些按钮」共用 askRendersOptionButtons（见其注释）
+  const renderButtons = askRendersOptionButtons(input.questions);
 
   for (const q of input.questions) {
     elements.push({
@@ -45,7 +50,7 @@ export const buildGroupAskCardJson = (
       element_id: askQuestionElementId(input.askId, q.id),
       content: `**${q.question}**`,
     });
-    if (!singleQuestion || !q.options?.length) continue;
+    if (!renderButtons || !q.options?.length) continue;
     for (const opt of q.options) {
       const value: CardButtonValue = {
         kind: "group_ask",

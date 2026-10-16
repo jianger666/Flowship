@@ -52,7 +52,7 @@ import { useDialog } from "@/hooks/use-dialog";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpHealth } from "@/hooks/use-mcp-health";
 import { useMcpOAuth } from "@/hooks/use-mcp-oauth";
-import { RESERVED_MCP_NAMES } from "@/lib/mcp-config";
+import { parseBulkMcpJson, RESERVED_MCP_NAMES } from "@/lib/mcp-config";
 import { cn } from "@/lib/utils";
 
 interface McpCardProps {
@@ -329,6 +329,10 @@ export const McpCard = ({
 
 // ----------------- 高级：整体 JSON 编辑 -----------------
 
+// 整份 servers 的规范化展示文本（草稿初值 / 外部变更回流 / 判断「有没有改动」共用）
+const bulkJsonText = (servers: Record<string, McpServerConfig>): string =>
+  JSON.stringify({ mcpServers: servers }, null, 2);
+
 const BulkJsonEditor = ({
   appServers,
   onChange,
@@ -338,43 +342,68 @@ const BulkJsonEditor = ({
   onChange: (next: Record<string, McpServerConfig>) => void;
   onCommit: (next: Record<string, McpServerConfig>) => void;
 }) => {
-  // JSON 草稿（编辑中途可暂时非法、合法时才回写）
-  const [draft, setDraft] = useState(
-    JSON.stringify({ mcpServers: appServers }, null, 2),
-  );
-  // 自己最后一次成功 commit 的序列化值：外部 appServers 变化回流时据此区分
-  // 「自己打字引起的回声」（不重置 draft、免得正在编辑被顶掉）和「条目操作 / 导入
-  // 等外部变更」（重置、保持同步——否则展开着的旧 JSON 一 commit 会把删掉的写回来）
-  const lastEmittedRef = useRef(JSON.stringify(appServers));
+  // JSON 草稿：只在本地编辑、点「保存」才校验落盘（S13-09：原来每次击键合法即整包落盘、可能清空已配 MCP）
+  const [draft, setDraft] = useState(bulkJsonText(appServers));
+  // 上次同步进草稿的外部值：外部 appServers 变了（条目增删改 / 导入）就把草稿重置成最新，
+  // 否则展开着的旧 JSON 一保存会把已删掉的 server 写回来
+  const lastSyncedRef = useRef(JSON.stringify(appServers));
   useEffect(() => {
     const incoming = JSON.stringify(appServers);
-    if (incoming === lastEmittedRef.current) return;
-    lastEmittedRef.current = incoming;
-    setDraft(JSON.stringify({ mcpServers: appServers }, null, 2));
+    if (incoming === lastSyncedRef.current) return;
+    lastSyncedRef.current = incoming;
+    setDraft(bulkJsonText(appServers));
   }, [appServers]);
 
+  // 草稿校验结果（输入中实时算、只用于展示错误 + 控制保存按钮）
+  const parsed = useMemo(() => parseBulkMcpJson(draft), [draft]);
+  // 草稿相对已保存值是否有改动
+  const dirty = draft !== bulkJsonText(appServers);
+
+  const handleSave = () => {
+    if (!parsed.ok) return;
+    const servers = parsed.servers as unknown as Record<string, McpServerConfig>;
+    onChange(servers);
+    onCommit(servers);
+  };
+
   return (
-    <CodeEditor
-      id="app-mcp-json"
-      value={draft}
-      onChange={(raw) => {
-        setDraft(raw);
-        try {
-          const parsed = JSON.parse(raw) as {
-            mcpServers?: Record<string, McpServerConfig>;
-          };
-          if (parsed.mcpServers && typeof parsed.mcpServers === "object") {
-            lastEmittedRef.current = JSON.stringify(parsed.mcpServers);
-            onChange(parsed.mcpServers);
-            onCommit(parsed.mcpServers);
-          }
-        } catch {
-          // 编辑中途 JSON 可能暂时非法
-        }
-      }}
-      language="json"
-      rows={10}
-    />
+    <div className="space-y-1.5">
+      <CodeEditor
+        id="app-mcp-json"
+        value={draft}
+        onChange={setDraft}
+        language="json"
+        rows={10}
+        ariaInvalid={dirty && !parsed.ok}
+      />
+      <div className="flex items-center gap-2">
+        <p
+          className={cn(
+            "min-w-0 flex-1 truncate text-xs",
+            dirty && !parsed.ok ? "text-destructive" : "text-muted-foreground",
+          )}
+        >
+          {dirty && !parsed.ok ? parsed.error : dirty ? "有未保存的修改" : ""}
+        </p>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          disabled={!dirty}
+          onClick={() => setDraft(bulkJsonText(appServers))}
+        >
+          还原
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          disabled={!dirty || !parsed.ok}
+          onClick={handleSave}
+        >
+          保存
+        </Button>
+      </div>
+    </div>
   );
 };
 

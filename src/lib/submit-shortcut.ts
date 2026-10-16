@@ -1,5 +1,6 @@
 import type { KeyboardEvent } from "react";
 
+import { isImeComposing } from "@/lib/ime";
 import type { SubmitShortcut } from "@/lib/types";
 
 export const SUBMIT_SHORTCUT_LABEL: Record<SubmitShortcut, string> = {
@@ -21,7 +22,7 @@ export const shouldSubmitOnKeyDown = (
 ): boolean => {
   if (event.key !== "Enter") return false;
   // 中文输入法选词期间的 Enter 不是提交，必须让给 IME。
-  if (event.nativeEvent.isComposing) return false;
+  if (isImeComposing(event)) return false;
 
   if (shortcut === "enter") {
     return !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey;

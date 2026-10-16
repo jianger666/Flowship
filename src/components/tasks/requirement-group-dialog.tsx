@@ -38,6 +38,7 @@ import {
   getRequirementGroupStatus,
 } from "@/lib/task-store";
 import type { Task } from "@/lib/types";
+import { isImeComposing } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -459,7 +460,13 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
               autoFocus
               aria-invalid={!!fieldError}
               invalid={!!fieldError}
-              onKeyDown={(e) => { if (e.key === "Enter" && !manualConfirmDisabled) { e.preventDefault(); void runBind(); } }}
+              onKeyDown={(e) => {
+                // IME 选词中的 Enter 不是确认
+                if (e.key === "Enter" && !isImeComposing(e) && !manualConfirmDisabled) {
+                  e.preventDefault();
+                  void runBind();
+                }
+              }}
             />
             {parsedInputId && !isSameAsBound && (
               <p className="font-mono text-xs text-muted-foreground">将关联：{parsedInputId}</p>

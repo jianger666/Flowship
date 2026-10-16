@@ -28,6 +28,18 @@ import {
   stripBugMrFields,
   type MrInboxMrDetail,
 } from "@/lib/mr-inbox";
+import { buildIgnoredMeta } from "@/lib/mr-inbox-ignored-meta";
+import {
+  applyInboxPatches,
+  createInboxRefreshGate,
+  nextDataOnScanFailure,
+  removeInboxUrl,
+  restoreInboxSnapshot,
+  runCoalescedInboxRefresh,
+  snapshotInboxUrl,
+  type InboxIgnoredSnapshot,
+  type InboxPatch,
+} from "@/lib/mr-inbox-state";
 import { sendTaskNotification, setInboxBadge } from "@/lib/shell-notify";
 
 /** bug 可流转目标（GET /api/mr-inbox/bug-transitions） */
@@ -84,6 +96,11 @@ interface MrInboxData {
 interface MrInboxContextValue {
   data: MrInboxData | null;
   refreshing: boolean;
+  /**
+   * 最近一次扫描的失败文案（null = 无错）。S13-05：失败时 data 保留上一次成功的列表，
+   * 面板据此在列表上方挂错误条，而不是清空整表。
+   */
+  scanError: string | null;
   unreadCount: number;
   refresh: (opts?: { force?: boolean }) => Promise<void>;
   /** 标已读（url = mrUrl 或 bugUrl） */
@@ -91,8 +108,12 @@ interface MrInboxContextValue {
   /** 批量标已读（POST 成功后再改本地 seenAtMs；失败抛错给调用方 toast） */
   markAllSeen: (urls: string[]) => Promise<void>;
   mergeMr: (mrUrl: string) => Promise<void>;
-  /** 忽略条目（url = mrUrl 或 bugUrl）：从三组永久移除 */
-  ignoreItem: (url: string) => Promise<void>;
+  /** 忽略条目（url = mrUrl 或 bugUrl）：从三组移除；返回快照供「撤销」 */
+  ignoreItem: (url: string) => Promise<IgnoredSnapshot>;
+  /** 撤销忽略：服务端取消忽略 + 本地塞回条目 + 后台强制重扫（常驻「已忽略」列表的恢复也走它，快照只带 url） */
+  restoreIgnored: (snapshot: IgnoredSnapshot) => Promise<void>;
+  /** 忽略名单版本号：忽略 / 恢复成功后 +1，「已忽略」列表据此重新拉取 */
+  ignoredRev: number;
   /** 懒加载某 bug 当前可流转目标 */
   listBugTransitions: (input: {
     projectKey: string;
@@ -118,6 +139,12 @@ interface MrInboxContextValue {
   }>;
 }
 
+/** 忽略前的条目快照（撤销用） */
+export type IgnoredSnapshot = InboxIgnoredSnapshot<
+  MrInboxEntry,
+  BugInboxEntry
+>;
+
 const MrInboxContext = createContext<MrInboxContextValue | null>(null);
 
 /** 角标同步去抖（避免短时多次 setState 狂刷 IPC） */
@@ -137,22 +164,60 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
   const [data, setData] = useState<MrInboxData | null>(null);
   // 拉取中（首拉 + 手动刷新）
   const [refreshing, setRefreshing] = useState(false);
+  // 上次发起拉取的时间（回前台补拉判断是否过期）
   const lastFetchAtRef = useRef(0);
-  const refreshingRef = useRef(false);
+  // 刷新闸门：在飞标记 + 尾随 force 登记（调度见 mr-inbox-state 的 requestInboxRefresh）
+  const refreshGateRef = useRef(createInboxRefreshGate());
+  // 最近一次扫描的失败文案（成功即清）
+  const [scanError, setScanError] = useState<string | null>(null);
+  // 忽略名单版本号（忽略 / 恢复成功 +1，「已忽略」列表依赖它重拉）
+  const [ignoredRev, setIgnoredRev] = useState(0);
+  // 最新 data 镜像（忽略前取快照用；不在渲染期写 ref）
+  const dataRef = useRef<MrInboxData | null>(null);
+  // S13-04：扫描 in-flight 期间发生的本地乐观变换，响应回来后按序重放到新结果上，
+  // 否则慢扫描的整表覆盖会让刚忽略 / 合并 / 流转 / 标已读的条目「复活」
+  const pendingPatchesRef = useRef<InboxPatch<MrInboxData>[]>([]);
   // 上轮未读 key 集合；null = 尚未建基线（首轮 / 降级后重建）
   const prevUnreadKeysRef = useRef<Set<string> | null>(null);
   // 上次已发给壳的角标数（相同值不重发）
   const lastBadgeCountRef = useRef<number | null>(null);
   const badgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const refresh = useCallback(async (opts?: { force?: boolean }) => {
-    if (refreshingRef.current) return;
-    refreshingRef.current = true;
-    setRefreshing(true);
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  /** 本地乐观变换：立刻改 data；扫描进行中则同时记入补丁队列，供响应回来后重放 */
+  const applyPatch = useCallback((patch: InboxPatch<MrInboxData>) => {
+    if (refreshGateRef.current.running) pendingPatchesRef.current.push(patch);
+    setData((prev) => (prev ? patch(prev) : prev));
+  }, []);
+
+  /**
+   * 扫描失败：上一次成功的列表 / 角标 / 通知基线都保留（data 不动），只记 scanError；
+   * 没有成功基线（首拉失败 / 降级态）才落成 error 态。
+   */
+  const failScan = useCallback((message: string) => {
+    setScanError(message);
+    setData((prev) =>
+      nextDataOnScanFailure<MrInboxData>(prev, message, (msg) => ({
+        status: "error",
+        ...emptyGroups(),
+        message: msg,
+      })),
+    );
+  }, []);
+
+  /**
+   * 单轮扫描：拉一次、重放补丁、落 data。只管这一轮，不管闸门 / refreshing 状态
+   * （调度由 refresh → runCoalescedInboxRefresh 负责，才能在在飞时登记尾随 force）。
+   */
+  const scanOnce = useCallback(async (force: boolean) => {
+    pendingPatchesRef.current = [];
     lastFetchAtRef.current = Date.now();
     try {
       const res = await fetch(
-        opts?.force ? "/api/mr-inbox?refresh=1" : "/api/mr-inbox",
+        force ? "/api/mr-inbox?refresh=1" : "/api/mr-inbox",
       );
       // 审查：HTTP 非 2xx 时 body 可能是 { error }、不能当成功列表写（会把三组清成 []）
       if (!res.ok) {
@@ -163,17 +228,18 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
         } catch {
           // ignore
         }
-        setData((prev) =>
-          prev
-            ? { ...prev, status: "error", message }
-            : { status: "error", ...emptyGroups(), message },
-        );
+        failScan(message);
         return;
       }
       const body = (await res.json()) as MrInboxData & {
         items?: MrInboxEntry[];
       };
-      setData({
+      // 服务端 200 但 status:"error"（扫描中途 meegle / 网络瞬断）同样算失败：不覆盖上次成功的列表
+      if (body.status === "error") {
+        failScan(body.message || "未知错误");
+        return;
+      }
+      const fresh: MrInboxData = {
         status: body.status,
         pendingMr: Array.isArray(body.pendingMr) ? body.pendingMr : [],
         myBugs: Array.isArray(body.myBugs) ? body.myBugs : [],
@@ -183,27 +249,37 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
         message: body.message,
         scannedAt: body.scannedAt,
         gitTokenConfigured: body.gitTokenConfigured,
-      });
+      };
+      // 把扫描期间发生的乐观操作重放到新结果上（同步段内取走队列、不留窗口）
+      const patches = pendingPatchesRef.current;
+      pendingPatchesRef.current = [];
+      setScanError(null);
+      setData(applyInboxPatches(fresh, patches));
     } catch (err) {
       console.warn("[mr-inbox] 拉取失败:", err);
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              status: "error",
-              message: err instanceof Error ? err.message : String(err),
-            }
-          : {
-              status: "error",
-              ...emptyGroups(),
-              message: err instanceof Error ? err.message : String(err),
-            },
-      );
+      failScan(err instanceof Error ? err.message : String(err));
     } finally {
-      refreshingRef.current = false;
-      setRefreshing(false);
+      pendingPatchesRef.current = [];
     }
-  }, []);
+  }, [failScan]);
+
+  /**
+   * 刷新入口。force 遇到在飞的刷新**不丢弃**：登记一次尾随 force（多次合并成一次），
+   * 在飞的这次结束后立刻再 force 扫一遍（N9-01）——撤销忽略 / 合并后的 force 是要「操作之后重扫」，
+   * 在飞的那次是操作之前发起的，拿到的是旧结果，丢掉 force 会让条目顺序 / 详情停在乐观快照上。
+   * 普通（轮询 / 回前台）刷新有在飞的就并入，行为不变。
+   */
+  const refresh = useCallback(
+    (opts?: { force?: boolean }) =>
+      runCoalescedInboxRefresh({
+        gateRef: refreshGateRef,
+        force: opts?.force === true,
+        scanOnce,
+        onStart: () => setRefreshing(true),
+        onSettled: () => setRefreshing(false),
+      }),
+    [scanOnce],
+  );
 
   useEffect(() => {
     void refresh();
@@ -226,45 +302,38 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
   }, [refresh]);
 
   const setSeen = useCallback(async (url: string, seen: boolean) => {
-    const patchSeen = <T extends { mrUrl?: string; bugUrl?: string; seenAtMs: number | null }>(
-      list: T[],
-      nextSeenAt: number | null,
-    ): T[] =>
-      list.map((it) => {
-        const key = it.mrUrl ?? it.bugUrl;
-        return key === url ? { ...it, seenAtMs: nextSeenAt } : it;
+    // 分组各用各的 key：MR→mrUrl、bug→bugUrl（待回归 bug 行也带 mrUrl，不能用 ?? 串）
+    const seenPatch =
+      (nextSeenAt: number | null): InboxPatch<MrInboxData> =>
+      (d) => ({
+        ...d,
+        pendingMr: d.pendingMr.map((it) =>
+          it.mrUrl === url ? { ...it, seenAtMs: nextSeenAt } : it,
+        ),
+        myBugs: d.myBugs.map((it) =>
+          it.bugUrl === url ? { ...it, seenAtMs: nextSeenAt } : it,
+        ),
+        pendingRegression: d.pendingRegression.map((it) =>
+          it.bugUrl === url ? { ...it, seenAtMs: nextSeenAt } : it,
+        ),
       });
 
     // 乐观更新；失败回滚（审查：原实现不查 res.ok、假标已读）
-    let previousSeenAt: number | null | undefined;
-    setData((prev) => {
-      if (!prev) return prev;
-      const hitMr = prev.pendingMr.find((it) => it.mrUrl === url);
-      const hitBug = [...prev.myBugs, ...prev.pendingRegression].find(
-        (it) => it.bugUrl === url,
-      );
-      previousSeenAt = hitMr?.seenAtMs ?? hitBug?.seenAtMs;
-      const nextSeenAt = seen ? Date.now() : null;
-      return {
-        ...prev,
-        pendingMr: patchSeen(prev.pendingMr, nextSeenAt),
-        myBugs: patchSeen(prev.myBugs, nextSeenAt),
-        pendingRegression: patchSeen(prev.pendingRegression, nextSeenAt),
-      };
-    });
+    // 走 applyPatch：扫描 in-flight 时记入补丁队列，响应回来后重放（S13-04）
+    const hitMr = dataRef.current?.pendingMr.find((it) => it.mrUrl === url);
+    const hitBug = [
+      ...(dataRef.current?.myBugs ?? []),
+      ...(dataRef.current?.pendingRegression ?? []),
+    ].find((it) => it.bugUrl === url);
+    const hit = hitMr ?? hitBug;
+    // 注意：不能用 ?? 取值——seenAtMs 本身可能是 null（未读），会被误当「没命中」而丢回滚
+    const previousSeenAt: number | null | undefined = hit
+      ? hit.seenAtMs
+      : undefined;
+    applyPatch(seenPatch(seen ? Date.now() : null));
     const rollback = () => {
       if (previousSeenAt === undefined) return;
-      const old = previousSeenAt;
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              pendingMr: patchSeen(prev.pendingMr, old),
-              myBugs: patchSeen(prev.myBugs, old),
-              pendingRegression: patchSeen(prev.pendingRegression, old),
-            }
-          : prev,
-      );
+      applyPatch(seenPatch(previousSeenAt));
     };
     try {
       const res = await fetch("/api/mr-inbox/seen", {
@@ -288,7 +357,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       rollback();
       console.warn("[mr-inbox] 标已读失败:", err);
     }
-  }, []);
+  }, [applyPatch]);
 
   /** 批量标已读：等接口成功再改本地（失败可重试、不乐观误标） */
   const markAllSeen = useCallback(async (urls: string[]) => {
@@ -312,23 +381,19 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
     const now = Date.now();
     const keySet = new Set(unique);
     // 分组各用各的 key：MR→mrUrl、bug→bugUrl（bug 行也可能带 mrUrl，不能用 ?? 串）
-    setData((prev) =>
-      prev
-        ? {
-            ...prev,
-            pendingMr: prev.pendingMr.map((it) =>
-              keySet.has(it.mrUrl) ? { ...it, seenAtMs: now } : it,
-            ),
-            myBugs: prev.myBugs.map((it) =>
-              keySet.has(it.bugUrl) ? { ...it, seenAtMs: now } : it,
-            ),
-            pendingRegression: prev.pendingRegression.map((it) =>
-              keySet.has(it.bugUrl) ? { ...it, seenAtMs: now } : it,
-            ),
-          }
-        : prev,
-    );
-  }, []);
+    applyPatch((d) => ({
+      ...d,
+      pendingMr: d.pendingMr.map((it) =>
+        keySet.has(it.mrUrl) ? { ...it, seenAtMs: now } : it,
+      ),
+      myBugs: d.myBugs.map((it) =>
+        keySet.has(it.bugUrl) ? { ...it, seenAtMs: now } : it,
+      ),
+      pendingRegression: d.pendingRegression.map((it) =>
+        keySet.has(it.bugUrl) ? { ...it, seenAtMs: now } : it,
+      ),
+    }));
+  }, [applyPatch]);
 
   const mergeMr = useCallback(async (mrUrl: string) => {
     const res = await fetch("/api/mr-inbox/merge", {
@@ -349,24 +414,27 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
     // 待测 MR：整条剔除；待回归 / 我的 BUG：只清 MR 关联（与 markBugMrMergedInCache 对齐）
     const clearBugMr = (it: BugInboxEntry): BugInboxEntry =>
       it.mrUrl === mrUrl ? stripBugMrFields(it) : it;
-    setData((prev) =>
-      prev
-        ? {
-            ...prev,
-            pendingMr: prev.pendingMr.filter((it) => it.mrUrl !== mrUrl),
-            myBugs: prev.myBugs.map(clearBugMr),
-            pendingRegression: prev.pendingRegression.map(clearBugMr),
-          }
-        : prev,
-    );
-  }, []);
+    applyPatch((d) => ({
+      ...d,
+      pendingMr: d.pendingMr.filter((it) => it.mrUrl !== mrUrl),
+      myBugs: d.myBugs.map(clearBugMr),
+      pendingRegression: d.pendingRegression.map(clearBugMr),
+    }));
+  }, [applyPatch]);
 
-  /** 忽略：POST 成功后从三组都 filter 掉该 url（乐观：先请求再本地移除，对齐 transitionBug） */
+  /**
+   * 忽略：POST 成功后从三组都 filter 掉该 url（先请求再本地移除，对齐 transitionBug）。
+   * 返回被移除条目的快照，调用方可据此给「撤销」（S13-19）。
+   */
   const ignoreItem = useCallback(async (url: string) => {
+    const snapshot: IgnoredSnapshot = dataRef.current
+      ? snapshotInboxUrl(dataRef.current, url)
+      : { url };
     const res = await fetch("/api/mr-inbox/ignore", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
+      // meta：条目简要信息（标题 / 分组 / 引用），供常驻「已忽略」列表展示
+      body: JSON.stringify({ url, meta: buildIgnoredMeta(snapshot) }),
     });
     if (!res.ok) {
       let message = `HTTP ${res.status}`;
@@ -378,19 +446,35 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       }
       throw new Error(message);
     }
-    setData((prev) =>
-      prev
-        ? {
-            ...prev,
-            pendingMr: prev.pendingMr.filter((it) => it.mrUrl !== url),
-            myBugs: prev.myBugs.filter((it) => it.bugUrl !== url),
-            pendingRegression: prev.pendingRegression.filter(
-              (it) => it.bugUrl !== url,
-            ),
-          }
-        : prev,
-    );
-  }, []);
+    applyPatch((d) => removeInboxUrl(d, url));
+    setIgnoredRev((n) => n + 1);
+    return snapshot;
+  }, [applyPatch]);
+
+  /** 撤销忽略：服务端取消忽略 → 本地幂等塞回 → 后台强制重扫校正顺序 / 详情 */
+  const restoreIgnored = useCallback(
+    async (snapshot: IgnoredSnapshot) => {
+      const res = await fetch("/api/mr-inbox/ignore", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: snapshot.url }),
+      });
+      if (!res.ok) {
+        let message = `HTTP ${res.status}`;
+        try {
+          const body = (await res.json()) as { error?: string };
+          if (body.error) message = body.error;
+        } catch {
+          // ignore
+        }
+        throw new Error(message);
+      }
+      applyPatch((d) => restoreInboxSnapshot(d, snapshot));
+      setIgnoredRev((n) => n + 1);
+      void refresh({ force: true });
+    },
+    [applyPatch, refresh],
+  );
 
   const listBugTransitions = useCallback(
     async (input: { projectKey: string; workItemId: string }) => {
@@ -463,8 +547,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
           ? body.stillPendingFix
           : isBugPendingFixStatus(label);
 
-      setData((prev) => {
-        if (!prev) return prev;
+      applyPatch((prev) => {
         if (input.action === "transition" && stillPending && label) {
           // 仍属待修：就地改 statusLabel，不移出列表
           return {
@@ -490,7 +573,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
         stillPendingFix: stillPending,
       };
     },
-    [],
+    [applyPatch],
   );
 
   // 未读总数：仅 status===ok 计数；降级 / 未登录 → 0（角标同源清零）
@@ -559,24 +642,30 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
     () => ({
       data,
       refreshing,
+      scanError,
       unreadCount,
       refresh,
       setSeen,
       markAllSeen,
       mergeMr,
       ignoreItem,
+      restoreIgnored,
+      ignoredRev,
       listBugTransitions,
       transitionBug,
     }),
     [
       data,
       refreshing,
+      scanError,
       unreadCount,
       refresh,
       setSeen,
       markAllSeen,
       mergeMr,
       ignoreItem,
+      restoreIgnored,
+      ignoredRev,
       listBugTransitions,
       transitionBug,
     ],

@@ -96,14 +96,20 @@ import {
   fetchTask,
   finalizeTask,
   getPendingQuestionSend,
+  appendTaskEvent,
+  applyRewoundResult,
   mergeTaskEvents,
+  replaceTaskEventsWithSnapshot,
   reopenTask,
+  rewindNeedsResync,
   setActionExcluded,
   setTaskUiLayout,
   stopTask,
   submitTaskQuestion,
   type ImagePayload,
+  type RewoundResult,
 } from "@/lib/task-store";
+import { reconcileRunActive, watchDormantToastId } from "@/lib/watch-reconnect";
 import { resolveSessionModel, talkForceModel } from "@/lib/task-model";
 import { loadTalkOverride } from "@/lib/talk-model-override";
 import {
@@ -309,10 +315,31 @@ const TaskDetailPage = () => {
     void refresh();
   }, [refresh]);
 
+  // 回退后本地事件窗口对不齐（见 rewind-marker.ts）：完整重新拉取一次并「整体替换」本地事件
+  // （不能走 absorbTask——merge 只增不换，快照里没有回退标记时删不掉本地的过期后半段）
+  const resyncEvents = useCallback(async () => {
+    if (!id) return;
+    const requestedId = id;
+    try {
+      const t = await fetchTask(requestedId, { tail: EVENT_TAIL });
+      if (!t || routeIdRef.current !== requestedId) return;
+      if (!canCommitTaskSnapshot(t.id)) return;
+      setTask((prev) =>
+        prev && prev.id === t.id ? replaceTaskEventsWithSnapshot(prev, t) : prev,
+      );
+    } catch (err) {
+      if (routeIdRef.current !== requestedId) return;
+      toast.error(`刷新任务失败：${(err as Error).message}`);
+    }
+  }, [id]);
+
   // 把当前任务的关键状态同步进侧栏全局列表（任务 + 对话模式都经过这里）：
   //  1) 你正在看的这个任务、侧栏的转圈 / 等你回复点实时准（不等轮询）
   //  2) 让 useTaskList「知道」有任务在跑 → 触发它的条件轮询去刷后台其它任务
   // 仅依赖影响侧栏展示 / 轮询触发的关键字段、不随 events 高频 setState 全列表重渲染
+  // 对话换工作目录（ChatWorkdirPicker）= 侧栏要换仓组；不进依赖的话行会一直待在旧组（常是
+  // 最底下的 Home）、直到下次整表刷新才挪走
+  const repoPathsKey = task?.repoPaths?.join("\n");
   useEffect(() => {
     // deleted terminal 后不得把侧栏回灌
     if (task && canCommitTaskSnapshot(task.id)) upsertTask(task);
@@ -325,6 +352,7 @@ const TaskDetailPage = () => {
     task?.title,
     task?.pinned,
     task?.actions.length,
+    repoPathsKey,
   ]);
 
   // 记住「最后浏览的对话 / 工作台任务」（v1.1.x）：胶囊切回对应模式时优先落它
@@ -464,7 +492,24 @@ const TaskDetailPage = () => {
       onRestrictedRun: setRestrictedRunActive,
       onTalkQueue: setTalkQueue,
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
-      onWatchException: (err) => toast.error(`watch 异常：${err.message}`),
+      // resume 有值 = 重试预算耗尽、已休眠：挂「重连」按钮并常驻，别让用户面对静默停更的页面
+      // 稳定 id：同一任务重复休眠只原位更新、不叠加；连接恢复 / 卸载 / 切任务时由 onWatchDormantEnd 撤掉
+      onWatchException: (err, resume) =>
+        toast.error(
+          `watch 异常：${err.message}`,
+          resume
+            ? {
+                id: watchDormantToastId("task", task?.id ?? ""),
+                action: { label: "重连", onClick: resume },
+                duration: Infinity,
+              }
+            : undefined,
+        ),
+      onWatchDormantEnd: (taskId) =>
+        toast.dismiss(watchDormantToastId("task", taskId)),
+      // 重连 / 休眠唤醒后的服务端快照校准 run latch：断线期间漏了 done 也不会一直卡「运行中」
+      onBootstrapSnapshot: (t) =>
+        setRunActive((prev) => reconcileRunActive(prev, t.runStatus)),
       onTaskDeleted: handleTaskDeleted,
     },
     !!task && task.mode !== "chat",
@@ -873,11 +918,20 @@ const TaskDetailPage = () => {
           onEventAppend={(ev) => {
             // 双保险：ChatView 已滤 ephemeral，这里再挡一次防漏进持久 rows
             if (isEphemeralToolOutputDelta(ev)) return;
-            setTask((prev) => {
-              if (!prev) return prev;
-              if (prev.events.some((e) => e.id === ev.id)) return prev;
-              return { ...prev, events: [...prev.events, ev] };
-            });
+            // 回退标记事件本地窗口对不齐（只加载了尾部分页等）：不猜，完整重新拉取一次并整体替换本地
+            // （此时 appendTaskEvent 不追加该事件；拉回的快照自带它）
+            const cur = taskRef.current;
+            if (cur && rewindNeedsResync(cur, ev)) void resyncEvents();
+            // appendTaskEvent：按 id 去重追加；回退标记事件会先截掉本地被删的后半段
+            setTask((prev) => (prev ? appendTaskEvent(prev, ev) : prev));
+          }}
+          onRewound={(r: RewoundResult) => {
+            // 回退 HTTP 响应直给的标记：不依赖标记事件写入 / SSE 到达，直接把本地对齐到这次回退
+            const cur = taskRef.current;
+            if (!cur) return;
+            const { resync } = applyRewoundResult(cur, r);
+            setTask((prev) => (prev ? applyRewoundResult(prev, r).task : prev));
+            if (resync) void resyncEvents();
           }}
           onPrependEvents={handlePrependEvents}
           onTaskDeleted={handleTaskDeleted}

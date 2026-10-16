@@ -58,7 +58,10 @@ export interface GroupQaSummaryMeta extends GroupQaSummaryExtraMeta {
 
 /** 群问答一轮：列表一行 + 展开详情 */
 export interface GroupQaRound {
-  /** runTag；历史数据用 `legacy-<问题事件id>` */
+  /**
+   * runTag（含有问无答的轮次，= 问题事件的 restrictedRunTag）；历史数据用 `legacy-<问题事件id>`。
+   * 非 legacy 轮次的 key 就是 meta.groupRun 的值，「查看过程」直接拿它过滤，别再另造形状。
+   */
   key: string;
   /** 问题时间（列表倒序用） */
   ts: number;
@@ -360,10 +363,13 @@ export const collectGroupQaRounds = (
     });
   }
   // 有问无答（新代码也会有：强关 / 崩溃打断的那轮）
-  for (const [, { q }] of byRunTag) {
+  for (const [runTag, { q }] of byRunTag) {
     if (q && !pairedQuestions.has(q)) {
       rounds.push({
-        key: `open-${q.id}`,
+        // key 必须就是 runTag（byRunTag 的键 = 问题的 restrictedRunTag）：卡片「查看过程」拿 round.key
+        // 当 runTag 去配 meta.groupRun，曾用 `open-<事件id>` 导致进行中 / 被打断 / 汇总缺失的轮次
+        // 永远看不到过程。顺带让汇总落地前后 key 不变（展开状态 / DOM id 不丢）。
+        key: runTag,
         ts: q.ts,
         askerName: strOf(metaOf(q).groupSender) || "群成员",
         askerOpenId: strOf(metaOf(q).groupSenderOpenId),

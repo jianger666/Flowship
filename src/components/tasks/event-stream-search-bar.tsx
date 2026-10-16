@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useShellPlatform } from "@/hooks/use-shell-platform";
 import { getSearchThisPaneLabel } from "@/lib/platform-shortcuts";
+import { isImeComposing } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -75,7 +76,8 @@ export const EventStreamSearchBar = ({
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
+    // IME 选词中的 Enter 交给输入法（否则选词会顺带跳到下一个命中）
+    if (e.key === "Enter" && !isImeComposing(e)) {
       e.preventDefault();
       if (e.shiftKey) onPrev();
       else onNext();

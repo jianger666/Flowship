@@ -41,12 +41,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { IntInput } from "@/components/ui/int-input";
 import { PasswordInput } from "@/components/ui/password-input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { useDialog } from "@/hooks/use-dialog";
+import { useStableRowKeys } from "@/hooks/use-stable-row-keys";
+import { PORT_MAX, PORT_MIN } from "@/lib/int-field";
 import {
   companyEnvTemplateJson,
   findCompanyEnvServerIssue,
+  findCompanyEnvServerRowIssue,
+  isBlankCompanyEnvRow,
   isCompanyEnvConfigured,
   isXxljobReadonly,
   parseCompanyEnvImport,
@@ -103,6 +109,30 @@ const stableKey = (value: unknown): string => {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+};
+
+/**
+ * 删除含用户填写内容的条目：有内容先确认（S13-14 / R7-01，原先一击即删 + 立即落盘、内容找不回）；
+ * 刚添加还没填任何文本的空白行直接删（判定用 company-env.ts 的 isBlankCompanyEnvRow，与服务端
+ * settings-fs 的收缩判定共用同一份——「添加」落盘的默认行带 env: "test"，env 等默认字段不算内容）。
+ * apply 里自己调 commit / onCommit。
+ * 本文件里**所有**从数组移除元素的写法都必须包在 removeRow(...) 的回调里
+ * （tests/settings-safety-contract.test.ts 用 AST 枚举守住）。
+ */
+const useRemoveRow = () => {
+  const { confirm } = useDialog();
+  return async (kind: string, name: string, row: object, apply: () => void) => {
+    if (!isBlankCompanyEnvRow(row)) {
+      const ok = await confirm({
+        title: `删除${kind}？`,
+        description: `${name ? `「${name}」` : "该条目"}将立即从配置中移除并保存，已填写的内容（含密码）无法找回。`,
+        confirmLabel: "删除",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    apply();
+  };
 };
 
 /** 迷你 label + 控件（并排字段用、禁 placeholder-only） */
@@ -221,7 +251,9 @@ const StringListEditor = ({
   onCommit: (next: string[]) => void;
   placeholder?: string;
   addLabel?: string;
-}) => (
+}) => {
+  const removeRow = useRemoveRow();
+  return (
   <div className="space-y-1.5">
     {lines.map((line, i) => (
       <div key={i} className="flex items-center gap-1.5">
@@ -246,7 +278,11 @@ const StringListEditor = ({
             variant="ghost"
             size="icon"
             className="size-8 shrink-0 text-muted-foreground"
-            onClick={() => onCommit(lines.filter((_, j) => j !== i))}
+            onClick={() =>
+              void removeRow("列表项", line.trim(), { line }, () =>
+                onCommit(lines.filter((_, j) => j !== i)),
+              )
+            }
           >
             <X className="size-3.5" />
           </Button>
@@ -255,7 +291,8 @@ const StringListEditor = ({
     ))}
     <AddRowButton label={addLabel} onClick={() => onCommit([...lines, ""])} />
   </div>
-);
+  );
+};
 
 /** 折叠小节壳：收起 = 图标 + 名 + 状态摘要 + chevron */
 const EnvSection = ({
@@ -415,6 +452,7 @@ export const CompanyEnvSection = ({
   onChange,
   onCommit,
 }: CompanyEnvSectionProps) => {
+  const { confirm } = useDialog();
   // 导入飞行中（防双击）
   const [importing, setImporting] = useState(false);
   // 模板预览 dialog
@@ -428,17 +466,12 @@ export const CompanyEnvSection = ({
     promise: Promise<boolean>;
   } | null>(null);
 
-  /** 落盘前校验：已填主机的服务器必须有环境名和用户，否则 ssh-exec 永远选不中 */
+  /**
+   * 落盘（带去重）。
+   * S13-02：不再因「某台服务器缺 env / user」拒绝整份落盘——那会连带阻断 PG / Redis 等所有小节的保存、
+   * 还在失焦时就弹 toast。缺项改为服务器卡里的行内提示（findCompanyEnvServerRowIssue），落盘照常。
+   */
   const persist = (next: CompanyEnv): Promise<boolean> => {
-    const issue = findCompanyEnvServerIssue(next);
-    if (issue === "missing-env") {
-      toast.warning("已填主机的服务器需要先选择环境，否则 SSH 无法选中该台");
-      return Promise.resolve(false);
-    }
-    if (issue === "missing-user") {
-      toast.warning("已填主机的服务器需要填写用户，否则 SSH 无法连接");
-      return Promise.resolve(false);
-    }
     const key = stableKey(next);
     if (lastSavedRef.current === key) return Promise.resolve(true);
     const pending = pendingCommitRef.current;
@@ -516,22 +549,26 @@ export const CompanyEnvSection = ({
         toast.error(`导入失败：${parsed.error}`);
         return;
       }
+      // S13-10：导入是「整体覆盖」（所有小节、含已有密码），当前已有配置时先确认
+      if (isCompanyEnvConfigured(value)) {
+        const ok = await confirm({
+          title: "覆盖当前环境配置？",
+          description:
+            "导入会整体替换现有的服务器 / 数据库 / 日志等全部环境配置（含已保存的密码），无法撤销。",
+          confirmLabel: "覆盖导入",
+          destructive: true,
+          defaultFocus: "cancel",
+        });
+        if (!ok) return;
+      }
       // 导入后保持收起——摘要变绿即感知生效
       setOpenId(null);
-      const issue = findCompanyEnvServerIssue(parsed.value);
-      if (issue) {
-        onChange(parsed.value);
-        toast.warning(
-          issue === "missing-env"
-            ? "导入内容暂未保存：请补全服务器的 env 后重新保存"
-            : "导入内容暂未保存：请补全服务器的 user 后重新保存",
-        );
-        return;
-      }
       const saved = await commit(parsed.value);
       if (!saved) {
         // saveFieldValue 失败时已弹「保存失败」toast，这里不重复提示
         return;
+      } else if (findCompanyEnvServerIssue(parsed.value)) {
+        toast.warning("已导入，但有服务器缺环境或用户，SSH 无法选中，请在服务器小节补全");
       } else if (!isCompanyEnvConfigured(parsed.value)) {
         toast.warning("已导入，但未填可用的服务器/数据库等字段");
       } else if (parsed.warnings.length > 0) {
@@ -550,7 +587,15 @@ export const CompanyEnvSection = ({
     }
   };
 
-  const handleExport = () => {
+  const handleExport = async () => {
+    // S13-10：导出文件含明文密码（跨机器迁移 / 发给同事一键导入就是靠它），导出前明示风险
+    const ok = await confirm({
+      title: "导出包含明文密码",
+      description:
+        "导出的 company-env.json 里服务器 / 数据库等密码是明文，请勿发到公开渠道或提交进仓库。",
+      confirmLabel: "仍然导出",
+    });
+    if (!ok) return;
     const blob = new Blob([`${JSON.stringify(value, null, 2)}\n`], {
       type: "application/json",
     });
@@ -579,6 +624,17 @@ export const CompanyEnvSection = ({
   const elkList = value.elk;
   const slsList = value.sls ?? [];
   const httpApis = value.httpApis ?? [];
+
+  // 各含密码小节的稳定行 key（S13-17：不能用下标，否则删行后密码框「显示」状态串到别的行）
+  const serverKeys = useStableRowKeys(servers, stableKey);
+  const pgKeys = useStableRowKeys(pgList, stableKey);
+  const redisKeys = useStableRowKeys(redisList, stableKey);
+  const xxlKeys = useStableRowKeys(value.xxljob, stableKey);
+  const nacosKeys = useStableRowKeys(nacosList, stableKey);
+  const elkKeys = useStableRowKeys(elkList, stableKey);
+  const slsKeys = useStableRowKeys(slsList, stableKey);
+
+  const removeRow = useRemoveRow();
 
   const sStat = serverSummary(servers);
   const pStat = pgSummary(pgList);
@@ -616,7 +672,7 @@ export const CompanyEnvSection = ({
               type="button"
               variant="outline"
               size="sm"
-              onClick={handleExport}
+              onClick={() => void handleExport()}
             >
               <Download />
               导出
@@ -645,111 +701,127 @@ export const CompanyEnvSection = ({
             onToggle={toggle}
           >
             <div className="space-y-2">
-              {servers.map((s, i) => (
-                <InstanceCard key={i}>
-                  <div className="flex flex-wrap items-end gap-1.5">
-                    <MiniField
-                      label="环境"
-                      className={ENV_FIELD_CLASS}
-                    >
-                      <Combobox
-                        value={s.env}
-                        onValueChange={(env) => {
-                          const next: CompanyEnvServer[] = servers.map(
-                            (row, j) => (j === i ? { ...row, env } : row),
-                          );
-                          commit({ ...value, servers: next });
-                        }}
-                        options={ENV_OPTIONS}
-                        placeholder="请选择"
-                        allowCustom
-                        className="h-8 w-full"
-                      />
-                    </MiniField>
-                    <MiniField
-                      label="主机"
-                      className="min-w-0 flex-1 space-y-0.5"
-                    >
-                      <Input
-                        value={s.host}
-                        onChange={(e) => {
-                          const next = servers.map((row, j) =>
-                            j === i ? { ...row, host: e.target.value } : row,
-                          );
-                          patch({ servers: next });
-                        }}
-                        onBlur={() => persist(value)}
-                        className="h-8 font-mono text-xs"
-                      />
-                    </MiniField>
-                    <Tooltip content="删除">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        className="size-8"
-                        onClick={() => {
-                          commit({
-                            ...value,
-                            servers: servers.filter((_, j) => j !== i),
-                          });
-                        }}
+              {servers.map((s, i) => {
+                const rowIssue = findCompanyEnvServerRowIssue(s);
+                return (
+                  <InstanceCard key={serverKeys[i]}>
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      <MiniField
+                        label="环境"
+                        className={ENV_FIELD_CLASS}
                       >
-                        <Trash2 className="size-3.5" />
-                      </Button>
-                    </Tooltip>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    <MiniField
-                      label="端口"
-                      className="w-20 shrink-0 space-y-0.5"
-                    >
-                      <Input
-                        type="number"
-                        value={s.port}
-                        onChange={(e) => {
-                          const port = Number(e.target.value) || 22;
-                          const next = servers.map((row, j) =>
-                            j === i ? { ...row, port } : row,
-                          );
-                          patch({ servers: next });
-                        }}
-                        onBlur={() => persist(value)}
-                        className="h-8"
-                      />
-                    </MiniField>
-                    <MiniField label="用户">
-                      <Input
-                        value={s.user}
-                        onChange={(e) => {
-                          const next = servers.map((row, j) =>
-                            j === i ? { ...row, user: e.target.value } : row,
-                          );
-                          patch({ servers: next });
-                        }}
-                        onBlur={() => persist(value)}
-                        className="h-8"
-                      />
-                    </MiniField>
-                    <MiniField label="密码">
-                      <PasswordInput
-                        value={s.password}
-                        onChange={(e) => {
-                          const next = servers.map((row, j) =>
-                            j === i
-                              ? { ...row, password: e.target.value }
-                              : row,
-                          );
-                          patch({ servers: next });
-                        }}
-                        onBlur={() => persist(value)}
-                        autoComplete="off"
-                        className="h-8"
-                      />
-                    </MiniField>
-                  </div>
-                </InstanceCard>
-              ))}
+                        <Combobox
+                          value={s.env}
+                          onValueChange={(env) => {
+                            const next: CompanyEnvServer[] = servers.map(
+                              (row, j) => (j === i ? { ...row, env } : row),
+                            );
+                            commit({ ...value, servers: next });
+                          }}
+                          options={ENV_OPTIONS}
+                          placeholder="请选择"
+                          allowCustom
+                          className="h-8 w-full"
+                        />
+                      </MiniField>
+                      <MiniField
+                        label="主机"
+                        className="min-w-0 flex-1 space-y-0.5"
+                      >
+                        <Input
+                          value={s.host}
+                          onChange={(e) => {
+                            const next = servers.map((row, j) =>
+                              j === i ? { ...row, host: e.target.value } : row,
+                            );
+                            patch({ servers: next });
+                          }}
+                          onBlur={() => persist(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <Tooltip content="删除">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="size-8"
+                          onClick={() =>
+                            void removeRow("服务器", s.host, s, () =>
+                              commit({
+                                ...value,
+                                servers: servers.filter((_, j) => j !== i),
+                              }),
+                            )
+                          }
+                        >
+                          <Trash2 className="size-3.5" />
+                        </Button>
+                      </Tooltip>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField
+                        label="端口"
+                        className="w-20 shrink-0 space-y-0.5"
+                      >
+                        <IntInput
+                          label="端口"
+                          value={s.port}
+                          min={PORT_MIN}
+                          max={PORT_MAX}
+                          fallback={22}
+                          onCommit={(port) =>
+                            commit({
+                              ...value,
+                              servers: servers.map((row, j) =>
+                                j === i ? { ...row, port } : row,
+                              ),
+                            })
+                          }
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="用户">
+                        <Input
+                          value={s.user}
+                          onChange={(e) => {
+                            const next = servers.map((row, j) =>
+                              j === i ? { ...row, user: e.target.value } : row,
+                            );
+                            patch({ servers: next });
+                          }}
+                          onBlur={() => persist(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="密码">
+                        <PasswordInput
+                          value={s.password}
+                          onChange={(e) => {
+                            const next = servers.map((row, j) =>
+                              j === i
+                                ? { ...row, password: e.target.value }
+                                : row,
+                            );
+                            patch({ servers: next });
+                          }}
+                          onBlur={() => persist(value)}
+                          autoComplete="off"
+                          className="h-8"
+                        />
+                      </MiniField>
+                    </div>
+                    {/* 缺项只提示不拦保存（S13-02）：SSH 选不中 / 连不上，但其它小节照常存 */}
+                    {rowIssue ? (
+                      <p className="text-[11px] text-warning">
+                        {rowIssue === "missing-env"
+                          ? "缺环境名：SSH 无法选中这台"
+                          : "缺用户：SSH 无法连接这台"}
+                      </p>
+                    ) : null}
+                  </InstanceCard>
+                );
+              })}
               <AddRowButton
                 label="添加服务器"
                 onClick={() => {
@@ -785,7 +857,7 @@ export const CompanyEnvSection = ({
                     pg: pgList.map((row, j) => (j === i ? next : row)),
                   });
                 return (
-                  <InstanceCard key={i}>
+                  <InstanceCard key={pgKeys[i]}>
                     <div className="flex flex-wrap items-end gap-1.5">
                       <InstanceCardHeader
                         env={p.env}
@@ -810,10 +882,12 @@ export const CompanyEnvSection = ({
                           commitPg({ ...p, readonly })
                         }
                         onRemove={() =>
-                          commit({
-                            ...value,
-                            pg: pgList.filter((_, j) => j !== i),
-                          })
+                          void removeRow("PostgreSQL 实例", p.host, p, () =>
+                            commit({
+                              ...value,
+                              pg: pgList.filter((_, j) => j !== i),
+                            }),
+                          )
                         }
                       />
                     </div>
@@ -822,16 +896,13 @@ export const CompanyEnvSection = ({
                         label="端口"
                         className="w-20 shrink-0 space-y-0.5"
                       >
-                        <Input
-                          type="number"
+                        <IntInput
+                          label="端口"
                           value={p.port}
-                          onChange={(e) =>
-                            patchPg({
-                              ...p,
-                              port: Number(e.target.value) || 5432,
-                            })
-                          }
-                          onBlur={() => persist(value)}
+                          min={PORT_MIN}
+                          max={PORT_MAX}
+                          fallback={5432}
+                          onCommit={(port) => commitPg({ ...p, port })}
                           className="h-8"
                         />
                       </MiniField>
@@ -898,7 +969,7 @@ export const CompanyEnvSection = ({
                     redis: redisList.map((row, j) => (j === i ? next : row)),
                   });
                 return (
-                  <InstanceCard key={i}>
+                  <InstanceCard key={redisKeys[i]}>
                     <div className="flex flex-wrap items-end gap-1.5">
                       <InstanceCardHeader
                         env={r.env}
@@ -923,10 +994,12 @@ export const CompanyEnvSection = ({
                           commitRedis({ ...r, readonly })
                         }
                         onRemove={() =>
-                          commit({
-                            ...value,
-                            redis: redisList.filter((_, j) => j !== i),
-                          })
+                          void removeRow("Redis 实例", r.host, r, () =>
+                            commit({
+                              ...value,
+                              redis: redisList.filter((_, j) => j !== i),
+                            }),
+                          )
                         }
                       />
                     </div>
@@ -935,16 +1008,13 @@ export const CompanyEnvSection = ({
                         label="端口"
                         className="w-20 shrink-0 space-y-0.5"
                       >
-                        <Input
-                          type="number"
+                        <IntInput
+                          label="端口"
                           value={r.port}
-                          onChange={(e) =>
-                            patchRedis({
-                              ...r,
-                              port: Number(e.target.value) || 6379,
-                            })
-                          }
-                          onBlur={() => persist(value)}
+                          min={PORT_MIN}
+                          max={PORT_MAX}
+                          fallback={6379}
+                          onCommit={(port) => commitRedis({ ...r, port })}
                           className="h-8"
                         />
                       </MiniField>
@@ -952,16 +1022,13 @@ export const CompanyEnvSection = ({
                         label="DB"
                         className="w-16 shrink-0 space-y-0.5"
                       >
-                        <Input
-                          type="number"
+                        <IntInput
+                          label="DB"
                           value={r.db}
-                          onChange={(e) =>
-                            patchRedis({
-                              ...r,
-                              db: Math.max(0, Number(e.target.value) || 0),
-                            })
-                          }
-                          onBlur={() => persist(value)}
+                          min={0}
+                          max={1023}
+                          fallback={0}
+                          onCommit={(db) => commitRedis({ ...r, db })}
                           className="h-8"
                         />
                       </MiniField>
@@ -1022,7 +1089,7 @@ export const CompanyEnvSection = ({
                     ),
                   });
                 return (
-                  <InstanceCard key={i}>
+                  <InstanceCard key={xxlKeys[i]}>
                     <div className="flex flex-wrap gap-1.5">
                       <MiniField
                         label="环境"
@@ -1073,12 +1140,14 @@ export const CompanyEnvSection = ({
                           variant="ghost"
                           size="icon"
                           className="mt-4 size-8 shrink-0"
-                          onClick={() => {
-                            commit({
-                              ...value,
-                              xxljob: value.xxljob.filter((_, j) => j !== i),
-                            });
-                          }}
+                          onClick={() =>
+                            void removeRow("XXL-Job 环境", x.baseUrl, x, () =>
+                              commit({
+                                ...value,
+                                xxljob: value.xxljob.filter((_, j) => j !== i),
+                              }),
+                            )
+                          }
                         >
                           <Trash2 className="size-3.5" />
                         </Button>
@@ -1147,7 +1216,7 @@ export const CompanyEnvSection = ({
                     nacos: nacosList.map((row, j) => (j === i ? next : row)),
                   });
                 return (
-                  <InstanceCard key={i}>
+                  <InstanceCard key={nacosKeys[i]}>
                     <div className="flex flex-wrap items-end gap-1.5">
                       <InstanceCardHeader
                         env={n.env}
@@ -1172,10 +1241,12 @@ export const CompanyEnvSection = ({
                           commitNacos({ ...n, readonly })
                         }
                         onRemove={() =>
-                          commit({
-                            ...value,
-                            nacos: nacosList.filter((_, j) => j !== i),
-                          })
+                          void removeRow("Nacos 集群", n.baseUrl, n, () =>
+                            commit({
+                              ...value,
+                              nacos: nacosList.filter((_, j) => j !== i),
+                            }),
+                          )
                         }
                       />
                     </div>
@@ -1258,7 +1329,7 @@ export const CompanyEnvSection = ({
                     elk: elkList.map((row, j) => (j === i ? next : row)),
                   });
                 return (
-                  <InstanceCard key={i}>
+                  <InstanceCard key={elkKeys[i]}>
                     <div className="flex flex-wrap items-end gap-1.5">
                       <InstanceCardHeader
                         env={e.env}
@@ -1279,10 +1350,12 @@ export const CompanyEnvSection = ({
                       </MiniField>
                       <InstanceRowEnd
                         onRemove={() =>
-                          commit({
-                            ...value,
-                            elk: elkList.filter((_, j) => j !== i),
-                          })
+                          void removeRow("ELK 实例", e.baseUrl, e, () =>
+                            commit({
+                              ...value,
+                              elk: elkList.filter((_, j) => j !== i),
+                            }),
+                          )
                         }
                       />
                     </div>
@@ -1349,7 +1422,7 @@ export const CompanyEnvSection = ({
                     sls: slsList.map((row, j) => (j === i ? next : row)),
                   });
                 return (
-                  <InstanceCard key={i}>
+                  <InstanceCard key={slsKeys[i]}>
                     <div className="flex flex-wrap items-end gap-1.5">
                       <InstanceCardHeader
                         env={s.env}
@@ -1370,10 +1443,12 @@ export const CompanyEnvSection = ({
                       </MiniField>
                       <InstanceRowEnd
                         onRemove={() =>
-                          commit({
-                            ...value,
-                            sls: slsList.filter((_, j) => j !== i),
-                          })
+                          void removeRow("SLS 实例", s.project, s, () =>
+                            commit({
+                              ...value,
+                              sls: slsList.filter((_, j) => j !== i),
+                            }),
+                          )
                         }
                       />
                     </div>
@@ -1488,12 +1563,14 @@ export const CompanyEnvSection = ({
                         size="icon"
                         className="size-8 shrink-0 text-muted-foreground"
                         aria-label="删除"
-                        onClick={() => {
-                          commit({
-                            ...value,
-                            httpApis: httpApis.filter((_, j) => j !== i),
-                          });
-                        }}
+                        onClick={() =>
+                          void removeRow("HTTP API", h.url, h, () =>
+                            commit({
+                              ...value,
+                              httpApis: httpApis.filter((_, j) => j !== i),
+                            }),
+                          )
+                        }
                       >
                         <Trash2 className="size-3.5" />
                       </Button>
@@ -1581,11 +1658,14 @@ export const CompanyEnvSection = ({
                           type="button"
                           variant="ghost"
                           size="icon-xs"
+                          aria-label="删除"
                           onClick={() =>
-                            commit({
-                              ...value,
-                              custom: value.custom.filter((_, j) => j !== i),
-                            })
+                            void removeRow("自定义条目", c.name, c, () =>
+                              commit({
+                                ...value,
+                                custom: value.custom.filter((_, j) => j !== i),
+                              }),
+                            )
                           }
                         >
                           <Trash2 />

@@ -117,6 +117,20 @@ export type MarkdownTextSize = "default" | "reply";
 export const MARKDOWN_REPLY_TEXT = "text-[15px] leading-7";
 
 /**
+ * task(log) 右栏的 AI 回复正文档：14px / leading-6（24px）= prose-sm 的原生值。
+ *
+ * 为什么 task 栏不跟 chat 用 15px：2026-10-12 事件流 v2 把 AI 正文真正落到 15px / 28px 后，
+ * 用户（2026-10-13）反馈「事件流本身就不宽、文字变大了体验不好」——task 的事件流是右侧分栏、
+ * 只有 chat 居中宽列（max-w-3xl）的一半多一点，每行字数少、行高又大，一屏装不下几句话。
+ * 14px / 24px 正是 v2 之前用户一直在用的实际渲染值（三个月没人抱怨）。
+ *
+ * 所以这一档**不传 `size="reply"`**（走 default = prose-sm 原生 14px / 24px），
+ * 外层 wrapper 用这个常量给非 prose 元素对齐；chat 宽列仍是 15px。
+ * 流式占位与定稿必须同档，否则收尾换成正式行时整段文字会跳一下。
+ */
+export const MARKDOWN_LOG_REPLY_TEXT = "text-sm leading-6";
+
+/**
  * reply 档在 prose 元素上加的类：正文 15px / leading-7 + 行内 code 钉 12px。
  * prose-sm 里行内 code 是 `.857em`，基准从 14px 抬到 15px 后会变 12.86px——落在字号阶梯
  * （15 / 14 / 12 / 11）之外，所以钉回 `text-xs`。选择器 `:not(pre)>code` 只命中行内 code，
@@ -222,7 +236,8 @@ interface MarkdownTextProps {
   /**
    * 正文字号档（只对 variant="chat" 生效）：
    * - default：14px（prose-sm 原值）——问答卡、工具产出等次要面
-   * - reply：对话正文 15px / leading-7（{@link MARKDOWN_REPLY_TEXT}）——**AI 回复**一律用这档；
+   * - reply：对话正文 15px / leading-7（{@link MARKDOWN_REPLY_TEXT}）——**chat 宽列里的 AI 回复**用这档；
+   *   task(log) 右栏窄、用 default（14px / 24px，见 {@link MARKDOWN_LOG_REPLY_TEXT}）。
    *   流式占位与定稿必须同档，否则流式结束换成正式行时整段文字会跳一下
    */
   size?: MarkdownTextSize;

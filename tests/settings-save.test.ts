@@ -29,6 +29,7 @@ const localStorageStub = {
 import {
   DEFAULT_SETTINGS,
   getSettings,
+  getSettingsUnreadable,
   normalizeSettings,
   saveSettings,
 } from "@/lib/local-store";
@@ -137,6 +138,33 @@ describe("saveSettings（CR-08）", () => {
     await expect(fail).resolves.toBe(false);
     expect(getSettings().apiKey).toBe("已落盘");
   });
+
+  it("F6-03：运行中途某次 PUT 撞上 500 settings_unreadable → 仍只是普通保存失败（false + 回滚），不记粘性的「不可读」状态", async () => {
+    // 有意的取舍：这可能是瞬时错误（Windows 杀软 / 同步盘短暂占住文件），粘性暂停会让设置页在文件恢复后
+    // 还一直拒绝保存；「不可读」状态只在读取阶段（initSettings 的 GET /full）记录
+    const ok = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "中途前" });
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    pendingCalls[0].resolve(okResponse());
+    await expect(ok).resolves.toBe(true);
+
+    const fail = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "中途写失败" });
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(2));
+    pendingCalls[1].resolve(
+      new Response(
+        JSON.stringify({ error: "settings_unreadable", reason: "EBUSY: resource busy" }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await expect(fail).resolves.toBe(false);
+    expect(getSettings().apiKey).toBe("中途前");
+    expect(getSettingsUnreadable()).toBeNull();
+
+    // 文件恢复后，下一次保存照常成功
+    const again = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "恢复后" });
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(3));
+    pendingCalls[2].resolve(okResponse());
+    await expect(again).resolves.toBe(true);
+  });
 });
 
 describe("normalizeSettings 健壮性", () => {
@@ -171,6 +199,7 @@ describe("repoConfigEquals（CR-09）", () => {
     devBranch: "develop",
     branchTemplate: "feature/{storyId}",
     previewCommand: "npm run dev",
+    setupCommand: "pnpm install --frozen-lockfile",
   };
 
   it("全字段一致 → 相等；可选字段 undefined 与空串视同", () => {
@@ -178,7 +207,7 @@ describe("repoConfigEquals（CR-09）", () => {
     expect(
       repoConfigEquals(
         { name: "a", path: "/a" },
-        { name: "a", path: "/a", onlineBranch: "", previewCommand: "" },
+        { name: "a", path: "/a", onlineBranch: "", previewCommand: "", setupCommand: "" },
       ),
     ).toBe(true);
   });
@@ -189,6 +218,7 @@ describe("repoConfigEquals（CR-09）", () => {
     ["devBranch", { devBranch: "dev" }],
     ["branchTemplate", { branchTemplate: "feat/{storyId}" }],
     ["previewCommand", { previewCommand: "pnpm dev" }],
+    ["setupCommand", { setupCommand: "yarn install" }],
     ["name", { name: "web2" }],
     ["path", { path: "/repo/web2" }],
   ] as const)("%s 单独改动 → 不相等（旧实现漏比五个字段）", (_field, patch) => {

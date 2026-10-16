@@ -38,6 +38,13 @@ export interface RepoConfig {
    */
   previewCommand?: string;
   /**
+   * 依赖初始化命令（如 `yarn install --frozen-lockfile --prefer-offline`）。
+   * worktree 新建后，若依赖目录未能从原仓库克隆（非 macOS / 克隆失败 / 原仓无依赖目录），
+   * 在 worktree 目录里执行；克隆成功则不执行。权威来源为服务端 config.json（设置页保存），
+   * 不信任客户端或任务快照；留空 = 不执行（回退 agent 自装依赖）。
+   */
+  setupCommand?: string;
+  /**
    * 只读仓：AI 不允许改内容 / 建分支 / commit / push / 提 MR（允许 pull、切提测分支拉最新做验证）。
    * 建任务时快照进 task.readonlyRepoPaths；运行时读快照、不回头查设置。
    */

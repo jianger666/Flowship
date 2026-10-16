@@ -226,6 +226,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
             send({ type: "error", message: ev.message });
             break;
           case "assistant_delta":
+            // 旁路群答疑 run 的增量带 origin，不能流进属主 UI 实时气泡
+            if (ev.origin) break;
             send({ type: "assistant_delta", text: ev.text });
             break;
           // 思考实时帧（纯内存、不落盘）：思考进行中让 UI 把「进行中的 thinking 行」画进流程；

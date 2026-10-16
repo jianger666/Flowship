@@ -244,17 +244,38 @@ export const sameRepoPaths = (
 /**
  * 没说过话的空对话草稿（对齐 Codex：占位标题 + 还没会话锚点）。
  * 用户改过名或发过首条就不算空，新建时另开。
+ * 已归档的不算：侧栏不显示归档项，复用它 =「点了新建、打开的对话却不在左边列表」。
  */
 export const isUnusedDraftChat = (t: {
   mode?: TaskMode;
   title: string;
   repoStatus: string;
   sessionAgentId?: string;
+  archived?: boolean;
 }): boolean =>
   t.mode === "chat" &&
+  !t.archived &&
   t.repoStatus === "developing" &&
   isPlaceholderChatTitle(t.title) &&
   !t.sessionAgentId?.trim();
+
+/**
+ * 「对话」胶囊 / 归档当前对话后的落点（/chats 页用）：
+ * 优先「最后浏览的那条」，没有就取最近活跃的；**只在未归档的对话里选**——
+ * 侧栏不显示归档项，落到归档对话 = 页面开着、左边列表却没有它。
+ * 没有可落的（没对话 / 全归档）返回 undefined，由调用方显示空态。
+ */
+export const pickChatLanding = <
+  T extends { id: string; mode?: TaskMode; archived?: boolean; updatedAt: number },
+>(
+  tasks: readonly T[],
+  lastChatId: string | null,
+): T | undefined => {
+  const chats = tasks.filter((t) => t.mode === "chat" && !t.archived);
+  if (chats.length === 0) return undefined;
+  const last = lastChatId ? chats.find((t) => t.id === lastChatId) : undefined;
+  return last ?? [...chats].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+};
 
 /**
  * 找一条可复用的空草稿。有指定工作目录时优先同目录；没有同目录就复用最近那条空的。
@@ -265,6 +286,7 @@ export const findUnusedDraftChat = <
     title: string;
     repoStatus: string;
     sessionAgentId?: string;
+    archived?: boolean;
     updatedAt: number;
     repoPaths?: string[];
   },

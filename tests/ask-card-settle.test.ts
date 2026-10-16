@@ -261,3 +261,90 @@ describe("settleAskCards", () => {
     expect(patched).toBe(1);
   });
 });
+
+describe("settle 占坑释放 / 终态视图生命周期（R3-02）", () => {
+  const seedTwoCards = async (): Promise<void> => {
+    for (const [messageId, cardId, routeTaskId] of [
+      ["om_p2p", "card_p2p", TASK_ID],
+      ["om_group", "card_group", ""],
+    ] as const) {
+      await rememberAskCard({
+        messageId,
+        cardId,
+        routeTaskId,
+        askTaskId: TASK_ID,
+        askId: ASK_ID,
+      });
+    }
+  };
+
+  const settleInput = {
+    taskId: TASK_ID,
+    askId: ASK_ID,
+    questions: QUESTIONS,
+    noteByQuestion: { q1: "已选择：方案 A" },
+    fallbackNote: "已回答",
+    hintNote: "done",
+  };
+
+  it("没有卡 → 占坑释放（可重试）、终态视图保留、重试能重新占坑", async () => {
+    const {
+      getAskCardSettledView,
+      isAskCardSettled: settled,
+    } = await import("@/lib/server/feishu-bridge/ask-settle-state");
+
+    expect(await settleAskCards(settleInput)).toBe(0);
+    expect(settled(TASK_ID, ASK_ID)).toBe(false);
+    expect(getAskCardSettledView(TASK_ID, ASK_ID)).toMatchObject({
+      noteByQuestion: { q1: "已选择：方案 A" },
+      hintNote: "done",
+    });
+
+    // 卡索引后来落盘了：重试能占上、置态成功
+    await seedTwoCards();
+    expect(await settleAskCards(settleInput)).toBe(2);
+    expect(settled(TASK_ID, ASK_ID)).toBe(true);
+  });
+
+  it("dropAskCardSettledView：只丢视图；已占坑的继续挡重复置态，没占坑的整条删掉", async () => {
+    const {
+      __askCardSettleSizeForTest,
+      claimAskCardSettle,
+      dropAskCardSettledView,
+      getAskCardSettledView,
+    } = await import("@/lib/server/feishu-bridge/ask-settle-state");
+
+    // 已占坑 + 有视图
+    await seedTwoCards();
+    expect(await settleAskCards(settleInput)).toBe(2);
+    dropAskCardSettledView(TASK_ID, ASK_ID);
+    expect(getAskCardSettledView(TASK_ID, ASK_ID)).toBeNull();
+    expect(claimAskCardSettle(TASK_ID, ASK_ID)).toBe(false);
+
+    // 释放过占坑（无卡）+ 有视图 → drop 后整条删除
+    __resetAskCardSettleForTest();
+    const noCard = { ...settleInput, askId: "ask-nocard" };
+    expect(await settleAskCards(noCard)).toBe(0);
+    expect(__askCardSettleSizeForTest()).toBe(1);
+    dropAskCardSettledView(TASK_ID, "ask-nocard");
+    expect(__askCardSettleSizeForTest()).toBe(0);
+  });
+
+  it("超过 TTL 的登记（含只剩视图的）在下一次占坑时被清掉", async () => {
+    const { __askCardSettleSizeForTest, claimAskCardSettle } = await import(
+      "@/lib/server/feishu-bridge/ask-settle-state"
+    );
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-14T00:00:00Z"));
+      expect(await settleAskCards(settleInput)).toBe(0); // 无卡：只剩视图
+      expect(__askCardSettleSizeForTest()).toBe(1);
+
+      vi.setSystemTime(new Date("2026-10-15T00:00:01Z")); // > 24h
+      expect(claimAskCardSettle("other-task", "other-ask")).toBe(true);
+      expect(__askCardSettleSizeForTest()).toBe(1); // 旧的被扫掉、只剩新占的
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

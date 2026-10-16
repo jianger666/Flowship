@@ -12,7 +12,7 @@
  * query：?project=<projectKey>&name=<工作项名>&url=<详情页URL>
  */
 
-import { Suspense, use, useMemo } from "react";
+import { Suspense, use, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { ChevronLeft, Rocket } from "lucide-react";
@@ -20,9 +20,14 @@ import { ChevronLeft, Rocket } from "lucide-react";
 import { TaskLaunchForm } from "@/components/tasks/task-launch-form";
 import { WorkitemDetail } from "@/components/feishu/workitem-detail";
 import { Button } from "@/components/ui/button";
+import { LoadingState } from "@/components/ui/loading-state";
 import { Separator } from "@/components/ui/separator";
 import { useTaskList } from "@/hooks/use-task-list";
-import { extractFeishuStoryId } from "@/lib/branch-template";
+import {
+  decideWorkitemGate,
+  findExistingWorkitemTask,
+  safeHttpUrl,
+} from "@/lib/workitem-link";
 import type { Task } from "@/lib/types";
 
 const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) => {
@@ -31,19 +36,34 @@ const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) =
   const sp = useSearchParams();
   const projectKey = sp.get("project") ?? undefined;
   const name = sp.get("name") ?? "";
-  const url = sp.get("url") ?? "";
-  const { tasks, upsertTask } = useTaskList();
+  // query 可被任意构造：只放行 http(s) 链接（拒绝 javascript: / data: 等），非法当没有链接
+  const url = safeHttpUrl(sp.get("url"));
+  const { tasks, loaded, upsertTask } = useTaskList();
+  // 用户明确选择「仍要新建」后才放出表单（匹配口径再准也可能有误判 / 用户就是想再建一个）
+  const [forceNew, setForceNew] = useState(false);
+  // 表单已放出过的工作项 id：放出后即使之后才匹配到已有任务也不卸载表单（防丢已填内容）；记 id 是为切到别的工作项时自动失效
+  const [formShownFor, setFormShownFor] = useState<string | null>(null);
 
-  // 兜底防重复建：该工作项已有任务（看板正常不会带进来、直开 URL 场景）→ 提示直进。
-  // 精确比 story id（不用 includes、防短 id 子串误匹配、与 board join 同口径）
+  // 兜底防重复建：该工作项已有任务（看板正常不会带进来、直开 URL 场景）→ 提示直进，
+  // 但永远留「仍要新建」出口。id 只从详情链接路径里取、再补归一化链接比对（口径见 workitem-link.ts）
   const existing = useMemo(
-    () =>
-      tasks.find(
-        (t) =>
-          t.mode !== "chat" && extractFeishuStoryId(t.feishuStoryUrl) === id,
-      ),
-    [tasks, id],
+    () => findExistingWorkitemTask(tasks, { id, url }),
+    [tasks, id, url],
   );
+
+  // 启动区三态：任务列表首次加载完成前一律 loading——此时 tasks 为空、existing 必然查不到，
+  // 先放表单会在匹配上后被卸载（丢输入 / 误建重复任务，N9-02）
+  const gate = decideWorkitemGate({
+    loaded,
+    existing,
+    forceNew,
+    formShown: formShownFor === id,
+  });
+
+  // 表单一旦放出就记下来：之后轮询 / 别的窗口建了同一工作项的任务也只补提示、不收回表单
+  useEffect(() => {
+    if (gate === "form") setFormShownFor(id);
+  }, [gate, id]);
 
   const handleCreated = (task: Task) => {
     upsertTask(task);
@@ -67,16 +87,32 @@ const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) =
 
       <Separator />
 
-      {/* 启动配置区 / 已有任务直进 */}
-      {existing ? (
+      {/* 启动配置区 / 已有任务直进；任务列表加载完成前只给占位、不渲染表单 */}
+      {gate === "loading" && (
+        <LoadingState variant="card" label="正在检查该工作项是否已有任务…" />
+      )}
+      {gate !== "loading" && existing && (
         <div className="flex items-center gap-3 rounded-md border border-primary/30 bg-primary/5 px-4 py-3 text-sm">
           <Rocket className="size-4 shrink-0 text-primary" />
           <span className="min-w-0 flex-1">
-            这个工作项已有任务「{existing.title}」
+            已存在相关任务：
+            <Link
+              href={`/tasks/${existing.id}`}
+              className="underline hover:text-foreground"
+            >
+              {existing.title}
+            </Link>
           </span>
+          {/* 表单已展开（点过「仍要新建」或之前就放出了）时不再给这个按钮 */}
+          {gate === "existing" && (
+            <Button size="sm" variant="outline" onClick={() => setForceNew(true)}>
+              仍要新建
+            </Button>
+          )}
           <Button size="sm" render={<Link href={`/tasks/${existing.id}`}>进入任务</Link>} />
         </div>
-      ) : (
+      )}
+      {gate === "form" && (
         <TaskLaunchForm
           initialTitle={name}
           feishuStoryUrl={url}

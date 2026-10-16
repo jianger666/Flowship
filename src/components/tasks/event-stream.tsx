@@ -45,8 +45,10 @@ import {
 } from "@/hooks/use-stream-follow";
 import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
 import {
+  RHYTHM_GROUP_DIVIDER_TOP,
   rhythmPaddingBottom,
   rhythmPaddingTop,
+  rhythmShowsGroupDivider,
   rhythmTier,
   type RhythmFacts,
 } from "@/lib/event-stream-rhythm";
@@ -126,6 +128,7 @@ import {
   mergeAdjacentThinking,
   summarize,
 } from "./event-stream/utils";
+import { buildResendPayload } from "./event-stream/resend-payload";
 import {
   AskUserRequestRow,
   CompactionRow,
@@ -414,6 +417,13 @@ interface Props {
   liveThinking?: LiveThinking | null;
   /** P3：回退到 checkpointed user_reply */
   onRewind?: (eventId: string) => void;
+  /**
+   * 编辑已发送的消息（Codex / Cursor IDE 式）的「回退」那一半：父组件负责 确认 → 停当前回复 → 回退
+   * 到这条消息之前（有文件检查点连文件一起还原、没有就只回退对话）。返回 ok 后本组件把编辑后的
+   * 内容作为新消息发出——于是被编辑的消息及之后的对话被替换。cancelled = 用户在确认框取消、
+   * failed = 父组件已弹错误提示，两种都保持编辑态。不传 = 退回旧语义（只有最后一条、编辑后追加）。
+   */
+  onEditRewind?: (ev: TaskEvent) => Promise<"ok" | "cancelled" | "failed">;
   /** P5：本地排队占位气泡（displayText 与服务端 user_reply 文案对齐） */
   pendingLocalReplies?: Array<{
     id: string;
@@ -641,6 +651,7 @@ const EventStreamImpl = ({
   liveToolOutputs,
   liveThinking,
   onRewind,
+  onEditRewind,
   pendingLocalReplies,
   queueBanner,
   allowQueueWhileRunning,
@@ -1520,6 +1531,7 @@ const EventStreamImpl = ({
 
   // v1.0：chat「最后一条用户消息」重发 / 原地编辑——把（编辑后的）内容作为新消息发到末尾。
   // 原消息保留（append-only）；重发携带原 meta.images / attachments（批 B 补图）。
+  // 〔更新〕「编辑」现在走下面的 handleEditInPlace（替换这条及之后的对话）；本函数只剩原样重发 / 重新生成
   // 返回 false = 失败（编辑态保持）；true = 成功
   const resendLockRef = useRef(false);
   const handleResend = useCallback(
@@ -1573,6 +1585,51 @@ const EventStreamImpl = ({
       }
     },
     [onUserReply, task.id],
+  );
+
+  // 最新的 onUserReply：它闭包着发送那一刻的 task 快照（runStatus 等）。原地编辑里回退会把 task 换掉，
+  // 之后发送要用换过之后的那一份（否则刚停掉的 run 在旧快照里还是 running、新消息被误标成「排队中」）
+  const onUserReplyRef = useRef(onUserReply);
+  onUserReplyRef.current = onUserReply;
+
+  // chat 原地编辑任意一条用户消息：编辑后的内容替换「这条及之后的对话」，然后从这里重新跑。
+  // 顺序：先回读图 / 附件（回退会删事件，图要在删之前取）→ 父组件 确认 / 停 / 回退 → 发新消息。
+  // 回退成功但新消息没发出去时旧消息已经删了，把用户打的字放回输入框、别让它丢。
+  // 返回 false = 没改成（编辑态保持）；true = 回退已提交（这一行已不在了，编辑态随之消失）。
+  const handleEditInPlace = useCallback(
+    async (text: string, sourceEv?: TaskEvent): Promise<boolean> => {
+      if (!sourceEv || !onEditRewind || resendLockRef.current) return false;
+      resendLockRef.current = true;
+      try {
+        const payload = await buildResendPayload(task.id, {
+          ...sourceEv,
+          text,
+        });
+        if (payload.imagesPartial) toast.warning("部分附图未能带上");
+        const rewound = await onEditRewind(sourceEv);
+        if (rewound !== "ok") return false;
+        // 回退把 task 快照换掉了：让出一拍给 React 渲染出去、onUserReplyRef 才是新的那一份
+        //（只影响「排队中 / 发送中」这类展示判断，不影响消息本身是否送达；用定时器不用 rAF——窗口在后台时 rAF 不触发）
+        await new Promise<void>((r) => setTimeout(r, 50));
+        const sent = await onUserReplyRef.current?.(
+          text,
+          payload.images,
+          payload.attachments,
+          payload.skillRefs,
+        );
+        if (sent === false) {
+          setDraft((prev) => (prev.trim() ? `${text}\n\n${prev}` : text));
+          inputRef.current?.focus();
+          toast.warning(
+            "已回到这条消息之前，但新消息没发出去；内容已放回输入框，可修改后重发",
+          );
+        }
+        return true;
+      } finally {
+        resendLockRef.current = false;
+      }
+    },
+    [onEditRewind, task.id, setDraft, inputRef],
   );
 
   // 最后一条用户消息：重发入口挂它；「重新生成」也复用它的原文 + 图/附件
@@ -1670,6 +1727,13 @@ const EventStreamImpl = ({
       it.kind === "__work_group__" ||
       it.kind === "__tool_block__" ||
       it.kind === "__tool_verb_group__",
+    // AI 平铺正文（定稿 + 流式）：无框无底色，组间要靠分隔线读出来
+    aiText: isStreamingItem(it) || it.kind === "assistant_message",
+    // 用户这一侧的话：自带气泡 / 边框，且与紧随其后的回答是一组
+    userSide:
+      isPendingLocalItem(it) ||
+      it.kind === "user_reply" ||
+      it.kind === "ask_user_request",
   });
 
   return (
@@ -1910,6 +1974,11 @@ const EventStreamImpl = ({
             // 要先减回 firstItemIndex 才能对 items 数组做定位（分页 prepend 后不减必错位）
             itemContent={(absIdx, item) => {
               const idx = absIdx - firstItemIndex;
+              const facts = rhythmFacts(item);
+              const prevFacts = idx > 0 ? rhythmFacts(items[idx - 1]) : null;
+              const tier = rhythmTier(idx, facts, prevFacts);
+              // AI 一段新话的开头：在留白正中画一条渐隐细线（条件与理由见 rhythmShowsGroupDivider）
+              const showGroupDivider = rhythmShowsGroupDivider(tier, facts, prevFacts);
               return (
               <div
                 data-search-owner-id={
@@ -1923,17 +1992,24 @@ const EventStreamImpl = ({
                   "min-w-0 max-w-full px-4",
                   isChat && "mx-auto w-full max-w-3xl px-6",
                   // 回合节奏（chat / task 同一套）：组间大、组内小——说了一句话 + 它接着干的活读成一组
-                  rhythmPaddingTop(
-                    variant,
-                    rhythmTier(
-                      idx,
-                      rhythmFacts(item),
-                      idx > 0 ? rhythmFacts(items[idx - 1]) : null,
-                    ),
-                  ),
+                  rhythmPaddingTop(variant, tier),
                   idx === items.length - 1 && rhythmPaddingBottom(variant),
+                  // 绝对定位的分隔线以本容器的 padding 盒为基准
+                  showGroupDivider && "relative",
                 )}
               >
+                {/* 组间分隔线：两端渐隐（不是整宽实线——整宽线太像 AI 正文里的 markdown hr），
+                    横向与内容区同边距，纵向落在对话档留白正中。纯装饰、不拦指针 */}
+                {showGroupDivider && (
+                  <div
+                    aria-hidden
+                    className={cn(
+                      "pointer-events-none absolute h-px bg-gradient-to-r from-transparent via-border to-transparent",
+                      RHYTHM_GROUP_DIVIDER_TOP,
+                      isChat ? "inset-x-6" : "inset-x-4",
+                    )}
+                  />
+                )}
                 {/* A3 每轮分割线：用户消息 = 新一轮开始、上方细线 + 轮次时间（第一轮不画） */}
                 {isChat &&
                   item.kind === "user_reply" &&
@@ -2039,6 +2115,12 @@ const EventStreamImpl = ({
                         : undefined
                     }
                     onRewind={isChat ? onRewind : undefined}
+                    // chat 任意一条用户消息原地编辑（替换这条及之后的对话）：可发消息 + 父组件接了回退才给
+                    onEditInPlace={
+                      isChat && canCompose && onEditRewind
+                        ? handleEditInPlace
+                        : undefined
+                    }
                     // 引用追问：可发消息时所有 AI 回复都可引用（不限最后一条）
                     onQuote={isChat && canCompose ? handleQuote : undefined}
                     runActive={isRunning}

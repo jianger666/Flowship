@@ -25,6 +25,7 @@ import { parseGitlabMrUrl, shouldAttachGitlabToken } from "@/lib/mr-inbox";
 import { getMR, mergeMR } from "./gitlab-client";
 import { collectGitlabHostAllowlist } from "./mr-inbox-scanner";
 import { readSettingsFile } from "./settings-fs";
+import { assertTrustedGitHost } from "./trusted-git-host";
 
 /** 没配测试分支的仓回退到这个（与 ship / submit_mr 口径一致） */
 export const BYPASS_DEFAULT_TEST_BRANCH = "test";
@@ -108,6 +109,16 @@ export const mergeTestMrForBypass = async (
     return {
       ok: false,
       text: "合 test MR 失败：MR 所属 GitLab 不在已配置仓库允许列表，拒绝合并。",
+    };
+  }
+  // 第二道闸：allowlist 来自仓库 origin（agent 可写）——再对照首次绑定的可信 host / config 白名单。
+  // 旁路 agent 吃的是群里非属主的不可信输入，MR 链接完全由对方给，这里不能只靠 origin 推导的名单。
+  try {
+    assertTrustedGitHost(parsed.host);
+  } catch (err) {
+    return {
+      ok: false,
+      text: `合 test MR 失败：${err instanceof Error ? err.message : String(err)}`,
     };
   }
   const config = { host: parsed.host, token: gitToken };

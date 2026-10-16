@@ -10,7 +10,7 @@ import path from "node:path";
 
 import { NextResponse } from "next/server";
 
-import { buildRevealInFolderSpec } from "@/lib/local-file-os";
+import { buildRevealInFolderSpec, isWindowsUncPath } from "@/lib/local-file-os";
 
 export const runtime = "nodejs";
 
@@ -40,6 +40,15 @@ export const POST = async (req: Request) => {
   if (!p) return NextResponse.json({ error: "path 必填" }, { status: 400 });
   if (!path.isAbsolute(p) && !/^[a-zA-Z]:[\\/]/.test(p)) {
     return NextResponse.json({ error: "path 必须是绝对路径" }, { status: 400 });
+  }
+
+  // UNC / 设备路径：explorer /select 也会主动连 SMB（NTLM 外泄），与 open-path 同口径拒绝；
+  // 双引号会破坏 `/select,"..."` 单 argv 的引用。
+  if (os.platform() === "win32" && (isWindowsUncPath(p) || p.includes('"'))) {
+    return NextResponse.json(
+      { error: "出于安全考虑，不支持网络共享（UNC）路径或含双引号的路径" },
+      { status: 400 },
+    );
   }
 
   const { command, args, ignoreNonZeroExit } = buildRevealInFolderSpec(

@@ -35,6 +35,66 @@ const clip = (s: string, max: number): string =>
 const cleanName = (raw: unknown): string =>
   clip(oneLine(raw).replace(/[[\]<>]/g, "").trim(), 40);
 
+// ----- 「最近聊天」发送人名字：额外剥掉系统标签字样 -----
+//
+// 「（你自己）」「（机器人）」是渲染层按 isSelf / isBot 追加的系统标签。昵称是群里任何人可控的，
+// 写成 `安若流年（你自己）` 就能让一个别的机器人在 prompt 里看起来像「我自己」，所以发送人名字里
+// 这类括号包裹的标签字样一律剥掉——标签只认渲染层追加的那一个。
+//
+// 为什么不直接并进 cleanName：cleanName 还给 roster 清单用，而协议层 group-reply-protocol 的
+// promptNameOf 与它逐步同口径（tests/group-reply-protocol-r5.test.ts 对拍），agent 照抄清单里的名字写
+// `@名字` 才解析得到人；这边单方面多剥一截，昵称带「（机器人）」的合法成员就会静默 @ 不上。
+// 聊天行里的名字只是展示，不参与 @ 解析，所以只在这里收紧。
+
+const SYSTEM_LABEL_WORDS = ["你自己", "机器人"];
+/** 词内允许夹空白（`你 自 己`）：模型读起来仍是同一个标签 */
+const spacedLabel = (w: string): string => [...w].join("\\s*");
+const LABEL_ONE = `(?:${SYSTEM_LABEL_WORDS.map(spacedLabel).join("|")})`;
+/** 括号里是一个或多个标签，用常见分隔符相连（模仿 roster 的「机器人、你自己」写法） */
+const LABEL_GROUP = `${LABEL_ONE}(?:[\\s、,，;；/|·&+＋]*${LABEL_ONE})*`;
+/** 开 / 闭括号各自成类、不要求配对：`(你自己）` 这种混搭模型照样当标签读 */
+const BRACKET_OPEN = "(（\\[［【〔〖「『｛{﹙《〈";
+const BRACKET_CLOSE = ")）\\]］】〕〗」』｝}﹚》〉";
+const SYSTEM_LABEL_RE = new RegExp(
+  `[${BRACKET_OPEN}]\\s*${LABEL_GROUP}\\s*[${BRACKET_CLOSE}]`,
+  "g",
+);
+const EMPTY_BRACKET_RE = new RegExp(`[${BRACKET_OPEN}]\\s*[${BRACKET_CLOSE}]`, "g");
+
+/**
+ * 反复剥标签直到稳定：嵌套 `（（你自己））` / 叠加 `（机器人）（你自己）` 一轮剥不干净。
+ * 空括号只在「这一轮真的剥掉了标签」之后才清——否则合法昵称里的 `A()` 会被无故改掉。
+ */
+const stripSystemLabels = (s: string): string => {
+  let cur = s;
+  for (;;) {
+    const next = cur.replace(SYSTEM_LABEL_RE, "");
+    if (next === cur) return cur;
+    cur = oneLine(next.replace(EMPTY_BRACKET_RE, ""));
+  }
+};
+
+/** 昵称真实上限远小于此；先截再剥，嵌套括号的恶意昵称才不会让逐层剥离变成二次型 */
+const SENDER_NAME_SCAN_MAX = 200;
+
+/**
+ * 发送人名字 = cleanName + 剥系统标签。顺序有讲究：
+ * `[` `]` 既是标签括号（`[你自己]`）又会被名字清洗拆掉，所以「先剥 → 拆方括号 → 再剥」：
+ * 先剥保住方括号写法，再剥防止 `（你[]自己）` 拆完拼出新标签。
+ * 不含标签字样的名字，结果与 cleanName 完全一致。
+ */
+const cleanSenderName = (raw: unknown): string => {
+  const noAngle = oneLine(raw).slice(0, SENDER_NAME_SCAN_MAX).replace(/[<>]/g, "");
+  const noSquare = stripSystemLabels(noAngle).replace(/[[\]]/g, "");
+  return clip(stripSystemLabels(noSquare).trim(), 40);
+};
+
+/**
+ * id 的「类型前缀」：`ou_…`（open_id）/ `cli_…`（app_id）等；认不出返回 ""。
+ * 两个 id 前缀相同才算「同一类、可以直接比相等」。
+ */
+const idClassOf = (id: string): string => /^([a-z]+)_/.exec(id)?.[1] ?? "";
+
 /** 路径 → 文件名（兼容 / 与 \） */
 const baseName = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 
@@ -262,6 +322,10 @@ export const formatRecentChatSection = (
   const maxItems = opts.maxItems ?? 15;
   const perItem = opts.perItemChars ?? 300;
   const total = opts.totalChars ?? 4000;
+  const selfOpenId = opts.selfOpenId ?? "";
+  const selfIdClass = idClassOf(selfOpenId);
+  // 本机名字走与发送人同一套清洗：两边口径一致，按名比较才不会因为一边剥了标签一边没剥而错位
+  const selfNameClean = cleanSenderName(opts.selfName);
 
   const rendered: string[] = [];
   for (const msg of msgs ?? []) {
@@ -280,12 +344,18 @@ export const formatRecentChatSection = (
     );
     if (!body) continue; // 纯面板 / 空消息
     const isBot = msg.senderKind === "bot";
-    const name =
-      cleanName(msg.senderName) || (isBot ? "某机器人" : "某成员");
-    const isSelf =
-      isBot &&
-      ((!!opts.selfOpenId && msg.senderOpenId === opts.selfOpenId) ||
-        (!!opts.selfName && name === cleanName(opts.selfName)));
+    const senderName = cleanSenderName(msg.senderName);
+    const name = senderName || (isBot ? "某机器人" : "某成员");
+    // 自我识别：id 说了算，按名只是「拿不到可比较 id」时的兜底。
+    // 为什么还留按名：历史里机器人发言的 sender id 在缺 open_bot_id 时退化成 app_id（`cli_…`，
+    // 见 group-roster.parseHistoryResponse），和 selfOpenId（`ou_…`）不同类、没法比；
+    // 发送人 id 为空、selfOpenId 没取到时同理。这些情形不按名就认不出自己的旧发言。
+    // 但两边都是同一类 id（都是 `ou_…`）时，id 不等就是别人——同名机器人（或昵称里伪造的
+    // 同名）不能再借按名回退冒充自己。
+    const idComparable = selfIdClass !== "" && selfIdClass === idClassOf(msg.senderOpenId);
+    const idHit = !!selfOpenId && msg.senderOpenId === selfOpenId;
+    const nameHit = !!selfNameClean && senderName === selfNameClean;
+    const isSelf = isBot && (idHit || (!idComparable && nameHit));
     const time = hhmm(msg.createTime);
     rendered.push(
       `${time ? `[${time}] ` : ""}${name}${isSelf ? "（你自己）" : isBot ? "（机器人）" : ""}：${body}`,

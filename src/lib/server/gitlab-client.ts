@@ -16,7 +16,17 @@
  * - 失败 always 返结构化错误（不抛、不 throw）、agent 拿到 `{ ok: false, error }` 直接转告用户、
  *   不试图自救——失败原因（token 过期 / project 不存在 / branch 不存在 / network）由人决策
  * - 不做重试：MR 是带副作用的操作、重试可能造成重复 MR、调用方按需手动重试
+ * - PAT 只发往可信 host：所有请求都经 buildBaseUrl，里面先过 assertTrustedGitHost（见 trusted-git-host.ts）
+ * - PAT 不跟随重定向：所有 fetch 都走 fetchWithGitToken（`redirect: "error"`）。undici 跨源 302 只剔除
+ *   Authorization / Cookie、不剔自定义头 `PRIVATE-TOKEN`——不关的话可信 host 一个 302 就能把 PAT 带给别的 host。
+ *   新增 REST 入口**必须**用它、不要直接 fetch（tests/gitlab-client-redirect.test.ts 会逐个入口验证）。
  */
+
+import {
+  assertTrustedGitHost,
+  fetchWithGitToken,
+  GitHostRedirectError,
+} from "./trusted-git-host";
 
 interface GitLabConfig {
   /** 不带协议前缀、如 `gitlab.wukongedu.net` */
@@ -117,11 +127,21 @@ const FETCH_TIMEOUT_MS = 30_000;
 const buildBaseUrl = (host: string): string => {
   const trimmed = host.trim().replace(/\/+$/, "").replace(/^https?:\/\//, "");
   if (!trimmed) throw new Error("GitLab host 为空");
-  return `https://${trimmed}/api/v4`;
+  // PAT 只发往可信 host（首次绑定固定 / 白名单，见 trusted-git-host.ts）。
+  // 放在 buildBaseUrl 而不是各调用方：本模块每个 REST 入口都先过这里、再 buildHeaders、最后才 fetch，
+  // 校验失败（throw）发生在构造请求之前、调用方的 try/catch 会收成 { ok:false }——没有任何网络请求发出。
+  // 调用方（submit_mr / 收件箱 / 合并 route）各自也会提前校验给出更早、更清晰的失败；这里是兜底，
+  // 防以后新增调用方忘了校验。
+  // 请求 URL 用校验返回的「规范化 host」而不是原始输入：校验的就是实际发出去的 host，
+  // 不给「校验看到 A、URL 解析器却认成 B」的差异留空间（大小写 / `:443` / 尾点都已收敛）。
+  const trustedHost = assertTrustedGitHost(trimmed);
+  return `https://${trustedHost}/api/v4`;
 };
 
 /** fetch 失败文案：TimeoutError / AbortError 也走「网络错误」、给可读 message */
 const formatFetchNetworkError = (err: unknown): string => {
+  // 被重定向不是网络问题：文案本身已说明原因与处理办法，不加「网络错误」前缀误导排查方向
+  if (err instanceof GitHostRedirectError) return err.message;
   if (err instanceof Error) {
     const name = err.name;
     if (name === "TimeoutError" || name === "AbortError") {
@@ -217,7 +237,7 @@ const findOpenMR = async (
   });
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests?${q.toString()}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithGitToken(url, {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -264,7 +284,7 @@ export const createMR = async (
 
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithGitToken(url, {
       method: "POST",
       headers,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -327,7 +347,7 @@ const closeMR = async (input: {
   }
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithGitToken(url, {
       method: "PUT",
       headers,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -419,7 +439,7 @@ export const getMRMergeStatus = async (
   for (let attempt = 0; attempt < maxPolls; attempt++) {
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await fetchWithGitToken(url, {
         method: "GET",
         headers,
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -482,7 +502,7 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
   }
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithGitToken(url, {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -537,7 +557,7 @@ export const mergeMR = async (input: GetMRInput): Promise<MergeMRResult> => {
   }
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}/merge`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithGitToken(url, {
       method: "PUT",
       headers,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),

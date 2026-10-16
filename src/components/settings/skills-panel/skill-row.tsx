@@ -43,7 +43,11 @@ type Props = {
   /** 任意行飞行中 → 本行装卸控件全禁用（防点别的行静默无反应） */
   anyBusy?: boolean;
   onEdit: (name: string) => void;
-  onView: (name: string, source: SkillRow["source"]) => void;
+  onView: (
+    name: string,
+    source: SkillRow["source"],
+    repoPath?: string,
+  ) => void;
   /** 可管理源：整行删除（server 按 source/repo 定位目录） */
   onDelete: (row: SkillRow) => void;
   /** 可管理源：Switch 切 disabledSkills（同名一关全关） */
@@ -140,7 +144,7 @@ export const SkillRowItem = ({
             size="sm"
             variant="ghost"
             className={ROW_ACTION_BTN}
-            onClick={() => onView(s.name, s.source)}
+            onClick={() => onView(s.name, s.source, s.repoPath)}
           >
             查看
           </Button>

@@ -9,9 +9,11 @@ import {
   HOME_GROUP_LABEL,
   movePinnedId,
   normalizeRepoPath,
+  pickVisibleGroupItems,
   reconcileChatListOrder,
   repoPathsForGroupCreate,
   resolveRepoGroupLabel,
+  scrollDeltaToReveal,
 } from "@/lib/sidebar-groups";
 import type { TaskSummary } from "@/lib/types";
 
@@ -215,5 +217,119 @@ describe("reconcileChatListOrder", () => {
 
   it("空序时用当前 liveIds（第一次按 recency 冻住）", () => {
     expect(reconcileChatListOrder([], ["a", "b"])).toEqual(["a", "b"]);
+  });
+});
+
+describe("组头「+」新建后整组顶到最前（侧栏滚动位置不变时新行会落在视口之上）", () => {
+  it("下方仓组里新建 → 该组变第一组、新对话是组内第一条", () => {
+    const repoA = ["/Users/me/a"];
+    const repoB = ["/Users/me/b"];
+    const repoC = ["/Users/me/c"];
+    const base = [
+      task({ id: "a1", title: "a1", repoPaths: repoA, updatedAt: 30 }),
+      task({ id: "b1", title: "b1", repoPaths: repoB, updatedAt: 20 }),
+      task({ id: "c1", title: "c1", repoPaths: repoC, updatedAt: 10 }),
+    ];
+    const before = buildRepoGroups(base, [], [], ["a1", "b1", "c1"]);
+    expect(before.map((g) => g.items[0]!.id)).toEqual(["a1", "b1", "c1"]);
+
+    // 点第三组（c）的「+」：promoteSidebarChat 把新 id 顶到序首
+    const created = task({ id: "n1", title: "新", repoPaths: repoC, updatedAt: 99 });
+    const order = ["n1", "a1", "b1", "c1"];
+    const after = buildRepoGroups([...base, created], [], [], order);
+    expect(after[0]!.key).toBe("repo:/users/me/c");
+    expect(after[0]!.items.map((t) => t.id)).toEqual(["n1", "c1"]);
+    // 其余组整体被挤下去——点「+」那一刻在视口里的位置，新行已不在原处
+    expect(after.slice(1).map((g) => g.items[0]!.id)).toEqual(["a1", "b1"]);
+  });
+});
+
+describe("pickVisibleGroupItems（当前对话始终露出）", () => {
+  const items = ["a", "b", "c", "d", "e", "f"].map((id) => ({ id }));
+  const ids = (xs: { id: string }[]) => xs.map((x) => x.id);
+
+  it("没超限 / 已展开 → 全展、无隐藏", () => {
+    const few = items.slice(0, 4);
+    expect(pickVisibleGroupItems(few, { limit: 4, expanded: false })).toEqual({
+      visible: few,
+      hiddenCount: 0,
+    });
+    const r = pickVisibleGroupItems(items, { limit: 4, expanded: true });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d", "e", "f"]);
+    expect(r.hiddenCount).toBe(0);
+  });
+
+  it("超限且当前对话在前 N 条里 → 只展前 N 条", () => {
+    const r = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: false,
+      activeId: "b",
+    });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d"]);
+    expect(r.hiddenCount).toBe(2);
+  });
+
+  it("超限且当前对话在被收起的尾部 → 追加露出，隐藏数扣掉它", () => {
+    const r = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: false,
+      activeId: "f",
+    });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d", "f"]);
+    expect(r.hiddenCount).toBe(1);
+  });
+
+  it("刚好超限 1 条且当前对话就是那条 → 全露、隐藏数为 0", () => {
+    const five = items.slice(0, 5);
+    const r = pickVisibleGroupItems(five, {
+      limit: 4,
+      expanded: false,
+      activeId: "e",
+    });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d", "e"]);
+    expect(r.hiddenCount).toBe(0);
+  });
+
+  it("当前对话不在本组 / 没有当前对话 → 行为不变；limit=Infinity（置顶组）不限", () => {
+    expect(
+      ids(
+        pickVisibleGroupItems(items, {
+          limit: 4,
+          expanded: false,
+          activeId: "zzz",
+        }).visible,
+      ),
+    ).toEqual(["a", "b", "c", "d"]);
+    const pinned = pickVisibleGroupItems(items, {
+      limit: Number.POSITIVE_INFINITY,
+      expanded: false,
+    });
+    expect(pinned.visible).toHaveLength(6);
+    expect(pinned.hiddenCount).toBe(0);
+  });
+});
+
+describe("scrollDeltaToReveal（把行滚进侧栏可视区）", () => {
+  const view = { top: 100, bottom: 500 };
+
+  it("已完整在视口内 → 不滚", () => {
+    expect(scrollDeltaToReveal(view, { top: 200, bottom: 232 })).toBe(0);
+    expect(scrollDeltaToReveal(view, { top: 100, bottom: 132 })).toBe(0);
+  });
+
+  it("在视口下方（Home 组在最底）→ 向下滚到刚好露出 + 边距", () => {
+    // 行底 700、视口底 500 → 200 + 8
+    expect(scrollDeltaToReveal(view, { top: 668, bottom: 700 })).toBe(208);
+  });
+
+  it("在视口上方 → 向上滚（负增量）", () => {
+    expect(scrollDeltaToReveal(view, { top: 40, bottom: 72 })).toBe(-68);
+  });
+
+  it("行比视口还高 → 不把行顶滚出视口", () => {
+    // 行 150~900（高 750 > 视口 400）：向下最多滚到行顶贴视口顶（150-100-8=42）
+    expect(scrollDeltaToReveal(view, { top: 150, bottom: 900 })).toBe(42);
+    // 行顶本就紧贴视口顶：不动
+    expect(scrollDeltaToReveal(view, { top: 104, bottom: 900 })).toBe(0);
   });
 });

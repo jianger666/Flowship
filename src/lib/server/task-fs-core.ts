@@ -33,6 +33,7 @@ import type {
   UserRole,
 } from "@/lib/types";
 import { dataRoot, RenameAbortedError, renameWithRetry } from "./data-root";
+import { serializeEventLineRedacted } from "./event-secret-redact";
 import { failpoint } from "./failpoints";
 import { coalesceAdjacentThinking } from "@/lib/merge-thinking";
 // 只用其纯函数（getTaskCwd 路径计算、零 IO）、task-worktrees 不反向依赖本模块（无环）
@@ -1176,7 +1177,9 @@ const appendEventLineUnlocked = async (
   try {
     await fs.appendFile(
       path.join(taskDir(id), EVENTS_FILE),
-      JSON.stringify(ev) + "\n",
+      // 落盘前精确脱敏 gitToken / apiKey / 公司环境密码（agent 读 config.json / company-env.json
+      // 取凭据会让它进 tool_result）；命中时原地改 ev，之后 publish 的也是脱敏版
+      serializeEventLineRedacted(ev) + "\n",
       "utf-8",
     );
     return true;

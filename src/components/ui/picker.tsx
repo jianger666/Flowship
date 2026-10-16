@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/popover";
 import { OverflowTooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { isImeComposing } from "@/lib/ime";
 
 export type PickerOption = {
   value: string;
@@ -352,7 +353,7 @@ export const Picker: PickerComponent = (props) => {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+                  if (e.key !== "Enter" || isImeComposing(e)) return;
                   e.preventDefault();
                   if (loading) return;
                   const target =

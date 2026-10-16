@@ -45,7 +45,11 @@ type Props = {
   /** 正在安装 / 卸载的 skill 名（行内 spinner + 防双击） */
   busyName: string | null;
   onEdit: (name: string) => void;
-  onView: (name: string, source: SkillRow["source"]) => void;
+  onView: (
+    name: string,
+    source: SkillRow["source"],
+    repoPath?: string,
+  ) => void;
   onDelete: (row: SkillRow) => void;
   onToggleManageable: (row: SkillRow, enabled: boolean) => void;
   onInstall: (row: SkillRow) => void;
@@ -230,7 +234,7 @@ export const SkillListPane = ({
         >
           {skills.map((s) => (
             <SkillRowItem
-              key={`${s.source}:${s.teamCategory ?? ""}:${s.name}`}
+              key={`${s.source}:${s.teamCategory ?? ""}:${s.repoPath ?? ""}:${s.name}`}
               skill={s}
               dimmed={rowDimmed(s)}
               sourceTag={searching ? sourceTagForSkill(s) : undefined}

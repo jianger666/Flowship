@@ -110,6 +110,11 @@ export interface RewindResult {
   restoredRepos: RestoreReposDetail[];
   /** 被截断掉的事件条数（含目标 user_reply 及之后） */
   truncatedEventCount: number;
+  /**
+   * 回退后服务端保留的事件条数（严格早于目标 user_reply 的那段；不含随后追加的回退 info）。
+   * 客户端本地窗口里找不到被回退事件时，靠它对「完整窗口」做权威截断（见 rewind-marker.ts）。
+   */
+  keptEventCount: number;
   /** getTask 失败：回退已成功，客户端应刷新查看最新状态 */
   refreshRequired?: true;
 }
@@ -119,6 +124,7 @@ export type RewindErrorCode =
   | "not_chat"
   | "no_checkpoint"
   | "run_active"
+  | "bad_target"
   | "restore_failed";
 
 export class RewindError extends Error {
@@ -983,14 +989,156 @@ export interface RewindDeps {
    * rewind 门闩检查交叉闭合（另一侧在 chat-runner 做）。
    */
   isQueueDraining: (taskId: string) => boolean;
-  /** 写 info 事件 */
+  /**
+   * 写 info 事件。info.keptEventCount = 回退后服务端保留的事件条数
+   * （调用方据此给事件打回退标记，见 rewind-marker.ts）
+   */
   appendInfoEvent: (
     taskId: string,
     text: string,
+    info: { keptEventCount: number },
   ) => Promise<TaskEvent | null>;
   /** 读完整 Task（截断后） */
   getTask: (taskId: string) => Promise<Task | null>;
 }
+
+/**
+ * rewind / 编辑回退共用的「进锁前」检查：lifecycle（停止 / 删除中）、task 存在且是 chat、没有 run 在跑。
+ * 抛错一律是 RewindError；调用方已占着 rewind 门闩、在 finally 里释放。
+ */
+const assertRewindPreflight = async (
+  taskId: string,
+  deps: RewindDeps,
+): Promise<void> => {
+  const lifecycle = getChatLifecycle(taskId);
+  if (lifecycle === "stopping" || lifecycle === "deleting") {
+    throw new RewindError("run_active", "任务正在停止/删除、无法回退", 409);
+  }
+
+  const meta = await readMetaV06(taskId);
+  if (!meta) {
+    throw new RewindError("not_found", "task 不存在", 404);
+  }
+  if (meta.mode !== "chat") {
+    throw new RewindError("not_chat", "仅 chat 模式支持 rewind", 409);
+  }
+  if (deps.isRunActive(taskId) || meta.runStatus === "running") {
+    throw new RewindError("run_active", "agent 正在跑、请先停止再回退", 409);
+  }
+};
+
+/**
+ * rewind / 编辑回退共用的「锁内复查」（闭合 TOCTOU）：进锁前到破坏性操作之间，
+ * chat-reply / drain 可能已启动。通过后清掉排队，返回锁内读到的最新 meta。
+ * 对侧在发送 / 启动 / drain 前同步检查 isChatRewindInProgress；两侧配合闭合窗口。
+ */
+const assertRewindIdleLocked = async (
+  taskId: string,
+  deps: RewindDeps,
+): Promise<NonNullable<Awaited<ReturnType<typeof readMetaV06>>>> => {
+  const lockedMeta = await readMetaV06(taskId);
+  if (!lockedMeta) {
+    throw new RewindError("not_found", "task 在 rewind 中被删", 404);
+  }
+  if (deps.isRunActive(taskId)) {
+    throw new RewindError("run_active", "agent 正在跑、请先停止再回退", 409);
+  }
+  if (lockedMeta.runStatus === "running") {
+    throw new RewindError(
+      "run_active",
+      "任务 runStatus 为 running、请先停止再回退",
+      409,
+    );
+  }
+  if (deps.isQueueDraining(taskId)) {
+    // 与 flushChatQueue 入口的 rewind 门闩检查交叉闭合（另一侧在 chat-runner）
+    throw new RewindError("run_active", "正在发送排队消息、请稍后回退", 409);
+  }
+  if (hasChatStartReservation(taskId)) {
+    throw new RewindError("run_active", "正在启动新会话、请稍后回退", 409);
+  }
+  if (getChatQueueCount(taskId) > 0) {
+    throw new RewindError(
+      "run_active",
+      "仍有排队中的消息、请先停止或等待发送完成再回退",
+      409,
+    );
+  }
+  // 复查通过：清掉排队（防竞态下刚入队的旧上下文消息在回退后幽灵发送）
+  // 走唯一终态 sink——复查后到清队之间若有消息挤入（202 已返回）、
+  // 它必须收到 queue_failed 终态、不能被裸 clear 静默丢
+  failQueuedItems(taskId, { reason: "rewound" });
+  return lockedMeta;
+};
+
+/**
+ * 回退已提交之后的收尾（rewind / 编辑回退共用）：写回退标记 info（失败只 warn）→ 读最新 Task
+ * （失败重试一次；仍失败返回 refreshRequired，**绝不**报错——回退已提交，错误状态会诱导客户端重试破坏性请求）。
+ */
+const finishRewind = async (
+  taskId: string,
+  deps: RewindDeps,
+  core: {
+    restoredRepos: RestoreReposDetail[];
+    truncatedEventCount: number;
+    keptEventCount: number;
+  },
+  infoText: string,
+): Promise<RewindResult> => {
+  // info 缺失无伤：锁外写失败只 warn，不把整次 rewind 判失败
+  try {
+    await deps.appendInfoEvent(taskId, infoText, {
+      keptEventCount: core.keptEventCount,
+    });
+  } catch (err) {
+    console.warn(
+      `[chat-checkpoint] appendInfoEvent 失败 task=${taskId}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  let task: Task | null = null;
+  try {
+    task = await deps.getTask(taskId);
+  } catch (err) {
+    console.warn(
+      `[chat-checkpoint] getTask 失败 task=${taskId}，将重试一次:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+  if (!task) {
+    try {
+      task = await deps.getTask(taskId);
+    } catch (err) {
+      console.warn(
+        `[chat-checkpoint] getTask 重试仍失败 task=${taskId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  if (!task) {
+    // 回退已提交，绝不能用错误状态诱导客户端重试破坏性请求
+    console.warn(
+      `[chat-checkpoint] getTask 重试仍失败 task=${taskId}：回退已完成，返回 refreshRequired`,
+    );
+    return {
+      ok: true,
+      task: null,
+      refreshRequired: true,
+      restoredRepos: core.restoredRepos,
+      truncatedEventCount: core.truncatedEventCount,
+      keptEventCount: core.keptEventCount,
+    };
+  }
+
+  return {
+    ok: true,
+    task,
+    restoredRepos: core.restoredRepos,
+    truncatedEventCount: core.truncatedEventCount,
+    keptEventCount: core.keptEventCount,
+  };
+};
 
 /** 把回滚结果拼进错误文案：哪些仓已回滚、哪些需手工处理（带安全点 treeOid） */
 const formatRollbackNote = (
@@ -1041,29 +1189,7 @@ export const executeChatRewind = async (
   try {
     // 占位后立刻查 stop/DELETE lifecycle——闭合「rewind 刚起步、DELETE 已在收尾」
     // 反向竞态；抛错走 finally endChatRewind，勿与删除交叉改仓
-    const lifecycle = getChatLifecycle(taskId);
-    if (lifecycle === "stopping" || lifecycle === "deleting") {
-      throw new RewindError(
-        "run_active",
-        "任务正在停止/删除、无法回退",
-        409,
-      );
-    }
-
-    const meta = await readMetaV06(taskId);
-    if (!meta) {
-      throw new RewindError("not_found", "task 不存在", 404);
-    }
-    if (meta.mode !== "chat") {
-      throw new RewindError("not_chat", "仅 chat 模式支持 rewind", 409);
-    }
-    if (deps.isRunActive(taskId) || meta.runStatus === "running") {
-      throw new RewindError(
-        "run_active",
-        "agent 正在跑、请先停止再回退",
-        409,
-      );
-    }
+    await assertRewindPreflight(taskId, deps);
 
     const pointsPeek = await readRewindPoints(taskId);
     const targetPeek = pointsPeek.find(
@@ -1093,50 +1219,7 @@ export const executeChatRewind = async (
 
       // —— 锁内复查（闭合 TOCTOU）：进锁前到破坏性操作之间，chat-reply / drain 可能已启动 ——
       // 对侧会在发送/启动/drain 前同步检查 isChatRewindInProgress；两侧配合闭合窗口。
-      const lockedMeta = await readMetaV06(taskId);
-      if (!lockedMeta) {
-        throw new RewindError("not_found", "task 在 rewind 中被删", 404);
-      }
-      if (deps.isRunActive(taskId)) {
-        throw new RewindError(
-          "run_active",
-          "agent 正在跑、请先停止再回退",
-          409,
-        );
-      }
-      if (lockedMeta.runStatus === "running") {
-        throw new RewindError(
-          "run_active",
-          "任务 runStatus 为 running、请先停止再回退",
-          409,
-        );
-      }
-      if (deps.isQueueDraining(taskId)) {
-        // 与 flushChatQueue 入口的 rewind 门闩检查交叉闭合（另一侧在 chat-runner）
-        throw new RewindError(
-          "run_active",
-          "正在发送排队消息、请稍后回退",
-          409,
-        );
-      }
-      if (hasChatStartReservation(taskId)) {
-        throw new RewindError(
-          "run_active",
-          "正在启动新会话、请稍后回退",
-          409,
-        );
-      }
-      if (getChatQueueCount(taskId) > 0) {
-        throw new RewindError(
-          "run_active",
-          "仍有排队中的消息、请先停止或等待发送完成再回退",
-          409,
-        );
-      }
-      // 复查通过：清掉排队（防竞态下刚入队的旧上下文消息在回退后幽灵发送）
-      // 走唯一终态 sink——复查后到清队之间若有消息挤入（202 已返回）、
-      // 它必须收到 queue_failed 终态、不能被裸 clear 静默丢
-      failQueuedItems(taskId, { reason: "rewound" });
+      const lockedMeta = await assertRewindIdleLocked(taskId, deps);
 
       // —— preflight：确认目标 tree 仍在、events 里确有该 eventId ——
       for (const s of lockedTarget.repoSnapshots) {
@@ -1246,6 +1329,7 @@ export const executeChatRewind = async (
       // 单侧补偿失败会留下契约禁止的半完成态（如仓库回退了、对话没恢复）。
       let truncateDone = false;
       let truncCount = 0;
+      let keptCount = 0;
       try {
         const trunc = await truncateEventsBeforeEventId(taskId, eventId);
         if (!trunc) {
@@ -1258,6 +1342,7 @@ export const executeChatRewind = async (
         }
         truncateDone = true;
         truncCount = trunc.truncatedCount;
+        keptCount = trunc.kept.length;
 
         // 成功路径：保留目标之前的点 + 刚才那条 pre_rewind（已 append 过，这里按内存列表一次重写，避免重复）
         const keptPoints = lockedPoints.slice(0, targetIdx);
@@ -1306,6 +1391,7 @@ export const executeChatRewind = async (
         return {
           restoredRepos,
           truncatedEventCount: trunc.truncatedCount,
+          keptEventCount: trunc.kept.length,
           checkpointAt: lockedTarget.createdAt,
         };
       } catch (err) {
@@ -1349,6 +1435,7 @@ export const executeChatRewind = async (
           return {
             restoredRepos,
             truncatedEventCount: truncCount,
+            keptEventCount: keptCount,
             checkpointAt: lockedTarget.createdAt,
           };
         }
@@ -1400,59 +1487,147 @@ export const executeChatRewind = async (
     const timeLabel = new Date(core.checkpointAt).toLocaleString("zh-CN", {
       hour12: false,
     });
-    // info 缺失无伤：锁外写失败只 warn，不把整次 rewind 判失败
-    try {
-      await deps.appendInfoEvent(
-        taskId,
-        `已回退到 ${timeLabel} 的检查点（恢复 ${okCount} 个仓库文件状态）`,
-      );
-    } catch (err) {
-      console.warn(
-        `[chat-checkpoint] appendInfoEvent 失败 task=${taskId}:`,
-        err instanceof Error ? err.message : err,
-      );
-    }
-
-    let task: Task | null = null;
-    try {
-      task = await deps.getTask(taskId);
-    } catch (err) {
-      console.warn(
-        `[chat-checkpoint] getTask 失败 task=${taskId}，将重试一次:`,
-        err instanceof Error ? err.message : err,
-      );
-    }
-    if (!task) {
-      try {
-        task = await deps.getTask(taskId);
-      } catch (err) {
-        console.warn(
-          `[chat-checkpoint] getTask 重试仍失败 task=${taskId}:`,
-          err instanceof Error ? err.message : err,
-        );
-      }
-    }
-    if (!task) {
-      // 回退已提交，绝不能用错误状态诱导客户端重试破坏性请求
-      console.warn(
-        `[chat-checkpoint] getTask 重试仍失败 task=${taskId}：回退已完成，返回 refreshRequired`,
-      );
-      return {
-        ok: true,
-        task: null,
-        refreshRequired: true,
-        restoredRepos: core.restoredRepos,
-        truncatedEventCount: core.truncatedEventCount,
-      };
-    }
-
-    return {
-      ok: true,
-      task,
-      restoredRepos: core.restoredRepos,
-      truncatedEventCount: core.truncatedEventCount,
-    };
+    return await finishRewind(
+      taskId,
+      deps,
+      core,
+      `已回退到 ${timeLabel} 的检查点（恢复 ${okCount} 个仓库文件状态）`,
+    );
   } finally {
     endChatRewind(taskId);
   }
+};
+
+// ----------------- 编辑回退（只回退对话；可选择是否同时还原文件）-----------------
+
+/** 编辑回退（只回退对话）写进事件流的标记文案 */
+export const EDIT_REWIND_CONVERSATION_ONLY_INFO =
+  "已回退到这条消息之前的对话（文件未改动）";
+
+/**
+ * 只回退对话、不碰文件：删掉目标 user_reply 及之后的事件、关会话（下一条消息会用截断后的历史
+ * 开新会话）。给「编辑已发送的消息」用——这条消息没有文件检查点（没绑仓 / 检查点已被裁掉 / 打点失败）
+ * 时也能编辑。
+ *
+ * 与 {@link executeChatRewind} 共用门闩 / 进锁前检查 / 锁内复查 / 收尾，区别只在没有文件操作：
+ * 没有安全快照、没有恢复、也就没有「回滚仓库」这一段——截断之前没有任何改动（原子写、失败即原样），
+ * 截断之后的记账（rewind_points / meta / refs）全部前滚、绝不让已提交的回退报错。
+ *
+ * rewind_points：丢掉锚在被截断事件上的点（它们对应的 user_reply 没了、回退不到），其余保留；
+ * 不另打 pre_rewind 安全点（没动文件）。
+ */
+export const executeChatConversationRewind = async (
+  taskId: string,
+  eventId: string,
+  deps: RewindDeps,
+): Promise<RewindResult> => {
+  if (!tryBeginChatRewind(taskId)) {
+    throw new RewindError("run_active", "已有回退在进行中", 409);
+  }
+
+  try {
+    await assertRewindPreflight(taskId, deps);
+
+    const core = await withTaskLock(taskId, async () => {
+      await assertRewindIdleLocked(taskId, deps);
+
+      const events = await readEvents(taskId);
+      const idx = events.findIndex((e) => e.id === eventId);
+      if (idx < 0) {
+        throw new RewindError("not_found", "找不到这条消息", 404);
+      }
+      if (events[idx]!.kind !== "user_reply") {
+        throw new RewindError("bad_target", "只能从用户消息处回退", 400);
+      }
+      const truncatedIds = new Set(events.slice(idx).map((e) => e.id));
+      const lockedPoints = await readRewindPoints(taskId);
+
+      const trunc = await truncateEventsBeforeEventId(taskId, eventId);
+      if (!trunc) {
+        // 刚才读到了、现在没了：持锁不该发生（锁外并发写）；此时什么都没改
+        throw new RewindError("not_found", "找不到这条消息", 404);
+      }
+
+      // —— 截断已提交，以下全部前滚（best-effort）——
+      const keptPoints = lockedPoints.filter((p) => !truncatedIds.has(p.eventId));
+      const discardedPoints = lockedPoints.filter((p) =>
+        truncatedIds.has(p.eventId),
+      );
+      if (discardedPoints.length > 0) {
+        try {
+          await writeRewindPoints(taskId, keptPoints);
+        } catch (err) {
+          console.warn(
+            `[chat-checkpoint] 编辑回退 task=${taskId} 写 rewind_points 失败（对话已截断、前滚）:`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+      try {
+        const freshMeta = await readMetaV06(taskId);
+        if (freshMeta) {
+          freshMeta.sessionAgentId = undefined;
+          freshMeta.runStatus = "idle";
+          freshMeta.updatedAt = Date.now();
+          await writeMeta(freshMeta);
+        }
+      } catch (err) {
+        console.warn(
+          `[chat-checkpoint] 编辑回退 task=${taskId} 写 meta 失败（对话已截断、前滚）:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      if (discardedPoints.length > 0) {
+        try {
+          await pruneCheckpointRefs(taskId, discardedPoints, keptPoints);
+        } catch (err) {
+          console.warn(
+            `[chat-checkpoint] 编辑回退 task=${taskId} pruneCheckpointRefs 失败:`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
+      // 门闩已挡新消息；关会话 = 清 sessionAgentId 对应的内存会话，下一条消息开新会话
+      deps.closeSession(taskId);
+
+      return {
+        restoredRepos: [] as RestoreReposDetail[],
+        truncatedEventCount: trunc.truncatedCount,
+        keptEventCount: trunc.kept.length,
+      };
+    });
+
+    return await finishRewind(
+      taskId,
+      deps,
+      core,
+      EDIT_REWIND_CONVERSATION_ONLY_INFO,
+    );
+  } finally {
+    endChatRewind(taskId);
+  }
+};
+
+/**
+ * 「编辑已发送的消息」的回退入口：这条消息还有文件检查点 → 完整回退（还原文件 + 截断对话，
+ * 同 {@link executeChatRewind}）；没有 → 只回退对话（{@link executeChatConversationRewind}）。
+ * 调用方（界面）要对「会还原文件」先做确认；检查点已被裁掉时这里自动降级成只回退对话，
+ * 方向是安全的（文件只会少改、不会多改）。
+ */
+export const executeChatEditRewind = async (
+  taskId: string,
+  eventId: string,
+  deps: RewindDeps,
+): Promise<RewindResult> => {
+  const points = await readRewindPoints(taskId);
+  const hasCheckpoint = points.some(
+    (p) =>
+      p.eventId === eventId &&
+      p.kind !== "pre_rewind" &&
+      p.repoSnapshots.length > 0,
+  );
+  return hasCheckpoint
+    ? executeChatRewind(taskId, eventId, deps)
+    : executeChatConversationRewind(taskId, eventId, deps);
 };

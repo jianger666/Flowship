@@ -74,6 +74,8 @@ export const ApiKeySection = ({
                 variant="outline"
                 size="icon"
                 onClick={() => setShowKey((s) => !s)}
+                aria-label={showKey ? "隐藏 API Key" : "显示 API Key"}
+                aria-pressed={showKey}
               >
                 {showKey ? <EyeOff /> : <Eye />}
               </Button>

@@ -276,6 +276,47 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
     expect(lastDone()?.ok).toBe(false);
   });
 
+  // ─────────────────────────────────────────────────────────────
+  // S01-01：create / send 抛错时 runningTasks 还没登记本实例，状态必须仍能归位
+  // ─────────────────────────────────────────────────────────────
+  it("Agent.create 抛错 → 写 error 事件、runStatus 归位（不卡 running）", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    mockCreate.mockRejectedValue(new Error("create boom"));
+
+    await startLikeRoute(id);
+    await waitUntil(() => !isTaskStarting(id));
+
+    expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
+    const events = await readEvents(id);
+    expect(
+      events.some(
+        (e) => e.kind === "error" && e.text.includes("答疑 agent 启动失败"),
+      ),
+    ).toBe(true);
+    expect(runningTasks.has(id)).toBe(false);
+    // R1-03：与 bailOutWithoutRun 对齐——启动失败必须发 done(ok=false)，
+    // 群出向 tap 才会摘掉 rememberGroupReply 登记并回「这轮没跑成功」
+    expect(lastDone()?.ok).toBe(false);
+    expect(lastDone()?.task.runStatus).toBe("awaiting_user");
+  });
+
+  it("agent.send 抛错 → runStatus 归位、已起的 agent 被 close", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const oneshot = makeFakeAgent("agent_send_fail");
+    oneshot.send.mockRejectedValue(new Error("send boom"));
+    mockCreate.mockResolvedValue(oneshot);
+
+    await startLikeRoute(id);
+    await waitUntil(() => !isTaskStarting(id));
+
+    expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
+    expect(oneshot.close).toHaveBeenCalled();
+    expect(runningTasks.has(id)).toBe(false);
+    expect(lastDone()?.ok).toBe(false);
+  });
+
   it("真 run 在飞时让位且绝不动 runStatus（那个 running 是后继的）", async () => {
     const id = alloc();
     await seedAckedTask(id);

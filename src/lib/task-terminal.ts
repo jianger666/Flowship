@@ -88,6 +88,29 @@ export const WATCH_UNAVAILABLE_BACKOFF_CAP_MS = 12_000;
 export const WATCH_CLEAN_RECONNECT_DELAY_MS = 1_000;
 
 /**
+ * 退避预算耗尽（terminate_exhausted）后进入「休眠待重连」：不再静默停更。
+ * 休眠期靠 online / 页面回可见 / 手动「重连」/ 低频兜底定时复查唤醒，唤醒后预算清零重新开始。
+ * 兜底定时复查间隔（只在页面可见且在线时才真正重连，隐藏页不烧电、不打服务端）
+ */
+export const WATCH_DORMANT_RETRY_INTERVAL_MS = 60_000;
+
+/** 休眠期的唤醒信号来源 */
+export type WatchResumeSignal = "online" | "visible" | "tick" | "manual";
+
+/**
+ * 休眠期收到唤醒信号时是否真的重连（纯函数）。
+ * - manual（用户点「重连」）无条件重连
+ * - 其余信号：页面隐藏 → 不重连（回可见时会有 visible 信号补上）；离线 → 不重连（online 事件会补上）
+ */
+export const shouldResumeWatch = (
+  signal: WatchResumeSignal,
+  env: { hidden: boolean; online: boolean },
+): boolean => {
+  if (signal === "manual") return true;
+  return !env.hidden && env.online;
+};
+
+/**
  * watch 失败后的重连策略（纯函数）。
  *
  * - deleted → 立即终止（由调用方 commit terminal）

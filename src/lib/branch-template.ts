@@ -177,6 +177,38 @@ export const findUnknownPlaceholders = (template: string): string[] => {
 };
 
 /**
+ * 仓库列表落盘前的分支模板闸门（S13-01）。
+ *
+ * 背景：RepoCard 的 onChange 只改草稿、onCommit 却把「整份 repos 草稿」落盘——
+ * 用户在 A 仓模板框敲了字面量 `{yyMMdd}`（正确是 `{date:yyMMdd}`）还没通过校验，
+ * 紧接着失焦别的框 / 改仓名 / 开关 / 增删仓，都会带着这条坏模板一起落盘，
+ * 之后建任务就会生成字面 `{yyMMdd}` 的分支名。
+ *
+ * 规则：next 里模板含未知占位符的仓，落盘用「已落盘的旧值」（persisted 按 path 对）顶替；
+ * 返回 blocked（被顶替的仓 path）供调用方 toast 与保留草稿。
+ */
+export const guardRepoBranchTemplates = <
+  T extends { path: string; branchTemplate?: string },
+>(
+  next: T[],
+  persisted: T[],
+): { repos: T[]; blocked: string[] } => {
+  const blocked: string[] = [];
+  const repos = next.map((r) => {
+    if (findUnknownPlaceholders(r.branchTemplate ?? "").length === 0) return r;
+    blocked.push(r.path);
+    const old = persisted.find((p) => p.path === r.path)?.branchTemplate;
+    // 旧值本身也非法（历史脏数据）时不再沿用、直接清空回落全局模板
+    const fallback =
+      old !== undefined && findUnknownPlaceholders(old).length === 0
+        ? old
+        : undefined;
+    return { ...r, branchTemplate: fallback };
+  });
+  return { repos, blocked };
+};
+
+/**
  * 从飞书 story URL 抠 story id（V0.10 从 action-gates 抽出、worktree 分支命名共用）
  * 规则：优先 detail/<digits> 段、兜底最长一段 ≥6 位连续数字；抠不到返 null
  */

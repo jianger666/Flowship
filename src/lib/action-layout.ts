@@ -315,3 +315,17 @@ export const removeActionLayoutId = (
   order: layout.order.filter((k) => k !== id),
   hidden: layout.hidden.filter((k) => k !== id),
 });
+
+/**
+ * 把 list 里的 key 上移 / 下移一位（delta = -1 / +1）。
+ * 越界 / key 不存在 → 返回原数组引用（调用方据此判断「没动」）；否则返回新数组。
+ * 键盘用户的排序入口（拖拽之外的替代，S13-21）。
+ */
+export const moveKeyBy = <T>(list: readonly T[], key: T, delta: -1 | 1): T[] => {
+  const from = list.indexOf(key);
+  const to = from + delta;
+  if (from < 0 || to < 0 || to >= list.length) return list as T[];
+  const next = [...list];
+  [next[from], next[to]] = [next[to], next[from]];
+  return next;
+};

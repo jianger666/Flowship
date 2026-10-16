@@ -61,32 +61,43 @@ describe("对话正文 15px：字号落在 prose 元素上", () => {
   });
 });
 
-describe("AI 回复三处都用 reply 档，次要面不放大", () => {
-  it("rows.tsx：流式占位（chat / log）+ 定稿气泡 = 3 处 size=reply，答题回执保持默认档", () => {
+describe("AI 回复：chat 宽列 15px、task(log) 右栏 14px，次要面不放大", () => {
+  it("MARKDOWN_LOG_REPLY_TEXT = text-sm leading-6（prose-sm 原生 14px / 24px），规范文件里也写了这一档", () => {
+    const value = /export const MARKDOWN_LOG_REPLY_TEXT = "([^"]+)";/.exec(md)?.[1];
+    expect(value).toBe("text-sm leading-6");
+    // 规范里必须交代「task 右栏为什么是 14px」——不写的话下一个人会顺手把它「统一」回 15px
+    expect(rule).toContain("MARKDOWN_LOG_REPLY_TEXT");
+  });
+
+  it("rows.tsx：chat 流式 = reply、log 流式 = default、定稿气泡按 variant 二选一，答题回执保持默认档", () => {
     const tags = markdownTags(rows);
     expect(tags, "rows.tsx 里的 MarkdownText 调用数变了——新增的要想清楚属于哪一档").toHaveLength(4);
 
-    const reply = tags.filter((t) => /\bsize="reply"/.test(t));
-    expect(reply).toHaveLength(3);
-
-    // 流式的两处必须都是 reply：不一致的话流式结束换成正式行时整段文字会跳一下
+    // 流式的两处：chat 分支 reply、log 分支 default。
+    // 各自必须与定稿同档：不一致的话流式结束换成正式行时整段文字会跳一下
     const streaming = tags.filter((t) => /\bstreaming\b/.test(t));
     expect(streaming).toHaveLength(2);
-    for (const t of streaming) expect(t).toMatch(/\bsize="reply"/);
+    expect(streaming.filter((t) => /\bsize="reply"/.test(t))).toHaveLength(1);
+    expect(streaming.filter((t) => /\bsize="default"/.test(t))).toHaveLength(1);
 
-    // 定稿气泡（text={ev.text}）= reply；答题回执（text={replyEvent.text}）是用户答的话、保持默认档
+    // 定稿气泡（text={ev.text}）：chat = reply、log = default（右栏窄）；
+    // 答题回执（text={replyEvent.text}）是用户答的话、保持默认档
     const finalBody = tags.filter((t) => t.includes("text={ev.text}"));
     expect(finalBody).toHaveLength(1);
-    expect(finalBody[0]).toMatch(/\bsize="reply"/);
+    expect(finalBody[0]).toMatch(/size=\{isLog \? "default" : "reply"\}/);
     const askReply = tags.filter((t) => t.includes("text={replyEvent.text}"));
     expect(askReply).toHaveLength(1);
     expect(askReply[0]).not.toMatch(/\bsize="reply"/);
   });
 
-  it("外层 wrapper 走 MARKDOWN_REPLY_TEXT 常量，不再手写 15px 字面量", () => {
+  it("外层 wrapper 走常量，不再手写 15px / 14px 字面量：chat = MARKDOWN_REPLY_TEXT、log = MARKDOWN_LOG_REPLY_TEXT", () => {
     expect(rows).not.toContain('"text-[15px] leading-7"');
+    expect(rows).not.toContain('"text-sm leading-6"');
+    // 流式占位：chat 分支一处、log 分支一处
     expect(rows).toContain("className={MARKDOWN_REPLY_TEXT}");
-    expect(rows).toContain("cn(MESSAGE_ACTION_HOST, MARKDOWN_REPLY_TEXT)");
+    expect(rows).toContain("className={MARKDOWN_LOG_REPLY_TEXT}");
+    // 定稿气泡 wrapper：同一个 isLog 二选一，且与上面的 size 判定是同一个条件
+    expect(rows).toContain("isLog ? MARKDOWN_LOG_REPLY_TEXT : MARKDOWN_REPLY_TEXT");
   });
 
   it("其它 MarkdownText 调用方（问答卡 / 群问答 / 工具产出）不传 reply：它们是次要面、保持 14px / 12px", () => {

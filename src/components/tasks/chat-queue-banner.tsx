@@ -33,6 +33,7 @@ import {
   type ChatQueueItem,
 } from "@/lib/task-store";
 import type { Task } from "@/lib/types";
+import { isImeComposing } from "@/lib/ime";
 
 interface Props {
   task: Task;
@@ -235,7 +236,11 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
                       autoFocus
                       disabled={savingEdit}
                       onKeyDown={(e) => {
-                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                        if (
+                          e.key === "Enter" &&
+                          !isImeComposing(e) &&
+                          (e.metaKey || e.ctrlKey)
+                        ) {
                           e.preventDefault();
                           handleSaveEdit(it.itemId);
                         }
@@ -296,7 +301,7 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
                       </button>
                     </span>
                   </Tooltip>
-                  <Tooltip content="立即发送（打断当前回复）">
+                  <Tooltip content="立即发送（插话给正在工作的 AI，不中断它）">
                     <span className="inline-flex">
                       <button
                         type="button"

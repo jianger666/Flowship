@@ -63,6 +63,7 @@ import {
   type ThinkingSnapshot,
 } from "@/lib/thinking-live";
 import { buildInputHistory } from "@/lib/composer-history";
+import { editRewindConfirmCopy, planEditRewind } from "@/lib/edit-rewind";
 import {
   allocClientChatQueueItemId,
   findReusableUncertainOperation,
@@ -90,8 +91,10 @@ import {
   stopTask,
   updateTaskFields,
   type ImagePayload,
+  type RewoundResult,
 } from "@/lib/task-store";
 import { canCommitTaskSnapshot, commitTaskDeleted } from "@/lib/task-terminal";
+import { reconcileRunActive, watchDormantToastId } from "@/lib/watch-reconnect";
 import { promoteSidebarChat } from "@/lib/view-memory";
 import {
   isEphemeralToolOutputDelta,
@@ -105,6 +108,11 @@ interface Props {
   // 父组件持 task state、ChatView 把最新 task / event 推回去（SSE 增量驱动）
   onTaskUpdate: (next: Task) => void;
   onEventAppend: (ev: TaskEvent) => void;
+  /**
+   * 回退成功后、响应体直给的回退标记：父级据此把本地事件窗口对齐到这次回退
+   * （不依赖标记 info 事件写入 / SSE 到达）。不传 = 只靠事件流里的标记。
+   */
+  onRewound?: (rewound: RewoundResult) => void;
   // v1.0.x 事件懒加载：上拉分页拉到的更早事件、插到父组件事件列表头部
   onPrependEvents?: (events: TaskEvent[]) => void;
   /** task_deleted / watch 410 → 清本地态后通知父级（setTask null + 侧栏失效） */
@@ -129,6 +137,7 @@ export const ChatView = ({
   task,
   onTaskUpdate,
   onEventAppend,
+  onRewound,
   onPrependEvents,
   onTaskDeleted,
 }: Props) => {
@@ -213,6 +222,9 @@ export const ChatView = ({
   // 闭包捕获的 taskId——卸载后异步回调先验 terminal
   const taskIdRef = useRef(task.id);
   taskIdRef.current = task.id;
+  // 最新 task 快照（给稳定回调读事件窗口 / 仓库绑定，免得每来一条事件就重建回调、让消息行全部重渲）
+  const latestTaskRef = useRef(task);
+  latestTaskRef.current = task;
 
   // 全局 prompt / confirm（重命名 / 回退）
   const { prompt, confirm } = useDialog();
@@ -237,9 +249,11 @@ export const ChatView = ({
   // 把 callback ref 化、避免 SSE effect 因为父组件 re-render 反复重连
   const onTaskUpdateRef = useRef(onTaskUpdate);
   const onEventAppendRef = useRef(onEventAppend);
+  const onRewoundRef = useRef(onRewound);
   const onTaskDeletedRef = useRef(onTaskDeleted);
   onTaskUpdateRef.current = onTaskUpdate;
   onEventAppendRef.current = onEventAppend;
+  onRewoundRef.current = onRewound;
   onTaskDeletedRef.current = onTaskDeleted;
 
   /**
@@ -427,7 +441,24 @@ export const ChatView = ({
     // msg 已是 runner 拼好的可读文案（「Chat agent 异常：…」），别再套一层
     // 「watch 出错」——那会误导成 SSE 断了，实际是 agent 挂了
     onErrorMessage: (msg) => toast.error(msg),
-    onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
+    // resume 有值 = 重试预算耗尽、已休眠：挂「重连」按钮并常驻，别让用户面对静默停更的页面
+    // 稳定 id：同一任务重复休眠只原位更新、不叠加；连接恢复 / 卸载 / 切任务时由 onWatchDormantEnd 撤掉
+    onWatchException: (err, resume) =>
+      toast.error(
+        `Chat watch 异常：${err.message}`,
+        resume
+          ? {
+              id: watchDormantToastId("chat", task.id),
+              action: { label: "重连", onClick: resume },
+              duration: Infinity,
+            }
+          : undefined,
+      ),
+    onWatchDormantEnd: (taskId) =>
+      toast.dismiss(watchDormantToastId("chat", taskId)),
+    // 重连 / 休眠唤醒后的服务端快照校准 run latch：断线期间漏了 done 也不会一直卡「运行中」
+    onBootstrapSnapshot: (t) =>
+      setRunActive((prev) => reconcileRunActive(prev, t.runStatus)),
     // task_deleted / watch 410 → 清 pending/streaming + ledger，再走统一 sink
     onTaskDeleted: (deletedId) => {
       clearStreaming();
@@ -723,10 +754,13 @@ export const ChatView = ({
       });
       if (!ok) return;
       try {
-        const { task: latest, refreshRequired } = await rewindChatToEvent(
-          task.id,
-          eventId,
-        );
+        const {
+          task: latest,
+          refreshRequired,
+          rewound,
+        } = await rewindChatToEvent(task.id, eventId);
+        // 响应体里的回退标记先于 task 快照应用：标记事件写失败 / SSE 没到时，本地也能截掉被删的后半段
+        if (rewound) onRewoundRef.current?.(rewound);
         if (!latest || refreshRequired) {
           // 回退已提交但服务端读 task 失败：勿 onTaskUpdate(null)，提示用户刷新
           toast.success("已回退，请刷新查看最新状态");
@@ -744,6 +778,65 @@ export const ChatView = ({
       }
     },
     [confirm, task.id],
+  );
+
+  // 编辑已发送的消息（Codex / Cursor IDE 式）的「回退」那一半：确认（会丢东西才问）→ 先停当前回复 →
+  // 回退到这条消息之前（有文件检查点连文件一起还原、没有就只回退对话）。回退成功返回 ok，
+  // EventStream 随后把编辑后的内容作为新消息发出——被编辑的消息及之后的对话就这样被替换。
+  // cancelled = 用户在确认框取消；failed = 已弹错误提示。两者都让编辑态保持、什么都没删。
+  const handleEditRewind = useCallback(
+    async (ev: TaskEvent): Promise<"ok" | "cancelled" | "failed"> => {
+      const cur = latestTaskRef.current;
+      const plan = planEditRewind({
+        events: cur.events,
+        eventId: ev.id,
+        runActive: runActiveRef.current || cur.runStatus === "running",
+      });
+      if (!plan) {
+        toast.error("找不到这条消息，无法编辑");
+        return "failed";
+      }
+      if (plan.needsConfirm) {
+        const ok = await confirm({
+          ...editRewindConfirmCopy(plan, {
+            repoBound: cur.repoPaths.length > 0,
+          }),
+          destructive: true,
+        });
+        if (!ok) return "cancelled";
+      }
+      if (plan.needsStop && !(await stopAgentCore())) return "failed";
+      try {
+        // 刚停下的 run 收尾可能还差一拍（服务端回退要求没有 run / 排队 / 启动中）：409 短暂重试
+        let result: Awaited<ReturnType<typeof rewindChatToEvent>> | null = null;
+        for (let attempt = 0; result === null; attempt++) {
+          try {
+            result = await rewindChatToEvent(taskIdRef.current, ev.id, {
+              mode: "edit",
+            });
+          } catch (err) {
+            const transient =
+              plan.needsStop &&
+              err instanceof ApiRequestError &&
+              err.status === 409;
+            if (!transient || attempt >= 3) throw err;
+            await new Promise((r) => setTimeout(r, 400));
+          }
+        }
+        // 响应体里的回退标记先于 task 快照应用（同 handleRewind）
+        if (result.rewound) onRewoundRef.current?.(result.rewound);
+        if (!result.task || result.refreshRequired) {
+          toast.success("已回退，请刷新查看最新状态");
+        } else {
+          onTaskUpdateRef.current(result.task);
+        }
+        return "ok";
+      } catch (err) {
+        toast.error(`编辑失败：${(err as Error).message}`);
+        return "failed";
+      }
+    },
+    [confirm, stopAgentCore],
   );
 
   // C：待发送气泡直改 / 直删（服务端队列 + 本地 ledger 乐观更新）。
@@ -894,6 +987,7 @@ export const ChatView = ({
           onPrependEvents={onPrependEvents}
           onTaskUpdate={onTaskUpdate}
           onRewind={handleRewind}
+          onEditRewind={handleEditRewind}
           pendingLocalReplies={pendingForStream}
           queueBanner={queueBanner}
           allowQueueWhileRunning

@@ -43,6 +43,14 @@ import { formatRelative, REPO_STATUS_LABEL } from "@/lib/task-display";
 import { setTaskArchived } from "@/lib/task-store";
 import { isWorktreeTaskLike } from "@/lib/lightweight-task";
 import {
+  matchesSessionQuery,
+  pickArchivedSessions,
+  pickFinishedSessions,
+  pickStaleChatSessions,
+  prunePicked,
+  SESSIONS_PAGE_SIZE,
+} from "@/lib/sessions-filter";
+import {
   loadSidebarPinnedOrder,
   saveSidebarPinnedOrder,
 } from "@/lib/view-memory";
@@ -70,9 +78,6 @@ const MODE_FILTERS: Array<{ key: ModeFilter; label: string }> = [
   { key: "chat", label: "对话" },
   { key: "task", label: "任务" },
 ];
-
-/** 「不活跃对话」阈值（30 天未活跃快捷选中用） */
-const CHAT_STALE_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** 残留工作区勾选前缀，避免和任务 id 在 Set 里撞车 */
 const STALE_PICK_PREFIX = "stale:";
@@ -224,19 +229,13 @@ const SessionsPage = () => {
   );
 
   const visible = useMemo(() => {
-    const kw = query.trim().toLowerCase();
     const rows = tasks.filter((t) => {
       if (filter === "active" && t.archived) return false;
       if (filter === "archived" && !t.archived) return false;
       if (modeFilter === "chat" && t.mode !== "chat") return false;
       if (modeFilter === "task" && t.mode === "chat") return false;
-      if (!kw) return true;
-      const tail = (t.repoPaths?.[0] ?? "").toLowerCase();
-      return (
-        t.title.toLowerCase().includes(kw) ||
-        tail.includes(kw) ||
-        repoTail(t).toLowerCase().includes(kw)
-      );
+      // 搜索覆盖任务关联的所有仓（不只第一个）
+      return matchesSessionQuery(t, query);
     });
     // 占用没扫完时 size 全 0、排出来是假顺序，回落按最近（按钮侧同时禁用）
     if (sort === "size" && storage) {
@@ -256,17 +255,44 @@ const SessionsPage = () => {
 
   // 快捷选中：点击时现算，不 memo——memo  deps 里 Date.now() 是冻住的，页面开几小时
   // 阈值就不动（刚满 30 天的进不来）。finished 本与时间无关，同样只点击时用，顺手一起改。
-  const getFinishedTasks = () =>
-    tasks.filter(
-      (t) =>
-        (t.mode ?? "task") !== "chat" &&
-        (t.repoStatus === "merged" || t.repoStatus === "abandoned"),
-    );
-  const getStaleChats = () =>
-    tasks.filter(
-      (t) => t.mode === "chat" && Date.now() - t.updatedAt > CHAT_STALE_MS,
-    );
-  const getArchivedTasks = () => tasks.filter((t) => t.archived);
+
+  // 分批渲染：一次只渲染前 N 行、「显示更多」追加；筛选 / 搜索 / 排序变了回到第一批
+  // （按 key 比对派生，不用 effect 重置）
+  const listKey = `${filter}|${modeFilter}|${sort}|${query}`;
+  const [shown, setShown] = useState<{ key: string; n: number }>({
+    key: listKey,
+    n: SESSIONS_PAGE_SIZE,
+  });
+  const shownCount =
+    shown.key === listKey ? shown.n : SESSIONS_PAGE_SIZE;
+  const renderedRows = useMemo(
+    () => visible.slice(0, shownCount),
+    [visible, shownCount],
+  );
+  const hiddenCount = visible.length - renderedRows.length;
+
+  // R8-05：勾选集合只认「此刻已渲染的行 + 残留工作区」。筛选 / 搜索 / 排序变了、列表回到第一批后，
+  // 旧勾选里看不见的行自动失效（不参与计数 / 体积 / 批量删除），不会删到用户没看到的行。
+  // 只派生不回写：回到原筛选再次渲染出来的行会带着勾选显示，用户看得见。
+  const pickableKeys = useMemo(
+    () => [
+      ...renderedRows.map((t) => t.id),
+      ...(storage?.staleWorktrees ?? []).map(
+        (s) => `${STALE_PICK_PREFIX}${s.id}`,
+      ),
+    ],
+    [renderedRows, storage],
+  );
+  const effectivePicked = useMemo(
+    () => prunePicked(picked, pickableKeys),
+    [picked, pickableKeys],
+  );
+
+  // 三个快捷选中只作用于「当前筛选后且已渲染」的行（renderedRows），
+  // 未点「显示更多」的行用户没看到、不能被一键选中后批量删掉
+  const getFinishedTasks = () => pickFinishedSessions(renderedRows);
+  const getStaleChats = () => pickStaleChatSessions(renderedRows, Date.now());
+  const getArchivedTasks = () => pickArchivedSessions(renderedRows);
 
   const togglePick = (key: string) => {
     if (deleting) return;
@@ -295,7 +321,7 @@ const SessionsPage = () => {
 
   const pickedBytes = useMemo(() => {
     let s = 0;
-    for (const key of picked) {
+    for (const key of effectivePicked) {
       if (key.startsWith(STALE_PICK_PREFIX)) {
         s += staleById.get(key.slice(STALE_PICK_PREFIX.length))?.bytes ?? 0;
       } else {
@@ -303,7 +329,7 @@ const SessionsPage = () => {
       }
     }
     return s;
-  }, [picked, sizeById, staleById]);
+  }, [effectivePicked, sizeById, staleById]);
 
   // 扫描完成前 sizeById 是空 Map，pickedBytes 算出来是 0——别展示假数
   const sizesReady = storage !== null;
@@ -447,16 +473,18 @@ const SessionsPage = () => {
   };
 
   const handleBatchDelete = async () => {
-    if (picked.size === 0 || deleting) return;
-    const taskKeys = Array.from(picked).filter(
+    // 执行点再与「当前可见（已渲染）」求交：只删用户此刻看得见、勾着的项
+    const toDelete = prunePicked(picked, pickableKeys);
+    if (toDelete.size === 0 || deleting) return;
+    const taskKeys = Array.from(toDelete).filter(
       (k) => !k.startsWith(STALE_PICK_PREFIX),
     );
-    const staleIds = Array.from(picked)
+    const staleIds = Array.from(toDelete)
       .filter((k) => k.startsWith(STALE_PICK_PREFIX))
       .map((k) => k.slice(STALE_PICK_PREFIX.length));
     const ok = await confirm({
-      title: `删除 ${picked.size} 项？`,
-      description: `含 ${taskKeys.length} 个会话与 ${staleIds.length} 个残留工作区（${pickedBytesText}）、不可恢复。正在跑的会先停掉。`,
+      title: `删除 ${toDelete.size} 项？`,
+      description: `将删除当前列表中已勾选的 ${toDelete.size} 项：${taskKeys.length} 个会话与 ${staleIds.length} 个残留工作区（${pickedBytesText}）、不可恢复。正在跑的会先停掉。`,
       confirmLabel: "删除",
       destructive: true,
     });
@@ -699,7 +727,13 @@ const SessionsPage = () => {
               >
                 选中已归档（{getArchivedTasks().length}）
               </Button>
-              {picked.size > 0 && (
+              {hiddenCount > 0 && (
+                <span className="text-[11px] text-muted-foreground">
+                  快捷选中只作用于已显示的 {renderedRows.length} 行（还有{" "}
+                  {hiddenCount} 行未显示，点「显示更多」后可继续选）
+                </span>
+              )}
+              {effectivePicked.size > 0 && (
                 <Button
                   variant="destructive"
                   size="sm"
@@ -715,7 +749,7 @@ const SessionsPage = () => {
                   ) : (
                     <>
                       <Trash2 className="size-3.5" />
-                      删除所选（{picked.size} 个 · {pickedBytesText}）
+                      删除所选（{effectivePicked.size} 个 · {pickedBytesText}）
                     </>
                   )}
                 </Button>
@@ -734,7 +768,7 @@ const SessionsPage = () => {
             </div>
           ) : (
             <div className="divide-y">
-              {visible.map((t) => {
+              {renderedRows.map((t) => {
               const busy = busyIds.has(t.id);
               const size = sizeById.get(t.id)?.total;
               return (
@@ -744,7 +778,7 @@ const SessionsPage = () => {
                 >
                   {managing && (
                     <Checkbox
-                      checked={picked.has(t.id)}
+                      checked={effectivePicked.has(t.id)}
                       onCheckedChange={() => togglePick(t.id)}
                       disabled={!!deleting}
                       onClick={(e) => e.stopPropagation()}
@@ -842,6 +876,23 @@ const SessionsPage = () => {
                 </div>
               );
             })}
+              {hiddenCount > 0 && (
+                <div className="flex justify-center px-4 py-3">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs text-muted-foreground"
+                    onClick={() =>
+                      setShown({
+                        key: listKey,
+                        n: shownCount + SESSIONS_PAGE_SIZE,
+                      })
+                    }
+                  >
+                    显示更多（还有 {hiddenCount} 个）
+                  </Button>
+                </div>
+              )}
             </div>
           )}
         </Card>
@@ -865,7 +916,7 @@ const SessionsPage = () => {
                   >
                     {managing && (
                       <Checkbox
-                        checked={picked.has(key)}
+                        checked={effectivePicked.has(key)}
                         onCheckedChange={() => togglePick(key)}
                         disabled={!!deleting}
                         onClick={(e) => e.stopPropagation()}

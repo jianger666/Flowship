@@ -277,9 +277,32 @@ interface ChatQueueGlobalState {
    * direct / firstMessage / queued / queue-priority / flush 共用；挂 globalThis 防分裂。
    */
   messageOps: Map<string, Map<string, MessageOperation>>;
+  /**
+   * per-task「系统关会话」标记：closeChatSession 在 reason 为 reconnect / error / restart（非用户意图）
+   * 摘表的那一刻记下「系统自己清队前后的队列 generation」。见 {@link markChatSystemClose}。
+   */
+  systemCloses: Map<string, ChatSystemCloseMark>;
   /** 全局 item 发号器（与 Map 同寿命，防 resetModules 撞号） */
   nextItemSeq: number;
 }
+
+export type ChatSystemCloseMark = {
+  /**
+   * 系统自己清队**之前**的队列 generation（没有清队 = 与 generation 相同）。
+   * 与 steer 开始时的 generation 不等，说明系统动手前用户（停止 / 回退）已经清过队。
+   */
+  preClearGeneration: number;
+  /** 摘表那一刻的队列 generation（系统自己的清队已含在内） */
+  generation: number;
+  /**
+   * 本 task 的系统关闭序号（每次打标 +1，从 1 起；随标记存放，所以 hot reload 不回退）。
+   * 为什么要有（第八轮 L5-01）：「立即发送」steer 在 take 与 steerChatRun 起手之间有一段 await（冲半截回复 / 落 user_reply /
+   * 检查点），这期间系统关闭时 steer 还没握到 rec、不会被唤醒成 replaced，只会在起手时读到「没有会话」降成 followup。
+   * 调用方在 take 时记下当时的序号，之后「序号变大」= take 之后发生过系统关闭（不依赖时钟、同毫秒也分得清），
+   * 据此把这条消息按「系统换掉了会话」重排，而不是记 stopped / no_session 丢掉。
+   */
+  seq: number;
+};
 
 // V6：相对 V5 增 messageOps；换 key 防 hot-reload 缺字段分裂
 const CHAT_QUEUE_GLOBAL_KEY = "__flowshipChatQueueV6__";
@@ -297,6 +320,7 @@ const getQueueState = (): ChatQueueGlobalState => {
       inFlightItemIds: new Map(),
       recentSettled: new Map(),
       messageOps: new Map(),
+      systemCloses: new Map(),
       nextItemSeq: 1,
     };
   }
@@ -307,6 +331,7 @@ const getQueueState = (): ChatQueueGlobalState => {
   if (!state.inFlightItemIds) state.inFlightItemIds = new Map();
   if (!state.recentSettled) state.recentSettled = new Map();
   if (!state.messageOps) state.messageOps = new Map();
+  if (!state.systemCloses) state.systemCloses = new Map();
   if (typeof state.nextItemSeq !== "number" || state.nextItemSeq < 1) {
     state.nextItemSeq = 1;
   }
@@ -319,6 +344,7 @@ const inFlightMap = () => getQueueState().inFlight;
 const inFlightItemIdsMap = () => getQueueState().inFlightItemIds;
 const recentSettledMap = () => getQueueState().recentSettled;
 const messageOpsMap = () => getQueueState().messageOps;
+const systemClosesMap = () => getQueueState().systemCloses;
 
 const taskMessageOps = (taskId: string): Map<string, MessageOperation> => {
   const map = messageOpsMap();
@@ -924,6 +950,13 @@ export const failQueuedItems = (
      * 仍接受以防漏改调用方，但不再豁免失败——请改用 currentHandedOff。
      */
     currentReplyPersisted?: boolean;
+    /**
+     * 不在队里、也不是 in-flight 槽里的「在途」条——目前只有「立即发送」steer 在飞的那条
+     * （刻意不占 in-flight 槽，见 chat-queue-send-now.steerQueuedMessage）。
+     * error 收尾要把它和队里其它消息一起判失败（同命运、同一条提示）；已是终态 / 已 handoff 的条跳过，
+     * 不重复落终态。cancelled / rewound 不传：那两条路径由 steer 的落定结果自己收尾（stopped / 重排）。
+     */
+    extraItemIds?: readonly string[];
   },
 ): string[] => {
   const remaining = takeRemainingChatQueueItemIds(taskId);
@@ -943,6 +976,11 @@ export const failQueuedItems = (
   }
   for (const id of remaining) {
     if (!failedIds.includes(id)) failedIds.push(id);
+  }
+  for (const id of options.extraItemIds ?? []) {
+    if (failedIds.includes(id)) continue;
+    if (isMessageOperationTerminal(taskId, id)) continue;
+    failedIds.push(id);
   }
 
   // clear 仅允许经本 sink（内部私有语义；导出留给 DELETE/测试）
@@ -973,6 +1011,37 @@ export const getChatQueueGeneration = (taskId: string): number =>
   generations().get(taskId) ?? 0;
 
 /**
+ * 系统（非用户）摘会话时调用：记下「系统自己清队前、后的队列 generation」。
+ *
+ * 为什么要有：cancelled / error 收尾都是「先 failQueuedItems（清队、generation + 1）→ 同一同步段内
+ * closeChatSession」。在飞的「立即发送」steer 随后落定为 replaced，调用方需要判断「消息被谁作废」：
+ *   - 只拿 steer 开始时的 generation 比，会把系统自己的这次清队误当成用户停止（第六轮修过）；
+ *   - 只拿摘表时的 generation 当基线，又会把「系统清队之前用户已经清过的那一次」吸收掉（第七轮 K1-01）——
+ *     用户停止的清队先到、系统强清 / 取消收尾后到，标记取到的就是已含用户那一次的值，消息被重排回来。
+ * 所以两个值都记：只有「清队前 == steer 开始时、当前 == 摘表时」才说明从 steer 开始到现在没有用户 / 回退的清队。
+ *
+ * @param preClearGeneration 系统自己清队**之前**读到的 generation；没有清队（forceClear / 重连）省略 = 当前值。
+ *   必须在系统自己的清队之前、与清队同一同步段内读（调用方保证）。
+ * 本函数必须在系统自己的清队之后、同一同步段内调用（closeChatSession 保证）。
+ */
+export const markChatSystemClose = (
+  taskId: string,
+  preClearGeneration?: number,
+): void => {
+  const generation = getChatQueueGeneration(taskId);
+  systemClosesMap().set(taskId, {
+    preClearGeneration: preClearGeneration ?? generation,
+    generation,
+    seq: (systemClosesMap().get(taskId)?.seq ?? 0) + 1,
+  });
+};
+
+/** 最近一次系统摘会话的标记（无则 undefined）；见 {@link markChatSystemClose} */
+export const getChatSystemCloseMark = (
+  taskId: string,
+): ChatSystemCloseMark | undefined => systemClosesMap().get(taskId);
+
+/**
  * 清空队列 + 递增 generation（不做终态 publish / 不写 ledger）。
  *
  * ⚠️ 业务清队必须走 failQueuedItems。本函数仅供：
@@ -995,6 +1064,7 @@ export const clearChatQueue = (taskId: string): void => {
 export const cleanupChatQueueState = (taskId: string): void => {
   queues().delete(taskId);
   generations().delete(taskId);
+  systemClosesMap().delete(taskId);
   endChatQueueInFlight(taskId);
   recentSettledMap().delete(taskId);
   // operation 表一并清（与 ledger 同寿命）

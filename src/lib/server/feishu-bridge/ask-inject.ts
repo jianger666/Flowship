@@ -22,6 +22,7 @@ import {
 } from "@/lib/server/chat-pending";
 import { deliverChatAskReply, hasChatSession } from "@/lib/server/chat-runner";
 import { deliverAskReply } from "@/lib/server/task-runner";
+import { supersedePendingAsks } from "@/lib/server/ask-supersede";
 import { fulfillAskWait } from "@/lib/server/ask-wait";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import { getTask } from "@/lib/server/task-fs";
@@ -170,6 +171,22 @@ export const injectPendingAskText = async (
       : agentSessions.has(taskId);
     if (sessionAlive) {
       restorePendingAskIf(taskId, pending);
+    } else {
+      // 不放回只是「内存里不再等这组答案」，事件流里这组 ask 仍是「待回答」、群里那张橙卡还挂着按钮。
+      // 与 ask-reply 路由同一口径写作废标记：前端据此收起答题卡，飞书桥接的 tap 认出标记后把卡置「已失效」
+      // （F3-02：此前这里漏了，点旧卡的人只会得到中性的「已失效或已回答」）。
+      // lease：写标记要读盘 + 写盘，期间用户可能已经唤醒新会话——那时这组 ask 不再是孤儿，放手不碰
+      try {
+        await supersedePendingAsks(taskId, "会话已失效", () =>
+          isChat ? !hasChatSession(taskId) : !agentSessions.has(taskId),
+        );
+      } catch (err) {
+        // 作废标记是善后：失败不能改变「答案没送达」这个返回值
+        console.warn(
+          `[feishu-bridge/ask-inject] 会话已死、写作废标记失败 task=${taskId}:`,
+          err,
+        );
+      }
     }
     return {
       ok: false,

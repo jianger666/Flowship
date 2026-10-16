@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
+import { pickChatLanding } from "@/lib/task-display";
 import { getLastChatId } from "@/lib/view-memory";
 
 const ChatsPage = () => {
@@ -29,24 +30,22 @@ const ChatsPage = () => {
     router.push(`/tasks/${task.id}`);
   });
 
-  const chats = tasks.filter((t) => t.mode === "chat");
+  // 落点只在未归档对话里选：侧栏不显示归档项。归档当前对话会 push 到这里，
+  // 若落回刚归档的那条（最后浏览 = 它），就会「停在一个左边列表里没有的对话上」
+  const landing = loaded ? pickChatLanding(tasks, getLastChatId()) : undefined;
 
   useEffect(() => {
-    if (!loaded || redirectedRef.current || chats.length === 0) return;
+    if (!loaded || redirectedRef.current || !landing) return;
     // 优先落「最后浏览的对话」（用户拍板「切到工作台再切回来要记住」）、
-    // 没记录 / 已被删则回退最近活跃（updatedAt 倒序第一条）
-    const lastId = getLastChatId();
-    const target =
-      (lastId && chats.find((t) => t.id === lastId)) ||
-      [...chats].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    // 没记录 / 已被删 / 已归档则回退最近活跃（updatedAt 倒序第一条）
     redirectedRef.current = true;
-    router.replace(`/tasks/${target.id}`);
-  }, [loaded, chats, router]);
+    router.replace(`/tasks/${landing.id}`);
+  }, [loaded, landing, router]);
 
   if (!loaded) return <LoadingState variant="hero" />;
 
-  // 有对话时 effect 会跳走、这里只在「一条对话都没有」时真正渲染
-  if (chats.length > 0) return <LoadingState variant="hero" />;
+  // 有可落的对话时 effect 会跳走、这里只在「没有未归档对话」时真正渲染
+  if (landing) return <LoadingState variant="hero" />;
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-8">

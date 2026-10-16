@@ -8,7 +8,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { Task } from "@/lib/types";
 
@@ -556,4 +556,691 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     });
     await removeTaskWorktrees(remaining);
   });
+
+  it("S03-01：gitdir 指针失效（rev-parse 失败）时改名隔离保留未提交改动、不直接 rm，重复触发后缀唯一", async () => {
+    const repo = path.join(TMP_ROOT, "broken-pointer-repo");
+    await fs.mkdir(repo, { recursive: true });
+    git(repo, "init", "-b", "main");
+    git(repo, "config", "user.email", "t@t.local");
+    git(repo, "config", "user.name", "t");
+    await fs.writeFile(path.join(repo, "base.txt"), "base\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "init");
+
+    const t = makeTask({
+      id: "t_1700000000010_brokenptr",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/999002",
+    });
+    await markTaskAlive(t.id);
+    const wd = getTaskWorkRepoPaths(t)[0];
+    await ensureTaskWorktrees(t, () => true);
+
+    // 固定时间戳：第二轮同名目录必须追加 -1 后缀、不覆盖第一轮隔离目录
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    try {
+      for (const round of [0, 1]) {
+        // 用户未提交改动 + 把 .git 指针改坏（模拟主仓被移动 → git rev-parse 失败）
+        await fs.writeFile(path.join(wd, `wip-${round}.txt`), `dirty-${round}\n`);
+        await fs.writeFile(
+          path.join(wd, ".git"),
+          `gitdir: ${path.join(TMP_ROOT, "moved-away", ".git", "worktrees", "x")}\n`,
+        );
+        const res = await ensureTaskWorktrees(t, () => true);
+        expect(res.infos[0].name).toBe("feature/999002-集成测试");
+        // 重建后的新 worktree 是合法的
+        expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+      }
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    const first = `${wd}.orphaned-1800000000000`;
+    const second = `${wd}.orphaned-1800000000000-1`;
+    await expect(fs.readFile(path.join(first, "wip-0.txt"), "utf8")).resolves.toBe(
+      "dirty-0\n",
+    );
+    // 第二轮隔离的是第一轮重建出来的新目录——里面不应有 wip-0（新建的干净检出）、只有 wip-1
+    await expect(fs.readFile(path.join(second, "wip-1.txt"), "utf8")).resolves.toBe(
+      "dirty-1\n",
+    );
+    await expect(fs.access(path.join(second, "wip-0.txt"))).rejects.toThrow();
+    // 新目录不带旧改动
+    await expect(fs.access(path.join(wd, "wip-0.txt"))).rejects.toThrow();
+    await expect(fs.access(path.join(wd, "wip-1.txt"))).rejects.toThrow();
+
+    await removeTaskWorktrees(t);
+  });
+
+  /** 建临时仓 + 已 ensure 的 worktree，返回任务与工作区路径 */
+  const setupEnsuredTask = async (
+    key: string,
+    storyId: string,
+  ): Promise<{ t: Task; wd: string }> => {
+    const repo = path.join(TMP_ROOT, `${key}-repo`);
+    await fs.mkdir(repo, { recursive: true });
+    git(repo, "init", "-b", "main");
+    git(repo, "config", "user.email", "t@t.local");
+    git(repo, "config", "user.name", "t");
+    await fs.writeFile(path.join(repo, "base.txt"), "base\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "init");
+    const t = makeTask({
+      id: `t_1700000000020_${key}`,
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: `https://project.feishu.cn/x/story/detail/${storyId}`,
+    });
+    await markTaskAlive(t.id);
+    const wd = getTaskWorkRepoPaths(t)[0];
+    await ensureTaskWorktrees(t, () => true);
+    return { t, wd };
+  };
+
+  it.each(["EBUSY", "EXDEV"])(
+    "R2-01：带 .git 的损坏目录改名隔离失败（%s）时抛错、保留目录与未提交改动、不降级 rm",
+    async (code) => {
+      const { t, wd } = await setupEnsuredTask(
+        `rename-fail-${code.toLowerCase()}`,
+        code === "EBUSY" ? "999003" : "999004",
+      );
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty\n");
+      await fs.writeFile(
+        path.join(wd, ".git"),
+        `gitdir: ${path.join(TMP_ROOT, "moved-away", ".git", "worktrees", "y")}\n`,
+      );
+
+      const realRename = fs.rename.bind(fs);
+      const renameSpy = vi
+        .spyOn(fs, "rename")
+        .mockImplementation(async (from, to) => {
+          if (String(to).includes(".orphaned-")) {
+            throw Object.assign(new Error(`${code}: rename failed`), { code });
+          }
+          return realRename(from, to);
+        });
+      try {
+        await expect(ensureTaskWorktrees(t, () => true)).rejects.toThrow(
+          /自动改名隔离失败[\s\S]*已保留原目录/,
+        );
+        await expect(ensureTaskWorktrees(t, () => true)).rejects.toThrow(
+          new RegExp(wd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        );
+        expect(renameSpy).toHaveBeenCalled();
+      } finally {
+        renameSpy.mockRestore();
+      }
+
+      // 目录、未提交文件、坏 .git 指针全部原样、没有半截删除
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe(
+        "dirty\n",
+      );
+      await expect(fs.readFile(path.join(wd, "base.txt"), "utf8")).resolves.toBe(
+        "base\n",
+      );
+      await expect(fs.readFile(path.join(wd, ".git"), "utf8")).resolves.toContain(
+        "moved-away",
+      );
+      // 没产生隔离目录
+      const siblings = await fs.readdir(path.dirname(wd));
+      expect(siblings.filter((n) => n.includes(".orphaned-"))).toEqual([]);
+
+      await fs.rm(wd, { recursive: true, force: true });
+      await removeTaskWorktrees(t);
+    },
+  );
+
+  it("R2-01 回归：无 .git 的半截目录（只有依赖克隆残留）仍被清理并重建 worktree", async () => {
+    const { t, wd } = await setupEnsuredTask("half-dir", "999005");
+    // 模拟半截目录：整个工作区换成只有依赖残留、没有 .git
+    await removeTaskWorktrees(t);
+    await fs.mkdir(path.join(wd, "node_modules", "pkg"), { recursive: true });
+    await fs.writeFile(path.join(wd, "node_modules", "pkg", "i.js"), "1\n");
+    await expect(fs.access(path.join(wd, ".git"))).rejects.toThrow();
+
+    const renameSpy = vi.spyOn(fs, "rename");
+    try {
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.infos[0].name).toBe("feature/999005-集成测试");
+      // 无 .git 不走改名隔离
+      expect(
+        renameSpy.mock.calls.some(([, to]) => String(to).includes(".orphaned-")),
+      ).toBe(false);
+    } finally {
+      renameSpy.mockRestore();
+    }
+    expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+    await expect(fs.access(path.join(wd, "node_modules", "pkg", "i.js"))).rejects.toThrow();
+    const siblings = await fs.readdir(path.dirname(wd));
+    expect(siblings.filter((n) => n.includes(".orphaned-"))).toEqual([]);
+
+    await removeTaskWorktrees(t);
+  });
+
+  // ───────────── N10-02：「坏掉」判定只认结构性证据，不再因一次 git 失败就改名隔离 ─────────────
+
+  /** 读 worktree 的 `.git` 指针，返回它指向的 gitdir（主仓 `.git/worktrees/<name>`） */
+  const readGitDirOf = async (wd: string): Promise<string> => {
+    const raw = await fs.readFile(path.join(wd, ".git"), "utf8");
+    return raw.match(/^gitdir:\s*(.+?)\s*$/m)![1];
+  };
+
+  /**
+   * 在 PATH 最前面塞一个 git 包装：FLOWSHIP_TEST_GIT_FAIL_REVPARSE=1 时让
+   * `rev-parse --is-inside-work-tree` 假失败（模拟超时 / 负载 / 权限等临时故障），其余命令原样透传给真 git。
+   * 返回还原函数。仅 Unix（shell 脚本）。
+   */
+  const installFlakyGit = async (): Promise<() => void> => {
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const binDir = path.join(TMP_ROOT, "flaky-git-bin");
+    await fs.mkdir(binDir, { recursive: true });
+    await fs.writeFile(
+      path.join(binDir, "git"),
+      [
+        "#!/bin/sh",
+        'if [ "$FLOWSHIP_TEST_GIT_FAIL_REVPARSE" = "1" ]; then',
+        '  case "$*" in',
+        '    *--is-inside-work-tree*) echo "fatal: simulated transient failure (load / timeout)" >&2; exit 128 ;;',
+        "  esac",
+        "fi",
+        `exec "${realGit}" "$@"`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${prevPath ?? ""}`;
+    return () => {
+      process.env.PATH = prevPath;
+      delete process.env.FLOWSHIP_TEST_GIT_FAIL_REVPARSE;
+    };
+  };
+
+  it.skipIf(process.platform === "win32")(
+    "N10-02：rev-parse 临时失败但 .git 指针 / gitdir 完好 → 不改名、不删、抛错；恢复后原目录原样复用（未提交改动还在）",
+    async () => {
+      const { t, wd } = await setupEnsuredTask("transient-git", "999010");
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty\n");
+      const pointerBefore = await fs.readFile(path.join(wd, ".git"), "utf8");
+
+      const restore = await installFlakyGit();
+      const renameSpy = vi.spyOn(fs, "rename");
+      const rmSpy = vi.spyOn(fs, "rm");
+      try {
+        process.env.FLOWSHIP_TEST_GIT_FAIL_REVPARSE = "1";
+        // 连续两次都是临时失败：每次都只抛错、都不动目录（报错里带 git 的 stderr 方便排查）
+        for (let i = 0; i < 2; i++) {
+          await expect(ensureTaskWorktrees(t, () => true)).rejects.toThrow(
+            /simulated transient failure[\s\S]*没有证据表明目录已损坏[\s\S]*已保留原目录/,
+          );
+        }
+        expect(
+          renameSpy.mock.calls.some(([, to]) => String(to).includes(".orphaned-")),
+        ).toBe(false);
+        expect(rmSpy.mock.calls.filter(([p]) => String(p) === wd)).toEqual([]);
+      } finally {
+        renameSpy.mockRestore();
+        rmSpy.mockRestore();
+        restore();
+      }
+
+      // 抛错期间目录、未提交文件、指针全部原样、没有隔离目录
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe("dirty\n");
+      await expect(fs.readFile(path.join(wd, ".git"), "utf8")).resolves.toBe(pointerBefore);
+      const siblings = await fs.readdir(path.dirname(wd));
+      expect(siblings.filter((n) => n.includes(".orphaned-"))).toEqual([]);
+
+      // git 恢复后再 ensure：复用同一个目录（没有新建 / 重建），改动还在
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.createdRepos).toEqual([]);
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe("dirty\n");
+      expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  type BreakCase = {
+    name: string;
+    storyId: string;
+    /** 把 worktree 的 .git 结构弄坏成 git 必定认不出的样子 */
+    breakIt: (wd: string) => Promise<void>;
+  };
+  const breakCases: BreakCase[] = [
+    {
+      name: ".git 指针文件被截断成空文件",
+      storyId: "999011",
+      breakIt: async (wd) => {
+        await fs.writeFile(path.join(wd, ".git"), "");
+      },
+    },
+    {
+      name: ".git 指针文件内容不是 gitdir: 行",
+      storyId: "999012",
+      breakIt: async (wd) => {
+        await fs.writeFile(path.join(wd, ".git"), "garbage\n");
+      },
+    },
+    {
+      name: "指针指向的 gitdir 缺 HEAD",
+      storyId: "999013",
+      breakIt: async (wd) => {
+        await fs.rm(path.join(await readGitDirOf(wd), "HEAD"));
+      },
+    },
+    {
+      name: "指针指向的 worktree gitdir 缺 commondir",
+      storyId: "999014",
+      breakIt: async (wd) => {
+        await fs.rm(path.join(await readGitDirOf(wd), "commondir"));
+      },
+    },
+    {
+      name: ".git 被换成缺 HEAD 的空目录",
+      storyId: "999015",
+      breakIt: async (wd) => {
+        await fs.rm(path.join(wd, ".git"));
+        await fs.mkdir(path.join(wd, ".git"));
+      },
+    },
+    // ───── M6-02：HEAD 在、但内容不是合法 ref / sha——git 实测同样 `fatal: not a git repository` ─────
+    {
+      name: "M6-02：指针指向的 gitdir 的 HEAD 是空文件",
+      storyId: "999016",
+      breakIt: async (wd) => {
+        await fs.writeFile(path.join(await readGitDirOf(wd), "HEAD"), "");
+      },
+    },
+    {
+      name: "M6-02：指针指向的 gitdir 的 HEAD 是垃圾内容",
+      storyId: "999017",
+      breakIt: async (wd) => {
+        await fs.writeFile(path.join(await readGitDirOf(wd), "HEAD"), "garbage\n");
+      },
+    },
+    {
+      name: "M6-02：指针指向的 gitdir 的 HEAD 只有 39 位十六进制（不是合法 sha）",
+      storyId: "999018",
+      breakIt: async (wd) => {
+        await fs.writeFile(
+          path.join(await readGitDirOf(wd), "HEAD"),
+          `${"a".repeat(39)}\n`,
+        );
+      },
+    },
+    {
+      name: "M6-02：.git 目录里的 HEAD 是空文件",
+      storyId: "999019",
+      breakIt: async (wd) => {
+        await fs.rm(path.join(wd, ".git"));
+        await fs.mkdir(path.join(wd, ".git"));
+        await fs.writeFile(path.join(wd, ".git", "HEAD"), "");
+      },
+    },
+    // ───── M6-01 对照：主仓本身可达、只是 worktree 登记没了——这才是「指针失效」的正面证据 ─────
+    {
+      name: "M6-01 对照：主仓可达、但 worktree 登记目录（.git/worktrees/<name>）被删",
+      storyId: "999020",
+      breakIt: async (wd) => {
+        await fs.rm(await readGitDirOf(wd), { recursive: true, force: true });
+      },
+    },
+  ];
+
+  it.each(breakCases)(
+    "N10-02：结构性损坏（$name）仍改名隔离保留未提交改动并重建",
+    async ({ name, storyId, breakIt }) => {
+      const key = `struct-${storyId}`;
+      const { t, wd } = await setupEnsuredTask(key, storyId);
+      await fs.writeFile(path.join(wd, "wip.txt"), `dirty-${name}\n`);
+      await breakIt(wd);
+
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.createdRepos).toHaveLength(1);
+
+      // 旧目录被改名隔离、未提交改动原样在里面
+      const siblings = await fs.readdir(path.dirname(wd));
+      const isolated = siblings.filter((n) => n.includes(".orphaned-"));
+      expect(isolated).toHaveLength(1);
+      await expect(
+        fs.readFile(path.join(path.dirname(wd), isolated[0], "wip.txt"), "utf8"),
+      ).resolves.toBe(`dirty-${name}\n`);
+      // 原路径上是重新建好的合法 worktree（不带旧改动）
+      expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+      await expect(fs.access(path.join(wd, "wip.txt"))).rejects.toThrow();
+
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  // ───────────── 第四轮 M6：边缘形态（主仓不可达 / HEAD 内容合法性 / 悬空软链） ─────────────
+
+  /** 软链 / 改权限 / 假 git 都是 Unix 手段；Windows 跳过（见汇报「未验证项」） */
+  const itPosix = process.platform === "win32" ? it.skip : it;
+  const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  /** 目录里名字带 .orphaned- 的兄弟项（改名隔离留下的） */
+  const isolatedSiblings = async (wd: string): Promise<string[]> =>
+    (await fs.readdir(path.dirname(wd))).filter((n) => n.includes(".orphaned-"));
+  /** 断言：ensure 抛了「不动目录」的错——没产生 .orphaned-、没对 wd 递归 rm */
+  const expectLeftUntouched = async (
+    run: () => Promise<unknown>,
+    wd: string,
+    messageRe: RegExp,
+    times = 2,
+  ): Promise<void> => {
+    const renameSpy = vi.spyOn(fs, "rename");
+    const rmSpy = vi.spyOn(fs, "rm");
+    try {
+      // 连续多次：每次都只抛错、都不动目录（下次推进自然重试，不是一次性判决）
+      for (let i = 0; i < times; i++) {
+        await expect(run()).rejects.toThrow(messageRe);
+      }
+      expect(
+        renameSpy.mock.calls.some(([, to]) => String(to).includes(".orphaned-")),
+      ).toBe(false);
+      expect(rmSpy.mock.calls.filter(([p]) => String(p) === wd)).toEqual([]);
+    } finally {
+      renameSpy.mockRestore();
+      rmSpy.mockRestore();
+    }
+    expect(await isolatedSiblings(wd)).toEqual([]);
+  };
+
+  it("M6-01：主仓暂时不可达（整个目录改名模拟没挂载）→ 不隔离不删、抛错带挂载提示与路径、改动原地不动；主仓恢复后复用同一目录", async () => {
+    const { t, wd } = await setupEnsuredTask("repo-unmounted", "999030");
+    const repo = t.repoPaths[0];
+    await fs.writeFile(path.join(wd, "wip.txt"), "dirty\n");
+    const pointerBefore = await fs.readFile(path.join(wd, ".git"), "utf8");
+    // 指针里记的主仓 .git（macOS tmpdir 下是 realpath、跟 repo 字面路径可能不同），报错里应带的就是它
+    const mainGit = path.resolve(path.dirname(path.dirname(await readGitDirOf(wd))));
+    const away = `${repo}.away`;
+    await fs.rename(repo, away);
+    try {
+      await expectLeftUntouched(
+        () => ensureTaskWorktrees(t, () => true),
+        wd,
+        new RegExp(
+          `主仓暂时不可达（是否未挂载？）[\\s\\S]*${escapeRe(mainGit)}[\\s\\S]*已保留原目录`,
+        ),
+      );
+    } finally {
+      // 无论断言成败都要还原主仓，否则后续用例 / afterAll 清理受影响
+      await fs.rename(away, repo);
+    }
+
+    // 主仓回来：目录、未提交文件、指针全部原样，复用同一目录（没有重建）
+    await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe("dirty\n");
+    await expect(fs.readFile(path.join(wd, ".git"), "utf8")).resolves.toBe(pointerBefore);
+    const res = await ensureTaskWorktrees(t, () => true);
+    expect(res.createdRepos).toEqual([]);
+    await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe("dirty\n");
+    expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+
+    await removeTaskWorktrees(t);
+  }, 60_000);
+
+  const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  (process.platform === "win32" || isRoot ? it.skip : it)(
+    "M6-01：主仓目录无权限（stat 报 EACCES、不是 ENOENT）→ 同样不当成损坏、不隔离，带不可达提示；权限恢复后复用",
+    async () => {
+      const { t, wd } = await setupEnsuredTask("repo-eacces", "999031");
+      const repo = t.repoPaths[0];
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty\n");
+      await fs.chmod(repo, 0o000);
+      try {
+        await expectLeftUntouched(
+          () => ensureTaskWorktrees(t, () => true),
+          wd,
+          /主仓暂时不可达（是否未挂载？）[\s\S]*已保留原目录/,
+        );
+      } finally {
+        await fs.chmod(repo, 0o755);
+      }
+
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.createdRepos).toEqual([]);
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe("dirty\n");
+
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  /** HEAD 的几种 git 认的合法写法（相对 sha 构造）——这些不能被误判成损坏 */
+  const validHeads: Array<{
+    name: string;
+    storyId: string;
+    head: (sha: string) => string;
+  }> = [
+    { name: "ref 无空格（ref:refs/heads/x）", storyId: "999040", head: () => "ref:refs/heads/x\n" },
+    { name: "detached 40 位 sha1", storyId: "999041", head: (sha) => `${sha}\n` },
+    {
+      name: "detached 64 位十六进制（sha256 形态）",
+      storyId: "999042",
+      head: (sha) => `${sha}${sha.slice(0, 24)}\n`,
+    },
+  ];
+  itPosix.each(validHeads)(
+    "M6-02 反例：HEAD 是 git 认的合法写法（$name）+ rev-parse 临时失败 → 仍不隔离、抛错，不误伤",
+    async ({ storyId, head }) => {
+      const { t, wd } = await setupEnsuredTask(`valid-head-${storyId}`, storyId);
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty\n");
+      const headFile = path.join(await readGitDirOf(wd), "HEAD");
+      const headBefore = await fs.readFile(headFile, "utf8");
+      const sha = git(t.repoPaths[0], "rev-parse", "HEAD");
+      await fs.writeFile(headFile, head(sha));
+
+      const restore = await installFlakyGit();
+      try {
+        process.env.FLOWSHIP_TEST_GIT_FAIL_REVPARSE = "1";
+        await expectLeftUntouched(
+          () => ensureTaskWorktrees(t, () => true),
+          wd,
+          /没有证据表明目录已损坏[\s\S]*已保留原目录/,
+        );
+      } finally {
+        restore();
+        await fs.writeFile(headFile, headBefore);
+      }
+
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.createdRepos).toEqual([]);
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe("dirty\n");
+
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  itPosix(
+    "M6-02 反例：旧式软链 HEAD（core.preferSymlinkRefs，loose ref 不在 → 软链悬空，但 git 认）+ rev-parse 临时失败 → 不当成「缺 HEAD」、不隔离",
+    async () => {
+      const { t, wd } = await setupEnsuredTask("symlink-head", "999043");
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty\n");
+      // 工作区换成「独立仓 + 软链 HEAD」：.git 是目录，HEAD → refs/heads/main（未出生分支，loose ref 不存在 → 软链悬空）
+      await fs.rm(path.join(wd, ".git"));
+      git(wd, "-c", "core.preferSymlinkRefs=true", "init", "-q", "-b", "main");
+      const headFile = path.join(wd, ".git", "HEAD");
+      expect((await fs.lstat(headFile)).isSymbolicLink()).toBe(true);
+      // open 跟随软链会 ENOENT——这正是旧实现把它误判成「缺 HEAD」的原因
+      await expect(fs.access(headFile)).rejects.toThrow();
+      // 对照：git 自己认这种仓（否则本用例没有意义）
+      expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+
+      const restore = await installFlakyGit();
+      try {
+        process.env.FLOWSHIP_TEST_GIT_FAIL_REVPARSE = "1";
+        await expectLeftUntouched(
+          () => ensureTaskWorktrees(t, () => true),
+          wd,
+          /没有证据表明目录已损坏[\s\S]*已保留原目录/,
+        );
+      } finally {
+        restore();
+      }
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe("dirty\n");
+      expect((await fs.lstat(headFile)).isSymbolicLink()).toBe(true);
+
+      await fs.rm(wd, { recursive: true, force: true });
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  itPosix(
+    "M6-03：.git 是悬空软链（相对目标不存在、其所在目录可达）→ 正面证据，改名隔离保留改动并重建",
+    async () => {
+      const { t, wd } = await setupEnsuredTask("dangling-link", "999032");
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty-link\n");
+      await fs.rm(path.join(wd, ".git"));
+      // 相对目标按软链所在目录（workDir）解析：落在 <taskDir>/no-such-dotgit，其所在 <taskDir> 存在
+      await fs.symlink("../no-such-dotgit", path.join(wd, ".git"));
+
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.createdRepos).toHaveLength(1);
+
+      const isolated = await isolatedSiblings(wd);
+      expect(isolated).toHaveLength(1);
+      const orphan = path.join(path.dirname(wd), isolated[0]);
+      await expect(fs.readFile(path.join(orphan, "wip.txt"), "utf8")).resolves.toBe(
+        "dirty-link\n",
+      );
+      // 软链本身原样搬进隔离目录（没被跟随删除）
+      expect((await fs.lstat(path.join(orphan, ".git"))).isSymbolicLink()).toBe(true);
+      expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+      await expect(fs.access(path.join(wd, "wip.txt"))).rejects.toThrow();
+
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  itPosix(
+    "M6-03：悬空软链的目标所在目录不可达（疑似没挂载）→ 不隔离、抛挂载提示；目录「挂回来」后同一目录被判坏并重建",
+    async () => {
+      const { t, wd } = await setupEnsuredTask("dangling-unmounted", "999033");
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty-unmounted\n");
+      await fs.rm(path.join(wd, ".git"));
+      const mountRoot = path.join(TMP_ROOT, "unmounted-disk");
+      const target = path.join(mountRoot, "repo", ".git");
+      await fs.symlink(target, path.join(wd, ".git"));
+
+      await expectLeftUntouched(
+        () => ensureTaskWorktrees(t, () => true),
+        wd,
+        new RegExp(
+          `主仓暂时不可达（是否未挂载？）[\\s\\S]*${escapeRe(path.dirname(target))}[\\s\\S]*已保留原目录`,
+        ),
+      );
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe(
+        "dirty-unmounted\n",
+      );
+      expect((await fs.lstat(path.join(wd, ".git"))).isSymbolicLink()).toBe(true);
+
+      // 目标所在目录「挂回来」但里面确实没有 .git → 这回是确凿的悬空软链、照常隔离重建
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.createdRepos).toHaveLength(1);
+      const isolated = await isolatedSiblings(wd);
+      expect(isolated).toHaveLength(1);
+      await expect(
+        fs.readFile(path.join(path.dirname(wd), isolated[0], "wip.txt"), "utf8"),
+      ).resolves.toBe("dirty-unmounted\n");
+
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  itPosix(
+    "M6-03 补充：悬空软链是多跳（.git → 本地软链 → 没挂载的路径）→ 沿链走到末端判不可达，不被第一跳「所在目录可达」误判成损坏",
+    async () => {
+      const { t, wd } = await setupEnsuredTask("dangling-chain", "999034");
+      await fs.writeFile(path.join(wd, "wip.txt"), "dirty-chain\n");
+      await fs.rm(path.join(wd, ".git"));
+      // 第一跳（<taskDir>/gitdir-hop）本身在、所在目录也在；真正够不着的是它再往后指的那块盘
+      const hop = path.join(path.dirname(wd), "gitdir-hop");
+      const target = path.join(TMP_ROOT, "unmounted-chain-disk", "repo", ".git");
+      await fs.symlink(target, hop);
+      await fs.symlink("../gitdir-hop", path.join(wd, ".git"));
+
+      await expectLeftUntouched(
+        () => ensureTaskWorktrees(t, () => true),
+        wd,
+        new RegExp(
+          `主仓暂时不可达（是否未挂载？）[\\s\\S]*${escapeRe(path.dirname(target))}[\\s\\S]*已保留原目录`,
+        ),
+      );
+      await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe(
+        "dirty-chain\n",
+      );
+
+      // 末端所在目录「挂回来」但没有 .git → 确凿的悬空软链链、照常隔离重建，改动在 .orphaned-*
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      const res = await ensureTaskWorktrees(t, () => true);
+      expect(res.createdRepos).toHaveLength(1);
+      const isolated = await isolatedSiblings(wd);
+      expect(isolated).toHaveLength(1);
+      await expect(
+        fs.readFile(path.join(path.dirname(wd), isolated[0], "wip.txt"), "utf8"),
+      ).resolves.toBe("dirty-chain\n");
+
+      await fs.rm(hop, { force: true });
+      await removeTaskWorktrees(t);
+    },
+    60_000,
+  );
+
+  it("M6-01 补充：任务主仓 repoPath 自己是 linked worktree（.git 是指针文件），gitdir 宿主没挂载 → 不能因 repoPath/.git「存在」就判可重建而隔离", async () => {
+    const key = "repo-linked-wt";
+    const host = path.join(TMP_ROOT, `${key}-host`);
+    const repo = path.join(TMP_ROOT, `${key}-repo`);
+    await fs.mkdir(host, { recursive: true });
+    git(host, "init", "-b", "main");
+    git(host, "config", "user.email", "t@t.local");
+    git(host, "config", "user.name", "t");
+    await fs.writeFile(path.join(host, "base.txt"), "base\n");
+    git(host, "add", "-A");
+    git(host, "commit", "-m", "init");
+    // repo 是 host 的 linked worktree：它的 .git 只是个指向 host/.git/worktrees/<name> 的指针文件
+    git(host, "worktree", "add", "--detach", repo);
+    expect((await fs.lstat(path.join(repo, ".git"))).isFile()).toBe(true);
+
+    const t = makeTask({
+      id: `t_1700000000020_${key}`,
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/999035",
+    });
+    await markTaskAlive(t.id);
+    const wd = getTaskWorkRepoPaths(t)[0];
+    await ensureTaskWorktrees(t, () => true);
+    await fs.writeFile(path.join(wd, "wip.txt"), "dirty-linked\n");
+
+    // host 整个挪走模拟没挂载：repo 目录本身还在本地、repo/.git 文件也还在，但它指向的 gitdir 够不着
+    const away = `${host}.away`;
+    await fs.rename(host, away);
+    try {
+      await expectLeftUntouched(
+        () => ensureTaskWorktrees(t, () => true),
+        wd,
+        /主仓暂时不可达（是否未挂载？）[\s\S]*已保留原目录/,
+      );
+    } finally {
+      await fs.rename(away, host);
+    }
+
+    // host 回来：同一目录原样复用、改动还在
+    const res = await ensureTaskWorktrees(t, () => true);
+    expect(res.createdRepos).toEqual([]);
+    await expect(fs.readFile(path.join(wd, "wip.txt"), "utf8")).resolves.toBe(
+      "dirty-linked\n",
+    );
+    expect(git(wd, "rev-parse", "--is-inside-work-tree")).toBe("true");
+
+    await removeTaskWorktrees(t);
+  }, 60_000);
 });

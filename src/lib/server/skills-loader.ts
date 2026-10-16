@@ -522,6 +522,16 @@ export const readSkillBodyByName = async (
 };
 
 /**
+ * 自管 skill 目录绝对路径提示行（段首第二行）。
+ * pi provider 的 agent shell 会被 `stripHostInjectedEnv` 剥掉 FLOWSHIP_DATA_DIR（故意的、安全需要），
+ * skill-creator 等需要「写到数据目录 skills/」的 skill 不能依赖该环境变量——
+ * 这里把绝对路径直接写进 prompt，agent 无需环境变量就能定位。
+ * 路径只含目录位置、不含任何凭证。
+ */
+export const renderAppSkillsDirHint = (): string =>
+  `自管 skill 目录（新建 / 修改自管 skill 就写这里，数据目录下的 skills/）：\`${path.join(getAppSkillsDir(), "<skill名>", "SKILL.md")}\`。`;
+
+/**
  * 把 skills 渲染成 prompt 末尾的 [AVAILABLE_SKILLS] 段
  *
  * 段首一行「相对路径解析」+ 每个 skill 2~4 行：
@@ -545,6 +555,7 @@ export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   }
   const lines: string[] = [
     "相对路径解析：SKILL.md 正文里的 `templates/` `references/` `scripts/` 等相对路径都在该 skill `path` 所在目录下、用 `read` 读；`kbRoot` 只用来解析 `knowledge-base/…` 这类库内路径。",
+    renderAppSkillsDirHint(),
     "",
   ];
   for (const s of skills) {

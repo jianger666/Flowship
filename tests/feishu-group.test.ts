@@ -8,8 +8,10 @@ import type { LarkAuthStatus } from "@/lib/server/feishu-bridge/lark-api";
 import { LarkApiError } from "@/lib/server/feishu-bridge/types";
 import type { Task } from "@/lib/types";
 import {
+  __resetUnpersistedGroupsForTest,
   __setFeishuGroupDepsForTest,
   atEmailTag,
+  NO_BOUND_GROUP_TOOL_MESSAGE,
   buildShareCardJson,
   buildShareDocFilename,
   ensureRequirementGroup,
@@ -34,6 +36,7 @@ import {
 
 afterEach(() => {
   __setFeishuGroupDepsForTest(null);
+  __resetUnpersistedGroupsForTest();
 });
 
 /**
@@ -285,20 +288,174 @@ describe("ensureRequirementGroup", () => {
     ).rejects.toThrow("meta.json 写盘失败");
   });
 
-  // 调用方漏传 persist 又走到建群 = bug：抛内部错误，别把没存住的群当成功返回
-  it("没传 persist 走到建群 → 抛内部错误（防孤儿群）", async () => {
+  // 没传 persist = 工具路径：产品语义是不自建群 → 可行动的 no_group，不是「内部错误」
+  it("没传 persist 走到建群 → 抛 no_group 可行动文案（不是内部错误、不建群）", async () => {
+    const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_mine" });
     __setFeishuGroupDepsForTest({
       ...noRegistryDeps,
       fetchGroupType: async () => ({ value: "disabled" }),
-      createChat: async () => ({ chat_id: "oc_mine" }),
+      createChat,
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
     });
 
-    await expect(ensureRequirementGroup(baseTask())).rejects.toMatchObject({
-      name: "FeishuGroupError",
-      code: "lark_error",
+    const err = await ensureRequirementGroup(baseTask()).catch((e) => e);
+    expect(err).toBeInstanceOf(FeishuGroupError);
+    expect(err.code).toBe("no_group");
+    expect(err.message).toBe(NO_BOUND_GROUP_TOOL_MESSAGE);
+    expect(err.message).toContain("任务页的飞书协作入口");
+    expect(err.message).not.toContain("内部错误");
+    // 先校验后建群：校验失败时一个群都不能建（否则每次重试都多一个孤儿群）
+    expect(createChat).not.toHaveBeenCalled();
+  });
+
+  // S09-01：agent 工具路径（flowship-tools.share_to_group）不传 persistLocalGroup，
+  // 任务又没有已绑定群——重复调用也不能真建群
+  it("工具路径无 persist 且无已绑定群：重复分享 N 次 create-chat 调用数恒为 0", async () => {
+    const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_orphan" });
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      fetchGroupType: async () => ({ value: "disabled" }),
+      createChat,
+      fetchWorkitemName: async () => "登录优化",
+      getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
+      decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+    });
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        shareToRequirementGroup(
+          baseTask(),
+          { kind: "message", content: "hi" },
+          { verifyOwnerMembership: true },
+        ),
+      ).rejects.toMatchObject({
+        name: "FeishuGroupError",
+        code: "no_group",
+        message: NO_BOUND_GROUP_TOOL_MESSAGE,
+      });
+    }
+    expect(createChat).toHaveBeenCalledTimes(0);
+  });
+
+  // R3-03：建群成功但落盘失败 → 错误带 chat_id；同一任务重试复用该群、不再建第二个
+  describe("建群成功但落盘失败的补偿", () => {
+    const stubCreateDeps = (
+      createChat: (opts: {
+        name: string;
+        userIdList?: string[];
+        botIdList?: string[];
+      }) => Promise<{ chat_id: string }>,
+    ) => {
+      const warnings: string[] = [];
+      __setFeishuGroupDepsForTest({
+        ...noRegistryDeps,
+        fetchGroupType: async () => ({ value: "disabled" }),
+        createChat,
+        fetchWorkitemName: async () => "登录优化",
+        getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
+        decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+        warn: (m) => warnings.push(m),
+      });
+      return warnings;
+    };
+
+    it("落盘失败：错误信息 + 日志都带 chat_id，且不吞错", async () => {
+      const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_orphan1" });
+      const warnings = stubCreateDeps(createChat);
+
+      const err = await ensureRequirementGroup(baseTask(), {
+        persistLocalGroup: async () => {
+          throw new Error("meta.json 写盘失败");
+        },
+      }).catch((e) => e);
+
+      expect(err).toBeInstanceOf(FeishuGroupError);
+      expect(err.message).toContain("oc_orphan1");
+      expect(err.message).toContain("meta.json 写盘失败");
+      expect(err.chatId).toBe("oc_orphan1");
+      expect(warnings.some((w) => w.includes("oc_orphan1"))).toBe(true);
+    });
+
+    it("同一任务重试：复用已建的群补落盘，createChat 总共只调 1 次", async () => {
+      const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_orphan1" });
+      stubCreateDeps(createChat);
+
+      await expect(
+        ensureRequirementGroup(baseTask(), {
+          persistLocalGroup: async () => {
+            throw new Error("写盘失败");
+          },
+        }),
+      ).rejects.toThrow("写盘失败");
+      expect(createChat).toHaveBeenCalledTimes(1);
+
+      const persistLocalGroup = vi.fn().mockResolvedValue(undefined);
+      const r = await ensureRequirementGroup(baseTask(), { persistLocalGroup });
+
+      expect(createChat).toHaveBeenCalledTimes(1); // 没有第二个群
+      expect(persistLocalGroup).toHaveBeenCalledWith(
+        "oc_orphan1",
+        "登录优化需求群",
+      );
+      expect(r).toMatchObject({
+        chatId: "oc_orphan1",
+        created: true,
+        source: "task",
+        chatName: "登录优化需求群",
+      });
+
+      // 落盘成功后补偿表已清：再来一个没有绑定的同任务，会正常新建
+      createChat.mockResolvedValueOnce({ chat_id: "oc_new2" });
+      const r2 = await ensureRequirementGroup(baseTask(), {
+        persistLocalGroup: async () => undefined,
+      });
+      expect(r2.chatId).toBe("oc_new2");
+      expect(createChat).toHaveBeenCalledTimes(2);
+    });
+
+    it("重试时落盘又失败：仍保留补偿记录，下一次继续复用同一个群", async () => {
+      const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_orphan1" });
+      stubCreateDeps(createChat);
+      const failing = async () => {
+        throw new Error("写盘失败");
+      };
+
+      await expect(
+        ensureRequirementGroup(baseTask(), { persistLocalGroup: failing }),
+      ).rejects.toThrow();
+      await expect(
+        ensureRequirementGroup(baseTask(), { persistLocalGroup: failing }),
+      ).rejects.toThrow("oc_orphan1");
+      const r = await ensureRequirementGroup(baseTask(), {
+        persistLocalGroup: async () => undefined,
+      });
+
+      expect(r.chatId).toBe("oc_orphan1");
+      expect(createChat).toHaveBeenCalledTimes(1);
+    });
+
+    it("别的任务不会误用这个已建未落盘的群", async () => {
+      const createChat = vi
+        .fn()
+        .mockResolvedValueOnce({ chat_id: "oc_orphan1" })
+        .mockResolvedValueOnce({ chat_id: "oc_other" });
+      stubCreateDeps(createChat);
+
+      await expect(
+        ensureRequirementGroup(baseTask({ id: "t1" }), {
+          persistLocalGroup: async () => {
+            throw new Error("写盘失败");
+          },
+        }),
+      ).rejects.toThrow();
+      const r = await ensureRequirementGroup(baseTask({ id: "t2" }), {
+        persistLocalGroup: async () => undefined,
+      });
+
+      expect(r.chatId).toBe("oc_other");
+      expect(createChat).toHaveBeenCalledTimes(2);
     });
   });
 

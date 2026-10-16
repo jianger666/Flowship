@@ -28,6 +28,8 @@ import { promisify } from "node:util";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
+import { buildOpenUrlSpec } from "@/lib/local-file-os";
+
 import { dataRoot, renameWithRetry } from "./data-root";
 import { enqueueMeegle } from "./meegle-queue";
 import {
@@ -698,17 +700,20 @@ export const startLogin = async (
             (state.openedUrls ?? 0) < 3
           ) {
             state.openedUrls = (state.openedUrls ?? 0) + 1;
-            const opener =
-              process.platform === "darwin"
-                ? ["open", [m[0]]]
-                : process.platform === "win32"
-                  ? ["cmd", ["/c", "start", "", m[0]]]
-                  : ["xdg-open", [m[0]]];
+            // 不经 cmd：Windows 上 `cmd /c start "" <url>` 会把 URL 里的 `&` 当命令分隔符截断
+            // （飞书授权链接 query 必带 &），构造命令统一走纯函数（见 local-file-os.ts）
+            const opener = buildOpenUrlSpec(m[0], process.platform);
             try {
-              spawn(opener[0] as string, opener[1] as string[], {
-                detached: true,
-                stdio: "ignore",
-              }).unref();
+              if (opener) {
+                spawn(opener.command, opener.args, {
+                  detached: true,
+                  stdio: "ignore",
+                  windowsHide: true,
+                })
+                  // 找不到 opener（ENOENT 等）会异步 emit error、不监听会变成未捕获异常
+                  .on("error", () => {})
+                  .unref();
+              }
             } catch {
               // 打不开就靠 UI 链接 / 二维码
             }

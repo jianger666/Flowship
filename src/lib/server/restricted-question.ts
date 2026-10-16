@@ -29,6 +29,9 @@
  * 5. prompt 由 buildRestrictedPrompt 组装（buildReadonlyUserMessage 打底用户话术 + 任务背景 +
  *    旁路公司环境脱敏声明），「# 边界」段永远排在最后。
  *    工具走两端默认全开（honor-system，内部用）；身份隔离（无 callerToken）+ 提示词 # 边界讲规矩，两边同一套话术。
+ *    ⚠️ honor-system = 没有执行层边界：属主 OS 用户能读的凭据（config.json 里的 PAT / apiKey / 公司环境密码、
+ *    ~/.ssh 等）它都够得着；pi provider 也只摘 PAT 的环境变量、不阻止读文件，Cursor provider 下连环境变量都摘不掉——
+ *    只适合只有可信同事的内部群（详见下面 startRestrictedGroupQuestion 里的注释）。
  *    有 `groupContext` 时再多拼三段上下文（群里有谁 / 任务状态快照 / 群里最近聊天）+ 回复规矩，
  *    段落格式化见 feishu-bridge/group-answer-context.ts；拉取整体硬超时 3 秒、失败降级为空，不拖慢起 agent。
  *    答疑 agent 每个问题都是全新的、没有记忆——这些就是它对「群里刚发生了什么」的全部认知。
@@ -423,6 +426,21 @@ export const startRestrictedGroupQuestion = (
       // 这是“全开”必须付的代价。唯一保留的是身份隔离：不传 callerToken，
       // submit_work / submit_mr 等系统工具无身份可用（否则旁路能关掉属主的 action，这是正确性问题，
       // 不是安全选项）；ask_user 同样不可用（群里没人能答它的提问）。审计靠事件流。
+      //
+      // ⚠️ 「全开」的代价不止公司环境密码（N3-01，老实写清楚，别误以为这里有边界）：
+      // 旁路 agent 以属主的 OS 用户身份跑工具全开的 shell / read，凡属主能读的它都够得着——
+      //   - config.json：GitLab PAT（gitToken）、Cursor / 自定义 provider 的 apiKey、公司环境密码；
+      //   - GitLab PAT 的环境变量 FLOWSHIP_GITLAB_TOKEN：pi provider 下环境变量已摘掉（下面 omitGitToken；
+      //     只摘变量、不阻止读文件——pi 的 read 照样能读上面的 config.json），
+      //     **Cursor provider 下摘不掉**——SDK 的本地 agent shell 原样继承 server 的 process.env，
+      //     没有 env 选项，又不能临时删进程全局 env（会把属主并行会话弄坏）；群里任何能 @ 机器人的人
+      //     让它 `printenv` 就能拿到 PAT；
+      //   - ~/.ssh、~/.aws、浏览器 / 其它工具的凭据文件等一切属主 OS 用户能读的东西。
+      // omitGitToken 只是收掉「最显眼」的一条路、不是边界；config.json 之类照样读得到。
+      // Cursor 默认路径的这条无身份旁路沿用同一局限；已拍板**不**用 `disallowedTools` / `local.customTools`
+      // 换掉内置 shell（Cursor 的 read 同样能读 config.json、没形成真边界；换 shell 还会影响工具块展示、有回归风险），
+      // 详见 git-token-env.ts 头部。
+      // 所以**旁路只适合只有可信同事的内部群**；把机器人拉进有外部人员 / 不可信成员的群 = 把属主的凭据交出去。
       const { syncCompanyEnvFileFromSettings, loadCompanyEnvBriefSection } =
         await import("./company-env-fs");
       await syncCompanyEnvFileFromSettings();
@@ -446,6 +464,11 @@ export const startRestrictedGroupQuestion = (
           // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入。
           // 不传 callerToken：系统工具（交卷 / 提问 / 提 MR）按无身份处理，推进本来就走不了任务链。
           local: { cwd, settingSources: [] },
+          // pi provider：shell 与子代理 bash 摘掉 FLOWSHIP_GITLAB_TOKEN（N3-01）。必须显式传、
+          // 不能靠「无 callerToken」推断——属主 one-shot 同样无 callerToken、却该保留 token。
+          // 只摘环境变量、不阻止读文件；Cursor provider 下是空操作（SDK 继承 server env、摘不掉，见上方注释与 git-token-env.ts）。
+          // tests/restricted-group-question.test.ts 钉住这里必须传 true。
+          omitGitToken: true,
         }),
         SDK_CREATE_RESUME_TIMEOUT_MS,
         "Agent.create(restricted-question)",

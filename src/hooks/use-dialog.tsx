@@ -55,6 +55,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { Input } from "@/components/ui/input";
+import { isImeComposing } from "@/lib/ime";
 
 // Confirm 配置
 export interface ConfirmOptions {
@@ -291,7 +292,8 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
                 placeholder={state.opts.placeholder}
                 aria-invalid={!!promptError}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && !promptError) {
+                  // IME 选词中的 Enter 不是提交
+                  if (e.key === "Enter" && !isImeComposing(e) && !promptError) {
                     e.preventDefault();
                     closePrompt(promptValue);
                   }

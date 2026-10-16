@@ -16,6 +16,11 @@ import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { bootArgsForTask } from "./agent-provider";
 import { getSettings } from "./local-store";
+import {
+  planRewindTruncation,
+  readRewindMarker,
+  type RewindMarker,
+} from "./rewind-marker";
 import type { ThinkingSnapshot } from "./thinking-live";
 import type { TalkQueueItem } from "./talk-queue";
 import {
@@ -113,6 +118,108 @@ export const fetchEarlierEvents = async (
 };
 
 /**
+ * 若 `incoming` 里有「本地还没见过」的回退标记事件，把本地 events 对齐到那次回退
+ * （截法见 rewind-marker.ts 的 planRewindTruncation：找得到 eventId 精确截 → 完整窗口按 keptCount 截 → 否则 resync）。
+ * 标记事件本地已有 = 此前已处理过（如先经 SSE 追加、后到的快照），不重复截。
+ * resync=true：本地窗口不可信、无法在本地算出正确结果，调用方须用服务端快照整体替换（见 mergeTaskEvents）
+ * 或触发一次完整重新拉取（见 rewindNeedsResync）。
+ * 无需截断时 events 原样返回同一数组引用。
+ */
+const truncateForRewind = (
+  prev: Pick<Task, "events" | "eventsTruncated">,
+  incoming: TaskEvent[],
+): { events: TaskEvent[]; resync: boolean } => {
+  const known = new Set(prev.events.map((e) => e.id));
+  let result = prev.events;
+  for (const ev of incoming) {
+    if (known.has(ev.id)) continue;
+    const marker = readRewindMarker(ev);
+    if (!marker) continue;
+    const plan = planRewindTruncation(result, marker, {
+      complete: !prev.eventsTruncated,
+    });
+    if (plan.kind === "resync") return { events: prev.events, resync: true };
+    result = plan.events;
+  }
+  return { events: result, resync: false };
+};
+
+/**
+ * 这条 SSE 事件是不是「本地无法自行对齐的回退标记」——是则调用方应触发一次完整重新拉取
+ * （此时 appendTaskEvent 不会追加该事件；拉回的快照里带着它，mergeTaskEvents 会据此整体替换本地）。
+ */
+export const rewindNeedsResync = (prev: Task, ev: TaskEvent): boolean =>
+  !prev.events.some((e) => e.id === ev.id) &&
+  truncateForRewind(prev, [ev]).resync;
+
+/**
+ * 单条 SSE 事件追加进本地 events（按 id 去重）；回退标记事件会先截掉本地被删的后半段。
+ * 与 mergeTaskEvents 共用 truncateForRewind，保证「先 SSE 事件后快照」「先快照后 SSE」两种到达序都对。
+ * 本地无法对齐（rewindNeedsResync）时原样返回 prev、不追加：标记事件留给后续快照 / 重连回放再处理，
+ * 否则它一旦「已知」就再也触发不了纠正。
+ */
+export const appendTaskEvent = (prev: Task, ev: TaskEvent): Task => {
+  if (prev.events.some((e) => e.id === ev.id)) return prev;
+  const { events, resync } = truncateForRewind(prev, [ev]);
+  if (resync) return prev;
+  return { ...prev, events: [...events, ev] };
+};
+
+/** 回退 HTTP 响应里的 `rewound`（不依赖标记事件写入成功；见 rewind route） */
+export interface RewoundResult extends RewindMarker {
+  /** 标记 info 事件的 id；写失败为 null */
+  markerEventId: string | null;
+}
+
+/**
+ * 回退请求成功后，直接据响应体把本地对齐到这次回退（标记事件写失败 / 没经 SSE 到达时的权威来源）。
+ * 标记事件本地已有 = SSE 已处理过、跳过。resync=true 时 task 原样返回，调用方应触发一次完整重新拉取。
+ */
+export const applyRewoundResult = (
+  prev: Task,
+  r: RewoundResult,
+): { task: Task; resync: boolean } => {
+  if (r.markerEventId && prev.events.some((e) => e.id === r.markerEventId)) {
+    return { task: prev, resync: false };
+  }
+  const plan = planRewindTruncation(prev.events, r, {
+    complete: !prev.eventsTruncated,
+  });
+  if (plan.kind === "resync") return { task: prev, resync: true };
+  return {
+    task: plan.events === prev.events ? prev : { ...prev, events: plan.events },
+    resync: false,
+  };
+};
+
+const isPersistentEvent = (e: TaskEvent): boolean =>
+  !e.id.startsWith("ephemeral_") && e.kind !== "tool_output_delta";
+
+/**
+ * 回退后本地窗口不可信：以服务端快照 events 为准整体替换，再补上「快照之后才到的」本地事件
+ * （经 SSE 先到、快照里还没有）。
+ * 「之后」的判据 = ts 晚于 max(快照末条 ts, 快照 updatedAt)：回退会把 meta.updatedAt 推到回退时刻，
+ * 被删掉的旧事件 ts 都早于它；只比快照末条 ts 的话，回退标记没写成功时被删事件会被当成「更新的」捡回来。
+ * 调用方：mergeTaskEvents（带回退标记的快照）与页面的「完整重新拉取」。
+ */
+export const replaceTaskEventsWithSnapshot = (prev: Task, next: Task): Task => {
+  const snapEvents = next.events.filter(isPersistentEvent);
+  const known = new Set(snapEvents.map((e) => e.id));
+  const lastTs = snapEvents.length > 0 ? snapEvents[snapEvents.length - 1].ts : 0;
+  const floor = Math.max(lastTs, next.updatedAt);
+  const later = prev.events.filter(
+    (e) => isPersistentEvent(e) && !known.has(e.id) && e.ts > floor,
+  );
+  const events = later.length > 0 ? [...snapEvents, ...later] : snapEvents;
+  const eventsTruncated = next.eventsTruncated;
+  // 过期快照不得盖运行态（同 mergeTaskEvents 末尾）
+  if (next.updatedAt < prev.updatedAt) {
+    return { ...prev, events, eventsTruncated };
+  }
+  return { ...next, events, eventsTruncated };
+};
+
+/**
  * v1.0.x：把服务端来的 task 快照合并进本地 state、**本地事件列表只增不换**。
  *
  * 背景：事件懒加载后、task 快照的 events 可能是空（SSE 中途帧）/ 尾部切片（GET ?tail）/
@@ -121,11 +228,23 @@ export const fetchEarlierEvents = async (
  *   - **更早的回灌一律丢弃**——mutation 响应带全量 events 会把懒加载一次打穿
  *     （发条消息就灌进上万条、打开秒开白做）；更早历史只归上拉分页管
  * 事件日志 append-only（supersede 等都是追加新 info、从不改写旧事件）、丢弃早段无信息损失。
+ *
+ * 唯一例外：chat 回退（rewind）会删掉服务端的后半段。「过期旧快照」与「回退后的新快照」
+ * 单靠 ts / 长度分不清，所以用回退 info 事件上的显式标记（rewind-marker.ts）当可靠信号：
+ * 本地没有的回退标记事件一到，先把本地从被回退事件起截掉（truncateForRewind），再按上面规则合并。
+ * 没带标记的旧快照照旧被丢弃，既有保护不变。
  */
 export const mergeTaskEvents = (prev: Task | null, next: Task): Task => {
   if (!prev || prev.id !== next.id || prev.events.length === 0) return next;
-  const prevIds = new Set(prev.events.map((e) => e.id));
-  const lastTs = prev.events[prev.events.length - 1].ts;
+  // 回退截断：被截空（回退到最早一条）时本地没有可保留的东西 → 直接以服务端 next 为准
+  const rewind = truncateForRewind(prev, next.events);
+  // 本地窗口不可信、算不出正确截断 → 这份带回退标记的快照就是权威：整体替换本地，
+  // 只保留「比快照更新、且快照里没有」的本地事件（快照之后经 SSE 到的新事件）
+  if (rewind.resync) return replaceTaskEventsWithSnapshot(prev, next);
+  const prevEvents = rewind.events;
+  if (prevEvents.length === 0) return next;
+  const prevIds = new Set(prevEvents.map((e) => e.id));
+  const lastTs = prevEvents[prevEvents.length - 1].ts;
   // >=：同毫秒新事件不漏（id 去重兜住同一条）
   // 顺带挡 ephemeral（防御：误写入 next.events 时不进本地持久 rows）
   const newer = next.events.filter(
@@ -136,7 +255,7 @@ export const mergeTaskEvents = (prev: Task | null, next: Task): Task => {
       e.ts >= lastTs,
   );
   const events =
-    newer.length > 0 ? [...prev.events, ...newer] : prev.events;
+    newer.length > 0 ? [...prevEvents, ...newer] : prevEvents;
   const eventsTruncated = next.eventsTruncated ?? prev.eventsTruncated;
   // 过期快照不得盖运行态：失败 done 若晚于唤醒后的 running 到达，
   // 会把顶栏打回「失败」、输入条解锁，而 agent 其实已经在跑。
@@ -1056,17 +1175,29 @@ export const sendChatReply = async (
   };
 };
 
-/** P3：回退到带 checkpoint 的 user_reply */
+/**
+ * P3：回退到带 checkpoint 的 user_reply。
+ * rewound = 服务端回退标记（响应体直给，不依赖标记 info 事件写入成功）；旧服务端没给则缺省。
+ * `mode:"edit"`（编辑已发送的消息）：任意 user_reply 都行——有文件检查点就连文件一起还原、
+ * 没有就只回退对话（`restoredRepos` 为 0 即没动文件）；缺省 = 严格回退（必须有检查点）。
+ */
 export const rewindChatToEvent = async (
   taskId: string,
   eventId: string,
-): Promise<{ task: Task | null; refreshRequired?: boolean }> => {
+  opts?: { mode?: "rewind" | "edit" },
+): Promise<{
+  task: Task | null;
+  refreshRequired?: boolean;
+  rewound?: RewoundResult;
+}> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/rewind`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ eventId }),
+      body: JSON.stringify(
+        opts?.mode ? { eventId, mode: opts.mode } : { eventId },
+      ),
     },
   );
   const data = await handleJson<{
@@ -1075,10 +1206,32 @@ export const rewindChatToEvent = async (
     restoredRepos?: number;
     truncatedEventCount?: number;
     refreshRequired?: boolean;
+    rewound?: {
+      fromEventId?: string;
+      keptCount?: number;
+      markerEventId?: string | null;
+    };
+    markerEventWritten?: boolean;
   }>(res);
+  const r = data.rewound;
+  const rewound: RewoundResult | undefined =
+    r && typeof r.fromEventId === "string" && r.fromEventId
+      ? {
+          fromEventId: r.fromEventId,
+          keptCount:
+            typeof r.keptCount === "number" &&
+            Number.isInteger(r.keptCount) &&
+            r.keptCount >= 0
+              ? r.keptCount
+              : null,
+          markerEventId:
+            typeof r.markerEventId === "string" ? r.markerEventId : null,
+        }
+      : undefined;
   return {
     task: data.task,
     ...(data.refreshRequired ? { refreshRequired: true } : {}),
+    ...(rewound ? { rewound } : {}),
   };
 };
 
@@ -1120,9 +1273,11 @@ export const removeChatQueueItems = async (
 };
 
 /**
- * 排队消息「立即发送」：server 原子编排（take → stop 清剩余队 → 用该条起新会话）。
+ * 排队消息「立即发送」：server 原子编排。
+ * 优先 steer 插话（不停止、直接把这条插进正在跑的这一轮，AI 当前步骤结束后读到）；
+ * 不能 steer（pi 后端 / 冷启动 / 收尾空窗）才回退「take → stop 清剩余队 → 用该条起新会话」。
  * 旧路径 promote + stop 会把刚置顶的条一并 failQueuedItems 清掉，永远发不出去。
- * bootArgs 必传（stop 后无会话、要自动启动）。
+ * bootArgs 必传（回退路径 stop 后无会话、要自动启动）。
  */
 export const sendQueuedChatMessageNow = async (
   taskId: string,

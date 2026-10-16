@@ -236,10 +236,40 @@ const asStr = (v: unknown): string | undefined =>
 // ---------- 业务查询（看板主源：workhour list-schedule） ----------
 
 /** 工作项详情（预览页 / 任务详情融合用；默认字段已含 description） */
-// 成功结果进程内缓存：同一 story 反复起 agent 时 resolveUserIdentity 不重付 CLI
-const workitemDetailCache = new Map<string, Record<string, unknown>>();
+// 成功结果进程内缓存：同一 story 反复起 agent 时 resolveUserIdentity 不重付 CLI。
+// 带 TTL：工作项的状态 / 角色成员 / group_type 会在飞书侧被改，永不过期会让预览页、
+// 需求群成员（建群拉人）读到陈旧数据；过期后下一次读自动重拉。
+// 需要立刻拿最新（用户点刷新 / 刚改完工作项）走 `invalidateWorkitemDetailCache`。
+/** 工作项详情缓存有效期：5 分钟（与 projectsCache 10 分钟同量级、更保守） */
+export const WORKITEM_DETAIL_TTL_MS = 5 * 60 * 1000;
+const workitemDetailCache = new Map<
+  string,
+  { at: number; detail: Record<string, unknown> }
+>();
 const workitemDetailCacheKey = (id: string, projectKey?: string): string =>
   `${projectKey ?? ""}:${id}`;
+
+/**
+ * 手动失效工作项详情缓存。
+ * 不传参 = 全清（换账号 / 全量刷新）；传 workItemId = 只清这一条
+ * （projectKey 不传时清掉该 id 在所有空间下的条目——调用方常常不知道 key 的写法）。
+ */
+export const invalidateWorkitemDetailCache = (
+  workItemId?: string,
+  projectKey?: string,
+): void => {
+  if (!workItemId) {
+    workitemDetailCache.clear();
+    return;
+  }
+  if (projectKey !== undefined) {
+    workitemDetailCache.delete(workitemDetailCacheKey(workItemId, projectKey));
+    return;
+  }
+  for (const key of [...workitemDetailCache.keys()]) {
+    if (key.endsWith(`:${workItemId}`)) workitemDetailCache.delete(key);
+  }
+};
 
 export const fetchWorkitemDetail = async (
   workItemId: string,
@@ -247,7 +277,9 @@ export const fetchWorkitemDetail = async (
 ): Promise<Record<string, unknown>> => {
   const cacheKey = workitemDetailCacheKey(workItemId, projectKey);
   const cached = workitemDetailCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached && Date.now() - cached.at < WORKITEM_DETAIL_TTL_MS) {
+    return cached.detail;
+  }
 
   const args = ["workitem", "get", "--work-item-id", workItemId];
   if (projectKey) args.push("--project-key", projectKey);
@@ -262,8 +294,12 @@ export const fetchWorkitemDetail = async (
       detail = r;
     }
   }
-  // 成功才缓存（空对象也算一次成功响应、避免同 key 狂打）
-  workitemDetailCache.set(cacheKey, detail);
+  // 成功才缓存（空对象也算一次成功响应、避免同 key 狂打）；顺手清已过期条目防 Map 无界增长
+  const now = Date.now();
+  for (const [k, e] of workitemDetailCache) {
+    if (now - e.at >= WORKITEM_DETAIL_TTL_MS) workitemDetailCache.delete(k);
+  }
+  workitemDetailCache.set(cacheKey, { at: now, detail });
   return detail;
 };
 
@@ -286,6 +322,8 @@ export const invalidateMeegleIdentityCaches = (): void => {
   meCache = undefined;
   identityCache = undefined;
   myEmailCache = undefined;
+  // 换账号后工作项可见性 / 权限可能不同，详情缓存一并作废
+  invalidateWorkitemDetailCache();
 };
 
 // meegle-cli 已依赖 feishu-cli、反向 import 会循环——用注册回调挂到 invalidateStatusCache

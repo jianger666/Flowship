@@ -15,6 +15,7 @@
  *      同样不该让测试写）。需要自己数据目录的测试照旧在 import 前改 env，覆盖即可。
  */
 import { isAppUserDataPath } from "../../src/lib/server/app-data-dir";
+import { GITLAB_TOKEN_ENV_NAME } from "../../src/lib/server/git-token-env";
 import { HOST_INJECTED_ENV_KEYS } from "../../src/lib/server/host-env";
 
 /**
@@ -42,6 +43,10 @@ export const applyHermeticEnv = (
   const inheritedDataDir = env.FLOWSHIP_DATA_DIR || undefined;
   const stripped = HOST_INJECTED_ENV_KEYS.filter((k) => env[k] !== undefined);
   for (const key of HOST_INJECTED_ENV_KEYS) delete env[key];
+  // GitLab token 环境变量：agent shell 里跑 vitest 会继承到 server 注入的真实 PAT（git-token-env.ts）。
+  // 它不算宿主注入变量（不进 HOST_INJECTED_ENV_KEYS、不计入 stripped），但测试进程里不该带着真 token：
+  // 否则「没配 token → env 应为空」这类断言取决于谁启动了我，真 token 也可能被测试输出带出去。
+  delete env[GITLAB_TOKEN_ENV_NAME];
   const dataDir = makeTempDir();
   env.FLOWSHIP_DATA_DIR = dataDir;
   return {

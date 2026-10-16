@@ -28,8 +28,10 @@ import {
 } from "@/components/ui/card";
 import { useDialog } from "@/hooks/use-dialog";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
-import { findUnknownPlaceholders } from "@/lib/branch-template";
+import { guardRepoBranchTemplates } from "@/lib/branch-template";
+import { getSettings } from "@/lib/local-store";
 import { pickNativePaths } from "@/lib/native-picker";
+import { REPO_SHELL_COMMAND_MAX_LEN } from "@/lib/repo-shell-command";
 import { isAbsolutePathLike, pathBasename } from "@/lib/path-utils";
 
 import type { RepoConfig } from "@/lib/types";
@@ -50,6 +52,24 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
   // v0.9.11：每仓分支候选（本地 + 远端）——undefined=拉取中、isRepo=false=非 git（分支字段禁用）
   const branchMap = useRepoBranches(repos.map((r) => r.path));
 
+  // 所有落盘的唯一出口（S13-01）：模板含未知占位符的仓不落盘（用已落盘旧值顶替）、草稿保留在输入框里。
+  // 原先只有模板框自己的 blur 校验、其它动作（改仓名 / 开关 / 增删仓 / 别的框失焦）整份草稿落盘会把坏模板带进去
+  const commitRepos = (next: RepoConfig[]) => {
+    const { repos: safe, blocked } = guardRepoBranchTemplates(
+      next,
+      getSettings().repos,
+    );
+    onCommit(safe);
+    if (blocked.length > 0) {
+      // 把草稿（含坏模板）放回输入框、让用户继续改；落盘值已是安全版
+      onChange(next);
+      toast.error(
+        "分支模板含未知占位符、未保存——日期请用 {date:yyMMdd}",
+        { id: "repo-branch-template-invalid" },
+      );
+    }
+  };
+
   // 添加若干仓库、name 默认 basename、重复路径跳过
   const addRepos = (paths: string[]) => {
     const fresh = paths.filter((p) => p && !repos.some((r) => r.path === p));
@@ -58,7 +78,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
       return;
     }
     // 增删是离散操作、直接落盘
-    onCommit([...repos, ...fresh.map((p) => ({ name: pathBasename(p), path: p }))]);
+    commitRepos([...repos, ...fresh.map((p) => ({ name: pathBasename(p), path: p }))]);
   };
 
   // 原生选目录（mac 支持多选、win 单选）
@@ -103,34 +123,31 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
   };
   const onRenameBlur = (path: string, name: string) => {
     const finalName = name.trim() || pathBasename(path);
-    onCommit(repos.map((r) => (r.path === path ? { ...r, name: finalName } : r)));
+    commitRepos(repos.map((r) => (r.path === path ? { ...r, name: finalName } : r)));
   };
 
   // V0.6.3/V0.6.7：仓库分支字段（线上 / 测试 / dev 分支 + 分支模板覆盖、都 per-repo 选填）
   // 通用 setter：输入改草稿、blur 落盘——按 field 改对应字段、省得每个字段写一对
   const setRepoField = (
     path: string,
-    field: "onlineBranch" | "testBranch" | "devBranch" | "branchTemplate" | "previewCommand",
+    field:
+      | "onlineBranch"
+      | "testBranch"
+      | "devBranch"
+      | "branchTemplate"
+      | "previewCommand"
+      | "setupCommand",
     value: string,
   ) => {
     onChange(repos.map((r) => (r.path === path ? { ...r, [field]: value } : r)));
   };
   const onRepoFieldBlur = () => {
-    onCommit(repos);
+    commitRepos(repos);
   };
 
-  // 分支模板覆盖：失焦落盘前拦未知占位符（与全局模板同一套规则、输入中不打扰）
-  const onBranchTemplateBlur = (path: string) => {
-    const tpl =
-      repos.find((r) => r.path === path)?.branchTemplate ?? "";
-    const unknown = findUnknownPlaceholders(tpl);
-    if (unknown.length > 0) {
-      toast.error(
-        `模板含未知占位符 ${unknown.join("、")}——日期请用 {date:yyMMdd}`,
-      );
-      return;
-    }
-    onCommit(repos);
+  // 分支模板覆盖：失焦走统一出口 commitRepos——含未知占位符的草稿不落盘并 toast（输入中不打扰）
+  const onBranchTemplateBlur = () => {
+    commitRepos(repos);
   };
 
   // v0.9.11：分支字段改 Combobox 后是离散选择、选中即落盘（不再走「草稿 + blur」）
@@ -139,14 +156,14 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     field: "onlineBranch" | "testBranch" | "devBranch",
     value: string,
   ) => {
-    onCommit(
+    commitRepos(
       repos.map((r) => (r.path === path ? { ...r, [field]: value } : r)),
     );
   };
 
   // 删除是离散操作、直接落盘
   const removeRepo = (path: string) => {
-    onCommit(repos.filter((r) => r.path !== path));
+    commitRepos(repos.filter((r) => r.path !== path));
   };
 
   // 只读 / 脚本仓开关：离散选择、选中即落盘（关 = undefined、不落 false 脏 config）
@@ -155,7 +172,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     field: "readonly" | "scriptRepo",
     value: boolean,
   ) => {
-    onCommit(
+    commitRepos(
       repos.map((r) =>
         r.path === path ? { ...r, [field]: value ? true : undefined } : r,
       ),
@@ -298,7 +315,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                           onChange={(e) =>
                             setRepoField(r.path, "branchTemplate", e.target.value)
                           }
-                          onBlur={() => onBranchTemplateBlur(r.path)}
+                          onBlur={onBranchTemplateBlur}
                           placeholder="留空用全局默认"
                           className="font-mono text-xs"
                         />
@@ -318,6 +335,23 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                         />
                       </Tooltip>
                     </div>
+                  </div>
+
+                  {/* 第四行：依赖初始化命令（worktree 克隆依赖失败时在任务工作区执行） */}
+                  <div className="grid gap-1">
+                    <span className="text-[11px] text-muted-foreground">依赖初始化命令</span>
+                    <Tooltip content="Windows 或克隆 node_modules 失败时，在任务工作区自动执行；留空则由 AI 自行安装依赖">
+                      <Input
+                        value={r.setupCommand ?? ""}
+                        onChange={(e) =>
+                          setRepoField(r.path, "setupCommand", e.target.value)
+                        }
+                        onBlur={onRepoFieldBlur}
+                        placeholder="yarn install --frozen-lockfile --prefer-offline"
+                        maxLength={REPO_SHELL_COMMAND_MAX_LEN}
+                        className="font-mono text-xs"
+                      />
+                    </Tooltip>
                   </div>
                 </div>
               );

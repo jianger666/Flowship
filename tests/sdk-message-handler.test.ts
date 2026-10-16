@@ -668,6 +668,49 @@ describe("handleSdkMessage：Cursor 的 subagent 自定义工具（MCP 外壳）
     expect(ev?.meta?.args).not.toContain("custom-user-tools");
   });
 
+  it("running：ctx 带父会话模型时，inherit 的 model / effort 徽标换成实际生效值（args 只在 running 落盘一次，事后补不了）", async () => {
+    const withParent: AssistantBufferCtx = {
+      ...assistantCtx,
+      subagentParentModel: {
+        id: "claude-sonnet-5-5",
+        params: [{ id: "reasoning_effort", value: "high" }],
+      },
+    };
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_inherit",
+        status: "running",
+        args: { ...subagentArgs, args: { prompt: "p", description: "d", model: "inherit" } },
+      } as never,
+      withParent,
+      leaseOk,
+    );
+    const parsed = parseTaskToolArgs(toolCallEvents()[0]?.meta?.args as string);
+    expect(parsed?.model).toBe("claude-sonnet-5-5");
+    expect(parsed?.effort).toBe("high");
+  });
+
+  it("running：ctx 没有父会话模型（pi / 没挂 subagent）时徽标保持原始入参，不乱补", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_inherit2",
+        status: "running",
+        args: { ...subagentArgs, args: { prompt: "p", description: "d", model: "inherit" } },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const parsed = parseTaskToolArgs(toolCallEvents()[0]?.meta?.args as string);
+    expect(parsed?.model).toBe("inherit");
+    expect(parsed?.effort ?? null).toBeNull();
+  });
+
   it("running：prompt 很长也不会把尾部的 model / effort 截掉（走 task 的短字段前置）", async () => {
     await handleSdkMessage(
       "task-1",

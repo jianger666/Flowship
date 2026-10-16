@@ -678,14 +678,100 @@ export interface EnsureGroupOptions {
    * 建群成功后的本地落盘（调用方注入：`setTaskGroupAssociation` 的薄包）。
    *
    * feishu-group 不静态 import task-fs（依赖图太重，沿用 group-route 动态连接的同款理由），
-   * 所以建群链只负责建、不管存。走到建群却没传这个 = 调用方 bug，直接抛内部错误——
-   * 绝不能吞：群建好了没存住，下次又建一个，攒的全是没人进得去的孤儿群。
+   * 所以建群链只负责建、不管存。**没传 = 这条调用路径不许自建群**（agent 工具 share_to_group）：
+   * 走到建群前直接抛 `no_group`（带可行动文案 {@link NO_BOUND_GROUP_TOOL_MESSAGE}），一个群都不建。
+   * 落盘失败绝不能吞：群建好了没存住，下次又建一个，攒的全是没人进得去的孤儿群——
+   * 所以失败会抛带 chat_id 的错误，并把该群记进内存「已建未落盘」表，同一任务重试复用它。
    */
   persistLocalGroup?: (
     chatId: string,
     chatName: string | undefined,
   ) => Promise<void>;
 }
+
+/** 工具路径（没有本地持久化入口）走到「需要建群」时的提示——agent / 用户都能照着做 */
+export const NO_BOUND_GROUP_TOOL_MESSAGE =
+  "该任务还没有绑定需求群，工具无法自动建群；请先在任务页的飞书协作入口创建/绑定需求群后再分享";
+
+// ----------------- 「已建未落盘」补偿表 -----------------
+
+/** 建群成功但本地落盘失败的群：同一任务重试复用，别再建一个 */
+interface UnpersistedGroup {
+  chatId: string;
+  chatName?: string;
+  at: number;
+}
+
+const UNPERSISTED_TTL_MS = 24 * 60 * 60 * 1000;
+const UNPERSISTED_MAX = 200;
+const UNPERSISTED_KEY = "__flowshipUnpersistedGroupsV1__";
+
+/** 挂 globalThis：route chunk / HMR 分裂后各份模块实例共用同一张表 */
+const getUnpersistedMap = (): Map<string, UnpersistedGroup> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, UnpersistedGroup> | undefined
+  >;
+  if (!g[UNPERSISTED_KEY]) g[UNPERSISTED_KEY] = new Map();
+  return g[UNPERSISTED_KEY]!;
+};
+
+const getUnpersistedGroup = (taskId: string): UnpersistedGroup | null => {
+  const m = getUnpersistedMap();
+  const cur = m.get(taskId);
+  if (!cur) return null;
+  if (Date.now() - cur.at > UNPERSISTED_TTL_MS) {
+    m.delete(taskId);
+    return null;
+  }
+  return cur;
+};
+
+const rememberUnpersistedGroup = (
+  taskId: string,
+  chatId: string,
+  chatName: string | undefined,
+): void => {
+  const m = getUnpersistedMap();
+  m.delete(taskId); // 重新插入 = 排到最新
+  m.set(taskId, { chatId, chatName, at: Date.now() });
+  while (m.size > UNPERSISTED_MAX) {
+    const oldest = m.keys().next();
+    if (oldest.done) break;
+    m.delete(oldest.value);
+  }
+};
+
+/** 单测重置「已建未落盘」表 */
+export const __resetUnpersistedGroupsForTest = (): void => {
+  getUnpersistedMap().clear();
+};
+
+/**
+ * 把刚建（或上次已建未落盘）的群落盘到本任务。
+ * 成功 → 清补偿表；失败 → 记补偿表 + 日志 + 抛带 chat_id 的错误（重试会复用该群）。
+ */
+const persistCreatedGroup = async (
+  taskId: string,
+  persist: NonNullable<EnsureGroupOptions["persistLocalGroup"]>,
+  chatId: string,
+  chatName: string | undefined,
+): Promise<void> => {
+  try {
+    await persist(chatId, chatName);
+  } catch (err) {
+    rememberUnpersistedGroup(taskId, chatId, chatName);
+    getDeps().warn(
+      `需求群已建成但落盘到任务失败 task=${taskId} chat=${chatId}：${errText(err)}（已记内存，重试将复用该群、不再建群）`,
+    );
+    throw new FeishuGroupError(
+      "lark_error",
+      `需求群已建成（chat_id=${chatId}）但关联到本任务失败：${errText(err)}。重试会复用该群、不会重复建群`,
+      { chatId },
+    );
+  }
+  getUnpersistedMap().delete(taskId);
+};
 
 /**
  * 幂等取/建本任务关联的群。
@@ -767,44 +853,62 @@ export const ensureRequirementGroup = async (
       );
     }
 
-    // 建群是**唯一**能带人 / 带 bot 的时机（事后拉人拉 bot 免审 scope 下全不可用），
-    // 所以这一次要尽量带齐：发起人本人（bot 建群自己自动入群、但不带人的话建群人
-    // 自己都看不见这个群）+ 注册表命中的角色成员 + 他们各自的 bot。
-    const botInfo = await getDeps().getBotInfo();
-    const ownerOpenId = botInfo.ownerOpenId.trim();
-
-    const workitemName = await getDeps().fetchWorkitemName(
-      story.workItemId,
-      story.projectKey,
-    );
-
-    const reqName = (workitemName || task.title || story.workItemId).trim();
-    const chatName = `${reqName}需求群`;
-
-    const invites = await resolveGroupInvites(
-      story,
-      ownerOpenId,
-      botInfo.appId?.trim() ?? "",
-    );
-    const created = await getDeps().createChat({
-      name: chatName,
-      userIdList: invites.userIdList,
-      // 一个都没命中时不塞空数组：载荷干净、也不动老调用方的断言
-      ...(invites.botIdList.length > 0 ? { botIdList: invites.botIdList } : {}),
-    });
-    const myChatId = created.chat_id;
-
-    // 新群只记本任务本地（工作项碰都不碰）：存不住 = 下次又建一个攒孤儿群，
-    // 所以 persist 缺失/失败直接抛，不吞（与当年保工作项 bind 的吞错正好反过来——
-    // 那时群是全组共享的、吞了卡还能发出去；现在群只归本任务，没存住就是没关联上）。
+    // 持久化入口必须在 createChat 之前校验：建群是不可逆的外部副作用，先建后查
+    // 会在漏传入口时每次调用都真建一个群（飞书里攒孤儿群）。
+    // 没传 = 工具路径（agent 的 share_to_group）：产品语义是工具不自建群，只往任务已绑定的群发；
+    // 所以这里是「用户 / agent 可行动」的结构化错误（no_group），不是内部错误，更不建群。
     const persist = opts.persistLocalGroup;
     if (!persist) {
-      throw new FeishuGroupError(
-        "lark_error",
-        "内部错误：建群成功但没有本地持久化入口",
-      );
+      throw new FeishuGroupError("no_group", NO_BOUND_GROUP_TOOL_MESSAGE);
     }
-    await persist(myChatId, chatName);
+
+    // 补偿：上一次「建群成功但落盘失败」留下了已建未落盘的群——同一任务重试直接复用，
+    // 只补落盘，不再建第二个（否则每次落盘抖一下都多一个没人进得去的孤儿群）
+    let myChatId: string;
+    let chatName: string | undefined;
+    const orphan = getUnpersistedGroup(task.id);
+    if (orphan) {
+      getDeps().warn(
+        `复用上次已建未落盘的需求群 chat=${orphan.chatId}（task=${task.id}），补落盘、不再建群`,
+      );
+      myChatId = orphan.chatId;
+      chatName = orphan.chatName;
+    } else {
+      // 建群是**唯一**能带人 / 带 bot 的时机（事后拉人拉 bot 免审 scope 下全不可用），
+      // 所以这一次要尽量带齐：发起人本人（bot 建群自己自动入群、但不带人的话建群人
+      // 自己都看不见这个群）+ 注册表命中的角色成员 + 他们各自的 bot。
+      const botInfo = await getDeps().getBotInfo();
+      const ownerOpenId = botInfo.ownerOpenId.trim();
+
+      const workitemName = await getDeps().fetchWorkitemName(
+        story.workItemId,
+        story.projectKey,
+      );
+
+      const reqName = (workitemName || task.title || story.workItemId).trim();
+      chatName = `${reqName}需求群`;
+
+      const invites = await resolveGroupInvites(
+        story,
+        ownerOpenId,
+        botInfo.appId?.trim() ?? "",
+      );
+      const created = await getDeps().createChat({
+        name: chatName,
+        userIdList: invites.userIdList,
+        // 一个都没命中时不塞空数组：载荷干净、也不动老调用方的断言
+        ...(invites.botIdList.length > 0 ? { botIdList: invites.botIdList } : {}),
+      });
+      myChatId = created.chat_id;
+    }
+
+    // 新群只记本任务本地（工作项碰都不碰）：存不住 = 下次又建一个攒孤儿群，
+    // 所以 persist 失败直接抛，不吞（与当年保工作项 bind 的吞错正好反过来——
+    // 那时群是全组共享的、吞了卡还能发出去；现在群只归本任务，没存住就是没关联上）。
+    // 抛之前先把已建出的群记进内存「已建未落盘」表：同一任务的重试复用它、不再建群；
+    // 错误信息 / 日志带上 chat_id，进程重启后内存表丢了也能人工去飞书里找到这个群。
+    // persist 缺失已在建群前拦掉（见上），这里只会是执行失败。
+    await persistCreatedGroup(task.id, persist, myChatId, chatName);
     // 关联变了：群反查缓存整清（旧映射也在里面；review 十三轮-1/十三轮-2，
     // 新关联群 60 秒内 @ 不再撞 miss 说“没关联”）。
     // 动态 import：group-route 静态边太重（连着 task-runner），运行时再连。
@@ -817,7 +921,12 @@ export const ensureRequirementGroup = async (
         );
       });
     // 刚建的群名是本机拼的、无需再查一次；建群人自己必在群里，不用校验
-    return { chatId: myChatId, created: true, chatName, source: "task" as const };
+    return {
+      chatId: myChatId,
+      created: true,
+      ...(chatName ? { chatName } : {}),
+      source: "task" as const,
+    };
   } catch (err) {
     throw await mapExternalError(err);
   }

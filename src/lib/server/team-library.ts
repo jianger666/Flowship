@@ -38,6 +38,12 @@ import {
 import { dataRoot } from "./data-root";
 import { createMR } from "./gitlab-client";
 import {
+  assertTrustedGitHost,
+  fetchWithGitToken,
+  GitHostRedirectError,
+  gitHostFromUrl,
+} from "./trusted-git-host";
+import {
   getTeamSkillAuthorIdentities,
   getTeamSkillAuthors,
 } from "./team-skill-authors";
@@ -254,6 +260,11 @@ const INLINE_CREDENTIAL_HELPER = `!f(){ echo username=oauth2; echo "password=$${
  * - 第一个空 helper（credential.helper=）清掉系统 keychain 等全局 helper 干扰
  * - token 走 env 不进命令行：.git/config、FETCH_HEAD、ps 里都只有干净 URL
  * - http.postBuffer 调大：镜像 5M+ 的 push 用默认 buffer 会被 GitLab HTTP 500 拒
+ * - http.followRedirects=false：**不能省**。inline helper 不看 host（对任何 host 的凭据请求都吐出 PAT），
+ *   而 git 默认 `initial` 会跟随首个请求的 3xx、并按**重定向后的 host** 重新向 helper 要凭据——
+ *   可信 host 返回 302 → 别的 host（401）→ helper 把 PAT 交给 git → 发给别的 host（已用本地两个 http server 实测）。
+ *   关掉后 3xx 直接是 git 的错误（`The requested URL returned error: 302`），PAT 不出可信 host。
+ *   代价：GitLab 项目改名 / 迁移后的旧 URL（服务端 301）会失败，需用户把共享库地址改成新地址——可接受。
  */
 export const buildAuthedGitArgs = (subArgs: string[]): string[] => [
   "-c",
@@ -262,6 +273,8 @@ export const buildAuthedGitArgs = (subArgs: string[]): string[] => [
   `credential.helper=${INLINE_CREDENTIAL_HELPER}`,
   "-c",
   "http.postBuffer=157286400",
+  "-c",
+  "http.followRedirects=false",
   ...subArgs,
 ];
 
@@ -297,6 +310,11 @@ export const classifyPushRejection = (errorText: string): PushRejectionKind => {
 /**
  * 从 GitLab https 仓库 URL 解析 host + projectPath（createMR / canMirror 探测共用）。
  * `https://gitlab.wukongedu.net/frontend/infra/repo.git` → host + `frontend/infra/repo`
+ *
+ * host 取 `URL.host`（非默认端口会带上：`gitlab.corp.com:8443`；默认端口不显示）而不是 `URL.hostname`：
+ * 后者把端口丢了，PAT 的可信 host 校验就会把「同一台机器上的另一个端口」当成同一个服务（P3），
+ * 调用方拼 `https://${host}/api/v4/…` 时也会把请求发到 443 而不是仓库真正的端口。
+ * 非 http(s)（ssh:// 等）的端口是该协议自己的端口、不能当 HTTPS 端口用，仍只取主机名。
  */
 export const parseGitLabRepoUrl = (
   repoUrl: string,
@@ -308,7 +326,8 @@ export const parseGitLabRepoUrl = (
       .replace(/\.git$/i, "")
       .replace(/\/+$/, "");
     if (!u.hostname || !projectPath) return null;
-    return { host: u.hostname, projectPath };
+    const isHttp = u.protocol === "https:" || u.protocol === "http:";
+    return { host: isHttp ? u.host : u.hostname, projectPath };
   } catch {
     return null;
   }
@@ -337,13 +356,19 @@ const getGitLabUploadIdentity = async (
     .update(token)
     .digest("hex")
     .slice(0, 12);
+  // key 含端口（parsed.host 是 URL.host）：同机不同端口是不同的 GitLab 实例，身份不能串用
   const cacheKey = `${parsed.host}:${tokenDigest}`;
   const cached = gitLabIdentityCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return { ok: true, identity: cached.identity };
   }
+  // PAT 只发往可信 host：构造请求之前校验，失败不发任何网络请求。
+  // 校验的是下面 `https://${parsed.host}/api/v4/user` 这个实际目的地（含端口），而不是仓库 URL 的 git 端口
+  const untrusted = trustedHostErrorForApiHost(parsed.host);
+  if (untrusted) return { ok: false, error: untrusted };
   try {
-    const response = await fetch(`https://${parsed.host}/api/v4/user`, {
+    // 不跟随重定向：PRIVATE-TOKEN 是自定义头，undici 跨源 302 不会剔除（见 trusted-git-host.ts fetchWithGitToken）
+    const response = await fetchWithGitToken(`https://${parsed.host}/api/v4/user`, {
       method: "GET",
       headers: {
         "PRIVATE-TOKEN": token,
@@ -377,7 +402,10 @@ const getGitLabUploadIdentity = async (
       return { ok: false, error: "GitLab 用户信息缺少 id/username" };
     }
     const identity: GitLabUploadIdentity = {
-      host: parsed.host,
+      // 刻意只存主机名、不带端口：它会被写进共享库的 .flowship-owner.json，并与历史 owner 文件按字符串比较
+      // （team-library-ownership.ts 的 sameHost）；带上端口会让非默认端口部署的既有 owner 全部「无权覆盖」自己的条目。
+      // 这不是凭据出站闸（出站闸在上面），所以不在这里改口径
+      host: parsed.host.replace(/:\d+$/, ""),
       userId,
       username,
       name: name || username,
@@ -544,9 +572,11 @@ const probeCanMirror = async (
 
   let value = false;
   const parsed = parseGitLabRepoUrl(cfg.knowledgeSourceUrl);
-  if (parsed) {
+  // PAT 只发往可信 host：不可信按「不可镜像」处理、不发探测请求（trustedHostErrorForApiHost 见 runGit 上方）
+  if (parsed && !trustedHostErrorForApiHost(parsed.host)) {
     try {
-      const res = await fetch(
+      // 不跟随重定向（理由同 getGitLabUploadIdentity）；被重定向 = 探测失败 = 不可镜像
+      const res = await fetchWithGitToken(
         `https://${parsed.host}/api/v4/projects/${encodeURIComponent(parsed.projectPath)}`,
         {
           method: "GET",
@@ -555,8 +585,12 @@ const probeCanMirror = async (
         },
       );
       value = res.status === 200;
-    } catch {
-      // 网络异常 / 超时 → 按不可镜像处理（下次 TTL 过期再探）
+    } catch (err) {
+      // 网络异常 / 超时 → 按不可镜像处理（下次 TTL 过期再探）；
+      // 被重定向单独留一行日志（不含 token）：否则用户只看到「镜像入口灰了」、不知道是地址被改写
+      if (err instanceof GitHostRedirectError) {
+        console.warn(`[team-library] canMirror 探测被重定向、已拒绝跟随：${parsed.host}`);
+      }
       value = false;
     }
   }
@@ -586,11 +620,77 @@ type GitResult =
   | { ok: true; stdout: string; stderr: string }
   | { ok: false; error: string; stdout: string; stderr: string };
 
+/**
+ * PAT 出站前的可信 host 闸（只校验、不负责固定）。
+ * 共享库的 host 来自配置（DEFAULT_TEAM_LIBRARY / team-library.json），不是 remote 或评论链接，
+ * 所以它不该决定「可信 host 是谁」（pinIfAbsent:false）——但已固定 / 配了白名单时，必须一致，
+ * 否则 PAT 会随 inline credential helper 发给与用户 GitLab 不同的 host。
+ * 返回错误文案（null = 放行）。URL 不是 http(s) GitLab 地址（本地路径 / ssh / file）= 没有 PAT 出站语义、放行。
+ *
+ * 比较的是「主机名 + 端口」（P3：同机不同端口是另一个服务），分两个出口——因为实际连接的目的地不同：
+ *   - {@link trustedHostErrorForUrl}：git 出站（clone / fetch / push），git 按 URL 自己的 scheme 连接，
+ *     目的地 = {@link gitHostFromUrl}（http 默认 80、https 默认 443）；
+ *   - {@link trustedHostErrorForApiHost}：REST 出站，请求永远是 `https://${host}/api/v4/…`，
+ *     校验的就是拼进请求的那个 host 字符串本身，闸与请求用同一个值、不会出现「验 A 发 B」。
+ */
+const gateTrustedGitHost = (host: string | null): string | null => {
+  try {
+    // host 为 null（URL 解析不了）时 assertTrustedGitHost 按「非法 host」拒绝：fail-closed，不放行
+    assertTrustedGitHost(host, { pinIfAbsent: false });
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+};
+
+/** git 出站闸：目的地由 URL 的 scheme + 端口决定（见 {@link gitHostFromUrl}） */
+const trustedHostErrorForUrl = (url: string | null | undefined): string | null => {
+  const parsed = url ? parseGitLabRepoUrl(url.trim()) : null;
+  if (!parsed || !url) return null;
+  return gateTrustedGitHost(gitHostFromUrl(url.trim()));
+};
+
+/** REST 出站闸：host 就是调用方拼进 `https://${host}/api/v4/…` 的那个 `parseGitLabRepoUrl().host` */
+const trustedHostErrorForApiHost = (host: string): string | null =>
+  gateTrustedGitHost(host);
+
+/**
+ * 带 PAT 的 git 网络操作前的目的地校验：runGit 的唯一闸口（所有 clone / fetch / push / ls-remote 都经它）。
+ * 目的地取参数里显式给的 http(s) URL（clone / ls-remote），否则读 cwd 仓的 origin（fetch / push origin …）——
+ * 后者正是「clone 的 origin 被改成别的地址」的攻击面。
+ * export 仅供单测（直接验「origin 被改」这条 runGit 之外难构造的路径）。
+ */
+export const checkGitEgressTrusted = async (
+  args: string[],
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): Promise<string | null> => {
+  if (!env?.[GIT_TOKEN_ENV]) return null; // 没带 PAT 的本地操作不管
+  let url = args.find((a) => /^https?:\/\//i.test(a));
+  if (!url && cwd) {
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["config", "--get", "remote.origin.url"],
+        { cwd, timeout: 10_000 },
+      );
+      url = String(stdout).trim();
+    } catch {
+      return null; // 读不到 origin：git 自己也推不出目的地、不会触发 https 认证
+    }
+  }
+  return trustedHostErrorForUrl(url);
+};
+
 const runGit = async (
   args: string[],
   cwd?: string,
   env?: NodeJS.ProcessEnv,
 ): Promise<GitResult> => {
+  const untrusted = await checkGitEgressTrusted(args, cwd, env);
+  if (untrusted) {
+    return { ok: false, error: untrusted, stdout: "", stderr: "" };
+  }
   try {
     const { stdout, stderr } = await execFileAsync("git", args, {
       cwd,
@@ -624,9 +724,18 @@ const runGit = async (
           ? String(e.stderr)
           : "";
     // execFile 失败的 message 含完整命令行——脱敏后才能对外（API / toast / 日志）
-    const detail = redactGitText(
+    const rawDetail = redactGitText(
       (stderr || stdout || e.message || String(err)).trim(),
     );
+    // 带 PAT 的网络操作开了 http.followRedirects=false（buildAuthedGitArgs）：服务端 3xx 会以
+    // 「returned error: 30x」失败。单独点明原因，否则用户只看到一句 git 报错、不知道是地址被重定向
+    // 状态码：301 / 302 / 303（See Other）/ 307 / 308——git 对这五个都会报 `returned error: 30x`；
+    // 之前漏了 303，撞上时用户拿不到下面这句提示。
+    // 常见真实原因除了改名 / 迁移，还有「地址没带 `.git` 后缀」：GitLab 会把无后缀的 info/refs 302 到带后缀的地址
+    const detail =
+      env?.[GIT_TOKEN_ENV] && /returned error: 30[12378]\b/.test(rawDetail)
+        ? `${rawDetail}\n（GitLab 把该地址重定向了——可能是项目改名 / 迁移，或共享库地址缺少 \`.git\` 后缀。为防止 GitLab Token 被带到其它地址，已不跟随重定向；请把共享库地址改成最终地址。）`
+        : rawDetail;
     return {
       ok: false,
       error: detail || "git 命令失败",
@@ -2395,6 +2504,36 @@ export const getTeamUploadPermissions =
     return { ok: true, permissions };
   };
 
+/**
+ * 删除前的归属校验（S07-01）：与上传覆盖同一套规则（owner 文件 → 历史首次提交邮箱 → fail closed），
+ * 否则任何持有推送权限 token 的人都能删别人上传的共享 skill。
+ * 单独导出便于单测（删除全链路要走 git 网络）；上传 / 权限快照路径用的是同一个 decideSharedSkillUpdate。
+ */
+export const authorizeSharedSkillDeletion = async (opts: {
+  /** skill 目录绝对路径（读 .flowship-owner.json） */
+  absDir: string;
+  /** 相对 clone 根的 posix 路径：skills/<cat>/<name> */
+  relDir: string;
+  /** 实际执行 push 的 GitLab token 对应身份 */
+  currentUser: GitLabUploadIdentity;
+  /** 创建人索引（历史无 owner 文件的项兜底） */
+  authorIdentities: Record<string, { name: string; email?: string }>;
+}): Promise<{ ok: true } | { ok: false; error: string }> => {
+  const authorIdentity = opts.authorIdentities[opts.relDir];
+  const decision = decideSharedSkillUpdate({
+    exists: true,
+    owner: await readSharedSkillOwner(opts.absDir),
+    legacyAuthor: authorIdentity?.name.trim() || undefined,
+    legacyAuthorEmail: authorIdentity?.email,
+    currentUser: opts.currentUser,
+  });
+  if (decision.allowed) return { ok: true };
+  return {
+    ok: false,
+    error: `无权删除「${path.posix.basename(opts.relDir)}」：${decision.reason}`,
+  };
+};
+
 export type DeleteFromTeamLibraryResult =
   | {
       ok: true;
@@ -2428,6 +2567,9 @@ const deleteFromTeamLibraryInternal = async (
   }
 
   const cfg = await getTeamLibraryConfig();
+  // 删除必须像上传一样先确认 token 对应的 GitLab 身份（fail closed：查不到身份就不删）
+  const identity = await getGitLabUploadIdentity(cfg.repoUrl, token);
+  if (!identity.ok) return { ok: false, error: identity.error };
   const repoDir = teamLibraryRepoDir();
   const skillsRoot = path.join(repoDir, "skills");
 
@@ -2448,6 +2590,14 @@ const deleteFromTeamLibraryInternal = async (
   if (!isStrictlyInside(skillsRoot, hit.absDir)) {
     return { ok: false, error: `skill 路径越界：${needle}` };
   }
+  // 归属校验：只有创建人（owner 文件 / 历史首次提交邮箱）才能删，与上传覆盖同规则
+  const authz = await authorizeSharedSkillDeletion({
+    absDir: hit.absDir,
+    relDir: located.relDir,
+    currentUser: identity.identity,
+    authorIdentities: await getTeamSkillAuthorIdentities(repoDir),
+  });
+  if (!authz.ok) return authz;
 
   const stageDelete = async (): Promise<void> => {
     // 冲突重试后目录可能已不在（远端别人先删）——幂等当作成功准备

@@ -51,6 +51,10 @@ import {
   runOptimisticSubmit,
 } from "@/lib/optimistic-submit";
 import {
+  claimTalkClientItemId,
+  settleTalkClientItemId,
+} from "@/lib/talk-send-attempt";
+import {
   CURSOR_PROVIDER_ID,
   type ModelSelection,
   type Task,
@@ -331,6 +335,16 @@ export const TaskTalkComposer = ({
       // 快照 payload 后立刻 reset，气泡靠 SSE 补；失败才恢复正文+路径。
       // question POST 含 resume，长会话下要等一两分钟，之前输入框全程占着正文被当成“卡死”。
       const snap = rich.payload();
+      const forceModel = talkForceModel(pickedModel, resolveSessionModel(task));
+      // 发送幂等键：服务端待送达队列按它去重。POST 已入队但响应丢了时，用户原样再按回车
+      // 要复用同一个 id（否则同一句话排两遍）；改了内容 / 上一条成功后则换新 id（见 talk-send-attempt）。
+      const clientItemId = claimTalkClientItemId(task.id, {
+        text: snap.text,
+        images: snap.images,
+        attachments: snap.attachments,
+        skills: snap.skillRefs,
+        modelKey: modelSelectionKey(forceModel),
+      });
       const outcome = await runOptimisticSubmit({
         payload: snap,
         reset: () => rich.reset(),
@@ -358,13 +372,14 @@ export const TaskTalkComposer = ({
             task,
             snap.text,
             snap.images,
-            talkForceModel(pickedModel, resolveSessionModel(task)),
+            forceModel,
             snap.attachments,
             snap.skillRefs,
-            { queueIfBusy: queueMode },
+            { queueIfBusy: queueMode, clientItemId },
           ),
       });
       if (!outcome.ok) {
+        // 失败不 settle：保留 id，同一条的重试要复用它
         toast.error(
           outcome.error instanceof Error
             ? outcome.error.message
@@ -372,6 +387,8 @@ export const TaskTalkComposer = ({
         );
         return;
       }
+      // 成功（含 202 入队）：下一条换新 id
+      settleTalkClientItemId(task.id, clientItemId);
       const result = outcome.result;
       if (result.queued) {
         toast.success("已排队，当前这轮跑完自动发送");

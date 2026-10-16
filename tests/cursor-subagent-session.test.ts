@@ -7,7 +7,7 @@
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-cursor-subagent-session-"));
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
@@ -44,8 +44,16 @@ const mockList = vi.fn(async (arg: unknown) => {
     },
   ];
 });
+const mockResume = vi.fn(async (id: string, arg: unknown) => {
+  void id;
+  void arg;
+  return { agentId: id, send: childSend, close: childClose };
+});
 vi.mock("@cursor/sdk", () => ({
-  Agent: { create: (arg: unknown) => mockCreate(arg) },
+  Agent: {
+    create: (arg: unknown) => mockCreate(arg),
+    resume: (id: string, arg: unknown) => mockResume(id, arg),
+  },
   Cursor: { models: { list: (arg: unknown) => mockList(arg) } },
 }));
 
@@ -70,6 +78,7 @@ const run = async (
 afterEach(() => {
   vi.useRealTimers();
   mockCreate.mockClear();
+  mockResume.mockClear();
   childSend.mockClear();
   childClose.mockClear();
 });
@@ -192,6 +201,114 @@ describe("受理超时（与父会话同口径的 SDK deadline）", () => {
       cwd: "/w",
     });
     const p = run(link, { prompt: "x" });
+    await vi.advanceTimersByTimeAsync(181_000);
+    const out = await p;
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("超时");
+  });
+});
+
+describe("resume：真实 SDK 路径（Agent.resume）", () => {
+  // 不依赖前面用例留下的 mockList 状态（「目录拿不到」那条会把它重置成空目录）
+  beforeEach(() => {
+    mockList.mockReset();
+    mockList.mockResolvedValue([
+      {
+        id: "claude-sonnet-5-5",
+        displayName: "Claude Sonnet 5.5",
+        parameters: [
+          { id: "reasoning_effort", values: [{ value: "low" }, { value: "medium" }, { value: "high" }] },
+          { id: "context", values: [{ value: "300k" }, { value: "1m" }] },
+        ],
+      },
+    ] as never);
+  });
+
+  const mk = (apiKey: string) =>
+    createCursorSubagentLinkForSession({
+      apiKey,
+      parentModel: {
+        id: "claude-sonnet-5-5",
+        params: [
+          { id: "reasoning_effort", value: "high" },
+          { id: "context", value: "1m" },
+        ],
+      },
+      cwd: "/work/proj",
+    });
+
+  /** 让下一次 create 出来的子 agent 带 SDK 分配的 id（真实 SDK 一定有） */
+  const nextChildId = (id: string) =>
+    mockCreate.mockResolvedValueOnce({ agentId: id, send: childSend, close: childClose } as never);
+
+  it("结果末尾给 id；resume 用 Agent.resume(该 id, 与 create 同一份选项)——tools / disallowedTools 不持久化，必须再传", async () => {
+    const link = mk("sk-resume-a");
+    nextChildId("sdk-child-1");
+    const first = await run(link, { prompt: "干活" });
+    expect(first.text.startsWith("子任务结果\n\n[子代理 sdk-child-1 · claude-sonnet-5-5 (reasoning_effort=high)]")).toBe(true);
+    const createOpts = lastCreate();
+
+    const second = await run(link, { prompt: "接着改", resume: "sdk-child-1" });
+    expect(second.isError).toBe(false);
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(mockResume).toHaveBeenCalledTimes(1);
+    expect(mockResume.mock.calls[0][0]).toBe("sdk-child-1");
+    const resumeOpts = mockResume.mock.calls[0][1] as Opts;
+    // 与 create 同口径：apiKey / 模型（藏起来的 context 已剥）/ cwd / settingSources / 去掉 task
+    expect(resumeOpts.apiKey).toBe(createOpts.apiKey);
+    expect(resumeOpts.model).toEqual(createOpts.model);
+    expect(resumeOpts.disallowedTools).toEqual(["task"]);
+    expect(resumeOpts).not.toHaveProperty("tools");
+    expect((resumeOpts.local as Opts).cwd).toBe("/work/proj");
+    expect((resumeOpts.local as Opts).settingSources).toEqual([]);
+    expect(resumeOpts.local).not.toHaveProperty("customTools");
+    expect(resumeOpts).not.toHaveProperty("mcpServers");
+    expect(childSend).toHaveBeenLastCalledWith("接着改");
+    expect(childClose).toHaveBeenCalledTimes(2); // create 那次、resume 那次各关一次
+  });
+
+  it("explore：resume 时仍只给读 / 搜白名单（否则只读子代理接回来就拿到写权限）", async () => {
+    const link = mk("sk-resume-b");
+    nextChildId("sdk-child-ro");
+    await run(link, { prompt: "只看", subagentType: "explore" });
+    await run(link, { prompt: "再看", resume: "sdk-child-ro" });
+    const resumeOpts = mockResume.mock.calls[0][1] as Opts;
+    expect(resumeOpts.tools).toEqual([...CURSOR_SUBAGENT_READONLY_TOOLS]);
+    expect(resumeOpts).not.toHaveProperty("disallowedTools");
+  });
+
+  it("换过模型 + effort 的子代理：resume 沿用当初那份（不回退到父模型）", async () => {
+    const link = mk("sk-resume-c");
+    nextChildId("sdk-child-m");
+    await run(link, { prompt: "x", model: "claude-sonnet-5-5", effort: "low" });
+    await run(link, { prompt: "y", resume: "sdk-child-m" });
+    expect((mockResume.mock.calls[0][1] as Opts).model).toEqual({
+      id: "claude-sonnet-5-5",
+      params: [{ id: "reasoning_effort", value: "low" }],
+    });
+  });
+
+  it("Agent.resume 抛错（会话记录被清了等）：给模型一句能照做的话，并忘掉这条登记", async () => {
+    const link = mk("sk-resume-d");
+    nextChildId("sdk-child-gone");
+    await run(link, { prompt: "x" });
+    mockResume.mockRejectedValueOnce(new Error("agent not found in store"));
+    const out = await run(link, { prompt: "y", resume: "sdk-child-gone" });
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("agent not found in store");
+    expect(out.text).toContain("另起");
+    const again = await run(link, { prompt: "y", resume: "sdk-child-gone" });
+    expect(again.text).toContain("找不到子代理");
+    expect(mockResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("Agent.resume 挂死：到点报超时（与 create 同口径），不无限停在「子代理工作中」", async () => {
+    const link = mk("sk-resume-e");
+    nextChildId("sdk-child-slow");
+    await run(link, { prompt: "x" });
+    vi.useFakeTimers();
+    mockResume.mockImplementationOnce(() => new Promise(() => {}));
+    const p = run(link, { prompt: "y", resume: "sdk-child-slow" });
     await vi.advanceTimersByTimeAsync(181_000);
     const out = await p;
     expect(out.isError).toBe(true);

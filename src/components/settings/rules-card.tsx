@@ -36,6 +36,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useDialog } from "@/hooks/use-dialog";
 import { getSettings, initSettings, saveSettings } from "@/lib/local-store";
 import { cn } from "@/lib/utils";
+import { isImeComposing } from "@/lib/ime";
 
 // 跟 /api/rules 返回对齐
 interface RuleRow {
@@ -105,6 +106,8 @@ export const RulesCard = () => {
   const [editing, setEditing] = useState<{ name: string; content: string } | null>(
     null,
   );
+  // 列表读取失败的提示（S13-08：失败不能当成「没有规则」；有旧数据时保留旧数据、只 toast）
+  const [loadError, setLoadError] = useState<string | null>(null);
   // 请求飞行中（防双击）
   const [busy, setBusy] = useState(false);
   // 一句话新建输入草稿
@@ -113,13 +116,18 @@ export const RulesCard = () => {
   const refresh = useCallback(async () => {
     try {
       const res = await fetch("/api/rules", { cache: "no-store" });
-      const data = (await res.json()) as { rules?: RuleRow[] };
-      setRules(data.rules ?? []);
+      const data = (await res.json().catch(() => null)) as {
+        rules?: RuleRow[];
+        error?: string;
+      } | null;
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      setRules(data?.rules ?? []);
+      setLoadError(null);
     } catch (err) {
-      toast.error(
-        `读取 rules 失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-      setRules([]);
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`读取 rules 失败：${message}`);
+      // 不动 rules：已有列表就保留（别把读失败的刷新显示成「规则全没了」）；首次加载失败 rules 仍是 null、走错误态
+      setLoadError(message);
     }
   }, []);
 
@@ -182,7 +190,15 @@ export const RulesCard = () => {
     if (enabled) cur.delete(name);
     else cur.add(name);
     const ok = await saveSettings({ ...s, disabledRules: [...cur] });
-    if (!ok) toast.error("开关保存失败、请重试");
+    if (!ok) {
+      // S13-12：保存失败回滚 UI——否则开关停在新状态、实际仍是旧值、重进页面才发现
+      setRules((prev) =>
+        prev
+          ? prev.map((r) => (r.name === name ? { ...r, enabled: !enabled } : r))
+          : prev,
+      );
+      toast.error("开关保存失败、已恢复原状态、请重试");
+    }
   };
 
   // 一句话添加：自动命名 + 纯文本 .mdc → 现有 POST
@@ -237,7 +253,7 @@ export const RulesCard = () => {
             className="min-w-0 flex-1"
             onKeyDown={(e) => {
               // 单行 Input：裸 Enter 提交（IME 选词中的 Enter 放过）
-              if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+              if (e.key !== "Enter" || isImeComposing(e)) return;
               e.preventDefault();
               void handleQuickAdd();
             }}
@@ -254,7 +270,23 @@ export const RulesCard = () => {
         </div>
 
         {rules === null ? (
-          <LoadingState variant="inline" />
+          loadError ? (
+            <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 px-3 py-2 text-sm">
+              <span className="min-w-0 truncate text-destructive">
+                读取失败：{loadError}
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => void refresh()}
+              >
+                重试
+              </Button>
+            </div>
+          ) : (
+            <LoadingState variant="inline" />
+          )
         ) : rules.length === 0 ? (
           <EmptyHint>还没有自管规则——上面输入一句话即可添加</EmptyHint>
         ) : (

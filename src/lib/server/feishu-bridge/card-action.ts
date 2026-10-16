@@ -13,8 +13,14 @@
 
 import type { ModelSelection } from "@cursor/sdk";
 
+import { supersedePendingAsks } from "@/lib/server/ask-supersede";
+import { fulfillAskWait } from "@/lib/server/ask-wait";
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
-import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
+import {
+  getPendingAsk,
+  restorePendingAskIf,
+  takePendingAskIf,
+} from "@/lib/server/chat-pending";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import {
   deliverChatAskReply,
@@ -34,9 +40,15 @@ import {
 } from "./bridge-state";
 import {
   ASK_CARD_ANSWERED_HINT,
-  isAskCardSettled,
   settleAskCards,
 } from "./ask-card-settle";
+import { isAskCardPatched } from "./ask-settle-state";
+import {
+  resolveStaleAskReason,
+  staleAskButtonText,
+  staleAskReplyText,
+  type StaleAskReason,
+} from "./ask-stale";
 import { findTaskByMessageId } from "./card-map";
 import {
   GROUP_MEMBER_FALLBACK_NAME,
@@ -359,10 +371,15 @@ const resolveCardId = async (
 };
 
 /**
- * 无 pending 时只知道被点的那颗按钮——把它换成失效提示。
+ * 无 pending 时只知道被点的那颗按钮——把它换成失效提示（文案按真实原因分流，见 ask-stale）。
  *
- * 这组 ask 已经被 {@link settleAskCards} 整体置成终态时**不做**：问题区连同按钮
+ * **这张卡**的终态 patch 已被 {@link settleAskCards} 成功发出时**不做**：问题区连同按钮
  * 早被换掉了，再 patch 一个不存在的 element_id 只会白报一次飞书错误。
+ *
+ * 判据必须按「这张卡」而不是「这组 ask 是否已占坑」（F3-01）：同一组 ask 常挂在私聊流式卡 +
+ * 群答题卡两张卡上，settle 一成一败时占坑保持（部分成功不退坑），按整组判就会把失败那张卡
+ * 上还挂着的按钮也一并放过——点了既不置态、也没有任何卡面反馈。失败那张卡上这条单按钮 patch
+ * 就是它剩下的自愈入口。
  */
 const patchSingleButtonStale = async (
   cardId: string,
@@ -370,8 +387,9 @@ const patchSingleButtonStale = async (
   askId: string,
   questionId: string,
   optionId: string,
+  reason: StaleAskReason,
 ): Promise<void> => {
-  if (isAskCardSettled(taskId, askId)) return;
+  if (isAskCardPatched(taskId, askId, cardId)) return;
   const bid = askOptionElementId(askId, questionId, optionId);
   await batchUpdateCard(
     cardId,
@@ -383,7 +401,7 @@ const patchSingleButtonStale = async (
           element: {
             tag: "markdown",
             element_id: bid,
-            content: "⚠️ 该问题已失效或已回答",
+            content: staleAskButtonText(reason),
           },
         },
       },
@@ -469,9 +487,17 @@ const handleAskAction = async (
   const cardId = await resolveCardId(messageId, value.taskId);
   const pending = getPendingAsk(value.taskId);
 
-  // 失效：无 pending / askId 不匹配 → 卡片置提示 + bot 私聊（先到先得）
-  // askId 不匹配时 pending 属于另一组提问，不能拿它的 options 去删按钮
-  if (!pending || pending.askId !== value.askId) {
+  // 失效反馈：卡片按钮置提示 + bot 私聊（先到先得）。
+  // 两处共用：①入口就没有匹配的 pending；②入口读到了、但真正摘除时已被别处（app / 另一次点击）抢先了结
+  const replyStale = async (): Promise<void> => {
+    // 文案按事件流真相分流：只有真有人答了才说「已回答」，跳过 / 过期 / 取消 / 顶替各说各的；
+    // 拿不准（登记丢了、标记还没落盘）沿用中性的「已失效或已回答」
+    const reason = await resolveStaleAskReason(
+      getTask,
+      value.taskId,
+      value.askId,
+      getPendingAsk(value.taskId)?.askId,
+    );
     if (cardId) {
       try {
         await patchSingleButtonStale(
@@ -480,6 +506,7 @@ const handleAskAction = async (
           value.askId,
           value.questionId,
           value.optionId,
+          reason,
         );
       } catch (err) {
         warnLark("patchAskStale", err);
@@ -487,13 +514,16 @@ const handleAskAction = async (
     }
     try {
       const bot = await getBotAppInfo();
-      await sendTextMessage(
-        bot.ownerOpenId,
-        "该问题已失效或已回答（可能已在 app / 飞书另一侧提交），无需再答。",
-      );
+      await sendTextMessage(bot.ownerOpenId, staleAskReplyText(reason, "owner"));
     } catch (err) {
       warnLark("sendTextMessage(stale ask)", err);
     }
+  };
+
+  // 失效：无 pending / askId 不匹配
+  // askId 不匹配时 pending 属于另一组提问，不能拿它的 options 去删按钮
+  if (!pending || pending.askId !== value.askId) {
+    await replyStale();
     return;
   }
 
@@ -538,15 +568,43 @@ const handleAskAction = async (
     warnLark("loadBridgeBootContext", err);
   }
 
-  const ok = await deliverChatAskReply(
-    task,
+  // 先摘再投（对齐 ask-inject / ask-reply / ask-skip）：上面几处 await 期间 app 或另一次点击
+  // 可能已经了结这组 ask——按 askId + token 原子摘除，摘不到就彻底放手（不投递、不落事件），
+  // 否则网页和飞书几乎同时答同一个 ask 会把答案投递两份。摘除之后到投递之间零 await 间隙。
+  const taken = takePendingAskIf(value.taskId, pending.askId, pending.token);
+  if (!taken) {
+    await replyStale();
+    return;
+  }
+
+  // 对齐 ask-inject / ask-reply / ask-skip：run 还停在 ask-wait 的前台 curl 上时，
+  // 答案必须写进那条 curl（同一轮继续），不能走 send——否则会被判「上一轮尚未结束」busy
+  const viaWait = await fulfillAskWait(
+    value.taskId,
+    pending.askId,
     built.replyText,
-    undefined,
-    bootArgs,
   );
+  const ok = viaWait
+    ? true
+    : await deliverChatAskReply(task, built.replyText, undefined, bootArgs);
   if (!ok) {
-    if (!hasChatSession(value.taskId)) {
-      clearPendingAsk(value.taskId);
+    // 会话还活着 = 只是这次忙 → 放回去让人重试（槽位已被新提问占住则不放，绝不盖新的）；
+    // 会话已死 → 不放回（与 ask-inject / ask-reply 一致：这组问题就此作废）
+    if (hasChatSession(value.taskId)) {
+      restorePendingAskIf(value.taskId, taken);
+    } else {
+      // 不放回只是内存里不再等这组答案；事件流里这组 ask 仍「待回答」、卡片按钮还挂着。
+      // 与 ask-reply 路由 / ask-inject 同口径写作废标记（tap 认出后把卡置「已失效」）——F3-02。
+      // lease：写标记要读盘 + 写盘，期间用户可能已唤醒新会话，那时这组 ask 不再是孤儿、放手不碰
+      try {
+        await supersedePendingAsks(
+          value.taskId,
+          "会话已失效",
+          () => !hasChatSession(value.taskId),
+        );
+      } catch (err) {
+        warnLark("supersedePendingAsks(deliver fail)", err);
+      }
     }
     try {
       const bot = await getBotAppInfo();
@@ -560,7 +618,7 @@ const handleAskAction = async (
     return;
   }
 
-  clearPendingAsk(value.taskId);
+  // 送达成功——pending 在上面已原子摘走，这里不需要再清
   // 卡片答题成功 → 当前对话指针切到该卡 task（直发后续消息进同一对话）
   void setCurrentChatTaskId(value.taskId);
 
@@ -785,10 +843,34 @@ const handleGroupAskAction = async (
   // 群里点按钮答题一律记泛称；打字作答那条链有 sender_name、记的是真名。
   const answeredBy = GROUP_MEMBER_FALLBACK_NAME;
   const cardId = await resolveCardId(messageId);
+
+  // boot 上下文必须**先于**下面的 pending 比对加载（N7-a）：
+  // `injectPendingAskText` 入口是无条件 `takePendingAsk(taskId)`——摘的是「此刻槽位里那组」，
+  // 它不认 value.askId。若比对 askId 之后还夹着一个 await（旧实现就是在这里 await 加载 boot），
+  // 窗口里 agent 登记了新一组提问，点旧卡的人会把旧选项 label 答到新提问上
+  //（实测：Q1 选哪个（ask-2）？答：方案 A）。所以从 askId 比对到 inject 的第一个同步语句之间
+  // **一个 await 都不许有**——比对 + 摘除落在同一个同步段里，等价于私聊卡的 takePendingAskIf。
+  let bootArgs: { apiKey?: string; model?: ModelSelection } | undefined;
+  try {
+    const boot = await loadBridgeBootContext();
+    if (boot) bootArgs = { apiKey: boot.apiKey, model: boot.model };
+  } catch (err) {
+    warnLark("loadBridgeBootContext(group ask)", err);
+  }
+
+  // ⚠️ 自此往下到 injectPendingAskText 调用之间不得出现 await（失效分支直接 return 的除外）
   const pending = getPendingAsk(value.taskId);
 
-  // 先到先得：app / p2p / 群里另一个人已经答过 → 这次点击作废
+  // 先到先得 / 已失效：这次点击作废。注意「作废」不等于「有人答了」——取消 / 顶替 / 重启 /
+  // 跳过 / 过期之后点旧卡同样走这里，文案按事件流真相分流（只有真有人答了才说「已经有人回答了」）。
+  // 失效分支直接 return，里面 await 无妨（零 await 窗口只约束比对 → 摘除之间，见上）
   if (!pending || pending.askId !== value.askId) {
+    const reason = await resolveStaleAskReason(
+      getTask,
+      value.taskId,
+      value.askId,
+      pending?.askId,
+    );
     if (cardId) {
       try {
         await patchSingleButtonStale(
@@ -797,6 +879,7 @@ const handleGroupAskAction = async (
           value.askId,
           value.questionId,
           value.optionId,
+          reason,
         );
       } catch (err) {
         warnLark("patchGroupAskStale", err);
@@ -805,7 +888,7 @@ const handleGroupAskAction = async (
     try {
       await sendTextMessageToChat(
         value.chatId,
-        `${mentionTag(operatorOpenId, answeredBy)} 这个问题已经有人回答了`,
+        `${mentionTag(operatorOpenId, answeredBy)} ${staleAskReplyText(reason, "group")}`,
       );
     } catch (err) {
       warnLark("sendTextMessageToChat(stale group ask)", err);
@@ -820,14 +903,6 @@ const handleGroupAskAction = async (
       `${LOG} 群答题选项不在 pending 内 task=${value.taskId} q=${value.questionId} opt=${value.optionId}`,
     );
     return;
-  }
-
-  let bootArgs: { apiKey?: string; model?: ModelSelection } | undefined;
-  try {
-    const boot = await loadBridgeBootContext();
-    if (boot) bootArgs = { apiKey: boot.apiKey, model: boot.model };
-  } catch (err) {
-    warnLark("loadBridgeBootContext(group ask)", err);
   }
 
   // 登记必须抢在注入之前：deliverAskReply 一返回 agent 就在跑、先到的 delta / done

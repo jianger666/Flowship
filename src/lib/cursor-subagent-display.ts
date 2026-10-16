@@ -12,6 +12,9 @@
  * 只改展示用的副本，不动 SDK 原消息。
  */
 
+import { isDefaultThinkingValue } from "@/lib/custom-effort";
+import { currentEffortValue, isInheritModelArg } from "@/lib/subagent-spec";
+
 /** Cursor 侧子代理工具名（模型通过 MCP 调它；与 pi 的 `task` 同参） */
 export const CURSOR_SUBAGENT_TOOL_NAME = "subagent";
 
@@ -61,15 +64,57 @@ export const unwrapMcpText = (
   return { text: parts.join("\n"), isError: value?.isError === true };
 };
 
+/** 改写展示参数时需要的父会话信息（不传 = 徽标保持模型传的原始值） */
+export interface SubagentDisplayContext {
+  /** 父会话当前模型（含思考档参数）；子代理「沿用」时就是它 */
+  parentModel?: { id: string; params?: Array<{ id: string; value: string }> };
+}
+
+/**
+ * 卡片徽标要显示**实际生效**的模型 / 思考档，而不是模型随手写的 `inherit`：
+ *  - model 缺省 / inherit → 父会话模型 id；
+ *  - 模型沿用、effort 又没填 → 父会话当前的思考档（子代理沿用它，见 resolveSubagentModel）；
+ *  - 显式填了别的模型 / effort → 原样（那就是实际值）；
+ *  - resume 调用不改写：接着的是之前那个子代理，它当初用什么模型这里不知道，不硬造。
+ * 只改展示副本，工具真实入参（模型看到的、SDK 收到的）一个字不动。
+ */
+const withEffectiveModelBadges = (
+  inner: Record<string, unknown>,
+  parent: NonNullable<SubagentDisplayContext["parentModel"]>,
+): Record<string, unknown> => {
+  if (typeof inner.resume === "string" && inner.resume.trim()) return inner;
+  const out: Record<string, unknown> = { ...inner };
+  const inherits =
+    isInheritModelArg(inner.model) ||
+    (typeof inner.model === "string" &&
+      inner.model.trim().toLowerCase() === parent.id.toLowerCase());
+  if (isInheritModelArg(inner.model)) out.model = parent.id;
+  const effortEmpty =
+    typeof inner.effort !== "string" ||
+    !inner.effort.trim() ||
+    isDefaultThinkingValue(inner.effort);
+  if (inherits && effortEmpty) {
+    const effort = currentEffortValue(parent.params);
+    if (effort) out.effort = effort;
+  }
+  return out;
+};
+
 /**
  * 把 `subagent` 的 MCP 调用改写成 `task` 的展示形状；其它消息原样返回（同一引用）。
- *  - name → "task"，args → 真入参（扁平）
+ *  - name → "task"，args → 真入参（扁平；传了 ctx.parentModel 时徽标字段换成实际生效值）
  *  - result → 纯文本（MCP 信封里的 `isError` 折成 status:"error"，卡片才会标红）
  */
-export const toSubagentDisplayCall = <M extends ToolCallShape>(msg: M): M => {
+export const toSubagentDisplayCall = <M extends ToolCallShape>(
+  msg: M,
+  ctx?: SubagentDisplayContext,
+): M => {
   if (!isCursorSubagentCall(msg)) return msg;
   const outer = msg.args as Record<string, unknown>;
-  const inner = isRecord(outer.args) ? outer.args : {};
+  const rawInner = isRecord(outer.args) ? outer.args : {};
+  const inner = ctx?.parentModel
+    ? withEffectiveModelBadges(rawInner, ctx.parentModel)
+    : rawInner;
   const next: Record<string, unknown> = {
     ...(msg as Record<string, unknown>),
     name: "task",

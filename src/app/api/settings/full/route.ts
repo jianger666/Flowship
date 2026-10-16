@@ -10,7 +10,6 @@
  */
 import { NextResponse } from "next/server";
 
-import { errorResponse } from "@/lib/server/route-helpers";
 import { readSettingsFile } from "@/lib/server/settings-fs";
 
 export const runtime = "nodejs";
@@ -22,7 +21,12 @@ export const GET = async (): Promise<Response> => {
   }
   if (result.status === "error") {
     console.error("[/api/settings/full] config.json 不可读:", result.reason);
-    return errorResponse("settings_unreadable", 500);
+    // error 保持 settings_unreadable（client 据此分流）；reason 给设置页展示——
+    // readSettingsFile 保证它不含文件内容（只有类别 / 出错位置 / fs 报错）
+    return NextResponse.json(
+      { error: "settings_unreadable", reason: result.reason },
+      { status: 500 },
+    );
   }
   return NextResponse.json({ exists: true, settings: result.settings });
 };

@@ -9,8 +9,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  RHYTHM_GROUP_DIVIDER_TOP,
   rhythmPaddingBottom,
   rhythmPaddingTop,
+  rhythmShowsGroupDivider,
   rhythmTier,
   type RhythmFacts,
   type RhythmTier,
@@ -20,6 +22,10 @@ import {
 const TALK: RhythmFacts = { talk: true, process: false };
 const PROCESS: RhythmFacts = { talk: false, process: true };
 const CARD: RhythmFacts = { talk: false, process: false };
+/** AI 平铺正文（对话类、无框无底色） */
+const AI_TEXT: RhythmFacts = { talk: true, process: false, aiText: true };
+/** 用户这一侧的话（气泡 / 待发送 / 提问卡：对话类、自带底色或边框） */
+const USER_SIDE: RhythmFacts = { talk: true, process: false, userSide: true };
 
 /** Tailwind 间距类 → px（一个单位 4px：pt-0.5 = 2px、pt-7 = 28px） */
 const px = (cls: string): number => {
@@ -141,5 +147,55 @@ describe("档与档之间的关系：别让整列又变回等距", () => {
       }
       expect(rhythmPaddingBottom(variant)).toMatch(/^pb-\d+(\.\d+)?$/);
     }
+  });
+});
+
+describe("rhythmShowsGroupDivider：AI 新一段话的开头画渐隐细线（留白之外再给一个分界）", () => {
+  /** 按真实调用方式：先算档、再问要不要画线 */
+  const divider = (
+    index: number,
+    item: RhythmFacts,
+    prev: RhythmFacts | null,
+  ): boolean => rhythmShowsGroupDivider(rhythmTier(index, item, prev), item, prev);
+
+  it("AI 回复接在过程行 / 卡片 / 上一段 AI 话后面：画线（这是「新的一组」的开头）", () => {
+    for (const prev of [PROCESS, CARD, AI_TEXT]) {
+      expect(divider(3, AI_TEXT, prev)).toBe(true);
+    }
+  });
+
+  it("AI 回复紧跟用户这一侧的话（气泡 / 待发送 / 提问卡）：不画线——一问一答是同一组，不能被线劈开", () => {
+    expect(divider(3, AI_TEXT, USER_SIDE)).toBe(false);
+  });
+
+  it("列表第一条不画线（没有上文，档是 first）", () => {
+    expect(divider(0, AI_TEXT, null)).toBe(false);
+  });
+
+  it("用户气泡 / 提问卡自己不画线：它们自带底色或边框，本来就是醒目的锚点", () => {
+    for (const prev of [PROCESS, CARD, AI_TEXT]) {
+      expect(divider(3, USER_SIDE, prev)).toBe(false);
+    }
+  });
+
+  it("过程行 / 卡片不画线：它们属于上一段话的「组内」，线只切组间", () => {
+    for (const item of [PROCESS, CARD]) {
+      for (const prev of [TALK, AI_TEXT, PROCESS]) {
+        expect(divider(3, item, prev)).toBe(false);
+      }
+    }
+  });
+
+  it("没标 aiText / userSide 的对话类（旧调用方 / 其它对话）保守地不画线：宁可少画、不能错画", () => {
+    expect(divider(3, TALK, PROCESS)).toBe(false);
+    expect(divider(3, TALK, TALK)).toBe(false);
+  });
+
+  it("线落在对话档留白的正中：top 偏移 = 对话档 padding-top 的一半（改一个必须改另一个）", () => {
+    const top = px(RHYTHM_GROUP_DIVIDER_TOP.replace(/^top-/, "pt-"));
+    for (const variant of VARIANTS) {
+      expect(top * 2).toBe(px(rhythmPaddingTop(variant, "conversation")));
+    }
+    expect(RHYTHM_GROUP_DIVIDER_TOP).toMatch(/^top-\d+(\.\d+)?$/);
   });
 });

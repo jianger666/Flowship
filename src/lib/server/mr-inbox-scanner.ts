@@ -50,6 +50,7 @@ import {
 } from "./meegle-cli";
 import { getMR, type GetMRResult } from "./gitlab-client";
 import { deriveHostFromRepo } from "./submit-mr-guard";
+import { assertTrustedGitHost } from "./trusted-git-host";
 import { readSettingsFile } from "./settings-fs";
 
 /**
@@ -92,6 +93,17 @@ export const getMRWithHostAllowlist = async (opts: {
       ok: false,
       error: "MR host 不在已配置仓库允许列表",
       skipped: true,
+    };
+  }
+  // 第二道闸：allowlist 是从仓库 origin 推的（remote 在 agent 可写的 .git/config 里，可被改成
+  // evil host 后就「合法」地进了 allowlist），所以还要对照首次绑定固定的可信 host / config 白名单。
+  // 不标 skipped：这种不一致（remote 被改 / 换了域名）要让用户在收件箱行上看到原因，而不是静默只剩链接。
+  try {
+    assertTrustedGitHost(parsed.host);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
     };
   }
   return getMR({
@@ -347,6 +359,17 @@ export const removeBugFromInboxCache = (bugUrl: string): void => {
       pendingRegression: r.pendingRegression.filter((it) => it.bugUrl !== bugUrl),
     },
   };
+};
+
+/**
+ * 撤销忽略：清掉该 url 在近期补丁里的记录。
+ * 忽略时 removeMrFromInboxCache / removeBugFromInboxCache 会把 url 记进 recentMutations（10 分钟），
+ * 之后每次扫描结果都会被它滤掉；撤销若不清，重扫回来的条目仍被过滤、10 分钟内「撤销无效」。
+ */
+export const clearRecentMutation = (url: string): void => {
+  const state = getGlobalState();
+  state.recentMutations.mergedMrUrls.delete(url);
+  state.recentMutations.removedBugUrls.delete(url);
 };
 
 /** 整缓存作废（角色切换等场景可选） */

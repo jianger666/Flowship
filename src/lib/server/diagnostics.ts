@@ -31,7 +31,10 @@ const maskSecret = (v: unknown): string => {
   return `${v.slice(0, 6)}…（长度 ${v.length}）`;
 };
 
-// 读 config.json 并脱敏成概要文本
+// 读 config.json 并脱敏成概要文本。
+// 只读这一个固定文件、不枚举数据目录：同目录的 config.json.bak / .bak.shrink（含已被清掉 / 轮换掉的旧 key）/
+// .corrupt-<ts> / .tmp.* 都含明文凭据，不会、也不能被带进诊断包——日后若要加「打包 / 列出数据目录」，必须整族排除
+// （行为钉在 tests/settings-backup-exclusion.test.ts）。
 const readSanitizedConfig = async (): Promise<string> => {
   try {
     const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");

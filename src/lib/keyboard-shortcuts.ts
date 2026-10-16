@@ -5,6 +5,7 @@
  * 引用这里，单测直接构造最小事件对象。
  */
 
+import { isImeComposing } from "@/lib/ime";
 import type { SubmitShortcut } from "@/lib/types";
 
 /** 判定用的最小键盘事件形状（原生 / React 事件都能喂） */
@@ -16,6 +17,8 @@ export interface KeyComboEvent {
   shiftKey: boolean;
   /** IME 组合输入中（原生 event.isComposing）；缺省当 false */
   isComposing?: boolean;
+  /** 兼容 Safari：IME 选词的 Enter 在 keydown 上 isComposing 为 false 但 keyCode 为 229 */
+  keyCode?: number;
 }
 
 /**
@@ -43,7 +46,7 @@ const matchesSubmitCombo = (
   shortcut: SubmitShortcut,
 ): boolean => {
   if (e.key !== "Enter") return false;
-  if (e.isComposing) return false;
+  if (isImeComposing(e)) return false;
   if (shortcut === "enter") {
     return !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey;
   }

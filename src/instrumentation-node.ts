@@ -67,10 +67,30 @@ export const registerNode = (): void => {
   void import("./lib/server/feishu-cli").then((m) => m.injectFeishuCliPath());
   void import("./lib/server/sdk-platform-bin").then((m) => m.injectSdkRgPath());
 
-  // P0-02：启动幂等收紧密钥文件权限（config.json 0600 / mcp-oauth 0700+0600）
+  // P0-02：启动幂等收紧密钥文件权限（config.json 0600 / mcp-oauth 0700+0600）；
+  // hardenConfigFilePerms 同时清掉崩溃遗留的 config.json 原子写临时文件（含明文凭据、脱敏源不覆盖，K3-08）。
   // 失败只 warn、不阻断启动；日志不含文件内容
   void import("./lib/server/settings-fs").then((m) => m.hardenConfigFilePerms());
   void import("./lib/server/mcp-oauth").then((m) => m.hardenMcpOAuthPerms());
+
+  // GitLab token → process.env.FLOWSHIP_GITLAB_TOKEN（agent shell 继承、不再读 config.json，见 git-token-env.ts）。
+  // 放 instrumentation：agent 起前就要就位（重启后恢复的会话 / 飞书触发的会话不一定经设置保存或会话启动路径）。
+  // 只读 config.json 的 gitToken 一个字段；读失败（损坏等）不动 env；失败只 warn、不阻断启动。
+  void Promise.all([
+    import("./lib/server/settings-fs"),
+    import("./lib/server/git-token-env"),
+  ])
+    .then(async ([settingsFs, gitTokenEnv]) => {
+      gitTokenEnv.syncGitTokenEnvFromSettingsResult(
+        await settingsFs.readSettingsFile(),
+      );
+    })
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 同步 GitLab token 环境变量失败（不阻断）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
 
   // 非生产兜底（pnpm dev:web / 纯 node 起服）：没有 Electron 壳调 /api/boot-warmup，
   // 不兜的话 dev 下迁移/预置/组库同步/目录预热全丢。setImmediate 让出启动窗口，

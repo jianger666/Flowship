@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
+import { keyHashOf as apiKeyHashOf } from "@/lib/api-key-cache";
 import type { AgentProviderId, CustomProviderFormat, ModelOption } from "@/lib/types";
 
 export interface ModelsFetchInput {
@@ -42,16 +43,18 @@ export interface UseModelsResult {
   fetchModels: (input: ModelsFetchInput, options?: ModelsFetchOptions) => Promise<void>;
 }
 
-const CACHE_KEY = "flowship:models-cache:v5";
+const CACHE_KEY = "flowship:models-cache:v6";
+// v5 及以前的指纹含 key 前后 4 位明文（S13-15 隐私）：读缓存时顺手删掉旧条目
+const LEGACY_CACHE_KEYS = ["flowship:models-cache:v5"];
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-// 凭据摘要：缓存归属判定用（不存明文、本地工具够用的弱指纹）
+// 凭据摘要：缓存归属判定用（对完整 key 做哈希、不含任何 key 片段）
 const keyHashOf = (input: ModelsFetchInput): string => {
   const apiKey = input.apiKey ?? "";
   const fmt = input.format ?? "";
   const baseUrl = input.baseUrl ?? "";
   const provider = input.provider ?? "";
-  return `${provider}|${apiKey.length}:${apiKey.slice(0, 4)}:${apiKey.slice(-4)}|${baseUrl}|${fmt}`;
+  return `${provider}|${apiKeyHashOf(apiKey)}|${baseUrl}|${fmt}`;
 };
 
 interface ModelsCache {
@@ -62,6 +65,7 @@ interface ModelsCache {
 
 const readCache = (input: ModelsFetchInput): ModelOption[] | null => {
   try {
+    for (const legacy of LEGACY_CACHE_KEYS) window.localStorage.removeItem(legacy);
     const raw = window.localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const c = JSON.parse(raw) as ModelsCache;

@@ -15,6 +15,7 @@ import { ExternalLink } from "lucide-react";
 import { LoadingState } from "@/components/ui/loading-state";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { settingsUrl } from "@/lib/settings-link";
+import { safeHttpUrl } from "@/lib/workitem-link";
 
 interface Props {
   /** 二选一：直接给 id+project、或给工作项 URL（服务端本地 decode） */
@@ -63,7 +64,9 @@ const pickStr = (detail: Record<string, unknown>, keys: string[]): string | unde
   return undefined;
 };
 
-export const WorkitemDetail = ({ workItemId, projectKey, url }: Props) => {
+export const WorkitemDetail = ({ workItemId, projectKey, url: rawUrl }: Props) => {
+  // 外链只放行 http(s)（拒绝 javascript: / data:）；其它调用方（任务详情）传来的也一并兜住
+  const url = safeHttpUrl(rawUrl) || undefined;
   const [state, setState] = useState<FetchState>({ phase: "loading" });
 
   useEffect(() => {

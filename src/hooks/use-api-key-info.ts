@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
+import { isLegacyKeyHash, keyHashOf } from "@/lib/api-key-cache";
 import type { ApiKeyInfo } from "@/lib/types";
 
 export interface UseApiKeyInfoOptions {
@@ -31,10 +32,6 @@ export interface UseApiKeyInfoResult {
 const CACHE_KEY = "flowship:api-key-info-cache";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-// apiKey 摘要：缓存归属判定用（不存明文、本地工具够用的弱指纹）
-const keyHashOf = (apiKey: string): string =>
-  `${apiKey.length}:${apiKey.slice(0, 4)}:${apiKey.slice(-4)}`;
-
 interface InfoCache {
   keyHash: string;
   info: ApiKeyInfo;
@@ -46,6 +43,11 @@ const readCache = (apiKey: string): ApiKeyInfo | null => {
     const raw = window.localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const c = JSON.parse(raw) as InfoCache;
+    // 旧版把 key 前后 4 位明文写进了指纹：读到就清掉（S13-15 隐私）
+    if (isLegacyKeyHash(c.keyHash)) {
+      window.localStorage.removeItem(CACHE_KEY);
+      return null;
+    }
     if (c.keyHash !== keyHashOf(apiKey)) return null;
     if (Date.now() - c.ts > CACHE_TTL_MS) return null;
     return c.info ?? null;
@@ -69,6 +71,14 @@ const writeCache = (apiKey: string, info: ApiKeyInfo) => {
   }
 };
 
+const clearCache = () => {
+  try {
+    window.localStorage.removeItem(CACHE_KEY);
+  } catch {
+    // 隐私模式等失败不影响主流程
+  }
+};
+
 export const useApiKeyInfo = (): UseApiKeyInfoResult => {
   // Cursor.me 返回的账号信息（依赖有效 API key）
   const [info, setInfo] = useState<ApiKeyInfo | null>(null);
@@ -88,6 +98,8 @@ export const useApiKeyInfo = (): UseApiKeyInfoResult => {
 
     const trimmed = apiKey.trim();
     if (!trimmed) {
+      // 清空 key：账号信息块随之消失，缓存的姓名 / 邮箱也一并清掉
+      clearCache();
       setInfo(null);
       setError("");
       setLoading(false);
@@ -100,7 +112,14 @@ export const useApiKeyInfo = (): UseApiKeyInfoResult => {
     if (cached) {
       setInfo(cached);
       setError("");
+    } else {
+      // 没有这把 key 的缓存：上一把 key 的姓名 / 邮箱不能继续挂在新 key 下面等接口——
+      // 用户会误以为新 key 属于那个人（接口失败时才清掉就太晚了，成功前一直显示的是别人的账号）
+      setInfo(null);
     }
+    // 静默刷新不会走下面的 setLoading(true)，而上面的 abort 可能刚中止了一个非静默请求——
+    // 被中止的请求在 finally 里不会复位 loading（`!ctrl.signal.aborted` 守卫），这里补一次，否则转圈永远不停
+    if (silent) setLoading(false);
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;

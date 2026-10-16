@@ -18,7 +18,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Reorder, useDragControls } from "framer-motion";
-import { GripVertical, Loader2 } from "lucide-react";
+import { ChevronDown, ChevronUp, GripVertical, Loader2 } from "lucide-react";
 
 import {
   TeamActionViewDialog,
@@ -43,6 +43,7 @@ import {
   BUILTIN_ADVANCE_ACTIONS,
   DEFAULT_GROUP_ORDER,
   isBuiltinAdvanceAction,
+  moveKeyBy,
   normalizeCollapsedGroups,
   normalizeGroupOrder,
   partitionActionsByGroup,
@@ -118,6 +119,10 @@ interface RowProps {
   // 自定义 action 引用的 skill（缺失的灰显、提示推进时跳过）
   skills?: { name: string; missing: boolean }[];
   onToggleHidden: (visible: boolean) => void;
+  /** 键盘排序替代拖拽：组内上移 / 下移一位（边界处按钮禁用；S13-21） */
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  onMove: (delta: -1 | 1) => void;
   onDragEnd: () => void;
   /** 拖拽会话中 → 启用 layout 动画；否则关（防 mount 重放） */
   layoutEnabled: boolean;
@@ -175,6 +180,9 @@ const LayoutRow = ({
   knowledgeDisabled,
   skills,
   onToggleHidden,
+  canMoveUp,
+  canMoveDown,
+  onMove,
   onDragEnd,
   layoutEnabled,
   onDragSessionStart,
@@ -298,6 +306,33 @@ const LayoutRow = ({
       )}
       {/* 操作区常驻文字按钮 */}
       <div className="flex shrink-0 items-center gap-0.5">
+        {/* 键盘排序：上移 / 下移（拖拽手柄之外的替代入口）；data-move 供移动后恢复焦点 */}
+        <Tooltip content="上移">
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
+            aria-label={`上移 ${label}`}
+            data-move={`${value}:up`}
+            disabled={!canMoveUp}
+            onClick={() => onMove(-1)}
+          >
+            <ChevronUp className="size-3.5" />
+          </Button>
+        </Tooltip>
+        <Tooltip content="下移">
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
+            aria-label={`下移 ${label}`}
+            data-move={`${value}:down`}
+            disabled={!canMoveDown}
+            onClick={() => onMove(1)}
+          >
+            <ChevronDown className="size-3.5" />
+          </Button>
+        </Tooltip>
         {onConvertLegacy && (
           <Button
             size="sm"
@@ -379,6 +414,9 @@ const GroupSection = ({
   onGroupDragEnd,
   onToggleCollapsed,
   onActionReorder,
+  onMoveGroup,
+  canMoveGroupUp,
+  canMoveGroupDown,
   renderRow,
 }: {
   groupKey: ActionGroupKey;
@@ -390,7 +428,11 @@ const GroupSection = ({
   onGroupDragEnd: () => void;
   onToggleCollapsed: (on: boolean) => void;
   onActionReorder: (nextKeys: string[]) => void;
-  renderRow: (key: string) => ReactNode;
+  /** 键盘换组序（拖拽之外的替代） */
+  onMoveGroup: (delta: -1 | 1) => void;
+  canMoveGroupUp: boolean;
+  canMoveGroupDown: boolean;
+  renderRow: (key: string, index: number, total: number) => ReactNode;
 }) => {
   // 组头独立拖拽控制器——只手柄发起、不误触「默认折叠」开关
   const controls = useDragControls();
@@ -430,6 +472,32 @@ const GroupSection = ({
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
           {ACTION_GROUP_LABEL[groupKey]}
         </span>
+        <Tooltip content="上移分组">
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
+            aria-label={`上移分组 ${ACTION_GROUP_LABEL[groupKey]}`}
+            data-move={`group:${groupKey}:up`}
+            disabled={!canMoveGroupUp}
+            onClick={() => onMoveGroup(-1)}
+          >
+            <ChevronUp className="size-3.5" />
+          </Button>
+        </Tooltip>
+        <Tooltip content="下移分组">
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
+            aria-label={`下移分组 ${ACTION_GROUP_LABEL[groupKey]}`}
+            data-move={`group:${groupKey}:down`}
+            disabled={!canMoveGroupDown}
+            onClick={() => onMoveGroup(1)}
+          >
+            <ChevronDown className="size-3.5" />
+          </Button>
+        </Tooltip>
         <span className="shrink-0 tabular-nums text-xs text-muted-foreground">
           {keys.length}
         </span>
@@ -458,7 +526,7 @@ const GroupSection = ({
               onReorder={onActionReorder}
               className="grid gap-1.5"
             >
-              {keys.map((key) => renderRow(key))}
+              {keys.map((key, i) => renderRow(key, i, keys.length))}
             </Reorder.Group>
           </div>
         </div>
@@ -647,6 +715,57 @@ export const ActionLayoutConfig = ({
     setOrder(flatFromBuckets(groupOrderRef.current, buckets));
   };
 
+  // 键盘移动后要把焦点还给「同方向」按钮（行换位会让按钮重挂 / 失焦）；边界处按钮已禁用则落到另一向
+  const pendingMoveFocusRef = useRef<string | null>(null);
+  useEffect(() => {
+    const target = pendingMoveFocusRef.current;
+    if (!target) return;
+    pendingMoveFocusRef.current = null;
+    const q = (id: string) =>
+      document.querySelector<HTMLButtonElement>(
+        `[data-move="${CSS.escape(id)}"]`,
+      );
+    const btn = q(target);
+    if (btn && !btn.disabled) {
+      btn.focus();
+      return;
+    }
+    const sibling = target.endsWith(":up")
+      ? target.replace(/:up$/, ":down")
+      : target.replace(/:down$/, ":up");
+    q(sibling)?.focus();
+  }, [order, groupOrderLocal]);
+
+  /** 键盘上移 / 下移一个 action（组内）：立刻更新本地并落盘 */
+  const handleMoveAction = (
+    groupKey: ActionGroupKey,
+    key: string,
+    delta: -1 | 1,
+  ) => {
+    const buckets = bucketsFromFlat(orderRef.current);
+    const moved = moveKeyBy(buckets[groupKey], key, delta);
+    if (moved === buckets[groupKey]) return;
+    buckets[groupKey] = moved;
+    const nextOrder = flatFromBuckets(groupOrderRef.current, buckets);
+    pendingMoveFocusRef.current = `${key}:${delta < 0 ? "up" : "down"}`;
+    setOrder(nextOrder);
+    persist(nextOrder, layout.hidden);
+  };
+
+  /** 键盘上移 / 下移一个分组 */
+  const handleMoveGroup = (groupKey: ActionGroupKey, delta: -1 | 1) => {
+    const nextGroups = moveKeyBy(groupOrderRef.current, groupKey, delta);
+    if (nextGroups === groupOrderRef.current) return;
+    const nextOrder = flatFromBuckets(
+      nextGroups,
+      bucketsFromFlat(orderRef.current),
+    );
+    pendingMoveFocusRef.current = `group:${groupKey}:${delta < 0 ? "up" : "down"}`;
+    setGroupOrderLocal(nextGroups);
+    setOrder(nextOrder);
+    persist(nextOrder, layout.hidden, { groupOrder: nextGroups });
+  };
+
   const toggleHidden = (key: string, visible: boolean) => {
     const set = new Set(layout.hidden);
     if (visible) set.delete(key);
@@ -663,7 +782,7 @@ export const ActionLayoutConfig = ({
     }
   };
 
-  const renderRow = (key: string) => {
+  const renderRow = (key: string, index: number, total: number) => {
     const def = customById.get(key);
     // 旧格式（playbook 写正文）已停用：不可编辑 / 导出、只留转建 / 查看原内容 + 删除
     const isLegacy = !!def?.legacyPlaybook;
@@ -744,6 +863,11 @@ export const ActionLayoutConfig = ({
             : undefined
         }
         onToggleHidden={(visible) => toggleHidden(key, visible)}
+        canMoveUp={index > 0}
+        canMoveDown={index < total - 1}
+        onMove={(delta) =>
+          handleMoveAction(resolveActionGroup(key, customById), key, delta)
+        }
         onDragEnd={handleActionDragEnd}
         onEdit={def && !isLegacy && !isTeam ? () => onEdit(def) : undefined}
         onDelete={
@@ -776,7 +900,7 @@ export const ActionLayoutConfig = ({
         onReorder={handleGroupReorder}
         className="grid gap-3"
       >
-        {sections.map((section) => (
+        {sections.map((section, sectionIndex) => (
           <GroupSection
             key={section.key}
             groupKey={section.key}
@@ -792,6 +916,9 @@ export const ActionLayoutConfig = ({
             onActionReorder={(nextKeys) =>
               handleActionReorder(section.key, nextKeys)
             }
+            onMoveGroup={(delta) => handleMoveGroup(section.key, delta)}
+            canMoveGroupUp={sectionIndex > 0}
+            canMoveGroupDown={sectionIndex < sections.length - 1}
             renderRow={renderRow}
           />
         ))}
