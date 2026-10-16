@@ -228,6 +228,12 @@ describe("ownership R34 TerminalCleanupCoordinator (R33-2/R33-3)", () => {
       setResourceJoinTimeoutMsForTest(200);
 
       const removeSpy = vi.spyOn(taskWorktrees, "removeTaskWorktrees");
+      // 第十轮：靠 finalizeTask 在 join 分支打的那行日志确认「第二次 finalize 真的走到了加入在飞 cleanup」（调用穿透、不吞日志）
+      const logSpy = vi.spyOn(console, "log");
+      const joinLogged = (): boolean =>
+        logSpy.mock.calls.some((c) =>
+          String(c[0]).includes(`join 不重入 remove task=${id}`),
+        );
 
       const hang = installHangingFailpoint("finalize.beforeDeferredRemove");
       const pFin1 = finalizeTask(id, "abandoned");
@@ -243,6 +249,20 @@ describe("ownership R34 TerminalCleanupCoordinator (R33-2/R33-3)", () => {
       expect(getTerminalCleanupPhase(id)).toBe("waiting");
       expect(removeSpy).toHaveBeenCalledTimes(0);
 
+      // 第十轮：放行之前先等到第二次 finalize **确实走到了 join 分支**。
+      // 此前这里同步断言完就立刻 release：第二次 finalize 走到 acquire 之前要先过好几个异步步骤（等任务停止 / 写 meta / 停预览，都是文件 IO），
+      // 高负载下第一次 cleanup 的真实 git 删除与 release 可能在它到达之前就全部做完——它就找不到在飞的 cleanup、自己再起一次删除，
+      // 计数变 2（第九轮全量跑里红过一次，单跑 5 次全过）。第一次 cleanup 完成之后才到的第二次 finalize 本来就该自己再跑一次幂等清理，
+      // 对产品无害；这条断言要证明的是「join 期间不重入」，所以必须先确保真的 join 上了。
+      const joinDeadline = Date.now() + 8_000;
+      while (!joinLogged() && Date.now() < joinDeadline) {
+        await sleep(20);
+      }
+      expect(joinLogged(), "第二次 finalize 应走到「已有 terminal cleanup 在飞、join」分支").toBe(true);
+      // join 之后、放行之前：仍挂在 waiting、仍没有 remove
+      expect(getTerminalCleanupPhase(id)).toBe("waiting");
+      expect(removeSpy).toHaveBeenCalledTimes(0);
+
       hang.release();
       await raceExpectSettled(pFin2, 10_000);
       const deadline = Date.now() + 8_000;
@@ -252,6 +272,7 @@ describe("ownership R34 TerminalCleanupCoordinator (R33-2/R33-3)", () => {
       expect(hasTerminalCleanup(id)).toBe(false);
       expect(removeSpy).toHaveBeenCalledTimes(1);
       removeSpy.mockRestore();
+      logSpy.mockRestore();
     },
     40_000,
   );
@@ -288,9 +309,22 @@ describe("ownership R34 TerminalCleanupCoordinator (R33-2/R33-3)", () => {
 
       // 第二次 finalize 启动——应挂在 join 上（holder 未 release 前不 settle）
       let fin2Settled = false;
+      // 第十轮：同 ①，先确认第二次 finalize 真的走到了 join 分支再断言（否则高负载下「sleep 200ms 后还没 settle」
+      // 可能只是它还没走到 acquire、并没有 join 上，这条用例就不再证明它名字里说的事）
+      const logSpy = vi.spyOn(console, "log");
       const pFin2 = finalizeTask(id, "abandoned").then(() => {
         fin2Settled = true;
       });
+      const joinDeadline = Date.now() + 8_000;
+      while (
+        !logSpy.mock.calls.some((c) =>
+          String(c[0]).includes(`join 不重入 remove task=${id}`),
+        ) &&
+        Date.now() < joinDeadline
+      ) {
+        await sleep(20);
+      }
+      logSpy.mockRestore();
       await sleep(200);
       expect(fin2Settled).toBe(false);
       // 关键：phase 仍是 executing——第二 holder 不得降级回 waiting、不得 release
