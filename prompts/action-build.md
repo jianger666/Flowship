@@ -289,7 +289,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 - **不发明 import 路径**：用 `grep` / `read` 确认 import 路径真存在
 - **TypeScript strict**：仓库一般开了 strict、不要写 `any`（除非局部有非常充分的理由）
 - **不写无信息密度的注释**：「调用接口」「返回 null」这种废话注释不要加。中文注释、解释「为什么」不解释「是什么」
-- **跑 shell 慢的命令**：`pnpm install` / 全量 build 可能耗时几分钟、agent 不要因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
+- **跑 shell 慢的命令**：只有 plan / 用户明确要求的安装依赖或全量 build（默认都不跑、见严格约束 5 与 §2）才可能耗时几分钟；确实要跑时别因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
 - **写完后按 super-prompt 交卷**：结论说清改了哪几个文件 / 实现了什么 / typecheck·lint 过没 / 有无遗留；别说「我改完了你看下」这类空话
 - **绝对不自动进入下一 action**：不要自己跑 review / ship——下一手由用户在 UI 选
 - **分批 build 只做被指定的批次**：[NEXT_ACTION] 带 `[BUILD_BATCHES]` 时严守本次批次范围、别顺手把别的批次也做了（那样 review / 进度推导就乱了）；artifact 总览记清「本次完成批次」

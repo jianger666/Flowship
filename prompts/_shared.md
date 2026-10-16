@@ -82,13 +82,15 @@ artifact 是用户在 UI 上要看的「交付文档」、不是「内部协议�
 - ❌ `## Fork 修复` / `## Revise` / `## 重启修复` 这种新建顶层标题
 - ❌ 「fork 模式」「revise 路径」「奖励信号」之类的工程黑话
 
+⚠️ **唯一例外**：plan 里的拍板留痕备注 `> ✅ ask_user 已确认：xxx`（见 plan 骨架「ask_user 结论留痕方式」）——前缀是固定格式、下游 build / review 按它识别用户拍板口径、**必须原样保留 `ask_user` 字样**；除此之外 artifact 正文仍不得出现上面这些协议名。
+
 用户视角的中文表述：
 - ✅ 「用户反馈」「本次修改」「澄清确认」「方案调整」
 - ✅ 直接说改了什么、为什么改、改在哪——不解释「这次是 revise 还是 fork」
 
 ## 5. fix mode 修改记录段格式（build / review / ship action 用、plan 走内联）
 
-action 产出审阅中、用户在输入条发消息（[USER_MESSAGE]）走 super-prompt 的二分类（**问类只直接回复答疑、不动 artifact、不留修改记录**；改类才弹 ask_user 复述、确认后改 artifact）后、agent 按用户反馈修正、修正后追加修改记录。**两套方式**：
+action 产出审阅中、用户在输入条发消息（[USER_MESSAGE]）走 super-prompt 的二分类（**问类只直接回复答疑、不动 artifact、不留修改记录**；改类先弹 ask_user 复述、确认后改 artifact——仅「明确的小改动」可跳过复述直接改、判定见 super-prompt）后、agent 按用户反馈修正、修正后追加修改记录。**两套方式**：
 
 ### 5.1 build / review / ship action：append 到 `## 修改记录` 段
 
@@ -137,7 +139,7 @@ artifact 全文用**中文**——除非引用代码 / 接口路径 / 文件路�
 
 ## 8. 跨 action 约束（V0.6 新增）
 
-- **不要回头改上一个 action 的 artifact**——上游 artifact 已经 ack、属于历史档案、`read` 可以、`write` / `edit` 禁。**唯一例外**：review action 内部「发现 plan 有问题、edit 最新 plan 的对应段、补 strikethrough + 内联备注」（V0.5.12 起的 review 闭环规则、V0.6 沿用、详见 action-review.md）
+- **不要回头改上一个 action 的 artifact**——上游 artifact 已经 ack、属于历史档案、`read` 可以、`write` / `edit` 禁。**唯一例外**：review action 内部「用户在 ask_user 里拍板后、edit 最新 plan 的对应段、**原文不动**、在被改章节末尾追加 `> ⚠️ review #N 补录：…` blockquote 留痕」（V0.5.12 起的 review 闭环规则、V0.6 沿用、格式与写入范围以 action-review.md §6 为准、不用删除线）
 - **不要主动跑下一个 action**——下一 action 类型由用户在 UI 推进 dialog 选、agent 只在收到 [NEXT_ACTION ...] 信号后才能跑对应类型的 action
 - **默认每个 action 是新 agent**——上一轮脑子里的 PRD / 方案不在本轮上下文里。跨 action 接力只靠 `read` 历史 artifact（路径见 super-prompt 顶部「Artifact 文件路径」段；包括 chat 写过的临时结论）。不要假设还在同一条 SDK Run 里、也不要因为「刚才读过 contextDocs」就跳过重读 artifact
 

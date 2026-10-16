@@ -52,7 +52,7 @@
 
 1. **允许写入的文件清单**：
    - `actions/<n>-review.md`（即本 action 的 artifact）—— 主产物、自由写
-   - **最新 plan artifact**（`actions/<plan_n>-plan.md`）—— **只在执行步骤 §6 ask_user 用户答完 b/c 后允许 edit**、且只动「描述 / 注解」段、不动 §5 task 拆分骨架 / 文件清单 / 决策标题。除此之外 plan 全程只读
+   - **最新 plan artifact**（`actions/<plan_n>-plan.md`）—— **只在执行步骤 §6.2 按用户 ask_user 答案落地时允许 edit**（实现偏差答 b / 未完成 task 答 c / 飞书未覆盖项答 a、b）、只做「追加注解 / blockquote 留痕」或「§5 末尾追加 follow-up task」、不改既有 task 的拆分骨架 / 文件清单 / 决策标题、不动原描述。除此之外 plan 全程只读
    - 其它任何文件（`src/**` / build artifact / meta.json 等）一律只读
 2. **不动 .git / 不动业务代码** —— 如果 review 发现 build 有问题、不要自己改、走 §6 ask_user 让用户决策（详见下面「差异分流」）
 3. **不调动作类 MCP**：不调飞书 MCP 改 story、不调 GitLab MCP 提 MR、不调任何让外部状态变化的工具。可读类 MCP（拉飞书原文、看 swagger）随便用
@@ -374,7 +374,7 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 - **跟飞书 story 原始需求一致性**：高 / 中 / 低（附理由）
 - **build 校验状态**：lint=<pass/fail>、typecheck=<pass/fail>（搬最新 build artifact「全量校验」）
 - **bug 复审结论**：🔴 阻塞 <N> 条 / 🟡 建议 <N> 条（一条都没有就写「未发现高置信 bug」、不要硬凑）
-- **基底 commit**：`git rev-parse HEAD` 拿到的真值（runner 后置检查会比对、不要编）
+- **基底 commit**：`git rev-parse HEAD` 拿到的真值（runner 后置检查会比对、不要编；**必填**，缺失会判 ❌；多个可写 git 仓时在该条目下逐仓各列一行 HEAD 真值）
 - **建议结论**：
   - ✅ 可交付（无真偏差 / 无未完成 task、或仅有「已授权变更」、**且无 🔴 阻塞 bug**）—— 下一步可走 ship action
   - ⚠️ 有真偏差需用户决策（有「实现偏差」/「未完成 task」段、即无据可依的跑偏）—— 推进前先看决策；**注：「已授权变更」段不算**（用户已在某轮 build 拍板、无需再决策）
@@ -384,7 +384,7 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 ## plan 拍板口径复核
 
 > ⚠️ 本段**只列「plan 阶段」用户拍板的口径**——即最新 plan artifact 正文里 plan agent 内联的 `> ✅ ask_user 已确认：xxx` / `> ✅ 已确认：xxx` 备注（plan ack 之前用户拍板的）。
-> ⛔ **不要列**：review ack 补录的项（`> ⚠️ review ack 补录：xxx`、`> ✅ review 已确认：xxx`）——那是 review 阶段拍板、归「§ 用户决策」段、不归本段。
+> ⛔ **不要列**：review 阶段补录的项（`> ⚠️ review #N 补录：xxx`、`> ✅ review 已确认：xxx`）——那是 review 阶段拍板、归「§ 用户决策」段、不归本段。
 > 没有 plan 内联 ✅ 备注（plan 阶段没用 ask_user 或备注被删了）时整段省略、不写空标题。
 
 | plan 拍板口径 | plan 位置 | build 实施一致性 | 备注 |
@@ -527,7 +527,7 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 
 ## 几条要点
 
-- **写入限制**：只能写 review artifact + 在 §6 ask_user 答完 b/c 后 edit 最新 plan artifact（且只动描述 / 注解）、其它一切只读。违反 = 推进时按反馈修正
+- **写入限制**：只能写 review artifact + 在 §6.2 按用户答案落地时 edit 最新 plan artifact（只追加注解 / follow-up、不动原描述）、其它一切只读。违反 = 推进时按反馈修正
 - **不调动作类 MCP**：不提 MR / 不改飞书 story 状态、ship action 才干这事
 - **不输出交付信息**：commit msg / MR body / 自测 checklist 都在 ship action 里产、review 不掺合（V0.6 改、V0.5 review 兼了 ship 的活、现在拆开）
 - **拿确定性产物做差值**：git diff 是事实、**累积意图**（最新 plan + 各轮 build 记录的用户指令 / 产品反馈）是约束、两者对照 = 结构化差异表。能追溯到用户指令的改动归「已授权变更」（不双重确认）、无据可依的才是真偏差（V0.6.10）

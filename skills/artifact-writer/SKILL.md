@@ -78,7 +78,7 @@ args: {
 
 ## 收到用户 revise（改类反馈）时的写法
 
-用户改类反馈走 ask_user 复述确认（主 prompt 里详述）。**确认理解后**改 artifact 时：
+用户改类反馈先走 ask_user 复述确认（仅「明确的小改动」可跳过复述直接改，判定见主 prompt）。**确认理解后**（或属于可跳过复述的小改动）改 artifact 时：
 
 - **改局部段落** → 用 `edit` 工具 `{ path, oldText, newText }`、不是 `write` 整文件覆盖（保留 git diff 干净）
 - **结构性大改** → 用 `write` 整文件覆盖（一次写完）
