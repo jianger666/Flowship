@@ -1480,8 +1480,8 @@ const rejectLeadingOption = (bin: string, t: string, why: string): string => {
  *    （第九轮 N9-01 复核实测：不只脚本 / 预加载——以软链做路径前缀的 `cat` / `node` / `bash` 操作数同样 ok:true。
  *    所以「偏严不偏松」只对 ① 成立，对软链不成立：软链恰恰是放行方向。接线前要改成对**所有路径操作数**做 realpath 再钳。）
  *
- * **接线前必做清单（第九轮复核，全部潜伏、当前没有调用方传 `readOnly: true`；期限：下一个发版 tag 前仍无调用方就整段删，
- * 连同 r8 的守卫测试与预言机 fuzz，不留半截）**：
+ * **接线前必做清单（第九轮复核，全部潜伏、当前没有调用方传 `readOnly: true`；期限：原定 v1.9.32 tag 前，该版发版时仍无调用方、
+ * 顺延一次——v1.9.33 tag 前仍无调用方就整段删，连同 r8 的守卫测试与预言机 fuzz，不留半截，不再顺延）**：
  *  - N9-01：路径操作数 realpath 后再钳（见上）；
  *  - N9-02：`git show --textconv`、`git diff --ext-diff` 会调 git 配置里的外部程序，只读模式下 agent 改不了配置所以当前无法利用，
  *    接线时把这两个选项加进 git 的拒绝名单；
