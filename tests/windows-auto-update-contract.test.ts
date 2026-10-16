@@ -123,10 +123,14 @@ describe("Windows 安装诊断日志 + 静默更新预检（v1.9.30）", () => {
     for (const msg of messages) {
       expect(msg, `日志文案含非 ASCII：${msg}`).toMatch(/^[\x20-\x7e]*$/);
       // 变量白名单：版本 / 阈值常量 / $0-$9 寄存器；其余（$INSTDIR $TEMP $APPDATA …）一律可能带中文路径
+      // MODE = flowshipForceCleanOld 的宏参数（编译期字面量 "broken" / "failed"，不是运行时变量）
       for (const v of msg.matchAll(/\$\{(\w+)\}|\$(\w+)/g)) {
         const name = (v[1] ?? v[2]) as string;
         const ok =
-          name === "VERSION" || name === "FLOWSHIP_MIN_TEMP_FREE_MB" || /^[0-9]$/.test(name);
+          name === "VERSION" ||
+          name === "FLOWSHIP_MIN_TEMP_FREE_MB" ||
+          name === "MODE" ||
+          /^[0-9]$/.test(name);
         expect(ok, `日志 "${msg}" 引用了 $${name}：可能是含中文的完整路径`).toBe(true);
       }
     }
@@ -418,5 +422,164 @@ describe("Windows 静默更新 Temp 兜底（v1.9.13、D 盘用户更新完人�
 
   it("静默安装前发系统通知打预防针（黑屏几分钟别杀进程）", () => {
     expect(main).toContain("正在安装更新");
+  });
+});
+
+describe("Windows 更新包 manifest 验签接线（R9-01、fail-closed）", () => {
+  // installWinUpdate 的函数体：从声明到 quitAndInstall
+  const installStart = main.indexOf("const installWinUpdate = async");
+  const installEnd = main.indexOf("winAutoUpdater.quitAndInstall(true, true)");
+  const installFn = main.slice(installStart, installEnd);
+  // update-downloaded 事件处理器：到下一个 error 监听之前
+  const evStart = main.indexOf('winAutoUpdater.on("update-downloaded"');
+  const evEnd = main.indexOf('winAutoUpdater.on("error"', evStart);
+  const evHandler = main.slice(evStart, evEnd);
+  // 统一拒绝处置函数
+  const rejStart = main.indexOf("const rejectUnverifiedWinUpdate = async");
+  const rejFn = main.slice(rejStart, main.indexOf("\n};", rejStart));
+
+  it("installWinUpdate：安装前验签，位于门禁之后、置 quitting / 通知 / 墓碑 / quitAndInstall 之前", () => {
+    expect(installStart).toBeGreaterThanOrEqual(0);
+    expect(installEnd).toBeGreaterThan(installStart);
+    const markerGate = installFn.indexOf("hasSilentUpdateMarker(exeDir");
+    const verify = installFn.indexOf("await verifyWinPendingInstaller(pendingInstaller)");
+    const spaceGate = installFn.indexOf("checkUpdateTempSpace(os.tmpdir(), statfsSync)");
+    const notify = installFn.indexOf("new Notification(");
+    const quit = installFn.search(/^\s*quitting = true;/m);
+    const tombstone = installFn.indexOf("WIN_UPDATE_ATTEMPT_FILE");
+    for (const [name, i] of Object.entries({ markerGate, verify, spaceGate, notify, quit, tombstone })) {
+      expect(i, `installWinUpdate 缺少 ${name}`).toBeGreaterThanOrEqual(0);
+    }
+    expect(verify).toBeGreaterThan(markerGate);
+    expect(verify).toBeLessThan(spaceGate);
+    expect(verify).toBeLessThan(notify);
+    expect(verify).toBeLessThan(quit);
+    expect(verify).toBeLessThan(tombstone);
+  });
+
+  it("installWinUpdate：验签失败 = 统一拒绝处置后 return，不置 quitting、不进 quitAndInstall", () => {
+    const verify = installFn.indexOf("await verifyWinPendingInstaller(pendingInstaller)");
+    const spaceGate = installFn.indexOf("checkUpdateTempSpace(os.tmpdir(), statfsSync)");
+    // 验签门禁本体：从验签调用到下一道门禁（磁盘空间预检）之前
+    const rejectBranch = installFn.slice(verify, spaceGate);
+    expect(rejectBranch).toContain("} catch (err) {");
+    expect(rejectBranch).toContain("await rejectUnverifiedWinUpdate({");
+    expect(rejectBranch).toMatch(/return;\s*\}/);
+    // 拒绝分支里不能出现置位语句（注释提到不算）
+    expect(rejectBranch).not.toMatch(/^\s*quitting = true;/m);
+    expect(rejectBranch).not.toContain("quitAndInstall");
+    // installWinUpdate 自己不再弹框 / 开页（统一收口在 rejectUnverifiedWinUpdate、避免连弹两次）
+    expect(rejectBranch).not.toContain("dialog.showErrorBox");
+    expect(rejectBranch).not.toContain("openExternal");
+  });
+
+  it("rejectUnverifiedWinUpdate：删缓存 exe → 回 available 带错误 → 弹一次框 + 开发布页；永不置 quitting", () => {
+    expect(rejStart).toBeGreaterThanOrEqual(0);
+    const rm = rejFn.indexOf("await fs.rm(file, { force: true })");
+    const state = rejFn.indexOf('setUpdateState({ phase: "available"');
+    const box = rejFn.indexOf("dialog.showErrorBox(");
+    const open = rejFn.indexOf("void shell.openExternal(RELEASE_LATEST_URL)");
+    for (const [name, i] of Object.entries({ rm, state, box, open })) {
+      expect(i, `rejectUnverifiedWinUpdate 缺少 ${name}`).toBeGreaterThanOrEqual(0);
+    }
+    expect(rm).toBeLessThan(state);
+    expect(state).toBeLessThan(box);
+    expect(box).toBeLessThan(open);
+    expect(rejFn.match(/dialog\.showErrorBox\(/g)).toHaveLength(1);
+    expect(rejFn).toContain("winPendingInstaller = null");
+    expect(rejFn).not.toMatch(/^\s*quitting = true;/m);
+    // R6-5：error 文案取纯函数 buildVerifyRejectionNotice 的 stateError（= reason；mac 的 downloadAndStageMacUpdate 同一来源）
+    expect(rejFn).toContain("error: notice.stateError");
+  });
+
+  it("update-downloaded：先验签再置 ready；验签期间保持 downloading；失败回 available 不进 ready", () => {
+    // M3-05：「验签 → 通过则置 ready」抽成 verifyAndMarkWinReady，update-downloaded 事件与点徽标重验共用，
+    // 约束不变、只是挪了位置：事件里只负责置 downloading「忙」态并交给共用函数，ready 只能出现在共用函数的验签成功之后
+    expect(evStart).toBeGreaterThanOrEqual(0);
+    expect(evEnd).toBeGreaterThan(evStart);
+    const hold = evHandler.indexOf('setUpdateState({ phase: "downloading"');
+    const mark = evHandler.indexOf("verifyAndMarkWinReady({");
+    for (const [name, i] of Object.entries({ hold, mark })) {
+      expect(i, `update-downloaded 缺少 ${name}`).toBeGreaterThanOrEqual(0);
+    }
+    expect(hold).toBeLessThan(mark);
+    // 事件处理自己既不能验签也不能置 ready（绕过共用函数 = 绕过 fail-closed 次序）
+    expect(evHandler).not.toContain("verifyWinPendingInstaller(");
+    expect(evHandler).not.toContain('phase: "ready"');
+
+    const markStart = main.indexOf("const verifyAndMarkWinReady = async");
+    expect(markStart).toBeGreaterThanOrEqual(0);
+    const markFn = main.slice(markStart, main.indexOf("\n};", markStart));
+    const verify = markFn.indexOf("await verifyWinPendingInstaller(pending)");
+    const reject = markFn.indexOf("await rejectUnverifiedWinUpdate({");
+    const ready = markFn.indexOf('setUpdateState({ phase: "ready"');
+    for (const [name, i] of Object.entries({ verify, reject, ready })) {
+      expect(i, `verifyAndMarkWinReady 缺少 ${name}`).toBeGreaterThanOrEqual(0);
+    }
+    expect(verify).toBeLessThan(ready);
+    // 失败分支在置 ready 之前就 return 了：ready 只出现这一次、且只在验签成功之后
+    expect(reject).toBeLessThan(ready);
+    expect(markFn.slice(reject, ready)).toContain("return false;");
+    expect(markFn.match(/phase: "ready"/g)).toHaveLength(1);
+    // 只在没被别处改动时置 ready（验签期间被 error 事件打回 available 就别凭空冒出 ready）
+    expect(markFn).toContain('if (updateState.phase === "downloading") {');
+    // 共用函数里不能无条件置 ready
+    expect(markFn.slice(0, verify)).not.toContain('phase: "ready"');
+  });
+
+  it("manifest 查找键取自 latest.yml（pickWinInstallerAssetName），不取 downloadedFile 的本地文件名", () => {
+    expect(evHandler).toContain("assetName: pickWinInstallerAssetName(info)");
+    expect(evHandler).not.toMatch(/basename\(\s*info/);
+    expect(evHandler).toContain("file: info?.downloadedFile");
+    // 版本号不可信：必须三段数字才会被拿去拼 manifest URL。
+    // F1-02：门禁本体（file / assetName → 版本号 → 库登记交叉校验 → 验签）已抽到 win-pending-verify.mjs，
+    // 行为由 update-manifest-win-pending.test.ts 真调用覆盖；这里只守「壳里仍委托给它、并把验签实现注入进去」
+    // + 模块里的关键字面没被删（grep 只是补充，不再是唯一的保障）
+    const verifyFn = main.slice(
+      main.indexOf("const verifyWinPendingInstaller = async"),
+      main.indexOf("const rejectUnverifiedWinUpdate = async"),
+    );
+    expect(main).toContain('from "./win-pending-verify.mjs"');
+    expect(verifyFn).toContain("await verifyWinPendingInstallerWith(pending, {");
+    expect(verifyFn).toContain("verifyDownloadedUpdate,");
+    expect(verifyFn).toContain("sameWinPath,");
+    expect(verifyFn).toContain("winAutoUpdater?.downloadedUpdateHelper?.file");
+    const gate = read("electron-app/win-pending-verify.mjs");
+    expect(gate).toContain("/^\\d+\\.\\d+\\.\\d+$/");
+    expect(gate).toContain("await verifyDownloadedUpdate(pending.version, pending.file, pending.assetName)");
+  });
+
+  it("installUpdateNow：等事件里的验签出结果、验签失败（phase ≠ ready）不再进安装；安装 await 持锁防双击并发", () => {
+    const start = main.indexOf("const installUpdateNow = async");
+    const end = main.indexOf("const fetchLatestVersion = async");
+    const fn = main.slice(start, end);
+    const reset = fn.indexOf("winDownloadedVerifyTask = null;");
+    const download = fn.indexOf("await updater.downloadUpdate()");
+    const waitVerify = fn.indexOf("await winDownloadedVerifyTask;");
+    const notReady = fn.indexOf('if (updateState.phase !== "ready") {');
+    const install = fn.indexOf("await runInstallWinUpdate(updateReadyVersion);", notReady);
+    for (const [name, i] of Object.entries({ reset, download, waitVerify, notReady, install })) {
+      expect(i, `installUpdateNow 缺少 ${name}`).toBeGreaterThanOrEqual(0);
+    }
+    expect(reset).toBeLessThan(download);
+    expect(download).toBeLessThan(waitVerify);
+    expect(waitVerify).toBeLessThan(notReady);
+    expect(notReady).toBeLessThan(install);
+    // ready 态直接装的分支也是 await（持有 installInFlight 锁）、没有 fire-and-forget 的 installWinUpdate 调用
+    expect(fn.match(/await runInstallWinUpdate\(updateReadyVersion\)/g)).toHaveLength(2);
+    expect(fn).not.toMatch(/^\s*installWinUpdate\(/m);
+    // 保留原有「下载中 / 安装中忽略」
+    expect(fn).toContain('updateState.phase === "downloading" || updateState.phase === "installing"');
+  });
+
+  it("兼容性在注释里写清：旧壳不验签行为不变；新壳对缺 manifest / 缺 exe 条目一律拒绝", () => {
+    const note = main.slice(
+      main.indexOf("// ---------- Windows 更新包验签（R9-01"),
+      main.indexOf("let winPendingInstaller"),
+    );
+    expect(note).toContain("旧壳");
+    expect(note).toContain("行为不变");
+    expect(note).toContain("没有 manifest / manifest 里没有 exe 条目");
+    expect(note).toContain("一律拒绝自动安装");
   });
 });

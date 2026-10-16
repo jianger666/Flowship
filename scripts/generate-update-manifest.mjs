@@ -1,17 +1,24 @@
 #!/usr/bin/env node
 /**
- * 生成签名的更新 manifest（CR-02、CI 发版链用）
+ * 生成签名的更新 manifest（CR-02 起、R9-01 扩到 Windows；CI 发版链用）
  *
  * 用法：node scripts/generate-update-manifest.mjs <version> <asset 文件...>
+ *   - asset = 两枚 mac dmg（arm64 + x64）+ 一枚 Windows exe（本脚本不挑扩展名、签什么由调用方
+ *     release.yml finalize 决定并硬校验「恰好 2 dmg + 1 exe」）
  *   - 对每个 asset 算 SHA-256 + size、拼 manifest payload
  *   - 用 env `UPDATE_MANIFEST_PRIVATE_KEY`（Ed25519 私钥 PEM、GitHub secret）签名
  *   - 产出 `update-manifest.json`（CI 随后传到同 tag release）
  *   - **secret 未配置 / 签名失败 → exit 1**（fail-closed、不发残缺 / 无验签版）
  *
+ * 为什么 exe 也要进来：mac 包没有 Apple 签名、Windows exe 也没有代码签名证书，
+ * 两个平台的安装包真实性都只能靠这份签名清单自证；否则 Windows 走 electron-updater 只信
+ * latest.yml 里的 sha512、谁能改 GitHub release 谁就能推恶意 exe。
+ *
  * manifest 结构（签名覆盖 version + files、字段顺序即 JSON.stringify 顺序、验签方必须同序重建）：
  *   { version, files: [{ name, size, sha256 }], signature: base64(Ed25519(payload)) }
  *
- * 壳侧验证见 electron-app/main.js 的 verifyDownloadedUpdate；
+ * 壳侧验证见 electron-app/update-manifest-verify.mjs（纯函数）与 electron-app/main.js 的
+ * verifyDownloadedUpdate（IO）；mac 暂存链路与 Windows 下载后 / 安装前共用同一套；
  * 公钥单一来源：electron-app/update-manifest-public-key.pem
  */
 import { createHash, createPrivateKey, sign } from "node:crypto";
@@ -35,7 +42,7 @@ if (!privateKeyPem) {
   process.exit(1);
 }
 
-// 流式算 SHA-256（dmg 100MB+、不整读进内存）
+// 流式算 SHA-256（dmg / exe 100MB+、不整读进内存）
 const sha256File = (file) =>
   new Promise((resolve, reject) => {
     const hash = createHash("sha256");

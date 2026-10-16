@@ -28,7 +28,7 @@ import {
   Tray,
 } from "electron";
 import { spawn, execFile, execFileSync } from "node:child_process";
-import { createHash, createPublicKey, verify } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   promises as fs,
   mkdirSync,
@@ -56,6 +56,38 @@ import {
   findInstallerAbort,
   hasSilentUpdateMarker,
 } from "./win-update-guard.mjs";
+// 更新 manifest 验签的纯函数部分（mac dmg / Windows exe 共用、可用真实密钥对单测）：./update-manifest-verify.mjs。
+// IO（读公钥 / 取 manifest / 实测 size 与 SHA-256）仍在本文件的 verifyDownloadedUpdate。
+import {
+  UpdateVerifyUnavailableError,
+  buildGenericUpdateFailureNotice,
+  buildVerifyRejectionNotice,
+  fetchUpdateManifest,
+  findSignedManifestEntry,
+  isVerifyFailure,
+  pickWinInstallerAssetName,
+  verifyManifestEntry,
+} from "./update-manifest-verify.mjs";
+// Windows 待装 exe 的安装前验签门禁（依赖注入的纯函数、可真调用单测）：./win-pending-verify.mjs
+import { verifyWinPendingInstallerWith } from "./win-pending-verify.mjs";
+// mac 自动暂存失败后的重试策略（确定性失败永久跳过、其余一律按时间退避、连续 3 次提示一次、同版本「会白下 dmg 的失败」累计 3 次后轮询放弃自动暂存（累计 ≠ 严格连续：成功暂存 / 换版本才清零）；
+// 纯函数、有单测）：./update-verify-retry.mjs
+import {
+  buildRepeatedFailureNotice,
+  isPermanentVerifyFailure,
+  isVerifyRetryBlocked,
+  nextCostlyFailureRecord,
+  nextVerifyRetry,
+  shouldGiveUpAutoStage,
+  shouldPromptRepeatedFailure,
+} from "./update-verify-retry.mjs";
+// 外链 / 导航协议白名单（纯函数、可单测）：./external-url.mjs
+import {
+  isIdeDeepLink,
+  isSafeExternalUrl,
+  isSafeMailtoUrl,
+  isSameAppOrigin,
+} from "./external-url.mjs";
 // 磁盘剩余空间换算 + 静默更新预检（statfs 注入以便在 Mac 上单测）：纯函数在 ./disk-space.mjs。
 // 预检阈值 MIN_TEMP_FREE_MB 是唯一的 JS 侧来源（弹框文案也读它），与 installer.nsh 的 define 由测试对账。
 import { MIN_TEMP_FREE_MB, checkUpdateTempSpace, formatFreeGB } from "./disk-space.mjs";
@@ -162,24 +194,14 @@ const applyAppNapGuard = () => {
 
 // 站内 URL 必须按 origin 精确比对——`url.startsWith(BASE_URL)` 会被
 // `http://127.0.0.1:8876@evil/` / `:88760/` / `.attacker.tld/` 前缀绕过（审查发现）
-const isAppUrl = (url) => {
-  try {
-    const u = new URL(url);
-    return (
-      u.protocol === "http:" &&
-      u.hostname === HOST &&
-      Number(u.port) === PORT
-    );
-  } catch {
-    return false;
-  }
-};
+// （判定本身在 ./external-url.mjs、有单测；这里只绑定本实例的 host / port）
+const isAppUrl = (url) => isSameAppOrigin(url, { host: HOST, port: PORT });
 
-// 外链白名单：与 IPC open-external 同源——只放行 http(s) + 系统设置深链，
-// 避免 window.open / IPC 成任意协议跳板
-const OPEN_EXTERNAL_ALLOWED = /^(https?:|x-apple\.systempreferences:|ms-settings:)/i;
-const isSafeExternalUrl = (url) =>
-  typeof url === "string" && OPEN_EXTERNAL_ALLOWED.test(url);
+// 外链白名单（isSafeExternalUrl、定义见 ./external-url.mjs）：http(s) + 系统设置深链，
+// setWindowOpenHandler 与 IPC open-external 共用，避免 window.open / IPC 成任意协议跳板。
+// IDE deep link（cursor:// / vscode://）只走同 frame 导航、由 will-navigate 单独放行 isIdeDeepLink，
+// 不进这份通用白名单（grep 确认 src/ 里没有 window.open / IPC 去开 IDE 协议）；
+// mailto 同理：只由 will-navigate 按 isSafeMailtoUrl 的严格形态放行。
 
 // userData 钉死在 fe-ai-flow（默认跟 productName 走）——显示名从「AI工作流」改成
 // 「Flowship」（v1.1.0）或以后再改名、数据目录都不漂移、用户任务数据不丢；测试实例独立目录防污染
@@ -1233,6 +1255,14 @@ const createWindow = async () => {
       appName: IS_TEST ? "FlowshipTest" : "Flowship",
     });
   });
+  // 真退出（quitting 已置位：Cmd+Q / Tray 退出 / 自更新 quitAndInstall）时无视页面的 beforeunload 拦截。
+  // Electron 里页面 beforeunload 返回/设置了 returnValue 会**静默取消** window.close()/app.quit()——
+  // 不会像浏览器那样弹确认框，没有 will-prevent-unload 处理就表现为「点退出 / 重启更新没反应」。
+  // 设置页有未保存草稿时会注册 beforeunload（见 use-settings），此处保证它拦不住真退出。
+  // 非退出场景（普通导航）保持默认行为、不在这里放行。
+  mainWindow.webContents.on("will-prevent-unload", (event) => {
+    if (quitting) event.preventDefault();
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
     pageLoaded = false;
@@ -1254,6 +1284,15 @@ const createWindow = async () => {
   // → 拦下来交系统处理、窗口永远停在 Flowship 页面上
   // 特例：app-update://install 是页面「新版本」标识发起的装更新指令、壳自己消费
   // 主窗不放行 data:——splash 是独立 BrowserWindow 自己 loadURL(data:)，不经此 handler
+  //
+  // ⚠️ 交给系统（shell.openExternal）前必须过白名单：这里承载 IDE deep link（页面里裸
+  // `<a href="cursor://file/...">` 同 frame 导航），所以不能一刀切拒绝；但 file: / smb: /
+  // javascript: / 任意自定义协议绝不能被页面（或被注入的内容）借这条路拉起系统处理器。
+  // 放行 = 通用外链（isSafeExternalUrl）、前端真实生成的 IDE deep link（isIdeDeepLink，
+  // 仅 cursor / vscode 的 `://file/<绝对路径>` 形态）、或严格形态的 mailto（isSafeMailtoUrl：
+  // 页面里裸 `<a href="mailto:…">` 同 frame 导航，白名单化之后它曾被静默拦下、点了没反应；
+  // 只放这里、不进 setWindowOpenHandler / IPC——前端没有走那两条路开 mailto 的调用方）；
+  // 其余一律拦下、不打开、只记一行日志。
   mainWindow.webContents.on("will-navigate", (e, url) => {
     if (url.startsWith("app-update://")) {
       e.preventDefault();
@@ -1261,8 +1300,16 @@ const createWindow = async () => {
       return;
     }
     if (isAppUrl(url)) return;
+    // 站外一律先拦导航：不论后面放行与否，主窗都不能被带走
     e.preventDefault();
-    void shell.openExternal(url);
+    if (isSafeExternalUrl(url) || isIdeDeepLink(url) || isSafeMailtoUrl(url)) {
+      void shell.openExternal(url).catch((err) => {
+        log(`[will-navigate] 打开外部链接失败 ${err?.message || err}`);
+      });
+      return;
+    }
+    // 只记前 80 字符：URL 里可能带 token / 本地路径，别把整串写进日志
+    log(`[will-navigate] 拒绝非白名单 URL：${String(url).slice(0, 80)}`);
   });
 
   // 禁用浏览器默认「刷新页面」快捷键（cmd/ctrl+R、cmd+shift+R 强刷、F5）——
@@ -1447,8 +1494,9 @@ const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
 let applyingStagedOnQuit = false;
 const RELEASE_LATEST_URL = "https://github.com/jianger666/Flowship/releases/latest";
 
-// 「该版本是否已弹过错误框」持久化——仅用于 mac 暂存失败的 showErrorBox 去重
-// （发现新版本本身 2026-07-15 起不再弹窗、只静默点亮右上角徽标）
+// 「该版本是否已弹过错误框」持久化——仅用于 mac 自动暂存失败的 showErrorBox 去重
+// （发现新版本本身 2026-07-15 起不再弹窗、只静默点亮右上角徽标）。
+// 只有真的弹了框（确定不符 / 没带 manifest）才记；暂时性失败不弹框、也就不消耗这个名额（R6-5，见 buildVerifyRejectionNotice）
 const promptedFile = () => path.join(app.getPath("userData"), "update-prompted.json");
 
 const wasPrompted = async (version) => {
@@ -1593,17 +1641,26 @@ const cleanupUpdateLeftovers = async () => {
 // mac 包无 Apple 签名、Gatekeeper 又被绕开（fetch 下载无 quarantine）——dmg 的真实性
 // 必须自证：CI 用 Ed25519 私钥对「版本 + asset SHA-256 清单」签名产 update-manifest.json
 // （scripts/generate-update-manifest.mjs）、壳内置公钥先验签再验哈希、验不过保留旧应用。
+// Windows 同理（R9-01）：exe 同样没有代码签名证书，而 electron-updater 只信 latest.yml 里的 sha512——
+// 能改 GitHub release 的人就能推恶意 exe。所以 exe 也签进**同一份** manifest，
+// Windows 下载完成后（update-downloaded）与 quitAndInstall 之前都走本函数，见下方「Windows 更新包验签」。
 //
 // 公钥单一来源：同目录 update-manifest-public-key.pem（CI verify-update-manifest.mjs 共用、
 // 防双源漂移）。私钥只在 GitHub secret `UPDATE_MANIFEST_PRIVATE_KEY`。
-// **fail-closed**：公钥缺失 / manifest 下载失败 / 签名不匹配 / hash 不匹配 → 一律 throw、
-// 拒绝自动安装；调用方降级开 RELEASE_LATEST_URL 让用户手动下。
+// **fail-closed**：公钥缺失 / manifest 下载失败 / 签名不匹配 / hash 不匹配 → 一律 throw、拒绝自动安装。
+// 失败按**类型**分三类（N2-02 + M3-03，定义见 ./update-manifest-verify.mjs）：
+//  - UpdateVerifyMismatchError：确定不符 → 调用方删缓存包 + 降级开 RELEASE_LATEST_URL 让用户手动下；
+//  - UpdateVerifyUnavailableError：暂时无法校验（5xx / 超时 / 网络 / 公钥读不了 / 本地读文件失败）→ 同样拒绝安装，
+//    但**保留**缓存包、不开发布页，下次点徽标重新验（见 rejectUnverifiedWinUpdate / resumeRetainedWinInstaller）；
+//  - UpdateVerifyManifestMissingError（Unavailable 的子类，HTTP 404 / 410）：这个 release 没带 manifest——
+//    保留缓存、仍拒绝安装，但重试不会好，所以弹「该版本暂不支持自动校验」并开发布页（降级手动下载）。
+// 判定逻辑（验签 → version → 条目 → size → sha256）在 ./update-manifest-verify.mjs（纯函数、有单测）。
 const UPDATE_MANIFEST_PUBLIC_KEY_PATH = path.join(
   __dirname,
   "update-manifest-public-key.pem",
 );
 
-// 流式算文件 SHA-256（dmg 100MB+、不整读进内存）
+// 流式算文件 SHA-256（安装包 100MB+、不整读进内存）
 const sha256File = (file) =>
   new Promise((resolve, reject) => {
     const hash = createHash("sha256");
@@ -1613,61 +1670,71 @@ const sha256File = (file) =>
     stream.on("error", reject);
   });
 
-// 下载完的 dmg 验 manifest 签名 + SHA-256 + 大小。任一步不过 → throw（调用方 catch
-// 降级开下载页；此时还没动旧应用）。无「公钥空跳过」分支。
-const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
+// 读内置公钥 + 取 manifest + 过「签名 / version / 条目」三道廉价检查，返回 { manifest, publicKeyPem }。
+// 从 verifyDownloadedUpdate 拆出来（F1-01）：mac 暂存要在**下载 dmg 之前**先做这一步——清单只有几百字节，
+// 取不到 / 验不过时根本不用白下 112MB 的 dmg（M3-04 的根因就是先下 dmg、后取清单）。
+// 这里只是 fail-fast 的前置检查、不做最终裁决：最终裁决仍是 verifyDownloadedUpdate 里的 verifyManifestEntry
+// （它拿实测 size / SHA-256 重走全部检查）。任一步不过 → throw 带类型的错。无「公钥空跳过」分支。
+const loadSignedManifest = async (version, assetName) => {
   let publicKeyPem = "";
   try {
     publicKeyPem = readFileSync(UPDATE_MANIFEST_PUBLIC_KEY_PATH, "utf8").trim();
   } catch (err) {
-    throw new Error(
+    // 公钥是壳自带的：读不出来是我们这边的问题、不是安装包的问题 → 暂时无法校验（不删缓存包）
+    throw new UpdateVerifyUnavailableError(
       `更新验签公钥缺失（${UPDATE_MANIFEST_PUBLIC_KEY_PATH}）：${err?.message || err}、已中止替换`,
+      "public-key",
+      { cause: err },
     );
   }
   if (!publicKeyPem) {
-    throw new Error("更新验签公钥为空、已中止替换（fail-closed）");
+    throw new UpdateVerifyUnavailableError("更新验签公钥为空、已中止替换（fail-closed）", "public-key");
   }
 
   const manifestUrl = `https://github.com/jianger666/Flowship/releases/download/v${version}/update-manifest.json`;
-  let res;
+  // 取清单（含 30s 超时、网络 / HTTP / 解析失败的分类）在纯模块里：
+  // 超时必须有——Windows 链路里验签挂在「下载完成」之后、徽标处于 downloading 态，
+  // 网络挂起会让 promise 永不收敛 → 徽标永远点不动、只能重启应用；mac 暂存链路共用本函数、同样受益。
+  // 这些失败都只说明「这次没拿到清单」（GitHub 抖动 / 强制门户），不证明安装包有问题：
+  // 仍然拒绝安装（fail-closed），但保留已下载的包、让用户稍后重试，而不是白白再下 112MB。
+  const manifest = await fetchUpdateManifest({ url: manifestUrl });
+  // 顺序与改造前一致：先过「签名 / version / 条目」三道廉价检查，manifest 有问题就别白算
+  // 100MB+ 的 SHA-256（也不会在 manifest 已坏时去读一个可能根本不存在的文件）；
+  // 算出实测 size / sha256 后，再交给 verifyManifestEntry 做**最终裁决**（它自己重走全部检查，
+  // 通过与否只看它，这里的前置调用只是 fail-fast、不是第二套判定）。
+  findSignedManifestEntry({ manifest, publicKeyPem, version, assetName });
+  return { manifest, publicKeyPem };
+};
+
+// 下载完的安装包（mac dmg / Windows exe）验 manifest 签名 + SHA-256 + 大小。任一步不过 → throw
+// （调用方 catch 降级开下载页；此时还没动旧应用）。
+// preloaded：调用方已用 loadSignedManifest 取好的清单上下文（mac 在下载 dmg 之前先取了）；
+// 不传则在这里现取（Windows 路径：electron-updater 下完才进来，行为与拆分前完全一致）。
+const verifyDownloadedUpdate = async (version, filePath, assetName, preloaded) => {
+  const { manifest, publicKeyPem } = preloaded ?? (await loadSignedManifest(version, assetName));
+  let stat;
+  let digest;
   try {
-    res = await fetch(manifestUrl);
+    stat = await fs.stat(filePath);
+    digest = await sha256File(filePath);
   } catch (err) {
-    throw new Error(`更新 manifest 下载失败：${err?.message || err}、已中止替换`);
+    // 本地读不了文件（杀软占用 / 权限 / 文件被清理）：没法证明内容不符 → 暂时无法校验。
+    // 文件真被清理了的话，保留缓存无副作用（electron-updater 发现缓存失效会重新下载）
+    throw new UpdateVerifyUnavailableError(
+      `读取已下载的安装包失败：${err?.message || err}、已中止替换`,
+      "local-io",
+      { cause: err },
+    );
   }
-  if (!res.ok) {
-    // 发版链必产 manifest——拿不到就当被篡改 / 降级攻击、拒绝自动安装
-    throw new Error(`更新 manifest 下载失败 HTTP ${res.status}、已中止替换`);
-  }
-  let manifest;
-  try {
-    manifest = await res.json();
-  } catch (err) {
-    throw new Error(`更新 manifest JSON 解析失败：${err?.message || err}、已中止替换`);
-  }
-  // 验签 payload 只覆盖 version + files、跟 generate-update-manifest.mjs 同序重建
-  const payload = JSON.stringify({ version: manifest.version, files: manifest.files });
-  const ok = verify(
-    null, // Ed25519 内建 digest
-    Buffer.from(payload, "utf8"),
-    createPublicKey(publicKeyPem),
-    Buffer.from(String(manifest.signature ?? ""), "base64"),
-  );
-  if (!ok) throw new Error("更新 manifest 签名校验失败、已中止替换");
-  if (manifest.version !== version) {
-    throw new Error(`manifest 版本不符（${manifest.version} ≠ ${version}）、已中止替换`);
-  }
-  const entry = (manifest.files ?? []).find((f) => f?.name === assetName);
-  if (!entry) throw new Error(`manifest 里没有 ${assetName} 的摘要、已中止替换`);
-  const stat = await fs.stat(dmgPath);
-  if (stat.size !== entry.size) {
-    throw new Error(`dmg 大小不符（${stat.size} ≠ ${entry.size}）、已中止替换`);
-  }
-  const digest = await sha256File(dmgPath);
-  if (digest !== entry.sha256) {
-    throw new Error("dmg SHA-256 校验失败（内容被篡改 / 传输损坏）、已中止替换");
-  }
-  log(`[updater] manifest 验签 + dmg 摘要校验通过（${assetName}）`);
+  verifyManifestEntry({
+    manifest,
+    publicKeyPem,
+    version,
+    assetName,
+    size: stat.size,
+    sha256: digest,
+  });
+  log(`[updater] manifest 验签 + 安装包摘要校验通过（${assetName}）`);
 };
 
 // ---------- mac 延迟自更新（下载暂存 ≠ 立刻替换） ----------
@@ -1696,10 +1763,53 @@ const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
 // staged.json 落盘前双方都会走下载分支抢写同一 dmg / staged 目录——single-flight、
 // 重入方 await 同一个 promise 拿同一份暂存结果。
 let stagingPromise = null;
+// 本进程内「验签失败过」的版本（M3-04）：自动路径（2h 轮询 / 设置页检查更新）据此不再重下同一版本。
+// 为什么需要：dmg 有 100MB+、验签失败后在 downloadAndStageMacUpdateInner 的 finally 里一定会删，
+// 清单持续取不到 / 验不过时，没有这条记录就会「每 2 小时重下一遍 dmg → 验签失败 → 又删」。
+// 只记**确定性**的验签失败（isPermanentVerifyFailure：确定不符 Mismatch、该 release 没带 manifest 404 / 410）——
+// 这两类重试不会好，才永久跳过。其余失败（Unavailable：5xx / 限流 / 超时 / 网络…；以及 dmg 下载 502 / 不完整、
+// hdiutil / ditto 失败这类未归类错误）不记在这里：一次瞬时失败就让该版本在本进程内永久不再自动暂存，
+// 会废掉 2h 轮询「网络恢复后自愈」的价值（F1-01），它们走下面的 macVerifyRetry 按时间退避。
+// 只在内存里（进程内），重启应用即重置——重启本身就是一次显式重试。
+// 重试由用户点徽标触发（macSelfUpdate → downloadAndStageMacUpdate，不看这条记录）；成功暂存后清掉。
+// 登记发生在 downloadAndStageMacUpdate 的 catch 里：对任何触发方式（轮询 / 设置页检查更新 / 点徽标）、
+// 不管这次有没有弹框一律登记——「谁弹框」与「谁登记」是两件事（K3-05，弹框见 handleMacStageFailure）。
+let macVerifyFailedVersion = null;
+// **非永久**失败的退避记录 { version, failures, notBefore }（策略与数值见 ./update-verify-retry.mjs）：
+// 退避期内自动路径跳过暂存，到点放行；用户点徽标的显式重试不受约束、失败照样累计；成功暂存清掉，换版本从头算。
+// 第七轮 P2-2：以前只有 Unavailable 才登记，未归类错误（dmg 502 / hdiutil / ditto 失败……）既不登记也不弹框，
+// 每次轮询都重走一遍「清单 → 下载 100MB+ → 失败 → 删除」；现在凡是非永久失败都登记。failures 同时就是「连续失败次数」。
+// 如实说明它管得到谁（R6-5 实证、第八轮 L2-04 订正）：退避（5/10/20/40/80/120/120… 分钟）主要挡非轮询触发的自动暂存（设置页「检查更新」）；
+// 对 2 小时轮询**不是保护**：放不放行只看「最近一次失败的时刻 + 退避」是否 ≤ 下一次轮询到点——常见情形（失败紧跟触发、耗时秒~分钟级）
+// 前 5 次都放行，但失败发生得晚（k=5 时 delta > 40 分钟，或点徽标 / 手动检查在两次轮询之间失败）就会被挡一轮；
+// 封顶后（连续失败 ≥ 6 次）失败只要晚于触发就隔一轮跳过一次——详见 update-verify-retry.mjs 文件头与 tests/update-verify-retry.test.ts。
+// 轮询靠的是下面的 macStageGiveUpVersion 闸；暂时性失败对用户的打扰靠 buildVerifyRejectionNotice（后台触发不弹框）兜住；连续 3 次再提示一次（见下）。
+let macVerifyRetry = null;
+// 「会白下 dmg 的失败」连续计数 { version, count }（第八轮 L2-01；口径与哪些失败计入见 ./update-verify-retry.mjs 的 isCostlyStageFailure）：
+// **不分触发方式**（后台 / 设置页检查更新 / 点徽标的失败都计）；Unavailable（清单阶段、下载之前就败）既不计数也不清零；
+// 永久失败不进这里（有 macVerifyFailedVersion）。成功暂存清掉；换版本从 1 重算。
+let macCostlyFailures = null;
+// 「放弃自动暂存」闸（第八轮 L2-01）：登记的版本 = 该版本的 macCostlyFailures 已达 STAGE_GIVE_UP_AFTER（3）。
+// 为什么需要：退避不读 failures、对 2h 轮询基本不设防，未归类失败（dmg 502 / 不完整 / hdiutil / ditto / 找不到 .app）
+// 会在每一轮轮询里整包重下 100MB+。**只有后台轮询（runUpdateCheck）读它**：遇到就跳过自动暂存、只记一行日志；
+// 设置页「检查更新」（manualCheckForUpdate）与点徽标（macSelfUpdate）不看它、照常发起尝试——成功暂存则解除，失败则
+// 计数继续涨、闸保持登记（不会借一次手动尝试多放后台 3 次）。换版本（只按版本相等判断）/ 成功暂存 / 重启（内存变量）解除。
+// 与 macVerifyFailedVersion 的区别：那个是「重试不会好」的永久跳过（确定不符 / 没带清单）；这个只是「别再替用户反复烧流量」，
+// 用户一点就能重试。这里不弹框：「多次失败」提示框（handleMacStageFailure）说的「点徽标重试或手动下载」正是此后唯一的重试入口。
+let macStageGiveUpVersion = null;
+// 「自动更新多次失败」说明框已弹过的版本（进程内、按版本）。**刻意独立于 wasPrompted**：wasPrompted 是「每版本一次」的持久名额，
+// 确定不符 / 没带清单的安全告警也用它（alreadyPrompted 为真时后台全部静默）；若「多次失败」提示占用它，
+// 同一版本 3 次暂时性失败后真出现「确定不符」就会因名额已用而静默——完整性告警丢失。成功暂存时清掉（连续失败从头算）。
+let repeatedFailurePromptedVersion = null;
 const downloadAndStageMacUpdate = (version) => {
   if (stagingPromise) return stagingPromise;
   stagingPromise = downloadAndStageMacUpdateInner(version)
     .then((meta) => {
+      macVerifyFailedVersion = null;
+      macVerifyRetry = null;
+      macCostlyFailures = null;
+      macStageGiveUpVersion = null;
+      repeatedFailurePromptedVersion = null;
       // 已暂存跳过下载 / 下载暂存完成——统一在这置 ready、页面徽标变「重启更新」。
       // 用户点徽标触发的链路（installInFlight 持锁中）跳过：macSelfUpdate 马上置
       // installing、中间闪一帧可点的 ready 没意义（蓝军 P1）
@@ -1709,8 +1819,27 @@ const downloadAndStageMacUpdate = (version) => {
       return meta;
     })
     .catch((err) => {
-      // 失败回 available（徽标仍亮、点击可重试）；弹不弹框由调用方决定
-      setUpdateState({ phase: "available", version, error: String(err?.message || err) });
+      // 记录失败（见上方 macVerifyFailedVersion / macVerifyRetry / macCostlyFailures 注释）：
+      // 确定性失败永久跳过、**其余一律**按时间退避（P2-2：含未归类错误）；按类型判、不匹配文案。
+      // 一律登记、不分触发方式（后台 / 设置页检查更新 / 点徽标）——「谁弹框」另见 handleMacStageFailure。
+      if (isPermanentVerifyFailure(err)) {
+        macVerifyFailedVersion = version;
+      } else {
+        macVerifyRetry = nextVerifyRetry(macVerifyRetry, version, Date.now());
+        // 第八轮 L2-01：再数一遍「会白下 dmg 的失败」（Unavailable 不计、也不清零）；够 3 次就让后台轮询别再替用户反复烧流量
+        macCostlyFailures = nextCostlyFailureRecord(macCostlyFailures, version, err);
+        if (shouldGiveUpAutoStage(macCostlyFailures, version)) {
+          macStageGiveUpVersion = version;
+        }
+      }
+      // 失败回 available（徽标仍亮、点击可重试）；弹不弹框由调用方决定。
+      // error 文案取 buildVerifyRejectionNotice 的 stateError（与 Windows rejectUnverifiedWinUpdate 同一个来源）；
+      // 它与触发方式无关，所以这里不传 trigger
+      setUpdateState({
+        phase: "available",
+        version,
+        error: buildVerifyRejectionNotice(err).stateError,
+      });
       throw err;
     })
     .finally(() => {
@@ -1737,6 +1866,11 @@ const downloadAndStageMacUpdateInner = async (version) => {
     // 非常规安装位置（如直接在 dmg 里跑）——抛给调用方降级开下载页
     throw new Error("非常规安装位置、无法自更新");
   }
+  // F1-01：先取清单、再下 dmg。清单只有几百字节、dmg 有 100MB+——清单取不到 / 验不过（签名、version、
+  // 条目）就别白下一遍（M3-04 的根因）。放在 try 之外：这时还没碰磁盘 / 挂载点，抛出即可。
+  // 取到的清单上下文传给下面的 verifyDownloadedUpdate 复用、不重复请求；它仍会用下载后实测的
+  // size / SHA-256 做最终裁决（verifyManifestEntry），这里只是 fail-fast 的前置检查。
+  const manifestCtx = await loadSignedManifest(version, assetName);
   const updatesDir = updatesDirPath();
   const dmgPath = path.join(updatesDir, `v${version}.dmg`);
   const mountPoint = path.join(updatesDir, `mnt-${Date.now()}`);
@@ -1775,7 +1909,7 @@ const downloadAndStageMacUpdateInner = async (version) => {
     }
 
     // CR-02：签名 manifest 校验——在 attach 之前拦掉被篡改的包
-    await verifyDownloadedUpdate(version, dmgPath, assetName);
+    await verifyDownloadedUpdate(version, dmgPath, assetName, manifestCtx);
 
     await execFileStrict("hdiutil", [
       "attach", dmgPath, "-nobrowse", "-quiet", "-mountpoint", mountPoint,
@@ -1945,7 +2079,19 @@ const macSelfUpdate = async (version) => {
     setUpdateState({ phase: "installing", version, error: null });
     await applyStagedUpdate({ relaunch: true });
   } catch (err) {
-    log(`[updater] 自更新失败：${err?.message || err}、降级开下载页`);
+    // 弹框内容按失败类型分（K3-04，与 Windows 的 rejectUnverifiedWinUpdate 读同一个纯函数、trigger="user"——用户点了徽标在等结果）：
+    //  - 验签类（确定不符 / 暂时无法校验 / 没带清单）：标题、正文、是否开发布页都取 notice。
+    //    暂时性失败只弹说明、**不开发布页**（网络好了再点徽标就能成），以前这里一律开页、比 Windows 激进；
+    //  - 其余（dmg 下载 502 / 不完整、hdiutil / ditto 失败、套用失败……）说的不是「校验」，套用「暂时无法校验更新包」会误导，
+    //    用通用的「自动更新失败」+ 开发布页（降级手动下载）——文案取 buildGenericUpdateFailureNotice，与设置页「检查更新」触发的
+    //    暂存失败（handleMacStageFailure, trigger="user"）共用同一个函数（第八轮 L2-02：以前这里内联一份、那边套了验签文案）。
+    const verifyType = isVerifyFailure(err);
+    const notice = verifyType
+      ? buildVerifyRejectionNotice(err, { trigger: "user" })
+      : buildGenericUpdateFailureNotice(err);
+    log(
+      `[updater] 自更新失败：${err?.message || err}、${verifyType ? "按验签失败处置" : "按通用失败处置（降级开下载页）"}（开发布页=${notice.openReleasePage}）`,
+    );
     // 状态回退：暂存还有效回 ready（点徽标重试秒装）、否则回 available（重试重下）
     const staged = await readStagedMeta().catch(() => null);
     const stillStaged =
@@ -1955,11 +2101,8 @@ const macSelfUpdate = async (version) => {
       version,
       error: String(err?.message || err),
     });
-    dialog.showErrorBox(
-      "自动更新失败",
-      `${err?.message || err}\n\n将打开下载页、请手动下载安装。`,
-    );
-    void shell.openExternal(RELEASE_LATEST_URL);
+    if (notice.showDialog) dialog.showErrorBox(notice.title, notice.body);
+    if (notice.openReleasePage) void shell.openExternal(RELEASE_LATEST_URL);
   } finally {
     mainWindow?.setProgressBar(-1);
   }
@@ -1986,19 +2129,47 @@ const installUpdateNow = async () => {
     // 二轮复审 P1）；已下载完（上次 quitAndInstall 失败回 ready）直接装，不重复下载；
     // 其余此刻才开始下载（autoDownload=false）
     if (updateState.phase === "downloading" || updateState.phase === "installing") return;
+    // M3-05：上一次验签没过但保留了缓存（暂时无法校验 / 没带 manifest）→ 先直接对那份文件重验，
+    // 不去赌 electron-updater 会不会重发 update-downloaded。通过 → phase=ready、落进下面既有的
+    // 「已下载、直接安装」分支；仍失败 → 已按类型处置过（弹框 / 开发布页）、这里直接返回；
+    // 没有可复用的缓存（"fallback"）→ 往下照旧 downloadUpdate()。
+    if (updateState.phase === "available" && winRetainedInstaller) {
+      const resumed = await resumeRetainedWinInstaller(updateReadyVersion);
+      if (resumed === "rejected") return;
+    }
     if (updateState.phase === "ready") {
       log(`[updater] win 已下载、直接安装重启 v${updateReadyVersion}`);
-      installWinUpdate(updateReadyVersion);
+      // await（持锁）：installWinUpdate 开头多了异步验签（R9-01）、验签期间 phase 还是 ready——
+      // 不持锁的话这段窗口里再点一次徽标会并发进来第二个 installWinUpdate（双验签、双通知、双墓碑）
+      await runInstallWinUpdate(updateReadyVersion);
       return;
     }
     try {
       log(`[updater] win 开始下载 v${updateReadyVersion}`);
       const updater = await ensureWinAutoUpdater();
       setUpdateState({ phase: "downloading", version: updateReadyVersion, percent: 0, error: null });
+      // 清掉上一轮的验签任务引用：下面等的必须是「这一次」下载完成事件里启动的那个
+      winDownloadedVerifyTask = null;
       await updater.downloadUpdate();
-      // 下完直接装：用户点徽标时已经确认过，对齐 mac「确认一次就干」
+      // update-downloaded 事件里的验签是异步的（取 manifest + 算 SHA-256）、downloadUpdate() 返回时
+      // 它可能还没跑完：等它出结果再往下走。验签失败时事件处理里已经弹框 / 删缓存包 / 回 available，
+      // 这里只静默返回、不再弹第二次框
+      await winDownloadedVerifyTask;
       if (updateState.phase === "installing" || quitting) return;
-      installWinUpdate(updateReadyVersion);
+      if (updateState.phase !== "ready") {
+        if (updateState.phase === "downloading") {
+          // downloadUpdate 已 resolve 却没收到完成事件（理论不会发生）：别把徽标永远卡在「下载中」
+          log("[updater] win downloadUpdate 已返回但未收到 update-downloaded、回到可重试态");
+          mainWindow?.setProgressBar(-1);
+          setUpdateState({
+            phase: "available",
+            error: "下载已结束但未收到完成通知、已取消本次自动更新，请重试",
+          });
+        }
+        return;
+      }
+      // 下完直接装：用户点徽标时已经确认过，对齐 mac「确认一次就干」
+      await runInstallWinUpdate(updateReadyVersion);
     } catch (err) {
       // quitAndInstall 过程中 downloadUpdate 可能被中断，别误报下载失败
       if (quitting || updateState.phase === "installing") return;
@@ -2043,6 +2214,205 @@ const UPDATE_POLL_MS = 2 * 60 * 60 * 1000;
 
 // win electron-updater 单例：首次用到时初始化、轮询 / 手动检查 / 下载复用同一个、不重复注册监听器
 let winAutoUpdater = null;
+
+// ---------- Windows 更新包验签（R9-01、fail-closed） ----------
+//
+// 威胁：electron-updater 只信 latest.yml 里的 sha512，而 latest.yml 和 exe 都在 GitHub release 上——
+// 谁能改 release 谁就能推恶意 exe，壳会静默 quitAndInstall 把它跑起来。exe 目前没有代码签名证书，
+// 所以复用 mac 的方案：CI 把 exe 的 SHA-256 / size 也签进同一份 update-manifest.json（Ed25519），
+// 壳用内置公钥验签、再比对本地 exe 的实测 size / sha256（verifyDownloadedUpdate）。
+// 验两次：① update-downloaded 时（失败不进 ready、用户看不到「重启更新」再失败）；
+//        ② installWinUpdate 里 quitAndInstall 之前（验的是此刻磁盘上、即将被拉起的那个文件）。
+//
+// manifest 里的查找键 assetName 取自 latest.yml 的 files[].url（见 pickWinInstallerAssetName 的注释），
+// 不是 downloadedFile 的本地文件名——它是 electron-updater 的缓存路径（可能来自上次启动留下的
+// update-info.json），属于本地状态、不是 release 上的事实。
+//
+// 兼容性：
+// - 已经装在用户机器上的旧壳没有这段代码、行为不变（仍只信 latest.yml 的 sha512）——
+//   本修复只对「已装上含本逻辑的版本」之后的更新生效；
+// - 新壳对「没有 manifest / manifest 里没有 exe 条目 / 签名不对」的 release 一律拒绝自动安装、
+//   降级为弹框 + 开发布页手动下载（没有「manifest 缺失就放行」的兼容分支，否则攻击者删掉 manifest 即可降级绕过）。
+//   发版链由 release.yml finalize 保证每个 release 的 manifest 同时含 2 枚 dmg + 1 枚 exe。
+//
+// 已知取舍：验签通过到 quitAndInstall 之间（通知 + 墓碑 + 1.5s 等待）文件仍躺在用户可写的缓存目录，
+// 理论上同用户权限的本地进程可在这个窗口里调包；但同权限进程本来就能直接改已安装的应用文件，
+// 不在「篡改 release」这个威胁模型内，所以不为此再引入拷贝 / 锁文件的复杂度。
+
+// 已通过验签、等待安装的 exe：{ version, file, assetName }；验过之前、验失败后都是 null
+let winPendingInstaller = null;
+// 验签没过、但**保留了缓存包**的那一份：{ version, file, assetName } 或 null（M3-05）。
+// 由 rejectUnverifiedWinUpdate 在「保留缓存」（暂时无法校验 / 没带 manifest）时登记、
+// resumeRetainedWinInstaller 在用户点徽标时消费。为什么要自己记：原先「保留缓存、点徽标重新验」
+// 全靠 electron-updater 缓存命中时重发 update-downloaded——源码确实会重发（AppUpdater.executeDownload
+// 命中缓存走 done(false) → dispatchUpdateDownloaded），但那是库的内部行为、不是公开契约，
+// 万一哪个版本不再重发，用户就卡在「缓存在、却永远进不了 ready」。自己记下路径，点徽标时直接重验，
+// 不论库怎么表现都不会卡死。只在内存里：重启应用后 electron-updater 的缓存校验（sha512）会重新接管。
+let winRetainedInstaller = null;
+// 最近一次 update-downloaded 事件启动的验签任务（永不 reject、结果体现在 updateState.phase 上）。
+// installUpdateNow 在 downloadUpdate() 返回后等它、避免与事件里的验签并发处置
+let winDownloadedVerifyTask = null;
+
+// Windows 路径大小写不敏感；只用于「同一个文件」判定
+const sameWinPath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+
+// 对待装 exe 做完整验签；失败 throw（由调用方决定怎么处置）。
+// 门禁本体（file / assetName → 版本号三段数字 → 库登记的待装文件交叉校验 → 验签）已抽到
+// ./win-pending-verify.mjs 做成依赖注入的纯函数（F1-02：以前全仓没有测试真调用过它、只靠源码顺序 grep）；
+// 这里只负责把运行时依赖接进去。winAutoUpdater 必须在调用时才读（getRunFile 是惰性的）：
+// 它在应用启动后才初始化、之后还会被换。
+const verifyWinPendingInstaller = async (pending) => {
+  await verifyWinPendingInstallerWith(pending, {
+    getRunFile: () => winAutoUpdater?.downloadedUpdateHelper?.file,
+    sameWinPath,
+    verifyDownloadedUpdate,
+  });
+};
+
+// 验签失败的统一处置（事件里验签 / installWinUpdate 里验签 / 点徽标重验共用）：一律拒绝自动安装，
+// 再按**错误类型**分三路（N2-02 + M3-03；buildVerifyRejectionNotice 只看 instanceof、不匹配 message 文案）：
+//  - 确定不符（UpdateVerifyMismatchError）：删缓存包 + 回 available + 弹框 + 开发布页让用户手动下；
+//  - 暂时无法校验（UpdateVerifyUnavailableError / 未归类错误）：**保留**缓存包、回 available 带错误、弹框说明，
+//    不开发布页——下次点徽标时直接对保留的文件重验（resumeRetainedWinInstaller）；
+//  - 该版本没带 manifest（UpdateVerifyManifestMissingError，404 / 410）：同样保留缓存、仍拒绝安装，
+//    但重试不会好，所以弹「暂不支持自动校验」并开发布页（新壳对没有 manifest 的 release 的既定策略 = 降级手动下载）。
+// 「类型 → 弹不弹框 / 开不开发布页 / 写什么错误文案」由纯函数 buildVerifyRejectionNotice 一处决定（R6-5），
+// mac 自动暂存失败（runUpdateCheck）读的是同一个函数、只是 trigger 不同：这里的验签全程由用户点徽标触发
+// （autoDownload=false），用户在等结果，所以 trigger="user"——三类都弹框（暂时性失败也要告诉他没成、可重试）。
+// 同一时刻只会有一条路径走到这里（事件里失败 → phase 已回 available、installUpdateNow 不会再进安装；
+// ready 后再失败 → 只有 installWinUpdate 这一处），所以只弹一次框。绝不置 quitting：app 必须继续活着。
+const rejectUnverifiedWinUpdate = async ({ version, file, assetName, err, stage }) => {
+  const notice = buildVerifyRejectionNotice(err, { trigger: "user" });
+  const reason = notice.reason;
+  const kind = notice.definitive
+    ? "确定不符"
+    : notice.manifestMissing
+      ? "该版本没带 manifest、保留已下载的安装包"
+      : "暂时无法校验、保留已下载的安装包";
+  log(`[updater] win ${stage}验签未通过、拒绝自动安装（${kind}）：${reason}`);
+  winPendingInstaller = null;
+  // 保留缓存时登记「可重验」记录，供点徽标时直接重验（见 winRetainedInstaller 注释）；
+  // 确定不符 = 包即将被删、记录必须清掉；缺 file / assetName 就没法重验（assetName 缺失时重验必然复现
+  // 「找不到文件名」），不登记、让点徽标走 downloadUpdate 由 latest.yml 重新给一次
+  winRetainedInstaller = file && assetName && !notice.definitive ? { version, file, assetName } : null;
+  mainWindow?.setProgressBar(-1);
+  // 缓存包此刻的真实去留（K3-06）：弹框正文里「已清除 / 已保留」必须对得上——
+  // 有 file 默认是留在磁盘上（kept）；确定不符且 rm 成功才是 cleared；没有 file 就是 none。
+  // Windows 与 mac 不同：这里 exe 早已下载，所以清单级确定不符（签名 / version / 条目缺失）也会走到下面的删除
+  let fileState = file ? "kept" : "none";
+  if (file && notice.definitive) {
+    // 删掉缓存里的 exe：electron-updater 对「缓存里已有」的包会直接复用、不重新下载，
+    // 不删的话下次点徽标会拿同一份坏包再验一遍；也不该把疑似被调包的安装包留在磁盘上。
+    // 只在「确定不符」时删——网络抖动 / 读文件失败这类暂时性失败不该让用户白下 112MB。
+    // 删不掉（被杀软占用等）不影响拒绝——下次仍会被验签挡住
+    try {
+      await fs.rm(file, { force: true });
+      fileState = "cleared";
+      log(`[updater] win 已删除未通过验签的安装包 ${file}`);
+    } catch (rmErr) {
+      log(`[updater] win 删除未通过验签的安装包失败（忽略）${rmErr?.message || rmErr}`);
+    }
+  }
+  // 第八轮 L2-06：「kept」不能只凭有 file 参数——验签失败到弹框之间杀软可能已把缓存 exe 删了（或它早被清理），
+  // 这时弹框再写「已下载的安装包已保留」就是假话。弹框前 stat 一次：只有「不存在」（ENOENT / ENOTDIR）才改按「无文件」口径（none：
+  // 既不说保留、也不说清除——不是我们删的）；权限 / 占用类错误（EPERM / EBUSY / EACCES）文件多半还在，保守仍按 kept。
+  // 只在要说「保留」的情形下 stat（有 file 且没被我们删掉）：确定不符 + rm 失败（占用）时文件仍在磁盘上，同样走这里核实一次。
+  if (fileState === "kept") {
+    try {
+      await fs.stat(file);
+    } catch (statErr) {
+      if (statErr?.code === "ENOENT" || statErr?.code === "ENOTDIR") {
+        fileState = "none";
+        log(`[updater] win 缓存的安装包此刻已不在磁盘上（可能被杀软清理）、按「无文件」处理：${file}`);
+      }
+    }
+  }
+  setUpdateState({ phase: "available", version, percent: 0, error: notice.stateError });
+  // 同一个 err / trigger 再取一次，只为让正文带上真实的 fileState（删除前还不知道 rm 会不会成功）；处置标志位与上面的 notice 一致
+  const shown = buildVerifyRejectionNotice(err, { trigger: "user", fileState });
+  // trigger="user" 下 showDialog 恒为 true（行为与改造前一致）；仍读标志位而不是写死，保证两个平台同一套处置语义
+  if (shown.showDialog) dialog.showErrorBox(shown.title, shown.body);
+  // 开发布页只给「确定不符」与「没带 manifest」：暂时性失败网络好了点徽标就能成、没必要把人往外赶
+  if (shown.openReleasePage) void shell.openExternal(RELEASE_LATEST_URL);
+};
+
+// 「验签 → 通过则登记待装并置 ready」的**唯一实现**（M3-05）：
+// update-downloaded 事件（刚下完 / electron-updater 缓存命中时重发）与点徽标时对「已保留缓存」的直接重验
+// 都走它，两条路径的 fail-closed 语义因此不可能漂移（不复制粘贴）。
+// 返回 true = 通过；false = 未通过（已按分流处置：弹框 / 删或留缓存 / 回 available）。验签失败不会 reject。
+// 调用前调用方须已把 phase 置为 downloading（验签期间的「忙」态，见 update-downloaded 注释）。
+const verifyAndMarkWinReady = async ({ version, file, assetName, stage }) => {
+  const pending = { version, file, assetName };
+  try {
+    await verifyWinPendingInstaller(pending);
+  } catch (err) {
+    await rejectUnverifiedWinUpdate({ version, file, assetName, err, stage });
+    return false;
+  }
+  winPendingInstaller = pending;
+  winRetainedInstaller = null; // 用完即清：此刻起由 winPendingInstaller 接管
+  // 只在没被别处改动时置 ready：验签期间若有 error 事件把 phase 打回了 available，
+  // 就让用户再点一次（走 downloadUpdate / 缓存命中再验一遍），别在 error 之后又凭空冒出 ready
+  if (updateState.phase === "downloading") {
+    setUpdateState({ phase: "ready", version, percent: 100, error: null });
+  }
+  return true;
+};
+
+// 点徽标时处理「已保留缓存、状态 available」的情形（M3-05）：能复用就直接对该文件重跑验签，
+// 不依赖 electron-updater 重发 update-downloaded。
+// 返回：
+//  - "ready"    重验通过、phase 已是 ready（调用方接着走既有的「已下载、直接安装」分支）；
+//  - "rejected" 重验仍失败，已由 rejectUnverifiedWinUpdate 按类型处置（弹框 / 删或留缓存），调用方直接返回；
+//  - "fallback" 没有可复用的保留缓存（没记录 / 版本变了 / 文件没了 / 库登记的待装文件已不是它），
+//               调用方照旧走 downloadUpdate()（electron-updater 自己决定复用缓存还是重下）。
+const resumeRetainedWinInstaller = async (version) => {
+  const retained = winRetainedInstaller;
+  if (!retained) return "fallback";
+  const discard = (why) => {
+    log(`[updater] win 保留的安装包不可直接复用（${why}）、改走 downloadUpdate`);
+    winRetainedInstaller = null;
+    return "fallback";
+  };
+  // 保留的是旧版本的包、之后轮询又发现了更新的版本：它跟这次要装的不是一个东西
+  if (retained.version !== version) return discard(`版本已变 v${retained.version} → v${version}`);
+  // quitAndInstall 装的是 electron-updater 内部登记的待装文件（downloadedUpdateHelper.file）：
+  // 它已不是我们保留的这个（或已被库清空）时，重验这个文件没意义——通过了也装不上，会变成「ready → 点了又报错」的死循环。
+  // helper 本身取不到（库内部改名）就不拦，与 verifyWinPendingInstaller 里的同款交叉校验口径一致。
+  // 【同一个条件、两处处置不同——有意的（第八轮 L2-05，保持现状只补说明）】
+  //  - 这里（点徽标、对「此前被拒后保留」的文件重验之前）：静默回落 downloadUpdate，不弹框、不删文件。此刻还没有任何「已验签、等着装」
+  //    的东西，helper.file 变了只说明库自己往前走了（读 electron-updater 6.8.9 源码，未实跑）：后续一次下载失败 / 取消时 helper.clear()
+  //    会置空 file 并清空 pending 目录，新一次 downloadUpdate 会用新路径覆盖 file——这是库的正常状态变化、不是篡改证据，
+  //    而且保留的文件此刻可能已经不在了；回落后由 electron-updater 自己按 sha512 决定复用缓存还是重下。
+  //  - win-pending-verify.mjs 的 K3-11（update-downloaded 事件 / installWinUpdate 的 quitAndInstall 之前）：同样的不一致抛「确定不符」
+  //    （删缓存 + 开发布页）。那里已经走到「验过、马上要装」，quitAndInstall 装的是 BaseUpdater.installerPath = helper.file；
+  //    它 ≠ 我们验过的文件意味着库要拉起一个没验过的包，没有安全的回落路径，只能 fail-closed。
+  //  helper.file 与事件里的 downloadedFile：库在 AppUpdater.executeDownload 的 done() 里先 setDownloadedFile(updateFile) 再用同一个
+  //  updateFile 派发事件（新下载、命中缓存两条分支都是），所以事件那一刻二者是同一个字符串；之后才可能分叉（上面两种情形）。
+  const helper = winAutoUpdater?.downloadedUpdateHelper;
+  if (helper && (typeof helper.file !== "string" || !sameWinPath(helper.file, retained.file))) {
+    return discard("electron-updater 登记的待装文件已不是它");
+  }
+  try {
+    await fs.stat(retained.file);
+  } catch {
+    return discard("文件已不在");
+  }
+  log(`[updater] win 对已保留的安装包直接重新验签（不依赖 update-downloaded 重发）v${version}`);
+  winPendingInstaller = null;
+  // 验签是异步的（取 manifest + 算 SHA-256）：与 update-downloaded 同口径、phase 保持 downloading 当「忙」态，
+  // UI 不可点、轮询也不会打断
+  setUpdateState({ phase: "downloading", version, percent: 100, error: null });
+  const ok = await verifyAndMarkWinReady({ ...retained, stage: "重新校验已保留的安装包" });
+  return ok ? "ready" : "rejected";
+};
+
+// installWinUpdate 的「不抛异常」包装：installUpdateNow 要 await 它来持锁，
+// 但它里面任何意外异常都不该被当成「下载失败」报给用户（原先是 fire-and-forget、异常只会变 unhandledRejection）
+const runInstallWinUpdate = (version) =>
+  installWinUpdate(version).catch((err) => {
+    log(`[updater] win 安装流程异常 ${err?.stack || err?.message || err}`);
+  });
 
 // win electron-updater 懒加载初始化（只做一次）：
 // - autoDownload=false 是本方案核心——检查更新只查版本号、不自动下载、把下载推迟到用户点按钮后（对齐 mac）
@@ -2099,6 +2469,25 @@ const installWinUpdate = async (version) => {
       `${reason}。\n\n去发布页手动下载安装包、装到原目录即可（数据不受影响）。装完这一次，之后的自动更新恢复正常。`,
     );
     void shell.openExternal(RELEASE_LATEST_URL);
+    return;
+  }
+  // 安装包验签门禁（R9-01、fail-closed）：quitAndInstall 之前再验一次 manifest 签名 + 实测 size / SHA-256。
+  // 位置有讲究：
+  // - 必须在 quitting 置位 / 墓碑 / 通知之前：失败只是「拒绝」、app 必须继续活着（与上面几道门禁一致）；
+  // - update-downloaded 时已验过一次，这里仍要再验：ready 之后用户可能过了很久才点、或点了失败回 ready 再点，
+  //   要验的是「此刻磁盘上、即将被拉起的那个文件」，而不是事件那一刻的快照。
+  // 失败统一走 rejectUnverifiedWinUpdate（删缓存包 / 回 available / 弹一次框 + 开发布页），不置 quitting。
+  const pendingInstaller = winPendingInstaller;
+  try {
+    await verifyWinPendingInstaller(pendingInstaller);
+  } catch (err) {
+    await rejectUnverifiedWinUpdate({
+      version,
+      file: pendingInstaller?.file,
+      assetName: pendingInstaller?.assetName,
+      err,
+      stage: "安装前",
+    });
     return;
   }
   // 磁盘空间预检（与安装器 .onInit 同口径同阈值，见 disk-space.mjs）：安装器那道预检只在「主进程已退出、
@@ -2171,12 +2560,29 @@ const ensureWinAutoUpdater = async () => {
     mainWindow?.setProgressBar(p.percent / 100);
     setUpdateState({ phase: "downloading", percent: Math.floor(p.percent) });
   });
-  // 下载完成（autoDownload=false 下只会被用户点按钮后的 downloadUpdate 触发）
+  // 下载完成（autoDownload=false 下只会被用户点按钮后的 downloadUpdate 触发）。
+  // R9-01：先验 manifest 签名、通过才置 ready——失败则回 available + 带错误、绝不进 ready，
+  // 这样用户不会先看到「重启更新」、点了才失败。
+  // 验签是异步的（取 manifest + 流式算 SHA-256），这段时间 phase 刻意保持 downloading（percent 100）：
+  // installUpdateNow 对 downloading 直接忽略点击、runUpdateCheck / manualCheckForUpdate 也不会打断它，
+  // 现有的「下载中 / 安装中忽略」状态机原样复用、不引入新 phase。
   winAutoUpdater.on("update-downloaded", (info) => {
     mainWindow?.setProgressBar(-1);
     const v = info?.version || updateReadyVersion;
-    log(`[updater] 新版本 v${v} 已下载完成`);
-    setUpdateState({ phase: "ready", version: v, percent: 100, error: null });
+    log(`[updater] 新版本 v${v} 已下载完成、先验签再置 ready`);
+    winPendingInstaller = null; // 验过之前不算「待装」
+    setUpdateState({ phase: "downloading", version: v, percent: 100, error: null });
+    // 「验签 → 通过则登记待装并置 ready、失败按类型处置」与点徽标重验共用 verifyAndMarkWinReady，
+    // 事件里不再自己写一份（两份会漂移）。ready 只会出现在验签成功之后
+    winDownloadedVerifyTask = verifyAndMarkWinReady({
+      version: v,
+      file: info?.downloadedFile,
+      assetName: pickWinInstallerAssetName(info),
+      stage: "下载完成后",
+    }).catch((err) => {
+      // 兜底：reject 处置自身出意外也别变成 unhandledRejection、更别让 installUpdateNow 的 await 抛出去
+      log(`[updater] win 下载后验签流程异常 ${err?.stack || err?.message || err}`);
+    });
   });
   winAutoUpdater.on("error", (err) => {
     mainWindow?.setProgressBar(-1);
@@ -2204,11 +2610,95 @@ const ensureWinAutoUpdater = async () => {
   return winAutoUpdater;
 };
 
+// mac「自动暂存」（轮询 / 启动检查 / 设置页「检查更新」触发，不是用户点徽标）失败后的统一处置——
+// 「谁弹框、弹什么」的唯一入口（第七轮 K3-05：以前设置页那条路 `.catch(() => {})` 把失败整个吞了）。
+// 点徽标（macSelfUpdate）不走这里：它自己按 trigger="user" 弹框。
+//
+// 登记与弹框是两件事：macVerifyFailedVersion / macVerifyRetry 由 downloadAndStageMacUpdate 的 catch 对所有触发方式一律登记
+// （不管弹没弹框），所以这里只管「要不要告诉用户」，进来时记录已经是最新的。
+//  - trigger="background"（2h 轮询 / 启动检查，没人在等）：
+//      · 确定不符 / 没带清单：弹框 + 开发布页 + 记 wasPrompted（每版本一次、持久）；
+//      · 暂时性 / 未归类：不弹框、不开发布页、不消耗 wasPrompted（一次 503 不该吓人，更不能把唯一一次安全提示用掉）；
+//      · 同一版本连续失败 ≥ 3 次（非永久失败）：再弹**一次**「自动更新多次失败」说明框——只提示、不开发布页，
+//        用独立的进程内标记 repeatedFailurePromptedVersion 去重、**不**碰 wasPrompted（见该变量注释的反例）；
+//  - trigger="user"（设置页「检查更新」后台暂存，用户刚点了按钮）：三类都弹框（暂时性也要说「没成、可重试」），
+//    不看也不消耗 wasPrompted；不叠「多次失败」框（每次失败本来就有自己的反馈）。
+//    验签类（确定不符 / 暂时无法校验 / 没带清单）取 buildVerifyRejectionNotice；非验签类（dmg 502 / 磁盘满 / hdiutil / ditto……）
+//    取 buildGenericUpdateFailureNotice（第八轮 L2-02：与点徽标的 macSelfUpdate 通用分支同一个函数——以前这里一律走验签文案，
+//    「ditto ENOSPC」会被说成「暂时无法校验更新包 / 请检查网络后重试」）。后台触发的非验签类失败仍静默（R6-5 / P2-2）。
+// 用户点徽标的 macSelfUpdate 持有 installInFlight 锁、并合流到同一次暂存时，失败由它统一反馈，这里不再弹（避免同一次失败两个框）。
+//
+// 第八轮 L2-03：downloadAndStageMacUpdate 是单飞的——轮询暂存在途时用户点「检查更新」，两边合流到同一个 promise，失败时拿到
+// **同一个 Error 对象**、各跑一遍本函数（一个 background、一个 user）。用 dialoguedStageErrors（WeakSet<Error>）记「这个错误对象已经
+// 弹过框」，后到的一方跳过弹框 / 开发布页 / 「多次失败」框，同一次失败不会弹两个框、开两次发布页。
+// 只在**真的要弹框**时占位：后台对暂时性 / 未归类失败本来就静默、不占位，用户那次手动检查的反馈因此不会丢。
+// 占位与弹框之间不能有 await（见 claimStageErrorDialog），所以放在每个 showErrorBox 的紧前面、并且在 await wasPrompted / markPrompted 之后。
+// 抛出的若是字符串等非对象（WeakSet 放不进去）就不去重、照常弹。
+const dialoguedStageErrors = new WeakSet();
+const claimStageErrorDialog = (err) => {
+  if ((typeof err !== "object" && typeof err !== "function") || err === null) return true;
+  if (dialoguedStageErrors.has(err)) return false;
+  dialoguedStageErrors.add(err);
+  return true;
+};
+const handleMacStageFailure = async (err, version, trigger) => {
+  if (installInFlight) {
+    log(`[updater] mac 暂存失败（点徽标流程已接管反馈、此处不再弹框）${err?.message || err}`);
+    return;
+  }
+  const notice =
+    trigger === "user" && !isVerifyFailure(err)
+      ? buildGenericUpdateFailureNotice(err)
+      : buildVerifyRejectionNotice(err, {
+          trigger,
+          alreadyPrompted: trigger === "background" ? await wasPrompted(version) : false,
+        });
+  log(
+    `[updater] mac 暂存失败（拒绝自动安装；触发=${trigger} 弹框=${notice.showDialog} 开发布页=${notice.openReleasePage}）${notice.reason}`,
+  );
+  // 先记「已提示」再弹（showErrorBox 在 mac 上同步阻塞到用户点掉；弹框期间退出也不会下次再弹一遍）。
+  // markPrompted 不受去重影响：「这个版本的完整性告警已经让用户看到过」不论是哪一方弹的都成立
+  if (notice.markPrompted) await markPrompted(version);
+  // 以下到 showErrorBox / openExternal 之间不能再 await：占位（claim）与弹框必须在同一个同步段里、否则两方可能同时通过检查
+  if (notice.showDialog && claimStageErrorDialog(err)) {
+    dialog.showErrorBox(notice.title, notice.body);
+    if (notice.openReleasePage) void shell.openExternal(RELEASE_LATEST_URL);
+  } else if (notice.showDialog) {
+    log(`[updater] mac 暂存失败：同一个错误已由另一路触发弹过框、此处跳过弹框与开发布页（触发=${trigger}）`);
+  } else if (notice.openReleasePage) {
+    // 防御：现有纯函数里「开发布页」恒伴随「弹框」；万一以后拆开，仍照原语义开页（不占弹框名额）
+    void shell.openExternal(RELEASE_LATEST_URL);
+  }
+  if (
+    trigger === "background" &&
+    !isPermanentVerifyFailure(err) &&
+    shouldPromptRepeatedFailure(macVerifyRetry, version, repeatedFailurePromptedVersion)
+  ) {
+    // 同一个错误对象已被另一路弹过框就不再叠一个「多次失败」框，也**不**置标记（这次没真弹，下一次后台失败仍可提示）
+    if (claimStageErrorDialog(err)) {
+      // 同样先置标记再弹
+      repeatedFailurePromptedVersion = version;
+      const repeated = buildRepeatedFailureNotice({
+        version,
+        failures: macVerifyRetry.failures,
+        reason: notice.reason,
+      });
+      log(`[updater] mac v${version} 连续失败 ${macVerifyRetry.failures} 次、提示用户（不开发布页、不占 wasPrompted 名额）`);
+      dialog.showErrorBox(repeated.title, repeated.body);
+    } else {
+      log(`[updater] mac v${version} 连续失败已达阈值、但同一个错误已弹过框、本次不再叠「多次失败」框`);
+    }
+  }
+};
+
 // 查一次更新（启动 + 每 2h 轮询都走这）。
 // 发现新版一律不弹窗、只静默点亮右上角「新版本」徽标（2026-07-15 用户拍板）。
 // win：只查版本号、用户点徽标才下载（electron-updater autoDownload=false）。
 // mac：查到新版后立刻后台下载暂存（不碰 /Applications）；点徽标 = apply+relaunch，
-//       不点则退出时自动套用；暂存失败仍弹 showErrorBox（每版本一次、降级手动下载）。
+//       不点则退出时自动套用。暂存失败的处置见 handleMacStageFailure（R6-5、同 Windows）：确定不符 / 没带清单 = 弹框 + 开发布页
+//       （每版本一次、降级手动下载）；暂时性 / 未归类 = 不弹框、错误留在 updateState.error、按时间退避；连续 3 次提示一次；
+//       会白下 dmg 的失败（未归类 / local-io）同版本累计 3 次后轮询放弃自动暂存（macStageGiveUpVersion，第八轮 L2-01；
+//       「累计」不是严格连续——期间的 503 等清单阶段失败既不累计也不重置，成功暂存 / 换版本才清零）。
 const runUpdateCheck = async () => {
   try {
     const current = app.getVersion();
@@ -2238,20 +2728,34 @@ const runUpdateCheck = async () => {
     // 安装中跳过（二轮复审 P1）：apply 已消费 meta、此刻再触发 staging 会重新下 dmg、
     // 与替换 / relaunch / 启动清扫竞态
     if (UPDATE_MODE === "download" && !installInFlight && updateState.phase !== "installing") {
-      try {
-        await downloadAndStageMacUpdate(latest);
-      } catch (err) {
-        // 验签 / 下载失败 = 拒绝自动安装；徽标已亮，提示一次并开下载页（点徽标仍可重试）
+      if (macVerifyFailedVersion === latest) {
+        // M3-04：同一版本本进程内已验签失败过——不再自动重下 100MB+ 的 dmg 白算一遍。
+        // 徽标仍亮（上一次失败时已置 available + 带错误）、用户点它就是显式重试；重启应用同样会重置
+        log(`[updater] mac v${latest} 本进程内验签失败过、跳过自动暂存（点更新徽标或重启应用可重试）`);
+      } else if (macStageGiveUpVersion === latest) {
+        // 第八轮 L2-01：同版本「会白下 dmg 的失败」（未归类错误 / local-io）已累计 ≥ 3 次（期间的 503 等清单阶段失败既不累计也不重置）——后台轮询不再替用户整包重下 100MB+。
+        // 退避救不了这个（它不读 failures、对 2h 轮询基本不设防，见 macVerifyRetry 注释）。只记一行日志、不弹框；
+        // 徽标仍亮（失败时已置 available + 带错误）、点徽标 / 设置页「检查更新」是显式重试（成功暂存即解除）；换版本 / 重启同样解除。
+        log(`[updater] mac v${latest} 自动暂存累计失败 ${macCostlyFailures?.count ?? "多"} 次、放弃自动暂存（点更新徽标或「检查更新」可重试）`);
+      } else if (isVerifyRetryBlocked(macVerifyRetry, latest, Date.now())) {
+        // F1-01：非永久失败（5xx / 限流 / 超时 / dmg 下载失败……）只按时间退避、不永久跳过——退避期内不重下，到点自动放行。
+        // 如实说明（第八轮 L2-04 订正）：退避对 2h 轮询**不是保护**——放不放行只看「最近一次失败时刻 + 退避」是否 ≤ 本次轮询时刻：
+        // 常见情形前 5 次失败都放行、走不到这个分支，但失败发生得晚（点徽标 / 手动检查在两次轮询之间失败）会被挡一轮；
+        // 封顶后（连续失败 ≥ 6 次）失败只要晚于触发就隔一轮跳过一次（见 update-verify-retry.mjs 文件头）。
+        // 所以会白下 dmg 的未归类失败靠上面的 macStageGiveUpVersion 闸止损，不靠这里
         log(
-          `[updater] mac 暂存失败（拒绝自动安装、降级手动下载）${err?.message || err}`,
+          `[updater] mac v${latest} 自动暂存暂时失败、退避中，跳过自动暂存` +
+            `（约 ${Math.ceil((macVerifyRetry.notBefore - Date.now()) / 60_000)} 分钟后自动重试；点更新徽标可立即重试）`,
         );
-        if (!(await wasPrompted(latest))) {
-          await markPrompted(latest);
-          dialog.showErrorBox(
-            "自动更新不可用",
-            `发现新版本 v${latest}，但自动安装未通过完整性校验：\n${err?.message || err}\n\n将打开下载页，请手动下载安装。`,
-          );
-          void shell.openExternal(RELEASE_LATEST_URL);
+      } else {
+        try {
+          await downloadAndStageMacUpdate(latest);
+        } catch (err) {
+          // 暂存失败 = 拒绝自动安装；徽标已亮、错误文案已由 downloadAndStageMacUpdate 写进 updateState.error
+          // （点徽标仍可重试）。弹不弹框 / 开不开发布页 / 记不记「已提示」按失败**类型**由
+          // handleMacStageFailure 一处决定（读 buildVerifyRejectionNotice：与 Windows rejectUnverifiedWinUpdate 同一个纯函数，
+          // 只是 trigger 不同；连续失败 3 次的「多次失败」提示也在那里）
+          await handleMacStageFailure(err, latest, "background");
         }
       }
     }
@@ -2307,7 +2811,9 @@ const manualCheckForUpdate = async () => {
       }
       // mac：手动检查发现新版也立刻后台暂存（对齐轮询、含 installing 门闩）、
       // 徽标随进度走、点徽标秒装。
-      // 失败静默回 available（wrapper 管）——手动路径 toast 已提示去点徽标、点了会重试并明错
+      // 失败：状态回 available（downloadAndStageMacUpdate 的 catch 管）+ 走 handleMacStageFailure 以 trigger="user" 反馈
+      // （K3-05：这是用户点了「检查更新」触发的，三类失败都该有反馈；以前 `.catch(() => {})` 把第一次确定不符整个吞了，
+      // 而它已被登记为永久失败、之后后台轮询永远跳过它——这个版本的完整性告警就再也弹不出来了）
       if (
         UPDATE_MODE === "download" &&
         app.isPackaged &&
@@ -2315,7 +2821,21 @@ const manualCheckForUpdate = async () => {
         !installInFlight &&
         updateState.phase !== "installing"
       ) {
-        void downloadAndStageMacUpdate(latest).catch(() => {});
+        // M3-04：同版本验签失败过就不再自动重下（反复点「检查更新」= 反复下 dmg 再静默失败）；
+        // 结果里仍照常告诉用户有新版、点徽标才是显式重试
+        if (macVerifyFailedVersion === latest) {
+          log(`[updater] mac v${latest} 本进程内验签失败过、手动检查也跳过自动暂存`);
+        } else if (isVerifyRetryBlocked(macVerifyRetry, latest, Date.now())) {
+          // F1-01：非永久失败的退避期内同样不重下（到点后手动检查会放行）
+          log(`[updater] mac v${latest} 自动暂存暂时失败、退避中，手动检查也跳过自动暂存`);
+        } else {
+          // 第八轮 L2-01：这里**刻意不读** macStageGiveUpVersion——「放弃自动暂存」只约束没人在等的后台轮询；
+          // 用户点了「检查更新」就是显式重试，照常发起（成功暂存会解除闸，失败则计数继续涨、闸保持登记）。
+          void downloadAndStageMacUpdate(latest)
+            .catch((err) => handleMacStageFailure(err, latest, "user"))
+            // 反馈本身（弹框 / 写 wasPrompted）出错不能变成未处理的 rejection；不会影响已返回的手动检查结果
+            .catch((e) => log(`[updater] mac 手动检查的暂存失败反馈出错（忽略）${e?.message || e}`));
+        }
       }
       return { status: "available", current, latest };
     }

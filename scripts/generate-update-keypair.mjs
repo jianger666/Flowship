@@ -15,19 +15,35 @@
  *   3. 两者都配好后、后续 release 必带 update-manifest.json、壳强制验签
  *
  * 可选：UPDATE_MANIFEST_KEYPAIR_OUT=/path/to/private.pem 把私钥落到文件（默认只 stdout）
+ *
+ * ⚠️ 公钥文件已存在时默认**拒绝覆盖**（要换密钥对必须显式加 `--force`）：
+ *   公钥是壳里内置、CI 验签共用的单一来源，换掉它 = 已发布的所有客户端都对不上新私钥签的 manifest、
+ *   自更新全部验签失败（要等用户手动装新包）。手滑再跑一次这个脚本的代价远大于加一个参数。
+ *   覆盖前请确认：新私钥已写进 GitHub secret `UPDATE_MANIFEST_PRIVATE_KEY`，且接受「存量客户端需手动升级」。
  */
 import { generateKeyPairSync } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const publicKeyPath = path.join(root, "electron-app", "update-manifest-public-key.pem");
+
+// 先于生成密钥对判断：拒绝时不应产生任何副作用、也不该把一把「用不上的私钥」打到终端
+if (existsSync(publicKeyPath) && !process.argv.includes("--force")) {
+  console.error(
+    `拒绝覆盖：${publicKeyPath} 已存在。\n` +
+      "重新生成密钥对会让所有已发布的客户端验签失败（需手动升级）。\n" +
+      "确实要换密钥对：node scripts/generate-update-keypair.mjs --force",
+  );
+  process.exit(1);
+}
 
 const { publicKey, privateKey } = generateKeyPairSync("ed25519");
 
 const pubPem = publicKey.export({ type: "spki", format: "pem" }).toString();
 const privPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const publicKeyPath = path.join(root, "electron-app", "update-manifest-public-key.pem");
 await fs.writeFile(publicKeyPath, pubPem, "utf8");
 
 const outPriv = process.env.UPDATE_MANIFEST_KEYPAIR_OUT?.trim();

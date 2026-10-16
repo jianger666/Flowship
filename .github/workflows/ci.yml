@@ -1,0 +1,52 @@
+# 门禁：typecheck + eslint + 全量 vitest（对应 AGENTS.md「发版流程」里的门禁三件套）。
+#
+# 三个入口：
+#   - release.yml 发版前（workflow_call）：门禁不过 → 不 build、不建 draft release、不出包；
+#   - pull_request：合入前自检；
+#   - workflow_dispatch：打 tag 前手动点一次，先确认 Linux 上全绿（门禁只在 ubuntu 跑，
+#     Windows / mac 专属行为靠测试里的模拟，真机行为不在这里验证）。
+#
+# 历史：原 sdk-gate.yml 只在 SDK / store 相关路径变更时跑一小撮对拍测试，且 worker 隔离删除后
+# 已无独立职责；全量 vitest 已包含那几组测试，这里不再保留按路径触发的子集门禁。
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      # 部分集成测试会真跑 git commit：GitHub runner 没有全局 git 身份，这里兜底
+      # （测试自己带 -c user.name 的不受影响；覆盖不到的用例至少不会因「Please tell me who you are」红）
+      GIT_AUTHOR_NAME: ci
+      GIT_AUTHOR_EMAIL: ci@example.invalid
+      GIT_COMMITTER_NAME: ci
+      GIT_COMMITTER_EMAIL: ci@example.invalid
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 版本从 package.json 的 packageManager 字段读、不在这双写
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: ESLint
+        run: pnpm lint
+
+      # tests/setup/hermetic-env.ts 会把数据目录指到临时目录并剔除宿主注入变量，CI 里无需额外隔离
+      - name: 单测
+        run: pnpm test
