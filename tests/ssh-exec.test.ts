@@ -33,6 +33,17 @@ type Result = {
   error?: string;
 };
 
+/**
+ * 把「假 ssh 的 stdout」写进文件、返回路径（配合 SSH2_FAKE_STDOUT_FILE）。
+ * 不能用环境变量传大输出：Linux 单个环境变量上限 128KB（MAX_ARG_STRLEN），
+ * 150KB / 500KB 的 env 会让 spawn 直接 E2BIG（macOS 没这个限制，本机跑不出来、CI 的 Linux 才红）。
+ */
+const writeFakeStdoutFile = async (content: string): Promise<string> => {
+  const file = path.join(TMP, "fake-stdout.txt");
+  await writeFile(file, content);
+  return file;
+};
+
 /** spawn 脚本并读 stdout JSON（非零退出码也正常返回，错误场景脚本按设计 exit 1） */
 const run = async (
   args: string[],
@@ -89,7 +100,7 @@ describe("ssh-exec CLI", () => {
   it("大 stdout 完整进入 JSON（不因提前 exit 截断）", async () => {
     const big = "x".repeat(150_000);
     const { result } = await run(["--env", "test", "--", "cat big.log"], {
-      SSH2_FAKE_STDOUT: big,
+      SSH2_FAKE_STDOUT_FILE: await writeFakeStdoutFile(big),
     });
     expect(result.ok).toBe(true);
     expect(result.stdout.length).toBe(big.length);
@@ -99,7 +110,7 @@ describe("ssh-exec CLI", () => {
   it("超大 stdout 在累积阶段截断、JSON 体积有界", async () => {
     const big = "y".repeat(500_000);
     const { result } = await run(["--env", "test", "--", "cat huge.log"], {
-      SSH2_FAKE_STDOUT: big,
+      SSH2_FAKE_STDOUT_FILE: await writeFakeStdoutFile(big),
     });
     expect(result.ok).toBe(true);
     expect(result.stdout.length).toBeLessThan(210_000);

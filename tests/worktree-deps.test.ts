@@ -406,10 +406,14 @@ describe("runSetupCommand · Windows 分支（注入 platform / killWinTree）",
     }
   }, 30_000);
 
-  it("killWinTree 失败（taskkill 不存在 / 进程已不在）→ 退化为直接 child.kill，不必干等宽限期", async () => {
+  // 前提：回退的 child.kill 打到的 pid 就是 node 本身。POSIX 的 `/bin/sh -c` 不一定 exec 最后一条命令——
+  // macOS 的 sh 是 bash 会 exec，但 Debian / Ubuntu 的 dash 不会（CI 的 Linux 上实测：spawn 返回的 pid 是 sh、node 是它的子进程），
+  // kill 只杀得到 sh、node 变孤儿继续占着管道，close 不来、只能等满宽限期，用例就红。所以 POSIX 下显式加 `exec ` 前缀，
+  // 让 sh 被 node 替换。Windows 的 cmd.exe 没有 exec、同样「child.kill 只杀得到壳」，这条的前提在 win32 上不成立，跳过。
+  it.skipIf(process.platform === "win32")("killWinTree 失败（taskkill 不存在 / 进程已不在）→ 退化为直接 child.kill，不必干等宽限期", async () => {
     const cwd = await mk();
     const started = Date.now();
-    const res = await runSetupCommand(nodeCmd("setInterval(()=>{},1000)"), cwd, {
+    const res = await runSetupCommand(`exec ${nodeCmd("setInterval(()=>{},1000)")}`, cwd, {
       rootWorktreePath: cwd,
       timeoutMs: 400,
       platform: "win32",

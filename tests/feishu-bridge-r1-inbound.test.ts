@@ -3,7 +3,7 @@
  */
 import { EventEmitter } from "node:events";
 import type { ChildProcess, spawn as nodeSpawn } from "node:child_process";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   baseRouterDeps,
@@ -259,6 +259,20 @@ describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
 });
 
 describe("R1-8：keep-awake exit 身份校验", () => {
+  // KeepAwake.start() 只在 darwin / win32 才起子进程，其余平台（CI 的 Linux）直接跳过、isActive() 恒为 false。
+  // 这条用例验的是 exit 身份校验、与平台无关，所以把平台固定成 darwin（spawn 已被注入替换，不会真起 caffeinate）。
+  const realPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  beforeEach(() => {
+    Object.defineProperty(process, "platform", {
+      value: "darwin",
+      configurable: true,
+    });
+  });
+  afterEach(() => {
+    Object.defineProperty(process, "platform", realPlatform);
+    vi.useRealTimers();
+  });
+
   it("stop→start 快切后旧 exit 不清新 child、不排重启", async () => {
     vi.useFakeTimers();
     const children: Array<{

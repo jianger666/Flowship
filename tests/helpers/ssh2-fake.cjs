@@ -61,7 +61,11 @@ class FakeClient {
     }
     const stream = {
       on: (ev, h) => {
-        if (ev === "data") h(Buffer.from(process.env.SSH2_FAKE_STDOUT || ""));
+        if (ev === "data") {
+          // 大输出走文件：Linux 单个环境变量上限 128KB（MAX_ARG_STRLEN），150KB+ 的 env 会让 spawn 直接 E2BIG
+          const f = process.env.SSH2_FAKE_STDOUT_FILE;
+          h(f ? fs.readFileSync(f) : Buffer.from(process.env.SSH2_FAKE_STDOUT || ""));
+        }
         if (ev === "error" && process.env.SSH2_FAKE_MODE === "stream-error") {
           process.nextTick(() => h(new Error("remote channel exploded")));
         }
