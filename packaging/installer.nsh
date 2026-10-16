@@ -23,6 +23,8 @@
 ;   tmpredirect = 旧版本移除提速：result=applied 表示旧卸载器的 TEMP 已临时指到旧安装目录所在盘；其余取值是没改的原因
 ;               （fresh-install / same-drive / not-drive-path / mkdir-failed / write-failed / already），见「旧版本移除提速」
 ;   tmprestore  = 旧卸载器退出后还原 TEMP 并清理临时目录（dir=removed 清掉了 / kept 保留：旧卸载器失败）
+;   heal      = 旧安装自愈（mode=broken / failed；result=cleaned / partial 表示已强清旧目录），见下方「旧安装自愈」
+;   appclose  = 手动安装发现 Flowship 仍在运行、弹框问用户（step=prompt / declined / stuck / aborted / done），见「安装前确认 App 已退出」
 ;   ABORT     = 静默更新预检不过、主动退出（此时旧版本一个文件都没动）
 ;   WARN      = 手动安装预检不过、弹框问用户（CONTINUE = 用户选了继续；DECLINED = 取消、旧版本没动）
 ; 只写 ASCII、路径只记盘符（StrCpy $N $INSTDIR 2 → "E:"）：FileWrite 在 Unicode 安装器里按系统 ANSI
@@ -69,6 +71,8 @@
   Var flowshipTmpDir
   Var flowshipOrigTemp
   Var flowshipOrigTmp
+  ; 旧安装自愈（见 flowshipForceCleanOld）：1 = 旧安装目录已被我们强清（主程序没了）
+  Var flowshipHealed
 !endif
 
 ; 追加一行日志："[ts=<unix 秒>] <MSG>"。全程保护寄存器（Push/Pop），失败不报错。
@@ -284,6 +288,233 @@
   ${endIf}
 !macroend
 
+; ===== 旧安装自愈（v1.9.32）=====
+; 为什么：有同事的机器上「装 / 更新必报 Flowship 无法关闭」、点重试永远过不去，只能手动跑清理脚本
+; （结束进程 + 删整个安装目录 + 删卸载注册表项）才能重装。那个框的文案是误导——它是官方
+; uninstallOldVersion 在「旧卸载器连续 5 次退出码非 0」之后弹的，跟进程没关系；旧卸载器失败的根因没取证到，
+; 但这台机器上它失败之后目录留下半截（主程序没了、注册表还指着它），之后每次安装都撞同一个墙。
+; 与其等根因，不如把那个脚本做成安装器自己的兜底，两道：
+;   broken = 覆盖安装前预检：注册表有卸载记录、但旧安装目录里已经没有主程序 → 这个安装本来就废了、
+;            没有任何东西值得卸载。直接清掉目录 + 删卸载注册表项，官方 uninstallOldVersion 读不到
+;            UninstallString 就整段跳过（根本不再去调那个必败的旧卸载器，也就没有那个框）。
+;            手动安装在「点安装」那一刻跑（begin 页）、静默安装 / 自动更新在 customInit 里跑。
+;   failed = 旧卸载器已经跑了、退出码非 0（官方 5 次重试用尽 / 用户在那个框上点了取消，静默安装自动取消）：
+;            以前这里弹框 + Quit，装不下去。现在 App 没在跑的话就强清旧目录、当作移除成功继续往下装。
+;            App 还在跑 / 没法确认 / 清完主程序还在 → 保持原行为（弹框 + Quit），不会把一个还活着的 App 删残。
+; 安全：只动「X:\…\${APP_FILENAME}」这种盘符路径（目录名必须恰好是 APP_FILENAME，防注册表值被改出花样后
+; 整树递归删到别处）；只删安装目录，用户数据在 %APPDATA%\fe-ai-flow、不受影响（旧卸载器自己的兜底也是整目录删）。
+; 目录来源与官方 uninstallOldVersion 同口径：注册表 InstallLocation，没有就取卸载器路径的父目录。
+; 参数 MODE：字面量 "broken" 或 "failed"。结果记 installer.log 的 heal 行：
+;   result=cleaned（目录删干净）/ partial（主程序没了、目录有残留文件）/ healthy / app-running / exe-still-there /
+;   process-check-failed / no-uninstall-record / no-location / not-drive-path / not-app-dir
+; 成功（cleaned / partial）时 $flowshipHealed = "1"。
+; 调用方不需要保护寄存器（自带 Push/Pop，只改错误标志）。
+!macro flowshipForceCleanOld MODE
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  StrCpy $flowshipHealed "0"
+  StrCpy $2 "ok"
+  ; $3 = 卸载器完整路径（UninstallString 里带引号的那段；官方 uninstallOldVersion 的同款解析）
+  ReadRegStr $3 SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" "UninstallString"
+  !ifdef UNINSTALL_REGISTRY_KEY_2
+    ${if} $3 == ""
+      ReadRegStr $3 SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY_2}" "UninstallString"
+    ${endIf}
+  !endif
+  ${if} $3 == ""
+    ${if} "${MODE}" == "broken"
+      StrCpy $2 "no-uninstall-record"
+    ${endIf}
+  ${endIf}
+  StrCpy $4 $3 1
+  ${if} $4 == '"'
+    StrCpy $3 $3 "" 1
+    StrCpy $4 0
+    ${Do}
+      StrCpy $1 $3 1 $4
+      ${if} $1 == ""
+      ${orIf} $1 == '"'
+        ${ExitDo}
+      ${endIf}
+      IntOp $4 $4 + 1
+    ${Loop}
+    StrCpy $3 $3 $4
+  ${endIf}
+  ; $0 = 旧安装目录
+  ReadRegStr $0 SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" "InstallLocation"
+  ${if} $0 == ""
+  ${andIf} $3 != ""
+    StrLen $4 $3
+    ${Do}
+      IntOp $4 $4 - 1
+      ${if} $4 < 1
+        ${ExitDo}
+      ${endIf}
+      StrCpy $1 $3 1 $4
+      ${if} $1 == "\"
+        StrCpy $0 $3 $4
+        ${ExitDo}
+      ${endIf}
+    ${Loop}
+  ${endIf}
+  ; 容忍被引号包起来 / 带尾部分隔符的旧值
+  StrCpy $1 $0 1
+  ${if} $1 == '"'
+    StrCpy $0 $0 "" 1
+  ${endIf}
+  StrCpy $1 $0 1 -1
+  ${if} $1 == '"'
+  ${orIf} $1 == "\"
+    StrLen $4 $0
+    IntOp $4 $4 - 1
+    StrCpy $0 $0 $4
+  ${endIf}
+  ; 目录必须是「X:\…\${APP_FILENAME}」
+  ${if} $2 == "ok"
+    ${if} $0 == ""
+      StrCpy $2 "no-location"
+    ${else}
+      StrCpy $1 $0 1 1
+      StrCpy $4 $0 1 2
+      ${if} $1 != ":"
+      ${orIf} $4 != "\"
+        StrCpy $2 "not-drive-path"
+      ${else}
+        StrLen $4 "\${APP_FILENAME}"
+        IntOp $4 0 - $4
+        StrCpy $1 $0 "" $4
+        ${if} $1 != "\${APP_FILENAME}"
+          StrCpy $2 "not-app-dir"
+        ${endIf}
+      ${endIf}
+    ${endIf}
+  ${endIf}
+  ; 触发条件
+  ${if} $2 == "ok"
+    ${if} "${MODE}" == "broken"
+      ; 主程序还在 = 这是个能用的安装，交给官方旧卸载器去卸，这里不碰
+      ${if} ${FileExists} "$0\${APP_EXECUTABLE_FILENAME}"
+        StrCpy $2 "healthy"
+      ${endIf}
+    ${else}
+      ; App 还在跑就不删：锁住的文件删不掉、半删又装不上，比旧卸载器干净回滚后留下的完整旧版更糟。
+      ; 与官方 FIND_PROCESS 的 tasklist 分支同款命令（不限用户：别的会话里的 Flowship 也算在跑）。
+      ; 退出码 0 = 找到了、1 = 没找到；其它（cmd / tasklist 起不来）= 没法确认，同样不删。
+      nsExec::Exec `"$SYSDIR\cmd.exe" /C tasklist /FI "IMAGENAME eq ${APP_EXECUTABLE_FILENAME}" /FO CSV /NH | "$SYSDIR\findstr.exe" /B /I /C:"\"${APP_EXECUTABLE_FILENAME}\""`
+      Pop $4
+      ${if} $4 == "0"
+        StrCpy $2 "app-running"
+      ${elseIf} $4 != "1"
+        StrCpy $2 "process-check-failed"
+      ${endIf}
+    ${endIf}
+  ${endIf}
+  ; 清理：先把当前目录挪出去（进程的 cwd 在旧目录里时目录本身删不掉）；
+  ; 确认主程序已经没了才删卸载注册表项（没删干净就不动注册表、保持原行为）
+  ${if} $2 == "ok"
+    DetailPrint "old install is broken or its uninstaller keeps failing: removing it and installing fresh"
+    SetOutPath $TEMP
+    RMDir /r "$0"
+    ${if} ${FileExists} "$0\${APP_EXECUTABLE_FILENAME}"
+      StrCpy $2 "exe-still-there"
+    ${else}
+      DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"
+      !ifdef UNINSTALL_REGISTRY_KEY_2
+        DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY_2}"
+      !endif
+      StrCpy $flowshipHealed "1"
+      ${if} ${FileExists} "$0\*.*"
+        StrCpy $2 "partial"
+      ${else}
+        StrCpy $2 "cleaned"
+      ${endIf}
+    ${endIf}
+  ${endIf}
+  ClearErrors
+  ; 日志只记盘符（见文件开头：路径含中文时 ANSI 落盘、读取端会乱码）
+  StrCpy $1 $0 2
+  !insertmacro flowshipLog "heal v${VERSION} mode=${MODE} result=$2 oldDrive=$1"
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
+; ===== 安装前确认 App 已退出（v1.9.32，仅有界面的手动安装）=====
+; 为什么：以前手动安装在 customInit（安装器一启动、用户还没点「安装」）就无条件 taskkill——用户可能只是点开看看、
+; 随后取消，App 却已经被杀；而且用户对「App 被杀了」毫无预期。同时，「Flowship 没退」常常是用户看不见的：
+; App 崩溃 / 被强杀后内置 server 会变成没有窗口的孤儿进程（它和主程序是同一个 exe 镜像），
+; 用户在任务栏里什么也看不到，却会让后面的文件被占用。
+; 现在：点「安装」那一刻（begin 页）先查有没有 Flowship.exe 在跑（不管是有窗口的真没退、还是看不见的孤儿，
+; 查到的方式一样）→ 没有就什么都不提示；有就弹框说明「安装需要先退出」，点「确定」才杀（/T 整棵树）、
+; 然后等它真退出（最多约 5 秒，逐 0.5 秒复查）；点「取消」退出安装、什么都没动。
+; 杀完还在（App 以管理员身份运行 / 在别的 Windows 登录会话里 / 被安全软件保护）：再弹「重试 / 忽略 / 中止」——
+; 「忽略」是给多用户同机的人留的口子（别人的进程本来就不该挡我们这个用户的安装）。
+; 查不出来（cmd / tasklist 起不来）当作没在跑、不拦安装（与改动前等价：之前也没有任何检查）。
+; ⚠️ 这不覆盖「旧卸载器自己失败」那类假「无法关闭」——那时 Flowship.exe 根本没在跑，由上面的旧安装自愈兜底。
+; 不覆盖：无界面的 /S 手动安装（没人可问，仍在 customInit 里直接杀）、自动更新（主进程自己清，见 customInit）。
+; 日志只在弹过框时写：appclose step=prompt / declined / stuck / aborted / done（done 的 running=0 已退出、1 仍在、? 没法确认）。
+; 探测宏：$0 返回 1 = 在跑、0 = 没在跑、? = 没法确认。命令与官方 FIND_PROCESS 的 tasklist 分支同形，但不加用户过滤：
+; 官方的 USERNAME 过滤只写 %USERNAME%，而 tasklist 的该过滤器据我所知匹配的是「域\用户」全名，
+; 只写用户名在不少机器上可能匹配不到（没有在 Windows 上验证）——查漏了 = 该问的不问、孤儿进程继续挡安装，
+; 宁可多问一次（多用户同机的人有「忽略」兜底）。
+!macro flowshipAppRunningProbe
+  nsExec::Exec `"$SYSDIR\cmd.exe" /C tasklist /FI "IMAGENAME eq ${APP_EXECUTABLE_FILENAME}" /FO CSV /NH | "$SYSDIR\findstr.exe" /B /I /C:"\"${APP_EXECUTABLE_FILENAME}\""`
+  Pop $0
+  ${if} $0 == "0"
+    StrCpy $0 "1"
+  ${elseIf} $0 == "1"
+    StrCpy $0 "0"
+  ${else}
+    StrCpy $0 "?"
+  ${endIf}
+!macroend
+
+; 只在 begin 页里展开一次（宏内是固定名字的标签，展开两次会重复定义、编译直接报错）。自带 Push/Pop。
+!macro flowshipEnsureAppClosed
+  Push $0
+  Push $1
+  Push $2
+  ; $1 = 是否已经问过用户（0 / 1）
+  StrCpy $1 "0"
+  flowshipAppCloseCheck:
+    !insertmacro flowshipAppRunningProbe
+    StrCmp $0 "1" 0 flowshipAppCloseDone
+    StrCmp $1 "0" flowshipAppCloseAsk flowshipAppCloseRetryAsk
+  flowshipAppCloseAsk:
+    StrCpy $1 "1"
+    !insertmacro flowshipLog "appclose v${VERSION} step=prompt"
+    MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION "检测到 ${PRODUCT_NAME} 仍在运行（可能只剩没有窗口的后台进程）。$\n$\n安装前需要先退出它：点「确定」将关闭 ${PRODUCT_NAME} 并继续安装（任务数据保存在磁盘上、不会丢失；正在运行的任务会被中断）；点「取消」退出安装。" /SD IDOK IDOK flowshipAppCloseKill
+    !insertmacro flowshipLog "appclose v${VERSION} step=declined"
+    Quit
+  flowshipAppCloseRetryAsk:
+    !insertmacro flowshipLog "appclose v${VERSION} step=stuck"
+    MessageBox MB_ABORTRETRYIGNORE|MB_ICONEXCLAMATION "无法关闭 ${PRODUCT_NAME}。它可能以管理员身份运行，或运行在其他 Windows 登录会话里。$\n$\n请在任务管理器里手动结束 ${PRODUCT_NAME}（含后台进程），然后点「重试」；点「忽略」不管它、直接继续安装（若文件被占用，安装可能失败）；点「中止」退出安装。" /SD IDIGNORE IDRETRY flowshipAppCloseKill IDIGNORE flowshipAppCloseDone
+    !insertmacro flowshipLog "appclose v${VERSION} step=aborted"
+    Quit
+  flowshipAppCloseKill:
+    nsExec::Exec 'taskkill /F /T /IM "${APP_EXECUTABLE_FILENAME}"'
+    Pop $0
+    StrCpy $2 0
+  flowshipAppCloseWait:
+    Sleep 500
+    !insertmacro flowshipAppRunningProbe
+    StrCmp $0 "1" 0 flowshipAppCloseCheck
+    IntOp $2 $2 + 1
+    IntCmp $2 10 flowshipAppCloseCheck flowshipAppCloseWait flowshipAppCloseCheck
+  flowshipAppCloseDone:
+    StrCmp $1 "1" 0 flowshipAppCloseEnd
+    !insertmacro flowshipLog "appclose v${VERSION} step=done running=$0"
+  flowshipAppCloseEnd:
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
 ; 在「选目录」页之后、「安装」页之前插一个永远不显示的页（creator 里 Abort = 跳过该页）：
 ; 它的回调恰好在用户点「安装」的那一刻执行一次，正好用来记 begin 时间点。
 ; （electron-builder 的 instFilesPre 在这个页之后、不能改，所以走 customPageAfterChangeDir 这个官方扩展点。）
@@ -295,6 +526,9 @@
     Push $0
     Push $1
     Push $2
+    ; 先确认 App 已退出（见 flowshipEnsureAppClosed）：放在 begin 计时之前——用户在弹框上停留的时间
+    ; 算向导停留（waitSec），不算安装慢；也要先于下面的一切（实测 / TEMP 重定向 / 旧安装自愈 / 官方旧卸载器）。
+    !insertmacro flowshipEnsureAppClosed
     System::Call 'kernel32::GetTickCount()i.r0'
     StrCpy $flowshipBeginTick $0
     ; probe / 旧版本移除的时间点先对齐到 begin：万一下面的钩子没被调用，对应的秒数也是 0 而不是负数
@@ -314,6 +548,9 @@
     ; 旧版本移除提速（见 flowshipTmpRedirect）：手动安装在「点安装」这一刻设；静默安装 / 自动更新没有这一页，在 customInit 里设。
     ; 放在 tick 重取之后：建目录 + 验证可写只是几毫秒，算进旧版本移除那一段（它本来就是这一段的一部分）。
     !insertmacro flowshipTmpRedirect
+    ; 旧安装自愈（见 flowshipForceCleanOld）：旧目录里主程序已经没了、注册表却还指着它 → 清掉，官方旧卸载器整段跳过。
+    ; 放在「点安装」这一刻（用户已确认要装、此后不会再退出向导）；静默安装在 customInit 里跑同一个宏。
+    !insertmacro flowshipForceCleanOld "broken"
     Pop $2
     Pop $1
     Pop $0
@@ -334,15 +571,26 @@
   StrCpy $1 "0"
   IfErrors 0 +2
   StrCpy $1 "1"
+  ; 旧卸载器的真实退出码先存进 $2：下面自愈成功会把 $R0 改成 0，日志里要记的是真实值
+  StrCpy $2 $R0
+  ; 旧安装自愈（见 flowshipForceCleanOld）：旧卸载器拉起来了、但退出码非 0（官方 5 次重试用尽）——
+  ; App 没在跑就强清旧目录、把退出码当 0 往下装；不满足条件（flowshipHealed 保持 0）则 $R0 原样，走下面的弹框 + Quit。
+  ${if} $1 == "0"
+  ${andIf} $R0 != 0
+    !insertmacro flowshipForceCleanOld "failed"
+    ${if} $flowshipHealed == "1"
+      StrCpy $R0 0
+    ${endIf}
+  ${endIf}
   ; 先还原 TEMP / TMP 并清理旧卸载器的临时目录（见 flowshipTmpRedirect）：必须在错误标志存进 $1 之后
   ; （RMDir 会改错误标志），且在下面「拉不起来 → 继续往下装」/ 弹框 Quit 两个分支之前。
+  ; 自愈成功时 $R0 已是 0，旧卸载器失败时留在临时目录里的文件（旧文件的残片）一并清掉。
   ; 清理耗时算进 uninstSec（它本来就是移除旧版本的一部分）。
   !insertmacro flowshipTmpRestore $1 $R0
   System::Call 'kernel32::GetTickCount()i.r0'
   StrCpy $flowshipUninstTick $0
   IntOp $0 $0 - $flowshipProbeTick
   IntOp $0 $0 / 1000
-  StrCpy $2 $R0
   !insertmacro flowshipLog "uninstalled v${VERSION} uninstSec=$0 launchFailed=$1 code=$2"
   ${if} $1 == "1"
     DetailPrint `Uninstall was not successful. Not able to launch uninstaller!`
@@ -453,10 +701,12 @@
   Pop $0
 !macroend
 
-; 手动安装器启动时先清残留进程（同事实测「安装一直卡住、提示 Flowship 无法关闭」的根因）：
+; 手动安装要清残留进程（同事实测「安装一直卡住、提示 Flowship 无法关闭」的根因之一）：
 ; Windows 上内置 server 子进程就是 Flowship.exe 本体（ELECTRON_RUN_AS_NODE、无窗口）——
 ; app 崩溃 / 被强杀后它会变成隐形孤儿进程、NSIS 的「应用正在运行」检查永远过不去、
 ; 而用户看不到任何可关的窗口。手动安装走 /T 清整棵树（任务数据全程落盘、无损）。
+; v1.9.32 起有界面的手动安装不在这里杀、改为点「安装」时查到在跑才弹框问（flowshipEnsureAppClosed）；
+; 这里只剩无界面的 /S 手动安装（没人可问）直接杀。
 ;
 ; 自动更新禁止 /T：electron-updater 从 Flowship.exe 派生本安装器；/T 会把安装器
 ; 当子进程杀掉，旧卸载器已经 RMDir 掉安装目录之后新文件拷不进去，桌面快捷方式
@@ -580,10 +830,15 @@
   ; 分不清主程序 / server 子进程（同一个 exe 镜像），/T 更会顺手杀掉 electron-updater
   ; 派生的本安装器（旧目录已删、新文件没写完 = 更新完 App 没了）。只有用户手动安装
   ; （本安装器不是 Flowship 的子进程）才需要清隐形孤儿 server。
+  ; 有界面的手动安装不在这里杀（v1.9.32）：用户这时还没确认要装、可能点「取消」退出向导——
+  ; 提前杀掉他正在用的 App 不合适。改成在「点安装」那一刻先查、查到在跑再弹框问，
+  ; 点「确定」才杀（flowshipEnsureAppClosed，在 begin 页里）。无界面的 /S 手动安装没人可问，仍在这里直接杀。
   ${if} ${isUpdated}
     DetailPrint "update path: skip taskkill (main process owns PID cleanup)"
   ${else}
-    nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+    ${if} ${Silent}
+      nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+    ${endIf}
   ${endIf}
 
   ; 旧版本移除提速（见 flowshipTmpRedirect）：静默安装 / 自动更新没有向导页、也就没有「点安装」那一刻，在这里设。
@@ -591,6 +846,8 @@
   ; 手动安装不在这里设（向导可能停留很久，别让这期间拉起的子进程都带着改过的 TEMP），在 begin 页里设。
   ${if} ${Silent}
     !insertmacro flowshipTmpRedirect
+    ; 旧安装自愈（见 flowshipForceCleanOld）：同样放在所有 Abort 分支之后——预检不过要退出时，旧安装一个字节都不动。
+    !insertmacro flowshipForceCleanOld "broken"
   ${endIf}
 !macroend
 

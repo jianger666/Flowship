@@ -297,7 +297,9 @@ electron-updater 的 logger 只接 info / warn / error 是安全的、首启标�
 | `init` | `tempFreeMB` | %TEMP% 所在盘剩余空间（MB） |
 | `begin` | `waitSec` / `prevVer` | 向导停留秒数（**不是**安装慢）/ 覆盖安装时的旧版本号，全新安装为 `-` |
 | `fsprobe inst` / `fsprobe tmp` | `files` `createMs` `delMs` `freeMB` `err` | 安装前在目标盘建、删一批小文件（≤60 个或 ≤1.5s）。**单价 = createMs / files**；9657 个文件的下限 ≈ 单价 × 9657。`inst` 是安装目录所在盘、`tmp` 是 %TEMP% 所在盘。`err=1` = 连第一个文件都建不出来。`delMs` 对应旧版本卸载要删 ~9.6k 个文件的成本 |
-| `uninstalled` | `uninstSec` `code` | 旧版本移除耗时 / 旧卸载器退出码 |
+| `uninstalled` | `uninstSec` `code` | 旧版本移除耗时 / 旧卸载器退出码（旧安装自愈成功时 `code` 仍是**真实**退出码，不是被改写后的 0，见 §10.6） |
+| `appclose` | `step` | 手动安装发现 Flowship 仍在运行、弹框问了用户（§10.7）：`prompt`（弹了）/ `declined`（点取消退出）/ `stuck`（杀完还在）/ `aborted`（点中止）/ `done running=0\|1\|?`（收尾：0 已退出、1 仍在（点了忽略）、? 没法确认）。**没弹过框就没有这一行** |
+| `heal` | `mode` `result` `oldDrive` | 旧安装自愈（§10.6）：`mode=broken`（覆盖安装前预检）/ `failed`（旧卸载器退出码非 0）；`result=cleaned` / `partial` = 已强清旧目录，其余是没动的原因 |
 | `phases` | `waitSec` `probeSec` `uninstSec` `extractSec` | **四段相加 = `done` 行的 `elapsedSec`**。`extractSec` 大 = 慢在写新文件（杀软 / 磁盘）；`uninstSec` 大 = 慢在删旧文件 |
 
 经验值（待真机校准，不是结论）：正常 SSD + 仅 Defender 的机器 `createMs/files` 应在个位数毫秒；若是几十毫秒，9657 个文件就是几分钟，基本就是「杀软 on-access 扫描 + 机械盘」。
@@ -448,3 +450,61 @@ env power plan=Balanced   env battery on-ac charge=98%   env machine mfr=LENOVO 
 - 手动安装用户点「安装」前取消、或静默更新里用户拒绝 UAC，可能在旧安装目录所在盘根留下一个**空的隐藏目录** `.flowship-tmp`（下次覆盖安装会复用并清掉）。
 - 解压阶段（`extractSec` 9~14s）不受这条影响：§10.4 里 `useZip` 包的解压直接写目标目录，不经 `%TEMP%`；官方 7z 包会经 `$PLUGINSDIR\7z-out`（`%TEMP%` 所在盘）多一遍落盘，是另一条可优化项，本次没动。
 - `legacy HKCU → HKLM` 迁移时官方会再拉一次旧卸载器（`uninstallOldVersion HKEY_CURRENT_USER`），那一次走默认 `%TEMP%`，没有加速也不受影响。
+
+### 10.6 兜底：旧安装自愈（2026-10-13，待真机验证）——「装 / 更新必报 Flowship 无法关闭」那台机器
+
+> ⚠️ 只做了 makensis 编译 + 字符串级契约测试（`tests/win-install-self-heal-contract.test.ts`），**没有 Windows 真机验证**。根因**没取到证据**（见下），这一条是「不管根因，让安装能走下去」的兜底，不是根因修复。
+
+**现象**：有同事（9/24 的 EDY）的机器上，装 / 更新必弹「Flowship 无法关闭，请手动关闭后点重试」，点重试永远过不去；没有 `Flowship.exe`、无进程占用、Defender 关；只有手动跑清理脚本（结束进程 + 删 `…\fe-ai-flow\Flowship` + 删卸载注册表项 `85016543-…`）才能重装。
+
+**能确定的**：
+
+- 这个框不是「进程没关」。它是官方 `uninstallOldVersion` 在旧卸载器**连续 5 次退出码非 0** 后弹的（`appCannotBeClosed` 文案）；静默安装 `/SD IDCANCEL` 自动取消、直接走后面的失败分支。
+- 旧卸载器退出码非 0 的唯一路径：`un.atomicRMDir` 把旧文件逐个 `Rename` 到 `%TEMP%\nsXXX.tmp\old-install`，某个文件失败 → `un.restoreFiles` 回滚 → `Abort`。
+- 9/24 的诊断目录里：`locales` 被动过（11:00）、`resources` 目录自身没动、字母序在 `resources` 之后的 7 个文件原样在 → 遍历在 `resources\…` 内部停了。
+- **回滚没救回来**（字母序靠前的文件没了）。若只是某个源文件被锁，回滚会把文件原样搬回、目录应当完整——所以更像「旧卸载器被中途杀 / 拦」或「搬进 / 搬出 %TEMP% 这一步被挡」（TEMP 跨盘、安全软件按「大批量改名 exe / dll」拦截），而不是单个文件占用。**这是推断，没有日志佐证。**
+- 此后每次安装都撞同一堵墙：注册表还指着那个半截目录，官方流程永远先去调那个必败的旧卸载器。
+
+**怎么兜底**（`packaging/installer.nsh`，宏 `flowshipForceCleanOld`，两道）：
+
+| 模式 | 时机 | 条件 | 动作 |
+|---|---|---|---|
+| `broken` | 手动安装：begin 页（点「安装」那一刻）；静默安装 / 自动更新：`customInit` 末尾（所有 `Abort` 之后） | 注册表有卸载记录、旧安装目录里**没有 `Flowship.exe`** | 删旧安装目录 + 删卸载注册表项 → 官方读不到 `UninstallString`、整段跳过旧卸载器，**不再有那个框** |
+| `failed` | `customUnInstallCheck`（官方旧卸载器退出后必经） | 旧卸载器拉起来了、退出码非 0，且 **App 没在跑**（tasklist 精确匹配 `Flowship.exe`） | 同上；成功就把 `$R0` 置 0 当作移除成功继续装。**交互安装仍会先看到一次那个框（官方 5 次重试用尽后弹），点「取消」即可继续**；静默更新无感 |
+
+**安全边界**（契约测试逐条锁）：
+
+- 只动「`X:\…\Flowship`」盘符路径，目录名必须恰好是 `APP_FILENAME`（防注册表值被改出花样后递归删到别处）；目录来源与官方同口径（`InstallLocation`，没有就取卸载器路径的父目录）。
+- 只删安装目录，用户数据在 `%APPDATA%\fe-ai-flow`，不受影响（旧卸载器自己的兜底也是整目录删）。
+- `failed` 模式 App 在跑 / 没法确认 / 清完 `Flowship.exe` 还在 → **保持原行为**（弹框 + `Quit`），不会把一个还活着的 App 删残。主程序确认已经没了才删注册表项。
+- 自愈**不杀任何进程**（更新路径的安装器是 `Flowship.exe` 的子进程，按名杀会误杀自己）。
+- 全脚本递归删除一共两处（TEMP 临时目录 + 这里），契约测试写死数量。
+
+**日志（`installer.log`）**：`heal v… mode=broken|failed result=… oldDrive=X:`。`result=cleaned` / `partial` = 已强清；`healthy`（旧安装完好、没碰）/ `app-running` / `exe-still-there` / `process-check-failed` / `no-uninstall-record` / `no-location` / `not-drive-path` / `not-app-dir` = 没动的原因。`uninstalled … code=` 仍记旧卸载器的**真实**退出码。
+
+**已知边界**：
+
+- `failed` 模式在旧卸载器没把旧文件回滚完整时能救（旧目录本来就废了），但救不了「装新文件这一步也被同一个东西拦」（那会落到官方解压阶段的重试框）。
+- 这条不解释**为什么**旧卸载器在那台机器上失败。要根因，仍需那台机器上一份 `installer.log`（看 `heal` 行出现了没有、`uninstalled … code=`、`init` 里的 `tempDrive` / `instDrive`）。
+- 已经走到「半截目录」的客户端**必须手动下载一次新安装包**（应用内更新门禁会拒绝没有主程序的目录）。
+
+### 10.7 安装前确认 App 已退出（2026-10-13，待真机验证）
+
+> ⚠️ 与 §10.6 一样：只做了 makensis 编译 + 字符串级契约测试（`tests/win-install-app-closed-contract.test.ts`），没有 Windows 真机验证。
+
+**改了什么**（`packaging/installer.nsh`，宏 `flowshipAppRunningProbe` / `flowshipEnsureAppClosed`）：
+
+- **有界面的手动安装**，用户点「安装」那一刻（begin 页，早于文件系统实测 / TEMP 重定向 / 旧安装自愈 / 官方旧卸载器）先用 `tasklist` 查 `Flowship.exe` 在不在跑。**不管是有窗口的真没退、还是没有窗口的隐形孤儿 server（它和主程序是同一个 exe 镜像），查法一样。**
+- 没在跑：什么都不提示（正常安装体验不变）。
+- 在跑：弹框「安装前需要先退出它：点『确定』将关闭 Flowship 并继续安装（任务数据不会丢失；正在运行的任务会被中断）；点『取消』退出安装」。**点确定才 `taskkill /F /T /IM`**，然后每 0.5s 复查、最多约 5s 等它真退出；点取消 = 直接退出安装，什么都没杀。
+- 杀完还在（管理员身份运行 / 别的登录会话 / 被安全软件保护）：再弹「中止 / 重试 / 忽略」。「忽略」是给多用户同机的人留的口子（别人的进程本来就不该挡这个用户的安装）。
+- 查不出来（`cmd` / `tasklist` 起不来）：当作没在跑、不拦安装。
+
+**与之前行为的差别**：以前在 `customInit`（安装器一启动、用户还没点「安装」）就无条件 `taskkill`——用户只是点开看看再取消，App 也已经被杀了，而且没有任何提示。现在 `customInit` 里的 `taskkill` 只剩无界面的 `/S` 手动安装（没人可问）；自动更新路径仍然不杀（主进程自清、`/T` 会误杀作为子进程的安装器）。
+
+**它不解决的**：9/24 那台机器（§10.6）。那里 `Flowship.exe` 根本没在跑，「无法关闭」是旧卸载器连续 5 次退出码非 0 弹的假框——探测会判「没在跑」、不弹框，仍然靠 §10.6 的旧安装自愈兜底。两者互补：这一条管「真有进程挡着」，§10.6 管「没进程但旧卸载器必败」。
+
+**已知边界**：
+- 探测只看镜像名 `Flowship.exe`，不看路径。孤儿的 `rg.exe` / `cursorsandbox.exe` 等子进程不在探测范围内（`taskkill /T` 会连带清掉在世的子树；已脱离进程树的孤儿仍由官方 `CHECK_APP_RUNNING` 兜底）。
+- 手动安装的安装器若本身是 `Flowship.exe` 的子进程（比如从 App 里直接「打开安装包」），`/T` 会把安装器一起杀掉——与改动前一致，不是新引入。
+- 点「确定」前正在跑的任务会被中断（`/F` 强杀）；任务数据全程落盘，下次启动照常恢复。

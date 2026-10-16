@@ -154,9 +154,12 @@ describe("flowshipTmpRestore：还原环境变量 + 清理目录", () => {
     );
     expect(body).toContain('StrCpy $0 "kept"');
     expect(body).toContain('StrCpy $0 "removed"');
-    // 整个安装脚本里的递归删除只有这一处、且对象只能是我们自己的目录变量
+    // 整个安装脚本里的递归删除只有两处：我们自己的临时目录变量（这里）、旧安装自愈里经过盘符 + 目录名校验的
+    // 旧安装目录（契约见 win-install-self-heal-contract.test.ts）。新增第三处必须过 review、在这里显式登记。
     const all = nsisCode(installer).match(/RMDir\s+\/r[^\n]*/g) ?? [];
-    expect(all).toEqual(['RMDir /r "$flowshipTmpDir"']);
+    expect(all).toEqual(['RMDir /r "$flowshipTmpDir"', 'RMDir /r "$0"']);
+    // 临时目录那一处只出现在 flowshipTmpRestore 里
+    expect(body.match(/RMDir\s+\/r/g)).toHaveLength(1);
   });
 
   it("不碰 $R0（旧卸载器退出码，后面要用）；只用 $0 做临时变量并保护；日志宏会改错误标志所以收尾 ClearErrors", () => {
