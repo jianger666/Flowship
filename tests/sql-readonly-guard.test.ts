@@ -1,20 +1,16 @@
 /**
  * 只读 SQL 静态门（S15-01）：词法扫描、不再「先剥注释再扫关键字」。
  *
- * 覆盖：
- * 1. 纯函数 checkReadonlySql（TS 版）与 scripts/pg-exec.mjs 内联版同一张用例表、结论一致（防两份漂移）；
- * 2. 旁路只读 shell（validateReadonlyShellCommand）对 `SELECT '--'; DROP TABLE t` 这类绕过的拒绝；
- * 3. 正常 SELECT / 带注释 SELECT / WITH 仍放行。
+ * 覆盖 scripts/pg-exec.mjs 的 checkReadonlySql：
+ * 1. 绕过 / 写 / 多语句 / 未闭合 → 拒；
+ * 2. 正常 SELECT / 带注释 SELECT / WITH 仍放行。
+ * （v1.9.33 起只剩 pg-exec.mjs 这一份实现：原先 src/lib/server/sql-readonly-guard.ts 的 TS 拷贝只服务于只读 shell 守卫，
+ * 随它一起删了，「两份同表防漂移」的对照也就没有了。）
  * pg-exec CLI 的库侧只读（BEGIN READ ONLY + extended protocol）见 tests/pg-exec.test.ts。
  */
-import { mkdtempSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { checkReadonlySql as checkTs } from "@/lib/server/sql-readonly-guard";
 import { checkReadonlySql as checkMjs } from "../scripts/pg-exec.mjs";
-import { validateReadonlyShellCommand } from "@/lib/server/pi-coding-tools";
 
 type Verdict = { ok: boolean; reason?: string };
 
@@ -160,11 +156,8 @@ const ALLOW: string[] = [
   "SELECT * FROM t WHERE id IN (1, 2) AND name = 'pg_read_file(x)'",
 ];
 
-describe("checkReadonlySql（TS 版 + pg-exec.mjs 内联版同表）", () => {
-  const impls: Array<[string, (sql: string) => Verdict]> = [
-    ["ts", checkTs as (sql: string) => Verdict],
-    ["mjs", checkMjs as (sql: string) => Verdict],
-  ];
+describe("checkReadonlySql（scripts/pg-exec.mjs）", () => {
+  const impls: Array<[string, (sql: string) => Verdict]> = [["mjs", checkMjs as (sql: string) => Verdict]];
 
   for (const [name, check] of impls) {
     it(`[${name}] 绕过 / 写 / 多语句 / 未闭合 → 拒`, () => {
@@ -181,89 +174,4 @@ describe("checkReadonlySql（TS 版 + pg-exec.mjs 内联版同表）", () => {
       }
     });
   }
-});
-
-describe("旁路只读 shell：pg-exec SQL 门", () => {
-  const CWD = mkdtempSync(path.join(os.tmpdir(), "fe-sql-guard-"));
-  const check = (sqlArg: string) =>
-    validateReadonlyShellCommand(
-      CWD,
-      `node "/repo/scripts/pg-exec.mjs" --env test -- ${sqlArg}`,
-      undefined,
-      undefined,
-    );
-
-  it("SELECT '--'; DROP TABLE t 被拒（双引号包 SQL，内含单引号）", () => {
-    const r = check(`"SELECT '--'; DROP TABLE t"`);
-    expect(r.ok).toBe(false);
-    expect(r.reason).toContain("单条");
-  });
-
-  it("多语句 / COMMIT; … 被拒", () => {
-    expect(check(`'SELECT 1; SELECT 2'`).ok).toBe(false);
-    expect(check(`'COMMIT; DROP TABLE t'`).ok).toBe(false);
-  });
-
-  it("R4-01：双引号里的 $VAR$ / $ / 反斜杠 / 反引号 / $(...) 一律拒（shell 会展开，guard 与数据库看到的 SQL 不一致）", () => {
-    // 载荷：guard 把 `$USER$ ... $USER$` 当美元串（一条 SELECT），bash 展开 $USER 后数据库收到三条语句
-    const payload = "SELECT 1 $USER$ ; DROP TABLE t; SELECT 1 $USER$";
-    const r = check(`"${payload}"`);
-    expect(r.ok).toBe(false);
-    expect(r.reason).toContain("单引号");
-    for (const sql of [
-      `"SELECT $HOME"`,
-      `"SELECT \\$x"`,
-      `"SELECT 'a\\nb'"`,
-      `"SELECT 1 $(id)"`,
-      '"SELECT `id`"',
-      `"SELECT 1 $$ x $$"`,
-    ]) {
-      expect(check(sql).ok, sql).toBe(false);
-    }
-    // 单引号里 shell 不展开，$USER$ 就是美元串，放行（只是一条 SELECT）
-    expect(check(`'${payload}'`).ok).toBe(true);
-    expect(check(`'SELECT $$a$$'`).ok).toBe(true);
-    // 双引号里没有 $ \ ` 的正常 SQL 仍可用
-    expect(check(`"SELECT 'a;b' AS v"`).ok).toBe(true);
-  });
-
-  it("引号内再出现同种引号 = shell 在中间收尾、后面拼别的命令，一律拒", () => {
-    for (const sql of [
-      `'SELECT 1'; rm -rf /tmp/x; 'SELECT 2'`,
-      `"SELECT 1"; touch /tmp/x; "y"`,
-      `'SELECT 1' 'SELECT 2'`,
-      `'SELECT '\\''a'\\'''`,
-    ]) {
-      expect(check(sql).ok, sql).toBe(false);
-    }
-    // SQL 含双引号标识符 → 用单引号整体包；含单引号 → 用双引号整体包
-    expect(check(`'SELECT "x" FROM t'`).ok).toBe(true);
-  });
-
-  it("R4-02：\\r 结尾的 -- 注释后接分号 → 拒；R4-03：副作用函数 → 拒", () => {
-    expect(check(`'SELECT 1 --\r; DROP TABLE t'`).ok).toBe(false);
-    for (const sql of ["SELECT pg_sleep(100)", "SELECT pg_terminate_backend(1)", "SELECT nextval('s')"]) {
-      const r = check(`"${sql}"`);
-      expect(r.ok, sql).toBe(false);
-      expect(r.reason, sql).toContain("函数");
-    }
-    expect(check(`'SELECT pg_size_pretty(pg_database_size(1))'`).ok).toBe(true);
-  });
-
-  it("H4-09：JOIN comment ON … 放行；真正的 COMMENT ON 语句仍拒", () => {
-    expect(check(`'SELECT * FROM post p JOIN comment ON comment.post_id = p.id'`).ok).toBe(true);
-    for (const sql of ["COMMENT ON TABLE t IS 'x'", ";COMMENT ON TABLE t IS NULL"]) {
-      const r = check(`"${sql}"`);
-      expect(r.ok, sql).toBe(false);
-      expect(r.reason, sql).toContain("INSERT/UPDATE/DELETE/DDL");
-    }
-  });
-
-  it("正常 SELECT / 带注释 SELECT / WITH / 末尾分号仍放行", () => {
-    expect(check(`'SELECT * FROM t LIMIT 5'`).ok).toBe(true);
-    expect(check(`'SELECT 1 -- INSERT INTO t'`).ok).toBe(true);
-    expect(check(`'WITH x AS (SELECT 1) SELECT * FROM x'`).ok).toBe(true);
-    expect(check(`'SELECT * FROM t WHERE a > 1;'`).ok).toBe(true);
-    expect(check(`"SELECT 'a;b' AS v"`).ok).toBe(true);
-  });
 });

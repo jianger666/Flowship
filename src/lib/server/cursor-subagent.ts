@@ -62,9 +62,11 @@ import { randomUUID } from "node:crypto";
 import { Agent as CursorAgent } from "@cursor/sdk";
 import type { ModelSelection, SDKCustomTool, ToolName } from "@cursor/sdk";
 
+import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import { withoutHiddenModelSelection } from "@/lib/model-params";
 import {
   catalogFromModelOptions,
+  currentEffortValue,
   formatModelCatalog,
   normalizeSubagentType,
   parseSubagentRequest,
@@ -87,6 +89,7 @@ import {
   withSdkDeadline,
 } from "./sdk-deadline";
 import {
+  emitBackgroundSubagentJobsChanged,
   emitBackgroundSubagentSettled,
   formatDuration,
   setSubagentSessionControl,
@@ -95,6 +98,7 @@ import {
   type SubagentSessionControl,
 } from "./subagent-background";
 import { setSubagentParentModel } from "./subagent-parent-model";
+import type { SubagentRunHandle, SubagentRunInit } from "./subagent-transcript";
 
 /** explore（只读）：读 / 搜，不写文件、不跑命令（与 pi 的 read/grep/find/ls 对齐） */
 export const CURSOR_SUBAGENT_READONLY_TOOLS: ToolName[] = [
@@ -188,6 +192,11 @@ export interface SubagentChildAgent {
   close?: () => unknown;
 }
 
+/** 记录器工厂（装配层把 taskId / provider 绑好）：子代理工具只管给内容 */
+export interface SubagentTranscriptSink {
+  start: (init: Omit<SubagentRunInit, "taskId" | "provider">) => SubagentRunHandle;
+}
+
 export interface CursorSubagentDeps {
   /** 父会话当前模型（inherit 的基线）；没有 = 父会话没显式选模型 */
   parentModel?: SubagentModelSelection;
@@ -215,11 +224,28 @@ export interface CursorSubagentDeps {
   background?: {
     /** 一个后台子代理收尾（完成 / 失败 / 取消）时调；不得抛（抛了只告警） */
     onSettled: (evt: BackgroundSubagentEvent) => void;
+    /**
+     * 后台子代理的集合变了（有一个转入后台 / 有一个收尾）时调，之后 `control.backgroundJobs()` 读到的就是新清单。
+     * 界面据此画「子代理在后台干活」条。不得抛（抛了只告警、不影响子代理收尾）。
+     */
+    onJobsChanged?: () => void;
     /** 同时在跑的后台子代理上限，缺省 {@link BACKGROUND_SUBAGENT_MAX_CONCURRENT} */
     maxConcurrent?: number;
     /** 单个后台子代理最长运行时间，缺省 {@link BACKGROUND_SUBAGENT_MAX_RUNTIME_MS}；超时取消并按失败收尾 */
     maxRuntimeMs?: number;
   };
+  /**
+   * 子代理过程记录（详情面板用：任务书全文 + 子代理自己的 thinking / 工具调用 / 回复）。
+   * 不提供 = 不记（单测 / 没有 taskId 的一次性调用）。记录器**绝不能影响子代理本身**：
+   * start 抛错只告警、当没记；句柄的方法这里也都包了 try/catch。
+   */
+  transcripts?: SubagentTranscriptSink;
+  /**
+   * 父 run 被取消 / 会话被关（`run.cancel()` / `close()` / `asyncDispose`，即 {@link SubagentLink.cancelAll}）时
+   * 同步调一次——给「同样拿不到取消信号、需要被叫醒」的兄弟工具（`wait`）搭便车，省得它再包一层 Proxy。
+   * 不得抛（抛了只告警，不影响取消本身）。
+   */
+  onParentCancel?: () => void;
 }
 
 export interface SubagentLink {
@@ -388,6 +414,15 @@ export const createCursorSubagentLink = (
 
   const cancelAll = async (): Promise<void> => {
     generation += 1;
+    // 先于等子 run 取消：兄弟工具（wait）的唤醒是同步的、不该排在子 run 的取消后面
+    try {
+      deps.onParentCancel?.();
+    } catch (err) {
+      console.warn(
+        "[cursor-subagent] onParentCancel 抛错（已忽略）：",
+        err instanceof Error ? err.message : err,
+      );
+    }
     await Promise.allSettled([...live].map((r) => r.cancel()));
   };
 
@@ -471,10 +506,22 @@ export const createCursorSubagentLink = (
     /** 后台运行超时的计时器 */
     timer?: NodeJS.Timeout;
     timedOut?: boolean;
+    /** 这次调用的过程记录（没配记录器 / 起不来时为空） */
+    rec?: SubagentRunHandle;
   }
   const jobs = new Map<string, Job>();
   /** 已通过上限检查、还没登记进 jobs 的后台调用数（见 runSubagent 里的占位） */
   let reservedBackgroundSlots = 0;
+  /**
+   * 本会话内每个 job 的开始时间严格递增（同一毫秒里连派两个，第二个 +1ms）。
+   * 清单按 (startedAt, id) 排序、id 是随机串——时间戳撞车时顺序会随机翻转，界面上的行会跳、测试也会抖；
+   * 让时间戳唯一，「先派的在前」就是确定的（耗时误差 ≤ 个位数毫秒，可忽略）。
+   */
+  let lastStartedAt = 0;
+  const nextStartedAt = (): number => {
+    lastStartedAt = Math.max(Date.now(), lastStartedAt + 1);
+    return lastStartedAt;
+  };
   /** 父 agent 的 agentId（attach 时记下）：后台收尾事件带上，投递时核对是不是同一个会话 */
   let parentAgentId: string | undefined;
 
@@ -482,6 +529,43 @@ export const createCursorSubagentLink = (
     let n = 0;
     for (const j of jobs.values()) if (j.background) n += 1;
     return n;
+  };
+
+  /** 后台在跑的清单（界面视图，按开始时间升序；前台等待中的不算，与 backgroundRunning 同口径） */
+  const backgroundJobs = (): BackgroundSubagentJobView[] =>
+    [...jobs.values()]
+      .filter((j) => j.background)
+      .map((j) => ({
+        id: j.id,
+        description: j.description,
+        startedAt: j.startedAt,
+        detached: j.detached,
+        ...(j.rec ? { runKey: j.rec.key } : {}),
+      }))
+      .sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+
+  /** 过程记录的任何调用都不许影响子代理本身：抛了只告警 */
+  const recSafe = (fn: () => void): void => {
+    try {
+      fn();
+    } catch (err) {
+      console.warn(
+        "[cursor-subagent] 过程记录出错（已忽略）：",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  };
+
+  /** 通知「后台清单变了」：订阅方抛错只告警，绝不能挡住子代理自己的收尾 / 转后台 */
+  const notifyJobsChanged = (): void => {
+    try {
+      bg?.onJobsChanged?.();
+    } catch (err) {
+      console.warn(
+        "[cursor-subagent] 后台清单变化回调抛错（已忽略）：",
+        err instanceof Error ? err.message : err,
+      );
+    }
   };
 
   const control: SubagentSessionControl = {
@@ -496,6 +580,7 @@ export const createCursorSubagentLink = (
       return n;
     },
     backgroundRunning,
+    backgroundJobs,
   };
 
   /** 3-5 个词的摘要；模型没给就取 prompt 开头 */
@@ -503,6 +588,10 @@ export const createCursorSubagentLink = (
     req.description?.trim() ||
     req.prompt.replace(/\s+/g, " ").trim().slice(0, 30) ||
     "子任务";
+
+  /** 后台运行超时被终止的说明（送主 AI 的失败事件与过程记录共用同一句） */
+  const timeoutMessage = (): string =>
+    `超过 ${formatDuration(maxRuntimeMs)} 仍未完成，已被终止`;
 
   /** 后台收尾：结果交给订阅方（chat-runner）。订阅方抛错只告警。 */
   const settleBackground = (
@@ -512,11 +601,14 @@ export const createCursorSubagentLink = (
     if (job.timer) clearTimeout(job.timer);
     jobs.delete(job.id);
     if (!bg) return;
+    // 先于 onSettled：这个子代理已经不在跑了，界面上的「后台工作中」条先更新，
+    // 再由 onSettled 去唤醒主 AI / 落提示行（唤醒后的 run 会立刻把输入框切回「运行中」）
+    notifyJobsChanged();
     const base = {
       jobId: job.id,
       parentAgentId,
       description: job.description,
-      durationMs: Date.now() - job.startedAt,
+      durationMs: Math.max(0, Date.now() - job.startedAt),
       detached: job.detached,
     };
     let evt: BackgroundSubagentEvent;
@@ -529,7 +621,7 @@ export const createCursorSubagentLink = (
         evt = {
           ...base,
           status: "failed",
-          text: `超过 ${formatDuration(maxRuntimeMs)} 仍未完成，已被终止`,
+          text: timeoutMessage(),
         };
       } else if (msg === CANCELLED_TEXT) {
         evt = { ...base, status: "cancelled", text: "" };
@@ -555,17 +647,25 @@ export const createCursorSubagentLink = (
   ): void => {
     job.background = true;
     job.detach = undefined;
+    recSafe(() => job.rec?.setBackground(job.detached));
     job.timer = setTimeout(() => {
+      // 只打标、不在这里给记录收尾：cancel 来得太晚时子 run 可能其实已经成功返回，
+      // 主 AI 会收到 done——详情面板必须和主 AI 看到的一致。记录统一由 settle 按真实结局收尾
+      // （超时被杀 → settle 看到 cancelled 且 job.timedOut，写成「失败·超时」）
       job.timedOut = true;
       void run.cancel().catch(noop);
     }, maxRuntimeMs);
     job.timer.unref?.();
     void settled.then((outcome) => settleBackground(job, outcome));
+    // 此刻起它算「后台在跑」：界面要画出来（前台转后台的那一刻同理）
+    notifyJobsChanged();
   };
 
   const runSubagent = async (
     req: SubagentRequest,
     rawSubagentType?: string,
+    /** SDK 给工具回调的 toolCallId：过程记录用它精确绑到事件流卡片的 callId */
+    toolCallId?: string,
   ): Promise<string> => {
     const gen0 = generation;
     const cancelled = (): boolean => generation !== gen0;
@@ -673,12 +773,48 @@ export const createCursorSubagentLink = (
       const startedChild = child;
       const startedRun = run;
 
+      // 过程记录：子 run 已经起来了才开始记（建子 agent 失败的用法错误不值得留一份）
+      let rec: SubagentRunHandle | undefined;
+      if (deps.transcripts) {
+        try {
+          rec = deps.transcripts.start({
+            description: describeJob(req),
+            prompt: req.prompt,
+            model: childModel?.id,
+            effort: currentEffortValue(childModel?.params),
+            explore,
+            resumed: !!resumed,
+            agentId: startedChild.agentId ?? resumed?.id,
+            toolCallId,
+            background: wantsBackground,
+          });
+        } catch (err) {
+          console.warn(
+            "[cursor-subagent] 过程记录起不来（已忽略、照常跑）：",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
+      // job 先于 settle 建好：settle 收尾记录时要读 job.timedOut（超时被杀 ≠ 用户取消）
+      const job: Job = {
+        id: `bg_${randomUUID().slice(0, 8)}`,
+        description: describeJob(req),
+        startedAt: nextStartedAt(),
+        background: false,
+        detached: false,
+        rec,
+      };
+
       /** 等子 run 跑完、产出给调用方的文本；收尾（摘 live / 关子 agent / 释放 busy）都在这里 */
       const settle = async (): Promise<string> => {
         try {
           let streamed = "";
           try {
-            for await (const m of startedRun.stream()) streamed += toText(m);
+            for await (const m of startedRun.stream()) {
+              streamed += toText(m);
+              recSafe(() => rec?.onMessage(m));
+            }
           } catch {
             // 流中途断：终态以 wait() 为准（失败会在下面抛出来）
           }
@@ -696,6 +832,9 @@ export const createCursorSubagentLink = (
           const text = (res.result ?? streamed).trim() || "(子任务无输出)";
           // 只有成功才登记 / 给 id：失败、取消的子代理状态不确定，不鼓励接着做
           const childId = startedChild.agentId ?? resumed?.id;
+          // 两步各自兜底：setAgentId 抛了也不能跳过 finish，否则记录会一直停在 running
+          recSafe(() => rec?.setAgentId(childId)); // 有的 SDK 版本 send 之后才有 agentId
+          recSafe(() => rec?.finish({ status: "done", result: text }));
           if (!childId) return text;
           rememberChild(
             parentKey,
@@ -703,6 +842,19 @@ export const createCursorSubagentLink = (
             resumed ? resumed.info : { model: childModel, explore, busy: false },
           );
           return text + formatSubagentTrailer({ agentId: childId, model: childModel });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          recSafe(() =>
+            rec?.finish(
+              // 超时被杀：子 run 被我们 cancel、这里看到的是 cancelled，但原因是超时、不是用户取消
+              job.timedOut
+                ? { status: "failed", error: timeoutMessage() }
+                : msg === CANCELLED_TEXT
+                  ? { status: "cancelled" }
+                  : { status: "failed", error: msg },
+            ),
+          );
+          throw err;
         } finally {
           live.delete(startedRun);
           await closeChild(startedChild);
@@ -711,13 +863,6 @@ export const createCursorSubagentLink = (
       };
 
       settleOwnsBusy = true;
-      const job: Job = {
-        id: `bg_${randomUUID().slice(0, 8)}`,
-        description: describeJob(req),
-        startedAt: Date.now(),
-        background: false,
-        detached: false,
-      };
       // settle 永不 reject：统一成 { ok } 结果，前台 / 后台 / 转后台三条出口共用
       const settled = settle().then(
         (text) => ({ ok: true as const, text }),
@@ -780,12 +925,16 @@ export const createCursorSubagentLink = (
           : CURSOR_SUBAGENT_INPUT_JSON_SCHEMA,
       ),
     ) as NonNullable<SDKCustomTool["inputSchema"]>,
-    execute: async (args) => {
+    execute: async (args, context) => {
       const parsed = parseSubagentRequest(args);
       // 用法错误（prompt 空 / model / effort 无效）：isError 标出来，message 原样给模型改
       if (!parsed.ok) return textResult(parsed.error, true);
       try {
-        const out = await runSubagent(parsed.request, rawSubagentTypeOf(args));
+        const out = await runSubagent(
+          parsed.request,
+          rawSubagentTypeOf(args),
+          context?.toolCallId,
+        );
         return textResult(out || "(子任务无输出)");
       } catch (err) {
         if (err instanceof SubagentUsageError) {
@@ -923,6 +1072,10 @@ export const createCursorSubagentLinkForSession = (opts: {
   cwd?: string;
   /** 给了 = 开后台运行（chat 会话）：后台子代理收尾事件按这个 taskId 投递给 chat-runner */
   backgroundTaskId?: string;
+  /** 父 run 被取消 / 会话被关时同步调一次（见 {@link CursorSubagentDeps.onParentCancel}） */
+  onParentCancel?: () => void;
+  /** 子代理过程记录器（装配层绑好 taskId）；不给 = 不记 */
+  transcripts?: SubagentTranscriptSink;
 }): SubagentLink => {
   const parentModel = opts.parentModel
     ? withoutHiddenModelSelection(opts.parentModel)
@@ -930,11 +1083,15 @@ export const createCursorSubagentLinkForSession = (opts: {
   const backgroundTaskId = opts.backgroundTaskId;
   return createCursorSubagentLink({
     parentModel,
+    ...(opts.onParentCancel ? { onParentCancel: opts.onParentCancel } : {}),
+    ...(opts.transcripts ? { transcripts: opts.transcripts } : {}),
     ...(backgroundTaskId
       ? {
           background: {
             onSettled: (evt) =>
               emitBackgroundSubagentSettled(backgroundTaskId, evt),
+            onJobsChanged: () =>
+              emitBackgroundSubagentJobsChanged(backgroundTaskId),
           },
         }
       : {}),

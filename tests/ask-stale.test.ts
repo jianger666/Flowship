@@ -25,22 +25,19 @@ process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
 const {
   batchUpdateCard,
   sendInteractiveCardToChat,
-  sendPostMarkdownToChat,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
 } = vi.hoisted(() => ({
   batchUpdateCard: vi.fn<
     (cardId: string, actions: unknown[], seq: number) => Promise<void>
   >(async () => undefined),
   sendInteractiveCardToChat: vi.fn(),
-  sendPostMarkdownToChat: vi.fn(),
-  sendTextMessageToChat: vi.fn(),
+  sendMarkdownCardToChat: vi.fn(),
 }));
 
 vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   batchUpdateCard,
   sendInteractiveCardToChat,
-  sendPostMarkdownToChat,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
 }));
 
 const {

@@ -1094,3 +1094,51 @@ describe("attach：登记父会话模型（卡片徽标用）", () => {
     expect(getSubagentParentModel(link.attach(parentOf("P1")))).toBeUndefined();
   });
 });
+
+describe("onParentCancel：父取消联动的搭便车钩子（wait 用它在 run 被取消时叫醒睡着的回调）", () => {
+  it("cancelAll 调一次；run.cancel() / close() 经 attach 的代理都会触发", async () => {
+    const onParentCancel = vi.fn();
+    const { deps } = makeDeps();
+    const link = createCursorSubagentLink({ ...deps, onParentCancel });
+
+    await link.cancelAll();
+    expect(onParentCancel).toHaveBeenCalledTimes(1);
+
+    const parentCancel = vi.fn(async () => {});
+    const raw = {
+      agentId: "P1",
+      // 只声明签名（不写占位形参，免得 lint 报未使用）：attach 返回的包装沿用这个类型，下面 send("hi") 才过得了 tsc
+      send: vi.fn<(prompt?: string) => Promise<{ cancel: () => Promise<void> }>>(
+        async () => ({ cancel: parentCancel }),
+      ),
+      close: vi.fn(),
+    };
+    const wrapped = link.attach(raw);
+    onParentCancel.mockClear();
+    await (await wrapped.send("hi")).cancel();
+    expect(onParentCancel).toHaveBeenCalledTimes(1);
+    expect(parentCancel).toHaveBeenCalledTimes(1);
+    wrapped.close();
+    expect(onParentCancel).toHaveBeenCalledTimes(2);
+    expect(raw.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("钩子抛错只告警：父的取消照常完成、子 run 照常被取消", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { deps } = makeDeps();
+    const link = createCursorSubagentLink({
+      ...deps,
+      onParentCancel: () => {
+        throw new Error("boom");
+      },
+    });
+    await expect(link.cancelAll()).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("不传钩子 = 行为不变", async () => {
+    const { deps } = makeDeps();
+    await expect(createCursorSubagentLink(deps).cancelAll()).resolves.toBeUndefined();
+  });
+});

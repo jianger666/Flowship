@@ -15,7 +15,7 @@ const {
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
   deliverChatAskReply,
   hasChatSession,
   getTask,
@@ -36,7 +36,7 @@ const {
       chat_id: "oc",
       message_id: "om",
     })),
-    sendTextMessageToChat: vi.fn<AnyFn>(async () => ({
+    sendMarkdownCardToChat: vi.fn<AnyFn>(async () => ({
       chat_id: "oc",
       message_id: "om",
     })),
@@ -62,7 +62,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
   updateCardEntity: vi.fn(async () => undefined),
 }));
 vi.mock("@/lib/server/chat-runner", () => ({
@@ -279,8 +279,8 @@ describe("群答题卡按钮：askId 一路带到原子摘除", () => {
     expect(writeUserEventAndPublishStrict).not.toHaveBeenCalled();
     expect(getPendingAsk(TASK_ID)?.askId).toBe("ask-2");
     // 点击人拿到的是「已经有人回答了」的失效反馈（事件流里确有 ask_user_reply）
-    expect(sendTextMessageToChat).toHaveBeenCalledTimes(1);
-    expect(String(sendTextMessageToChat.mock.calls[0]![1])).toContain(
+    expect(sendMarkdownCardToChat).toHaveBeenCalledTimes(1);
+    expect(String(sendMarkdownCardToChat.mock.calls[0]![1])).toContain(
       "已经有人回答了",
     );
   });
@@ -318,8 +318,8 @@ describe("群答题卡按钮：askId 一路带到原子摘除", () => {
 
     expect(deliverChatAskReply).not.toHaveBeenCalled();
     expect(getPendingAsk(TASK_ID)?.askId).toBe("ask-2");
-    expect(sendTextMessageToChat).toHaveBeenCalledTimes(1);
-    const text = String(sendTextMessageToChat.mock.calls[0]![1]);
+    expect(sendMarkdownCardToChat).toHaveBeenCalledTimes(1);
+    const text = String(sendMarkdownCardToChat.mock.calls[0]![1]);
     expect(text).not.toContain("有人回答");
     expect(text).toContain("已失效");
   });
@@ -357,7 +357,7 @@ describe("群答题卡按钮：askId 一路带到原子摘除", () => {
     const b = clickOldCard("ou_b");
     await Promise.all([a, b]);
     expect(deliverChatAskReply).toHaveBeenCalledTimes(1);
-    expect(sendTextMessageToChat).toHaveBeenCalledTimes(1);
+    expect(sendMarkdownCardToChat).toHaveBeenCalledTimes(1);
     expect(getPendingAsk(TASK_ID)).toBeNull();
   });
 });

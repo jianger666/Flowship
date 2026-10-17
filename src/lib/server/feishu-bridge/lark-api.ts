@@ -436,61 +436,6 @@ export const sendTextMessage = async (
 };
 
 /**
- * 发纯文本到群聊（`--chat-id`，与私聊 `--user-id` 互斥）。
- *
- * 群里 @ 人用飞书文本消息的 `<at user_id="ou_xxx">名字</at>` 内联标签
- * （拼接由调用方做、见 group-route.mentionTag）。
- */
-export const sendTextMessageToChat = async (
-  chatId: string,
-  text: string,
-): Promise<SendMessageResult> => {
-  const rec = await runLark([
-    "im",
-    "+messages-send",
-    "--chat-id",
-    chatId,
-    "--text",
-    text,
-  ]);
-  return extractSendResult(rec);
-};
-
-/**
- * 飞书 `post` 消息的 content JSON：整段走 `md` 标签。
- * 官方推荐发 Markdown 用这条（CommonMark + GFM）；`text` 类型不会渲染 `**` / `` ` `` / 列表。
- * `<at user_id="ou_xxx">名</at>` 写进 markdown 正文即可 @，不要再并排塞别的 post 标签
- *（`md` 必须独占一段）。
- */
-export const buildPostMarkdownContent = (markdown: string): string =>
-  JSON.stringify({
-    zh_cn: {
-      content: [[{ tag: "md", text: markdown }]],
-    },
-  });
-
-/**
- * 往群聊发一段会渲染的 Markdown（`--msg-type post`）。
- * 群里 @ 答疑走这条；短状态回执（推进失败 / 没产物）仍用 {@link sendTextMessageToChat}。
- */
-export const sendPostMarkdownToChat = async (
-  chatId: string,
-  markdown: string,
-): Promise<SendMessageResult> => {
-  const rec = await runLark([
-    "im",
-    "+messages-send",
-    "--chat-id",
-    chatId,
-    "--msg-type",
-    "post",
-    "--content",
-    buildPostMarkdownContent(markdown),
-  ]);
-  return extractSendResult(rec);
-};
-
-/**
  * 把一段文本以「文件消息」发进群聊（需求群分享的完整产物走这条）。
  *
  * 为什么要先落一次临时盘：lark-cli 的 `--file` 只吃 **cwd 相对路径**——绝对路径和 `..`
@@ -598,6 +543,104 @@ export const sendInteractiveCardToChat = async (
   const sent = await sendCardMessageToChat(chatId, created.card_id);
   return { ...sent, card_id: created.card_id };
 };
+
+// ----------------- 群聊「文本卡」：群里的文字一律发卡片、不再发 text / post -----------------
+
+/** 卡片 markdown 里 @ 人要的 id：只认飞书 open_id / app_id 的常见字符，别的退化成纯文本 `@名` */
+const CARD_AT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * 分段扫描用：第 1 组 = 代码围栏 / 行内代码（原样保留，里面的 `<` 本来就是字面量）；
+ * 第 2、3 组 = 上游 `mentionTag` 产出的 `<at user_id="ou_x">名</at>`。
+ */
+const CARD_MD_SEGMENT_RE =
+  /(```[\s\S]*?```|`[^`\n]+`)|<at user_id="([^"<>\s]*)">([^<>]*)<\/at>/g;
+
+/**
+ * 把「发 text / post 时代」的正文转成卡片 markdown 能正确渲染的写法（纯函数）：
+ *
+ * 1. **@ 语法不同**：上游（`group-shared.mentionTag`、回复协议、提测 @）统一产出
+ *    `<at user_id="ou_x">名</at>`——text / post 认这个；卡片 markdown 要写 `<at id=ou_x></at>`
+ *    （显示名由飞书按 id 自动补）。上游不跟着改：协议解析 / 切块防切断都围着旧写法转，
+ *    只在最后一跳转换。id 不合法 → 退化成 `@名`，至少看得出在叫谁。
+ * 2. **`<` 要转 `&lt;`**：卡片 markdown 把 `<xxx>` 当标签解析，`推进 <action>` / `List<string>`
+ *    这类字面量不转会被吞掉（官方文档明写特殊字符需 HTML 实体转义）。代码围栏 / 行内代码里
+ *    不转（实体在代码里不一定还原）；`>` 不动，免得把用户写的 `> 引用` 打坏。
+ */
+export const toCardMarkdown = (text: string): string => {
+  const escapeLt = (s: string): string => s.replace(/</g, "&lt;");
+  let out = "";
+  let last = 0;
+  for (const m of text.matchAll(CARD_MD_SEGMENT_RE)) {
+    const start = m.index ?? 0;
+    out += escapeLt(text.slice(last, start));
+    if (m[1] !== undefined) {
+      out += m[1];
+    } else {
+      const id = m[2] ?? "";
+      const name = (m[3] ?? "").trim() || "你";
+      out += CARD_AT_ID_RE.test(id) ? `<at id=${id}></at>` : `@${name}`;
+    }
+    last = start + m[0].length;
+  }
+  return out + escapeLt(text.slice(last));
+};
+
+/** 会话列表 / 推送预览的摘要长度（卡片默认预览是「[卡片]」，看不出说了什么） */
+const CARD_SUMMARY_MAX = 50;
+
+const summarizeForCard = (text: string): string =>
+  Array.from(
+    text
+      .replace(/<at user_id="[^"<>\s]*">([^<>]*)<\/at>/g, "@$1")
+      .replace(/<[^>\n]*>/g, "")
+      .replace(/[*`~#>]/g, "")
+      .replace(/\s+/g, " ")
+      .trim(),
+  )
+    .slice(0, CARD_SUMMARY_MAX)
+    .join("");
+
+/**
+ * 群里「一段文字」的卡片：无 header、无 footer、只有一个 markdown 元素——
+ * 视觉上尽量接近一条普通消息，系统回执（「已开始跑 XX」）不至于变成一张张大卡刷屏。
+ * `config.summary` 把会话列表 / 推送预览的「[卡片]」换成正文开头。
+ */
+export const buildMarkdownCardJson = (
+  markdown: string,
+): Record<string, unknown> => {
+  const summary = summarizeForCard(markdown);
+  return {
+    schema: "2.0",
+    config: {
+      update_multi: true,
+      ...(summary ? { summary: { content: summary } } : {}),
+    },
+    body: {
+      elements: [
+        {
+          tag: "markdown",
+          element_id: "md_text",
+          content: toCardMarkdown(markdown),
+        },
+      ],
+    },
+  };
+};
+
+/**
+ * 往群聊发一段文字（卡片形态）——**群里文字类出口的唯一收口**：
+ * 系统回执 / 推进收口文字 / 群答疑正文 / 提测 @ 都走它，不再发 text / post。
+ *
+ * 入参仍是上游习惯的写法（纯文本或 markdown，@ 用 `<at user_id>`），转换见 {@link toCardMarkdown}。
+ * 走「建卡实体 → 发 interactive」与其它群卡（答题卡 / 分享卡 / 选择卡）同一条已验证的链路，
+ * 不引入新的 scope 与新的发送形态。
+ */
+export const sendMarkdownCardToChat = async (
+  chatId: string,
+  markdown: string,
+): Promise<SendMessageResult> =>
+  sendInteractiveCardToChat(chatId, buildMarkdownCardJson(markdown));
 
 /**
  * 创建群聊：`POST /open-apis/im/v1/chats?user_id_type=open_id`

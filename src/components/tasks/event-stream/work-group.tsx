@@ -32,6 +32,7 @@ import {
 import type { Task, TaskEvent } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+import { Collapse } from "./collapse";
 import { EventRow } from "./rows";
 import { CollapseChevron, PROCESS_ROW_BUTTON } from "./stream-style";
 import { ToolBlockRow, ToolVerbGroupRow } from "./tool-block";
@@ -119,6 +120,7 @@ const WorkGroupRowImpl = ({
   liveToolOutputs,
   isRunningTail,
   showProcessingPlaceholder,
+  defaultExpanded = false,
 }: {
   group: WorkGroupItem;
   taskId: string;
@@ -131,6 +133,11 @@ const WorkGroupRowImpl = ({
   isRunningTail?: boolean;
   /** 流尾空等：write 已完成、下一句还没出来 */
   showProcessingPlaceholder?: boolean;
+  /**
+   * 默认就展开（完成后也不自动收起；用户手动点过仍以手动为准）。
+   * 给「专门来看过程」的场景用——子代理详情面板：打开它就是为了看干了什么，不该再多点一下。
+   */
+  defaultExpanded?: boolean;
 }) => {
   // null = 未手动干预，跟随 autoExpanded；boolean = 用户点过，以手动为准
   const [manual, setManual] = useState<boolean | null>(null);
@@ -142,7 +149,8 @@ const WorkGroupRowImpl = ({
   const allBoot =
     group.members.length > 0 &&
     group.members.every((m) => isBootInfoItem(m));
-  const autoExpanded = !allBoot && (group.hasRunning || !!isRunningTail);
+  const autoExpanded =
+    !allBoot && (group.hasRunning || !!isRunningTail || defaultExpanded);
 
   // 自动收起的「防打扰」闸（2026-07-28、用户实测「自动折叠也感觉怪」）：
   // 判定见 shouldPinWorkGroupOpen（纯函数、可单测）。
@@ -244,7 +252,8 @@ const WorkGroupRowImpl = ({
         )}
       </button>
 
-      {expanded && (
+      {/* 展开 / 收起走高度动画（Collapse）：action 完成自动收起时整组几十 ~ 几百像素不再「啪」地消失 */}
+      <Collapse open={expanded}>
         <div className="ml-2 mt-0.5 min-w-0 max-w-full space-y-0.5 border-l border-border pl-2.5">
           {group.members.map((m) => (
             <WorkGroupMember
@@ -258,7 +267,7 @@ const WorkGroupRowImpl = ({
           ))}
           {showProcessingPlaceholder ? <ProcessingPlaceholderRow /> : null}
         </div>
-      )}
+      </Collapse>
     </div>
   );
 };

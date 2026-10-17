@@ -14,12 +14,14 @@
  *      revise] / [USER_REPLY] 头 + 附件段）——原 formatToolReturnAsText 的瘦身版、信号
  *      字面量与 prompts 的约定由 tests/protocol-signals.test.ts 守护
  *
- * 依赖方向（保证无环）：只依赖 types / protocol-signals、不 import flowship-tools / task-runner。
+ * 依赖方向（保证无环）：只依赖 types / protocol-signals / 叶子模块（ask-wait、session-wait），
+ * 不 import flowship-tools / task-runner。
  */
 
 import type { ActionType, PlanBatch } from "../types";
 import { SIGNALS, buildNextActionHead } from "../protocol-signals";
 import { cancelAskWait, resetAskWaitForTest } from "./ask-wait";
+import { interruptWaits } from "./session-wait";
 
 // ----------------- 类型 -----------------
 
@@ -408,6 +410,10 @@ export const cancelPendingIf = (
  */
 export const invalidateCallerToken = (taskId: string): void => {
   expectedCallerTokens.delete(taskId);
+  // 注意：这里**不**叫醒在睡的 `wait`。stop 在调它之后还要等资源任务收尾、再取消主 run；
+  // 现在就叫醒，`wait` 会提前把 [WAIT_CANCELLED] 还给一个此刻还没被取消的 run，
+  // 模型可能趁这个空窗又往下说一轮。叫醒放在 cancelTaskRun / cancelChatRun 之后——
+  // 由 stop 紧随其后的 cleanupChatTaskState 负责（Cursor 的 customTool 回调拿不到取消信号，必须主动叫醒）
 };
 
 /**
@@ -421,6 +427,8 @@ export const cleanupChatTaskState = (taskId: string): void => {
   awaitingNotifiers.delete(taskId);
   taskActionHandlers.delete(taskId);
   expectedCallerTokens.delete(taskId);
+  // 删除任务走的是这里（不经 invalidateCallerToken）：同样要把在睡的 wait 叫醒
+  interruptWaits(taskId, "cancel");
   // 始终 sync：stop 后不应再亮「待回答」；重启孤儿 askId 也一并清掉
   schedulePendingAskMetaSync(taskId);
 };

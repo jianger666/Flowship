@@ -48,6 +48,7 @@ import {
   listRecentSettled,
 } from "@/lib/server/chat-queue";
 import { getLiveThinkingSnapshot } from "@/lib/server/sdk-message-handler";
+import { getBackgroundSubagentSnapshot } from "@/lib/server/subagent-background";
 import {
   getTaskVisibility,
   getTaskWithTailEvents,
@@ -264,6 +265,11 @@ export const GET = async (req: Request, { params }: Ctx) => {
           case "talk_queue":
             send({ type: "talk_queue", items: ev.items });
             break;
+          // 后台子代理在飞清单（整份快照、纯内存）：主 AI 说完一轮后它们可能还在干活，
+          // 界面据此在输入框上方画「子代理在后台工作」条
+          case "background_subagents":
+            send({ type: "background_subagents", jobs: ev.jobs });
+            break;
           // DELETE 逻辑删除提交 → 通知客户端并关流
           case "task_deleted":
             send({ type: "task_deleted", taskId: ev.taskId });
@@ -304,6 +310,13 @@ export const GET = async (req: Request, { params }: Ctx) => {
           active: hasRestrictedQuestionInFlight(id),
         });
         send({ type: "talk_queue", items: buildTalkQueueSnapshot(id) });
+        // 后台子代理在飞清单的补位：中途打开页面 / 切走再切回 / 断线重连都收不到「转入后台 / 收尾」
+        // 那几帧——在跑不补 → 用户看不到子代理还在干活；已结束不补 → 断线前的非空清单会一直挂着。
+        // 所以**无条件**发一帧当前整份（空数组 = 没有），客户端整份替换
+        send({
+          type: "background_subagents",
+          jobs: getBackgroundSubagentSnapshot(id),
+        });
         // 进行中思考的快照：无条件发一帧（对象 = 接着长；null = 没在思考、前端清残留）。
         // 这段思考的落盘事件已经在 tail 里 = 思考其实结束了（节流状态还没来得及清），发 null 防幽灵
         const liveSnap =

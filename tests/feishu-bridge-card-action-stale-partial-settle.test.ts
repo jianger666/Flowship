@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const TMP = path.join(os.tmpdir(), `card-action-partial-settle-${Date.now()}`);
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
 
-const { getBotAppInfo, batchUpdateCard, sendTextMessage, sendTextMessageToChat, getTask } =
+const { getBotAppInfo, batchUpdateCard, sendTextMessage, sendMarkdownCardToChat, getTask } =
   vi.hoisted(() => {
     type AnyFn = (...args: never[]) => unknown;
     return {
@@ -32,7 +32,7 @@ const { getBotAppInfo, batchUpdateCard, sendTextMessage, sendTextMessageToChat, 
         (cardId: string, actions: unknown[], seq: number) => Promise<void>
       >(async () => undefined),
       sendTextMessage: vi.fn<AnyFn>(async () => ({})),
-      sendTextMessageToChat: vi.fn<AnyFn>(async () => ({})),
+      sendMarkdownCardToChat: vi.fn<AnyFn>(async () => ({})),
       getTask: vi.fn<AnyFn>(),
     };
   });
@@ -41,7 +41,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
   updateCardEntity: vi.fn(async () => undefined),
 }));
 vi.mock("@/lib/server/chat-runner", () => ({

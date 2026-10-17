@@ -205,3 +205,98 @@ describe("Agent.create / resume：取消联动已装到返回的 agent 上", () 
     }
   });
 });
+
+describe("Agent.create / resume：run 被取消 / 会话被关时，在睡的 wait 同步叫醒（回调拿不到取消信号）", () => {
+  type WaitTool = { execute: (a: unknown, c: unknown) => Promise<{ content: Array<{ text: string }> }> };
+  const waitOf = (arg: unknown): WaitTool =>
+    (customToolsOf(arg) as unknown as Record<string, WaitTool>).wait!;
+  const textOf = (r: { content: Array<{ text: string }> }): string =>
+    r.content.map((c) => c.text).join("");
+
+  it("run.cancel()：本实例睡着的 wait 立刻 [WAIT_CANCELLED]，不再睡到自己的定时器", async () => {
+    const { activeWaitCount } = await import("@/lib/server/session-wait");
+    mockCreate.mockClear();
+    const agent = await Agent.create({
+      ...baseInput,
+      callerToken: "tok",
+      taskId: "t-wire-cancel",
+    } as never);
+    const sleeping = waitOf(mockCreate.mock.calls[0][0]).execute({ seconds: 600 }, {});
+    expect(activeWaitCount("t-wire-cancel")).toBe(1);
+
+    await (await agent.send("hi")).cancel();
+
+    expect(textOf(await sleeping)).toMatch(/^\[WAIT_CANCELLED\]/);
+    expect(activeWaitCount("t-wire-cancel")).toBe(0);
+  });
+
+  it("agent.close()：同样叫醒", async () => {
+    const { activeWaitCount } = await import("@/lib/server/session-wait");
+    mockCreate.mockClear();
+    const agent = await Agent.create({
+      ...baseInput,
+      callerToken: "tok",
+      taskId: "t-wire-close",
+    } as never);
+    const sleeping = waitOf(mockCreate.mock.calls[0][0]).execute({ seconds: 600 }, {});
+    expect(activeWaitCount("t-wire-close")).toBe(1);
+
+    agent.close();
+
+    expect(textOf(await sleeping)).toMatch(/^\[WAIT_CANCELLED\]/);
+    expect(activeWaitCount("t-wire-close")).toBe(0);
+  });
+
+  it("resume 回来的实例同样接上", async () => {
+    const { activeWaitCount } = await import("@/lib/server/session-wait");
+    mockResume.mockClear();
+    const agent = await Agent.resume("agent-x", {
+      ...baseInput,
+      callerToken: "tok",
+      taskId: "t-wire-resume",
+    } as never);
+    const sleeping = waitOf(mockResume.mock.calls[0][1]).execute({ seconds: 600 }, {});
+    expect(activeWaitCount("t-wire-resume")).toBe(1);
+    await (await agent.send("hi")).cancel();
+    expect(textOf(await sleeping)).toMatch(/^\[WAIT_CANCELLED\]/);
+  });
+
+  it("同一任务的新旧实例：取消旧实例只叫醒旧实例的 wait，新实例的不受影响（懒重启 / 重连换实例）", async () => {
+    const { activeWaitCount, interruptWaits } = await import("@/lib/server/session-wait");
+    mockCreate.mockClear();
+    const oldAgent = await Agent.create({
+      ...baseInput,
+      callerToken: "tok-old",
+      taskId: "t-wire-two",
+    } as never);
+    await Agent.create({
+      ...baseInput,
+      callerToken: "tok-new",
+      taskId: "t-wire-two",
+    } as never);
+    const oldSleep = waitOf(mockCreate.mock.calls[0][0]).execute({ seconds: 600 }, {});
+    const newSleep = waitOf(mockCreate.mock.calls[1][0]).execute({ seconds: 600 }, {});
+    expect(activeWaitCount("t-wire-two")).toBe(2);
+
+    await (await oldAgent.send("hi")).cancel();
+
+    expect(textOf(await oldSleep)).toMatch(/^\[WAIT_CANCELLED\]/);
+    expect(activeWaitCount("t-wire-two")).toBe(1);
+
+    // 清场：新实例那个由用户侧「跳过」叫醒
+    interruptWaits("t-wire-two", "skip");
+    expect(textOf(await newSleep)).toMatch(/^\[WAIT_SKIPPED\]/);
+  });
+
+  it("没有睡着的 wait 时 cancel / close 照常（不抛、不影响父 cancel）", async () => {
+    parentCancel.mockClear();
+    const agent = await Agent.create({
+      ...baseInput,
+      callerToken: "tok",
+      taskId: "t-wire-idle",
+    } as never);
+    await (await agent.send("hi")).cancel();
+    expect(parentCancel).toHaveBeenCalledTimes(1);
+    expect(() => agent.close()).not.toThrow();
+  });
+});

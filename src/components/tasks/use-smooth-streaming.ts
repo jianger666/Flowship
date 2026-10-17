@@ -3,6 +3,18 @@
 import { useCallback, useRef, useState } from "react";
 
 /**
+ * 截取终点别落在代理对（emoji / 生僻字）中间：UTF-16 下一个 emoji 占两个码元，
+ * 按码元硬切会让上屏的那一帧出现半个字符（渲染成 �），下一帧才补全——吐字时 emoji 一闪一闪。
+ * 终点前一个码元是高位代理就多带一个（低位代理）；已经到末尾则不动（流还没把后半个送来时，
+ * 末尾的半个字符由下一帧补齐，这里不越界）。
+ */
+export const safeSliceEnd = (text: string, end: number): number => {
+  if (end <= 0 || end >= text.length) return end;
+  const prev = text.charCodeAt(end - 1);
+  return prev >= 0xd800 && prev <= 0xdbff ? end + 1 : end;
+};
+
+/**
  * Codex 式丝滑吐字（chat-view / 任务详情页共用）。
  *
  * 三层管线：
@@ -27,9 +39,9 @@ export const useSmoothStreaming = () => {
       return;
     }
     const step = Math.max(2, Math.ceil(remaining * 0.12));
-    displayedLenRef.current = Math.min(
-      target.length,
-      displayedLenRef.current + step,
+    displayedLenRef.current = safeSliceEnd(
+      target,
+      Math.min(target.length, displayedLenRef.current + step),
     );
     setStreamingText(target.slice(0, displayedLenRef.current));
     smoothRafRef.current =

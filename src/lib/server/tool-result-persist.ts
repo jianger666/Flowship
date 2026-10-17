@@ -410,14 +410,34 @@ export const persistTruncatedOutput = async (
   };
 };
 
-type BuildArgs = {
-  taskId: string;
+type InlineBuildArgs = {
   callId: string;
   /** SDK msg.name（可能是 mcp） */
   rawName: string;
   args?: unknown;
   result?: unknown;
   msgStatus: string;
+};
+
+type BuildArgs = InlineBuildArgs & {
+  taskId: string;
+};
+
+/** SDK 原始工具名 → 归一化展示名（MCP → mcp:server:tool）；落盘版与内存版共用 */
+const resolveResultToolName = (input: InlineBuildArgs): string => {
+  const argsRec = asRecord(input.args) ?? {};
+  return normalizeToolName({
+    type: input.rawName,
+    name: input.rawName,
+    args: {
+      providerIdentifier:
+        typeof argsRec.providerIdentifier === "string"
+          ? argsRec.providerIdentifier
+          : undefined,
+      toolName:
+        typeof argsRec.toolName === "string" ? argsRec.toolName : undefined,
+    },
+  });
 };
 
 /**
@@ -465,19 +485,7 @@ const previewOfSpilled = (
 export const buildToolResultMeta = async (
   input: BuildArgs,
 ): Promise<ToolResultMeta> => {
-  const argsRec = asRecord(input.args) ?? {};
-  const name = normalizeToolName({
-    type: input.rawName,
-    name: input.rawName,
-    args: {
-      providerIdentifier:
-        typeof argsRec.providerIdentifier === "string"
-          ? argsRec.providerIdentifier
-          : undefined,
-      toolName:
-        typeof argsRec.toolName === "string" ? argsRec.toolName : undefined,
-    },
-  });
+  const name = resolveResultToolName(input);
 
   const status = resolveToolResultStatus(input.msgStatus, name, input.result);
   // 抽文本按 SDK 原始工具名（shell/read/edit…）；MCP 走 stringify 兜底
@@ -509,9 +517,34 @@ export const buildToolResultMeta = async (
   return finishMeta(input, name, status, persisted);
 };
 
+/**
+ * 组装 tool_result meta 的**纯内存版**：不落 `tool-outputs/` 全量文件、不读盘。
+ *
+ * 给子代理过程记录用（`subagent-transcript`）：子代理自己的工具调用不进主事件流，
+ * 记录里只留 8KB 预览（超限截断并标 `truncated`、**不带 fullPath**——界面据此不出「加载完整输出」，
+ * 点开必 404 的入口比没有更糟）。不落全量文件还有一层原因：`tool-outputs/` 有「最多 200 个 / 50MB」的
+ * 淘汰（见 pruneToolOutputsDir），子代理动辄几十次读文件，会把主会话的全量输出挤掉。
+ * 抽文本 / 判状态 / shell·edit·write 附加字段与落盘版同一套（共用 finishMeta）。
+ */
+export const buildInlineToolResultMeta = (
+  input: InlineBuildArgs,
+): ToolResultMeta => {
+  const name = resolveResultToolName(input);
+  const status = resolveToolResultStatus(input.msgStatus, name, input.result);
+  const outputText = extractToolOutputText(input.rawName, input.result);
+  const persisted =
+    utf8ByteLength(outputText) > TOOL_RESULT_OUTPUT_LIMIT
+      ? {
+          output: truncateToLimit(outputText, TOOL_RESULT_OUTPUT_LIMIT),
+          truncated: true as const,
+        }
+      : { output: outputText };
+  return finishMeta(input, name, status, persisted);
+};
+
 /** output 定稿后补 shell/edit/write 附加字段（V2 复用落盘与老 persist 共用） */
 const finishMeta = (
-  input: BuildArgs,
+  input: InlineBuildArgs,
   name: string,
   status: ToolResultStatus,
   persisted: { output: string; truncated?: boolean; fullPath?: string },

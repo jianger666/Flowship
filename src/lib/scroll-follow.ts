@@ -232,3 +232,56 @@ export const shouldPinWorkGroupOpen = (
   autoExpanded: boolean,
   following: boolean,
 ): boolean => prevAutoExpanded && !autoExpanded && !following;
+
+// ---------- 「回到最新」的平滑滚动（2026-10-17「全是大动作」） ----------
+//
+// 点「回到最新」/ Cmd+End 原来是下一帧直接把 scrollTop 写成 scrollHeight——离底部几屏远时画面
+// 啪地一下换了个世界，用户丢了上下文。改成短缓动：控制器自己逐帧写 scrollTop（不用浏览器的
+// behavior:smooth——流式期间内容还在长，原生平滑滚动的目标是点击那一刻的值，落地后又差一截，
+// 还会被我们自己的贴底写入打断），每帧**重新读**当前最大可滚位置当终点，内容在长也追得上。
+//
+// 离得太远（超过 SMOOTH_BOTTOM_MAX_VIEWPORTS 个视口）不做动画：几千像素的「滑行」本身就是
+// 一个长达半秒的大动作，直接跳（Slack / Discord 同款取舍）。离得太近（贴底带内）更不用动。
+
+/** 超过这么多个视口高度的距离直接跳、不做滑行 */
+export const SMOOTH_BOTTOM_MAX_VIEWPORTS = 3;
+/** 滑行时长下限 / 上限（毫秒）：近的快、远的稍慢，但都压在「一眨眼」的量级 */
+export const SMOOTH_BOTTOM_MIN_MS = 180;
+export const SMOOTH_BOTTOM_MAX_MS = 360;
+
+/** 这次回到最新要不要做滑行动画 */
+export const shouldAnimateScrollToBottom = (
+  distance: number,
+  clientHeight: number,
+  reducedMotion: boolean,
+): boolean =>
+  !reducedMotion &&
+  distance > FOLLOW_PIN_THRESHOLD &&
+  distance <= clientHeight * SMOOTH_BOTTOM_MAX_VIEWPORTS;
+
+/** 滑行时长：随距离（以视口高度为单位）线性加长，夹在 [MIN, MAX] */
+export const smoothBottomDuration = (
+  distance: number,
+  clientHeight: number,
+): number => {
+  const viewports = distance / Math.max(clientHeight, 1);
+  return Math.min(
+    SMOOTH_BOTTOM_MAX_MS,
+    Math.max(SMOOTH_BOTTOM_MIN_MS, SMOOTH_BOTTOM_MIN_MS + viewports * 60),
+  );
+};
+
+/** easeOutCubic：起步快、收尾慢——「甩过去再轻轻落地」 */
+export const easeOutCubic = (progress: number): number => {
+  const p = Math.min(1, Math.max(0, progress));
+  return 1 - (1 - p) ** 3;
+};
+
+/** 滑行第 elapsed 毫秒时该写的 scrollTop（终点 target 每帧由调用方重读） */
+export const smoothBottomTop = (
+  from: number,
+  target: number,
+  elapsed: number,
+  duration: number,
+): number =>
+  from + (target - from) * easeOutCubic(duration <= 0 ? 1 : elapsed / duration);

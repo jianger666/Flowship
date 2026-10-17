@@ -190,10 +190,13 @@ const runStopTaskAgent = async (
           : `用户停止了${actionLabel}（agent 已中断、可重新「推进」）`;
     // 用户 stop 操作——无条件 writeEventAndPublish（不带 lease）
     // （stop-task 不在 no-restricted-syntax 文件名单内，无需 eslint-disable）
+    // meta.stopped：前端据此把「这一轮被停掉」当边界（lib/chat-stream-display.isStopMarkerInfo）——
+    // 启动阶段（正在发送首包…）被停时没有任何 agent 活动事件可清 boot 进度行，只能靠它
     await writeEventAndPublish(id, {
       kind: "info",
       actionId: current?.id,
       text: stopText,
+      meta: { stopped: true },
     });
 
     const fresh = (await getTask(id)) ?? live;

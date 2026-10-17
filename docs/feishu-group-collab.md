@@ -198,7 +198,7 @@ UI / Agent
             │              （工作项碰都不碰，所以没有跨机器的并发收敛问题）
             ├─ format=card（默认）：sendInteractiveCardToChat
             │     └─ kind=artifact 再 sendFileMessageToChat（全文 md）
-            ├─ format=post：sendPostMarkdownToChat（mentions 拼成 `<at user_id>`）
+            ├─ format=post：sendMarkdownCardToChat 文本卡（mentions 拼成 `<at user_id>`、发送前转卡片写法）
             └─ 发送失败：isBotNotInGroupSendError（230002 一族）
                    → 抛 bot_not_in_group（带 botLabel）；其它错误照旧 lark_error
 ```
@@ -211,7 +211,7 @@ UI / Agent
 | 建卡实体 `createCardEntity` | 同上 |
 | 群聊发卡 `sendInteractiveCardToChat` | 同上（本期新增薄封装） |
 | 群聊发文件 `sendFileMessageToChat` | 同上（临时 md + cwd 相对路径，见「内容形态」） |
-| 群聊发 post markdown `sendPostMarkdownToChat` | 同上（`format: "post"` / 提测 @） |
+| 群聊发文字（文本卡）`sendMarkdownCardToChat` | 同上——**群里文字类出口的唯一收口**，见下「群里文字一律发文本卡」 |
 | 建群 / bot 展示名 | `createImChat` / `getBotDisplayName`（降级链单一来源） |
 | meegle 串行队列 + 错误三态 | `meegle-cli.ts` |
 | `group_type` 只读回落、工作项名 | `fetchWorkitemGroupType`（只读） / `fetchWorkitemName`（`bindWorkitemGroup` 已停用：任务关联只记本地，不写工作项） |
@@ -428,7 +428,50 @@ describe 里要同步说清内容形态（`artifact` 走 md 文件不截断 / �
 | format | 群里长什么样 | 谁在用 |
 |------|-------------|---------|
 | `card`（默认） | 互动卡片；`kind=artifact` 再跟一条 md 文件 | UI 分享 / MCP `share_to_group` / 自动播报 / 群内推进产物 |
-| `post` | 一条会渲染的 IM markdown；`mentions` 拼成 `<at user_id>` | 提测 @（`notify_group_testers`） |
+| `post`（历史取值名） | 一张文本卡（见下节）；`mentions` 拼成 `<at user_id>` | 已无生产调用者，仅留作降级储备 |
+
+### 群里文字一律发文本卡（2026-10-16）
+
+用户拍板：**机器人在群里发的文字不再用普通消息（text / post），统一发飞书卡片**。
+服务端自己发的文字出口（A 类）全部收口到 `lark-api.sendMarkdownCardToChat(chatId, markdown)`：
+
+| 原出口 | 现在 |
+|--------|------|
+| 群内系统回执（`group-route.replyToGroup`：忙线 / 排队 / 已开始跑 / 仅属主 / 限流提示 / 没关联…） | 文本卡 |
+| 推进收口文字（`group-outbound`：失败 / 旁白 / 刚交卷 / 没产出 / 到期） | 文本卡 |
+| 群答疑正式回答（`flushQuestionReply`，含切块） | 文本卡（以前是 `post` + `md`） |
+| 群答题卡点完后的回执（`card-action`：已失效 / 没送达） | 文本卡 |
+| `share` 的 `format: "post"` | 文本卡 |
+
+`sendTextMessageToChat` / `sendPostMarkdownToChat` / `buildPostMarkdownContent` **已删除**——群里别再新加 text / post 出口。
+不变的：p2p 私聊（`sendTextMessage`）、md 文件消息（`sendFileMessageToChat`）、已经是卡片的答题卡 / 选择卡 / 分享卡。
+
+**文本卡长什么样**：schema 2.0、**无 header、无 footer、只有一个 markdown 元素**——视觉上尽量接近一条普通消息，
+「已开始跑 XX」这类一句话回执不会变成一张张大卡刷屏。`config.summary` 设成正文开头（@ 还原成 `@名`、去标签 /
+md 符号、≤50 字），会话列表 / 推送预览不再是干巴巴的「[卡片]」。发送走和其它群卡同一条已验证链路
+（建卡实体 → 发 interactive），不引入新 scope；代价是每条多一次 lark-cli 调用。
+
+**发不出去怎么让属主知道**（2026-10-17）：文本卡依赖 `cardkit:card:write`，缺权限 / 接口故障时连「缺机器人权限」这种提示自己也发不出去、群里一片沉默。
+所有往群里发的出口（上表 A 类 + 问群卡 + 产物卡）失败时，除了 `console.warn`，都经 `group-failure-notice.noteGroupSendFailure(taskId, chatId, err, what?)`
+在**任务事件流**留一条 info（缺权限翻成「缺机器人权限：cardkit:card:write」；其它错误带飞书错误码 / log_id）。
+**同一个群一分钟只记一条**（所有出口共用节流 key `group-reply-failed:<chatId>`，入向 / 出向 / 卡片回调合起来不刷屏）；永不抛；
+**不加纯文本降级出口**——只让失败可见，不改发送方式。
+
+**上游不改、最后一跳统一转换**（`lark-api.toCardMarkdown`，纯函数）：
+
+| 项 | 做法 |
+|----|------|
+| @ 语法 | 内部统一写法仍是 `<at user_id="ou_x">名</at>`（`group-shared.mentionTag`、回复协议、切块防切断都围着它转）；发送前转成卡片 markdown 的 `<at id=ou_x></at>`（显示名由飞书补）。id 含非法字符 → 退化成纯文本 `@名` |
+| 裸 `<` | 转 `&lt;`——卡片 markdown 把 `<xxx>` 当标签，`推进 <action>` / `List<string>` 不转会被吞（官方文档明写特殊字符需 HTML 实体转义）。**代码围栏 / 行内代码里不转**；`>` 不动（别打坏 `> 引用`） |
+
+⚠️ **刻意没做的（B 类，agent 自己发的）**：任务答疑 agent 在 shell 里自己拼 `lark-cli im +messages-send --text`、`expect_group_reply` 的「手写 `<at>` 的 text 消息」
+（`task-runner` one-shot 提示词 + `flowship-tools` 描述）这批**仍是普通消息**——要改得给 agent 一个原生发群工具
+（带 `mentions[{open_id,name}]`）+ 改提示词，且 Cursor provider 的 shell 拦不住，只能靠提示词引导。用户拍板「只改容易的、先保持统一」，暂不做。
+
+⚠️ **「@ 机器人」在卡片里是否能触发对方机器人未实测**：仓库里 `task-runner` / `flowship-tools` 两处注释写「分享卡片的 at 只认真人、@机器人不会亮」，
+没找到实测记录；第三方实测（lark-bot2bot）说 interactive 卡片里的 `<at id=…>` 能触发对方 `im.message.receive_v1`
+（前提：对方开 `im:message.group_at_msg.include_bot:readonly`），且对方收到的事件正文是否完整也没验证。
+切换后第一次对安若流年发 @ 时请真机确认「被触发 + 读到完整正文」；不行就对「@ 机器人要数据」这一个场景回退。
 
 `card` 再按 `kind` 分流：
 
@@ -1432,7 +1475,7 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 - `tests/advance-options.test.ts`：server 复算的可推进清单与推进弹窗同口径
   （布局顺序显隐 / 分组序 / 日常任务只列自定义 / 关 skill / 团队规范开关 / legacy 滤除）
 - `tests/feishu-group-outbound.test.ts`：ask 卡发群（两个开关 + 未绑群）、回答攒 delta
-  后按回复协议回群（**post markdown**、不是纯文本；只发最终段、真人提问人才自动补 @，细节见 `group-outbound-reply`）、done 后登记摘除、推进产物走 share 卡、share 失败降级发文本、
+  后按回复协议回群（**文本卡**、不是 text / post；只发最终段、真人提问人才自动补 @，细节见 `group-outbound-reply`）、done 后登记摘除、推进产物走 share 卡、share 失败降级发文本、
   **产物卡先占再发**（播报已占坑就不发第二张 / 发失败退坑）；
   **token 化投递**（属主 done 先到不动旁路登记 / 两条登记并存各投各的 / stop 补发的
   无 origin done 不误 flush / 多位同事各自 token / assistant_message 兜底也认 origin）、

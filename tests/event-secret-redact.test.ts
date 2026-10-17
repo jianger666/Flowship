@@ -70,6 +70,9 @@ const {
 const { publish, subscribeAllTaskStreams, subscribeTaskStream } = await import(
   "@/lib/server/task-stream"
 );
+const { getBackgroundSubagentSnapshot, setBackgroundSubagentSnapshotProvider } = await import(
+  "@/lib/server/subagent-background"
+);
 const {
   discardPendingThinkingDeltas,
   flushPendingAssistantDeltas,
@@ -712,6 +715,40 @@ describe("实时推流脱敏（R1-01：publish 唯一扇出点）", () => {
     expect((event.meta as { chunk: string }).chunk).toContain(FAKE_TOKEN);
     expect(JSON.stringify(tapFrames)).not.toContain(FAKE_TOKEN);
     expect(JSON.stringify(tapFrames)).not.toContain(FAKE_PG_PASSWORD);
+  });
+
+  it("background_subagents（后台子代理清单，模型填的 description）：实时帧与 bootstrap 补帧都脱敏，原对象不被改", async () => {
+    await writeConfig({ gitToken: FAKE_TOKEN });
+    const jobs = [
+      { id: "bg_1", description: `用 ${FAKE_TOKEN} 拉仓库`, startedAt: 1, detached: false, runKey: "sa_1" },
+      { id: "bg_2", description: "干净的摘要", startedAt: 2, detached: true },
+    ];
+    publish(TASK, { kind: "background_subagents", jobs });
+
+    for (const got of [frames, tapFrames]) {
+      const frame = got[0] as Extract<TaskStreamEvent, { kind: "background_subagents" }>;
+      expect(frame.jobs[0]).toEqual({
+        id: "bg_1",
+        description: `用 ${REDACTED_GIT_TOKEN} 拉仓库`,
+        startedAt: 1,
+        detached: false,
+        runKey: "sa_1",
+      });
+      expect(frame.jobs[1]).toEqual(jobs[1]);
+      expect(JSON.stringify(got)).not.toContain(FAKE_TOKEN);
+    }
+    // 不原地改：调用方（会话清单）手里的原对象保持原样
+    expect(jobs[0]!.description).toContain(FAKE_TOKEN);
+
+    // 重连 bootstrap 补帧不经 publish：snapshot 读取处自己脱敏
+    setBackgroundSubagentSnapshotProvider(() => jobs);
+    try {
+      const snap = getBackgroundSubagentSnapshot(TASK);
+      expect(JSON.stringify(snap)).not.toContain(FAKE_TOKEN);
+      expect(snap[0]!.description).toBe(`用 ${REDACTED_GIT_TOKEN} 拉仓库`);
+    } finally {
+      setBackgroundSubagentSnapshotProvider(null);
+    }
   });
 
   it("没命中 / 没配凭据：同一个帧对象原样推送（零拷贝），其它帧种类不受影响", async () => {

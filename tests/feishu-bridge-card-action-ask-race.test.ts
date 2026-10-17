@@ -55,7 +55,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
-  sendTextMessageToChat: vi.fn(async () => ({})),
+  sendMarkdownCardToChat: vi.fn(async () => ({})),
   updateCardEntity: vi.fn(async () => undefined),
 }));
 vi.mock("@/lib/server/chat-runner", () => ({

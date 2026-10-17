@@ -23,6 +23,10 @@
  *    在变大——输入没过期 + 朝底部走 + 进贴底带，三样齐了才恢复。浏览器平滑滚动动画的后续帧、
  *    Virtuoso 的补偿 scrollBy 都是「朝底部、进了带」的程序化滚动，没有往下翻输入就骗不了它
  *    （用户实测的「往回滚一点又弹回底部」）。
+ * 6. **「回到最新」是一小段缓动、不是瞬移**（2026-10-17）：`scrollToBottomSmooth` 控制器自己逐帧写
+ *    scrollTop（每帧重读终点、内容在长也追得上），滑行期间跟随态保持 false（流式的贴底请求不跟它抢），
+ *    落地才开闸；用户上滚 / 拖滚动条 / 点别处跳转（public setFollowing）当场取消。
+ *    太远（> 3 个视口）或「减少动态效果」直接跳。
  * 5. **视口高度变化要补一条贴底**：composer 变高 / 窗口缩放时视口变矮，原先靠 Virtuoso 自己的
  *    「视口变矮就贴底」路径；那条路径跟「内容增高就贴底」共用一个闸门、被我们一起关掉了
  *    （见 scroll-follow 的 VIRTUOSO_NEVER_AT_BOTTOM），这里用 ResizeObserver 补回来、受跟随态约束。
@@ -44,6 +48,9 @@ import {
   isUpIntentTouch,
   isUpIntentWheel,
   nextFollowing,
+  shouldAnimateScrollToBottom,
+  smoothBottomDuration,
+  smoothBottomTop,
 } from "@/lib/scroll-follow";
 
 export interface StreamFollowController {
@@ -55,6 +62,11 @@ export interface StreamFollowController {
   setFollowing: (next: boolean) => void;
   /** 请求贴底：rAF 合批、一帧最多一次、已贴底则不动；贴完再复查几帧、用户上滚即停 */
   requestScrollToBottom: () => void;
+  /**
+   * 「回到最新」：短缓动滑到底、落地后恢复跟随（太远 / 减少动态效果 / 没容器时退化为立即开闸 + 贴底）。
+   * 滑行期间跟随态保持 false；用户上滚、拖滚动条、任何 public setFollowing 调用都会取消滑行。
+   */
+  scrollToBottomSmooth: () => void;
   /** 订阅跟随态翻转（useSyncExternalStore） */
   subscribe: (onChange: () => void) => () => void;
   getSnapshot: () => boolean;
@@ -65,6 +77,12 @@ export interface StreamFollowController {
 /** 已经贴到这个距离内就不用再写 scrollTop 了（同时是复查时「这一帧贴着了」的判定） */
 const ALREADY_AT_BOTTOM_EPS = 1;
 
+/** 读系统「减少动态效果」偏好；SSR / 单测（无 matchMedia）当没开 */
+const prefersReducedMotion = (): boolean =>
+  typeof window !== "undefined" &&
+  typeof window.matchMedia === "function" &&
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
 /**
  * 控制器工厂（export 供单测直接构造；组件侧一律走下面的 useStreamFollow）。
  * @param scrollToBottomRef 只在**没有滚动容器可写**时（单测 / Window 滚动）才用的兜底贴底动作；
@@ -72,8 +90,10 @@ const ALREADY_AT_BOTTOM_EPS = 1;
  */
 export const createStreamFollowController = (
   scrollToBottomRef: { current: () => void },
-  /** 时间源（单测注入、判「往下翻」输入是否还在有效期内） */
+  /** 时间源（单测注入、判「往下翻」输入是否还在有效期内 / 驱动滑行进度） */
   now: () => number = () => performance.now(),
+  /** 「减少动态效果」偏好（单测注入；默认读系统媒体查询，无 matchMedia 的环境当没开） */
+  reducedMotion: () => boolean = prefersReducedMotion,
 ): StreamFollowController => {
   /** 唯一事实源：当前是否跟随最新。初始 true（进来就在底部看最新） */
   let following = true;
@@ -83,6 +103,8 @@ export const createStreamFollowController = (
   let scroller: HTMLElement | null = null;
   /** 本帧已排队的贴底 rAF id；非 null = 别重复排 */
   let scrollRaf: number | null = null;
+  /** 「回到最新」滑行的 rAF id；非 null = 正在滑 */
+  let smoothRaf: number | null = null;
   /** 用户主动上滚意图：手势监听置位、紧随其后的 scroll 回调消费掉 */
   let intentUp = false;
   /** 正在拖原生滚动条：拖动期间每次 scroll 都按用户意图算 */
@@ -105,13 +127,33 @@ export const createStreamFollowController = (
     scrollRaf = null;
   };
 
-  const setFollowing = (next: boolean) => {
+  /** 取消「回到最新」的滑行（用户上滚 / 去别处 / 卸载） */
+  const cancelSmooth = () => {
+    if (smoothRaf === null) return;
+    cancelAnimationFrame(smoothRaf);
+    smoothRaf = null;
+  };
+
+  /**
+   * 内部写跟随态（状态机 / 滑行落地用）。**不取消滑行**：滑行自己写 scrollTop 会触发 scroll 回调 →
+   * evaluate → 这里（还没跟随、没有上滚意图 → 结果仍是 false），若在此取消就把滑行自己杀了。
+   */
+  const applyFollowing = (next: boolean) => {
     if (next === following) return;
     following = next;
     // 用户离开底部：还没执行的贴底 / 复查作废（帧回调里还会再看一眼跟随态，双保险）
     if (!next) cancelPin();
     // 微任务通知：允许渲染期写入（初始定位恢复）而不触发 React 跨组件更新告警
     queueMicrotask(notify);
+  };
+
+  /**
+   * 对外的 setFollowing（初始定位恢复 / 切 task / 「跳到某一项」前停跟随）：先取消滑行再写。
+   * 点横幅回到上一条时必须走它——否则正在滑向底部的动画会把人又带回去。
+   */
+  const setFollowing = (next: boolean) => {
+    cancelSmooth();
+    applyFollowing(next);
   };
 
   /** 用「当前几何 + 上滚意图 + 往下翻输入 + 本次滚动方向」跑一次状态机 */
@@ -121,7 +163,7 @@ export const createStreamFollowController = (
     scrollDelta: number,
   ) => {
     if (!scroller) return;
-    setFollowing(
+    applyFollowing(
       nextFollowing(following, {
         distanceFromBottom: distanceFromBottom(scroller),
         userIntentUp,
@@ -151,8 +193,14 @@ export const createStreamFollowController = (
     evaluate(intent, now() - downIntentAt <= DOWN_INTENT_TTL_MS, scrollDelta);
   };
 
+  /** 用户主动往上翻：置意图位 + 取消「回到最新」的滑行（别跟用户抢方向盘） */
+  const markUpIntent = () => {
+    intentUp = true;
+    cancelSmooth();
+  };
+
   const onWheel = (e: WheelEvent) => {
-    if (isUpIntentWheel(e.deltaY)) intentUp = true;
+    if (isUpIntentWheel(e.deltaY)) markUpIntent();
     else if (isDownIntentWheel(e.deltaY)) markDownIntent();
   };
 
@@ -162,7 +210,7 @@ export const createStreamFollowController = (
 
   const onTouchMove = (e: TouchEvent) => {
     const y = e.touches[0]?.clientY ?? 0;
-    if (isUpIntentTouch(y - touchStartY)) intentUp = true;
+    if (isUpIntentTouch(y - touchStartY)) markUpIntent();
     else if (isDownIntentTouch(y - touchStartY)) markDownIntent();
   };
 
@@ -171,7 +219,7 @@ export const createStreamFollowController = (
     if (target && isEditableTarget(target.tagName, target.isContentEditable)) {
       return;
     }
-    if (isUpIntentKey(e.key)) intentUp = true;
+    if (isUpIntentKey(e.key)) markUpIntent();
     else if (isDownIntentKey(e.key)) markDownIntent();
   };
 
@@ -180,6 +228,7 @@ export const createStreamFollowController = (
     if (!scroller || e.target !== scroller) return;
     if (isScrollbarPointer(e.offsetX, scroller.clientWidth)) {
       draggingScrollbar = true;
+      cancelSmooth();
       // 点轨道翻页可能是往下翻：松手后的动画帧要能把人带回贴底（拖动期间仍按上滚意图算）
       markDownIntent();
     }
@@ -224,10 +273,50 @@ export const createStreamFollowController = (
     schedulePin({ stable: 0, budget: PIN_SETTLE_MAX_FRAMES });
   };
 
+  const scrollToBottomSmooth = () => {
+    cancelSmooth();
+    const finish = () => {
+      applyFollowing(true);
+      requestScrollToBottom();
+    };
+    const el = scroller;
+    // 没容器（单测 / Window 滚动）/ 已在跟随（贴底链在跑、不需要再滑）：直接开闸 + 贴底
+    if (!el || following) {
+      finish();
+      return;
+    }
+    const distance = distanceFromBottom(el);
+    if (!shouldAnimateScrollToBottom(distance, el.clientHeight, reducedMotion())) {
+      finish();
+      return;
+    }
+    const from = el.scrollTop;
+    const startedAt = now();
+    const duration = smoothBottomDuration(distance, el.clientHeight);
+    const tick = () => {
+      smoothRaf = null;
+      const cur = scroller;
+      if (!cur) return;
+      const elapsed = now() - startedAt;
+      if (elapsed >= duration) {
+        // 落地：一步贴到真底、开闸，再交给贴底链盯几帧（Virtuoso 测量完总高可能又变）
+        cur.scrollTop = cur.scrollHeight;
+        finish();
+        return;
+      }
+      // 终点每帧重读：滑行期间流式内容还在长、总高在变
+      const target = Math.max(0, cur.scrollHeight - cur.clientHeight);
+      cur.scrollTop = smoothBottomTop(from, target, elapsed, duration);
+      smoothRaf = requestAnimationFrame(tick);
+    };
+    smoothRaf = requestAnimationFrame(tick);
+  };
+
   /** 视口高度观察者（原因见 attachScroller 里的说明） */
   let viewportObserver: ResizeObserver | null = null;
 
   const detach = () => {
+    cancelSmooth();
     if (!scroller) return;
     scroller.removeEventListener("scroll", onScroll);
     scroller.removeEventListener("wheel", onWheel);
@@ -239,6 +328,17 @@ export const createStreamFollowController = (
     viewportObserver?.disconnect();
     viewportObserver = null;
     scroller = null;
+    // 手势态是跟着旧 scroller 的：不清的话，拖着滚动条时容器被换掉（Virtuoso 重挂 / 卸载）收不到 pointerup，
+    // `draggingScrollbar` 会粘到新容器上、把它之后每一次程序化滚动都当成用户上滚；
+    // 没过期的「往下翻」输入同理，会被新容器上的程序化滚动借去恢复跟随。
+    //
+    // **刻意不动 `following`**：它是事件流级别的状态，不属于某个 scroller——切 task 时的初始定位恢复
+    // 在渲染期就写了它（`setFollowing(startFollowing)`），早于 Virtuoso 挂上新 scroller；
+    // 这里若复位成 true，会把「恢复到上次翻到的位置（不贴底）」的结果在挂载那一刻覆盖掉。
+    intentUp = false;
+    draggingScrollbar = false;
+    touchStartY = 0;
+    downIntentAt = Number.NEGATIVE_INFINITY;
   };
 
   const attachScroller = (el: HTMLElement | Window | null) => {
@@ -280,6 +380,7 @@ export const createStreamFollowController = (
     isFollowing: () => following,
     setFollowing,
     requestScrollToBottom,
+    scrollToBottomSmooth,
     subscribe: (onChange) => {
       listeners.add(onChange);
       return () => listeners.delete(onChange);

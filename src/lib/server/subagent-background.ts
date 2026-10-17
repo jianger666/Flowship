@@ -17,6 +17,9 @@
  * pi 的 `task` 同步跑完、不支持）。
  */
 
+import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
+import { redactCopyIfHit } from "./event-secret-redact";
+
 // ----------------- 会话级控制句柄（chat-runner 用） -----------------
 
 /** 一个父 agent 会话上的子代理控制面 */
@@ -25,6 +28,11 @@ export interface SubagentSessionControl {
   detachForeground(): number;
   /** 后台在跑的子代理数（含从前台转来的）；空闲回收要据此放过这个会话 */
   backgroundRunning(): number;
+  /**
+   * 后台在跑的子代理清单（与 {@link backgroundRunning} 同口径：前台等待中的不算）。
+   * 界面据此画「子代理在后台干活」条（SSE `background_subagents` 帧、bootstrap 补发）；按开始时间升序。
+   */
+  backgroundJobs(): BackgroundSubagentJobView[];
 }
 
 type ControlHolder = typeof globalThis & {
@@ -112,6 +120,90 @@ export const emitBackgroundSubagentSettled = (
 /** 仅测试：清空订阅 */
 export const __clearBackgroundSubagentListenersForTests = (): void => {
   hub().clear();
+  (globalThis as JobsHubHolder).__flowshipSubagentJobsHub?.clear();
+};
+
+// ----------------- 在飞清单变化（link → chat-runner → 界面） -----------------
+//
+// 「后台子代理集合变了」（有新的转入后台 / 有一个收尾）：link 只报「变了」（带 taskId），
+// 不带清单——清单由订阅方（chat-runner）按**当前会话**现读（见 getSubagentSessionControl(rec.agent).backgroundJobs()）再推给界面。
+// 为什么不直接带清单：被替换掉的旧会话实例的子代理被取消时也会陆续报「变了」，
+// 若它带着自己那份（已空的）清单直接推，会把新实例刚派出的子代理从界面上抹掉；
+// 按当前会话现读，旧实例的迟到通知顶多多推一次同样的真值。
+
+export type BackgroundSubagentJobsChangedListener = (taskId: string) => void;
+
+type JobsHubHolder = typeof globalThis & {
+  __flowshipSubagentJobsHub?: Set<BackgroundSubagentJobsChangedListener>;
+};
+
+const jobsHub = (): Set<BackgroundSubagentJobsChangedListener> => {
+  const g = globalThis as JobsHubHolder;
+  g.__flowshipSubagentJobsHub ??= new Set();
+  return g.__flowshipSubagentJobsHub;
+};
+
+/** 订阅「后台子代理清单变了」；返回注销函数（chat-runner 模块加载时订阅一次） */
+export const onBackgroundSubagentJobsChanged = (
+  cb: BackgroundSubagentJobsChangedListener,
+): (() => void) => {
+  jobsHub().add(cb);
+  return () => jobsHub().delete(cb);
+};
+
+/** link 调：订阅方抛错只告警、不影响别的订阅方，更不能影响子代理本身的收尾 */
+export const emitBackgroundSubagentJobsChanged = (taskId: string): void => {
+  for (const cb of [...jobsHub()]) {
+    try {
+      cb(taskId);
+    } catch (err) {
+      console.warn(
+        `[subagent-background] 清单变化订阅方抛错 task=${taskId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+};
+
+// ----------------- 当前清单读取（watch-task bootstrap 用） -----------------
+//
+// watch-task 路由要在每次连接 bootstrap 时补一帧「此刻在跑的后台子代理」。清单的真值在 chat-runner
+// （会话表 runningChats），路由不该为这点事 import 一个近 4000 行的 runner——chat-runner 加载时把读取函数登记在这里，
+// 路由经本叶子模块读。没登记（本进程还没加载过 chat-runner）= 没有任何 chat 会话 = 空清单，答案本来就是空。
+
+export type BackgroundSubagentSnapshotProvider = (
+  taskId: string,
+) => BackgroundSubagentJobView[];
+
+type ProviderHolder = typeof globalThis & {
+  __flowshipSubagentSnapshotProvider?: BackgroundSubagentSnapshotProvider | null;
+};
+
+/** chat-runner 登记 / 注销（hot reload 时后加载的覆盖旧的） */
+export const setBackgroundSubagentSnapshotProvider = (
+  provider: BackgroundSubagentSnapshotProvider | null,
+): void => {
+  (globalThis as ProviderHolder).__flowshipSubagentSnapshotProvider = provider;
+};
+
+/** 此刻某个任务在后台跑的子代理清单（读不到 / provider 抛错都按空——bootstrap 不能因为它挂掉） */
+export const getBackgroundSubagentSnapshot = (
+  taskId: string,
+): BackgroundSubagentJobView[] => {
+  const provider = (globalThis as ProviderHolder)
+    .__flowshipSubagentSnapshotProvider;
+  if (!provider) return [];
+  try {
+    // bootstrap 补帧不经 task-stream.publish（实时帧在那里脱敏），这里同口径脱敏：
+    // description 是模型填的文本，不能让重连补帧成为明文出口
+    return redactCopyIfHit(provider(taskId));
+  } catch (err) {
+    console.warn(
+      `[subagent-background] 读取后台子代理清单失败 task=${taskId}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return [];
+  }
 };
 
 // ----------------- 文案 -----------------

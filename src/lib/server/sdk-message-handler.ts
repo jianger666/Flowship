@@ -17,7 +17,11 @@ import {
   compactionEventMeta,
   compactionEventText,
 } from "@/lib/compaction-display";
-import { toSubagentDisplayCall } from "@/lib/cursor-subagent-display";
+import {
+  extractSubagentCallArgs,
+  toSubagentDisplayCall,
+  toWaitDisplayCall,
+} from "@/lib/cursor-subagent-display";
 import { appendThinkingText } from "@/lib/thinking-live";
 
 import { appendEvent, getTask, patchActionIfOwner } from "./task-fs";
@@ -31,6 +35,7 @@ import {
   truncate,
   writeOwnedEventAndPublish,
 } from "./task-stream";
+import { noteSubagentToolCall } from "./subagent-transcript";
 import { buildToolResultMeta } from "./tool-result-persist";
 
 /**
@@ -604,13 +609,24 @@ export const handleSdkMessage = async (
    */
   origin?: string,
 ): Promise<void> => {
+  // 子代理过程记录配对：主流里这条 `subagent` 调用的 callId ↔ 工具回调里记下的那份过程记录。
+  // 必须在下面改写 / 截断之前做（要拿模型传的完整任务书）；任何状态都调、幂等；不抛、不阻塞。
+  if (rawMsg.type === "tool_call") {
+    const subCall = extractSubagentCallArgs(rawMsg);
+    if (subCall) {
+      noteSubagentToolCall(taskId, { callId: rawMsg.call_id, prompt: subCall.prompt });
+    }
+  }
   // Cursor 的 `subagent` 自定义工具（MCP 外壳）改写成与 pi / 原生同形的 `task`，
-  // 子代理卡片、状态行、model / effort 徽标才认得出；其它消息原样（同一引用）
+  // 子代理卡片、状态行、model / effort 徽标才认得出；`wait` 同理改写成扁平的 `wait`
+  // （状态行「等待中」+ 跳过按钮、工具块摘要按名字认它）。其它消息原样（同一引用）
   const msg: SDKMessage =
     rawMsg.type === "tool_call"
-      ? toSubagentDisplayCall(rawMsg, {
-          parentModel: assistantCtx.subagentParentModel,
-        })
+      ? toWaitDisplayCall(
+          toSubagentDisplayCall(rawMsg, {
+            parentModel: assistantCtx.subagentParentModel,
+          }),
+        )
       : rawMsg;
   // 入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
   const stillCurrent = lease;

@@ -180,4 +180,17 @@ describe("U1/U3 stop lifecycle（task 模式）", () => {
     );
     expect(stopTexts.some((t) => t.includes("用户停止了"))).toBe(true);
   });
+
+  it("停止事件带 meta.stopped=true：前端靠它清掉「正在发送首包…」等 boot 进度行（契约）", async () => {
+    const id = alloc();
+    const task = makeTask(id);
+
+    await stopTaskAgent(task);
+
+    const stopEvent = mockAppendEvent.mock.calls
+      .map((c) => c[1] as { kind: string; text?: string; meta?: Record<string, unknown> })
+      .find((e) => (e.text ?? "").includes("用户停止了"));
+    expect(stopEvent?.kind).toBe("info");
+    expect(stopEvent?.meta).toEqual({ stopped: true });
+  });
 });

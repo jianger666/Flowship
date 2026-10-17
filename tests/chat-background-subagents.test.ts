@@ -4,7 +4,9 @@
  *     子代理自动转后台、工具调用立刻返回、插话被 steer 进当前这一轮；
  *   - 后台子代理收尾 → 结果作为一条消息送回主 AI（忙则 steer、攒着等收尾；闲则唤醒一轮），
  *     事件流里给用户留一行提示、不落用户气泡；
- *   - 停止 / 关会话 → 后台子代理一并取消、结果不再投递。
+ *   - 停止 / 关会话 → 后台子代理一并取消、结果不再投递；
+ *   - 界面信号：后台子代理的在飞清单经 `background_subagents` 帧整份推给界面——
+ *     主 AI 说完一轮（会话空闲）后条不能收，子代理全部收尾 / 会话被关才收。
  *
  * 并行隔离：先钉 FLOWSHIP_DATA_DIR 再动态 import。
  */
@@ -56,9 +58,9 @@ const { enqueueChatMessage, clearChatQueue } = await import(
 const { sendQueuedChatMessageNow } = await import(
   "@/lib/server/chat-queue-send-now"
 );
-const { emitBackgroundSubagentSettled } = await import(
-  "@/lib/server/subagent-background"
-);
+const { emitBackgroundSubagentSettled, getBackgroundSubagentSnapshot } =
+  await import("@/lib/server/subagent-background");
+const { subscribeTaskStream } = await import("@/lib/server/task-stream");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(`chat-background DATA_DIR 未隔离到 TMP：${taskDir("probe")}`);
@@ -410,6 +412,55 @@ describe("后台结果的投递时机", () => {
     wakeRun.release();
   });
 
+  it("主 AI 正睡在 wait 里时后台结果到达：先叫醒 wait，再 steer 进去（否则结果被睡眠压住，最长 30 分钟）", async () => {
+    const { activeWaitCount } = await import("@/lib/server/session-wait");
+    const parent = manualRun({ steer: async () => "complete_delivered" });
+    const { subagentTool } = await startParentRun(parent.run);
+    const waitTool = (
+      mockResume.mock.calls.at(-1)?.[1] as {
+        local: { customTools: Record<string, { execute: (a: unknown, c: unknown) => Promise<{ content: Array<{ text: string }> }> }> };
+      }
+    ).local.customTools.wait!;
+    expect(waitTool).toBeTruthy();
+
+    // 派后台子代理，然后主 AI 去 wait 等它
+    await runTool(subagentTool, { prompt: "查资料", description: "查资料", run_in_background: true });
+    const sleeping = runTool(waitTool, { seconds: 600, reason: "等后台子代理" });
+    expect(activeWaitCount(TASK_ID)).toBe(1);
+
+    // 子代理做完 → 结果经 steer 送主 AI；wait 先被叫醒
+    childRuns[0]!.release("资料内容：ABC-123");
+    const wakeText = await sleeping;
+    expect(wakeText).toMatch(/^\[WAIT_INTERRUPTED\]/);
+    expect(wakeText).toContain("后台子代理");
+    expect(activeWaitCount(TASK_ID)).toBe(0);
+
+    const steer = parent.run.steer as ReturnType<typeof vi.fn>;
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledTimes(1), { timeout: 3000 });
+    expect(String(steer.mock.calls[0]![0])).toContain("资料内容：ABC-123");
+  });
+
+  it("这一轮不能 steer（结果只能攒到收尾再送）：不叫醒 wait——叫醒了也送不进去、白白打断用户设的等待", async () => {
+    const { activeWaitCount, interruptWaits } = await import("@/lib/server/session-wait");
+    const parent = manualRun(); // 没有 steer（pi 形态）
+    const { subagentTool } = await startParentRun(parent.run);
+    const waitTool = (
+      mockResume.mock.calls.at(-1)?.[1] as {
+        local: { customTools: Record<string, { execute: (a: unknown, c: unknown) => Promise<{ content: Array<{ text: string }> }> }> };
+      }
+    ).local.customTools.wait!;
+    await runTool(subagentTool, { prompt: "a", description: "任务A", run_in_background: true });
+    const sleeping = runTool(waitTool, { seconds: 600 });
+    expect(activeWaitCount(TASK_ID)).toBe(1);
+
+    childRuns[0]!.release("A 的结果");
+    await settleTail();
+    expect(activeWaitCount(TASK_ID)).toBe(1); // 还在睡
+
+    interruptWaits(TASK_ID, "cancel"); // 清场
+    expect(await sleeping).toMatch(/^\[WAIT_CANCELLED\]/);
+  });
+
   it("steer 被退回（revert_to_followup）：不丢，这一轮收尾后送出", async () => {
     const parent = manualRun({ steer: async () => "revert_to_followup" });
     const { parentAgent, subagentTool } = await startParentRun(parent.run);
@@ -643,5 +694,131 @@ describe("空闲回收不能把还有后台子代理的会话回收掉", () => {
     expect(block.indexOf("backgroundRunning()")).toBeLessThan(
       block.indexOf("closeChatSession"),
     );
+  });
+});
+
+describe("界面信号：background_subagents 帧（主 AI 说完后子代理还在干活，条不能收）", () => {
+  /** 订阅任务流里的 background_subagents 帧，按到达顺序记整份清单 */
+  const watchJobFrames = () => {
+    const frames: Array<
+      Array<{ id: string; description: string; startedAt: number; detached: boolean }>
+    > = [];
+    const unsub = subscribeTaskStream(TASK_ID, (ev) => {
+      if (ev.kind === "background_subagents") frames.push(ev.jobs);
+    });
+    return { frames, unsub };
+  };
+
+  it("派出 → 非空帧；主 AI 这一轮说完（会话空闲）条仍在；子代理做完 → 空帧，且先于唤醒主 AI", async () => {
+    const parent = manualRun({ steer: async () => "complete_delivered" });
+    const { parentAgent, subagentTool } = await startParentRun(parent.run);
+    const { frames, unsub } = watchJobFrames();
+    try {
+      await runTool(subagentTool, {
+        prompt: "跑个长任务",
+        description: "长任务",
+        run_in_background: true,
+      });
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toMatchObject([{ description: "长任务", detached: false }]);
+      // bootstrap（watch-task 路由）读的是同一份真值
+      expect(getBackgroundSubagentSnapshot(TASK_ID)).toEqual(frames[0]);
+
+      // 主 AI 说完这一轮：会话回到空闲——这正是用户「看不出还有子代理在干活」的那一刻
+      parent.release("好的，我派了个后台子代理");
+      await vi.waitFor(() => expect(isChatRunActive(TASK_ID)).toBe(false), {
+        timeout: 5000,
+        interval: 30,
+      });
+      expect(hasChatSession(TASK_ID)).toBe(true);
+      expect(frames.at(-1)).toHaveLength(1); // 没有被 run 收尾误清
+      expect(getBackgroundSubagentSnapshot(TASK_ID)).toHaveLength(1);
+
+      // 子代理做完 → 清单变空；唤醒主 AI 的那次 send 发生时，界面上的条已经收了
+      const wakeRun = manualRun({ steer: async () => "complete_delivered" });
+      parentAgent.send.mockResolvedValue(wakeRun.run);
+      childRuns[0]!.release("长任务的结论");
+      await vi.waitFor(() => expect(parentAgent.send).toHaveBeenCalledTimes(2), {
+        timeout: 5000,
+        interval: 30,
+      });
+      expect(frames.at(-1)).toEqual([]);
+      expect(getBackgroundSubagentSnapshot(TASK_ID)).toEqual([]);
+      wakeRun.release("收到结论");
+    } finally {
+      unsub();
+    }
+  });
+
+  it("多个后台子代理各自收尾：清单逐个变短，最后一个收尾才空", async () => {
+    const parent = manualRun();
+    const { subagentTool } = await startParentRun(parent.run);
+    const { frames, unsub } = watchJobFrames();
+    try {
+      await runTool(subagentTool, { prompt: "a", description: "任务A", run_in_background: true });
+      await runTool(subagentTool, { prompt: "b", description: "任务B", run_in_background: true });
+      expect(frames.at(-1)?.map((j) => j.description)).toEqual(["任务A", "任务B"]);
+
+      childRuns[0]!.release("A 的结果");
+      await vi.waitFor(
+        () => expect(frames.at(-1)?.map((j) => j.description)).toEqual(["任务B"]),
+        { timeout: 3000 },
+      );
+      childRuns[1]!.release("B 的结果");
+      await vi.waitFor(() => expect(frames.at(-1)).toEqual([]), { timeout: 3000 });
+    } finally {
+      unsub();
+    }
+  });
+
+  it("用户插话把前台子代理转后台：清单里出现它，来源标 detached", async () => {
+    const parent = manualRun({ steer: async () => "complete_delivered" });
+    const { subagentTool } = await startParentRun(parent.run);
+    const { frames, unsub } = watchJobFrames();
+    try {
+      const call = runTool(subagentTool, { prompt: "查资料", description: "查资料" });
+      await vi.waitFor(() => expect(childRuns).toHaveLength(1), { timeout: 3000 });
+      await settleTail();
+      expect(frames).toHaveLength(0); // 前台等待中不算后台在跑
+
+      enqueueChatMessage(TASK_ID, {
+        itemId: "cq_bar",
+        agentText: "插个话",
+        displayText: "插个话",
+        enqueuedAt: Date.now(),
+      });
+      await sendQueuedChatMessageNow(TASK_ID, "cq_bar", BOOT);
+      await call;
+
+      expect(frames.at(-1)).toMatchObject([{ description: "查资料", detached: true }]);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("停止空闲会话（连带取消后台子代理）→ 清单收空：条不会一直挂着", async () => {
+    const parent = manualRun({ steer: async () => "complete_delivered" });
+    const { subagentTool } = await startParentRun(parent.run);
+    const { frames, unsub } = watchJobFrames();
+    try {
+      await runTool(subagentTool, { prompt: "a", description: "后台", run_in_background: true });
+      parent.release("ok");
+      await vi.waitFor(() => expect(isChatRunActive(TASK_ID)).toBe(false), {
+        timeout: 5000,
+        interval: 30,
+      });
+      expect(frames.at(-1)).toHaveLength(1);
+
+      expect(cancelChatRun(TASK_ID)).toBe(true);
+      await vi.waitFor(() => expect(frames.at(-1)).toEqual([]), { timeout: 3000 });
+      expect(hasChatSession(TASK_ID)).toBe(false);
+      expect(getBackgroundSubagentSnapshot(TASK_ID)).toEqual([]);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("没有会话 → 快照为空（bootstrap 对没聊过的任务也安全）", () => {
+    expect(getBackgroundSubagentSnapshot("t_no_such_task")).toEqual([]);
   });
 });

@@ -52,7 +52,6 @@ import {
   buildResendPayload,
   findLastUserReply,
 } from "@/components/tasks/event-stream/resend-payload";
-import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskChangesPanel } from "@/components/tasks/task-changes-panel";
@@ -1242,12 +1241,6 @@ const TaskDetailPage = () => {
                 />
                 </StreamActionsProvider>
               </div>
-              {/* 疑似卡住提示：挂在输入条上方，chat / task 共用 SuspectStuckHint */}
-              <SuspectStuckHint
-                task={task}
-                streamingText={streamingText}
-                className="shrink-0 px-6 py-1.5"
-              />
               {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文）
                   群问答 tab 可见时隐藏：只读 tab 下输入框会误导用户在此发言 */}
               {groupQaVisible ? null : (

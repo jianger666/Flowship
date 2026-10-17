@@ -120,7 +120,7 @@ export interface GroupMention {
 }
 
 export interface ParsedGroupReply {
-  /** silent = 不发群；send = 发 text（已含真 @ 标签，可直接给 post+md 发送） */
+  /** silent = 不发群；send = 发 text（已含真 @ 标签，可直接交给 sendMarkdownCardToChat 发文本卡） */
   kind: "silent" | "send";
   /** 发群正文（kind=silent 时为空串） */
   text: string;

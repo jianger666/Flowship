@@ -43,6 +43,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useTaskWatch } from "@/hooks/use-task-watch";
+import {
+  backgroundSubagentJobsEqual,
+  type BackgroundSubagentJobView,
+} from "@/lib/background-subagents";
 import { useDialog } from "@/hooks/use-dialog";
 import {
   clearChatOpLedger,
@@ -133,6 +137,9 @@ type PendingLocalReply = ChatOperation & {
   skillRefs?: Array<{ name: string; absPath: string }>;
 };
 
+/** 「没有后台子代理」的稳定空数组：切任务重置时不产生新引用（EventStream 是 memo、新引用 = 白白重渲染） */
+const NO_BACKGROUND_SUBAGENTS: BackgroundSubagentJobView[] = [];
+
 export const ChatView = ({
   task,
   onTaskUpdate,
@@ -203,6 +210,12 @@ export const ChatView = ({
   >({});
   // P5：排队条（第 N 条）；null = 无排队
   const [queuedCount, setQueuedCount] = useState<number | null>(null);
+  // 此刻还在后台跑的子代理（SSE background_subagents 帧维护整份快照，每次连接 bootstrap 补发当前值）。
+  // 与 runActive 无关：主 AI 说完一轮后 runActive 归零、会话看上去「已结束」，后台子代理却可能还在干活，
+  // 输入框上方的「子代理在后台工作」条靠它画（切任务清空，新任务 bootstrap 会补发）
+  const [backgroundSubagents, setBackgroundSubagents] = useState<
+    BackgroundSubagentJobView[]
+  >(NO_BACKGROUND_SUBAGENTS);
   // Operation ledger（pending + settled + outcomes）——HTTP/SSE 同一 reducer
   const [pendingLocalReplies, setPendingLocalReplies] = useState<
     PendingLocalReply[]
@@ -290,6 +303,8 @@ export const ChatView = ({
     stopAfterSubmitRef.current = false;
     setLiveToolOutputs({});
     setRunActive(false);
+    // 上个任务的后台子代理不能串到新任务（新任务连上 SSE 后 bootstrap 会补发它自己的）
+    setBackgroundSubagents(NO_BACKGROUND_SUBAGENTS);
     // 排队快照只对「本次挂载内登记的占位」有意义；切走后丢掉，免得越攒越多
     queuedAtSubmitRef.current = new Map();
     // 立即投影当前 ledger，再订阅后续 dispatch
@@ -438,6 +453,12 @@ export const ChatView = ({
     },
     onThinkingDelta: pushThinkingDelta,
     onThinkingSnapshot: applySnapshot,
+    // 后台子代理在飞清单：整份替换；与现值相同（bootstrap 补发 vs 实时帧常常同一份）就不 setState，
+    // 省一次整个聊天视图的重渲染
+    onBackgroundSubagents: (jobs) =>
+      setBackgroundSubagents((prev) =>
+        backgroundSubagentJobsEqual(prev, jobs) ? prev : jobs,
+      ),
     // msg 已是 runner 拼好的可读文案（「Chat agent 异常：…」），别再套一层
     // 「watch 出错」——那会误导成 SSE 断了，实际是 agent 挂了
     onErrorMessage: (msg) => toast.error(msg),
@@ -990,6 +1011,7 @@ export const ChatView = ({
           onEditRewind={handleEditRewind}
           pendingLocalReplies={pendingForStream}
           queueBanner={queueBanner}
+          backgroundSubagents={backgroundSubagents}
           allowQueueWhileRunning
           onEditPending={handleEditPending}
           onDeletePending={handleDeletePending}

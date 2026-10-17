@@ -9,7 +9,7 @@ import {
   __resetLarkBinCacheForTest,
   __setLarkExecForTest,
   __setLarkRetryBaseForTest,
-  buildPostMarkdownContent,
+  buildMarkdownCardJson,
   describeLarkCommand,
   fetchChatInfo,
   getBotAppInfo,
@@ -20,7 +20,8 @@ import {
   probeLarkAuthStatus,
   probeSelfInChat,
   runLark,
-  sendPostMarkdownToChat,
+  sendMarkdownCardToChat,
+  toCardMarkdown,
   uploadImage,
 } from "@/lib/server/feishu-bridge/lark-api";
 import {
@@ -132,52 +133,151 @@ describe("describeLarkCommand", () => {
   });
 });
 
-describe("sendPostMarkdownToChat", () => {
-  it("buildPostMarkdownContent 整段包进 md 标签", () => {
-    const parsed = JSON.parse(
-      buildPostMarkdownContent("**粗体** `uuid`\n- 一项"),
-    ) as {
-      zh_cn: { content: Array<Array<{ tag: string; text: string }>> };
-    };
-    expect(parsed.zh_cn.content).toEqual([
-      [{ tag: "md", text: "**粗体** `uuid`\n- 一项" }],
-    ]);
+// 群里的文字一律发「文本卡」：上游仍按 text / post 时代的写法（`<at user_id>`、裸 `<`）拼正文，
+// 最后一跳统一转成卡片 markdown 的写法。这组用例钉的是那一跳。
+describe("toCardMarkdown", () => {
+  it("<at user_id> → <at id=…>：显示名交给飞书按 id 补", () => {
+    expect(toCardMarkdown('<at user_id="ou_x">张三</at> 请看')).toBe(
+      "<at id=ou_x></at> 请看",
+    );
   });
 
-  it("走 --msg-type post --content，不走 --text", async () => {
+  it("机器人的 id（cli_ / ou_ 都一样）照转，一段里多个 @ 与正文穿插", () => {
+    expect(
+      toCardMarkdown(
+        '<at user_id="ou_a">甲</at> 和 <at user_id="cli_bot1">安若流年</at>：请逐条答',
+      ),
+    ).toBe("<at id=ou_a></at> 和 <at id=cli_bot1></at>：请逐条答");
+  });
+
+  it("id 含非法字符 → 退化成纯文本 @名，不拼出坏标签", () => {
+    expect(toCardMarkdown('<at user_id="ou$x">李四</at> 在吗')).toBe(
+      "@李四 在吗",
+    );
+  });
+
+  it("没有 id 的 @（mentionTag 已退化成 @名）原样保留", () => {
+    expect(toCardMarkdown("@王五 在吗")).toBe("@王五 在吗");
+  });
+
+  it("正文里的裸 `<` 转 &lt;（否则 `推进 <action>` 会被当标签吞掉）；`>` 不动", () => {
+    expect(toCardMarkdown("推进 <plan / build>，或只发「推进」")).toBe(
+      "推进 &lt;plan / build>，或只发「推进」",
+    );
+    expect(toCardMarkdown("> 引用一句")).toBe("> 引用一句");
+  });
+
+  it("行内代码 / 代码围栏里不转（`<` 在代码里本来就是字面量）", () => {
+    expect(toCardMarkdown("用 `List<string>` 接收")).toBe(
+      "用 `List<string>` 接收",
+    );
+    const fenced = '```ts\nconst a: Array<number> = [];\n<at user_id="ou_x">x</at>\n```';
+    expect(toCardMarkdown(fenced)).toBe(fenced);
+  });
+
+  it("回复协议把伪造 at 标签碎片换成的全角 ＜ 原样放过", () => {
+    expect(toCardMarkdown("＜at user_id=\"ou_fake\">假")).toBe(
+      "＜at user_id=\"ou_fake\">假",
+    );
+  });
+});
+
+describe("buildMarkdownCardJson", () => {
+  it("2.0 卡片、无 header、只有一个 markdown 元素", () => {
+    const card = buildMarkdownCardJson("**粗体** 一句话") as {
+      schema: string;
+      header?: unknown;
+      body: { elements: Array<{ tag: string; content: string }> };
+    };
+    expect(card.schema).toBe("2.0");
+    expect(card.header).toBeUndefined();
+    expect(card.body.elements).toHaveLength(1);
+    expect(card.body.elements[0]).toMatchObject({
+      tag: "markdown",
+      content: "**粗体** 一句话",
+    });
+  });
+
+  it("正文走 toCardMarkdown（@ 已转成卡片写法）", () => {
+    const card = buildMarkdownCardJson('<at user_id="ou_x">张三</at> 好了') as {
+      body: { elements: Array<{ content: string }> };
+    };
+    expect(card.body.elements[0]?.content).toBe("<at id=ou_x></at> 好了");
+  });
+
+  it("summary 把会话预览的「[卡片]」换成正文开头：@ 还原成 @名、去标签与 md 符号、≤50 字", () => {
+    const card = buildMarkdownCardJson(
+      `<at user_id="ou_x">张三</at> **已开始跑** <plan>\n${"很长".repeat(40)}`,
+    ) as { config: { summary?: { content: string } } };
+    const summary = card.config.summary?.content ?? "";
+    expect(summary.startsWith("@张三 已开始跑")).toBe(true);
+    expect(summary).not.toMatch(/[*<>]/);
+    expect(Array.from(summary).length).toBeLessThanOrEqual(50);
+  });
+
+  it("正文清洗后为空 → 不带 summary 字段（不塞空串）", () => {
+    const card = buildMarkdownCardJson("**  **") as {
+      config: { summary?: unknown };
+    };
+    expect(card.config.summary).toBeUndefined();
+  });
+});
+
+describe("sendMarkdownCardToChat（群里文字类出口的唯一收口）", () => {
+  it("建卡实体 → 发 interactive；不走 --text / --msg-type post", async () => {
     const calls: string[][] = [];
     __setLarkExecForTest(async (_bin, args) => {
       calls.push(args);
       return {
-        stdout: JSON.stringify({
-          ok: true,
-          data: { chat_id: "oc_g", message_id: "om_md" },
-        }),
+        stdout: JSON.stringify(
+          args[0] === "api"
+            ? { ok: true, data: { card_id: "c_md" } }
+            : { ok: true, data: { chat_id: "oc_g", message_id: "om_card" } },
+        ),
         stderr: "",
       };
     });
-    const sent = await sendPostMarkdownToChat(
+    const sent = await sendMarkdownCardToChat(
       "oc_g",
-      '<at user_id="ou_x">张三</at> **中性**',
+      '<at user_id="cli_bot1">安若流年</at> 请逐条答',
     );
-    expect(sent).toEqual({ chat_id: "oc_g", message_id: "om_md" });
-    expect(calls[0]?.slice(0, 6)).toEqual([
+    expect(sent).toMatchObject({ chat_id: "oc_g", message_id: "om_card" });
+    expect(calls).toHaveLength(2);
+
+    // ① 建卡实体：卡片 JSON 里 @ 已是卡片写法
+    expect(calls[0]?.slice(0, 3)).toEqual([
+      "api",
+      "POST",
+      "/open-apis/cardkit/v1/cards",
+    ]);
+    const dataIdx = calls[0]!.indexOf("--data");
+    const created = JSON.parse(calls[0]![dataIdx + 1]!) as {
+      type: string;
+      data: string;
+    };
+    expect(created.type).toBe("card_json");
+    const card = JSON.parse(created.data) as {
+      body: { elements: Array<{ content: string }> };
+    };
+    expect(card.body.elements[0]?.content).toBe(
+      "<at id=cli_bot1></at> 请逐条答",
+    );
+
+    // ② 发送：interactive + 卡片实体 id，没有任何 text / post 痕迹
+    expect(calls[1]?.slice(0, 6)).toEqual([
       "im",
       "+messages-send",
       "--chat-id",
       "oc_g",
       "--msg-type",
-      "post",
+      "interactive",
     ]);
-    expect(calls[0]).toContain("--content");
-    expect(calls[0]).not.toContain("--text");
-    const contentIdx = calls[0]!.indexOf("--content");
-    const content = JSON.parse(calls[0]![contentIdx + 1]!) as {
-      zh_cn: { content: Array<Array<{ tag: string; text: string }>> };
-    };
-    expect(content.zh_cn.content[0]?.[0]).toEqual({
-      tag: "md",
-      text: '<at user_id="ou_x">张三</at> **中性**',
+    expect(calls[1]).not.toContain("--text");
+    expect(calls[1]).not.toContain("post");
+    const contentIdx = calls[1]!.indexOf("--content");
+    expect(JSON.parse(calls[1]![contentIdx + 1]!)).toEqual({
+      type: "card",
+      data: { card_id: "c_md" },
     });
   });
 });

@@ -248,8 +248,8 @@ describe("task(log) 与 chat 对话外观统一", () => {
   it("log 的 AI 回复只多一个可折叠的元信息头：aria-expanded + 共享行按钮 + 共享 chevron", () => {
     const logHeader = between(
       eventRow,
-      "{isLog && (",
-      "{showBody && (",
+      "{isLog &&",
+      "{showBody && !streaming && (",
     );
     expect(logHeader).toContain("aria-expanded={!collapsed}");
     expect(logHeader).toContain("PROCESS_ROW_BUTTON");
@@ -298,23 +298,28 @@ describe("task(log) 与 chat 对话外观统一", () => {
     expect(rows).not.toContain("hover:opacity-80");
   });
 
-  it("log 的流式行与正式 AI 回复同款平铺（不再是带边框的 info 卡），字号行高跟正式行一致", () => {
-    const streaming = between(
-      rows,
-      "const StreamingAssistantRowImpl",
-      "export const StreamingAssistantRow = memo",
+  it("流式行与定稿 AI 回复是同一个组件、同一套外壳（不再有独立的 StreamingAssistantRow）：头高一致、正文同一个 MarkdownText", () => {
+    // 2026-10-17「吐完字整段抖一下」：流式项曾用独立组件，定稿事件一到整段卸载重挂。
+    // 现在流式项走 EventRow 的 `streaming` 态，定稿事件通过 Virtuoso key 接管同一个节点（lib/stream-handoff）
+    expect(rows).not.toContain("StreamingAssistantRow");
+    expect(rows).toContain("streaming = false,");
+    expect(eventRow).toContain("streaming={streaming}");
+    // 流式头与定稿头同高（h-7）：它们是同一个节点原地切换，高度差 = 吐完字整段往下顶一截
+    const logHeader = between(
+      eventRow,
+      "{isLog &&",
+      "{showBody && !streaming && (",
     );
-    expect(streaming).not.toContain("border-info");
-    expect(streaming).not.toContain("bg-info/5");
-    // chat / log 两个分支各一处：外层 wrapper 走共享常量（chat 15px、log 右栏 14px），
-    // MarkdownText 各自传同档的 size（chat reply / log default）——
-    // 字号必须落在 prose 元素上（只包外层 div 会被 prose-sm 盖掉，详见 markdown-reply-size-contract），
-    // 保证收尾换成正式行时文字不跳
-    expect(countOf(streaming, "className={MARKDOWN_REPLY_TEXT}")).toBe(1);
-    expect(countOf(streaming, "className={MARKDOWN_LOG_REPLY_TEXT}")).toBe(1);
-    expect(streaming.match(/<MarkdownText\s+size="reply"/g) ?? []).toHaveLength(1);
-    expect(streaming.match(/<MarkdownText\s+size="default"/g) ?? []).toHaveLength(1);
-    expect(streaming).toContain("animate-spin text-info");
+    expect(countOf(logHeader, "h-7")).toBe(2);
+    expect(logHeader).toContain("animate-spin text-info");
+    expect(logHeader).toContain("AI 回复中…");
+    // 流式头不是带边框的 info 卡
+    expect(logHeader).not.toContain("border-info");
+    expect(logHeader).not.toContain("bg-info/5");
+    // 流式中：不挂 hover 动作条 / 选区引用，log 头强制展开
+    expect(eventRow).toContain("{showBody && !streaming && (");
+    expect(eventRow).toContain("const showBody = !isLog || !collapsed || streaming;");
+    expect(eventRow).toContain("onMouseUp={streaming ? undefined : onAssistantMouseUp}");
   });
 
   it("回合节奏：chat 与 log 走同一个纯函数（lib/event-stream-rhythm），JSX 里不再各写一套 pt-* 三元", () => {

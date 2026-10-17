@@ -31,6 +31,24 @@ export const isModCombo = (e: KeyComboEvent, key: string): boolean =>
   !e.shiftKey &&
   e.key.toLowerCase() === key.toLowerCase();
 
+/** 右侧抽屉（`Sheet` 的 SheetContent）根节点上的 data-slot，焦点归属判定用 */
+export const SHEET_CONTENT_SELECTOR = '[data-slot="sheet-content"]';
+
+/**
+ * 焦点 / 按键目标是否落在右侧抽屉里。
+ *
+ * 抽屉是非模态的（焦点离开也不会关），用户盯着子代理详情按空格 / 翻页时，
+ * 主界面的「自动聚焦输入框」「Cmd/Ctrl+End 回到最新」都不该把键盘抢走。
+ * 只收最小形状（有 `closest` 就行），不碰 document，单测可直接喂假对象。
+ */
+export const isInsideSheet = (
+  target: { closest?: (selector: string) => unknown } | EventTarget | null | undefined,
+): boolean => {
+  const el = target as { closest?: (selector: string) => unknown } | null | undefined;
+  if (!el || typeof el.closest !== "function") return false;
+  return el.closest(SHEET_CONTENT_SELECTOR) != null;
+};
+
 /** 提交快捷键的对位：enter ↔ mod-enter（运行中「立即发送」用对位键） */
 export const oppositeSubmitShortcut = (s: SubmitShortcut): SubmitShortcut =>
   s === "enter" ? "mod-enter" : "enter";

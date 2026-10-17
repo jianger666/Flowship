@@ -36,13 +36,40 @@ import {
   type AskUserQuestion,
   type NotifyAwaitingResult,
 } from "./chat-pending";
+import { WAIT_TOOL_NAME } from "@/lib/wait-display";
 import { buildAskWaitCurl, openAskWait } from "./ask-wait";
 import { createCustomAction } from "./custom-action-fs";
+import {
+  WAIT_MAX_SECONDS,
+  WAIT_MIN_SECONDS,
+  formatWaitResult,
+  normalizeWaitSeconds,
+  runWait,
+} from "./session-wait";
 import { getAppSkillsDir } from "./skills-loader";
 import { getTask } from "./task-fs";
 import { writeEventAndPublish } from "./task-stream";
 
 export type FlowshipToolContent = Array<{ type: "text"; text: string }>;
+
+/**
+ * 工具回调的运行时上下文（两条后端各自能给多少给多少，全可选）。
+ * 现在只有 `wait` 用它；其余工具自己带 task_id 入参、校验 callerToken，不依赖这里。
+ */
+export interface FlowshipToolContext {
+  /**
+   * 这个会话属于哪个任务：`wait` 据此登记，停止 / 插话 / 「跳过等待」按 taskId 把它唤醒。
+   * 两条后端在工具构建处都知道 taskId；没有时 `wait` 仍能等，只是只能被定时器 / signal 结束。
+   */
+  taskId?: string;
+  /**
+   * agent 实例级 scope：这个实例的 run 被取消 / 会话被关时（懒重启、错误收尾、超时……不经 stop 的那些路径）
+   * 按它叫醒在睡的 `wait`。只有 Cursor 路径有（pi 靠 signal）；见 session-wait 头注释。
+   */
+  scope?: string;
+  /** 本次调用被取消的信号。pi 有；Cursor SDK 的 customTool 回调没有（靠注册表在停止时主动唤醒） */
+  signal?: AbortSignal;
+}
 
 export interface FlowshipToolDef {
   name: string;
@@ -53,6 +80,7 @@ export interface FlowshipToolDef {
   handler: (
     args: Record<string, unknown>,
     callerToken: string | undefined,
+    ctx?: FlowshipToolContext,
   ) => Promise<{ content: FlowshipToolContent }>;
 }
 
@@ -656,6 +684,44 @@ const expectGroupReplyDef: FlowshipToolDef = {
   },
 };
 
+// ----------------- 等待 wait -----------------
+
+/** reason 回显给模型 / 用户的最大长度（模型自己填的、别让一段长文顶满状态行） */
+const WAIT_REASON_MAX = 120;
+
+const waitDef: FlowshipToolDef = {
+  name: WAIT_TOOL_NAME,
+  label: "等待一段时间",
+  description: [
+    "等待一段时间再继续。需要等外部的事（后台命令跑完、CI / 流水线、文件生成、接口限流冷却、让某个服务先起来……）时用本工具——不要用 shell 的 `sleep`，也不要用 SDK 自带的 await / sleep：本工具在界面上会显示已等时长和原因、用户能随时「跳过等待」；停止任务、用户点「立即发送」插话、后台子代理交回结果也会让它提前返回（用户用普通发送排进队列的消息要等这一轮结束才会送达，不会唤醒它）。",
+    `入参：seconds（${WAIT_MIN_SECONDS}–${WAIT_MAX_SECONDS}，必填）；reason（一句话说明在等什么，会显示给用户，强烈建议填）。`,
+    "它只是睡觉：**不会替你检查**要等的事是否完成。醒来后你自己去确认；没好再决定要不要继续等，间隔适当拉长（几十秒到几分钟），别每隔几秒就轮询一次。",
+    "返回以 [WAIT_DONE]（等够了）/ [WAIT_SKIPPED]（用户不想再等——不代表要等的事已完成，仍要自己确认）/ [WAIT_INTERRUPTED]（有新消息：用户插话或后台子代理交回结果）/ [WAIT_CANCELLED]（任务被停止——立刻结束本轮、不再调任何工具）开头；后三种按返回文案里的指示做，不要不管不顾地再睡一遍。",
+  ].join("\n"),
+  parameters: TBObject({
+    seconds: TBNumber(),
+    reason: TBOptional(TBString()),
+  }),
+  handler: async (args, _callerToken, ctx) => {
+    // 不校验 callerToken：本工具没有 task_id 入参、也没有任何副作用（只是睡觉），
+    // 被新 agent 接管后旧 agent 的等待最多白睡到自己的定时器 / 停止时被唤醒
+    const norm = normalizeWaitSeconds(args.seconds);
+    if (!norm) {
+      return text(
+        `参数错误：seconds 必须是 ${WAIT_MIN_SECONDS}–${WAIT_MAX_SECONDS} 之间的数字（秒）。`,
+      );
+    }
+    const reason = str(args.reason).trim().slice(0, WAIT_REASON_MAX);
+    const outcome = await runWait({
+      key: ctx?.taskId,
+      scope: ctx?.scope,
+      plannedMs: norm.seconds * 1000,
+      signal: ctx?.signal,
+    });
+    return text(formatWaitResult(outcome, { reason, clamped: norm.clamped }));
+  },
+};
+
 /** Flowship 自有工具清单（cursor SDK customTools + pi customTools 共用） */
 export const flowShipTools: FlowshipToolDef[] = [
   submitWorkDef,
@@ -667,6 +733,7 @@ export const flowShipTools: FlowshipToolDef[] = [
   shareToGroupDef,
   notifyGroupTestersDef,
   expectGroupReplyDef,
+  waitDef,
 ];
 
 /**
@@ -690,14 +757,27 @@ const typeBoxToJsonSchema = (schema: unknown): Record<string, SDKJsonValue> => {
  */
 export const buildSdkCustomTools = (
   callerToken: string,
+  /**
+   * 会话所属任务 / agent 实例：`wait` 据 taskId 被停止 / 插话 / 跳过唤醒，据 waitScope 被
+   * 「这个实例的 run 被取消 / 会话被关」唤醒（见 FlowshipToolContext）
+   */
+  opts?: { taskId?: string; waitScope?: string },
 ): Record<string, SDKCustomTool> => {
   const tools: Record<string, SDKCustomTool> = {};
+  // Cursor 的 customTool 回调没有 AbortSignal（见 session-wait 头注释），这里只能给 taskId / scope
+  const ctx: FlowshipToolContext | undefined =
+    opts?.taskId || opts?.waitScope
+      ? {
+          ...(opts.taskId ? { taskId: opts.taskId } : {}),
+          ...(opts.waitScope ? { scope: opts.waitScope } : {}),
+        }
+      : undefined;
   for (const t of flowShipTools) {
     tools[t.name] = {
       description: t.description,
       inputSchema: typeBoxToJsonSchema(t.parameters),
       execute: async (args) => {
-        const r = await t.handler(args, callerToken);
+        const r = await t.handler(args, callerToken, ctx);
         return { content: r.content };
       },
     };
@@ -714,6 +794,7 @@ export const withFlowshipSdkCustomTools = <T extends object>(
   callerToken: string | undefined,
   /** 与系统工具一起挂的额外工具（如 `subagent`）；只在这里挂系统工具时才带上 */
   extraTools?: Record<string, SDKCustomTool>,
+  opts?: { taskId?: string; waitScope?: string },
 ): T | (T & { customTools: Record<string, SDKCustomTool> }) => {
   if (!callerToken) return (local ?? {}) as T;
   if (
@@ -725,6 +806,9 @@ export const withFlowshipSdkCustomTools = <T extends object>(
   }
   return {
     ...(local ?? {}),
-    customTools: { ...buildSdkCustomTools(callerToken), ...(extraTools ?? {}) },
+    customTools: {
+      ...buildSdkCustomTools(callerToken, opts),
+      ...(extraTools ?? {}),
+    },
   } as T & { customTools: Record<string, SDKCustomTool> };
 };

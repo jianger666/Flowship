@@ -44,7 +44,7 @@ for (const name of ["config.json", "config.json.bak", "config.json.bak.shrink", 
 await fs.writeFile(path.join(DATA, "other.txt"), "unrelated\n");
 await fs.writeFile(path.join(CWD, "hello.txt"), "hello\n");
 
-const { isBypassBlockedReadPath, checkBypassRead, validateReadonlyShellCommand } = await import(
+const { isBypassBlockedReadPath, checkBypassRead } = await import(
   "@/lib/server/pi-coding-tools"
 );
 
@@ -180,16 +180,13 @@ describe("B · dev+ino：同一个文件换个名字也认得（注入 linux，�
     expect(isBypassBlockedReadPath(path.join(DATA, "other.txt"))).toBe(false);
   });
 
-  it("工具层：旁路 read / shell cat 读到数据目录文件的硬链接被拒", async () => {
+  it("工具层：旁路 read 读到数据目录文件的硬链接被拒", async () => {
     const link = path.join(CWD, "innocent-notes.txt");
     await fs.link(path.join(DATA, "config.json"), link);
     // 链接在工作区里，目录钳制放行；拦它的只能是「凭据文件」判定
     expect(checkBypassRead(CWD, "t1")({ path: link }) ?? "").toContain("凭据文件");
-    const verdict = validateReadonlyShellCommand(CWD, "cat innocent-notes.txt", undefined, undefined);
-    expect(verdict.ok).toBe(false);
-    expect(verdict.reason ?? "").toContain("凭据文件");
-    // 对照：工作区里的普通文件照常放行
-    expect(validateReadonlyShellCommand(CWD, "cat hello.txt", undefined, undefined).ok).toBe(true);
+    // 对照：工作区里的普通文件照常放行（read 守卫不拦）
+    expect(checkBypassRead(CWD, "t1")({ path: path.join(CWD, "hello.txt") })).toBeNull();
   });
 });
 

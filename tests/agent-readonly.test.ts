@@ -1,9 +1,10 @@
 /**
  * 只读门禁接线用例（review P0-1 的回归护栏）。
  *
- * 只读 = 不推进、不改东西；查数据（pg-exec SELECT、读日志）算读操作，允许。
+ * 只读 = 不推进、不改东西。
  * readOnly 双收敛：Cursor 走 `tools` 白名单 + 不挂系统 customTools；
- * pi 走 `buildReadOnlyToolDefs`（read/grep/glob/shell，写类/子代理/MCP 不给）。
+ * pi 走 `buildReadOnlyToolDefs`（read/grep/glob/merge_test_mr，写类/子代理/MCP/shell 不给；
+ * 只读 shell 守卫已在 v1.9.33 删除，见 pi-coding-tools.ts 里的说明）。
  */
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
@@ -71,7 +72,7 @@ describe("Agent.create readOnly（Cursor 路）", () => {
 });
 
 describe("pi buildReadOnlyToolDefs", () => {
-  it("只留 read/grep/glob/shell/merge_test_mr，无写类/子代理/MCP", async () => {
+  it("只留 read/grep/glob/merge_test_mr，无写类/子代理/MCP/shell", async () => {
     const { buildReadOnlyToolDefs } = await import(
       "@/lib/server/pi-coding-tools"
     );
@@ -80,7 +81,7 @@ describe("pi buildReadOnlyToolDefs", () => {
       .map((d) => (d as { name?: unknown }).name)
       .filter((n) => typeof n === "string")
       .sort();
-    // shell=只读校验版（含跑仓内脚本），merge_test_mr=服务端执行、只合 test 分支
-    expect(names).toEqual(["glob", "grep", "merge_test_mr", "read", "shell"]);
+    // merge_test_mr=服务端执行、只合 test 分支；没有 shell（只读 shell 守卫已删，见 pi-coding-tools.ts）
+    expect(names).toEqual(["glob", "grep", "merge_test_mr", "read"]);
   });
 });

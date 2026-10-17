@@ -14,6 +14,7 @@
  * 契约：
  * - id 前缀 ephemeral_boot_、meta.bootStage=true：前端 lib/chat-stream-display.isBootStageInfo
  *   识别、渐进单行显示（每阶段最少停留 700ms）、agent 真活动（正文 / thinking / 工具 / 错误）出现即整组消失；
+ *   用户停止（stop-task 落的 info 带 meta.stopped=true）同样让它消失——启动阶段被停时没有 agent 活动可清；
  * - user_reply 不会让它消失（boot 期间排队进来的消息不该把进度顶没）；
  * - 只推 SSE、绝不 appendEvent：reload 后天然为空、不污染事件日志；
  * - 尽力而为：推送失败只 debug，**绝不**影响发送主流程。

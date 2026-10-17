@@ -26,8 +26,7 @@ const { batchUpdateCard } = vi.hoisted(() => ({
 vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   batchUpdateCard,
   sendInteractiveCardToChat: vi.fn(),
-  sendPostMarkdownToChat: vi.fn(),
-  sendTextMessageToChat: vi.fn(),
+  sendMarkdownCardToChat: vi.fn(),
 }));
 
 const {

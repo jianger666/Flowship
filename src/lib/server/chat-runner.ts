@@ -32,9 +32,12 @@ import {
   formatBackgroundSubagentMessage,
   formatBackgroundSubagentNotice,
   getSubagentSessionControl,
+  onBackgroundSubagentJobsChanged,
   onBackgroundSubagentSettled,
+  setBackgroundSubagentSnapshotProvider,
   type BackgroundSubagentEvent,
 } from "./subagent-background";
+import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import {
@@ -61,6 +64,7 @@ import {
   setChatAwaitingNotifier,
 } from "./chat-pending";
 import { failpoint } from "./failpoints";
+import { interruptWaits } from "./session-wait";
 import { chatTurnProtocolSection } from "./turn-discipline";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { supersedePendingAsks } from "./ask-supersede";
@@ -654,6 +658,10 @@ const closeChatSession = (
     }
   }
   setChatAwaitingNotifier(taskId, null);
+  // 关会话会把后台子代理一并取消；它们的取消是异步收尾的、逐个报「清单变了」——
+  // 万一哪个取消迟迟不落定，界面的「后台工作中」条就会一直挂着。会话摘表后清单一定是空，这里补推一帧保证它收掉
+  const hadBackgroundJobs =
+    (getSubagentSessionControl(rec.agent)?.backgroundJobs().length ?? 0) > 0;
   if (rec.agent) {
     try {
       rec.agent.close();
@@ -661,6 +669,7 @@ const closeChatSession = (
       /* noop */
     }
   }
+  if (hadBackgroundJobs) publishBackgroundSubagents(taskId);
   if (!opts.keepPersisted && agentIdToClear) {
     // 条件清——finalGuard 现查「盘上仍是本 agentId + 内存无后继」
     void clearTaskSessionAgentIdIf(
@@ -901,6 +910,29 @@ const getReconnectStops = (): Map<string, () => void> => {
 
 const publish = (taskId: string, ev: TaskStreamEvent): void => {
   publishTaskStreamEvent(taskId, ev);
+};
+
+/**
+ * 某任务此刻在后台跑的子代理清单——按**当前会话**现读（会话不在 = 空）。
+ * watch-task 的 bootstrap 经 subagent-background 的 provider 读它（见文件末尾的登记），
+ * 实时帧也走它（见 publishBackgroundSubagents）：两处同源，断线重连后不会与实时状态漂移。
+ */
+export const getBackgroundSubagentJobs = (
+  taskId: string,
+): BackgroundSubagentJobView[] =>
+  getSubagentSessionControl(runningChats.get(taskId)?.agent)?.backgroundJobs() ??
+  [];
+
+/**
+ * 把「此刻的后台子代理清单」整份推给界面（`background_subagents` 帧、纯内存不落盘）。
+ * 界面据此在输入框上方画「子代理在后台工作」条——主 AI 说完一轮后会话呈现「已结束」，
+ * 但后台子代理还在干活，没有这条信号用户完全看不出来（2026-10-17 用户反馈）。
+ */
+const publishBackgroundSubagents = (taskId: string): void => {
+  publish(taskId, {
+    kind: "background_subagents",
+    jobs: getBackgroundSubagentJobs(taskId),
+  });
 };
 
 // 启动链 ephemeral 进度（publishBootProgress）已抽到 ./boot-progress：
@@ -3810,6 +3842,15 @@ export const drainBackgroundResults = async (taskId: string): Promise<void> => {
     // 忙：能 steer 就插进当前这一轮（AI 当前步骤结束后读到），否则等这一轮收尾（finalize 会再调本函数）
     if (!canSteerChatRun(taskId)) return;
     const batch = queued.splice(0);
+    // 主 AI 若正睡在 `wait` 里（典型：派了后台子代理、然后「等一会儿」等它们），steer 要等它这一步结束才送得进去，
+    // 结果会被睡眠压住（最长 30 分钟，恰好等于下面的总期限）。后台结果正是它在等的新信息：叫醒它，
+    // 它读到 [WAIT_INTERRUPTED] 后就能处理这批结果；还要等别的再调一次 wait 即可。
+    const wokenWaits = interruptWaits(taskId, "steer");
+    if (wokenWaits > 0) {
+      console.log(
+        `[chat-runner] task=${taskId} 后台结果到达：${wokenWaits} 个 wait 已提前结束`,
+      );
+    }
     // 总期限（STEER_TOTAL_TIMEOUT_MS）内主 AI 一直没收下：steerChatRun 返回 cancelled，但这和「会话被停止 / 关闭」不是一回事——
     // 会话与这一轮都还在，SDK 之后仍可能读到这批结果。措辞要如实：不写「已被停止或关闭」，
     // 也不沿用面向用户插话的「一条插话…」（这批不是用户说的话），由这里按后台结果的口径写
@@ -3913,6 +3954,18 @@ export const drainBackgroundResults = async (taskId: string): Promise<void> => {
       );
     });
   });
+}
+
+{
+  // 后台子代理清单变了（转入后台 / 收尾）→ 推最新整份给界面。订阅一次（hot reload 先注销旧的）
+  const KEY = "__flowshipChatBackgroundJobsUnsub__";
+  const g = globalThis as unknown as Record<string, (() => void) | undefined>;
+  g[KEY]?.();
+  g[KEY] = onBackgroundSubagentJobsChanged((taskId) => {
+    publishBackgroundSubagents(taskId);
+  });
+  // watch-task bootstrap 读当前清单走这里（路由不 import 本模块，见 subagent-background 的 provider 说明）
+  setBackgroundSubagentSnapshotProvider(getBackgroundSubagentJobs);
 }
 
 /**

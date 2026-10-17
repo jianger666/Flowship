@@ -6,8 +6,8 @@
  * 从 event-stream.tsx 抽出（V0.5.11）：
  *   - MarkdownText：assistant_message 用 markdown 渲染
  *   - SkillTokenText：user_reply 纯文本 + 真实 skill `/name` 高亮
- *   - StreamingAssistantRow：chat 模式流式 placeholder「AI 回复中...」
- *   - EventRow：单条事件渲染（含图标 / phase 标签 / 时间 / 折叠 / 附图 / 附路径）
+ *   - EventRow：单条事件渲染（含图标 / phase 标签 / 时间 / 折叠 / 附图 / 附路径）；
+ *     流式中的 AI 回复也由它渲染（`streaming` prop，见 lib/stream-handoff：定稿事件原地接管同一个节点）
  *   - AskUserRequestRow：ask_user 事件历史回放卡（V0.3.2 起交互移到 modal、这里只放历史）
  */
 
@@ -93,6 +93,7 @@ import {
   type TaskEvent,
 } from "@/lib/types";
 
+import { Collapse } from "./collapse";
 import { ErrorCard } from "./error-card";
 import { LiveThinkingTail } from "./live-thinking-tail";
 import {
@@ -118,72 +119,6 @@ export { MarkdownText } from "@/components/markdown-text";
 
 /** 「引用」选区上限：整篇引进输入框会把草稿撑爆 */
 const QUOTE_MAX_LENGTH = 1000;
-
-/**
- * 流式 placeholder 卡片：复用 assistant_message 的视觉样式
- *
- * 出现条件：chat-view 收到 SDK assistant chunk 推 streamingText 非空
- * 消失条件：收到正式 assistant_message 事件、chat-view setStreamingText("")
- *
- * 视觉提示：左侧图标 + 标签「AI 回复中...」+ 末尾闪烁光标、明显区分「流式中」vs「已完成」
- */
-const StreamingAssistantRowImpl = ({
-  text,
-  variant = "log",
-  baseDir,
-  ownerId = "__streaming__",
-}: {
-  text: string;
-  variant?: "log" | "chat";
-  baseDir?: string;
-  ownerId?: string;
-}) => {
-  // chat 形态：跟正式 AI 回复同样平铺（Streamdown streaming 模式自带流式动画、无容器）
-  // 字号 / 行高必须与正式 assistant 气泡（MARKDOWN_REPLY_TEXT）一致——
-  // 不一致的话流式结束换成正式行时整段文字会跳一下。
-  // ⚠ 字号要落在 prose 元素上（size="reply"）：只包外层 div 会被 prose-sm 盖掉，见 MARKDOWN_REPLY_TEXT 的注释
-  if (variant === "chat") {
-    return (
-      <div className={MARKDOWN_REPLY_TEXT}>
-        <MarkdownText
-          size="reply"
-          text={text}
-          streaming
-          baseDir={baseDir}
-          searchOwnerId={ownerId}
-          searchField="extra0"
-        />
-      </div>
-    );
-  }
-  // log：与 chat 同款平铺（事件流 v2：跟正式 AI 回复一致、收尾换成正式行时不跳），
-  // 只在上面多一行「AI 回复中…」小标——task 没有 chat 底部那条状态行，
-  // 「正在输出」和「已经说完」得靠它区分。进行中 = info 色 spinner
-  return (
-    <div>
-      <div className="mb-0.5 flex items-center gap-1.5 px-1.5 text-[11px] text-muted-foreground">
-        <Loader2 className="size-3 shrink-0 animate-spin text-info" />
-        <span>AI 回复中…</span>
-      </div>
-      {/* 流式过程按 markdown 渲染、Streamdown 未闭合块平滑处理；
-          字号 / 行高跟正式 AI 回复同一档（log 右栏窄 = 14px / 24px，收尾换成正式行时不跳） */}
-      <div className={MARKDOWN_LOG_REPLY_TEXT}>
-        <MarkdownText
-          size="default"
-          text={text}
-          streaming
-          baseDir={baseDir}
-          searchOwnerId={ownerId}
-          searchField="extra0"
-        />
-      </div>
-    </div>
-  );
-};
-
-// React.memo（V0.5.14）：text 频繁因 chunk 追加而变化、其他时候稳定
-// memo 让 SSE 推 chunk 时只有 text 真的变了才重渲染、Virtuoso 内部 item 不无意义 reconcile
-export const StreamingAssistantRow = memo(StreamingAssistantRowImpl);
 
 interface ProcessEventRowProps {
   ev: TaskEvent;
@@ -248,7 +183,9 @@ const ProcessEventRow = ({
         {formatTs(ev.ts)}
       </span>
     </button>
-    {!collapsed && (
+    {/* 思考落盘 / 工具完成触发自动收起时走高度动画（Collapse 收起期间继续画「展开时」那棵子树——
+        进行中的思考是 ~5 行实时窗口、落盘后 body 会换成全文，不冻结的话高度会先暴涨再收） */}
+    <Collapse open={!collapsed}>
       <div className={cn("ml-5 mt-1", PROCESS_BODY_RAIL)}>
         {batch ? (
           <ul className="space-y-1">
@@ -287,7 +224,7 @@ const ProcessEventRow = ({
           </div>
         )}
       </div>
-    )}
+    </Collapse>
   </div>
   );
 };
@@ -560,6 +497,7 @@ const EventRowImpl = ({
   onRewind,
   onQuote,
   runActive = false,
+  streaming = false,
 }: {
   ev: TaskEvent;
   taskId: string;
@@ -602,6 +540,17 @@ const EventRowImpl = ({
   onQuote?: (text: string) => void;
   /** agent 正在跑：隐藏回退按钮 */
   runActive?: boolean;
+  /**
+   * 这条 AI 回复还在流式吐字（event-stream 用合成的 assistant_message 事件 + 本标记渲染流式项）。
+   *
+   * 流式项和定稿事件**走同一个组件、同一套外壳**，定稿事件通过 Virtuoso key 接管流式项
+   * （lib/stream-handoff）——定稿那一刻只是 `streaming` true → false、`ev` 换成真事件，
+   * 正文原地从 streaming 切 static，不卸载 / 不重挂 / 不改头部高度。
+   * 老做法是流式项用一个独立的占位组件、定稿时整段重挂载，表现就是「吐完字抖一下」。
+   * 只在 assistant_message 分支生效；流式期间：不挂 hover 动作条（复制半截没意义）、
+   * 不挂选区引用、log 头不可折叠（强制展开）。
+   */
+  streaming?: boolean;
 }) => {
   const action = ev.actionId
     ? task.actions.find((a) => a.id === ev.actionId)
@@ -865,7 +814,19 @@ const EventRowImpl = ({
     if (isAssistant) {
       // log 的折叠头：task 里 AI 回复可手动收起（默认展开）——长计划 / 长汇报收成一行摘要，
       // 纵览事件流时不用一路滚过去。chat 没有这个头：对话正文永远展开
-      const showBody = !isLog || !collapsed;
+      // 流式中强制展开：流式头不可折叠，用户之前手动收起过的同 id 行不会存在（流式项 id 是新的）
+      const showBody = !isLog || !collapsed || streaming;
+      const assistantBody = (
+        <MarkdownText
+          size={isLog ? "default" : "reply"}
+          text={ev.text}
+          streaming={streaming}
+          baseDir={markdownBaseDir}
+          searchOwnerId={ev.id}
+          // 流式项在搜索索引里的字段名是 extra0、定稿事件是 body（见 lib/event-stream-search）
+          searchField={streaming ? "extra0" : "body"}
+        />
+      );
       return (
         <div
           ref={assistantContainerRef}
@@ -874,28 +835,37 @@ const EventRowImpl = ({
             // chat 宽列 15px / 28px；task(log) 右栏窄 14px / 24px（流式占位同档，收尾不跳）
             isLog ? MARKDOWN_LOG_REPLY_TEXT : MARKDOWN_REPLY_TEXT,
           )}
-          onMouseUp={onAssistantMouseUp}
+          onMouseUp={streaming ? undefined : onAssistantMouseUp}
         >
-          {isLog && (
-            <button
-              type="button"
-              onClick={handleToggle}
-              aria-expanded={!collapsed}
-              className={cn(PROCESS_ROW_BUTTON, "mb-0.5")}
-            >
-              <CollapseChevron open={!collapsed} />
-              {actionType && (
-                <ActionTag label={ACTION_LABEL_SHORT[actionType] ?? actionType} />
-              )}
-              <span className="shrink-0 text-[11px] tabular-nums">
-                {formatTs(ev.ts)}
-              </span>
-              {collapsed && summary && (
-                <span className="min-w-0 flex-1 truncate">{summary}</span>
-              )}
-            </button>
-          )}
-          {showBody && (
+          {isLog &&
+            (streaming ? (
+              // 流式头：跟下面定稿头同一套盒子（h-7 / 圆角 / 内边距 / 下沿距），只是不可点、转圈代替箭头。
+              // 两个头高度必须一致——定稿时它们是同一个节点原地切换，高度差 = 吐完字整段往下顶一截
+              <div className="mb-0.5 flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 text-left text-xs text-muted-foreground">
+                <Loader2 className="size-3 shrink-0 animate-spin text-info" />
+                <span>AI 回复中…</span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleToggle}
+                aria-expanded={!collapsed}
+                className={cn(PROCESS_ROW_BUTTON, "mb-0.5 h-7 py-0")}
+              >
+                <CollapseChevron open={!collapsed} />
+                {actionType && (
+                  <ActionTag label={ACTION_LABEL_SHORT[actionType] ?? actionType} />
+                )}
+                <span className="shrink-0 text-[11px] tabular-nums">
+                  {formatTs(ev.ts)}
+                </span>
+                {collapsed && summary && (
+                  <span className="min-w-0 flex-1 truncate">{summary}</span>
+                )}
+              </button>
+            ))}
+          {/* 流式中不挂 hover 动作条（复制半截没意义）和选区引用；定稿后原地出现（动作条是 absolute、不占高度） */}
+          {showBody && !streaming && (
             <>
               <MessageActionBar actions={assistantActions} />
               {/* 选区浮动「引用」：定位 / 样式 / 防选区塌陷都在公共件里 */}
@@ -910,14 +880,14 @@ const EventRowImpl = ({
                   }}
                 />
               )}
-              <MarkdownText
-                size={isLog ? "default" : "reply"}
-                text={ev.text}
-                baseDir={markdownBaseDir}
-                searchOwnerId={ev.id}
-                searchField="body"
-              />
             </>
+          )}
+          {/* 正文：流式 / 定稿是同一个 MarkdownText 实例、只切 streaming（Streamdown 原地换 mode）。
+              log 形态的手动折叠走高度动画；chat 正文永远展开、不套 Collapse（少两层 DOM） */}
+          {isLog ? (
+            <Collapse open={showBody}>{assistantBody}</Collapse>
+          ) : (
+            assistantBody
           )}
           {guideDialog}
         </div>
@@ -1220,8 +1190,8 @@ const EventRowImpl = ({
             <span className="min-w-0 flex-1 truncate">{summary}</span>
           )}
         </button>
-        {/* 展开态才渲染 body */}
-        {!collapsed && (
+        {/* 展开态才渲染 body（展开 / 收起走高度动画） */}
+        <Collapse open={!collapsed}>
           <div
             className={cn(
               "mt-1 leading-relaxed wrap-break-word text-foreground",
@@ -1231,7 +1201,7 @@ const EventRowImpl = ({
           >
             <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
           </div>
-        )}
+        </Collapse>
         {/* ask_user_reply 附图缩略图：折叠 / 展开都显示（图比文字更值得"始终见到"）
             点缩略图站内 lightbox 看大图、多图可左右切换（V0.8.8 统一 ImageThumb）*/}
         {hasImageMeta && images.length > 0 && (
@@ -1321,7 +1291,7 @@ const CollapsedAskRow = ({
           {formatTs(ev.ts)}
         </span>
       </button>
-      {open && (
+      <Collapse open={open}>
         <div className="flex flex-col gap-1.5 border-t px-2.5 py-2 text-xs text-muted-foreground">
           {hint && <div>{hint}</div>}
           {questions.length > 0 ? (
@@ -1340,7 +1310,7 @@ const CollapsedAskRow = ({
             <div className="wrap-break-word">{ev.text}</div>
           )}
         </div>
-      )}
+      </Collapse>
     </div>
   );
 };

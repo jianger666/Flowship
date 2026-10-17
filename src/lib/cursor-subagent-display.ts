@@ -14,6 +14,7 @@
 
 import { isDefaultThinkingValue } from "@/lib/custom-effort";
 import { currentEffortValue, isInheritModelArg } from "@/lib/subagent-spec";
+import { WAIT_TOOL_NAME } from "@/lib/wait-display";
 
 /** Cursor 侧子代理工具名（模型通过 MCP 调它；与 pi 的 `task` 同参） */
 export const CURSOR_SUBAGENT_TOOL_NAME = "subagent";
@@ -64,6 +65,27 @@ export const unwrapMcpText = (
   return { text: parts.join("\n"), isError: value?.isError === true };
 };
 
+/**
+ * 取 `subagent` MCP 调用里模型传的**原始入参**（完整任务书 / 摘要）。
+ * 不是 `isCursorSubagentCall` 的调用 → null。入参缺失 / 类型不对时对应字段为 undefined。
+ *
+ * 给子代理过程记录配对用（`subagent-transcript` 的 `noteSubagentToolCall`）：
+ * 落事件的 args 会被截到 2000 字，配对要拿完整任务书，所以要在改写 / 截断之前取。
+ */
+export const extractSubagentCallArgs = (
+  msg: ToolCallShape,
+): { prompt?: string; description?: string } | null => {
+  if (!isCursorSubagentCall(msg)) return null;
+  const outer = msg.args as Record<string, unknown>;
+  const inner = isRecord(outer.args) ? outer.args : {};
+  return {
+    ...(typeof inner.prompt === "string" ? { prompt: inner.prompt } : {}),
+    ...(typeof inner.description === "string"
+      ? { description: inner.description }
+      : {}),
+  };
+};
+
 /** 改写展示参数时需要的父会话信息（不传 = 徽标保持模型传的原始值） */
 export interface SubagentDisplayContext {
   /** 父会话当前模型（含思考档参数）；子代理「沿用」时就是它 */
@@ -98,6 +120,43 @@ const withEffectiveModelBadges = (
     if (effort) out.effort = effort;
   }
   return out;
+};
+
+/** 是不是我们的 `wait` 工具调用（Cursor 的 MCP 外壳；pi 里它本来就叫 `wait`、不需要改写） */
+export const isCursorWaitCall = (msg: ToolCallShape): boolean => {
+  if (msg.name !== "mcp") return false;
+  if (!isRecord(msg.args)) return false;
+  return (
+    msg.args.providerIdentifier === CURSOR_CUSTOM_TOOLS_SERVER &&
+    msg.args.toolName === WAIT_TOOL_NAME
+  );
+};
+
+/**
+ * 把 `wait` 的 MCP 调用改写成扁平的 `wait`（name → "wait"，args → 真入参 `{seconds, reason}`，
+ * result 拆掉 MCP 信封）；其它消息原样返回（同一引用）。
+ *
+ * 为什么要改：UI（状态行「等待中」+ 跳过按钮、工具块摘要）按工具名 `wait` + 扁平入参认它，
+ * pi 路径本来就是这个形状；不改的话 Cursor 下就是一个 `mcp`、摘要里是整段外壳 JSON。
+ * 只改展示用的副本，不动 SDK 原消息。
+ */
+export const toWaitDisplayCall = <M extends ToolCallShape>(msg: M): M => {
+  if (!isCursorWaitCall(msg)) return msg;
+  const outer = msg.args as Record<string, unknown>;
+  const inner = isRecord(outer.args) ? outer.args : {};
+  const next: Record<string, unknown> = {
+    ...(msg as Record<string, unknown>),
+    name: WAIT_TOOL_NAME,
+    args: inner,
+  };
+  if (msg.result !== undefined) {
+    const unwrapped = unwrapMcpText(msg.result);
+    if (unwrapped) {
+      next.result = unwrapped.text;
+      if (unwrapped.isError) next.status = "error";
+    }
+  }
+  return next as M;
 };
 
 /**

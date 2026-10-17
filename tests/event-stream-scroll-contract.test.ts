@@ -52,6 +52,15 @@ const sliceBalanced = (
   throw new Error(`\`${marker}\` 的 ${open}${close} 没配平`);
 };
 
+/** 截 `from` 到 `to` 之间的片段（from 必须存在、to 必须在它之后） */
+const between = (source: string, from: string, to: string): string => {
+  const start = source.indexOf(from);
+  expect(start, `源码里找不到 \`${from}\``).toBeGreaterThanOrEqual(0);
+  const end = source.indexOf(to, start + from.length);
+  expect(end, `\`${from}\` 之后找不到 \`${to}\``).toBeGreaterThan(start);
+  return source.slice(start, end);
+};
+
 describe("贴底跟随：用户上滚意图 > 几何阈值", () => {
   it("不再用大阈值兼职「防流式增高误判」（120px 会把用户的小幅上滚一起吞掉）", () => {
     expect(eventStream).not.toContain("atBottomThreshold={120}");
@@ -156,34 +165,76 @@ describe("贴底不走 Virtuoso 的 scrollToIndex（它的重试链内容一直�
   });
 
   it("跟随态翻成 false 时取消已排队的帧", () => {
+    const applyFollowing = sliceBalanced(
+      followHook,
+      "const applyFollowing = (next: boolean) => {",
+      "{",
+    );
+    expect(applyFollowing).toContain("cancelPin()");
+  });
+
+  it("对外的 setFollowing 先取消「回到最新」滑行再写态；状态机内部写态走 applyFollowing、不取消（否则滑行自己的 scroll 回调会把它杀掉）", () => {
     const setFollowing = sliceBalanced(
       followHook,
       "const setFollowing = (next: boolean) => {",
       "{",
     );
-    expect(setFollowing).toContain("cancelPin()");
+    expect(setFollowing).toContain("cancelSmooth()");
+    expect(setFollowing).toContain("applyFollowing(next)");
+    const evaluate = sliceBalanced(followHook, "const evaluate = (", "{");
+    expect(evaluate).toContain("applyFollowing(");
+    expect(evaluate).not.toContain("cancelSmooth()");
   });
 
-  it("组件里 scrollToIndex 只剩「跳到某一项」的用途（搜索命中 / 提问锚点 / 回到本轮开头）+ 一个兜底贴底", () => {
-    // 兜底那一处是 "LAST"；其余都带具体 index（idx），语义是用户主动跳转
+  it("组件里 scrollToIndex 只剩「跳到某一项」的唯一出口 jumpToItem + 一个兜底贴底", () => {
+    // 兜底那一处是 "LAST"；其余只许出现在 jumpToItem 里（搜索命中 / 提问锚点 / 回到本轮开头都走它）
     const all = eventStream.match(/scrollToIndex\(\{/g) ?? [];
     const last = eventStream.match(/scrollToIndex\(\{[^}]*"LAST"/g) ?? [];
     expect(last).toHaveLength(1);
-    expect(all.length - last.length).toBe(3);
+    expect(all.length - last.length).toBe(1);
+    const jump = sliceBalanced(eventStream, "const jumpToItem = useCallback", "(");
+    expect(jump).toContain("scrollToIndex({ index, align, behavior })");
+  });
+
+  it("jumpToItem 先停跟随再滚——流式吐字时点横幅回到上一条不再「回去一半又弹回来」", () => {
+    // 流式期间跟随态是 true、每个 chunk 都触发贴底；程序化 scrollToIndex 没有「用户上滚」手势，
+    // 状态机不会自己停跟随——不先 setFollowing(false)，滚到一半就被下一帧贴底写回底部
+    const jump = sliceBalanced(eventStream, "const jumpToItem = useCallback", "(");
+    expect(jump.indexOf("follow.setFollowing(false)")).toBeGreaterThanOrEqual(0);
+    expect(jump.indexOf("follow.setFollowing(false)")).toBeLessThan(
+      jump.indexOf("scrollToIndex"),
+    );
+  });
+
+  it("三个跳转入口（搜索命中 / 未答提问 / 点横幅回到本轮开头）全部走 jumpToItem、自己不碰 scrollToIndex", () => {
+    const search = sliceBalanced(eventStream, "const scrollToSearchHit = useCallback", "(");
+    expect(search).toContain("jumpToItem(");
+    expect(search).not.toContain("scrollToIndex");
+    const ask = sliceBalanced(eventStream, "const jumpToPendingAsk = useCallback", "(");
+    expect(ask).toContain("jumpToItem(");
+    expect(ask).not.toContain("scrollToIndex");
+    // 点横幅：onClick 里按 stickyTurnIdRef 找下标再 jumpToItem
+    const banner = between(eventStream, "const id = stickyTurnIdRef.current;", "className=\"pointer-events-auto");
+    expect(banner).toContain('jumpToItem(idx, "start", "smooth")');
+    expect(stripComments(banner)).not.toContain("scrollToIndex");
   });
 });
 
 describe("回到最新按钮", () => {
-  it("点击 = 恢复跟随 + 复用控制器的贴底出口（自己再滚一次就把「两套自动滚」请回来了）", () => {
+  it("点击 = 控制器的平滑回底（滑行 + 落地开闸 + 贴底都在控制器里；自己再滚一次就把「两套自动滚」请回来了）", () => {
     const backToBottom = sliceBalanced(
       eventStream,
       "const backToBottom = useCallback",
       "(",
     );
-    // 只滚不开闸 → 下一个 chunk 又把人甩回历史位置；开闸不滚 → 得等下一条事件才动
-    expect(backToBottom).toContain("follow.setFollowing(true)");
-    expect(backToBottom).toContain("follow.requestScrollToBottom()");
+    // 只滚不开闸 → 下一个 chunk 又把人甩回历史位置；开闸不滚 → 得等下一条事件才动。
+    // 这两件事现在由 scrollToBottomSmooth 一并负责（落地时 applyFollowing(true) + requestScrollToBottom）
+    expect(backToBottom).toContain("follow.scrollToBottomSmooth()");
     expect(backToBottom).not.toContain("scrollToIndex");
+    const smooth = sliceBalanced(followHook, "const scrollToBottomSmooth = () => {", "{");
+    expect(smooth).toContain("applyFollowing(true)");
+    expect(smooth).toContain("requestScrollToBottom()");
+    expect(smooth).not.toContain("scrollToIndex");
   });
 
   it("跟琥珀色 ask 悬浮条错位摆放——两条的显示条件都含「非贴底」、必定同时出现", () => {
@@ -259,3 +310,60 @@ describe("工作过程组自动折叠有防打扰闸", () => {
     expect(workGroup).toContain("shouldPinWorkGroupOpen");
   });
 });
+
+// 2026-10-17 用户拍板「切换对话后应该始终定位到最后一条 / 底部」：撤掉 v1.1.x 的滚动位置记忆
+// （离开时记视口顶部事件 id、非贴底离开回来恢复）。恢复只能对齐到「那条 item 的开头」、恢复成非贴底态后
+// AI 流式输出时看到的是一段不动的旧内容、锚点不在尾页时又静默退回底部——行为不可预期。
+// 这些很容易被「顺手加回来」，靠源码契约守住（UI 在 node 环境跑不起来）。
+describe("进入对话 / 任务一律落在最后一条、处于「跟随最新」（不再恢复上次的滚动位置）", () => {
+  const code = stripComments(eventStream);
+  const viewMemory = stripComments(read("lib", "view-memory.ts"));
+
+  it("事件流不再读 / 写滚动锚点：没有 getScrollAnchor / saveScrollAnchor / 对 view-memory 的依赖", () => {
+    expect(code).not.toContain("getScrollAnchor");
+    expect(code).not.toContain("saveScrollAnchor");
+    expect(code).not.toContain("@/lib/view-memory");
+  });
+
+  it("view-memory 不再导出滚动锚点读写（别的记忆——草稿 / 最后浏览的对话 / 附件快照——不受影响）", () => {
+    expect(viewMemory).not.toMatch(/export const (save|get)ScrollAnchor/);
+    expect(viewMemory).not.toContain("scrollAnchors");
+    expect(viewMemory).toContain("export const rememberLastChat");
+  });
+
+  it("初始定位 latch：第一次有 items 就开跟随、并把 Virtuoso 的初始项定为最后一条（无条件、不看任何记忆）", () => {
+    const latch = between(
+      code,
+      "if (initialTopRef.current === null && items.length > 0) {",
+      "\n  }\n",
+    );
+    expect(latch).toContain("follow.setFollowing(true);");
+    expect(latch).toContain("initialTopRef.current = items.length - 1;");
+    // 不再有任何分支会把它改成别的位置 / 非跟随态
+    expect(latch).not.toContain("setFollowing(false)");
+    // 闸本身就是 if 的头；头之后的函数体里不许再有分支
+    expect(latch.slice(latch.indexOf("{") + 1)).not.toMatch(/\bif\b/);
+    expect(latch).not.toContain("findIndex");
+  });
+
+  it("Virtuoso 的初始项取这个 latch（无 latch 时也是最后一条）", () => {
+    expect(code).toContain(
+      "initialTopMostItemIndex={initialTopRef.current ?? items.length - 1}",
+    );
+  });
+
+  it("rangeChanged 只算 sticky 轮次头、不写任何记忆", () => {
+    const range = sliceBalanced(eventStream, "rangeChanged={", "{");
+    expect(range).toContain("applyStickyTurn(resolveStickyTurn(list, localIdx));");
+    expect(range).not.toContain("Anchor");
+  });
+
+  it("Virtuoso 的初始定位只在 mount 时生效——切任务必须重挂：chat 的 EventStream 与 task 页的主区都挂 key={task.id}", () => {
+    const chatView = read("components", "tasks", "chat-view.tsx");
+    const chatEs = chatView.slice(chatView.indexOf("<EventStream"));
+    expect(chatEs.slice(0, 80)).toContain("key={task.id}");
+    const taskPage = read("app", "tasks", "[id]", "page.tsx");
+    expect(taskPage).toMatch(/<ResizablePanelGroup\s+key=\{task\.id\}/);
+  });
+});
+

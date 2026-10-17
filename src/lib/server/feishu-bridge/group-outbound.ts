@@ -8,7 +8,8 @@
  * 2. **回答回群**：群里 @bot 提的问题，只攒「最后一次工具调用之后」那段文字，done 时按
  *    回复协议（group-reply-protocol）落地：agent 可选择 NO_REPLY 不发、`@名字` 换成真 @。
  *    机器人提问人失败 / 空回答一律静默（防两个机器人互 @ 成环）。
- *    走 `post` + `md`（飞书 `text` 不渲染 markdown）；短状态回执仍用纯文本。
+ *    群里的文字（回答正文 / 短状态回执）一律发**文本卡**（`lark-api.sendMarkdownCardToChat`），
+ *    不再发 text / post；上游仍按 `<at user_id>` 拼 @，发送前统一转成卡片写法。
  *    攒 / flush **只认事件 origin 与登记 runTag 相等的那一路 run**（token 化投递协议、
  *    见 group-shared）——属主 run 和多位同事的旁路答疑 run 同时在飞也各回各的
  * 3. **推进产物回群**：群内「推进 xxx」跑完，把 action 产物以 share 卡发回群
@@ -43,6 +44,7 @@ import {
 import { parseAskVoidMarker, settleAskCardsOnVoidMarker } from "./ask-stale";
 import { rememberAskCard } from "./card-map";
 import { buildGroupAskCardJson } from "./group-ask-card";
+import { noteGroupSendFailure } from "./group-failure-notice";
 import type { GroupMember } from "./group-contract";
 import { parseGroupReply } from "./group-reply-protocol";
 import {
@@ -69,8 +71,7 @@ import {
 } from "./group-shared";
 import {
   sendInteractiveCardToChat,
-  sendPostMarkdownToChat,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
 } from "./lark-api";
 import type { CardStreamAskQuestion } from "./types";
 
@@ -89,9 +90,10 @@ export interface GroupOutboundDeps {
   ) => Promise<string | null>;
   resolveSenderName: () => Promise<string>;
   sendAskCard: typeof sendInteractiveCardToChat;
-  sendText: typeof sendTextMessageToChat;
-  /** 群答疑正文：post markdown，会渲染粗体 / 代码 / 列表 */
-  sendMarkdown: typeof sendPostMarkdownToChat;
+  /** 短状态回执（推进失败 / 没产物 / 到期）：发出去是卡片，入参仍是纯文本 + `<at user_id>` */
+  sendText: typeof sendMarkdownCardToChat;
+  /** 群答疑正文：markdown 卡片，会渲染粗体 / 代码 / 列表（与 sendText 同一个出口、两个依赖名只为单测分开断言） */
+  sendMarkdown: typeof sendMarkdownCardToChat;
   shareToGroup: (task: Task, input: ShareToGroupInput) => Promise<unknown>;
   rememberAskCard: typeof rememberAskCard;
   isBridgeEnabled: typeof isFeishuChatBridgeEnabled;
@@ -126,8 +128,8 @@ const defaultDeps = (): GroupOutboundDeps => ({
   resolveSenderName: async () =>
     (await import("@/lib/server/feishu-group")).resolveShareSenderName(),
   sendAskCard: sendInteractiveCardToChat,
-  sendText: sendTextMessageToChat,
-  sendMarkdown: sendPostMarkdownToChat,
+  sendText: sendMarkdownCardToChat,
+  sendMarkdown: sendMarkdownCardToChat,
   shareToGroup: async (task, input) =>
     (await import("@/lib/server/feishu-group")).shareToRequirementGroup(
       task,
@@ -153,6 +155,24 @@ const defaultDeps = (): GroupOutboundDeps => ({
 });
 
 let deps: GroupOutboundDeps = defaultDeps();
+
+/**
+ * 群里发一条短状态回执（推进失败 / 没产物 / 到期 …）。发送失败不抛：warn + 在任务事件流留一条 info，
+ * 让属主看得见（群里文字走卡片、缺 `cardkit:card:write` 之类时回执自己就发不出去，见 group-failure-notice）。
+ * 调用点都是各自分支的最后一步，吞掉失败与原先「抛给外层 catch 只 warn」在流程上等价。
+ */
+const sendReceipt = async (
+  taskId: string,
+  chatId: string,
+  text: string,
+): Promise<void> => {
+  try {
+    await deps.sendText(chatId, text);
+  } catch (err) {
+    warn(`群回执发送失败 task=${taskId}`, err);
+    await noteGroupSendFailure(taskId, chatId, err, "回执");
+  }
+};
 
 // ----------------- 桥接开关缓存（对齐 p2p outbound） -----------------
 //
@@ -306,7 +326,14 @@ export const sendAskCardToGroup = async (
     questions,
     senderName,
   });
-  const sent = await deps.sendAskCard(chatId, card);
+  let sent: Awaited<ReturnType<typeof deps.sendAskCard>>;
+  try {
+    sent = await deps.sendAskCard(chatId, card);
+  } catch (err) {
+    // 问群卡发不出去：属主在群里等不到题、app 里答题照常——让他知道群里为什么没卡；异常照旧抛给调用方
+    await noteGroupSendFailure(task.id, chatId, err, "问群卡");
+    throw err;
+  }
   try {
     await deps.rememberAskCard({
       messageId: sent.message_id,
@@ -430,7 +457,7 @@ const flushGroupAdvanceReply = async (
 
   const at = mentionTag(entry.requesterOpenId, entry.requesterName);
   if (resolved.phase === "failed") {
-    await deps.sendText(entry.chatId, `${at} 推进没跑成功、去 Flowship 看事件流`);
+    await sendReceipt(taskId, entry.chatId, `${at} 推进没跑成功、去 Flowship 看事件流`);
     return;
   }
 
@@ -440,7 +467,8 @@ const flushGroupAdvanceReply = async (
     // action 已终态还没 artifact = 这轮真没出文档。旁白按文本回、**绝不冒充产物卡**
     //（也就不占防重坑——那张坑位只属于真产物）
     const narration = truncateForGroup(entry.answer.trim());
-    await deps.sendText(
+    await sendReceipt(
+      taskId,
       entry.chatId,
       narration ? `${at} 已跑完：${narration}` : `${at} 已跑完（没有产出文档）`,
     );
@@ -452,7 +480,7 @@ const flushGroupAdvanceReply = async (
   // 但发起人还等着交代：卡片那边不 @ 人（artifact 无正文拼不上 @），这里补一句
   // 轻提醒（review 十一轮-1）。能到这里的都是属主本人（路由层 + 回调层双验），@ 没事。
   if (!claimGroupArtifactCard(taskId, actionId)) {
-    await deps.sendText(entry.chatId, `${at} 刚交卷，产物见上卡`);
+    await sendReceipt(taskId, entry.chatId, `${at} 刚交卷，产物见上卡`);
     return;
   }
   try {
@@ -465,7 +493,9 @@ const flushGroupAdvanceReply = async (
     // 一张卡都没发出去 → 退坑，别把播报侧也一起堵死
     releaseGroupArtifactCard(taskId, actionId);
     warn("产物发群", err);
-    await deps.sendText(entry.chatId, `${at} 已跑完，但产物没发出来（去 Flowship 看）`);
+    // 产物没发出去本身也让属主看得见（兜底回执若也发不出去，下面 sendReceipt 的那条被同群节流吃掉，这条已经写了）
+    await noteGroupSendFailure(taskId, entry.chatId, err, "产物");
+    await sendReceipt(taskId, entry.chatId, `${at} 已跑完，但产物没发出来（去 Flowship 看）`);
   }
 };
 
@@ -682,6 +712,8 @@ const flushQuestionReply = async (
     } catch (err) {
       sendOk = false;
       warn(`回答回群发送失败 task=${taskId}`, err);
+      // 答疑回复没发出去：除了群问答 tab 的 ok:false 汇总，主事件流也留一条 info 让属主看得见
+      await noteGroupSendFailure(taskId, entry.chatId, err, "答疑回复");
       break;
     }
   }
@@ -821,7 +853,8 @@ export const reviewExpiredGroupAdvance = async (
     if (taken.actionId) releaseGroupAdvancePickByAction(taskId, taken.actionId);
     // 开关关掉 = 用户本就不要推进结果回群，那也不必回执
     if (!(await deps.isAdvanceResultToGroupEnabled())) return;
-    await deps.sendText(
+    await sendReceipt(
+      taskId,
       taken.chatId,
       `${mentionTag(taken.requesterOpenId, taken.requesterName)} ${ADVANCE_EXPIRED_TEXT}`,
     );

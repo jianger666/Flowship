@@ -51,8 +51,7 @@ describe("错误：独立平铺成 destructive 卡", () => {
 
   it("错误分流在 chat / log 分叉之前——两形态共用同一张卡", () => {
     const errIdx = rows.indexOf('if (ev.kind === "error")');
-    // EventRowImpl 里 chat 分支的段落标题（StreamingAssistantRow 也有个 variant 判断、
-    // 不能用它当锚点）
+    // EventRowImpl 里 chat 分支的段落标题（用它当锚点最稳）
     const chatIdx = rows.indexOf("// ---------- chat 形态");
     expect(errIdx).toBeGreaterThan(0);
     expect(chatIdx).toBeGreaterThan(0);

@@ -8,7 +8,7 @@
  * task 工具：专属「子代理」卡片（Bot 图标 + 任务书 / 产出分区）。
  */
 
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo, useState, type CSSProperties } from "react";
 import {
   Bot,
   Check,
@@ -17,6 +17,7 @@ import {
   FileCode2,
   ListTodo,
   Loader2,
+  PanelRightOpen,
   Terminal,
   X,
 } from "lucide-react";
@@ -33,7 +34,12 @@ import {
   useIdePathLinker,
   type IdePathLinker,
 } from "@/components/ui/ide-path-link";
+import { useOpenSubagentDetail } from "@/components/tasks/subagent-detail-context";
+import { useDiffSyntaxTokens } from "@/hooks/use-diff-syntax-tokens";
 import { useTaskBaseDir } from "@/hooks/use-task-base-dir";
+import { diffLanguageFromPath, type DiffSyntaxToken } from "@/lib/diff-syntax";
+import { subagentTargetFromToolBlock } from "@/lib/subagent-run-display";
+import { isSkippableWaitBlock } from "@/lib/wait-display";
 import { cn } from "@/lib/utils";
 import {
   countDiffStats,
@@ -61,6 +67,8 @@ import {
   PROCESS_BODY_RAIL,
   PROCESS_ROW_BUTTON,
 } from "./stream-style";
+import { Collapse } from "./collapse";
+import { SkipWaitButton } from "./skip-wait-button";
 import { formatTs } from "./utils";
 
 // ---------- 干净 diff 视图（解析层 parseUnifiedDiff；双列行号 + 无 @@ 原文）----------
@@ -98,12 +106,46 @@ const DiffLineNum = ({
   );
 };
 
+/**
+ * 语法色 token 的颜色：浅色走 `--sdm-c`，深色走 `--shiki-dark`（Shiki 双主题）。
+ * class 串与 Streamdown 代码块里的完全一致——那组 class 已经被 Tailwind 生成过、在本应用两种主题下实测可用。
+ */
+const DIFF_TOKEN_CLASS =
+  "text-[var(--sdm-c,inherit)] dark:text-[var(--shiki-dark,var(--sdm-c,inherit))]";
+
+const DiffTokens = ({ tokens }: { tokens: DiffSyntaxToken[] }) => {
+  if (tokens.length === 0) return <>{" "}</>;
+  return (
+    <>
+      {tokens.map((t, i) => (
+        <span
+          key={i}
+          className={DIFF_TOKEN_CLASS}
+          style={
+            {
+              "--sdm-c": t.light,
+              "--shiki-dark": t.dark,
+              ...(t.italic ? { fontStyle: "italic" } : {}),
+              ...(t.bold ? { fontWeight: 600 } : {}),
+            } as CSSProperties
+          }
+        >
+          {t.content}
+        </span>
+      ))}
+    </>
+  );
+};
+
 const DiffLine = ({
   line,
+  tokens,
   linker,
   filePath,
 }: {
   line: DiffViewLine;
+  /** 语法色 token；null = 没有（语言不认 / 还没算出来 / diff 太大），退回整行红绿字 */
+  tokens?: DiffSyntaxToken[] | null;
   linker?: IdePathLinker;
   filePath?: string | null;
 }) => {
@@ -120,20 +162,27 @@ const DiffLine = ({
     );
   }
 
+  // 有语法色时，文字颜色交给 token，「新增 / 删除」只靠底色区分（底色比整行染字时略深一档，
+  // 否则文字不再带红绿后，改动行不够醒目）；没有语法色就保持原来的整行红绿字
+  const highlighted = tokens != null;
   return (
     <div
       className={cn(
         "flex font-mono text-[11px] leading-relaxed",
-        line.kind === "add" && "bg-success/10 text-success",
-        line.kind === "del" && "bg-destructive/10 text-destructive",
-        line.kind === "context" && "text-muted-foreground",
+        line.kind === "add" &&
+          (highlighted ? "bg-success/15" : "bg-success/10 text-success"),
+        line.kind === "del" &&
+          (highlighted
+            ? "bg-destructive/15"
+            : "bg-destructive/10 text-destructive"),
+        line.kind === "context" && !highlighted && "text-muted-foreground",
       )}
     >
       <DiffLineNum n={line.oldLine} />
       <DiffLineNum n={line.newLine} linker={linker} filePath={filePath} />
       {/* whitespace-pre + 外层横滚：折行会打乱双列行号对齐 */}
       <span className="min-w-0 flex-1 whitespace-pre px-2 py-px">
-        {line.text || " "}
+        {tokens ? <DiffTokens tokens={tokens} /> : line.text || " "}
       </span>
     </div>
   );
@@ -148,6 +197,7 @@ export const InlineDiff = ({
   truncated,
   linker,
   filePath,
+  highlightPath,
   className,
   scrollClassName,
 }: {
@@ -156,12 +206,21 @@ export const InlineDiff = ({
   /** 有 linker + filePath 时新行号可点、跳 IDE 对应行 */
   linker?: IdePathLinker;
   filePath?: string | null;
+  /**
+   * 仅用来按扩展名选语法高亮的语言（默认取 filePath）。
+   * 已删除文件没有可跳转的 filePath、但扩展名还在，由调用方单独传。
+   */
+  highlightPath?: string | null;
   /** 外层容器追加 class（默认已带 mt-1.5） */
   className?: string;
   /** 内层滚动区追加 class（靠 cn 覆盖默认的 max-h-64，如传 max-h-none） */
   scrollClassName?: string;
 }) => {
   const lines = useMemo(() => parseUnifiedDiff(diff), [diff]);
+  const tokenLines = useDiffSyntaxTokens(
+    lines,
+    diffLanguageFromPath(highlightPath ?? filePath),
+  );
   return (
     // 复制的是 unified diff 原文（能直接贴回终端 / patch）；服务端截断过的就只有这些、
     // diff 没有「加载完整」通道（跟工具输出不同、落盘的只有截断后的那份）
@@ -179,7 +238,13 @@ export const InlineDiff = ({
         {/* min-w-max：横滚内容宽 = 最长行，行级 diff 高亮铺满整行（否则背景只到容器宽、右侧无底色） */}
         <div className="min-w-max">
           {lines.map((line, i) => (
-            <DiffLine key={i} line={line} linker={linker} filePath={filePath} />
+            <DiffLine
+              key={i}
+              line={line}
+              tokens={tokenLines?.[i]}
+              linker={linker}
+              filePath={filePath}
+            />
           ))}
           {truncated && (
             <div className="border-t border-border/50 px-2 py-1 text-[11px] text-muted-foreground">
@@ -380,6 +445,8 @@ const TaskSubagentBlock = ({
   const [collapsed, setCollapsed] = useState(() =>
     toolBlockDefaultCollapsed(block.name, nested),
   );
+  // 打开详情抽屉（宿主在 EventStream 层）；不在宿主里（单独复用卡片 / 单测）为 null → 不画入口
+  const openDetail = useOpenSubagentDetail();
   // 任务书超长：点「显示更多」内联展开全文
   const [promptExpanded, setPromptExpanded] = useState(false);
   // 产出区第二层折叠（完成态）
@@ -450,11 +517,13 @@ const TaskSubagentBlock = ({
       )}
     >
       <div className="border-l-[3px] border-l-subagent/60">
+        {/* 头部 = 折叠开关 + 右侧「详情」入口并排（不能把详情按钮嵌进折叠按钮里：button 套 button 不合法） */}
+        <div className="flex min-w-0 items-stretch">
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
           aria-expanded={!collapsed}
-          className="flex w-full cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-subagent/[0.08] hover:text-foreground"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-subagent/[0.08] hover:text-foreground"
         >
           <CollapseChevron open={!collapsed} />
           <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-subagent/15">
@@ -489,8 +558,24 @@ const TaskSubagentBlock = ({
             {formatTs(block.ts)}
           </span>
         </button>
+        {openDetail ? (
+          // 详情：右侧抽屉里看给子代理的完整任务书 + 它自己的工作过程（thinking / 工具调用 / 回复）。
+          // 卡片里的任务书只是被截断的预览、产出只是最后一段文字，过程根本没在这里
+          <Tooltip content="查看给子代理的任务书和它的工作过程">
+            <button
+              type="button"
+              onClick={() => openDetail(subagentTargetFromToolBlock(block))}
+              aria-label="查看子代理详情"
+              className="flex shrink-0 cursor-pointer items-center gap-1 px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-subagent/[0.08] hover:text-foreground"
+            >
+              <PanelRightOpen className="size-3.5" aria-hidden />
+              详情
+            </button>
+          </Tooltip>
+        ) : null}
+        </div>
 
-        {!collapsed && (
+        <Collapse open={!collapsed}>
           <div className="space-y-2.5 px-3 pb-3 pt-0.5">
             {/* 任务书 */}
             <div className="space-y-1">
@@ -577,7 +662,7 @@ const TaskSubagentBlock = ({
               )}
             </div>
           </div>
-        )}
+        </Collapse>
       </div>
     </div>
   );
@@ -714,7 +799,16 @@ const RegularToolBlockRow = ({
         </span>
       </button>
 
-      {!collapsed && (
+      {/* wait 在睡：不论折叠与否都露出「跳过等待」（task 形态没有状态行，这是唯一入口）。
+          放在标题按钮外面——按钮套按钮不合法、点击也会冒泡成折叠 / 展开 */}
+      {isSkippableWaitBlock(block) && (
+        <div className="ml-5 mt-0.5">
+          <SkipWaitButton taskId={taskId} />
+        </div>
+      )}
+
+      {/* 展开 / 收起走高度动画：write 完成自动收起、用户手动点开都不再「啪」地跳 */}
+      <Collapse open={!collapsed}>
         <div
           className={cn(
             "ml-5 mt-1 min-w-0 max-w-full space-y-1.5",
@@ -773,14 +867,14 @@ const RegularToolBlockRow = ({
                   </span>
                 )}
               </button>
-              {!diffCollapsed && (
+              <Collapse open={!diffCollapsed}>
                 <InlineDiff
                   diff={diff}
                   truncated={block.result?.diffTruncated}
                   linker={linker}
                   filePath={filePath}
                 />
-              )}
+              </Collapse>
             </div>
           )}
 
@@ -797,7 +891,7 @@ const RegularToolBlockRow = ({
                   输出
                 </button>
               )}
-              {(block.status === "running" || outputOpen) && (
+              <Collapse open={block.status === "running" || outputOpen}>
                 <CopyableBlock
                   text={outputCopySource}
                   label="复制输出"
@@ -807,7 +901,7 @@ const RegularToolBlockRow = ({
                     {fullText ?? displayOutput}
                   </pre>
                 </CopyableBlock>
-              )}
+              </Collapse>
               {/* 仅 truncated+fullPath 都有才出按钮；写盘失败只有 truncated、点开会 404。
                   点击就地拉全量替换进上面的滚动框（不再弹 Dialog——用户嫌重） */}
               <LoadFullOutputButton
@@ -827,7 +921,7 @@ const RegularToolBlockRow = ({
             <ExpandedEmptyPlaceholder status={block.status} />
           )}
         </div>
-      )}
+      </Collapse>
     </div>
   );
 };
@@ -884,13 +978,13 @@ const TodoToolBlock = ({
         </span>
       </button>
 
-      {!collapsed && (
+      <Collapse open={!collapsed}>
         <ul className={cn("ml-5 mt-1 space-y-1", PROCESS_BODY_RAIL)}>
           {todos.map((item, i) => (
             <TodoToolItemRow key={i} item={item} />
           ))}
         </ul>
-      )}
+      </Collapse>
     </div>
   );
 };
@@ -985,7 +1079,7 @@ const ToolVerbGroupRowImpl = ({
           {formatTs(group.ts)}
         </span>
       </button>
-      {!collapsed && (
+      <Collapse open={!collapsed}>
         <div className="ml-5 mt-0.5 space-y-0.5 border-l border-border pl-2">
           {group.members.map((m) => (
             <ToolBlockRow
@@ -996,7 +1090,7 @@ const ToolVerbGroupRowImpl = ({
             />
           ))}
         </div>
-      )}
+      </Collapse>
     </div>
   );
 };

@@ -7,9 +7,15 @@ import {
   groupChatRenderItems,
   isLatestErrorEvent,
   isWorkGroup,
+  latestEventTs,
+  msUntilStall,
   PROCESSING_PLACEHOLDER_LABEL,
   shouldShowProcessingPlaceholder,
   STATUS_ELAPSED_SHOW_AFTER_MS,
+  STATUS_STALL_AFTER_MS,
+  STATUS_STALL_DETAIL,
+  STATUS_STALL_LABEL,
+  stallFallbackStatus,
   type WorkGroupItem,
 } from "../src/lib/chat-turns";
 import type { StreamRenderItem, ToolBlock, ToolVerbGroup } from "../src/lib/tool-display";
@@ -713,6 +719,163 @@ describe("deriveActiveStatus", () => {
     it("文案出口只有 analyzingToolLabel 一个（改措辞不用满仓库找）", () => {
       expect(analyzingToolLabel("read")).toBe("正在分析 read 的结果");
     });
+  });
+});
+
+describe("静默兜底：stallSinceTs（SDK 里不可见的等待，如 Cursor 原生 await 的 sleep）", () => {
+  const user = ev({ id: "u", kind: "user_reply", text: "q", ts: 1 });
+  const thinking = ev({ id: "t", kind: "thinking", text: "想", ts: 2 });
+  const toolDone = [
+    ev({
+      id: "c",
+      kind: "tool_call",
+      text: "调用 shell",
+      ts: 2,
+      meta: { callId: "x", name: "shell", args: "{}" },
+    }),
+    ev({
+      id: "r",
+      kind: "tool_result",
+      text: "完成",
+      ts: 3,
+      meta: { callId: "x", name: "shell", status: "success" },
+    }),
+  ];
+
+  it("不传 lastActivityTs = 不兜底：返回值里根本没有 stallSinceTs 这个键（既有 toEqual 断言不受影响）", () => {
+    for (const events of [[user, thinking], [user, ...toolDone]]) {
+      expect(deriveActiveStatus(events)).not.toHaveProperty("stallSinceTs");
+    }
+  });
+
+  it("空等类（思考刚结束 / 工具跑完等模型 / 回复刚结束）传了就带上锚，其余字段原样", () => {
+    expect(deriveActiveStatus([user, thinking], undefined, { lastActivityTs: 2 })).toEqual({
+      label: "思考中",
+      stallSinceTs: 2,
+    });
+    expect(
+      deriveActiveStatus([user, ...toolDone], undefined, { lastActivityTs: 3 }),
+    ).toEqual({ label: "正在分析 shell 的结果", sinceTs: 3, stallSinceTs: 3 });
+    expect(
+      deriveActiveStatus(
+        [user, ev({ id: "a", kind: "assistant_message", text: "答", ts: 2 })],
+        undefined,
+        { lastActivityTs: 2 },
+      ),
+    ).toEqual({ label: "正在回复…", stallSinceTs: 2 });
+  });
+
+  it("锚点取调用方给的「最后一条事件」，不是这一步自己的 ts（隐藏事件也是还在动的证据）", () => {
+    // 状态由 ts=3 的 tool_result 决定，但全局最后一条事件在 ts=9
+    expect(
+      deriveActiveStatus([user, ...toolDone], undefined, { lastActivityTs: 9 }),
+    ).toMatchObject({ sinceTs: 3, stallSinceTs: 9 });
+  });
+
+  it("没资格的一律不挂：工具在跑 / 子代理 / 压缩 / 正文在流 / 实时思考 / 启动阶段", () => {
+    const opts = { lastActivityTs: 5 };
+    // 工具在跑
+    const running = ev({
+      id: "c",
+      kind: "tool_call",
+      text: "调用 shell",
+      ts: 2,
+      meta: { callId: "x", name: "shell", args: "{}" },
+    });
+    expect(deriveActiveStatus([user, running], undefined, opts)).not.toHaveProperty(
+      "stallSinceTs",
+    );
+    // 子代理
+    const sub = ev({
+      id: "s",
+      kind: "tool_call",
+      text: "调用 task",
+      ts: 2,
+      meta: { callId: "t1", name: "task", args: "{}" },
+    });
+    expect(deriveActiveStatus([user, sub], undefined, opts)).not.toHaveProperty(
+      "stallSinceTs",
+    );
+    // 压缩进行中
+    const compact = ev({
+      id: "k",
+      kind: "info",
+      text: "正在压缩上下文…",
+      ts: 2,
+      meta: { kind: "compaction", status: "running" },
+    });
+    expect(deriveActiveStatus([user, compact], undefined, opts)).not.toHaveProperty(
+      "stallSinceTs",
+    );
+    // 正文在流：delta 持续来，不算静默
+    expect(
+      deriveActiveStatus([user, thinking], undefined, { ...opts, streaming: true }),
+    ).not.toHaveProperty("stallSinceTs");
+    expect(
+      deriveActiveStatus([user, ...toolDone], undefined, { ...opts, streaming: true }),
+    ).not.toHaveProperty("stallSinceTs");
+    // 实时思考：thinking-delta 持续来
+    expect(
+      deriveActiveStatus([user, ...toolDone], undefined, { ...opts, thinkingSince: 4 }),
+    ).toEqual({ label: "思考中", sinceTs: 4 });
+    // 启动阶段（yieldToTail）：PendingRow 在计时，不抢
+    expect(deriveActiveStatus([user], undefined, opts)).toEqual({
+      label: "正在启动…",
+      yieldToTail: true,
+    });
+  });
+
+  it("有未答提问（awaitingUser）：空等类也不挂锚——事件流静默是在等人答、不是卡住，不能改口「仍在等待」", () => {
+    for (const events of [[user, thinking], [user, ...toolDone]]) {
+      // 对照：同样的事件、没有未答提问时是挂锚的
+      expect(
+        deriveActiveStatus(events, undefined, { lastActivityTs: 5 }),
+      ).toHaveProperty("stallSinceTs", 5);
+      expect(
+        deriveActiveStatus(events, undefined, { lastActivityTs: 5, awaitingUser: true }),
+      ).not.toHaveProperty("stallSinceTs");
+    }
+    // awaitingUser: false 与不传等价
+    expect(
+      deriveActiveStatus([user, thinking], undefined, { lastActivityTs: 5, awaitingUser: false }),
+    ).toHaveProperty("stallSinceTs", 5);
+    // 只去掉锚，状态文案本身不变
+    expect(
+      deriveActiveStatus([user, ...toolDone], undefined, { lastActivityTs: 5, awaitingUser: true }),
+    ).toEqual({ label: "正在分析 shell 的结果", sinceTs: 3 });
+  });
+
+  it("脏值（0 / 负数 / NaN / Infinity）不挂锚：状态行不会拿一个无意义的起点去算「已等待」", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(
+        deriveActiveStatus([user, thinking], undefined, { lastActivityTs: bad }),
+      ).not.toHaveProperty("stallSinceTs");
+    }
+  });
+
+  it("阈值 20s：差多久改口（msUntilStall）+ 改口后的状态（锚点同时当走字起点）", () => {
+    expect(STATUS_STALL_AFTER_MS).toBe(20_000);
+    expect(msUntilStall(1000, 1000)).toBe(20_000);
+    expect(msUntilStall(1000, 11_000)).toBe(10_000);
+    expect(msUntilStall(1000, 21_000)).toBe(0);
+    // 过了点是负数：调用方据此「立刻改口」而不是排一个负延迟的定时器
+    expect(msUntilStall(1000, 30_000)).toBeLessThan(0);
+    expect(stallFallbackStatus(1000)).toEqual({
+      label: STATUS_STALL_LABEL,
+      detail: STATUS_STALL_DETAIL,
+      sinceTs: 1000,
+    });
+    expect(STATUS_STALL_LABEL).toBe("仍在等待");
+  });
+});
+
+describe("latestEventTs：静默兜底的锚", () => {
+  it("空列表是 0", () => {
+    expect(latestEventTs([])).toBe(0);
+  });
+
+  it("取末条（新事件 append 在尾、上拉历史在头）", () => {
+    expect(latestEventTs([{ ts: 10 }, { ts: 20 }, { ts: 50 }])).toBe(50);
   });
 });
 

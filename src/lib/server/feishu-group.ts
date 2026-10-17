@@ -50,7 +50,7 @@ import {
   probeSelfInChat,
   sendFileMessageToChat,
   sendInteractiveCardToChat,
-  sendPostMarkdownToChat,
+  sendMarkdownCardToChat,
 } from "@/lib/server/feishu-bridge/lark-api";
 import { mentionTag } from "@/lib/server/feishu-bridge/group-shared";
 import {
@@ -84,9 +84,11 @@ import {
 export type ShareKind = "artifact" | "message" | "question";
 
 /**
- * 发到需求群的形态：卡片（可跟 md 文件）或一条会渲染的 IM markdown。
+ * 发到需求群的形态：分享卡（可跟 md 文件）或一段「文本卡」（无 header 的单 markdown 卡）。
  *
- * `post` 已无生产调用者（提测已切卡片 `<at email>`，grep 只剩类型与定义）——
+ * `post` 是历史取值名：早期发的是 IM post，现在群里文字一律发卡片，
+ * 它发出去的是 `lark-api.sendMarkdownCardToChat` 的文本卡（取值名不改，免得动 API 契约）。
+ * 它已无生产调用者（提测已切卡片 `<at email>`，grep 只剩类型与定义）——
  * 保留仅作降级储备，新需求一律走 `card`，不要再给 `post` 加新调用。
  */
 export type ShareFormat = "card" | "post";
@@ -123,7 +125,7 @@ export interface ShareAtResult {
 export interface ShareToGroupInput {
   /**
    * 默认 `card`（现有分享 / 播报 / 产物回群）。
-   * `post` = 一条飞书 post markdown，可带 {@link mentions} 做真 @；不建卡片、不跟文件。
+   * `post` = 一段文本卡（markdown），可带 {@link mentions} 做真 @；不跟文件。
    */
   format?: ShareFormat;
   /** `card` 时必填；`post` 忽略。缺省按 `message` 处理。 */
@@ -287,8 +289,8 @@ export interface FeishuGroupDeps {
   sendCard: typeof sendInteractiveCardToChat;
   /** 发 md 文件消息（整份产物的正文载体、卡片之后紧跟一条） */
   sendDoc: typeof sendFileMessageToChat;
-  /** `format: "post"`：一条会渲染的 IM markdown（提测 @ / 以后短通知） */
-  sendPost: typeof sendPostMarkdownToChat;
+  /** `format: "post"`：一段会渲染的 markdown（提测 @ / 以后短通知），发出去是卡片 */
+  sendPost: typeof sendMarkdownCardToChat;
   resolveSenderName: () => Promise<string>;
   warn: (msg: string) => void;
 }
@@ -322,7 +324,7 @@ const defaultDeps = (): FeishuGroupDeps => ({
   sendCard: (chatId, card) => sendInteractiveCardToChat(chatId, card),
   sendDoc: (chatId, filename, content) =>
     sendFileMessageToChat(chatId, filename, content),
-  sendPost: (chatId, markdown) => sendPostMarkdownToChat(chatId, markdown),
+  sendPost: (chatId, markdown) => sendMarkdownCardToChat(chatId, markdown),
   resolveSenderName: () => resolveLocalSenderName(),
   warn: (msg) => console.warn(`[feishu-group] ${msg}`),
 });
@@ -1511,8 +1513,9 @@ export const resolveShareAts = async (
 // ----------------- 分享闭环 -----------------
 
 /**
- * `format: "post"` 的正文：mentions 换成飞书 `<at>` 标签搁在最前。
- * 卡片不走这条——卡片 markdown 的 @ 语法不同，且分享卡本来就不承担 @ 通知。
+ * `format: "post"` 的正文：mentions 换成 `<at user_id>` 标签搁在最前
+ *（发送时由 `lark-api.toCardMarkdown` 统一转成卡片的 `<at id>` 写法）。
+ * 分享卡（`format: "card"`）不走这条——它的 @ 走 `<at email>`，且分享卡本来就不承担 @ 通知。
  */
 export const composePostShareMarkdown = (
   content: string,
@@ -1569,7 +1572,7 @@ const rethrowIfBotNotInGroup = async (
  * 「本人还在这个群里」，死绑定直接抛 `owner_not_in_group` / `group_unreachable`。
  *
  * `format: "card"`（默认）：互动卡；kind=artifact 再紧跟一条 md 文件装全文。
- * `format: "post"`：一条 IM markdown，`mentions` 由本函数拼 `<at>`；不建卡片、不跟文件。
+ * `format: "post"`：一段文本卡，`mentions` 由本函数拼 `<at>`；不跟文件。
  *
  * 返回 { chatId, messageId, created, docMessageId? }。
  */

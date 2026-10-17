@@ -65,6 +65,7 @@ import {
 import { mcpDisplayName } from "@/lib/mcp-tool-name";
 import {
   catalogFromModelOptions,
+  currentEffortValue,
   formatModelCatalog,
   resolveSubagentModel,
   SubagentUsageError,
@@ -85,6 +86,10 @@ import {
   buildReadOnlyToolDefs,
   READONLY_CUSTOM_TOOL_NAMES,
 } from "./pi-coding-tools";
+import {
+  startSubagentRun,
+  type SubagentRunHandle,
+} from "./subagent-transcript";
 import { withModelBudget, type ModelBudgetSpill } from "./tool-output-budget";
 import { loadSkillsForTask } from "./skills-loader";
 import { injectSdkRgPath } from "./sdk-platform-bin";
@@ -401,6 +406,113 @@ const loadSubagentCatalog = async (
 };
 
 /**
+ * pi 子会话事件 → 与 Cursor 同形的 SDKMessage（给子代理过程记录喂；翻译口径同 `PiRunAdapter.onEvent`
+ * 里翻主会话的那几类：text_delta / thinking_delta / toolcall_end / tool_execution_end）。
+ * `toolArgs` 缓存 toolcall_end 的入参：执行结束事件里没有入参，要靠它补。
+ * 纯函数（只读写传进来的缓存），不认识的事件返回空数组。
+ */
+export const piSubagentEventMessages = (
+  ev: AgentSessionEvent,
+  toolArgs: Map<string, { name: string; args: unknown }>,
+): SDKMessage[] => {
+  if (ev.type === "message_update") {
+    const inner = ev.assistantMessageEvent;
+    if (!inner) return [];
+    if (inner.type === "text_delta" && inner.delta) {
+      return [
+        {
+          type: "assistant",
+          message: { content: [{ type: "text", text: inner.delta }] },
+        } as unknown as SDKMessage,
+      ];
+    }
+    if (inner.type === "thinking_delta" && inner.delta) {
+      return [{ type: "thinking", text: inner.delta } as unknown as SDKMessage];
+    }
+    if (inner.type === "toolcall_end" && inner.toolCall) {
+      const tc = inner.toolCall;
+      const name = mcpDisplayName(tc.name);
+      toolArgs.set(tc.id, { name, args: tc.arguments });
+      return [
+        {
+          type: "tool_call",
+          call_id: tc.id,
+          name,
+          args: tc.arguments,
+          status: "running",
+        } as unknown as SDKMessage,
+      ];
+    }
+    return [];
+  }
+  if (ev.type === "tool_execution_end") {
+    const cached = toolArgs.get(ev.toolCallId) ?? {
+      name: mcpDisplayName(ev.toolName),
+      args: {},
+    };
+    return [
+      {
+        type: "tool_call",
+        call_id: ev.toolCallId,
+        name: cached.name,
+        args: cached.args,
+        status: ev.isError ? "error" : "completed",
+        result: ev.result,
+      } as unknown as SDKMessage,
+    ];
+  }
+  return [];
+};
+
+/** 起一份 pi 子代理过程记录；没 taskId（一次性调用）/ 起不来 → undefined（只告警） */
+const startPiSubagentRecord = (input: {
+  taskId: string | undefined;
+  toolCallId: string | undefined;
+  req: SubagentRequest;
+  model: string;
+  effort: string | undefined;
+}): SubagentRunHandle | undefined => {
+  if (!input.taskId) return undefined;
+  try {
+    return startSubagentRun({
+      taskId: input.taskId,
+      provider: "pi",
+      // 与 Cursor 路径的 describeJob 同口径：没写 description 就取任务书开头
+      description:
+        input.req.description?.trim() ||
+        input.req.prompt.replace(/\s+/g, " ").trim().slice(0, 30) ||
+        "子任务",
+      prompt: input.req.prompt,
+      model: input.model,
+      effort: input.effort,
+      explore: input.req.subagentType === "explore",
+      toolCallId: input.toolCallId,
+    });
+  } catch (err) {
+    console.warn(
+      "[custom-agent] 子代理过程记录起不来（已忽略、照常跑）：",
+      err instanceof Error ? err.message : err,
+    );
+    return undefined;
+  }
+};
+
+const safeFinishRecord = (
+  rec: SubagentRunHandle | undefined,
+  outcome: Parameters<SubagentRunHandle["finish"]>[0],
+): void => {
+  if (!rec) return;
+  try {
+    rec.finish(outcome);
+  } catch (err) {
+    console.warn(
+      "[custom-agent] 子代理过程记录收尾出错（已忽略）：",
+      err instanceof Error ? err.message : err,
+    );
+  }
+};
+
+/**
  * 进程内嵌套子会话：给 task 工具用——起一个子 agent、跑完返最终文本。
  *
  * - 模型 / effort：缺省沿用父会话；显式指定则在**当前 provider** 内解析（见 subagent-spec），
@@ -413,9 +525,15 @@ const loadSubagentCatalog = async (
 export const runPiSubagent = async (
   req: SubagentRequest,
   signal: AbortSignal | undefined,
-  ctx: { parent: SubagentParent; cwd: string; taskId?: string },
+  ctx: {
+    parent: SubagentParent;
+    cwd: string;
+    taskId?: string;
+    /** 父会话里这次 `task` 调用的 callId：过程记录据此绑到事件流卡片 */
+    toolCallId?: string;
+  },
 ): Promise<string> => {
-  const { parent, cwd, taskId } = ctx;
+  const { parent, cwd, taskId, toolCallId } = ctx;
   const parentSel = {
     id: parent.input.model?.id?.trim() || "default",
     params: parent.input.model?.params,
@@ -479,6 +597,7 @@ export const runPiSubagent = async (
   const onAbort = () => {
     void Promise.resolve(session.abort()).catch(() => {});
   };
+  let rec: SubagentRunHandle | undefined;
   try {
     signal?.addEventListener("abort", onAbort, { once: true });
     // 创建期间可能已被取消（上面的 aborted 检查与监听挂上之间有 await）。
@@ -486,10 +605,29 @@ export const runPiSubagent = async (
     // 直接抛错、不往下走到 prompt（这里到 prompt 之间没有 await，不会再漏窗口）；finally 会 dispose 会话。
     if (signal?.aborted) throw new Error("子任务已取消");
     let result = "";
+    // 过程记录（详情面板）：起不来 / 中途出错都只告警，绝不影响子代理本身
+    rec = startPiSubagentRecord({
+      taskId,
+      toolCallId,
+      req,
+      model: resolved.model.id,
+      effort: resolved.effort ?? currentEffortValue(resolved.model.params),
+    });
+    const toolArgs = new Map<string, { name: string; args: unknown }>();
     // 用对象承接：闭包里赋值，直接 let 会被 TS 窄化成 null
     const fail: { prompt: string | null } = { prompt: null };
     await new Promise<void>((resolve) => {
       const unsub = session.subscribe((ev) => {
+        if (rec) {
+          try {
+            for (const m of piSubagentEventMessages(ev, toolArgs)) rec.onMessage(m);
+          } catch (err) {
+            console.warn(
+              "[custom-agent] 子代理过程记录出错（已忽略）：",
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
         if (ev.type === "message_update") {
           const inner = ev.assistantMessageEvent;
           if (inner?.type === "text_delta" && inner.delta) result += inner.delta;
@@ -521,7 +659,17 @@ export const runPiSubagent = async (
         text ? `${failure}\n（子任务中途失败，已产出的部分内容：）\n${text}` : failure,
       );
     }
+    safeFinishRecord(rec, { status: "done", result: text || "(子任务无输出)" });
     return text;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    safeFinishRecord(
+      rec,
+      signal?.aborted || msg === "子任务已取消"
+        ? { status: "cancelled" }
+        : { status: "failed", error: msg },
+    );
+    throw err;
   } finally {
     signal?.removeEventListener("abort", onAbort);
     try {
@@ -554,10 +702,17 @@ const buildCustomTools = (
             label: t.label,
             description: t.description,
             parameters: t.parameters,
-            execute: async (_toolCallId: string, params: unknown) => {
+            // pi 的 execute 第三位是 AbortSignal（Cursor 的 customTool 回调没有）：
+            // `wait` 要靠它在 run 被取消时立刻醒；taskId 让停止 / 插话 / 跳过也能按任务唤醒
+            execute: async (
+              _toolCallId: string,
+              params: unknown,
+              signal?: AbortSignal,
+            ) => {
               const r = await t.handler(
                 params as Record<string, unknown>,
                 callerToken,
+                { ...(taskId ? { taskId } : {}), ...(signal ? { signal } : {}) },
               );
               return { content: r.content, details: undefined };
             },
@@ -566,7 +721,13 @@ const buildCustomTools = (
     : []),
     ...buildCodingToolDefs(
       cwd,
-      (req, signal) => runPiSubagent(req, signal, { parent, cwd, taskId }),
+      (req, signal, c) =>
+        runPiSubagent(req, signal, {
+          parent,
+          cwd,
+          taskId,
+          toolCallId: c?.toolCallId,
+        }),
       spill,
       // 旁路（无 GitLab 凭证）：shell 摘 token；子代理 bash 在 runPiSubagent 里同口径摘
       { omitGitToken: parent.input.omitGitToken === true },
@@ -876,7 +1037,7 @@ export const createCustomAgent = async (
   // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
   // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
   // 全部过滤掉，模型只看到 read/edit/write/grep。
-  // 只读轮次：白名单 + customTools 双收敛（read/grep/glob/只读shell/合test-MR，写类不给）。
+  // 只读轮次：白名单 + customTools 双收敛（read/grep/glob/合test-MR，写类 / shell 不给）。
   // 注：旁路 honor-system 后不再传 readOnly，此分支当前无人接线，留作收紧时直接用。
   const customTools = readOnly
     ? buildReadOnlyToolDefs(

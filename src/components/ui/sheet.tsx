@@ -72,11 +72,16 @@ function SheetContent({
       >
         {children}
         {showCloseButton && (
+          // 关闭键放左上、紧挨标题（SheetHeader 的 pl-11 给它让位），不放右上：
+          // Windows 壳右上角有一条系统画的窗口控制按钮（56px 高 × 138px 宽，画在网页内容之上），
+          // 抽屉贴着视口顶边，右上角的叉叉会被它盖住、点击也被它吃掉。
+          // 左上角两个平台都没有系统控件，不用按平台分支。
+          // top-1 = 与 SheetHeader 第一行（py-2 + 20px 行高）垂直居中对齐。
           <DialogPrimitive.Close
             render={
               <Button
                 variant="ghost"
-                className="absolute top-2 right-2"
+                className="absolute top-1 left-2"
                 size="icon-sm"
               />
             }
@@ -94,7 +99,8 @@ function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="sheet-header"
-      className={cn("flex shrink-0 flex-col gap-1 border-b px-3 py-2 pr-10", className)}
+      // pl-11：左边给 SheetContent 里绝对定位的关闭键（left-2 + 28px 宽）留位，标题 / 描述都从它右边起
+      className={cn("flex shrink-0 flex-col gap-1 border-b py-2 pr-3 pl-11", className)}
       {...props}
     />
   );

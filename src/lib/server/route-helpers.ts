@@ -122,7 +122,10 @@ export const extractInteractiveText = (
         budget -= t.length;
       }
     }
-    for (const v of Object.values(o)) {
+    for (const [k, v] of Object.entries(o)) {
+      // `config` 是卡片设置（含 `summary.content` = 会话列表 / 推送预览的摘要），不是正文：
+      // 我们发的文本卡（lark-api.buildMarkdownCardJson）的摘要就是正文开头，不跳会让取回的文本开头多出一遍
+      if (k === "config") continue;
       if (typeof v === "object") walk(v);
     }
   };

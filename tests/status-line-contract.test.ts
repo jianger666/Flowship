@@ -26,6 +26,13 @@ const statusLine = read(
   "event-stream",
   "active-status-line.tsx",
 );
+const toolBlock = read("components", "tasks", "event-stream", "tool-block.tsx");
+const skipWaitButton = read(
+  "components",
+  "tasks",
+  "event-stream",
+  "skip-wait-button.tsx",
+);
 
 /** 取 `from` 与 `to` 两个标记之间的源码（含 from、不含 to） */
 const between = (source: string, from: string, to: string): string => {
@@ -63,11 +70,55 @@ describe("组尾「处理中…」让位给输入框上方的状态行", () => {
     const renderSide = between(
       eventStream,
       "{hideReplyComposer || !isChat ? null : (",
-      "<SuspectStuckHint",
+      "<ConversationComposer",
     );
-    expect(renderSide).toContain(
-      "{activeStatus && <ActiveStatusLine status={activeStatus} />}",
+    // 状态行本身仍受 activeStatus 门控；2026-10 起多挂了「跳过等待」回调（wait 工具在跑时才出按钮）
+    expect(renderSide).toMatch(
+      /\{activeStatus && \(\s*<ActiveStatusLine\s+status=\{activeStatus\}\s+onSkipWait=\{handleSkipWait\}\s*\/>\s*\)\}/,
     );
+  });
+
+  it("「跳过等待」：回调走 skipWait（不是 stop）、失败 toast；按钮只在 skippable 且有回调时画", () => {
+    // 回调：叫醒 wait，不是停止整个 run——run 的上下文和后续步骤都要还在
+    const handler = between(
+      eventStream,
+      "const handleSkipWait = useCallback(",
+      "const attachScrollerRef",
+    );
+    expect(handler).toContain("await skipWait(taskIdForSkip)");
+    expect(handler).not.toMatch(/stopTask|\/stop/);
+    expect(handler).toContain("toast.error");
+    // 按钮：两个条件缺一不可（只有 skippable 没回调 = 没人响应；反过来 = 非 wait 步骤也出按钮）
+    expect(statusLine).toMatch(/status\.skippable && onSkipWait \?/);
+    expect(statusLine).toContain("跳过等待");
+    // 点击后禁用、处理完恢复（别让人连点出一串请求）
+    expect(statusLine).toMatch(/disabled=\{skipping\}/);
+  });
+
+  it("task 形态没有状态行：「跳过等待」也挂在 wait 的工具块上（两种形态都渲染工具块）", () => {
+    // 前提：task 形态确实不画状态行——否则这个入口就是多余的
+    expect(eventStream).toContain("{hideReplyComposer || !isChat ? null : (");
+    const regular = between(toolBlock, "const RegularToolBlockRow = (", "const TodoToolBlock");
+    // 条件走共用判定（与状态行的 skippable 同口径：wait 且在跑）
+    expect(regular).toContain("isSkippableWaitBlock(block)");
+    const buttonAt = regular.indexOf("<SkipWaitButton taskId={taskId} />");
+    expect(buttonAt, "工具块里没挂 SkipWaitButton").toBeGreaterThan(0);
+    // 不能挂进折叠体里：折叠时（wait 默认折叠）也得看得见——否则 task 里还是没有入口
+    const bodyAt = regular.search(/<Collapse open=\{!collapsed\}>/);
+    expect(bodyAt, "找不到工具块的折叠体").toBeGreaterThan(0);
+    expect(buttonAt).toBeLessThan(bodyAt);
+    // 不能塞进标题 <button> 里：按钮套按钮不合法，点击还会冒泡成折叠 / 展开
+    const headerEnd = regular.indexOf("</button>");
+    expect(headerEnd).toBeGreaterThan(0);
+    expect(buttonAt).toBeGreaterThan(headerEnd);
+  });
+
+  it("工具块的按钮走 skipWait（不是 stop）、失败 toast、点了就禁用", () => {
+    expect(skipWaitButton).toContain("await skipWait(taskId)");
+    expect(skipWaitButton).not.toMatch(/stopTask|\/stop/);
+    expect(skipWaitButton).toContain("toast.error");
+    expect(skipWaitButton).toMatch(/disabled=\{skipping\}/);
+    expect(skipWaitButton).toContain("跳过等待");
   });
 
   it("组尾判定拿到了 statusLineVisible（漏传 = 判定函数永远当「没有状态行」、两处都画）", () => {
@@ -91,29 +142,26 @@ describe("状态行槽位：运行期间始终预留，状态行出没不带着�
   });
 
   it("槽位是状态行的外层容器；预留高度与状态行自己的高度同为 h-7（不一致 = 状态行一出现输入框就跳）", () => {
-    expect(eventStream).toContain(
-      '<div className={reserveStatusSlot ? "h-7" : undefined}>',
+    // 槽位 className：运行期间 h-7、其余 h-0，且带高度过渡（2026-10-17：run 结束这 28px 一帧消失，
+    // 跟吐字收尾 / 工作过程组收起撞在同一帧 = 「完成后抖一下」）
+    const slotStart = eventStream.indexOf(
+      'reserveStatusSlot ? "h-7" : "h-0"',
     );
+    expect(slotStart).toBeGreaterThan(0);
+    const slotHead = eventStream.slice(Math.max(0, slotStart - 700), slotStart);
+    expect(slotHead).toContain("transition-[height]");
+    expect(slotHead).toContain("overflow-hidden");
+    expect(slotHead).toContain("motion-reduce:transition-none");
     // 状态行自己的根节点高度
     expect(statusLine).toMatch(/<div className="flex h-7 min-w-0 items-center/);
-    // 槽位包着它（而不是兄弟节点）
+    // 槽位包着它（而不是兄弟节点）：槽位 div 的第一个 `</div>` 必须在状态行之后
     const slot = between(
       eventStream,
-      '<div className={reserveStatusSlot ? "h-7" : undefined}>',
-      "<SuspectStuckHint",
-    );
-    expect(slot).toContain("<ActiveStatusLine");
-  });
-
-  it("预留的是「状态行」这一行，不是疑似卡住提示（后者按需出现、不预留）", () => {
-    const slot = between(
-      eventStream,
-      '<div className={reserveStatusSlot ? "h-7" : undefined}>',
+      'reserveStatusSlot ? "h-7" : "h-0"',
       "<ConversationComposer",
     );
-    // 槽位 div 先闭合、SuspectStuckHint 才开始
-    expect(slot.indexOf("</div>")).toBeGreaterThan(-1);
-    expect(slot.indexOf("</div>")).toBeLessThan(slot.indexOf("<SuspectStuckHint"));
+    expect(slot).toContain("<ActiveStatusLine");
+    expect(slot.indexOf("<ActiveStatusLine")).toBeLessThan(slot.indexOf("</div>"));
   });
 });
 
@@ -155,5 +203,71 @@ describe("状态行「已等待」走字定时器", () => {
     const elapsedSpan = between(statusLine, "{elapsed ? (", "{status.detail ?");
     expect(elapsedSpan).toContain("tabular-nums");
     expect(elapsedSpan).toContain("shrink-0");
+  });
+});
+
+describe("静默兜底：SDK 里不可见的等待（Cursor 原生 await 的 sleep）不能让状态行静态 / 说错话", () => {
+  const stalledHook = between(
+    statusLine,
+    "const useStalled",
+    "const useElapsedMs",
+  );
+
+  it("event-stream 把「整个任务最后一条事件的 ts」作为原始数值传给 deriveActiveStatus，且在 memo 外算、在依赖里", () => {
+    // 在 memo 外算：memo 里不许碰全量事件列表（见 event-stream-scroll-contract 的性能闸）
+    expect(eventStream).toContain("const lastEventTs = latestEventTs(task.events);");
+    const memo = between(
+      eventStream,
+      "const activeStatus = useMemo",
+      "const statusLineVisible",
+    );
+    // 漏传 = 状态行永远不兜底、回到睡觉时静态说「思考中」
+    expect(memo).toContain("lastActivityTs: lastEventTs,");
+    // 漏了依赖：来了新事件锚点不更新、状态行拿旧锚点算「已等待」
+    expect(memo).toMatch(/statusEvents,\s*lastEventTs,\s*awaitingAsk,\s*liveToolOutputs,/);
+  });
+
+  it("有未答提问时不兜底：把 awaitingAsk 传给 deriveActiveStatus（漏传 = 等人答题 20s 后状态行改口「仍在等待」、像卡住）", () => {
+    const memo = between(
+      eventStream,
+      "const activeStatus = useMemo",
+      "const statusLineVisible",
+    );
+    expect(memo).toContain("awaitingUser: awaitingAsk,");
+  });
+
+  it("只起一次 setTimeout（不是 interval）、卸载 / 换锚点必清；effect 依赖是 [stallSinceTs]", () => {
+    expect(stalledHook).toContain("window.setTimeout(");
+    expect(stalledHook).not.toContain("setInterval");
+    expect(stalledHook).toMatch(/return \(\) => window\.clearTimeout\(id\);/);
+    expect(stalledHook).toMatch(/\},\s*\[stallSinceTs\],?\s*\);/);
+  });
+
+  it("已经静默够久（remaining ≤ 0）要立刻改口，不能排一个负延迟的定时器", () => {
+    expect(stalledHook).toMatch(
+      /if \(remaining <= 0\) \{\s*setStalledFor\(stallSinceTs\);\s*return;\s*\}/,
+    );
+  });
+
+  it("状态存的是「哪个锚点已经够久」、不是布尔：新事件换了锚点的那一帧旧的「仍在等待」立刻失效、不闪", () => {
+    expect(stalledHook).toContain("useState<number | undefined>(undefined)");
+    expect(stalledHook).toContain(
+      "return stallSinceTs !== undefined && stalledFor === stallSinceTs;",
+    );
+  });
+
+  it("组件：够久 → 换成 stallFallbackStatus；走字起点跟着换后的 status（仍由 useElapsedMs 一处计时）", () => {
+    const component = between(
+      statusLine,
+      "export const ActiveStatusLine",
+      "return (",
+    );
+    expect(component).toContain("useStalled(base.stallSinceTs)");
+    expect(component).toContain("stallFallbackStatus(base.stallSinceTs)");
+    // 计时只有一处：用换后的 status.sinceTs，不是 base 的
+    expect(component).toContain("useElapsedMs(status.sinceTs)");
+    expect(statusLine).toMatch(
+      /import \{[^}]*\bmsUntilStall\b[^}]*\bstallFallbackStatus\b[^}]*\} from "@\/lib\/chat-turns";|import \{[^}]*\bstallFallbackStatus\b[^}]*\bmsUntilStall\b[^}]*\} from "@\/lib\/chat-turns";/,
+    );
   });
 });

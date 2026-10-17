@@ -272,6 +272,8 @@ const DiffBody = ({
       linker={linker}
       // 已删除文件不在盘上、新行号跳转必偏 → 不传
       filePath={file.status === "deleted" ? null : file.absolutePath}
+      // 删除文件 filePath 是 null，但扩展名还在，语法高亮仍要按它选语言
+      highlightPath={file.path}
       className="mt-0"
       scrollClassName="max-h-none"
     />

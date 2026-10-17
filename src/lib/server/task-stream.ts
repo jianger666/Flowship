@@ -14,6 +14,7 @@
 
 import { redactCopyIfHit, redactSecretsInText } from "./event-secret-redact";
 import { appendEvent } from "./task-fs";
+import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import type { Task, TaskEvent, ActionRecord } from "@/lib/types";
 import type { TaskFieldsSnapshot } from "./task-prompts";
 // 仅 type-only——action-side-effects 不反向依赖本模块，无运行时环
@@ -51,6 +52,8 @@ export const stringifyMeta = (v: unknown): string => {
 //     只给属主主链发、没有 origin
 //   - queue_failed: 队列整队失败控制帧（纯内存、不落盘）
 //   - restricted_run: 旁路只读答疑 run 的活跃度信号（纯内存、不落盘、不进 runStatus）
+//   - background_subagents: chat 会话里「此刻还在后台跑的子代理」整份快照（纯内存、不落盘；
+//     主 AI 说完一轮后子代理可能还在干活，界面据此在输入框上方画「子代理在后台工作」条；bootstrap 补发当前值）
 //   - task_deleted: DELETE 逻辑删除提交后通知既有 watcher 关流（纯内存、不落盘）
 //
 // `origin`（event / assistant_delta / done 三种帧）= 这条事件出自哪一路 run：
@@ -78,6 +81,8 @@ export type TaskStreamEvent =
   | { kind: "restricted_run"; active: boolean }
   /** task 模式待送达队列快照（纯内存、不落盘；bootstrap 补发当前值） */
   | { kind: "talk_queue"; items: TalkQueueItem[] }
+  /** chat 会话后台子代理在飞清单（整份快照、空数组 = 没有；纯内存、不落盘；bootstrap 补发当前值） */
+  | { kind: "background_subagents"; jobs: BackgroundSubagentJobView[] }
   | { kind: "task_deleted"; taskId: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;
@@ -534,6 +539,7 @@ export const subscribeAllTaskStreams = (
  * - `assistant_delta` / `thinking_delta` / `error`：文本字段精确值替换；
  * - ephemeral 事件帧（`tool_output_delta`、boot 进度等，id 以 `ephemeral_` 开头）：
  *   命中才深拷贝脱敏（调用方可能还握着原对象）；
+ * - `background_subagents`（后台子代理清单，纯内存不落盘）：命中才深拷贝脱敏；
  * - 落盘事件帧（`event`）已在 appendEventLine 脱敏，这里不重复扫；
  * - 其余帧（task / action / done …）不是文本流，不处理。
  * 未命中 / 没配凭据：返回同一个对象，零拷贝。局限见 event-secret-redact.ts 头注释
@@ -549,6 +555,13 @@ const redactStreamEvent = (ev: TaskStreamEvent): TaskStreamEvent => {
     case "error": {
       const message = redactSecretsInText(ev.message);
       return message === ev.message ? ev : { ...ev, message };
+    }
+    case "background_subagents": {
+      // 后台子代理清单里的 description 是模型填的（可能抄进 prompt 里的凭据）；这帧不落盘、不经
+      // appendEventLine，落盘事件与过程记录里同样的文本都脱敏了，实时帧不能成为唯一的明文出口。
+      // bootstrap 补帧不走 publish，由 getBackgroundSubagentSnapshot 自己脱敏
+      const jobs = redactCopyIfHit(ev.jobs);
+      return jobs === ev.jobs ? ev : { ...ev, jobs };
     }
     case "event": {
       const e = ev.event;

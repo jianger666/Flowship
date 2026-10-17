@@ -18,6 +18,8 @@
  * baseUrl/apiKey/format，调用方传的 apiKey 被忽略。
  */
 
+import { randomUUID } from "node:crypto";
+
 import { Agent as CursorAgent } from "@cursor/sdk";
 
 import {
@@ -38,7 +40,9 @@ import {
 import type { CustomAgentInput } from "./custom-agent-backend";
 import { withFlowshipSdkCustomTools } from "./flowship-tools";
 import { withCursorJsonlStore } from "./sdk-agent-store";
+import { interruptWaits } from "./session-wait";
 import { readSettingsFile } from "./settings-fs";
+import { startSubagentRun } from "./subagent-transcript";
 
 /** 与 @cursor/sdk 的 Agent.create 返回类型一致（下游类型零改动） */
 export type AgentInstance = Awaited<ReturnType<typeof CursorAgent.create>>;
@@ -179,6 +183,9 @@ const attachFlowshipTools = <
   background?: { taskId?: string; enabled?: boolean },
 ): { input: T; subagent: SubagentLink | undefined } => {
   if (!callerToken) return { input, subagent: undefined };
+  // 本 agent 实例的 `wait` 等待 scope：run 被取消 / 会话被关时（懒重启、错误收尾、超时……）
+  // 经 subagent 的取消联动按它叫醒——按实例不按 taskId，新旧实例同属一个任务时不互相误伤
+  const waitScope = `wait-scope:${randomUUID()}`;
   const subagent = createCursorSubagentLinkForSession({
     apiKey: input.apiKey ?? "",
     parentModel: input.model,
@@ -186,13 +193,34 @@ const attachFlowshipTools = <
     ...(background?.enabled && background.taskId
       ? { backgroundTaskId: background.taskId }
       : {}),
+    onParentCancel: () => {
+      interruptWaits(waitScope, "cancel");
+    },
+    // 子代理过程记录（详情面板）：task / chat 两种模式都记，按 taskId 落到任务目录
+    ...(background?.taskId
+      ? {
+          transcripts: {
+            start: (init) =>
+              startSubagentRun({
+                ...init,
+                taskId: background.taskId!,
+                provider: "cursor",
+              }),
+          },
+        }
+      : {}),
   });
   return {
     input: {
       ...input,
-      local: withFlowshipSdkCustomTools(input.local, callerToken, {
-        [CURSOR_SUBAGENT_TOOL_NAME]: subagent.tool,
-      }),
+      local: withFlowshipSdkCustomTools(
+        input.local,
+        callerToken,
+        { [CURSOR_SUBAGENT_TOOL_NAME]: subagent.tool },
+        // taskId 给 `wait`：停止 / 插话 / 「跳过等待」按它唤醒（background.taskId 在两条路径都会传）；
+        // waitScope：本实例被取消 / 关闭时按它唤醒
+        { taskId: background?.taskId, waitScope },
+      ),
       disallowedTools: withNativeTaskDisabled(input.disallowedTools),
     },
     subagent,

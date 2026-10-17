@@ -68,6 +68,7 @@ import {
   stepDormantNotice,
   withBootstrapNotice,
 } from "@/lib/watch-reconnect";
+import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import type { ThinkingSnapshot } from "@/lib/thinking-live";
 import type { TalkQueueItem } from "@/lib/talk-queue";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
@@ -149,6 +150,11 @@ export interface UseTaskWatchCallbacks {
   onRestrictedRun?: (active: boolean) => void;
   /** task 模式待送达队列快照 */
   onTalkQueue?: (items: TalkQueueItem[]) => void;
+  /**
+   * chat 会话后台子代理在飞清单（整份快照、空数组 = 没有）——主 AI 说完一轮后它们可能还在干活，
+   * 调用方据此在输入框上方画「子代理在后台工作」条。每次连接的 bootstrap 会补发当前值。
+   */
+  onBackgroundSubagents?: (jobs: BackgroundSubagentJobView[]) => void;
   /**
    * task_deleted / watch 410 / 已 hydrate 的 404 → 停重连。
    * 调用方接到后 `commitTaskDeleted`；503 unavailable 不可走此 sink。
@@ -296,6 +302,10 @@ export const useTaskWatch = (
           onTalkQueue: (items) => {
             if (cancelled) return;
             callbacksRef.current.onTalkQueue?.(items);
+          },
+          onBackgroundSubagents: (jobs) => {
+            if (cancelled) return;
+            callbacksRef.current.onBackgroundSubagents?.(jobs);
           },
           onTaskDeleted: (deletedId) => {
             if (cancelled) return;

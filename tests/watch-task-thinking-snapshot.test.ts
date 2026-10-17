@@ -6,7 +6,7 @@
  * 从头重新长。根因是实时思考只存在于前端本地 state，服务端的 thinking_delta 又从不回放。
  *
  * 真实路由 + 真实 handleSdkMessage（真实 publish / subscribe / 落盘）+ 临时数据目录，钉死：
- *   1. bootstrap 帧序：task → tail 事件（带 replay 标记）→ queue_state → restricted_run → talk_queue → thinking_snapshot；
+ *   1. bootstrap 帧序：task → tail 事件（带 replay 标记）→ queue_state → restricted_run → talk_queue → background_subagents → thinking_snapshot；
  *      快照帧**无条件**发（没在思考 = live:null），前端据此对齐（有则重建、无则清）；
  *   2. 快照 = 订阅那一刻之前已发出的全部，其后的实时帧排在它后面——不重不漏
  *      （订阅与读快照必须同步配对：bootstrap 的磁盘读取挂起期间发的帧，不能既进快照又进 buffer）；
@@ -201,7 +201,7 @@ const installHang = (name: string) => {
 };
 
 describe("bootstrap 帧序与 replay 标记", () => {
-  it("没有进行中的思考：快照帧照发、live 为 null；顺序在 queue_state / restricted_run / talk_queue 之后；tail 事件全带 replay", async () => {
+  it("没有进行中的思考：快照帧照发、live 为 null；顺序在 queue_state / restricted_run / talk_queue / background_subagents 之后；tail 事件全带 replay", async () => {
     const id = await alloc();
     await appendEvent(id, { kind: "user_reply", text: "第一条" });
     await appendEvent(id, { kind: "info", text: "第二条" });
@@ -215,6 +215,7 @@ describe("bootstrap 帧序与 replay 标记", () => {
       "queue_state",
       "restricted_run",
       "talk_queue",
+      "background_subagents",
       "thinking_snapshot",
     ]);
     const events = frames.filter((f) => f.type === "event");

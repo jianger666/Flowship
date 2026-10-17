@@ -52,9 +52,10 @@ describe("事件流内联搜索 UI", () => {
     expect(eventStream).toContain("findOwnerDomSearchMatches");
     expect(eventStream).toContain("applyDomSearchHighlights");
     expect(eventStream).toContain("scrollDomSearchMatchIntoView");
-    expect(eventStream).toContain("index: idx");
+    // 搜索命中经 jumpToItem 滚动（先停跟随再 scrollToIndex，见 event-stream-scroll-contract）
+    expect(eventStream).toContain('jumpToItem(idx, "center", "auto")');
     expect(eventStream).toContain("findRenderIndexForEventId");
-    expect(eventStream).toContain("scrollToIndex");
+    expect(eventStream).toContain("scrollToIndex({ index, align, behavior })");
     expect(eventStream).toContain('placeholder="搜索 AI 回复…"');
     expect(eventStream).toContain('data-pane-search="event-stream"');
     expect(eventStream).not.toContain("document\n        .querySelector");

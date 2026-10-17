@@ -179,30 +179,6 @@ describe("C · env 继承", () => {
     // 首次 import pi-coding-tools（转译一大串依赖）+ 真 spawn bash，冷启动可能超默认 5s
   }, 60_000);
 
-  it("旁路只读 shell 摘掉该变量：非属主的不可信输入手里没有 GitLab 凭证", async () => {
-    if (process.platform === "win32") return;
-    process.env[GITLAB_TOKEN_ENV_NAME] = FAKE_TOKEN;
-    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fe-token-env-ro-"));
-    try {
-      // 只读 shell 允许「node + 工作目录内文件」：脚本只打印变量长度、不打印值
-      fs.writeFileSync(
-        path.join(cwd, "probe.js"),
-        `process.stdout.write("len=" + String((process.env.${GITLAB_TOKEN_ENV_NAME} || "").length));`,
-      );
-      const { buildReadOnlyToolDefs } = await import("@/lib/server/pi-coding-tools");
-      const shell = buildReadOnlyToolDefs(cwd, { taskId: "t1" }).find(
-        (d) => (d as { name?: unknown }).name === "shell",
-      ) as unknown as {
-        execute: (...a: unknown[]) => Promise<{ content: Array<{ text: string }> }>;
-      };
-      const out = await shell.execute("call-1", { command: "node probe.js" });
-      const text = out.content.map((c) => c.text).join("\n");
-      expect(text, text).toContain("len=0");
-    } finally {
-      fs.rmSync(cwd, { recursive: true, force: true });
-    }
-  }, 60_000);
-
   it("测试进程的 hermetic 环境会清掉继承来的真 token，且不把它算进 stripped（它不是宿主注入变量）", () => {
     const env: Record<string, string | undefined> = {
       [GITLAB_TOKEN_ENV_NAME]: FAKE_TOKEN,

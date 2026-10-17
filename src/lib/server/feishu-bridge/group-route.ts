@@ -108,7 +108,7 @@ import {
   getBotOpenId,
   fetchInboundMessageText,
   sendInteractiveCardToChat,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
 } from "./lark-api";
 import {
   describeScopeShortage,
@@ -119,7 +119,11 @@ import type {
   InjectResultPayload,
   ParsedInboundContent,
 } from "./router";
-import type { CardButtonValue, FeishuInboundMessage } from "./types";
+import { noteGroupSendFailure } from "./group-failure-notice";
+import {
+  type CardButtonValue,
+  type FeishuInboundMessage,
+} from "./types";
 
 const LOG = "[feishu-bridge/group-route]";
 
@@ -177,7 +181,8 @@ export interface GroupRouteDeps {
   getBotOpenId: typeof getBotOpenId;
   /** 本机 bot 展示名——mentions 里认不出 open_id 时按名字兜底判 @ */
   getBotDisplayName: typeof getBotDisplayName;
-  sendTextToChat: typeof sendTextMessageToChat;
+  /** 回群文字（系统回执）：发出去是卡片，入参仍是纯文本 + `<at user_id>`（见 lark-api.toCardMarkdown） */
+  sendTextToChat: typeof sendMarkdownCardToChat;
   /** 发交互卡到群（推进选择卡用） */
   sendCardToChat: typeof sendInteractiveCardToChat;
   listTasks: typeof listTasks;
@@ -212,7 +217,7 @@ const defaultDeps = (): GroupRouteDeps => ({
   getBotAppInfo,
   getBotOpenId,
   getBotDisplayName,
-  sendTextToChat: sendTextMessageToChat,
+  sendTextToChat: sendMarkdownCardToChat,
   sendCardToChat: sendInteractiveCardToChat,
   listTasks,
   getTask,
@@ -556,7 +561,31 @@ const groupReplyMention = (
   requesterIsBot ? null : { openId: requester.openId, name: requester.name };
 
 /**
- * 回群。**返回 true = 已发出**；false = 静默（对机器人）或发送失败（失败只 warn、不抛）。
+ * 回群发不出去 → 在任务事件流里留一条 info，让属主看得见（本体与节流在 `group-failure-notice`，
+ * 出向 / 卡片回调的发群出口共用同一个，这里只负责先把「群 → 任务」解析出来）。
+ *
+ * - 找不到关联任务（群没绑 / 已归档 / 已删）= 没有地方可写，只留 warn；
+ * - 永不抛：它跑在「已经出错」的路径上，不能把原本只 warn 的失败变成抛错、打断入向链。
+ */
+const noteGroupReplyFailure = async (
+  chatId: string,
+  err: unknown,
+): Promise<void> => {
+  try {
+    const taskId = await resolveTaskIdByGroupChat(chatId);
+    if (!taskId) return;
+    await noteGroupSendFailure(taskId, chatId, err);
+  } catch (noteErr) {
+    console.warn(
+      `${LOG} 记录回群失败时出错 chat=${chatId}:`,
+      noteErr instanceof Error ? noteErr.message : noteErr,
+    );
+  }
+};
+
+/**
+ * 回群。**返回 true = 已发出**；false = 静默（对机器人）或发送失败（失败只 warn、不抛；
+ * 同时在任务事件流留一条 info，见 {@link noteGroupReplyFailure}）。
  * 绝大多数调用方不关心结果；要「发成功才认领名额」的（回放丢弃提示，见 sendBypassDropHints）看返回值。
  */
 const replyToGroup = async (
@@ -580,6 +609,7 @@ const replyToGroup = async (
       `${LOG} 回群失败 chat=${chatId}:`,
       err instanceof Error ? err.message : err,
     );
+    await noteGroupReplyFailure(chatId, err);
     return false;
   }
 };

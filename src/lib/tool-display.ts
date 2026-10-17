@@ -13,6 +13,7 @@
 import { isMcpToolName } from "@/lib/mcp-tool-name";
 import { isAbsolutePathLike } from "@/lib/path-utils";
 import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
+import { WAIT_TOOL_NAME, waitToolSummary } from "@/lib/wait-display";
 
 /** SSE ephemeral：不进 task.events / 不进持久 rows */
 export const isEphemeralToolOutputDelta = (ev: TaskEvent): boolean =>
@@ -860,6 +861,12 @@ export const toolBlockSummary = (block: ToolBlock): string => {
   if (isTodoTool(block.name)) {
     const todos = parseTodoToolArgs(block.args);
     if (todos) return todoListSummary(todos);
+  }
+
+  // wait：共 1m0s · 等 CI 跑完（没有可读入参时回落到下面的通用逻辑）
+  if (n === WAIT_TOOL_NAME) {
+    const waitSummary = waitToolSummary(block.args);
+    if (waitSummary) return waitSummary;
   }
 
   // edit / write：路径 + 行统计

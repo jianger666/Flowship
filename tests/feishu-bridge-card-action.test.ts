@@ -7,7 +7,7 @@ const {
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
   updateCardEntity,
   getPendingAsk,
   takePendingAskIf,
@@ -34,6 +34,7 @@ const {
   injectPendingAskText,
   handleGroupAdvancePick,
   fulfillAskWait,
+  noteGroupSendFailure,
 } = vi.hoisted(() => {
   type AnyFn = (...args: never[]) => unknown;
   return {
@@ -43,7 +44,7 @@ const {
       chat_id: "oc",
       message_id: "om",
     })),
-    sendTextMessageToChat: vi.fn<AnyFn>(async () => ({
+    sendMarkdownCardToChat: vi.fn<AnyFn>(async () => ({
       chat_id: "oc",
       message_id: "om",
     })),
@@ -73,8 +74,14 @@ const {
     injectPendingAskText: vi.fn<AnyFn>(async () => ({ ok: true })),
     handleGroupAdvancePick: vi.fn<AnyFn>(async () => undefined),
     fulfillAskWait: vi.fn<AnyFn>(async () => false),
+    noteGroupSendFailure: vi.fn<AnyFn>(async () => undefined),
   };
 });
+
+// 群里回执发不出去 → 事件流留 info 的本体（group-failure-notice）有自己的单测，这里只验「该调时调了」
+vi.mock("@/lib/server/feishu-bridge/group-failure-notice", () => ({
+  noteGroupSendFailure,
+}));
 
 // ask-wait 槽：默认「没有挂着的 curl」（false → 走 deliver）；个别用例改成 true 验同一轮写入
 vi.mock("@/lib/server/ask-wait", () => ({
@@ -85,7 +92,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
-  sendTextMessageToChat,
+  sendMarkdownCardToChat,
   updateCardEntity,
 }));
 
@@ -508,8 +515,8 @@ describe("group_ask（需求群答题）", () => {
       action_value: JSON.stringify(groupAskValue),
     });
     expect(injectPendingAskText).not.toHaveBeenCalled();
-    expect(sendTextMessageToChat).toHaveBeenCalledTimes(1);
-    expect(String(sendTextMessageToChat.mock.calls[0]![1])).toContain(
+    expect(sendMarkdownCardToChat).toHaveBeenCalledTimes(1);
+    expect(String(sendMarkdownCardToChat.mock.calls[0]![1])).toContain(
       "已经有人回答了",
     );
   });
@@ -523,7 +530,7 @@ describe("group_ask（需求群答题）", () => {
       action_value: JSON.stringify(groupAskValue),
     });
     expect(injectPendingAskText).not.toHaveBeenCalled();
-    expect(sendTextMessageToChat).toHaveBeenCalledTimes(1);
+    expect(sendMarkdownCardToChat).toHaveBeenCalledTimes(1);
   });
 
   // 官方嵌套形态只在 event.context 里给来源 chat——取值链漏了它，跨角色答题
@@ -551,7 +558,7 @@ describe("group_ask（需求群答题）", () => {
       action_value: JSON.stringify(groupAskValue),
     });
     expect(injectPendingAskText).not.toHaveBeenCalled();
-    expect(sendTextMessageToChat).not.toHaveBeenCalled();
+    expect(sendMarkdownCardToChat).not.toHaveBeenCalled();
   });
 
   it("事件没给来源 chat → 退回 owner 闸：非 owner 丢弃、owner 放行", async () => {
@@ -602,10 +609,67 @@ describe("group_ask（需求群答题）", () => {
       chat_id: groupAskValue.chatId,
       action_value: JSON.stringify(groupAskValue),
     });
-    expect(String(sendTextMessageToChat.mock.calls[0]![1])).toContain(
+    expect(String(sendMarkdownCardToChat.mock.calls[0]![1])).toContain(
       "答案没送达",
     );
     expect(listGroupReplies("task-1")).toHaveLength(0);
+  });
+
+  // 群里点了卡却没有任何反馈（回执自己也发不出去，多半是缺卡片权限）——属主无从知道，
+  // 回执失败除了 warn 还要在事件流留 info（本体见 group-failure-notice.ts）
+  it("失效回执自己发不出去 → 通知属主（带群 id / 任务 id），流程不抛", async () => {
+    getPendingAsk.mockReturnValue({ ...pendingAsk, askId: "ask-2" });
+    const boom = new Error("缺权限");
+    sendMarkdownCardToChat.mockRejectedValueOnce(boom);
+    await expect(
+      handleCardActionEvent({
+        operator_id: OTHER,
+        message_id: "om_card",
+        chat_id: groupAskValue.chatId,
+        action_value: JSON.stringify(groupAskValue),
+      }),
+    ).resolves.toBeUndefined();
+    expect(noteGroupSendFailure).toHaveBeenCalledTimes(1);
+    expect(noteGroupSendFailure).toHaveBeenCalledWith(
+      "task-1",
+      groupAskValue.chatId,
+      boom,
+      "卡片回执",
+    );
+  });
+
+  it("「答案没送达」回执自己发不出去 → 同样通知属主", async () => {
+    injectPendingAskText.mockResolvedValue({
+      ok: false,
+      reason: "deliver_failed",
+      error: "会话忙",
+    });
+    const boom = new Error("缺权限");
+    sendMarkdownCardToChat.mockRejectedValueOnce(boom);
+    await handleCardActionEvent({
+      operator_id: OTHER,
+      message_id: "om_card",
+      chat_id: groupAskValue.chatId,
+      action_value: JSON.stringify(groupAskValue),
+    });
+    expect(noteGroupSendFailure).toHaveBeenCalledWith(
+      "task-1",
+      groupAskValue.chatId,
+      boom,
+      "卡片回执",
+    );
+  });
+
+  it("回执发送成功：不通知", async () => {
+    getPendingAsk.mockReturnValue({ ...pendingAsk, askId: "ask-2" });
+    await handleCardActionEvent({
+      operator_id: OTHER,
+      message_id: "om_card",
+      chat_id: groupAskValue.chatId,
+      action_value: JSON.stringify(groupAskValue),
+    });
+    expect(sendMarkdownCardToChat).toHaveBeenCalledTimes(1);
+    expect(noteGroupSendFailure).not.toHaveBeenCalled();
   });
 
   // 群内推进跑到一半 agent 调 ask_user：这条答案属于同一轮推进，
@@ -1131,7 +1195,7 @@ describe("点旧卡的失效反馈按真实原因分流（M5-03）", () => {
     });
 
   const groupMsg = (): string =>
-    String(sendTextMessageToChat.mock.calls[0]![1]);
+    String(sendMarkdownCardToChat.mock.calls[0]![1]);
   const ownerMsg = (): string => String(sendTextMessage.mock.calls[0]![1]);
   const buttonPatchJson = (): string => JSON.stringify(batchUpdateCard.mock.calls);
 

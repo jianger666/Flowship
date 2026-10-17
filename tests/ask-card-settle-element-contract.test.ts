@@ -59,8 +59,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   updateCardElementContent,
   getBotAppInfo,
   sendInteractiveCardToChat,
-  sendPostMarkdownToChat: vi.fn(),
-  sendTextMessageToChat: vi.fn(),
+  sendMarkdownCardToChat: vi.fn(),
 }));
 
 const {

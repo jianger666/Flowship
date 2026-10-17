@@ -34,8 +34,7 @@ const { batchUpdateCard, deliverAskReply, deliverChatAskReply, hasChatSession } 
 vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   batchUpdateCard,
   sendInteractiveCardToChat: vi.fn(),
-  sendPostMarkdownToChat: vi.fn(),
-  sendTextMessageToChat: vi.fn(),
+  sendMarkdownCardToChat: vi.fn(),
 }));
 vi.mock("@/lib/server/task-runner", () => ({ deliverAskReply }));
 vi.mock("@/lib/server/chat-runner", () => ({

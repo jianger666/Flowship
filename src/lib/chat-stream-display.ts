@@ -128,11 +128,24 @@ const BOOT_SETTLING_KINDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * 是否是「用户点了停止」落的那条 info（server stop-task 写入、带 meta.stopped=true）。
+ * 它标志着这一轮已经被掐掉：此前的 boot 进度行（ephemeral、不落盘、没人会清）不再有意义。
+ * 认 meta 不认文案：chat / action / 划除三种停止文案各不相同。
+ */
+export const isStopMarkerInfo = (
+  ev: Pick<TaskEvent, "kind" | "meta">,
+): boolean => ev.kind === "info" && ev.meta?.stopped === true;
+
+/**
  * 从事件序列取「当前活跃的启动进度行」（同一时刻只显示最新一条）。
  *
  * 从尾部回扫：
  * - 先遇到 boot 行 → 它就是最新进度、返回之
  * - 先遇到任何 agent 活动（assistant/thinking/tool/error…）→ 本轮已开始、无活跃进度
+ * - 先遇到停止标记 → 这一轮被用户停掉了、无活跃进度。
+ *   （2026-10-16 用户实测：在「正在发送首包…」时点停止、首包还没回、没有任何 agent 活动事件，
+ *   boot 行没人清、一直挂在「用户停止了对话」下面；之后热会话续聊不报阶段，旧行还会借尸还魂。
+ *   后续新一轮的 boot 行在停止标记之后，回扫先命中它、不受影响。）
  * - 扫完没有 boot 行 → null（历史回看：boot 行不落盘、reload 后天然为空）
  */
 export const extractActiveBootStage = (
@@ -142,6 +155,7 @@ export const extractActiveBootStage = (
     const ev = events[i]!;
     if (isBootStageInfo(ev)) return ev;
     if (BOOT_SETTLING_KINDS.has(ev.kind)) return null;
+    if (isStopMarkerInfo(ev)) return null;
   }
   return null;
 };

@@ -25,6 +25,7 @@ import {
   type ToolVerbGroup,
   isInTurnToolErrorEvent,
 } from "@/lib/tool-display";
+import { WAIT_TOOL_NAME, waitToolSummary } from "@/lib/wait-display";
 
 // ---------- 类型 ----------
 
@@ -69,6 +70,18 @@ export type ActiveStatus = {
    */
   sinceTs?: number;
   /**
+   * 静默兜底的锚（毫秒时间戳 = 上一次活动的时间）。只有「空等」类状态、且调用方传了 lastActivityTs 才有。
+   * 有值 = 状态行可以在静默够久（STATUS_STALL_AFTER_MS）后把文案换成「仍在等待 · 已 Ns」。
+   * 兜的是 SDK 里对我们不可见的等待（如 Cursor 原生 await 的 sleep）：事件流一片空白，
+   * 状态行要么静态说「思考中」、要么对着睡觉的模型说「正在分析 X 的结果」。
+   */
+  stallSinceTs?: number;
+  /**
+   * 这一步是个可以被用户跳过的等待（`wait` 工具在跑）：状态行据此挂「跳过等待」按钮。
+   * 只在 chat 状态行有；跳过 = 叫醒那个在睡的 `wait`，模型收到 [WAIT_SKIPPED] 后继续。
+   */
+  skippable?: boolean;
+  /**
    * 「让位」标记：这一状态的信息，在列表末尾已经有一行进度行（PendingRow / BootStageRow）
    * 在说的时候，状态行就不再画，免得上下各说一遍「在启动」。
    *
@@ -81,6 +94,9 @@ export type ActiveStatus = {
 
 /** 工具都跑完、下一句还没出来：空等挂在这一句，不挂在 write 上（也是说不清上一个工具时的兜底文案） */
 export const PROCESSING_PLACEHOLDER_LABEL = "处理中…";
+
+/** `wait` 工具在跑时的状态行文案 */
+export const WAIT_STATUS_LABEL = "等待中";
 
 /**
  * 工具跑完、模型还没给出下一步时的状态行文案：「正在分析 read 的结果」。
@@ -100,6 +116,39 @@ export const formatStatusElapsed = (elapsedMs: number): string | null =>
   elapsedMs < STATUS_ELAPSED_SHOW_AFTER_MS
     ? null
     : formatDurationCoarse(elapsedMs);
+
+/**
+ * 「静默兜底」：agent 在跑、但已经这么久没有任何新事件 / 输出时，状态行改口「仍在等待」。
+ *
+ * 为什么需要它：SDK 里有些工具调用对我们完全不可见（实测 Cursor 原生 `await`——
+ * 模型睡 12s、SDK 流里 0 条 tool_call），事件流停在「思考中」/「正在分析 X 的结果」，
+ * 前者静态不动、后者在说一句错话（它其实在睡觉，没在分析）。
+ *
+ * 阈值 20s：正常活跃间隙实测最长 ~40s（模型生成一整个大文件的工具参数），
+ * 20s 起改口不会误导——文案只陈述「暂无新输出」，不断言原因。
+ * （曾经另有一条 5 分钟级的「疑似卡住」提示条，已移除——长 `wait` / 长 shell 本来就会长时间没有新事件。）
+ */
+export const STATUS_STALL_AFTER_MS = 20_000;
+
+/** 事件流末条 ts（没有事件 = 0）。新事件 append 在末尾；上拉历史 prepend 在头部、更旧。静默兜底的锚。 */
+export const latestEventTs = (events: readonly { ts: number }[]): number =>
+  events.length === 0 ? 0 : events[events.length - 1]!.ts;
+export const STATUS_STALL_LABEL = "仍在等待";
+export const STATUS_STALL_DETAIL = "暂无新输出";
+
+/** 距「静默够久、该改口」还差多少毫秒；≤ 0 = 已经够久了。 */
+export const msUntilStall = (stallSinceTs: number, now: number): number =>
+  stallSinceTs + STATUS_STALL_AFTER_MS - now;
+
+/**
+ * 静默够久后的状态：「仍在等待 · 已 Ns」。
+ * sinceTs = 上一次活动的时间，所以 Ns 是「已经多久没动静」，不是「这一步跑了多久」。
+ */
+export const stallFallbackStatus = (stallSinceTs: number): ActiveStatus => ({
+  label: STATUS_STALL_LABEL,
+  detail: STATUS_STALL_DETAIL,
+  sinceTs: stallSinceTs,
+});
 
 /**
  * 工作过程组末尾要不要挂「处理中…」。
@@ -573,6 +622,18 @@ const deriveActiveStatusBase = (
           : undefined;
         return busyBase({ label: "子代理工作中", detail, ...since });
       }
+      // wait：我们自己的等待工具——不说「正在执行 wait」，直接说「等待中」，
+      // 详情是「共 1m0s · 等 CI 跑完」（计划时长 + 原因），已等多久由状态行走字；
+      // skippable 让状态行挂「跳过等待」按钮
+      if (name.toLowerCase() === WAIT_TOOL_NAME) {
+        const summary = waitToolSummary(getArgs(ev));
+        return busyBase({
+          label: WAIT_STATUS_LABEL,
+          detail: summary ? clipDetail(summary) : undefined,
+          skippable: true,
+          ...since,
+        });
+      }
       const live = cid && liveToolOutputs ? liveToolOutputs[cid] : undefined;
       const detail = live?.trim()
         ? lastLineClipped(live)
@@ -632,18 +693,58 @@ const deriveActiveStatusBase = (
 export const deriveActiveStatus = (
   events: readonly TaskEvent[],
   liveToolOutputs?: Record<string, string>,
-  opts?: { streaming?: boolean; thinkingSince?: number | null },
+  opts?: {
+    streaming?: boolean;
+    thinkingSince?: number | null;
+    /**
+     * 整个任务最后一条事件的 ts（毫秒）。传了、且这一步有资格走静默兜底时，
+     * 返回值多带 `stallSinceTs`（见 ActiveStatus.stallSinceTs）；不传 = 不兜底。
+     */
+    lastActivityTs?: number;
+    /**
+     * AI 正在等用户（有一条未答的 ask_user 提问）。是 = 不走静默兜底：
+     * 此刻事件流不动是因为在等人答、不是 SDK 里有看不见的等待，「仍在等待 · 暂无新输出」会让人以为它卡住了。
+     */
+    awaitingUser?: boolean;
+  },
 ): ActiveStatus | null => {
   const base = deriveActiveStatusBase(events, liveToolOutputs, opts);
   if (!base) return null;
   const since = opts?.thinkingSince;
-  if (since == null) return base.status;
+  if (since == null) return withStallAnchor(base, opts);
   // 正文已经在流 = 在回复、不是在思考（实时态此时本应已被清掉，这里兜竞态）
   if (opts?.streaming) return base.status;
   // 只盖「空等」类；工具在跑 / 子代理 / 压缩有更具体的信息，不能盖
   if (!base.idle) return base.status;
+  // 实时思考中：thinking-delta 在持续来，不算静默——这里不挂 stallSinceTs
   // 脏值（NaN 等）退化成不带计时的「思考中」，别让走字显示 NaNs
   return Number.isFinite(since)
     ? { label: THINKING_LIVE_LABEL, sinceTs: since }
     : { label: THINKING_LIVE_LABEL };
+};
+
+/**
+ * 给「空等」类状态挂上静默兜底的锚（stallSinceTs）。
+ *
+ * 有资格 = 空等类（刚启动之外：思考刚结束 / 工具跑完等模型 / 回复刚结束），且没有实时活动在证明「还在动」：
+ *   - 正文在流（streaming）：delta 持续来，不算静默；
+ *   - 工具在跑 / 子代理 / 压缩（非 idle）：有更具体的信息，也有 liveOutput 自己的走字；
+ *   - 「正在启动…」（yieldToTail）：启动阶段由列表里的 PendingRow 计时，不抢；
+ *   - 在等用户答题（awaitingUser）：静默是因为等人，不是卡住。
+ * 没传 lastActivityTs / 脏值 → 不挂（原样返回，既有断言不受影响）。
+ */
+const withStallAnchor = (
+  base: StatusBase,
+  opts?: { streaming?: boolean; lastActivityTs?: number; awaitingUser?: boolean },
+): ActiveStatus => {
+  const ts = opts?.lastActivityTs;
+  const eligible =
+    base.idle &&
+    !opts?.streaming &&
+    !opts?.awaitingUser &&
+    !base.status.yieldToTail &&
+    ts !== undefined &&
+    Number.isFinite(ts) &&
+    ts > 0;
+  return eligible ? { ...base.status, stallSinceTs: ts } : base.status;
 };

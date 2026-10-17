@@ -222,7 +222,11 @@ describe("订阅 hub", () => {
 describe("会话控制句柄登记", () => {
   it("登记在 agent 对象上、按对象取；没登记 / 非对象 → undefined", () => {
     const agent = {};
-    const ctl = { detachForeground: () => 0, backgroundRunning: () => 0 };
+    const ctl = {
+      detachForeground: () => 0,
+      backgroundRunning: () => 0,
+      backgroundJobs: () => [],
+    };
     setSubagentSessionControl(agent, ctl);
     expect(getSubagentSessionControl(agent)).toBe(ctl);
     expect(getSubagentSessionControl({})).toBeUndefined();

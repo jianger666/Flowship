@@ -11,6 +11,7 @@ import {
   USER_MSG_COLLAPSE_LINES,
   extractActiveBootStage,
   isBootStageInfo,
+  isStopMarkerInfo,
   resolveStickyTurn,
   shouldCollapseUserMessage,
   shouldShowTurnDivider,
@@ -199,6 +200,62 @@ describe("extractActiveBootStage（渐进单行归并）", () => {
       ev("user_reply", { text: "排队的第二条" }),
     ];
     expect(extractActiveBootStage(events)?.text).toBe("正在创建会话…");
+  });
+
+  // 2026-10-16 用户实测：「正在发送首包…」时点停止，首包没回、没有任何 agent 活动事件，
+  // boot 行没人清、一直挂在「用户停止了对话」下面
+  describe("用户停止（meta.stopped 标记）", () => {
+    const stopEv = (): TaskEvent =>
+      ev("info", {
+        text: "用户停止了对话（agent 已中断、可继续发消息）",
+        meta: { stopped: true },
+      });
+
+    it("boot 行之后落了停止标记 → 无活跃进度（停止后不再转圈）", () => {
+      const events = [
+        ev("user_reply", { text: "挺火的" }),
+        bootEv("mcp", "正在检查 MCP…"),
+        bootEv("send", "正在发送首包…"),
+        stopEv(),
+      ];
+      expect(extractActiveBootStage(events)).toBeNull();
+    });
+
+    it("停止后 user_reply 又进来（排队 / 重发）也不会让旧 boot 行借尸还魂", () => {
+      const events = [
+        ev("user_reply"),
+        bootEv("send", "正在发送首包…"),
+        stopEv(),
+        ev("user_reply", { text: "再发一条" }),
+      ];
+      expect(extractActiveBootStage(events)).toBeNull();
+    });
+
+    it("停止之后新一轮的 boot 行照常显示（它在停止标记之后、回扫先命中它）", () => {
+      const events = [
+        ev("user_reply"),
+        bootEv("send", "正在发送首包…"),
+        stopEv(),
+        ev("user_reply", { text: "再发一条" }),
+        bootEv("resume", "正在恢复对话…"),
+      ];
+      expect(extractActiveBootStage(events)?.text).toBe("正在恢复对话…");
+    });
+
+    it("只认 meta 标记：普通 info（含文案像停止的）不算边界；非 info 带 stopped 也不算", () => {
+      const plain = ev("info", { text: "用户停止了对话（假装的）" });
+      const nonInfo = ev("user_reply", { meta: { stopped: true } });
+      expect(isStopMarkerInfo(plain)).toBe(false);
+      expect(isStopMarkerInfo(nonInfo)).toBe(false);
+      expect(isStopMarkerInfo(stopEv())).toBe(true);
+      expect(
+        extractActiveBootStage([
+          ev("user_reply"),
+          bootEv("create", "正在创建会话…"),
+          plain,
+        ])?.text,
+      ).toBe("正在创建会话…");
+    });
   });
 
   it("历史加载（无 boot 行——不落盘）不显示", () => {

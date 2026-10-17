@@ -21,6 +21,10 @@ import {
   readRewindMarker,
   type RewindMarker,
 } from "./rewind-marker";
+import {
+  parseBackgroundSubagentJobs,
+  type BackgroundSubagentJobView,
+} from "./background-subagents";
 import type { ThinkingSnapshot } from "./thinking-live";
 import type { TalkQueueItem } from "./talk-queue";
 import {
@@ -625,6 +629,8 @@ interface SSEEnvelope {
     | "restricted_run"
     /** task 模式待送达队列快照（纯内存） */
     | "talk_queue"
+    /** chat 会话后台子代理在飞清单（整份快照、纯内存；bootstrap 补发当前值） */
+    | "background_subagents"
     /** 任务已逻辑删除，客户端应停订阅、勿重连 */
     | "task_deleted";
   event?: TaskEvent;
@@ -662,6 +668,8 @@ interface SSEEnvelope {
   taskId?: string;
   /** restricted_run 帧：旁路答疑此刻在不在飞 */
   active?: boolean;
+  /** background_subagents 帧：在飞清单（按不可信输入，经 parseBackgroundSubagentJobs 校验后才交给回调） */
+  jobs?: unknown;
   /** talk_queue 帧：待送达队列条目（逐字段校验后才交给回调） */
   items?: Array<{
     id?: unknown;
@@ -790,6 +798,12 @@ export interface TaskStreamCallbacks {
   onRestrictedRun?: (active: boolean) => void;
   /** talk_queue——task 模式待送达队列整份快照 */
   onTalkQueue?: (items: TalkQueueItem[]) => void;
+  /**
+   * background_subagents——chat 会话里此刻还在后台跑的子代理，整份快照（空数组 = 没有）。
+   * 主 AI 说完一轮后会话呈现「已结束」、后台子代理却可能还在干活；上层据此在输入框上方画「子代理在后台工作」条。
+   * 每次连接的 bootstrap 会补发当前值，断线重连后不会停在旧状态。无效帧（jobs 不是数组）直接丢弃、不回调。
+   */
+  onBackgroundSubagents?: (jobs: BackgroundSubagentJobView[]) => void;
   /**
    * task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
    */
@@ -969,6 +983,10 @@ export const watchTaskStream = async (
                 typeof e.createdAt === "number",
             );
             callbacks.onTalkQueue?.(parsed);
+          } else if (env.type === "background_subagents") {
+            // 整份替换；jobs 不是数组的无效帧丢掉（不动本地状态——别拿脏数据把条抹掉）
+            const parsed = parseBackgroundSubagentJobs(env.jobs);
+            if (parsed !== undefined) callbacks.onBackgroundSubagents?.(parsed);
           } else if (
             env.type === "task_deleted" &&
             typeof env.taskId === "string"
@@ -1540,6 +1558,19 @@ export const stopTask = async (taskId: string): Promise<Task> => {
     res,
   );
   return data.task;
+};
+
+/**
+ * 「跳过等待」：叫醒这个任务里正在睡的 `wait` 工具（模型收到 [WAIT_SKIPPED] 后继续）。
+ * 返回叫醒了几个；0 = 当时没有在睡的（刚好到点自己醒了），不是错误。
+ */
+export const skipWait = async (taskId: string): Promise<number> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/wait/skip`,
+    { method: "POST" },
+  );
+  const data = await handleJson<{ ok: true; woken: number }>(res);
+  return data.woken;
 };
 
 /**

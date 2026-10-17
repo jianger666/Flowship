@@ -25,7 +25,7 @@
  * 它是 server 专门放进 process.env、要 agent shell 继承的凭据通道（agent 命令里引用它调 GitLab API，
  * 不再去读 config.json）。别把它加进来——加了 pi provider 的 shell 工具就拿不到 token、
  * 「GitLab 访问」提示里的用法会失效（tests/git-token-env.test.ts 钉住）。
- * 旁路（非属主）只读 shell 另在 pi-coding-tools 里显式摘掉它。
+ * 旁路（非属主）的 shell 另靠 `omitGitToken` 在 pi-coding-tools 的 shellTool 里显式摘掉它。
  */
 export const HOST_INJECTED_ENV_KEYS = [
   // Electron 语义开关：带上它任何 Electron 二进制都会被当纯 node 执行

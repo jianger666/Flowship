@@ -1,11 +1,15 @@
 /**
  * 全局快捷键 / composer 键位纯判定单测（C / B / E2 批次）
  */
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
   DOUBLE_ESC_WINDOW_MS,
+  SHEET_CONTENT_SELECTOR,
   isDoubleEsc,
+  isInsideSheet,
   isModCombo,
   oppositeSubmitShortcut,
   resolveRunningSubmitAction,
@@ -34,6 +38,33 @@ describe("isModCombo（Cmd/Ctrl+字母）", () => {
 
   it("键不同不命中", () => {
     expect(isModCombo(key({ key: "n", metaKey: true }), "k")).toBe(false);
+  });
+});
+
+describe("isInsideSheet（焦点 / 按键目标是否在右侧抽屉里）", () => {
+  /** 最小假节点：closest 只认抽屉选择器 */
+  const node = (inside: boolean) => ({
+    closest: (sel: string) => (sel === SHEET_CONTENT_SELECTOR && inside ? {} : null),
+  });
+
+  it("抽屉里的节点 → true；主界面节点 → false", () => {
+    expect(isInsideSheet(node(true))).toBe(true);
+    expect(isInsideSheet(node(false))).toBe(false);
+  });
+
+  it("用的是 SheetContent 的 data-slot 选择器（与 sheet.tsx 同一个口径）", () => {
+    expect(SHEET_CONTENT_SELECTOR).toBe('[data-slot="sheet-content"]');
+    const sheetSrc = readFileSync(
+      path.resolve(import.meta.dirname, "..", "src", "components", "ui", "sheet.tsx"),
+      "utf-8",
+    );
+    expect(sheetSrc).toContain('data-slot="sheet-content"');
+  });
+
+  it("没焦点 / 没有 closest（window、document 等非元素目标）→ false，不抛", () => {
+    expect(isInsideSheet(null)).toBe(false);
+    expect(isInsideSheet(undefined)).toBe(false);
+    expect(isInsideSheet({} as EventTarget)).toBe(false);
   });
 });
 

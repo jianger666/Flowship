@@ -50,6 +50,7 @@ import {
   type StaleAskReason,
 } from "./ask-stale";
 import { findTaskByMessageId } from "./card-map";
+import { noteGroupSendFailure } from "./group-failure-notice";
 import {
   GROUP_MEMBER_FALLBACK_NAME,
   mentionTag,
@@ -71,8 +72,8 @@ import {
 import {
   batchUpdateCard,
   getBotAppInfo,
+  sendMarkdownCardToChat,
   sendTextMessage,
-  sendTextMessageToChat,
   updateCardEntity,
 } from "./lark-api";
 import {
@@ -886,12 +887,14 @@ const handleGroupAskAction = async (
       }
     }
     try {
-      await sendTextMessageToChat(
+      await sendMarkdownCardToChat(
         value.chatId,
         `${mentionTag(operatorOpenId, answeredBy)} ${staleAskReplyText(reason, "group")}`,
       );
     } catch (err) {
-      warnLark("sendTextMessageToChat(stale group ask)", err);
+      warnLark("sendMarkdownCardToChat(stale group ask)", err);
+      // 回执发不出去也让属主看得见（群里点了旧卡却没有任何反应，属主无从知道是权限问题）
+      await noteGroupSendFailure(value.taskId, value.chatId, err, "卡片回执");
     }
     return;
   }
@@ -926,12 +929,13 @@ const handleGroupAskAction = async (
     // 没送进去就别挂着登记——否则下一轮无关的 done 会把结果误发进群
     restoreGroupReply(value.taskId, replyHandle);
     try {
-      await sendTextMessageToChat(
+      await sendMarkdownCardToChat(
         value.chatId,
         `${mentionTag(operatorOpenId, answeredBy)} 答案没送达：${result.error}`,
       );
     } catch (err) {
-      warnLark("sendTextMessageToChat(group ask fail)", err);
+      warnLark("sendMarkdownCardToChat(group ask fail)", err);
+      await noteGroupSendFailure(value.taskId, value.chatId, err, "卡片回执");
     }
     return;
   }

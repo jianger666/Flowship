@@ -63,6 +63,7 @@ import {
   type SteerChatOpts,
   type SteerChatResult,
 } from "@/lib/server/chat-runner";
+import { interruptWaits } from "@/lib/server/session-wait";
 import { stopTaskAgent } from "@/lib/server/stop-task";
 import {
   PERSIST_FAIL_RETRY_MESSAGE,
@@ -424,6 +425,11 @@ export type SteerSendNowDeps = {
    * 返回转了几个。缺省 = 不转。
    */
   detachForeground?: (taskId: string) => number;
+  /**
+   * 用户插话时把主 AI 正在睡的 `wait` 叫醒（同理：它阻塞在工具调用里，steer 要等它睡完才读得到）。
+   * 返回叫醒了几个。缺省 = 不叫。
+   */
+  interruptWaits?: (taskId: string) => number;
   isRunActive: (taskId: string) => boolean;
   hasSession: (taskId: string) => boolean;
   flushQueue: (taskId: string) => Promise<void>;
@@ -444,6 +450,7 @@ const defaultSteerDeps: SteerSendNowDeps = {
   registerInflight: registerInflightSteer,
   steer: steerChatRun,
   detachForeground: detachChatForegroundSubagents,
+  interruptWaits: (taskId) => interruptWaits(taskId, "steer"),
   isRunActive: isChatRunActive,
   hasSession: hasChatSession,
   flushQueue: flushChatQueue,
@@ -644,6 +651,13 @@ const steerQueuedMessage = async (
         if (detached > 0) {
           console.log(
             `[chat-queue-send-now] task=${taskId} 插话：${detached} 个前台子代理已转后台`,
+          );
+        }
+        // 同理叫醒在睡的 wait：它返回 [WAIT_INTERRUPTED]、主 AI 随即读到这条插话
+        const wokenWaits = sd.interruptWaits?.(taskId) ?? 0;
+        if (wokenWaits > 0) {
+          console.log(
+            `[chat-queue-send-now] task=${taskId} 插话：${wokenWaits} 个 wait 已提前结束`,
           );
         }
         // item：在飞期间登记到会话记录上——error 收尾要把这一条也算进「未送达」（它不在队里、也不占 in-flight 槽）；

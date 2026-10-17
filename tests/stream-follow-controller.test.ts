@@ -752,3 +752,240 @@ describe("视口高度变化：补一次贴底（Virtuoso 自己那条路径被�
     expect(ctrl.isFollowing()).toBe(true);
   });
 });
+
+// ---------- 「回到最新」平滑滚动（2026-10-17「全是大动作」） ----------
+
+describe("scrollToBottomSmooth：回到最新是一小段缓动、不是瞬移", () => {
+  /** 离底 400px（总高 2000、视口 800、最大可滚 1200 → 停在 800）、已翻离底部 */
+  const awayFromBottom = (over: Partial<ScrollerInit> = {}) => {
+    const h = setupWithScroller({ top: 800, ...over });
+    h.ctrl.setFollowing(false);
+    return h;
+  };
+
+  /** 推进假时钟、跑一帧，并按浏览器行为派发这次程序化写入引发的 scroll 事件 */
+  const stepFrame = (sc: FakeScroller, ms: number) => {
+    clock += ms;
+    flushFrame();
+    sc.dispatch("scroll");
+  };
+
+  it("滑行期间跟随态保持 false（流式的贴底请求不跟它抢）、落地才开闸并交给贴底链", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    expect(ctrl.isFollowing()).toBe(false);
+    // 点击当下不直接写 scrollTop（先排一帧起跑）
+    expect(sc.writes).toEqual([]);
+    expect(pendingFrames()).toBe(1);
+
+    stepFrame(sc, 0); // 起跑帧 elapsed=0：写入起点
+    stepFrame(sc, 100); // 中途
+    expect(ctrl.isFollowing()).toBe(false);
+    const mid = sc.top();
+    expect(mid).toBeGreaterThan(800);
+    expect(mid).toBeLessThan(1200);
+
+    stepFrame(sc, 400); // 超过时长 → 落地
+    expect(sc.top()).toBe(1200);
+    expect(ctrl.isFollowing()).toBe(true);
+    // 落地后交给贴底链再盯几帧（Virtuoso 测量完总高可能又变）
+    expect(pendingFrames()).toBe(1);
+  });
+
+  it("逐帧单调往下走、不越过终点（easeOut：起步快、收尾慢）", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    const tops: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      stepFrame(sc, 40);
+      tops.push(sc.top());
+    }
+    for (let i = 1; i < tops.length; i++) {
+      expect(tops[i]!).toBeGreaterThanOrEqual(tops[i - 1]!);
+      expect(tops[i]!).toBeLessThanOrEqual(1200);
+    }
+    // easeOut：前 40ms 走的距离 > 最后一小段
+    expect(tops[0]! - 800).toBeGreaterThan(tops[5]! - tops[4]!);
+  });
+
+  it("滑行自己写 scrollTop 引发的 scroll 回调不会把滑行杀掉（内部写态不取消滑行）", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    for (let i = 0; i < 20 && !ctrl.isFollowing(); i++) stepFrame(sc, 30);
+    expect(sc.top()).toBe(1200);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("终点每帧重读：滑行期间流式内容还在长，落地时落在新的底部", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    stepFrame(sc, 0);
+    stepFrame(sc, 80);
+    sc.grow(300); // 总高 2300 → 最大可滚 1500
+    stepFrame(sc, 400);
+    expect(sc.top()).toBe(1500);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("滑行中用户往上滚 → 当场取消：之后的帧不再写 scrollTop、跟随态仍是 false", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    stepFrame(sc, 0);
+    stepFrame(sc, 60);
+    const before = sc.writes.length;
+    sc.dispatch("wheel", { deltaY: -120 });
+    expect(pendingFrames()).toBe(0);
+    stepFrame(sc, 400);
+    expect(sc.writes.length).toBe(before);
+    expect(ctrl.isFollowing()).toBe(false);
+  });
+
+  it("滑行中用户按 ↑ / 触摸上拖 / 点滚动条，同样取消", () => {
+    for (const act of [
+      (sc: FakeScroller) => sc.dispatch("keydown", key("ArrowUp")),
+      (sc: FakeScroller) => {
+        sc.dispatch("touchstart", { touches: [{ clientY: 100 }] });
+        sc.dispatch("touchmove", { touches: [{ clientY: 300 }] });
+      },
+      (sc: FakeScroller) =>
+        sc.dispatch("pointerdown", { target: sc.el, offsetX: 950 }),
+    ]) {
+      queued = new Map();
+      const { ctrl, sc } = awayFromBottom();
+      ctrl.scrollToBottomSmooth();
+      stepFrame(sc, 0);
+      act(sc);
+      expect(pendingFrames()).toBe(0);
+      expect(ctrl.isFollowing()).toBe(false);
+    }
+  });
+
+  it("滑行中任何对外的 setFollowing（点横幅 / 跳到某一项）都会取消滑行——否则会把人又滑回底部", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    stepFrame(sc, 0);
+    const before = sc.writes.length;
+    ctrl.setFollowing(false);
+    expect(pendingFrames()).toBe(0);
+    stepFrame(sc, 400);
+    expect(sc.writes.length).toBe(before);
+    expect(ctrl.isFollowing()).toBe(false);
+  });
+
+  it("离得太远（超过 3 个视口）不做滑行：直接开闸 + 贴底", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 0, height: 6000, client: 800 });
+    ctrl.setFollowing(false);
+    ctrl.scrollToBottomSmooth();
+    expect(ctrl.isFollowing()).toBe(true);
+    flushFrame();
+    expect(sc.top()).toBe(5200);
+  });
+
+  it("本来就在贴底带内 / 已经在跟随：直接开闸，不起滑行", () => {
+    const near = setupWithScroller({ top: 1180 });
+    near.ctrl.setFollowing(false);
+    near.ctrl.scrollToBottomSmooth();
+    expect(near.ctrl.isFollowing()).toBe(true);
+
+    const following = setupWithScroller({ top: 1200 });
+    following.ctrl.scrollToBottomSmooth();
+    expect(following.ctrl.isFollowing()).toBe(true);
+    expect(following.sc.writes).toEqual([]);
+  });
+
+  it("「减少动态效果」：不做滑行，直接开闸 + 贴底", () => {
+    const scrollToBottom = vi.fn();
+    const ctrl = createStreamFollowController(
+      { current: scrollToBottom },
+      () => clock,
+      () => true,
+    );
+    const sc = makeScroller({ ...GEOM, top: 800 });
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    ctrl.setFollowing(false);
+    ctrl.scrollToBottomSmooth();
+    expect(ctrl.isFollowing()).toBe(true);
+    flushFrame();
+    expect(sc.top()).toBe(1200);
+  });
+
+  it("没有滚动容器（单测 / Window 滚动）：退化成开闸 + 兜底贴底", () => {
+    const { ctrl, scrollToBottom } = setup();
+    ctrl.setFollowing(false);
+    ctrl.scrollToBottomSmooth();
+    expect(ctrl.isFollowing()).toBe(true);
+    flushFrame();
+    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+  });
+
+  it("重复点击不叠滑行：新的一次取消旧的", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    ctrl.scrollToBottomSmooth();
+    expect(pendingFrames()).toBe(1);
+    for (let i = 0; i < 20 && !ctrl.isFollowing(); i++) stepFrame(sc, 30);
+    expect(sc.top()).toBe(1200);
+  });
+
+  it("卸载（dispose）/ 换容器时取消滑行", () => {
+    const { ctrl, sc } = awayFromBottom();
+    ctrl.scrollToBottomSmooth();
+    ctrl.dispose();
+    expect(pendingFrames()).toBe(0);
+    expect(sc.writes).toEqual([]);
+  });
+});
+
+// ---------- 换容器（detach）：手势残留不带到新容器、跟随态保留 ----------
+
+describe("换 / 摘滚动容器：手势态随旧容器清掉，跟随态不动", () => {
+  const swapTo = (ctrl: ReturnType<typeof setup>["ctrl"], over: Partial<ScrollerInit> = {}) => {
+    const next: FakeScroller = makeScroller({ ...GEOM, ...over });
+    ctrl.attachScroller(next.el as unknown as HTMLElement);
+    return next;
+  };
+
+  it("拖着滚动条时容器被换掉（没收到 pointerup）：新容器上无用户输入的程序化滚动不会被当成上滚", () => {
+    const { ctrl, sc } = setupWithScroller();
+    sc.dispatch("pointerdown", { target: sc.el, offsetX: 905 }); // 开始拖滚动条
+    const next = swapTo(ctrl); // Virtuoso 重挂：旧容器上的 pointerup 永远不会来
+    expect(ctrl.isFollowing()).toBe(true);
+    next.userScrollTo(1190); // 程序化的小幅滚动（Virtuoso 补偿之类），没有任何用户输入
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("没过期的「往下翻」输入不会被新容器借去恢复跟随", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(1000); // 用户上滚离开底部
+    expect(ctrl.isFollowing()).toBe(false);
+    sc.dispatch("wheel", { deltaY: 100 }); // 刚往下翻了一下（输入还在有效期内）
+    const next = swapTo(ctrl, { top: 1100 });
+    next.userScrollTo(1160); // 新容器上程序化地「朝底部、进了贴底带」
+    expect(ctrl.isFollowing()).toBe(false); // 没有属于新容器的往下翻输入，不能恢复
+  });
+
+  it("未消费的上滚意图 / 触摸起点也不带过去", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 500 });
+    ctrl.setFollowing(true);
+    sc.dispatch("wheel", { deltaY: -40 }); // 置了上滚意图、scroll 事件还没来
+    const next = swapTo(ctrl, { top: 500 });
+    next.userScrollTo(460); // 新容器上的第一个 scroll 不该吃掉旧容器遗留的意图
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("跟随态是事件流级别的、不跟容器走：换 / 摘容器都不复位（切 task 的初始定位恢复在渲染期先写了它）", () => {
+    const { ctrl, sc } = setupWithScroller();
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(1000);
+    expect(ctrl.isFollowing()).toBe(false);
+    swapTo(ctrl);
+    expect(ctrl.isFollowing()).toBe(false);
+    ctrl.attachScroller(null);
+    expect(ctrl.isFollowing()).toBe(false);
+    // 反过来：跟随中换容器也保持跟随
+    ctrl.setFollowing(true);
+    swapTo(ctrl);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+});

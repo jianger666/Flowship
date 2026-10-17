@@ -1401,7 +1401,9 @@ export const sanitizeGroupMemberName = (raw: unknown): string => {
 };
 
 /**
- * 飞书 @ 标签：纯文本消息和 post 的 `md` 正文都认 `<at user_id="ou_xxx">名字</at>`。
+ * 群内 @ 标签的**内部统一写法**：`<at user_id="ou_xxx">名字</at>`（text / post 原生认它）。
+ * 群里文字现在发的是文本卡，卡片 markdown 要写 `<at id=ou_xxx></at>`——
+ * 由 `lark-api.toCardMarkdown` 在最后一跳转换，上游（回复协议 / 切块 / 各回执）仍只认这一种写法。
  * open_id 缺失时退化成纯文本「@名字」（至少让人看得出在叫谁）。
  */
 export const mentionTag = (openId: string, name: string): string => {

@@ -32,7 +32,7 @@ const CONNECT_TIMEOUT_MS = 15_000;
 const QUERY_TIMEOUT_MS = 60_000;
 const OUTPUT_CAP = 200_000;
 
-// ---- 只读 SQL 静态门（与 src/lib/server/sql-readonly-guard.ts 同逻辑；本脚本要单文件分发，故内联一份）----
+// ---- 只读 SQL 静态门（本脚本要单文件分发，所以逻辑内联在这里；原先在 src/lib/server 下的 TS 拷贝随只读 shell 守卫在 v1.9.33 删除）----
 // 旧实现先正则剥注释再扫关键字，`SELECT '--'; DROP TABLE t` 可绕过。现改词法扫描：按 PostgreSQL 规则
 // 识别注释（块注释可嵌套）/ 单引号串（仅 E'..' 认反斜杠转义）/ 双引号标识符 / 美元引用串并抹掉，
 // 再扫写关键字、数顶层语句数（只放单条）。这只是第一道防线；实例 readonly 时另在库侧强制只读（见 main）。
@@ -42,7 +42,6 @@ const OUTPUT_CAP = 200_000;
  * `SELECT comment FROM t` 误拒成「写」，不锚定的 `COMMENT\s+ON` 又会把 `… JOIN comment ON …`（联接条件）误拒（H4-09）；
  * 而 COMMENT 语句文法只有 `COMMENT ON …` 一种形态、且只能做语句的第一个词（两词间只有空白 / 已抹掉的注释），
  * 所以锚在「整段开头或某个 `;` 之后（中间只有空白）」不会放过真 COMMENT 语句；多条语句本来就先被 `statements > 1` 拒掉。
- * 与 src/lib/server/sql-readonly-guard.ts 的 WRITE_SQL_RE 必须保持同步。
  */
 const WRITE_RE =
   /(?:^|;)\s*COMMENT\s+ON\b|\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|CREATE|ALTER|GRANT|REVOKE|COPY|VACUUM|REINDEX|CLUSTER|REFRESH|CALL|DO|LOCK|INTO)\b/i;

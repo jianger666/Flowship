@@ -86,12 +86,6 @@ describe("悬浮条 / 推进按钮：跟着同一个判定走", () => {
     expect(page).toContain("!awaitingAskAnswer &&");
   });
 
-  it("疑似卡住在未答提问时不亮，判定同样只看 findPendingAskEvent", () => {
-    const hint = read("components", "tasks", "suspect-stuck-hint.tsx");
-    expect(hint).toContain("findPendingAskEvent(task.events)");
-    expect(hint).toContain("awaitingAsk");
-  });
-
   it("「跟 AI 说」输入条的答题提示也走同一判定", () => {
     const composer = read("components", "tasks", "task-talk-composer.tsx");
     expect(composer).toContain("findPendingAskEvent(task.events)");

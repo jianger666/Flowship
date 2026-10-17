@@ -269,6 +269,8 @@ describe("sendQueuedChatMessageNow · steer 插话路径", () => {
     runActive?: boolean;
     hasSession?: boolean;
     extraMsg?: Partial<QueuedChatMsg>;
+    /** 挂上「叫醒在睡的 wait」依赖（值 = 它报告叫醒了几个）；缺省不挂，其余用例的 order 期望不变 */
+    wakeWaits?: number;
   }) => {
     const queue = await import("@/lib/server/chat-queue");
     const tid = `t_steer_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -314,6 +316,15 @@ describe("sendQueuedChatMessageNow · steer 插话路径", () => {
       flushQueue: vi.fn(async () => {
         order.push("flushQueue");
       }),
+      ...(opts?.wakeWaits !== undefined
+        ? {
+            interruptWaits: vi.fn((id: string) => {
+              void id;
+              order.push("interruptWaits");
+              return opts.wakeWaits ?? 0;
+            }),
+          }
+        : {}),
     };
     const deps: SendNowDeps = {
       getTask: vi.fn(async () => task),
@@ -365,6 +376,36 @@ describe("sendQueuedChatMessageNow · steer 插话路径", () => {
     ]);
     expect(queue.isMessageHandedOff(tid, "cq_target")).toBe(true);
     queue.clearChatQueue(tid);
+  });
+
+  it("插话叫醒在睡的 wait：落盘之后、steer 之前（同步段内，保证先后顺序）；用叫醒的是这个 taskId", async () => {
+    const { queue, tid, order, deps, steerDeps } = await setup({ wakeWaits: 1 });
+
+    await sendQueuedChatMessageNow(tid, "cq_target", validBoot, deps);
+    await settleTail();
+
+    // 先叫醒再 steer：wait 先返回 [WAIT_INTERRUPTED]，随后 steer 的话才读得到
+    expect(order).toEqual(["flushAssistant", "persist", "interruptWaits", "steer"]);
+    expect(steerDeps.interruptWaits).toHaveBeenCalledTimes(1);
+    expect(steerDeps.interruptWaits).toHaveBeenCalledWith(tid);
+    expect(queue.isMessageHandedOff(tid, "cq_target")).toBe(true);
+    queue.clearChatQueue(tid);
+  });
+
+  it("没人在睡（叫醒 0 个）也照常 steer；不能 steer 时走打断重发、不碰 interruptWaits（stop 自己会叫醒）", async () => {
+    const idle = await setup({ wakeWaits: 0 });
+    await sendQueuedChatMessageNow(idle.tid, "cq_target", validBoot, idle.deps);
+    await settleTail();
+    expect(idle.order).toEqual(["flushAssistant", "persist", "interruptWaits", "steer"]);
+    expect(idle.queue.isMessageHandedOff(idle.tid, "cq_target")).toBe(true);
+    idle.queue.clearChatQueue(idle.tid);
+
+    const noSteer = await setup({ wakeWaits: 1, canSteer: false });
+    await sendQueuedChatMessageNow(noSteer.tid, "cq_target", validBoot, noSteer.deps);
+    await settleTail();
+    expect(noSteer.steerDeps.interruptWaits).not.toHaveBeenCalled();
+    expect(noSteer.deps.stop).toHaveBeenCalled();
+    noSteer.queue.clearChatQueue(noSteer.tid);
   });
 
   it("HTTP 不等 steer：steer 还挂着就已返回 202，operation 停在 persisted、落定后才 handedOff", async () => {

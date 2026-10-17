@@ -5,7 +5,7 @@
  * - sessionStorage：最后浏览的对话 / 输入草稿 / 看板时间范围——重启 app 即忘（符合预期、
  *   不产生陈旧状态）；Electron 单窗口、session 生命周期 = app 生命周期
  * - localStorage：输入条拖过的高度 / 侧栏分组折叠与置顶序——用户的全局偏好、跨重启保留
- * - 模块级内存 Map：事件流滚动锚点 / 输入条附件快照（图 File 对象不可序列化、也不进配额）——
+ * - 模块级内存 Map：输入条附件快照（图 File 对象不可序列化、也不进配额）——
  *   SPA 路由切换组件会卸载、但模块常驻；reload 即忘无妨
  */
 
@@ -96,7 +96,7 @@ export const saveDraft = (scope: DraftScope, taskId: string, text: string) => {
 //
 // 为什么不用 sessionStorage：图附件是 File / base64 dataUrl（单图 10MB、上限 6 张），
 // 序列化进 storage 必爆 5MB 配额；File 对象根本不可序列化。模块级内存 Map 跟
-// 滚动锚点同策略：SPA 切页组件卸载但模块常驻、回来照样在；reload 即忘（正文不受影响、
+// 模块级内存同策略：SPA 切页组件卸载但模块常驻、回来照样在；reload 即忘（正文不受影响、
 // 仍走上面的 sessionStorage）。key 按 scope + task 隔离——A 任务的图绝不串进 B。
 
 export interface SnapshotImage {
@@ -207,26 +207,8 @@ export const clearAttachmentSnapshot = (
   attachmentSnapshots.delete(attachSnapKey(scope, id));
 };
 
-// ---------- 事件流滚动锚点（离开时视口顶部的事件 id；贴底则回来照常落底） ----------
-
-interface ScrollAnchor {
-  /** 视口顶部第一条渲染 item 的事件 id */
-  anchorId: string;
-  /** 离开时是否贴底（贴底 = 回来不恢复、维持「跟随最新」默认行为） */
-  atBottom: boolean;
-}
-
-// 模块级内存：key = taskId
-const scrollAnchors = new Map<string, ScrollAnchor>();
-
-/** 记录离开任务事件流时的滚动锚点（模块内存，reload 即忘） */
-export const saveScrollAnchor = (taskId: string, anchor: ScrollAnchor) => {
-  scrollAnchors.set(taskId, anchor);
-};
-
-/** 读回滚动锚点；没记过（或贴底跟随中不恢复）由消费方判断 atBottom */
-export const getScrollAnchor = (taskId: string): ScrollAnchor | undefined =>
-  scrollAnchors.get(taskId);
+// 事件流滚动位置**不再记忆**（2026-10-17 用户拍板「切换对话后始终定位到最后一条 / 底部」）：
+// 进入对话一律落底并处于「跟随最新」，见 event-stream.tsx 的初始定位。别在这里把它加回来。
 
 // ---------- 任务已读（「待确认」已读即清、用户拍板） ----------
 //
