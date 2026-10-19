@@ -65,6 +65,7 @@ import {
 } from "@/lib/server/chat-runner";
 import { cleanupChatQueueState, failQueuedItems } from "@/lib/server/chat-queue";
 import { forgetSubagentRunsForDeletedTask } from "@/lib/server/subagent-transcript";
+import { forgetSchedulesForDeletedTask } from "@/lib/server/schedule-store";
 import { clearCorrelatedEntries } from "@/lib/server/feishu-bridge/group-outbound-registry";
 import { clearGroupQuestionQueue } from "@/lib/server/feishu-bridge/group-shared";
 import { clearTalkQueue } from "@/lib/server/task-talk-queue";
@@ -709,6 +710,9 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 子代理过程记录的内存表同清：任务书 / 过程里可能有敏感内容，已删任务不该再被
     // `GET /subagent-runs` 读到（磁盘那份随任务目录删；延迟删除分支里目录还在，读盘侧另有可用性闸）
     forgetSubagentRunsForDeletedTask(id);
+    // 定时：从调度索引摘掉（schedules.json 随任务目录删；摘了之后 tick 不会再碰这个任务，
+    // 也不会有人把目录又建出来——store 落盘前会复查目录 / 删除标记）
+    forgetSchedulesForDeletedTask(id);
 
     // quarantine 场景——先 prepared→tombstone→committed，再 HTTP 200；
     // deleting lifecycle 保持到后台物理删完；job 归零后再清 refs + deleteTask（refs 失败留 journal）。

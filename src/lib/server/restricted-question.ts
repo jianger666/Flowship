@@ -55,6 +55,7 @@ import {
   formatRecentChatSection,
   formatRosterSection,
 } from "./feishu-bridge/group-answer-context";
+import { finalizeSideRunBackgroundShells } from "./finalize-open-tools";
 import { createRunPerfTracker } from "./run-perf";
 import { summarizeRunFailure } from "./sdk-error";
 import {
@@ -585,6 +586,9 @@ export const startRestrictedGroupQuestion = (
         /* noop */
       }
       unregisterRestrictedQuestion(task.id, record);
+      // 这一轮旁路 run 起的后台 shell 在此收尾（停追踪 + 补 ended）：旁路 run 没有属主 run 的 finalize，
+      // 不收的话追踪会轮询到进程退出、「群问答」里的转圈也永远不停。fire-and-forget、内部吞错。
+      void finalizeSideRunBackgroundShells(task.id, origin, alive);
     }
   };
 

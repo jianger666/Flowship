@@ -10,9 +10,11 @@
  * 只做 UI 渲染前合并，不动 events.jsonl。
  */
 
+import { backgroundJobIdsInText } from "@/lib/background-subagents";
 import { isMcpToolName } from "@/lib/mcp-tool-name";
 import { isAbsolutePathLike } from "@/lib/path-utils";
 import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
+import { SCHEDULE_TOOL_NAME, scheduleToolSummary } from "@/lib/schedule";
 import { WAIT_TOOL_NAME, waitToolSummary } from "@/lib/wait-display";
 
 /** SSE ephemeral：不进 task.events / 不进持久 rows */
@@ -401,6 +403,13 @@ export type ToolBlock = {
   result?: ToolResultEventMeta;
   ts: number;
   actionId?: string;
+  /**
+   * 已转后台、仍在跑（tool_call 本身已「完成」）。渲染层转圈用——不是工具状态，
+   * status 仍是 success，不参与 coerceStaleRunningTools / 分组判定。两个来源：
+   *  - shell：{@link markBackgroundRunningTools} 在会话 running 时按标记事件打上；
+   *  - 子代理（task 卡）：{@link markBackgroundSubagentTools} 按服务端下发的「后台在跑清单」打上。
+   */
+  backgroundRunning?: boolean;
 };
 
 /** 连续非破坏性工具收成一行 */
@@ -594,6 +603,81 @@ export const coerceStaleRunningTools = (
       return { ...it, members };
     }
     return it;
+  });
+  return changed ? out : items;
+};
+
+/**
+ * 给「已转后台、仍在跑」的 shell 块打 backgroundRunning（图标转圈用）。
+ *
+ * 调用方只在会话 running 时传非空集合——会话停了就不该转圈（进程可能还活着，
+ * 但这一轮已经收尾，对用户来说没有「正在进行」的事）。
+ * 只认 shell 块：标记是服务端按 shell 工具结果落的，别的工具名撞 callId 也不理。
+ * 只给 `status === "success"` 的块打（与 {@link markBackgroundSubagentTools} 同口径）。
+ * 没有命中的块保持原对象（引用稳定，下游 memo 不被无谓击穿）；全无命中返回原数组。
+ */
+export const markBackgroundRunningTools = (
+  items: StreamRenderItem[],
+  runningCallIds: ReadonlySet<string>,
+): StreamRenderItem[] => {
+  if (runningCallIds.size === 0) return items;
+  let changed = false;
+  const mapBlock = (block: ToolBlock): ToolBlock => {
+    if (block.name.toLowerCase() !== "shell") return block;
+    // 与子代理卡（markBackgroundSubagentTools）同口径：只有 success（= 起后台进程的那次调用已正常返回）才可能是「后台还在跑」。
+    // running 本来就转圈；error / interrupted 的红叉 / 中断标不能被盖成转圈
+    if (block.status !== "success") return block;
+    if (!runningCallIds.has(block.callId)) return block;
+    if (block.backgroundRunning) return block;
+    changed = true;
+    return { ...block, backgroundRunning: true };
+  };
+  const out = items.map((it) => {
+    if (isToolBlock(it)) return mapBlock(it);
+    if (isToolVerbGroup(it)) {
+      let groupChanged = false;
+      const members = it.members.map((m) => {
+        const next = mapBlock(m);
+        if (next !== m) groupChanged = true;
+        return next;
+      });
+      return groupChanged ? { ...it, members } : it;
+    }
+    return it;
+  });
+  return changed ? out : items;
+};
+
+/**
+ * 给「已转后台、仍在跑」的子代理卡（task 块）打 backgroundRunning（图标转圈用）。
+ *
+ * 现象（2026-10-19 用户截图）：主 AI 用 `run_in_background` 派子代理，`subagent` 工具调用立刻返回
+ * 「已在后台启动…（后台任务 bg_xxxxxxxx）」→ 这张卡 status=success、亮绿勾，可子代理其实还在干活
+ * （聊天框上方的条还写着「在后台工作」）；用户插话把前台子代理转后台时同理。
+ *
+ * 判定：卡片结果文本里带的后台任务 id 在 `runningJobIds`（服务端实时下发的后台在跑清单）里。
+ *  - 不靠 callId：清单里没有 callId；也不靠「会话是否 running」——后台子代理常常在主 AI 说完之后才跑完，
+ *    清单本身就是权威（跑完 / 取消 / 超时 / 应用重启都会从清单里消失，卡片随之回到完成态）；
+ *  - 只认 task 块：只有 `subagent` 会写这种 id；别的工具名碰巧输出里带 `bg_xxxxxxxx` 也不理；
+ *  - 只处理 success 的块（running 本来就转圈；error / interrupted 的标不能被盖掉）；
+ *    没有命中的块保持原对象，全无命中返回原数组。
+ */
+export const markBackgroundSubagentTools = (
+  items: StreamRenderItem[],
+  runningJobIds: ReadonlySet<string>,
+): StreamRenderItem[] => {
+  if (runningJobIds.size === 0) return items;
+  let changed = false;
+  const out = items.map((it) => {
+    if (!isToolBlock(it)) return it;
+    if (it.name.toLowerCase() !== "task") return it;
+    // 只有 success（= 派出去的那次调用已正常返回）才可能是「后台还在跑」：running 本来就转圈，
+    // error / interrupted 的红叉 / 中断标不能被盖掉
+    if (it.status !== "success" || it.backgroundRunning) return it;
+    const ids = backgroundJobIdsInText(it.result?.output);
+    if (!ids.some((id) => runningJobIds.has(id))) return it;
+    changed = true;
+    return { ...it, backgroundRunning: true };
   });
   return changed ? out : items;
 };
@@ -867,6 +951,12 @@ export const toolBlockSummary = (block: ToolBlock): string => {
   if (n === WAIT_TOOL_NAME) {
     const waitSummary = waitToolSummary(block.args);
     if (waitSummary) return waitSummary;
+  }
+
+  // schedule：创建 · 30 分钟后 · 看 CI（解析不了入参时回落到通用逻辑）
+  if (n === SCHEDULE_TOOL_NAME) {
+    const scheduleSummary = scheduleToolSummary(block.args);
+    if (scheduleSummary) return scheduleSummary;
   }
 
   // edit / write：路径 + 行统计

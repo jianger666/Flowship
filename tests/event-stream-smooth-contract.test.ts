@@ -120,8 +120,8 @@ describe("折叠体全部走 <Collapse>（不再 `{!collapsed && <body/>}` 硬�
     expect(rows).not.toMatch(/\{open && \(\s*<div/);
   });
 
-  it("工具块家族：子代理卡 / 普通块 / 待办清单 / 动词组 + 普通块里的 diff 与输出子折叠", () => {
-    expect(count(toolBlock, "<Collapse open={!collapsed}>")).toBe(4);
+  it("工具块家族：普通块 / 待办清单 / 动词组 + 普通块里的 diff 与输出子折叠（子代理卡已无内联展开，整条点击开抽屉）", () => {
+    expect(count(toolBlock, "<Collapse open={!collapsed}>")).toBe(3);
     expect(toolBlock).toContain("<Collapse open={!diffCollapsed}>");
     expect(toolBlock).toContain('<Collapse open={block.status === "running" || outputOpen}>');
     // 折叠体不许再有硬切（标题行里「展开时露出路径」那条是 header 内容、不带 <div 体）

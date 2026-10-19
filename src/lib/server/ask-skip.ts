@@ -103,6 +103,12 @@ const NOOP_HANDLE: AskSkipHandle = {
 };
 
 /**
+ * 惰性句柄的公开引用：不是「用户说话」的注入（定时触发等系统消息）不得顶掉用户还没答的提问，
+ * 调用方用它代替 `beginAskSkip(...)`，其余流程（hint / commit / rollback）照常调用、全是空操作。
+ */
+export const INERT_ASK_SKIP: AskSkipHandle = NOOP_HANDLE;
+
+/**
  * 同一轮 ask-wait curl 还挂着时，把「跳过 + 用户新消息」写成 stdout 答案。
  * 模型在等 `[ASK_USER_REPLY]`，不走 send，避免「上一轮尚未结束」。
  */

@@ -163,13 +163,24 @@ const parseCodeRefCaption = (
   return { path, line, display: `${pathDisplayLabel(path)}${suffix}` };
 };
 
+/**
+ * 不加载图片的占位（只显示 alt 文字）。用于**不可信来源**的 markdown（别家机器人发的群消息）：
+ * 图片一渲染浏览器就会向 src 发请求，发消息的人能借此知道你什么时候打开、从哪个 IP 打开（追踪像素）。
+ * 管线里 `harden` 对图片是全放行的（allowedImagePrefixes ["*"]、允许 data:），所以只能在组件层拦；
+ * markdown 的 `![](url)` 和原始 HTML 的 `<img>` 最后都是 hast 的 img 元素、都走这个槽。
+ */
+export const BlockedMarkdownImage = ({ alt }: { alt?: string }) => (
+  <span className="text-muted-foreground">[图片{alt ? `：${alt}` : ""}]</span>
+);
+
 const buildMarkdownComponents = (
   linker: LocalFilePathLinker,
   size: MarkdownTextSize,
+  blockImages: boolean,
 ): Components =>
   ({
     a: MarkdownLink,
-    img: MarkdownImage,
+    img: blockImages ? BlockedMarkdownImage : MarkdownImage,
     // Streamdown 的 inline code 槽（覆盖 code 会连 fenced 一起接管、失去 Shiki）
     inlineCode: ({
       children,
@@ -241,6 +252,11 @@ interface MarkdownTextProps {
    *   流式占位与定稿必须同档，否则流式结束换成正式行时整段文字会跳一下
    */
   size?: MarkdownTextSize;
+  /**
+   * 不加载图片（只显示「[图片：alt]」）。不可信来源的 markdown 用——别家机器人的群消息等：
+   * 远程图片一渲染就会发请求（追踪像素）。AI 自己的回复 / 产物不传。
+   */
+  blockImages?: boolean;
   /** 外层 prose 容器额外 class */
   className?: string;
   /** 栏内搜索：事件 / 产物 ownerId（与 PaneSearchHighlightContext 或显式 props 配合） */
@@ -259,6 +275,7 @@ const MarkdownTextImpl = ({
   baseDir,
   variant = "chat",
   size = "default",
+  blockImages = false,
   className,
   searchOwnerId,
   searchField = "body",
@@ -268,8 +285,8 @@ const MarkdownTextImpl = ({
 }: MarkdownTextProps) => {
   const linker = useLocalFilePathLinker(baseDir);
   const components = useMemo(
-    () => buildMarkdownComponents(linker, size),
-    [linker, size],
+    () => buildMarkdownComponents(linker, size, blockImages),
+    [linker, size, blockImages],
   );
   // Application Support 等路径带空格：裸 markdown 图 destination 会被截断，包 <> 后再解析
   const displayText = useMemo(

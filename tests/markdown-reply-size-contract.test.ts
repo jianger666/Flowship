@@ -74,7 +74,8 @@ describe("AI 回复：chat 宽列 15px、task(log) 右栏 14px，次要面不放
     // 2026-10-17：流式项并进 EventRow（`streaming` prop），原来「流式两处 + 定稿一处」合成一处——
     // 流式 / 定稿共用同一个标签，字号不可能再不一致（不一致 = 流式结束时整段文字跳一下）。
     // 新增的要想清楚属于哪一档
-    expect(tags, "rows.tsx 里的 MarkdownText 调用数变了——新增的要想清楚属于哪一档").toHaveLength(2);
+    // 2026-10-19：+1 = 飞书群里机器人发来的 user_reply（text={displayText}，用户气泡里的 markdown，14px）
+    expect(tags, "rows.tsx 里的 MarkdownText 调用数变了——新增的要想清楚属于哪一档").toHaveLength(3);
 
     // AI 回复正文（text={ev.text}）：流式 / 定稿同一个标签、同一个 size 判定：
     // chat = reply、log = default（右栏窄）
@@ -82,6 +83,11 @@ describe("AI 回复：chat 宽列 15px、task(log) 右栏 14px，次要面不放
     expect(body).toHaveLength(1);
     expect(body[0]).toMatch(/size=\{isLog \? "default" : "reply"\}/);
     expect(body[0]).toMatch(/\bstreaming=\{streaming\}/);
+    // 机器人群消息（text={displayText}）：在 14px 的用户气泡里，保持默认档（不传 size）
+    const botReply = tags.filter((t) => t.includes("text={displayText}"));
+    expect(botReply).toHaveLength(1);
+    expect(botReply[0]).not.toMatch(/\bsize=/);
+    expect(botReply[0]).not.toMatch(/\bstreaming=/);
     // 答题回执（text={replyEvent.text}）是用户答的话、保持默认档
     const askReply = tags.filter((t) => t.includes("text={replyEvent.text}"));
     expect(askReply).toHaveLength(1);
@@ -97,12 +103,14 @@ describe("AI 回复：chat 宽列 15px、task(log) 右栏 14px，次要面不放
     expect(rows).toContain("isLog ? MARKDOWN_LOG_REPLY_TEXT : MARKDOWN_REPLY_TEXT");
   });
 
-  it("其它 MarkdownText 调用方（问答卡 / 群问答 / 工具产出）不传 reply：它们是次要面、保持 14px / 12px", () => {
+  it("其它 MarkdownText 调用方（问答卡 / 群问答 / 子代理详情抽屉的产出·回复）不传 reply：它们是次要面、保持 14px / 12px", () => {
     for (const rel of [
       "src/components/tasks/ask-user-inline.tsx",
       // 群问答的 MarkdownText 在拆出来的单轮卡片里（面板本身不再直接渲染 markdown）
       "src/components/tasks/group-qa-round-card.tsx",
-      "src/components/tasks/event-stream/tool-block.tsx",
+      // 子代理的产出 / 回复原来在事件流卡片的展开区里（tool-block.tsx），2026-10-18 卡片改成整条点击开抽屉、
+      // 展开区没了，markdown 只剩抽屉里这两处
+      "src/components/tasks/subagent-detail.tsx",
     ]) {
       const tags = markdownTags(read(rel));
       expect(tags.length, `${rel} 应该有 MarkdownText 调用`).toBeGreaterThan(0);
@@ -124,8 +132,11 @@ describe("代码块文字 14px：pre / code 继承容器字号", () => {
     );
   });
 
-  it("12px 档容器（工具块产出）把 --prose-code-size 降到 0.75rem，代码块不比周围正文还大", () => {
-    const tool = read("src/components/tasks/event-stream/tool-block.tsx");
-    expect(tool).toContain("[--prose-code-size:0.75rem]");
+  it("12px 档容器（子代理详情抽屉的产出 / 回复）把 --prose-code-size 降到 0.75rem，代码块不比周围正文还大", () => {
+    const detail = read("src/components/tasks/subagent-detail.tsx");
+    // 产出白卡 + 回复行两处 12px 容器，都要降
+    expect(detail.match(/\[--prose-code-size:0\.75rem\]/g)).toHaveLength(2);
+    // 工具块里已经没有 markdown 渲染（子代理卡不再内联展开产出）：别在这里悄悄加回去又忘了降档
+    expect(markdownTags(read("src/components/tasks/event-stream/tool-block.tsx"))).toHaveLength(0);
   });
 });

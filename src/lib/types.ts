@@ -1732,6 +1732,15 @@ export type TaskSummary = Omit<Task, "events" | "actions" | "pendingAskId"> & {
    * 老任务无该字段 = undefined → 当无 ask。
    */
   hasPendingAsk?: boolean;
+  /**
+   * 此刻在后台跑的子代理数（纯内存读数、不落盘；只有 `GET /api/tasks` 列表接口会带，且 > 0 才带）。
+   *
+   * 主 AI 说完一轮后 `runStatus` 回 awaiting_user / idle，但后台子代理可能还在干活——
+   * 侧栏 / 会话管理页只看 runStatus 会画成「空闲」（与事件流里「子代理卡片打勾但其实还在跑」
+   * 同一类问题）。列表据此补一个「后台还在跑」的转圈。
+   * 缺省 / 0 = 没有（含服务端重启后：会话没了、子代理随之取消）。
+   */
+  backgroundSubagentCount?: number;
 };
 
 // ---- MCP 连通性健康（V0.6.11） ----

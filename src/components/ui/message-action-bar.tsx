@@ -53,7 +53,9 @@ export const MessageActionBar = ({
   return (
     <div
       className={cn(
-        "absolute -top-3 right-2 z-10 flex items-center overflow-hidden rounded-md border bg-background shadow-sm",
+        // w-max：absolute 元素默认宽度被宿主（消息气泡）的可用宽度卡住，气泡很短时按钮会被挤窄、
+        // 文字逐字竖排；固定成内容宽度，让它向左伸出气泡（right-2 锚定右侧）
+        "absolute -top-3 right-2 z-10 flex w-max items-center overflow-hidden rounded-md border bg-background shadow-sm",
         // 平时透明、hover 或键盘聚焦时显形（tab 到按钮上也要看得见）
         "opacity-0 transition-opacity group-hover/msgbar:opacity-100 focus-within:opacity-100",
         className,
@@ -61,14 +63,15 @@ export const MessageActionBar = ({
     >
       {items.map((action, idx) => (
         <Tooltip key={action.key} content={action.label}>
-          <span className="inline-flex">
+          <span className="inline-flex shrink-0">
             <button
               type="button"
               onClick={action.onClick}
               disabled={action.disabled || action.busy}
               aria-label={action.label}
               className={cn(
-                "flex cursor-pointer items-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground",
+                // whitespace-nowrap + 图标 shrink-0：任何宽度下文字都不换行、图标不被压成小点
+                "flex shrink-0 cursor-pointer items-center gap-1 whitespace-nowrap px-2 py-1.5 text-[11px] text-muted-foreground [&_svg]:shrink-0",
                 "hover:bg-muted hover:text-foreground",
                 "disabled:cursor-not-allowed disabled:opacity-50",
                 idx > 0 && "border-l",

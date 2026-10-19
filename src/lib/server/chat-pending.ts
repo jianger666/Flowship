@@ -695,6 +695,10 @@ export type AgentMessage = {
   attachmentPaths?: string[];
   // user_message：当前有产出在等审阅时的上下文（服务端附加、要求处理完重新交卷）
   ackContext?: { actionId: string; artifactPath?: string };
+  // user_message：这条是**定时到点**由系统发的（`[SCHEDULE_FIRED …]`），不是用户在任务页说的话。
+  // 保留 [USER_MESSAGE] 抬头（协议信号 / 通道不变），但脚注不能再说「这是用户的插话、先判断纯疑问还是修改要求」——
+  // 那会和 _super.md 里「不要走疑问 / 修改二分类、也不要当成用户在改需求」自相矛盾
+  scheduled?: boolean;
   // next_action 的元数据（拼 [NEXT_ACTION ...] 头）
   nextActionId?: string;
   nextActionType?: ActionType;
@@ -770,7 +774,11 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
       ...attachmentSections(msg),
       "",
     ];
-    if (msg.ackContext) {
+    if (msg.scheduled) {
+      lines.push(
+        "（这是系统按你之前设的定时自动触发的消息、**不是用户的插话**：不要走「纯疑问 / 修改要求」的二分类、也不要当成用户在改需求。按上面你自己留的话做；不要调 submit_work / submit_mr 推进任务链——进度停在原地。处理完自然结束本轮回复。）",
+      );
+    } else if (msg.ackContext) {
       // 「〈产出审阅中〉」字面量必须保留——_super.md 教 agent 的判卷闸门就是这个词
       //（审计揪过：文案与 prompt 字面对不上、agent 可能漏交卷）
       lines.push(

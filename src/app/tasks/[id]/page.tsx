@@ -58,6 +58,7 @@ import { TaskChangesPanel } from "@/components/tasks/task-changes-panel";
 import { TaskUtilityActions } from "@/components/tasks/task-utility-actions";
 import { TalkQueueBanner } from "@/components/tasks/talk-queue-banner";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
+import { ScheduleChip } from "@/components/tasks/schedule-chip";
 import type { TalkQueueItem } from "@/lib/talk-queue";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
@@ -1246,6 +1247,8 @@ const TaskDetailPage = () => {
               {groupQaVisible ? null : (
                 <>
                 <TalkQueueBanner taskId={task.id} talkQueue={talkQueue} />
+                {/* 会话里已设的定时（AI 给自己设的「到点叫我」）；没有时整条收起。chat 的同一条在 EventStream 里 */}
+                <ScheduleChip taskId={task.id} events={task.events} inset />
                 <TaskTalkComposer
                   task={task}
                   onTaskUpdate={absorbTask}

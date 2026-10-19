@@ -5,7 +5,7 @@
  *
  * 视觉：图标 + 名称 + 摘要一行；展开区缩进 + 左边线；token 用 muted/border。
  * Chat 打磨：shell 默认折叠、摘要绝不 dump args JSON；运行中直播输出、完成后收起。
- * task 工具：专属「子代理」卡片（Bot 图标 + 任务书 / 产出分区）。
+ * task 工具：专属「子代理」任务条（Bot 图标 + 标题；整条点击开详情抽屉，不内联展开）。
  */
 
 import { memo, useMemo, useState, type CSSProperties } from "react";
@@ -17,13 +17,11 @@ import {
   FileCode2,
   ListTodo,
   Loader2,
-  PanelRightOpen,
   Terminal,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { MarkdownText } from "@/components/markdown-text";
 import {
   CopyableBlock,
   type CopyTextSource,
@@ -264,7 +262,9 @@ const ToolBlockIcon = ({
 }: {
   block: ToolBlock;
 }) => {
-  if (block.status === "running") {
+  // backgroundRunning：shell 超时 / 被要求后台跑，tool_call 虽已「完成」进程还在跑（常见于
+  // AI 随后调 wait 等它）——不能亮绿色终端图标说「跑完了」，继续转圈直到进程退出或本轮收尾。
+  if (block.status === "running" || block.backgroundRunning) {
     return <Loader2 className="size-3.5 shrink-0 animate-spin text-info" />;
   }
   // run 终结未收到完成帧 / 渲染层 coerce：中性灰、不转圈
@@ -294,9 +294,6 @@ const formatDuration = (ms?: number): string | null => {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
 };
-
-/** 任务书截断阈值（展开区「显示更多」） */
-const TASK_PROMPT_PREVIEW_CHARS = 400;
 
 interface ToolBlockRowProps {
   block: ToolBlock;
@@ -432,79 +429,96 @@ const ExpandedEmptyPlaceholder = ({
 
 /**
  * name=task 子代理专属迷你卡。
- * 与普通工具行拉开层次：左侧紫轨 + 浅紫渐变底 + 圆角边框；
- * 完成态产出走 MarkdownText（running 仍用 pre，避免流式 markdown 闪烁）。
+ * 与普通工具行拉开层次：左侧紫轨 + 浅紫渐变底 + 圆角边框。
+ *
+ * 只有一行「任务条」、没有内联展开区：整条是一个按钮，点一下开右侧详情抽屉
+ * （任务书全文 + 子代理自己的工作过程 + 产出，见 `subagent-detail.tsx`）。
+ * 用户 2026-10-18：「点击整个子代理的任务条就是打开抽屉，后面的详情按钮可以去掉，
+ * 抽屉里的功能已经覆盖了展开的功能」——所以不再有折叠 / 展开、任务书 / 产出预览、「详情」按钮。
  */
 const TaskSubagentBlock = ({
   block,
-  taskId,
   liveOutput,
   nested,
 }: ToolBlockRowProps) => {
-  // 默认折叠（与 toolBlockDefaultCollapsed 一致）
-  const [collapsed, setCollapsed] = useState(() =>
-    toolBlockDefaultCollapsed(block.name, nested),
-  );
-  // 打开详情抽屉（宿主在 EventStream 层）；不在宿主里（单独复用卡片 / 单测）为 null → 不画入口
+  // 打开详情抽屉（宿主在 EventStream 层）；不在宿主里（单独复用卡片 / 单测）为 null → 退成不可点的展示行
   const openDetail = useOpenSubagentDetail();
-  // 任务书超长：点「显示更多」内联展开全文
-  const [promptExpanded, setPromptExpanded] = useState(false);
-  // 产出区第二层折叠（完成态）
-  const [outputOpen, setOutputOpen] = useState(false);
-  // 截断输出就地加载后的全文
-  const [fullText, setFullText] = useState<string | null>(null);
-  // 「加载完整输出」请求中
-  const [fullLoading, setFullLoading] = useState(false);
 
   const taskArgs = useMemo(
     () => parseTaskToolArgs(block.args),
     [block.args],
   );
   const title = taskArgs?.description?.trim() || "子代理任务";
-  const prompt = taskArgs?.prompt ?? "";
-  const promptLong = prompt.length > TASK_PROMPT_PREVIEW_CHARS;
-  const promptShown =
-    promptExpanded || !promptLong
-      ? prompt
-      : `${prompt.slice(0, TASK_PROMPT_PREVIEW_CHARS)}…`;
 
-  const displayOutput =
-    block.status === "running" && liveOutput
-      ? liveOutput
-      : block.result?.output;
-
-  const outputBody = fullText ?? displayOutput;
-  const markdownBaseDir = useTaskBaseDir(
-    taskId,
-    !!outputBody && block.status !== "running",
-    block.actionId,
-  );
-  // 复制产出：截断时现拉全量（不是复制滚动框里可见的那截）
-  const outputCopySource = buildOutputCopySource(
-    taskId,
-    block,
-    fullText,
-    displayOutput,
-    setFullText,
-  );
-
+  // 运行中：条上露出最新一行输出，不用开抽屉也能看到它还在动
   const liveTail =
-    collapsed &&
-    block.status === "running" &&
-    liveOutput
+    block.status === "running" && liveOutput
       ? liveOutput.trim().split("\n").filter(Boolean).slice(-1)[0]
       : null;
 
-  const statusIcon =
-    block.status === "running" ? (
-      <Loader2 className="size-3.5 shrink-0 animate-spin text-info" />
-    ) : block.status === "interrupted" ? (
-      <CircleSlash className="size-3.5 shrink-0 text-muted-foreground" />
-    ) : block.status === "error" ? (
-      <X className="size-3.5 shrink-0 text-destructive" />
-    ) : (
-      <Check className="size-3.5 shrink-0 text-success" />
-    );
+  // 后台子代理：派出去的那次工具调用早就「完成」了（status=success），但子代理还在干活——
+  // 与 running 同样转圈，别亮绿勾（backgroundRunning 由事件流按「后台在跑清单」打上）
+  const stillWorking =
+    block.status === "running" || block.backgroundRunning === true;
+  const statusIcon = stillWorking ? (
+    <Loader2 className="size-3.5 shrink-0 animate-spin text-info" aria-hidden />
+  ) : block.status === "interrupted" ? (
+    <CircleSlash className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+  ) : block.status === "error" ? (
+    <X className="size-3.5 shrink-0 text-destructive" aria-hidden />
+  ) : (
+    <Check className="size-3.5 shrink-0 text-success" aria-hidden />
+  );
+  // 图标读屏读不到：给读屏补一句状态文字。后台运行中条上本来就有可见的「后台运行中」，不重复
+  const statusSrText = block.backgroundRunning
+    ? null
+    : block.status === "running"
+      ? "运行中"
+      : block.status === "interrupted"
+        ? "已中断"
+        : block.status === "error"
+          ? "失败"
+          : "已完成";
+
+  const barClass =
+    "flex w-full min-w-0 items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground";
+  const barContent = (
+    <>
+      <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-subagent/15">
+        <Bot className="size-3.5 text-subagent" />
+      </span>
+      <span className="shrink-0 rounded-sm bg-subagent/15 px-1.5 py-px text-[11px] font-semibold tracking-wide text-subagent">
+        子代理
+      </span>
+      <span className="min-w-0 shrink truncate text-[11px] font-medium text-foreground">
+        {title}
+      </span>
+      {/* 模型徽标：args.model 有值才显示；历史缺 model 不硬造。
+          effort 同理。徽标显示的是模型传的入参：pi 的 task 校验不过会整个调用报错
+          （卡片是错误态、没起子会话），所以非错误态卡片上的徽标 = 实际生效值 */}
+      {taskArgs?.model && (
+        <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-subagent">
+          {taskArgs.model}
+        </span>
+      )}
+      {taskArgs?.effort && (
+        <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-muted-foreground">
+          {taskArgs.effort}
+        </span>
+      )}
+      {statusIcon}
+      {statusSrText ? <span className="sr-only">{statusSrText}</span> : null}
+      {liveTail ? (
+        <span className="min-w-0 flex-1 truncate text-[11px]">{liveTail}</span>
+      ) : block.backgroundRunning ? (
+        // 后台运行中没有直播输出可露，写明「还在跑」，否则只有一个小圈、看不出为什么 success 的卡还在转
+        <span className="shrink-0 text-[11px]">后台运行中</span>
+      ) : null}
+      <span className="ml-auto shrink-0 text-[11px] tabular-nums opacity-0 transition-opacity group-hover/tool:opacity-100 group-focus-within/tool:opacity-100">
+        {formatTs(block.ts)}
+      </span>
+    </>
+  );
 
   return (
     <div
@@ -517,152 +531,27 @@ const TaskSubagentBlock = ({
       )}
     >
       <div className="border-l-[3px] border-l-subagent/60">
-        {/* 头部 = 折叠开关 + 右侧「详情」入口并排（不能把详情按钮嵌进折叠按钮里：button 套 button 不合法） */}
-        <div className="flex min-w-0 items-stretch">
-        <button
-          type="button"
-          onClick={() => setCollapsed((c) => !c)}
-          aria-expanded={!collapsed}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-subagent/[0.08] hover:text-foreground"
-        >
-          <CollapseChevron open={!collapsed} />
-          <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-subagent/15">
-            <Bot className="size-3.5 text-subagent" />
-          </span>
-          <span className="shrink-0 rounded-sm bg-subagent/15 px-1.5 py-px text-[11px] font-semibold tracking-wide text-subagent">
-            子代理
-          </span>
-          <span className="min-w-0 shrink truncate text-[11px] font-medium text-foreground">
-            {title}
-          </span>
-          {/* 模型徽标：args.model 有值才显示；历史缺 model 不硬造。
-              effort 同理。徽标显示的是模型传的入参：pi 的 task 校验不过会整个调用报错
-              （卡片是错误态、没起子会话），所以非错误态卡片上的徽标 = 实际生效值 */}
-          {taskArgs?.model && (
-            <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-subagent">
-              {taskArgs.model}
-            </span>
-          )}
-          {taskArgs?.effort && (
-            <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-muted-foreground">
-              {taskArgs.effort}
-            </span>
-          )}
-          {statusIcon}
-          {collapsed && liveTail && (
-            <span className="min-w-0 flex-1 truncate text-[11px]">
-              {liveTail}
-            </span>
-          )}
-          <span className="ml-auto shrink-0 text-[11px] tabular-nums opacity-0 transition-opacity group-hover/tool:opacity-100 group-focus-within/tool:opacity-100">
-            {formatTs(block.ts)}
-          </span>
-        </button>
         {openDetail ? (
-          // 详情：右侧抽屉里看给子代理的完整任务书 + 它自己的工作过程（thinking / 工具调用 / 回复）。
-          // 卡片里的任务书只是被截断的预览、产出只是最后一段文字，过程根本没在这里
-          <Tooltip content="查看给子代理的任务书和它的工作过程">
-            <button
-              type="button"
-              onClick={() => openDetail(subagentTargetFromToolBlock(block))}
-              aria-label="查看子代理详情"
-              className="flex shrink-0 cursor-pointer items-center gap-1 px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-subagent/[0.08] hover:text-foreground"
-            >
-              <PanelRightOpen className="size-3.5" aria-hidden />
-              详情
-            </button>
-          </Tooltip>
-        ) : null}
-        </div>
-
-        <Collapse open={!collapsed}>
-          <div className="space-y-2.5 px-3 pb-3 pt-0.5">
-            {/* 任务书 */}
-            <div className="space-y-1">
-              <div className="text-[11px] font-medium tracking-wide text-subagent">
-                任务书
-              </div>
-              {prompt ? (
-                <div className="space-y-1">
-                  {/* 复制的是完整任务书、不是「显示更多」之前的那截 */}
-                  <CopyableBlock text={prompt} label="复制任务书">
-                    <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-subagent/15 bg-background/70 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground dark:bg-background/40">
-                      {promptShown}
-                    </pre>
-                  </CopyableBlock>
-                  {promptLong && (
-                    <button
-                      type="button"
-                      onClick={() => setPromptExpanded((v) => !v)}
-                      className="cursor-pointer text-[11px] text-subagent hover:underline"
-                    >
-                      {promptExpanded ? "收起" : "显示更多"}
-                    </button>
-                  )}
-                </div>
-              ) : (
-                <div className="text-[11px] text-muted-foreground">无任务书</div>
-              )}
-            </div>
-
-            {/* 产出：完成态 markdown；running 用 pre 防流式闪烁 */}
-            <div className="space-y-1">
-              <div className="text-[11px] font-medium tracking-wide text-subagent">
-                产出
-              </div>
-              {block.status === "running" && !displayOutput ? (
-                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                  <Loader2 className="size-3 shrink-0 animate-spin text-info" />
-                  <span>运行中…</span>
-                </div>
-              ) : displayOutput ? (
-                <div>
-                  {block.status !== "running" && (
-                    <button
-                      type="button"
-                      onClick={() => setOutputOpen((o) => !o)}
-                      className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
-                    >
-                      <CollapseChevron open={outputOpen} />
-                      输出
-                    </button>
-                  )}
-                  {(block.status === "running" || outputOpen) && (
-                    <CopyableBlock
-                      text={outputCopySource}
-                      label="复制产出"
-                      className="mt-1"
-                    >
-                      <div className="max-h-64 overflow-y-auto rounded-md border border-subagent/15 bg-background/80 p-2 dark:bg-background/40">
-                        {block.status === "running" ? (
-                          <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
-                            {outputBody}
-                          </pre>
-                        ) : (
-                          // --prose-code-size：这个容器是 12px 档，代码块跟着降一档（默认 14px 会比周围正文还大）
-                          <div className="text-xs leading-relaxed text-foreground [--prose-code-size:0.75rem] [&_.prose]:text-xs">
-                            <MarkdownText text={outputBody ?? ""} baseDir={markdownBaseDir} />
-                          </div>
-                        )}
-                      </div>
-                    </CopyableBlock>
-                  )}
-                  <LoadFullOutputButton
-                    block={block}
-                    taskId={taskId}
-                    fullText={fullText}
-                    fullLoading={fullLoading}
-                    onLoaded={setFullText}
-                    onLoadingChange={setFullLoading}
-                    onEnsureOpen={() => setOutputOpen(true)}
-                  />
-                </div>
-              ) : (
-                <ExpandedEmptyPlaceholder status={block.status} />
-              )}
-            </div>
-          </div>
-        </Collapse>
+          <button
+            type="button"
+            // 抽屉开着时点这条 = 换内容 / 保持打开，不算「点了抽屉外面」（见 keepsSubagentDrawerOpen）
+            data-subagent-opener=""
+            onClick={() => openDetail(subagentTargetFromToolBlock(block))}
+            aria-haspopup="dialog"
+            // 不再写 aria-label：它会整条覆盖按钮的可访问名称，条上的状态（转圈 / 对勾 / 后台运行中 / 模型徽标）读屏就拿不到了。
+            // 名称让它从内容算（「子代理 · 标题 · 状态…」）
+            className={cn(
+              barClass,
+              "cursor-pointer transition-colors hover:bg-subagent/[0.08] hover:text-foreground",
+              // 外层 overflow-hidden 会把浏览器默认 outline 裁掉、键盘焦点就看不见了：用向内的 ring（不会被裁）
+              "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+            )}
+          >
+            {barContent}
+          </button>
+        ) : (
+          <div className={barClass}>{barContent}</div>
+        )}
       </div>
     </div>
   );
@@ -718,6 +607,7 @@ const RegularToolBlockRow = ({
   const statusBits: string[] = [];
   if (block.status === "error") statusBits.push("✗");
   if (block.status === "interrupted") statusBits.push("已中断");
+  if (block.backgroundRunning) statusBits.push("后台运行中");
   if (block.result?.exitCode != null && block.result.exitCode !== 0) {
     statusBits.push(`exit ${block.result.exitCode}`);
   }

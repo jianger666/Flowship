@@ -36,6 +36,7 @@ import {
   writeOwnedEventAndPublish,
 } from "./task-stream";
 import { noteSubagentToolCall } from "./subagent-transcript";
+import { trackBackgroundShell } from "./shell-background-tracker";
 import { buildToolResultMeta } from "./tool-result-persist";
 
 /**
@@ -338,6 +339,7 @@ const emitToolResult = async (
       await appendEvent(taskId, event, stillCurrent);
     } else {
       await writeOwnedEventAndPublish(taskId, stillCurrent, event, origin);
+      maybeTrackBackgroundShell(taskId, msg, meta, stillCurrent, origin);
     }
   } catch (err) {
     console.warn(
@@ -345,6 +347,33 @@ const emitToolResult = async (
       err,
     );
   }
+};
+
+/**
+ * shell 成功返回后异步查一次：它是不是「超时 / 被要求后台跑、tool_call 已结束但进程还在跑」。
+ * SDK 在这种情况下照样回 success + exit 0（公开结果里没有后台信号），事件流只能靠这里补一个标记，
+ * 让 shell 块继续转圈而不是亮「已完成」。fire-and-forget、永不抛错；muted（提问等答案的 curl）不追踪。
+ */
+const maybeTrackBackgroundShell = (
+  taskId: string,
+  msg: Extract<SDKMessage, { type: "tool_call" }>,
+  meta: { status: string; exitCode?: number; executionTime?: number },
+  stillCurrent: () => boolean,
+  origin?: string,
+): void => {
+  if (msg.name !== "shell" || meta.status !== "success") return;
+  if (meta.exitCode !== undefined && meta.exitCode !== 0) return;
+  const args = (msg.args ?? {}) as Record<string, unknown>;
+  const command = typeof args.command === "string" ? args.command : "";
+  if (!command) return;
+  void trackBackgroundShell({
+    taskId,
+    callId: msg.call_id,
+    command,
+    startedAtMs: Date.now() - (meta.executionTime ?? 0),
+    lease: stillCurrent,
+    origin,
+  });
 };
 
 // ----------------- assistant_delta 合帧（perf：SSE 帧率收敛） -----------------

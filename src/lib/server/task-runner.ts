@@ -208,6 +208,8 @@ import {
   type RunningCheck,
   type TaskOpHandle,
 } from "./task-stream";
+import { buildScheduleInfoMeta, SCHEDULE_ONE_SHOT_BOUNDARY_LINES } from "@/lib/schedule";
+import { cancelAllSchedulesForTask } from "./schedule-store";
 import {
   beginChatLifecycle,
   endChatLifecycle,
@@ -1944,6 +1946,14 @@ export const finalizeTask = async (
   try {
     // V12：取消一切在途启动意图（与 stop/DELETE 同协议）
     revokeTaskOps(taskId);
+    // 终结 = 这个任务不再「活着」：定时一起取消。不取消的话，周期定时会在合入 / 放弃之后继续按周期触发
+    // （每次都落一条「任务已合入」之类的错误事件）。reopen 之后定时也不会回来（和归档同口径）
+    await cancelSchedulesWithNotice(
+      taskId,
+      finalStatus === "merged" ? "任务已合入" : "任务已放弃",
+      "cancelled",
+      (n) => `任务已${finalStatus === "merged" ? "合入" : "放弃"}，${n} 个定时一并取消`,
+    );
     // V0.11：不再向 agent 发终态信号——finalize 语义就是「关掉这个 task」：
     // 有活 run 直接 cancel、跨 run 会话一并关掉（cancelTaskRun 内部处理）
     const hadLive = cancelTaskRun(taskId);
@@ -2153,6 +2163,32 @@ export const finalizeTask = async (
 };
 
 /**
+ * 会话归档 / 任务终结：把它名下还活着的定时全部取消，并在事件流里留一句提示。
+ * best-effort——失败只告警、不挡调用方主流程（定时是辅助能力；漏取消的会在投递时被
+ * 「已归档 / 已终结」的永久失败判定兜住，见 schedule-service.deliverScheduleFire）。
+ */
+const cancelSchedulesWithNotice = async (
+  taskId: string,
+  note: string,
+  phase: "archived" | "cancelled",
+  noticeText: (cancelled: number) => string,
+): Promise<void> => {
+  try {
+    const cancelled = await cancelAllSchedulesForTask(taskId, note);
+    if (cancelled > 0) {
+      // eslint-disable-next-line no-restricted-syntax -- 豁免：归档 / 终结是用户直接操作，非 owner 语境、无 lease 可带；事件只是「定时已取消」的提示
+      await writeEventAndPublish(taskId, {
+        kind: "info",
+        text: noticeText(cancelled),
+        meta: buildScheduleInfoMeta("*", phase),
+      });
+    }
+  } catch (err) {
+    console.warn(`[task-runner] 取消定时失败（忽略）task=${taskId}`, err);
+  }
+};
+
+/**
  * 归档任务并清理隔离工作区（V1.1：归档不再只是藏行）。
  *
  * 语义对齐 finalizeTask 的清理段、但不碰 repoStatus（developing 保持）：
@@ -2175,6 +2211,9 @@ export const archiveTaskWithCleanup = async (
   }
   const task = await getTaskMeta(taskId);
   if (!task) return null;
+  // 归档 = 这个会话不再「活着」：定时一起取消（恢复归档后也不会回来——否则归档的会话会被定时消息悄悄唤醒）。
+  // 放在所有分支之前：chat / 非 worktree 的早退路径也要取消。best-effort，失败不挡归档
+  await cancelSchedulesWithNotice(taskId, "会话已归档", "archived", (n) => `会话已归档，${n} 个定时一并取消`);
   // 非任务模式 / 非隔离工作区任务：只翻标记（chat 沿用“后台继续跑”语义）
   if (task.mode === "chat" || !isWorktreeTask(task)) {
     return await setTaskPinArchive(taskId, { archived: true });
@@ -5602,6 +5641,8 @@ export const deliverTaskQuestion = async (
   opGen?: number,
   /** 分节计时收集器（question-timing 行透出 resume/agentSend 子阶段） */
   timing?: (entry: string) => void,
+  /** 定时到点的消息（不是用户插话）：封装脚注换成「系统定时触发」版本，见 buildAgentMessage.scheduled */
+  scheduled?: boolean,
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
     task,
@@ -5611,6 +5652,7 @@ export const deliverTaskQuestion = async (
       imagePaths,
       attachmentPaths,
       ackContext,
+      scheduled,
     }),
     ackContext
       ? { creds, errorActionId: ackContext.actionId, opGen, timing }
@@ -5640,6 +5682,8 @@ export const startOneShotQuestion = (
   attachmentPaths?: string[],
   /** 路由入场 admission token；缺省则本函数入口同步取（须在任何 await 前） */
   opGen?: number,
+  /** 定时到点的消息（不是用户在任务页说的话）：提示词的措辞跟着换 */
+  scheduled?: boolean,
 ): void => {
   const prevRunStatus = task.runStatus === "running" ? "idle" : task.runStatus;
   // 同步捕获（路由可提前传入）；V2：纳入 startingTasks
@@ -5845,23 +5889,31 @@ export const startOneShotQuestion = (
             text: questionText,
             imagePaths,
             attachmentPaths,
+            scheduled,
           });
           // V0.13.x 放开「只读答疑」（用户拍板「纯答疑限制太死」）——疑问就答、
           // 要改就改，只是不推进任务链（本 agent 没有 action 上下文）。
           const prompt = [
-            `你是任务「${task.title}」的临时助手。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手。`,
+            scheduled
+              ? `你是任务「${task.title}」的临时助手。下面是系统按会话里设过的定时自动触发的一条消息（不是用户刚说的话）：按其中你当时留的话处理，不要当成用户在提问或改需求。`
+              : `你是任务「${task.title}」的临时助手。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手。`,
             "",
             ...backgroundLines,
             "",
             ...groupLines,
             "",
-            "# 用户的话",
+            scheduled ? "# 定时触发的消息" : "# 用户的话",
             askedText,
             "",
             "# 边界",
-            "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
-            "- 大改动（整段功能 / 跨多文件重构）→ 说明建议、引导用户点「推进」走正式阶段（你没有任务链上下文、别硬扛）",
-            "- 不要提交 commit / 提 MR、处理完自然结束回复",
+            // 定时版没有「疑问 / 小改动」二分类，并明说这条通道没有 schedule 工具（见该常量注释）
+            ...(scheduled
+              ? SCHEDULE_ONE_SHOT_BOUNDARY_LINES
+              : [
+                  "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
+                  "- 大改动（整段功能 / 跨多文件重构）→ 说明建议、引导用户点「推进」走正式阶段（你没有任务链上下文、别硬扛）",
+                  "- 不要提交 commit / 提 MR、处理完自然结束回复",
+                ]),
           ].join("\n");
           if (
             isTaskOpStale(task.id, admissionOpGen) ||

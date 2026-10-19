@@ -231,6 +231,10 @@ const WorkGroupRowImpl = ({
           expanded ? null : (
             <Loader2 className="size-3 shrink-0 animate-spin text-info" />
           )
+        ) : group.hasBackground && !expanded ? (
+          // 组里有工具已返回、但后台还在干（shell 转后台 / 后台子代理）：折叠后里面的转圈看不见，
+          // 组头替它转，别让折叠的「工作过程 · N 步 · 时长」读起来像全部结束了。展开时成员行自己在转
+          <Loader2 className="size-3 shrink-0 animate-spin text-info" />
         ) : (
           // 同秒完成（<1s）不显示「0s」——空字符串时整段不渲染
           formatGroupDuration(group.startTs, group.endTs) && (

@@ -16,6 +16,7 @@
  * - commands：/stop /new /list /status /help
  * - reactions：注入结果 emoji 回执（Get / Typing / CrossMark）
  * - inbound runtime：consumer 守护 + keep-awake + 30s 开关轮询
+ * - 定时任务调度器（schedule-service，非飞书模块，借用同一个启动锚点）
  *
  * 撤回同步（recall）已下线（2026-07-19 用户拍板：CLI 未收录 recalled_v1、支持不确定）。
  */
@@ -27,18 +28,34 @@ import { ensureBridgeRuntimePolling } from "./inbound";
 import { ensureFeishuOutboundRegistered } from "./outbound";
 import { ensureReactionReceiptsRegistered } from "./reactions";
 
+/**
+ * 定时任务调度器共用这个启动锚点（同样不能挂 instrumentation，且同样靠壳启动时 ping status 兜底
+ * headless 场景）。动态 import：测试 / 只想要桥接的调用方不必连带加载投递链路。
+ * 与飞书桥接各步**互不依赖**——所以放在 finally 里调：桥接任一步抛错也不能让定时跟着起不来。
+ */
+const startScheduleRunner = (): void => {
+  if (process.env.VITEST) return;
+  void import("../schedule-service")
+    .then((m) => m.ensureScheduleRunnerStarted())
+    .catch((err) => console.warn("[schedule] 启动失败", err));
+};
+
 /** server 启动时调一次；重复调用无副作用 */
 export const ensureFeishuBridgeBootstrapped = (): void => {
-  ensureFeishuOutboundRegistered();
-  ensureFeishuGroupOutboundRegistered();
-  ensureCardActionHandlerRegistered();
-  ensureBridgeCommandsRegistered();
-  ensureReactionReceiptsRegistered();
-  // vitest：ownership 等测会 import chat-reply /tasks 路由触发本函数；
-  // 那些用例常只 mock kill-orphans.reapTaskOrphans，sync→stopConsumer 调
-  // unregisterManagedChild 会炸成 unhandled rejection。桥接单测自行调
-  // ensureBridgeRuntimePolling / syncBridgeRuntime，不依赖本锚点起 consumer。
-  if (process.env.VITEST) return;
-  // 放最后：consumer 起来时上面的 handler / 命令表已就位
-  ensureBridgeRuntimePolling();
+  try {
+    ensureFeishuOutboundRegistered();
+    ensureFeishuGroupOutboundRegistered();
+    ensureCardActionHandlerRegistered();
+    ensureBridgeCommandsRegistered();
+    ensureReactionReceiptsRegistered();
+    // vitest：ownership 等测会 import chat-reply /tasks 路由触发本函数；
+    // 那些用例常只 mock kill-orphans.reapTaskOrphans，sync→stopConsumer 调
+    // unregisterManagedChild 会炸成 unhandled rejection。桥接单测自行调
+    // ensureBridgeRuntimePolling / syncBridgeRuntime，不依赖本锚点起 consumer。
+    if (process.env.VITEST) return;
+    // 放最后：consumer 起来时上面的 handler / 命令表已就位
+    ensureBridgeRuntimePolling();
+  } finally {
+    startScheduleRunner();
+  }
 };

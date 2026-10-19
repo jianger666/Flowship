@@ -52,6 +52,12 @@ import {
   shouldRejectArchiveSnapshot,
 } from "@/lib/task-list-refresh";
 import {
+  BUSY_TAIL_REFRESH_MS,
+  isTaskBusy,
+  keepBackgroundSubagentCount,
+  shouldTailRefreshAfterBusy,
+} from "@/lib/task-background";
+import {
   canCommitTaskSnapshot,
   commitTaskDeleted,
   isTaskTerminalDeleted,
@@ -196,10 +202,20 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   }, [refresh]);
 
   // 有没有任务在跑——条件轮询的开关（值只在 false↔true 切换时才重启 interval）
-  const hasRunning = useMemo(
-    () => tasks.some((t) => t.runStatus === "running"),
-    [tasks],
-  );
+  // 后台子代理还在跑也算「忙」：主 AI 说完后 runStatus 已回等待态，没有这条轮询就不会再刷新列表，
+  // 子代理的转圈既不会出现、也收不掉（读数只在列表接口里、详情页回灌不带）
+  const hasRunning = useMemo(() => tasks.some(isTaskBusy), [tasks]);
+
+  // 「忙 → 不忙」的边沿补刷一次：这个翻转可能来自详情页回灌（不带后台读数），
+  // 最后 ≤ 2s 里才派出的后台子代理会因此漏读——见 shouldTailRefreshAfterBusy。
+  const wasBusyRef = useRef(false);
+  useEffect(() => {
+    const wasBusy = wasBusyRef.current;
+    wasBusyRef.current = hasRunning;
+    if (!shouldTailRefreshAfterBusy(wasBusy, hasRunning)) return;
+    const timer = setTimeout(() => void refresh(), BUSY_TAIL_REFRESH_MS);
+    return () => clearTimeout(timer);
+  }, [hasRunning, refresh]);
 
   // 飞书桥接开启时：服务端可能随时被飞书消息唤醒（新建对话 / 注入消息），
   // 客户端没有任何触发点——窗口不聚焦列表就一直陈旧（2026-07-19 用户双屏实测）。
@@ -235,7 +251,7 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       const idx = prev.findIndex((t) => t.id === summary.id);
       if (idx < 0) return [summary, ...prev];
       const next = [...prev];
-      next[idx] = summary;
+      next[idx] = keepBackgroundSubagentCount(prev[idx], summary);
       return next;
     });
   }, []);

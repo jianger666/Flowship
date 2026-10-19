@@ -162,11 +162,12 @@ describe("接线契约", () => {
     // 编辑态与「发送」都以 editHandler 为准（不是只认 onResend）
     expect(src).toMatch(/if \(editing && editHandler\) \{/);
     expect(src).toMatch(/const ok = await runEdit\(trimmed, ev\);/);
-    expect(src).toMatch(/editHandler && \{\s*key: "edit"/);
+    // （定时触发的消息不是用户说的话，另加 `!isScheduleMsg &&` 不给编辑 / 重发——见 schedule-wiring-contract）
+    expect(src).toMatch(/editHandler &&\s*(?:!isScheduleMsg &&\s*)?\{\s*key: "edit"/);
     expect(src).toContain("编辑（之后的对话会被替换）");
     expect(src).toContain("编辑后重发（原消息保留）");
     // 「原样重发」仍只认 onResend（只有最后一条）
-    expect(src).toMatch(/onResend && \{\s*key: "resend"/);
+    expect(src).toMatch(/onResend &&\s*(?:!isScheduleMsg &&\s*)?\{\s*key: "resend"/);
   });
 
   it("event-stream：onEditInPlace 只在 chat + 能发消息 + 接了 onEditRewind 时给，且不再限制最后一条", async () => {

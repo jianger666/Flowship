@@ -13,6 +13,7 @@
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlarmClock,
   Ban,
   CheckCircle2,
   ChevronDown,
@@ -70,14 +71,18 @@ import {
   isAskSuperseded,
 } from "@/lib/ask-pending";
 import type { PendingBubbleMode } from "@/lib/chat-pending-display";
-import { shouldCollapseUserMessage } from "@/lib/chat-stream-display";
+import {
+  isMarkdownUserReply,
+  isScheduleUserReply,
+  shouldCollapseUserMessage,
+  userReplyDisplayText,
+} from "@/lib/chat-stream-display";
 import {
   autoEventCollapsed,
   isLiveThinkingMeta,
   toggleEventCollapsed,
 } from "@/lib/chat-turns";
 import { formatDurationPrecise } from "@/lib/duration-display";
-import { cleanGroupQuestionText } from "@/lib/group-qa";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { isImeComposing } from "@/lib/ime";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
@@ -335,6 +340,17 @@ const USER_REPLY_BUBBLE =
   "ml-auto w-fit max-w-[85%] min-w-0 rounded-2xl bg-secondary px-4 py-2.5";
 const USER_REPLY_TEXT =
   "w-full min-w-0 wrap-anywhere whitespace-pre-wrap text-sm leading-relaxed";
+/**
+ * 机器人（飞书群）回复的 markdown 正文盒：与 USER_REPLY_TEXT 同宽同字号，但**不能带 whitespace-pre-wrap**
+ * （markdown 渲染出的块之间本来就有换行，pre-wrap 会让每段再多出一截空行）。
+ * 段落内的单个换行按换行显示（`[&_p]:whitespace-pre-line`）：机器人是按「一行一句」写的，markdown 默认把软换行折成空格会糊成一团；
+ * 只加在 p 上——li / blockquote 里 remark 会插进块与块之间的 "\n" 文本节点，加了会多出空行。
+ */
+const USER_REPLY_MD_TEXT =
+  "w-full min-w-0 wrap-anywhere text-sm [&_p]:whitespace-pre-line";
+/** 折叠：markdown 里的块不吃 line-clamp，改成限高（8 行 × leading-6 = 12rem）+ 底部渐隐 */
+const USER_REPLY_MD_COLLAPSED =
+  "max-h-48 overflow-hidden [mask-image:linear-gradient(to_bottom,black_75%,transparent)]";
 
 /** 本地占位气泡——用户消息、跟正式气泡同样右对齐。三种样子（见 lib/chat-pending-display）：
  * - mode="inflight"：刚按下回车、正在把消息交给 SDK → **正式气泡外观**（和落盘后的真气泡
@@ -969,10 +985,25 @@ const EventRowImpl = ({
         isGroupMsg && typeof ev.meta?.groupSender === "string"
           ? ev.meta.groupSender.trim()
           : "";
-      const displayText = isGroupMsg
-        ? cleanGroupQuestionText(ev.text) || ev.text
-        : ev.text;
+      // 定时触发（AI 之前用 schedule 工具给自己设的、到点系统发回来的那条）：不是用户说的话。
+      // ev.text 是给 AI 看的整段样板（[SCHEDULE_FIRED …] + 处理要点），展示只放「定时触发 · 标题」徽标 +
+      // AI 当时留给自己的话（meta.scheduleMessage）；不给重发 / 编辑（重发出去就成了用户冒充系统）
+      const isScheduleMsg = isScheduleUserReply(ev);
+      const scheduleTitle =
+        isScheduleMsg && typeof ev.meta?.scheduleTitle === "string"
+          ? ev.meta.scheduleTitle.trim()
+          : "";
+      const scheduleSeq =
+        isScheduleMsg &&
+        ev.meta?.scheduleKind === "every" &&
+        typeof ev.meta?.scheduleSeq === "number"
+          ? ev.meta.scheduleSeq
+          : null;
+      // 展示文本与粘顶轮次头同一份判定（userReplyDisplayText）
+      const displayText = userReplyDisplayText(ev);
       const userCollapsible = shouldCollapseUserMessage(displayText);
+      // 飞书群里机器人发来的按 markdown 渲染（真人 / 自己输入的 / 定时触发的仍是纯文本）
+      const userMarkdown = isMarkdownUserReply(ev);
       const bubble = (
         // 右对齐收窄块（Codex 风、A1）：ml-auto + max-w 85%；min-w-0 + wrap-anywhere 防长 URL 撑破
         <div className={cn(MESSAGE_ACTION_HOST, USER_REPLY_BUBBLE)}>
@@ -985,13 +1016,15 @@ const EventRowImpl = ({
                 text: "回退到这里",
                 onClick: () => onRewind?.(ev.id),
               },
-              onResend && {
+              onResend &&
+                !isScheduleMsg && {
                 key: "resend",
                 icon: <RotateCcw className="size-3" />,
                 label: "原样重发这条消息",
                 onClick: () => void runResend(ev.text, ev),
               },
-              editHandler && {
+              editHandler &&
+                !isScheduleMsg && {
                 key: "edit",
                 icon: <PencilLine className="size-3" />,
                 label: onEditInPlace
@@ -1014,6 +1047,17 @@ const EventRowImpl = ({
               </span>
             </div>
           )}
+          {isScheduleMsg && (
+            <div className="mb-1.5 flex min-w-0 items-center gap-1">
+              <span className="inline-flex max-w-full min-w-0 items-center gap-1 rounded-sm bg-info/15 px-1.5 py-0.5 text-[11px] font-medium text-info">
+                <AlarmClock className="size-3 shrink-0" />
+                <span className="truncate">
+                  {scheduleTitle ? `定时触发 · ${scheduleTitle}` : "定时触发"}
+                  {scheduleSeq !== null ? ` · 第 ${scheduleSeq} 次` : ""}
+                </span>
+              </span>
+            </div>
+          )}
           {isGroupMsg && (
             <div className="mb-1.5 flex items-center gap-1">
               <span className="inline-flex items-center gap-1 rounded-sm bg-info/15 px-1.5 py-0.5 text-[11px] font-medium text-info">
@@ -1030,11 +1074,19 @@ const EventRowImpl = ({
           )}
           <div
             className={cn(
-              USER_REPLY_TEXT,
-              userCollapsible && !userExpanded && "line-clamp-8",
+              userMarkdown ? USER_REPLY_MD_TEXT : USER_REPLY_TEXT,
+              userCollapsible &&
+                !userExpanded &&
+                (userMarkdown ? USER_REPLY_MD_COLLAPSED : "line-clamp-8"),
             )}
           >
-            <SearchHighlightText ownerId={ev.id} field="body" text={displayText} />
+            {userMarkdown ? (
+              // 用户输入不进事件流搜索索引（见 lib/event-stream-search），所以这里不传 searchOwnerId。
+              // blockImages：别家机器人的内容不可信，不加载其中的图片（远程图 = 追踪像素，能得知你的打开时刻和 IP）
+              <MarkdownText text={displayText} baseDir={markdownBaseDir} blockImages />
+            ) : (
+              <SearchHighlightText ownerId={ev.id} field="body" text={displayText} />
+            )}
           </div>
           {userCollapsible && (
             <button

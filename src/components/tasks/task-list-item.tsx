@@ -9,6 +9,7 @@
  *
  * 行首指示按 runStatus 三态切换（复用同一个槽位、不回到「满屏色点」）：
  *  - running       → 转圈（多任务并行时一眼看出哪个 AI 在跑）
+ *  - 主 AI 已说完但后台子代理还在跑 → 同样转圈（见 task-background；否则会被画成空闲）
  *  - awaiting_user 且**真有事等你**（task 模式、action 等审阅 / ask 等答案）→ 琥珀色脉冲点
  *  - 其余（idle / error / chat 静息 / approve 后静息）→ 类型图标（对话气泡 / 任务清单）
  * （error 不特殊标：断线类 error 常见、标了反而噪声。）
@@ -46,6 +47,7 @@ import {
 import { formatRelative } from "@/lib/task-display";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { taskStageLine } from "@/lib/task-stage-line";
+import { hasBackgroundSubagents } from "@/lib/task-background";
 import { cn } from "@/lib/utils";
 import { getTaskSeenAt } from "@/lib/view-memory";
 import type { TaskSummary } from "@/lib/types";
@@ -95,6 +97,16 @@ const LeadingIndicator = ({
       <Loader2
         className="size-3.5 shrink-0 animate-spin text-info"
         aria-label="AI 运行中"
+      />
+    );
+  }
+  // 主 AI 说完了、但派到后台的子代理还在干：同样转圈，别画成空闲
+  // （runStatus 此刻已是 awaiting_user / idle，只看它会让用户以为「都结束了」）
+  if (hasBackgroundSubagents(task)) {
+    return (
+      <Loader2
+        className="size-3.5 shrink-0 animate-spin text-info"
+        aria-label="子代理后台运行中"
       />
     );
   }

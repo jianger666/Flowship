@@ -105,6 +105,7 @@ import {
   attachLiveThinking,
   deriveActiveStatus,
   groupChatRenderItems,
+  isBootOnlyWorkGroup,
   latestEventTs,
   shouldShowProcessingPlaceholder,
   type WorkGroupItem,
@@ -113,11 +114,16 @@ import {
   coerceStaleRunningTools,
   isToolBlock,
   isToolVerbGroup,
+  markBackgroundRunningTools,
+  markBackgroundSubagentTools,
   mergeToolDisplayEvents,
   type StreamRenderItem,
 } from "@/lib/tool-display";
+import { collectRunningBackgroundCallIds } from "@/lib/shell-background";
 import {
   hasInflightPending,
+  loadingSinceTs,
+  resolveLoadingStart,
   shouldShowComposerRunning,
   shouldShowSendLoading,
   type PendingBubbleMode,
@@ -125,6 +131,7 @@ import {
 import type { LiveThinking } from "@/lib/thinking-live";
 import {
   extractActiveBootStage,
+  isScheduleUserReply,
   resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
@@ -150,8 +157,12 @@ import {
 import { GroupQaPanel } from "./group-qa-panel";
 import { ActiveStatusLine } from "./event-stream/active-status-line";
 import { BackgroundSubagentsBar } from "./background-subagents-bar";
+import { ScheduleChip } from "./schedule-chip";
 import { SubagentDetailHost } from "./subagent-detail";
-import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
+import {
+  backgroundJobIdSet,
+  type BackgroundSubagentJobView,
+} from "@/lib/background-subagents";
 import { WorkGroupRow } from "./event-stream/work-group";
 import { AskUserInlineCard } from "./ask-user-inline";
 import { EventStreamSearchBar } from "./event-stream-search-bar";
@@ -172,6 +183,11 @@ interface StreamingItem {
 interface LoadingItem {
   kind: "__loading__";
   id: string;
+  /**
+   * 「已等待」的起算时间（落盘的 user_reply 的 ts，见 loadingSinceTs）。
+   * 没有（inflight 占位 / 取不到）= 按组件挂载起算；切走再切回重挂后靠它接着数。
+   */
+  since?: number;
 }
 
 /** P5：本地排队占位（尚未落盘的 user_reply） */
@@ -301,21 +317,29 @@ const BootStageRow = ({ text }: { text: string }) => (
  *
  * 占位气泡（inflight）→ user_reply 落盘 → 等首 token 全程是同一个 `__loading__` 项（同 key），
  * 本组件不重挂载、「已等待 Ns」从按下回车起连续计时。
+ * 切走再切回（组件重挂）时靠 `since`（落盘的 user_reply 的 ts）接着数——起算点只在首次挂载时定，
+ * 交接过程中 since 才到也不会让计时往回跳（见 chat-pending-display 的 loadingSinceTs / resolveLoadingStart）。
  *
  * 模型一开始思考，这一行就会被工作过程流程里「进行中的那条 thinking 行」取代
  * （见 attachLiveThinking）——2026-10-10 实测模型第 6s 就在想了，
  * 这里却一直写「等待模型响应… 已等待 62s」。
  */
-const PendingRow = () => {
-  // 挂载起算的已等待秒数
-  const [elapsed, setElapsed] = useState(0);
+const PendingRow = ({ since }: { since?: number }) => {
+  // 起算点只在首次挂载时定（之后 since 才到——占位 → 落盘交接——不能让计时往回跳）；
+  // 重挂载（回车后切走再切回）时 since 已经在、按真实起点接着数，阶段文案也不会退回「准备环境…」
+  const [t0] = useState(() => resolveLoadingStart(since, Date.now()));
+  // state 存「整秒数」而不是时间戳：500ms 一次的 tick 里同一秒内 setState 同值会被 React 跳过，
+  // 重渲染维持在每秒一次（存 Date.now() 每次都变、等于翻倍）
+  const [elapsed, setElapsed] = useState(() =>
+    Math.max(0, Math.floor((Date.now() - t0) / 1000)),
+  );
   useEffect(() => {
-    const t0 = Date.now();
-    const id = window.setInterval(() => {
-      setElapsed(Math.floor((Date.now() - t0) / 1000));
-    }, 500);
+    const id = window.setInterval(
+      () => setElapsed(Math.max(0, Math.floor((Date.now() - t0) / 1000))),
+      500,
+    );
     return () => window.clearInterval(id);
-  }, []);
+  }, [t0]);
   const phase = elapsed < 3 ? "准备环境…" : "等待模型响应…";
   return (
     <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
@@ -641,12 +665,29 @@ const buildStreamItems = (
    * 那次就是恒 false、跑着的工具全成「已中断」）——强制每个调用点自己说清楚。
    */
   runActive: boolean,
+  /**
+   * 此刻还在后台跑的子代理任务 id（服务端实时下发的清单，见 background-subagents.ts）。
+   * 子代理卡在 `run_in_background` 派出时就「完成」了（工具调用立刻返回），图标要靠它继续转圈。
+   * 同样无默认值：漏传 = 后台子代理的卡悄悄亮绿勾（2026-10-19 用户截图的就是这个）。没有就传空集合。
+   */
+  backgroundJobIds: ReadonlySet<string>,
 ): Array<StreamRenderItem | WorkGroupItem> => {
   const src = eventsForStreamRender(events, isChat);
   const merged = mergeToolDisplayEvents(mergeAdjacentThinking(src));
   // 仅非 running 时 coerce——running 中的真·进行中工具保持转圈
   const tools = runActive ? merged : coerceStaleRunningTools(merged);
-  return groupChatRenderItems(tools);
+  // 已转后台、进程还在跑的 shell：tool_call 虽已「完成」，会话还在跑时图标仍转圈。
+  // 标记事件在上面 eventsForStreamRender 里被藏了（不渲染），这里直接读未过滤的 events。
+  // 会话已停 → 不转（见 markBackgroundRunningTools 注释）
+  const withBackgroundShells = runActive
+    ? markBackgroundRunningTools(tools, collectRunningBackgroundCallIds(events))
+    : tools;
+  // 已转后台、仍在跑的子代理：清单是权威、不看 runActive（后台子代理常在主 AI 说完之后才跑完）
+  const withBackground = markBackgroundSubagentTools(
+    withBackgroundShells,
+    backgroundJobIds,
+  );
+  return groupChatRenderItems(withBackground);
 };
 
 /** 与 contentCount 同一计量：工作过程组按成员摊开（loadEarlier 算 prepend 增量用） */
@@ -784,9 +825,14 @@ const EventStreamImpl = ({
   // isRunning=false 时 coerce 脏 running 工具 →「已中断」（chat / task 共用）
   // 群问答 tab：有旁路问答轮次时才出现；切过去只读呈现，主流程事件流不受影响
   const [showGroupQa, setShowGroupQa] = useState(false);
+  // 后台在跑的子代理 id 集合：chat-view 对清单做了相等判断（没变不换引用），这里按引用 memo 即可
+  const backgroundJobIds = useMemo(
+    () => backgroundJobIdSet(backgroundSubagents),
+    [backgroundSubagents],
+  );
   const baseItems = useMemo(
-    () => buildStreamItems(task.events, isChat, isRunning),
-    [task.events, isChat, isRunning],
+    () => buildStreamItems(task.events, isChat, isRunning, backgroundJobIds),
+    [task.events, isChat, isRunning, backgroundJobIds],
   );
   // 群问答轮次（原始事件聚合，不走主流程过滤管线；chat 形态无群桥接不展示）
   const groupQaRounds = useMemo(
@@ -927,11 +973,29 @@ const EventStreamImpl = ({
       last.kind !== "__tool_verb_group__" &&
       last.kind !== "__work_group__" &&
       last.kind === "user_reply";
+    // ③ 已受理、启动提示（如「已跳过不可用的 MCP」）已落盘成「启动过程」组、模型还没开口：
+    // 末项不再是 user_reply，但仍是「等 AI」。启动阶段的 ephemeral 进度行（displayedBoot）只在内存里，
+    // 回车后立刻切走再切回会丢——不在这里补，列表里就一个「在转」的东西都没有（2026-10-17 用户截图）。
+    // 只在 chat 判：task 形态没有状态行、启动组本来就带自己的进行态。
+    const lastIsBootOnly = isChat && isBootOnlyWorkGroup(last);
     // 两段共用同一个 __loading__ 项（同 id → 占位落盘交接时不重挂载、「已等待 Ns」不清零）：
     // ① 已按回车、user_reply 还没落盘（inflight 占位）——此时 runStatus 可能还没 running；
-    // ② 已受理、user_reply 已落盘、AI 还没动静（原有）。
-    if (shouldShowSendLoading({ isRunning, lastIsUser, hasInflight })) {
-      return [...withPending, { kind: "__loading__", id: "__loading__" }];
+    // ② 已受理、user_reply 已落盘、AI 还没动静（原有）；③ 同上、但流尾是纯启动提示组。
+    if (
+      shouldShowSendLoading({
+        isRunning,
+        lastIsUser: lastIsUser || lastIsBootOnly,
+        hasInflight,
+      })
+    ) {
+      return [
+        ...withPending,
+        {
+          kind: "__loading__",
+          id: "__loading__",
+          since: loadingSinceTs(withPending as ReadonlyArray<{ kind: string; ts?: number }>, hasInflight),
+        },
+      ];
     }
     return withPending;
   }, [
@@ -1449,7 +1513,8 @@ const EventStreamImpl = ({
             fetchEarlierEvents(requestedTaskId, beforeId, limit),
           // 与 items useMemo / 下面的 firstItemIndex 差值同一个函数
           countItems: (evs) =>
-            buildStreamItems(evs as TaskEvent[], isChat, isRunning).length,
+            buildStreamItems(evs as TaskEvent[], isChat, isRunning, backgroundJobIds)
+              .length,
           isCancelled: () => taskIdRef.current !== requestedTaskId,
         });
         if (!batch || taskIdRef.current !== requestedTaskId) return;
@@ -1462,11 +1527,17 @@ const EventStreamImpl = ({
         if (fresh.length > 0) {
           // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对 /
           // chat 工作组跨页合并——必须与 items 同一套 buildStreamItems 算前后条数差值
-          const beforeItems = buildStreamItems(cur, isChat, isRunning);
+          const beforeItems = buildStreamItems(
+            cur,
+            isChat,
+            isRunning,
+            backgroundJobIds,
+          );
           const afterItems = buildStreamItems(
             [...fresh, ...cur],
             isChat,
             isRunning,
+            backgroundJobIds,
           );
           const beforeLen = beforeItems.length;
           const afterLen = afterItems.length;
@@ -1715,9 +1786,12 @@ const EventStreamImpl = ({
     return undefined;
   }, [task.events]);
 
+  // 最后一条是定时到点发的（不是用户说的话）：没有「重新生成」——原样再发 = 把系统样板 / AI 自己写的备忘当成用户的话发出去
+  const canRegenerateFromLastUserReply = !!lastUserReply && !isScheduleUserReply(lastUserReply);
+
   // 重新生成 = 把最后一条用户消息原样再发一遍（append-only、历史保留、不弹确认）
   const handleRegenerate = useCallback(async () => {
-    if (!lastUserReply) return;
+    if (!lastUserReply || isScheduleUserReply(lastUserReply)) return;
     await handleResend(lastUserReply.text, lastUserReply);
   }, [handleResend, lastUserReply]);
 
@@ -2105,7 +2179,7 @@ const EventStreamImpl = ({
                     streaming
                   />
                 ) : isLoadingItem(item) ? (
-                  <PendingRow />
+                  <PendingRow since={item.since} />
                 ) : isBootStageItem(item) ? (
                   <BootStageRow text={item.text} />
                 ) : isPendingLocalItem(item) ? (
@@ -2133,7 +2207,9 @@ const EventStreamImpl = ({
                       hasRunning: item.hasRunning,
                       hasStreamingText: !!streamingText,
                       lastMemberKind: item.members[item.members.length - 1]?.kind,
-                      statusLineVisible,
+                      // 流尾已有一行进度（「准备环境…」/ 启动阶段）时状态行会让位给它——
+                      // 它同样已经在说「还在等」，组尾的「处理中…」不再上下各说一遍
+                      statusLineVisible: statusLineVisible || tailHasProgressRow,
                     })}
                   />
                 ) : isToolBlock(item) ? (
@@ -2179,7 +2255,7 @@ const EventStreamImpl = ({
                       isChat &&
                       canCompose &&
                       !isRunning &&
-                      !!lastUserReply &&
+                      canRegenerateFromLastUserReply &&
                       item.id === lastAssistantId
                         ? handleRegenerate
                         : undefined
@@ -2230,6 +2306,9 @@ const EventStreamImpl = ({
             {backgroundSubagents ? (
               <BackgroundSubagentsBar jobs={backgroundSubagents} />
             ) : null}
+            {/* 会话里已设的定时（AI 用 schedule 工具给自己设的「到点叫我」）：没有时整条收起。
+                task 模式的同一条挂在 page.tsx 的「跟 AI 说」输入条上方 */}
+            <ScheduleChip taskId={task.id} events={task.events} />
           </div>
           <ConversationComposer
             {...rich.bind}

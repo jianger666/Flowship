@@ -98,6 +98,62 @@ describe("错误：独立平铺成 destructive 卡", () => {
   });
 });
 
+describe("飞书群机器人的回复：用户气泡里按 markdown 渲染", () => {
+  const userBranch = rows.slice(rows.indexOf("const userMarkdown = isMarkdownUserReply(ev);"));
+
+  it("判定只走 isMarkdownUserReply（与「机器人」徽标同一个口径），不在 rows 里再手写一份", () => {
+    expect(rows).toContain("const userMarkdown = isMarkdownUserReply(ev);");
+    expect(countOf(rows, "isMarkdownUserReply(")).toBe(1);
+    // 没有「真人也走 markdown」的旁路：MarkdownText 的 displayText 只出现在 userMarkdown 分支里
+    expect(userBranch).toMatch(/\{userMarkdown \? \(\s*(?:\/\/[^\n]*\n\s*)*<MarkdownText text=\{displayText\} baseDir=\{markdownBaseDir\} blockImages \/>\s*\) : \(\s*<SearchHighlightText ownerId=\{ev\.id\} field="body" text=\{displayText\} \/>/);
+  });
+
+  it("markdown 盒不带 whitespace-pre-wrap（否则块间换行再叠一层空行）；段内单个换行按换行显示", () => {
+    const mdBox = /const USER_REPLY_MD_TEXT =\s*"([^"]+)"/.exec(rows)?.[1] ?? "";
+    expect(mdBox, "找不到 USER_REPLY_MD_TEXT").not.toBe("");
+    expect(mdBox).not.toContain("whitespace-pre-wrap");
+    expect(mdBox).toContain("[&_p]:whitespace-pre-line");
+    // 与纯文本盒同宽、同防长串撑破的几何
+    expect(mdBox).toContain("w-full min-w-0 wrap-anywhere text-sm");
+    // pre-line 只加在 p 上：li / blockquote 里块与块之间有 remark 插的 "\n" 文本节点，加了会多出空行
+    expect(mdBox).not.toMatch(/\[&_li\]|\[&_\*\]|\[&_ul\]/);
+  });
+
+  it("不可信来源：机器人消息里的图片不加载（blockImages；远程图 = 追踪像素），槽位由 markdown-text 按开关切换", () => {
+    expect(userBranch).toContain("<MarkdownText text={displayText} baseDir={markdownBaseDir} blockImages />");
+    const md = readFileSync(path.join(srcDir, "components", "markdown-text.tsx"), "utf-8");
+    expect(md).toContain("img: blockImages ? BlockedMarkdownImage : MarkdownImage,");
+    expect(md).toContain("buildMarkdownComponents(linker, size, blockImages)");
+    expect(md).toContain("blockImages = false,"); // 默认照常加载：AI 回复 / 产物栏不受影响
+    // 占位组件自己不许渲染 img / picture / source：净化白名单放行 <source srcSet>，
+    // 占位一旦渲染成 <img>（比如做懒加载占位），防护就静默失效
+    const blocked = md.slice(md.indexOf("export const BlockedMarkdownImage"), md.indexOf("const buildMarkdownComponents"));
+    expect(blocked).toContain("BlockedMarkdownImage");
+    expect(blocked).not.toMatch(/<(img|picture|source|video|audio|iframe|object|embed)\b/i);
+    expect(blocked).not.toMatch(/\bsrc\b|srcSet/i);
+    // AI 回复那处 MarkdownText 不许带 blockImages（那是 AI 自己的输出、有图要显示）
+    const assistantTag = /<MarkdownText\s+size=\{isLog[\s\S]*?\/>/.exec(rows)?.[0] ?? "";
+    expect(assistantTag).not.toBe("");
+    expect(assistantTag).not.toContain("blockImages");
+  });
+
+  it("气泡文本盒按 userMarkdown 二选一：markdown 用 USER_REPLY_MD_TEXT、其余仍是 USER_REPLY_TEXT", () => {
+    expect(userBranch).toContain("userMarkdown ? USER_REPLY_MD_TEXT : USER_REPLY_TEXT");
+  });
+
+  it("折叠：markdown 里的块不吃 line-clamp，改限高 + 溢出隐藏；纯文本仍是 line-clamp-8", () => {
+    const collapsed = /const USER_REPLY_MD_COLLAPSED =\s*"([^"]+)"/.exec(rows)?.[1] ?? "";
+    expect(collapsed).toContain("max-h-48");
+    expect(collapsed).toContain("overflow-hidden");
+    expect(userBranch).toContain('userMarkdown ? USER_REPLY_MD_COLLAPSED : "line-clamp-8"');
+  });
+
+  it("重发 / 编辑仍用原 ev.text（只改展示，前缀是给 agent 的上下文）", () => {
+    expect(rows).toContain("runResend(ev.text, ev)");
+    expect(rows).toContain("setEditDraft(ev.text)");
+  });
+});
+
 describe("hover 动作条：MessageActionBar 单一来源", () => {
   it("对话类消息块都用公共件（AI 回复 chat / log 共用一处渲染 + 用户消息一处）", () => {
     // 事件流 v2 之前是三处 JSX（chat AI / log AI / chat 用户）；task(log) 的 AI 回复并入 chat 的
@@ -127,6 +183,21 @@ describe("hover 动作条：MessageActionBar 单一来源", () => {
       (f) => f !== owner && readFileSync(f, "utf-8").includes(barClass),
     );
     expect(offenders.map((f) => path.relative(srcDir, f))).toEqual([]);
+  });
+
+  it("动作条不受宿主（气泡）宽度挤压：短消息不会把「回退到这里」竖排", () => {
+    // 回归：用户消息很短（如一两个字）时，absolute 的动作条可用宽度 = 气泡宽度 - right 偏移，
+    // flex 子项被压窄、文字逐字换行、图标缩成小点。三处缺一不可：
+    const bar = readFileSync(
+      path.join(srcDir, "components", "ui", "message-action-bar.tsx"),
+      "utf-8",
+    );
+    // 1) 容器取内容宽度（不吃宿主的可用宽度）
+    expect(bar).toMatch(/absolute -top-3 right-2[^"]*\bw-max\b/);
+    // 2) 按钮文字不换行 + 不被 flex 压缩
+    expect(bar).toMatch(/"flex shrink-0[^"]*\bwhitespace-nowrap\b/);
+    // 3) 图标不被压缩
+    expect(bar).toContain("[&_svg]:shrink-0");
   });
 
   it("log 形态补上复制：chat / log 的 AI 回复走同一个分支、同一份 assistantActions", () => {

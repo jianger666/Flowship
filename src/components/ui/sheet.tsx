@@ -5,6 +5,7 @@
  *
  * 非模态侧栏：默认 `modal={false}` + 不渲染 Backdrop，左侧任务区仍可看/点；
  * `disablePointerDismissal` 默认 true，连点路径切换预览时不误关；Esc / X 仍可关。
+ * 想要「点抽屉外面关闭」的调用方自己传 `disablePointerDismissal={false}`（例：子代理详情抽屉）。
  *
  * 为什么不用居中 Dialog：本地文件预览是「边看任务边瞄文件」、占右侧一条；
  * 以后若要换成左侧/全屏，只改 SheetContent 定位即可。

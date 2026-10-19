@@ -81,7 +81,12 @@ import {
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
-import { beginAskSkip, fulfillAskSkipViaWait, type AskSkipHandle } from "@/lib/server/ask-skip";
+import {
+  beginAskSkip,
+  fulfillAskSkipViaWait,
+  INERT_ASK_SKIP,
+  type AskSkipHandle,
+} from "@/lib/server/ask-skip";
 import {
   isSessionRotationDue,
   isPerfRotationDue,
@@ -136,6 +141,12 @@ export interface ChatInjectBody {
 export interface ChatInjectOptions {
   /** 合并进 user_reply.meta（如飞书来源标记 / feishuMessageId） */
   userReplyMetaExtra?: Record<string, unknown>;
+  /**
+   * 定时任务到点触发（系统发的，不是用户说话）：不认领 askSkip——
+   * 用户还没答的提问不许被一条定时消息「隐式跳过」。其余路径（会话恢复 / 入队 / checkpoint /
+   * user_reply 落盘）与普通消息完全一致。
+   */
+  scheduledTrigger?: boolean;
 }
 
 const MAX_IMAGES_PER_REPLY = 6;
@@ -367,7 +378,8 @@ const runChatReplyInject = async (
   // agent 提问后用户不答、直接发新消息 = **隐式跳过**那组提问（chat 侧原来一个字都没处理：
   // 答题卡和顶部「AI 在等你回答」悬浮条会一直挂着）。认领同步、赶在下面所有 await 之前——
   // 它是与「答题」互斥的那一步（谁先摘到 pendingAsk 谁说了算，见 ask-skip 文件头）
-  const askSkip = beginAskSkip(task);
+  // 定时触发是系统消息、不是用户的回答 → 用惰性句柄，绝不顶掉待答提问
+  const askSkip = options.scheduledTrigger ? INERT_ASK_SKIP : beginAskSkip(task);
   if (askSkip.claimed) skipRef.handle = askSkip;
 
   // 事件 = 用户原文；agent = 跳过上下文 + skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）

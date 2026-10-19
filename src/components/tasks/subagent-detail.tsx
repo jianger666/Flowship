@@ -11,7 +11,12 @@
  * # 为什么面板的宿主放在 EventStream 这一层（`SubagentDetailHost`）
  * 卡片在 Virtuoso 虚拟列表里：滚出视口就卸载，面板状态放在卡片里，一滚动抽屉就没了。
  * 宿主包住整个 EventStream（卡片和输入框上方的条都在它里面），通过 context 把 `open(target)` 递下去。
- * 没有宿主的地方（单独复用卡片、单测）`useOpenSubagentDetail()` 返回 null，卡片就不画「详情」入口。
+ * 没有宿主的地方（单独复用卡片、单测）`useOpenSubagentDetail()` 返回 null，卡片 / 条退成不可点的展示行。
+ *
+ * # 怎么开 / 怎么关
+ * 开：点子代理任务条（整条都是点击区，没有单独的「详情」按钮、也没有内联展开）；
+ * 关：左上 X / Esc / 点抽屉外面。抽屉是非模态的（不盖遮罩），点外面的那一下同时落到被点的东西上；
+ * 点「开抽屉」的入口、点抽屉里弹出的二级浮层（大图预览 / 菜单）不算点外面（见 `keepsSubagentDrawerOpen`）；焦点移出抽屉不关（见 `shouldBlockSubagentDrawerClose`）。
  *
  * # 内容怎么画
  * 过程记录和主事件流同形（TaskEvent），直接走同一条渲染管线（`buildSubagentRunItems`）：
@@ -30,6 +35,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ReactNode,
 } from "react";
 import { Bot, TriangleAlert } from "lucide-react";
@@ -59,6 +65,7 @@ import {
 import {
   buildSubagentRunItems,
   releaseFollowOnOpen,
+  shouldBlockSubagentDrawerClose,
   shouldStickToBottom,
 } from "@/lib/subagent-run-display";
 import type { Task, TaskEvent } from "@/lib/types";
@@ -555,10 +562,31 @@ export const SubagentDetailHost = ({
 
   const visible = open && opened?.taskId === task.id;
 
+  const handleOpenChange = useCallback<
+    NonNullable<ComponentProps<typeof Sheet>["onOpenChange"]>
+  >((next, eventDetails) => {
+    // 两类关闭请求要拦（判据在 shouldBlockSubagentDrawerClose，单测钉死）：
+    // - outside-press 落在「开抽屉」的入口（任务条 / 后台条）或抽屉里弹出的二级浮层（大图预览、菜单）上：不算点了外面，
+    //   入口自己的 click 会去 openDetail（同一条不动、另一条换内容）；
+    // - focus-out：`disablePointerDismissal={false}` 会顺带打开 base-ui 的「焦点移出即关」，点另一条任务条 / 大图上的按钮 /
+    //   Tab 出抽屉都会触发，用户并不是想关抽屉，一律拦掉。Esc / X / 点外面仍是正式的关闭路径。
+    if (!next && shouldBlockSubagentDrawerClose(eventDetails.reason, eventDetails.event.target)) {
+      eventDetails.cancel();
+      return;
+    }
+    setOpen(next);
+  }, []);
+
   return (
     <SubagentDetailContext.Provider value={openDetail}>
       {children}
-      <Sheet open={visible} onOpenChange={setOpen}>
+      <Sheet
+        open={visible}
+        onOpenChange={handleOpenChange}
+        // 点抽屉外面关闭（Sheet 默认不响应外部点击；用户 2026-10-18 要这个抽屉能点外面关）。
+        // 仍是非模态：不盖遮罩、外面的东西照常可点——这一下既关抽屉、也落到被点的东西上
+        disablePointerDismissal={false}
+      >
         <SheetContent className="sm:max-w-2xl">
           {opened && opened.taskId === task.id ? (
             <SubagentDetailPanel

@@ -151,6 +151,16 @@ export interface TaskQuestionInjectOptions {
    */
   correlatedAnswer?: boolean;
   /**
+   * 定时任务到点触发（系统发的，不是用户说话）。与普通属主消息的三处不同——都是「别因为一条
+   * 定时消息改动用户的任务状态」：
+   * ① 不认领 askSkip：用户还没答的提问不许被它「隐式跳过」；
+   * ② 不带 ackContext：action 在等审阅（awaiting_ack）时**不** snapshot 产物、不把 action 打回 running
+   *    （消息照常送给 AI，由它自己判断要不要动产物）；
+   * ③ 不唤醒（resume）当前 action：会话没了就走一次性 agent，不复活已停止 / 出错 / 等审阅的阶段。
+   * 与 {@link restrictToQuestion} 不同，它仍然复用活会话、保留全权限（定时是 AI 自己给自己设的）。
+   */
+  scheduledTrigger?: boolean;
+  /**
    * agent 真在跑时入队而非 409（仅 app 输入条 / 属主群消息 / 托办回执用；只答疑旁路不走这里）。
    * 入队后 202 `{ queued: true }`，由 task-talk-queue 在 task 空闲后串行重放。
    * 重放时必须清掉，防止 drain 遇到「刚好又忙」再入队死循环。
@@ -885,7 +895,7 @@ const runTaskQuestionInject = async (
   // 当前产出在等审阅（awaiting_ack）= 原「再聊聊」场景：先 snapshot artifact 版本
   //（用户可能要求改、保留改前版本）、消息附「处理完重新交卷」上下文。
   // questionOnly 直接当没有 ack 上下文——非属主的一句话不该改产物、更不该重交卷
-  const ackAction = questionOnly
+  const ackAction = questionOnly || options.scheduledTrigger
     ? undefined
     : task.actions.find(
         (a) => a.id === task.currentActionId && a.status === "awaiting_ack",
@@ -915,7 +925,7 @@ const runTaskQuestionInject = async (
   // B1：隐式跳过认领用的事件同样只看尾部（与上面 pendingAskOpen 同一快照语义；
   // 认领本身走 takePendingAskIf 原子注册，不依赖全量）。
   const askSkip =
-    questionOnly || options.correlatedAnswer
+    questionOnly || options.correlatedAnswer || options.scheduledTrigger
       ? null
       : beginAskSkip({ ...task, events: askEvents });
   if (askSkip?.claimed) skipRef.handle = askSkip;
@@ -989,6 +999,7 @@ const runTaskQuestionInject = async (
               attachmentPaths.length > 0 ? attachmentPaths : undefined,
               opGen,
               timing,
+              options.scheduledTrigger === true,
             ),
           );
   } catch (err) {
@@ -1017,6 +1028,7 @@ const runTaskQuestionInject = async (
   const currentAction = task.actions.find((a) => a.id === task.currentActionId);
   const canResume =
     !questionOnly &&
+    !options.scheduledTrigger &&
     !sent &&
     !!currentAction &&
     (currentAction.status === "error" ||
@@ -1320,6 +1332,7 @@ const runTaskQuestionInject = async (
       { apiKey: apiKey!, model: fallbackModel! },
       attachmentPaths.length > 0 ? attachmentPaths : undefined,
       opGen,
+      options.scheduledTrigger === true,
     );
   }
 

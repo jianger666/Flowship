@@ -41,7 +41,8 @@ const routeType = (pathname: string): "board" | "standalone" | "detail" => {
   if (
     pathname.startsWith("/settings") ||
     pathname.startsWith("/actions") ||
-    pathname.startsWith("/sessions")
+    pathname.startsWith("/sessions") ||
+    pathname.startsWith("/schedules")
   ) {
     return "standalone";
   }

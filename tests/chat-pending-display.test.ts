@@ -14,6 +14,8 @@ import {
   classifyPendingBubble,
   decideChatStop,
   hasInflightPending,
+  loadingSinceTs,
+  resolveLoadingStart,
   settleStopIntent,
   shouldShowComposerRunning,
   shouldShowSendLoading,
@@ -152,5 +154,48 @@ describe("settleStopIntent", () => {
   it("登记过 + 任务已删 / 已切走 → 收掉外观，不 stop（stop 只会 404、弹一条多余的错）", () => {
     expect(settleStopIntent({ pending: true, accepted: true, alive: false })).toBe("release");
     expect(settleStopIntent({ pending: true, accepted: false, alive: false })).toBe("release");
+  });
+});
+
+describe("loadingSinceTs / resolveLoadingStart：切走再切回后「已等待」接着数", () => {
+  it("取最近一条落盘 user_reply 的 ts（末项是用户消息、或其后只跟着启动提示）", () => {
+    expect(loadingSinceTs([{ kind: "user_reply", ts: 1000 }], false)).toBe(1000);
+    expect(
+      loadingSinceTs(
+        [
+          { kind: "user_reply", ts: 1000 },
+          { kind: "assistant_message", ts: 1500 },
+          { kind: "user_reply", ts: 2000 },
+          { kind: "__work_group__", ts: 2100 },
+        ],
+        false,
+      ),
+    ).toBe(2000);
+  });
+
+  it("有 inflight 占位时不取：流里最近的 user_reply 是上一轮的，取了会一上来就算成几分钟", () => {
+    expect(loadingSinceTs([{ kind: "user_reply", ts: 1000 }], true)).toBeUndefined();
+  });
+
+  it("没有 user_reply / ts 缺失或不合法 → undefined（按挂载起算）", () => {
+    expect(loadingSinceTs([], false)).toBeUndefined();
+    expect(loadingSinceTs([{ kind: "assistant_message", ts: 1 }], false)).toBeUndefined();
+    expect(loadingSinceTs([{ kind: "user_reply" }], false)).toBeUndefined();
+    expect(loadingSinceTs([{ kind: "user_reply", ts: 0 }], false)).toBeUndefined();
+    expect(loadingSinceTs([{ kind: "user_reply", ts: Number.NaN }], false)).toBeUndefined();
+  });
+
+  it("resolveLoadingStart：有 since 且不在未来 → 用它；否则（没有 / 时钟偏差的未来值）按挂载那一刻", () => {
+    expect(resolveLoadingStart(1000, 5000)).toBe(1000);
+    expect(resolveLoadingStart(5000, 5000)).toBe(5000);
+    expect(resolveLoadingStart(undefined, 5000)).toBe(5000);
+    expect(resolveLoadingStart(9000, 5000)).toBe(5000);
+  });
+
+  it("重挂后的已等待秒数：按真实起点算，阶段文案不会退回「准备环境…」", () => {
+    const since = 1_000_000;
+    const remountAt = since + 20_000;
+    const t0 = resolveLoadingStart(since, remountAt);
+    expect(Math.floor((remountAt - t0) / 1000)).toBe(20);
   });
 });

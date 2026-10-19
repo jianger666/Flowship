@@ -14,6 +14,7 @@ import {
   toolArgsLookLikeAskWait,
 } from "@/lib/ask-wait-detect";
 import { isBootStageInfo } from "@/lib/chat-stream-display";
+import { isShellBackgroundMarkerEvent } from "@/lib/shell-background";
 import { isInTurnToolErrorEvent } from "@/lib/tool-display";
 import {
   groupRunTagOf,
@@ -59,6 +60,8 @@ export const isHiddenFromEventStream = (
   if (ev.meta?.muted === true) return true;
   // 跳过 / 过期标记：卡片折叠行已经说了，别同话说两遍
   if (isAskSkipMarkerEvent(ev) || isAskExpireMarkerEvent(ev)) return true;
+  // 后台 shell 运行 / 结束标记：只给 shell 块的转圈用（见 buildStreamItems），本身不是一行内容
+  if (isShellBackgroundMarkerEvent(ev)) return true;
   // 提问挂着的 ask-wait curl：协议内部，不是用户要看的工作过程
   if (isAskWaitStreamEvent(ev)) return true;
   // 回合内工具失败误写成 kind=error（红卡留给整轮崩溃）

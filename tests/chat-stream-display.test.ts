@@ -11,10 +11,13 @@ import {
   USER_MSG_COLLAPSE_LINES,
   extractActiveBootStage,
   isBootStageInfo,
+  isMarkdownUserReply,
+  isScheduleUserReply,
   isStopMarkerInfo,
   resolveStickyTurn,
   shouldCollapseUserMessage,
   shouldShowTurnDivider,
+  userReplyDisplayText,
 } from "@/lib/chat-stream-display";
 import type { TaskEvent } from "@/lib/types";
 
@@ -96,6 +99,78 @@ describe("shouldShowTurnDivider（每轮分割线）", () => {
   it("此前只有 __work_group__（正文被吸组）→ 画", () => {
     const kinds = ["user_reply", "__work_group__", "user_reply"];
     expect(shouldShowTurnDivider(kinds, 2)).toBe(true);
+  });
+});
+
+describe("userReplyDisplayText / isScheduleUserReply：user_reply 给人看的文本（气泡与粘顶头共用）", () => {
+  const BOILERPLATE = "[SCHEDULE_FIRED id=sch_a]\n这是你之前设的定时……\n标题：看 CI\n去看 CI 结果";
+
+  it("定时触发：显示 AI 当时留给自己的话，不是整段 [SCHEDULE_FIRED …] 样板", () => {
+    const e = { text: BOILERPLATE, meta: { source: "schedule", scheduleMessage: "  去看 CI 结果  " } };
+    expect(isScheduleUserReply(e)).toBe(true);
+    expect(userReplyDisplayText(e)).toBe("去看 CI 结果");
+  });
+
+  it("定时触发但 meta 里没有 scheduleMessage（旧数据）→ 回落原文，不显示空白", () => {
+    expect(userReplyDisplayText({ text: BOILERPLATE, meta: { source: "schedule" } })).toBe(BOILERPLATE);
+    expect(userReplyDisplayText({ text: BOILERPLATE, meta: { source: "schedule", scheduleMessage: "   " } })).toBe(
+      BOILERPLATE,
+    );
+  });
+
+  it("飞书群里属主自己的消息：剥内部前缀；剥空了回落原文", () => {
+    expect(
+      userReplyDisplayText({ text: "[群消息·来自 李四]\n这个接口啥时候好？", meta: { source: "feishu_group" } }),
+    ).toBe("这个接口啥时候好？");
+    expect(userReplyDisplayText({ text: "[群消息·来自 李四]", meta: { source: "feishu_group" } })).toBe(
+      "[群消息·来自 李四]",
+    );
+  });
+
+  it("普通用户消息 / 没有 meta / 没有 text：原样（不误剥）", () => {
+    expect(userReplyDisplayText({ text: "[Bug] 登录失败" })).toBe("[Bug] 登录失败");
+    expect(userReplyDisplayText({ text: "你好", meta: { source: "feishu" } })).toBe("你好");
+    expect(userReplyDisplayText({})).toBe("");
+    expect(isScheduleUserReply({})).toBe(false);
+    expect(isScheduleUserReply({ meta: { source: "feishu" } })).toBe(false);
+  });
+});
+
+describe("isMarkdownUserReply：只有飞书群里机器人发来的才按 markdown 渲染", () => {
+  it("source=feishu_group 且服务端明写 groupSenderIsBot=true → 是", () => {
+    expect(isMarkdownUserReply({ meta: { source: "feishu_group", groupSenderIsBot: true } })).toBe(true);
+  });
+
+  it("真人群消息（没写 groupSenderIsBot / false）、用户自己输入、飞书私聊、定时触发 → 都不是（保持纯文本，`*` `_` 不被当排版）", () => {
+    expect(isMarkdownUserReply({ meta: { source: "feishu_group" } })).toBe(false);
+    expect(isMarkdownUserReply({ meta: { source: "feishu_group", groupSenderIsBot: false } })).toBe(false);
+    // 只认严格的 true：字符串 / 数字都不算（不猜）
+    expect(isMarkdownUserReply({ meta: { source: "feishu_group", groupSenderIsBot: "true" } })).toBe(false);
+    expect(isMarkdownUserReply({ meta: { source: "feishu_group", groupSenderIsBot: 1 } })).toBe(false);
+    expect(isMarkdownUserReply({})).toBe(false);
+    expect(isMarkdownUserReply({ meta: null })).toBe(false);
+    expect(isMarkdownUserReply({ meta: { source: "feishu" } })).toBe(false);
+    // 不是群消息却带着 groupSenderIsBot（脏数据）：不渲染
+    expect(isMarkdownUserReply({ meta: { groupSenderIsBot: true } })).toBe(false);
+    expect(isMarkdownUserReply({ meta: { source: "schedule", groupSenderIsBot: true } })).toBe(false);
+  });
+});
+
+describe("resolveStickyTurn：粘顶头显示展示文本（review 🟡）", () => {
+  it("定时触发的那一轮粘顶头显示 AI 留的话，不是原始样板；普通轮次不受影响", () => {
+    const items = [
+      { id: "u1", kind: "user_reply", text: "普通问题" },
+      { id: "a1", kind: "assistant_message", text: "回答" },
+      {
+        id: "s1",
+        kind: "user_reply",
+        text: "[SCHEDULE_FIRED id=sch_a]\n……样板……",
+        meta: { source: "schedule", scheduleMessage: "去看 CI 结果" },
+      },
+      { id: "a2", kind: "assistant_message", text: "好的" },
+    ];
+    expect(resolveStickyTurn(items, 1)).toEqual({ id: "u1", text: "普通问题" });
+    expect(resolveStickyTurn(items, 3)).toEqual({ id: "s1", text: "去看 CI 结果" });
   });
 });
 

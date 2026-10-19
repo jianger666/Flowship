@@ -100,6 +100,30 @@ export const backgroundSubagentJobsEqual = (
   });
 };
 
+/**
+ * 后台任务 id 的形状：`bg_` + 8 位小写十六进制（服务端 `bg_${randomUUID().slice(0, 8)}`，见 cursor-subagent.ts）。
+ * 服务端把 id 写进了 `subagent` 工具返回给模型的文本里（`已在后台启动子代理「…」（后台任务 bg_xxxxxxxx）` /
+ * `[这个子代理已转到后台继续运行] …（后台任务 bg_xxxxxxxx）…`），事件流上那张子代理卡的 `result.output` 就是这段文本——
+ * 这是卡片 ↔ 后台清单里某一项之间唯一稳定的联系（清单没有 callId；过程记录按 callId 配对是另一套、会晚到）。
+ */
+const BACKGROUND_JOB_ID_RE = /\bbg_[0-9a-f]{8}\b/g;
+
+/** 文本里出现的所有后台任务 id（去重、保序）；没有 / 入参不是字符串 → 空数组 */
+export const backgroundJobIdsInText = (text: unknown): string[] => {
+  if (typeof text !== "string" || text.length === 0) return [];
+  return [...new Set(text.match(BACKGROUND_JOB_ID_RE) ?? [])];
+};
+
+/**
+ * 此刻还在后台跑的任务 id 集合（事件流给子代理卡打「仍在运行」标用）。
+ * 同一份 jobs 反复调用得到「内容相同」的集合；空清单返回共享的空集合（引用稳定，下游 memo 不被击穿）。
+ */
+export const NO_BACKGROUND_JOB_IDS: ReadonlySet<string> = new Set();
+export const backgroundJobIdSet = (
+  jobs: readonly Pick<BackgroundSubagentJobView, "id">[] | undefined,
+): ReadonlySet<string> =>
+  jobs && jobs.length > 0 ? new Set(jobs.map((j) => j.id)) : NO_BACKGROUND_JOB_IDS;
+
 /** 条上的一行说明 */
 export interface BackgroundSubagentSummary {
   /** 主文案：`子代理「查资料」在后台工作` / `3 个子代理在后台工作` */

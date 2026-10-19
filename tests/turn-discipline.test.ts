@@ -8,6 +8,7 @@ import path from "node:path";
 
 import {
   ASK_USER_TURN_LINE,
+  SCHEDULE_TOOL_TURN_LINE,
   WAIT_TOOL_TURN_LINE,
   chatTurnProtocolSection,
   turnDisciplineSection,
@@ -116,6 +117,71 @@ describe("turn-discipline wait 工具单一源", () => {
 
     it("交卷之后不要再调 wait（防止交卷后挂着不结束本轮）", () => {
       expect(section).toMatch(/交卷[^\n]*之后不要再调/);
+    });
+  });
+});
+
+describe("turn-discipline schedule 工具单一源", () => {
+  it("SCHEDULE_TOOL_TURN_LINE 正向引导调 schedule：设完正常结束本轮、别 wait 硬睡 / 别自己写 sleep·cron、message 写三件事、错过不补发", () => {
+    expect(SCHEDULE_TOOL_TURN_LINE).toContain("`schedule`");
+    expect(SCHEDULE_TOOL_TURN_LINE).toContain("正常结束本轮");
+    expect(SCHEDULE_TOOL_TURN_LINE).toContain("别用 `wait` 硬睡");
+    expect(SCHEDULE_TOOL_TURN_LINE).toContain("cron");
+    expect(SCHEDULE_TOOL_TURN_LINE).toContain("`cancel`");
+    expect(SCHEDULE_TOOL_TURN_LINE).toContain("不会补发");
+  });
+
+  it("chat / task 段都引用同一行（不各写各的，改措辞只改一处）", () => {
+    expect(chatTurnProtocolSection()).toContain(SCHEDULE_TOOL_TURN_LINE);
+    expect(turnDisciplineSection()).toContain(SCHEDULE_TOOL_TURN_LINE);
+  });
+
+  it("与 wait 行并存、各管一件事：wait 行还在，schedule 行在它后面", () => {
+    for (const section of [chatTurnProtocolSection(), turnDisciplineSection()]) {
+      const w = section.indexOf(WAIT_TOOL_TURN_LINE);
+      const s = section.indexOf(SCHEDULE_TOOL_TURN_LINE);
+      expect(w).toBeGreaterThanOrEqual(0);
+      expect(s).toBeGreaterThan(w);
+    }
+  });
+
+  describe("task 主提示词 _super.md 的 schedule 段", () => {
+    const sup = readFileSync(
+      path.resolve(import.meta.dirname, "..", "prompts", "_super.md"),
+      "utf-8",
+    );
+    const section = (() => {
+      const start = sup.indexOf("**`schedule`（之后再叫你）**");
+      if (start < 0) throw new Error("_super.md 缺「`schedule`（之后再叫你）」段");
+      const end = sup.indexOf("\n## ", start);
+      return sup.slice(start, end);
+    })();
+
+    it("独立成段、紧跟 wait 段之后，且位于核心机制里（在「用户操作怎么到你手上」之前）", () => {
+      expect(sup.indexOf("**`wait`（等外部的事）**")).toBeLessThan(
+        sup.indexOf("**`schedule`（之后再叫你）**"),
+      );
+      expect(sup.indexOf("**`schedule`（之后再叫你）**")).toBeLessThan(
+        sup.indexOf("## 用户操作怎么到你手上"),
+      );
+    });
+
+    it("与共享行同口径：别 wait 硬睡 / 别自己写 sleep·cron、设完正常结束本轮、message 三件事、错过不补发", () => {
+      for (const phrase of ["`wait`", "cron", "正常结束本轮", "`cancel`", "不会补发"]) {
+        expect(section, phrase).toContain(phrase);
+        expect(SCHEDULE_TOOL_TURN_LINE, phrase).toContain(phrase);
+      }
+    });
+
+    it("交代到点消息的头部信号：不是用户说话，task 里前面还有 [USER_MESSAGE]，别走疑问 / 修改二分类", () => {
+      expect(section).toContain("[SCHEDULE_FIRED id=…]");
+      expect(section).toContain("[USER_MESSAGE]");
+      expect(section).toContain("不是用户说话");
+      expect(section).toContain("二分类");
+    });
+
+    it("归档 / 删除时定时一起取消的口径写明", () => {
+      expect(section).toContain("归档 / 删除");
     });
   });
 });

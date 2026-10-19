@@ -62,7 +62,7 @@ const useNow = (): number => {
 
 /** 条本体的样式：单个直接开详情（button）/ 多个当 Popover 的触发器，两处共用 */
 const BAR_CLASS =
-  "flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-muted/50";
+  "flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5 text-left text-xs outline-none transition-colors hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50";
 
 const BarContent = ({
   summary,
@@ -135,7 +135,12 @@ const JobsListPopover = ({
     <Popover open={listOpen} onOpenChange={setListOpen}>
       <PopoverTrigger
         render={
-          <button type="button" className={BAR_CLASS}>
+          <button
+            type="button"
+            // 与单个后台条同口径：抽屉开着时点它（弹出列表）不算「点了抽屉外面」，不然抽屉被关、而单个条却不会
+            data-subagent-opener=""
+            className={BAR_CLASS}
+          >
             <BarContent summary={summary} elapsed={elapsed} multiple={multiple} />
           </button>
         }
@@ -226,6 +231,8 @@ const BarBody = ({ jobs }: { jobs: readonly BackgroundSubagentJobView[] }) => {
           <button
             type="button"
             data-bg-subagent-open-detail
+            // 抽屉开着时点这条 = 保持打开，不算「点了抽屉外面」（见 keepsSubagentDrawerOpen）
+            data-subagent-opener=""
             onClick={() => openDetail(singleTarget)}
             className={BAR_CLASS}
           >

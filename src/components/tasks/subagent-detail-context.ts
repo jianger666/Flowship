@@ -7,7 +7,7 @@
  * 而子代理卡片（`tool-block.tsx`）又要拿「打开面板」的入口——放一起就是 tool-block ↔ subagent-detail 的循环依赖。
  * 这里只有 context，谁都可以依赖它。
  *
- * 没有宿主（`SubagentDetailHost`，挂在 EventStream 根上）的地方拿到 null：卡片 / 条据此不画「详情」入口。
+ * 没有宿主（`SubagentDetailHost`，挂在 EventStream 根上）的地方拿到 null：卡片 / 条据此退成不可点的展示行。
  */
 
 import { createContext, useContext } from "react";
@@ -20,6 +20,6 @@ export const SubagentDetailContext = createContext<OpenSubagentDetail | null>(
   null,
 );
 
-/** 拿「打开子代理详情」的函数；不在宿主里返回 null（调用方据此决定画不画入口） */
+/** 拿「打开子代理详情」的函数；不在宿主里返回 null（调用方据此决定整条是不是可点） */
 export const useOpenSubagentDetail = (): OpenSubagentDetail | null =>
   useContext(SubagentDetailContext);

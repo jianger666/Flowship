@@ -1,13 +1,17 @@
 /**
  * run cancel / 终结后未闭合 tool_call 被 finalize 为 interrupted
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
+import {
+  buildShellBackgroundEvent,
+  collectRunningBackgroundShells,
+} from "@/lib/shell-background";
 import type { TaskEvent } from "@/lib/types";
 import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 
@@ -24,7 +28,11 @@ const { writeOwnedEventAndPublish } = await import("@/lib/server/task-stream");
 const {
   collectOpenToolCalls,
   finalizeOpenToolCalls,
+  finalizeSideRunBackgroundShells,
 } = await import("@/lib/server/finalize-open-tools");
+const { activeBackgroundShellTrackerCount, trackBackgroundShell } = await import(
+  "@/lib/server/shell-background-tracker"
+);
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
@@ -365,5 +373,329 @@ describe("群答疑旁路遗留的 tool_call（G2-02）", () => {
 
     // 幂等
     expect(await finalizeOpenToolCalls(id, lease)).toBe(0);
+  });
+});
+
+// shell 转后台后 tool_call 早已完成，不归「未配对 tool_call」管；但它的 running 标记会让渲染层继续转圈。
+// run 收尾不补 ended 的话，下一轮会话一 running，这块旧 shell 又转起来。
+describe("后台 shell 标记的收尾（running → ended/run-ended）", () => {
+  const ids: string[] = [];
+  const RUN_TAG = "grp_run_bg";
+
+  afterEach(() => {
+    for (const id of ids.splice(0)) {
+      clearEventSeqCounter(id);
+    }
+  });
+
+  const newTask = async (tag: string): Promise<string> => {
+    const id = `t_fotbg_${tag}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    ids.push(id);
+    await writeMeta(makeMeta(id));
+    return id;
+  };
+
+  const writeMarker = async (
+    id: string,
+    callId: string,
+    phase: "running" | "ended",
+    origin?: string,
+  ) =>
+    writeOwnedEventAndPublish(
+      id,
+      () => true,
+      buildShellBackgroundEvent({
+        callId,
+        phase,
+        ...(phase === "ended" ? { reason: "exited" as const } : {}),
+      }),
+      origin,
+    );
+
+  it("仍标着运行中的后台 shell → 补写 ended(run-ended)；不计入返回值；幂等", async () => {
+    const id = await newTask("basic");
+    await writeMarker(id, "call_bg", "running");
+    expect(collectRunningBackgroundShells(await readEvents(id))).toHaveLength(1);
+
+    const lease = () => true;
+    // 返回值只数被中断的工具——这里没有未闭合工具，所以是 0
+    expect(await finalizeOpenToolCalls(id, lease)).toBe(0);
+
+    const events = await readEvents(id);
+    expect(collectRunningBackgroundShells(events)).toEqual([]);
+    const last = events[events.length - 1];
+    expect(last.kind).toBe("info");
+    expect(last.meta).toMatchObject({
+      shellBackground: { callId: "call_bg", phase: "ended", reason: "run-ended" },
+    });
+    // 标记是内部状态、不渲染
+    expect(isHiddenFromEventStream(last)).toBe(true);
+
+    // 幂等：再收尾不再写
+    const before = events.length;
+    await finalizeOpenToolCalls(id, lease);
+    expect((await readEvents(id)).length).toBe(before);
+  });
+
+  it("已经 ended（进程自己退出了）的不重复收", async () => {
+    const id = await newTask("already");
+    await writeMarker(id, "call_done", "running");
+    await writeMarker(id, "call_done", "ended");
+    const before = (await readEvents(id)).length;
+    await finalizeOpenToolCalls(id, () => true);
+    expect((await readEvents(id)).length).toBe(before);
+  });
+
+  it("与未闭合 tool_call 同时存在：工具照旧补 interrupted（返回 1），后台 shell 标记也收掉", async () => {
+    const id = await newTask("mixed");
+    const lease = () => true;
+    await writeOwnedEventAndPublish(id, lease, {
+      kind: "tool_call",
+      text: "调用 read",
+      meta: { callId: "call_open", name: "read" },
+    });
+    await writeMarker(id, "call_bg", "running");
+
+    expect(await finalizeOpenToolCalls(id, lease)).toBe(1);
+    const events = await readEvents(id);
+    expect(
+      events.some(
+        (e) => e.kind === "tool_result" && e.meta?.callId === "call_open",
+      ),
+    ).toBe(true);
+    expect(collectRunningBackgroundShells(events)).toEqual([]);
+  });
+
+  it("lease 失主 → 不写（旧 run 无权替新 run 收标记）", async () => {
+    const id = await newTask("lease");
+    await writeMarker(id, "call_bg", "running");
+    const before = (await readEvents(id)).length;
+    await finalizeOpenToolCalls(id, () => false);
+    const after = await readEvents(id);
+    expect(after.length).toBe(before);
+    expect(collectRunningBackgroundShells(after)).toHaveLength(1);
+  });
+
+  it("旁路 run 的标记：补写的 ended 带回同一个 groupRun，仍被属主主流藏起来", async () => {
+    const id = await newTask("grp");
+    await writeMarker(id, "side_bg", "running", RUN_TAG);
+    await writeMarker(id, "own_bg", "running");
+
+    await finalizeOpenToolCalls(id, () => true);
+    const events = await readEvents(id);
+    expect(collectRunningBackgroundShells(events)).toEqual([]);
+    const sideEnd = events.find(
+      (e) =>
+        (e.meta?.shellBackground as { callId?: string; phase?: string } | undefined)
+          ?.callId === "side_bg" &&
+        (e.meta?.shellBackground as { phase?: string }).phase === "ended",
+    );
+    const ownEnd = events.find(
+      (e) =>
+        (e.meta?.shellBackground as { callId?: string; phase?: string } | undefined)
+          ?.callId === "own_bg" &&
+        (e.meta?.shellBackground as { phase?: string }).phase === "ended",
+    );
+    expect(sideEnd?.meta?.groupRun).toBe(RUN_TAG);
+    expect(ownEnd?.meta?.groupRun).toBeUndefined();
+  });
+
+  it("收尾同时停掉该任务还在轮询终端文件的追踪（之后不会再写 ended(exited)）", async () => {
+    const id = await newTask("stop");
+    const cursorDir = path.join(TMP_ROOT, "cursor-data");
+    const prevEnv = process.env.CURSOR_DATA_DIR;
+    process.env.CURSOR_DATA_DIR = cursorDir;
+    try {
+      const t = Date.now();
+      const dir = path.join(cursorDir, "projects", "ws", "terminals");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, "1.txt"),
+        `---\npid: 5\ncwd: "/w"\ncommand: "sleep 99"\nstatus: running  \nstarted_at: ${new Date(t).toISOString()}\nrunning_for_ms: 0        \n---\n`,
+        "utf8",
+      );
+      const writes: string[] = [];
+      const done = trackBackgroundShell({
+        taskId: id,
+        callId: "call_poll",
+        command: "sleep 99",
+        startedAtMs: t,
+        lease: () => true,
+        probeDelayMs: 5,
+        pollIntervalMs: 60_000,
+        isPidAlive: () => true,
+        write: async (m) => {
+          writes.push(m.phase);
+        },
+      });
+      const start = Date.now();
+      while (writes.length < 1 && Date.now() - start < 3000) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      expect(writes).toEqual(["running"]);
+      expect(activeBackgroundShellTrackerCount()).toBe(1);
+
+      await finalizeOpenToolCalls(id, () => true);
+      await done;
+      expect(activeBackgroundShellTrackerCount()).toBe(0);
+      expect(writes).toEqual(["running"]);
+    } finally {
+      if (prevEnv === undefined) delete process.env.CURSOR_DATA_DIR;
+      else process.env.CURSOR_DATA_DIR = prevEnv;
+    }
+  });
+  it("收尾先停追踪、等在途写盘落定、再读事件尾巴：正在落盘的 running 标记也会被补 ended（不留孤儿）", async () => {
+    const id = await newTask("race");
+    const cursorDir = path.join(TMP_ROOT, "cursor-data-race");
+    const prevEnv = process.env.CURSOR_DATA_DIR;
+    process.env.CURSOR_DATA_DIR = cursorDir;
+    try {
+      const t = Date.now();
+      const dir = path.join(cursorDir, "projects", "ws", "terminals");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, "1.txt"),
+        `---\npid: 5\ncwd: "/w"\ncommand: "sleep 77"\nstatus: running  \nstarted_at: ${new Date(t).toISOString()}\nrunning_for_ms: 0        \n---\n`,
+        "utf8",
+      );
+      let writeStarted = false;
+      const done = trackBackgroundShell({
+        taskId: id,
+        callId: "call_race",
+        command: "sleep 77",
+        startedAtMs: t,
+        lease: () => true,
+        probeDelayMs: 5,
+        pollIntervalMs: 60_000,
+        isPidAlive: () => true,
+        // 慢写盘：标记是在 finalize 已经开始之后才真正落盘的
+        write: async (m) => {
+          writeStarted = true;
+          await new Promise((r) => setTimeout(r, 120));
+          await writeMarker(id, m.callId, m.phase === "running" ? "running" : "ended");
+        },
+      });
+      const start = Date.now();
+      while (!writeStarted && Date.now() - start < 3000) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      expect(writeStarted).toBe(true);
+      // 此刻 running 标记还没落盘
+      expect(collectRunningBackgroundShells(await readEvents(id))).toEqual([]);
+
+      await finalizeOpenToolCalls(id, () => true);
+      await done;
+
+      const events = await readEvents(id);
+      // 在途的 running 落盘后被同一轮收尾读到并补了 ended——没有孤儿 running
+      expect(collectRunningBackgroundShells(events)).toEqual([]);
+      const phases = events
+        .map((e) => (e.meta?.shellBackground as { phase?: string } | undefined)?.phase)
+        .filter(Boolean);
+      expect(phases).toEqual(["running", "ended"]);
+      expect(activeBackgroundShellTrackerCount()).toBe(0);
+    } finally {
+      if (prevEnv === undefined) delete process.env.CURSOR_DATA_DIR;
+      else process.env.CURSOR_DATA_DIR = prevEnv;
+    }
+  });
+
+  it("finalizeSideRunBackgroundShells：只收这个旁路 run 自己的 running；属主 / 别的旁路 run 的不碰，带回同一个 groupRun", async () => {
+    const id = await newTask("side");
+    await writeMarker(id, "mine_bg", "running", "grp_mine");
+    await writeMarker(id, "other_side_bg", "running", "grp_other");
+    await writeMarker(id, "owner_bg", "running");
+
+    await finalizeSideRunBackgroundShells(id, "grp_mine", () => true);
+
+    const events = await readEvents(id);
+    expect(
+      collectRunningBackgroundShells(events)
+        .map((s) => s.callId)
+        .sort(),
+    ).toEqual(["other_side_bg", "owner_bg"]);
+    const ended = events.find(
+      (e) =>
+        (e.meta?.shellBackground as { callId?: string; phase?: string } | undefined)
+          ?.callId === "mine_bg" &&
+        (e.meta?.shellBackground as { phase?: string }).phase === "ended",
+    );
+    expect(ended?.meta?.groupRun).toBe("grp_mine");
+    expect(
+      (ended?.meta?.shellBackground as { reason?: string } | undefined)?.reason,
+    ).toBe("run-ended");
+    expect(isHiddenFromEventStream(ended as TaskEvent)).toBe(true);
+  });
+
+  it("finalizeSideRunBackgroundShells：失主不写；读尾巴失败也不抛（不能拖垮旁路 run 的收口）", async () => {
+    const id = await newTask("side-lease");
+    await writeMarker(id, "mine_bg", "running", "grp_mine");
+    const before = (await readEvents(id)).length;
+    await finalizeSideRunBackgroundShells(id, "grp_mine", () => false);
+    expect((await readEvents(id)).length).toBe(before);
+
+    // 任务不存在 → 读不到事件，照样 resolve
+    await expect(
+      finalizeSideRunBackgroundShells("t_not_exists_xyz", "grp_mine", () => true),
+    ).resolves.toBeUndefined();
+  });
+
+  it("finalizeSideRunBackgroundShells：只停该旁路 run 自己的追踪，属主 / 别的旁路 run 的追踪继续", async () => {
+    const id = await newTask("side-stop");
+    const cursorDir = path.join(TMP_ROOT, "cursor-data-side");
+    const prevEnv = process.env.CURSOR_DATA_DIR;
+    process.env.CURSOR_DATA_DIR = cursorDir;
+    try {
+      const t = Date.now();
+      const dir = path.join(cursorDir, "projects", "ws", "terminals");
+      mkdirSync(dir, { recursive: true });
+      const put = (n: number, command: string) =>
+        writeFileSync(
+          path.join(dir, `${n}.txt`),
+          `---\npid: 5\ncwd: "/w"\ncommand: "${command}"\nstatus: running  \nstarted_at: ${new Date(t).toISOString()}\nrunning_for_ms: 0        \n---\n`,
+          "utf8",
+        );
+      put(1, "job-side");
+      put(2, "job-owner");
+      const writes: string[] = [];
+      const mk = (command: string, origin?: string) =>
+        trackBackgroundShell({
+          taskId: id,
+          callId: `call_${command}`,
+          command,
+          startedAtMs: t,
+          lease: () => true,
+          probeDelayMs: 5,
+          pollIntervalMs: 60_000,
+          isPidAlive: () => true,
+          ...(origin ? { origin } : {}),
+          write: async (m) => {
+            writes.push(`${m.callId}:${m.phase}`);
+          },
+        });
+      const doneSide = mk("job-side", "grp_side");
+      const doneOwner = mk("job-owner");
+      const start = Date.now();
+      while (writes.length < 2 && Date.now() - start < 3000) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      expect(writes.sort()).toEqual([
+        "call_job-owner:running",
+        "call_job-side:running",
+      ]);
+      expect(activeBackgroundShellTrackerCount()).toBe(2);
+
+      await finalizeSideRunBackgroundShells(id, "grp_side", () => true);
+      await doneSide;
+      expect(activeBackgroundShellTrackerCount()).toBe(1);
+
+      // 属主的追踪还活着；属主 finalize 才会把它停掉
+      await finalizeOpenToolCalls(id, () => true);
+      await doneOwner;
+      expect(activeBackgroundShellTrackerCount()).toBe(0);
+    } finally {
+      if (prevEnv === undefined) delete process.env.CURSOR_DATA_DIR;
+      else process.env.CURSOR_DATA_DIR = prevEnv;
+    }
   });
 });

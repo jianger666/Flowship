@@ -38,6 +38,12 @@ export type WorkGroupItem = {
   hasError: boolean;
   /** 组内含 running 状态工具块（或末尾有进行中的思考——见 attachLiveThinking） */
   hasRunning: boolean;
+  /**
+   * 组内有「调用已返回、但活还在后台干」的工具块（shell 转后台 / 后台子代理，见 ToolBlock.backgroundRunning）。
+   * 只管折叠组头要不要继续转圈——**不**参与 hasRunning（不触发自动展开、不影响「处理中…」占位）：
+   * 后台的活可能跑很久（dev server 一类），不能让组一直弹开。缺省 = false。
+   */
+  hasBackground?: boolean;
   /** 首成员 ts */
   startTs: number;
   /** 末成员 ts */
@@ -357,6 +363,22 @@ export const isBootInfoItem = (it: StreamRenderItem): boolean => {
   return isBootInfoText(ev.text);
 };
 
+/**
+ * 这一项是不是「只有启动链提示」的工作过程组（成员全是启动链 info：准备工作区 / 启动 agent / MCP 跳过…）。
+ *
+ * 用途：判断 agent 是不是还没干任何实际的事。流尾是这种组 = 启动提示已经落盘、但模型还没开口，
+ * 此时「还在等」的进度行不能因为末项不再是 user_reply 就消失——启动阶段的 ephemeral 进度行（BootStageRow）
+ * 只在内存里、切走再切回就没了（见 server/boot-progress.ts），列表里不补一行就什么「在转」的东西都不剩。
+ * 空组不算（没有成员说明不了任何事）。
+ */
+export const isBootOnlyWorkGroup = (
+  it: { kind: string } | null | undefined,
+): boolean => {
+  if (!it || it.kind !== "__work_group__") return false;
+  const members = (it as WorkGroupItem).members;
+  return members.length > 0 && members.every((m) => isBootInfoItem(m));
+};
+
 /** 组内含 ⚠️ 警告行（MCP 跳过等）——组头挂标，折叠也不吞提示 */
 export const groupHasBootWarn = (
   members: readonly StreamRenderItem[],
@@ -389,6 +411,10 @@ const memberHasRunning = (it: StreamRenderItem): boolean => {
   return false;
 };
 
+/** 工具块已返回、但后台还在跑（verb-group 只装读 / 列 / 搜类，不会有） */
+const memberHasBackground = (it: StreamRenderItem): boolean =>
+  it.kind === "__tool_block__" && (it as ToolBlock).backgroundRunning === true;
+
 const buildWorkGroup = (members: StreamRenderItem[]): WorkGroupItem => {
   const first = members[0]!;
   const last = members[members.length - 1]!;
@@ -398,6 +424,7 @@ const buildWorkGroup = (members: StreamRenderItem[]): WorkGroupItem => {
     members,
     hasError: members.some(memberHasError),
     hasRunning: members.some(memberHasRunning),
+    hasBackground: members.some(memberHasBackground),
     startTs: first.ts,
     endTs: last.ts,
     stepCount: members.length,

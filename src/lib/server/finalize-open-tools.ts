@@ -7,7 +7,12 @@
  */
 
 import { readEventsTail } from "./task-fs-core";
+import { stopBackgroundShellTracking } from "./shell-background-tracker";
 import { writeOwnedEventAndPublish } from "./task-stream";
+import {
+  buildShellBackgroundEvent,
+  collectRunningBackgroundShells,
+} from "@/lib/shell-background";
 import type { TaskEvent } from "@/lib/types";
 
 /**
@@ -84,11 +89,17 @@ export const finalizeOpenToolCalls = async (
   lease: () => boolean,
 ): Promise<number> => {
   if (!lease()) return 0;
+
+  // 本轮收尾：不再轮询后台 shell 的终端文件（它们由下面补写 ended 收掉）。
+  // **必须在读事件尾巴之前**、并等在途追踪落定：追踪可能正好在写 running 标记，
+  // 先读尾巴再停的话，读到的快照里没有这条 running，它晚到落盘后就成了永远没人补 ended 的孤儿。
+  await stopBackgroundShellTracking(taskId);
+  if (!lease()) return 0;
+
   const { events } = await readEventsTail(taskId, FINALIZE_SCAN_TAIL);
   if (!lease()) return 0;
 
   const open = collectOpenToolCalls(events);
-  if (open.length === 0) return 0;
 
   let written = 0;
   for (const tool of open) {
@@ -118,5 +129,77 @@ export const finalizeOpenToolCalls = async (
       `[finalize-open-tools] task=${taskId} 闭合未完成工具 ${written}/${open.length}`,
     );
   }
+
+  await closeRunningBackgroundShells(taskId, lease, events);
   return written;
+};
+
+/**
+ * 群答疑旁路 run 收尾：只收**它自己**（`origin` = runTag）起的后台 shell。
+ *
+ * 旁路 run 的 lease 只在被取消时才翻（见 restricted-question 的 record.cancelled）、正常结束不翻——
+ * 不在这里收尾的话，它的追踪会一直轮询到进程退出（dev server 就是永远），「群问答」里的转圈也永远不停。
+ * 与属主 run 的收尾口径一致：停追踪（等在途写入落定）→ 补写 ended(run-ended)（不是杀进程）。
+ * 永不 reject：收尾失败不能影响旁路 run 自己的收口。
+ */
+export const finalizeSideRunBackgroundShells = async (
+  taskId: string,
+  origin: string,
+  lease: () => boolean,
+): Promise<void> => {
+  try {
+    await stopBackgroundShellTracking(taskId, origin);
+    if (!lease()) return;
+    const { events } = await readEventsTail(taskId, FINALIZE_SCAN_TAIL);
+    const mine = collectRunningBackgroundShells(events).filter(
+      (shell) => shell.groupRun === origin,
+    );
+    for (const shell of mine) {
+      if (!lease()) return;
+      await writeOwnedEventAndPublish(
+        taskId,
+        lease,
+        buildShellBackgroundEvent({
+          callId: shell.callId,
+          phase: "ended",
+          reason: "run-ended",
+        }),
+        origin,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `[finalize-open-tools] 旁路 run 后台 shell 收尾失败 task=${taskId}`,
+      err,
+    );
+  }
+};
+
+/**
+ * 收尾时仍标着「后台运行中」的 shell：补写 ended(run-ended)。
+ *
+ * shell 转后台后 tool_call 早已完成，不归上面的「未配对 tool_call」管；但它的 running 标记会让
+ * 渲染层继续转圈——不收的话，下一轮对话一开始（会话重新 running）这块旧 shell 又会转起来。
+ * 进程可能还活着（比如留了个 dev server），这里收的是「这一轮不再展示转圈」，不是杀进程。
+ * 不计入返回值（返回值只数被中断的工具）。同样只看尾部窗口、写前复查 lease。
+ */
+const closeRunningBackgroundShells = async (
+  taskId: string,
+  lease: () => boolean,
+  events: readonly TaskEvent[],
+): Promise<void> => {
+  for (const shell of collectRunningBackgroundShells(events)) {
+    if (!lease()) return;
+    await writeOwnedEventAndPublish(
+      taskId,
+      lease,
+      buildShellBackgroundEvent({
+        callId: shell.callId,
+        phase: "ended",
+        reason: "run-ended",
+      }),
+      // 与 running 标记同一个身份：旁路 run 的标记要由同一个 origin 收，才会一起被折叠
+      shell.groupRun,
+    );
+  }
 };

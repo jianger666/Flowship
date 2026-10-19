@@ -241,8 +241,11 @@ describe("task(log) 与 chat 对话外观统一", () => {
     expect(eventRow).toContain(
       'if (variant === "chat" || isAssistant || isUser)',
     );
-    // 不许再有 log 专属的第二套 assistant / user 渲染
-    expect(countOf(eventRow, "<MarkdownText")).toBe(1);
+    // 不许再有 log 专属的第二套 assistant / user 渲染：EventRow 里的 MarkdownText 只有两处，
+    // 都在这段共用分支里——AI 回复正文（text={ev.text}）、飞书群机器人的用户气泡（text={displayText}，chat / log 同一处）
+    expect(countOf(eventRow, "<MarkdownText")).toBe(2);
+    expect(countOf(eventRow, "<MarkdownText\n          size={isLog")).toBe(1);
+    expect(countOf(eventRow, "<MarkdownText text={displayText}")).toBe(1);
   });
 
   it("log 的 AI 回复只多一个可折叠的元信息头：aria-expanded + 共享行按钮 + 共享 chevron", () => {
@@ -460,9 +463,10 @@ describe("错误卡 / 提问卡：当前要你处理的强、已过去的弱", (
 });
 
 describe("键盘 / 读屏可达", () => {
-  it("所有折叠按钮都声明 aria-expanded（rows 5 处 / tool-block 4 处 / work-group 1 处）", () => {
+  it("所有折叠按钮都声明 aria-expanded（rows 5 处 / tool-block 3 处 / work-group 1 处）", () => {
     expect(countOf(rows, "aria-expanded")).toBeGreaterThanOrEqual(5);
-    expect(countOf(toolBlock, "aria-expanded")).toBeGreaterThanOrEqual(4);
+    // 子代理卡已不是折叠按钮（整条点击开抽屉、没有展开区），所以比原来少一处：普通块 / 待办 / 动词组
+    expect(countOf(toolBlock, "aria-expanded")).toBeGreaterThanOrEqual(3);
     expect(countOf(workGroup, "aria-expanded")).toBeGreaterThanOrEqual(1);
   });
 

@@ -5,7 +5,49 @@
  * 放组件里没法单测。event-stream / rows 只做渲染、判定逻辑单一来源在这。
  */
 
+import { cleanGroupQuestionText } from "@/lib/group-qa";
 import type { TaskEvent } from "@/lib/types";
+
+// ---------- user_reply 的展示文本 / 来源 ----------
+
+/** 只关心 meta 的最小形状（TaskEvent / 粘顶候选都满足） */
+type UserReplyLike = { text?: string; meta?: Record<string, unknown> | null };
+
+/**
+ * 这条 user_reply 是不是**定时到点由系统发的**（AI 之前用 schedule 工具给自己设的）。
+ * 它不是用户说的话：不给重发 / 编辑 / 重新生成（原样再发一遍 = 把整段系统样板、或 AI 自己写的备忘当成用户的话发出去，
+ * 等于绕过「定时消息不构成用户授权」的约定）。
+ */
+export const isScheduleUserReply = (ev: { meta?: Record<string, unknown> | null }): boolean =>
+  ev.meta?.source === "schedule";
+
+/**
+ * user_reply 给人看的文本（事件流气泡 / 粘顶轮次头共用一份，别各写一遍）：
+ * - 定时触发：`text` 是给 AI 看的整段样板（`[SCHEDULE_FIRED …]` + 处理要点），人只看 AI 当时留给自己的话（meta.scheduleMessage）；
+ * - 飞书群里属主自己的消息：剥掉喂给 agent 的内部前缀（`[群消息·来自 X]` 等）；
+ * - 其余原文。
+ * 只改展示：重发 / 编辑仍用原 `text`（前缀是给 agent 的上下文，原样重发语义才对）。
+ */
+export const userReplyDisplayText = (ev: UserReplyLike): string => {
+  const text = typeof ev.text === "string" ? ev.text : "";
+  if (isScheduleUserReply(ev)) {
+    const body = typeof ev.meta?.scheduleMessage === "string" ? ev.meta.scheduleMessage.trim() : "";
+    return body || text;
+  }
+  if (ev.meta?.source === "feishu_group") return cleanGroupQuestionText(text) || text;
+  return text;
+};
+
+/**
+ * 这条 user_reply 的正文要不要按 markdown 渲染：只有**飞书群里机器人发来的**才要。
+ * 机器人写的回复本来就是 markdown（行内代码 / 加粗 / 列表），按纯文本摆出来满屏 `**` 和反引号；
+ * 真人的群消息、用户自己在 App 里输入的、定时触发的备忘仍是纯文本——它们里的 `*` `_` `#` 不是排版标记，
+ * 按 markdown 解析会吃字 / 变格式。
+ * 判定只认服务端明写的 `groupSenderIsBot`（没写 = 不是机器人，不猜），与「机器人」徽标同一个口径。
+ * 只改展示：重发 / 编辑用的仍是原 `text`。
+ */
+export const isMarkdownUserReply = (ev: { meta?: Record<string, unknown> | null }): boolean =>
+  ev.meta?.source === "feishu_group" && ev.meta?.groupSenderIsBot === true;
 
 // ---------- 超长用户消息折叠（Codex 同款「显示更多」） ----------
 
@@ -66,6 +108,7 @@ export type StickyTurnCandidate = {
   id: string;
   kind: string;
   text?: string;
+  meta?: Record<string, unknown> | null;
 };
 
 /**
@@ -89,7 +132,8 @@ export const resolveStickyTurn = (
     const it = items[i];
     if (it && it.kind === "user_reply") {
       if (i < localIdx) {
-        return { id: it.id, text: typeof it.text === "string" ? it.text : "" };
+        // 粘顶头也走展示文本：定时触发的那条显示 AI 留的话、而不是整段 [SCHEDULE_FIRED …] 样板
+        return { id: it.id, text: userReplyDisplayText(it) };
       }
       return null;
     }

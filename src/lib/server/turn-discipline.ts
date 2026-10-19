@@ -34,6 +34,16 @@ export const WAIT_TOOL_TURN_LINE =
   "- 真有外部的事要等（命令跑完 / CI / 限流冷却 / 服务起来）→ 调 `wait` 工具睡一会儿，不要自己跑 sleep / watch / 轮询脚本，也不要用 SDK 自带的 await。它只是睡觉、**不替你检查**：醒来自己确认，没好再决定要不要继续等，间隔拉长一点。手头能做的先做完再等，别拿它空等（等用户回答用 `ask_user`、等用户下一步直接正常结束本轮，都不用 `wait`）";
 
 /**
+ * `schedule` 工具的使用纪律（chat / task 单一源）。
+ *
+ * 和 `wait` 分工：`wait` = 这一轮里睡几分钟（最长 30 分钟、占着本轮）；`schedule` = 结束本轮、
+ * 到点系统把消息发回来（可以隔几小时 / 几天、不占会话）。两者都不是「等用户」。
+ * 刻意把「写清做什么 / 怎么汇报 / 何时取消」放进措辞：成本护栏只靠 prompt（用户拍板不做硬限制）。
+ */
+export const SCHEDULE_TOOL_TURN_LINE =
+  "- 要在**之后**某个时间再做 / 再看一件事（N 分钟后查 CI、每 10 分钟看一次部署、明早提醒用户）→ 调 `schedule` 工具设定时，然后正常结束本轮：到点系统会把你当时留的话作为新消息发回本会话，不用干等。几十分钟的等待别用 `wait` 硬睡，也别自己写 sleep / cron / 后台脚本。建定时时 `message` 要写清三件事：到点做什么、没变化时一两句带过（别打扰用户）、什么时候该自己 `cancel` 它（周期任务别让它一直跑）。应用没开 / 电脑睡眠时错过的不会补发";
+
+/**
  * task 模式的「回合纪律」段（曾注入 _super.md；现交卷协议只留 super「核心机制」一处）。
  * 仍导出给测试对账 chat / task 对 ask_user 的同一句措辞。
  *
@@ -50,6 +60,7 @@ export const turnDisciplineSection = (): string =>
     ASK_USER_TURN_LINE,
     "- **不要为交卷执行等待 / 轮询**——sleep / watch / 自己编的 curl 都不要。提问只用 `ask_user` 返回里的那条 curl",
     WAIT_TOOL_TURN_LINE,
+    SCHEDULE_TOOL_TURN_LINE,
     "- 交卷 / 提问是内部机制、别在正文里提工具名",
   ].join("\n");
 
@@ -70,6 +81,7 @@ export const chatTurnProtocolSection = (): string =>
     "- **说完就正常结束回复**——不要为闲聊执行等待 / 轮询（sleep / watch / 自己编的 curl 都不要）；提问只用 `ask_user` 返回里的那条 curl。不要调 `submit_work`（本模式用不到它）。",
     ASK_USER_TURN_LINE,
     WAIT_TOOL_TURN_LINE,
+    SCHEDULE_TOOL_TURN_LINE,
     "- 飞书权限缺失时（`app_scope_not_applied` / `token_missing`）：把缺的 scope 原样列出来问用户去开通，只推免审的常规权限（发消息、收消息、群信息、卡片这类）；群成员列表（`im:chat:members:read`）要审核、只告知不催（仅“我在不在群”可查）；看不懂的、要审核的只告知、不催。不要反复重试同一条，更不许静默降级凑合（比如拿不到 open_id 就发纯文本代替真 `@`，必须先停下来问用户要）。",
     "- 内部机制（工具名 / 协议）别在正文里提、直接给用户该看的内容。",
   ].join("\n");

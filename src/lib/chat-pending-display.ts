@@ -52,6 +52,38 @@ export const shouldShowSendLoading = (s: {
   hasInflight: boolean;
 }): boolean => (s.isRunning && s.lastIsUser) || s.hasInflight;
 
+/**
+ * 「准备环境… 已等待 Ns」的起算时间（落盘的 user_reply 的 ts）。
+ *
+ * 为什么要：进度行的计时按组件挂载起算，回车后切走再切回、组件重挂，「已等待」会从 0 重数，
+ * 阶段文案（< 3s 说「准备环境…」、之后说「等待模型响应…」）也跟着退回去。带上服务端落盘的
+ * user_reply 时间，重挂后就能接着数。
+ *
+ * 取「最近一条 user_reply」：进度行出现时（`isRunning && 末项是用户消息 / 纯启动组`）它就是本轮的起点。
+ * 有 inflight 占位时不取：user_reply 还没落盘，流里最近的那条是**上一轮**的，取了会把「已等待」
+ * 一上来就算成几分钟——这时进度行是刚挂载的，按挂载起算本来就对。
+ */
+export const loadingSinceTs = (
+  items: ReadonlyArray<{ kind: string; ts?: number }>,
+  hasInflight: boolean,
+): number | undefined => {
+  if (hasInflight) return undefined;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i]!;
+    if (it.kind !== "user_reply") continue;
+    return typeof it.ts === "number" && Number.isFinite(it.ts) && it.ts > 0 ? it.ts : undefined;
+  }
+  return undefined;
+};
+
+/**
+ * 进度行实际起算点：有落盘时间且不在未来（时钟偏差 / 脏数据）就用它，否则按挂载那一刻。
+ * 只在组件首次挂载时算一次、之后不再跟着 `since` 变——占位（无 since）→ user_reply 落盘交接时
+ * 同一个组件不重挂，起算点不能因为 since 到了就往回跳。
+ */
+export const resolveLoadingStart = (since: number | undefined, now: number): number =>
+  since !== undefined && since <= now ? since : now;
+
 // ---------------------------------------------------------------------------
 // 同一个「发出后空窗」里，输入框这一侧的状态（2026-10-12）
 //

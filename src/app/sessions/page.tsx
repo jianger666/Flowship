@@ -40,6 +40,7 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskList } from "@/hooks/use-task-list";
 import { formatRelative, REPO_STATUS_LABEL } from "@/lib/task-display";
+import { hasBackgroundSubagents } from "@/lib/task-background";
 import { setTaskArchived } from "@/lib/task-store";
 import { isWorktreeTaskLike } from "@/lib/lightweight-task";
 import {
@@ -850,12 +851,18 @@ const SessionsPage = () => {
                           已归档
                         </Badge>
                       )}
-                      {t.runStatus === "running" && (
+                      {t.runStatus === "running" ? (
                         <Badge variant="outline" size="xs" className="gap-1">
                           <Loader2 className="size-3 animate-spin" />
                           跑着
                         </Badge>
-                      )}
+                      ) : hasBackgroundSubagents(t) ? (
+                        // 主 AI 已说完、后台子代理还在干：别让会话管理页显示成空闲
+                        <Badge variant="outline" size="xs" className="gap-1">
+                          <Loader2 className="size-3 animate-spin" />
+                          后台运行中
+                        </Badge>
+                      ) : null}
                       <span className="max-w-32 truncate">{repoTail(t)}</span>
                       <span aria-hidden>·</span>
                       <span className="shrink-0 tabular-nums">

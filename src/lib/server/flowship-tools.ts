@@ -36,8 +36,22 @@ import {
   type AskUserQuestion,
   type NotifyAwaitingResult,
 } from "./chat-pending";
+import {
+  buildScheduleInfoMeta,
+  describeSchedulePlan,
+  formatScheduleDateTime,
+  formatScheduleLocalIso,
+  formatScheduleTime,
+  SCHEDULE_MAX_ACTIVE_PER_TASK,
+  SCHEDULE_MIN_INTERVAL_MINUTES,
+  SCHEDULE_STATUS_LABEL,
+  SCHEDULE_TOOL_NAME,
+  validateScheduleCreate,
+  type ScheduleRecord,
+} from "@/lib/schedule";
 import { WAIT_TOOL_NAME } from "@/lib/wait-display";
 import { buildAskWaitCurl, openAskWait } from "./ask-wait";
+import { cancelSchedule, createSchedule, readSchedules } from "./schedule-store";
 import { createCustomAction } from "./custom-action-fs";
 import {
   WAIT_MAX_SECONDS,
@@ -47,7 +61,7 @@ import {
   runWait,
 } from "./session-wait";
 import { getAppSkillsDir } from "./skills-loader";
-import { getTask } from "./task-fs";
+import { getTask, getTaskMeta } from "./task-fs";
 import { writeEventAndPublish } from "./task-stream";
 
 export type FlowshipToolContent = Array<{ type: "text"; text: string }>;
@@ -722,6 +736,114 @@ const waitDef: FlowshipToolDef = {
   },
 };
 
+// ----------------- 定时 schedule -----------------
+
+const scheduleLine = (r: ScheduleRecord): string => {
+  const next =
+    r.nextFireAt !== null ? `，下次 ${formatScheduleDateTime(r.nextFireAt)}` : "";
+  const counts =
+    r.fireCount > 0 || r.missedCount > 0
+      ? `，已触发 ${r.fireCount} 次${r.missedCount > 0 ? `、错过 ${r.missedCount} 次` : ""}`
+      : "";
+  return `- ${r.id}｜${r.title}｜${describeSchedulePlan(r)}｜${SCHEDULE_STATUS_LABEL[r.status]}${next}${counts}`;
+};
+
+const scheduleDef: FlowshipToolDef = {
+  name: SCHEDULE_TOOL_NAME,
+  label: "定时叫你",
+  description: [
+    "给自己设一个定时：到点由系统把你当时留的 `message` 作为新消息发回**本会话**（会话被回收了会先恢复再送）。用于「之后再做 / 再看」——N 分钟后查 CI、每 10 分钟看一次部署、明早提醒用户。设完正常结束本轮即可，不用干等；几十分钟的等待别用 `wait` 硬睡。",
+    "`action=create`：`title`（一句话，会显示给用户）+ `message`（到点留给你自己的话，必填）。时间三选一：`delay_minutes`（N 分钟后，一次性）/ `at`（ISO 8601 绝对时间，一次性；必须带具体时刻、最好带时区偏移，如 `2026-10-20T09:00:00+08:00`，**不能只写日期**；不带偏移按本机时区）/ `every_minutes`（周期；首次触发在一个间隔后，也可再给 `delay_minutes` 或 `at` 指定首次时间；可加 `max_runs` 限制次数——按「到点次数」计，会话忙时合并掉的 / 错过的也占名额，所以实际送达数可能少于它）。数字参数请传数字。",
+    `约束：最小 ${SCHEDULE_MIN_INTERVAL_MINUTES} 分钟、最远 7 天；每个会话最多同时 ${SCHEDULE_MAX_ACTIVE_PER_TASK} 条。`,
+    "`message` 要写清：到点做什么；没有值得报告的变化时怎么办（一两句带过、别打扰用户）；什么时候该自己 `cancel` 它——周期任务不需要了就取消，别让它一直触发。",
+    "应用没开 / 电脑睡眠时错过的**不会补发**（会标记为已错过）。会话被归档或删除时定时一起取消。",
+    "`action=list`：列出本会话的定时（含 id）。`action=cancel`：用 `id` 取消一条。",
+    "到点那条消息以 `[SCHEDULE_FIRED id=…]` 开头：这是系统发的、不是用户说话，按你当时留的话做。",
+  ].join("\n"),
+  parameters: TBObject({
+    action: TBEnum(["create", "list", "cancel"]),
+    title: TBOptional(TBString()),
+    message: TBOptional(TBString()),
+    delay_minutes: TBOptional(TBNumber()),
+    at: TBOptional(TBString()),
+    every_minutes: TBOptional(TBNumber()),
+    max_runs: TBOptional(TBNumber()),
+    id: TBOptional(TBString()),
+  }),
+  handler: async (args, callerToken, ctx) => {
+    // 没有 task_id 入参：会话归属取自工具构建处带进来的 taskId（模型指不到别的会话）
+    const taskId = ctx?.taskId;
+    if (!taskId) {
+      return text("定时不可用：当前会话缺少任务信息（不是正式会话）。");
+    }
+    // 与 wait 不同，本工具有副作用（落盘、日后往会话里注入消息）：像 submit_work / ask_user 一样先验 callerToken，
+    // 被新 agent 接管 / 已停止的旧实例里还在飞的调用不许再建 / 取消定时（fail-closed：没注册 / 没带 token 也拒）
+    if (!matchExpectedCallerToken(taskId, callerToken)) {
+      return text(CALLER_MISMATCH_ERROR);
+    }
+    const action = str(args.action);
+    const now = Date.now();
+
+    if (action === "list") {
+      const list = (await readSchedules(taskId)).filter(
+        (r) => r.status === "active" || r.status === "paused",
+      );
+      if (list.length === 0) return text("本会话没有进行中的定时。");
+      return text(
+        [`本会话有 ${list.length} 条定时：`, ...list.map(scheduleLine)].join("\n"),
+      );
+    }
+
+    if (action === "cancel") {
+      const id = str(args.id).trim();
+      if (!id) return text("参数错误：cancel 需要 id（先用 action=list 查）。");
+      const r = await cancelSchedule(taskId, id, "AI 取消");
+      if (!r.ok) return text(`取消失败：${r.error}`);
+      // 提示事件只是给界面刷新定时条用的：写失败不能让模型看到「取消失败」——定时其实已经取消了
+      await writeEventAndPublish(taskId, {
+        kind: "info",
+        text: `定时「${r.record.title}」已取消`,
+        meta: buildScheduleInfoMeta(r.record.id, "cancelled"),
+      }).catch((err) => console.warn("[schedule] 写取消提示事件失败", err));
+      return text(`[CANCELLED id=${r.record.id}] 已取消定时「${r.record.title}」。`);
+    }
+
+    if (action === "create") {
+      const v = validateScheduleCreate(args, now);
+      if (!v.ok) return text(`参数错误：${v.error}`);
+      // 已归档 / 已终结（合入 / 放弃）的会话：这时建的定时到点必然送不进去（周期的还会反复失败），直接拒绝。
+      // 归档的 chat 后台可能还有 AI 在跑，所以挡在创建这一关
+      const meta = await getTaskMeta(taskId);
+      if (meta?.archived) return text("创建失败：这个会话已归档，不能再设定时。");
+      if (meta && (meta.repoStatus === "merged" || meta.repoStatus === "abandoned")) {
+        return text(
+          `创建失败：这个任务已${meta.repoStatus === "merged" ? "合入" : "放弃"}，不能再设定时。`,
+        );
+      }
+      const created = await createSchedule(taskId, v.value, now);
+      if (!created.ok) return text(`创建失败：${created.error}`);
+      const r = created.record;
+      // 定时已经落盘：提示事件写失败不能让模型看到「创建失败」（它会重试 → 重复创建）
+      await writeEventAndPublish(taskId, {
+        kind: "info",
+        text:
+          r.kind === "once"
+            ? `已设定定时「${r.title}」：${formatScheduleTime(r.nextFireAt ?? now, now)} 触发`
+            : `已设定周期定时「${r.title}」：${describeSchedulePlan(r)}，首次 ${formatScheduleTime(r.nextFireAt ?? now, now)}`,
+        meta: buildScheduleInfoMeta(r.id, "created"),
+      }).catch((err) => console.warn("[schedule] 写创建提示事件失败", err));
+      return text(
+        [
+          `[SCHEDULED id=${r.id}] 已设定定时「${r.title}」：${describeSchedulePlan(r)}，${r.kind === "once" ? "" : "首次 "}${formatScheduleLocalIso(r.nextFireAt ?? now)}（本机时间）。`,
+          "到点系统会把你留的 message 作为新消息发回本会话。现在继续手头的事或直接结束本轮——不要为了等它去 wait / 轮询。应用没开 / 电脑睡眠时错过的不会补发。",
+        ].join("\n"),
+      );
+    }
+
+    return text("参数错误：action 必须是 create / list / cancel 之一。");
+  },
+};
+
 /** Flowship 自有工具清单（cursor SDK customTools + pi customTools 共用） */
 export const flowShipTools: FlowshipToolDef[] = [
   submitWorkDef,
@@ -734,6 +856,7 @@ export const flowShipTools: FlowshipToolDef[] = [
   notifyGroupTestersDef,
   expectGroupReplyDef,
   waitDef,
+  scheduleDef,
 ];
 
 /**

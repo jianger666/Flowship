@@ -193,6 +193,80 @@ describe("目标构造：卡片 / 条 → 详情面板的打开目标", () => {
   });
 });
 
+describe("keepsSubagentDrawerOpen：抽屉外的按下要不要放过（点入口 / 二级浮层不关抽屉）", () => {
+  /** 假元素：closest(selector) 只在「祖先链里带这些标记」时命中——按选择器里的片段匹配 */
+  const elWith = (...marks: string[]) => ({
+    closest: (selector: string) =>
+      marks.some((m) => selector.includes(m)) ? {} : null,
+  });
+
+  it("选择器覆盖：开抽屉的入口 + 抽屉里弹出的二级浮层（大图预览 / 菜单 / 下拉）", () => {
+    const sel = display.SUBAGENT_DRAWER_KEEP_OPEN_SELECTOR;
+    for (const piece of [
+      "[data-subagent-opener]",
+      '[role="dialog"]',
+      '[role="alertdialog"]',
+      '[role="menu"]',
+      '[role="listbox"]',
+    ]) {
+      expect(sel).toContain(piece);
+    }
+  });
+
+  it("命中任一标记 = 放过；没命中 = 照常关", () => {
+    expect(display.keepsSubagentDrawerOpen(elWith("[data-subagent-opener]"))).toBe(true);
+    expect(display.keepsSubagentDrawerOpen(elWith('[role="dialog"]'))).toBe(true);
+    expect(display.keepsSubagentDrawerOpen(elWith('[role="menu"]'))).toBe(true);
+    expect(display.keepsSubagentDrawerOpen(elWith("[nothing-relevant]"))).toBe(false);
+  });
+
+  it("目标不是元素（null / undefined / 没有 closest 的 EventTarget / document）= 不放过、照常关", () => {
+    expect(display.keepsSubagentDrawerOpen(null)).toBe(false);
+    expect(display.keepsSubagentDrawerOpen(undefined)).toBe(false);
+    expect(display.keepsSubagentDrawerOpen({} as EventTarget)).toBe(false);
+    expect(display.keepsSubagentDrawerOpen(new EventTarget())).toBe(false);
+  });
+
+  it("真实调用的是 closest(选择器)：把整条选择器原样交给 closest", () => {
+    const seen: string[] = [];
+    display.keepsSubagentDrawerOpen({
+      closest: (selector: string) => {
+        seen.push(selector);
+        return null;
+      },
+    });
+    expect(seen).toEqual([display.SUBAGENT_DRAWER_KEEP_OPEN_SELECTOR]);
+  });
+});
+
+describe("shouldBlockSubagentDrawerClose：抽屉的关闭请求要不要拦（review 🟡：focus-out 路径）", () => {
+  const elWith = (...marks: string[]) => ({
+    closest: (selector: string) => (marks.some((m) => selector.includes(m)) ? {} : null),
+  });
+  const plain = elWith("[nothing-relevant]");
+
+  it("focus-out 一律拦：不管焦点落到哪（点另一条任务条 / 大图上的按钮 / Tab 出抽屉都不是想关抽屉）", () => {
+    expect(display.shouldBlockSubagentDrawerClose("focus-out", plain)).toBe(true);
+    expect(display.shouldBlockSubagentDrawerClose("focus-out", elWith("[data-subagent-opener]"))).toBe(true);
+    expect(display.shouldBlockSubagentDrawerClose("focus-out", null)).toBe(true);
+    expect(display.shouldBlockSubagentDrawerClose("focus-out", undefined)).toBe(true);
+  });
+
+  it("outside-press：落在入口 / 二级浮层上放过，落在别处照常关（保留「点外面关」）", () => {
+    expect(display.shouldBlockSubagentDrawerClose("outside-press", elWith("[data-subagent-opener]"))).toBe(true);
+    expect(display.shouldBlockSubagentDrawerClose("outside-press", elWith('[role="dialog"]'))).toBe(true);
+    expect(display.shouldBlockSubagentDrawerClose("outside-press", plain)).toBe(false);
+    expect(display.shouldBlockSubagentDrawerClose("outside-press", null)).toBe(false);
+  });
+
+  it("正式的关闭路径（Esc / X / 程序化）不拦", () => {
+    for (const reason of ["escape-key", "close-press", "none", "imperative-action", ""]) {
+      expect(display.shouldBlockSubagentDrawerClose(reason, plain), reason).toBe(false);
+      expect(display.shouldBlockSubagentDrawerClose(reason, elWith("[data-subagent-opener]")), reason).toBe(false);
+    }
+  });
+});
+
 describe("extractSubagentCallArgs：从 MCP 外壳里取模型传的原始入参（配对用，必须是完整任务书）", () => {
   const mcp = (inner: unknown) => ({
     name: "mcp",
@@ -474,30 +548,81 @@ describe("GET /api/tasks/[id]/subagent-runs", () => {
 
 // ============================================================ D. 源码契约
 
-describe("契约：事件流里的子代理卡片", () => {
+describe("契约：事件流里的子代理卡片（整条任务条 = 开抽屉的按钮，没有内联展开 / 「详情」按钮）", () => {
   const code = readSrc("components", "tasks", "event-stream", "tool-block.tsx");
   const card = sliceFrom(code, "const TaskSubagentBlock = (", "const RegularToolBlockRow = (");
+  const cardCode = stripComments(card);
 
-  it("卡片头有「详情」入口：按 callId 开面板，任务书 / 产出作兜底；不在宿主里（单独复用）就不画", () => {
-    expect(card).toContain("useOpenSubagentDetail()");
-    expect(card).toContain("subagentTargetFromToolBlock(block)");
-    expect(card).toContain('aria-label="查看子代理详情"');
-    expect(card).toContain("{openDetail ? (");
+  it("整条任务条是一个按钮：点一下按 callId 开面板（任务书 / 产出作兜底）；不在宿主里（单独复用）退成不可点的 div", () => {
+    expect(cardCode).toContain("useOpenSubagentDetail()");
+    expect(cardCode).toContain("onClick={() => openDetail(subagentTargetFromToolBlock(block))}");
+    expect(cardCode).toContain("{openDetail ? (");
+    // 按钮包着整条内容（标题 / 徽标 / 状态 / 时间戳都在里面），不是只包一个小图标
+    const btnOpen = cardCode.indexOf("<button");
+    const btnClose = cardCode.indexOf("</button>");
+    expect(btnOpen).toBeGreaterThan(0);
+    expect(cardCode.slice(btnOpen, btnClose)).toContain("{barContent}");
+    // 没有宿主：同样的内容放进普通 div、没有 onClick / cursor-pointer
+    expect(cardCode).toContain("<div className={barClass}>{barContent}</div>");
     // 用 context 叶子模块、不直接 import 面板（面板要 import 工具块，直接依赖就是循环依赖）
     expect(code).toContain('@/components/tasks/subagent-detail-context"');
     expect(code).not.toContain('@/components/tasks/subagent-detail"');
   });
 
-  it("详情按钮与折叠按钮并排、不嵌套（button 套 button 不合法）", () => {
-    const toggleAt = card.indexOf("onClick={() => setCollapsed((c) => !c)}");
-    const detailAt = card.indexOf('aria-label="查看子代理详情"');
-    expect(toggleAt).toBeGreaterThan(0);
-    expect(detailAt).toBeGreaterThan(toggleAt);
-    // 折叠按钮先闭合、详情按钮才开始
-    const between = card.slice(toggleAt, detailAt);
-    expect(between).toContain("</button>");
-    // 详情按钮用 Tooltip、不用原生 title
-    expect(stripComments(card)).not.toMatch(/\btitle=/);
+  it("卡片里整个只有一个 <button>（不再有折叠开关 + 「详情」并排；也不会 button 套 button）", () => {
+    expect(cardCode.match(/<button\b/g)).toHaveLength(1);
+    expect(cardCode.match(/<\/button>/g)).toHaveLength(1);
+  });
+
+  it("不再有内联展开：没有折叠状态 / Collapse / chevron / 任务书·产出预览 / 「显示更多」/ 「详情」入口", () => {
+    for (const gone of [
+      "setCollapsed",
+      "<Collapse",
+      "CollapseChevron",
+      "aria-expanded",
+      "promptExpanded",
+      "outputOpen",
+      "LoadFullOutputButton",
+      "CopyableBlock",
+      "MarkdownText",
+      "显示更多",
+      "复制任务书",
+      "复制产出",
+      "PanelRightOpen",
+      "<Tooltip",
+      "查看子代理详情\"",
+    ]) {
+      expect(cardCode, gone).not.toContain(gone);
+    }
+    // 「详情」两个字不再作为按钮文案出现（注释里提到不算）
+    expect(cardCode).not.toMatch(/>\s*详情\s*</);
+    expect(code).not.toContain("TASK_PROMPT_PREVIEW_CHARS");
+  });
+
+  it("整条可点的可见反馈：pointer 光标 + hover 底色；入口带 data-subagent-opener（抽屉开着点它不算点外面）", () => {
+    expect(cardCode).toContain("cursor-pointer");
+    expect(cardCode).toContain("hover:bg-subagent/[0.08]");
+    expect(cardCode).toContain('data-subagent-opener=""');
+    expect(cardCode).toContain('aria-haspopup="dialog"');
+  });
+
+  it("无障碍：不用 aria-label 覆盖整条名称（状态读屏拿不到）；图标 aria-hidden + 读屏状态文字；焦点环向内（外层 overflow-hidden 会裁掉默认 outline）", () => {
+    const bar = sliceFrom(cardCode, "const TaskSubagentBlock = (", "const RegularToolBlockRow = (");
+    expect(bar).not.toContain("aria-label");
+    expect(bar).toContain('<span className="sr-only">{statusSrText}</span>');
+    for (const icon of ["<Loader2", "<CircleSlash", "<X ", "<Check"]) {
+      const at = bar.indexOf(icon);
+      expect(at, icon).toBeGreaterThan(-1);
+      expect(bar.slice(at, bar.indexOf("/>", at)), icon).toContain("aria-hidden");
+    }
+    expect(bar).toContain("focus-visible:ring-2 focus-visible:ring-inset");
+    // 后台运行中条上已有可见文字，读屏文字不重复
+    expect(bar).toContain("block.backgroundRunning\n    ? null");
+  });
+
+  it("运行中条上露出最新一行输出（不用开抽屉也能看到还在动）", () => {
+    expect(cardCode).toContain('block.status === "running" && liveOutput');
+    expect(cardCode).toContain("{liveTail ? (");
   });
 });
 
@@ -550,6 +675,21 @@ describe("契约：聊天框上方「后台工作」条", () => {
     expect(code).toContain("target && openDetail");
   });
 
+  it("多个时的列表 Popover 触发按钮也带 data-subagent-opener（与单个条一致：抽屉开着点它不关抽屉）", () => {
+    const popover = sliceFrom(code, "const JobsListPopover = (", "<PopoverContent");
+    expect(popover).toContain('data-subagent-opener=""');
+  });
+
+  it("键盘焦点可见：条按钮有 focus-visible 样式（不是只靠被 overflow 裁掉的默认 outline）", () => {
+    expect(code).toMatch(/const BAR_CLASS =[\s\S]*?focus-visible:ring-3/);
+  });
+
+  it("单个直接开详情的整条按钮带 data-subagent-opener：抽屉开着点它不算点了抽屉外面", () => {
+    const single = sliceFrom(code, "{singleTarget && openDetail ? (", "<JobsListPopover");
+    expect(single).toContain('data-subagent-opener=""');
+    expect(single).toContain("openDetail(singleTarget)");
+  });
+
   it("列表展开状态放在 Popover 子组件里、不放 BarBody：条切到「单个直接开详情」/ 收起时随分支卸载，不会粘住", () => {
     const popover = sliceFrom(code, "const JobsListPopover = (", "const BarBody = (");
     expect(popover).toContain("const [listOpen, setListOpen] = useState(false);");
@@ -595,10 +735,49 @@ describe("契约：详情面板本体", () => {
   });
 
   it("宿主：Sheet 只开关抽屉；目标连同所属 task 一起存（换 task 不残留）；面板按目标 key 重置", () => {
-    expect(code).toContain("<Sheet open={visible} onOpenChange={setOpen}>");
+    expect(code).toContain("<Sheet");
+    expect(code).toContain("open={visible}");
+    expect(code).toContain("onOpenChange={handleOpenChange}");
     expect(code).toContain("opened?.taskId === task.id");
     expect(code).toContain("key={subagentDetailTargetId(opened.target)}");
     expect(code).toContain("SubagentDetailContext.Provider");
+  });
+
+  it("点抽屉外面关闭：Sheet 开 disablePointerDismissal={false}（默认不响应外部点击）；仍是非模态（不盖遮罩）", () => {
+    const sheet = sliceFrom(code, "<Sheet", "<SheetContent");
+    expect(sheet).toContain("disablePointerDismissal={false}");
+    // 不能改成模态：外面的东西（输入框等）得照常可点，点外面那一下同时落到被点的东西上
+    expect(sheet).not.toContain("modal");
+    expect(code).not.toContain("<SheetOverlay");
+    // 通用 Sheet 的默认不动：别的抽屉（改动面板）不因此变成「点外面就关」
+    const sheetUi = stripComments(readSrc("components", "ui", "sheet.tsx"));
+    expect(sheetUi).toContain("disablePointerDismissal = true");
+    expect(stripComments(readSrc("components", "tasks", "task-changes-panel.tsx"))).not.toContain(
+      "disablePointerDismissal",
+    );
+  });
+
+  it("关闭请求的拦截：判据走 shouldBlockSubagentDrawerClose（outside-press 看目标、focus-out 一律拦）；其余照常 setOpen(next)；Esc / X 的关闭不受影响", () => {
+    const handler = sliceFrom(code, "const handleOpenChange = useCallback", "[]);");
+    expect(handler).toContain("shouldBlockSubagentDrawerClose(eventDetails.reason, eventDetails.event.target)");
+    expect(handler).toContain("eventDetails.cancel();");
+    // 只拦「关闭」：打开（next=true）永远照常走
+    expect(handler).toContain("!next &&");
+    expect(handler).toContain("setOpen(next);");
+    // 拦截分支在 setOpen 之前 return，不会既 cancel 又关
+    expect(handler.indexOf("return;")).toBeGreaterThan(handler.indexOf("eventDetails.cancel();"));
+    expect(handler.indexOf("return;")).toBeLessThan(handler.indexOf("setOpen(next);"));
+  });
+
+  it("为什么必须拦 focus-out：disablePointerDismissal={false} 会让 base-ui 同时打开 closeOnFocusOut（升级后若这条前提变了要回来看）", () => {
+    const popup = readFileSync(
+      path.resolve(import.meta.dirname, "..", "node_modules/@base-ui/react/dialog/popup/DialogPopup.js"),
+      "utf-8",
+    );
+    expect(popup).toContain("closeOnFocusOut: !disablePointerDismissal");
+    // 抽屉开着 disablePointerDismissal={false} → closeOnFocusOut 为 true → 必须有 focus-out 的拦截
+    expect(code).toContain("disablePointerDismissal={false}");
+    expect(sliceFrom(code, "const handleOpenChange = useCallback", "[]);")).toContain("shouldBlockSubagentDrawerClose(");
   });
 
   it("终态那一帧也贴底：effect 用 wasRunningRef 认出「刚跑完」、判定走 shouldStickToBottom（不再只看 running）", () => {

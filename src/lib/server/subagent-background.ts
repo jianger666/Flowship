@@ -206,6 +206,28 @@ export const getBackgroundSubagentSnapshot = (
   }
 };
 
+/**
+ * 此刻某个任务在后台跑的子代理**数**（任务列表接口逐任务读、只要个数）。
+ *
+ * 和 {@link getBackgroundSubagentSnapshot} 同源（同一个 provider），但不做脱敏拷贝——
+ * 列表要对每个任务都问一遍，而绝大多数任务根本没有会话；个数里没有任何文本，没必要付脱敏的代价。
+ * 读不到 / provider 抛错 = 0（列表接口不能因为它挂掉）。
+ */
+export const getBackgroundSubagentCount = (taskId: string): number => {
+  const provider = (globalThis as ProviderHolder)
+    .__flowshipSubagentSnapshotProvider;
+  if (!provider) return 0;
+  try {
+    return provider(taskId).length;
+  } catch (err) {
+    console.warn(
+      `[subagent-background] 读取后台子代理数失败 task=${taskId}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return 0;
+  }
+};
+
 // ----------------- 文案 -----------------
 
 /**

@@ -21,9 +21,16 @@ import {
 import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
 import { failpoint } from "@/lib/server/failpoints";
 import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
+import { getBackgroundSubagentCount } from "@/lib/server/subagent-background";
 import { isValidReqId } from "@/lib/req-id";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
-import { USER_ROLES, type NewTaskInput, type TaskMode, type UserRole } from "@/lib/types";
+import {
+  USER_ROLES,
+  type NewTaskInput,
+  type TaskMode,
+  type TaskSummary,
+  type UserRole,
+} from "@/lib/types";
 
 // 飞书桥接 bootstrap 锚点：任务列表是 app 启动后最早被请求的 API 之一，
 // 挂这里保证 server 起来后桥接 consumer/出向 tap 尽快就位
@@ -57,9 +64,19 @@ const sanitizeRepoBranchMap = (
   return Object.keys(out).length > 0 ? out : undefined;
 };
 
+/**
+ * 给列表里在跑后台子代理的任务补 `backgroundSubagentCount`（纯内存读数；> 0 才带，其余行 payload 不变）。
+ * 主 AI 说完一轮后 runStatus 回等待态、子代理还在后台干——列表只看 runStatus 会把它画成「空闲」。
+ */
+const withBackgroundSubagentCounts = (tasks: TaskSummary[]): TaskSummary[] =>
+  tasks.map((t) => {
+    const count = getBackgroundSubagentCount(t.id);
+    return count > 0 ? { ...t, backgroundSubagentCount: count } : t;
+  });
+
 export const GET = async () => {
   try {
-    const tasks = await listTasks();
+    const tasks = withBackgroundSubagentCounts(await listTasks());
     // helper 与 Response 之间可插入删除——提交点再 filter
     await failpoint("httpRead.afterHelper");
     return commitReadableTaskListResponse(tasks, (filtered) => ({

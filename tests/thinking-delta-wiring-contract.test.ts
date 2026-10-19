@@ -426,7 +426,8 @@ describe("展示：思考是流程里一条真正的 thinking 行，由已有的
     // 旧的壳字段已没有：进行中的思考是 members 里的一个成员，不是壳上的附加物
     expect(workGroup).not.toContain("group.liveThinking");
 
-    expect(eventStream).toContain("<PendingRow />");
+    // 只带起算时间（切走再切回后接着数），不带思考
+    expect(eventStream).toContain("<PendingRow since={item.since} />");
     expect(eventStream).not.toContain("<PendingRow thinking");
     expect(eventStream).not.toContain("thinkingLine={");
     expect(workGroup).not.toContain("thinkingLine");

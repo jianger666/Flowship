@@ -20,7 +20,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Blocks, LayoutDashboard, MessageSquare, MessageSquareText, PanelLeft, Settings } from "lucide-react";
+import { AlarmClock, Blocks, LayoutDashboard, MessageSquare, MessageSquareText, PanelLeft, Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 
@@ -154,7 +154,8 @@ export const AppHeader = ({
   const isNeutralPage =
     pathname.startsWith("/settings") ||
     pathname.startsWith("/actions") ||
-    pathname.startsWith("/sessions");
+    pathname.startsWith("/sessions") ||
+    pathname.startsWith("/schedules");
 
   useEffect(() => {
     setPlatform(window.__shell?.platform ?? "");
@@ -241,6 +242,23 @@ export const AppHeader = ({
             }
           >
             <Blocks />
+          </Button>
+        </Tooltip>
+        <Tooltip content="定时任务">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="[&_svg:not([class*='size-'])]:size-4.5"
+            nativeButton={false}
+            render={
+              <Link
+                href="/schedules"
+                className="no-underline"
+                aria-label="定时任务"
+              />
+            }
+          >
+            <AlarmClock />
           </Button>
         </Tooltip>
         <Tooltip content="会话管理">

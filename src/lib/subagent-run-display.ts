@@ -5,6 +5,8 @@
  *   （thinking 合并 → tool_call / tool_result 配对 → 工作过程分组），面板拿结果直接画。
  * - {@link subagentTargetFromToolBlock}：事件流里的 `task` 卡片 → 详情面板的打开目标（含兜底信息）。
  * - {@link subagentTargetFromJob}：聊天框上方「后台工作」条的一行 → 详情面板的打开目标。
+ * - {@link keepsSubagentDrawerOpen}：抽屉外的按下要不要放过（点「开抽屉」的入口 / 抽屉里弹出的二级浮层不关）。
+ * - {@link shouldBlockSubagentDrawerClose}：抽屉的关闭请求要不要拦（outside-press 看目标、focus-out 一律拦）。
  */
 
 import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
@@ -43,7 +45,7 @@ export const buildSubagentRunItems = (
  * 面板退回展示卡片自己手上的任务书（可能被截断）和产出。
  */
 export const subagentTargetFromToolBlock = (
-  block: Pick<ToolBlock, "callId" | "args" | "status" | "result">,
+  block: Pick<ToolBlock, "callId" | "args" | "status" | "result" | "backgroundRunning">,
 ): SubagentDetailTarget => {
   const args = parseTaskToolArgs(block.args);
   const output = block.result?.output;
@@ -56,7 +58,8 @@ export const subagentTargetFromToolBlock = (
       model: args?.model ?? undefined,
       effort: args?.effort ?? undefined,
       output: output?.trim() ? output : undefined,
-      running: block.status === "running",
+      // 后台子代理的卡 status 早已是 success、但它还在跑：记录刚建好 / 刚落盘的瞬间查不到时面板要多等几秒
+      running: block.status === "running" || block.backgroundRunning === true,
     },
   };
 };
@@ -75,6 +78,55 @@ export const subagentTargetFromJob = (
     // 条上的行都是还在跑的：记录刚建好 / 刚落盘的瞬间查不到时，面板多等几秒再下结论
     fallback: { description: job.description, running: true },
   };
+};
+
+/**
+ * 点到这些元素上**不算**「点了抽屉外面」，抽屉保持打开：
+ * - `[data-subagent-opener]`：子代理任务条 / 后台工作条这类「开抽屉」的入口。抽屉开着时点另一条 = 换内容、
+ *   点同一条 = 不动。若算外部点击，就会先走一遍「关」、再靠入口自己的 click 重新打开——最终开不开取决于
+ *   这两次状态更新会不会被合并，不把正确性押在这种时序上；
+ * - `role=dialog / alertdialog / menu / listbox`：抽屉里弹出来的二级浮层（图片大图预览、文件链接的右键 / 下拉菜单等），
+ *   它们挂在 portal 里、物理上在抽屉外面，但用户是在操作抽屉里的东西，点它们不该把抽屉关掉。
+ */
+export const SUBAGENT_DRAWER_KEEP_OPEN_SELECTOR = [
+  "[data-subagent-opener]",
+  '[role="dialog"]',
+  '[role="alertdialog"]',
+  '[role="menu"]',
+  '[role="listbox"]',
+].join(", ");
+
+/**
+ * 抽屉外的一次按下（outside-press）要不要放过、不关抽屉。
+ * 只收最小形状（有 `closest` 就行），不碰 document，单测可直接喂假对象；拿不到元素（非 Element 目标）= 不放过、照常关。
+ */
+export const keepsSubagentDrawerOpen = (
+  target: { closest?: (selector: string) => unknown } | EventTarget | null | undefined,
+): boolean => {
+  const el = target as { closest?: (selector: string) => unknown } | null | undefined;
+  if (!el || typeof el.closest !== "function") return false;
+  return el.closest(SUBAGENT_DRAWER_KEEP_OPEN_SELECTOR) != null;
+};
+
+/**
+ * 抽屉的一次「关闭请求」要不要被拦下（`handleOpenChange` 的 cancel 判据）。
+ *
+ * base-ui 的 `disablePointerDismissal={false}`（我们要「点抽屉外面关」）会**同时**打开 `closeOnFocusOut`：
+ * 非模态抽屉里，焦点只要移到抽屉外、且不在它的浮层树里，就以 `focus-out` 为由请求关闭。
+ * 我们要的只是「点外面关」，所以：
+ * - `outside-press`：点在入口 / 二级浮层上放过（见 {@link keepsSubagentDrawerOpen}），其余照常关；
+ * - `focus-out`：**一律拦**。典型现场：点另一条子代理任务条（先 outside-press 被放过，随后焦点落到那个按钮 →
+ *   focus-out 又请求关闭，抽屉关了又靠入口的 click 重开）、抽屉里点大图再点大图上的按钮、键盘 Tab 出抽屉。
+ *   这几种都不是「用户想关抽屉」；Esc / 右上角 X / 点外面这三条正式的关闭路径不受影响；
+ * - 其余原因（Esc、X、程序化关闭）照常关。
+ */
+export const shouldBlockSubagentDrawerClose = (
+  reason: string,
+  target: Parameters<typeof keepsSubagentDrawerOpen>[0],
+): boolean => {
+  if (reason === "focus-out") return true;
+  if (reason === "outside-press") return keepsSubagentDrawerOpen(target);
+  return false;
 };
 
 /**
