@@ -17,11 +17,23 @@ import {
   compactionEventMeta,
   compactionEventText,
 } from "@/lib/compaction-display";
+import {
+  LIVE_OUTPUT_MAX_CHARS,
+  sliceLiveOutputTail,
+} from "@/lib/live-output-cap";
 
 import { publish, writeOwnedEventAndPublish } from "./task-stream";
 
 const FLUSH_INTERVAL_MS = 500;
 const FLUSH_BYTES = 2 * 1024;
+
+// ephemeral 帧 id 的进程内单调计数。
+// 只靠 `Date.now()` 不够唯一：同一 callId 在同一毫秒内 flush 两次（≥2KB 的大块连着来 /
+// 刚 flush 完紧接着 tool-call-completed 的收尾 flush）会得到同一个 id，
+// 而 watch-task 路由按 event id 去重（sentEventIds），后一块会被当「已发过」整块丢掉——
+// 实时输出缺一截，且帧只走 SSE、不落盘、事后补不回来（V8-02）。
+// 计数不重置、跨发布器共享：不同任务 / 不同 run 撞上同 callId 同毫秒也不会重复。
+let ephemeralFrameSeq = 0;
 
 type Buf = {
   chunks: string[];
@@ -61,7 +73,8 @@ export const createShellOutputDeltaPublisher = (
     publish(taskId, {
       kind: "event",
       event: {
-        id: `ephemeral_tod_${callId}_${Date.now()}`,
+        // 前缀 `ephemeral_tod_` 不能变（tool-display 靠它识别 ephemeral 帧）；末尾计数保证同毫秒也唯一
+        id: `ephemeral_tod_${callId}_${Date.now()}_${++ephemeralFrameSeq}`,
         ts: Date.now(),
         kind: "tool_output_delta",
         text: "",
@@ -83,7 +96,9 @@ export const createShellOutputDeltaPublisher = (
     buf.bytes = 0;
     buf.lastFlushAt = Date.now();
     if (chunk.length === 0) return;
-    publishChunk(callId, chunk);
+    // 客户端直播窗口只留尾部 LIVE_OUTPUT_MAX_CHARS（同一口径，见 lib/live-output-cap）：
+    // SDK 一次吐几 MB 时，整块发出去既占 SSE 带宽、前端又要整块 JSON.parse，纯浪费（R7-02）
+    publishChunk(callId, sliceLiveOutputTail(chunk, LIVE_OUTPUT_MAX_CHARS));
   };
 
   return (args: { update: InteractionUpdate }): void => {

@@ -33,7 +33,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { OverflowTooltip } from "@/components/ui/tooltip";
+import { OverflowTooltip, Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { isImeComposing } from "@/lib/ime";
 
@@ -86,7 +86,7 @@ type PickerSharedProps = {
   /** 覆盖弹层宽度等；默认跟 trigger 等宽 `w-(--anchor-width)` */
   contentClassName?: string;
   searchPlaceholder?: string;
-  /** Combobox 兼容：原生 title。新调用方请用外层 Tooltip，不要扩大这个 prop */
+  /** trigger hover 提示（Tooltip 渲染，不再是原生 title——键盘 / 触屏不可达、不跟主题，R13-02） */
   title?: string;
   /** 弹层相对 trigger 水平对齐；贴下方展开、默认 start */
   align?: "start" | "center" | "end";
@@ -302,6 +302,9 @@ export const Picker: PickerComponent = (props) => {
     >
       {/* 包一层：Portal 打开时会在 trigger 旁插入 FocusGuard。SettingRow 的 space-y
           会把这些兄弟当成额外子元素、给后面的行加 margin（设置页点开下拉会往下挤）。 */}
+      {/* hover 提示走 Tooltip（不用原生 title，R13-02）：套在**外层 wrapper div** 上、不套 PopoverTrigger 的 render——
+          Tooltip 的 Trigger 只给 div 合并 props，没有额外 DOM；套在 trigger 按钮上会吞掉 Base UI 注入的 onClick / ref（见下） */}
+      <Tooltip content={title}>
       <div className={cn("relative w-full min-w-0", wrapperClassName)}>
         <PopoverTrigger
           render={
@@ -311,7 +314,6 @@ export const Picker: PickerComponent = (props) => {
               type="button"
               disabled={disabled}
               aria-invalid={invalid || undefined}
-              title={title}
               className={cn(TRIGGER_CLASS, className)}
             >
               <span className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
@@ -464,6 +466,7 @@ export const Picker: PickerComponent = (props) => {
           {footer}
         </PopoverContent>
       </div>
+      </Tooltip>
     </Popover>
   );
 };

@@ -130,31 +130,47 @@ const FileRow = ({
 }) => {
   const { dir, name } = splitPath(file.path);
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={cn(
-        "flex w-full min-w-0 cursor-pointer items-center gap-1.5 px-2 py-1 text-left text-xs hover:bg-muted/60",
-        selected && "bg-muted",
-      )}
-    >
-      <StatusBadge status={file.status} />
-      <span className="flex min-w-0 flex-1 items-baseline">
-        <span className="shrink-0 truncate font-mono font-medium text-foreground">
-          {name}
+    // 整行挂 Tooltip 看完整路径（行里的文件名 / 目录窄了会被省略）。内容恒非空（路径永远有）——
+    // 刻意不做「没被截断才不挂」：Tooltip 在「content 为空 → 直接返回 children」与「非空 → 包 Provider」
+    // 之间切换会改变元素树形状、行按钮被卸载重挂，键盘焦点会丢（同 tool-path-display 的结论）
+    <Tooltip
+      side="right"
+      content={
+        <span className="font-mono">
+          {file.path}
+          {file.oldPath ? <span className="block">← {file.oldPath}</span> : null}
         </span>
-        {dir && (
-          <span className="ml-1.5 min-w-0 truncate font-mono text-[11px] text-muted-foreground">
-            {dir}
-          </span>
+      }
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        className={cn(
+          "flex w-full min-w-0 cursor-pointer items-center gap-1.5 px-2 py-1 text-left text-xs hover:bg-muted/60",
+          selected && "bg-muted",
         )}
-      </span>
-      {file.binary ? (
-        <span className="shrink-0 text-[11px] text-muted-foreground">二进制</span>
-      ) : (
-        <LineStat added={file.added} removed={file.removed} className="text-[11px]" />
-      )}
-    </button>
+      >
+        <StatusBadge status={file.status} />
+        {/* 窄了先省略目录、再省略文件名（目录 shrink 权重远大于文件名 → 先缩到 0，文件名才开始被截），
+            +/− 统计始终 shrink-0 钉右、不被文件名盖住。
+            旧版文件名是 shrink-0 + truncate：不收缩 → truncate 永远不生效，长文件名会顶出容器压住统计 */}
+        <span className="flex min-w-0 flex-1 items-baseline">
+          <span className="min-w-0 truncate font-mono font-medium text-foreground">
+            {name}
+          </span>
+          {dir && (
+            <span className="ml-1.5 min-w-0 shrink-[100] truncate font-mono text-[11px] text-muted-foreground">
+              {dir}
+            </span>
+          )}
+        </span>
+        {file.binary ? (
+          <span className="shrink-0 text-[11px] text-muted-foreground">二进制</span>
+        ) : (
+          <LineStat added={file.added} removed={file.removed} className="text-[11px]" />
+        )}
+      </button>
+    </Tooltip>
   );
 };
 
@@ -191,7 +207,7 @@ const RepoScopeNote = ({ repo }: { repo: TaskRepoChanges }) => {
 };
 
 const RepoHeader = ({ repo }: { repo: TaskRepoChanges }) => (
-  <div className="sticky top-0 z-10 border-b bg-background/95 px-2 py-1.5 backdrop-blur-sm">
+  <div className="sticky top-0 z-10 border-b bg-background px-2 py-1.5">
     <div className="flex min-w-0 items-center gap-1.5 text-xs">
       <span className="min-w-0 truncate font-medium">{repo.shortName}</span>
       {repo.branch ? (

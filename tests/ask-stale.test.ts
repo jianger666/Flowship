@@ -102,7 +102,7 @@ const requestEvent = (askId = ASK_ID): Ev =>
 const replyEvent = (askId = ASK_ID): Ev =>
   ev("ask_user_reply", { askId, source: "feishu" });
 const voidMarker = (askId = ASK_ID): Ev =>
-  ev("info", { supersededAskId: askId }, "上一组提问因用户停止失效、无需再回答。");
+  ev("info", { supersededAskId: askId }, "上一组提问已失效（用户停止），无需再回答。");
 const skipMarker = (askId = ASK_ID): Ev =>
   ev("info", { supersededAskId: askId, askSkipped: true });
 const expireMarker = (askId = ASK_ID): Ev =>

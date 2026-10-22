@@ -688,8 +688,12 @@ describe("scheduleEmptyMessage：管理页各筛选下的空态文案（不能�
   it("进行中为空但已结束有数据 → 指路「已结束」；真的一条都没有 → 教怎么设", () => {
     expect(scheduleEmptyMessage("ongoing", { ongoing: 0, finished: 3, all: 3 })).toContain("已结束的 3 条");
     expect(scheduleEmptyMessage("ongoing", { ongoing: 0, finished: 3, all: 3 })).not.toContain("还没有定时");
-    expect(scheduleEmptyMessage("ongoing", { ongoing: 0, finished: 0, all: 0 })).toContain("还没有定时");
-    expect(scheduleEmptyMessage("all", { ongoing: 0, finished: 0, all: 0 })).toContain("还没有定时");
+    expect(scheduleEmptyMessage("ongoing", { ongoing: 0, finished: 0, all: 0 })).toBe(
+      "还没有定时。去对话或者工作台让 AI 建一个吧",
+    );
+    expect(scheduleEmptyMessage("all", { ongoing: 0, finished: 0, all: 0 })).toBe(
+      "还没有定时。去对话或者工作台让 AI 建一个吧",
+    );
     expect(scheduleEmptyMessage("finished", { ongoing: 2, finished: 0, all: 2 })).toBe("还没有结束的定时");
   });
 });

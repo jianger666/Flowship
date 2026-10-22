@@ -10,6 +10,8 @@
  *   「≥6 位数字兜底」会误命中）。
  */
 
+import { deriveListLoadView } from "./load-outcome";
+
 /** 只允许 http / https 外链；非法 / 其它协议返回 ""（调用方当「没有链接」处理） */
 export const safeHttpUrl = (raw: string | null | undefined): string => {
   const text = (raw ?? "").trim();
@@ -57,8 +59,10 @@ interface TaskLike {
   feishuStoryUrl?: string;
 }
 
-/** 预览页「启动区」的三态：加载中 / 已有任务（表单收起）/ 新建表单 */
-export type WorkitemGate = "loading" | "existing" | "form";
+/**
+ * 预览页「启动区」的四态：加载中 / 列表加载失败（查不了有没有已有任务）/ 已有任务（表单收起）/ 新建表单
+ */
+export type WorkitemGate = "loading" | "error" | "existing" | "form";
 
 /**
  * 决定预览页启动区渲染什么（纯函数，页面只负责按结果渲染）。
@@ -72,21 +76,42 @@ export type WorkitemGate = "loading" | "existing" | "form";
  * 这时只补一条「已存在」提示、不能把表单卸载掉丢输入。
  *
  * 保持上一轮设计：首次就撞上已有任务 → 表单默认收起（existing），点「仍要新建」（forceNew）才展开。
+ *
+ * 为什么还要看 loadError（F3-03）：loaded 只表示「拉过一次了」、不表示「拉成功了」——
+ * 列表首拉失败时 loaded 照样为 true、tasks 是空数组，`existing` 必然查不到，
+ * 若此时放表单，用户会在「其实已有任务、只是没拉到」的情况下对同一需求重复启动。
+ * 所以没命中 + 列表是「没数据 + 有失败」（deriveListLoadView === "error"）→ error：
+ * 不放表单、页面给「加载失败 + 重试」。几个刻意的取舍：
+ *  - 命中 existing 是正证据，不看 loadError（旧数据里命中了也成立）；
+ *  - formShown 优先于 error：表单已放出、用户可能在填，后台刷新失败不能把它收回丢输入；
+ *  - 已有旧数据时（taskCount > 0）后台刷新失败仍按 ready 走，口径与侧栏 / /chats 一致
+ *    （不拿失败态盖掉能用的旧列表）；
+ *  - loadError / taskCount 可缺省（老调用方）：只传 loadError 不传 taskCount 时 taskCount 按 0 算，
+ *    宁可多挡一次表单也不在失败时放行。
  */
 export const decideWorkitemGate = (input: {
   loaded: boolean;
   existing: unknown;
   forceNew: boolean;
   formShown?: boolean;
+  /** useTaskList().loadError：最近一次列表拉取的失败原因，null / 缺省 = 最近一次是好的 */
+  loadError?: string | null;
+  /** useTaskList().tasks.length：判断「有没有旧数据可用」 */
+  taskCount?: number;
 }): WorkitemGate => {
   if (!input.loaded) return "loading";
   if (input.formShown) return "form";
-  if (input.existing && !input.forceNew) return "existing";
-  return "form";
+  if (input.existing) return input.forceNew ? "form" : "existing";
+  const view = deriveListLoadView({
+    loaded: input.loaded,
+    loadError: input.loadError ?? null,
+    count: input.taskCount ?? 0,
+  });
+  return view === "error" ? "error" : "form";
 };
 
-/** 「按已有任务做分流」时的查找结果：列表未就绪 / 命中 / 没命中 */
-export type TaskLookupState = "pending" | "hit" | "miss";
+/** 「按已有任务做分流」时的查找结果：列表未就绪 / 命中 / 没命中 / 列表加载失败（不知道有没有） */
+export type TaskLookupState = "pending" | "hit" | "miss" | "unknown";
 
 /**
  * 任务列表首次加载完成前，「没找到」不等于「没有」：tasks 还是空数组，hit 必然为空。
@@ -97,9 +122,34 @@ export type TaskLookupState = "pending" | "hit" | "miss";
 export const resolveTaskLookup = (
   loaded: boolean,
   hit: unknown,
+  /**
+   * 列表拉取失败信息（useTaskList 的 loadError / tasks.length）：首拉失败时 loaded 也会是 true、tasks 是空的，
+   * 「没命中」不等于「没有」——此时返回 "unknown"（不下「没有」的结论、别引导新建，第二轮 review F3-03 同类）。
+   * 已有旧数据（count>0）时后台刷新失败仍按 miss 走，与侧栏 / 工作项页同口径。缺省 = 旧行为。
+   */
+  listState?: { loadError?: string | null; taskCount?: number },
 ): TaskLookupState => {
   if (hit) return "hit";
-  return loaded ? "miss" : "pending";
+  if (!loaded) return "pending";
+  if (listState?.loadError && (listState.taskCount ?? 0) === 0) return "unknown";
+  return "miss";
+};
+
+/**
+ * 看板缓存里记着的 task id 要不要信：列表没就绪、或列表首拉失败（没数据 + 有失败）时拿不到「实时存活任务」
+ * 做校验，回退信任缓存映射——否则点已有任务会被误导去预览页、可能对同一工作项重复建任务。
+ */
+export const shouldTrustCachedTaskLink = (s: {
+  loaded: boolean;
+  loadError?: string | null;
+  taskCount: number;
+}): boolean => {
+  const view = deriveListLoadView({
+    loaded: s.loaded,
+    loadError: s.loadError ?? null,
+    count: s.taskCount,
+  });
+  return view === "loading" || view === "error";
 };
 
 /**

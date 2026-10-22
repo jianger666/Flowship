@@ -11,6 +11,12 @@
 
 import type { TalkQueueItem, TalkQueueSource } from "@/lib/talk-queue";
 import {
+  buildDroppedQueueNotice,
+  describeDroppedAttachments,
+  type DroppedNoticeItem,
+} from "@/lib/dropped-queue-notice";
+import { redactSecretsInText } from "@/lib/server/event-secret-redact";
+import {
   listGroupQuestionQueueView,
   removeGroupQuestionFromQueue,
   subscribeGroupQuestionQueue,
@@ -180,13 +186,60 @@ const classifyReplayConflict = async (res: Response): Promise<ReplayConflict> =>
   }
 };
 
+/**
+ * 丢弃时把完整原文放进事件 meta 的来源：**用户自己的话**（app 输入条 / 群属主）。
+ * 托办回执（group_reply）是外部机器人的回执，不是用户要重发的话，只留单行摘要、不把全文存进 meta。
+ */
+const USER_TEXT_SOURCES: readonly TalkQueueOwnedSource[] = ["app", "group_owner"];
+
+const bodyTextOf = (item: TalkQueueStoredItem): string => {
+  const raw = (item.rawBody as { text?: unknown } | null | undefined)?.text;
+  return typeof raw === "string" ? raw : "";
+};
+
+/**
+ * 条目里**用户自己的话**的完整文本（已脱敏、未截断）；非用户来源 / 没有文本（纯图片、纯文件）返回 ""。
+ * 必须在截断（摘要 80 字 / meta 2000 字）之前脱敏：落盘前全局那道脱敏按完整精确值匹配，
+ * 凭据一旦横跨截断点就只剩半截前缀、命不中（同 chat-runner 清队的口径）。
+ */
+const userTextOf = (item: TalkQueueStoredItem): string =>
+  USER_TEXT_SOURCES.includes(item.source) ? redactSecretsInText(bodyTextOf(item)) : "";
+
+const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+/** 条目带的图片 / 文件的文字占位（「2 张图片」）；没有附件返回 ""（Q6-04：纯图片 / 文件条被清时卡里要看得到） */
+const attachmentsOf = (item: TalkQueueStoredItem): string => {
+  const raw = item.rawBody as { images?: unknown; attachments?: unknown } | null | undefined;
+  const n = (v: unknown): number => (Array.isArray(v) ? v.length : 0);
+  return describeDroppedAttachments(n(raw?.images), n(raw?.attachments));
+};
+
 const discardWithInfo = async (
   taskId: string,
   reason: string,
-  preview: string,
+  item: TalkQueueStoredItem,
 ): Promise<void> => {
-  const text = `排队的消息没送出去：${reason}${preview ? `（${preview.slice(0, 80)}）` : ""}`;
-  await writeEventAndPublish(taskId, { kind: "info", text }).catch((err) => {
+  const header = `排队的消息没送出去：${oneLine(reason)}`;
+  const text = userTextOf(item);
+  let notice: ReturnType<typeof buildDroppedQueueNotice>;
+  if (text.trim()) {
+    notice = buildDroppedQueueNotice({
+      header,
+      count: 1,
+      items: [{ itemId: item.itemId, text }],
+    });
+  } else {
+    // 没有可放进卡片的文本（纯图片 / 纯文件 / 外部回执）：单行摘要，与以前一致。
+    // 摘要取自**脱敏后的全文**再截 80 字（item.preview 入队时已截到 120 字，凭据横跨那个点就只剩半截前缀）
+    const body = oneLine(redactSecretsInText(bodyTextOf(item)));
+    const snippet = (body || item.preview).slice(0, 80);
+    notice = { text: snippet ? `${header}（${snippet}）` : header };
+  }
+  await writeEventAndPublish(taskId, {
+    kind: "info",
+    text: notice.text,
+    ...(notice.meta ? { meta: notice.meta } : {}),
+  }).catch((err) => {
     console.warn(`[task-talk-queue] 写 info 失败 task=${taskId}:`, err);
   });
 };
@@ -214,7 +267,7 @@ const sweepExpired = (taskId: string): void => {
   if (keep.length === 0) st.queues.delete(taskId);
   else st.queues.set(taskId, keep);
   for (const e of expired) {
-    void discardWithInfo(taskId, "排队超过 30 分钟已过期", e.preview);
+    void discardWithInfo(taskId, "排队超过 30 分钟已过期", e);
   }
   publishSnapshot(taskId);
 };
@@ -257,7 +310,7 @@ const drainOnce = async (taskId: string): Promise<void> => {
       await discardWithInfo(
         taskId,
         "会话已断开，托办回执不会自动唤醒 agent",
-        item.preview,
+        item,
       );
       return;
     }
@@ -288,7 +341,7 @@ const drainOnce = async (taskId: string): Promise<void> => {
       await discardWithInfo(
         taskId,
         "任务被停止，输入条排的队已按停止清除",
-        item.preview,
+        item,
       );
       return;
     }
@@ -304,10 +357,10 @@ const drainOnce = async (taskId: string): Promise<void> => {
     } catch {
       /* noop */
     }
-    await discardWithInfo(taskId, reason, item.preview);
+    await discardWithInfo(taskId, reason, item);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    await discardWithInfo(taskId, reason, item.preview);
+    await discardWithInfo(taskId, reason, item);
   } finally {
     stopDrainTimerIfIdle(taskId);
   }
@@ -527,6 +580,55 @@ export const clearTalkQueue = (
   if (n > 0) publishSnapshot(taskId);
   stopDrainTimerIfIdle(taskId);
   return n;
+};
+
+/**
+ * 同 clearTalkQueue，但把被清掉的**用户自己的话**的完整文本一并返回（已脱敏、未截断），
+ * 给调用方落「排队消息未送达」事件用（D8-04）。
+ *
+ * 为什么要单独一个函数：clearTalkQueue 清完就拿不到文本了，快照必须在清之前、**同步**取；
+ * 调用方（stop-task）要把「清队」留在原位置（早于一连串 await），事件稍后再落。
+ * `count` 与 clearTalkQueue 返回值同义（含群问题等拿不到文本的）；`items` 含有文本**或带图片 / 文件**的用户来源条
+ * （附件条只带 `attachments` 文字占位，Q6-04）。
+ */
+export const clearTalkQueueCapturing = (
+  taskId: string,
+  opts?: { onlySources?: readonly TalkQueueSource[] },
+): { count: number; items: DroppedNoticeItem[] } => {
+  const only = opts?.onlySources;
+  const removing = (getState().queues.get(taskId) ?? []).filter(
+    (e) => !only || only.includes(e.source),
+  );
+  const items: DroppedNoticeItem[] = [];
+  for (const e of removing) {
+    const text = userTextOf(e);
+    // 图片 / 文件只取数量做文字占位（本体不进事件）；只对用户自己的话来源（托办回执不是用户要重发的东西）
+    const attachments = USER_TEXT_SOURCES.includes(e.source) ? attachmentsOf(e) : "";
+    if (text.trim() || attachments) {
+      items.push({ itemId: e.itemId, text, ...(attachments ? { attachments } : {}) });
+    }
+  }
+  return { count: clearTalkQueue(taskId, opts), items };
+};
+
+/**
+ * 排队的话被清掉后，往事件流落一条「未送达」info（带 meta.droppedTexts，前端画 DroppedQueueCard）。
+ * 失败只告警、不抛——它是提示，不能反过来拖垮 stop 之类的收尾。count ≤ 0 不写。
+ * `header` 是首行（卡片标题），如「已停止，2 条排队消息未送达、请重新发送」。
+ */
+export const noticeTalkQueueDropped = async (
+  taskId: string,
+  args: { header: string; count: number; items: readonly DroppedNoticeItem[] },
+): Promise<void> => {
+  if (args.count <= 0) return;
+  const notice = buildDroppedQueueNotice(args);
+  await writeEventAndPublish(taskId, {
+    kind: "info",
+    text: notice.text,
+    ...(notice.meta ? { meta: notice.meta } : {}),
+  }).catch((err) => {
+    console.warn(`[task-talk-queue] 写未送达提示失败 task=${taskId}:`, err);
+  });
 };
 
 /** 单测：手动跑一轮 drain（不依赖 setInterval） */

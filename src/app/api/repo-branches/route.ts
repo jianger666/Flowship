@@ -16,14 +16,20 @@ import { NextResponse } from "next/server";
 
 import { listRepoBranches } from "@/lib/server/git-branches";
 import { isAbsolutePathLike } from "@/lib/path-utils";
+import { nonLocalPathReason } from "@/lib/unc-path";
 
 export const runtime = "nodejs";
 
 export const GET = async (req: Request) => {
   const path = new URL(req.url).searchParams.get("path")?.trim() ?? "";
-  // 绝对路径校验走共享跨平台判断（CR-11）：POSIX / Windows 盘符（`D:\...`、`D:/...`）/
-  // UNC（`\\server\share`）都认——V0.14.x 踩过：只认 `/` 开头、Windows 仓库全部 400、
-  // 前端把 400 归一成「非 git 仓库」、git 探测压根没执行
+  // 先挡 UNC / 非本机磁盘形态（R12-01）：这个 GET 渲染层一行 `![](/api/repo-branches?path=//host/share)` 就能触发，
+  // Windows 上 `git -C <UNC>` 的 cwd / `fs.stat` 会让系统连 SMB 并带 NTLM 凭据。必须在任何 git / fs 调用之前
+  const nonLocal = nonLocalPathReason(path);
+  if (nonLocal) {
+    return NextResponse.json({ error: nonLocal }, { status: 400 });
+  }
+  // 绝对路径校验走共享跨平台判断（CR-11）：POSIX / Windows 盘符（`D:\...`、`D:/...`）都认——
+  // V0.14.x 踩过：只认 `/` 开头、Windows 仓库全部 400、前端把 400 归一成「非 git 仓库」、git 探测压根没执行
   if (!isAbsolutePathLike(path)) {
     return NextResponse.json(
       { error: "path 必须是绝对路径" },

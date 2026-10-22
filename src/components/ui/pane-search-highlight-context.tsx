@@ -2,14 +2,13 @@
 
 import { createContext, useContext } from "react";
 
-import type { SearchOccurrence } from "@/lib/text-search-highlight";
-import { firstGlobalIndexForField } from "@/lib/text-search-highlight";
-
+/**
+ * 栏内搜索上下文：只带「模型有命中的 owner 集合」（供折叠行 / 工作过程组强制展开）。
+ * 文本高亮统一走 DOM 的 CSS Custom Highlight（lib/dom-text-search），这里不再带 query / occurrences——
+ * 旧的行内 `<mark>` 管线（rehype 插件 + highlightPlainText）在 src 内早已零调用，D3-07 已清掉。
+ */
 export interface PaneSearchHighlightValue {
-  query: string;
-  activeGlobalIndex: number;
-  occurrences: readonly SearchOccurrence[];
-  /** 至少有一个 occurrence 的 ownerId（供折叠行 / 工作过程组强制展开） */
+  /** 至少有一个 occurrence 的 ownerId */
   hitOwnerIds: ReadonlySet<string>;
 }
 
@@ -25,24 +24,4 @@ export const usePaneSearchHighlight = (): PaneSearchHighlightValue | null =>
 export const useOwnerHasSearchHit = (ownerId: string): boolean => {
   const ctx = usePaneSearchHighlight();
   return Boolean(ctx?.hitOwnerIds.has(ownerId));
-};
-
-/** 某 owner+field 的首个 globalIndex（供 Markdown / 纯文本高亮） */
-export const useSearchFieldGlobalOffset = (
-  ownerId: string,
-  field: string,
-): { query: string; activeGlobalIndex: number; globalOffset: number } | null => {
-  const ctx = usePaneSearchHighlight();
-  if (!ctx || !ctx.query.trim()) return null;
-  const globalOffset = firstGlobalIndexForField(
-    ctx.occurrences,
-    ownerId,
-    field,
-  );
-  if (globalOffset < 0) return null;
-  return {
-    query: ctx.query,
-    activeGlobalIndex: ctx.activeGlobalIndex,
-    globalOffset,
-  };
 };

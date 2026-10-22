@@ -62,8 +62,12 @@ describe("事件流内联搜索 UI", () => {
   });
 
   it("chat 搜索悬浮在内容区，不再常驻占用一整行", () => {
+    // 浮层是实心面（ui-conventions）：不透明底 + 完整边框 + shadow-sm，不再 /90 半透明 + backdrop-blur 糊字
     expect(eventStream).toContain(
-      '"absolute right-3 top-2 z-20 rounded-lg border border-border/60 bg-background/90 shadow-sm backdrop-blur"',
+      '"absolute right-3 top-2 z-20 rounded-lg border border-border bg-background shadow-sm"',
+    );
+    expect(eventStream).not.toContain(
+      "border-border/60 bg-background/90 shadow-sm backdrop-blur",
     );
     expect(eventStream).toContain(
       '"w-[min(28rem,calc(100%-1.5rem))] p-1"',
@@ -80,7 +84,9 @@ describe("事件流内联搜索 UI", () => {
 
   it("Markdown 渲染接入栏内搜索高亮", () => {
     expect(markdownText).toContain('data-search-content="true"');
-    expect(markdownText).toContain("searchOwnerId");
+    // D3-07：行内 <mark>（rehype 插件 + searchOwnerId 等 props）已清掉，高亮只走 DOM CSS Highlight
+    expect(markdownText).not.toContain("rehypeSearchHighlight");
+    expect(markdownText).not.toContain("searchOwnerId");
     expect(domTextSearch).toContain("CSS.highlights");
   });
 

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { hasUrlUserinfo, redactUrlUserinfo } from "@/lib/custom-provider-url";
 import type { CustomProviderFormat } from "@/lib/types";
 import {
   listModelOptions,
@@ -42,6 +43,13 @@ export const POST = async (req: Request) => {
     if (!baseUrl) {
       return NextResponse.json({ error: "缺少 baseUrl" }, { status: 400 });
     }
+    // 含用户名 / 密码的地址 fetch 会直接抛错并把整串（含密钥）回显：不发请求，直接 400 说明原因（不回显地址）
+    if (hasUrlUserinfo(baseUrl)) {
+      return NextResponse.json(
+        { error: "接口地址里带了用户名 / 密码：请把密钥填到 API Key，不要写进地址" },
+        { status: 400 },
+      );
+    }
     source = {
       kind: "custom",
       baseUrl,
@@ -59,14 +67,15 @@ export const POST = async (req: Request) => {
   try {
     return NextResponse.json({ models: await listModelOptions(source) });
   } catch (err) {
-    console.error("[/api/models] error:", err);
-    const message = err instanceof Error ? err.message : String(err);
+    // 日志 / 响应都擦掉 URL userinfo（地址里带 `user:TOKEN@` 时 fetch 异常消息含整串密钥，D1-05）
+    const message = redactUrlUserinfo(err instanceof Error ? err.message : String(err));
+    console.error("[/api/models] error:", redactUrlUserinfo(err instanceof Error ? (err.stack ?? err.message) : String(err)));
     // 仅 dev 把 stack 摘要随响应返、production 不泄露 server 路径 / 内部实现
     const detail =
       process.env.NODE_ENV !== "production" &&
       err instanceof Error &&
       err.stack
-        ? err.stack.split("\n").slice(0, 3).join(" | ")
+        ? redactUrlUserinfo(err.stack.split("\n").slice(0, 3).join(" | "))
         : "";
     return NextResponse.json(
       { error: `拉取模型列表失败：${message}${detail ? ` (${detail})` : ""}` },

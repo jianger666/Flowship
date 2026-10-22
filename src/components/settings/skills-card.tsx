@@ -365,7 +365,7 @@ export const SkillsCard = () => {
     const cur = new Set(s.disabledSkills ?? []);
     if (enabled) cur.delete(name);
     else cur.add(name);
-    const ok = await saveSettings({ ...s, disabledSkills: [...cur] });
+    const ok = await saveSettings({ ...s, disabledSkills: [...cur] }, ["disabledSkills"]);
     if (!ok) {
       patchRow(!enabled);
       toast.error("开关保存失败，请重试");

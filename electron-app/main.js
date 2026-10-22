@@ -134,8 +134,10 @@ import {
 } from "./security-products.mjs";
 // 防后台节流实验开关（v1.9.28、默认关）：纯函数在 ./app-nap.mjs（单测直接 import）
 import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
-// NODE_OPTIONS 取值含空格时的引用（崩溃取证目录在 macOS 的「Application Support」下）：./node-options.mjs
-import { quoteNodeOptionValue } from "./node-options.mjs";
+// server 子进程的 Node 启动旗标（堆上限 + 崩溃取证，走 argv 而不是 NODE_OPTIONS）：./node-options.mjs
+import { buildServerNodeArgs } from "./node-options.mjs";
+// 系统通知 payload 解析（taskId / target:"inbox" 点击去向，N1-12）：./notify-target.mjs
+import { parseNotifyPayload } from "./notify-target.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -534,27 +536,17 @@ const startServer = () => {
   const serverJs = path.join(serverDir, "server.js");
   // OOM 止血（2026-09-03 实测：长会话 + 子代理巨型回包常驻内存，默认堆 ~2G 跑 1 小时必爆
   // `heap out of memory` → server 退出 code=? → 壳弹「服务异常退出」）。server 是独立子进程，
-  // 这里的 NODE_OPTIONS 只影响它，不污染用户 shell / agent 子进程（cap 只设上限、不预分配）。
-  // 已有 max-old-space-size（用户手动调过）则不动，避免覆盖手工值。
-  // split(" ") + join(" ") 对单空格分隔是无损的：用户自带的带引号取值（`--x="a b"`）被切成两段、
-  // 再用同一个空格接回，原样保留。**我们自己追加**的取值若含空格必须用 quoteNodeOptionValue 加引号，
-  // 否则 Node 只取空格前那一截（report-directory 曾因此落到不存在的目录、取证报告写不出来）。
   // mem-governance③ [设计决策]：恒带堆上限 + 崩溃取证。漏带旧路径实测 2.5GB 即崩。
   // ③只抬天花板、不改变增长曲线形状；取证 report 含 transcript 级数据，落盘到数据目录并只留最近 5 份。
   // P3-2：report-directory 落地 + 启动时轮转（默认落 cwd、无界累积）。
-  const serverNodeOptions = (process.env.NODE_OPTIONS ?? "")
-    .split(" ")
-    .filter(Boolean);
-  if (!serverNodeOptions.some((o) => o.includes("max-old-space-size"))) {
-    serverNodeOptions.push("--max-old-space-size=4096");
-  }
-  for (const flag of [
-    "--report-on-fatalerror",
-    "--report-uncaught-exception",
-  ]) {
-    if (!serverNodeOptions.includes(flag)) serverNodeOptions.push(flag);
-  }
-  // P3-2：report 落盘目录指到数据目录 + 只留最近 5 份（best-effort，失败不挡启动）
+  //
+  // ⛔ 这些旗标走 **argv**（`spawn(bin, [...serverNodeArgs, serverJs])`），不要再写进 NODE_OPTIONS
+  // （第三轮 review N3-01 P1）：NODE_OPTIONS 会被 server 的所有子孙进程继承，用户 PATH 上较旧的 Node
+  // （< 22.13 不认 `--report-exclude-env`）会直接 exit 9，agent shell 里的 pnpm / npm / tsc / vitest / hooks
+  // 全部起不来；取证旗标还会让每个子孙进程异常退出都落一份报告。argv 不被继承，只对 server 自己生效，
+  // 含空格的路径也不用加引号。宿主自己的 NODE_OPTIONS（用户手设）原样透传、不改写。
+  // 实现与单测见 ./node-options.mjs 的 buildServerNodeArgs。
+  // report 落盘目录指到数据目录 + 只留最近 5 份（best-effort，失败不挡启动）
   const nodeReportDir = path.join(
     app.getPath("userData"),
     "data",
@@ -576,15 +568,14 @@ const startServer = () => {
   } catch {
     /* 轮转失败不挡启动 */
   }
-  if (!serverNodeOptions.some((o) => o.includes("report-directory"))) {
-    serverNodeOptions.push(
-      `--report-directory=${quoteNodeOptionValue(nodeReportDir)}`,
-    );
-  }
-  const proc = spawn(serverNodeBin(), [serverJs], {
+  const serverNodeArgs = buildServerNodeArgs({
+    userNodeOptions: process.env.NODE_OPTIONS,
+    nodeVersion: process.versions.node,
+    reportDir: nodeReportDir,
+  });
+  const proc = spawn(serverNodeBin(), [...serverNodeArgs, serverJs], {
     env: {
       ...process.env,
-      NODE_OPTIONS: serverNodeOptions.join(" "),
       // 三件套：execPath 当 node 用（含孙进程继承、hooks 依赖）+ 端口 + 数据目录
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(PORT),
@@ -601,7 +592,7 @@ const startServer = () => {
   });
   serverProc = proc;
   bootTimeline.mark("serverSpawn");
-  log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")} nodeOptions=${serverNodeOptions.join(" ") || "（空）"}`);
+  log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")} nodeArgs=${serverNodeArgs.join(" ") || "（空）"}`);
   // ⚠️ 世代守卫（自更新失败恢复竞态）：stopServer 会先把 serverProc 置 null 再杀、
   // SIGKILL 后不等回收就可能 startServer 拉新的——旧进程迟来的 exit 若无脑
   // serverProc=null / 弹「服务异常退出」、会误杀刚拉起的新 server（serverProc !== proc
@@ -1162,6 +1153,11 @@ const createWindow = async () => {
   mainWindow = new BrowserWindow({
     width: st?.width ?? 1280,
     height: st?.height ?? 800,
+    // 窗口最小尺寸（第二轮 review 窄栏三件套）：原先无下限，侧栏 257px + 事件流栏默认 30%
+    // ⇒ task 事件流栏在默认窗口只有约 307px，缩小窗口后答题卡 / 工具块 / 子代理卡都会溢出。
+    // 960×600 是 review 建议值；上次保存的更小窗口状态会被 Electron 自动抬到下限。
+    minWidth: 960,
+    minHeight: 600,
     x: st?.x,
     y: st?.y,
     show: false,
@@ -1272,7 +1268,14 @@ const createWindow = async () => {
   // 审查后补协议白名单，与 IPC open-external 同源，防任意协议跳板）：
   // - 外链（飞书 story / MR / GitHub…）、OAuth 授权页 → https、在白名单内
   // - 站内 URL 也 deny（用户实测「应用内闪一下」差）——若要开外链走 markdown/IPC
+  //   （第四轮 Q4-02：以前注释这么写、实现却把 `http://127.0.0.1:<本应用端口>/api/…` 当普通 http 链接
+  //   openExternal 了——系统浏览器打开时 `Sec-Fetch-Site: none`，Fetch Metadata 闸拦不住，
+  //   AI 输出里的一条恶意链接就能让用户一点触发本机 GET 副作用；现在站内 URL 显式 deny）
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isAppUrl(url)) {
+      console.warn(`[setWindowOpenHandler] 拒绝站内 URL：${String(url).slice(0, 80)}`);
+      return { action: "deny" };
+    }
     if (!isSafeExternalUrl(url)) {
       console.warn(`[setWindowOpenHandler] 拒绝非白名单 URL：${String(url).slice(0, 80)}`);
       return { action: "deny" };
@@ -1415,15 +1418,14 @@ ipcMain.on("inbox:set-badge", (_e, payload) => {
 
 // ---------- 任务注意力通知（v0.9.5） ----------
 //
-// 页面（TaskAttentionWatcher）发现某 task 转入「等你回复 / 提问 / 失败」且窗口不在前台时、
+// 页面（TaskAttentionWatcher）发现某 task 转入「等你回复 / 提问 / 失败」，且「没有聚焦、
+// 或聚焦但正看着的不是这个任务」（V7-03 起；只有聚焦 + 正看着它才静音）时、
 // IPC 过来发系统通知；点通知 → 聚焦窗口 + 回传 taskId 给页面路由跳转。
 // 通知只是「叫人回来」的信使、判断「什么时候该叫」全在页面侧（那边有完整任务状态）。
-// 收件箱增量通知也走同一通道（无 taskId、点通知只聚焦窗口）。
+// 收件箱增量通知也走同一通道（无 taskId、带 target:"inbox"：点通知聚焦窗口并让页面打开收件箱，N1-12）。
 ipcMain.on("task-notify", (_e, payload) => {
   if (!Notification.isSupported()) return;
-  const title = typeof payload?.title === "string" ? payload.title.slice(0, 80) : "Flowship";
-  const body = typeof payload?.body === "string" ? payload.body.slice(0, 200) : "";
-  const taskId = typeof payload?.taskId === "string" ? payload.taskId : "";
+  const { title, body, taskId, target } = parseNotifyPayload(payload);
   try {
     const n = new Notification({
       title,
@@ -1442,6 +1444,8 @@ ipcMain.on("task-notify", (_e, payload) => {
         mainWindow.focus();
         if (taskId) {
           mainWindow.webContents.send("task-notify-click", taskId);
+        } else if (target) {
+          mainWindow.webContents.send("notify-target-click", target);
         }
       }
     });
@@ -1455,6 +1459,11 @@ ipcMain.on("task-notify", (_e, payload) => {
 //
 // 白名单见顶部 isSafeExternalUrl——别让页面 IPC 成任意协议跳板。
 ipcMain.on("open-external", (_e, url) => {
+  // 站内 URL 不交给系统浏览器（同 setWindowOpenHandler，第四轮 Q4-02）
+  if (isAppUrl(url)) {
+    log(`[open-external] 拒绝站内 URL：${String(url).slice(0, 80)}`);
+    return;
+  }
   if (!isSafeExternalUrl(url)) {
     log(`[open-external] 拒绝非法 URL：${String(url).slice(0, 80)}`);
     return;

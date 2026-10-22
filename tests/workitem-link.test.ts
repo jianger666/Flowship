@@ -12,6 +12,7 @@ import {
   findExistingWorkitemTask,
   normalizeWorkitemUrl,
   resolveTaskLookup,
+  shouldTrustCachedTaskLink,
   safeHttpUrl,
 } from "@/lib/workitem-link";
 
@@ -198,6 +199,114 @@ describe("decideWorkitemGate（N9-02：任务列表没加载完不能放表单�
     expect(frames).toEqual(["loading", "existing"]);
     expect(frames).not.toContain("form");
   });
+
+  // ---- F3-03：列表加载失败（loaded 为 true、但没拉到）不能放表单 ----
+
+  it("列表首拉失败（loaded + 没数据 + 有 loadError）→ error，不是 form（否则对已有任务的需求会重复启动）", () => {
+    expect(
+      decideWorkitemGate({
+        loaded: true,
+        existing: undefined,
+        forceNew: false,
+        loadError: "HTTP 503",
+        taskCount: 0,
+      }),
+    ).toBe("error");
+  });
+
+  it("没有失败（loadError 为 null / 缺省）+ 列表真的为空 → 仍是 form", () => {
+    expect(
+      decideWorkitemGate({
+        loaded: true,
+        existing: undefined,
+        forceNew: false,
+        loadError: null,
+        taskCount: 0,
+      }),
+    ).toBe("form");
+    // 老调用方不传 loadError / taskCount：行为不变
+    expect(decideWorkitemGate({ loaded: true, existing: undefined, forceNew: false })).toBe(
+      "form",
+    );
+  });
+
+  it("没加载完仍是 loading（loadError 不能越过 loading 抢先画失败）", () => {
+    expect(
+      decideWorkitemGate({
+        loaded: false,
+        existing: undefined,
+        forceNew: false,
+        loadError: "断网",
+        taskCount: 0,
+      }),
+    ).toBe("loading");
+  });
+
+  it("已有旧数据时后台刷新失败 → 仍按 ready 走（口径同侧栏 / /chats：不拿失败态盖掉能用的旧列表）", () => {
+    expect(
+      decideWorkitemGate({
+        loaded: true,
+        existing: undefined,
+        forceNew: false,
+        loadError: "断网",
+        taskCount: 5,
+      }),
+    ).toBe("form");
+  });
+
+  it("只传 loadError、忘了 taskCount：按 0 算、宁可挡住表单也不在失败时放行", () => {
+    expect(
+      decideWorkitemGate({
+        loaded: true,
+        existing: undefined,
+        forceNew: false,
+        loadError: "断网",
+      }),
+    ).toBe("error");
+  });
+
+  it("命中已有任务是正证据：即使 loadError 非空也走 existing / form（点「仍要新建」），不降成 error", () => {
+    expect(
+      decideWorkitemGate({
+        loaded: true,
+        existing: hit,
+        forceNew: false,
+        loadError: "断网",
+        taskCount: 0,
+      }),
+    ).toBe("existing");
+    expect(
+      decideWorkitemGate({
+        loaded: true,
+        existing: hit,
+        forceNew: true,
+        loadError: "断网",
+        taskCount: 0,
+      }),
+    ).toBe("form");
+  });
+
+  it("表单已放出过：之后后台刷新失败也不收回表单（防丢已填内容）", () => {
+    expect(
+      decideWorkitemGate({
+        loaded: true,
+        existing: undefined,
+        forceNew: false,
+        formShown: true,
+        loadError: "断网",
+        taskCount: 0,
+      }),
+    ).toBe("form");
+  });
+
+  it("时序：首拉失败 → 点重试成功（loadError 清掉）→ 表单放出；全程失败那一帧没有 form", () => {
+    const frames = [
+      { loaded: false, loadError: null, taskCount: 0 },
+      { loaded: true, loadError: "HTTP 503", taskCount: 0 },
+      { loaded: true, loadError: null, taskCount: 0 },
+    ].map((f) => decideWorkitemGate({ ...f, existing: undefined, forceNew: false }));
+    expect(frames).toEqual(["loading", "error", "form"]);
+  });
 });
 
 describe("resolveTaskLookup（收件箱「改bug」等按已有任务分流的入口）", () => {
@@ -208,6 +317,29 @@ describe("resolveTaskLookup（收件箱「改bug」等按已有任务分流的�
     expect(resolveTaskLookup(true, undefined)).toBe("miss");
     expect(resolveTaskLookup(true, { id: "t" })).toBe("hit");
     expect(resolveTaskLookup(false, { id: "t" })).toBe("hit");
+  });
+  it("列表首拉失败（loaded=true、没数据、有 loadError）→ unknown，不当「没有」引导新建", () => {
+    expect(resolveTaskLookup(true, undefined, { loadError: "HTTP 500", taskCount: 0 })).toBe("unknown");
+  });
+  it("失败但有旧数据 / 没失败 / 命中 → 与旧口径一致", () => {
+    expect(resolveTaskLookup(true, undefined, { loadError: "HTTP 500", taskCount: 3 })).toBe("miss");
+    expect(resolveTaskLookup(true, undefined, { loadError: null, taskCount: 0 })).toBe("miss");
+    expect(resolveTaskLookup(true, { id: "t" }, { loadError: "HTTP 500", taskCount: 0 })).toBe("hit");
+    expect(resolveTaskLookup(false, undefined, { loadError: "HTTP 500", taskCount: 0 })).toBe("pending");
+  });
+});
+
+describe("shouldTrustCachedTaskLink（飞书看板点已有任务）", () => {
+  it("没加载完 → 信缓存", () => {
+    expect(shouldTrustCachedTaskLink({ loaded: false, taskCount: 0 })).toBe(true);
+  });
+  it("首拉失败（没数据 + 有失败）→ 信缓存，不被误导去预览页重复建任务", () => {
+    expect(shouldTrustCachedTaskLink({ loaded: true, loadError: "HTTP 500", taskCount: 0 })).toBe(true);
+  });
+  it("有数据（含旧数据）/ 确实没有任务 → 用实时列表校验", () => {
+    expect(shouldTrustCachedTaskLink({ loaded: true, loadError: "HTTP 500", taskCount: 2 })).toBe(false);
+    expect(shouldTrustCachedTaskLink({ loaded: true, loadError: null, taskCount: 2 })).toBe(false);
+    expect(shouldTrustCachedTaskLink({ loaded: true, loadError: null, taskCount: 0 })).toBe(false);
   });
 });
 
@@ -329,12 +461,16 @@ describe("接线契约", () => {
     });
     expect(handleFix).toBeDefined();
     const body = handleFix!.body.getText(sf);
-    const pendingAt = body.indexOf('resolveTaskLookup(tasksLoaded, hit) === "pending"');
+    const pendingAt = body.indexOf('lookup === "pending"');
+    const unknownAt = body.indexOf('lookup === "unknown"');
     const guideAt = body.indexOf("新建改bug任务？");
+    expect(body).toContain("resolveTaskLookup(tasksLoaded, hit, {");
     expect(pendingAt).toBeGreaterThan(-1);
+    expect(unknownAt).toBeGreaterThan(-1);
     expect(guideAt).toBeGreaterThan(-1);
-    // pending 拦截必须在「引导新建」的 confirm 之前
+    // pending / unknown（列表首拉失败）拦截必须在「引导新建」的 confirm 之前
     expect(pendingAt).toBeLessThan(guideAt);
+    expect(unknownAt).toBeLessThan(guideAt);
   });
 
   it("手动建任务页本身不做「已有任务」判断（分流在入口），不读 tasks，没有同类漏洞", () => {

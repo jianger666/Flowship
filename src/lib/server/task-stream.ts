@@ -60,7 +60,12 @@ export const stringifyMeta = (v: unknown): string => {
 //   - 省略  → 属主主链（task / chat run、one-shot、stop 补发的 done…）
 //   - 有值  → 旁路 run 的不可复用 token（当前只有受限群答疑）
 // 群回流的回群登记按它精确投递（见 feishu-bridge/group-shared 的 token 化协议）。
-// 前端不消费 origin——旁路是否在飞走 restricted_run 帧。
+// 前端对 origin 的消费（第三轮 review D9-01）：
+//   - done 帧：route 把 origin 原样带给客户端——旁路 run 的 done 不得清属主的流式气泡 / 放 run latch
+//     （owner-run-signal.planDoneFrame）；属主主链的 done 没有这个字段；
+//   - event 帧：不带 origin，客户端看事件自己的 `meta.groupRun`（落盘时已打标）；
+//   - assistant_delta：route 直接丢弃带 origin 的，不发给前端。
+// 旁路是否在飞仍走 restricted_run 帧。
 export type TaskStreamEvent =
   | { kind: "event"; event: TaskEvent; origin?: string }
   | { kind: "task"; task: Task }

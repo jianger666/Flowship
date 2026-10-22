@@ -500,7 +500,8 @@ describe("接线契约", () => {
   });
 
   it("面板挂错误条 + 忽略 toast 带撤销", () => {
-    expect(panel).toContain("scanError");
+    // N1-01 粒度：错误条改读结构化的 scanNotice（按场景给文案，行为见 mr-inbox-partial-streak.test.ts）
+    expect(panel).toContain("scanNotice");
     expect(panel).toContain('label: "撤销"');
     expect(panel).toContain("restoreIgnored");
   });

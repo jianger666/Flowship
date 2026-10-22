@@ -22,6 +22,8 @@ import path from "node:path";
 
 import type { JumpIde } from "@/lib/types";
 
+import { stripHostInjectedEnv } from "./host-env";
+
 const execFileAsync = promisify(execFile);
 
 export interface IdeToolInfo {
@@ -482,10 +484,13 @@ export const openInIde = async (
     const [cmd, cmdArgs] = tool.isCmdScript
       ? ["cmd.exe", ["/d", "/s", "/c", tool.exec, ...args]]
       : [tool.exec, args];
+    // env 剔宿主注入变量：VS Code / Cursor / Windsurf 都是 Electron 应用，吃到 ELECTRON_RUN_AS_NODE=1
+    // 会被当纯 node 跑、静默秒退（见 host-env.ts）；PORT / HOSTNAME 等也不该漏进 IDE 里的终端
     const child = spawn(cmd, cmdArgs as string[], {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
+      env: stripHostInjectedEnv(),
     });
     // 静默失败探测（V0.11.9、同事 Windows 实测「点了没反应」）：spawn 本身成功但进程
     // 秒退（脚本路径带空格被 cmd 拆坏 / exe 损坏）时原实现直接当成功、用户零反馈。

@@ -33,6 +33,7 @@ import { getSettings } from "@/lib/local-store";
 import { pickNativePaths } from "@/lib/native-picker";
 import { REPO_SHELL_COMMAND_MAX_LEN } from "@/lib/repo-shell-command";
 import { isAbsolutePathLike, pathBasename } from "@/lib/path-utils";
+import { firstNonLocalRepoPath } from "@/lib/unc-path";
 
 import type { RepoConfig } from "@/lib/types";
 
@@ -72,7 +73,16 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
 
   // 添加若干仓库、name 默认 basename、重复路径跳过
   const addRepos = (paths: string[]) => {
-    const fresh = paths.filter((p) => p && !repos.some((r) => r.path === p));
+    // UNC / WSL / 非本机磁盘：登记处就拒收并写原因（Q4-01）——放行的话下游 repo-branches 回 400，
+    // 分支框只会显示「非 git 仓库」，用户不知道真正原因
+    const accepted: string[] = [];
+    for (const p of paths) {
+      const rejected = p ? firstNonLocalRepoPath([p]) : null;
+      if (rejected) toast.error(rejected.reason);
+      else accepted.push(p);
+    }
+    if (accepted.length === 0) return;
+    const fresh = accepted.filter((p) => p && !repos.some((r) => r.path === p));
     if (fresh.length === 0) {
       toast.error("选的目录已经在列表里");
       return;
@@ -98,8 +108,8 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
 
   // 手填路径备份入口（粘贴绝对路径、给极端场景兜底）
   // 用 useDialog().prompt 替代 window.prompt——shadcn 风格 + 内联校验、不阻塞主线程
-  // CR-11：校验走共享跨平台判断——Windows 盘符（D:\repo）/ UNC 路径也放行、
-  // 原实现只认 `/` 开头、Windows 用户手填兜底完全不可用
+  // CR-11：校验走共享跨平台判断——Windows 盘符（D:\repo）也放行、原实现只认 `/` 开头、Windows 用户手填兜底完全不可用；
+  // UNC / WSL 路径在这里就拒（Q4-01：下游 git / 读文件入口一律 400，不支持）
   const promptManualPath = async () => {
     const input = await prompt({
       title: "手填仓库路径",
@@ -109,6 +119,8 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
       validate: (v) => {
         const trimmed = v.trim().replace(/[\\/]+$/, "");
         if (!trimmed) return "路径不能为空";
+        const rejected = firstNonLocalRepoPath([trimmed]);
+        if (rejected) return rejected.reason;
         if (!isAbsolutePathLike(trimmed)) return "请填绝对路径";
         return "";
       },
@@ -203,7 +215,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                     ? "路径不存在、检查一下"
                     : entry.gitMissing
                       ? "未检测到 git、可手填分支"
-                      : "非 git 仓库"
+                      : (entry.reason ?? "非 git 仓库")
                   : undefined;
               return (
                 // *:min-w-0：行内长路径的 min-content 会把 grid 隐式轨道撑得比容器宽、

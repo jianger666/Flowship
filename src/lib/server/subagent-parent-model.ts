@@ -8,11 +8,14 @@
  * 表挂 globalThis：Next 的多个路由 chunk / dev HMR 可能各 import 一份本模块，登记和读取必须是同一张表。
  * 键是 facade 返回给调用方的那个（包了取消联动的）父 agent 对象，WeakMap——agent 释放表项自动消失。
  */
+import type { SubagentDisplayLookup } from "@/lib/cursor-subagent-display";
 import type { SubagentModelSelection } from "@/lib/subagent-spec";
 
 type ParentModelMap = WeakMap<object, SubagentModelSelection | undefined>;
+type DisplayLookupMap = WeakMap<object, SubagentDisplayLookup>;
 type Holder = typeof globalThis & {
   __flowshipSubagentParentModels?: ParentModelMap;
+  __flowshipSubagentDisplayLookups?: DisplayLookupMap;
 };
 
 const table = (): ParentModelMap => {
@@ -38,4 +41,29 @@ export const getSubagentParentModel = (
 ): SubagentModelSelection | undefined =>
   agent !== null && typeof agent === "object"
     ? table().get(agent)
+    : undefined;
+
+const lookupTable = (): DisplayLookupMap => {
+  const g = globalThis as Holder;
+  g.__flowshipSubagentDisplayLookups ??= new WeakMap();
+  return g.__flowshipSubagentDisplayLookups;
+};
+
+/**
+ * facade 给父 agent 挂 `subagent` 时登记「查子代理实际模型 / 思考档」的同步查表函数
+ *（该模型的默认档、resume 那个子代理当初用的模型）。与父模型同键、同生命周期。
+ */
+export const setSubagentDisplayLookup = (
+  agent: object,
+  lookup: SubagentDisplayLookup,
+): void => {
+  lookupTable().set(agent, lookup);
+};
+
+/** 读某个父 agent 的查表函数；不是 Cursor 路径 / 没挂 subagent 的 agent → undefined（徽标不补默认档、resume 不补模型） */
+export const getSubagentDisplayLookup = (
+  agent: unknown,
+): SubagentDisplayLookup | undefined =>
+  agent !== null && typeof agent === "object"
+    ? lookupTable().get(agent)
     : undefined;

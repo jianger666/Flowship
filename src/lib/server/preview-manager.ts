@@ -26,9 +26,33 @@ import { promisify } from "node:util";
 import { dataRoot } from "./data-root";
 import { getChatLifecycle } from "./chat-gate";
 import { failpoint } from "./failpoints";
+import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
+import { stripHostInjectedEnv } from "./host-env";
 import type { PreviewSlotStatus } from "@/lib/types";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * 预览命令（用户配置的 `pnpm dev` / `next dev` / umi 等）的子进程环境。
+ *
+ * 在 server 自己的环境上剔掉宿主注入的变量（见 `host-env.ts`）：
+ * - PORT / HOSTNAME：Electron 壳给内置 Next server 注入的。原封漏给 dev server 会被 umi/webpack 等
+ *   优先读走、顶掉用户 `--port` 配置，再因 8876 被 app 自己占着自动 +1 全跑到 8877
+ *   （用户实测：--port=8888 实跑 8877）；
+ * - ELECTRON_RUN_AS_NODE / `__NEXT_PRIVATE_*` / NEXT_DEPLOYMENT_ID / FLOWSHIP_DATA_DIR 等：
+ *   用户项目若也是 Next，standalone 配置会让它的 `next dev` 报错；
+ * - GitLab token 是给 agent 调 API 用的，用户随手配的预览命令用不到、也不该拿到。
+ *
+ * `base` 仅供测试注入；不改传入对象。
+ */
+export const buildPreviewEnv = (
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv => {
+  const env = stripHostInjectedEnv(base);
+  delete env[GITLAB_TOKEN_ENV_NAME];
+  env.FORCE_COLOR = "0";
+  return env;
+};
 
 // ----------------- per-task「启动中」计数（入队 → spawn 完成） -----------------
 
@@ -546,12 +570,8 @@ const doStartPreview = async (
   // - unix：detached 自成进程组、kill(-pid) 整组杀
   // - Windows：detached 会给子进程开独立控制台黑框（用户可见）、而树杀走 taskkill /T
   //   本就不依赖进程组 → 不 detach + windowsHide 压掉窗口
-  // 剔掉 app 自用的 PORT / HOSTNAME（Electron 壳给内置 Next server 注入的）——
-  // 原封漏给 dev server 会被 umi/webpack 等优先读走、顶掉用户 --port 配置，
-  // 再因 8876 被 app 自己占着自动 +1 全跑到 8877（用户实测：--port=8888 实跑 8877）
-  const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: "0" };
-  delete env.PORT;
-  delete env.HOSTNAME;
+  // 环境剔掉宿主注入的变量，见 buildPreviewEnv
+  const env = buildPreviewEnv();
   const proc = spawn(input.command, {
     cwd: input.workDir,
     shell: true,

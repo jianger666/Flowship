@@ -18,13 +18,19 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { useModels } from "@/hooks/use-models";
 import {
+  countTasksBoundToProvider,
   customProviderDisplayName,
   emptyCustomProvider,
   hostNameFromUrl,
   isCustomProviderReady,
   listProviderOptions,
 } from "@/lib/agent-provider";
-import { formatFromCustomBaseUrl } from "@/lib/custom-provider-url";
+import {
+  customBaseUrlNotice,
+  formatFromCustomBaseUrl,
+  validateCustomBaseUrl,
+} from "@/lib/custom-provider-url";
+import { fetchTasks } from "@/lib/task-store";
 import { CURSOR_PROVIDER_ID, CUSTOM_PROVIDER_FORMAT_LABEL } from "@/lib/types";
 import type {
   AgentProviderId,
@@ -98,10 +104,24 @@ export const CustomProviderList = ({
 
   const handleDelete = async (id: string) => {
     const row = items.find((p) => p.id === id);
+    // 统计还有多少对话 / 任务绑着它：删除后（或「删了重加」换了新 id）它们要重新选提供方才能继续发送（D1-03）。
+    // 拉不到列表就不说数字，只说后果——不因统计失败挡住删除
+    let boundCount: number | null = null;
+    try {
+      boundCount = countTasksBoundToProvider(await fetchTasks(), id);
+    } catch {
+      boundCount = null;
+    }
+    const consequence =
+      boundCount === null
+        ? "已经绑定它的对话 / 任务删除后需要重新选择提供方才能继续发送。"
+        : boundCount > 0
+          ? `有 ${boundCount} 个对话 / 任务正绑定它：删除后它们需要重新选择提供方才能继续发送（不会自动改走别家）。`
+          : "";
     const ok = await confirm({
       title: "删除这个提供方？",
       description: row
-        ? `「${customProviderDisplayName(row)}」会从目录里去掉。`
+        ? `「${customProviderDisplayName(row)}」会从目录里去掉。${consequence}`
         : undefined,
       destructive: true,
     });
@@ -184,6 +204,8 @@ const CustomProviderRow = ({
   const pullModels = useCallback(
     (row: CustomProviderConfig, manual?: boolean) => {
       if (!row.baseUrl.trim()) return;
+      // 地址本身不合法（含 userinfo / 缺协议头…）就别发请求：红字已经说明原因，发出去只会回显一串错误（第四轮 Q2-06）
+      if (validateCustomBaseUrl(row.baseUrl)) return;
       void fetchModels(
         {
           apiKey: row.apiKey,
@@ -211,6 +233,11 @@ const CustomProviderRow = ({
   const ready = isCustomProviderReady(value);
   const host = hostNameFromUrl(value.baseUrl);
   const summary = ready ? host || value.baseUrl.trim() : "未配置";
+  const baseUrlError = validateCustomBaseUrl(value.baseUrl);
+  // 「已自动处理」的黄字提示（带 ?# / 粘了具体接口地址）：不是错误，不用红字、不设 aria-invalid
+  const baseUrlNotice = baseUrlError ? null : customBaseUrlNotice(value.baseUrl);
+  // 拉不到模型列表（没有 /models 的网关 / 列表为空）时给「手填模型 ID」出口（D1-04）
+  const showManualModel = !loading && (!!error || models.length === 0);
 
   return (
     <div className="border-b last:border-b-0">
@@ -279,8 +306,22 @@ const CustomProviderRow = ({
                 onChange(next);
                 commit(next, true);
               }}
+              placeholder="https://api.example.com/v1"
+              aria-invalid={baseUrlError ? true : undefined}
               className="font-mono"
             />
+            {baseUrlError ? (
+              <div className="mt-1 text-[11px] text-destructive">
+                {baseUrlError}
+              </div>
+            ) : baseUrlNotice ? (
+              <div className="mt-1 text-[11px] text-warning">{baseUrlNotice}</div>
+            ) : (
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                末尾写了 /v1 就保留；没写时，路径里已有版本段（如 /v4、/v3、/v1beta）则原样使用，否则自动补 /v1。
+                暂不支持「不带版本段、又不能带 /v1」的地址（如 GitHub Models、Azure 经典部署）
+              </div>
+            )}
           </div>
           <div>
             <div className="mb-1 text-[11px] text-muted-foreground">API Key</div>
@@ -300,6 +341,8 @@ const CustomProviderRow = ({
                   variant="outline"
                   size="icon"
                   onClick={() => setShowKey((s) => !s)}
+                  aria-label={showKey ? "隐藏 API Key" : "显示 API Key"}
+                  aria-pressed={showKey}
                 >
                   {showKey ? <EyeOff /> : <Eye />}
                 </Button>
@@ -350,6 +393,34 @@ const CustomProviderRow = ({
             modelsError={error}
             providerId={value.id}
           />
+          {showManualModel ? (
+            <div>
+              <div className="mb-1 text-[11px] text-muted-foreground">
+                手填模型 ID
+              </div>
+              <Input
+                type="text"
+                value={value.defaultModel?.id ?? ""}
+                onChange={(e) =>
+                  setField("defaultModel", { id: e.target.value })
+                }
+                onBlur={(e) => {
+                  const id = e.target.value.trim();
+                  const row = { ...value, defaultModel: id ? { id } : undefined };
+                  onChange(row);
+                  onCommit(row);
+                }}
+                placeholder="例如 gpt-4o-mini"
+                className="font-mono"
+                spellCheck={false}
+              />
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                {error
+                  ? "拉不到模型列表时（有些网关没有 /models）可以直接填模型 ID"
+                  : "这个端点没有返回模型列表，可以直接填模型 ID"}
+              </div>
+            </div>
+          ) : null}
           <div className="flex justify-end border-t border-border/60 pt-2">
             <Button
               type="button"

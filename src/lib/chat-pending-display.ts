@@ -34,6 +34,33 @@ export const classifyPendingBubble = (p: {
   return p.queued ? "queued" : "inflight";
 };
 
+/**
+ * 这条本地占位有没有东西可画（V1-07）。
+ *
+ * 占位的正文只在**提交它的那个窗口**里有——ledger 是纯内存，刷新页面 / 开第二个窗口后，
+ * 占位是 watch bootstrap 按服务端 operationSnapshot 重建的，快照只有 itemId + phase，没有文字
+ * （见 chat-pending-reconcile 的「bootstrap snapshot 重建」，displayText 恒为 ""）。
+ * 把它画出来就是一个空白的虚线「排队中…」气泡，还带编辑 / 删除，点编辑是空输入框。
+ *
+ * 不画、但仍留在 ledger 里：排队条（chat-queue-banner）按 ledger 的数量出现，再去服务端拉
+ * 带正文的排队清单——编辑 / 删除在那里都有，空气泡本来就是重复的、且是坏的。
+ * 不走「快照带 text」：直接发送途中的 accepting 项不在服务端队列里、拿不到文字，
+ * 只能覆盖一半；而「没有可画内容就不画」对两种情形一视同仁。
+ *
+ * 判据是「文字 / 图片 / 附件 / skill 都没有」才算空：纯附件消息登记时带着附件、没文字，
+ * 同样是本窗口提交的占位，必须照旧画（别一刀切掉空文字）。
+ */
+export const hasPendingBubbleContent = (p: {
+  displayText?: string;
+  images?: ReadonlyArray<unknown>;
+  attachments?: ReadonlyArray<unknown>;
+  skillRefs?: ReadonlyArray<unknown>;
+}): boolean =>
+  (p.displayText ?? "").trim() !== "" ||
+  (p.images?.length ?? 0) > 0 ||
+  (p.attachments?.length ?? 0) > 0 ||
+  (p.skillRefs?.length ?? 0) > 0;
+
 /** 是否有「立即发送途中」的占位：有就该在列表末尾挂进度行 */
 export const hasInflightPending = (
   items: ReadonlyArray<{ mode?: PendingBubbleMode }> | undefined,
@@ -101,6 +128,10 @@ export const resolveLoadingStart = (since: number | undefined, now: number): num
  *
  * 提交飞行期间（submitting）也算：气泡已是正式消息，输入框就别再装作「还在发送」。
  * 有待答提问时照旧不画运行态——那时回车 = 隐式跳过提问，输入条要保持可发。
+ *
+ * 后台子代理还在跑**不算**运行态（第三轮 review R3-02；V16-03 当初把它并进来是为了给停止入口，
+ * 却把整套运行态带了出来：转圈、发送键变「排队发送」——服务端此刻并不排队、附件按钮消失）。
+ * 它只需要一个停止键，见 {@link shouldShowComposerStopOnly}。
  */
 export const shouldShowComposerRunning = (s: {
   /** run 进行中 latch（runStatus 进过 running，done 事件才松开） */
@@ -109,6 +140,46 @@ export const shouldShowComposerRunning = (s: {
   submitting: boolean;
   awaitingAsk: boolean;
 }): boolean => (s.isRunning || s.submitting) && !s.awaitingAsk;
+
+/**
+ * 输入框只多出一个停止键（不改发送键 / 附件 / 转圈的语义）：主 AI 说完一轮后 isRunning 归零，
+ * 会话看上去「已结束」，后台子代理却可能还在干活，输入框没有任何停止入口（V16-03）。
+ * 停止键点下去 = 停整个会话（连带取消后台子代理），由调用方把 tooltip 写成「停止（含 N 个后台子代理）」说清楚。
+ *
+ * 已经是完整运行态（自带停止键）或有待答提问（回车 = 隐式跳过提问，输入条保持常态）时不出。
+ */
+export const shouldShowComposerStopOnly = (s: {
+  isRunning: boolean;
+  submitting: boolean;
+  awaitingAsk: boolean;
+  /** 此刻还在后台跑的子代理个数（不传 = 0） */
+  backgroundSubagentCount?: number;
+}): boolean =>
+  (s.backgroundSubagentCount ?? 0) > 0 &&
+  !s.awaitingAsk &&
+  !shouldShowComposerRunning(s);
+
+/**
+ * 输入框能不能输入（第三轮 review D7-03）。
+ *
+ * `submitting`（提交飞行中）**要算进可输入**：编辑器在 POST 飞行期间不锁（第二轮 V5-01：发完能立刻补一句 / 贴图），
+ * 防双发靠提交闩锁（lib/composer-actions 的 createSubmitLatch，event-stream 持有）+ ConversationComposer.handleSubmit / 发送键对 submitting 的拦截（composerSubmitBlock），不靠锁编辑器。
+ * 之前 chat 的 `canReply = !isSubmitting` 折进来，空闲首发回车到服务端受理的 1.3–6.7s 整个编辑器灰掉。
+ *
+ * 注意只改「编辑器能不能输入」；行内动作（重发 / 重新生成 / 原地编辑 / 引用）仍看 `awaitingUser`（= canReply）。
+ */
+export const deriveComposeEnabled = (s: {
+  /** 调用方说「可回复」（chat：!isSubmitting；缺省 awaiting_user） */
+  awaitingUser: boolean;
+  awaitingAsk: boolean;
+  isRunning: boolean;
+  allowQueueWhileRunning: boolean;
+  submitting: boolean;
+}): boolean =>
+  s.awaitingUser ||
+  s.awaitingAsk ||
+  (s.isRunning && s.allowQueueWhileRunning) ||
+  s.submitting;
 
 /**
  * 点停止键：现在就停，还是等这次提交落地再停。

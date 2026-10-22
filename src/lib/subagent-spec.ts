@@ -68,6 +68,12 @@ export interface ModelCatalogEntry {
   /** 思考档参数的 id（Cursor 可能是 thinking / effort）；没有 = 该模型不支持 effort */
   effortParamId?: string;
   efforts: string[];
+  /**
+   * 不指定 effort 时这个模型自己的默认档（取自清单里 `isDefault` 预设的思考档取值）。
+   * 只给展示用（卡片徽标 / 过程记录）——真实请求不传 effort 就是走它，这里不参与任何校验。
+   * 清单里没标默认预设 / 默认值不在可选档里（自定义 provider 的 Default 就是「不覆盖」）→ 缺省，不硬造。
+   */
+  defaultEffort?: string;
 }
 
 /** 只给「目录里查不到这个模型」时兜底校验用的通用档（与 pi 的 thinkingLevel 同集合） */
@@ -188,11 +194,21 @@ export const catalogFromModelOptions = (
 ): ModelCatalogEntry[] =>
   options.map((m) => {
     const effort = findEffortParam(m.parameters);
+    // 默认档：Cursor 清单里每个带档位的模型都标了一个 isDefault 预设，其 params 里就有它的档位取值
+    const defaultRaw = effort
+      ? m.variants?.find((v) => v.isDefault)?.params.find((p) => p.id === effort.id)
+          ?.value
+      : undefined;
+    const defaultEffort =
+      effort && defaultRaw && effort.values.includes(defaultRaw)
+        ? defaultRaw
+        : undefined;
     return {
       id: m.id,
       displayName: m.displayName,
       ...(effort ? { effortParamId: effort.id } : {}),
       efforts: effort?.values ?? [],
+      ...(defaultEffort ? { defaultEffort } : {}),
     };
   });
 
@@ -244,6 +260,18 @@ const findEntry = (
     (e) => e.displayName && e.displayName.toLowerCase() === lower,
   );
   return byName.length === 1 ? byName[0] : null;
+};
+
+/**
+ * 清单里某个模型的默认思考档（只给展示用）。model 的写法与 resolveSubagentModel 同口径
+ *（精确 id → 忽略大小写 → 唯一 displayName）；清单拿不到 / 没这个模型 / 没标默认档 → undefined。
+ */
+export const catalogDefaultEffort = (
+  catalog: readonly ModelCatalogEntry[] | null | undefined,
+  modelId: string,
+): string | undefined => {
+  if (!catalog || !modelId.trim()) return undefined;
+  return findEntry(catalog, modelId.trim())?.defaultEffort;
 };
 
 export type ResolvedSubagentModel =

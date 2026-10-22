@@ -81,12 +81,13 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useModels } from "@/hooks/use-models";
 import { useProviderSwitch } from "@/hooks/use-provider-switch";
 import { useRichInput } from "@/hooks/use-rich-input";
+import { resolveAdvanceDialogOpenChange } from "@/lib/advance-dialog-close";
 import { buildActionInstructionHistory } from "@/lib/composer-history";
 import { getSettings } from "@/lib/local-store";
 import {
   getModelCredsForProvider,
   hasModelCredsForProvider,
-  resolveTaskProvider,
+  resolveTaskProviderForPicker,
 } from "@/lib/agent-provider";
 import {
   ACTION_LABEL,
@@ -124,6 +125,7 @@ import {
 import { wkCommandForAction } from "@/lib/wk-command";
 import { isCompanyEnvConfigured } from "@/lib/company-env";
 import { SettingsLink } from "@/lib/settings-link";
+import { filterProbeableRepoPaths } from "@/lib/unc-path";
 import { cn } from "@/lib/utils";
 import {
   defaultModelForProvider,
@@ -409,6 +411,12 @@ interface Props {
     customActionId?: string;
   }) => Promise<void>;
   submitting: boolean;
+  /**
+   * 上一次推进失败的完整原因（父组件持有）。推进失败不再关弹窗——指令 / 附图 / 预填原样保留，
+   * 原因（可能是多行：结论 + 逐条明细 + 下一步）整段展示在这里，用户原地改了重试。
+   * 契约见 lib/advance-submit。
+   */
+  submitError?: string | null;
 }
 
 export const AdvanceDialog = ({
@@ -419,6 +427,7 @@ export const AdvanceDialog = ({
   onSubmit,
   submitting,
   prefill,
+  submitError,
 }: Props) => {
   // V0.6.14：ship「合并后删源分支」开关初始值（取 task 上次选择、缺省 false=保留）。
   // 提成 memo 依赖 primitive 字段、effect 据它初始化而非整个 task（防 SSE 推 task 引用变打回表单）
@@ -506,7 +515,7 @@ export const AdvanceDialog = ({
   // 弹窗开着时 SSE 推了新 task（别处切了提供方等），跟实时值比会在用户没动手时误触发。
   const openProviderRef = useRef<string>("");
   // 本 render 的 task 家（getSettings 非响应式，每 render 现读；open 快照走上面的 ref）
-  const taskProvider = resolveTaskProvider(task, getSettings());
+  const taskProvider = resolveTaskProviderForPicker(task, getSettings());
   // 弹窗内换提供方的切换动作：共用 hook；成功后立刻 absorb（P1-4），
   // 成功 toast 文案按推进场景走（“本次推进即用…”而不是“下条消息…”）。
   const { switchProvider, saving: switchingProvider } = useProviderSwitch({
@@ -608,7 +617,7 @@ export const AdvanceDialog = ({
     // 默认模型 = 本 task 最近 action 用的 → task.model（ref.current、打开瞬间最新、不进 deps 防 SSE 重置）
     // → 当次 getSettings().defaultModel 兜底（含 params）。settings 在这里读、保证拿到最新设置页默认模型。
     const s = getSettings();
-    const providerId = resolveTaskProvider(taskRef.current, s);
+    const providerId = resolveTaskProviderForPicker(taskRef.current, s);
     // 提供方跟 task 对齐（SSE 推 task 不会重跑本 effect、弹窗内手切的不被盖掉）；
     // 打开瞬间的家另存 ref，providerChanged 跟快照比、不跟实时 prop 比（P1-5）
     openProviderRef.current = providerId;
@@ -625,12 +634,15 @@ export const AdvanceDialog = ({
     teamKnowledgeEnabledRef.current = s.teamKnowledgeEnabled !== false;
     setResolvedGitHost(undefined);
     setGitHostError(null);
-    if (repoPathsRef.current.length > 0) {
+    // UNC / WSL 仓先过滤掉（Q4-01）：repo-remote-meta 对任一路径是 UNC 都整体 400，
+    // 不过滤的话同任务里的本地仓会被连坐、host 推导整体失败
+    const probeRepoPaths = filterProbeableRepoPaths(repoPathsRef.current);
+    if (probeRepoPaths.length > 0) {
       // 脚本仓排除出 host 推导（与 server resolveEffectiveGitHost 同口径、防误报多实例）
       const scriptPaths = scriptRepoPathsRef.current.filter((p) =>
-        repoPathsRef.current.includes(p),
+        probeRepoPaths.includes(p),
       );
-      const q = encodeURIComponent(repoPathsRef.current.join(","));
+      const q = encodeURIComponent(probeRepoPaths.join(","));
       const sq = encodeURIComponent(scriptPaths.join(","));
       void fetch(`/api/repo-remote-meta?paths=${q}&scriptPaths=${sq}`)
         .then((r) => r.json())
@@ -1193,10 +1205,13 @@ export const AdvanceDialog = ({
         className="flex min-w-0 flex-col items-start gap-0.5"
       >
         <div className="flex w-full items-center gap-1.5">
-          {/* 标题单行省略；被截断时悬停看全文（批次标题是用户挑批次的主要依据） */}
-          <span className="min-w-0 truncate text-xs font-medium" title={b.title}>
-            {b.title}
-          </span>
+          {/* 标题单行省略；被截断时悬停看全文（批次标题是用户挑批次的主要依据）。
+              走 Tooltip、不用原生 title（规范「Hover 提示」） */}
+          <Tooltip content={b.title}>
+            <span className="min-w-0 truncate text-xs font-medium">
+              {b.title}
+            </span>
+          </Tooltip>
           <Badge variant="outline" size="xs">
             #{b.sourceActionN}
           </Badge>
@@ -1233,7 +1248,7 @@ export const AdvanceDialog = ({
     // 弹窗开着时别处已切到同一家并 SSE 推过来，就不再切一次（免得多弹一次确认框）。
     const needSwitch =
       providerChanged &&
-      pickedProvider !== resolveTaskProvider(task, getSettings());
+      pickedProvider !== resolveTaskProviderForPicker(task, getSettings());
     let switchedTask: Task | undefined;
     if (needSwitch) {
       // 新家的凭据先验：把用户刚挑的模型带上（task.model 还是旧家的，不能拿它验新家；helper 内部 toast）
@@ -1293,15 +1308,27 @@ export const AdvanceDialog = ({
   };
 
   return (
-    // disablePointerDismissal：带草稿表单（指令 + 附件）、点外误关丢草稿；Esc / X / 取消仍可关
+    // disablePointerDismissal：带草稿表单（指令 + 附件）、点外误关丢草稿；
+    // 提交中 Esc / X 也不可关（V6-03，裁决见 resolveAdvanceDialogOpenChange）；其余时候 Esc / X / 取消仍可关
     <Dialog
       open={open}
       onOpenChange={(next, details) => {
-        // slash / `@` 菜单开着时的 Esc 归菜单——不然一按 Esc 连指令草稿一起关没。
+        // 提交中不可关：以前「取消」被 disabled、但 Esc / X 仍能关，关闭即 rich.reset() 清掉指令 + 附件，
+        // 失败 toast 还指向一个已不在的弹窗。口径同 ShareToGroupDialog（`if (sharing) return`）。
+        // 失败后弹窗本来就不关（planAdvanceUi：失败不关、不清预填），所以失败态草稿自然保住。
+        //
+        // 其次：slash / `@` 菜单开着时的 Esc 归菜单——不然一按 Esc 连指令草稿一起关没。
         // 关键是**主动关掉**而不是空 return：焦点不在编辑器时（点过下拉 / 按钮）
         // 编辑器自己的 Esc 处理收不到这一下，光拦不关 → 菜单永远开着 → Esc 成死键、
         // 弹窗再也关不掉（只能点 X / 取消）
-        if (!next && details.reason === "escape-key" && menuOpenRef.current) {
+        const decision = resolveAdvanceDialogOpenChange({
+          next,
+          reason: details.reason,
+          submitting,
+          menuOpen: menuOpenRef.current,
+        });
+        if (decision === "block") return;
+        if (decision === "close-menu") {
           closeMenusRef.current?.();
           menuOpenRef.current = false;
           return;
@@ -1497,6 +1524,7 @@ export const AdvanceDialog = ({
                     : undefined,
                 )}
                 disabled={submitting}
+                ariaLabel="推进指令"
                 boxHeight={ADVANCE_INPUT_HEIGHT}
                 onMenuOpenChange={handleMenuOpenChange}
               />
@@ -1617,6 +1645,22 @@ export const AdvanceDialog = ({
               </div>
             </div>
           </div>
+
+          {/* 上次推进失败的完整原因：整段原样（保留换行）+ 超长可滚动；提交中隐藏（重试已在途） */}
+          {submitError && !submitting && (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-destructive"
+            >
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-medium">推进失败</div>
+                <div className="mt-0.5 max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-xs text-destructive/90">
+                  {submitError}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <DialogFooter className="gap-2">

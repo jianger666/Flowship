@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   analyzingToolLabel,
+  AWAITING_ASK_LABEL,
   deriveActiveStatus,
   formatStatusElapsed,
   groupChatRenderItems,
@@ -172,7 +173,8 @@ describe("groupChatRenderItems", () => {
       "__work_group__",
     ]);
     expect((out[1] as WorkGroupItem).id).toBe("t");
-    expect((out[3] as WorkGroupItem).id).toBe("tail");
+    // 组 id = 首成员的稳定身份：思考取事件 id、工具块取 `tool:${callId}`（R4-01，见 tests/row-id-stability.test.ts）
+    expect((out[3] as WorkGroupItem).id).toBe("tool:tail");
     expect((out[3] as WorkGroupItem).members).toHaveLength(1);
   });
 
@@ -656,15 +658,16 @@ describe("deriveActiveStatus", () => {
       expect(status).toEqual({ label: PROCESSING_PLACEHOLDER_LABEL, sinceTs: 7 });
     });
 
-    it("并行工具：还有 tool_call 没配上结果时说不清是哪个——不乱点名，退回「处理中…」", () => {
+    it("并行工具：还有 tool_call 没配上结果 → 状态行说那个还在跑的（V16-02：旧写法停在先回来的 read 的结果上、说「处理中…」）", () => {
       const status = deriveActiveStatus([
         user,
         call("c1", "a", "read", 2),
         call("c2", "b", "grep", 3),
         result("r1", "a", "read", 5),
       ]);
-      // 尾部扫到 read 的结果就停；grep 还没回来 → 点 read 会误导（其实还在等 grep）
-      expect(status).toEqual({ label: PROCESSING_PLACEHOLDER_LABEL, sinceTs: 5 });
+      // read 先回来、grep 还没回来：不能点 read（会误导），也不能说「处理中…」（它其实在执行 grep）
+      expect(status).toMatchObject({ label: "正在执行 grep", sinceTs: 3 });
+      expect(status).not.toHaveProperty("stallSinceTs");
     });
 
     it("工具名过长按 28 字截断（MCP 工具名可以很长，别把整行顶满）", () => {
@@ -839,10 +842,10 @@ describe("静默兜底：stallSinceTs（SDK 里不可见的等待，如 Cursor �
     expect(
       deriveActiveStatus([user, thinking], undefined, { lastActivityTs: 5, awaitingUser: false }),
     ).toHaveProperty("stallSinceTs", 5);
-    // 只去掉锚，状态文案本身不变
+    // V16-01：文案也不能再说「正在分析 shell 的结果」——AI 是在等人答，不是在分析（见下方「等你回答」一节）
     expect(
       deriveActiveStatus([user, ...toolDone], undefined, { lastActivityTs: 5, awaitingUser: true }),
-    ).toEqual({ label: "正在分析 shell 的结果", sinceTs: 3 });
+    ).toEqual({ label: AWAITING_ASK_LABEL });
   });
 
   it("脏值（0 / 负数 / NaN / Infinity）不挂锚：状态行不会拿一个无意义的起点去算「已等待」", () => {
@@ -866,6 +869,269 @@ describe("静默兜底：stallSinceTs（SDK 里不可见的等待，如 Cursor �
       sinceTs: 1000,
     });
     expect(STATUS_STALL_LABEL).toBe("仍在等待");
+  });
+});
+
+describe("等你回答（V16-01）：AI 在等用户答题时，状态行不再说「正在分析 ask_user 的结果」逐秒走字", () => {
+  const user = ev({ id: "u", kind: "user_reply", text: "q", ts: 1 });
+  const askCall = ev({
+    id: "c",
+    kind: "tool_call",
+    text: "调用 ask_user",
+    ts: 2,
+    meta: { callId: "ask1", name: "ask_user", args: "{}" },
+  });
+  const askRequest = ev({
+    id: "ask",
+    kind: "ask_user_request",
+    text: "要选哪个？",
+    ts: 3,
+    meta: { askId: "a1", questions: [] },
+  });
+  // 真实复现：ask_user 的 tool_call / tool_result 都落了盘，回扫跳过 ask_* 后命中 tool_result
+  const askResult = ev({
+    id: "r",
+    kind: "tool_result",
+    text: "完成",
+    ts: 4,
+    meta: { callId: "ask1", name: "ask_user", status: "success" },
+  });
+
+  it("文案是「等你回答」、起点取提问事件的 ts（计时表达「等了多久」）；工具名不外露", () => {
+    const events = [user, askCall, askRequest, askResult];
+    // 修前：{ label: "正在分析 ask_user 的结果", sinceTs: 4 }
+    expect(deriveActiveStatus(events)).toEqual({
+      label: "正在分析 ask_user 的结果",
+      sinceTs: 4,
+    });
+    const status = deriveActiveStatus(events, undefined, {
+      lastActivityTs: 4,
+      awaitingUser: true,
+    });
+    expect(status).toEqual({ label: AWAITING_ASK_LABEL, sinceTs: 3 });
+    expect(AWAITING_ASK_LABEL).toBe("等你回答");
+    expect(status?.label).not.toContain("ask_user");
+  });
+
+  it("不挂静默兜底锚（等人答不是卡住，不能二十秒后改口「仍在等待」）", () => {
+    const status = deriveActiveStatus([user, askCall, askRequest, askResult], undefined, {
+      lastActivityTs: 4,
+      awaitingUser: true,
+    });
+    expect(status).not.toHaveProperty("stallSinceTs");
+    expect(status).not.toHaveProperty("detail");
+    expect(status).not.toHaveProperty("yieldToTail");
+  });
+
+  it("取最近一条提问的 ts（同一轮里问过多次时）", () => {
+    const ask2 = ev({
+      id: "ask2",
+      kind: "ask_user_request",
+      text: "再问一个",
+      ts: 9,
+      meta: { askId: "a2", questions: [] },
+    });
+    expect(
+      deriveActiveStatus([user, askRequest, ask2], undefined, { awaitingUser: true }),
+    ).toEqual({ label: AWAITING_ASK_LABEL, sinceTs: 9 });
+  });
+
+  it("提问事件不在切片里（调用方只传本轮切片）：仍说「等你回答」、只是不带计时", () => {
+    expect(
+      deriveActiveStatus([user, askResult], undefined, { awaitingUser: true }),
+    ).toEqual({ label: AWAITING_ASK_LABEL });
+  });
+
+  it("提问事件 ts 是脏值 → 不带 sinceTs（不显示 NaNs）", () => {
+    const status = deriveActiveStatus(
+      [user, { ...askRequest, ts: Number.NaN }],
+      undefined,
+      { awaitingUser: true },
+    );
+    expect(status).toEqual({ label: AWAITING_ASK_LABEL });
+  });
+
+  it("盖过实时思考（thinkingSince）：等人答时模型没在思考，不能说「思考中」", () => {
+    expect(
+      deriveActiveStatus([user, askRequest], undefined, {
+        awaitingUser: true,
+        thinkingSince: 5,
+      }),
+    ).toEqual({ label: AWAITING_ASK_LABEL, sinceTs: 3 });
+  });
+
+  it("正文已在流（streaming）：照旧「正在回复…」——只有没在吐字时才说等你回答", () => {
+    expect(
+      deriveActiveStatus([user, askRequest, askResult], undefined, {
+        awaitingUser: true,
+        streaming: true,
+      }),
+    ).toEqual({ label: "正在回复…" });
+  });
+
+  it("没有未答提问：行为不变（awaitingUser 缺省 / false 等价）", () => {
+    const events = [user, askCall, askRequest, askResult];
+    const base = deriveActiveStatus(events);
+    expect(deriveActiveStatus(events, undefined, { awaitingUser: false })).toEqual(base);
+    expect(deriveActiveStatus(events, undefined, {})).toEqual(base);
+  });
+
+  it("空事件仍返回 null（即使 awaitingUser）", () => {
+    expect(deriveActiveStatus([], undefined, { awaitingUser: true })).toBeNull();
+  });
+});
+
+describe("并行工具 / 子代理（V16-02）：先回来的 tool_result 不能盖掉还在跑的 tool_call", () => {
+  const user = ev({ id: "u", kind: "user_reply", text: "q", ts: 1 });
+  const taskCall = (id: string, callId: string, ts: number, description = "排查") =>
+    ev({
+      id,
+      kind: "tool_call",
+      text: "调用 task",
+      ts,
+      meta: { callId, name: "task", args: JSON.stringify({ description, prompt: "x" }) },
+    });
+  const shellCall = (id: string, callId: string, ts: number) =>
+    ev({
+      id,
+      kind: "tool_call",
+      text: "调用 shell",
+      ts,
+      meta: { callId, name: "shell", args: JSON.stringify({ command: "pnpm test" }) },
+    });
+  const done = (id: string, callId: string, name: string, ts: number) =>
+    ev({
+      id,
+      kind: "tool_result",
+      text: "完成",
+      ts,
+      meta: { callId, name, status: "success" },
+    });
+
+  const T0 = 1_000_000;
+
+  it("复现：两个并行子代理，一个 40s 完成后——剩下那个仍是「子代理工作中」，不挂静默兜底锚（不会 300s 时说「仍在等待 · 260s 暂无新输出」）", () => {
+    const events = [
+      user,
+      taskCall("c1", "a", T0, "子代理 A"),
+      taskCall("c2", "b", T0 + 1000, "子代理 B"),
+      done("r1", "a", "task", T0 + 40_000),
+    ];
+    // 修前：{ label: "处理中…", sinceTs: T0+40000, stallSinceTs: T0+40000 }
+    const status = deriveActiveStatus(events, undefined, {
+      lastActivityTs: T0 + 40_000,
+    });
+    expect(status).toEqual({
+      label: "子代理工作中",
+      detail: "子代理 B",
+      sinceTs: T0 + 1000,
+    });
+    expect(status).not.toHaveProperty("stallSinceTs");
+  });
+
+  it("对照单个子代理：同样的结构（只剩一个在跑）与「单个子代理在跑」的状态完全一致", () => {
+    const parallel = deriveActiveStatus(
+      [user, taskCall("c1", "a", T0), taskCall("c2", "b", T0 + 1000), done("r1", "a", "task", T0 + 40_000)],
+      undefined,
+      { lastActivityTs: T0 + 40_000 },
+    );
+    const single = deriveActiveStatus([user, taskCall("c2", "b", T0 + 1000)], undefined, {
+      lastActivityTs: T0 + 40_000,
+    });
+    expect(parallel).toEqual(single);
+  });
+
+  it("多个还在跑：「N 个子代理工作中」+ 最久的起点（不是最新那个的）、不带 detail", () => {
+    const status = deriveActiveStatus(
+      [user, taskCall("c1", "a", T0 + 5000), taskCall("c2", "b", T0), taskCall("c3", "c", T0 + 9000)],
+      undefined,
+      { lastActivityTs: T0 + 9000 },
+    );
+    expect(status).toEqual({ label: "3 个子代理工作中", sinceTs: T0 });
+    expect(status).not.toHaveProperty("stallSinceTs");
+  });
+
+  it("多个还在跑、其中一个已先回来 → 数的是「还没回来的」", () => {
+    const status = deriveActiveStatus([
+      user,
+      taskCall("c1", "a", T0),
+      taskCall("c2", "b", T0 + 1000),
+      taskCall("c3", "c", T0 + 2000),
+      done("r1", "b", "task", T0 + 3000),
+    ]);
+    // a / c 还在跑；最久的是 a（T0）
+    expect(status).toEqual({ label: "2 个子代理工作中", sinceTs: T0 });
+  });
+
+  it("并行的不全是子代理（shell + 子代理）：不说「子代理」，按「工具并行执行」计数", () => {
+    const status = deriveActiveStatus([
+      user,
+      shellCall("c1", "a", T0),
+      taskCall("c2", "b", T0 + 1000),
+    ]);
+    expect(status).toEqual({ label: "2 个工具并行执行中", sinceTs: T0 });
+  });
+
+  it("并行 shell：先回来的结果在尾部时，说还在跑的那条 shell（带它的摘要），不是「处理中…」", () => {
+    const status = deriveActiveStatus([
+      user,
+      shellCall("c1", "a", T0),
+      shellCall("c2", "b", T0 + 1000),
+      done("r1", "a", "shell", T0 + 2000),
+    ]);
+    expect(status).toMatchObject({ label: "正在执行 shell", sinceTs: T0 + 1000 });
+    expect(status?.detail).toMatch(/pnpm test/);
+  });
+
+  it("全部回来之后才是「正在分析 X 的结果」（起点是最后落盘的那条结果）", () => {
+    const status = deriveActiveStatus([
+      user,
+      taskCall("c1", "a", T0),
+      taskCall("c2", "b", T0 + 1000),
+      done("r1", "a", "task", T0 + 40_000),
+      done("r2", "b", "task", T0 + 50_000),
+    ]);
+    expect(status).toEqual({ label: "正在分析 task 的结果", sinceTs: T0 + 50_000 });
+  });
+
+  it("正文已在流：照旧「正在回复…」（还有没回来的工具也一样，吐字是更强的活动证据）", () => {
+    const status = deriveActiveStatus(
+      [user, taskCall("c1", "a", T0), taskCall("c2", "b", T0 + 1000), done("r1", "a", "task", T0 + 2000)],
+      undefined,
+      { streaming: true },
+    );
+    expect(status).toEqual({ label: "正在回复…" });
+  });
+
+  it("还在跑的是 wait：保留「等待中 + 可跳过」（单个时沿用原有的状态构造）", () => {
+    const status = deriveActiveStatus([
+      user,
+      ev({
+        id: "w",
+        kind: "tool_call",
+        text: "调用 wait",
+        ts: T0,
+        meta: { callId: "w1", name: "wait", args: JSON.stringify({ seconds: 60, reason: "等 CI" }) },
+      }),
+      shellCall("c2", "b", T0 + 1000),
+      done("r1", "b", "shell", T0 + 2000),
+    ]);
+    expect(status).toMatchObject({ label: "等待中", skippable: true, sinceTs: T0 });
+  });
+
+  it("思考实时态不盖「还在跑的工具」（有更具体的信息）", () => {
+    const status = deriveActiveStatus(
+      [user, taskCall("c1", "a", T0), taskCall("c2", "b", T0 + 1000), done("r1", "a", "task", T0 + 2000)],
+      undefined,
+      { thinkingSince: T0 + 3000 },
+    );
+    expect(status?.label).toBe("子代理工作中");
+  });
+
+  it("串行不受影响：上一个工具跑完、下一个还没开始 → 仍是「正在分析 X 的结果」", () => {
+    expect(
+      deriveActiveStatus([user, shellCall("c1", "a", T0), done("r1", "a", "shell", T0 + 5000)]),
+    ).toEqual({ label: "正在分析 shell 的结果", sinceTs: T0 + 5000 });
   });
 });
 

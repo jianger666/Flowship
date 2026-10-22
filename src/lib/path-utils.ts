@@ -24,6 +24,7 @@
  */
 
 import { ACTION_TYPES, type ActionType, type JumpIde } from "./types";
+import { isUncLikePath } from "./unc-path";
 
 /** Windows 盘符绝对路径（`D:\...` / `D:/...`）。归一化前后都能判。 */
 const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
@@ -36,7 +37,7 @@ const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
  * 裸盘符 `C:`（盘相对路径）不算绝对。
  */
 export const isAbsolutePathLike = (p: string): boolean =>
-  p.startsWith("/") || isWindowsAbsPath(p) || /^\\\\[^\\]/.test(p);
+  p.startsWith("/") || isWindowsAbsPath(p) || isUncLikePath(p);
 
 /** 把 Windows 反斜杠分隔符归一化成 `/`（POSIX 路径原样返回） */
 const normalizeSeparators = (p: string): string => p.replace(/\\/g, "/");
@@ -553,8 +554,7 @@ export const getRepoShortNames = (
  * Windows UNC（`\\server\share` 或归一化后 `//server/share`）。
  * 审查发现：旧 shellQuotePath 只认盘符，带空格 UNC 误走 POSIX 单引号 → Windows cd 失败。
  */
-const isWindowsUncPath = (p: string): boolean =>
-  /^\\\\[^\\]/.test(p) || /^\/\/[^/]/.test(p);
+const isWindowsUncPath = (p: string): boolean => isUncLikePath(p);
 
 /**
  * 把路径转成 shell 可直接粘贴的形式（任务页「复制路径」按钮用）

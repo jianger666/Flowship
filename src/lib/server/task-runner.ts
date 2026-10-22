@@ -28,8 +28,15 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
-import { getSubagentParentModel } from "./subagent-parent-model";
+import {
+  Agent,
+  resolveProviderIdForCreate,
+  resolveProviderIdFromDisk,
+} from "./agent-backend";
+import {
+  getSubagentDisplayLookup,
+  getSubagentParentModel,
+} from "./subagent-parent-model";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { dataRoot } from "./data-root";
@@ -71,6 +78,7 @@ import {
   isRetryableRunError,
   summarizeRunFailure,
 } from "./sdk-error";
+import { RECONNECT_TOTAL_MAX, createReconnectBudget } from "./reconnect-budget";
 import { createRunPerfTracker } from "./run-perf";
 import { notePrep } from "./run-prep-notes";
 import {
@@ -106,6 +114,7 @@ import {
   buildDepPrepareHint,
   cloneMissingTaskDepDirs,
   ensureTaskWorktrees,
+  formatWorktreeCleanupNotes,
   getTaskCwd,
   getTaskWorkRepoPaths,
   isLightweightDailyTask,
@@ -209,7 +218,15 @@ import {
   type TaskOpHandle,
 } from "./task-stream";
 import { buildScheduleInfoMeta, SCHEDULE_ONE_SHOT_BOUNDARY_LINES } from "@/lib/schedule";
-import { cancelAllSchedulesForTask } from "./schedule-store";
+import { buildMrNoticeEvent, formatFinalizeNotice } from "@/lib/task-event-text";
+import { cancelAllSchedulesForTask, restoreArchiveCancelledSchedulesDetailed } from "./schedule-store";
+import {
+  collectWorktreeRemoval,
+  emptyArchiveReport,
+  newDeleteWorktreeReport,
+  restoreScheduleParts,
+  type ArchiveReport,
+} from "@/lib/worktree-report";
 import {
   beginChatLifecycle,
   endChatLifecycle,
@@ -275,6 +292,7 @@ import {
   mrTargetBranchOf,
 } from "@/lib/task-display";
 import { buildSkillDirective } from "@/lib/protocol-signals";
+import { TASK_RESUME_HINT, resumeHintFor } from "@/lib/stop-copy";
 import { supersedePendingAsks } from "./ask-supersede";
 
 /**
@@ -1256,10 +1274,18 @@ const advanceTaskCore = async (
   // action（review = 换人复审铁律）、勾了也压不掉。
   // 自定义 action 恒走内置默认（ACTION_FRESH_AGENT_DEFAULT.custom、定义里不再有 freshAgent 开关）
   // 仓列表变了（编辑任务解绑 / 加仓）不能续旧会话：旧 agent cwd 指向已拆的 worktree。
-  const sessionRepos = agentSessions.get(task.id)?.repoPaths;
-  // 老会话没记 repoPaths：不能当成「没漂」续旧 cwd。缺字段或列表不一致都强制新 agent。
+  const memSessionForRepos = agentSessions.get(task.id);
+  // 只有「内存里确有会话」才有资格判漂移：
+  // - 会话在、但没记 repoPaths（老会话）：不能当成「没漂」续旧 cwd，保守强制新 agent；
+  // - 会话在、列表不一致：真漂移，强制新 agent；
+  // - **内存无会话**（空闲 12 分钟被回收 / 服务重启后必然如此）：是「未知」不是「已漂移」。
+  //   仓库集合真变化时 updateTaskFields 会同步清掉盘上 sessionAgentId、编辑路由还关内存会话，
+  //   所以「内存没有 + 盘上锚点还在」只可能是锚点建立后仓库没动过——续用（Agent.resume）安全。
+  //   之前把它也当漂移（a6b0ce1），用户勾了「续用当前 agent」会被静默无视、恒起新 agent。
   const reposDrifted =
-    !sessionRepos || !sameRepoPathList(sessionRepos, task.repoPaths);
+    !!memSessionForRepos &&
+    (!memSessionForRepos.repoPaths ||
+      !sameRepoPathList(memSessionForRepos.repoPaths, task.repoPaths));
   // task 保命轮换（OOM 根治 + 2026-09-07 双条件防过矫）：增量水位超线 **并且**
   // 堆过半才强制起新 agent。新 agent 走正常 fresh 路径（artifact + 任务元信息
   // 就是接力棒），只扔 SDK 会话缓存；sessionInputTokens 在
@@ -1356,9 +1382,13 @@ const advanceTaskCore = async (
   const effectiveGitHost =
     (await resolveEffectiveGitHost(task.repoPaths, task.scriptRepoPaths)) ??
     undefined;
+  // 入口没带 gitToken（飞书群推进的 bootArgs 就没有）≠ 没配：回落服务端 config.json 再判，
+  // 否则群里「推进 提测」会被「ship 需要配 PAT」拦下，尽管设置页明明配了；
+  // 与会话启动 / 恢复（internalStartAgent / resumeTaskSession）同口径。两头都没有才真拒。
+  const admissionGitToken = await resolveSessionGitToken({ gitToken });
   const pre = checkActionPrerequisites(task, actionType, {
     gitHost: effectiveGitHost,
-    gitToken,
+    gitToken: admissionGitToken,
   });
   if (!pre.ok) {
     throw new Error(`准入条件不满足：${pre.reason}`);
@@ -1596,7 +1626,7 @@ const advanceTaskCore = async (
   // 前端会弹失效的旧问题弹窗、用户答了必报错；严重时还把 runStatus 打回 error 死循环）。
   // 推进是「开新 action」语义、不续传旧问题（用户主动换方向 = 放弃旧断点）、只清孤儿、忽略返回值。
   cancelPending(task.id);
-  await supersedePendingAsks(task.id, "推进新 action");
+  await supersedePendingAsks(task.id, "推进新阶段");
   await abortIfTaskOpStale(task.id, opGen);
   await failpoint("advance.beforeHandoff");
   await internalStartAgent({
@@ -1719,7 +1749,7 @@ const resumeCurrentActionCore = async (
   reapTaskOrphans(getTaskWorkRepoPaths(fresh), { delayedRescan: false });
 
   // 作废旧 agent 没答完的 ask（返回未答问题、新 agent 断点续传重问）
-  const pendingQuestions = await supersedePendingAsks(fresh.id, "输入条唤醒当前 action");
+  const pendingQuestions = await supersedePendingAsks(fresh.id, "输入条唤醒当前阶段");
 
   // 唤醒 = 新启动意图：作废残留停止标记（同 advanceTask appendAction）。
   // V1：lifecycle / gen bump 任一命中都不得继续。
@@ -2118,15 +2148,10 @@ export const finalizeTask = async (
             ) {
               const repoTail = (p: string) =>
                 p.split("/").filter(Boolean).pop() ?? p;
-              const snapshotNote =
-                removed && removed.snapshotRepos.length > 0
-                  ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
-                  : "";
-              // 快照落不了仍强制删：提醒用户未提交改动可能已丢（已 commit 的仍在分支上）
-              const failedNote =
-                removed && removed.snapshotFailedRepos.length > 0
-                  ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
-                  : "";
+              // 文案与行为同源（review #2）：快照成功 → 说明落在哪个 ref；快照失败 → 该仓 worktree 已保留、没删
+              const { snapshotNote, failedNote } = removed
+                ? formatWorktreeCleanupNotes(removed, repoTail)
+                : { snapshotNote: "", failedNote: "" };
               // eslint-disable-next-line no-restricted-syntax -- 豁免：finalize 终态 owner 无条件语义
               await writeEventAndPublish(taskId, {
                 kind: "info",
@@ -2151,10 +2176,8 @@ export const finalizeTask = async (
     // eslint-disable-next-line no-restricted-syntax -- 豁免：finalize 终态 owner 无条件语义
     await writeEventAndPublish(taskId, {
       kind: "info",
-      text:
-        finalStatus === "merged"
-          ? `Task 已标合入 main、收尾结束${reason ? `（${reason}）` : ""}`
-          : `Task 已被 abandon${reason ? `（${reason}）` : ""}`,
+      // 不写死分支名（目标分支常是 master / release）、不夹英文（第二轮 review V12-04）
+      text: formatFinalizeNotice(finalStatus, reason),
       meta: { finalStatus, reason },
     });
   } finally {
@@ -2172,9 +2195,11 @@ const cancelSchedulesWithNotice = async (
   note: string,
   phase: "archived" | "cancelled",
   noticeText: (cancelled: number) => string,
-): Promise<void> => {
+  /** restorable：归档用——给被取消的记录留还原信息，取消归档时恢复（见 restoreArchiveCancelledSchedules） */
+  opts: { restorable?: boolean } = {},
+): Promise<number> => {
   try {
-    const cancelled = await cancelAllSchedulesForTask(taskId, note);
+    const cancelled = await cancelAllSchedulesForTask(taskId, note, Date.now(), opts);
     if (cancelled > 0) {
       // eslint-disable-next-line no-restricted-syntax -- 豁免：归档 / 终结是用户直接操作，非 owner 语境、无 lease 可带；事件只是「定时已取消」的提示
       await writeEventAndPublish(taskId, {
@@ -2183,8 +2208,10 @@ const cancelSchedulesWithNotice = async (
         meta: buildScheduleInfoMeta("*", phase),
       });
     }
+    return cancelled;
   } catch (err) {
     console.warn(`[task-runner] 取消定时失败（忽略）task=${taskId}`, err);
+    return 0;
   }
 };
 
@@ -2203,20 +2230,61 @@ const cancelSchedulesWithNotice = async (
 export const archiveTaskWithCleanup = async (
   taskId: string,
   archived: boolean,
-): Promise<Task | null> => {
+): Promise<Task | null> => (await archiveTaskWithReport(taskId, archived))?.task ?? null;
+
+/**
+ * {@link archiveTaskWithCleanup} + 「服务端实际做了什么」的回报（第三轮 review D2b-06 / D2b-03）：
+ * - `report.worktree`：工作区清理的真实结果（清了 / 快照失败而保留了哪些目录）。此前归档 toast 由客户端按
+ *   任务形状预测「已清理隔离工作区」，服务端快照失败时其实保留了目录——文案与行为不同源；
+ * - `report.cancelledSchedules` / `restoredSchedules`：归档取消了几条定时、取消归档还原了几条。
+ */
+export const archiveTaskWithReport = async (
+  taskId: string,
+  archived: boolean,
+): Promise<{ task: Task; report: ArchiveReport } | null> => {
   const { setTaskPinArchive } = await import("./task-fs");
+  const report = emptyArchiveReport();
   // false 分支只是翻标记、不重建 worktree（下次推进重建）；别在这里加“恢复即重建”，会拖慢取消归档并引入并发写竞态。
   if (!archived) {
-    return await setTaskPinArchive(taskId, { archived: false });
+    const restoredTask = await setTaskPinArchive(taskId, { archived: false });
+    if (!restoredTask) return null;
+    // 先翻标记再还原定时：还原后若恰好到点，投递时不能再被「会话已归档」永久失败兜住
+    try {
+      const outcome = await restoreArchiveCancelledSchedulesDetailed(taskId);
+      report.restoredSchedules = outcome.restored;
+      // Q9-06：已过点（记为已错过）/ 已用满次数（记为已结束）的也要如实回报——归档时承诺过「取消归档可恢复」
+      report.missedSchedules = outcome.missed;
+      report.endedSchedules = outcome.ended;
+      const restoreParts = restoreScheduleParts(report);
+      if (restoreParts.length > 0) {
+        // eslint-disable-next-line no-restricted-syntax -- 豁免：取消归档是用户直接操作，非 owner 语境、无 lease 可带；事件只是「定时已恢复 / 已过点」的提示
+        await writeEventAndPublish(taskId, {
+          kind: "info",
+          text: `已取消归档，${restoreParts.join("、")}`,
+          meta: buildScheduleInfoMeta("*", "restored"),
+        });
+      }
+    } catch (err) {
+      console.warn(`[task-runner] 取消归档：还原定时失败（忽略）task=${taskId}`, err);
+    }
+    return { task: restoredTask, report };
   }
   const task = await getTaskMeta(taskId);
   if (!task) return null;
-  // 归档 = 这个会话不再「活着」：定时一起取消（恢复归档后也不会回来——否则归档的会话会被定时消息悄悄唤醒）。
+  // 归档 = 这个会话不再「活着」：定时一起取消（否则归档的会话会被定时消息悄悄唤醒）。
+  // 取消不是永久的：被取消的记录带还原信息，取消归档时恢复（D2b-03）。
   // 放在所有分支之前：chat / 非 worktree 的早退路径也要取消。best-effort，失败不挡归档
-  await cancelSchedulesWithNotice(taskId, "会话已归档", "archived", (n) => `会话已归档，${n} 个定时一并取消`);
+  report.cancelledSchedules = await cancelSchedulesWithNotice(
+    taskId,
+    "会话已归档",
+    "archived",
+    (n) => `会话已归档，${n} 个定时一并取消（取消归档时会恢复）`,
+    { restorable: true },
+  );
   // 非任务模式 / 非隔离工作区任务：只翻标记（chat 沿用“后台继续跑”语义）
   if (task.mode === "chat" || !isWorktreeTask(task)) {
-    return await setTaskPinArchive(taskId, { archived: true });
+    const flagged = await setTaskPinArchive(taskId, { archived: true });
+    return flagged ? { task: flagged, report } : null;
   }
   // 有活就停：与 finalize 同协议（cancel 只是发信号、下面等真停再删）。
   // 注意不删 pendingStopRequests：cancel 在 Agent.create→runningTasks.set 窗口走的是“记标记让启动链自裁”分支，
@@ -2244,23 +2312,28 @@ export const archiveTaskWithCleanup = async (
     console.warn(`[task-runner] archiveTask: 清理 worktree 失败 task=${taskId}`, err);
     return null;
   });
+  // 回报给客户端 toast：服务端实际结果（清了 / 保留了哪些），不让客户端再按任务形状预测
+  const wtReport = newDeleteWorktreeReport();
+  collectWorktreeRemoval(wtReport, removed);
+  report.worktree = {
+    removed: removed?.removedAny ?? false,
+    kept: wtReport.kept,
+    snapshotCount: removed?.snapshotRepos.length ?? 0,
+  };
   if (removed?.removedAny || (removed?.snapshotFailedRepos.length ?? 0) > 0) {
     const repoTail = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
-    const snapshotNote =
-      removed && removed.snapshotRepos.length > 0
-        ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
-        : "";
-    const failedNote =
-      removed && removed.snapshotFailedRepos.length > 0
-        ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
-        : "";
+    // 文案与行为同源（review #2）：快照成功 → 说明落在哪个 ref；快照失败 → 该仓 worktree 已保留、没删
+    const { snapshotNote, failedNote } = removed
+      ? formatWorktreeCleanupNotes(removed, repoTail)
+      : { snapshotNote: "", failedNote: "" };
     // eslint-disable-next-line no-restricted-syntax -- 豁免：归档清理 owner 无条件语义
     await writeEventAndPublish(taskId, {
       kind: "info",
       text: `已归档并清理任务隔离工作区（feature 分支保留在原仓库、取消归档后下次推进会自动重建${snapshotNote}${failedNote}）`,
     });
   }
-  return await setTaskPinArchive(taskId, { archived: true });
+  const archivedTask = await setTaskPinArchive(taskId, { archived: true });
+  return archivedTask ? { task: archivedTask, report } : null;
 };
 
 /**
@@ -2716,7 +2789,8 @@ export const buildSessionBridges = (
           if (a) publish(task.id, { kind: "action", action: a });
         }
 
-        // 有冲突走 error 事件（红、醒目）、无冲突走 info——用户在事件流一眼看到「这条 MR 合不了」
+        // 有冲突也走 info（MR 已经建好 / 推上去了，是成功的事——原先写成 error 会出红卡 + 重试，V12-03），
+        // 但带 meta.notice：行动指引形态（默认展开）、用户一眼看到「这条 MR 要手动解冲突」
         // 失主则跳过事件（MR 已在 GitLab、本地审计留给新主）
         if (!callerStillValid()) {
           return {
@@ -2732,43 +2806,25 @@ export const buildSessionBridges = (
           };
         }
         const mrVerb = mrVersion > 1 ? `推送（v${mrVersion}）` : "创建";
-        if (hasConflicts) {
-          await writeOwnedEventAndPublish(
-            task.id,
-            callerStillValid,
-            {
-              kind: "error",
-              actionId: mr.actionId,
-              text: `MR 已${mrVerb}、但跟 ${mr.targetBranch} 有冲突、需用户手动解决后才能合：${result.url}`,
-              meta: {
-                repoPath: mr.repoPath,
-                projectPath: mr.projectPath,
-                mrUrl: result.url,
-                mrIid: result.iid,
-                mrVersion,
-                mergeStatus: detailedStatus,
-              },
+        await writeOwnedEventAndPublish(
+          task.id,
+          callerStillValid,
+          buildMrNoticeEvent({
+            actionId: mr.actionId,
+            mrVerb,
+            targetBranch: mr.targetBranch,
+            url: result.url,
+            hasConflicts,
+            meta: {
+              repoPath: mr.repoPath,
+              projectPath: mr.projectPath,
+              mrUrl: result.url,
+              mrIid: result.iid,
+              mrVersion,
+              mergeStatus: detailedStatus,
             },
-          );
-        } else {
-          await writeOwnedEventAndPublish(
-            task.id,
-            callerStillValid,
-            {
-              kind: "info",
-              actionId: mr.actionId,
-              text: `MR 已${mrVerb}：${result.url}`,
-              meta: {
-                repoPath: mr.repoPath,
-                projectPath: mr.projectPath,
-                mrUrl: result.url,
-                mrIid: result.iid,
-                mrVersion,
-                mergeStatus: detailedStatus,
-              },
-            },
-          );
-        }
+          }),
+        );
         return {
           ok: true,
           data: {
@@ -3200,6 +3256,12 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     // 必须在 Agent.create 之前：SDK 本地 agent 的 shell 继承 server 的 process.env。
     // 入口没带 token 时回落服务端 config.json（与 resume 同口径），避免「入口没带」把已配置的 env 清掉。
     await syncSessionGitTokenEnv({ gitToken });
+    // submit_mr 桥的 Token 快照 + 「GitLab 访问」提示词判定：入口带的优先，没带回落服务端 config.json
+    // （与 resumeTaskSession 同口径）。桥闭包持的是会话期不可变快照，这里漏了整个会话里每次
+    // submit_mr 都报「当前会话里没有 GitLab Token」且不会自愈——飞书群里推进（bootArgs 不带 gitToken）
+    // 起的新 agent 就是这么中招的（10-08 事故只修了 resume 路径）。
+    // 只给桥 / 提示词判定用：不进 argv、不进日志 / 事件；env 同步仍只吃入口原值（上一行，读失败 ≠ 确定没有）。
+    const sessionGitToken = await resolveSessionGitToken({ gitToken });
 
     // advance 在步骤 4 只 snapshot 一次 activeRun——one-shot 可能在
     // 那之后、走到这里之前才完成 send 预登记。持 opHandle 的正式启动意图
@@ -3264,7 +3326,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     // 2) 只构造 bridge 闭包——注册延到 create 后 installSessionIfCurrent
     //    （create 期间 agent 未跑、不会调 MCP；半状态根源是「create 前注册 + create 后 set session」分步）
     const bridges = buildSessionBridges(task, {
-      gitToken,
+      gitToken: sessionGitToken,
       callerToken,
     });
 
@@ -3363,7 +3425,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             // SDK local 无 env 透传 → 启动前把 companyEnv 同步到固定路径供 skill 读
             await syncCompanyEnvFileFromSettings();
             // V2a：记下本会话绑定的提供方，切提供方后复用防线靠它（对不上强制 fresh）。
-            const createdProviderId = await resolveProviderIdFromDisk(task);
+            // 绑定的自定义提供方已被删除时这里直接报错（不静默落回 Cursor，D1-03）
+            const createdProviderId = await resolveProviderIdForCreate(task);
             const created = await withSdkDeadline(
               Agent.create({
                 apiKey,
@@ -3493,8 +3556,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             // settings 配了 gitToken 才注入「GitLab 访问」段（token 走环境变量，agent 不读 config.json）。
             // host 展示可信 host：origin 被篡改成别的地址时，别让提示词教 agent 把 token 发过去。
             const gitTrust = resolveGitHostForPrompt(effectiveGitHost);
+            // 判定用回落后的 sessionGitToken：入口没带（飞书群推进）但设置页配了，env 已同步、该段也该注入
             const gitlabAccessSection =
-              gitToken && gitToken.trim().length > 0
+              sessionGitToken && sessionGitToken.trim().length > 0
                 ? buildGitlabAccessDirective(gitTrust.host, dataRoot(), {
                     untrustedOriginHost: gitTrust.untrustedOriginHost,
                   })
@@ -3847,6 +3911,11 @@ const tryAutoReconnect = async (
     errorActionId?: string;
     questionRun?: boolean;
     reconnectAttempt?: number;
+    /**
+     * S1b-04：本条 consume 链累计的重连总次数——**不随「重连恢复后归零」重置**，
+     * 只做「每圈都先吐一点再断」这种无限环的硬上限兜底（RECONNECT_TOTAL_MAX）。
+     */
+    reconnectTotal?: number;
     /** V12：透传给递归 consume——状态写门控仍认同一把 handle */
     opHandle: TaskOpHandle;
     /**
@@ -3858,6 +3927,10 @@ const tryAutoReconnect = async (
 ): Promise<"handled" | "cancelled" | "give-up"> => {
   const attempt = (opts.reconnectAttempt ?? 0) + 1;
   if (attempt > RECONNECT_MAX) return "give-up";
+  // S1b-04：attempt 会在「重连后真有产出」时归零（见 consumeSessionRun 的 reconnectBudget），
+  // 这里另记一个不归零的总次数——「每圈都先吐一点再断」也不能无限重连下去
+  const total = (opts.reconnectTotal ?? 0) + 1;
+  if (total > RECONNECT_TOTAL_MAX) return "give-up";
   const msg = err instanceof Error ? err.message : String(err);
   if (!isRetryableRunError(msg, err, attempt)) return "give-up";
   if (isCancelled()) return "cancelled";
@@ -3867,6 +3940,7 @@ const tryAutoReconnect = async (
   const nextOpts = {
     ...opts,
     reconnectAttempt: attempt,
+    reconnectTotal: total,
     reconnectSessionInstanceId: myReconnectSessionId,
   };
   /** 失主让位：不 give-up 标 error、不碰共享状态 */
@@ -4003,7 +4077,9 @@ const tryAutoReconnect = async (
     }
     await consumeSessionRun(fresh, resumedAgent, run, {
       ...opts,
+      // 已用次数带进新 run；新 run 收到首条真有产出的消息后会在 consume 内归零（S1b-04）
       reconnectAttempt: attempt,
+      reconnectTotal: total,
     });
     return "handled";
   } catch (sendErr) {
@@ -4012,7 +4088,25 @@ const tryAutoReconnect = async (
       const y = yieldIfOpLost();
       if (y) return y;
     }
-    return tryAutoReconnect(fresh, sendErr, nextOpts, isCancelled);
+    // 先把本轮 resume 刚装进表里的新会话摘掉（对齐 chat 版 runReconnectAttempt 的 catch）：
+    // 不摘的话，下一轮 closeTaskSession(expected=旧坏会话) 门控关不掉它，resumeTaskSession 又把表里这条
+    // 死会话当「别的实例已登记」CAS 让位——后面几轮全部空转、白白退避到放弃，死会话还一直占着位子。
+    // 离线 / VPN 重连 / 刚唤醒笔记本最容易撞上（resume 靠本地存储能成功、send 要联网）。
+    // 按 instanceId 门控只关自己装的那条（用户 / 推进已换主则 no-op）；keepPersisted 留锚点给下一轮 resume；
+    // reap:false——它还没跑过任何 shell。
+    closeTaskSession(task.id, undefined, {
+      reap: false,
+      keepPersisted: true,
+      expectedSessionInstanceId: record.instanceId,
+    });
+    // 递归的「旧会话实例号」也换成刚摘掉的这条：它才是本轮之后「我关过的实例」，
+    // 下一轮 resume 的 CAS（closedSessionInstanceId）据此只认「表里是别人 = 让位」。
+    return tryAutoReconnect(
+      fresh,
+      sendErr,
+      { ...nextOpts, reconnectSessionInstanceId: record.instanceId },
+      isCancelled,
+    );
   }
 };
 
@@ -4427,6 +4521,8 @@ const consumeSessionRun = async (
     questionRun?: boolean;
     // V0.13.x 自动重连计数（tryAutoReconnect 递归时递增、防无限重连）
     reconnectAttempt?: number;
+    // S1b-04：不归零的总次数（硬上限兜底），原样透传给下一轮 tryAutoReconnect
+    reconnectTotal?: number;
     /**
      * V12：op handle 必传——owner（启动链 claim）或 observer（ask/one-shot 快照）。
      * 状态写门控走 isOpOwner；observer 的 release 是 no-op。
@@ -4435,6 +4531,10 @@ const consumeSessionRun = async (
   },
 ): Promise<void> => {
   let cancelled = false;
+  // S1b-04：重连预算——本 run 收到首条「真有产出」的 SDK 消息（= 重连真的恢复了）就归零。
+  // 初始值 = 上一轮 tryAutoReconnect 带进来的已用次数；之后任何一次新断线都按它算，
+  // 不再接着已经恢复过的旧计数写「第 4/5 次」。
+  const reconnectBudget = createReconnectBudget(opts.reconnectAttempt ?? 0);
   // run 内水位触发的自动压缩续接标记（fireMidRunRotation 置位、cancelled 分流消费）
   let rotationRequested = false;
   // 24h 硬超时：跟用户点停止分开——停止走 stop-task 的中性「已失效」，超时要打 askExpired
@@ -4535,6 +4635,13 @@ const consumeSessionRun = async (
     return true;
   };
 
+  // 流中途抛错时冲刷「已缓冲、但流后 flush 还没机会跑」的思考 + 正文（catch 入口调用）。
+  // 为什么要提到 try 外：assistantCtx 是 try 里的 const，catch 够不着；
+  // 流抛错直接跳进 catch，try 里流后那段 flush 不会执行，尾部回复就永远只在内存 buffer 里——
+  // 重连会起新 ctx 把它作废，刷新页面 / 回放就丢，而 sdk-error 的放弃文案还写着「已生成的内容保留在上方」。
+  // assistantCtx 创建前就抛错（没有可冲的）时保持 undefined → catch 里 no-op。
+  let flushBufferedOnError: (() => Promise<void>) | undefined;
+
   try {
     // 同 gen claim（B 尚未登记 runner）时 isTaskOpCurrent=false——
     // 必须纯让位（cancel + 只关自己 session），绝不 restore / applyPendingStop 走共享写。
@@ -4629,6 +4736,7 @@ const consumeSessionRun = async (
       buffer: "",
       // 子代理卡片徽标要显示「沿用」的实际模型（只有 Cursor 路径挂了 subagent 才取得到）
       subagentParentModel: getSubagentParentModel(agent),
+      subagentDisplayLookup: getSubagentDisplayLookup(agent),
       flush: async () => {
         // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
         flushPendingAssistantDeltas(task.id);
@@ -4647,6 +4755,15 @@ const consumeSessionRun = async (
         );
       },
     };
+    // 与下面「stream 结束后」那段同口径（失主跳过、先思考后正文）；两个 flush 都是
+    // 「先取走并清空 buffer 再写」，正常路径已冲过的这里再调是 no-op，天然幂等。
+    flushBufferedOnError = async () => {
+      if (lostStartOwner()) return;
+      await flushThinkingBuffer(task.id, assistantCtx, () =>
+        isTaskOpCurrent(opts.opHandle),
+      );
+      await assistantCtx.flush();
+    };
 
     // 打点：send 受理到首个流事件（≈首 token）的等待——量化「首包预填」开销
     const perfStreamStart = Date.now();
@@ -4656,6 +4773,14 @@ const consumeSessionRun = async (
         perfFirstEventSeen = true;
         console.log(
           `[perf] task=${task.id} first-event ms=${Date.now() - perfStreamStart}`,
+        );
+      }
+      // 重连后的会话真有产出了 → 预算归零（只认 assistant 正文 / thinking / tool_call / usage，
+      // system / status 不算，见 reconnect-budget.ts）。放在 handleSdkMessage 之前：
+      // 信号只关心「流上来了什么」，与本地落盘是否成功无关
+      if (reconnectBudget.noteSdkMessage(msg)) {
+        console.log(
+          `[task-runner] task=${task.id} 重连后已收到新消息、重连预算归零`,
         );
       }
       // 流回调绑 operation——lease 必传、失主整条消息丢弃
@@ -4782,7 +4907,8 @@ const consumeSessionRun = async (
             // eslint-disable-next-line no-restricted-syntax -- detached catch（fire-and-forget）：resume 的 claimTaskOp 已换主、opts.opHandle 的 lease 闭包必 no-op，只能裸写事件
             await writeEventAndPublish(task.id, {
               kind: "error",
-              text: "自动压缩续接失败、请在底部输入条说句话唤醒本阶段继续",
+              // 恢复文案统一走 stop-copy（第五轮 P4：原先硬编码「请在底部输入条说句话唤醒本阶段」，与其它停止 / 恢复文案漂移）
+              text: `自动压缩续接失败：${resumeHintFor(task.mode)}`,
             });
           });
           return;
@@ -5106,7 +5232,7 @@ const consumeSessionRun = async (
               text: [
                 `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷就结束了，且追问失败`,
                 "",
-                "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
+                `下一步：${TASK_RESUME_HINT}`,
               ].join("\n"),
             },
           );
@@ -5124,6 +5250,8 @@ const consumeSessionRun = async (
         // 追问本身也是一轮 run、走同一管道（计数已 +1、再未交卷会再追或标 error）
         await consumeSessionRun(task, agent, nextRun, {
           ...opts,
+          // 追问 run 接着本 run 的预算现状（已恢复过就是 0），别回退成入场时的旧值
+          reconnectAttempt: reconnectBudget.used,
         });
         return;
       }
@@ -5156,7 +5284,7 @@ const consumeSessionRun = async (
           text: [
             `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 submit_work）就结束了回复`,
             "",
-            "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
+            `下一步：${TASK_RESUME_HINT}`,
           ].join("\n"),
         },
       );
@@ -5258,6 +5386,20 @@ const consumeSessionRun = async (
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
     cancelEscape.dispose();
+    // 流中途抛错 / 断线：先把已缓冲、用户屏幕上早已看到的尾部回复和思考落成事件，
+    // 再走下面任何分支（问一问失败 error / 自动重连「连接中断」info / 放弃时的 error / cancel 收尾）。
+    // 必须先于这些事件写入，才能保持时序（正文在前、错误在后）；
+    // best-effort：落盘失败只告警，绝不能挡住后面的重连 / 错误收尾。失主由 flushBufferedOnError 自己跳过。
+    if (flushBufferedOnError) {
+      try {
+        await flushBufferedOnError();
+      } catch (flushErr) {
+        console.warn(
+          `[task-runner] task=${task.id} 流异常时冲刷已缓冲回复失败:`,
+          flushErr,
+        );
+      }
+    }
     if (opts.questionRun) {
       // 失主不发「答疑失败」error / done envelope；写前再复查
       if (lostStartOwner()) return;
@@ -5292,7 +5434,12 @@ const consumeSessionRun = async (
       // 绝不标 error（审计 P1：原来 cancelled 走 give-up 会把用户主动停止标成失败）
       const outcome = cancelled
         ? ("cancelled" as const)
-        : await tryAutoReconnect(task, err, opts, () => cancelled);
+        : await tryAutoReconnect(
+            task,
+            err,
+            { ...opts, reconnectAttempt: reconnectBudget.used },
+            () => cancelled,
+          );
       if (outcome === "handled") {
         // 重连成功、新 run 已在递归调用里消费完毕——这里什么都不用做
       } else if (outcome === "cancelled") {
@@ -5748,6 +5895,9 @@ export const startOneShotQuestion = (
     try {
       // 测试插桩：入口 snapshot 之后、首个 IO 之前——矩阵可在此注入 claim
       await failpoint("oneshot.beforeEnsure");
+      // 绑定的自定义提供方已被删除：在准备工作区之前就拒（抛进下面 catch → error 事件 + 归位 runStatus + done(ok=false)），
+      // 不静默落回 Cursor（上下文会出域，第四轮 Q2-02）。配置读不出来时 resolveProviderIdForCreate 不判「已删除」
+      await resolveProviderIdForCreate(task);
       // 纯答疑：只保证 cwd 目录在，跳过依赖拷贝（不挡首包）
       await writeOwnedEventAndPublish(
         task.id,
@@ -5835,7 +5985,8 @@ export const startOneShotQuestion = (
             Agent.create({
               apiKey: creds.apiKey,
               model: creds.model,
-              providerId: await resolveProviderIdFromDisk(task),
+              // 与入口同口径：悬空提供方直接抛（受理段排队期间设置被改也不会静默落回 Cursor）
+              providerId: await resolveProviderIdForCreate(task),
               taskId: task.id,
               // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
               local: { cwd: effectiveCwd, settingSources: [] },

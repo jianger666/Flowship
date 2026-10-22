@@ -66,7 +66,7 @@ export const FeatureBranchesField = ({
                       ? "路径不存在"
                       : entry.gitMissing
                         ? "未检测到 git、可手填"
-                        : "非 git 仓库"
+                        : (entry.reason ?? "非 git 仓库")
                     : "选择业务分支"
                 }
                 wrapperClassName="w-auto min-w-0 flex-1"

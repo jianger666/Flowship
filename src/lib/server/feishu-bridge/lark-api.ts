@@ -12,6 +12,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { getLarkCliBin } from "@/lib/server/feishu-cli";
+import { nonLocalPathReason } from "@/lib/unc-path";
 
 import { getBridgeDataDir } from "./bridge-config";
 import type { BotAppInfo, BotSelfInfo, SendMessageResult } from "./types";
@@ -860,6 +861,10 @@ export const patchCardSettings = async (
  * `cannot open file` / `unsafe file path`（对齐 downloadMessageResource 的相对路径 + cwd 手法）。
  */
 export const uploadImage = async (filePath: string): Promise<string> => {
+  // 深度防御（Q4-03）：UNC / 非本机磁盘路径不能当 lark-cli 的 cwd / 读取目标（Windows 上会连 SMB、带 NTLM 凭据）。
+  // 出站层（outbound.ts）已先拦；这里兜住其它直接调用方
+  const nonLocal = nonLocalPathReason(filePath);
+  if (nonLocal) throw new LarkApiError(nonLocal, { raw: null });
   const abs = path.resolve(filePath);
   const cwd = path.dirname(abs);
   const base = path.basename(abs);

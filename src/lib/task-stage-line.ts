@@ -9,6 +9,18 @@
 import { actionDisplayLabel } from "@/lib/task-display";
 import type { TaskSummary } from "@/lib/types";
 
+/**
+ * 侧栏行首指示该不该画「待回答」而不是「运行中转圈」（第三轮 review R3-03）。
+ *
+ * 同一轮 curl 等答案时 runStatus 仍是 running（见文件头），只看 runStatus 会转圈——
+ * 而 task 行第二行同时写着「待回答」（taskStageLine），自相矛盾。chat / task 同口径。
+ * 只收窄「转圈」这一支：isTaskBusy（列表轮询 / 折叠保护）不变——此刻 run 确实还活着。
+ * 其余态（awaiting_user 的琥珀点、空闲图标）走 LeadingIndicator 原有判定，这里不接管。
+ */
+export const isAwaitingAnswer = (
+  task: Pick<TaskSummary, "runStatus" | "hasPendingAsk">,
+): boolean => task.runStatus === "running" && task.hasPendingAsk === true;
+
 export type TaskStageLine = {
   stage: string;
   status: string;

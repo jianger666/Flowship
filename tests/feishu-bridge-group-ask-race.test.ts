@@ -339,7 +339,8 @@ describe("群答题卡按钮：askId 一路带到原子摘除", () => {
     const fnStart = src.indexOf("const handleGroupAskAction = async");
     expect(fnStart).toBeGreaterThanOrEqual(0);
     const fn = src.slice(fnStart, src.indexOf("\n};", fnStart));
-    const boot = fn.indexOf("await loadBridgeBootContext()");
+    // 带窗口任务取 boot（review F2-01）：getTask 与 loadBridgeBootContext 都在比对之前
+    const boot = fn.indexOf("await loadBridgeBootContext(askTask");
     const cmp = fn.indexOf("const pending = getPendingAsk(value.taskId);");
     const inject = fn.indexOf("await injectPendingAskText(");
     expect(boot).toBeGreaterThanOrEqual(0);

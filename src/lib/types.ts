@@ -1154,6 +1154,17 @@ export interface RepoBranchList {
   gitMissing?: boolean;
   /** 仓库路径不存在——前端提示检查路径（手填多一层目录 / 打错、跟非 git 仓分开说） */
   pathMissing?: boolean;
+  /**
+   * git 认它是仓库、但它自己下面没有 `.git`（monorepo 子目录）。
+   * 任务快照（isGitRepoPath）判「非 git」→ 不隔离 worktree、不建分支、改动面板与 ship 跳过它，
+   * 表单据此提示，别让用户以为在隔离区里干活（第三轮 D2a-03）。
+   */
+  notRoot?: boolean;
+  /**
+   * 服务端拒绝 / 探测失败的原因（Q4-01）：`/api/repo-branches` 回 400（UNC / 非本机路径等）时带上服务端 `error` 文案，
+   * 前端展示它，而不是一律「非 git 仓库」。只有 `isRepo:false` 的失败结果会带。
+   */
+  reason?: string;
 }
 
 // ----------------- 任务代码改动预览（task 模式、前后端共用） -----------------
@@ -1453,6 +1464,18 @@ export interface ArtifactRevision {
  */
 export type TaskMode = "task" | "chat";
 
+/** 最近一次 chat 回退的记录（见 {@link Task.lastRewind}） */
+export interface LastRewind {
+  /** 被回退到的事件 id（该事件及之后全部被服务端删除） */
+  fromEventId: string;
+  /** 回退后服务端保留的事件条数；未知为 null */
+  keptCount: number | null;
+  /** 回退标记 info 事件的 id；标记事件写失败为 null */
+  markerEventId: string | null;
+  /** 回退发生的时刻（服务端时钟）；只用来比较「哪次回退更新」，不当绝对时间展示 */
+  ts: number;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -1664,6 +1687,13 @@ export interface Task {
    */
   provider?: AgentProviderId;
   uiLayout?: { artifactPanelSize?: number };
+  /**
+   * 最近一次 chat 回退（rewind）的记录，落 meta、随 task 快照（含 SSE bootstrap 的 task 帧）下发。
+   * 回退标记事件只是事件日志里普通的一条，回退后再产生 300+ 条事件它就被挤出尾部窗口，断线重连的
+   * 另一个窗口拿不到标记、被删的事件会留在界面上（第三轮 review D9-04）——这个字段不随窗口滑走。
+   * 客户端据此判断「本地窗口是否早于这次回退」（task-store.lastRewindNeedsResync）。没回退过 = 缺省。
+   */
+  lastRewind?: LastRewind;
   events: TaskEvent[];
   /**
    * v1.0.x 事件懒加载：本 Task object 的 events 是「尾部切片」（不是全量）——
@@ -1741,6 +1771,15 @@ export type TaskSummary = Omit<Task, "events" | "actions" | "pendingAskId"> & {
    * 缺省 / 0 = 没有（含服务端重启后：会话没了、子代理随之取消）。
    */
   backgroundSubagentCount?: number;
+  /**
+   * 该会话还有「会触发」的定时（active，或 paused 但有待投递）——纯内存索引读数、不落盘；
+   * 只有 `GET /api/tasks` 列表接口会带，且为 true 才带。
+   *
+   * 为什么要：到点的定时会在服务端把空闲会话唤醒并跑完，而列表轮询原先只在「有任务在跑」时开，
+   * 会话空闲 + 窗口失焦时客户端既不转圈也发不出通知。列表据此在没有别的轮询理由时低频兜底刷新
+   * （策略见 lib/task-list-poll）。缺省 = 没有。
+   */
+  hasLiveSchedule?: boolean;
 };
 
 // ---- MCP 连通性健康（V0.6.11） ----

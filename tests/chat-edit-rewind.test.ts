@@ -41,8 +41,15 @@ const {
 const taskFsCore = await import("@/lib/server/task-fs-core");
 const { appendEventLine, newEventId, readEvents, readMetaV06, taskDir, writeMeta } =
   taskFsCore;
-const { clearChatGate, endChatRewind, tryBeginChatRewind, tryReserveChatStart, releaseChatStart } =
-  await import("@/lib/server/chat-gate");
+const {
+  beginChatLifecycle,
+  clearChatGate,
+  endChatLifecycle,
+  endChatRewind,
+  tryBeginChatRewind,
+  tryReserveChatStart,
+  releaseChatStart,
+} = await import("@/lib/server/chat-gate");
 const { clearChatQueue, enqueueChatMessage } = await import(
   "@/lib/server/chat-queue"
 );
@@ -303,9 +310,13 @@ describe("executeChatConversationRewind：只回退对话", () => {
 
   it("agent 正在跑 / 队列在发送 / 起新会话中 / 还有排队消息 → run_active(409)，什么都不删、不关会话", async () => {
     const ids = await seedConversation();
-    const cases: Array<[string, () => (() => void) | void, Parameters<typeof deps>[0]]> = [
-      ["正在跑", () => {}, { isRunActive: () => true }],
-      ["队列发送中", () => {}, { isQueueDraining: () => true }],
+    // 第 4 项 reason：路由把它当 409 响应的稳定 `code` 发给前端（V7-06），
+    // 前端据此各说各的提示——`code` 本身（run_active）保持不变
+    const cases: Array<
+      [string, () => (() => void) | void, Parameters<typeof deps>[0], string | undefined]
+    > = [
+      ["正在跑", () => {}, { isRunActive: () => true }, undefined],
+      ["队列发送中", () => {}, { isQueueDraining: () => true }, "queue_draining"],
       [
         "起新会话中",
         () => {
@@ -313,6 +324,7 @@ describe("executeChatConversationRewind：只回退对话", () => {
           return () => releaseChatStart(TASK_ID, token!);
         },
         {},
+        "session_starting",
       ],
       [
         "还有排队消息",
@@ -325,15 +337,18 @@ describe("executeChatConversationRewind：只回退对话", () => {
           });
         },
         {},
+        "queue_pending",
       ],
     ];
-    for (const [name, setup, over] of cases) {
+    for (const [name, setup, over, reason] of cases) {
       const cleanup = setup();
       const d = deps(over);
-      await expect(
-        executeChatConversationRewind(TASK_ID, ids.u1, d),
-        name,
-      ).rejects.toMatchObject({ code: "run_active", status: 409 });
+      const caught = await executeChatConversationRewind(TASK_ID, ids.u1, d).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(caught, name).toMatchObject({ code: "run_active", status: 409 });
+      expect((caught as { reason?: string }).reason, name).toBe(reason);
       expect(d.closeSession, name).not.toHaveBeenCalled();
       expect(await readEvents(TASK_ID), name).toHaveLength(6);
       if (typeof cleanup === "function") cleanup();
@@ -362,13 +377,40 @@ describe("executeChatConversationRewind：只回退对话", () => {
     ).rejects.toMatchObject({ code: "not_found" });
   });
 
+  it("任务正在停止 / 删除 → run_active(409) + reason=task_closing（前端不能再叫用户「先停止」）", async () => {
+    const ids = await seedConversation();
+    for (const phase of ["stopping", "deleting"] as const) {
+      expect(beginChatLifecycle(TASK_ID, phase)).toBe(true);
+      try {
+        await expect(
+          executeChatConversationRewind(TASK_ID, ids.u1, deps()),
+          phase,
+        ).rejects.toMatchObject({
+          code: "run_active",
+          status: 409,
+          reason: "task_closing",
+        });
+      } finally {
+        endChatLifecycle(TASK_ID, phase);
+      }
+    }
+    expect(await readEvents(TASK_ID)).toHaveLength(6);
+  });
+
+  it("agent 正在跑 / meta 标着 running 的 reason 缺省（路由退回 code=run_active）", async () => {
+    const ids = await seedConversation();
+    await expect(
+      executeChatConversationRewind(TASK_ID, ids.u1, deps({ isRunActive: () => true })),
+    ).rejects.toSatisfy((e: { reason?: string }) => e.reason === undefined);
+  });
+
   it("门闩被占（另一个回退在进行）→ run_active，且不会释放别人的门闩", async () => {
     const ids = await seedConversation();
     expect(tryBeginChatRewind(TASK_ID)).toBe(true);
     try {
       await expect(
         executeChatConversationRewind(TASK_ID, ids.u1, deps()),
-      ).rejects.toMatchObject({ code: "run_active" });
+      ).rejects.toMatchObject({ code: "run_active", reason: "rewind_in_progress" });
       // 门闩仍被原持有者占着
       expect(tryBeginChatRewind(TASK_ID)).toBe(false);
     } finally {

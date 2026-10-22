@@ -44,7 +44,7 @@ import {
   taskDir,
 } from "@/lib/server/task-fs-core";
 import { failpoint } from "@/lib/server/failpoints";
-import { abortRunningCheck, archiveTaskWithCleanup, cancelTaskRun, closeTaskSession } from "@/lib/server/task-runner";
+import { abortRunningCheck, archiveTaskWithReport, cancelTaskRun, closeTaskSession } from "@/lib/server/task-runner";
 import {
   cancelRestrictedQuestions,
   hasResourceJobs,
@@ -78,6 +78,8 @@ import {
 } from "@/lib/server/chat-gate";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
 import { isValidReqId } from "@/lib/req-id";
+import { firstNonLocalRepoPath } from "@/lib/unc-path";
+import { isTailAnchorEvent } from "@/lib/tail-anchor";
 import { WorktreeUnbindError } from "@/lib/server/task-worktrees";
 import { clearActionSideEffects } from "@/lib/server/action-side-effects";
 import {
@@ -91,6 +93,8 @@ import {
   migrateProviderSettings,
 } from "@/lib/agent-provider";
 import { readSettingsFile } from "@/lib/server/settings-fs";
+import { describeDeleteFailure } from "@/lib/server/delete-failure";
+import { newDeleteWorktreeReport, worktreeReportBody } from "@/lib/worktree-report";
 
 /** DELETE 等 rewind 退出的轮询间隔 / 上限 */
 const DELETE_REWIND_POLL_MS = 100;
@@ -127,9 +131,9 @@ const removeDeletionJournalIfFullyDone = async (
 };
 
 /** 已提交删除事务 → 202 recoveryPending（鼓励前滚、禁止 4xx 诱使重试破坏） */
-const recoveryPendingResponse = () =>
+const recoveryPendingResponse = (extra: Record<string, unknown> = {}) =>
   NextResponse.json(
-    { ok: true, recoveryPending: true },
+    { ok: true, recoveryPending: true, ...extra },
     { status: 202 },
   );
 
@@ -186,11 +190,18 @@ export const GET = async (req: Request, { params }: Ctx) => {
     const { id } = await params;
     // v1.0.x 事件懒加载：?tail=N 只带最近 N 条（尾部反向读、不整文件 parse）。
     // 切了片就置 eventsTruncated、客户端据此开「上拉加载更早」；更早的走 GET events?before= 分页。
-    const tailRaw = new URL(req.url).searchParams.get("tail");
+    const searchParams = new URL(req.url).searchParams;
+    const tailRaw = searchParams.get("tail");
     const tailParsed = tailRaw ? Number.parseInt(tailRaw, 10) : NaN;
     if (Number.isFinite(tailParsed) && tailParsed > 0) {
       const tail = Math.min(tailParsed, MAX_EVENTS_TAIL);
-      const task = await getTaskWithTailEvents(id, tail);
+      // ?anchor=1：窗口补到含最近一条 user_reply / action_start（300 条窗口一致性，D8-01/02/03）——
+      // 首屏 / 回退后重拉用它，与 watch-task bootstrap 同一个判定，两边窗口一致、客户端「只追加」的合并才不乱序
+      const task = await getTaskWithTailEvents(
+        id,
+        tail,
+        searchParams.get("anchor") === "1" ? { anchor: isTailAnchorEvent } : undefined,
+      );
       // helper 与 Response 之间可插入删除——failpoint + 提交点同步复查
       await failpoint("httpRead.afterHelper");
       if (!task) {
@@ -266,16 +277,18 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       // 纯置顶沿用原子翻标记。archived + pinned 同发时先清后补 pin，非原子：
       // 中间隔一次 SSE/轮询，旧快照可能盖掉 pin，靠前端 markArchiving 窗口兜底（概率小、可接受）。
       if (typeof body.archived === "boolean") {
-        const archivedTask = await archiveTaskWithCleanup(id, body.archived);
-        if (!archivedTask)
+        const outcome = await archiveTaskWithReport(id, body.archived);
+        if (!outcome)
           return NextResponse.json({ error: "not_found" }, { status: 404 });
+        const archivedTask = outcome.task;
+        // report = 服务端实际做了什么（清理 / 保留了哪些工作区、取消 / 恢复了几条定时）——客户端 toast 只认它
         if (typeof body.pinned === "boolean" && body.pinned !== archivedTask.pinned) {
           const pinnedTask = await setTaskPinArchive(id, { pinned: body.pinned });
           if (!pinnedTask)
             return NextResponse.json({ error: "not_found" }, { status: 404 });
-          return NextResponse.json({ task: pinnedTask });
+          return NextResponse.json({ task: pinnedTask, report: outcome.report });
         }
-        return NextResponse.json({ task: archivedTask });
+        return NextResponse.json({ task: archivedTask, report: outcome.report });
       }
       const task = await setTaskPinArchive(id, {
         pinned: body.pinned,
@@ -416,6 +429,12 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           { error: "repoPaths 必须是字符串数组" },
           { status: 400 },
         );
+      }
+      // UNC / WSL / 非本机磁盘仓库：编辑入口与创建入口（POST /api/tasks）同口径拒收并写原因（Q4-01）。
+      // chat 与 task 模式都经过这里（task 模式随后落入编辑字段分支），所以放在分叉之前
+      const rejectedRepo = firstNonLocalRepoPath(value);
+      if (rejectedRepo) {
+        return NextResponse.json({ error: rejectedRepo.reason }, { status: 400 });
       }
       const current = await getTask(id);
       if (!current)
@@ -802,7 +821,10 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
         );
       }
     }
-    const ok = await deleteTask(id);
+    // worktree 清理的实际结果（快照失败而保留的目录 / 落了的快照）随响应带回，前端据此 toast
+    //（任务删了事件无处可写，不带回的话用户不知道目录其实还留着；第三轮 review F1-03）
+    const wtReport = newDeleteWorktreeReport();
+    const ok = await deleteTask(id, wtReport);
     if (!ok) {
       // 已 committed → 前滚；unknown → 503 不 publish
       const still = await readDeletionJournal(id);
@@ -838,15 +860,15 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // manifest / refs 未收尾 → 对外 accepted + recoveryPending
     const afterRead = await readDeletionJournal(id);
     if (afterRead.kind === "unknown") {
-      return recoveryPendingResponse();
+      return recoveryPendingResponse(worktreeReportBody(wtReport));
     }
     if (
       !refsAllSucceeded ||
       (afterRead.kind === "present" && afterRead.value.manifestPending)
     ) {
-      return recoveryPendingResponse();
+      return recoveryPendingResponse(worktreeReportBody(wtReport));
     }
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true, ...worktreeReportBody(wtReport) });
   } catch (err) {
     // committed / tombstone → 前滚 + publish；unknown → 503 不 publish
     const journal = await readDeletionJournal(id);
@@ -891,6 +913,12 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 出口异常：必须释放 deleting，否则任务永远卡在 deleting → 后续请求全 409
     endChatLifecycle(id, "deleting");
     console.error("[DELETE /api/tasks/[id]] failed", err);
-    return NextResponse.json({ error: "bad_request" }, { status: 400 });
+    // 这里的异常都是服务端内部失败（IO / 权限 / 内部状态），不是请求有问题——
+    // 报 400 bad_request 既错了语义，又让用户只看到一句不透明的 HTTP 400（第三轮 review D4b-04）。
+    // 此时 prepared journal 已回滚、deleting 门闩已释放：任务没被删，重试可以成功。
+    return NextResponse.json(
+      { error: describeDeleteFailure(err), code: "delete_failed" },
+      { status: 500 },
+    );
   }
 };

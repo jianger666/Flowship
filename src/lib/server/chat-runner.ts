@@ -27,7 +27,10 @@
  */
 
 import { Agent } from "./agent-backend";
-import { getSubagentParentModel } from "./subagent-parent-model";
+import {
+  getSubagentDisplayLookup,
+  getSubagentParentModel,
+} from "./subagent-parent-model";
 import {
   formatBackgroundSubagentMessage,
   formatBackgroundSubagentNotice,
@@ -49,12 +52,15 @@ import {
 } from "./task-fs";
 import { getEventsLogPath, readEventsTail } from "./task-fs-core";
 import { redactSecretsInText } from "./event-secret-redact";
+import { describeDroppedAttachments } from "@/lib/dropped-queue-notice";
 import {
   formatChatHistorySection,
   HISTORY_INJECT_SCAN_EVENTS,
   selectChatHistoryTurns,
   type ChatHistoryInject,
 } from "@/lib/chat-history-inject";
+import { isScheduleBoilerplateText } from "@/lib/chat-stream-display";
+import { parseScheduleClientItemId } from "@/lib/schedule";
 import { maybeGenerateChatTitle } from "./chat-title";
 import {
   cancelPending,
@@ -140,13 +146,13 @@ import {
   writeUserEventAndPublishStrict,
   type TaskStreamEvent,
 } from "./task-stream";
+import { MCP_HEALTH_LABEL } from "@/lib/types";
+import type { FeAiFlowSettings, Task } from "@/lib/types";
 import {
-  defaultModelForProvider,
-  MCP_HEALTH_LABEL,
-} from "@/lib/types";
-import type { Task } from "@/lib/types";
-import {
+  DANGLING_TASK_PROVIDER_MESSAGE,
+  bootArgsForTask,
   findCustomProvider,
+  isTaskProviderDangling,
   migrateProviderSettings,
   resolveTaskProvider,
   sessionMatchesProvider,
@@ -163,6 +169,7 @@ import {
   getChatQueueCount,
   getChatQueueGeneration,
   isMessageOperationTerminal,
+  listQueuedChatAttachmentCounts,
   listQueuedChatMessages,
   markChatSystemClose,
   markMessagePersisted,
@@ -1507,6 +1514,14 @@ export const runChatSession = async (
     const providerSettings = migrateProviderSettings(
       settingsResult.status === "ok" ? settingsResult.settings : {},
     );
+    // 绑定的自定义提供方已被删除：报错让用户重选，不静默落回 Cursor（旧对话的上下文 / 代码会悄悄出域，D1-03）。
+    // 配置读不出来时 customProviders 只是默认空值，不据此判「已删除」
+    if (
+      settingsResult.status === "ok" &&
+      isTaskProviderDangling(task, providerSettings)
+    ) {
+      throw new Error(DANGLING_TASK_PROVIDER_MESSAGE);
+    }
     const providerId = resolveTaskProvider(task, providerSettings);
     const recAtCreate = runningChats.get(task.id);
     if (recAtCreate?.instanceId === myInstanceId) {
@@ -1990,10 +2005,17 @@ const readServerChatCreds = async (
     defaultModel: (result.settings.defaultModel as ModelSelection | undefined) ?? {
       id: "",
     },
+    provider: migrated.provider,
     customProviders: migrated.customProviders,
   };
-  const providerId = resolveTaskProvider(task, settings);
-  const model = defaultModelForProvider(settings, providerId);
+  // 模型必须跟窗口走（bootArgsForTask：最近 action.agentModel → task.model → 设置页默认），
+  // 同 app 输入条 / 定时任务的口径。原先直接取设置页默认模型：窗口选的是 B、重连却悄悄用默认 A 把会话
+  // 接回来（runModel=A），下次发送 bootArgs.model=B ≠ runModel → 懒重启，上下文被压成 12 轮摘要。
+  // 凭据门（apiKey / baseUrl 校验）仍按 providerId 在下面单独判，不依赖 bootArgsForTask 的 apiKey。
+  const { model, providerId } = bootArgsForTask(
+    task,
+    settings as FeAiFlowSettings,
+  );
   if (!model?.id?.trim()) return null;
   if (isCursorProvider(providerId)) {
     if (!settings.apiKey.trim()) return null;
@@ -2425,7 +2447,8 @@ const finalizeChatRunIfCurrent = async (
 /** 被清队丢弃的排队消息：count 含拿不到文本的条（如已出队的 in-flight 条），items 只含有文本的条 */
 type DroppedQueueItems = {
   count: number;
-  items: Array<{ itemId: string; text: string }>;
+  /** attachments = 图片 / 文件的文字占位（「2 张图片」；无附件不带，Q6-04：停止清队的卡据此列出纯附件条） */
+  items: Array<{ itemId: string; text: string; attachments?: string }>;
 };
 
 /** 提示文本里每条消息的摘要上限（字符） */
@@ -2445,12 +2468,19 @@ const truncateChars = (s: string, max: number): string => {
  * failQueuedItems 会 take + clear 队列，之后就拿不到文本了，所以快照必须在它之前、同步取。
  * 仅 displayText（用户看到的原文），不碰 agentText / 图片 / 附件路径。
  */
-const failQueuedItemsCapturingTexts = (
+export const failQueuedItemsCapturingTexts = (
   taskId: string,
-  reason: "error" | "cancelled",
+  reason: "error" | "cancelled" | "stopped",
 ): DroppedQueueItems => {
   const textById = new Map(
     listQueuedChatMessages(taskId).map((m) => [m.itemId, m.displayText]),
+  );
+  // 图片 / 文件条只取数量（「2 张图片」占位）——清队后路径 / 内容都不留；与文本同样必须清队之前同步取
+  const attachmentsById = new Map(
+    [...listQueuedChatAttachmentCounts(taskId)].map(([itemId, c]) => [
+      itemId,
+      describeDroppedAttachments(c.images, c.files),
+    ]),
   );
   // error 收尾：「立即发送」steer 在飞的消息（已出队、不占 in-flight 槽）和队里其它消息同命运——
   // 一并判失败（原因 error）、并入同一条「未送达」提示。调用方都已确认本实例仍是当前实例（isCurrent），
@@ -2471,16 +2501,32 @@ const failQueuedItemsCapturingTexts = (
     ...(extraItemIds.length > 0 ? { extraItemIds } : {}),
   });
   const items: DroppedQueueItems["items"] = [];
+  // 定时到点的系统消息（itemId 形如 sch_xxx.seq.attempt，或正文是 [SCHEDULE_FIRED…] 样板）不是用户发的话：
+  // 既不进「未送达」卡（不露样板、不提供「放回输入框」冒充用户重发），也不算进条数——
+  // 它被清掉的事实由 schedule-queue-loss 另写一条定时专属提示（R2-02）
+  let scheduleDropped = 0;
   for (const itemId of failedIds) {
     const text = textById.get(itemId);
+    if (
+      parseScheduleClientItemId(itemId) !== null ||
+      (typeof text === "string" && isScheduleBoilerplateText(text))
+    ) {
+      scheduleDropped++;
+      continue;
+    }
     // 必须在这里（截断之前）脱敏：落盘前全局那道脱敏按「完整的精确值」匹配，
     // noticeQueuedItemsDropped 的摘要 / droppedTexts 先截断再落盘，凭据一旦横跨截断点就只剩半截前缀，
     // 精确匹配命不中、前缀原样写进 events.jsonl 并推给所有订阅者。先脱敏再截断，截断最多切到占位符。
-    if (typeof text === "string") {
-      items.push({ itemId, text: redactSecretsInText(text) });
+    const attachments = attachmentsById.get(itemId);
+    if (typeof text === "string" || attachments) {
+      items.push({
+        itemId,
+        text: typeof text === "string" ? redactSecretsInText(text) : "",
+        ...(attachments ? { attachments } : {}),
+      });
     }
   }
-  return { count: failedIds.length, items };
+  return { count: failedIds.length - scheduleDropped, items };
 };
 
 /**
@@ -2713,6 +2759,7 @@ const consumeChatRun = async (
       buffer: "",
       // 子代理卡片徽标要显示「沿用」的实际模型（只有 Cursor 路径挂了 subagent 才取得到）
       subagentParentModel: getSubagentParentModel(rec?.agent),
+      subagentDisplayLookup: getSubagentDisplayLookup(rec?.agent),
       flush: async () => {
         // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
         flushPendingAssistantDeltas(task.id);
@@ -2808,6 +2855,23 @@ const consumeChatRun = async (
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
     cancelEscape.dispose();
+    // 流中途抛错 / 断线：先把已缓冲、用户屏幕上早已看到的正文和思考落成事件，
+    // 再走下面任何分支（重连「连接中断」info / 放弃时的 error / cancel 收尾）。
+    // 为什么：正文 / 思考是攒在本 run 自己的 ctx 里、遇到工具调用或流正常结束才 flush（见 try 里
+    // 流后那两行）；抛错直接跳进 catch，这两行没机会跑，ctx 随本次 consume 作废——
+    // 重连会起新 ctx，这段已经展示给用户的尾巴就再也落不了盘（刷新页面 / 回放就丢），
+    // 而错误文案还写着「已生成的内容保留在上方」。必须在写 error / 重连事件之前冲，保持时序。
+    // 幂等：两个 flush 都是「先取走并清空 buffer 再写」，正常路径已冲过的这里是 no-op；
+    // best-effort：落盘失败只告警，绝不能挡住后面的重连 / 错误收尾。写事件走 chatLease，失主不落盘。
+    try {
+      await flushThinkingBuffer(task.id, ctx, chatLease);
+      await ctx.flush();
+    } catch (flushErr) {
+      console.warn(
+        `[chat-runner] task=${task.id} 流异常时冲刷已缓冲回复失败:`,
+        flushErr,
+      );
+    }
     // 流异常中断：这一轮的 run 句柄已经是死的，不能再被 steer。
     // 为什么在这里清：currentRun 只在流「正常走完」时清；抛错走 catch → 自动重连，
     // 坏实例会在首次退避（2s）里仍挂在表内（runActive=true、currentRun 仍指向断流的 run），
@@ -3790,7 +3854,13 @@ const deliverBackgroundSubagentResult = async (
     await writeOwnedEventAndPublish(
       taskId,
       () => runningChats.get(taskId)?.instanceId === instanceId,
-      { kind: "info", text: formatBackgroundSubagentNotice(evt) },
+      {
+        kind: "info",
+        text: formatBackgroundSubagentNotice(evt),
+        // 机器字段：主 AI 被后台结果唤醒的 run 失败时，错误卡据此知道「这一轮不是用户那句话触发的」、
+        // 不给重试（chat-turns.resolveErrorRecovery，第二轮 review V3-04）
+        meta: { subkind: "background_result" },
+      },
     );
   } catch (err) {
     console.warn(`[chat-runner] 后台子代理提示落盘失败 task=${taskId}:`, err);
@@ -3808,6 +3878,14 @@ const deliverBackgroundSubagentResult = async (
   pendingBackgroundResults.set(taskId, list);
   await drainBackgroundResults(taskId);
 };
+
+/**
+ * 攒着、还没送进主 AI 的后台子代理结果条数（只读）。
+ * 给测试 / 诊断用：测试要等「结果已入队」时直接观察它，而不是睡固定毫秒、
+ * 也不是靠「到达提示落盘与入队之间只有微任务」这种实现不变量（将来中间加一个 await 就会失效）。
+ */
+export const getPendingBackgroundResultCount = (taskId: string): number =>
+  pendingBackgroundResults.get(taskId)?.length ?? 0;
 
 /**
  * 把攒着的后台子代理结果送进主 AI（一次合并成一条消息）。

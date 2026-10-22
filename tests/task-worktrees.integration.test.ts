@@ -20,8 +20,11 @@ import {
   ensureTaskWorktrees,
   getTaskWorkRepoPaths,
   getTaskWorktreesDir,
+  formatWorktreeCleanupNotes,
   removeTaskWorktrees,
   syncTaskWorktreesToRepoPaths,
+  wipSnapshotRefName,
+  WorktreeUnbindError,
 } from "@/lib/server/task-worktrees";
 import { getUniqueRepoDirNames } from "@/lib/path-utils";
 import { resolveWkWorktreeBranchInfos } from "@/lib/server/wk-source-branch";
@@ -203,6 +206,29 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     );
     expect(wipFiles).toContain("a.txt");
     expect(wipFiles).toContain("new-file.ts");
+
+    // review #2：快照同时落在 refs/flowship/wip/*（不依赖任务分支，detached 场景也不会悬空），
+    // 且返回值带 ref / commit / 记到的任务分支，供事件文案如实描述
+    const wipRef = wipSnapshotRefName(task.id, getUniqueRepoDirNames(task.repoPaths)[0]);
+    expect(removed.snapshots).toHaveLength(1);
+    expect(removed.snapshots![0]).toMatchObject({
+      repoPath: REPO,
+      ref: wipRef,
+      branch: "feature/888888-集成测试",
+    });
+    expect(removed.snapshotFailures).toEqual([]);
+    expect(git(REPO, "rev-parse", wipRef)).toBe(removed.snapshots![0].commit);
+    // 任务分支 HEAD 与 wip ref 是同一个提交（附着分支 → 快进到同一 commit）
+    expect(git(REPO, "rev-parse", "feature/888888-集成测试")).toBe(
+      git(REPO, "rev-parse", wipRef),
+    );
+    // 被 .gitignore 忽略的文件（.env.local / node_modules）不进快照——只存用户代码改动
+    const wipTree = git(REPO, "ls-tree", "-r", "--name-only", wipRef).split("\n");
+    expect(wipTree).toContain("new-file.ts");
+    expect(wipTree).not.toContain(".env.local");
+    expect(wipTree.some((f) => f.startsWith("node_modules/"))).toBe(false);
+    // 主仓 index / 工作区没被快照流程弄脏（临时 index 不污染真 index）
+    expect(git(REPO, "status", "--porcelain")).toBe("");
   });
 
   it("移除后可重建（reopen 场景）：分支已存在 → 直接挂载、WIP 快照内容还在", async () => {
@@ -234,7 +260,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(git(workDir, "branch", "--show-current")).toBe(taskBranch);
   });
 
-  it("快照失败仍强制删除：原仓被移走（git status 查不了）→ 目录删掉、记 snapshotFailedRepos", async () => {
+  it("快照失败保留 worktree：原仓被移走（git status 查不了）→ 目录不删、记 snapshotFailedRepos，修复后可再清", async () => {
     // 独立仓 + 独立 task（不污染共享 REPO 的后续用例）
     const repo2 = path.join(TMP_ROOT, "origin-repo-2");
     const repo2Moved = `${repo2}-moved`;
@@ -259,20 +285,38 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     await fs.writeFile(path.join(workDir2, "uncommitted.txt"), "precious\n");
 
     // 原仓整个移走 → worktree 的 .git 指针失效、git status 必失败。
-    // 用户主动删：仍强制删目录释放占用（未提交改动会丢——已拍板可接受）
+    // review #2：快照没落下就**不删**目录（此前是「仍强制删」→ 未提交改动随目录一起丢）
     await fs.rename(repo2, repo2Moved);
     try {
       const removed = await removeTaskWorktrees(task2);
       expect(removed.snapshotFailedRepos).toEqual([repo2]);
-      expect(removed.removedAny).toBe(true);
-      await expect(fs.access(workDir2)).rejects.toThrow();
+      expect(removed.snapshotRepos).toEqual([]);
+      expect(removed.removedAny).toBe(false);
+      expect(removed.snapshotFailures).toHaveLength(1);
+      expect(removed.snapshotFailures![0]).toMatchObject({
+        repoPath: repo2,
+        workDir: workDir2,
+      });
+      expect(removed.snapshotFailures![0].reason).not.toBe("");
+      // 未提交改动原封不动还在
+      await expect(
+        fs.readFile(path.join(workDir2, "uncommitted.txt"), "utf8"),
+      ).resolves.toBe("precious\n");
     } finally {
-      // 还原（afterAll 统一清 TMP_ROOT、这里只为不影响潜在后续用例）
       await fs.rename(repo2Moved, repo2).catch(() => {});
     }
+
+    // 原仓还原后再清一次：这次快照成功 → 未提交改动进 refs/flowship/wip → 才删目录
+    const retry = await removeTaskWorktrees(task2);
+    expect(retry.snapshotFailedRepos).toEqual([]);
+    expect(retry.snapshotRepos).toEqual([repo2]);
+    expect(retry.removedAny).toBe(true);
+    await expect(fs.access(workDir2)).rejects.toThrow();
+    const wip2 = retry.snapshots![0];
+    expect(git(repo2, "show", `${wip2.ref}:uncommitted.txt`)).toBe("precious");
   });
 
-  it("remove：merge 冲突态 WIP 快照失败 → 仍强制删除、记 snapshotFailedRepos", async () => {
+  it("remove：merge 冲突态 WIP 快照失败 → 保留 worktree、记 snapshotFailedRepos，解决冲突后可再清", async () => {
     // 前置：上一条 ensure 后 worktree 仍在任务分支上
     const taskBranch = "feature/888888-集成测试";
     const conflictFile = path.join(workDir, "conflict.txt");
@@ -304,8 +348,17 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     const removed = await removeTaskWorktrees(task);
     expect(removed.snapshotFailedRepos).toEqual([REPO]);
     expect(removed.snapshotRepos).toEqual([]);
-    expect(removed.removedAny).toBe(true);
-    // 目录已删、分支占用已释放（未提交冲突内容丢——用户主动删可接受）
+    expect(removed.removedAny).toBe(false);
+    expect(removed.snapshotFailures![0].reason).toMatch(/冲突|unmerged/);
+    // review #2：冲突态没法安全快照 → 目录与冲突内容原样保留（此前会被 --force 删掉）
+    await expect(fs.readFile(conflictFile, "utf8")).resolves.toMatch(/<<<<<<</);
+    expect(git(REPO, "worktree", "list")).toContain(workDir);
+
+    // 用户解决（这里直接 abort）后再清：干净 → 无需快照、正常删
+    git(workDir, "merge", "--abort");
+    const cleaned = await removeTaskWorktrees(task);
+    expect(cleaned.snapshotFailedRepos).toEqual([]);
+    expect(cleaned.removedAny).toBe(true);
     await expect(fs.access(workDir)).rejects.toThrow();
     expect(git(REPO, "worktree", "list")).not.toContain(workDir);
   });
@@ -1243,4 +1296,243 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
 
     await removeTaskWorktrees(t);
   }, 60_000);
+});
+
+/**
+ * review #2：删 worktree 前的 WIP 快照改 plumbing（临时 index → write-tree → commit-tree → update-ref），
+ * 并且「快照没落下就不删目录」。下面几条用真 git 复现 review 里的三类故障：
+ * 签名 / prepare-commit-msg 让 `git commit` 失败、detached HEAD 快照悬空、失败后仍强删。
+ */
+describe("WIP 快照（review #2）：落 refs/flowship/wip、失败保留 worktree", () => {
+  /** 静默跑 git（预期会失败的调用不往测试输出里喷 fatal 噪音） */
+  const gitQuiet = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
+
+  const initRepo = async (name: string): Promise<string> => {
+    const repo = path.join(TMP_ROOT, name);
+    await fs.mkdir(repo, { recursive: true });
+    git(repo, "init", "-b", "main");
+    git(repo, "config", "user.email", "t@t.local");
+    git(repo, "config", "user.name", "t");
+    await fs.writeFile(path.join(repo, "f.txt"), "base\n");
+    await fs.writeFile(path.join(repo, ".gitignore"), ".env.local\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "init");
+    return repo;
+  };
+
+  /** 在 ref 名下先占一个子 ref → 之后 update-ref 该 ref 必因 D/F 冲突失败（确定性地让「落 ref」这一步挂掉） */
+  const blockWipRef = (repo: string, taskId: string, dirName: string): string => {
+    const ref = wipSnapshotRefName(taskId, dirName);
+    git(repo, "update-ref", `${ref}/blocker`, "HEAD");
+    return ref;
+  };
+
+  it("detached HEAD + commit.gpgsign=true + 必失败的 prepare-commit-msg：旧写法 commit 必挂，新快照照样落到 ref、ref 不悬空、忽略文件不入快照", async () => {
+    const repo = await initRepo("wip-gpg-repo");
+    // 复现 review 的环境：签名程序不可用 + prepare-commit-msg hook 失败（--no-verify 对这个 hook 无效）
+    git(repo, "config", "commit.gpgsign", "true");
+    git(repo, "config", "gpg.program", "false");
+    const hook = path.join(repo, ".git", "hooks", "prepare-commit-msg");
+    await fs.mkdir(path.dirname(hook), { recursive: true });
+    await fs.writeFile(hook, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+    const t = makeTask({
+      id: "t_1700000000101_wipgpg",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/555101",
+    });
+    await markTaskAlive(t.id);
+    // detached 预热：worktree 没有任何分支（旧实现 commit 出来后无 ref 指向）
+    await ensureTaskWorktrees(t, () => true, { branchSelection: { kind: "detached" } });
+    const wd = getTaskWorkRepoPaths(t)[0];
+    expect(git(wd, "branch", "--show-current")).toBe("");
+
+    await fs.writeFile(path.join(wd, "f.txt"), "changed\n");
+    await fs.writeFile(path.join(wd, "new.ts"), "export const n = 1;\n");
+    await fs.writeFile(path.join(wd, ".env.local"), "SECRET=1\n");
+    // 对照：旧写法（add -A && commit --no-verify）在这个环境下确实失败
+    expect(() =>
+      gitQuiet(wd, "commit", "--allow-empty", "--no-verify", "-m", "x"),
+    ).toThrow();
+    // …且失败的 commit 没留下任何东西（HEAD 仍是 main 的那个提交）
+    expect(git(wd, "rev-parse", "HEAD")).toBe(git(repo, "rev-parse", "main"));
+
+    const mainTip = git(repo, "rev-parse", "main");
+    const removed = await removeTaskWorktrees(t);
+    expect(removed.snapshotFailedRepos).toEqual([]);
+    expect(removed.snapshotRepos).toEqual([repo]);
+    expect(removed.removedAny).toBe(true);
+    await expect(fs.access(wd)).rejects.toThrow();
+    expect(git(repo, "worktree", "list")).not.toContain(wd);
+
+    const snap = removed.snapshots![0];
+    expect(snap.ref).toBe(wipSnapshotRefName(t.id, "wip-gpg-repo"));
+    // detached：没有分支可记 → 只落在 ref 上，如实不声称「记到了任务分支」
+    expect(snap.branch).toBeUndefined();
+    // ref 真的指向快照 commit（不悬空）、parent 是原 HEAD、main 没被动
+    expect(git(repo, "rev-parse", snap.ref)).toBe(snap.commit);
+    expect(git(repo, "rev-parse", `${snap.ref}^`)).toBe(mainTip);
+    expect(git(repo, "rev-parse", "main")).toBe(mainTip);
+    // 内容：tracked 改动 + untracked 新文件在；被 .gitignore 忽略的 .env.local 不在
+    expect(git(repo, "show", `${snap.ref}:f.txt`)).toBe("changed");
+    expect(git(repo, "show", `${snap.ref}:new.ts`)).toContain("export const n = 1;");
+    expect(git(repo, "ls-tree", "-r", "--name-only", snap.ref).split("\n")).not.toContain(
+      ".env.local",
+    );
+    // 有 reflog（--create-reflog）：同一任务再次快照覆盖 ref 时旧版本仍可找回
+    expect(git(repo, "reflog", "show", snap.ref)).toContain(snap.commit.slice(0, 7));
+    // 原仓 main 工作区干净、没被临时 index 弄脏
+    expect(git(repo, "status", "--porcelain")).toBe("");
+  });
+
+  it("落 ref 失败（ref 名被占）→ worktree 保留、未提交改动与分支原样、removedAny=false；修好后再清成功", async () => {
+    const repo = await initRepo("wip-keep-repo");
+    const t = makeTask({
+      id: "t_1700000000102_wipkeep",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/555102",
+    });
+    await markTaskAlive(t.id);
+    await ensureTaskWorktrees(t, () => true);
+    const wd = getTaskWorkRepoPaths(t)[0];
+    const branch = git(wd, "branch", "--show-current");
+    const branchTip = git(repo, "rev-parse", branch);
+    await fs.writeFile(path.join(wd, "precious.txt"), "do-not-lose\n");
+
+    const ref = blockWipRef(repo, t.id, "wip-keep-repo");
+    const removed = await removeTaskWorktrees(t);
+    expect(removed.removedAny).toBe(false);
+    expect(removed.snapshotRepos).toEqual([]);
+    expect(removed.snapshotFailedRepos).toEqual([repo]);
+    expect(removed.snapshotFailures![0].workDir).toBe(wd);
+    expect(removed.snapshotFailures![0].reason).toContain("update-ref");
+    // 目录、改动、git 注册、分支都没动
+    await expect(fs.readFile(path.join(wd, "precious.txt"), "utf8")).resolves.toBe(
+      "do-not-lose\n",
+    );
+    expect(git(repo, "worktree", "list")).toContain(wd);
+    expect(git(repo, "rev-parse", branch)).toBe(branchTip);
+    // 事件文案如实：保留、不是「已强制删除」
+    const { snapshotNote, failedNote } = formatWorktreeCleanupNotes(removed);
+    expect(snapshotNote).toBe("");
+    expect(failedNote).toContain("工作区已保留未删除");
+    expect(failedNote).not.toContain("强制删除");
+
+    // 用户处理掉占位后再清：这次成功、分支前进到 WIP（附着在任务分支上）
+    git(repo, "update-ref", "-d", `${ref}/blocker`);
+    const retry = await removeTaskWorktrees(t);
+    expect(retry.snapshotFailedRepos).toEqual([]);
+    expect(retry.removedAny).toBe(true);
+    await expect(fs.access(wd)).rejects.toThrow();
+    expect(retry.snapshots![0].branch).toBe(branch);
+    expect(git(repo, "show", `${ref}:precious.txt`)).toBe("do-not-lose");
+    expect(git(repo, "rev-parse", branch)).toBe(git(repo, "rev-parse", ref));
+  });
+
+  it("HEAD 附着的不是任务分支（已知任务分支名时）：只写 ref、不污染那条别的分支", async () => {
+    const repo = await initRepo("wip-wrongbranch-repo");
+    git(repo, "branch", "integration", "main");
+    const t = makeTask({
+      id: "t_1700000000103_wipwrong",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/555103",
+      gitBranches: [{ repoPath: repo, name: "feature/555103-集成测试", baseBranch: "main" }],
+    });
+    await markTaskAlive(t.id);
+    await ensureTaskWorktrees(t, () => true);
+    const wd = getTaskWorkRepoPaths(t)[0];
+    // 模拟 agent 手滑把 worktree 切到了集成分支（#10 的 checkout -B 类场景）
+    git(wd, "checkout", "integration");
+    await fs.writeFile(path.join(wd, "stray.txt"), "oops\n");
+    const integrationTip = git(repo, "rev-parse", "integration");
+
+    const removed = await removeTaskWorktrees(t);
+    expect(removed.snapshotRepos).toEqual([repo]);
+    expect(removed.snapshots![0].branch).toBeUndefined();
+    // 集成分支没被塞 WIP commit，改动只在 ref 上
+    expect(git(repo, "rev-parse", "integration")).toBe(integrationTip);
+    expect(git(repo, "show", `${removed.snapshots![0].ref}:stray.txt`)).toBe("oops");
+  });
+
+  it("ensure 撞已删任务孤儿：孤儿有未提交改动 → 先落 ref 再释放（不动分支）；快照失败 → 不强删、ensure 抛错", async () => {
+    const repo = await initRepo("wip-orphan-repo");
+    const story = "https://project.feishu.cn/x/story/detail/555104";
+    const a = makeTask({
+      id: "t_1700000000104_orphan_a",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: story,
+    });
+    const b = makeTask({
+      id: "t_1700000000105_orphan_b",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: story,
+    });
+    await markTaskAlive(a.id);
+    await ensureTaskWorktrees(a, () => true);
+    const wdA = getTaskWorkRepoPaths(a)[0];
+    const branch = git(wdA, "branch", "--show-current");
+    const branchTip = git(repo, "rev-parse", branch);
+    await fs.writeFile(path.join(wdA, "orphan-dirty.txt"), "from-a\n");
+    // 删任务但 worktree 残留（tasks/<id> 没了），另一个任务同 story 要用同名分支
+    await markTaskDeleted(a.id);
+    await markTaskAlive(b.id);
+
+    const ref = blockWipRef(repo, a.id, "wip-orphan-repo");
+    await expect(ensureTaskWorktrees(b, () => true)).rejects.toThrow(/创建隔离工作区失败/);
+    // 孤儿没被强删：改动还在、git 仍登记着
+    await expect(fs.readFile(path.join(wdA, "orphan-dirty.txt"), "utf8")).resolves.toBe(
+      "from-a\n",
+    );
+    expect(git(repo, "worktree", "list")).toContain(wdA);
+
+    // 占位清掉后重试：孤儿先快照（只写 ref、任务已删不动分支）再释放，b 成功接管分支
+    git(repo, "update-ref", "-d", `${ref}/blocker`);
+    const res = await ensureTaskWorktrees(b, () => true);
+    expect(res.createdRepos).toEqual([repo]);
+    await expect(fs.access(wdA)).rejects.toThrow();
+    expect(git(repo, "show", `${ref}:orphan-dirty.txt`)).toBe("from-a");
+    expect(git(repo, "rev-parse", branch)).toBe(branchTip);
+
+    await removeTaskWorktrees(b);
+    await markTaskDeleted(b.id);
+  });
+
+  it("syncTaskWorktreesToRepoPaths 解绑：快照失败 → 抛 WorktreeUnbindError、保留目录；修好后再解绑成功并留 ref", async () => {
+    const repoX = await initRepo("wip-sync-x");
+    const repoY = await initRepo("wip-sync-y");
+    const t = makeTask({
+      id: "t_1700000000106_wipsync",
+      repoPaths: [repoX, repoY],
+      repoBaseBranches: { [repoX]: "main", [repoY]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/555106",
+    });
+    await markTaskAlive(t.id);
+    await ensureTaskWorktrees(t, () => true);
+    const dirNames = getUniqueRepoDirNames(t.repoPaths);
+    const wdX = path.join(getTaskWorktreesDir(t.id), dirNames[0]);
+    await fs.writeFile(path.join(wdX, "unbind-dirty.txt"), "keep-me\n");
+
+    const ref = blockWipRef(repoX, t.id, dirNames[0]);
+    const failure = syncTaskWorktreesToRepoPaths(t, [repoX, repoY], [repoY]);
+    await expect(failure).rejects.toBeInstanceOf(WorktreeUnbindError);
+    await expect(failure).rejects.toThrow(/未提交的改动/);
+    await expect(fs.readFile(path.join(wdX, "unbind-dirty.txt"), "utf8")).resolves.toBe(
+      "keep-me\n",
+    );
+
+    git(repoX, "update-ref", "-d", `${ref}/blocker`);
+    const ok = await syncTaskWorktreesToRepoPaths(t, [repoX, repoY], [repoY]);
+    expect(ok.unboundRepos).toEqual([repoX]);
+    expect(ok.snapshotRepos).toEqual([repoX]);
+    await expect(fs.access(wdX)).rejects.toThrow();
+    expect(git(repoX, "show", `${ref}:unbind-dirty.txt`)).toBe("keep-me");
+
+    await removeTaskWorktrees(makeTask({ ...t, repoPaths: [repoY] }));
+  });
 });

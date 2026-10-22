@@ -82,6 +82,8 @@ const setup = (opts: {
   background?: Partial<NonNullable<CursorSubagentDeps["background"]>>;
   parentModel?: CursorSubagentDeps["parentModel"];
   createError?: string;
+  /** 模型目录（缺省拿不到 = null） */
+  catalog?: Awaited<ReturnType<CursorSubagentDeps["loadCatalog"]>>;
 }) => {
   const runs: ScriptedRun[] = [];
   let seq = 0;
@@ -98,7 +100,7 @@ const setup = (opts: {
   });
   const deps: CursorSubagentDeps = {
     parentModel: opts.parentModel ?? { id: "composer-2.5" },
-    loadCatalog: async () => null,
+    loadCatalog: async () => opts.catalog ?? null,
     createChild,
     ...(opts.transcripts ? { transcripts: opts.transcripts } : {}),
     ...(opts.background
@@ -384,5 +386,67 @@ describe("接真实记录器：从工具回调一路到可被详情接口取走�
         "assistant_message",
       ]);
     }
+  });
+});
+
+describe("过程记录的 effort：写子代理实际生效的档位（含该模型的默认档）", () => {
+  beforeEach(() => __resetSubagentResumablesForTests());
+
+  const CATALOG = [
+    {
+      id: "claude-sonnet-5-5",
+      displayName: "Claude Sonnet 5.5",
+      effortParamId: "reasoning_effort",
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "high",
+    },
+    { id: "composer-2.5", displayName: "Composer 2.5", efforts: [] },
+  ];
+
+  const startedWith = async (
+    args: Record<string, unknown>,
+    over: { parentModel?: CursorSubagentDeps["parentModel"] } = {},
+  ) => {
+    const { sink, start } = fakeSink();
+    const { link, runs } = setup({ transcripts: sink, catalog: CATALOG, ...over });
+    const p = call(link, args);
+    await tick();
+    runs[0]!.finish("done");
+    await p;
+    expect(start).toHaveBeenCalledTimes(1);
+    return start.mock.calls[0]![0] as { model?: string; effort?: string };
+  };
+
+  it("显式别的模型、没写 effort：记该模型目录里的默认档", async () => {
+    expect(await startedWith({ prompt: "x", model: "claude-sonnet-5-5" })).toMatchObject({
+      model: "claude-sonnet-5-5",
+      effort: "high",
+    });
+  });
+
+  it("显式写了 effort：记写的那个，不被默认档盖掉", async () => {
+    expect(
+      await startedWith({ prompt: "x", model: "claude-sonnet-5-5", effort: "max" }),
+    ).toMatchObject({ effort: "max" });
+  });
+
+  it("沿用父会话且父会话有档位参数：记父会话的档位（不退到默认档）", async () => {
+    expect(
+      await startedWith(
+        { prompt: "x" },
+        {
+          parentModel: {
+            id: "claude-sonnet-5-5",
+            params: [{ id: "reasoning_effort", value: "low" }],
+          },
+        },
+      ),
+    ).toMatchObject({ model: "claude-sonnet-5-5", effort: "low" });
+  });
+
+  it("该模型没有档位 / 目录里没标默认档：不记 effort（不硬造）", async () => {
+    const init = await startedWith({ prompt: "x", model: "composer-2.5" });
+    expect(init.model).toBe("composer-2.5");
+    expect(init.effort).toBeUndefined();
   });
 });

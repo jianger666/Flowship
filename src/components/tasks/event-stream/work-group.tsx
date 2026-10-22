@@ -9,11 +9,12 @@
  * 本文件只交付组件，Batch C 再接到 event-stream items 管线。
  */
 
-import { memo, useMemo, useRef, useState } from "react";
+import { memo, useMemo, useRef } from "react";
 import { Loader2, TriangleAlert, X } from "lucide-react";
 
 import { usePaneSearchHighlight } from "@/components/ui/pane-search-highlight-context";
 import { Tooltip } from "@/components/ui/tooltip";
+import { useRowViewState } from "@/hooks/use-row-view-state";
 import { useStreamFollowContext } from "@/hooks/use-stream-follow";
 import {
   PROCESSING_PLACEHOLDER_LABEL,
@@ -23,13 +24,19 @@ import {
   type WorkGroupItem,
 } from "@/lib/chat-turns";
 import { formatDurationCoarse } from "@/lib/duration-display";
+import { ROW_VIEW_FIELD, workGroupViewKey } from "@/lib/row-view-keys";
 import { shouldPinWorkGroupOpen } from "@/lib/scroll-follow";
 import {
   isToolBlock,
   isToolVerbGroup,
+  streamItemStableId,
   type StreamRenderItem,
 } from "@/lib/tool-display";
 import type { Task, TaskEvent } from "@/lib/types";
+import {
+  workGroupMemberPropsEqual,
+  type WorkGroupMemberCmpProps,
+} from "@/lib/work-group-member";
 import { cn } from "@/lib/utils";
 
 import { Collapse } from "./collapse";
@@ -63,27 +70,16 @@ const lastRunningName = (members: StreamRenderItem[]): string | null => {
 
 // ---------- 成员渲染 ----------
 
-const WorkGroupMember = ({
+const WorkGroupMemberImpl = ({
   member,
   taskId,
   task,
   variant,
-  liveToolOutputs,
-}: {
-  member: StreamRenderItem;
-  taskId: string;
-  task: Task;
-  /** 跟随宿主形态：chat 细行 / log 卡片行（task 模式也走分组、2026-07-21 用户拍板） */
-  variant: "log" | "chat";
-  liveToolOutputs?: Record<string, string>;
-}) => {
+  liveOutput,
+}: WorkGroupMemberCmpProps) => {
   if (isToolBlock(member)) {
     return (
-      <ToolBlockRow
-        block={member}
-        taskId={taskId}
-        liveOutput={liveToolOutputs?.[member.callId]}
-      />
+      <ToolBlockRow block={member} taskId={taskId} liveOutput={liveOutput} />
     );
   }
   if (isToolVerbGroup(member)) {
@@ -101,6 +97,13 @@ const WorkGroupMember = ({
     </div>
   );
 };
+
+/**
+ * 成员行 memo（D5-01）：展开的运行中尾组每个事件 / 每个输出增量，宿主传下来的 `task` 与 `liveToolOutputs`
+ * 整体都换新对象，不拦的话几百个成员每次整组重渲。比较规则见 lib/work-group-member。
+ * 前提是成员对象引用稳定（mergeToolDisplayEvents / buildWorkGroup 的缓存保证，见 tests/tool-block-ref-stability.test.ts）。
+ */
+const WorkGroupMember = memo(WorkGroupMemberImpl, workGroupMemberPropsEqual);
 
 // ---------- WorkGroupRow ----------
 
@@ -139,8 +142,22 @@ const WorkGroupRowImpl = ({
    */
   defaultExpanded?: boolean;
 }) => {
-  // null = 未手动干预，跟随 autoExpanded；boolean = 用户点过，以手动为准
-  const [manual, setManual] = useState<boolean | null>(null);
+  // null = 未手动干预，跟随 autoExpanded；boolean = 用户点过，以手动为准。
+  // 走 useRowViewState（V2-05）：行被虚拟列表卸载再滚回来，用户手动展开 / 收起的结果不能丢。
+  // 组 id = 第一个成员的「稳定身份」（lib/chat-turns buildWorkGroup → streamItemStableId）：
+  // 后面追加成员不变；读类工具连续完成（单块并成 verb 组）、连续待办合并时也不变——
+  // 不是「第一个成员的 id」（那个会变，组级状态按旧 id 存、翻 id 后整组 remount 并丢状态，R4-01）。
+  // 分页补页让组向前长出更早成员时首成员换了、组 id 会随之换，这是已知限制。
+  const [manual, setManual] = useRowViewState<boolean | null>(
+    workGroupViewKey(taskId, group, ROW_VIEW_FIELD.workManual),
+    null,
+  );
+  // 「钉住展开」闩锁（见下面 shouldPinWorkGroupOpen）：原来是 useRef，行一卸载就清零——用户没跟随时
+  // 看着自动展开的组跑完被钉住、滚走再滚回来又被收起，等于白钉。同样进存档。
+  const [pinnedOpen, setPinnedOpen] = useRowViewState<boolean>(
+    workGroupViewKey(taskId, group, ROW_VIEW_FIELD.workPinned),
+    false,
+  );
 
   // 全启动链成员（唤醒/工作区/agent/MCP 跳过）→ 标题写「启动过程」别写「工作过程」。
   // 启动组永不自动展开（2026-09-24）：4 行 boot 提示运行时全弹出来太吵；
@@ -166,22 +183,20 @@ const WorkGroupRowImpl = ({
     return false;
   }, [group.members, searchCtx]);
   const prevAutoExpandedRef = useRef(autoExpanded);
-  const stickyOpenRef = useRef(false);
-  if (
-    shouldPinWorkGroupOpen(
-      prevAutoExpandedRef.current,
-      autoExpanded,
-      // 拿不到控制器（组件被单独复用）时按「跟随中」算、维持原自动收起行为
-      followCtl ? followCtl.isFollowing() : true,
-    )
-  ) {
-    stickyOpenRef.current = true;
-  }
+  const pinThisRender = shouldPinWorkGroupOpen(
+    prevAutoExpandedRef.current,
+    autoExpanded,
+    // 拿不到控制器（组件被单独复用）时按「跟随中」算、维持原自动收起行为
+    followCtl ? followCtl.isFollowing() : true,
+  );
+  // 渲染期落闩锁（同 Collapse 的「由 props 推导 state」写法）：本次渲染用 `pinThisRender` 立刻生效、
+  // 不等 state 回写，所以仍不会先闪一帧折叠
+  if (pinThisRender && !pinnedOpen) setPinnedOpen(true);
   prevAutoExpandedRef.current = autoExpanded;
   // 搜索命中优先展开：即使用户此前手动收起，也不能让“下一条”跳向不可见内容。
   const expanded =
     hasSearchHitInGroup ||
-    (manual ?? (autoExpanded || stickyOpenRef.current));
+    (manual ?? (autoExpanded || pinnedOpen || pinThisRender));
 
   // 折叠且 running / 处理中：右侧一眼活动，组头要极淡不抢戏
   let runningTail: string | null = null;
@@ -261,12 +276,12 @@ const WorkGroupRowImpl = ({
         <div className="ml-2 mt-0.5 min-w-0 max-w-full space-y-0.5 border-l border-border pl-2.5">
           {group.members.map((m) => (
             <WorkGroupMember
-              key={m.id}
+              key={streamItemStableId(m)}
               member={m}
               taskId={taskId}
               task={task}
               variant={variant}
-              liveToolOutputs={liveToolOutputs}
+              liveOutput={isToolBlock(m) ? liveToolOutputs?.[m.callId] : undefined}
             />
           ))}
           {showProcessingPlaceholder ? <ProcessingPlaceholderRow /> : null}

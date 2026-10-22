@@ -309,7 +309,7 @@ const ActionsPanel = () => {
           pruned.order.length !== layout.order.length ||
           pruned.hidden.length !== layout.hidden.length
         ) {
-          void saveSettings({ ...s, actionLayout: pruned });
+          void saveSettings({ ...s, actionLayout: pruned }, ["actionLayout"]);
         }
         setActions((prev) => prev.filter((a) => a.id !== def.id));
         // 成功：列表行消失自表达，不 toast
@@ -345,7 +345,7 @@ const ActionsPanel = () => {
           pruned.order.length !== layout.order.length ||
           pruned.hidden.length !== layout.hidden.length
         ) {
-          void saveSettings({ ...s, actionLayout: pruned });
+          void saveSettings({ ...s, actionLayout: pruned }, ["actionLayout"]);
         }
         setActions((prev) => prev.filter((a) => a.id !== def.id));
         // 成功：列表行消失自表达；连删 skill 也无额外成功 toast（失败才 toast）
@@ -373,7 +373,7 @@ const ActionsPanel = () => {
         pruned.order.length !== layout.order.length ||
         pruned.hidden.length !== layout.hidden.length
       ) {
-        void saveSettings({ ...s, actionLayout: pruned });
+        void saveSettings({ ...s, actionLayout: pruned }, ["actionLayout"]);
       }
       setActions((prev) => prev.filter((a) => a.id !== def.id));
       // 成功：列表行消失自表达，不 toast

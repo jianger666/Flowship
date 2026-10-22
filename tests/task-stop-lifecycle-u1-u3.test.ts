@@ -35,6 +35,8 @@ vi.mock("@/lib/server/task-runner", () => ({
 
 vi.mock("@/lib/server/chat-runner", () => ({
   cancelChatRun: vi.fn(() => false),
+  // stop-task 清 chat 队时取原文（Q6-02）：本测试无 chat 队，恒空
+  failQueuedItemsCapturingTexts: vi.fn(() => ({ count: 0, items: [] })),
 }));
 
 vi.mock("@/lib/server/kill-orphans", () => ({

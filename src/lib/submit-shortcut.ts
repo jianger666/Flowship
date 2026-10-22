@@ -11,6 +11,14 @@ export const SUBMIT_SHORTCUT_LABEL: Record<SubmitShortcut, string> = {
 export const getSubmitShortcutHint = (shortcut: SubmitShortcut): string =>
   shortcut === "enter" ? "Enter 发送，Shift+Enter 换行" : "Cmd/Ctrl+Enter 发送";
 
+/**
+ * AI 运行中输入框的 placeholder：提示的键位必须跟个人提交快捷键一致。
+ * 之前写死「回车排队」，而默认设置是 `mod-enter`——用户按 Enter 只会换行、排不进去
+ * （2026-10-20 第二轮 review U3b-04）。
+ */
+export const getRunningQueuePlaceholder = (shortcut: SubmitShortcut): string =>
+  `AI 正在跑，${getSubmitShortcutTitle(shortcut)} 排队，跑完自动发送…`;
+
 export const getSubmitShortcutTitle = (shortcut: SubmitShortcut): string =>
   shortcut === "enter" ? "Enter" : "Cmd/Ctrl+Enter";
 

@@ -50,6 +50,42 @@ describe("#6 · 问答卡选项文字不撑破按钮", () => {
   });
 });
 
+/**
+ * #8 问答卡底部操作行窄栏溢出（V13-03）
+ *
+ * review 按文案宽度算过：左「已答 N / M」+ 右「稍后再补充」「提交全部回答」两枚按钮，
+ * 单行需要的宽度在 307px 侧栏缺约 11px、窗口 1180 缺 41px、1100 缺 65px——按钮会被挤出卡片右缘。
+ * 根因：容器是不换行的 flex、右侧按钮组是 flex item（min-width:auto = 内容宽，不会收缩），
+ * 放不下时只能溢出。修法：容器 `flex-wrap gap-y-1.5`（放不下就折到第二行、行间留缝），
+ * 按钮组 `ml-auto`（折行后仍靠右，与单行时的位置一致）。
+ * 弱保护：只断言类名还在，**没有在浏览器里实测过**（上面的缺口数字来自 review 的计算，不是本测试量的）。
+ */
+describe("#8 · 问答卡底部操作行窄栏折行而不是溢出", () => {
+  const src = read("src/components/tasks/ask-user-inline.tsx");
+
+  const container = src.match(
+    /<div className="([^"]*)">\s*<span className="[^"]*">\s*已答 \{answeredCount\}/,
+  );
+  const group = src.match(
+    /已答 \{answeredCount\} \/ \{questions\.length\}\s*<\/span>\s*<div className="([^"]*)">[\s\S]*?稍后再补充/,
+  );
+
+  it("能定位到操作行容器与按钮组（结构变了就更新这条契约）", () => {
+    expect(container, "找不到包着「已答 N / M」的操作行容器").not.toBeNull();
+    expect(group, "找不到「已答」之后、含「稍后再补充」的按钮组").not.toBeNull();
+  });
+
+  it("操作行容器：flex-wrap + gap-y-1.5（放不下折到第二行、行间不贴死）", () => {
+    expect(classTokens(container![1]!)).toEqual(
+      expect.arrayContaining(["flex", "flex-wrap", "gap-y-1.5"]),
+    );
+  });
+
+  it("按钮组：ml-auto（折行后仍靠右）", () => {
+    expect(classTokens(group![1]!)).toContain("ml-auto");
+  });
+});
+
 describe("#1 · 推进弹窗批次区不被长标题撑出弹窗", () => {
   const src = read("src/components/tasks/advance-dialog.tsx");
 
@@ -85,11 +121,12 @@ describe("#1 · 推进弹窗批次区不被长标题撑出弹窗", () => {
     expect(button).not.toBeNull();
     expect(classTokens(button![1]!)).toContain("min-w-0");
 
-    // 标题：min-w-0 truncate，且带 title 让被截断的标题悬停可读
+    // 标题：min-w-0 truncate，且包 Tooltip 让被截断的标题悬停可读（规范「Hover 提示」：不用原生 title）
     const title = card.match(
-      /<span className="([^"]*)" title=\{b\.title\}>\s*\{b\.title\}\s*<\/span>/,
+      /<Tooltip content=\{b\.title\}>\s*<span className="([^"]*)">\s*\{b\.title\}\s*<\/span>\s*<\/Tooltip>/,
     );
-    expect(title, "标题 span 要带 title={b.title}").not.toBeNull();
+    expect(title, "标题 span 要包 <Tooltip content={b.title}>").not.toBeNull();
+    expect(card).not.toMatch(/\btitle=\{b\.title\}/);
     expect(classTokens(title![1]!)).toEqual(
       expect.arrayContaining(["min-w-0", "truncate"]),
     );

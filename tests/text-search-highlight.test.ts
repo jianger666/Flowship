@@ -1,18 +1,12 @@
 /**
- * 栏内搜索 occurrence 与高亮纯函数单测
+ * 栏内搜索 occurrence 纯函数单测（行内 <mark> 高亮管线已在 D3-07 清掉，高亮走 DOM CSS Highlight）
  */
-import { isValidElement, Fragment } from "react";
 import { describe, expect, it } from "vitest";
 
 import {
   findOccurrenceRanges,
   findOccurrencesInFields,
-  findSearchOccurrenceElement,
-  highlightPlainText,
   normalizePaneSearchQuery,
-  scrollSearchOccurrenceIntoView,
-  SEARCH_MARK_ACTIVE_CLASS,
-  SEARCH_MARK_CLASS,
   stepOccurrenceIndex,
   stabilizeOccurrenceIndex,
 } from "@/lib/text-search-highlight";
@@ -45,68 +39,6 @@ describe("findOccurrencesInFields", () => {
     expect(occ).toHaveLength(2);
     expect(occ[0]).toMatchObject({ globalIndex: 0, ownerId: "e1" });
     expect(occ[1]).toMatchObject({ globalIndex: 1, ownerId: "e2" });
-  });
-});
-
-describe("highlightPlainText", () => {
-  it("空查询不改动", () => {
-    expect(highlightPlainText("MR text", "  ", 0, 0)).toBe("MR text");
-  });
-
-  it("active 与 normal mark 区分", () => {
-    const out = highlightPlainText("aa MR bb MR cc", "MR", 1, 0);
-    expect(isValidElement(out) || out === "aa MR bb MR cc").toBe(true);
-    if (isValidElement(out) && out.type === Fragment) {
-      const marks = (out.props as { children: unknown[] }).children.filter(
-        (c) => isValidElement(c) && c.type === "mark",
-      );
-      expect(marks).toHaveLength(2);
-    }
-  });
-
-  it("active/normal class 均含明显背景，active 含 ring", () => {
-    expect(SEARCH_MARK_CLASS).not.toBe(SEARCH_MARK_ACTIVE_CLASS);
-    expect(SEARCH_MARK_CLASS).toMatch(/bg-amber/);
-    expect(SEARCH_MARK_ACTIVE_CLASS).toMatch(/bg-amber/);
-    expect(SEARCH_MARK_ACTIVE_CLASS).toMatch(/ring/);
-  });
-});
-
-describe("findSearchOccurrenceElement（pane 内 scope）", () => {
-  const mkRoot = (pane: "artifact" | "stream", index: number) => {
-    const mark = { pane, index };
-    return {
-      querySelector: (sel: string) =>
-        sel === `[data-search-occurrence="${index}"]` ? mark : null,
-    } as unknown as ParentNode;
-  };
-
-  it("同编号双 pane 各自根内定位、不串栏", () => {
-    const artifactRoot = mkRoot("artifact", 0);
-    const streamRoot = mkRoot("stream", 0);
-    expect(findSearchOccurrenceElement(artifactRoot, 0)).toEqual({
-      pane: "artifact",
-      index: 0,
-    });
-    expect(findSearchOccurrenceElement(streamRoot, 0)).toEqual({
-      pane: "stream",
-      index: 0,
-    });
-  });
-
-  it("scroll 只在给定 root 内查找", () => {
-    const scrolled: ScrollIntoViewOptions[] = [];
-    const el = {
-      scrollIntoView: (opts?: ScrollIntoViewOptions) => {
-        scrolled.push(opts ?? {});
-      },
-    };
-    const root = {
-      querySelector: () => el,
-    } as unknown as ParentNode;
-    expect(scrollSearchOccurrenceIntoView(root, 0)).toBe(true);
-    expect(scrolled).toHaveLength(1);
-    expect(scrollSearchOccurrenceIntoView(null, 0)).toBe(false);
   });
 });
 

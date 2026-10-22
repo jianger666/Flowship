@@ -15,7 +15,7 @@
  * 目标仓库每次留空、用户自己选。缺项点启动：对应 Field 标 warning，不在按钮旁挂黄字。
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, Plug, Rocket } from "lucide-react";
 import { toast } from "sonner";
 
@@ -27,6 +27,7 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { Field } from "@/components/ui/field";
 import { Form } from "@/components/ui/form";
 import { Label } from "@/components/ui/label";
+import { LoadingState } from "@/components/ui/loading-state";
 import { ProviderModelPicker } from "@/components/ui/provider-model-picker";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { Input } from "@/components/ui/input";
@@ -36,7 +37,20 @@ import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
-import { getSettings, initSettings } from "@/lib/local-store";
+import {
+  getSettings,
+  getSettingsUnreadable,
+  initSettings,
+  isSettingsLoaded,
+} from "@/lib/local-store";
+import {
+  describeLaunchSettingsFailure,
+  launchSettingsPhase,
+  resolveLaunchReposView,
+  type LaunchSettingsPhase,
+  needsRemoteBranchRefresh,
+  notGitRootRepoPaths,
+} from "@/lib/launch-repos-state";
 import {
   activateWkRequirement,
   fetchWkActivateContext,
@@ -123,7 +137,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   const [defaultModelId, setDefaultModelId] = useState("");
   const { models: availableModels, fetchModels } = useModels();
-  const branchMap = useRepoBranches(repoPaths, { refresh: true });
+  // 轻量调用（不 fetch）：所有角色都要——给「不是 git 仓根」提示用（D2a-03）
+  const lightBranchMap = useRepoBranches(repoPaths);
   const [submitting, setSubmitting] = useState(false);
   // 点启动后才出现的字段校验（Field.error，warning 色）
   const [fieldErrors, setFieldErrors] = useState<
@@ -132,6 +147,71 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
 
   // 手动 + 选了日常 → 轻量态 UI；看板预填恒为需求任务
   const isDailyLaunch = urlEditable && launchKind === "daily";
+  // 只有 QA 的「被测业务分支」框要最新的远端分支：别的角色不发 refresh（服务端 git fetch --prune，D2a-01）
+  const branchMap = useRepoBranches(
+    needsRemoteBranchRefresh({
+      isDailyLaunch,
+      userRole,
+      repoCount: repoPaths.length,
+    })
+      ? repoPaths
+      : [],
+    { refresh: true },
+  );
+  const notRootRepoPaths = notGitRootRepoPaths(repoPaths, lightBranchMap);
+
+  // 设置读取阶段：loading（init 在途）/ ready（读到真实配置）/ failed（没读到、getSettings() 只是默认值）。
+  // 仓库区只认它 + 仓库数（lib/launch-repos-state）——以前 init 失败也照样预填默认值、
+  // 对用户说反话「还没配置仓库」且永不重试（第二轮 review V11-04）
+  const [settingsPhase, setSettingsPhase] =
+    useState<LaunchSettingsPhase>("loading");
+  // config.json 本身读不了（区别于网络 / 服务没就绪这类瞬时失败）：失败提示多给一个「去设置页查看」入口
+  const [settingsUnreadable, setSettingsUnreadable] = useState(false);
+  const [retryingSettings, setRetryingSettings] = useState(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // init 结束后把 local-store 的结果灌进表单；mount 与「重试」共用（isAlive：卸载后迟到的回调不再 setState）
+  const applyLoadedSettings = (isAlive: () => boolean) => {
+    const loaded = isSettingsLoaded();
+    setSettingsUnreadable(getSettingsUnreadable() !== null);
+    setSettingsPhase(launchSettingsPhase(loaded));
+    // 没读到磁盘上的真实配置：getSettings() 只是默认值（repos = []、角色 / 提供方 / worktree 偏好都是占位）——
+    // 不拿它预填（否则默认值被当成用户配置），也不据此说「还没配置仓库」；等用户点「重试」
+    if (!loaded) return;
+    const s = getSettings();
+    const providerId = s.provider ?? CURSOR_PROVIDER_ID;
+    const defaultModel = defaultModelForProvider(s, providerId);
+    setPickedProvider(providerId);
+    setUserRole(s.userRole);
+    setRepos(s.repos);
+    setDisabledMcp(s.disabledMcpServers ?? []);
+    setDefaultModelId(defaultModel?.id ?? "");
+    setPickedModel(defaultModel?.id?.trim() ? defaultModel : { id: "" });
+    // v1.1.x：隔离工作区默认值走设置页偏好（只读型用法可默认直跑原仓）、表单可临时改
+    setRunInRepo(s.isolateWorktreeDefault === false);
+    void fetchWkActivateContext()
+      .then((ctx) => {
+        if (!isAlive()) return;
+        setActivateHubReady(ctx.hubReady);
+        setActivateOwners(ctx.owners);
+        setTechOwner((prev) => prev || matchHubOwnerValue(ctx.owners, ctx.ownerName));
+      })
+      .catch(() => {
+        /* 读不到就当没配 Hub，不挡启动 */
+      });
+    if (hasModelCredsForProvider(s, providerId)) {
+      void fetchModels({
+        ...getModelCredsForProvider(s, providerId),
+        provider: providerId,
+      });
+    }
+  };
 
   // mount：await initSettings 后再读 cache 预填（冷启动同步 getSettings 会拿到 DEFAULT_SETTINGS）
   useEffect(() => {
@@ -139,39 +219,28 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
     void (async () => {
       await initSettings();
       if (!alive) return;
-      const s = getSettings();
-      const providerId = s.provider ?? CURSOR_PROVIDER_ID;
-      const defaultModel = defaultModelForProvider(s, providerId);
-      setPickedProvider(providerId);
-      setUserRole(s.userRole);
-      setRepos(s.repos);
-      setDisabledMcp(s.disabledMcpServers ?? []);
-      setDefaultModelId(defaultModel?.id ?? "");
-      setPickedModel(defaultModel?.id?.trim() ? defaultModel : { id: "" });
-      // v1.1.x：隔离工作区默认值走设置页偏好（只读型用法可默认直跑原仓）、表单可临时改
-      setRunInRepo(s.isolateWorktreeDefault === false);
-      void fetchWkActivateContext()
-        .then((ctx) => {
-          if (!alive) return;
-          setActivateHubReady(ctx.hubReady);
-          setActivateOwners(ctx.owners);
-          setTechOwner((prev) => prev || matchHubOwnerValue(ctx.owners, ctx.ownerName));
-        })
-        .catch(() => {
-          /* 读不到就当没配 Hub，不挡启动 */
-        });
-      if (hasModelCredsForProvider(s, providerId)) {
-        void fetchModels({
-          ...getModelCredsForProvider(s, providerId),
-          provider: providerId,
-        });
-      }
+      applyLoadedSettings(() => alive);
     })();
     return () => {
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅 mount 预填一次
   }, []);
+
+  // 「重试」：失败态下重新读设置。initSettings 失败会清空单飞 promise，所以这里会真的重发请求；
+  // 成功 → 照 mount 的口径预填（提供方 / 模型 / 角色 / 仓库都换成真实配置）、仓库区换回选择器
+  const handleRetrySettings = async () => {
+    if (retryingSettings) return;
+    setRetryingSettings(true);
+    try {
+      await initSettings();
+    } finally {
+      if (mountedRef.current) {
+        applyLoadedSettings(() => mountedRef.current);
+        setRetryingSettings(false);
+      }
+    }
+  };
 
   // initialTitle 异步到位（详情拉回来）时回填未被用户改过的标题
   useEffect(() => {
@@ -238,6 +307,13 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
 
   const handleLaunch = async () => {
     if (submitting) return;
+    // 设置没读到：仓库 / 角色 / 提供方 / worktree 偏好全是默认值占位，不拿它去校验或建任务——指路到「重试」
+    if (settingsPhase === "failed") {
+      toast.error("设置读取失败，先点「目标仓库」处的「重试」", {
+        id: "launch-settings-failed",
+      });
+      return;
+    }
     const errors = collectLaunchErrors();
     if (Object.keys(errors).length > 0) {
       setFieldErrors(errors);
@@ -343,6 +419,13 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       setSubmitting(false);
     }
   };
+
+  // 「目标仓库」区画什么：loading / failed / picker / empty 四态（lib/launch-repos-state）
+  const reposView = resolveLaunchReposView({
+    phase: settingsPhase,
+    repoCount: repos.length,
+  });
+  const settingsFailure = describeLaunchSettingsFailure(settingsUnreadable);
 
   return (
     <Form
@@ -482,7 +565,33 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         required
         error={fieldErrors.repos}
       >
-        {repos.length > 0 ? (
+        {reposView === "loading" ? (
+          <LoadingState variant="inline" label="读取设置中…" />
+        ) : reposView === "failed" ? (
+          // 设置没读到：说「读取失败 + 重试」，不说「还没配置仓库」（默认值里的空数组不是用户的配置）
+          <EmptyHint size="sm" className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <span className="min-w-0 flex-1 basis-48">{settingsFailure.message}</span>
+            <span className="flex shrink-0 items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={retryingSettings}
+                onClick={() => void handleRetrySettings()}
+              >
+                {retryingSettings ? "重试中…" : "重试"}
+              </Button>
+              {settingsFailure.showSettingsLink && (
+                <a
+                  href={settingsUrl("repos")}
+                  className="text-primary underline-offset-2 hover:underline"
+                >
+                  去设置页查看
+                </a>
+              )}
+            </span>
+          </EmptyHint>
+        ) : reposView === "picker" ? (
           <MultiSelect<RepoConfig>
             options={repos}
             value={repoPaths}
@@ -532,6 +641,15 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
               去设置页添加
             </a>
           </EmptyHint>
+        )}
+        {notRootRepoPaths.length > 0 && (
+          <p className="text-xs text-warning">
+            {notRootRepoPaths
+              .map((p) => repos.find((r) => r.path === p)?.name ?? p)
+              .join("、")}
+            {" "}
+            不是 git 仓库根目录（是仓库里的子目录）：不会创建隔离工作区，也不会建分支，AI 会直接改这个目录
+          </p>
         )}
       </Field>
 

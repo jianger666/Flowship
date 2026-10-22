@@ -4,6 +4,7 @@ import path from "node:path";
 
 import type { GitBranchInfo, Task } from "@/lib/types";
 import { testingTaskConfiguredBranchRepoPaths } from "@/lib/testing-task";
+import { stripHostInjectedEnv } from "./host-env";
 import {
   beginResourceJob,
   endResourceJob,
@@ -163,7 +164,9 @@ const execGit = (
         timeout,
         signal,
         encoding: "utf8",
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        // checkout 会触发用户仓的 post-checkout 钩子（husky 里常有 `pnpm build` / node 脚本）：
+        // 钩子不该拿到宿主注入变量（R10b-05，见 host-env.ts）
+        env: { ...stripHostInjectedEnv(), GIT_TERMINAL_PROMPT: "0" },
       },
       (error, stdout, stderr) => {
         if (error) {

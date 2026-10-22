@@ -16,13 +16,16 @@ import { NextResponse } from "next/server";
 import {
   commitReadableTaskListResponse,
   createTask,
-  listTasks,
+  listTasksWithCorrupt,
 } from "@/lib/server/task-fs";
 import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
 import { failpoint } from "@/lib/server/failpoints";
 import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
 import { getBackgroundSubagentCount } from "@/lib/server/subagent-background";
+import { scheduleLiveTaskIds } from "@/lib/server/schedule-store";
+import { markLiveScheduleTasks } from "@/lib/task-list-poll";
 import { isValidReqId } from "@/lib/req-id";
+import { firstNonLocalRepoPath } from "@/lib/unc-path";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
 import {
   USER_ROLES,
@@ -76,11 +79,19 @@ const withBackgroundSubagentCounts = (tasks: TaskSummary[]): TaskSummary[] =>
 
 export const GET = async () => {
   try {
-    const tasks = withBackgroundSubagentCounts(await listTasks());
+    const listed = await listTasksWithCorrupt();
+    // 再给「还有会触发的定时」的会话打 hasLiveSchedule（读进程内索引、不读盘；没有 live 定时时 payload 不变）：
+    // 客户端据此在没有别的轮询理由时低频兜底刷新，定时唤醒的 run 才有机会被看见 / 通知
+    const tasks = markLiveScheduleTasks(
+      withBackgroundSubagentCounts(listed.tasks),
+      scheduleLiveTaskIds(),
+    );
     // helper 与 Response 之间可插入删除——提交点再 filter
     await failpoint("httpRead.afterHelper");
     return commitReadableTaskListResponse(tasks, (filtered) => ({
       tasks: filtered,
+      // meta.json 损坏而无法列出的任务（独立数组、不混进 tasks）；没有损坏时不带字段、payload 不变
+      ...(listed.corrupt.length > 0 ? { corrupt: listed.corrupt } : {}),
     }));
   } catch (err) {
     console.error("[GET /api/tasks] failed", err);
@@ -103,6 +114,12 @@ export const POST = async (req: Request) => {
     }
 
     const repoPaths = sanitizeRepoPaths(body.repoPaths);
+    // UNC / WSL / 非本机磁盘仓库：创建处就拒并写明原因（Q4-01）。放行的话后面 repo-branches / repo-remote-meta
+    // 都会 400（R12-01 守卫），任务却已建出来、表单只显示「非 git 仓库」，用户不知道为什么
+    const rejectedRepo = firstNonLocalRepoPath(repoPaths);
+    if (rejectedRepo) {
+      return NextResponse.json({ error: rejectedRepo.reason }, { status: 400 });
+    }
     if (!isChat && repoPaths.length === 0) {
       return NextResponse.json(
         { error: "repoPaths 至少 1 个仓库" },

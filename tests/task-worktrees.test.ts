@@ -53,6 +53,8 @@ import {
   resolveOriginalRepoPath,
   resolveTaskIsolateWorktree,
   planWorktreeDirChanges,
+  formatWorktreeCleanupNotes,
+  wipSnapshotRefName,
 } from "@/lib/server/task-worktrees";
 import {
   formatRepoSectionForPrompt,
@@ -609,5 +611,102 @@ describe("isSafeBranchName（worktree add / checkout 前白名单）", () => {
     expect(isSafeBranchName("evil;rm")).toBe(false);
     expect(isSafeBranchName("a b")).toBe(false);
     expect(isSafeBranchName("")).toBe(false);
+  });
+});
+
+describe("wipSnapshotRefName（WIP 快照 ref 命名，review #2）", () => {
+  it("常规 taskId + 仓短名：refs/flowship/wip/<task>-<repo>，不在 heads / tags 下", () => {
+    const ref = wipSnapshotRefName("t_1700000000001_ab12", "crm-web");
+    expect(ref).toBe("refs/flowship/wip/t_1700000000001_ab12-crm-web");
+    expect(ref.startsWith("refs/heads/")).toBe(false);
+  });
+
+  it("含空格 / 点 / 中文 / git 禁用字符的仓短名被清洗，且仍是合法 ref 名", () => {
+    for (const dir of ["my repo", "a..b", "x.lock", "仓库", "w~1^:?*[\\", "-lead"]) {
+      const ref = wipSnapshotRefName("t_1_x", dir);
+      // 只剩 [A-Za-z0-9_/-]
+      expect(ref).toMatch(/^refs\/flowship\/wip\/[A-Za-z0-9_-]+$/);
+    }
+  });
+
+  it("清洗后会撞名的不同目录（my repo / my_repo）靠哈希后缀区分，不会互相覆盖快照", () => {
+    const a = wipSnapshotRefName("t_1_x", "my repo");
+    const b = wipSnapshotRefName("t_1_x", "my_repo");
+    expect(a).not.toBe(b);
+    // 同输入稳定
+    expect(wipSnapshotRefName("t_1_x", "my repo")).toBe(a);
+  });
+});
+
+describe("formatWorktreeCleanupNotes（事件文案与行为同源，review #2）", () => {
+  const tail = (p: string): string => p.split("/").pop() ?? p;
+
+  it("全成功：只有 snapshotNote、写 ref（不再写「已自动 commit 到任务分支」）", () => {
+    const { snapshotNote, failedNote } = formatWorktreeCleanupNotes(
+      {
+        snapshotRepos: ["/w/crm-web"],
+        snapshotFailedRepos: [],
+        snapshots: [
+          { repoPath: "/w/crm-web", ref: "refs/flowship/wip/t1-crm-web", commit: "a".repeat(40) },
+        ],
+        snapshotFailures: [],
+      },
+      tail,
+    );
+    expect(failedNote).toBe("");
+    expect(snapshotNote).toContain("crm-web → refs/flowship/wip/t1-crm-web");
+    expect(snapshotNote).not.toContain("同时记在任务分支");
+    expect(snapshotNote).not.toContain("已自动 commit");
+  });
+
+  it("快照同时记到了任务分支：文案点名分支", () => {
+    const { snapshotNote } = formatWorktreeCleanupNotes({
+      snapshotRepos: ["/w/a"],
+      snapshotFailedRepos: [],
+      snapshots: [
+        {
+          repoPath: "/w/a",
+          ref: "refs/flowship/wip/t1-a",
+          commit: "b".repeat(40),
+          branch: "feature/1-x",
+        },
+      ],
+    });
+    expect(snapshotNote).toContain("同时记在任务分支 feature/1-x");
+  });
+
+  it("失败：如实说工作区已保留、带原因与目录，绝不出现「已强制删除」", () => {
+    const { snapshotNote, failedNote } = formatWorktreeCleanupNotes(
+      {
+        snapshotRepos: [],
+        snapshotFailedRepos: ["/w/crm-api"],
+        snapshotFailures: [
+          { repoPath: "/w/crm-api", workDir: "/d/worktrees/t1/crm-api", reason: "工作区有未合并冲突" },
+        ],
+      },
+      tail,
+    );
+    expect(snapshotNote).toBe("");
+    expect(failedNote).toContain("工作区已保留未删除");
+    expect(failedNote).toContain("crm-api");
+    expect(failedNote).toContain("工作区有未合并冲突");
+    expect(failedNote).toContain("/d/worktrees/t1/crm-api");
+    expect(failedNote).not.toContain("强制删除");
+  });
+
+  it("旧调用方 / mock 只带 snapshotRepos / snapshotFailedRepos（无详细字段）：退化为仓名列表、不抛", () => {
+    const { snapshotNote, failedNote } = formatWorktreeCleanupNotes(
+      { snapshotRepos: ["/w/a"], snapshotFailedRepos: ["/w/b"] },
+      tail,
+    );
+    expect(snapshotNote).toContain("a");
+    expect(failedNote).toContain("b");
+    expect(failedNote).toContain("已保留");
+  });
+
+  it("全空：两段都是空串（调用方可直接拼接）", () => {
+    expect(
+      formatWorktreeCleanupNotes({ snapshotRepos: [], snapshotFailedRepos: [] }),
+    ).toEqual({ snapshotNote: "", failedNote: "" });
   });
 });

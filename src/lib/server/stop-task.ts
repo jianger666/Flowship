@@ -32,9 +32,9 @@ import {
   revokeTaskOps,
   writeEventAndPublish,
 } from "./task-stream";
-import { cancelChatRun } from "./chat-runner";
-import { failQueuedItems } from "./chat-queue";
-import { clearTalkQueue } from "./task-talk-queue";
+import { cancelChatRun, failQueuedItemsCapturingTexts } from "./chat-runner";
+import { clearTalkQueueCapturing, noticeTalkQueueDropped } from "./task-talk-queue";
+import { stopNoticeText } from "@/lib/stop-copy";
 import {
   beginChatLifecycle,
   cancelChatStart,
@@ -132,10 +132,13 @@ const runStopTaskAgent = async (
     // chat task 的 run 在 chat-runner 的 runningChats、正经 task 在 task-runner 的 runningTasks、
     // 一个 task 只落其一、两个都试、命中即停（cancelTaskRun 命中即短路、不会误触发 cancelChatRun）
     const hadAgent = cancelTaskRun(id) || cancelChatRun(id);
-    // 停止清队走唯一 sink（queue_failed + recentSettled），禁止直调 clear
-    failQueuedItems(id, { reason: "stopped" });
-    // 用户点停止：清掉输入条排的队，群来源保留、空闲后照常送达
-    clearTalkQueue(id, { onlySources: ["app"] });
+    // 停止清队走唯一 sink（queue_failed + recentSettled），禁止直调 clear；
+    // chat 输入条排的队（含纯图片 / 文件条）也要在清之前同步取走文本 / 附件占位——清完就没了，
+    // 「未送达」事件等下面「用户停止了…」落盘后再写（Q6-02 / Q6-04，与 task 的 droppedTalk 对称；定时样板在里面被剔）
+    const droppedChat = failQueuedItemsCapturingTexts(id, "stopped");
+    // 用户点停止：清掉输入条排的队，群来源保留、空闲后照常送达。
+    // 清队处必须同步取走被清条目的文本（清完就没了）；「未送达」事件等下面「用户停止了…」落盘后再写（D8-04）
+    const droppedTalk = clearTalkQueueCapturing(id, { onlySources: ["app"] });
     // 撤销启动 lease（标 cancelled），owner 在 checkpoint 窗口内复查失效后中止；
     // 不用 clearChatGate——不能清正在进行的 rewind 门闩（rewind 侧 finally 自己 endChatRewind）
     cancelChatStart(id);
@@ -182,12 +185,12 @@ const runStopTaskAgent = async (
     const actionLabel = current
       ? ` ${ACTION_LABEL[current.type] ?? current.type} action`
       : "";
-    const stopText =
-      live.mode === "chat"
-        ? "用户停止了对话（agent 已中断、可继续发消息）"
-        : opts.trigger === "exclude"
-          ? `划除时自动停止了${actionLabel}（agent 已中断、可重新「推进」）`
-          : `用户停止了${actionLabel}（agent 已中断、可重新「推进」）`;
+    // 「停止之后怎么继续」文案单一来源：lib/stop-copy（D8-06；确认框 / 本事件 / boot-recovery 同一说法）
+    const stopText = stopNoticeText({
+      mode: live.mode,
+      trigger: opts.trigger,
+      actionLabel,
+    });
     // 用户 stop 操作——无条件 writeEventAndPublish（不带 lease）
     // （stop-task 不在 no-restricted-syntax 文件名单内，无需 eslint-disable）
     // meta.stopped：前端据此把「这一轮被停掉」当边界（lib/chat-stream-display.isStopMarkerInfo）——
@@ -197,6 +200,15 @@ const runStopTaskAgent = async (
       actionId: current?.id,
       text: stopText,
       meta: { stopped: true },
+    });
+    // 输入条排的队被这次停止清掉了：以前只发 SSE 快照、事件流里不留痕，排的话悄悄没了；
+    // 现在落一条带完整原文的「未送达」事件（前端画 DroppedQueueCard，可复制；失败只告警、不拖垮 stop）
+    // chat 与 task 的两条队互斥（一个任务只落其一），合并后统一落一张卡；总数为 0 不写（不制造空提示）
+    const droppedCount = droppedChat.count + droppedTalk.count;
+    await noticeTalkQueueDropped(id, {
+      header: `已停止，${droppedCount} 条排队消息未送达、请重新发送`,
+      count: droppedCount,
+      items: [...droppedChat.items, ...droppedTalk.items],
     });
 
     const fresh = (await getTask(id)) ?? live;

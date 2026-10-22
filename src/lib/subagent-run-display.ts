@@ -118,7 +118,11 @@ export const keepsSubagentDrawerOpen = (
  * - `focus-out`：**一律拦**。典型现场：点另一条子代理任务条（先 outside-press 被放过，随后焦点落到那个按钮 →
  *   focus-out 又请求关闭，抽屉关了又靠入口的 click 重开）、抽屉里点大图再点大图上的按钮、键盘 Tab 出抽屉。
  *   这几种都不是「用户想关抽屉」；Esc / 右上角 X / 点外面这三条正式的关闭路径不受影响；
- * - 其余原因（Esc、X、程序化关闭）照常关。
+ * - `escape-key`：焦点在**抽屉外面**「自己也吃 Esc」的地方（输入框 / 可编辑区 / 弹出的浮层与菜单）时拦——
+ *   base-ui 把 Esc 监听挂在 document 上、不看事件是不是已被处理，于是在 `@` / `/` 菜单、搜索条、
+ *   气泡编辑、排队面板编辑里按 Esc「只想关自己那一层」，抽屉也跟着没了（第二轮 review V17-01）。
+ *   焦点在抽屉里 / body / 普通按钮上时 Esc 仍照常关抽屉；
+ * - 其余原因（X、程序化关闭）照常关。
  */
 export const shouldBlockSubagentDrawerClose = (
   reason: string,
@@ -126,7 +130,38 @@ export const shouldBlockSubagentDrawerClose = (
 ): boolean => {
   if (reason === "focus-out") return true;
   if (reason === "outside-press") return keepsSubagentDrawerOpen(target);
+  if (reason === "escape-key") return escapeBelongsToSomethingElse(target);
   return false;
+};
+
+/** 抽屉自身的内容区（Esc 落在这里 = 用户想关抽屉） */
+export const SUBAGENT_DRAWER_CONTENT_SELECTOR = '[data-slot="sheet-content"]';
+
+/**
+ * 「自己也吃 Esc」的元素：输入框 / 文本域 / 下拉 / 可编辑区（Lexical 输入条、`@` 菜单所在处）/ 文本框角色，
+ * 外加抽屉保持打开的那批浮层（对话框 / 菜单 / 列表框，见 {@link SUBAGENT_DRAWER_KEEP_OPEN_SELECTOR}）。
+ */
+export const ESCAPE_OWNER_SELECTOR = [
+  "input",
+  "textarea",
+  "select",
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="textbox"]',
+  SUBAGENT_DRAWER_KEEP_OPEN_SELECTOR,
+].join(", ");
+
+/**
+ * Esc 是不是该留给别的东西：目标在抽屉外、且落在「自己也吃 Esc」的元素里。
+ * 只收最小形状（有 `closest` 就行）；拿不到元素（document / body 以外的非 Element 目标）= 不拦、照常关。
+ */
+const escapeBelongsToSomethingElse = (
+  target: { closest?: (selector: string) => unknown } | EventTarget | null | undefined,
+): boolean => {
+  const el = target as { closest?: (selector: string) => unknown } | null | undefined;
+  if (!el || typeof el.closest !== "function") return false;
+  // 焦点在抽屉里：Esc 就是要关抽屉（抽屉内容区是 portal，二级浮层不在它里面，不受影响）
+  if (el.closest(SUBAGENT_DRAWER_CONTENT_SELECTOR) != null) return false;
+  return el.closest(ESCAPE_OWNER_SELECTOR) != null;
 };
 
 /**
@@ -166,4 +201,22 @@ export const releaseFollowOnOpen = (o: {
   if (o.status !== undefined) return o.status !== "running";
   if (o.phase === "missing") return true;
   return undefined;
+};
+
+/**
+ * 子代理任务条的 Tooltip 第二行：「模型 x · 推理强度 y」；两者都没有 → null。
+ *
+ * 为什么要有它：任务条里的 model / effort 徽标在窄栏（task 事件流栏 ≈307px）里会被让位给标题——
+ * 先在徽标容器里被截断、再整体隐藏（V17-04）。隐藏后的徽标没有可悬停的目标，信息只能挂到整条 Tooltip 上；
+ * 同时 `high` 这种裸词徽标本来也没说明它是什么，带上字段名反而比徽标多一点信息。
+ */
+export const subagentBarMetaText = (
+  args: { model?: string | null; effort?: string | null } | null | undefined,
+): string | null => {
+  const model = args?.model?.trim();
+  const effort = args?.effort?.trim();
+  const parts: string[] = [];
+  if (model) parts.push(`模型 ${model}`);
+  if (effort) parts.push(`推理强度 ${effort}`);
+  return parts.length > 0 ? parts.join(" · ") : null;
 };

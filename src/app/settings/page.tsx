@@ -38,6 +38,7 @@ import { useModels } from "@/hooks/use-models";
 import { useApiKeyInfo } from "@/hooks/use-api-key-info";
 import { getSettings } from "@/lib/local-store";
 import { describeSettingsUnreadable } from "@/lib/settings-unreadable";
+import { describeSettingsLoadFailure } from "@/lib/settings-load-state";
 import {
   CURSOR_PROVIDER_ID,
   DEFAULT_MEEGLE_PROJECT,
@@ -95,7 +96,16 @@ const CAPABILITY_FOCUS: Record<string, string> = {
 const SettingsPage = () => {
   const router = useRouter();
   const { openCurrent: openWhatsNew } = useWhatsNew();
-  const { settings, loaded, unreadable, update, saveFieldValue } = useSettings();
+  const {
+    settings,
+    loaded,
+    unreadable,
+    loadFailed,
+    retrying,
+    retryLoad,
+    update,
+    saveFieldValue,
+  } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
   // API Key 归属信息（Cursor.me）——拉模型时顺便拉、展示在 Key 下面
   const { info: apiKeyInfo, fetchInfo } = useApiKeyInfo();
@@ -154,10 +164,11 @@ const SettingsPage = () => {
   // 用 ref 保证只跑一次。
   const didInitValidate = useRef(false);
   useEffect(() => {
-    if (!loaded || didInitValidate.current) return;
+    // 加载失败时 settings.apiKey 只是默认空串、不拉；「重试加载」成功后（loadFailed 翻 false）再用真实 key 拉一次
+    if (!loaded || loadFailed || didInitValidate.current) return;
     didInitValidate.current = true;
     pullCursorModels(settings.apiKey);
-  }, [loaded, pullCursorModels, settings.apiKey]);
+  }, [loaded, loadFailed, pullCursorModels, settings.apiKey]);
 
   // 当前导航高亮项（点导航 / 滚动跟随都更新）
   const [activeFocus, setActiveFocus] = useState<string>(NAV_ITEMS[0].focus);
@@ -232,11 +243,14 @@ const SettingsPage = () => {
     return <LoadingState variant="hero" />;
   }
 
-  // config.json 读取阶段就不可读：settings 此时只是默认值，渲染表单会误导用户以为配置丢了、
-  // 还会诱导去改——改了也存不进去。所以只在顶部给明确原因，卡片区整体不渲染
+  // 读取阶段没拿到磁盘上的真实配置（config.json 不可读，或网络 / 服务没就绪等瞬时失败）：
+  // settings 此时只是默认值，渲染表单会误导用户以为配置丢了、还会诱导去改——改了也存不进去
+  // （存了反而会以默认值覆盖磁盘，所以保存链也一律拒写）。所以只在顶部给明确原因 + 「重试加载」，卡片区整体不渲染
   const unreadableText = unreadable
     ? describeSettingsUnreadable(unreadable.reason)
     : null;
+  const loadFailureText =
+    unreadableText ?? (loadFailed ? describeSettingsLoadFailure() : null);
 
   // 返回 = 回来路（任务详情 / 首页都可能）、无历史（直开 /settings）兜底回首页
   const handleBack = () => {
@@ -313,7 +327,7 @@ const SettingsPage = () => {
           </div>
         </div>
 
-        {unreadable && unreadableText && (
+        {loadFailureText && (
           <div
             role="alert"
             className="rounded-md border border-destructive/40 bg-destructive/5 p-3"
@@ -325,22 +339,32 @@ const SettingsPage = () => {
               />
               <div className="min-w-0 flex-1 space-y-1">
                 <div className="text-sm font-medium text-foreground">
-                  {unreadableText.headline}
+                  {loadFailureText.headline}
                 </div>
                 <div className="text-sm leading-relaxed text-muted-foreground">
-                  {unreadableText.detail}
+                  {loadFailureText.detail}
                 </div>
-                {unreadable.reason && (
+                {unreadable && unreadable.reason && (
                   <div className="font-mono text-xs break-all text-muted-foreground">
                     原因：{unreadable.reason}
                   </div>
                 )}
+                <div className="pt-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={retrying}
+                    onClick={() => void retryLoad()}
+                  >
+                    {retrying ? "重试中…" : "重试加载"}
+                  </Button>
+                </div>
               </div>
             </div>
           </div>
         )}
 
-        {!unreadable && (
+        {!loadFailed && (
           <>
         {/* ---- 模型：提供方 + 凭据 + 默认模型 ---- */}
         {wrapCard(

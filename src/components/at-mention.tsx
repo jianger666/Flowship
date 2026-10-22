@@ -6,11 +6,16 @@
  * 交互对齐 slash skill 菜单：↑↓ 选、Enter 确认、Esc 关、继续输入过滤。
  * 数据源 GET /api/repo-files；选中后 Lexical 插 FileTokenNode（`@rel/path`）。
  * 未绑 workdir 时打 `@` → toast 提示，不弹菜单。
+ *
+ * 触发口径见 lib/composer-trigger（`@` 任意位置、排除邮箱前缀与路径中段）。
+ * 结果绑定其所属 query（lib/at-mention-pick）：候选是异步拉的，query 一变旧结果还在菜单里，
+ * 此时选中会把 `@Button` 换成上一轮的 `@Bar.ts`（V5-02）——query 与结果不匹配一律拒选。
  */
 
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   type KeyboardEvent,
@@ -20,17 +25,29 @@ import { toast } from "sonner";
 
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
-import { REPO_FILES_Q_MAX_LEN } from "@/lib/repo-files-shared";
+import { useActiveOptionScroll } from "@/hooks/use-active-option-scroll";
+import { fetchAtFiles, type AtFileHit } from "@/lib/at-mention-fetch";
+import {
+  atEmptyHint,
+  atMenuView,
+  atResultsFromOutcome,
+  normalizeAtQuery,
+  pickableFor,
+} from "@/lib/at-mention-pick";
+import { matchAtTrigger } from "@/lib/composer-trigger";
+import { optionDomId } from "@/lib/menu-scroll";
 import { cn } from "@/lib/utils";
 import { Tooltip } from "@/components/ui/tooltip";
 import { isImeComposing } from "@/lib/ime";
 
-/** 光标前「正在打 @」：行首或空白后的 @partial（partial 可含 `/`、可空） */
-export const AT_RE = /(^|\s)@([^\s:]*)$/;
+export type { AtFileHit };
 
-export interface AtFileHit {
-  path: string;
-  isDir: boolean;
+/** 一次候选结果 + 它是按哪个（已截断的）query 拉的 */
+interface AtResults {
+  query: string;
+  files: AtFileHit[];
+  /** 失败 / 超时落的空结果（空态文案与「无匹配」区分，Q6-09） */
+  failed?: boolean;
 }
 
 /** Lexical 注入：选中后直接插 FileTokenNode，成功返 true */
@@ -38,13 +55,24 @@ export type AtPickHandler = (hit: AtFileHit) => boolean;
 
 export interface AtMentionApi {
   menuOpen: boolean;
+  /** 菜单里画的候选（stale 时是上一轮的旧结果——只用来画、不能直接拿来选，选走 pickAt） */
   filtered: AtFileHit[];
   activeIndex: number;
-  /** 是否在拉候选（空 query 首扫可能稍慢） */
+  /** 没有可展示的结果、在等（首扫可能稍慢） */
   loading: boolean;
+  /**
+   * 候选还不是当前 query 的（在路上）：列表降透明 + aria-busy；
+   * 此时 Enter / Tab 要拦下（不选陈旧项、也不能漏给「提交」）、菜单保持、等结果到。
+   */
+  stale: boolean;
+  /** 当前 query 的候选请求失败 / 超时（空态要写「候选加载超时」而不是「无匹配」） */
+  failed: boolean;
+  /** 列表 DOM id（输入框 aria-controls / 选项 id 的前缀） */
+  listId: string;
   onDraftChange: (draft: string, cursor: number) => void;
   onKeyDown: (e: KeyboardEvent) => boolean;
-  pickAt: (index: number) => void;
+  /** 选中第 index 项；结果与当前 query 不匹配时拒选并返回 false */
+  pickAt: (index: number) => boolean;
   registerPickHandler: (handler: AtPickHandler | null) => () => void;
   reset: () => void;
 }
@@ -61,9 +89,11 @@ const DEBOUNCE_MS = 120;
 export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
   // null = 没在打 @；string = 当前过滤词（可空串 = 刚打出 @）
   const [query, setQuery] = useState<string | null>(null);
-  const [filtered, setFiltered] = useState<AtFileHit[]>([]);
+  // 候选 + 它所属的 query：不再单存 filtered——结果必须带着「按哪个 query 拉的」，
+  // 选中前与当前 query 比对（V5-02）
+  const [results, setResults] = useState<AtResults | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [loading, setLoading] = useState(false);
+  const listId = useId();
 
   const stateRef = useRef({ draft: "", cursor: 0 });
   const pickHandlerRef = useRef<AtPickHandler | null>(null);
@@ -79,50 +109,32 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
   // query 变化 → debounce 拉 API
   useEffect(() => {
     if (query === null) {
-      setFiltered([]);
-      setLoading(false);
+      setResults(null);
       return;
     }
     if (repoPathsRef.current.length === 0) {
-      setFiltered([]);
-      setLoading(false);
+      setResults(null);
       return;
     }
-    const q = query.slice(0, REPO_FILES_Q_MAX_LEN);
+    const q = normalizeAtQuery(query);
     const controller = new AbortController();
-    setLoading(true);
     const timer = setTimeout(() => {
-      const params = new URLSearchParams({
+      // 请求 + 读 body 整体带超时（lib/at-mention-fetch，R6-07）：挂起的请求不再让菜单永远停在
+      // loading、stale 永远为真、Enter / Tab 永远被拦
+      void fetchAtFiles({
         taskId: taskIdRef.current,
         q,
-      });
-      void fetch(`/api/repo-files?${params}`, {
-        cache: "no-store",
         signal: controller.signal,
-      })
-        .then((r) => {
-          // 响应已落地后 abort 不再抛 AbortError——.then 里再判，防慢请求覆盖新 query
-          if (controller.signal.aborted) return null;
-          return r.json();
-        })
-        .then((d: { files?: AtFileHit[]; error?: string } | null) => {
-          if (d === null || controller.signal.aborted) return;
-          setFiltered(Array.isArray(d.files) ? d.files : []);
-          setActiveIndex(0);
-          setLoading(false);
-        })
-        .catch((err: unknown) => {
-          // query 变化 abort 旧请求：静默，避免把 loading/结果冲掉
-          if (
-            controller.signal.aborted ||
-            (err instanceof DOMException && err.name === "AbortError") ||
-            (err instanceof Error && err.name === "AbortError")
-          ) {
-            return;
-          }
-          setFiltered([]);
-          setLoading(false);
-        });
+      }).then((out) => {
+        // query 变化 / 卸载 abort 旧请求：静默，避免把结果冲掉
+        if (controller.signal.aborted) return;
+        // 失败 / 超时 = 这个 query 没有候选（结果所属 query 照记，菜单落空态、Enter 不再被吞），
+        // 带 failed 标记：空态写「候选加载超时」而不是「无匹配文件」（Q6-09）
+        const next = atResultsFromOutcome(q, out);
+        if (!next) return;
+        setResults(next);
+        if (out.kind === "ok") setActiveIndex(0);
+      });
     }, DEBOUNCE_MS);
     return () => {
       controller.abort();
@@ -133,7 +145,7 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
   const onDraftChange = useCallback((nextDraft: string, cursor: number) => {
     stateRef.current = { draft: nextDraft, cursor };
     const before = nextDraft.slice(0, cursor);
-    const m = before.match(AT_RE);
+    const m = matchAtTrigger(before);
     if (!m) {
       setQuery(null);
       unboundToastedRef.current = false;
@@ -149,7 +161,7 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
       return;
     }
     unboundToastedRef.current = false;
-    setQuery(m[2] ?? "");
+    setQuery(m.query);
   }, []);
 
   const registerPickHandler = useCallback((handler: AtPickHandler | null) => {
@@ -160,34 +172,46 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
   }, []);
 
   const pickAt = useCallback(
-    (index: number) => {
-      const hit = filtered[index];
-      if (!hit) return;
+    (index: number): boolean => {
+      // 单点校验：结果必须是当前 query 拉的才选（键盘 Enter / Tab 与鼠标点击都走这里）。
+      // 不匹配 = 候选在路上，拒选、菜单保持，用户等结果到再选
+      const hit = pickableFor(
+        query,
+        results?.query ?? null,
+        results?.files ?? [],
+        index,
+      );
+      if (!hit) return false;
       if (pickHandlerRef.current?.(hit)) {
         setQuery(null);
-        return;
+        return true;
       }
       // fallback：字符串替换 `@partial` → `@path `（尾空格关菜单）
       const { draft: cur, cursor } = stateRef.current;
       const before = cur.slice(0, cursor);
-      const m = before.match(AT_RE);
+      const m = matchAtTrigger(before);
       if (!m) {
         setQuery(null);
-        return;
+        return false;
       }
-      const partialLen = (m[2]?.length ?? 0) + 1; // `@` + partial
-      const cut = before.slice(0, before.length - partialLen);
+      const cut = before.slice(0, m.start);
       const token = `@${hit.path} `;
       const next = `${cut}${token}${cur.slice(cursor)}`;
       const nextCursor = cut.length + token.length;
       stateRef.current = { draft: next, cursor: nextCursor };
       applyDraftRef.current(next, nextCursor);
       setQuery(null);
+      return true;
     },
-    [filtered],
+    [query, results],
   );
 
   const menuOpen = query !== null;
+  const view = atMenuView(query, results);
+  const filtered = view.items as AtFileHit[];
+  const { stale } = view;
+  const loading = view.mode === "loading";
+  const failed = view.mode === "empty" && results?.failed === true;
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent): boolean => {
@@ -206,7 +230,10 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
         return true;
       }
       if (e.key === "Enter" || e.key === "Tab") {
-        if (filtered.length === 0) return false;
+        // 结果已到且确实无匹配：不吞（让提交 / 换行 / Tab 走原逻辑）。
+        // 候选还在路上（stale，含首次加载）：必须拦下——选不了陈旧项，
+        // 放行的话半截的 `@But` 会被当成正文提交出去；菜单保持、等结果到再按一次
+        if (filtered.length === 0 && !stale) return false;
         e.preventDefault();
         pickAt(activeIndex);
         return true;
@@ -218,7 +245,7 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
       }
       return false;
     },
-    [menuOpen, filtered.length, activeIndex, pickAt],
+    [menuOpen, filtered.length, stale, activeIndex, pickAt],
   );
 
   const reset = useCallback(() => {
@@ -230,6 +257,9 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
     filtered,
     activeIndex,
     loading,
+    stale,
+    failed,
+    listId,
     onDraftChange,
     onKeyDown,
     pickAt,
@@ -240,21 +270,47 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
 
 /** `@` 文件菜单（挂输入岛上方、视觉对齐 SlashSkillMenu） */
 export const AtMentionMenu = ({ at }: { at: AtMentionApi }) => {
+  // hook 必须在 early return 之前（hooks 顺序固定）
+  const listRef = useActiveOptionScroll({
+    activeIndex: at.activeIndex,
+    itemCount: at.filtered.length,
+    open: at.menuOpen,
+  });
   if (!at.menuOpen) return null;
+  const hasItems = at.filtered.length > 0;
+  // 只有「还画着旧列表」才降透明；首次加载（没有旧结果）画的是 spinner，不压暗
+  const dim = at.stale && hasItems;
   return (
     <div className="absolute bottom-full left-2 z-30 mb-1 w-96 max-w-[calc(100%-1rem)] overflow-hidden rounded-lg border bg-popover shadow-md">
-      <div className="max-h-64 overflow-y-auto p-1">
-        {at.loading && at.filtered.length === 0 ? (
+      {/* 列表区域（不是整行）：加载中还留着上一轮旧结果时降透明 + aria-busy——瞬时加载态，
+          告诉用户「这不是你现在这串字的结果」（此时也选不了，见 pickAt） */}
+      <div
+        ref={listRef}
+        id={at.listId}
+        role={hasItems ? "listbox" : undefined}
+        aria-label={hasItems ? "文件" : undefined}
+        aria-busy={at.stale}
+        className={cn(
+          "relative max-h-64 overflow-y-auto p-1 transition-opacity motion-reduce:transition-none",
+          dim && "opacity-60",
+        )}
+      >
+        {at.loading && !hasItems ? (
           <LoadingState variant="inline" className="px-2 py-3" />
-        ) : at.filtered.length === 0 ? (
+        ) : !hasItems ? (
           <EmptyHint variant="dashed" size="sm" align="center" className="m-1">
-            无匹配文件
+            {atEmptyHint(at.failed)}
           </EmptyHint>
         ) : (
           at.filtered.map((f, i) => (
             <button
               key={`${f.path}-${i}`}
               type="button"
+              role="option"
+              id={optionDomId(at.listId, i)}
+              aria-selected={i === at.activeIndex}
+              data-option-index={i}
+              tabIndex={-1}
               onMouseDown={(e) => {
                 e.preventDefault();
                 at.pickAt(i);

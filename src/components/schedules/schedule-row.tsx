@@ -46,11 +46,15 @@ export const ScheduleRow = ({
   const finished = record.status === "done" || record.status === "cancelled";
   return (
     <div className={cn("flex items-start gap-2 px-1.5 py-1.5 text-xs", className)}>
-      <span
-        className={cn("mt-1.5 size-1.5 shrink-0 rounded-full", DOT_CLASS[record.status])}
-        title={SCHEDULE_STATUS_LABEL[record.status]}
-        aria-label={SCHEDULE_STATUS_LABEL[record.status]}
-      />
+      {/* 状态点：hover 提示走 Tooltip（规范「Hover 提示」：不用原生 title）；
+          点本身只有颜色、读屏靠 role=img + aria-label */}
+      <Tooltip content={SCHEDULE_STATUS_LABEL[record.status]}>
+        <span
+          role="img"
+          className={cn("mt-1.5 size-1.5 shrink-0 rounded-full", DOT_CLASS[record.status])}
+          aria-label={SCHEDULE_STATUS_LABEL[record.status]}
+        />
+      </Tooltip>
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-1.5">
           <Tooltip

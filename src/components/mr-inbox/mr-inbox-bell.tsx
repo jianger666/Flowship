@@ -8,6 +8,7 @@
  * 不亮红点，点开面板见引导文案。badge 超 99 显示 99+。
  */
 
+import { useEffect, useState } from "react";
 import { Inbox } from "lucide-react";
 
 import { MrInboxPanel } from "@/components/mr-inbox/mr-inbox-panel";
@@ -20,16 +21,20 @@ import {
 } from "@/components/ui/popover";
 import { useMrInbox } from "@/hooks/use-mr-inbox";
 import { formatUnreadBadge } from "@/lib/mr-inbox";
+import { onNotifyTargetClick } from "@/lib/shell-notify";
 
 export const MrInboxBell = () => {
   const { unreadCount } = useMrInbox();
+  // 受控：点「收件箱新增待处理」系统通知后壳回传 target:"inbox"，在这里打开面板（N1-12）
+  const [open, setOpen] = useState(false);
+  useEffect(() => onNotifyTargetClick(() => setOpen(true)), []);
 
   // PopoverTrigger 的 render 必须是可交互 DOM（Button）。
   // 之前把 Tooltip 塞进 render：Base UI 的 onClick/ref/children 落到不透传的 Tooltip 上 →
   // Inbox 图标进不了 Button（空方块）、点击打不开面板（combobox.tsx 同款坑）。
   // Tooltip 包外层 span，hover tip 与 Popover 点击各走各的。
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <Tooltip content="收件箱">
         <span className="inline-flex">
           <PopoverTrigger
@@ -50,7 +55,7 @@ export const MrInboxBell = () => {
             {unreadCount > 0 && (
               <span
                 aria-hidden
-                className="absolute top-0.5 right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[11px] leading-none font-medium text-white"
+                className="absolute top-0.5 right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[11px] leading-none font-medium text-primary-foreground"
               >
                 {formatUnreadBadge(unreadCount)}
               </span>

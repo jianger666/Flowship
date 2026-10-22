@@ -219,13 +219,13 @@ export const GroupQaRoundCard = memo(function GroupQaRoundCard({
                 <CircleAlert aria-hidden className="size-3" />
                 需要你决定
               </div>
-              <div className="whitespace-pre-wrap text-foreground">
+              <div className="wrap-anywhere whitespace-pre-wrap text-foreground">
                 {needsOwner}
               </div>
             </div>
           )}
           {round.questionText && (
-            <div className="border-l-2 border-border pl-2 text-xs whitespace-pre-wrap text-foreground/90">
+            <div className="border-l-2 border-border pl-2 text-xs wrap-anywhere whitespace-pre-wrap text-foreground/90">
               {round.questionText}
             </div>
           )}
@@ -234,7 +234,7 @@ export const GroupQaRoundCard = memo(function GroupQaRoundCard({
               <div className="text-[11px] text-muted-foreground">
                 答疑 agent 选择不回复，群里没有发任何内容。它的原话：
               </div>
-              <div className="rounded-md border border-border bg-card px-2 py-1.5 font-mono text-[11px] whitespace-pre-wrap text-foreground">
+              <div className="rounded-md border border-border bg-card px-2 py-1.5 font-mono text-[11px] wrap-anywhere whitespace-pre-wrap text-foreground">
                 {round.answerText.trim() || "（无）"}
               </div>
             </div>

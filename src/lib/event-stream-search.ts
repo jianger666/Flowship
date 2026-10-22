@@ -9,6 +9,8 @@ import { markdownToSearchableFields } from "@/lib/markdown-visible-search";
 import { isEphemeralToolOutputDelta } from "@/lib/tool-display";
 import {
   findOccurrencesInFields,
+  searchOccurrenceIdentity,
+  stabilizeOccurrenceIndex,
   type SearchOccurrence,
   type SearchableField,
 } from "@/lib/text-search-highlight";
@@ -240,4 +242,59 @@ export const resolveSearchHighlightForItem = (
   );
 
   return { weak: !current, current };
+};
+
+/**
+ * 搜索范围提示：事件流只加载了最近一段（首屏 tail），更早的在「上拉分页」里、没加载就搜不到——
+ * 搜更早的内容会得到 0/0、却没有任何线索说明「不是真没有」。
+ * 有更早未加载的事件、且正在搜索时给一条范围说明（0 命中和有命中都要给：有命中也可能漏掉更早的）；
+ * 能拉更早（有 onPrependEvents）时再带一个「加载更早的再搜」入口。
+ * 不做服务端全文检索（MVP）：入口复用现有的上拉分页，加载后搜索结果随 items 自动重算。
+ */
+export interface SearchScopeNotice {
+  text: string;
+  /** 是否提供「加载更早的再搜」入口 */
+  canLoadEarlier: boolean;
+}
+
+export const deriveSearchScopeNotice = (input: {
+  /** 搜索已激活且有非空查询 */
+  filtering: boolean;
+  /** 还有更早的事件没加载 */
+  hasMoreEarlier: boolean;
+  /** 已加载的事件条数（task.events.length） */
+  loadedCount: number;
+  /** 宿主是否接了 prepend 能力（没接就只能提示、没法拉） */
+  canLoadEarlier: boolean;
+}): SearchScopeNotice | null => {
+  if (!input.filtering || !input.hasMoreEarlier) return null;
+  return {
+    text: `仅搜索已加载的最近 ${input.loadedCount} 条`,
+    canLoadEarlier: input.canLoadEarlier,
+  };
+};
+
+/**
+ * 命中集合变化后（新查询 / 流式追加 / 上拉 prepend 更早事件）重算当前命中下标。
+ *
+ * 只按下标保持（旧实现）在 prepend 时会出错：更早的命中插到列表前面，同一个下标就指向了另一处命中，
+ * 「当前命中」变了、视口随即被拽去别处。所以优先按 occurrence 身份（ownerId + field + start）
+ * 找回原来选中的那一处；找不到（查询变了 / 该处被移走）再退回按下标钳制。
+ * prevIndex = -1（此前 0 命中）时没有「原来选中的」，会落到第 0 个——
+ * 即加载更早事件后第一次搜到东西，直接定位到它。
+ */
+export const stabilizeOccurrenceSelection = (
+  prevOccurrences: readonly SearchOccurrence[],
+  prevIndex: number,
+  nextOccurrences: readonly SearchOccurrence[],
+): number => {
+  if (nextOccurrences.length === 0) return -1;
+  const prev = prevIndex >= 0 ? prevOccurrences[prevIndex] : undefined;
+  if (prev) {
+    // 身份含段序号（D3-01）：一条多段回复里每段首个命中的 (owner, field, start) 相同
+    const key = searchOccurrenceIdentity(prev);
+    const same = nextOccurrences.findIndex((o) => searchOccurrenceIdentity(o) === key);
+    if (same >= 0) return same;
+  }
+  return stabilizeOccurrenceIndex(prevIndex, nextOccurrences.length);
 };

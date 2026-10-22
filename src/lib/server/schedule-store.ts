@@ -19,6 +19,7 @@ import {
   markCancelled,
   markPaused,
   markResumed,
+  markRestoredAfterArchive,
   pruneFinished,
   SCHEDULE_FILE,
   SCHEDULE_MAX_ACTIVE_PER_TASK,
@@ -355,23 +356,84 @@ export const removeFinishedSchedule = async (
   return out.result;
 };
 
-/** 归档 / 任务终结：把这个会话所有还活着的定时取消。返回被取消的条数 */
+/**
+ * 归档 / 任务终结：把这个会话所有还活着的定时取消。返回被取消的条数。
+ * `restorable`（归档用）：给被取消的记录打上取消前的状态，取消归档时能由
+ * {@link restoreArchiveCancelledSchedules} 还原；任务终结的取消不带（终结 ≠ 暂时收起）。
+ */
 export const cancelAllSchedulesForTask = async (
   taskId: string,
   note: string,
   now: number = Date.now(),
+  opts: { restorable?: boolean } = {},
 ): Promise<number> => {
   const out = await mutateSchedules<number>(taskId, (list) => {
     let n = 0;
+    let stripped = 0;
     const next = list.map((r) => {
-      if (isFinishedStatus(r.status)) return r;
+      if (isFinishedStatus(r.status)) {
+        // Q9-02：归档 → 终结 → 取消归档。归档时被取消的记录还带着还原标记，任务终结（非 restorable）
+        // 必须把它去掉——终结时「应当永远取消」，否则之后取消归档会把已终结任务的定时复活。
+        // 不计入返回的条数（它们早已被取消，终结不再追加「定时已取消」事件）。
+        if (!opts.restorable && r.status === "cancelled" && r.archiveCancelled) {
+          stripped += 1;
+          const rest = { ...r };
+          delete rest.archiveCancelled;
+          return rest;
+        }
+        return r;
+      }
       n += 1;
-      return markCancelled(r, now, note);
+      const cancelled = markCancelled(r, now, note);
+      if (opts.restorable && (r.status === "active" || r.status === "paused")) {
+        cancelled.archiveCancelled = { prevStatus: r.status, nextFireAt: r.nextFireAt };
+      }
+      return cancelled;
     });
-    return { list: next, result: n, changed: n > 0 };
+    return { list: next, result: n, changed: n > 0 || stripped > 0 };
   });
   return out.ok ? out.result : 0;
 };
+
+/** 取消归档还原的结果分布（toast / info 事件用；第四轮 Q9-06：以前只数「回到进行中」的，其余静默） */
+export interface ArchiveRestoreOutcome {
+  /** 重新回到进行中 / 暂停 */
+  restored: number;
+  /** 一次性定时在归档期间已过点 → 如实改写成「已错过」 */
+  missed: number;
+  /** 周期定时已用满次数 → 改写成「已结束」 */
+  ended: number;
+}
+
+/**
+ * 取消归档：把「因归档被取消」的定时还原（口径见 {@link markRestoredAfterArchive}）。
+ * 只动带 `archiveCancelled` 标记的记录。还原时已过点（一次性）或已用满次数（周期）的会被如实改写成「已错过 / 已结束」，
+ * 分别计入 `missed` / `ended`（归档 toast 承诺过「取消归档可恢复」，这两类要如实告诉用户）。
+ */
+export const restoreArchiveCancelledSchedulesDetailed = async (
+  taskId: string,
+  now: number = Date.now(),
+): Promise<ArchiveRestoreOutcome> => {
+  const out = await mutateSchedules<ArchiveRestoreOutcome>(taskId, (list) => {
+    const result: ArchiveRestoreOutcome = { restored: 0, missed: 0, ended: 0 };
+    const next = list.map((r) => {
+      if (r.status !== "cancelled" || !r.archiveCancelled) return r;
+      const restored = markRestoredAfterArchive(r, now);
+      if (restored.status === "active" || restored.status === "paused") result.restored += 1;
+      else if (restored.status === "missed") result.missed += 1;
+      else if (restored.status === "done") result.ended += 1;
+      return restored;
+    });
+    return { list: next, result, changed: next.some((r, i) => r !== list[i]) };
+  });
+  return out.ok ? out.result : { restored: 0, missed: 0, ended: 0 };
+};
+
+/** 同上，只返回「重新回到进行中 / 暂停」的条数（旧调用方口径，不含已错过 / 已结束） */
+export const restoreArchiveCancelledSchedules = async (
+  taskId: string,
+  now: number = Date.now(),
+): Promise<number> => (await restoreArchiveCancelledSchedulesDetailed(taskId, now)).restored;
 
 // ----------------- 全局枚举 -----------------
 

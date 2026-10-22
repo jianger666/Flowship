@@ -53,6 +53,8 @@ export const GitLabSection = ({
               variant="outline"
               size="icon"
               onClick={() => setShowToken((s) => !s)}
+              aria-label={showToken ? "隐藏 GitLab Token" : "显示 GitLab Token"}
+              aria-pressed={showToken}
             >
               {showToken ? <EyeOff /> : <Eye />}
             </Button>

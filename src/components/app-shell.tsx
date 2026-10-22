@@ -28,6 +28,7 @@ import {
   dispatchArtifactSearchFocus,
   dispatchEventStreamSearchFocus,
   getActivePaneSearchScope,
+  isArtifactPaneCollapsed,
   resolvePaneSearchScope,
   setActivePaneSearchScope,
   type PaneSearchScope,
@@ -127,6 +128,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
       const scope = resolvePaneSearchScope(
         getActivePaneSearchScope(),
         pathname,
+        isArtifactPaneCollapsed(),
       );
       if (!scope) return;
       e.preventDefault();

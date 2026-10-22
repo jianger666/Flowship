@@ -86,7 +86,8 @@ describe("服务端：切换前复查占用", () => {
     expect(start).toBeGreaterThan(0);
     const body = gitBranches.slice(start);
     const precheck = body.indexOf("occupiedBranchMessage(b, occupant)");
-    const checkout = body.indexOf('["checkout", b]');
+    // 尾部带 `--`：分支名来自 UI、不能退化成路径（见 checkoutGitBranch 的注释）
+    const checkout = body.indexOf('["checkout", b, "--"]');
     expect(precheck).toBeGreaterThan(0);
     expect(checkout).toBeGreaterThan(precheck);
   });

@@ -169,6 +169,45 @@ describe("checkoutGitBranch：切换被占用的分支", () => {
     expect(res.error).not.toContain("不能同时检出");
     expect(res.error.length).toBeGreaterThan(0);
   });
+
+  it("分支不存在、但工作区有同名已跟踪文件：不会退化成「还原该文件」，报错且未提交改动保留（S7b-04）", async () => {
+    // 独立小仓、不碰共享 REPO。UI 的分支列表可能过期（分支刚被删），名字恰好等于一个已跟踪文件。
+    const repo = path.join(TMP, "ghost-repo");
+    fs.mkdirSync(repo, { recursive: true });
+    git(repo, "init", "-q");
+    git(repo, "symbolic-ref", "HEAD", "refs/heads/main");
+    git(repo, "config", "user.email", "t@example.com");
+    git(repo, "config", "user.name", "tester");
+    fs.writeFileSync(path.join(repo, "ghost"), "committed\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "init");
+    fs.writeFileSync(path.join(repo, "ghost"), "uncommitted edit\n");
+
+    const res = await checkoutGitBranch(repo, "ghost");
+    expect(res.ok).toBe(false);
+    // 没带 `--` 时 git 会 `Updated 1 path from the index`、把上面的改动静默还原掉
+    expect(fs.readFileSync(path.join(repo, "ghost"), "utf8")).toBe("uncommitted edit\n");
+    expect(currentBranch(repo)).toBe("main");
+  });
+
+  it("远端独有分支：带 `--` 后 DWIM 仍生效（自动建跟踪分支并切过去）", async () => {
+    const origin = path.join(TMP, "dwim-origin.git");
+    const clone = path.join(TMP, "dwim-clone");
+    git(TMP, "init", "-q", "--bare", origin);
+    git(TMP, "clone", "-q", origin, clone);
+    git(clone, "symbolic-ref", "HEAD", "refs/heads/main");
+    git(clone, "config", "user.email", "t@example.com");
+    git(clone, "config", "user.name", "tester");
+    git(clone, "commit", "-q", "--allow-empty", "-m", "init");
+    git(clone, "push", "-q", "-u", "origin", "main");
+    git(clone, "branch", "remote-only");
+    git(clone, "push", "-q", "origin", "remote-only");
+    git(clone, "branch", "-q", "-D", "remote-only");
+    git(clone, "fetch", "-q", "origin");
+
+    expect(await checkoutGitBranch(clone, "remote-only")).toEqual({ ok: true });
+    expect(currentBranch(clone)).toBe("remote-only");
+  });
 });
 
 // 垫片是 sh 脚本：Windows 上没有，跳过（降级逻辑本身与平台无关）

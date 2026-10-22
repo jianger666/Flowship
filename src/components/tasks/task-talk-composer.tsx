@@ -13,6 +13,10 @@
  * 这轮跑完自动送达），右侧换成 Composer 同款停止键 + 排队发送键；
  * 有未答提问时例外：输入条保持可发，回车顶掉这张卡（隐式跳过）。
  * 任务终态整条隐藏。
+ *
+ * 发送 POST 期间（长会话 resume 要一两分钟）**编辑器不锁**，只锁发送键（跟 chat 输入岛一致，V5-01）：
+ * 输入框乐观秒清后用户可以直接接着打下一句；此时再按 Enter 静默不动（不重复发送、新敲的字原样留着），
+ * 返回后把焦点还回编辑器；失败恢复与发送期间新敲的内容合并、不覆盖。
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -21,20 +25,30 @@ import { toast } from "sonner";
 import { ConversationComposer } from "@/components/conversation-composer";
 import { ComposerSessionProvider } from "@/components/composer-session";
 import { Tooltip } from "@/components/ui/tooltip";
-import { buildInputHistory } from "@/lib/composer-history";
+import { buildTaskInputHistory } from "@/lib/composer-history";
+import { shouldRefocusComposerAfterSend } from "@/lib/composer-refocus";
+import {
+  mergeRestoredList,
+  mergeRestoredText,
+} from "@/lib/talk-draft-merge";
 import { ModelSelect } from "@/components/ui/model-select";
 import { Picker } from "@/components/ui/picker";
 import { useModels } from "@/hooks/use-models";
 import { useProviderSwitch } from "@/hooks/use-provider-switch";
+import { useSubmitShortcut } from "@/hooks/use-settings";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { findPendingAskEvent } from "@/lib/ask-pending";
-import { getSettings } from "@/lib/local-store";
+import { getRunningQueuePlaceholder } from "@/lib/submit-shortcut";
+import { getSettings, isSettingsLoaded } from "@/lib/local-store";
 import {
+  DANGLING_TASK_PROVIDER_MESSAGE,
   getModelCredsForProvider,
   hasModelCredsForProvider,
   isProviderSwitchLocked,
+  isTaskProviderDangling,
   listProviderOptions,
   resolveTaskProvider,
+  resolveTaskProviderForPicker,
 } from "@/lib/agent-provider";
 import {
   modelSelectionKey,
@@ -64,6 +78,9 @@ import {
   loadTalkOverride,
   saveTalkOverride,
 } from "@/lib/talk-model-override";
+
+// 路径附件上限：与 hooks/use-path-attach 的 MAX_PATHS 同值（那边没导出；失败恢复合并时用）
+const TALK_MAX_PATHS = 10;
 
 // 说话条手动选模型：粘住语义（用户选了 Gemini 就一直是 Gemini，直到用户再手动切、
 // 切提供方、或推进链变了才跟上）。one-shot 问答不进 action 链、不改 action.agentModel，
@@ -104,16 +121,28 @@ export const TaskTalkComposer = ({
   // 有未答提问时输入条保持可发（回车 = 隐式跳过这张卡），不要被 shell 阻塞画成停止键。
   const pendingAsk = findPendingAskEvent(task.events);
   const isRunning = runActive && !pendingAsk;
+  // 运行中 placeholder 的键位跟个人提交快捷键走（默认 mod-enter、Enter 只会换行，U3b-04）
+  const submitShortcut = useSubmitShortcut();
   // 运行中仍允许打字排队：输入区只被 submitting 锁；busy 另管模型 / 提供方切换（跑着不能换）
   const busy = submitting || isRunning;
 
-  // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、跟 chat 输入岛同一份实现
+  // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、跟 chat 输入岛同一份实现。
+  // 不传 disabled：发送飞行中编辑器 / 附件动作都保持可用（V5-01），只有发送键被 submitting 锁。
   const rich = useRichInput({
     taskId: task.id,
     draft: { scope: "talk", id: task.id },
     maxImages: 6,
-    disabled: submitting,
   });
+  // 失败恢复要与「发送期间新敲 / 新贴的」合并：读最新的路径 / 图列表
+  //（handleSubmit 的闭包是提交时刻的 render、await 之后已陈旧）
+  const pathsRef = useRef(rich.pathAttach.paths);
+  pathsRef.current = rich.pathAttach.paths;
+  const imagesRef = useRef(rich.attach.images);
+  imagesRef.current = rich.attach.images;
+  // 提交闩锁：同帧连按两次 Enter 时 submitting state 还没刷新、state 挡不住第二次，ref 同步生效
+  const submitLatchRef = useRef(false);
+  // 输入条根节点：发送返回后判断焦点是不是还在条内（见 shouldRefocusComposerAfterSend）
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   // 展示模型：用户手动覆盖优先（粘住），否则跟当前推进实际在用的模型
   //（最近 action.agentModel → task.model）。action 链任何变化（新 action / 唤醒改模型，
@@ -134,7 +163,7 @@ export const TaskTalkComposer = ({
       onTaskUpdate(latest);
     },
   });
-  const providerId = resolveTaskProvider(task, getSettings());
+  const providerId = resolveTaskProviderForPicker(task, getSettings());
   const providerLocked = isProviderSwitchLocked(task);
   // busy（含流式尾巴 latch isRunning）/ providerLocked 是交集关系：压成一道判，文案按是否真在跑区分。
   // savingProvider（切家中）单独静默返回——连点防抖，不打扰。
@@ -295,9 +324,10 @@ export const TaskTalkComposer = ({
     () => ({
       taskId: task.id,
       repoPaths: task.repoPaths,
-      inputHistory: buildInputHistory(task.events),
+      // 事件窗口可能只有最近一段（长 run 后重开页面）：并上 actions 的指令，↑ 才不会翻空（D8-03）
+      inputHistory: buildTaskInputHistory(task.events, task.actions),
     }),
-    [task.id, task.repoPaths, task.events],
+    [task.id, task.repoPaths, task.events, task.actions],
   );
 
   // 有未答提问 → placeholder 轻提示去答题卡；**不禁输入**（同事踩坑：网断 /
@@ -316,14 +346,44 @@ export const TaskTalkComposer = ({
   // 同一轮 curl 阻塞时 runStatus 仍是 running，不能再绑 awaiting_user。
   const awaitingAnswer = !halted && !!pendingAsk;
 
+  // 发送返回后把焦点还给编辑器（V5-01）。不抢：用户已切任务 / 已把焦点放到别处 / 本来就在编辑器里都不动，
+  // 判定见 shouldRefocusComposerAfterSend（点发送键提交时焦点会随按钮 disabled 掉到 body，这里补回来）
+  const refocusAfterSend = (sendTaskId: string): void => {
+    if (typeof document === "undefined") return;
+    const active = document.activeElement;
+    if (
+      shouldRefocusComposerAfterSend({
+        sameTask: taskIdRef.current === sendTaskId,
+        active,
+        body: document.body,
+        root: rootRef.current,
+        activeIsEditor:
+          active instanceof HTMLElement && active.isContentEditable,
+      })
+    ) {
+      rich.focus();
+    }
+  };
+
   const handleSubmit = async () => {
-    if (!rich.hasContent || submitting) return;
+    // 闩锁（ref）先于一切：提交中（含同帧连按 Enter）再触发 = 静默返回——不重复发送，
+    // 输入框里用户新敲的字原样留着（没清、没丢），等这条发完再发；发送键仍由 submitting 禁用转圈
+    if (submitLatchRef.current || !rich.hasContent || submitting) return;
+    // 绑定的自定义提供方已被删除：拒发并说明原因，别让 bootArgsForTask 落回 Cursor 凭据把对话送出域
+    // （第四轮 Q2-02；与 prepareRunArgs 同口径——配置没加载成功时 customProviders 只是默认空值，不据此判「已删除」）。
+    // 输入框内容保持原样，用户在底栏重选提供方后可直接再发
+    if (isSettingsLoaded() && isTaskProviderDangling(task, getSettings())) {
+      toast.error(DANGLING_TASK_PROVIDER_MESSAGE);
+      return;
+    }
     // 跨挂载去重：上一条还在飞时拒掉（submitTaskQuestion 内有同款前置兜底、这里先给轻提示）
     if (getPendingQuestionSend(task.id)) {
       toast.error("上一条消息还在发送中、稍等它发完再发");
       return;
     }
+    submitLatchRef.current = true;
     setSubmitting(true);
+    const sendTaskId = task.id;
     // 运行中发送 = 排队：服务端 queueIfBusy 入队返 202，不做乐观气泡（送达时才由 user_reply 事件出现）
     const queueMode = isRunning;
     // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、
@@ -348,12 +408,30 @@ export const TaskTalkComposer = ({
       const outcome = await runOptimisticSubmit({
         payload: snap,
         reset: () => rich.reset(),
+        // 失败恢复：编辑器不再锁（V5-01），发送期间输入框可能已有新内容 / 新图 / 新路径——
+        // 合并而不是覆盖（原文在前、新敲的在后；图 / 路径按内容去重）
         restore: (p) =>
           restoreOptimisticDraft(
             p,
-            (t) => rich.setValue(t),
-            (paths) => rich.pathAttach.replaceAll(paths),
-            (imgs) => rich.attach.replaceAll(imgs),
+            (t) => rich.setValue((cur) => mergeRestoredText(t, cur)),
+            (paths) =>
+              rich.pathAttach.replaceAll(
+                mergeRestoredList(
+                  paths,
+                  pathsRef.current,
+                  (x) => x,
+                  TALK_MAX_PATHS,
+                ),
+              ),
+            (imgs) =>
+              rich.attach.replaceAll(
+                mergeRestoredList(
+                  imgs,
+                  imagesRef.current,
+                  (i) => i.data,
+                  rich.attach.maxImages,
+                ),
+              ),
           ),
         ...(queueMode
           ? {}
@@ -404,7 +482,10 @@ export const TaskTalkComposer = ({
       // 粘住语义：one-shot 问答不改 actions，覆盖留着下条继续用；
       // 唤醒改了 action 模型的，actionSig effect 会清覆盖跟上新会话。
     } finally {
+      submitLatchRef.current = false;
       setSubmitting(false);
+      // 成功 / 失败 / 202 排队三条路径都经过这里：POST 返回后把焦点还回编辑器
+      refocusAfterSend(sendTaskId);
     }
   };
 
@@ -415,7 +496,7 @@ export const TaskTalkComposer = ({
 
   return (
     <ComposerSessionProvider value={composerSession}>
-      <div className="border-t px-3 py-2">
+      <div ref={rootRef} className="border-t px-3 py-2">
         <ConversationComposer
           {...rich.bind}
           editorKey={task.id}
@@ -424,10 +505,11 @@ export const TaskTalkComposer = ({
             awaitingAnswer
               ? "可先答上方提问，也可在此继续说"
               : isRunning
-                ? "AI 正在跑，回车排队，跑完自动发送…"
+                ? getRunningQueuePlaceholder(submitShortcut)
                 : "想改、想问、贴图、/ 唤起 skill、@ 引用文件（⌘/Ctrl+J）"
           }
-          disabled={submitting}
+          ariaLabel="跟 AI 说"
+          // 只锁发送键（submitting：禁用 + 转圈）、不锁编辑器——跟 chat 输入岛一致（V5-01）
           submitting={submitting}
           leading={
             <span className="flex min-w-0 flex-1 items-center gap-1.5">

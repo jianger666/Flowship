@@ -86,8 +86,22 @@ export const extractSubagentCallArgs = (
   };
 };
 
+/**
+ * 查「这个子代理实际用的模型 / 思考档」的同步查表函数（由 cursor-subagent 的 link 提供，经
+ * `subagent-parent-model` 登记表交给流消费方）。全部可缺省：缺哪个，对应的徽标就保持不改写。
+ * 必须同步、不能发网络请求——它在事件流热路径上（每条 tool_call 消息都过一遍）。
+ */
+export interface SubagentDisplayLookup {
+  /** 某个模型在清单里的默认思考档（只读已缓存的清单；清单没缓存 / 没标默认档 → undefined） */
+  defaultEffortOf?: (modelId: string) => string | undefined;
+  /** resume 接上的子代理当初实际用的模型 / 思考档；登记表里没有（应用重启后等）→ undefined */
+  resumedChildOf?: (
+    agentId: string,
+  ) => { model?: string; effort?: string } | undefined;
+}
+
 /** 改写展示参数时需要的父会话信息（不传 = 徽标保持模型传的原始值） */
-export interface SubagentDisplayContext {
+export interface SubagentDisplayContext extends SubagentDisplayLookup {
   /** 父会话当前模型（含思考档参数）；子代理「沿用」时就是它 */
   parentModel?: { id: string; params?: Array<{ id: string; value: string }> };
 }
@@ -96,27 +110,44 @@ export interface SubagentDisplayContext {
  * 卡片徽标要显示**实际生效**的模型 / 思考档，而不是模型随手写的 `inherit`：
  *  - model 缺省 / inherit → 父会话模型 id；
  *  - 模型沿用、effort 又没填 → 父会话当前的思考档（子代理沿用它，见 resolveSubagentModel）；
+ *  - effort 还是空（显式指定了别的模型没写 effort / 父会话参数里没有档位）→ 该模型在清单里的默认档
+ *    （不传 effort 时子代理就是走它；清单没缓存 / 没标默认档就不显示，不硬造）；
  *  - 显式填了别的模型 / effort → 原样（那就是实际值）；
- *  - resume 调用不改写：接着的是之前那个子代理，它当初用什么模型这里不知道，不硬造。
+ *  - resume 调用：模型 / 思考档沿用当初那个子代理的（登记表里查；查不到就不改写，不硬造）。
  * 只改展示副本，工具真实入参（模型看到的、SDK 收到的）一个字不动。
  */
 const withEffectiveModelBadges = (
   inner: Record<string, unknown>,
-  parent: NonNullable<SubagentDisplayContext["parentModel"]>,
+  ctx: SubagentDisplayContext,
 ): Record<string, unknown> => {
-  if (typeof inner.resume === "string" && inner.resume.trim()) return inner;
+  if (typeof inner.resume === "string" && inner.resume.trim()) {
+    const child = ctx.resumedChildOf?.(inner.resume.trim());
+    if (!child || (!child.model && !child.effort)) return inner;
+    const out: Record<string, unknown> = { ...inner };
+    if (child.model) out.model = child.model;
+    if (child.effort) out.effort = child.effort;
+    return out;
+  }
+  const parent = ctx.parentModel;
   const out: Record<string, unknown> = { ...inner };
+  const inheritArg = isInheritModelArg(inner.model);
   const inherits =
-    isInheritModelArg(inner.model) ||
-    (typeof inner.model === "string" &&
-      inner.model.trim().toLowerCase() === parent.id.toLowerCase());
-  if (isInheritModelArg(inner.model)) out.model = parent.id;
+    !!parent &&
+    (inheritArg ||
+      (typeof inner.model === "string" &&
+        inner.model.trim().toLowerCase() === parent.id.toLowerCase()));
+  if (parent && inheritArg) out.model = parent.id;
   const effortEmpty =
     typeof inner.effort !== "string" ||
     !inner.effort.trim() ||
     isDefaultThinkingValue(inner.effort);
-  if (inherits && effortEmpty) {
-    const effort = currentEffortValue(parent.params);
+  if (effortEmpty) {
+    let effort =
+      parent && inherits ? currentEffortValue(parent.params) : undefined;
+    // 模型此时已定（沿用 → 父模型 id；显式 → 原值）才去查默认档；沿用但不知道父模型就没得查
+    if (!effort && typeof out.model === "string" && !isInheritModelArg(out.model)) {
+      effort = ctx.defaultEffortOf?.(out.model);
+    }
     if (effort) out.effort = effort;
   }
   return out;
@@ -171,9 +202,10 @@ export const toSubagentDisplayCall = <M extends ToolCallShape>(
   if (!isCursorSubagentCall(msg)) return msg;
   const outer = msg.args as Record<string, unknown>;
   const rawInner = isRecord(outer.args) ? outer.args : {};
-  const inner = ctx?.parentModel
-    ? withEffectiveModelBadges(rawInner, ctx.parentModel)
-    : rawInner;
+  const inner =
+    ctx && (ctx.parentModel || ctx.defaultEffortOf || ctx.resumedChildOf)
+      ? withEffectiveModelBadges(rawInner, ctx)
+      : rawInner;
   const next: Record<string, unknown> = {
     ...(msg as Record<string, unknown>),
     name: "task",

@@ -30,7 +30,7 @@ import {
 } from "@/components/ui/popover";
 import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { actionDisplayLabel } from "@/lib/task-display";
+import { actionDisplayLabel, getActionExcludeBlockReason } from "@/lib/task-display";
 import type { ActionRecord } from "@/lib/types";
 
 interface Props {
@@ -61,6 +61,8 @@ const ActionChip = ({
 }: ActionChipProps) => {
   const isSelected = action.id === selectedActionId;
   const isExcluded = action.excluded === true;
+  // 进行中的 action 不能划除（服务端 409）：非空 = 按钮置灰并说明原因
+  const excludeBlockReason = getActionExcludeBlockReason(action);
   // timeline 只表达「正在查看」和「是否划除」：
   // action 运行状态会被长 shell 等待放大成噪音，不在导航条里再额外染色。
   // postCheck 未过：列表上一眼可见的警示标（详情在警示标 tooltip、面板正文有完整红条）
@@ -76,13 +78,17 @@ const ActionChip = ({
         selected={isSelected}
         onClick={() => onSelectAction(action.id)}
         className={cn(
-          "flex items-center gap-1 text-foreground/85 hover:bg-muted/50 hover:text-foreground",
+          // 文字层级不靠透明度（事件流 v2 / 规范「文字层级不靠透明度」）：正文一律语义 token——
+          // 常态 text-foreground（原 text-foreground/85）、已划除 text-muted-foreground（原整个 chip 压 opacity-60）
+          "flex items-center gap-1 text-foreground hover:bg-muted/50",
+          // 已划除 = 删除线 + 弱化文字色；删除线本身就是「被划掉」的信号，不需要再整体压透明
+          isExcluded && "text-muted-foreground line-through",
           // 当前查看 = ring 描边 + 正文色提亮（底色由 ChoiceButton tab 的 bg-selected 给）。
           // 原来这里单独引了一套靛蓝、是全站唯一的第三种彩色体系，收编回全局选中态规范。
           // ring 是 box-shadow、不占盒模型；不加 border / 不改 padding / 不改字重 ⇒
           // 选中前后宽高完全一致、点击切换不抖动（这个结构决策保留不动）。
+          // 放在 isExcluded 之后：又选中又划除时文字回到 foreground（选中底 bg-selected 上 muted 字对比不够）
           isSelected && "text-foreground ring-1 ring-ring/70",
-          isExcluded && "line-through opacity-60",
         )}
       >
         <span
@@ -109,22 +115,31 @@ const ActionChip = ({
       {onToggleExclude && (
         <Tooltip
           content={
-            isExcluded
+            excludeBlockReason ??
+            (isExcluded
               ? "恢复这个 action（重新纳入 agent 上下文）"
-              : "划除（把这个 action 排出 agent 上下文、可恢复）"
+              : "划除（把这个 action 排出 agent 上下文、可恢复）")
           }
         >
           <button
             type="button"
+            // 不用原生 disabled：disabled 按钮收不到鼠标事件，Tooltip 就说不出「为什么不能划」
+            aria-disabled={excludeBlockReason ? true : undefined}
+            // 纯图标钮要有名字（× / ↺ 读屏什么都读不出）；不可划除的原因走 Tooltip
+            aria-label={isExcluded ? "恢复这个 action" : "划除这个 action"}
             onClick={(e) => {
               e.stopPropagation();
+              // 进行中的 action 服务端会 409（V18-05）：前端先拦住、给原因，不弹确认框再失败
+              if (excludeBlockReason) return;
               onToggleExclude(action);
             }}
             className={cn(
               "ml-0.5 inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors",
               isExcluded
                 ? "opacity-100 hover:text-primary"
-                : "opacity-0 group-hover/chip:opacity-100 hover:text-destructive",
+                : "opacity-0 group-focus-within/chip:opacity-100 group-hover/chip:opacity-100 hover:text-destructive",
+              excludeBlockReason &&
+                "cursor-not-allowed hover:text-muted-foreground group-hover/chip:opacity-60",
             )}
           >
             {isExcluded ? (
@@ -181,7 +196,7 @@ export const ActionTimeline = ({
           <Tooltip content="查看全部 action">
             <PopoverTrigger
               aria-label={`查看全部 ${actions.length} 个 action`}
-              className="inline-flex h-7 cursor-pointer items-center rounded-md border border-border/60 bg-muted/20 px-2 text-xs text-muted-foreground/90 transition-colors hover:bg-muted/50 hover:text-foreground"
+              className="inline-flex h-7 cursor-pointer items-center rounded-md border border-border/60 bg-muted/20 px-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
             >
               全部 ({actions.length})
             </PopoverTrigger>

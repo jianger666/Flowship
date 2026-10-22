@@ -18,7 +18,13 @@ describe("SKILL_NAME_CHAR_CLASS / SLASH_RE", () => {
     expect(SKILL_NAME_CHAR_CLASS).toContain("\\u4e00");
     expect("/写".match(SLASH_RE)?.[2]).toBe("写");
     expect("/写代码".match(SLASH_RE)?.[2]).toBe("写代码");
-    expect("帮我/写".match(SLASH_RE)).toBeNull(); // 前置非空白不触发
+  });
+
+  it("V5-06：前置紧贴中文 / 全角标点也触发（旧口径「前置非空白不触发」已废止）；URL / 路径里的 / 仍不触发", () => {
+    expect("帮我/写".match(SLASH_RE)?.[2]).toBe("写");
+    expect("好的，/写".match(SLASH_RE)?.[2]).toBe("写");
+    expect("src/app".match(SLASH_RE)).toBeNull();
+    expect("https://a.com/b".match(SLASH_RE)).toBeNull();
   });
 });
 

@@ -146,6 +146,8 @@ export const baseRouterDeps = (
   // 反查被回复消息的 parent/root：空结果即走活跃 chat 兜底，绝不能打真飞书
   larkApi: async () => ({ data: { items: [] } }),
   listTasks: async () => [],
+  // 注入前按窗口算 bootArgs 要读 meta：默认查无此任务（退回设置页默认模型），别去真读盘
+  getTaskMeta: async () => null,
   createTask: async () => ({ id: "task-new", title: "新对话" }) as never,
   getPendingAsk: () => null,
   handleChatReplyInject: async () => okInjectResponse(),

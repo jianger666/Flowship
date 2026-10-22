@@ -384,7 +384,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
                 ) : bound.membershipUnknown ? (
                   <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">未确认你在群里</span>
                 ) : (
-                  <span className="shrink-0 rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-600">正常</span>
+                  <span className="shrink-0 rounded-full bg-success/10 px-2 py-0.5 text-xs text-success">正常</span>
                 )}
               </div>
               <div className="flex min-w-0 items-center gap-1.5">

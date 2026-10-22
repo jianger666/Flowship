@@ -288,29 +288,17 @@ describe("deriveActiveStatus + 思考实时态", () => {
   });
 
   it("空等类文案不论措辞都会被实时思考盖掉：说不清上一个工具时的兜底「处理中…」同样如此", () => {
-    // 并行工具：read 回来了、grep 还没回——文案退回「处理中…」（见 chat-turns 的 hasUnpairedToolCall）
-    const callA = ev({
-      id: "ca",
-      kind: "tool_call",
-      text: "调用 read",
-      ts: 2,
-      meta: { callId: "a", name: "read", args: "{}" },
-    });
-    const callB = ev({
-      id: "cb",
-      kind: "tool_call",
-      text: "调用 grep",
-      ts: 3,
-      meta: { callId: "b", name: "grep", args: "{}" },
-    });
+    // 连工具名都说不清（tool_result 既没 name、也找不到对应的 tool_call）——文案退回「处理中…」。
+    // （原先用「并行工具：read 回来了、grep 还没回」当例子；V16-02 之后那种情形说的是还在跑的 grep、
+    // 属于 busy 类、不会被实时思考盖掉，见 tests/chat-turns.test.ts「并行工具 / 子代理」）
     const resultA = ev({
       id: "ra",
       kind: "tool_result",
       text: "完成",
       ts: 4,
-      meta: { callId: "a", name: "read", status: "success" },
+      meta: { callId: "a", status: "success" },
     });
-    const events = [user, callA, callB, resultA];
+    const events = [user, resultA];
     expect(deriveActiveStatus(events)).toEqual({
       label: PROCESSING_PLACEHOLDER_LABEL,
       sinceTs: 4,

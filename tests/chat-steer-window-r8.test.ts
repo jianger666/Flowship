@@ -47,7 +47,7 @@ vi.mock("@cursor/sdk", () => ({
 }));
 
 /** 开关：为 true 时 setTaskRunStatusIfRunOwner 一律抛 EIO（模拟收尾落盘故障，走 finalizeChatRunSafely 兜底） */
-const failure = { statusWrite: false };
+const failure = { statusWrite: false, taskId: "" };
 vi.mock("@/lib/server/task-fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/server/task-fs")>();
   return {
@@ -55,13 +55,17 @@ vi.mock("@/lib/server/task-fs", async (importOriginal) => {
     setTaskRunStatusIfRunOwner: (
       ...args: Parameters<typeof actual.setTaskRunStatusIfRunOwner>
     ) => {
-      if (failure.statusWrite) return Promise.reject(new Error("EIO: disk gone"));
+      // 只让「本用例自己的任务」抛 EIO：每个用例独立任务 id 后，上一个用例迟到的收尾链不再被同 id 的新会话挡掉，
+      // 开关若不看 taskId 就会误伤它（变成未处理拒绝、vitest 退出码 1）
+      if (failure.statusWrite && args[0] === failure.taskId) {
+        return Promise.reject(new Error("EIO: disk gone"));
+      }
       return actual.setTaskRunStatusIfRunOwner(...args);
     },
   };
 });
 
-const { readEvents, taskDir, writeMeta } = await import(
+const { readEvents, taskDir, withTaskLock, writeMeta } = await import(
   "@/lib/server/task-fs-core"
 );
 const rn = await import("@/lib/server/chat-runner");
@@ -77,7 +81,7 @@ if (!taskDir("probe").startsWith(TMP_ROOT)) {
   );
 }
 
-const TASK_ID = "t_1700000012000_steer_window";
+let TASK_ID = "t_1700000012000_steer_window";
 const AGENT_ID = "agent_fake_steer_window";
 const BOOT = {
   apiKey: "test-key",
@@ -87,6 +91,24 @@ const STEER_TEXT = "插话：换个思路 STEER-R8";
 
 let itemSeq = 0;
 let ITEM_ID = "cq_steer_window_0";
+
+/** 本文件用过的全部任务 id（afterAll 要把每一个的收尾写盘都等完再 rm 临时根） */
+const usedTaskIds = new Set<string>();
+
+/**
+ * 给迟到的收尾写盘留出落地时间：**固定** 5 轮「排空该任务的 per-task 锁 + 让出 40ms」，不判断「有没有新活」——
+ * 是时间裕量、不是同步点。用例之间不靠它：每个用例有独立任务 id / 目录，迟到写入落在自己的目录里
+ * （以前共用一个 id + beforeEach 里 `fs.rm(taskDir)`，上一个用例 `failStream()` 触发的 error 收尾
+ * `finalizeReconnectGaveUp → setTaskRunStatusIfRunOwner` 还在「读 meta → 写 tmp → rename」，目录被删 → rename ENOENT →
+ * 未处理的 rejection → vitest 退出码 1；与 chat-steer-requeue-by-reason / chat-background-subagents 同族）。
+ * 产品代码没改：删任务走 withTaskLock，锁内不会有目录被抽走，这条竞态只存在于测试的清理方式。
+ */
+const quiesceTask = async (taskId: string): Promise<void> => {
+  for (let i = 0; i < 5; i++) {
+    await withTaskLock(taskId, async () => undefined);
+    await new Promise((r) => setTimeout(r, 40));
+  }
+};
 
 const makeMeta = (id: string): TaskMetaV06 =>
   ({
@@ -258,11 +280,10 @@ beforeEach(async () => {
   failure.statusWrite = false;
   itemSeq += 1;
   ITEM_ID = `cq_steer_window_${itemSeq}`;
+  TASK_ID = `t_1700000012000_steer_window_${itemSeq}`;
+  usedTaskIds.add(TASK_ID);
   mockResume.mockReset();
-  q.clearChatQueue(TASK_ID);
-  rn.closeChatSessionUnconditional(TASK_ID);
-  await new Promise((r) => setTimeout(r, 30));
-  await fs.rm(taskDir(TASK_ID), { recursive: true, force: true }).catch(() => {});
+  // 新 id：没有残留的队列 / 会话 / 目录，不需要（也不该）再 rm 任何东西
   await writeMeta(makeMeta(TASK_ID));
   // task-fs 的 boot recovery 惰性触发：在任务还是 idle 时先触发一次
   await getTask(TASK_ID);
@@ -286,7 +307,8 @@ afterEach(async () => {
 
 afterAll(async () => {
   rn.closeChatSessionUnconditional(TASK_ID);
-  await new Promise((r) => setTimeout(r, 50));
+  // 每个用例的任务各等一遍（并行等：总耗时仍约 200ms），再删临时根
+  await Promise.all([...usedTaskIds].map((id) => quiesceTask(id)));
   await fs.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 
@@ -470,6 +492,7 @@ describe("L5-03：finalizeChatRunSafely 的 cancelled + restart 兜底站点", (
 
     // 从此刻起收尾写状态一律抛 EIO：cancelled 收尾自己抛错 → finalizeChatRunSafely 兜底（清队 + 摘表）
     failure.statusWrite = true;
+    failure.taskId = TASK_ID;
     expect(rn.cancelChatRun(TASK_ID, { reason: "restart" })).toBe(true);
 
     await waitSessionGone();

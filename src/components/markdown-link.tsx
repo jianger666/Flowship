@@ -18,6 +18,7 @@ import type { AnchorHTMLAttributes } from "react";
 import { useImagePreview } from "@/components/ui/image-preview";
 import { Tooltip } from "@/components/ui/tooltip";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
+import { isUncLikePath } from "@/lib/unc-path";
 
 const CLICKABLE = /^https?:\/\//;
 // 本地绝对路径（POSIX / Windows 盘符、含 file:// 前缀）+ 图片扩展名
@@ -32,7 +33,9 @@ export const MarkdownLink = ({
   const { node, ...domProps } = rest;
   void node;
   const { open } = useImagePreview();
-  if (href && LOCAL_IMAGE.test(href)) {
+  // UNC 形态（`//host/a.png`）虽然匹配 LOCAL_IMAGE，但被安全守卫有意挡掉、src 会是空串——
+  // 不进可点的灯箱按钮（点开是空白全屏），落到下面的纯文本分支，路径仍可见 / 可复制（R12-03）
+  if (href && LOCAL_IMAGE.test(href) && !isUncLikePath(href)) {
     const src = toLoadableImageSrc(href);
     return (
       <Tooltip content={`预览图片：${href}`}>

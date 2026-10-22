@@ -134,7 +134,7 @@ export type MessagePayloadForFingerprint = {
 
 /**
  * 稳定 payload 指纹——委托共享 `computeChatPayloadFingerprint`
- *（FNV + imageKeysFromPayloads 的 filename / mime+len 键，不再 SHA-256 图内容）。
+ *（FNV + imageKeysFromPayloads 的 filename / mime + len + 内容 FNV hash 键，不再 SHA-256 图内容）。
  */
 export const fingerprintFromMessagePayload = (
   payload: MessagePayloadForFingerprint,
@@ -908,6 +908,26 @@ export const listQueuedChatMessages = (
     displayText: m.displayText,
     enqueuedAt: m.enqueuedAt,
   }));
+
+/**
+ * 只读快照——排队中各条消息带的图片 / 文件数（itemId → 数量；没附件的条不在表里）。
+ * 给「清队时留一张未送达卡」用（Q6-04）：纯图片 / 文件的条没有文字，卡里只能写「N 张图片」这类占位；
+ * 必须在 failQueuedItems 清队**之前**同步取（清完就没了）。只给数量、不给路径 / 内容。
+ */
+export const listQueuedChatAttachmentCounts = (
+  taskId: string,
+): Map<string, { images: number; files: number }> => {
+  const out = new Map<string, { images: number; files: number }>();
+  for (const m of queues().get(taskId) ?? []) {
+    const images = Math.max(m.imageAbsPaths?.length ?? 0, m.savedImages?.length ?? 0);
+    const files = Math.max(
+      m.attachmentAbsPaths?.length ?? 0,
+      m.attachmentMetas?.length ?? 0,
+    );
+    if (images > 0 || files > 0) out.set(m.itemId, { images, files });
+  }
+  return out;
+};
 
 /**
  * 只读快照——当前服务端仍「存活」的 queue itemId（队内 + in-flight）。

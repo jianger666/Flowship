@@ -8,6 +8,7 @@
  * 已置顶时置顶按钮常显高亮（既是状态标记、又是取消入口）。
  *
  * 行首指示按 runStatus 三态切换（复用同一个槽位、不回到「满屏色点」）：
+ *  - running + 有未答提问（等你回答，runStatus 仍是 running）→ 琥珀色脉冲点「待回答」，不转圈（R3-03）
  *  - running       → 转圈（多任务并行时一眼看出哪个 AI 在跑）
  *  - 主 AI 已说完但后台子代理还在跑 → 同样转圈（见 task-background；否则会被画成空闲）
  *  - awaiting_user 且**真有事等你**（task 模式、action 等审阅 / ask 等答案）→ 琥珀色脉冲点
@@ -46,7 +47,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { formatRelative } from "@/lib/task-display";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
-import { taskStageLine } from "@/lib/task-stage-line";
+import { isAwaitingAnswer, taskStageLine } from "@/lib/task-stage-line";
 import { hasBackgroundSubagents } from "@/lib/task-background";
 import { cn } from "@/lib/utils";
 import { getTaskSeenAt } from "@/lib/view-memory";
@@ -91,6 +92,18 @@ const LeadingIndicator = ({
   task: TaskSummary;
   seenAt: number;
 }) => {
+  // AI 提问等你回答（runStatus 仍是 running、前台 curl 在阻塞）：画「等你」的琥珀点，不转圈——
+  // 转圈会说「AI 在干活」，与状态行 / 头部徽标 / 本行第二行的「待回答」矛盾（R3-03）
+  if (isAwaitingAnswer(task)) {
+    return (
+      <span
+        className="flex size-3.5 shrink-0 items-center justify-center"
+        aria-label="待回答"
+      >
+        <span className="size-2 rounded-full bg-brand" />
+      </span>
+    );
+  }
   // AI 正在跑：转圈
   if (task.runStatus === "running") {
     return (
@@ -127,7 +140,7 @@ const LeadingIndicator = ({
         className="flex size-3.5 shrink-0 items-center justify-center"
         aria-label="等待你处理"
       >
-        <span className="size-2 animate-pulse rounded-full bg-brand" />
+        <span className="size-2 rounded-full bg-brand" />
       </span>
     );
   }

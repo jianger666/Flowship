@@ -259,11 +259,51 @@ describe("shouldBlockSubagentDrawerClose：抽屉的关闭请求要不要拦（r
     expect(display.shouldBlockSubagentDrawerClose("outside-press", null)).toBe(false);
   });
 
-  it("正式的关闭路径（Esc / X / 程序化）不拦", () => {
-    for (const reason of ["escape-key", "close-press", "none", "imperative-action", ""]) {
+  it("正式的关闭路径（X / 程序化）不拦", () => {
+    for (const reason of ["close-press", "none", "imperative-action", ""]) {
       expect(display.shouldBlockSubagentDrawerClose(reason, plain), reason).toBe(false);
       expect(display.shouldBlockSubagentDrawerClose(reason, elWith("[data-subagent-opener]")), reason).toBe(false);
     }
+  });
+
+  // V17-01：base-ui 的 Esc 监听挂在 document 上、不看事件是否已被别处处理——
+  // 在抽屉外「自己也吃 Esc」的地方（输入框 / 可编辑区 / 弹层）按 Esc 不能把抽屉一并关掉
+  describe("escape-key（V17-01）", () => {
+    it("焦点在抽屉外的输入框 / 文本域 / 可编辑区 / 文本框角色里：拦（Esc 留给它自己）", () => {
+      for (const mark of ["input", "textarea", "contenteditable", '[role="textbox"]', "select"]) {
+        expect(display.shouldBlockSubagentDrawerClose("escape-key", elWith(mark)), mark).toBe(true);
+      }
+    });
+
+    it("焦点在抽屉外弹出的对话框 / 菜单 / 列表框（大图预览、@ 菜单、排队面板）里：拦", () => {
+      for (const mark of ['[role="dialog"]', '[role="menu"]', '[role="listbox"]']) {
+        expect(display.shouldBlockSubagentDrawerClose("escape-key", elWith(mark)), mark).toBe(true);
+      }
+    });
+
+    it("焦点在抽屉自己里面：照常关（即使里面有输入框）", () => {
+      expect(
+        display.shouldBlockSubagentDrawerClose(
+          "escape-key",
+          elWith(display.SUBAGENT_DRAWER_CONTENT_SELECTOR, "input"),
+        ),
+      ).toBe(false);
+    });
+
+    it("焦点在 body / 普通按钮 / 拿不到元素：照常关（不能让 Esc 关不掉抽屉）", () => {
+      expect(display.shouldBlockSubagentDrawerClose("escape-key", plain)).toBe(false);
+      expect(display.shouldBlockSubagentDrawerClose("escape-key", null)).toBe(false);
+      expect(display.shouldBlockSubagentDrawerClose("escape-key", undefined)).toBe(false);
+      expect(display.shouldBlockSubagentDrawerClose("escape-key", new EventTarget())).toBe(false);
+    });
+
+    it("真实选择器：直接用 jsdom 风格的 closest 语义校验选择器本身合法（不含语法错误）", () => {
+      // 选择器是逗号拼接的一整串：任何一段语法错误都会让 closest 抛 SyntaxError（运行时才炸）
+      const sel = display.ESCAPE_OWNER_SELECTOR;
+      expect(sel.split(", ").every((p) => p.length > 0)).toBe(true);
+      expect(sel).toContain("textarea");
+      expect(sel).toContain(display.SUBAGENT_DRAWER_KEEP_OPEN_SELECTOR);
+    });
   });
 });
 
@@ -589,11 +629,14 @@ describe("契约：事件流里的子代理卡片（整条任务条 = 开抽屉�
       "复制任务书",
       "复制产出",
       "PanelRightOpen",
-      "<Tooltip",
       "查看子代理详情\"",
     ]) {
       expect(cardCode, gone).not.toContain(gone);
     }
+    // Tooltip：当年禁的是「详情」图标按钮上的那个。V17-04 起整条任务条有且只有一个 Tooltip——
+    // 窄栏里标题被截断 / 模型·强度徽标整体隐藏后，悬停给全文（见 subagent-bar-layout-contract）
+    expect(cardCode.match(/<Tooltip\b/g)).toHaveLength(1);
+    expect(cardCode).toContain("<Tooltip content={barTooltip}>");
     // 「详情」两个字不再作为按钮文案出现（注释里提到不算）
     expect(cardCode).not.toMatch(/>\s*详情\s*</);
     expect(code).not.toContain("TASK_PROMPT_PREVIEW_CHARS");

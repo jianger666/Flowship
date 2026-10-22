@@ -26,8 +26,10 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import type { RewindFailureCode } from "@/lib/rewind-failure";
 import type { Task, TaskEvent } from "@/lib/types";
 import { renameWithRetry } from "./data-root";
+import { isDirGoneError } from "./fs-gone";
 import {
   endChatRewind,
   getChatLifecycle,
@@ -36,6 +38,8 @@ import {
 } from "./chat-gate";
 import { failQueuedItems, getChatQueueCount } from "./chat-queue";
 import { failpoint } from "./failpoints";
+import { stripHostInjectedEnv } from "./host-env";
+import { buildTargetFoldSet, isTargetTreeAlias } from "./rewind-target-alias";
 import {
   EVENTS_FILE,
   readEvents,
@@ -54,6 +58,9 @@ export const MAX_REWIND_POINTS = 20;
 
 /** git 命令超时（任务书：15s） */
 const GIT_TIMEOUT_MS = 15_000;
+
+/** 破坏性写工作区的 git 命令（`read-tree -u --reset`）超时：被杀掉会留下半恢复的工作区，所以比只读命令宽得多 */
+export const RESET_GIT_TIMEOUT_MS = 120_000;
 
 const CHECKPOINTS_DIR = "checkpoints";
 const REWIND_POINTS_FILE = "rewind_points.jsonl";
@@ -95,7 +102,10 @@ export interface RestoreReposDetail {
   repoPath: string;
   treeOid: string;
   ok: boolean;
-  /** restore 后清掉的 untracked（快照后新建的） */
+  /**
+   * restore 时清掉的未跟踪文件（相对仓根；= 安全快照里有、目标 tree 里没有的，能从安全快照找回）。
+   * 不在安全快照里的未跟踪文件（被 .gitignore 忽略的 .env.local / 本地库 / 日志等）绝不会出现在这里、也不会被删。
+   */
   removedUntracked: string[];
   error?: string;
 }
@@ -130,12 +140,25 @@ export type RewindErrorCode =
 export class RewindError extends Error {
   readonly code: RewindErrorCode;
   readonly status: number;
+  /**
+   * `run_active` 这一大类 409 的细分原因（V7-06）：停止/删除中、正在发排队、正在起会话、还有排队、
+   * 已有回退在进行……它们的 `code` 都是 run_active（既有测试 / 调用方都按它判），
+   * 但前端要对它们各说各的话——路由把 `reason ?? code` 当 409 响应的稳定 `code` 发出去，
+   * 前端据此选提示、不再靠匹配中文报错文案。没有细分（agent 正在跑）时缺省。
+   */
+  readonly reason?: RewindFailureCode;
 
-  constructor(code: RewindErrorCode, message: string, status: number) {
+  constructor(
+    code: RewindErrorCode,
+    message: string,
+    status: number,
+    reason?: RewindFailureCode,
+  ) {
     super(message);
     this.name = "RewindError";
     this.code = code;
     this.status = status;
+    this.reason = reason;
   }
 }
 
@@ -158,17 +181,25 @@ interface GitResult {
   stderr: string;
 }
 
+/**
+ * 容量上限 256MiB：`ls-tree -r --name-only -z` / `diff-tree` 的输出 = 全部路径总字节，8–12 万文件的 monorepo 轻松超 8MiB，
+ * 撞线后整体中止回退、且旧写法 `e.stderr ?? e.message` 在 stderr 为空串时不回落 → 原因为空（第四轮 Q3-01）。
+ */
+export const CHECKPOINT_GIT_MAX_BUFFER = 256 * 1024 * 1024;
+
 const runGit = async (
   repoPath: string,
   args: string[],
-  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+  opts: { env?: Record<string, string | undefined>; timeoutMs?: number } = {},
 ): Promise<GitResult> => {
   try {
     const { stdout, stderr } = await execFileAsync("git", args, {
       cwd: repoPath,
       timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
-      maxBuffer: 8 * 1024 * 1024,
-      env: opts.env ? { ...process.env, ...opts.env } : process.env,
+      maxBuffer: CHECKPOINT_GIT_MAX_BUFFER,
+      // 剔宿主注入变量（ELECTRON_RUN_AS_NODE / PORT / __NEXT_PRIVATE_* …）：read-tree -u / checkout 会触发用户仓的
+      // post-checkout / post-index-change 等钩子，钩子整份继承 server 环境会拿到这些变量（第四轮 Q3-14）
+      env: { ...stripHostInjectedEnv(), ...(opts.env ?? {}) },
     });
     return {
       ok: true,
@@ -180,7 +211,8 @@ const runGit = async (
     return {
       ok: false,
       stdout: String(e.stdout ?? "").trim(),
-      stderr: String(e.stderr ?? e.message ?? "").trim(),
+      // `||` 而非 `??`：maxBuffer 超限 / 被信号杀时 e.stderr 是空串，`??` 不回落 → 失败原因为空
+      stderr: String(e.stderr || e.message || "").trim(),
     };
   }
 };
@@ -204,7 +236,8 @@ export const snapshotRepoTree = async (
     os.tmpdir(),
     `fe-ckpt-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.index`,
   );
-  const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+  // 只传增量（runGit 自己会叠在「剔掉宿主注入变量」的 env 上；这里再展开 process.env 会把宿主变量带回去，Q3-14）
+  const env = { GIT_INDEX_FILE: tmpIndex };
 
   try {
     // 有 HEAD 则先铺底；空仓 / 无 commit 则空 index 起步，add -A 仍可收 untracked
@@ -231,13 +264,45 @@ export const snapshotRepoTree = async (
   }
 };
 
+/** {@link restoreRepoTree} 的可选参数 */
+export interface RestoreRepoTreeOptions {
+  /**
+   * 回退前对当前工作区取的安全快照 tree oid——决定「哪些未跟踪文件可以删」的唯一依据：
+   * 只有安全快照里有、目标 tree 里没有的路径才会被删（删了还能从安全快照找回）。
+   * 不传则本函数动手前自己对当前工作区取一份当基线（多一次快照的耗时，语义相同）。
+   */
+  safetyTreeOid?: string;
+}
+
 /**
- * 把工作区 + index 恢复到 treeOid，并清掉 restore 后仍 untracked 的文件
- *（= 快照之后新建、不在 tree 里的）。
+ * 路径是否在仓内且形态正常：git 吐出来的相对路径理论上都规矩，这里仍挡一道，
+ * 防止任何畸形路径（绝对路径 / `..` / 空段）让后续 `fs.unlink` 删到仓外。
+ */
+const toRepoAbsPath = (repoPath: string, rel: string): string | null => {
+  if (!rel || rel.includes("\0") || path.isAbsolute(rel)) return null;
+  const parts = rel.split("/");
+  if (parts.some((p) => p === "" || p === "." || p === ".." || p === ".git")) {
+    return null;
+  }
+  return path.join(repoPath, ...parts);
+};
+
+/**
+ * 把工作区 + index 恢复到 treeOid，并清掉「回退区间内新建、又能从安全快照找回」的未跟踪文件。
+ *
+ * ⚠️ 为什么不能再 `git clean -fd`（2026-10-20 review #3）：
+ * 回退会先把已跟踪的 `.gitignore` 还原成目标点的旧版——回退区间内新增的忽略规则随之消失，
+ * 原先被它忽略的 `.env.local` / 本地库 / 日志一下子变成「未跟踪」，`clean -fd` 会把它们永久删掉；
+ * 而它们在安全快照时被新规则忽略、**根本不在快照里**，删了就找不回。
+ * 所以改成算差集：只删「安全快照有、目标 tree 无」的路径（`diff-tree --diff-filter=A target safety`）——
+ * 这些文件都在 pre_rewind 安全点里，回滚 / 用户手工都能找回；不在安全快照里的未跟踪文件
+ * （被忽略的、安全快照之后才冒出来的）一律不碰。
+ * tracked 文件的增删改仍由 `read-tree -u --reset` 一次到位（index 里有的、目标没有的它会删）。
  */
 export const restoreRepoTree = async (
   repoPath: string,
   treeOid: string,
+  opts: RestoreRepoTreeOptions = {},
 ): Promise<RestoreReposDetail> => {
   const base: RestoreReposDetail = {
     repoPath,
@@ -253,48 +318,157 @@ export const restoreRepoTree = async (
     return { ...base, error: `非法 treeOid：${treeOid}` };
   }
 
-  // -u --reset：index + 工作区对齐到 tree（tracked 增删改一次到位）
-  const reset = await runGit(repoPath, [
-    "read-tree",
-    "-u",
-    "--reset",
+  // 「可删范围」的基线：必须在任何破坏性操作之前拿到，拿不到就中止（工作区原样不动）
+  let safetyOid = opts.safetyTreeOid;
+  if (safetyOid !== undefined && !isTreeOid(safetyOid)) {
+    return { ...base, error: `非法安全快照 treeOid：${safetyOid}` };
+  }
+  if (safetyOid === undefined) {
+    const snap = await snapshotRepoTree(repoPath);
+    if ("error" in snap) {
+      return {
+        ...base,
+        error: `无法确定可安全清理的文件范围（安全快照失败：${snap.error}），已中止、未改动工作区`,
+      };
+    }
+    safetyOid = snap.treeOid;
+  }
+
+  // 先把「要删的未跟踪文件」算出来（只读）：算不出来同样在动手前中止，
+  // 不能退化成「不知道删什么就全删」
+  const added = await runGit(repoPath, [
+    "diff-tree",
+    "-r",
+    "--no-renames",
+    "--diff-filter=A",
+    "--name-only",
+    "-z",
+    treeOid,
+    safetyOid,
+  ]);
+  if (!added.ok) {
+    return {
+      ...base,
+      error: `diff-tree 失败（无法确定可清理的文件）：${added.stderr || "git 未给出原因"}`,
+    };
+  }
+  const safetyOnlyPaths = added.stdout.split("\0").filter(Boolean);
+
+  // 目标树的全部路径（折叠后）：「绝不删与目标树仅大小写 / 规范化不同的路径」的依据（第三轮 review R1-01）。
+  // 同样在动手前只读地取：取不到就中止，不退化成「不设防地删」。
+  const targetPaths = await runGit(repoPath, [
+    "ls-tree",
+    "-r",
+    "--name-only",
+    "-z",
     treeOid,
   ]);
+  if (!targetPaths.ok) {
+    return {
+      ...base,
+      error: `ls-tree 失败（无法确定哪些路径属于目标版本）：${targetPaths.stderr || "git 未给出原因"}`,
+    };
+  }
+  const targetFold = buildTargetFoldSet(targetPaths.stdout);
+
+  // -u --reset：index + 工作区对齐到 tree（tracked 增删改一次到位）
+  // 超时放宽到 120s（第五轮 P4）：这是**破坏性**命令——被 15s 超时杀掉会留下一半恢复的工作区，代价远高于多等一会儿。
+  // 极端构造（空工作区一次性检出 3.4 万个独立目录）实测 10~11s，离 15s 只剩几秒余量；现实形状 < 1.5s。
+  const reset = await runGit(
+    repoPath,
+    ["read-tree", "-u", "--reset", treeOid],
+    { timeoutMs: RESET_GIT_TIMEOUT_MS },
+  );
   if (!reset.ok) {
     return { ...base, error: `read-tree 失败：${reset.stderr}` };
   }
 
-  // 快照后新建的 untracked 仍留在盘上（含空目录）→ git clean -fd 对齐「当时」
-  // 不进 -x：ignored 文件本就不进快照，保持不动
-  const beforeClean = await runGit(repoPath, [
-    "status",
-    "--porcelain",
-    "-uall",
-  ]);
+  // 此刻 index == 目标 tree：safetyOnlyPaths 里仍在盘上的 = 当时未跟踪（非 ignored）的文件，逐个删
   const removedUntracked: string[] = [];
-  if (beforeClean.ok && beforeClean.stdout) {
-    for (const line of beforeClean.stdout.split("\n")) {
-      if (!line.startsWith("?? ")) continue;
-      let rel = line.slice(3);
-      if (
-        (rel.startsWith('"') && rel.endsWith('"')) ||
-        (rel.startsWith("'") && rel.endsWith("'"))
-      ) {
-        rel = rel.slice(1, -1);
+  const touchedDirs = new Set<string>();
+  let realRepo: string;
+  try {
+    realRepo = await fs.realpath(repoPath);
+  } catch (err) {
+    return {
+      ...base,
+      error: `解析仓库真实路径失败：${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  // ⚠️ 大小写不敏感文件系统（macOS APFS 默认 / Windows NTFS）上，diff-tree 给的路径字面量不可信
+  // （2026-10-20 第二轮 review F1-01）：目标点叫 `Components/`、区间内被改名 `components/` 并提交时，
+  // safetyOnlyPaths 里有 `components/Button.tsx`；read-tree 把磁盘改回 `Components/Button.tsx` 后，
+  // 这条路径在盘上仍指向刚恢复的目标文件，unlink 就等于把目标版本删了（还报 ok）。
+  // 所以只删「回退后 git 自己认为真正未跟踪」的路径：与 `ls-files -o` 的实际结果取交集，
+  // 别名路径（已被 index 按大小写不敏感匹配成 tracked）不会出现在里面。
+  // 查不出来就整体跳过清理——宁可留下几个多余文件，也不冒删到目标文件的险。
+  const untrackedNow = await runGit(repoPath, [
+    "ls-files",
+    "-o",
+    "--exclude-standard",
+    "-z",
+  ]);
+  let actuallyUntracked: Set<string> | null = null;
+  if (untrackedNow.ok) {
+    actuallyUntracked = new Set(untrackedNow.stdout.split("\0").filter(Boolean));
+  } else {
+    console.warn(
+      `[chat-checkpoint] ls-files -o 失败，跳过未跟踪文件清理 repo=${repoPath}：${untrackedNow.stderr}`,
+    );
+  }
+
+  for (const rel of safetyOnlyPaths) {
+    if (!actuallyUntracked) break;
+    if (!actuallyUntracked.has(rel)) continue;
+    // 第二道防线（R1-01）：`ls-files -o` 的裁决依赖 core.ignorecase——false 的仓建在大小写不敏感的盘上时，
+    // 别名路径照样被它列出。直接对目标树做折叠比较：与目标树任一路径仅大小写 / 规范化不同 → 绝不删。
+    // 真大小写敏感的盘上最多多留一个同名异大小写的文件（在安全快照里、能找回），好过删错一个
+    if (isTargetTreeAlias(rel, targetFold)) continue;
+    const abs = toRepoAbsPath(repoPath, rel);
+    if (!abs) {
+      console.warn(`[chat-checkpoint] 跳过形态异常的路径 repo=${repoPath} path=${rel}`);
+      continue;
+    }
+    try {
+      const st = await fs.lstat(abs);
+      // 目录（子模块 gitlink / 文件变目录）不动：只清文件与软链
+      if (st.isDirectory()) continue;
+      // 父目录若被换成指向仓外的软链，unlink 会删到仓外——realpath 校验后再动手
+      const realDir = await fs.realpath(path.dirname(abs));
+      if (realDir !== realRepo && !realDir.startsWith(realRepo + path.sep)) {
+        console.warn(
+          `[chat-checkpoint] 跳过父目录越出仓库的路径 repo=${repoPath} path=${rel}`,
+        );
+        continue;
       }
-      // 目录条目常带尾 /
-      if (rel.endsWith("/")) rel = rel.slice(0, -1);
-      if (rel) removedUntracked.push(rel);
+      await fs.unlink(abs);
+      removedUntracked.push(rel);
+      touchedDirs.add(path.dirname(abs));
+    } catch (err) {
+      // ENOTDIR：文件 ↔ 目录互换后父路径变成了文件（F1-02），该路径已不存在、等同 ENOENT
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") continue;
+      return {
+        ...base,
+        removedUntracked,
+        error: `清理未跟踪文件失败（${rel}）：${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
-  const cleaned = await runGit(repoPath, ["clean", "-fd"]);
-  if (!cleaned.ok) {
-    return {
-      ...base,
-      removedUntracked,
-      error: `git clean 失败：${cleaned.stderr}`,
-    };
+  // 删完后变空的目录一并收掉（对齐旧 clean -fd 「回到当时」的观感）；非空目录 rmdir 会失败即停，不会误删
+  const repoRoot = path.resolve(repoPath);
+  for (const dir of [...touchedDirs].sort((a, b) => b.length - a.length)) {
+    let cur = path.resolve(dir);
+    while (cur !== repoRoot && cur.startsWith(repoRoot + path.sep)) {
+      try {
+        await fs.rmdir(cur);
+      } catch {
+        break;
+      }
+      cur = path.dirname(cur);
+    }
   }
 
   return { ...base, ok: true, removedUntracked };
@@ -433,13 +607,25 @@ export const readRewindPoints = async (
   return out;
 };
 
-/** 原子重写 rewind_points.jsonl（先 mkdir） */
+/**
+ * 原子重写 rewind_points.jsonl。
+ *
+ * 只建 `checkpoints/` 这一层、**不 recursive**（第四轮 Q3-08，同 tool-result-persist 的 D4b-02）：任务目录不存在 = 任务已被删，
+ * 迟到的写入（DELETE 200 之后 chat-runner / 回退收尾还在落盘）若 `mkdir -p` 会把已删任务的目录复活成一个只有
+ * `checkpoints/rewind_points.jsonl` 的空壳，再次 DELETE 还会落成 202 recoveryPending。任务目录缺失 → 降级为不写（已删任务不需要）。
+ */
 export const writeRewindPoints = async (
   taskId: string,
   points: RewindPoint[],
 ): Promise<void> => {
   const dir = getCheckpointsDir(taskId);
-  await fs.mkdir(dir, { recursive: true });
+  try {
+    await fs.mkdir(dir);
+  } catch (err) {
+    // taskDir 已不在：任务被删，不复活（第五轮 Q3-08：macOS 并发删除时可能是 EINVAL 而不只是 ENOENT，见 fs-gone.ts）
+    if (await isDirGoneError(err, path.dirname(dir))) return;
+    if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+  }
   const finalPath = getRewindPointsPath(taskId);
   const body =
     points.length === 0
@@ -453,6 +639,9 @@ export const writeRewindPoints = async (
     await renameWithRetry(tmpPath, finalPath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
+    // mkdir 之后目录又被并发删掉：writeFile / rename 不会建父目录，目录不在了 = 任务刚被删，同样降级
+    // （第五轮 Q3-08：macOS 上并发删除时 rename 抛的是 EINVAL、不是 ENOENT——只认 ENOENT 会让上面的「不抛」约定在 macOS 上失效）
+    if (await isDirGoneError(err, dir)) return;
     throw err;
   }
 };
@@ -1012,7 +1201,12 @@ const assertRewindPreflight = async (
 ): Promise<void> => {
   const lifecycle = getChatLifecycle(taskId);
   if (lifecycle === "stopping" || lifecycle === "deleting") {
-    throw new RewindError("run_active", "任务正在停止/删除、无法回退", 409);
+    throw new RewindError(
+      "run_active",
+      "任务正在停止/删除、无法回退",
+      409,
+      "task_closing",
+    );
   }
 
   const meta = await readMetaV06(taskId);
@@ -1052,16 +1246,27 @@ const assertRewindIdleLocked = async (
   }
   if (deps.isQueueDraining(taskId)) {
     // 与 flushChatQueue 入口的 rewind 门闩检查交叉闭合（另一侧在 chat-runner）
-    throw new RewindError("run_active", "正在发送排队消息、请稍后回退", 409);
+    throw new RewindError(
+      "run_active",
+      "正在发送排队消息、请稍后回退",
+      409,
+      "queue_draining",
+    );
   }
   if (hasChatStartReservation(taskId)) {
-    throw new RewindError("run_active", "正在启动新会话、请稍后回退", 409);
+    throw new RewindError(
+      "run_active",
+      "正在启动新会话、请稍后回退",
+      409,
+      "session_starting",
+    );
   }
   if (getChatQueueCount(taskId) > 0) {
     throw new RewindError(
       "run_active",
       "仍有排队中的消息、请先停止或等待发送完成再回退",
       409,
+      "queue_pending",
     );
   }
   // 复查通过：清掉排队（防竞态下刚入队的旧上下文消息在回退后幽灵发送）
@@ -1183,7 +1388,12 @@ export const executeChatRewind = async (
 ): Promise<RewindResult> => {
   // 进程内门闩：先占位，阻止 chat-reply 在检查完 isRunActive 后仍启动 run
   if (!tryBeginChatRewind(taskId)) {
-    throw new RewindError("run_active", "已有回退在进行中", 409);
+    throw new RewindError(
+      "run_active",
+      "已有回退在进行中",
+      409,
+      "rewind_in_progress",
+    );
   }
 
   try {
@@ -1289,17 +1499,24 @@ export const executeChatRewind = async (
             });
             continue;
           }
-          results.push(await restoreRepoTree(repoPath, treeOid));
+          // 目标 = 安全快照本身：差集为空、不会删任何未跟踪文件；
+          // 前面已清掉的（安全快照里有的）文件会被 read-tree 写回来
+          results.push(
+            await restoreRepoTree(repoPath, treeOid, { safetyTreeOid: treeOid }),
+          );
         }
         return results;
       };
 
       // 2) 按 target 逐仓恢复；任一失败 → 回滚当前失败仓 + 此前已成功的仓
-      // （read-tree 成功但 git clean 失败时，当前仓可能已被部分修改）
+      // （read-tree 成功但清理未跟踪文件失败时，当前仓可能已被部分修改）
+      // 传入刚落盘的安全快照：只有它里面有的未跟踪文件才允许被清（见 restoreRepoTree）
       const restoredRepos: RestoreReposDetail[] = [];
       const succeededPaths: string[] = [];
       for (const s of lockedTarget.repoSnapshots) {
-        const detail = await restoreRepoTree(s.repoPath, s.treeOid);
+        const detail = await restoreRepoTree(s.repoPath, s.treeOid, {
+          safetyTreeOid: safetyByRepo.get(s.repoPath),
+        });
         restoredRepos.push(detail);
         if (!detail.ok) {
           const rollbackResults = await rollbackReposToSafety([
@@ -1473,6 +1690,8 @@ export const executeChatRewind = async (
             err.code,
             `${err.message}（${note}）${restoreSuffix}`,
             err.status,
+            // 细分 409 的 reason 不能在这层重包时丢掉（前端按它选提示）
+            err.reason,
           );
         }
         throw new RewindError(
@@ -1522,7 +1741,12 @@ export const executeChatConversationRewind = async (
   deps: RewindDeps,
 ): Promise<RewindResult> => {
   if (!tryBeginChatRewind(taskId)) {
-    throw new RewindError("run_active", "已有回退在进行中", 409);
+    throw new RewindError(
+      "run_active",
+      "已有回退在进行中",
+      409,
+      "rewind_in_progress",
+    );
   }
 
   try {

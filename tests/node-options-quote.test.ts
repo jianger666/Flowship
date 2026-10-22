@@ -1,104 +1,152 @@
 /**
- * NODE_OPTIONS 取值引用（electron-app/node-options.mjs + main.js 接线契约）
+ * server 子进程的 Node 启动旗标（electron-app/node-options.mjs + main.js 接线契约）
  *
- * 回归背景：壳给 server 子进程注入 `--report-directory=<userData>/data/diagnostics/node-reports`，
- * macOS 的 userData 在「Application Support」下、含空格；NODE_OPTIONS 按空格切词，不加引号时
- * Node 只取到 `/…/Library/Application`、后半段被静默丢弃，崩溃取证报告写不出来、且没有任何报错。
+ * 第三轮 review N3-01（P1）：旗标走 argv，**不再写 NODE_OPTIONS**。
+ *   - NODE_OPTIONS 会被 server 的所有子孙进程继承；用户 PATH 上 Node < 22.13 遇到 `--report-exclude-env`
+ *     会 `exit 9`（not allowed in NODE_OPTIONS），agent shell 里的 pnpm / npm / tsc / vitest / hooks 全起不来。
+ *   - argv 不被继承；含空格的 report 目录（macOS「Application Support」）也不再需要引号。
  *
  * 钉死的语义：
- * - 不含空格 / 引号的取值保持原样（不加引号，行为与过去完全一致）
- * - 含空格 / 引号 / 反斜杠的取值，经**真 Node** 解析后 process.report.directory 与原值逐字符相等（往返）
- * - main.js 接线：`--report-directory` 必须经 quoteNodeOptionValue；main.js 引入的本地 .mjs 必须存在且会被打进包
+ * - buildServerNodeArgs 的默认 / 用户已设 / 版本门控三类输出
+ * - 真 Node：argv 里含空格的 --report-directory 逐字符往返；孙进程的 NODE_OPTIONS / execArgv 干净
+ * - main.js 接线：旗标进 spawn 的 argv 数组，spawn 的 env 里没有 NODE_OPTIONS 改写；本地 .mjs 都真实存在且会被打进包
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { quoteNodeOptionValue } from "../electron-app/node-options.mjs";
+import {
+  buildServerNodeArgs,
+  supportsReportExcludeEnv,
+} from "../electron-app/node-options.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const main = readFileSync(path.join(root, "electron-app/main.js"), "utf8");
 
-/** 把取值经 quoteNodeOptionValue 塞进 NODE_OPTIONS，让真 Node 解析后读回 */
-const roundTrip = (dir: string): string => {
-  const r = spawnSync(
-    process.execPath,
-    ["-e", "process.stdout.write(process.report.directory)"],
-    {
-      env: {
-        ...process.env,
-        NODE_OPTIONS: `--max-old-space-size=512 --report-directory=${quoteNodeOptionValue(dir)}`,
-      },
-      encoding: "utf8",
-    },
-  );
-  expect(r.status, r.stderr).toBe(0);
-  return r.stdout;
-};
+const REPORT_DIR =
+  "/Users/x/Library/Application Support/fe-ai-flow/data/diagnostics/node-reports";
 
-describe("quoteNodeOptionValue（纯函数）", () => {
-  it("不含空格 / 引号：原样返回（含无空格的 Windows 路径，引号外反斜杠本来就是普通字符）", () => {
-    expect(quoteNodeOptionValue("/tmp/plain/dir")).toBe("/tmp/plain/dir");
-    expect(quoteNodeOptionValue("C:\\Users\\Name\\AppData\\Roaming")).toBe(
-      "C:\\Users\\Name\\AppData\\Roaming",
-    );
-    expect(quoteNodeOptionValue("")).toBe("");
+describe("buildServerNodeArgs（纯函数）", () => {
+  it("默认：堆上限 + 取证旗标 + exclude-env（支持时）+ 原样（不加引号）的 report 目录", () => {
+    expect(
+      buildServerNodeArgs({ userNodeOptions: "", nodeVersion: "24.16.0", reportDir: REPORT_DIR }),
+    ).toEqual([
+      "--max-old-space-size=4096",
+      "--report-on-fatalerror",
+      "--report-uncaught-exception",
+      "--report-exclude-env",
+      `--report-directory=${REPORT_DIR}`,
+    ]);
   });
 
-  it("含空格：整体加双引号；引号内的反斜杠与引号各补一个反斜杠", () => {
-    expect(quoteNodeOptionValue("/Users/x/Library/Application Support/a")).toBe(
-      '"/Users/x/Library/Application Support/a"',
-    );
-    expect(quoteNodeOptionValue("C:\\Users\\John Doe\\AppData")).toBe(
-      '"C:\\\\Users\\\\John Doe\\\\AppData"',
-    );
-    expect(quoteNodeOptionValue('a"b c')).toBe('"a\\"b c"');
+  it("用户自己的 NODE_OPTIONS 已设同名项：不再追加（不覆盖手工值）", () => {
+    const args = buildServerNodeArgs({
+      userNodeOptions:
+        "--max-old-space-size=8192 --report-on-fatalerror --report-uncaught-exception --report-exclude-env --report-directory=/tmp/x",
+      nodeVersion: "24.16.0",
+      reportDir: REPORT_DIR,
+    });
+    expect(args).toEqual([]);
   });
 
-  it("制表符 / 换行也算空白：同样加引号", () => {
-    expect(quoteNodeOptionValue("a\tb")).toBe('"a\tb"');
+  it("版本门控：内嵌 Node 不认 --report-exclude-env 就不加（argv 里的未知旗标会让 server 起不来）", () => {
+    const args = buildServerNodeArgs({
+      userNodeOptions: undefined,
+      nodeVersion: "22.12.0",
+      reportDir: REPORT_DIR,
+    });
+    expect(args).not.toContain("--report-exclude-env");
+    expect(args).toContain("--max-old-space-size=4096");
+  });
+
+  it("返回的是 argv 数组元素：含空格的目录是一个元素，不被切词、不带引号", () => {
+    const args = buildServerNodeArgs({ userNodeOptions: "", nodeVersion: "24.16.0", reportDir: REPORT_DIR });
+    const dirArg = args.find((a: string) => a.startsWith("--report-directory="));
+    expect(dirArg).toBe(`--report-directory=${REPORT_DIR}`);
+    expect(dirArg).not.toMatch(/"/);
   });
 });
 
-describe("真 Node 往返：process.report.directory 与原值逐字符相等", () => {
+describe("真 Node：旗标走 argv", () => {
+  const probe = (args: string[], env: Record<string, string | undefined> = {}) =>
+    spawnSync(
+      process.execPath,
+      [
+        ...args,
+        "-e",
+        "process.stdout.write(JSON.stringify({dir:process.report.directory,excl:process.report.excludeEnv,opts:process.env.NODE_OPTIONS??null}))",
+      ],
+      { env: { ...process.env, NODE_OPTIONS: undefined, ...env } as NodeJS.ProcessEnv, encoding: "utf8" },
+    );
+
   it.each([
-    ["正式包真实形态（macOS Application Support，回归用例）", "/Users/x/Library/Application Support/fe-ai-flow/data/diagnostics/node-reports"],
+    ["正式包真实形态（macOS Application Support）", REPORT_DIR],
     ["无空格", "/tmp/plain/dir"],
-    ["连续两个空格", "/tmp/two  spaces/dir"],
-    ["反斜杠 + 空格（POSIX 下合法）", "/tmp/back\\slash and space/dir"],
     ["引号字符 + 空格", '/tmp/qu"ote and space/dir'],
-    ["Windows 风格：用户名带空格", "C:\\Users\\John Doe\\AppData\\Roaming\\Flowship\\data\\diagnostics"],
-    ["Windows 风格：无空格（不加引号也必须原样）", "C:\\Users\\Name\\AppData\\Roaming\\Flowship"],
     ["中文 + 空格", "/tmp/中文 目录/报告"],
-  ])("%s", (_name, dir) => {
-    expect(roundTrip(dir)).toBe(dir);
+  ])("argv 里的 --report-directory 往返：%s", (_n, dir) => {
+    const r = probe([`--report-directory=${dir}`]);
+    expect(r.status, r.stderr).toBe(0);
+    const out = JSON.parse(r.stdout) as { dir: string; opts: string | null };
+    expect(out.dir).toBe(dir);
+    expect(out.opts).toBeNull();
   });
 
-  it("对照：不加引号时含空格的取值确实会被截断（证明这个函数有存在的必要）", () => {
-    const dir = "/tmp/has space/dir";
+  it("当前 Node 支持 --report-exclude-env ⇒ argv 形式真能起且生效", () => {
+    if (!supportsReportExcludeEnv(process.versions.node)) return;
+    const r = probe(["--report-exclude-env"]);
+    expect(r.status, r.stderr).toBe(0);
+    expect((JSON.parse(r.stdout) as { excl: boolean }).excl).toBe(true);
+  });
+
+  it("孙进程不继承 argv 旗标（这正是不写 NODE_OPTIONS 的意义）", () => {
+    // server（带 argv 旗标）→ 孙进程：孙进程的 execArgv 里没有任何继承来的 --max-old-space-size / --report-*、NODE_OPTIONS 未设
+    const grandchild =
+      "process.stdout.write(JSON.stringify({exec:process.execArgv.filter((a)=>/^--(max-old|report)/.test(a)),opts:process.env.NODE_OPTIONS??null}))";
+    const server = `const r=require('node:child_process').spawnSync(process.execPath,['-e',${JSON.stringify(
+      grandchild,
+    )}],{encoding:'utf8',env:process.env});process.stdout.write(r.stdout)`;
     const r = spawnSync(
       process.execPath,
-      ["-e", "process.stdout.write(process.report.directory)"],
-      {
-        env: { ...process.env, NODE_OPTIONS: `--report-directory=${dir}` },
-        encoding: "utf8",
-      },
+      ["--max-old-space-size=4096", "--report-on-fatalerror", "-e", server],
+      { env: { ...process.env, NODE_OPTIONS: undefined } as NodeJS.ProcessEnv, encoding: "utf8" },
     );
-    expect(r.stdout).not.toBe(dir);
-    expect(r.stdout).toBe("/tmp/has");
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual({ exec: [], opts: null });
+  });
+});
+
+describe("supportsReportExcludeEnv（版本门控）", () => {
+  it("v23.3.0 引入、v22.13.0 回移，更老的版本不加", () => {
+    expect(supportsReportExcludeEnv("24.16.0")).toBe(true);
+    expect(supportsReportExcludeEnv("v24.0.0")).toBe(true);
+    expect(supportsReportExcludeEnv("23.3.0")).toBe(true);
+    expect(supportsReportExcludeEnv("23.2.9")).toBe(false);
+    expect(supportsReportExcludeEnv("22.13.0")).toBe(true);
+    expect(supportsReportExcludeEnv("22.12.9")).toBe(false);
+    expect(supportsReportExcludeEnv("20.18.0")).toBe(false);
+    expect(supportsReportExcludeEnv("")).toBe(false);
+    expect(supportsReportExcludeEnv(undefined)).toBe(false);
+    expect(supportsReportExcludeEnv("garbage")).toBe(false);
   });
 });
 
 describe("main.js 接线契约", () => {
-  it("--report-directory 经 quoteNodeOptionValue，且不再有未加引号的写法", () => {
-    expect(main).toContain(
-      'import { quoteNodeOptionValue } from "./node-options.mjs";',
-    );
-    expect(main).toMatch(
-      /--report-directory=\$\{quoteNodeOptionValue\(nodeReportDir\)\}/,
-    );
-    expect(main).not.toMatch(/--report-directory=\$\{nodeReportDir\}/);
+  it("旗标进 spawn 的 argv 数组（入口脚本之前），spawn 的 env 里不改写 NODE_OPTIONS", () => {
+    expect(main).toMatch(/import\s*\{[^}]*\bbuildServerNodeArgs\b[^}]*\}\s*from\s*"\.\/node-options\.mjs";/);
+    expect(main).toMatch(/spawn\(serverNodeBin\(\),\s*\[\.\.\.serverNodeArgs,\s*serverJs\]/);
+    // 从 spawn 到 stdio 这一段 env 里不能再有 NODE_OPTIONS（N3-01）
+    const spawnAt = main.indexOf("spawn(serverNodeBin()");
+    const stdioAt = main.indexOf("stdio:", spawnAt);
+    expect(spawnAt).toBeGreaterThan(-1);
+    expect(main.slice(spawnAt, stdioAt)).not.toMatch(/NODE_OPTIONS\s*:/);
+  });
+
+  it("main.js 不再有 serverNodeOptions / 把 --report-* 或 --max-old-space-size 拼进 NODE_OPTIONS 的写法", () => {
+    expect(main).not.toMatch(/serverNodeOptions/);
+    expect(main).not.toMatch(/NODE_OPTIONS\s*:\s*[^\n]*join/);
+    expect(main).not.toMatch(/quoteNodeOptionValue/);
   });
 
   it("main.js 引入的本地模块都真实存在，且 electron-builder 不会把它们漏出包外", () => {
@@ -122,5 +170,11 @@ describe("main.js 接线契约", () => {
         expect(covered, `${name} 未被 build.files 覆盖`).toBe(true);
       }
     }
+  });
+
+  it("main.js：主窗口有 960×600 的最小尺寸", () => {
+    const win = main.slice(main.indexOf("mainWindow = new BrowserWindow({"));
+    expect(win.slice(0, 600)).toMatch(/minWidth:\s*960/);
+    expect(win.slice(0, 600)).toMatch(/minHeight:\s*600/);
   });
 });

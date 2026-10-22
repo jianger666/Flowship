@@ -88,8 +88,9 @@ describe("AI 回复：chat 宽列 15px、task(log) 右栏 14px，次要面不放
     expect(botReply).toHaveLength(1);
     expect(botReply[0]).not.toMatch(/\bsize=/);
     expect(botReply[0]).not.toMatch(/\bstreaming=/);
-    // 答题回执（text={replyEvent.text}）是用户答的话、保持默认档
-    const askReply = tags.filter((t) => t.includes("text={replyEvent.text}"));
+    // 答题回执里的**题目**（Q7b-03：答案不再走 markdown、是纯文本容器；题目是 AI 写的 markdown，
+    // 展示层读 meta.questions，不是协议原文，V12-01）保持默认档
+    const askReply = tags.filter((t) => t.includes("b.question"));
     expect(askReply).toHaveLength(1);
     expect(askReply[0]).not.toMatch(/\bsize="reply"/);
   });

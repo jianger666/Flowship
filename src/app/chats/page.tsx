@@ -8,20 +8,22 @@
  * 「新建对话」大按钮。跳转用 replace（落点页不进历史、返回键不会退回空壳）。
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Loader2, MessageSquare, Plus } from "lucide-react";
+import { Loader2, MessageSquare, Plus, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
+import { deriveListLoadView } from "@/lib/load-outcome";
 import { pickChatLanding } from "@/lib/task-display";
 import { getLastChatId } from "@/lib/view-memory";
 
 const ChatsPage = () => {
   const router = useRouter();
-  const { tasks, loaded, upsertTask } = useTaskList();
+  const { tasks, loaded, loadError, refresh, upsertTask } = useTaskList();
+  const [retrying, setRetrying] = useState(false);
   // 跳转只做一次：列表轮询更新时不要反复 replace（用户可能已手动去了别的对话）
   const redirectedRef = useRef(false);
 
@@ -46,6 +48,31 @@ const ChatsPage = () => {
 
   // 有可落的对话时 effect 会跳走、这里只在「没有未归档对话」时真正渲染
   if (landing) return <LoadingState variant="hero" />;
+
+  // 列表首拉失败（没任何数据 + 有失败原因）≠「还没有对话」：不下「没有」的结论，给重试
+  if (deriveListLoadView({ loaded, loadError, count: tasks.length }) === "error") {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-4 p-8">
+        <p className="text-sm text-destructive">对话列表加载失败：{loadError}</p>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={retrying}
+          onClick={() => {
+            setRetrying(true);
+            void refresh().finally(() => setRetrying(false));
+          }}
+        >
+          {retrying ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="size-3.5" />
+          )}
+          重试
+        </Button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-8">

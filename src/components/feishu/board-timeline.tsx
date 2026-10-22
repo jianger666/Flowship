@@ -17,9 +17,11 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import type { BoardItem } from "@/components/feishu/feishu-board";
 import { Button } from "@/components/ui/button";
+import { LoadingState } from "@/components/ui/loading-state";
 import { DateRangePicker, type DayRange } from "@/components/ui/date-range-picker";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useTodayStart } from "@/hooks/use-today-start";
+import { boardEmptyKind } from "@/lib/board-empty";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -28,6 +30,8 @@ interface Props {
   /** 时间范围（受控、V0.14.1 提升到 FeishuBoard——接口按区间查、变化要重拉） */
   range: DayRange;
   onRangeChange: (r: DayRange) => void;
+  /** 正在（重新）拉取：空看板此时不能下「没有排期」的结论（Q9-05） */
+  refreshing?: boolean;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -54,7 +58,7 @@ const toCols = (
   };
 };
 
-export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) => {
+export const BoardTimeline = ({ items, onOpen, range, onRangeChange, refreshing = false }: Props) => {
   // 展开的需求 id 集合（展开 = 下方插节点排期子行）
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
@@ -234,12 +238,19 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
           )}
 
           {/* 行渲染 */}
-          {rows.length === 0 ? (
+          {rows.length === 0 && boardEmptyKind({ rowCount: rows.length, refreshing }) === "loading" ? (
+            <div
+              className="py-10 text-center"
+              style={{ gridColumn: `1 / ${span + 1}`, gridRow: 2 }}
+            >
+              <LoadingState variant="inline" label="正在查询排期…" />
+            </div>
+          ) : rows.length === 0 ? (
             <div
               className="py-10 text-center text-xs text-muted-foreground"
               style={{ gridColumn: `1 / ${span + 1}`, gridRow: 2 }}
             >
-              该空间在这个时间段没有排期——切换空间或调整时间范围，或
+              这个时间段没有排期——调整时间范围，或
               <Link
                 href="/workitems/new"
                 className="text-primary underline-offset-2 hover:underline"

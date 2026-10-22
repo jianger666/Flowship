@@ -15,7 +15,9 @@
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { bootArgsForTask } from "./agent-provider";
+import { normalizeCorruptTasks, type CorruptTaskInfo } from "./corrupt-task";
 import { getSettings } from "./local-store";
+import { TASK_LIST_FETCH_TIMEOUT_MS } from "./task-list-poll";
 import {
   planRewindTruncation,
   readRewindMarker,
@@ -26,12 +28,14 @@ import {
   type BackgroundSubagentJobView,
 } from "./background-subagents";
 import type { ThinkingSnapshot } from "./thinking-live";
+import type { ArchiveReport, DeleteWorktreeReportBody } from "./worktree-report";
 import type { TalkQueueItem } from "./talk-queue";
 import {
   type ActionRecord,
   type ArtifactRevision,
   type AskUserAnswer,
   type GitBranchState,
+  type LastRewind,
   type McpHealth,
   type NewTaskInput,
   type PreviewSlotStatus,
@@ -87,17 +91,43 @@ const handleJson = async <T>(res: Response): Promise<T> => {
 
 // ----------------- 列表 / 详情 -----------------
 
-export const fetchTasks = async (): Promise<TaskSummary[]> => {
-  const res = await fetch("/api/tasks", { cache: "no-store" });
-  const data = await handleJson<{ tasks: TaskSummary[] }>(res);
-  return data.tasks;
+/**
+ * 列表 + 「meta 损坏而无法列出的任务」。
+ * `corrupt` 在响应里是可选字段（没有损坏时服务端不带、旧服务端也没有），
+ * 这里一律规整成数组（缺省 = []），调用方不用再判 undefined。
+ */
+export const fetchTaskList = async (): Promise<{
+  tasks: TaskSummary[];
+  corrupt: CorruptTaskInfo[];
+}> => {
+  // Q8-06：带总超时——挂起（服务端卡住 / 连接半开）的请求会自己失败，不会永久占着轮询的在途守卫
+  const res = await fetch("/api/tasks", {
+    cache: "no-store",
+    signal: AbortSignal.timeout(TASK_LIST_FETCH_TIMEOUT_MS),
+  });
+  const data = await handleJson<{ tasks: TaskSummary[]; corrupt?: unknown }>(res);
+  return { tasks: data.tasks, corrupt: normalizeCorruptTasks(data.corrupt) };
 };
+
+/** 只要任务摘要的调用方用它（签名同改前；需要损坏信息用 fetchTaskList） */
+export const fetchTasks = async (): Promise<TaskSummary[]> =>
+  (await fetchTaskList()).tasks;
 
 export const fetchTask = async (
   id: string,
-  opts?: { tail?: number },
+  opts?: {
+    tail?: number;
+    /**
+     * 窗口补到含最近一条 user_reply / action_start（服务端 `?anchor=1`，300 条窗口一致性）。
+     * 只给「任务页首屏 / 回退后重拉」用，与 SSE bootstrap 同口径；`tail:1` 取目录这类探针不要传。
+     */
+    anchored?: boolean;
+  },
 ): Promise<Task | null> => {
-  const qs = opts?.tail && opts.tail > 0 ? `?tail=${opts.tail}` : "";
+  const qs =
+    opts?.tail && opts.tail > 0
+      ? `?tail=${opts.tail}${opts.anchored ? "&anchor=1" : ""}`
+      : "";
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}${qs}`, {
     cache: "no-store",
   });
@@ -169,10 +199,46 @@ export const appendTaskEvent = (prev: Task, ev: TaskEvent): Task => {
   return { ...prev, events: [...events, ev] };
 };
 
+/** 两条回退记录取更新的（ts 大者）；任一缺失取另一个 */
+const newerLastRewind = (
+  a: LastRewind | undefined,
+  b: LastRewind | undefined,
+): LastRewind | undefined => (a && b ? (b.ts >= a.ts ? b : a) : (a ?? b));
+
+/** 合并结果上的 lastRewind 取 prev / next 里更新的；与 next 相同（或都没有）就不动对象，不凭空多出 key */
+const withNewerLastRewind = (merged: Task, prev: Task, next: Task): Task => {
+  const lr = newerLastRewind(prev.lastRewind, next.lastRewind);
+  return lr === merged.lastRewind ? merged : { ...merged, lastRewind: lr };
+};
+
+/**
+ * 服务端快照 `next` 带着一次「本地还没见过」的回退，而本地又没有它的标记事件 → 本地事件窗口不可信，
+ * 调用方应做一次完整重新拉取并整体替换（resyncEvents）。第三轮 review D9-04：
+ * 回退标记事件被后续 300+ 条事件挤出尾部窗口、另一个窗口断线重连时，本地「只追加」的合并没有任何信号，
+ * 被回退删掉的事件会复活；`Task.lastRewind` 不随窗口滑走，靠它补上这个信号。
+ *
+ * 必须幂等（此后**每一帧** task 快照都带着同一条 lastRewind）：
+ *   - 本地已知这次或更新的回退（prev.lastRewind.ts >= next.lastRewind.ts）→ false，覆盖「合并 / 重拉之后」
+ *     与「迟到的旧快照」；mergeTaskEvents / replaceTaskEventsWithSnapshot 会把 lastRewind 推进到更新的那条；
+ *   - 本地已有它的标记事件 → false：SSE 先到、truncateForRewind 已按标记对齐过；
+ *   - 本地没有任何事件 → false（没有什么会错）。
+ * 调用方要在 mergeTaskEvents **之前**用合并前的 prev 判定（合并后 lastRewind 就推进了）。
+ */
+export const lastRewindNeedsResync = (prev: Task, next: Task): boolean => {
+  const lr = next.lastRewind;
+  if (!lr) return false;
+  if (prev.lastRewind && prev.lastRewind.ts >= lr.ts) return false;
+  if (prev.events.length === 0) return false;
+  if (lr.markerEventId && prev.events.some((e) => e.id === lr.markerEventId)) return false;
+  return true;
+};
+
 /** 回退 HTTP 响应里的 `rewound`（不依赖标记事件写入成功；见 rewind route） */
 export interface RewoundResult extends RewindMarker {
   /** 标记 info 事件的 id；写失败为 null */
   markerEventId: string | null;
+  /** 回退时刻（服务端时钟，= Task.lastRewind.ts）；旧服务端没给则缺省 */
+  ts?: number;
 }
 
 /**
@@ -190,8 +256,24 @@ export const applyRewoundResult = (
     complete: !prev.eventsTruncated,
   });
   if (plan.kind === "resync") return { task: prev, resync: true };
+  // 本地已对齐到这次回退：把它记成本地已知的 lastRewind（响应带了 ts 才记——没有可比较的时间就不编），
+  // 否则随后到达的、带着同一条 lastRewind 的 task 帧会让回退者自己白白重拉一次（lastRewindNeedsResync）
+  const lastRewind: LastRewind | undefined =
+    typeof r.ts === "number"
+      ? newerLastRewind(prev.lastRewind, {
+          fromEventId: r.fromEventId,
+          keptCount: r.keptCount,
+          markerEventId: r.markerEventId,
+          ts: r.ts,
+        })
+      : prev.lastRewind;
+  const truncated =
+    plan.events === prev.events ? prev : { ...prev, events: plan.events };
   return {
-    task: plan.events === prev.events ? prev : { ...prev, events: plan.events },
+    task:
+      lastRewind === truncated.lastRewind
+        ? truncated
+        : { ...truncated, lastRewind },
     resync: false,
   };
 };
@@ -218,9 +300,9 @@ export const replaceTaskEventsWithSnapshot = (prev: Task, next: Task): Task => {
   const eventsTruncated = next.eventsTruncated;
   // 过期快照不得盖运行态（同 mergeTaskEvents 末尾）
   if (next.updatedAt < prev.updatedAt) {
-    return { ...prev, events, eventsTruncated };
+    return withNewerLastRewind({ ...prev, events, eventsTruncated }, prev, next);
   }
-  return { ...next, events, eventsTruncated };
+  return withNewerLastRewind({ ...next, events, eventsTruncated }, prev, next);
 };
 
 /**
@@ -263,10 +345,12 @@ export const mergeTaskEvents = (prev: Task | null, next: Task): Task => {
   const eventsTruncated = next.eventsTruncated ?? prev.eventsTruncated;
   // 过期快照不得盖运行态：失败 done 若晚于唤醒后的 running 到达，
   // 会把顶栏打回「失败」、输入条解锁，而 agent 其实已经在跑。
+  // lastRewind 两个分支都取 prev / next 里更新的：调用方已在合并前用 lastRewindNeedsResync 判过，
+  // 这里推进它，之后每一帧带着同一条 lastRewind 的快照才不会反复触发重拉
   if (next.updatedAt < prev.updatedAt) {
-    return { ...prev, events, eventsTruncated };
+    return withNewerLastRewind({ ...prev, events, eventsTruncated }, prev, next);
   }
-  return { ...next, events, eventsTruncated };
+  return withNewerLastRewind({ ...next, events, eventsTruncated }, prev, next);
 };
 
 // ----------------- 创建 / 删除 / 配置 patch -----------------
@@ -284,14 +368,26 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
 /** 删除结果：ok=已删；not_found=服务端已无（二次删除幂等成功，不当错） */
 export type DeleteTaskResult = "ok" | "not_found";
 
-export const deleteTask = async (id: string): Promise<DeleteTaskResult> => {
+export const deleteTask = async (id: string): Promise<DeleteTaskResult> =>
+  (await deleteTaskWithReport(id)).result;
+
+/**
+ * 同 {@link deleteTask}，另带服务端的工作区清理回报（快照失败而保留的目录 / 落了快照的仓）。
+ * toast 文案只认这份回报，不再默认「删干净了」（review F1-03）。
+ */
+export const deleteTaskWithReport = async (
+  id: string,
+): Promise<{ result: DeleteTaskResult; report?: DeleteWorktreeReportBody }> => {
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
   // 404 = 已不存在：调用方当幂等成功，勿 toast「任务不存在」
-  if (res.status === 404) return "not_found";
-  await handleJson<{ ok: true }>(res);
-  return "ok";
+  if (res.status === 404) return { result: "not_found" };
+  const data = await handleJson<{ ok: true } & DeleteWorktreeReportBody>(res);
+  return {
+    result: "ok",
+    report: { worktreeKept: data.worktreeKept, worktreeSnapshots: data.worktreeSnapshots },
+  };
 };
 
 // V0.8 侧栏：置顶 / 取消置顶（PATCH /api/tasks/[id]）
@@ -312,14 +408,22 @@ export const setTaskPinned = async (
 export const setTaskArchived = async (
   id: string,
   archived: boolean,
-): Promise<Task> => {
+): Promise<Task> => (await setTaskArchivedWithReport(id, archived)).task;
+
+/**
+ * 同 {@link setTaskArchived}，另带服务端「实际做了什么」的回报（清理 / 保留了哪些工作区、取消 / 恢复了几条定时）。
+ * 归档 / 恢复 toast 只认这份，不再由客户端按任务形状预测（review D2b-06）。
+ */
+export const setTaskArchivedWithReport = async (
+  id: string,
+  archived: boolean,
+): Promise<{ task: Task; report?: ArchiveReport }> => {
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ archived }),
   });
-  const data = await handleJson<{ task: Task }>(res);
-  return data.task;
+  return await handleJson<{ task: Task; report?: ArchiveReport }>(res);
 };
 
 export const setTaskDisabledMcpServers = async (
@@ -638,6 +742,8 @@ interface SSEEnvelope {
   task?: Task;
   action?: ActionRecord;
   ok?: boolean;
+  /** done 帧：旁路群答疑 run 的身份 token（属主主链的 done 没有这个字段） */
+  origin?: string;
   message?: string;
   text?: string;
   /** thinking_delta 帧：这段思考落盘后那条 thinking 事件的 id */
@@ -742,7 +848,11 @@ export interface TaskStreamCallbacks {
   onEvent?: (ev: TaskEvent, meta?: TaskEventMeta) => void;
   onTaskUpdate?: (task: Task) => void;
   onActionUpdate?: (action: ActionRecord) => void;
-  onDone?: (task: Task, ok: boolean) => void;
+  /**
+   * 本回合 run 收尾。`origin` 有值 = 这是**旁路群答疑 run** 的 done（不是属主主 run 的）：
+   * 上层不得据此清属主的流式气泡 / 放 run latch（见 owner-run-signal.planDoneFrame）。
+   */
+  onDone?: (task: Task, ok: boolean, origin?: string) => void;
   onError?: (message: string) => void;
   /**
    * 流式 chunk 推送、UI 拼接展示打字效果
@@ -892,7 +1002,11 @@ export const watchTaskStream = async (
           } else if (env.type === "action" && env.action) {
             callbacks.onActionUpdate?.(env.action);
           } else if (env.type === "done" && env.task) {
-            callbacks.onDone?.(env.task, !!env.ok);
+            callbacks.onDone?.(
+              env.task,
+              !!env.ok,
+              typeof env.origin === "string" && env.origin ? env.origin : undefined,
+            );
           } else if (env.type === "error") {
             callbacks.onError?.(env.message ?? "未知错误");
           } else if (
@@ -1228,6 +1342,7 @@ export const rewindChatToEvent = async (
       fromEventId?: string;
       keptCount?: number;
       markerEventId?: string | null;
+      ts?: number;
     };
     markerEventWritten?: boolean;
   }>(res);
@@ -1244,6 +1359,7 @@ export const rewindChatToEvent = async (
               : null,
           markerEventId:
             typeof r.markerEventId === "string" ? r.markerEventId : null,
+          ...(typeof r.ts === "number" && Number.isFinite(r.ts) ? { ts: r.ts } : {}),
         }
       : undefined;
   return {

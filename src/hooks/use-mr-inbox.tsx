@@ -4,7 +4,10 @@
  * 收件箱全局 store（Provider 挂 providers.tsx）
  *
  * 三分组：pendingMr / myBugs / pendingRegression；未读 badge = 三组未见总和。
- * 轮询：启动即拉 + 前台每 10 分钟 + 回前台补拉（不可见不扫）。
+ * 轮询：启动即拉 + 前台每 MR_INBOX_POLL_INTERVAL_MS（5 分钟）+ 回前台补拉；
+ * 窗口不可见时：Electron 壳内放宽到 MR_INBOX_HIDDEN_POLL_INTERVAL_MS（10 分钟）继续扫（托盘常驻也要涨角标 / 发通知，N1-03），
+ * 浏览器标签页仍不扫（见 shouldPollInboxNow）；这套时机逻辑在 mr-inbox-poller.ts（不依赖 React、有行为测试，N9-3），hook 只接线；
+ * 服务端缓存 TTL 刻意比轮询间隔短 60 秒（N1-04），保证每个轮询周期都是真扫。
  * 三期注意力：未读数 → app 图标角标；扫描 diff 新增未读 → 系统通知（首轮不发）。
  */
 
@@ -20,18 +23,21 @@ import {
 } from "react";
 
 import {
-  buildInboxNotifyCopy,
-  diffInboxUnreadForNotify,
   isBugPendingFixStatus,
-  listUnreadInboxItems,
-  MR_INBOX_POLL_INTERVAL_MS,
+  MR_INBOX_SCAN_CLIENT_TIMEOUT_MS,
   stripBugMrFields,
+  type MrInboxIncompleteScope,
   type MrInboxMrDetail,
 } from "@/lib/mr-inbox";
 import { buildIgnoredMeta } from "@/lib/mr-inbox-ignored-meta";
+import { createDomInboxPoller } from "@/lib/mr-inbox-poller";
 import {
   applyInboxPatches,
+  createInboxNotifyBaseline,
   createInboxRefreshGate,
+  createInboxScanTracker,
+  decideInboxScanResult,
+  describeScanFetchError,
   nextDataOnScanFailure,
   removeInboxUrl,
   restoreInboxSnapshot,
@@ -39,6 +45,8 @@ import {
   snapshotInboxUrl,
   type InboxIgnoredSnapshot,
   type InboxPatch,
+  type InboxScanNotice,
+  type InboxScanTracker,
 } from "@/lib/mr-inbox-state";
 import { sendTaskNotification, setInboxBadge } from "@/lib/shell-notify";
 
@@ -91,6 +99,11 @@ interface MrInboxData {
   message?: string;
   scannedAt?: number;
   gitTokenConfigured?: boolean;
+  /**
+   * 本份数据是「部分失败」的不完整扫描且尚未连续同类失败（首拉没有旧表时才会落进 state）：不建通知基线。
+   * 连续多轮同类失败后的合并结果 / 只含已扫到条目的表**不带**它（由 decideInboxScanResult 决定）。
+   */
+  partial?: boolean;
 }
 
 interface MrInboxContextValue {
@@ -101,6 +114,11 @@ interface MrInboxContextValue {
    * 面板据此在列表上方挂错误条，而不是清空整表。
    */
   scanError: string | null;
+  /**
+   * 错误条的结构化场景（整轮失败 / 保留旧表 / 合并展示 / 无旧表的残表）；面板据此给准确措辞，
+   * 用 formatInboxScanNotice 渲染。与 scanError 同时为 null / 非 null。
+   */
+  scanNotice: InboxScanNotice | null;
   unreadCount: number;
   refresh: (opts?: { force?: boolean }) => Promise<void>;
   /** 标已读（url = mrUrl 或 bugUrl） */
@@ -164,12 +182,16 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
   const [data, setData] = useState<MrInboxData | null>(null);
   // 拉取中（首拉 + 手动刷新）
   const [refreshing, setRefreshing] = useState(false);
-  // 上次发起拉取的时间（回前台补拉判断是否过期）
-  const lastFetchAtRef = useRef(0);
+  // 轮询器（N9-3）：tick / 回前台补拉 / 上次发起时刻都在里面（不依赖 React、有行为测试），hook 只做接线；
+  // useState 初始化器保证整个 Provider 生命周期里是同一个对象（lastFetchAt 不会被重渲染清零）
+  const [poller] = useState(createDomInboxPoller);
   // 刷新闸门：在飞标记 + 尾随 force 登记（调度见 mr-inbox-state 的 requestInboxRefresh）
   const refreshGateRef = useRef(createInboxRefreshGate());
-  // 最近一次扫描的失败文案（成功即清）
-  const [scanError, setScanError] = useState<string | null>(null);
+  // 最近一次扫描的失败提示（成功即清）；scanError 是它的原始文案
+  const [scanNotice, setScanNotice] = useState<InboxScanNotice | null>(null);
+  const scanError = scanNotice?.message ?? null;
+  // 连续多轮部分失败的跟踪（N1-01：同类失败 ≥ 2 轮后合并展示；完整扫描清零）
+  const scanTrackerRef = useRef<InboxScanTracker>(createInboxScanTracker());
   // 忽略名单版本号（忽略 / 恢复成功 +1，「已忽略」列表依赖它重拉）
   const [ignoredRev, setIgnoredRev] = useState(0);
   // 最新 data 镜像（忽略前取快照用；不在渲染期写 ref）
@@ -177,8 +199,9 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
   // S13-04：扫描 in-flight 期间发生的本地乐观变换，响应回来后按序重放到新结果上，
   // 否则慢扫描的整表覆盖会让刚忽略 / 合并 / 流转 / 标已读的条目「复活」
   const pendingPatchesRef = useRef<InboxPatch<MrInboxData>[]>([]);
-  // 上轮未读 key 集合；null = 尚未建基线（首轮 / 降级后重建）
-  const prevUnreadKeysRef = useRef<Set<string> | null>(null);
+  // 通知基线（上轮未读 key 集合 + 基线是否建在「不完整的表」上）：状态机在纯 TS 对象里（有行为测试），
+  // hook 只调 settle；useState 初始化器保证跨渲染稳定（useMemo 只是性能提示、React 可能丢缓存，不能用来持有状态）
+  const [notifyBaseline] = useState(createInboxNotifyBaseline);
   // 上次已发给壳的角标数（相同值不重发）
   const lastBadgeCountRef = useRef<number | null>(null);
   const badgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -198,7 +221,13 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
    * 没有成功基线（首拉失败 / 降级态）才落成 error 态。
    */
   const failScan = useCallback((message: string) => {
-    setScanError(message);
+    setScanNotice({
+      kind: "failed",
+      message,
+      staleSinceMs: scanTrackerRef.current.lastFullScanAt,
+      rounds: 0,
+      kinds: [],
+    });
     setData((prev) =>
       nextDataOnScanFailure<MrInboxData>(prev, message, (msg) => ({
         status: "error",
@@ -214,10 +243,12 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
    */
   const scanOnce = useCallback(async (force: boolean) => {
     pendingPatchesRef.current = [];
-    lastFetchAtRef.current = Date.now();
+    poller.noteFetchStarted();
     try {
+      // N1-15：扫描 fetch 带总超时（> 服务端总 deadline）；超时走 failScan，finally 随之释放刷新闸门
       const res = await fetch(
         force ? "/api/mr-inbox?refresh=1" : "/api/mr-inbox",
+        { signal: AbortSignal.timeout(MR_INBOX_SCAN_CLIENT_TIMEOUT_MS) },
       );
       // 审查：HTTP 非 2xx 时 body 可能是 { error }、不能当成功列表写（会把三组清成 []）
       if (!res.ok) {
@@ -233,6 +264,11 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       }
       const body = (await res.json()) as MrInboxData & {
         items?: MrInboxEntry[];
+        /** N1-01：服务端扫描中途有单步失败 / 超时，列表不完整 */
+        partial?: boolean;
+        partialMessage?: string;
+        /** N1-01 粒度：partial 时没扫到的范围（合并展示用） */
+        incomplete?: MrInboxIncompleteScope;
       };
       // 服务端 200 但 status:"error"（扫描中途 meegle / 网络瞬断）同样算失败：不覆盖上次成功的列表
       if (body.status === "error") {
@@ -253,15 +289,25 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       // 把扫描期间发生的乐观操作重放到新结果上（同步段内取走队列、不留窗口）
       const patches = pendingPatchesRef.current;
       pendingPatchesRef.current = [];
-      setScanError(null);
-      setData(applyInboxPatches(fresh, patches));
+      // N1-01：「保留旧表 / 连续同类失败后合并展示 / 是否带 partial（不建基线）」全由纯函数决策
+      const decision = decideInboxScanResult<MrInboxData>({
+        prev: dataRef.current,
+        fresh: applyInboxPatches(fresh, patches),
+        partial: body.partial === true,
+        partialMessage: body.partialMessage,
+        incomplete: body.incomplete,
+        tracker: scanTrackerRef.current,
+      });
+      scanTrackerRef.current = decision.tracker;
+      setScanNotice(decision.notice);
+      setData(decision.data);
     } catch (err) {
       console.warn("[mr-inbox] 拉取失败:", err);
-      failScan(err instanceof Error ? err.message : String(err));
+      failScan(describeScanFetchError(err));
     } finally {
       pendingPatchesRef.current = [];
     }
-  }, [failScan]);
+  }, [failScan, poller]);
 
   /**
    * 刷新入口。force 遇到在飞的刷新**不丢弃**：登记一次尾随 force（多次合并成一次），
@@ -281,25 +327,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
     [scanOnce],
   );
 
-  useEffect(() => {
-    void refresh();
-    const tick = () => {
-      if (document.visibilityState !== "visible") return;
-      void refresh();
-    };
-    const interval = setInterval(tick, MR_INBOX_POLL_INTERVAL_MS);
-    const onVisible = () => {
-      if (document.visibilityState !== "visible") return;
-      if (Date.now() - lastFetchAtRef.current >= MR_INBOX_POLL_INTERVAL_MS) {
-        void refresh();
-      }
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [refresh]);
+  useEffect(() => poller.start(() => void refresh()), [poller, refresh]);
 
   const setSeen = useCallback(async (url: string, seen: boolean) => {
     // 分组各用各的 key：MR→mrUrl、bug→bugUrl（待回归 bug 行也带 mrUrl，不能用 ?? 串）
@@ -619,30 +647,23 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     if (!data) return;
 
-    // 降级态：清基线，下次 ok 当首轮（存量不推）
-    if (data.status !== "ok") {
-      prevUnreadKeysRef.current = null;
-      return;
-    }
-
-    const items = listUnreadInboxItems(data);
-    const prev = prevUnreadKeysRef.current;
-    const { notify, newItems } = diffInboxUnreadForNotify(prev, items);
-    prevUnreadKeysRef.current = new Set(items.map((it) => it.key));
-
-    if (!notify || newItems.length === 0) return;
-    // 与 task-attention-watcher 对齐：窗口在前台不发横幅（角标已够）
-    if (typeof document !== "undefined" && document.hasFocus()) return;
-
-    const copy = buildInboxNotifyCopy(newItems);
-    if (copy) sendTaskNotification(copy);
-  }, [data]);
+    // 「降级态清基线 / partial 残表不建基线 / 只对这份数据里的条目做差 / 基线不可信时恢复轮静默 / 前台不发」
+    // 全在 createInboxNotifyBaseline → planInboxNotify 里（N1-01，有行为测试），这里只执行它的结论。
+    const copy = notifyBaseline.settle(
+      data,
+      // 与 task-attention-watcher 对齐：窗口在前台不发横幅（角标已够）
+      typeof document !== "undefined" && document.hasFocus(),
+    );
+    // target:"inbox"：点通知后壳聚焦窗口并让页面打开收件箱面板（N1-12）
+    if (copy) sendTaskNotification({ ...copy, target: "inbox" });
+  }, [data, notifyBaseline]);
 
   const value = useMemo<MrInboxContextValue>(
     () => ({
       data,
       refreshing,
       scanError,
+      scanNotice,
       unreadCount,
       refresh,
       setSeen,
@@ -658,6 +679,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       data,
       refreshing,
       scanError,
+      scanNotice,
       unreadCount,
       refresh,
       setSeen,

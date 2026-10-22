@@ -73,9 +73,12 @@ export const clearLastWork = () => {
 
 // ---------- 输入草稿（按 task 记、发送后清；打了半段切页不丢） ----------
 
-// scope 区分同一 task 的多个输入位（chat 事件流输入岛 / 任务「跟 AI 说」条）
-// 只有「常驻输入位」才留草稿——弹窗 / 答题卡关掉就该清空、不进这套
-export type DraftScope = "reply" | "talk";
+// scope 区分同一 task 的多个输入位（chat 事件流输入岛 / 任务「跟 AI 说」条 / ask 答题卡单题）
+// 只有「常驻输入位」才留草稿——弹窗关掉就该清空、不进这套。
+// "ask"：ask_user 内联答题卡是事件流（虚拟列表）里的一项，上滚离开视口会被卸载、
+//   组件 state 全丢；它的 id 是 `${taskId}:${askId}:${questionId}`（见 lib/ask-draft），
+//   提交成功 / ask 作废后由 ask-draft 的 clear / prune 清掉，不会无限堆积。
+export type DraftScope = "reply" | "talk" | "ask";
 
 const draftKey = (scope: DraftScope, taskId: string) =>
   `flowship:draft:${scope}:${taskId}`;
@@ -205,6 +208,59 @@ export const clearAttachmentSnapshot = (
   id: string,
 ): void => {
   attachmentSnapshots.delete(attachSnapKey(scope, id));
+};
+
+// ---------- ask 答题卡草稿（单题选择态 + 按条件整体清理） ----------
+//
+// 答题卡每题的「正文 + 图」直接复用上面的通用草稿（scope = "ask"）：正文进 sessionStorage、
+// 图进附件快照 Map。这里只补两样通用草稿没有的：
+//  1. 选择态（选了哪个选项 / 是否切到「自定义回答」）——体量极小、跟图一样放模块级内存 Map
+//  2. 按 id 谓词批量清理——提交成功 / ask 作废时一次清掉某张卡（或某任务名下过期的卡）的全部草稿
+
+/** 答题卡单题的选择态；`optionId` 缺省 = 没选固定选项 */
+export interface AskChoiceDraft {
+  optionId?: string;
+  otherMode: boolean;
+}
+
+const askChoices = new Map<string, AskChoiceDraft>();
+
+/** 读单题选择态（id = `${taskId}:${askId}:${questionId}`）；没记过返回 undefined */
+export const loadAskChoice = (id: string): AskChoiceDraft | undefined =>
+  askChoices.get(id);
+
+/** 存单题选择态（点选项 / 切自定义回答时直写） */
+export const saveAskChoice = (id: string, choice: AskChoiceDraft): void => {
+  askChoices.set(id, choice);
+};
+
+/**
+ * 清掉所有满足 `match(id)` 的答题卡草稿：正文（sessionStorage）+ 图快照 + 选择态。
+ * id 是 scope="ask" 下的草稿 id（不含 scope 前缀）。
+ */
+export const clearAskDraftsWhere = (match: (id: string) => boolean): void => {
+  const s = ss();
+  if (s) {
+    const prefix = draftKey("ask", "");
+    // 先收集再删：边遍历边删会让 key(i) 下标错位
+    const doomed: string[] = [];
+    for (let i = 0; i < s.length; i++) {
+      const k = s.key(i);
+      if (k && k.startsWith(prefix) && match(k.slice(prefix.length))) {
+        doomed.push(k);
+      }
+    }
+    for (const k of doomed) s.removeItem(k);
+  }
+  const snapPrefix = attachSnapKey("ask", "");
+  for (const key of [...attachmentSnapshots.keys()]) {
+    if (key.startsWith(snapPrefix) && match(key.slice(snapPrefix.length))) {
+      attachmentSnapshots.delete(key);
+    }
+  }
+  for (const id of [...askChoices.keys()]) {
+    if (match(id)) askChoices.delete(id);
+  }
 };
 
 // 事件流滚动位置**不再记忆**（2026-10-17 用户拍板「切换对话后始终定位到最后一条 / 底部」）：

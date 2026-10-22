@@ -697,3 +697,54 @@ describe("三期注意力：diff 新增未读 + 通知文案", () => {
     expect(buildInboxNotifyCopy([])).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// N1-02：MR 状态 chip 文案（原来 8 种状态全叫「检查中」）
+// ---------------------------------------------------------------------------
+import { describeMrMergeStatus as describeMrMergeStatusN102 } from "@/lib/mr-inbox";
+
+describe("describeMrMergeStatus（N1-02）", () => {
+  const mk = (detailedMergeStatus: string, over: Partial<{ hasConflicts: boolean; mergeable: boolean }> = {}) =>
+    describeMrMergeStatusN102({
+      detailedMergeStatus,
+      hasConflicts: false,
+      mergeable: false,
+      ...over,
+    });
+
+  it("真实 GitLab 状态各有自己的中文文案，不再统一叫「检查中」", () => {
+    const table: Array<[string, string]> = [
+      ["draft_status", "草稿"],
+      ["ci_must_pass", "CI 未通过"],
+      ["ci_still_running", "CI 进行中"],
+      ["not_approved", "待审批"],
+      ["discussions_not_resolved", "讨论未解决"],
+      ["need_rebase", "需 rebase"],
+      ["blocked_status", "被阻塞"],
+      ["requested_changes", "被要求修改"],
+    ];
+    for (const [status, label] of table) {
+      expect(mk(status).label).toBe(label);
+    }
+    const labels = new Set(table.map(([s]) => mk(s).label));
+    expect(labels.size).toBe(table.length);
+    expect(labels.has("检查中")).toBe(false);
+  });
+
+  it("tone：CI 失败 / 阻塞 danger，草稿 muted，CI 运行中 warn", () => {
+    expect(mk("ci_must_pass").tone).toBe("danger");
+    expect(mk("blocked_status").tone).toBe("danger");
+    expect(mk("draft_status").tone).toBe("muted");
+    expect(mk("ci_still_running").tone).toBe("warn");
+  });
+
+  it("旧行为保留：冲突 / 可合并优先；checking / unchecked / 未知值回落「检查中」并带原文", () => {
+    expect(mk("conflict", { hasConflicts: true })).toMatchObject({ label: "有冲突", tone: "danger" });
+    expect(mk("mergeable", { mergeable: true })).toMatchObject({ label: "可合并", tone: "ok" });
+    // 冲突优先于可合并（与旧 chip 顺序一致）
+    expect(mk("x", { hasConflicts: true, mergeable: true }).label).toBe("有冲突");
+    expect(mk("checking")).toMatchObject({ label: "检查中", hint: "checking" });
+    expect(mk("unchecked").label).toBe("检查中");
+    expect(mk("some_future_status")).toMatchObject({ label: "检查中", hint: "some_future_status" });
+  });
+});

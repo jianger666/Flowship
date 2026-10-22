@@ -4,7 +4,7 @@
  * 算法：`JSON.stringify([text, imagePaths, attachmentPaths, skills])` → FNV-1a 短 hash。
  * 身份仲裁只认 itemId + fingerprint，文案不参与。
  *
- * imagePaths：两端统一 `imageKeysFromPayloads`（filename 或 mime+len）；
+ * imagePaths：两端统一 `imageKeysFromPayloads`（filename 或 mime + len + 内容 hash）；
  * server claim 优先信 client POST 的 `payloadFingerprint`，缺失时用本函数兜底。
  */
 
@@ -50,7 +50,10 @@ export const computeChatPayloadFingerprint = (
 
 /**
  * ImagePayload → imagePaths 键（发送前尚无落盘 path）。
- * 优先 filename；否则 mimeType + data 长度（不把整段 base64 打进指纹）。
+ * 「filename（没有则 mimeType）+ data 长度 + 内容 hash」：不把整段 base64 打进指纹，但内容要参与——
+ * 粘贴的截图文件名恒为 `image.png`，只认文件名 / 长度会把「另一张同名截图」当成上一条 uncertain
+ * 消息的重试：复用 itemId → 服务端判已受理 → 这条从未发送、草稿被清、无提示（V1-03）。
+ * 与 task 通道 `talkSendFingerprint`（mime + 文件名 + 长度 + 内容 hash）同口径。
  */
 export const imageKeysFromPayloads = (
   images?: ReadonlyArray<{
@@ -61,8 +64,9 @@ export const imageKeysFromPayloads = (
 ): string[] =>
   (images ?? []).map((img, i) => {
     const name = img.filename?.trim();
-    if (name) return name;
-    return `${img.mimeType}:len${img.data.length}:${i}`;
+    const content = `len${img.data.length}:${shortStableHash(img.data)}`;
+    if (name) return `${name}:${content}`;
+    return `${img.mimeType}:${content}:${i}`;
   });
 
 /** 从发送参数算指纹（chat-view / sendChatReply 共用） */

@@ -177,7 +177,7 @@ export const WorkspaceActions = ({ task }: Props) => {
       return (
         <>
           <span className="inline-flex items-center gap-1 px-1 text-xs text-muted-foreground">
-            <span className="size-1.5 animate-pulse rounded-full bg-success" />
+            <span className="size-1.5 rounded-full bg-success" />
             预览中
           </span>
           {mine.url && (

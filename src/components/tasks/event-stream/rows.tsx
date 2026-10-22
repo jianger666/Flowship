@@ -63,15 +63,28 @@ import {
   SelectionFloatButton,
   useSelectionFloat,
 } from "@/components/ui/selection-float";
+import { useRowViewState } from "@/hooks/use-row-view-state";
 import { useShareToGroup } from "@/hooks/use-share-to-group";
+import {
+  ROW_VIEW_FIELD,
+  eventRowViewKey,
+  userEditViewKeys,
+} from "@/lib/row-view-keys";
 import {
   extractAskQuestions,
   isAskExpired,
   isAskSkipped,
   isAskSuperseded,
 } from "@/lib/ask-pending";
-import type { PendingBubbleMode } from "@/lib/chat-pending-display";
 import {
+  askReplyDisplaySummary,
+  askReplyDisplayBlocks,
+  askReplyDisplayText,
+} from "@/lib/ask-reply-display";
+import type { PendingBubbleMode } from "@/lib/chat-pending-display";
+import { extractDroppedAttachments } from "@/lib/dropped-queue-notice";
+import {
+  extractDroppedTexts,
   isMarkdownUserReply,
   isScheduleUserReply,
   shouldCollapseUserMessage,
@@ -89,16 +102,17 @@ import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { pathBasename } from "@/lib/path-utils";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { useJumpIde, useSubmitShortcut } from "@/hooks/use-settings";
-import { ACTION_LABEL_SHORT } from "@/lib/task-display";
+import { actionTagLabel } from "@/lib/task-display";
 import { isInTurnToolErrorEvent } from "@/lib/tool-display";
 import {
   JUMP_IDE_LABEL,
-  type ActionType,
   type Task,
   type TaskEvent,
 } from "@/lib/types";
 
+import { AskQuestionsReadonly } from "./ask-questions-readonly";
 import { Collapse } from "./collapse";
+import { DroppedQueueCard } from "./dropped-queue-card";
 import { ErrorCard } from "./error-card";
 import { LiveThinkingTail } from "./live-thinking-tail";
 import {
@@ -127,6 +141,8 @@ const QUOTE_MAX_LENGTH = 1000;
 
 interface ProcessEventRowProps {
   ev: TaskEvent;
+  /** 展开后的正文；缺省 = ev.text（答题回执传人话层文本，见 lib/ask-reply-display） */
+  bodyText?: string;
   collapsed: boolean;
   summary: string;
   batch: ToolCallBatchItem[] | null;
@@ -142,6 +158,7 @@ interface ProcessEventRowProps {
  */
 const ProcessEventRow = ({
   ev,
+  bodyText,
   collapsed,
   summary,
   batch,
@@ -224,7 +241,7 @@ const ProcessEventRow = ({
             <SearchHighlightText
               ownerId={ev.id}
               field="body"
-              text={ev.text}
+              text={bodyText ?? ev.text}
             />
           </div>
         )}
@@ -511,6 +528,7 @@ const EventRowImpl = ({
   onEditInPlace,
   onRegenerate,
   onRewind,
+  rewindingEventId,
   onQuote,
   runActive = false,
   streaming = false,
@@ -549,6 +567,12 @@ const EventRowImpl = ({
   /** chat checkpoint 回退：仅 checkpointed user_reply + 非 running 时传 */
   onRewind?: (eventId: string) => void;
   /**
+   * 正在回退的用户消息 id（回退 / 编辑回退进行中；null / 不传 = 没有回退在飞）。
+   * 命中本行 → 「回退到这里」转圈；有任何回退在飞 → 所有行的该按钮禁用（V7-05：回退要几秒、再点只会换来
+   * 服务端「已有回退在进行中」）。
+   */
+  rewindingEventId?: string | null;
+  /**
    * chat「引用追问」：选中 AI 回复一段文字后点浮动「引用」——把选区文本回传给父、
    * 由 event-stream 前置成 markdown blockquote 写进 draft（零服务端改动）。
    * 仅 chat + canCompose 时父才传；本组件只在 assistant 分支启用选中检测。
@@ -561,7 +585,8 @@ const EventRowImpl = ({
    *
    * 流式项和定稿事件**走同一个组件、同一套外壳**，定稿事件通过 Virtuoso key 接管流式项
    * （lib/stream-handoff）——定稿那一刻只是 `streaming` true → false、`ev` 换成真事件，
-   * 正文原地从 streaming 切 static，不卸载 / 不重挂 / 不改头部高度。
+   * EventRow / MarkdownText 不卸载 / 不重挂、头部高度不变；正文里 Streamdown 恒用 streaming 模式
+   * （不切 static，否则内部整棵 Block 重挂，见 lib/streamdown-options 的 resolveStreamdownMode）。
    * 老做法是流式项用一个独立的占位组件、定稿时整段重挂载，表现就是「吐完字抖一下」。
    * 只在 assistant_message 分支生效；流式期间：不挂 hover 动作条（复制半截没意义）、
    * 不挂选区引用、log 头不可折叠（强制展开）。
@@ -571,13 +596,50 @@ const EventRowImpl = ({
   const action = ev.actionId
     ? task.actions.find((a) => a.id === ev.actionId)
     : undefined;
-  const actionType: ActionType | undefined = action?.type;
   const markdownBaseDir = action?.cwd ?? task.workCwd;
 
+  // 答题回执给人看的文本（第二轮 review V12-01）：ev.text 是写给 agent 的协议文本
+  // （开头字面 `[ASK_USER_REPLY]`、「稍后再补充」是一整段对 AI 的指令），展示层只读结构化的 meta.answers。
+  // 只有回执事件才去找配对的提问（题目用来拼「Qn: 问题」）；其它事件 O(1) 返回 null
+  const askReplyView = useMemo(() => {
+    if (ev.kind !== "ask_user_reply") return null;
+    const askId = typeof ev.meta?.askId === "string" ? ev.meta.askId : "";
+    const req = askId
+      ? task.events.find(
+          (e) => e.kind === "ask_user_request" && e.meta?.askId === askId,
+        )
+      : undefined;
+    const questions = req ? extractAskQuestions(req.meta) : undefined;
+    return {
+      text: askReplyDisplayText(ev, questions),
+      summary: askReplyDisplaySummary(ev, questions),
+    };
+  }, [ev, task.events]);
+  // 过程行 / log 卡片正文：回执用人话层，其余原样 ev.text
+  const bodyText = askReplyView?.text ?? ev.text;
+
   // 原地编辑态（仅 chat 用户消息 + onResend 存在时有意义）：
-  // editing=进入编辑、editDraft=编辑草稿（进入时用原文初始化）
-  const [editing, setEditing] = useState(false);
-  const [editDraft, setEditDraft] = useState("");
+  // editing=进入编辑、editDraft=编辑草稿（进入时用原文初始化）。
+  // 进 useRowViewState（R4-05）：Virtuoso 的 increaseViewportBy.top = 0，编辑行一滚出上沿就卸载，
+  // 原来的 useState 会把用户已敲的字连同编辑态一起丢掉（且无提示）。只有用户消息有编辑入口，
+  // 其它事件行传 null key = 不读不写存档（不让每个事件行都往 LRU 里塞两条）。
+  const editKeys =
+    ev.kind === "user_reply" ? userEditViewKeys(taskId, ev.id) : null;
+  const [editing, setEditing] = useRowViewState<boolean>(
+    editKeys?.editing ?? null,
+    false,
+  );
+  const [editDraft, setEditDraft] = useRowViewState<string>(
+    editKeys?.draft ?? null,
+    "",
+  );
+  // 只有「点编辑按钮进入」才自动聚焦；卸载后重挂恢复编辑态不能抢焦点（会把正在滚动的人拽回编辑框）
+  const autoFocusEditRef = useRef(false);
+  const closeEdit = () => {
+    autoFocusEditRef.current = false;
+    setEditing(false);
+    setEditDraft("");
+  };
   // 超长用户消息折叠展开态（Codex「显示更多」同款）：组件内 state、默认折叠
   const [userExpanded, setUserExpanded] = useState(false);
   // 编辑 / 重发飞行锁（防连点；失败时保持 editing）
@@ -612,10 +674,15 @@ const EventRowImpl = ({
   // 编辑入口：优先原地编辑（任意一条用户消息）；没有就退回「编辑后追加」（只有最后一条）
   const editHandler = onEditInPlace ?? onResend;
 
-  // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留
+  // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留。
+  // 只在真处于编辑态时才写：setter 会落存档，没在编辑的行（绝大多数）挂载时不该白写一条
   useEffect(() => {
-    if (!editHandler) setEditing(false);
-  }, [editHandler]);
+    if (!editHandler && editing) {
+      autoFocusEditRef.current = false;
+      setEditing(false);
+      setEditDraft("");
+    }
+  }, [editHandler, editing, setEditing, setEditDraft]);
 
   const runHandler = async (
     handler: typeof onResend,
@@ -721,7 +788,11 @@ const EventRowImpl = ({
   // 用户手动点开 / 收起过的保持他的选择（manualCollapsed 不随 live 变化）。
   const defaultCollapsed = !isDefaultVisible;
   const [initialCollapsed] = useState(defaultCollapsed);
-  const [manualCollapsed, setManualCollapsed] = useState<boolean | null>(null);
+  // 手动选择进存档（V2-05）：行被虚拟列表卸载再滚回来不回到默认折叠
+  const [manualCollapsed, setManualCollapsed] = useRowViewState<boolean | null>(
+    eventRowViewKey(taskId, ev.id, ROW_VIEW_FIELD.eventManualCollapsed),
+    null,
+  );
   const isLiveRow = isLiveThinkingMeta(ev);
   const autoCollapsed = autoEventCollapsed(isLiveRow, initialCollapsed);
   const collapsed = manualCollapsed ?? autoCollapsed;
@@ -729,7 +800,8 @@ const EventRowImpl = ({
 
   useEffect(() => {
     if (hasSearchHit) setManualCollapsed(false);
-  }, [hasSearchHit]);
+    // useRowViewState 的 setter 引用恒稳定，列进依赖不会多触发
+  }, [hasSearchHit, setManualCollapsed]);
 
   useEffect(() => {
     if (hasSearchHit) setUserExpanded(true);
@@ -747,14 +819,15 @@ const EventRowImpl = ({
     ? ""
     : batch
       ? `${summarize(ev.text)} ×${batchCount}`
-      : summarize(ev.text);
+      : summarize(askReplyView?.summary ?? ev.text);
   const processRow = (
     <ProcessEventRow
       ev={ev}
+      bodyText={bodyText}
       collapsed={collapsed}
       summary={summary}
       batch={batch}
-      actionTag={variant === "log" && actionType ? (ACTION_LABEL_SHORT[actionType] ?? actionType) : undefined}
+      actionTag={variant === "log" && action ? actionTagLabel(action) : undefined}
       isToolCall={isToolCall}
       isThinking={isThinking}
       onToggle={handleToggle}
@@ -773,10 +846,35 @@ const EventRowImpl = ({
         ev={ev}
         events={task.events}
         runActive={runActive}
+        eventsTruncated={task.eventsTruncated}
+        // 形态 + 工作目录：上下文超长时 chat 给「开新对话」（带上当前目录）、task 只建议换模型
+        mode={variant === "chat" ? "chat" : "task"}
+        repoPaths={task.repoPaths}
         // log 形态保留 action 归属标（跟其它 log 行一致、知道是哪个 action 挂的）
         actionTag={
-          variant === "log" && actionType
-            ? (ACTION_LABEL_SHORT[actionType] ?? actionType)
+          variant === "log" && action
+            ? actionTagLabel(action)
+            : undefined
+        }
+      />
+    );
+  }
+
+  // 排队消息被丢（run 出错 / 会话关闭清队）：服务端把完整文本放在 meta.droppedTexts（V3-05）。
+  // 以前这条 info 只会被压成一行 11px 灰色细线、用户得自己回想发过什么；有文本就画成「未送达」卡
+  //（完整展示 + 复制 + 放回输入框）。在 chat / log 分叉之前分流、两形态共用。
+  const droppedTexts = ev.kind === "info" ? extractDroppedTexts(ev.meta) : [];
+  // 纯图片 / 文件的排队条没有文字、只有附件占位（Q6-04）：同样画卡，别退回一行灰字
+  const droppedAttachments = ev.kind === "info" ? extractDroppedAttachments(ev.meta) : [];
+  if (droppedTexts.length > 0 || droppedAttachments.length > 0) {
+    return (
+      <DroppedQueueCard
+        ev={ev}
+        texts={droppedTexts}
+        attachments={droppedAttachments}
+        actionTag={
+          variant === "log" && action
+            ? actionTagLabel(action)
             : undefined
         }
       />
@@ -838,9 +936,6 @@ const EventRowImpl = ({
           text={ev.text}
           streaming={streaming}
           baseDir={markdownBaseDir}
-          searchOwnerId={ev.id}
-          // 流式项在搜索索引里的字段名是 extra0、定稿事件是 body（见 lib/event-stream-search）
-          searchField={streaming ? "extra0" : "body"}
         />
       );
       return (
@@ -869,8 +964,8 @@ const EventRowImpl = ({
                 className={cn(PROCESS_ROW_BUTTON, "mb-0.5 h-7 py-0")}
               >
                 <CollapseChevron open={!collapsed} />
-                {actionType && (
-                  <ActionTag label={ACTION_LABEL_SHORT[actionType] ?? actionType} />
+                {action && (
+                  <ActionTag label={actionTagLabel(action)} />
                 )}
                 <span className="shrink-0 text-[11px] tabular-nums">
                   {formatTs(ev.ts)}
@@ -898,7 +993,9 @@ const EventRowImpl = ({
               )}
             </>
           )}
-          {/* 正文：流式 / 定稿是同一个 MarkdownText 实例、只切 streaming（Streamdown 原地换 mode）。
+          {/* 正文：流式 / 定稿是同一个 MarkdownText 实例、只切 streaming。注意这只保证 MarkdownText 不重挂；
+              Streamdown 内部 mode 一换（streaming → static）整棵 Block 照样卸载重挂，所以 MarkdownText 对流式过的
+              实例恒用 mode="streaming"、靠 isAnimating / parseIncompleteMarkdown 表达定稿（lib/streamdown-options）。
               log 形态的手动折叠走高度动画；chat 正文永远展开、不套 Collapse（少两层 DOM） */}
           {isLog ? (
             <Collapse open={showBody}>{assistantBody}</Collapse>
@@ -922,7 +1019,7 @@ const EventRowImpl = ({
           void (async () => {
             try {
               const ok = await runEdit(trimmed, ev);
-              if (ok) setEditing(false);
+              if (ok) closeEdit();
             } finally {
               setEditSubmitting(false);
             }
@@ -933,13 +1030,13 @@ const EventRowImpl = ({
             <Textarea
               value={editDraft}
               onChange={(e) => setEditDraft(e.target.value)}
-              autoFocus
+              autoFocus={autoFocusEditRef.current}
               disabled={editSubmitting}
               className="max-h-64 min-h-[52px] resize-none border-none bg-transparent p-1.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
               onKeyDown={(e) => {
                 if (e.key === "Escape" && !e.nativeEvent.isComposing) {
                   e.preventDefault();
-                  if (!editSubmitting) setEditing(false);
+                  if (!editSubmitting) closeEdit();
                   return;
                 }
                 // 提交快捷键跟设置页偏好一致（helper 内部已处理 IME / enter vs mod-enter）
@@ -955,7 +1052,7 @@ const EventRowImpl = ({
                 size="sm"
                 className="h-7 text-xs"
                 disabled={editSubmitting}
-                onClick={() => setEditing(false)}
+                onClick={closeEdit}
               >
                 取消
               </Button>
@@ -1015,6 +1112,9 @@ const EventRowImpl = ({
                 label: "回退到这里",
                 text: "回退到这里",
                 onClick: () => onRewind?.(ev.id),
+                // 回退进行中：本行转圈、其余行禁用（V7-05）
+                busy: rewindingEventId === ev.id,
+                disabled: !!rewindingEventId,
               },
               onResend &&
                 !isScheduleMsg && {
@@ -1031,6 +1131,7 @@ const EventRowImpl = ({
                   ? "编辑（之后的对话会被替换）"
                   : "编辑后重发（原消息保留）",
                 onClick: () => {
+                  autoFocusEditRef.current = true;
                   setEditDraft(ev.text);
                   setEditing(true);
                 },
@@ -1154,8 +1255,8 @@ const EventRowImpl = ({
       return (
         <div>
           <div className="mb-1 flex items-center justify-end gap-1.5 text-[11px] text-muted-foreground">
-            {actionType && (
-              <ActionTag label={ACTION_LABEL_SHORT[actionType] ?? actionType} />
+            {action && (
+              <ActionTag label={actionTagLabel(action)} />
             )}
             <span className="tabular-nums">{formatTs(ev.ts)}</span>
           </div>
@@ -1230,8 +1331,8 @@ const EventRowImpl = ({
           className="flex w-full cursor-pointer items-center gap-2 text-left text-muted-foreground transition-colors hover:text-foreground"
         >
           <CollapseChevron open={!collapsed} />
-          {actionType && (
-            <ActionTag label={ACTION_LABEL_SHORT[actionType] ?? actionType} />
+          {action && (
+            <ActionTag label={actionTagLabel(action)} />
           )}
           <span className="shrink-0 text-[11px]">{EVENT_LABEL[ev.kind]}</span>
           <span className="shrink-0 text-[11px] tabular-nums">
@@ -1251,7 +1352,7 @@ const EventRowImpl = ({
               isNotice && "whitespace-pre-wrap",
             )}
           >
-            <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
+            <SearchHighlightText ownerId={ev.id} field="body" text={bodyText} />
           </div>
         </Collapse>
         {/* ask_user_reply 附图缩略图：折叠 / 展开都显示（图比文字更值得"始终见到"）
@@ -1383,6 +1484,17 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
     [task.events, askId],
   );
   const answered = !!replyEvent;
+  // 已答卡给人看的文本（第二轮 review V12-01）：replyEvent.text 是写给 agent 的协议文本，
+  // 展示读结构化的 meta.answers（题目来自本条提问）；「稍后再补充」不再把对 AI 的指令整段露出来
+  // Q7b-03：返回结构化块——题目走 MarkdownText、答案走纯文本容器（答案不能经 markdown：
+  // GFM 裸链接识别先于反斜杠转义，URL 答案会变坏链接）
+  const replyDisplayBlocks = useMemo(
+    () =>
+      replyEvent
+        ? askReplyDisplayBlocks(replyEvent, extractAskQuestions(ev.meta))
+        : [],
+    [replyEvent, ev.meta],
+  );
 
   // 是否已被作废：断线重启 / 换 agent / 停止时后端补一条 info 标记（判定见 lib/ask-pending）。
   // 作废的 ask 没有真实 reply、显示中性失效态、别再误导成「正在等你答」。
@@ -1446,7 +1558,7 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
         ) : answered ? (
           <CheckCircle2 className="size-4 text-success" />
         ) : (
-          <Sparkles className="size-4 animate-pulse text-brand" />
+          <Sparkles className="size-4 text-brand" />
         )}
         <span
           className={cn("font-medium", superseded && "text-muted-foreground")}
@@ -1454,13 +1566,25 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
           {superseded
             ? "这组提问已失效"
             : answered
-              ? `已回答 ${questionsCount} 个问题`
+              ? // 「稍后再补充」没有任何答案：卡头不能说「已回答」（V12-01）
+                replyEvent?.meta?.deferred === true
+                ? `${questionsCount} 个问题稍后再补充`
+                : `已回答 ${questionsCount} 个问题`
               : `AI 问了 ${questionsCount} 个问题`}
         </span>
         <span className="text-[11px] tabular-nums text-muted-foreground">
           {formatTs(ev.ts)}
         </span>
       </div>
+
+      {/* 已失效：卡头只说「这组提问已失效」、用户看不到问了什么（V6-01）——题干折叠只读放回来 */}
+      {superseded && (
+        <AskQuestionsReadonly
+          meta={ev.meta}
+          fallbackText={ev.text}
+          baseDir={task.workCwd}
+        />
+      )}
 
       {/* 未答且未失效但没走内联卡（非最新一条的脏数据残留）：中性占位、不放交互 */}
       {!answered && !superseded && (
@@ -1469,15 +1593,30 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
         </div>
       )}
 
-      {/* 已答：展示拼接好的 Q&A markdown（内陷一档：页面底色，跟外面的白卡分出层次） */}
+      {/* 已答：题目走 markdown、答案逐字纯文本（内陷一档：页面底色，跟外面的白卡分出层次） */}
       {answered && replyEvent && (
-        <div className="rounded-md border bg-background px-3 py-2 text-sm">
-          <MarkdownText
-            text={replyEvent.text}
-            baseDir={task.workCwd}
-            searchOwnerId={replyEvent.id}
-            searchField="body"
-          />
+        <div className="flex flex-col gap-2 rounded-md border bg-background px-3 py-2 text-sm">
+          {replyDisplayBlocks.map((b, i) =>
+            b.kind === "plain" ? (
+              <p key={i} className="whitespace-pre-wrap break-words">
+                {b.text}
+              </p>
+            ) : (
+              <div key={i} className="flex flex-col gap-1">
+                {b.question !== null ? (
+                  <MarkdownText
+                    text={`${b.label}: ${b.question}`}
+                    baseDir={task.workCwd}
+                  />
+                ) : (
+                  <p className="font-mono text-[11px] text-muted-foreground">
+                    {b.label}
+                  </p>
+                )}
+                <p className="whitespace-pre-wrap break-words">{b.answer}</p>
+              </div>
+            ),
+          )}
         </div>
       )}
     </div>

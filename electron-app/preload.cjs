@@ -44,8 +44,17 @@ contextBridge.exposeInMainWorld("__appUpdater", {
 // 任务注意力通知（v0.9.5）：页面发现任务转入「等你回复 / 提问 / 失败」且窗口不在前台
 // 时发系统通知；点通知壳聚焦窗口并回传 taskId、页面自己跳详情页
 contextBridge.exposeInMainWorld("__notify", {
-  /** @param {{ title: string, body?: string, taskId?: string }} payload */
+  /** @param {{ title: string, body?: string, taskId?: string, target?: "inbox" }} payload */
   send: (payload) => ipcRenderer.send("task-notify", payload),
+  /**
+   * 订阅「点了带 target 的通知」（N1-12：target:"inbox" → 页面打开收件箱）。返回取消订阅函数。
+   * @param {(target: string) => void} callback
+   */
+  onTargetClick: (callback) => {
+    const listener = (_event, target) => callback(target);
+    ipcRenderer.on("notify-target-click", listener);
+    return () => ipcRenderer.removeListener("notify-target-click", listener);
+  },
   /**
    * 订阅「用户点了通知」——回传 taskId、页面 router.push 跳过去。返回取消订阅函数。
    * @param {(taskId: string) => void} callback

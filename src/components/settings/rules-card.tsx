@@ -189,7 +189,7 @@ export const RulesCard = () => {
     const cur = new Set(s.disabledRules ?? []);
     if (enabled) cur.delete(name);
     else cur.add(name);
-    const ok = await saveSettings({ ...s, disabledRules: [...cur] });
+    const ok = await saveSettings({ ...s, disabledRules: [...cur] }, ["disabledRules"]);
     if (!ok) {
       // S13-12：保存失败回滚 UI——否则开关停在新状态、实际仍是旧值、重进页面才发现
       setRules((prev) =>

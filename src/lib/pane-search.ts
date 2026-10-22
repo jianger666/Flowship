@@ -18,9 +18,22 @@ export const setActivePaneSearchScope = (scope: PaneSearchScope): void => {
 export const getActivePaneSearchScope = (): PaneSearchScope | null =>
   activeScope;
 
+/**
+ * 任务页的产物栏当前是不是折叠的（页面在折叠 / 展开 / 卸载时写入）。
+ * 折叠态面板子树仍挂载（只是宽度 0），Cmd/Ctrl+F 若还路由到产物栏，输入会落进看不见的搜索框（第三轮 R9a-01）。
+ */
+let artifactPaneCollapsed = false;
+
+export const setArtifactPaneCollapsed = (collapsed: boolean): void => {
+  artifactPaneCollapsed = collapsed;
+};
+
+export const isArtifactPaneCollapsed = (): boolean => artifactPaneCollapsed;
+
 /** 测试 / 路由默认：重置作用域记忆 */
 export const resetActivePaneSearchScope = (): void => {
   activeScope = null;
+  artifactPaneCollapsed = false;
 };
 
 export const isTaskDetailPath = (pathname: string): boolean =>
@@ -34,10 +47,13 @@ export const isTaskDetailPath = (pathname: string): boolean =>
 export const resolvePaneSearchScope = (
   scope: PaneSearchScope | null,
   pathname: string,
+  /** 产物栏已折叠：落到产物栏的结果改路由到事件流（唯一看得见的栏） */
+  artifactCollapsed = false,
 ): PaneSearchScope | null => {
   if (!isTaskDetailPath(pathname)) return null;
-  if (scope === "event-stream" || scope === "artifact") return scope;
-  return "artifact";
+  const resolved: PaneSearchScope =
+    scope === "event-stream" || scope === "artifact" ? scope : "artifact";
+  return artifactCollapsed && resolved === "artifact" ? "event-stream" : resolved;
 };
 
 export const dispatchArtifactSearchFocus = (): void => {

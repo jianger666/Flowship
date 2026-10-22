@@ -12,14 +12,17 @@ import {
   parseToolArgsJson,
   parseUnifiedDiff,
   todoListSummary,
+  toolBlockArgsTruncatedHint,
   toolBlockDefaultCollapsed,
   toolBlockAutoCollapsed,
+  toolBlockDetailLine,
   toolBlockExpandedArgsPreview,
   toolBlockSummary,
   type ToolBlock,
   type ToolVerbGroup,
   verbGroupLabel,
 } from "../src/lib/tool-display";
+import { truncate } from "../src/lib/server/task-stream";
 import type { TaskEvent } from "../src/lib/types";
 
 const ev = (
@@ -350,6 +353,66 @@ describe("toolBlockSummary 人类可读解析", () => {
     );
   });
 
+  // V4-05：Cursor SDK 的 glob 工具 args 是 camelCase（tool-call-types.d.ts：globPattern / targetDirectory），
+  // prompts/_super.md 也这么教模型，pi 桥 `prepareGlobArgs` 同时认两种。摘要只认 snake_case 时折叠行看不出在找什么。
+  it("glob：camelCase 的 globPattern 显示 pattern（SDK / pi 真实形状）", () => {
+    const args = JSON.stringify({
+      globPattern: "**/*.test.ts",
+      targetDirectory: "/repo/tests",
+    });
+    expect(toolBlockSummary(block({ name: "glob", args }))).toBe("**/*.test.ts");
+  });
+
+  it("glob：只有 targetDirectory 时退到目录；snake_case 老形状不回归", () => {
+    expect(
+      toolBlockSummary(
+        block({
+          name: "glob",
+          args: JSON.stringify({ targetDirectory: "/repo/src" }),
+        }),
+      ),
+    ).toBe("/repo/src");
+    expect(
+      toolBlockSummary(
+        block({
+          name: "glob",
+          args: JSON.stringify({ glob_pattern: "*.md", target_directory: "/r" }),
+        }),
+      ),
+    ).toBe("*.md");
+  });
+
+  it("grep：camelCase 的 targetDirectory 也算搜索范围", () => {
+    const args = JSON.stringify({
+      pattern: "needle",
+      targetDirectory: "/repo/src",
+    });
+    expect(toolBlockSummary(block({ name: "grep", args }))).toBe(
+      "/needle/ /repo/src",
+    );
+  });
+
+  it("未映射工具的通用兜底也认 globPattern；args 被截断时前缀里的 globPattern 照样抠得出", () => {
+    expect(
+      toolBlockSummary(
+        block({
+          name: "some_mcp_search",
+          args: JSON.stringify({ globPattern: "src/**/*.tsx" }),
+        }),
+      ),
+    ).toBe("src/**/*.tsx");
+    const long = JSON.stringify({
+      globPattern: "src/**/*.tsx",
+      targetDirectory: "/repo",
+      note: "n".repeat(900),
+    });
+    const truncated = `${long.slice(0, 500)}…(truncated ${long.length - 500} chars)`;
+    expect(parseToolArgsJson(truncated)).toBeNull();
+    expect(toolBlockSummary(block({ name: "glob", args: truncated }))).toBe(
+      "src/**/*.tsx",
+    );
+  });
+
   it("edit 显示 filePath +N/−M", () => {
     const diff = ["--- a/f", "+++ b/f", "-a", "+b", "+c"].join("\n");
     const s = toolBlockSummary(
@@ -385,6 +448,142 @@ describe("toolBlockSummary 人类可读解析", () => {
     expect(
       toolBlockSummary(block({ name: "unknown", args: "plain text cmd" })),
     ).toBe("plain text cmd");
+  });
+});
+
+/**
+ * V4-01：工具参数被服务端 truncate 后（`…(truncated N chars)`）摘要必须仍可读。
+ * 旧测试漏网是因为 helper 的 text 写成字面量「调用」、args 又是完整 JSON；
+ * 真实事件是 `text = 调用 shell:{…前 120 字符}`、`meta.args = 前 N 字符 + …(truncated K chars)`。
+ * 这里用服务端同一个 `truncate` + 真实事件形状，经 mergeToolDisplayEvents 走完整配对再断言。
+ */
+describe("V4-01：参数被截断后的摘要（真实事件形状）", () => {
+  /** 与 sdk-message-handler 落盘一致：text 截 120、meta.args 截 max */
+  const realCall = (
+    name: string,
+    args: Record<string, unknown>,
+    opts: { max?: number; result?: Record<string, unknown> } = {},
+  ): ToolBlock => {
+    const argsStr = JSON.stringify(args);
+    const call = ev({
+      id: "call1",
+      kind: "tool_call",
+      text: `调用 ${name}:${truncate(argsStr, 120)}`,
+      meta: {
+        callId: "cc1",
+        name,
+        args: truncate(argsStr, opts.max ?? 500),
+      },
+    });
+    const events = [call];
+    if (opts.result) {
+      events.push(
+        ev({
+          id: "res1",
+          kind: "tool_result",
+          text: `工具完成 ${name}`,
+          ts: 2,
+          meta: {
+            callId: "cc1",
+            name,
+            status: "success",
+            output: "",
+            ...opts.result,
+          },
+        }),
+      );
+    }
+    const out = mergeToolDisplayEvents(events);
+    expect(out).toHaveLength(1);
+    return out[0] as ToolBlock;
+  };
+
+  const heredoc = `cd /repo && python3 - <<'PY'\n${"print('hello world')\n".repeat(60)}PY`;
+
+  it("shell heredoc 超 500 字符：运行中摘要是 `$ 命令前缀`，不是裸 `调用 shell:{…`", () => {
+    const b = realCall("shell", { command: heredoc, working_directory: "/repo" });
+    expect(b.args).toMatch(/…\(truncated \d+ chars\)$/);
+    expect(parseToolArgsJson(b.args)).toBeNull(); // 前提：整段 JSON 确实 parse 不了
+    const s = toolBlockSummary(b);
+    expect(s.startsWith("$ cd /repo && python3 - <<'PY'")).toBe(true);
+    expect(s).not.toContain('{"command"');
+    expect(s).not.toContain("调用");
+  });
+
+  it("shell 完成后：摘要仍是命令，不退化成输出首行（修前是 `hello world`）", () => {
+    const b = realCall(
+      "shell",
+      { command: heredoc },
+      { result: { output: "hello world\nhello world\n", exitCode: 0 } },
+    );
+    const s = toolBlockSummary(b);
+    expect(s).not.toBe("hello world");
+    expect(s.startsWith("$ cd /repo")).toBe(true);
+    // 展开区「一层」同样是命令
+    expect(toolBlockDetailLine(b)?.startsWith("$ cd /repo")).toBe(true);
+  });
+
+  it("命令本体被截断 → 摘要尾带 …、提示「命令过长已截断」；命令完整 → 不提示", () => {
+    const cut = realCall("shell", { command: heredoc });
+    expect(toolBlockSummary(cut).endsWith("…")).toBe(true);
+    expect(toolBlockArgsTruncatedHint(cut)).toBe("命令过长已截断");
+
+    // 命令完整、只是后面的短字段被截（command 在前、尾部字段溢出）→ 命令是全的，不报截断
+    const tail = realCall("shell", {
+      command: "pnpm test",
+      description: "x".repeat(900),
+    });
+    expect(tail.args).toMatch(/…\(truncated \d+ chars\)$/);
+    expect(toolBlockSummary(tail)).toBe("$ pnpm test");
+    expect(toolBlockArgsTruncatedHint(tail)).toBeNull();
+
+    // 根本没截断
+    const short = realCall("shell", { command: "ls" });
+    expect(toolBlockSummary(short)).toBe("$ ls");
+    expect(toolBlockArgsTruncatedHint(short)).toBeNull();
+  });
+
+  it("展开区「一层」命令不再被摘要的 500 字符上限吃掉（服务端放宽到 4000 后能看到更多）", () => {
+    const long = `echo ${"a".repeat(1500)}`;
+    const b = realCall("shell", { command: long }, { max: 4000 });
+    expect(b.args).not.toMatch(/truncated/);
+    const detail = toolBlockDetailLine(b);
+    expect(detail?.length).toBe(`$ ${long}`.length);
+    expect(toolBlockArgsTruncatedHint(b)).toBeNull();
+  });
+
+  it("JSON 转义在截断前缀里单遍还原：Windows 路径 C:\\new\\temp 不会被误还原成换行 + ew", () => {
+    const cmd = `dir "C:\\new\\temp" && echo ${"z".repeat(700)}`;
+    const b = realCall("shell", { command: cmd });
+    const s = toolBlockSummary(b);
+    expect(s.startsWith('$ dir "C:\\new\\temp" && echo zzz')).toBe(true);
+  });
+
+  it("write：关键字段 path 前置后，即使 content 超长被截断，摘要仍是路径", () => {
+    // 服务端新形状：path 在前、content 在后
+    const b = realCall("write", {
+      path: "/repo/src/big.ts",
+      content: "x".repeat(2000),
+    });
+    expect(b.args).toMatch(/…\(truncated \d+ chars\)$/);
+    expect(toolBlockSummary(b)).toBe("/repo/src/big.ts");
+    // path 完整 → 没有「命令过长」提示
+    expect(toolBlockArgsTruncatedHint(b)).toBeNull();
+  });
+
+  it("grep：pattern 在截断前缀里照样出摘要", () => {
+    const b = realCall("grep", {
+      pattern: "needle",
+      path: "/repo/src",
+      glob: "*.ts".repeat(300),
+    });
+    expect(toolBlockSummary(b)).toBe("/needle/ /repo/src");
+  });
+
+  it("截断前缀里一个可抠的字段都没有（command 被挤到窗口外）→ 退回旧兜底、不抛错、不报「命令过长」", () => {
+    const b = realCall("shell", { description: "d".repeat(900), command: "ls" });
+    expect(toolBlockSummary(b)).toBe(b.text);
+    expect(toolBlockArgsTruncatedHint(b)).toBeNull();
   });
 });
 
@@ -667,6 +866,50 @@ describe("parseTodoToolArgs / updateTodos 合并", () => {
       { content: "A", status: "completed" },
       { content: "B", status: "pending" },
       { content: "", status: "in_progress" },
+    ]);
+  });
+
+  it("V4-06：Cursor SDK 真实形状 inProgress（驼峰）→ in_progress，不再掉成 pending", () => {
+    // 形状取自真实 events.jsonl 的 updateTodos 产出：status 是 completed / inProgress / pending
+    const args = JSON.stringify({
+      todos: [
+        { content: "核实前提", status: "completed" },
+        { content: "实现 store", status: "inProgress" },
+        { content: "单测", status: "pending" },
+      ],
+    });
+    expect(parseTodoToolArgs(args)).toEqual([
+      { content: "核实前提", status: "completed" },
+      { content: "实现 store", status: "in_progress" },
+      { content: "单测", status: "pending" },
+    ]);
+  });
+
+  it("V4-06：status 大小写 / 连字符 / 空白变体都归一（IN_PROGRESS / in-progress / In Progress）", () => {
+    for (const raw of ["IN_PROGRESS", "in-progress", "In Progress", "inprogress"]) {
+      const got = parseTodoToolArgs({ todos: [{ content: "x", status: raw }] });
+      expect(got, raw).toEqual([{ content: "x", status: "in_progress" }]);
+    }
+    // 其它枚举也走同一条归一化路径：Completed / CANCELLED 不再因大小写掉成 pending
+    expect(
+      parseTodoToolArgs({
+        todos: [
+          { content: "a", status: "Completed" },
+          { content: "b", status: "CANCELLED" },
+        ],
+      }),
+    ).toEqual([
+      { content: "a", status: "completed" },
+      { content: "b", status: "cancelled" },
+    ]);
+  });
+
+  it("V4-06：截断 JSON 前缀里的 inProgress 条目同样归一", () => {
+    const partial =
+      '{"todos":[{"content":"一","status":"completed"},{"content":"二","status":"inProgress"},{"content":"三未闭合';
+    expect(parseTodoToolArgs(partial)).toEqual([
+      { content: "一", status: "completed" },
+      { content: "二", status: "in_progress" },
     ]);
   });
 

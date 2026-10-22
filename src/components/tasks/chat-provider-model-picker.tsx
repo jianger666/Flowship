@@ -15,7 +15,7 @@ import {
   getModelCredsForProvider,
   hasModelCredsForProvider,
   isProviderSwitchLocked,
-  resolveTaskProvider,
+  resolveTaskProviderForPicker,
 } from "@/lib/agent-provider";
 import { getSettings } from "@/lib/local-store";
 import { setTaskModel } from "@/lib/task-store";
@@ -46,7 +46,8 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
   const settings = getSettings();
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
-  const providerId = resolveTaskProvider(task, settings);
+  // 绑定的条目已删除时是悬空 id（下拉显示「请重选」，选任意一家都会触发切换）
+  const providerId = resolveTaskProviderForPicker(task, settings);
 
   const current: ModelSelection = useMemo(() => {
     if (task.model?.id?.trim()) return task.model;
@@ -71,16 +72,21 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
   }, [providerId, fetchModels]);
 
   const busy = task.runStatus === "running" || savingProvider;
-  // V1：chat 空闲就露提供方（发过消息也行）；running 由 busy 禁掉，后端再判一次。
-  const showProvider = !isProviderSwitchLocked(task);
+  // V1：chat 一直露提供方（发过消息也行），running 只走 `disabled`（由 busy 灰掉），后端再判一次。
+  // 以前这里用 `!isProviderSwitchLocked(task)` 当「显不显示」：每轮开始 / 结束提供方下拉整个卸载 / 冒出，
+  // 模型框左移再回弹（每轮抖两次），运行中也看不出「当前在用哪家」（第二轮 review V5-04）。
+  const showProvider = true;
+  // 真正能不能切仍以锁判据为准（running 会被 busy 灰掉、handleProviderChange 再拦一次）
+  const switchLocked = isProviderSwitchLocked(task);
 
   const handleProviderChange = async (nextId: string) => {
-    if (!showProvider || !nextId || nextId === providerId) return;
+    if (!nextId || nextId === providerId) return;
     // 硬约束 1：running 中禁止切，前端先拦（后端 setTaskProvider 还会再判）。
     if (task.runStatus === "running") {
       toast.error("正在运行中，不能切换提供方，等停下来再切");
       return;
     }
+    if (switchLocked) return;
     const latest = await switchProvider(nextId);
     if (latest) pull(nextId);
   };
@@ -108,6 +114,10 @@ export const ChatProviderModelPicker = ({ task, onTaskUpdate }: Props) => {
       selection={current}
       onModelChange={(next) => void handleModelChange(next)}
       disabled={busy}
+      // 运行中灰掉提供方时说明原因（V5-04：以前是整个卸载，用户看不出「现在在用哪家」也不知道为什么没了）
+      providerDisabledReason={
+        task.runStatus === "running" ? "AI 运行中不能切换提供方，等它停下来再切" : undefined
+      }
       differFromSettingsHint={showProvider}
       onModelOpenChange={(open) => {
         if (open && models.length === 0) pull(providerId);

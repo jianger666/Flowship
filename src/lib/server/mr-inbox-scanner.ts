@@ -11,8 +11,9 @@
  *
  * 按 settings.userRole 决定扫哪些组（fe/be 只扫 myBugs；qa 扫 MR+待回归；未设全扫）。
  *
- * 容错：单条失败 console.warn 跳过；meegle 未装/未登录结构化降级。
- * 缓存 TTL 10 分钟 + single-flight（只缓存 ok）；切默认空间时 invalidate。
+ * 容错：单条失败 console.warn 跳过**并记入 failures**——本轮有失败 / 超总时限 → 结果带 `partial:true`
+ * （N1-01 / N1-15）：不进缓存、不让客户端当成「完整的一轮」；meegle 未装/未登录结构化降级。
+ * 缓存 TTL 见 MR_INBOX_CACHE_TTL_MS（略小于轮询间隔）+ single-flight（只缓存完整 ok）；切默认空间时 invalidate。
  */
 
 import {
@@ -27,6 +28,8 @@ import {
   isSafeGitlabHost,
   isWorkitemReadyForQaInbox,
   MR_INBOX_CACHE_TTL_MS,
+  MR_INBOX_SCAN_DEADLINE_MS,
+  buildMrInboxPartialMessage,
   parseGitlabMrUrl,
   parseMoqlBugQueryResponse,
   pickLatestMrUrlFromComments,
@@ -34,6 +37,8 @@ import {
   stripBugMrFields,
   truncateCommentSnippet,
   type InboxGroupId,
+  type MrInboxFailureKind,
+  type MrInboxIncompleteScope,
   type MrInboxMrDetail,
   type MrUrlCandidate,
 } from "@/lib/mr-inbox";
@@ -180,6 +185,14 @@ export type MrInboxScanResult =
       pendingRegression: BugInboxItem[];
       scannedAt: number;
       gitTokenConfigured: boolean;
+      /**
+       * 本轮扫描不完整（中途有单步失败 / 超总时限）：列表可能少几条，不进缓存；
+       * 客户端据此保留旧表、不触发「新增」通知（N1-01 / N1-15）。
+       */
+      partial?: boolean;
+      partialMessage?: string;
+      /** partial 时「哪些范围没扫到」：客户端连续多轮同类失败后据此合并展示（N1-01 粒度） */
+      incomplete?: MrInboxIncompleteScope;
     }
   | { status: "not_installed" | "not_authed" | "error"; message: string };
 
@@ -282,6 +295,13 @@ export const getMrInbox = async (
       if (result.status === "ok") {
         // 扫描可能早于用户合并/流转启动：落库前套补丁，调用方拿到的也是套用后的
         const patched = applyRecentMutations(result);
+        if (patched.partial) {
+          // N1-01：不完整的一轮绝不落缓存（否则「少几条」被固化一个 TTL）。
+          // 返回**本轮真实扫到的部分** + 没扫到的范围（incomplete）：旧表由客户端持有——
+          // 它决定「保留旧表」还是「连续多轮同类失败后合并展示」（服务端若偷换成旧缓存，
+          // 永久性失败就永远只能冻结在上次完整结果上，看不到新增条目）。
+          return patched;
+        }
         state.cache = { at: Date.now(), result: patched };
         return patched;
       }
@@ -387,6 +407,73 @@ interface CandidateWithItem extends MrUrlCandidate {
   workItemUrl?: string;
 }
 
+/**
+ * 一轮扫描的失败记录 + 总 deadline（N1-01 / N1-15）。
+ * 每个 `try/catch → continue` 的单步失败都要 `fail()`，否则「少几条」会被当成完整结果缓存。
+ */
+export interface ScanContext {
+  failures: string[];
+  /** 失败类别（去重）：客户端据此判断「连续几轮同一类失败」 */
+  kinds: Set<MrInboxFailureKind>;
+  /** 没扫到的范围（合并展示时只沿用落在这些范围里的旧条目） */
+  workItemIds: Set<string>;
+  scheduleProjectKeys: Set<string>;
+  myBugsProjectKeys: Set<string>;
+  pendingRegressionProjectKeys: Set<string>;
+  /** 绝对时间 ms；超过后各循环提前收尾 */
+  deadlineAt: number;
+  timedOut: boolean;
+}
+
+const createScanContext = (
+  now: number = Date.now(),
+  deadlineMs: number = MR_INBOX_SCAN_DEADLINE_MS,
+): ScanContext => ({
+  failures: [],
+  kinds: new Set(),
+  workItemIds: new Set(),
+  scheduleProjectKeys: new Set(),
+  myBugsProjectKeys: new Set(),
+  pendingRegressionProjectKeys: new Set(),
+  deadlineAt: now + deadlineMs,
+  timedOut: false,
+});
+
+/** 记一次单步失败（文案 + 类别）；范围另由调用方往 ctx 的各 Set 里加 */
+const recordFailure = (
+  ctx: ScanContext,
+  kind: MrInboxFailureKind,
+  message: string,
+): void => {
+  ctx.failures.push(message);
+  ctx.kinds.add(kind);
+};
+
+/** 超总时限则记一次失败并返回 true（循环里 `if (overDeadline(ctx)) break;`） */
+const overDeadline = (ctx: ScanContext): boolean => {
+  if (ctx.timedOut) return true;
+  if (Date.now() < ctx.deadlineAt) return false;
+  ctx.timedOut = true;
+  recordFailure(ctx, "deadline", "超过扫描总时限、仅返回已扫到的部分");
+  return true;
+};
+
+/** 把 ctx 里累计的失败范围整理成返回给客户端的 incomplete（无失败返回 undefined） */
+const buildIncompleteScope = (
+  ctx: ScanContext,
+): MrInboxIncompleteScope | undefined => {
+  if (ctx.failures.length === 0) return undefined;
+  return {
+    kinds: [...ctx.kinds],
+    // 超总时限：没法精确说出哪些没扫到 → 全部未知
+    ...(ctx.timedOut ? { all: true } : {}),
+    workItemIds: [...ctx.workItemIds],
+    scheduleProjectKeys: [...ctx.scheduleProjectKeys],
+    myBugsProjectKeys: [...ctx.myBugsProjectKeys],
+    pendingRegressionProjectKeys: [...ctx.pendingRegressionProjectKeys],
+  };
+};
+
 /** 拼「经办人 / 报告人 = 当前登录人」+ 状态 in 白名单的 MQL */
 const buildBugMql = (
   projectKey: string,
@@ -413,6 +500,7 @@ const scanPendingMr = async (
   simpleNames: Map<string, string>,
   gitToken: string,
   allowedHosts: ReadonlySet<string>,
+  ctx: ScanContext,
 ): Promise<MrInboxItem[]> => {
   const from = Date.now() - 60 * DAY_MS;
   const to = Date.now() + 30 * DAY_MS;
@@ -420,6 +508,7 @@ const scanPendingMr = async (
   const workitems: Array<{ id: string; name: string; projectKey: string }> = [];
   const seenIds = new Set<string>();
   for (const project of projects) {
+    if (overDeadline(ctx)) break;
     try {
       const items = await fetchUserSchedule(project.key, myKey, from, to);
       for (const it of items) {
@@ -428,6 +517,8 @@ const scanPendingMr = async (
         workitems.push({ id: it.id, name: it.name, projectKey: project.key });
       }
     } catch (err) {
+      recordFailure(ctx, "schedule", `空间 ${project.name} 排期拉取失败`);
+      ctx.scheduleProjectKeys.add(project.key);
       console.warn(
         `[mr-inbox] 空间 ${project.name}(${project.key}) 排期拉取失败、跳过:`,
         err instanceof Error ? err.message : err,
@@ -437,10 +528,13 @@ const scanPendingMr = async (
 
   const hits: typeof workitems = [];
   for (const wi of workitems) {
+    if (overDeadline(ctx)) break;
     try {
       const nodes = await fetchWorkitemNodes(wi.id, wi.projectKey);
       if (isWorkitemReadyForQaInbox(nodes)) hits.push(wi);
     } catch (err) {
+      recordFailure(ctx, "nodes", `工作项 ${wi.id} 节点拉取失败`);
+      ctx.workItemIds.add(wi.id);
       console.warn(
         `[mr-inbox] 工作项 ${wi.id} 节点拉取失败、跳过:`,
         err instanceof Error ? err.message : err,
@@ -450,6 +544,7 @@ const scanPendingMr = async (
 
   const candidates: CandidateWithItem[] = [];
   for (const wi of hits) {
+    if (overDeadline(ctx)) break;
     try {
       const comments = await fetchWorkitemComments(wi.id, wi.projectKey);
       const simple = simpleNames.get(wi.projectKey);
@@ -472,6 +567,8 @@ const scanPendingMr = async (
         }
       }
     } catch (err) {
+      recordFailure(ctx, "comments", `工作项 ${wi.id} 评论拉取失败`);
+      ctx.workItemIds.add(wi.id);
       console.warn(
         `[mr-inbox] 工作项 ${wi.id} 评论拉取失败、跳过:`,
         err instanceof Error ? err.message : err,
@@ -553,9 +650,11 @@ const scanBugsForRole = async (
   host: string | undefined,
   simpleNames: Map<string, string>,
   userKey: string,
+  ctx: ScanContext,
 ): Promise<BugInboxItem[]> => {
   const byUrl = new Map<string, BugInboxItem>();
   for (const project of projects) {
+    if (overDeadline(ctx)) break;
     try {
       const mql = buildBugMql(project.key, roleField, statusLabels, userKey);
       const resp = await queryWorkitemsByMql(project.key, mql);
@@ -580,6 +679,12 @@ const scanBugsForRole = async (
         });
       }
     } catch (err) {
+      recordFailure(ctx, "bugs", `空间 ${project.name} bug 查询失败`);
+      // 经办人查询 = 我的 BUG 组；报告人查询 = 待回归组
+      (roleField === "__经办人"
+        ? ctx.myBugsProjectKeys
+        : ctx.pendingRegressionProjectKeys
+      ).add(project.key);
       console.warn(
         `[mr-inbox] 空间 ${project.name}(${project.key}) bug MQL 失败、跳过:`,
         err instanceof Error ? err.message : err,
@@ -693,6 +798,7 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
     let pendingMr: MrInboxItem[] = [];
     let myBugs: BugInboxItem[] = [];
     let pendingRegression: BugInboxItem[] = [];
+    const ctx = createScanContext();
 
     const need = (g: InboxGroupId) => visible.has(g);
 
@@ -704,6 +810,7 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
         simpleNames,
         gitToken,
         allowedHosts,
+        ctx,
       );
     }
     if (need("myBugs")) {
@@ -715,6 +822,7 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
         host,
         simpleNames,
         myKey,
+        ctx,
       );
     }
     if (need("pendingRegression")) {
@@ -726,6 +834,7 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
         host,
         simpleNames,
         myKey,
+        ctx,
       );
       // 仅待回归组挂 MR（我的 BUG 不需要）
       pendingRegression = await enrichPendingRegressionWithMr(
@@ -745,6 +854,14 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
       pendingRegression,
       scannedAt: Date.now(),
       gitTokenConfigured: !!gitToken,
+      // N1-01 / N1-15：有任何单步失败或超总时限 → 标 partial（不缓存、客户端保留旧表）
+      ...(ctx.failures.length > 0
+        ? {
+            partial: true as const,
+            partialMessage: buildMrInboxPartialMessage(ctx.failures),
+            incomplete: buildIncompleteScope(ctx),
+          }
+        : {}),
     };
   } catch (err) {
     if (err instanceof MeegleError) {

@@ -77,6 +77,15 @@ export interface StreamFollowController {
 /** 已经贴到这个距离内就不用再写 scrollTop 了（同时是复查时「这一帧贴着了」的判定） */
 const ALREADY_AT_BOTTOM_EPS = 1;
 
+/**
+ * 「上滚意图」的有效期（毫秒，与 `DOWN_INTENT_TTL_MS` 对称）：手势只置意图位、由紧随其后的 scroll
+ * 回调消费，浏览器里手势到 scroll 通常不超过一两帧，1s 足够宽松；超过就说明这次手势根本没引出
+ * scroll（已在最顶上再上滚、内容还装得下一屏），意图该作废——否则它会一直躲着，等到控制器自己贴底
+ * 写 scrollTop 触发的 scroll 把它消费掉，被当成「用户上滚」而永久关掉跟随（V2-02）。
+ * 拖原生滚动条走 `draggingScrollbar`、不受它约束。
+ */
+export const UP_INTENT_TTL_MS = 1000;
+
 /** 读系统「减少动态效果」偏好；SSR / 单测（无 matchMedia）当没开 */
 const prefersReducedMotion = (): boolean =>
   typeof window !== "undefined" &&
@@ -105,8 +114,11 @@ export const createStreamFollowController = (
   let scrollRaf: number | null = null;
   /** 「回到最新」滑行的 rAF id；非 null = 正在滑 */
   let smoothRaf: number | null = null;
-  /** 用户主动上滚意图：手势监听置位、紧随其后的 scroll 回调消费掉 */
-  let intentUp = false;
+  /**
+   * 最近一次用户主动上滚意图的时间：手势监听记下、紧随其后的 scroll 回调消费掉，
+   * 且只在 `UP_INTENT_TTL_MS` 内有效（手势没引出 scroll 时不能一直躲着，见常量注释）
+   */
+  let intentUpAt = Number.NEGATIVE_INFINITY;
   /** 正在拖原生滚动条：拖动期间每次 scroll 都按用户意图算 */
   let draggingScrollbar = false;
   /** 触摸起点 Y（判断手指往下拖 = 往上翻历史） */
@@ -183,8 +195,10 @@ export const createStreamFollowController = (
 
   const onScroll = () => {
     if (!scroller) return;
-    const intent = intentUp || draggingScrollbar;
-    intentUp = false;
+    // 过期的意图当没有：它对应的手势没引出过 scroll，眼前这个 scroll 是程序化的（V2-02）
+    const intent =
+      now() - intentUpAt <= UP_INTENT_TTL_MS || draggingScrollbar;
+    intentUpAt = Number.NEGATIVE_INFINITY;
     // 每个 scroll 事件都要更新基准（不能只在挂上时记一次）：用户先上滚很远、再往下滚回来时，
     // 「往下」是相对上一帧而言的
     const top = scroller.scrollTop;
@@ -193,10 +207,21 @@ export const createStreamFollowController = (
     evaluate(intent, now() - downIntentAt <= DOWN_INTENT_TTL_MS, scrollDelta);
   };
 
-  /** 用户主动往上翻：置意图位 + 取消「回到最新」的滑行（别跟用户抢方向盘） */
+  /**
+   * 用户主动往上翻：置意图位 + 取消「回到最新」的滑行（别跟用户抢方向盘）。
+   * **同时作废还没过期的往下翻输入**（V2-03）：1s TTL 内「先下后上」，之后 Virtuoso 向上补偿的
+   * scrollBy(+28)「朝底部、进了贴底带」，会借着残留的往下翻输入把跟随误恢复；最后一次手势是上滚，
+   * 之前的往下翻输入就不该再算数。
+   *
+   * **容器不可滚（内容装得下一屏）时不登记上滚意图**（V2-02）：此时滚轮 / ↑ / 触摸下拖都不会引出
+   * scroll 事件，意图没人消费、会一直躲着；等 AI 的回答长出一屏、控制器第一次贴底写 scrollTop
+   * 引发 scroll，就被当成「用户上滚」把跟随永久关掉。没有可滚的内容，用户也就没有「离开底部」可言。
+   */
   const markUpIntent = () => {
-    intentUp = true;
+    downIntentAt = Number.NEGATIVE_INFINITY;
     cancelSmooth();
+    if (scroller && scroller.scrollHeight <= scroller.clientHeight) return;
+    intentUpAt = now();
   };
 
   const onWheel = (e: WheelEvent) => {
@@ -335,7 +360,7 @@ export const createStreamFollowController = (
     // **刻意不动 `following`**：它是事件流级别的状态，不属于某个 scroller——切 task 时的初始定位恢复
     // 在渲染期就写了它（`setFollowing(startFollowing)`），早于 Virtuoso 挂上新 scroller；
     // 这里若复位成 true，会把「恢复到上次翻到的位置（不贴底）」的结果在挂载那一刻覆盖掉。
-    intentUp = false;
+    intentUpAt = Number.NEGATIVE_INFINITY;
     draggingScrollbar = false;
     touchStartY = 0;
     downIntentAt = Number.NEGATIVE_INFINITY;

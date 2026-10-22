@@ -9,10 +9,12 @@
  */
 
 import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 
 import { occupantOf, occupiedBranchMessage } from "../git-branch-occupancy";
+import { stripHostInjectedEnv } from "./host-env";
 import type {
   GitBranchOccupant,
   GitBranchState,
@@ -281,7 +283,9 @@ export const listRepoBranches = async (
       }
       if (name) seen.add(name);
     }
-    return { isRepo: true, branches: [...seen] };
+    // 子目录（monorepo 的 packages/web 之类）：git 能列分支，但任务快照口径（目录下有 .git）判它「非 git」
+    const notRoot = !existsSync(path.join(dir, ".git"));
+    return { isRepo: true, branches: [...seen], ...(notRoot ? { notRoot: true } : {}) };
   } catch (err) {
     // 三种失败分开诊断（同事 Windows「真 git 仓被报非 git」排查不动、被迫较真）：
     // ① 路径不存在（spawn cwd 不存在也报 ENOENT、必须先 stat 区分）
@@ -328,7 +332,16 @@ export const checkoutGitBranch = async (
   const occupant = occupantOf(await buildBranchOccupancy(entries, current), b);
   if (occupant) return { ok: false, error: occupiedBranchMessage(b, occupant) };
   try {
-    await execFileAsync("git", ["checkout", b], { cwd: dir, timeout: 15_000 });
+    // 尾部 `--`：声明 b 只能是分支 / 提交、不能退化成路径。不带它时，分支名来自 UI（列表可能已过期、
+    // 分支刚被删），若工作区恰有同名已跟踪文件，`git checkout b` 会静默把该文件从 index 还原、丢未提交改动
+    //（实测 Updated 1 path from the index）；带 `--` 则直接 `fatal: invalid reference`。
+    // 远端独有分支的 DWIM（自动建跟踪分支）在带 `--` 时照常生效（实测）。
+    // env 剔宿主注入变量：checkout 会触发用户仓的 post-checkout 钩子（见 host-env.ts / task-worktrees.runGit）
+    await execFileAsync("git", ["checkout", b, "--"], {
+      cwd: dir,
+      timeout: 15_000,
+      env: stripHostInjectedEnv(),
+    });
     return { ok: true };
   } catch (err) {
     const e = err as { stderr?: string; message?: string };

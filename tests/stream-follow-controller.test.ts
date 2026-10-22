@@ -15,7 +15,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createStreamFollowController } from "@/hooks/use-stream-follow";
+import {
+  UP_INTENT_TTL_MS,
+  createStreamFollowController,
+} from "@/hooks/use-stream-follow";
 import {
   DOWN_INTENT_TTL_MS,
   PIN_SETTLE_MAX_FRAMES,
@@ -669,6 +672,132 @@ describe("回放：键盘 ↑ 的平滑滚动动画 + Virtuoso 补偿（用户�
       sc.userScrollTo(top);
       expect(ctrl.isFollowing(), `top=${top}`).toBe(false);
     }
+  });
+
+  // V2-03（2026-10-20 第二轮 review）：`markUpIntent` 没清 `downIntentAt`，1s TTL 内「先下后上」
+  // 之后，Virtuoso 向上补偿的 scrollBy(+28) 会借着残留的往下翻输入把跟随误恢复
+  it("1s 内先往下翻再往上翻：上滚必须作废之前的往下翻输入，之后 Virtuoso 补偿 +28 不恢复跟随", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    // 1) 先上滚一点点离开底部（离底 20、上滚意图优先于几何）
+    sc.dispatch("wheel", { deltaY: -50 });
+    sc.userScrollTo(1180);
+    expect(ctrl.isFollowing()).toBe(false);
+    // 2) 往下翻一下（记下往下翻输入、t=0）
+    sc.dispatch("wheel", { deltaY: 50 });
+    // 3) 300ms 后又往上翻（仍在 1s TTL 内）：scroll 回调消费上滚意图
+    clock = 300;
+    sc.dispatch("wheel", { deltaY: -50 });
+    sc.userScrollTo(1160);
+    expect(ctrl.isFollowing()).toBe(false);
+    // 4) Virtuoso 向上补偿 scrollBy(+28)：朝底部、进贴底带、但没有「新的」往下翻输入
+    sc.userScrollTo(1188);
+    expect(ctrl.isFollowing()).toBe(false);
+    // 之后真正的往下翻输入照常能恢复（不能把恢复路径一起堵死）
+    sc.dispatch("wheel", { deltaY: 50 });
+    sc.userScrollTo(1200);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("同一批手势里先上滚、再往下翻：往下翻输入是后发生的，照常有效", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("wheel", { deltaY: -50 });
+    sc.userScrollTo(1180);
+    expect(ctrl.isFollowing()).toBe(false);
+    clock = 100;
+    sc.dispatch("wheel", { deltaY: 50 });
+    sc.userScrollTo(1195);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+});
+
+// ---------- V2-02：上滚意图残留（2026-10-20 第二轮 review） ----------
+
+describe("V2-02：上滚意图不能无限期残留（内容不足一屏时上滚一下 → 之后长出一屏不能被当成用户上滚）", () => {
+  /** 内容不足一屏：总高 = 视口 = 800，不可滚 */
+  const NOT_SCROLLABLE: Partial<ScrollerInit> = { top: 0, height: 800, client: 800 };
+
+  /** 内容长出一屏后控制器第一次贴底：写 scrollTop → 浏览器异步派发一个没有任何用户输入的 scroll 事件 */
+  const growThenPin = (sc: FakeScroller, ctrl: ReturnType<typeof setup>["ctrl"]) => {
+    sc.grow(1200); // 总高 2000、最大可滚 1200
+    ctrl.requestScrollToBottom();
+    flushFrame();
+    sc.dispatch("scroll");
+  };
+
+  it("不可滚时滚轮上滚：不登记意图 → 长出一屏后第一次贴底的 scroll 不会被当成用户上滚、跟随不关", () => {
+    const { ctrl, sc } = setupWithScroller(NOT_SCROLLABLE);
+    sc.dispatch("wheel", { deltaY: -100 }); // 没有可滚的内容 → 浏览器不会派发 scroll
+    expect(ctrl.isFollowing()).toBe(true);
+    growThenPin(sc, ctrl);
+    expect(sc.writes).toEqual([2000]); // 控制器确实贴了底
+    expect(sc.top()).toBe(1200);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("不可滚时键盘 ↑ / PageUp / Home、触摸下拖同样不登记意图", () => {
+    const acts: Array<(sc: FakeScroller) => void> = [
+      (sc) => sc.dispatch("keydown", key("ArrowUp")),
+      (sc) => sc.dispatch("keydown", key("PageUp")),
+      (sc) => sc.dispatch("keydown", key("Home")),
+      (sc) => {
+        sc.dispatch("touchstart", { touches: [{ clientY: 100 }] });
+        sc.dispatch("touchmove", { touches: [{ clientY: 300 }] });
+      },
+    ];
+    for (const act of acts) {
+      queued = new Map();
+      const { ctrl, sc } = setupWithScroller(NOT_SCROLLABLE);
+      act(sc);
+      growThenPin(sc, ctrl);
+      expect(ctrl.isFollowing()).toBe(true);
+    }
+  });
+
+  it("可滚但没有 scroll 事件的上滚（已经在最顶上再上滚）：意图过了 TTL 就作废，之后程序化滚动不关跟随", () => {
+    // top=0 往上滚：浏览器不会派发 scroll；意图残留，直到控制器自己贴底写 scrollTop
+    const { ctrl, sc } = setupWithScroller({ top: 0, height: 2000, client: 800 });
+    sc.dispatch("wheel", { deltaY: -100 });
+    clock = UP_INTENT_TTL_MS + 1;
+    ctrl.requestScrollToBottom();
+    flushFrame();
+    sc.dispatch("scroll");
+    expect(sc.writes).toEqual([2000]);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("TTL 之内的真实上滚仍然立刻停跟随（恰好 TTL 边界算有效）", () => {
+    const { ctrl, sc } = setupWithScroller();
+    sc.dispatch("wheel", { deltaY: -100 });
+    clock = UP_INTENT_TTL_MS;
+    sc.userScrollTo(1100);
+    expect(ctrl.isFollowing()).toBe(false);
+  });
+
+  it("手势到 scroll 之间隔了超过 TTL → 不当成用户上滚（浏览器的 scroll 不会晚这么久，晚到的是别的来源）", () => {
+    const { ctrl, sc } = setupWithScroller();
+    sc.dispatch("wheel", { deltaY: -100 });
+    clock = UP_INTENT_TTL_MS + 1;
+    sc.userScrollTo(1100);
+    // 离底 100 > 贴底带、也没有往下翻输入：状态机维持原值（跟随中）
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("不可滚时的上滚不会堵死后续真实上滚：长出一屏后用户真上滚照常停跟随", () => {
+    const { ctrl, sc } = setupWithScroller(NOT_SCROLLABLE);
+    sc.dispatch("wheel", { deltaY: -100 });
+    growThenPin(sc, ctrl);
+    expect(ctrl.isFollowing()).toBe(true);
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(1100);
+    expect(ctrl.isFollowing()).toBe(false);
+  });
+
+  it("拖原生滚动条不受上滚 TTL 影响：拖多久都按用户意图算", () => {
+    const { ctrl, sc } = setupWithScroller();
+    sc.dispatch("pointerdown", { target: sc.el, offsetX: 905 });
+    clock = UP_INTENT_TTL_MS * 10;
+    sc.userScrollTo(900);
+    expect(ctrl.isFollowing()).toBe(false);
   });
 });
 

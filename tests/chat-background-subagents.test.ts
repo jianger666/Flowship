@@ -38,7 +38,7 @@ vi.mock("@cursor/sdk", () => ({
   },
 }));
 
-const { readEvents, taskDir, writeMeta } = await import(
+const { readEvents, taskDir, withTaskLock, writeMeta } = await import(
   "@/lib/server/task-fs-core"
 );
 const {
@@ -46,6 +46,7 @@ const {
   closeChatSessionUnconditional,
   detachChatForegroundSubagents,
   drainBackgroundResults,
+  getPendingBackgroundResultCount,
   hasChatSession,
   isChatRunActive,
   resumeChatSession,
@@ -66,7 +67,17 @@ if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(`chat-background DATA_DIR 未隔离到 TMP：${taskDir("probe")}`);
 }
 
-const TASK_ID = "t_1700000005000_bgsub";
+/**
+ * 每个用例一个独立任务 id（beforeEach 里换）：以前所有用例共用一个 id，beforeEach 还要 `fs.rm(taskDir)` 清目录——
+ * 上一个用例收尾后仍在飞的写盘（如「wait 里收到后台结果」那条：steer 返回后 drainBackgroundResults → sendChatMessage
+ * 还要写 meta）会和下一个用例的 rm 交错，rename 时目录没了 → ENOENT → 未处理的 rejection → vitest 退出码 1。
+ * 并行 6 路 × 4 轮修前 4/24 次红（全落在这一条），根因与 chat-steer-requeue-by-reason 同族。产品代码没问题
+ * （删任务走 withTaskLock，锁内不会有目录被抽走），所以只改测试。
+ */
+let TASK_ID = "t_1700000005000_bgsub";
+let taskSeq = 0;
+/** 本文件用过的全部任务 id（afterAll 要把每一个的收尾写盘都等完再 rm 临时根） */
+const usedTaskIds = new Set<string>();
 const PARENT_ID = "agent_fake_bgsub_parent";
 const BOOT = {
   apiKey: "test-key",
@@ -190,14 +201,38 @@ const eventsOfKind = async (kind: string) =>
 
 const settleTail = () => new Promise((r) => setTimeout(r, 30));
 
+/**
+ * 等「攒着、还没送进主 AI 的后台结果」恰好 n 条（直接观察入队，不睡固定毫秒）。
+ * 固定 30ms 的 settleTail 在重载 / 写盘变慢时不够：第二个结果还没入队就放主 AI 的 run 收尾，唤醒消息里只有一个结果。
+ * 曾改成「等到达提示落盘」——那依赖「落盘与入队之间只有微任务」这个实现不变量，在落盘后、入队前插一个真实 await
+ * 就会红约一半（注入压测 16/30）；直接看队列没有这个前提（同条件 0/30）。
+ * 只对「这一轮不能 steer / 被退回、结果只能攒着」的用例有意义（能 steer 的路径入队后立刻被取走，计数瞬间回 0）。
+ */
+const waitQueued = (n: number) =>
+  vi.waitFor(() => expect(getPendingBackgroundResultCount(TASK_ID)).toBe(n), {
+    timeout: 5000,
+    interval: 20,
+  });
+
+/**
+ * 给迟到的收尾写盘留出落地时间：**固定** 5 轮「排空该任务的 per-task 锁 + 让出 40ms」，不判断「有没有新活」——
+ * 是时间裕量、不是同步点。用例之间不靠它：每个用例有独立任务 id / 目录，迟到写入落在自己的目录里。
+ */
+const quiesceTask = async (taskId: string): Promise<void> => {
+  for (let i = 0; i < 5; i++) {
+    await withTaskLock(taskId, async () => undefined);
+    await new Promise((r) => setTimeout(r, 40));
+  }
+};
+
 beforeEach(async () => {
+  taskSeq += 1;
+  TASK_ID = `t_1700000005000_bgsub_${taskSeq}`;
+  usedTaskIds.add(TASK_ID);
   mockResume.mockReset();
   mockCreate.mockReset();
   installChildFactory();
-  clearChatQueue(TASK_ID);
-  closeChatSessionUnconditional(TASK_ID);
-  await new Promise((r) => setTimeout(r, 30));
-  await fs.rm(taskDir(TASK_ID), { recursive: true, force: true }).catch(() => {});
+  // 新 id：没有残留的队列 / 会话 / 目录，不需要（也不该）再 rm 任何东西
   await writeMeta(makeMeta(TASK_ID));
 });
 
@@ -209,7 +244,8 @@ afterEach(async () => {
 
 afterAll(async () => {
   closeChatSessionUnconditional(TASK_ID);
-  await new Promise((r) => setTimeout(r, 50));
+  // 每个用例的任务各等一遍（并行等：总耗时仍约 200ms），再删临时根
+  await Promise.all([...usedTaskIds].map((id) => quiesceTask(id)));
   await fs.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 
@@ -331,8 +367,15 @@ describe("用户插话 → 前台子代理自动转后台", () => {
     expect(delivered).toContain("资料内容：ABC-123");
     expect(delivered).toContain("不是用户的指令");
 
-    const infos = (await eventsOfKind("info")) as Array<{ text?: string }>;
+    const infos = (await eventsOfKind("info")) as Array<{
+      text?: string;
+      meta?: Record<string, unknown>;
+    }>;
     expect(infos.some((e) => e.text?.includes("后台子代理「查资料」已完成"))).toBe(true);
+    // 机器字段：错误卡靠它认出「这一轮是后台结果唤醒的、不是用户那句话」（chat-turns.resolveErrorRecovery）
+    expect(
+      infos.find((e) => e.text?.includes("后台子代理「查资料」已完成"))?.meta?.subkind,
+    ).toBe("background_result");
     // 用户气泡只有那一条插话——子代理结果不冒充用户说话
     const replies = (await eventsOfKind("user_reply")) as Array<{ text?: string }>;
     expect(replies.map((e) => e.text)).toEqual(["插个话"]);
@@ -393,7 +436,7 @@ describe("后台结果的投递时机", () => {
 
     childRuns[0]!.release("A 的结果");
     childRuns[1]!.release("B 的结果");
-    await settleTail();
+    await waitQueued(2); // 两个结果都已入队（直接看队列，不是睡固定毫秒碰运气）
     // 还在忙：没有往里送、也没有另起一轮
     expect(parentAgent.send).toHaveBeenCalledTimes(1);
 
@@ -454,7 +497,7 @@ describe("后台结果的投递时机", () => {
     expect(activeWaitCount(TASK_ID)).toBe(1);
 
     childRuns[0]!.release("A 的结果");
-    await settleTail();
+    await waitQueued(1); // 结果已入队，这时 wait 仍在睡才是有意义的断言
     expect(activeWaitCount(TASK_ID)).toBe(1); // 还在睡
 
     interruptWaits(TASK_ID, "cancel"); // 清场
@@ -471,7 +514,7 @@ describe("后台结果的投递时机", () => {
       () => expect(parent.run.steer as ReturnType<typeof vi.fn>).toHaveBeenCalled(),
       { timeout: 3000 },
     );
-    await settleTail();
+    await waitQueued(1); // steer 被退回后结果放回队里（先等放回，再断言「没另起」才有意义）
     expect(parentAgent.send).toHaveBeenCalledTimes(1); // 还在忙、没另起
 
     const wakeRun = manualRun();
@@ -617,7 +660,7 @@ describe("该丢的结果就丢", () => {
     const { parentAgent, subagentTool } = await startParentRun(parent.run);
     await runTool(subagentTool, { prompt: "a", description: "A", run_in_background: true });
     childRuns[0]!.release("A 的结果");
-    await settleTail();
+    await waitQueued(1); // A 的结果已攒进队列，之后关会话才是「攒着的结果作废」
 
     closeChatSessionUnconditional(TASK_ID);
     parent.release("x");
@@ -663,9 +706,11 @@ describe("该丢的结果就丢", () => {
       timeout: 3000,
       interval: 30,
     });
-    await settleTail();
-    // sendChatMessage 失败会关掉这个会话
-    expect(hasChatSession(TASK_ID)).toBe(false);
+    // sendChatMessage 失败会关掉这个会话（等关会话落定，不睡固定毫秒）
+    await vi.waitFor(() => expect(hasChatSession(TASK_ID)).toBe(false), {
+      timeout: 3000,
+      interval: 20,
+    });
 
     const parent2 = manualRun();
     const second = await startParentRun(parent2.run);

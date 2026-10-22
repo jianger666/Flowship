@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  catalogDefaultEffort,
   catalogFromModelOptions,
   currentEffortValue,
   findEffortParam,
@@ -536,5 +537,129 @@ describe("isInheritModelArg（与 resolveSubagentModel 的「沿用」同口径�
       // 缺省 / 空 / inherit → inherited；写成与父同 id 也是 inherited，但那不属于「model 参数缺省」
       if (isInheritModelArg(model)) expect(resolved.inherited).toBe(true);
     }
+  });
+});
+
+describe("catalogFromModelOptions · 默认 effort（取自 isDefault 预设）", () => {
+  // 形状取自 2026-10-19 真实 Cursor 清单（claude-sonnet-5-5 / gemini-4-argon）
+  const sonnet: ModelOption = {
+    id: "claude-sonnet-5-5",
+    displayName: "Sonnet 5.5",
+    parameters: [
+      { id: "context", values: [{ value: "300k" }, { value: "1m" }] },
+      {
+        id: "reasoning_effort",
+        values: ["low", "medium", "high", "xhigh", "max"].map((value) => ({ value })),
+      },
+    ],
+    variants: [
+      {
+        displayName: "300k Low",
+        params: [
+          { id: "context", value: "300k" },
+          { id: "reasoning_effort", value: "low" },
+        ],
+      },
+      {
+        displayName: "1M High",
+        isDefault: true,
+        params: [
+          { id: "context", value: "1m" },
+          { id: "reasoning_effort", value: "high" },
+        ],
+      },
+    ],
+  };
+  const gemini: ModelOption = {
+    id: "gemini-4-argon",
+    displayName: "Gemini 4 Argon",
+    parameters: [
+      {
+        id: "reasoning_effort",
+        values: ["low", "medium", "high"].map((value) => ({ value })),
+      },
+    ],
+    variants: [
+      { displayName: "Low", params: [{ id: "reasoning_effort", value: "low" }] },
+      {
+        displayName: "Medium",
+        isDefault: true,
+        params: [{ id: "reasoning_effort", value: "medium" }],
+      },
+      { displayName: "High", params: [{ id: "reasoning_effort", value: "high" }] },
+    ],
+  };
+
+  it("默认档 = isDefault 预设里那个思考档参数的取值（不是第一档、不是别的预设）", () => {
+    const cat = catalogFromModelOptions([sonnet, gemini]);
+    expect(cat.find((e) => e.id === "claude-sonnet-5-5")?.defaultEffort).toBe("high");
+    expect(cat.find((e) => e.id === "gemini-4-argon")?.defaultEffort).toBe("medium");
+  });
+
+  it("没标默认预设 / 没有 variants / 没有档位参数 → 不带 defaultEffort（不硬造）", () => {
+    const noDefault: ModelOption = {
+      ...gemini,
+      id: "nd",
+      variants: gemini.variants!.map((v) => ({ ...v, isDefault: false })),
+    };
+    const noVariants: ModelOption = { ...gemini, id: "nv", variants: undefined };
+    const noEffort: ModelOption = {
+      id: "ne",
+      displayName: "NE",
+      parameters: [{ id: "fast", values: [{ value: "true" }, { value: "false" }] }],
+      variants: [{ displayName: "d", isDefault: true, params: [{ id: "fast", value: "true" }] }],
+    };
+    for (const e of catalogFromModelOptions([noDefault, noVariants, noEffort])) {
+      expect(e).not.toHaveProperty("defaultEffort");
+    }
+  });
+
+  it("默认预设里的档位不在可选档里（自定义 provider 的 Default = 不覆盖）→ 不带 defaultEffort", () => {
+    const custom: ModelOption = {
+      id: "gpt-x",
+      displayName: "GPT X",
+      parameters: [
+        { id: "thinking", values: [{ value: "default" }, { value: "low" }, { value: "high" }] },
+      ],
+      variants: [
+        { displayName: "gpt-x", isDefault: true, params: [{ id: "thinking", value: "default" }] },
+      ],
+    };
+    const [entry] = catalogFromModelOptions([custom]);
+    expect(entry.efforts).toEqual(["low", "high"]);
+    expect(entry).not.toHaveProperty("defaultEffort");
+  });
+
+  it("默认预设里的档位值是开关（true/false）→ 那个参数本来就不算档位，不带 defaultEffort", () => {
+    const [entry] = catalogFromModelOptions([
+      {
+        id: "t",
+        displayName: "T",
+        parameters: [{ id: "thinking", values: [{ value: "true" }, { value: "false" }] }],
+        variants: [{ displayName: "d", isDefault: true, params: [{ id: "thinking", value: "true" }] }],
+      },
+    ]);
+    expect(entry).not.toHaveProperty("defaultEffort");
+  });
+});
+
+describe("catalogDefaultEffort", () => {
+  const cat: ModelCatalogEntry[] = [
+    { id: "claude-sonnet-5-5", displayName: "Sonnet 5.5", efforts: ["high"], defaultEffort: "high" },
+    { id: "plain", displayName: "Plain", efforts: [] },
+  ];
+
+  it("按 resolveSubagentModel 同口径找模型（精确 id / 忽略大小写 / 唯一 displayName）", () => {
+    expect(catalogDefaultEffort(cat, "claude-sonnet-5-5")).toBe("high");
+    expect(catalogDefaultEffort(cat, " CLAUDE-Sonnet-5-5 ")).toBe("high");
+    expect(catalogDefaultEffort(cat, "sonnet 5.5")).toBe("high");
+  });
+
+  it("清单拿不到 / 没这个模型 / 没标默认档 / 空 id → undefined", () => {
+    expect(catalogDefaultEffort(null, "claude-sonnet-5-5")).toBeUndefined();
+    expect(catalogDefaultEffort(undefined, "claude-sonnet-5-5")).toBeUndefined();
+    expect(catalogDefaultEffort(cat, "nope")).toBeUndefined();
+    expect(catalogDefaultEffort(cat, "plain")).toBeUndefined();
+    expect(catalogDefaultEffort(cat, "  ")).toBeUndefined();
   });
 });

@@ -14,6 +14,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { nonLocalPathReason } from "@/lib/unc-path";
+
 const EXT_TO_MIME: Record<string, string> = {
   png: "image/png",
   jpg: "image/jpeg",
@@ -36,6 +38,10 @@ export const runtime = "nodejs";
 export const GET = async (req: Request) => {
   const raw = new URL(req.url).searchParams.get("path")?.trim() ?? "";
   if (!raw) return errorJson("path 必填");
+  // UNC 形态（`//host/share`、`\\host\share`、`\\?\UNC\…`）必须在碰文件系统之前拒绝：
+  // Windows 上对它做 realpath / stat 会让系统主动连 SMB、带 NTLM 凭据（V10-01）。与平台无关地拒
+  const nonLocal = nonLocalPathReason(raw);
+  if (nonLocal) return errorJson(nonLocal);
   // 绝对路径校验（POSIX + Windows 盘符都认）
   if (!path.isAbsolute(raw) && !/^[a-zA-Z]:[\\/]/.test(raw)) {
     return errorJson("path 必须是绝对路径");

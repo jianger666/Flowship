@@ -16,16 +16,17 @@ import { DEFAULT_MEEGLE_PROJECT, JUMP_IDES, USER_ROLES, CURSOR_PROVIDER_ID } fro
 import type {
   ActionLayoutPref,
   FeAiFlowSettings,
-  ModelSelection,
   UserRole,
 } from "./types";
 import { migrateProviderSettings } from "./agent-provider";
+import { RETIRED_SETTINGS_KEYS, readDefaultModel } from "./settings-legacy";
 import { sanitizeRepoShellCommand } from "./repo-shell-command";
 import {
   SettingsUnreadableError,
   parseSettingsUnreadable,
   type SettingsUnreadable,
 } from "./settings-unreadable";
+import { canPersistSettings } from "./settings-load-state";
 import {
   emptyActionLayout,
   normalizeCollapsedGroups,
@@ -130,20 +131,6 @@ const cloneDefaultSettings = (): FeAiFlowSettings => ({
 const isBrowser = (): boolean =>
   typeof window !== "undefined" && typeof window.localStorage !== "undefined";
 
-// defaultModel 字段读出来校验：必须是 { id: string } 形态、不然回 default
-// 老 schema 兼容（V0.5.12.2 删）：以前 defaultModel 是纯 string、残留就重配
-const readDefaultModel = (raw: unknown): ModelSelection => {
-  if (
-    raw &&
-    typeof raw === "object" &&
-    "id" in raw &&
-    typeof (raw as { id: unknown }).id === "string"
-  ) {
-    return raw as ModelSelection;
-  }
-  return { id: "" };
-};
-
 // 推进面板布局偏好归一：order / hidden / 分组字段；坏值回退缺省
 const normalizeActionLayout = (raw: unknown): ActionLayoutPref => {
   if (!raw || typeof raw !== "object") return emptyActionLayout();
@@ -216,11 +203,11 @@ export const normalizeSettings = (
   // 历史残留键读取时忽略、不落进归一结果（下次落盘就把它们从 config.json 抹掉）
   // username：V0.12.x 已删；gitHost：已退役（host 按任务仓库 remote 现推）；
   // groupCollab：2026-07-28 三个群协作开关砍掉、行为固定在 bridge-config.GROUP_COLLAB_POLICY
-  delete (merged as Record<string, unknown>).username;
-  delete (merged as Record<string, unknown>).gitHost;
-  delete (merged as Record<string, unknown>).groupCollab;
-  // 旧单槽 customProvider 迁进 customProviders 后从归一结果抹掉，下次落盘清掉
-  delete (merged as Record<string, unknown>).customProvider;
+  // 旧单槽 customProvider 迁进 customProviders 后同样从归一结果抹掉，下次落盘清掉
+  // （退役键表与服务端 PATCH 归一共用 settings-legacy.RETIRED_SETTINGS_KEYS，别各写一份）
+  for (const k of RETIRED_SETTINGS_KEYS) {
+    delete (merged as Record<string, unknown>)[k];
+  }
 
   const migratedProvider = migrateProviderSettings(parsed);
 
@@ -309,6 +296,12 @@ let loadUnreadable: SettingsUnreadable | null = null;
 export const getSettingsUnreadable = (): SettingsUnreadable | null =>
   loadUnreadable;
 
+/**
+ * 是否已成功把磁盘上的真实 config.json 灌进缓存（最近一次 init 的结果）。
+ * false 时 getSettings() 只是默认值：设置页据此显示「加载失败 + 重试加载」、拒绝一切保存（见 canPersistSettings）。
+ */
+export const isSettingsLoaded = (): boolean => initSucceeded;
+
 // 同步读缓存（签名不变、prepareRunArgs 等 9 处调用方一律不用改）
 export const getSettings = (): FeAiFlowSettings => cache;
 
@@ -332,6 +325,39 @@ const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let message = `HTTP ${res.status}`;
+    try {
+      const data = (await res.json()) as { error?: string };
+      if (data?.error) message = data.error;
+    } catch {
+      // 错误体不是 JSON、用状态码兜底
+    }
+    throw new SettingsPutError(message, res.status);
+  }
+};
+
+/**
+ * 字段级补丁（第三轮 D1-01）：PATCH /api/settings，服务端在写锁内读盘、只替换这些键。
+ * value 为 undefined 的键走 remove（JSON 序列化会吞掉 undefined，不能当 patch 值发）。
+ * 错误处理与 putSettings 同口径（SettingsPutError 带状态码）。
+ */
+const patchSettings = async (
+  next: FeAiFlowSettings,
+  keys: readonly (keyof FeAiFlowSettings)[],
+): Promise<void> => {
+  const patch: Record<string, unknown> = {};
+  const remove: string[] = [];
+  for (const k of keys) {
+    const v = next[k];
+    if (v === undefined) remove.push(k);
+    else patch[k] = v;
+  }
+  const res = await fetch(API, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ patch, ...(remove.length > 0 ? { remove } : {}) }),
   });
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
@@ -417,6 +443,14 @@ export const initSettings = (): Promise<void> => {
 // CR-08：客户端写队列——连续快速保存串行落盘、后发请求不可能被先发的整对象覆盖
 let writeQueue: Promise<void> = Promise.resolve();
 
+/**
+ * 最近一次被服务端拒绝的保存带回的原因（`error` 文案；没有就是 null）。
+ * 设置页的 4xx toast 用它说明「为什么被拒」，而不是只给通用「请检查输入」（第四轮 Q2-03）。
+ * 成功的保存会清空它；只有服务端明确给了原因（非 `HTTP <状态码>` 兜底文案）才记。
+ */
+let lastRejectReason: string | null = null;
+export const getLastSettingsRejectReason = (): string | null => lastRejectReason;
+
 export interface SaveSettingsResult {
   ok: boolean;
   /**
@@ -433,29 +467,36 @@ export interface SaveSettingsResult {
  */
 export const saveSettingsDetailed = async (
   next: FeAiFlowSettings,
+  /**
+   * 这次只改了哪些顶层字段：给了就走字段级 PATCH（服务端读盘后只替换这些键，不会把别处刚改的内容还原）；
+   * 不给 = 整对象 PUT（初始化写默认配置等「就是要整份覆盖」的场景）。第三轮 D1-01。
+   */
+  changedKeys?: readonly (keyof FeAiFlowSettings)[],
 ): Promise<SaveSettingsResult> => {
+  // 没成功加载过磁盘上的真实配置 → 一律拒绝（返失败、不带状态码，调用方如 use-settings 自己 toast、不抛错）。
+  //
+  // 为什么不是「先重试 init、成功了就写 next」（旧实现，已删）：调用方的 next 是用 getSettings() 构造的，
+  // init 成功前它只是默认值——重试成功后再 PUT 这份「默认值 + 用户改的一项」，会把磁盘上的
+  // apiKey / gitToken / 仓库 / 公司环境 / MCP / provider 整个覆盖成默认值（review #16）。
+  // 这里仍顺手重试一次加载：本次保存照拒，但缓存换成真实配置后，用户**下一次**操作（基于真实配置构造 next）才安全。
+  // 必须在乐观更新 cache 之前：拒绝时 cache 一个字都不动。
+  if (isBrowser() && !canPersistSettings({ initSucceeded })) {
+    await initSettings();
+    console.error(
+      "[local-store] saveSettings 拒绝写入：config.json 尚未成功加载、避免用默认值覆盖磁盘配置",
+    );
+    return { ok: false };
+  }
   // 乐观更新前记下旧 cache；PUT 失败时回滚，避免内存与磁盘分叉
   const prev = cache;
   cache = next;
   if (!isBrowser()) return { ok: false };
-  // 初始化未成功时先重试一次真实 GET；仍失败则拒绝 PUT（返失败、不带状态码，
-  // 调用方如 use-settings 已有 toast.error——不抛错）
-  if (!initSucceeded) {
-    await initSettings();
-    if (!initSucceeded) await initSettings(); // 再试一次（失败会清空 initPromise）
-    if (!initSucceeded) {
-      console.error(
-        "[local-store] saveSettings 拒绝写入：config.json 初始化仍失败、避免用本地缓存覆盖磁盘配置",
-      );
-      // 仍是本次乐观值才回滚（并发后续 save 已覆盖则不动）
-      if (cache === next) cache = prev;
-      return { ok: false };
-    }
-    // 重试成功后 init 可能用服务端值盖掉了 cache——写回用户本次意图再落盘
-    cache = next;
-  }
   // 权威写：挂到串行队列尾（保序）、await 服务端结果（失败不再被静默当成功）
-  const attempt = writeQueue.then(() => putSettings(next));
+  const attempt = writeQueue.then(() =>
+    changedKeys && changedKeys.length > 0
+      ? patchSettings(next, changedKeys)
+      : putSettings(next),
+  );
   // 队列指针只关心「上一个写是否结束」、错误由本次调用方消费、不传染下一个
   writeQueue = attempt.then(
     () => undefined,
@@ -463,10 +504,15 @@ export const saveSettingsDetailed = async (
   );
   try {
     await attempt;
+    lastRejectReason = null;
     return { ok: true };
   } catch (err) {
     console.error("[local-store] 写 config.json 失败", err);
     if (cache === next) cache = prev;
+    lastRejectReason =
+      err instanceof SettingsPutError && !/^HTTP \d+$/.test(err.message)
+        ? err.message
+        : null;
     return { ok: false, status: err instanceof SettingsPutError ? err.status : undefined };
   }
 };
@@ -479,8 +525,10 @@ export const saveSettingsDetailed = async (
  *          内存 cache 同步更新（乐观、getSettings 立即可读）。
  *          需要区分失败原因（要不要自动重试）的调用方用 saveSettingsDetailed。
  */
-export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> =>
-  (await saveSettingsDetailed(next)).ok;
+export const saveSettings = async (
+  next: FeAiFlowSettings,
+  changedKeys?: readonly (keyof FeAiFlowSettings)[],
+): Promise<boolean> => (await saveSettingsDetailed(next, changedKeys)).ok;
 
 // ----------------- 每提供方常用模型（下拉里点星钉住、最多 2 个） -----------------
 
@@ -498,6 +546,6 @@ export const toggleStarredModel = (
   const s = getSettings();
   const result = toggleStarredModelId(s.starredModels, providerId, modelId);
   if (result.full) return { starred: false, full: true };
-  void saveSettings({ ...s, starredModels: result.next });
+  void saveSettings({ ...s, starredModels: result.next }, ["starredModels"]);
   return { starred: result.starred, full: false };
 };

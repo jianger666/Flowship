@@ -43,7 +43,7 @@
  *    都必须带 origin——漏一类，那类事件就会漏到属主的主事件流里。
  */
 
-import { Agent, resolveProviderIdFromDisk } from "./agent-backend";
+import { Agent, resolveProviderIdForCreate } from "./agent-backend";
 
 import type { ModelSelection } from "@cursor/sdk";
 
@@ -391,6 +391,19 @@ export const startRestrictedGroupQuestion = (
         return;
       }
 
+      // 任务绑定的自定义提供方已被删除：直接拒（不起 agent、不准备工作区），不静默落回 Cursor——
+      // 群里的上下文 / 代码会跟着出域（第四轮 Q2-02）。原因经 settle 落成 error 事件 + done(ok=false)，群里会收到「没跑成功」
+      let bypassProviderId: string;
+      try {
+        bypassProviderId = await resolveProviderIdForCreate(task);
+      } catch (err) {
+        await settle(
+          false,
+          `群答疑没启动：${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
+
       // 群上下文（roster / 最近聊天 / 身份）与准备工作区 / 建会话**并行**拉：整体硬超时 3 秒、
       // 失败降级为空、永不抛错——不拖慢起 agent。没有 groupContext 的老调用方不拉
       const groupSectionsPromise: Promise<GroupPromptSections | undefined> =
@@ -445,7 +458,6 @@ export const startRestrictedGroupQuestion = (
       const { syncCompanyEnvFileFromSettings, loadCompanyEnvBriefSection } =
         await import("./company-env-fs");
       await syncCompanyEnvFileFromSettings();
-      const bypassProviderId = await resolveProviderIdFromDisk(task);
       const companyEnvSection = await loadCompanyEnvBriefSection();
       if (!alive()) {
         await settle(false, "群答疑已取消");

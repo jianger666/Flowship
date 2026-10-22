@@ -65,7 +65,7 @@ export const Providers = ({ children }: ProvidersProps) => {
           <LocalFilePreviewProvider>
           {/* TaskListProvider：侧栏 + 各页面共享同一份任务列表、新建 / 删除 / 状态变化统一同步 */}
           <TaskListProvider>
-            {/* MrInboxProvider：提测收件箱（顶栏 badge + 任务内提醒条共享一份、前台 5 分钟轮询） */}
+            {/* MrInboxProvider：提测收件箱（顶栏 badge + 任务内提醒条共享一份、前台 5 分钟轮询；Electron 壳内收进托盘 / 最小化后放宽到 10 分钟，浏览器标签页不可见不扫） */}
             <MrInboxProvider>
               {/* 任务转入「等你回复」且窗口在后台 → 系统通知 + Dock 角标（点通知跳详情页） */}
               <TaskAttentionWatcher />

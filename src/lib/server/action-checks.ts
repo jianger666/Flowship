@@ -44,6 +44,7 @@ import path from "node:path";
 
 import type { ActionRecord, Task } from "@/lib/types";
 
+import { stripHostInjectedEnv } from "./host-env";
 import { getActionArtifactPath } from "./task-fs-core";
 import {
   getTaskCwd,
@@ -657,6 +658,8 @@ const gitCapture = async (
       cwd: repoPath,
       timeout: timeoutMs,
       maxBuffer: FINGERPRINT_PART_CAP,
+      // 剔宿主注入变量：git 会读用户仓配置（fsmonitor 钩子 / 外部 diff 驱动 / textconv），不把宿主环境交出去（Q1-01）
+      env: stripHostInjectedEnv(),
     });
     return stdout;
   } catch {
@@ -674,6 +677,8 @@ const gitHashObjectStdinPaths = (
     const proc = spawn("git", ["hash-object", "--stdin-paths"], {
       cwd: repoPath,
       windowsHide: true,
+      // 同 gitCapture：hash-object 会跑用户仓配置的 clean 过滤器（filter.<n>.clean 是任意命令）（Q1-04）
+      env: stripHostInjectedEnv(),
     });
     let out = "";
     const timer = setTimeout(() => {
@@ -1081,7 +1086,14 @@ const runShell = (
     let stderr = "";
     // windowsHide：Windows 上从无控制台的 GUI 进程（Electron 壳）起 console 子进程
     // 会闪黑框、CREATE_NO_WINDOW 压掉（mac/linux 无此概念、传了无副作用）
-    const proc = spawn(cmd, args, { cwd, shell: false, windowsHide: true });
+    // env 剔宿主注入变量：这里目前只跑 git 读命令（rev-parse / status / log），但 git 会读用户仓配置
+    // （fsmonitor 钩子、外部 diff 驱动等），与其它 spawn 出口保持一致、不把宿主环境交出去
+    const proc = spawn(cmd, args, {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      env: stripHostInjectedEnv(),
+    });
     let timer: NodeJS.Timeout | null = setTimeout(() => {
       try {
         proc.kill("SIGKILL");

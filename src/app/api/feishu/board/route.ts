@@ -19,6 +19,7 @@
 
 import { NextResponse } from "next/server";
 
+import { mergeBoardWindows, splitBoardWindows } from "@/lib/board-range";
 import { extractFeishuStoryId } from "@/lib/branch-template";
 import {
   fetchMyUserKey,
@@ -38,6 +39,21 @@ import { failpoint } from "@/lib/server/failpoints";
 export const runtime = "nodejs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 看板每次请求都要 host 拼详情页链接：meegleAuthStatus 走进程级串行队列且无缓存，
+ * 连点平移会让它排到前面一堆 CLI 调用后面。host 基本不变——只缓存「已登录且拿到 host」的结果 60s（D2a-04）。
+ */
+let authHostCache: { at: number; host: string | undefined } | null = null;
+const AUTH_HOST_TTL_MS = 60_000;
+const cachedAuthHost = async (): Promise<{ host: string | undefined }> => {
+  if (authHostCache && Date.now() - authHostCache.at < AUTH_HOST_TTL_MS) {
+    return { host: authHostCache.host };
+  }
+  const st = await meegleAuthStatus();
+  if (st.authenticated && st.host) authHostCache = { at: Date.now(), host: st.host };
+  return { host: st.host };
+};
 
 export const GET = async (req: Request) => {
   const url = new URL(req.url);
@@ -62,13 +78,26 @@ export const GET = async (req: Request) => {
       });
     }
 
-    // workhour 接口约束：单次跨度 ≤ 3 个月——超出的按 90 天截断（甘特窗口不会这么大）
-    const clampedTo = Math.min(to, from + 90 * DAY_MS);
-    const items = await fetchUserSchedule(project, myKey, from, clampedTo);
+    // workhour 接口约束：单次跨度 ≤ 3 个月。半年预设 / 日历任意区间会超出——
+    // 按 ≤90 天分段串行请求、合并去重（以前直接截断：后面的排期静默为空，界面却照画满列，D2a-02）。
+    // 客户端换区间会 abort 旧请求：每段之前先看 signal，别把串行队列白白跑完（D2a-04）
+    const { windows, truncated } = splitBoardWindows(from, to);
+    const parts: Awaited<ReturnType<typeof fetchUserSchedule>>[] = [];
+    for (const w of windows) {
+      if (req.signal.aborted) {
+        return NextResponse.json(
+          { status: "error", message: "请求已取消" },
+          { status: 499 },
+        );
+      }
+      parts.push(await fetchUserSchedule(project, myKey, w.from, w.to));
+    }
+    const items = mergeBoardWindows(parts);
+    const clampedTo = windows[windows.length - 1]?.to ?? to;
 
     // url 兜底（feishuStoryUrl 关联 + AI 拉需求入口）：simple_name 拼标准详情页路径
     const [{ host }, simpleNames] = await Promise.all([
-      meegleAuthStatus(),
+      cachedAuthHost(),
       fetchProjectSimpleNames(),
     ]);
     const simple = simpleNames.get(project);
@@ -107,7 +136,13 @@ export const GET = async (req: Request) => {
     console.log(
       `[feishu-board] project=${project} 区间 ${new Date(from).toISOString().slice(0, 10)}~${new Date(clampedTo).toISOString().slice(0, 10)}：${linked.length} 项、关联任务 ${linked.filter((i) => i.task).length} 项`,
     );
-    return NextResponse.json({ status: "ok", projects, items: linked });
+    return NextResponse.json({
+      status: "ok",
+      projects,
+      items: linked,
+      // 区间超过单次最大分段数时只查了前面一部分：前端据此提示实际覆盖到哪天
+      ...(truncated ? { coveredTo: clampedTo } : {}),
+    });
   } catch (err) {
     if (err instanceof MeegleError) {
       return NextResponse.json({ status: err.kind, message: err.message });

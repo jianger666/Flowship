@@ -993,8 +993,9 @@ const buildDevDirective = (action: ActionRecord): string | undefined => {
   }
   return [
     "[DEV_PUSH_MODE] 本次联调走「直推」：",
-    "- 本地基于 origin/dev 切 dev、把 feature merge 进来、直推 origin/dev（feature 分支全程不动）。",
-    "- 冲突处理按 action-dev.md「直推」段走（在本地 dev 上 AI 智能解 / 用户自己解）。",
+    // 不能再写「切本地 dev」：任务工作区与主仓共享分支 refs，checkout -B dev 会把用户主仓同名本地 dev 一并重置（review #10）
+    "- 基于 origin/dev 切 detached HEAD（git checkout --detach origin/<dev>、不创建 / 不重置任何本地 dev 分支）、把 feature merge 进来、git push origin HEAD:refs/heads/<dev> 直推（feature 分支全程不动）。",
+    "- 冲突处理按 action-dev.md「直推」段走（在 detached HEAD 上 AI 智能解 / 用户自己解）。",
     "- 不要走提 PR（不调 submit_mr）。",
   ].join("\n");
 };

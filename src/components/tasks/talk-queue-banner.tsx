@@ -20,6 +20,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { Tooltip } from "@/components/ui/tooltip";
 import { removeTalkQueueItems, type TalkQueueItem } from "@/lib/task-store";
 import { TALK_QUEUE_SOURCE_LABEL } from "@/lib/talk-queue";
 
@@ -35,14 +36,28 @@ export const TalkQueueBanner = ({ taskId, talkQueue }: Props) => {
   const [open, setOpen] = useState(false);
   // 删除飞行中的条目 id（行内按钮 disabled 防连点；快照里消失后无需再清）
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(new Set());
-  // 上一次的条数：用来识别「从无到有」的那一下
-  const prevCountRef = useRef(0);
+  // 面板是不是「自动弹开」的：自动弹开时不抢焦点（用户正在输入框里打字，焦点被抢到第一个按钮上，
+  // 接着打的字落不进输入框、按空格 / 回车会直接触发按钮——第二轮 review U3b-02）；手动点开照常聚焦
+  const [autoOpened, setAutoOpened] = useState(false);
+  // 上一次的条数：用来识别「从无到有」的那一下。
+  // 初值取挂载时的条数（N1）：进入一个本来就有排队的任务不算「从无到有」，不弹（否则切回来时
+  // composer 的自动聚焦会被弹层抢走）
+  const prevCountRef = useRef(queuedCount);
 
   useEffect(() => {
     const prev = prevCountRef.current;
     prevCountRef.current = queuedCount;
-    if (prev <= 0 && queuedCount > 0) setOpen(true);
+    if (prev <= 0 && queuedCount > 0) {
+      setAutoOpened(true);
+      setOpen(true);
+    }
   }, [queuedCount]);
+
+  const handleOpenChange = (next: boolean) => {
+    // 用户手动开 / 关：之后再开都按正常交互处理（聚焦进弹层）
+    setAutoOpened(false);
+    setOpen(next);
+  };
 
   const handleDelete = (itemId: string) => {
     setDeleting((prev) => new Set(prev).add(itemId));
@@ -62,29 +77,38 @@ export const TalkQueueBanner = ({ taskId, talkQueue }: Props) => {
   if (queuedCount <= 0) return null;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        render={
-          <button
-            type="button"
-            title="点击管理排队消息"
-            className="mx-2.5 mb-1.5 flex cursor-pointer items-center gap-2 rounded-full border border-primary/30 bg-primary/10 px-3 py-1.5 text-left text-xs font-medium text-foreground shadow-sm transition-colors hover:bg-primary/15"
-          >
-            <span className="relative flex size-2 shrink-0">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/50" />
-              <span className="relative inline-flex size-2 rounded-full bg-primary" />
-            </span>
-            <span className="inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-primary-foreground">
-              {queuedCount}
-            </span>
-            <span className="min-w-0 flex-1 truncate">
-              条消息排队中，当前这轮跑完自动送达
-            </span>
-            <ChevronRight className="size-3.5 shrink-0 opacity-70" />
-          </button>
-        }
-      />
-      <PopoverContent align="start" className="w-80 p-2">
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      {/* hover 提示走 Tooltip、不用原生 title（规范「Hover 提示」）。PopoverTrigger.render 必须是可交互 DOM，
+          Tooltip 不透传 onClick / ref，塞进 render 会让点击打不开面板——所以包在外层 span（同 chat-mcp-picker）；
+          原先挂在 button 上的 mx / mb 与 flex 版式搬到外层 span，button 用 flex-1 铺满 */}
+      <Tooltip content="点击管理排队消息">
+        <span className="mx-2.5 mb-1.5 flex">
+          <PopoverTrigger
+            render={
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-full border border-primary/30 bg-primary/10 px-3 py-1.5 text-left text-xs font-medium text-foreground shadow-sm transition-colors hover:bg-primary/15"
+              >
+                {/* 静态点：事件流 v2「动效同屏只留一处主动效」——同屏已有状态行 shimmer，
+                    排队条的点不再 animate-ping（它也没登记 prefers-reduced-motion 静止态） */}
+                <span className="size-2 shrink-0 rounded-full bg-primary" aria-hidden />
+                <span className="inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-primary-foreground">
+                  {queuedCount}
+                </span>
+                <span className="min-w-0 flex-1 truncate">
+                  条消息排队中，当前这轮跑完自动送达
+                </span>
+                <ChevronRight className="size-3.5 shrink-0 opacity-70" />
+              </button>
+            }
+          />
+        </span>
+      </Tooltip>
+      <PopoverContent
+        align="start"
+        className="w-80 p-2"
+        initialFocus={!autoOpened}
+      >
         <div className="mb-1.5 px-1 text-xs font-medium">排队中的消息</div>
         {talkQueue.length === 0 ? (
           <EmptyHint className="px-1 py-2">队列已空</EmptyHint>
@@ -118,17 +142,23 @@ export const TalkQueueBanner = ({ taskId, talkQueue }: Props) => {
                     {it.preview}
                   </p>
                 </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  title="从队列移除"
-                  disabled={deleting.has(it.id)}
-                  className="shrink-0 text-muted-foreground hover:text-destructive"
-                  onClick={() => handleDelete(it.id)}
-                >
-                  <Trash2 />
-                </Button>
+                {/* 删除飞行中 Button 是原生 disabled、收不到鼠标事件——Tooltip 挂外层 span；
+                    纯图标钮补 aria-label */}
+                <Tooltip content="从队列移除">
+                  <span className="inline-flex shrink-0">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="从队列移除"
+                      disabled={deleting.has(it.id)}
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={() => handleDelete(it.id)}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </span>
+                </Tooltip>
               </li>
             ))}
           </ul>

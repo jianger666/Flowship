@@ -20,6 +20,7 @@ import {
   defaultModelForProvider,
   isCursorProvider,
 } from "@/lib/types";
+import { validateCustomBaseUrl } from "@/lib/custom-provider-url";
 import { getSettings } from "@/lib/local-store";
 import { resolveSessionModel } from "@/lib/task-model";
 
@@ -74,12 +75,8 @@ export const customProviderDisplayName = (p: CustomProviderConfig): string =>
 export const isCustomProviderReady = (p: CustomProviderConfig): boolean => {
   const url = p.baseUrl.trim();
   if (!url) return false;
-  try {
-    const u = new URL(url);
-    return u.protocol === "http:" || u.protocol === "https:";
-  } catch {
-    return false;
-  }
+  // 含 userinfo 的地址 fetch 会直接抛错（还把密钥回显出来）：不算配好（D1-05）
+  return validateCustomBaseUrl(url) === null;
 };
 
 export const providerDisplayName = (
@@ -155,11 +152,35 @@ export const migrateProviderSettings = (parsed: {
   }
   if (
     provider !== CURSOR_PROVIDER_ID &&
-    !list.some((p) => p.id === provider && isCustomProviderReady(p))
+    !list.some((p) => p.id === provider && isProviderKeepableAsDefault(p))
   ) {
     provider = CURSOR_PROVIDER_ID;
   }
   return { provider, customProviders: list };
+};
+
+/**
+ * 默认提供方指向的条目能不能原样保留：配好的当然可以；**地址写了但校验不过**（含 userinfo / 缺协议头…）也保留——
+ * 不能因为「不算配好」就把默认静默改成 Cursor（新对话会默认走 Cursor 云端、数据出域且无提示，第四轮 Q2-07）。
+ * 保留后发送时由 `customProviderNotReadyReason` 说明真实原因；只有没填地址的草稿 / 已删的条目才回退 Cursor。
+ */
+const isProviderKeepableAsDefault = (p: CustomProviderConfig): boolean =>
+  isCustomProviderReady(p) || p.baseUrl.trim() !== "";
+
+/**
+ * 自定义提供方「不能发请求」的具体原因（给 toast / 错误文案用）；能发（或是 Cursor / 条目不存在）→ null。
+ * 地址为空 → 「缺少自定义 Provider 接口地址」；地址写了但无效 → validateCustomBaseUrl 的原因（别说「缺少地址」，用户明明填了）。
+ */
+export const customProviderNotReadyReason = (
+  settings: Pick<FeAiFlowSettings, "customProviders"> | null | undefined,
+  providerId: string,
+): string | null => {
+  if (isCursorProvider(providerId)) return null;
+  const cp = findCustomProvider(settings, providerId);
+  if (!cp) return null;
+  if (!cp.baseUrl.trim()) return "缺少自定义 Provider 接口地址";
+  const invalid = validateCustomBaseUrl(cp.baseUrl);
+  return invalid ? `自定义 Provider「${customProviderDisplayName(cp)}」的接口地址无效：${invalid}` : null;
 };
 
 export const findCustomProvider = (
@@ -289,6 +310,48 @@ export const resolveTaskProvider = (
   }
   return CURSOR_PROVIDER_ID;
 };
+
+/**
+ * 任务显式绑定了一个自定义提供方、但那条目已被删除（或「删了重加」换了新 id）。
+ * resolveTaskProvider 对这种任务会落回 Cursor——发送路径若照常发，旧对话的上下文 / 代码会悄悄改走 Cursor 云端
+ * （用户选内网网关的初衷是数据不出域，第三轮 D1-03）。发送前用它拦住，让用户先在底栏重新选提供方。
+ * 「条目还在但地址被清空」不算：那条走凭据校验失败（有明确报错）。老值 `custom` 能映射到某条也不算。
+ */
+export const isTaskProviderDangling = (
+  task: { provider?: string },
+  settings: Pick<FeAiFlowSettings, "customProviders"> | null | undefined,
+): boolean => {
+  const id = task.provider;
+  if (!id || isCursorProvider(id)) return false;
+  const list = settings?.customProviders ?? [];
+  if (id === "custom") {
+    return !list.find((p) => p.id === LEGACY_CUSTOM_PROVIDER_ID) && !list.some(isCustomProviderReady);
+  }
+  return !list.some((p) => p.id === id);
+};
+
+/**
+ * 提供方下拉要显示的值：绑定的条目已删除时给出那个悬空 id（下拉里找不到它 → 显示占位「请重选」，
+ * 选任意一家都会触发切换、写回 task.provider）；否则同 resolveTaskProvider。
+ * 不能用 resolveTaskProvider 的结果直接显示——它在这种情况下落回 Cursor，用户再选 Cursor 就是
+ * 「选了当前值」而不触发切换，永远摆脱不掉悬空绑定。
+ */
+export const resolveTaskProviderForPicker = (
+  task: { provider?: string; sessionAgentId?: string },
+  settings: Pick<FeAiFlowSettings, "customProviders"> | null | undefined,
+): AgentProviderId =>
+  task.provider && isTaskProviderDangling(task, settings)
+    ? task.provider
+    : resolveTaskProvider(task, settings);
+
+export const DANGLING_TASK_PROVIDER_MESSAGE =
+  "这个对话原来绑定的提供方已被删除，请先在输入框底部重新选择提供方再发送";
+
+/** 设置页删除提供方前统计「还有多少对话 / 任务绑着它」（确认文案用） */
+export const countTasksBoundToProvider = (
+  tasks: ReadonlyArray<{ provider?: string }>,
+  providerId: string,
+): number => tasks.filter((t) => t.provider === providerId).length;
 
 export const getModelCredsForProvider = (
   settings: Pick<FeAiFlowSettings, "apiKey" | "customProviders">,

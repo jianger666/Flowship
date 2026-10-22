@@ -16,6 +16,7 @@ import {
   isAskWaitCommand,
   toolArgsLookLikeAskWait,
 } from "@/lib/ask-wait-detect";
+import { detectAgentShellKind, type AgentShellKind } from "./agent-shell";
 
 export { isAskWaitCommand, toolArgsLookLikeAskWait };
 
@@ -133,8 +134,17 @@ export const askWaitListenPort = (): string =>
 export const buildAskWaitUrl = (taskId: string, token: string): string =>
   `http://127.0.0.1:${askWaitListenPort()}/api/tasks/${encodeURIComponent(taskId)}/ask-wait?token=${encodeURIComponent(token)}`;
 
-export const buildAskWaitCurl = (taskId: string, token: string): string =>
-  `curl -NsS --no-buffer ${JSON.stringify(buildAskWaitUrl(taskId, token))}`;
+/**
+ * 返给模型的前台 curl。Windows 默认壳是 PowerShell 5.1，`curl` 是 Invoke-WebRequest 的别名，
+ * `-NsS --no-buffer` 直接报参数错误、同一轮继续的协议退化成靠 send（同仓 GitLab 段已写 curl.exe）。
+ * Git Bash / mac / linux 保持裸 `curl`。
+ */
+export const buildAskWaitCurl = (
+  taskId: string,
+  token: string,
+  shellKind: AgentShellKind = detectAgentShellKind(),
+): string =>
+  `${shellKind === "PowerShell" ? "curl.exe" : "curl"} -NsS --no-buffer ${JSON.stringify(buildAskWaitUrl(taskId, token))}`;
 
 /**
  * 提问受理后开槽。同一 task 新提问顶旧槽（旧 curl 会被关掉）。

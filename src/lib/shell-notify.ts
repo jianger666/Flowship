@@ -11,10 +11,15 @@
 
 import { toast } from "sonner";
 
+/** 点通知后页面要去的非任务目标（N1-12：收件箱增量通知 → 打开收件箱） */
+export type NotifyTarget = "inbox";
+
 interface TaskNotifyPayload {
   title: string;
   body?: string;
   taskId?: string;
+  /** 无 taskId 时的点击去向；壳会在点击后回传给 onNotifyTargetClick 订阅者 */
+  target?: NotifyTarget;
 }
 
 declare global {
@@ -23,6 +28,8 @@ declare global {
     __notify?: {
       send: (payload: TaskNotifyPayload) => void;
       onNotifyClick: (callback: (taskId: string) => void) => () => void;
+      /** 点了带 target 的通知（旧壳无此方法，调用方要容错） */
+      onTargetClick?: (callback: (target: string) => void) => () => void;
     };
     /** Electron preload 暴露的壳能力（与 app-header 声明合并） */
     __shell?: {
@@ -60,6 +67,17 @@ export const sendTaskNotification = (payload: TaskNotifyPayload): void => {
 export const onTaskNotifyClick = (
   callback: (taskId: string) => void,
 ): (() => void) => window.__notify?.onNotifyClick(callback) ?? (() => {});
+
+/**
+ * 订阅「用户点了带 target 的通知」（N1-12）：只回调已知 target（目前仅 "inbox"），
+ * 旧壳 / 非桌面端没有通道时返回 no-op。
+ */
+export const onNotifyTargetClick = (
+  callback: (target: NotifyTarget) => void,
+): (() => void) =>
+  window.__notify?.onTargetClick?.((target) => {
+    if (target === "inbox") callback(target);
+  }) ?? (() => {});
 
 /**
  * Windows 任务栏 overlay：canvas 画红圆底白数字（≤9 数字、>9 为「9+」）。

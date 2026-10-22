@@ -20,6 +20,14 @@ import { getTask } from "./task-fs";
 import { writeEventAndPublish } from "./task-stream";
 
 /**
+ * 作废事件的正文：「上一组提问已失效（{原因}），无需再回答。」
+ * 原因由调用方给、只写名词短语（「用户停止」「推进新阶段」）——旧句式把原因拼进「因…失效」里，
+ * 原因本身带「失效」就叠字、带英文 action 就漏空格（第二轮 review V12-02）。
+ */
+export const formatSupersededAskText = (reason: string): string =>
+  `上一组提问已失效（${reason}），无需再回答。`;
+
+/**
  * 作废 task 下「当前还没被回答的 ask_user_request」。
  *
  * @param lease 可选；getTask / 写作废事件用 lease 门控——接管发生在其 IO 内时
@@ -55,7 +63,7 @@ export const supersedePendingAsks = async (
         actionId: ev.actionId,
         text: opts?.expired
           ? ASK_EXPIRED_EVENT_TEXT
-          : `上一组提问因${reason}失效、无需再回答。`,
+          : formatSupersededAskText(reason),
         meta: {
           supersededAskId: askId,
           ...(opts?.expired ? { [ASK_EXPIRED_META_KEY]: true } : {}),

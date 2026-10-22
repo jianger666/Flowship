@@ -44,6 +44,19 @@ jobs:
         env:
           BUILD_STANDALONE: "1"
 
+      # 组 electron job 复用的 server 布局。
+      # standalone 纯 JS 跨平台、ubuntu build 一份 win/mac 都用；且 win runner 上
+      # next build 会撞 EPERM scandir "Application Data" junction、必须绕开
+      - run: node scripts/assemble-electron-server.mjs
+
+      # 发版冒烟：把组好的 server 真启动一次（readyz → 首页 200 → 静态资源 200）。
+      # 此前整条发版链没有任何一步真跑过打出来的 server，而 finalize 会自动把 draft 转正——
+      # 「单测 / build 全绿、装上才发现 server 起不来」（缺依赖 / 漏拷 .next/static）只能靠用户踩。
+      # 放在建 release 占位之前：冒烟红了不会留下一个半成品 draft。
+      # 只覆盖 Linux 上的 server 布局；win / mac 平台包（@cursor/sdk-<platform>）由 electron job 里的实加载验真兜底。
+      - name: 冒烟：server 布局真启动一次
+        run: node scripts/smoke-boot-server.mjs --server-dir dist/app-server
+
       # 先建 release 占位（generate_release_notes）——让下游 win/mac electron job 的
       # electron-builder --publish 往同 tag release 追加 asset、不竞态创建。
       # 关键：建成 draft（不可见）——electron-builder getOrCreateRelease 会优先复用匹配
@@ -55,10 +68,8 @@ jobs:
           draft: true
           generate_release_notes: true
 
-      # 给 electron job 复用的 server 布局（tar 保留权限 / 防 artifact zip 丢元数据）。
-      # standalone 纯 JS 跨平台、ubuntu build 一份 win/mac 都用；且 win runner 上
-      # next build 会撞 EPERM scandir "Application Data" junction、必须绕开
-      - run: node scripts/assemble-electron-server.mjs && tar -czf app-server.tar.gz -C dist app-server
+      # tar 保留权限 / 防 artifact zip 丢元数据
+      - run: tar -czf app-server.tar.gz -C dist app-server
 
       - uses: actions/upload-artifact@v4
         with:

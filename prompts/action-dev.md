@@ -2,7 +2,7 @@
 
 dev action 的目标：把当前 task 各仓的代码改动送到该仓的 **dev 分支（联调分支、develop）**、触发联调流水线。两种推送方式（用户在推进 dialog 选、本次到底走哪种由载荷里的 `[DEV_PUSH_MODE]` 指令钉死、不要自己挑）：
 
-- **直推（direct）**：本地基于 `origin/<dev>` 把 feature 合进去、直接 push 到 `origin/<dev>`（开发对 dev 有直推权限）。最快触发流水线、不留 MR。
+- **直推（direct）**：基于 `origin/<dev>` 的 **detached HEAD**（不建、不重置任何本地 `<dev>` 分支）把 feature 合进去、直接 push 到 `origin/<dev>`（开发对 dev 有直推权限）。最快触发流水线、不留 MR。
 - **提 PR（mr）**：push feature 到 origin、调 `submit_mr` 建 `feature → <dev>` 的 MR（跟 ship 同一套、落详情页 MR 列表 + 冲突门禁）。
 
 > **dev 分支从哪来**：每仓的 dev 分支见 super prompt 顶部「## 仓库分支配置」段（建 task 时从设置页快照）。**没配 dev 分支的仓本 action 跳过**（联调必须显式配 dev 分支才知道推哪）、artifact 里写「跳过、原因：未配 dev 分支」。下文 `<dev>` 都指「该仓配置的 dev 分支」。
@@ -21,8 +21,9 @@ dev action 的目标：把当前 task 各仓的代码改动送到该仓的 **dev
 
 - **绝不把 dev 分支的内容弄到 feature 分支上**——不许 `git merge <dev>` / `git rebase <dev>` / `git pull origin <dev>` 到 feature、不许 force push feature。feature 永远保持干净、只单向往 dev 送。
 - 合并（feature → dev）只发生在**另一条分支**上、feature 本体不碰：
-  - 直推模式：在本地 `<dev>` 分支上 merge feature（checkout 到 dev、不动 feature）、解完直推 `origin/<dev>`。
+  - 直推模式：在 `origin/<dev>` 的 detached HEAD 上 merge feature（`git checkout --detach "origin/$DEV"`、不动 feature）、解完 `git push origin HEAD:"refs/heads/$DEV"` 直推。
   - 提 PR 模式：无冲突时 GitLab 端合；有冲突走 `<feature>__conflict` 一次性分支（同 ship §3.6、方向是 feature 合进 __conflict）。
+- **绝不在任务工作区里创建 / 重置 / 移动本地 `<dev>` 分支**——不许 `git checkout -B "$DEV" ...` / `git checkout -b "$DEV"` / `git branch -f "$DEV" ...` / `git reset` 到 `<dev>`。原因：任务工作区是 `git worktree`、**与用户主仓共享同一份分支 refs**；在这里把 `$DEV` 重置成 `origin/$DEV`，会把用户主仓里同名的本地 dev 分支一起改掉（主仓 index / 工作区还停在旧版本、`git status` 出现一份「已暂存的反向 diff」，随手 commit 就会把同事已合入 dev 的提交回滚掉）。需要 dev 的内容一律用 `origin/$DEV` 或 detached HEAD。
 - **先看载荷里的 `[DEV_PUSH_MODE]` 指令**决定走「直推」还是「提 PR」——只走指定那一套、不要两套都做、不要自作主张换。
 
 ## 单仓 vs 多仓
@@ -63,8 +64,9 @@ if [ -z "$CHANGES" ]; then
   echo "[skip] 本仓相对 origin/$DEV 无改动、跳过"; exit 0
 fi
 
-# 基于最新 dev 建/重置本地 dev 分支、把 feature 合进来（feature → dev、不是反过来）
-git checkout -B "$DEV" "origin/$DEV"
+# 基于最新 origin/dev 切到 detached HEAD（⚠️ 不要 checkout -B / -b / branch -f 本地 $DEV：
+# 任务工作区与主仓共享分支 refs、那样会把用户主仓里同名本地 dev 分支一并重置），再把 feature 合进来（feature → dev、不是反过来）
+git checkout --detach "origin/$DEV"
 git merge --no-ff "$FEATURE" -m "merge ${FEATURE} into ${DEV}（联调）" \
   || echo "[conflict] merge 进入冲突态、按下方「## 冲突处理」走、先别 push"
 ```
@@ -72,18 +74,19 @@ git merge --no-ff "$FEATURE" -m "merge ${FEATURE} into ${DEV}（联调）" \
 **merge 干净（无冲突）** → 直接 push：
 
 ```bash
-# dev 有直推权限、推回 origin/dev（绝不 force、绝不碰 feature）
-if ! git push origin "$DEV":"$DEV" 2>&1; then
+# dev 有直推权限、把 detached HEAD（= origin/dev + 合入的 feature）推回 origin/dev（绝不 force、绝不碰 feature）。
+# 目标写全名 refs/heads/$DEV：远程同时有同名 tag 时 HEAD:$DEV 会报歧义
+if ! git push origin HEAD:"refs/heads/$DEV" 2>&1; then
   echo "[error] push origin/$DEV 失败（可能别人刚推了 dev、non-fast-forward）、绝不 force"
   git checkout "$FEATURE"   # 恢复 HEAD、报用户重跑（重跑会重新 fetch 最新 dev）
   exit 1
 fi
 HEAD_SHA=$(git rev-parse HEAD)
-git checkout "$FEATURE"      # 恢复 HEAD 到 feature、防后续误把本地 dev 当工作分支
+git checkout "$FEATURE"      # 恢复 HEAD 到 feature 分支（别停在 detached、也不留任何本地 dev 分支）
 echo "[ok] DEV=$DEV HEAD=$HEAD_SHA pushed origin/$DEV"
 ```
 
-**merge 有冲突** → 走「## 冲突处理」（直推模式在**当前本地 dev 分支**上解、feature 不动）。
+**merge 有冲突** → 走「## 冲突处理」（直推模式在 **`origin/<dev>` 的 detached HEAD** 上解、feature 不动）。
 
 > ⚠️ 直推没有 MR、冲突是本地 `git merge` 当场暴露的（不靠 server poll）。解完直推即触发流水线。
 
@@ -165,9 +168,9 @@ ask_user({
 
 解冲突标记的通用原则：`git diff --name-only --diff-filter=U` 拿冲突清单 → 逐个 `read` → 按 `<<<<<<<` / `=======` / `>>>>>>>` 智能合并（**保留 feature 这次任务的业务意图、同时纳入 dev 在冲突处的改动**、一般两边都要、不是二选一）→ 拿不准（语义冲突 / 两边逻辑互斥 / 删改冲突）就停下来 `ask_user` 把这处贴出来问用户。
 
-- **直推模式 + 选 AI 解**：此刻已在本地 dev 分支的 merge 冲突态、就地解：解完 `git diff --check` 确认无残留 → `git add -A && git commit --no-edit` → `git push origin "$DEV":"$DEV"` → `git checkout "$FEATURE"`。
+- **直推模式 + 选 AI 解**：此刻已在 `origin/<dev>` detached HEAD 上的 merge 冲突态、就地解（别新建本地 dev 分支）：解完 `git diff --check` 确认无残留 → `git add -A` → `git commit --no-edit`（分开执行、不用 `&&` 串，PowerShell 5.x 不支持）→ `git push origin HEAD:"refs/heads/$DEV"` → `git checkout "$FEATURE"` 回到 feature。push 被拒（non-fast-forward）同样先 `git checkout "$FEATURE"` 回 feature、报用户重跑、绝不 force。
 - **提 PR 模式 + 选 AI 解**：走 ship §3.6 同款 `__conflict` 一次性分支（`git checkout -B "${FEATURE}__conflict" "origin/$DEV"` → `git merge --no-ff "$FEATURE"` 解冲突 → `git push -f` 该 __conflict 分支 → `git checkout "$FEATURE"` → 对本仓重调 `submit_mr`、`source_branch` 改成 `__conflict`、`target_branch` 仍是 dev 分支）。server 会自动关掉被取代的旧 MR、别手动折腾。
-- **选自己解**：直推模式 `git merge --abort` 回干净态 + `git checkout "$FEATURE"`；提 PR 模式留着现状、等用户解完回复后重跑联调 action。
+- **选自己解**：直推模式先 `git merge --abort` 回干净态、再 `git checkout "$FEATURE"` 回 feature（两步分开执行）；提 PR 模式留着现状、等用户解完回复后重跑联调 action。
 
 ---
 
@@ -195,7 +198,7 @@ artifact 路径：`actions/<N>-dev.md`、按下方骨架写、写完按 super-pr
 ## §3 自检
 - typecheck: ✅ / ❌
 - lint: ✅ / ❌
-- git status 干净（已 checkout 回 feature）: ✅ / ❌
+- git status 干净（已 checkout 回 feature、没停在 detached HEAD、没创建 / 重置本地 dev 分支）: ✅ / ❌
 
 ## §4 待澄清 / 风险
 <跳仓 / 冲突用户自己解 / push 失败 / MR 失败的、列这里>
@@ -211,6 +214,7 @@ artifact 路径：`actions/<N>-dev.md`、按下方骨架写、写完按 super-pr
 - ❌ 没配 dev 分支的仓硬推（跳过、artifact 记原因）
 - ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不落库、详情页看不到）
 - ❌ push 被拒（non-fast-forward）时 force push 覆盖远程（绝对不、报用户处理 / 重跑）
+- ❌ 在任务工作区里 `git checkout -B "$DEV" "origin/$DEV"` / `git checkout -b` / `git branch -f` / `git reset` 本地 dev 分支（worktree 与主仓共享 refs、会把用户主仓同名本地 dev 分支重置成 origin 并留下反向暂存 diff；直推一律走 `git checkout --detach "origin/$DEV"`）
 - ❌ 交卷后自动跑下一 action（绝对不、说完结论即结束回复、等用户推进）
 
 ## 调用礼仪

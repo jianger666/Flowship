@@ -50,6 +50,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { RowViewStateScope } from "@/hooks/use-row-view-state";
 import { useStreamFollow } from "@/hooks/use-stream-follow";
 import { useSubagentRun } from "@/hooks/use-subagent-run";
 import { isToolBlock, isToolVerbGroup } from "@/lib/tool-display";
@@ -317,53 +318,58 @@ const RunProcess = ({
 
   const lastIdx = items.length - 1;
   return (
-    <div className="min-w-0 space-y-0.5">
-      {items.map((item, i) => {
-        const isLast = i === lastIdx;
-        if (item.kind === "__work_group__") {
+    // 行视图状态（展开 / 折叠 / 加载完的完整输出）的作用域 = 这份子代理记录：过程记录里的行 id 是 sr_1、sr_2…
+    // 每份记录都从 1 开始，而 taskId 又和主流相同——不隔离的话，这里点开的工具块会和主流 / 别的子代理里
+    // 同 id 的行串状态（V2-05）
+    <RowViewStateScope.Provider value={`sa:${snapshot.meta.key}`}>
+      <div className="min-w-0 space-y-0.5">
+        {items.map((item, i) => {
+          const isLast = i === lastIdx;
+          if (item.kind === "__work_group__") {
+            return (
+              <WorkGroupRow
+                key={item.id}
+                group={item}
+                taskId={task.id}
+                task={task}
+                variant="chat"
+                // 专门来看过程的面板：打开就是展开的，完成了也不自动收起
+                defaultExpanded
+                isRunningTail={running && isLast}
+                showProcessingPlaceholder={running && isLast && !item.hasRunning}
+              />
+            );
+          }
+          if (isToolBlock(item)) {
+            return <ToolBlockRow key={item.id} block={item} taskId={task.id} />;
+          }
+          if (isToolVerbGroup(item)) {
+            return <ToolVerbGroupRow key={item.id} group={item} taskId={task.id} />;
+          }
+          if (item.kind === "assistant_message") {
+            return (
+              <SubagentReplyRow
+                key={item.id}
+                ev={item}
+                // 只有最后一段回复、且子代理还在跑时才可能还在吐字
+                streaming={running && isLast}
+                baseDir={baseDir}
+              />
+            );
+          }
           return (
-            <WorkGroupRow
+            <EventRow
               key={item.id}
-              group={item}
+              ev={item}
               taskId={task.id}
               task={task}
               variant="chat"
-              // 专门来看过程的面板：打开就是展开的，完成了也不自动收起
-              defaultExpanded
-              isRunningTail={running && isLast}
-              showProcessingPlaceholder={running && isLast && !item.hasRunning}
+              runActive={running}
             />
           );
-        }
-        if (isToolBlock(item)) {
-          return <ToolBlockRow key={item.id} block={item} taskId={task.id} />;
-        }
-        if (isToolVerbGroup(item)) {
-          return <ToolVerbGroupRow key={item.id} group={item} taskId={task.id} />;
-        }
-        if (item.kind === "assistant_message") {
-          return (
-            <SubagentReplyRow
-              key={item.id}
-              ev={item}
-              // 只有最后一段回复、且子代理还在跑时才可能还在吐字
-              streaming={running && isLast}
-              baseDir={baseDir}
-            />
-          );
-        }
-        return (
-          <EventRow
-            key={item.id}
-            ev={item}
-            taskId={task.id}
-            task={task}
-            variant="chat"
-            runActive={running}
-          />
-        );
-      })}
-    </div>
+        })}
+      </div>
+    </RowViewStateScope.Provider>
   );
 };
 

@@ -94,6 +94,7 @@ import {
   SESSION_ROTATION_INFO_TEXT,
 } from "@/lib/server/session-rotate";
 import { buildSkillDirective } from "@/lib/protocol-signals";
+import { announceSessionRebuilt } from "@/lib/server/session-rebuilt-notice";
 import { notePrep } from "./run-prep-notes";
 import { appendTimingLog } from "./timing-log";
 import { heapPressure } from "./sdk-store-gc";
@@ -547,6 +548,28 @@ const runChatReplyInject = async (
   // 提到模式判断前声明（原在模式 2 处、模式 1 引用会 TDZ 报错）
   const bootArgs = parsed.bootArgs;
 
+  // S2a-05：本请求已经为「会话重建」写过自己的 info（换提供方 / 保命轮换）→ 后面不再补第二条
+  let rebuildInfoCovered = false;
+  /**
+   * runChatSession 同步前奏跑完（「启动中」占位已挂、已转交 runner；会话未必已真正建成）之后，
+   * 告诉用户「AI 保留了多少上文」（第四轮 Q5-08：以前写成「已确认起来」，与时序不符）。
+   * 只要「新会话 + 有历史切片」就算重建——懒重启（换模型 / MCP / 工作目录）、resume 失败降级、
+   * 锚点丢失后重起都走这里；新对话首条没有历史、自然不写。
+   * 排除口径与 runChatSession 的 loadChatHistoryInject 一致（skipEventId / skipUserText）。
+   * best-effort：写提示失败绝不能让已经起来的会话 / 已受理的消息回头报错。
+   */
+  const announceRebuiltIfNeeded = async (skip: {
+    skipEventId?: string;
+    skipUserText?: string;
+  }): Promise<void> => {
+    if (rebuildInfoCovered) return;
+    try {
+      await announceSessionRebuilt(task.id, skip);
+    } catch (err) {
+      console.warn(`[chat-reply] 会话重建提示失败 task=${task.id}:`, err);
+    }
+  };
+
   // V0.11.1：内存没会话但有落盘锚点（服务重启 / 空闲回收后）→ 先 Agent.resume 接回、
   // 下面统一走「有会话」分支 send 续接、上下文不丢。resume 失败会清锚点、自然落到起新会话。
   // 本请求是预约赢家 → claimRun 认领首发，勿在通用 resume 里无条件 flush。
@@ -880,6 +903,7 @@ const runChatReplyInject = async (
           kind: "info",
           text: `已切换到 ${label}，本窗口用新会话继续，上方历史仍保留。`,
         });
+        rebuildInfoCovered = true;
       }
       // 保命轮换提示（2026-09-03 OOM 根治）：info 事件在事件流里显示为灰色居中细线、无需 UI 改动
       if (rotationDue) {
@@ -887,6 +911,7 @@ const runChatReplyInject = async (
           kind: "info",
           text: SESSION_ROTATION_INFO_TEXT,
         });
+        rebuildInfoCovered = true;
       }
     }
   }
@@ -1101,6 +1126,11 @@ const runChatReplyInject = async (
           // starting 占位已挂 → transfer 给 runner（非 handedOff）
           agentStarted = true;
           endChatQueueInFlight(task.id);
+          // 与 runChatSession 同口径排除当前这条（skipPersistEvent 路径没有 firstMessageEventId、按文本排）
+          await announceRebuiltIfNeeded({
+            skipEventId: firstMessageEventId,
+            skipUserText: head.agentText,
+          });
         } else {
           // lease_cancelled 且未 settle（无 clientItemId 等）→ 重排
           failHeadIfPersistedOrRequeue();
@@ -1216,6 +1246,11 @@ const runChatReplyInject = async (
     agentStarted = true;
     // 新会话已带着这条消息（含跳过上下文）起来了 → 落跳过标记
     await askSkip.commit();
+    // 懒重启 / resume 失败降级后的新会话：告诉用户 AI 保留了多少上文（首条消息无历史则不写）
+    await announceRebuiltIfNeeded({
+      skipEventId: replyEvent?.id,
+      skipUserText: agentText,
+    });
 
     const fresh = await getTask(task.id);
     const phase =

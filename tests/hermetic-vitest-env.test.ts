@@ -8,7 +8,7 @@
  *   D. 端到端：用「继承了桌面包数据目录」的环境真拉起一个 vitest，检查假的桌面包数据没被动过——
  *      事故的根因是环境传递 + 模块加载时钉死 DATA_DIR，单元测试看不见，只能真跑一遍。
  */
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +19,9 @@ import { HOST_INJECTED_ENV_KEYS } from "@/lib/server/host-env";
 import { isValidMetaShape } from "@/lib/server/task-fs-core";
 import {
   applyHermeticEnv,
+  applyHermeticGitEnv,
   assertEnvNotAppData,
+  HERMETIC_GIT_IDENTITY,
   type EnvBag,
 } from "./helpers/hermetic-env";
 
@@ -89,6 +91,92 @@ describe("A · applyHermeticEnv（纯逻辑）", () => {
   });
 });
 
+describe("A · applyHermeticGitEnv（git 配置隔离）", () => {
+  it("全局配置指向 os.devNull、不读系统配置、禁交互提示，并给兜底提交身份", () => {
+    const env: EnvBag = {
+      GIT_CONFIG_GLOBAL: "/Users/me/.gitconfig-with-gpgsign",
+      GIT_AUTHOR_NAME: "someone-else",
+    };
+    applyHermeticGitEnv(env);
+    expect(env.GIT_CONFIG_GLOBAL).toBe(os.devNull);
+    expect(env.GIT_CONFIG_NOSYSTEM).toBe("1");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    for (const k of [
+      "GIT_AUTHOR_NAME",
+      "GIT_COMMITTER_NAME",
+    ] as const) {
+      expect(env[k]).toBe(HERMETIC_GIT_IDENTITY.name);
+    }
+    for (const k of [
+      "GIT_AUTHOR_EMAIL",
+      "GIT_COMMITTER_EMAIL",
+    ] as const) {
+      expect(env[k]).toBe(HERMETIC_GIT_IDENTITY.email);
+    }
+  });
+
+  it("applyHermeticEnv 一并做 git 隔离（setupFiles 只调这一个入口）", () => {
+    const env: EnvBag = { GIT_CONFIG_GLOBAL: "/Users/me/.gitconfig" };
+    applyHermeticEnv(env, () => "/tmp/hermetic-git");
+    expect(env.GIT_CONFIG_GLOBAL).toBe(os.devNull);
+    expect(env.GIT_CONFIG_NOSYSTEM).toBe("1");
+    expect(env.GIT_AUTHOR_NAME).toBe(HERMETIC_GIT_IDENTITY.name);
+  });
+
+  it("端到端：全局配置开了 commit.gpgsign（签名程序必失败）+ 没配身份，隔离后 git commit 仍成功", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "flowship-hermetic-git-"));
+    try {
+      const badGlobal = path.join(root, "gitconfig");
+      fs.writeFileSync(
+        badGlobal,
+        "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n",
+        "utf-8",
+      );
+      const repo = path.join(root, "repo");
+      fs.mkdirSync(repo);
+      const run = (env: NodeJS.ProcessEnv, ...args: string[]): string =>
+        // stdio 全管道：对照组的「gpg failed to sign」是预期失败、别灌进测试输出
+        execFileSync("git", args, {
+          cwd: repo,
+          env,
+          encoding: "utf-8",
+          stdio: "pipe",
+        });
+
+      // 对照：没隔离时同一份全局配置确实会让 commit 失败（证明这条用例有牙，不是在测空气）
+      const dirty: NodeJS.ProcessEnv = {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: badGlobal,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@t.local",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@t.local",
+      };
+      run(dirty, "init", "-q", "-b", "main");
+      expect(() =>
+        run(dirty, "commit", "-q", "--allow-empty", "-m", "x"),
+      ).toThrow();
+
+      // 隔离后（含丢掉身份）：commit 成功
+      const hermetic: NodeJS.ProcessEnv = { ...dirty };
+      for (const k of [
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+      ]) {
+        delete hermetic[k];
+      }
+      applyHermeticGitEnv(hermetic as EnvBag);
+      run(hermetic, "commit", "-q", "--allow-empty", "-m", "x");
+      expect(run(hermetic, "log", "-1", "--format=%s").trim()).toBe("x");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("A · assertEnvNotAppData", () => {
   it("FLOWSHIP_DATA_DIR 指向桌面包数据目录（正式 / test 包）→ 抛错，并指明路径", () => {
     expect(() =>
@@ -124,6 +212,21 @@ describe("B · 当前测试进程的实际环境（setupFiles 真的生效了）
       if (key === "FLOWSHIP_DATA_DIR") continue;
       expect(process.env[key], key).toBeUndefined();
     }
+  });
+
+  it("git 配置已隔离：本机 / 系统的全局配置（commit.gpgsign、core.excludesfile 等）一条都读不到", () => {
+    expect(process.env.GIT_CONFIG_GLOBAL).toBe(os.devNull);
+    expect(process.env.GIT_CONFIG_NOSYSTEM).toBe("1");
+    expect(process.env.GIT_TERMINAL_PROMPT).toBe("0");
+    // 子进程（继承本进程 env）里真的读不到任何全局配置，而不只是「变量设了」
+    const listed = spawnSync("git", ["config", "--global", "--list"], {
+      encoding: "utf-8",
+    });
+    expect(listed.stdout.trim()).toBe("");
+    const gpg = spawnSync("git", ["config", "--get", "commit.gpgsign"], {
+      encoding: "utf-8",
+    });
+    expect(gpg.stdout.trim()).toBe("");
   });
 });
 

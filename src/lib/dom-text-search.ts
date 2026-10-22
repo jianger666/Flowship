@@ -49,17 +49,34 @@ const BLOCK_SELECTOR = [
   "ul",
 ].join(",");
 
+/**
+ * DOM 搜索不计的子树。模型侧（lib/markdown-visible-search 按 mdast 数命中）不计的东西，DOM 这边也得不计，
+ * 否则「第 k 个命中对第 k 个 DOM Range」会整体错位（D3-02）：
+ *  - 代码块头（Streamdown 的语言标签「ts / js / json / bash」——搜这些词必中）；
+ *  - mermaid 块（svg 里的文字 + 头部控件；模型侧不计 mermaid 围栏）；
+ *  - KaTeX 的 MathML 副本（同一个公式 DOM 里有 MathML + HTML 两份文字，会算两次）。
+ */
+export const DOM_SEARCH_IGNORE_SELECTOR = [
+  "[data-pane-search-ignore]",
+  '[data-streamdown="code-block-header"]',
+  '[data-streamdown="mermaid-block"]',
+  ".katex-mathml",
+  "script",
+  "style",
+  "noscript",
+  "textarea",
+  "input",
+  "select",
+  "option",
+  "[hidden]",
+  '[aria-hidden="true"]',
+].join(",");
+
 const isSearchableTextNode = (node: Text, root: Element): boolean => {
   if (!node.data) return false;
   const parent = node.parentElement;
   if (!parent || !root.contains(parent)) return false;
-  if (
-    parent.closest(
-      '[data-pane-search-ignore],script,style,noscript,textarea,input,select,option,[hidden],[aria-hidden="true"]',
-    )
-  ) {
-    return false;
-  }
+  if (parent.closest(DOM_SEARCH_IGNORE_SELECTOR)) return false;
   return true;
 };
 
@@ -125,15 +142,22 @@ export const findDomTextRanges = (root: Element, query: string): Range[] => {
   return ranges;
 };
 
+/**
+ * @param hitOwnerIds 模型侧有命中的 owner 白名单（D3-07）。给了就只扫这些 owner：
+ *   用户气泡 / 思考 / info 行也带 data-search-owner-id，但它们不进搜索索引——不限定的话会被涂黄却不计数、Enter 跳不到。
+ *   不传 = 扫全部 owner（旧行为）。
+ */
 export const findOwnerDomSearchMatches = (
   root: Element,
   query: string,
+  hitOwnerIds?: ReadonlySet<string>,
 ): DomSearchMatch[] => {
   const matches: DomSearchMatch[] = [];
   const owners = root.querySelectorAll<HTMLElement>("[data-search-owner-id]");
   owners.forEach((owner) => {
     const ownerId = owner.dataset.searchOwnerId;
     if (!ownerId) return;
+    if (hitOwnerIds && !hitOwnerIds.has(ownerId)) return;
     const markedRoots = Array.from(
       owner.querySelectorAll<HTMLElement>("[data-search-content]"),
     ).filter(

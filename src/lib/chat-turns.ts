@@ -14,7 +14,10 @@ import {
   isCompactionInfo,
   isCompactionRunning,
 } from "@/lib/compaction-display";
+import { isScheduleUserReply } from "@/lib/chat-stream-display";
 import { formatDurationCoarse } from "@/lib/duration-display";
+import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
+import { liveOutputTailLine } from "@/lib/live-output-cap";
 import { THINKING_LIVE_LABEL, type LiveThinking } from "@/lib/thinking-live";
 import type { TaskEvent } from "@/lib/types";
 import {
@@ -24,6 +27,7 @@ import {
   type ToolBlock,
   type ToolVerbGroup,
   isInTurnToolErrorEvent,
+  streamItemStableId,
 } from "@/lib/tool-display";
 import { WAIT_TOOL_NAME, waitToolSummary } from "@/lib/wait-display";
 
@@ -31,7 +35,12 @@ import { WAIT_TOOL_NAME, waitToolSummary } from "@/lib/wait-display";
 
 export type WorkGroupItem = {
   kind: "__work_group__";
-  /** 组内第一个成员的 id（分页 prepend 下稳定、用作 React key 与折叠 state key） */
+  /**
+   * 组内第一个成员的**稳定身份**（`streamItemStableId`：工具块 `tool:${callId}`、verb 组取首成员、其余事件 id），
+   * 用作 React key 与折叠 state key。不是「首成员的 id」：读类工具连续完成时单块会并成 verb 组、
+   * 连续待办会合并成取最新 call 的块，首成员的 id 因此会变；稳定身份不变（R4-01）。
+   * 追加成员不变；分页补页若让组向前长出更早的成员，首成员换了、组 id 会随之换（已知限制，见 tests/row-id-stability.test.ts）。
+   */
   id: string;
   members: StreamRenderItem[];
   /** 组内含 error 事件或 error 状态工具块 */
@@ -103,6 +112,13 @@ export const PROCESSING_PLACEHOLDER_LABEL = "处理中…";
 
 /** `wait` 工具在跑时的状态行文案 */
 export const WAIT_STATUS_LABEL = "等待中";
+
+/**
+ * AI 在等用户回答（有未答的 ask_user 提问）时的状态行文案（V16-01）。
+ * 此刻事件流不动是因为在等人，不是在分析 / 卡住——不能说「正在分析 ask_user 的结果」（内部工具名外露、
+ * 还逐秒走字）。计时起点取提问事件的 ts，表达的是「已经等了多久」。
+ */
+export const AWAITING_ASK_LABEL = "等你回答";
 
 /**
  * 工具跑完、模型还没给出下一步时的状态行文案：「正在分析 read 的结果」。
@@ -415,12 +431,36 @@ const memberHasRunning = (it: StreamRenderItem): boolean => {
 const memberHasBackground = (it: StreamRenderItem): boolean =>
   it.kind === "__tool_block__" && (it as ToolBlock).backgroundRunning === true;
 
+/**
+ * 组对象缓存（D5-01）：成员（按引用）逐个相同 → 复用上一次的组对象，`memo(WorkGroupRow)` 才命得中。
+ * 键 = 组首成员（对象）。成员引用的稳定性由 mergeToolDisplayEvents 的块缓存 / 事件本身保证；
+ * 组的派生字段（hasError / hasRunning / ts …）只由成员决定，所以「成员一样 = 组一样」。
+ */
+const WORK_GROUP_CACHE = new WeakMap<StreamRenderItem, WorkGroupItem>();
+const sameMembers = (
+  a: readonly StreamRenderItem[],
+  b: readonly StreamRenderItem[],
+): boolean => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
 const buildWorkGroup = (members: StreamRenderItem[]): WorkGroupItem => {
+  const first = members[0]!;
+  const hit = WORK_GROUP_CACHE.get(first);
+  if (hit && sameMembers(hit.members, members)) return hit;
+  const group = buildWorkGroupFresh(members);
+  WORK_GROUP_CACHE.set(first, group);
+  return group;
+};
+
+const buildWorkGroupFresh = (members: StreamRenderItem[]): WorkGroupItem => {
   const first = members[0]!;
   const last = members[members.length - 1]!;
   return {
     kind: "__work_group__",
-    id: first.id,
+    id: streamItemStableId(first),
     members,
     hasError: members.some(memberHasError),
     hasRunning: members.some(memberHasRunning),
@@ -465,12 +505,14 @@ export const groupChatRenderItems = (
 // ---------- 错误可重试判定 ----------
 
 /**
- * 这条 error 是不是「当轮失败」——只有它该给「重试」入口。
+ * 这条 error 是不是「当轮失败」——只有它该给恢复入口（重试 / 重新推进，见 {@link resolveErrorRecovery}）。
  *
- * 重试的语义是「把最后一条用户消息原样再发」。翻历史时点旧错误上的重试、
+ * 重试的语义是「把触发这一轮的用户消息原样再发」。翻历史时点旧错误上的重试、
  * 发出去的是今天最后那条消息、完全不是用户预期。所以要求两件事同时成立：
  *   1. 它是最后一条 error（之后没有更新的失败）
- *   2. 其后没有新的 user_reply（用户已经继续说话 = 这一轮翻篇了）
+ *   2. 其后没有新的 user_reply / action_start（用户已经继续说话、或已重新推进 = 这一轮翻篇了）
+ * 对主流不可见的事件（非属主群问答 / 旁路 run 的过程与错误等，见 isHiddenFromEventStream）
+ * 不参与翻篇判定——别人在群里问了一句，不能让属主自己的这条错误"过期"。
  */
 export const isLatestErrorEvent = (
   events: readonly TaskEvent[],
@@ -481,12 +523,157 @@ export const isLatestErrorEvent = (
     // 回合内工具失败不算「当轮崩溃」——不能挡真正的 run 错误，也不能自己带重试
     if (isInTurnToolErrorEvent(ev)) continue;
     if (ev.id === eventId) return ev.kind === "error";
-    if (ev.kind === "error" || ev.kind === "user_reply") return false;
+    if (isHiddenFromEventStream(ev)) continue;
+    if (
+      ev.kind === "error" ||
+      ev.kind === "user_reply" ||
+      ev.kind === "action_start"
+    ) {
+      return false;
+    }
   }
   return false;
 };
 
+/**
+ * 错误卡是不是「当轮」样式 / 能不能给恢复入口：属主主 run 没在跑 + 是最新一条错误。
+ *
+ * `mainRunActive` 必须是**属主主 run** 的在跑态，不能是 task 页并入了旁路群答疑 run 的 isRunning——
+ * 否则主任务失败后群里来一个提问，错误卡整张翻篇（恢复入口消失、样式变灰），旁路结束又弹回来（D6-02）。
+ */
+export const isCurrentErrorCard = (
+  events: readonly TaskEvent[],
+  errorId: string,
+  mainRunActive: boolean,
+): boolean => !mainRunActive && isLatestErrorEvent(events, errorId);
+
+/**
+ * 错误卡能给什么恢复入口：
+ *  - `retry`：把 `source` 这条用户消息原样再发（图 / 附件 / skill 引用由调用方回读）
+ *  - `readvance`：这轮是「推进」触发的（action 跑挂 / 推进前置步骤失败）——重放用户消息没有意义，
+ *    回到推进弹窗重新推进
+ *  - `none`：没有安全的入口（历史错误 / 定时 / 后台唤醒 / 答题回执触发 / 找不到触发源）
+ */
+export type ErrorRecovery =
+  | { kind: "retry"; source: TaskEvent }
+  | { kind: "readvance" }
+  | { kind: "none" };
+
+const NO_RECOVERY: ErrorRecovery = { kind: "none" };
+
+/** 定时到点的样板正文开头（meta.source 缺失的老事件靠它兜底） */
+const SCHEDULE_FIRED_PREFIX = "[SCHEDULE_FIRED";
+
+/** 这条 user_reply 是不是定时样板（不是用户说的话，原样重发 = 冒充用户） */
+const isScheduleBoilerplate = (ev: TaskEvent): boolean =>
+  isScheduleUserReply(ev) ||
+  (typeof ev.text === "string" && ev.text.startsWith(SCHEDULE_FIRED_PREFIX));
+
+/**
+ * 「触发一轮 agent run」的事件——错误卡要认的是「这一轮是被谁叫起来的」，不是「最后一条 user_reply」：
+ *  - user_reply：用户消息（含定时样板，定时样板由调用方另判）
+ *  - ask_user_reply：答题回执（run 因它继续）
+ *  - action_start：推进了新 action
+ *  - 后台子代理结果到达（info + `meta.subkind="background_result"`，chat-runner 写）：
+ *    主 AI 被后台结果唤醒、没有任何用户话——此时失败不能重放一小时前的用户话
+ */
+const isRunTriggerEvent = (ev: TaskEvent): boolean =>
+  ev.kind === "user_reply" ||
+  ev.kind === "ask_user_reply" ||
+  ev.kind === "action_start" ||
+  (ev.kind === "info" && ev.meta?.subkind === "background_result");
+
+/**
+ * 错误卡恢复入口的**单点判定**（第二轮 review F4-01 / V3-02 / V3-04 / V9-01 / V12-03 同一根因）。
+ *
+ * 旧口径只看「是不是最新的 error」，推进失败 / action 失败 / 定时失败 / 后台唤醒失败的红卡
+ * 都带「重试」，点了把事件流里最后一条 user_reply 重放进问答通道。新口径：
+ *   - 必须是当轮失败（{@link isLatestErrorEvent}）；
+ *   - `meta.subkind="advance_failed"`（推进前置步骤失败，路由补写）→ `readvance`；
+ *   - 否则往前找最近的「触发源」：用户亲手发的 user_reply（非定时样板）→ `retry`；
+ *     action_start → `readvance`；其余（答题回执 / 后台唤醒 / 定时样板 / 没找到）→ `none`。
+ * 对主流不可见的事件（非属主群问答等）不当触发源。
+ *
+ * 300 条窗口（第三轮 review D8-02）：task 页首屏 / watch-task bootstrap 只带最近一段事件，
+ * 一轮长 run 崩了、重开页面后触发源可能在窗口外（服务端已尽量把窗口补到含最近一条 user_reply /
+ * action_start，补不到才会走到这里）。`opts.truncated`（= task.eventsTruncated）告诉本函数「回扫到数组头
+ * 找不到触发源 ≠ 没有触发源」：
+ *   - task 形态降级为 `readvance`——「重新推进」要经推进弹窗由用户确认，不会替用户重放任何消息；
+ *   - chat 形态（默认同）仍 none——触发源可能是用户消息 / 定时样板 / 后台唤醒，猜错就是重放旧话。
+ * 只有「回扫到头一个触发源都没撞到」才降级；撞到了（哪怕是答题回执 / 定时样板）照旧按它判。
+ */
+export const resolveErrorRecovery = (
+  events: readonly TaskEvent[],
+  errorId: string,
+  opts?: { truncated?: boolean; mode?: "chat" | "task" },
+): ErrorRecovery => {
+  if (!isLatestErrorEvent(events, errorId)) return NO_RECOVERY;
+  let errIdx = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]!.id === errorId) {
+      errIdx = i;
+      break;
+    }
+  }
+  if (errIdx < 0) return NO_RECOVERY;
+  const err = events[errIdx]!;
+  // 历史遗留：MR「有冲突」曾被写成 kind=error（带 meta.mrUrl）。它是成功的事、不是哪一轮崩了，
+  // 老数据里的这类红卡不给任何入口（新写的已改成 info + notice，见 task-event-text）
+  if (typeof err.meta?.mrUrl === "string") return NO_RECOVERY;
+  if (err.meta?.subkind === "advance_failed") return { kind: "readvance" };
+  for (let i = errIdx - 1; i >= 0; i--) {
+    const ev = events[i]!;
+    if (!isRunTriggerEvent(ev) || isHiddenFromEventStream(ev)) continue;
+    if (ev.kind === "user_reply") {
+      return isScheduleBoilerplate(ev)
+        ? NO_RECOVERY
+        : { kind: "retry", source: ev };
+    }
+    if (ev.kind === "action_start") return { kind: "readvance" };
+    return NO_RECOVERY;
+  }
+  // 回扫到头没撞到任何触发源：窗口被截过的 task 形态退到「重新推进」，其余没有安全入口
+  if (opts?.truncated && opts.mode === "task") return { kind: "readvance" };
+  return NO_RECOVERY;
+};
+
 // ---------- deriveActiveStatus ----------
+
+/**
+ * 粘性状态行的输入切片：只留「最近一条 user_reply / action_start 起」的本轮事件。
+ *
+ * 为什么要切（2026-07-28 性能修，见 docs/HANDOFF.md）：deriveActiveStatus 的第一步是 O(全部事件) 地收
+ * doneCallIds，而 shell 直播每来一个 delta 就是一个新的 liveToolOutputs 对象、状态行 memo 必然重算——
+ * events 攒到几千条时主线程就在持续重扫全量。切到本轮后扫描量从「全量」降到「本轮」。
+ *
+ * 为什么切了等价：deriveActiveStatusBase 从尾部回扫、**撞到 user_reply / action_start 必定收尾**，
+ * 走不到最近一条起点之前；而 tool_result 永远晚于自己的 tool_call，本轮里的 tool_call 要配的 result
+ * 也一定在本轮内。起点之前没回结果的孤儿 tool_call 不再混进「还在跑的工具」——这是有意的
+ * （它属于上一轮 / 上一个 action）。
+ *
+ * action_start 是 task 形态的起点（chat 里不会出现）：task 一个 action 的 run 动辄上千条事件，
+ * 不切的话接上状态行就等于给 task 事件流引入「每个 shell delta 重扫全量」的老毛病（V16-05）。
+ * 没有任何起点（刚建的 chat / 纯日志）时退回全量，那会儿本来也没几条。
+ *
+ * 起点必须是**对主流可见**的（第三轮 review R3-01）：需求群里非属主的提问会写成对主流隐藏的 user_reply
+ * （source:feishu_group + restrictedRunTag）。把它当切点，切片从这条起、调用方随后又滤掉隐藏事件，
+ * 切片为空 → 状态行消失（shell 明明在跑）、「等你回答」也一并消失。与 resolveErrorRecovery /
+ * isLatestErrorEvent 同一个口径：隐藏事件不参与「这一轮从哪开始」的判定。
+ */
+export const sliceCurrentRunEvents = (
+  events: readonly TaskEvent[],
+): readonly TaskEvent[] => {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]!;
+    if (
+      (ev.kind === "user_reply" || ev.kind === "action_start") &&
+      !isHiddenFromEventStream(ev)
+    ) {
+      return events.slice(i);
+    }
+  }
+  return events;
+};
 
 const DETAIL_MAX = 80;
 
@@ -498,18 +685,9 @@ const clipDetail = (s: string, max = DETAIL_MAX): string => {
 };
 
 /** liveOutput 取末行再截断 */
-const lastLineClipped = (text: string): string => {
-  const lines = text.split("\n");
-  let last = "";
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const t = lines[i]!.trim();
-    if (t) {
-      last = t;
-      break;
-    }
-  }
-  return clipDetail(last || text.trim());
-};
+const lastLineClipped = (text: string): string =>
+  // `\r` 刷新（进度条）取最后一次刷新的内容（R7-02）
+  clipDetail(liveOutputTailLine(text) || text.trim());
 
 const getCallId = (ev: TaskEvent): string =>
   typeof ev.meta?.callId === "string" ? ev.meta.callId : "";
@@ -573,35 +751,97 @@ const deriveActiveStatusBase = (
 ): StatusBase | null => {
   if (events.length === 0) return null;
 
-  // 先收集：已完成的 callId（有对应 tool_result）、各 callId 的工具名、出现过的 tool_call callId
+  // 先收集：已完成的 callId（有对应 tool_result）、各 callId 的工具名、出现过的 tool_call 事件
   const doneCallIds = new Set<string>();
   const toolNameByCallId = new Map<string, string>();
-  const calledIds: string[] = [];
+  const calledEvents: TaskEvent[] = [];
   for (const ev of events) {
     const cid = getCallId(ev);
     if (!cid) continue;
     if (ev.kind === "tool_result") {
       doneCallIds.add(cid);
     } else if (ev.kind === "tool_call") {
-      calledIds.push(cid);
+      calledEvents.push(ev);
       if (typeof ev.meta?.name === "string" && ev.meta.name) {
         toolNameByCallId.set(cid, ev.meta.name);
       }
     }
   }
-  // 并行工具：还有 tool_call 没配上 result 时，「上一个工具」说不清——退回泛称、不乱点名
-  const hasUnpairedToolCall = calledIds.some((cid) => !doneCallIds.has(cid));
+  // 还没配上 tool_result 的 tool_call（按出现顺序）= 并行工具 / 子代理里还在跑的那些（V16-02）
+  const openCalls = calledEvents.filter((e) => !doneCallIds.has(getCallId(e)));
+
+  /** 一个还没配上结果的 tool_call 此刻的状态行：子代理 / wait / 其它工具各有各的说法 */
+  const runningToolStatus = (ev: TaskEvent): StatusBase => {
+    const cid = getCallId(ev);
+    const name = getToolName(ev);
+    const since = sinceOf(ev);
+    // task 子代理特殊文案
+    if (name.toLowerCase() === "task") {
+      const taskArgs = parseTaskToolArgs(getArgs(ev));
+      const detail = taskArgs?.description
+        ? clipDetail(taskArgs.description)
+        : undefined;
+      return busyBase({ label: "子代理工作中", detail, ...since });
+    }
+    // wait：我们自己的等待工具——不说「正在执行 wait」，直接说「等待中」，
+    // 详情是「共 1m0s · 等 CI 跑完」（计划时长 + 原因），已等多久由状态行走字；
+    // skippable 让状态行挂「跳过等待」按钮
+    if (name.toLowerCase() === WAIT_TOOL_NAME) {
+      const summary = waitToolSummary(getArgs(ev));
+      return busyBase({
+        label: WAIT_STATUS_LABEL,
+        detail: summary ? clipDetail(summary) : undefined,
+        skippable: true,
+        ...since,
+      });
+    }
+    const live = cid && liveToolOutputs ? liveToolOutputs[cid] : undefined;
+    const detail = live?.trim()
+      ? lastLineClipped(live)
+      : summarizeToolCallArgs(ev);
+    return busyBase({
+      label: `正在执行 ${name}`,
+      detail,
+      ...since,
+    });
+  };
+
+  /**
+   * 还有工具没回来时的状态（没有 = null）。
+   * 并行工具 / 子代理里先完成的那个 tool_result 落在尾部时，回扫第一个命中的就是它，
+   * 却不代表没活干了——还在跑的那几个才是此刻的真相（V16-02：旧写法说「处理中…」、20s 后改口
+   * 「仍在等待 · 260s 暂无新输出」，而另一个子代理明明在跑）。
+   * 一个：沿用它自己的说法；多个：「N 个子代理工作中」（全是 task 时，否则「N 个工具并行执行中」）
+   * + 最久的那个的起点。都是非 idle（busy）：不挂静默兜底锚、也不被思考实时态盖掉。
+   */
+  const openCallsStatus = (): StatusBase | null => {
+    if (openCalls.length === 0) return null;
+    if (openCalls.length === 1) return runningToolStatus(openCalls[0]!);
+    const allSubagents = openCalls.every(
+      (e) => getToolName(e).toLowerCase() === "task",
+    );
+    const starts = openCalls.map((e) => e.ts).filter(Number.isFinite);
+    return busyBase({
+      label: allSubagents
+        ? `${openCalls.length} 个子代理工作中`
+        : `${openCalls.length} 个工具并行执行中`,
+      ...(starts.length > 0 ? { sinceTs: Math.min(...starts) } : {}),
+    });
+  };
 
   /** 工具跑完、下一句还没出来（ev = 触发这次判定的 tool_result / 已完成的 tool_call） */
   const waitingAfterTools = (ev: TaskEvent): StatusBase => {
     // 正文已经在流：改口「正在回复…」，别停在「处理中…」
     if (opts?.streaming) return idleBase({ label: "正在回复…" });
+    // 前面还有没回来的工具 = 它们才是此刻在干的活（V16-02），不是「先回来的这个在等模型」
+    const open = openCallsStatus();
+    if (open) return open;
     const since = sinceOf(ev);
     const rawName =
       typeof ev.meta?.name === "string" && ev.meta.name
         ? ev.meta.name
         : toolNameByCallId.get(getCallId(ev));
-    if (!rawName || hasUnpairedToolCall) {
+    if (!rawName) {
       return idleBase({ label: PROCESSING_PLACEHOLDER_LABEL, ...since });
     }
     return idleBase({
@@ -624,6 +864,19 @@ const deriveActiveStatusBase = (
         : idleBase({ label: "正在启动…", yieldToTail: true });
     }
 
+    // task 形态一轮 run 的起点（推进了新 action）：和 user_reply 同理是回扫的终点——
+    // 不能越过它去读上一个 action 的尾巴（否则新 action 刚启动就说成「正在分析 shell 的结果」，
+    // 上个 action 里没回结果的孤儿 tool_call 也会混进「还在跑的工具」）。
+    // 与 user_reply 的区别：task 形态流尾没有 PendingRow 给这一段计时（那是 chat 回车后的占位），
+    // 所以这里自己带 action_start 的 ts 当起点、状态行走字；也不 yieldToTail（没有进度行可让）。
+    // 这一段正是「启动过程」组里 spinner 不转、唯一的活信号是页面头部「停止」的窗口（V16-05）。
+    // chat 的事件里不会有 action_start，这条分支对 chat 零影响
+    if (ev.kind === "action_start") {
+      return opts?.streaming
+        ? idleBase({ label: "正在回复…" })
+        : idleBase({ label: "正在启动…", ...sinceOf(ev) });
+    }
+
     // 自定义 pi 压缩：字已经在屏上，但 agent_settled 还没到——别继续说「正在回复」
     if (isCompactionInfo(ev)) {
       if (isCompactionRunning(ev)) {
@@ -639,37 +892,9 @@ const deriveActiveStatusBase = (
         // 已完成的 tool_call：等下一轮模型（交卷 / 结论 / 下一个工具）
         return waitingAfterTools(ev);
       }
-      const name = getToolName(ev);
-      const since = sinceOf(ev);
-      // task 子代理特殊文案
-      if (name.toLowerCase() === "task") {
-        const taskArgs = parseTaskToolArgs(getArgs(ev));
-        const detail = taskArgs?.description
-          ? clipDetail(taskArgs.description)
-          : undefined;
-        return busyBase({ label: "子代理工作中", detail, ...since });
-      }
-      // wait：我们自己的等待工具——不说「正在执行 wait」，直接说「等待中」，
-      // 详情是「共 1m0s · 等 CI 跑完」（计划时长 + 原因），已等多久由状态行走字；
-      // skippable 让状态行挂「跳过等待」按钮
-      if (name.toLowerCase() === WAIT_TOOL_NAME) {
-        const summary = waitToolSummary(getArgs(ev));
-        return busyBase({
-          label: WAIT_STATUS_LABEL,
-          detail: summary ? clipDetail(summary) : undefined,
-          skippable: true,
-          ...since,
-        });
-      }
-      const live = cid && liveToolOutputs ? liveToolOutputs[cid] : undefined;
-      const detail = live?.trim()
-        ? lastLineClipped(live)
-        : summarizeToolCallArgs(ev);
-      return busyBase({
-        label: `正在执行 ${name}`,
-        detail,
-        ...since,
-      });
+      // 并行的多个还在跑：合并成一句（「N 个子代理工作中」+ 最久的起点），不只点最后一个的名
+      if (openCalls.length > 1) return openCallsStatus()!;
+      return runningToolStatus(ev);
     }
 
     // 已完成的 tool_result：等下一轮模型，不是已经在写回复
@@ -684,13 +909,25 @@ const deriveActiveStatusBase = (
     // 不带 detail：它的原文就在上面工作过程组的思考行里（折叠摘要），再摘一行放这里是同一句话说两遍。
     // 算「空等」类（idle）：紧跟着又开始新一段思考时，让实时态（带计时）盖掉它；
     // 正文已经在流则改口「正在回复…」——此时正文在屏上、思考早就结束了
+    //
+    // 但若前面还有没回来的工具（并行工具 / 子代理期间模型又落了一条 thinking / 正文），它们才是此刻在干的活
+    // （R3-04，V16-02 同根）：不然返回的是「空等」类、外层挂静默兜底锚，30s 后改口「仍在等待 · N 秒暂无新输出」，
+    // 而子代理 / 长 shell 明明在跑。正文在流（streaming）时仍是「正在回复…」——那是真在出字。
     if (ev.kind === "thinking") {
+      if (!opts?.streaming) {
+        const open = openCallsStatus();
+        if (open) return open;
+      }
       return idleBase({
         label: opts?.streaming ? "正在回复…" : THINKING_LIVE_LABEL,
       });
     }
 
     if (ev.kind === "assistant_message") {
+      if (!opts?.streaming) {
+        const open = openCallsStatus();
+        if (open) return open;
+      }
       return idleBase({ label: "正在回复…" });
     }
 
@@ -729,12 +966,25 @@ export const deriveActiveStatus = (
      */
     lastActivityTs?: number;
     /**
-     * AI 正在等用户（有一条未答的 ask_user 提问）。是 = 不走静默兜底：
-     * 此刻事件流不动是因为在等人答、不是 SDK 里有看不见的等待，「仍在等待 · 暂无新输出」会让人以为它卡住了。
+     * AI 正在等用户（有一条未答的 ask_user 提问）。是 = 状态行说「等你回答」（V16-01）、不走静默兜底：
+     * 此刻事件流不动是因为在等人答，不是在分析、也不是 SDK 里有看不见的等待——
+     * 「正在分析 ask_user 的结果」「仍在等待 · 暂无新输出」都会让人以为它卡住了。
+     * 正文已经在流（streaming）时不适用，照旧「正在回复…」。
      */
     awaitingUser?: boolean;
   },
 ): ActiveStatus | null => {
+  if (events.length === 0) return null;
+  // 等你回答：以调用方传入的「有未答提问」为准（它按全量事件算、切片里不一定还留着提问事件本身）；
+  // 起点取切片里最近一条提问的 ts，表达「已经等了多久」，找不到就只显示文案
+  if (opts?.awaitingUser && !opts.streaming) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]!.kind === "ask_user_request") {
+        return { label: AWAITING_ASK_LABEL, ...sinceOf(events[i]!) };
+      }
+    }
+    return { label: AWAITING_ASK_LABEL };
+  }
   const base = deriveActiveStatusBase(events, liveToolOutputs, opts);
   if (!base) return null;
   const since = opts?.thinkingSince;

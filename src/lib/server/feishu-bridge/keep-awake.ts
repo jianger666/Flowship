@@ -55,7 +55,10 @@ export class KeepAwake {
     let args: string[];
     if (process.platform === "darwin") {
       bin = "/usr/bin/caffeinate";
-      args = ["-s"];
+      // `-w <pid>`：本 server 进程一退出 caffeinate 自己跟着退。壳在 Cmd+Q / 自更新重启时
+      // 对 server 直接 SIGKILL（electron-app/main.js before-quit），我们的 stop() 根本来不及跑，
+      // 没有 -w 就会留下孤儿 `caffeinate -s`，插电时整机从此不再睡眠。
+      args = ["-s", "-w", String(process.pid)];
     } else if (process.platform === "win32") {
       bin = "powershell.exe";
       args = [

@@ -76,7 +76,7 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
               currentActionN != null &&
               b.sourceActionN === currentActionN;
             return (
-              <TableRow key={b.effectiveId} className={cn(built && "opacity-70")}>
+              <TableRow key={b.effectiveId}>
                 <TableCell className="align-top font-mono text-xs text-muted-foreground">
                   <div>{b.rawId}</div>
                   {/* 追加场景标来源：这批是第几次方案引入的 */}
@@ -86,7 +86,14 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
                     </div>
                   )}
                 </TableCell>
-                <TableCell className="align-top font-medium">
+                {/* 已实现的行靠「绿勾 + 标题弱化」区分，不压整行 opacity：
+                    透明度会把「已实现」绿字压到 2.83:1、灰字 3.45:1（ui-conventions 禁止整行 opacity，第二轮 review V18-10） */}
+                <TableCell
+                  className={cn(
+                    "align-top font-medium",
+                    built && "font-normal text-muted-foreground",
+                  )}
+                >
                   <span>{b.title}</span>
                   {isNew && (
                     <span className="ml-2 inline-block rounded-sm bg-primary/10 px-1.5 py-0.5 align-middle text-[11px] font-normal text-primary">

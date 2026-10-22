@@ -4,7 +4,8 @@
  * 输入框 `/` 唤起 skill（Codex 式内联 token）
  *
  * 交互：
- * - 光标前正在打 `/xxx`（行首或空格后）→ 输入框上方弹 skill 菜单、继续打字过滤
+ * - 光标前正在打 `/xxx`（行首 / 空白后 / 紧贴中文·全角标点后；URL / 路径里的 `/` 不算，见 lib/composer-trigger）
+ *   → 输入框上方弹 skill 菜单、继续打字过滤
  * - ↑↓ 选、Enter/Tab 确认、Esc 关；点击也可选
  * - 选中：优先走编辑器注入的 pickHandler（Lexical 直接插 SkillTokenNode）；
  *   否则 fallback 把光标前 `/partial` 补全成纯文本 `/skill-name `（applyDraft）
@@ -20,6 +21,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -30,12 +32,19 @@ import { Sparkles } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { SkillToken } from "@/components/ui/skill-token";
-import { parseSkillTokens, SLASH_RE } from "@/lib/skill-token";
+import { useActiveOptionScroll } from "@/hooks/use-active-option-scroll";
+import { optionDomId } from "@/lib/menu-scroll";
+import {
+  matchSlashMenuTrigger,
+  matchSlashTrigger,
+  parseSkillTokens,
+} from "@/lib/skill-token";
 import { isImeComposing } from "@/lib/ime";
 
 // 对外 re-export：调用方仍可从本模块拿解析 API（Composer 既有 import 路径不断）
 export {
   matchLongestSkillName,
+  matchSlashTrigger,
   parseSkillTokens,
   SKILL_NAME_CHAR_CLASS,
   SKILL_TOKEN_RE,
@@ -135,6 +144,8 @@ export interface SlashSkillsApi {
   filtered: SlashSkill[];
   /** 键盘高亮索引 */
   activeIndex: number;
+  /** 列表 DOM id（输入框 aria-controls / 选项 id 的前缀） */
+  listId: string;
   /**
    * 当前草稿里解析出的 skill 引用（去重、按出现序）。
    * 供发送时作为独立 skills 字段传给 API；UI token 由 Lexical 节点渲染，不靠这个。
@@ -178,6 +189,7 @@ export const useSlashSkills = (opts: {
   const [query, setQuery] = useState<string | null>(null);
   // 键盘高亮索引
   const [activeIndex, setActiveIndex] = useState(0);
+  const listId = useId();
   // 最近一次 onDraftChange 的草稿 + 光标（选中时做文本替换用）
   const stateRef = useRef({ draft: opts.draft, cursor: opts.draft.length });
   // Lexical 注入的 pick：优先插 SkillTokenNode，失败再字符串 fallback
@@ -254,8 +266,9 @@ export const useSlashSkills = (opts: {
   const onDraftChange = useCallback((nextDraft: string, cursor: number) => {
     stateRef.current = { draft: nextDraft, cursor };
     const before = nextDraft.slice(0, cursor);
-    const m = before.match(SLASH_RE);
-    setQuery(m ? m[2] : null);
+    // 菜单用 matchSlashMenuTrigger：紧贴中文的空 query（「前端/」「增/删」）不展开 8 项（R6-06）
+    const m = matchSlashMenuTrigger(before);
+    setQuery(m ? m.query : null);
     setActiveIndex(0);
   }, []);
 
@@ -277,13 +290,13 @@ export const useSlashSkills = (opts: {
       }
       const { draft: cur, cursor } = stateRef.current;
       const before = cur.slice(0, cursor);
-      const m = before.match(SLASH_RE);
+      const m = matchSlashTrigger(before);
       if (!m) {
         setQuery(null);
         return;
       }
       // fallback：把光标前的 `/partial` 补全成 `/skill-name `（尾空格关菜单）
-      const cut = before.slice(0, before.length - (m[2].length + 1));
+      const cut = before.slice(0, m.start);
       const next = `${cut}/${skill.name} ${cur.slice(cursor)}`;
       const nextCursor = cut.length + skill.name.length + 2; // `/` + name + ` `
       stateRef.current = { draft: next, cursor: nextCursor };
@@ -332,6 +345,7 @@ export const useSlashSkills = (opts: {
     menuOpen,
     filtered,
     activeIndex,
+    listId,
     references,
     knownNames,
     onDraftChange,
@@ -344,14 +358,33 @@ export const useSlashSkills = (opts: {
 
 /** slash 菜单（挂在输入框容器内、absolute 浮在上方）。容器需要 relative。 */
 export const SlashSkillMenu = ({ slash }: { slash: SlashSkillsApi }) => {
+  // hook 必须在 early return 之前（hooks 顺序固定）：↑↓ / 回绕后高亮项滚进列表可视区（V5-03）
+  const listRef = useActiveOptionScroll({
+    activeIndex: slash.activeIndex,
+    itemCount: slash.filtered.length,
+    open: slash.menuOpen,
+  });
   if (!slash.menuOpen) return null;
   return (
     <div className="absolute bottom-full left-2 z-30 mb-1 w-80 max-w-[calc(100%-1rem)] overflow-hidden rounded-lg border bg-popover shadow-md">
-      <div className="max-h-64 overflow-y-auto p-1">
+      {/* listbox 语义：焦点留在输入框（textbox），高亮项靠 aria-activedescendant 指过来；
+          relative = 选项 offsetTop 以本容器为基准（滚动 hook 用） */}
+      <div
+        ref={listRef}
+        id={slash.listId}
+        role="listbox"
+        aria-label="技能"
+        className="relative max-h-64 overflow-y-auto p-1"
+      >
         {slash.filtered.map((s, i) => (
           <button
             key={s.name}
             type="button"
+            role="option"
+            id={optionDomId(slash.listId, i)}
+            aria-selected={i === slash.activeIndex}
+            data-option-index={i}
+            tabIndex={-1}
             // onMouseDown 防 contentEditable 失焦（blur 会先于 click 关菜单）
             onMouseDown={(e) => {
               e.preventDefault();

@@ -54,6 +54,15 @@ export const GET = async (req: Request) => {
       ),
       scannedAt: result.scannedAt,
       gitTokenConfigured: result.gitTokenConfigured,
+      // N1-01 / N1-15：扫描不完整时透传（含「没扫到的范围」）：客户端据此保留旧表 /
+      // 连续多轮同类失败后合并展示，并只对本轮扫到的条目做通知差分
+      ...(result.partial
+        ? {
+            partial: true,
+            partialMessage: result.partialMessage,
+            incomplete: result.incomplete,
+          }
+        : {}),
     });
   } catch (err) {
     console.error("[GET /api/mr-inbox] failed", err);

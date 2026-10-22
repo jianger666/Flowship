@@ -21,7 +21,12 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { NextResponse } from "next/server";
 import { DATA_DIR, META_FILE, ensureDataDir, sanitizeId } from "@/lib/server/task-fs-core";
-import { getTaskWorktreesDir, getWorktreesRoot } from "@/lib/server/task-worktrees";
+import {
+  cleanupStaleTaskWorktrees,
+  getTaskWorktreesDir,
+  getWorktreesRoot,
+  type WipSnapshotInfo,
+} from "@/lib/server/task-worktrees";
 import { errorResponse } from "@/lib/server/route-helpers";
 import type { RepoStatus, TaskMode } from "@/lib/types";
 
@@ -127,6 +132,13 @@ export interface StaleWorktree {
   bytes: number;
 }
 
+/** 快照 → 给前端的精简字段（ref 让 toast 能告诉用户「改动存在哪、去哪找回」） */
+const toSnapshotDto = (s: WipSnapshotInfo & { dirName: string }) => ({
+  dirName: s.dirName,
+  repoPath: s.repoPath,
+  ref: s.ref,
+});
+
 export const GET = async () => {
   try {
     await ensureDataDir();
@@ -167,19 +179,22 @@ export const GET = async () => {
         mode,
         repoStatus,
         updatedAt,
-        bytes: await dirSize(dir),
-        worktreeBytes: 0, // 下面并发补
+        bytes: 0, // 下面并发补（原先这里串行 await dirSize：数百个会话 + 慢盘时扫描要分钟级，review D2b-02）
+        worktreeBytes: 0,
       });
     }
 
     const liveIds = new Set(taskIds);
 
-    // 活任务的 worktree 大小：并发限 4（du 虽快、同时开太多也会抢盘）
-    const wtSizes = await mapPool(entries, WORKTREE_SIZE_CONCURRENCY, async (e) =>
-      dirSize(getTaskWorktreesDir(e.id)),
-    );
+    // 任务数据 + 活任务 worktree 的大小：每个任务一路（先数据后工作区），整体并发限 4（du 虽快、同时开太多也会抢盘）。
+    // mapPool 按入参顺序回结果——entries[i] 对应 sizes[i]，不受完成先后影响
+    const sizes = await mapPool(entries, WORKTREE_SIZE_CONCURRENCY, async (e) => ({
+      bytes: await dirSize(path.join(DATA_DIR, e.id)),
+      worktreeBytes: await dirSize(getTaskWorktreesDir(e.id)),
+    }));
     for (let i = 0; i < entries.length; i++) {
-      entries[i].worktreeBytes = wtSizes[i];
+      entries[i].bytes = sizes[i].bytes;
+      entries[i].worktreeBytes = sizes[i].worktreeBytes;
     }
 
     // 残留工作区：worktrees/ 下有、但 tasks/ 无对应目录
@@ -223,9 +238,16 @@ export const GET = async () => {
 /**
  * 删除残留工作区：仅当 data/tasks/<id> 不存在时才允许删，
  * 防误删还活着的任务的 worktree。
+ *
+ * 逐个仓目录走 WIP 快照守卫（与删任务 / 归档同一道，见 cleanupStaleTaskWorktrees）：
+ * 未提交改动存得下 → 先落 ref 再删；存不下（冲突态 / 子模块有改动 / 嵌套仓 / 原仓不可用…）→ 该目录保留，
+ * 整个请求回 409 + `kept`（原因列表）。前端据此再问用户一次，确认后带 `force=1` 才越过守卫。
+ * 旧实现是裸 `fs.rm`——而守卫保留下来的目录恰好就是之后出现在这个列表里的那批（第三轮 review D2b-01）。
  */
 export const DELETE = async (req: Request) => {
-  const raw = new URL(req.url).searchParams.get("stale")?.trim() ?? "";
+  const params = new URL(req.url).searchParams;
+  const raw = params.get("stale")?.trim() ?? "";
+  const force = params.get("force") === "1";
   if (!raw) return errorResponse("stale 必填", 400);
 
   let id: string;
@@ -257,8 +279,33 @@ export const DELETE = async (req: Request) => {
   }
 
   try {
-    await fs.rm(wtDir, { recursive: true, force: true });
-    return NextResponse.json({ ok: true });
+    const res = await cleanupStaleTaskWorktrees(id, { force });
+    if (res.kept.length > 0) {
+      // 已处理掉的那部分照常生效；保留的目录里还有没存下的改动，交给用户决定
+      return NextResponse.json(
+        {
+          error: `有 ${res.kept.length} 个工作区目录里的未提交改动无法自动保存，已保留未删除`,
+          kept: res.kept.map((k) => ({
+            dirName: k.dirName,
+            reason: k.reason,
+            // 快照其实落了、只是目录没删掉：前端据此别再说「删了就找不回」（Q3-07）
+            ...(k.snapshotSaved ? { snapshotSaved: true } : {}),
+          })),
+          removedDirs: res.removedDirs,
+          snapshots: res.snapshots.map(toSnapshotDto),
+        },
+        { status: 409 },
+      );
+    }
+    return NextResponse.json({
+      ok: true,
+      removedDirs: res.removedDirs,
+      snapshots: res.snapshots.map(toSnapshotDto),
+      // force 越过守卫强删的目录（快照没存下、改动已丢）：让调用方 / 日志看得到，不静默（Q3-06）
+      ...(res.forced.length > 0
+        ? { forced: res.forced.map((k) => ({ dirName: k.dirName, reason: k.reason })) }
+        : {}),
+    });
   } catch (err) {
     console.error("[DELETE /api/system/storage] failed", err);
     return errorResponse(

@@ -6,7 +6,9 @@
  *   data/
  *     tasks/
  *       <taskId>/
- *         meta.json ← 任务元信息、含 actions[] / mrs[] / gitBranches[]
+ *         meta.json ← 任务元信息、含 actions[] / mrs[] / gitBranches[]（写入 = tmp + fsync + 滚 .bak + rename）
+ *         meta.json.bak ← 上一版有效 meta（只存通过 schema 校验的版本；启动时 meta.json 内容损坏则用它恢复）
+ *         meta.json.invalid ← 恢复时被替换掉的坏原件（单槽、仅留给人工排查）
  *         events.jsonl ← 事件流、每行一条 JSON、追加写
  *         actions/ ← 每条 action 一个 artifact
  *           1-plan.md
@@ -45,6 +47,7 @@ import type {
   ActionType,
   DevPushMode,
   GitBranchInfo,
+  LastRewind,
   ModelSelection,
   MRRecord,
   NewTaskInput,
@@ -76,7 +79,9 @@ import {
   syncTaskWorktreesToRepoPaths,
   type WorktreeTaskLike,
 } from "./task-worktrees";
+import { collectWorktreeRemoval, type DeleteWorktreeReport } from "@/lib/worktree-report";
 import { sameRepoPathList } from "@/lib/path-utils";
+import { BOOT_RECOVERY_TEXT } from "@/lib/stop-copy";
 import { reapTaskOrphans } from "./kill-orphans";
 import { maybeFireMidRunRotation, rotationUsageOf } from "./session-rotate";
 import { maybeGcSdkStore } from "./sdk-store-gc";
@@ -93,10 +98,13 @@ import {
   killStalePreview,
   stopPreviewsForTask,
 } from "./preview-manager";
+import type { CorruptTaskInfo } from "@/lib/corrupt-task";
 import {
   DATA_DIR,
   DELETED_TOMBSTONE_FILE,
+  META_BACKUP_FILE,
   META_FILE,
+  META_INVALID_FILE,
   actionArtifactRelPath,
   appendEventLine,
   assembleTask,
@@ -107,6 +115,7 @@ import {
   hydrateTask,
   hydrateTaskSummary,
   hydrateTaskWithTailEvents,
+  inspectMetaCorruptionSync,
   isValidMetaShape,
   newActionId,
   newContextDocId,
@@ -116,6 +125,7 @@ import {
   readMetaRaw,
   readMetaV06,
   readMetaV06EvidenceSync,
+  restoreMetaFromBackup,
   taskDir,
   withTaskLock,
   prepareMetaWrite,
@@ -794,6 +804,11 @@ const runBootRecovery = async (): Promise<void> => {
   const liveTaskIds = new Set<string>();
   for (const id of ids) {
     if (await exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE))) continue;
+    // meta.json 内容损坏（崩溃留下空文件 / 降级后新枚举读不了）且 meta.json.bak 有效 → 先用 .bak 恢复，
+    // 再走下面的正常 recovery（恢复出来的 meta 若还是 running 照样会被标 error）。
+    // 放在启动期而不是每次读时回落：此刻没有任何读写在跑，不会覆盖用户手改到一半的 meta；
+    // 没有 .bak / 恢复失败则原样往下走（读不出来 → 当存活、由 listTasksWithCorrupt 暴露）。
+    await restoreMetaFromBackup(id).catch(() => undefined);
     let raw: unknown | null;
     try {
       raw = await readMetaRaw(id);
@@ -826,8 +841,8 @@ const runBootRecovery = async (): Promise<void> => {
       id: newEventId(),
       ts: Date.now(),
       kind: "error",
-      // task / chat 共用：chat 没有「推进」按钮、用通用措辞（任务点推进 / 对话发消息都算「重新发起」）
-      text: "[boot-recovery] Web 进程重启时本任务的 agent 正在运行、这一轮已中断。重新发起即可恢复。",
+      // task / chat 共用：文案单一来源 lib/stop-copy（D8-06，与停止确认框 / 停止后 info 同一说法）
+      text: BOOT_RECOVERY_TEXT,
     };
     try {
       await appendEventLine(id, event);
@@ -909,16 +924,24 @@ const ensureBootRecovery = async (): Promise<void> => {
  */
 export type TaskVisibility = "readable" | "deleted" | "unavailable";
 
-export const getTaskVisibility = (taskId: string): TaskVisibility => {
+/**
+ * getTaskVisibility 的带原因版本（逻辑原样、只多回一个 `metaUnknown`）。
+ * metaUnknown=true 表示 unavailable 的**唯一**原因是 meta 读 unknown（删除证据都明确非终态）——
+ * listTasksWithCorrupt 据此把「meta 损坏导致消失」的任务单独暴露，而不必重复探测删除证据
+ * （重复探测会让测试里的一次性注入 / 日志翻倍）。
+ */
+const evaluateTaskVisibility = (
+  taskId: string,
+): { visibility: TaskVisibility; metaUnknown: boolean } => {
   const tomb = probeDeleteTombstoneSync(taskId);
   if (tomb.kind === "unknown") {
     console.error(
       `[task-fs] getTaskVisibility: tombstone 未知 → unavailable id=${taskId}`,
       tomb.error,
     );
-    return "unavailable";
+    return { visibility: "unavailable", metaUnknown: false };
   }
-  if (tomb.kind === "present") return "deleted";
+  if (tomb.kind === "present") return { visibility: "deleted", metaUnknown: false };
 
   const journal = readDeletionJournalSync(taskId);
   if (journal.kind === "unknown") {
@@ -926,10 +949,10 @@ export const getTaskVisibility = (taskId: string): TaskVisibility => {
       `[task-fs] getTaskVisibility: journal 未知 → unavailable id=${taskId}`,
       journal.error,
     );
-    return "unavailable";
+    return { visibility: "unavailable", metaUnknown: false };
   }
   if (journal.kind === "present" && journal.value.phase === "committed") {
-    return "deleted";
+    return { visibility: "deleted", metaUnknown: false };
   }
 
   // 删除证据 absent（或 prepared）时，meta unknown → unavailable（临时 I/O / schema）
@@ -939,10 +962,13 @@ export const getTaskVisibility = (taskId: string): TaskVisibility => {
       `[task-fs] getTaskVisibility: meta 未知 → unavailable id=${taskId}`,
       meta.error,
     );
-    return "unavailable";
+    return { visibility: "unavailable", metaUnknown: true };
   }
-  return "readable";
+  return { visibility: "readable", metaUnknown: false };
 };
+
+export const getTaskVisibility = (taskId: string): TaskVisibility =>
+  evaluateTaskVisibility(taskId).visibility;
 
 /**
  * 统一读提交闸（同步）——visibility !== readable 即隐藏。
@@ -1017,16 +1043,38 @@ export const commitReadableTaskListResponse = <T extends { id: string }>(
   wrap: (filtered: T[]) => unknown,
 ): NextResponse => NextResponse.json(wrap(filterCommittedReads(items)));
 
-export const listTasks = async (): Promise<TaskSummary[]> => {
+/**
+ * 列表 + 「损坏的任务」。
+ *
+ * 为什么另给 corrupt 数组、而不是把损坏任务塞进 tasks：tasks 会被所有权 / boot recovery /
+ * 飞书桥接 / 搜索等逻辑当真任务遍历，混进假任务（没有可信的 runStatus / repoPaths）会被误用。
+ * 损坏任务只在这里单独带出 {id, kind, reason, metaPath, backupValid}，UI 自己决定怎么展示。
+ *
+ * 只有「删除证据都明确非终态、且唯一原因是 meta 读 unknown」的目录才进 corrupt：
+ * 已删除 / 删除证据读不了 / 没有 meta.json 的目录仍按原样静默隐藏。
+ */
+export const listTasksWithCorrupt = async (): Promise<{
+  tasks: TaskSummary[];
+  corrupt: CorruptTaskInfo[];
+}> => {
   await ensureBootRecovery();
   await ensureDataDir();
   const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
   const ids = entries.filter((e) => e.isDirectory()).map((e) => e.name);
 
   const summaries: TaskSummary[] = [];
+  const corrupt: CorruptTaskInfo[] = [];
   for (const id of ids) {
     // 双保险：tombstone / committed journal 存在一律 skip
-    if (!assertTaskReadable(id)) continue;
+    const gate = evaluateTaskVisibility(id);
+    if (gate.visibility !== "readable") {
+      // 以前这里直接 continue——meta 损坏的任务从侧栏静默消失、用户不知道它还在磁盘上
+      if (gate.metaUnknown) {
+        const info = inspectMetaCorruptionSync(id);
+        if (info) corrupt.push(info);
+      }
+      continue;
+    }
     let raw: unknown | null;
     try {
       raw = await readMetaRaw(id);
@@ -1048,8 +1096,12 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
     summaries.push(summary);
   }
   // 循环结束后最终过滤——A 已 push 后仍可能 await B/C，期间 A 被删须剔除
-  return filterCommittedReads(summaries);
+  return { tasks: filterCommittedReads(summaries), corrupt };
 };
+
+/** 只要任务摘要的调用方（绝大多数）用它：签名与行为同改前，损坏任务不会混进来 */
+export const listTasks = async (): Promise<TaskSummary[]> =>
+  (await listTasksWithCorrupt()).tasks;
 
 /**
  * tombstone 存在 → 视为已删（与 listTasks 一致）。
@@ -1260,13 +1312,18 @@ export const readTaskRepoStatusFresh = async (
 export const getTaskWithTailEvents = async (
   id: string,
   tail: number,
+  /**
+   * 窗口补到「含最近一条 anchor 事件」（上限 MAX_EVENTS_TAIL，见 readEventsTail）。
+   * 首屏 GET 与 watch-task bootstrap 必须传同一个判定——两边窗口一致，客户端「只追加」的合并才不乱序。
+   */
+  opts?: { anchor?: (ev: TaskEvent) => boolean },
 ): Promise<Task | null> => {
   await ensureBootRecovery();
   if (!assertTaskReadable(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
-  const task = await hydrateTaskWithTailEvents(raw, tail);
+  const task = await hydrateTaskWithTailEvents(raw, tail, opts);
   // hydrate 后可挂起——矩阵在此注入删除，验证不发 stale
   await failpoint("getTaskWithTailEvents.afterHydrate");
   if (!assertTaskReadable(id)) return null;
@@ -1425,7 +1482,11 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
   return await hydrateTask(meta);
 };
 
-export const deleteTask = async (id: string): Promise<boolean> => {
+/**
+ * @param report 可选出参：worktree 清理的实际结果（快照失败而保留的目录 / 落了的快照 ref）。
+ *   删任务后事件没处可写，不带回的话用户对「目录其实还留着」一无所知（第三轮 review F1-03）。
+ */
+export const deleteTask = async (id: string, report?: DeleteWorktreeReport): Promise<boolean> => {
   // 审查发现：原先无锁 fs.rm，与锁内 writeMeta（会 mkdir）竞态 → 删完被写回「复活」。
   // 存在检查 + 清理 + rm 整段持锁，与 writeMeta / 其它 meta RMW 互斥。
   return withTaskLock(id, async () => {
@@ -1442,7 +1503,9 @@ export const deleteTask = async (id: string): Promise<boolean> => {
     const meta = await readMetaV06(id).catch(() => null);
     // V0.10：先清隔离工作区；失败不挡删除、boot 孤儿扫描兜底
     try {
-      if (meta && isWorktreeTask(meta)) await removeTaskWorktrees(meta);
+      if (meta && isWorktreeTask(meta)) {
+        collectWorktreeRemoval(report, await removeTaskWorktrees(meta));
+      }
     } catch (err) {
       console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
     }
@@ -1480,6 +1543,10 @@ export const deleteTask = async (id: string): Promise<boolean> => {
       // 复用 writeDeleteTombstone（与 DELETE 延迟分支同一协议）
       await writeDeleteTombstone(id);
       await fs.unlink(path.join(dir, META_FILE)).catch(() => {});
+      // .bak / .invalid 一并卸：启动恢复只在「主文件存在且损坏」时才用 .bak（主文件缺失不会复活），
+      // 这里清掉是为了不在被删任务目录里留一份完整 meta 副本
+      await fs.unlink(path.join(dir, META_BACKUP_FILE)).catch(() => {});
+      await fs.unlink(path.join(dir, META_INVALID_FILE)).catch(() => {});
       // tombstone 后 events 不再作为合法日志——一并清 counter
       clearEventSeqCounter(id);
       console.warn(
@@ -1863,6 +1930,22 @@ export const setTaskUiLayout = async (
     } else {
       meta.uiLayout = undefined;
     }
+    await writeMeta(meta);
+  });
+
+/**
+ * 记录最近一次 chat 回退（回退路由在截断 + 写标记事件之后调；语义见 types.ts Task.lastRewind，D9-04）。
+ * 只落 meta、不动 updatedAt（回退本身已把它推到回退时刻）；任务不存在 / meta 损坏静默跳过——
+ * 它只是给「断线重连的另一个窗口」多一道对齐信号，写不进去不能让已提交的回退报错。
+ */
+export const setTaskLastRewind = async (
+  id: string,
+  lastRewind: LastRewind,
+): Promise<void> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return;
+    meta.lastRewind = lastRewind;
     await writeMeta(meta);
   });
 

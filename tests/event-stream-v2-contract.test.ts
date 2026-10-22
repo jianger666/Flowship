@@ -415,13 +415,21 @@ describe("浮层 / 分隔：实心面、不糊字", () => {
 });
 
 describe("错误卡 / 提问卡：当前要你处理的强、已过去的弱", () => {
-  it("错误卡「当轮」= 没在跑 + 是最近一条错误；重试按钮只给当轮", () => {
+  it("错误卡「当轮」= 没在跑 + 是最近一条错误；恢复入口（重试 / 重新推进）只给当轮，且按触发源单点判定", () => {
+    // 「当轮」资格走 chat-turns.isCurrentErrorCard（= !mainRunActive && isLatestErrorEvent）；
+    // 传进来的 runActive 是属主主 run 的在跑态、不含旁路群答疑（D6-02，行为见 tests/main-run-active.test.ts）
     expect(errorCard).toContain(
-      "const isCurrent = !runActive && isLatestErrorEvent(events, ev.id);",
+      "const isCurrent = isCurrentErrorCard(events, ev.id, !!runActive);",
     );
+    // 第二轮 review F4-01 / V3-02 / V3-04 / V9-01 / V12-03：只靠 isCurrent 会让推进失败 / 定时失败 /
+    // 后台唤醒失败的卡也带「重试」、点了重放旧 user_reply——资格统一走 resolveErrorRecovery
+    // 第三个参数带窗口截断信息（D8-02：task 形态触发源被挤出窗口时降级「重新推进」）
+    expect(errorCard).toContain("resolveErrorRecovery(events, ev.id, {");
     expect(errorCard).toContain(
-      "const canRetry = !!streamActions?.onRetryLastMessage && isCurrent;",
+      "const canRetry = !!streamActions?.onRetryLastMessage && !!retrySource;",
     );
+    expect(errorCard).toContain("recovery.kind === \"readvance\"");
+    expect(errorCard).not.toMatch(/canRetry\s*=\s*[^;]*&&\s*isCurrent\s*;/);
   });
 
   it("错误卡当轮整卡 destructive 描边 + 淡底；历史只留左侧一道 destructive 线 + 白卡底", () => {

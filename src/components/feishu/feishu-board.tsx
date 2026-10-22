@@ -32,6 +32,7 @@ import { cn } from "@/lib/utils";
 import { markShellContentReady } from "@/lib/shell-ready";
 import { loadBoardRange, saveBoardRange } from "@/lib/view-memory";
 import { useTaskList } from "@/hooks/use-task-list";
+import { shouldTrustCachedTaskLink } from "@/lib/workitem-link";
 
 type MeegleProjectSetting = NonNullable<FeAiFlowSettings["meegleProject"]>;
 
@@ -79,7 +80,12 @@ interface BoardResp {
   items?: BoardItem[];
   /** 可访问空间（设置页下拉仍用；看板本身不再切空间） */
   projects?: Array<{ key: string; name: string; simpleName?: string }>;
+  /** 区间过长、服务端只查了前面一部分时：实际覆盖到的结束时间（ms） */
+  coveredTo?: number;
 }
+
+/** 区间变化后等多久再发请求（连点「平移」只发最后一次；首拉不等待） */
+const RANGE_DEBOUNCE_MS = 300;
 
 const CACHE_KEY = "flowship.board.cache.v3";
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -89,7 +95,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export const FeishuBoard = () => {
   const router = useRouter();
   // 侧栏任务列表：点看板时实时校验 it.task（缓存旧映射不失效，盲跳会 404）
-  const { tasks, loaded: tasksLoaded } = useTaskList();
+  const { tasks, loaded: tasksLoaded, loadError: tasksLoadError } = useTaskList();
   const liveTaskIds = useMemo(
     () => new Set(tasks.map((t) => t.id)),
     [tasks],
@@ -102,6 +108,10 @@ export const FeishuBoard = () => {
   const [refreshing, setRefreshing] = useState(false);
   // 请求序号：旧请求晚到不覆盖新数据
   const seqRef = useRef(0);
+  // 在途请求的取消句柄：换区间 / 新一轮刷新 / 卸载时 abort 旧请求——
+  // 服务端 meegle 是进程级串行队列，不取消就会把没人要的旧请求全跑完，还堵住预览页等别的 meegle 调用（D2a-04）
+  const abortRef = useRef<AbortController | null>(null);
+  const firstFetchRef = useRef(true);
   // 瞬态失败静默重试余额（成功回满；见 refresh 里的护栏注释）
   const retryLeftRef = useRef(2);
   // 静默重试 timer：卸载 / 新一轮 refresh 必须清掉，防幽灵 refresh
@@ -178,13 +188,18 @@ export const FeishuBoard = () => {
     // 新一轮开始先清掉上一轮静默重试，避免叠多个幽灵 timer
     clearRetryTimer();
     const seq = ++seqRef.current;
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     setRefreshing(true);
     try {
       const qs = new URLSearchParams();
       qs.set("project", meegleProject.key);
       qs.set("from", String(range.from));
       qs.set("to", String(range.to));
-      const r = await fetch(`/api/feishu/board?${qs.toString()}`);
+      const r = await fetch(`/api/feishu/board?${qs.toString()}`, {
+        signal: ctrl.signal,
+      });
       const data = (await r.json()) as BoardResp;
       // 只缓存 ok 响应——升级重启后 CLI 冷启动的瞬态失败若写进跨重启缓存、
       // 下次启动首屏直接渲降级态（用户实测「升级完授权像没检测到」的元凶之一）
@@ -215,6 +230,8 @@ export const FeishuBoard = () => {
         setResp(data);
       }
     } catch (err) {
+      // 被我们自己 abort（换区间 / 新一轮刷新 / 卸载）不是失败：别画错误态、别排重试
+      if (ctrl.signal.aborted) return;
       if (seq === seqRef.current) {
         // fetch 本身挂（网络 / server 短暂不可达）走同一护栏：有好数据不清屏、静默重试
         const prev = respRef.current;
@@ -231,17 +248,26 @@ export const FeishuBoard = () => {
         }
       }
     } finally {
-      if (seq === seqRef.current) setRefreshing(false);
+      if (seq === seqRef.current && !ctrl.signal.aborted) setRefreshing(false);
     }
   }, [meegleProject.key, range, clearRetryTimer, scheduleSilentRetry]);
 
   useEffect(() => {
     aliveRef.current = true;
     refreshRef.current = refresh;
-    void refresh();
+    // 首拉立即发；之后区间 / 空间变化防抖 300ms，连点「往后平移」只发最后一次（D2a-04）
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (firstFetchRef.current) {
+      firstFetchRef.current = false;
+      void refresh();
+    } else {
+      timer = setTimeout(() => void refresh(), RANGE_DEBOUNCE_MS);
+    }
     return () => {
       aliveRef.current = false;
+      if (timer !== null) clearTimeout(timer);
       clearRetryTimer();
+      abortRef.current?.abort();
     };
   }, [refresh, clearRetryTimer]);
 
@@ -251,7 +277,16 @@ export const FeishuBoard = () => {
       // localStorage / 内存缓存里的 task id 删任务后不失效——用侧栏实时列表校验；
       // 列表还没加载完（loaded=false、tasks 空）时回退信任缓存映射——否则秒开缓存
       // 期间点已有任务会被误导去预览页、可能重复建任务
-      if (it.task && (!tasksLoaded || liveTaskIds.has(it.task.id))) {
+      // 列表首拉失败（loaded=true 但没数据 + 有失败）同样拿不到实时校验，也回退信任缓存（shouldTrustCachedTaskLink）
+      if (
+        it.task &&
+        (shouldTrustCachedTaskLink({
+          loaded: tasksLoaded,
+          loadError: tasksLoadError,
+          taskCount: tasks.length,
+        }) ||
+          liveTaskIds.has(it.task.id))
+      ) {
         router.push(`/tasks/${it.task.id}`);
         return;
       }
@@ -261,7 +296,7 @@ export const FeishuBoard = () => {
       if (it.url) qs.set("url", it.url);
       router.push(`/workitems/${encodeURIComponent(it.id)}?${qs.toString()}`);
     },
-    [router, liveTaskIds, tasksLoaded],
+    [router, liveTaskIds, tasksLoaded, tasksLoadError, tasks.length],
   );
 
   const items = useMemo(() => resp?.items ?? [], [resp]);
@@ -309,7 +344,9 @@ export const FeishuBoard = () => {
   // ---------- 首拉 loading：整区居中（不带看板头部行）----------
   // 位置跟首页 gate 的 hero 完全重合——原来 loading 在头部行下方的 flex-1 里、
   // 中心比 gate loading 低一截、启动链三段 loading 逐级往下跳（用户实测「不断往下抖」）
-  if (resp === null || (refreshing && items.length === 0)) {
+  // 只有「还没有任何响应」才整页 hero：已有响应（哪怕 0 条）刷新 / 平移区间时保留工具条与区间选择器，
+  // 只在刷新钮上转圈——否则空看板「往后平移找排期」每一步都整页闪烁且不可操作（D2a-05）
+  if (resp === null) {
     return <LoadingState variant="hero" immediate />;
   }
 
@@ -321,6 +358,12 @@ export const FeishuBoard = () => {
         <h1 className="text-lg font-semibold tracking-tight">我的排期</h1>
         {/* 当前默认空间名：只展示、不可点（切空间去设置页） */}
         <span className="text-xs text-muted-foreground">{meegleProject.name}</span>
+        {resp.coveredTo !== undefined && resp.coveredTo < range.to ? (
+          <span className="text-xs text-warning">
+            区间太长，只显示到 {new Date(resp.coveredTo).getMonth() + 1}/
+            {new Date(resp.coveredTo).getDate()}
+          </span>
+        ) : null}
         <Button
           size="sm"
           variant="outline"
@@ -349,6 +392,7 @@ export const FeishuBoard = () => {
           items={items}
           onOpen={handleOpen}
           range={range}
+          refreshing={refreshing}
           onRangeChange={(r) => {
             setRange(r);
             saveBoardRange(r);

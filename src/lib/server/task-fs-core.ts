@@ -17,9 +17,11 @@ import { promises as fs } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
 
+import type { CorruptTaskInfo, CorruptTaskKind } from "@/lib/corrupt-task";
 import type {
   ActionRecord,
   GitBranchInfo,
+  LastRewind,
   MRRecord,
   ModelSelection,
   RepoStatus,
@@ -33,6 +35,7 @@ import type {
   UserRole,
 } from "@/lib/types";
 import { dataRoot, RenameAbortedError, renameWithRetry } from "./data-root";
+import { isDirGoneError } from "./fs-gone";
 import { serializeEventLineRedacted } from "./event-secret-redact";
 import { failpoint } from "./failpoints";
 import { coalesceAdjacentThinking } from "@/lib/merge-thinking";
@@ -44,6 +47,14 @@ import { z } from "zod";
 
 export const DATA_DIR = path.join(dataRoot(), "tasks");
 export const META_FILE = "meta.json";
+/**
+ * meta.json 的「上一版有效备份」：每次覆盖写前由 refreshMetaBackup 滚动一次，
+ * 只存能通过 schema 校验的版本（坏文件绝不顶掉好备份）。
+ * 用途：崩溃 / 降级后 meta.json 内容损坏时，启动期 restoreMetaFromBackup 用它原子恢复主文件。
+ */
+export const META_BACKUP_FILE = "meta.json.bak";
+/** 恢复时被替换掉的坏 meta.json 原件（单槽、下次恢复覆盖）：留给人工排查，也避免「降级再升级」丢掉新版数据 */
+export const META_INVALID_FILE = "meta.json.invalid";
 export const EVENTS_FILE = "events.jsonl";
 export const ACTIONS_DIR = "actions";
 // 任务专属可写工作目录（V0.x「产出解耦」）：artifact 之外的文件产出（脚本 / 数据 / 中间产物）
@@ -250,6 +261,8 @@ export interface TaskMetaV06 {
   /** 本窗口绑定的 agent 提供方（cursor 或 customProviders.id） */
   provider?: string;
   uiLayout?: { artifactPanelSize?: number };
+  /** 最近一次 chat 回退的记录（回退路由写；语义见 types.ts Task.lastRewind，D9-04） */
+  lastRewind?: LastRewind;
 }
 
 /**
@@ -309,6 +322,52 @@ export const isValidMetaShape = (raw: unknown): raw is TaskMetaV06 => {
     return false;
   }
   return true;
+};
+
+type MetaTextParse =
+  | { ok: true; meta: TaskMetaV06 }
+  | { ok: false; kind: Exclude<CorruptTaskKind, "read_error">; reason: string };
+
+/**
+ * 纯函数：把 meta 文本解析 + schema 校验成「有效 / 损坏（带类别与原因）」，不打日志。
+ * 给 .bak 校验、损坏任务识别用——它们要的是一个结论，而不是 isValidMetaShape 那种每次失败都 warn。
+ *
+ * reason 会进 API 响应：只写类别 / JSON 出错位置 / schema 出错字段路径，
+ * 绝不拼文件内容（V8 的 JSON.parse 报错里带内容片段，所以不直接用 e.message）。
+ */
+const parseMetaText = (text: string): MetaTextParse => {
+  if (text.trim().length === 0) {
+    return {
+      ok: false,
+      kind: "empty",
+      reason: "meta.json 为空（可能上次进程写一半挂了）",
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    const pos = /position (\d+)/.exec(e instanceof Error ? e.message : "")?.[1];
+    return {
+      ok: false,
+      kind: "invalid_json",
+      reason: `meta.json 不是合法 JSON${pos ? `（位置 ${pos}）` : ""}`,
+    };
+  }
+  const checked = TaskMetaV06Schema.safeParse(parsed);
+  if (!checked.success) {
+    const issues = checked.error.issues
+      .slice(0, 3)
+      .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+      .join("; ");
+    return {
+      ok: false,
+      kind: "schema_mismatch",
+      reason: `meta.json 不符合当前 schema：${issues}`,
+    };
+  }
+  // 与 isValidMetaShape 一致：返回原始对象（looseObject 透传未知字段，不能返回 zod 的 data）
+  return { ok: true, meta: parsed as TaskMetaV06 };
 };
 
 // per-task mutex（防 read-modify-write race、沿用 V0.5）
@@ -460,6 +519,194 @@ export const readMetaV06EvidenceSync = (id: string): MetaEvidenceRead => {
   }
 };
 
+// ----------------- meta 损坏识别 / .bak 恢复 / 备份滚动 -----------------
+
+const metaFilePath = (id: string): string => path.join(taskDir(id), META_FILE);
+const metaBackupPath = (id: string): string =>
+  path.join(taskDir(id), META_BACKUP_FILE);
+
+/** 同步读 .bak 并判有效（只回答「能不能用来恢复」，读失败 / 不存在都算无效） */
+const isBackupValidSync = (id: string): boolean => {
+  try {
+    return parseMetaText(readFileSync(metaBackupPath(id), "utf-8")).ok;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 同步识别「这个任务目录的 meta.json 是否损坏」，损坏返回描述、否则 null。
+ *
+ * 为什么需要它：getTaskVisibility 对 meta 读 unknown（内容损坏 / schema 不合）一律 fail-closed
+ * 判 unavailable，listTasks 因此直接跳过——任务从侧栏静默消失、用户不知道它还在磁盘上。
+ * 列表在「已确认不是删除证据导致的 unavailable」后调它，把这类任务单独暴露出去（不混进 Task[]）。
+ *
+ * - meta.json 不存在（ENOENT）→ null：不是任务目录 / 已降级删除，不算损坏
+ * - 读文件本身失败 → kind=read_error（可能是瞬时 I/O 故障、不一定内容坏，所以不会据此自动恢复）
+ * - 内容空 / 非 JSON / schema 不合 → 对应 kind
+ */
+export const inspectMetaCorruptionSync = (id: string): CorruptTaskInfo | null => {
+  const metaPath = metaFilePath(id);
+  let text: string;
+  try {
+    text = readFileSync(metaPath, "utf-8");
+  } catch (err) {
+    if (isMetaEnoent(err)) return null;
+    const code = (err as NodeJS.ErrnoException)?.code ?? "unknown";
+    return {
+      id,
+      kind: "read_error",
+      reason: `读取 meta.json 失败（${code}）`,
+      metaPath,
+      backupValid: false,
+    };
+  }
+  const parsed = parseMetaText(text);
+  if (parsed.ok) return null;
+  return {
+    id,
+    kind: parsed.kind,
+    reason: parsed.reason,
+    metaPath,
+    backupValid: isBackupValidSync(id),
+  };
+};
+
+/**
+ * 写文件并 fsync（meta 原子写的 tmp 阶段用）。
+ *
+ * 为什么：只有 tmp + rename 时，断电 / 内核崩溃可能出现「rename 已持久化、tmp 的数据块没落盘」
+ * ——meta.json 变成空文件或半截文件，任务整个读不出来。rename 之前 fsync(tmp) 才能保证
+ * rename 之后看到的一定是完整内容。
+ *
+ * fsync 本身失败（个别网络盘 / 文件系统不支持）只 warn、不挡写：效果不会比改前（完全不 fsync）更差。
+ */
+const writeFileFsynced = async (
+  filePath: string,
+  content: string,
+): Promise<void> => {
+  const fh = await fs.open(filePath, "w");
+  try {
+    await fh.writeFile(content, "utf-8");
+    await fh.sync().catch((err: unknown) => {
+      console.warn(
+        `[task-fs] meta fsync 失败（忽略、继续 rename）：${
+          (err as NodeJS.ErrnoException)?.code ?? String(err)
+        }`,
+      );
+    });
+  } finally {
+    await fh.close();
+  }
+};
+
+/**
+ * 覆盖写 meta.json 之前，把「当前有效的旧 meta」滚成 meta.json.bak。
+ *
+ * - 旧文件不存在（首次写）→ 不动
+ * - 旧文件本身已坏（空 / 非 JSON / schema 不合）→ **不动 .bak**：坏文件不能顶掉好备份
+ * - 失败只 warn、不挡主写：备份是兜底、不是前置条件
+ * - 用 fs.writeFile 直写而不是 tmp+rename：.bak 先于主文件 rename 写完，写 .bak 中途崩溃时主文件
+ *   仍是完整的旧版（rename 还没发生），下次写会重新滚备份，不存在「主文件与 .bak 同时是坏的」窗口；
+ *   同时避免多走一次 renameWithRetry（它挂着 rename.beforeAttempt failpoint，测试靠它定位 meta 的 rename）。
+ * - 开销：多一次读 + 校验 + 写（实测 24KB meta 约 +0.7ms，其中 zod 校验约 0.03ms）。
+ */
+const refreshMetaBackup = async (metaFile: string): Promise<void> => {
+  try {
+    let oldText: string;
+    try {
+      oldText = await fs.readFile(metaFile, "utf-8");
+    } catch (err) {
+      if (isMetaEnoent(err)) return;
+      throw err;
+    }
+    if (!parseMetaText(oldText).ok) return;
+    await fs.writeFile(
+      path.join(path.dirname(metaFile), META_BACKUP_FILE),
+      oldText,
+      "utf-8",
+    );
+  } catch (err) {
+    console.warn(
+      `[task-fs] 刷新 meta.json.bak 失败（忽略、不挡主写）：${
+        (err as NodeJS.ErrnoException)?.code ??
+        (err instanceof Error ? err.message : String(err))
+      }`,
+    );
+  }
+};
+
+export type MetaRestoreResult =
+  /** 主文件内容损坏、.bak 有效 → 已用 .bak 原子恢复 */
+  | "restored"
+  /** 主文件有效 / 不存在 / 读文件失败（I/O 故障不是内容损坏）→ 什么都没做 */
+  | "not_needed"
+  /** 主文件内容损坏、但没有可用的 .bak */
+  | "no_backup"
+  /** 想恢复但写失败（磁盘满 / 权限）；主文件保持原样 */
+  | "failed";
+
+/**
+ * 主 meta.json 内容损坏（空 / 非 JSON / schema 不合）且 meta.json.bak 有效 → 用 .bak 原子恢复主文件。
+ *
+ * 只在启动期（boot recovery）调：恢复发生在任何读写之前、没有「手改 meta 到一半被覆盖」的风险；
+ * 运行中遇到损坏只通过 listTasksWithCorrupt 暴露、不自动动文件。
+ *
+ * 安全边界：
+ * - 主文件不存在（ENOENT）绝不「复活」：deleteTask 降级删除只卸了 meta、不能被 .bak 拉回来
+ * - 主文件读失败（EACCES / EIO / 杀软占用）不算损坏：可能是瞬时错误，拿旧备份顶上去等于回退数据
+ * - 持 withTaskLock，与 meta 的读改写互斥
+ * - 恢复前把坏原件留成 meta.json.invalid（非空才留）：「新版写入新枚举 → 回滚旧版」这种场景里
+ *   被判坏的其实是较新的数据，不留一份就等于恢复时把它销毁了
+ * - 写 tmp 同样 fsync 后 rename；.bak 保持不动（恢复后它与主文件同内容）
+ */
+export const restoreMetaFromBackup = (id: string): Promise<MetaRestoreResult> =>
+  withTaskLock(id, async (): Promise<MetaRestoreResult> => {
+    const finalPath = metaFilePath(id);
+    let primaryText: string;
+    try {
+      primaryText = await fs.readFile(finalPath, "utf-8");
+    } catch {
+      return "not_needed";
+    }
+    if (parseMetaText(primaryText).ok) return "not_needed";
+
+    let backupText: string;
+    try {
+      backupText = await fs.readFile(metaBackupPath(id), "utf-8");
+    } catch {
+      return "no_backup";
+    }
+    if (!parseMetaText(backupText).ok) return "no_backup";
+
+    const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    try {
+      if (primaryText.trim().length > 0) {
+        await fs
+          .writeFile(path.join(taskDir(id), META_INVALID_FILE), primaryText, "utf-8")
+          .catch((err) => {
+            console.warn(
+              `[task-fs] 保留损坏 meta 原件失败（继续恢复）id=${id}：${
+                (err as NodeJS.ErrnoException)?.code ?? String(err)
+              }`,
+            );
+          });
+      }
+      await writeFileFsynced(tmpPath, backupText);
+      await renameWithRetry(tmpPath, finalPath);
+      console.warn(
+        `[task-fs] meta.json 内容损坏、已用 meta.json.bak 恢复 id=${id}（坏原件留在 ${META_INVALID_FILE}）`,
+      );
+      return "restored";
+    } catch (err) {
+      await fs.unlink(tmpPath).catch(() => {});
+      console.warn(`[task-fs] 用 meta.json.bak 恢复失败 id=${id}`, err);
+      return "failed";
+    }
+  });
+
 /**
  * 把序列化 + 写 tmp 与原子 rename 拆开。
  * prepare 期间脏值只在 tmp、meta.json 未动；commit = rename；abort = unlink tmp。
@@ -480,12 +727,13 @@ export const prepareMetaWrite = async (
   // createTask 靠这里 mkdir 建任务目录；deleteTask 持 withTaskLock 后与之互斥，不会「删完被写回复活」
   await fs.mkdir(dir, { recursive: true });
   const finalPath = path.join(dir, META_FILE);
-  // 原子写：tmp + rename（Windows 重试逻辑与 writePrivateFileAtomic 共用 renameWithRetry）
+  // 原子写：tmp（fsync）+ 滚 .bak + rename（Windows 重试逻辑与 writePrivateFileAtomic 共用 renameWithRetry）
   const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
     .toString(36)
     .slice(2, 8)}`;
   try {
-    await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2), "utf-8");
+    // fsync(tmp) 后才允许 rename：防断电后 meta.json 变空文件 / 半截（见 writeFileFsynced）
+    await writeFileFsynced(tmpPath, JSON.stringify(meta, null, 2));
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
     throw err;
@@ -504,6 +752,9 @@ export const prepareMetaWrite = async (
           await fs.unlink(tmpPath).catch(() => {});
           return false;
         }
+        // 确认要提交了才滚 .bak（被 finalGuard 拒写的事务不碰备份）。
+        // 这里有 await，但权威 lease 不受影响：下面 renameWithRetry 每次 fs.rename 前仍会再验 finalGuard
+        await refreshMetaBackup(finalPath);
         // finalGuard 压进 rename retry 循环——每次 fs.rename 前再验；
         // 首轮失败退避期间换主 → RenameAbortedError → 清 tmp、返 false
         await renameWithRetry(tmpPath, finalPath, finalGuard);
@@ -572,17 +823,34 @@ export const readEvents = async (id: string): Promise<TaskEvent[]> => {
     .filter((x): x is TaskEvent => x !== null);
 };
 
+/** 倒着找满足条件的最后一个下标（没有 = -1；不依赖 ES2023 的 findLastIndex） */
+const lastIndexWhere = <T>(arr: readonly T[], pred: (x: T) => boolean): number => {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (pred(arr[i]!)) return i;
+  }
+  return -1;
+};
+
 /**
  * 从文件尾按块反向读。
  * 相邻 thinking 收口后再计 limit——token 级思考不会把 user_reply / 工具挤出窗口。
  * hasMore = 收口后还有更早事件（或触及原始行扫描上限）。
+ *
+ * `opts.anchor`（300 条窗口一致性，第三轮 review D8-01/02/03）：传了就把窗口补到「含最近一条满足
+ * anchor 的事件」——错误卡恢复入口 / 状态行起点 / ↑ 历史都要往前找触发这一轮的 user_reply / action_start，
+ * 一轮长 run 之后它在最近 n 条之外就静默失效。补读有上限 {@link MAX_EVENTS_TAIL}（总条数不超过它，
+ * 防巨型任务的首屏失控）；n 本身已不小于上限、或锚点就在最近 n 条里时与不传完全一致。
  */
 export const readEventsTail = async (
   id: string,
   n: number,
+  opts?: { anchor?: (ev: TaskEvent) => boolean },
 ): Promise<{ events: TaskEvent[]; hasMore: boolean }> => {
   const limit = Math.max(0, Math.min(Math.floor(n), MAX_EVENTS_TAIL));
   if (limit === 0) return { events: [], hasMore: false };
+  const anchor = opts?.anchor;
+  // 补读后的总条数上限（n 已不小于它时 = n，不额外放大）
+  const maxTotal = Math.max(limit, MAX_EVENTS_TAIL);
 
   const p = path.join(taskDir(id), EVENTS_FILE);
   if (!(await exists(p))) return { events: [], hasMore: false };
@@ -631,16 +899,26 @@ export const readEventsTail = async (
         }
       }
       const logical = coalesceAdjacentThinking([...collected].reverse());
-      if (logical.length > limit || hitRawCap) break;
+      if (hitRawCap) break;
+      if (logical.length > limit) {
+        // 不要锚点 / 锚点已在手里 / 已读到补读上限：够了；否则接着往前读
+        if (!anchor) break;
+        if (logical.length >= maxTotal) break;
+        if (lastIndexWhere(logical, anchor) >= 0) break;
+      }
     }
 
     const coalesced = coalesceAdjacentThinking([...collected].reverse());
+    // 窗口起点：默认只留最近 limit 条；锚点比这更早、且离末尾不超过 maxTotal 条 → 起点退到锚点。
+    // 锚点远在上限之外（或根本没有）= 补了也拿不到它，不白白放大首屏，保持 limit 条（派生态走客户端降级）
+    let start = Math.max(0, coalesced.length - limit);
+    if (anchor) {
+      const ai = lastIndexWhere(coalesced, anchor);
+      if (ai >= 0 && ai < start && coalesced.length - ai <= maxTotal) start = ai;
+    }
     const hasMore =
-      pos > 0 ||
-      coalesced.length > limit ||
-      collected.length >= MAX_EVENTS_TAIL_RAW;
-    const events =
-      coalesced.length > limit ? coalesced.slice(-limit) : coalesced;
+      pos > 0 || start > 0 || collected.length >= MAX_EVENTS_TAIL_RAW;
+    const events = start > 0 ? coalesced.slice(start) : coalesced;
     return { events, hasMore };
   } finally {
     await fh.close();
@@ -1164,6 +1442,42 @@ export const clearEventSeqCounter = (taskId: string): void => {
 };
 
 /**
+ * 「本进程已确认 events.jsonl 末尾是换行」的 taskId 集合（2026-10-20 第二轮 review V8-01）。
+ *
+ * 崩溃 / ENOSPC 可能在文件末尾留下一条没写完的半行（不以 `\n` 结尾）。下一条事件若直接 append，
+ * 会被粘进那行坏数据：当次已 publish 上屏，但刷新 / 重连 / 换窗口都读不回来，而 seq、sidecar 照常前进。
+ * 所以每个 task 在本进程内第一次写之前（以及任何一次写失败之后）读一下末字节，不是 `\n` 就先补一个——
+ * 坏半行被隔离成独立一行（读侧本来就会跳过解析失败的行），新事件完整落盘。
+ * 挂 globalThis：与其他 per-task 状态同因，Next dev 多 chunk 下 module-level 会分裂。
+ */
+const EVENT_TAIL_VERIFIED_KEY = "__flowshipEventTailVerifiedV1__";
+const getEventTailVerified = (): Set<string> => {
+  const g = globalThis as unknown as Record<string, Set<string> | undefined>;
+  if (!g[EVENT_TAIL_VERIFIED_KEY]) g[EVENT_TAIL_VERIFIED_KEY] = new Set();
+  return g[EVENT_TAIL_VERIFIED_KEY]!;
+};
+
+/** 文件非空且末字节不是 `\n` → true（需要先补一个换行）；文件不存在 / 为空 → false */
+const eventsFileTailNeedsNewline = async (file: string): Promise<boolean> => {
+  let fh: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    fh = await fs.open(file, "r");
+    const { size } = await fh.stat();
+    if (size === 0) return false;
+    const buf = Buffer.alloc(1);
+    await fh.read(buf, 0, 1, size - 1);
+    return buf[0] !== 0x0a;
+  } catch (err) {
+    // 文件还没建（首条事件）/ 目录已删：没有坏尾巴可言；appendFile 自己会处理 ENOENT
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    // 其它读失败不挡写入：保持旧行为（直接 append）
+    return false;
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+};
+
+/**
  * 实际 append（无串行）。
  * @returns true=已写入；false=ENOENT（任务目录已删、透传给上层不 publish）
  */
@@ -1174,18 +1488,26 @@ const appendEventLineUnlocked = async (
   // 不再无条件 mkdir：审查发现与 deleteTask 竞态时会把已删目录「复活」。
   // 调用方约定目录已存在（createTask 先 writeMeta；appendEvent 先查 meta；boot recovery 已有 meta）。
   // 目录没了 = 任务已删 → ENOENT 返 false（上层不构造成功、不 publish 幽灵事件）。
+  const file = path.join(taskDir(id), EVENTS_FILE);
+  const verified = getEventTailVerified();
   try {
+    const healNewline = verified.has(id)
+      ? false
+      : await eventsFileTailNeedsNewline(file);
     await fs.appendFile(
-      path.join(taskDir(id), EVENTS_FILE),
+      file,
       // 落盘前精确脱敏 gitToken / apiKey / 公司环境密码（agent 读 config.json / company-env.json
       // 取凭据会让它进 tool_result）；命中时原地改 ev，之后 publish 的也是脱敏版
-      serializeEventLineRedacted(ev) + "\n",
+      (healNewline ? "\n" : "") + serializeEventLineRedacted(ev) + "\n",
       "utf-8",
     );
+    verified.add(id);
     return true;
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return false;
+    // 写失败可能留下半行：下次写前重新核对末字节
+    verified.delete(id);
+    // 任务目录已删 → false（第五轮 Q3-08：macOS 并发删除时可能是 EINVAL / ENOTDIR 而不只是 ENOENT，见 fs-gone.ts）
+    if (await isDirGoneError(err, taskDir(id))) return false;
     throw err;
   }
 };
@@ -1330,6 +1652,7 @@ export const assembleTask = (
   model: meta.model,
   provider: meta.provider,
   uiLayout: meta.uiLayout,
+  lastRewind: meta.lastRewind,
   events,
 });
 
@@ -1349,8 +1672,9 @@ export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
 export const hydrateTaskWithTailEvents = async (
   meta: TaskMetaV06,
   tail: number,
+  opts?: { anchor?: (ev: TaskEvent) => boolean },
 ): Promise<Task> => {
-  const { events, hasMore } = await readEventsTail(meta.id, tail);
+  const { events, hasMore } = await readEventsTail(meta.id, tail, opts);
   const task = assembleTask(meta, events);
   if (hasMore) task.eventsTruncated = true;
   return task;

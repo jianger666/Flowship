@@ -8,8 +8,14 @@
  * 整段闪一下 / 跳几个像素。
  *
  * 修法：让定稿事件**接管流式项的 Virtuoso key**。Virtuoso 按 key 复用 item 外壳、React 在外壳里
- * 看到同一个 `EventRow` 就地更新 props（`streaming` true → false、`ev` 换成真事件），
- * Streamdown 在原地从 streaming 模式切 static，已渲染的块一个都不重建。
+ * 看到同一个 `EventRow` 就地更新 props（`streaming` true → false、`ev` 换成真事件）。
+ *
+ * ⚠ 这一层只保证 Virtuoso 外壳 / EventRow / MarkdownText 实例不重挂，**管不到 Streamdown 内部**：
+ * 上游 `mode` 从 streaming 换成 static 时，Streamdown 返回的子树从「数组 child」变成「单元素 child」，
+ * React 照样把里面所有 Block / 代码块 / mermaid 卸载重挂（2026-10-20 第二轮 review V15-01，
+ * 对照 streamdown 2.5.0 源码核实；此前这里写的「已渲染的块一个都不重建」与上游行为不符）。
+ * 所以 MarkdownText 对「流式过的实例」恒用 `mode="streaming"`、只靠 `isAnimating` 表达「吐完了」，
+ * 定稿时再关 `parseIncompleteMarkdown`——判定在 lib/streamdown-options.ts 的 resolveStreamdownMode。
  *
  * 这里只放「什么时候该接管」的纯判定（不碰 DOM / React），由 event-stream.tsx 用
  * 「渲染期 setState（由输入推导 state）」驱动：同输入多算几次结果不变，StrictMode 双渲染安全。

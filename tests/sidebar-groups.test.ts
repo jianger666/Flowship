@@ -1,12 +1,16 @@
 /**
  * 侧栏分组 / 置顶重排 单测
  */
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
   applyPinnedOrder,
   buildRepoGroups,
+  canReconcileChatOrder,
   HOME_GROUP_LABEL,
+  isSidebarAlwaysShowItem,
   movePinnedId,
   normalizeRepoPath,
   pickVisibleGroupItems,
@@ -309,6 +313,150 @@ describe("pickVisibleGroupItems（当前对话始终露出）", () => {
   });
 });
 
+describe("pickVisibleGroupItems.alwaysShow（V7-02：忙的 / 等回答的不许被折叠）", () => {
+  // 复现：同仓组 ≥5 个 chat，先开跑的长任务被后发消息的对话挤到第 5 位 → 折进「展开其余 N 条」，
+  // 转圈 / 等回答 / 后台子代理信号一起消失
+  const items = ["a", "b", "c", "d", "e", "f"].map((id) => ({ id }));
+  const ids = (xs: { id: string }[]) => xs.map((x) => x.id);
+  const busyIds = (set: string[]) => (t: { id: string }) => set.includes(t.id);
+
+  it("第 5 位的运行中对话被露出，且保持原排序位置；隐藏数只算真正藏起来的", () => {
+    const r = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: false,
+      alwaysShow: busyIds(["e"]),
+    });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d", "e"]);
+    expect(r.hiddenCount).toBe(1);
+  });
+
+  it("多个忙的散在尾部 → 全部露出、顺序不乱；其余照旧折叠", () => {
+    const r = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: false,
+      alwaysShow: busyIds(["f", "e"]),
+    });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d", "e", "f"]);
+    expect(r.hiddenCount).toBe(0);
+  });
+
+  it("alwaysShow 与 activeId 叠加：两者都露出，仍保持原序", () => {
+    const r = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: false,
+      activeId: "f",
+      alwaysShow: busyIds(["e"]),
+    });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d", "e", "f"]);
+    expect(r.hiddenCount).toBe(0);
+  });
+
+  it("忙的本来就在前 N 条里 → 不重复、不多露；头部没忙的也不受影响", () => {
+    const r = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: false,
+      alwaysShow: busyIds(["b"]),
+    });
+    expect(ids(r.visible)).toEqual(["a", "b", "c", "d"]);
+    expect(r.hiddenCount).toBe(2);
+  });
+
+  it("没有任何忙的 / 不传 alwaysShow → 与原行为完全一致", () => {
+    const base = pickVisibleGroupItems(items, { limit: 4, expanded: false });
+    const none = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: false,
+      alwaysShow: () => false,
+    });
+    expect(ids(base.visible)).toEqual(["a", "b", "c", "d"]);
+    expect(none).toEqual(base);
+  });
+
+  it("已展开 / 没超限 → 谓词不起作用（本来就全展）", () => {
+    const expanded = pickVisibleGroupItems(items, {
+      limit: 4,
+      expanded: true,
+      alwaysShow: busyIds(["e"]),
+    });
+    expect(ids(expanded.visible)).toEqual(["a", "b", "c", "d", "e", "f"]);
+    expect(expanded.hiddenCount).toBe(0);
+    const few = pickVisibleGroupItems(items.slice(0, 3), {
+      limit: 4,
+      expanded: false,
+      alwaysShow: busyIds(["c"]),
+    });
+    expect(ids(few.visible)).toEqual(["a", "b", "c"]);
+    expect(few.hiddenCount).toBe(0);
+  });
+
+  it("不改入参（返回新数组）", () => {
+    const input = [...items];
+    pickVisibleGroupItems(input, {
+      limit: 4,
+      expanded: false,
+      alwaysShow: busyIds(["e"]),
+    });
+    expect(input).toEqual(items);
+  });
+});
+
+describe("isSidebarAlwaysShowItem（忙 / 后台子代理 / 待回答 都不折叠）", () => {
+  it("主 AI 在跑 → 露出", () => {
+    expect(
+      isSidebarAlwaysShowItem(task({ id: "r", title: "r", runStatus: "running" })),
+    ).toBe(true);
+  });
+
+  it("主 AI 说完了但后台子代理还在跑 → 露出（与侧栏转圈同口径）", () => {
+    expect(
+      isSidebarAlwaysShowItem(
+        task({
+          id: "b",
+          title: "b",
+          runStatus: "awaiting_user",
+          backgroundSubagentCount: 2,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("有未答的提问 → 露出", () => {
+    expect(
+      isSidebarAlwaysShowItem(
+        task({ id: "q", title: "q", runStatus: "awaiting_user", hasPendingAsk: true }),
+      ),
+    ).toBe(true);
+  });
+
+  it("空闲 / 出错 / 后台读数为 0 或缺省 / 提问标记为 false → 不露出（不让折叠形同虚设）", () => {
+    for (const t of [
+      task({ id: "i", title: "i", runStatus: "idle" }),
+      task({ id: "e", title: "e", runStatus: "error" }),
+      task({ id: "z", title: "z", runStatus: "idle", backgroundSubagentCount: 0 }),
+      task({ id: "f", title: "f", runStatus: "awaiting_user", hasPendingAsk: false }),
+    ]) {
+      expect(isSidebarAlwaysShowItem(t)).toBe(false);
+    }
+  });
+});
+
+describe("app-sidebar 接线契约：折叠按钮把忙的行传给 pickVisibleGroupItems", () => {
+  const src = readFileSync(
+    path.join(process.cwd(), "src/components/app-sidebar.tsx"),
+    "utf-8",
+  );
+
+  it("pickVisibleGroupItems 调用带 alwaysShow: isSidebarAlwaysShowItem", () => {
+    expect(src).toMatch(/alwaysShow:\s*isSidebarAlwaysShowItem/);
+    expect(src).toMatch(/isSidebarAlwaysShowItem,?\s*\n?[^]*?from "@\/lib\/sidebar-groups"/);
+  });
+
+  it("上一波的 canReconcileChatOrder 守卫与 CorruptTasksNotice 没被动（防误伤）", () => {
+    expect(src).toMatch(/canReconcileChatOrder/);
+    expect(src).toMatch(/CorruptTasksNotice/);
+  });
+});
+
 describe("scrollDeltaToReveal（把行滚进侧栏可视区）", () => {
   const view = { top: 100, bottom: 500 };
 
@@ -331,5 +479,29 @@ describe("scrollDeltaToReveal（把行滚进侧栏可视区）", () => {
     expect(scrollDeltaToReveal(view, { top: 150, bottom: 900 })).toBe(42);
     // 行顶本就紧贴视口顶：不动
     expect(scrollDeltaToReveal(view, { top: 104, bottom: 900 })).toBe(0);
+  });
+});
+
+describe("canReconcileChatOrder（V7-08：冷启动不清空粘性序）", () => {
+  it("列表还没加载完：不对齐（否则空列表会把已存的粘性序清成 []）", () => {
+    expect(canReconcileChatOrder({ loaded: false, loadError: null, chatCount: 0 })).toBe(false);
+    expect(canReconcileChatOrder({ loaded: false, loadError: null, chatCount: 5 })).toBe(false);
+  });
+
+  it("首拉失败且列表为空：「没拉到」≠「没有对话」，不对齐", () => {
+    expect(
+      canReconcileChatOrder({ loaded: true, loadError: "fetch failed", chatCount: 0 }),
+    ).toBe(false);
+  });
+
+  it("加载成功：有对话 / 真的删光了都要对齐", () => {
+    expect(canReconcileChatOrder({ loaded: true, loadError: null, chatCount: 3 })).toBe(true);
+    expect(canReconcileChatOrder({ loaded: true, loadError: null, chatCount: 0 })).toBe(true);
+  });
+
+  it("刷新失败但手里还有旧列表：照常对齐（列表不是空的、不会误清）", () => {
+    expect(
+      canReconcileChatOrder({ loaded: true, loadError: "refresh failed", chatCount: 2 }),
+    ).toBe(true);
   });
 });

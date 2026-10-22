@@ -30,6 +30,7 @@ import {
   DEFAULT_SETTINGS,
   getSettings,
   getSettingsUnreadable,
+  initSettings,
   normalizeSettings,
   saveSettings,
 } from "@/lib/local-store";
@@ -55,12 +56,11 @@ const errResponse = (): Response =>
     headers: { "Content-Type": "application/json" },
   });
 
-beforeAll(() => {
+beforeAll(async () => {
   vi.stubGlobal(
     "fetch",
     (url: string, init?: RequestInit) => {
-      // P1-03：saveSettings 在 init 未成功时会先 GET /api/settings/full——
-      // 单测里自动放行成功，只把真正的 PUT 记进 pendingCalls
+      // 单测里 GET /api/settings/full 自动放行成功，只把真正的 PUT 记进 pendingCalls
       const method = (init?.method ?? "GET").toUpperCase();
       if (String(url).includes("/api/settings/full") && method === "GET") {
         return Promise.resolve(
@@ -81,6 +81,9 @@ beforeAll(() => {
       });
     },
   );
+  // review #16：saveSettings 在 init 成功之前一律拒写（旧实现会在保存时顺手 init 再写 next，
+  // 而 next 是基于默认值构造的、会覆盖磁盘配置）。所以这里要像真实页面一样先完成加载
+  await initSettings();
 });
 
 afterEach(() => {

@@ -49,7 +49,7 @@ vi.mock("@cursor/sdk", () => ({
   },
 }));
 
-const { readEvents, taskDir, writeMeta } = await import(
+const { readEvents, taskDir, withTaskLock, writeMeta } = await import(
   "@/lib/server/task-fs-core"
 );
 const {
@@ -80,7 +80,14 @@ if (!taskDir("probe").startsWith(TMP_ROOT)) {
   );
 }
 
-const TASK_ID = "t_1700000011000_steer_reason";
+/**
+ * 每个用例一个独立的任务 id（beforeEach 里换）：上一个用例的收尾链（`finalizeReconnectGaveUp` → 条件写 runStatus → 写事件）
+ * 是 fire-and-forget 的，可能在用例结束后才落盘；以前所有用例共用一个 id、beforeEach / afterAll 又 `rm` 任务目录，
+ * 收尾链的 `rename meta.json` 一旦撞上 `rm` 就 ENOENT → 未处理的 Promise rejection → vitest 退出码 1（机器负载高时约 15% 复现）。
+ * 换 id 后上一个用例的迟到写入落在它自己的目录里、与下一个用例无关；产品代码不动——删任务走 withTaskLock，
+ * 锁内不会有目录被抽走，这里的竞态只来自测试自己的 `rm`。
+ */
+let TASK_ID = "t_1700000011000_steer_reason_0";
 const AGENT_ID = "agent_fake_steer_reason";
 const BOOT = {
   apiKey: "test-key",
@@ -217,15 +224,30 @@ const settledState = async (
 const infoEvents = async (): Promise<TaskEvent[]> =>
   (await readEvents(TASK_ID)).filter((e) => e.kind === "info");
 
+/** 本文件用过的全部任务 id（afterAll 要把每一个的收尾写盘都等完再 rm 临时根） */
+const usedTaskIds = new Set<string>();
+
+/**
+ * 给迟到的收尾写盘留出落地时间：**固定** 5 轮「排空该任务的 per-task 锁 + 让出 40ms」（总共约 200ms），不判断「有没有新活」。
+ * 链上每一步（finalizeOpenToolCalls → 条件写 runStatus → 写事件 / 发布）都在 per-task 锁里、步间只有零星 await，
+ * 所以多轮排空 + 间隔能覆盖到它；但这是时间裕量、不是同步点——裕量没有标定到失败点（锁内的延迟，比如 rename 前注入的，
+ * 会被「进锁」这道屏障吸收，量不到「进锁之前」的迟到，所以那类注入不构成裕量证据）。用例之间不靠它：每个用例有独立任务 id / 目录，迟到写入落在自己的目录里。
+ */
+const quiesceTask = async (taskId: string): Promise<void> => {
+  for (let i = 0; i < 5; i++) {
+    await withTaskLock(taskId, async () => undefined);
+    await new Promise((r) => setTimeout(r, 40));
+  }
+};
+
 beforeEach(async () => {
   itemSeq += 1;
+  TASK_ID = `t_1700000011000_steer_reason_${itemSeq}`;
+  usedTaskIds.add(TASK_ID);
   ITEM_ID = `cq_steer_reason_${itemSeq}`;
   OTHER_ID = `cq_steer_reason_other_${itemSeq}`;
   mockResume.mockReset();
-  clearChatQueue(TASK_ID);
-  closeChatSessionUnconditional(TASK_ID);
-  await new Promise((r) => setTimeout(r, 30));
-  await fs.rm(taskDir(TASK_ID), { recursive: true, force: true }).catch(() => {});
+  // 新 id：没有残留的队列 / 会话 / 目录，不需要（也不该）再 rm 任何东西
   await writeMeta(makeMeta(TASK_ID));
   // task-fs 的 boot recovery 惰性触发：在任务还是 idle 时先触发一次
   await getTask(TASK_ID);
@@ -248,7 +270,8 @@ afterEach(async () => {
 
 afterAll(async () => {
   closeChatSessionUnconditional(TASK_ID);
-  await new Promise((r) => setTimeout(r, 50));
+  // 每个用例的任务各等一遍（并行等：总耗时仍约 200ms），再删临时根
+  await Promise.all([...usedTaskIds].map((id) => quiesceTask(id)));
   await fs.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 

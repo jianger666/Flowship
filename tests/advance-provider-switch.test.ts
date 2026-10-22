@@ -106,3 +106,34 @@ describe("useProviderSwitch 共享动作（三入口同款）", () => {
     );
   });
 });
+
+describe("对话 footer 的提供方下拉运行中不卸载（第二轮 review V5-04）", () => {
+  const src = read("src/components/tasks/chat-provider-model-picker.tsx");
+
+  it("showProvider 不再由「锁」决定：运行中只走 disabled，不整个卸载（否则每轮模型框抖两次）", () => {
+    expect(src).not.toMatch(/const showProvider = !isProviderSwitchLocked/);
+    expect(src).toMatch(/const showProvider = true/);
+    // 运行中仍灰掉：disabled 由 busy（running / 切家中）驱动
+    expect(src).toMatch(/disabled=\{busy\}/);
+  });
+
+  it("running 时切提供方仍被前端拦住并提示（后端再判一次）", () => {
+    expect(src).toContain("正在运行中，不能切换提供方，等停下来再切");
+    expect(src).toMatch(/if \(switchLocked\) return;/);
+  });
+});
+
+describe("提供方下拉灰掉时给原因（第二轮 review V5-04）", () => {
+  const picker = read("src/components/ui/provider-model-picker.tsx");
+  const chatPicker = read("src/components/tasks/chat-provider-model-picker.tsx");
+
+  it("ProviderModelPicker：disabled 且有原因时 Tooltip 说原因（优先于默认提示）", () => {
+    expect(picker).toContain("providerDisabledReason?: string;");
+    expect(picker).toMatch(/disabled && providerDisabledReason\s*\?\s*providerDisabledReason/);
+  });
+
+  it("对话 footer：运行中传「AI 运行中不能切换…」", () => {
+    expect(chatPicker).toMatch(/providerDisabledReason=\{/);
+    expect(chatPicker).toContain("AI 运行中不能切换提供方");
+  });
+});

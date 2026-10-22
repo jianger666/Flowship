@@ -148,6 +148,10 @@ describe("formatTokens", () => {
     [1_000_000, "1M"],
     [5_426_732, "5.4M"],
     [12_400_000, "12M"],
+    // 进位：四舍五入后 >= 1000k 要写成 M，不能是「1000k」
+    [999_499, "999k"],
+    [999_500, "1M"],
+    [999_999, "1M"],
   ])("%i → %s", (input, expected) => {
     expect(formatTokens(input)).toBe(expected);
   });

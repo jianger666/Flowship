@@ -3,10 +3,12 @@
 /**
  * 任务级 MCP 开关（V0.3.3 button + dialog 形态）
  *
- * - 按钮显示当前启用数：「MCP servers (3/4)」
+ * - 按钮是「MCP」+ 一个「已启用/总数」计数徽标（如 3/4）
  * - 点击弹 Dialog、内部列出所有 server、每条一个 Switch
  * - 切换 → 立即 PATCH 后端（McpToggleList 内部 handle）、不需要保存按钮
- * - 任务正在跑时 Dialog 底部提示「下次启动 / revise 时生效」
+ * - 列表下方常驻一句「何时生效」（mcpEffectNote，按 runStatus 区分）：开关只写 task.disabledMcpServers，
+ *   已启动的 agent 不会热更新，要等下次推进新起 agent 才按新开关加载（V11-02；
+ *   以前这里的注释声称有一句运行中的底部提示，实际从来没有渲染过）
  */
 
 import { useMemo, useState } from "react";
@@ -25,6 +27,7 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpHealth } from "@/hooks/use-mcp-health";
+import { mcpEffectNote } from "@/lib/mcp-effect-note";
 import { cn } from "@/lib/utils";
 import type { Task } from "@/lib/types";
 
@@ -126,6 +129,10 @@ export const TaskMcpPanel = ({ task, onTaskUpdate }: TaskMcpPanelProps) => {
                   onEnableProbe={probeOne}
                 />
               </div>
+              {/* 何时生效：开关即时落盘，但对已在跑的 agent 无效（见 mcp-effect-note 的事实依据） */}
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {mcpEffectNote(task.runStatus)}
+              </p>
             </div>
           )}
         </DialogContent>

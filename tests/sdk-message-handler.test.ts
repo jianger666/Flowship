@@ -3,7 +3,14 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { parseTaskToolArgs, parseTodoToolArgs } from "@/lib/tool-display";
+import {
+  mergeToolDisplayEvents,
+  parseTaskToolArgs,
+  parseTodoToolArgs,
+  toolBlockArgsTruncatedHint,
+  toolBlockSummary,
+  type ToolBlock,
+} from "@/lib/tool-display";
 
 type WrittenEvent = {
   kind: string;
@@ -576,16 +583,16 @@ describe("handleSdkMessage task 工具 args 短字段前置 + 截断", () => {
     expect(parsed?.effort).toBe("high");
   });
 
-  it("非 task 工具 args 截断仍是 500 上限", async () => {
+  it("其它工具（grep 等）args 截断仍是 500 上限", async () => {
     const longVal = "x".repeat(600);
     await handleSdkMessage(
       "task-1",
       {
         type: "tool_call",
-        name: "shell",
-        call_id: "call_shell_trunc",
+        name: "grep",
+        call_id: "call_grep_trunc",
         status: "running",
-        args: { command: longVal },
+        args: { pattern: longVal },
       } as never,
       assistantCtx,
       leaseOk,
@@ -598,6 +605,119 @@ describe("handleSdkMessage task 工具 args 短字段前置 + 截断", () => {
     // truncate 默认 max=500：正文前 500 字符 + 后缀
     const body = argsStr.replace(/…\(truncated \d+ chars\)$/, "");
     expect(body.length).toBe(500);
+  });
+
+  // V4-01：shell / write / edit 的 args 上限放宽到 4000（命令本体 / heredoc 脚本常超 500）
+  it("shell 命令 600 字符不再被截断（旧上限 500）：args 是完整可 parse 的 JSON", async () => {
+    const longVal = "x".repeat(600);
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "shell",
+        call_id: "call_shell_600",
+        status: "running",
+        args: { command: longVal, working_directory: "/repo" },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const argsStr = toolCallEvents()[0]?.meta?.args as string;
+    expect(argsStr).not.toMatch(/truncated/);
+    expect(JSON.parse(argsStr)).toEqual({
+      command: longVal,
+      working_directory: "/repo",
+    });
+  });
+
+  it("shell 命令超 4000 → 截到 4000 + 后缀；真实事件形状下摘要仍是 `$ 命令`", async () => {
+    const script = `cd /repo && python3 - <<'PY'\n${"print('x')\n".repeat(600)}PY`;
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "shell",
+        call_id: "call_shell_5000",
+        status: "running",
+        args: { command: script },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const ev = toolCallEvents()[0];
+    const argsStr = ev?.meta?.args as string;
+    expect(argsStr).toMatch(/…\(truncated \d+ chars\)$/);
+    expect(argsStr.replace(/…\(truncated \d+ chars\)$/, "").length).toBe(4000);
+    // 端到端：落盘事件（text 截 120 + meta.args 截 4000）→ 配对 → 摘要
+    const [item] = mergeToolDisplayEvents([
+      { id: "e1", ts: 1, kind: "tool_call", text: ev?.text ?? "", meta: ev?.meta } as never,
+    ]);
+    const summary = toolBlockSummary(item as ToolBlock);
+    expect(summary.startsWith("$ cd /repo && python3 - <<'PY'")).toBe(true);
+    expect(toolBlockArgsTruncatedHint(item as ToolBlock)).toBe("命令过长已截断");
+  });
+
+  it("shell：关键字段 command 前置（SDK 键序里它排在长字段后面也能留在截断窗口内）", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "shell",
+        call_id: "call_shell_order",
+        status: "running",
+        args: { description: "d".repeat(5000), command: "pnpm test" },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const argsStr = toolCallEvents()[0]?.meta?.args as string;
+    expect(argsStr.startsWith('{"command":"pnpm test"')).toBe(true);
+  });
+
+  it("write：path 前置到 content 之前（真实数据里 351 次 write 是 content 在前）→ 长 content 被截也能拿到路径", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "write",
+        call_id: "call_write_order",
+        status: "running",
+        // SDK 原始键序：content 在前、path 在后
+        args: { content: "c".repeat(6000), path: "/repo/src/big.ts" },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const ev = toolCallEvents()[0];
+    const argsStr = ev?.meta?.args as string;
+    expect(argsStr.startsWith('{"path":"/repo/src/big.ts"')).toBe(true);
+    expect(argsStr).toMatch(/…\(truncated \d+ chars\)$/);
+    expect(argsStr.replace(/…\(truncated \d+ chars\)$/, "").length).toBe(4000);
+    const [item] = mergeToolDisplayEvents([
+      { id: "e1", ts: 1, kind: "tool_call", text: ev?.text ?? "", meta: ev?.meta } as never,
+    ]);
+    expect(toolBlockSummary(item as ToolBlock)).toBe("/repo/src/big.ts");
+  });
+
+  it("edit：path 前置到 edits 数组之前；其余键相对顺序不变", async () => {
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "edit",
+        call_id: "call_edit_order",
+        status: "running",
+        args: {
+          edits: [{ oldText: "a", newText: "b" }],
+          path: "/repo/src/a.ts",
+          note: "n",
+        },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+    const argsStr = toolCallEvents()[0]?.meta?.args as string;
+    expect(Object.keys(JSON.parse(argsStr))).toEqual(["path", "edits", "note"]);
   });
 
   it("updateTodos 长 todos 数组 → 事件 args 能解析出全部条目", async () => {
@@ -709,6 +829,99 @@ describe("handleSdkMessage：Cursor 的 subagent 自定义工具（MCP 外壳）
     const parsed = parseTaskToolArgs(toolCallEvents()[0]?.meta?.args as string);
     expect(parsed?.model).toBe("inherit");
     expect(parsed?.effort ?? null).toBeNull();
+  });
+
+  it("running：显式指定了别的模型但没写 effort → 徽标补该模型的默认档（查表函数来自 ctx）", async () => {
+    const withLookup: AssistantBufferCtx = {
+      ...assistantCtx,
+      subagentParentModel: {
+        id: "gemini-4-argon",
+        params: [{ id: "reasoning_effort", value: "high" }],
+      },
+      subagentDisplayLookup: {
+        defaultEffortOf: (id) => (id === "claude-sonnet-5-5" ? "high" : undefined),
+      },
+    };
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_default_effort",
+        status: "running",
+        args: {
+          ...subagentArgs,
+          args: {
+            prompt: "p",
+            description: "查看素材",
+            model: "claude-sonnet-5-5",
+            subagentType: "explore",
+          },
+        },
+      } as never,
+      withLookup,
+      leaseOk,
+    );
+    const parsed = parseTaskToolArgs(toolCallEvents()[0]?.meta?.args as string);
+    expect(parsed?.model).toBe("claude-sonnet-5-5");
+    expect(parsed?.effort).toBe("high");
+  });
+
+  it("running：resume 接着之前的子代理 → 徽标显示它当初的模型 / effort（args 只在 running 落盘一次）", async () => {
+    const withLookup: AssistantBufferCtx = {
+      ...assistantCtx,
+      subagentParentModel: { id: "gemini-4-argon" },
+      subagentDisplayLookup: {
+        resumedChildOf: (id) =>
+          id === "agent-606696db" ? { model: "claude-sonnet-5-5", effort: "high" } : undefined,
+      },
+    };
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "mcp",
+        call_id: "call_sub_resume",
+        status: "running",
+        args: {
+          ...subagentArgs,
+          args: { prompt: "继续读剩下的", description: "查看其余素材", resume: "agent-606696db" },
+        },
+      } as never,
+      withLookup,
+      leaseOk,
+    );
+    const parsed = parseTaskToolArgs(toolCallEvents()[0]?.meta?.args as string);
+    expect(parsed?.model).toBe("claude-sonnet-5-5");
+    expect(parsed?.effort).toBe("high");
+    expect(parsed?.description).toBe("查看其余素材");
+  });
+
+  it("running：ctx 没有查表函数时，指定别的模型 / resume 的卡片保持原样，不乱补", async () => {
+    for (const [id, inner] of [
+      ["call_sub_nolookup_a", { prompt: "p", description: "d", model: "claude-sonnet-5-5" }],
+      ["call_sub_nolookup_b", { prompt: "p", description: "d", resume: "agent-x" }],
+    ] as const) {
+      await handleSdkMessage(
+        "task-1",
+        {
+          type: "tool_call",
+          name: "mcp",
+          call_id: id,
+          status: "running",
+          args: { ...subagentArgs, args: inner },
+        } as never,
+        { ...assistantCtx, subagentParentModel: { id: "gemini-4-argon" } },
+        leaseOk,
+      );
+    }
+    const evs = toolCallEvents();
+    const a = parseTaskToolArgs(evs[0]?.meta?.args as string);
+    const b = parseTaskToolArgs(evs[1]?.meta?.args as string);
+    expect(a?.model).toBe("claude-sonnet-5-5");
+    expect(a?.effort ?? null).toBeNull();
+    expect(b?.model ?? null).toBeNull();
+    expect(b?.effort ?? null).toBeNull();
   });
 
   it("running：prompt 很长也不会把尾部的 model / effort 截掉（走 task 的短字段前置）", async () => {

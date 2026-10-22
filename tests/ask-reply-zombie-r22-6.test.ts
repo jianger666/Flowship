@@ -62,7 +62,7 @@ vi.mock("@/lib/server/chat-runner", async (importOriginal) => {
 });
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
-const { readEvents, readMetaV06, taskDir, writeMeta } = taskFsCore;
+const { readEvents, readMetaV06, taskDir, withTaskLock, writeMeta } = taskFsCore;
 const { appendEvent } = await import("@/lib/server/task-fs");
 const { agentSessions, clearTaskStarting } = await import(
   "@/lib/server/task-stream"
@@ -125,6 +125,11 @@ const seedZombieAsk = async (id: string): Promise<void> => {
     },
   });
   if (!ev) throw new Error("seed ask_user_request 失败");
+  // appendEvent 首条事件后会在后台排一个「meta.updatedAt 触碰」（withTaskLock 内 读 meta → 写 meta，best-effort）。
+  // 它若在后面用例「存图窗口」里的 writeMeta(running) 之后才落盘，会把 awaiting_user 的陈旧快照写回去，
+  // 路由读到 awaiting_user → 410 而不是 409（负载高时约 9% 红，第五轮定位：是测试自己的竞态、不是路由问题）。
+  // per-task 锁是 FIFO：排在触碰之后拿一次空锁，就保证它已落盘，再往下走才有确定的初始态。
+  await withTaskLock(id, async () => undefined);
 };
 
 const callAskReply = async (

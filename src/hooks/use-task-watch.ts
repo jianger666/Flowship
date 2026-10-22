@@ -32,8 +32,8 @@
  *   光 setTask(latest) 不会触发 effect 重跑、客户端 SSE 已断 → 收不到新事件 → 必须刷页面、
  *   解法是调用方维护一个 epoch 计数、每次「让 agent 又活了」的成功路径 ++、effect dep 加它自然重连
  *
- * - **被动断开自动重连（V0.6.8）**：SSE 流可能被动断开（route 的 maxDuration=300s 到点、
- *   网络抖动、服务端重启），此时 watchTaskStream 正常返回 / 抛错、但 effect 不会自己重跑、
+ * - **被动断开自动重连（V0.6.8）**：SSE 流可能被动断开（网络抖动、服务端重启、代理 / 系统休眠掐连接；
+ *   注意不含 route 的 `maxDuration=300`——自托管运行时不执行它，不会每 300s 断一次），此时 watchTaskStream 正常返回 / 抛错、但 effect 不会自己重跑、
  *   客户端就**静默停在断连那一刻的状态**——典型表现：agent 产出了 artifact 但页面不刷新、
  *   必须手动刷新 / 切 action tab 才看到。解法是 hook 内部用 loop 自动重连。
  * - **done ≠ 停止订阅（V0.11.6 修）**：V0.11 起 run = 一个回合、agent 每说完一轮都 publish
@@ -103,7 +103,8 @@ export interface UseTaskWatchCallbacks {
    * 前端接着长、不从头吐）；null = 没在思考（清掉本地残留的实时态）
    */
   onThinkingSnapshot?: (snapshot: ThinkingSnapshot | null) => void;
-  onDone?: (task: Task, ok: boolean) => void;
+  /** origin 有值 = 旁路群答疑 run 的 done，不是属主主 run 的（见 owner-run-signal.planDoneFrame） */
+  onDone?: (task: Task, ok: boolean, origin?: string) => void;
   // SSE envelope 里的 error 帧（服务端主动发的协议错误）
   onErrorMessage?: (message: string) => void;
   // watchTaskStream 自己 throw 出来的异常（HTTP 4xx / 网络断 / 解析错）
@@ -268,12 +269,12 @@ export const useTaskWatch = (
             if (cancelled) return;
             callbacksRef.current.onThinkingSnapshot?.(snapshot);
           },
-          onDone: (t, ok) => {
+          onDone: (t, ok, origin) => {
             if (cancelled) return;
             if (t.repoStatus === "merged" || t.repoStatus === "abandoned") {
               gotTerminalDone = true;
             }
-            callbacksRef.current.onDone?.(t, ok);
+            callbacksRef.current.onDone?.(t, ok, origin);
           },
           onError: (msg) => {
             if (cancelled) return;
@@ -389,7 +390,7 @@ export const useTaskWatch = (
         // 终态 done / task_deleted / 410 / hydrated-404 → 停止订阅
         if (cancelled || gotTerminalDone || gotTaskDeleted) return;
 
-        // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 干净重连
+        // 被动断流（网络抖 / 服务端重启 / 休眠恢复；route 的 maxDuration 在自托管运行时不生效，不是断流原因）→ 干净重连
         await delay(WATCH_CLEAN_RECONNECT_DELAY_MS);
         if (cancelled) return;
       }

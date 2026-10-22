@@ -11,6 +11,7 @@
  */
 
 import { backgroundJobIdsInText } from "@/lib/background-subagents";
+import { LIVE_OUTPUT_MAX_LINES, trimLiveOutput } from "@/lib/live-output-cap";
 import { isMcpToolName } from "@/lib/mcp-tool-name";
 import { isAbsolutePathLike } from "@/lib/path-utils";
 import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
@@ -56,9 +57,23 @@ export const isTodoTool = (name: string): boolean => {
   );
 };
 
+/**
+ * 归一化后的 status 键（小写、去掉 `-` `_` 空白）→ 内部枚举。
+ * Cursor SDK 真实发的是驼峰 `inProgress`（pi / 其它来源可能是 `in_progress` / `in-progress`），
+ * 以前只认 snake_case，「进行中」条目永远掉成 pending（空心圈）。`canceled`（美式拼写）一并兜住。
+ */
+const TODO_STATUS_BY_KEY: Record<string, TodoItem["status"]> = {
+  pending: "pending",
+  inprogress: "in_progress",
+  completed: "completed",
+  cancelled: "cancelled",
+  canceled: "cancelled",
+};
+
 const normalizeTodoStatus = (v: unknown): TodoItem["status"] => {
-  if (typeof v === "string" && TODO_STATUS_SET.has(v as TodoItem["status"])) {
-    return v as TodoItem["status"];
+  if (typeof v === "string") {
+    const hit = TODO_STATUS_BY_KEY[v.toLowerCase().replace(/[-_\s]/g, "")];
+    if (hit && TODO_STATUS_SET.has(hit)) return hit;
   }
   // 非法 / 缺失 → pending（容错，别整条丢）
   return "pending";
@@ -296,26 +311,167 @@ export type TaskToolArgs = {
   effort: string | null;
 };
 
-/** 从残缺 JSON 流式前缀里抠 string 字段（键完整、值可能未闭合） */
-const extractPartialJsonStringField = (
+/**
+ * 单遍还原 JSON 字符串转义。必须单遍：逐个 replace 会把 `C:\\new`（原文 `\\` + `n`）
+ * 里的 `\n` 先还原成换行，Windows 路径 / 命令就坏了。
+ */
+const unescapeJsonStringBody = (s: string): string =>
+  s.replace(/\\(u[0-9a-fA-F]{4}|[\s\S])/g, (_m, esc: string) => {
+    if (esc.length === 5) return String.fromCharCode(parseInt(esc.slice(1), 16));
+    switch (esc) {
+      case "n":
+        return "\n";
+      case "t":
+        return "\t";
+      case "r":
+        return "\r";
+      case "b":
+        return "\b";
+      case "f":
+        return "\f";
+      default:
+        return esc; // `\"` `\\` `\/` → 后面那个字符本身
+    }
+  });
+
+/**
+ * 从残缺 JSON 流式前缀里抠 string 字段（键完整、值可能未闭合）。
+ * `complete` = 值的结束引号也在前缀里（false = 值本身被截断了）。
+ */
+const extractPartialJsonStringFieldInfo = (
   raw: string,
   key: string,
-): string | null => {
+): { value: string; complete: boolean } | null => {
   // "key": "value… 或 "key":"value…
   const re = new RegExp(
-    `"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"?`,
+    `"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)("?)`,
     "s",
   );
   const m = raw.match(re);
   if (!m?.[1]) return null;
-  // 反解常见转义，残缺前缀不追求完备
-  const unescaped = m[1]
-    .replace(/\\n/g, "\n")
-    .replace(/\\t/g, "\t")
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, "\\");
-  const trimmed = unescaped.trim();
-  return trimmed || null;
+  const complete = m[2] === '"';
+  // 残缺前缀不追求完备
+  let value = unescapeJsonStringBody(m[1]);
+  // 值被截断时，服务端 `truncate`（按 UTF-16 码元切）可能正好切开一个代理对（emoji）→ 尾部留一个孤立高位代理，
+  // 渲染成「�」。丢掉那半个字符（R7-04）；值完整时不动（完整值里的孤立代理是原文就有的）
+  if (!complete) value = value.replace(/[\uD800-\uDBFF]$/, "");
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return { value: trimmed, complete };
+};
+
+const extractPartialJsonStringField = (
+  raw: string,
+  key: string,
+): string | null => extractPartialJsonStringFieldInfo(raw, key)?.value ?? null;
+
+/** 落盘截断后缀：`…(truncated 123 chars)`（task-stream `truncate` 追加） */
+const ARGS_TRUNCATED_SUFFIX_RE = /…\(truncated \d+ chars\)$/;
+
+/**
+ * 摘要行会读的 string 字段。args 被服务端截断后整段 JSON 必然 parse 不了，
+ * 但 command / path 这类关键字段在前缀里——逐个抠出来，摘要照样可读（V4-01）。
+ */
+const LOOSE_ARG_KEYS = [
+  "command",
+  "cmd",
+  "path",
+  "target_file",
+  "file_path",
+  "filePath",
+  "pattern",
+  "regex",
+  "query",
+  "glob",
+  "glob_pattern",
+  // Cursor SDK / pi 桥实际发的是 camelCase（tool-call-types.d.ts），snake_case 只是历史写法，两种都认（V4-05）
+  "globPattern",
+  "target_directory",
+  "targetDirectory",
+  "file",
+  "url",
+] as const;
+
+/**
+ * 宽松解析工具 args：整段 JSON 能 parse 就用；被截断（或流式残缺）时退到从前缀抠
+ * {@link LOOSE_ARG_KEYS} 里的 string 字段。抠不出任何字段 → parsed=null（调用方走旧兜底）。
+ *
+ * `fieldCut`：args 确实带截断后缀、且抠出来的某个字段值本身没收尾（= 用户看到的是半截命令 / 路径）。
+ * 命令完整、只是后面的长字段被截掉时为 false，不误报。
+ */
+type LooseArgs = { parsed: Record<string, unknown> | null; fieldCut: boolean };
+
+/**
+ * 解析缓存（D5-03）：`toolBlockSummary` / `toolBlockDetailLine` / `toolBlockExpandedArgsPreview` /
+ * `toolBlockArgsTruncatedHint` 渲染一行时各调一遍，args 被截断（edit / write / 长 shell 几乎必然）时每遍都要
+ * 跑 18 个正则（一行 20µs → 57µs）。按「同一个 args 字符串」缓存：四个函数共用一次解析，
+ * 同一行以后每次重渲染（滚动 / 展开 / 状态变）也不再重算。
+ * 有界：条目数上限（LRU，Map 迭代序 = 插入序）+ 超长 args 不入缓存（病态输入照旧每次算、不占内存）。
+ * 返回的对象是共享的——调用方只读（现有三处调用点都只取字段）。
+ */
+const LOOSE_ARGS_CACHE_LIMIT = 512;
+const LOOSE_ARGS_CACHE_MAX_LEN = 8192;
+const looseArgsCache = new Map<string, LooseArgs>();
+let looseArgsHits = 0;
+let looseArgsMisses = 0;
+
+/** 诊断 / 测试用：解析缓存的命中统计与当前规模 */
+export const toolArgsParseCacheStats = (): {
+  hits: number;
+  misses: number;
+  size: number;
+  limit: number;
+} => ({
+  hits: looseArgsHits,
+  misses: looseArgsMisses,
+  size: looseArgsCache.size,
+  limit: LOOSE_ARGS_CACHE_LIMIT,
+});
+
+const parseToolArgsLoose = (args?: string): LooseArgs => {
+  if (typeof args !== "string" || args.length > LOOSE_ARGS_CACHE_MAX_LEN) {
+    return parseToolArgsLooseUncached(args);
+  }
+  const hit = looseArgsCache.get(args);
+  if (hit) {
+    looseArgsHits++;
+    // 续命：挪到插入序末尾
+    looseArgsCache.delete(args);
+    looseArgsCache.set(args, hit);
+    return hit;
+  }
+  looseArgsMisses++;
+  const value = parseToolArgsLooseUncached(args);
+  looseArgsCache.set(args, value);
+  if (looseArgsCache.size > LOOSE_ARGS_CACHE_LIMIT) {
+    const oldest = looseArgsCache.keys().next().value as string;
+    looseArgsCache.delete(oldest);
+  }
+  return value;
+};
+
+const parseToolArgsLooseUncached = (
+  args?: string,
+): LooseArgs => {
+  const full = parseToolArgsJson(args);
+  if (full) return { parsed: full, fieldCut: false };
+  if (!args?.trim()) return { parsed: null, fieldCut: false };
+  const cleaned = args.replace(ARGS_TRUNCATED_SUFFIX_RE, "").trim();
+  // 只处理「JSON 对象的残缺前缀」；其它脏数据保持旧兜底
+  if (!cleaned.startsWith("{")) return { parsed: null, fieldCut: false };
+  const out: Record<string, unknown> = {};
+  let incomplete = false;
+  for (const key of LOOSE_ARG_KEYS) {
+    const hit = extractPartialJsonStringFieldInfo(cleaned, key);
+    if (!hit) continue;
+    out[key] = hit.value;
+    if (!hit.complete) incomplete = true;
+  }
+  if (Object.keys(out).length === 0) return { parsed: null, fieldCut: false };
+  return {
+    parsed: out,
+    fieldCut: incomplete && ARGS_TRUNCATED_SUFFIX_RE.test(args),
+  };
 };
 
 /**
@@ -388,6 +544,12 @@ const clipOneLine = (s: string, max = 500): string => {
   return `${flat.slice(0, max)}…`;
 };
 
+/**
+ * 展开区 shell 命令的显示上限。与服务端 shell args 的 truncate 上限同值
+ * （sdk-message-handler `BIG_ARGS_TOOL_TRUNCATE_MAX`）——落盘里有多少就给用户看多少。
+ */
+const SHELL_DETAIL_CLIP_MAX = 4000;
+
 export type ToolBlockStatus = "running" | "success" | "error" | "interrupted";
 
 /** 配对后的单工具块（渲染层用） */
@@ -410,6 +572,12 @@ export type ToolBlock = {
    *  - 子代理（task 卡）：{@link markBackgroundSubagentTools} 按服务端下发的「后台在跑清单」打上。
    */
   backgroundRunning?: boolean;
+  /**
+   * 行状态身份的覆盖值：只有「连续待办合并块」会带（= 首条待办的稳定身份）。
+   * 合并块的 id / callId 跟随最新一条 call（key 与 loadFullOutput 都要最新的），但待办卡的折叠态、
+   * React key 不能跟着每次 `todo_write` 换——见 {@link streamItemStableId}。
+   */
+  stableId?: string;
 };
 
 /** 连续非破坏性工具收成一行 */
@@ -419,6 +587,11 @@ export type ToolVerbGroup = {
   members: ToolBlock[];
   ts: number;
   actionId?: string;
+  /**
+   * 首个成员的稳定身份（{@link streamItemStableId}）。`id`（`verb_…`）对外不变，
+   * 但工作过程组的 id / 存档 key 取它：单块 → 并成 verb 组时，组首成员的身份不能翻。
+   */
+  firstEventId?: string;
 };
 
 export type ToolDisplayItem = ToolBlock | ToolVerbGroup;
@@ -433,6 +606,30 @@ export const isToolBlock = (it: StreamRenderItem): it is ToolBlock =>
 
 export const isToolVerbGroup = (it: StreamRenderItem): it is ToolVerbGroup =>
   it.kind === "__tool_verb_group__";
+
+/**
+ * 一行在整个流式 / 分页过程中不变的身份——React key、行视图状态存档 key、工作过程组 id 都用它
+ * （R4-01 / R4-02 / V8-04，第三轮 review）。
+ *
+ *  - 工具块：`tool:${callId}`。call 事件自己的 id 与孤儿 `tool_result`（call 在上一页）的 id 是两个不同的值，
+ *    但 callId 相同——分页补上上一页前后，同一个块的身份不变；
+ *  - 连续待办合并块：取首条待办的身份（`stableId`），agent 每更新一次待办 id 都跟着最新 call，身份不动；
+ *  - verb 组：首成员的身份（`firstEventId`）——读类工具连续完成时，单块并成 verb 组，组首的身份不翻；
+ *  - 其余事件（思考 / info / 用户消息…）：事件 id。
+ *
+ * 注意不是「事件 id」：块 `id` 字段保持原义（call 事件 id，合并待办块取最新），别处按它找事件的逻辑不受影响。
+ */
+export const streamItemStableId = (it: StreamRenderItem): string => {
+  if (it.kind === "__tool_verb_group__") {
+    const g = it as ToolVerbGroup;
+    return g.firstEventId ?? (g.members[0] ? streamItemStableId(g.members[0]) : g.id);
+  }
+  if (it.kind === "__tool_block__") {
+    const b = it as ToolBlock;
+    return b.stableId ?? `tool:${b.callId}`;
+  }
+  return it.id;
+};
 
 const getCallId = (ev: TaskEvent): string =>
   typeof ev.meta?.callId === "string" ? ev.meta.callId : "";
@@ -493,16 +690,138 @@ const toolCallToBlock = (
 };
 
 /**
+ * 块缓存（D5-01，第三轮 review）：同一条 tool_call 事件、同一个配对 result 事件 → 复用上一次产出的块对象。
+ *
+ * 为什么：这个函数每个新事件都重跑一遍全量事件，原先每次重建所有块对象，`memo(ToolBlockRow)` /
+ * `memo(WorkGroupRow)` 在「事件追加」路径上一次都命不中（5000 事件追加 1 条，成员引用不变率 3.7%），
+ * 展开的运行中尾组每个事件整组重渲（854 成员约 60ms render）。
+ *
+ * 安全性：键是事件对象（WeakMap，事件被回收缓存跟着走）；条目里存构造输入的快照（result 事件 / meta 引用、
+ * text / ts / actionId / args / name / callId），任何一项变了（result 到场、事件被就地改）都重建，
+ * 不会返回陈旧块。缓存里的块永远不被原地修改——下游（待办合并 / 后台标记 / 过期 running 兜底 / 重复 call 升级 args）
+ * 一律克隆后再改。
+ */
+type CallBlockCacheEntry = {
+  result: TaskEvent | undefined;
+  resultMeta: ToolResultEventMeta | undefined;
+  resultTs: number | undefined;
+  text: string;
+  ts: number;
+  actionId: string | undefined;
+  args: string | undefined;
+  name: string;
+  callId: string;
+  block: ToolBlock;
+};
+const CALL_BLOCK_CACHE = new WeakMap<TaskEvent, CallBlockCacheEntry>();
+
+const cachedCallBlock = (
+  ev: TaskEvent,
+  resultEv: TaskEvent | undefined,
+  resultMeta: ToolResultEventMeta | undefined,
+  useCache: boolean,
+): ToolBlock => {
+  const resultTs = resultEv?.ts;
+  if (useCache) {
+    const hit = CALL_BLOCK_CACHE.get(ev);
+    if (
+      hit &&
+      hit.result === resultEv &&
+      hit.resultMeta === resultMeta &&
+      hit.resultTs === resultTs &&
+      hit.text === ev.text &&
+      hit.ts === ev.ts &&
+      hit.actionId === ev.actionId &&
+      hit.args === getArgs(ev) &&
+      hit.name === getToolName(ev) &&
+      hit.callId === getCallId(ev)
+    ) {
+      return hit.block;
+    }
+  }
+  const block = toolCallToBlock(ev, resultMeta, resultTs);
+  if (useCache) {
+    CALL_BLOCK_CACHE.set(ev, {
+      result: resultEv,
+      resultMeta,
+      resultTs,
+      text: ev.text,
+      ts: ev.ts,
+      actionId: ev.actionId,
+      args: getArgs(ev),
+      name: getToolName(ev),
+      callId: getCallId(ev),
+      block,
+    });
+  }
+  return block;
+};
+
+/** 孤儿 tool_result（call 在上一页）合成的块的缓存，规则同 {@link CALL_BLOCK_CACHE} */
+type OrphanBlockCacheEntry = {
+  meta: ToolResultEventMeta;
+  text: string;
+  ts: number;
+  actionId: string | undefined;
+  block: ToolBlock;
+};
+const ORPHAN_BLOCK_CACHE = new WeakMap<TaskEvent, OrphanBlockCacheEntry>();
+
+const cachedOrphanResultBlock = (
+  ev: TaskEvent,
+  meta: ToolResultEventMeta,
+  useCache: boolean,
+): ToolBlock => {
+  if (useCache) {
+    const hit = ORPHAN_BLOCK_CACHE.get(ev);
+    if (
+      hit &&
+      hit.meta === meta &&
+      hit.text === ev.text &&
+      hit.ts === ev.ts &&
+      hit.actionId === ev.actionId
+    ) {
+      return hit.block;
+    }
+  }
+  const block: ToolBlock = {
+    kind: "__tool_block__",
+    id: ev.id,
+    callId: meta.callId,
+    name: meta.name,
+    status: toolResultStatusToBlock(meta.status),
+    text: ev.text,
+    result: meta,
+    ts: ev.ts,
+    actionId: ev.actionId,
+  };
+  if (useCache) {
+    ORPHAN_BLOCK_CACHE.set(ev, {
+      meta,
+      text: ev.text,
+      ts: ev.ts,
+      actionId: ev.actionId,
+      block,
+    });
+  }
+  return block;
+};
+
+/**
  * 把 tool_call + tool_result 按 callId 配对，再对连续 verb-group 成员收组。
  * tool_result 单独出现（历史缺 running）→ 合成 completed 块。
  * tool_output_delta 应在进本函数前已滤掉。
  *
  * 历史双写兜底：同 callId 多条 tool_call 只出一块——args 取更长、id/ts 留第一条
  * （服务端新数据已修、已落盘历史仍可能双条，渲染层必须去重）。
+ *
+ * 块 / verb 组对象按输入缓存复用（见 {@link CALL_BLOCK_CACHE}）；`noCache` 仅给等价性测试对拍用。
  */
 export const mergeToolDisplayEvents = (
   events: TaskEvent[],
+  opts: { noCache?: boolean } = {},
 ): StreamRenderItem[] => {
+  const useCache = !opts.noCache;
   const resultsByCallId = new Map<string, TaskEvent>();
   for (const ev of events) {
     if (ev.kind !== "tool_result") continue;
@@ -530,7 +849,8 @@ export const mergeToolDisplayEvents = (
         if (isToolBlock(existing)) {
           const nextArgs = getArgs(ev);
           if ((nextArgs?.length ?? 0) > (existing.args?.length ?? 0)) {
-            existing.args = nextArgs;
+            // 克隆再改：existing 可能是缓存里的块，原地改会污染下一次（只有第一条事件的）输入
+            raw[idx] = { ...existing, args: nextArgs };
           }
         }
         const resultEv = resultsByCallId.get(cid);
@@ -544,7 +864,7 @@ export const mergeToolDisplayEvents = (
         : undefined;
       if (resultEv) consumedResults.add(resultEv.id);
       if (cid) firstBlockIndexByCallId.set(cid, raw.length);
-      raw.push(toolCallToBlock(ev, resultMeta, resultEv?.ts));
+      raw.push(cachedCallBlock(ev, resultEv, resultMeta, useCache));
       continue;
     }
 
@@ -555,17 +875,7 @@ export const mergeToolDisplayEvents = (
         raw.push(ev);
         continue;
       }
-      raw.push({
-        kind: "__tool_block__",
-        id: ev.id,
-        callId: meta.callId,
-        name: meta.name,
-        status: toolResultStatusToBlock(meta.status),
-        text: ev.text,
-        result: meta,
-        ts: ev.ts,
-        actionId: ev.actionId,
-      });
+      raw.push(cachedOrphanResultBlock(ev, meta, useCache));
       continue;
     }
 
@@ -573,7 +883,26 @@ export const mergeToolDisplayEvents = (
   }
 
   // 连续 updateTodos 只留最新（中间状态无回看价值）；再进 verb-group
-  return groupVerbRuns(collapseConsecutiveTodoBlocks(raw));
+  return groupVerbRuns(collapseConsecutiveTodoBlocks(raw, useCache), useCache);
+};
+
+/**
+ * 后处理克隆缓存（D5-01）：下面几个「给块打标 / 改状态」的后处理每次都 `{ ...block, x }` 克隆，
+ * 长期转圈的后台 shell / 子代理会让所在工作组每个事件都换引用。块对象本身是不可变的（见 CALL_BLOCK_CACHE），
+ * 所以「同一个原块 → 同一个克隆」是安全的；原块被换掉（result 到场等）缓存自然落空。
+ */
+const INTERRUPTED_CLONES = new WeakMap<ToolBlock, ToolBlock>();
+const BACKGROUND_CLONES = new WeakMap<ToolBlock, ToolBlock>();
+const cloneOnce = (
+  cache: WeakMap<ToolBlock, ToolBlock>,
+  block: ToolBlock,
+  patch: Partial<ToolBlock>,
+): ToolBlock => {
+  const hit = cache.get(block);
+  if (hit) return hit;
+  const next: ToolBlock = { ...block, ...patch };
+  cache.set(block, next);
+  return next;
 };
 
 /**
@@ -587,7 +916,7 @@ export const coerceStaleRunningTools = (
   const mapBlock = (block: ToolBlock): ToolBlock => {
     if (block.status !== "running") return block;
     changed = true;
-    return { ...block, status: "interrupted" };
+    return cloneOnce(INTERRUPTED_CLONES, block, { status: "interrupted" });
   };
   const out = items.map((it) => {
     if (isToolBlock(it)) return mapBlock(it);
@@ -630,7 +959,7 @@ export const markBackgroundRunningTools = (
     if (!runningCallIds.has(block.callId)) return block;
     if (block.backgroundRunning) return block;
     changed = true;
-    return { ...block, backgroundRunning: true };
+    return cloneOnce(BACKGROUND_CLONES, block, { backgroundRunning: true });
   };
   const out = items.map((it) => {
     if (isToolBlock(it)) return mapBlock(it);
@@ -677,24 +1006,27 @@ export const markBackgroundSubagentTools = (
     const ids = backgroundJobIdsInText(it.result?.output);
     if (!ids.some((id) => runningJobIds.has(id))) return it;
     changed = true;
-    return { ...it, backgroundRunning: true };
+    return cloneOnce(BACKGROUND_CLONES, it, { backgroundRunning: true });
   });
   return changed ? out : items;
 };
 
 /**
  * 连续多条待办工具块（中间无其它非 ephemeral 项）→ 只保留最新一条。
- * id/ts 用最新，虚拟列表 key 跟随最新 call。
+ * id / callId / ts 用最新（正文、直播输出、完整输出都要最新一条 call 的），
+ * 但行**身份**用首条待办的（`stableId`）：agent 几乎每一步都更新待办，身份跟着最新 call 走的话，
+ * 用户折叠过的待办卡每更新一次就自己弹开（R4-02），整行也跟着 remount。
  */
 const collapseConsecutiveTodoBlocks = (
   items: StreamRenderItem[],
+  useCache = true,
 ): StreamRenderItem[] => {
   const out: StreamRenderItem[] = [];
   for (const it of items) {
     if (isToolBlock(it) && isTodoTool(it.name)) {
       const prev = out[out.length - 1];
       if (prev && isToolBlock(prev) && isTodoTool(prev.name)) {
-        out[out.length - 1] = it;
+        out[out.length - 1] = withStableId(it, streamItemStableId(prev), useCache);
         continue;
       }
     }
@@ -703,7 +1035,37 @@ const collapseConsecutiveTodoBlocks = (
   return out;
 };
 
-const groupVerbRuns = (items: StreamRenderItem[]): StreamRenderItem[] => {
+/** 合并待办块 = 最新那块的克隆 + stableId；同一个最新块、同一个 stableId → 复用克隆（引用稳定，见 D5-01） */
+const MERGED_TODO_CACHE = new WeakMap<
+  ToolBlock,
+  { stableId: string; block: ToolBlock }
+>();
+const withStableId = (
+  latest: ToolBlock,
+  stableId: string,
+  useCache: boolean,
+): ToolBlock => {
+  if (useCache) {
+    const hit = MERGED_TODO_CACHE.get(latest);
+    if (hit && hit.stableId === stableId) return hit.block;
+  }
+  const block: ToolBlock = { ...latest, stableId };
+  if (useCache) MERGED_TODO_CACHE.set(latest, { stableId, block });
+  return block;
+};
+
+/** verb 组缓存：成员（按引用）逐个相同 → 复用上一次的组对象；键是组首块（D5-01） */
+const VERB_GROUP_CACHE = new WeakMap<ToolBlock, ToolVerbGroup>();
+const sameBlocks = (a: readonly ToolBlock[], b: readonly ToolBlock[]): boolean => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+const groupVerbRuns = (
+  items: StreamRenderItem[],
+  useCache = true,
+): StreamRenderItem[] => {
   const out: StreamRenderItem[] = [];
   let buf: ToolBlock[] = [];
 
@@ -712,13 +1074,22 @@ const groupVerbRuns = (items: StreamRenderItem[]): StreamRenderItem[] => {
     if (buf.length === 1) {
       out.push(buf[0]);
     } else {
-      out.push({
-        kind: "__tool_verb_group__",
-        id: `verb_${buf[0].id}`,
-        members: buf,
-        ts: buf[buf.length - 1].ts,
-        actionId: buf[0].actionId,
-      });
+      const hit = useCache ? VERB_GROUP_CACHE.get(buf[0]) : undefined;
+      if (hit && sameBlocks(hit.members, buf)) {
+        out.push(hit);
+      } else {
+        const group: ToolVerbGroup = {
+          kind: "__tool_verb_group__",
+          id: `verb_${buf[0].id}`,
+          members: buf,
+          ts: buf[buf.length - 1].ts,
+          actionId: buf[0].actionId,
+          // 首成员的稳定身份：工作过程组 id / verb 组存档 key 都取它（R4-01）
+          firstEventId: streamItemStableId(buf[0]),
+        };
+        if (useCache) VERB_GROUP_CACHE.set(buf[0], group);
+        out.push(group);
+      }
     }
     buf = [];
   };
@@ -937,7 +1308,8 @@ export const parseUnifiedDiff = (diff: string): DiffViewLine[] => {
  */
 export const toolBlockSummary = (block: ToolBlock): string => {
   const n = block.name.toLowerCase();
-  const parsed = parseToolArgsJson(block.args);
+  // 宽松解析：args 被服务端截断（>500 字符）后整段 JSON parse 不了，退到抠前缀字段（V4-01）
+  const { parsed, fieldCut } = parseToolArgsLoose(block.args);
   const diff = block.result?.diff;
   const diffStats = diff ? countDiffStats(diff) : null;
 
@@ -975,7 +1347,8 @@ export const toolBlockSummary = (block: ToolBlock): string => {
   // shell：可读命令
   if (n === "shell" && parsed) {
     const cmd = pickStr(parsed, ["command", "cmd"]);
-    if (cmd) return clipOneLine(`$ ${cmd}`);
+    // 命令本体被截断：尾部补 …，别让半截命令读成完整命令
+    if (cmd) return clipOneLine(`$ ${cmd}${fieldCut ? "…" : ""}`);
   }
 
   // read
@@ -996,7 +1369,13 @@ export const toolBlockSummary = (block: ToolBlock): string => {
   if (n === "grep" || n === "greptool" || n.includes("grep")) {
     if (parsed) {
       const pattern = pickStr(parsed, ["pattern", "regex", "query"]);
-      const path = pickStr(parsed, ["path", "glob", "file", "target_directory"]);
+      const path = pickStr(parsed, [
+        "path",
+        "glob",
+        "file",
+        "target_directory",
+        "targetDirectory",
+      ]);
       if (pattern && path) return clipOneLine(`/${pattern}/ ${path}`);
       if (pattern) return clipOneLine(`/${pattern}/`);
       if (path) return clipOneLine(path);
@@ -1014,11 +1393,14 @@ export const toolBlockSummary = (block: ToolBlock): string => {
     n.includes("listdir")
   ) {
     if (parsed) {
+      // globPattern / targetDirectory 是 SDK 与 pi 的真实形状（V4-05），snake_case 兼容老数据
       const pat = pickStr(parsed, [
+        "globPattern",
         "glob_pattern",
         "glob",
         "pattern",
         "path",
+        "targetDirectory",
         "target_directory",
       ]);
       if (pat) return clipOneLine(pat);
@@ -1038,6 +1420,7 @@ export const toolBlockSummary = (block: ToolBlock): string => {
       "file_path",
       "filePath",
       "pattern",
+      "globPattern",
       "glob_pattern",
       "glob",
       "query",
@@ -1045,7 +1428,7 @@ export const toolBlockSummary = (block: ToolBlock): string => {
     ]);
     if (hint) {
       const prefix = pickStr(parsed, ["command", "cmd"]) ? "$ " : "";
-      return clipOneLine(`${prefix}${hint}`);
+      return clipOneLine(`${prefix}${hint}${fieldCut ? "…" : ""}`);
     }
   }
 
@@ -1070,11 +1453,34 @@ export const toolBlockSummary = (block: ToolBlock): string => {
  * 无可用字段时返 null（调用方不渲染该行）。
  */
 export const toolBlockDetailLine = (block: ToolBlock): string | null => {
+  // shell：展开就是为了看全命令，不套摘要行 500 字符的上限（服务端已放宽到 4000，能看到的就给全）
+  if (block.name.toLowerCase() === "shell") {
+    const { parsed, fieldCut } = parseToolArgsLoose(block.args);
+    const cmd = parsed ? pickStr(parsed, ["command", "cmd"]) : undefined;
+    if (cmd) {
+      return clipOneLine(
+        `$ ${cmd}${fieldCut ? "…" : ""}`,
+        SHELL_DETAIL_CLIP_MAX,
+      );
+    }
+  }
   const summary = toolBlockSummary(block);
   // text 若只是「调用 shell:{...}」这类带 JSON 的，不当作 detail
   if (!summary) return null;
   if (summary === block.text && /\{/.test(block.text)) return null;
   return summary;
+};
+
+/**
+ * 展开区「参数被截断」提示：摘要读的那个字段（shell 的命令 / 路径等）本身只剩半截时返回文案，
+ * 否则 null。命令完整、只是后面的长字段（write 的 content 等）被截掉不提示——那不影响用户看到的内容。
+ */
+export const toolBlockArgsTruncatedHint = (block: ToolBlock): string | null => {
+  const { parsed, fieldCut } = parseToolArgsLoose(block.args);
+  if (!parsed || !fieldCut) return null;
+  return block.name.toLowerCase() === "shell"
+    ? "命令过长已截断"
+    : "参数过长已截断";
 };
 
 /**
@@ -1247,6 +1653,29 @@ export const toolPathNeedsBaseDir = (pathLike: string): boolean => {
   return !isAbsolutePathLike(pathLike);
 };
 
+/**
+ * 「加载完整输出」后，输出框要不要滚到底（U3a-06 尾巴）。
+ *
+ * 只有 shell：服务端对它存的预览是「头 + 尾」（命令的报错 / 汇总都在末尾，见 tool-result-persist 的
+ * `previewModeFor`），用户点「加载完整输出」想看的正是尾巴——不滚的话 `<pre>` 停在最顶、
+ * 得自己手动拖到底。read / grep 等是「头部」预览，要看的是文件 / 结果的开头，滚到底反而丢上下文。
+ * 口径与服务端一致：按工具名 shell 判。
+ */
+export const shouldScrollFullOutputToEnd = (block: Pick<ToolBlock, "name">): boolean =>
+  block.name.toLowerCase() === "shell";
+
+/**
+ * 输出框要不要滚到底：shell（见上）且「内容是头 + 尾的截断预览」或「已加载完整输出」（R7-05）。
+ * 预览被截断（`result.truncated`）时报错 / 汇总在尾部，用户展开就是为了看它，不该先滚过 2KB 噪声头；
+ * 没截断的短输出没有滚动条、写 scrollTop 也无害，但不必白写。运行中（没有 result，直播框）不滚。
+ */
+export const shouldScrollOutputToEnd = (
+  block: Pick<ToolBlock, "name" | "result">,
+  hasFullText: boolean,
+): boolean =>
+  shouldScrollFullOutputToEnd(block) &&
+  (hasFullText || block.result?.truncated === true);
+
 /** 从 tool_output_delta 抽 callId + chunk */
 export const parseToolOutputDelta = (
   ev: TaskEvent,
@@ -1259,9 +1688,11 @@ export const parseToolOutputDelta = (
   return { callId, chunk };
 };
 
-/** 实时输出保留尾部 N 行 */
-export const trimLiveOutputLines = (text: string, maxLines = 20): string => {
-  const lines = text.split("\n");
-  if (lines.length <= maxLines) return text;
-  return lines.slice(-maxLines).join("\n");
-};
+/**
+ * 实时输出保留尾部 N 行（默认 20）**且不超过 8192 字符**，`\r` 也算换行（R7-02，实现见 lib/live-output-cap）。
+ * 名字沿用旧的（调用方不改），语义是「行数 + 字符数」双封顶。
+ */
+export const trimLiveOutputLines = (
+  text: string,
+  maxLines = LIVE_OUTPUT_MAX_LINES,
+): string => trimLiveOutput(text, maxLines);

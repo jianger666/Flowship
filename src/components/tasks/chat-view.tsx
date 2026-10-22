@@ -56,10 +56,11 @@ import {
 } from "@/lib/chat-op-ledger";
 import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
 import {
-  classifyPendingBubble,
   decideChatStop,
+  hasPendingBubbleContent,
   settleStopIntent,
 } from "@/lib/chat-pending-display";
+import { projectPendingForStream } from "@/lib/stream-pending";
 import {
   advanceLiveThinking,
   applyThinkingSnapshot,
@@ -68,6 +69,11 @@ import {
 } from "@/lib/thinking-live";
 import { buildInputHistory } from "@/lib/composer-history";
 import { editRewindConfirmCopy, planEditRewind } from "@/lib/edit-rewind";
+import {
+  REWIND_BUSY_NOTICE,
+  rewindFailureToast,
+  runExclusiveRewind,
+} from "@/lib/rewind-failure";
 import {
   allocClientChatQueueItemId,
   findReusableUncertainOperation,
@@ -83,11 +89,11 @@ import {
   shouldApplyTaskUpdateForOperation,
   shouldReleaseSubmitLock,
 } from "@/lib/chat-submit-controller";
+import { effectiveQueueCount, nextQueueAutoOpenTickForPending } from "@/lib/queue-banner";
 import { prepareRunArgs } from "@/lib/run-args";
-import {
-  RUN_STATUS_LABEL,
-  RUN_STATUS_VARIANT,
-} from "@/lib/task-display";
+import { findPendingAskEvent } from "@/lib/ask-pending";
+import { effectiveRunActive } from "@/lib/owner-run-signal";
+import { deriveChatHeaderRunBadge } from "@/lib/task-header-status";
 import {
   ApiRequestError,
   rewindChatToEvent,
@@ -100,11 +106,7 @@ import {
 import { canCommitTaskSnapshot, commitTaskDeleted } from "@/lib/task-terminal";
 import { reconcileRunActive, watchDormantToastId } from "@/lib/watch-reconnect";
 import { promoteSidebarChat } from "@/lib/view-memory";
-import {
-  isEphemeralToolOutputDelta,
-  parseToolOutputDelta,
-  trimLiveOutputLines,
-} from "@/lib/tool-display";
+import { useLiveToolOutputs } from "@/hooks/use-live-tool-outputs";
 import type { Task, TaskEvent } from "@/lib/types";
 
 interface Props {
@@ -203,13 +205,15 @@ export const ChatView = ({
   const stopAfterSubmitRef = useRef(false);
   // run 进行中锁：runStatus 交卷后会从 running → awaiting_ack、但 run 还在流式吐消息；
   // 用 latch 把「输入框 loading」保持到 run 真正结束（done 事件）再放开。
-  const [runActive, setRunActive] = useState(false);
-  // shell 流式输出：callId → 尾部窗口文本（ephemeral，不进 task.events）
-  const [liveToolOutputs, setLiveToolOutputs] = useState<
-    Record<string, string>
-  >({});
+  // 初值吃 task 当前态：打开 / 切回一个正在运行的会话，首个 commit 就是「在跑」（D9-03）
+  const [runActive, setRunActive] = useState(() => task.runStatus === "running");
+  // shell 流式输出：callId → 尾部窗口文本（ephemeral，不进 task.events）；与 task 页共用同一个 hook
+  const { liveToolOutputs, absorbLiveToolOutputEvent, clearLiveToolOutputs } =
+    useLiveToolOutputs();
   // P5：排队条（第 N 条）；null = 无排队
   const [queuedCount, setQueuedCount] = useState<number | null>(null);
+  // 排队条「自动弹开」信号：订阅到的实时 dispatch 里发现「从无到有」时递增（恢复路径不递增，见 onLedgerLive）
+  const [queueAutoOpenTick, setQueueAutoOpenTick] = useState(0);
   // 此刻还在后台跑的子代理（SSE background_subagents 帧维护整份快照，每次连接 bootstrap 补发当前值）。
   // 与 runActive 无关：主 AI 说完一轮后 runActive 归零、会话看上去「已结束」，后台子代理却可能还在干活，
   // 输入框上方的「子代理在后台工作」条靠它画（切任务清空，新任务 bootstrap 会补发）
@@ -238,6 +242,11 @@ export const ChatView = ({
   // 最新 task 快照（给稳定回调读事件窗口 / 仓库绑定，免得每来一条事件就重建回调、让消息行全部重渲）
   const latestTaskRef = useRef(task);
   latestTaskRef.current = task;
+  // 回退（含编辑回退）单飞锁（第二轮 review V7-05）：确认后到服务端回退完成要几秒（还原多个仓 + 截断），
+  // 期间再点一次会发出第二个 POST、换来红色「已有回退在进行中」，而第一次其实在成功。
+  // ref 是锁本身（同步判重、不等渲染），state 给 UI（被回退的那一行转圈、其余行的回退按钮禁用）
+  const rewindLockRef = useRef<string | null>(null);
+  const [rewindingEventId, setRewindingEventId] = useState<string | null>(null);
 
   // 全局 prompt / confirm（重命名 / 回退）
   const { prompt, confirm } = useDialog();
@@ -290,6 +299,21 @@ export const ChatView = ({
     setQueuedCount(activeCount > 0 ? activeCount : null);
   }, []);
 
+  // 订阅到的「实时」dispatch：投影之外，判一下排队条要不要自动弹开（第三轮 review R6-01）。
+  // 排队条常驻挂载（0 条返回 null），「从无到有」不能再靠它挂载时的条数比较——只有这里知道
+  // 这一次是用户刚发的 / SSE 推来的实时变化；切回会话时的恢复（下面的 applyLedgerToUi 直调）不弹（N1）
+  const onLedgerLive = useCallback(
+    (state: ChatOpState) => {
+      const prevPending = pendingLocalRepliesRef.current;
+      applyLedgerToUi(state);
+      const nextPending = pendingLocalRepliesRef.current;
+      // 「从无到有」才递增 tick；bootstrap 从服务端重建出来的占位（无指纹）不算（Q6-01）——
+      // 纯函数、连真实 ledger 的行为测试见 tests/queue-banner.test.ts
+      setQueueAutoOpenTick((t) => nextQueueAutoOpenTickForPending(t, prevPending, nextPending));
+    },
+    [applyLedgerToUi],
+  );
+
   // 切 task：清 streaming 等 UI 态；订阅当前 task ledger
   useEffect(() => {
     clearStreaming();
@@ -301,7 +325,7 @@ export const ChatView = ({
     setStopping(false);
     // 上个任务登记的「提交落地后再停」不能带到新任务（否则新任务的第一条消息一落地就被停掉）
     stopAfterSubmitRef.current = false;
-    setLiveToolOutputs({});
+    clearLiveToolOutputs();
     setRunActive(false);
     // 上个任务的后台子代理不能串到新任务（新任务连上 SSE 后 bootstrap 会补发它自己的）
     setBackgroundSubagents(NO_BACKGROUND_SUBAGENTS);
@@ -309,8 +333,15 @@ export const ChatView = ({
     queuedAtSubmitRef.current = new Map();
     // 立即投影当前 ledger，再订阅后续 dispatch
     applyLedgerToUi(getChatOpLedger(task.id));
-    return subscribeChatOp(task.id, applyLedgerToUi);
-  }, [task.id, applyLedgerToUi, clearStreaming, clearThinkingLive]);
+    return subscribeChatOp(task.id, onLedgerLive);
+  }, [
+    task.id,
+    applyLedgerToUi,
+    onLedgerLive,
+    clearStreaming,
+    clearThinkingLive,
+    clearLiveToolOutputs,
+  ]);
 
   // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松开——
   // 交卷后（awaiting_ack）run 还在流式吐消息时、输入框 loading 不会提前关掉。
@@ -322,36 +353,28 @@ export const ChatView = ({
   // 展示分类 mode（立即发送 / 排队 / 状态不明）见 lib/chat-pending-display：
   // 排队与否取「提交那一刻 run 是否在跑」的快照（登记时记入 queuedAtSubmitRef），
   // 不能渲染时看 runActive——受理（running）早于 user_reply 落盘，会把立即发送误判成排队、气泡来回闪。
-  // 没登记过的占位（刷新页面后从 sessionStorage 恢复的）才退回「当前 run 是否在跑」兜底。
+  // 没登记过的占位才退回「当前 run 是否在跑」兜底——它们来自重连 bootstrap 按服务端快照重建
+  // （切走再切回 / 第二窗口；ledger 是纯内存，**没有**任何刷新后的持久化恢复）。
+  // 重建的占位没有正文（快照只有 itemId + phase），画出来是空白的虚线气泡 + 空编辑框（V1-07），
+  // 所以没有内容可画的不送进事件流；它仍在 ledger 里、计入排队数，排队条会去服务端拉带正文的清单。
+  // 投影（visible / mode / local 的口径）在 lib/stream-pending.projectPendingForStream（纯函数、有单测）：
+  // local = 本窗口本次挂载内登记过的才是「用户刚按了回车」（事件流据此提交即到底），
+  // bootstrap 重建的占位没登记过 → false，出现时不能把正在翻历史的人拽到底部（R5-03）
   const pendingForStream = useMemo(
     () =>
-      pendingLocalReplies
-        .filter((p) => !shouldHideLocalPlaceholder(p))
-        .map((p) => ({
-          ...p,
-          mode: classifyPendingBubble({
-            uncertain: p.uncertain,
-            queued: queuedAtSubmitRef.current.get(p.itemId) ?? runActive,
-          }),
-        })),
+      projectPendingForStream(pendingLocalReplies, {
+        visible: (p) => !shouldHideLocalPlaceholder(p) && hasPendingBubbleContent(p),
+        queuedAtSubmit: queuedAtSubmitRef.current,
+        runActive,
+      }),
     [pendingLocalReplies, runActive],
   );
 
   useTaskWatch(task.id, {
     onEvent: (ev, meta) => {
-      // ephemeral shell delta：不进持久 events，按 callId 累积到运行中工具块
-      const delta = parseToolOutputDelta(ev);
-      if (delta) {
-        setLiveToolOutputs((prev) => ({
-          ...prev,
-          [delta.callId]: trimLiveOutputLines(
-            `${prev[delta.callId] ?? ""}${delta.chunk}`,
-          ),
-        }));
-        return;
-      }
-      // 双保险：其它 ephemeral 也不落盘
-      if (isEphemeralToolOutputDelta(ev)) return;
+      // ephemeral shell delta：不进持久 events，按 callId 累积到运行中工具块（与 task 页共用 hook）；
+      // tool_result 到达时 hook 会顺手清掉该 callId 的直播缓冲（最终 output 在 meta），事件本身继续往下走
+      if (absorbLiveToolOutputEvent(ev)) return;
 
       // 任何落盘事件到达 = 这段思考已经有正式内容（thinking 事件本身 / 紧随的工具 / 正文）
       // 或新一轮开始（user_reply）——实时「思考中」到此为止。服务端保证实时帧不会晚于
@@ -361,20 +384,6 @@ export const ChatView = ({
       // 之后从第一个字重新吐（2026-10-13 用户反馈）。思考是否真的结束了，由紧随其后的
       // thinking_snapshot 对齐（null = 已结束、清；对象 = 仍在、接着长）
       if (!meta?.replay) clearThinkingLive();
-
-      // tool_result 到达 → 清掉该 callId 的直播缓冲（最终 output 在 meta）
-      if (ev.kind === "tool_result") {
-        const cid =
-          typeof ev.meta?.callId === "string" ? ev.meta.callId : "";
-        if (cid) {
-          setLiveToolOutputs((prev) => {
-            if (!(cid in prev)) return prev;
-            const next = { ...prev };
-            delete next[cid];
-            return next;
-          });
-        }
-      }
 
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") clearStreaming();
@@ -387,8 +396,10 @@ export const ChatView = ({
 
       onEventAppendRef.current(ev);
     },
-    // 整队作废 → reducer 记 failed（静默清占位，气泡消失本身就是反馈）。
-    // 只有磁盘写入失败这种真事故才弹；stop / 立即发送清掉的不打扰。
+    // 整队作废 → reducer 记 failed（清占位，气泡消失）。
+    // 只有磁盘写入失败这种真事故才弹 toast；「气泡消失」本身只说「没了」不说「去哪了」，
+    // 所以 stop / run 出错清掉的排队消息由服务端另落一张「未送达」卡（可复制 / 放回输入框，Q6-02），
+    // 不靠这里弹窗；「立即发送」不清队（其余排队条放回），也不打扰。
     onQueueFailed: (itemIds, reason) => {
       dispatchChatOp(task.id, { type: "queue_failed", itemIds });
       if (
@@ -428,7 +439,7 @@ export const ChatView = ({
     onDone: (t) => {
       clearStreaming();
       clearThinkingLive();
-      setLiveToolOutputs({});
+      clearLiveToolOutputs();
       setRunActive(false);
       const remaining = pendingLocalRepliesRef.current.length;
       // done_clear 只清已有明确终态；无终态保持 uncertain/persisted（静默、不弹）
@@ -484,7 +495,7 @@ export const ChatView = ({
     onTaskDeleted: (deletedId) => {
       clearStreaming();
       clearThinkingLive();
-      setLiveToolOutputs({});
+      clearLiveToolOutputs();
       dispatchChatOp(deletedId, { type: "clear_all" });
       clearChatOpLedger(deletedId);
       // 父级会再调 commitTaskDeleted；此处先清本地，父级负责 sticky + 列表
@@ -766,6 +777,11 @@ export const ChatView = ({
   // P3：回退（「回退到这里」按钮保留；会话改动面板已砍）
   const handleRewind = useCallback(
     async (eventId: string) => {
+      // 已有回退在进行（含编辑回退）：连确认框都不弹——再确认一次只会换来服务端的「已有回退在进行中」
+      if (rewindLockRef.current !== null) {
+        toast.info(REWIND_BUSY_NOTICE);
+        return;
+      }
       const ok = await confirm({
         title: "回退到这里？",
         description:
@@ -774,29 +790,36 @@ export const ChatView = ({
         confirmLabel: "回退",
       });
       if (!ok) return;
-      try {
-        const {
-          task: latest,
-          refreshRequired,
-          rewound,
-        } = await rewindChatToEvent(task.id, eventId);
-        // 响应体里的回退标记先于 task 快照应用：标记事件写失败 / SSE 没到时，本地也能截掉被删的后半段
-        if (rewound) onRewoundRef.current?.(rewound);
-        if (!latest || refreshRequired) {
-          // 回退已提交但服务端读 task 失败：勿 onTaskUpdate(null)，提示用户刷新
-          toast.success("已回退，请刷新查看最新状态");
-          return;
-        }
-        onTaskUpdateRef.current(latest);
-        toast.success("已回退");
-      } catch (err) {
-        const msg = (err as Error).message;
-        if (/跑|running|停止|409/i.test(msg)) {
-          toast.error("请先停止当前回复再回退");
-        } else {
-          toast.error(`回退失败：${msg}`);
-        }
-      }
+      // 确认框开着的这段时间别处（编辑回退）可能已经起了回退：锁没抢到就直接提示，不发第二个 POST
+      const outcome = await runExclusiveRewind(
+        rewindLockRef,
+        eventId,
+        setRewindingEventId,
+        async () => {
+          // 回退要几秒：给个 loading toast，成败都用同一个 id 就地换成结果（V7-05：原来整段零反馈）
+          const toastId = toast.loading("正在回退…");
+          try {
+            const {
+              task: latest,
+              refreshRequired,
+              rewound,
+            } = await rewindChatToEvent(task.id, eventId);
+            // 响应体里的回退标记先于 task 快照应用：标记事件写失败 / SSE 没到时，本地也能截掉被删的后半段
+            if (rewound) onRewoundRef.current?.(rewound);
+            if (!latest || refreshRequired) {
+              // 回退已提交但服务端读 task 失败：勿 onTaskUpdate(null)，提示用户刷新
+              toast.success("已回退，请刷新查看最新状态", { id: toastId });
+              return;
+            }
+            onTaskUpdateRef.current(latest);
+            toast.success("已回退", { id: toastId });
+          } catch (err) {
+            // 按服务端 409 的稳定 code 选提示（V7-06），不再匹配中文报错文案
+            toast.error(rewindFailureToast(err, "rewind"), { id: toastId });
+          }
+        },
+      );
+      if (!outcome.ran) toast.info(REWIND_BUSY_NOTICE);
     },
     [confirm, task.id],
   );
@@ -807,6 +830,11 @@ export const ChatView = ({
   // cancelled = 用户在确认框取消；failed = 已弹错误提示。两者都让编辑态保持、什么都没删。
   const handleEditRewind = useCallback(
     async (ev: TaskEvent): Promise<"ok" | "cancelled" | "failed"> => {
+      // 别的回退还在进行：先别确认、别停当前回复——回退成功后这条消息可能已经不在了（V7-05）
+      if (rewindLockRef.current !== null) {
+        toast.info(REWIND_BUSY_NOTICE);
+        return "failed";
+      }
       const cur = latestTaskRef.current;
       const plan = planEditRewind({
         events: cur.events,
@@ -828,22 +856,38 @@ export const ChatView = ({
       }
       if (plan.needsStop && !(await stopAgentCore())) return "failed";
       try {
-        // 刚停下的 run 收尾可能还差一拍（服务端回退要求没有 run / 排队 / 启动中）：409 短暂重试
-        let result: Awaited<ReturnType<typeof rewindChatToEvent>> | null = null;
-        for (let attempt = 0; result === null; attempt++) {
-          try {
-            result = await rewindChatToEvent(taskIdRef.current, ev.id, {
-              mode: "edit",
-            });
-          } catch (err) {
-            const transient =
-              plan.needsStop &&
-              err instanceof ApiRequestError &&
-              err.status === 409;
-            if (!transient || attempt >= 3) throw err;
-            await new Promise((r) => setTimeout(r, 400));
-          }
+        // 回退 HTTP（含 409 短重试）整段持单飞锁（V7-05）：期间别行的「回退到这里」被禁用、
+        // 再起的回退直接被拒——编辑那一行自己的反馈是发送钮上的转圈（rows.tsx editSubmitting），这里不再叠 toast
+        const outcome = await runExclusiveRewind(
+          rewindLockRef,
+          ev.id,
+          setRewindingEventId,
+          async () => {
+            // 刚停下的 run 收尾可能还差一拍（服务端回退要求没有 run / 排队 / 启动中）：409 短暂重试
+            let got: Awaited<ReturnType<typeof rewindChatToEvent>> | null = null;
+            for (let attempt = 0; got === null; attempt++) {
+              try {
+                got = await rewindChatToEvent(taskIdRef.current, ev.id, {
+                  mode: "edit",
+                });
+              } catch (err) {
+                const transient =
+                  plan.needsStop &&
+                  err instanceof ApiRequestError &&
+                  err.status === 409;
+                if (!transient || attempt >= 3) throw err;
+                await new Promise((r) => setTimeout(r, 400));
+              }
+            }
+            return got;
+          },
+        );
+        if (!outcome.ran) {
+          // 确认 / 停止期间别处起了回退：编辑态保持、什么都没删
+          toast.info(REWIND_BUSY_NOTICE);
+          return "failed";
         }
+        const result = outcome.value;
         // 响应体里的回退标记先于 task 快照应用（同 handleRewind）
         if (result.rewound) onRewoundRef.current?.(result.rewound);
         if (!result.task || result.refreshRequired) {
@@ -853,7 +897,8 @@ export const ChatView = ({
         }
         return "ok";
       } catch (err) {
-        toast.error(`编辑失败：${(err as Error).message}`);
+        // 按服务端 409 的稳定 code 选提示（V7-06）；没有 code 的老响应退回原文
+        toast.error(rewindFailureToast(err, "edit"));
         return "failed";
       }
     },
@@ -906,15 +951,18 @@ export const ChatView = ({
     [task.id],
   );
 
-  // P5：running 时仍可排队发送；仅 isSubmitting 短暂锁
+  // P5：running 时仍可排队发送；isSubmitting 期间短暂关掉「行内动作 + 自动聚焦」（重发 / 重新生成 / 原地编辑 / 引用）。
+  // 编辑器本身不锁（EventStream 的 composeEnabled 另算、submitting 不会关掉它，第三轮 review D7-03）：
+  // 防双发靠同步提交闩（event-stream sendingLatch）+ 发送键 disabled，发完能立刻补一句 / 贴图
   const canReply = !isSubmitting;
 
   // 事件流行内动作（错误卡「重试」）：能力住在这里（握着 ledger / 提交锁），
   // 靠 Context 注入给深层的错误卡，避免为一个按钮往 EventStream 加一路 prop
   const streamActions = useMemo(
     () => ({
-      onRetryLastMessage: async () => {
-        const last = findLastUserReply(task.events);
+      // source = 错误卡判定出的「触发失败那一轮的用户消息」；没传才退回最后一条（单点判定见 resolveErrorRecovery）
+      onRetryLastMessage: async (source?: TaskEvent) => {
+        const last = source ?? findLastUserReply(task.events);
         if (!last) return;
         const payload = await buildResendPayload(task.id, last);
         if (payload.imagesPartial) toast.warning("部分附图未能重发");
@@ -929,10 +977,13 @@ export const ChatView = ({
     [task.events, task.id, handleUserReply],
   );
 
-  const disabledHint = (() => {
-    if (isSubmitting) return "正在发送、稍候";
-    return undefined;
-  })();
+  // 头部运行态徽标：AI 提问等你回答时 runStatus 仍是 running，徽标写「待回答」而不是「运行中」
+  // （与底部状态行「等你回答」同口径，R3-03）。只取布尔、按 events 引用缓存，流式吐字不重扫
+  const awaitingAsk = useMemo(
+    () => !!findPendingAskEvent(task.events),
+    [task.events],
+  );
+  const headerRunBadge = deriveChatHeaderRunBadge(task.runStatus, awaitingAsk);
 
   const statusHint = (() => {
     if (task.runStatus === "error") {
@@ -942,13 +993,18 @@ export const ChatView = ({
   })();
 
   // D 批次：排队条可点开小面板（列排队消息 + 行内删除 / 立即发送）、组件见 chat-queue-banner。
-  // 条子只在 run SES alive 时才挂：“排队” = 在当前回复后面等着。
+  // 条子只在 run SES alive 时才显示：“排队” = 在当前回复后面等着（effectiveQueueCount：run 没在跑 = 0）。
   // 空闲时发的消息只是直发在途（输入框 loading + 待发送气泡已经表达了），
   // 也算一条“排队中”纯属误导——之前恢复/直发 loading 闪条子就是这么来的。
-  const queueBanner =
-    runActive && queuedCount != null && queuedCount > 0 ? (
-      <ChatQueueBanner key={task.id} task={task} queuedCount={queuedCount} />
-    ) : null;
+  // 常驻挂载、0 条由组件自己返回 null（R6-01）：条件挂载会让它每次都「挂上来就是 N」，自动弹开永远不可达
+  const queueBanner = (
+    <ChatQueueBanner
+      key={task.id}
+      task={task}
+      queuedCount={effectiveQueueCount({ runActive, queuedCount })}
+      autoOpenTick={queueAutoOpenTick}
+    />
+  );
 
   return (
     <ComposerSessionProvider value={composerSession}>
@@ -974,9 +1030,9 @@ export const ChatView = ({
               <Badge variant="outline" size="xs">
                 对话
               </Badge>
-              {task.runStatus !== "idle" && task.runStatus !== "awaiting_user" && (
-                <Badge variant={RUN_STATUS_VARIANT[task.runStatus]} size="xs">
-                  {RUN_STATUS_LABEL[task.runStatus]}
+              {headerRunBadge.kind === "badge" && (
+                <Badge variant={headerRunBadge.variant} size="xs">
+                  {headerRunBadge.label}
                 </Badge>
               )}
             </div>
@@ -1001,14 +1057,15 @@ export const ChatView = ({
           onUserReply={handleUserReply}
           canReply={canReply}
           submitting={isSubmitting}
-          disabledHint={disabledHint}
-          isRunning={runActive}
+          // 渲染期也看 task.runStatus：latch 要等 effect 才置位，首个 commit 不能把在跑的工具画成「已中断」（D9-03）
+          isRunning={effectiveRunActive(runActive, task.runStatus)}
           onStop={handleStop}
           stopping={stopping}
           onPrependEvents={onPrependEvents}
           onTaskUpdate={onTaskUpdate}
           onRewind={handleRewind}
           onEditRewind={handleEditRewind}
+          rewindingEventId={rewindingEventId}
           pendingLocalReplies={pendingForStream}
           queueBanner={queueBanner}
           backgroundSubagents={backgroundSubagents}

@@ -25,9 +25,17 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { ChevronDown, ChevronRight, ChevronUp, Loader2, Plus } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  Loader2,
+  Plus,
+  RefreshCw,
+} from "lucide-react";
 import { toast } from "sonner";
 
+import { CorruptTasksNotice } from "@/components/corrupt-tasks-notice";
 import { TaskListItem } from "@/components/tasks/task-list-item";
 import { Button } from "@/components/ui/button";
 import { EmptyHint } from "@/components/ui/empty-hint";
@@ -38,15 +46,19 @@ import { useDialog } from "@/hooks/use-dialog";
 import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
 import { getSettings } from "@/lib/local-store";
+import { deriveListLoadView } from "@/lib/load-outcome";
 import {
   buildRepoGroups,
+  canReconcileChatOrder,
+  isSidebarAlwaysShowItem,
   pickVisibleGroupItems,
   reconcileChatListOrder,
   repoPathsForGroupCreate,
   scrollDeltaToReveal,
   type SidebarGroup,
 } from "@/lib/sidebar-groups";
-import { setTaskArchived, setTaskPinned, updateTaskFields } from "@/lib/task-store";
+import { setTaskArchivedWithReport, setTaskPinned, updateTaskFields } from "@/lib/task-store";
+import { buildArchiveToast, buildRestoreToast, restoreToastNeeded } from "@/lib/worktree-report";
 import { isWorktreeTaskLike } from "@/lib/lightweight-task";
 import { cn } from "@/lib/utils";
 import {
@@ -137,8 +149,18 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   const router = useRouter();
   const params = useParams<{ id?: string }>();
   const activeId = params?.id;
-  const { tasks, loaded, upsertTask, refresh, markArchiving, unmarkArchiving } =
-    useTaskList();
+  const {
+    tasks,
+    loaded,
+    loadError,
+    corrupt,
+    upsertTask,
+    refresh,
+    markArchiving,
+    unmarkArchiving,
+  } = useTaskList();
+  // 列表首拉失败的重试中（按钮转圈 + 防连点）
+  const [retryingList, setRetryingList] = useState(false);
   const { prompt, confirm } = useDialog();
   // 当前模式（顶栏胶囊同源）——决定列表过滤 + 顶部按钮形态
   const mode = useAppMode();
@@ -212,6 +234,10 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   // 粘性序对齐全量对话：已有相对位置不动，新窗口插顶，已删丢掉、归档留占位
   useEffect(() => {
     if (!orderHydrated || mode !== "chat") return;
+    // 列表还没拉到 / 首拉失败时 allChatIds 是空的：此刻对齐会把粘性序清成 []（V7-08）
+    if (!canReconcileChatOrder({ loaded, loadError, chatCount: allChatIds.length })) {
+      return;
+    }
     setChatOrder((prev) => {
       const prevSet = new Set(prev);
       let next = reconcileChatListOrder(prev, allChatIds);
@@ -235,7 +261,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       saveSidebarChatOrder(next);
       return next;
     });
-  }, [orderHydrated, mode, allChatIds, archivedChatIds]);
+  }, [orderHydrated, mode, allChatIds, archivedChatIds, loaded, loadError]);
 
   // 工作台（work）：时间桶；对话（chat）：仓组
   const timeGroups = useMemo(
@@ -398,7 +424,8 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   };
 
   // 归档：idle 点即归档；running 先确认（worktree 任务归档会停机 + 清 worktree），归档后侧栏隐藏，去会话管理页找回/恢复/彻底删除
-  // 清理口径与服务端 archiveTaskWithCleanup 一致：isWorktreeTaskLike（task-worktrees.ts isWorktreeTask 的前端同口径）
+  // willCleanup 只用于归档前确认框的预告（还没请求，只能预测）；归档后的 toast 一律以服务端回报 report 为准。
+  // 口径与服务端 archiveTaskWithReport 一致：isWorktreeTaskLike（task-worktrees.ts isWorktreeTask 的前端同口径）
   const handleArchive = async (task: TaskSummary) => {
     if (archivingIds.has(task.id)) return;
     const willCleanup = isWorktreeTaskLike(task);
@@ -417,7 +444,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     upsertTask({ ...task, archived: true });
     markArchiving(task.id, true);
     try {
-      const updated = await setTaskArchived(task.id, true);
+      const { task: updated, report } = await setTaskArchivedWithReport(task.id, true);
       upsertTask(updated);
       setPinnedOrder((prev) => {
         const order = prev.filter((id) => id !== task.id);
@@ -427,15 +454,15 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       if (activeId === task.id) {
         router.push(task.mode === "chat" ? "/chats" : "/");
       }
-      const running = task.runStatus === "running";
-      toast.success(
-        running && !willCleanup
-          ? `已归档「${task.title}」、任务仍在后台跑`
-          : running
-            ? `已归档「${task.title}」、已停止并清理隔离工作区`
-            : willCleanup
-              ? `已归档「${task.title}」、已清理隔离工作区`
-              : `已归档「${task.title}」、可在会话管理找回`,
+      // toast 只认服务端回报（清了 / 保留了哪些工作区、取消了几条定时），不再按任务形状预测（review D2b-06）
+      const archiveToast = buildArchiveToast({
+        title: task.title,
+        wasRunning: task.runStatus === "running",
+        report,
+        plainSuffix: "、可在会话管理找回",
+      });
+      (archiveToast.kind === "warning" ? toast.warning : toast.success)(
+        archiveToast.message,
         {
           action: {
             label: "撤销",
@@ -444,8 +471,14 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                 // 恢复方向同样标记：窗口内服务端旧快照（archived:true）不得闪掉刚恢复的行
                 markArchiving(task.id, false);
                 try {
-                  const restored = await setTaskArchived(task.id, false);
+                  const { task: restored, report: restoreReport } =
+                    await setTaskArchivedWithReport(task.id, false);
                   upsertTask(restored);
+                  // 撤销也把定时找回来了：说一声（没定时就不打扰）
+                  // （Q9-06：已过点记为「已错过」/ 已用满次数的也要说，不只恢复了才说）
+                  if (restoreToastNeeded(restoreReport)) {
+                    toast.success(buildRestoreToast(task.title, restoreReport));
+                  }
                   // 恢复归档的置顶时把手动序接回去（跟会话页 restorePinnedOrder 同语义），
                   // 否则钉还在、序掉到末尾
                   if (restored.pinned) {
@@ -483,6 +516,12 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   };
 
   const empty = sorted.length === 0;
+  // 首拉失败（没任何旧数据 + 有失败原因）≠「还没有任务」：画失败态 + 重试，不下「没有」的结论
+  const listView = deriveListLoadView({
+    loaded,
+    loadError,
+    count: tasks.length,
+  });
 
   const renderChatGroups = (groups: SidebarGroup[]) => (
     <div className="flex flex-col gap-3">
@@ -493,13 +532,16 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
         const createPaths = repoPathsForGroupCreate(group);
         // 非置顶组默认只展 4 条
         const expanded = expandedGroups.has(group.key);
-        // 当前打开的对话即使排在第 4 条之后也要露出来（见 pickVisibleGroupItems）
+        // 当前打开的对话即使排在第 4 条之后也要露出来（见 pickVisibleGroupItems）；
+        // 在跑 / 有后台子代理 / 有未答提问的行同样不许折进「展开其余」（V7-02）：
+        // 转圈、等回答这些信号只画在行上，被折叠就等于看不见
         const { visible: visibleItems, hiddenCount } = pickVisibleGroupItems(
           group.items,
           {
             limit: isPinned ? Number.POSITIVE_INFINITY : GROUP_VISIBLE_LIMIT,
             expanded,
             activeId,
+            alwaysShow: isSidebarAlwaysShowItem,
           },
         );
         return (
@@ -516,7 +558,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                 ) : (
                   <ChevronDown className="size-3.5 shrink-0 text-muted-foreground/60" />
                 )}
-                <span className="min-w-0 truncate text-[13px] font-semibold tracking-wide text-foreground">
+                <span className="min-w-0 truncate text-xs font-semibold tracking-wide text-foreground">
                   {group.label}
                 </span>
               </button>
@@ -573,8 +615,10 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     // 对标 Cursor / Linear 的侧栏做法；border-r 保留细分隔
     <aside
       aria-hidden={!open}
+      // 收起态整棵退出 Tab 序 / 读屏：仅 aria-hidden 时里面的按钮（含底部损坏任务提示）仍能被 Tab 聚焦（V7-12 余项）
+      inert={!open}
       className={cn(
-        "h-full shrink-0 overflow-hidden border-r border-border/60 bg-muted/30 transition-[width] duration-200 ease-out",
+        "h-full shrink-0 overflow-hidden border-r border-border/60 bg-muted/30 transition-[width] duration-200 ease-out motion-reduce:transition-none",
         open ? "w-64" : "w-0",
       )}
     >
@@ -610,6 +654,28 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
         >
           {!loaded ? (
             <LoadingState variant="inline" className="block px-3 py-2" />
+          ) : listView === "error" ? (
+            <div className="mt-2 flex flex-col items-center gap-2 rounded-md border border-dashed px-3 py-3 text-center">
+              <p className="text-xs text-destructive">
+                {mode === "chat" ? "对话" : "任务"}列表加载失败：{loadError}
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={retryingList}
+                onClick={() => {
+                  setRetryingList(true);
+                  void refresh().finally(() => setRetryingList(false));
+                }}
+              >
+                {retryingList ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="size-3.5" />
+                )}
+                重试
+              </Button>
+            </div>
           ) : empty ? (
             <div className="mt-2">
               <EmptyHint variant="dashed" size="sm" align="center">
@@ -633,6 +699,10 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
             </div>
           )}
         </nav>
+
+        {/* meta.json 损坏的任务不在列表里（也点不进去）：在滚动区下方给个克制的提示，
+            不随长列表滚走；没有损坏时不渲染（F3-02） */}
+        <CorruptTasksNotice corrupt={corrupt} listTrusted={loaded && !loadError} />
       </div>
     </aside>
   );

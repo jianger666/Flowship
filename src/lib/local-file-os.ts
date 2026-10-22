@@ -6,6 +6,8 @@
 
 import path from "node:path";
 
+import { isUncLikePath } from "./unc-path";
+
 export interface OsSpawnSpec {
   command: string;
   args: string[];
@@ -117,10 +119,9 @@ const posixEffectiveExt = (absPath: string): string => {
 /**
  * Windows UNC / 设备命名空间路径（`\\host\share`、`//host/share`、`\\?\...`、`\\.\...`）。
  * 对这类路径做 open 或 explorer /select 都会让系统主动连 SMB（泄漏 NTLM 凭据），一律拒绝。
- * 仅对 Windows 有意义（posix 上 `//x` 只是普通路径），调用方按平台判断。
+ * 判定复用 `unc-path.ts` 的单一实现（R12-05）；那边是平台无关的，这里保留旧名给 open / reveal 的调用方。
  */
-export const isWindowsUncPath = (absPath: string): boolean =>
-  /^[\\/]{2}/.test(absPath);
+export const isWindowsUncPath = (absPath: string): boolean => isUncLikePath(absPath);
 
 export type OpenPathPlan =
   | { kind: "open"; spec: OsSpawnSpec }

@@ -22,7 +22,8 @@ import {
 } from "@/lib/view-memory";
 
 // 单次最多附几条路径（跟 chat-reply / question 路由的上限对齐）
-const MAX_PATHS = 10;
+/** 路径附件上限（导出给失败恢复合并用：恢复项与新附的合并后同样要守这个上限） */
+export const MAX_PATHS = 10;
 
 // 读快照恢复路径列表；无快照 / 无 persist 返回空（跟以前行为一致）
 const restorePaths = (

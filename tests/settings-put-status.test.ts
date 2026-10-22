@@ -21,6 +21,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import {
   DEFAULT_SETTINGS,
   getSettings,
+  initSettings,
   saveSettings,
   saveSettingsDetailed,
 } from "@/lib/local-store";
@@ -36,7 +37,7 @@ type PutOutcome = Response | "network-error";
 let putQueue: PutOutcome[] = [];
 let putCount = 0;
 
-beforeAll(() => {
+beforeAll(async () => {
   vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
     const method = (init?.method ?? "GET").toUpperCase();
     if (String(url).includes("/api/settings/full") && method === "GET") {
@@ -47,6 +48,8 @@ beforeAll(() => {
     if (next === "network-error") throw new TypeError("fetch failed");
     return next;
   });
+  // review #16：init 成功之前 saveSettings 一律拒写——这些用例测的是 PUT 失败分流，先像真实页面一样完成加载
+  await initSettings();
 });
 
 beforeEach(() => {

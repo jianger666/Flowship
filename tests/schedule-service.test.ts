@@ -153,6 +153,59 @@ describe("deliverScheduleFire：投递前的拦截", () => {
   });
 });
 
+describe("deliverScheduleFire：绑定的提供方已被删（第四轮 Q2-02）", () => {
+  const settingsWithProviders = (customProviders: unknown[]) => ({
+    status: "ok",
+    settings: {
+      apiKey: "sk-cursor",
+      defaultModel: { id: "composer-2" },
+      customProviders,
+    },
+  });
+  const OTHER = { id: "cp_other", name: "other", baseUrl: "https://other.example.com/v1", apiKey: "k", format: "openai" };
+
+  it("悬空（task.provider 指向已删条目）：拒投、不调任何 inject、原因写明、不标 permanent（用户重选后可恢复）", async () => {
+    for (const mode of ["chat", "task"] as const) {
+      mocks.getTaskMeta.mockResolvedValue({
+        id: "t_svc",
+        mode,
+        archived: false,
+        provider: "cp_gone",
+        model: { id: "gpt-5" },
+      });
+      mocks.readSettingsFile.mockResolvedValue(settingsWithProviders([OTHER]));
+      const r = await service.deliverScheduleFire(request("t_svc"));
+      expect(r.kind).toBe("failed");
+      expect(r.kind === "failed" && r.reason).toContain("提供方已被删除");
+      expect(r.kind === "failed" && r.permanent).toBeFalsy();
+    }
+    // Cursor 凭据（sk-cursor）没有被任何通道拿去投递
+    expect(mocks.chatInject).not.toHaveBeenCalled();
+    expect(mocks.taskInject).not.toHaveBeenCalled();
+  });
+
+  it("反例对：绑定的提供方还在 → 正常投递，bootArgs 用那家的凭据", async () => {
+    mocks.getTaskMeta.mockResolvedValue({
+      id: "t_svc",
+      mode: "chat",
+      archived: false,
+      provider: "cp_other",
+      model: { id: "gpt-5" },
+    });
+    mocks.readSettingsFile.mockResolvedValue(settingsWithProviders([OTHER]));
+    expect(await service.deliverScheduleFire(request("t_svc"))).toEqual({ kind: "delivered" });
+    expect(mocks.chatInject.mock.calls[0]![1].bootArgs).toMatchObject({ apiKey: "k", model: { id: "gpt-5" } });
+  });
+
+  it("反例对：配置读不出来时不据此判「已删除」（沿用既有「缺凭据」失败，不误报悬空）", async () => {
+    mocks.getTaskMeta.mockResolvedValue({ id: "t_svc", mode: "chat", archived: false, provider: "cp_gone" });
+    mocks.readSettingsFile.mockResolvedValue({ status: "missing" });
+    const r = await service.deliverScheduleFire(request("t_svc"));
+    expect(r.kind).toBe("failed");
+    expect(r.kind === "failed" && r.reason).not.toContain("提供方已被删除");
+  });
+});
+
 describe("deliverScheduleFire：按会话模式分发", () => {
   it("chat：走 handleChatReplyInject；带幂等键 / bootArgs / meta.source=schedule / scheduledTrigger", async () => {
     const req = request("t_svc");

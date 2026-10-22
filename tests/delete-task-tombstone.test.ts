@@ -22,6 +22,16 @@ import {
 
 import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 
+// boot recovery 末尾会 fire-and-forget 一轮 SDK store 瘦身（maybeGcSdkStore）：它在 `<DATA_DIR>/sdk-agent-store`
+// 下开 store、建文件，而本文件的 DATA_DIR 就是 TMP_ROOT——最后一条「boot 清扫」用例结束后它还在后台写，
+// `afterAll` 的 `fs.rm(TMP_ROOT, recursive)` 与之交错 → `ENOTEMPTY`、整个 suite 红、vitest 退出码 1
+// （并行 6 路 × 6 轮修前 2/36 次红，日志里能看到 `[sdk-store] checkpoints 使用 fast 实现 … fe-delete-tombstone-…/sdk-agent-store`）。
+// 本文件测的是 tombstone 清扫，与 SDK store 瘦身无关，所以只把这一个后台动作桩掉；产品代码不动。
+vi.mock("@/lib/server/sdk-store-gc", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/sdk-store-gc")>()),
+  maybeGcSdkStore: vi.fn(),
+}));
+
 // OS 保证唯一；必须在动态 import 之前钉死 env
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-delete-tombstone-"));
 process.env.FLOWSHIP_DATA_DIR = TMP_ROOT;

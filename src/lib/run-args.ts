@@ -24,11 +24,14 @@ import { toast } from "sonner";
 import type { ModelSelection } from "@cursor/sdk";
 
 import {
+  DANGLING_TASK_PROVIDER_MESSAGE,
   bootArgsForTask,
+  customProviderNotReadyReason,
   hasModelCredsForProvider,
+  isTaskProviderDangling,
   resolveTaskProvider,
 } from "@/lib/agent-provider";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, isSettingsLoaded } from "@/lib/local-store";
 import { settingsUrl } from "@/lib/settings-link";
 import { isCursorProvider, type Task } from "@/lib/types";
 
@@ -39,11 +42,20 @@ export interface RunArgs {
 
 export const prepareRunArgs = (task: Task): RunArgs | null => {
   const settings = getSettings();
+  // 绑定的自定义提供方已被删除：别悄悄改走 Cursor（数据会出域）。配置没加载成功时 customProviders 只是默认空值，不能据此判「已删除」
+  if (isSettingsLoaded() && isTaskProviderDangling(task, settings)) {
+    toast.error(DANGLING_TASK_PROVIDER_MESSAGE);
+    return null;
+  }
   const providerId = resolveTaskProvider(task, settings);
   const isCustom = !isCursorProvider(providerId);
 
   if (!hasModelCredsForProvider(settings, providerId)) {
-    toast.error(isCustom ? "缺少自定义 Provider 接口地址" : "缺少 API Key", {
+    // 自定义条目「地址写了但无效」（含 userinfo / 缺协议头）时说真原因，别说「缺少接口地址」（第四轮 Q2-07）
+    const reason = isCustom
+      ? (customProviderNotReadyReason(settings, providerId) ?? "缺少自定义 Provider 接口地址")
+      : "缺少 API Key";
+    toast.error(reason, {
       action: {
         label: "去设置",
         onClick: () => {

@@ -24,8 +24,10 @@ import {
 } from "react";
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
 
+import { Tooltip } from "@/components/ui/tooltip";
 import { useTitleBarOverlayDim } from "@/hooks/use-titlebar-overlay-dim";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
+import { isUncLikePath } from "@/lib/unc-path";
 import { cn } from "@/lib/utils";
 
 export interface PreviewImage {
@@ -212,38 +214,40 @@ export const ImageThumb = ({
   };
 
   return (
-    <div
-      className={cn(
-        "group relative size-14 overflow-hidden rounded-md border bg-card",
-        className,
-      )}
-      title={title ?? alt}
-    >
-      <button
-        type="button"
-        onClick={handleOpen}
-        className="block size-full cursor-zoom-in"
-        aria-label="查看大图"
+    // 悬浮提示走 Tooltip（规范：不用原生 title=）；content 为空时 Tooltip 直接返回子元素
+    <Tooltip content={title ?? alt}>
+      <div
+        className={cn(
+          "group relative size-14 overflow-hidden rounded-md border bg-card",
+          className,
+        )}
       >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={src}
-          alt={alt ?? ""}
-          loading="lazy"
-          className={cn("size-full object-cover", imgClassName)}
-        />
-      </button>
-      {onRemove && (
         <button
           type="button"
-          onClick={onRemove}
-          className="absolute right-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
-          aria-label="移除"
+          onClick={handleOpen}
+          className="block size-full cursor-zoom-in"
+          aria-label="查看大图"
         >
-          <X className="size-3" />
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={src}
+            alt={alt ?? ""}
+            loading="lazy"
+            className={cn("size-full object-cover", imgClassName)}
+          />
         </button>
-      )}
-    </div>
+        {onRemove && (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="absolute right-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+            aria-label="移除"
+          >
+            <X className="size-3" />
+          </button>
+        )}
+      </div>
+    </Tooltip>
   );
 };
 
@@ -266,16 +270,24 @@ export const MarkdownImage = ({
   const { open } = useImagePreview();
   // src 可能是 string（url / dataUrl）；react-markdown 类型上带 Blob、运行时基本是 string
   const url = typeof src === "string" ? toLoadableImageSrc(src) : "";
-  if (!url) return null;
+  if (!url) {
+    // UNC 形态是被安全守卫有意挡掉的（见 lib/unc-path）：别静默吞成空白，给个看得见的占位（R12-03），
+    // 与 BlockedMarkdownImage 同款朴素文案
+    if (typeof src === "string" && isUncLikePath(src)) {
+      return <span className="text-muted-foreground">[图片：网络路径不支持预览]</span>;
+    }
+    return null;
+  }
   return (
-    // eslint-disable-next-line @next/next/no-img-element
-    <img
-      src={url}
-      alt={alt ?? ""}
-      title={title ?? alt}
-      loading="lazy"
-      onClick={() => open([{ src: url, alt, title }])}
-      className="my-2 max-h-80 max-w-full cursor-zoom-in rounded-md border object-contain"
-    />
+    <Tooltip content={title ?? alt}>
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={url}
+        alt={alt ?? ""}
+        loading="lazy"
+        onClick={() => open([{ src: url, alt, title }])}
+        className="my-2 max-h-80 max-w-full cursor-zoom-in rounded-md border object-contain"
+      />
+    </Tooltip>
   );
 };

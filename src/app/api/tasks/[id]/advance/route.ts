@@ -29,6 +29,8 @@
  * - task 不存在 → 404
  * - 准入条件不满足（如 build 但没 plan）→ 400
  * - 缺 apiKey 字段 / model / images 等 → 400（自定义允许空 Key）
+ * - advanceTask 抛错（含 ensureTaskWorktrees 建工作区失败）→ 400 `{ error: 完整文案, code: "advance_failed" }`，
+ *   并按 advance-failure.ts 的规则补写一条 error 事件（事件流留痕、弹窗关掉后也查得到）
  */
 
 import { promises as fs } from "node:fs";
@@ -49,10 +51,18 @@ import {
   setTaskRemoveSourceBranchOnMerge,
 } from "@/lib/server/task-fs";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
-import { advanceTask } from "@/lib/server/task-runner";
+import {
+  advanceTask,
+  isTaskOpStale,
+  TASK_OP_STALE_HTTP_MESSAGE,
+} from "@/lib/server/task-runner";
+import { shouldRecordAdvanceFailure } from "@/lib/server/advance-failure";
 import { getCustomAction } from "@/lib/server/custom-action-fs";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
-import { getTaskOpGeneration } from "@/lib/server/task-stream";
+import {
+  getTaskOpGeneration,
+  writeOwnedEventAndPublish,
+} from "@/lib/server/task-stream";
 import {
   ACTION_TYPES,
   type ActionType,
@@ -62,6 +72,53 @@ import {
 
 /** 响应里带回的尾部事件条数（与任务页首屏 EVENT_TAIL 同值） */
 const RESPONSE_EVENT_TAIL = 300;
+
+/** 推进失败后判重只需看最近这几条事件（本次请求期间写的 error 必在尾部） */
+const FAILURE_DEDUPE_EVENT_TAIL = 30;
+
+/**
+ * 推进失败 → 补写一条 error 事件（尽力而为、绝不抛：写不进去也不能盖住真正的错误响应）。
+ *
+ * 为什么要写：`ensureTaskWorktrees` 等推进前置步骤抛错时 runner 不写事件、只有 HTTP 400，
+ * 用户关掉弹窗后事件流里查不到「这次推进为什么没起来」。
+ * 写不写由 advance-failure 的纯函数判（让位 / 准入拒绝 / 已写过 / 正在跑 都不写）。
+ * lease 用「admission gen 未变 + lifecycle 空」——stop / 删除在飞时不往事件流写。
+ */
+const recordAdvanceFailure = async (input: {
+  taskId: string;
+  opGen: number;
+  message: string;
+  startedAt: number;
+  actionType: ActionType;
+}): Promise<void> => {
+  try {
+    const fresh = await getTaskWithTailEvents(
+      input.taskId,
+      FAILURE_DEDUPE_EVENT_TAIL,
+    );
+    if (!fresh) return;
+    const shouldWrite = shouldRecordAdvanceFailure({
+      message: input.message,
+      staleMessage: TASK_OP_STALE_HTTP_MESSAGE,
+      startedAt: input.startedAt,
+      recentEvents: fresh.events,
+      runStatus: fresh.runStatus,
+      repoStatus: fresh.repoStatus,
+    });
+    if (!shouldWrite) return;
+    await writeOwnedEventAndPublish(
+      input.taskId,
+      () => !isTaskOpStale(input.taskId, input.opGen),
+      {
+        kind: "error",
+        text: input.message,
+        meta: { subkind: "advance_failed", actionType: input.actionType },
+      },
+    );
+  } catch (err) {
+    console.warn(`[advance] task=${input.taskId} 补写失败事件出错：`, err);
+  }
+};
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -126,6 +183,8 @@ const sanitizeRepoBranchMap = (
 export const runtime = "nodejs";
 
 export const POST = async (req: Request, { params }: Ctx) => {
+  // 收到请求的时刻：失败补写事件时只认此后写入的 error（判重用）
+  const startedAt = Date.now();
   const { id } = await params;
 
   let body: PostBody;
@@ -311,6 +370,15 @@ export const POST = async (req: Request, { params }: Ctx) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[advance] task=${task.id} failed:`, err);
-    return errorResponse(message, 400);
+    // 事件流留痕（ensureTaskWorktrees 等前置步骤抛错 runner 不写事件）；响应体带完整文案 + 稳定 code，
+    // 客户端据此留住弹窗与预填、把整段原因展示在弹窗里（不只首行 toast）
+    await recordAdvanceFailure({
+      taskId: task.id,
+      opGen,
+      message,
+      startedAt,
+      actionType,
+    });
+    return errorResponse(message, 400, { code: "advance_failed" });
   }
 };

@@ -27,19 +27,32 @@ interface HooksJsonShape {
 }
 
 /**
+ * 旧 .sh 代的完整形态：`command` 整串就是 fe 自己 scripts 目录的**绝对路径**
+ * （当年是 `path.join(process.cwd(), "scripts", "stop-hook.sh")`，没有任何解释器 / 参数 / env 前缀）。
+ * 允许首尾引号、路径里有空格（Windows 用户目录常见），但必须以盘符或 `/` 开头。
+ * 不能只按脚本名匹配：业务仓库自己的 `./scripts/stop-hook.sh`、`bash scripts/shell-guard.sh`、
+ * `"$CURSOR_PROJECT_DIR/scripts/stop-hook.sh"` 同名但不是 fe 的——误删后 hooks.json 是已跟踪文件，
+ * 会被带进 MR（review C1-01）。
+ */
+const FE_LEGACY_SH_COMMAND =
+  /^\s*["']?(?:[A-Za-z]:[\\/]|\/)[^"'\r\n]*?scripts[\\/](?:stop-hook|shell-guard)\.sh["']?\s*$/;
+
+/**
  * 内容指纹：是否 fe 注入的 hook command（与当前 process.cwd() 无关）。
  * 覆盖：mjs + ELECTRON_RUN_AS_NODE（V0.8+）、以及更早的 .sh 绝对路径形态。
+ *
+ * @internal 导出仅供单测
  */
-const isFeCommand = (cmd: string): boolean => {
+export const isFeCommand = (cmd: string): boolean => {
   const isFeScript =
     /scripts[/\\](?:stop-hook|shell-guard)\.(?:mjs|sh)/.test(cmd);
   if (!isFeScript) return false;
   // mjs 代注入模板固定带 ELECTRON_RUN_AS_NODE；缺这个更像误伤同名脚本
-  if (/\.mjs(?:\s|"|$)/.test(cmd) || cmd.includes(".mjs")) {
+  if (cmd.includes(".mjs")) {
     return cmd.includes("ELECTRON_RUN_AS_NODE");
   }
-  // .sh 旧代：无 ELECTRON_RUN_AS_NODE、脚本名本身即指纹
-  return true;
+  // .sh 旧代：无 ELECTRON_RUN_AS_NODE，只认「整串就是一条绝对路径」的原始形态
+  return FE_LEGACY_SH_COMMAND.test(cmd);
 };
 
 /**

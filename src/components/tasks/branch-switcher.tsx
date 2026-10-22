@@ -303,14 +303,14 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
       <PopoverContent align="start" sideOffset={6} className="w-80 p-0">
         {worktreeMissing ? (
           <div className="flex items-start gap-1.5 px-2.5 py-3 text-[11px] leading-relaxed text-muted-foreground">
-            <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-warning" />
             <span>worktree 尚未就绪，暂不能切换分支。</span>
           </div>
         ) : (
           <>
             {/* 切换前警告（可选） */}
             {warning && (
-              <div className="flex items-start gap-1.5 border-b border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
+              <div className="flex items-start gap-1.5 border-b border-warning/40 bg-warning/10 px-2.5 py-2 text-[11px] leading-relaxed text-warning">
                 <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                 <span>{warning}</span>
               </div>

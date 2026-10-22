@@ -25,6 +25,7 @@ import {
   type TaskStreamEvent,
 } from "@/lib/server/task-stream";
 import type { Task, TaskEvent } from "@/lib/types";
+import { fileUrlToLocalPath, isUncLikePath, nonLocalPathReason } from "@/lib/unc-path";
 
 import {
   isFeishuBridgeStreamingEnabled,
@@ -320,6 +321,8 @@ const extractToolPreviewTarget = (argsSummary: string): string => {
         "url",
         "pattern",
         "glob_pattern",
+        // SDK 类型 / pi 别名用 camelCase（第二轮 review V4-05 同类遗漏）
+        "globPattern",
       ]) {
         const v = o[key];
         if (typeof v === "string" && v.trim()) return v.trim();
@@ -598,6 +601,20 @@ const renderProcess = (parts: ProcessPart[], answerStarted: boolean): string => 
   return blocks.join("\n\n");
 };
 
+/**
+ * 出站上传的统一 UNC 守卫（Q4-03）：任何要交给 `uploadImage` 的本地路径先过一遍白名单。
+ * lark-cli 以 `path.dirname(path.resolve(p))` 为 cwd 启动子进程，Windows 上 UNC 当 cwd / 读文件会连 SMB 并带 NTLM 凭据；
+ * 飞书消息里的图片路径是 AI 写的（可被提示注入）。命中就抛错——调用方本来就把「上传失败」降级成「仅 app 内可见」。
+ */
+const uploadLocalImageGuarded = async (
+  upload: UploadImageFn,
+  filePath: string,
+): Promise<string> => {
+  const reason = nonLocalPathReason(filePath);
+  if (reason) throw new Error(reason);
+  return upload(filePath);
+};
+
 const isLocalImageSrc = (src: string): boolean => {
   const t = src.trim();
   if (!t) return false;
@@ -653,17 +670,21 @@ export const replaceLocalImagesInMarkdown = async (
     const start = m.index ?? -1;
     if (start < 0 || !isLocalImageSrc(src)) continue;
     let filePath = src;
-    if (src.startsWith("file://")) {
+    if (/^file:\/\//i.test(src)) {
+      // `file:///C:/x` → `C:/x`（不是 `/C:/x`，Q4-03 同族）；`file:////h/s`、`file://h/s` 留给下面的 UNC 守卫
+      const stripped = fileUrlToLocalPath(src);
       try {
-        filePath = decodeURIComponent(src.slice("file://".length));
+        filePath = decodeURIComponent(stripped);
       } catch {
-        filePath = src.slice("file://".length);
+        filePath = stripped;
       }
     }
     filePath = await resolveLocalImagePath(filePath, taskId);
     let replacement: string;
     try {
-      const key = await upload(filePath);
+      // 原始 src（含 `file://h/s` 这种剥完像相对路径的 UNC）与解析后的路径都要过守卫，upload 不会被调用
+      if (isUncLikePath(src)) throw new Error("UNC");
+      const key = await uploadLocalImageGuarded(upload, filePath);
       replacement = `![${alt}](${key})`;
     } catch {
       replacement = "[图片：仅 app 内可见]";
@@ -874,7 +895,7 @@ const ensureCardStarted = async (
     let echoText = turn.echoText;
     if (turn.echoImageAbsPaths.length > 0) {
       const settled = await Promise.allSettled(
-        turn.echoImageAbsPaths.map((abs) => uploadImageImpl(abs)),
+        turn.echoImageAbsPaths.map((abs) => uploadLocalImageGuarded(uploadImageImpl, abs)),
       );
       const keys: string[] = [];
       let failCount = 0;

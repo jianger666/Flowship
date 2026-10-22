@@ -120,6 +120,11 @@ export interface ScheduleRecord {
   endedAt?: number;
   /** 结束原因（done / cancelled / missed 时一句话） */
   endNote?: string;
+  /**
+   * 因「会话归档」被系统取消的记录才有：保留取消前的状态与下次触发时刻，取消归档时据此还原
+   * （见 {@link markRestoredAfterArchive}）。用户 / AI 自己取消的、任务终结时取消的都没有这个字段——不还原。
+   */
+  archiveCancelled?: { prevStatus: "active" | "paused"; nextFireAt: number | null };
   /** 最近 {@link SCHEDULE_HISTORY_MAX} 条触发历史，旧的在前 */
   history: ScheduleHistoryEntry[];
 }
@@ -455,6 +460,50 @@ export const markResumed = (r: ScheduleRecord, now: number): ScheduleRecord => {
   return next;
 };
 
+/**
+ * 取消归档时还原「因归档被取消」的定时（第三轮 review D2b-03：归档会取消该会话全部定时，
+ * 此前「撤销」只翻归档标记、定时全没了）。口径同 {@link markResumed}：
+ * - 取消前是暂停 → 还原回暂停（不替用户擅自开跑）；
+ * - 周期：从现在起重新计一个完整间隔（不补归档期间的）；已认领满 maxRuns → 直接结束；
+ * - 一次性：原时刻还没到 → 照旧；已过点 → 记成「已错过」（保留提醒、不补发）。
+ * 没有 `archiveCancelled` 标记 / 不是 cancelled 的记录原样返回（绝不乱还原用户自己取消的）。
+ */
+export const markRestoredAfterArchive = (r: ScheduleRecord, now: number): ScheduleRecord => {
+  const info = r.archiveCancelled;
+  if (r.status !== "cancelled" || !info) return r;
+  const next = clone(r);
+  delete next.archiveCancelled;
+  next.endedAt = undefined;
+  next.endNote = undefined;
+  if (info.prevStatus === "paused") {
+    next.status = "paused";
+    next.nextFireAt = info.nextFireAt;
+    return next;
+  }
+  next.status = "active";
+  if (next.kind === "every") {
+    if (next.maxRuns !== undefined && next.seq >= next.maxRuns) {
+      finish(next, "done", now, maxRunsDoneNote(next));
+      return next;
+    }
+    next.nextFireAt = now + (next.intervalMs ?? 0);
+    return next;
+  }
+  if (info.nextFireAt !== null && info.nextFireAt > now) {
+    next.nextFireAt = info.nextFireAt;
+    return next;
+  }
+  next.missedCount += 1;
+  pushHistory(next, {
+    at: now,
+    outcome: "missed",
+    dueAt: info.nextFireAt ?? undefined,
+    note: "归档期间已过点",
+  });
+  finish(next, "missed", now, "归档期间已过点");
+  return next;
+};
+
 // ----------------- 创建：入参校验 -----------------
 
 export interface ScheduleCreateInput {
@@ -723,6 +772,17 @@ export const isValidScheduleRecord = (raw: unknown): raw is ScheduleRecord => {
   }
   if (r.kind === "every" && !(isFiniteNum(r.intervalMs) && r.intervalMs > 0)) return false;
   if (r.maxRuns !== undefined && !isFiniteNum(r.maxRuns)) return false;
+  if (r.archiveCancelled !== undefined) {
+    const a = r.archiveCancelled as Partial<NonNullable<ScheduleRecord["archiveCancelled"]>> | null;
+    if (
+      !a ||
+      typeof a !== "object" ||
+      (a.prevStatus !== "active" && a.prevStatus !== "paused") ||
+      !(a.nextFireAt === null || isFiniteNum(a.nextFireAt))
+    ) {
+      return false;
+    }
+  }
   if (r.pending !== undefined) {
     const p = r.pending as Partial<SchedulePending> | null;
     if (!p || typeof p !== "object") return false;
@@ -845,7 +905,7 @@ export const scheduleEmptyMessage = (
   if (filter === "ongoing" && counts.finished > 0) {
     return `现在没有进行中的定时（已结束的 ${counts.finished} 条在「已结束」里）`;
   }
-  return "还没有定时。在对话里让 AI「20 分钟后帮我看下 CI」，它就会给自己设一个";
+  return "还没有定时。去对话或者工作台让 AI 建一个吧";
 };
 
 /** 一条定时的时间 / 计数描述（列表行副标题）：「下次 14:30 · 已触发 2 次」 */
@@ -1070,7 +1130,7 @@ export const buildScheduleFireMeta = (
 /** 定时相关 info 事件的 meta */
 export const buildScheduleInfoMeta = (
   scheduleId: string,
-  phase: "created" | "missed" | "failed" | "cancelled" | "archived",
+  phase: "created" | "missed" | "failed" | "cancelled" | "archived" | "restored",
 ): Record<string, unknown> => ({
   subkind: SCHEDULE_SUBKIND,
   scheduleId,

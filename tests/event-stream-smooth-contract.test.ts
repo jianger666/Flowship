@@ -180,7 +180,8 @@ describe("流式 → 定稿：同一个节点原地交接（不再卸载重挂�
   it("EventRow 的 streaming 态：同一个 MarkdownText 只切 streaming、log 头同高、流式中不挂动作条", () => {
     expect(rowsCode).toContain("streaming = false,");
     expect(rowsCode).toContain("streaming={streaming}");
-    expect(rowsCode).toContain('searchField={streaming ? "extra0" : "body"}');
+    // 搜索高亮早已走 DOM 的 CSS Highlight，<mark> 管线（searchField 等 props）已删（D3-07 / 第三轮），不再断言
+    expect(rowsCode).not.toContain("searchField=");
     expect(rowsCode).toContain("{showBody && !streaming && (");
     // 渲染 MarkdownText 的位置不依赖 streaming 条件：它在 JSX 子节点序列里的槽位固定，
     // 流式 / 定稿切换才会复用同一个实例（条件渲染会让槽位错位）

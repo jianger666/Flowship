@@ -33,6 +33,7 @@ import {
   DefaultResourceLoader,
   createAgentSession,
   SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type {
   AgentSession,
@@ -117,20 +118,32 @@ const piAgentDir = (): string => path.join(dataRoot(), "pi-agent");
  * 是唯一来源；pi 自带发现只作兜底——与 loader 同名的滤掉，防 pi 的
  * <available_skills> 块和 fe 的「## Skills」段双渲染 / 版本漂移。
  */
-const buildResourceLoader = async (cwd: string) => {
+/** @internal 导出仅供单测（验证项目目录不被信任） */
+export const buildResourceLoader = async (cwd: string) => {
   const owned = new Set(
     (await loadSkillsForTask([cwd]).catch(() => [])).map((s) => s.name),
   );
+  // 项目目录一律「不受信任」：pi 对受信项目会自动执行 `<cwd>/.pi/extensions/*.ts`
+  // （在 Flowship server 进程内、无沙箱），并用 `.pi/SYSTEM.md` 替换系统提示词、
+  // `.pi/settings.json` 追加 packages——被绑定的仓库里只要有人放一个文件就是 RCE，
+  // 不需要任何提示注入。untrusted 后只剩 agentDir（我们自己的 pi-agent 数据目录）的
+  // 全局资源；项目 skill 由上面 fe 自管 loader（含 .agents/skills）负责，不受影响。
+  // loader 与 session 必须共用同一个 settingsManager：createAgentSession 缺省会自己
+  // `SettingsManager.create(cwd, agentDir)` 出一个默认受信的，读到项目 settings。
+  const settingsManager = SettingsManager.create(cwd, piAgentDir(), {
+    projectTrusted: false,
+  });
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir: piAgentDir(),
+    settingsManager,
     skillsOverride: (base) => ({
       skills: base.skills.filter((s) => !owned.has(s.name)),
       diagnostics: base.diagnostics,
     }),
   });
   await loader.reload();
-  return loader;
+  return { resourceLoader: loader, settingsManager };
 };
 const piSessionDir = (): string => path.join(dataRoot(), "pi-sessions");
 
@@ -570,7 +583,7 @@ export const runPiSubagent = async (
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
-    resourceLoader: await buildResourceLoader(cwd),
+    ...(await buildResourceLoader(cwd)),
     modelRuntime: child.runtime,
     model: child.model,
     tools:
@@ -1054,7 +1067,7 @@ export const createCustomAgent = async (
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
-    resourceLoader: await buildResourceLoader(cwd),
+    ...(await buildResourceLoader(cwd)),
     modelRuntime: runtime,
     model,
     thinkingLevel,
@@ -1123,7 +1136,7 @@ export const resumeCustomAgent = async (
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
-    resourceLoader: await buildResourceLoader(cwd),
+    ...(await buildResourceLoader(cwd)),
     modelRuntime: runtime,
     model,
     thinkingLevel,
@@ -1146,7 +1159,7 @@ export const promptOnceCustom = async (
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
-    resourceLoader: await buildResourceLoader(cwd),
+    ...(await buildResourceLoader(cwd)),
     modelRuntime: runtime,
     model,
     thinkingLevel: "off",

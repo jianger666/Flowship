@@ -92,6 +92,56 @@ export const actionDisplayLabel = (
   return table[action.type] ?? action.type;
 };
 
+/**
+ * 事件流里「这条事件属于哪个 action」的归属标：`#2 实现`（与左栏时间线 chip 同形：`#{n} {short 标签}`）。
+ * 原来事件流只写类型（`ACTION_LABEL_SHORT[type]`）：同一 task 里两次 build 都叫「实现」、
+ * 自定义 action 一律叫「自定义」，跟时间线对不上（第二轮 review V18-01）。
+ */
+export const actionTagLabel = (action: {
+  n: number;
+  type: string;
+  customLabel?: string;
+}): string => `#${action.n} ${actionDisplayLabel(action, "short")}`;
+
+// ===========================================
+// 划除 action：能不能划 / 确认框怎么说（第二轮 review V18-02 / V18-05）
+// ===========================================
+//
+// 服务端 action-exclude 路由的行为（UI 文案必须与之同源）：
+// - action 正在运行（running）且 task 在跑 → 409「先停止再划除」
+// - action 在 awaiting_ack（交卷等你确认）且 task 在等你回答 → 会先 stop 会话、标 cancelled，再划除
+// - 其余照常划除（不删数据，恢复划除只翻 excluded）
+
+/** 这个 action 现在能不能划除；不能 → 返回原因（给按钮 Tooltip），能 → null。已划除的（= 恢复）永远可以 */
+export const getActionExcludeBlockReason = (action: {
+  status: string;
+  excluded?: boolean;
+}): string | null => {
+  if (action.excluded) return null;
+  if (action.status === "running") {
+    return "这一步还在进行中：先点顶部「停止」，停下来再划除";
+  }
+  return null;
+};
+
+/** 划除确认框的文案：交卷等你确认的那一步划除会同时结束它的收尾，不能再说「随时可恢复」就完事 */
+export const getActionExcludeConfirmCopy = (action: {
+  status: string;
+}): { description: string; confirmLabel: string } => {
+  if (action.status === "awaiting_ack") {
+    return {
+      description:
+        "它正在等你确认：划除会同时结束这一步的收尾（会话关闭、待确认的提问作废），之后恢复划除也不会让它继续。后续推进 / 接力不再参考它，已有数据不删。",
+      confirmLabel: "停止并划除",
+    };
+  }
+  return {
+    description:
+      "把这个 action 从 agent 上下文里排除（后续推进 / 接力不再参考它）。不删数据、随时可恢复。",
+    confirmLabel: "划除",
+  };
+};
+
 // ===========================================
 // V0.x：MR 目标分支 / 类型（提测 vs 联调）——前后端共用单一源
 // ===========================================
@@ -394,7 +444,10 @@ const findDuplicate = (
   const title = normalizeBatchTitle(batch.title);
   const candidate = active.find((prev) => {
     if (prev.status === "superseded") return false;
-    if (prev.rawId === batch.id) return true;
+    // 不能「rawId 相同就判重复」：追加方案时模型最自然的写法是从 b1 重新编号，
+    // 标题完全不同的新批次会被误判为「疑似重复」并排除出「全选」，build 只做旧批次、
+    // 新增需求不进 build，进度却显示 1/3（2026-10-20 第二轮 review V11-01）。
+    // 重复只看标题（归一后互相包含）；同 rawId 的区分由 effectiveId（带 plan action id）保证。
     if (!title) return false;
     const prevTitle = normalizeBatchTitle(prev.title);
     return !!prevTitle && (prevTitle.includes(title) || title.includes(prevTitle));
@@ -464,7 +517,11 @@ const isBuildDoneStatus = (status: ActionStatus): boolean =>
  * - 新 replan 通过 action.replanMode 决定 append / rebuild；
  * - build.requestedBatchIds 新写 effectiveId，旧裸 id 在唯一匹配时兼容。
  */
-export const deriveEffectiveBatches = (task: Task): EffectiveBatchesResult => {
+// 参数只取 actions：调用方（task 详情页的 useMemo）可以只依赖 task.actions，
+// 事件追加让 task 换引用时不必重算（V11-07）。函数体里确实只读 task.actions。
+export const deriveEffectiveBatches = (
+  task: Pick<Task, "actions">,
+): EffectiveBatchesResult => {
   const plans = task.actions.filter(isPlanWithBatches);
   if (plans.length === 0) {
     return { batches: [], superseded: [], builtIds: new Set() };

@@ -24,6 +24,9 @@ import {
 } from "./data-root";
 import { emptyCompanyEnv, isBlankCompanyEnvRow, normalizeCompanyEnv } from "../company-env";
 import { sanitizeRepoShellCommand } from "../repo-shell-command";
+import { hasUrlUserinfo } from "../custom-provider-url";
+import { firstNonLocalRepoPath } from "../unc-path";
+import { normalizeMergedSettingsForPatch } from "../settings-legacy";
 import type { FeAiFlowSettings } from "../types";
 
 export const settingsFilePath = (): string => path.join(dataRoot(), "config.json");
@@ -636,42 +639,175 @@ const backupSettingsOnShrink = async (
  * 落盘次序（都在同一把写锁内）：判定收缩 → 收缩则先写 `.bak.shrink` → 再滚 `.bak` → 最后写 config.json。
  * 任一备份失败只 warn；主写失败时两份备份都已是覆盖前的配置、config.json 仍是原样。
  */
-export const putSettingsFile = async (
-  incoming: Record<string, unknown>,
-): Promise<
+type PutSettingsFileResult =
   | {
       status: "ok";
       settings: Record<string, unknown>;
       previous: Record<string, unknown> | null;
     }
-  | { status: "unreadable"; reason: string }
-> =>
+  | { status: "unreadable"; reason: string };
+
+/** 写锁内的整对象写：校验 → 读盘 → 掩码兜底 → 收缩备份 / .bak → 原子写（PUT 与 PATCH 共用） */
+const putSettingsFileLocked = async (
+  incoming: Record<string, unknown>,
+): Promise<PutSettingsFileResult> => {
+  // route 已前置校验；这里是唯一落盘入口上的兜底——日后别的调用方绕过 route 也写不进 `{}` / `[]`
+  const invalid = validateSettingsPayload(incoming);
+  if (invalid) throw new Error(invalid);
+  const currentResult = await readSettingsFile();
+  if (currentResult.status === "error") {
+    // 损坏 / 读不了：在备份之前就返回——坏文件既不会被覆盖、也不会顶掉一份好的 .bak
+    return { status: "unreadable" as const, reason: currentResult.reason };
+  }
+  const previous =
+    currentResult.status === "ok" ? currentResult.settings : null;
+  const { settings } = preserveSecretsOnPut(incoming, previous);
+  sanitizeSettingsReposShellCommands(settings);
+  if (previous) {
+    // 收缩判定用掩码合并 + 净化后的 settings（见 shrunkSettingsKeys）；先写 .bak.shrink、再滚 .bak
+    const shrunk = shrunkSettingsKeys(previous, settings);
+    if (shrunk.length > 0) await backupSettingsOnShrink(previous, shrunk);
+    // 覆盖前先留一份：误写（客户端 bug / 手滑）之后还有路可以找回 API key 和仓库配置
+    await backupSettingsBeforeOverwrite(previous);
+  }
+  // 直接写盘、不走 writeSettingsFileAtomic（避免同链嵌套死锁）
+  await writePrivateFileAtomic(
+    settingsFilePath(),
+    JSON.stringify(settings, null, 2),
+  );
+  return { status: "ok" as const, settings, previous };
+};
+
+export const putSettingsFile = async (
+  incoming: Record<string, unknown>,
+): Promise<PutSettingsFileResult> =>
+  withSettingsWriteLock(() => putSettingsFileLocked(incoming));
+
+/** PATCH 不能碰的键名（原型污染） */
+const FORBIDDEN_PATCH_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * 校验字段级补丁体：`{ patch: { key: value… }, remove?: string[] }`，patch / remove 至少有一个非空。
+ * 返回错误文案或 null。
+ */
+export const validateSettingsPatch = (body: unknown): string | null => {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return "补丁必须是对象 { patch, remove? }";
+  }
+  const { patch, remove } = body as { patch?: unknown; remove?: unknown };
+  if (
+    patch !== undefined &&
+    (typeof patch !== "object" || patch === null || Array.isArray(patch))
+  ) {
+    return "patch 必须是对象";
+  }
+  if (
+    remove !== undefined &&
+    (!Array.isArray(remove) || remove.some((k) => typeof k !== "string"))
+  ) {
+    return "remove 必须是字符串数组";
+  }
+  const patchKeys = patch ? Object.keys(patch) : [];
+  const removeKeys = (remove as string[] | undefined) ?? [];
+  if (patchKeys.length + removeKeys.length === 0) return "补丁为空";
+  if (patch && Object.prototype.hasOwnProperty.call(patch, "customProviders")) {
+    const bad = validateCustomProvidersInput((patch as Record<string, unknown>).customProviders);
+    if (bad) return bad;
+  }
+  for (const k of [...patchKeys, ...removeKeys]) {
+    if (FORBIDDEN_PATCH_KEYS.has(k)) return `不允许的字段名：${k}`;
+  }
+  // apiKey / defaultModel / repos 是「完整配置」的必备三项：可以改值（清 key = 空串），不能整键删除
+  for (const k of removeKeys) {
+    if (k === "apiKey" || k === "defaultModel" || k === "repos") {
+      return `不能删除必备字段：${k}`;
+    }
+  }
+  return null;
+};
+
+/**
+ * 本次**写入**的 customProviders 里有没有地址带用户名 / 密码的条目（第四轮 Q2-06）：有 → 返回给用户看的原因。
+ * 之前「拒收」只是设置页的红字，服务端照存；含 userinfo 的地址 Node fetch 会直接抛错并把整串（含密钥）回显到页面 / 日志。
+ * 只校验**调用方这次要写的值**（PUT 的整包 / PATCH 里的 customProviders），不校验合并后的盘上内容——
+ * 否则盘上已有的旧坏条目会让用户改任何无关开关都被 400 挡住。文案只点名提供方显示名、绝不回显地址。
+ */
+export const validateCustomProvidersInput = (value: unknown): string | null => {
+  if (!Array.isArray(value)) return null;
+  for (const row of value) {
+    if (!row || typeof row !== "object") continue;
+    const { baseUrl, name } = row as { baseUrl?: unknown; name?: unknown };
+    if (typeof baseUrl === "string" && hasUrlUserinfo(baseUrl)) {
+      const label = typeof name === "string" && name.trim() ? `「${name.trim()}」` : "";
+      return `提供方${label}的接口地址里带了用户名 / 密码：请把密钥填到 API Key，不要写进地址（已拒绝保存）`;
+    }
+  }
+  return null;
+};
+
+/**
+ * 本次**写入**的 repos 里有没有「新加的」UNC / WSL / 非本机磁盘路径（第五轮 Q4-01 服务端兜底）：有 → 返回给用户看的原因。
+ * 设置页登记仓库时已经在前端拒收，但 API 谁都能调（脚本 / 旧页面 / 手改请求），不挡的话这类路径会躺进 config.json，
+ * 之后 repo-branches / 建任务都 400、被前端吞成「非 git 仓库」。
+ * 只拒**盘上原本没有的**路径：旧配置里已经存在的 UNC 仓库（升级前登记的）仍随整包 PUT 原样带回——
+ * 逐条校验会让用户改任何无关开关都被 400 挡住（与 {@link validateCustomProvidersInput} 同口径），也保留用户自己删掉它的路。
+ * @param incoming 这次要写的 repos 值（PUT 整包里的 repos / PATCH 的 patch.repos）；不是数组 → 不校验（交给其它校验）
+ * @param existing 盘上当前的 repos（读失败 / 没有就传 undefined = 全部视为新增）
+ */
+export const validateNewRepoPaths = (
+  incoming: unknown,
+  existing: unknown,
+  platform: string = process.platform,
+): string | null => {
+  if (!Array.isArray(incoming)) return null;
+  const known = new Set<string>();
+  if (Array.isArray(existing)) {
+    for (const r of existing) {
+      const p = (r as { path?: unknown } | null)?.path;
+      if (typeof p === "string") known.add(p);
+    }
+  }
+  const added: string[] = [];
+  for (const r of incoming) {
+    const p = (r as { path?: unknown } | null)?.path;
+    if (typeof p === "string" && !known.has(p)) added.push(p);
+  }
+  return firstNonLocalRepoPath(added, platform)?.reason ?? null;
+};
+
+/**
+ * 字段级补丁（第三轮 D1-01）：在**同一把写锁内**读盘 → 只替换补丁里的键 → 走与 PUT 完全相同的
+ * 校验 / 掩码兜底 / 收缩备份 / `.bak` / 原子写。
+ *
+ * 为什么不是整对象 PUT：客户端缓存可能早已陈旧（浏览器标签 / 带外恢复 config.json），整包 PUT 会把别处
+ * 刚改的 key 轮换、仓库删除整体还原。补丁只动本次改的字段，其余以盘上最新为准。
+ * 盘上没有 config.json（missing）→ 拒绝：补丁没有「基线」可言，让客户端先完成初始化。
+ */
+export const patchSettingsFile = async (args: {
+  patch?: Record<string, unknown>;
+  remove?: readonly string[];
+}): Promise<PutSettingsFileResult | { status: "missing" }> =>
   withSettingsWriteLock(async () => {
-    // route 已前置校验；这里是唯一落盘入口上的兜底——日后别的调用方绕过 route 也写不进 `{}` / `[]`
-    const invalid = validateSettingsPayload(incoming);
-    if (invalid) throw new Error(invalid);
-    const currentResult = await readSettingsFile();
-    if (currentResult.status === "error") {
-      // 损坏 / 读不了：在备份之前就返回——坏文件既不会被覆盖、也不会顶掉一份好的 .bak
-      return { status: "unreadable" as const, reason: currentResult.reason };
+    const current = await readSettingsFile();
+    if (current.status === "error") {
+      return { status: "unreadable" as const, reason: current.reason };
     }
-    const previous =
-      currentResult.status === "ok" ? currentResult.settings : null;
-    const { settings } = preserveSecretsOnPut(incoming, previous);
-    sanitizeSettingsReposShellCommands(settings);
-    if (previous) {
-      // 收缩判定用掩码合并 + 净化后的 settings（见 shrunkSettingsKeys）；先写 .bak.shrink、再滚 .bak
-      const shrunk = shrunkSettingsKeys(previous, settings);
-      if (shrunk.length > 0) await backupSettingsOnShrink(previous, shrunk);
-      // 覆盖前先留一份：误写（客户端 bug / 手滑）之后还有路可以找回 API key 和仓库配置
-      await backupSettingsBeforeOverwrite(previous);
-    }
-    // 直接写盘、不走 writeSettingsFileAtomic（避免同链嵌套死锁）
-    await writePrivateFileAtomic(
-      settingsFilePath(),
-      JSON.stringify(settings, null, 2),
+    if (current.status !== "ok") return { status: "missing" as const };
+    const merged: Record<string, unknown> = { ...current.settings };
+    for (const [k, v] of Object.entries(args.patch ?? {})) merged[k] = v;
+    for (const k of args.remove ?? []) delete merged[k];
+    // 合并后先按客户端 normalizeSettings 同口径补全 / 升级，再走与 PUT 相同的校验：
+    // ① 盘上缺 apiKey / defaultModel / repos 之一（或 defaultModel 是旧字符串）不再让每次保存恒 400（Q2-03；
+    //    旧整包 PUT 因客户端发全字段而自愈）；② 退役键 / 旧单槽 customProvider 在这里清掉、升级，
+    //    删光提供方后旧单槽不「复活」（Q2-05）
+    return putSettingsFileLocked(
+      normalizeMergedSettingsForPatch(merged, {
+        touchedKeys: new Set([...Object.keys(args.patch ?? {}), ...(args.remove ?? [])]),
+        customProvidersExplicit:
+          Object.prototype.hasOwnProperty.call(args.patch ?? {}, "customProviders") ||
+          (args.remove ?? []).includes("customProviders"),
+      }),
     );
-    return { status: "ok" as const, settings, previous };
   });
 
 /**

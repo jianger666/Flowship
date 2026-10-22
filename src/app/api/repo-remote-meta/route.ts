@@ -16,6 +16,7 @@ import {
   deriveProjectPathFromRepo,
 } from "@/lib/server/submit-mr-guard";
 import { errorResponse } from "@/lib/server/route-helpers";
+import { nonLocalPathReason } from "@/lib/unc-path";
 
 export const runtime = "nodejs";
 
@@ -33,6 +34,13 @@ export const GET = async (req: Request): Promise<Response> => {
     : multi;
   if (paths.length === 0) {
     return errorResponse("缺少 path 或 paths 参数", 400);
+  }
+  // UNC / 非本机磁盘形态：任何一个都整体 400、一个仓都不探测（R12-01）。
+  // 这个 GET 渲染层一行 `![](/api/repo-remote-meta?path=//host/share)` 就能触发，
+  // 下面的 `git config` 以该路径为 cwd，Windows 上会连 SMB 并带 NTLM 凭据
+  for (const p of paths) {
+    const nonLocal = nonLocalPathReason(p);
+    if (nonLocal) return errorResponse(nonLocal, 400);
   }
   // 脚本仓排除集（client 传 task.scriptRepoPaths 快照、与 server resolveEffectiveGitHost 同口径）
   const scriptPaths = new Set(

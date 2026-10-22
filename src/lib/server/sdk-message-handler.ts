@@ -21,6 +21,7 @@ import {
   extractSubagentCallArgs,
   toSubagentDisplayCall,
   toWaitDisplayCall,
+  type SubagentDisplayLookup,
 } from "@/lib/cursor-subagent-display";
 import { appendThinkingText } from "@/lib/thinking-live";
 
@@ -114,6 +115,11 @@ export interface AssistantBufferCtx {
     id: string;
     params?: Array<{ id: string; value: string }>;
   };
+  /**
+   * 同源的同步查表函数（该模型的默认 effort、resume 子代理当初用的模型）：显式指定了别的模型但没写 effort、
+   * 或 resume 接着之前的子代理时，徽标靠它补上实际生效的值。没有 = 这两种卡片保持原始入参、不补。
+   */
+  subagentDisplayLookup?: SubagentDisplayLookup;
   sdkErrorMessage?: string;
   /** 本回合已交卷成功：之后模型输出（答案）照常广播、固定收尾延到 run 结束 */
   submitSeen?: boolean;
@@ -234,6 +240,46 @@ const TASK_TOOL_ARGS_TRUNCATE_MAX = 2000;
  */
 const TODO_TOOL_ARGS_TRUNCATE_MAX = 4000;
 
+/**
+ * shell / write / edit 的 args 上限（V4-01）。默认 500 对这三个工具太小：
+ * 真实数据里 30% 的 shell 调用（heredoc 脚本、长 git commit -m、curl -d）超过 500，
+ * 截断后整段 JSON parse 不了，界面与 events.jsonl 都找不到命令本体。
+ * 与前端 tool-display 的 `SHELL_DETAIL_CLIP_MAX` 同值。
+ * 代价：events.jsonl 估算增 ~3%（见汇报；单条上限 4000 字符、不影响 text 的 120 截断）。
+ */
+const BIG_ARGS_TOOL_TRUNCATE_MAX = 4000;
+
+const ARGS_PATH_KEYS = ["path", "file_path", "target_file", "filePath"] as const;
+
+/**
+ * 这三个工具要「关键字段前置」：命令 / 路径是摘要行与展开区的主角，
+ * 但 SDK 原始键序里它常排在长字段后面（真实数据 write 有 77% 是 content 在前、path 在后），
+ * 长字段一占满截断窗口，关键字段就被永久截掉。
+ */
+const BIG_ARGS_KEY_FIELDS: ReadonlyMap<string, readonly string[]> = new Map<
+  string,
+  readonly string[]
+>([
+  ["shell", ["command", "cmd"]],
+  ["write", ARGS_PATH_KEYS],
+  ["edit", ARGS_PATH_KEYS],
+]);
+
+/** 把 keys 里存在的字段挪到最前（其余键相对顺序不变）；非对象 / 没有命中的键原样返回 */
+const frontLoadArgKeys = (args: unknown, keys: readonly string[]): unknown => {
+  if (args == null || typeof args !== "object" || Array.isArray(args)) {
+    return args;
+  }
+  const raw = args as Record<string, unknown>;
+  const head: Record<string, unknown> = {};
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(raw, k)) head[k] = raw[k];
+  }
+  if (Object.keys(head).length === 0) return args;
+  // 展开后 head 里的键保持在前（同名键只改值、不改位置），其余键沿用原顺序
+  return { ...head, ...raw };
+};
+
 /** updateTodos / update_todos（大小写不敏感） */
 const isUpdateTodosToolName = (name: string): boolean => {
   const n = name.toLowerCase();
@@ -246,6 +292,7 @@ const isUpdateTodosToolName = (name: string): boolean => {
  * 默认 truncate(500) 会把尾部 model / effort 永久截掉 → 前端徽标永远拿不到。
  *
  * updateTodos：放大截断上限（见 TODO_TOOL_ARGS_TRUNCATE_MAX）。
+ * shell / write / edit：关键字段（命令 / 路径）前置 + 上限 4000（见 BIG_ARGS_TOOL_TRUNCATE_MAX）。
  */
 const stringifyToolCallArgs = (
   name: string,
@@ -278,6 +325,14 @@ const stringifyToolCallArgs = (
     return {
       argsStr: stringifyMeta(args),
       truncateMax: TODO_TOOL_ARGS_TRUNCATE_MAX,
+    };
+  }
+  // shell / write / edit：命令 / 路径前置 + 放大上限
+  const keyFields = BIG_ARGS_KEY_FIELDS.get(name.toLowerCase());
+  if (keyFields) {
+    return {
+      argsStr: stringifyMeta(frontLoadArgKeys(args, keyFields)),
+      truncateMax: BIG_ARGS_TOOL_TRUNCATE_MAX,
     };
   }
   return { argsStr: stringifyMeta(args), truncateMax: 500 };
@@ -654,6 +709,7 @@ export const handleSdkMessage = async (
       ? toWaitDisplayCall(
           toSubagentDisplayCall(rawMsg, {
             parentModel: assistantCtx.subagentParentModel,
+            ...assistantCtx.subagentDisplayLookup,
           }),
         )
       : rawMsg;

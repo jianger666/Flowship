@@ -232,3 +232,149 @@ describe("toSubagentDisplayCall · 徽标显示实际生效的模型 / 思考档
     expect(toSubagentDisplayCall(shell, { parentModel: PARENT })).toBe(shell);
   });
 });
+
+describe("toSubagentDisplayCall · 默认档与 resume 的徽标", () => {
+  const PARENT = {
+    id: "gemini-4-argon",
+    params: [{ id: "reasoning_effort", value: "high" }],
+  };
+  // 2026-10-19 真实 Cursor 清单：sonnet-5-5 默认 high、gemini-4-argon 默认 medium
+  const DEFAULTS: Record<string, string> = {
+    "claude-sonnet-5-5": "high",
+    "gemini-4-argon": "medium",
+  };
+  const defaultEffortOf = (id: string) => DEFAULTS[id.toLowerCase()];
+  const call = (inner: Record<string, unknown>) => ({
+    ...running,
+    args: { ...running.args, args: inner },
+  });
+  const badge = (
+    inner: Record<string, unknown>,
+    ctx: Parameters<typeof toSubagentDisplayCall>[1],
+  ) => toSubagentDisplayCall(call(inner), ctx).args as Record<string, unknown>;
+
+  it("显式写了别的模型、没写 effort：显示该模型清单里的默认档（不套父会话的 high）", () => {
+    const out = badge(
+      { prompt: "p", model: "claude-sonnet-5-5", subagentType: "explore" },
+      { parentModel: PARENT, defaultEffortOf },
+    );
+    expect(out).toMatchObject({ model: "claude-sonnet-5-5", effort: "high" });
+    // 另一个模型就用它自己的默认档，证明不是写死 / 不是抄父会话
+    expect(
+      badge({ prompt: "p", model: "gemini-4-argon" }, { defaultEffortOf }),
+    ).toMatchObject({ effort: "medium" });
+  });
+
+  it("没有父模型也能补默认档（显式模型不依赖父会话）", () => {
+    expect(
+      badge({ prompt: "p", model: "claude-sonnet-5-5" }, { defaultEffortOf }),
+    ).toMatchObject({ model: "claude-sonnet-5-5", effort: "high" });
+  });
+
+  it("effort=default / 空白也算没写：补默认档", () => {
+    for (const effort of ["default", "  ", "DEFAULT"]) {
+      expect(
+        badge({ prompt: "p", model: "claude-sonnet-5-5", effort }, { defaultEffortOf }),
+      ).toMatchObject({ effort: "high" });
+    }
+  });
+
+  it("显式写了 effort：原样，不被默认档覆盖", () => {
+    expect(
+      badge(
+        { prompt: "p", model: "claude-sonnet-5-5", effort: "xhigh" },
+        { parentModel: PARENT, defaultEffortOf },
+      ),
+    ).toMatchObject({ effort: "xhigh" });
+  });
+
+  it("沿用父会话：父会话当前档优先；父会话参数里没有档位才退到父模型的默认档", () => {
+    expect(
+      badge({ prompt: "p" }, { parentModel: PARENT, defaultEffortOf }),
+    ).toMatchObject({ model: "gemini-4-argon", effort: "high" });
+    expect(
+      badge(
+        { prompt: "p" },
+        { parentModel: { id: "gemini-4-argon" }, defaultEffortOf },
+      ),
+    ).toMatchObject({ model: "gemini-4-argon", effort: "medium" });
+  });
+
+  it("清单里没有 / 没标默认档 / 模型是 list：不硬造 effort", () => {
+    const unknown = badge(
+      { prompt: "p", model: "composer-2.5" },
+      { parentModel: PARENT, defaultEffortOf },
+    );
+    expect(unknown.model).toBe("composer-2.5");
+    expect(unknown).not.toHaveProperty("effort");
+    expect(
+      badge({ prompt: "p", model: "list" }, { defaultEffortOf }),
+    ).not.toHaveProperty("effort");
+  });
+
+  it("沿用但不知道父模型：model 保持原样、也不去查默认档", () => {
+    const seen: string[] = [];
+    const out = badge(
+      { prompt: "p", model: "inherit" },
+      {
+        defaultEffortOf: (id) => {
+          seen.push(id);
+          return "high";
+        },
+      },
+    );
+    expect(out).toEqual({ prompt: "p", model: "inherit" });
+    expect(seen).toEqual([]);
+  });
+
+  it("resume：模型 / effort 取当初那个子代理的；resume 字段与其它入参保留", () => {
+    const resumedChildOf = (id: string) =>
+      id === "agent-1" ? { model: "claude-sonnet-5-5", effort: "high" } : undefined;
+    const out = badge(
+      { description: "d", prompt: "p", resume: " agent-1 " },
+      { parentModel: PARENT, defaultEffortOf, resumedChildOf },
+    );
+    expect(out).toEqual({
+      description: "d",
+      prompt: "p",
+      resume: " agent-1 ",
+      model: "claude-sonnet-5-5",
+      effort: "high",
+    });
+  });
+
+  it("resume：登记表里查不到（应用重启后）/ 没有 resumedChildOf → 原样不改写，不硬造", () => {
+    const raw = { prompt: "p", resume: "agent-gone" };
+    expect(
+      badge(raw, { parentModel: PARENT, defaultEffortOf, resumedChildOf: () => undefined }),
+    ).toEqual(raw);
+    expect(badge(raw, { parentModel: PARENT, defaultEffortOf })).toEqual(raw);
+    expect(
+      badge(raw, { resumedChildOf: () => ({}) }),
+    ).toEqual(raw);
+  });
+
+  it("resume：只有 model 没有 effort 也只补 model，不抄父会话的档位", () => {
+    const out = badge(
+      { prompt: "p", resume: "a" },
+      { parentModel: PARENT, resumedChildOf: () => ({ model: "composer-2.5" }) },
+    );
+    expect(out).toMatchObject({ model: "composer-2.5" });
+    expect(out).not.toHaveProperty("effort");
+  });
+
+  it("只给查表函数、没有 parentModel 也会走改写（不是只在有父模型时才生效）", () => {
+    const out = badge(
+      { prompt: "p", resume: "a" },
+      { resumedChildOf: () => ({ model: "m", effort: "low" }) },
+    );
+    expect(out).toMatchObject({ model: "m", effort: "low" });
+  });
+
+  it("只改展示副本：原消息一个字不动", () => {
+    const msg = call({ prompt: "p", model: "claude-sonnet-5-5" });
+    const snapshot = JSON.parse(JSON.stringify(msg));
+    toSubagentDisplayCall(msg, { parentModel: PARENT, defaultEffortOf });
+    expect(msg).toEqual(snapshot);
+  });
+});

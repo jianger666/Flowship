@@ -27,7 +27,7 @@ interface ComboboxProps {
   allowCustom?: boolean;
   /** 候选为空（且非 loading）时列表区提示 */
   emptyHint?: string;
-  /** trigger hover 提示（原生 title；新场景请用外层 Tooltip，不要扩大使用） */
+  /** trigger hover 提示（内部走 Tooltip，不是原生 title；R13-02） */
   title?: string;
   className?: string;
   /** 打在包 trigger 的那层。flex 行里跟固定宽 label 并排必须传 `w-auto min-w-0 flex-1` */

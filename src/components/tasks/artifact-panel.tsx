@@ -22,7 +22,7 @@
  */
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ChevronDown,
@@ -338,7 +338,7 @@ const revisionOptionLabel = (
   return time;
 };
 
-export const ArtifactPanel = ({
+const ArtifactPanelImpl = ({
   action,
   taskId,
   baseDir,
@@ -350,6 +350,8 @@ export const ArtifactPanel = ({
 }: Props) => {
   const actionTitle = formatActionTitle(action.type);
   const pathLinker = useLocalFilePathLinker(baseDir);
+  // 依赖里的 repoShortNames / onArtifactRefClick 必须由调用方稳定住（页面里是 useMemo / useCallback）：
+  // Streamdown 的 Block 比较器逐键比 components，任何一项换引用 = 整篇产物 markdown 重渲（V11-07）
   const markdownComponents = useMemo(
     () => buildMarkdownComponents(pathLinker, repoShortNames, onArtifactRefClick),
     [pathLinker, repoShortNames, onArtifactRefClick],
@@ -1288,3 +1290,7 @@ export const ArtifactPanel = ({
     </div>
   );
 };
+
+// memo：task 页面每帧 / 每条 SSE 事件都会重渲，而产物栏只关心 action / 批次 / 回调这几项。
+// 浅比较生效的前提是调用方的 props 稳定（见页面里的 useMemo / useCallback 与 task.actions 窄依赖）
+export const ArtifactPanel = memo(ArtifactPanelImpl);

@@ -11,6 +11,7 @@
  */
 
 import { pathBasename } from "@/lib/path-utils";
+import { isTaskBusy } from "@/lib/task-background";
 import type { TaskSummary } from "@/lib/types";
 
 /** 置顶组 / Home（未绑仓）/ 仓库路径 */
@@ -50,6 +51,25 @@ export const sortByStickyOrder = <T extends { id: string; updatedAt: number }>(
     if (rb == null) return -1;
     return ra - rb;
   });
+};
+
+/**
+ * 此刻能不能拿「当前列表」去对齐并持久化粘性序（2026-10-20 第二轮 review V7-08）。
+ *
+ * 冷启动时列表还没拉到（或首拉失败）→ 全量对话 id 为空；此时对齐会把 localStorage 里的粘性序
+ * 清成 []，列表到齐后只能按 pinned + updatedAt 重建，「发送才上浮、后台流式不改序」每次重启都归零。
+ * - 没 loaded：不动
+ * - loaded 但带 loadError 且列表为空：「没拉到」≠「没有对话」，不动
+ * - loaded 且无错：即使真的为空也要对齐（用户确实删光了所有对话）
+ */
+export const canReconcileChatOrder = (state: {
+  loaded: boolean;
+  loadError: string | null;
+  chatCount: number;
+}): boolean => {
+  if (!state.loaded) return false;
+  if (state.loadError && state.chatCount === 0) return false;
+  return true;
 };
 
 /**
@@ -239,22 +259,46 @@ export const buildRepoGroups = (
  * 仓组默认只展前 limit 条（其余走「展开其余 N 条」）；但**正在看的那条**若落在被收起的
  * 尾部，也得露出来——侧栏里看不到当前对话，用户就只能绕去会话管理找（2026-10-15 实测）。
  * 已展开 / 条数没超限 → 全展；limit 传 Infinity = 不限（置顶组）。
- * 露出的当前条追加在前 limit 条之后，hiddenCount 只算仍被藏起来的。
+ *
+ * 被收起的尾部里还有两类行必须露出（保持原排序位置、不改顺序），hiddenCount 只算仍被藏起来的：
+ * - 当前打开的那条（activeId）；
+ * - `alwaysShow(t)` 为真的行（V7-02，2026-10-20 第二轮 review）：转圈 / 后台子代理 / 等你回答
+ *   这些信号只画在行上，行一旦被挤出前 N 条、折进「展开其余 N 条」，信号就跟着消失。
+ *   排序来自「发送成功才上浮」——先开跑的长任务会被后发消息的对话挤到第 5 位，正是最需要被看见的那条。
+ *   谓词由调用方给（见 isSidebarAlwaysShowItem），本函数不认识任务状态。
  */
 export const pickVisibleGroupItems = <T extends { id: string }>(
   items: readonly T[],
-  opts: { limit: number; expanded: boolean; activeId?: string },
+  opts: {
+    limit: number;
+    expanded: boolean;
+    activeId?: string;
+    alwaysShow?: (item: T) => boolean;
+  },
 ): { visible: T[]; hiddenCount: number } => {
   if (opts.expanded || items.length <= opts.limit) {
     return { visible: [...items], hiddenCount: 0 };
   }
-  const head = items.slice(0, opts.limit);
-  const active = opts.activeId
-    ? items.find((t) => t.id === opts.activeId)
-    : undefined;
-  const visible = active && !head.includes(active) ? [...head, active] : head;
+  // 按原序过滤：前 limit 条 + 当前条 + 必须露出的行。不能写成「head 后面追加」，
+  // 否则第 5 位的忙行会被排到第 6 位的当前条之后，列表顺序与粘性序不一致
+  const visible = items.filter(
+    (t, i) =>
+      i < opts.limit ||
+      (opts.activeId !== undefined && t.id === opts.activeId) ||
+      opts.alwaysShow?.(t) === true,
+  );
   return { visible, hiddenCount: items.length - visible.length };
 };
+
+/**
+ * 侧栏仓组里「不许被折叠」的行：AI 在跑 / 后台子代理在跑 / 有未答的提问。
+ * 与行首指示（task-list-item 的 LeadingIndicator）同一套判定——转圈用 isTaskBusy，
+ * 「等你回答」看 hasPendingAsk——折叠不能比指示灯更晚知道「这行有事」。
+ * 空闲 / 出错不算：全都算的话折叠就形同虚设。
+ */
+export const isSidebarAlwaysShowItem = (
+  t: Pick<TaskSummary, "runStatus" | "backgroundSubagentCount" | "hasPendingAsk">,
+): boolean => isTaskBusy(t) || t.hasPendingAsk === true;
 
 /**
  * 把某行滚进可视区所需的 scrollTop 增量（纯函数，坐标同一坐标系即可）。

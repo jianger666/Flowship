@@ -14,7 +14,10 @@
 
 import type { CustomProviderFormat, ModelOption } from "@/lib/types";
 import { withCatalogEffort } from "@/lib/custom-effort";
-import { customModelListAttempts } from "@/lib/custom-provider-url";
+import {
+  customModelListAttempts,
+  redactUrlUserinfo,
+} from "@/lib/custom-provider-url";
 import {
   getModelsDevIndex,
   lookupCatalogReasoning,
@@ -104,5 +107,8 @@ export const listCustomModels = async (args: {
       lastErr = err instanceof Error ? err : new Error(String(err));
     }
   }
-  throw lastErr ?? new Error("拉取模型列表失败");
+  // 错误文案会原样进设置页红字 / toast / server 日志：地址里万一带了 userinfo（`https://user:TOKEN@host`，
+  // Node fetch 会把含密钥的整串放进异常消息）这里统一擦掉（第三轮 D1-05）
+  if (lastErr) throw new Error(redactUrlUserinfo(lastErr.message));
+  throw new Error("拉取模型列表失败");
 };

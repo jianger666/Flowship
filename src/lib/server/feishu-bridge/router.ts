@@ -15,7 +15,7 @@ import type { ModelSelection } from "@cursor/sdk";
 
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
 import { getPendingAsk } from "@/lib/server/chat-pending";
-import { createTask, listTasks } from "@/lib/server/task-fs";
+import { createTask, getTaskMeta, listTasks } from "@/lib/server/task-fs";
 import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
 import { readSettingsFile } from "@/lib/server/settings-fs";
 import { listSkillsWithSource } from "@/lib/server/app-skills";
@@ -25,9 +25,17 @@ import {
   extractInteractiveText,
   parseTextContent,
 } from "@/lib/server/route-helpers";
-import { defaultModelForProvider, isCursorProvider, type TaskSummary } from "@/lib/types";
 import {
+  defaultModelForProvider,
+  isCursorProvider,
+  type FeAiFlowSettings,
+  type TaskSummary,
+} from "@/lib/types";
+import {
+  DANGLING_TASK_PROVIDER_MESSAGE,
+  bootArgsForTask,
   findCustomProvider,
+  isTaskProviderDangling,
   migrateProviderSettings,
 } from "@/lib/agent-provider";
 
@@ -216,6 +224,8 @@ type RouterDeps = {
   rememberCardMessage: typeof rememberCardMessage;
   larkApi: typeof larkApi;
   listTasks: typeof listTasks;
+  /** 注入前读窗口 meta（取窗口所选 model / provider 算 bootArgs；轻量读、不 hydrate events） */
+  getTaskMeta: typeof getTaskMeta;
   createTask: typeof createTask;
   getPendingAsk: typeof getPendingAsk;
   handleChatReplyInject: typeof handleChatReplyInject;
@@ -235,6 +245,7 @@ let deps: RouterDeps = {
   rememberCardMessage,
   larkApi,
   listTasks,
+  getTaskMeta,
   createTask,
   getPendingAsk,
   handleChatReplyInject,
@@ -258,6 +269,7 @@ export const __setRouterDepsForTest = (
       rememberCardMessage,
       larkApi,
       listTasks,
+      getTaskMeta,
       createTask,
       getPendingAsk,
       handleChatReplyInject,
@@ -932,8 +944,17 @@ const titleFromMessage = (text: string): string => {
     : t;
 };
 
-/** 从 settings 读 bootArgs + 默认 workdir + MCP 黑名单 */
-export const loadBridgeBootContext = async (): Promise<{
+/**
+ * 从 settings 读 bootArgs + 默认 workdir + MCP 黑名单。
+ *
+ * @param task 给**已存在的窗口**取 bootArgs 时必传：模型 / 提供方跟窗口走（bootArgsForTask 口径，
+ *   与 app 输入条、定时任务一致），否则飞书注入带的是设置页默认模型——与窗口所选不一致时，
+ *   chat-inject 的 modelEquals 判「换了模型」→ 懒重启（取消在跑回合 + 上下文压成 12 轮摘要）。
+ *   不传 = 新建对话 / 命令等「还没有窗口」的场景，仍取设置页默认提供方 + 默认模型。
+ */
+export const loadBridgeBootContext = async (
+  task?: Parameters<typeof bootArgsForTask>[0],
+): Promise<{
   apiKey: string;
   model: ModelSelection;
   provider: string;
@@ -948,10 +969,20 @@ export const loadBridgeBootContext = async (): Promise<{
   const settings = {
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
     defaultModel: (raw.defaultModel as ModelSelection | undefined) ?? { id: "" },
+    provider: migrated.provider,
     customProviders: migrated.customProviders,
   };
-  const provider = migrated.provider;
-  const model = defaultModelForProvider(settings, provider);
+  // 窗口绑定的自定义提供方已被删除：拒绝（返回 null），不让 bootArgsForTask 落回 Cursor 凭据——
+  // 飞书进来的消息 / 上下文会悄悄走云端（第四轮 Q2-02；与主路径 resolveProviderIdForCreate 同口径）。
+  // 调用方想给出明确原因用 `bridgeTaskProviderDanglingReason`
+  if (task && isTaskProviderDangling(task, settings)) return null;
+  // 有窗口：provider / model 都交给 bootArgsForTask（task.model 缺失 / 空 id 时它自己回落设置页默认）；
+  // 凭据门下面仍按这里定的 provider 判（窗口绑的那家，不是设置页默认家）
+  const taskBoot = task
+    ? bootArgsForTask(task, settings as FeAiFlowSettings)
+    : null;
+  const provider = taskBoot?.providerId ?? migrated.provider;
+  const model = taskBoot?.model ?? defaultModelForProvider(settings, provider);
   const apiKey = isCursorProvider(provider)
     ? settings.apiKey
     : (findCustomProvider(settings, provider)?.apiKey ?? "");
@@ -972,6 +1003,22 @@ export const loadBridgeBootContext = async (): Promise<{
     ? raw.disabledMcpServers.filter((x): x is string => typeof x === "string")
     : [];
   return { apiKey, model, provider, repoPaths, disabledMcpServers };
+};
+
+/**
+ * 窗口绑定的提供方是否已被删（loadBridgeBootContext 因此返回 null 时，用它把「缺 Key」的泛化提示换成真正原因）。
+ * 配置读不出来 / 没传窗口 → null（不误判）。
+ */
+export const bridgeTaskProviderDanglingReason = async (
+  task?: Parameters<typeof bootArgsForTask>[0],
+): Promise<string | null> => {
+  if (!task) return null;
+  const result = await deps.readSettingsFile().catch(() => null);
+  if (!result || result.status !== "ok") return null;
+  const migrated = migrateProviderSettings(result.settings as Record<string, unknown>);
+  return isTaskProviderDangling(task, { customProviders: migrated.customProviders })
+    ? DANGLING_TASK_PROVIDER_MESSAGE
+    : null;
 };
 
 /**
@@ -1182,8 +1229,9 @@ export const routeInboundMessage = async (
     if (isGroupChatMessage(msg)) {
       const payload = await routeGroupInboundMessage(msg, {
         parseContent: parseInboundContent,
-        loadBootContext: async () => {
-          const boot = await loadBridgeBootContext();
+        // 带上目标任务：提供方 / 模型跟窗口走，别拿设置页默认模型去 resume（F2-01）
+        loadBootContext: async (task) => {
+          const boot = await loadBridgeBootContext(task);
           return boot ? { apiKey: boot.apiKey, model: boot.model } : null;
         },
       });
@@ -1389,7 +1437,10 @@ export const routeInboundMessage = async (
   await touchCurrentChatPointer(taskId);
 
   // 5) 注入
-  const boot = await loadBridgeBootContext();
+  // bootArgs 的模型要跟目标窗口走（bootArgsForTask 口径）：读不到 meta（任务刚删 / IO 异常）就退回
+  // 设置页默认——此时注入本身也会因任务不存在失败，不在这里额外拦
+  const bootTask = await deps.getTaskMeta(taskId).catch(() => null);
+  const boot = await loadBridgeBootContext(bootTask ?? undefined);
   const bootArgs = boot
     ? { apiKey: boot.apiKey, model: boot.model }
     : undefined;
@@ -1427,7 +1478,10 @@ export const routeInboundMessage = async (
   }
 
   if (!bootArgs) {
-    const error = "缺少 API Key 或默认模型，请先在设置页配置";
+    // 悬空提供方要说真话：不是「缺 Key」，而是窗口原来绑的那家被删了（回执给属主，不静默改走 Cursor）
+    const error =
+      (await bridgeTaskProviderDanglingReason(bootTask ?? undefined)) ??
+      "缺少 API Key 或默认模型，请先在设置页配置";
     await notifyOwnerError(error);
     const payload: InjectResultPayload = {
       kind: "failed",

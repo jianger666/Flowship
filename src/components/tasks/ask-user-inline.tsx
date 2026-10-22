@@ -12,13 +12,14 @@
  * - 一次问完所有问题、全答完才能提交；每题选项 ABCD / 自定义文本 / 各自贴图
  * - 「稍后再补充」：confirm 后 deferred 提交、agent 按 default 推进
  * - 提交快捷键跟设置页偏好（mod-enter 任意焦点 / enter 仅 textarea 内）
- * - 失效态（runStatus=error / idle）：显示提示 + 禁交互（不挡屏、无需 dismiss）
+ * - 失效态（runStatus=error / idle）：显示提示 + 禁交互（不挡屏、无需 dismiss）；题干折叠只读保留
+ *   （提示叫用户「AI 会读历史继续」，不能让人看不到问了什么）
  *
  * 提交成功后用接口返回的 task 收卡（完成信号由提交者发出）；SSE 仍会推
  * ask_user_reply，findPendingAskEvent 变 null 是双保险。
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AlertTriangle, Ban, Loader2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
@@ -27,13 +28,21 @@ import { ChoiceButton } from "@/components/ui/choice-button";
 import { ComposerSessionProvider } from "@/components/composer-session";
 import { RichInput } from "@/components/rich-input";
 import { cn } from "@/lib/utils";
+import { AskQuestionsReadonly } from "@/components/tasks/event-stream/ask-questions-readonly";
 import { MarkdownText } from "@/components/tasks/event-stream/rows";
+import { askDraftId, clearAskDrafts, resolveInitialAskChoice } from "@/lib/ask-draft";
 import { extractAskQuestions } from "@/lib/ask-pending";
-import { ApiRequestError } from "@/lib/task-store";
+import { loadAskChoice, saveAskChoice } from "@/lib/view-memory";
+import {
+  ASK_SUBMIT_IDLE,
+  classifyAskSubmitError,
+  reduceAskSubmit,
+} from "@/lib/ask-submit-state";
 import { useDialog } from "@/hooks/use-dialog";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { MAX_SKILL_REFS } from "@/lib/protocol-signals";
+import { resumeHintFor } from "@/lib/stop-copy";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { submitAskReply } from "@/lib/task-store";
 import type { ImagePayload } from "@/lib/task-store";
@@ -58,6 +67,9 @@ interface AnswerDraft {
   images: ImagePayload[];
   skillRefs: Array<{ name: string; absPath: string }>;
 }
+
+// 属于「别的 ask / 还没上报」时读到的空草稿表（稳定引用，免得每次 render 新建对象）
+const EMPTY_DRAFTS: Record<string, AnswerDraft> = {};
 
 // 字母前缀：A-Z、超过 26 个回退数字（选项数量不设上限、schema 已放开）
 const LETTER_PREFIX = Array.from({ length: 26 }, (_, i) =>
@@ -92,6 +104,8 @@ interface AskQuestionItemProps {
   question: AskUserQuestion;
   // 所属任务：`@` 引文件 / 粘贴落盘要用（本题输入内核透传）
   taskId: string;
+  // 所属提问：与 taskId + question.id 一起决定本题草稿位（卸载 / 重挂后靠它找回输入）
+  askId: string;
   /** 相对路径 inline code 解析基准（task cwd） */
   baseDir?: string;
   // 题号（从 1 开始展示）
@@ -112,28 +126,46 @@ interface AskQuestionItemProps {
 const AskQuestionItem = ({
   question,
   taskId,
+  askId,
   baseDir,
   index,
   submitting,
   onChange,
   onSubmitAll,
 }: AskQuestionItemProps) => {
-  // 本题选了哪个 option（undefined = 没选 / 走自定义文本）
-  const [optionId, setOptionId] = useState<string | undefined>(undefined);
   const hasOptions = !!question.options && question.options.length > 0;
-  // 自定义输入模式：没 options 的纯文本题天然常显输入框、有 options 的点「自定义回答」才切
-  const [otherMode, setOtherMode] = useState(!hasOptions);
+  // 本题草稿位：按 task + ask + 题目隔离。答题卡是事件流（虚拟列表）里的一项，上滚离开视口会被
+  // 卸载——输入态必须落到草稿 store（而不是只放组件 state），滚回来重挂时才能原样还原
+  const draftId = askDraftId(taskId, askId, question.id);
 
   // 本题输入态：跟输入条 / 推进弹窗同一套内核（`/` skill、`@` 引文件、贴图）。
   // 不给路径附件——ask-reply 通道不收 attachments（`@` 引用本身以原文进答案、agent 照样能读）。
+  // 传 draft = 复用现有草稿机制：正文进 sessionStorage、图进附件快照；挂载时自动还原。
+  // 提交成功 / ask 作废后由 lib/ask-draft 的 clearAskDrafts / pruneAskDrafts 清理。
   const rich = useRichInput({
     taskId,
+    draft: { scope: "ask", id: draftId },
     disabled: submitting,
     enablePaths: false,
     consumePendingSlash: false,
   });
   const { value: text, setValue: setText, attach, slash } = rich;
   const images = attach.images;
+
+  // 选择态初值：还原卸载前的选项 / 自定义模式（含一致性校验，见 resolveInitialAskChoice）。
+  // 必须放在 useRichInput 之后——要看恢复出来的正文 / 图来决定是否处于自定义模式
+  const [initialChoice] = useState(() =>
+    resolveInitialAskChoice(question, loadAskChoice(draftId), {
+      hasText: text.trim().length > 0,
+      hasImages: images.length > 0,
+    }),
+  );
+  // 本题选了哪个 option（undefined = 没选 / 走自定义文本）
+  const [optionId, setOptionId] = useState<string | undefined>(
+    initialChoice.optionId,
+  );
+  // 自定义输入模式：没 options 的纯文本题天然常显输入框、有 options 的点「自定义回答」才切
+  const [otherMode, setOtherMode] = useState(initialChoice.otherMode);
 
   // 仅「自定义回答」模式能带图：选固定选项（A/B/C）不带（用户拍板）。
   const inCustomMode = otherMode || !hasOptions;
@@ -172,12 +204,15 @@ const AskQuestionItem = ({
     setOptionId(optId);
     setText("");
     if (hasOptions) setOtherMode(false);
+    // 选择态直写草稿 store（卸载重挂后还原用）
+    saveAskChoice(draftId, { optionId: optId, otherMode: !hasOptions });
   };
 
   // 切到自定义模式：清 optionId、文本框出现（图保留）
   const handleEnterOther = () => {
     setOtherMode(true);
     setOptionId(undefined);
+    saveAskChoice(draftId, { optionId: undefined, otherMode: true });
   };
 
   return (
@@ -246,6 +281,7 @@ const AskQuestionItem = ({
             {...rich.bind}
             onSubmit={onSubmitAll}
             placeholder="输入你的回答…"
+            ariaLabel={`回答提问：第 ${index} 题的自定义回答`}
             disabled={submitting}
             boxHeight={ASK_INPUT_HEIGHT}
             className="bg-background"
@@ -282,29 +318,56 @@ export const AskUserInlineCard = ({
     [task.id, task.repoPaths],
   );
 
-  // 每题草稿答案（含图）、子组件上报、按 question.id 索引
-  const [drafts, setDrafts] = useState<Record<string, AnswerDraft>>({});
-  // 提交中：防双击 / 网络重发
-  const [submitting, setSubmitting] = useState(false);
-  // 投递中：首次提交的链还在送答案、本卡只读等终态。
+  // 每题草稿答案（含图）、子组件上报、按 question.id 索引，**归属某个 askId**。
+  // 子组件挂载时会立刻上报一次（含从草稿 store 还原出来的内容）；若像以前那样在 askId effect 里
+  // setDrafts({}) 清空，会把这批还原上报冲掉（effect 顺序是子先父后）——
+  // 表现为输入框里明明有字、却显示「已答 0 / N」且提交按钮灰着。所以不清空，而是按 askId 归属：
+  // 属于别的 ask 的旧上报读出来就是空。
+  const [draftState, setDraftState] = useState<{
+    askId: string | null;
+    byQuestion: Record<string, AnswerDraft>;
+  }>({ askId: null, byQuestion: {} });
+  const drafts = draftState.askId === askId ? draftState.byQuestion : EMPTY_DRAFTS;
+  // 提交态：submitting = 请求在飞（防双击 / 网络重发）；
+  // inFlight = 投递中：首次提交的链还在送答案、本卡只读等终态。
   // 30s 只切只读、不 abort——abort 会让用户以为失败，服务端却可能还在结束上一轮。
-  const [inFlight, setInFlight] = useState(false);
+  // 两个量收进同一个 reducer 一起迁（lib/ask-submit-state）：失败时漏清 inFlight 就是 D7-01。
+  const [{ submitting, inFlight }, dispatchSubmit] = useReducer(
+    reduceAskSubmit,
+    ASK_SUBMIT_IDLE,
+  );
   // agent 已断（runStatus=error）：这组 ask 送不达、禁交互 + 引导用输入条唤醒
   const isDisconnected = task.runStatus === "error";
   // 24h 硬超时后 run 归 idle，SSE 还没把过期标记推到时先把表单收掉，别 Amber 假等
   const isExpiredIdle = task.runStatus === "idle";
   const isStale = isDisconnected || isExpiredIdle;
 
-  // askId 切换时清状态；子组件靠 key remount 各自重置
-  useEffect(() => {
-    setDrafts({});
-    setSubmitting(false);
-    setInFlight(false);
-  }, [askId]);
-
-  const handleDraftChange = useCallback((qid: string, draft: AnswerDraft) => {
-    setDrafts((prev) => ({ ...prev, [qid]: draft }));
+  // 投递中的 90s 兜底解锁 timer：单独存 ref，失败 / 成功 / 重新进入投递 / 换 ask 时都要清——
+  // 否则上一次尝试遗留的 timer 会在下一次提交的途中误把 inFlight 放掉（D7-01）
+  const inFlightUnlockTimerRef = useRef<number | null>(null);
+  const clearInFlightUnlockTimer = useCallback(() => {
+    if (inFlightUnlockTimerRef.current !== null) {
+      window.clearTimeout(inFlightUnlockTimerRef.current);
+      inFlightUnlockTimerRef.current = null;
+    }
   }, []);
+
+  // askId 切换时清提交态；子组件靠 key remount 各自重置（输入草稿按 askId 隔离、不在这里清）
+  useEffect(() => {
+    dispatchSubmit({ type: "reset" });
+    clearInFlightUnlockTimer();
+  }, [askId, clearInFlightUnlockTimer]);
+
+  const handleDraftChange = useCallback(
+    (qid: string, draft: AnswerDraft) => {
+      setDraftState((prev) =>
+        prev.askId === askId
+          ? { askId, byQuestion: { ...prev.byQuestion, [qid]: draft } }
+          : { askId, byQuestion: { [qid]: draft } },
+      );
+    },
+    [askId],
+  );
 
   const answeredCount = useMemo(
     () => questions.filter((q) => isDraftAnswered(drafts[q.id])).length,
@@ -314,7 +377,7 @@ export const AskUserInlineCard = ({
 
   // 网断时 fetch 可能挂很久不 reject，按钮会永久「提交中…」——超时改切投递中只读，不掐请求
   const SUBMIT_IN_FLIGHT_HINT_MS = 30_000;
-  // 提交成功/超时的 setTimeout：卸载时清掉，避免卸载后 setSubmitting（审查）
+  // 提交成功/超时的 setTimeout：卸载时清掉，避免卸载后 dispatch（审查）
   const submitTimersRef = useRef<number[]>([]);
   const trackTimer = (id: number) => {
     submitTimersRef.current.push(id);
@@ -328,17 +391,22 @@ export const AskUserInlineCard = ({
     () => () => {
       for (const t of submitTimersRef.current) window.clearTimeout(t);
       submitTimersRef.current = [];
+      clearInFlightUnlockTimer();
     },
-    [],
+    [clearInFlightUnlockTimer],
   );
 
   // 投递中只读：首次提交还在飞（或撞上另一条链的 409）。90s 兑底解锁防事件丢失卡死
   const IN_FLIGHT_UNLOCK_MS = 90_000;
-  const markInFlight = () => {
-    setSubmitting(false);
-    setInFlight(true);
+  const markInFlight = (type: "slow" | "conflict") => {
+    dispatchSubmit({ type });
     toast.info("你的回答已在投递中，请勿重复提交，完成后会自动收起");
-    trackTimer(window.setTimeout(() => setInFlight(false), IN_FLIGHT_UNLOCK_MS));
+    // 重新进入投递：先清上一次遗留的兜底 timer，再起新的（只留一个）
+    clearInFlightUnlockTimer();
+    inFlightUnlockTimerRef.current = window.setTimeout(() => {
+      inFlightUnlockTimerRef.current = null;
+      dispatchSubmit({ type: "fallback_unlock" });
+    }, IN_FLIGHT_UNLOCK_MS);
   };
 
   const applyAskSuccess = (result: {
@@ -348,22 +416,32 @@ export const AskUserInlineCard = ({
     if (result.persistWarning) {
       toast.error(`消息已送达但记录保存失败：${result.persistWarning}`);
     }
+    // 提交成功（含「稍后再补充」）：这张卡的草稿（正文 / 图 / 选择态）用完即清，
+    // 否则同 askId 的卡之后再挂载会把已提交的内容又还原出来
+    if (askId) clearAskDrafts(task.id, askId);
     // 提交者带回的 task 含 ask_user_reply → findPendingAskEvent 立刻变 null、切回放
     if (result.task) onTaskUpdate?.(result.task);
-    setSubmitting(false);
-    setInFlight(false);
+    clearInFlightUnlockTimer();
+    dispatchSubmit({ type: "succeeded" });
   };
 
-  const handleAskInFlightError = (err: unknown): boolean => {
-    if (
-      err instanceof ApiRequestError &&
-      err.status === 409 &&
-      err.code === "ask_in_flight"
-    ) {
-      markInFlight();
-      return true;
+  /**
+   * 提交失败的统一出口（handleSubmit / handleDefer 共用）：
+   * - 409 ask_in_flight：另一条链在送同一份答案 → 转投递中只读等终态，不报错；
+   * - 其余失败：答案没送达 → 回到可提交（submitting / inFlight 一起清，含「>30s 转投递中」之后才失败的情形）、
+   *   清 90s 兜底 timer、toast 明说可重新提交（D7-01）；
+   * - 服务端终态拒绝（404 / 409 已回答 / 已跳过 / 已过期，kind=rejected）：toast 只写服务端原文、
+   *   不再叫用户「可重新提交」（Q6-18，文案见 classifyAskSubmitError）。
+   */
+  const handleAskSubmitError = (err: unknown) => {
+    const plan = classifyAskSubmitError(err);
+    if (plan.kind === "in_flight") {
+      markInFlight("conflict");
+      return;
     }
-    return false;
+    clearInFlightUnlockTimer();
+    dispatchSubmit({ type: "failed" });
+    toast.error(plan.message);
   };
 
   const handleSubmit = async () => {
@@ -388,10 +466,10 @@ export const AskUserInlineCard = ({
     }
     // 各题 `/` 引用的 skill 合并去重（一次 ask-reply 只发一条消息、指引拼一份就够）
     const skillRefs = mergeSkillRefs(questions.map((q) => drafts[q.id]));
-    setSubmitting(true);
+    dispatchSubmit({ type: "start" });
     // 超过 30s 只切「投递中」，不 abort——服务端可能还在结束提问后没停的那一轮
     const hintTimer = trackTimer(
-      window.setTimeout(() => markInFlight(), SUBMIT_IN_FLIGHT_HINT_MS),
+      window.setTimeout(() => markInFlight("slow"), SUBMIT_IN_FLIGHT_HINT_MS),
     );
     try {
       const askResult = await submitAskReply(task, askId, answers, {
@@ -402,9 +480,7 @@ export const AskUserInlineCard = ({
       applyAskSuccess(askResult);
     } catch (err) {
       clearTrackedTimer(hintTimer);
-      if (handleAskInFlightError(err)) return;
-      toast.error(err instanceof Error ? err.message : String(err));
-      setSubmitting(false);
+      handleAskSubmitError(err);
     }
   };
 
@@ -419,9 +495,9 @@ export const AskUserInlineCard = ({
       cancelLabel: "回去答题",
     });
     if (!ok) return;
-    setSubmitting(true);
+    dispatchSubmit({ type: "start" });
     const hintTimer = trackTimer(
-      window.setTimeout(() => markInFlight(), SUBMIT_IN_FLIGHT_HINT_MS),
+      window.setTimeout(() => markInFlight("slow"), SUBMIT_IN_FLIGHT_HINT_MS),
     );
     try {
       const deferResult = await submitAskReply(task, askId, [], {
@@ -431,9 +507,7 @@ export const AskUserInlineCard = ({
       applyAskSuccess(deferResult);
     } catch (err) {
       clearTrackedTimer(hintTimer);
-      if (handleAskInFlightError(err)) return;
-      toast.error(err instanceof Error ? err.message : String(err));
-      setSubmitting(false);
+      handleAskSubmitError(err);
     }
   };
 
@@ -495,17 +569,26 @@ export const AskUserInlineCard = ({
       )}
 
       {isStale ? (
-        // 失效态：不挡屏、无需 dismiss——提示后用户直接用底部输入条继续即可
-        <div className="flex items-start gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-          {isDisconnected ? (
-            <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
-          ) : (
-            <Ban className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-          )}
-          {isDisconnected
-            ? "Agent 已断开、这组问题暂时送不达。在底部输入条说句话即可唤醒当前阶段、AI 会接着读历史（含这组问题）继续。"
-            : "这组提问已过期。在下方继续即可。"}
-        </div>
+        // 失效态：不挡屏、无需 dismiss——提示后用户直接用底部输入条继续即可。
+        // 提示叫用户「AI 会读历史（含这组问题）继续」，所以题干必须还看得到（V6-01）：
+        // 折叠只读，点开才占地方——已经不再等答、别抢戏
+        <>
+          <div className="flex items-start gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+            {isDisconnected ? (
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+            ) : (
+              <Ban className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+            )}
+            {isDisconnected
+              ? `Agent 已断开、这组问题暂时送不达。${resumeHintFor(task.mode)}，AI 会接着读历史（含这组问题）继续。`
+              : "这组提问已过期。在下方继续即可。"}
+          </div>
+          <AskQuestionsReadonly
+            meta={ev.meta}
+            fallbackText={ev.text}
+            baseDir={task.workCwd}
+          />
+        </>
       ) : (
         <>
           {/* 答题框的 `@` 引文件要 task 上下文；答题不套 ↑ 历史（历史是「说过的话」、跟本题无关） */}
@@ -521,6 +604,7 @@ export const AskUserInlineCard = ({
                   <AskQuestionItem
                     question={q}
                     taskId={task.id}
+                    askId={askId}
                     baseDir={task.workCwd}
                     index={qIdx + 1}
                     submitting={submitting || inFlight}
@@ -532,11 +616,13 @@ export const AskUserInlineCard = ({
             </div>
           </ComposerSessionProvider>
 
-          <div className="flex items-center justify-between gap-2 border-t border-border/50 pt-2.5 text-xs text-muted-foreground">
+          {/* 窄栏（侧栏 / 小窗口）下「已答 N / M + 两枚按钮」单行放不下：容器不换行时右侧按钮组
+              min-width:auto 收不动、会被挤出卡片右缘。flex-wrap 让它折到第二行，ml-auto 保证折行后仍靠右 */}
+          <div className="flex flex-wrap items-center justify-between gap-2 gap-y-1.5 border-t border-border/50 pt-2.5 text-xs text-muted-foreground">
             <span className="shrink-0 tabular-nums">
               已答 {answeredCount} / {questions.length}
             </span>
-            <div className="flex items-center gap-1.5">
+            <div className="ml-auto flex items-center gap-1.5">
               <Button
                 size="sm"
                 variant="ghost"

@@ -18,7 +18,7 @@
 
 "use client";
 
-import { useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { ArrowUp, Info, Loader2, Square } from "lucide-react";
 
 import {
@@ -29,6 +29,7 @@ import type { SlashSkillsApi } from "@/components/slash-skills";
 import { useComposerSession } from "@/components/composer-session";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
+import { composerSubmitBlock, deriveComposerActions } from "@/lib/composer-actions";
 import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { loadBoxHeight, saveBoxHeight } from "@/lib/view-memory";
@@ -37,6 +38,8 @@ import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 // 拖高上下界（px）：下界 = 默认两行高、上界防把上方内容顶没
 const MIN_BOX_HEIGHT = 52;
 const MAX_BOX_HEIGHT = 400;
+// 提交在途按 Enter 的「正在发送…」提示停留时长（ms）
+const SEND_HINT_MS = 1500;
 
 export type { ComposerFocusHandle };
 
@@ -54,8 +57,9 @@ export interface ConversationComposerProps {
   /** 整体禁用：编辑器 + 附件动作 + 发送（停止键不受它管） */
   disabled?: boolean;
   /**
-   * 请求飞行中：常态「发送」键转圈（跟 running 的区别：这是「提交这条」的短暂态）。
-   * 运行态（running）下「排队发送」键只灰掉防连点、不转圈——转圈 + 停止键已经在左边了。
+   * 请求飞行中（跟 running 的区别：这是「提交这条」的短暂态）：发送键转圈、提示「发送中」并禁用防连点；
+   * 编辑器本身不锁（调用方的 disabled 不应折进它，第三轮 review D7-03）。
+   * 运行态下转圈归发送键、左侧「AI 在跑」的圈让出——同屏只留一个（见 lib/composer-actions）。
    */
   submitting?: boolean;
   /**
@@ -88,8 +92,15 @@ export interface ConversationComposerProps {
 
   /** agent 运行态：右侧动作组换成 spinner + 停止键 */
   running?: boolean;
+  /**
+   * 只多出停止键（后台子代理还在跑、主 AI 空闲）：不改发送键 / 附件 / 转圈的语义（第三轮 review R3-02）。
+   * 已经是 running 时无意义（运行态自带停止键）。
+   */
+  stopOnly?: boolean;
   onStop?: () => void;
   stopping?: boolean;
+  /** 停止键 tooltip（不传 = 「停止生成（中断 agent）」）；停止还会连带取消后台子代理时由调用方点明 */
+  stopLabel?: string;
 
   /**
    * chat 排队：运行中仍可发送（footer 同时显示停止 + 发送）。
@@ -99,8 +110,11 @@ export interface ConversationComposerProps {
   /** 输入区上方排队提示条 */
   queueBanner?: ReactNode;
 
-  /** 岛容器附加 class（如禁用态调暗 opacity-70） */
+  /** 岛容器附加 class（如禁用态降低边框 / 底色对比；⛔ 不要整体压 opacity，文字 / placeholder 会掉到 AA 以下） */
   className?: string;
+
+  /** 输入框的可访问名称（调用方必传、同屏互不重名；N2-06） */
+  ariaLabel?: string;
 }
 
 export const ConversationComposer = ({
@@ -122,10 +136,13 @@ export const ConversationComposer = ({
   topRow,
   leading,
   running,
+  stopOnly,
   onStop,
   stopping,
+  stopLabel,
   allowQueueWhileRunning,
   queueBanner,
+  ariaLabel,
   className,
 }: ConversationComposerProps) => {
   // 手动拖过的高度（null = 未拖过、编辑器随内容自增）；记全局偏好、跨任务共用
@@ -145,32 +162,89 @@ export const ConversationComposer = ({
   const hasContent =
     value.trim().length > 0 || images.length > 0 || pathList.length > 0;
 
+  // 提交在途时按 Enter：被拦下（防双发）不能静默——给一点轻反馈（Q6-10）：发送键旁短暂写「正在发送…」，
+  // 与发送键的转圈 / tooltip「发送中」同口径（D7-03）；提交一落地（submitting 变 false）提示立刻消失
+  const [sendHint, setSendHint] = useState(false);
+  const sendHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (sendHintTimerRef.current) clearTimeout(sendHintTimerRef.current);
+    },
+    [],
+  );
+  const flashSendHint = () => {
+    setSendHint(true);
+    if (sendHintTimerRef.current) clearTimeout(sendHintTimerRef.current);
+    sendHintTimerRef.current = setTimeout(() => setSendHint(false), SEND_HINT_MS);
+  };
+
   const handleSubmit = () => {
-    if (disabled || submitting || !hasContent) return;
+    const block = composerSubmitBlock({ disabled, submitting, hasContent });
+    if (block === "submitting") flashSendHint();
+    if (block) return;
     onSubmit();
   };
 
   const showUnbound =
     !!session?.showUnboundBanner && (session.repoPaths?.length ?? 0) === 0;
 
-  // 发送键：运行态排队发送与常态发送共用（title 文案不同）。
-  // 转圈只属于常态「发送」：运行态左边已经有转圈 + 停止键，提交飞行中旁边的「排队发送」
-  // 只灰掉防连点、不再转第二个圈——否则回车后（输入框按运行态画）仍是一副「loading」的样子。
-  const sendButton = (label: "发送" | "排队发送") => (
-    <Tooltip content={`${label}（${getSubmitShortcutTitle(submitShortcut)}）`}>
+  // 右侧动作组的决策（附件 / 转圈 / 停止 / 发送）收在 lib/composer-actions：
+  // 提交飞行中发送键转圈并提示「发送中」（D7-03），stopOnly 只多一个停止键（R3-02）
+  const actions = deriveComposerActions({
+    running: !!running,
+    stopOnly: !!stopOnly,
+    submitting: !!submitting,
+    allowQueueWhileRunning: !!allowQueueWhileRunning,
+  });
+
+  // 发送键：运行态排队发送与常态发送共用。提交飞行中禁用防连点 + 转圈 + tooltip「发送中」；
+  // 转圈只有这一个（运行态左侧「AI 在跑」的圈此时让出，见 deriveComposerActions）。
+  const sendButton = (send: NonNullable<typeof actions.send>) => (
+    <Tooltip
+      content={
+        submitting
+          ? send.tip
+          : `${send.tip}（${getSubmitShortcutTitle(submitShortcut)}）`
+      }
+    >
       <span className="inline-flex">
         <Button
           type="button"
           size="sm"
-          disabled={disabled || submitting || !hasContent}
+          disabled={composerSubmitBlock({ disabled, submitting, hasContent }) !== null}
           onClick={handleSubmit}
           className="ml-1 size-7 rounded-lg p-0"
-          aria-label={label}
+          aria-label={send.tip}
         >
-          {submitting && label === "发送" ? (
+          {send.spinning ? (
             <Loader2 className="size-4 animate-spin" />
           ) : (
             <ArrowUp className="size-4" />
+          )}
+        </Button>
+      </span>
+    </Tooltip>
+  );
+
+  // 停止键：运行态与 stopOnly 共用（停止不受 disabled 管——受理前点停止走「登记意图」）
+  const stopButton = (
+    <Tooltip content={stopLabel ?? "停止生成（中断 agent）"}>
+      <span className="inline-flex">
+        <Button
+          type="button"
+          size="sm"
+          onClick={onStop}
+          disabled={stopping}
+          // 停止键文字色：项目没有 --destructive-foreground，用 text-primary-foreground——
+          // 浅色近白（在 destructive 上约 4.6:1）、深色近黑（在暗色 destructive 上约 6.1:1，oklch 换算）；
+          // 原来写死 text-white 在暗色下只有 2.89:1（V13-08）
+          className="ml-1 size-7 rounded-lg bg-destructive p-0 text-primary-foreground hover:bg-destructive/90"
+          aria-label="停止"
+        >
+          {stopping ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <Square className="size-3 fill-current" />
           )}
         </Button>
       </span>
@@ -193,10 +267,11 @@ export const ConversationComposer = ({
       onPickPaths={onPickPaths}
       picking={picking}
       onPasteLongText={onPasteLongText}
+      ariaLabel={ariaLabel}
       boxHeight={boxHeight}
       boxContainerRef={boxContainerRef}
-      // 运行态整组换成 spinner + 停止键、附件按钮让位
-      showAttachActions={!running}
+      // 运行态整组换成 spinner + 停止键、附件按钮让位（stopOnly 不让位——它只多一个停止键）
+      showAttachActions={actions.showAttach}
       className={className}
       header={
         <>
@@ -274,33 +349,22 @@ export const ConversationComposer = ({
       }
       leading={leading}
       trailing={
-        running ? (
-          <>
-            {/* running = info（项目约定：进行中只用 text-info，跟状态行 / 组头 spinner 同色） */}
+        <>
+          {/* running = info（项目约定：进行中只用 text-info，跟状态行 / 组头 spinner 同色）；
+              提交飞行中转圈归发送键，这里让出（同屏只留一个圈） */}
+          {actions.runSpinner && (
             <Loader2 className="size-3.5 animate-spin text-info" />
-            <Tooltip content="停止生成（中断 agent）">
-              <span className="inline-flex">
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={onStop}
-                  disabled={stopping}
-                  className="ml-1 size-7 rounded-lg bg-destructive p-0 text-white hover:bg-destructive/90"
-                >
-                  {stopping ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Square className="size-3 fill-current" />
-                  )}
-                </Button>
-              </span>
-            </Tooltip>
-            {/* chat 排队：运行中仍可发下一条 */}
-            {allowQueueWhileRunning && sendButton("排队发送")}
-          </>
-        ) : (
-          sendButton("发送")
-        )
+          )}
+          {actions.stopButton && stopButton}
+          {/* 提交在途又按了 Enter（被防双发拦下）：轻提示「正在发送…」（读屏播报；提交落地即消失，Q6-10） */}
+          {sendHint && submitting && (
+            <span role="status" className="text-xs text-muted-foreground">
+              正在发送…
+            </span>
+          )}
+          {/* 常态「发送」；chat 运行态仍可排队发下一条（「排队发送」） */}
+          {actions.send && sendButton(actions.send)}
+        </>
       }
     />
   );

@@ -303,3 +303,19 @@ describe("第六轮：收缩备份 config.json.bak.shrink（路由 + 真实 sett
     expect(await exists(shrinkPath())).toBe(false);
   });
 });
+
+describe("D1-09 PUT /api/settings 响应不回传 settings", () => {
+  it("成功响应只有 { ok: true }——公司环境密码 / MCP env / headers 不会随响应回显", async () => {
+    const res = await putJson({
+      ...GOOD_CONFIG,
+      companyEnv: { PASSWORD: "company-pw-should-not-echo" },
+      mcpServers: {
+        demo: { command: "x", env: { TOKEN: "mcp-token-should-not-echo" } },
+      },
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(JSON.parse(text)).toEqual({ ok: true });
+    expect(text).not.toMatch(/company-pw-should-not-echo|mcp-token-should-not-echo/);
+  });
+});

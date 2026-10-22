@@ -120,8 +120,11 @@ export interface RichInputProps {
    */
   onMenuOpenChange?: (open: boolean, closeMenus: () => void) => void;
 
-  /** 岛容器附加 class（如禁用态调暗 opacity-70） */
+  /** 岛容器附加 class（如禁用态降低边框 / 底色对比；⛔ 不要整体压 opacity，文字 / placeholder 会掉到 AA 以下） */
   className?: string;
+
+  /** 输入框的可访问名称（调用方必传、同屏互不重名；N2-06） */
+  ariaLabel?: string;
 }
 
 export const RichInput = ({
@@ -147,6 +150,7 @@ export const RichInput = ({
   showAttachActions = true,
   onMenuOpenChange,
   className,
+  ariaLabel,
 }: RichInputProps) => {
   const session = useComposerSession();
 
@@ -270,6 +274,7 @@ export const RichInput = ({
         atMention={atForEditor}
         attach={attach}
         onPasteLongText={onPasteLongText}
+        ariaLabel={ariaLabel}
       />
 
       {/* footer：左 slot + 右动作组（附件按钮 + 外壳传的发送 / 停止）。

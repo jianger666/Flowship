@@ -711,6 +711,8 @@ describe("executeChatRewind 事务回滚与门闩", () => {
       ).rejects.toMatchObject({
         name: "RewindError",
         code: "run_active",
+        // 稳定 reason（V7-06）：路由当 409 响应的 `code` 发给前端，前端不再匹配上面这句中文
+        reason: "queue_draining",
         message: expect.stringContaining("正在发送排队消息"),
       });
 
@@ -757,6 +759,7 @@ describe("executeChatRewind 事务回滚与门闩", () => {
         ).rejects.toMatchObject({
           name: "RewindError",
           code: "run_active",
+          reason: "rewind_in_progress",
           message: expect.stringContaining("已有回退在进行中"),
         });
         await expect(
@@ -810,6 +813,9 @@ describe("executeChatRewind 事务回滚与门闩", () => {
         expect((err as InstanceType<typeof RewindError>).code).toBe(
           "run_active",
         );
+        expect((err as InstanceType<typeof RewindError>).reason).toBe(
+          "session_starting",
+        );
         expect((err as InstanceType<typeof RewindError>).message).toMatch(
           /启动新会话/,
         );
@@ -819,6 +825,361 @@ describe("executeChatRewind 事务回滚与门闩", () => {
       } finally {
         releaseChatStart(TASK_ID);
       }
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+});
+
+/**
+ * 回退不得永久删掉「被新 .gitignore 规则覆盖」的文件（2026-10-20 review #3）。
+ *
+ * 复现：回退先把已跟踪的 .gitignore 还原成目标点的旧版（没有忽略规则），随后原先的
+ * `git clean -fd` 把回退区间内新增规则所覆盖的 `.env.local` / 本地库 / 日志当成「未跟踪文件」整个删掉——
+ * 而它们在安全快照时被新规则忽略、根本不在快照里，删了就找不回来。
+ * 修法：只删「安全快照里有、目标 tree 里没有」的路径（= 能从安全快照找回的）。
+ */
+describe("回退不删被新 .gitignore 覆盖的文件（review #3）", () => {
+  const REPO_IGN = path.join(TMP_ROOT, "repo-ignore-rules");
+  const OLD_IGNORE = "# 目标点：还没有任何忽略规则\n";
+  const NEW_IGNORE = `${OLD_IGNORE}.env.local\nlocal.db\nlogs/\n`;
+
+  /** 目标点（checkpoint）= 旧 .gitignore + tracked.txt；之后「AI 回合」加规则 + 产生被忽略文件 + AI 新建文件 */
+  const seedIgnoreScenario = async (eventId: string) => {
+    await fs.rm(REPO_IGN, { recursive: true, force: true });
+    await fs.mkdir(REPO_IGN, { recursive: true });
+    git(REPO_IGN, "init", "-b", "main");
+    git(REPO_IGN, "config", "user.email", "t@t.local");
+    git(REPO_IGN, "config", "user.name", "t");
+    await fs.writeFile(path.join(REPO_IGN, ".gitignore"), OLD_IGNORE);
+    await fs.writeFile(path.join(REPO_IGN, "tracked.txt"), "v1\n");
+    git(REPO_IGN, "add", "-A");
+    git(REPO_IGN, "commit", "-m", "init（.gitignore 还没有忽略规则）");
+
+    await writeMeta(makeMeta([REPO_IGN]));
+    await writeRewindPoints(TASK_ID, []);
+    await fs.writeFile(path.join(taskDir(TASK_ID), "events.jsonl"), "", "utf-8");
+
+    const target = await snapshotRepoTree(REPO_IGN);
+    if ("error" in target) throw new Error(target.error);
+    await appendRewindPoint(TASK_ID, {
+      eventId,
+      createdAt: Date.now(),
+      repoSnapshots: [{ repoPath: REPO_IGN, treeOid: target.treeOid }],
+      kind: "checkpoint",
+    });
+    await appendEventLine(TASK_ID, {
+      id: eventId,
+      ts: Date.now(),
+      kind: "user_reply",
+      text: "to-rewind",
+      meta: { checkpointed: true },
+    } as TaskEvent);
+    await appendEventLine(TASK_ID, {
+      id: newEventId(),
+      ts: Date.now() + 1,
+      kind: "assistant_message",
+      text: "after",
+    } as TaskEvent);
+
+    // —— AI 回合：新增忽略规则（改了已跟踪的 .gitignore）+ 产生被新规则覆盖的本地文件 + 新建普通文件 ——
+    await fs.writeFile(path.join(REPO_IGN, ".gitignore"), NEW_IGNORE);
+    await fs.writeFile(path.join(REPO_IGN, ".env.local"), "SECRET=1\n");
+    await fs.writeFile(path.join(REPO_IGN, "local.db"), "sqlite-bytes\n");
+    await fs.mkdir(path.join(REPO_IGN, "logs"), { recursive: true });
+    await fs.writeFile(path.join(REPO_IGN, "logs", "app.log"), "line\n");
+    await fs.writeFile(path.join(REPO_IGN, "ai-created.txt"), "made by ai\n");
+    await fs.mkdir(path.join(REPO_IGN, "ai-dir"), { recursive: true });
+    await fs.writeFile(path.join(REPO_IGN, "ai-dir", "x.txt"), "x\n");
+    await fs.writeFile(path.join(REPO_IGN, "tracked.txt"), "v2-by-ai\n");
+    return target;
+  };
+
+  const exists = (p: string): Promise<boolean> =>
+    fs.access(p).then(
+      () => true,
+      () => false,
+    );
+
+  it(
+    "executeChatRewind：被新规则忽略的 .env.local / local.db / logs 回退后仍在；AI 新建的普通文件照旧被删（且能从安全快照找回）",
+    async () => {
+      const eventId = newEventId();
+      const target = await seedIgnoreScenario(eventId);
+
+      const res = await executeChatRewind(TASK_ID, eventId, stubRewindDeps());
+      expect(res.ok).toBe(true);
+
+      // 已跟踪文件回到目标点（含 .gitignore 还原成旧版）
+      await expect(
+        fs.readFile(path.join(REPO_IGN, ".gitignore"), "utf8"),
+      ).resolves.toBe(OLD_IGNORE);
+      await expect(
+        fs.readFile(path.join(REPO_IGN, "tracked.txt"), "utf8"),
+      ).resolves.toBe("v1\n");
+
+      // 核心：不在安全快照里的被忽略文件一个都不许删
+      await expect(
+        fs.readFile(path.join(REPO_IGN, ".env.local"), "utf8"),
+      ).resolves.toBe("SECRET=1\n");
+      await expect(
+        fs.readFile(path.join(REPO_IGN, "local.db"), "utf8"),
+      ).resolves.toBe("sqlite-bytes\n");
+      await expect(
+        fs.readFile(path.join(REPO_IGN, "logs", "app.log"), "utf8"),
+      ).resolves.toBe("line\n");
+
+      // 原功能保持：安全快照里有、目标里没有的（AI 新建的普通文件 / 目录）仍被清掉
+      expect(await exists(path.join(REPO_IGN, "ai-created.txt"))).toBe(false);
+      expect(await exists(path.join(REPO_IGN, "ai-dir"))).toBe(false);
+      const detail = res.restoredRepos.find((d) => d.repoPath === REPO_IGN)!;
+      expect(detail.ok).toBe(true);
+      expect(detail.removedUntracked).toEqual(
+        expect.arrayContaining(["ai-created.txt", "ai-dir/x.txt"]),
+      );
+      // 被忽略文件绝不出现在「已删」清单里
+      expect(detail.removedUntracked).not.toContain(".env.local");
+      expect(detail.removedUntracked).not.toContain("local.db");
+      expect(detail.removedUntracked).not.toContain("logs/app.log");
+
+      // 被删的普通文件能从 pre_rewind 安全点找回（而 .env.local 本来就不在里面——所以更不能删）
+      const points = await readRewindPoints(TASK_ID);
+      const safety = points.find((p) => p.kind === "pre_rewind");
+      const safetyOid = safety!.repoSnapshots.find(
+        (s) => s.repoPath === REPO_IGN,
+      )!.treeOid;
+      expect(git(REPO_IGN, "show", `${safetyOid}:ai-created.txt`)).toBe(
+        "made by ai",
+      );
+      expect(() =>
+        // stdio 管道：预期失败的 fatal 别灌进测试输出
+        execFileSync("git", ["cat-file", "-e", `${safetyOid}:.env.local`], {
+          cwd: REPO_IGN,
+          stdio: "pipe",
+        }),
+      ).toThrow();
+      expect(target.treeOid).not.toBe(safetyOid);
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+
+  it(
+    "restoreRepoTree 不给安全快照时自己先对当前工作区取一份当基线：同样不删被忽略文件",
+    async () => {
+      const target = await seedIgnoreScenario(newEventId());
+
+      const restored = await restoreRepoTree(REPO_IGN, target.treeOid);
+      expect(restored.ok).toBe(true);
+      await expect(
+        fs.readFile(path.join(REPO_IGN, ".env.local"), "utf8"),
+      ).resolves.toBe("SECRET=1\n");
+      expect(await exists(path.join(REPO_IGN, "ai-created.txt"))).toBe(false);
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+
+  it(
+    "restoreRepoTree 传入的安全快照之后才出现的未跟踪文件也不删（删了就是没备份的永久丢失）",
+    async () => {
+      const target = await seedIgnoreScenario(newEventId());
+      const safety = await snapshotRepoTree(REPO_IGN);
+      if ("error" in safety) throw new Error(safety.error);
+      // 安全快照之后才冒出来的普通（未被忽略）文件：不在快照里、不可找回 → 不许删
+      await fs.writeFile(path.join(REPO_IGN, "late.txt"), "after safety\n");
+
+      const restored = await restoreRepoTree(REPO_IGN, target.treeOid, {
+        safetyTreeOid: safety.treeOid,
+      });
+      expect(restored.ok).toBe(true);
+      await expect(
+        fs.readFile(path.join(REPO_IGN, "late.txt"), "utf8"),
+      ).resolves.toBe("after safety\n");
+      // 安全快照里有的仍照常清
+      expect(await exists(path.join(REPO_IGN, "ai-created.txt"))).toBe(false);
+      expect(restored.removedUntracked).not.toContain("late.txt");
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+
+  it(
+    "回滚（目标 = 安全快照）不删任何未跟踪文件，并能把清掉的文件写回来",
+    async () => {
+      const target = await seedIgnoreScenario(newEventId());
+      const safety = await snapshotRepoTree(REPO_IGN);
+      if ("error" in safety) throw new Error(safety.error);
+
+      // 先按目标回退（清掉 ai-created.txt），再回滚到安全快照 → 文件回来
+      const fwd = await restoreRepoTree(REPO_IGN, target.treeOid, {
+        safetyTreeOid: safety.treeOid,
+      });
+      expect(fwd.ok).toBe(true);
+      expect(await exists(path.join(REPO_IGN, "ai-created.txt"))).toBe(false);
+
+      const back = await restoreRepoTree(REPO_IGN, safety.treeOid, {
+        safetyTreeOid: safety.treeOid,
+      });
+      expect(back.ok).toBe(true);
+      expect(back.removedUntracked).toEqual([]);
+      await expect(
+        fs.readFile(path.join(REPO_IGN, "ai-created.txt"), "utf8"),
+      ).resolves.toBe("made by ai\n");
+      await expect(
+        fs.readFile(path.join(REPO_IGN, ".env.local"), "utf8"),
+      ).resolves.toBe("SECRET=1\n");
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+});
+
+/**
+ * 回退在大小写不敏感文件系统上不得把「只差大小写的目录」整个删掉（2026-10-20 第二轮 review F1-01）。
+ *
+ * 复现（macOS APFS 默认 / Windows NTFS）：目标点 tree 里目录叫 `Components/`，回退区间内被重命名成
+ * `components/` 并提交——安全快照 tree 里只有 `components/Button.tsx`。`diff-tree --diff-filter=A target safety`
+ * 因此给出 `components/Button.tsx`；`read-tree -u --reset` 把磁盘改回 `Components/Button.tsx` 之后，
+ * 这条路径在大小写不敏感的盘上**仍指向刚恢复的文件**，旧实现 `unlink` 就把目标版本的文件删掉了。
+ * 修法：只删 `git ls-files -o`（回退后真正未跟踪）里也有的路径，不信 diff-tree 给的路径字面量。
+ * 大小写敏感的文件系统（Linux CI）上不存在别名，本组用例自动跳过。
+ */
+describe("回退不删大小写别名路径（F1-01）", () => {
+  const REPO_CASE = path.join(TMP_ROOT, "repo-case-alias");
+
+  const isCaseInsensitiveFs = (() => {
+    const probe = path.join(TMP_ROOT, "case-probe");
+    try {
+      execFileSync("mkdir", ["-p", probe]);
+      execFileSync("touch", [path.join(probe, "a")]);
+      execFileSync("test", ["-e", path.join(probe, "A")]);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  const exists = (p: string): Promise<boolean> =>
+    fs.access(p).then(
+      () => true,
+      () => false,
+    );
+
+  it.runIf(isCaseInsensitiveFs)(
+    "目标点 `Components/`、区间内被改名成 `components/`：回退后 Components/Button.tsx 必须还在",
+    async () => {
+      await fs.rm(REPO_CASE, { recursive: true, force: true });
+      await fs.mkdir(path.join(REPO_CASE, "Components"), { recursive: true });
+      git(REPO_CASE, "init", "-b", "main");
+      git(REPO_CASE, "config", "user.email", "t@t.local");
+      git(REPO_CASE, "config", "user.name", "t");
+      git(REPO_CASE, "config", "core.ignorecase", "true");
+      await fs.writeFile(path.join(REPO_CASE, "a.txt"), "a\n");
+      await fs.writeFile(path.join(REPO_CASE, "Components", "Button.tsx"), "v1\n");
+      git(REPO_CASE, "add", "-A");
+      git(REPO_CASE, "commit", "-m", "init");
+
+      const target = await snapshotRepoTree(REPO_CASE);
+      if ("error" in target) throw new Error(target.error);
+
+      // AI 回合：只差大小写的目录改名并提交（两步 mv 才能在大小写不敏感盘上改名）
+      git(REPO_CASE, "mv", "Components", "tmp-rename");
+      git(REPO_CASE, "mv", "tmp-rename", "components");
+      git(REPO_CASE, "commit", "-m", "rename dir case");
+
+      const safety = await snapshotRepoTree(REPO_CASE);
+      if ("error" in safety) throw new Error(safety.error);
+      // 前提自检：安全快照里确实是小写目录（否则本用例没在测它想测的东西）
+      expect(git(REPO_CASE, "ls-tree", "-r", "--name-only", safety.treeOid)).toContain(
+        "components/Button.tsx",
+      );
+
+      const restored = await restoreRepoTree(REPO_CASE, target.treeOid, {
+        safetyTreeOid: safety.treeOid,
+      });
+      expect(restored.ok).toBe(true);
+      // 核心：目标版本里的文件还在、内容没变
+      await expect(
+        fs.readFile(path.join(REPO_CASE, "Components", "Button.tsx"), "utf8"),
+      ).resolves.toBe("v1\n");
+      expect(await exists(path.join(REPO_CASE, "a.txt"))).toBe(true);
+      // 它不是「未跟踪文件」，不许出现在已删清单里
+      expect(restored.removedUntracked).toEqual([]);
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+
+  it(
+    "文件 ↔ 目录互换（F1-02）：目标点 `foo` 是文件、区间内变成目录 `foo/bar.txt`，回退照常 ok 且文件回来",
+    async () => {
+      await fs.rm(REPO_CASE, { recursive: true, force: true });
+      await fs.mkdir(REPO_CASE, { recursive: true });
+      git(REPO_CASE, "init", "-b", "main");
+      git(REPO_CASE, "config", "user.email", "t@t.local");
+      git(REPO_CASE, "config", "user.name", "t");
+      await fs.writeFile(path.join(REPO_CASE, "foo"), "file-content\n");
+      git(REPO_CASE, "add", "-A");
+      git(REPO_CASE, "commit", "-m", "init");
+      const target = await snapshotRepoTree(REPO_CASE);
+      if ("error" in target) throw new Error(target.error);
+
+      await fs.rm(path.join(REPO_CASE, "foo"));
+      await fs.mkdir(path.join(REPO_CASE, "foo"));
+      await fs.writeFile(path.join(REPO_CASE, "foo", "bar.txt"), "ai-made\n");
+      const safety = await snapshotRepoTree(REPO_CASE);
+      if ("error" in safety) throw new Error(safety.error);
+
+      const restored = await restoreRepoTree(REPO_CASE, target.treeOid, {
+        safetyTreeOid: safety.treeOid,
+      });
+      expect(restored.ok).toBe(true);
+      await expect(
+        fs.readFile(path.join(REPO_CASE, "foo"), "utf8"),
+      ).resolves.toBe("file-content\n");
+      // 被 read-tree 顶掉的目录内容留在安全快照里，可找回
+      expect(git(REPO_CASE, "show", `${safety.treeOid}:foo/bar.txt`)).toBe("ai-made");
+    },
+    GIT_IT_TIMEOUT_MS,
+  );
+
+  it.runIf(isCaseInsensitiveFs)(
+    "同样经 executeChatRewind 走完整流程：返回 ok 时目标版本的目录不能不见",
+    async () => {
+      await fs.rm(REPO_CASE, { recursive: true, force: true });
+      await fs.mkdir(path.join(REPO_CASE, "Components"), { recursive: true });
+      git(REPO_CASE, "init", "-b", "main");
+      git(REPO_CASE, "config", "user.email", "t@t.local");
+      git(REPO_CASE, "config", "user.name", "t");
+      git(REPO_CASE, "config", "core.ignorecase", "true");
+      await fs.writeFile(path.join(REPO_CASE, "Components", "Button.tsx"), "v1\n");
+      git(REPO_CASE, "add", "-A");
+      git(REPO_CASE, "commit", "-m", "init");
+
+      await writeMeta(makeMeta([REPO_CASE]));
+      await writeRewindPoints(TASK_ID, []);
+      await fs.writeFile(path.join(taskDir(TASK_ID), "events.jsonl"), "", "utf-8");
+      const eventId = newEventId();
+      const target = await snapshotRepoTree(REPO_CASE);
+      if ("error" in target) throw new Error(target.error);
+      await appendRewindPoint(TASK_ID, {
+        eventId,
+        createdAt: Date.now(),
+        repoSnapshots: [{ repoPath: REPO_CASE, treeOid: target.treeOid }],
+        kind: "checkpoint",
+      });
+      await appendEventLine(TASK_ID, {
+        id: eventId,
+        ts: Date.now(),
+        kind: "user_reply",
+        text: "to-rewind",
+        meta: { checkpointed: true },
+      } as TaskEvent);
+
+      git(REPO_CASE, "mv", "Components", "tmp-rename");
+      git(REPO_CASE, "mv", "tmp-rename", "components");
+      git(REPO_CASE, "commit", "-m", "rename dir case");
+
+      const res = await executeChatRewind(TASK_ID, eventId, stubRewindDeps());
+      expect(res.ok).toBe(true);
+      await expect(
+        fs.readFile(path.join(REPO_CASE, "Components", "Button.tsx"), "utf8"),
+      ).resolves.toBe("v1\n");
     },
     GIT_IT_TIMEOUT_MS,
   );

@@ -55,6 +55,7 @@ import {
 } from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import { buildTalkQueueSnapshot } from "@/lib/server/task-talk-queue";
+import { isTailAnchorEvent } from "@/lib/tail-anchor";
 import {
   hasRestrictedQuestionInFlight,
   type TaskStreamEvent,
@@ -70,6 +71,10 @@ interface Ctx {
 }
 
 export const runtime = "nodejs";
+// 注意：这个 maxDuration 在本应用的自托管运行时（Electron 内嵌的 `next start` / standalone server）里**不会被执行**——
+// Next 只在类型 / typegen 里认它，真正按它掐流的是 Vercel 之类的托管平台；这里路由也没有任何定时关流逻辑。
+// 所以 SSE 不会「每 300s 到点断一次」，断流只来自网络抖动 / 服务端重启 / 终态 close（第三轮 review §7）。
+// 保留它只是为了万一被部署到会执行它的平台时有个上限声明；客户端的自动重连（use-task-watch）与它无依赖。
 export const maxDuration = 300;
 
 // bootstrap 默认只带最近这么多条事件（?tail= 可覆盖）——长对话打开秒开、更早的上拉分页
@@ -130,7 +135,10 @@ export const GET = async (req: Request, { params }: Ctx) => {
   // 尾部反向读、不整文件 parse
   let initial: Task | null;
   try {
-    initial = await getTaskWithTailEvents(id, tail);
+    // 窗口补到含最近一条 user_reply / action_start（300 条窗口一致性，D8-01/02/03）：
+    // 错误卡恢复入口 / 状态行 / ↑ 历史都往前找触发这一轮的事件，一轮长 run 之后它在最近 300 条之外就静默失效。
+    // 与首屏 GET ?anchor=1 同一个判定：两边窗口一致，客户端「只追加」的合并不会乱序
+    initial = await getTaskWithTailEvents(id, tail, { anchor: isTailAnchorEvent });
   } catch (err) {
     cleanup();
     throw err;
@@ -213,7 +221,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
             send({ type: "action", action: ev.action });
             break;
           case "done": {
-            send({ type: "done", task: stripEvents(ev.task), ok: ev.ok });
+            // 旁路群答疑 run 的 done 带 origin：客户端据此不动属主的流式气泡 / run latch（D9-01）。
+            // 属主主链的 done 没有 origin，不带这个字段（帧形状与改前一致）
+            send({
+              type: "done",
+              task: stripEvents(ev.task),
+              ok: ev.ok,
+              ...(ev.origin ? { origin: ev.origin } : {}),
+            });
             doneSent = true;
             // V0.11.6：done = 本回合 run 结束、不再等于「本次订阅结束」——
             // 只有任务真终态才关流、否则保持挂着接后续 send 起的新 run

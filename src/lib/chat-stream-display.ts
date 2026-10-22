@@ -49,6 +49,49 @@ export const userReplyDisplayText = (ev: UserReplyLike): string => {
 export const isMarkdownUserReply = (ev: { meta?: Record<string, unknown> | null }): boolean =>
   ev.meta?.source === "feishu_group" && ev.meta?.groupSenderIsBot === true;
 
+// ---------- 排队消息被丢（run 出错 / 会话关闭清队）的提示 ----------
+//
+// 服务端 chat-runner.noticeQueuedItemsDropped 清队后写一条 info：正文是「N 条排队消息未送达」+ 摘要列表，
+// 完整文本放在 `meta.droppedTexts`（已脱敏、单条 ≤ 2000 字、不含附件 / 图片）。以前前端没有读者，
+// 气泡一消失用户就得自己回想发过什么；现在带这个字段的 info 画成「未送达」卡：完整展示 + 复制 + 放回输入框。
+
+/**
+ * 这段文本是不是定时到点的系统样板（`[SCHEDULE_FIRED id=…] 定时任务到点了…`，给 AI 看的、不是用户说的话）。
+ * 「未送达」卡不得展示它、更不能提供「放回输入框」（放回 = 冒充用户重发一条定时；第三轮 review R2-02）。
+ * 服务端清队时已按这个口径剔除；这里是前端读侧的防御（老事件 / 别的写入点）。
+ */
+export const isScheduleBoilerplateText = (text: string): boolean =>
+  /^\s*\[SCHEDULE_FIRED\b/.test(text);
+
+/**
+ * 取出 `meta.droppedTexts` 里的完整文本（落盘数据不可全信：非字符串 / 纯空白的脏项丢掉；
+ * 定时样板也丢——它不是用户的话，见 {@link isScheduleBoilerplateText}）
+ */
+export const extractDroppedTexts = (
+  meta: Record<string, unknown> | null | undefined,
+): string[] => {
+  const raw = meta?.droppedTexts;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (t): t is string =>
+      typeof t === "string" && t.trim().length > 0 && !isScheduleBoilerplateText(t),
+  );
+};
+
+/** 放回输入框的文本：多条用空行隔开、顺序不变 */
+export const joinDroppedTexts = (texts: readonly string[]): string =>
+  texts.join("\n\n");
+
+/** 把放回的内容前置到现有草稿前（同「引用追问」「编辑回退失败放回」的口径）：不覆盖用户正在写的东西 */
+export const prependRestoredToDraft = (prev: string, restored: string): string =>
+  prev.trim() ? `${restored}\n\n${prev}` : restored;
+
+/** 「未送达」卡的标题：服务端文案首行（去掉尾部冒号）；摘要列表不重复进标题，完整文本在卡里单独展示 */
+export const droppedNoticeTitle = (text: string): string => {
+  const first = (text.split("\n")[0] ?? "").trim().replace(/[：:]$/, "").trim();
+  return first || "排队消息未送达、请重新发送";
+};
+
 // ---------- 超长用户消息折叠（Codex 同款「显示更多」） ----------
 
 /** 折叠阈值：超过这个换行行数默认截断 */

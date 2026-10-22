@@ -62,11 +62,13 @@ const sliceObjectLiteral = (source: string, marker: string): string => {
 };
 
 describe("组尾「处理中…」让位给输入框上方的状态行", () => {
-  it("statusLineVisible 与状态行的渲染条件同口径：没隐藏输入区 && 有 activeStatus", () => {
+  it("statusLineVisible 与状态行的渲染条件同口径：chat = 没隐藏输入区；task = 事件流底部那条（V16-05）；都要有 activeStatus", () => {
+    // V16-05：task 形态也画状态行（事件流底部），所以「隐藏输入区」不再等于「没有状态行」——
+    // 旧口径 `!hideReplyComposer && !!activeStatus` 在 task 形态恒为 false，组尾「处理中…」会和新状态行并存
     expect(eventStream).toContain(
-      "const statusLineVisible = !hideReplyComposer && !!activeStatus;",
+      "const statusLineVisible = (!isChat || !hideReplyComposer) && !!activeStatus;",
     );
-    // 渲染侧的条件：隐藏输入区（task 形态）整块不画；否则有 activeStatus 才画状态行
+    // 渲染侧的条件：chat 隐藏输入区整块不画；否则有 activeStatus 才画状态行（task 形态那条见下方 V16-05 一节）
     const renderSide = between(
       eventStream,
       "{hideReplyComposer || !isChat ? null : (",
@@ -95,8 +97,8 @@ describe("组尾「处理中…」让位给输入框上方的状态行", () => {
     expect(statusLine).toMatch(/disabled=\{skipping\}/);
   });
 
-  it("task 形态没有状态行：「跳过等待」也挂在 wait 的工具块上（两种形态都渲染工具块）", () => {
-    // 前提：task 形态确实不画状态行——否则这个入口就是多余的
+  it("「跳过等待」也挂在 wait 的工具块上（两种形态都渲染工具块；工具块上的入口随行滚走、状态行那条不会）", () => {
+    // chat 输入框上方那条状态行槽位仍只在 chat 画（task 形态的状态行在事件流底部，是另一处，见 V16-05 一节）
     expect(eventStream).toContain("{hideReplyComposer || !isChat ? null : (");
     const regular = between(toolBlock, "const RegularToolBlockRow = (", "const TodoToolBlock");
     // 条件走共用判定（与状态行的 skippable 同口径：wait 且在跑）
@@ -129,8 +131,75 @@ describe("组尾「处理中…」让位给输入框上方的状态行", () => {
     expect(call).toMatch(/\bstatusLineVisible\b/);
   });
 
-  it("task 形态没有状态行，组尾兜底这条路还在（work-group 仍按 showProcessingPlaceholder 渲染）", () => {
+  it("没有状态行可让位时（run 不在跑 / 状态行本帧让位给流尾进度行），组尾兜底这条路还在（work-group 仍按 showProcessingPlaceholder 渲染）", () => {
     expect(workGroup).toContain("showProcessingPlaceholder");
+  });
+});
+
+describe("V16-05：task 形态接粘性状态行（事件流底部一条，复用 deriveActiveStatus）", () => {
+  const activeStatusMemo = between(
+    eventStream,
+    "const activeStatus = useMemo",
+    "const statusLineVisible",
+  );
+
+  it("activeStatus 不再只给 chat：只看属主主 run（mainRunActive，R3-05：旁路群答疑在飞不冒状态行）；仍不碰 task.events（性能闸）、仍吃 statusEvents", () => {
+    // 旧写法 `if (!isChat || !isRunning) return null;` = task 形态永远没有状态行
+    expect(activeStatusMemo).toContain("if (!mainRunActive) return null;");
+    expect(activeStatusMemo).not.toContain("!isChat");
+    expect(activeStatusMemo).not.toContain("task.events");
+    expect(activeStatusMemo).toContain("statusEvents");
+  });
+
+  it("本轮切片用 sliceCurrentRunEvents（user_reply / action_start 起），chat / task 同一条路——不再 task 吃全量", () => {
+    const statusEvents = between(
+      eventStream,
+      "const statusEvents = useMemo",
+      "const tailHasProgressRow",
+    );
+    expect(statusEvents).toContain("sliceCurrentRunEvents(task.events)");
+    // 旧写法：task 形态直接吃 task.events 全量（接上状态行后 = 每个 shell delta 重扫全量）
+    expect(statusEvents).not.toMatch(/!isChat\s*\?\s*task\.events/);
+    // 切片只跟事件走（liveToolOutputs 进了它的依赖就白切了）
+    expect(statusEvents).not.toContain("liveToolOutputs");
+    expect(eventStream).toMatch(
+      /import \{[^}]*\bsliceCurrentRunEvents\b[^}]*\} from "@\/lib\/chat-turns";/,
+    );
+  });
+
+  it("task 形态在事件流底部画状态行：槽位运行期间预留 h-7（出没不带着列表高度跳）、里面是同一个 ActiveStatusLine + 跳过等待", () => {
+    // 只看属主主 run：旁路群答疑在飞时空闲任务不撑空槽（R3-05）
+    expect(eventStream).toContain("const reserveTaskStatusSlot = !isChat && mainRunActive;");
+    const slot = between(
+      eventStream,
+      "{isChat ? null : (",
+      "</PaneSearchHighlightProvider>",
+    );
+    expect(slot).toContain('reserveTaskStatusSlot ? "h-7" : "h-0"');
+    // 与 chat 槽位同款：高度过渡 + 裁切 + 减少动态效果下不动画
+    expect(slot).toContain("transition-[height]");
+    expect(slot).toContain("overflow-hidden");
+    expect(slot).toContain("motion-reduce:transition-none");
+    expect(slot).toMatch(
+      /\{activeStatus && \(\s*<ActiveStatusLine\s+status=\{activeStatus\}\s+onSkipWait=\{handleSkipWait\}\s*\/>\s*\)\}/,
+    );
+    // 槽位包着状态行（不是兄弟）：槽位 div 的第一个 </div> 在状态行之后
+    expect(slot.indexOf("<ActiveStatusLine")).toBeLessThan(slot.indexOf("</div>"));
+    // 它在列表容器之后、不是列表里的虚拟项——长列表滚下去也一直在视口底部
+    expect(eventStream.indexOf("{isChat ? null : (")).toBeGreaterThan(
+      eventStream.indexOf("{hideReplyComposer || !isChat ? null : ("),
+    );
+  });
+
+  it("task 形态的状态行与组尾「处理中…」同口径让位（statusLineVisible 含 task 形态）", () => {
+    const call = sliceObjectLiteral(
+      eventStream,
+      "shouldShowProcessingPlaceholder({",
+    );
+    expect(call).toContain("statusLineVisible: statusLineVisible || tailHasProgressRow,");
+    expect(eventStream).toContain(
+      "const statusLineVisible = (!isChat || !hideReplyComposer) && !!activeStatus;",
+    );
   });
 });
 

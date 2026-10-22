@@ -83,6 +83,7 @@ import {
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import { isApiKeyFieldPresent } from "@/lib/agent-provider";
 import { buildSkillDirective } from "@/lib/protocol-signals";
+import { CHAT_RESUME_HINT, TASK_RESUME_HINT, resumeHintFor } from "@/lib/stop-copy";
 import {
   errorResponse,
   parseAndValidateImages,
@@ -588,13 +589,13 @@ const handleAskReply = async (
           }
           // 返 false = 会话没接回来（rewind 窗口 / 被停 / run 在跑）：同样是没送到
           await noteWakeFailure(
-            "答案已记录、但唤醒 AI 失败（会话没接回来）——在底部输入条说句话即可继续",
+            `答案已记录、但唤醒 AI 失败（会话没接回来）——${CHAT_RESUME_HINT}`,
           );
         })
         .catch(async (err) => {
           console.error(`[ask-reply] chat=${task.id} 唤醒兜底失败：`, err);
           await noteWakeFailure(
-            `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话即可继续`,
+            `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——${CHAT_RESUME_HINT}`,
           );
         });
     } else {
@@ -613,7 +614,7 @@ const handleAskReply = async (
         .catch(async (err) => {
           console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
           await noteWakeFailure(
-            `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
+            `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——${TASK_RESUME_HINT}`,
           );
         });
     }
@@ -729,9 +730,7 @@ const handleAskReply = async (
       await writeEventAndPublish(task.id, {
         kind: "error",
         actionId: reqEvent.actionId,
-        text: isChat
-          ? "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可继续。"
-          : "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可唤醒，或重新「推进」。",
+        text: `Agent 已断开（进程重启或异常退出）、本次问答没送到。${resumeHintFor(isChat ? "chat" : "task")}。`,
       });
       publishTaskStreamEvent(task.id, { kind: "task", task: failedTask });
       publishTaskStreamEvent(task.id, {
@@ -740,9 +739,7 @@ const handleAskReply = async (
         ok: false,
       });
       return errorResponse(
-        isChat
-          ? "agent 已断开——在底部输入条说句话即可继续"
-          : "agent 已断开——在底部输入条说句话即可唤醒，或重新「推进」",
+        `agent 已断开——${resumeHintFor(isChat ? "chat" : "task")}`,
         410,
       );
     }
@@ -813,7 +810,7 @@ const handleAskReply = async (
       keepPendingClaimed();
       await supersedePendingAsks(task.id, "会话已失效");
       return errorResponse(
-        "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话即可继续",
+        `没有可续接的 agent 会话（会话已失效）——${CHAT_RESUME_HINT}`,
         409,
       );
     }
@@ -856,7 +853,7 @@ const handleAskReply = async (
       keepPendingClaimed();
       await supersedePendingAsks(task.id, "会话已失效");
       return errorResponse(
-        "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话或重新「推进」即可继续",
+        `没有可续接的 agent 会话（会话已失效）——${TASK_RESUME_HINT}`,
         409,
       );
     }

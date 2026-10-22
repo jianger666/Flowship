@@ -20,7 +20,12 @@
  * 和打包 app 并让它们共用同一个数据目录，两边各有一个调度器，到点的定时会**双发**。
  * 要这样用请给其中一个换 `FLOWSHIP_DATA_DIR`；没有做跨进程文件锁（代价 / 收益不成比例）。
  */
-import { bootArgsForTask, migrateProviderSettings } from "@/lib/agent-provider";
+import {
+  DANGLING_TASK_PROVIDER_MESSAGE,
+  bootArgsForTask,
+  isTaskProviderDangling,
+  migrateProviderSettings,
+} from "@/lib/agent-provider";
 import {
   buildScheduleInfoMeta,
   SCHEDULE_TICK_MS,
@@ -54,10 +59,18 @@ const warn = (msg: string, err?: unknown): void => {
   console.warn(`[schedule] ${msg}`, err instanceof Error ? err.message : (err ?? ""));
 };
 
-/** 读设置 → 与该会话输入条同口径的 bootArgs；读不到凭据 / 模型返回 null */
+/**
+ * 读设置 → 与该会话输入条同口径的 bootArgs；读不到凭据 / 模型返回 null。
+ * 会话绑定的自定义提供方已被删除 → 返回 `{ danglingProvider }`（调用方据此拒投、写明原因），
+ * 不能照常 bootArgsForTask：它会落回 Cursor 凭据、定时消息（含会话上下文）悄悄走云端（第四轮 Q2-02）。
+ */
 const loadBootArgs = async (
   task: NonNullable<Awaited<ReturnType<typeof getTaskMeta>>>,
-): Promise<{ apiKey: string; model: { id: string; params?: Array<{ id: string; value: string }> } } | null> => {
+): Promise<
+  | { apiKey: string; model: { id: string; params?: Array<{ id: string; value: string }> } }
+  | { danglingProvider: string }
+  | null
+> => {
   const result = await readSettingsFile();
   if (result.status !== "ok") return null;
   const raw = result.settings as Record<string, unknown>;
@@ -69,6 +82,9 @@ const loadBootArgs = async (
     provider: migrated.provider,
     customProviders: migrated.customProviders,
   } as unknown as FeAiFlowSettings;
+  if (isTaskProviderDangling(task, settings)) {
+    return { danglingProvider: DANGLING_TASK_PROVIDER_MESSAGE };
+  }
   const { apiKey, model } = bootArgsForTask(task, settings);
   if (!model?.id?.trim()) return null;
   return { apiKey, model: model as { id: string; params?: Array<{ id: string; value: string }> } };
@@ -105,6 +121,11 @@ export const deliverScheduleFire = async (req: DeliverRequest): Promise<DeliverO
 
   const boot = await loadBootArgs(task);
   if (!boot) return { kind: "failed", reason: "缺少 API Key 或模型，请先在设置页配置" };
+  // 悬空提供方：拒投并把原因落成「定时失败」提示（runner 会写进该会话的事件流）。
+  // 不标 permanent——用户在输入框底部重选提供方后，周期定时下一轮即可恢复
+  if ("danglingProvider" in boot) {
+    return { kind: "failed", reason: boot.danglingProvider };
+  }
 
   const body = {
     text: req.text,

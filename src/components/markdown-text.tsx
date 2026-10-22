@@ -18,11 +18,10 @@
  *   - 全站 shadcn oklch token、Streamdown 组件直接吃现有主题变量
  */
 
-import { memo, useMemo, type ReactNode } from "react";
+import { memo, useMemo, useRef, type ReactNode } from "react";
 import {
   Streamdown,
   defaultRemarkPlugins,
-  defaultRehypePlugins,
   type Components,
   type ThemeInput,
 } from "streamdown";
@@ -34,9 +33,15 @@ import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 
 import { cn } from "@/lib/utils";
-import { useSearchFieldGlobalOffset } from "@/components/ui/pane-search-highlight-context";
-import { rehypeSearchHighlight } from "@/lib/rehype-search-highlight";
 import { streamingCodePlugin } from "@/lib/streaming-code-highlighter";
+import {
+  STREAMDOWN_REHYPE_PLUGINS,
+  STREAMDOWN_REMEND_OPTIONS,
+  STREAMDOWN_TRANSLATIONS_ZH,
+  parseMarkdownIntoBlocksKeepReferences,
+  parseMarkdownIntoBlocksKeepReferencesStreaming,
+  resolveStreamdownMode,
+} from "@/lib/streamdown-options";
 import { MarkdownLink } from "@/components/markdown-link";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -53,16 +58,18 @@ import {
   pathDisplayLabel,
 } from "@/lib/path-utils";
 import { wrapLocalMarkdownImageDestinations } from "@/lib/local-image-src";
-import { rehypeRewriteLocalImages } from "@/lib/rehype-rewrite-local-images";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 
 // 插件实例全局一份（Shiki 高亮器有初始化开销、别每次 render 新建）
 const STREAMDOWN_PLUGINS = { code, mermaid, math, cjk };
-// 流式中专用：代码块限频高亮。上游每帧把整块代码重新分词（缓存键含 length、增长中必 miss），
+// 流式过的实例专用：代码块限频高亮。上游每帧把整块代码重新分词（缓存键含 length、增长中必 miss），
 // 代码密集的回复里占主线程 ~40%；这里文字照常逐帧增长、只把「上色」摊薄（见 throttled-code-plugin.ts）。
-// 流式结束后（streaming=false）换回上游插件：命中其缓存、即时补全最终配色。
+// 定稿后**不换回上游插件**（2026-10-20 V15-01）：plugins 是代码块高亮 effect 的依赖，换引用 = 所有代码块
+// 的高亮 effect 在定稿那一帧重跑一遍；限频插件的终态本来就是对的（不变式 I3：窗口到期的 trailing
+// 会对最新全文真实高亮一次、补齐配色），代价只是最后一截颜色最迟晚一个限频窗口（≤1s）、与流式期间一致。
+// 从没流式过的实例（历史消息 / 产物栏 / 文件预览）仍用上游插件。
 const STREAMDOWN_STREAMING_PLUGINS = {
   ...STREAMDOWN_PLUGINS,
   code: streamingCodePlugin,
@@ -78,14 +85,9 @@ const REMARK_PLUGINS = [
   remarkKeepTrailingUnderscore,
   remarkTrimAutolinkCjk,
 ];
-// rehype：传自定义列表也是整表替换。顺序 = raw → 本地图改写 → sanitize → harden。
-// 本地图必须在 sanitize 前改写（file:// 会被剥 src）；artifact / 修订视图共用此表。
-export const STREAMDOWN_REHYPE_PLUGINS = [
-  defaultRehypePlugins.raw,
-  rehypeRewriteLocalImages,
-  defaultRehypePlugins.sanitize,
-  defaultRehypePlugins.harden,
-];
+// rehype 插件链：列表本体在 lib/streamdown-options.ts（纯 .ts，测试能拿真实插件链跑 Streamdown）；这里原样再导出，
+// artifact-panel / artifact-revision-view 的导入路径不变。顺序 = raw → UNC 拦截 → 本地图改写 → sanitize → harden。
+export { STREAMDOWN_REHYPE_PLUGINS };
 // 操作栏精简（用户反馈「又有间距又有操作栏、太重」）：代码块只留复制、表格全关、
 // mermaid 留全屏 + 拖拽缩放（图表真需要）；行号也关（聊天场景不引用行号、纯噪音）
 export const STREAMDOWN_CONTROLS = {
@@ -259,14 +261,6 @@ interface MarkdownTextProps {
   blockImages?: boolean;
   /** 外层 prose 容器额外 class */
   className?: string;
-  /** 栏内搜索：事件 / 产物 ownerId（与 PaneSearchHighlightContext 或显式 props 配合） */
-  searchOwnerId?: string;
-  /** 栏内搜索字段 key，默认 body */
-  searchField?: string;
-  /** 显式搜索高亮（产物栏等不挂 Context 时用） */
-  searchQuery?: string;
-  searchActiveGlobalIndex?: number;
-  searchGlobalOffset?: number;
 }
 
 const MarkdownTextImpl = ({
@@ -277,11 +271,6 @@ const MarkdownTextImpl = ({
   size = "default",
   blockImages = false,
   className,
-  searchOwnerId,
-  searchField = "body",
-  searchQuery: searchQueryProp,
-  searchActiveGlobalIndex: searchActiveProp = -1,
-  searchGlobalOffset: searchGlobalOffsetProp,
 }: MarkdownTextProps) => {
   const linker = useLocalFilePathLinker(baseDir);
   const components = useMemo(
@@ -293,31 +282,17 @@ const MarkdownTextImpl = ({
     () => wrapLocalMarkdownImageDestinations(text),
     [text],
   );
-  const ctxHighlight = useSearchFieldGlobalOffset(
-    searchOwnerId ?? "",
-    searchField,
-  );
-  const searchQuery = searchQueryProp ?? ctxHighlight?.query ?? "";
-  const searchActiveGlobalIndex =
-    searchActiveProp >= 0
-      ? searchActiveProp
-      : (ctxHighlight?.activeGlobalIndex ?? -1);
-  const searchGlobalOffset =
-    searchGlobalOffsetProp ?? ctxHighlight?.globalOffset ?? -1;
+  // 搜索高亮不在这里做：事件流 / 产物栏统一走 DOM 的 CSS Custom Highlight（lib/dom-text-search），
+  // 不改 React 管理的 DOM、也就不会被 Streamdown 的块 memo 留下上一次查询的半截 <mark>（D3-07 清理了旧的 rehype <mark> 管线）
 
-  const rehypePlugins = useMemo(() => {
-    const base = [...STREAMDOWN_REHYPE_PLUGINS];
-    if (searchQuery.trim() && searchGlobalOffset >= 0) {
-      base.push(
-        rehypeSearchHighlight({
-          query: searchQuery,
-          activeGlobalIndex: searchActiveGlobalIndex,
-          globalOffset: searchGlobalOffset,
-        }),
-      );
-    }
-    return base;
-  }, [searchQuery, searchActiveGlobalIndex, searchGlobalOffset]);
+  // 「这个实例流式过」只增不减：流式 → 定稿时 Streamdown 的 mode 不能换（一换，内部子树从数组 child 变单元素
+  // child，整棵 Block / 代码块 / mermaid 卸载重挂），见 resolveStreamdownMode。
+  // 渲染期写 ref 是幂等的单调闩锁（false → true），StrictMode 双渲染 / 被丢弃的并发渲染都不会写出错误结果
+  // （最坏是多留在 streaming 模式）。streaming 与 static 的输出并不完全等价：streaming 逐块解析，
+  // 引用式链接 `[文档][1]` 的定义在另一个块里就失效——靠下面的 parseMarkdownIntoBlocksFn 补齐（R8-01）。
+  const hasStreamedRef = useRef(false);
+  if (streaming) hasStreamedRef.current = true;
+  const streamMode = resolveStreamdownMode(!!streaming, hasStreamedRef.current);
 
   return (
   <div
@@ -337,16 +312,34 @@ const MarkdownTextImpl = ({
     )}
   >
     <Streamdown
-      mode={streaming ? "streaming" : "static"}
+      mode={streamMode.mode}
+      // isAnimating 单独控制「还在不在吐字」（光标 / 控件禁用 / 未闭合块处理）；mode 不随它变
       isAnimating={streaming}
+      // 定稿时 false：文本已完整、不再让 remend 补全（会改写它）；流式中为 true
+      parseIncompleteMarkdown={streamMode.parseIncompleteMarkdown}
+      // 流式中未写完的链接只显示文字，不闪「文字 [blocked]」（V15-02）
+      remend={STREAMDOWN_REMEND_OPTIONS}
+      // 有引用定义的文本整篇当一个块：恒 streaming 模式下逐块解析会让 `[文档][1]` 永久变字面量（R8-01）
+      // 流式中再裁掉末尾没写完的定义行（否则 `[文档][1]` 会先指向被截断的 URL，Q7b-01）；定稿后用不裁的版本
+      parseMarkdownIntoBlocksFn={
+        streaming
+          ? parseMarkdownIntoBlocksKeepReferencesStreaming
+          : parseMarkdownIntoBlocksKeepReferences
+      }
       // 流式末尾闪烁光标（caret 无默认、不显式传就没光标）
       caret={streaming ? "block" : undefined}
       shikiTheme={SHIKI_THEME}
-      plugins={streaming ? STREAMDOWN_STREAMING_PLUGINS : STREAMDOWN_PLUGINS}
+      plugins={
+        streamMode.throttledCode
+          ? STREAMDOWN_STREAMING_PLUGINS
+          : STREAMDOWN_PLUGINS
+      }
       remarkPlugins={REMARK_PLUGINS}
-      rehypePlugins={rehypePlugins}
+      rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
       components={components}
       controls={STREAMDOWN_CONTROLS}
+      // 控件文案走中文（代码块「复制代码」/ mermaid 全屏 / 外链确认 / 图片兜底…），V15-08 / V14-04
+      translations={STREAMDOWN_TRANSLATIONS_ZH}
       // 行号视觉上不要（globals.css 藏 ::before 计数器）、但 **不能传 lineNumbers=false**：
       // 上游该路径行 span 不带 block class 也不吐换行、整块代码塌成一行（headless 实测）
     >

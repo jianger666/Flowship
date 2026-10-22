@@ -13,21 +13,30 @@
  * - dirty：各字段的 dirty map（缓存计算结果、不要每次 render 重算）
  * - hasUnsaved：dirty 任一为 true（用于离页提示）
  * - update / saveFieldValue：更新草稿（文本框输入用）/ 落盘某字段（编辑即保存）
- * - loaded：是否完成首次 config 初始化（避免 SSR/hydrate 闪空）
+ * - loaded：是否完成首次 config 初始化尝试（避免 SSR/hydrate 闪空；不代表加载成功，见 loadFailed）
  * - unreadable：config.json 读取阶段就不可读（损坏 / 权限等）时的 reason；非 null 时暂停保存、
  *   设置页只展示错误提示（settings 此时是默认值、不是用户的配置）
+ * - loadFailed：init 没能拿到磁盘上的真实配置（含 unreadable，也含网络 / 服务没就绪这类瞬时失败）。
+ *   true 时 settings 只是默认值：设置页显示「加载失败 + 重试加载」、一切保存被拒（review #16）
+ * - retryLoad / retrying：重新加载真实配置（失败态才有意义）；成功后草稿换成真实配置、才允许编辑
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import {
   DEFAULT_SETTINGS,
+  getLastSettingsRejectReason,
   getSettings,
   getSettingsUnreadable,
   initSettings,
+  isSettingsLoaded,
   saveSettingsDetailed,
 } from "@/lib/local-store";
+import {
+  SETTINGS_NOT_LOADED_TOAST,
+  canPersistSettings,
+} from "@/lib/settings-load-state";
 import {
   createSaveRetrier,
   saveWithRetry,
@@ -45,8 +54,10 @@ import type {
 } from "@/lib/types";
 
 /** 服务端 4xx 拒绝保存（如校验不过的 400）：这类失败重试不会成功，所以文案不能说「将自动重试」 */
-const rejectedToast = (status: number): string =>
-  `保存失败：服务端拒绝了这次修改（HTTP ${status}）、不会自动重试。请检查输入后再改一次该项`;
+export const rejectedToast = (status: number, reason?: string | null): string =>
+  reason?.trim()
+    ? `保存失败：服务端拒绝了这次修改（HTTP ${status}）：${reason.trim()}。不会自动重试，请检查后再改一次该项`
+    : `保存失败：服务端拒绝了这次修改（HTTP ${status}）、不会自动重试。请检查输入后再改一次该项`;
 
 // RepoConfig 稳定序列化比较：字段顺序固定、可选字段缺省归一空串（CR-09）。
 // 加新字段时记得补这里——漏了该字段的编辑不会触发 dirty。
@@ -115,6 +126,11 @@ export interface UseSettingsResult {
   savedSettings: FeAiFlowSettings;
   loaded: boolean;
   unreadable: SettingsUnreadable | null;
+  /** init 没拿到磁盘上的真实配置（含 unreadable）；此时 settings 只是默认值、保存被拒 */
+  loadFailed: boolean;
+  /** 「重试加载」进行中 */
+  retrying: boolean;
+  retryLoad: () => Promise<void>;
   dirty: Record<SettingsField, boolean>;
   hasUnsaved: boolean;
   update: <K extends SettingsField>(key: K, value: FeAiFlowSettings[K]) => void;
@@ -279,21 +295,59 @@ export const useSettings = (): UseSettingsResult => {
   const unreadableRef = useRef(unreadable);
   unreadableRef.current = unreadable;
 
+  // init 没能拿到磁盘上的真实配置（含 unreadable；也含网络 / 服务没就绪这类瞬时失败，它们没有 unreadable 状态）。
+  // 此时 settings 只是默认值：以前这种情况渲染一个无提示的空表单、改一项就以默认值为底整包 PUT 覆盖磁盘（review #16）。
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const retryingRef = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // 把 local-store 的 init 结果（真实配置 or 默认值 + 失败态）同步进 hook 状态；首次加载与「重试加载」共用
+  const applyInitResult = useCallback(() => {
+    const s = getSettings();
+    setSettings(s);
+    setSavedSettings(s);
+    setUnreadable(getSettingsUnreadable());
+    setLoadFailed(!isSettingsLoaded());
+    setLoaded(true);
+  }, []);
+
   // 首次挂载：先 await 配置初始化（读 config.json）、再灌进草稿态
   useEffect(() => {
     let alive = true;
     void initSettings().then(() => {
       if (!alive) return;
-      const s = getSettings();
-      setSettings(s);
-      setSavedSettings(s);
-      setUnreadable(getSettingsUnreadable());
-      setLoaded(true);
+      applyInitResult();
     });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [applyInitResult]);
+
+  // 「重试加载」：失败态下重新 GET /full；成功 → 草稿换成真实配置、解除拒写；仍失败 → 保持拒写并提示。
+  // initSettings 失败会清空单飞 promise，所以这里会真的重新发请求（成功后再调只会复用结果）
+  const retryLoad = useCallback(async (): Promise<void> => {
+    if (retryingRef.current) return;
+    retryingRef.current = true;
+    setRetrying(true);
+    try {
+      await initSettings();
+    } finally {
+      retryingRef.current = false;
+      if (mountedRef.current) {
+        applyInitResult();
+        setRetrying(false);
+        if (isSettingsLoaded()) toast.success("配置已加载");
+        else toast.error("重试加载仍失败，设置继续保持暂停保存");
+      }
+    }
+  }, [applyInitResult]);
 
   // dirty 状态按字段缓存：各字段在 settings/savedSettings 任意变化时才重算
   // 避免之前每次 render 多次 JSON.stringify 的浪费
@@ -358,9 +412,10 @@ export const useSettings = (): UseSettingsResult => {
   );
 
   // 不可读时没有任何东西能存：不再算「有未保存修改」，免得离页还被 beforeunload 拦一道
+  // 加载失败同理：草稿 = 默认值、没有「已保存」可言，也存不进去
   const hasUnsaved = useMemo(
-    () => !unreadable && Object.values(dirty).some(Boolean),
-    [dirty, unreadable]
+    () => !unreadable && !loadFailed && Object.values(dirty).some(Boolean),
+    [dirty, unreadable, loadFailed]
   );
 
   // 通用字段更新工具：只改草稿、不写 config.json
@@ -393,7 +448,8 @@ export const useSettings = (): UseSettingsResult => {
         onGiveUp: () =>
           toast.error("配置多次重试仍未能保存、请检查磁盘 / 服务后再改一次该项"),
         // 重试那一次才被服务端 4xx 拒绝（如配置已被别处改成校验不过的形态）：同一份内容再重试没有意义
-        onRejected: (_key, status) => toast.error(rejectedToast(status)),
+        onRejected: (_key, status) =>
+          toast.error(rejectedToast(status, getLastSettingsRejectReason())),
       });
     }
     return retrierRef.current;
@@ -416,6 +472,13 @@ export const useSettings = (): UseSettingsResult => {
       toast.error(describeSettingsUnreadable(unreadableRef.current.reason).headline);
       return Promise.resolve(false);
     }
+    // 没成功加载过磁盘上的真实配置（瞬时失败 / 服务没就绪）：getSettings() 只是默认值，
+    // 在它上面改一项再整包 PUT 会覆盖磁盘配置——同样不改草稿、不落盘、不排自动重试（重试也基于默认值）。
+    // 直接问 local-store（真值源）、不用 loadFailed state：state 要等下一次渲染才更新，这里是兜底
+    if (!canPersistSettings({ initSucceeded: isSettingsLoaded() })) {
+      toast.error(SETTINGS_NOT_LOADED_TOAST);
+      return Promise.resolve(false);
+    }
     const next: FeAiFlowSettings = { ...getSettings(), [key]: value };
     setSettings((prev) => ({ ...prev, [key]: value }));
     // 作废旧重试 + 失败登记重试都交给 saveWithRetry：它按世代判断「期间是否有同字段的新保存」，
@@ -424,10 +487,13 @@ export const useSettings = (): UseSettingsResult => {
     return saveWithRetry({
       retrier: getRetrier(),
       key,
-      first: () => saveSettingsDetailed(next),
+      first: () => saveSettingsDetailed(next, [key]),
       retry: async () => {
         // 重试用「落盘最新」做 base、只覆盖本字段（同首次保存）
-        const res = await saveSettingsDetailed({ ...getSettings(), [key]: value });
+        const res = await saveSettingsDetailed(
+          { ...getSettings(), [key]: value },
+          [key],
+        );
         if (res.ok) setSavedSettings((prev) => ({ ...prev, [key]: value }));
         return res;
       },
@@ -435,7 +501,8 @@ export const useSettings = (): UseSettingsResult => {
       // 并登记自动重试——之前失败后草稿再没人去存、只能等用户碰巧再改一次
       onFailed: () => toast.error("保存失败：配置没能写入 config.json、将自动重试"),
       // 被服务端 4xx 拒绝：不会重试，提示不能再说「将自动重试」
-      onRejected: (status) => toast.error(rejectedToast(status)),
+      onRejected: (status) =>
+        toast.error(rejectedToast(status, getLastSettingsRejectReason())),
     }).then((ok) => {
       if (ok) setSavedSettings((prev) => ({ ...prev, [key]: value }));
       return ok;
@@ -464,6 +531,9 @@ export const useSettings = (): UseSettingsResult => {
     savedSettings,
     loaded,
     unreadable,
+    loadFailed,
+    retrying,
+    retryLoad,
     dirty,
     hasUnsaved,
     update,

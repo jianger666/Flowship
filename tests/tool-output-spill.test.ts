@@ -8,10 +8,28 @@
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-tool-output-spill-"));
 process.env.FLOWSHIP_DATA_DIR = TMP_ROOT;
+
+// 落盘只建 `tool-outputs/` 一层、不再替不存在的任务 recursive 建任务目录（D4b-02：目录不存在 = 任务已被删）。
+// 这些用例模拟的是「任务存在」，所以先把任务目录建好
+beforeAll(async () => {
+  for (const id of [
+    "task-v2-spill",
+    "task-v2-fail",
+    "task-v2-read",
+    "task-v2-sub",
+    "task-v2-ui",
+    "task-v2-mcp",
+    "task-v2-e2e",
+    "task-v2-link",
+    "task-v2-cursor",
+  ]) {
+    await fs.mkdir(path.join(TMP_ROOT, "tasks", id), { recursive: true });
+  }
+});
 
 const {
   MODEL_OUTPUT_DEFAULT_BUDGET,

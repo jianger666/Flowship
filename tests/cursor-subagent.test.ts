@@ -20,7 +20,10 @@ import {
   type SubagentChildAgent,
   type SubagentChildRun,
 } from "@/lib/server/cursor-subagent";
-import { getSubagentParentModel } from "@/lib/server/subagent-parent-model";
+import {
+  getSubagentDisplayLookup,
+  getSubagentParentModel,
+} from "@/lib/server/subagent-parent-model";
 import { SUBAGENT_INPUT_JSON_SCHEMA, type ModelCatalogEntry } from "@/lib/subagent-spec";
 
 // ----------------- 假依赖 -----------------
@@ -1140,5 +1143,225 @@ describe("onParentCancel：父取消联动的搭便车钩子（wait 用它在 ru
   it("不传钩子 = 行为不变", async () => {
     const { deps } = makeDeps();
     await expect(createCursorSubagentLink(deps).cancelAll()).resolves.toBeUndefined();
+  });
+});
+
+// ----------------- 展示用查表：默认 effort / resume 子代理的模型 -----------------
+
+/** 带默认档的目录（形状同 2026-10-19 真实清单：sonnet-5-5 默认 high、gemini-4-argon 默认 medium） */
+const CATALOG_WITH_DEFAULTS: ModelCatalogEntry[] = [
+  { id: "composer-2.5", displayName: "Composer 2.5", efforts: [] },
+  {
+    id: "claude-sonnet-5-5",
+    displayName: "Claude Sonnet 5.5",
+    effortParamId: "reasoning_effort",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+    defaultEffort: "high",
+  },
+  {
+    id: "gemini-4-argon",
+    displayName: "Gemini 4 Argon",
+    effortParamId: "reasoning_effort",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "medium",
+  },
+];
+
+describe("展示用查表：该模型的默认 effort", () => {
+  beforeEach(() => __resetSubagentResumablesForTests());
+
+  const lookupOf = (link: ReturnType<typeof createCursorSubagentLink>) =>
+    getSubagentDisplayLookup(link.attach(parentOf("P-lookup")))!;
+
+  it("attach 返回的对象上登记了查表函数；原对象 / 别的对象查不到", () => {
+    const { deps } = makeDeps();
+    const link = createCursorSubagentLink(deps);
+    const raw = parentOf("P1");
+    const wrapped = link.attach(raw);
+    expect(getSubagentDisplayLookup(wrapped)).toEqual({
+      defaultEffortOf: expect.any(Function),
+      resumedChildOf: expect.any(Function),
+    });
+    expect(getSubagentDisplayLookup(raw)).toBeUndefined();
+    expect(getSubagentDisplayLookup(parentOf("P2"))).toBeUndefined();
+  });
+
+  it("目录还没拉过、也没有可偷看的缓存：查不到（不发网络请求、不抛）", () => {
+    const { deps, loadCatalog } = makeDeps();
+    const lookup = lookupOf(createCursorSubagentLink(deps));
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBeUndefined();
+    expect(loadCatalog).not.toHaveBeenCalled();
+  });
+
+  it("peekCatalog 有缓存：直接查得到；peekCatalog 本身只读，不触发 loadCatalog", () => {
+    const { deps, loadCatalog } = makeDeps();
+    const peekCatalog = vi.fn(() => CATALOG_WITH_DEFAULTS);
+    const lookup = lookupOf(createCursorSubagentLink({ ...deps, peekCatalog }));
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBe("high");
+    expect(lookup.defaultEffortOf!("gemini-4-argon")).toBe("medium");
+    expect(lookup.defaultEffortOf!("composer-2.5")).toBeUndefined();
+    expect(lookup.defaultEffortOf!("not-in-catalog")).toBeUndefined();
+    expect(loadCatalog).not.toHaveBeenCalled();
+  });
+
+  it("peekCatalog 抛错 / 返回 null：当没有，不抛、不影响查表", () => {
+    const { deps } = makeDeps();
+    const throwing = lookupOf(
+      createCursorSubagentLink({
+        ...deps,
+        peekCatalog: () => {
+          throw new Error("cache boom");
+        },
+      }),
+    );
+    expect(throwing.defaultEffortOf!("claude-sonnet-5-5")).toBeUndefined();
+    const empty = lookupOf(createCursorSubagentLink({ ...deps, peekCatalog: () => null }));
+    expect(empty.defaultEffortOf!("claude-sonnet-5-5")).toBeUndefined();
+  });
+
+  it("显式选模型的调用拉过目录后，这份目录被记住：之后（同步）就查得到，peekCatalog 缺省也行", async () => {
+    const { deps, loadCatalog } = makeDeps({
+      loadCatalog: vi.fn(async () => CATALOG_WITH_DEFAULTS),
+    });
+    const link = createCursorSubagentLink(deps);
+    const lookup = lookupOf(link);
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBeUndefined();
+    await call(link, { prompt: "x", model: "claude-sonnet-5-5" });
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBe("high");
+    // 记住目录不等于不再拉：每次显式选模型仍照常 loadCatalog（目录可能在两次调用之间变了）
+    await call(link, { prompt: "y", model: "gemini-4-argon" });
+    expect(loadCatalog).toHaveBeenCalledTimes(2);
+  });
+
+  it("缓存（peekCatalog）比记住的那份新鲜：两边都有时以缓存为准——长会话里目录变了不用旧默认档", async () => {
+    const changed = CATALOG_WITH_DEFAULTS.map((e) =>
+      e.id === "claude-sonnet-5-5" ? { ...e, defaultEffort: "medium" } : e,
+    );
+    const { deps } = makeDeps({
+      loadCatalog: vi.fn(async () => CATALOG_WITH_DEFAULTS),
+    });
+    let peeked: ModelCatalogEntry[] | null = null;
+    const link = createCursorSubagentLink({ ...deps, peekCatalog: () => peeked });
+    const lookup = lookupOf(link);
+    await call(link, { prompt: "x", model: "claude-sonnet-5-5" }); // 记住：默认 high
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBe("high"); // 缓存没有 → 兜底用记住的
+    peeked = changed; // 之后目录刷新了
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBe("medium");
+    peeked = null; // 缓存过期 → 又退回记住的
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBe("high");
+  });
+
+  it("peekCatalog 抛错时退回记住的那份（不是直接当没有）", async () => {
+    const { deps } = makeDeps({
+      loadCatalog: vi.fn(async () => CATALOG_WITH_DEFAULTS),
+    });
+    const link = createCursorSubagentLink({
+      ...deps,
+      peekCatalog: () => {
+        throw new Error("cache boom");
+      },
+    });
+    const lookup = lookupOf(link);
+    await call(link, { prompt: "x", model: "claude-sonnet-5-5" });
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBe("high");
+  });
+
+  it("loadCatalog 拿不到（null）：不覆盖之前记住的目录", async () => {
+    let n = 0;
+    const loadCatalog = vi.fn(async () => (n++ === 0 ? CATALOG_WITH_DEFAULTS : null));
+    const { deps } = makeDeps({ loadCatalog });
+    const link = createCursorSubagentLink(deps);
+    const lookup = lookupOf(link);
+    await call(link, { prompt: "x", model: "claude-sonnet-5-5" });
+    await call(link, { prompt: "y", model: "gemini-4-argon" }); // 这次拿不到、不校验
+    expect(lookup.defaultEffortOf!("claude-sonnet-5-5")).toBe("high");
+  });
+});
+
+describe("展示用查表：resume 接着的子代理当初用的模型 / effort", () => {
+  beforeEach(() => __resetSubagentResumablesForTests());
+
+  it("显式别的模型、没写 effort：模型 + 该模型的默认档", async () => {
+    const { deps } = makeDeps({
+      withIds: true,
+      loadCatalog: vi.fn(async () => CATALOG_WITH_DEFAULTS),
+    });
+    const link = createCursorSubagentLink(deps);
+    const lookup = getSubagentDisplayLookup(link.attach(parentOf("P-r1")))!;
+    await call(link, { prompt: "x", model: "claude-sonnet-5-5" });
+    expect(lookup.resumedChildOf!("child-1")).toEqual({
+      model: "claude-sonnet-5-5",
+      effort: "high",
+    });
+  });
+
+  it("显式写了 effort：用写的那个，不是默认档", async () => {
+    const { deps } = makeDeps({
+      withIds: true,
+      loadCatalog: vi.fn(async () => CATALOG_WITH_DEFAULTS),
+    });
+    const link = createCursorSubagentLink(deps);
+    const lookup = getSubagentDisplayLookup(link.attach(parentOf("P-r2")))!;
+    await call(link, { prompt: "x", model: "claude-sonnet-5-5", effort: "xhigh" });
+    expect(lookup.resumedChildOf!("child-1")).toEqual({
+      model: "claude-sonnet-5-5",
+      effort: "xhigh",
+    });
+  });
+
+  it("沿用父会话：用父会话当前档（参数里有就不退到默认档）", async () => {
+    const { deps } = makeDeps({
+      withIds: true,
+      parentModel: {
+        id: "claude-sonnet-5-5",
+        params: [{ id: "reasoning_effort", value: "low" }],
+      },
+    });
+    const link = createCursorSubagentLink({
+      ...deps,
+      peekCatalog: () => CATALOG_WITH_DEFAULTS,
+    });
+    const lookup = getSubagentDisplayLookup(link.attach(parentOf("P-r3")))!;
+    await call(link, { prompt: "x" });
+    expect(lookup.resumedChildOf!("child-1")).toEqual({
+      model: "claude-sonnet-5-5",
+      effort: "low",
+    });
+  });
+
+  it("没有 effort 可显示（模型没有档位）：只给 model，不带 effort 键", async () => {
+    const { deps } = makeDeps({
+      withIds: true,
+      loadCatalog: vi.fn(async () => CATALOG_WITH_DEFAULTS),
+    });
+    const link = createCursorSubagentLink(deps);
+    const lookup = getSubagentDisplayLookup(link.attach(parentOf("P-r4")))!;
+    await call(link, { prompt: "x", model: "composer-2.5" });
+    const info = lookup.resumedChildOf!("child-1");
+    expect(info).toEqual({ model: "composer-2.5" });
+    expect(info).not.toHaveProperty("effort");
+  });
+
+  it("登记表里没有这个 id / 当初没有显式模型（父会话没选、也没换）→ undefined", async () => {
+    const { deps } = makeDeps({ withIds: true, parentModel: undefined });
+    const link = createCursorSubagentLink({ ...deps, parentModel: undefined });
+    const lookup = getSubagentDisplayLookup(link.attach(parentOf("P-r5")))!;
+    await call(link, { prompt: "x" });
+    expect(lookup.resumedChildOf!("child-1")).toBeUndefined();
+    expect(lookup.resumedChildOf!("agent-never-seen")).toBeUndefined();
+  });
+
+  it("按父会话分桶：别的父会话派的子代理查不到", async () => {
+    const { deps } = makeDeps({
+      withIds: true,
+      loadCatalog: vi.fn(async () => CATALOG_WITH_DEFAULTS),
+    });
+    const a = createCursorSubagentLink(deps);
+    const lookupA = getSubagentDisplayLookup(a.attach(parentOf("P-A")))!;
+    const b = createCursorSubagentLink(deps);
+    const lookupB = getSubagentDisplayLookup(b.attach(parentOf("P-B")))!;
+    await call(a, { prompt: "x", model: "claude-sonnet-5-5" });
+    expect(lookupA.resumedChildOf!("child-1")).toBeDefined();
+    expect(lookupB.resumedChildOf!("child-1")).toBeUndefined();
   });
 });

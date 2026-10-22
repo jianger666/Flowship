@@ -23,7 +23,9 @@ import { randomUUID } from "node:crypto";
 import { Agent as CursorAgent } from "@cursor/sdk";
 
 import {
+  DANGLING_TASK_PROVIDER_MESSAGE,
   findCustomProvider,
+  isTaskProviderDangling,
   migrateProviderSettings,
   resolveTaskProvider,
 } from "@/lib/agent-provider";
@@ -290,6 +292,25 @@ export const resolveProviderIdFromDisk = async (task: {
   const migrated = migrateProviderSettings(
     result.status === "ok" ? result.settings : {},
   );
+  return resolveTaskProvider(task, migrated);
+};
+
+/**
+ * 起新会话用的 providerId：同 resolveProviderIdFromDisk，但任务绑定的自定义提供方已被删除时直接报错，
+ * 不静默落回 Cursor（第三轮 D1-03：旧对话的上下文 / 代码会悄悄改走云端，违背选内网网关的初衷）。
+ * 配置读不出来时不判「已删除」（空的 customProviders 只是读盘失败的副产物）。
+ */
+export const resolveProviderIdForCreate = async (task: {
+  provider?: string;
+  sessionAgentId?: string;
+}): Promise<string> => {
+  const result = await readSettingsFile();
+  const migrated = migrateProviderSettings(
+    result.status === "ok" ? result.settings : {},
+  );
+  if (result.status === "ok" && isTaskProviderDangling(task, migrated)) {
+    throw new Error(DANGLING_TASK_PROVIDER_MESSAGE);
+  }
   return resolveTaskProvider(task, migrated);
 };
 

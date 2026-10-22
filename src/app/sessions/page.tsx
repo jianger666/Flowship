@@ -39,10 +39,23 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskList } from "@/hooks/use-task-list";
+import { deriveListLoadView } from "@/lib/load-outcome";
 import { formatRelative, REPO_STATUS_LABEL } from "@/lib/task-display";
 import { hasBackgroundSubagents } from "@/lib/task-background";
-import { setTaskArchived } from "@/lib/task-store";
+import { setTaskArchivedWithReport } from "@/lib/task-store";
 import { isWorktreeTaskLike } from "@/lib/lightweight-task";
+import {
+  buildArchiveToast,
+  buildDeleteToast,
+  buildRestoreToast,
+  restoreToastNeeded,
+  buildStaleDeletedToast,
+  buildStaleForceDescription,
+  withDeleteFailurePrefix,
+  interpretStaleDeleteResponse,
+  type DeleteWorktreeReportBody,
+  type StaleDeleteOutcome,
+} from "@/lib/worktree-report";
 import {
   matchesSessionQuery,
   pickArchivedSessions,
@@ -83,6 +96,10 @@ const MODE_FILTERS: Array<{ key: ModeFilter; label: string }> = [
 /** 残留工作区勾选前缀，避免和任务 id 在 Set 里撞车 */
 const STALE_PICK_PREFIX = "stale:";
 
+/** 删除确认框里的提醒：隔离工作区里可能有还没提交的代码（服务端会先尽量存快照，存不下就保留目录） */
+const DELETE_UNCOMMITTED_NOTE =
+  "隔离工作区里可能有未提交的代码：删除前会先尽量存成快照，存不下的目录会保留、不会被删掉。";
+
 interface StorageEntry {
   id: string;
   bytes: number;
@@ -110,8 +127,18 @@ const repoTail = (t: TaskSummary): string => {
 
 const SessionsPage = () => {
   const router = useRouter();
-  const { tasks, loaded, upsertTask, refresh, deleteTaskById, markArchiving, unmarkArchiving } =
-    useTaskList();
+  const {
+    tasks,
+    loaded,
+    loadError,
+    upsertTask,
+    refresh,
+    deleteTaskById,
+    markArchiving,
+    unmarkArchiving,
+  } = useTaskList();
+  // 列表首拉失败后的重试中（按钮转圈 + 防连点）
+  const [retryingList, setRetryingList] = useState(false);
   const { confirm } = useDialog();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterKey>("all");
@@ -355,10 +382,10 @@ const SessionsPage = () => {
       // 恢复方向同样标记： success upsert 之后、轮询仍可能拿回旧快照（archived:true）盖掉
       markArchiving(task.id, false);
       try {
-        const updated = await setTaskArchived(task.id, false);
+        const { task: updated, report } = await setTaskArchivedWithReport(task.id, false);
         upsertTask(updated);
         if (task.pinned) restorePinnedOrder(task.id);
-        toast.success(`已恢复「${task.title}」`);
+        toast.success(buildRestoreToast(task.title, report));
       } catch (err) {
         toast.error(`恢复失败：${(err as Error).message}`);
         markBusy(task.id, false);
@@ -374,7 +401,8 @@ const SessionsPage = () => {
   const handleToggleArchive = async (task: TaskSummary) => {
     if (busyIds.has(task.id)) return;
     const next = !task.archived;
-    // 清理口径与服务端 archiveTaskWithCleanup 一致：isWorktreeTaskLike（task-worktrees.ts isWorktreeTask 的前端同口径）
+    // 仅用于「归档前」的确认文案预告（还没请求，只能预测）；归档后的 toast 一律以服务端回报 report 为准（review D2b-06）。
+    // 口径与服务端 archiveTaskWithReport 一致：isWorktreeTaskLike（task-worktrees.ts isWorktreeTask 的前端同口径）
     const willCleanup = next && isWorktreeTaskLike(task);
     if (next && task.runStatus === "running") {
       const ok = await confirm({
@@ -391,11 +419,11 @@ const SessionsPage = () => {
     // 归档/恢复双向都标记（恢复窗口拦 archived:true 的旧快照，反向闪现同账）
     markArchiving(task.id, next);
     try {
-      const updated = await setTaskArchived(task.id, next);
+      const { task: updated, report } = await setTaskArchivedWithReport(task.id, next);
       upsertTask(updated);
       if (!next) {
         if (task.pinned) restorePinnedOrder(task.id);
-        toast.success(`已恢复「${task.title}」`);
+        toast.success(buildRestoreToast(task.title, report));
       } else {
         // 会话页归档也把存储里置顶序的幽灵 id 摘掉；侧栏内存态不用通知——
         // 渲染层本来就忽略不存在的 id，侧栏下次自己 prune/save 时自愈
@@ -404,15 +432,13 @@ const SessionsPage = () => {
             loadSidebarPinnedOrder().filter((x) => x !== task.id),
           );
         }
-        const running = task.runStatus === "running";
-        toast.success(
-          running && !willCleanup
-            ? `已归档「${task.title}」、任务仍在后台跑`
-            : running
-              ? `已归档「${task.title}」、已停止并清理隔离工作区`
-              : willCleanup
-                ? `已归档「${task.title}」、已清理隔离工作区`
-                : `已归档「${task.title}」`,
+        const archiveToast = buildArchiveToast({
+          title: task.title,
+          wasRunning: task.runStatus === "running",
+          report,
+        });
+        (archiveToast.kind === "warning" ? toast.warning : toast.success)(
+          archiveToast.message,
           {
             action: {
               label: "撤销",
@@ -420,9 +446,15 @@ const SessionsPage = () => {
                 void (async () => {
                   markArchiving(task.id, false);
                   try {
-                    const restored = await setTaskArchived(task.id, false);
+                    const { task: restored, report: restoreReport } =
+                      await setTaskArchivedWithReport(task.id, false);
                     upsertTask(restored);
                     if (task.pinned) restorePinnedOrder(task.id);
+                    // 撤销也把定时找回来了：说一声（没定时就不打扰）
+                    // （Q9-06：已过点记为「已错过」/ 已用满次数的也要说，不只恢复了才说）
+                    if (restoreToastNeeded(restoreReport)) {
+                      toast.success(buildRestoreToast(task.title, restoreReport));
+                    }
                   } catch (err) {
                     toast.error(`撤销失败：${(err as Error).message}`);
                   } finally {
@@ -450,23 +482,26 @@ const SessionsPage = () => {
     const size = sizeById.get(task.id)?.total;
     const ok = await confirm({
       title: "彻底删除？",
-      description: `「${task.title}」将被永久删除、连同 data/tasks/${task.id}/ 整个目录${size ? `（约 ${formatBytes(size)}）` : ""}、不可恢复。`,
+      description: `「${task.title}」将被永久删除、连同 data/tasks/${task.id}/ 整个目录${size ? `（约 ${formatBytes(size)}）` : ""}、不可恢复。${isWorktreeTaskLike(task) ? DELETE_UNCOMMITTED_NOTE : ""}`,
       destructive: true,
       confirmLabel: "彻底删除",
     });
     if (!ok) return;
     markBusy(task.id, true);
     try {
-      await deleteTaskById(task.id);
+      let report: DeleteWorktreeReportBody | undefined;
+      await deleteTaskById(task.id, { onReport: (r) => (report = r) });
       setPicked((prev) => {
         const next = new Set(prev);
         next.delete(task.id);
         return next;
       });
-      toast.success(`已彻底删除「${task.title}」`);
+      // 文案只认服务端回报：目录因快照失败被保留时不能说「已彻底删除」就完事
+      const deleted = buildDeleteToast(task.title, report);
+      (deleted.kind === "warning" ? toast.warning : toast.success)(deleted.message);
       void scan();
     } catch (err) {
-      toast.error(`删除失败：${(err as Error).message}`);
+      toast.error(withDeleteFailurePrefix((err as Error).message));
       void refresh();
     } finally {
       markBusy(task.id, false);
@@ -485,7 +520,7 @@ const SessionsPage = () => {
       .map((k) => k.slice(STALE_PICK_PREFIX.length));
     const ok = await confirm({
       title: `删除 ${toDelete.size} 项？`,
-      description: `将删除当前列表中已勾选的 ${toDelete.size} 项：${taskKeys.length} 个会话与 ${staleIds.length} 个残留工作区（${pickedBytesText}）、不可恢复。正在跑的会先停掉。`,
+      description: `将删除当前列表中已勾选的 ${toDelete.size} 项：${taskKeys.length} 个会话与 ${staleIds.length} 个残留工作区（${pickedBytesText}）、不可恢复。正在跑的会先停掉。${DELETE_UNCOMMITTED_NOTE}`,
       confirmLabel: "删除",
       destructive: true,
     });
@@ -496,16 +531,22 @@ const SessionsPage = () => {
     ];
     setDeleting({ done: 0, total: jobs.length });
     let failed = 0;
+    // 被守卫保留的（未提交改动没存下来）：不算失败也不算删掉——批量里不替用户做「强删」决定，
+    // 留在列表里让用户逐个确认（单个删除会弹二次确认）
+    let kept = 0;
     for (let i = 0; i < jobs.length; i++) {
       try {
         if (jobs[i].kind === "task") {
-          await deleteTaskById(jobs[i].id);
+          let keptHere = false;
+          await deleteTaskById(jobs[i].id, {
+            onReport: (r) => {
+              keptHere = (r.worktreeKept?.length ?? 0) > 0;
+            },
+          });
+          if (keptHere) kept++;
         } else {
-          const res = await fetch(
-            `/api/system/storage?stale=${encodeURIComponent(jobs[i].id)}`,
-            { method: "DELETE" },
-          );
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const outcome = await deleteStaleWorktree(jobs[i].id);
+          if (outcome.kind === "kept") kept++;
         }
       } catch {
         failed++;
@@ -518,8 +559,13 @@ const SessionsPage = () => {
     if (failed > 0) {
       toast.error(`${failed} 个删除失败、其余已删`);
       void refresh();
-    } else
+    } else if (kept > 0) {
+      toast.warning(
+        `已处理 ${jobs.length} 项，其中 ${kept} 项的工作区里有未提交的改动没能自动保存，目录已保留；请到列表里逐个确认后再删`,
+      );
+    } else {
       toast.success(`已删除 ${jobs.length} 个、释放${pickedBytesText}`);
+    }
     setPicked(new Set());
     void scan();
   };
@@ -530,33 +576,51 @@ const SessionsPage = () => {
     if (!order.includes(taskId)) saveSidebarPinnedOrder([...order, taskId]);
   };
 
-  const deleteStaleWorktree = async (id: string): Promise<void> => {
+  // 服务端先逐个目录走快照守卫：存得下 → 落快照再删；存不下 → 目录保留并回 409（outcome.kind==="kept"）。
+  // force=true 才越过守卫（用户在二次确认框里点了「仍要删除」）。
+  const deleteStaleWorktree = async (id: string, force = false): Promise<StaleDeleteOutcome> => {
     const res = await fetch(
-      `/api/system/storage?stale=${encodeURIComponent(id)}`,
+      `/api/system/storage?stale=${encodeURIComponent(id)}${force ? "&force=1" : ""}`,
       { method: "DELETE" },
     );
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body: unknown = await res.json().catch(() => null);
+    return interpretStaleDeleteResponse(res.status, body);
   };
 
   const handleDeleteStale = async (s: { id: string; bytes: number }) => {
     const ok = await confirm({
       title: "删除残留工作区？",
-      description: `${s.id}（约 ${formatBytes(s.bytes)}）、不可恢复。`,
+      description: `${s.id}（约 ${formatBytes(s.bytes)}）、不可恢复。其中可能有未提交的代码：会先尽量存成快照，存不下的会再问你一次。`,
       destructive: true,
       confirmLabel: "删除",
     });
     if (!ok) return;
     try {
-      await deleteStaleWorktree(s.id);
+      let outcome = await deleteStaleWorktree(s.id);
+      if (outcome.kind === "kept") {
+        // 守卫拦下：这些目录里的未提交改动存不下来，直接删就找不回了——再问一次，确认才强删
+        const force = await confirm({
+          title: "有未提交的代码没能保存",
+          description: buildStaleForceDescription(outcome.kept),
+          destructive: true,
+          confirmLabel: "仍要删除",
+        });
+        if (!force) {
+          void scan();
+          return;
+        }
+        outcome = await deleteStaleWorktree(s.id, true);
+        if (outcome.kind === "kept") throw new Error("目录仍未能清理，请稍后重试");
+      }
       setPicked((prev) => {
         const next = new Set(prev);
         next.delete(`${STALE_PICK_PREFIX}${s.id}`);
         return next;
       });
-      toast.success("已删除残留工作区");
+      toast.success(buildStaleDeletedToast(outcome.kind === "ok" ? outcome.snapshots : undefined));
       void scan();
     } catch (err) {
-      toast.error(`删除失败：${(err as Error).message}`);
+      toast.error(withDeleteFailurePrefix((err as Error).message));
     }
   };
 
@@ -567,6 +631,14 @@ const SessionsPage = () => {
   };
 
   if (!loaded) return <LoadingState variant="hero" />;
+
+  // 列表首拉失败（没任何旧数据 + 有失败原因）≠「还没有对话」：不下「没有」的结论，给重试
+  //（口径与侧栏 / /chats 同源，见 lib/load-outcome 的 deriveListLoadView）
+  const listView = deriveListLoadView({
+    loaded,
+    loadError,
+    count: tasks.length,
+  });
 
   const staleList = storage?.staleWorktrees ?? [];
 
@@ -648,22 +720,29 @@ const SessionsPage = () => {
             const active = sort === s.key;
             const unavailable = s.key === "size" && !storage;
             return (
-              <button
+              // 原生 disabled 的 button 收不到鼠标事件、Tooltip 直接挂它上面不会出——挂外层 span；
+              // 可用时 content 为空、Tooltip 不挂气泡（只剩一个 inline-flex 外层 span）
+              <Tooltip
                 key={s.key}
-                type="button"
-                onClick={() => setSort(s.key)}
-                aria-pressed={active}
-                disabled={unavailable}
-                title={unavailable ? "占用扫描完成后可用" : undefined}
-                className={cn(
-                  "cursor-pointer rounded-full px-3 py-1 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                  active
-                    ? "bg-selected text-selected-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
+                content={unavailable ? "占用扫描完成后可用" : undefined}
               >
-                {s.label}
-              </button>
+                <span className="inline-flex">
+                  <button
+                    type="button"
+                    onClick={() => setSort(s.key)}
+                    aria-pressed={active}
+                    disabled={unavailable}
+                    className={cn(
+                      "cursor-pointer rounded-full px-3 py-1 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                      active
+                        ? "bg-selected text-selected-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {s.label}
+                  </button>
+                </span>
+              </Tooltip>
             );
           })}
         </div>
@@ -757,7 +836,31 @@ const SessionsPage = () => {
               )}
             </div>
           )}
-          {visible.length === 0 ? (
+          {listView === "error" ? (
+            <div className="px-4 py-8">
+              <div className="flex flex-col items-center gap-2 rounded-md border border-dashed px-3 py-3 text-center">
+                <p className="text-xs text-destructive">
+                  会话列表加载失败：{loadError}
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={retryingList}
+                  onClick={() => {
+                    setRetryingList(true);
+                    void refresh().finally(() => setRetryingList(false));
+                  }}
+                >
+                  {retryingList ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="size-3.5" />
+                  )}
+                  重试
+                </Button>
+              </div>
+            </div>
+          ) : visible.length === 0 ? (
             <div className="px-4 py-8">
               <EmptyHint variant="dashed" size="sm" align="center">
                 {query.trim()

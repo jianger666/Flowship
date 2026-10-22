@@ -124,7 +124,14 @@ describe("压缩接线契约", () => {
   });
 
   it("事件流把 streaming 插到尾部 compaction 之前，并用 CompactionRow", () => {
-    expect(stream).toContain("insertBeforeTrailingCompaction");
+    // V1-01：事件流改走 composeStreamTail（flow → streaming → pending），它内部仍用 insertBeforeTrailingCompaction
+    expect(stream).toContain("composeStreamTail");
+    expect(
+      readFileSync(
+        path.resolve(import.meta.dirname, "../src/lib/stream-pending.ts"),
+        "utf-8",
+      ),
+    ).toContain("insertBeforeTrailingCompaction");
     expect(stream).toContain("<CompactionRow");
   });
 

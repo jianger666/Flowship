@@ -315,3 +315,60 @@ describe("resume：真实 SDK 路径（Agent.resume）", () => {
     expect(out.text).toContain("超时");
   });
 });
+
+describe("展示用：默认 effort 从真实模型目录缓存里偷看（peekCatalog）", () => {
+  // 形状同 2026-10-19 真实 Cursor 清单：每个带档位的模型有一个 isDefault 预设
+  const listWithDefaults = [
+    {
+      id: "claude-sonnet-5-5",
+      displayName: "Claude Sonnet 5.5",
+      parameters: [
+        { id: "context", values: [{ value: "300k" }, { value: "1m" }] },
+        { id: "reasoning_effort", values: ["low", "medium", "high"].map((value) => ({ value })) },
+      ],
+      variants: [
+        { displayName: "Low", params: [{ id: "reasoning_effort", value: "low" }] },
+        {
+          displayName: "High",
+          isDefault: true,
+          params: [
+            { id: "context", value: "1m" },
+            { id: "reasoning_effort", value: "high" },
+          ],
+        },
+      ],
+    },
+  ];
+  const parentAgent = (id: string) => ({ agentId: id, send: vi.fn(), close: vi.fn() });
+  const mkLink = (apiKey: string) =>
+    createCursorSubagentLinkForSession({
+      apiKey,
+      parentModel: { id: "gemini-4-argon", params: [{ id: "reasoning_effort", value: "high" }] },
+      cwd: "/w",
+    });
+
+  beforeEach(() => {
+    mockList.mockReset();
+    mockList.mockResolvedValue(listWithDefaults as never);
+  });
+
+  it("同 apiKey 之前拉过目录（进程缓存里有）：新 link 不用再拉就查得到默认档；没缓存的 apiKey 查不到、也不发请求", async () => {
+    const { getSubagentDisplayLookup } = await import("@/lib/server/subagent-parent-model");
+    // 预热缓存：显式选模型的调用会拉一次目录
+    await run(mkLink("sk-peek-warm"), { prompt: "x", model: "claude-sonnet-5-5" });
+    expect(mockList).toHaveBeenCalledTimes(1);
+
+    const warm = getSubagentDisplayLookup(mkLink("sk-peek-warm").attach(parentAgent("P-warm")))!;
+    expect(warm.defaultEffortOf!("claude-sonnet-5-5")).toBe("high");
+    expect(mockList).toHaveBeenCalledTimes(1); // 偷看缓存，不是再拉一次
+
+    const cold = getSubagentDisplayLookup(mkLink("sk-peek-cold").attach(parentAgent("P-cold")))!;
+    expect(cold.defaultEffortOf!("claude-sonnet-5-5")).toBeUndefined();
+    expect(mockList).toHaveBeenCalledTimes(1); // 冷的 apiKey 也没有因为展示去发网络请求
+  });
+
+  it("显式换模型不写 effort：真实创建选项里仍不替它传 effort（默认档只用于显示，不改子代理实际行为）", async () => {
+    await run(mkLink("sk-peek-create"), { prompt: "x", model: "claude-sonnet-5-5" });
+    expect(lastCreate().model).toEqual({ id: "claude-sonnet-5-5" });
+  });
+});

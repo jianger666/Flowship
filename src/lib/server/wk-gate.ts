@@ -55,6 +55,7 @@ import {
   getTaskWorkRepoPaths,
   type WorktreeTaskLike,
 } from "./task-worktrees";
+import { stripHostInjectedEnv } from "./host-env";
 import { getTeamLibraryKnowledgeSkillsDir } from "./team-library-paths";
 import { readWkConfig } from "./wk-config";
 
@@ -593,7 +594,10 @@ export const buildDeliverySyncArgs = (plan: WkGatePlanActive): string[] => {
  * `infer_req_id`），不喂的话会退到脚本里 hardcode 的作者本机路径。
  */
 const scriptEnv = (plan: WkGatePlanActive): NodeJS.ProcessEnv => ({
-  ...process.env,
+  // 从剔掉宿主注入变量的环境起步：脚本是项目方维护的 python，里面会再起 git / pnpm 等子进程（触发用户仓钩子），
+  // 整份继承 server 环境会把 ELECTRON_RUN_AS_NODE / PORT / __NEXT_PRIVATE_STANDALONE_CONFIG 一路带下去。
+  // （WK_REQUIRE_DELIVERY_BASELINE 等 WK_ 开关仍原样继承，见上方 isWkTruthy 的读取）
+  ...stripHostInjectedEnv(),
   WK_DOC_ROOT: plan.docRepoPath,
   WK_REQ_ID: plan.reqId,
   PYTHONIOENCODING: "utf-8",

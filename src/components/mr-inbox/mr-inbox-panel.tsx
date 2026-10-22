@@ -56,8 +56,10 @@ import {
   describeIgnoredEntry,
   type IgnoredEntry,
 } from "@/lib/mr-inbox-ignored-meta";
+import { formatInboxScanNotice } from "@/lib/mr-inbox-state";
 import {
   buildStoryUrlFromBug,
+  describeMrMergeStatus,
   inboxGroupsVisibleForRole,
   type InboxGroupId,
   type MrInboxMrDetail,
@@ -119,9 +121,13 @@ const MrStatusChip = ({
     );
   }
   if (!mr) return null;
-  if (mr.hasConflicts) return <Chip tone="danger">有冲突</Chip>;
-  if (mr.mergeable) return <Chip tone="ok">可合并</Chip>;
-  return <Chip title={mr.detailedMergeStatus}>检查中</Chip>;
+  // N1-02：状态文案 / tone 由纯函数决定（草稿 / CI / 审批 / 讨论 / rebase / 阻塞各有各的话）
+  const chip = describeMrMergeStatus(mr);
+  return (
+    <Chip tone={chip.tone} title={chip.hint}>
+      {chip.label}
+    </Chip>
+  );
 };
 
 /** 分组标题 + 各自空态 */
@@ -477,7 +483,7 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
  */
 const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
   const { setSeen, listBugTransitions, transitionBug } = useMrInbox();
-  const { tasks, loaded: tasksLoaded } = useTaskList();
+  const { tasks, loaded: tasksLoaded, loadError: tasksLoadError } = useTaskList();
   const { confirm } = useDialog();
   const router = useRouter();
   const handleIgnore = useIgnoreHandler(entry.bugUrl);
@@ -548,8 +554,19 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
       : undefined;
     // 任务列表首次加载完成前 tasks 是空的、hit 必然为空：此时不能当「没有对应任务」去引导新建
     // （会为已有任务重复建一个）。没有 storyId 时本来就没法匹配，与列表是否就绪无关
-    if (storyId && resolveTaskLookup(tasksLoaded, hit) === "pending") {
+    const lookup = storyId
+      ? resolveTaskLookup(tasksLoaded, hit, {
+          loadError: tasksLoadError,
+          taskCount: tasks.length,
+        })
+      : "miss";
+    if (lookup === "pending") {
       toast.info("任务列表还在加载，稍等一下再点");
+      return;
+    }
+    // 列表首拉失败（loaded 也是 true、tasks 空）：不知道有没有对应任务，别引导新建（会为已有任务重复建一个）
+    if (lookup === "unknown") {
+      toast.error(`任务列表加载失败，没法判断有没有对应任务：${tasksLoadError}`);
       return;
     }
     if (!hit) {
@@ -986,7 +1003,7 @@ export const MrInboxPanel = ({
   filterWorkItemId,
   className,
 }: MrInboxPanelProps) => {
-  const { data, refreshing, scanError, refresh, markAllSeen } = useMrInbox();
+  const { data, refreshing, scanNotice, refresh, markAllSeen } = useMrInbox();
   // 「全部已读」请求进行中（按钮 disabled + 转圈、防双击）
   const [markingAll, setMarkingAll] = useState(false);
 
@@ -1101,12 +1118,13 @@ export const MrInboxPanel = ({
       </div>
 
       {/* S13-05：扫描失败时保留上一次成功的列表，只在列表上方挂错误条 */}
-      {data?.status === "ok" && scanError && (
+      {/* N1-01：按场景给准确文案（整轮失败 / 保留旧表 / 合并展示 / 无旧表的残表），不再一律写「下方为上次结果」 */}
+      {data?.status === "ok" && scanNotice && (
         <div
           role="status"
           className="mx-3 mb-2 rounded-md bg-warning/10 px-2.5 py-1.5 text-xs text-warning"
         >
-          最近一次扫描失败（下方为上次结果）：{scanError}——
+          {formatInboxScanNotice(scanNotice)}——
           <button
             type="button"
             className="cursor-pointer underline hover:text-foreground"

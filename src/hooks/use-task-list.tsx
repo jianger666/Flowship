@@ -8,6 +8,7 @@
  *
  * 提供：
  *  - tasks / loaded：列表 + 首次加载完成标记
+ *  - corrupt：meta.json 损坏而无法列出的任务（同一个列表响应带回，侧栏据此提示「N 个任务数据损坏」）
  *  - refresh()：重新拉服务端列表（轻量 TaskSummary[]、N×1 IO）
  *  - upsertTask(task)：单条插入 / 更新（新建任务后即时插入、不等下次 refresh；
  *    详情页基本信息变化时同步侧栏状态点）
@@ -16,9 +17,12 @@
  *    pendingDeletes 过滤 refresh 防「幽灵回魂」、404 当幂等成功
  *
  * 刷新时机：mount 一次 + 窗口重新聚焦（focus）时——多任务并行，切回 app 拿最新态。
- * 外加「条件轮询」：仅当列表里存在 running 任务时、每 POLL_INTERVAL_MS 刷一次、全跑完即停。
- * 这样切到 B 时、后台还在跑的 A 跑完几秒内侧栏就更新（停转圈 / 变成等你回复点）。
- * 没有任务在跑时不轮询、不浪费。
+ * 外加「条件轮询」（间隔 / 开关见 lib/task-list-poll 的 pickTaskListPollPlan）：
+ *  - 列表里存在 running 任务（或飞书桥接开）→ 每 2s 刷一次、全跑完即停。
+ *    这样切到 B 时、后台还在跑的 A 跑完几秒内侧栏就更新（停转圈 / 变成等你回复点）。
+ *  - 没有任务在跑、但服务端说有会触发的定时（TaskSummary.hasLiveSchedule）→ 30s 低频兜底
+ *    （页面不可见 60s），定时唤醒的 chat 才有机会被看见 / 通知；这一档内容没变沿用旧引用。
+ *  - 都没有 → 不轮询、不浪费。
  *
  * refresh 请求 epoch + successfulDeletedIds——DELETE 200 后迟到的旧 refresh
  * 不得整表覆盖回灌；pendingDeletes 在 unmark 后为空，单靠它挡不住交叉时序。
@@ -39,11 +43,14 @@ import {
 } from "react";
 
 import { getSettings } from "@/lib/local-store";
+import { loadErrorMessage } from "@/lib/load-outcome";
+import { sameCorruptTasks, type CorruptTaskInfo } from "@/lib/corrupt-task";
 import {
-  deleteTask as deleteTaskApi,
-  fetchTasks,
+  deleteTaskWithReport as deleteTaskWithReportApi,
+  fetchTaskList,
   type DeleteTaskResult,
 } from "@/lib/task-store";
+import type { DeleteWorktreeReportBody } from "@/lib/worktree-report";
 import {
   canCommitTaskListRefresh,
   filterTaskListAfterRefresh,
@@ -58,6 +65,15 @@ import {
   shouldTailRefreshAfterBusy,
 } from "@/lib/task-background";
 import {
+  canStartPoll,
+  hasLiveScheduleTask,
+  createTaskListUpsertTracker,
+  pickTaskListPollPlan,
+  sameTaskList,
+  shouldClearPollInflight,
+  type PollInflight,
+} from "@/lib/task-list-poll";
+import {
   canCommitTaskSnapshot,
   commitTaskDeleted,
   isTaskTerminalDeleted,
@@ -68,6 +84,19 @@ import type { Task, TaskSummary } from "@/lib/types";
 interface TaskListContextValue {
   tasks: TaskSummary[];
   loaded: boolean;
+  /**
+   * 最近一次列表拉取的失败原因（成功即清；null = 最近一次是好的）。
+   * 消费方用它区分「首拉失败」与「真的没有任务」：loaded 且 tasks 为空时，
+   * loadError 非空 = 没拉到、不是没有——画失败态 + 重试，别画「还没有任务」
+   * （判定见 lib/load-outcome 的 deriveListLoadView）。
+   */
+  loadError: string | null;
+  /**
+   * meta.json 损坏而无法列出的任务（不在 tasks 里：它们没有可信的 runStatus / repoPaths，
+   * 混进去会被各处当真任务用）。没有损坏 / 旧服务端没这个字段 = []。
+   * 拉取失败时保留上一次成功的值（不拿「拉不到」当「没有损坏」）。侧栏据此显示提示。
+   */
+  corrupt: CorruptTaskInfo[];
   refresh: () => Promise<void>;
   upsertTask: (task: Task | TaskSummary) => void;
   removeTask: (id: string) => void;
@@ -79,7 +108,11 @@ interface TaskListContextValue {
    */
   deleteTaskById: (
     id: string,
-    options?: { onLocked?: () => void },
+    options?: {
+      onLocked?: () => void;
+      /** 服务端的工作区清理回报（保留的目录 / 落了快照的仓）：toast 据此说话，别默认「删干净了」 */
+      onReport?: (report: DeleteWorktreeReportBody) => void;
+    },
   ) => Promise<DeleteTaskResult>;
   /**
    * 归档中标记：归档是“改字段”不是“删行”，pendingDeletes 那套盖不上。
@@ -92,8 +125,8 @@ interface TaskListContextValue {
 
 const TaskListContext = createContext<TaskListContextValue | null>(null);
 
-// 条件轮询间隔：仅当有任务在跑时生效（本地读 meta.json 很轻、2s 兼顾实时与开销）
-const POLL_INTERVAL_MS = 2000;
+// 轮询间隔 / 开关条件见 lib/task-list-poll（pickTaskListPollPlan）：
+// 忙 / 桥接 = 2s；仅有 live 定时 = 30s（页面不可见 60s）；都没有 = 不轮询
 
 // Task（完整）→ TaskSummary：派生 actionCount / lastAction* / hasPendingAsk，剔除 events / actions / pendingAskId
 // （避免把可能很大的 events 数组带进侧栏列表）。本身已是 Summary 则原样返回。
@@ -116,6 +149,15 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   // 首次加载完成——侧栏 loading 占位用
   const [loaded, setLoaded] = useState(false);
+  // 最近一次拉取的失败原因（成功清掉）：区分「首拉失败」与「还没有任务」
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // 损坏的任务（来自同一个列表响应，随成功的 refresh 一起更新）
+  const [corrupt, setCorrupt] = useState<CorruptTaskInfo[]>([]);
+  // 最近一次列表响应里有没有「还会触发的定时」（服务端打的 hasLiveSchedule）——兜底轮询的开关。
+  // 单独存、不从 tasks 行上现算：详情页 upsertTask 回灌的行不带这个标记，会把它冲掉
+  const [scheduleLive, setScheduleLive] = useState(false);
+  // 页面不可见（最小化 / 切走）——兜底轮询据此降频
+  const [pageHidden, setPageHidden] = useState(false);
   // 删除中 id（驱动按钮 disabled；与 ref 同步，ref 给 refresh/upsert 同步读）
   const [deletingIds, setDeletingIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -124,6 +166,10 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   const pendingDeletesRef = useRef<Set<string>>(new Set());
   // pendingArchives：归档/恢复等待窗口内，反向旧快照不得盖掉乐观更新（值=目标方向）
   const pendingArchivesRef = useRef<Map<string, boolean>>(new Map());
+  // 本地 upsert 时间表 + 响应落地合并（见 createTaskListUpsertTracker）。
+  // 必须用 useState 初始化器持有：useMemo 只是性能提示、React 可以丢缓存——tracker 若随渲染重建，
+  // 已记下的 upsert 时间会清零、Q8-06 同族的「新建任务被慢轮询抹掉」会复发
+  const [upsertTracker] = useState(createTaskListUpsertTracker);
   // refresh 请求世代——DELETE 成功时推进，作废任何更早启动的在飞 refresh
   const refreshEpochRef = useRef(0);
   // 已成功删除 id（进程内有界 Set）——过滤迟到 refresh 里残留的已删任务
@@ -147,34 +193,68 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     pendingArchivesRef.current.delete(id);
   }, []);
 
-  const refresh = useCallback(async () => {
+  // reuseIfSame：仅「live 定时兜底轮询」传 true——内容没变就沿用旧列表引用，30s 一次也不让整棵树白白重渲。
+  // 2s 档与聚焦 / 手动刷新保持原行为（每次换新引用），不在这里顺手改
+  const runRefresh = useCallback(async (reuseIfSame: boolean) => {
     // 捕获发起时 epoch；响应到达时若已推进则整响应丢弃
     const startEpoch = refreshEpochRef.current;
+    // 请求发出时间：响应落地时用它补回「请求之后才本地新建」的行（第五轮 Q8-06 同族）
+    const fetchStartedAt = Date.now();
     try {
-      const list = await fetchTasks();
+      const { tasks: list, corrupt: corruptList } = await fetchTaskList();
       if (!canCommitTaskListRefresh(startEpoch, refreshEpochRef.current)) {
         return;
       }
       // 再滤 sticky terminal（跨 tab task_deleted 与 epoch 双保险）
       // 归档中 id：服务端旧快照archived:false 不得覆盖，强制按已归档保留（其它字段取服务端最新）
-      setTasks(
-        applyPendingArchives(
-          filterTaskListAfterRefresh(
-            list,
-            pendingDeletesRef.current,
-            successfulDeletedIdsRef.current,
-          ).filter((t) => !isTaskTerminalDeleted(t.id)),
-          pendingArchivesRef.current,
-        ),
+      const nextList = applyPendingArchives(
+        filterTaskListAfterRefresh(
+          list,
+          pendingDeletesRef.current,
+          successfulDeletedIdsRef.current,
+        ).filter((t) => !isTaskTerminalDeleted(t.id)),
+        pendingArchivesRef.current,
       );
+      // Q8-06：本地行（SSE upsertTask 回灌）比响应行新时保留本地行——慢轮询不回滚新状态；
+      // 请求发出之后才本地新建的行（响应里没有）也补回（第五轮同族）。合并逻辑全在 upsertTracker（纯函数 + 行为测试）
+      setTasks((prev) => {
+        const merged = upsertTracker.merge(
+          prev,
+          nextList,
+          fetchStartedAt,
+          // 补回的行同样不得是删除中 / 已删除的（与上面对响应行的过滤同口径，防复活）
+          (id) =>
+            pendingDeletesRef.current.has(id) ||
+            successfulDeletedIdsRef.current.has(id) ||
+            isTaskTerminalDeleted(id),
+        );
+        return reuseIfSame && sameTaskList(prev, merged) ? prev : merged;
+      });
+      // live 定时标记取自这次响应（拉不到时保留上次的值：不拿「拉不到」当「没有定时」）
+      setScheduleLive(hasLiveScheduleTask(nextList));
+      // 内容没变就沿用旧引用：运行中每 2s 轮询一次，别让侧栏底部的提示 / 弹层跟着白白重渲染
+      setCorrupt((prev) =>
+        sameCorruptTasks(prev, corruptList) ? prev : corruptList,
+      );
+      setLoadError(null);
     } catch (err) {
-      // 侧栏静默（不 toast 刷屏）；首页 / 详情页自己的拉取会暴露错误
+      // 不 toast 刷屏（轮询 / 聚焦刷新会反复触发）；但把失败原因记下来——
+      // 否则首拉失败时 tasks 仍是空数组、侧栏会把它画成「还没有任务」（失败说谎）
       console.warn("[task-list] 刷新失败", err);
+      // 过期 refresh（DELETE 等已推进 epoch）的失败不代表当前状态，别污染
+      if (canCommitTaskListRefresh(startEpoch, refreshEpochRef.current)) {
+        setLoadError(loadErrorMessage(err));
+      }
     } finally {
       // 过期 refresh 仍可标记 loaded（首次 mount 不应被 DELETE 卡死）
       setLoaded(true);
     }
-  }, []);
+  }, [upsertTracker]);
+
+  // 对外的 refresh：签名不变（聚焦 / 手动 / 各页面调用点都走它），行为 = 原来的 refresh
+  const refresh = useCallback(() => runRefresh(false), [runRefresh]);
+  // live 定时兜底轮询专用：内容没变不换列表引用
+  const refreshQuiet = useCallback(() => runRefresh(true), [runRefresh]);
 
   useEffect(() => {
     void refresh();
@@ -223,12 +303,48 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   // getSettings 是同步缓存读，每次渲染取一次即可（开关切换后 focus/refresh 自然带动重渲染）
   const bridgeOn = getSettings().feishuChatBridge === true;
 
-  // 条件轮询：存在 running 任务、或飞书桥接开启时定时刷新
+  // 页面可见性：只用来给「live 定时兜底轮询」降频（最小化 / 切走时 30s → 60s，不停）
   useEffect(() => {
-    if (!hasRunning && !bridgeOn) return;
-    const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    const sync = () => setPageHidden(document.visibilityState === "hidden");
+    sync();
+    document.addEventListener("visibilitychange", sync);
+    return () => document.removeEventListener("visibilitychange", sync);
+  }, []);
+
+  // 条件轮询（间隔 / 开关见 pickTaskListPollPlan）：
+  //  - 有任务在忙、或飞书桥接开启 → 2s（原行为）；
+  //  - 都没有、但有会触发的定时（服务端打的 hasLiveSchedule）→ 30s 兜底：到点被唤醒的 chat
+  //    才有机会被侧栏看到 / 被 watcher 通知（V7-03）；没有 live 定时 = 一次都不轮询。
+  // 兜底档（quiet）内容没变沿用旧引用；一旦撞见 running 会自然切到 2s 档，结束后经尾刷回到兜底档。
+  const plan = pickTaskListPollPlan({
+    busy: hasRunning,
+    bridgeOn,
+    scheduleLive,
+    pageHidden,
+  });
+  const pollMs = plan?.intervalMs ?? null;
+  const pollQuiet = plan?.quiet ?? false;
+  // 在途保护（第三轮 R11-07）：上一次轮询还没返回就不再叠发——慢响应 + SSE 回灌交错会让侧栏状态回跳、
+  // 同一次完成被通知两次；服务端繁忙时 2s 档还会自叠加
+  // Q8-06：守卫带超时 + 世代——卡住（> TASK_LIST_POLL_INFLIGHT_TIMEOUT_MS）的请求不能永久挡住后续轮询，
+  // 旧请求迟到结束时也不能清掉新一轮的记录
+  const pollInflightRef = useRef<PollInflight | null>(null);
+  const pollTokenRef = useRef(0);
+  useEffect(() => {
+    if (pollMs === null) return;
+    const timer = setInterval(() => {
+      const now = Date.now();
+      if (!canStartPoll(pollInflightRef.current, now)) return;
+      const token = (pollTokenRef.current += 1);
+      pollInflightRef.current = { token, startedAt: now };
+      void (pollQuiet ? refreshQuiet() : refresh()).finally(() => {
+        if (shouldClearPollInflight(pollInflightRef.current, token)) {
+          pollInflightRef.current = null;
+        }
+      });
+    }, pollMs);
     return () => clearInterval(timer);
-  }, [hasRunning, bridgeOn, refresh]);
+  }, [pollMs, pollQuiet, refresh, refreshQuiet]);
 
   const upsertTask = useCallback((task: Task | TaskSummary) => {
     const summary = toSummary(task);
@@ -247,6 +363,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     ) {
       return;
     }
+    // 记下本地 upsert 时间：慢轮询响应落地时据此补回「请求之后才新建」的行
+    upsertTracker.mark(summary.id);
     setTasks((prev) => {
       const idx = prev.findIndex((t) => t.id === summary.id);
       if (idx < 0) return [summary, ...prev];
@@ -254,7 +372,7 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       next[idx] = keepBackgroundSubagentCount(prev[idx], summary);
       return next;
     });
-  }, []);
+  }, [upsertTracker]);
 
   const removeTask = useCallback((id: string) => {
     setTasks((prev) => prev.filter((t) => t.id !== id));
@@ -263,7 +381,10 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   const deleteTaskById = useCallback(
     async (
       id: string,
-      options?: { onLocked?: () => void },
+      options?: {
+        onLocked?: () => void;
+        onReport?: (report: DeleteWorktreeReportBody) => void;
+      },
     ): Promise<DeleteTaskResult> => {
       // 已在删：幂等短路，避免双击连发两次 DELETE
       if (pendingDeletesRef.current.has(id)) return "ok";
@@ -274,11 +395,12 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       // 锁定后立刻回调（侧栏用来离开当前详情，避免 upsertTask 回灌）
       options?.onLocked?.();
       try {
-        const result = await deleteTaskApi(id);
+        const { result, report } = await deleteTaskWithReportApi(id);
         // ok / not_found 都算成功
         // 走统一 sink（推进 epoch + sticky + 列表移除）
         commitTaskDeleted(id);
         unmarkDeleting(id);
+        if (report) options?.onReport?.(report);
         return result;
       } catch (err) {
         unmarkDeleting(id);
@@ -293,6 +415,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       value={{
         tasks,
         loaded,
+        loadError,
+        corrupt,
         refresh,
         upsertTask,
         removeTask,

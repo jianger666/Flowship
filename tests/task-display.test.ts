@@ -101,6 +101,30 @@ describe("computeBatchProgress 多 plan 派生", () => {
     expect(progress.batches[1].duplicateOfEffectiveId).toBe("act_1:b1");
   });
 
+  it("append 时 rawId 相同但标题不同（模型从 b1 重新编号）≠ 重复：新批次可选、进度分母包含它（V11-01）", () => {
+    const task = taskWithActions([
+      action(1, "plan", { planBatches: [batch("b1", "导出 CSV 功能")] }),
+      action(2, "build", { requestedBatchIds: ["b1"] }),
+      action(3, "plan", {
+        replanMode: "append" satisfies ReplanMode,
+        planBatches: [batch("b1", "权限校验"), batch("b2", "审计日志")],
+      }),
+    ]);
+
+    const progress = computeBatchProgress(task);
+
+    expect(progress.batches.map((b) => b.duplicateOfEffectiveId)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(progress.done).toBe(1);
+    expect(progress.remaining.map((b) => b.effectiveId)).toEqual([
+      "act_3:b1",
+      "act_3:b2",
+    ]);
+  });
+
   it("rebuild 只替代此前 pending 批次，已 built 历史保留", () => {
     const task = taskWithActions([
       action(1, "plan", {

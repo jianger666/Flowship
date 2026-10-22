@@ -6,6 +6,7 @@
  */
 
 import { readLocalFileForPreview } from "@/lib/server/local-file-read";
+import { nonLocalPathReason } from "@/lib/unc-path";
 
 const errorJson = (message: string, status = 400) =>
   new Response(JSON.stringify({ error: message }), {
@@ -18,6 +19,9 @@ export const runtime = "nodejs";
 export const GET = async (req: Request) => {
   const raw = new URL(req.url).searchParams.get("path")?.trim() ?? "";
   if (!raw) return errorJson("path 必填");
+  // UNC 在碰文件系统之前拒绝（Windows 上 realpath 会触发 SMB / NTLM 外发，见 lib/unc-path）
+  const nonLocal = nonLocalPathReason(raw);
+  if (nonLocal) return errorJson(nonLocal);
 
   try {
     const data = await readLocalFileForPreview(raw);

@@ -38,6 +38,7 @@ const listSourceFiles = (dir: string): string[] => {
 
 const rows = read("components", "tasks", "event-stream", "rows.tsx");
 const errorCard = read("components", "tasks", "event-stream", "error-card.tsx");
+const errorClassifyLib = read("lib", "error-classify.ts");
 
 describe("错误：独立平铺成 destructive 卡", () => {
   it("rows 把 error 分流到 ErrorCard、不再落到灰细行 processRow", () => {
@@ -72,20 +73,28 @@ describe("错误：独立平铺成 destructive 卡", () => {
   it("渲染 meta.detail：runner 存了原始诊断（sdk-error.ts），UI 得读", () => {
     expect(errorCard).toContain("ev.meta?.detail");
     expect(errorCard).toContain("查看详情");
-    // detail 与正文相同时不重复放一份
-    expect(errorCard).toContain("detail !== ev.text.trim()");
+    // detail 与正文相同时不重复放一份（V3-03：判定移进 lib/error-classify.ts 的 buildErrorCardModel，
+    // 卡片的 hasDetail 只认它算出的 diagnostic；行为见 tests/error-classify.test.ts）
+    expect(errorCard).toContain("buildErrorCardModel(");
+    expect(errorCard).toContain("model.diagnostic");
+    expect(errorClassifyLib).toContain("det !== bodyTrim");
   });
 
   it("复制走 CopyButton 公共件、复制内容含原始诊断", () => {
     expect(errorCard).toContain("CopyButton");
     expect(errorCard).toContain("copyText");
-    expect(errorCard).toContain("DETAIL_HEADING");
+    // 分隔标题随判定一起搬进了 lib（复制串由 buildErrorCardModel 拼）
+    expect(errorClassifyLib).toContain("ERROR_DETAIL_HEADING");
   });
 
-  it("重试只给当轮失败（isLatestErrorEvent 把关）、能力由 Context 注入", () => {
-    expect(errorCard).toContain("isLatestErrorEvent");
+  it("重试只给当轮失败（isCurrentErrorCard = !mainRunActive && isLatestErrorEvent 把关）、能力由 Context 注入", () => {
+    expect(errorCard).toContain("isCurrentErrorCard");
+    expect(errorCard).toContain("resolveErrorRecovery");
     expect(errorCard).toContain("useStreamActions");
     expect(errorCard).toContain("onRetryLastMessage");
+    // 推进 / action 失败的卡不带「重试」、改「重新推进」
+    expect(errorCard).toContain("onReadvance");
+    expect(errorCard).toContain("重新推进");
     // agent 正在跑时这条错误已翻篇、不给重试
     expect(errorCard).toContain("!runActive");
   });

@@ -230,7 +230,10 @@ describe("接线契约：use-settings / 设置页（未在浏览器里看过实�
     expect(iGuard).toBeGreaterThan(-1);
     expect(iRetry).toBeGreaterThan(iGuard);
     expect(save.slice(iGuard, iRetry)).toContain("Promise.resolve(false)");
-    expect(hook).toMatch(/!unreadable && Object\.values\(dirty\)\.some\(Boolean\)/);
+    // review #16：加载失败（含不可读）同样不算「有未保存修改」
+    expect(hook).toMatch(
+      /!unreadable && !loadFailed && Object\.values\(dirty\)\.some\(Boolean\)/,
+    );
   });
 
   it("设置页：不可读时在顶部给 role=alert 提示（标题 + 说明 + reason），并且不渲染表单卡片", () => {
@@ -238,8 +241,9 @@ describe("接线契约：use-settings / 设置页（未在浏览器里看过实�
     expect(page).toContain("describeSettingsUnreadable(");
     expect(page).toContain('role="alert"');
     expect(page).toMatch(/\{unreadable\.reason\}/);
-    // 提示在第一张卡之前；卡片区被 `!unreadable` 守着
+    // 提示在第一张卡之前；卡片区被 `!loadFailed` 守着（review #16：loadFailed ⊇ unreadable，
+    // 瞬时加载失败同样不渲染默认值表单——不可读时 loadFailed 必为 true，见 settings-load-guard.test.ts）
     expect(page.indexOf('role="alert"')).toBeLessThan(page.indexOf("wrapCard(\n          \"model\""));
-    expect(page).toContain("{!unreadable && (");
+    expect(page).toContain("{!loadFailed && (");
   });
 });

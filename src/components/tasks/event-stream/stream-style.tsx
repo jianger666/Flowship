@@ -47,7 +47,7 @@ export const CollapseChevron = ({
  *
  * - 12px 主文、中性灰、hover 走 `bg-accent`（浅色下 1.12 的底色差，旧的 `bg-muted/40` 只有 1.03、
  *   肉眼几乎看不出有 hover 反馈）；瞬时态按规范用 hover:bg-accent。
- * - 焦点环不在这里写：globals.css 全局 `outline-ring/50` 已经给原生 button 的 :focus-visible 画了轮廓，
+ * - 焦点环不在这里写：globals.css 全局 `outline-ring`（不透明，2026-10-20 起；原 /50 只有 ~1.8:1）已经给原生 button 的 :focus-visible 画了轮廓，
  *   这里只要「不写 outline-none」就是键盘可达的。
  */
 export const PROCESS_ROW_BUTTON =

@@ -54,15 +54,22 @@ describe("EventStream：输入框运行态", () => {
     expect(call).toMatch(/submitting: !!submitting,/);
     expect(call).toMatch(/awaitingAsk,/);
     expect(eventStream).toMatch(/const composerRunning = shouldShowComposerRunning\(/);
+    // 后台子代理不再算运行态（R3-02）：它走单独的 stopOnly（tests/composer-submit-state.test.ts）
+    expect(call).not.toMatch(/backgroundSubagentCount/);
   });
 
   it("不能退回老写法：只看 isRunning 会让提交飞行期间只剩转圈的发送键", () => {
     expect(eventStream).not.toMatch(/const composerRunning = isRunning && !awaitingAsk/);
   });
 
-  it("composerRunning 仍然是传给输入框的 running（停止键 / 调暗都由它决定）", () => {
+  it("composerRunning 仍然是传给输入框的 running（停止键 / 失活态降对比都由它决定）", () => {
     expect(eventStream).toMatch(/running=\{composerRunning\}/);
-    expect(eventStream).toMatch(/!isAwaitingUser && !composerRunning && !awaitingAsk/);
+    // 失活态的写法从「整岛 opacity-70」改成只降边框 / 底色 / 阴影（V13-12：整岛压透明会把文字压到 AA 以下）；
+    // 三个条件和 && 的结构不变，只是现在分行、并且尾巴是实色 token 而不是 opacity
+    expect(eventStream).toMatch(
+      /!isAwaitingUser\s*&&\s*!composerRunning\s*&&\s*!awaitingAsk\s*&&\s*"border-border\/60 bg-muted\/30 shadow-none"/,
+    );
+    expect(eventStream).not.toMatch(/!awaitingAsk\s*&&\s*"opacity-70"/);
   });
 
   it("判定函数从 lib/chat-pending-display 引入", () => {
@@ -72,30 +79,39 @@ describe("EventStream：输入框运行态", () => {
   });
 });
 
-describe("ConversationComposer：运行态里不再转第二个圈", () => {
+// 第三轮 review D7-03 / R3-02：右侧动作组的决策抽到 lib/composer-actions（行为见 tests/composer-submit-state.test.ts），
+// 这里只钉组件接线。旧写法是 JSX 里 `submitting && label === "发送"` 才转圈、`running ? (...) : sendButton("发送")` 整组切换。
+describe("ConversationComposer：右侧动作组走 deriveComposerActions（运行态里只留一个圈）", () => {
   const sendButtonSrc = (() => {
     const start = composer.indexOf("const sendButton");
     expect(start).toBeGreaterThanOrEqual(0);
-    const end = composer.indexOf("return (", start);
+    const end = composer.indexOf("const stopButton", start);
     expect(end).toBeGreaterThan(start);
     return composer.slice(start, end);
   })();
 
-  it("发送键转圈只属于常态「发送」（排队发送键只灰掉防连点）", () => {
-    expect(sendButtonSrc).toMatch(/submitting && label === "发送"/);
-    // 不能退回「只要 submitting 就转」
-    expect(sendButtonSrc).not.toMatch(/\{submitting \?/);
+  it("发送键转圈由 actions.send.spinning 决定（常态 / 排队发送共用；左侧「AI 在跑」的圈在提交飞行时让出）", () => {
+    expect(sendButtonSrc).toMatch(/send\.spinning \?/);
+    expect(composer).toMatch(/actions\.runSpinner &&/);
   });
 
   it("发送键在提交飞行期间仍然是禁用的（防连点不能丢）", () => {
-    expect(sendButtonSrc).toMatch(/disabled=\{disabled \|\| submitting \|\| !hasContent\}/);
+    // Q6-03：判据抽成 composerSubmitBlock（穷举等价于旧的 disabled || submitting || !hasContent，见 tests/submit-latch.test.ts）
+    expect(sendButtonSrc).toMatch(
+      /disabled=\{composerSubmitBlock\(\{ disabled, submitting, hasContent \}\) !== null\}/,
+    );
   });
 
-  it("运行态仍是 spinner + 停止键 + 排队发送（allowQueueWhileRunning）", () => {
-    expect(composer).toMatch(/running \? \(/);
-    expect(composer).toMatch(/allowQueueWhileRunning && sendButton\("排队发送"\)/);
+  it("运行态仍是 spinner + 停止键 + 排队发送（allowQueueWhileRunning 传给决策函数）", () => {
+    expect(composer).toMatch(/actions\.stopButton && stopButton/);
+    expect(composer).toMatch(/actions\.send && sendButton\(actions\.send\)/);
+    expect(composer).toMatch(/allowQueueWhileRunning: !!allowQueueWhileRunning/);
     // 停止键不受 disabled 管（受理前点停止走「登记意图」，不能被编辑器禁用挡住）
     expect(composer).toMatch(/disabled=\{stopping\}/);
+  });
+
+  it("附件按钮是否让位走 actions.showAttach（stopOnly 不让位）", () => {
+    expect(composer).toMatch(/showAttachActions=\{actions\.showAttach\}/);
   });
 });
 
@@ -161,7 +177,8 @@ describe("ChatView：受理前点停止 → 登记意图，提交落地再兑现
 
   it("切任务时清掉登记的意图：否则新任务的第一条消息一落地就被停掉", () => {
     const from = chatView.indexOf("// 切 task：清 streaming 等 UI 态");
-    const to = chatView.indexOf("return subscribeChatOp(task.id, applyLedgerToUi);");
+    // 订阅的是 onLedgerLive（第三轮 R6-01：实时 dispatch 里顺带判排队条的「从无到有」）
+    const to = chatView.indexOf("return subscribeChatOp(task.id, onLedgerLive);");
     expect(from).toBeGreaterThanOrEqual(0);
     expect(to).toBeGreaterThan(from);
     const effect = chatView.slice(from, to);

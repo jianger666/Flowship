@@ -4,11 +4,12 @@
  * 工具块 UI（Phase 1）：running→completed 合并渲染 + GB 折叠规则 + inline diff
  *
  * 视觉：图标 + 名称 + 摘要一行；展开区缩进 + 左边线；token 用 muted/border。
- * Chat 打磨：shell 默认折叠、摘要绝不 dump args JSON；运行中直播输出、完成后收起。
+ * Chat 打磨：shell 默认折叠、摘要不 dump args JSON（**例外**：未映射工具——submit_mr / MCP——运行中摘要回落到 `调用 x:{args}`，
+ * 完成后变输出首行；Tooltip 的挂载决定为此做了闩锁，见 resolveRowTooltip / R7-03）；运行中直播输出、完成后收起。
  * task 工具：专属「子代理」任务条（Bot 图标 + 标题；整条点击开详情抽屉，不内联展开）。
  */
 
-import { memo, useMemo, useState, type CSSProperties } from "react";
+import { memo, useCallback, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Bot,
   Check,
@@ -34,9 +35,20 @@ import {
 } from "@/components/ui/ide-path-link";
 import { useOpenSubagentDetail } from "@/components/tasks/subagent-detail-context";
 import { useDiffSyntaxTokens } from "@/hooks/use-diff-syntax-tokens";
+import { useRowViewState } from "@/hooks/use-row-view-state";
 import { useTaskBaseDir } from "@/hooks/use-task-base-dir";
 import { diffLanguageFromPath, type DiffSyntaxToken } from "@/lib/diff-syntax";
-import { subagentTargetFromToolBlock } from "@/lib/subagent-run-display";
+import { liveOutputTailLine } from "@/lib/live-output-cap";
+import {
+  ROW_VIEW_FIELD,
+  toolRowViewKey,
+  verbGroupViewKey,
+} from "@/lib/row-view-keys";
+import { resolveRowTooltip, toolPathRowParts } from "@/lib/tool-path-display";
+import {
+  subagentBarMetaText,
+  subagentTargetFromToolBlock,
+} from "@/lib/subagent-run-display";
 import { isSkippableWaitBlock } from "@/lib/wait-display";
 import { cn } from "@/lib/utils";
 import {
@@ -45,15 +57,17 @@ import {
   parseTaskToolArgs,
   parseTodoToolArgs,
   parseUnifiedDiff,
+  shouldScrollOutputToEnd,
+  streamItemStableId,
   todoListSummary,
   toolBlockDefaultCollapsed,
   toolBlockAutoCollapsed,
+  toolBlockArgsTruncatedHint,
   toolBlockDetailLine,
   toolBlockExpandedArgsPreview,
   toolBlockFilePath,
   toolBlockSummary,
   toolDetailPathSegment,
-  toolPathNeedsBaseDir,
   verbGroupLabel,
   type DiffViewLine,
   type TodoItem,
@@ -453,7 +467,7 @@ const TaskSubagentBlock = ({
   // 运行中：条上露出最新一行输出，不用开抽屉也能看到它还在动
   const liveTail =
     block.status === "running" && liveOutput
-      ? liveOutput.trim().split("\n").filter(Boolean).slice(-1)[0]
+      ? (liveOutputTailLine(liveOutput) ?? null)
       : null;
 
   // 后台子代理：派出去的那次工具调用早就「完成」了（status=success），但子代理还在干活——
@@ -480,6 +494,19 @@ const TaskSubagentBlock = ({
           ? "失败"
           : "已完成";
 
+  // 整条 Tooltip：窄栏里标题可能被截断、徽标可能整体隐藏（V17-04），悬停时给全文。
+  // 内容恒非空（标题缺省「子代理任务」）——Tooltip 在「content 为空返回 children」与「包装」之间切换会
+  // 让按钮重挂、键盘焦点丢，所以别让它有为空的分支
+  const metaText = subagentBarMetaText(taskArgs);
+  const barTooltip = (
+    <>
+      <div>{title}</div>
+      {metaText && (
+        <div className="mt-0.5 text-muted-foreground">{metaText}</div>
+      )}
+    </>
+  );
+
   const barClass =
     "flex w-full min-w-0 items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground";
   const barContent = (
@@ -490,20 +517,34 @@ const TaskSubagentBlock = ({
       <span className="shrink-0 rounded-sm bg-subagent/15 px-1.5 py-px text-[11px] font-semibold tracking-wide text-subagent">
         子代理
       </span>
-      <span className="min-w-0 shrink truncate text-[11px] font-medium text-foreground">
+      {/* 标题：保底 3rem 再可收（truncate）。原来是 `min-w-0 shrink`——任务条里别的件全是 shrink-0，
+          窄栏（≈307px）带「模型 + 强度」徽标时标题成了唯一让位的、被压到 0 宽（V17-04）。
+          不用报告建议的 `shrink-0 max-w-[55%]`：max-w 会把标题钳死、溢出转嫁给状态图标，理由见 subagent-bar-layout-contract 测试头 */}
+      <span className="min-w-12 shrink truncate text-[11px] font-medium text-foreground">
         {title}
       </span>
-      {/* 模型徽标：args.model 有值才显示；历史缺 model 不硬造。
-          effort 同理。徽标显示的是模型传的入参：pi 的 task 校验不过会整个调用报错
-          （卡片是错误态、没起子会话），所以非错误态卡片上的徽标 = 实际生效值 */}
-      {taskArgs?.model && (
-        <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-subagent">
-          {taskArgs.model}
-        </span>
-      )}
-      {taskArgs?.effort && (
-        <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-muted-foreground">
-          {taskArgs.effort}
+      {/* 模型 / 强度徽标：args 有值才显示；历史缺值不硬造。
+          徽标显示的是模型传的入参：pi 的 task 校验不过会整个调用报错
+          （卡片是错误态、没起子会话），所以非错误态卡片上的徽标 = 实际生效值。
+          两个徽标装进一个「先让位」的容器：shrink-[100] 让它在标题（shrink=1）之前吃掉绝大部分收缩量，
+          min-w-0 + overflow-hidden 让它能一路收到 0 宽（窄栏里整体隐藏，不留只剩边框的小方块）；
+          容器里模型徽标可截断、强度徽标整块保持——窄了先裁掉强度、再截断模型。
+          被裁 / 隐藏的内容靠整条 Tooltip 看（见 barTooltip） */}
+      {(taskArgs?.model || taskArgs?.effort) && (
+        <span
+          data-subagent-badges
+          className="flex min-w-0 shrink-[100] items-center gap-1.5 overflow-hidden"
+        >
+          {taskArgs?.model && (
+            <span className="min-w-0 truncate rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-subagent">
+              {taskArgs.model}
+            </span>
+          )}
+          {taskArgs?.effort && (
+            <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-muted-foreground">
+              {taskArgs.effort}
+            </span>
+          )}
         </span>
       )}
       {statusIcon}
@@ -531,27 +572,29 @@ const TaskSubagentBlock = ({
       )}
     >
       <div className="border-l-[3px] border-l-subagent/60">
-        {openDetail ? (
-          <button
-            type="button"
-            // 抽屉开着时点这条 = 换内容 / 保持打开，不算「点了抽屉外面」（见 keepsSubagentDrawerOpen）
-            data-subagent-opener=""
-            onClick={() => openDetail(subagentTargetFromToolBlock(block))}
-            aria-haspopup="dialog"
-            // 不再写 aria-label：它会整条覆盖按钮的可访问名称，条上的状态（转圈 / 对勾 / 后台运行中 / 模型徽标）读屏就拿不到了。
-            // 名称让它从内容算（「子代理 · 标题 · 状态…」）
-            className={cn(
-              barClass,
-              "cursor-pointer transition-colors hover:bg-subagent/[0.08] hover:text-foreground",
-              // 外层 overflow-hidden 会把浏览器默认 outline 裁掉、键盘焦点就看不见了：用向内的 ring（不会被裁）
-              "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
-            )}
-          >
-            {barContent}
-          </button>
-        ) : (
-          <div className={barClass}>{barContent}</div>
-        )}
+        <Tooltip content={barTooltip}>
+          {openDetail ? (
+            <button
+              type="button"
+              // 抽屉开着时点这条 = 换内容 / 保持打开，不算「点了抽屉外面」（见 keepsSubagentDrawerOpen）
+              data-subagent-opener=""
+              onClick={() => openDetail(subagentTargetFromToolBlock(block))}
+              aria-haspopup="dialog"
+              // 不再写 aria-label：它会整条覆盖按钮的可访问名称，条上的状态（转圈 / 对勾 / 后台运行中 / 模型徽标）读屏就拿不到了。
+              // 名称让它从内容算（「子代理 · 标题 · 状态…」）
+              className={cn(
+                barClass,
+                "cursor-pointer transition-colors hover:bg-subagent/[0.08] hover:text-foreground",
+                // 外层 overflow-hidden 会把浏览器默认 outline 裁掉、键盘焦点就看不见了：用向内的 ring（不会被裁）
+                "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+              )}
+            >
+              {barContent}
+            </button>
+          ) : (
+            <div className={barClass}>{barContent}</div>
+          )}
+        </Tooltip>
       </div>
     </div>
   );
@@ -566,15 +609,30 @@ const RegularToolBlockRow = ({
 }: ToolBlockRowProps) => {
   // write 完成后收起（产物栏已有文件）；用户点过则以手动为准。
   // 其余工具仍走 toolBlockDefaultCollapsed（edit 展开看 diff；读/shell 折叠）。
-  const [manualCollapsed, setManualCollapsed] = useState<boolean | null>(null);
+  //
+  // 这四个视图状态走 useRowViewState（V2-05）：Virtuoso 行离开视口就卸载，用户点开 / 加载完的内容
+  // 滚走再滚回来不能丢（fullText 丢了还要再请求一次）。加载中 fullLoading 是瞬时态、不进存档。
+  const [manualCollapsed, setManualCollapsed] = useRowViewState<boolean | null>(
+    toolRowViewKey(taskId, block, ROW_VIEW_FIELD.toolManualCollapsed),
+    null,
+  );
   const autoCollapsed = toolBlockAutoCollapsed(block.name, block.status, nested);
   const collapsed = manualCollapsed ?? autoCollapsed;
   // 第二层：完整 output（默认折叠；展开一层只看摘要/命令）
-  const [outputOpen, setOutputOpen] = useState(false);
+  const [outputOpen, setOutputOpen] = useRowViewState<boolean>(
+    toolRowViewKey(taskId, block, ROW_VIEW_FIELD.toolOutputOpen),
+    false,
+  );
   // edit diff：默认展开（collapsed_edit_blocks=OFF）
-  const [diffCollapsed, setDiffCollapsed] = useState(false);
+  const [diffCollapsed, setDiffCollapsed] = useRowViewState<boolean>(
+    toolRowViewKey(taskId, block, ROW_VIEW_FIELD.toolDiffCollapsed),
+    false,
+  );
   // 截断输出的完整内容（2026-07-20 用户拍板去弹窗：点「加载完整输出」就地替换进滚动框）
-  const [fullText, setFullText] = useState<string | null>(null);
+  const [fullText, setFullText] = useRowViewState<string | null>(
+    toolRowViewKey(taskId, block, ROW_VIEW_FIELD.toolFullText),
+    null,
+  );
   const [fullLoading, setFullLoading] = useState(false);
 
   // 原「运行中自动展开、完成自动收起」已删（2026-07-20 用户实测「图标像反了」）：
@@ -584,6 +642,8 @@ const RegularToolBlockRow = ({
   const summary = toolBlockSummary(block);
   const detailLine = toolBlockDetailLine(block);
   const argsPreview = toolBlockExpandedArgsPreview(block);
+  // 命令 / 路径本身只剩半截（args 超服务端上限被截断）→ 展开区明说，别让半截命令读成完整命令
+  const argsTruncatedHint = toolBlockArgsTruncatedHint(block);
   const diff = block.result?.diff;
   const diffStats = useMemo(
     () => (diff ? countDiffStats(diff) : null),
@@ -592,12 +652,10 @@ const RegularToolBlockRow = ({
 
   // 本块指向的文件（edit / write / read）——路径、diff 标题、diff 行号都拿它去跳 IDE
   const filePath = useMemo(() => toolBlockFilePath(block), [block]);
-  // 只有相对路径才需要 task cwd 兜底：SDK 给的基本是绝对路径、不为它们白发一次详情请求
-  const baseDir = useTaskBaseDir(
-    taskId,
-    !!filePath && toolPathNeedsBaseDir(filePath),
-    block.actionId,
-  );
+  // 任何带文件路径的块都要 task cwd：相对路径靠它拼绝对路径（IDE 跳转），绝对路径靠它在折叠行里剥掉
+  // 工作目录前缀（V4-07：前缀对用户是纯噪音，还把文件名挤出窄栏）。useTaskBaseDir 对同一任务只发一次
+  // 详情请求（模块级缓存），不是每个块一次。
+  const baseDir = useTaskBaseDir(taskId, !!filePath, block.actionId);
   // 拼不出绝对路径时 IdePathLink 自己退化成纯文本（不给点了没反应的假链接）
   const linker = useIdePathLinker(baseDir);
   // detail 行里可点的那一段（不是路径行 → null、整行走原纯文本）
@@ -624,13 +682,59 @@ const RegularToolBlockRow = ({
     collapsed &&
     block.status === "running" &&
     liveOutput
-      ? liveOutput.trim().split("\n").filter(Boolean).slice(-1)[0]
+      ? // `\r` 刷新（进度条）取最后一次刷新的内容，不是整串当一行只显示最早的百分比（R7-02）
+        (liveOutputTailLine(liveOutput) ?? null)
       : null;
+
+  // 折叠行的路径摘要（V4-07）：只在摘要本来就是「路径 [+N/−M]」时拆段（shell 命令 / grep 模式等不动）。
+  // 拆段结果只依赖路径 / baseDir / diff 统计、不依赖折叠状态——下面 Tooltip 的内容也取自它（原因见 toolRowTooltipText）
+  // useMemo（D5-02）：输入都是稳定值（块引用稳定后 summary / filePath / diffStats 不变），
+  // 折叠 / 展开 / 直播输出这些只改本行 state 的重渲染不用再拆一遍路径、再拼一遍 Tooltip 文案
+  const pathParts = useMemo(
+    () =>
+      filePath && toolDetailPathSegment(summary, filePath)
+        ? toolPathRowParts({ filePath, baseDir, stats: diffStats })
+        : null,
+    [filePath, summary, baseDir, diffStats],
+  );
+  // 折叠且不在直播尾行时才画三段；展开 / 直播时行内没有这条摘要
+  const pathRow = collapsed && !liveTail ? pathParts : null;
+  // Tooltip 挂不挂跨渲染稳定（R7-03）：未映射工具运行中摘要是 `调用 x:{json}`、完成后变输出首行，
+  // 内容长度跨过阈值会让包装「有 ↔ 无」切换、行按钮重挂失焦。闩锁 + 运行中恒挂见 resolveRowTooltip
+  const tipMountedRef = useRef(false);
+  const rowTip = resolveRowTooltip({
+    summary,
+    pathParts,
+    running: block.status === "running" || block.backgroundRunning === true,
+    mounted: tipMountedRef.current,
+    fallback: block.name,
+  });
+  tipMountedRef.current = rowTip.mounted;
+  const rowTooltip = rowTip.content;
 
   // 展开区是否已有实质内容（detail / args 兜底 / diff / output）
   const hasExpandedBody = Boolean(
     detailLine || argsPreview || diff || displayOutput,
   );
+
+  // 全量输出到手后，shell 的输出框滚到底（U3a-06 尾巴）：shell 预览是「头 + 尾」，用户点
+  // 「加载完整输出」想看的是尾巴，不滚的话 <pre> 停在最顶、要手动拖。
+  // ref 回调的身份只随「有没有全量 / 要不要滚」变：全量刚到手那一次重渲染 React 会先 null 再重新调用它，
+  // 此时 DOM 已经换成全文、scrollHeight 是对的；之后的重渲染（流式 / 状态变）身份不变、不会再把用户拖走。
+  // 行被虚拟列表卸载后带着存档里的全量重挂也会再滚一次——输出框内部的滚动位置本来就不跨挂载保留。
+  // 截断的预览本身（头 + 尾，报错 / 汇总在尾部）也滚到底（R7-05）：不然展开后停在最顶、要先滚过一大段噪声头。
+  // 判定在 shouldScrollOutputToEnd（纯函数）；全量到手时 hasFullText 变 → 回调身份变 → 再滚一次
+  const hasFullText = fullText != null;
+  const scrollOutputToEnd = shouldScrollOutputToEnd(block, hasFullText);
+  // hasFullText 回调体里没用到，但它变（全量到手）必须换回调身份，React 才会重新调用 ref 再滚一次到尾——所以对这一处放行 exhaustive-deps
+  /* eslint-disable react-hooks/exhaustive-deps */
+  const fullOutputRef = useCallback(
+    (el: HTMLPreElement | null) => {
+      if (el && scrollOutputToEnd) el.scrollTop = el.scrollHeight;
+    },
+    [hasFullText, scrollOutputToEnd],
+  );
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   // 复制输出：截断时现拉全量（不是复制滚动框里可见的那截）
   const outputCopySource = buildOutputCopySource(
@@ -643,51 +747,84 @@ const RegularToolBlockRow = ({
 
   return (
     <div className={cn("group/tool w-full min-w-0 max-w-full", nested && "pl-0")}>
-      <button
-        type="button"
-        onClick={() => setManualCollapsed(!collapsed)}
-        aria-expanded={!collapsed}
-        className={PROCESS_ROW_BUTTON}
-      >
-        <CollapseChevron open={!collapsed} />
-        <ToolBlockIcon block={block} />
-        <span className="shrink-0 font-medium text-foreground">
-          {block.name}
-        </span>
-        {collapsed && (liveTail || summary) && (
-          <span
-            className={cn(
-              "min-w-0 flex-1 truncate",
-              // shell 命令 / 路径用 mono，一眼可辨
-              (block.name.toLowerCase() === "shell" ||
-                block.name.toLowerCase() === "edit" ||
-                block.name.toLowerCase() === "write" ||
-                block.name.toLowerCase() === "read") &&
-                "font-mono",
-            )}
-          >
-            {liveTail ?? summary}
+      {/* 整行 Tooltip（V4-07）：折叠行里的路径剥了 baseDir 前缀、目录段还会被省略，完整路径 / 长命令靠它看。
+          顶层块和 verb group / 工作过程组里的 nested 块是同一个组件，所以都有。
+          内容为空时 Tooltip 直接返回 children；内容刻意不随折叠状态变（见 toolRowTooltipText） */}
+      <Tooltip content={rowTooltip}>
+        <button
+          type="button"
+          onClick={() => setManualCollapsed(!collapsed)}
+          aria-expanded={!collapsed}
+          className={PROCESS_ROW_BUTTON}
+        >
+          <CollapseChevron open={!collapsed} />
+          <ToolBlockIcon block={block} />
+          <span className="shrink-0 font-medium text-foreground">
+            {block.name}
           </span>
-        )}
-        {/* 展开态的路径：点它跳 IDE、点行内其它地方仍是折叠（IdePathLink 内部 stopPropagation） */}
-        {!collapsed && block.result?.filePath && !diff && (
-          <IdePathLink
-            linker={linker}
-            path={block.result.filePath}
-            className="min-w-0 flex-1 truncate font-mono"
-          />
-        )}
-        <span className="ml-auto flex shrink-0 items-center gap-1.5">
-          {statusBits.length > 0 && block.status !== "running" && (
-            <span className="text-[11px] tabular-nums text-muted-foreground">
-              {statusBits.join(" · ")}
+          {pathRow ? (
+            // 路径摘要三段：目录可被省略（min-w-0 truncate）、文件名钉住（shrink-0）、+N/−M 钉右（shrink-0）。
+            // 窄栏（task 事件流栏 ≈307px）下视觉就是「头 … 文件名  +N/−M」，不再是行尾 truncate 先吃 +N/−M 再吃文件名
+            <span className="flex min-w-0 flex-1 items-baseline gap-1.5 font-mono">
+              <span className="flex min-w-0 items-baseline">
+                {pathRow.dir && (
+                  <span data-path-dir className="min-w-0 truncate">
+                    {pathRow.dir}
+                  </span>
+                )}
+                {/* min-w-0 不能省：truncate 的 flex item 默认 min-width:auto = 整串文字宽，min 会压过 max-w-full，
+                    超长文件名就溢出而不是截断（ui-conventions「min-w-0 加在自己是 nowrap 内容的那个 flex item 上」） */}
+                <span
+                  data-path-base
+                  className="min-w-0 max-w-full shrink-0 truncate"
+                >
+                  {pathRow.base}
+                </span>
+              </span>
+              {pathRow.stats && (
+                <span data-path-stats className="shrink-0 tabular-nums">
+                  {pathRow.stats}
+                </span>
+              )}
             </span>
+          ) : (
+            collapsed &&
+            (liveTail || summary) && (
+              <span
+                className={cn(
+                  "min-w-0 flex-1 truncate",
+                  // shell 命令 / 路径用 mono，一眼可辨
+                  (block.name.toLowerCase() === "shell" ||
+                    block.name.toLowerCase() === "edit" ||
+                    block.name.toLowerCase() === "write" ||
+                    block.name.toLowerCase() === "read") &&
+                    "font-mono",
+                )}
+              >
+                {liveTail ?? summary}
+              </span>
+            )
           )}
-          <span className="text-[11px] tabular-nums opacity-0 transition-opacity group-hover/tool:opacity-100 group-focus-within/tool:opacity-100">
-            {formatTs(block.ts)}
+          {/* 展开态的路径：点它跳 IDE、点行内其它地方仍是折叠（IdePathLink 内部 stopPropagation） */}
+          {!collapsed && block.result?.filePath && !diff && (
+            <IdePathLink
+              linker={linker}
+              path={block.result.filePath}
+              className="min-w-0 flex-1 truncate font-mono"
+            />
+          )}
+          <span className="ml-auto flex shrink-0 items-center gap-1.5">
+            {statusBits.length > 0 && block.status !== "running" && (
+              <span className="text-[11px] tabular-nums text-muted-foreground">
+                {statusBits.join(" · ")}
+              </span>
+            )}
+            <span className="text-[11px] tabular-nums opacity-0 transition-opacity group-hover/tool:opacity-100 group-focus-within/tool:opacity-100">
+              {formatTs(block.ts)}
+            </span>
           </span>
-        </span>
-      </button>
+        </button>
+      </Tooltip>
 
       {/* wait 在睡：不论折叠与否都露出「跳过等待」（task 形态没有状态行，这是唯一入口）。
           放在标题按钮外面——按钮套按钮不合法、点击也会冒泡成折叠 / 展开 */}
@@ -724,6 +861,11 @@ const RegularToolBlockRow = ({
                 </>
               ) : (
                 (detailLine ?? argsPreview)
+              )}
+              {argsTruncatedHint && (
+                <span className="ml-1.5 font-sans text-[11px] text-warning">
+                  {argsTruncatedHint}
+                </span>
               )}
             </div>
           )}
@@ -787,7 +929,10 @@ const RegularToolBlockRow = ({
                   label="复制输出"
                   className="mt-1"
                 >
-                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border bg-card p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  <pre
+                    ref={fullOutputRef}
+                    className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border bg-card p-2 font-mono text-[11px] leading-relaxed text-muted-foreground"
+                  >
                     {fullText ?? displayOutput}
                   </pre>
                 </CopyableBlock>
@@ -822,11 +967,16 @@ const RegularToolBlockRow = ({
  */
 const TodoToolBlock = ({
   block,
+  taskId,
   nested,
 }: ToolBlockRowProps) => {
-  // 清单默认展开；nested（verb 内）仍跟 defaultCollapsed
-  const [collapsed, setCollapsed] = useState(() =>
-    toolBlockDefaultCollapsed(block.name, nested),
+  // 清单默认展开；nested（verb 内）仍跟 defaultCollapsed。
+  // 走 useRowViewState（V2-05）：用户折叠 / 展开后，行被虚拟列表卸载再滚回来不回到默认。
+  // key 的行身份是合并待办块的 stableId（= 首条待办），不是最新一条 call 的 id：agent 每更新一次待办
+  // id 就换一个，按 id 存的折叠态每次都落空、卡片自己弹开（R4-02）
+  const [collapsed, setCollapsed] = useRowViewState<boolean>(
+    toolRowViewKey(taskId, block, ROW_VIEW_FIELD.todoCollapsed),
+    () => toolBlockDefaultCollapsed(block.name, nested),
   );
 
   const todos = useMemo(
@@ -952,8 +1102,11 @@ const ToolVerbGroupRowImpl = ({
   group: ToolVerbGroup;
   taskId: string;
 }) => {
-  // 默认折叠成一行（GB group_tool_verbs）
-  const [collapsed, setCollapsed] = useState(true);
+  // 默认折叠成一行（GB group_tool_verbs）；展开态进存档，滚走再滚回来不丢（V2-05）
+  const [collapsed, setCollapsed] = useRowViewState<boolean>(
+    verbGroupViewKey(taskId, group, ROW_VIEW_FIELD.verbCollapsed),
+    true,
+  );
   return (
     <div className="group/verb">
       <button
@@ -973,7 +1126,7 @@ const ToolVerbGroupRowImpl = ({
         <div className="ml-5 mt-0.5 space-y-0.5 border-l border-border pl-2">
           {group.members.map((m) => (
             <ToolBlockRow
-              key={m.id}
+              key={streamItemStableId(m)}
               block={m}
               taskId={taskId}
               nested

@@ -32,6 +32,19 @@ import type { RepoBranchList } from "@/lib/types";
 const REFRESH_CACHE_MS = 5 * 60 * 1000;
 const refreshCache = new Map<string, { at: number; data: RepoBranchList }>();
 
+/** 非 2xx 响应里的 `{ error }` 文案（读不出 / 不是字符串 → 空对象，调用方退回通用提示） */
+export const readServerReason = async (
+  r: Pick<Response, "json">,
+): Promise<{ reason?: string }> => {
+  try {
+    const body = (await r.json()) as { error?: unknown };
+    const reason = typeof body?.error === "string" ? body.error.trim() : "";
+    return reason ? { reason } : {};
+  } catch {
+    return {};
+  }
+};
+
 export const useRepoBranches = (
   paths: string[],
   opts?: { refresh?: boolean },
@@ -73,15 +86,27 @@ export const useRepoBranches = (
         `/api/repo-branches?path=${encodeURIComponent(p)}` +
         (refresh ? "&refresh=1" : "");
       void fetch(url)
-        .then((r) =>
+        .then(async (r) =>
           r.ok
-            ? (r.json() as Promise<RepoBranchList>)
-            : { isRepo: false, branches: [] as string[] },
+            ? { res: (await r.json()) as RepoBranchList, failed: false }
+            : {
+                // 非 2xx（UNC / 非本机路径等 400）：保留服务端原因给界面展示，别一律吞成「非 git 仓库」（Q4-01）
+                res: {
+                  isRepo: false,
+                  branches: [] as string[],
+                  ...(await readServerReason(r)),
+                } as RepoBranchList,
+                failed: true,
+              },
         )
         // 拉失败归一成「非 git」：禁用下拉（本机 app 网络失败罕见、不值得区分错误态）
-        .catch(() => ({ isRepo: false, branches: [] as string[] }))
-        .then((res) => {
-          if (refresh) refreshCache.set(key, { at: Date.now(), data: res });
+        .catch(() => ({
+          res: { isRepo: false, branches: [] as string[] } as RepoBranchList,
+          failed: true,
+        }))
+        .then(({ res, failed }) => {
+          // 失败结果不进会话缓存（第三轮 D2a-01：一次瞬时失败会让同路径 5 分钟内都是「非 git 仓库」禁用态）
+          if (refresh && !failed) refreshCache.set(key, { at: Date.now(), data: res });
           if (aliveRef.current) setMap((prev) => ({ ...prev, [p]: res }));
         });
     }

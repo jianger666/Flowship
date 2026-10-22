@@ -43,6 +43,32 @@ export const HOST_INJECTED_ENV_KEYS = [
 ] as const;
 
 /**
+ * 从 NODE_OPTIONS 里剔掉宿主追加的 `--report-*` 取证旗标（含带引号的取值），其余（如 `--max-old-space-size`）原样保留。
+ *
+ * 为什么需要：宿主**旧版本**曾把 `--report-on-fatalerror` / `--report-uncaught-exception` /
+ * `--report-directory=<数据目录>` 写进 server 的 NODE_OPTIONS。agent 的 shell 子进程继承后，任何 node 脚本异常退出
+ * （路径写错、找不到模块、EPIPE…）都会往正式数据目录落一份取证报告——第二轮 review §10 实测：审查脚本一次性落了 20 份。
+ * 第三轮 N3-01 起这些旗标改走 server 的 argv（不被继承，见 electron-app/node-options.mjs），NODE_OPTIONS 里不再有它们；
+ * 这里保留剔除是兜底：用户自己在 NODE_OPTIONS 里设了同名旗标、或旧壳拉起的 server 仍在运行时，agent 那份环境依旧干净。
+ * 分词规则与 Node 解析 NODE_OPTIONS 一致：双引号内的空格不切词（数据目录在「Application Support」下）。
+ */
+export function stripReportFlagsFromNodeOptions(value: string): string {
+  const tokens = value.match(/(?:[^\s"]|"(?:[^"\\]|\\.)*")+/g) ?? [];
+  // 只剔宿主自己追加的那几个（不动用户自带的其它 --report-* 设置）
+  return tokens
+    .filter((t) => !HOST_INJECTED_REPORT_FLAGS.has(t.split("=")[0]!))
+    .join(" ");
+}
+
+/** 宿主（旧版 electron-app/main.js startServer 曾写进 NODE_OPTIONS）的取证旗标名（不含取值） */
+const HOST_INJECTED_REPORT_FLAGS: ReadonlySet<string> = new Set([
+  "--report-on-fatalerror",
+  "--report-uncaught-exception",
+  "--report-directory",
+  "--report-exclude-env",
+]);
+
+/**
  * 返回一份剔除宿主注入变量的浅拷贝 env（不修改传入对象 / process.env）。
  * 给 agent shell 工具 spawn 子进程时传 `env: stripHostInjectedEnv()` 用。
  */
@@ -53,6 +79,17 @@ export function stripHostInjectedEnv(
   for (const key of HOST_INJECTED_ENV_KEYS) {
     delete cleaned[key];
   }
-  // 收窄回 ProcessEnv：剔除只减不增，NODE_ENV 等必填键语义不变
+  // NODE_OPTIONS 不能整个删（用户自带的 --max-old-space-size 等要保留），只剔宿主追加的 --report-* 取证旗标
+  if (typeof cleaned.NODE_OPTIONS === "string") {
+    const stripped = stripReportFlagsFromNodeOptions(cleaned.NODE_OPTIONS);
+    if (stripped) cleaned.NODE_OPTIONS = stripped;
+    else delete cleaned.NODE_OPTIONS;
+  }
+  // server 自己的 NODE_ENV=production（Next standalone 的 server.js 第一批语句无条件写它，第四轮 Q1-06）：
+  // 不能放进 HOST_INJECTED_ENV_KEYS（hermetic-env 据此表删键会把 vitest 的 NODE_ENV=test 一起删掉），
+  // 所以在这里单独、且只剔 "production"——用户命令拿到它会让 npm / yarn 1 漏装 devDependencies（tsc / eslint / vitest 缺失）、
+  // 预览 dev server 以 production 值起。用户自己设的 development / test 等值原样保留。
+  if (cleaned.NODE_ENV === "production") delete (cleaned as Record<string, string | undefined>).NODE_ENV;
+  // 收窄回 ProcessEnv：剔除只减不增
   return cleaned as NodeJS.ProcessEnv;
 }

@@ -67,7 +67,12 @@ vi.mock("@/lib/server/meegle-cli", () => ({
   resolveUserIdentityForPrompt: async () => "",
 }));
 
-const { taskDir, writeMeta } = await import("@/lib/server/task-fs-core");
+const { readEvents, taskDir, writeMeta } = await import(
+  "@/lib/server/task-fs-core"
+);
+const { droppedNoticeTitle, extractDroppedTexts } = await import(
+  "@/lib/chat-stream-display"
+);
 const { getTask, listTasks } = await import("@/lib/server/task-fs");
 const { clearChatGate } = await import("@/lib/server/chat-gate");
 const taskWorktrees = await import("@/lib/server/task-worktrees");
@@ -216,6 +221,45 @@ describe("清队调用点接线", () => {
     ]);
     // 群问题带启动凭据、真身在群队列：stop 不能顺手清它
     expect(groupQuestionQueueLength(id)).toBe(1);
+  });
+
+  it("stop：清掉的 app 输入条要落一条「未送达」事件（完整原文），排在「用户停止了…」之后；群来源的话不进该事件（D8-04）", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id));
+    const task = (await getTask(id))!;
+    seedAllSources(id);
+
+    await stopTaskAgent(task);
+
+    const evs = await readEvents(id);
+    const stopIdx = evs.findIndex(
+      (e) => e.kind === "info" && e.meta?.stopped === true,
+    );
+    const dropIdx = evs.findIndex(
+      (e) => e.kind === "info" && extractDroppedTexts(e.meta).length > 0,
+    );
+    expect(stopIdx).toBeGreaterThanOrEqual(0);
+    expect(dropIdx).toBeGreaterThan(stopIdx);
+    const dropped = evs[dropIdx]!;
+    expect(extractDroppedTexts(dropped.meta)).toEqual(["app 输入条"]);
+    expect(droppedNoticeTitle(dropped.text)).toBe(
+      "已停止，1 条排队消息未送达、请重新发送",
+    );
+    // 群来源保留、照常送达——它们的话不能被说成「未送达」
+    const all = JSON.stringify(evs);
+    expect(all).not.toContain("属主在群里说");
+    expect(all).not.toContain("托办回执");
+  });
+
+  it("stop：队里没有 app 输入条时不写「未送达」事件（不制造空提示）", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id));
+    const task = (await getTask(id))!;
+
+    await stopTaskAgent(task);
+
+    const evs = await readEvents(id);
+    expect(evs.some((e) => e.text?.includes("未送达"))).toBe(false);
   });
 
   it("finalize（abandoned）：整队清——含群问题（带 boot.apiKey）", async () => {

@@ -59,25 +59,31 @@ describe("到点消息走普通用户消息的路径，但不抢用户的东西�
 
 describe("会话生命周期：归档 / 删除 → 定时一起取消", () => {
   const runner = src("src/lib/server/task-runner.ts");
-  const fnStart = runner.indexOf("export const archiveTaskWithCleanup = async (");
+  const fnStart = runner.indexOf("export const archiveTaskWithReport = async (");
 
   it("归档：在 chat / 非 worktree 的早退之前取消（否则 chat 归档了定时还在、会悄悄唤醒归档的会话）", () => {
     expect(fnStart).toBeGreaterThan(0);
     const body = runner.slice(fnStart, fnStart + 6000);
-    const cancelAt = body.indexOf('cancelSchedulesWithNotice(taskId, "会话已归档", "archived"');
+    const cancelAt = body.search(/cancelSchedulesWithNotice\(\s*taskId,\s*"会话已归档",\s*"archived"/);
     const earlyReturnAt = body.indexOf('if (task.mode === "chat" || !isWorktreeTask(task))');
     expect(cancelAt).toBeGreaterThan(0);
     expect(earlyReturnAt).toBeGreaterThan(cancelAt);
   });
 
-  it("取消归档（archived=false）不碰定时：取消过的不会因为恢复归档又回来", () => {
-    const body = runner.slice(fnStart, fnStart + 1500);
+  it("取消归档（archived=false）只还原「归档时取消的」（带标记），不会复活用户自己取消 / 已结束的定时（D2b-03）", () => {
+    const body = runner.slice(fnStart, fnStart + 3000);
     const falseBranch = body.slice(
       body.indexOf("if (!archived) {"),
       body.indexOf("const task = await getTaskMeta(taskId);"),
     );
     expect(falseBranch).toContain("setTaskPinArchive(taskId, { archived: false })");
-    expect(falseBranch).not.toContain("Schedule");
+    expect(falseBranch).toContain("restoreArchiveCancelledSchedulesDetailed(taskId)");
+    // 归档那一侧必须声明 restorable，否则没有还原信息可用
+    const archiveSide = body.slice(body.indexOf("const task = await getTaskMeta(taskId);"));
+    expect(archiveSide).toMatch(/restorable: true/);
+    // 终结（合入 / 放弃）不是归档：不带 restorable，取消后不会因取消归档回来
+    const finalizeAt = runner.indexOf("export const finalizeTask = async (");
+    expect(runner.slice(finalizeAt, finalizeAt + 4000)).not.toContain("restorable");
   });
 
   it("取消失败只 log、不挡归档 / 终结主流程（共用 cancelSchedulesWithNotice）", () => {

@@ -8,18 +8,28 @@
  * （停止键），而不是只剩一个转圈的发送键；受理前点停止要等提交落地再停（热路径发送前快照窗口里
  * 没有占位，直接停会让 AI 在「已停止」之后被重新拉起）。
  */
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
   classifyPendingBubble,
   decideChatStop,
   hasInflightPending,
+  hasPendingBubbleContent,
   loadingSinceTs,
   resolveLoadingStart,
   settleStopIntent,
   shouldShowComposerRunning,
+  shouldShowComposerStopOnly,
   shouldShowSendLoading,
 } from "@/lib/chat-pending-display";
+import {
+  emptyChatOpState,
+  reduceChatOperation,
+  shouldHideLocalPlaceholder,
+} from "@/lib/chat-pending-reconcile";
 
 describe("classifyPendingBubble", () => {
   it("立即发送（没排队、状态正常）→ inflight：渲染成正式气泡", () => {
@@ -113,6 +123,41 @@ describe("shouldShowComposerRunning", () => {
       }
     }
   });
+
+  // V16-03：后台子代理还在跑时，主 AI 可能早已说完一轮（isRunning 归零）——输入框只剩「发送」键、
+  // 没有任何停止入口，用户想停掉后台子代理却无处可点（停止 = 关整个会话，会连带 cancelAll 后台子代理）。
+  // 第三轮 R3-02：当初把它并进 shouldShowComposerRunning 会把整套运行态（转圈 / 「排队发送」/ 附件按钮消失）带出来，
+  // 改为单独的 shouldShowComposerStopOnly（只多一个停止键）——下面的 describe 钉住这条分工
+});
+
+describe("shouldShowComposerStopOnly（R3-02，原 V16-03：后台子代理的停止入口）", () => {
+  const idle = { isRunning: false, submitting: false, awaitingAsk: false };
+
+  it("主 AI 空闲但还有后台子代理在跑 → 只多一个停止键（停止键可达），而不是整套运行态", () => {
+    expect(shouldShowComposerStopOnly({ ...idle, backgroundSubagentCount: 2 })).toBe(true);
+    // 同样的输入下，完整运行态是关的——转圈 / 「排队发送」/ 附件按钮消失都不该出现
+    expect(shouldShowComposerRunning(idle)).toBe(false);
+  });
+
+  it("后台子代理数是 0 / 没传 → 与原来一致（不凭空多出停止键）", () => {
+    expect(shouldShowComposerStopOnly({ ...idle, backgroundSubagentCount: 0 })).toBe(false);
+    expect(shouldShowComposerStopOnly(idle)).toBe(false);
+  });
+
+  it("有待答提问时后台子代理也不改变「保持可发」：awaitingAsk 仍然最优先", () => {
+    expect(
+      shouldShowComposerStopOnly({ ...idle, awaitingAsk: true, backgroundSubagentCount: 1 }),
+    ).toBe(false);
+  });
+
+  it("已经是完整运行态时不重复（运行态自带停止键）", () => {
+    expect(
+      shouldShowComposerStopOnly({ ...idle, isRunning: true, backgroundSubagentCount: 1 }),
+    ).toBe(false);
+    expect(
+      shouldShowComposerStopOnly({ ...idle, submitting: true, backgroundSubagentCount: 1 }),
+    ).toBe(false);
+  });
 });
 
 describe("decideChatStop", () => {
@@ -197,5 +242,132 @@ describe("loadingSinceTs / resolveLoadingStart：切走再切回后「已等待�
     const remountAt = since + 20_000;
     const t0 = resolveLoadingStart(since, remountAt);
     expect(Math.floor((remountAt - t0) / 1000)).toBe(20);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// V1-07（第二轮 review）：刷新 / 第二窗口后 bootstrap 重建的占位没有正文，不能画成空白气泡
+// ---------------------------------------------------------------------------
+describe("hasPendingBubbleContent：占位气泡有没有东西可画", () => {
+  it("有文字 → 画", () => {
+    expect(hasPendingBubbleContent({ displayText: "稍后帮我看下 CI" })).toBe(true);
+  });
+
+  it("没文字也没附件：空白（bootstrap 重建的那种）→ 不画；纯空白字符同理", () => {
+    expect(hasPendingBubbleContent({ displayText: "" })).toBe(false);
+    expect(hasPendingBubbleContent({ displayText: " \n\t" })).toBe(false);
+    expect(
+      hasPendingBubbleContent({ displayText: "", images: [], attachments: [], skillRefs: [] }),
+    ).toBe(false);
+  });
+
+  it("纯附件 / 纯图片 / 纯 skill 的本窗口消息：没文字但确有内容 → 照旧画（不能被一刀切掉）", () => {
+    expect(hasPendingBubbleContent({ displayText: "", images: [{}] })).toBe(true);
+    expect(hasPendingBubbleContent({ displayText: "", attachments: ["/tmp/a.png"] })).toBe(true);
+    expect(hasPendingBubbleContent({ displayText: "", skillRefs: [{ name: "x" }] })).toBe(true);
+  });
+});
+
+describe("V1-07：bootstrap 重建的排队占位 vs 本窗口登记的占位", () => {
+  const snap = (itemId: string) => ({
+    type: "queue_state" as const,
+    serverItemIds: [itemId],
+    recentSettled: [],
+    operationSnapshot: [{ itemId, phase: "accepting" }],
+  });
+
+  it("刷新后 bootstrap 重建：占位在 ledger 里（计入排队数），但没正文 → 不画气泡", () => {
+    const { state } = reduceChatOperation(emptyChatOpState(), snap("cq_rebuilt"));
+    expect(state.pending).toHaveLength(1);
+    expect(state.pending[0]!.displayText).toBe("");
+    // 仍在 ledger：排队条据此显示「N 条排队」并去服务端拉带正文的清单（可编辑 / 删除）
+    expect(shouldHideLocalPlaceholder(state.pending[0]!)).toBe(false);
+    expect(hasPendingBubbleContent(state.pending[0]!)).toBe(false);
+  });
+
+  it("本窗口登记的排队消息（有正文）：照常画", () => {
+    const { state } = reduceChatOperation(emptyChatOpState(), {
+      type: "register",
+      op: {
+        id: "cq_local",
+        itemId: "cq_local",
+        payloadFingerprint: "fp_local",
+        persistence: "sending",
+        terminalKnowledge: "none",
+        networkUncertain: false,
+        text: "排队的这一句",
+        displayText: "排队的这一句",
+      },
+    });
+    expect(hasPendingBubbleContent(state.pending[0]!)).toBe(true);
+  });
+
+  it("本窗口登记的纯附件消息：没文字，但登记时带了附件 → 照常画", () => {
+    const { state } = reduceChatOperation(emptyChatOpState(), {
+      type: "register",
+      op: {
+        id: "cq_att",
+        itemId: "cq_att",
+        payloadFingerprint: "fp_att",
+        persistence: "sending",
+        terminalKnowledge: "none",
+        networkUncertain: false,
+        text: "",
+        displayText: "",
+        attachments: ["/tmp/report.pdf"],
+      },
+    });
+    expect(hasPendingBubbleContent(state.pending[0]!)).toBe(true);
+  });
+
+  it("本窗口已登记的占位遇到重连 bootstrap：保留原正文（不被重建成空的）", () => {
+    let state = reduceChatOperation(emptyChatOpState(), {
+      type: "register",
+      op: {
+        id: "cq_keep",
+        itemId: "cq_keep",
+        payloadFingerprint: "fp_keep",
+        persistence: "sending",
+        terminalKnowledge: "none",
+        networkUncertain: false,
+        text: "原文",
+        displayText: "原文",
+      },
+    }).state;
+    state = reduceChatOperation(state, snap("cq_keep")).state;
+    expect(state.pending).toHaveLength(1);
+    expect(hasPendingBubbleContent(state.pending[0]!)).toBe(true);
+  });
+});
+
+describe("V1-07：chat-view 接线（源码契约）", () => {
+  const src = readFileSync(
+    path.resolve(import.meta.dirname, "..", "src/components/tasks/chat-view.tsx"),
+    "utf-8",
+  );
+  // 含 useMemo 上方那段说明注释
+  const memo = src.slice(
+    src.indexOf("// 是否渲染本地占位只看 persistence"),
+    src.indexOf("useTaskWatch(task.id, {"),
+  );
+
+  it("送进事件流的占位要同时过 persisted 隐藏和「有内容可画」两道滤", () => {
+    expect(memo).toContain("shouldHideLocalPlaceholder(p)");
+    expect(memo).toMatch(/hasPendingBubbleContent\(p\)/);
+  });
+
+  it("排队计数（applyLedgerToUi）不过「有内容」滤：重建的占位仍计入，排队条才会出现", () => {
+    const apply = src.slice(
+      src.indexOf("const applyLedgerToUi = useCallback("),
+      src.indexOf("// 切 task：清 streaming 等 UI 态"),
+    );
+    expect(apply).toContain("shouldHideLocalPlaceholder(p)");
+    expect(apply.includes("hasPendingBubbleContent")).toBe(false);
+  });
+
+  it("注释说实话：ledger 是纯内存，刷新后占位来自 bootstrap 重建；不再声称「sessionStorage 恢复」", () => {
+    expect(src.includes("sessionStorage")).toBe(false);
+    expect(memo).toMatch(/纯内存/);
+    expect(memo).toMatch(/bootstrap/);
   });
 });

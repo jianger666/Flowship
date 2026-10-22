@@ -4,7 +4,8 @@
  * 提供方 + 模型组合选择器
  *
  * 两个 picker 一律并排、跟对话 footer 同一套 compact 样式。
- * 提供方下拉只在建任务 / 空对话出现；chat 发过消息、推进里只留模型。
+ * 提供方下拉在建任务 / 对话 footer / 推进弹窗 / 任务说话条都有（空闲时可切）；运行中只灰掉、不卸载，
+ * 卸载会让模型框每轮左移再回弹（第二轮 review V5-04）。`showProvider=false` 只给确实不该切的场景。
  * full 表单在上方多一行常用 chip；compact 只留下拉里的星。
  */
 
@@ -15,7 +16,12 @@ import { Picker } from "@/components/ui/picker";
 import { Tooltip } from "@/components/ui/tooltip";
 import { listProviderOptions, providerDisplayName } from "@/lib/agent-provider";
 import { getSettings } from "@/lib/local-store";
-import { CURSOR_PROVIDER_ID, type ModelOption, type ModelSelection } from "@/lib/types";
+import {
+  CURSOR_PROVIDER_ID,
+  isCursorProvider,
+  type ModelOption,
+  type ModelSelection,
+} from "@/lib/types";
 
 interface Props {
   providerId: string;
@@ -32,6 +38,8 @@ interface Props {
   onModelOpenChange?: (open: boolean) => void;
   /** 本窗口提供方和设置页默认不一致时，hover 提示（对话 footer 用） */
   differFromSettingsHint?: boolean;
+  /** 提供方下拉被灰掉时 hover 说明原因（如「AI 运行中不能切换」）；只在 disabled 且有值时替换默认提示 */
+  providerDisabledReason?: string;
 }
 
 export const ProviderModelPicker = ({
@@ -46,6 +54,7 @@ export const ProviderModelPicker = ({
   emptyPlaceholder = "选择模型",
   onModelOpenChange,
   differFromSettingsHint = false,
+  providerDisabledReason,
 }: Props) => {
   const settings = getSettings();
   const options = listProviderOptions(settings);
@@ -56,9 +65,13 @@ export const ProviderModelPicker = ({
   // 下拉里点星后刷新上方常用行
   const [starTick, setStarTick] = useState(0);
 
+  // 当前值不在可选列表里（绑定的自定义提供方被删了 / 地址被清空）：下拉显示占位，选哪家都会触发切换
+  const unavailable =
+    !isCursorProvider(providerId) && !options.some((o) => o.value === providerId);
   const providerPicker = (
     <Picker
       value={providerId}
+      placeholder={unavailable ? "请重选" : undefined}
       onChange={(id) => onProviderChange?.(id)}
       options={options}
       disabled={disabled}
@@ -83,15 +96,17 @@ export const ProviderModelPicker = ({
   );
 
   const providerName = providerDisplayName(settings, providerId);
-  const providerEl = showHint ? (
-    <Tooltip
-      content={`本窗口用这个提供方，设置页默认是 ${providerDisplayName(settings, settingsDefault)}`}
-    >
-      <span className="inline-flex w-auto max-w-24 shrink-0">{providerPicker}</span>
-    </Tooltip>
-  ) : (
-    // 长提供方名会被 max-w-24 截断，hover 给全名（与模型 pill 的完整名 tooltip 同理）
-    <Tooltip content={providerName}>
+  // 提示优先级：灰掉的原因 > 与设置页默认不一致 > 长名全名（max-w-24 会截断，hover 给全名）。
+  // 原生 disabled 控件收不到鼠标事件，所以 Tooltip 一律挂在外层 span 上。
+  const providerTip = unavailable
+    ? "原来绑定的提供方已删除或没配好，请重新选择一个提供方再发送"
+    : disabled && providerDisabledReason
+      ? providerDisabledReason
+      : showHint
+        ? `本窗口用这个提供方，设置页默认是 ${providerDisplayName(settings, settingsDefault)}`
+        : providerName;
+  const providerEl = (
+    <Tooltip content={providerTip}>
       <span className="inline-flex w-auto max-w-24 shrink-0">{providerPicker}</span>
     </Tooltip>
   );

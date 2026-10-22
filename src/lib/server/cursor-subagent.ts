@@ -65,6 +65,7 @@ import type { ModelSelection, SDKCustomTool, ToolName } from "@cursor/sdk";
 import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import { withoutHiddenModelSelection } from "@/lib/model-params";
 import {
+  catalogDefaultEffort,
   catalogFromModelOptions,
   currentEffortValue,
   formatModelCatalog,
@@ -81,7 +82,7 @@ import {
   type SubagentRequest,
 } from "@/lib/subagent-spec";
 
-import { listModelOptions } from "./model-catalog";
+import { getCachedModelOptions, listModelOptions } from "./model-catalog";
 import { withCursorJsonlStore } from "./sdk-agent-store";
 import {
   SDK_CREATE_RESUME_TIMEOUT_MS,
@@ -97,7 +98,10 @@ import {
   type BackgroundSubagentEvent,
   type SubagentSessionControl,
 } from "./subagent-background";
-import { setSubagentParentModel } from "./subagent-parent-model";
+import {
+  setSubagentDisplayLookup,
+  setSubagentParentModel,
+} from "./subagent-parent-model";
 import type { SubagentRunHandle, SubagentRunInit } from "./subagent-transcript";
 
 /** explore（只读）：读 / 搜，不写文件、不跑命令（与 pi 的 read/grep/find/ls 对齐） */
@@ -202,6 +206,12 @@ export interface CursorSubagentDeps {
   parentModel?: SubagentModelSelection;
   /** 当前 provider 的模型目录；拿不到返回 null（此时不校验 model id） */
   loadCatalog: () => Promise<ModelCatalogEntry[] | null>;
+  /**
+   * 同步偷看「已缓存」的模型目录（不发网络请求、没缓存返回 null）。只给展示用：卡片徽标 /
+   * 过程记录要写「该模型的默认 effort」，而这个时机往往还没人拉过目录（纯沿用不拉）。
+   * 不提供 = 只用本 link 之前 loadCatalog 成功拿到过的那份。
+   */
+  peekCatalog?: () => ModelCatalogEntry[] | null;
   /** 起子 agent；model 为空 = 沿用 SDK 默认（仅父会话没选模型且 inherit 时） */
   createChild: (opts: {
     model?: SubagentModelSelection;
@@ -411,6 +421,46 @@ export const createCursorSubagentLink = (
    * 同一个持久化会话被恢复成新实例时 agentId 不变，新 link 能接着看到之前派出的子代理。
    */
   let parentKey = `link:${randomUUID()}`;
+
+  // ----------------- 展示用：子代理实际生效的 effort -----------------
+  // 不传 effort 时子代理走该模型自己的默认档，目录里有（isDefault 预设）。卡片徽标 / 过程记录把它写出来，
+  // 而不是留空。目录只在「显式选模型」时才会拉（纯沿用不为此多一次网络往返），所以这里额外记住拉到过的那份当兜底；
+  // 平时优先偷看进程里已缓存的（peekCatalog，新鲜优先），缓存没有 / 过期才用记住的。全程同步、不发请求——事件流热路径要用。
+  let catalogMemo: ModelCatalogEntry[] | null = null;
+  const loadCatalog = async (): Promise<ModelCatalogEntry[] | null> => {
+    const catalog = await deps.loadCatalog();
+    if (catalog) catalogMemo = catalog;
+    return catalog;
+  };
+  const peekCatalogSafe = (): ModelCatalogEntry[] | null => {
+    // 进程缓存（peekCatalog）优先：它有 10 分钟 TTL、会随目录刷新；link 记住的那份只在缓存过期 / 没有时兜底，
+    // 否则长会话里目录变了，卡片会一直用第一次拉到的旧默认档
+    try {
+      const fresh = deps.peekCatalog?.();
+      if (fresh) return fresh;
+    } catch {
+      /* 只是展示用，偷看失败当没有、退回记住的那份 */
+    }
+    return catalogMemo;
+  };
+  const defaultEffortOf = (modelId: string): string | undefined =>
+    catalogDefaultEffort(peekCatalogSafe(), modelId);
+  /** 一个子代理实际生效的 effort：显式 / 沿用的档位参数优先，没有再用该模型的默认档 */
+  const effectiveEffortOf = (
+    model: SubagentModelSelection | undefined,
+  ): string | undefined =>
+    model
+      ? (currentEffortValue(model.params) ?? defaultEffortOf(model.id))
+      : undefined;
+  /** resume 卡片徽标：接着的子代理当初用的模型 / 档位（登记表里没有 → undefined，不硬造） */
+  const resumedChildOf = (
+    agentId: string,
+  ): { model?: string; effort?: string } | undefined => {
+    const model = childrenOf(parentKey, false)?.get(agentId)?.model;
+    if (!model) return undefined;
+    const effort = effectiveEffortOf(model);
+    return { model: model.id, ...(effort ? { effort } : {}) };
+  };
 
   const cancelAll = async (): Promise<void> => {
     generation += 1;
@@ -717,7 +767,7 @@ export const createCursorSubagentLink = (
         };
 
         const catalog = subagentNeedsCatalog(req)
-          ? await deps.loadCatalog()
+          ? await loadCatalog()
           : null;
         if (wantsModelList(req.model)) {
           return catalog
@@ -781,7 +831,7 @@ export const createCursorSubagentLink = (
             description: describeJob(req),
             prompt: req.prompt,
             model: childModel?.id,
-            effort: currentEffortValue(childModel?.params),
+            effort: effectiveEffortOf(childModel),
             explore,
             resumed: !!resumed,
             agentId: startedChild.agentId ?? resumed?.id,
@@ -958,6 +1008,8 @@ export const createCursorSubagentLink = (
     const wrapped = wrapAgentWithCancelLink(agent, cancelAll);
     // 事件流卡片徽标要显示「沿用」的实际模型：登记在返回给调用方的这个对象上（见 subagent-parent-model）
     setSubagentParentModel(wrapped, deps.parentModel);
+    // 同样登记「查默认档 / resume 子代理模型」的查表函数（事件流卡片徽标用，见 subagent-parent-model）
+    setSubagentDisplayLookup(wrapped, { defaultEffortOf, resumedChildOf });
     // 转后台 / 后台计数的控制面同样登记在 wrapped 上，chat-runner 经 rec.agent 取
     setSubagentSessionControl(wrapped, control);
     return wrapped;
@@ -1095,6 +1147,13 @@ export const createCursorSubagentLinkForSession = (opts: {
           },
         }
       : {}),
+    peekCatalog: () => {
+      const cached = getCachedModelOptions({
+        kind: "cursor",
+        apiKey: opts.apiKey,
+      });
+      return cached ? catalogFromModelOptions(cached) : null;
+    },
     loadCatalog: async () => {
       try {
         const options = await listModelOptions({

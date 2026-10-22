@@ -104,7 +104,11 @@ export const accumulateTokenUsage = (
 export const formatTokens = (n: number): string => {
   const v = safeCount(n);
   if (v < 1000) return String(v);
-  const unit = v >= 1_000_000 ? { div: 1_000_000, suffix: "M" } : { div: 1000, suffix: "k" };
+  // 999_500 起四舍五入后会是「1000k」：该进位成 M（第二轮 review V18-04 顺带）
+  const unit =
+    v >= 1_000_000 || Math.round(v / 1000) >= 1000
+      ? { div: 1_000_000, suffix: "M" }
+      : { div: 1000, suffix: "k" };
   const scaled = v / unit.div;
   const text = scaled >= 10 ? String(Math.round(scaled)) : scaled.toFixed(1);
   // 1.0k → 1k

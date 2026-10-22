@@ -12,6 +12,7 @@
 import { NextResponse } from "next/server";
 import { openInIde } from "@/lib/server/ide-tools";
 import { JUMP_IDES, type JumpIde } from "@/lib/types";
+import { nonLocalPathReason } from "@/lib/unc-path";
 
 export const runtime = "nodejs";
 
@@ -30,6 +31,10 @@ export const POST = async (req: Request) => {
     return NextResponse.json({ error: `ide 非法：${ide}` }, { status: 400 });
   }
   if (!p) return NextResponse.json({ error: "path 必填" }, { status: 400 });
+  // UNC / 非本机磁盘形态：IDE 去打开网络共享会主动连 SMB 并带 NTLM 凭据（R12-02）——
+  // 与 open-path / reveal-in-folder 同口径拒绝，且在 spawn 之前
+  const nonLocal = nonLocalPathReason(p);
+  if (nonLocal) return NextResponse.json({ error: nonLocal }, { status: 400 });
   const line =
     typeof body.line === "number" && Number.isFinite(body.line) && body.line > 0
       ? Math.floor(body.line)

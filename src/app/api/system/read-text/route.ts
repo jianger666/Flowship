@@ -8,6 +8,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { nonLocalPathReason } from "@/lib/unc-path";
+
 const ALLOWED_EXT = new Set(["json", "txt", "md"]);
 const MAX_BYTES = 2 * 1024 * 1024;
 
@@ -22,6 +24,9 @@ export const runtime = "nodejs";
 export const GET = async (req: Request) => {
   const raw = new URL(req.url).searchParams.get("path")?.trim() ?? "";
   if (!raw) return errorJson("path 必填");
+  // UNC 在碰文件系统之前拒绝（Windows 上 realpath 会触发 SMB / NTLM 外发，见 lib/unc-path）
+  const nonLocal = nonLocalPathReason(raw);
+  if (nonLocal) return errorJson(nonLocal);
   if (!path.isAbsolute(raw) && !/^[a-zA-Z]:[\\/]/.test(raw)) {
     return errorJson("path 必须是绝对路径");
   }

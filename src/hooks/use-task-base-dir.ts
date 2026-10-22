@@ -13,8 +13,9 @@
  *   进模块级缓存 + 逐 taskId 订阅：同一任务几十个工具块只发一个请求，
  *   值落地后也只通知用到它的那几行。
  *
- * 按需触发（enabled）：SDK 给的路径**绝大多数是绝对路径**、根本不需要 baseDir，
- * 只有真出现相对路径的块才会去拉——常态下零请求。
+ * 按需触发（enabled）：调用方只对「带文件路径的块」置 true（V4-07 起：绝对路径也要它——
+ * 折叠行里用它剥掉工作目录前缀）；没有文件路径的块（shell / grep…）不发请求。
+ * 同一任务无论多少块都只有一个请求（见上面的模块级缓存 + inflight）。
  */
 
 import { useCallback, useEffect, useSyncExternalStore } from "react";
@@ -72,7 +73,7 @@ const ensureTaskCwdLoaded = (taskId: string): void => {
 };
 
 /**
- * @param enabled 只有真需要（出现相对路径）时才置 true——false 时不发请求
+ * @param enabled 只有真需要（块带文件路径）时才置 true——false 时不发请求
  * @param actionId 有值则优先用该 action 的 cwd 快照（改仓后老 action 的相对路径基准才对）
  */
 export const useTaskBaseDir = (

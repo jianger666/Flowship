@@ -151,8 +151,12 @@
 
 /* 全局基础样式：默认中文字体、统一 border 颜色等 */
 @layer base {
+  /* 焦点环取色不透明（2026-10-20 V13-07）：原来 outline-ring/50 对页面底 / 卡片 / muted 只有
+     1.72–1.88:1，而它是事件流所有折叠行（过程组头 / 思考行 / 工具行）键盘焦点的**唯一**依据；
+     不透明 --ring 实算（oklch → sRGB、WCAG 相对亮度）：浅色 3.37–3.95:1、深色 3.18–4.04:1，
+     三种底面都 ≥ 3:1（WCAG 1.4.11 非文本对比度）。一处改、全站受益。 */
   * {
-    @apply border-border outline-ring/50;
+    @apply border-border outline-ring;
   }
   body {
     @apply bg-background text-foreground font-sans;
@@ -549,6 +553,28 @@
 }
 .prose [data-streamdown="table-cell"] a {
   word-break: break-all;
+}
+/* 事件流窄栏（task 右栏约 307px）收紧表格单元格（2026-10-20 V13-01）：
+   Streamdown 单元格默认 px-4 py-2，4 列表格光左右内衬就吃掉 128px，再叠上面的
+   overflow-wrap: anywhere，每列只剩约 2 个汉字宽。这里只对虚拟滚动的事件流收紧：
+   内衬 16px → 8px、列宽下限 4.5em（border-box 含内衬，内容区约 3 个汉字）；
+   放不下就走 Streamdown 表壳自带的 overflow-x-auto 横向滚动，而不是继续挤成竖排。
+   ⛔ 作用域必须带 [data-virtuoso-scroller]、不要改成裸 .prose：产物栏 / 文件预览（文档面）不虚拟化，
+   它们的表格是用户在 700px 容器里调优过的，上面那条 anywhere 规则不动文档面。 */
+[data-virtuoso-scroller] .prose [data-streamdown="table-header-cell"],
+[data-virtuoso-scroller] .prose [data-streamdown="table-cell"] {
+  padding: 0.25rem 0.5rem;
+  /* 内容区 ≥ 4 个汉字：border-box 下 min-width 含左右 padding（共 1rem），所以是 4em + 1rem；
+     写 4.5em 时内容区只有约 3.4 个字（第二轮 review V13-01 要求 4 个） */
+  min-width: calc(4em + 1rem);
+}
+/* 松散列表项里的多个段落（2026-10-20 V15-04）：Streamdown 给 li 写死了 [&>p]:inline
+   （为的是 list-inside 的序号 / 圆点能跟第一段文字同一行——第一个子元素若是块级 p，
+   序号会单独占一行）。副作用：一个 li 里有两个以上 <p>（「步骤标题段 + 说明段」）时，
+   后面的段落也被 inline 拼进同一行。修法：只让「前面已经有 p」的段落恢复块级——
+   第一段保持 inline（序号照旧贴着它），第二段起另起一行。选择器锚 data 属性、不怕上游改类名。 */
+.prose [data-streamdown="list-item"] > p ~ p {
+  display: block;
 }
 
 /* skill token tag 的小闪 icon（ui/skill-token.tsx 单一来源的一部分）：

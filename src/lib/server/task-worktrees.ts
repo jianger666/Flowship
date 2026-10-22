@@ -17,6 +17,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { existsSync, promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
@@ -24,6 +25,7 @@ import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { failpoint } from "./failpoints";
+import { stripHostInjectedEnv } from "./host-env";
 // ownership 快照与活跃态读无环叶子模块（静态 import 不构环——
 // 之前动态 import ./task-stream 躲环，在 Turbopack dev 下会拿到半初始化
 // namespace 报 `snapshotTaskOp is not a function`）。
@@ -40,6 +42,7 @@ import {
   type ResourceJobHandle,
 } from "./resource-jobs";
 import { getRepoSetupCommand } from "./settings-fs";
+import { parseWorktreeStatusV2 } from "./worktree-status";
 import {
   detectLockfileDrift,
   discoverDepDirs,
@@ -168,6 +171,11 @@ export interface WorktreeTaskLike {
   readonlyRepoPaths?: string[];
   /** 脚本仓快照（纯提示性标注、不参与路径映射）；undefined = 无脚本仓（老任务） */
   scriptRepoPaths?: string[];
+  /**
+   * 任务分支记录（可选）——只给「删 worktree 前 WIP 快照」用：知道任务分支才能确认
+   * worktree 的 HEAD 真的附着在它上面、再把 WIP commit 记到分支上；不传则沿用「HEAD 附着在哪个本地分支就记在哪个」。
+   */
+  gitBranches?: ReadonlyArray<{ repoPath: string; name: string }>;
 }
 
 // ----------------- 纯函数：判定 + 路径映射 -----------------
@@ -371,6 +379,9 @@ export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
 
 // ----------------- git 执行底座 -----------------
 
+/** git 子进程 stdout/stderr 的容量上限（见 runGit 内注释；导出给测试断言「不再是 4MiB」） */
+export const GIT_MAX_BUFFER = 256 * 1024 * 1024;
+
 interface GitResult {
   ok: boolean;
   stdout: string;
@@ -387,6 +398,8 @@ const runGit = async (
   args: string[],
   timeoutMs = 60_000,
   job?: ResourceJobHandle,
+  /** 额外环境变量（叠在清洗后的 process.env 上）；WIP 快照用 GIT_INDEX_FILE 指向临时 index */
+  extraEnv?: Record<string, string>,
 ): Promise<GitResult> => {
   // 长命令（checkout / worktree add / fetch）可被终态 owner revoke
   const ac = job ? new AbortController() : null;
@@ -397,7 +410,14 @@ const runGit = async (
     const { stdout, stderr } = await execFileAsync("git", args, {
       cwd: repoPath,
       timeout: timeoutMs,
-      maxBuffer: 4 * 1024 * 1024,
+      // 守卫的 `status --porcelain=v2 -z --untracked-files=all` 每条记录比 v1 长约 3 倍，且 -uall 把整棵未跟踪目录
+      // 展开：数万文件全改 / 新增（codemod、lint --fix、build 产物未进 .gitignore）轻松超 4MiB。超限不丢数据
+      // （failed、保留目录），但会让大改动任务的归档 / 删除永远卡在「保留」——放大到 256MiB（只在真有输出时才占内存）
+      maxBuffer: GIT_MAX_BUFFER,
+      // 一律剔宿主注入变量：worktree add / checkout 会触发用户仓的 post-checkout 等钩子（husky 里常有
+      // `pnpm install` / `next build`），钩子整份继承 server 环境会吃到 ELECTRON_RUN_AS_NODE / PORT /
+      // __NEXT_PRIVATE_STANDALONE_CONFIG。不剔 GitLab token——fetch 之类的 git 网络命令要靠它认证
+      env: { ...stripHostInjectedEnv(), ...(extraEnv ?? {}) },
       ...(ac ? { signal: ac.signal } : {}),
     });
     return { ok: true, stdout: stdout.trim(), stderr: stderr.trim() };
@@ -412,7 +432,8 @@ const runGit = async (
     return {
       ok: false,
       stdout: (e.stdout ?? "").trim(),
-      stderr: (e.stderr ?? e.message ?? "").trim(),
+      // `||` 而非 `??`：maxBuffer 超限 / 被信号杀时 e.stderr 是空串，`??` 不回落会让失败原因变成空（Q3-02）
+      stderr: (e.stderr || e.message || "").trim(),
     };
   } finally {
     if (job) registerJobAbort(job.taskId, job.jobId, null);
@@ -880,9 +901,9 @@ const findWorktreePathForBranch = async (
  * macOS 注意：git stderr 常给 `/private/var/...`，而 dataRoot 可能是 `/var/...`
  *（/var → /private/var 软链）——必须 realpath 后再比前缀，否则永远判不成孤儿。
  */
-const isDeletedTaskOrphanWorktree = async (
+const findDeletedTaskOrphanWorktree = async (
   occupyingPath: string,
-): Promise<boolean> => {
+): Promise<{ taskId: string; dirName: string } | null> => {
   const resolveNorm = async (p: string): Promise<string> => {
     try {
       return normPath(await fs.realpath(p));
@@ -893,15 +914,22 @@ const isDeletedTaskOrphanWorktree = async (
   const root = await resolveNorm(getWorktreesRoot());
   const p = await resolveNorm(occupyingPath);
   const prefix = `${root}/`;
-  if (!p.startsWith(prefix)) return false;
-  const taskId = p.slice(prefix.length).split("/")[0];
-  if (!taskId) return false;
-  return !(await pathExists(path.join(dataRoot(), "tasks", taskId)));
+  if (!p.startsWith(prefix)) return null;
+  const [taskId, dirName] = p.slice(prefix.length).split("/");
+  if (!taskId) return null;
+  if (await pathExists(path.join(dataRoot(), "tasks", taskId))) return null;
+  // dirName 只用来给 WIP 快照 ref 命名；占用路径就是任务容器目录本身时退回 basename
+  return { taskId, dirName: dirName || path.basename(p) };
 };
 
 /**
  * 撞「already checked out / already used by worktree」时：若占用方是已删任务孤儿，
  * 则 force remove + prune 释放分支，返回 true 让调用方重试 add；否则返回 false。
+ *
+ * ⚠️ 强删前必须先落 WIP 快照（2026-10-20 review #2）：这类孤儿正是「快照失败后被保留下来的 worktree」
+ * （removeTaskWorktrees / 开机孤儿清理在快照失败时不再强删），里面可能还躺着唯一一份未提交改动。
+ * 快照仍失败 → **不释放**、返回 false，让 ensure 带着「分支被占用」的报错抛给用户（报错里有占用路径），
+ * 宁可新任务暂时建不起来，也不在这里悄悄销毁用户的未提交改动。
  */
 const tryReleaseDeletedTaskOrphan = async (
   repoPath: string,
@@ -915,7 +943,23 @@ const tryReleaseDeletedTaskOrphan = async (
     if (branch) occupying = await findWorktreePathForBranch(repoPath, branch);
   }
   if (!occupying) return false;
-  if (!(await isDeletedTaskOrphanWorktree(occupying))) return false;
+  const orphan = await findDeletedTaskOrphanWorktree(occupying);
+  if (!orphan) return false;
+  // 目录已经没了（只剩 git 里一条过期登记）→ 没有可丢的东西、直接走下面的 remove / prune
+  if (await pathExists(occupying)) {
+    // 任务已删、不会再 reopen：taskBranch=null → 只写 ref、不往分支上记 WIP commit
+    const snap = await snapshotDirtyWorktree(occupying, {
+      taskId: orphan.taskId,
+      dirName: orphan.dirName,
+      taskBranch: null,
+    });
+    if (snap.kind === "failed") {
+      console.warn(
+        `[task-worktrees] 已删任务孤儿 worktree 的 WIP 快照失败、不强制释放（避免销毁未提交改动）：${occupying}：${snap.reason}`,
+      );
+      return false;
+    }
+  }
   console.log(
     `[task-worktrees] 发现已删任务孤儿 worktree，强制释放后重试：${occupying}`,
   );
@@ -2228,86 +2272,351 @@ const copyRootEnvFiles = async (repoPath: string, workDir: string): Promise<void
 
 // ----------------- worktree 清理 -----------------
 
-/** WIP 快照三态：干净 / 已落快照 / 脏但落不了（调用方决定是否仍删） */
-type SnapshotResult = "clean" | "snapshotted" | "failed";
+/** WIP 快照 ref 的命名空间：不在 heads / tags / remotes 下，不进分支列表、默认也不会被 push / fetch 带走 */
+const WIP_REF_PREFIX = "refs/flowship/wip";
+
+/**
+ * ref 名的一段：只留 `[A-Za-z0-9_-]`，其余（空格 / 点 / 中文 / `~^:?*[\` 等 git 不允许或易出事的字符）换成 `_`。
+ * 清洗过的名字追加原名的短哈希，避免 `my repo` 与 `my_repo` 这类不同目录撞同一个 ref（互相覆盖快照）。
+ */
+const sanitizeRefPart = (raw: string): string => {
+  const safe = raw.replace(/[^A-Za-z0-9_-]/g, "_");
+  if (safe === raw && safe.length > 0) return safe;
+  const hash = createHash("sha1").update(raw).digest("hex").slice(0, 8);
+  return `${safe || "x"}-${hash}`;
+};
+
+/** 某任务某仓的 WIP 快照 ref：`refs/flowship/wip/<taskId>-<仓短名>`（同名重复快照靠 reflog 保留历史版本） */
+export const wipSnapshotRefName = (taskId: string, dirName: string): string =>
+  `${WIP_REF_PREFIX}/${sanitizeRefPart(taskId)}-${sanitizeRefPart(dirName)}`;
+
+/** 一次成功落地的 WIP 快照（写事件告知用户「改动在哪、怎么找回」） */
+export interface WipSnapshotInfo {
+  /** 原仓库路径 */
+  repoPath: string;
+  /** `refs/flowship/wip/<task>-<repo>`（指向快照 commit，不会悬空） */
+  ref: string;
+  /** 快照 commit 的完整 sha */
+  commit: string;
+  /**
+   * 快照 commit 同时被记到了这个本地分支上（= 任务分支）——reopen 重建 worktree 检出分支即无缝续推。
+   * undefined = 只落在 ref 上（detached HEAD / 任务已删 / HEAD 不在任务分支上）。
+   */
+  branch?: string;
+}
+
+/** 一次未能落地的 WIP 快照（该仓 worktree 已**保留**、没有被删） */
+export interface WipSnapshotFailure {
+  /** 原仓库路径 */
+  repoPath: string;
+  /** 被保留下来的 worktree 目录 */
+  workDir: string;
+  reason: string;
+}
+
+/** WIP 快照三态：干净（可直接删）/ 已落快照（可删）/ 脏但落不了（**不得删**） */
+type SnapshotOutcome =
+  | { kind: "clean" }
+  | { kind: "snapshotted"; ref: string; commit: string; branch?: string }
+  | { kind: "failed"; reason: string };
+
+/**
+ * 子模块当前 HEAD 提交是否「只在本地」：返回 null = 已存在于某个远端跟踪 ref 上（删 worktree 后仍可从远端取回）；
+ * 返回字符串 = 不可恢复的描述（短 sha / 无法判断的原因）。**判断不了一律按「只在本地」处理**（宁可保留目录）。
+ */
+const submoduleHeadOnlyLocal = async (workDir: string, sub: string): Promise<string | null> => {
+  const subDir = path.join(workDir, sub);
+  const head = await runGit(subDir, ["rev-parse", "-q", "--verify", "HEAD^{commit}"]);
+  if (!head.ok || !head.stdout) return `无法读取子模块 HEAD：${head.stderr || "空输出"}`;
+  const onRemote = await runGit(subDir, [
+    "for-each-ref", "--count=1", "--format=%(refname)", `--contains=${head.stdout}`, "refs/remotes",
+  ]);
+  if (!onRemote.ok) return `无法判断提交 ${head.stdout.slice(0, 8)} 是否已推送：${onRemote.stderr}`;
+  return onRemote.stdout ? null : `提交 ${head.stdout.slice(0, 8)}`;
+};
+
+/** snapshotDirtyWorktree 的上下文（命名 ref + 决定要不要把 WIP commit 记到任务分支） */
+interface SnapshotContext {
+  taskId: string;
+  /** worktree 在任务容器目录下的短名（getUniqueRepoDirNames 产出，也是 ref 名的一部分） */
+  dirName: string;
+  /**
+   * 是否把 WIP commit 记到本地分支上：
+   * - string：只有 HEAD 恰好附着在这个分支上才记（手滑 checkout 到别的分支时不污染它）
+   * - null：只写 ref、绝不动任何分支（任务已删、不会再 reopen）
+   * - undefined：调用方不知道任务分支 → HEAD 附着在哪个本地分支就记在哪个（沿用旧行为）
+   */
+  taskBranch?: string | null;
+}
 
 /**
  * 删 worktree 前的产物保底：工作区脏（build 完没 ship 时、改动只以未提交形式存在）
- * → 自动 commit 一份 WIP 快照到任务分支再删——「分支保留 = 产物保留」才真成立、
- * reopen 重建 worktree 检出分支还能无缝续推。
+ * → 把整个工作区快照成一个 WIP commit、并让 ref 指住它，再允许删。
  *
- * 返回三态（调用方按场景决定是否仍删目录）：
- * - clean：干净（porcelain 空）→ 可直接删
- * - snapshotted：脏且已 commit 成功 → 可删（产物在分支上）
- * - failed：脏但落不了快照（merge 冲突 / status 挂 / commit 失败）
- *   - `removeTaskWorktrees`（用户主动删/终结）：仍强制删，接受未提交改动丢失
- *   - `cleanupOrphanTaskWorktrees`（开机自动）：保守保留，防误伤
+ * 为什么用 plumbing、不用 `git add -A && git commit`（2026-10-20 review #2，已用真 git 复现三条）：
+ * 1. `commit --no-verify` 只绕 pre-commit / commit-msg，**绕不过 prepare-commit-msg**，也关不掉
+ *    `commit.gpgsign`——签名程序不可用 / hook 失败时 commit 直接失败；
+ * 2. worktree 常是 detached HEAD（新任务预热、帮切找不到分支都会 detached），commit 出来没有任何 ref 指向，
+ *    删完 worktree 就是 dangling、等 gc 回收，事件却还写「已 commit 到任务分支」；
+ * 3. commit 失败后旧实现仍 `worktree remove --force`，未提交改动随目录一起没了。
+ * 现在：临时 index（拷一份真实 index，不动真实 index / 工作区）→ `add -A` → `write-tree` →
+ * `commit-tree`（不触发任何 hook / 签名）→ `update-ref refs/flowship/wip/<task>-<repo>`（有 ref 指向、不悬空）。
+ * 只有「HEAD 附着在任务分支上」时才额外把分支 fast-forward 到快照 commit（见 {@link SnapshotContext.taskBranch}），
+ * 保住既有约定：「分支保留 = 产物保留」、reopen 重建 worktree 检出分支即无缝续推。
+ *
+ * 快照范围 = `git add -A` 的范围：已跟踪文件的改动 / 删除 + 未跟踪且**未被 .gitignore 忽略**的文件。
+ * 被忽略的文件（.env.local、node_modules、构建产物…）不进快照——它们本来就是可再生 / 机器本地的，
+ * 且 worktree 建的时候靠「拷 .env* + 克隆依赖」补齐；这是有意的取舍、不是漏网。
+ *
+ * 三态（调用方据此决定能不能删目录）：
+ * - clean：干净（porcelain 空 / 快照树与 HEAD 一致 / 目录里压根没有 .git）→ 可直接删
+ * - snapshotted：脏且已落 ref → 可删（产物在 ref / 分支上）
+ * - failed：脏但落不了快照（merge 冲突 / status 挂 / git 命令失败）→ **调用方不得删**，保留目录等用户处理
  *
  * merge / rebase 冲突中：porcelain 会出现 UU/AA/DU 等未合并码。此时若盲目
- * `git add -A` 会把带 <<<<<<< 的文件当成「已解决」并成功 commit 出脏 merge、
+ * `git add -A` 会把带 <<<<<<< 的文件当成「已解决」并成功落快照、
  * 掩盖真实冲突——所以未合并时直接 failed，不特判 MERGE_HEAD 文件是否存在。
  */
-const snapshotDirtyWorktree = async (workDir: string): Promise<SnapshotResult> => {
-  const status = await runGit(workDir, ["status", "--porcelain"]);
+const snapshotDirtyWorktree = async (
+  workDir: string,
+  ctx: SnapshotContext,
+): Promise<SnapshotOutcome> => {
+  const fail = (reason: string): SnapshotOutcome => {
+    console.warn(`[task-worktrees] WIP 快照失败：${workDir}：${reason}`);
+    return { kind: "failed", reason };
+  };
+
+  // 目录里没有 .git（只剩依赖克隆残留的半截目录）：没有 git 状态可丢，维持「可清」——
+  // 与 ensure 对 `absent` 的处置一致。若连 status 都是因为别的原因挂了，下面照常判 failed。
+  if ((await probePath(path.join(workDir, ".git"))) === "missing") {
+    return { kind: "clean" };
+  }
+
+  // v2 + -z：能区分「子模块指针变了」与「子模块里有未提交改动」（见 worktree-status.ts）。
+  // --ignore-submodules=none：用户配了 diff.ignoreSubmodules=all / submodule.<n>.ignore 时 status 默认就不报子模块。
+  // --untracked-files=all：命令行旗标压过 `status.showUntrackedFiles=no`（否则「只新增文件」的 worktree 被判干净直接删，
+  // 第四轮 Q3-05）；且把未跟踪目录展开到文件级——默认 normal 模式把 `refs/inner/` 折成 `? refs/`，嵌套 git 仓在深度 ≥2
+  // 时守卫只探 `refs/.git` 而漏过（Q3-04）。展开后 untrackedDirs 里就只剩「git 自己都不往里进的目录」= 嵌套仓。
+  const status = await runGit(workDir, [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--ignore-submodules=none",
+    "--untracked-files=all",
+  ]);
   // status 本身跑不了（原仓被移走 / .git 指针坏 / git 不在 PATH）时无法证明干净 → failed
   if (!status.ok) {
-    console.warn(
-      `[task-worktrees] git status 失败、无法证明工作区干净、WIP 快照失败：${workDir}：${status.stderr}`,
-    );
-    return "failed";
+    return fail(`git status 失败、无法证明工作区干净：${status.stderr}`);
   }
-  if (status.stdout.length === 0) return "clean";
+  if (status.stdout.length === 0) return { kind: "clean" };
+  const summary = parseWorktreeStatusV2(status.stdout);
   // 未合并路径（merge/rebase 冲突）：add 会假解决、记 failed 让调用方决定
-  const hasUnmerged = status.stdout
-    .split("\n")
-    .some((line) => /^(?:DD|AU|UD|UA|DU|AA|UU)\s/.test(line));
-  if (hasUnmerged) {
-    console.warn(
-      `[task-worktrees] 工作区有未合并冲突、跳过 WIP 快照：${workDir}`,
+  if (summary.unmerged.length > 0) {
+    return fail("工作区有未合并冲突（merge / rebase 进行中），不做快照");
+  }
+  // 子模块里的未提交改动进不了父仓 tree（只存一个 gitlink 指针）：下面的 add -A / write-tree 会得出
+  // 「快照树 == HEAD 树」而判 clean → 整目录被删、改动永久丢失（第三轮 review D2b-15）。存不下就别删。
+  if (summary.dirtySubmodules.length > 0) {
+    return fail(
+      `子模块内有未提交的改动（${summary.dirtySubmodules.join("、")}）：这类改动存不进快照，` +
+        "请先在子模块里提交或处理掉",
     );
-    return "failed";
   }
-  const added = await runGit(workDir, ["add", "-A"]);
-  if (!added.ok) {
-    console.warn(`[task-worktrees] WIP 快照 git add 失败：${workDir}：${added.stderr}`);
-    return "failed";
+  // 子模块指针移动（`SC..`）：父仓 tree 里记得住新的 gitlink sha，但若该提交只存在于子模块自己的 gitdir
+  // （在 worktree 里 `submodule update --init` 后本地提交、没推送），删 worktree 会连 `.git/worktrees/<n>/modules/<sub>` 一起删，
+  // 提交在原仓 / 任何远端都不可达——快照里只剩一个指向空气的 sha（第四轮 Q3-03）。已在某个远端上的提交才放行。
+  const lostSubmoduleCommits: string[] = [];
+  for (const sub of summary.movedSubmodules) {
+    const lost = await submoduleHeadOnlyLocal(workDir, sub);
+    if (lost) lostSubmoduleCommits.push(`${sub}（${lost}）`);
   }
-  // 本地快照 commit：绕过业务仓库自己的 hooks（可能装了 lint-staged 等、失败会挡快照）；
-  // 用户没配 git 身份时给个兜底身份、保证「能 commit 的场景」一定能落。
-  const committed = await runGit(workDir, [
-    "-c", "user.name=flowship",
-    "-c", "user.email=flowship@local",
-    "commit", "--no-verify", "-m", "WIP：任务终结前自动快照（Flowship）",
-  ]);
-  if (!committed.ok) {
-    console.warn(
-      `[task-worktrees] WIP 快照 commit 失败：${workDir}：${committed.stderr}`,
+  if (lostSubmoduleCommits.length > 0) {
+    return fail(
+      `子模块 ${lostSubmoduleCommits.join("、")} 的 HEAD 已移动到没推送到任何远端的提交：` +
+        "该提交只存在于子模块自己的 gitdir、删除 worktree 后无法找回，请先在子模块里推送或处理掉",
     );
-    return "failed";
   }
-  return "snapshotted";
+  // 未跟踪的嵌套 git 仓：add -A 只会记一个 gitlink，嵌套仓里的内容（含它自己的未提交改动）随目录一起丢
+  // （无提交的嵌套仓则 add -A 直接报错）。同样存不下就别删（F1-05）。
+  const nestedRepos: string[] = [];
+  for (const dir of summary.untrackedDirs) {
+    if ((await probePath(path.join(workDir, dir, ".git"))) !== "missing") {
+      nestedRepos.push(dir.replace(/\/$/, ""));
+    }
+  }
+  if (nestedRepos.length > 0) {
+    return fail(
+      `含有未跟踪的嵌套 git 仓库（${nestedRepos.join("、")}）：快照不会保存它里面的内容，` +
+        "请先移走或处理掉",
+    );
+  }
+
+  // HEAD：空仓（unborn）时没有，快照 commit 就没有 parent
+  const head = await runGit(workDir, ["rev-parse", "-q", "--verify", "HEAD^{commit}"]);
+  const headSha = head.ok ? head.stdout : "";
+
+  // 真实 index（worktree 专属 gitdir 下）。--git-path 可能给相对 cwd 的路径、统一按 workDir 解析
+  const idxOut = await runGit(workDir, ["rev-parse", "--git-path", "index"]);
+  if (!idxOut.ok || !idxOut.stdout) {
+    return fail(`解析 index 路径失败：${idxOut.stderr || idxOut.stdout}`);
+  }
+  const realIndex = path.resolve(workDir, idxOut.stdout);
+  // 临时 index 放在真实 index 的同一目录：拆分索引（core.splitIndex）的 sharedindex.* 也按该目录解析
+  // 后缀必须带随机量：同一进程内并发快照同一个 worktree 时 `Date.now()` 会同毫秒撞名 → `index.lock` 已存在 → 误报失败（Q3-09）
+  const tmpIndex = `${realIndex}.flowship-wip-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+  const idxEnv = { GIT_INDEX_FILE: tmpIndex };
+
+  try {
+    // 铺底：拷真实 index（保留 stat 缓存、add -A 只需重算改动的文件；也保住「已 git add -f 的被忽略文件」）。
+    // 真实 index 不在（极少）就退回 read-tree HEAD / 空 index——add -A 都能补全。
+    let seeded = false;
+    try {
+      await fs.copyFile(realIndex, tmpIndex);
+      seeded = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        return fail(`拷贝 index 失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (!seeded && headSha) {
+      const rt = await runGit(workDir, ["read-tree", "HEAD"], 60_000, undefined, idxEnv);
+      if (!rt.ok) return fail(`read-tree HEAD 失败：${rt.stderr}`);
+    }
+
+    // 超时放宽到 120s：add -A 要哈希所有改动 / 未跟踪文件，大仓上 60s 偏紧；超时即 failed、保留目录，不会误删
+    const added = await runGit(workDir, ["add", "-A"], 120_000, undefined, idxEnv);
+    if (!added.ok) return fail(`git add -A 失败：${added.stderr}`);
+    const written = await runGit(workDir, ["write-tree"], 60_000, undefined, idxEnv);
+    const tree = written.stdout.toLowerCase();
+    if (!written.ok || !/^[0-9a-f]{40,64}$/.test(tree)) {
+      return fail(`write-tree 失败：${written.stderr || written.stdout}`);
+    }
+
+    // 快照树 == HEAD 的树：status 看着脏、内容层却没有任何差异（如纯换行符归一化）→ 没有可保存的东西
+    if (headSha) {
+      const headTree = await runGit(workDir, ["rev-parse", "-q", "--verify", "HEAD^{tree}"]);
+      if (headTree.ok && headTree.stdout.toLowerCase() === tree) {
+        return { kind: "clean" };
+      }
+    }
+
+    // commit-tree 本身不跑任何 hook、也不读 commit.gpgsign；`-c commit.gpgsign=false` 是显式兜底。
+    // 用户没配 git 身份时给个兜底身份、保证「能写对象的场景」一定能落。
+    const committed = await runGit(workDir, [
+      "-c", "user.name=flowship",
+      "-c", "user.email=flowship@local",
+      "-c", "commit.gpgsign=false",
+      "commit-tree", tree,
+      ...(headSha ? ["-p", headSha] : []),
+      "-m", "WIP：任务终结前自动快照（Flowship）",
+    ]);
+    const commit = committed.stdout.toLowerCase();
+    if (!committed.ok || !/^[0-9a-f]{40,64}$/.test(commit)) {
+      return fail(`commit-tree 失败：${committed.stderr || committed.stdout}`);
+    }
+
+    // 先让 ref 指住它——从这一刻起快照不会悬空。--create-reflog：refs/flowship 不在 git 默认记 reflog 的
+    // 命名空间里，不显式要求就没有历史；同一任务同一仓再次快照（reopen 后又脏了）覆盖 ref 时旧版本仍能从 reflog 找回。
+    const ref = wipSnapshotRefName(ctx.taskId, ctx.dirName);
+    const updated = await runGit(workDir, [
+      "update-ref", "--create-reflog", "-m", "Flowship WIP 快照（删 worktree 前）", ref, commit,
+    ]);
+    if (!updated.ok) return fail(`update-ref ${ref} 失败：${updated.stderr}`);
+
+    // 兼容既有约定：HEAD 附着在任务分支上时，把分支 fast-forward 到快照 commit（旧实现就是 commit 到分支）。
+    // 带旧值做 CAS——期间分支被别处动过就放弃这一步（ref 已经保住了数据）。
+    let advancedBranch: string | undefined;
+    if (headSha && ctx.taskBranch !== null) {
+      const sym = await runGit(workDir, ["symbolic-ref", "-q", "HEAD"]);
+      const prefix = "refs/heads/";
+      if (sym.ok && sym.stdout.startsWith(prefix)) {
+        const branch = sym.stdout.slice(prefix.length);
+        if (ctx.taskBranch === undefined || ctx.taskBranch === branch) {
+          const moved = await runGit(workDir, [
+            "update-ref", "-m", "Flowship WIP 快照（删 worktree 前）",
+            sym.stdout, commit, headSha,
+          ]);
+          if (moved.ok) {
+            advancedBranch = branch;
+            // 分支前进后真实 index 还停在旧 HEAD：mixed reset 把它对齐到新 HEAD（工作区不动），
+            // 免得目录万一没删成（Windows 占用等）时 git status 出现「已暂存的反向 diff」。失败无碍。
+            await runGit(workDir, ["reset", "-q"]);
+          } else {
+            console.warn(
+              `[task-worktrees] WIP 快照未能记到分支 ${branch}（分支已变动？），仅保存在 ${ref}：${moved.stderr}`,
+            );
+          }
+        }
+      }
+    }
+
+    return { kind: "snapshotted", ref, commit, branch: advancedBranch };
+  } finally {
+    await fs.rm(tmpIndex, { force: true }).catch(() => {});
+  }
 };
 
 export interface RemoveWorktreesResult {
   /** 是否真的清理了至少一个目录 */
   removedAny: boolean;
-  /** 删前自动 commit 了 WIP 快照的原仓库路径（写事件告知用户用） */
+  /** 删前把未提交改动落了 WIP 快照（refs/flowship/wip/…）的原仓库路径（写事件告知用户用） */
   snapshotRepos: string[];
   /**
-   * WIP 快照失败但仍已强制删除的原仓库路径。
-   * 未提交改动可能已丢（已 commit 的仍在任务分支上）——用户主动删/终结可接受。
+   * WIP 快照失败的原仓库路径——**这些仓的 worktree 已保留、没有被删**（未提交改动还在原目录里）。
+   * 调用方（task-runner 的事件文案）必须如实告知「已保留、需手动处理」，不能再写「已强制删除」。
    */
   snapshotFailedRepos: string[];
+  /** 每个成功快照的 ref / commit / 是否记到了任务分支（比 snapshotRepos 详细；旧调用方 / mock 可不带） */
+  snapshots?: WipSnapshotInfo[];
+  /** 每个失败仓的保留目录与原因（比 snapshotFailedRepos 详细；旧调用方 / mock 可不带） */
+  snapshotFailures?: WipSnapshotFailure[];
 }
+
+/**
+ * 把 removeTaskWorktrees 的快照结果写成事件文案片段（snapshotNote / failedNote，各自带「；」前缀、无内容为空串）。
+ * 集中在这里是为了让文案与行为同源：成功说「已保存到 refs/flowship/wip/…」、失败如实说「工作区已保留」，
+ * 不再有「已强制删除」「已自动 commit 到任务分支」这类与实际不符的描述。
+ */
+export const formatWorktreeCleanupNotes = (
+  removed: Pick<
+    RemoveWorktreesResult,
+    "snapshotRepos" | "snapshotFailedRepos" | "snapshots" | "snapshotFailures"
+  >,
+  repoTail: (repoPath: string) => string = (p) => p,
+): { snapshotNote: string; failedNote: string } => {
+  const saved =
+    removed.snapshots && removed.snapshots.length > 0
+      ? removed.snapshots.map(
+          (s) =>
+            `${repoTail(s.repoPath)} → ${s.ref}${s.branch ? `（同时记在任务分支 ${s.branch}）` : ""}`,
+        )
+      : removed.snapshotRepos.map(repoTail);
+  const snapshotNote =
+    saved.length > 0
+      ? `；未提交改动已保存到 ${saved.join("、")}（可用 git log / git checkout 该 ref 找回）`
+      : "";
+  const kept =
+    removed.snapshotFailures && removed.snapshotFailures.length > 0
+      ? removed.snapshotFailures.map(
+          (f) => `${repoTail(f.repoPath)}（${f.reason}；目录 ${f.workDir}）`,
+        )
+      : removed.snapshotFailedRepos.map(repoTail);
+  const failedNote =
+    kept.length > 0
+      ? `；⚠️ 以下仓的未提交改动无法自动保存、工作区已保留未删除，请手动处理后再清理：${kept.join("、")}`
+      : "";
+  return { snapshotNote, failedNote };
+};
 
 /**
  * 删掉本 task 的全部 worktree（task 终结 / 删除时调）。
  * feature 分支**保留**在原仓库（worktree 删了分支还在）；工作区有未提交改动时
- * 先尽力 commit WIP 快照到任务分支（见 snapshotDirtyWorktree）。
+ * 先落 WIP 快照（refs/flowship/wip/…，见 snapshotDirtyWorktree）再删。
  *
- * ⚠️ 强制删除决策（用户拍板）：快照失败也继续删——否则孤儿 worktree 目录残留会一直
- * 占用 feature 分支，删任务后重建同 story/同标题任务会撞 `already checked out`。
- * 代价：快照失败时该仓未提交改动会丢（已 commit 的在分支上、reopen 不依赖此目录）。
+ * ⚠️ 快照失败 → **保留该仓 worktree、不删**（2026-10-20 review #2 改：此前是「快照失败也强制删」，
+ * 未提交改动随目录一起丢）。失败仓记进 `snapshotFailedRepos` / `snapshotFailures`，由调用方告知用户；
+ * 其它仓照常处理。代价：该目录会继续占用 feature 分支，直到用户处理——ensure 撞「分支被占用」时
+ * 对已删任务孤儿的自愈（tryReleaseDeletedTaskOrphan）同样会先快照、失败也不会强删。
  * best-effort：单仓失败只 log、不抛（boot 孤儿扫描兜底）。
  */
 export const removeTaskWorktrees = async (
@@ -2335,19 +2644,33 @@ export const removeTaskWorktrees = async (
   let removedAny = false;
   const snapshotRepos: string[] = [];
   const snapshotFailedRepos: string[] = [];
+  const snapshots: WipSnapshotInfo[] = [];
+  const snapshotFailures: WipSnapshotFailure[] = [];
   for (let i = 0; i < t.repoPaths.length; i++) {
     const repoPath = t.repoPaths[i];
     const workDir = path.join(taskDir, names[i]);
     if (!(await pathExists(workDir))) continue;
-    // 未提交改动先尽力落 WIP 快照；无论成败都继续删，释放分支占用
-    const snap = await snapshotDirtyWorktree(workDir);
-    if (snap === "snapshotted") {
+    // 未提交改动先落 WIP 快照：成功才允许删；失败则保留这个 worktree（见函数头注释）
+    const snap = await snapshotDirtyWorktree(workDir, {
+      taskId: t.id,
+      dirName: names[i],
+      taskBranch: t.gitBranches?.find((b) => b.repoPath === repoPath)?.name,
+    });
+    if (snap.kind === "snapshotted") {
       snapshotRepos.push(repoPath);
-    } else if (snap === "failed") {
+      snapshots.push({
+        repoPath,
+        ref: snap.ref,
+        commit: snap.commit,
+        branch: snap.branch,
+      });
+    } else if (snap.kind === "failed") {
       console.warn(
-        `[task-worktrees] WIP 快照失败、仍强制删除 worktree（未提交改动可能丢失）：${workDir}`,
+        `[task-worktrees] WIP 快照失败、保留 worktree 不删（未提交改动仍在原目录）：${workDir}：${snap.reason}`,
       );
       snapshotFailedRepos.push(repoPath);
+      snapshotFailures.push({ repoPath, workDir, reason: snap.reason });
+      continue;
     }
     // 优先走 git worktree remove（同时清 .git/worktrees 注册）；原仓库没了 / 命令失败退回 rm + prune
     const removed = await runGit(
@@ -2359,11 +2682,147 @@ export const removeTaskWorktrees = async (
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
       await runGit(repoPath, ["worktree", "prune"]);
     }
+    // 删后复核（第四轮 Q3-10d）：`fs.rm(...).catch(()=>{})` 吞掉了 EACCES / EBUSY（Windows 占用 / 权限），目录实际还在却无条件
+    // 记「已清理」→ 归档 toast 说「已清理隔离工作区」。目录还在就如实记进保留列表（快照若已落，原因里一并说明）
+    if (await pathExists(workDir)) {
+      const reason =
+        "目录没能删掉（可能被占用或没有权限）" +
+        (snap.kind === "snapshotted" ? `；未提交改动已存到 ${snap.ref}、不会丢` : "");
+      console.warn(`[task-worktrees] worktree 目录删除后仍在、保留：${workDir}：${reason}`);
+      snapshotFailedRepos.push(repoPath);
+      snapshotFailures.push({ repoPath, workDir, reason });
+      continue;
+    }
     removedAny = true;
   }
   // 容器目录清空后移除（还有残留就留着、不 force 递归删以防误伤）
   await fs.rmdir(taskDir).catch(() => {});
-  return { removedAny, snapshotRepos, snapshotFailedRepos };
+  return { removedAny, snapshotRepos, snapshotFailedRepos, snapshots, snapshotFailures };
+};
+
+/** 一个因 WIP 快照失败而被保留的残留 worktree 目录 */
+export interface StaleWorktreeKept {
+  /** 容器目录下的仓短名 */
+  dirName: string;
+  workDir: string;
+  reason: string;
+  /**
+   * 快照其实**已经落了 ref**、只是目录没删掉（Windows 占用 / 权限）：未提交改动安全，别再说「找不回了」（第四轮 Q3-07）。
+   * 缺省 = 快照没存下（或没尝试）。
+   */
+  snapshotSaved?: boolean;
+}
+
+export interface StaleWorktreeCleanupResult {
+  /** 已删掉的仓短名目录 */
+  removedDirs: string[];
+  /** 删前落了 WIP 快照的目录（refs/flowship/wip/…） */
+  snapshots: Array<WipSnapshotInfo & { dirName: string }>;
+  /**
+   * 快照失败 / 目录删不掉、目录**保留**未删的。
+   * 非 force：快照失败的都在这里。force：只剩「目录删不掉」的（快照失败的越过去、记在 {@link forced}）。
+   */
+  kept: StaleWorktreeKept[];
+  /** `force` 时：仍尝试了快照、但存不下，用户确认后越过守卫强删的目录（记录在案，第四轮 Q3-06） */
+  forced: StaleWorktreeKept[];
+}
+
+/**
+ * 从 worktree 目录自己的 `.git` 指针反查原仓（残留目录没有 meta、不知道原仓）。
+ * 非 bare 仓返回仓根（`.git` 的上一级），bare 仓返回 gitdir 本身；原仓不可用 → null。
+ */
+const resolveWorktreeOwnerRepo = async (workDir: string): Promise<string | null> => {
+  const common = await runGit(workDir, ["rev-parse", "--git-common-dir"]);
+  if (!common.ok || !common.stdout) return null;
+  const gitDir = path.resolve(workDir, common.stdout);
+  return path.basename(gitDir) === ".git" ? path.dirname(gitDir) : gitDir;
+};
+
+/**
+ * 删一个 worktree 目录并清掉原仓里的登记（`.git/worktrees/<n>`，不清的话任务分支会一直报 already checked out）。
+ * 原仓不可用 → 只能直接删目录。
+ */
+const removeWorktreeDirAndRegistration = async (workDir: string): Promise<void> => {
+  const repoCwd = await resolveWorktreeOwnerRepo(workDir);
+  if (repoCwd) {
+    const removed = await runGit(repoCwd, ["worktree", "remove", "--force", workDir], 60_000);
+    if (removed.ok) return;
+  }
+  await fs.rm(workDir, { recursive: true, force: true });
+  if (repoCwd) await runGit(repoCwd, ["worktree", "prune"]);
+};
+
+/**
+ * 存储页「删除残留工作区」（任务已删、`worktrees/<taskId>/` 还在）：和 {@link removeTaskWorktrees} 同一道守卫。
+ *
+ * 旧实现是裸 `fs.rm`——而被 removeTaskWorktrees「快照失败 → 保留」下来的目录，恰好就是之后出现在这个列表里的那批：
+ * 守卫保住的未提交改动，在这里被一键清掉（第三轮 review D2b-01 / F1-04，实测复现）。
+ * 现在逐个仓目录：先 {@link snapshotDirtyWorktree}（`taskBranch:null`：任务已删，只写 ref、不动任何分支），
+ * 存得下 / 本来就干净才删；存不下 → 保留并记进 `kept`。`force` 是用户在二次确认里明确选「仍然删除」的出口
+ * （没有它，原仓被移走这类永远快照失败的残留目录就永远清不掉）。
+ */
+export const cleanupStaleTaskWorktrees = async (
+  taskId: string,
+  opts: { force?: boolean } = {},
+): Promise<StaleWorktreeCleanupResult> => {
+  const result: StaleWorktreeCleanupResult = { removedDirs: [], snapshots: [], kept: [], forced: [] };
+  const taskDir = getTaskWorktreesDir(taskId);
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(taskDir, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+  for (const e of entries) {
+    // 软链 / 普通文件不当 worktree 处理：最后随容器目录一起清（rm 不跟软链）
+    if (!e.isDirectory()) continue;
+    const workDir = path.join(taskDir, e.name);
+    // force 也先尽力快照（第四轮 Q3-06）：存得下就存（强删不该白白丢掉本可保住的改动）；存不下才越过——并记录在案
+    const snap = await snapshotDirtyWorktree(workDir, {
+      taskId,
+      dirName: e.name,
+      taskBranch: null,
+    });
+    let snapshotSaved = false;
+    if (snap.kind === "failed") {
+      if (!opts.force) {
+        console.warn(
+          `[task-worktrees] 残留工作区 WIP 快照失败、保留不删：${workDir}：${snap.reason}`,
+        );
+        result.kept.push({ dirName: e.name, workDir, reason: snap.reason });
+        continue;
+      }
+      console.warn(
+        `[task-worktrees] 残留工作区 WIP 快照失败、用户确认强删（未提交改动将丢失）：${workDir}：${snap.reason}`,
+      );
+      result.forced.push({ dirName: e.name, workDir, reason: snap.reason });
+    } else if (snap.kind === "snapshotted") {
+      snapshotSaved = true;
+      result.snapshots.push({
+        dirName: e.name,
+        repoPath: (await resolveWorktreeOwnerRepo(workDir)) ?? workDir,
+        ref: snap.ref,
+        commit: snap.commit,
+        branch: snap.branch,
+      });
+    }
+    try {
+      await removeWorktreeDirAndRegistration(workDir);
+      result.removedDirs.push(e.name);
+    } catch (err) {
+      // 目录删不掉（Windows 占用 / 权限）：如实保留、不吞成功
+      const reason = `删除目录失败：${err instanceof Error ? err.message : String(err)}`;
+      console.warn(`[task-worktrees] 残留工作区删除失败：${workDir}：${reason}`);
+      result.kept.push({ dirName: e.name, workDir, reason, ...(snapshotSaved ? { snapshotSaved: true } : {}) });
+    }
+  }
+  if (result.kept.length === 0) {
+    // 容器目录里剩下的（普通文件 / 软链）一并清
+    await fs.rm(taskDir, { recursive: true, force: true }).catch(() => {});
+  } else {
+    await fs.rmdir(taskDir).catch(() => {});
+  }
+  return result;
 };
 
 /** 用户主动解绑时拆 / 挪 worktree 失败——调用方不得写 meta */
@@ -2377,13 +2836,15 @@ export class WorktreeUnbindError extends Error {
 export type SyncTaskWorktreesResult = {
   unboundRepos: string[];
   snapshotRepos: string[];
+  /** 恒为空：快照失败不再「删了再报」，而是直接抛 WorktreeUnbindError（保留字段只为兼容旧调用方） */
   snapshotFailedRepos: string[];
 };
 
 /**
  * 用户主动改仓：按旧短名拆已解绑仓的 worktree，再把仍绑着的仓挪到新短名。
  * 只读 / 非 git 从没建过 worktree，跳过（候选目录不存在也跳过，绝不对原仓下手）。
- * WIP 快照失败仍强制拆（对齐 removeTaskWorktrees）。拆 / 挪失败抛错。
+ * WIP 快照失败**不拆**、抛 WorktreeUnbindError（与 removeTaskWorktrees 同口径：不销毁没存下来的未提交改动；
+ * 区别是这里是用户主动改仓、可以直接把失败原因抛回去让他处理）。拆 / 挪失败同样抛错。
  */
 export const syncTaskWorktreesToRepoPaths = async (
   t: WorktreeTaskLike,
@@ -2407,15 +2868,25 @@ export const syncTaskWorktreesToRepoPaths = async (
   const forceRemove = async (
     repoPath: string,
     workDir: string,
+    dirName: string,
   ): Promise<void> => {
     if (!(await pathExists(workDir))) return;
-    const snap = await snapshotDirtyWorktree(workDir);
-    if (snap === "snapshotted") snapshotRepos.push(repoPath);
-    else if (snap === "failed") {
+    const snap = await snapshotDirtyWorktree(workDir, {
+      taskId: t.id,
+      dirName,
+      taskBranch: t.gitBranches?.find((b) => b.repoPath === repoPath)?.name,
+    });
+    if (snap.kind === "snapshotted") {
+      snapshotRepos.push(repoPath);
+    } else if (snap.kind === "failed") {
+      // 快照失败 → 不删、抛错：调用方（updateTaskFields）据此不写 meta，用户看到原因后手动处理再重试。
+      // 比「删了再告知」安全：这是用户主动解绑，没有「必须立刻释放」的时限，丢未提交改动不可逆。
       console.warn(
-        `[task-worktrees] 解绑仓 WIP 快照失败、仍强制删除 worktree：${workDir}`,
+        `[task-worktrees] 解绑仓 WIP 快照失败、保留 worktree 不删：${workDir}：${snap.reason}`,
       );
-      snapshotFailedRepos.push(repoPath);
+      throw new WorktreeUnbindError(
+        `无法保存 ${workDir} 里未提交的改动（${snap.reason}），已保留该隔离工作区、未解绑。请先手动提交 / 备份其中的改动，或解决上述问题后重试。`,
+      );
     }
     const removed = await runGit(
       repoPath,
@@ -2435,7 +2906,7 @@ export const syncTaskWorktreesToRepoPaths = async (
 
   for (const item of planned.remove) {
     if (skipsWorktreeIsolation(oldLike, item.repoPath)) continue;
-    await forceRemove(item.repoPath, path.join(taskDir, item.dirName));
+    await forceRemove(item.repoPath, path.join(taskDir, item.dirName), item.dirName);
   }
 
   const moves = planned.relocate.filter(
@@ -2539,11 +3010,21 @@ const pruneUnmappedTaskWorktreeDirs = async (
     } catch {
       /* 不是 worktree 指针、下面 rm 兜底 */
     }
-    const snap = await snapshotDirtyWorktree(workDir);
-    if (snap === "failed") {
+    // 任务还活着、解绑后残留的目录：能从 .git 指针反查出原仓就用任务分支记录对一下 HEAD；
+    // 查不到（undefined）→ 沿用「HEAD 附着在哪个分支就记在哪个」
+    const snap = await snapshotDirtyWorktree(workDir, {
+      taskId: t.id,
+      dirName: e.name,
+      taskBranch: repoPath
+        ? t.gitBranches?.find((b) => b.repoPath === repoPath)?.name
+        : undefined,
+    });
+    if (snap.kind === "failed") {
+      // 快照落不了就别删：目录留着、下次 ensure 再试（改名隔离目录 .orphaned-* 也是同样的「留给用户」口径）
       console.warn(
-        `[task-worktrees] 未映射 worktree WIP 快照失败、仍强制删除：${workDir}`,
+        `[task-worktrees] 未映射 worktree WIP 快照失败、保留目录不删：${workDir}：${snap.reason}`,
       );
+      continue;
     }
     if (repoPath) {
       const removed = await runGit(
@@ -2608,9 +3089,13 @@ export const cleanupOrphanTaskWorktrees = async (
           const gitFile = await fs.readFile(path.join(workDir, ".git"), "utf8");
           const mainGitDir = parseMainGitDirFromPointer(gitFile);
           if (mainGitDir) mainGitDirs.add(mainGitDir);
-          // 未提交改动先尽力 commit 到任务分支；失败则整棵保留（开机保守）
-          const snap = await snapshotDirtyWorktree(workDir);
-          if (snap === "failed") snapshotFailed = true;
+          // 未提交改动先落 WIP 快照（任务已删、不会 reopen：只写 ref、不动分支）；失败则整棵保留（开机保守）
+          const snap = await snapshotDirtyWorktree(workDir, {
+            taskId: e.name,
+            dirName: r.name,
+            taskBranch: null,
+          });
+          if (snap.kind === "failed") snapshotFailed = true;
         } catch {
           // .git 文件读不到（非 worktree 残留）、直接随目录删
         }

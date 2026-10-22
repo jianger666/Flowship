@@ -252,11 +252,16 @@ export const writeAppSkill = async (
   }
   if (!content.trim()) return "SKILL.md 内容不能为空";
   const dir = path.join(getAppSkillsDir(), name);
+  const file = path.join(dir, "SKILL.md");
+  const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}`;
   try {
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "SKILL.md"), content, "utf-8");
+    // 先写临时文件再 rename 覆盖：写到一半失败（磁盘满 / 被打断）时旧 SKILL.md 不会被截成半截
+    await fs.writeFile(tmp, content, "utf-8");
+    await fs.rename(tmp, file);
     return null;
   } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
     return `写入失败：${err instanceof Error ? err.message : String(err)}`;
   }
 };
@@ -322,6 +327,92 @@ export const deleteAppSkill = async (name: string): Promise<string | null> =>
   deleteSkillBySource(name, "app");
 
 /**
+ * 把 `srcDir` 整个拷成 `dest`，已有的 `dest` 在**新版完整拷好之后**才换掉（review D2b-04）。
+ *
+ * 旧写法是先 `rm(dest)` 再 `cp(src, dest)`：源里任何一个读不了的文件（权限 / 坏链）让 cp 中途抛错，
+ * 用户原来装好的同名 skill 已经被删光、只剩半截目录。现在：
+ *  1. 先拷到数据根下的临时目录（失败 → 清临时目录、`dest` 一个字节不动）；
+ *  2. 旧 `dest` 改名成备份 → 临时目录改名成 `dest`；第二步失败就把备份改回去；
+ *  3. 成功后删备份。
+ * 临时目录放在 skills 目录的同级（同一文件系统、rename 才是原子的；也不会被 skills 扫描当成 skill）。
+ */
+const SKILL_IMPORT_TMP_PREFIX = ".skill-import-";
+/** 导入临时目录 / 备份目录的残留保留多久（超过才清：别误删另一个正在跑的导入的临时目录） */
+export const SKILL_IMPORT_LEFTOVER_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * 清掉数据根下遗留的 `.skill-import-*`（含 `.old` 备份）临时目录（Q9-03）。
+ * 来源：导入过程中进程被杀 / Windows 上成功路径末尾 `rm(backup)` 被占用失败后被吞——此前没有任何清扫，永久残留。
+ * 只清 mtime 超过 `maxAgeMs` 的；任何一步失败都忽略（清扫是尽力而为，不能挡住导入）。返回清掉的条目名。
+ */
+export const sweepStaleSkillImportLeftovers = async (
+  root: string,
+  now: number = Date.now(),
+  maxAgeMs: number = SKILL_IMPORT_LEFTOVER_MAX_AGE_MS,
+): Promise<string[]> => {
+  const removed: string[] = [];
+  let entries: string[];
+  try {
+    entries = await fs.readdir(root);
+  } catch {
+    return removed;
+  }
+  for (const name of entries) {
+    if (!name.startsWith(SKILL_IMPORT_TMP_PREFIX)) continue;
+    const abs = path.join(root, name);
+    try {
+      const st = await fs.stat(abs);
+      if (now - st.mtimeMs < maxAgeMs) continue;
+      await fs.rm(abs, { recursive: true, force: true });
+      removed.push(name);
+    } catch {
+      // 尽力而为
+    }
+  }
+  return removed;
+};
+
+const replaceDirWithCopy = async (srcDir: string, dest: string): Promise<void> => {
+  const parent = path.dirname(dest);
+  const stamp = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const tmp = path.join(path.dirname(parent), `${SKILL_IMPORT_TMP_PREFIX}${stamp}`);
+  const backup = `${tmp}.old`;
+  let backedUp = false;
+  // 下次导入时顺手清上次崩溃 / 占用遗留的临时目录（Q9-03）
+  await sweepStaleSkillImportLeftovers(path.dirname(parent));
+  try {
+    await fs.mkdir(parent, { recursive: true });
+    try {
+      await fs.cp(srcDir, tmp, { recursive: true });
+    } catch (err) {
+      // 报错里带的是临时目录路径，用户看不懂：换回目标 skill 路径（Q9-03e）
+      if (err instanceof Error && err.message.includes(tmp)) {
+        err.message = err.message.split(tmp).join(dest);
+      }
+      throw err;
+    }
+    try {
+      await fs.rename(dest, backup);
+      backedUp = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; // 本来就没有旧版
+    }
+    try {
+      await fs.rename(tmp, dest);
+    } catch (err) {
+      if (backedUp) {
+        await fs.rename(backup, dest).catch(() => {});
+        backedUp = false;
+      }
+      throw err;
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
+    if (backedUp) await fs.rm(backup, { recursive: true, force: true }).catch(() => {});
+  }
+};
+
+/**
  * 从全局 `~/.cursor/skills/` 导入（整目录拷贝、含 scripts 等附属文件——
  * SKILL.md 常引用同目录脚本、只拷 md 会导入残废 skill）。
  * @param names 要导入的 skill 目录名列表
@@ -359,9 +450,7 @@ export const importSkillsFromCursor = async (
       continue;
     }
     try {
-      const dest = path.join(getAppSkillsDir(), name);
-      await fs.rm(dest, { recursive: true, force: true });
-      await fs.cp(srcDir, dest, { recursive: true });
+      await replaceDirWithCopy(srcDir, path.join(getAppSkillsDir(), name));
       imported.push(name);
     } catch (err) {
       failed.push({

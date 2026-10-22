@@ -24,6 +24,7 @@ import { glob } from "glob";
 import { stripHostInjectedEnv } from "./host-env";
 import { stripGitTokenEnv } from "./git-token-env";
 import { dataRoot } from "./data-root";
+import { detectGitBashPath } from "./agent-shell";
 import { isAskWaitCommand } from "./ask-wait";
 import {
   Number as TBNumber,
@@ -85,6 +86,26 @@ export const resolveShellTimeoutMsForCommand = (
  * 长驻命令超时不再留孙进程孤儿。模块级单例即可（无会话状态）。
  */
 const localBash = createLocalBashOperations();
+
+/**
+ * Windows：pi 默认只认 `%ProgramFiles%\Git\bin\bash.exe` / PATH 上的 bash.exe，Git 装在 D 盘或
+ * 用户目录时整个 shell 工具不可用；而 Flowship 自己的 detectGitBashPath（注册表 → where → 常规路径）
+ * 能探到。非 win32 / 探不到时回落默认实现（行为与以前一致）。
+ * shellPath 是 createLocalBashOperations 的构造期参数，所以按已探到的路径缓存一份实例。
+ */
+const gitBashOpsByPath = new Map<string, ReturnType<typeof createLocalBashOperations>>();
+const resolveLocalBash = async (): Promise<
+  ReturnType<typeof createLocalBashOperations>
+> => {
+  const gitBash = await detectGitBashPath().catch(() => null);
+  if (!gitBash) return localBash;
+  let ops = gitBashOpsByPath.get(gitBash);
+  if (!ops) {
+    ops = createLocalBashOperations({ shellPath: gitBash });
+    gitBashOpsByPath.set(gitBash, ops);
+  }
+  return ops;
+};
 /** 输出收集上限（对齐原 maxBuffer 10MB） */
 const MAX_SHELL_OUTPUT_BYTES = 10 * 1024 * 1024;
 
@@ -279,7 +300,7 @@ const shellTool = (
       const baseEnv = stripHostInjectedEnv();
       const shellEnv = opts.omitGitToken ? stripGitTokenEnv(baseEnv) : baseEnv;
       try {
-        const { exitCode } = await localBash.exec(command, workCwd, {
+        const { exitCode } = await (await resolveLocalBash()).exec(command, workCwd, {
           onData: (data) => {
             if (total >= MAX_SHELL_OUTPUT_BYTES) return;
             chunks.push(data);

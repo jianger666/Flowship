@@ -563,7 +563,8 @@ const handleAskAction = async (
 
   let bootArgs: { apiKey?: string; model?: ModelSelection } | undefined;
   try {
-    const boot = await loadBridgeBootContext();
+    // 带上窗口：模型 / 提供方跟任务走，不用设置页默认（review F2-01）
+    const boot = await loadBridgeBootContext(task);
     if (boot) bootArgs = { apiKey: boot.apiKey, model: boot.model };
   } catch (err) {
     warnLark("loadBridgeBootContext", err);
@@ -689,7 +690,9 @@ const handleRetryAction = async (
 
   let bootArgs: { apiKey?: string; model?: ModelSelection } | undefined;
   try {
-    const boot = await loadBridgeBootContext();
+    // 重试要跟窗口的模型 / 提供方走（review F2-01）：取不到任务就退回设置页默认（旧行为）
+    const retryTask = await getTask(value.taskId).catch(() => null);
+    const boot = await loadBridgeBootContext(retryTask ?? undefined);
     if (boot) bootArgs = { apiKey: boot.apiKey, model: boot.model };
   } catch (err) {
     warnLark("loadBridgeBootContext", err);
@@ -853,7 +856,9 @@ const handleGroupAskAction = async (
   // **一个 await 都不许有**——比对 + 摘除落在同一个同步段里，等价于私聊卡的 takePendingAskIf。
   let bootArgs: { apiKey?: string; model?: ModelSelection } | undefined;
   try {
-    const boot = await loadBridgeBootContext();
+    // 与窗口同模型 / 提供方（review F2-01）；这一步仍在 pending 比对之前，不破坏下面的零 await 窗口
+    const askTask = await getTask(value.taskId).catch(() => null);
+    const boot = await loadBridgeBootContext(askTask ?? undefined);
     if (boot) bootArgs = { apiKey: boot.apiKey, model: boot.model };
   } catch (err) {
     warnLark("loadBridgeBootContext(group ask)", err);
@@ -1041,8 +1046,8 @@ export const handleCardActionEvent = async (raw: unknown): Promise<void> => {
     if (value.kind === "group_advance") {
       if (!(await isGroupCardClickFromItsChat(norm, value.chatId))) return;
       const { handleGroupAdvancePick } = await import("./group-route");
-      await handleGroupAdvancePick(value, norm.operatorOpenId, async () => {
-        const boot = await loadBridgeBootContext();
+      await handleGroupAdvancePick(value, norm.operatorOpenId, async (task) => {
+        const boot = await loadBridgeBootContext(task);
         return boot ? { apiKey: boot.apiKey, model: boot.model } : null;
       });
       return;

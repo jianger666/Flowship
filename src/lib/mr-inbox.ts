@@ -13,11 +13,138 @@ export const MR_INBOX_SEEN_MAX_AGE_DAYS = 90;
 export const MR_INBOX_SEEN_MAX_AGE_MS =
   MR_INBOX_SEEN_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 
-/** 扫描结果内存缓存 TTL（2026-07-15 用户拍板 10 分钟 → 5 分钟：默认空间收敛后单轮扫描只 ~2s、扫得起） */
-export const MR_INBOX_CACHE_TTL_MS = 5 * 60 * 1000;
-
-/** 前端前台轮询间隔（与缓存 TTL 对齐） */
+/** 前端前台轮询间隔 */
 export const MR_INBOX_POLL_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * Electron 壳内窗口不可见（Cmd+W 收进托盘 / 最小化 / 被全遮住）时放宽到的轮询间隔（N1-03）。
+ * 必须是 {@link MR_INBOX_POLL_INTERVAL_MS} 的整数倍（实现是「隔拍扫」）且大于缓存 TTL（每次都是真扫）。
+ */
+export const MR_INBOX_HIDDEN_POLL_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * 缓存 TTL 必须**小于**轮询间隔（N1-04）：客户端按「请求发起时刻」计时，服务端按「扫描完成时刻」
+ * 计 TTL，扫描耗时 S>0 时二者相等会让每次轮询都差 S 秒命中缓存、实际每 2 个周期才真扫一次。
+ * 余量 60 秒 ≥ 服务端扫描总时限（MR_INBOX_SCAN_DEADLINE_MS）：任何不超时的扫描都盖得住；
+ * 多窗口 / 面板重复请求仍能命中缓存。
+ */
+export const MR_INBOX_CACHE_TTL_MS = MR_INBOX_POLL_INTERVAL_MS - 60 * 1000;
+
+/**
+ * 服务端单轮扫描总时限（N1-15）：超时返回已扫到的部分 + partial，不缓存。
+ * 时限只在两步之间检查，最坏还会多等一次 meegle CLI（30s 超时）——50 + 30 < 客户端 90s。
+ */
+export const MR_INBOX_SCAN_DEADLINE_MS = 50 * 1000;
+
+/** 客户端扫描 fetch 超时（N1-15）：必须大于服务端总时限，给服务端先返回 partial 的机会 */
+export const MR_INBOX_SCAN_CLIENT_TIMEOUT_MS = 90 * 1000;
+
+/** 部分失败（partial）时给面板的失败文案：最多列 3 条原因 */
+export const buildMrInboxPartialMessage = (
+  failures: readonly string[],
+): string => {
+  if (failures.length === 0) return "";
+  const shown = failures.slice(0, 3).join("；");
+  const more = failures.length > 3 ? `等 ${failures.length} 处` : "";
+  return `本轮扫描未完整（${shown}${more}）`;
+};
+
+/**
+ * 部分失败的类别（N1-01 粒度修复）：客户端按「连续几轮出现同一类」决定要不要切到「合并展示」。
+ * - schedule：空间排期拉取失败；nodes：工作项节点拉取失败；comments：工作项评论拉取失败；
+ * - bugs：bug 查询失败；deadline：超过服务端扫描总时限。
+ */
+export type MrInboxFailureKind =
+  | "schedule"
+  | "nodes"
+  | "comments"
+  | "bugs"
+  | "deadline";
+
+/**
+ * 本轮扫描「没扫到」的范围（服务端随 partial 一起返回）：
+ * 合并展示时只有落在这些范围里的旧条目才沿用旧表，范围外「本轮扫到却没出现」的旧条目是真的没了。
+ */
+export interface MrInboxIncompleteScope {
+  /** 本轮出现过的失败类别（去重） */
+  kinds: MrInboxFailureKind[];
+  /** 超总时限：不知道哪些没扫到 → 旧表里所有没被新数据覆盖的条目都沿用 */
+  all?: boolean;
+  /** 待测 MR：这些工作项的节点 / 评论没拉到 */
+  workItemIds?: string[];
+  /** 待测 MR：这些空间的排期没拉到（整空间的 MR 未知） */
+  scheduleProjectKeys?: string[];
+  /** 我的 BUG：这些空间的 bug 查询失败 */
+  myBugsProjectKeys?: string[];
+  /** 待回归：这些空间的 bug 查询失败 */
+  pendingRegressionProjectKeys?: string[];
+}
+
+/** 失败类别的中文名（提示文案用） */
+export const MR_INBOX_FAILURE_KIND_LABEL: Record<MrInboxFailureKind, string> = {
+  schedule: "空间排期拉取",
+  nodes: "工作项节点拉取",
+  comments: "工作项评论拉取",
+  bugs: "bug 查询",
+  deadline: "扫描总时限",
+};
+
+/** MR 状态 chip 的展示描述（N1-02） */
+export interface MrMergeStatusChip {
+  label: string;
+  tone: "muted" | "ok" | "danger" | "warn";
+  /** tooltip：未知状态才带原文，已知状态给一句「怎么办」 */
+  hint?: string;
+}
+
+/**
+ * GitLab detailed_merge_status → 中文短标签 + tone。
+ * 真实枚举见 GitLab API：blocked_status / checking / ci_must_pass / ci_still_running /
+ * discussions_not_resolved / draft_status / external_status_checks / jira_association /
+ * mergeable / need_rebase / not_approved / not_open / requested_changes / unchecked，
+ * 以及旧字段 merge_status 回落值 can_be_merged / cannot_be_merged(_recheck)。
+ * 未知值回落「检查中」+ 原文 tooltip（与旧行为一致，不吞信息）。
+ */
+export const describeMrMergeStatus = (
+  mr: Pick<MrInboxMrDetail, "detailedMergeStatus" | "hasConflicts" | "mergeable">,
+): MrMergeStatusChip => {
+  if (mr.hasConflicts) return { label: "有冲突", tone: "danger" };
+  if (mr.mergeable) return { label: "可合并", tone: "ok" };
+  switch (mr.detailedMergeStatus) {
+    case "draft_status":
+      return { label: "草稿", tone: "muted", hint: "MR 仍是草稿，转为正式后才能合并" };
+    case "ci_must_pass":
+      return { label: "CI 未通过", tone: "danger", hint: "流水线未通过或未跑完，合并前必须通过" };
+    case "ci_still_running":
+      return { label: "CI 进行中", tone: "warn", hint: "流水线还在运行" };
+    case "not_approved":
+      return { label: "待审批", tone: "warn", hint: "还缺必需的审批" };
+    case "requested_changes":
+      return { label: "被要求修改", tone: "warn", hint: "有评审人要求修改" };
+    case "discussions_not_resolved":
+      return { label: "讨论未解决", tone: "warn", hint: "还有未解决的评审讨论" };
+    case "need_rebase":
+      return { label: "需 rebase", tone: "warn", hint: "源分支落后目标分支，需要先 rebase" };
+    case "blocked_status":
+      return { label: "被阻塞", tone: "danger", hint: "被其它 MR / 依赖阻塞" };
+    case "external_status_checks":
+      return { label: "外部检查未过", tone: "warn", hint: "外部状态检查未通过" };
+    case "jira_association":
+      return { label: "缺关联 Jira", tone: "warn", hint: "项目要求关联 Jira 工单" };
+    case "not_open":
+      return { label: "未打开", tone: "muted", hint: "MR 不处于打开状态" };
+    case "cannot_be_merged":
+    case "cannot_be_merged_recheck":
+      return { label: "不可合并", tone: "danger", hint: "GitLab 判定当前不可合并" };
+    default:
+      // checking / unchecked / 未知：GitLab 异步计算中或新枚举，保留原文给用户
+      return {
+        label: "检查中",
+        tone: "muted",
+        hint: mr.detailedMergeStatus || undefined,
+      };
+  }
+};
 
 /** 工作项节点（过滤用最小字段） */
 export interface MrInboxNode {

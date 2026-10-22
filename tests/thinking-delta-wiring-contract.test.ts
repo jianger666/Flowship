@@ -180,7 +180,9 @@ describe("服务端发送口径：只给属主主链、思考段结束必须丢�
 describe("chat-view 清理时机：落盘事件 / 正文 / 结束都要清「思考中」", () => {
   it("onEvent：在 ephemeral 早退之后清（落盘事件 = 这段思考有了正式内容或新一轮开始）", () => {
     const onEvent = sliceBalanced(chatView, "onEvent: (ev, meta) => {", "{");
-    const ephemeralAt = onEvent.indexOf("if (isEphemeralToolOutputDelta(ev)) return;");
+    // V4-04 起 ephemeral 帧的吸收收进 useLiveToolOutputs（chat / task 页共用）：
+    // absorbLiveToolOutputEvent 对 ephemeral 帧返回 true = 早退，语义同旧的 isEphemeralToolOutputDelta 早退
+    const ephemeralAt = onEvent.indexOf("if (absorbLiveToolOutputEvent(ev)) return;");
     const clearAt = onEvent.indexOf("clearThinkingLive();");
     expect(ephemeralAt).toBeGreaterThanOrEqual(0);
     expect(clearAt).toBeGreaterThan(ephemeralAt);
@@ -224,9 +226,10 @@ describe("chat-view 清理时机：落盘事件 / 正文 / 结束都要清「思
     // 切任务的 effect：依赖数组（task.id + clearThinkingLive）所属的那个 useEffect，体里必须真调用。
     // 只在依赖数组里列着、体里没调用 = 没清——否则 A 任务正在思考时切到正在跑的 B，
     // B 的流尾会挂着 A 的思考文本。（变异验证里这条最初只检查依赖数组，被漏过一次）
-    const depsAt = chatView.indexOf(
-      "[task.id, applyLedgerToUi, clearStreaming, clearThinkingLive]",
-    );
+    // 依赖数组随别的清理项 / 回调（clearLiveToolOutputs、onLedgerLive…）增减，不钉整串，只认「含 task.id + applyLedgerToUi + clearThinkingLive」那个
+    const depsMatch = /\[\s*task\.id,\s*applyLedgerToUi,[^\]]*\bclearThinkingLive\b[^\]]*\]/.exec(chatView);
+    expect(depsMatch).not.toBeNull();
+    const depsAt = depsMatch!.index;
     expect(depsAt).toBeGreaterThanOrEqual(0);
     const effectStart = chatView.lastIndexOf("useEffect(", depsAt);
     expect(effectStart).toBeGreaterThanOrEqual(0);
@@ -333,8 +336,10 @@ describe("展示：思考是流程里一条真正的 thinking 行，由已有的
     expect(rows).toContain(
       "const [initialCollapsed] = useState(defaultCollapsed);",
     );
-    expect(rows).toContain(
-      "const [manualCollapsed, setManualCollapsed] = useState<boolean | null>(null);",
+    // V2-05：手动选择改走 useRowViewState（模块级存档），行被虚拟列表卸载再滚回来不回到默认折叠；
+    // 语义仍是「null = 没手动动过 → 跟自动态」，所以下面的 collapsed / toggle / 搜索命中断言不变
+    expect(rows).toMatch(
+      /const \[manualCollapsed, setManualCollapsed\] = useRowViewState<boolean \| null>\(\s*eventRowViewKey\(taskId, ev\.id, ROW_VIEW_FIELD\.eventManualCollapsed\),\s*null,\s*\);/,
     );
     expect(rows).toContain(
       "const autoCollapsed = autoEventCollapsed(isLiveRow, initialCollapsed);",

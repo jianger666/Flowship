@@ -28,6 +28,7 @@ import {
 } from "@/lib/server/skills-loader";
 import { readTeamSkillStates } from "@/lib/server/team-skill-states";
 import { errorResponse } from "@/lib/server/route-helpers";
+import { nonLocalPathReason } from "@/lib/unc-path";
 
 export const runtime = "nodejs";
 
@@ -37,12 +38,21 @@ export const GET = async (req: Request) => {
   await fs.mkdir(appSkillsDir, { recursive: true }).catch(() => {});
   // 项目级源数据：客户端传已登记仓根路径列表（settings.repos）；非法 JSON 忽略
   let repoPaths: string[] | undefined;
+  // UNC / 非本机磁盘形态的仓路径：不 stat 它（R12-01）。渲染层一行 `![](/api/skills?repos=["//host/share"])`
+  // 就能触发这个 GET，Windows 上 `fs.stat(<UNC>/.agents/skills)` 会连 SMB 并带 NTLM 凭据。
+  // 丢掉这些条目而不是整个 400：设置页会把已登记的仓全传过来，一条坏路径不该让整个技能列表打不开
+  const rejectedRepos: string[] = [];
   const rawRepos = new URL(req.url).searchParams.get("repos") ?? "";
   if (rawRepos) {
     try {
       const parsed: unknown = JSON.parse(rawRepos);
       if (Array.isArray(parsed)) {
-        repoPaths = parsed.filter((p): p is string => typeof p === "string");
+        repoPaths = [];
+        for (const p of parsed) {
+          if (typeof p !== "string") continue;
+          if (nonLocalPathReason(p)) rejectedRepos.push(p);
+          else repoPaths.push(p);
+        }
       }
     } catch {
       // 忽略、退化为不列项目级
@@ -87,6 +97,8 @@ export const GET = async (req: Request) => {
     })),
     cursorGlobal,
     appSkillsDir,
+    // 被拒绝的仓路径（UNC 等）：只在有时才带，调用方可据此提示「这些仓没有读取」
+    ...(rejectedRepos.length > 0 ? { rejectedRepos } : {}),
   });
 };
 

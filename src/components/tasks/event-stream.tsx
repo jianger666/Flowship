@@ -51,17 +51,18 @@ import {
   rhythmTier,
   type RhythmFacts,
 } from "@/lib/event-stream-rhythm";
-import { findPendingAskEvent } from "@/lib/ask-pending";
+import { pruneAskDrafts } from "@/lib/ask-draft";
+import { askIdOfEvent, findPendingAskEvent } from "@/lib/ask-pending";
 import { collectGroupQaRounds, pickRoundsNeedingOwner } from "@/lib/group-qa";
+import { deriveGroupQaScope } from "@/lib/group-qa-scope";
 import {
+  deriveSearchScopeNotice,
   findRenderIndexForEventId,
   normalizeEventStreamSearchQuery,
   searchEventStreamRenderOccurrences,
+  stabilizeOccurrenceSelection,
 } from "@/lib/event-stream-search";
-import {
-  stabilizeOccurrenceIndex,
-  stepOccurrenceIndex,
-} from "@/lib/text-search-highlight";
+import { stepOccurrenceIndex } from "@/lib/text-search-highlight";
 import {
   applyDomSearchHighlights,
   clearDomSearchHighlights,
@@ -94,12 +95,18 @@ import {
   skipWait,
   type ImagePayload,
 } from "@/lib/task-store";
-import {
-  restoreOptimisticDraft,
-  runOptimisticSubmit,
-} from "@/lib/optimistic-submit";
+import { runOptimisticSubmit } from "@/lib/optimistic-submit";
+import { shouldAutoFocusComposer } from "@/lib/composer-refocus";
+import { createSubmitLatch, startLatchedSubmit } from "@/lib/composer-actions";
+import { restoreDraftMerged } from "@/lib/talk-draft-merge";
+import { MAX_PATHS } from "@/hooks/use-path-attach";
 import type { Task, TaskEvent } from "@/lib/types";
-import { insertBeforeTrailingCompaction, isCompactionInfo } from "@/lib/compaction-display";
+import { isCompactionInfo } from "@/lib/compaction-display";
+import {
+  applyPendingScan,
+  composeStreamTail,
+  type PendingScanBaseline,
+} from "@/lib/stream-pending";
 
 import {
   attachLiveThinking,
@@ -108,6 +115,7 @@ import {
   isBootOnlyWorkGroup,
   latestEventTs,
   shouldShowProcessingPlaceholder,
+  sliceCurrentRunEvents,
   type WorkGroupItem,
 } from "@/lib/chat-turns";
 import {
@@ -124,7 +132,9 @@ import {
   hasInflightPending,
   loadingSinceTs,
   resolveLoadingStart,
+  deriveComposeEnabled,
   shouldShowComposerRunning,
+  shouldShowComposerStopOnly,
   shouldShowSendLoading,
   type PendingBubbleMode,
 } from "@/lib/chat-pending-display";
@@ -132,9 +142,14 @@ import type { LiveThinking } from "@/lib/thinking-live";
 import {
   extractActiveBootStage,
   isScheduleUserReply,
+  prependRestoredToDraft,
   resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
+import {
+  StreamActionsProvider,
+  useStreamActions,
+} from "./event-stream/stream-actions";
 import {
   extractUserReplyAttachments,
   extractUserReplyImages,
@@ -166,6 +181,8 @@ import {
 import { WorkGroupRow } from "./event-stream/work-group";
 import { AskUserInlineCard } from "./ask-user-inline";
 import { EventStreamSearchBar } from "./event-stream-search-bar";
+import { EventStreamSearchScopeNotice } from "./event-stream-search-scope-notice";
+import { StreamAnnouncer } from "./stream-announcer";
 import { pathBasename } from "@/lib/path-utils";
 
   // streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
@@ -423,6 +440,14 @@ interface Props {
   // **必填**：曾漏传（task 详情页）→ 恒 false → 跑 action 时长 shell / subagent 全被
   // 渲染成灰色「已中断」。别改回可选。
   isRunning: boolean;
+  /**
+   * **属主主 run** 在跑（不含旁路群答疑 run）。错误卡的「当轮失败」资格、底部状态行及其占位槽、
+   * 组尾「处理中…」只看属主的 run——否则主任务失败后群里来一个提问，错误卡整张翻篇
+   * （恢复入口消失、样式变灰），旁路结束又弹回来（D6-02），空闲任务也会为旁路撑开一个空状态槽（R3-05）。
+   * 第四轮 Q5-01 起 task 页的 `isRunning` 也不再并入旁路在飞（旁路过程事件整条藏在「群问答」tab，
+   * 主流里没有旁路工具块可画），所以两者在 task 页同值；缺省 = isRunning（chat 没有旁路）。
+   */
+  mainRunActive?: boolean;
   onStop?: () => void;
   stopping?: boolean;
   // V0.7.11：渲染形态
@@ -457,6 +482,12 @@ interface Props {
    * failed = 父组件已弹错误提示，两种都保持编辑态。不传 = 退回旧语义（只有最后一条、编辑后追加）。
    */
   onEditRewind?: (ev: TaskEvent) => Promise<"ok" | "cancelled" | "failed">;
+  /**
+   * 正在回退的那条用户消息 id（回退 / 编辑回退进行中，null / 不传 = 没有回退在飞；第二轮 review V7-05）。
+   * 被回退的那一行「回退到这里」转圈、其余行的该按钮禁用——回退要几秒，期间再点只会换来服务端
+   * 「已有回退在进行中」。只在回退开始 / 结束时变，不会拖累流式渲染。
+   */
+  rewindingEventId?: string | null;
   /** P5：本地排队占位气泡（displayText 与服务端 user_reply 文案对齐） */
   pendingLocalReplies?: Array<{
     id: string;
@@ -471,6 +502,12 @@ interface Props {
     mode?: PendingBubbleMode;
     /** 对应服务端 queue itemId（直改 / 直删用） */
     itemId?: string;
+    /**
+     * 是否本窗口本次挂载内用户自己提交的（「提交即到底」只认它）。`false` = bootstrap 从服务端快照
+     * 重建的 / 别的窗口登记的，它们出现时不能把正在翻历史的人拽到底部。**必须显式 `true` 才算本地发起**
+     * （缺省不算，fail-closed）：新增占位来源忘了标，最多是不滚动，不会拽人。
+     */
+    local?: boolean;
   }>;
   /** C：待发送气泡直改 / 直删（父组件接 task-store + ledger） */
   onEditPending?: (itemId: string, newText: string) => Promise<boolean | void>;
@@ -608,9 +645,11 @@ const StreamFloatingBar = ({
           onClick={onJumpToAsk}
           // 入场淡入（animate-in 只动 opacity / transform；居中用的是 translate 属性、互不打架）：
           // 滚离底部那一刻按钮不再「啪」地冒出来
-          className="absolute bottom-14 left-1/2 z-10 flex -translate-x-1/2 animate-in items-center gap-1.5 rounded-full border border-brand/50 bg-brand/15 px-3 py-1.5 text-xs font-medium text-brand shadow-md backdrop-blur transition-colors duration-150 fade-in-0 hover:bg-brand/25 motion-reduce:animate-none"
+          // 浮在正文之上的面必须实心（事件流 v2）：bg-background + 品牌描边 / 品牌字；
+          // 原来 bg-brand/15 + 毛玻璃模糊是半透明、会透出下面的正文
+          className="absolute bottom-14 left-1/2 z-10 flex -translate-x-1/2 animate-in items-center gap-1.5 rounded-full border border-brand/50 bg-background px-3 py-1.5 text-xs font-medium text-brand shadow-md transition-colors duration-150 fade-in-0 hover:bg-accent motion-reduce:animate-none"
         >
-          <SparklesIcon className="size-3.5 animate-pulse" />
+          <SparklesIcon className="size-3.5" />
           AI 在等你回答、点击查看
         </button>
       )}
@@ -623,7 +662,9 @@ const StreamFloatingBar = ({
           // 无新内容时只有一个箭头图标、没有可读文本，读屏得靠它
           aria-label="回到最新"
           className={cn(
-            "absolute bottom-3 right-3 z-10 rounded-full bg-background/90 text-xs shadow-md backdrop-blur",
+            // 实心底（浮层不许半透明 + 毛玻璃模糊）；Button outline 暗色自带 dark:bg-input/30（半透明），
+            // 这里 dark: 一并盖成实色，否则暗色下去掉 blur 后正文会透出来
+            "absolute bottom-3 right-3 z-10 rounded-full bg-background text-xs shadow-md dark:bg-background dark:hover:bg-muted",
             // 入场：淡入 + 自下方 4px 浮上来（离底那一刻不再「啪」地冒出）
             "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",
             newCount > 0 && "px-3.5",
@@ -710,6 +751,7 @@ const EventStreamImpl = ({
   composerLeading,
   composerTop,
   isRunning,
+  mainRunActive = isRunning,
   onStop,
   stopping,
   variant = "log",
@@ -720,6 +762,7 @@ const EventStreamImpl = ({
   liveThinking,
   onRewind,
   onEditRewind,
+  rewindingEventId,
   pendingLocalReplies,
   queueBanner,
   backgroundSubagents,
@@ -736,6 +779,15 @@ const EventStreamImpl = ({
     () => findPendingAskEvent(task.events),
     [task.events],
   );
+  // 答题卡草稿回收：本任务名下「不是当前待答」的草稿（已答 / 已作废 / 换了新 ask）已无用，
+  // 在流这一层（不随虚拟列表卸载）判定并清理——卡自己卸载时无法区分「滚走了」与「已作废」，
+  // 所以回收不能放在卡里。用 askId 原始值做依赖（pendingAskEvent 引用会随 events 变）。
+  const pendingAskIdForDrafts = pendingAskEvent
+    ? askIdOfEvent(pendingAskEvent)
+    : null;
+  useEffect(() => {
+    pruneAskDrafts(task.id, pendingAskIdForDrafts);
+  }, [task.id, pendingAskIdForDrafts]);
 
   // 输入框可用 = 父组件传 canReply（没传回退 awaiting_user）；提前算、下面 useRichInput 要用
   const canCompose = canReply ?? task.runStatus === "awaiting_user";
@@ -743,10 +795,16 @@ const EventStreamImpl = ({
   const isAwaitingUser = canCompose;
   // 提问期间输入条仍可发（回车顶掉当前卡）；chat 运行中还可排队
   const awaitingAsk = !!pendingAskEvent;
-  const composeEnabled =
-    isAwaitingUser ||
-    awaitingAsk ||
-    !!(isRunning && allowQueueWhileRunning);
+  // 能不能输入：提交飞行中（submitting）也可输入——编辑器不锁，防双发靠同步提交闩（sendingLatch）+ ConversationComposer 对 submitting 的拦截 + 发送键 disabled
+  // （第三轮 review D7-03：chat 的 canReply=!isSubmitting 曾折进来，空闲首发回车到受理的 1.3–6.7s 整个编辑器灰掉）。
+  // 只管编辑器；行内动作（重发 / 重新生成 / 原地编辑 / 引用）和自动聚焦仍看 canCompose
+  const composeEnabled = deriveComposeEnabled({
+    awaitingUser: isAwaitingUser,
+    awaitingAsk,
+    isRunning,
+    allowQueueWhileRunning: !!allowQueueWhileRunning,
+    submitting: !!submitting,
+  });
   // 输入框按运行态画（停止键）：run 在跑，或回车后提交还在飞（服务端还没受理、isRunning 尚为假）。
   // 后者气泡已是正式消息、列表末尾是「准备环境…」，输入框不能还只是一个转圈的发送键、停不了
   // （实测这段窗口热路径 1.3–2.7s、冷路径 4.5–6.7s）。判定与停止语义见 lib/chat-pending-display。
@@ -755,6 +813,20 @@ const EventStreamImpl = ({
     submitting: !!submitting,
     awaitingAsk,
   });
+  // 后台子代理还在跑（V16-03）：主 AI 说完一轮后 isRunning 归零，没有它输入框就没有停止入口——
+  // 只多一个停止键（stopOnly），不把整套运行态带出来（R3-02：转圈 / 「排队发送」/ 附件按钮消失）
+  const composerStopOnly = shouldShowComposerStopOnly({
+    isRunning,
+    submitting: !!submitting,
+    awaitingAsk,
+    backgroundSubagentCount: backgroundSubagents?.length ?? 0,
+  });
+  // 停止键 tooltip：有后台子代理时点名「含 N 个」——停止 = 关整个会话，会连带取消它们，别让用户以为只停主 AI
+  // （没有后台子代理 = undefined，沿用 composer 默认文案）
+  const stopLabel =
+    backgroundSubagents && backgroundSubagents.length > 0
+      ? `停止（含 ${backgroundSubagents.length} 个后台子代理）`
+      : undefined;
 
   // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、
   // 跟 task「跟 AI 说」条 / 推进弹窗 / 答题卡同一份实现（见 hooks/use-rich-input.ts）
@@ -767,6 +839,13 @@ const EventStreamImpl = ({
   const setDraft = rich.setValue;
   const restoreDraft = rich.restore;
   const inputRef = rich.focusRef;
+  // 路径 / 图片附件的最新值镜像：提交失败恢复（submitVia 的 restore）发生在 POST 返回之后，
+  // 闭包里的 rich.pathAttach.paths / rich.attach.images 是发送那一刻（已秒清）的陈旧值——
+  // 合并要读「此刻」的（R5-01：飞行中又贴的图 / 拖的文件不能被快照覆盖）
+  const pathsRef = useRef(rich.pathAttach.paths);
+  pathsRef.current = rich.pathAttach.paths;
+  const imagesRef = useRef(rich.attach.images);
+  imagesRef.current = rich.attach.images;
 
   // 个人偏好的提交快捷键（placeholder 提示用；提交判定在 Composer 内部）
   const submitShortcutHint = getSubmitShortcutHint(useSubmitShortcut());
@@ -839,7 +918,16 @@ const EventStreamImpl = ({
     () => collectGroupQaRounds(task.events ?? []),
     [task.events],
   );
-  const showQaPanel = showGroupQa && groupQaRounds.length > 0;
+  // 还有没有更早的可拉（初值来自 task.eventsTruncated、之后由分页响应维护）。
+  // 声明放这里而不是分页那一段：群问答只统计已加载的事件，tab 要据此说明范围（D8-01）
+  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  const groupQaScope = deriveGroupQaScope({
+    roundCount: groupQaRounds.length,
+    hasMoreEarlier,
+    hasGroup: !!task.feishuGroupChatId,
+    isChat,
+  });
+  const showQaPanel = showGroupQa && groupQaScope.showTab;
   // 群问答是只读 tab：通知父页面隐藏底部输入条（否则输入框会误导用户在此发言）
   useEffect(() => {
     onGroupQaVisibleChange?.(showQaPanel);
@@ -849,6 +937,11 @@ const EventStreamImpl = ({
   // 才不会因「同 startIndex 短路」跳过 sticky 重算（否则切回事件流粘顶头状态是旧的）。
   useEffect(() => {
     lastRangeStartRef.current = null;
+    // 进群问答 tab 时 Virtuoso 整个卸载、切回来是重新挂载，而 initialTopMostItemIndex 读的是 initialTopRef——
+    // 它只在为 null 时写一次、只有切 task 才复位，不清的话切回来会用首次加载时的陈旧下标重挂（V17-02）。
+    // 只在「进入」时清：切回事件流那次渲染的 latch（见下方「初始定位」）会重新落在最后一条并恢复跟随，
+    // 与进入对话 / 任务同一个行为（2026-10-17 用户拍板「进入一律落在最后一条」）
+    if (showQaPanel) initialTopRef.current = null;
   }, [showQaPanel]);
   // agent 正好 ask_user 时自动切回事件流：QA 是只读 tab，问答卡+提示条+输入框全藏，
   // 用户盯着 QA 页收不到任何信号、agent 干等。只在 null→有 的上升沿切一次；
@@ -916,23 +1009,23 @@ const EventStreamImpl = ({
     // attachLiveThinking 只改流尾一项、前面的项引用不变，memo 的成员行不会被击穿
     const live = isChat && isRunning && !streamingText ? liveThinking : null;
     const flow = live ? attachLiveThinking(orderedItems, live) : orderedItems;
-    const withPending: RenderItem[] = [
-      ...flow,
-      ...(pendingLocalReplies ?? []).map(
-        (p): PendingLocalItem => ({
-          kind: "__pending_local__",
-          id: p.id,
-          text: p.displayText,
-          uncertain: p.uncertain,
-          mode: p.mode,
-          itemId: p.itemId ?? p.id,
-        }),
-      ),
-    ];
+    const pendingItems = (pendingLocalReplies ?? []).map(
+      (p): PendingLocalItem => ({
+        kind: "__pending_local__",
+        id: p.id,
+        text: p.displayText,
+        uncertain: p.uncertain,
+        mode: p.mode,
+        itemId: p.itemId ?? p.id,
+      }),
+    );
+    const withPending: RenderItem[] = [...flow, ...pendingItems];
     if (streamingText) {
-      // 压缩 info 会落在 events 尾部；流式气泡默认拼末尾会跑到压缩上面。
-      // 插到尾部连续 compaction 之前，视觉上是「回复 → 正在压缩」。
-      return insertBeforeTrailingCompaction(withPending, {
+      // 流式气泡排在 flow 之后、**所有 pending 之前**（V1-01）：老写法对拼好 pending 的数组插，
+      // 流式项落到排队气泡下面（排队气泡画在回复上方），定稿后回复变成 flow 里的事件、排队气泡又跳到它下面。
+      // 压缩 info 会落在 events 尾部；流式气泡默认拼末尾会跑到压缩上面——
+      // composeStreamTail 内部插到尾部连续 compaction 之前，视觉上是「回复 → 正在压缩」。
+      return composeStreamTail<RenderItem>(flow, pendingItems, {
         kind: "__streaming__",
         // 按段编号（不是固定 "__streaming__"）：上一段被定稿事件接管的 key 不能被下一段撞上
         id: streamItemId(handoff.seq),
@@ -1092,15 +1185,30 @@ const EventStreamImpl = ({
     if (!isSearchFiltering) return new Set<string>();
     return new Set(searchOccurrences.map((o) => o.ownerId));
   }, [isSearchFiltering, searchOccurrences]);
+  // Provider 的 value 必须引用稳定：搜索开着时每帧新对象会让所有消费者行绕过 memo（D3-03 放大器）。
+  // 文本高亮统一交给 DOM/CSS Highlight；这里只保留 owner 集合，供折叠行自动展开。
+  const searchHighlightCtx = useMemo(
+    () => (isSearchFiltering ? { hitOwnerIds: searchHitOwnerIds } : null),
+    [isSearchFiltering, searchHitOwnerIds],
+  );
+  // DOM 高亮 / 定位只扫「模型有命中」的 owner（D3-07：用户气泡 / 思考 / info 不进索引，别涂黄）。
+  // 走 ref 读取：命中集合每来一个事件都是新 Set，进 effect 依赖会让 reveal effect 每个事件重滚一次
+  const searchHitOwnerIdsRef = useRef(searchHitOwnerIds);
+  searchHitOwnerIdsRef.current = searchHitOwnerIds;
 
-  // 查询 / 事件变化：保持 occurrence 下标
+  // 查询 / 事件变化：保持「当前命中」。上一轮的命中表放 ref——按 occurrence 身份找回原选中项，
+  // 而不是只按下标：上拉 / 「加载更早的再搜」prepend 更早事件后，新命中插在前面，
+  // 同一个下标会指向另一处命中、视口被拽走（见 stabilizeOccurrenceSelection）
+  const prevSearchOccurrencesRef = useRef(searchOccurrences);
   useEffect(() => {
+    const prevOccurrences = prevSearchOccurrencesRef.current;
+    prevSearchOccurrencesRef.current = searchOccurrences;
     if (!isSearchFiltering) {
       setSearchHitIndex(-1);
       return;
     }
     setSearchHitIndex((prev) =>
-      stabilizeOccurrenceIndex(prev, searchOccurrences.length),
+      stabilizeOccurrenceSelection(prevOccurrences, prev, searchOccurrences),
     );
   }, [searchOccurrences, isSearchFiltering]);
 
@@ -1129,7 +1237,8 @@ const EventStreamImpl = ({
   const lastItemIsWorkGroup =
     orderedItems[orderedItems.length - 1]?.kind === "__work_group__";
 
-  // 粘性状态行的输入切片：只保留「最近一条 user_reply 起」的本轮事件。
+  // 粘性状态行的输入切片：只保留「最近一条 user_reply / action_start 起」的本轮事件
+  // （切法在 chat-turns 的 sliceCurrentRunEvents；task 形态一轮 run 以 action_start 开头，V16-05）。
   //
   // 为什么要切（2026-07-28 性能修）：deriveActiveStatus 的第一步是 O(全部事件) 地收
   // doneCallIds，而下面那个 memo 的依赖里有 liveToolOutputs——shell 直播每来一个
@@ -1140,20 +1249,16 @@ const EventStreamImpl = ({
   //（「正在启动…」那条分支），所以它根本走不到最近一条 user_reply 之前；而 tool_result
   // 永远晚于自己的 tool_call，切片里的 tool_call 要配的 result 也一定在切片内，
   // doneCallIds 因此不会漏。结论：同样的答案，扫描量从「全量」降到「本轮」。
-  // 没有 user_reply（刚建的 chat）时退回全量，那会儿本来也没几条。
-  const statusEvents = useMemo(() => {
-    const src = !isChat
-      ? task.events
-      : (() => {
-          for (let i = task.events.length - 1; i >= 0; i--) {
-            if (task.events[i]!.kind === "user_reply") {
-              return task.events.slice(i);
-            }
-          }
-          return task.events;
-        })();
-    return src.filter((e) => !isHiddenFromEventStream(e, { isChat }));
-  }, [isChat, task.events]);
+  // 没有起点事件（刚建的 chat）时退回全量，那会儿本来也没几条。
+  // task 形态原先整个吃全量（那时没有状态行）；接上状态行后必须和 chat 走同一条切片路，
+  // 否则 task 的 shell 直播每个 delta 都会重扫整个任务的事件（V16-05）。
+  const statusEvents = useMemo(
+    () =>
+      sliceCurrentRunEvents(task.events).filter(
+        (e) => !isHiddenFromEventStream(e, { isChat }),
+      ),
+    [isChat, task.events],
+  );
 
   // 流尾是不是一行进度（「等待模型响应…」/ 启动阶段）。是 = 它已经在说「还在等」，
   // 状态行的「正在启动…」就别再说一遍（同一件事上下各一句，和思考原文重复是一个毛病）。
@@ -1168,9 +1273,14 @@ const EventStreamImpl = ({
   // 不用 statusEvents（它滤掉了隐藏事件，而隐藏事件也是「还在动」的证据）
   const lastEventTs = latestEventTs(task.events);
 
-  // 运行中粘性状态行（Batch C）：仅 chat + running；有 streamingText 时 label「正在回复…」正常
+  // 运行中粘性状态行（Batch C）：running 时 chat / task 都有；有 streamingText 时 label「正在回复…」正常。
+  // task 形态（V16-05）：assistant_message 之后 / 落盘的 thinking 之后 / action_start 后的「启动过程」组，
+  // 流里没有任何转圈或计时、唯一的活信号是页面头部的「停止」（长列表滚下去就看不见）——
+  // 同一个纯函数、同一份本轮切片，画在事件流底部（见下方 reserveTaskStatusSlot）。
+  // task 的 liveToolOutputs 每个 delta 也是新引用：输入只能是本轮切片（statusEvents），别挂回全量事件
   const activeStatus = useMemo(() => {
-    if (!isChat || !isRunning) return null;
+    // 只看属主主 run：旁路群答疑 run 在飞不该让主任务的状态行冒出来（R3-05）
+    if (!mainRunActive) return null;
     // 刚按回车、user_reply 还没落盘：列表末尾已有「准备环境…」进度行；
     // 此时 statusEvents 还停在上一轮，回扫会闪出上一轮的「正在回复…」——不并存
     if (hasInflight) return null;
@@ -1189,8 +1299,7 @@ const EventStreamImpl = ({
     if (status?.yieldToTail && tailHasProgressRow) return null;
     return status;
   }, [
-    isChat,
-    isRunning,
+    mainRunActive,
     hasInflight,
     statusEvents,
     lastEventTs,
@@ -1201,10 +1310,11 @@ const EventStreamImpl = ({
     tailHasProgressRow,
   ]);
 
-  // 状态行这一帧会不会真的画出来：与下方渲染条件（!hideReplyComposer && activeStatus）同口径。
+  // 状态行这一帧会不会真的画出来：与下方渲染条件同口径——
+  // chat = 输入框上方那条（隐藏输入区时不画）；task = 事件流底部那条（V16-05，恒画、有 activeStatus 才有内容）。
   // 画出来时它已经在说「正在分析 X 的结果 · 12s」，工作过程组尾的「处理中…」据此让位，
-  // 不再同一句废话上下各说一遍；task 形态没有状态行，组尾仍兜底
-  const statusLineVisible = !hideReplyComposer && !!activeStatus;
+  // 不再同一句废话上下各说一遍；没有状态行可让位时（没在跑 / 让位给流尾进度行），组尾仍兜底
+  const statusLineVisible = (!isChat || !hideReplyComposer) && !!activeStatus;
 
   // 状态行「跳过等待」：叫醒本会话里在睡的 wait（0 个 = 刚好到点自己醒了，不提示）。
   // 失败才 toast；成功后状态行靠事件流里 wait 的 tool_result 自己切走
@@ -1221,6 +1331,10 @@ const EventStreamImpl = ({
   // 状态行有 / 无（让位给流尾进度行、两种状态切换的间隙）时，输入框和事件流可视区高度不变——
   // 不预留的话，状态行每出没一次，输入框就整体上下跳 28px、事件流底部跟着伸缩。
   const reserveStatusSlot = isChat && (isRunning || hasInflight || !!submitting);
+  // task 形态的同款槽位（事件流底部）：运行期间预留，状态行出没不带着列表可视区高度上下跳。
+  // 没有 hasInflight / submitting：那两个是 chat 输入框的提交飞行态，task 的「跟 AI 说」在页面级输入条里
+  // 只看属主主 run：旁路群答疑在飞时空闲任务不该撑开一个空槽并动画伸缩（R3-05）
+  const reserveTaskStatusSlot = !isChat && mainRunActive;
 
   // 轮次分割判定用的 kind 序列。挂 orderedItems 不挂 items：虚拟项一律追加在尾部、
   // 且都不是 user_reply，越界读回 undefined、shouldShowTurnDivider 自然返回 false，
@@ -1327,7 +1441,7 @@ const EventStreamImpl = ({
     const revealMountedTarget = (): boolean => {
       const root = searchScrollRootRef.current;
       const matches = root
-        ? findOwnerDomSearchMatches(root, searchQuery)
+        ? findOwnerDomSearchMatches(root, searchQuery, searchHitOwnerIdsRef.current)
         : [];
       const target = matches.find(
         (match) =>
@@ -1386,7 +1500,11 @@ const EventStreamImpl = ({
     let frame = 0;
     const refresh = () => {
       frame = 0;
-      const matches = findOwnerDomSearchMatches(root, searchQuery);
+      const matches = findOwnerDomSearchMatches(
+        root,
+        searchQuery,
+        searchHitOwnerIdsRef.current,
+      );
       applyDomSearchHighlights(
         matches,
         "flowship-event-search",
@@ -1441,8 +1559,7 @@ const EventStreamImpl = ({
 
   // ---------- v1.0.x 事件懒加载（上拉分页） ----------
   // firstItemIndex：Virtuoso prepend 保滚动位置的官方机制——头部插 N 个 item 就减 N
-  // 还有没有更早的可拉（初值来自 task.eventsTruncated、之后由分页响应维护）
-  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  // （hasMoreEarlier / setHasMoreEarlier 的声明提到了「群问答 tab」那一段之前——tab 的范围提示要用它）
   // 拉取飞行中（顶部小 spinner、渲染用）
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   // 上一次拉取失败（顶部显示手动重试；下一次开拉时清掉）
@@ -1607,6 +1724,22 @@ const EventStreamImpl = ({
     follow.requestScrollToBottom();
   }, [follow, items, streamingText, isRunning]);
 
+  // 提交即到底（V2-01）：上滚读历史后在输入框回车，新气泡和流式回复全在视口外、只剩一个「回到最新」圆钮，
+  // 用户容易以为没发出去而重复回车。检测到「本窗口新发起的占位」出现就缓动回底并恢复跟随。
+  // **只认本地发起**（占位的 `local === true`，缺省不算——fail-closed，R5-03）：飞书 / 别的窗口的消息走 user_reply 事件、
+  // 不会有占位；bootstrap 重建的占位 local=false——它们出现不是用户按了回车，不能把正在翻历史的人拽走。
+  // 基线按 task 存：首次挂载 / 切 task 时已有的占位只记基线、不触发。
+  // effect 体在 lib/stream-pending.applyPendingScan（纯函数、有单测：fake 回调断言「新本地占位 → 调用」）
+  const pendingScanRef = useRef<PendingScanBaseline | null>(null);
+  useEffect(() => {
+    pendingScanRef.current = applyPendingScan(
+      pendingScanRef.current,
+      task.id,
+      pendingLocalReplies ?? [],
+      () => follow.scrollToBottomSmooth(),
+    );
+  }, [pendingLocalReplies, task.id, follow]);
+
   // 「回到最新」：短缓动滑到底 + 落地恢复自动跟随（太远 / 减少动态效果时直接跳）。
   // **不新开滚动入口**——滑行与落地后的贴底都在控制器里（自己写 scrollTop、落地交给它那条
   // rAF 合批的贴底链）。这里若自己再调一次 scrollToIndex，
@@ -1657,8 +1790,17 @@ const EventStreamImpl = ({
       // 焦点已在右侧抽屉里（比如正盯着子代理详情）就不抢：否则后台子代理唤醒主 AI、一轮说完，
       // 用户在抽屉里按空格 / 翻页的键会变成往输入框里打字。在 timer 回调里判（不是 effect 体里），
       // 取的是「真正要 focus 那一刻」的焦点位置
+      // 页面上有非空选区也不抢（R5-01 ◐）：受理后 / 一轮说完回到可输入时，用户可能正选着上一条 AI 回复要复制，
+      // 一 focus 选区就没了。判定见 lib/composer-refocus.shouldAutoFocusComposer
       const timer = setTimeout(() => {
-        if (isInsideSheet(document.activeElement)) return;
+        if (
+          !shouldAutoFocusComposer({
+            activeInsideSheet: isInsideSheet(document.activeElement),
+            selection: window.getSelection(),
+          })
+        ) {
+          return;
+        }
         inputRef.current?.focus();
       }, 0);
       return () => clearTimeout(timer);
@@ -1809,35 +1951,64 @@ const EventStreamImpl = ({
     [setDraft, inputRef],
   );
 
-  // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
-  const sendingLockRef = useRef(false);
+  // 「未送达」卡的「放回输入框」（V3-05）：run 出错 / 会话关闭时排队消息被清掉，把丢掉的话前置回草稿、聚焦。
+  // 草稿住在这一层（rich），所以由这里注入、卡片不碰输入框；父层（ChatView / 详情页）注入的能力原样透传。
+  // 只在 chat 且渲染了输入岛时提供——否则放回的是一个看不见的草稿、等于没放
+  const parentStreamActions = useStreamActions();
+  const handleRestoreDraft = useCallback(
+    (text: string) => {
+      setDraft((prev) => prependRestoredToDraft(prev, text));
+      inputRef.current?.focus();
+    },
+    [setDraft, inputRef],
+  );
+  const canRestoreDraft = isChat && !hideReplyComposer;
+  const mergedStreamActions = useMemo(
+    () => ({
+      ...parentStreamActions,
+      onRestoreDraft: canRestoreDraft ? handleRestoreDraft : undefined,
+    }),
+    [parentStreamActions, canRestoreDraft, handleRestoreDraft],
+  );
+
+  // 同步飞行闩：防 isSubmitting state 一帧延迟导致连点 / 连按 Enter 重复提交
+  // （纯函数 createSubmitLatch / startLatchedSubmit 见 lib/composer-actions，行为测试 tests/submit-latch.test.ts，Q6-03）
+  const [sendingLatch] = useState(createSubmitLatch);
   // 取草稿 → 发送 → 成功清空
   // 提交模式走公共 runOptimisticSubmit（与 task 输入条同一份）：
   // 快照 payload 后立刻 reset（气泡靠 SSE user_reply 补），失败才恢复正文+路径。
   const submitVia = (send: typeof onUserReply) => {
-    if (!send || sendingLockRef.current) return;
-    // 文本 / 图 / 路径至少有一个、纯空消息不发
-    if (!rich.hasContent) return;
-    // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
-    const snap = rich.payload();
-    sendingLockRef.current = true;
-    void runOptimisticSubmit({
-      payload: snap,
-      reset: () => rich.reset(),
-      restore: (p) =>
-        restoreOptimisticDraft(
-          p,
-          (t) => rich.setValue(t),
-          (paths) => rich.pathAttach.replaceAll(paths),
-          (imgs) => rich.attach.replaceAll(imgs),
-        ),
-      // 占位走父级 ledger，不过这里。onUserReply 可同步可异步，包一层统一成 Promise。
-      send: () =>
-        Promise.resolve(send(snap.text, snap.images, snap.attachments, snap.skillRefs)),
-      // 返 false=失败（恢复草稿）；成功靠 SSE user_reply 补气泡
-      isFailure: (result) => result === false,
-    }).finally(() => {
-      sendingLockRef.current = false;
+    // 没发送函数 / 文本 / 图 / 路径一个都没有（纯空消息不发）/ 闩被占 → 不发；落定（成功 / 失败 / 抛错）都释放闩
+    startLatchedSubmit({
+      latch: sendingLatch,
+      hasSend: !!send,
+      hasContent: rich.hasContent,
+      run: () => {
+        if (!send) return Promise.resolve();
+        // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
+        const snap = rich.payload();
+        return runOptimisticSubmit({
+          payload: snap,
+          reset: () => rich.reset(),
+          // 失败恢复：chat 编辑器不锁（D7-03），POST 飞行期间输入框可能已有新敲的下一句 / 新图 / 新路径——
+          // 合并而不是覆盖（原文在前、新敲的在后；图 / 路径去重、守上限），与 task 说话条同一套规则（R5-01）
+          restore: (p) =>
+            restoreDraftMerged(p, {
+              setValue: (updater) => rich.setValue(updater),
+              currentPaths: () => pathsRef.current,
+              currentImages: () => imagesRef.current,
+              replacePaths: (paths) => rich.pathAttach.replaceAll(paths),
+              replaceImages: (imgs) => rich.attach.replaceAll(imgs),
+              maxPaths: MAX_PATHS,
+              maxImages: rich.attach.maxImages,
+            }),
+          // 占位走父级 ledger，不过这里。onUserReply 可同步可异步，包一层统一成 Promise。
+          send: () =>
+            Promise.resolve(send(snap.text, snap.images, snap.attachments, snap.skillRefs)),
+          // 返 false=失败（恢复草稿）；成功靠 SSE user_reply 补气泡
+          isFailure: (result) => result === false,
+        });
+      },
     });
   };
   const handleSend = () => submitVia(onUserReply);
@@ -1876,26 +2047,35 @@ const EventStreamImpl = ({
       it.kind === "ask_user_request",
   });
 
+  // 搜索范围提示：还有更早事件没加载时，搜索只覆盖已加载那段——有无命中都要说明，
+  // 并复用上拉分页（loadEarlier）给「加载更早的再搜」入口；加载后 items 变、命中自动重算
+  const searchScopeNotice = deriveSearchScopeNotice({
+    // 群问答 tab 下展示的是只读 QA 列表、搜索不作用于它，提示条也不出
+    filtering: isSearchFiltering && !showQaPanel,
+    hasMoreEarlier,
+    loadedCount: task.events.length,
+    canLoadEarlier: !!onPrependEvents,
+  });
+  const renderSearchScopeNotice = (className: string) =>
+    searchScopeNotice ? (
+      <EventStreamSearchScopeNotice
+        text={searchScopeNotice.text}
+        canLoadEarlier={searchScopeNotice.canLoadEarlier}
+        loading={loadingEarlier}
+        onLoadEarlier={() => void loadEarlier()}
+        className={className}
+      />
+    ) : null;
+
   return (
     // 子代理详情面板的宿主：事件流里的子代理卡（Virtuoso 里滚出视口就卸载）和输入框上方的
     // 「后台工作」条都从这里打开同一个抽屉——状态放卡片里的话一滚动抽屉就没了
     <SubagentDetailHost task={task}>
     {/* 跟随控制器透给深层子树：工作过程组的「自动折叠」要看用户是不是在翻历史 */}
     <StreamFollowContext.Provider value={follow}>
-    <PaneSearchHighlightProvider
-      value={
-        isSearchFiltering
-          ? {
-              // 文本高亮统一交给 DOM/CSS Highlight；这里只保留 owner 集合，供折叠行
-              // 自动展开。否则 Streamdown memo 会残留上一次查询生成的局部 <mark>。
-              query: "",
-              activeGlobalIndex: -1,
-              occurrences: [],
-              hitOwnerIds: searchHitOwnerIds,
-            }
-          : null
-      }
-    >
+    {/* 行内动作：透传父层注入的（错误卡重试 / 重新推进）+ 本层补的「放回输入框」（草稿住在这一层） */}
+    <StreamActionsProvider value={mergedStreamActions}>
+    <PaneSearchHighlightProvider value={searchHighlightCtx}>
     <div
       className="flex h-full flex-col"
       data-pane-search="event-stream"
@@ -1916,7 +2096,11 @@ const EventStreamImpl = ({
           inputRef={searchInputRef}
           placeholder="搜索 AI 回复…"
           ariaLabel="搜索 AI 回复"
+          // 搜索激活态 leading 让位（V13-04）：tab 是 flex-1、Input 也是 flex-1，两者平分剩余宽度——
+          // 307px 的事件流栏里 Input 只剩约 71px（有群问答 tab 时约 25px）。搜索一激活就已切回事件流
+          // （activateStreamSearch 里 setShowGroupQa(false)），tab 此刻没有用处；关掉搜索后原样回来
           leading={
+            searchActive ? null : (
             <span className="flex flex-1 items-center gap-3">
               <button
                 type="button"
@@ -1930,7 +2114,7 @@ const EventStreamImpl = ({
               >
                 事件流
               </button>
-              {!isChat && groupQaRounds.length > 0 && (
+              {groupQaScope.showTab && (
                 <button
                   type="button"
                   onClick={() => setShowGroupQa(true)}
@@ -1941,23 +2125,40 @@ const EventStreamImpl = ({
                       : "text-muted-foreground hover:text-foreground",
                   )}
                 >
-                  群问答（{groupQaRounds.length}）
+                  {/* 窗口只含最近一段事件时计数带「+」（至少这么多），范围说明在面板顶部 */}
+                  群问答{groupQaScope.countText && `（${groupQaScope.countText}）`}
+                  {/* 状态点一律静态（事件流 v2「动效同屏只留一处主动效」）；
+                      点只有颜色，role=img + aria-label 给读屏，hover 提示走 Tooltip（不用原生 title） */}
                   {groupQaAnswering && (
-                    <span className="inline-block size-1.5 animate-pulse rounded-full bg-info" />
+                    <Tooltip content="群里有提问正在回答">
+                      <span
+                        role="img"
+                        aria-label="群里有提问正在回答"
+                        className="inline-block size-1.5 rounded-full bg-info"
+                      />
+                    </Tooltip>
                   )}
                   {groupQaNeedsOwnerCount > 0 && (
-                    <span
-                      className="inline-block size-1.5 rounded-full bg-brand"
-                      title={`有 ${groupQaNeedsOwnerCount} 件事等你在群问答里拍板`}
-                    />
+                    <Tooltip
+                      content={`有 ${groupQaNeedsOwnerCount} 件事等你在群问答里拍板`}
+                    >
+                      <span
+                        role="img"
+                        aria-label={`有 ${groupQaNeedsOwnerCount} 件事等你在群问答里拍板`}
+                        className="inline-block size-1.5 rounded-full bg-brand"
+                      />
+                    </Tooltip>
                   )}
                 </button>
               )}
             </span>
+            )
           }
           className="h-10 shrink-0 border-b px-4"
         />
       )}
+      {/* log 形态：范围提示是标题栏下方一条细行（占位只在搜索且有更早未加载时出现） */}
+      {!isChat && renderSearchScopeNotice("border-b px-4 py-1")}
       {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll。
           relative：给 chat 搜索与「AI 在等你回答」悬浮条定位 */}
       <div className="relative min-h-0 flex-1">
@@ -1976,13 +2177,18 @@ const EventStreamImpl = ({
             placeholder="搜索 AI 回复…"
             ariaLabel="搜索 AI 回复"
             className={cn(
-              "absolute right-3 top-2 z-20 rounded-lg border border-border/60 bg-background/90 shadow-sm backdrop-blur",
+              "absolute right-3 top-2 z-20 rounded-lg border border-border bg-background shadow-sm",
               searchActive
                 ? "w-[min(28rem,calc(100%-1.5rem))] p-1"
                 : "p-0.5",
             )}
           />
         )}
+        {/* chat 形态：搜索框是右上角悬浮的，范围提示紧贴其下同样悬浮（不占垂直布局） */}
+        {isChat &&
+          renderSearchScopeNotice(
+            "absolute right-3 top-12 z-20 max-w-[min(28rem,calc(100%-1.5rem))] rounded-md border border-border bg-background px-2 py-0.5 shadow-sm",
+          )}
         {/* E1 sticky 轮次头：默认 hidden，rangeChanged 里命令式显隐（见 applyStickyTurn）。
             chat / task 都启用：task 事件流里用户也会直接发消息提问（user_reply）、
             回滚看历史时同样需要「回到最近提问」的锚。
@@ -2039,7 +2245,13 @@ const EventStreamImpl = ({
         />
         )}
         {showQaPanel ? (
-          <GroupQaPanel rounds={groupQaRounds} events={task.events} />
+          <GroupQaPanel
+            rounds={groupQaRounds}
+            events={task.events}
+            scopeNotice={groupQaScope.notice}
+            onLoadEarlier={onPrependEvents ? () => void loadEarlier() : undefined}
+            loadingEarlier={loadingEarlier}
+          />
         ) : items.length === 0 ? (
           <div
             className={cn(
@@ -2198,7 +2410,11 @@ const EventStreamImpl = ({
                     taskId={task.id}
                     task={task}
                     variant={variant}
-                    liveToolOutputs={liveToolOutputs}
+                    // 直播输出只有「运行中」的工具块会用（status !== running 时展示落盘 output）；
+                    // 没有运行中成员的组不收它，否则别的工具每个输出增量都会击穿所有可见组的 memo（D5-01）
+                    liveToolOutputs={
+                      item.hasRunning ? liveToolOutputs : undefined
+                    }
                     isRunningTail={item.id === lastGroupId && isRunning}
                     showProcessingPlaceholder={shouldShowProcessingPlaceholder({
                       isRunning,
@@ -2261,6 +2477,7 @@ const EventStreamImpl = ({
                         : undefined
                     }
                     onRewind={isChat ? onRewind : undefined}
+                    rewindingEventId={rewindingEventId}
                     // chat 任意一条用户消息原地编辑（替换这条及之后的对话）：可发消息 + 父组件接了回退才给
                     onEditInPlace={
                       isChat && canCompose && onEditRewind
@@ -2269,7 +2486,8 @@ const EventStreamImpl = ({
                     }
                     // 引用追问：可发消息时所有 AI 回复都可引用（不限最后一条）
                     onQuote={isChat && canCompose ? handleQuote : undefined}
-                    runActive={isRunning}
+                    // 错误卡「当轮失败」资格 / 回退按钮只看属主主 run：旁路群答疑在飞不让主任务的错误卡翻篇（D6-02）
+                    runActive={mainRunActive}
                   />
                 )}
               </div>
@@ -2322,23 +2540,62 @@ const EventStreamImpl = ({
                   : (disabledHint ?? "agent 当前没有等待你回复")
             }
             disabled={!composeEnabled}
+            ariaLabel="发消息"
             submitting={submitting}
             topRow={composerTop}
             leading={composerLeading}
             running={composerRunning}
+            stopOnly={composerStopOnly}
             onStop={onStop}
             stopping={stopping}
+            stopLabel={stopLabel}
             allowQueueWhileRunning={allowQueueWhileRunning && !awaitingAsk}
             queueBanner={queueBanner}
             className={cn(
               "mx-auto w-full max-w-3xl",
-              !isAwaitingUser && !composerRunning && !awaitingAsk && "opacity-70",
+              // 失活态（AI 没在等你回复）：只降低边框 / 底色 / 阴影的对比，⛔ 不整体压 opacity——
+              // 旧的整岛 opacity-70 连 placeholder 与文字一起压（实测 3.45 / 4.02:1，低于 AA 4.5:1，V13-12）；
+              // 现在文字 / placeholder 保持 text-muted-foreground 的原始对比度
+              !isAwaitingUser &&
+                !composerRunning &&
+                !awaitingAsk &&
+                "border-border/60 bg-muted/30 shadow-none",
             )}
           />
         </div>
       )}
+      {/* task 形态的粘性状态行（V16-05）：列表容器之外、固定在事件流底部——长列表滚下去也看得见，
+          不是列表里的虚拟项（那样滚走就没了，正是「AI 在跑但流里没有转圈 / 计时」要修的）。
+          槽位运行期间始终占住 h-7，状态行出没不带着列表可视区高度跳（同 chat 槽位的做法）。
+          task 的输入条在页面级（TaskTalkComposer），所以这里只有状态行、没有输入岛 */}
+      {isChat ? null : (
+        <div className="shrink-0 px-4">
+          <div
+            className={cn(
+              "overflow-hidden transition-[height] duration-200 ease-out motion-reduce:transition-none",
+              reserveTaskStatusSlot ? "h-7" : "h-0",
+            )}
+          >
+            {activeStatus && (
+              <ActiveStatusLine
+                status={activeStatus}
+                onSkipWait={handleSkipWait}
+              />
+            )}
+          </div>
+        </div>
+      )}
+      {/* 读屏播报区（V14-01 / V16-10）：sr-only、挂在列表之外，只念状态行 label（不含秒数）与
+          挂载之后新增的失败 / 待答 / 完成。列表里的卡片不加 live 属性（虚拟列表滚入视口会反复播报） */}
+      <StreamAnnouncer
+        taskId={task.id}
+        events={task.events}
+        isChat={isChat}
+        statusLabel={activeStatus?.label ?? ""}
+      />
     </div>
     </PaneSearchHighlightProvider>
+    </StreamActionsProvider>
     </StreamFollowContext.Provider>
     </SubagentDetailHost>
   );

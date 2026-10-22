@@ -41,6 +41,8 @@ const listTasksMock = vi.fn<() => Promise<TaskSummary[]>>();
 
 vi.mock("@/lib/server/task-fs", () => ({
   listTasks: () => listTasksMock(),
+  // GET /api/tasks 改调 listTasksWithCorrupt（同时带「损坏的任务」）；这里只关心 tasks、corrupt 恒空
+  listTasksWithCorrupt: async () => ({ tasks: await listTasksMock(), corrupt: [] }),
   // 与真实实现同形：把 wrap 的结果包成 Response（这里只关心 body）
   commitReadableTaskListResponse: <T extends { id: string }>(
     items: T[],
@@ -272,7 +274,8 @@ describe("C. 接线与 UI 契约", () => {
 
   it("读数只在列表接口里补，且走与 watch-task 同源的 provider（不另起一份真值）", () => {
     const route = read("src/app/api/tasks/route.ts");
-    expect(route).toContain("withBackgroundSubagentCounts(await listTasks())");
+    // 路由改调 listTasksWithCorrupt（tasks + 损坏任务）：读数仍只补在 listed.tasks 上
+    expect(route).toContain("withBackgroundSubagentCounts(listed.tasks)");
     expect(route).toContain("getBackgroundSubagentCount(t.id)");
     const leaf = read("src/lib/server/subagent-background.ts");
     const fn = leaf.slice(leaf.indexOf("export const getBackgroundSubagentCount"));

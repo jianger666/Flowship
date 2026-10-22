@@ -6,9 +6,11 @@ import { describe, expect, it, beforeEach } from "vitest";
 import { isModCombo, type KeyComboEvent } from "@/lib/keyboard-shortcuts";
 import {
   getActivePaneSearchScope,
+  isArtifactPaneCollapsed,
   resetActivePaneSearchScope,
   resolvePaneSearchScope,
   setActivePaneSearchScope,
+  setArtifactPaneCollapsed,
 } from "@/lib/pane-search";
 
 const key = (partial: Partial<KeyComboEvent> & { key: string }): KeyComboEvent => ({
@@ -43,6 +45,28 @@ describe("resolvePaneSearchScope", () => {
     expect(resolvePaneSearchScope(null, "/chats")).toBe(null);
     expect(resolvePaneSearchScope(null, "/")).toBe(null);
     expect(resolvePaneSearchScope(null, "/settings")).toBe(null);
+  });
+});
+
+describe("R9a-01：产物栏折叠后 Cmd/Ctrl+F 不再路由到产物栏", () => {
+  beforeEach(() => resetActivePaneSearchScope());
+
+  it("折叠 + 无焦点记忆 / 最后点的是产物栏 → 事件流；没折叠仍是产物栏", () => {
+    expect(resolvePaneSearchScope(null, "/tasks/abc", true)).toBe("event-stream");
+    expect(resolvePaneSearchScope("artifact", "/tasks/abc", true)).toBe("event-stream");
+    expect(resolvePaneSearchScope("event-stream", "/tasks/abc", true)).toBe("event-stream");
+    expect(resolvePaneSearchScope(null, "/tasks/abc", false)).toBe("artifact");
+    expect(resolvePaneSearchScope("artifact", "/tasks/abc")).toBe("artifact");
+    // 非任务页不受影响
+    expect(resolvePaneSearchScope(null, "/settings", true)).toBe(null);
+  });
+
+  it("折叠标记是模块级状态：页面写入、reset 复位", () => {
+    expect(isArtifactPaneCollapsed()).toBe(false);
+    setArtifactPaneCollapsed(true);
+    expect(isArtifactPaneCollapsed()).toBe(true);
+    resetActivePaneSearchScope();
+    expect(isArtifactPaneCollapsed()).toBe(false);
   });
 });
 

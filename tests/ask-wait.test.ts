@@ -131,4 +131,16 @@ describe("ask-wait 槽", () => {
       toolArgsLookLikeAskWait({ command: buildAskWaitCurl("t1", "tok") }),
     ).toBe(true);
   });
+
+  it("buildAskWaitCurl：PowerShell 用 curl.exe（curl 是 Invoke-WebRequest 别名），其它壳用 curl", () => {
+    const ps = buildAskWaitCurl("t1", "tok", "PowerShell");
+    expect(ps.startsWith("curl.exe -NsS --no-buffer ")).toBe(true);
+    for (const kind of ["Git Bash", "zsh", "bash"] as const) {
+      expect(buildAskWaitCurl("t1", "tok", kind).startsWith("curl -NsS ")).toBe(
+        true,
+      );
+    }
+    // curl.exe 版本同样要被 ask-wait 识别（等答案的 24h 超时、事件流隐藏都靠它）
+    expect(isAskWaitCommand(ps)).toBe(true);
+  });
 });

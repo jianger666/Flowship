@@ -15,7 +15,7 @@
 import { Suspense, use, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { ChevronLeft, Rocket } from "lucide-react";
+import { ChevronLeft, Loader2, RefreshCw, Rocket } from "lucide-react";
 
 import { TaskLaunchForm } from "@/components/tasks/task-launch-form";
 import { WorkitemDetail } from "@/components/feishu/workitem-detail";
@@ -38,7 +38,9 @@ const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) =
   const name = sp.get("name") ?? "";
   // query 可被任意构造：只放行 http(s) 链接（拒绝 javascript: / data: 等），非法当没有链接
   const url = safeHttpUrl(sp.get("url"));
-  const { tasks, loaded, upsertTask } = useTaskList();
+  const { tasks, loaded, loadError, refresh, upsertTask } = useTaskList();
+  // 列表加载失败后的重试中（按钮转圈 + 防连点）
+  const [retrying, setRetrying] = useState(false);
   // 用户明确选择「仍要新建」后才放出表单（匹配口径再准也可能有误判 / 用户就是想再建一个）
   const [forceNew, setForceNew] = useState(false);
   // 表单已放出过的工作项 id：放出后即使之后才匹配到已有任务也不卸载表单（防丢已填内容）；记 id 是为切到别的工作项时自动失效
@@ -51,13 +53,17 @@ const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) =
     [tasks, id, url],
   );
 
-  // 启动区三态：任务列表首次加载完成前一律 loading——此时 tasks 为空、existing 必然查不到，
-  // 先放表单会在匹配上后被卸载（丢输入 / 误建重复任务，N9-02）
+  // 启动区四态：任务列表首次加载完成前一律 loading——此时 tasks 为空、existing 必然查不到，
+  // 先放表单会在匹配上后被卸载（丢输入 / 误建重复任务，N9-02）；
+  // 列表首拉失败（loaded 但没数据 + 有 loadError）→ error：同样查不到 existing、
+  // 放表单会让用户对已有任务的需求重复启动（F3-03），所以只画「加载失败 + 重试」
   const gate = decideWorkitemGate({
     loaded,
     existing,
     forceNew,
     formShown: formShownFor === id,
+    loadError,
+    taskCount: tasks.length,
   });
 
   // 表单一旦放出就记下来：之后轮询 / 别的窗口建了同一工作项的任务也只补提示、不收回表单
@@ -90,6 +96,32 @@ const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) =
       {/* 启动配置区 / 已有任务直进；任务列表加载完成前只给占位、不渲染表单 */}
       {gate === "loading" && (
         <LoadingState variant="card" label="正在检查该工作项是否已有任务…" />
+      )}
+      {gate === "error" && (
+        // 与侧栏 / 对话落点同款失败态：亮出原因 + 重试；不画启动表单（查不了「是否已有任务」）。
+        // 重试成功后 loadError 清掉，gate 自动转成 existing / form
+        <div className="flex flex-col items-center gap-2 rounded-md border border-dashed px-3 py-4 text-center">
+          <p className="text-xs text-destructive">任务列表加载失败：{loadError}</p>
+          <p className="text-xs text-muted-foreground">
+            没法确认这个工作项是否已有任务，先不显示启动表单，免得重复启动。
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={retrying}
+            onClick={() => {
+              setRetrying(true);
+              void refresh().finally(() => setRetrying(false));
+            }}
+          >
+            {retrying ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3.5" />
+            )}
+            重试
+          </Button>
+        </div>
       )}
       {gate !== "loading" && existing && (
         <div className="flex items-center gap-3 rounded-md border border-primary/30 bg-primary/5 px-4 py-3 text-sm">

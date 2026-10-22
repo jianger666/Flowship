@@ -393,6 +393,30 @@ describe("main.js 接线契约：放行判定必须挡在 shell.openExternal 前
     expect(ipcBlock).not.toContain("isSafeMailtoUrl");
   });
 
+  it("站内 URL（本应用 origin）在 setWindowOpenHandler / IPC 里先 deny，不交给系统浏览器（Q4-02）", () => {
+    const wo = main.indexOf("setWindowOpenHandler(");
+    const woBlock = main.slice(wo, main.indexOf("\n  });", wo));
+    const ipc = main.indexOf('ipcMain.on("open-external"');
+    const ipcBlock = main.slice(ipc, main.indexOf("\n});", ipc));
+    for (const block of [woBlock, ipcBlock]) {
+      const app = block.indexOf("if (isAppUrl(url))");
+      const open = block.indexOf("shell.openExternal(url)");
+      expect(app).toBeGreaterThanOrEqual(0);
+      expect(open).toBeGreaterThan(app);
+      // 站内分支里不能有 openExternal
+      expect(block.slice(app, block.indexOf("}", app))).not.toContain("openExternal");
+    }
+  });
+
+  it("isSameAppOrigin 判定站内（行为）：同 origin 任意路径 / 带 userinfo 或相近端口的不算站内", () => {
+    const ctx = { host: "127.0.0.1", port: 8876 };
+    expect(isSameAppOrigin("http://127.0.0.1:8876/api/repo-branches?x=1", ctx)).toBe(true);
+    expect(isSameAppOrigin("http://127.0.0.1:8876/tasks/t_1", ctx)).toBe(true);
+    expect(isSameAppOrigin("http://127.0.0.1:88760/api/x", ctx)).toBe(false);
+    expect(isSameAppOrigin("http://127.0.0.1:8876@evil.example/api/x", ctx)).toBe(false);
+    expect(isSameAppOrigin("https://github.com/a/b", ctx)).toBe(false);
+  });
+
   it("壳里不再有前缀正则版白名单，判定统一来自 external-url.mjs", () => {
     expect(main).not.toContain("OPEN_EXTERNAL_ALLOWED");
     expect(main).toContain('from "./external-url.mjs"');
