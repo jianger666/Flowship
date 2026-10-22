@@ -68,7 +68,7 @@ vi.mock("@/lib/server/update-pending", () => ({
 }));
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
-const { readEvents, readMetaV06, taskDir, writeMeta } = taskFsCore;
+const { readEvents, readMetaV06, taskDir, withTaskLock, writeMeta } = taskFsCore;
 const {
   agentSessions,
   clearResourceJobs,
@@ -121,6 +121,20 @@ afterAll(() => {
 });
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * 给迟到的 fire-and-forget 写盘留出落地时间，再清任务目录：用例结束时 finalize / prewarm 链尾的
+ * `appendEvent` meta touch、meta.json.bak 刷新可能还在飞（都在 per-task 锁里）。不等的话，目录一被删它们就
+ * ENOENT、各打一条 console.warn——而且常落在文件收尾之后，vitest 在关 worker 的 rpc 时还有一条日志没送完，
+ * 报 `EnvironmentTeardownError: Closing rpc while "onUserConsoleLog" was pending`（Linux CI 上红过一次）。
+ * **固定** 5 轮「排空该任务的锁 + 让出 40ms」（共约 200ms）：时间裕量、不是同步点。
+ */
+const quiesceTask = async (taskId: string): Promise<void> => {
+  for (let i = 0; i < 5; i++) {
+    await withTaskLock(taskId, async () => undefined);
+    await sleep(40);
+  }
+};
 
 const raceExpectSettled = async <T,>(p: Promise<T>, ms: number): Promise<T> => {
   const result = await Promise.race([
@@ -194,15 +208,20 @@ describe("ownership R28-1 ResourceJob", () => {
     clearFailpoints();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     clearFailpoints();
-    for (const id of ids.splice(0)) {
+    const batch = ids.splice(0);
+    for (const id of batch) {
       agentSessions.delete(id);
       runningTasks.delete(id);
       clearTaskStarting(id);
       clearResourceJobs(id);
       clearChatGate(id);
       cleanupChatTaskState(id);
+    }
+    // 先等迟到的写盘落完，再清目录（见 quiesceTask）
+    await Promise.all(batch.map(quiesceTask));
+    for (const id of batch) {
       try {
         rmSync(taskDir(id), { recursive: true, force: true });
       } catch {

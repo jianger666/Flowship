@@ -401,6 +401,8 @@ ai-flow-action-hub/
 
 > **v1.9.35（2026-10-22）发版范围**：下面标「下一版（未发布）· 第二～十二轮外部评审修复」的各块（含第八轮后续的 N1-03 托盘轮询）随 v1.9.35 一并发出，标题里的「未发布」不再逐块改；发没发成以 GitHub Releases 为准。这批改动的 UI 部分发版时**仍未经本机验证**（输入法组字 / 撤销栈 / 分栏拖拽 / Electron 点通知 / 托盘 10 分钟扫描，清单见第四轮块末与第八轮后续块末）——发版前已向用户明确提示这一点，用户回复「按推荐」后发出（没有单独确认「已亲自看过」）。
 
+> **v1.9.35 首次 tag 的 CI 红了（Linux `verify` 单测）**：701 个文件全过、只有 1 条 `Unhandled Rejection: EnvironmentTeardownError: Closing rpc while "onUserConsoleLog" was pending`（归因到 `ownership-r28-resource`）。原因：测试结束时 finalize / prewarm 链尾还有没人 await 的写盘（`appendEvent` 的 meta touch、meta.json.bak 刷新），目录一被清就 ENOENT、各打一条 console.warn，这条日志落在文件收尾之后，vitest 关 worker rpc 时还没送完 → 整次运行退出码 1。修法（只改测试）：`ownership-r28-resource` 的 `afterEach` 先排空任务锁（固定 5 轮 × 40ms，**时间裕量、不是同步点**）再清目录；`tests/setup/hermetic-env.ts` 的 `afterAll` 在删临时数据目录前让出 50ms（用模块加载时抓的真 `setTimeout`——第一版用全局 `setTimeout`，被 `vi.useFakeTimers()` 的 `warmup-scheduler` 卡成 hook 超时，已改）。**⚠ 本机一直没复现这类红的原因**：Cursor agent 的 shell 里有 `CURSOR_AGENT` 环境变量，vitest 检测到会进「agent 模式」、**不转发 console 输出**，于是永远不会有「日志还在路上」这种红；CI（和你自己在终端里跑）会转发。**要在本机模拟 CI：`env -u CURSOR_AGENT -u NODE_ENV CI=true pnpm vitest run`**（`NODE_ENV` 也会被宿主设成 `production`）。模拟 CI 的全量里，「文件收尾之后才发出的日志」从每次 6~8 条降到 0 条（3 次）；但这个红本身我**没在本机复现过**（修前模拟 CI 全量 2/2 也是绿的），所以「修好了」的证据是这个间接指标 + 3/3 全绿，不是红→绿对照。
+
 ### 下一版（未发布）· 第十二轮外部评审复核（2026-10-22，无代码改动）
 
 > 来源：另一个 AI 对第十一轮修复的复核（报告同时补交了他自己漏交的第十一轮结论）。**结论：作者上一轮回复里的说法全部核实属实，没有新的代码级问题，不需要再改代码**。这一轮我没动任何文件，只在这里记录复核的事实。
