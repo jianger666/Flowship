@@ -1053,6 +1053,13 @@ export const ChatView = ({
               )}
             </div>
           </div>
+          {/* 右上角：代码改动入口（当前分支相对线上分支的全部改动，含已提交 + 未提交）。
+              原来挤在输入框上方的工具行里、和目录 / 分支 / MCP 排成一串，用户找不到——那一行放的是
+              「发送前要选的上下文」，页面级入口该在页面头部。xs 尺寸 = 标题栏一行的高度，
+              入口异步出现 / 消失时标题栏不跳。换工作目录就整个重挂，免得带着上一个目录的范围 / 基线 */}
+          <div className="flex shrink-0 items-center gap-2">
+            <TaskChangesPanel key={`${task.id}:${task.workCwd ?? ""}`} task={task} size="xs" />
+          </div>
         </div>
         {statusHint && (
           <div className="mt-1 w-full text-xs text-muted-foreground">
@@ -1099,9 +1106,6 @@ export const ChatView = ({
                 onTaskUpdate={onTaskUpdate}
               />
               <BranchSwitcher task={task} variant="select" />
-              {/* 当前分支相对线上分支的全部改动（含已提交 + 未提交）；换工作目录就整个重挂，
-                  免得带着上一个目录的范围 / 基线 */}
-              <TaskChangesPanel key={`${task.id}:${task.workCwd ?? ""}`} task={task} />
               <ChatMcpPicker task={task} onTaskUpdate={onTaskUpdate} />
             </>
           }

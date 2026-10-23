@@ -3,12 +3,16 @@
 /**
  * 事件流左侧「提问时间线」（chat / task 共用，仿 Codex）。
  *
- * - **折叠态**：贴左边缘一列细刻度（一次提问一格，超过 36 次按比例并格），当前正在看的那一轮刻度拉长加深；
- *   跳转到窗口之外时目标刻度脉冲（点完面板就收起了，这是折叠态唯一的「正在找」反馈，另有 EventStream 的延迟 toast）；
- *   刻度列总宽 < 16px（与 task 形态 px-4 的内容区左缘错开、不压正文）；
- *   点刻度直接跳到那一轮；
+ * - **折叠态**：顶上一个小图标（让它读作「一个控件」而不是装饰线）+ 一列刻度（一次提问一格，超过 36 次按比例并格），
+ *   当前正在看的那一轮刻度拉长加深；跳转到窗口之外时目标刻度脉冲（点完面板就收起了，这是折叠态唯一的
+ *   「正在找」反馈，另有 EventStream 的延迟 toast）；点刻度直接跳到那一轮；
+ *   位置由 `anchor` 定：task 形态贴事件区最左缘；chat 形态贴**居中内容列的左缘外侧**——chat 内容居中、两侧是大片
+ *   空白，贴最左缘时它离正文几百 px、在余光里根本看不见（用户反馈「我都不知道左边有个这个」）；
+ *   整条宽度 < 16px：落在正文左侧的内边距里（task px-4 / chat px-6），不压正文；
  * - **展开态**（鼠标移上去 / 点一下 / 键盘 Enter 展开）：实心浮层，按日期分组列出每次提问的时刻 + 两行预览，
  *   当前轮用 `bg-selected` 高亮、打开时自动滚到它；点一行跳转并收起（好让用户看到跳到的内容）；
+ *   朝向：把手左侧放得下就向左开（落在左侧空白区、不盖正文），放不下才向右开（`pickOutlinePanelSide`）；
+ *   向右开时面板钉回事件区最左缘（`outlinePanelRightShift`）：对正文的覆盖量与旧版（把手本来就贴最左缘）逐档相等；
  * - **定时触发**（AI 给自己设的定时到点后落盘的 user_reply）默认不列，面板里有开关、偏好记在 localStorage；
  * - 项不足 2 个就整条不画（只有一次提问的对话没有「时间」可导航）。
  *
@@ -20,12 +24,13 @@ import {
   memo,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
-import { Clock, Flag, Loader2 } from "lucide-react";
+import { Clock, Flag, ListTree, Loader2 } from "lucide-react";
 
 import { Switch } from "@/components/ui/switch";
 import { useTodayStart } from "@/hooks/use-today-start";
@@ -33,10 +38,13 @@ import {
   bucketOutlineTicks,
   formatOutlineTime,
   groupOutlineRows,
+  outlinePanelRightShift,
+  pickOutlinePanelSide,
   resolveVisibleActiveId,
   visibleOutline,
   type ActiveOutlineStore,
   type OutlineItem,
+  type OutlinePanelSide,
 } from "@/lib/stream-outline";
 import { loadOutlineShowSchedule, saveOutlineShowSchedule } from "@/lib/view-memory";
 import { cn } from "@/lib/utils";
@@ -46,6 +54,17 @@ const HOVER_OPEN_DELAY_MS = 80;
 const HOVER_CLOSE_DELAY_MS = 160;
 /** 不足这么多个可见项就不画 */
 const MIN_VISIBLE_ITEMS = 2;
+
+/**
+ * chat 形态（anchor="column"）把手的 `left`：贴居中内容列（`max-w-3xl` = 48rem）的左缘外侧。
+ * - 事件区宽 100%，Virtuoso 右侧留 8px 滚动条槽（scrollbar-gutter: stable），内容列居中在剩下的宽度里，
+ *   所以列左缘 = (100% - 8px - 48rem) / 2；
+ * - 再往左挪 6px：把手（宽 ≤ 14px）占 [列左缘 - 6px, 列左缘 + 8px]，而正文从列左缘 + 24px（px-6）才开始，
+ *   中间还剩 16px 空隙——贴得够近、一眼能和正文联系起来，又不压字；
+ * - 窗口窄到内容列顶满时 max(2px, …) 把它夹回最左缘，与 task 形态的 left-0.5 同位、整条仍落在 px-6 的内边距里。
+ * 48rem 必须与 EventStream 里 chat 内容列的 `max-w-3xl` 同步（契约测试钉着）。
+ */
+const COLUMN_ANCHOR_LEFT = "max(2px, calc((100% - 8px - 48rem) / 2 - 6px))";
 
 const noActive = (): null => null;
 
@@ -58,6 +77,13 @@ interface StreamOutlineRailProps {
   onJump: (eventId: string) => void;
   /** 正在往前加载、要跳去的那一项（该项显示加载中；跳转进行时不重复触发） */
   jumpingId: string | null;
+  /**
+   * 把手放哪：
+   * - `edge`（默认，task 形态）：贴事件区最左缘——task 内容铺满，最左缘就在正文旁；
+   * - `column`（chat 形态）：贴居中内容列的左缘外侧——chat 内容居中、两侧是大片空白，
+   *   贴最左缘离正文几百 px，在余光里看不见。
+   */
+  anchor?: "edge" | "column";
 }
 
 export const StreamOutlineRail = memo(function StreamOutlineRail({
@@ -65,12 +91,16 @@ export const StreamOutlineRail = memo(function StreamOutlineRail({
   activeStore,
   onJump,
   jumpingId,
+  anchor = "edge",
 }: StreamOutlineRailProps) {
   const panelId = useId();
   const today0 = useTodayStart();
   const [showSchedule, setShowSchedule] = useState(false);
   const [hoverOpen, setHoverOpen] = useState(false);
   const [pinned, setPinned] = useState(false);
+  const [panelSide, setPanelSide] = useState<OutlinePanelSide>("right");
+  // 向右开时面板 `left` 的像素值（≤ 0，把面板拉回事件区最左缘）；向左开用不到
+  const [panelShiftPx, setPanelShiftPx] = useState(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -111,6 +141,18 @@ export const StreamOutlineRail = memo(function StreamOutlineRail({
   const rows = useMemo(() => groupOutlineRows(visible, today0 + 12 * 3600_000), [visible, today0]);
 
   const open = hoverOpen || pinned;
+
+  // 展开那一刻量一次把手左侧还剩多少空间，决定面板往哪边开、向右开时往回拉多少（layout effect：在绘制前定好，
+  // 用户看不到先错位再跳）。只在展开时量：展开期间改窗口大小不动它——面板正在被看，中途翻面比继续用旧朝向更扎眼
+  useLayoutEffect(() => {
+    if (!open) return;
+    const root = rootRef.current;
+    if (!root) return;
+    // root 是 absolute、相对事件区定位：offsetLeft 就是把手左缘到事件区左缘的距离
+    const roomLeft = root.offsetLeft;
+    setPanelSide(pickOutlinePanelSide(roomLeft));
+    setPanelShiftPx(outlinePanelRightShift(roomLeft));
+  }, [open]);
 
   // 展开时把当前轮滚到面板中间（手算 scrollTop：scrollIntoView 会连带滚外层）
   useEffect(() => {
@@ -165,7 +207,11 @@ export const StreamOutlineRail = memo(function StreamOutlineRail({
       ref={rootRef}
       role="navigation"
       aria-label="提问时间线"
-      className="pointer-events-none absolute inset-y-0 left-0.5 z-20 flex items-center"
+      className={cn(
+        "pointer-events-none absolute inset-y-0 z-20 flex items-center",
+        anchor === "edge" && "left-0.5",
+      )}
+      style={anchor === "column" ? { left: COLUMN_ANCHOR_LEFT } : undefined}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       onBlur={(e) => {
@@ -189,8 +235,13 @@ export const StreamOutlineRail = memo(function StreamOutlineRail({
         aria-busy={jumpingId ? true : undefined}
         aria-controls={open ? panelId : undefined}
         onClick={() => setPinned((p) => !p)}
-        className="pointer-events-auto flex max-h-full flex-col items-start justify-center overflow-hidden rounded-md py-1 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+        className="group/rail pointer-events-auto flex max-h-full flex-col items-start justify-center overflow-hidden rounded-md py-1 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
       >
+        {/* 把手图标：没有它整条只是几根浅灰细线，读起来是装饰、不是能点的控件 */}
+        <ListTree
+          aria-hidden
+          className="mb-1 size-3 shrink-0 text-muted-foreground transition-colors group-hover/rail:text-foreground group-focus-visible/rail:text-foreground motion-reduce:transition-none"
+        />
         {ticks.map((t) => {
           const first = visible[t.first]!;
           const isActive = activeIndex >= t.first && activeIndex <= t.last;
@@ -208,13 +259,15 @@ export const StreamOutlineRail = memo(function StreamOutlineRail({
             >
               <span
                 className={cn(
-                  "h-0.5 rounded-full transition-[width,background-color] motion-reduce:transition-none",
+                  // 3px 粗：原来 2px × 6px 的 bg-border（对白底约 1.2:1）几乎看不见。非当前刻度是可点控件的图形部分，
+                  // 要过 WCAG 1.4.11 的 3:1（它不是文字，所以「文字不叠 alpha / 4.5:1」不适用）：/60 浅色只有 2.7:1，/70 是 3.3:1
+                  "h-[3px] rounded-full transition-[width,background-color] motion-reduce:transition-none",
                   // 跳转目标刻度：加长 + 变深 + 脉冲（减少动态效果时只剩加长变深，不靠动画传达）
                   isJumpTarget
                     ? "w-3 animate-pulse bg-muted-foreground motion-reduce:animate-none"
                     : isActive
                       ? "w-3 bg-foreground"
-                      : "w-1.5 bg-border group-hover/tick:bg-muted-foreground",
+                      : "w-2 bg-muted-foreground/70 group-hover/tick:bg-foreground",
                 )}
               />
             </span>
@@ -225,7 +278,15 @@ export const StreamOutlineRail = memo(function StreamOutlineRail({
       {open && (
         <div
           id={panelId}
-          className="pointer-events-auto absolute top-1/2 left-0 flex max-h-[calc(100%-1rem)] w-72 -translate-y-1/2 flex-col rounded-lg border border-border bg-background shadow-sm animate-in fade-in-0 duration-150 motion-reduce:animate-none"
+          className={cn(
+            "pointer-events-auto absolute top-1/2 flex max-h-[calc(100%-1rem)] w-72 -translate-y-1/2 flex-col rounded-lg border border-border bg-background shadow-sm animate-in fade-in-0 duration-150 motion-reduce:animate-none",
+            // 向左开：右缘贴把手左缘（留 4px 缝）；向右开的 left 走下面的 style（要按把手离最左缘多远来算）。
+            // w-72 / mr-1 与 stream-outline.ts 里的 OUTLINE_PANEL_WIDTH_PX / OUTLINE_PANEL_GAP_PX 同值
+            panelSide === "left" && "right-full mr-1",
+          )}
+          // 向右开：把面板拉回事件区最左缘（盖住把手，与老行为一致）。chat 把手离最左缘可能有几百 px，
+          // 若与把手左缘对齐，窄窗口里会固定盖住正文 258px，比旧版（面板钉在最左缘）多盖 100~250px
+          style={panelSide === "right" ? { left: panelShiftPx } : undefined}
         >
           <div className="flex shrink-0 items-center justify-between gap-2 px-3 pt-2 pb-1">
             <span className="text-xs font-medium">提问时间线</span>

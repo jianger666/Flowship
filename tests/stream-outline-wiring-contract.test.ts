@@ -16,6 +16,14 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import {
+  OUTLINE_EDGE_INSET_PX,
+  OUTLINE_PANEL_GAP_PX,
+  OUTLINE_PANEL_WIDTH_PX,
+  outlinePanelRightShift,
+  pickOutlinePanelSide,
+} from "@/lib/stream-outline";
+
 const srcDir = path.resolve(import.meta.dirname, "..", "src");
 const read = (...p: string[]): string => readFileSync(path.join(srcDir, ...p), "utf-8");
 
@@ -199,10 +207,18 @@ describe("event-stream 接线：loadEarlier 的 until 模式", () => {
 });
 
 describe("event-stream 接线：渲染", () => {
-  it("时间线只在事件流视图渲染（!showQaPanel），带稳定 props", () => {
+  it("时间线只在事件流视图渲染（!showQaPanel），带稳定 props；chat 贴内容列、task 贴最左缘", () => {
     expect(code).toMatch(
-      /\{!showQaPanel && \(\s*<StreamOutlineRail\s+items=\{railItems\}\s+activeStore=\{outlineActiveStore\}\s+onJump=\{onOutlineJump\}\s+jumpingId=\{jumpingId\}\s*\/>\s*\)\}/,
+      /\{!showQaPanel && \(\s*<StreamOutlineRail\s+items=\{railItems\}\s+activeStore=\{outlineActiveStore\}\s+onJump=\{onOutlineJump\}\s+jumpingId=\{jumpingId\}\s+anchor=\{isChat \? "column" : "edge"\}\s*\/>\s*\)\}/,
     );
+  });
+
+  it("chat 把手的 48rem 与事件流里 chat 内容列的 max-w-3xl 同宽（改一处必须改另一处，否则把手会悬在离正文很远的地方）", () => {
+    // 事件流：chat 内容列 = 居中 + max-w-3xl（48rem）+ px-6（正文从列左缘 + 24px 起）
+    expect(code).toContain('isChat && "mx-auto w-full max-w-3xl px-6"');
+    const rail = stripComments(read("components", "tasks", "stream-outline-rail.tsx"));
+    // 48rem = max-w-3xl；8px = Virtuoso 的 scrollbar-gutter；6px = 往列左缘外挪的量（把手 ≤ 14px 宽 → 离正文还剩 16px）
+    expect(rail).toContain('const COLUMN_ANCHOR_LEFT = "max(2px, calc((100% - 8px - 48rem) / 2 - 6px))"');
   });
 
   it("时间线渲染在与 Virtuoso 同一个 relative 容器里（absolute 定位靠它）、且在 Virtuoso 之前", () => {
@@ -290,6 +306,121 @@ describe("时间线组件", () => {
   it("展开定位当前轮用手算 scrollTop，不用会连带滚外层的 scrollIntoView", () => {
     expect(src).not.toContain("scrollIntoView");
     expect(src).toContain("list.scrollTop =");
+  });
+
+  it("可发现性：折叠态有图标把手；刻度 3px 粗、非当前刻度不再是看不见的 bg-border", () => {
+    // 用户反馈「都不知道左边有个这个」：老版本是 2px × 6px 的 bg-border 细线（对白底约 1.2:1）、没有任何控件标识
+    expect(src).toContain("<ListTree");
+    expect(src).toContain('"h-[3px] rounded-full ');
+    expect(src).not.toMatch(/\bbg-border\b/);
+  });
+
+  it("非当前刻度的对比度：alpha ≥ 70（浅色页面底 3.28:1）——可点控件的图形要过 WCAG 1.4.11 的 3:1，/60 只有 2.68:1", () => {
+    // 从源码里解析 alpha（不透明 = 100 也算过）：谁改回 /60 或更淡就红。
+    // 算法：--muted-foreground oklch(0.46 0.01 264) 按 alpha 叠在 --background oklch(0.967 0.002 247) 上，WCAG 相对亮度——
+    // 浅色 /50 2.21、/60 2.68、/70 3.28、/80 4.07、不透明 6.48；深色 /60 就有 3.40。
+    // 刻度是控件图形、不是文字：「文字不叠 alpha / 4.5:1」（ui-conventions）不适用，适用的是非文本对比度 3:1
+    const m = /"w-2 bg-muted-foreground(?:\/(\d+))? /.exec(src);
+    expect(m, "非当前刻度的写法变了：同步改这里的解析").not.toBeNull();
+    const alpha = m![1] === undefined ? 100 : Number(m![1]);
+    expect(alpha).toBeGreaterThanOrEqual(70);
+  });
+
+  it("anchor：默认 edge 贴最左缘（left-0.5）；column 走内联 left（COLUMN_ANCHOR_LEFT）", () => {
+    expect(src).toContain('anchor = "edge"');
+    expect(src).toContain('anchor === "edge" && "left-0.5"');
+    expect(src).toContain('style={anchor === "column" ? { left: COLUMN_ANCHOR_LEFT } : undefined}');
+  });
+
+  it("展开面板朝向：展开那一刻（layout effect，绘制前）量把手左侧空间，放得下向左开、放不下向右开并拉回最左缘", () => {
+    expect(src).toMatch(
+      /useLayoutEffect\(\(\) => \{\s*if \(!open\) return;\s*const root = rootRef\.current;\s*if \(!root\) return;\s*const roomLeft = root\.offsetLeft;\s*setPanelSide\(pickOutlinePanelSide\(roomLeft\)\);\s*setPanelShiftPx\(outlinePanelRightShift\(roomLeft\)\);\s*\}, \[open\]\)/,
+    );
+    expect(src).toContain('panelSide === "left" && "right-full mr-1"');
+    // 面板宽 w-72（288px）/ 缝 mr-1（4px）与纯函数里的常量同值：量的空间要和实际占的空间对得上
+    expect(src).toMatch(/\bw-72\b/);
+    const lib = stripComments(read("lib", "stream-outline.ts"));
+    expect(lib).toContain("export const OUTLINE_PANEL_WIDTH_PX = 288;");
+    expect(lib).toContain("export const OUTLINE_PANEL_GAP_PX = 4;");
+    // 向右开：面板左缘走 inline style（值 = outlinePanelRightShift，≤ 0）、不再写死 left-0 跟着把手左缘走；
+    // 落点常量（2px）与 task 形态把手的 left-0.5（0.125rem）= 旧版面板的位置同值
+    expect(src).toContain('style={panelSide === "right" ? { left: panelShiftPx } : undefined}');
+    // 面板开头标签（id → style）里不许再写 left-0：会让向右开的面板重新跟着把手左缘走（窄窗口固定多盖正文 258px）
+    const panelStart = src.indexOf("id={panelId}");
+    const panelStyle = src.indexOf('style={panelSide === "right"');
+    expect(panelStart).toBeGreaterThan(-1);
+    expect(panelStyle).toBeGreaterThan(panelStart);
+    expect(src.slice(panelStart, panelStyle)).not.toMatch(/(?<![\w-])left-0(?![\w.])/);
+    expect(src).toContain('anchor === "edge" && "left-0.5"');
+    expect(lib).toContain("export const OUTLINE_EDGE_INSET_PX = 2;");
+    expect(OUTLINE_EDGE_INSET_PX).toBe(0.125 * 16);
+  });
+
+  it("几何：chat 把手（14px 宽）在任何窗口宽度下都不压正文——与正文（内容列左缘 + 24px）至少留 8px", () => {
+    // 从源码的公式字符串里解析各个量，而不是在测试里另写一份：谁改了偏移量，这里按数值重算，压到正文就红
+    const m =
+      /COLUMN_ANCHOR_LEFT = "max\((\d+)px, calc\(\(100% - (\d+)px - (\d+)rem\) \/ 2 - (\d+)px\)\)"/.exec(src);
+    expect(m, "COLUMN_ANCHOR_LEFT 的写法变了：同步改这里的解析").not.toBeNull();
+    const [minLeft, gutter, columnRem, shift] = m!.slice(1, 5).map(Number) as [
+      number,
+      number,
+      number,
+      number,
+    ];
+    const column = columnRem * 16; // 内容列宽（max-w-3xl = 48rem）
+    const railWidth = 14; // 刻度 span 的 w-3.5（图标 size-3 = 12px 更窄）
+    expect(src).toContain("h-2.5 w-3.5");
+    const textInset = 24; // chat 内容列的 px-6：正文从列左缘 + 24px 才开始
+    for (let w = 320; w <= 3200; w += 8) {
+      const colLeft = Math.max(0, (w - gutter - column) / 2); // 内容列左缘（窗口窄到顶满时贴 0）
+      const left = Math.max(minLeft, (w - gutter - column) / 2 - shift); // calc 里的 100% 就是事件区宽 w
+      const gap = colLeft + textInset - (left + railWidth); // 把手右缘 → 正文左缘
+      expect(gap, `事件区宽 ${w}px`).toBeGreaterThanOrEqual(8);
+    }
+  });
+
+  it("几何：窄窗口向右开的面板对正文的覆盖量与旧版（面板钉在最左缘）逐档相等；向左开的一点不盖、也不跑出事件区", () => {
+    // 背景（R12 评审抓到）：把手搬到内容列旁边后，向右开的面板若还与把手左缘对齐，会固定盖住正文 258px，
+    // 而旧版（把手和面板都在最左缘）只盖 max(0, 266 - 内容列左缘)——事件区 1000px 时多盖 104px、1300px 时多盖 254px。
+    // 与上一条同样从源码公式里解析把手位置（谁改了偏移量，这里按数值重算），再用真实的纯函数算面板落点
+    const m =
+      /COLUMN_ANCHOR_LEFT = "max\((\d+)px, calc\(\(100% - (\d+)px - (\d+)rem\) \/ 2 - (\d+)px\)\)"/.exec(src);
+    expect(m, "COLUMN_ANCHOR_LEFT 的写法变了：同步改这里的解析").not.toBeNull();
+    const [minLeft, gutter, columnRem, shift] = m!.slice(1, 5).map(Number) as [
+      number,
+      number,
+      number,
+      number,
+    ];
+    const column = columnRem * 16;
+    const textInset = 24; // chat 内容列的 px-6：正文从列左缘 + 24px 才开始
+    // 面板区间 [panelLeft, panelRight] 与正文区间 [textLeft, +∞) 的交叠宽度
+    const overlap = (panelLeft: number, panelRight: number, textLeft: number): number =>
+      Math.max(0, panelRight - Math.max(panelLeft, textLeft));
+    // 旧版：把手贴最左缘（left-0.5），面板左缘与把手对齐 → [2, 2 + 288]
+    const legacyRight = OUTLINE_EDGE_INSET_PX + OUTLINE_PANEL_WIDTH_PX;
+    const opened = { left: 0, right: 0 };
+    for (let w = 320; w <= 3200; w += 8) {
+      const railLeft = Math.max(minLeft, (w - gutter - column) / 2 - shift); // = 展开时量到的 root.offsetLeft
+      const textLeft = Math.max(0, (w - gutter - column) / 2) + textInset;
+      if (pickOutlinePanelSide(railLeft) === "left") {
+        opened.left += 1;
+        const panelRight = railLeft - OUTLINE_PANEL_GAP_PX;
+        const panelLeft = panelRight - OUTLINE_PANEL_WIDTH_PX;
+        expect(overlap(panelLeft, panelRight, textLeft), `事件区宽 ${w}px 向左开`).toBe(0);
+        expect(panelLeft, `事件区宽 ${w}px 向左开的面板左缘（不能跑出事件区）`).toBeGreaterThanOrEqual(0);
+      } else {
+        opened.right += 1;
+        const panelLeft = railLeft + outlinePanelRightShift(railLeft);
+        expect(panelLeft, `事件区宽 ${w}px 向右开的面板左缘`).toBe(OUTLINE_EDGE_INSET_PX);
+        expect(overlap(panelLeft, panelLeft + OUTLINE_PANEL_WIDTH_PX, textLeft), `事件区宽 ${w}px 向右开`).toBe(
+          overlap(OUTLINE_EDGE_INSET_PX, legacyRight, textLeft),
+        );
+      }
+    }
+    // 两个分支都真的走到过：别因为公式变了、循环里一边永远不进而空转
+    expect(opened.left).toBeGreaterThan(0);
+    expect(opened.right).toBeGreaterThan(0);
   });
 });
 

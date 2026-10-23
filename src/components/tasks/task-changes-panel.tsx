@@ -3,7 +3,9 @@
 /**
  * 代码改动预览入口（task 与 chat 共用）：看到现在改了什么、代码有没有问题，不用再开 IDE。
  *
- * - 入口：头部 chip 行 / chat 输入框上方的「改动 N +a −r」小按钮（数字随 agent 运行实时涨）
+ * - 入口：task 页头部 chip 行 / chat 页标题栏右上角的「改动 N +a −r」小按钮（数字随 agent 运行实时涨）
+ *   （chat 原来挂在输入框上方的工具行里，和目录 / 分支 / MCP 排成一串，用户反馈找不到——那一行放的是
+ *   「发送前要选的上下文」，不是页面级入口）
  * - 面板：右侧非模态 Sheet（边看任务 / 对话边看 diff），见 changes/changes-sheet.tsx
  *   左边按仓分组的文件树（搜索、已查看进度），右边单文件 diff（统一 / 分栏、词级 + 语法高亮、
  *   展开上下文、选中行引用到对话、j/k/n/p 快捷键……）
@@ -40,9 +42,15 @@ import type { Task, TaskChangeScope } from "@/lib/types";
 
 interface Props {
   task: Task;
+  /**
+   * 入口按钮尺寸：默认 `sm`（28px，task 页头部 chip 行里与其他 chip 同高）；
+   * chat 页标题栏右上角用 `xs`（24px = 标题栏一行的高度）——用 sm 会把标题栏撑高 4px，
+   * 而入口要等数据回来才出现，标题栏会在加载完的那一刻跳一下
+   */
+  size?: "sm" | "xs";
 }
 
-export const TaskChangesPanel = ({ task }: Props) => {
+export const TaskChangesPanel = ({ task, size = "sm" }: Props) => {
   const chat = task.mode === "chat";
   // task：工作区已启动且绑了仓；chat：选了工作目录（repoPaths[0]）
   const enabled = canLoadChanges(task);
@@ -122,7 +130,7 @@ export const TaskChangesPanel = ({ task }: Props) => {
             : "查看本任务相对线上分支的全部代码改动"
         }
       >
-        <Button type="button" variant="outline" size="sm" onClick={() => setOpen(true)}>
+        <Button type="button" variant="outline" size={size} onClick={() => setOpen(true)}>
           <FileDiff />
           改动
           {totals.files > 0 && (

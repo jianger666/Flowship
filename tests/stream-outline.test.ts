@@ -12,7 +12,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  OUTLINE_EDGE_INSET_PX,
   OUTLINE_MAX_TICKS,
+  OUTLINE_PANEL_GAP_PX,
+  OUTLINE_PANEL_WIDTH_PX,
   OUTLINE_PREVIEW_MAX,
   bucketOutlineTicks,
   createActiveOutlineStore,
@@ -21,6 +24,8 @@ import {
   formatOutlineTime,
   groupOutlineRows,
   mergeOutline,
+  outlinePanelRightShift,
+  pickOutlinePanelSide,
   previewText,
   resolveActiveOutlineId,
   resolveVisibleActiveId,
@@ -250,6 +255,72 @@ describe("bucketOutlineTicks：折叠态刻度并格", () => {
         if (i > 0) expect(t.first).toBe(ticks[i - 1]!.last + 1);
       });
     }
+  });
+});
+
+describe("pickOutlinePanelSide：展开面板往哪边开", () => {
+  const need = OUTLINE_PANEL_WIDTH_PX + OUTLINE_PANEL_GAP_PX;
+
+  it("把手左侧放得下整块面板（含缝）→ 向左开：面板落在左侧空白区、不盖正文", () => {
+    expect(pickOutlinePanelSide(need)).toBe("left");
+    expect(pickOutlinePanelSide(need + 1)).toBe("left");
+    // 1830px 宽的事件区里 chat 把手离左缘的距离：(1830 - 8 - 768) / 2 - 6
+    expect(pickOutlinePanelSide(521)).toBe("left");
+  });
+
+  it("差一个像素放不下 → 向右开（窄窗口 / task 形态把手贴最左缘：与老行为一致）", () => {
+    expect(pickOutlinePanelSide(need - 1)).toBe("right");
+    expect(pickOutlinePanelSide(2)).toBe("right"); // task 形态的 left-0.5
+    expect(pickOutlinePanelSide(0)).toBe("right");
+  });
+
+  it("量不出来（NaN）/ 负数按放不下算：宁可盖住一点正文，也不让面板跑到事件区外面被裁掉", () => {
+    expect(pickOutlinePanelSide(Number.NaN)).toBe("right");
+    expect(pickOutlinePanelSide(-10)).toBe("right");
+  });
+
+  it("面板宽 / 缝是 w-72（18rem）/ mr-1（0.25rem）的像素值", () => {
+    expect(OUTLINE_PANEL_WIDTH_PX).toBe(18 * 16);
+    expect(OUTLINE_PANEL_GAP_PX).toBe(0.25 * 16);
+  });
+});
+
+describe("outlinePanelRightShift：向右开时把面板拉回事件区最左缘", () => {
+  const need = OUTLINE_PANEL_WIDTH_PX + OUTLINE_PANEL_GAP_PX;
+
+  it("task 形态把手本来就在 2px（left-0.5）→ 0：面板与把手左缘对齐，与老行为一致", () => {
+    expect(outlinePanelRightShift(2)).toBe(0);
+  });
+
+  it("chat 窄窗口：把手离最左缘越远拉回得越多，面板左缘恒落在 2px（覆盖量与旧版逐档相等）", () => {
+    // 事件区 1000px：把手左缘 (1000 - 8 - 768) / 2 - 6 = 106
+    expect(outlinePanelRightShift(106)).toBe(-104);
+    // 事件区 1300px：(1300 - 8 - 768) / 2 - 6 = 256
+    expect(outlinePanelRightShift(256)).toBe(-254);
+    for (let left = OUTLINE_EDGE_INSET_PX; left < need; left++) {
+      expect(left + outlinePanelRightShift(left), `把手左缘 ${left}px`).toBe(OUTLINE_EDGE_INSET_PX);
+    }
+  });
+
+  it("刚好放不下左开（差 1px）也照样拉回：面板右缘 = 2 + 288 = 290px", () => {
+    const left = need - 1;
+    expect(pickOutlinePanelSide(left)).toBe("right");
+    expect(left + outlinePanelRightShift(left) + OUTLINE_PANEL_WIDTH_PX).toBe(
+      OUTLINE_EDGE_INSET_PX + OUTLINE_PANEL_WIDTH_PX,
+    );
+  });
+
+  it("比 2px 更靠左 / 负数 / 量不出来（NaN、±Infinity）→ 0：只往左拉，不往右推、不乱飞", () => {
+    expect(outlinePanelRightShift(1)).toBe(0);
+    expect(outlinePanelRightShift(0)).toBe(0);
+    expect(outlinePanelRightShift(-10)).toBe(0);
+    expect(outlinePanelRightShift(Number.NaN)).toBe(0);
+    expect(outlinePanelRightShift(Number.POSITIVE_INFINITY)).toBe(0);
+    expect(outlinePanelRightShift(Number.NEGATIVE_INFINITY)).toBe(0);
+  });
+
+  it("落点常量是 left-0.5（0.125rem）的像素值", () => {
+    expect(OUTLINE_EDGE_INSET_PX).toBe(0.125 * 16);
   });
 });
 

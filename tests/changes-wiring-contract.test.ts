@@ -33,14 +33,34 @@ const expectNoMatch = (src: string, re: RegExp, label: string): void => {
 };
 
 describe("入口：只有两处，各管一种模式", () => {
-  it("chat：输入框上方的工具行挂入口，紧跟分支切换器，key 带工作目录（换目录重置面板状态）", () => {
+  it("chat：入口在页面头部右上角（标题栏右侧），不在输入框上方的工具行里；key 带工作目录（换目录重置面板状态）", () => {
     const src = read("components/tasks/chat-view.tsx");
     expect(src).toContain('import { TaskChangesPanel } from "@/components/tasks/task-changes-panel"');
-    const branch = src.indexOf('<BranchSwitcher task={task} variant="select" />');
+    // 只渲染一次：别处偷偷多挂会出现两个按钮、两套轮询
+    expect(src.match(/<TaskChangesPanel\b/g)).toHaveLength(1);
     const panel = src.indexOf("<TaskChangesPanel");
-    expect(branch).toBeGreaterThan(-1);
-    expect(panel).toBeGreaterThan(branch);
-    expect(src).toContain('<TaskChangesPanel key={`${task.id}:${task.workCwd ?? ""}`} task={task} />');
+    // 在标题栏里：标题 <h1> 之后、事件流 <EventStream 之前
+    expect(src.indexOf("<h1")).toBeGreaterThan(-1);
+    expect(panel).toBeGreaterThan(src.indexOf("<h1"));
+    expect(panel).toBeLessThan(src.indexOf("<EventStream"));
+    // 输入框上方的工具行（composerTop：目录 / 分支 / MCP，都是「发送前要选的上下文」）里不再有它——
+    // 用户反馈：混在那一串里找不到
+    const topAt = src.indexOf("composerTop={");
+    expect(topAt).toBeGreaterThan(-1);
+    expect(src.slice(topAt)).not.toContain("<TaskChangesPanel");
+    // 工具行本身没被误删：分支切换器仍在
+    expect(src.slice(topAt)).toContain('<BranchSwitcher task={task} variant="select" />');
+    // key 带工作目录；尺寸 xs = 标题栏一行的高度（sm 会撑高标题栏，入口异步出现时标题栏会跳一下）
+    expect(src).toContain(
+      '<TaskChangesPanel key={`${task.id}:${task.workCwd ?? ""}`} task={task} size="xs" />',
+    );
+  });
+
+  it("入口按钮尺寸可选：默认 sm（与 task 头部 chip 行同高），chat 标题栏传 xs；尺寸透传给 Button", () => {
+    const src = code("components/tasks/task-changes-panel.tsx");
+    expect(src).toContain('size?: "sm" | "xs"');
+    expect(src).toContain('size = "sm"');
+    expect(src).toMatch(/<Button\s+type="button"\s+variant="outline"\s+size=\{size\}/);
   });
 
   it("task：入口在页面头部 chip 行，且在 chat 提前 return 之后——chat 页面不会出现两个入口", () => {

@@ -297,6 +297,46 @@ export const groupOutlineRows = (
   return rows;
 };
 
+/** 展开面板的宽度（px）。与 StreamOutlineRail 里面板的 `w-72`（18rem）同值——契约测试钉着，改一处必须改另一处 */
+export const OUTLINE_PANEL_WIDTH_PX = 288;
+/** 面板与刻度把手之间的间隙（px）。与面板的 `mr-1`（0.25rem）同值 */
+export const OUTLINE_PANEL_GAP_PX = 4;
+
+export type OutlinePanelSide = "left" | "right";
+
+/**
+ * 展开面板往哪一侧开。
+ *
+ * chat 形态下刻度把手贴着居中内容列的左缘（离事件区左边缘可能有几百 px）：
+ * - 把手左侧放得下整块面板（含间隙）→ 向左开：面板落在左侧空白区，不盖住居中的正文；
+ * - 放不下（窗口窄、内容列已顶到左缘；task 形态把手本来就贴最左缘）→ 向右开，盖住正文左侧——
+ *   面板钉回事件区最左缘（`outlinePanelRightShift`），对正文的覆盖量与「把手贴最左缘」时的老行为一致。
+ *
+ * @param roomLeftPx 把手左缘到事件区左缘的距离（px）；量不出来（NaN）按放不下算
+ */
+export const pickOutlinePanelSide = (roomLeftPx: number): OutlinePanelSide =>
+  roomLeftPx >= OUTLINE_PANEL_WIDTH_PX + OUTLINE_PANEL_GAP_PX ? "left" : "right";
+
+/**
+ * 向右开时面板左缘的落点：事件区最左缘往里这么多（px）。与 task 形态把手的 `left-0.5`（0.125rem）同值——
+ * 旧版面板就固定在这儿，向右开时对正文的覆盖量必须与旧版一致。
+ */
+export const OUTLINE_EDGE_INSET_PX = 2;
+
+/**
+ * 向右开时面板 `left` 的取值（px，相对把手左缘，≤ 0）：把面板拉回事件区最左缘。
+ *
+ * 为什么不让面板跟着把手左缘走：chat 把手贴着内容列、离最左缘可能有几百 px，窄窗口里它放不下左开；
+ * 此时若向右开还与把手左缘对齐，面板会**固定**盖住正文 258px（面板 288 − 把手左缘到正文的 30px），
+ * 而旧版（面板钉在最左缘）只盖 max(0, 266 − 内容列左缘)——事件区宽 1000px 时多盖 104px、1300px 时多盖 254px。
+ * 拉回最左缘后覆盖量与旧版逐档相等；task 形态把手本来就在 2px，结果是 0（行为不变）。
+ *
+ * @param roomLeftPx 把手左缘到事件区左缘的距离（px）；量不出来（非有限数）按 0 算（= 与把手左缘对齐）；
+ *   比 2px 更靠左也按 0 算（只往左拉、不往右推）
+ */
+export const outlinePanelRightShift = (roomLeftPx: number): number =>
+  Number.isFinite(roomLeftPx) ? Math.min(0, OUTLINE_EDGE_INSET_PX - roomLeftPx) : 0;
+
 /**
  * 「当前在看哪一轮」的外部小 store。
  *

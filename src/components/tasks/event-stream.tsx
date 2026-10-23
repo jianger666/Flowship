@@ -2539,13 +2539,16 @@ const EventStreamImpl = ({
           onBackToBottom={backToBottom}
         />
         )}
-        {/* 左侧提问时间线：只在事件流视图（群问答 tab 是另一份只读列表、轮次口径不同） */}
+        {/* 左侧提问时间线：只在事件流视图（群问答 tab 是另一份只读列表、轮次口径不同）。
+            chat 内容居中、两侧是大片空白：把手贴内容列左缘（贴最左缘离正文几百 px、没人注意得到）；
+            task 内容铺满：贴最左缘就是正文旁 */}
         {!showQaPanel && (
           <StreamOutlineRail
             items={railItems}
             activeStore={outlineActiveStore}
             onJump={onOutlineJump}
             jumpingId={jumpingId}
+            anchor={isChat ? "column" : "edge"}
           />
         )}
         {showQaPanel ? (
