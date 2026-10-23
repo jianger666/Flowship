@@ -199,6 +199,13 @@ const docxEntries = (text: string): ZipEntry[] => [
 
 const MB = 1024 * 1024;
 
+/**
+ * 要现场构造几十到上百 MB 压缩数据的用例（Buffer.alloc 大块 + deflate）：隔离跑也要 0.6–0.8 秒，
+ * 全量并行时被放大到 5 秒以上（本机全量实测超时过一次）。CI 的 2 核机器更慢，别靠默认 5s 碰运气。
+ * 只放宽超时、不改任何断言。
+ */
+const BIG_ZIP_TEST_MS = 60_000;
+
 const writeFile = async (name: string, data: Buffer | Uint8Array): Promise<string> => {
   const file = path.join(TMP, name);
   await fs.writeFile(file, data);
@@ -279,7 +286,7 @@ describe("zip 守卫 assertSafeOfficeZip", () => {
     expect(() => assertSafeOfficeZip(over, "docx")).toThrow(/单个文件.*压缩炸弹/);
     const ok = buildZip([{ name: "a", data: Buffer.alloc(MAX_OFFICE_ZIP_ENTRY_BYTES), deflate: true }]);
     expect(() => assertSafeOfficeZip(ok, "docx")).not.toThrow();
-  });
+  }, BIG_ZIP_TEST_MS);
 
   it("每个条目都不超单条上限、但总量超限也拒绝", () => {
     const each = 40 * MB; // < 单条上限；3 个 = 120MB > 总量上限
@@ -290,7 +297,7 @@ describe("zip 守卫 assertSafeOfficeZip", () => {
       [1, 2, 3].map((i) => ({ name: `part${i}`, data: Buffer.alloc(each), deflate: true })),
     );
     expect(() => assertSafeOfficeZip(zip, "xlsx")).toThrow(/总量.*压缩炸弹/);
-  });
+  }, BIG_ZIP_TEST_MS);
 
   it("条目数爆炸（> 上限）拒绝", () => {
     const entries = Array.from({ length: MAX_OFFICE_ZIP_ENTRIES + 1 }, (_, i) => ({
@@ -594,7 +601,7 @@ describe("谎报大小的 zip bomb：按真实解压量拒绝（assertSafeOffice
     const file = await writeFile("shrunk-count.docx", shrunk);
     await expect(readLocalFileForPreview(file)).rejects.toThrow(/目录结构有歧义/);
     expect(mammothCalled).toBe(false);
-  });
+  }, BIG_ZIP_TEST_MS);
 
   it("端到端（M3-01）：同样的手法对 xlsx：XLSX.read 之前就被拒", async () => {
     const zip = buildZip([
@@ -606,7 +613,7 @@ describe("谎报大小的 zip bomb：按真实解压量拒绝（assertSafeOffice
     vi.mocked(XLSX.read).mockClear();
     await expect(readLocalFileForPreview(file)).rejects.toThrow(/目录结构有歧义/);
     expect(XLSX.read).not.toHaveBeenCalled();
-  });
+  }, BIG_ZIP_TEST_MS);
 
   it("端到端（xlsx 纯 JS inflate 空转）：含「压缩后 / 解压后都声明 0 的空 deflate 条目」的 xlsx 在 XLSX.read 之前被拒", async () => {
     // XLSX.read 在这种文件上会同步空转数秒（实测 235 字节 ≈ 1~3 秒、每个条目叠加一次），必须根本没被调用；
@@ -800,7 +807,7 @@ describe("xlsx 预览（真实 xlsx 库）", () => {
     vi.mocked(XLSX.read).mockClear();
     await expect(readLocalFileForPreview(file)).rejects.toThrow(/压缩炸弹/);
     expect(XLSX.read).not.toHaveBeenCalled(); // 守卫先于解析器，解析器根本没被喂这个文件
-  });
+  }, BIG_ZIP_TEST_MS);
 
   it("旧版 .xls（CFB 而非 zip）：跳过 zip 守卫，仍可被解析器读出并预览", async () => {
     const wb = XLSX.utils.book_new();

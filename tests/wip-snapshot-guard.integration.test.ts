@@ -72,6 +72,13 @@ const makeTask = (repo: string, tag: string): Task => {
   } as unknown as Task;
 };
 
+/**
+ * 建子模块仓（主仓 + 子仓 + worktree + submodule update）的用例：隔离跑也要 0.7–1.3 秒，
+ * 全量并行时被放大到 5 秒以上（本机全量实测超时过一次）。CI 的 2 核机器更慢，别靠默认 5s 碰运气。
+ * 凡是调 setupSubmoduleTask 的用例都带上它（只放宽超时、不改任何断言）。
+ */
+const SUBMODULE_TEST_MS = 60_000;
+
 /** 带一个子模块（vendor/sub）的主仓 + 在 worktree 里把子模块拉起来 */
 const setupSubmoduleTask = async (tag: string) => {
   const sub = await initRepo(`${tag}-sub`);
@@ -106,7 +113,7 @@ describe("D2b-15：子模块里的未提交改动不得被判 clean", () => {
       fs.readFile(path.join(wd, "vendor", "sub", "f.txt"), "utf8"),
     ).resolves.toBe("DIRTY IN SUBMODULE\n");
     expect(git(repo, "worktree", "list")).toContain(wd);
-  });
+  }, SUBMODULE_TEST_MS);
 
   it("子模块里只有未跟踪的新文件（S..U）同样保留", async () => {
     const { repo, t, wd } = await setupSubmoduleTask("sm-untracked");
@@ -117,7 +124,7 @@ describe("D2b-15：子模块里的未提交改动不得被判 clean", () => {
     await expect(
       fs.readFile(path.join(wd, "vendor", "sub", "scratch.md"), "utf8"),
     ).resolves.toBe("只在子模块里\n");
-  });
+  }, SUBMODULE_TEST_MS);
 
   it("用户配了 diff.ignoreSubmodules=all（git status 默认就不报子模块）也拦得住——守卫强制 --ignore-submodules=none", async () => {
     const { repo, t, wd } = await setupSubmoduleTask("sm-ignoreall");
@@ -128,7 +135,7 @@ describe("D2b-15：子模块里的未提交改动不得被判 clean", () => {
     const removed = await removeTaskWorktrees(t);
     expect(removed.snapshotFailedRepos).toEqual([repo]);
     expect(removed.removedAny).toBe(false);
-  });
+  }, SUBMODULE_TEST_MS);
 
   it("对照：子模块干净时照常清理（不误伤）", async () => {
     const { repo, t, wd } = await setupSubmoduleTask("sm-clean");
@@ -137,7 +144,7 @@ describe("D2b-15：子模块里的未提交改动不得被判 clean", () => {
     expect(removed.removedAny).toBe(true);
     await expect(fs.access(wd)).rejects.toThrow();
     expect(git(repo, "worktree", "list")).not.toContain(wd);
-  });
+  }, SUBMODULE_TEST_MS);
 });
 
 describe("F1-05：未跟踪的嵌套 git 仓不得被「快照成 gitlink」后静默丢内容", () => {
@@ -255,7 +262,7 @@ describe("D2b-01 / F1-04：残留工作区清理（存储页）复用 WIP 快照
       "DIRTY\n",
     );
     expect(git(repo, "worktree", "list")).toContain(wd);
-  });
+  }, SUBMODULE_TEST_MS);
 
   it("force：用户在确认框里明确选「仍然删除」才越过守卫（没有这个出口，原仓被移走的残留目录永远删不掉）", async () => {
     const { repo, t, wd, dirName } = await setupStale("stale-force");

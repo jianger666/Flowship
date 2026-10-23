@@ -407,6 +407,24 @@ describe("只读与安全", () => {
       expect(src).toContain('"--no-show-signature"');
     });
 
+    it("忽略空白（-w）只加在 numstat 上：清单（name-status）和指纹（raw）一律不带——较新的 git 在 -w 下会把「只改了空白」的文件整行省略", () => {
+      // 行为测试（task-changes-scope.integration「忽略空白」）只有在较新的 git（实测 2.54.0）上才会红、2.42.0 抓不到——
+      // 所以这里再钉一条源码契约：不管本机装的是哪个 git 版本，回归都拦得住（v1.9.36 首跑 Linux CI 就是栽在这里）
+      const defAt = src.indexOf("const diffArgs = (...flags: string[])");
+      expect(defAt).toBeGreaterThan(-1);
+      const defEnd = src.indexOf("];", defAt);
+      expect(defEnd).toBeGreaterThan(defAt);
+      expect(src.slice(defAt, defEnd), "diffArgs 的定义里不能带 -w（会让 name-status / raw 也被 -w 过滤）").not.toContain(
+        '"-w"',
+      );
+      // 三个清单调用：name-status 与 raw 原样不带 -w，只有 numstat 条件性地带
+      expect(src).toContain('runGit(root, diffArgs("--name-status"))');
+      expect(src).toContain('runGit(root, diffArgs("--raw", "--no-abbrev"))');
+      expect(src).toContain('runGit(root, diffArgs("--numstat", ...(opts.ignoreWs ? ["-w"] : [])))');
+      // 单文件 diff 取 patch 仍然带 -w（要把空白差异从 patch 里去掉）
+      expect(src).toMatch(/\.\.\.\(opts\.ignoreWs \? \["-w"\] : \[\]\),\s*\.\.\.sc\.value\.revs/);
+    });
+
     it("git 一律在仓库根里跑（不用工作目录本身）：清单 / 单文件 diff / 提交列表都先取 root", () => {
       expect(src).toContain('"--show-toplevel"');
       // 取不到仓库根 = 不是 git 仓库，三处各自走自己的「不可用」分支

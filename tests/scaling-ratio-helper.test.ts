@@ -7,10 +7,10 @@
  *
  * 这里钉三件事（都用「在 make 里按调用次序造出确定的抖动」，不靠真实负载碰运气）：
  *  ① 真线性 → 绿；
- *  ② **真二次型 → 仍然红**（取最小比值不能把二次型放过去——这是这个改动唯一的风险）；
+ *  ② **真二次型 → 仍然红**（取最小比值不能把二次型放过去——这是这个改动唯一的风险；用虚拟时钟，见该用例里的说明）；
  *  ③ 第一轮被抖动拉高、第二轮恢复 → 绿（修前的单轮行为在这里是红的：`rounds: 1` 对照）。
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { doublingRatio, LINEAR_RATIO_MAX } from "./helpers/scaling-ratio";
 
@@ -25,19 +25,43 @@ const burn = (iters: number): void => {
 const N = 4000;
 /** 线性：耗时 ∝ n */
 const linear = (n: number) => () => burn(n * 120);
-/** 二次型：耗时 ∝ n²（外层 n 次、每次 burn(n / 8)） */
-const quadratic = (n: number) => () => {
-  for (let i = 0; i < n; i++) burn(Math.ceil(n / 8));
-};
 
 describe("doublingRatio（多轮取最小比值）", () => {
   it("① 真线性：比值 < 阈值", () => {
     expect(doublingRatio(linear, N)).toBeLessThan(LINEAR_RATIO_MAX);
   });
 
-  it("② 真二次型：多轮取最小之后仍然 > 阈值（不会把二次型放过去）", () => {
-    // 二次型每一轮都接近 4，取最小仍然高于 3
-    expect(doublingRatio(quadratic, 600)).toBeGreaterThan(LINEAR_RATIO_MAX);
+  it("② 真二次型：多轮取最小之后仍然 > 阈值（不会把二次型放过去）——虚拟时钟，比值只取决于规模、不受机器忙闲影响", () => {
+    // 为什么不测真实计时：二次型期望比 4、阈值 3，余量只有 1.33 倍，而且「多轮取最小」对「期望比值偏高」的断言天然不利——
+    // 任何一轮被调度抢占压到 3 以下，整条就红。实测同一份二次型实现：Linux CI（2 核）上量出过 2.83；
+    // 本机 8 核被 8 个空转进程抢占时，十次里有五到八次 ≤ 3（换二次型的写法也一样，是噪声压过了形状）。
+    // 红灯只取决于「当时机器忙不忙」，当不了门禁。
+    // helper 的逻辑（取最小 / 提前停）与时钟从哪来无关：把时钟换成确定的——fn 每被调一次，时钟前进 cost(n) 毫秒，
+    // 比值就精确等于 cost(2n) / cost(n)：二次型恰好 4、线性恰好 2。上面的「真线性」（期望 2、对阈值有 1.5 倍余量）仍用真实计时。
+    let now = 0;
+    const spy = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      const timed = (cost: (n: number) => number) => (n: number) => () => {
+        now += cost(n);
+      };
+      const ratio = doublingRatio(
+        timed((n) => (n * n) / 1e4),
+        600,
+      );
+      expect(ratio).toBeCloseTo(4, 10);
+      expect(ratio).toBeGreaterThan(LINEAR_RATIO_MAX);
+      // 同一套虚拟时钟下线性恰好 2、被判为线性：证明上面的 4 来自「二次型」本身，不是时钟造出的假象
+      expect(
+        doublingRatio(
+          timed((n) => n / 50),
+          600,
+        ),
+      ).toBeCloseTo(2, 10);
+    } finally {
+      spy.mockRestore();
+    }
+    // 时钟已还原：不能把虚拟的 performance.now 漏给后面的用例
+    expect(vi.isMockFunction(performance.now)).toBe(false);
   });
 
   /** 第 1 次造「2n 规模」函数时让它多干 8 倍活（模拟「大规模那一侧整个窗口都被抖动拉高」），之后恢复正常 */

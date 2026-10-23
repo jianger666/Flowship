@@ -927,14 +927,17 @@ export const readRepoChanges = async (
     // 与单文件 diff 同一组格式开关（防御性）：实测 textconv 只影响 patch 文本、不改变 numstat / name-status / raw，
     // 但清单与单文件走同一组参数，口径就不会因 git 版本 / 配置差异而分叉，也不会去执行用户配的 textconv 外部命令
     "--no-textconv",
-    ...(opts.ignoreWs ? ["-w"] : []),
+    // 注意：这里不带 -w。-w 只给 numstat（见下）——name-status / raw 必须是「完整清单」，不能随忽略空白而变
     ...revs,
     "--",
   ];
   const [branch, nameStatus, numstat, rawRun, untrackedRun, counts] = await Promise.all([
     readBranchName(root),
     runGit(root, diffArgs("--name-status")),
-    runGit(root, diffArgs("--numstat")),
+    // -w 只加在 numstat 上：清单（name-status）与指纹（raw）一律不带。较新的 git（实测 2.54.0）在 -w 下会把
+    // 「只改了空白」的文件从 name-status / raw 里整行省略（2.42.0 不会）——清单里这些文件就凭空消失，
+    // 「仅空白改动」的标记也就没有了。numstat 里缺的那些 = 只改了空白，由下面的 wsOnly 补上
+    runGit(root, diffArgs("--numstat", ...(opts.ignoreWs ? ["-w"] : []))),
     // 两侧 blob 的 oid：文件级指纹用。读失败不影响清单（只是没有指纹、前端退回行数签名）
     runGit(root, diffArgs("--raw", "--no-abbrev")),
     includeUntracked
@@ -950,7 +953,7 @@ export const readRepoChanges = async (
   const stats = parseNumstatZ(numstat.stdout);
   const files: TaskChangeFile[] = parseNameStatusZ(nameStatus.stdout).map((e) => {
     const s = stats.get(e.path);
-    // -w 下 name-status 仍会列出「只改了空白」的文件、numstat 却整行省略——
+    // name-status 不带 -w、是完整清单；numstat 带 -w 时会把「只改了空白」的文件整行省略——
     // 不特殊处理会被当成「没统计到 = 二进制 / 过大」，这里明确标成「仅空白」、行数记 0
     const wsOnly = opts.ignoreWs === true && s === undefined;
     return {
