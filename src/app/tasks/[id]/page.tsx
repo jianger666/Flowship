@@ -67,6 +67,7 @@ import { TalkQueueBanner } from "@/components/tasks/talk-queue-banner";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
 import { ScheduleChip } from "@/components/tasks/schedule-chip";
 import type { TalkQueueItem } from "@/lib/talk-queue";
+import type { AssistantSnapshot } from "@/lib/assistant-live";
 import { stopConfirmDescription, stoppableQueuedCount } from "@/lib/stop-copy";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
@@ -215,6 +216,10 @@ const TaskDetailPage = () => {
   }, []);
   const clearStreaming = useCallback(() => {
     streamControlsRef.current?.clearStreaming();
+  }, []);
+  // 每次（重）连接 bootstrap 的「进行中正文」快照（assistant_snapshot）：切走再切回 / 重连后立刻铺上已生成的全部
+  const applyAssistantSnapshot = useCallback((snap: AssistantSnapshot | null) => {
+    streamControlsRef.current?.applySnapshot(snap);
   }, []);
   // 运行中 shell 的直播输出（callId → 尾部 20 行，ephemeral、不进 task.events）；与 ChatView 共用同一个 hook。
   // 只当 prop 传给 EventStream，别拿它喂要扫全量 events 的 memo（HANDOFF「别进 activeStatus memo」）
@@ -559,13 +564,14 @@ const TaskDetailPage = () => {
   useTaskWatch(
     task?.id,
     {
-      onEvent: (ev) => {
+      onEvent: (ev, meta) => {
         // ephemeral tool_output_delta 不进 task.events：累积进直播缓冲后到此为止；
         // tool_result 会顺手清掉该 callId 的缓冲、但仍要继续往下走正常落进 events
         if (absorbLiveToolOutputEvent(ev)) return;
         // 只有属主主链的 assistant_message 落盘才清流式气泡：旁路群答疑 run（meta.groupRun）与主 run 并存，
         // 它的回答落盘不该把属主正在吐的字清掉（D9-01）
-        if (shouldClearStreamingOnEvent(ev)) clearStreaming();
+        // bootstrap 回放的历史尾部（meta.replay）同样不清——由紧随其后的 assistant_snapshot 对齐（见 shouldClearStreamingOnEvent）
+        if (shouldClearStreamingOnEvent(ev, meta)) clearStreaming();
         setTask((prev) => {
           if (!prev) return prev;
           if (prev.events.some((e) => e.id === ev.id)) return prev;
@@ -606,6 +612,7 @@ const TaskDetailPage = () => {
         }
       },
       onAssistantDelta: pushDelta,
+      onAssistantSnapshot: applyAssistantSnapshot,
       onTalkQueue: setTalkQueue,
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
       // resume 有值 = 重试预算耗尽、已休眠：挂「重连」按钮并常驻，别让用户面对静默停更的页面
@@ -1181,15 +1188,18 @@ const TaskDetailPage = () => {
         <ChatView
           task={task}
           onTaskUpdate={absorbTask}
-          onEventAppend={(ev) => {
+          onEventAppend={(ev, meta) => {
             // 双保险：ChatView 已滤 ephemeral，这里再挡一次防漏进持久 rows
             if (isEphemeralToolOutputDelta(ev)) return;
             // 回退标记事件本地窗口对不齐（只加载了尾部分页等）：不猜，完整重新拉取一次并整体替换本地
             // （此时 appendTaskEvent 不追加该事件；拉回的快照自带它）
             const cur = taskRef.current;
             if (cur && rewindNeedsResync(cur, ev)) void resyncEvents();
-            // appendTaskEvent：按 id 去重追加；回退标记事件会先截掉本地被删的后半段
-            setTask((prev) => (prev ? appendTaskEvent(prev, ev) : prev));
+            // appendTaskEvent：按 id 去重追加；回退标记事件会先截掉本地被删的后半段；
+            // 回放（meta.replay）里比本地窗口首条还早的事件直接丢弃（评审 N5，不接到末尾乱序）
+            setTask((prev) =>
+              prev ? appendTaskEvent(prev, ev, { replay: meta?.replay === true }) : prev,
+            );
           }}
           onRewound={(r: RewoundResult) => {
             // 回退 HTTP 响应直给的标记：不依赖标记事件写入 / SSE 到达，直接把本地对齐到这次回退

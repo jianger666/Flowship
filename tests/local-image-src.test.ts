@@ -54,6 +54,60 @@ describe("wrapLocalMarkdownImageDestinations", () => {
       wrapLocalMarkdownImageDestinations("![a](https://example.com/a b.png)"),
     ).toBe("![a](https://example.com/a b.png)");
   });
+
+  it("alt 含转义 `\\]` / 多个转义对仍能匹配并改写", () => {
+    const md = `![a\\]b \\\\ c](${QR_PATH})`;
+    expect(wrapLocalMarkdownImageDestinations(md)).toBe(
+      `![a\\]b \\\\ c](<${QR_PATH}>)`,
+    );
+  });
+});
+
+// ReDoS：旧正则 `((?:\\.|[^\]])*)` 两个分支在反斜杠上重叠，`![` + N 个 `\` 回溯指数增长
+// （N=42 约 0.8s、N≈60 约一小时，渲染线程卡死且重开仍冻）。新正则任何输入都应在毫秒级返回。
+describe("wrapLocalMarkdownImageDestinations 不得 ReDoS", () => {
+  const timed = (md: string): number => {
+    const t0 = performance.now();
+    wrapLocalMarkdownImageDestinations(md);
+    return performance.now() - t0;
+  };
+
+  it("`![` + 大量反斜杠（旧正则指数爆炸的输入）", () => {
+    expect(timed("![" + "\\".repeat(60))).toBeLessThan(200);
+    expect(timed("![" + "\\".repeat(5000))).toBeLessThan(500);
+  });
+
+  it("反斜杠后接 `]` 但缺 `(`、无结尾 `)` 的变体", () => {
+    expect(timed("![" + "\\".repeat(60) + "]")).toBeLessThan(200);
+    expect(timed("![" + "\\]".repeat(60) + "(")).toBeLessThan(200);
+    expect(timed("![a](" + "x".repeat(100_000))).toBeLessThan(500);
+  });
+
+  it("大量未闭合的 `![a](`（二次方风险）", () => {
+    expect(timed("![a](".repeat(20_000))).toBeLessThan(2000);
+  });
+
+  it("没有 `![` 的文本直接原样返回（快速路径，同一个字符串）", () => {
+    const md = "普通文本 [link](/Users/x/a b.png) ".repeat(50_000);
+    expect(wrapLocalMarkdownImageDestinations(md)).toBe(md);
+    expect(timed(md)).toBeLessThan(50);
+  });
+
+  it("超大文本（>20 万字符）不改写：带空格的本地图片路径保持原样，且不会拖住主线程", () => {
+    const big = `![a](${QR_PATH}) ` + "![a](".repeat(60_000);
+    expect(big.length).toBeGreaterThan(200_000);
+    expect(wrapLocalMarkdownImageDestinations(big)).toBe(big);
+    expect(timed(big)).toBeLessThan(50);
+    // 对照：同样的图在正常大小的文本里照常改写
+    expect(wrapLocalMarkdownImageDestinations(`![a](${QR_PATH})`)).toBe(`![a](<${QR_PATH}>)`);
+  });
+
+  it("超长 alt（>1000）/ 超长 dest（>2048）不再改写、原样返回", () => {
+    const longAlt = `![${"x".repeat(1500)}](${QR_PATH})`;
+    expect(wrapLocalMarkdownImageDestinations(longAlt)).toBe(longAlt);
+    const longDest = `![a](/${"d d/".repeat(2000)}qr.png)`;
+    expect(wrapLocalMarkdownImageDestinations(longDest)).toBe(longDest);
+  });
 });
 
 describe("toLoadableImageSrc", () => {

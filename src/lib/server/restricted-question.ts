@@ -64,7 +64,7 @@ import {
   withSdkDeadline,
 } from "./sdk-deadline";
 import {
-  flushPendingAssistantDeltas,
+  flushAssistantSegment,
   flushThinkingBuffer,
   handleSdkMessage,
   type AssistantBufferCtx,
@@ -546,22 +546,8 @@ export const startRestrictedGroupQuestion = (
       // 流式消费——只翻译成事件流，不碰 action / runStatus / 会话表
       const assistantCtx: AssistantBufferCtx = {
         buffer: "",
-        flush: async () => {
-          // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
-          flushPendingAssistantDeltas(task.id);
-          const trimmed = assistantCtx.buffer.trim();
-          assistantCtx.buffer = "";
-          if (trimmed.length === 0) return;
-          await writeOwnedEventAndPublish(
-            task.id,
-            alive,
-            {
-              kind: "assistant_message",
-              text: trimmed,
-            },
-            origin,
-          );
-        },
+        // 统一结算；带 origin = 旁路答疑：不碰属主主链的实时快照（见 flushAssistantSegment）
+        flush: () => flushAssistantSegment(task.id, assistantCtx, alive, origin),
       };
       for await (const msg of run.stream()) {
         await handleSdkMessage(task.id, msg, assistantCtx, alive, origin);

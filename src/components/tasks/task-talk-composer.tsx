@@ -26,6 +26,7 @@ import { ConversationComposer } from "@/components/conversation-composer";
 import { ComposerSessionProvider } from "@/components/composer-session";
 import { Tooltip } from "@/components/ui/tooltip";
 import { buildTaskInputHistory } from "@/lib/composer-history";
+import { appendToDraft, registerComposerInsert } from "@/lib/composer-insert-bridge";
 import { shouldRefocusComposerAfterSend } from "@/lib/composer-refocus";
 import {
   mergeRestoredList,
@@ -318,6 +319,18 @@ export const TaskTalkComposer = ({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [focusInput]);
+
+  // 代码改动面板「引用到对话」：把选中的 diff 片段接在草稿后面、聚焦输入条。
+  // 草稿住在这一层（rich），面板拿不到它——所以由这里按 taskId 注册一个接收函数
+  const setTalkValue = rich.setValue;
+  useEffect(
+    () =>
+      registerComposerInsert(task.id, (text) => {
+        setTalkValue((cur) => appendToDraft(cur, text));
+        focusInput();
+      }),
+    [task.id, setTalkValue, focusInput],
+  );
 
   // @ / ↑ 历史：task 模式也复用同一 ComposerSession
   const composerSession = useMemo(

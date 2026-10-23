@@ -168,6 +168,15 @@ const FIXED_FILES = [
   "components/composer-editor.tsx",
   "components/tasks/task-launch-form.tsx",
   "components/tasks/stream-announcer.tsx",
+  "components/tasks/stream-outline-rail.tsx",
+  // 代码改动面板（task-changes-panel 拆出来的新组件）
+  "components/tasks/changes/changes-sheet.tsx",
+  "components/tasks/changes/diff-minimap.tsx",
+  "components/tasks/changes/diff-table.tsx",
+  "components/tasks/changes/diff-viewer.tsx",
+  "components/tasks/changes/file-list.tsx",
+  "components/tasks/changes/scope-toolbar.tsx",
+  "components/tasks/changes/shared.tsx",
 ] as const;
 
 /**
@@ -270,6 +279,13 @@ describe("已修文件：不回到 ui-conventions 禁止的写法", () => {
       "components/tasks/action-timeline.tsx",
       "components/tasks/batch-plan-table.tsx",
       "components/tasks/task-changes-panel.tsx",
+      "components/tasks/changes/changes-sheet.tsx",
+      "components/tasks/changes/diff-minimap.tsx",
+      "components/tasks/changes/diff-table.tsx",
+      "components/tasks/changes/diff-viewer.tsx",
+      "components/tasks/changes/file-list.tsx",
+      "components/tasks/changes/scope-toolbar.tsx",
+      "components/tasks/changes/shared.tsx",
       "components/composer-editor.tsx",
       "components/conversation-composer.tsx",
       // 排队条两份不在此列：里面只剩一个装饰性箭头图标的 opacity-70（图标不是文字层级，alpha 属装饰）

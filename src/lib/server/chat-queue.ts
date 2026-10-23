@@ -879,6 +879,67 @@ export const enqueueChatMessageFront = (
 };
 
 /**
+ * 把一批「已被受理过」的消息**按原顺序**塞回队首（send-now 打断重发：stop 前救出的其余排队条，start 后塞回）。
+ *
+ * 为什么不是逐条 enqueueChatMessage（BE2-01）：
+ *   1) 它要过容量检查——stop → start 这几百毫秒窗口里又来了 2 条以上新消息、队列又接近上限时，
+ *      塞回的老消息会被 `full` 拒掉；调用方又不看返回值——**已经回过 202 的消息静默丢失**，
+ *      只留下一个永远排队中的幽灵气泡；
+ *   2) 它是 append：塞回的老消息排到窗口内新到的消息后面，先来的反而后发。
+ * 这里：不过容量（与 enqueueChatMessageFront 同口径，「已接受的绝不丢」，理论超限只打 error）、
+ * 整批塞在队首（先于窗口内的新到达）、原顺序不变。
+ *
+ * opts.afterItemId：start 失败时目标条已被放回队首、用户点的是「立即发送」，它应仍排第一——
+ * 队首恰是该条就插在它后面。
+ *
+ * 幂等 / 不复活：已经在队里或在 in-flight 的跳过（重复塞回不叠两份）；operation 已终态（窗口内被用户删了 / 作废了）的跳过。
+ * 返回实际塞回 / 跳过的条数（供日志与单测）。
+ */
+export const enqueueChatMessagesFront = (
+  taskId: string,
+  msgs: QueuedChatMsgInput[],
+  opts?: { afterItemId?: string },
+): { requeued: number; skipped: number } => {
+  const map = queues();
+  const cur = map.get(taskId) ?? [];
+  const inFlightId = inFlightItemIdsMap().get(taskId);
+  const present = new Set(cur.map((m) => m.itemId));
+  if (inFlightId) present.add(inFlightId);
+
+  const toInsert: QueuedChatMsg[] = [];
+  let skipped = 0;
+  for (const m of msgs) {
+    const itemId =
+      typeof m.itemId === "string" && m.itemId.trim() ? m.itemId.trim() : undefined;
+    if (itemId) {
+      if (present.has(itemId)) {
+        skipped++;
+        continue;
+      }
+      if (lookupQueueItemAcceptance(taskId, itemId).status === "settled") {
+        skipped++;
+        continue;
+      }
+      present.add(itemId);
+    }
+    toInsert.push(withItemId(m));
+  }
+  if (toInsert.length === 0) return { requeued: 0, skipped };
+
+  const splitAt =
+    opts?.afterItemId && cur[0]?.itemId === opts.afterItemId ? 1 : 0;
+  const next = [...cur.slice(0, splitAt), ...toInsert, ...cur.slice(splitAt)];
+  if (next.length + (inFlightId ? 1 : 0) > CHAT_QUEUE_MAX) {
+    console.error(
+      `[chat-queue] task=${taskId} 批量塞回队首后短暂超上限（${next.length} > ${CHAT_QUEUE_MAX}）、` +
+        `保留全部已接受消息，绝不丢`,
+    );
+  }
+  map.set(taskId, next);
+  return { requeued: toInsert.length, skipped };
+};
+
+/**
  * 同步取出并清空剩余排队条目的 itemId（不含已 dequeue 的 in-flight 条）。
  * 不碰 generation / in-flight——调用方随后 clearChatQueue 统一收尾。
  */

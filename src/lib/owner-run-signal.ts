@@ -20,10 +20,17 @@ export const isSideRunEvent = (ev: Pick<TaskEvent, "meta">): boolean => {
 
 /**
  * 这条落盘事件到达时，要不要清属主的流式气泡：
- * 只有属主主链的 assistant_message（流式文本已定稿落盘）才清；旁路的不清。
+ * 只有属主主链的、**刚发生的** assistant_message（流式文本已定稿落盘）才清；
+ *   - 旁路的不清（见文件头）；
+ *   - bootstrap 回放的历史尾部（meta.replay）不清：每次（重）连接都会把尾部历史重读一遍，若也当成
+ *     「这段流式文字定稿了」，同页重连时本地正在长的那段字会被清空（重连瞬间文字突然消失）。
+ *     这段字到底有没有定稿，由紧随其后的 assistant_snapshot 帧统一对齐（null = 已落盘、清；对象 = 仍在、接着长）。
  */
-export const shouldClearStreamingOnEvent = (ev: TaskEvent): boolean =>
-  ev.kind === "assistant_message" && !isSideRunEvent(ev);
+export const shouldClearStreamingOnEvent = (
+  ev: TaskEvent,
+  meta?: { replay?: boolean },
+): boolean =>
+  ev.kind === "assistant_message" && !isSideRunEvent(ev) && !meta?.replay;
 
 /**
  * task 页的运行态（D6-02 / R3-05 / 第四轮 Q5-01）：

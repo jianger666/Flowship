@@ -45,6 +45,11 @@ describe("① 平滑吐字 state 下沉：页面不再持有逐帧 state", () =>
     expect(page).toMatch(
       /const clearStreaming = useCallback\(\(\) => \{\s*streamControlsRef\.current\?\.clearStreaming\(\);\s*\}, \[\]\);/,
     );
+    // 进行中正文快照同样走稳定转发（空依赖），SSE 回调接它
+    expect(page).toMatch(
+      /const applyAssistantSnapshot = useCallback\(\(snap: AssistantSnapshot \| null\) => \{\s*streamControlsRef\.current\?\.applySnapshot\(snap\);\s*\}, \[\]\);/,
+    );
+    expect(page).toMatch(/onAssistantSnapshot: applyAssistantSnapshot/);
     expect(page).toContain("controlsRef={streamControlsRef}");
     // SSE 的 assistant_delta 仍然接 pushDelta
     expect(page).toMatch(/onAssistantDelta: pushDelta/);
@@ -53,7 +58,7 @@ describe("① 平滑吐字 state 下沉：页面不再持有逐帧 state", () =>
   it("SmoothEventStream：吐字 hook 在它里面，通过 useImperativeHandle 把 pushDelta / clearStreaming 暴露回页面", () => {
     expect(host).toContain("useSmoothStreaming()");
     expect(host).toContain("useImperativeHandle(");
-    expect(host).toMatch(/\{ pushDelta, clearStreaming \}/);
+    expect(host).toMatch(/\{ pushDelta, applySnapshot, clearStreaming \}/);
     expect(host).toContain("<EventStream");
     expect(host).toMatch(/streamingText=\{streamingText\}/);
   });

@@ -54,7 +54,7 @@ describe("tool-block：图标", () => {
 });
 
 describe("event-stream：buildStreamItems", () => {
-  const fn = sliceFrom(eventStream, "const buildStreamItems = (", "/** 与 contentCount 同一计量");
+  const fn = sliceFrom(eventStream, "const buildStreamItems = (", "/** 与 contentUnitIds 同一计量");
 
   it("只在会话 running 时打标；读的是未过滤的 events（标记在 src 里已被藏掉）", () => {
     expect(fn).toMatch(/runActive\s*\?\s*markBackgroundRunningTools\(/);

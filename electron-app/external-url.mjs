@@ -200,13 +200,54 @@ export const isSafeMailtoUrl = (url) => {
 };
 
 /**
+ * 主机名是否指向本机回环（入参是 `URL.hostname`：WHATWG 已把 `127.1` / `2130706433` / `0x7f.1` 规范化成
+ * `127.0.0.1`、`[0:0:0:0:0:0:0:1]` 规范化成 `[::1]`，所以这里不必再处理那些写法）。
+ * 覆盖：127.0.0.0/8、0.0.0.0（Linux / macOS 上连它等于连本机）、`localhost` 与 `*.localhost`（RFC 6761、
+ * Chromium 直接解析成回环；末尾多一个 `.` 的写法也算）、`[::1]`、`[::]`、IPv4 映射的回环 `[::ffff:7fxx:xxxx]`。
+ */
+const isLoopbackHostname = (hostname) => {
+  const h = String(hostname).toLowerCase().replace(/\.$/, "");
+  return (
+    /^127\.\d+\.\d+\.\d+$/.test(h) ||
+    h === "0.0.0.0" ||
+    h === "localhost" ||
+    h.endsWith(".localhost") ||
+    h === "[::1]" ||
+    h === "[::]" ||
+    /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(h)
+  );
+};
+
+/**
+ * 是否「本应用 origin」（精确）：host 必须与壳绑定的一致（127.0.0.1）、端口一致。
+ * 主窗同 frame 导航到这个 origin 才是真站内（will-navigate 放行用）。
+ */
+export const isCanonicalAppOrigin = (url, { host, port }) => {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" && u.hostname === host && Number(u.port) === port;
+  } catch {
+    return false;
+  }
+};
+
+/**
  * 是否站内 URL：必须按 origin 精确比对——`url.startsWith(BASE_URL)` 会被
  * `http://127.0.0.1:8876@evil/` / `:88760/` / `.attacker.tld/` 前缀绕过（审查发现）。
+ *
+ * 主机名认「本机回环的所有写法」（127.0.0.1 / localhost / [::1] …）而不只是壳绑定的那一个：
+ * 服务只绑 127.0.0.1，但 `http://localhost:8876/api/…`、`http://[::1]:8876/api/…` 指向的仍是同一个服务。
+ * 如果它们被当「站外 http 链接」交给系统浏览器，顶层导航带 `Sec-Fetch-Site: none`，Fetch Metadata 闸拦不住，
+ * AI 输出里一条恶意链接就能让用户一点触发 `mr-inbox?refresh=1` / `repo-branches`（git fetch）这类有副作用的 GET——
+ * 与第四轮 Q4-02 收的 `127.0.0.1` 形态是同一个洞，只是换了个主机名写法（2026-10-23 全仓审查复现）。
+ * 所以别名也算「站内」：setWindowOpenHandler / IPC 一律 deny、不交系统浏览器；
+ * 同 frame 导航到别名则由 main.js 的 will-navigate 用 isCanonicalAppOrigin 区分后拦下（别名 origin 与主窗不同源，放行会把主窗带走）。
  */
 export const isSameAppOrigin = (url, { host, port }) => {
   try {
     const u = new URL(url);
-    return u.protocol === "http:" && u.hostname === host && Number(u.port) === port;
+    if (u.protocol !== "http:" || Number(u.port) !== port) return false;
+    return u.hostname === host || (isLoopbackHostname(host) && isLoopbackHostname(u.hostname));
   } catch {
     return false;
   }

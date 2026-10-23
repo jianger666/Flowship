@@ -216,6 +216,12 @@ export interface MrInboxMrDetail {
   detailedMergeStatus: string;
   hasConflicts: boolean;
   mergeable: boolean;
+  /**
+   * 扫描那一刻源分支的 HEAD 提交。点「合并」时随请求带上（GitLab `sha` 守卫）：
+   * 用户看到「可合并」之后作者又推了新提交 → 合并被拒、提示刷新，而不是把没看过的提交一并合进去。
+   * 旧缓存 / 取不到时缺省（不带守卫、沿用旧行为）。
+   */
+  headSha?: string;
 }
 
 /**

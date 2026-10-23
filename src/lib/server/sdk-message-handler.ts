@@ -96,6 +96,13 @@ export const flushThinkingBuffer = async (
 export interface AssistantBufferCtx {
   buffer: string;
   flush: () => Promise<void>;
+  /**
+   * 本段正文落盘后那条 assistant_message 事件的预定 id：段内第一个 chunk 时定下、之后每个 delta 帧都带、
+   * 落盘时原样复用（见 flushAssistantSegment）。与 thinkingEventId 同套路，同样放在每路 run 自己的 ctx 里：
+   * 旁路答疑（origin）run 不预定（它的 delta 不进属主的实时气泡 / 快照），由 appendEvent 现生成。
+   * 用途：watch-task 新订阅者 bootstrap 时据此判断「快照里这段正文是否已经在 tail 里落盘」。
+   */
+  assistantEventId?: string;
   /** 思考 delta 攒在这儿，一段思考只落一条 thinking 事件（pi 的 thinking_delta 是 token 级） */
   thinkingBuffer?: string;
   /** 本段思考累加的 durationMs（最后一条 SDK thinking 常带） */
@@ -447,6 +454,8 @@ interface PendingDeltaEntry {
   /** 入队时的 lease 闭包——flush 时重估，失主丢弃（闭包本身按当前实例动态判定） */
   lease: () => boolean;
   origin?: string;
+  /** 本段正文的预定落盘事件 id（仅属主主链有；随每帧带给前端 / 路由，并记入实时快照） */
+  eventId?: string;
 }
 
 const DELTA_BUFFER_MAP_KEY = "__flowshipAssistantDeltaBuffers__";
@@ -472,11 +481,18 @@ const flushDeltaKey = (map: Map<string, PendingDeltaEntry>, key: string): void =
   map.delete(key);
   if (text.length === 0) return;
   if (!buf.lease()) return;
-  publishIfCurrent(key.split("::")[0]!, buf.lease, {
+  const taskId = key.split("::")[0]!;
+  const published = publishIfCurrent(taskId, buf.lease, {
     kind: "assistant_delta",
     text,
     ...(buf.origin ? { origin: buf.origin } : {}),
+    ...(buf.eventId ? { eventId: buf.eventId } : {}),
   });
+  // 没发出去（发帧这一刻 lease 才失主）的字不进快照——快照 = 订阅者「本该已经收到」的全部。
+  // 旁路答疑（origin）的字不进：快照属于属主主链、旁路的回答走自己的落盘事件
+  if (published && !buf.origin && buf.eventId) {
+    recordLiveAssistant(taskId, buf.lease, buf.eventId, text);
+  }
 };
 
 /** 冲掉某任务全部待发 delta（同步、幂等）；空 entry 顺手清掉 */
@@ -494,6 +510,7 @@ const enqueueAssistantDelta = (
   stillCurrent: () => boolean,
   origin: string | undefined,
   text: string,
+  eventId?: string,
 ): void => {
   const map = getDeltaBufferMap();
   const key = `${taskId}::${origin ?? ""}`;
@@ -502,6 +519,7 @@ const enqueueAssistantDelta = (
     buf = { text: "", timer: null, lease: stillCurrent, origin };
     map.set(key, buf);
   }
+  buf.eventId = eventId;
   const needFlush = buf.text.length === 0 && buf.timer === null;
   buf.text += text;
   if (buf.text.length >= DELTA_FLUSH_BYTES) {
@@ -512,6 +530,128 @@ const enqueueAssistantDelta = (
   if (needFlush) {
     buf.timer = setTimeout(() => flushDeltaKey(map, key), DELTA_FLUSH_INTERVAL_MS);
   }
+};
+
+// ----------------- 进行中正文的实时快照（assistant_snapshot） -----------------
+// 为什么要有它（2026-10-22 用户反馈「对话在生成中、我切到别的窗口再切回来，看到的是它返回的中间部分，
+// 要等它生成完才能看到全部」）：assistant_delta 是纯内存帧、从不回放；一段不带工具调用的长回复，
+// 要等下一次 tool_call / thinking / 流结束才会 ctx.flush 成 assistant_message 事件，整段在磁盘上根本没有。
+// 切走时 ChatView 卸载、前端的流式文本（React ref）随之消失，切回开的新 SSE 只能从「订阅之后的第一帧」
+// 开始拼——于是只看到后半截。与 thinking_snapshot 同套路：服务端记住「已发出的进行中那一段」，
+// 新订阅者 bootstrap 时补一帧 assistant_snapshot，前端据此把整段铺上、再接着往下长。
+//
+// 只记属主主链（origin 为空）。段结束（flushAssistantSegment）同步清；lease 失主在读取时顺手清。
+
+interface LiveAssistant {
+  /** 本段正文的预定落盘事件 id */
+  eventId: string;
+  /** 本段已**发出**（publish 成功）的原文：快照里还在 70ms 合帧窗口里的 pending 不算，发出时才进来（否则 bootstrap 之后的那一帧会把它重复一遍） */
+  sent: string;
+  /** 最近一次记账时的 lease 闭包——读取时重估，失主 = 这段已经死了 */
+  lease: () => boolean;
+}
+
+/** 进行中那一段正文的快照（watch-task 新订阅者 bootstrap 补发，帧名 assistant_snapshot） */
+export interface LiveAssistantSnapshot {
+  /** 落盘后那条 assistant_message 的预定 id */
+  eventId: string;
+  /** 已发出的原文（整段，已脱敏） */
+  text: string;
+  /** 已发出的字符数（脱敏前口径，仅供校验） */
+  total: number;
+}
+
+const LIVE_ASSISTANT_MAP_KEY = "__flowshipLiveAssistantSegments__";
+const getLiveAssistantMap = (): Map<string, LiveAssistant> => {
+  const g = globalThis as unknown as Record<
+    typeof LIVE_ASSISTANT_MAP_KEY,
+    Map<string, LiveAssistant> | undefined
+  >;
+  if (!g[LIVE_ASSISTANT_MAP_KEY]) g[LIVE_ASSISTANT_MAP_KEY] = new Map();
+  return g[LIVE_ASSISTANT_MAP_KEY];
+};
+
+/** 一个 delta 帧发出去之后记账（换了 eventId = 新的一段、整个重建） */
+const recordLiveAssistant = (
+  taskId: string,
+  lease: () => boolean,
+  eventId: string,
+  text: string,
+): void => {
+  const map = getLiveAssistantMap();
+  let st = map.get(taskId);
+  if (!st || st.eventId !== eventId) {
+    st = { eventId, sent: "", lease };
+    map.set(taskId, st);
+  }
+  st.lease = lease;
+  st.sent += text;
+};
+
+/** 这段正文结束了（落盘 / 作废）：清快照。同步、幂等 */
+export const discardLiveAssistant = (taskId: string): void => {
+  getLiveAssistantMap().delete(taskId);
+};
+
+/**
+ * 此刻进行中那一段正文的快照；没有（没在吐字 / 还没发出过任何一帧 / run 已失主）→ null。
+ *
+ * 同步、零副作用（失主时顺手清状态除外）——路由要「订阅」与「读快照」之间没有任何 await：
+ * 快照 = 订阅那一刻之前已发出的全部，之后的帧都进 buffer，不重不漏（理由同 getLiveThinkingSnapshot）。
+ * 读取时重估 lease：run 被取消 / 换了新实例 / 已结束而状态没被清（异常路径）时，
+ * 不能把一个已经死掉的正文当作进行中告诉新订阅者（幽灵流式气泡）。
+ */
+export const getLiveAssistantSnapshot = (
+  taskId: string,
+): LiveAssistantSnapshot | null => {
+  const st = getLiveAssistantMap().get(taskId);
+  if (!st || st.sent.length === 0) return null;
+  if (!st.lease()) {
+    discardLiveAssistant(taskId);
+    return null;
+  }
+  return {
+    eventId: st.eventId,
+    // 快照由 watch-task 直接 send、不经 publish——对累积文本再脱敏（也补上凭据被切在相邻两帧的情形）
+    text: redactSecretsInText(st.sent),
+    total: st.sent.length,
+  };
+};
+
+/**
+ * 一段正文的统一结算（chat-runner / task-runner / restricted-question 三处 `ctx.flush` 共用）。
+ *
+ * 顺序固定、不能换：
+ *   1. 先把待发 delta 冲出去（防「尾巴 delta 晚到成幽灵字」）；
+ *   2. 同步取走 buffer 和预定 id、同步清实时快照——**必须在 await 落盘之前**：
+ *      新订阅者可能插在落盘的 await 期间订阅，那时快照必须已是 null，否则它拿到「整段 + 之后又收到落盘事件」；
+ *      放到落盘之后清的话，写盘失败 / 抛错时 live 态永远清不掉；
+ *   3. 最后才 await 落盘（走 owned sink：lease 失主不落盘）。落盘事件复用预定 id。
+ * 旁路答疑（origin）不碰快照：快照是按 taskId 共享的、属于属主主链，旁路收尾清它会误伤主链正在吐的字。
+ */
+export const flushAssistantSegment = async (
+  taskId: string,
+  ctx: AssistantBufferCtx,
+  lease: () => boolean,
+  origin?: string,
+): Promise<void> => {
+  flushPendingAssistantDeltas(taskId);
+  const trimmed = ctx.buffer.trim();
+  const eventId = ctx.assistantEventId;
+  ctx.buffer = "";
+  ctx.assistantEventId = undefined;
+  if (!origin) discardLiveAssistant(taskId);
+  if (trimmed.length === 0) return;
+  await writeOwnedEventAndPublish(
+    taskId,
+    lease,
+    {
+      kind: "assistant_message",
+      text: trimmed,
+      ...(eventId ? { id: eventId } : {}),
+    },
+    origin,
+  );
 };
 
 // ----------------- thinking_delta 节流（让「思考中」实时可见） -----------------
@@ -1004,9 +1144,18 @@ export const handleSdkMessage = async (
           }, stillCurrent);
           break;
         }
+        // 本段正文落盘后的事件 id：段内第一个 chunk 时定下，之后每个 delta 帧都带、落盘时复用
+        // （flushAssistantSegment）。旁路答疑（origin）不预定：它的字不进属主的实时气泡 / 快照
+        if (!origin) assistantCtx.assistantEventId ??= newEventId();
         assistantCtx.buffer += text;
         // streaming delta 走合帧缓冲——攒够 70ms/240B 再广播（失主在 flush 时丢弃）
-        enqueueAssistantDelta(taskId, stillCurrent, origin, text);
+        enqueueAssistantDelta(
+          taskId,
+          stillCurrent,
+          origin,
+          text,
+          assistantCtx.assistantEventId,
+        );
       }
       break;
     }

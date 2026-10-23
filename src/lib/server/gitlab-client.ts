@@ -114,6 +114,8 @@ export type GetMRResult =
       detailedMergeStatus: string;
       hasConflicts: boolean;
       mergeable: boolean;
+      /** 源分支当前 HEAD 提交（GitLab `sha`）。收件箱据此在合并时带 `sha` 守卫——只合用户看到的那一版 */
+      headSha?: string;
     }
   | { ok: false; error: string };
 
@@ -537,6 +539,7 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
       detailedMergeStatus: detailed,
       hasConflicts,
       mergeable,
+      ...(typeof body?.sha === "string" && body.sha ? { headSha: body.sha } : {}),
     };
   } catch (err) {
     return { ok: false, error: formatFetchNetworkError(err) };
@@ -545,8 +548,15 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
 
 /**
  * 合并 MR（PUT …/merge）。失败返结构化错误（冲突 / pipeline / 权限等）。
+ *
+ * input.sha：期望的源分支 HEAD 提交。带上则 GitLab 只在 HEAD 仍是它时才合并，
+ * 否则回 409（「SHA does not match HEAD of source branch」）——防止用户看到「可合并」之后、
+ * 作者又推了新提交，却被一并合进目标分支（收件箱的「可合并」可能是几分钟前的扫描缓存，GAP3-02）。
+ * 不带 = 沿用旧行为（合并当前 HEAD）。
  */
-export const mergeMR = async (input: GetMRInput): Promise<MergeMRResult> => {
+export const mergeMR = async (
+  input: GetMRInput & { sha?: string },
+): Promise<MergeMRResult> => {
   let base: string;
   let headers: HeadersInit;
   try {
@@ -561,7 +571,7 @@ export const mergeMR = async (input: GetMRInput): Promise<MergeMRResult> => {
       method: "PUT",
       headers,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      body: JSON.stringify({}),
+      body: JSON.stringify(input.sha ? { sha: input.sha } : {}),
     });
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };

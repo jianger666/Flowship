@@ -366,7 +366,8 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
     if (!ok) return;
     setMerging(true);
     try {
-      await mergeMr(entry.mrUrl);
+      // 带上扫描那一刻的源分支 HEAD：作者之后又推了新提交会被服务端拒绝，而不是把没看过的改动一并合入
+      await mergeMr(entry.mrUrl, entry.mr?.headSha);
       toast.success("MR 已合并");
     } catch (err) {
       toast.error(
@@ -873,7 +874,7 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
     if (!ok) return;
     setBusy("merge");
     try {
-      await mergeMr(entry.mrUrl);
+      await mergeMr(entry.mrUrl, entry.mr.headSha);
       toast.success("MR 已合并");
     } catch (err) {
       toast.error(

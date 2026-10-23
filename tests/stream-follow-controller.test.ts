@@ -458,6 +458,157 @@ describe("停跟随：只认用户上滚", () => {
     expect(ctrl.isFollowing()).toBe(false);
   });
 
+  describe("外层不会滚的上滚滚轮不登记意图（评审 N1：残留意图被流式贴底写的 scroll 事件误当上滚、跟随被关）", () => {
+    /** 贴底跟随中、流式长了一截 → 控制器贴底写 → 浏览器异步派发的 scroll 事件 */
+    const streamAndPin = (ctx: ReturnType<typeof setupWithScroller>) => {
+      ctx.sc.grow(28);
+      ctx.ctrl.requestScrollToBottom();
+      flushFrame();
+      ctx.sc.dispatch("scroll");
+    };
+    const inner = (scrollTop: number, parent: unknown = null) => ({
+      scrollTop,
+      scrollHeight: 600,
+      clientHeight: 200,
+      parentElement: parent,
+    });
+
+    it("横向为主的滚轮（触控板左右滑，deltaY 带小负数）不关跟随", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      ctx.sc.dispatch("wheel", { deltaX: 40, deltaY: -3 });
+      streamAndPin(ctx);
+      expect(ctx.ctrl.isFollowing()).toBe(true);
+    });
+
+    it("在内层可滚区（scrollTop>0）里上滚 → 被内层吃掉、外层跟随不受影响", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      // 目标 → 中间层（不可滚）→ 外层容器
+      const mid = { scrollTop: 0, scrollHeight: 100, clientHeight: 100, parentElement: ctx.sc.el };
+      ctx.sc.dispatch("wheel", { deltaY: -40, target: inner(80, mid) });
+      streamAndPin(ctx);
+      expect(ctx.ctrl.isFollowing()).toBe(true);
+    });
+
+    it("内层已在顶（scrollTop=0）→ 上滚会冒泡到外层，照常停跟随", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      ctx.sc.dispatch("wheel", { deltaY: -40, target: inner(0, ctx.sc.el) });
+      ctx.sc.userScrollTo(1160);
+      expect(ctx.ctrl.isFollowing()).toBe(false);
+    });
+
+    it("目标就是外层容器自己 → 照常停跟随", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      ctx.sc.dispatch("wheel", { deltaY: -40, target: ctx.sc.el });
+      ctx.sc.userScrollTo(1160);
+      expect(ctx.ctrl.isFollowing()).toBe(false);
+    });
+
+    it("被忽略的上滚不会顺手作废「往下翻」输入（它不是用户在外层的手势）", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      ctx.sc.dispatch("wheel", { deltaY: -100 });
+      ctx.sc.userScrollTo(1000); // 先正常离开底部
+      expect(ctx.ctrl.isFollowing()).toBe(false);
+      ctx.sc.dispatch("wheel", { deltaY: 100 }); // 往下翻输入
+      ctx.sc.dispatch("wheel", { deltaX: 50, deltaY: -2 }); // 横向小抖动：忽略
+      ctx.sc.userScrollTo(1170); // 朝底部、进贴底带
+      expect(ctx.ctrl.isFollowing()).toBe(true);
+    });
+
+    it("用户在外层真上滚、同一帧 Virtuoso 补偿 +28 合并成净正 delta → 仍停跟随（不按 delta 方向丢意图）", () => {
+      // 评审建议的「onScroll 里 delta>0 就丢意图」会在这里把真上滚吞掉、人被贴底拽回；所以只在源头排除
+      const ctx = setupWithScroller({ top: 1200 });
+      ctx.sc.dispatch("wheel", { deltaY: -7.5 });
+      ctx.sc.userScrollTo(1200); // 用户 -7、补偿 +7 以上 → 同一帧的 scroll 事件净 delta ≥ 0
+      expect(ctx.ctrl.isFollowing()).toBe(false);
+    });
+  });
+
+  describe("触摸 / 键盘路径与滚轮同口径过滤（评审 R3：此前只有滚轮路径过滤、触摸 / 键盘仍会登记残留意图）", () => {
+    const streamAndPin = (ctx: ReturnType<typeof setupWithScroller>) => {
+      ctx.sc.grow(28);
+      ctx.ctrl.requestScrollToBottom();
+      flushFrame();
+      ctx.sc.dispatch("scroll");
+    };
+    const innerScrollable = (scrollTop: number, parent: unknown) => ({
+      scrollTop,
+      scrollHeight: 600,
+      clientHeight: 200,
+      parentElement: parent,
+      tagName: "DIV",
+      isContentEditable: false,
+    });
+
+    it("触摸：手指落在内层可滚区（scrollTop>0）里下拖 → 被内层吃掉、跟随不受影响", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      const target = innerScrollable(80, ctx.sc.el);
+      ctx.sc.dispatch("touchstart", { touches: [{ clientX: 50, clientY: 100 }], target });
+      ctx.sc.dispatch("touchmove", { touches: [{ clientX: 50, clientY: 160 }], target });
+      streamAndPin(ctx);
+      expect(ctx.ctrl.isFollowing()).toBe(true);
+    });
+
+    it("触摸：横向为主的滑动（左右滑代码块 / 表格）不关跟随", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      ctx.sc.dispatch("touchstart", { touches: [{ clientX: 50, clientY: 100 }] });
+      ctx.sc.dispatch("touchmove", { touches: [{ clientX: 150, clientY: 106 }] });
+      streamAndPin(ctx);
+      expect(ctx.ctrl.isFollowing()).toBe(true);
+    });
+
+    it("触摸：内层已在顶（scrollTop=0）→ 手势冒泡到外层，照常停跟随", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      const target = innerScrollable(0, ctx.sc.el);
+      ctx.sc.dispatch("touchstart", { touches: [{ clientX: 50, clientY: 100 }], target });
+      ctx.sc.dispatch("touchmove", { touches: [{ clientX: 50, clientY: 160 }], target });
+      ctx.sc.userScrollTo(1150);
+      expect(ctx.ctrl.isFollowing()).toBe(false);
+    });
+
+    it("触摸：被忽略的下拖不会作废「往下翻」输入", () => {
+      const ctx = setupWithScroller({ top: 1200 });
+      ctx.sc.dispatch("wheel", { deltaY: -100 });
+      ctx.sc.userScrollTo(1000);
+      expect(ctx.ctrl.isFollowing()).toBe(false);
+      ctx.sc.dispatch("wheel", { deltaY: 100 }); // 往下翻输入
+      const target = innerScrollable(80, ctx.sc.el);
+      ctx.sc.dispatch("touchstart", { touches: [{ clientX: 50, clientY: 100 }], target });
+      ctx.sc.dispatch("touchmove", { touches: [{ clientX: 50, clientY: 160 }], target }); // 内层吃掉：忽略
+      ctx.sc.userScrollTo(1170);
+      expect(ctx.ctrl.isFollowing()).toBe(true);
+    });
+
+    it("键盘：焦点在内层可滚区（scrollTop>0）里按 ↑ / PageUp / Home → 内层消化、跟随不受影响", () => {
+      for (const k of ["ArrowUp", "PageUp", "Home"]) {
+        const ctx = setupWithScroller({ top: 1200 });
+        ctx.sc.dispatch("keydown", { key: k, target: innerScrollable(80, ctx.sc.el) });
+        streamAndPin(ctx);
+        expect(ctx.ctrl.isFollowing(), k).toBe(true);
+      }
+    });
+
+    it("键盘：内层已在顶 / 焦点在外层自身 → 照常停跟随", () => {
+      for (const mk of [
+        (el: unknown) => innerScrollable(0, el),
+        (el: unknown) => el, // 目标就是外层容器
+      ]) {
+        const ctx = setupWithScroller({ top: 1200 });
+        const target = mk(ctx.sc.el);
+        ctx.sc.dispatch("keydown", { key: "ArrowUp", target });
+        ctx.sc.userScrollTo(1160);
+        expect(ctx.ctrl.isFollowing()).toBe(false);
+      }
+    });
+
+    it("键盘：↓ / PageDown 不受影响（只过滤上滚方向）", () => {
+      const ctx = setupWithScroller({ top: 1000 });
+      ctx.ctrl.setFollowing(false);
+      ctx.sc.dispatch("keydown", { key: "End", target: innerScrollable(80, ctx.sc.el) });
+      ctx.sc.userScrollTo(1170); // 朝底部、进贴底带
+      expect(ctx.ctrl.isFollowing()).toBe(true);
+    });
+  });
+
   it("滚轮往下不是上滚意图", () => {
     const { ctrl, sc } = setupWithScroller();
     sc.dispatch("wheel", { deltaY: 40 });

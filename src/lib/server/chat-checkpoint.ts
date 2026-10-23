@@ -46,6 +46,7 @@ import {
   readMetaV06,
   readMetaV06Evidence,
   taskDir,
+  withEventAppendChain,
   withTaskLock,
   writeMeta,
 } from "./task-fs-core";
@@ -1146,25 +1147,51 @@ const readEventsRawText = async (taskId: string): Promise<string> => {
   }
 };
 
-/** 原子重写 events：保留严格早于 eventId 的行（不含目标及之后） */
+/**
+ * 原子重写 events：保留严格早于 eventId 的行（不含目标及之后）。
+ *
+ * **整段「读全量 → slice → tmp + rename」排进 events 的追加链**（评审 BE5）：追加走 `appendEventLine` 的
+ * per-task 链、不拿 `withTaskLock`，回退持的锁挡不住它——旁路群答疑 run 等写者在读和 rename 之间 `appendFile`
+ * 到旧文件，那一行会被 rename 吃掉（客户端已收到 publish、磁盘没有、seq 出现空洞）。进链后：链里已排的写者先落完，
+ * 这里读到的是一致快照；之后排队的写者落在截断后的文件上（= 落在截断点之后）。
+ * 调用方已持 `withTaskLock`，链内写者都不取锁，先持锁再进链不会互等（见 `withEventAppendChain`）。
+ */
 export const truncateEventsBeforeEventId = async (
   taskId: string,
   eventId: string,
-): Promise<{ kept: TaskEvent[]; truncatedCount: number } | null> => {
-  const events = await readEvents(taskId);
-  const idx = events.findIndex((e) => e.id === eventId);
-  if (idx < 0) return null;
-  const kept = events.slice(0, idx);
-  const truncatedCount = events.length - kept.length;
+): Promise<{ kept: TaskEvent[]; truncatedCount: number } | null> =>
+  withEventAppendChain(taskId, async () => {
+    const events = await readEvents(taskId);
+    const idx = events.findIndex((e) => e.id === eventId);
+    if (idx < 0) return null;
+    const kept = events.slice(0, idx);
+    const truncatedCount = events.length - kept.length;
 
-  const finalPath = path.join(taskDir(taskId), EVENTS_FILE);
-  const body =
-    kept.length === 0
-      ? ""
-      : kept.map((e) => JSON.stringify(e)).join("\n") + "\n";
-  await atomicWriteTextFile(finalPath, body);
-  return { kept, truncatedCount };
-};
+    const finalPath = path.join(taskDir(taskId), EVENTS_FILE);
+    const body =
+      kept.length === 0
+        ? ""
+        : kept.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    await atomicWriteTextFile(finalPath, body);
+    return { kept, truncatedCount };
+  });
+
+/**
+ * 后置失败时把 events 恢复成截断前的原文（best-effort 的补偿）。同样排进追加链，并且**只在文件
+ * 真被改写过时才写回**：
+ * - 备份之后文件只被追加（现状就是这种：走到这条补偿路径时截断没有成功、文件没动，期间只可能有旁路
+ *   run 追加）→ 当前内容以备份为前缀，什么都不用做——原样写回备份反而会把这期间追加的行抹掉；
+ * - 当前内容不以备份为前缀（文件被改写过，截断落了盘却走到这里，按设计不该发生）→ 写回备份，保持旧行为。
+ */
+export const restoreEventsRawText = (
+  taskId: string,
+  backup: string,
+): Promise<void> =>
+  withEventAppendChain(taskId, async () => {
+    const current = await readEventsRawText(taskId);
+    if (current.startsWith(backup)) return;
+    await atomicWriteTextFile(path.join(taskDir(taskId), EVENTS_FILE), backup);
+  });
 
 // ----------------- rewind 主流程 -----------------
 
@@ -1665,10 +1692,7 @@ export const executeChatRewind = async (
         // best-effort：恢复 events 原文 + rewind_points 中间态（locked + safety）
         const restoreNotes: string[] = [];
         try {
-          await atomicWriteTextFile(
-            path.join(taskDir(taskId), EVENTS_FILE),
-            eventsRawBackup,
-          );
+          await restoreEventsRawText(taskId, eventsRawBackup);
         } catch (restoreErr) {
           restoreNotes.push(
             `events 恢复失败：${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`,

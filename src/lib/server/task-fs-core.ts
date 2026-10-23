@@ -803,7 +803,7 @@ const parseEventLine = (raw: string): TaskEvent | null => {
 };
 
 /** 从 Buffer 行去 CR 再 parse（反向按字节扫 \n 时用） */
-const parseEventLineBuf = (buf: Buffer): TaskEvent | null => {
+export const parseEventLineBuf = (buf: Buffer): TaskEvent | null => {
   let s = buf;
   if (s.length > 0 && s[s.length - 1] === 0x0d) s = s.subarray(0, s.length - 1);
   return parseEventLine(s.toString("utf-8"));
@@ -1513,6 +1513,43 @@ const appendEventLineUnlocked = async (
 };
 
 /**
+ * 在某 task 的 events.jsonl **追加链**里跑一段（与 {@link appendEventLine} 同一条 per-task 链、同一套
+ * 「前一个失败也跑本次 / 链尾永不 reject」语义）。
+ *
+ * 为什么要有它（2026-10-23 评审 BE5）：回退要**整文件重写** events.jsonl（读全量 → slice → tmp + rename），
+ * 而 {@link appendEventLine} 不拿 `withTaskLock`，两者互不排斥——读和 rename 之间若有 `appendFile` 落到旧文件，
+ * rename 之后那一行就没了（客户端已经收到 publish、磁盘上却没有，seq 出现空洞）。现实写者：
+ * 旁路群答疑 run（`restricted-question` 的 `writeOwnedEventAndPublish`）不被回退的 idle 守卫挡住。
+ * 整文件重写必须排进这条链：链内写者先落完、重写拿到的是一致快照，之后排队的写者落在截断后的文件上。
+ *
+ * ⚠ `fn` 里**不能**再调 `appendEventLine` / `appendEvent` / 本函数（同 task）——它们要等本条链，会死锁。
+ * 也不要在 `fn` 里去取 `withTaskLock`：调用方可能已经持锁（回退就是），链内再取锁、而持锁者在等链 = 互等。
+ * （链内现有写者——lease / onCommitted / seq 发号——都不取 withTaskLock，所以「先持锁、再进链」是安全的。）
+ */
+export const withEventAppendChain = async <T>(
+  id: string,
+  fn: () => Promise<T>,
+): Promise<T> => {
+  const chains = getEventAppendChains();
+  const previous = chains.get(id) ?? Promise.resolve();
+  // previous 失败也跑本次（.then(fn, fn)）；本次失败仍抛给 await 方
+  const next = previous.then(fn, fn);
+  // 链尾永不 reject，避免一次失败毒死后续排队者
+  const retained = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  chains.set(id, retained);
+  try {
+    return await next;
+  } finally {
+    if (chains.get(id) === retained) {
+      chains.delete(id);
+    }
+  }
+};
+
+/**
  * 追加一条事件行（按 taskId 串行）。
  * 链上单次写入失败会抛给调用方，但不中断后续写入（catch 后继续）。
  *
@@ -1530,8 +1567,6 @@ export const appendEventLine = async (
   lease?: () => boolean,
   onCommitted?: (event: TaskEvent) => void,
 ): Promise<boolean> => {
-  const chains = getEventAppendChains();
-  const previous = chains.get(id) ?? Promise.resolve();
   // lease 必须在 chain 内、appendFile 前同步验——入队后失主则拒写
   const run = async (): Promise<boolean> => {
     await failpoint("event.inQueue");
@@ -1564,21 +1599,7 @@ export const appendEventLine = async (
     }
     return true;
   };
-  // previous 失败也跑本次写（.then(run, run)）；本次失败仍抛给 await 方
-  const next = previous.then(run, run);
-  // 链尾永不 reject，避免一次失败毒死后续排队者
-  const retained = next.then(
-    () => undefined,
-    () => undefined,
-  );
-  chains.set(id, retained);
-  try {
-    return await next;
-  } finally {
-    if (chains.get(id) === retained) {
-      chains.delete(id);
-    }
-  }
+  return withEventAppendChain(id, run);
 };
 
 /**

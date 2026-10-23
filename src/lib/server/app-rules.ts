@@ -12,7 +12,7 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import matter from "gray-matter";
+import { parseFrontmatter } from "./frontmatter";
 
 import { getAppRulesDir } from "./cursor-config";
 
@@ -51,7 +51,7 @@ const scanRulesDir = async (dir: string): Promise<AppRuleEntry[]> => {
     const abs = path.join(dir, ent.name);
     try {
       // gray-matter 剥掉老文件可能残留的 frontmatter、预览只看正文
-      const parsed = matter(await fs.readFile(abs, "utf-8"));
+      const parsed = parseFrontmatter(await fs.readFile(abs, "utf-8"));
       out.push({
         name: path.basename(ent.name, path.extname(ent.name)),
         absPath: abs,

@@ -216,11 +216,15 @@ describe("bootstrap 帧序与 replay 标记", () => {
       "restricted_run",
       "talk_queue",
       "background_subagents",
+      // 进行中正文快照紧挨在思考快照之前（同一类「重连补态」帧，bootstrap 末尾两帧）
+      "assistant_snapshot",
       "thinking_snapshot",
     ]);
     const events = frames.filter((f) => f.type === "event");
     expect(events.every((f) => f.replay === true)).toBe(true);
     expect(frames.at(-1)).toEqual({ type: "thinking_snapshot", live: null });
+    // 没有进行中的正文：assistant 快照照发、live 为 null
+    expect(frames.at(-2)).toEqual({ type: "assistant_snapshot", live: null });
   });
 
   it("有进行中的思考：快照带 eventId / 已发出的文本 / 累计数 / 首帧时刻（字段口径与 thinking_delta 帧一致）", async () => {

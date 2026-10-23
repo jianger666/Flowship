@@ -19,7 +19,8 @@ export const runtime = "nodejs";
 export const GET = async () => {
   try {
     return NextResponse.json({
-      config: await readWkConfig(),
+      // strict：文件存在但读不动时回 500 read_failed（不是 200 + 空配置）——设置页据此显示「读取失败」、不放行保存
+      config: await readWkConfig({ strict: true }),
       path: wkConfigPath(),
     });
   } catch (err) {

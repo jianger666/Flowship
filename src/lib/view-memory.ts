@@ -336,6 +336,26 @@ export const saveBoxHeight = (h: number) => {
   }
 };
 
+// ---------- 提问时间线：是否显示「定时触发」项（全局偏好、跨任务共用；默认不显示） ----------
+
+const OUTLINE_SHOW_SCHEDULE_KEY = "flowship:outline-show-schedule";
+
+export const loadOutlineShowSchedule = (): boolean => {
+  try {
+    return localStorage.getItem(OUTLINE_SHOW_SCHEDULE_KEY) === "1";
+  } catch {
+    return false;
+  }
+};
+
+export const saveOutlineShowSchedule = (on: boolean) => {
+  try {
+    localStorage.setItem(OUTLINE_SHOW_SCHEDULE_KEY, on ? "1" : "0");
+  } catch {
+    /* 存储被禁忽略 */
+  }
+};
+
 // ---------- 看板时间范围（会话级：改过区间切页不重置、重启回默认防陈旧日期） ----------
 
 const BOARD_RANGE_KEY = "flowship:board-range";

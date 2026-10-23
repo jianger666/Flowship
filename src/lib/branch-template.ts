@@ -22,19 +22,26 @@
 export const DEFAULT_BRANCH_TEMPLATE = "feature/{storyId}-{taskTitle}";
 
 /**
- * 单段 branch-safe：保留中文 + 字母数字；空白 / 各种括号 / git 非法字符（~ ^ @ : ? * [ \ / < > | "）
- * 以及 shell 元字符（$ ` ; ! &）统一换 -；连续点折 -（git 禁 ..）；首尾 - 和 . 去掉。
- * 中间单点保留（如 v1.0）。
+ * 单段 branch-safe：**以白名单为准**——只保留 `[A-Za-z0-9\u4e00-\u9fa5._-]`（字母数字 + 常用汉字 + `.` `_` `-`），
+ * 其它一切字符（空白 / 括号 / 全角标点 / 弯引号 / `'` `#` `%` `+` / emoji / 书名号 / 带音标字母 /
+ * git 非法字符 / shell 元字符 …）统一换 -；连续点折 -（git 禁 ..）；首尾 - 和 . 去掉；
+ * 段尾 `.lock` 改成 `-lock`（git 禁以 .lock 结尾的 ref 分量）。中间单点保留（如 v1.0）。
+ *
+ * 为什么是白名单而不是黑名单：旧实现只替换一批已知标点，不在替换集也不在 isSafeBranchName
+ * 白名单里的字符（全角逗号 / 冒号 / 感叹号、弯引号、`#`、emoji 等）会原样保留，随后任务启动时
+ * 抛「任务分支名非法」、隔离工作区创建失败；中文团队的任务标题带全角标点很常见，命中率不低。
+ * 白名单与 isSafeBranchName 同一字符集，任意输入的清洗结果必过校验（tests/branch-template.test.ts 有属性测试）。
  *
  * 注意：`/` 也换成 -——变量值不该自带路径层级、层级由模板字面控制。
  */
 export const sanitizeBranchSegment = (s: string): string =>
   s
     .trim()
-    .replace(/[\s\\/:*?"<>|~^@`$!&;【】（）()\[\]{}]+/g, "-")
+    .replace(/[^A-Za-z0-9\u4e00-\u9fa5._-]+/g, "-")
     .replace(/\.{2,}/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^[-.]+|[-.]+$/g, "");
+    .replace(/^[-.]+|[-.]+$/g, "")
+    .replace(/\.lock$/i, "-lock");
 
 /**
  * 完整分支名清洗：按 `/` 分段走 sanitizeBranchSegment，保留路径分隔。
@@ -55,11 +62,12 @@ export const isSafeBranchName = (name: string): boolean => {
   if (!name || name !== name.trim()) return false;
   if (name.startsWith("-") || name.endsWith(".lock")) return false;
   if (name.includes("..") || name.includes("//")) return false;
-  // 与 sanitizeBranchSegment 同级字符集，额外允许 `/` 作层级分隔
+  // 与 sanitizeBranchSegment 同一白名单，额外允许 `/` 作层级分隔
   if (!/^[A-Za-z0-9\u4e00-\u9fa5._/-]+$/.test(name)) return false;
-  // 分段不能为空、不能是 `.`、不能以 `.` 结尾（git 禁）
+  // 分段不能为空、不能以 `.` 开头或结尾、不能以 `.lock` 结尾（git check-ref-format 对每个分量都禁）
   for (const seg of name.split("/")) {
-    if (!seg || seg === "." || seg.endsWith(".")) return false;
+    if (!seg || seg.startsWith(".") || seg.endsWith(".")) return false;
+    if (seg.endsWith(".lock")) return false;
   }
   return true;
 };
@@ -120,7 +128,11 @@ export const renderBranchName = (
     .replace(/\/{2,}/g, "/")
     .replace(/^\/+|\/+$/g, "");
   // 模板字面量也可能带非法字符（如 `feature$/{storyId}`）——整串再过一遍 branch-safe
-  return sanitizeBranchName(rendered);
+  const cleaned = sanitizeBranchName(rendered);
+  if (isSafeBranchName(cleaned)) return cleaned;
+  // 兜底：极端输入（标题全是 emoji 且模板只有 {taskTitle} → 空串 / 模板字面量本身就非法）清洗后仍不合法时，
+  // 退回 feature/{storyId}-{时间戳}，保证 worktree 创建永远拿得到合法分支名
+  return `feature/${sanitizeBranchSegment(vars.storyId ?? "") || "task"}-${formatDate("yyyyMMdd-HHmmss", now)}`;
 };
 
 /**

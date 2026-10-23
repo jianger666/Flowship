@@ -46,7 +46,8 @@ export const stringifyMeta = (v: unknown): string => {
 //   - action: 单条 ActionRecord 更新（V0.6 新、UI 增量刷 timeline）
 //   - done: agent run 终止（运行时层、跟 task 业务终态独立）
 //   - error: 顶层错误（用于显示 toast）
-//   - assistant_delta: assistant_message 流式 chunk、UI 拼接打字效果
+//   - assistant_delta: assistant_message 流式 chunk、UI 拼接打字效果（纯内存；新订阅者靠 bootstrap 的
+//     assistant_snapshot 帧补上「已发出的整段」，见 sdk-message-handler.getLiveAssistantSnapshot）
 //   - thinking_delta: 思考进行中的实时增量（纯内存、不落盘；UI 把它累积成工作过程里「进行中的
 //     那条 thinking 行」，思考段落盘后的 thinking 事件才是正式内容，id 与帧里的 eventId 一致）。
 //     只给属主主链发、没有 origin
@@ -72,7 +73,10 @@ export type TaskStreamEvent =
   | { kind: "action"; action: ActionRecord }
   | { kind: "done"; task: Task; ok: boolean; origin?: string }
   | { kind: "error"; message: string }
-  | { kind: "assistant_delta"; text: string; origin?: string }
+  // eventId（仅属主主链有）= 这一段正文落盘后那条 assistant_message 的预定 id：段内第一个 chunk 时定下、
+  // 之后每帧相同、落盘时原样复用（与 thinking_delta 同套路）。watch-task 路由靠它判断「这段正文已经在
+  // bootstrap 读到的 tail 里落盘了」，把订阅后才到的同段尾巴 delta 丢掉——否则重连瞬间会冒出一小截幽灵流式文字
+  | { kind: "assistant_delta"; text: string; origin?: string; eventId?: string }
   // 思考实时帧：一段思考要攒到结束才落一条 thinking 事件，期间界面只剩「等待模型响应…」——
   // 实测一段 65s 的思考（模型第 6s 就开始了）让用户干等 70s。这一帧让「思考中」实时可见。
   // eventId = 这段思考落盘后那条 thinking 事件的 id：服务端在段内第一个 chunk 时预先定好、
@@ -106,6 +110,16 @@ export interface RunningTaskRecord {
   // V0.6.6 热更：agent 启动时的 {title,role,feishuStoryUrl} 快照、reused 推进时 diff 出变更注入 directive
   startSnapshot: TaskFieldsSnapshot;
   cancel: () => void;
+  /**
+   * 把这一路 run 里「已缓冲、还没落盘」的半截思考 + 正文立刻落盘（stop 专用）。
+   * 只有 consumeSessionRun 里真正在消费流的那条 record 才有；预登记的 record / 没有半截内容时可缺省或空转。
+   *
+   * 为什么需要（BE1-02）：stop 的第一步是 revokeTaskOps，之后 run 自己的 lease 就失主了——
+   * 流收尾那段 flush 整段跳过，用户停止前已经流给他看的半截回复 / 思考只存在于内存、刷新页面就没了。
+   * 所以 stop 必须在 revoke **之前同步起跑**这个函数（它同步取走 buffer、写盘用固定放行的 lease），
+   * 再 revoke，最后 await 它落盘完成。绝不抛。
+   */
+  flushPartialOutput?: () => Promise<void>;
 }
 
 /**
@@ -753,6 +767,21 @@ export const writeOwnedEventAndPublish = async (
 };
 
 // ----------------- runner 状态小工具 -----------------
+
+/**
+ * stop 专用：把这个 task 在飞的 run 里「已缓冲、还没落盘」的半截思考 + 正文落盘（没有 run / 没有半截内容 = no-op）。
+ * **必须在 revokeTaskOps 之前调用、且调用时不要 await**——它同步取走 buffer，之后 revoke 才不会让半截输出随 lease 失主丢掉；
+ * 调用方在 revoke 之后再 await 返回的 Promise（保证半截回复先于「用户停止了」那条 info 落盘）。绝不抛。
+ */
+export const flushRunningTaskPartialOutput = async (taskId: string): Promise<void> => {
+  const rec = runningTasks.get(taskId);
+  if (!rec?.flushPartialOutput) return;
+  try {
+    await rec.flushPartialOutput();
+  } catch (err) {
+    console.warn(`[task-stream] task=${taskId} flushRunningTaskPartialOutput 失败：`, err);
+  }
+};
 
 // 等某 task 的 run 真正退出（cancel 后 runningTasks entry 由 run 的 finally 清）
 export const waitForTaskToStop = async (

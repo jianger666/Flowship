@@ -72,6 +72,26 @@ describe("next.config.mjs headers()：CSP 只下发 Report-Only", () => {
   });
 });
 
+describe("防点击劫持：X-Frame-Options（Report-Only 的 frame-ancestors 只上报、不拦）", () => {
+  it("对所有路由下发 X-Frame-Options: SAMEORIGIN", async () => {
+    const rules = await loadRules();
+    const rule = rules.find((r) =>
+      r.headers.some((h) => h.key.toLowerCase() === "x-frame-options"),
+    );
+    expect(rule?.source).toBe("/:path*");
+    const hit = rule!.headers.find((h) => h.key.toLowerCase() === "x-frame-options");
+    expect(hit?.value).toBe("SAMEORIGIN");
+  });
+
+  it("dev / 生产都下发", async () => {
+    for (const env of ["development", "production"]) {
+      vi.stubEnv("NODE_ENV", env);
+      const keys = (await loadRules()).flatMap((r) => r.headers.map((h) => h.key.toLowerCase()));
+      expect(keys).toContain("x-frame-options");
+    }
+  });
+});
+
 describe("策略内容：关键指令不能丢", () => {
   it("含 object-src 'none' / base-uri 'self' / frame-ancestors 'self' / report-uri /api/csp-report", async () => {
     const policy = await policyOf();

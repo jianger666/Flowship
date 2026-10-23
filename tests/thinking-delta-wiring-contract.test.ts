@@ -198,7 +198,7 @@ describe("chat-view 清理时机：落盘事件 / 正文 / 结束都要清「思
   it("onEvent：清实时态与追加落盘事件在同一个同步回调里、且清在前（同批渲染 → 合成行直接换成同 id 的落盘行，没有空档）", () => {
     const onEvent = sliceBalanced(chatView, "onEvent: (ev, meta) => {", "{");
     const clearAt = onEvent.indexOf("clearThinkingLive();");
-    const appendAt = onEvent.indexOf("onEventAppendRef.current(ev);");
+    const appendAt = onEvent.indexOf("onEventAppendRef.current(ev, meta);");
     expect(clearAt).toBeGreaterThanOrEqual(0);
     expect(appendAt).toBeGreaterThan(clearAt);
     // 两者之间不能有 await——一旦隔着异步，React 就可能把它们拆成两次渲染、中间闪一帧空档

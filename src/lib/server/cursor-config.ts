@@ -20,7 +20,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import matter from "gray-matter";
+import { parseFrontmatter } from "./frontmatter";
 import type { McpServerConfig } from "@cursor/sdk";
 
 import { RESERVED_MCP_NAMES } from "../mcp-config";
@@ -168,7 +168,7 @@ export const readAppRulesForPrompt = async (): Promise<string> => {
   for (const file of files) {
     if (disabled.has(path.basename(file, path.extname(file)))) continue;
     try {
-      const parsed = matter(await fs.readFile(file, "utf-8"));
+      const parsed = parseFrontmatter(await fs.readFile(file, "utf-8"));
       // 老文件可能「只有 frontmatter description、正文为空」——退到 description、
       // 别把启用中的规则静默漏掉（Bugbot 揪出：UI 显示启用、prompt 里却没有）
       const body = parsed.content.trim();

@@ -40,7 +40,8 @@ const PROBE_DOT: Record<WkHubProbeStatus, string> = {
 };
 
 export const WkHarnessSection = () => {
-  const { config, loaded, configPath, saved, update, save } = useWkConfig();
+  const { config, loaded, loadError, reload, configPath, saved, update, save } =
+    useWkConfig();
 
   // 原生 picker 调用中（防双击连开两个系统对话框）
   const [picking, setPicking] = useState(false);
@@ -148,6 +149,22 @@ export const WkHarnessSection = () => {
 
   if (!loaded) {
     return <LoadingState variant="inline" />;
+  }
+
+  // 读取失败：不画表单。空表单一旦被编辑 + 失焦就会提交空值、清掉 ~/.wk/config.yaml 里已有的 Hub 地址 / Token / 产出目录（hook 里 save 也会拒绝，这里是让人看得懂）
+  if (loadError) {
+    return (
+      <div className="space-y-2">
+        <div className="text-sm font-medium">团队 wk 流程</div>
+        <p className="text-xs text-destructive">
+          读取 ~/.wk/config.yaml 失败（{loadError}），已暂停编辑，避免空表单覆盖已有配置。
+        </p>
+        <Button type="button" variant="outline" size="sm" onClick={reload}>
+          <RefreshCw />
+          重新读取
+        </Button>
+      </div>
+    );
   }
 
   // 探测 / 「测试连接」按钮跟着草稿走：地址和 Token 都没失焦也能先一起验证

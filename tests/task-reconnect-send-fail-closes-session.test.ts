@@ -280,15 +280,18 @@ describe("task 自动重连：resume 成功但 send 失败 → 摘掉新装会�
       await waitUntil(() => agentR2.send.mock.calls.length >= 1, 12_000);
       expect(String(agentR2.send.mock.calls[0]![0])).toContain("网络连接中断");
       expect(mockResume).toHaveBeenCalledTimes(2);
-      const events = await readEvents(id);
-      expect(
-        events.some(
+      // 「重连成功」事件在 send 受理**之后**才 await 落盘（task-runner 的重连分支）：上面 send 被调用
+      // 只说明请求发出去了，不说明这条 info 已写盘——立刻 readEvents 断言是确定会偶发红的竞态
+      // （评审 R7 F-1：8 路并发下 HEAD 16 次里 2 次红），这里和上面「重连中 2/5」一样轮询等它落盘。
+      await waitUntil(async () => {
+        const events = await readEvents(id);
+        return events.some(
           (e) =>
             e.kind === "info" &&
             e.meta?.kind === "reconnected" &&
             e.meta?.attempt === 2,
-        ),
-      ).toBe(true);
+        );
+      }, 8000);
 
       await pSend.catch(() => {});
     },

@@ -83,6 +83,7 @@ import {
 } from "./update-verify-retry.mjs";
 // 外链 / 导航协议白名单（纯函数、可单测）：./external-url.mjs
 import {
+  isCanonicalAppOrigin,
   isIdeDeepLink,
   isSafeExternalUrl,
   isSafeMailtoUrl,
@@ -198,6 +199,9 @@ const applyAppNapGuard = () => {
 // `http://127.0.0.1:8876@evil/` / `:88760/` / `.attacker.tld/` 前缀绕过（审查发现）
 // （判定本身在 ./external-url.mjs、有单测；这里只绑定本实例的 host / port）
 const isAppUrl = (url) => isSameAppOrigin(url, { host: HOST, port: PORT });
+// 本应用 origin 的「精确」判定（will-navigate 用）：isAppUrl 还认 localhost / [::1] 等回环别名，
+// 别名要拦、不能放行同 frame 导航（见 external-url.mjs 的 isSameAppOrigin 注释）
+const isCanonicalAppUrl = (url) => isCanonicalAppOrigin(url, { host: HOST, port: PORT });
 
 // 外链白名单（isSafeExternalUrl、定义见 ./external-url.mjs）：http(s) + 系统设置深链，
 // setWindowOpenHandler 与 IPC open-external 共用，避免 window.open / IPC 成任意协议跳板。
@@ -1302,7 +1306,15 @@ const createWindow = async () => {
       void installUpdateNow();
       return;
     }
-    if (isAppUrl(url)) return;
+    if (isAppUrl(url)) {
+      // 本应用 origin → 放行；localhost / [::1] 等回环别名也是「站内」、但与主窗不同源：放行会把主窗带去别的 origin
+      // （跨站、被中间件 403），交系统浏览器又是 Sec-Fetch-Site: none 绕过 Fetch Metadata 闸——两头都不要，拦下
+      if (!isCanonicalAppUrl(url)) {
+        e.preventDefault();
+        log(`[will-navigate] 拒绝回环别名站内 URL：${String(url).slice(0, 80)}`);
+      }
+      return;
+    }
     // 站外一律先拦导航：不论后面放行与否，主窗都不能被带走
     e.preventDefault();
     if (isSafeExternalUrl(url) || isIdeDeepLink(url) || isSafeMailtoUrl(url)) {

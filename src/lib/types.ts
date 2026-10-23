@@ -1187,16 +1187,52 @@ export interface TaskChangeFile {
   untracked: boolean;
   /** 磁盘上的绝对路径（跳 IDE 用；deleted 文件已不在盘上、前端不要拿它跳） */
   absolutePath: string;
+  /**
+   * 忽略空白（`-w`）时这个文件只剩空白差异：行数统计是 0 / 0、diff 是空的。
+   * git 在 `-w` 下 name-status 仍会列它、numstat 却会省略它——不单独标出来会被当成「没统计到的二进制」
+   */
+  whitespaceOnly?: boolean;
+  /**
+   * 嵌套的 git 仓库：未跟踪的目录里自带 `.git`，git 只能把它整个当成一项、看不进去。
+   * `path` 已去掉尾斜杠；没有行数、没有 diff——它里面的改动要到它自己的仓库里看（前端不会为它请求 diff）。
+   */
+  nestedRepo?: boolean;
+  /**
+   * 文件级内容指纹：旧侧（基线）与新侧（工作区 / 提交）两个 blob 的标识拼成，形如 `a1b2c3d4e5f6..9f8e7d6c5b4a`
+   * （各取 git blob oid 前 12 位；没有旧侧——新增 / 未跟踪——旧侧写 `-`，没有新侧——已删除——新侧写 `-`；
+   * 超大 / 读不到内容的新侧退回 `m<大小>:<mtime>`）。
+   * 读内容算 oid 有成本控制：每次读取里「已跟踪文件的补算 + 未跟踪文件的读盘」共用一份字节预算，超出的先退回
+   * `m<大小>:<mtime>`，之后几次读取靠缓存（命中的不占预算）逐个变成 oid——极端情况下（一次改动里有几十 MB 的文件）
+   * 同一个文件的指纹会变一次，它的「已查看」也会跟着失效一次。
+   * 同一份内容无论在工作区 / 暂存区 / 提交里，指纹字符串都相同——`git add`、`git commit` 不会让「已查看」失效
+   * （例外：配了 autocrlf 之类的清洗过滤器时，进暂存区的 blob 与工作区原文不同，会多失效一次）。
+   * 前端用它判断「这个文件的 diff 还是不是我上次看的那份」：只靠「状态 + 增删行数」会把
+   * 「切分支后同一文件同样 +1 −1」当成没变——单文件 diff 缓存命中旧分支的内容、「已查看」标记也沿用。
+   * 缺省 = 没取到（计算失败 / 超出上限）；前端退回只用状态 + 行数。
+   */
+  fingerprint?: string;
 }
+
+/**
+ * 改动范围（改动面板顶部的「范围」切换）：
+ * - branch：相对线上分支分叉点的全部改动（已提交 + 未提交 + 未跟踪）——默认
+ * - uncommitted：只看未提交的（相对 HEAD，含未跟踪）——agent 刚改的这一点
+ * - commit：分支上的某一个提交（相对它的第一个父提交）；sha 必须在「线上分支..HEAD」里
+ */
+export type TaskChangeScope =
+  | { kind: "branch" }
+  | { kind: "uncommitted" }
+  | { kind: "commit"; sha: string };
 
 /**
  * 改动基线：
  * - merge-base：HEAD 与「线上分支」的分叉点——任务分支上自己的提交 + 未提交改动都算「本任务的改动」
- * - head：找不到线上分支时的降级，只能看 HEAD 之后的未提交改动
+ * - head：找不到线上分支时的降级（或「只看未提交」范围），只能看 HEAD 之后的未提交改动
+ * - commit-parent：看单个提交时，基线是该提交的第一个父提交
  */
 export interface TaskRepoChangeBase {
-  kind: "merge-base" | "head";
-  /** 展示用的参照名：origin/main / main / HEAD */
+  kind: "merge-base" | "head" | "commit-parent";
+  /** 展示用的参照名：origin/main / main / HEAD / abc1234^ */
   label: string;
   /** 基线 commit 的短 sha（展示用） */
   shortSha: string;
@@ -1207,7 +1243,9 @@ export type TaskRepoChangesUnavailable =
   | "dir_missing"
   | "not_git"
   | "no_head"
-  | "git_error";
+  | "git_error"
+  /** 选中的提交不在当前分支上（切了分支 / 提交被改写）——前端提示并回落到「全部改动」 */
+  | "scope_invalid";
 
 export interface TaskRepoChanges {
   /** 原仓路径（task.repoPaths 里的值；接口按它定位仓） */
@@ -1233,6 +1271,48 @@ export interface TaskRepoChanges {
   filesTruncated?: boolean;
   /** 未跟踪文件清单读取失败 / 超限、新文件可能没列全 */
   untrackedSkipped?: boolean;
+  /** 本次读取用的范围（原样回显，前端据此丢弃过期响应） */
+  scope?: TaskChangeScope["kind"];
+  /** 当前分支比线上分支多几个提交（merge-base 基线才有） */
+  aheadOfBase?: number;
+  /** 线上分支比分叉点多几个提交（= 当前分支落后线上分支多少；merge-base 基线才有） */
+  behindBase?: number;
+  /**
+   * 手动指定了「对比基线」：requested = 用户选的分支名；applied = 是否生效
+   * （分支不存在 / 与 HEAD 无共同祖先时回落成自动探测，前端据此提示）
+   */
+  baseOverride?: { requested: string; applied: boolean };
+}
+
+/** 分支上的一个提交（提交选择器用） */
+export interface TaskRepoCommit {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  author: string;
+  /** 提交时间（秒） */
+  ts: number;
+  /**
+   * 合并提交（多个父提交）：只有合并提交才带。看它「相对第一父」的改动可能是整条被合进来的分支，
+   * 不是这次合并自己「做了什么」——UI 据此标注，免得用户以为是 bug。
+   */
+  isMerge?: boolean;
+}
+
+/** 一个仓「线上分支..HEAD」之间的提交（新 → 旧） */
+export interface TaskRepoCommitList {
+  repoPath: string;
+  shortName: string;
+  /** 读不到（工作区缺失 / 非 git / 没有线上分支可比）时带原因，commits 为空 */
+  unavailable?: TaskRepoChangesUnavailable | "no_base";
+  base: TaskRepoChangeBase | null;
+  commits: TaskRepoCommit[];
+  /** 提交数超过上限、只列了最近的一部分 */
+  truncated?: boolean;
+}
+
+export interface TaskChangeCommits {
+  repos: TaskRepoCommitList[];
 }
 
 export interface TaskChanges {
@@ -1249,6 +1329,8 @@ export interface TaskChangeFileDiff {
   binary: boolean;
   /** diff 大到连读都放弃了——前端提示去 IDE 看 */
   tooLarge?: boolean;
+  /** 这份 diff 带整个文件的上下文（「展开上下文」按需拉；默认只带每处改动前后 3 行） */
+  fullContext?: boolean;
 }
 
 export interface GitBranchInfo {

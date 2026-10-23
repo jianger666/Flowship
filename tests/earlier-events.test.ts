@@ -16,6 +16,7 @@ import {
   EARLIER_MAX_PAGES_PER_BATCH,
   EARLIER_PAGE_SIZE,
   fetchEarlierBatch,
+  shouldReopenEarlierPaging,
   type EarlierPage,
 } from "@/lib/earlier-events";
 import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
@@ -218,6 +219,7 @@ describe("fetchEarlierBatch：一次上拉要么顶部多出一条可见条目�
       hasMore: true,
       progressed: true,
       pages: 1,
+      found: false,
     });
     expect(server.calls).toEqual([{ beforeId: log[4]!.id, limit: 2 }]);
   });
@@ -302,7 +304,7 @@ describe("fetchEarlierBatch：一次上拉要么顶部多出一条可见条目�
       fetchPage: server.fetchPage,
       countItems,
     });
-    expect(batch).toEqual({ fresh: [], hasMore: false, progressed: true, pages: 0 });
+    expect(batch).toEqual({ fresh: [], hasMore: false, progressed: true, pages: 0, found: false });
     expect(server.calls).toHaveLength(0);
   });
 
@@ -356,7 +358,7 @@ describe("fetchEarlierBatch：一次上拉要么顶部多出一条可见条目�
       countItems,
     });
     expect(calls).toBe(1);
-    expect(batch).toEqual({ fresh: [], hasMore: false, progressed: true, pages: 1 });
+    expect(batch).toEqual({ fresh: [], hasMore: false, progressed: true, pages: 1, found: false });
   });
 
   it("拉的过程中任务被切走：返回 null，不再继续请求", async () => {
@@ -425,5 +427,157 @@ describe("fetchEarlierBatch：一次上拉要么顶部多出一条可见条目�
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids).not.toContain(appended.id);
     for (const e of cur) expect(ids).not.toContain(e.id);
+  });
+});
+
+describe("shouldReopenEarlierPaging（整体替换成更晚的尾窗口后重开分页，评审 N4）", () => {
+  const base = { prevFirstTs: 1000, firstTs: 5000, pagedOnce: true, truncated: true };
+
+  it("翻到头之后窗口被换成更晚的尾窗口（首条往后移）+ 仍有更早的 → 重开", () => {
+    expect(shouldReopenEarlierPaging(base)).toBe(true);
+  });
+
+  it("首条不动 / 往更早走（prepend）→ 不重开", () => {
+    expect(shouldReopenEarlierPaging({ ...base, firstTs: 1000 })).toBe(false);
+    expect(shouldReopenEarlierPaging({ ...base, firstTs: 500 })).toBe(false);
+  });
+
+  it("没拉过页（pagedOnce=false）→ 交给 eventsTruncated 同步，不在这里重开", () => {
+    expect(shouldReopenEarlierPaging({ ...base, pagedOnce: false })).toBe(false);
+  });
+
+  it("新窗口没有更早的（truncated=false）→ 不重开", () => {
+    expect(shouldReopenEarlierPaging({ ...base, truncated: false })).toBe(false);
+  });
+
+  it("首次渲染 / 空窗口（null）→ 不重开", () => {
+    expect(shouldReopenEarlierPaging({ ...base, prevFirstTs: null })).toBe(false);
+    expect(shouldReopenEarlierPaging({ ...base, firstTs: null })).toBe(false);
+  });
+});
+
+// ---------- 提问时间线：拉到目标事件为止（untilEventId） ----------
+
+describe("fetchEarlierBatch：untilEventId（时间线点了窗口之外的更早一轮）", () => {
+  /** 一千多条：目标在最开头，窗口只有尾部 20 条 */
+  const buildLong = () => {
+    resetSeq();
+    const log: TaskEvent[] = [];
+    for (let i = 0; i < 120; i += 1) {
+      log.push(userReply(`问 ${i}`), reply(`答 ${i}`));
+    }
+    return log;
+  };
+
+  it("不因「顶部多出一条可见条目」提前收工：一直拉到目标出现、found=true", async () => {
+    const log = buildLong(); // 240 条
+    const target = log[10]!;
+    const server = makeServer(log);
+    const local = makeLocal(log, 20);
+    const batch = await fetchEarlierBatch({
+      getCurrent: local.getCurrent,
+      fetchPage: server.fetchPage,
+      countItems,
+      pageSize: 20,
+      maxPages: 50,
+      untilEventId: target.id,
+    });
+    expect(batch!.found).toBe(true);
+    // 没带 until 时第一页就会因为条目数变多而收工；带了就必须拉到目标所在那页
+    expect(batch!.pages).toBeGreaterThan(5);
+    expect(batch!.fresh.some((e) => e.id === target.id)).toBe(true);
+    expect(batch!.progressed).toBe(true);
+  });
+
+  it("对照：不带 until 同样的数据第一页就收工（那条规则是给「上拉到顶」用的、不能被 until 改坏）", async () => {
+    const log = buildLong();
+    const server = makeServer(log);
+    const local = makeLocal(log, 20);
+    const batch = await fetchEarlierBatch({
+      getCurrent: local.getCurrent,
+      fetchPage: server.fetchPage,
+      countItems,
+      pageSize: 20,
+      maxPages: 50,
+    });
+    expect(batch!.pages).toBe(1);
+    expect(batch!.found).toBe(false);
+  });
+
+  it("受 maxPages 约束：拉不到时 found=false、hasMore 仍为 true（调用方决定再来一批还是放弃）", async () => {
+    const log = buildLong();
+    const server = makeServer(log);
+    const local = makeLocal(log, 20);
+    const batch = await fetchEarlierBatch({
+      getCurrent: local.getCurrent,
+      fetchPage: server.fetchPage,
+      countItems,
+      pageSize: 20,
+      maxPages: 3,
+      untilEventId: log[0]!.id,
+    });
+    expect(batch!.pages).toBe(3);
+    expect(batch!.found).toBe(false);
+    expect(batch!.hasMore).toBe(true);
+    expect(batch!.fresh).toHaveLength(60);
+  });
+
+  it("历史读完仍没有这条：found=false、hasMore=false（它已不存在）", async () => {
+    const log = buildLong();
+    const server = makeServer(log);
+    const local = makeLocal(log, 20);
+    const batch = await fetchEarlierBatch({
+      getCurrent: local.getCurrent,
+      fetchPage: server.fetchPage,
+      countItems,
+      pageSize: 100,
+      maxPages: 50,
+      untilEventId: "e_not_exist",
+    });
+    expect(batch!.found).toBe(false);
+    expect(batch!.hasMore).toBe(false);
+    expect(batch!.progressed).toBe(true);
+  });
+
+  it("目标本来就在本地：一页都不拉、found=true", async () => {
+    const log = buildLong();
+    const server = makeServer(log);
+    const local = makeLocal(log, 20);
+    const batch = await fetchEarlierBatch({
+      getCurrent: local.getCurrent,
+      fetchPage: server.fetchPage,
+      countItems,
+      pageSize: 20,
+      untilEventId: log[log.length - 1]!.id,
+    });
+    expect(batch!.found).toBe(true);
+    expect(batch!.pages).toBe(0);
+    expect(server.calls).toHaveLength(0);
+  });
+
+  it("多批续拉：上一批没拉到（found=false、hasMore=true），提交后下一批接着往前、最终拉到", async () => {
+    const log = buildLong();
+    const target = log[0]!;
+    const server = makeServer(log);
+    const local = makeLocal(log, 20);
+    let found = false;
+    let batches = 0;
+    while (!found && batches < 20) {
+      const batch = await fetchEarlierBatch({
+        getCurrent: local.getCurrent,
+        fetchPage: server.fetchPage,
+        countItems,
+        pageSize: 20,
+        maxPages: 3,
+        untilEventId: target.id,
+      });
+      batches += 1;
+      local.prepend(batch!.fresh);
+      found = batch!.found;
+      if (!batch!.hasMore) break;
+    }
+    expect(found).toBe(true);
+    expect(batches).toBeGreaterThan(1);
+    expect(local.getCurrent()[0]!.id).toBe(target.id);
   });
 });

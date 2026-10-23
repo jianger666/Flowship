@@ -803,8 +803,13 @@ describe("实时推流脱敏（R1-01：publish 唯一扇出点）", () => {
       () => true,
     );
     flushPendingAssistantDeltas(TASK);
+    // eventId = 这段正文落盘后那条 assistant_message 的预定 id（assistant_snapshot 配对用），与脱敏无关
     expect(frames).toEqual([
-      { kind: "assistant_delta", text: `jq 取到：${REDACTED_GIT_TOKEN}` },
+      {
+        kind: "assistant_delta",
+        text: `jq 取到：${REDACTED_GIT_TOKEN}`,
+        eventId: expect.any(String),
+      },
     ]);
   });
 

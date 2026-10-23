@@ -26,7 +26,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import matter from "gray-matter";
+import { parseFrontmatter } from "./frontmatter";
 
 import { dataRoot } from "./data-root";
 import { getToolsSkillsDir } from "./feishu-cli";
@@ -188,7 +188,7 @@ export const parseSkillFile = async (
   opts?: ParseSkillFileOpts,
 ): Promise<SkillEntry | null> => {
   const raw = await fs.readFile(absPath, "utf-8");
-  const parsed = matter(raw);
+  const parsed = parseFrontmatter(raw);
   const data = parsed.data as Record<string, unknown>;
 
   // name 必填、缺省用 SKILL.md 父目录名作为兜底
@@ -512,7 +512,7 @@ export const readSkillBodyByName = async (
   try {
     const raw = await fs.readFile(entry.absPath, "utf-8");
     return {
-      body: matter(raw).content.trim(),
+      body: parseFrontmatter(raw).content.trim(),
       skillDir: path.dirname(entry.absPath),
       ...(entry.kbRoot ? { kbRoot: entry.kbRoot } : {}),
     };

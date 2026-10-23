@@ -94,7 +94,7 @@ import {
   createShellOutputDeltaPublisher,
 } from "./shell-output-bridge";
 import {
-  flushPendingAssistantDeltas,
+  flushAssistantSegment,
   flushThinkingBuffer,
   handleSdkMessage,
   maybeEmitSubmitFixedText,
@@ -2760,18 +2760,9 @@ const consumeChatRun = async (
       // 子代理卡片徽标要显示「沿用」的实际模型（只有 Cursor 路径挂了 subagent 才取得到）
       subagentParentModel: getSubagentParentModel(rec?.agent),
       subagentDisplayLookup: getSubagentDisplayLookup(rec?.agent),
-      flush: async () => {
-        // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
-        flushPendingAssistantDeltas(task.id);
-        const trimmed = ctx.buffer.trim();
-        ctx.buffer = "";
-        if (trimmed.length === 0) return;
-        // flush 走 owned sink——本实例已被摘除/替换则不落盘
-        await writeOwnedEventAndPublish(task.id, chatLease, {
-          kind: "assistant_message",
-          text: trimmed,
-        });
-      },
+      // 统一结算（先冲 delta → 同步取走 buffer / 预定 id / 清实时快照 → 再 owned-sink 落盘，
+      // 本实例已被摘除/替换则不落盘）：见 sdk-message-handler.flushAssistantSegment
+      flush: () => flushAssistantSegment(task.id, ctx, chatLease),
     };
     if (rec) {
       // 插话前冲刷：先 thinking 再 assistant，对齐流内顺序

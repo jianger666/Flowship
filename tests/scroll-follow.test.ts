@@ -14,7 +14,10 @@ import {
   PIN_SETTLE_STABLE_FRAMES,
   VIRTUOSO_NEVER_AT_BOTTOM,
   countNewItems,
+  advanceNewItemsTracker,
   distanceFromBottom,
+  headGrowthWithoutNewTail,
+  initNewItemsTracker,
   isDownIntentKey,
   isDownIntentTouch,
   isDownIntentWheel,
@@ -23,6 +26,7 @@ import {
   isUpIntentKey,
   isUpIntentTouch,
   isUpIntentWheel,
+  isUpScrollHandledElsewhere,
   nextFollowing,
   nextNewItemsBaseline,
   shouldPinWorkGroupOpen,
@@ -520,6 +524,291 @@ describe("「N 条新内容」计数（回到最新按钮）", () => {
 
   it("跟随态 prepend 不走基线抬高（基线已跟平 itemCount）", () => {
     expect(nextNewItemsBaseline(100, 120, true, 20)).toBe(120);
+  });
+});
+
+describe("isUpScrollHandledElsewhere（外层不会滚的上滚不登记意图，评审 N1）", () => {
+  interface FakeEl {
+    scrollTop: number;
+    scrollHeight: number;
+    clientHeight: number;
+    parentElement: FakeEl | null;
+  }
+  const el = (
+    scrollTop: number,
+    scrollHeight: number,
+    clientHeight: number,
+    parentElement: FakeEl | null = null,
+  ): FakeEl => ({ scrollTop, scrollHeight, clientHeight, parentElement });
+
+  it("横向分量大于纵向 → 外层不滚", () => {
+    expect(isUpScrollHandledElsewhere({ deltaX: 30, deltaY: -5 }, null, {})).toBe(true);
+  });
+
+  it("纵向为主、无目标 / deltaX 缺省 → 外层会滚", () => {
+    expect(isUpScrollHandledElsewhere({ deltaY: -5 }, null, {})).toBe(false);
+    expect(isUpScrollHandledElsewhere({ deltaX: 2, deltaY: -40 }, undefined, {})).toBe(false);
+  });
+
+  it("deltaX 与 deltaY 绝对值相等 → 不算横向为主", () => {
+    expect(isUpScrollHandledElsewhere({ deltaX: 10, deltaY: -10 }, null, {})).toBe(false);
+  });
+
+  it("沿父链找到「可滚且 scrollTop>0」的内层 → 被吃掉", () => {
+    const scroller = el(900, 2000, 800);
+    const mid = el(0, 100, 100, scroller);
+    const target = el(50, 600, 200, mid);
+    expect(isUpScrollHandledElsewhere({ deltaY: -30 }, target, scroller)).toBe(true);
+  });
+
+  it("内层在顶（scrollTop=0）→ 会冒泡到外层", () => {
+    const scroller = el(900, 2000, 800);
+    expect(isUpScrollHandledElsewhere({ deltaY: -30 }, el(0, 600, 200, scroller), scroller)).toBe(false);
+  });
+
+  it("内层 scrollTop>0 但装得下（scrollHeight<=clientHeight，如 overflow:hidden 的残值）→ 不算可滚", () => {
+    const scroller = el(900, 2000, 800);
+    expect(isUpScrollHandledElsewhere({ deltaY: -30 }, el(5, 200, 200, scroller), scroller)).toBe(false);
+  });
+
+  it("走到外层容器就停——外层自己 scrollTop>0 不算「被别人吃掉」", () => {
+    const scroller = el(900, 2000, 800);
+    expect(isUpScrollHandledElsewhere({ deltaY: -30 }, scroller, scroller)).toBe(false);
+    expect(isUpScrollHandledElsewhere({ deltaY: -30 }, el(0, 100, 100, scroller), scroller)).toBe(false);
+  });
+});
+
+describe("headGrowthWithoutNewTail（头部突然变长不算「新内容」，2026-10-23 切 effort 后 99+）", () => {
+  /** 模拟 StreamFloatingBar：每帧 (count, tailId, following, bump)，返回最终计数 */
+  const runAnchored = (
+    steps: Array<{
+      count: number;
+      tailId: string | null;
+      following: boolean;
+      bump?: number;
+    }>,
+  ): number => {
+    let baseline = steps[0]!.count;
+    let last = { count: steps[0]!.count, tailId: steps[0]!.tailId };
+    for (const s of steps) {
+      const growth = headGrowthWithoutNewTail(last, s.count, s.tailId);
+      last = { count: s.count, tailId: s.tailId };
+      baseline = nextNewItemsBaseline(
+        baseline,
+        s.count,
+        s.following,
+        Math.max(s.bump ?? 0, growth),
+      );
+    }
+    return countNewItems(baseline, last.count);
+  };
+
+  it("尾部没动、总数变多 → 返回增量", () => {
+    expect(headGrowthWithoutNewTail({ count: 300, tailId: "e9" }, 2100, "e9")).toBe(1800);
+  });
+
+  it("尾部变了（真有新内容）→ 0，交给总数差值去计", () => {
+    expect(headGrowthWithoutNewTail({ count: 300, tailId: "e9" }, 302, "e11")).toBe(0);
+  });
+
+  it("总数没变 / 变少 → 0（变少由基线 min 处理）", () => {
+    expect(headGrowthWithoutNewTail({ count: 300, tailId: "e9" }, 300, "e9")).toBe(0);
+    expect(headGrowthWithoutNewTail({ count: 300, tailId: "e9" }, 200, "e9")).toBe(0);
+  });
+
+  it("空列表（tailId=null）不判定", () => {
+    expect(headGrowthWithoutNewTail({ count: 0, tailId: null }, 50, null)).toBe(0);
+    expect(headGrowthWithoutNewTail({ count: 0, tailId: null }, 50, "e1")).toBe(0);
+  });
+
+  it("用户在底部、离开后头部被整体替换成 300→2100 条、尾没动 → 计数 0（不是 99+）", () => {
+    expect(
+      runAnchored([
+        { count: 300, tailId: "e9", following: true },
+        { count: 300, tailId: "e9", following: false },
+        { count: 2100, tailId: "e9", following: false },
+      ]),
+    ).toBe(0);
+  });
+
+  it("头部整体变长之后真来了新内容 → 只计新内容", () => {
+    expect(
+      runAnchored([
+        { count: 300, tailId: "e9", following: true },
+        { count: 300, tailId: "e9", following: false },
+        { count: 2100, tailId: "e9", following: false },
+        { count: 2103, tailId: "e12", following: false },
+      ]),
+    ).toBe(3);
+  });
+
+  it("长 action 里工作过程组新增成员（尾成员 id 变了）→ 照常计数", () => {
+    expect(
+      runAnchored([
+        { count: 300, tailId: "tool:a", following: true },
+        { count: 300, tailId: "tool:a", following: false },
+        { count: 304, tailId: "tool:e", following: false },
+      ]),
+    ).toBe(4);
+  });
+
+  it("上拉分页同时满足 bump 与 headGrowth → 取 max 不重复抬高，之后的尾部新内容照报", () => {
+    expect(
+      runAnchored([
+        { count: 100, tailId: "e9", following: true },
+        { count: 100, tailId: "e9", following: false },
+        { count: 120, tailId: "e9", following: false, bump: 20 },
+        { count: 123, tailId: "e12", following: false },
+      ]),
+    ).toBe(3);
+  });
+
+  it("StrictMode 二次渲染（同输入再跑一遍）结果不变", () => {
+    // 第二次渲染时 last 已是当前值 → growth=0，基线已是第一次写好的值
+    const first = headGrowthWithoutNewTail({ count: 300, tailId: "e9" }, 2100, "e9");
+    const baseline = nextNewItemsBaseline(300, 2100, false, first);
+    const second = headGrowthWithoutNewTail({ count: 2100, tailId: "e9" }, 2100, "e9");
+    expect(second).toBe(0);
+    expect(nextNewItemsBaseline(baseline, 2100, false, second)).toBe(baseline);
+  });
+});
+
+describe("advanceNewItemsTracker（尾锚点计数，评审 N2）", () => {
+  const ids = (from: number, to: number): string[] =>
+    Array.from({ length: to - from }, (_, i) => `e${from + i}`);
+
+  /** 按真实顺序推一遍：每步 (ids, following, prependDelta)，返回最后一步的 newCount */
+  const run = (
+    steps: Array<{ ids: string[]; following: boolean; prependDelta?: number }>,
+  ): number => {
+    let tracker = initNewItemsTracker(steps[0]!.ids);
+    let newCount = 0;
+    for (const s of steps) {
+      const r = advanceNewItemsTracker(tracker, s.ids, s.following, s.prependDelta ?? 0);
+      tracker = r.tracker;
+      newCount = r.newCount;
+    }
+    return newCount;
+  };
+
+  it("跟随中恒 0；离开后没变化也是 0", () => {
+    expect(run([{ ids: ids(0, 100), following: true }])).toBe(0);
+    expect(
+      run([
+        { ids: ids(0, 100), following: true },
+        { ids: ids(0, 100), following: false },
+      ]),
+    ).toBe(0);
+  });
+
+  it("离开后尾部追加 N 个 → N", () => {
+    expect(
+      run([
+        { ids: ids(0, 100), following: true },
+        { ids: ids(0, 100), following: false },
+        { ids: ids(0, 107), following: false },
+      ]),
+    ).toBe(7);
+  });
+
+  it("【N2】头部变长 + 尾部同一次来了新内容 → 只数锚点之后的（RC3 的尾没动判据在这里会误报 99+）", () => {
+    // 离开时 e0..e299；同一次更新里头部多出 1800 条更早的、尾部也新来 2 条
+    const before = ids(0, 300);
+    const after = [...Array.from({ length: 1800 }, (_, i) => `old${i}`), ...before, "n1", "n2"];
+    expect(
+      run([
+        { ids: before, following: true },
+        { ids: before, following: false },
+        { ids: after, following: false },
+      ]),
+    ).toBe(2);
+  });
+
+  it("头部被整体替换（锚点仍在、尾没动）→ 0", () => {
+    const before = ids(0, 300);
+    const after = [...Array.from({ length: 1800 }, (_, i) => `old${i}`), ...before];
+    expect(
+      run([
+        { ids: before, following: true },
+        { ids: before, following: false },
+        { ids: after, following: false },
+      ]),
+    ).toBe(0);
+  });
+
+  it("上拉分页（头部 prepend）不算新内容，之后的尾部新内容照报", () => {
+    const before = ids(100, 200);
+    const prepended = [...ids(0, 100), ...before];
+    expect(
+      run([
+        { ids: before, following: true },
+        { ids: before, following: false },
+        { ids: prepended, following: false, prependDelta: 100 },
+        { ids: [...prepended, "n1", "n2", "n3"], following: false },
+      ]),
+    ).toBe(3);
+  });
+
+  it("锚点所在的块被合并走（工具块并进 verb 组）→ 退回条数基线、不丢也不虚报，并重新落锚", () => {
+    // 离开时尾是 tool:c2；它完成后与前面的读类工具并成 verb 组、身份变成首成员 tool:c1，后面又来了 2 个新单元
+    const start = ["a", "b", "tool:c1", "tool:c2"];
+    const merged = ["a", "b", "tool:c1", "n1", "n2"];
+    const r1 = advanceNewItemsTracker(
+      advanceNewItemsTracker(initNewItemsTracker(start), start, true).tracker,
+      start,
+      false,
+    );
+    const r2 = advanceNewItemsTracker(r1.tracker, merged, false);
+    // 总数 4 → 5、基线 4 → 差值 1：虽然实际来了 2 个，但合并吃掉了 1 个——不虚报成 99+、量级正确
+    expect(r2.newCount).toBe(1);
+    // 重新落锚到新内容之前的那个单元
+    expect(r2.tracker.anchorId).toBe("n1");
+    // 之后再来 n3：已改按新锚点 n1 数——n1 之后是 n2、n3 → 2
+    const r3 = advanceNewItemsTracker(r2.tracker, [...merged, "n3"], false);
+    expect(r3.newCount).toBe(2);
+  });
+
+  it("锚点被回退裁掉、总数变少 → 基线跟着降，不出现负数", () => {
+    const before = ids(0, 100);
+    const trimmed = ids(0, 60); // 锚点 e99 被裁
+    const r = advanceNewItemsTracker(
+      advanceNewItemsTracker(initNewItemsTracker(before), before, false).tracker,
+      trimmed,
+      false,
+    );
+    expect(r.newCount).toBe(0);
+    expect(r.tracker.anchorId).toBe("e59");
+  });
+
+  it("离开时列表为空（锚点 null）→ 之后新增的都算新内容", () => {
+    expect(
+      run([
+        { ids: [], following: true },
+        { ids: [], following: false },
+        { ids: ["n1", "n2"], following: false },
+      ]),
+    ).toBe(2);
+  });
+
+  it("幂等：同一输入重复推进（StrictMode 双渲）结果不变", () => {
+    const before = ids(0, 300);
+    const after = [...Array.from({ length: 50 }, (_, i) => `old${i}`), ...before, "n1"];
+    const t0 = advanceNewItemsTracker(initNewItemsTracker(before), before, false).tracker;
+    const first = advanceNewItemsTracker(t0, after, false);
+    const second = advanceNewItemsTracker(first.tracker, after, false);
+    expect(second.newCount).toBe(first.newCount);
+    expect(second.tracker.anchorId).toBe(first.tracker.anchorId);
+    // 锚点丢了走兜底分支时同样幂等
+    const gone = ["x", "y", "z"];
+    const g1 = advanceNewItemsTracker(first.tracker, gone, false);
+    const g2 = advanceNewItemsTracker(g1.tracker, gone, false);
+    expect(g2.newCount).toBe(g1.newCount);
+    expect(g2.tracker.anchorId).toBe(g1.tracker.anchorId);
+  });
+
+  it("重复 id 取最后一次出现的位置", () => {
+    const t = { baseline: 3, anchorId: "a", lastCount: 3, lastTailId: "a" };
+    expect(advanceNewItemsTracker(t, ["a", "b", "a", "c"], false).newCount).toBe(1);
   });
 });
 

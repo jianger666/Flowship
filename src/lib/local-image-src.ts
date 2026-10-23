@@ -13,14 +13,33 @@ const LOCAL_IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp)$/i;
 const isLocalAbsolutePath = (path: string): boolean =>
   path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path);
 
+/** 超过这个长度的文本不做改写（见 wrapLocalMarkdownImageDestinations 里的说明） */
+const MAX_REWRITE_LENGTH = 200_000;
+
+/**
+ * 匹配 `![alt](dest)`。
+ *
+ * ReDoS 防护：旧写法 `((?:\\.|[^\]])*)` 的两个分支在 `\` 上重叠（`\\.` 与 `[^\]]` 都能吃反斜杠），
+ * 输入 `![` + N 个 `\` 时回溯呈指数增长（实测 N=42 约 0.8s、N≈60 约一小时，且渲染线程卡死、重开仍冻）。
+ * 现写法 alt 的两个分支互斥（`\\[\s\S]` 吃「转义对」、`[^\]\\]` 吃其它字符），并给 alt / dest 都加了长度上限，
+ * 任何输入都是线性（乘以常数上限）。alt 超过 1000 字符或 dest 超过 2048 字符的图不再被改写（原样渲染）。
+ */
+const IMAGE_DESTINATION_RE =
+  /!\[((?:\\[\s\S]|[^\]\\]){0,1000})\]\((<[^>\n]{0,2048}>|[^)\n]{1,2048})\)/g;
+
 /**
  * CommonMark 裸 destination 不能含空格。mac 数据目录 `Application Support` 会把
  * `![二维码](/Users/…/Application Support/…/qr.png)` 截成看不见的图 + 尾巴原文。
  * 渲染前把这类 destination 包进 `<>`（spec 允许空格），再交给 /api/local-image。
  */
-export const wrapLocalMarkdownImageDestinations = (md: string): string =>
-  md.replace(
-    /!\[((?:\\.|[^\]])*)\]\((<[^>\n]*>|[^)\n]+)\)/g,
+export const wrapLocalMarkdownImageDestinations = (md: string): string => {
+  // 没有图片语法的绝大多数文本：一次 includes 就返回，不进正则
+  if (!md.includes("![")) return md;
+  // 残余成本是线性的（`![a](` 反复出现时每个起点都吃满 2048 的上限才失败，约 1ms/KB）：
+  // 超大文本（>20 万字符）不改写——只是带空格的本地图片路径不会被修成可渲染，换主线程不被拖住
+  if (md.length > MAX_REWRITE_LENGTH) return md;
+  return md.replace(
+    IMAGE_DESTINATION_RE,
     (full, alt: string, dest: string) => {
       const trimmed = dest.trim();
       if (trimmed.startsWith("<") && trimmed.endsWith(">")) return full;
@@ -34,6 +53,7 @@ export const wrapLocalMarkdownImageDestinations = (md: string): string =>
       return `![${alt}](<${trimmed}>)`;
     },
   );
+};
 
 /** URL 路径段是不是 `.` / `..`（含 `%2e` 写法）——浏览器解析 URL 时会把它们折叠掉 */
 const isDotSegment = (seg: string): boolean => /^(\.|%2e){1,2}$/i.test(seg);

@@ -8,6 +8,9 @@ import path from "node:path";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // 组件 SSR 冒烟（renderToStaticMarkup）要能直接 import .tsx：tsconfig 的 jsx 是 preserve（交给 Next 编译），
+  // vite 会跟着原样保留 JSX → 解析失败。只在测试环境显式指定 automatic runtime，不动 tsconfig、不影响 Next 构建
+  oxc: { jsx: { runtime: "automatic" } },
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "src"),

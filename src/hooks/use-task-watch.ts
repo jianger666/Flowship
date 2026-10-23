@@ -69,6 +69,7 @@ import {
   withBootstrapNotice,
 } from "@/lib/watch-reconnect";
 import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
+import type { AssistantSnapshot } from "@/lib/assistant-live";
 import type { ThinkingSnapshot } from "@/lib/thinking-live";
 import type { TalkQueueItem } from "@/lib/talk-queue";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
@@ -103,6 +104,11 @@ export interface UseTaskWatchCallbacks {
    * 前端接着长、不从头吐）；null = 没在思考（清掉本地残留的实时态）
    */
   onThinkingSnapshot?: (snapshot: ThinkingSnapshot | null) => void;
+  /**
+   * 进行中正文的快照：每次（重）连接 bootstrap 恰好一帧。对象 = 此刻正在吐字（带已发出的整段，
+   * 前端铺上再接着拼、不只剩后半截）；null = 没在吐字（清掉本地残留的流式文字）
+   */
+  onAssistantSnapshot?: (snapshot: AssistantSnapshot | null) => void;
   /** origin 有值 = 旁路群答疑 run 的 done，不是属主主 run 的（见 owner-run-signal.planDoneFrame） */
   onDone?: (task: Task, ok: boolean, origin?: string) => void;
   // SSE envelope 里的 error 帧（服务端主动发的协议错误）
@@ -268,6 +274,10 @@ export const useTaskWatch = (
           onThinkingSnapshot: (snapshot) => {
             if (cancelled) return;
             callbacksRef.current.onThinkingSnapshot?.(snapshot);
+          },
+          onAssistantSnapshot: (snapshot) => {
+            if (cancelled) return;
+            callbacksRef.current.onAssistantSnapshot?.(snapshot);
           },
           onDone: (t, ok, origin) => {
             if (cancelled) return;

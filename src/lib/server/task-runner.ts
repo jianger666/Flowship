@@ -257,7 +257,7 @@ import {
   planBranchesForBuild,
 } from "./action-gates";
 import {
-  flushPendingAssistantDeltas,
+  flushAssistantSegment,
   flushThinkingBuffer,
   handleSdkMessage,
   maybeEmitSubmitFixedText,
@@ -4641,6 +4641,9 @@ const consumeSessionRun = async (
   // 重连会起新 ctx 把它作废，刷新页面 / 回放就丢，而 sdk-error 的放弃文案还写着「已生成的内容保留在上方」。
   // assistantCtx 创建前就抛错（没有可冲的）时保持 undefined → catch 里 no-op。
   let flushBufferedOnError: (() => Promise<void>) | undefined;
+  // stop 专用：在 revoke 之前同步起跑、把在飞的半截思考 + 正文落盘（见 RunningTaskRecord.flushPartialOutput）。
+  // 与上面一样：assistantCtx 在 try 里才创建，所以先声明、后赋值；创建前 stop 到来 = no-op
+  let flushForStop: (() => Promise<void>) | undefined;
 
   try {
     // 同 gen claim（B 尚未登记 runner）时 isTaskOpCurrent=false——
@@ -4709,6 +4712,7 @@ const consumeSessionRun = async (
         });
         cancelEscape.arm();
       },
+      flushPartialOutput: () => flushForStop?.() ?? Promise.resolve(),
     });
 
     hardTimer = setTimeout(() => {
@@ -4737,23 +4741,33 @@ const consumeSessionRun = async (
       // 子代理卡片徽标要显示「沿用」的实际模型（只有 Cursor 路径挂了 subagent 才取得到）
       subagentParentModel: getSubagentParentModel(agent),
       subagentDisplayLookup: getSubagentDisplayLookup(agent),
-      flush: async () => {
-        // assistant_message 落盘前冲掉待发 delta——防尾巴 delta 晚到成幽灵字
-        flushPendingAssistantDeltas(task.id);
-        const trimmed = assistantCtx.buffer.trim();
-        assistantCtx.buffer = "";
-        if (trimmed.length === 0) return;
-        // flush 走 owned sink——opHandle lease 必填、失主不落盘
-        await writeOwnedEventAndPublish(
-          task.id,
-          () => isTaskOpCurrent(opts.opHandle),
-          {
-            kind: "assistant_message",
-            actionId: undefined,
-            text: trimmed,
-          },
-        );
-      },
+      // 统一结算（先冲 delta → 同步取走 buffer / 预定 id / 清实时快照 → 再 owned-sink 落盘，
+      // opHandle lease 必填、失主不落盘）：见 sdk-message-handler.flushAssistantSegment
+      flush: () =>
+        flushAssistantSegment(task.id, assistantCtx, () =>
+          isTaskOpCurrent(opts.opHandle),
+        ),
+    };
+    // stop 的「revoke 之前先落盘」（BE1-02）：用户点停止前已经流给他看的半截回复 / 思考，
+    // 以前随 revoke 失主一起被丢（流收尾 flush 整段跳过）、刷新页面就没了，而 chat 模式有落盘。
+    // 同步起跑：两个 flush **同时发起**再 await——各自「取走 buffer / 预定 id / 清实时快照」都在自己第一个 await 之前，
+    // 所以整个取走动作在 flushForStop 返回 promise 之前就全做完了（评审 R3：之前先 await 思考再调正文，正文 buffer
+    // 是让出一个微任务之后才取走的，注释和实现不严格一致；实际无风险，但同步起跑才是 stop 先于 revoke 的真保证）。
+    // 写盘发生在 stop 随后的 revoke 之后，所以 lease 固定放行——这是 stop 主动落的、不是失主迟到的事件。
+    // 至多一个 buffer 有内容（assistant 开头先冲思考、thinking 开头先冲正文），落盘顺序按发起顺序（先思考后正文）。
+    // 用 Promise.all 而不是依次 await：两个都已发起，前一个抛错时后一个的 rejection 也有人接、不会变成 unhandled。
+    // 失主（已被后继接管 / 已 revoke）不管。
+    flushForStop = async () => {
+      if (lostStartOwner()) return;
+      const always = () => true;
+      try {
+        await Promise.all([
+          flushThinkingBuffer(task.id, assistantCtx, always),
+          flushAssistantSegment(task.id, assistantCtx, always),
+        ]);
+      } catch (err) {
+        console.warn(`[task-runner] task=${task.id} stop 前落盘半截输出失败：`, err);
+      }
     };
     // 与下面「stream 结束后」那段同口径（失主跳过、先思考后正文）；两个 flush 都是
     // 「先取走并清空 buffer 再写」，正常路径已冲过的这里再调是 no-op，天然幂等。

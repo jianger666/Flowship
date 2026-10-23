@@ -245,8 +245,14 @@ describe("回到最新按钮", () => {
   });
 
   it("「N 条新内容」走 scroll-follow 的纯函数、别在组件里另拼一套算法", () => {
-    expect(eventStream).toContain("nextNewItemsBaseline(");
-    expect(eventStream).toContain("countNewItems(");
+    expect(eventStream).toContain("advanceNewItemsTracker(");
+    // 条数基线 / 头部增量兜底都收在纯函数里（锚点丢了才用），组件里不再直接拼
+    const scrollFollow = read("lib", "scroll-follow.ts");
+    expect(scrollFollow).toMatch(
+      /export const advanceNewItemsTracker[\s\S]*headGrowthWithoutNewTail\(/,
+    );
+    expect(scrollFollow).toMatch(/advanceNewItemsTracker[\s\S]*nextNewItemsBaseline\(/);
+    expect(scrollFollow).toMatch(/advanceNewItemsTracker[\s\S]*countNewItems\(/);
   });
 
   it("计数按工作过程组的成员摊开——退回 items.length 会在长 action 里常驻 0", () => {
@@ -256,14 +262,26 @@ describe("回到最新按钮", () => {
     expect(eventStream).toMatch(
       /countStreamContentUnits[\s\S]*__work_group__[\s\S]*members\.length/,
     );
-    const contentCount = sliceBalanced(
+    // 内容单元身份表同样按成员摊开（长度与上面恒等），「N 条新内容」以它做尾锚点
+    expect(eventStream).toMatch(
+      /const streamContentUnitIds[\s\S]*__work_group__[\s\S]*for \(const m of it\.members\) ids\.push\(streamItemStableId\(m\)\)/,
+    );
+    expect(eventStream).toContain("unitIds={contentUnitIds}");
+  });
+
+  it("头部突然变长（整体重拉 / 回退对齐）不算新内容：尾锚点计数、身份表取 baseItems 不取 orderedItems", () => {
+    // 2026-10-23 用户反馈「切 effort 点确定后冒出 99+ 条新内容、内容区滚到很早的位置」；评审 N2
+    const unitIds = sliceBalanced(
       eventStream,
-      "const contentCount = useMemo",
+      "const contentUnitIds = useMemo",
       "(",
     );
-    // 挂 orderedItems 不挂 items：虚拟项跟着 chunk 变、没必要每秒重算几十次
-    expect(contentCount).toContain("orderedItems");
-    expect(eventStream).toContain("contentCount={contentCount}");
+    // orderedItems 把未答 ask 挪到末尾、会盖住真正的时间序尾部；虚拟项在分组之后追加、不在 baseItems 里
+    expect(unitIds).toContain("baseItems");
+    expect(unitIds).not.toContain("orderedItems");
+    // 渲染期推进（幂等）、结果写回 ref；prepend 增量只在锚点丢了才会被用到
+    expect(eventStream).toMatch(/trackerRef\.current = advanced\.tracker/);
+    expect(eventStream).toContain("prependBaselineBumpRef");
   });
 });
 

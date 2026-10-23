@@ -24,6 +24,7 @@ import {
   supersedePendingAsks,
 } from "./task-runner";
 import {
+  flushRunningTaskPartialOutput,
   isTaskStarting,
   joinResourceJobs,
   pendingStopRequests,
@@ -101,6 +102,13 @@ const runStopTaskAgent = async (
   try {
     // V12：立刻 revoke——已入场但卡在 baseline/create 的 advance/one-shot 靠入场快照发现作废，
     // 即使本 stop 稍后释放 lifecycle、pending 也被清掉，旧请求仍不得继续 Agent.create/send。
+    //
+    // BE1-02：revoke 之前先**同步起跑**「半截输出落盘」（不 await）——revoke 一生效，run 自己的 lease 就失主、
+    // 流收尾的 flush 整段跳过，用户停止前已经流给他看的半截回复 / 思考就只剩内存、刷新页面没了
+    // （chat 模式有落盘、task 模式没有，两边不一致）。它同步取走 buffer、写盘用固定放行的 lease，
+    // 所以随后的 revoke 不影响它；await 放在 revoke / 失效 bridge lease 之后（下面），
+    // 保证半截回复先于「用户停止了」那条 info 落盘。
+    const flushingPartial = flushRunningTaskPartialOutput(id);
     revokeTaskOps(id);
 
     // begin("stopping") 成功后、首个 await 前同步失效 bridge lease——
@@ -109,6 +117,7 @@ const runStopTaskAgent = async (
     if (beganStopping) {
       invalidateCallerToken(id);
     }
+    await flushingPartial;
 
     // 先 revoke（中止已挂 abort 的子进程），再 join。
     // 超时 **不再开闸**——joinResourceJobs 置 quarantine（fail-closed）；

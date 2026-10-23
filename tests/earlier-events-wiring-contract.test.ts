@@ -39,17 +39,27 @@ const sliceFunction = (source: string, marker: string): string => {
 };
 
 const code = stripComments(eventStream);
-const loadEarlier = sliceFunction(code, "const loadEarlier = async () =>");
+const loadEarlier = sliceFunction(code, "const loadEarlier = async (");
 
 describe("event-stream 上拉分页接线", () => {
   it("loadEarlier 走 fetchEarlierBatch（拉到有进展为止），不再固定拉一页", () => {
-    expect(code).toContain(
-      'import { fetchEarlierBatch } from "@/lib/earlier-events"',
+    expect(code).toMatch(
+      /import \{[^}]*\bfetchEarlierBatch\b[^}]*\} from "@\/lib\/earlier-events"/,
     );
     expect(loadEarlier).toContain("fetchEarlierBatch(");
     // 旧实现：以本地第一条为锚点直接单页请求
     expect(loadEarlier).not.toContain("anchor.id");
     expect(code).not.toMatch(/const EARLIER_PAGE_SIZE\s*=/);
+  });
+
+  it("整体替换成更晚的尾窗口后重开分页（评审 N4）：首条时刻往后移 → shouldReopenEarlierPaging → 清 pagedOnce + 重开 hasMore", () => {
+    expect(code).toContain("shouldReopenEarlierPaging({");
+    const effect = code.slice(code.indexOf("const lastFirstEventTsRef"));
+    expect(effect).toMatch(/pagedOnceRef\.current = false;\s*setHasMoreEarlier\(true\);/);
+    // 必须声明在「eventsTruncated 同步分页开关」的 effect 之后：同一次提交里两者都跑时这里的 true 才是最终值
+    expect(code.indexOf("const lastFirstEventTsRef")).toBeGreaterThan(
+      code.indexOf("if (!pagedOnceRef.current) setHasMoreEarlier(!!task.eventsTruncated);"),
+    );
   });
 
   it("条目数用与渲染管线同一个 buildStreamItems 数（否则这里判有进展、Virtuoso 序号却没变）", () => {

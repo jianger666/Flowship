@@ -125,7 +125,8 @@ interface MrInboxContextValue {
   setSeen: (url: string, seen: boolean) => Promise<void>;
   /** 批量标已读（POST 成功后再改本地 seenAtMs；失败抛错给调用方 toast） */
   markAllSeen: (urls: string[]) => Promise<void>;
-  mergeMr: (mrUrl: string) => Promise<void>;
+  /** sha = 扫描那一刻源分支的 HEAD（entry.mr.headSha）：带上后作者再推新提交会被拒，避免合入没看过的改动 */
+  mergeMr: (mrUrl: string, sha?: string) => Promise<void>;
   /** 忽略条目（url = mrUrl 或 bugUrl）：从三组移除；返回快照供「撤销」 */
   ignoreItem: (url: string) => Promise<IgnoredSnapshot>;
   /** 撤销忽略：服务端取消忽略 + 本地塞回条目 + 后台强制重扫（常驻「已忽略」列表的恢复也走它，快照只带 url） */
@@ -423,11 +424,11 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
     }));
   }, [applyPatch]);
 
-  const mergeMr = useCallback(async (mrUrl: string) => {
+  const mergeMr = useCallback(async (mrUrl: string, sha?: string) => {
     const res = await fetch("/api/mr-inbox/merge", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mrUrl }),
+      body: JSON.stringify(sha ? { mrUrl, sha } : { mrUrl }),
     });
     if (!res.ok) {
       let message = `HTTP ${res.status}`;

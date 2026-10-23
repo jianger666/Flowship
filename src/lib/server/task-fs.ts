@@ -134,6 +134,7 @@ import {
   type TaskMetaV06,
 } from "./task-fs-core";
 import { failpoint } from "./failpoints";
+import { readEventsOutline, type OutlineResult } from "./events-outline";
 
 /** 终态 task 上任何旧链的 action/runStatus 条件写都非法（finalize 走裸 set） */
 const isTerminalRepoStatus = (repoStatus: RepoStatus): boolean =>
@@ -1348,6 +1349,26 @@ export const getTaskEventsBefore = async (
   await failpoint("getTaskEventsBefore.afterRead");
   if (!assertTaskReadable(id)) return null;
   return page;
+};
+
+/**
+ * 提问时间线大纲（事件流左侧时间线的数据源）：全部 user_reply / action_start 的 id / 时刻 / 预览。
+ * 任务不存在 / 不可读返 null（调用方按 taskVisibilityErrorResponse 回 404 / 410 / 503）。
+ * 读法见 events-outline（顺序扫 + 按任务增量缓存），不整份 parse events.jsonl。
+ */
+export const getTaskEventsOutline = async (
+  id: string,
+): Promise<OutlineResult | null> => {
+  await ensureBootRecovery();
+  if (!assertTaskReadable(id)) return null;
+  const raw = await readMetaRaw(id);
+  if (!raw) return null;
+  if (!isValidMetaShape(raw)) return null;
+  const outline = await readEventsOutline(id);
+  // 扫完后复查（扫描期间任务可能被删）
+  await failpoint("getTaskEventsOutline.afterRead");
+  if (!assertTaskReadable(id)) return null;
+  return outline;
 };
 
 /**

@@ -40,6 +40,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Tooltip } from "@/components/ui/tooltip";
+import { dispatchGitBranchChanged } from "@/lib/changes/events";
 import {
   occupantOf,
   occupiedBranchHint,
@@ -218,6 +219,8 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
       setState(next);
       setOpen(false);
       toast.success(`已切到分支 ${branch}`);
+      // 代码改动面板 / chip 跟着切到新分支的改动（不用等下一次轮询或窗口聚焦）
+      dispatchGitBranchChanged(task.id);
     } catch (err) {
       toast.error(`切分支失败：${(err as Error).message}`);
     } finally {

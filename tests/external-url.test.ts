@@ -10,6 +10,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  isCanonicalAppOrigin,
   isIdeDeepLink,
   isSafeExternalUrl,
   isSafeMailtoUrl,
@@ -334,7 +335,10 @@ describe("isSameAppOrigin：站内判定必须按 origin 精确比对", () => {
     ["端口前缀 88760", "http://127.0.0.1:88760/"],
     ["host 后缀伪装", "http://127.0.0.1:8876.attacker.example/"],
     ["https", "https://127.0.0.1:8876/"],
-    ["localhost", "http://localhost:8876/"],
+    ["localhost 别名但端口不对", "http://localhost:8877/"],
+    ["localhost 带 userinfo 伪装", "http://localhost:8876@evil.example/"],
+    ["localhost 后缀伪装", "http://localhost.evil.example:8876/"],
+    ["localhost 别名 https", "https://localhost:8876/"],
     ["缺端口", "http://127.0.0.1/"],
     ["别的端口", "http://127.0.0.1:8877/"],
     ["非 URL", "not a url"],
@@ -342,6 +346,53 @@ describe("isSameAppOrigin：站内判定必须按 origin 精确比对", () => {
     ["cursor 协议", "cursor://file/Users/me/a.ts"],
   ])("非站内：%s", (_name, url) => {
     expect(isSameAppOrigin(url, origin)).toBe(false);
+  });
+});
+
+describe("isSameAppOrigin：回环别名（localhost / [::1] …）也是站内、不能交给系统浏览器", () => {
+  // 系统浏览器顶层导航带 Sec-Fetch-Site: none，绕过 Fetch Metadata 闸；
+  // `http://localhost:<端口>/api/…` 指向的仍是同一个本机服务（2026-10-23 全仓审查复现）
+  const ctx = { host: "127.0.0.1", port: 8876 };
+  it.each([
+    "http://localhost:8876/api/mr-inbox?refresh=1",
+    "http://LOCALHOST:8876/api/x",
+    "http://localhost.:8876/api/x",
+    "http://foo.localhost:8876/api/x",
+    "http://[::1]:8876/api/repo-branches?path=x",
+    "http://[0:0:0:0:0:0:0:1]:8876/api/x",
+    "http://[::]:8876/api/x",
+    "http://[::ffff:127.0.0.1]:8876/api/x",
+    "http://127.1:8876/api/x",
+    "http://2130706433:8876/api/x",
+    "http://127.0.0.2:8876/api/x",
+    "http://0.0.0.0:8876/api/x",
+  ])("站内别名：%s", (url) => {
+    expect(isSameAppOrigin(url, ctx)).toBe(true);
+  });
+
+  it("isCanonicalAppOrigin 仍是精确比对：别名不算 canonical，只有 127.0.0.1:端口 才是", () => {
+    expect(isCanonicalAppOrigin("http://127.0.0.1:8876/tasks/1", ctx)).toBe(true);
+    for (const alias of [
+      "http://localhost:8876/",
+      "http://[::1]:8876/",
+      "http://127.0.0.2:8876/",
+      "http://127.0.0.1:8877/",
+      "https://127.0.0.1:8876/",
+    ]) {
+      expect(isCanonicalAppOrigin(alias, ctx)).toBe(false);
+    }
+  });
+
+  it("公网 / 内网主机即使端口相同也不是站内", () => {
+    for (const url of [
+      "http://example.com:8876/",
+      "http://192.168.1.10:8876/",
+      "http://10.0.0.1:8876/",
+      "http://evil-localhost:8876/",
+      "http://localhost-evil.example:8876/",
+    ]) {
+      expect(isSameAppOrigin(url, ctx)).toBe(false);
+    }
   });
 });
 
@@ -354,12 +405,21 @@ describe("main.js 接线契约：放行判定必须挡在 shell.openExternal 前
     expect(handlerStart).toBeGreaterThanOrEqual(0);
     expect(handler).toContain('url.startsWith("app-update://")');
     expect(handler).toContain("void installUpdateNow()");
-    expect(handler).toContain("if (isAppUrl(url)) return;");
+    expect(handler).toContain("if (isAppUrl(url)) {");
+    // 站内分支里：本应用 origin 放行，回环别名（localhost / [::1] …）拦下，且分支内绝不 openExternal
+    const siteBlock = handler.slice(
+      handler.indexOf("if (isAppUrl(url)) {"),
+      handler.indexOf("// 站外一律先拦导航"),
+    );
+    expect(siteBlock).toContain("if (!isCanonicalAppUrl(url)) {");
+    expect(siteBlock).toContain("e.preventDefault();");
+    expect(siteBlock).not.toContain("openExternal");
   });
 
   it("站外导航一律先 preventDefault、再判白名单；openExternal 只出现在白名单分支内", () => {
-    const siteGate = handler.indexOf("if (isAppUrl(url)) return;");
-    const prevent = handler.indexOf("e.preventDefault();", siteGate);
+    const siteGate = handler.indexOf("if (isAppUrl(url)) {");
+    // 站外分支的 preventDefault 在站内分支之后（站内分支里那个只拦回环别名）
+    const prevent = handler.indexOf("e.preventDefault();", handler.indexOf("// 站外一律先拦导航"));
     const gate = handler.indexOf(
       "if (isSafeExternalUrl(url) || isIdeDeepLink(url) || isSafeMailtoUrl(url)) {",
     );
@@ -454,6 +514,7 @@ describe("will-navigate 处理器真实执行（切出 main.js 源码、注入�
     new Function(
       "mainWindow",
       "isAppUrl",
+      "isCanonicalAppUrl",
       "isSafeExternalUrl",
       "isIdeDeepLink",
       "isSafeMailtoUrl",
@@ -464,6 +525,7 @@ describe("will-navigate 处理器真实执行（切出 main.js 源码、注入�
     )(
       mainWindow,
       (u: string) => isSameAppOrigin(u, { host: "127.0.0.1", port: 8876 }),
+      (u: string) => isCanonicalAppOrigin(u, { host: "127.0.0.1", port: 8876 }),
       isSafeExternalUrl,
       isIdeDeepLink,
       isSafeMailtoUrl,
@@ -523,6 +585,19 @@ describe("will-navigate 处理器真实执行（切出 main.js 源码、注入�
     const e = s.navigate(url);
     expect(e.preventDefault).toHaveBeenCalledTimes(1);
     expect(s.shell.openExternal).toHaveBeenCalledWith(url);
+  });
+
+  it.each([
+    "http://localhost:8876/api/mr-inbox?refresh=1",
+    "http://[::1]:8876/api/repo-branches?path=x",
+    "http://127.0.0.2:8876/api/x",
+  ])("回环别名站内 URL：拦下导航、不交系统浏览器、不放行带走主窗（%s）", (url) => {
+    const s = setup();
+    const e = s.navigate(url);
+    expect(e.preventDefault).toHaveBeenCalledTimes(1);
+    expect(s.shell.openExternal).not.toHaveBeenCalled();
+    expect(s.log).toHaveBeenCalledTimes(1);
+    expect(String(s.log.mock.calls[0]![0])).toContain("回环别名");
   });
 
   it("站内导航不拦；app-update:// 仍由壳自己消费", () => {

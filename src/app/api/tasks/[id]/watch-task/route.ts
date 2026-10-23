@@ -29,6 +29,17 @@
  *   快照发完后用 sentEventIds 去重回放 buffer，再转直通；快照 tail 的 event id
  *   也预先写入 sentEventIds，保证不丢不重。
  *
+ * 进行中正文的快照（2026-10-23，帧 `assistant_snapshot`，与下面的思考快照同套路）：
+ *   assistant_delta 也是纯内存帧、从不回放；一段不带工具调用的长回复要等 ctx.flush 才落成 assistant_message，
+ *   整段在磁盘上根本没有。用户切走再切回（ChatView 卸载重挂）、SSE 断流重连后，新订阅者只能从「订阅之后的
+ *   第一帧」开始拼——只看到后半截，要等整段生成完才见全文（用户反馈「切回来展示的是返回的中间部分」）。
+ *   所以 bootstrap 里（thinking_snapshot 之前）**无条件**补一帧：live = {eventId, text, total}（此刻正在吐、
+ *   带已发出的整段）或 null（没在吐字——前端据此清掉本地残留）。
+ *   - 订阅与读快照同步配对（同思考快照：中间没有 await）；
+ *   - 这段正文的落盘事件（预定 eventId）已经在 tail 里 → 发 live:null，且订阅后才到的同段 delta 一并丢弃
+ *     （否则快照 null 之后又冒出一小截幽灵流式文字，而落盘事件被 sentEventIds 去重吞掉、前端永远等不到清流信号）；
+ *   - 前端对 bootstrap 回放的 assistant_message（replay:true）不清流式文字，由这一帧统一对齐。
+ *
  * 进行中思考的快照（2026-10-13，帧 `thinking_snapshot`）：
  *   thinking_delta 是纯内存帧、从不回放；前端的实时思考态又只活在组件本地 state 里——
  *   切到别的对话再切回（组件重挂）、SSE 断流重连，新订阅者只能从「订阅之后的第一帧」开始，
@@ -47,7 +58,10 @@ import {
   listMessageOperationSnapshot,
   listRecentSettled,
 } from "@/lib/server/chat-queue";
-import { getLiveThinkingSnapshot } from "@/lib/server/sdk-message-handler";
+import {
+  getLiveAssistantSnapshot,
+  getLiveThinkingSnapshot,
+} from "@/lib/server/sdk-message-handler";
 import { getBackgroundSubagentSnapshot } from "@/lib/server/subagent-background";
 import {
   getTaskVisibility,
@@ -120,6 +134,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
   // 一旦隔了 await（比如挪到下面读完磁盘之后再读），期间发的帧会既进快照又进 buffer，
   // 前端按「快照 + 增量」重建就会把那段文字重复一遍
   const thinkingSnap = getLiveThinkingSnapshot(id);
+  // 进行中正文的快照同理（紧跟、同样不能隔 await）：快照 = 订阅那一刻之前已发出的整段
+  const assistantSnap = getLiveAssistantSnapshot(id);
 
   // 幂等清理：ReadableStream.cancel / req.signal abort / closeStream 都可能触发，防 double-clean
   const cleanup = () => {
@@ -244,7 +260,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
           case "assistant_delta":
             // 旁路群答疑 run 的增量带 origin，不能流进属主 UI 实时气泡
             if (ev.origin) break;
-            send({ type: "assistant_delta", text: ev.text });
+            // 这段正文的落盘事件已经在 tail 里（或已经分发过）：订阅后才到的同段尾巴 delta 不能再发——
+            // 快照对它发的是 live:null，再发 delta 前端会冒出一小截永远等不到清流信号的幽灵文字
+            if (ev.eventId && sentEventIds.has(ev.eventId)) break;
+            send({
+              type: "assistant_delta",
+              text: ev.text,
+              ...(ev.eventId ? { eventId: ev.eventId } : {}),
+            });
             break;
           // 思考实时帧（纯内存、不落盘）：思考进行中让 UI 把「进行中的 thinking 行」画进流程；
           // eventId 与这段思考落盘后的事件 id 一致
@@ -332,6 +355,15 @@ export const GET = async (req: Request, { params }: Ctx) => {
           type: "background_subagents",
           jobs: getBackgroundSubagentSnapshot(id),
         });
+        // 进行中正文的快照：无条件发一帧（对象 = 整段铺上再接着长；null = 没在吐字、前端清残留）。
+        // 这段正文的落盘事件已经在 tail 里 = 其实已经结束（flush 与本次读 tail 交错），发 null 防幽灵。
+        // 不能对快照的 eventId 调 rememberEventId：后来真正落盘的 assistant_message 会被当重复丢掉，前端就收不到清流信号
+        const assistantLive =
+          assistantSnap &&
+          !tailEvents.some((e) => e.id === assistantSnap.eventId)
+            ? assistantSnap
+            : null;
+        send({ type: "assistant_snapshot", live: assistantLive });
         // 进行中思考的快照：无条件发一帧（对象 = 接着长；null = 没在思考、前端清残留）。
         // 这段思考的落盘事件已经在 tail 里 = 思考其实结束了（节流状态还没来得及清），发 null 防幽灵
         const liveSnap =

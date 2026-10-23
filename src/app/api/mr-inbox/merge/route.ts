@@ -1,7 +1,9 @@
 /**
  * POST /api/mr-inbox/merge —— 收件箱直接合并 MR
  *
- * body: { mrUrl: string }
+ * body: { mrUrl: string; sha?: string }
+ * sha = 用户看到「可合并」那次扫描时源分支的 HEAD 提交：带上则 GitLab 只在 HEAD 仍是它时才合并，
+ * 作者之后又推了新提交就回 409、提示刷新（GAP3-02）；不带 = 沿用旧行为。
  * host / projectPath / iid 全部从 MR URL 解析（不依赖任务仓库推导）；
  * token 用 settings.gitToken。成功后把该 MR 从收件箱缓存剔除（UI 立即一致）。
  *
@@ -21,11 +23,12 @@ import {
 import { errorResponse } from "@/lib/server/route-helpers";
 import { readSettingsFile } from "@/lib/server/settings-fs";
 import { assertTrustedGitHost } from "@/lib/server/trusted-git-host";
+import { isMergeShaMismatch } from "@/lib/mr-merge-error";
 
 export const runtime = "nodejs";
 
 export const POST = async (req: Request) => {
-  let body: { mrUrl?: unknown };
+  let body: { mrUrl?: unknown; sha?: unknown };
   try {
     body = await req.json();
   } catch {
@@ -36,6 +39,15 @@ export const POST = async (req: Request) => {
 
   const parsed = parseGitlabMrUrl(mrUrl);
   if (!parsed) return errorResponse("MR URL 无法解析");
+
+  // sha 可选；给了就必须像个提交哈希（别把任意字符串塞进 GitLab 请求体）
+  let sha: string | undefined;
+  if (body.sha !== undefined && body.sha !== null && body.sha !== "") {
+    if (typeof body.sha !== "string" || !/^[0-9a-f]{7,64}$/i.test(body.sha.trim())) {
+      return errorResponse("sha 必须是 7–64 位十六进制提交哈希");
+    }
+    sha = body.sha.trim();
+  }
 
   const settingsResult = await readSettingsFile();
   const settings =
@@ -68,8 +80,16 @@ export const POST = async (req: Request) => {
       config: { host: parsed.host, token: gitToken },
       projectPath: parsed.projectPath,
       iid: parsed.iid,
+      ...(sha ? { sha } : {}),
     });
     if (!result.ok) {
+      // 带了 sha 而被拒、且错误指向「HEAD 不匹配」：作者在扫描之后又推了新提交——给人话、409，别当 502 网关错误
+      if (sha && isMergeShaMismatch(result.error)) {
+        return errorResponse(
+          "该 MR 在你上次刷新之后有了新提交，为避免把没看过的改动一并合入，已拒绝合并。请刷新收件箱、确认后再合并",
+          409,
+        );
+      }
       return errorResponse(result.error, 502);
     }
     // 合并成功：从待测 MR 组剔除；待回归 bug 行只清 MR 关联（bug 本身还在）

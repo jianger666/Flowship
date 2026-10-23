@@ -3,7 +3,13 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { safeSliceEnd } from "@/components/tasks/use-smooth-streaming";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+import {
+  planForegroundCatchUp,
+  safeSliceEnd,
+} from "@/components/tasks/use-smooth-streaming";
 
 describe("safeSliceEnd", () => {
   it("普通字符原样", () => {
@@ -24,5 +30,42 @@ describe("safeSliceEnd", () => {
     expect(safeSliceEnd("😀", 0)).toBe(0);
     expect(safeSliceEnd("ab", 2)).toBe(2);
     expect(safeSliceEnd("ab", 5)).toBe(5);
+  });
+});
+
+describe("planForegroundCatchUp（回到前台直接追平，评审 N6）", () => {
+  it("后台期间攒了字（目标串 + 合帧队列）→ 并起来、标记需要跳到末尾", () => {
+    expect(planForegroundCatchUp("hello", " world", 5)).toEqual({
+      target: "hello world",
+      changed: true,
+    });
+    expect(planForegroundCatchUp("hello world", "", 5)).toEqual({
+      target: "hello world",
+      changed: true,
+    });
+  });
+
+  it("本来就追平 / 什么都没有 → 不需要动（不 setState）", () => {
+    expect(planForegroundCatchUp("hello", "", 5).changed).toBe(false);
+    expect(planForegroundCatchUp("", "", 0).changed).toBe(false);
+  });
+
+  it("契约：hook 监听 document 的 visibilitychange、卸载时摘同一个处理函数、只在可见时处理", () => {
+    const src = readFileSync(
+      path.resolve(
+        import.meta.dirname,
+        "..",
+        "src/components/tasks/use-smooth-streaming.ts",
+      ),
+      "utf-8",
+    );
+    expect(src).toContain(
+      'document.addEventListener("visibilitychange", onVisibilityChange);',
+    );
+    expect(src).toContain(
+      'document.removeEventListener("visibilitychange", onVisibilityChange)',
+    );
+    expect(src).toContain('if (document.visibilityState !== "visible") return;');
+    expect(src).toContain("planForegroundCatchUp(");
   });
 });

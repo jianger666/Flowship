@@ -15,6 +15,7 @@
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import { bootArgsForTask } from "./agent-provider";
+import { appendChangesQuery, type ChangesQuery } from "./changes/scope";
 import { normalizeCorruptTasks, type CorruptTaskInfo } from "./corrupt-task";
 import { getSettings } from "./local-store";
 import { TASK_LIST_FETCH_TIMEOUT_MS } from "./task-list-poll";
@@ -27,6 +28,9 @@ import {
   parseBackgroundSubagentJobs,
   type BackgroundSubagentJobView,
 } from "./background-subagents";
+import type { AssistantSnapshot } from "./assistant-live";
+import type { OutlineItem } from "./stream-outline";
+import { isTailAnchorEvent } from "./tail-anchor";
 import type { ThinkingSnapshot } from "./thinking-live";
 import type { ArchiveReport, DeleteWorktreeReportBody } from "./worktree-report";
 import type { TalkQueueItem } from "./talk-queue";
@@ -40,6 +44,7 @@ import {
   type NewTaskInput,
   type PreviewSlotStatus,
   type Task,
+  type TaskChangeCommits,
   type TaskChangeFileDiff,
   type TaskChanges,
   type TaskEvent,
@@ -152,6 +157,24 @@ export const fetchEarlierEvents = async (
 };
 
 /**
+ * 提问时间线大纲（全部 user_reply / action_start 的 id / 时刻 / 预览，见 lib/stream-outline）。
+ * 前端窗口只有最近一段事件，长会话里更早的提问靠它列出来。
+ */
+export const fetchTaskOutline = async (
+  id: string,
+  signal?: AbortSignal,
+): Promise<{ items: OutlineItem[]; truncated: boolean }> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/outline`, {
+    cache: "no-store",
+    signal,
+  });
+  return await handleJson<{ items: OutlineItem[]; truncated: boolean }>(res);
+};
+
+const isPersistentEvent = (e: TaskEvent): boolean =>
+  !e.id.startsWith("ephemeral_") && e.kind !== "tool_output_delta";
+
+/**
  * 若 `incoming` 里有「本地还没见过」的回退标记事件，把本地 events 对齐到那次回退
  * （截法见 rewind-marker.ts 的 planRewindTruncation：找得到 eventId 精确截 → 完整窗口按 keptCount 截 → 否则 resync）。
  * 标记事件本地已有 = 此前已处理过（如先经 SSE 追加、后到的快照），不重复截。
@@ -160,15 +183,34 @@ export const fetchEarlierEvents = async (
  * 无需截断时 events 原样返回同一数组引用。
  */
 const truncateForRewind = (
-  prev: Pick<Task, "events" | "eventsTruncated">,
+  prev: Pick<Task, "events" | "eventsTruncated" | "lastRewind">,
   incoming: TaskEvent[],
 ): { events: TaskEvent[]; resync: boolean } => {
   const known = new Set(prev.events.map((e) => e.id));
   let result = prev.events;
+  // 本地窗口里第一条持久事件的时刻（没有 = 不设防，走原逻辑）
+  const firstLocalTs = prev.events.find(isPersistentEvent)?.ts;
   for (const ev of incoming) {
     if (known.has(ev.id)) continue;
     const marker = readRewindMarker(ev);
     if (!marker) continue;
+    // 标记事件比本地窗口里**最早**的事件还早 = 那次回退发生在本地窗口建立之前：
+    // 窗口是回退之后的服务端日志切片，天然已对齐——既没有可截的、也不该 resync。
+    // 为什么必须跳过：mutation 响应（切 effort / 模型 / MCP / 改标题……共 20 来个入口、server 端 24 处）带**全量**
+    // events，里面会带着回退过的会话里所有「早已被挤出本地窗口」的老标记；不跳的话每个老标记都因「本地找不到被回退事件、
+    // 窗口又不完整」判成 resync，把本地 300 条整体换成上千条——列表头部凭空多出一大截而 Virtuoso 保持 scrollTop 像素，
+    // 视口落到很早的内容上、「N 条新内容」冒出 99+（用户 2026-10-23 反馈：切 effort 点确定后右边出现 99+、内容区滚到很早）。
+    // 判据安全性：回退写标记时 ts = 回退时刻，晚于当时所有存活事件；本地窗口首条比它还晚 ⇒ 窗口里每一条都是回退之后才产生的，
+    // 没有一条会被这次回退删掉。回退发生在窗口加载之后时，标记 ts 必然晚于窗口里被删的那些，不会被跳过、原逻辑照常处理
+    // （多标签页同理）；SSE 实时标记 ts 不小于本地末条，行为不变。严格小于：同毫秒边界走保守的原逻辑。
+    if (firstLocalTs !== undefined && ev.ts < firstLocalTs) continue;
+    // 本地已知这次或更新的回退（prev.lastRewind.ts >= 标记 ts）→ 已对齐过、不再处理。
+    // 典型：**回退者自己**的 HTTP 响应先于 SSE 标记到达——`applyRewoundResult` 已按响应体精确截好并记下 lastRewind，
+    // 随后响应里的 task（带全量 / 尾部 events、含这条标记）经 mergeTaskEvents 进来：标记不在本地、被回退事件又已被截掉，
+    // 窗口不完整时会判 resync，把窗口换成上千条（评审 N3 之外的另一条整体替换入口）。
+    // 与 lastRewindNeedsResync 同一幂等约定（「本地已知这次或更新的回退 → 不再重拉」）：标记 ts 与 lastRewind.ts 同值
+    // （回退路由取 marker.ts），所以用 <=。**别的窗口**的回退：本地 lastRewind 更老（或没有）、标记 ts 更大，不会被跳过，行为不变。
+    if (prev.lastRewind && ev.ts <= prev.lastRewind.ts) continue;
     const plan = planRewindTruncation(result, marker, {
       complete: !prev.eventsTruncated,
     });
@@ -192,8 +234,20 @@ export const rewindNeedsResync = (prev: Task, ev: TaskEvent): boolean =>
  * 本地无法对齐（rewindNeedsResync）时原样返回 prev、不追加：标记事件留给后续快照 / 重连回放再处理，
  * 否则它一旦「已知」就再也触发不了纠正。
  */
-export const appendTaskEvent = (prev: Task, ev: TaskEvent): Task => {
+export const appendTaskEvent = (
+  prev: Task,
+  ev: TaskEvent,
+  /** replay：这条是 SSE bootstrap 回放的历史尾部事件（onEvent 的第二个参数） */
+  opts?: { replay?: boolean },
+): Task => {
   if (prev.events.some((e) => e.id === ev.id)) return prev;
+  // 回放里「比本地窗口首条还早」的事件：只追加会把它们接到末尾、时间序错乱（评审 N5：别的窗口回退使日志变短后，
+  // 重连的 bootstrap 会回放比本地更早的尾部），直到后面的回退标记触发截断 / 重拉才纠正。
+  // 与 mergeTaskEvents「更早的回灌一律丢弃、更早历史只归上拉分页管」同口径；实时事件不受影响（不带 replay）。
+  if (opts?.replay) {
+    const firstLocalTs = prev.events.find(isPersistentEvent)?.ts;
+    if (firstLocalTs !== undefined && ev.ts < firstLocalTs) return prev;
+  }
   const { events, resync } = truncateForRewind(prev, [ev]);
   if (resync) return prev;
   return { ...prev, events: [...events, ev] };
@@ -278,8 +332,30 @@ export const applyRewoundResult = (
   };
 };
 
-const isPersistentEvent = (e: TaskEvent): boolean =>
-  !e.id.startsWith("ephemeral_") && e.kind !== "tool_output_delta";
+/**
+ * 尾窗口大小：与任务页首屏 / 重拉的 EVENT_TAIL（page.tsx）同值；锚点补读上限与服务端 MAX_EVENTS_TAIL
+ * （server/task-fs-core.ts）同值——tests/merge-task-events-resync-window.test.ts 有契约钉住两处不漂。
+ */
+export const RESYNC_TAIL_EVENTS = 300;
+export const RESYNC_TAIL_MAX = 1000;
+
+/**
+ * 把（可能是全量的）事件列表裁成尾窗口：最近 RESYNC_TAIL_EVENTS 条，且补到含最近一条 user_reply / action_start
+ * （与服务端 `?anchor=1` 同判定 isTailAnchorEvent、同上限——客户端「只追加」的合并靠窗口口径一致不乱序）。
+ * 本来就不大于窗口 → 原样返回同一数组引用。
+ */
+const trimToTailWindow = (
+  events: TaskEvent[],
+): { events: TaskEvent[]; trimmed: boolean } => {
+  if (events.length <= RESYNC_TAIL_EVENTS) return { events, trimmed: false };
+  let start = events.length - RESYNC_TAIL_EVENTS;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (!isTailAnchorEvent(events[i]!)) continue;
+    if (i < start && events.length - i <= RESYNC_TAIL_MAX) start = i;
+    break;
+  }
+  return { events: events.slice(start), trimmed: start > 0 };
+};
 
 /**
  * 回退后本地窗口不可信：以服务端快照 events 为准整体替换，再补上「快照之后才到的」本地事件
@@ -289,7 +365,11 @@ const isPersistentEvent = (e: TaskEvent): boolean =>
  * 调用方：mergeTaskEvents（带回退标记的快照）与页面的「完整重新拉取」。
  */
 export const replaceTaskEventsWithSnapshot = (prev: Task, next: Task): Task => {
-  const snapEvents = next.events.filter(isPersistentEvent);
+  // 快照可能是全量（mutation 响应 / 旧路径）：先裁成「尾窗口」再替换——整体替换成上千条会让列表头部凭空长出一大截
+  // （评审 N3；Virtuoso 视口落到很早的内容、触发「滚到很早的地方」）。已是尾窗口大小的快照（首屏 / 重拉）原样通过
+  const { events: snapEvents, trimmed } = trimToTailWindow(
+    next.events.filter(isPersistentEvent),
+  );
   const known = new Set(snapEvents.map((e) => e.id));
   const lastTs = snapEvents.length > 0 ? snapEvents[snapEvents.length - 1].ts : 0;
   const floor = Math.max(lastTs, next.updatedAt);
@@ -297,7 +377,7 @@ export const replaceTaskEventsWithSnapshot = (prev: Task, next: Task): Task => {
     (e) => isPersistentEvent(e) && !known.has(e.id) && e.ts > floor,
   );
   const events = later.length > 0 ? [...snapEvents, ...later] : snapEvents;
-  const eventsTruncated = next.eventsTruncated;
+  const eventsTruncated = trimmed ? true : next.eventsTruncated;
   // 过期快照不得盖运行态（同 mergeTaskEvents 末尾）
   if (next.updatedAt < prev.updatedAt) {
     return withNewerLastRewind({ ...prev, events, eventsTruncated }, prev, next);
@@ -576,33 +656,66 @@ export const checkoutTaskBranch = async (
 };
 
 /**
- * task 代码改动清单（GET /api/tasks/[id]/changes）：各仓相对基线改了哪些文件 + 增删行数（不含 patch）。
- * 轻量、可轮询；chat / 未启动的任务返回空 repos。
+ * 代码改动清单（GET /api/tasks/[id]/changes）：各仓改了哪些文件 + 增删行数（不含 patch）。
+ * task / chat 都能用、轻量、可轮询；没绑工作目录的 chat / 未启动的任务返回空 repos。
+ * query 缺省 = 整条分支 / 自动基线 / 不忽略空白。
  */
-export const fetchTaskChanges = async (id: string): Promise<TaskChanges> => {
-  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/changes`, {
-    cache: "no-store",
-  });
+export const fetchTaskChanges = async (
+  id: string,
+  query: Partial<ChangesQuery> = {},
+  signal?: AbortSignal,
+): Promise<TaskChanges> => {
+  const params = new URLSearchParams();
+  appendChangesQuery(params, query);
+  const qs = params.toString();
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(id)}/changes${qs ? `?${qs}` : ""}`,
+    { cache: "no-store", signal },
+  );
   const data = await handleJson<{ changes: TaskChanges }>(res);
   return data.changes;
 };
 
-/** 单个文件相对基线的 unified diff（GET /api/tasks/[id]/changes/file、按需拉） */
+/**
+ * 单个文件的 unified diff（GET /api/tasks/[id]/changes/file、按需拉）。
+ * full=true 拉整文件内容（-U1000000），给「展开上下文」用。
+ */
 export const fetchTaskChangeFileDiff = async (
   id: string,
   file: { repoPath: string; path: string; oldPath?: string },
+  query: Partial<ChangesQuery> & { full?: boolean } = {},
+  signal?: AbortSignal,
 ): Promise<TaskChangeFileDiff> => {
   const params = new URLSearchParams({
     repoPath: file.repoPath,
     path: file.path,
   });
   if (file.oldPath) params.set("oldPath", file.oldPath);
+  appendChangesQuery(params, query);
+  if (query.full) params.set("full", "1");
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(id)}/changes/file?${params.toString()}`,
-    { cache: "no-store" },
+    { cache: "no-store", signal },
   );
   const data = await handleJson<{ file: TaskChangeFileDiff }>(res);
   return data.file;
+};
+
+/** 各仓「基线之后」的提交列表（GET /api/tasks/[id]/changes/commits）：范围选择器的数据源 */
+export const fetchTaskChangeCommits = async (
+  id: string,
+  query: Pick<ChangesQuery, "baseRef"> = { baseRef: null },
+  signal?: AbortSignal,
+): Promise<TaskChangeCommits> => {
+  const params = new URLSearchParams();
+  appendChangesQuery(params, { baseRef: query.baseRef });
+  const qs = params.toString();
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(id)}/changes/commits${qs ? `?${qs}` : ""}`,
+    { cache: "no-store", signal },
+  );
+  const data = await handleJson<{ commits: TaskChangeCommits }>(res);
+  return data.commits;
 };
 
 // ----------------- MCP 配置读取（V0.13 独立化：servers = fe 自管有效集） -----------------
@@ -723,6 +836,11 @@ interface SSEEnvelope {
      * null = 没在思考。让重新订阅的前端接着长、而不是从头开始
      */
     | "thinking_snapshot"
+    /**
+     * 进行中正文的快照（bootstrap 无条件一帧，在 thinking_snapshot 之前）：live 为对象 = 此刻正在吐字、带已发出的整段；
+     * null = 没在吐字。让切走再切回 / 重连的前端立刻看到已生成的全部、而不是只剩后半截
+     */
+    | "assistant_snapshot"
     /** 队列整队失败控制帧 */
     | "queue_failed"
     /** bootstrap 队列存活快照 */
@@ -746,11 +864,11 @@ interface SSEEnvelope {
   origin?: string;
   message?: string;
   text?: string;
-  /** thinking_delta 帧：这段思考落盘后那条 thinking 事件的 id */
+  /** thinking_delta / assistant_delta 帧：这段思考 / 正文落盘后那条事件的 id */
   eventId?: string;
   /** event 帧：true = bootstrap 回放的历史尾部事件（不是刚发生的）；实时事件不带这个字段 */
   replay?: boolean;
-  /** thinking_snapshot 帧：进行中思考的快照；null = 没在思考。字段按「不可信输入」逐项校验 */
+  /** thinking_snapshot / assistant_snapshot 帧：进行中思考 / 正文的快照；null = 没有。字段按「不可信输入」逐项校验 */
   live?: {
     eventId?: unknown;
     text?: unknown;
@@ -812,6 +930,27 @@ const parseThinkingSnapshot = (
   }
   if (typeof since !== "number" || !Number.isFinite(since)) return undefined;
   return { id: eventId, text, total, since };
+};
+
+/**
+ * assistant_snapshot 帧的 live 字段 → AssistantSnapshot：
+ *   - null → null（明确的「没在吐字」）；
+ *   - 字段齐全且类型对（eventId 非空串、text 字符串、total 有限非负数）→ 快照；
+ *   - 其它（缺字段 / 类型不对 / 缺 live）→ undefined（无效帧，调用方丢弃：宁可不动本地状态，也别拿脏数据覆盖它）。
+ * 线上字段叫 eventId（与 assistant_delta 帧一致），前端内部叫 id。
+ */
+const parseAssistantSnapshot = (
+  live: SSEEnvelope["live"] | undefined,
+): AssistantSnapshot | null | undefined => {
+  if (live === null) return null;
+  if (typeof live !== "object" || live === undefined) return undefined;
+  const { eventId, text, total } = live;
+  if (typeof eventId !== "string" || eventId.length === 0) return undefined;
+  if (typeof text !== "string") return undefined;
+  if (typeof total !== "number" || !Number.isFinite(total) || total < 0) {
+    return undefined;
+  }
+  return { id: eventId, text, total };
 };
 
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
@@ -876,6 +1015,14 @@ export interface TaskStreamCallbacks {
    * 无效帧（字段缺失 / 类型不对）直接丢弃、不回调：宁可不动本地状态，也别拿脏数据覆盖它。
    */
   onThinkingSnapshot?: (snapshot: ThinkingSnapshot | null) => void;
+  /**
+   * 进行中正文的快照（每次连接 bootstrap 恰好一帧，在 thinking 快照之前）：
+   *   - 对象 = 此刻正在吐字，带服务端已发出的整段——上层把它铺到流式气泡上再接着拼实时增量，
+   *     切走再切回 / 重连后不再只剩后半截；
+   *   - null = 此刻没在吐字——上层清掉本地可能残留的流式文字。
+   * 无效帧（字段缺失 / 类型不对）直接丢弃、不回调。
+   */
+  onAssistantSnapshot?: (snapshot: AssistantSnapshot | null) => void;
   /**
    * 队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
    */
@@ -1022,6 +1169,10 @@ export const watchTaskStream = async (
             env.eventId.length > 0
           ) {
             callbacks.onThinkingDelta?.(env.text, env.eventId);
+          } else if (env.type === "assistant_snapshot") {
+            // 无效帧丢弃（undefined）：不动本地状态；null / 合法对象才回调
+            const snap = parseAssistantSnapshot(env.live);
+            if (snap !== undefined) callbacks.onAssistantSnapshot?.(snap);
           } else if (env.type === "thinking_snapshot") {
             // 无效帧丢弃（undefined）：不动本地状态；null / 合法对象才回调
             const snap = parseThinkingSnapshot(env.live);

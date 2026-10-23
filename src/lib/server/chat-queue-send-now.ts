@@ -27,8 +27,8 @@ import {
   drainRemainingChatQueue,
   emitQueuedMessageFlushed,
   endChatQueueInFlight,
-  enqueueChatMessage,
   enqueueChatMessageFront,
+  enqueueChatMessagesFront,
   getChatQueueGeneration,
   getChatSystemCloseMark,
   isMessageOperationTerminal,
@@ -466,14 +466,32 @@ export type SendNowDeps = {
   steer?: SteerSendNowDeps;
   /** 取剩余队（默认真实实现；单测可 mock 验“其余排队保留”） */
   drainRest?: typeof drainRemainingChatQueue;
-  /** 塞回剩余队（默认真实实现；单测可 mock 断言顺序） */
-  requeueRest?: (taskId: string, rest: QueuedChatMsg[]) => void;
+  /**
+   * 塞回剩余队（默认真实实现；单测可 mock 断言顺序）。
+   * afterItemId = 本次「立即发送」的目标条：start 失败时它已被放回队首，其余要跟在它后面
+   */
+  requeueRest?: (
+    taskId: string,
+    rest: QueuedChatMsg[],
+    afterItemId?: string,
+  ) => void;
 };
 
-/** 默认塞回：同 id 原样 append（operation 非终态 → 幂等受理继续排队） */
-const defaultRequeueRest = (taskId: string, rest: QueuedChatMsg[]): void => {
-  for (const m of rest) {
-    enqueueChatMessage(taskId, {
+/**
+ * 默认塞回：整批按原顺序塞队首（enqueueChatMessagesFront）。
+ * 以前逐条 enqueueChatMessage 且无视返回值（BE2-01）：窗口内又来 2 条以上新消息、队列又将满时，
+ * 塞回的老消息被 `full` 拒掉——已回 202 的消息静默丢失、留下幽灵「排队中」气泡；
+ * 而且是 append，老消息还排到了窗口内新消息后面。
+ * afterItemId：start 失败时目标条已放回队首，其余应跟在它后面（见 enqueueChatMessagesFront）。
+ */
+const defaultRequeueRest = (
+  taskId: string,
+  rest: QueuedChatMsg[],
+  afterItemId?: string,
+): void => {
+  const { requeued, skipped } = enqueueChatMessagesFront(
+    taskId,
+    rest.map((m) => ({
       itemId: m.itemId,
       agentText: m.agentText,
       displayText: m.displayText,
@@ -484,7 +502,13 @@ const defaultRequeueRest = (taskId: string, rest: QueuedChatMsg[]): void => {
       enqueuedAt: m.enqueuedAt,
       skipPersistEvent: m.skipPersistEvent,
       extraMeta: m.extraMeta,
-    });
+    })),
+    { afterItemId },
+  );
+  if (skipped > 0) {
+    console.warn(
+      `[chat-queue-send-now] task=${taskId} 塞回其余排队：${requeued} 条已塞回、${skipped} 条已在队里 / 已终态而跳过`,
+    );
   }
 };
 
@@ -765,7 +789,7 @@ export const sendQueuedChatMessageNow = async (
   } catch (err) {
     // stop 失败：目标条放回队首、其余按原顺序跟回，一条不丢
     enqueueChatMessageFront(taskId, taken);
-    requeueRest(taskId, rest);
+    requeueRest(taskId, rest, taken.itemId);
     throw err;
   }
 
@@ -789,6 +813,6 @@ export const sendQueuedChatMessageNow = async (
   try {
     return await deps.start(taskId, taken, validated);
   } finally {
-    requeueRest(taskId, rest);
+    requeueRest(taskId, rest, taken.itemId);
   }
 };

@@ -206,6 +206,10 @@ const nextConfig = {
           key: "Content-Security-Policy-Report-Only",
           value: buildCspReportOnlyPolicy(process.env.NODE_ENV === "production"),
         },
+        // 防点击劫持（旧台账 M-12，2026-10-23 全仓审查仍未修）：Report-Only 里的 `frame-ancestors` 只上报、不拦，
+        // 恶意网页能把 http://127.0.0.1:<端口>/ 嵌进 iframe 诱导点击。X-Frame-Options 不属于 CSP、没有「误 enforce 白屏」的风险：
+        // 本应用唯一的 iframe 是本地文件预览（blob: 文档，不经此响应头），其余页面不被嵌入，同源嵌入仍放行。
+        { key: "X-Frame-Options", value: "SAMEORIGIN" },
       ],
     },
   ],

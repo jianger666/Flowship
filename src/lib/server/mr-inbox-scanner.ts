@@ -620,6 +620,7 @@ const scanPendingMr = async (
               detailedMergeStatus: mr.detailedMergeStatus,
               hasConflicts: mr.hasConflicts,
               mergeable: mr.mergeable,
+              ...(mr.headSha ? { headSha: mr.headSha } : {}),
             }
           : null,
         ...(error ? { mrError: error } : {}),
@@ -750,6 +751,7 @@ const enrichPendingRegressionWithMr = async (
           detailedMergeStatus: r.detailedMergeStatus,
           hasConflicts: r.hasConflicts,
           mergeable: r.mergeable,
+          ...(r.headSha ? { headSha: r.headSha } : {}),
         };
         return { ...bug, mrUrl: parsed.canonicalUrl, mr };
       } catch (err) {

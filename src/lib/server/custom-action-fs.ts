@@ -15,7 +15,7 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import matter from "gray-matter";
+import { parseFrontmatter } from "./frontmatter";
 
 import { dataRoot, writePrivateFileAtomic } from "./data-root";
 import {
@@ -289,7 +289,7 @@ const defFromMeta = (
 // 新格式：frontmatter 有 skill、正文空（迁移前旧壳）。
 // 旧格式（无 skill 字段、正文塞 playbook）→ 返回带 legacyPlaybook 的 def。
 const parseDef = (id: string, raw: string): CustomActionDef | null => {
-  const parsed = matter(raw);
+  const parsed = parseFrontmatter(raw);
   const data = parsed.data as Record<string, unknown>;
   const label = typeof data.label === "string" ? data.label.trim() : "";
   if (!label) return null;

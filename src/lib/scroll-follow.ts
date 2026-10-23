@@ -155,9 +155,106 @@ export const nextNewItemsBaseline = (
   return following || prependDelta <= 0 ? base : base + prependDelta;
 };
 
+/**
+ * 头部整体变化的增量：**尾部没动、总数却变多** = 多出来的那些在头部（整体重拉 / 回退对齐 / 头部补页），
+ * 不是用户没看到的新内容。调用方把它当作 prependDelta 的下限同步抬高基线（取 max、别和 loadEarlier 的显式增量相加：
+ * 上拉分页同时满足两者，相加会让基线欠下一截）。
+ *
+ * 为什么需要（2026-10-23 用户反馈「切 effort 点确定后右边冒出 99+ 条新内容、内容区滚到很早的位置」）：
+ * 只比总数差，任何让头部突然变长的路径（mutation 响应整体替换本地窗口等）都会被算成「几百条新内容」。
+ * 回退对齐的根因已在 task-store.truncateForRewind 修掉，这里是兜底：以后别的路径再让头部变长，也不会误报。
+ *
+ * tailId = 最后一个内容单元的稳定身份（工作过程组取最后一个成员——否则长 action 里新增成员时尾 id 不变、会被当成头部变化）；
+ * 任一侧为 null（空列表）不判定。
+ */
+export const headGrowthWithoutNewTail = (
+  prev: { count: number; tailId: string | null },
+  count: number,
+  tailId: string | null,
+): number =>
+  tailId !== null && tailId === prev.tailId && count > prev.count
+    ? count - prev.count
+    : 0;
+
 /** 基线到当前条数的差值（负数夹到 0） */
 export const countNewItems = (baseline: number, itemCount: number): number =>
   Math.max(0, itemCount - baseline);
+
+/**
+ * 「N 条新内容」的完整状态（回到最新按钮）：**尾锚点**优先、条数基线兜底。
+ *
+ * - `anchorId`：用户离开底部那一刻，**最后一个内容单元**的稳定身份。之后 N = 该单元**之后**有几个单元——
+ *   任何头部变化（整体重拉 / 回退对齐 / 上拉分页）都改不动它，哪怕同一次渲染里头部变长、尾部也来了新内容
+ *   （评审 N2：RC3 的 headGrowthWithoutNewTail 只管「尾没动」，这种情形仍会报 99+）。
+ * - 锚点找不到（它所在的块被合并进别的块 / 被回退裁掉）：退回条数基线（nextNewItemsBaseline + 头部增量兜底），
+ *   并**立刻重新落锚**到「新内容之前的那一个单元」——之后又是锚点计数，不会一直靠条数差。
+ * - `lastCount` / `lastTailId`：上一帧的快照，给 headGrowthWithoutNewTail 判「尾没动而总数变多」用。
+ *
+ * 幂等：同一输入重复推进结果不变（渲染期写 ref + StrictMode 双渲）——第二次进来锚点已落在第一次算出的位置。
+ */
+export interface NewItemsTracker {
+  baseline: number;
+  anchorId: string | null;
+  lastCount: number;
+  lastTailId: string | null;
+}
+
+export const initNewItemsTracker = (ids: readonly string[]): NewItemsTracker => {
+  const tailId = ids.length > 0 ? ids[ids.length - 1]! : null;
+  return { baseline: ids.length, anchorId: tailId, lastCount: ids.length, lastTailId: tailId };
+};
+
+export const advanceNewItemsTracker = (
+  prev: NewItemsTracker,
+  /** 当前全部内容单元的稳定身份，按时间顺序（工作过程组已按成员摊开） */
+  ids: readonly string[],
+  following: boolean,
+  /** 非跟随态下 loadEarlier 头部 prepend 的条数（锚点丢了才会用到） */
+  prependDelta = 0,
+): { tracker: NewItemsTracker; newCount: number } => {
+  const count = ids.length;
+  const tailId = count > 0 ? ids[count - 1]! : null;
+  // 跟随中：最新内容就在眼前，一切跟平
+  if (following) {
+    return { tracker: initNewItemsTracker(ids), newCount: 0 };
+  }
+  const anchorAt = prev.anchorId === null ? -1 : ids.lastIndexOf(prev.anchorId);
+  if (anchorAt >= 0) {
+    const newCount = count - 1 - anchorAt;
+    return {
+      tracker: {
+        baseline: count - newCount,
+        anchorId: prev.anchorId,
+        lastCount: count,
+        lastTailId: tailId,
+      },
+      newCount,
+    };
+  }
+  // 锚点丢了：条数基线兜底，再重新落锚
+  const growth = headGrowthWithoutNewTail(
+    { count: prev.lastCount, tailId: prev.lastTailId },
+    count,
+    tailId,
+  );
+  const baseline = nextNewItemsBaseline(
+    prev.baseline,
+    count,
+    false,
+    Math.max(prependDelta, growth),
+  );
+  const newCount = countNewItems(baseline, count);
+  const anchorIdx = count - 1 - newCount;
+  return {
+    tracker: {
+      baseline,
+      anchorId: anchorIdx >= 0 ? ids[anchorIdx]! : null,
+      lastCount: count,
+      lastTailId: tailId,
+    },
+    newCount,
+  };
+};
 
 /** 键盘上翻键：焦点落在列表内某个按钮上时按这些键也会把列表往上滚 */
 const UP_INTENT_KEYS: ReadonlySet<string> = new Set([
@@ -170,6 +267,47 @@ export const isUpIntentKey = (key: string): boolean => UP_INTENT_KEYS.has(key);
 
 /** 滚轮：deltaY < 0 = 往上翻 */
 export const isUpIntentWheel = (deltaY: number): boolean => deltaY < 0;
+
+/** 手势（滚轮 / 触摸 / 键盘）目标沿 parentElement 向上走时只需要的几何字段（单测用假对象、运行时是 HTMLElement） */
+export interface ScrollAncestorLike {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  parentElement: ScrollAncestorLike | null;
+}
+
+/**
+ * 这次**上滚**手势（滚轮 / 触摸下拖 / ↑ PageUp Home）其实不会让外层事件流滚动吗——是的话不该登记「用户上滚」意图。
+ * 三条输入路径共用本判断（评审 R3：触摸 / 键盘路径此前未对称过滤）：滚轮传 WheelEvent 本身，
+ * 触摸传 {deltaX: 横向位移, deltaY: -纵向位移}（手指下拖 = 内容上滚 = deltaY 为负），键盘传 {deltaY: -1}。
+ *
+ * 为什么要排除（2026-10-23 评审 N1，「点确定前 following 就已经是 false」的一个成因）：
+ * 意图位只在**外层** scroll 事件里被消费；滚轮事件却会从内层冒泡到外层监听器。两类滚轮外层根本不滚：
+ *  1. **横向为主**（触控板左右滑、shift+滚轮）——`deltaY` 常带小负数；
+ *  2. **被嵌套可滚区吃掉**（工具输出框 / 代码块 / 表格，内层 scrollTop > 0 时上滚先滚内层）。
+ * 意图没人消费、残留 UP_INTENT_TTL_MS；这期间流式的贴底写会引出外层 scroll 事件，意图被它消费 →
+ * 被当成「用户上滚」把跟随关掉——用户明明停在底部、什么都没滚。
+ *
+ * 只处理**上滚**方向：这是会误关跟随的那个方向，而且判「内层还能往上滚」只需 `scrollTop > 0`，
+ * 不用读 overflow 样式（overflow:hidden 的元素 scrollTop 恒为 0）。往下方向不做同类排除——
+ * 内层「还能往下滚」得读 overflow 才判得准，而漏掉一次往下意图只是少一次恢复跟随的机会、不会误关。
+ *
+ * 刻意**不改** onScroll 里「意图被任意 scroll 消费」的语义：Virtuoso 向上补偿的 scrollBy(+28) 可能和用户的一次小幅
+ * 上滚合并成同一个 scroll 事件（净 delta 为正），按 delta 方向丢意图会把真上滚吞掉、人被贴底拽回（老的「一滚就抖」）。
+ *
+ * target 缺失（单测里派发的假事件）→ 只做横向判断。
+ */
+export const isUpScrollHandledElsewhere = (
+  e: { deltaX?: number; deltaY: number },
+  target: ScrollAncestorLike | null | undefined,
+  scroller: unknown,
+): boolean => {
+  if (Math.abs(e.deltaX ?? 0) > Math.abs(e.deltaY)) return true;
+  for (let el = target ?? null; el && el !== scroller; el = el.parentElement) {
+    if (el.scrollTop > 0 && el.scrollHeight > el.clientHeight) return true;
+  }
+  return false;
+};
 
 /**
  * 触摸：手指相对起点往**下**拖（clientY 变大）= 内容往下走 = 在看更早的内容。

@@ -47,10 +47,12 @@ import {
   isUpIntentKey,
   isUpIntentTouch,
   isUpIntentWheel,
+  isUpScrollHandledElsewhere,
   nextFollowing,
   shouldAnimateScrollToBottom,
   smoothBottomDuration,
   smoothBottomTop,
+  type ScrollAncestorLike,
 } from "@/lib/scroll-follow";
 
 export interface StreamFollowController {
@@ -123,6 +125,7 @@ export const createStreamFollowController = (
   let draggingScrollbar = false;
   /** 触摸起点 Y（判断手指往下拖 = 往上翻历史） */
   let touchStartY = 0;
+  let touchStartX = 0;
   /** 上一次 scroll 事件时的 scrollTop（挂上时取当前值）：本次相减得滚动方向 */
   let lastScrollTop = 0;
   /** 最近一次用户「往下翻」输入的时间：恢复跟随要求它还在有效期内（程序化滚动没有输入） */
@@ -225,18 +228,44 @@ export const createStreamFollowController = (
   };
 
   const onWheel = (e: WheelEvent) => {
-    if (isUpIntentWheel(e.deltaY)) markUpIntent();
-    else if (isDownIntentWheel(e.deltaY)) markDownIntent();
+    if (isUpIntentWheel(e.deltaY)) {
+      // 横向滑动 / 被内层可滚区吃掉的上滚：外层不会滚、没有 scroll 事件来消费意图，
+      // 残留的意图会被之后流式贴底写的 scroll 事件误当成「用户上滚」（评审 N1）。不登记、也不取消滑行
+      if (
+        isUpScrollHandledElsewhere(
+          e,
+          e.target as unknown as ScrollAncestorLike | null,
+          scroller,
+        )
+      ) {
+        return;
+      }
+      markUpIntent();
+    } else if (isDownIntentWheel(e.deltaY)) markDownIntent();
   };
 
   const onTouchStart = (e: TouchEvent) => {
     touchStartY = e.touches[0]?.clientY ?? 0;
+    touchStartX = e.touches[0]?.clientX ?? 0;
   };
 
   const onTouchMove = (e: TouchEvent) => {
     const y = e.touches[0]?.clientY ?? 0;
-    if (isUpIntentTouch(y - touchStartY)) markUpIntent();
-    else if (isDownIntentTouch(y - touchStartY)) markDownIntent();
+    const x = e.touches[0]?.clientX ?? 0;
+    if (isUpIntentTouch(y - touchStartY)) {
+      // 与滚轮同口径（评审 N1 / R3）：横向为主的滑动、或手指落在内层可滚区且它还没滚到顶（下拖由内层消化），
+      // 外层不会滚、没有 scroll 事件消费意图 → 不登记。touchmove 的 target 恒为触点起始元素
+      if (
+        isUpScrollHandledElsewhere(
+          { deltaX: x - touchStartX, deltaY: -(y - touchStartY) },
+          e.target as unknown as ScrollAncestorLike | null,
+          scroller,
+        )
+      ) {
+        return;
+      }
+      markUpIntent();
+    } else if (isDownIntentTouch(y - touchStartY)) markDownIntent();
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -244,8 +273,19 @@ export const createStreamFollowController = (
     if (target && isEditableTarget(target.tagName, target.isContentEditable)) {
       return;
     }
-    if (isUpIntentKey(e.key)) markUpIntent();
-    else if (isDownIntentKey(e.key)) markDownIntent();
+    if (isUpIntentKey(e.key)) {
+      // 焦点在内层可滚区里且它还没滚到顶：↑ / PageUp / Home 由内层消化，外层不滚（评审 R3，与滚轮 / 触摸同口径）
+      if (
+        isUpScrollHandledElsewhere(
+          { deltaY: -1 },
+          e.target as unknown as ScrollAncestorLike | null,
+          scroller,
+        )
+      ) {
+        return;
+      }
+      markUpIntent();
+    } else if (isDownIntentKey(e.key)) markDownIntent();
   };
 
   const onPointerDown = (e: PointerEvent) => {
@@ -363,6 +403,7 @@ export const createStreamFollowController = (
     intentUpAt = Number.NEGATIVE_INFINITY;
     draggingScrollbar = false;
     touchStartY = 0;
+    touchStartX = 0;
     downIntentAt = Number.NEGATIVE_INFINITY;
   };
 

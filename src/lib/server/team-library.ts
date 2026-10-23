@@ -2417,7 +2417,17 @@ const listSharedSkillDirs = async (
       if (!isStrictlyInside(skillsRoot, absDir)) continue;
       const skillMd = path.join(absDir, "SKILL.md");
       if (!(await pathExists(skillMd))) continue;
-      const parsed = await parseSkillFile(skillMd, { enforceTeamName: true });
+      // 一份坏的 SKILL.md（YAML 非法 / 前言引擎不允许）只跳过它自己，别让整个列表 reject
+      let parsed;
+      try {
+        parsed = await parseSkillFile(skillMd, { enforceTeamName: true });
+      } catch (err) {
+        console.warn(
+          `[team-library] 共享 skill 解析失败、已跳过 ${path.relative(repoDir, skillMd)}：`,
+          err instanceof Error ? err.message : err,
+        );
+        continue;
+      }
       if (!parsed) continue;
       out.push({
         category: catEnt.name,

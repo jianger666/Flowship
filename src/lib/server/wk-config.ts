@@ -94,12 +94,22 @@ const markHubDefaultHandled = async (url: string): Promise<void> => {
   }
 };
 
-/** 纯读文件；不存在 / 读不动一律返回空配置（不抛） */
-const readWkConfigFile = async (): Promise<WkConfig> => {
+/** 文件不存在（= 真·没配过）。其它读失败（EACCES / EIO / EISDIR / EMFILE / 云盘离线……）不算「空」 */
+const isFileMissing = (err: unknown): boolean =>
+  (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+
+/**
+ * 纯读文件。不存在 → 空配置；其它读失败：
+ * - 默认（宽松）：也返回空配置、不抛——wk-gate / wk-activate 这类「读不到就当没配」的调用方靠它不炸；
+ * - `strict`：抛出——给设置页 GET 用，让前端的「读取失败 + 重新读取」有真实触发源
+ *   （否则 200 + 空配置会让前端以为读成功、放行保存，空表单一落盘就覆盖掉文件里的其它内容；评审 R3 FE5）。
+ */
+const readWkConfigFile = async (strict = false): Promise<WkConfig> => {
   let raw: string;
   try {
     raw = await fs.readFile(wkConfigPath(), "utf8");
-  } catch {
+  } catch (err) {
+    if (strict && !isFileMissing(err)) throw err;
     return { ...EMPTY_WK_CONFIG };
   }
   return configFromYaml(raw);
@@ -115,8 +125,10 @@ export const writeWkConfig = async (cfg: WkConfigInput): Promise<void> => {
   let existing = "";
   try {
     existing = await fs.readFile(target, "utf8");
-  } catch {
-    /* 首次写入 */
+  } catch (err) {
+    // 只有「文件不存在」才是首次写入。读不动（EACCES / EIO / EISDIR…）却当成空文件重写，
+    // 会把同事配的其它键和注释整个抹掉、与文件头「其余内容原样保留」的承诺矛盾——宁可写失败（评审 R3 FE5）
+    if (!isFileMissing(err)) throw err;
   }
 
   const next = applyWkConfig(existing, cfg);
@@ -141,8 +153,13 @@ export const writeWkConfig = async (cfg: WkConfigInput): Promise<void> => {
  * 只播种一次（见 {@link hubDefaultMarkPath}）：之后地址完全由用户说了算，
  * 包括「清空 = 不接入 Hub」。
  */
-export const readWkConfig = async (): Promise<WkConfig> => {
-  const cfg = await readWkConfigFile();
+export const readWkConfig = async (
+  opts?: {
+    /** 读失败（文件存在但读不动）时抛出而不是当空配置——只给设置页 GET 用，见 readWkConfigFile */
+    strict?: boolean;
+  },
+): Promise<WkConfig> => {
+  const cfg = await readWkConfigFile(opts?.strict === true);
   if (await hubDefaultHandled()) return cfg;
 
   // 用户（或同事）已经配过地址 → 不插手，但记一笔，免得他之后清空又被我们塞回默认值

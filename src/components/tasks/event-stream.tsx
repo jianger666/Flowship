@@ -78,8 +78,8 @@ import {
 } from "@/lib/pane-search";
 import {
   VIRTUOSO_NEVER_AT_BOTTOM,
-  countNewItems,
-  nextNewItemsBaseline,
+  advanceNewItemsTracker,
+  initNewItemsTracker,
 } from "@/lib/scroll-follow";
 import {
   INITIAL_STREAM_HANDOFF,
@@ -89,13 +89,21 @@ import {
   streamItemId,
 } from "@/lib/stream-handoff";
 import { getSubmitShortcutHint } from "@/lib/submit-shortcut";
-import { fetchEarlierBatch } from "@/lib/earlier-events";
+import { fetchEarlierBatch, shouldReopenEarlierPaging } from "@/lib/earlier-events";
+import { useTaskOutline } from "@/hooks/use-task-outline";
+import {
+  OUTLINE_JUMP_MAX_EVENTS,
+  createActiveOutlineStore,
+  resolveActiveOutlineId,
+} from "@/lib/stream-outline";
+import { StreamOutlineRail } from "./stream-outline-rail";
 import {
   fetchEarlierEvents,
   skipWait,
   type ImagePayload,
 } from "@/lib/task-store";
 import { runOptimisticSubmit } from "@/lib/optimistic-submit";
+import { appendToDraft, registerComposerInsert } from "@/lib/composer-insert-bridge";
 import { shouldAutoFocusComposer } from "@/lib/composer-refocus";
 import { createSubmitLatch, startLatchedSubmit } from "@/lib/composer-actions";
 import { restoreDraftMerged } from "@/lib/talk-draft-merge";
@@ -122,6 +130,7 @@ import {
   coerceStaleRunningTools,
   isToolBlock,
   isToolVerbGroup,
+  streamItemStableId,
   markBackgroundRunningTools,
   markBackgroundSubagentTools,
   mergeToolDisplayEvents,
@@ -532,6 +541,27 @@ interface Props {
 // Virtuoso firstItemIndex 起始基数（prepend 分页时递减、官方要求保持正数——取个够大的）
 const FIRST_INDEX_BASE = 1_000_000;
 
+// 提问时间线跳到窗口之外的更早一轮时，每页拉多少条原始事件（服务端单页上限 500、见 events/route）
+const OUTLINE_JUMP_PAGE_SIZE = 500;
+// 点中的目标迟迟没渲染出来（找不到对应条目）就放弃的等待时长（ms）
+const OUTLINE_JUMP_SETTLE_TIMEOUT_MS = 3000;
+// 往前找目标超过这么久才弹「正在往前找…」提示（ms）
+const OUTLINE_JUMP_LOADING_TOAST_DELAY_MS = 500;
+
+/** loadEarlier 的收口结果（只有带 until 的跳转调用才看 found / capped / exhausted） */
+interface EarlierJumpResult {
+  /** 真的起跑了一轮拉取（false = 已有分页在飞 / 历史已读完 / 只读视图 / 任务切走了） */
+  started: boolean;
+  found: boolean;
+  /** 拉取途中被取消（用户自己滚了 / 对话被回退 / 切任务）：停在已拉到的位置，不再继续、也不跳转 */
+  aborted: boolean;
+  /** 拉满 maxEvents 仍没到目标（再点一次继续往前） */
+  capped: boolean;
+  /** 历史读完了也没找到目标（它已不存在，比如被回退删了） */
+  exhausted: boolean;
+  failed: boolean;
+}
+
 // Virtuoso context 形状（Header 靠它拿「正在拉更早」状态、组件本身保持模块级稳定引用）
 interface StreamListContext {
   loadingEarlier: boolean;
@@ -606,15 +636,18 @@ const STICKY_HIDDEN_CLASSES = ["invisible", "-translate-y-1", "opacity-0"];
  */
 const StreamFloatingBar = ({
   follow,
-  contentCount,
+  unitIds,
   prependBaselineBumpRef,
   hasPendingAsk,
   onJumpToAsk,
   onBackToBottom,
 }: {
   follow: StreamFollowController;
-  /** 当前内容条数（工作过程组已摊开）——算「离开底部后又追加了几条」的基准 */
-  contentCount: number;
+  /**
+   * 全部内容单元的稳定身份、按时间顺序（工作过程组已按成员摊开）——算「离开底部后又追加了几条」：
+   * 以离开那一刻的最后一个单元为锚点、数它之后的单元数（见 scroll-follow.advanceNewItemsTracker）。
+   */
+  unitIds: readonly string[];
   /** loadEarlier prepend 后待同步的基线抬升量（消费即清零） */
   prependBaselineBumpRef: MutableRefObject<number>;
   hasPendingAsk: boolean;
@@ -622,18 +655,19 @@ const StreamFloatingBar = ({
   onBackToBottom: () => void;
 }) => {
   const following = useIsFollowing(follow);
-  // 离开底部那一刻的条数基线。用 ref 不用 state：它是从 props 推出来的缓存、
+  // 离开底部那一刻的尾锚点 + 条数基线。用 ref 不用 state：它是从 props 推出来的缓存、
   // 自己不该触发重渲；推进函数幂等，渲染期写安全（StrictMode 双渲同结果）
-  const baselineRef = useRef(contentCount);
+  const trackerRef = useRef(initNewItemsTracker(unitIds));
   const prependDelta = prependBaselineBumpRef.current;
   if (prependDelta > 0) prependBaselineBumpRef.current = 0;
-  baselineRef.current = nextNewItemsBaseline(
-    baselineRef.current,
-    contentCount,
+  const advanced = advanceNewItemsTracker(
+    trackerRef.current,
+    unitIds,
     following,
     prependDelta,
   );
-  const newCount = countNewItems(baselineRef.current, contentCount);
+  trackerRef.current = advanced.tracker;
+  const newCount = advanced.newCount;
   // 贴底跟随中 = 最新内容就在眼前，两条都不用出
   if (following) return null;
 
@@ -731,7 +765,7 @@ const buildStreamItems = (
   return groupChatRenderItems(withBackground);
 };
 
-/** 与 contentCount 同一计量：工作过程组按成员摊开（loadEarlier 算 prepend 增量用） */
+/** 与 contentUnitIds 同一计量（长度恒等）：工作过程组按成员摊开（loadEarlier 算 prepend 增量用） */
 const countStreamContentUnits = (
   units: Array<StreamRenderItem | WorkGroupItem | RenderItem>,
 ): number =>
@@ -739,6 +773,25 @@ const countStreamContentUnits = (
     (n, it) => n + (it.kind === "__work_group__" ? it.members.length : 1),
     0,
   );
+
+/**
+ * 全部内容单元的稳定身份（`streamItemStableId`），按时间顺序；工作过程组按**成员**摊开——
+ * 与 countStreamContentUnits 同一计量（长度恒等）。「N 条新内容」以它做尾锚点计数（scroll-follow.advanceNewItemsTracker）。
+ * 取 chronological 的 baseItems、不取 orderedItems（后者把未答 ask 挪到末尾、会盖住真正的尾部）。
+ */
+const streamContentUnitIds = (
+  units: ReadonlyArray<StreamRenderItem | WorkGroupItem>,
+): string[] => {
+  const ids: string[] = [];
+  for (const it of units) {
+    if (it.kind === "__work_group__") {
+      for (const m of it.members) ids.push(streamItemStableId(m));
+    } else {
+      ids.push(streamItemStableId(it));
+    }
+  }
+  return ids;
+};
 
 const EventStreamImpl = ({
   task,
@@ -1109,12 +1162,10 @@ const EventStreamImpl = ({
   // 工具块是连续过程项，groupChatRenderItems 全收进同一个工作过程组，items.length
   // 一动不动；于是用户翻在历史里、agent 忙了十分钟，按钮上还挂着「0」。
   //
-  // 挂 orderedItems 不挂 items：虚拟项（streaming / loading）跟着 chunk 变，
-  // 让计数每秒重算几十次不值当；流式那段落成 assistant_message 事件时自然计进来。
-  const contentCount = useMemo(
-    () => countStreamContentUnits(orderedItems),
-    [orderedItems],
-  );
+  // 挂 baseItems 不挂 items：虚拟项（streaming / loading）是在分组之后才追加的、不在 baseItems 里，
+  // 不会让计数每秒重算几十次；流式那段落成 assistant_message 事件时自然计进来。
+  // 取 baseItems 而不是 orderedItems：后者把未答 ask 挪到末尾，会盖住真正的时间序尾部（锚点要认真尾）。
+  const contentUnitIds = useMemo(() => streamContentUnitIds(baseItems), [baseItems]);
   // 上拉 prepend 后待抬高「新内容」基线的增量（StreamFloatingBar 渲染期消费）
   const prependBaselineBumpRef = useRef(0);
   // Virtuoso prepend 的锚定基准；itemContent 回调会带此偏移，命令式 scrollToIndex
@@ -1607,6 +1658,26 @@ const EventStreamImpl = ({
   useEffect(() => {
     if (!pagedOnceRef.current) setHasMoreEarlier(!!task.eventsTruncated);
   }, [task.eventsTruncated]);
+  // 窗口被整体换成更晚的尾窗口（resync）：首条事件往后移了 → 「已翻到头」的结论作废、重开分页（评审 N4，
+  // 规则与理由见 earlier-events.shouldReopenEarlierPaging）。放在 eventsTruncated 同步 effect 之后：
+  // 同一次提交里两者都跑时，这里的 true 是最终值。
+  const lastFirstEventTsRef = useRef<number | null>(null);
+  const firstEventTs = task.events[0]?.ts ?? null;
+  useEffect(() => {
+    const prevFirstTs = lastFirstEventTsRef.current;
+    lastFirstEventTsRef.current = firstEventTs;
+    if (
+      shouldReopenEarlierPaging({
+        prevFirstTs,
+        firstTs: firstEventTs,
+        pagedOnce: pagedOnceRef.current,
+        truncated: !!task.eventsTruncated,
+      })
+    ) {
+      pagedOnceRef.current = false;
+      setHasMoreEarlier(true);
+    }
+  }, [firstEventTs, task.eventsTruncated]);
 
   // 上拉到顶：拉更早的事件、prepend + firstItemIndex 同步递减（同一次 React batch、滚动不跳）。
   //
@@ -1614,9 +1685,28 @@ const EventStreamImpl = ({
   // 分页按原始事件条数切、渲染按回合折叠，一整页事件可能全是最顶上那个工作过程组的成员——
   // 这样 prepend 后条目数不变 → firstItemIndex 不变 → Virtuoso 的 startReached（按第一项序号
   // distinctUntilChanged）不会再触发，用户停在 scrollTop=0 就再也翻不动了（2026-10-13 用户反馈）。
-  const loadEarlier = async () => {
-    if (loadingEarlierRef.current || !hasMoreEarlier || !onPrependEvents) return;
-    if (!latestEventsRef.current[0]) return;
+  //
+  // 带 `until`（提问时间线点了窗口之外的更早一轮）= 一直拉到目标事件出现为止（最多 until.maxEvents 条原始事件）；
+  // 复用同一套 prepend + firstItemIndex 同步递减，**不**另起「整窗替换」——那会让 Virtuoso 的视口锚定整个失效。
+  // 返回 started=false 表示没起跑（已有分页在飞 / 历史已读完 / 只读视图）；其余字段只在带 until 时有意义。
+  const loadEarlier = async (until?: {
+    eventId: string;
+    maxEvents: number;
+    /** 每批开拉之前问一次：返回 true 就停（用户自己滚了 / 回退 / 切任务） */
+    isAborted?: () => boolean;
+  }): Promise<EarlierJumpResult> => {
+    const result: EarlierJumpResult = {
+      started: false,
+      found: false,
+      aborted: false,
+      capped: false,
+      exhausted: false,
+      failed: false,
+    };
+    if (loadingEarlierRef.current || !hasMoreEarlier || !onPrependEvents) return result;
+    if (!latestEventsRef.current[0]) return result;
+    result.started = true;
+    let loadedEvents = 0;
     // 闭包捕获当次 task.id；await 后与当前 props 比对，不一致则丢弃（审查：快切串任务）
     const requestedTaskId = task.id;
     loadingEarlierRef.current = true;
@@ -1624,7 +1714,14 @@ const EventStreamImpl = ({
     setEarlierFailed(false);
     try {
       for (;;) {
+        if (until?.isAborted?.()) {
+          result.aborted = true;
+          break;
+        }
         const batch = await fetchEarlierBatch({
+          ...(until
+            ? { untilEventId: until.eventId, pageSize: OUTLINE_JUMP_PAGE_SIZE }
+            : {}),
           getCurrent: () => latestEventsRef.current,
           fetchPage: (beforeId, limit) =>
             fetchEarlierEvents(requestedTaskId, beforeId, limit),
@@ -1634,7 +1731,9 @@ const EventStreamImpl = ({
               .length,
           isCancelled: () => taskIdRef.current !== requestedTaskId,
         });
-        if (!batch || taskIdRef.current !== requestedTaskId) return;
+        if (!batch || taskIdRef.current !== requestedTaskId) {
+          return { ...result, started: false };
+        }
         pagedOnceRef.current = true;
         // 再按提交时刻的本地事件去重一次（飞行期间本地可能已合入部分重叠事件、
         // 用原始 older 算差值会虚高 → firstItemIndex 多减 → 滚动错位）
@@ -1658,7 +1757,7 @@ const EventStreamImpl = ({
           );
           const beforeLen = beforeItems.length;
           const afterLen = afterItems.length;
-          // 非贴底时 prepend 会让 contentCount 变大，须同步抬高基线以免误报「N 条新内容」
+          // 非贴底时 prepend 会让内容单元数变大，须同步抬高基线以免误报「N 条新内容」（锚点丢了时才会用到）
           if (!follow.isFollowing()) {
             prependBaselineBumpRef.current +=
               countStreamContentUnits(afterItems) -
@@ -1673,13 +1772,30 @@ const EventStreamImpl = ({
           setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
         }
         setHasMoreEarlier(batch.hasMore);
+        if (until) {
+          loadedEvents += fresh.length;
+          if (batch.found) {
+            result.found = true;
+            break;
+          }
+          if (!batch.hasMore) {
+            result.exhausted = true;
+            break;
+          }
+          if (loadedEvents >= until.maxEvents) {
+            result.capped = true;
+            break;
+          }
+          continue;
+        }
         // 有进展 / 读完就收工；否则（一批全并进了已有条目、还有更早的）提交后接着拉
         if (batch.progressed || !batch.hasMore) break;
       }
     } catch (err) {
-      if (taskIdRef.current !== requestedTaskId) return;
+      if (taskIdRef.current !== requestedTaskId) return { ...result, started: false };
       // 失败后 Virtuoso 不会再触发 startReached（第一项序号没变），顶部给手动重试入口
       setEarlierFailed(true);
+      result.failed = true;
       toast.error(`加载更早事件失败：${(err as Error).message}`);
     } finally {
       if (taskIdRef.current === requestedTaskId) {
@@ -1687,7 +1803,172 @@ const EventStreamImpl = ({
         setLoadingEarlier(false);
       }
     }
+    return result;
   };
+
+  // ---------- 提问时间线（左侧刻度 / 展开面板，chat / task 共用） ----------
+  // 数据 = 服务端大纲（窗口被截断才取）+ 窗口里的实时事件；当前轮由 rangeChanged 写进外部 store
+  // （只让时间线自己重渲，滚动路径零 setState）。点击跳转的三条路：
+  //   ① 目标已渲染 → 直接 jumpToItem（唯一 scrollToIndex 出口，会先停跟随）；
+  //   ② 目标在更早的历史里 → 复用上拉分页一路拉到它出现（loadEarlier 的 until 模式，封顶
+  //      OUTLINE_JUMP_MAX_EVENTS 条、超了提示再点一次继续），拉到后等它渲染进 Virtuoso 再跳；
+  //   ③ 历史读完也没有 → 它已不存在（被回退删了等）：从时间线里摘掉并提示。
+  // 不做「整窗替换成目标附近」：窗口整体换掉会让 Virtuoso 的视口锚定失效（评审 RC2 的雷区）。
+  const outlineItems = useTaskOutline({
+    taskId: task.id,
+    events: task.events,
+    truncated: !!task.eventsTruncated,
+    lastRewind: task.lastRewind,
+  });
+  const outlineActiveStore = useMemo(() => createActiveOutlineStore(), []);
+  // 点过才发现已不存在的项（大纲是之前拉的、期间被回退删了）：本任务内不再画
+  const [deadOutlineIds, setDeadOutlineIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const railItems = useMemo(
+    () =>
+      deadOutlineIds.size === 0
+        ? outlineItems
+        : outlineItems.filter((it) => !deadOutlineIds.has(it.id)),
+    [outlineItems, deadOutlineIds],
+  );
+  // 正在往前加载、要跳去的那一项（时间线上该项显示加载中、期间不叠加新的跳转）
+  const [jumpingId, setJumpingId] = useState<string | null>(null);
+  // 拉到了、等它渲染进 Virtuoso 再跳的目标；jumpTick 只用来唤醒下面的 effect
+  const pendingJumpRef = useRef<string | null>(null);
+  const [jumpTick, setJumpTick] = useState(0);
+  useEffect(() => {
+    // 切 task：上一个任务的跳转 / 死项 / 当前轮全作废
+    pendingJumpRef.current = null;
+    setJumpingId(null);
+    setDeadOutlineIds(new Set());
+    outlineActiveStore.set(null);
+  }, [task.id, outlineActiveStore]);
+  useEffect(() => {
+    if (!pendingJumpRef.current) return;
+    // 等一帧：prepend 的 data / firstItemIndex 同一次提交，Virtuoso 下一帧才吃下去，
+    // 此时 scrollToIndex 才有对应的下标
+    const raf = requestAnimationFrame(() => {
+      const id = pendingJumpRef.current;
+      if (!id) return;
+      const idx = findRenderIndexForEventId(itemsRef.current, id);
+      if (idx < 0) return; // 还没渲染进来：items 再变时本 effect 会重跑
+      pendingJumpRef.current = null;
+      jumpToItem(idx, "start", "auto");
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [items, jumpTick, jumpToItem]);
+  const settleOutlineJump = (eventId: string) => {
+    const requestedTaskId = task.id;
+    pendingJumpRef.current = eventId;
+    setJumpTick((t) => t + 1);
+    window.setTimeout(() => {
+      if (taskIdRef.current !== requestedTaskId) return;
+      if (pendingJumpRef.current !== eventId) return;
+      pendingJumpRef.current = null;
+      toast.error("没能定位到这条消息");
+    }, OUTLINE_JUMP_SETTLE_TIMEOUT_MS);
+  };
+  const markOutlineItemGone = (eventId: string) => {
+    setDeadOutlineIds((prev) => new Set(prev).add(eventId));
+    toast.error("这条消息已经不存在了（可能被回退删除）");
+  };
+  // 跳转取消旗：切任务 / 回退（lastRewind 推进）/ 加载期间用户自己滚了 → true，加载循环下一批前停手、
+  // 拉到之后也不再跳转（不能把用户从他刚滚到的地方拽走）；每次发起跳转时复位
+  const jumpCancelledRef = useRef(false);
+  useEffect(() => {
+    jumpCancelledRef.current = true;
+  }, [task.id, task.lastRewind?.ts]);
+  // 主动回到最新（点「回到最新」/ Cmd+End / 提交即到底）= 用户要看最新，作废进行中的时间线跳转
+  // （加载完成后也不再跳回历史处）。ref 稳定、依赖空
+  const cancelOutlineJump = useCallback(() => {
+    jumpCancelledRef.current = true;
+    pendingJumpRef.current = null;
+  }, []);
+  // 卸载（离开页面）也作废：否则点了很早的提问后立刻走开，往前加载会在后台跑完（最多 5000 条、几批请求），
+  // 全局的 loading toast / 3 秒超时 toast 还会在别的页面残留几秒。StrictMode 的模拟卸载无害——每次发起跳转都会复位旗标
+  useEffect(() => cancelOutlineJump, [cancelOutlineJump]);
+  useEffect(() => {
+    if (!jumpingId) return;
+    const el = searchScrollRootRef.current;
+    if (!el) return;
+    const cancel = () => {
+      jumpCancelledRef.current = true;
+    };
+    el.addEventListener("wheel", cancel, { passive: true });
+    el.addEventListener("touchstart", cancel, { passive: true });
+    el.addEventListener("keydown", cancel);
+    return () => {
+      el.removeEventListener("wheel", cancel);
+      el.removeEventListener("touchstart", cancel);
+      el.removeEventListener("keydown", cancel);
+    };
+  }, [jumpingId]);
+  const jumpToOutlineItem = async (eventId: string) => {
+    // 新的点击作废上一次「拉到了、等渲染」的目标：否则先点了窗口内未渲染的项、下一帧前又点了已渲染的项，
+    // 旧目标会在下一帧把人拽回去
+    pendingJumpRef.current = null;
+    const idx = findRenderIndexForEventId(itemsRef.current, eventId);
+    if (idx >= 0) {
+      jumpToItem(idx, "start", "auto");
+      return;
+    }
+    const inWindow = latestEventsRef.current.some((e) => e.id === eventId);
+    if (inWindow) {
+      settleOutlineJump(eventId);
+      return;
+    }
+    if (!onPrependEvents) {
+      // 只读视图没有分页能力
+      toast.info("这条在更早的历史里，当前视图不能加载更早的消息");
+      return;
+    }
+    if (loadingEarlierRef.current) {
+      toast.info("正在加载更早的消息，稍后再点");
+      return;
+    }
+    if (!hasMoreEarlier) {
+      markOutlineItemGone(eventId);
+      return;
+    }
+    const requestedTaskId = task.id;
+    jumpCancelledRef.current = false;
+    setJumpingId(eventId);
+    // 时间线点完就收起、用户的视口又不在顶部（看不到顶部的「加载更早」行）：加载超过一会儿就给个常驻提示，
+    // 免得以为没点中而重复点击；很快拉到的不闪这个提示
+    let loadingToastId: string | number | undefined;
+    const loadingToastTimer = window.setTimeout(() => {
+      loadingToastId = toast.loading("正在往前找这条消息…");
+    }, OUTLINE_JUMP_LOADING_TOAST_DELAY_MS);
+    try {
+      const res = await loadEarlier({
+        eventId,
+        maxEvents: OUTLINE_JUMP_MAX_EVENTS,
+        isAborted: () => jumpCancelledRef.current,
+      });
+      if (taskIdRef.current !== requestedTaskId) return;
+      // 加载期间用户自己滚了 / 对话被回退：静默收手（时间线上的转圈消失就是信号）
+      if (jumpCancelledRef.current) return;
+      if (res.found) settleOutlineJump(eventId);
+      else if (res.capped)
+        toast.info(
+          `这条比较早，已往前加载 ${OUTLINE_JUMP_MAX_EVENTS} 条仍未到达，再点一次继续往前`,
+        );
+      else if (res.exhausted) markOutlineItemGone(eventId);
+      else if (!res.started && !res.failed)
+        toast.info("正在加载更早的消息，稍后再点");
+    } finally {
+      window.clearTimeout(loadingToastTimer);
+      if (loadingToastId !== undefined) toast.dismiss(loadingToastId);
+      if (taskIdRef.current === requestedTaskId) setJumpingId(null);
+    }
+  };
+  // 给 memo 化的时间线一个稳定的回调（本函数每次渲染都是新闭包）
+  const jumpToOutlineItemRef = useRef(jumpToOutlineItem);
+  jumpToOutlineItemRef.current = jumpToOutlineItem;
+  const onOutlineJump = useCallback((eventId: string) => {
+    void jumpToOutlineItemRef.current(eventId);
+  }, []);
 
   // 初始定位：进入一个对话 / 任务，**一律落在最后一条、并处于「跟随最新」**（渲染期 latch、每个 task 只写一次）。
   //
@@ -1736,17 +2017,21 @@ const EventStreamImpl = ({
       pendingScanRef.current,
       task.id,
       pendingLocalReplies ?? [],
-      () => follow.scrollToBottomSmooth(),
+      () => {
+        cancelOutlineJump();
+        follow.scrollToBottomSmooth();
+      },
     );
-  }, [pendingLocalReplies, task.id, follow]);
+  }, [pendingLocalReplies, task.id, follow, cancelOutlineJump]);
 
   // 「回到最新」：短缓动滑到底 + 落地恢复自动跟随（太远 / 减少动态效果时直接跳）。
   // **不新开滚动入口**——滑行与落地后的贴底都在控制器里（自己写 scrollTop、落地交给它那条
   // rAF 合批的贴底链）。这里若自己再调一次 scrollToIndex，
   // 就等于把「两套自动滚」的老毛病请回来（源码契约测试也盯着这条）。
   const backToBottom = useCallback(() => {
+    cancelOutlineJump();
     follow.scrollToBottomSmooth();
-  }, [follow]);
+  }, [follow, cancelOutlineJump]);
 
   // Virtuoso 报「总高变了」：跟随中就补一次贴底。它是 followOutput 的替代——后者只在条数变化时触发、
   // 还会启动一条没法取消的 scrollToIndex 重试链（见下方 Virtuoso 的 prop 注释）；
@@ -1963,6 +2248,16 @@ const EventStreamImpl = ({
     [setDraft, inputRef],
   );
   const canRestoreDraft = isChat && !hideReplyComposer;
+
+  // 代码改动面板「引用到对话」：把选中的 diff 片段接在草稿后面、聚焦输入框。
+  // 同「放回输入框」：只在 chat 且渲染了输入岛时接单——没有输入框就不注册（面板据此提示「找不到输入框」）
+  useEffect(() => {
+    if (!canRestoreDraft) return;
+    return registerComposerInsert(task.id, (text) => {
+      setDraft((prev) => appendToDraft(prev, text));
+      inputRef.current?.focus();
+    });
+  }, [canRestoreDraft, task.id, setDraft, inputRef]);
   const mergedStreamActions = useMemo(
     () => ({
       ...parentStreamActions,
@@ -2237,12 +2532,21 @@ const EventStreamImpl = ({
         <StreamFloatingBar
           key={task.id}
           follow={follow}
-          contentCount={contentCount}
+          unitIds={contentUnitIds}
           prependBaselineBumpRef={prependBaselineBumpRef}
           hasPendingAsk={!!pendingAskEvent}
           onJumpToAsk={jumpToPendingAsk}
           onBackToBottom={backToBottom}
         />
+        )}
+        {/* 左侧提问时间线：只在事件流视图（群问答 tab 是另一份只读列表、轮次口径不同） */}
+        {!showQaPanel && (
+          <StreamOutlineRail
+            items={railItems}
+            activeStore={outlineActiveStore}
+            onJump={onOutlineJump}
+            jumpingId={jumpingId}
+          />
         )}
         {showQaPanel ? (
           <GroupQaPanel
@@ -2303,6 +2607,8 @@ const EventStreamImpl = ({
               // E1 sticky：纯函数算目标 + 命令式 DOM，滚动路径零 setState
               // chat / task 都启用（task 事件流里用户也会直接发消息提问、同样需要锚）
               applyStickyTurn(resolveStickyTurn(list, localIdx));
+              // 时间线的「当前轮」：写外部 store（只重渲时间线自己）、不 setState 本组件
+              outlineActiveStore.set(resolveActiveOutlineId(list, localIdx));
             }}
             // 底部带 = 永远不算「在底部」（2026-10-12）：Virtuoso 有两条不问我们跟随态的自动贴底
             // （内容增高掉出底部带 / 视口变矮），都拿它的 atBottom 当闸门；带宽给任何正数，

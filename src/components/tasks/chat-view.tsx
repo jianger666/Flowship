@@ -24,6 +24,7 @@ import { toast } from "sonner";
 
 import { ChatProviderModelPicker } from "@/components/tasks/chat-provider-model-picker";
 import { BranchSwitcher } from "@/components/tasks/branch-switcher";
+import { TaskChangesPanel } from "@/components/tasks/task-changes-panel";
 import {
   ChatWorkdirPicker,
   type ChatWorkdirPickerHandle,
@@ -102,6 +103,7 @@ import {
   updateTaskFields,
   type ImagePayload,
   type RewoundResult,
+  type TaskEventMeta,
 } from "@/lib/task-store";
 import { canCommitTaskSnapshot, commitTaskDeleted } from "@/lib/task-terminal";
 import { reconcileRunActive, watchDormantToastId } from "@/lib/watch-reconnect";
@@ -113,7 +115,11 @@ interface Props {
   task: Task;
   // 父组件持 task state、ChatView 把最新 task / event 推回去（SSE 增量驱动）
   onTaskUpdate: (next: Task) => void;
-  onEventAppend: (ev: TaskEvent) => void;
+  /**
+   * 追加一条 SSE 事件进本地 events。meta.replay = bootstrap 回放的历史尾部事件（不是刚发生的）——
+   * 父组件据此丢弃「比本地窗口首条还早」的回放事件（评审 N5，见 task-store.appendTaskEvent）
+   */
+  onEventAppend: (ev: TaskEvent, meta?: TaskEventMeta) => void;
   /**
    * 回退成功后、响应体直给的回退标记：父级据此把本地事件窗口对齐到这次回退
    * （不依赖标记 info 事件写入 / SSE 到达）。不传 = 只靠事件流里的标记。
@@ -155,7 +161,14 @@ export const ChatView = ({
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
   // （Codex 式平滑追赶 + rAF 合帧逻辑在 use-smooth-streaming.ts，与任务详情页共用）
-  const { streamingText, pushDelta, clearStreaming } = useSmoothStreaming();
+  // applyAssistantSnapshot：每次（重）连接 bootstrap 的「进行中正文」快照——切到别的对话再切回（本组件重挂）、
+  // SSE 重连后立刻铺上已生成的全部，再接着拼实时增量，而不是只剩后半截、等整段落盘才看到全文
+  const {
+    streamingText,
+    pushDelta,
+    applySnapshot: applyAssistantSnapshot,
+    clearStreaming,
+  } = useSmoothStreaming();
   // 思考实时态（thinking_delta 帧）：累积本段思考原文，交给事件流合成一条「进行中的
   // thinking 事件」放进工作过程流程，由已有的思考行渲染。落盘后那条 thinking 事件与它同 id
   // （服务端预定），是同一个 React 节点——用户点开着读的内容不会被收起。
@@ -385,8 +398,10 @@ export const ChatView = ({
       // thinking_snapshot 对齐（null = 已结束、清；对象 = 仍在、接着长）
       if (!meta?.replay) clearThinkingLive();
 
-      // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
-      if (ev.kind === "assistant_message") clearStreaming();
+      // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影。
+      // 同思考：bootstrap 回放的历史尾部（meta.replay）不算「刚定稿」——重连时尾部会重读一遍，
+      // 若也清，同页重连时本地正在长的正文会突然消失；这段到底有没有定稿，由紧随其后的 assistant_snapshot 对齐
+      if (ev.kind === "assistant_message" && !meta?.replay) clearStreaming();
 
       // user_reply → 标 persisted（非终态），不写 delivered
       // SSE 绑当前 watch task.id，显式传入（不靠可变 ref 推断）
@@ -394,7 +409,7 @@ export const ChatView = ({
         dispatchChatOp(task.id, { type: "user_reply", ev });
       }
 
-      onEventAppendRef.current(ev);
+      onEventAppendRef.current(ev, meta);
     },
     // 整队作废 → reducer 记 failed（清占位，气泡消失）。
     // 只有磁盘写入失败这种真事故才弹 toast；「气泡消失」本身只说「没了」不说「去哪了」，
@@ -464,6 +479,7 @@ export const ChatView = ({
     },
     onThinkingDelta: pushThinkingDelta,
     onThinkingSnapshot: applySnapshot,
+    onAssistantSnapshot: applyAssistantSnapshot,
     // 后台子代理在飞清单：整份替换；与现值相同（bootstrap 补发 vs 实时帧常常同一份）就不 setState，
     // 省一次整个聊天视图的重渲染
     onBackgroundSubagents: (jobs) =>
@@ -1083,6 +1099,9 @@ export const ChatView = ({
                 onTaskUpdate={onTaskUpdate}
               />
               <BranchSwitcher task={task} variant="select" />
+              {/* 当前分支相对线上分支的全部改动（含已提交 + 未提交）；换工作目录就整个重挂，
+                  免得带着上一个目录的范围 / 基线 */}
+              <TaskChangesPanel key={`${task.id}:${task.workCwd ?? ""}`} task={task} />
               <ChatMcpPicker task={task} onTaskUpdate={onTaskUpdate} />
             </>
           }

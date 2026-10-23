@@ -9,6 +9,7 @@ import {
   isSafeBranchName,
   renderBranchName,
   sanitizeBranchName,
+  sanitizeBranchSegment,
 } from "@/lib/branch-template";
 
 describe("findUnknownPlaceholders", () => {
@@ -139,5 +140,120 @@ describe("guardRepoBranchTemplates（S13-01：其它保存动作不能把坏模�
     const { repos, blocked } = guardRepoBranchTemplates(draft, persisted);
     expect(blocked).toEqual([]);
     expect(repos[0]).toBe(draft[0]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 白名单清洗：任意任务标题渲染出的分支名必过 isSafeBranchName
+// （旧实现是「黑名单替换 + 白名单校验」两套口径：全角标点 / 弯引号 / # / emoji 等原样保留 → 任务启动抛「任务分支名非法」）
+// ---------------------------------------------------------------------------
+describe("renderBranchName：中文真实标题（全角标点 / emoji / 弯引号 …）必过 isSafeBranchName", () => {
+  const titles = [
+    "修复登录页，验证码不显示",
+    "支付：优化回调！",
+    "「新版」首页改版",
+    "《规范》更新",
+    "用户反馈“无法提交”问题",
+    "it's broken",
+    "issue #123 修复",
+    "折扣 100% + 优惠券",
+    "🔥 紧急修复线上问题",
+    "café 菜单适配",
+    "【前端】订单列表（二期）",
+    "a/b\\c:d*e?f",
+    "v1.2.3 发布",
+    "纯中文无标点",
+  ];
+
+  it.each(titles)("标题「%s」→ 合法分支名", (taskTitle) => {
+    const name = renderBranchName("feature/{storyId}-{taskTitle}", {
+      storyId: "6789012345",
+      taskTitle,
+    });
+    expect(isSafeBranchName(name)).toBe(true);
+    expect(name.startsWith("feature/6789012345")).toBe(true);
+  });
+
+  it("中文保留、全角标点变 -", () => {
+    expect(
+      renderBranchName("feature/{storyId}-{taskTitle}", {
+        storyId: "1",
+        taskTitle: "修复登录页，验证码不显示！",
+      }),
+    ).toBe("feature/1-修复登录页-验证码不显示");
+  });
+
+  it("段尾 .lock / 前导点 / 连续点都被处理", () => {
+    expect(sanitizeBranchSegment("foo.lock")).toBe("foo-lock");
+    // 大小写不敏感文件系统上 .LOCK 与 .lock 同名，一并处理
+    expect(sanitizeBranchSegment("FOO.LOCK")).toBe("FOO-lock");
+    expect(sanitizeBranchSegment(".hidden")).toBe("hidden");
+    expect(sanitizeBranchSegment("a...b")).toBe("a-b");
+    expect(sanitizeBranchSegment("   ")).toBe("");
+    expect(sanitizeBranchSegment("--x--")).toBe("x");
+  });
+
+  it("标题全是 emoji / 空白 + 模板只有 {taskTitle} → 兜底 feature/{storyId}-{时间戳}", () => {
+    const now = new Date(2026, 9, 23, 9, 5, 7);
+    const name = renderBranchName(
+      "{taskTitle}",
+      { storyId: "42", taskTitle: "🔥🔥 " },
+      now,
+    );
+    expect(name).toBe("feature/42-20261023-090507");
+    expect(isSafeBranchName(name)).toBe(true);
+    // storyId 也缺 → task
+    expect(
+      renderBranchName("{taskTitle}", { taskTitle: "🔥" }, now),
+    ).toBe("feature/task-20261023-090507");
+  });
+
+  it("模板字面量本身非法（整段是 emoji）也能兜底", () => {
+    const name = renderBranchName("🚀", { storyId: "7" }, new Date(2026, 0, 2, 3, 4, 5));
+    expect(isSafeBranchName(name)).toBe(true);
+    expect(name).toBe("feature/7-20260102-030405");
+  });
+
+  it("属性测试：固定种子的随机 Unicode 标题，渲染结果全部通过 isSafeBranchName", () => {
+    // mulberry32：固定种子、可复现
+    let a = 0x9e3779b9;
+    const rand = (): number => {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pools = [
+      "abcXYZ019 ._-/\\:*?\"<>|~^@`$!&;()[]{}",
+      "，。！？：；“”‘’、《》【】（）「」…—·",
+      "修复订单列表登录页验证码支付优惠券",
+      "🔥🚀✅éüñßçΩЖ日本語한국어\u0000\u200b\ufeff\n\t",
+      "#%+=,'",
+    ];
+    for (let i = 0; i < 5000; i++) {
+      const len = 1 + Math.floor(rand() * 40);
+      let title = "";
+      for (let j = 0; j < len; j++) {
+        const pool = pools[Math.floor(rand() * pools.length)];
+        const cps = [...pool];
+        title += cps[Math.floor(rand() * cps.length)];
+      }
+      const name = renderBranchName("feature/{storyId}-{taskTitle}", {
+        storyId: String(Math.floor(rand() * 1e10)),
+        taskTitle: title,
+      });
+      if (!isSafeBranchName(name)) {
+        throw new Error(
+          `标题 ${JSON.stringify(title)} → ${JSON.stringify(name)} 未通过 isSafeBranchName`,
+        );
+      }
+    }
+  });
+
+  it("isSafeBranchName：分量级 .lock / 前导点（git check-ref-format 要求）", () => {
+    expect(isSafeBranchName("feature/x.lock/y")).toBe(false);
+    expect(isSafeBranchName("feature/.hidden")).toBe(false);
+    expect(isSafeBranchName("feature/x.lock")).toBe(false);
+    expect(isSafeBranchName("feature/a.b-c_d/测试")).toBe(true);
   });
 });

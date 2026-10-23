@@ -13,6 +13,7 @@
  * 渲染端用 CSS 变量 + `dark:` 变体切换主题，所以这里同时保留亮 / 暗两个色值。
  */
 
+import { isNoNewlineMarker } from "@/lib/diff/marker";
 import { extToShikiLang } from "@/lib/local-file-kind";
 import type { DiffViewLine } from "@/lib/tool-display";
 
@@ -89,25 +90,11 @@ const sourceLineOf = (line: DiffViewLine): string =>
   line.text.replace(/\r$/, "");
 
 /**
- * 是不是 unified diff 的 `\ No newline at end of file` 标记行（git 会按 locale 本地化文案，
- * 所以认「反斜杠 + 空格」开头而不是英文原文）。
- *
- * `parseUnifiedDiff` 把它当 context 行返回，text 保留原样（含 `\`）、行号缺省。
- * 它不是源码：塞进旧 / 新侧会夹在 del 与 add 之间污染相邻行的着色。
- * 光看「context 且没行号」不够——缺 `@@` 头（截断 / 无 hunk）的 diff 里真正的上下文行也没行号，
- * 所以再加上「文字以 `\ ` 开头」才算。
- */
-const isNoNewlineMarker = (line: DiffViewLine): boolean =>
-  line.kind === "context" &&
-  line.oldLine === undefined &&
-  line.newLine === undefined &&
-  line.text.startsWith("\\ ");
-
-/**
  * 把 diff 行按 hunk 拆成待高亮的源码段。
  * - 旧侧 = 上下文 + 删除；新侧 = 上下文 + 新增；
  * - 没有删除行的 hunk 不出旧侧（用不上）；没有新增 / 上下文行的 hunk 不出新侧；
- * - `\ No newline at end of file` 标记行不是源码，两侧都不收（见 {@link isNoNewlineMarker}）。
+ * - `\ No newline at end of file` 标记行不是源码，两侧都不收（见 {@link isNoNewlineMarker}）：
+ *   塞进旧 / 新侧会夹在 del 与 add 之间污染相邻行的着色。
  */
 export const buildDiffSegments = (lines: DiffViewLine[]): DiffSegment[] => {
   const segments: DiffSegment[] = [];

@@ -16,10 +16,13 @@ import { useImperativeHandle, type ComponentProps, type Ref } from "react";
 
 import { EventStream } from "@/components/tasks/event-stream";
 import { useSmoothStreaming } from "@/components/tasks/use-smooth-streaming";
+import type { AssistantSnapshot } from "@/lib/assistant-live";
 
 export interface SmoothStreamControls {
   /** SSE assistant_delta 入口 */
   pushDelta: (text: string) => void;
+  /** SSE assistant_snapshot（每次连接 bootstrap 一帧）：整段铺上 / 补尾巴 / 清残留，见 useSmoothStreaming.applySnapshot */
+  applySnapshot: (snap: AssistantSnapshot | null) => void;
   /** 清流式态的唯一入口（正式 assistant_message 到达 / 切 task / 被中断时） */
   clearStreaming: () => void;
 }
@@ -36,11 +39,13 @@ export const SmoothEventStream = ({
   isRunning,
   ...streamProps
 }: Props) => {
-  const { streamingText, pushDelta, clearStreaming } = useSmoothStreaming();
-  useImperativeHandle(controlsRef, () => ({ pushDelta, clearStreaming }), [
-    pushDelta,
-    clearStreaming,
-  ]);
+  const { streamingText, pushDelta, applySnapshot, clearStreaming } =
+    useSmoothStreaming();
+  useImperativeHandle(
+    controlsRef,
+    () => ({ pushDelta, applySnapshot, clearStreaming }),
+    [pushDelta, applySnapshot, clearStreaming],
+  );
   // isRunning 单独解构、显式透传：它是 EventStream 的必填 prop（漏传 = 运行中的工具全渲染成「已中断」），
   // tests/event-stream-run-active 逐个调用点检查它；Props 里它仍是必填，页面漏传会直接 tsc 报错
   return (

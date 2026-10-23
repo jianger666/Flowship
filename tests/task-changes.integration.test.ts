@@ -185,8 +185,13 @@ describe("resolveChangeRepoTargets", () => {
     ]);
   });
 
-  it("chat / 未启动（无 workCwd）/ 无仓：没有可看的仓", () => {
-    expect(resolveChangeRepoTargets(isolatedTask({ mode: "chat" }))).toEqual([]);
+  it("chat 也能看（直接看用户选的工作目录、永远不算隔离）；未启动（无 workCwd）/ 无仓：没有可看的仓", () => {
+    // chat 不会有隔离 worktree：即使数据里残留 isolateWorktree，也按「就在原目录里改」处理
+    expect(resolveChangeRepoTargets(isolatedTask({ mode: "chat" }))).toEqual([
+      { repoPath: REPO, shortName: "main-repo", workDir: WT, isolated: false },
+    ]);
+    expect(resolveChangeRepoTargets(isolatedTask({ mode: "chat", workCwd: undefined }))).toEqual([]);
+    expect(resolveChangeRepoTargets(isolatedTask({ mode: "chat", repoPaths: [] }))).toEqual([]);
     expect(resolveChangeRepoTargets(isolatedTask({ workCwd: undefined }))).toEqual([]);
     expect(resolveChangeRepoTargets(isolatedTask({ repoPaths: [] }))).toEqual([]);
   });

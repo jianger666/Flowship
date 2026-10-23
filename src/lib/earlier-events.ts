@@ -53,6 +53,8 @@ export interface EarlierBatch {
   progressed: boolean;
   /** 本批实际请求了几页（诊断 / 测试用） */
   pages: number;
+  /** 传了 `untilEventId` 且已经拉到它（它在 fresh 里或本地早就有）；没传恒为 false */
+  found: boolean;
 }
 
 export interface FetchEarlierBatchOptions {
@@ -69,6 +71,12 @@ export interface FetchEarlierBatchOptions {
   isCancelled?: () => boolean;
   pageSize?: number;
   maxPages?: number;
+  /**
+   * 「跳到某条更早的消息」（提问时间线点击）：一直拉到这条事件出现为止——**不**因为「条目数变多了」提前收工
+   * （那条规则是给「上拉到顶、顶部多出一条就够了」用的；这里要的是目标本身）。
+   * 仍受 maxPages / 历史读完约束，拉不到时 `found=false`，调用方决定接着来一批还是放弃。
+   */
+  untilEventId?: string;
 }
 
 /**
@@ -86,16 +94,24 @@ export const fetchEarlierBatch = async (
     isCancelled,
     pageSize = EARLIER_PAGE_SIZE,
     maxPages = EARLIER_MAX_PAGES_PER_BATCH,
+    untilEventId,
   } = opts;
 
   const first = getCurrent()[0];
-  if (!first) return { fresh: [], hasMore: false, progressed: true, pages: 0 };
+  if (!first) {
+    return { fresh: [], hasMore: false, progressed: true, pages: 0, found: false };
+  }
+  // 目标本来就在本地：不用拉（调用方通常先查过，这里兜底）
+  if (untilEventId && getCurrent().some((e) => e.id === untilEventId)) {
+    return { fresh: [], hasMore: true, progressed: true, pages: 0, found: true };
+  }
 
   // 已拉到的更早事件（时间正序）与下一页的游标
   let acc: TaskEvent[] = [];
   let cursor = first.id;
   let hasMore = true;
   let pages = 0;
+  let found = false;
 
   while (pages < maxPages) {
     const page = await fetchPage(cursor, pageSize);
@@ -118,8 +134,12 @@ export const fetchEarlierBatch = async (
     const fresh = page.events.filter((e) => !known.has(e.id));
     if (fresh.length > 0) acc = [...fresh, ...acc];
 
+    if (untilEventId && page.events.some((e) => e.id === untilEventId)) {
+      found = true;
+      break;
+    }
     if (!hasMore) break;
-    if (acc.length > 0 && countItems([...acc, ...cur]) > countItems(cur)) break;
+    if (!untilEventId && acc.length > 0 && countItems([...acc, ...cur]) > countItems(cur)) break;
   }
 
   const cur = getCurrent();
@@ -127,6 +147,36 @@ export const fetchEarlierBatch = async (
   const fresh = acc.filter((e) => !known.has(e.id));
   const progressed =
     !hasMore ||
+    found ||
     (fresh.length > 0 && countItems([...fresh, ...cur]) > countItems(cur));
-  return { fresh, hasMore, progressed, pages };
+  return { fresh, hasMore, progressed, pages, found };
 };
+
+/**
+ * 本地窗口被整体换成更晚的尾窗口（resync：回退对齐 / 别的窗口回退后的整体替换）之后，
+ * 「已经翻到头了」的结论作废、要重新开放上拉分页（评审 N4）。
+ *
+ * 为什么需要：`pagedOnceRef`（拉过至少一页）是为了防「SSE 重连把 eventsTruncated 重新置 true 时误重开分页」，
+ * 但用户翻到头（hasMore=false）之后再发生整体替换，窗口换成 300 条尾巴 + eventsTruncated=true，
+ * 这道闸就把分页永远关死了——历史再也上拉不出来，刷新才恢复。
+ *
+ * 判据：**窗口首条事件的时刻比上一次看到的更晚**。正常运行里首条只会往更早走（prepend）或不动；
+ * 首条往后移 = 窗口被整体替换成了更晚的尾部（回退把尾部截短不会移动首条）。
+ * 另需「拉过页」（否则本来就在受 eventsTruncated 同步的路径上）且新窗口确实有更早的（eventsTruncated）。
+ * 纯函数、有单测。
+ */
+export const shouldReopenEarlierPaging = (input: {
+  /** 上一次渲染看到的窗口首条时刻；没见过 = null */
+  prevFirstTs: number | null;
+  /** 现在窗口首条时刻；空窗口 = null */
+  firstTs: number | null;
+  /** 是否拉过至少一页（pagedOnceRef） */
+  pagedOnce: boolean;
+  /** 服务端说还有更早的（task.eventsTruncated） */
+  truncated: boolean;
+}): boolean =>
+  input.pagedOnce &&
+  input.truncated &&
+  input.prevFirstTs !== null &&
+  input.firstTs !== null &&
+  input.firstTs > input.prevFirstTs;
