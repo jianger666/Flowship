@@ -70,7 +70,9 @@ const {
   runChatSession,
   sendChatMessage,
 } = await import("@/lib/server/chat-runner");
-const { clearChatGate } = await import("@/lib/server/chat-gate");
+const { clearChatGate, hasChatStartReservation } = await import(
+  "@/lib/server/chat-gate"
+);
 const { setFailpoint, clearFailpoints } = await import(
   "@/lib/server/failpoints"
 );
@@ -512,6 +514,13 @@ describe("R29 chat 旁路共享写", () => {
         await new Promise((r) => setTimeout(r, 20));
       }
       expect((await readMetaV06(TASK_ID))?.sessionAgentId).toBeUndefined();
+      // 锚点被清只是 forceClear 收尾里的一步：等内存会话与启动预约也摘干净再进 6c。
+      // 否则马上 resume 会被 resumeChatSession 入口的 runningChats / 预约检查挡回 null
+      // （v1.9.38 发版门禁在 Linux CI 上红过一次：下面 expect(ownerId).not.toBeNull()；本机连跑 12 次复现不了，根因没确证）。
+      for (let i = 0; i < 50; i++) {
+        if (!hasChatSession(TASK_ID) && !hasChatStartReservation(TASK_ID)) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
 
       // 6c：send 失主回滚——stop 后 map 空应落 idle（对齐既有 resume-owner 口径）
       mockResume.mockResolvedValue({
@@ -534,7 +543,16 @@ describe("R29 chat 旁路共享写", () => {
         BOOT,
         { claimRun: true },
       );
-      expect(ownerId).not.toBeNull();
+      // 失败时把当时的状态带进报错：这条在 Linux CI 上红过一次、本机复现不了，下次再红能直接看到是谁挡住了 resume
+      const nullWhy = async (): Promise<string> => {
+        const m = await readMetaV06(TASK_ID);
+        return (
+          `resumeChatSession 返回 null：hasChatSession=${hasChatSession(TASK_ID)} ` +
+          `startReservation=${hasChatStartReservation(TASK_ID)} runActive=${isChatRunActive(TASK_ID)} ` +
+          `meta.sessionAgentId=${m?.sessionAgentId ?? "无"} runStatus=${m?.runStatus ?? "无"}`
+        );
+      };
+      expect(ownerId, ownerId === null ? await nullWhy() : undefined).not.toBeNull();
 
       const origWriteMeta = taskFsCore.writeMeta;
       const spy = vi
