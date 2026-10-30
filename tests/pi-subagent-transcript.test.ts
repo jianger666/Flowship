@@ -249,3 +249,213 @@ describe("runPiSubagent → 记录器", () => {
     expect(transcript.__runKeysForTests(taskId)).toEqual([]);
   });
 });
+
+describe("子代理 · pi 内层自动重试（R14 Q11-02）：详情记录不把半截和全文焊成一条、返回值只丢出错那一条的半截", () => {
+  // pi 的事件：每条 assistant 消息先发 message_start；出错的半截之后发 auto_retry_start（带 pi 的错误原文），
+  // 再重新生成一条（又一个 message_start）。mock 只喂子代理关心的那几类
+  const msgStart = (role = "assistant"): Ev => ({
+    type: "message_start",
+    message: { role, content: [] },
+  });
+  const retry: Ev = {
+    type: "auto_retry_start",
+    attempt: 1,
+    maxAttempts: 3,
+    delayMs: 2000,
+    errorMessage: "terminated",
+  };
+  const readOk = (id: string): Ev[] => [
+    toolStart(id, "read", { path: "a.ts" }),
+    toolEnd(id, "read", { content: [{ type: "text", text: "文件内容" }] }),
+  ];
+
+  /** 跑一遍：返回子代理的返回值 + 详情记录（meta、事件的 [kind, text]、原始事件） */
+  const runWith = async (events: Ev[]) => {
+    const taskId = await freshTask();
+    const callId = `retry-${taskId}`;
+    hoisted.createAgentSession.mockResolvedValue({ session: sessionWith(events) });
+    const out = await runPiSubagent(req, new AbortController().signal, {
+      parent,
+      cwd,
+      taskId,
+      toolCallId: callId,
+    });
+    const snap = await transcript.getSubagentRunSnapshot(taskId, { callId });
+    return {
+      out,
+      meta: snap!.meta,
+      events: snap!.events.map((e) => [e.kind, e.text]),
+      raw: snap!.events,
+    };
+  };
+
+  it("piSubagentEventMessages：auto_retry_start → 只有 type 的封口信号，不带 pi 的错误原文；message_start 本身不产生消息", () => {
+    const out = piSubagentEventMessages(retry as never, new Map());
+    expect(out).toEqual([{ type: "auto_retry_start" }]);
+    expect(JSON.stringify(out)).not.toContain("terminated");
+    expect(piSubagentEventMessages(msgStart() as never, new Map())).toEqual([]);
+  });
+
+  it("吐了半截就断流、重试成功 → 详情里半截与全文各一条，返回值只有全文", async () => {
+    const r = await runWith([
+      msgStart(),
+      text("PART-A "),
+      retry,
+      msgStart(),
+      text("FULL-ANSWER"),
+      agentEnd,
+    ]);
+    // 旧：详情是一条 "PART-A FULL-ANSWER"（相邻的 assistant 片段被接成一段）
+    expect(r.events).toEqual([
+      ["assistant_message", "PART-A "],
+      ["assistant_message", "FULL-ANSWER"],
+    ]);
+    expect(r.out).toBe("FULL-ANSWER");
+    expect(r.meta.result).toBe("FULL-ANSWER");
+    // 过程记录只认四类事件：没有说明条目，也没把 pi 的错误原文带进记录
+    expect(JSON.stringify(r.raw)).not.toContain("terminated");
+  });
+
+  it("一个字都没吐就重试 → 详情里不出空条目，只有重新生成的那一条", async () => {
+    const r = await runWith([msgStart(), retry, msgStart(), text("FULL"), agentEnd]);
+    expect(r.events).toEqual([["assistant_message", "FULL"]]);
+    expect(r.out).toBe("FULL");
+  });
+
+  it("半截只有思考 → 思考封口，重新想的另起一条，正文再一条", async () => {
+    const r = await runWith([
+      msgStart(),
+      think("想一半"),
+      retry,
+      msgStart(),
+      think("重新想"),
+      text("FULL"),
+      agentEnd,
+    ]);
+    expect(r.events).toEqual([
+      ["thinking", "想一半"],
+      ["thinking", "重新想"],
+      ["assistant_message", "FULL"],
+    ]);
+    expect(r.out).toBe("FULL");
+  });
+
+  it("连续两次重试 → 每次都封口：[A1, A2, 全文] 三条，返回值只有全文", async () => {
+    const r = await runWith([
+      msgStart(),
+      text("A1 "),
+      retry,
+      msgStart(),
+      text("A2 "),
+      retry,
+      msgStart(),
+      text("FULL"),
+      agentEnd,
+    ]);
+    expect(r.events).toEqual([
+      ["assistant_message", "A1 "],
+      ["assistant_message", "A2 "],
+      ["assistant_message", "FULL"],
+    ]);
+    expect(r.out).toBe("FULL");
+  });
+
+  it("更早一轮已经说完的正文要留：后一轮才断流重试 → 返回值 = 更早的正文 + 重新生成的全文（不是只剩全文）", async () => {
+    const r = await runWith([
+      msgStart(),
+      text("STEP-1 "),
+      ...readOk("tc1"),
+      msgStart(),
+      text("PART-B "),
+      retry,
+      msgStart(),
+      text("FINAL"),
+      agentEnd,
+    ]);
+    // 旧（整个清零）：返回值是 "FINAL"，更早一轮的 "STEP-1 " 也丢了
+    expect(r.out).toBe("STEP-1 FINAL");
+    expect(r.meta.result).toBe("STEP-1 FINAL");
+    // 详情记录：更早一轮、工具调用、出错的半截、重新生成的全文，各是独立的条目
+    expect(r.events.map((e) => e[0])).toEqual([
+      "assistant_message",
+      "tool_call",
+      "tool_result",
+      "assistant_message",
+      "assistant_message",
+    ]);
+    expect(r.events.filter((e) => e[0] === "assistant_message").map((e) => e[1])).toEqual([
+      "STEP-1 ",
+      "PART-B ",
+      "FINAL",
+    ]);
+  });
+
+  it("对照：同样两轮、没有重试 → 两轮正文都在（重试不该改变更早轮次的正文）", async () => {
+    const r = await runWith([
+      msgStart(),
+      text("STEP-1 "),
+      ...readOk("tc1"),
+      msgStart(),
+      text("FINAL"),
+      agentEnd,
+    ]);
+    expect(r.out).toBe("STEP-1 FINAL");
+  });
+
+  it("多轮 + 连续两次重试 → 起点随每一条新的 message_start 更新，更早几轮的正文始终保留", async () => {
+    // 要三轮才钉得住「起点随每一轮更新」：只有两轮时，起点停在第二轮开头也恰好截回同一个位置
+    const r = await runWith([
+      msgStart(),
+      text("STEP-1 "),
+      ...readOk("tc1"),
+      msgStart(),
+      text("STEP-2 "),
+      ...readOk("tc2"),
+      msgStart(),
+      text("P1 "),
+      retry,
+      msgStart(),
+      text("P2 "),
+      retry,
+      msgStart(),
+      text("FINAL"),
+      agentEnd,
+    ]);
+    expect(r.out).toBe("STEP-1 STEP-2 FINAL");
+  });
+
+  it("【契约】起点 = 最近一条 assistant 消息的起点：user / toolResult 的 message_start 不改它", async () => {
+    // 真实 pi 里重试前最近一次 message_start 就是出错那条的，这个序列不会真的出现；
+    // 钉的是语义，免得 pi 以后改事件顺序时，把 toolResult 的起点误当成「这条回复的起点」而漏丢半截
+    const r = await runWith([
+      msgStart(),
+      text("A "),
+      msgStart("toolResult"),
+      retry,
+      msgStart(),
+      text("B"),
+      agentEnd,
+    ]);
+    expect(r.out).toBe("B");
+  });
+
+  it("【健壮】message_start 缺 message（合成 / 异常事件）→ 不抛、不改起点：返回值照常只丢出错那条的半截（R14 Q11-03 顺带的 P3）", async () => {
+    // pi 的 _emit 是 for…of 直接调监听者、没有 try/catch：这里一抛，排在后面的监听者收不到这次事件，
+    // 错误还会冒进 pi 的 agent 循环；所以缺 message 要当「不是 assistant 的起点」安静放过
+    const r = await runWith([
+      msgStart(),
+      text("A "),
+      { type: "message_start" },
+      retry,
+      msgStart(),
+      text("B"),
+      agentEnd,
+    ]);
+    expect(r.out).toBe("B");
+  });
+
+  it("【退化】没收到过 message_start（合成 / 旧事件）→ 起点 0，整个清零：半截不会留在返回值里", async () => {
+    const r = await runWith([text("PART "), retry, text("FULL"), agentEnd]);
+    expect(r.out).toBe("FULL");
+  });
+});

@@ -221,6 +221,7 @@ const LayoutRow = ({
           type="button"
           onPointerDown={(e) => controls.start(e)}
           className={DRAG_HANDLE_CLASS}
+          aria-label={`拖拽排序 ${label}`}
         >
           <GripVertical className="size-4" />
         </button>
@@ -465,6 +466,7 @@ const GroupSection = ({
             type="button"
             onPointerDown={(e) => controls.start(e)}
             className={DRAG_HANDLE_CLASS}
+            aria-label={`拖拽调整组顺序 ${ACTION_GROUP_LABEL[groupKey]}`}
           >
             <GripVertical className="size-4" />
           </button>

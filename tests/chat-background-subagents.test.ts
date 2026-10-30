@@ -52,6 +52,7 @@ const {
   resumeChatSession,
   runChatSession,
   sendChatMessage,
+  sweepIdleChatSessions,
 } = await import("@/lib/server/chat-runner");
 const { enqueueChatMessage, clearChatQueue } = await import(
   "@/lib/server/chat-queue"
@@ -727,18 +728,46 @@ describe("该丢的结果就丢", () => {
 });
 
 describe("空闲回收不能把还有后台子代理的会话回收掉", () => {
-  it("回收循环里按 backgroundRunning() 放过（源码契约：关会话会连后台子代理一起取消）", async () => {
+  it("回收守卫按 backgroundRunning() 放过，且清扫在判完守卫之后才关会话（源码契约：关会话会连后台子代理一起取消）", async () => {
+    // X3：清扫改走统一守卫（三处回收共用），不再在 interval 回调里内联判——契约跟着换位置，强度不降：
+    // ① 守卫快照里读 backgroundRunning()；② 清扫函数先过守卫、再 reclaimChatSession（里面才 closeChatSession）。
+    // 真正的行为在下一条用例里验。
     const src = await fs.readFile(
       path.join(process.cwd(), "src/lib/server/chat-runner.ts"),
       "utf-8",
     );
-    const start = src.indexOf("g[CHAT_SWEEPER_KEY] = setInterval");
-    expect(start).toBeGreaterThan(0);
-    const block = src.slice(start, src.indexOf("}, 10 * 60 * 1000)", start));
-    expect(block).toContain("backgroundRunning()");
-    expect(block.indexOf("backgroundRunning()")).toBeLessThan(
-      block.indexOf("closeChatSession"),
+    const snapStart = src.indexOf("const reclaimSnapshotOf");
+    expect(snapStart).toBeGreaterThan(0);
+    const snapBlock = src.slice(snapStart, src.indexOf("const chatReclaimBlock", snapStart));
+    expect(snapBlock).toContain("backgroundRunning()");
+    const sweepStart = src.indexOf("export const sweepIdleChatSessions");
+    expect(sweepStart).toBeGreaterThan(0);
+    const sweepBlock = src.slice(sweepStart, src.indexOf("\n};", sweepStart));
+    expect(sweepBlock).toContain("chatReclaimBlock(taskId, rec)");
+    expect(sweepBlock.indexOf("chatReclaimBlock(")).toBeLessThan(
+      sweepBlock.indexOf("reclaimChatSession("),
     );
+  });
+
+  it("行为：空闲超过 TTL、后台子代理还在跑 → 清扫不回收（会话与后台子代理都保留）", async () => {
+    const parent = manualRun({ steer: async () => "complete_delivered" });
+    const { subagentTool } = await startParentRun(parent.run);
+    await runTool(subagentTool, {
+      prompt: "跑个长任务",
+      description: "长任务",
+      run_in_background: true,
+    });
+    parent.release("好的，我派了个后台子代理");
+    await vi.waitFor(() => expect(isChatRunActive(TASK_ID)).toBe(false), {
+      timeout: 5000,
+      interval: 30,
+    });
+    expect(getBackgroundSubagentSnapshot(TASK_ID)).toHaveLength(1);
+
+    // 假「现在」= 13 分钟后：早过 12 分钟 TTL，但后台子代理还在跑
+    expect(sweepIdleChatSessions(Date.now() + 13 * 60 * 1000)).toBe(0);
+    expect(hasChatSession(TASK_ID)).toBe(true);
+    expect(getBackgroundSubagentSnapshot(TASK_ID)).toHaveLength(1);
   });
 });
 

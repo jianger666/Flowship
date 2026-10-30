@@ -95,7 +95,13 @@ export const POST = async (req: Request) => {
     // 合并成功：从待测 MR 组剔除；待回归 bug 行只清 MR 关联（bug 本身还在）
     removeMrFromInboxCache(parsed.canonicalUrl);
     markBugMrMergedInCache(parsed.canonicalUrl);
-    return NextResponse.json({ ok: true, mrUrl: parsed.canonicalUrl });
+    return NextResponse.json({
+      ok: true,
+      mrUrl: parsed.canonicalUrl,
+      // 双击 / 两个窗口 / 别人先合了：GitLab 回 405、补查发现已是 merged——目的已达成，按成功处理（缓存照样剔除），
+      // 带上标记让前端换一句更准的话（Q10-05）
+      ...(result.alreadyMerged ? { alreadyMerged: true } : {}),
+    });
   } catch (err) {
     console.error("[POST /api/mr-inbox/merge] failed", err);
     return errorResponse(err instanceof Error ? err.message : String(err), 500);

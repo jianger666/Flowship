@@ -42,7 +42,7 @@ import type {
   LocalAgentStoreListResult,
 } from "@cursor/sdk";
 
-import { dataRoot } from "./data-root";
+import { dataRoot, describeConfigReadError, stripBom } from "./data-root";
 import { withRetry, type RetryOptions } from "./fast-checkpoint-store";
 import {
   getSdkStoreHandle,
@@ -121,7 +121,34 @@ const strAt = (o: Record<string, unknown>, p: string[]): string | null => {
   return typeof cur === "string" ? cur : null;
 };
 
-/** 收集所有任务现行 sessionAgentId（活名单）。失败返 null = 跳过本轮 GC。 */
+// 与 task-fs-core 的 META_FILE / META_BACKUP_FILE 保持一致。这里不 import 它：task-fs-core 加载时会按
+// dataRoot() 钉死 DATA_DIR，GC 不该背这个副作用；两边常量的一致性由 tests/sdk-store-gc-live-ids.test.ts 钉着。
+const TASK_META_FILE = "meta.json";
+const TASK_META_BACKUP_FILE = "meta.json.bak";
+
+/**
+ * 从一份 meta 文本里取 sessionAgentId：有 → 该字符串；合法但没有（新建 / chat 还没跑过）→ ""；
+ * 读不出（JSON 坏 / 零长度 / 根不是对象）→ 抛。
+ */
+const sessionAgentIdFromMetaText = (raw: string): string => {
+  const meta: unknown = JSON.parse(stripBom(raw));
+  if (typeof meta !== "object" || meta === null || Array.isArray(meta)) {
+    throw new SyntaxError("meta 不是 JSON 对象");
+  }
+  const id = (meta as { sessionAgentId?: unknown }).sessionAgentId;
+  return typeof id === "string" ? id : "";
+};
+
+/**
+ * 收集所有任务现行 sessionAgentId（活名单）。失败返 null = 跳过本轮 GC。
+ *
+ * 「读不出」不能当成「这个任务没有活 agent」：活名单少一项 = 它的 store（checkpoints / runs / agents /
+ * run_events）会被 `planOrphans` 当孤儿清掉，而那正是用户的会话上下文（与文件头「宁可少删，不可误删」矛盾）。所以：
+ * - 目录里没有 meta.json（ENOENT）：不是任务目录 / 正在被删，照旧跳过；
+ * - meta.json 读不出（零长度 / 手改坏 / 被占用 / 权限）：退到 meta.json.bak（和主读取路径同一套备份）；
+ *   备份也读不出 → 整轮返 null（warn 点名 taskId、不带内容）。
+ * 代价：一个永久读不出的 meta（主文件和备份都坏）会让 GC 一直跳过——比误删活会话好；warn 每轮都点名它。
+ */
 export const collectLiveAgentIds = async (
   tasksDir?: string,
 ): Promise<Set<string> | null> => {
@@ -131,18 +158,36 @@ export const collectLiveAgentIds = async (
     const live = new Set<string>();
     for (const e of entries) {
       if (!e.isDirectory()) continue;
+      const taskDir = path.join(dir, e.name);
+      let id: string | undefined;
+      let primaryErr: unknown;
       try {
-        const raw = await fs.readFile(
-          path.join(dir, e.name, "meta.json"),
-          "utf-8",
+        id = sessionAgentIdFromMetaText(
+          await fs.readFile(path.join(taskDir, TASK_META_FILE), "utf-8"),
         );
-        const meta = JSON.parse(raw) as { sessionAgentId?: unknown };
-        if (typeof meta.sessionAgentId === "string" && meta.sessionAgentId) {
-          live.add(meta.sessionAgentId);
-        }
-      } catch {
-        // 单个 meta 坏了不影响整轮
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+        primaryErr = err;
       }
+      if (id === undefined) {
+        try {
+          id = sessionAgentIdFromMetaText(
+            await fs.readFile(
+              path.join(taskDir, TASK_META_BACKUP_FILE),
+              "utf-8",
+            ),
+          );
+        } catch {
+          // 备份也读不出：下面整轮跳过
+        }
+      }
+      if (id === undefined) {
+        console.warn(
+          `[sdk-store-gc] 读 meta 失败 taskId=${e.name}（${describeConfigReadError(primaryErr)}），本轮不做孤儿清理`,
+        );
+        return null;
+      }
+      if (id) live.add(id);
     }
     return live;
   } catch {

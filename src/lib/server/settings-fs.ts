@@ -20,6 +20,7 @@ import path from "node:path";
 import {
   dataRoot,
   hardenPathMode,
+  stripBom,
   writePrivateFileAtomic,
 } from "./data-root";
 import { emptyCompanyEnv, isBlankCompanyEnvRow, normalizeCompanyEnv } from "../company-env";
@@ -328,7 +329,8 @@ export const readSettingsFile = async (): Promise<SettingsReadResult> => {
   }
 
   try {
-    const parsed = JSON.parse(raw) as unknown;
+    // 去 BOM 只用于解析；下面坏文件备份仍写原文 raw（保留证据）
+    const parsed = JSON.parse(stripBom(raw)) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return { status: "ok", settings: parsed as Record<string, unknown> };
     }

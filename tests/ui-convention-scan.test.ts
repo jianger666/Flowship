@@ -163,6 +163,16 @@ const FIXED_FILES = [
   "components/tasks/action-timeline.tsx",
   "components/tasks/batch-plan-table.tsx",
   "components/tasks/branch-switcher.tsx",
+  // R14 Q3-01：头部 MR 链接条（v1.7.1 误删后补回的叶子组件）
+  "components/tasks/task-mr-links.tsx",
+  // R14 B2-2：存储降级红条（新叶子组件，事件流顶部常驻；颜色只走 destructive 语义 token）
+  "components/tasks/storage-degraded-bar.tsx",
+  // R14 B2-3：「有记录读不出来」灰条（新叶子组件，叠在红条之下；只走 muted 语义 token）
+  "components/tasks/events-skipped-notice.tsx",
+  // R14 B2-4c：低磁盘预警红条（新叶子组件 + 取数容器，叠在存储降级红条旁；颜色只走 destructive 语义 token）
+  "components/tasks/low-disk-bar.tsx",
+  // R14 B6-3：已归档会话灰条（新叶子组件，详情页顶部；只走 muted 语义 token，不用整块 opacity）
+  "components/tasks/archived-bar.tsx",
   "components/tasks/requirement-group-dialog.tsx",
   "components/conversation-composer.tsx",
   "components/composer-editor.tsx",

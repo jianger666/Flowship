@@ -1,7 +1,7 @@
 /**
  * 错误卡「按失败类型给中文说明 + 对应入口」（纯函数、无 React；第二轮 review V3-03）
  *
- * 用户最常撞到的几类失败（限流 / 鉴权 / 模型不可用 / 上下文超长 / 额度 / 网络），
+ * 用户最常撞到的几类失败（限流 / 鉴权 / 模型不可用 / 上下文超长 / 额度 / 网络 / 自定义端点异常），
  * 错误卡以前只展示英文原串 + 查看详情 / 复制 / 重试——看不懂、也不知道该去哪改；
  * 鉴权类还把「重试」摆成主按钮（同模型同 key 必然再败）。
  *
@@ -17,9 +17,13 @@
  * - 只扫开头 {@link MAX_SCAN} 个字符（诊断串可能几十万字符、关键字都在头部）；
  * - 服务端已改写成友好中文的整句（连接断 / SDK 放弃本轮）不二次归类，保持原文案。
  *
- * 优先级（先命中先赢，顺序有讲究）：上下文超长 → 额度 → 模型不可用 → 鉴权 → 限流 → 网络。
+ * 优先级（先命中先赢，顺序有讲究）：上下文超长 → 额度 → 模型不可用 → 鉴权 → 限流 → 网络 → 端点。
  * 例：OpenAI 余额不足也返 429 → 额度必须先于限流；「模型不存在或无权访问」是模型问题不是 Key 问题 →
  * 模型先于鉴权；按分钟 token 限速（TPM）是限流、不是上下文超长 → 有速率窗口特征时让位。
+ * 端点类（R14 Q11-01：空响应 / 回了网页）是新增的：网页排最后、只吃前面都没命中的，
+ * 既有归类一个不动（带 502 / 401 的网关页仍是网络 / 鉴权）；空响应是自家写的固定句、不会与别类混，最先判。
+ * 流被对端中途掐断（undici 的 `terminated`）不是端点类：那是瞬时网络问题（网关空闲超时 / 后端重启），
+ * 归网络类、「重试」留作主按钮——放进端点类会把「去设置」顶成主按钮、还让人去查接口地址，对一次偶发断流是误导。
  */
 
 export type ErrorKind =
@@ -29,6 +33,7 @@ export type ErrorKind =
   | "context_overflow"
   | "quota"
   | "network"
+  | "endpoint"
   | "unknown";
 
 export interface ErrorClassification {
@@ -202,6 +207,21 @@ const NETWORK_RES: readonly RegExp[] = [
   /网络(?:异常|错误|中断|不可用|故障|连接|请求失败)|(?:请求|连接)超时|连接(?:被重置|被拒绝|中断|断开)|无法连接|连不上/,
 ];
 
+// undici 的 `TypeError: terminated`：响应体读到一半被对端关了（网关空闲超时 / 后端重启 / 代理不支持流式）。
+// 真正的原因多半挂在 cause 里（`other side closed`，NETWORK_RES 已认）；cause 没带出来时就只剩这一个词，
+// 同一次故障不能因为 cause 有没有带出来而落成两种卡（R14 Q11-01 评审意见 F2）。
+// 必须整行就这一个词（前面可有行首空白 / `xxx:` 前缀，`TypeError: ` 就是这样的前缀）——
+// `process terminated by …` / `Build terminated` 这类不算；行首空白用 `[ \t]*` 不用 `\s*`，免得空行多时回溯成平方
+const NETWORK_TERMINATED_RE = /(?:^[ \t]*|[:：]\s*)terminated\s*$/m;
+
+// —— 自定义端点「回了东西、但不是模型回复」（R14 Q11-01）——
+// ① 空响应：pi-run-settle.ts 的 EMPTY_REPLY_MESSAGE（自家固定句，两边文案一致由 tests/error-classify.test.ts 钉着；
+//    不带 ^ 锚点：答疑 / 唤醒等路径会在前面加「答疑失败：」之类的前缀）
+const ENDPOINT_EMPTY_RE = /模型没有返回任何内容/;
+// ② 回了网页：地址填成网页 / 网关登录页 / 错误页——错误串里出现 HTML 文档标记。只认完整的文档标记
+//    （`<!doctype html` / `<html>`）；`Unexpected token '<', "<!DOCTYPE "...` 这类 JSON 解析错误没带出标记，不算
+const ENDPOINT_PAGE_RES: readonly RegExp[] = [/<!doctype\s+html\b/i, /<html[\s>]/i];
+
 const anyMatch = (res: readonly RegExp[], s: string): boolean =>
   res.some((re) => re.test(s));
 
@@ -212,6 +232,8 @@ const classifyKind = (text: string): ErrorKind => {
   if (typeof text !== "string" || !text.trim()) return "unknown";
   const s = text.slice(0, MAX_SCAN);
   if (anyMatch(PASSTHROUGH_RES, s)) return "unknown";
+  // 空响应是自家写的固定句、不会与别类混：最先判，别被后面哪条宽泛规则抢走
+  if (ENDPOINT_EMPTY_RE.test(s)) return "endpoint";
 
   const codes = extractStatusCodes(s);
   const grpc = grpcCodeOf(s);
@@ -241,15 +263,18 @@ const classifyKind = (text: string): ErrorKind => {
   if (anyMatch(RATE_RES, s) || hasCode(codes, 429, 529) || grpc === 8) {
     return "rate_limit";
   }
-  // 6) 网络 / 服务暂时不可用
+  // 6) 网络 / 服务暂时不可用（含 undici 的 terminated：流读到一半被掐断，重试一般就好）
   if (
     anyMatch(NETWORK_RES, s) ||
+    NETWORK_TERMINATED_RE.test(s) ||
     hasCode(codes, 502, 503, 504) ||
     grpc === 14 ||
     grpc === 4
   ) {
     return "network";
   }
+  // 7) 端点回了网页：排最后、只吃前面都没命中的（带 502 / 401 的网关页仍按状态码归类）
+  if (anyMatch(ENDPOINT_PAGE_RES, s)) return "endpoint";
   return "unknown";
 };
 
@@ -277,6 +302,10 @@ const COPY: Record<
   network: {
     title: "网络或模型服务暂时不可用",
     hint: "检查网络和代理后再试；服务端临时故障一般过一会儿就能恢复。",
+  },
+  endpoint: {
+    title: "模型服务没有返回正常内容",
+    hint: "可能是接口地址填成了网页地址、模型名不对，也可能是端点或网关本身出了问题。到设置里检查接口地址和模型名，没问题的话稍后再试。",
   },
 };
 
@@ -312,6 +341,7 @@ export interface ErrorActionPlan {
    * 「重试」/「重新推进」的视觉权重。
    * secondary = 降级：鉴权 / 额度 / 模型不可用 / 上下文超长这几类，同模型同 key 同上下文重试必然再败，
    * 不能摆成主按钮误导；但也不隐藏——用户去设置改完 Key 回来要能直接点，隐藏会逼他重打一遍。
+   * 端点类（空响应 / 回了网页）同理：同一个坏地址重试多半还是空。
    */
   retry: "primary" | "secondary";
 }
@@ -328,7 +358,8 @@ export const planErrorActions = (
     case "auth":
     case "quota":
     case "model_unavailable":
-      // 凭据 / 提供方 / 模型列表都在设置页「模型」栏
+    case "endpoint":
+      // 凭据 / 提供方（接口地址）/ 模型列表都在设置页「模型」栏
       return { settings: { focus: "model" }, newChat: false, retry: "secondary" };
     case "context_overflow":
       return { settings: null, newChat: opts.mode === "chat", retry: "secondary" };

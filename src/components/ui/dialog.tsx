@@ -74,7 +74,10 @@ function DialogContent({
         <DialogPrimitive.Popup
           data-slot="dialog-content"
           className={cn(
-            // grid 是为了让 gap-4 在 Popup 内部 stack（header / body / footer）生效——原版同款
+            // flex flex-col（X5-c；原为 grid）：gap-4 在 Popup 内部把 header / body / footer 纵向 stack 起来，两种布局都行。
+            // 改 flex 的原因是 DialogFooter 要吸底：`position: sticky` 只能在「包含块」里移动，
+            // grid item 的包含块是它自己的 grid 行（行高 = footer 自己的高度，没有任何可移动空间），sticky 在 grid 里等于不生效；
+            // flex item 的包含块是 flex 容器的内容区，才吸得住。不要改回 grid，也不要给 Popup 加 max-h / overflow（见本函数上方「mask 滚」说明）。
             // relative 替代原 fixed top/left/transform、配合外层 wrapper 实现 mask 滚动
             //
             // V0.5.9 hot-fix：`*:min-w-0` 防止 grid item 撑破 max-w 限制（用户实测踩到）
@@ -85,7 +88,7 @@ function DialogContent({
             //   - 如果你后面真有一个 dialog 想让内容撑大（罕见）、再单独 override
             // [-webkit-app-region:no-drag]：Electron 拖拽区按像素矩形计算、不看 z-index——
             // 高弹窗顶部落进 header 的 drag 区时 X 点不动（用户实测）、整个 Popup 显式 no-drag
-            "relative grid w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 *:min-w-0 [-webkit-app-region:no-drag]",
+            "relative flex w-full max-w-[calc(100%-2rem)] flex-col gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 *:min-w-0 [-webkit-app-region:no-drag]",
             className
           )}
           {...props}
@@ -175,6 +178,16 @@ function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
 // 如果你把父 DialogContent 改成 p-0（比如自己手控 header / 滚动 body / footer 三段布局）、
 // 记得在 DialogFooter className 上加 `mx-0 mb-0` 覆盖、否则负 margin 会把 footer
 // 拉出 content 边界、又被 overflow-hidden 裁掉、视觉上「贴底没下间距」。
+//
+// X5-c：吸底。弹窗高过窗口时走「mask 滚」，footer 随内容在最底、会被挤到屏幕外（用户看不到「知道了」/ 保存按钮）；
+// `sticky -bottom-4 z-10` 让它滚动时始终贴在视口底边。前提是父层 DialogContent 的 Popup 是 flex-col（grid 里 sticky 不生效），
+// 且 DialogFooter 是 Popup 的直接子元素（被 <form> / <div> 包住的话 sticky 的约束范围就成了那个包装层）。
+// 为什么是 `-bottom-4` 而不是 `bottom-0`：sticky 的偏移从「最近滚动祖先」的内边距内沿算起，这里的滚动祖先是
+// DialogContent 外层 wrapper（`overflow-y-auto p-4`），`bottom-0` 会让吸底的 footer 离窗口底边留 16px，
+// 没滚到底时这条缝里会露出正文的字（审查 AI 在无头 Chrome 里量出来的，F1）；`-bottom-4` 刚好抵消 wrapper 的 p-4。
+// 以后改了 wrapper 的 padding，这里的 `-bottom-4` 要同步改。
+// 底色必须**不透明**：吸底后下面有内容滚过，原来的半透明 `bg-muted/50` 会透出文字；
+// 这里用 color-mix 把 muted 50% 叠在 popover 上，观感与原来近似、但不透明。
 function DialogFooter({
   className,
   showCloseButton = false,
@@ -187,7 +200,7 @@ function DialogFooter({
     <div
       data-slot="dialog-footer"
       className={cn(
-        "-mx-4 -mb-4 flex flex-col-reverse gap-2 rounded-b-xl border-t bg-muted/50 p-4 sm:flex-row sm:justify-end",
+        "sticky -bottom-4 z-10 -mx-4 -mb-4 flex flex-col-reverse gap-2 rounded-b-xl border-t bg-[color-mix(in_oklab,var(--muted)_50%,var(--popover))] p-4 sm:flex-row sm:justify-end",
         className
       )}
       {...props}

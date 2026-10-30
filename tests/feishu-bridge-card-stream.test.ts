@@ -336,6 +336,10 @@ describe("createCardStream", () => {
     expect(stream.getIds().cardId).toBeUndefined();
     stream.pushAnswer("x");
     expect(updateCardElementContent).not.toHaveBeenCalled();
+    // R14 P1-1：start 就失败的句柄 finalize 后必须记成「没同步」（outbound 据此不报「已完成」）
+    await stream.finalize({ ok: true });
+    expect(stream.getHealth().finalizeOk).toBe(false);
+    expect(updateCardEntity).not.toHaveBeenCalled();
   });
 
   // review P1#5：多题不渲染按钮

@@ -29,6 +29,7 @@ import { useActiveOptionScroll } from "@/hooks/use-active-option-scroll";
 import { fetchAtFiles, type AtFileHit } from "@/lib/at-mention-fetch";
 import {
   atEmptyHint,
+  atFooterHint,
   atMenuView,
   atResultsFromOutcome,
   normalizeAtQuery,
@@ -48,6 +49,8 @@ interface AtResults {
   files: AtFileHit[];
   /** 失败 / 超时落的空结果（空态文案与「无匹配」区分，Q6-09） */
   failed?: boolean;
+  /** 服务端索引被截断：候选可能不全（空态 / footer 提示「仅索引前 N 项」）。缺省不带 */
+  truncated?: true;
 }
 
 /** Lexical 注入：选中后直接插 FileTokenNode，成功返 true */
@@ -67,6 +70,8 @@ export interface AtMentionApi {
   stale: boolean;
   /** 当前 query 的候选请求失败 / 超时（空态要写「候选加载超时」而不是「无匹配」） */
   failed: boolean;
+  /** 当前（新鲜）结果来自被截断的索引：空态 / footer 要提示「仅索引前 N 项」，候选可能不全 */
+  truncated: boolean;
   /** 列表 DOM id（输入框 aria-controls / 选项 id 的前缀） */
   listId: string;
   onDraftChange: (draft: string, cursor: number) => void;
@@ -212,6 +217,7 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
   const { stale } = view;
   const loading = view.mode === "loading";
   const failed = view.mode === "empty" && results?.failed === true;
+  const truncated = view.truncated === true;
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent): boolean => {
@@ -259,6 +265,7 @@ export const useAtMention = (opts: UseAtMentionOpts): AtMentionApi => {
     loading,
     stale,
     failed,
+    truncated,
     listId,
     onDraftChange,
     onKeyDown,
@@ -299,7 +306,7 @@ export const AtMentionMenu = ({ at }: { at: AtMentionApi }) => {
           <LoadingState variant="inline" className="px-2 py-3" />
         ) : !hasItems ? (
           <EmptyHint variant="dashed" size="sm" align="center" className="m-1">
-            {atEmptyHint(at.failed)}
+            {atEmptyHint(at.failed, at.truncated)}
           </EmptyHint>
         ) : (
           at.filtered.map((f, i) => (
@@ -335,7 +342,7 @@ export const AtMentionMenu = ({ at }: { at: AtMentionApi }) => {
         )}
       </div>
       <div className="border-t bg-muted/40 px-2.5 py-1 text-[11px] text-muted-foreground">
-        ↑↓ 选择 · Enter 确认 · Esc 关闭
+        {atFooterHint(at.truncated)}
       </div>
     </div>
   );

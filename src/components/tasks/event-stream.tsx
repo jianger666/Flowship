@@ -115,6 +115,7 @@ import {
   composeStreamTail,
   type PendingScanBaseline,
 } from "@/lib/stream-pending";
+import { createSearchFollowGate } from "@/lib/stream-search-follow";
 
 import {
   attachLiveThinking,
@@ -191,8 +192,12 @@ import { WorkGroupRow } from "./event-stream/work-group";
 import { AskUserInlineCard } from "./ask-user-inline";
 import { EventStreamSearchBar } from "./event-stream-search-bar";
 import { EventStreamSearchScopeNotice } from "./event-stream-search-scope-notice";
+import { EventsSkippedNotice } from "./events-skipped-notice";
+import { LowDiskBanner } from "./low-disk-bar";
+import { StorageDegradedBar } from "./storage-degraded-bar";
 import { StreamAnnouncer } from "./stream-announcer";
 import { pathBasename } from "@/lib/path-utils";
+import type { StorageDegradedState } from "@/lib/storage-degraded";
 
   // streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
 // kind 用未出现在 EventKind 里的字面量、做 discriminated union 区分
@@ -529,6 +534,11 @@ interface Props {
    * 后台子代理却可能还在干活，没有这条用户完全看不出来。不传 / 空数组 = 不画。
    */
   backgroundSubagents?: readonly BackgroundSubagentJobView[];
+  /**
+   * 存储降级状态（服务端 SSE `storage_degraded` 帧）：非 null = 事件写盘失败中（磁盘满 / 只读 / IO 错误），
+   * 在事件流顶部常驻红条——这段时间的新输出只显示在当前页面、没落盘。不传 / null = 不画。chat 与 task 两种形态都用。
+   */
+  storageDegraded?: StorageDegradedState | null;
   /** P5：运行中仍可排队发送 */
   allowQueueWhileRunning?: boolean;
 }
@@ -819,6 +829,7 @@ const EventStreamImpl = ({
   pendingLocalReplies,
   queueBanner,
   backgroundSubagents,
+  storageDegraded,
   allowQueueWhileRunning,
   onEditPending,
   onDeletePending,
@@ -1204,6 +1215,16 @@ const EventStreamImpl = ({
     setSearchHitIndex(-1);
   }, []);
 
+  // 搜索与「跟随最新」的配合（R14 B6-3 / Q2-02，逻辑见 lib/stream-search-follow）：
+  // 只有命中把视口带走才停跟随；Esc / × 关闭搜索时，搜索前在跟随的缓动回最新。
+  // useState 惰性初值：follow 引用恒定，闸随事件流实例建一次。
+  // 切 task 的清理（下面）只复用 closeStreamSearch + reset，不走 handleSearchClose——切页不该触发滑动。
+  const [searchFollowGate] = useState(() => createSearchFollowGate(follow));
+  const handleSearchClose = useCallback(() => {
+    closeStreamSearch();
+    searchFollowGate.resumeOnClose();
+  }, [closeStreamSearch, searchFollowGate]);
+
   useEffect(() => {
     const onFocusSearch = () => activateStreamSearch();
     window.addEventListener(EVENT_STREAM_SEARCH_FOCUS_EVENT, onFocusSearch);
@@ -1263,16 +1284,15 @@ const EventStreamImpl = ({
     );
   }, [searchOccurrences, isSearchFiltering]);
 
-  // 搜索 / 跳旧事件：暂停自动跟随
-  useEffect(() => {
-    if (isSearchFiltering) follow.setFollowing(false);
-  }, [follow, isSearchFiltering]);
+  // 搜索不再「query 非空就停跟随」：只有命中把视口带走才停（见下面 reveal effect 里的 pauseForHit），
+  // 关闭搜索时按需还回去（handleSearchClose）。输入中 / 输入法中间态 / 无命中，视口没动就不动跟随。
 
-  // 切 task 退出搜索并重置查询记忆
+  // 切 task 退出搜索并重置查询记忆（跟随闸的记号也清掉）
   useEffect(() => {
     closeStreamSearch();
     lastSearchQueryRef.current = "";
-  }, [task.id, closeStreamSearch]);
+    searchFollowGate.reset();
+  }, [task.id, closeStreamSearch, searchFollowGate]);
 
   // 全流最后一个工作过程组 id：尾部 running 展开判定用（isRunningTail）。
   // 挂 orderedItems 不挂 items——虚拟项里没有工作过程组，跟着 chunk 重算纯属浪费
@@ -1512,6 +1532,11 @@ const EventStreamImpl = ({
       return false;
     };
 
+    // 命中要把视口带走了：先停跟随（并记下「搜索前在不在跟随」），再滚。
+    // 必须排在 revealMountedTarget / scrollToSearchHit 之前：后者经 jumpToItem 也会停跟随，之后就读不到原状态；
+    // 已挂载的命中走 DOM 精确滚动、不经 jumpToItem，不先停的话流式下一个 chunk 会把视口拽回底部。
+    searchFollowGate.pauseForHit();
+
     // 同一虚拟视口内切换命中时直接精确滚到文字，避免先滚整行、再滚文字造成抖动。
     // 只有目标尚未挂载时才先唤醒对应 Virtuoso 行，再等待正文出现。
     if (revealMountedTarget()) return;
@@ -1535,6 +1560,7 @@ const EventStreamImpl = ({
     isSearchFiltering,
     searchQuery,
     scrollToSearchHit,
+    searchFollowGate,
   ]);
 
   // 高亮以当前已渲染 DOM 为准。虚拟列表换行、折叠区展开或流式文本变化后自动重建，
@@ -2385,7 +2411,7 @@ const EventStreamImpl = ({
           hitCount={searchOccurrences.length}
           onActivate={activateStreamSearch}
           onQueryChange={setSearchQuery}
-          onClose={closeStreamSearch}
+          onClose={handleSearchClose}
           onPrev={goToPrevSearchHit}
           onNext={goToNextSearchHit}
           inputRef={searchInputRef}
@@ -2454,6 +2480,17 @@ const EventStreamImpl = ({
       )}
       {/* log 形态：范围提示是标题栏下方一条细行（占位只在搜索且有更早未加载时出现） */}
       {!isChat && renderSearchScopeNotice("border-b px-4 py-1")}
+      {/* 存储降级红条：事件写盘失败期间常驻（新输出没落盘，见 StorageDegradedBar）；
+          chat 形态在最顶，log 形态在标题栏 / 范围提示之下 */}
+      {storageDegraded ? <StorageDegradedBar state={storageDegraded} /> : null}
+      {/* 低磁盘预警红条（B2-4c / Q15-10）：数据目录所在盘剩余 < 500MB 时常驻（见 LowDiskBar）。
+          上面那条是「已经写失败」、更紧急且已经把磁盘问题说清了——它在时这条不画，免得两条红的说同一件事 */}
+      <LowDiskBanner suppressed={!!storageDegraded} />
+      {/* 「有记录读不出来」灰条（Q9-08）：events.jsonl 里有非空但解析不了的行（崩溃半行 / 全 0 填充）时的信息提示，
+          叠在红条之下（红的更紧急）；纯信息、不用 role="alert" */}
+      {task.eventsSkipped ? (
+        <EventsSkippedNotice count={task.eventsSkipped} />
+      ) : null}
       {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll。
           relative：给 chat 搜索与「AI 在等你回答」悬浮条定位 */}
       <div className="relative min-h-0 flex-1">
@@ -2465,7 +2502,7 @@ const EventStreamImpl = ({
             hitCount={searchOccurrences.length}
             onActivate={activateStreamSearch}
             onQueryChange={setSearchQuery}
-            onClose={closeStreamSearch}
+            onClose={handleSearchClose}
             onPrev={goToPrevSearchHit}
             onNext={goToNextSearchHit}
             inputRef={searchInputRef}

@@ -201,7 +201,7 @@ const installHang = (name: string) => {
 };
 
 describe("bootstrap 帧序与 replay 标记", () => {
-  it("没有进行中的思考：快照帧照发、live 为 null；顺序在 queue_state / restricted_run / talk_queue / background_subagents 之后；tail 事件全带 replay", async () => {
+  it("没有进行中的思考：快照帧照发、live 为 null；顺序在 queue_state / restricted_run / talk_queue / background_subagents / storage_degraded 之后；tail 事件全带 replay", async () => {
     const id = await alloc();
     await appendEvent(id, { kind: "user_reply", text: "第一条" });
     await appendEvent(id, { kind: "info", text: "第二条" });
@@ -216,6 +216,8 @@ describe("bootstrap 帧序与 replay 标记", () => {
       "restricted_run",
       "talk_queue",
       "background_subagents",
+      // B2-2：存储降级的当前值，bootstrap 无条件补一帧（没降级也发 {degraded:false}），位置固定在 background_subagents 之后、进行中快照之前
+      "storage_degraded",
       // 进行中正文快照紧挨在思考快照之前（同一类「重连补态」帧，bootstrap 末尾两帧）
       "assistant_snapshot",
       "thinking_snapshot",

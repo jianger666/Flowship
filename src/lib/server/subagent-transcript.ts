@@ -567,6 +567,12 @@ const handleMessage = (rec: RunRecord, msg: unknown): void => {
     case "tool_call":
       onToolCall(rec, msg);
       return;
+    case "auto_retry_start":
+      // pi 内层自动重试，那条回复要整个重新生成一遍：只封口，让重新生成的文本另起一条——半截保留着（用户看过），
+      // 但不和全文焊成一段。不落说明条目：过程记录只认 thinking / assistant_message / tool_call / tool_result
+      // 四类（subagent-run.ts 的 RUN_EVENT_KINDS），别的读出来一律丢（R14 Q11-02）
+      rec.open = null;
+      return;
     default:
       return;
   }

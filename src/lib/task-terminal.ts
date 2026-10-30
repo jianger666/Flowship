@@ -88,6 +88,25 @@ export const WATCH_UNAVAILABLE_BACKOFF_CAP_MS = 12_000;
 export const WATCH_CLEAN_RECONNECT_DELAY_MS = 1_000;
 
 /**
+ * 建连后撑过多久才算「稳定连接」——只有稳定连接才清零重连预算（Q16-01）。
+ *
+ * 旧写法是首个合法 bootstrap 帧一到就清零：「建连后立刻被掐断 / 回调立刻抛错」的连接每轮都先清零、再记成第 1 次失败，
+ * 预算永远攒不到上限 → 永不休眠、不提示，只是每 ~1.5s 静默无限重连。
+ * 2s：正常长连接以分钟计；服务端 bootstrap 后立刻关流 / 代理掐流 / 脏事件触发回调抛错，都发生在毫秒级。
+ */
+export const WATCH_STABLE_CONNECTION_MS = 2_000;
+
+/**
+ * 这条连接是否撑过了稳定窗口（纯函数）。
+ * 从未建连（establishedAt=null）一律不算；系统时钟被回拨（结束早于建连）也不算。
+ */
+export const isStableWatchConnection = (
+  establishedAt: number | null,
+  endedAt: number,
+): boolean =>
+  establishedAt !== null && endedAt - establishedAt >= WATCH_STABLE_CONNECTION_MS;
+
+/**
  * 退避预算耗尽（terminate_exhausted）后进入「休眠待重连」：不再静默停更。
  * 休眠期靠 online / 页面回可见 / 手动「重连」/ 低频兜底定时复查唤醒，唤醒后预算清零重新开始。
  * 兜底定时复查间隔（只在页面可见且在线时才真正重连，隐藏页不烧电、不打服务端）
@@ -190,9 +209,12 @@ export const resolveWatchReconnectPolicy = (input: {
 /**
  * watch 流 clean resolve 后的 epoch 处理（hook 与单测共用）。
  *
- * - established=true → 清零两类计数（与 onConnectionEstablished 幂等）
- * - established=false（bootstrap 前空 EOF / 仅非法帧）→ 记一次 retryable，
+ * `established` = 这条连接「稳定地建立过」：收到合法 bootstrap 帧**并且**撑过 WATCH_STABLE_CONNECTION_MS
+ * （hook 用 settleWatchBudget / isStableWatchConnection 判定后传进来）。
+ * - established=true → 清零两类计数
+ * - established=false（bootstrap 前空 EOF / 仅非法帧 / 建连后立刻被关）→ 记一次 retryable，
  *   走既有 policy，**禁止**当成功清零
+ * 终态（merged / abandoned 的 done、task_deleted）关流是正常结束、不走这里：hook 在调用本函数之前就已返回。
  */
 export type WatchCleanEofDecision =
   | {

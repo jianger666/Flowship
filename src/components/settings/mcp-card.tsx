@@ -52,7 +52,11 @@ import { useDialog } from "@/hooks/use-dialog";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpHealth } from "@/hooks/use-mcp-health";
 import { useMcpOAuth } from "@/hooks/use-mcp-oauth";
-import { parseBulkMcpJson, RESERVED_MCP_NAMES } from "@/lib/mcp-config";
+import {
+  parseBulkMcpJson,
+  RESERVED_MCP_NAMES,
+  validateMcpServerConfig,
+} from "@/lib/mcp-config";
 import { cn } from "@/lib/utils";
 
 interface McpCardProps {
@@ -453,6 +457,12 @@ const ServerEditDialog = ({
       cfg = JSON.parse(configDraft) as McpServerConfig;
     } catch {
       toast.error("配置不是合法 JSON");
+      return;
+    }
+    // 合法 JSON ≠ 能用的配置：`123` / `{"url":123}` / 默认模板没改的空 url 存进去会让之后的新任务和对话起不来
+    const invalid = validateMcpServerConfig(cfg);
+    if (invalid) {
+      toast.error(`配置无效：${invalid}`);
       return;
     }
     onSave(key, cfg, existingName);

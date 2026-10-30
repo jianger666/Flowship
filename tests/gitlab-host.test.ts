@@ -42,6 +42,46 @@ describe("pickUnifiedGitHost", () => {
       pickUnifiedGitHost(["gitlab.a.com", "gitlab.b.com"]),
     ).toThrow(MULTI_GITLAB_HOST_ERROR);
   });
+
+  // R14 Q21-03：同一个实例的不同写法不该被当成「多仓属于不同实例」
+  it("同一个 host 的大小写 / 尾点 / 协议前缀 / 默认端口写法算同一个，返回规范写法", () => {
+    expect(pickUnifiedGitHost(["GitLab.Example.com", "gitlab.example.com"])).toBe(
+      "gitlab.example.com",
+    );
+    expect(pickUnifiedGitHost(["gitlab.example.com.", "gitlab.example.com"])).toBe(
+      "gitlab.example.com",
+    );
+    expect(
+      pickUnifiedGitHost(["https://gitlab.example.com", "gitlab.example.com:443"]),
+    ).toBe("gitlab.example.com");
+  });
+
+  it("单个 host 也返回规范写法（下游拿它拼 URL / 比对受信 host）", () => {
+    expect(pickUnifiedGitHost(["GitLab.Example.COM"])).toBe("gitlab.example.com");
+  });
+
+  it("规范化之后仍不同 → 照样 throw", () => {
+    expect(() =>
+      pickUnifiedGitHost(["GitLab.A.com", "gitlab.b.com."]),
+    ).toThrow(MULTI_GITLAB_HOST_ERROR);
+  });
+
+  it("纯空白的 host 当没有（不被当成一个畸形 host 参与比较）；前后的空白不影响同一性", () => {
+    expect(pickUnifiedGitHost(["   ", "gitlab.example.com"])).toBe("gitlab.example.com");
+    expect(pickUnifiedGitHost(["  gitlab.example.com  ", "gitlab.example.com"])).toBe(
+      "gitlab.example.com",
+    );
+  });
+
+  it("规整不了的畸形值不会被静默吞掉：与合法 host 并存仍算不一致", () => {
+    expect(() =>
+      pickUnifiedGitHost(["gitlab.example.com", "evil host"]),
+    ).toThrow(MULTI_GITLAB_HOST_ERROR);
+  });
+
+  it("单个规整不了的畸形值原样返回（不凭空变成 null、也不变成别的 host）", () => {
+    expect(pickUnifiedGitHost(["Not A Host!"])).toBe("Not A Host!");
+  });
 });
 
 describe("resolveEffectiveGitHost", () => {

@@ -14,6 +14,7 @@ import { resolveFlowLock } from "@/lib/flow-mutex";
 import { resolveReqId } from "@/lib/req-id";
 import type { GitBranchInfo, Task } from "@/lib/types";
 
+import { GIT_MAX_BUFFER, gitEnv } from "./git-exec";
 import { getTaskWorkRepoPaths } from "./task-worktrees";
 
 const STATUS_BRANCH_KEYS = [
@@ -82,7 +83,8 @@ const branchesContainingReqId = async (
         "refs/heads",
         "refs/remotes/origin",
       ],
-      { cwd: repoPath, timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
+      // maxBuffer 用共享的 GIT_MAX_BUFFER（Q10-02）：原来的 2MiB 在远端 refs 过万时超限，catch 静默吞掉 = 「没有这个分支」
+      { cwd: repoPath, timeout: 30_000, maxBuffer: GIT_MAX_BUFFER, env: gitEnv() },
     );
     names.push(
       ...stdout
@@ -97,7 +99,8 @@ const branchesContainingReqId = async (
     const { stdout } = await execFileAsync(
       "git",
       ["ls-remote", "--heads", "origin"],
-      { cwd: repoPath, timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+      // ls-remote 联网：gitEnv() 保证没凭据就失败、不阻塞也不弹窗（Q10-07），也不把 GitLab PAT 交给 git（Q10-04）
+      { cwd: repoPath, timeout: 30_000, maxBuffer: GIT_MAX_BUFFER, env: gitEnv() },
     );
     names.push(
       ...stdout
@@ -121,7 +124,7 @@ const branchExistsInRepo = async (
     await execFileAsync(
       "git",
       ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-      { cwd: repoPath, timeout: 30_000 },
+      { cwd: repoPath, timeout: 30_000, env: gitEnv() },
     );
     return true;
   } catch {
@@ -131,7 +134,7 @@ const branchExistsInRepo = async (
     await execFileAsync(
       "git",
       ["rev-parse", "--verify", "--quiet", `origin/${branch}`],
-      { cwd: repoPath, timeout: 30_000 },
+      { cwd: repoPath, timeout: 30_000, env: gitEnv() },
     );
     return true;
   } catch {

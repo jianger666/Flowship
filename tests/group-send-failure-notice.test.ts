@@ -176,12 +176,16 @@ describe("noteGroupSendFailure 本体", () => {
     expect(n!.text).toContain("log_id=20261017abc");
   });
 
-  it("同一个群一分钟只记一条（各出口共用同一个节流 key，不刷屏）；换个群各记各的", async () => {
+  it("同一个群、同一类消息一分钟只记一条（各出口共用同一张节流表，不刷屏）；换个群各记各的", async () => {
     await noteGroupSendFailure(TASK, CHAT, new Error("a"));
-    await noteGroupSendFailure(TASK, CHAT, new Error("b"), "回执");
+    await noteGroupSendFailure(TASK, CHAT, new Error("b"));
     expect(failureNotices()).toHaveLength(1);
-    await noteGroupSendFailure(TASK, "oc_other", new Error("c"));
+    await noteGroupSendFailure(TASK, CHAT, new Error("c"), "回执");
+    await noteGroupSendFailure(TASK, CHAT, new Error("d"), "回执");
+    // 不同类的各占各的名额（B4-4 / Q12b-07：「回执」失败不能把同一分钟的「答疑回复」失败吞掉；细节见 group-failure-notice-kinds.test.ts）
     expect(failureNotices()).toHaveLength(2);
+    await noteGroupSendFailure(TASK, "oc_other", new Error("e"));
+    expect(failureNotices()).toHaveLength(3);
   });
 
   it("与入向回执共用节流：入向已记过这个群，出向本分钟内不再记", async () => {
@@ -316,8 +320,11 @@ describe("失败原因怎么读（Command failed / 退出码 / 固定后缀）",
     expect(texts[0]).not.toContain("cardkit:card:write");
     expect(texts[1]).not.toContain("cardkit:card:write");
     expect(texts[2]).toContain("cardkit:card:write");
-    // 无关的也要给个能往下查的出口
-    expect(texts[0]).toContain("详情见应用日志");
+    // 认不出的无关失败也要给个能往下查的出口
+    expect(texts[1]).toContain("详情见应用日志");
+    // 机器人不在群是认得出的一类（B4-4 / Q12b-03）：给的是能照做的补救，不是「设置页检查」
+    expect(texts[0]).toContain("搜本机机器人的名字加回群");
+    expect(texts[0]).not.toContain("详情见应用日志");
   });
 
   it("原因整体仍受 300 字上限（超长的 Feishu 报错不顶满事件）", async () => {
@@ -407,7 +414,7 @@ describe("出向各出口：发不出去 → 事件流留 info", () => {
     expect(failureNotices()).toHaveLength(0);
   });
 
-  it("产物卡发不出去：先记「产物没发出去」；随后的兜底回执也挂时被同群节流吃掉，只留一条", async () => {
+  it("产物卡发不出去：先记「产物没发出去」；随后的兜底回执也挂时再记一条「回执没发出去」（不同类各占各的名额，B4-4 / Q12b-07）", async () => {
     const sendText = vi.fn(async () => {
       throw new Error(SCOPE_ERR);
     });
@@ -425,8 +432,9 @@ describe("出向各出口：发不出去 → 事件流留 info", () => {
     // 兜底回执确实尝试发了（原有行为不变）
     expect(sendText).toHaveBeenCalledTimes(1);
     const notices = failureNotices();
-    expect(notices).toHaveLength(1);
+    expect(notices).toHaveLength(2);
     expect(notices[0]!.text).toContain("产物没发出去");
+    expect(notices[1]!.text).toContain("回执没发出去");
   });
 
   it("推进登记到期的回执发不出去 → 同样留一条", async () => {

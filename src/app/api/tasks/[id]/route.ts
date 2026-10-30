@@ -44,7 +44,13 @@ import {
   taskDir,
 } from "@/lib/server/task-fs-core";
 import { failpoint } from "@/lib/server/failpoints";
-import { abortRunningCheck, archiveTaskWithReport, cancelTaskRun, closeTaskSession } from "@/lib/server/task-runner";
+import {
+  abortRunningCheck,
+  archiveTaskWithReport,
+  cancelTaskRun,
+  closeTaskSession,
+  TaskCleanupInProgressError,
+} from "@/lib/server/task-runner";
 import {
   cancelRestrictedQuestions,
   hasResourceJobs,
@@ -277,7 +283,16 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       // 纯置顶沿用原子翻标记。archived + pinned 同发时先清后补 pin，非原子：
       // 中间隔一次 SSE/轮询，旧快照可能盖掉 pin，靠前端 markArchiving 窗口兜底（概率小、可接受）。
       if (typeof body.archived === "boolean") {
-        const outcome = await archiveTaskWithReport(id, body.archived);
+        let outcome: Awaited<ReturnType<typeof archiveTaskWithReport>>;
+        try {
+          outcome = await archiveTaskWithReport(id, body.archived);
+        } catch (err) {
+          // 要清隔离工作区的归档会占 finalizing lifecycle（R14 Q7a-03）：stop / DELETE / finalize / reopen 在飞 → 409、让用户稍后重试
+          if (err instanceof TaskCleanupInProgressError) {
+            return NextResponse.json({ error: err.message }, { status: 409 });
+          }
+          throw err;
+        }
         if (!outcome)
           return NextResponse.json({ error: "not_found" }, { status: 404 });
         const archivedTask = outcome.task;

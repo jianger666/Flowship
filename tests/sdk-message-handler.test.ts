@@ -1,7 +1,7 @@
 /**
  * handleSdkMessage：tool_call running 去重 + task 工具 args 短字段前置 / 截断放大
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   mergeToolDisplayEvents,
@@ -1226,5 +1226,164 @@ describe("handleSdkMessage usage（= turn-ended）只计数，其后的消息照
     expect(ctx.turnEndedCount).toBeUndefined();
     expect(ctx.turnEndedAt).toBeUndefined();
     expect(writeOwnedEventAndPublish).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 自定义 pi 内层自动重试（R14 Q11-02）：流被掐断 / 网关 5xx 之后 pi 会自己把这一条回复整个重新生成一遍，
+ * 而出错的半截在重试之前已经推给 UI。不分开的话，半截和重新生成的全文会被焊成同一条 assistant_message
+ * （落盘就是「半截 + 全文」，读起来是一段重复的话）。
+ * 这里钉：重试开始时半截落成独立的一条、紧跟一行普通 info 说明，之后重新生成的全文才是新的一条；
+ * 不删已经流出去的字。
+ */
+describe("handleSdkMessage 自定义 pi 内层自动重试（auto_retry_start）", () => {
+  /** 落盘 / 过程行的时间线：「先落半截、再写说明、全文是新的一条」靠它断言顺序 */
+  let timeline: string[] = [];
+
+  beforeEach(() => {
+    timeline = [];
+    writeOwnedEventAndPublish.mockReset();
+    writeOwnedEventAndPublish.mockImplementation(async (_taskId, _lease, ev) => {
+      timeline.push(`${ev.kind}:${ev.text ?? ""}`);
+    });
+    appendEvent.mockClear();
+    __resetToolCallRunningSeenForTest();
+  });
+  afterEach(() => {
+    // 还原成别的 describe 期待的空实现，别把时间线记录器漏出去
+    writeOwnedEventAndPublish.mockReset();
+    writeOwnedEventAndPublish.mockImplementation(async () => {});
+  });
+
+  /** flush 与 runner 的 flushAssistantSegment 同语义：有字才落一条 assistant_message，落完清空 */
+  const makeCtx = (extra: Partial<AssistantBufferCtx> = {}): AssistantBufferCtx => {
+    const ctx: AssistantBufferCtx = {
+      buffer: "",
+      flush: async () => {
+        const text = ctx.buffer;
+        ctx.buffer = "";
+        if (text) timeline.push(`assistant_message:${text}`);
+      },
+      ...extra,
+    };
+    return ctx;
+  };
+  const assistantText = (text: string) =>
+    ({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    }) as never;
+  const retryMsg = (attempt?: number, max = 3) =>
+    ({ type: "auto_retry_start", attempt, maxAttempts: max, delayMs: 2000 }) as never;
+  const infoLine = (n: number) => `info:连接中断，已自动重试（第 ${n}/3 次）`;
+
+  it("半截正文先落成独立的一条、再写说明行；buffer 清空；不走消音审计通道", async () => {
+    const ctx = makeCtx();
+    await handleSdkMessage("task-1", assistantText("PART-A"), ctx, leaseOk);
+    expect(ctx.buffer).toBe("PART-A");
+    await handleSdkMessage("task-1", retryMsg(1), ctx, leaseOk);
+    expect(timeline).toEqual(["assistant_message:PART-A", infoLine(1)]);
+    expect(ctx.buffer).toBe("");
+    expect(appendEvent).not.toHaveBeenCalled();
+  });
+
+  it("说明行是普通 info（meta.kind=auto_retry、带次数），不是会一直转圈的 reconnecting 过程行", async () => {
+    await handleSdkMessage("task-1", retryMsg(2), makeCtx(), leaseOk);
+    expect(writeOwnedEventAndPublish).toHaveBeenCalledTimes(1);
+    expect(writeOwnedEventAndPublish.mock.calls[0][2]).toEqual({
+      kind: "info",
+      text: "连接中断，已自动重试（第 2/3 次）",
+      meta: { kind: "auto_retry", attempt: 2, max: 3 },
+    });
+  });
+
+  it("半截为空（一字未吐就断）→ 只写一行说明，不落空的 assistant_message", async () => {
+    await handleSdkMessage("task-1", retryMsg(1), makeCtx(), leaseOk);
+    expect(timeline).toEqual([infoLine(1)]);
+  });
+
+  it("重新生成的全文是新的一条：落盘形态 [半截, 说明, 全文]（不再焊成「半截 + 全文」）", async () => {
+    const ctx = makeCtx();
+    await handleSdkMessage("task-1", assistantText("PART-A"), ctx, leaseOk);
+    await handleSdkMessage("task-1", retryMsg(1), ctx, leaseOk);
+    await handleSdkMessage("task-1", assistantText("FULL-ANSWER"), ctx, leaseOk);
+    await ctx.flush(); // run 结束时 runner 的收尾 flush
+    expect(timeline).toEqual([
+      "assistant_message:PART-A",
+      infoLine(1),
+      "assistant_message:FULL-ANSWER",
+    ]);
+  });
+
+  it("连续两次重试：[A1, 说明 1/3, A2, 说明 2/3, FULL]", async () => {
+    const ctx = makeCtx();
+    await handleSdkMessage("task-1", assistantText("A1"), ctx, leaseOk);
+    await handleSdkMessage("task-1", retryMsg(1), ctx, leaseOk);
+    await handleSdkMessage("task-1", assistantText("A2"), ctx, leaseOk);
+    await handleSdkMessage("task-1", retryMsg(2), ctx, leaseOk);
+    await handleSdkMessage("task-1", assistantText("FULL"), ctx, leaseOk);
+    await ctx.flush();
+    expect(timeline).toEqual([
+      "assistant_message:A1",
+      infoLine(1),
+      "assistant_message:A2",
+      infoLine(2),
+      "assistant_message:FULL",
+    ]);
+  });
+
+  it("两次重试之间一字未吐（连续 503）：[A1, 说明 1/3, 说明 2/3, FULL]，中间不出空消息", async () => {
+    const ctx = makeCtx();
+    await handleSdkMessage("task-1", assistantText("A1"), ctx, leaseOk);
+    await handleSdkMessage("task-1", retryMsg(1), ctx, leaseOk);
+    await handleSdkMessage("task-1", retryMsg(2), ctx, leaseOk);
+    await handleSdkMessage("task-1", assistantText("FULL"), ctx, leaseOk);
+    await ctx.flush();
+    expect(timeline).toEqual([
+      "assistant_message:A1",
+      infoLine(1),
+      infoLine(2),
+      "assistant_message:FULL",
+    ]);
+  });
+
+  it("半截只有思考 → 思考落成独立的一条、再写说明；思考 buffer 清空", async () => {
+    const ctx = makeCtx();
+    await handleSdkMessage("task-1", { type: "thinking", text: "想到一半" } as never, ctx, leaseOk);
+    expect(ctx.thinkingBuffer).toBe("想到一半");
+    await handleSdkMessage("task-1", retryMsg(1), ctx, leaseOk);
+    expect(timeline).toEqual(["thinking:想到一半", infoLine(1)]);
+    expect(ctx.thinkingBuffer).toBe("");
+  });
+
+  it("半截里思考和正文都在 → 思考先、正文后、说明最后", async () => {
+    const ctx = makeCtx({ buffer: "PART-A", thinkingBuffer: "想" });
+    await handleSdkMessage("task-1", retryMsg(1), ctx, leaseOk);
+    expect(timeline).toEqual(["thinking:想", "assistant_message:PART-A", infoLine(1)]);
+  });
+
+  it("lease 已失效（run 已被替换）→ 什么都不写、半截也不 flush", async () => {
+    const flush = vi.fn(async () => {});
+    const ctx = makeCtx({ buffer: "旧 run 的残留", flush });
+    await handleSdkMessage("task-1", retryMsg(1), ctx, () => false);
+    expect(flush).not.toHaveBeenCalled();
+    expect(timeline).toEqual([]);
+  });
+
+  it("flush 期间 run 被替换 → 半截已经落了，但不再写说明行", async () => {
+    let current = true;
+    const ctx = makeCtx({ buffer: "PART-A" });
+    ctx.flush = async () => {
+      timeline.push(`assistant_message:${ctx.buffer}`);
+      ctx.buffer = "";
+      current = false;
+    };
+    await handleSdkMessage("task-1", retryMsg(1), ctx, () => current);
+    expect(timeline).toEqual(["assistant_message:PART-A"]);
+  });
+
+  it("缺次数的合成消息 → 退化成不带次数的说明行，不显示 NaN / undefined", async () => {
+    await handleSdkMessage("task-1", { type: "auto_retry_start" } as never, makeCtx(), leaseOk);
+    expect(timeline).toEqual(["info:连接中断，已自动重试"]);
   });
 });

@@ -160,9 +160,16 @@ export const looksHighEntropySecret = (raw: string): boolean => {
   return true;
 };
 
-/** 行左侧是否像 hash / commit 语境（高熵规则豁免） */
+/**
+ * 行左侧是否像 hash / commit 语境（高熵规则豁免）。
+ * - 前置字符里有 `@`：Docker 镜像摘要写作 `FROM node@sha256:<64 位十六进制>`（`sha256` 紧贴 `@`，不是空白 / 引号），
+ *   以前因此被当成高熵口令拦住（R14 Q13-03）。
+ * - 关键词后允许跟一个闭合引号：JSON / 带引号的键名写作 `"sha256": "<hex>"`、`'checksum': '<hex>'`。
+ *   以前只认 YAML 写法 `sha256: <hex>`，JSON 写法的哈希一直是误报，只是被「第 5 步只看行里第一个候选」掩盖
+ *  （`{"commit":"deadbeef…","sha256":"…"}` 里第一个候选多样性不够被放过、整行就不再看了）。
+ */
 const isHashContextKey = (left: string): boolean =>
-  /(?:^|[\s"'`{,.(])(?:sha(?:-?1|-?256|-?512)?|md5|commit(?:[_-]?hash)?|checksum|hash|etag)\s*$/i.test(
+  /(?:^|[\s"'`{,.(@])(?:sha(?:-?1|-?256|-?512)?|md5|commit(?:[_-]?hash)?|checksum|hash|etag)["'`]?\s*$/i.test(
     left.trimEnd(),
   );
 
@@ -849,9 +856,15 @@ const collectLinePairs = (line: string, st: BracketState, depth = 0): SensitiveP
 /**
  * 常见平台令牌的「值形态」（不依赖键名）：
  * OpenAI/Anthropic sk-、GitHub ghp_/gho_/ghu_/ghs_/ghr_/github_pat_、GitLab glpat-、
- * Slack xox*-、AWS AKIA…、HTTP `Bearer <token>`。
+ * Slack xox*-、AWS AKIA…、Telegram bot token、HTTP `Bearer <token>`。
  * 前缀前不能紧挨字母数字（`task-xxx` 里的 `sk-` 不算）；sk- / glpat- / Bearer 另要求含数字且含字母，
  * 挡住 `sk-my-long-kebab-name` 这类 slug；gh*_ / xox / AKIA 前缀本身足够特异、只排占位符。
+ *
+ * Telegram bot token（`<8–16 位 bot id>:A<34 位>`，第二段总长 35，BotFather 发的就是这个形态；现在的 bot id 是 10 位上下，
+ * 上限放到 16 是免得 id 涨到 11 位之后真 token 被静默漏掉）：路径里的 `…/bot<id>:<token>/sendMessage`
+ * 没有 hook 字样也没有敏感键名，以前只靠「URL 一律误报」被拦，第 5 步不再看 URL 之后由它兜住（R14 Q13-03）。
+ * 左侧只禁数字、不用 `\b`：`bot123456789:…` 里 `bot` 与数字相连，`\b` 不成立，URL 里的 token 会整个漏掉；右侧不能再接 token 字符。
+ * 官方文档里的示例 token 只有 34 位，算示例、不拦。
  *
  * 「至少 N 个」一律写成 `{N}X*` 而不是 `{N,}`：二者匹配的串完全一样，但带下界的计数量词整段按字符迭代、
  * 每次往 V8 回溯栈压一项，单个 token 到 ~8MB 就抛 `RangeError: Maximum call stack size exceeded`
@@ -886,6 +899,11 @@ const KNOWN_TOKEN_RULES: ReadonlyArray<{
   {
     label: "令牌(AKIA) ",
     re: /(?<![A-Za-z0-9])((?:AKIA|ASIA)[0-9A-Z]{16})(?![A-Za-z0-9])/,
+    needDigitAndLetter: false,
+  },
+  {
+    label: "令牌(Telegram bot) ",
+    re: /(?<![0-9])(\d{8,16}:A[A-Za-z0-9_-]{34})(?![A-Za-z0-9_-])/,
     needDigitAndLetter: false,
   },
   {
@@ -947,9 +965,150 @@ const PGPASS_RE = /^([^:\s]+):(\*|\d+):([^:]*):([^:]*):(.+)$/;
  * 再交给 `looksHighEntropySecret`。所以不是「≥ 20 位就命中」：口令开头 20 位里出现 `!` `@` `#` `$` `%` `&` `*` 空格 … 就整条无命中
  * （23 位 `Zx9fQ2m!K7pLw1234AbCdEf` 无命中；20 位全在字符集内命中、19 位不命中）。口令内部若含 `=` / `:`，则从那个符号之后重新起算
  * （它之后连续 ≥ 20 个字符集内字符仍命中，命中的是那一段）。这是已知残余——含特殊符号的口令可能漏报。
+ *
+ * 带 g：第 5 步用 matchAll **逐个候选**判（只许用 matchAll，不要在这个共享实例上调 exec / test）。
+ * 行里第一个候选被放过（hash 语境、UUID / 摘要 / 路径、不够高熵）之后，同一行后面键名不敏感的真口令仍要被看到。
  */
 const HIGH_ENTROPY_ASSIGN_RE =
-  /([:=])\s*['"]?([A-Za-z0-9+/=_\-.~]{20}[A-Za-z0-9+/=_\-.~]*)['"]?/;
+  /([:=])\s*['"]?([A-Za-z0-9+/=_\-.~]{20}[A-Za-z0-9+/=_\-.~]*)['"]?/g;
+
+/**
+ * isHashContextKey 只需要看候选左侧紧邻的几十个字符（关键词最长 11 个字符、必须紧贴候选，中间只能隔空白）。
+ * 整段左侧传进去的话，一行里候选很多时是 O(候选数 × 行长)。窗口截断只影响「关键词后面跟了 50 多个空白」这种极端写法。
+ */
+const HASH_CONTEXT_WINDOW = 64;
+const hashContextBefore = (text: string, index: number): boolean =>
+  isHashContextKey(
+    text.slice(Math.max(0, index - HASH_CONTEXT_WINDOW), index),
+  );
+
+/**
+ * URL：`scheme://…`，到第一个不属于 RFC 3986 URL 字符的字符为止——空白 / 括号 / 引号 / 逗号 / 分号 / 中文都会截断，
+ * 所以 `[文档](https://…)`、`"https://…"`、`https://a.b/c，password=…` 不会把后面的内容一起吞掉。
+ * 起点只从「标识符串起点」尝试（后顾，理由同 CONN_STRING_RE：scheme 字符类很宽，不加的话一长串字母每个位置都吃到串尾再失败，是二次方）。
+ */
+const URL_RE =
+  /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/[A-Za-z0-9\-._~:/?#@!$&*+=%]+/g;
+
+/** URL 的 authority（`://` 之后、第一个 `/` `?` `#` 之前）里有 `@` = 带 userinfo，口令 / 令牌可能就在里面，不能当普通链接抹掉 */
+const urlHasUserinfo = (url: string): boolean => {
+  for (let i = url.indexOf("://") + 3; i < url.length; i++) {
+    const c = url.charCodeAt(i);
+    if (c === 64) return true; // @
+    if (c === 47 || c === 63 || c === 35) return false; // / ? #
+  }
+  return false;
+};
+
+/**
+ * 把行里不带 userinfo 的 URL 换成占位 `URL`，**只给高熵赋值规则（第 5 步）用**。
+ * URL 本身（`https://example.com/a/b-c`、飞书 `…/wiki/wikcnAbCd…`、`?id=…`）天然「长 + 多类字符」，`https:` 之后的 `//…`
+ * 紧跟在 `:` 后就被当成高熵口令：仓库自带的 `context-docs-handler` skill 里两行飞书文档链接都被拦、团队库里贴一条
+ * 文档 / clone 链接就被阻断上传（R14 Q13-03）。
+ * credential-key / 连接串 / 平台令牌规则仍扫原行，所以 `?token=…`、`user:pass@host`、`ghp_…` 嵌在 URL 里照旧命中；
+ * 带 userinfo 的 URL 不抹（`https://<令牌>@host`）。路径里嵌着密钥的 webhook 地址以前靠「URL 一律误报」这个副作用被拦，
+ * 抹掉之后由 findWebhookUrlSecrets 专门兜住。
+ */
+const maskPlainUrls = (line: string): string =>
+  line.includes("://")
+    ? line.replace(URL_RE, (url) => (urlHasUserinfo(url) ? url : "URL"))
+    : line;
+
+/** `hook` / `hooks` / `webhook` / `webhooks` / `webhookb2`（Teams）——整个 host 标签或整个路径段，不是子串（`react-hooks`、`webhooks-overview` 不算） */
+const WEBHOOK_WORD_RE = /^(?:web)?hooks?(?:b\d+)?$/i;
+
+/**
+ * webhook 地址里的凭据段：≥ 16 位、只含 URL 安全字符（UUID 的 `-`）、不是占位符（`XXXXXXXX`）、
+ * 也不是「小写单词 + 分隔符」的文档名（`overview-of-webhooks-and-events`，同 looksHighEntropySecret 的 slug 豁免）。
+ * 不要求含数字 / 大写：文档和测试里的示例令牌常是纯小写（`abcdefghijklmnopqrstuvwx`），而 webhook 上下文已经把范围缩得很小。
+ * 字符集里没有 `@`：Teams 地址第一段 `<租户>@<团队>` 不是秘密，真正的密钥是后面的 `IncomingWebhook/<hex>/<guid>`（变异验证里加 `@` 与否测试都不红，是冗余）。
+ */
+const looksLikeWebhookCredential = (seg: string): boolean =>
+  seg.length >= 16 &&
+  /^[A-Za-z0-9_-]+$/.test(seg) &&
+  !isLowercaseSlug(seg) &&
+  !isPlaceholderSecretValue(seg);
+
+/**
+ * webhook 地址的合理长度远小于这个值（Teams 约 250 字符）。超长的只看开头：一整段 MB 级的连续 URL 字符
+ * 否则会被切成百万个路径段 / 标签——还是线性，但常数很重；令牌在开头 2KB 之内，照样命中。
+ */
+const MAX_WEBHOOK_URL_CHARS = 2048;
+
+/**
+ * 路径或查询里嵌着凭据的 webhook 地址：Slack `hooks.slack.com/services/T…/B…/<令牌>`、Discord `…/api/webhooks/<id>/<令牌>`、
+ * 飞书 / Lark `…/bot/v2/hook/<uuid>`、企业微信 `…/cgi-bin/webhook/send?key=<uuid>`、Teams `…webhook.office.com/webhookb2/…`。
+ * 地址本身就是密钥（拿到就能往群里发消息），却没有敏感键名、也不是 sk- / ghp_ 那种前缀形态——
+ * 以前只是被「URL 一律当高熵口令」顺带拦住；第 5 步不再看 URL 之后，改由这里按段精确判：
+ * host 标签或路径段里有**整词** hook(s) / webhook(s)，且路径段 / 查询值里有像随机凭据的段。每个 URL 最多报一条，返回被命中的那一段原值。
+ *
+ * 已知残余（R14 Q13-03 的取舍，不是遗漏；HANDOFF 同步记了）：
+ * - 路径里直接嵌着凭据、又没有整词 hook(s) 的地址（IFTTT `…/with/key/<key>`、`https://api.x.com/v1/<随机串>/export`）：
+ *   和文档 / 资源 id 在形态上分不开，以前只是被「URL 一律误报」顺带拦住，现在放过。Telegram `bot<id>:<token>` 形态明确，
+ *   已由 KNOWN_TOKEN_RULES 兜住；想补别的平台就像 Telegram 那样各加一条精确规则，不要靠降低上面的 16 位阈值
+ *  （降到 8 位，文档页里的 `services` / `reference` 之类就误报）。
+ * - Zapier catch hook（`hooks.zapier.com/hooks/catch/<数字>/<短 id>`）有 hooks 字样，但两段凭据都不足 16 位，同样放过。
+ * - hook 路径下的 Title-Case 文档 slug（`…/webhooks/Getting-Started-With-Webhooks`）会被报成令牌，因为 isLowercaseSlug 只豁免小写。
+ *   要豁免的话只认「用 - / _ 分隔、至少两段、每段都是单个单词（`[A-Z]?[a-z]+`）」：实测 100 万个随机 base64url 凭据，
+ *   24 位以上一个都不会被它放走（16 位 2 个）；而「全字母加分隔符」会放走 16 位的 2.4%、24 位的 0.84%。这是 P3，没做。
+ * - 注释行（`#` / `//` 开头）不走这里，只扫私钥 / 连接串 / 平台令牌：注释里贴的 webhook 地址放过（以前也放过）。
+ */
+const findWebhookUrlSecrets = (line: string): string[] => {
+  const out: string[] = [];
+  if (!line.includes("://")) return out;
+  for (const m of line.matchAll(URL_RE)) {
+    const url = m[0].slice(0, MAX_WEBHOOK_URL_CHARS);
+    const afterScheme = url.slice(url.indexOf("://") + 3);
+    const authorityEnd = afterScheme.search(/[/?#]/);
+    const authority =
+      authorityEnd === -1 ? afterScheme : afterScheme.slice(0, authorityEnd);
+    const host = authority.slice(authority.lastIndexOf("@") + 1).split(":")[0]!;
+    let rest = authorityEnd === -1 ? "" : afterScheme.slice(authorityEnd);
+    const hash = rest.indexOf("#");
+    if (hash !== -1) rest = rest.slice(0, hash);
+    const q = rest.indexOf("?");
+    const segs = (q === -1 ? rest : rest.slice(0, q)).split("/").filter(Boolean);
+    const isWebhook =
+      host.split(".").some((label) => WEBHOOK_WORD_RE.test(label)) ||
+      segs.some((seg) => WEBHOOK_WORD_RE.test(seg));
+    if (!isWebhook) continue;
+    const queryValues =
+      q === -1
+        ? []
+        : rest
+            .slice(q + 1)
+            .split(/[&;]/)
+            .map((kv) => kv.slice(kv.indexOf("=") + 1));
+    const cred = [...segs, ...queryValues].find(looksLikeWebhookCredential);
+    if (cred !== undefined) out.push(cred);
+  }
+  return out;
+};
+
+/** 标准 UUID（`8-4-4-4-12`）：资源 id / 请求 id，不是口令（键名敏感的 `token: <uuid>` 走 credential-key，不受影响） */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** npm / yarn 的 integrity（`sha512-<base64>`）与 `sha256:<hex>` 一类摘要前缀 */
+const DIGEST_VALUE_RE = /^sha(?:1|224|256|384|512)[-:]/i;
+
+/**
+ * 文件路径：含 `/`、全由路径字符组成，并且「最后一段带扩展名」（`src/lib/foo.ts`、`/Users/x/Foo.tsx`）。
+ * 刻意只认这一种：base64 / base64url 的字母表里没有 `.`，所以带扩展名的串不可能是 base64 口令——这是能论证「不会放走真口令」的唯一形态。
+ * 「以 `/` 开头」「以 `/` 结尾」「只是含 `/`」都不豁免：不含 `+` `=` 的 base64 口令（`wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`）
+ * 同样满足字符类、也可能恰好以 `/` 结尾；代价是目录路径 / refspec（`refs/remotes/origin/`）仍按以前的方式被判成高熵。
+ */
+const looksLikeFilePath = (s: string): boolean => {
+  if (!s.includes("/") || !/^[A-Za-z0-9_.~/-]+$/.test(s)) return false;
+  const last = s.slice(s.lastIndexOf("/") + 1);
+  const dot = last.lastIndexOf(".");
+  const ext = last.slice(dot + 1);
+  return dot >= 0 && ext.length >= 1 && ext.length <= 8 && /^[A-Za-z0-9]+$/.test(ext);
+};
+
+/** 高熵赋值里明确不是口令的值：UUID、npm integrity / sha 摘要、文件路径（R14 Q13-03） */
+const isBenignHighEntropyValue = (val: string): boolean =>
+  UUID_RE.test(val) || DIGEST_VALUE_RE.test(val) || looksLikeFilePath(val);
 
 const pushHit = (
   hits: SecretScanHit[],
@@ -1053,31 +1212,49 @@ export const scanSensitiveFiles = (
         pushHit(hits, file.path, lineNo, "credential-key", pair.label, secret);
       }
 
-      // 5) 高熵赋值（排除 hash/commit 语境）
+      // 5) 高熵赋值（URL 先抹掉，见 maskPlainUrls）。逐个候选看，但只有「良性值」才让位给后面的候选：
+      //    - 良性值（hash/commit 语境、UUID / 摘要 / 文件路径）：不报，也不能挡住同一行后面键名不敏感的真口令
+      //      （`{id: <uuid>, note: <口令>}`）——以前这些良性值自己会（误）命中、顺带把整行拦住，豁免之后没人再看后面了。
+      //    - 第一个真正被评估的候选：够高熵就报；不够高熵就整行放过（与以前一致）。继续往后看的话，
+      //      `kind: "background_subagents"; jobs: BackgroundSubagentJobView[]` 这类类型定义、Tailwind 类名里
+      //      后面的 CamelCase 标识符会被连带误报（语料差分里仓库自己就有 5 行）。
       let entropyHitOnLine = false;
-      const assign = HIGH_ENTROPY_ASSIGN_RE.exec(line);
-      if (assign) {
-        const left = line.slice(0, assign.index);
+      const entropyLine = maskPlainUrls(line);
+      for (const assign of entropyLine.matchAll(HIGH_ENTROPY_ASSIGN_RE)) {
         const val = assign[2]!;
-        if (!isHashContextKey(left) && looksHighEntropySecret(val)) {
-          // 已被 credential-key 覆盖的同行不再重复报高熵
-          if (!credentialHitOnLine) {
-            entropyHitOnLine = true;
-            pushHit(
-              hits,
-              file.path,
-              lineNo,
-              "high-entropy",
-              "高熵值 ",
-              val,
-            );
-          }
+        if (
+          hashContextBefore(entropyLine, assign.index) ||
+          isBenignHighEntropyValue(val)
+        ) {
+          continue;
+        }
+        // 已被 credential-key 覆盖的同行不再重复报高熵
+        if (looksHighEntropySecret(val) && !credentialHitOnLine) {
+          entropyHitOnLine = true;
+          pushHit(hits, file.path, lineNo, "high-entropy", "高熵值 ", val);
+        }
+        break;
+      }
+
+      // 5b) 路径 / 查询里嵌着凭据的 webhook 地址（第 5 步已抹掉 URL，这里兜住；同行已有 credential-key 命中就不重复报）
+      let webhookHitOnLine = false;
+      if (!credentialHitOnLine) {
+        for (const cred of findWebhookUrlSecrets(line)) {
+          webhookHitOnLine = true;
+          pushHit(
+            hits,
+            file.path,
+            lineNo,
+            "known-token",
+            "令牌(webhook URL) ",
+            cred,
+          );
         }
       }
 
       // 6) 值形态命中平台令牌（sk- / ghp_ / glpat- / xox*- / AKIA / Bearer；不依赖键名）
-      //    同行已被 credential-key / high-entropy 覆盖就不重复报
-      if (!credentialHitOnLine && !entropyHitOnLine) {
+      //    同行已被 credential-key / high-entropy / webhook 地址覆盖就不重复报
+      if (!credentialHitOnLine && !entropyHitOnLine && !webhookHitOnLine) {
         for (const t of findKnownTokens(line)) {
           pushHit(hits, file.path, lineNo, "known-token", t.label, t.value);
         }

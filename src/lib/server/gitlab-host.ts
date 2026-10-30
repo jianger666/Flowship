@@ -9,6 +9,7 @@
 import { deriveHostFromRepo } from "./submit-mr-guard";
 import {
   hasTrustedGitHostRecord,
+  normalizeGitHost,
   pinTrustedGitHostIfAbsent,
   type PinResult,
   type PinSource,
@@ -21,7 +22,10 @@ export const MULTI_GITLAB_HOST_ERROR = "多仓属于不同 GitLab 实例、暂�
  * 从已收集的 host 列表挑出唯一值。
  * - 全空 → null
  * - 多于一个不同 host → throw
- * - 恰好一个 → 返回该 host
+ * - 恰好一个 → 返回该 host（规整后的：小写、去尾点、去 `:443`）
+ *
+ * 比较前每个 host 都过 {@link normalizeGitHost}（Q21-03）：scp 写法与 https 写法、大小写不同、带尾点（FQDN）
+ * 指的是同一个 GitLab 实例，不该报「多仓属于不同实例」；规整不了的畸形值保持原样比较（各自成一类）。
  */
 export const pickUnifiedGitHost = (
   hosts: Array<string | null | undefined>,
@@ -29,7 +33,7 @@ export const pickUnifiedGitHost = (
   const unique = new Set<string>();
   for (const h of hosts) {
     const t = typeof h === "string" ? h.trim() : "";
-    if (t) unique.add(t);
+    if (t) unique.add(normalizeGitHost(t) ?? t);
   }
   if (unique.size === 0) return null;
   if (unique.size > 1) {

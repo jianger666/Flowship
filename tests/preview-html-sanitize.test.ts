@@ -4,9 +4,11 @@
  * - 正常 mammoth / SheetJS 风格输出（标题 / 列表 / 表格 / 链接 / 图片）原样保留
  * - 幂等：净化结果再净化不变
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { sanitizePreviewHtml } from "@/lib/preview-html-sanitize";
+
+import { cpuClock } from "./helpers/scaling-ratio";
 
 const ALLOWED_TAG_NAMES = new Set([
   "p", "br", "hr", "div", "span", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li",
@@ -203,13 +205,15 @@ const medianOf = (xs: number[]): number =>
  * - 先热身小档（让 JIT 稳定，避免首轮编译开销污染小档、把比例压低）；
  * - 小 / 大两档交替跑 rounds 轮、各取中位数（抵消单次 GC / 调度抖动）；
  * - now 可注入：自检时换成虚拟时钟，让「断言会不会红」不依赖真实耗时（确定性、不抖）。
+ *   默认是 CPU 时间（`helpers/scaling-ratio.ts` 的 cpuClock，不数被别的进程抢占的时间）：默认用墙钟时，
+ *   CPU 压力下这条线性守卫量出过「放大 10× 耗时放大 48.0×」（阈值 40，R14 Q18-04）。
  */
 const expectNearLinear = (
   fn: (input: string) => unknown,
   makeInput: (n: number) => string,
   opts: { small: number; rounds: number; now?: () => number },
 ): { ratio: number; smallMs: number; largeMs: number } => {
-  const now = opts.now ?? (() => performance.now());
+  const now = opts.now ?? cpuClock;
   const smallIn = makeInput(opts.small);
   const largeIn = makeInput(opts.small * SCALE_FACTOR);
   for (let i = 0; i < 3; i++) fn(smallIn);
@@ -287,5 +291,21 @@ describe("规模守卫自检：断言本身要抓得到 O(n²)、又不误报 O(
     expect(() =>
       expectNearLinear(fn, paragraphs, { small: 5_000, rounds: 5, now }),
     ).toThrow(/疑似超线性/);
+  });
+
+  it("默认计时源是 CPU 时间（R14 Q18-04）：不传 now 时整个过程一次都不读墙钟 performance.now", () => {
+    // 上面几条都显式传了虚拟 now，覆盖不到「默认值」——默认值被改回 performance.now 的话压力下会重新偶发红，没有别的用例会发现
+    const spy = vi.spyOn(performance, "now");
+    try {
+      expectNearLinear(
+        (s) => s.length,
+        (n) => "x".repeat(n),
+        { small: 1_000, rounds: 2 },
+      );
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(vi.isMockFunction(performance.now)).toBe(false);
   });
 });

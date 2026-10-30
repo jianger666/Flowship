@@ -75,7 +75,7 @@
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-import { dataRoot } from "./data-root";
+import { dataRoot, stripBom } from "./data-root";
 // 只取常量：git-token-env 对 settings-fs 只有 type import（编译期擦除），没有运行时依赖，不会成环
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 
@@ -250,8 +250,10 @@ const NO_SECRETS = Object.freeze([]) as unknown as RedactionSecret[];
 /**
  * 同步读某个凭据文件的值集合（事件写入热路径：只 stat 一次，文件没变就走缓存）。
  * 文件是 tmp+rename 原子写，inode / mtime / ctime / size 任一变化都会触发重读（纳秒精度）。
- * 读不到 / 没配 / 损坏 → 空集合（不脱敏、也绝不影响事件落盘）；失败不缓存，下次事件再试
- * （半写 / 瞬时 EBUSY 不能被钉成「没有凭据」）。
+ * 没配（ENOENT）→ 空集合。读不出来（半写 / 瞬时 EBUSY / 权限 / 手改坏）→ **沿用上一次读成功的凭据**：
+ * 不能让一次半写或一次手误，让这一段时间写盘的事件整体不脱敏；一次都没读成功过则与「没配」相同。
+ * 失败不动缓存条目：文件一变（stat 指纹不同）下个事件就会重读，半写 / 瞬时 EBUSY 不会被钉成「没有凭据」。
+ * 任何情况都不影响事件落盘。
  */
 const readSecretsCached = (
   slot: FileSlot,
@@ -273,7 +275,9 @@ const readSecretsCached = (
     ) {
       return hit.secrets;
     }
-    const secrets = extract(JSON.parse(readFileSync(file, "utf-8")) as unknown);
+    const secrets = extract(
+      JSON.parse(stripBom(readFileSync(file, "utf-8"))) as unknown,
+    );
     holder.files[slot] = {
       file,
       ino: st.ino,
@@ -283,10 +287,17 @@ const readSecretsCached = (
       secrets,
     };
     return secrets;
-  } catch {
-    // ENOENT / 半写 / 权限：本次视作没有可脱敏的凭据，下次事件再试
-    holder.files[slot] = null;
-    return NO_SECRETS;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      // 文件不存在 = 没配（含用户删了 config.json）：清缓存、空集合
+      holder.files[slot] = null;
+      return NO_SECRETS;
+    }
+    // 读不出来 ≠ 没配（半写 / 瞬时 EBUSY / 权限 / 手改坏）：沿用上一次读成功的凭据，缓存条目不动——
+    // 文件一变（stat 指纹不同）下个事件就会重读；一次都没读成功过则与「没配」相同。
+    // 只沿用**同一个文件**的缓存：数据目录换了（测试 / 多实例）时，别的文件的凭据不能拿来用。
+    const prev = holder.files[slot];
+    return prev && prev.file === file ? prev.secrets : NO_SECRETS;
   }
 };
 

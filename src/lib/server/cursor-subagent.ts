@@ -139,6 +139,20 @@ export const CURSOR_SUBAGENT_INPUT_JSON_SCHEMA = {
 /** 后台运行的护栏默认值：同时在跑的后台子代理数 / 单个后台子代理最长运行时间 */
 export const BACKGROUND_SUBAGENT_MAX_CONCURRENT = 4;
 export const BACKGROUND_SUBAGENT_MAX_RUNTIME_MS = 30 * 60 * 1000;
+/**
+ * 超时 cancel 之后给「子 run 收尾」的宽限：到点还没收尾就强制收尾（R14 Q11b-03）。
+ * SDK 的 `cancel()` 自己可能抛 / 被忽略 / 挂死——只发一次 cancel 就指望流会结束，job 就会永远留在表里：
+ * 占后台名额（4 个挂死后再也派不了）、占 resume 的 busy、让会话永不被空闲回收、侧栏一直转圈。
+ */
+export const BACKGROUND_SUBAGENT_CANCEL_GRACE_MS = 30_000;
+/** 发给 SDK 的 cancel / close 自己的硬上限：超过就放弃等待，收尾不能被它们拖住 */
+const SUBAGENT_SDK_CANCEL_DEADLINE_MS = 30_000;
+const SUBAGENT_SDK_CLOSE_DEADLINE_MS = 30_000;
+/**
+ * 前台已跑过头（超过上限）才转后台时的最短剩余时间：不立刻掐（给 1 秒），
+ * 但也不再多给一个完整的上限。maxRuntimeMs 比它还小（测试注入的小数值）时取 maxRuntimeMs 本身。
+ */
+const BACKGROUND_MIN_REMAINING_MS = 1_000;
 
 /** 开了后台运行的会话：在基础说明后追加的一段（数字取自本 link 实际生效的护栏） */
 export const cursorSubagentBackgroundNote = (limits: {
@@ -243,6 +257,11 @@ export interface CursorSubagentDeps {
     maxConcurrent?: number;
     /** 单个后台子代理最长运行时间，缺省 {@link BACKGROUND_SUBAGENT_MAX_RUNTIME_MS}；超时取消并按失败收尾 */
     maxRuntimeMs?: number;
+    /**
+     * 超时取消之后的宽限：到点子 run 还没收尾（cancel 失败 / 被忽略 / 流挂死）就强制按失败收尾，
+     * 缺省 {@link BACKGROUND_SUBAGENT_CANCEL_GRACE_MS}
+     */
+    cancelGraceMs?: number;
   };
   /**
    * 子代理过程记录（详情面板用：任务书全文 + 子代理自己的 thinking / 工具调用 / 回复）。
@@ -541,6 +560,7 @@ export const createCursorSubagentLink = (
   const bg = deps.background;
   const maxConcurrent = bg?.maxConcurrent ?? BACKGROUND_SUBAGENT_MAX_CONCURRENT;
   const maxRuntimeMs = bg?.maxRuntimeMs ?? BACKGROUND_SUBAGENT_MAX_RUNTIME_MS;
+  const cancelGraceMs = bg?.cancelGraceMs ?? BACKGROUND_SUBAGENT_CANCEL_GRACE_MS;
 
   /** 一次子代理调用（前台等待中 / 后台运行中）；收尾即从表里删 */
   interface Job {
@@ -555,6 +575,8 @@ export const createCursorSubagentLink = (
     detach?: () => void;
     /** 后台运行超时的计时器 */
     timer?: NodeJS.Timeout;
+    /** 超时 cancel 之后的宽限计时器：到点子 run 还没收尾就强制收尾（Q11b-03） */
+    graceTimer?: NodeJS.Timeout;
     timedOut?: boolean;
     /** 这次调用的过程记录（没配记录器 / 起不来时为空） */
     rec?: SubagentRunHandle;
@@ -649,6 +671,7 @@ export const createCursorSubagentLink = (
     outcome: { ok: true; text: string } | { ok: false; err: unknown },
   ): void => {
     if (job.timer) clearTimeout(job.timer);
+    if (job.graceTimer) clearTimeout(job.graceTimer);
     jobs.delete(job.id);
     if (!bg) return;
     // 先于 onSettled：这个子代理已经不在跑了，界面上的「后台工作中」条先更新，
@@ -689,22 +712,59 @@ export const createCursorSubagentLink = (
     }
   };
 
+  /**
+   * 超时终止子 run：cancel 加期限、失败 / 超时只告警。
+   * SDK 的 cancel 自己也会抛 / 挂死（半死连接），所以收尾**不指望它**——见 goBackground 的宽限计时器。
+   * 包一层 `.then`：cancel 同步抛错也变成 rejection，不会炸在计时器回调里。
+   */
+  const cancelRunBounded = async (run: SubagentChildRun): Promise<void> => {
+    try {
+      await withSdkDeadline(
+        Promise.resolve().then(() => run.cancel()),
+        SUBAGENT_SDK_CANCEL_DEADLINE_MS,
+        "subagent.cancel",
+      );
+    } catch (err) {
+      console.warn(
+        "[cursor-subagent] 后台子代理超时终止：cancel 失败 / 超时（宽限到点后强制收尾）：",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  };
+
   /** 把一个已在跑的 job 正式转成后台：计时 + 收尾时通知订阅方 */
   const goBackground = (
     job: Job,
     run: SubagentChildRun,
     settled: Promise<{ ok: true; text: string } | { ok: false; err: unknown }>,
+    /** 强制收尾：让 settle 里的赛跑以这个错误让位（cancel 无效时的最后手段） */
+    expire: (err: Error) => void,
   ): void => {
     job.background = true;
     job.detach = undefined;
     recSafe(() => job.rec?.setBackground(job.detached));
+    // 上限从「子代理开始」算，不是从转后台这一刻：前台已经跑的时间要扣掉
+    // （否则前台跑了 25 分钟再被插话转后台的，总共能跑 55 分钟，与提示词里承诺的「每个最长跑 N 分钟」不符）。
+    // 前台本身没有上限：转后台时已经超了的，短暂收尾（至少 1 秒），不再多给一个完整的上限
+    const remainingMs = maxRuntimeMs - Math.max(0, Date.now() - job.startedAt);
+    const delayMs = Math.max(
+      Math.min(BACKGROUND_MIN_REMAINING_MS, maxRuntimeMs),
+      remainingMs,
+    );
     job.timer = setTimeout(() => {
       // 只打标、不在这里给记录收尾：cancel 来得太晚时子 run 可能其实已经成功返回，
       // 主 AI 会收到 done——详情面板必须和主 AI 看到的一致。记录统一由 settle 按真实结局收尾
       // （超时被杀 → settle 看到 cancelled 且 job.timedOut，写成「失败·超时」）
       job.timedOut = true;
-      void run.cancel().catch(noop);
-    }, maxRuntimeMs);
+      void cancelRunBounded(run);
+      // 宽限：cancel 之后流 / wait 仍不结束（cancel 抛错 / 被忽略 / 流挂死）→ 强制收尾，
+      // 不留僵尸 job。正常收尾（settleBackground）会把这个计时器清掉
+      job.graceTimer = setTimeout(
+        () => expire(new Error(timeoutMessage())),
+        cancelGraceMs,
+      );
+      job.graceTimer.unref?.();
+    }, delayMs);
     job.timer.unref?.();
     void settled.then((outcome) => settleBackground(job, outcome));
     // 此刻起它算「后台在跑」：界面要画出来（前台转后台的那一刻同理）
@@ -793,9 +853,14 @@ export const createCursorSubagentLink = (
 
       const closeChild = async (c: SubagentChildAgent | undefined): Promise<void> => {
         try {
-          await Promise.resolve(c?.close?.());
+          // close 自己也可能挂（半死连接）：超过期限就放弃等待——收尾（摘 live / 放 busy / 通知后台清单）不能被它拖住
+          await withSdkDeadline(
+            Promise.resolve(c?.close?.()),
+            SUBAGENT_SDK_CLOSE_DEADLINE_MS,
+            "subagent.close",
+          );
         } catch {
-          /* 关闭失败不影响结果 */
+          /* 关闭失败 / 超时不影响结果 */
         }
       };
 
@@ -856,19 +921,38 @@ export const createCursorSubagentLink = (
         rec,
       };
 
+      // 强制收尾的出口：goBackground 的宽限计时器到点调 expire(err)，settle 里的赛跑随即让位（Q11b-03）
+      let abandoned = false;
+      let rejectExpiry!: (err: Error) => void;
+      const expiry = new Promise<never>((_, reject) => {
+        rejectExpiry = reject;
+      });
+      expiry.catch(noop); // settle 已收尾、没人在等时的 reject 不算未处理
+      const expire = (err: Error): void => {
+        abandoned = true;
+        rejectExpiry(err);
+      };
+
       /** 等子 run 跑完、产出给调用方的文本；收尾（摘 live / 关子 agent / 释放 busy）都在这里 */
       const settle = async (): Promise<string> => {
         try {
           let streamed = "";
-          try {
-            for await (const m of startedRun.stream()) {
-              streamed += toText(m);
-              recSafe(() => rec?.onMessage(m));
+          // 流 + wait 放进 drive，与 expiry 赛跑：cancel 无效 / 流挂死时 settle 不被它拖住——
+          // 否则永远走不到下面的 finally（子 agent 不关、busy 不放、job 不收尾）。
+          // 赛输的 drive 在后台自生自灭：它迟到的结果一律丢弃（成功路径的副作用都在赛跑之后）
+          const drive = async () => {
+            try {
+              for await (const m of startedRun.stream()) {
+                if (abandoned) break;
+                streamed += toText(m);
+                recSafe(() => rec?.onMessage(m));
+              }
+            } catch {
+              // 流中途断：终态以 wait() 为准（失败会在下面抛出来）
             }
-          } catch {
-            // 流中途断：终态以 wait() 为准（失败会在下面抛出来）
-          }
-          const res = await startedRun.wait();
+            return startedRun.wait();
+          };
+          const res = await Promise.race([drive(), expiry]);
           if (res.status === "cancelled") throw new Error(CANCELLED_TEXT);
           if (res.status !== "finished") {
             const partial = (res.result ?? streamed).trim();
@@ -922,7 +1006,7 @@ export const createCursorSubagentLink = (
       if (wantsBackground) {
         jobs.set(job.id, job);
         releaseSlot(); // 已登记进 jobs，从此算进 backgroundRunning
-        goBackground(job, startedRun, settled);
+        goBackground(job, startedRun, settled, expire);
         return (
           `已在后台启动子代理「${job.description}」（后台任务 ${job.id}）。` +
           "它做完后系统会把它的输出作为一条消息发给你——不用轮询、也不要等它，现在可以继续做别的事、或回应用户。"
@@ -938,7 +1022,7 @@ export const createCursorSubagentLink = (
         const first = await Promise.race([settled, detachedP]);
         if (first === "detached") {
           job.detached = true;
-          goBackground(job, startedRun, settled);
+          goBackground(job, startedRun, settled, expire);
           return (
             `[这个子代理已转到后台继续运行] 用户有新的话要先跟你说。子代理「${job.description}」（后台任务 ${job.id}）还在干活，` +
             "做完后系统会把它的输出作为一条消息发给你；现在先回应用户，不要等它。"

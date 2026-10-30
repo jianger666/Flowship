@@ -34,7 +34,13 @@ import type {
   TokenUsageRollup,
   UserRole,
 } from "@/lib/types";
-import { dataRoot, RenameAbortedError, renameWithRetry } from "./data-root";
+import {
+  dataRoot,
+  RenameAbortedError,
+  renameWithRetry,
+  stripBom,
+  writeFileFsynced,
+} from "./data-root";
 import { isDirGoneError } from "./fs-gone";
 import { serializeEventLineRedacted } from "./event-secret-redact";
 import { failpoint } from "./failpoints";
@@ -345,7 +351,7 @@ const parseMetaText = (text: string): MetaTextParse => {
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(stripBom(text));
   } catch (e) {
     const pos = /position (\d+)/.exec(e instanceof Error ? e.message : "")?.[1];
     return {
@@ -417,7 +423,7 @@ export const readMetaRaw = async (id: string): Promise<unknown | null> => {
     );
   }
   try {
-    return JSON.parse(raw);
+    return JSON.parse(stripBom(raw));
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(
@@ -474,7 +480,7 @@ const parseMetaEvidence = (raw: string, id: string): MetaEvidenceRead => {
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripBom(raw));
   } catch (e) {
     return { kind: "unknown", error: e };
   }
@@ -572,33 +578,8 @@ export const inspectMetaCorruptionSync = (id: string): CorruptTaskInfo | null =>
   };
 };
 
-/**
- * 写文件并 fsync（meta 原子写的 tmp 阶段用）。
- *
- * 为什么：只有 tmp + rename 时，断电 / 内核崩溃可能出现「rename 已持久化、tmp 的数据块没落盘」
- * ——meta.json 变成空文件或半截文件，任务整个读不出来。rename 之前 fsync(tmp) 才能保证
- * rename 之后看到的一定是完整内容。
- *
- * fsync 本身失败（个别网络盘 / 文件系统不支持）只 warn、不挡写：效果不会比改前（完全不 fsync）更差。
- */
-const writeFileFsynced = async (
-  filePath: string,
-  content: string,
-): Promise<void> => {
-  const fh = await fs.open(filePath, "w");
-  try {
-    await fh.writeFile(content, "utf-8");
-    await fh.sync().catch((err: unknown) => {
-      console.warn(
-        `[task-fs] meta fsync 失败（忽略、继续 rename）：${
-          (err as NodeJS.ErrnoException)?.code ?? String(err)
-        }`,
-      );
-    });
-  } finally {
-    await fh.close();
-  }
-};
+// 「tmp 阶段写 + fsync」的 writeFileFsynced 已下沉到 data-root.ts（Q9-04），与 writePrivateFileAtomic /
+// chat-checkpoint 的原子写共用同一份实现；meta 与 .bak 的原子写仍在下面调用它（只是不再在本文件定义）。
 
 /**
  * 覆盖写 meta.json 之前，把「当前有效的旧 meta」滚成 meta.json.bak。
@@ -791,36 +772,195 @@ const MAX_EVENTS_TAIL_RAW = 50_000;
 /** 反向读尾部时每块字节数——IO 量跟「要的条数 × 平均行宽」同阶，不跟文件总长 */
 const EVENTS_TAIL_CHUNK = 64 * 1024;
 
-/** 解析一行 JSONL（容忍 CRLF、空行、崩溃半行） */
-const parseEventLine = (raw: string): TaskEvent | null => {
+/** 一行 JSONL 的分类：事件 / 空白行（正常）/ 坏行（非空但解析不了：崩溃半行、断电后的全 0 填充、磁盘问题） */
+type EventLineClass =
+  | { kind: "event"; event: TaskEvent }
+  | { kind: "blank" }
+  | { kind: "bad" };
+
+/**
+ * 分类一行 JSONL（容忍 CRLF、空行）。
+ *
+ * 事件一定是 JSON 对象：`null` / 数字 / 字符串 / 布尔 / 数组虽然是合法 JSON，却不可能是事件，算坏行（丢弃并计数）。
+ * 旧实现对它们不一致——全量读把 `123` 之类当事件塞进列表（下游读 `ev.kind` 得 undefined）、尾部读只丢 falsy 值；
+ * 这里两条路径统一（审查 AI 预审 P3）。
+ */
+const classifyEventLine = (raw: string): EventLineClass => {
   const text = raw.trim();
-  if (!text) return null;
+  if (!text) return { kind: "blank" };
   try {
-    return JSON.parse(text) as TaskEvent;
+    const parsed: unknown = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? { kind: "event", event: parsed as TaskEvent }
+      : { kind: "bad" };
   } catch {
-    return null;
+    return { kind: "bad" };
   }
 };
 
-/** 从 Buffer 行去 CR 再 parse（反向按字节扫 \n 时用） */
+/** 按字节行（去尾部 CR）分类——反向按字节扫 \n 时用 */
+const classifyEventLineBuf = (buf: Buffer): EventLineClass => {
+  const s =
+    buf.length > 0 && buf[buf.length - 1] === 0x0d
+      ? buf.subarray(0, buf.length - 1)
+      : buf;
+  return classifyEventLine(s.toString("utf-8"));
+};
+
+/** 从 Buffer 行去 CR 再 parse（反向按字节扫 \n 时用；空行 / 坏行 → null） */
 export const parseEventLineBuf = (buf: Buffer): TaskEvent | null => {
-  let s = buf;
-  if (s.length > 0 && s[s.length - 1] === 0x0d) s = s.subarray(0, s.length - 1);
-  return parseEventLine(s.toString("utf-8"));
+  const c = classifyEventLineBuf(buf);
+  return c.kind === "event" ? c.event : null;
+};
+
+// ----- 坏行（Q9-08）：读到了就不能再静默 -----
+
+/**
+ * 一次读取里「非空但解析不了」的行（崩溃半行 / 断电后的全 0 填充 / 磁盘问题）。偏移与长度的单位都是字节。
+ * 只在有坏行时出现；只统计**这次读到的范围**（尾部读取不会再去数更早的）。
+ */
+export interface SkippedEventLines {
+  /** 这次读取范围内跳过了多少行 */
+  count: number;
+  /** 其中最靠文件头的一条：行首字节偏移 */
+  firstOffset: number;
+  /** 那一行的长度（字节，不含换行） */
+  firstLength: number;
+}
+
+/** 累加坏行统计（用对象而不是闭包里给 let 赋值：后者会被 TS 控制流窄化成 null） */
+const createSkipTracker = () => {
+  let count = 0;
+  let firstOffset = 0;
+  let firstLength = 0;
+  return {
+    note: (offset: number, length: number): void => {
+      if (count === 0 || offset < firstOffset) {
+        firstOffset = offset;
+        firstLength = length;
+      }
+      count += 1;
+    },
+    result: (): SkippedEventLines | null =>
+      count === 0 ? null : { count, firstOffset, firstLength },
+  };
+};
+
+/**
+ * 这条坏行算不算「被跳过的记录」。
+ *
+ * 文件尾**没有换行结尾**的最后一段不算：要么是 append 正在写的一行（读者瞬时读到半行，下一次读就完整了），
+ * 要么是崩溃留下的半行——后者在下一次 append 时会被补 `\n` 隔离成中间坏行，到那时再算。
+ * 唯一的例外是含 NUL（0x00）的尾段：JSON 文本里不会有裸 NUL，那是断电后「文件长度已更新、数据块全 0」的典型症状，
+ * 不可能是正在写的行，直接算。
+ */
+const countsAsSkipped = (line: Buffer, unterminatedTail: boolean): boolean =>
+  !unterminatedTail || line.includes(0);
+
+/** 每进程每任务只 warn 一次（读路径很热、坏行不会自己消失，不能每次读都刷日志）；挂 globalThis 防 dev 下 chunk 分裂 */
+const SKIPPED_WARNED_KEY = "__flowshipSkippedEventLinesWarnedV1__";
+const SKIPPED_WARNED_MAX = 2000;
+const getSkippedWarned = (): Set<string> => {
+  const g = globalThis as unknown as Record<string, Set<string> | undefined>;
+  if (!g[SKIPPED_WARNED_KEY]) g[SKIPPED_WARNED_KEY] = new Set();
+  return g[SKIPPED_WARNED_KEY]!;
+};
+
+/** 仅供测试：清掉「已 warn 过」的记录 */
+export const __resetSkippedEventLinesWarnedForTests = (): void => {
+  getSkippedWarned().clear();
+};
+
+/**
+ * 读到坏行就记一条日志：任务 id、条数、首处的字节偏移与长度；**不含行内容**（里面可能有凭据）。
+ * 日志会进 main.log / 诊断包——排障时能直接 `dd` / `xxd` 到那个偏移看。
+ */
+const reportSkippedEventLines = (taskId: string, s: SkippedEventLines): void => {
+  const warned = getSkippedWarned();
+  if (warned.has(taskId)) return;
+  if (warned.size >= SKIPPED_WARNED_MAX) warned.clear();
+  warned.add(taskId);
+  console.warn(
+    `[task-fs] events.jsonl 有 ${s.count} 条记录无法解析、已跳过（task=${taskId}，首处在字节偏移 ${s.firstOffset}、长 ${s.firstLength} 字节）；` +
+      "多半是崩溃 / 断电 / 磁盘问题留下的半行或全 0 填充。文件本身没有被改动，同一进程内不再重复提示。",
+  );
+};
+
+/**
+ * 把 events.jsonl 的原始字节按 `\n` 切成行，逐行回调：行内容（不含 `\n`）、行首字节偏移、
+ * 是否是「文件尾没有换行结尾的最后一段」。与旧的 `split(/\r?\n/)` 等价（CR 留给分类函数去掉）。
+ */
+const forEachEventLine = (
+  raw: Buffer,
+  onLine: (line: Buffer, start: number, unterminatedTail: boolean) => void,
+): void => {
+  let pos = 0;
+  while (pos < raw.length) {
+    const nl = raw.indexOf(0x0a, pos);
+    const end = nl < 0 ? raw.length : nl;
+    onLine(raw.subarray(pos, end), pos, nl < 0);
+    if (nl < 0) break;
+    pos = nl + 1;
+  }
+};
+
+/**
+ * 全量读 events.jsonl，并带回这次跳过的坏行统计（没有坏行 = null）。
+ * 读到坏行会 warn 一次（每进程每任务）；调用方想让用户知道，就把 `skipped.count` 放进 Task。
+ */
+export const readEventsWithStats = async (
+  id: string,
+): Promise<{ events: TaskEvent[]; skipped: SkippedEventLines | null }> => {
+  const p = path.join(taskDir(id), EVENTS_FILE);
+  if (!(await exists(p))) return { events: [], skipped: null };
+  const raw = await fs.readFile(p);
+  const events: TaskEvent[] = [];
+  const skip = createSkipTracker();
+  forEachEventLine(raw, (line, start, unterminatedTail) => {
+    const c = classifyEventLineBuf(line);
+    if (c.kind === "event") events.push(c.event);
+    else if (c.kind === "bad" && countsAsSkipped(line, unterminatedTail)) {
+      skip.note(start, line.length);
+    }
+  });
+  const skipped = skip.result();
+  if (skipped) reportSkippedEventLines(id, skipped);
+  return { events, skipped };
 };
 
 /**
  * 全量读 events.jsonl（诊断包 / 真需要全量的路径）。
  * 长任务热点路径请用 readEventsTail / readEventsBefore。
  */
-export const readEvents = async (id: string): Promise<TaskEvent[]> => {
+export const readEvents = async (id: string): Promise<TaskEvent[]> =>
+  (await readEventsWithStats(id)).events;
+
+/**
+ * 全量读 events.jsonl，同时带回**每条有效事件所在行的行首字节偏移**和整份原始字节。
+ * 回退重写用：要「保留目标事件之前的原文」（含坏行 / 空行 / CRLF），就得知道目标行从哪个字节开始。
+ * `offsets[i]` 对应 `events[i]`。文件不存在 → 三者都是空。
+ */
+export const readEventsWithOffsets = async (
+  id: string,
+): Promise<{ events: TaskEvent[]; offsets: number[]; raw: Buffer }> => {
   const p = path.join(taskDir(id), EVENTS_FILE);
-  if (!(await exists(p))) return [];
-  const raw = await fs.readFile(p, "utf-8");
-  return raw
-    .split(/\r?\n/)
-    .map((line) => parseEventLine(line))
-    .filter((x): x is TaskEvent => x !== null);
+  if (!(await exists(p))) return { events: [], offsets: [], raw: Buffer.alloc(0) };
+  const raw = await fs.readFile(p);
+  const events: TaskEvent[] = [];
+  const offsets: number[] = [];
+  const skip = createSkipTracker();
+  forEachEventLine(raw, (line, start, unterminatedTail) => {
+    const c = classifyEventLineBuf(line);
+    if (c.kind === "event") {
+      events.push(c.event);
+      offsets.push(start);
+    } else if (c.kind === "bad" && countsAsSkipped(line, unterminatedTail)) {
+      skip.note(start, line.length);
+    }
+  });
+  const skipped = skip.result();
+  if (skipped) reportSkippedEventLines(id, skipped);
+  return { events, offsets, raw };
 };
 
 /** 倒着找满足条件的最后一个下标（没有 = -1；不依赖 ES2023 的 findLastIndex） */
@@ -845,7 +985,12 @@ export const readEventsTail = async (
   id: string,
   n: number,
   opts?: { anchor?: (ev: TaskEvent) => boolean },
-): Promise<{ events: TaskEvent[]; hasMore: boolean }> => {
+): Promise<{
+  events: TaskEvent[];
+  hasMore: boolean;
+  /** 这次读到的范围里跳过的坏行（没有坏行 = 不带这个字段；Q9-08） */
+  skipped?: SkippedEventLines;
+}> => {
   const limit = Math.max(0, Math.min(Math.floor(n), MAX_EVENTS_TAIL));
   if (limit === 0) return { events: [], hasMore: false };
   const anchor = opts?.anchor;
@@ -865,6 +1010,11 @@ export const readEventsTail = async (
     let carry = Buffer.alloc(0);
     // collected[0] = 文件中最后一条有效事件（倒序）
     const collected: TaskEvent[] = [];
+    // 文件不是以换行结尾 → 从右数第一行是「没结束的尾段」（append 正在写 / 崩溃半行），坏行统计要区别对待
+    const lastByte = Buffer.alloc(1);
+    await fh.read(lastByte, 0, 1, size - 1);
+    let tailPending = lastByte[0] !== 0x0a;
+    const skip = createSkipTracker();
 
     while (pos > 0 && collected.length < MAX_EVENTS_TAIL_RAW) {
       const toRead = Math.min(EVENTS_TAIL_CHUNK, pos);
@@ -874,25 +1024,35 @@ export const readEventsTail = async (
       const data = Buffer.concat([buf.subarray(0, bytesRead), carry]);
 
       // 按字节找 \n，再整行 decode——避免 UTF-8 多字节字符被块边界切断后乱码
-      const linesFromRight: Buffer[] = [];
+      // start = 该行行首的文件偏移（data[i] 对应文件偏移 pos + i）；tail = 文件尾没结束的最后一段
+      const linesFromRight: Array<{ buf: Buffer; start: number; tail: boolean }> = [];
+      const pushLine = (buf: Buffer, start: number): void => {
+        linesFromRight.push({ buf, start, tail: tailPending });
+        tailPending = false; // 只有从右数第一行可能是尾段
+      };
       let end = data.length;
       for (let i = data.length - 1; i >= 0; i--) {
         if (data[i] !== 0x0a) continue;
-        linesFromRight.push(data.subarray(i + 1, end));
+        pushLine(data.subarray(i + 1, end), pos + i + 1);
         end = i;
       }
       if (pos > 0) {
         carry = data.subarray(0, end);
       } else {
         carry = Buffer.alloc(0);
-        if (end > 0) linesFromRight.push(data.subarray(0, end));
+        if (end > 0) pushLine(data.subarray(0, end), 0);
       }
 
       let hitRawCap = false;
-      for (const lineBuf of linesFromRight) {
-        const ev = parseEventLineBuf(lineBuf);
-        if (!ev) continue; // 空行 / 崩溃半行 / 坏 JSON
-        collected.push(ev);
+      for (const line of linesFromRight) {
+        const c = classifyEventLineBuf(line.buf);
+        if (c.kind === "blank") continue;
+        if (c.kind === "bad") {
+          // 崩溃半行 / 全 0 填充 / 坏 JSON：照旧跳过，但要记下来（Q9-08）
+          if (countsAsSkipped(line.buf, line.tail)) skip.note(line.start, line.buf.length);
+          continue;
+        }
+        collected.push(c.event);
         if (collected.length >= MAX_EVENTS_TAIL_RAW) {
           hitRawCap = true;
           break;
@@ -919,7 +1079,9 @@ export const readEventsTail = async (
     const hasMore =
       pos > 0 || start > 0 || collected.length >= MAX_EVENTS_TAIL_RAW;
     const events = start > 0 ? coalesced.slice(start) : coalesced;
-    return { events, hasMore };
+    const skipped = skip.result();
+    if (skipped) reportSkippedEventLines(id, skipped);
+    return skipped ? { events, hasMore, skipped } : { events, hasMore };
   } finally {
     await fh.close();
   }
@@ -1063,9 +1225,17 @@ export const readEventsBefore = async (
 
     // 倒序收集：collected[0] = 紧邻锚点之前的那条。多收 1 条只为判 hasMore
     const collected: Array<{ ev: TaskEvent; start: number }> = [];
+    const skip = createSkipTracker();
     await scanLinesBackward(fh, startPos, (lineBuf, lineStart) => {
-      const ev = parseEventLineBuf(lineBuf);
-      if (!ev) return true; // 空行 / 崩溃半行 / 坏 JSON
+      const c = classifyEventLineBuf(lineBuf);
+      if (c.kind === "blank") return true;
+      if (c.kind === "bad") {
+        // 崩溃半行 / 全 0 填充 / 坏 JSON：照旧跳过，但要记下来（Q9-08）。
+        // 只数锚点之后「这页 / 更早」的：锚点更靠文件尾的行不是这次翻页要的（文件尾还可能是 append 正在写的半行）
+        if (anchorFound) skip.note(lineStart, lineBuf.length);
+        return true;
+      }
+      const ev = c.event;
       if (!anchorFound) {
         if (ev.id === beforeId) {
           anchorFound = true;
@@ -1079,6 +1249,8 @@ export const readEventsBefore = async (
 
     if (!anchorFound) return { events: [], hasMore: false };
     rememberAnchorOffset(id, beforeId, anchorStart);
+    const skipped = skip.result();
+    if (skipped) reportSkippedEventLines(id, skipped);
 
     const hasMore = collected.length > page;
     const pageItems = hasMore ? collected.slice(0, page) : collected;
@@ -1478,7 +1650,41 @@ const eventsFileTailNeedsNewline = async (file: string): Promise<boolean> => {
 };
 
 /**
+ * append 的瞬时错误退避（R14 B2-2 / Q9-01）：Windows 上杀软 / 索引器短暂占用 events.jsonl 时
+ * `appendFile` 会抛 EBUSY / EPERM / EACCES，等一会儿就好。3 次 50 / 100 / 200ms，合计 ≤350ms——
+ * append 链是 per-task 串行的热路径，不能像 `renameWithRetry`（5 次、每次更长）那样等得更久；
+ * 穿透后照旧抛给上层。
+ *
+ * 哪些算「瞬时」按平台分（审查 AI 预审 F2 订正）：
+ *   - EBUSY：全平台（资源被占用，本来就是「等一下」的语义）；
+ *   - EPERM / EACCES：**仅 win32**。mac / Linux 上它们基本是永久的权限问题（只读文件、immutable 标志、目录无写权限），
+ *     重试只会让每个事件白等 350ms。
+ */
+const APPEND_RETRY_DELAYS_MS = [50, 100, 200] as const;
+
+export const isTransientAppendError = (
+  err: unknown,
+  platform: NodeJS.Platform = process.platform,
+): boolean => {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "EBUSY") return true;
+  return (code === "EPERM" || code === "EACCES") && platform === "win32";
+};
+
+const realAppendRetrySleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+let appendRetrySleep: (ms: number) => Promise<void> = realAppendRetrySleep;
+
+/** 测试专用：注入退避等待（用例里不真等）；不传 = 恢复真实等待。 */
+export const __setAppendRetrySleepForTests = (
+  fn?: (ms: number) => Promise<void>,
+): void => {
+  appendRetrySleep = fn ?? realAppendRetrySleep;
+};
+
+/**
  * 实际 append（无串行）。
+ * 瞬时占用类错误（见 {@link isTransientAppendError}）在这里退避重试；其余错误、重试穿透都原样抛出。
  * @returns true=已写入；false=ENOENT（任务目录已删、透传给上层不 publish）
  */
 const appendEventLineUnlocked = async (
@@ -1490,25 +1696,34 @@ const appendEventLineUnlocked = async (
   // 目录没了 = 任务已删 → ENOENT 返 false（上层不构造成功、不 publish 幽灵事件）。
   const file = path.join(taskDir(id), EVENTS_FILE);
   const verified = getEventTailVerified();
-  try {
-    const healNewline = verified.has(id)
-      ? false
-      : await eventsFileTailNeedsNewline(file);
-    await fs.appendFile(
-      file,
-      // 落盘前精确脱敏 gitToken / apiKey / 公司环境密码（agent 读 config.json / company-env.json
-      // 取凭据会让它进 tool_result）；命中时原地改 ev，之后 publish 的也是脱敏版
-      (healNewline ? "\n" : "") + serializeEventLineRedacted(ev) + "\n",
-      "utf-8",
-    );
-    verified.add(id);
-    return true;
-  } catch (err) {
-    // 写失败可能留下半行：下次写前重新核对末字节
-    verified.delete(id);
-    // 任务目录已删 → false（第五轮 Q3-08：macOS 并发删除时可能是 EINVAL / ENOTDIR 而不只是 ENOENT，见 fs-gone.ts）
-    if (await isDirGoneError(err, taskDir(id))) return false;
-    throw err;
+  // 每次失败都会清掉 `verified`，所以重试时会重新核对末字节：上一次若留下半行，这次先补换行把它隔离开，
+  // 不会和新事件粘成一行。
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const healNewline = verified.has(id)
+        ? false
+        : await eventsFileTailNeedsNewline(file);
+      await fs.appendFile(
+        file,
+        // 落盘前精确脱敏 gitToken / apiKey / 公司环境密码（agent 读 config.json / company-env.json
+        // 取凭据会让它进 tool_result）；命中时原地改 ev，之后 publish 的也是脱敏版
+        (healNewline ? "\n" : "") + serializeEventLineRedacted(ev) + "\n",
+        "utf-8",
+      );
+      verified.add(id);
+      return true;
+    } catch (err) {
+      // 写失败可能留下半行：下次写前重新核对末字节
+      verified.delete(id);
+      // 任务目录已删 → false（第五轮 Q3-08：macOS 并发删除时可能是 EINVAL / ENOTDIR 而不只是 ENOENT，见 fs-gone.ts）
+      if (await isDirGoneError(err, taskDir(id))) return false;
+      const delay = APPEND_RETRY_DELAYS_MS[attempt];
+      if (delay !== undefined && isTransientAppendError(err)) {
+        await appendRetrySleep(delay);
+        continue;
+      }
+      throw err;
+    }
   }
 };
 
@@ -1559,6 +1774,10 @@ export const withEventAppendChain = async <T>(
  * @param lease 可选；在 chain 回调内、appendFile 之前同步执行。
  *   false → 跳过写盘、返 false（堵死「检查通过后入队、B claim、队列才执行 A」）。
  * @param onCommitted 可选；写行成功且 failpoint 通过后、仍在链内同步调用。
+ * @param onPersistFailed 可选（R14 B2-2）；`appendFile` 抛错（磁盘满 / 只读 / IO 错误 / 重试穿透……）时，
+ *   在链内、**先摘掉 `ev.seq`**（seq 计数器不回滚、留空洞，理由见 catch 内注释）之后同步调用，随后照旧把错误抛给调用方。
+ *   用途：让上层把「没落盘」的事件仍推给在线订阅者（用户至少这一刻看得见），并置存储降级标志。
+ *   回调自己抛错会被吞掉（不得盖掉原始写盘错误、更不得断链）。ENOENT（目录已删）不走这里。
  * @returns true=已 append；false=lease 拒写或 ENOENT
  */
 export const appendEventLine = async (
@@ -1566,26 +1785,58 @@ export const appendEventLine = async (
   ev: TaskEvent,
   lease?: () => boolean,
   onCommitted?: (event: TaskEvent) => void,
+  onPersistFailed?: (event: TaskEvent, err: unknown) => void,
 ): Promise<boolean> => {
   // lease 必须在 chain 内、appendFile 前同步验——入队后失主则拒写
   const run = async (): Promise<boolean> => {
     await failpoint("event.inQueue");
     // lease 拒绝路径不发号（不烧号）；发号紧挨即将 appendFile
     if (lease && !lease()) return false;
+    // 通知上层「这条没落盘」；回调自己抛错只记日志——不得盖掉原始写盘错误、更不得断链
+    const notifyPersistFailed = (err: unknown): void => {
+      if (!onPersistFailed) return;
+      try {
+        onPersistFailed(ev, err);
+      } catch (cbErr) {
+        console.error(
+          `[task-fs-core] onPersistFailed 抛错 task=${id}：`,
+          cbErr,
+        );
+      }
+    };
     // Map miss（stop 后 / 进程重启）→ 先从 durable 尾部恢复再发号
-    await ensureEventSeqCounter(id);
+    try {
+      await ensureEventSeqCounter(id);
+    } catch (err) {
+      // 恢复 seq 水位要读盘；读失败（EIO…）同样意味着这条事件落不了盘。此时还没发号，无需回滚
+      notifyPersistFailed(err);
+      throw err;
+    }
     // 链内、lease 通过后发号——与写盘 / publish 同序
-    ev.seq = nextEventSeq(id);
+    const seq = nextEventSeq(id);
+    ev.seq = seq;
     // ENOENT 透传 false——上层 appendEvent 返 null、write* 不 publish
-    const ok = await appendEventLineUnlocked(id, ev);
+    let ok: boolean;
+    try {
+      ok = await appendEventLineUnlocked(id, ev);
+    } catch (err) {
+      // 写盘抛错（磁盘满 / 只读 / IO 错误 / 瞬时占用重试穿透）。**不回滚 seq 计数器**——保持旧行为：烧号、seq 留空洞。
+      // 理由（审查 AI 预审 F3）：appendFile 抛错 ≠「一个字节都没写」，整行已写入后才在 flush / close 阶段抛 EIO 同样存在；
+      // 此时若回滚，下一条事件会复用同一个号，盘上出现两行同 seq，破坏「唯一单调」。空洞无害（前端 / 飞书不依赖 seq 连续）。
+      // 只摘掉 ev.seq：上层会把这条事件当「没落盘」推给在线订阅者，不能让它带着一个盘上未必存在的号。
+      // （下面 ENOENT 分支的回滚保留——那是「目录已删、确定没写」。）
+      delete ev.seq;
+      notifyPersistFailed(err);
+      throw err;
+    }
     if (!ok) {
       // 未落盘——回退刚发的号，避免烧号空洞
-      rollbackEventSeq(id, ev.seq);
+      rollbackEventSeq(id, seq);
       delete ev.seq;
       return false;
     }
     // 落盘成功后批量推进 sidecar（每 N 条异步原子写，非每条同步）
-    maybeFlushSeqSidecar(id, ev.seq);
+    maybeFlushSeqSidecar(id, seq);
     // 写行成功后、publish 前——矩阵可挂起证明 B 不能插队 publish
     await failpoint("event.beforePublish");
     // onCommitted（通常 publish）抛错不得断 append 链——写盘已成功，吞错继续放链
@@ -1609,7 +1860,7 @@ export const appendEventLine = async (
 export const readSessionAgentIdSync = (taskId: string): string | undefined => {
   try {
     const raw = JSON.parse(
-      readFileSync(path.join(taskDir(taskId), META_FILE), "utf-8"),
+      stripBom(readFileSync(path.join(taskDir(taskId), META_FILE), "utf-8")),
     ) as { sessionAgentId?: unknown };
     return typeof raw.sessionAgentId === "string"
       ? raw.sessionAgentId
@@ -1682,22 +1933,27 @@ export const assembleTask = (
  * - 读全量 events.jsonl + 每条 action 的 artifact、组合成完整 Task object
  */
 export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
-  const events = await readEvents(meta.id);
-  return assembleTask(meta, events);
+  const { events, skipped } = await readEventsWithStats(meta.id);
+  const task = assembleTask(meta, events);
+  // 有坏行才带这个字段（Q9-08）：前端据此告诉用户「有几条记录读不出来」，而不是让它们悄悄消失
+  if (skipped) task.eventsSkipped = skipped.count;
+  return task;
 };
 
 /**
  * meta → Task，只带尾部 n 条事件（长任务详情 / SSE bootstrap 用）。
  * eventsTruncated = hasMore（文件里还有更早事件）。
+ * eventsSkipped = 这次读到的范围里被跳过的坏行数（只在有坏行时带；不去数更早的、没读到的部分）。
  */
 export const hydrateTaskWithTailEvents = async (
   meta: TaskMetaV06,
   tail: number,
   opts?: { anchor?: (ev: TaskEvent) => boolean },
 ): Promise<Task> => {
-  const { events, hasMore } = await readEventsTail(meta.id, tail, opts);
+  const { events, hasMore, skipped } = await readEventsTail(meta.id, tail, opts);
   const task = assembleTask(meta, events);
   if (hasMore) task.eventsTruncated = true;
+  if (skipped) task.eventsSkipped = skipped.count;
   return task;
 };
 

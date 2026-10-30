@@ -120,7 +120,13 @@ export type GetMRResult =
   | { ok: false; error: string };
 
 export type MergeMRResult =
-  | { ok: true; url: string; iid: number }
+  | {
+      ok: true;
+      url: string;
+      iid: number;
+      /** 这次没有真的合并：MR 在我们动手前已经是 merged（双击 / 两个窗口 / 别人先合了），按成功处理 */
+      alreadyMerged?: true;
+    }
   | { ok: false; error: string };
 
 /** GitLab REST 统一超时——无超时会在网络挂死时拖死 ship / 关旧 MR */
@@ -170,19 +176,57 @@ const encodeProjectPath = (projectPath: string): string => {
 };
 
 /**
+ * 状态行 + 详情拼接。GitLab 的 405 / 404 等常把状态行原样塞进 message（`{"message":"405 Method Not Allowed"}`），
+ * 直接拼会得到「405 Method Not Allowed: 405 Method Not Allowed」（Q10-05）。detail 自己以状态码打头（整句状态行也算）/
+ * 就是 statusText → 只留一份。
+ * 结果仍以状态码开头：`isMergeShaMismatch` 把「409 开头」当兜底判据（见 mr-merge-error.ts），不能丢。
+ * HTTP/2 下 statusText 为空：状态行 trim 后只剩状态码，不会出现「405 : …」。
+ */
+const joinStatusAndDetail = (
+  res: Response,
+  status: string,
+  detail: string,
+): string => {
+  const d = detail.trim();
+  if (!d) return status;
+  const text = res.statusText.trim().toLowerCase();
+  if (text && d.toLowerCase() === text) return status;
+  if (new RegExp(`^${res.status}\\b`).test(d)) return d;
+  return `${status}: ${d}`;
+};
+
+/** message 数组里的单项 → 字符串（对象不展开成 [object Object]） */
+const stringifyDetail = (item: unknown): string => {
+  if (typeof item === "string") return item;
+  if (item === null || item === undefined) return "";
+  return JSON.stringify(item).slice(0, 200);
+};
+
+/**
  * 解析 GitLab API 错误响应、返人类可读的错误字符串
  *
  * GitLab 错误格式有几种：
  *   - { message: "..." }
+ *   - { message: ["...", "..."] }（数组：逐条用「；」拼，不显示成 `0: …`）
  *   - { message: { base: ["..."], source_branch: ["..."] } }
  *   - { error: "..." } / { error_description: "..." }
  *   - 非 JSON（HTML 错误页）→ 用 status text
  */
 const formatGitLabError = async (res: Response): Promise<string> => {
-  const status = `${res.status} ${res.statusText}`;
+  const status = `${res.status} ${res.statusText}`.trim();
   try {
     const body = await res.json();
-    if (typeof body?.message === "string") return `${status}: ${body.message}`;
+    if (typeof body?.message === "string") {
+      return joinStatusAndDetail(res, status, body.message);
+    }
+    if (Array.isArray(body?.message)) {
+      // 数组型 message：以前落进下面的 Object.entries 分支、显示成「0: a | 1: b」
+      return joinStatusAndDetail(
+        res,
+        status,
+        body.message.map(stringifyDetail).filter(Boolean).join("；"),
+      );
+    }
     if (body?.message && typeof body.message === "object") {
       // 字段级错误：把所有字段错误平铺
       const parts: string[] = [];
@@ -200,6 +244,33 @@ const formatGitLabError = async (res: Response): Promise<string> => {
     return `${status}: ${JSON.stringify(body).slice(0, 200)}`;
   } catch {
     return `${status}: <non-JSON body>`;
+  }
+};
+
+/** `Response.json()` 的返回类型（不写显式 any：项目禁用，且 body?.sha 之类的宽松读法要保持） */
+type JsonBody = Awaited<ReturnType<Response["json"]>>;
+
+/**
+ * 读响应体 JSON，失败收成结构化错误（不抛）（Q10-06）：
+ * - SyntaxError（200 + HTML：网关 / 登录页 / 代理劫持）→「返回了无法解析的内容」，不是「网络错误」；
+ * - 其它（读 body 途中连接断了 / 超时）→ 才是网络错误。
+ * 以前 getMRMergeStatus 把 `res.json()` 放在 try 外（200+HTML 直接抛 SyntaxError，破坏本模块「失败 always 返结构化错误」），
+ * 其余入口在 try 内、被 catch 说成「网络错误：Unexpected token <」——两种都不对。
+ */
+const readJsonBody = async (
+  res: Response,
+): Promise<{ ok: true; body: JsonBody } | { ok: false; error: string }> => {
+  try {
+    return { ok: true, body: await res.json() };
+  } catch (err) {
+    // 按 name 判、不用 instanceof：Response.json 抛的 SyntaxError 可能来自另一个 realm（沙箱 / 测试环境）
+    if (err instanceof Error && err.name === "SyntaxError") {
+      return {
+        ok: false,
+        error: `GitLab 返回了无法解析的内容（HTTP ${res.status}、不是 JSON，可能被网关 / 登录页拦截）`,
+      };
+    }
+    return { ok: false, error: formatFetchNetworkError(err) };
   }
 };
 
@@ -247,7 +318,9 @@ const findOpenMR = async (
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };
     }
-    const body = await res.json();
+    const parsed = await readJsonBody(res);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    const body = parsed.body;
     const first = Array.isArray(body) ? body[0] : undefined;
     if (
       !first ||
@@ -315,7 +388,9 @@ export const createMR = async (
       }
       return { ok: false, error: await formatGitLabError(res) };
     }
-    const body = await res.json();
+    const parsed = await readJsonBody(res);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    const body = parsed.body;
     if (typeof body?.web_url !== "string" || typeof body?.iid !== "number") {
       return {
         ok: false,
@@ -452,7 +527,9 @@ export const getMRMergeStatus = async (
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };
     }
-    const body = await res.json();
+    const parsed = await readJsonBody(res);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    const body = parsed.body;
     // detailed_merge_status 优先（GitLab 15.6+）、老实例退回 merge_status
     const detailed: string =
       typeof body?.detailed_merge_status === "string"
@@ -512,7 +589,9 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };
     }
-    const body = await res.json();
+    const parsed = await readJsonBody(res);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    const body = parsed.body;
     const detailed: string =
       typeof body?.detailed_merge_status === "string"
         ? body.detailed_merge_status
@@ -546,6 +625,48 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
   }
 };
 
+/** 合并被 405 拒绝时 `detailed_merge_status` → 人话。只覆盖「不能合」的几类；认不出的值不猜、不追加原因 */
+const MERGE_BLOCK_REASONS = new Map<string, string>([
+  ["conflict", "有冲突，先解决冲突"],
+  ["cannot_be_merged", "有冲突，先解决冲突"],
+  ["ci_must_pass", "流水线没通过"],
+  ["ci_still_running", "流水线还在跑"],
+  ["draft_status", "还是草稿（Draft）"],
+  ["discussions_not_resolved", "还有未解决的讨论"],
+  ["not_approved", "还没批准"],
+  ["blocked_status", "被别的 MR 阻塞"],
+  ["need_rebase", "需要先 rebase"],
+  ["checking", "GitLab 还在检查可合性，稍后再试"],
+  ["unchecked", "GitLab 还在检查可合性，稍后再试"],
+  ["preparing", "GitLab 还在检查可合性，稍后再试"],
+]);
+
+/**
+ * 合并请求被 405 拒绝后补查一次 MR，把「不能合」说清楚（Q10-05）。
+ * 405 是 GitLab 的「现在不能合」：已合并 / 已关闭 / 草稿 / 流水线没过 / 有冲突 / 讨论未解决……全是它，
+ * 光看 `405 Method Not Allowed` 什么也看不出来：
+ *  - 已合并 → 幂等成功（`alreadyMerged`）：双击 / 两个窗口 / 别人先合了，用户要的结果已经达成，不该报失败；
+ *  - 已关闭 → 明说；
+ *  - 仍打开 → 按 detailed_merge_status 补一句原因，认不出的状态不猜；
+ *  - 补查本身失败 → 原样返回 GitLab 的拒绝文案（不拿「补查失败」掩盖真因）。
+ * 只对 405 补查：409（sha 守卫）等其它拒绝文案原样返回——`isMergeShaMismatch` 靠它识别。
+ */
+const explainMergeRefusal = async (
+  input: GetMRInput,
+  error: string,
+): Promise<MergeMRResult> => {
+  const probe = await getMR(input);
+  if (!probe.ok) return { ok: false, error };
+  if (probe.state === "merged") {
+    return { ok: true, url: probe.url, iid: probe.iid, alreadyMerged: true };
+  }
+  if (probe.state === "closed") {
+    return { ok: false, error: `${error}（该 MR 已关闭，无法合并）` };
+  }
+  const why = MERGE_BLOCK_REASONS.get(probe.detailedMergeStatus);
+  return { ok: false, error: why ? `${error}（${why}）` : error };
+};
+
 /**
  * 合并 MR（PUT …/merge）。失败返结构化错误（冲突 / pipeline / 权限等）。
  *
@@ -574,9 +695,13 @@ export const mergeMR = async (
       body: JSON.stringify(input.sha ? { sha: input.sha } : {}),
     });
     if (!res.ok) {
-      return { ok: false, error: await formatGitLabError(res) };
+      const error = await formatGitLabError(res);
+      if (res.status === 405) return await explainMergeRefusal(input, error);
+      return { ok: false, error };
     }
-    const body = await res.json();
+    const parsed = await readJsonBody(res);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    const body = parsed.body;
     return {
       ok: true,
       iid: typeof body?.iid === "number" ? body.iid : input.iid,

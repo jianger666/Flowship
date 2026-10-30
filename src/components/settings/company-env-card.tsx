@@ -201,16 +201,29 @@ const InstanceCardHeader = ({
   </MiniField>
 );
 
+/**
+ * 实例行「删除」键（纯图标，读屏读不出名字——R14 Q19-01）的可访问名：「删除 <类型> 第 N 项（<环境>）」。
+ * 不放 host / baseUrl：那是用户填的内网地址 / 可能带凭证的 URL，不往 DOM 属性里再抄一份；
+ * 序号 + 环境已足够在一排同类卡片里分清是哪一条。
+ */
+const removeInstanceLabel = (kind: string, index: number, env: string): string => {
+  const e = env.trim();
+  return `删除 ${kind} 第 ${index + 1} 项${e ? `（${e}）` : ""}`;
+};
+
 /** 首行行尾簇：只读（可选）+ 删除——所有实例卡统一放第一排末尾 */
 const InstanceRowEnd = ({
   readonly,
   onReadonlyChange,
   onRemove,
+  removeLabel,
 }: {
   readonly?: boolean;
   /** 不传 = 该子系统没有只读语义（ELK） */
   onReadonlyChange?: (next: boolean) => void;
   onRemove: () => void;
+  /** 删除键（纯图标）的可访问名，用 removeInstanceLabel 生成；必填，新增实例类型时不会漏 */
+  removeLabel: string;
 }) => (
   <div className="flex shrink-0 items-end gap-1.5">
     {onReadonlyChange ? (
@@ -228,6 +241,7 @@ const InstanceRowEnd = ({
         variant="ghost"
         size="icon"
         className="size-8"
+        aria-label={removeLabel}
         onClick={onRemove}
       >
         <Trash2 className="size-3.5" />
@@ -243,6 +257,7 @@ const StringListEditor = ({
   onCommit,
   placeholder,
   addLabel = "添加",
+  itemName = "项",
 }: {
   lines: string[];
   /** 输入中改草稿 */
@@ -251,6 +266,8 @@ const StringListEditor = ({
   onCommit: (next: string[]) => void;
   placeholder?: string;
   addLabel?: string;
+  /** 每行是什么（「命名空间」）——删除键（纯图标）的可访问名「删除<itemName> N」用 */
+  itemName?: string;
 }) => {
   const removeRow = useRemoveRow();
   return (
@@ -278,6 +295,7 @@ const StringListEditor = ({
             variant="ghost"
             size="icon"
             className="size-8 shrink-0 text-muted-foreground"
+            aria-label={`删除${itemName} ${i + 1}`}
             onClick={() =>
               void removeRow("列表项", line.trim(), { line }, () =>
                 onCommit(lines.filter((_, j) => j !== i)),
@@ -746,6 +764,7 @@ export const CompanyEnvSection = ({
                           variant="ghost"
                           size="icon"
                           className="size-8"
+                          aria-label={removeInstanceLabel("服务器", i, s.env)}
                           onClick={() =>
                             void removeRow("服务器", s.host, s, () =>
                               commit({
@@ -889,6 +908,7 @@ export const CompanyEnvSection = ({
                             }),
                           )
                         }
+                        removeLabel={removeInstanceLabel("PostgreSQL 实例", i, p.env)}
                       />
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -1001,6 +1021,7 @@ export const CompanyEnvSection = ({
                             }),
                           )
                         }
+                        removeLabel={removeInstanceLabel("Redis 实例", i, r.env)}
                       />
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -1140,6 +1161,7 @@ export const CompanyEnvSection = ({
                           variant="ghost"
                           size="icon"
                           className="mt-4 size-8 shrink-0"
+                          aria-label={removeInstanceLabel("XXL-Job 环境", i, x.env)}
                           onClick={() =>
                             void removeRow("XXL-Job 环境", x.baseUrl, x, () =>
                               commit({
@@ -1248,6 +1270,7 @@ export const CompanyEnvSection = ({
                             }),
                           )
                         }
+                        removeLabel={removeInstanceLabel("Nacos 集群", i, n.env)}
                       />
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -1280,6 +1303,7 @@ export const CompanyEnvSection = ({
                       <StringListEditor
                         lines={n.namespaces}
                         addLabel="添加命名空间"
+                        itemName="命名空间"
                         onChange={(namespaces) =>
                           patchNacos({ ...n, namespaces })
                         }
@@ -1357,6 +1381,7 @@ export const CompanyEnvSection = ({
                             }),
                           )
                         }
+                        removeLabel={removeInstanceLabel("ELK 实例", i, e.env)}
                       />
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -1450,6 +1475,7 @@ export const CompanyEnvSection = ({
                             }),
                           )
                         }
+                        removeLabel={removeInstanceLabel("SLS 实例", i, s.env)}
                       />
                     </div>
                     <div className="flex flex-wrap gap-1.5">

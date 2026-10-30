@@ -19,7 +19,7 @@
  * 抓输出里的授权 URL 给 UI 兜底展示、UI 轮询状态。
  */
 
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs, createReadStream, createWriteStream } from "node:fs";
 import os from "node:os";
@@ -515,6 +515,8 @@ interface InstallState {
 const G = globalThis as unknown as {
   __feishuCliInstall?: InstallState;
   __feishuCliLogins?: Map<string, LoginState>;
+  // 在跑的登录子进程（独立于 LoginState：LoginState 会被 GET 接口整个序列化给前端、不能带进程对象）
+  __feishuCliLoginChildren?: Map<string, LoginChild>;
   // 状态快照缓存 + 后台刷新 single-flight（v1.1.x 启动提速、见「状态探测」节）
   __feishuStatusCache?: StatusSnapshot | null;
   __feishuStatusRefreshing?: Promise<StatusSnapshot> | null;
@@ -533,6 +535,9 @@ export const uninstallFeishuTools = async (): Promise<void> => {
   if (getInstallState().running) {
     throw new Error("安装进行中、等安装完成后再卸载");
   }
+  // 登录子进程还在跑就先终止、并等它真的退出：unix 上删了 bin 它也照跑、授权一完成会把 ~/.lark-cli 重建出来；
+  // Windows 上 exe 被占着、下面的 rm 会 EBUSY
+  await cancelAllLogins();
   await fs.rm(getToolsBinDir(), { recursive: true, force: true });
   await fs.rm(getToolsSkillsDir(), { recursive: true, force: true });
   await fs.rm(path.join(os.homedir(), ".lark-cli"), { recursive: true, force: true });
@@ -605,12 +610,137 @@ interface LoginState {
   tail: string[];
   error?: string;
   exitCode?: number | null;
+  // 用户 / 卸载要求取消。spawn 之前还有异步窗口（lark-cli 查配置、meegle 的 config set 排队）、
+  // 那段时间没有子进程可杀，靠这个标记让 startLogin 在 spawn 前自行收口；收口时也靠它区分「用户取消」与「失败」
+  cancelRequested?: boolean;
+  // 超过 LOGIN_TIMEOUT_MS 被终止
+  timedOut?: boolean;
 }
 
+/** 在跑的登录子进程（存 G.__feishuCliLoginChildren，不放进 LoginState——那个会整个序列化给前端） */
+interface LoginChild {
+  child: ChildProcess;
+  /** 子进程 exit / error（任一）后 resolve：取消 / 卸载靠它等「真的退出了」 */
+  exited: Promise<void>;
+  /** 释放引用并唤醒 exited；Map 里还是自己才删（取消后立刻重登，旧进程迟到的 exit 不能删掉新进程的引用） */
+  release: () => void;
+  /** 正在终止中：重复取消、超时与取消撞车时共用同一轮 SIGTERM → SIGKILL，不重复发 */
+  terminating?: Promise<void>;
+}
+
+/**
+ * 登录子进程总时限：用户关掉授权页 / CLI 卡住时，「登录中」不能永远转圈、重试不能恒 409。
+ * 10 分钟只是兜底——CLI 自己的授权码过期会先非 0 退出；`config init --new` 含「浏览器建应用 → 授权」两步、不能取短。
+ * device-code 的真实有效期仓库里没有文档、也没实机核过。
+ */
+export const LOGIN_TIMEOUT_MS = 10 * 60_000;
+/** SIGTERM 后等这么久还没退出，就 SIGKILL */
+export const LOGIN_KILL_GRACE_MS = 3_000;
+/** SIGKILL 后再等这么久还没退出，就放弃等待、强制把 running 复位（僵死进程 / Windows 句柄占着，不能让 UI 永远卡住） */
+export const LOGIN_FORCE_SETTLE_MS = 2_000;
+
+const LOGIN_TOOLS = ["lark-cli", "meegle"] as const;
+const LOGIN_TIMEOUT_MESSAGE = `登录超时（${LOGIN_TIMEOUT_MS / 60_000} 分钟内未完成授权），已取消，可重新发起`;
+const LOGIN_UNRESPONSIVE_NOTE = "登录进程没有响应终止信号，已放弃等待，可重新发起";
+
 const getLogins = (): Map<string, LoginState> => (G.__feishuCliLogins ??= new Map());
+const getLoginChildren = (): Map<string, LoginChild> =>
+  (G.__feishuCliLoginChildren ??= new Map());
 
 export const getLoginState = (tool: string): LoginState | null =>
   getLogins().get(tool) ?? null;
+
+/**
+ * 登录流程收口。幂等：已经结束就不再改任何字段——超时 / 取消 / 强制放弃等待收口之后，
+ * 子进程迟到的 exit / error 事件因此不会把「登录超时」「已取消」覆盖成别的文案。
+ * 返回 true = 这次真的收口了。
+ */
+const settleLogin = (
+  state: LoginState,
+  patch: { exitCode?: number | null; error?: string } = {},
+): boolean => {
+  if (!state.running) return false;
+  state.running = false;
+  if (patch.exitCode !== undefined) state.exitCode = patch.exitCode;
+  if (patch.error !== undefined) state.error = patch.error;
+  // 登录态可能变了（成功 / 失效 / 被取消都算）：失效状态缓存、下一次 GET 拿真值
+  invalidateStatusCache();
+  return true;
+};
+
+/** 等 p 或 ms 到期（先到者）；不留残余定时器 */
+const waitOrTimeout = async (p: Promise<void>, ms: number): Promise<void> => {
+  let timer!: ReturnType<typeof setTimeout>;
+  try {
+    await Promise.race([
+      p,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/**
+ * 终止登录子进程：SIGTERM → 等 LOGIN_KILL_GRACE_MS → SIGKILL → 再等 LOGIN_FORCE_SETTLE_MS。
+ * 正常退出由 startLogin 里的 exit 回调收口；连 SIGKILL 都没等到退出（僵死进程 / Windows 句柄占着）时
+ * 这里强制收口，让用户能重新发起——否则 UI 永远转圈、重试恒 409。
+ * Windows 上 kill 的任何信号都是 TerminateProcess，走同一路径。
+ */
+const terminateLoginChild = (
+  tool: string,
+  entry: LoginChild,
+  state: LoginState,
+): Promise<void> => {
+  entry.terminating ??= (async () => {
+    const send = (signal: NodeJS.Signals) => {
+      try {
+        entry.child.kill(signal);
+      } catch {
+        // 进程已经没了
+      }
+    };
+    send("SIGTERM");
+    await waitOrTimeout(entry.exited, LOGIN_KILL_GRACE_MS);
+    if (!state.running) return;
+    send("SIGKILL");
+    await waitOrTimeout(entry.exited, LOGIN_FORCE_SETTLE_MS);
+    if (!state.running) return;
+    console.warn(`[feishu-cli] ${tool} 登录进程在 SIGKILL 后仍未退出、放弃等待并复位状态`);
+    entry.release();
+    settleLogin(state, {
+      error: state.timedOut
+        ? `${LOGIN_TIMEOUT_MESSAGE}（${LOGIN_UNRESPONSIVE_NOTE}）`
+        : LOGIN_UNRESPONSIVE_NOTE,
+    });
+  })();
+  return entry.terminating;
+};
+
+/**
+ * 取消登录（设置页「取消」按钮 / 卸载共用）。幂等：没在登录就什么也不做。
+ * - 子进程在跑：终止（SIGTERM → SIGKILL）并等它退出，返回时 running 已复位；
+ *   等的这段时间里 CLI 若恰好完成授权、以 0 退出——登录其实成功了、不算被取消，返回 { cancelled: false }
+ *   （设置页据此不弹「已取消登录」，刷新后看到的是「已登录」）；
+ * - 子进程还没起（lark-cli 查配置 / meegle 的 config set 排队中）：只置 cancelRequested，
+ *   startLogin 醒来在 spawn 前看到就不再起了。
+ */
+export const cancelLogin = async (tool: string): Promise<{ cancelled: boolean }> => {
+  const state = getLogins().get(tool);
+  if (!state?.running) return { cancelled: false };
+  state.cancelRequested = true;
+  const entry = getLoginChildren().get(tool);
+  if (entry) await terminateLoginChild(tool, entry, state);
+  return { cancelled: state.exitCode !== 0 };
+};
+
+/** 取消全部登录（卸载前调；两个工具各自幂等） */
+export const cancelAllLogins = async (): Promise<void> => {
+  await Promise.all(LOGIN_TOOLS.map((tool) => cancelLogin(tool)));
+};
 
 /**
  * 发起登录（后台 spawn、UI 轮询 getLoginState + 状态接口收敛）：
@@ -649,6 +779,12 @@ export const startLogin = async (
         }),
       );
     } catch (err) {
+      // 用户在第一次 config set 期间取消、它又失败了：不再起 config init + config set 这一轮重试
+      // （取消之后不该再起新的 CLI 子进程；卸载时它还可能把刚删掉的 ~/.meegle 又写出来）
+      if (state.cancelRequested) {
+        settleLogin(state);
+        return { ok: false, error: "登录已取消" };
+      }
       // config.json 不存在时 set 可能失败、先 init 再 set（整段仍在队列内串行）
       try {
         await enqueueMeegle(async () => {
@@ -660,6 +796,11 @@ export const startLogin = async (
           });
         });
       } catch {
+        // 用户在重试（config init + config set）期间取消、重试又失败：按「用户取消」收口，不显示「host 配置失败」红字
+        if (state.cancelRequested) {
+          settleLogin(state);
+          return { ok: false, error: "登录已取消" };
+        }
         state.running = false;
         state.error = `meegle host 配置失败：${err instanceof Error ? err.message : String(err)}`;
         return { ok: false, error: state.error };
@@ -673,13 +814,44 @@ export const startLogin = async (
     args = ["auth", "login", "--device-code", "--host", host];
   }
 
+  // 取消若发生在 spawn 之前的异步窗口（lark-cli 查配置 / meegle 的 config set 排队）：不再起子进程
+  if (state.cancelRequested) {
+    settleLogin(state);
+    return { ok: false, error: "登录已取消" };
+  }
+
   try {
     const child = spawn(cmd, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       env: process.env,
     });
+    // 登记子进程 + 总时限：超时 / 取消靠这两样才杀得到、也等得到它
+    const children = getLoginChildren();
+    let markExited!: () => void;
+    const entry: LoginChild = {
+      child,
+      exited: new Promise<void>((resolve) => {
+        markExited = resolve;
+      }),
+      release: () => {
+        if (children.get(tool) === entry) children.delete(tool);
+        markExited();
+      },
+    };
+    children.set(tool, entry);
+    const timeoutTimer = setTimeout(() => {
+      if (!state.running) return;
+      state.timedOut = true;
+      console.warn(
+        `[feishu-cli] ${tool} 登录超过 ${LOGIN_TIMEOUT_MS / 60_000} 分钟未完成、终止子进程`,
+      );
+      void terminateLoginChild(tool, entry, state);
+    }, LOGIN_TIMEOUT_MS);
+    timeoutTimer.unref?.();
     const onChunk = (buf: Buffer) => {
+      // 已收口（退出 / 取消 / 超时）后到达的残余输出不再处理：否则取消之后还可能再弹一次浏览器
+      if (!state.running) return;
       const text = buf.toString("utf8");
       for (const line of text.split("\n")) {
         const trimmed = line.trim();
@@ -728,25 +900,36 @@ export const startLogin = async (
     child.stdout?.on("data", onChunk);
     child.stderr?.on("data", onChunk);
     child.on("exit", (code) => {
-      state.running = false;
-      state.exitCode = code;
-      // 登录态可能变了（成功 / 失效都算）：失效状态缓存、下一次 GET 拿真值
-      invalidateStatusCache();
-      if (code !== 0) {
+      clearTimeout(timeoutTimer);
+      entry.release();
+      // 已被超时 / 取消的「放弃等待」收口过：迟到的 exit 只清理引用、不再改状态
+      if (!state.running) return;
+      // 授权恰好在取消 / 超时的同一刻成功：以 CLI 的退出码为准、按成功收口
+      if (code === 0) {
+        settleLogin(state, { exitCode: code });
+        return;
+      }
+      // 超时 / 用户取消是我们自己杀的、不是 CLI 失败：超时给专门文案；用户取消不算错误、不显示红字
+      let error: string | undefined;
+      if (state.timedOut) {
+        error = LOGIN_TIMEOUT_MESSAGE;
+      } else if (!state.cancelRequested) {
         // 带上 CLI 输出尾部（真实报错在这）——只给 code 用户和维护者都没法排查
         //（同事实测「code=3」猜不出原因）；完整 tail 落 main.log、诊断包可取
         const tailText = state.tail.slice(-3).join(" | ");
-        state.error = `登录进程退出 code=${code}${tailText ? `：${tailText}` : ""}`;
+        error = `登录进程退出 code=${code}${tailText ? `：${tailText}` : ""}`;
         console.warn(
           `[feishu-cli] ${tool} 登录失败 code=${code}、CLI 输出尾部：\n${state.tail.join("\n")}`,
         );
       }
+      // 登录态可能变了（成功 / 失效 / 被取消都算）：settleLogin 一并失效状态缓存、下一次 GET 拿真值
+      settleLogin(state, { exitCode: code, error });
     });
     child.on("error", (err) => {
-      state.running = false;
-      state.error = err.message;
-      // spawn 失败也可能是环境变了（bin 被删等）：一并失效状态缓存（蓝军 P2）
-      invalidateStatusCache();
+      clearTimeout(timeoutTimer);
+      entry.release();
+      // spawn 失败也可能是环境变了（bin 被删等）：settleLogin 一并失效状态缓存（蓝军 P2）
+      settleLogin(state, { error: err.message });
     });
     return { ok: true };
   } catch (err) {

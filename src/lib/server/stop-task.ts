@@ -2,7 +2,7 @@
  * 停止 task 的共享收尾（单一源）：
  *   1) cancelTaskRun / cancelChatRun：abort SDK Run + 关跨 run 会话
  *   2) cleanupChatTaskState / abortRunningCheck / reapTaskOrphans：清进程级状态与孤儿
- *   3) 非终态（running / awaiting_ack）action 标 cancelled、作废未答 ask
+ *   3) running action 标 cancelled（awaiting_ack 已交卷的保留、仅划除 exclude 一并收成 cancelled，R14 Q7a-05）、作废未答 ask
  *   4) runStatus 回 idle + 落停止事件 + publish
  *
  * 调用方：
@@ -170,10 +170,16 @@ const runStopTaskAgent = async (
     // worktree 路径仍可从入场快照取（目录结构不依赖 action 列表）
     reapTaskOrphans(getTaskWorkRepoPaths(task));
 
-    // 2+3) 非终态 action → cancelled + runStatus idle，同锁单次事务
+    // 2+3) running action → cancelled + runStatus idle，同锁单次事务
     // （与 appendAction 的 prepare→commit 共享 withTaskLock，必见刚提交的 running action）
+    // R14 Q7a-05：用户「停止」不丢已交卷的产物——agent 交卷后 check 先于 run 结束落 awaiting_ack（runStatus 刻意保持 running、
+    // 收尾旁白还在流），此时点停止只该停旁白，不该把已通过 check 的 action 打成 cancelled（推进按钮 / 「再聊聊」的 ack 上下文随之消失、
+    // 产物只能重跑）。awaiting_ack 留给用户之后 ack（与归档同口径）；划除（trigger=exclude）是用户明说「这个 action 不要了」，仍一并收成 cancelled。
     const live =
-      (await finalizeStaleAndIdleLocked(id, { toStatus: "cancelled" })) ?? task;
+      (await finalizeStaleAndIdleLocked(id, {
+        toStatus: "cancelled",
+        leaveAwaitingAck: opts.trigger !== "exclude",
+      })) ?? task;
 
     // 作废旧 agent 没答完的孤儿 ask（停止后旧 agent 已断、不清掉前端会弹失效的旧问题弹窗、
     // 用户答了必报错）。停止 = 主动中断、不续传旧问题、只清孤儿。

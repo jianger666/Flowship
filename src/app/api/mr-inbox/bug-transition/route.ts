@@ -200,16 +200,30 @@ export const POST = async (req: Request) => {
       }
     }
 
-    if (action === "reject") {
-      await addWorkitemComment(
-        projectKey,
-        workItemId,
-        `回归不通过：${reason}`,
-      );
-    }
-
+    // 先流转、后评论（Q21-02）。以前反过来：流转失败（必填字段 / 权限 / 网络）时评论已经发出去了，
+    // 用户重试一次就多一条「回归不通过」。现在流转失败 → 评论根本没发，重试安全。
     await transitionBugState(projectKey, workItemId, target.transitionId);
     removeBugFromInboxCache(bugUrl);
+
+    // 流转已成功、没法回滚：评论发失败不当整体失败（否则前端报「流转失败」、用户去重试，
+    // 但 bug 已经不在待回归了），只在响应里带 commentFailed，前端提示「已打回，但原因评论没发出去」
+    let commentFailed = false;
+    if (action === "reject") {
+      try {
+        await addWorkitemComment(
+          projectKey,
+          workItemId,
+          `回归不通过：${reason}`,
+        );
+      } catch (err) {
+        commentFailed = true;
+        // 只打报错信息、不主动打印评论正文（reason 是用户输入）
+        console.warn(
+          "[POST /api/mr-inbox/bug-transition] 已流转、打回原因评论发送失败:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
 
     return NextResponse.json({
       ok: true,
@@ -218,6 +232,7 @@ export const POST = async (req: Request) => {
       transitionId: target.transitionId,
       targetStateLabel: target.targetStateLabel,
       targetStateKey: target.targetStateKey,
+      ...(commentFailed ? { commentFailed: true } : {}),
     });
   } catch (err) {
     if (err instanceof MeegleError) {

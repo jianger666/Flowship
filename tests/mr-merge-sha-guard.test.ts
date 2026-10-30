@@ -81,14 +81,20 @@ describe("链路接线（源码契约）", () => {
     expect(read("src/lib/mr-inbox.ts")).toContain("headSha?: string;");
   });
 
-  it("前端：hook 把 sha 放进请求体；两个合并按钮都传 entry.mr 的 headSha", () => {
+  it("前端：hook 把 sha 放进请求体；共享合并 hook 把 headSha 传给 mergeMr；两个合并按钮都把 entry.mr 的 headSha 交给它", () => {
     expect(read("src/hooks/use-mr-inbox.tsx")).toContain(
       "body: JSON.stringify(sha ? { mrUrl, sha } : { mrUrl }),",
     );
+    // B5-3 去重：两个合并按钮共用 hooks/use-merge-mr.ts，mergeMr 只在这一处被调、必须带 headSha
+    const action = read("src/hooks/use-merge-mr.ts");
+    expect(action).toContain("await mergeMr(target.mrUrl, target.headSha);");
+    expect(action).not.toMatch(/await mergeMr\(target\.mrUrl\);/);
     const panel = read("src/components/mr-inbox/mr-inbox-panel.tsx");
-    expect(panel).toContain("await mergeMr(entry.mrUrl, entry.mr?.headSha);");
-    expect(panel).toContain("await mergeMr(entry.mrUrl, entry.mr.headSha);");
-    expect(panel).not.toMatch(/await mergeMr\(entry\.mrUrl\);/);
+    // 面板不再直接调 mergeMr（那样就绕过了共享 hook 的 sha / 防重入 / 提示）
+    expect(panel).not.toMatch(/\bmergeMr\(/);
+    // 两处都把 entry.mr 的 headSha 交出去（待测 MR 行 mr 可能为 null → ?.；待回归行已判空 → .）
+    expect(panel).toContain("headSha: entry.mr?.headSha,");
+    expect(panel).toContain("headSha: entry.mr.headSha,");
   });
 
   it("路由：sha 只接受 7–64 位十六进制；传给 mergeMR；HEAD 不匹配回 409 人话，其余失败仍 502", () => {

@@ -39,6 +39,7 @@
 import { promises as fs } from "node:fs";
 
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
+import { repoTail } from "@/lib/path-utils";
 import type { ShareLink, ShareToGroupInput } from "@/lib/server/feishu-group";
 import { getActionArtifactPath } from "@/lib/server/task-fs-core";
 import { actionDisplayLabel } from "@/lib/task-display";
@@ -156,8 +157,8 @@ export const buildAllActionMrLinks = (action: ActionRecord): ShareLink[] => {
     const url = mr.mrUrl?.trim();
     if (!url) continue;
     // 仓路径末段当标签（crm-web），拿不到就退回「MR」
-    const repoTail = mr.repoPath?.split("/").filter(Boolean).pop();
-    links.push({ label: repoTail ? `MR · ${repoTail}` : "MR", url });
+    const tail = mr.repoPath ? repoTail(mr.repoPath.replace(/[\\/]+$/, "")) : "";
+    links.push({ label: tail ? `MR · ${tail}` : "MR", url });
   }
   return links;
 };

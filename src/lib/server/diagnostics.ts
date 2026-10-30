@@ -6,7 +6,7 @@
  * - IDE 探测结果（探到哪个可执行文件、「在 IDE 打开没反应」类问题一眼定位）
  * - 配置概要（**脱敏**：apiKey / gitToken 只留前 6 位 + 长度、MCP 配置只留 server 名）
  * - installer.log（Windows 安装器每次安装 / 自动更新写的几行：耗时 / 剩余空间 / 预检结果；没有则不出现）
- * - main.log 尾部（壳 + server 全部输出都在这份里、默认取最后 ~300KB）
+ * - main.log 尾部（壳 + server 全部输出都在这份里、默认取最后 ~300KB；刚轮转完不足 300KB 时从 main.log.1 补足）
  *
  * 落地位置：~/Downloads（找不到回退数据目录）、文件名带时间戳不互相覆盖。
  */
@@ -15,7 +15,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { dataRoot } from "./data-root";
+import { dataRoot, describeConfigReadError, stripBom } from "./data-root";
 import { listIdeToolsDetailed } from "./ide-tools";
 
 // main.log 尾部截取量——太大发飞书费劲、300KB 足够覆盖最近几小时
@@ -38,7 +38,7 @@ const maskSecret = (v: unknown): string => {
 const readSanitizedConfig = async (): Promise<string> => {
   try {
     const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");
-    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    const cfg = JSON.parse(stripBom(raw)) as Record<string, unknown>;
     const lines: string[] = [
       `apiKey: ${maskSecret(cfg.apiKey)}`,
       `gitToken: ${maskSecret(cfg.gitToken)}`,
@@ -70,7 +70,8 @@ const readSanitizedConfig = async (): Promise<string> => {
     ];
     return lines.join("\n");
   } catch (err) {
-    return `（config.json 读取失败：${err instanceof Error ? err.message : String(err)}）`;
+    // 不带 err.message：V8 的 JSON 报错会夹带出错处附近的原文，而 config.json 开头就是密钥；诊断包是要发给别人的
+    return `（config.json 读取失败：${describeConfigReadError(err)}）`;
   }
 };
 
@@ -91,14 +92,37 @@ const readFileTail = async (file: string, maxBytes: number): Promise<string> => 
 // 壳日志目录：dataRoot = <userData>/data、日志在 <userData>/logs
 const shellLogsDir = (): string => path.join(dataRoot(), "..", "logs");
 
-// 读 main.log 尾部（壳把 server stdout 也写进这份、一份日志全覆盖）
-const readMainLogTail = async (): Promise<string> => {
+/**
+ * 读 main.log 尾部（壳把 server stdout 也写进这份、一份日志全覆盖）。
+ *
+ * 轮转（electron-app/shell-log.mjs：main.log 超过 20MB 就改名成 main.log.1、再开新的 main.log）之后新文件可能只有几行，
+ * 只读它的话诊断包恰好在「刚轮转完」时缺最近的上下文——所以主文件不足 300KB 时，从 main.log.1 的尾部补足到 300KB
+ * （补读量按字节算）。.1 不存在 / 读不了就算了（没轮转过是常态）。
+ */
+export const readMainLogTail = async (): Promise<string> => {
   const logPath = path.join(shellLogsDir(), "main.log");
+  let main: string;
+  let mainBytes = 0;
   try {
-    return await readFileTail(logPath, LOG_TAIL_BYTES);
+    main = await readFileTail(logPath, LOG_TAIL_BYTES);
+    mainBytes = Buffer.byteLength(main);
   } catch (err) {
-    return `（main.log 读取失败：${logPath}、${err instanceof Error ? err.message : String(err)}——dev 模式没有壳日志属正常）`;
+    main = `（main.log 读取失败：${logPath}、${err instanceof Error ? err.message : String(err)}——dev 模式没有壳日志属正常）`;
   }
+  if (mainBytes >= LOG_TAIL_BYTES) return main;
+  let older = "";
+  try {
+    older = await readFileTail(`${logPath}.1`, LOG_TAIL_BYTES - mainBytes);
+  } catch {
+    // 没轮转过 / 旧日志读不了：只给主文件
+  }
+  if (older === "") return main;
+  return [
+    "----- 以下来自 main.log.1（轮转前的旧日志，补足最近的上下文） -----",
+    older.replace(/\r?\n$/, ""),
+    "----- 以下来自 main.log（轮转后的新日志） -----",
+    main,
+  ].join("\n");
 };
 
 /**

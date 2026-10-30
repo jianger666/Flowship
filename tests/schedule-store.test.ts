@@ -90,13 +90,14 @@ describe("创建 / 读取", () => {
 
   it("单会话进行中（含暂停）的定时有健全性上限；已结束的不占名额", async () => {
     const taskId = await freshTask();
-    for (let i = 0; i < SCHEDULE_MAX_ACTIVE_PER_TASK; i++) await mustCreate(taskId);
-    const over = await store.createSchedule(taskId, onceInput(), NOW);
+    // R14 Q20-05：完全等价的活定时会被去重（不新建），所以这里每条用不同标题才能真的凑满名额
+    for (let i = 0; i < SCHEDULE_MAX_ACTIVE_PER_TASK; i++) await mustCreate(taskId, onceInput({ title: `t${i}` }));
+    const over = await store.createSchedule(taskId, onceInput({ title: "满了之后的一条" }), NOW);
     expect(over.ok).toBe(false);
     if (!over.ok) expect(over.error).toContain("先取消");
     const first = (await store.readSchedules(taskId))[0]!;
     await store.cancelSchedule(taskId, first.id, "x", NOW);
-    expect((await store.createSchedule(taskId, onceInput(), NOW)).ok).toBe(true);
+    expect((await store.createSchedule(taskId, onceInput({ title: "满了之后的一条" }), NOW)).ok).toBe(true);
   });
 });
 
@@ -163,7 +164,8 @@ describe("取消 / 暂停 / 恢复 / 清理", () => {
     expect(await store.cancelAllSchedulesForTask(taskId, "会话已归档", NOW)).toBe(0);
     const a = await mustCreate(taskId);
     await mustCreate(taskId, everyInput());
-    const c = await mustCreate(taskId);
+    // R14 Q20-05：与 a 完全等价的活定时会被去重成同一条，所以 c 要有不同的标题
+    const c = await mustCreate(taskId, onceInput({ title: "另一条" }));
     await store.cancelSchedule(taskId, c.id, "先前取消", NOW);
     expect(await store.cancelAllSchedulesForTask(taskId, "会话已归档", NOW + MIN)).toBe(2);
     const list = await store.readSchedules(taskId);

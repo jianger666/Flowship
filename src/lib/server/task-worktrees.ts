@@ -25,7 +25,7 @@ import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { failpoint } from "./failpoints";
-import { stripHostInjectedEnv } from "./host-env";
+import { GIT_MAX_BUFFER, gitEnv } from "./git-exec";
 // ownership 快照与活跃态读无环叶子模块（静态 import 不构环——
 // 之前动态 import ./task-stream 躲环，在 Turbopack dev 下会拿到半初始化
 // namespace 报 `snapshotTaskOp is not a function`）。
@@ -44,6 +44,15 @@ import {
 import { getRepoSetupCommand } from "./settings-fs";
 import { parseWorktreeStatusV2 } from "./worktree-status";
 import {
+  beginWorktreeAdd,
+  describeLiveInitializing,
+  isWorktreeAddInFlight,
+  judgeInitializingLock,
+  parseGitdirPointerValue,
+  worktreePathFromAdminGitdirFile,
+  type InitializingLockVerdict,
+} from "./worktree-residue";
+import {
   detectLockfileDrift,
   discoverDepDirs,
   ROOT_DEP_DIRS,
@@ -51,7 +60,7 @@ import {
   runSetupCommand,
   type SetupRunResult,
 } from "./worktree-deps";
-import { getEffectiveCwd, getUniqueRepoDirNames } from "@/lib/path-utils";
+import { getEffectiveCwd, getUniqueRepoDirNames, repoTail } from "@/lib/path-utils";
 import {
   DEFAULT_BRANCH_TEMPLATE,
   extractFeishuStoryId,
@@ -379,8 +388,11 @@ export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
 
 // ----------------- git 执行底座 -----------------
 
-/** git 子进程 stdout/stderr 的容量上限（见 runGit 内注释；导出给测试断言「不再是 4MiB」） */
-export const GIT_MAX_BUFFER = 256 * 1024 * 1024;
+/**
+ * git 子进程 stdout/stderr 的容量上限（见 runGit 内注释；导出给测试断言「不再是 4MiB」）。
+ * 定义在 git-exec.ts（git-branches / wk-source-branch 共用），这里保留原来的导出名。
+ */
+export { GIT_MAX_BUFFER };
 
 interface GitResult {
   ok: boolean;
@@ -414,10 +426,12 @@ const runGit = async (
       // 展开：数万文件全改 / 新增（codemod、lint --fix、build 产物未进 .gitignore）轻松超 4MiB。超限不丢数据
       // （failed、保留目录），但会让大改动任务的归档 / 删除永远卡在「保留」——放大到 256MiB（只在真有输出时才占内存）
       maxBuffer: GIT_MAX_BUFFER,
-      // 一律剔宿主注入变量：worktree add / checkout 会触发用户仓的 post-checkout 等钩子（husky 里常有
+      // 一律走 gitEnv()：worktree add / checkout 会触发用户仓的 post-checkout 等钩子（husky 里常有
       // `pnpm install` / `next build`），钩子整份继承 server 环境会吃到 ELECTRON_RUN_AS_NODE / PORT /
-      // __NEXT_PRIVATE_STANDALONE_CONFIG。不剔 GitLab token——fetch 之类的 git 网络命令要靠它认证
-      env: { ...stripHostInjectedEnv(), ...(extraEnv ?? {}) },
+      // __NEXT_PRIVATE_STANDALONE_CONFIG，还会拿到 GitLab PAT。旧注释说「fetch 之类的 git 网络命令要靠 token 认证」
+      // 不成立（git 不读这个变量，Flowship 调 GitLab 另有通道），详见 git-exec.ts 头注释；
+      // 同时设 GIT_TERMINAL_PROMPT=0 / GCM_INTERACTIVE=never（没凭据就失败、不阻塞也不弹窗）。extraEnv 叠在最后。
+      env: gitEnv(extraEnv),
       ...(ac ? { signal: ac.signal } : {}),
     });
     return { ok: true, stdout: stdout.trim(), stderr: stderr.trim() };
@@ -834,6 +848,267 @@ const isolateBrokenWorkDir = async (
   return target;
 };
 
+// ----------------- `git worktree add` 被硬杀的残留（R14 B5-2 / Q10-01） -----------------
+//
+// 判据与 live / stale 的划分见 worktree-residue.ts 头注释；这里是读盘、跑 git、动手的部分。
+// 一句话：`<主仓>/.git/worktrees/<名>/locked` 停在 `initializing`、又没有活的 add 在跑（本进程在途登记 + 年龄 ≥ 5 分钟）
+// → 半截检出残留。ensure 把目录改名隔离（不删文件）并 unlock（不碰分支）；6 处 `remove --force` 遇到它升级成 `--force --force`；
+// 老版本留下的「目录没了、登记还锁着」的僵尸，在 prune 前先 unlock。三条路径都只对 stale 动手，live / 用户手动 lock 的一律不碰。
+
+/** 比较用的规范形：正斜杠 + 去尾斜杠；Windows 再统一小写 */
+const normForCompare = (p: string): string => {
+  const n = normPath(p);
+  return process.platform === "win32" ? n.toLowerCase() : n;
+};
+
+/**
+ * 路径的规范形态：对最近的**存在**祖先取 realpath、再拼回不存在的尾段。
+ * git 在登记里写 realpath（macOS 上 `/tmp` → `/private/tmp`，实测），而 add 之前目标目录还不存在，
+ * 所以登记表 / 反查比较都必须先过这一步，否则 mac 上永远对不上。
+ */
+const canonicalizeWorktreePath = async (p: string): Promise<string> => {
+  const abs = path.resolve(p);
+  const tail: string[] = [];
+  let cur = abs;
+  for (;;) {
+    try {
+      const real = await fs.realpath(cur);
+      return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return abs;
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+};
+
+/** 读 `<adminDir>/locked`；没有 / 读不出来 → null（= 没有锁）。`ageMs` 是 mtime 距今 */
+const readAdminLock = async (
+  adminDir: string,
+): Promise<{ lockText: string; ageMs: number } | null> => {
+  const lockFile = path.join(adminDir, "locked");
+  try {
+    const [lockText, st] = await Promise.all([
+      fs.readFile(lockFile, "utf8"),
+      fs.stat(lockFile),
+    ]);
+    return { lockText, ageMs: Date.now() - st.mtimeMs };
+  } catch {
+    return null;
+  }
+};
+
+/** 目录还在：从 `<workDir>/.git` 指针找到它在主仓里的登记目录（不跑 git）；指针读不到 / 不是 gitdir 行 → null */
+const adminDirFromPointer = async (workDir: string): Promise<string | null> => {
+  let text: string;
+  try {
+    text = await fs.readFile(path.join(workDir, ".git"), "utf8");
+  } catch {
+    return null;
+  }
+  const value = parseGitdirPointerValue(text);
+  return value ? resolveGitPointer(workDir, value) : null;
+};
+
+/** 主仓里所有 worktree 的登记（`<commonDir>/worktrees/<名>/gitdir` 记着各自目录的 realpath）；读不出来 → 空 */
+const listWorktreeAdminEntries = async (
+  repoPath: string,
+  job?: ResourceJobHandle,
+): Promise<Array<{ adminDir: string; registeredPath: string }>> => {
+  const common = await runGit(repoPath, ["rev-parse", "--git-common-dir"], 60_000, job);
+  if (!common.ok || !common.stdout) return [];
+  const adminRoot = path.join(path.resolve(repoPath, common.stdout), "worktrees");
+  let names: string[];
+  try {
+    names = await fs.readdir(adminRoot);
+  } catch {
+    return [];
+  }
+  const entries: Array<{ adminDir: string; registeredPath: string }> = [];
+  for (const name of names) {
+    const adminDir = path.join(adminRoot, name);
+    try {
+      const registered = worktreePathFromAdminGitdirFile(
+        await fs.readFile(path.join(adminDir, "gitdir"), "utf8"),
+      );
+      if (registered) entries.push({ adminDir, registeredPath: registered });
+    } catch {
+      /* 没有 gitdir 的登记不是 worktree（或已被别人清掉）、跳过 */
+    }
+  }
+  return entries;
+};
+
+/**
+ * workDir 对应的 git 登记是不是「`git worktree add` 中断留下的 initializing 锁」。
+ * 目录在：直接读 `.git` 指针找登记目录（热路径、不起 git 子进程）；目录没了 / 指针不可用：按 `gitdir` 反查。
+ * none = 没有 initializing 锁（没登记 / 没 `locked` / 用户手动 lock 的）；live = 看起来 add 还在进行；stale = 残留。
+ */
+const judgeWorktreeInitializingLock = async (
+  repoPath: string,
+  workDir: string,
+): Promise<InitializingLockVerdict> => {
+  let adminDir = await adminDirFromPointer(workDir);
+  if (!adminDir) {
+    const want = normForCompare(await canonicalizeWorktreePath(workDir));
+    for (const entry of await listWorktreeAdminEntries(repoPath)) {
+      if (normForCompare(await canonicalizeWorktreePath(entry.registeredPath)) === want) {
+        adminDir = entry.adminDir;
+        break;
+      }
+    }
+  }
+  if (!adminDir) return { kind: "none" };
+  const lock = await readAdminLock(adminDir);
+  if (!lock) return { kind: "none" };
+  return judgeInitializingLock({
+    lockText: lock.lockText,
+    ageMs: lock.ageMs,
+    inFlight: isWorktreeAddInFlight(await canonicalizeWorktreePath(workDir)),
+  });
+};
+
+/**
+ * stale 的半截检出：把目录改名隔离（保留里面所有文件——包括老版本把它当健康 worktree 复用后 agent 已经写进去的）
+ * + `git worktree unlock`（只去掉 initializing 锁、不碰分支）。绝不删任何文件。
+ * 返回 "skipped" = 动手前二次判定已不是 stale（并发的另一次 ensure 已经处理 / 又变成 live），什么都没动。
+ * rename 失败沿用 isolateBrokenWorkDir 的语义：抛错、保留原目录、不降级成 rm（R2-01）。
+ */
+const healStaleInitializingWorkDir = async (
+  repoPath: string,
+  workDir: string,
+  job: ResourceJobHandle,
+): Promise<"healed" | "skipped"> => {
+  // 测试挂点：判定为 stale 之后、动手之前（并发用例在此让另一次 ensure 先处理完）
+  await failpoint("ensure.beforeHealHalfCheckout");
+  // 二次判定：检查与动手之间隔了 await，别的 ensure 可能已经隔离 + 重建了——别把人家刚建好的健康 worktree 再隔离一次
+  const again = await judgeWorktreeInitializingLock(repoPath, workDir);
+  if (again.kind !== "stale") return "skipped";
+  const ageSec = Math.round(again.ageMs / 1000);
+  try {
+    await isolateBrokenWorkDir(
+      workDir,
+      `半截检出：git worktree add 被硬杀，locked=initializing 已 ${ageSec}s`,
+    );
+  } catch (err) {
+    // 目录已经不在 = 并发的另一次刚把它隔离走了，接着 unlock（幂等）；别的原因（占用 / 权限）照旧抛、原目录原样保留
+    if (await pathExists(workDir)) throw err;
+  }
+  const unlocked = await runGit(repoPath, ["worktree", "unlock", workDir], 60_000, job);
+  if (!unlocked.ok) {
+    // 并发的另一次已经解开了 → 没有 initializing 锁就算成功；还在才是真失败
+    if ((await judgeWorktreeInitializingLock(repoPath, workDir)).kind !== "none") {
+      throw new Error(
+        `仓库 ${repoPath} 的工作区 ${workDir} 是「git worktree add 被中断」留下的半截检出，已改名隔离、里面的文件都保留；` +
+          `但解除 git 的 initializing 锁失败（${unlocked.stderr || unlocked.stdout || "无输出"}）。` +
+          `请手动执行 git -C "${repoPath}" worktree unlock "${workDir}" 后重试。`,
+      );
+    }
+  }
+  // 测试挂点：隔离 + 解锁刚做完、后面的「存量僵尸」兜底与 prune 还没跑——用例在此断言自愈本身已经解了锁（不靠兜底）
+  await failpoint("ensure.afterHealHalfCheckout");
+  return "healed";
+};
+
+/**
+ * 存量僵尸：老版本被硬杀、又把目录删了（或本版自愈改名之后），git 里留着「目录已不存在 + locked=initializing + 已 stale」的登记。
+ * `worktree prune` 清不掉被锁定的登记（实测），同名分支因此永远报 `already checked out`——先 unlock，再交给 prune。
+ * 只动 Flowship 自己的 worktrees 根下的登记（用户手建的 worktree 不碰）；目录还在的不碰（归 ensure 的自愈 / 各 remove 路径）；
+ * live 的不碰。返回解开的个数。
+ */
+const unlockStaleInitializingZombies = async (
+  repoPath: string,
+  job?: ResourceJobHandle,
+): Promise<number> => {
+  const root = normForCompare(await canonicalizeWorktreePath(getWorktreesRoot()));
+  let unlocked = 0;
+  for (const entry of await listWorktreeAdminEntries(repoPath, job)) {
+    const registered = await canonicalizeWorktreePath(entry.registeredPath);
+    if (!normForCompare(registered).startsWith(`${root}/`)) continue;
+    if (await pathExists(entry.registeredPath)) continue;
+    const lock = await readAdminLock(entry.adminDir);
+    if (!lock) continue;
+    const verdict = judgeInitializingLock({
+      lockText: lock.lockText,
+      ageMs: lock.ageMs,
+      inFlight: isWorktreeAddInFlight(registered),
+    });
+    if (verdict.kind !== "stale") continue;
+    const r = await runGit(repoPath, ["worktree", "unlock", entry.registeredPath], 60_000, job);
+    if (r.ok) {
+      unlocked++;
+      console.warn(
+        `[task-worktrees] 解开僵尸 worktree 登记的 initializing 锁（git worktree add 被硬杀、目录已不存在）：${entry.registeredPath}`,
+      );
+    } else {
+      console.warn(
+        `[task-worktrees] 解开僵尸 worktree 登记失败（尽力而为）：${entry.registeredPath}：${r.stderr || r.stdout}`,
+      );
+    }
+  }
+  return unlocked;
+};
+
+/**
+ * `git worktree remove --force`——6 处删除路径共用。
+ * `--force` 拦不住 locked 的 worktree（要 `--force --force`）：被硬杀的 add 留下 `locked=initializing`，
+ * 旧实现于是总落到「`fs.rm` + `prune`」，而 prune 清不掉被锁定的登记 → 目录没了、同名分支永远报 already checked out。
+ * 这里只在**确认是 stale 的 initializing 锁**时才升级成 `--force --force`；用户手动 lock 的 / live 的 / 别的失败原因，
+ * 原样返回失败，各调用点既有的守卫与「退回 fs.rm + prune」不变。
+ * 调用点必须已经过自己的快照守卫——`--force --force` 会删目录。
+ */
+const forceRemoveWorktree = async (
+  repoPath: string,
+  workDir: string,
+  timeoutMs = 60_000,
+  job?: ResourceJobHandle,
+): Promise<GitResult> => {
+  const removed = await runGit(repoPath, ["worktree", "remove", "--force", workDir], timeoutMs, job);
+  if (removed.ok) return removed;
+  const verdict = await judgeWorktreeInitializingLock(repoPath, workDir);
+  if (verdict.kind !== "stale") return removed;
+  console.warn(
+    `[task-worktrees] worktree remove 被 initializing 锁拦住（git worktree add 被硬杀的残留，已 ${Math.round(verdict.ageMs / 1000)}s）、升级为 remove --force --force：${workDir}`,
+  );
+  return runGit(repoPath, ["worktree", "remove", "--force", "--force", workDir], timeoutMs, job);
+};
+
+/**
+ * 删前快照的 `taskBranch` 口径：stale 的半截检出传 `null`（只写 ref、不动分支）。
+ * 半截检出里 HEAD 附着在任务分支上、索引却是空的——`snapshotDirtyWorktree` 会把「缺了大半文件」的树
+ * 写成 WIP commit 并**记到任务分支上**，分支末端从此是个删光的树，reopen 后检出就是缺文件的工作区。
+ * 其它情形原样返回调用方给的口径。
+ */
+const snapshotBranchFor = async (
+  repoPath: string | null | undefined,
+  workDir: string,
+  branch: string | null | undefined,
+): Promise<string | null | undefined> => {
+  if (!repoPath) return branch;
+  return (await judgeWorktreeInitializingLock(repoPath, workDir)).kind === "stale"
+    ? null
+    : branch;
+};
+
+/**
+ * `git worktree add`（含孤儿自愈后的 retry），期间在进程内登记「这个目录有 add 在跑」——
+ * 判残留时靠它区分「本进程正在 add」与「被硬杀的残留」（git 状态上二者逐字相同）。
+ */
+const runWorktreeAdd = async (
+  repoPath: string,
+  workDir: string,
+  addArgs: string[],
+  job: ResourceJobHandle,
+): Promise<GitResult> => {
+  const end = beginWorktreeAdd(await canonicalizeWorktreePath(workDir));
+  try {
+    return await runGit(repoPath, addArgs, 120_000, job);
+  } finally {
+    end();
+  }
+};
+
 /**
  * `git worktree add` 失败 stderr 是否在说「分支已被某 worktree 占用」。
  * 英文两套 + 中文常见译法都要认，否则 LANG=zh_CN 时孤儿自愈整段跳过。
@@ -963,11 +1238,7 @@ const tryReleaseDeletedTaskOrphan = async (
   console.log(
     `[task-worktrees] 发现已删任务孤儿 worktree，强制释放后重试：${occupying}`,
   );
-  const removed = await runGit(
-    repoPath,
-    ["worktree", "remove", "--force", occupying],
-    60_000,
-  );
+  const removed = await forceRemoveWorktree(repoPath, occupying);
   if (!removed.ok) {
     await fs.rm(occupying, { recursive: true, force: true }).catch(() => {});
     await runGit(repoPath, ["worktree", "prune"]);
@@ -1205,11 +1476,7 @@ const compensateRemoveCreatedWorktrees = async (
           continue;
         }
         // 故意不传 ResourceJob / 不接 abort——remove 不可中止；靠 compensateJob + quarantine 兜
-        const removed = await runGit(
-          repoPath,
-          ["worktree", "remove", "--force", workDir],
-          60_000,
-        );
+        const removed = await forceRemoveWorktree(repoPath, workDir);
         if (!removed.ok) {
           // fs.rm 同样紧前现查——remove 失败窗口内 B 可能已入场
           if (hasSuccessorNow()) {
@@ -1312,6 +1579,31 @@ const ensureTaskWorktreesInner = async (ctx: {
       throw new Error(
         `仓库 ${repoPath} 任务分支名非法「${branch}」、拒绝创建 / 切换隔离工作区`,
       );
+    }
+
+    // `git worktree add` 被硬杀（SIGKILL / 崩溃 / 断电）会留下「半截检出 + locked=initializing」——下面的复用判据
+    //（rev-parse 为 true、当前分支就是任务分支）它全部满足，会被当健康工作区复用（Q10-01）。所以必须在复用判断**之前**识别：
+    //  - stale（没有活的 add：本进程无在途登记、locked 已超 5 分钟）→ 目录改名隔离（不删文件）+ unlock，随后按「目录不存在」重建；
+    //  - live（看起来 add 还在进行）→ 不动目录与登记、抛可重试错误；
+    //  - none（没有 initializing 锁，含用户手动 lock 的健康 worktree）→ 照常复用。
+    // 目录里的文件一个不删：老版本把半截检出当健康复用后，agent 可能已经往里写了东西。判据与取舍见 worktree-residue.ts / HANDOFF「R14 B5-2」。
+    if (await pathExists(path.join(workDir, ".git"))) {
+      let half = await judgeWorktreeInitializingLock(repoPath, workDir);
+      if (half.kind === "stale") {
+        assertLease();
+        const healed = await healStaleInitializingWorkDir(repoPath, workDir, job);
+        // skipped = 动手前二次判定已变（并发的另一次已处理 / 又变 live）：按最新状态复判，别带着过期结论往下走
+        half =
+          healed === "skipped"
+            ? await judgeWorktreeInitializingLock(repoPath, workDir)
+            : { kind: "none" };
+      }
+      if (half.kind === "live") {
+        throw new Error(
+          `仓库 ${repoPath} 的工作区 ${workDir} 看起来有一次 git worktree add 还在进行（${describeLiveInitializing(half)}），` +
+            `为避免破坏正在建的目录，本次未做任何改动。请稍后重试。`,
+        );
+      }
     }
 
     // 已存在且是合法工作区 → 复用（幂等热路径、每次推进都会走到）。
@@ -1487,7 +1779,9 @@ const ensureTaskWorktreesInner = async (ctx: {
       // 无旧目录也要验——与原先「进新建路径必验」对齐（finalize 已接管则让位）
       assertLease();
     }
-    // 清「目录没了但 git 还记着」的僵尸 worktree 注册（否则 add 同路径报错）
+    // 清「目录没了但 git 还记着」的僵尸 worktree 注册（否则 add 同路径报错）。
+    // 被硬杀的 add 留下的登记是 locked=initializing，prune 清不掉（实测）——先把「目录已不存在 + stale」的解锁
+    await unlockStaleInitializingZombies(repoPath, job);
     await runGit(repoPath, ["worktree", "prune"], 60_000, job);
 
     // addArgs 存下来：撞「已删任务孤儿占用」时可 force-remove 后原样重试一次
@@ -1691,8 +1985,8 @@ const ensureTaskWorktreesInner = async (ctx: {
     // 测试矩阵按此名注入（ensure.beforeWorktreeAdd）
     await failpoint("ensure.beforeWorktreeAdd");
     assertLease();
-    // worktree add（可达 120s）挂 abort
-    let added = await runGit(repoPath, addArgs, 120_000, job);
+    // worktree add（可达 120s）挂 abort；期间登记「本进程在 add 这个目录」（判残留时区分进行中 / 被硬杀）
+    let added = await runWorktreeAdd(repoPath, workDir, addArgs, job);
     if (!added.ok) {
       // 存量孤儿自愈：老版本删任务时快照失败会 skip 删除，留下 worktree 目录 + 分支占用。
       // 若占用方是「已删任务」的孤儿 → force remove + prune 后重试一次 add。
@@ -1700,7 +1994,7 @@ const ensureTaskWorktreesInner = async (ctx: {
         // retry 也是一次独立 add——同样验 lease
         await failpoint("ensure.beforeWorktreeAdd");
         assertLease();
-        added = await runGit(repoPath, addArgs, 120_000, job);
+        added = await runWorktreeAdd(repoPath, workDir, addArgs, job);
       }
     }
     if (!added.ok) {
@@ -2171,7 +2465,7 @@ export const buildDepPrepareHint = async (
       const workDir = workPaths[i];
       if (skipsWorktreeIsolation(task, repoPath)) continue;
       if (!(await pathExists(workDir))) continue;
-      const name = repoPath.split("/").filter(Boolean).pop() ?? repoPath;
+      const name = repoTail(repoPath);
       const wantClone = await planDepClone(repoPath, workDir);
       const repoLines: string[] = [];
 
@@ -2582,15 +2876,15 @@ export const formatWorktreeCleanupNotes = (
     RemoveWorktreesResult,
     "snapshotRepos" | "snapshotFailedRepos" | "snapshots" | "snapshotFailures"
   >,
-  repoTail: (repoPath: string) => string = (p) => p,
+  tailOf: (repoPath: string) => string = (p) => p,
 ): { snapshotNote: string; failedNote: string } => {
   const saved =
     removed.snapshots && removed.snapshots.length > 0
       ? removed.snapshots.map(
           (s) =>
-            `${repoTail(s.repoPath)} → ${s.ref}${s.branch ? `（同时记在任务分支 ${s.branch}）` : ""}`,
+            `${tailOf(s.repoPath)} → ${s.ref}${s.branch ? `（同时记在任务分支 ${s.branch}）` : ""}`,
         )
-      : removed.snapshotRepos.map(repoTail);
+      : removed.snapshotRepos.map(tailOf);
   const snapshotNote =
     saved.length > 0
       ? `；未提交改动已保存到 ${saved.join("、")}（可用 git log / git checkout 该 ref 找回）`
@@ -2598,9 +2892,9 @@ export const formatWorktreeCleanupNotes = (
   const kept =
     removed.snapshotFailures && removed.snapshotFailures.length > 0
       ? removed.snapshotFailures.map(
-          (f) => `${repoTail(f.repoPath)}（${f.reason}；目录 ${f.workDir}）`,
+          (f) => `${tailOf(f.repoPath)}（${f.reason}；目录 ${f.workDir}）`,
         )
-      : removed.snapshotFailedRepos.map(repoTail);
+      : removed.snapshotFailedRepos.map(tailOf);
   const failedNote =
     kept.length > 0
       ? `；⚠️ 以下仓的未提交改动无法自动保存、工作区已保留未删除，请手动处理后再清理：${kept.join("、")}`
@@ -2654,7 +2948,12 @@ export const removeTaskWorktrees = async (
     const snap = await snapshotDirtyWorktree(workDir, {
       taskId: t.id,
       dirName: names[i],
-      taskBranch: t.gitBranches?.find((b) => b.repoPath === repoPath)?.name,
+      // 半截检出残留（locked=initializing）不往任务分支上记 WIP——见 snapshotBranchFor
+      taskBranch: await snapshotBranchFor(
+        repoPath,
+        workDir,
+        t.gitBranches?.find((b) => b.repoPath === repoPath)?.name,
+      ),
     });
     if (snap.kind === "snapshotted") {
       snapshotRepos.push(repoPath);
@@ -2673,11 +2972,7 @@ export const removeTaskWorktrees = async (
       continue;
     }
     // 优先走 git worktree remove（同时清 .git/worktrees 注册）；原仓库没了 / 命令失败退回 rm + prune
-    const removed = await runGit(
-      repoPath,
-      ["worktree", "remove", "--force", workDir],
-      60_000,
-    );
+    const removed = await forceRemoveWorktree(repoPath, workDir);
     if (!removed.ok) {
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
       await runGit(repoPath, ["worktree", "prune"]);
@@ -2745,7 +3040,7 @@ const resolveWorktreeOwnerRepo = async (workDir: string): Promise<string | null>
 const removeWorktreeDirAndRegistration = async (workDir: string): Promise<void> => {
   const repoCwd = await resolveWorktreeOwnerRepo(workDir);
   if (repoCwd) {
-    const removed = await runGit(repoCwd, ["worktree", "remove", "--force", workDir], 60_000);
+    const removed = await forceRemoveWorktree(repoCwd, workDir);
     if (removed.ok) return;
   }
   await fs.rm(workDir, { recursive: true, force: true });
@@ -2874,7 +3169,12 @@ export const syncTaskWorktreesToRepoPaths = async (
     const snap = await snapshotDirtyWorktree(workDir, {
       taskId: t.id,
       dirName,
-      taskBranch: t.gitBranches?.find((b) => b.repoPath === repoPath)?.name,
+      // 半截检出残留（locked=initializing）不往任务分支上记 WIP——见 snapshotBranchFor
+      taskBranch: await snapshotBranchFor(
+        repoPath,
+        workDir,
+        t.gitBranches?.find((b) => b.repoPath === repoPath)?.name,
+      ),
     });
     if (snap.kind === "snapshotted") {
       snapshotRepos.push(repoPath);
@@ -2888,11 +3188,7 @@ export const syncTaskWorktreesToRepoPaths = async (
         `无法保存 ${workDir} 里未提交的改动（${snap.reason}），已保留该隔离工作区、未解绑。请先手动提交 / 备份其中的改动，或解决上述问题后重试。`,
       );
     }
-    const removed = await runGit(
-      repoPath,
-      ["worktree", "remove", "--force", workDir],
-      60_000,
-    );
+    const removed = await forceRemoveWorktree(repoPath, workDir);
     if (!removed.ok) {
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
       await runGit(repoPath, ["worktree", "prune"]);
@@ -3015,9 +3311,14 @@ const pruneUnmappedTaskWorktreeDirs = async (
     const snap = await snapshotDirtyWorktree(workDir, {
       taskId: t.id,
       dirName: e.name,
-      taskBranch: repoPath
-        ? t.gitBranches?.find((b) => b.repoPath === repoPath)?.name
-        : undefined,
+      // 半截检出残留（locked=initializing）不往任务分支上记 WIP——见 snapshotBranchFor
+      taskBranch: await snapshotBranchFor(
+        repoPath || null,
+        workDir,
+        repoPath
+          ? t.gitBranches?.find((b) => b.repoPath === repoPath)?.name
+          : undefined,
+      ),
     });
     if (snap.kind === "failed") {
       // 快照落不了就别删：目录留着、下次 ensure 再试（改名隔离目录 .orphaned-* 也是同样的「留给用户」口径）
@@ -3027,11 +3328,7 @@ const pruneUnmappedTaskWorktreeDirs = async (
       continue;
     }
     if (repoPath) {
-      const removed = await runGit(
-        repoPath,
-        ["worktree", "remove", "--force", workDir],
-        60_000,
-      );
+      const removed = await forceRemoveWorktree(repoPath, workDir);
       if (!removed.ok) {
         await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
         await runGit(repoPath, ["worktree", "prune"]);
@@ -3108,6 +3405,8 @@ export const cleanupOrphanTaskWorktrees = async (
       }
       await fs.rm(orphanDir, { recursive: true, force: true });
       for (const gitDir of mainGitDirs) {
+        // 目录刚被 rm 掉、登记可能还锁着 initializing（硬杀的 add 残留）：prune 清不掉被锁的，先解锁（R14 Q10-01）
+        await unlockStaleInitializingZombies(path.dirname(gitDir));
         await runGit(path.dirname(gitDir), ["worktree", "prune"]);
       }
       console.log(`[task-worktrees] 已清理孤儿 worktree：${orphanDir}`);

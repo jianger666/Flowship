@@ -14,7 +14,7 @@ import type { Task } from "@/lib/types";
 const { getTaskMeta, searchTaskRepoFiles, readGitBranchState } = vi.hoisted(
   () => ({
     getTaskMeta: vi.fn(),
-    searchTaskRepoFiles: vi.fn(async () => [] as string[]),
+    searchTaskRepoFiles: vi.fn(async () => ({ files: [] as string[], truncated: false })),
     readGitBranchState: vi.fn(async () => ({
       isRepo: true,
       current: "main",

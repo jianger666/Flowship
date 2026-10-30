@@ -245,7 +245,13 @@ describe("ownership R23 wave1", () => {
     await fs.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
   });
 
-  it("R23-1a：stop 把 pendingAck cancelled 后 advance auto-approve 不改写 completed", async () => {
+  // R14 Q7a-05 之后：普通 stop 不再把已交卷（awaiting_ack）的 action 打成 cancelled（保留给用户之后 ack、与归档同口径）；
+  // 划除（trigger=exclude）仍把它收成 cancelled。两种收尾下 auto-approve 都必须因 revoke 被拒——不落「已通过」、不改写 completed。
+  // 本用例原本钉的是后者的竞态（stop 写 cancelled、auto-approve 不得盖回 completed），现参数化覆盖两种触发。
+  it.each([
+    { trigger: undefined, expectStatus: "awaiting_ack" as const },
+    { trigger: "exclude" as const, expectStatus: "cancelled" as const },
+  ])("R23-1a：stop(trigger=$trigger) 与 advance auto-approve 竞态 → action 终态 $expectStatus、auto-approve 不改写 completed", async ({ trigger, expectStatus }) => {
     // R24-8：旧用例先完整 stop 再用 fresh task 调 advance——pendingAck 分支根本不进；
     // 改为：带着 awaiting_ack 快照入场 → 锁住 task 让 auto-approve 卡在 patchActionIfOwner →
     // stop revoke → 放行后条件写被拒、不落「已通过」。
@@ -281,7 +287,7 @@ describe("ownership R23 wave1", () => {
     await sleep(80);
 
     const hangStop = installHangingFailpoint("stop.afterGate");
-    const pStop = stopTaskAgent(taskSnap);
+    const pStop = stopTaskAgent(taskSnap, trigger ? { trigger } : {});
     await hangStop.waitHit();
     // 此时已 revoke + lifecycle=stopping；放行后 auto-approve 的 isOwner/结构条件必失败
     releaseLock();
@@ -293,7 +299,7 @@ describe("ownership R23 wave1", () => {
 
     const fresh = await readMetaV06(id);
     expect(fresh?.actions.find((a) => a.id === "act_ack")?.status).toBe(
-      "cancelled",
+      expectStatus,
     );
     const events = await readEvents(id);
     expect(

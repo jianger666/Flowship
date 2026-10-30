@@ -28,6 +28,7 @@ import {
   isSafeGitlabHost,
   isWorkitemReadyForQaInbox,
   MR_INBOX_CACHE_TTL_MS,
+  MR_INBOX_FETCH_CONCURRENCY,
   MR_INBOX_SCAN_DEADLINE_MS,
   buildMrInboxPartialMessage,
   parseGitlabMrUrl,
@@ -54,6 +55,7 @@ import {
   type MeegleProject,
 } from "./meegle-cli";
 import { getMR, type GetMRResult } from "./gitlab-client";
+import { runWithLimit, type PoolGuard } from "./limited-pool";
 import { deriveHostFromRepo } from "./submit-mr-guard";
 import { assertTrustedGitHost } from "./trusted-git-host";
 import { readSettingsFile } from "./settings-fs";
@@ -449,14 +451,31 @@ const recordFailure = (
   ctx.kinds.add(kind);
 };
 
+/** 记一次「超总时限」（幂等）：循环里的检查与并发池到点放手都走它，保证只记一条 */
+const markTimedOut = (ctx: ScanContext): void => {
+  if (ctx.timedOut) return;
+  ctx.timedOut = true;
+  recordFailure(ctx, "deadline", "超过扫描总时限、仅返回已扫到的部分");
+};
+
 /** 超总时限则记一次失败并返回 true（循环里 `if (overDeadline(ctx)) break;`） */
 const overDeadline = (ctx: ScanContext): boolean => {
   if (ctx.timedOut) return true;
   if (Date.now() < ctx.deadlineAt) return false;
-  ctx.timedOut = true;
-  recordFailure(ctx, "deadline", "超过扫描总时限、仅返回已扫到的部分");
+  markTimedOut(ctx);
   return true;
 };
+
+/**
+ * 后半段并发池的时限闸（Q10-03）：领新任务前看时钟；到点后不再等在途任务（定时器放手）。
+ * 放手走 markTimedOut 而不是再比一次 Date.now()：定时器触发本身就说明到点了，不依赖时钟读数
+ *（测试里 Date 可能被单独拨动）。
+ */
+const poolGuard = (ctx: ScanContext): PoolGuard => ({
+  shouldStop: () => overDeadline(ctx),
+  deadlineAt: ctx.deadlineAt,
+  onAbandon: () => markTimedOut(ctx),
+});
 
 /** 把 ctx 里累计的失败范围整理成返回给客户端的 incomplete（无失败返回 undefined） */
 const buildIncompleteScope = (
@@ -579,8 +598,11 @@ const scanPendingMr = async (
 
   const items: MrInboxItem[] = [];
   if (gitToken) {
-    const detailed = await Promise.all(
-      deduped.map(async (c) => {
+    // 并发上限 + 总时限（Q10-03）：以前对全部候选 Promise.all、这一段不看 deadline
+    const slots = await runWithLimit(
+      deduped,
+      MR_INBOX_FETCH_CONCURRENCY,
+      async (c) => {
         const parsed = parseGitlabMrUrl(c.mrUrl);
         if (!parsed) return { c, mr: null as null, error: "MR URL 无法解析" };
         // host 不在 allowlist：仅展示纯链接，绝不带 PAT 出站
@@ -599,9 +621,14 @@ const scanPendingMr = async (
           return { c, mr: null as null, error: r.error };
         }
         return { c, mr: r, error: undefined };
-      }),
+      },
+      poolGuard(ctx),
     );
-    for (const { c, mr, error } of detailed) {
+    for (const slot of slots) {
+      // 超总时限没轮到 / 到点放手时还在途：不输出这一条。客户端 mergePartialScan 在 all（超时）下沿用旧条目；
+      // 输出成 mr:null 的纯链接反而会（新数据优先）盖掉旧表里带详情的同一条
+      if (!slot) continue;
+      const { c, mr, error } = slot.value;
       if (mr && (mr.state === "merged" || mr.state === "closed")) continue;
       items.push({
         mrUrl: c.mrUrl,
@@ -705,10 +732,15 @@ const enrichPendingRegressionWithMr = async (
   bugs: BugInboxItem[],
   gitToken: string,
   allowedHosts: ReadonlySet<string>,
+  ctx: ScanContext,
 ): Promise<BugInboxItem[]> => {
   if (bugs.length === 0) return bugs;
-  return Promise.all(
-    bugs.map(async (bug) => {
+  // 并发上限 + 总时限（Q10-03）：每个 bug 一次 meegle 评论（进程级串行队列）+ 一次 GitLab，
+  // 以前一口气全塞进去、不看 deadline
+  const slots = await runWithLimit(
+    bugs,
+    MR_INBOX_FETCH_CONCURRENCY,
+    async (bug): Promise<BugInboxItem> => {
       try {
         const comments = await fetchWorkitemComments(
           bug.workItemId,
@@ -761,8 +793,11 @@ const enrichPendingRegressionWithMr = async (
         );
         return bug;
       }
-    }),
+    },
+    poolGuard(ctx),
   );
+  // 超总时限没补到的 bug 原样保留：bug 本身来自 MQL、是新鲜的，只缺关联 MR（下一轮完整扫描会补上）
+  return bugs.map((bug, i) => slots[i]?.value ?? bug);
 };
 
 const scanMrInbox = async (): Promise<MrInboxScanResult> => {
@@ -843,6 +878,7 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
         pendingRegression,
         gitToken,
         allowedHosts,
+        ctx,
       );
     }
 

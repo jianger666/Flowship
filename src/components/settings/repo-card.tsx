@@ -257,6 +257,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                         type="button"
                         variant="ghost"
                         size="icon-sm"
+                        aria-label={`删除仓库 ${r.name || r.path}`}
                         onClick={() => removeRepo(r.path)}
                       >
                         <Trash2 />

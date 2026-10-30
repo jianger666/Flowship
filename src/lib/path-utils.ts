@@ -43,6 +43,18 @@ export const isAbsolutePathLike = (p: string): boolean =>
 const normalizeSeparators = (p: string): string => p.replace(/\\/g, "/");
 
 /**
+ * 仓库路径的末段（仓名）：展示 / 匹配用。反斜杠、尾随分隔符都认
+ * （Windows 路径 `C:\w\crm-web` → `crm-web`）；取不到（空串 / 全是分隔符）→ 原值。
+ * POSIX 路径的结果与历史写法 `p.split("/").filter(Boolean).pop() ?? p` 完全一致。
+ *
+ * R14 Q7b-05：旧写法只认 `/`——Windows 路径整条被当成「仓名」，ship 后置检查拿它当正则
+ * 去 artifact 里找跳过说明、永远找不到（明明写了「crm-web 跳过」也判「agent 漏报」）。
+ * 取仓名一律走这里（`tests/repo-tail-windows.test.ts` 扫源码防止旧写法回流）。
+ */
+export const repoTail = (p: string): string =>
+  normalizeSeparators(p).split("/").filter(Boolean).pop() ?? p;
+
+/**
  * 取绝对 / 相对路径末尾段
  *
  * - 自动剥掉尾随 `/`（目录场景：`/foo/bar/` → `bar`）

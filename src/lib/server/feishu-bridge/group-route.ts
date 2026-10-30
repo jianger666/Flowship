@@ -120,6 +120,14 @@ import type {
   ParsedInboundContent,
 } from "./router";
 import { noteGroupSendFailure } from "./group-failure-notice";
+import { noteGroupMultiBound } from "./group-multi-bound-notice";
+import {
+  hasLocalGroupBinding,
+  isGroupRouteCandidate,
+  pickRouteTask,
+  toCoBoundTask,
+  type CoBoundTask,
+} from "./group-task-binding";
 import {
   type CardButtonValue,
   type FeishuInboundMessage,
@@ -417,13 +425,18 @@ export const parseGroupCommand = (text: string): GroupCommand => {
 const CHAT_TASK_CACHE_KEY = "__flowshipFeishuGroupChatTaskCacheV1__";
 /** 命中缓存有效期——群绑定极少变，10 分钟足够省掉 meegle 往返 */
 const POSITIVE_TTL_MS = 10 * 60_000;
+/**
+ * 同一个群上绑了多个任务时的命中缓存有效期：受理哪个取决于「谁正在运行 / 等回答」，这是会变的，
+ * 缓存 10 分钟会让群消息在任务切换后继续进上一个活跃任务——缩到 1 分钟（代价只是更勤地重扫一遍）。
+ */
+const MULTI_BOUND_TTL_MS = 60_000;
 /** 未命中缓存有效期——别让无关群的刷屏每条都触发全量扫描 */
 const NEGATIVE_TTL_MS = 60_000;
 /** 单次扫描的任务上限（按 updatedAt 倒序取），防任务多时把 meegle 打爆 */
 const MAX_SCAN_TASKS = 20;
 
 type ChatTaskCache = {
-  hits: Map<string, { taskId: string; at: number }>;
+  hits: Map<string, { taskId: string; at: number; coBound?: CoBoundTask[] }>;
   misses: Map<string, number>;
 };
 
@@ -450,22 +463,32 @@ export const __resetGroupChatCacheForTest = (): void => {
   invalidateGroupChatCache();
 };
 
+export interface GroupRoute {
+  taskId: string;
+  /** 同一个群上绑定的全部任务（含 taskId 自己）；只有一个任务时为空数组 */
+  coBound: CoBoundTask[];
+}
+
 /**
- * 群 chat_id → 本机关联该需求的 task id。
+ * 群 chat_id → 本机关联该需求的任务。
  *
  * 反查方向是「本机任务 → 它绑定的群」而不是「群 → 工作项」：飞书没有开放
  * 「按群反查工作项」的接口，而本机任务数量有限、storyUrl → group_type 是现成的读路径。
  * 扫描顺带把查到的 (群, task) 全缓存下来，之后别的群消息大概率直接命中。
+ *
+ * 同一个群可能同时被多个任务绑（B4-4 / Q12b-02）：这里挑受理的那个——正在运行 / 等用户回答的优先，
+ * 同档取 updatedAt 最新（见 group-task-binding 的 pickRouteTask），并把同群的全部任务一起返回，
+ * 让调用方能给属主留一条提示。同伴只在「读它不用打网络」的范围里找（本地关联了这个群的任务）。
  */
-export const resolveTaskIdByGroupChat = async (
+export const resolveGroupRoute = async (
   chatId: string,
-): Promise<string | null> => {
+): Promise<GroupRoute | null> => {
   if (!chatId) return null;
   const cache = getChatTaskCache();
   const now = Date.now();
 
   const hit = cache.hits.get(chatId);
-  if (hit && now - hit.at < POSITIVE_TTL_MS) {
+  if (hit && now - hit.at < (hit.coBound?.length ? MULTI_BOUND_TTL_MS : POSITIVE_TTL_MS)) {
     // 命中也要活体校验：删任务 / 解绑 / 换绑都会让缓存撒谎，一次读全覆盖
     //（review 十三轮-1；换绑解绑经常发生在飞书侧，写钩子拦不住，只能读时验）。
     // 读炸了 fail-open 沿用旧命中（抖一下不断流）；明确对不上才删了重扫。
@@ -476,34 +499,21 @@ export const resolveTaskIdByGroupChat = async (
     } catch {
       fresh = true;
     }
-    if (fresh) return hit.taskId;
+    if (fresh) return { taskId: hit.taskId, coBound: hit.coBound ?? [] };
     cache.hits.delete(chatId);
   }
   const missAt = cache.misses.get(chatId);
   if (missAt && now - missAt < NEGATIVE_TTL_MS) return null;
 
   // 候选要带上本任务群关联字段：getBoundGroupChatId 本任务优先，没有它本地关联的群永远扫不到
-  let candidates: Array<{
-    id: string;
-    feishuStoryUrl?: string;
-    feishuGroupChatId?: string;
-    feishuGroupChatName?: string;
-  }> = [];
+  let candidates: Awaited<ReturnType<typeof listTasks>> = [];
   try {
     const all = await deps.listTasks();
     candidates = all
-      .filter(
-        (t) =>
-          // 有链接或有本任务群关联即可（口径与 getBound/describe 对齐：
-          // 本地关联不需要工作项，只剩链接一条会漏掉“绑了群但没链接”的任务）
-          ((t.feishuStoryUrl ?? "").trim().length > 0 ||
-            (t.feishuGroupChatId ?? "").trim().length > 0) &&
-          t.repoStatus !== "merged" &&
-          t.repoStatus !== "abandoned" &&
-          // 归档任务退出群回流：侧栏都藏了群里还回话心智对不上；且归档会 bump
-          // updatedAt 把活跃群任务挤出 20 个扫描窗口（归档越多群越哑）。找回即恢复。
-          !t.archived,
-      )
+      // 候选口径见 isGroupRouteCandidate（与绑定查重共用）：有链接或有本任务群关联即可、
+      // 已合并 / 已放弃 / 已归档的退出群回流。归档任务退出：侧栏都藏了群里还回话心智对不上；
+      // 且归档会 bump updatedAt 把活跃群任务挤出 20 个扫描窗口（归档越多群越哑）。找回即恢复。
+      .filter(isGroupRouteCandidate)
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
       .slice(0, MAX_SCAN_TASKS);
   } catch (err) {
@@ -520,7 +530,8 @@ export const resolveTaskIdByGroupChat = async (
   // 「先扫到」= 最近更新，必须它占位；后面较老的任务不许覆盖（否则缓存里的归属
   // 取决于「哪个群的消息先触发了扫描」，群消息会随机串到旧任务）
   const cachedInScan = new Set<string>();
-  for (const t of candidates) {
+  for (let i = 0; i < candidates.length; i += 1) {
+    const t = candidates[i]!;
     // candidate 级 try/continue：单个绑定读取一抖只跳过这一个候选，不穿出整条入向链
     //（和身份三连同一待遇；最坏变成节流后的无任务回执，按文案碰一下任务即恢复）。
     let bound: string | null = null;
@@ -540,12 +551,32 @@ export const resolveTaskIdByGroupChat = async (
     }
     if (bound === chatId) {
       cache.misses.delete(chatId);
-      return t.id;
+      // 先命中的 t 是候选里 updatedAt 最新的；再往后找「本地关联了同一个群」的同伴（读它们不用打网络），
+      // 有同伴就在其中挑一个受理（活着的优先），并把缓存改成这个挑选结果（缓存期缩短，见 MULTI_BOUND_TTL_MS）
+      const peers: typeof candidates = [];
+      for (const p of candidates.slice(i + 1)) {
+        if (!hasLocalGroupBinding(p)) continue;
+        try {
+          if ((await deps.getBoundGroupChatId(p)) === chatId) peers.push(p);
+        } catch {
+          // 同伴读不出来就当没有：不影响主路径
+        }
+      }
+      if (peers.length === 0) return { taskId: t.id, coBound: [] };
+      const chosen = pickRouteTask(t, peers);
+      const coBound = [t, ...peers].map(toCoBoundTask);
+      cache.hits.set(chatId, { taskId: chosen.id, at: Date.now(), coBound });
+      return { taskId: chosen.id, coBound };
     }
   }
   cache.misses.set(chatId, Date.now());
   return null;
 };
+
+/** 只要 task id 的调用方（回群失败提示等）用；挑选规则同 resolveGroupRoute */
+export const resolveTaskIdByGroupChat = async (
+  chatId: string,
+): Promise<string | null> => (await resolveGroupRoute(chatId))?.taskId ?? null;
 
 // ----------------- 回群小工具 -----------------
 
@@ -1895,7 +1926,8 @@ export const routeGroupInboundMessage = async (
   const senderIsBot = isGroupBotSender(msg);
 
   // 4) chat_id → 本机任务
-  const taskId = await resolveTaskIdByGroupChat(msg.chat_id);
+  const route = await resolveGroupRoute(msg.chat_id);
+  const taskId = route?.taskId ?? null;
   if (!taskId) {
     // 未绑定群：按 chat 节流，窗内只回第一句，其余静默；机器人发件人整条静默（groupReplyMention）。
     // 文案半句活路：任务存在但被挤出 20 任务扫描窗口时，去 app 碰一下任务比解绑重绑管用。
@@ -1909,6 +1941,11 @@ export const routeGroupInboundMessage = async (
       );
     }
     return { kind: "skipped", messageId, error: SKIP_GROUP_NO_TASK };
+  }
+  // 4.1) 这个群同时绑了多个任务：这条进了 taskId，给属主在它的事件流里留一条提示
+  // （节流、永不抛；只写事件、不往群里回话，见 group-multi-bound-notice）
+  if (route && route.coBound.length > 1) {
+    await noteGroupMultiBound(taskId, msg.chat_id, route.coBound);
   }
 
   // 4.25) 到达顺带 draining：队里有攒的且此刻空闲，先答旧的（FIFO），再处理当前这条

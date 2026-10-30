@@ -16,7 +16,7 @@ import {
   getAskCardSettledView,
 } from "./ask-settle-state";
 import { rememberAskCard, rememberCardMessage } from "./card-map";
-import { flushCardSeqToDisk, nextCardSequence } from "./card-seq";
+import { bumpCardSequence, flushCardSeqToDisk, nextCardSequence } from "./card-seq";
 import {
   batchUpdateCard,
   createCardEntity,
@@ -26,20 +26,64 @@ import {
   updateCardElementContent,
   updateCardEntity,
 } from "./lark-api";
+import { classifyLarkFailure, LarkApiError } from "./types";
 import type {
   CardHeaderTemplate,
   CardButtonValue,
   CardStreamAppendAskOpts,
   CardStreamFinalizeOpts,
   CardStreamHandle,
+  CardStreamHealth,
   CardStreamOptions,
   CardStreamStartOpts,
+  LarkFailureKind,
 } from "./types";
 
 /** 节流：时间阈值（Hermes 默认） */
 const FLUSH_INTERVAL_MS = 250;
 /** 节流：字符阈值 */
 const FLUSH_CHAR_THRESHOLD = 600;
+
+/**
+ * 熔断：连续失败 N 次后暂停流式更新（R14 P1-1）。
+ * 为什么要有：flush 失败既不回滚也不退避，节流器照 250ms 一次地发整卡 PUT（argv 可达数十 KB）——
+ * 飞书限流 / 断网 / 黑洞时变成 lark-cli 子进程风暴，还会占死「全进程单飞」的 lark 队列，拖垮别的任务。
+ */
+const BREAKER_FAIL_THRESHOLD = 3;
+/** 熔断退避：首次 2s，每次探测仍失败就翻倍，封顶 30s */
+const BREAKER_BACKOFF_BASE_MS = 2_000;
+const BREAKER_BACKOFF_MAX_MS = 30_000;
+/**
+ * 卡片更新类调用的单次超时。lark 调用进程级单飞，默认 30s 对流式更新太长：
+ * 一个黑洞请求会让所有任务的飞书写操作陪等 30s。
+ */
+const CARD_OP_TIMEOUT_MS = 8_000;
+/** 终稿（finalize）单次超时：它决定用户能不能看到完整回复，弱网下多给点时间，别轻易判失败 */
+const CARD_FINALIZE_TIMEOUT_MS = 15_000;
+/**
+ * 自驱探测封顶：卡一直没收尾、lark 又一直挂时，别在后台永远每 ≤30s 打一发。
+ * 超过这个次数（约 3.5 分钟）就不再自己续约；之后只有新的 push（说明这一轮还活着）或 finalize 才会再试。
+ */
+const BREAKER_MAX_AUTO_PROBES = 10;
+/**
+ * 累计跳闸几次才对外通知（onBreakerOpen）：2 = 首次探测仍失败。
+ * 1–2 秒的小抖动会 3 连败即跳闸、2s 后的首次探测就恢复了——这种不该给用户一条「已暂停实时推送」
+ */
+const BREAKER_NOTIFY_MIN_TRIPS = 2;
+/** 失败原因存入 / 打日志前的限长：lark-cli 的 execFile 错误 message 动辄几十 KB（含整卡 --data） */
+const ERROR_TEXT_MAX = 240;
+/**
+ * 内容超限（飞书卡片体积上限 / Windows 命令行上限，见 classifyLarkFailure 的 `too_long`）之后，终稿的收紧档位：
+ * 正文字符预算，过程区取一半。三档逐档收紧：Windows 命令行里的引号 / 反斜杠转义会把长度放大到 2~3 倍、
+ * 飞书卡片上限又按字节算（中文 3 字节 / 字），一次砍到 ≈10k 字不一定够；失败是「被拒绝」而不是写了一半，
+ * 逐档收紧重发没有副作用。
+ */
+const SHRINK_ANSWER_BUDGETS = [10_000, 5_000, 2_500] as const;
+/** 序号冲突（300317）一轮失败里最多自愈几次（任一次成功后复位）；仍冲突就按普通失败计入熔断 */
+const SEQ_HEALS_PER_EPISODE = 1;
+/** 流式模式被飞书关掉（200850 超时自动关 / 300309）后：一张卡最多重新打开几次、两次重开最少间隔 */
+const STREAM_REOPEN_MAX = 8;
+const STREAM_REOPEN_MIN_GAP_MS = 30_000;
 /** 单卡 content 上限；留余量给截断提示 */
 const CONTENT_SOFT_LIMIT = 95_000;
 const TRUNCATE_HINT = "\n\n内容过长，完整回复在 app 内查看";
@@ -379,6 +423,59 @@ export const buildStreamingCardJson = (opts: {
   };
 };
 
+/** 折叠空白并限长（失败原因进状态 / 日志 / 提示前都要过一遍） */
+const clipText = (s: string, max = ERROR_TEXT_MAX): string => {
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+};
+
+/**
+ * 失败原因的一行摘要。lark-cli 的 execFile 错误 message 是
+ * 「Command failed: <整条命令行（含 --data 整卡 JSON）>\n<stderr>」：直接截前 N 字，留下的全是 argv，
+ * 真正的原因（stderr）被截没了——所以先剥掉命令行，只留 stderr 里最后一条有内容的行；
+ * stderr 也是空的就退回「lark-cli 调用失败（命令标签）」。其它形态的 message 照常折叠空白 + 限长。
+ */
+const failureSummary = (err: unknown): string => {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!message.startsWith("Command failed:")) return clipText(message);
+  const rawStderr =
+    err instanceof LarkApiError
+      ? (err.raw as { stderr?: unknown } | undefined)?.stderr
+      : undefined;
+  const stderr =
+    typeof rawStderr === "string" && rawStderr.trim()
+      ? rawStderr
+      : message.split("\n").slice(1).join("\n");
+  const lines = stderr
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const lastLine = lines[lines.length - 1];
+  if (lastLine) return clipText(lastLine);
+  const api = err instanceof LarkApiError ? err.api : undefined;
+  return api ? `lark-cli 调用失败（${api}）` : "lark-cli 调用失败";
+};
+
+/**
+ * 失败原因瘦身后再存：lark-cli 的 execFile 错误 message 动辄几十 KB（见 failureSummary）；
+ * LarkApiError 还挂着 raw（stdout / stderr 全文）。句柄活多久它就占多久，
+ * 还会被 outbound 拿去拼提示——只留一行摘要 + 定位用的结构化字段（错误码 / 命令 / log_id / 违规字段）。
+ */
+const slimError = (err: unknown): unknown => {
+  if (err instanceof LarkApiError) {
+    return new LarkApiError(failureSummary(err), {
+      code: err.code,
+      api: err.api,
+      logId: err.logId,
+      fieldViolations: err.fieldViolations,
+      // 权限类失败的引导链接（开通 scope 的页面）：app 内提示要带上它，短字符串、不含正文
+      consoleUrl: err.consoleUrl ? clipText(err.consoleUrl, 400) : undefined,
+    });
+  }
+  if (err instanceof Error) return new Error(failureSummary(err));
+  return failureSummary(err);
+};
+
 export const createCardStream = (
   taskId: string,
   opts: CardStreamOptions,
@@ -392,6 +489,43 @@ export const createCardStream = (
   let messageId: string | undefined;
   /** lark 调用失败累计 */
   let failCount = 0;
+  // —— 熔断器（R14 P1-1）——
+  /** 连续失败次数；任一次成功清零 */
+  let consecutiveFails = 0;
+  /**
+   * 熔断打开到何时（ms 时间戳），0 = 关。到期即「半开」：放行一次探测——
+   * 失败立刻再跳闸（退避翻倍），成功则全部清零。
+   */
+  let breakerOpenUntil = 0;
+  /** 连续跳闸次数（决定退避翻倍；成功清零） */
+  let breakerTrips = 0;
+  /** 本卡生命周期内是否开过熔断（后来恢复了也算） */
+  let breakerEverOpened = false;
+  /** onBreakerOpen 是否已调过（每张卡最多一次） */
+  let breakerNotified = false;
+  /** finalize 的终稿内容是否落到了卡片：undefined = 还没 finalize */
+  let finalizeOk: boolean | undefined;
+  /** start() 失败（建卡 / 发卡没成）：这一轮飞书里从头到尾没有卡，finalize 必须记成「没同步」 */
+  let startFailed = false;
+  /** 最近一次 lark 失败（已瘦身：一行摘要 + 错误码 / 命令 / log_id / 违规字段等结构化字段，不带 raw，见 slimError） */
+  let lastError: unknown;
+  // —— 失败分类驱动的状态（R14 B4-3 · Q12a-06 / 07）——
+  /** 致命故障类别：设了就不再半开探测（再试也不会好），只剩 finalize 收尾；任一次写成功（= 恢复的证据）清掉 */
+  let fatalKind: LarkFailureKind | undefined;
+  /** 致命故障的对外通知是否已发（与普通熔断的 breakerNotified 各一次：「不会好了」是新信息） */
+  let fatalNotified = false;
+  /** 内容超限后的收紧档位：-1 = 不收紧；见 SHRINK_ANSWER_BUDGETS */
+  let shrinkLevel = -1;
+  /** 收紧是否真的截掉了内容（预算比实际内容大就没截） */
+  let shrinkApplied = false;
+  /** 序号冲突自愈次数余量（任一次写成功后复位） */
+  let seqHealsLeft = SEQ_HEALS_PER_EPISODE;
+  /** 流式重开：已重开次数 / 上次重开时间 / 是否已有一个重开 op 在排 */
+  let streamReopens = 0;
+  let lastReopenAt = 0;
+  let reopenQueued = false;
+  /** finalize 已经在执行（致命故障在这时才发现，不再单独通知——outbound 的终态 info 会说） */
+  let finalizing = false;
   /** 是否已 start / finalize */
   let started = false;
   let finalized = false;
@@ -446,11 +580,16 @@ export const createCardStream = (
 
   const warnFail = (label: string, err: unknown): void => {
     failCount += 1;
+    // 日志也限长：一次失败 30KB 的 message × 风暴期几百次，会把日志刷爆
     console.warn(
       `[feishu-bridge/card-stream] ${label}:`,
-      err instanceof Error ? err.message : err,
+      failureSummary(err),
     );
   };
+
+  /** 熔断是否打开（到期即「半开」：此时返回 false，放行一次探测）；致命故障 = 一直打开、永不半开 */
+  const isBreakerOpen = (): boolean =>
+    fatalKind !== undefined || breakerOpenUntil > Date.now();
 
   const clearFlushTimer = (): void => {
     if (flushTimer !== null) {
@@ -465,19 +604,207 @@ export const createCardStream = (
     return flushing;
   };
 
+  /** 链上是否已有一个「等着执行」的 flush（合并用：最多 1 个在跑 + 1 个在排） */
+  let flushQueued = false;
+  /**
+   * 请求一次 flush——合并排队：已有 flush 在排就不再排。
+   * 为什么：doFlush 每次读的都是最新 desired 全量，排队中的那个执行时自然带上之后所有 push；
+   * 不合并的话，链慢（限流 / 黑洞）时 250ms 一个 op 越排越长，恢复后还得把积压的整卡 PUT 逐个发完。
+   * 清零放在 op「开始执行」时：此后新到的 push 还能再排一个，不会漏。
+   */
+  const requestFlush = (): void => {
+    if (flushQueued) return;
+    flushQueued = true;
+    void enqueueCardOp(async () => {
+      flushQueued = false;
+      await doFlush();
+    });
+  };
+
+  /**
+   * 熔断期间的探测定时器：到期放行一次 flush（半开）。
+   * 不能只靠 push 触发——模型在长工具调用里没有新输出时没人再调 scheduleFlush，
+   * 卡片就永远等不到恢复探测。同一时刻只留这一个定时器（先清掉可能已排的 250ms 节流定时器）。
+   */
+  const armBreakerProbe = (): void => {
+    clearFlushTimer();
+    const wait = Math.max(FLUSH_INTERVAL_MS, breakerOpenUntil - Date.now());
+    flushTimer = scheduleTimer(() => {
+      flushTimer = null;
+      if (finalized) return;
+      requestFlush();
+    }, wait);
+  };
+
   const scheduleFlush = (): void => {
     // 非流式：不发中间态；流式且卡未建：等 start 成功后再刷
     if (finalized || !started || !streamingEnabled || !cardId) return;
+    // 熔断中：不再按 250ms / 字数起 flush（每一发都会撞墙），只留到期探测定时器
+    if (isBreakerOpen()) {
+      // 致命故障没有「到期探测」：不排任何定时器，只等 finalize
+      if (flushTimer === null && fatalKind === undefined) armBreakerProbe();
+      return;
+    }
     if (pendingChars >= FLUSH_CHAR_THRESHOLD) {
       clearFlushTimer();
-      void enqueueCardOp(() => doFlush());
+      requestFlush();
       return;
     }
     if (flushTimer !== null) return;
     flushTimer = scheduleTimer(() => {
       flushTimer = null;
-      void enqueueCardOp(() => doFlush());
+      requestFlush();
     }, FLUSH_INTERVAL_MS);
+  };
+
+  /**
+   * 对外通知「飞书卡片在掉线」（outbound 当场落一条 info）。普通熔断与致命故障各最多一次；
+   * 回调自己抛的异常吞掉——观测回调不能拖垮卡片流。普通熔断的入参形状与 B1 完全一致（不带 fatalKind）。
+   */
+  const notifyBreakerOpen = (retryInMs: number, fatal?: LarkFailureKind): void => {
+    if (fatal ? fatalNotified : breakerNotified) return;
+    if (fatal) fatalNotified = true;
+    else breakerNotified = true;
+    try {
+      opts.onBreakerOpen?.(
+        fatal
+          ? { consecutiveFails, retryInMs, error: lastError, fatalKind: fatal }
+          : { consecutiveFails, retryInMs, error: lastError },
+      );
+    } catch {
+      // 观测回调不能拖垮卡片流
+    }
+  };
+
+  /**
+   * 致命故障（再试也不会好）：熔断一直开着、不再半开探测，清掉待决的节流 / 探测定时器，只剩 finalize 收尾。
+   * `too_long` 同时把终稿收紧到第一档（finalize 的第一发就用缩短的内容，不白撞一次）。
+   * finalize 已经在跑时不再单独通知——outbound 的终态 info 会说。
+   */
+  const goFatal = (kind: LarkFailureKind): void => {
+    fatalKind = kind;
+    breakerEverOpened = true;
+    if (kind === "too_long") shrinkLevel = Math.max(shrinkLevel, 0);
+    clearFlushTimer();
+    if (!finalizing) notifyBreakerOpen(0, kind);
+  };
+
+  /**
+   * 飞书把本卡的流式模式关了（200850 超时自动关 / 300309）：此后每一发流式 content PUT 都会败。
+   * 官方文档给的恢复办法是把卡片 settings 里的 `streaming_mode` 设回 true——排进互斥链去做，
+   * 成功后马上补推落下的内容。有次数（STREAM_REOPEN_MAX）与间隔（STREAM_REOPEN_MIN_GAP_MS）上限，
+   * 返回 false = 这次不重开（调用方按普通失败计数；次数用完则转致命）。
+   * ⚠️ 这条恢复路径按飞书文档写成，**没有在真机上验证过**。
+   */
+  const reopenStream = (): boolean => {
+    if (!cardId || finalized || finalizing) return false;
+    if (reopenQueued) return true;
+    if (streamReopens >= STREAM_REOPEN_MAX) return false;
+    if (lastReopenAt > 0 && Date.now() - lastReopenAt < STREAM_REOPEN_MIN_GAP_MS) return false;
+    reopenQueued = true;
+    void enqueueCardOp(async () => {
+      reopenQueued = false;
+      if (finalized || finalizing || !cardId) return;
+      streamReopens += 1;
+      lastReopenAt = Date.now();
+      try {
+        await patchCardSettings(
+          cardId,
+          { config: { streaming_mode: true, update_multi: true } },
+          nextSeq(),
+          { timeoutMs: CARD_OP_TIMEOUT_MS },
+        );
+      } catch (err) {
+        // 重开本身失败：计入失败（间隔没到，不会再递归重开），之后走普通熔断
+        recordFailure("reopenStream", err);
+        return;
+      }
+      // 流式重新打开了：马上把落下的内容补上（成功会 recordSuccess）
+      await doFlush();
+    });
+    return true;
+  };
+
+  /**
+   * 记一次 lark 写失败：累计 + 连续计数；连续失败达阈值即跳闸（退避 2s → 4s → … 封顶 30s）。
+   * 互斥链保证同一时刻只有一个写在跑，计数不会并发错乱。
+   *
+   * B4-3：先按 `classifyLarkFailure` 分类，几类「再试也没用 / 可自愈」的失败走各自的策略，其余（限流 / 瞬时 / 未知）
+   * 照旧走连续 3 次熔断：
+   * - `gone`（卡片没了）/ `auth`（没权限）/ `too_long`（内容超限）→ 致命：停掉中间态（goFatal）；
+   * - `seq_conflict`（300317）→ 抬高该卡序号、马上重排一次 flush，不计入连续失败（一轮最多一次，仍冲突就按普通失败）；
+   * - `stream_closed`（流式被关）→ 重新打开流式（reopenStream）；次数用完 → 致命。
+   * start 失败 / finalize 期间的失败不分类：没有卡可修 / 终稿的就地自愈在 putFinal 里。
+   */
+  const recordFailure = (label: string, err: unknown): void => {
+    warnFail(label, err);
+    lastError = slimError(err);
+    if (label !== "start" && cardId && !finalized && !finalizing) {
+      const kind = classifyLarkFailure(err);
+      if (kind === "gone" || kind === "auth" || kind === "too_long") {
+        goFatal(kind);
+        return;
+      }
+      if (kind === "seq_conflict" && seqHealsLeft > 0) {
+        seqHealsLeft -= 1;
+        bumpCardSequence(cardId);
+        requestFlush();
+        return;
+      }
+      if (kind === "stream_closed") {
+        if (reopenStream()) return;
+        if (streamReopens >= STREAM_REOPEN_MAX) {
+          goFatal(kind);
+          return;
+        }
+      }
+    }
+    consecutiveFails += 1;
+    if (consecutiveFails < BREAKER_FAIL_THRESHOLD) return;
+    breakerTrips += 1;
+    const retryInMs = Math.min(
+      BREAKER_BACKOFF_BASE_MS * 2 ** (breakerTrips - 1),
+      BREAKER_BACKOFF_MAX_MS,
+    );
+    breakerOpenUntil = Date.now() + retryInMs;
+    breakerEverOpened = true;
+    // 持续性故障才对外通知：首次探测仍失败 = 第 2 次跳闸（小抖动探测就恢复，不打扰用户）。
+    // 通知前就进 finalize 的卡不会有这条——outbound 在终态另写一条 info，信号不丢
+    if (breakerTrips >= BREAKER_NOTIFY_MIN_TRIPS) notifyBreakerOpen(retryInMs);
+    // 流式进行中：排好到期探测（终稿 / 非流式 / 卡未建不需要）。自驱探测有次数上限（BREAKER_MAX_AUTO_PROBES）：
+    // 超过后不再续约，只等新的 push（scheduleFlush 的熔断分支会重新 arm）或 finalize
+    if (
+      started &&
+      !finalized &&
+      streamingEnabled &&
+      cardId &&
+      breakerTrips <= BREAKER_MAX_AUTO_PROBES
+    ) {
+      armBreakerProbe();
+    }
+  };
+
+  /** 一次 lark 写成功：连续失败清零、熔断关闭（探测成功 = 恢复）；致命故障 / 序号自愈余量一并复位 */
+  const recordSuccess = (): void => {
+    consecutiveFails = 0;
+    breakerTrips = 0;
+    breakerOpenUntil = 0;
+    fatalKind = undefined;
+    seqHealsLeft = SEQ_HEALS_PER_EPISODE;
+  };
+
+  /**
+   * finalize 失败的统一记账。终稿内容已经落到卡片（finalizeOk 已为 true）、只是收尾的小事
+   * （关 streaming_mode / 本地登记）失败 → 只 warn，不算「没同步」；否则终稿没落成，
+   * finalizeOk = false 并计入熔断（outbound 据此给用户明确提示，不再静默）。
+   */
+  const noteFinalizeFailure = (label: string, err: unknown): void => {
+    if (finalizeOk === true) {
+      warnFail(label, err);
+      return;
+    }
+    finalizeOk = false;
+    recordFailure(label, err);
   };
 
   /**
@@ -485,10 +812,20 @@ export const createCardStream = (
    * ⚠️ 禁止 rebuild / 全量 PUT 直接读 processFlushed——若 doFlush 的 batch 写出去后
    * flushed 未同步、或节流窗内 finalize 抢跑，全量 PUT 会用旧空串把思考区抹掉（P0 真机）。
    */
-  const canonicalProcess = (): string =>
-    truncateForCard(applyPrefixGuard(processFlushed, processDesired));
-  const canonicalAnswer = (): string =>
-    truncateForCard(applyPrefixGuard(answerFlushed, answerDesired));
+  /** 内容超限后的收紧：超过当前档位预算就截头 + 提示（不是超限就原样；shrinkLevel < 0 不收紧） */
+  const shrinkTo = (text: string, budget: number): string => {
+    if (text.length <= budget) return text;
+    shrinkApplied = true;
+    return text.slice(0, Math.max(0, budget - TRUNCATE_HINT.length)) + TRUNCATE_HINT;
+  };
+  const canonicalProcess = (): string => {
+    const text = truncateForCard(applyPrefixGuard(processFlushed, processDesired));
+    return shrinkLevel < 0 ? text : shrinkTo(text, SHRINK_ANSWER_BUDGETS[shrinkLevel] / 2);
+  };
+  const canonicalAnswer = (): string => {
+    const text = truncateForCard(applyPrefixGuard(answerFlushed, answerDesired));
+    return shrinkLevel < 0 ? text : shrinkTo(text, SHRINK_ANSWER_BUDGETS[shrinkLevel]);
+  };
 
   /** 把 desired 同步进 flushed（全量 PUT / finalize 前必调，保证写出去 = 内部态） */
   const syncFlushedFromDesired = (): void => {
@@ -548,7 +885,10 @@ export const createCardStream = (
     });
 
   /** 嵌套 panel 内 md_process：batch update_element 全量替换（流式 PUT 对嵌套静默无效） */
-  const batchPutProcess = async (content: string): Promise<void> => {
+  const batchPutProcess = async (
+    content: string,
+    timeoutMs: number = CARD_OP_TIMEOUT_MS,
+  ): Promise<void> => {
     if (!cardId) return;
     await batchUpdateCard(
       cardId,
@@ -567,6 +907,7 @@ export const createCardStream = (
         },
       ],
       nextSeq(),
+      { timeoutMs },
     );
   };
 
@@ -575,17 +916,24 @@ export const createCardStream = (
    * 真机：CardKit 全量 PUT 在 streaming_mode 下可能丢 collapsible_panel 嵌套 content，
    * 只靠 JSON 里带 processText 不够；batch 是嵌套区唯一可靠写入通道。
    */
-  const putEntityThenReassertProcess = async (): Promise<void> => {
+  const putEntityThenReassertProcess = async (
+    timeoutMs: number = CARD_OP_TIMEOUT_MS,
+  ): Promise<void> => {
     if (!cardId) return;
     syncFlushedFromDesired();
-    await updateCardEntity(cardId, rebuildCardJson(true), nextSeq());
+    await updateCardEntity(cardId, rebuildCardJson(true), nextSeq(), {
+      timeoutMs,
+    });
     if (processFlushed) {
-      await batchPutProcess(processFlushed);
+      await batchPutProcess(processFlushed, timeoutMs);
     }
   };
 
   const doFlush = async (): Promise<void> => {
     if (!cardId || finalized || !streamingEnabled) return;
+    // 熔断中：这一发必然撞墙，直接放过（内容留在 desired 里，到期探测 / finalize 整包补发）。
+    // finalize / append 在链上先调本函数、再做各自的写——它们自己的写不看熔断（强试一次），所以这里 return 不影响它们
+    if (isBreakerOpen()) return;
 
     const nextProcess = canonicalProcess();
     const nextAnswer = canonicalAnswer();
@@ -598,8 +946,10 @@ export const createCardStream = (
       return;
     }
 
-    // 先更新本地「已推」快照（打字机前缀以本地为准）；API 失败只记 fail、不回滚前缀
-    // ——失败后下一轮仍会用同一全量重试，符合「全量 PUT」语义
+    // 先更新本地「已推」快照（打字机前缀以本地为准）；API 失败时在 catch 里回滚到这里存的旧值
+    // ——请求没送达，卡片上并没有这些内容；不回滚的话，恢复后只要没有新增文字就永远不会补发
+    const prevProcessFlushed = processFlushed;
+    const prevAnswerFlushed = answerFlushed;
     if (processChanged) processFlushed = nextProcess;
     if (answerChanged) answerFlushed = nextAnswer;
     pendingChars = 0;
@@ -616,8 +966,10 @@ export const createCardStream = (
             ELEMENT_ANSWER,
             answerFlushed,
             nextSeq(),
+            { timeoutMs: CARD_OP_TIMEOUT_MS },
           );
         }
+        recordSuccess();
         return;
       }
       // 为什么思考区不走流式 PUT：
@@ -634,12 +986,17 @@ export const createCardStream = (
           ELEMENT_ANSWER,
           answerFlushed,
           nextSeq(),
+          { timeoutMs: CARD_OP_TIMEOUT_MS },
         );
       }
+      recordSuccess();
     } catch (err) {
-      warnFail("flush", err);
+      // 回滚「已推」快照（见上）。回滚必须和熔断一起做：没有熔断时，回滚会让每个排队的 flush 都重发整卡
+      processFlushed = prevProcessFlushed;
+      answerFlushed = prevAnswerFlushed;
       // header 失败时恢复脏标记，便于下次再试
       if (needHeader) headerDirty = true;
+      recordFailure("flush", err);
     }
   };
 
@@ -761,6 +1118,7 @@ export const createCardStream = (
       const sent = await sendCardMessage(openId, cardId);
       messageId = sent.message_id;
       started = true;
+      startFailed = false;
       await rememberCardMessage({
         messageId,
         cardId,
@@ -768,11 +1126,12 @@ export const createCardStream = (
         createdAt: Date.now(),
       });
     } catch (err) {
-      warnFail("start", err);
-      // start 失败：标记 started=false，后续 push 空操作
+      // start 失败：标记 started=false，后续 push 空操作；finalize 据 startFailed 记「没同步」
       started = false;
+      startFailed = true;
       cardId = undefined;
       messageId = undefined;
+      recordFailure("start", err);
     }
   };
 
@@ -869,6 +1228,8 @@ export const createCardStream = (
       // 非流式：只记状态，finalize 并入整卡
       if (!streamingEnabled) return;
       if (!cardId) return;
+      // 卡没了 / 没权限更新：按钮发不出去（本地快照已记，供 finalize 之外的读取）；别白等超时
+      if (fatalKind === "gone" || fatalKind === "auth") return;
 
       // 链上先刷过程/正文，避免随后全量 PUT 丢未推文本
       await doFlush();
@@ -887,14 +1248,16 @@ export const createCardStream = (
             },
           ],
           nextSeq(),
+          { timeoutMs: CARD_OP_TIMEOUT_MS },
         );
         // header / footer 状态全量 PUT + batch 回写思考区（防嵌套 content 被抹）
         headerDirty = false;
         await putEntityThenReassertProcess();
+        recordSuccess();
       } catch (err) {
-        warnFail("appendAskUser", err);
         // batch 成功但 header PUT 失败时仍保留快照，下次 finalize/flush 可补
         headerDirty = true;
+        recordFailure("appendAskUser", err);
       }
     });
   };
@@ -922,6 +1285,7 @@ export const createCardStream = (
       // 非流式：只记状态，finalize 并入整卡
       if (!streamingEnabled) return;
       if (!cardId) return;
+      if (fatalKind === "gone" || fatalKind === "auth") return;
 
       await doFlush();
       try {
@@ -938,9 +1302,11 @@ export const createCardStream = (
             },
           ],
           nextSeq(),
+          { timeoutMs: CARD_OP_TIMEOUT_MS },
         );
+        recordSuccess();
       } catch (err) {
-        warnFail("appendRetryButton", err);
+        recordFailure("appendRetryButton", err);
       }
     });
   };
@@ -955,30 +1321,79 @@ export const createCardStream = (
     }
   };
 
+  /**
+   * 终稿这一发的就地自愈（失败是「被拒绝」而不是写了一半，重发没有副作用）：
+   * ① 序号冲突（300317）→ 抬高该卡序号重发一次；
+   * ② 内容超限（`too_long`：卡片体积 / Windows 命令行）→ 终稿收紧一档（正文预算 10k → 5k → 2.5k 字）整包重发。
+   * 其它错误 / 档位用完 → 原样抛给调用方记账。`fn` 必须每次都从头重算要发的内容（收紧靠 canonical* 读 shrinkLevel）。
+   */
+  const putFinal = async <T>(fn: () => Promise<T>): Promise<T> => {
+    let healed = false;
+    for (;;) {
+      try {
+        return await fn();
+      } catch (err) {
+        const kind = classifyLarkFailure(err);
+        if (kind === "seq_conflict" && cardId && !healed) {
+          healed = true;
+          bumpCardSequence(cardId);
+          continue;
+        }
+        if (kind === "too_long" && shrinkLevel < SHRINK_ANSWER_BUDGETS.length - 1) {
+          shrinkLevel += 1;
+          console.warn(
+            `[feishu-bridge/card-stream] 终稿超出飞书卡片上限，正文收紧到 ${SHRINK_ANSWER_BUDGETS[shrinkLevel]} 字重发：`,
+            failureSummary(err),
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+  };
+
   const finalize = async (
     fin: CardStreamFinalizeOpts,
   ): Promise<void> => {
     clearFlushTimer();
     return enqueueCardOp(async () => {
+      finalizing = true;
       if (!started || finalized) {
+        // start 就失败了（建卡 / 发卡没成）：这一轮飞书里从头到尾没有卡，不能留 undefined——
+        // outbound 据 finalizeOk 判「没同步」，undefined 会被当成「还没结果」而照报「已完成」
+        if (!finalized && startFailed) finalizeOk = false;
         finalized = true;
         return;
       }
 
       applyFinalizeVisual(fin);
 
+      // 卡片已经没了 / 没权限更新：再发只会白等一个超时——不发。终态靠 outbound 的 info + 追发文案
+      // （finalizeOk=false、lastError 带着原因）；本地状态收口，与普通失败的收尾一致
+      if (fatalKind === "gone" || fatalKind === "auth") {
+        finalizeOk = false;
+        finalized = true;
+        headerDirty = false;
+        clearFlushTimer();
+        return;
+      }
+
       // —— 非流式：一次性建普通卡（引用+思考+正文+ask/retry+footer）——
       if (!streamingEnabled) {
         try {
-          answerDesired = closeUnclosedCodeFence(canonicalAnswer());
-          processDesired = closeUnclosedCodeFence(canonicalProcess());
-          syncFlushedFromDesired();
-          const cardJson = rebuildCardJson(false);
-          const created = await createCardEntity(cardJson);
+          const created = await putFinal(async () => {
+            answerDesired = closeUnclosedCodeFence(canonicalAnswer());
+            processDesired = closeUnclosedCodeFence(canonicalProcess());
+            syncFlushedFromDesired();
+            return createCardEntity(rebuildCardJson(false));
+          });
           cardId = created.card_id;
           const openId = await resolveOpenId();
           const sent = await sendCardMessage(openId, cardId);
           messageId = sent.message_id;
+          // 卡片消息已发出——用户已经能看到完整内容；下面的本地登记失败不算「没同步」
+          finalizeOk = true;
+          recordSuccess();
           await rememberCardMessage({
             messageId,
             cardId,
@@ -990,10 +1405,11 @@ export const createCardStream = (
           // 非流式从未开 streaming_mode，无需 patch 关流；仍刷 seq 盘水位（card-action 可能后续 patch）
           await flushCardSeqToDisk();
         } catch (err) {
-          warnFail("finalize(non-streaming)", err);
+          noteFinalizeFailure("finalize(non-streaming)", err);
         } finally {
           finalized = true;
           headerDirty = false;
+          clearFlushTimer();
         }
         return;
       }
@@ -1007,26 +1423,34 @@ export const createCardStream = (
       await doFlush();
 
       try {
-        // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）
-        // 先写回 desired，再 sync——保证 finalize 全量 PUT / batch 回写同源
-        answerDesired = closeUnclosedCodeFence(canonicalAnswer());
-        processDesired = closeUnclosedCodeFence(canonicalProcess());
-        syncFlushedFromDesired();
-        // footer + header 全量 PUT + batch 回写思考区（纯思考轮 P0：防嵌套 content 被抹）
-        await putEntityThenReassertProcess();
-        // 关 streaming_mode
+        // footer + header 全量 PUT + batch 回写思考区（纯思考轮 P0：防嵌套 content 被抹）。
+        // 序号冲突 / 内容超限在 putFinal 里就地自愈（每次重试都从头重算要发的内容）
+        await putFinal(async () => {
+          // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）
+          // 先写回 desired，再 sync——保证 finalize 全量 PUT / batch 回写同源
+          answerDesired = closeUnclosedCodeFence(canonicalAnswer());
+          processDesired = closeUnclosedCodeFence(canonicalProcess());
+          syncFlushedFromDesired();
+          await putEntityThenReassertProcess(CARD_FINALIZE_TIMEOUT_MS);
+        });
+        // 终稿内容已落到卡片。熔断中走到这里也是照发的（强试一次）——成功就是恢复的最好证据
+        finalizeOk = true;
+        recordSuccess();
+        // 关 streaming_mode：失败只意味着卡片在飞书侧继续显示「生成中」直到自动结束，内容已完整，不改 finalizeOk
         await patchCardSettings(
           cardId,
           { config: { streaming_mode: false, update_multi: true } },
           nextSeq(),
+          { timeoutMs: CARD_FINALIZE_TIMEOUT_MS },
         );
         // R1-3：finalize 后立即刷 seq，避免进程随后退出丢高水位
         await flushCardSeqToDisk();
       } catch (err) {
-        warnFail("finalize", err);
+        noteFinalizeFailure("finalize", err);
       } finally {
         finalized = true;
         headerDirty = false;
+        clearFlushTimer();
       }
     }).finally(dropSettledViews);
   };
@@ -1040,6 +1464,16 @@ export const createCardStream = (
     appendRetryButton,
     finalize,
     getFailCount: () => failCount,
+    getHealth: (): CardStreamHealth => ({
+      failCount,
+      consecutiveFails,
+      breakerOpen: isBreakerOpen(),
+      breakerEverOpened,
+      finalizeOk,
+      lastError,
+      fatalKind,
+      truncated: shrinkApplied ? true : undefined,
+    }),
     getIds: () => ({ messageId, cardId }),
   };
 };

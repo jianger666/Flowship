@@ -57,6 +57,8 @@ import {
   type StaleDeleteOutcome,
 } from "@/lib/worktree-report";
 import {
+  buildBatchDeleteSummary,
+  countProtectedStaleChats,
   matchesSessionQuery,
   pickArchivedSessions,
   pickFinishedSessions,
@@ -189,6 +191,13 @@ const SessionsPage = () => {
     void scan();
   }, [scan]);
 
+  // 进页补拉一次列表：「30 天未活跃」快捷选中要靠行上的 hasLiveSchedule 判「带定时」，
+  // 而详情页回灌（upsertTask）的行不带它、会把它冲掉——刚在详情页看过的旧会话可能因此被误选。
+  // 进页重拉把服务端的真值换回来（只缩短陈旧窗口，不改回灌逻辑本身）。
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
   const sizeById = useMemo(() => {
     const m = new Map<
       string,
@@ -320,6 +329,9 @@ const SessionsPage = () => {
   // 未点「显示更多」的行用户没看到、不能被一键选中后批量删掉
   const getFinishedTasks = () => pickFinishedSessions(renderedRows);
   const getStaleChats = () => pickStaleChatSessions(renderedRows, Date.now());
+  // 30 天未活跃里因置顶 / 在跑 / 带定时被跳过的个数（按钮计数 = 将选中的数，这里告诉用户少选了几个）
+  const getStaleProtectedCount = () =>
+    countProtectedStaleChats(renderedRows, Date.now());
   const getArchivedTasks = () => pickArchivedSessions(renderedRows);
 
   const togglePick = (key: string) => {
@@ -518,9 +530,21 @@ const SessionsPage = () => {
     const staleIds = Array.from(toDelete)
       .filter((k) => k.startsWith(STALE_PICK_PREFIX))
       .map((k) => k.slice(STALE_PICK_PREFIX.length));
+    // 确认框里列出「到底删哪些」：先算好再弹——别插在 title 与 description 之间
+    //（archive-delete-toast-wiring-contract 以 title 模板为锚，要求其后紧跟 DELETE_UNCOMMITTED_NOTE）。
+    // taskKeys 已与 pickableKeys 求交，都在 renderedRows 里；查不到的行（理论上没有）直接略过。
+    const rowById = new Map(renderedRows.map((t) => [t.id, t]));
+    const summary = buildBatchDeleteSummary(
+      taskKeys.flatMap((id) => {
+        const row = rowById.get(id);
+        return row ? [row] : [];
+      }),
+      staleIds.length,
+    );
+    const summaryBlock = summary ? `\n\n${summary}` : "";
     const ok = await confirm({
       title: `删除 ${toDelete.size} 项？`,
-      description: `将删除当前列表中已勾选的 ${toDelete.size} 项：${taskKeys.length} 个会话与 ${staleIds.length} 个残留工作区（${pickedBytesText}）、不可恢复。正在跑的会先停掉。${DELETE_UNCOMMITTED_NOTE}`,
+      description: `将删除当前列表中已勾选的 ${toDelete.size} 项：${taskKeys.length} 个会话与 ${staleIds.length} 个残留工作区（${pickedBytesText}）、不可恢复。正在跑的会先停掉。${DELETE_UNCOMMITTED_NOTE}${summaryBlock}`,
       confirmLabel: "删除",
       destructive: true,
     });
@@ -811,6 +835,12 @@ const SessionsPage = () => {
                 <span className="text-[11px] text-muted-foreground">
                   快捷选中只作用于已显示的 {renderedRows.length} 行（还有{" "}
                   {hiddenCount} 行未显示，点「显示更多」后可继续选）
+                </span>
+              )}
+              {getStaleProtectedCount() > 0 && (
+                <span className="text-[11px] text-muted-foreground">
+                  另有 {getStaleProtectedCount()} 个 30 天未活跃的会话因置顶 /
+                  在跑 / 带定时没被一键选中（要删请逐个勾选）
                 </span>
               )}
               {effectivePicked.size > 0 && (

@@ -4,6 +4,9 @@
  * R39-1：operation phase 单调 join——persisted 不被 late 202/direct/reject 降级
  * R39-2：watchTaskStream 首个合法 task bootstrap 发 connection-established，
  *        hook 镜像控制流当场清 transient/unavailable（不等流 EOF）
+ *        ——R14 B6-1（Q16-01）起改为：建连只记时刻，连接结束时按「撑过稳定窗口才清零」结算（settleWatchBudget）。
+ *        R40-② 的镜像已同步成同源：liveMs 默认刚好撑过窗口、原有用例语义不变；
+ *        「没撑过」的对照用例见 R40-② 里新增的那条，以及真跑 hook 的 tests/watch-stable-connection.test.ts
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -33,8 +36,10 @@ import {
   classifyWatchHttpStatus,
   resolveWatchReconnectPolicy,
   WATCH_MAX_TRANSIENT_FAILURES,
+  WATCH_STABLE_CONNECTION_MS,
 } from "@/lib/task-terminal";
 import type { Task } from "@/lib/types";
+import { settleWatchBudget } from "@/lib/watch-reconnect";
 
 afterEach(() => {
   __resetChatOpLedgerForTests();
@@ -100,6 +105,31 @@ const streamBootstrapThenError = (task: Task, errMsg = "stream dropped") => {
       controller.error(new Error(errMsg));
     },
   });
+};
+
+type Counters = {
+  unavailableAttempts: number;
+  transientFailures: number;
+  unavailableNotified: boolean;
+};
+
+/**
+ * 镜像 hook 在一条连接结束时的结算（R14 B6-1 / Q16-01；与 hook 同源：settleWatchBudget）：
+ * 建连只记时刻（establishedAt），连接结束时看建连后撑过稳定窗口没有——撑过才清零、没撑过原样累计。
+ * liveMs = 建连后这条连接活了多久，默认刚好撑过稳定窗口（= 正常长连接后断开）。
+ */
+const settleCounters = (
+  counters: Counters,
+  establishedAt: number | null,
+  liveMs: number = WATCH_STABLE_CONNECTION_MS,
+): Counters => {
+  const next = { ...counters };
+  settleWatchBudget(
+    next,
+    establishedAt,
+    establishedAt === null ? Date.now() : establishedAt + liveMs,
+  );
+  return next;
 };
 
 describe("R40-① R39-1：product-state 正交 join（persisted 不被 transport 降级）", () => {
@@ -324,13 +354,14 @@ describe("R40-① R39-1：product-state 正交 join（persisted 不被 transport
 });
 
 describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
-  it("前一轮 fetch reject 后、成功 bootstrap 再 reader error → transient=#1（非 #2）", async () => {
+  it("前一轮 fetch reject 后、成功 bootstrap 并撑过稳定窗口再 reader error → transient=#1（非 #2）", async () => {
     const taskId = "r40_epoch_reset";
     const task = stubTask(taskId);
     let unavailableAttempts = 0;
     let transientFailures = 0;
     let unavailableNotified = false;
     let established = 0;
+    let establishedAt = null as number | null;
 
     // round 1：fetch reject
     vi.stubGlobal(
@@ -343,9 +374,7 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
       await watchTaskStream(taskId, {
         onConnectionEstablished: () => {
           established += 1;
-          unavailableAttempts = 0;
-          transientFailures = 0;
-          unavailableNotified = false;
+          establishedAt = Date.now();
         },
       });
     } catch (err) {
@@ -380,13 +409,16 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
       await watchTaskStream(taskId, {
         onConnectionEstablished: () => {
           established += 1;
-          unavailableAttempts = 0;
-          transientFailures = 0;
-          unavailableNotified = false;
+          establishedAt = Date.now();
         },
       });
     } catch (err) {
-      // 建连已清零 → 本轮从 0 起算 → #1
+      // 撑过稳定窗口才断：先清零 → 本轮从 0 起算 → #1（建连当场不再清零，见文件头说明）
+      ({ unavailableAttempts, transientFailures, unavailableNotified } =
+        settleCounters(
+          { unavailableAttempts, transientFailures, unavailableNotified },
+          establishedAt,
+        ));
       const d = resolveWatchReconnectPolicy({
         kind: "retryable",
         unavailableAttempts,
@@ -405,11 +437,11 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
     expect(unavailableNotified).toBe(false);
   });
 
-  it("连续 6 轮成功 bootstrap→reader error 不 exhausted；6 次建连前失败仍终止", async () => {
+  it("连续 6 轮成功 bootstrap→（每轮都撑过稳定窗口）reader error 不 exhausted；6 次建连前失败仍终止", async () => {
     const taskId = "r40_six_ok_drop";
     const task = stubTask(taskId);
 
-    // 6× 成功建连后断流
+    // 6× 成功建连、撑过稳定窗口后断流
     {
       let unavailableAttempts = 0;
       let transientFailures = 0;
@@ -425,15 +457,20 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
         }),
       );
       for (let i = 0; i < 6; i++) {
+        let establishedAt = null as number | null;
         try {
           await watchTaskStream(taskId, {
             onConnectionEstablished: () => {
-              unavailableAttempts = 0;
-              transientFailures = 0;
-              unavailableNotified = false;
+              establishedAt = Date.now();
             },
           });
         } catch {
+          // 每轮连接都撑过了稳定窗口：先清零，再记成新一轮的 #1
+          ({ unavailableAttempts, transientFailures, unavailableNotified } =
+            settleCounters(
+              { unavailableAttempts, transientFailures, unavailableNotified },
+              establishedAt,
+            ));
           const d = resolveWatchReconnectPolicy({
             kind: "retryable",
             unavailableAttempts,
@@ -451,7 +488,7 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
         }
       }
       expect(exhausted).toBe(false);
-      // 每轮建连清零后断流只记 1，循环结束时仍为 1
+      // 每轮撑过稳定窗口、清零后断流只记 1，循环结束时仍为 1
       expect(transientFailures).toBe(1);
     }
 
@@ -496,6 +533,57 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
       }
       expect(exhausted).toBe(true);
     }
+  });
+
+  it("连续 6 轮「成功 bootstrap 后立刻 reader error」（没撑过稳定窗口）→ exhausted，不再静默无限重连", async () => {
+    const taskId = "r40_six_short_drop";
+    const task = stubTask(taskId);
+    let counters: Counters = {
+      unavailableAttempts: 0,
+      transientFailures: 0,
+      unavailableNotified: false,
+    };
+    let exhausted = false;
+    let rounds = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        return new Response(streamBootstrapThenError(task), {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }),
+    );
+    // 上限 20 轮只是防旧写法下的死循环：旧写法（建连即清零）每轮都清零再记 #1，永远不会 exhausted、会把 20 轮跑满
+    for (let i = 0; i < 20 && !exhausted; i++) {
+      rounds += 1;
+      let establishedAt = null as number | null;
+      try {
+        await watchTaskStream(taskId, {
+          onConnectionEstablished: () => {
+            establishedAt = Date.now();
+          },
+        });
+      } catch {
+        // 建连后立刻断（liveMs=0）：没撑过稳定窗口 → 预算原样、失败照常累计
+        counters = settleCounters(counters, establishedAt, 0);
+        const d = resolveWatchReconnectPolicy({
+          kind: "retryable",
+          ...counters,
+        });
+        if (d.action === "terminate_exhausted") {
+          exhausted = true;
+        } else if (d.action === "retry") {
+          counters = {
+            unavailableAttempts: d.nextUnavailableAttempts,
+            transientFailures: d.nextTransientFailures,
+            unavailableNotified: d.nextUnavailableNotified,
+          };
+        }
+      }
+    }
+    expect(exhausted).toBe(true);
+    expect(rounds).toBe(WATCH_MAX_TRANSIENT_FAILURES);
   });
 
   it("7×503 → fetch reject → 200 bootstrap → reader error → reconnect 成功：单 loop、无 sticky deleted、计数重置", async () => {
@@ -551,19 +639,21 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
     loopRuns += 1;
     let done = false;
     while (!done) {
+      // 每轮新连接：建连只记时刻，连接结束时按「撑过稳定窗口才清零」结算（本用例里建连后的连接都视为撑过了窗口）
+      let establishedAt = null as number | null;
       try {
         const { established } = await watchTaskStream(taskId, {
           onConnectionEstablished: () => {
-            unavailableAttempts = 0;
-            transientFailures = 0;
-            unavailableNotified = false;
+            establishedAt = Date.now();
           },
         });
-        // R40-2：仅 established 后 clean EOF 清 epoch
+        // R40-2：仅 established（且撑过稳定窗口）后 clean EOF 清 epoch
         if (established) {
-          unavailableAttempts = 0;
-          transientFailures = 0;
-          unavailableNotified = false;
+          ({ unavailableAttempts, transientFailures, unavailableNotified } =
+            settleCounters(
+              { unavailableAttempts, transientFailures, unavailableNotified },
+              establishedAt,
+            ));
           done = true;
         } else {
           const d = resolveWatchReconnectPolicy({
@@ -578,6 +668,12 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
           }
         }
       } catch (err) {
+        // bootstrap_drop 阶段：建连后撑过稳定窗口再断 → 先清零；建连前失败（503 / reject）establishedAt 为 null、原样累计
+        ({ unavailableAttempts, transientFailures, unavailableNotified } =
+          settleCounters(
+            { unavailableAttempts, transientFailures, unavailableNotified },
+            establishedAt,
+          ));
         const status =
           err instanceof ApiRequestError
             ? err.status

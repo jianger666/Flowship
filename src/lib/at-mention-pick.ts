@@ -8,7 +8,7 @@
  * 规则：结果绑定「它是按哪个 query 拉的」；当前 query 与结果所属 query 逐字相等才可选，
  * 不匹配一律拒选（UI 保持菜单、等结果到，不选陈旧项，也不把 Enter 漏给「提交」）。
  */
-import { REPO_FILES_Q_MAX_LEN } from "./repo-files-shared";
+import { REPO_FILES_MAX_ENTRIES, REPO_FILES_Q_MAX_LEN } from "./repo-files-shared";
 
 /** 请求前对 query 的截断（与 `/api/repo-files` 的 q 上限同口径；比较也必须用它） */
 export const normalizeAtQuery = (query: string): string =>
@@ -48,14 +48,31 @@ export const pickableFor = <T>(
 export const AT_EMPTY_HINT = "无匹配文件";
 /** 请求失败 / 超时（不是「没有匹配」：用户改个字重试才有机会拿到候选；第四轮 Q6-09） */
 export const AT_FAILED_HINT = "候选加载超时，改个字再试";
-export const atEmptyHint = (failed: boolean): string =>
-  failed ? AT_FAILED_HINT : AT_EMPTY_HINT;
+
+/** 「2 万项」这样的口语写法：整万写「N 万项」，否则写带千分位的「12,345 项」（数字与汉字之间留空格，同全站文案） */
+const humanItems = (n: number): string =>
+  n % 10_000 === 0 ? `${n / 10_000} 万项` : `${n.toLocaleString("en-US")} 项`;
+/** 索引被截断时的提示（数字取前后端共用的 REPO_FILES_MAX_ENTRIES；B6-5 / Q21-01） */
+export const AT_TRUNCATED_NOTE = `仅索引前 ${humanItems(REPO_FILES_MAX_ENTRIES)}`;
+/** 结果已到、没有匹配，但索引是被截断的：「无匹配」不等于「仓里没有」 */
+export const AT_EMPTY_TRUNCATED_HINT = `${AT_EMPTY_HINT}（仓库较大，${AT_TRUNCATED_NOTE}）`;
+
+export const atEmptyHint = (failed: boolean, truncated?: boolean): string =>
+  failed ? AT_FAILED_HINT : truncated ? AT_EMPTY_TRUNCATED_HINT : AT_EMPTY_HINT;
+
+/** 菜单底部的操作提示 */
+export const AT_FOOTER_HINT = "↑↓ 选择 · Enter 确认 · Esc 关闭";
+/** 索引被截断时追加一句——列表非空也要说：候选可能不全 */
+export const atFooterHint = (truncated?: boolean): string =>
+  truncated ? `${AT_FOOTER_HINT} · ${AT_TRUNCATED_NOTE}` : AT_FOOTER_HINT;
 
 /** 一次候选结果：按哪个 query 拉的 + 候选 + 是否是失败 / 超时落的空结果 */
 export interface AtResultsOf<T> {
   query: string;
   files: T[];
   failed: boolean;
+  /** 索引被截断：候选可能不全。缺省不带这个键（旧形状、旧测试的 toEqual 不受影响） */
+  truncated?: true;
 }
 
 /**
@@ -64,12 +81,16 @@ export interface AtResultsOf<T> {
  */
 export const atResultsFromOutcome = <T>(
   query: string,
-  out: { kind: "ok"; files: T[] } | { kind: "failed" } | { kind: "aborted" },
+  out: { kind: "ok"; files: T[]; truncated?: true } | { kind: "failed" } | { kind: "aborted" },
 ): AtResultsOf<T> | null => {
   if (out.kind === "aborted") return null;
-  return out.kind === "ok"
-    ? { query, files: out.files, failed: false }
-    : { query, files: [], failed: true };
+  if (out.kind === "ok") {
+    // 截断标记只在真截断时才带键：旧形状（`{ query, files, failed }`）原样不变
+    return out.truncated === true
+      ? { query, files: out.files, failed: false, truncated: true }
+      : { query, files: out.files, failed: false };
+  }
+  return { query, files: [], failed: true };
 };
 
 export type AtMenuMode = "closed" | "loading" | "empty" | "list";
@@ -86,12 +107,17 @@ export interface AtMenuView<T> {
   canPick: boolean;
   /** 要画的列表（stale 时是旧结果；loading / closed 时为空） */
   items: readonly T[];
+  /**
+   * 这批结果来自被截断的索引（候选可能不全）。**只在结果新鲜（属于当前 query）时才带键**：
+   * 旧结果（stale）上的「不全」说明不能贴到新 query 上；缺省不带键，旧断言不受影响
+   */
+  truncated?: true;
 }
 
 /** `@` 菜单状态机：把「query + 结果所属 query」折成 UI 要的几态（hook 与测试共用） */
 export const atMenuView = <T>(
   query: string | null,
-  results: { query: string; files: readonly T[] } | null,
+  results: { query: string; files: readonly T[]; truncated?: true } | null,
 ): AtMenuView<T> => {
   if (query === null) {
     return { mode: "closed", stale: false, canPick: false, items: [] };
@@ -104,6 +130,8 @@ export const atMenuView = <T>(
       stale: false,
       canPick: has,
       items: results.files,
+      // 只在结果新鲜时带「索引被截断」；缺省不带键
+      ...(results.truncated === true ? { truncated: true as const } : {}),
     };
   }
   // 结果不是这个 query 的（或还没有）：旧结果非空就继续画旧的，空就当「还在加载」——

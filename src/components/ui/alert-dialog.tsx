@@ -54,7 +54,12 @@ function AlertDialogContent({
         data-slot="alert-dialog-content"
         data-size={size}
         className={cn(
-          "group/alert-dialog-content fixed top-1/2 left-1/2 z-50 grid w-full -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none data-[size=default]:max-w-xs data-[size=sm]:max-w-xs data-[size=default]:sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          // X5-b：它是 fixed 居中的、没有 Dialog 那样的「遮罩滚」可借——内容（confirm() 的描述由调用方决定，
+          // 强删目录清单 / 批量删除清单都可能很长）高过窗口时，上下会被一起裁掉、按钮点不到。
+          // max-h + overflow-y-auto：超高时弹窗自己滚，按钮始终能滚到；
+          // [-webkit-app-region:no-drag]：同 DialogContent——Electron 拖拽区按像素矩形算、不看 z-index，高弹窗顶部落进 header 拖拽区时按钮点不动。
+          // 不加吸底 footer：这里的 footer 是无底衬的紧凑按钮行（2026-07-20），没有可吸的「操作条」。
+          "group/alert-dialog-content fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100dvh-2rem)] w-full -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto rounded-xl bg-popover p-4 text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none [-webkit-app-region:no-drag] data-[size=default]:max-w-xs data-[size=sm]:max-w-xs data-[size=default]:sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className
         )}
         {...props}

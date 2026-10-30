@@ -39,7 +39,7 @@ import {
 } from "./subagent-parent-model";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
-import { dataRoot } from "./data-root";
+import { dataRoot, stripBom } from "./data-root";
 
 import {
   appendAction,
@@ -126,7 +126,11 @@ import {
   type EnsureWorktreesOptions,
 } from "./task-worktrees";
 import { summarizeDepDirs } from "./worktree-deps";
-import { sameRepoPathList } from "@/lib/path-utils";
+import { repoTail, sameRepoPathList } from "@/lib/path-utils";
+import {
+  ADVANCE_STALE_MESSAGE,
+  isAdvanceExpectationStale,
+} from "./advance-expectation";
 import {
   SDK_CREATE_RESUME_TIMEOUT_MS,
   SDK_SEND_TIMEOUT_MS,
@@ -884,6 +888,13 @@ export interface AdvanceTaskInput {
   // V0.9：自定义 action 指向的定义 id（仅 actionType="custom" 传）
   customActionId?: string;
   /**
+   * R14 Q7a-04：客户端点「推进」时看到的当前 action id（null = 当时没有当前 action）。
+   * 带了就在串行队列出队后、做任何副作用之前对照盘上最新 `currentActionId`，不一致 → 抛 `ADVANCE_STALE_MESSAGE`
+   * （重复提交 / 页面陈旧，不能再起第二条 action、更不能把刚起的那条标 cancelled）。
+   * `undefined` = 没带（老客户端 / 飞书群路径）→ 不校验、保持旧行为。语义见 advance-expectation.ts。
+   */
+  expectedCurrentActionId?: string | null;
+  /**
    * 路由入场时同步捕获的 admission token。
    * 缺省则 advanceTask 导出入口在进串行队列前同步取。
    */
@@ -932,7 +943,15 @@ const finalizeOwnAction = async (
   status: "error" | "cancelled",
 ): Promise<void> => {
   if (!actionId) return;
-  await patchAction(taskId, actionId, { status });
+  // R14 Q7b-01：只收「仍 running」的 action——已交卷（awaiting_ack）/ 已通过（completed）的不再被 cancel / error 收尾打回。
+  // 触发场景：agent 已 submit_work、check 通过（action=awaiting_ack、runStatus 刻意保持 running，收尾旁白还在流），
+  // 旁白阶段卡 >20s 时用户发消息 → abortStuckRunForSend → consume 的 cancelled 分支，旧实现无条件打成 cancelled，
+  // 待审阅位丢了、路由随后因「不再是 awaiting_ack」回 409、用户那条消息也丢。
+  // 用户点「停止」由 stop-task 自己落终态（Q7a-05），不依赖本函数；handleRunFailure 早就带同款前置条件（actionStatus: "running"）。
+  // isOwner 传恒 true：保持原有「无 lease」语义（调用点各自在前面做过 yieldIfSuperseded / 失主复查），只加结构前置条件。
+  await patchActionIfOwner(taskId, actionId, { status }, () => true, {
+    actionStatus: "running",
+  });
 };
 
 // ----------------- 同一 task 的 advanceTask 串行化 -----------------
@@ -1064,7 +1083,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
           {
             kind: "info",
             text: `已后台预热任务隔离工作区（git worktree）${ensured.infos.length > 0 ? "并检出任务分支" : "（分支将在首次流程操作时绑定）"}：${ensured.createdRepos
-              .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+              .map((p) => repoTail(p))
               .join("、")}${cloneNote}——推进时无需再等待创建`,
           },
     );
@@ -1141,6 +1160,23 @@ const advanceTaskCore = async (
   let task = input.task;
   // 由 advanceTask 导出入口传入（禁止在此自取——出队后取会踩）
   const opGen = input.opGen!;
+
+  // R14 Q7a-04：推进 CAS——必须在一切副作用之前（下面的 abortRunningCheck 会掐掉上一个 action 的后置检查、
+  // refreshRepoBranches / ensureTaskWorktrees 都会写盘）。读盘上最新 meta（不信路由入场时那份快照：
+  // 排队期间前一个推进可能已经改了 currentActionId）；任务已被删（读不到）同样按「已变更」让位。
+  // 文案用专门的 ADVANCE_STALE_MESSAGE、不复用 TASK_OP_STALE_HTTP_MESSAGE：后者的「请重发」会诱导重复提交。
+  if (input.expectedCurrentActionId !== undefined) {
+    const latest = await getTaskMeta(input.task.id);
+    if (
+      !latest ||
+      isAdvanceExpectationStale(
+        latest.currentActionId,
+        input.expectedCurrentActionId,
+      )
+    ) {
+      throw new Error(ADVANCE_STALE_MESSAGE);
+    }
+  }
 
   // V0.10.1：壳自更新就位但用户没重启 → 老进程起新 run 必挂死（shell 永久卡住）、入口硬拦
   await assertNoUpdatePendingRestart();
@@ -1261,7 +1297,7 @@ const advanceTaskCore = async (
         {
           kind: "info",
           text: `已创建任务隔离工作区（git worktree）${ensured.infos.length > 0 ? "并检出任务分支" : "（分支将在 WK 代码阶段绑定）"}：${ensured.createdRepos
-            .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+            .map((p) => repoTail(p))
             .join("、")}；依赖目录后台准备中`,
         },
       );
@@ -1952,10 +1988,73 @@ const resumeCurrentActionCore = async (
 //（AI 自主二分类）；approve 语义由推进时自动认可（advanceTask 开头的隐式 approve）承担。
 
 /**
+ * 终态冲突：任务已是 merged / abandoned，又收到「相反」终态的 finalize（R14 Q7a-01）。
+ * route 映射 409——是状态冲突、不是请求格式错（与 {@link TaskCleanupInProgressError} 同族）。
+ * 同目标的重复 finalize **不算冲突**：重复 finalize 只 join 在飞的 terminal cleanup / 幂等补清理，是设计内的
+ *（tests/ownership-r34-cleanup-coord）。
+ */
+export class TaskTerminalConflictError extends Error {
+  readonly current: Extract<RepoStatus, "merged" | "abandoned">;
+  readonly requested: Extract<RepoStatus, "merged" | "abandoned">;
+  constructor(
+    current: Extract<RepoStatus, "merged" | "abandoned">,
+    requested: Extract<RepoStatus, "merged" | "abandoned">,
+  ) {
+    super(
+      current === "merged"
+        ? "任务已合入、不能再标记为放弃（要改请先「恢复」任务）"
+        : "任务已放弃、不能再标记为合入（要改请先「恢复」任务）",
+    );
+    this.name = "TaskTerminalConflictError";
+    this.current = current;
+    this.requested = requested;
+  }
+}
+
+/**
+ * finalize / archive 共用的「资源收口」（R14 Q7a-03）：先 revoke 资源事务，再 join starting + resourceJobs。
+ * resourceJobs 等满仍未归零 → quarantine（fail-closed），不得在旧事务仍可写盘时清 worktree。
+ * 超时与 joinResourceJobs / DELETE 共用 getResourceJoinTimeoutMs（单测可缩短）。
+ * @param tag 日志前缀（finalizeTask / archiveTask）
+ * @returns true = 已 quarantine（调用方不得同步删 worktree）
+ */
+const joinTerminalOpResources = async (
+  taskId: string,
+  tag: "finalizeTask" | "archiveTask",
+): Promise<boolean> => {
+  revokeResourceJobs(taskId);
+  const deadline = Date.now() + getResourceJoinTimeoutMs();
+  while (
+    (isTaskStarting(taskId) || hasResourceJobs(taskId)) &&
+    Date.now() < deadline
+  ) {
+    await new Promise<void>((r) => setTimeout(r, 50));
+  }
+  // starting 单独 warn（非 workspace 路径占用）；resource 超时 → quarantine
+  if (isTaskStarting(taskId)) {
+    console.warn(
+      `[task-runner] ${tag}: task=${taskId} starting 等待超时、继续终结（resource 另判）`,
+    );
+  }
+  if (hasResourceJobs(taskId)) {
+    // 已等满仍未归零 → fail-closed 隔离（与 joinResourceJobs 超时同契约）
+    markWorkspaceQuarantined(taskId);
+    console.error(
+      `[task-runner] ${tag}: task=${taskId} resourceJobs join 超时、已 quarantine；跳过同步清 worktree`,
+    );
+    return true;
+  }
+  return false;
+};
+
+/**
  * V0.6 终态：task 合入 / abandon
  *
  * - merged：write [TASK_DONE]、agent 收尾退出、setTaskRepoStatus=merged + runStatus=idle
  * - abandoned：write [TASK_ABANDONED]、agent 立刻退、setTaskRepoStatus=abandoned + runStatus=idle
+ *
+ * 终态守卫（R14 Q7a-01）：已是 merged / abandoned 再收到「相反」终态 → 抛 {@link TaskTerminalConflictError}（route 409），
+ * 不翻状态、不重复停预览 / 删 worktree。陈旧标签页点「放弃」、MR 其实早已合入，就是它的典型来源。
  */
 export const finalizeTask = async (
   taskId: string,
@@ -1974,6 +2073,16 @@ export const finalizeTask = async (
     throw new Error("任务正在停止/删除/终结、请稍后再试");
   }
   try {
+    // R14 Q7a-01 终态守卫：占住 lifecycle 之后、任何副作用之前，用**盘上 fresh** 的 repoStatus 判（不吃入场快照）——
+    // 已合入 / 已放弃再收到相反的终态 = 陈旧标签页误点，翻过去会把「已合入」改成「已放弃」并重复停预览 / 删 worktree。
+    // 只拦「反向」：同目标重复 finalize 仍走完整流程（join 在飞 cleanup / 幂等补清理，ownership-r34 钉着）。
+    const priorStatus = await readTaskRepoStatusFresh(taskId);
+    if (
+      (priorStatus === "merged" || priorStatus === "abandoned") &&
+      priorStatus !== finalStatus
+    ) {
+      throw new TaskTerminalConflictError(priorStatus, finalStatus);
+    }
     // V12：取消一切在途启动意图（与 stop/DELETE 同协议）
     revokeTaskOps(taskId);
     // 终结 = 这个任务不再「活着」：定时一起取消。不取消的话，周期定时会在合入 / 放弃之后继续按周期触发
@@ -2001,32 +2110,9 @@ export const finalizeTask = async (
         hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
       }、patch repoStatus=${finalStatus}`,
     );
-    // 先 revoke，再 join starting + resourceJobs。
-    // resourceJobs 超时 → quarantine（fail-closed），不得在旧事务仍可写盘时清 worktree。
-    // 超时与 joinResourceJobs / DELETE 共用 getResourceJoinTimeoutMs（单测可缩短）。
-    {
-      revokeResourceJobs(taskId);
-      const deadline = Date.now() + getResourceJoinTimeoutMs();
-      while (
-        (isTaskStarting(taskId) || hasResourceJobs(taskId)) &&
-        Date.now() < deadline
-      ) {
-        await new Promise<void>((r) => setTimeout(r, 50));
-      }
-      // starting 单独 warn（非 workspace 路径占用）；resource 超时 → quarantine
-      if (isTaskStarting(taskId)) {
-        console.warn(
-          `[task-runner] finalizeTask: task=${taskId} starting 等待超时、继续终结（resource 另判）`,
-        );
-      }
-      if (hasResourceJobs(taskId)) {
-        // 已等满仍未归零 → fail-closed 隔离（与 joinResourceJobs 超时同契约）
-        markWorkspaceQuarantined(taskId);
-        console.error(
-          `[task-runner] finalizeTask: task=${taskId} resourceJobs join 超时、已 quarantine；跳过同步清 worktree`,
-        );
-      }
-    }
+    // 先 revoke，再 join starting + resourceJobs；resourceJobs 超时 → quarantine（fail-closed）。
+    // 与 archive 共用（R14 Q7a-03，见 joinTerminalOpResources）。返回值不用：下面清 worktree 前自己再判 quarantine / hasResourceJobs。
+    await joinTerminalOpResources(taskId, "finalizeTask");
     // cancel 只是发信号、run 的 finally 可能还在往 worktree 写文件——对齐 DELETE 路由 /
     // deleteTask 口径、等真停再删、防边写边删撞车。没活 run 时秒过。
     await waitForTaskToStop(taskId, 8000);
@@ -2146,8 +2232,6 @@ export const finalizeTask = async (
               removed?.removedAny ||
               (removed?.snapshotFailedRepos.length ?? 0) > 0
             ) {
-              const repoTail = (p: string) =>
-                p.split("/").filter(Boolean).pop() ?? p;
               // 文案与行为同源（review #2）：快照成功 → 说明落在哪个 ref；快照失败 → 该仓 worktree 已保留、没删
               const { snapshotNote, failedNote } = removed
                 ? formatWorktreeCleanupNotes(removed, repoTail)
@@ -2271,36 +2355,76 @@ export const archiveTaskWithReport = async (
   }
   const task = await getTaskMeta(taskId);
   if (!task) return null;
-  // 归档 = 这个会话不再「活着」：定时一起取消（否则归档的会话会被定时消息悄悄唤醒）。
-  // 取消不是永久的：被取消的记录带还原信息，取消归档时恢复（D2b-03）。
-  // 放在所有分支之前：chat / 非 worktree 的早退路径也要取消。best-effort，失败不挡归档
-  report.cancelledSchedules = await cancelSchedulesWithNotice(
-    taskId,
-    "会话已归档",
-    "archived",
-    (n) => `会话已归档，${n} 个定时一并取消（取消归档时会恢复）`,
-    { restorable: true },
-  );
-  // 非任务模式 / 非隔离工作区任务：只翻标记（chat 沿用“后台继续跑”语义）
-  if (task.mode === "chat" || !isWorktreeTask(task)) {
-    const flagged = await setTaskPinArchive(taskId, { archived: true });
-    return flagged ? { task: flagged, report } : null;
+  // R14 Q7a-03：要清隔离工作区的归档，先占 finalizing lifecycle（与 finalize 同一套互斥）——
+  // 期间 isOpOwner 全 false，新推进 / 问答 / 预热拿不到合法 claim；stop / DELETE / finalize / reopen 在飞则占不到 → 409，
+  // 而且此时还没动定时（占不到就整个归档不发生，不留「定时已取消、任务没归档」的半截状态）。
+  // chat / 非 worktree 的归档只翻标记、不清任何东西，不占。
+  const needsCleanup = task.mode !== "chat" && isWorktreeTask(task);
+  if (needsCleanup && !beginChatLifecycle(taskId, "finalizing")) {
+    throw new TaskCleanupInProgressError(
+      getChatLifecycle(taskId) === "deleting"
+        ? "任务正在删除、请稍后再试"
+        : "任务正在停止 / 终结 / 恢复、请稍后再试",
+    );
   }
+  try {
+    // 归档 = 这个会话不再「活着」：定时一起取消（否则归档的会话会被定时消息悄悄唤醒）。
+    // 取消不是永久的：被取消的记录带还原信息，取消归档时恢复（D2b-03）。
+    // 放在所有分支之前：chat / 非 worktree 的早退路径也要取消。best-effort，失败不挡归档
+    report.cancelledSchedules = await cancelSchedulesWithNotice(
+      taskId,
+      "会话已归档",
+      "archived",
+      (n) => `会话已归档，${n} 个定时一并取消（取消归档时会恢复）`,
+      { restorable: true },
+    );
+    // 非任务模式 / 非隔离工作区任务：只翻标记（chat 沿用“后台继续跑”语义）
+    // （条件字面保持原样：tests/schedule-wiring-contract 钉着「取消定时在这个早退之前」）
+    if (task.mode === "chat" || !isWorktreeTask(task)) {
+      const flagged = await setTaskPinArchive(taskId, { archived: true });
+      return flagged ? { task: flagged, report } : null;
+    }
+    return await archiveWorktreeTaskLocked(task, report);
+  } finally {
+    if (needsCleanup) endChatLifecycle(taskId, "finalizing");
+  }
+};
+
+/**
+ * 归档的「停机 + 清隔离工作区」段——调用方（archiveTaskWithReport）已占 finalizing lifecycle。
+ * 与 finalize 同协议：revoke 在途启动意图 → cancel → join 启动链 / 资源 job（超时 quarantine）→ 等真停 → 收尾 action → 停预览 → 删 worktree。
+ */
+const archiveWorktreeTaskLocked = async (
+  task: Task,
+  report: ArchiveReport,
+): Promise<{ task: Task; report: ArchiveReport } | null> => {
+  const taskId = task.id;
+  // R14 Q7a-03：revoke 在途启动意图——归档前入场的推进 / 预热 / 依赖克隆拿的是旧 opGen，此后再 claim 一律失败；
+  // 没有这一步它们会和下面的 removeTaskWorktrees 并行写同一批目录。
+  revokeTaskOps(taskId);
+  // 与 archiveTaskWithReport 同款动态 import（task-fs ↔ task-runner 有循环依赖，见 Q7a-09，本轮不动）
+  const { setTaskPinArchive } = await import("./task-fs");
   // 有活就停：与 finalize 同协议（cancel 只是发信号、下面等真停再删）。
-  // 注意不删 pendingStopRequests：cancel 在 Agent.create→runningTasks.set 窗口走的是“记标记让启动链自裁”分支，
-  // 紧接着删等于亲手掐信号——迟到的 create 会注册成功又不自裁，然后边写边删。留着它，迟到链自裁时自己消费，
-  // 下次推进 claim 后也会消费（advance afterClaim），归档后无新启动、留着无害。finalize 敢删是因为终态不再启动。
+  // pendingStopRequests：cancel 在 Agent.create→runningTasks.set 窗口走的是“记标记让启动链自裁”分支——启动链还在飞（isTaskStarting）时
+  // 删等于亲手掐信号，迟到的 create 会注册成功又不自裁、然后边写边删，所以那种情况留着（迟到链自裁时自己消费）。
+  // 但启动链已退场（常态：下面 join 已等它归零）还留着就是残留：取消归档后第一次答疑 / 问一问会在 consume 起点被当「启动期停止」静默取消
+  //（R14 Q7a-02）——与 stop-task 同口径：无飞行消费者才清（见下面 join 之后）。
   cancelTaskRun(taskId);
   cancelRestrictedQuestions(taskId);
   // 归档同清排队：休眠任务的问题不等它醒，醒了重问（条目带 boot.apiKey，不留内存）
   clearGroupQuestionQueue(taskId);
   clearTalkQueue(taskId);
   clearCorrelatedEntries(taskId);
+  // R14 Q7a-03：join 启动链 + 资源 job——kickoffDeferredDepClone 等最长 15 分钟的依赖初始化就在 worktree 里跑，
+  // 先 revoke 掉它们的子进程再等退场；等满仍没退 → quarantine，下面不删目录（fail-closed，与 finalize 同契约）。
+  const quarantined = await joinTerminalOpResources(taskId, "archiveTask");
   // 两个 wait 相互独立、失败都吞，并行等（串行最长挂 16s，归档 PATCH 一直悬着体验差）
   await Promise.all([
     waitForTaskToStop(taskId, 8000).catch(() => {}),
     waitForRestrictedQuestionsToStop(taskId, 8000).catch(() => {}),
   ]);
+  // R14 Q7a-02：启动链已退场才清标记（与 stop-task 同口径）；还在飞（join 超时）则留给它自裁
+  if (!isTaskStarting(taskId)) pendingStopRequests.delete(taskId);
   // 只收 running、awaiting_ack 留给恢复后 ack；顺带把问一问留下的 running 状态回 idle
   await finalizeStaleAndIdleLocked(taskId, { toStatus: "cancelled", leaveAwaitingAck: true }).catch(() => null);
   try {
@@ -2308,10 +2432,21 @@ export const archiveTaskWithReport = async (
   } catch (err) {
     console.warn(`[task-runner] archiveTask: 停预览失败（忽略）task=${taskId}`, err);
   }
-  const removed = await removeTaskWorktrees(task).catch((err) => {
-    console.warn(`[task-runner] archiveTask: 清理 worktree 失败 task=${taskId}`, err);
-    return null;
-  });
+  // quarantine（join 超时、旧事务还可能写盘）→ fail-closed 不删目录，并如实告诉用户没清
+  //（目录原样保留；取消归档后下次推进继续用，或稍后再归档一次清理）
+  const removed = quarantined
+    ? null
+    : await removeTaskWorktrees(task).catch((err) => {
+        console.warn(`[task-runner] archiveTask: 清理 worktree 失败 task=${taskId}`, err);
+        return null;
+      });
+  if (quarantined) {
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：归档清理 owner 无条件语义
+    await writeEventAndPublish(taskId, {
+      kind: "info",
+      text: "已归档，但后台还有依赖初始化 / 预热没退出，本次没清理隔离工作区（目录原样保留；取消归档后下次推进会继续用）",
+    });
+  }
   // 回报给客户端 toast：服务端实际结果（清了 / 保留了哪些），不让客户端再按任务形状预测
   const wtReport = newDeleteWorktreeReport();
   collectWorktreeRemoval(wtReport, removed);
@@ -2321,7 +2456,6 @@ export const archiveTaskWithReport = async (
     snapshotCount: removed?.snapshotRepos.length ?? 0,
   };
   if (removed?.removedAny || (removed?.snapshotFailedRepos.length ?? 0) > 0) {
-    const repoTail = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
     // 文案与行为同源（review #2）：快照成功 → 说明落在哪个 ref；快照失败 → 该仓 worktree 已保留、没删
     const { snapshotNote, failedNote } = removed
       ? formatWorktreeCleanupNotes(removed, repoTail)
@@ -3125,9 +3259,6 @@ export const ensureWorkspaceReady = async (
  * 依赖准备结果 → 事件流文案（prewarm / 后台补齐共用）。
  * 克隆：`repo: node_modules + 子包 node_modules ×3`；初始化命令另列、成败分开说。
  */
-const repoTail = (repoPath: string): string =>
-  repoPath.split("/").filter(Boolean).pop() ?? repoPath;
-
 const describeClonedDirs = (entries: DepPrepareEntry[]): string =>
   entries
     .filter((c) => c.dirs.length > 0)
@@ -3791,7 +3922,7 @@ const readServerCreds = async (task: Task): Promise<SessionCreds> => {
       path.join(dataRoot(), "config.json"),
       "utf-8",
     );
-    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    const cfg = JSON.parse(stripBom(raw)) as Record<string, unknown>;
     const migrated = migrateProviderSettings(cfg);
     const settings = {
       apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey : "",
@@ -3833,7 +3964,7 @@ export const readServerGitToken = async (): Promise<string | undefined> => {
       path.join(dataRoot(), "config.json"),
       "utf-8",
     );
-    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    const cfg = JSON.parse(stripBom(raw)) as Record<string, unknown>;
     const token = typeof cfg.gitToken === "string" ? cfg.gitToken.trim() : "";
     return token || undefined;
   } catch {
@@ -5496,27 +5627,43 @@ const consumeSessionRun = async (
   } finally {
     // 收尾持有者闭合未配对 tool running（cancel / error / finished 共用入口）
     // 必须在 release 之前；失主（已被后继 claim）lease 拒写、不伤 B
-    if (isTaskOpCurrent(opts.opHandle)) {
-      await finalizeOpenToolCalls(task.id, () =>
-        isTaskOpCurrent(opts.opHandle),
+    // R14 Q7b-02：闭合本身抛错（读事件尾部 / 停后台 shell 跟踪失败：Windows 杀软 / 句柄占用 / EIO / ENOSPC）不能挡住下面的释放——
+    // 否则 runningTasks 永久占位（任务永远「运行中」，停止 / 推进都要走强清）+ unhandledRejection（调用方 void consume 没 catch）。
+    // 所以这里吞错只告警，释放动作放进内层 finally 保证一定执行。
+    try {
+      if (isTaskOpCurrent(opts.opHandle)) {
+        await finalizeOpenToolCalls(task.id, () =>
+          isTaskOpCurrent(opts.opHandle),
+        );
+      }
+    } catch (finalizeErr) {
+      console.warn(
+        `[task-runner] task=${task.id} 收尾闭合未配对 tool 失败（忽略、照常释放占位）：`,
+        finalizeErr,
       );
-    }
-    // 按 instanceId 删——forceClear 后 B 换了新号，旧 finally 不得抹掉 B
-    if (iOwnRunner()) {
-      runningTasks.delete(task.id);
-    }
-    // V12：正常 / 失败收尾都 release——owner 匹配才删；observer 内部 no-op
-    releaseTaskOpIf(opts.opHandle);
-    // 会话活跃时间戳（空闲回收 TTL 从「最后一个 run 结束」起算）
-    // 按 session instanceId 刷——同 agentId 的后继会话不碰
-    const session = agentSessions.get(task.id);
-    if (
-      session &&
-      (mySessionInstanceId !== undefined
-        ? session.instanceId === mySessionInstanceId
-        : session.agentId === agent.agentId)
-    ) {
-      session.lastActiveAt = Date.now();
+    } finally {
+      // 按 instanceId 删——forceClear 后 B 换了新号，旧 finally 不得抹掉 B
+      if (iOwnRunner()) {
+        // R14 Q7b-04：force-new 标志（forkPendingTasks）只在「被取消」分支消费；旧 run 自然结束的收尾期被唤醒 / 推进
+        // add 之后若没走到那些分支就会永久残留，之后任何不经 stop 的 cancel（abortStuckRunForSend / 24h 硬超时 / mid-run 轮换）
+        // 都会被当成「旧 agent 已收尾」吞掉、task 僵在 running 且没有 run。本 record 退场 = 这个标志的使命结束，随它一起清
+        //（读标志的地方全在本函数 finally 之前；只在仍是自己的 record 时清，不碰后继的）。
+        forkPendingTasks.delete(task.id);
+        runningTasks.delete(task.id);
+      }
+      // V12：正常 / 失败收尾都 release——owner 匹配才删；observer 内部 no-op
+      releaseTaskOpIf(opts.opHandle);
+      // 会话活跃时间戳（空闲回收 TTL 从「最后一个 run 结束」起算）
+      // 按 session instanceId 刷——同 agentId 的后继会话不碰
+      const session = agentSessions.get(task.id);
+      if (
+        session &&
+        (mySessionInstanceId !== undefined
+          ? session.instanceId === mySessionInstanceId
+          : session.agentId === agent.agentId)
+      ) {
+        session.lastActiveAt = Date.now();
+      }
     }
   }
 };
@@ -6586,17 +6733,33 @@ const sendToTaskSessionBody = async (
     // 已知极窄窗口（可接受）：agent 若在本写 commit 前就经 MCP notifier 落了 awaiting_user
     //（send resolve 后毫秒级调 ask_user/submit_work、现实几乎不可能），会被本写短暂盖回 running、
     // 由 consume 出口归位。
-    const runningNow = await setTaskRunStatusIfRunOwner(
-      task.id,
-      "running",
-      () => isTaskOpCurrent(entryOpHandle),
-    );
-    if (runningNow) publish(task.id, { kind: "task", task: runningNow });
+    // R14 Q7b-03：写 running 失败（EBUSY / EPERM / ENOSPC / 杀软）不能让「已受理」的 run 变孤儿——send 已把消息交给 agent、它正在后台跑，
+    // 这里一抛就跳过下面的 consume：没人读流、runningTasks 没占位，用户看到「发送失败」而 agent 其实收到了（重发会二次 send）。
+    // 盘上 runStatus 只是辅助显示（侧栏「运行中」），consume 的各出口会按真实结果归位，所以吞错、照常消费 run。
+    try {
+      const runningNow = await setTaskRunStatusIfRunOwner(
+        task.id,
+        "running",
+        () => isTaskOpCurrent(entryOpHandle),
+      );
+      if (runningNow) publish(task.id, { kind: "task", task: runningNow });
+    } catch (err) {
+      console.warn(
+        `[task-runner] sendToTaskSession: task=${task.id} send 已受理但写 running 失败（忽略、照常消费 run）`,
+        err,
+      );
+    }
     // consume 直接用入场 entryOpHandle——禁止 send 后再 snapshotTaskOp
+    // .catch 是兜底：consume 内部已 try/catch/finally 全包，万一仍有漏网也只记日志、不变 unhandledRejection（R14 Q7b-02）
     void consumeSessionRun(task, agent, run, {
       errorActionId: opts.errorActionId,
       questionRun: opts.questionRun,
       opHandle: entryOpHandle,
+    }).catch((err) => {
+      console.error(
+        `[task-runner] sendToTaskSession: task=${task.id} consume 异常退出`,
+        err,
+      );
     });
     return "sent";
   } finally {

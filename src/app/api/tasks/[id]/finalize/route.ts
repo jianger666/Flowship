@@ -21,12 +21,13 @@
  *
  * - task 不存在 → 404
  * - finalStatus 非法 → 400
+ * - 已合入再 abandoned / 已放弃再 merged（陈旧标签页误点）→ 409；同目标重复 finalize 不拦（幂等补清理）
  * - 没活 agent pending：不算错、直接 patch（用户从终态 abandon 用、agent 早已退）
  */
 
 import { errorResponse } from "@/lib/server/route-helpers";
 import { getTask } from "@/lib/server/task-fs";
-import { finalizeTask } from "@/lib/server/task-runner";
+import { finalizeTask, TaskTerminalConflictError } from "@/lib/server/task-runner";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -66,7 +67,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     await finalizeTask(task.id, finalStatus, reason);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return errorResponse(message, 400);
+    // 已合入 / 已放弃又收到相反的终态（陈旧标签页误点）= 状态冲突，不是请求格式错 → 409（R14 Q7a-01）
+    return errorResponse(message, err instanceof TaskTerminalConflictError ? 409 : 400);
   }
 
   const fresh = await getTask(task.id);

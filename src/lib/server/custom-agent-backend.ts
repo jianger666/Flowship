@@ -47,6 +47,9 @@ import {
   fatalAssistantError,
 } from "@/lib/custom-openai-compat";
 import {
+  EMPTY_REPLY_MESSAGE,
+  RETRY_INTERRUPTED_TOOL_RESULT,
+  assistantMessageHasOutput,
   settleErrorFromTranscript,
   stickyErrorAfterMessageEnd,
 } from "@/lib/pi-run-settle";
@@ -366,8 +369,14 @@ const bridgeUserMcpServers = async (
           description: t.description || `MCP 工具 ${t.name}`,
           // MCP 返回 JSON Schema、直接透传（pi 侧不再二次校验、交给 MCP server 自己验）
           parameters: t.inputSchema,
-          execute: async (_toolCallId: string, params: unknown) => {
-            const r = await t.call(params as Record<string, unknown>);
+          // 第 3 参 signal（pi 规范）必须往下传：用户点停止 / 任务被停时，这次 MCP 调用才能立刻中止
+          // （之前丢掉它，点停止后要一直等到 SDK 的 60 秒超时，R14 Q11-06）
+          execute: async (
+            _toolCallId: string,
+            params: unknown,
+            signal?: AbortSignal,
+          ) => {
+            const r = await t.call(params as Record<string, unknown>, { signal });
             return {
               content: r.content,
               details: r.isError ? { isError: true } : undefined,
@@ -382,6 +391,18 @@ const bridgeUserMcpServers = async (
       for (const b of bridges) void b.close().catch(() => {});
     },
   };
+};
+
+/**
+ * create / resume 的失败路径兜底关闭 MCP 桥：此时 adapter 没造出来、没人会再调 closeAll。
+ * 清理本身绝不能盖掉原始错误（closeAll 理论上不抛，这里再兜一层）。
+ */
+const closeMcpQuietly = (mcp: { closeAll: () => unknown }): void => {
+  try {
+    void Promise.resolve(mcp.closeAll()).catch(() => {});
+  } catch {
+    /* noop */
+  }
 };
 
 type PiRuntime = Awaited<ReturnType<typeof ModelRuntime.create>>;
@@ -420,7 +441,8 @@ const loadSubagentCatalog = async (
 
 /**
  * pi 子会话事件 → 与 Cursor 同形的 SDKMessage（给子代理过程记录喂；翻译口径同 `PiRunAdapter.onEvent`
- * 里翻主会话的那几类：text_delta / thinking_delta / toolcall_end / tool_execution_end）。
+ * 里翻主会话的那几类：text_delta / thinking_delta / toolcall_end / tool_execution_end；另外
+ * auto_retry_start 翻成一条只当「封口」信号的合成消息，见下面的分支）。
  * `toolArgs` 缓存 toolcall_end 的入参：执行结束事件里没有入参，要靠它补。
  * 纯函数（只读写传进来的缓存），不认识的事件返回空数组。
  */
@@ -473,6 +495,12 @@ export const piSubagentEventMessages = (
         result: ev.result,
       } as unknown as SDKMessage,
     ];
+  }
+  if (ev.type === "auto_retry_start") {
+    // pi 要把这条回复整个重新生成一遍。过程记录只认 thinking / assistant_message / tool_call / tool_result 四类，
+    // 所以这不是一条说明（info 会被丢掉），只是个「封口」信号：记录器收到后，重新生成的文本另起一条，
+    // 不和出错的半截焊成一段（R14 Q11-02）。不带 pi 的错误原文。
+    return [{ type: "auto_retry_start" } as unknown as SDKMessage];
   }
   return [];
 };
@@ -618,6 +646,9 @@ export const runPiSubagent = async (
     // 直接抛错、不往下走到 prompt（这里到 prompt 之间没有 await，不会再漏窗口）；finally 会 dispose 会话。
     if (signal?.aborted) throw new Error("子任务已取消");
     let result = "";
+    // 当前这条 assistant 消息开始时 result 已经有多长：pi 自动重试要把「出错的那一条」整个重新生成，
+    // 只该丢它的半截；result 是整个子会话所有轮次累计的，更早轮次已经说完的正文要留（R14 Q11-02）
+    let msgStartLen = 0;
     // 过程记录（详情面板）：起不来 / 中途出错都只告警，绝不影响子代理本身
     rec = startPiSubagentRecord({
       taskId,
@@ -644,6 +675,17 @@ export const runPiSubagent = async (
         if (ev.type === "message_update") {
           const inner = ev.assistantMessageEvent;
           if (inner?.type === "text_delta" && inner.delta) result += inner.delta;
+        } else if (ev.type === "message_start") {
+          // pi 为每条 assistant 消息都发 message_start（流没来得及发 start 就出错的，结束 / 出错时补发，
+          // 见 pi-agent-core 的 agent-loop），所以重试开始时最近一次 assistant 的就是出错那条的起点。
+          // 只认 assistant：user / toolResult 的 message_start 不是「这条回复的起点」
+          // `?.`：事件是 pi 的内部事件、类型上 message 必填，但合成 / 异常事件缺它时这里抛错会在 pi 的
+          // _emit（for…of 直接调监听者、没有 try/catch）里中断后面的监听者（R14 Q11-03 顺带的 P3）
+          if (ev.message?.role === "assistant") msgStartLen = result.length;
+        } else if (ev.type === "auto_retry_start") {
+          // pi 要把这条回复整个重新生成一遍：只丢出错那条的半截，免得把「半截 + 全文」当子任务结果还给父会话；
+          // 更早轮次的正文留着（R14 Q11-02）。没收到过 message_start（合成 / 旧事件）→ 起点 0，退化成整个清零
+          result = result.slice(0, msgStartLen);
         } else if (ev.type === "agent_end" && !ev.willRetry) {
           unsub();
           resolve();
@@ -754,15 +796,31 @@ const buildCustomTools = (
 
 type RunWaitResult = { status: "finished" | "cancelled" | "error"; result?: string };
 
-class PiRunAdapter {
+/**
+ * pi 事件 → Flowship run 的翻译器（一次 send 一个）。
+ * 导出只为事件级单测（tests/pi-run-adapter.test.ts 喂合成事件，不起 HTTP / 真会话）；业务代码走 createCustomAgent。
+ */
+export class PiRunAdapter {
   id: string;
   requestId: string;
   private buffer: SDKMessage[] = [];
   private toolArgs = new Map<string, { name: string; args: unknown }>();
+  /**
+   * 已推出 running、还没等到执行结果的工具调用 id。pi 对「以错误收尾的 assistant 消息」不会执行里面的工具，
+   * 流被掐断之后这些调用永远等不到 tool_execution_end——自动重试开始时据此补成 error，
+   * 卡片才不会一直转圈（R14 Q11-02）。
+   */
+  private openToolCallIds = new Set<string>();
   private ended = false;
   private cancelled = false;
   /** pi 把 API 失败写在 assistant 消息里，先记下、settle 时带出去 */
   private lastAssistantError: string | null = null;
+  /**
+   * 本轮（含 pi 内部自动重试，它们在同一个 run 里）是否出现过用户看得见的产出：
+   * 非空白正文 / 工具调用。思考不算。agent_settled 时一路没产出 = 空回复（R14 Q11-01），见 settleWithoutError。
+   * 按整个 run 累计、不看最后一条 assistant：工具跑完后模型一句话不说是正常的。
+   */
+  private sawOutput = false;
   private endResolve: ((r: RunWaitResult) => void) | null = null;
   private endPromise: Promise<RunWaitResult>;
   private unsub: (() => void) | null = null;
@@ -782,7 +840,7 @@ class PiRunAdapter {
     });
   }
 
-  /** subscribe 后由 createCustomAgent 绑定 */
+  /** subscribe 后由 createCustomAgent 绑定；收尾时 settle() 会在微任务里调用它退订（R14 Q11-03） */
   bindUnsubscribe(fn: () => void): void {
     this.unsub = fn;
   }
@@ -812,6 +870,46 @@ class PiRunAdapter {
     if (this.ended) return;
     this.ended = true;
     this.endResolve?.(result);
+    // 收尾即退订（R14 Q11-03）。之前 unsub 只存不用：同一会话每多一轮，这个 run 的监听者就多留一个，
+    // 收尾后下一轮的增量（bash 输出 / 文本 / 工具调用）还会灌进它的 onDelta / onStep。
+    // 必须放到微任务里退、不能同步：settle 常在 pi 的事件派发里被调用，pi 的 _emit 是 for…of 遍历监听数组、
+    // 退订是 splice，回调里同步退订会让排在后面的监听者漏收这一次事件。
+    // 为什么微任务就够：下一轮的事件来自 provider 流 / 子进程输出 / 工具执行，至少隔一个异步边界（宏任务），
+    // 一定在这次退订之后才到，所以下一轮的增量灌不进这个旧 run。
+    // 注意：调用方的 await wait() 若在 settle 之前就已挂起，它的续跑排在这次退订之前（endResolve 先于 queueMicrotask）——
+    // 那一刻它最多只是去订阅下一轮；而 pi 的退订是按监听函数自己 indexOf + splice，不会误删下一轮刚订阅的那个。
+    queueMicrotask(() => {
+      try {
+        this.unsub?.();
+      } catch {
+        /* 退订失败不能拖垮收尾：最多是回到旧行为（监听者留着） */
+      }
+      this.unsub = null;
+    });
+  }
+
+  /**
+   * 没有错误时的收尾：取消 → cancelled；一路没产出 → 空回复报错；否则 finished。
+   *
+   * 为什么不能一律 finished：端点地址填成网页（200 + HTML）、网关吞了正文、模型直接空 stop，
+   * pi 都当正常结束（supportsFinishReason 已关，流里没 finish_reason 时 pi 补成 stop），
+   * 用户看到「已完成」却什么都没有（R14 Q11-01）。取消优先：取消不是模型的错。
+   *
+   * 两处调用：agent_settled（没有错误），以及 auto_retry_end 失败但只是「缺 finish_reason」这种残缺收尾
+   * （fatalAssistantError 为 null）。后者在当前配置下基本走不到——compat 已关 supportsFinishReason，
+   * pi 不再抛 Stream ended without finish_reason——但事件级可测（tests/pi-run-adapter.test.ts）；
+   * 统一走这里，免得以后 compat / pi 变动让它重新可达时，空回复的洞又从这条路径漏出去。
+   */
+  private settleWithoutError(): void {
+    if (this.cancelled) {
+      this.settle({ status: "cancelled" });
+      return;
+    }
+    if (!this.sawOutput) {
+      this.settle({ status: "error", result: EMPTY_REPLY_MESSAGE });
+      return;
+    }
+    this.settle({ status: "finished" });
   }
 
   onEvent(ev: AgentSessionEvent): void {
@@ -821,16 +919,21 @@ class PiRunAdapter {
           const inner = ev.assistantMessageEvent;
           if (!inner) break;
           if (inner.type === "text_delta" && inner.delta) {
+            // 空白 delta（只有换行 / 空格）不算产出：整轮只有空白，屏幕上就是个空气泡
+            if (inner.delta.trim() !== "") this.sawOutput = true;
             this.push({
               type: "assistant",
               message: { content: [{ type: "text", text: inner.delta }] },
             } as unknown as SDKMessage);
           } else if (inner.type === "thinking_delta" && inner.delta) {
+            // 思考不计入 sawOutput：只想不说，用户这边仍是一条空回复
             this.push({ type: "thinking", text: inner.delta } as unknown as SDKMessage);
           } else if (inner.type === "toolcall_end" && inner.toolCall) {
+            this.sawOutput = true;
             const tc = inner.toolCall;
             const displayName = mcpDisplayName(tc.name);
             this.toolArgs.set(tc.id, { name: displayName, args: tc.arguments });
+            this.openToolCallIds.add(tc.id);
             // 工具开始：SDKMessage running + onDelta tool-call-started
             this.push({
               type: "tool_call",
@@ -856,6 +959,8 @@ class PiRunAdapter {
             this.lastAssistantError,
             ev.message,
           );
+          // 兜底：只给整条消息、不发 text_delta 的 provider 也算有产出（以整条 assistant 消息为权威口径）
+          if (assistantMessageHasOutput(ev.message)) this.sawOutput = true;
           break;
         }
         case "agent_end": {
@@ -872,6 +977,43 @@ class PiRunAdapter {
           }
           break;
         }
+        case "auto_retry_start": {
+          // pi 要把这条回复整个重新生成一遍，而出错的那半截已经推给 UI 了（R14 Q11-02）。
+          // ① 半截里已经 running、却永远等不到执行结果的工具调用补成 error：pi 对出错的 assistant 消息不执行工具，
+          //    不补的话卡片一直转圈，重试后模型再发同样的调用又会多出一张
+          for (const callId of this.openToolCallIds) {
+            const cached = this.toolArgs.get(callId) ?? { name: "tool", args: {} };
+            this.push({
+              type: "tool_call",
+              call_id: callId,
+              name: cached.name,
+              args: cached.args,
+              status: "error",
+              result: RETRY_INTERRUPTED_TOOL_RESULT,
+            } as unknown as SDKMessage);
+            this.fireDelta({
+              type: "tool-call-completed",
+              callId,
+              toolCall: {
+                type: cached.name === "bash" ? "shell" : cached.name,
+                result: {
+                  status: "error",
+                  value: { output: RETRY_INTERRUPTED_TOOL_RESULT },
+                },
+              },
+            } as unknown as InteractionUpdate);
+          }
+          this.openToolCallIds.clear();
+          // ② 合成边界消息交给 sdk-message-handler：在那里把半截正文落成独立一条、再写一行说明，
+          //    重新生成的全文才是新的一条（不分开会被焊成「半截 + 全文」）。不删已经流出的字
+          this.push({
+            type: "auto_retry_start",
+            attempt: ev.attempt,
+            maxAttempts: ev.maxAttempts,
+            delayMs: ev.delayMs,
+          } as unknown as SDKMessage);
+          break;
+        }
         case "auto_retry_end": {
           if (ev.success) {
             // 内部重试已恢复：清粘性错误，等后续 assistant / agent_settled 按最后一条收尾
@@ -881,15 +1023,19 @@ class PiRunAdapter {
           const err = fatalAssistantError(
             ev.finalError || this.lastAssistantError || "模型请求失败",
           );
-          // 缺 finish_reason：正文已在，按成功收尾，避免再等 agent_settled
-          this.settle(
-            err
-              ? { status: "error", result: err }
-              : { status: this.cancelled ? "cancelled" : "finished" },
-          );
+          if (err) {
+            this.settle({ status: "error", result: err });
+          } else {
+            // 缺 finish_reason 这种残缺收尾不算出错：正文已在就按成功收尾（避免再等 agent_settled）；
+            // 但一路没产出仍是空回复（Q11-01）、取消优先——与 agent_settled 同一套口径，见 settleWithoutError
+            this.settleWithoutError();
+          }
           break;
         }
         case "tool_execution_end": {
+          // 兜底：toolcall_end 没来（或没带 toolCall）但工具确实跑了，也不是空回复
+          this.sawOutput = true;
+          this.openToolCallIds.delete(ev.toolCallId);
           const displayName = mcpDisplayName(ev.toolName);
           const cached = this.toolArgs.get(ev.toolCallId) ?? {
             name: displayName,
@@ -953,9 +1099,8 @@ class PiRunAdapter {
           if (err && !this.cancelled) {
             this.settle({ status: "error", result: err });
           } else {
-            this.settle({
-              status: this.cancelled ? "cancelled" : "finished",
-            });
+            // 没有错误：取消 / 空回复（一路没产出）/ 正常结束，见 settleWithoutError
+            this.settleWithoutError();
           }
           break;
         }
@@ -1047,38 +1192,45 @@ export const createCustomAgent = async (
   const mcp = readOnly
     ? { toolDefs: [] as never[], closeAll: async () => {} }
     : await bridgeUserMcpServers(input.mcpServers);
-  // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
-  // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
-  // 全部过滤掉，模型只看到 read/edit/write/grep。
-  // 只读轮次：白名单 + customTools 双收敛（read/grep/glob/合test-MR，写类 / shell 不给）。
-  // 注：旁路 honor-system 后不再传 readOnly，此分支当前无人接线，留作收紧时直接用。
-  const customTools = readOnly
-    ? buildReadOnlyToolDefs(
-        cwd,
-        input.taskId ? { taskId: input.taskId } : undefined,
-      )
-    : buildCustomTools(
-        callerToken,
-        cwd,
-        { input, runtime, model, thinkingLevel },
-        mcp.toolDefs,
-        input.taskId,
-      );
-  const { session } = await createAgentSession({
-    cwd,
-    agentDir: piAgentDir(),
-    ...(await buildResourceLoader(cwd)),
-    modelRuntime: runtime,
-    model,
-    thinkingLevel,
-    tools: readOnly
-      ? [...READONLY_CUSTOM_TOOL_NAMES]
-      : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
-    customTools,
-    sessionManager: SessionManager.create(cwd, piSessionDir()),
-  });
-  const agentId = session.sessionFile ?? session.sessionId;
-  return buildAdapter(session, agentId, mcp.closeAll);
+  // 桥接 MCP 之后任何一步抛错（createAgentSession / 建会话文件 / 工具装配…），adapter 都没造出来，
+  // 没有人会再调 closeAll：已经连上的 stdio MCP 子进程会一直活到 app 退出（R14 Q11-05）→ 这里替它收
+  try {
+    // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
+    // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
+    // 全部过滤掉，模型只看到 read/edit/write/grep。
+    // 只读轮次：白名单 + customTools 双收敛（read/grep/glob/合test-MR，写类 / shell 不给）。
+    // 注：旁路 honor-system 后不再传 readOnly，此分支当前无人接线，留作收紧时直接用。
+    const customTools = readOnly
+      ? buildReadOnlyToolDefs(
+          cwd,
+          input.taskId ? { taskId: input.taskId } : undefined,
+        )
+      : buildCustomTools(
+          callerToken,
+          cwd,
+          { input, runtime, model, thinkingLevel },
+          mcp.toolDefs,
+          input.taskId,
+        );
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir: piAgentDir(),
+      ...(await buildResourceLoader(cwd)),
+      modelRuntime: runtime,
+      model,
+      thinkingLevel,
+      tools: readOnly
+        ? [...READONLY_CUSTOM_TOOL_NAMES]
+        : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
+      customTools,
+      sessionManager: SessionManager.create(cwd, piSessionDir()),
+    });
+    const agentId = session.sessionFile ?? session.sessionId;
+    return buildAdapter(session, agentId, mcp.closeAll);
+  } catch (err) {
+    closeMcpQuietly(mcp);
+    throw err;
+  }
 };
 
 /** resume 确定性失败：message 带 code 前缀，日志 / 降级统计可 grep `E_SESSION_` */
@@ -1106,26 +1258,11 @@ export const resumeCustomAgent = async (
   const { runtime, model, thinkingLevel } = await buildRuntime(input);
   const callerToken = input.callerToken;
   const readOnly = input.readOnly === true;
-  const mcp = readOnly
-    ? { toolDefs: [] as never[], closeAll: async () => {} }
-    : await bridgeUserMcpServers(input.mcpServers);
-  // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
-  // 只读分支同上，当前无人接线（旁路 honor-system 不传 readOnly），留作收紧时直接用。
-  const customTools = readOnly
-    ? buildReadOnlyToolDefs(
-        cwd,
-        input.taskId ? { taskId: input.taskId } : undefined,
-      )
-    : buildCustomTools(
-        callerToken,
-        cwd,
-        { input, runtime, model, thinkingLevel },
-        mcp.toolDefs,
-        input.taskId,
-      );
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接。
   // pi 对缺失文件会静默建空会话（resume「成功」但 messages=[]），随后 send 只有当前句、
   // 连起手 prompt 都没有。缺文件 / 空会话一律抛，让 chat-inject 降级新会话并注入最近对话。
+  // 这两项检查必须排在桥接 MCP **之前**（R14 Q11-05）：它们是设计内的确定性失败（降级新会话是常态路径），
+  // 先桥再检查的话，每次降级都白连一遍所有 stdio MCP、又不关，泄漏 N 个子进程直到 app 退出。
   if (!existsSync(agentId)) {
     throw sessionResumeError("E_SESSION_MISSING", agentId);
   }
@@ -1133,20 +1270,43 @@ export const resumeCustomAgent = async (
   if (sessionManager.buildSessionContext().messages.length === 0) {
     throw sessionResumeError("E_SESSION_EMPTY", agentId);
   }
-  const { session } = await createAgentSession({
-    cwd,
-    agentDir: piAgentDir(),
-    ...(await buildResourceLoader(cwd)),
-    modelRuntime: runtime,
-    model,
-    thinkingLevel,
-    tools: readOnly
-      ? [...READONLY_CUSTOM_TOOL_NAMES]
-      : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
-    customTools,
-    sessionManager,
-  });
-  return buildAdapter(session, agentId, mcp.closeAll);
+  const mcp = readOnly
+    ? { toolDefs: [] as never[], closeAll: async () => {} }
+    : await bridgeUserMcpServers(input.mcpServers);
+  // 桥接 MCP 之后抛错（createAgentSession 等）同样没有 adapter 来关 → 这里收（同 createCustomAgent）
+  try {
+    // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
+    // 只读分支同上，当前无人接线（旁路 honor-system 不传 readOnly），留作收紧时直接用。
+    const customTools = readOnly
+      ? buildReadOnlyToolDefs(
+          cwd,
+          input.taskId ? { taskId: input.taskId } : undefined,
+        )
+      : buildCustomTools(
+          callerToken,
+          cwd,
+          { input, runtime, model, thinkingLevel },
+          mcp.toolDefs,
+          input.taskId,
+        );
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir: piAgentDir(),
+      ...(await buildResourceLoader(cwd)),
+      modelRuntime: runtime,
+      model,
+      thinkingLevel,
+      tools: readOnly
+        ? [...READONLY_CUSTOM_TOOL_NAMES]
+        : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
+      customTools,
+      sessionManager,
+    });
+    return buildAdapter(session, agentId, mcp.closeAll);
+  } catch (err) {
+    closeMcpQuietly(mcp);
+    throw err;
+  }
 };
 
 /** chat 标题生成用的一次性 prompt（对应 cursor Agent.prompt） */
@@ -1174,6 +1334,9 @@ export const promptOnceCustom = async (
         if (ev.type === "message_update") {
           const inner = ev.assistantMessageEvent;
           if (inner?.type === "text_delta" && inner.delta) result += inner.delta;
+        } else if (ev.type === "auto_retry_start") {
+          // pi 要把这条回复整个重新生成一遍：出错的半截丢掉，标题只取最后一遍（R14 Q11-02）
+          result = "";
         } else if (ev.type === "agent_end" && !ev.willRetry) {
           unsub();
           resolve();

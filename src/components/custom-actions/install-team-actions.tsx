@@ -53,7 +53,7 @@ const categoryKeyFromDir = (dirPath: string): string | null => {
 
 export const InstallTeamActions = ({ onInstalled }: Props) => {
   const { confirm } = useDialog();
-  const { status, actions, loading, refresh } = useTeamLibrary(true, {
+  const { status, actions, refresh } = useTeamLibrary(true, {
     // 切到共享市场即静默 sync 一次：同事刚上传的 action 打开就能看到（不用手动刷新）
     autoSyncOnActive: true,
   });
@@ -300,7 +300,9 @@ export const InstallTeamActions = ({ onInstalled }: Props) => {
         </div>
       )}
 
-      {loading && !status ? (
+      {/* 还没拿到状态就转圈：首次读取前那一帧 loading 仍是 false，旧条件（要求 loading 为真才转圈）会先闪出
+          下面「共享库暂无可安装 action」；读取失败时 hook 会填 EMPTY_STATUS 兜底，不会一直转圈 */}
+      {!status ? (
         <LoadingState variant="inline" />
       ) : status?.needsToken ? (
         <EmptyHint size="sm">

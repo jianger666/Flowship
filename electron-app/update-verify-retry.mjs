@@ -54,6 +54,7 @@
  * 所以暂时性失败对用户的实际打扰程度**不靠退避**、而由「后台触发的暂时性失败不弹框」保证
  * （见 update-manifest-verify.mjs 的 buildVerifyRejectionNotice）；连续失败 3 次后再给一次「多次失败」的说明（见上）。
  */
+import { isStageNoSpaceError } from "./disk-space.mjs";
 import {
   UpdateVerifyManifestMissingError,
   UpdateVerifyMismatchError,
@@ -109,6 +110,8 @@ export const STAGE_GIVE_UP_AFTER = REPEATED_FAILURE_PROMPT_AFTER;
 /**
  * 这次失败要不要计入「放弃自动暂存」闸（第八轮 L2-01）= 是不是**会白下 dmg** 的失败。
  * - 永久失败（Mismatch / 没带清单）：false——它们走 macVerifyFailedVersion 永久跳过，不归这个闸管；
+ * - 磁盘空间不足（StageNoSpaceError，R14 B2-4 / Q15-01）：false——下载前的预检就拦下了、没花任何流量；
+ *   计入的话 3 次空间不足就会停掉轮询、用户腾出空间后也不再自动暂存（只剩点徽标）；
  * - 未归类错误 / 非 Error 值：true——dmg 下载 502 / 不完整、hdiutil / ditto 失败、找不到 .app 都发生在整包下载之后（或之中）；
  * - Unavailable：false——清单阶段（5xx / 限流 / 超时 / 网络 / 正文不是清单 / 过大 / 结构非法 / 公钥）在下载 dmg **之前**就败了、
  *   只花几百字节；计入的话 3 次 503 就会停掉轮询、废掉 F1-01「网络恢复后自愈」。
@@ -117,6 +120,7 @@ export const STAGE_GIVE_UP_AFTER = REPEATED_FAILURE_PROMPT_AFTER;
  */
 export const isCostlyStageFailure = (err) => {
   if (isPermanentVerifyFailure(err)) return false;
+  if (isStageNoSpaceError(err)) return false;
   if (!isVerifyFailure(err)) return true;
   return err instanceof UpdateVerifyUnavailableError && err.code === "local-io";
 };

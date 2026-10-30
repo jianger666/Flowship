@@ -10,6 +10,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
+import { runTeamLibraryActivation } from "@/lib/team-library-activation";
+
 /** GET /api/team-library 的 status 字段 */
 export type TeamLibraryStatus = {
   configured: boolean;
@@ -60,8 +62,9 @@ const normalizeStatus = (raw: Partial<TeamLibraryStatus> | null | undefined): Te
 
 /**
  * @param active false 时不拉（如所在 tab 未展示）——默认 true
- * @param opts.autoSyncOnActive true = 激活（挂载）时先静默 sync 一次再读——
- *   用于「共享市场」这类希望打开就看到最新的页面（git 拉取失败静默、读本地缓存兜底）
+ * @param opts.autoSyncOnActive true = 激活（挂载）时先读本地缓存把列表秒出来，再后台静默 sync 一次、成功才再读——
+ *   用于「共享市场」这类希望打开就看到最新的页面（git 拉取失败静默、缓存列表照常可用）。
+ *   R14 B6-2 · Q13-05：原先是先等 sync 再读，断网 / 断 VPN 时最长 120 秒什么都不显示
  */
 export const useTeamLibrary = (
   active = true,
@@ -116,31 +119,33 @@ export const useTeamLibrary = (
 
   useEffect(() => {
     if (!active) return;
-    // 首次挂载 abortRef 还是 null：effect 自持一个 controller，sync 也可被
-    // 卸载 / 新 refresh 取消；refresh 内部会接管 abortRef，cleanup 取消最新请求
-    const ac = new AbortController();
-    abortRef.current = ac;
-    const run = async () => {
-      if (opts?.autoSyncOnActive) {
-        // 静默 sync：失败不 toast（走本地缓存兜底）、手动「同步」按钮仍有自己的反馈
+    // 卸载 / active 关掉：不再发起新的读取。sync 用自己的 controller，不跟 refresh 共用 abortRef——
+    // refresh 开头会 abort 掉 abortRef 上的旧请求，「先 refresh 再 sync」时会把仍在途的 sync 误取消；
+    // 「已卸载」也不能再拿 signal.aborted 判断，用局部 cancelled
+    let cancelled = false;
+    const syncAc = new AbortController();
+    void runTeamLibraryActivation({
+      autoSync: !!opts?.autoSyncOnActive,
+      refresh,
+      sync: async () => {
+        // 静默 sync：失败不 toast（读缓存兜底）、手动「同步」按钮仍有自己的反馈
         try {
           const res = await fetch("/api/team-library/sync", {
             method: "POST",
-            signal: ac.signal,
+            signal: syncAc.signal,
           });
-          if (!res.ok) {
-            // 没配 token 等场景：读缓存展示、由页面状态引导
-          }
+          return res.ok;
         } catch {
           // AbortError（卸载）/ 网络错：静默
+          return false;
         }
-      }
-      if (ac.signal.aborted) return;
-      await refresh();
-    };
-    void run();
+      },
+      isCancelled: () => cancelled,
+    });
     return () => {
-      // 卸载 / active 关掉：取消进行中的请求，防 setState on unmounted
+      cancelled = true;
+      syncAc.abort();
+      // 卸载 / active 关掉：取消进行中的读取，防 setState on unmounted
       abortRef.current?.abort();
     };
   }, [active, refresh, opts?.autoSyncOnActive]);

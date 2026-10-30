@@ -24,7 +24,12 @@ export interface AtFileHit {
 export const AT_FETCH_TIMEOUT_MS = 5_000;
 
 export type AtFetchOutcome =
-  | { kind: "ok"; files: AtFileHit[] }
+  | {
+      kind: "ok";
+      files: AtFileHit[];
+      /** 服务端索引被截断（仓里条目超过上限）：候选可能不全。缺省不带这个键 */
+      truncated?: true;
+    }
   | { kind: "failed" }
   | { kind: "aborted" };
 
@@ -73,9 +78,11 @@ export const fetchAtFiles = async (opts: FetchAtFilesOpts): Promise<AtFetchOutco
     // 响应已落地后 abort 不再抛 AbortError——这里再判，防慢请求覆盖新 query
     if (signal.aborted) return { kind: "aborted" };
     if (!r.ok) return { kind: "failed" };
-    const d = (await r.json()) as { files?: AtFileHit[] } | null;
+    const d = (await r.json()) as { files?: AtFileHit[]; truncated?: unknown } | null;
     if (signal.aborted) return { kind: "aborted" };
-    return { kind: "ok", files: Array.isArray(d?.files) ? d.files : [] };
+    const files = Array.isArray(d?.files) ? d.files : [];
+    // 只认字面量 true；缺省 / 其它值一律不带这个键（旧响应形状、旧测试的 toEqual 不受影响）
+    return d?.truncated === true ? { kind: "ok", files, truncated: true } : { kind: "ok", files };
   })().catch((): AtFetchOutcome => (signal.aborted ? { kind: "aborted" } : { kind: "failed" }));
 
   try {

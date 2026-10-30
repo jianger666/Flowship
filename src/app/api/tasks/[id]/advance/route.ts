@@ -29,6 +29,9 @@
  * - task 不存在 → 404
  * - 准入条件不满足（如 build 但没 plan）→ 400
  * - 缺 apiKey 字段 / model / images 等 → 400（自定义允许空 Key）
+ * - 带了 `expectedCurrentActionId` 但与任务当前 action 不符（页面陈旧 / 重复提交 / 另一个窗口刚推进过，R14 Q7a-04）
+ *   → 409 `{ error: ADVANCE_STALE_MESSAGE, code: "advance_stale" }`，不落任何副作用、不写事件。
+ *   入场时对照一次（尽早拒绝）；排队期间被抢先推进的由 runner 出队后再对照、抛同一句文案，这里同样回 409
  * - advanceTask 抛错（含 ensureTaskWorktrees 建工作区失败）→ 400 `{ error: 完整文案, code: "advance_failed" }`，
  *   并按 advance-failure.ts 的规则补写一条 error 事件（事件流留痕、弹窗关掉后也查得到）
  */
@@ -57,6 +60,11 @@ import {
   TASK_OP_STALE_HTTP_MESSAGE,
 } from "@/lib/server/task-runner";
 import { shouldRecordAdvanceFailure } from "@/lib/server/advance-failure";
+import {
+  ADVANCE_STALE_MESSAGE,
+  isAdvanceExpectationStale,
+  parseExpectedCurrentActionId,
+} from "@/lib/server/advance-expectation";
 import { getCustomAction } from "@/lib/server/custom-action-fs";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import {
@@ -152,6 +160,8 @@ interface PostBody {
   repoDevBranches?: Record<string, string>;
   // V0.9：自定义 action 指向的定义 id（仅 actionType="custom" 时必填）
   customActionId?: string;
+  // R14 Q7a-04：点推进时页面看到的当前 action id（null = 当时没有）；缺省 = 不校验（老客户端 / 飞书路径）
+  expectedCurrentActionId?: string | null;
 }
 
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -206,6 +216,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const apiKey = body.apiKey.trim();
   if (!isValidModel(body.model)) return errorResponse("model 非法");
   const model = body.model;
+
+  // R14 Q7a-04：推进的乐观并发期望值（缺省 / null / 非空字符串合法，其余 400）
+  const expectedResult = parseExpectedCurrentActionId(
+    body.expectedCurrentActionId,
+  );
+  if (!expectedResult.ok) return errorResponse(expectedResult.error);
+  const expectedCurrentActionId = expectedResult.value;
 
   // 校验 images
   const imagesResult = parseAndValidateImages(
@@ -302,6 +319,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
+  // R14 Q7a-04：陈旧推进尽早拒绝——别先落「合并后删分支」偏好 / 存图这些副作用。
+  // 这里只是用入场快照挡掉明显过期的请求；权威判定在 advanceTask 的串行队列里（排队期间还会再变）。
+  if (isAdvanceExpectationStale(task.currentActionId, expectedCurrentActionId)) {
+    return errorResponse(ADVANCE_STALE_MESSAGE, 409, {
+      code: "advance_stale",
+    });
+  }
+
   // V0.6.14：ship 推进带「合并后是否删源分支」选择 → 先落 task 字段、
   // 之后 agent 调 submit_mr 时 handler 读 fresh task 拿到（advanceTask 内部不需要这字段）
   if (typeof body.removeSourceBranch === "boolean") {
@@ -357,6 +382,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       repoDevBranches: sanitizeRepoBranchMap(body.repoDevBranches),
       // V0.9：自定义 action 定义 id（仅 custom、上面已校验定义存在）
       customActionId,
+      // R14 Q7a-04：串行队列出队后再对照一次盘上最新 currentActionId（重复提交 / 排队期间被抢先推进）
+      expectedCurrentActionId,
       opGen,
     });
 
@@ -369,6 +396,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    // R14 Q7a-04：排队期间被抢先推进（runner 出队后 CAS 不一致）——与入场早拒绝同口径：
+    // 409 + advance_stale、不写 error 事件（先到的那次推进其实成功了，别往事件流塞一条假的「推进失败」）
+    if (message === ADVANCE_STALE_MESSAGE) {
+      console.warn(`[advance] task=${task.id} 排队期间已被抢先推进，按陈旧拒绝`);
+      return errorResponse(ADVANCE_STALE_MESSAGE, 409, {
+        code: "advance_stale",
+      });
+    }
     console.error(`[advance] task=${task.id} failed:`, err);
     // 事件流留痕（ensureTaskWorktrees 等前置步骤抛错 runner 不写事件）；响应体带完整文案 + 稳定 code，
     // 客户端据此留住弹窗与预填、把整段原因展示在弹窗里（不只首行 toast）

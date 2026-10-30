@@ -60,6 +60,20 @@ const { isFeishuBridgeStreamingEnabled } = await import(
   "@/lib/server/feishu-bridge/bridge-config"
 );
 
+/** 假句柄 getHealth 的默认值：终稿落成、熔断没开（用例按需覆盖） */
+const okHealth = vi.hoisted(
+  () =>
+    (over: Record<string, unknown> = {}) => ({
+      failCount: 0,
+      consecutiveFails: 0,
+      breakerOpen: false,
+      breakerEverOpened: false,
+      finalizeOk: true as boolean | undefined,
+      lastError: undefined as unknown,
+      ...over,
+    }),
+);
+
 type CardMock = {
   start: ReturnType<typeof vi.fn>;
   pushProcess: ReturnType<typeof vi.fn>;
@@ -69,6 +83,7 @@ type CardMock = {
   appendRetryButton: ReturnType<typeof vi.fn>;
   finalize: ReturnType<typeof vi.fn>;
   getFailCount: () => number;
+  getHealth: () => ReturnType<typeof okHealth>;
   getIds: () => { messageId?: string; cardId?: string };
 };
 
@@ -84,6 +99,7 @@ const cardFactory = vi.hoisted(() => {
       appendRetryButton: vi.fn(async () => undefined),
       finalize: vi.fn(async () => undefined),
       getFailCount: () => 0,
+      getHealth: () => okHealth(),
       getIds: () => ({ messageId: "om_x", cardId: "card_x" }),
     };
     cards.push(card);
@@ -124,6 +140,7 @@ const {
 } = await import("@/lib/server/feishu-bridge/outbound");
 
 const { publishTaskStreamEvent } = await import("@/lib/server/task-stream");
+const { LarkApiError } = await import("@/lib/server/feishu-bridge/types");
 
 const flush = async (): Promise<void> => {
   // 排空 microtask + 一轮 macrotask（start / finalize 链路）
@@ -148,6 +165,55 @@ const makeEvent = (
     meta,
   },
 });
+
+/**
+ * 用「getHealth 可控」的假卡跑一轮 user_reply → delta → done，返回那张假卡。
+ * runStatus 默认 awaiting_user（= 自然完成）；传 "idle" = 用户 stop。
+ */
+const runTurnWithHealth = async (opts: {
+  taskId: string;
+  health: Record<string, unknown>;
+  ok?: boolean;
+  runStatus?: string;
+}): Promise<CardMock> => {
+  const { taskId, health, ok = true, runStatus = "awaiting_user" } = opts;
+  cardFactory.create.mockImplementationOnce(() => {
+    const card: CardMock = {
+      start: vi.fn(async () => undefined),
+      pushProcess: vi.fn(),
+      pushAnswer: vi.fn(),
+      setHeaderStatus: vi.fn(),
+      appendAskUser: vi.fn(async () => undefined),
+      appendRetryButton: vi.fn(async () => undefined),
+      finalize: vi.fn(async () => undefined),
+      getFailCount: () => 0,
+      getHealth: () => okHealth(health),
+      getIds: () => ({ messageId: "om_h", cardId: "card_h" }),
+    };
+    cardFactory.cards.push(card);
+    return card;
+  });
+  publishTaskStreamEvent(taskId, makeEvent("user_reply", "问"));
+  publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "答" });
+  await flush();
+  publishTaskStreamEvent(taskId, {
+    kind: "done",
+    ok,
+    task: { id: taskId, title: "测对话", mode: "chat", runStatus } as never,
+  });
+  await flush();
+  return cardFactory.cards.at(-1)!;
+};
+
+/** 本用例里写进事件流的 info 文本 */
+const infoTexts = (): string[] =>
+  writeEventAndPublish.mock.calls
+    .filter(([, ev]) => ev.kind === "info")
+    .map(([, ev]) => ev.text ?? "");
+
+/** 最近一条飞书追发的文本 */
+const lastPing = (): string =>
+  String(sendTextMessage.mock.calls.at(-1)?.[1] ?? "");
 
 beforeEach(() => {
   __resetFeishuOutboundForTest();
@@ -234,6 +300,7 @@ describe("turn 状态机", () => {
     expect(cardFactory.create).toHaveBeenCalledWith(taskId, {
       title: "测对话",
       streaming: true,
+      onBreakerOpen: expect.any(Function),
     });
     const card = cardFactory.cards[0]!;
     expect(card.start).toHaveBeenCalled();
@@ -408,6 +475,7 @@ describe("turn 状态机", () => {
         appendRetryButton: vi.fn(async () => undefined),
         finalize: vi.fn(async () => undefined),
         getFailCount: () => 0,
+        getHealth: () => okHealth(),
         getIds: () => ({ messageId: "om_race", cardId: "card_race" }),
       };
       cardFactory.cards.push(card);
@@ -607,6 +675,7 @@ describe("turn 状态机", () => {
         appendRetryButton: vi.fn(async () => undefined),
         finalize: vi.fn(async () => undefined),
         getFailCount: () => 0,
+        getHealth: () => okHealth(),
         getIds: () => ({}),
       };
       cardFactory.cards.push(card);
@@ -706,47 +775,199 @@ describe("turn 状态机", () => {
     expect(cardFactory.create).toHaveBeenCalledTimes(1);
   });
 
-  // review P1#4 / 坑 #10：连续出向失败 app 内可见
-  it("finalize 时 failCount>=3 → writeEventAndPublish info 可见提示", async () => {
-    const createWithFails = vi.fn(() => {
-      const card: CardMock = {
-        start: vi.fn(async () => undefined),
-        pushProcess: vi.fn(),
-        pushAnswer: vi.fn(),
-        setHeaderStatus: vi.fn(),
-        appendAskUser: vi.fn(async () => undefined),
-        appendRetryButton: vi.fn(async () => undefined),
-        finalize: vi.fn(async () => undefined),
-        getFailCount: () => 3,
-        getIds: () => ({ messageId: "om_fail", cardId: "card_fail" }),
-      };
-      cardFactory.cards.push(card);
-      return card;
+  // review P1#4 / 坑 #10 + R14 P1-1：飞书卡片没同步完整内容 → app 内必须可见、飞书侧追发不能报喜。
+  // 判据是「终稿没落成 / 熔断仍开」，不再是整轮累计失败次数
+  // （旧 failCount>=3：偶发抖动 3 次就误报，而 finalize 自己失败时累计数可能只有 0~2、又一声不吭）
+  it("终稿没落到卡片（finalizeOk=false）→ app 内 info 带原因 + 飞书追发明说没同步、不报「已完成」", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis",
+      health: {
+        finalizeOk: false,
+        failCount: 1, // 累计数很小也要报：看的是「终稿没落成」，不是次数
+        lastError: new LarkApiError("Access denied", { code: 99991672 }),
+      },
     });
-    __setCreateCardStreamForTest(
-      createWithFails as unknown as Parameters<
-        typeof __setCreateCardStreamForTest
-      >[0],
-    );
 
-    const taskId = "t_failvis";
-    publishTaskStreamEvent(taskId, makeEvent("user_reply", "推"));
+    const infos = infoTexts();
+    expect(infos).toHaveLength(1);
+    expect(infos[0]).toContain("飞书卡片没能同步完整回复");
+    expect(infos[0]).toContain("Access denied");
+    expect(infos[0]).toContain("99991672");
+
+    expect(sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(lastPing()).toContain("没能同步");
+    expect(lastPing()).not.toContain("已完成");
+  });
+
+  it("累计失败数很大、但终稿已落成且熔断已恢复 → 不报警，追发仍是「已完成」（旧判据 failCount>=3 的误报）", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis_recovered",
+      health: { failCount: 99, breakerEverOpened: true, finalizeOk: true },
+    });
+    expect(infoTexts()).toHaveLength(0);
+    expect(sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(lastPing()).toContain("已完成");
+  });
+
+  it("熔断此刻仍开着（终稿结果未知）→ 同样算没同步", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis_breaker",
+      health: {
+        breakerOpen: true,
+        breakerEverOpened: true,
+        finalizeOk: undefined,
+        lastError: new Error("lark-cli 超时（8000ms）"),
+      },
+    });
+    const infos = infoTexts();
+    expect(infos).toHaveLength(1);
+    expect(infos[0]).toContain("没能同步完整回复");
+    expect(infos[0]).toContain("超时");
+    expect(lastPing()).toContain("没能同步");
+  });
+
+  it("没有失败原因可描述时 info 也不空（原因未知）", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis_noreason",
+      health: { finalizeOk: false, lastError: undefined },
+    });
+    expect(infoTexts()[0]).toContain("原因未知");
+  });
+
+  it("句柄没给出任何成功信号（finalizeOk=undefined、熔断也没开，例如建卡就失败）→ 按没同步报，不报喜", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis_nosignal",
+      health: {
+        finalizeOk: undefined,
+        breakerOpen: false,
+        lastError: new Error("建卡失败：no permission"),
+      },
+    });
+    const infos = infoTexts();
+    expect(infos).toHaveLength(1);
+    expect(infos[0]).toContain("没能同步完整回复");
+    expect(infos[0]).toContain("no permission");
+    expect(lastPing()).toContain("没能同步");
+    expect(lastPing()).not.toContain("已完成");
+  });
+
+  it("终稿落成但熔断标志仍开着（此刻仍在持续失败）→ 同样按没同步报，不报喜", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis_contradict",
+      health: {
+        finalizeOk: true,
+        breakerOpen: true,
+        lastError: new Error("rate limited"),
+      },
+    });
+    expect(infoTexts()).toHaveLength(1);
+    expect(infoTexts()[0]).toContain("rate limited");
+    expect(lastPing()).toContain("没能同步");
+    expect(lastPing()).not.toContain("已完成");
+  });
+
+  it("没同步时：app 内 info 先于飞书追发（追发走同一条 lark 单飞队列，黑洞时可能排满 30s——app 内提示不能被它拖慢）", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis_order",
+      health: { finalizeOk: false, lastError: new Error("boom") },
+    });
+    const infoOrder = writeEventAndPublish.mock.invocationCallOrder[0]!;
+    const pingOrder = sendTextMessage.mock.invocationCallOrder[0]!;
+    expect(infoOrder).toBeLessThan(pingOrder);
+  });
+
+  it("失败原因里的换行 / 连续空白被折叠成一行（info 是单行提示）", async () => {
+    await runTurnWithHealth({
+      taskId: "t_failvis_oneline",
+      health: {
+        finalizeOk: false,
+        lastError: new Error("第一行\n\n   第二行\t第三行"),
+      },
+    });
+    const info = infoTexts()[0]!;
+    expect(info).toContain("第一行 第二行 第三行");
+    expect(info).not.toMatch(/[\n\t]/);
+  });
+
+  it("失败原因是几十 KB 的 execFile 错误（message 带整卡 --data）时，info 只带一行摘要：≤ 400 字、不含整卡正文", async () => {
+    const BIG_MARK = "整卡正文标记";
+    const huge = new LarkApiError(
+      `Command failed: lark-cli api PUT /x --data ${"a".repeat(500)}${BIG_MARK}${"字".repeat(30_000)}`,
+      { code: 99991400 },
+    );
+    await runTurnWithHealth({
+      taskId: "t_failvis_huge",
+      health: { finalizeOk: false, lastError: huge },
+    });
+    const infos = infoTexts();
+    expect(infos).toHaveLength(1);
+    expect(infos[0]!.length).toBeLessThanOrEqual(400);
+    expect(infos[0]).not.toContain(BIG_MARK);
+
+    // 熔断提示同理
+    writeEventAndPublish.mockClear();
+    const createOpts = (
+      cardFactory.create.mock.calls.at(-1) as unknown as [
+        string,
+        {
+          onBreakerOpen?: (info: {
+            consecutiveFails: number;
+            retryInMs: number;
+            error: unknown;
+          }) => void;
+        },
+      ]
+    )[1];
+    createOpts.onBreakerOpen!({ consecutiveFails: 3, retryInMs: 2000, error: huge });
+    await flush();
+    const brk = infoTexts();
+    expect(brk).toHaveLength(1);
+    expect(brk[0]!.length).toBeLessThanOrEqual(400);
+    expect(brk[0]).not.toContain(BIG_MARK);
+  });
+
+  it("熔断一打开就当场写 info（不等 finalize）；回调里写 info 失败也不传播", async () => {
+    const taskId = "t_breaker_info";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "问"));
     publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "答" });
     await flush();
-    publishTaskStreamEvent(taskId, {
-      kind: "done",
-      ok: true,
-      task: { id: taskId, title: "测对话", mode: "chat" } as never,
+    const createOpts = (
+      cardFactory.create.mock.calls[0] as unknown as [
+        string,
+        {
+          onBreakerOpen?: (info: {
+            consecutiveFails: number;
+            retryInMs: number;
+            error: unknown;
+          }) => void;
+        },
+      ]
+    )[1];
+    expect(typeof createOpts.onBreakerOpen).toBe("function");
+
+    createOpts.onBreakerOpen!({
+      consecutiveFails: 3,
+      retryInMs: 2000,
+      error: new LarkApiError("rate limited", { code: 99991400 }),
     });
     await flush();
+    const infos = infoTexts();
+    expect(infos).toHaveLength(1);
+    expect(infos[0]).toContain("连续 3 次");
+    expect(infos[0]).toContain("rate limited");
+    // 此刻这一轮还没结束：没有追发
+    expect(sendTextMessage).not.toHaveBeenCalled();
 
-    expect(writeEventAndPublish).toHaveBeenCalledWith(
-      taskId,
-      expect.objectContaining({
-        kind: "info",
-        text: expect.stringContaining("飞书卡片推送异常（3 次失败）"),
+    // 写 info 自己失败：回调吞掉，不抛、不留未处理的 rejection（vitest 会把后者判红）
+    writeEventAndPublish.mockRejectedValueOnce(new Error("disk full"));
+    expect(() =>
+      createOpts.onBreakerOpen!({
+        consecutiveFails: 4,
+        retryInMs: 4000,
+        error: new Error("x"),
       }),
-    );
+    ).not.toThrow();
+    await flush();
   });
 
   // R1-7：多图回显按位序，慢的先完成也不打乱
@@ -847,6 +1068,7 @@ describe("流式开关冻结", () => {
     expect(cardFactory.create).toHaveBeenCalledWith(taskId, {
       title: "测对话",
       streaming: true,
+      onBreakerOpen: expect.any(Function),
     });
     expect(isFeishuBridgeStreamingEnabled).toHaveBeenCalledTimes(1);
 
@@ -949,7 +1171,64 @@ describe("流式完成追发短文本", () => {
     expect(cardFactory.create).toHaveBeenCalledWith("t_ping_nostream", {
       title: "测对话",
       streaming: false,
+      onBreakerOpen: expect.any(Function),
     });
     expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  // R14 P1-1：卡片没同步时追发不能报喜；非流式卡没发出去时更要追发（否则飞书里什么都收不到）
+  it("非流式 + 卡片没发出去（finalizeOk=false）→ 仍追发，明说没同步", async () => {
+    vi.mocked(isFeishuBridgeStreamingEnabled).mockResolvedValue(false);
+    await runTurnWithHealth({
+      taskId: "t_ping_nostream_fail",
+      health: { finalizeOk: false },
+    });
+    expect(sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(lastPing()).toContain("没能同步");
+  });
+
+  it("流式 + 没同步：⚠️ 文案带耗时、不再报「已完成」", async () => {
+    await runTurnWithHealth({
+      taskId: "t_ping_unsynced",
+      health: { finalizeOk: false },
+    });
+    expect(sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(lastPing()).toContain("⚠️ 回复没能同步到飞书卡片，请回 Flowship 查看（");
+    expect(lastPing()).not.toContain("已完成");
+  });
+
+  it("没同步时「❌ 处理失败」也明说卡片不可用（重试按钮可能没出来）", async () => {
+    await runTurnWithHealth({
+      taskId: "t_ping_fail_unsynced",
+      health: { finalizeOk: false },
+      ok: false,
+    });
+    expect(lastPing()).toContain("处理失败");
+    expect(lastPing()).toContain("没能同步");
+    expect(lastPing()).not.toContain("可在卡片重试");
+  });
+
+  it("有待答问题：同步正常 →「有问题等你回答」；没同步 → 同时说明选项按钮可能不可用", async () => {
+    getPendingAsk.mockReturnValue({ askId: "a1" } as never);
+    await runTurnWithHealth({ taskId: "t_ping_ask_ok", health: {} });
+    expect(lastPing()).toBe("🙋 有问题等你回答");
+
+    sendTextMessage.mockClear();
+    await runTurnWithHealth({
+      taskId: "t_ping_ask_unsynced",
+      health: { finalizeOk: false },
+    });
+    expect(lastPing()).toContain("有问题等你回答");
+    expect(lastPing()).toContain("没能同步");
+  });
+
+  it("用户 stop 的轮次：即使卡片没同步也不追发（人是自己停的），但 app 内 info 仍写", async () => {
+    await runTurnWithHealth({
+      taskId: "t_ping_stopped_unsynced",
+      health: { finalizeOk: false },
+      runStatus: "idle",
+    });
+    expect(sendTextMessage).not.toHaveBeenCalled();
+    expect(infoTexts()).toHaveLength(1);
   });
 });

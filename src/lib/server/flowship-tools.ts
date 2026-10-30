@@ -202,6 +202,63 @@ export const dispatchSubmitWork = async (args: {
   };
 };
 
+/** ask_user 一次最多几项：再多答题卡没法看，也多半是模型把整份文档当成问题塞进来了 */
+export const ASK_USER_MAX_QUESTIONS = 20;
+
+/**
+ * 提问入参校验（`dispatchAskUser` 开头调；工具 handler 与测试共用）。
+ * 弱模型 / 自定义 provider 不强制 inputSchema（pi 路径 TypeBox 只校验类型、不校验非空），会传
+ * `questions: []` 或 `[{id:"",question:""}]`：不校验就登记一个没有可答项的 pending ask、推一张空卡，
+ * 还让模型去挂 24 小时的 curl 等一份没人能提交的答案（只能靠用户点「跳过」/ 停止）。
+ * 返回 null = 合法；否则是给模型看的、点名第几项哪个字段的具体原因（模型据此自修复重发）。
+ */
+export const validateAskUserQuestions = (
+  questions: AskUserQuestion[],
+): string | null => {
+  const t = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return "questions 至少要有 1 项（当前 0 项）";
+  }
+  if (questions.length > ASK_USER_MAX_QUESTIONS) {
+    return `questions 最多 ${ASK_USER_MAX_QUESTIONS} 项（当前 ${questions.length} 项），请合并或拆成多轮`;
+  }
+  const seen = new Set<string>();
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    const at = `questions[${i}]`;
+    const id = t(q?.id);
+    if (!id) return `${at}.id 不能为空`;
+    if (seen.has(id)) return `${at}.id「${id}」与前面的项重复，id 必须唯一`;
+    seen.add(id);
+    if (!t(q?.question)) return `${at}（id=${id}）.question 不能为空`;
+    const options = q?.options;
+    if (options !== undefined) {
+      if (!Array.isArray(options) || options.length === 0) {
+        return `${at}（id=${id}）.options 给了空数组：要么至少 1 个选项，要么不要传 options（只收文字回答）`;
+      }
+      const optSeen = new Set<string>();
+      for (let j = 0; j < options.length; j++) {
+        const oid = t(options[j]?.id);
+        if (!oid) return `${at}（id=${id}）.options[${j}].id 不能为空`;
+        if (optSeen.has(oid)) {
+          return `${at}（id=${id}）.options[${j}].id「${oid}」重复，同一题里选项 id 必须唯一`;
+        }
+        optSeen.add(oid);
+        if (!t(options[j]?.label)) {
+          return `${at}（id=${id}）.options[${j}].label 不能为空`;
+        }
+      }
+    } else if (q?.allowText === false) {
+      return `${at}（id=${id}）既没有 options 又不允许文字回答（allow_text=false），用户无法作答`;
+    }
+  }
+  return null;
+};
+
+/** 校验不过时回给模型的整段文案（不登记、不推卡、没有 ASK_SUBMITTED，所以不要去挂 curl） */
+const askUserInvalidText = (reason: string): string =>
+  `提问未发出：${reason}。没有推送答题卡，也不要去执行 curl。请按 { id, question, options?: [{id,label}], allow_text? } 补全后重新调用 ask_user。`;
+
 /** 提问分派（工具 handler + 测试共用） */
 export const dispatchAskUser = async (args: {
   taskId: string;
@@ -212,6 +269,8 @@ export const dispatchAskUser = async (args: {
   if (!matchExpectedCallerToken(args.taskId, args.callerToken)) {
     return { ok: false, error: CALLER_MISMATCH_ERROR };
   }
+  const invalid = validateAskUserQuestions(args.questions);
+  if (invalid) return { ok: false, error: askUserInvalidText(invalid) };
   const askId = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const ask = registerPendingAsk(args.taskId, {
     askId,
@@ -293,17 +352,18 @@ const askUserDef: FlowshipToolDef = {
     ),
   }),
   handler: async (args, callerToken) => {
-    const raw = (Array.isArray(args.questions) ? args.questions : []) as Array<{
-      id?: unknown;
-      question?: unknown;
-      options?: Array<{ id?: unknown; label?: unknown }>;
-      allow_text?: unknown;
-    }>;
+    // 项不是对象（null / 字符串…）按空项处理，交给 dispatchAskUser 的校验点名，别在这里 TypeError
+    const obj = (v: unknown): Record<string, unknown> =>
+      v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+    const raw = (Array.isArray(args.questions) ? args.questions : []).map(obj);
     const questions: AskUserQuestion[] = raw.map((q) => ({
       id: str(q.id),
       question: str(q.question).trim(),
       options: Array.isArray(q.options)
-        ? q.options.map((o) => ({ id: str(o.id), label: str(o.label) }))
+        ? q.options.map((o) => {
+            const oo = obj(o);
+            return { id: str(oo.id), label: str(oo.label) };
+          })
         : undefined,
       allowText: q.allow_text !== false,
     }));
@@ -822,6 +882,19 @@ const scheduleDef: FlowshipToolDef = {
       }
       const created = await createSchedule(taskId, v.value, now);
       if (!created.ok) return text(`创建失败：${created.error}`);
+      // R14 Q20-05：已经有一条完全等价的活定时——没有新建，也不再写「已设定」提示事件（别往事件流重复刷）
+      if (created.deduped) {
+        const e = created.record;
+        return text(
+          [
+            `[ALREADY_SCHEDULED id=${e.id}] 这个会话里已经有同样的定时「${e.title}」（${describeSchedulePlan(e)}，${e.status === "paused" ? "当前已暂停" : `下次 ${formatScheduleLocalIso(e.nextFireAt ?? now)}（本机时间）`}），没有重复创建。`,
+            "不需要再设一次；要改时间 / 间隔，先取消这条（action=cancel）再新建。",
+            // R14 Q20-05 的使用侧副作用：接力续期（旧的周期定时次数快用完、再建下一条）正好是「同标题 / 同正文 / 同间隔 / 同次数、
+            // 只有首次时刻不同」，会被判成重复而断档——回执必须直接教出口，别让模型只能猜
+            "确实要另建一条并存的（如周期定时的次数快用完、需要接力续期）：请改标题或正文再建——标题、正文、间隔、次数都相同的，只要旧的还活着就会一直被当成重复。",
+          ].join("\n"),
+        );
+      }
       const r = created.record;
       // 定时已经落盘：提示事件写失败不能让模型看到「创建失败」（它会重试 → 重复创建）
       await writeEventAndPublish(taskId, {
@@ -900,8 +973,24 @@ export const buildSdkCustomTools = (
       description: t.description,
       inputSchema: typeBoxToJsonSchema(t.parameters),
       execute: async (args) => {
-        const r = await t.handler(args, callerToken, ctx);
-        return { content: r.content };
+        // 兜底：handler 抛错（args 为 null / undefined 时 `str(args.task_id)` 直接 TypeError，
+        // 各 handler 里的 getTask 也在 try 之外）要转成「文本 + isError」回给模型——与 pi 桥 /
+        // `subagent` 工具同口径；SDK 对 execute 抛错怎么呈现读不到，别指望它给一句能自修复的话
+        try {
+          const r = await t.handler(
+            (args ?? {}) as Record<string, unknown>,
+            callerToken,
+            ctx,
+          );
+          return { content: r.content };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[flowship-tools] 工具 ${t.name} 执行抛错、已转成 isError 回包：`, msg);
+          return {
+            content: [{ type: "text" as const, text: `工具 ${t.name} 执行失败：${msg}` }],
+            isError: true,
+          };
+        }
       },
     };
   }

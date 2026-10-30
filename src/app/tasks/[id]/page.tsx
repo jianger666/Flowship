@@ -67,9 +67,15 @@ import { TalkQueueBanner } from "@/components/tasks/talk-queue-banner";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
 import { ScheduleChip } from "@/components/tasks/schedule-chip";
 import type { TalkQueueItem } from "@/lib/talk-queue";
+import {
+  sameStorageDegraded,
+  type StorageDegradedState,
+} from "@/lib/storage-degraded";
 import type { AssistantSnapshot } from "@/lib/assistant-live";
 import { stopConfirmDescription, stoppableQueuedCount } from "@/lib/stop-copy";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
+import { TaskMrLinks } from "@/components/tasks/task-mr-links";
+import { ArchivedNotice } from "@/components/tasks/archived-bar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -252,6 +258,10 @@ const TaskDetailPage = () => {
   const [groupQaVisible, setGroupQaVisible] = useState(false);
   // task 模式待送达队列（SSE talk_queue 帧维护整份快照；切任务清空，新任务 bootstrap 会补发）
   const [talkQueue, setTalkQueue] = useState<TalkQueueItem[]>([]);
+  // 存储降级（SSE storage_degraded 帧维护；null = 没降级）：事件写盘失败期间事件流顶部常驻红条；
+  // 切任务清空，新任务 bootstrap 会补发当前值
+  const [storageDegraded, setStorageDegraded] =
+    useState<StorageDegradedState | null>(null);
   // V0.6.6「编辑任务」dialog 开关（改角色 / 标题 / 飞书链接 / 模型 / 工作分支）
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   // 任务输入条乐观占位行（HTTP 回来前事件流先出半透明气泡；按 taskId+nonce 隔离，
@@ -322,6 +332,8 @@ const TaskDetailPage = () => {
     clearStreaming();
     setSelectedActionId(null);
     setTalkQueue([]);
+    // 上个任务的存储降级红条不能串到新任务（新任务连上 SSE 后 bootstrap 会补发它自己的）
+    setStorageDegraded(null);
     setRunActive(false);
     // 折叠态属于上一个任务的 Group（key=task.id、切任务会重挂）；新 Group 总是展开着挂
     setArtifactCollapsed(false);
@@ -614,6 +626,11 @@ const TaskDetailPage = () => {
       onAssistantDelta: pushDelta,
       onAssistantSnapshot: applyAssistantSnapshot,
       onTalkQueue: setTalkQueue,
+      // 与现值相同（bootstrap 补发 vs 实时帧常常同一份）就不 setState，省一次整页重渲染
+      onStorageDegraded: (state) =>
+        setStorageDegraded((prev) =>
+          sameStorageDegraded(prev, state) ? prev : state,
+        ),
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
       // resume 有值 = 重试预算耗尽、已休眠：挂「重连」按钮并常驻，别让用户面对静默停更的页面
       // 稳定 id：同一任务重复休眠只原位更新、不叠加；连接恢复 / 卸载 / 切任务时由 onWatchDormantEnd 撤掉
@@ -1037,6 +1054,10 @@ const TaskDetailPage = () => {
           replanMode: input.replanMode,
           // V0.9 custom action：指向的定义 id（仅 custom 时有值）
           customActionId: input.customActionId,
+          // R14 Q7a-04：我点推进时看到的当前 action（null = 当时没有）。服务端对照盘上最新值：
+          // 重复提交 / 页面陈旧 / 另一个窗口抢先推进 → 拒掉（409，文案叫用户先看最新进度），不再起第二条 action。
+          // 取不到（undefined）时 JSON 会省掉该字段 = 不校验，不会误拒
+          expectedCurrentActionId: t.currentActionId,
           // V0.x A 方案：设置页最新分支配置（server 据此刷新 task 分支快照、设置页改了下次推进生效）
           repoBaseBranches:
             Object.keys(repoBaseBranches).length > 0
@@ -1302,6 +1323,13 @@ const TaskDetailPage = () => {
               {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）
                   ——本分支已是 task 模式（chat 模式在上面提前 return ChatView） */}
               <WorkspaceActions task={task} />
+              {/* R14 Q3-01：MR 链接（ship / dev action 落档后出现、多仓平铺）。v1.7.1 头部重构误删，
+                  做成叶子组件放回来——只吃 mrs + 两份分支快照，不传整个 task */}
+              <TaskMrLinks
+                mrs={task.mrs}
+                repoTestBranches={task.repoTestBranches}
+                repoDevBranches={task.repoDevBranches}
+              />
             </div>
           </div>
 
@@ -1429,6 +1457,9 @@ const TaskDetailPage = () => {
       </div>
 
       <Separator />
+
+      {/* 已归档提示 + 一键恢复（R14 B6-3 / Q3-03）：没归档时它自己返回 null */}
+      <ArchivedNotice task={task} onTaskUpdate={absorbTask} />
 
       {/* 主区 */}
       <div
@@ -1567,6 +1598,8 @@ const TaskDetailPage = () => {
                   onPrependEvents={handlePrependEvents}
                   onTaskUpdate={absorbTask}
                   onGroupQaVisibleChange={setGroupQaVisible}
+                  // 事件写盘失败（磁盘满 / 只读…）期间事件流顶部常驻红条；SSE storage_degraded 帧维护
+                  storageDegraded={storageDegraded}
                 />
                 </StreamActionsProvider>
               </div>

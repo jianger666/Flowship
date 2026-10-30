@@ -34,7 +34,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { getIdeAnchorProps } from "@/lib/ide-open";
-import { getRepoWorkDirs, shellQuotePath } from "@/lib/path-utils";
+import { getRepoWorkDirs, repoTail, shellQuotePath } from "@/lib/path-utils";
 import { getSettings, initSettings } from "@/lib/local-store";
 import {
   fetchPreviewStatus,
@@ -50,6 +50,10 @@ interface Props {
 
 // 小号纯图标按钮统一样式（省空间、给项目名/分支腾位置；语义靠 Tooltip）
 const BTN_CLS = "size-6 shrink-0 justify-center p-0 text-muted-foreground hover:text-foreground";
+
+// 这些按钮只有图标（语义靠 Tooltip，而 Tooltip 只在 hover 时才有），读屏读不出名字（R14 Q19-01）：
+// 可访问名 = 动作 +（仓名）——多仓时每个仓都有一排同样的按钮，不带仓名就分不清是哪个仓的
+const iconLabel = (action: string, repoName: string): string => `${action}（${repoName}）`;
 
 export const WorkspaceActions = ({ task }: Props) => {
   // 设置快照（jumpIde + 每仓预览命令）——挂载时读一次、设置页改完回来重新挂载自然刷新
@@ -166,10 +170,14 @@ export const WorkspaceActions = ({ task }: Props) => {
   const ideRepoSet = new Set(ideTargets.map((t) => t.repoPath));
   // candidates 理论上都挂在 ideTargets 上；对不上的兜底单独放（避免预览按钮消失）
   const orphanCandidates = candidates.filter((c) => !ideRepoSet.has(c.repoPath));
+  // 按钮可访问名里的仓名：与卡片上显示的短名同源，对不上（兜底的孤儿仓）就取路径末段
+  const repoNameOf = (repoPath: string): string =>
+    ideTargets.find((t) => t.repoPath === repoPath)?.shortName ?? repoTail(repoPath);
 
   /** 某仓组内的预览区：未跑→启动钮；本仓本任务在跑→运行态；本仓本任务已退→重试。
    *  每仓独立判断、互不隐藏（修旧 bug：一仓预览中另一仓按钮消失）。 */
   const renderPreviewForRepo = (repoPath: string) => {
+    const repoName = repoNameOf(repoPath);
     const mine = slots.find(
       (s) => s.repoPath === repoPath && s.taskId === task.id,
     );
@@ -186,6 +194,7 @@ export const WorkspaceActions = ({ task }: Props) => {
                 variant="ghost"
                 size="sm"
                 className={BTN_CLS}
+                aria-label={iconLabel(`打开 ${mine.url}`, repoName)}
                 nativeButton={false}
                 render={
                   <a
@@ -200,13 +209,14 @@ export const WorkspaceActions = ({ task }: Props) => {
               </Button>
             </Tooltip>
           )}
-          <PreviewLogPopover slot={mine} />
+          <PreviewLogPopover slot={mine} repoName={repoName} />
           <Tooltip content="停止预览 dev server">
             <span className="inline-flex">
               <Button
                 variant="ghost"
                 size="sm"
                 className={BTN_CLS}
+                aria-label={iconLabel("停止预览 dev server", repoName)}
                 disabled={busy}
                 onClick={() => void stop(repoPath)}
               >
@@ -224,13 +234,14 @@ export const WorkspaceActions = ({ task }: Props) => {
             <span className="size-1.5 rounded-full bg-destructive/80" />
             已退出
           </span>
-          <PreviewLogPopover slot={mine} />
+          <PreviewLogPopover slot={mine} repoName={repoName} />
           <Tooltip content="用同一命令重新启动预览">
             <span className="inline-flex">
               <Button
                 variant="ghost"
                 size="sm"
                 className={BTN_CLS}
+                aria-label={iconLabel("用同一命令重新启动预览", repoName)}
                 disabled={busy}
                 onClick={() => void start(mine.repoPath)}
               >
@@ -251,6 +262,7 @@ export const WorkspaceActions = ({ task }: Props) => {
             variant="ghost"
             size="sm"
             className={BTN_CLS}
+            aria-label={iconLabel(`启动预览:${c.command}`, repoName)}
             disabled={busy}
             onClick={() => void start(c.repoPath)}
           >
@@ -279,6 +291,7 @@ export const WorkspaceActions = ({ task }: Props) => {
                   variant="ghost"
                   size="sm"
                   className={BTN_CLS}
+                  aria-label={iconLabel("在 IDE 打开项目", t.shortName)}
                   nativeButton={false}
                   render={
                     <a
@@ -296,6 +309,7 @@ export const WorkspaceActions = ({ task }: Props) => {
                 variant="ghost"
                 size="sm"
                 className={BTN_CLS}
+                aria-label={iconLabel("复制工作区路径", t.shortName)}
                 onClick={() => void copyPath(t.workDir)}
               >
                 <Copy className="size-3.5" />
@@ -330,7 +344,7 @@ export const WorkspaceActions = ({ task }: Props) => {
         const orphanInner = (
           <>
             <span className="px-1 text-[11px] text-muted-foreground">
-              {c.repoPath.split("/").filter(Boolean).pop()}
+              {repoTail(c.repoPath)}
             </span>
             {renderPreviewForRepo(c.repoPath)}
           </>
@@ -350,16 +364,28 @@ export const WorkspaceActions = ({ task }: Props) => {
 };
 
 // 预览日志 popover（启动失败排查 / 看 dev server 输出）
-const PreviewLogPopover = ({ slot }: { slot: PreviewSlotStatus }) => (
+const PreviewLogPopover = ({
+  slot,
+  repoName,
+}: {
+  slot: PreviewSlotStatus;
+  /** 按钮可访问名里的仓名（与同排其它按钮同源，见 repoNameOf） */
+  repoName: string;
+}) => (
   <Popover>
     {/* PopoverTrigger.render 必须是可交互 DOM；Tooltip 不能塞进 render（同 combobox / 收件箱坑） */}
     <Tooltip content="查看 dev server 最近输出">
       <span className="inline-flex">
         <PopoverTrigger
           render={
-            <Button variant="ghost" size="sm" className={BTN_CLS}>
-            <FileTerminal className="size-3.5" />
-          </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className={BTN_CLS}
+              aria-label={iconLabel("查看 dev server 最近输出", repoName)}
+            >
+              <FileTerminal className="size-3.5" />
+            </Button>
           }
         />
       </span>

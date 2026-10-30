@@ -10,7 +10,7 @@
  *
  * - 空间 = settings.meegleProject（全局唯一默认空间、设置页可改；看板不再切换）
  * - 时间范围变化 → 重新拉取（接口按区间查）
- * - 点击：已有任务 → 任务页；没有 → 工作项预览页（启动才建任务）
+ * - 点击：已有任务 → 任务页（已归档的先恢复再进、见 lib/board-open）；没有 → 工作项预览页（启动才建任务）
  * - 降级态：CLI 未装 / 未授权 → 引导卡；报错 → 重试
  * - localStorage 按空间分 key 缓存秒开、请求序号防竞态
  */
@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Plug, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
 
 import { BoardTimeline } from "@/components/feishu/board-timeline";
 import type { DayRange } from "@/components/ui/date-range-picker";
@@ -30,9 +31,15 @@ import { settingsUrl } from "@/lib/settings-link";
 import { DEFAULT_MEEGLE_PROJECT, type FeAiFlowSettings } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { markShellContentReady } from "@/lib/shell-ready";
-import { loadBoardRange, saveBoardRange } from "@/lib/view-memory";
+import {
+  loadBoardRange,
+  loadSidebarPinnedOrder,
+  saveBoardRange,
+  saveSidebarPinnedOrder,
+} from "@/lib/view-memory";
 import { useTaskList } from "@/hooks/use-task-list";
-import { shouldTrustCachedTaskLink } from "@/lib/workitem-link";
+import { openBoardItem } from "@/lib/board-open";
+import { setTaskArchivedWithReport } from "@/lib/task-store";
 
 type MeegleProjectSetting = NonNullable<FeAiFlowSettings["meegleProject"]>;
 
@@ -94,12 +101,18 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 export const FeishuBoard = () => {
   const router = useRouter();
-  // 侧栏任务列表：点看板时实时校验 it.task（缓存旧映射不失效，盲跳会 404）
-  const { tasks, loaded: tasksLoaded, loadError: tasksLoadError } = useTaskList();
-  const liveTaskIds = useMemo(
-    () => new Set(tasks.map((t) => t.id)),
-    [tasks],
-  );
+  // 侧栏任务列表：点看板时实时校验 it.task（缓存旧映射不失效，盲跳会 404）；
+  // 列表里也有已归档的任务——点到它要先恢复（归档 / 恢复的同步口径同会话页）
+  const {
+    tasks,
+    loaded: tasksLoaded,
+    loadError: tasksLoadError,
+    upsertTask,
+    markArchiving,
+    unmarkArchiving,
+  } = useTaskList();
+  // 恢复请求在途的任务 id：连点同一条不重复发请求 / 重复弹提示
+  const restoringRef = useRef<Set<string>>(new Set());
   // 数据（null = 首次还没回来）
   const [resp, setResp] = useState<BoardResp | null>(null);
   // resp 的同步镜像（refresh 回调里做「手上是否有好数据」判断、不依赖闭包陈旧值）
@@ -271,32 +284,32 @@ export const FeishuBoard = () => {
     };
   }, [refresh, clearRetryTimer]);
 
-  // 点击工作项：有「仍存活」的任务直进、否则进预览（不盲信看板缓存里的 it.task）
+  // 点击工作项：有「仍存活」的任务直进（已归档的先恢复再进）、否则进预览（不盲信看板缓存里的 it.task）。
+  // 判定与流程全在 lib/board-open（可测）：localStorage / 内存缓存里的 task id 删任务后不失效，
+  // 用侧栏实时列表校验；列表没就绪 / 首拉失败时回退信任缓存映射——否则秒开缓存期间点已有任务
+  // 会被误导去预览页、可能重复建任务
   const handleOpen = useCallback(
     (it: BoardItem) => {
-      // localStorage / 内存缓存里的 task id 删任务后不失效——用侧栏实时列表校验；
-      // 列表还没加载完（loaded=false、tasks 空）时回退信任缓存映射——否则秒开缓存
-      // 期间点已有任务会被误导去预览页、可能重复建任务
-      // 列表首拉失败（loaded=true 但没数据 + 有失败）同样拿不到实时校验，也回退信任缓存（shouldTrustCachedTaskLink）
-      if (
-        it.task &&
-        (shouldTrustCachedTaskLink({
-          loaded: tasksLoaded,
-          loadError: tasksLoadError,
-          taskCount: tasks.length,
-        }) ||
-          liveTaskIds.has(it.task.id))
-      ) {
-        router.push(`/tasks/${it.task.id}`);
-        return;
-      }
-      const qs = new URLSearchParams();
-      if (it.projectKey) qs.set("project", it.projectKey);
-      if (it.name) qs.set("name", it.name);
-      if (it.url) qs.set("url", it.url);
-      router.push(`/workitems/${encodeURIComponent(it.id)}?${qs.toString()}`);
+      void openBoardItem(
+        it,
+        { tasks, loaded: tasksLoaded, loadError: tasksLoadError },
+        {
+          push: (url) => router.push(url),
+          setArchived: setTaskArchivedWithReport,
+          markArchiving,
+          unmarkArchiving,
+          upsertTask,
+          restorePinnedOrder: (id) => {
+            const order = loadSidebarPinnedOrder();
+            if (!order.includes(id)) saveSidebarPinnedOrder([...order, id]);
+          },
+          notifySuccess: (message) => void toast.success(message),
+          notifyError: (message) => void toast.error(message),
+          restoring: restoringRef.current,
+        },
+      );
     },
-    [router, liveTaskIds, tasksLoaded, tasksLoadError, tasks.length],
+    [router, tasks, tasksLoaded, tasksLoadError, upsertTask, markArchiving, unmarkArchiving],
   );
 
   const items = useMemo(() => resp?.items ?? [], [resp]);

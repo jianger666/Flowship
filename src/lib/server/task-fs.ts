@@ -92,7 +92,7 @@ import {
   type CheckpointRefManifest,
 } from "./chat-checkpoint";
 import { isAppUserDataPath } from "./app-data-dir";
-import { dataRoot } from "./data-root";
+import { dataRoot, writeFileFsynced } from "./data-root";
 import { readSettingsFile } from "./settings-fs";
 import {
   killStalePreview,
@@ -469,8 +469,12 @@ export const writeDeletionJournal = async (
     // 构建成功确认的零仓——与「空未知」区分
     ...(manifest.confirmedEmpty ? { confirmedEmpty: true } : {}),
   });
-  await fs.writeFile(tmpPath, body, "utf-8");
   try {
+    // rename 之前 fsync(tmp)（Q9-04）：断电留下空 / 半截的 journal，这次删除就永久卡住——
+    // readDeletionJournal 读到空文件 / 坏 JSON 是 unknown，recoverDeletionJournals 对 unknown 一律「本轮跳过、下次再试」，
+    // 每次启动都 console.error，残留永远清不掉。删除是低频操作，fsync 的代价可以忽略。
+    // 写 tmp 本身失败（ENOSPC 等）也要走下面的 catch 清掉 tmp，所以写在 try 里面
+    await writeFileFsynced(tmpPath, body);
     // 测试：prepared / committed 写失败可分别注入
     await failpoint(
       phase === "committed"
@@ -1599,6 +1603,8 @@ const lastMetaTouchAt = new Map<string, number>();
  *
  * @param lease 可选；透传到 appendEventLine 队内检查（false → 不写盘、返 null）
  * @param onCommitted 可选；链内写行成功后同步回调（writeEventAndPublish 传 publish）
+ * @param onPersistFailed 可选（R14 B2-2）；`appendFile` 抛错时链内同步回调（此时 `event.seq` 已摘除），
+ *   随后错误照旧向上抛——让 writeEventAndPublish 能把「没落盘」的事件仍推给在线订阅者并置存储降级标志
  *
  * 错误语义（调用方零影响、透传已存在）：
  * - ENOENT / lease 拒写 → 返 null（不抛）
@@ -1617,6 +1623,7 @@ export const appendEvent = async (
   },
   lease?: () => boolean,
   onCommitted?: (event: TaskEvent) => void,
+  onPersistFailed?: (event: TaskEvent, err: unknown) => void,
 ): Promise<TaskEvent | null> => {
   if (!(await exists(path.join(taskDir(taskId), META_FILE)))) return null;
   // id 单独拆出来再 spread：显式写成 `id: undefined` 的入参也不会把生成的 id 覆盖成 undefined；
@@ -1629,7 +1636,13 @@ export const appendEvent = async (
   };
   // 写行 + onCommitted（publish）同进 per-task append 链
   // 非 ENOENT 错误由 appendEventLineUnlocked 原样抛出（透传、不吞）
-  const wrote = await appendEventLine(taskId, event, lease, onCommitted);
+  const wrote = await appendEventLine(
+    taskId,
+    event,
+    lease,
+    onCommitted,
+    onPersistFailed,
+  );
   if (!wrote) return null;
 
   // meta.updatedAt 移出关键路径——列表排序 5s 粒度足够；失败只 warn

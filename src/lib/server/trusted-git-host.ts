@@ -52,7 +52,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { dataRoot, supportsUnixFileMode } from "./data-root";
+import { dataRoot, stripBom, supportsUnixFileMode } from "./data-root";
 
 /** 固定文件名（放数据目录根） */
 export const TRUSTED_GIT_HOST_FILE_NAME = "trusted-git-host.json";
@@ -246,7 +246,9 @@ export const hasTrustedGitHostRecord = (): boolean =>
 export const readGitHostAllowlist = (): string[] => {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as unknown;
+    parsed = JSON.parse(
+      stripBom(fs.readFileSync(configFilePath(), "utf-8")),
+    ) as unknown;
   } catch {
     return [];
   }

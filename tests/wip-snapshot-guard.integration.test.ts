@@ -247,6 +247,27 @@ describe("D2b-01 / F1-04：残留工作区清理（存储页）复用 WIP 快照
     expect(git(repo, "show", `${ref}:precious.txt`)).toBe("do-not-lose");
   });
 
+  it("R14 Q10-04：快照用的是临时 index（GIT_INDEX_FILE 经 runGit 的 extraEnv 传下去）——存不下而保留的目录里，用户真实的暂存区没被 `add -A` 改写", async () => {
+    const { repo, t, wd, dirName } = await setupStale("stale-index");
+    await fs.writeFile(path.join(wd, "precious.txt"), "do-not-lose\n"); // 未跟踪
+    await fs.writeFile(path.join(wd, "f.txt"), "edited\n"); // 已跟踪、未暂存
+    expect(git(wd, "diff", "--cached", "--name-only"), "前提：现场里没有任何已暂存的东西").toBe("");
+    git(repo, "update-ref", `${wipSnapshotRefName(t.id, dirName)}/blocker`, "HEAD"); // ref 名被占 → 快照存不下 → 目录保留
+
+    const res = await cleanupStaleTaskWorktrees(t.id);
+
+    expect(res.kept, "前提：快照确实跑到了 add -A / write-tree、并在落 ref 时失败").toHaveLength(1);
+    expect(res.kept[0].reason).toContain("update-ref");
+    expect(
+      git(wd, "diff", "--cached", "--name-only"),
+      "快照把改动暂存进了用户的真实 index（临时 index 没生效）",
+    ).toBe("");
+    expect(git(wd, "diff", "--name-only"), "已跟踪的改动仍是未暂存").toBe("f.txt");
+    expect(git(wd, "ls-files", "--others", "--exclude-standard"), "未跟踪文件仍是未跟踪").toBe(
+      "precious.txt",
+    );
+  });
+
   it("脏子模块的残留目录同样被拦（D2b-15 在这个入口也不能漏）", async () => {
     const { repo, t, wd } = await (async () => {
       const s = await setupSubmoduleTask("stale-sm");

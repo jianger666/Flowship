@@ -36,12 +36,14 @@ import {
   hasChatSession,
   isChatQueueDraining,
   isChatRunActive,
+  reclaimChatSessionsForWatermark,
   releaseChatRunClaim,
   resumeChatSession,
   runChatSession,
   sendChatMessage,
   waitForChatToStop,
 } from "@/lib/server/chat-runner";
+import { CHAT_WATERMARK_SOFT_RATIO } from "@/lib/server/chat-reclaim";
 import {
   captureChatCheckpoint,
   persistCheckpointForReply,
@@ -97,7 +99,7 @@ import { buildSkillDirective } from "@/lib/protocol-signals";
 import { announceSessionRebuilt } from "@/lib/server/session-rebuilt-notice";
 import { notePrep } from "./run-prep-notes";
 import { appendTimingLog } from "./timing-log";
-import { heapPressure } from "./sdk-store-gc";
+import { HeapPressureError, heapPressure, maybeGcSdkStore } from "./sdk-store-gc";
 import {
   migrateProviderSettings,
   providerDisplayName,
@@ -112,6 +114,7 @@ import {
   parseAndValidateSkills,
   stringSetEquals,
 } from "@/lib/server/route-helpers";
+import { TASK_INJECT_BUSY_CODE } from "./task-inject-shared";
 
 
 export interface ChatInjectBody {
@@ -175,6 +178,41 @@ export const handleChatReplyInject = async (
   } finally {
     skipRef.handle?.rollback();
   }
+};
+
+/**
+ * X3(b)：chat 入口的堆水位门。返回非 null = 拒（503），调用方原样返回。
+ *
+ * 两级：堆占用 ≥ 软水位（0.7）先回收「空闲、守卫放行」的热会话（占用从大到小、不含本次要服务的会话），
+ * **不拒单**——定时没人盯，拒了接力就停摆；回收之后仍 ≥ 硬水位（0.85，沿用 task 路径 assertHeapOk 的口径）
+ * 才拒这条新活。定时投递（schedule-service）、用户发送、飞书桥接都经 handleChatReplyInject，所以门放这一处；
+ * 定时触发被 503 拒时调度器按「暂时送不进」重试（classifyInjectResponse：≥500 → retry），不是永久失败。
+ * ⚠️ V8 回收有滞后：回收之后立刻复读的堆值可能还没降，所以硬水位下的拒单偏保守——这是已知局限。
+ */
+const applyChatHeapGate = async (taskId: string): Promise<Response | null> => {
+  const before = heapPressure();
+  if (before.ratio < CHAT_WATERMARK_SOFT_RATIO) return null;
+  let reclaimed = 0;
+  try {
+    reclaimed = await reclaimChatSessionsForWatermark({
+      exceptTaskId: taskId,
+      heapRatio: () => heapPressure().ratio,
+    });
+  } catch (err) {
+    // 回收是尽力而为：它自己出错不能挡住用户消息，照常按「回收后的堆读数」判是否拒
+    console.error(`[chat-reply] 水位回收失败 task=${taskId}:`, err);
+  }
+  const after = heapPressure();
+  console.warn(
+    `[chat-reply] 堆水位 ${Math.round(before.ratio * 100)}% ≥ 软水位，` +
+      `回收空闲热会话 ${reclaimed} 个，回收后 ${Math.round(after.ratio * 100)}% task=${taskId}`,
+  );
+  if (!after.over) return null;
+  maybeGcSdkStore();
+  return errorResponse(
+    new HeapPressureError("本条消息", after.usedMB, after.limitMB).message,
+    503,
+  );
 };
 
 const runChatReplyInject = async (
@@ -273,6 +311,11 @@ const runChatReplyInject = async (
   if (lifecycle === "deleting") {
     return errorResponse("任务正在删除", 409);
   }
+
+  // X3(b)：堆水位门——软水位先回收别的空闲热会话，回收后仍 ≥ 硬水位才拒。
+  // 放在 claim / 落盘 / 起会话之前：拒单不能留下 claim 或半截 user_reply。
+  const heapBlocked = await applyChatHeapGate(id);
+  if (heapBlocked) return heapBlocked;
 
   // 同步原子 claim——必须在 saveImageAttachments / checkpoint / send 之前。
   // 赢家拿唯一 handle；route 外层 try/finally 只认 transfer / settle / release。
@@ -462,6 +505,15 @@ const runChatReplyInject = async (
     }
     if (life === "deleting") {
       return errorResponse("任务正在删除", 409);
+    }
+    // R14 Q20-03：定时触发不占用户的排队名额——会话在跑 / 队列里已有东西时回 409 `task_busy`，交给调度器按
+    // 「忙 → 下个 tick 重试 + 待投递合并 + 10 分钟窗口」处理（与 task 路径同口径）。以前这里照常入队：周期定时能把
+    // 5 格队列占满（用户自己再发得到 409「排队已满」），回合结束后这些同一段内容的消息还逐条各起一轮 agent。
+    // 窗口耗尽仍按「一次性 → 错过 / 周期 → 记一次失败」结算。软拒绝不手动 release——外层 finally 统一释放认领
+    if (options.scheduledTrigger) {
+      return errorResponse("会话正在处理上一条消息、稍后再送", 409, {
+        code: TASK_INJECT_BUSY_CODE,
+      });
     }
     const queued = enqueueChatMessage(task.id, {
       // 优先用客户端预生成 id（兼容无 clientItemId 的旧入口 / task 侧）

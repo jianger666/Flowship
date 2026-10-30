@@ -25,6 +25,7 @@
  */
 import { createPublicKey, verify } from "node:crypto";
 import path from "node:path";
+import { isStageNoSpaceError } from "./disk-space.mjs";
 
 /**
  * 验签「确定不符」：清单 / 安装包与签名对不上，说明包被换 / 被改 / 被重放，或本就不是这次发布的包。
@@ -354,6 +355,9 @@ export const buildVerifyRejectionNotice = (err, opts) => {
  *
  * 原因取法 `err?.message || err` 与 macSelfUpdate 原先写的完全一致（非 Error 值、空 message 退回 String(err)，不会只剩「将打开下载页」）。
  *
+ * 唯一例外（R14 B2-4 / Q15-01）：**磁盘空间不足**（StageNoSpaceError，mac 暂存下载前的预检）——只弹框说明、**不开发布页**：
+ * 手动下载安装同样要这些空间，送过去只会重蹈覆辙（与 Windows buildSpaceBlockedMessage 同口径）。按类型判、不匹配文案。
+ *
  * @param {unknown} err
  * @returns {{
  *   definitive: boolean,
@@ -371,6 +375,19 @@ export const buildGenericUpdateFailureNotice = (err) => {
   const reason = String(
     /** @type {{ message?: unknown } | null | undefined} */ (err)?.message || err,
   );
+  if (isStageNoSpaceError(err)) {
+    return {
+      definitive: false,
+      manifestMissing: false,
+      showDialog: true,
+      openReleasePage: false,
+      markPrompted: false,
+      stateError: reason,
+      reason,
+      title: "磁盘空间不足，暂时无法更新",
+      body: reason,
+    };
+  }
   return {
     definitive: false,
     manifestMissing: false,

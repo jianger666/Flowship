@@ -37,6 +37,7 @@ import {
   readdirSync,
   existsSync,
   readFileSync,
+  statSync,
   statfsSync,
   writeFileSync,
 } from "node:fs";
@@ -91,7 +92,40 @@ import {
 } from "./external-url.mjs";
 // 磁盘剩余空间换算 + 静默更新预检（statfs 注入以便在 Mac 上单测）：纯函数在 ./disk-space.mjs。
 // 预检阈值 MIN_TEMP_FREE_MB 是唯一的 JS 侧来源（弹框文案也读它），与 installer.nsh 的 define 由测试对账。
-import { MIN_TEMP_FREE_MB, checkUpdateTempSpace, formatFreeGB } from "./disk-space.mjs";
+import {
+  MIN_TEMP_FREE_MB,
+  assertMacStageSpace,
+  bytesToMB,
+  checkUpdateTempSpace,
+  formatFreeGB,
+  freeBytes,
+} from "./disk-space.mjs";
+// 数据目录所在盘的低空间监视（< 2GB 系统通知、每 30 分钟一次；R14 B2-4b / Q15-10 壳部分）：判定 / 文案 / 阈值在 ./disk-watch.mjs
+import {
+  DISK_CHECK_INTERVAL_MS,
+  buildLowDiskNotice,
+  classifyDiskLevel,
+  decideDiskNotice,
+  emptyDiskNoticeState,
+} from "./disk-watch.mjs";
+// mac dmg 流式落盘（stream.pipeline：写盘失败 = reject 并销毁整条链，不再挂住 stagingPromise；R14 B2-4 / Q15-01）：./dmg-download.mjs
+import { streamResponseToFile } from "./dmg-download.mjs";
+// 壳日志 main.log 的写入器（写流 error 有监听、失败自愈 / 降级、按大小轮转；R14 B2-4b / Q15-03）：./shell-log.mjs
+import { createShellLogger } from "./shell-log.mjs";
+// 崩溃处置的决策与文案（server 退出：(code, signal)、自动重启一次、弹窗按钮；渲染 / 子进程退出）：纯函数、有单测：./shell-crash.mjs
+import {
+  BUTTON_OPEN_LOGS,
+  BUTTON_OPEN_REPORTS,
+  BUTTON_RELOAD,
+  buildRenderGoneNotice,
+  buildServerCrashNotice,
+  decideRenderGone,
+  decideServerExit,
+  describeChildGone,
+  describeExit,
+  describeRenderGone,
+  pickFreshReports,
+} from "./shell-crash.mjs";
 // 首次启动判定（标记按版本记、更新后的第一次启动同样按「首次」给宽限）：纯函数在 ./first-boot.mjs
 import {
   REGULAR_BOOT_TIMEOUT_MS,
@@ -254,22 +288,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- 落盘日志 ----------
 // 打包后的 app 没有终端、server stdout / 生命周期事件全落 userData/logs/main.log、
-// 出问题（启动失败 / server 崩 / 数据目录异常）有据可查
-let logStream = null;
-const log = (...args) => {
-  const line = `[${new Date().toISOString()}] ${args.join(" ")}`;
-  console.log(line);
-  try {
-    if (!logStream) {
-      const file = path.join(app.getPath("userData"), "logs", "main.log");
-      mkdirSync(path.dirname(file), { recursive: true });
-      logStream = createWriteStream(file, { flags: "a" });
-    }
-    logStream.write(`${line}\n`);
-  } catch {
-    // 日志写不进去不影响主流程
-  }
-};
+// 出问题（启动失败 / server 崩 / 数据目录异常）有据可查。
+// R14 B2-4b / Q15-03：写入器在 shell-log.mjs——写流的 error 有监听（磁盘满 / 权限被收不再变成「A JavaScript error」）、
+// 失败后丢弃坏流并自愈、连续失败降级（暂存内存、到点重试）、按大小轮转（旧版一份文件长了 4.5 个月、84MB）。
+// log(...args) 的签名与行格式与改前一致。
+const shellLogger = createShellLogger({
+  getLogFile: () => path.join(app.getPath("userData"), "logs", "main.log"),
+});
+const log = shellLogger.log;
+// stdout / stderr 的 EPIPE：从终端 / 管道启动、对端关掉后 console.log 会异步 emit 'error'，没有监听就是 uncaughtException。
+// 日志已经落盘，这里吞掉即可；监听里不能再 console.log（会递归）。
+for (const stream of [process.stdout, process.stderr]) stream?.on?.("error", () => {});
+// 主进程未捕获异常：这里只**记录**，不改变默认处置——Electron 仍会弹「A JavaScript error occurred in the main process」，致命错误不被吞。
+// 未处理的 Promise rejection **不在**这条的覆盖范围内：Electron 主进程对它是 warn、不转成 uncaughtException
+// （electron#36829，Electron 22 时代的结论；Electron 42 上没有验证），所以 Monitor 多半看不到、main.log 里也不会有。
+// 也故意没有补一个 'unhandledRejection' 的「只记录」监听：一挂上，默认处置（warn 还是转 uncaught）就被换成静默，
+// 这个行为变化没法在真机上验证，不值得换（B2-4b 终审 P3-2，拍板见 HANDOFF）。
+// 故意用 Monitor、不装 'uncaughtException' / 'unhandledRejection' 处理器：后者一挂上，默认处置就被换掉，得自己决定退不退、弹不弹。
+// 用同步追加（logSync）：进程可能下一刻就没了，异步流写不一定来得及。
+process.on("uncaughtExceptionMonitor", (err, origin) => {
+  shellLogger.logSync(`[fatal] ${origin}: ${err?.stack || err}`);
+});
 
 // execFile 的 promise 包装、出错返空串（探测类调用都 fail-open）
 const execFileP = (cmd, args) =>
@@ -551,12 +590,7 @@ const startServer = () => {
   // 含空格的路径也不用加引号。宿主自己的 NODE_OPTIONS（用户手设）原样透传、不改写。
   // 实现与单测见 ./node-options.mjs 的 buildServerNodeArgs。
   // report 落盘目录指到数据目录 + 只留最近 5 份（best-effort，失败不挡启动）
-  const nodeReportDir = path.join(
-    app.getPath("userData"),
-    "data",
-    "diagnostics",
-    "node-reports",
-  );
+  const nodeReportDir = nodeReportsDir();
   try {
     mkdirSync(nodeReportDir, { recursive: true });
     const keepReports = 5;
@@ -577,6 +611,7 @@ const startServer = () => {
     nodeVersion: process.versions.node,
     reportDir: nodeReportDir,
   });
+  const startedAt = Date.now();
   const proc = spawn(serverNodeBin(), [...serverNodeArgs, serverJs], {
     env: {
       ...process.env,
@@ -614,18 +649,12 @@ const startServer = () => {
   });
   proc.stdout.on("data", (d) => log(`[server] ${d}`.trimEnd()));
   proc.stderr.on("data", (d) => log(`[server:err] ${d}`.trimEnd()));
-  proc.on("exit", (code) => {
-    const stale = serverProc !== proc;
-    if (!stale) serverProc = null;
-    log(`[main] server 退出 code=${code ?? "?"} quitting=${quitting} stale=${stale}`);
-    // 不是用户主动退出、说明 server 崩了——提示后整个 app 退出（窗口留着也没意义）
-    if (!stale && !quitting) {
-      dialog.showErrorBox(
-        "服务异常退出",
-        `内部服务意外退出（code=${code ?? "?"}）、请重新打开应用。`,
-      );
-      app.quit();
-    }
+  // 退出处置在 onServerExit（决策 / 文案在 shell-crash.mjs，弹窗与自动重启在那里编排）。
+  // (code, signal) 都要收：被信号杀掉（OOM killer 的 SIGKILL、V8 堆耗尽的 SIGABRT）时 code 是 null——旧实现只收 code、日志里是常量 `code=?`。
+  proc.on("exit", (code, signal) => {
+    onServerExit({ proc, startedAt, code, signal }).catch((err) => {
+      log(`[main] server 退出处置本身出错：${err?.message || err}`);
+    });
   });
 };
 
@@ -677,6 +706,194 @@ const waitForReady = async (timeoutMs = REGULAR_BOOT_TIMEOUT_MS) => {
     await sleep(400);
   }
   return false;
+};
+
+// ---------- server / 渲染进程异常退出的处置（R14 B2-4b / Q15-04、Q15-03） ----------
+// 决策与文案在 shell-crash.mjs 的纯函数里（有单测）；这里只做 I/O 编排。
+// serverAutoRestarts：整个 App 进程生命周期内自动重启 server 的次数（只一次，见 MAX_AUTO_RESTARTS）；
+// serverCrashPrompted：崩溃弹窗只弹一次——自动重启期间「新 server 又崩」与「第一次重启的 waitForReady 超时」会撞车；
+// renderReloadTimes / renderGiveUpPrompted：渲染进程崩溃后自动刷新的节流记录与「反复崩溃」提示是否正在显示。
+let serverAutoRestarts = 0;
+let serverCrashPrompted = false;
+let renderReloadTimes = [];
+let renderGiveUpPrompted = false;
+
+// server 的崩溃取证报告目录（--report-on-fatalerror 落这里；startServer 也用这一个，别两处各写一遍路径）
+const nodeReportsDir = () => {
+  return path.join(app.getPath("userData"), "data", "diagnostics", "node-reports");
+};
+// 壳日志目录（main.log / installer.log 同目录；与 server 侧 diagnostics.ts 的 shellLogsDir 是同一个位置）
+const shellLogsDir = () => {
+  return path.join(app.getPath("userData"), "logs");
+};
+
+// 本次 server 启动之后才生成的取证报告（旧崩溃留下的不算）；目录不存在 / 读不了 = 没有
+const listFreshNodeReports = (sinceMs) => {
+  try {
+    const dir = nodeReportsDir();
+    const files = [];
+    for (const name of readdirSync(dir)) {
+      try {
+        files.push({ name, mtimeMs: statSync(path.join(dir, name)).mtimeMs });
+      } catch {
+        // 刚被轮转删掉
+      }
+    }
+    return pickFreshReports(files, sinceMs);
+  } catch {
+    return [];
+  }
+};
+
+// 弹一个带按钮的错误框，返回被点中的按钮文案（关掉对话框 = 最后一个按钮「退出」）。
+// 不传父窗：崩溃后主窗没有意义，也避免 macOS 的 sheet 挂在已死的页面上。
+const askCrashChoice = async (notice) => {
+  const last = notice.buttons.length - 1;
+  const { response } = await dialog.showMessageBox({
+    type: "error",
+    title: notice.title,
+    message: notice.title,
+    detail: notice.message,
+    buttons: notice.buttons,
+    defaultId: last,
+    cancelId: last,
+    noLink: true,
+  });
+  return notice.buttons[response] ?? notice.buttons[last];
+};
+
+// 在系统文件管理器里打开目录；失败只记日志（openPath 返回错误文案而不是抛）
+const openDirLogged = async (dir) => {
+  try {
+    const err = await shell.openPath(dir);
+    if (err) log(`[main] 打开目录失败 ${dir}：${err}`);
+  } catch (err) {
+    log(`[main] 打开目录失败 ${dir}：${err?.message || err}`);
+  }
+};
+
+// server 退出后的处置：旧进程迟来的 exit / 用户主动退出 → 忽略；稳定运行 ≥ 60s 后崩溃 → 自动重启一次并刷新页面；
+// 其余（启动就崩 / 已重启过 / 重启没恢复）→ 弹窗（日志目录 / 崩溃报告目录 / 退出）并退出。
+const onServerExit = async ({ proc, startedAt, code, signal }) => {
+  const stale = serverProc !== proc;
+  if (!stale) serverProc = null;
+  const uptimeMs = Date.now() - startedAt;
+  log(`[main] server 退出 ${describeExit(code, signal)} uptime=${Math.round(uptimeMs / 1000)}s quitting=${quitting} stale=${stale}`);
+  const action = decideServerExit({ stale, quitting, uptimeMs, autoRestarts: serverAutoRestarts });
+  if (action === "ignore") return;
+  let restartFailed = false;
+  if (action === "restart") {
+    serverAutoRestarts += 1;
+    log(`[main] server 稳定运行 ${Math.round(uptimeMs / 1000)}s 后意外退出、自动重启一次（本次运行内仅此一次）`);
+    try {
+      startServer();
+      const ready = await waitForReady();
+      if (quitting) return; // 重启期间用户退出了
+      if (ready) {
+        log("[main] server 自动重启成功、刷新页面");
+        try {
+          mainWindow?.webContents.reload();
+        } catch (err) {
+          // 窗口已销毁等：server 已经恢复，页面刷不刷得成不该被算成「重启失败」而弹崩溃窗（B2-4b 终审 P3-7）
+          log(`[main] 自动重启后刷新页面失败（忽略）：${err?.message || err}`);
+        }
+        return;
+      }
+      restartFailed = true;
+      log("[main] server 自动重启后一直没就绪");
+    } catch (err) {
+      restartFailed = true;
+      log(`[main] server 自动重启失败：${err?.message || err}`);
+    }
+  }
+  if (serverCrashPrompted || quitting) return;
+  serverCrashPrompted = true;
+  // 弹窗本身出错（窗口已销毁 / Electron 内部错误 / 文案构造抛错）也照样退出：这里是崩溃处置的末端、没有别人兜底——
+  // 调用方（startServer 的 exit 回调）的 .catch 只记日志；而启动期崩溃时 whenReady 里不再叠一个「启动超时」弹窗（B2-4b 终审 P3-4），
+  // 不退出就会留下一个没窗口、没提示的悬着进程（B2-4b 终审 P3-8）。
+  try {
+    const choice = await askCrashChoice(
+      buildServerCrashNotice({
+        code,
+        signal,
+        uptimeMs,
+        // 自动重启过（这次是重启没起来，或重启成功后又崩）→ 提示里说明「已自动重启过一次、没能恢复」（B2-4b 终审 P3-5）
+        restartFailed: restartFailed || serverAutoRestarts > 0,
+        hasFreshReports: listFreshNodeReports(startedAt).length > 0,
+      }),
+    );
+    if (choice === BUTTON_OPEN_LOGS) await openDirLogged(shellLogsDir());
+    else if (choice === BUTTON_OPEN_REPORTS) await openDirLogged(nodeReportsDir());
+  } catch (err) {
+    log(`[main] server 崩溃提示出错、直接退出：${err?.message || err}`);
+  } finally {
+    app.quit();
+  }
+};
+
+// 渲染进程异常退出（白屏 / 崩溃页）：只处置主窗；崩溃 / 内存不足 / 被结束 → 刷新页面（60s 内最多一次、累计最多 3 次），
+// 刷新救不回来就停止自动刷新、弹一次「页面反复崩溃」（重新加载 / 打开日志目录 / 退出）。clean-exit（正常关窗）等只记日志。
+const onRenderProcessGone = async (webContents, details) => {
+  log(describeRenderGone(details));
+  // 只处置主窗：splash 等小窗崩了不该消耗主窗的刷新配额、也不值得弹窗
+  if (!mainWindow || mainWindow.isDestroyed() || webContents !== mainWindow.webContents) return;
+  const decision = decideRenderGone({ reason: details?.reason, nowMs: Date.now(), reloadTimes: renderReloadTimes });
+  renderReloadTimes = decision.reloadTimes;
+  if (decision.action === "reload") {
+    log("[main] 主窗页面进程异常退出、刷新页面");
+    webContents.reload();
+    return;
+  }
+  if (decision.action !== "give-up" || renderGiveUpPrompted) return;
+  renderGiveUpPrompted = true;
+  try {
+    for (;;) {
+      const choice = await askCrashChoice(buildRenderGoneNotice({ reason: details?.reason }));
+      if (choice === BUTTON_OPEN_LOGS) {
+        await openDirLogged(shellLogsDir());
+        continue; // 看完日志后页面还是白的：再问一次，直到选「重新加载」或「退出」
+      }
+      if (choice === BUTTON_RELOAD) webContents.reload();
+      else app.quit();
+      return;
+    }
+  } finally {
+    renderGiveUpPrompted = false;
+  }
+};
+
+// ---------- 数据目录所在盘的低空间监视（R14 B2-4b / Q15-10 壳部分） ----------
+// 判定 / 文案 / 阈值在 disk-watch.mjs 的纯函数里（有单测）；这里只做量盘 + 发系统通知 + 定时。
+// diskNoticeState：各级别上次通知的时刻。只在内存里记——App 重启后再通知一次可以接受（取舍见 disk-watch.mjs 头注释）。
+let diskNoticeState = emptyDiskNoticeState();
+
+// 量一次、需要就发一条系统通知。任何异常只记日志：它跑在定时器里，抛出去会变成 uncaughtException（Electron 默认弹错误框）。
+const checkDiskOnce = () => {
+  try {
+    const dataDir = path.join(app.getPath("userData"), "data");
+    // 全新安装的首次启动 data 目录可能还没建：回退量 userData（同一个盘）
+    const bytes = freeBytes(dataDir, statfsSync) ?? freeBytes(app.getPath("userData"), statfsSync);
+    const freeMB = bytes === null ? null : bytesToMB(bytes);
+    const level = classifyDiskLevel(freeMB);
+    const decision = decideDiskNotice({ level, nowMs: Date.now(), state: diskNoticeState });
+    diskNoticeState = decision.state;
+    log(`[disk] 数据目录所在盘剩余 ${freeMB === null ? "?" : `${freeMB}MB`} level=${level}${decision.notify ? " → 通知用户" : ""}`);
+    if (!decision.notify) return;
+    if (!Notification.isSupported()) {
+      log("[disk] 系统通知不可用，没发出去");
+      return;
+    }
+    const { title, body } = buildLowDiskNotice({ level, freeMB });
+    new Notification({ title, body }).show();
+  } catch (err) {
+    log(`[disk] 低空间检查出错（忽略）：${err?.message || err}`);
+  }
+};
+
+// 启动时量一次，之后每 30 分钟一次；unref 让这个定时器不拖住进程退出
+const startDiskWatch = () => {
+  checkDiskOnce();
+  setInterval(checkDiskOnce, DISK_CHECK_INTERVAL_MS).unref();
 };
 
 // 首次启动标记：Windows 下冷盘 + Defender 首扫 + 未签名 SmartScreen，server 首次起床
@@ -1898,30 +2115,35 @@ const downloadAndStageMacUpdateInner = async (version) => {
   const stagedAppPath = path.join(updatesDir, `staged-${version}.app`);
   try {
     mkdirSync(updatesDir, { recursive: true });
+    // 磁盘预检（R14 B2-4 / Q15-01）：dmg（~120MB）和展开的 .app（~410MB）会同时在盘上，不够就别开始下——
+    // 否则下到一半 ENOSPC，用户白等一趟还只看到一句 errno。阈值 MIN_MAC_STAGE_FREE_MB 见 disk-space.mjs；量不到放行。
+    // 不够时抛 StageNoSpaceError：点徽标 / 设置页检查更新弹专门文案（不开发布页）、后台触发静默，不计入「会白下 dmg」的闸。
+    const stageSpace = assertMacStageSpace(updatesDir, statfsSync);
+    log(`[updater] 暂存预检 free=${stageSpace.freeMB ?? "?"}MB min=${stageSpace.minMB}MB`);
     log(`[updater] 下载 ${dmgUrl}`);
     setUpdateState({ phase: "downloading", version, percent: 0, error: null });
     const res = await fetch(dmgUrl);
     if (!res.ok || !res.body) throw new Error(`下载失败 HTTP ${res.status}`);
     // 流式落盘 + Dock 图标进度条 + 页面徽标进度（整数百分点变化才推、别刷爆 IPC）
     const total = Number(res.headers.get("content-length")) || 0;
-    const ws = createWriteStream(dmgPath);
-    let got = 0;
     let lastPct = -1;
-    for await (const chunk of res.body) {
-      if (!ws.write(chunk)) await new Promise((r) => ws.once("drain", r));
-      got += chunk.length;
-      if (total) {
-        mainWindow?.setProgressBar(got / total);
-        const pct = Math.floor((got / total) * 100);
+    // R14 B2-4 / Q15-01：落盘走 stream.pipeline（见 dmg-download.mjs）。写盘失败（磁盘满 / 权限 / 目录被删）= reject 并销毁整条链，
+    // 落到下面既有的 finally 清理 + downloadAndStageMacUpdate 的 catch 登记；改前手写 for-await + drain：目的流没有 error 监听、
+    // 流销毁后 drain 永不触发 → 这个函数永不 settle、stagingPromise（单飞锁）永不释放、徽标停在「下载中」直到重启。
+    const got = await streamResponseToFile({
+      body: res.body,
+      dest: dmgPath,
+      createWriteStream,
+      onProgress: (received) => {
+        if (!total) return;
+        mainWindow?.setProgressBar(received / total);
+        const pct = Math.floor((received / total) * 100);
         if (pct > lastPct) {
           lastPct = pct;
           setUpdateState({ percent: pct });
         }
-      }
-    }
-    await new Promise((resolve, reject) =>
-      ws.end((err) => (err ? reject(err) : resolve(undefined))),
-    );
+      },
+    });
     mainWindow?.setProgressBar(-1);
 
     // 完整性校验：下到残缺包就直接中止（v0.8.0 踩过残缺 dmg → ditto 半新半旧）
@@ -2921,6 +3143,8 @@ if (!app.requestSingleInstanceLock()) {
     } catch {
       /* 快照失败不挡启动 */
     }
+    // 数据目录所在盘 < 2GB 发系统通知、之后每 30 分钟再量一次（R14 B2-4b / Q15-10）；同步、不会抛、不挡启动
+    startDiskWatch();
     // 首次启动并行预读：越早越好（后面还有更新清扫 / 端口检查 / 开窗要走），fire-and-forget、
     // 失败只记日志、绝不挡启动。只在 Windows + 首次启动（全新安装 / 刚更新）才跑，见 ./boot-prefetch.mjs。
     // firstBoot 在这里就算好、后面的超时选择复用同一个值（标记要等 server 就绪才写，中途不会变）。
@@ -3154,6 +3378,13 @@ if (!app.requestSingleInstanceLock()) {
             : `exited code=${serverProc.exitCode}`;
       log(`[main] server 未就绪、放弃启动（累计等待 ${bootElapsedS()}s, server=${serverState})`);
       closeSplashWindow();
+      if (serverCrashPrompted) {
+        // server 在启动期间就崩了：崩溃弹窗（onServerExit）已经弹出、在等用户选（选完它自己 app.quit）。
+        // 这里不再叠一个「启动超时」——旧的 showErrorBox 同步阻塞、不会有这个交错，新的 showMessageBox 不阻塞才出现；
+        // 也不抢先 app.quit()：用户还没来得及点「打开日志目录」应用就没了（B2-4b 终审 P3-4）。
+        log("[main] server 启动期间已崩溃并弹出崩溃提示、不再弹「启动超时」");
+        return;
+      }
       dialog.showErrorBox(
         "启动超时",
         process.platform === "win32"
@@ -3173,6 +3404,17 @@ if (!app.requestSingleInstanceLock()) {
       return;
     }
     // 极端：主窗已销毁但仍在跑——不应发生（关窗只 hide）；防守不重建，等用户从 Tray 退
+  });
+
+  // 渲染进程 / 子进程异常退出：以前只留在 Chromium 自己的 stderr 里、main.log 一无所获；渲染进程崩溃后窗口是一片空白、用户只能杀 App。
+  // GPU / Utility 子进程 Electron 会自己重拉，这里只留痕。
+  app.on("render-process-gone", (_event, webContents, details) => {
+    onRenderProcessGone(webContents, details).catch((err) => {
+      log(`[main] render-process-gone 处置本身出错：${err?.message || err}`);
+    });
+  });
+  app.on("child-process-gone", (_event, details) => {
+    log(describeChildGone(details));
   });
 
   // 真退出时所有窗口销毁才走到这（关窗 hide 不会触发）。

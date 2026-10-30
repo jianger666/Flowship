@@ -116,8 +116,12 @@ describe("事件流内联搜索 UI", () => {
     expect(searchBar).toContain("Shift+Enter");
   });
 
-  it("搜索时暂停自动跟随", () => {
-    expect(eventStream).toContain("follow.setFollowing(false)");
+  it("搜索只在命中把视口带走时暂停自动跟随（不再 query 非空就停）；关闭搜索时按需恢复", () => {
+    // 旧断言只查字面量 follow.setFollowing(false)：jumpToItem 里也有，删掉旧 effect 后它照样绿、没有判别力。
+    // R14 B6-3 / Q2-02 收紧成精确断言（行为见 tests/stream-search-follow.test.ts）
+    expect(eventStream).not.toMatch(/if \(isSearchFiltering\) follow\.setFollowing\(false\)/);
+    expect(eventStream).toContain("searchFollowGate.pauseForHit()");
+    expect(eventStream).toContain("searchFollowGate.resumeOnClose()");
   });
 });
 

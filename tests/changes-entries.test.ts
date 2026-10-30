@@ -12,7 +12,7 @@ import {
   viewedSignature,
 } from "@/lib/changes/entries";
 import { parseFileQuery } from "@/lib/changes/file-filter";
-import { markViewed, type ViewedMap } from "@/lib/changes/viewed-store";
+import { isViewed, markViewed, type ViewedMap } from "@/lib/changes/viewed-store";
 import type { TaskChangeFile, TaskRepoChanges } from "@/lib/types";
 
 const file = (path: string, over: Partial<TaskChangeFile> = {}): TaskChangeFile => ({
@@ -51,14 +51,41 @@ describe("entryKey / signature", () => {
     expect(entryKey("/a", "x.ts")).toBe(entryKey("/a", "x.ts"));
   });
 
-  it("viewedSignature：状态 / 统计 / 未跟踪 / 空白-only 任一变化都换签名", () => {
+  it("viewedSignature：状态 / 统计 / 空白-only 任一变化都换签名", () => {
     const base = viewedSignature(file("a.ts"));
     expect(viewedSignature(file("a.ts"))).toBe(base);
     expect(viewedSignature(file("a.ts", { status: "added" }))).not.toBe(base);
     expect(viewedSignature(file("a.ts", { added: 2 }))).not.toBe(base);
     expect(viewedSignature(file("a.ts", { removed: 1 }))).not.toBe(base);
-    expect(viewedSignature(file("a.ts", { untracked: true }))).not.toBe(base);
     expect(viewedSignature(file("a.ts", { whitespaceOnly: true }))).not.toBe(base);
+  });
+
+  it("未跟踪 → 已跟踪（agent 对它 git add 了一下）：签名不变——内容没动，「已查看」就不该变黄（R14 Q4-02）", () => {
+    const base = viewedSignature(file("a.ts"));
+    expect(viewedSignature(file("a.ts", { untracked: true }))).toBe(base);
+    // 带指纹时同理
+    const fp = "-..aaaaaaaaaaaa";
+    expect(viewedSignature(file("a.ts", { untracked: true, fingerprint: fp }))).toBe(
+      viewedSignature(file("a.ts", { fingerprint: fp })),
+    );
+    // diff 缓存键（带路径）也不因此变：add 之后不会重拉 diff、展开状态保留
+    expect(fileSignature("/r", file("a.ts", { untracked: true }))).toBe(fileSignature("/r", file("a.ts")));
+  });
+
+  it("签名格式固定为 6 段、第 4 段恒为 0：用户 localStorage 里已存的「已查看」靠它沿用（R14 Q4-02）", () => {
+    expect(viewedSignature(file("a.ts", { fingerprint: "x..y" }))).toBe("modified:1:0:0:0:x..y");
+    expect(viewedSignature(file("a.ts", { fingerprint: "x..y", whitespaceOnly: true }))).toBe(
+      "modified:1:0:0:1:x..y",
+    );
+    expect(
+      viewedSignature(file("n.ts", { status: "added", added: 3, untracked: true, fingerprint: "-..zzz" })),
+    ).toBe("added:3:0:0:0:-..zzz");
+    // 没有指纹也保持 6 段（末段为空）
+    expect(viewedSignature(file("a.ts"))).toBe("modified:1:0:0:0:");
+    // 存量标记（按这个 6 段格式存下的）与新签名逐字相同 → 升级后仍判「已查看」
+    const key = entryKey("/r", "a.ts");
+    const stored: ViewedMap = markViewed({}, key, "modified:1:0:0:0:x..y");
+    expect(isViewed(stored, key, viewedSignature(file("a.ts", { fingerprint: "x..y" })))).toBe(true);
   });
 
   it("文件级指纹变了就换签名——哪怕状态和行数一模一样（切分支 / 等量替换）", () => {

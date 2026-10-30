@@ -1,5 +1,5 @@
 /**
- * 提测完成后需求群 @ 测试：名单换 open_id / 跳过分支 / bot 不在群静默
+ * 提测完成后需求群 @ 测试：名单换 open_id / 跳过分支 / bot 不在群给属主留 info（B4-4 / Q12b-04 起不再静默）
  *
  * 全部 mock 外部调用——禁止真调飞书。
  */
@@ -23,6 +23,7 @@ const {
   buildTesterNotifyContent,
   notifyShipTestersInGroup,
   pickTesterAtTargets,
+  testerNotifyIssueText,
 } = await import("@/lib/server/feishu-bridge/group-tester-notify");
 
 const { parseUserSearchEmailMap } = await import("@/lib/server/meegle-cli");
@@ -395,7 +396,7 @@ describe("notifyShipTestersInGroup", () => {
     expect(emitInfo).toHaveBeenCalledWith(expect.stringContaining("卡片"));
   });
 
-  it("无邮箱只有 union → 不发（post 降级已删，只认邮箱）", async () => {
+  it("无邮箱只有 union → 不发（post 降级已删，只认邮箱），但给属主留一条 info 点名（B4-4 / Q12b-04：原来 app 内零痕迹）", async () => {
     const shareToGroup = vi.fn(async () => ({ messageId: "om_n" }));
     const emitInfo = vi.fn();
     __setGroupTesterNotifyDepsForTest(
@@ -413,7 +414,10 @@ describe("notifyShipTestersInGroup", () => {
       notifyShipTestersInGroup(taskOf(action), action, { emitInfo }),
     ).resolves.toBe("skipped_no_open_ids");
     expect(shareToGroup).not.toHaveBeenCalled();
-    expect(emitInfo).not.toHaveBeenCalled();
+    expect(emitInfo).toHaveBeenCalledTimes(1);
+    expect(emitInfo).toHaveBeenCalledWith(
+      testerNotifyIssueText({ kind: "no_identity", names: ["张三"] }),
+    );
   });
 
   it("12 条 MR：按钮封顶 10，正文 12 条全列（超的溢到正文）", async () => {
@@ -467,7 +471,7 @@ describe("notifyShipTestersInGroup", () => {
     expect(emitInfo).toHaveBeenCalledWith(expect.stringContaining("B"));
   });
 
-  it("bot 不在群 → skipped_bot_not_in_group，不抛、不 emitInfo", async () => {
+  it("bot 不在群 → skipped_bot_not_in_group，不抛；给属主留一条带 bot 名的 info（B4-4 / Q12b-04：原来静默）", async () => {
     const emitInfo = vi.fn();
     __setGroupTesterNotifyDepsForTest(
       baseDeps({
@@ -484,7 +488,10 @@ describe("notifyShipTestersInGroup", () => {
     await expect(
       notifyShipTestersInGroup(taskOf(action), action, { emitInfo }),
     ).resolves.toBe("skipped_bot_not_in_group");
-    expect(emitInfo).not.toHaveBeenCalled();
+    expect(emitInfo).toHaveBeenCalledTimes(1);
+    expect(emitInfo).toHaveBeenCalledWith(
+      testerNotifyIssueText({ kind: "bot_not_in_group", botLabel: "Flowship·甲" }),
+    );
   });
 
   it("同一 action 只发一次", async () => {

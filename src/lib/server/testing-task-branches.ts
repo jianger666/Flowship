@@ -4,7 +4,7 @@ import path from "node:path";
 
 import type { GitBranchInfo, Task } from "@/lib/types";
 import { testingTaskConfiguredBranchRepoPaths } from "@/lib/testing-task";
-import { stripHostInjectedEnv } from "./host-env";
+import { gitEnv } from "./git-exec";
 import {
   beginResourceJob,
   endResourceJob,
@@ -165,8 +165,9 @@ const execGit = (
         signal,
         encoding: "utf8",
         // checkout 会触发用户仓的 post-checkout 钩子（husky 里常有 `pnpm build` / node 脚本）：
-        // 钩子不该拿到宿主注入变量（R10b-05，见 host-env.ts）
-        env: { ...stripHostInjectedEnv(), GIT_TERMINAL_PROMPT: "0" },
+        // 钩子不该拿到宿主注入变量（R10b-05，见 host-env.ts），也不该拿到 GitLab PAT（Q10-04，见 git-exec.ts）；
+        // 没凭据时直接失败（GIT_TERMINAL_PROMPT=0 / GCM_INTERACTIVE=never 由 gitEnv 统一设）
+        env: gitEnv(),
       },
       (error, stdout, stderr) => {
         if (error) {

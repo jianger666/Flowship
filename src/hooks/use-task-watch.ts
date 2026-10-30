@@ -44,6 +44,10 @@
  * - **重试预算耗尽不再静默停更**：连续 6 次建连失败（约 22s 退避）后进入「休眠待重连」——
  *   提示一次（带 resume 句柄供「重连」按钮）、之后靠 online / 页面回可见 / 60s 兜底（仅可见且在线）
  *   自动重连，唤醒后预算清零；页面隐藏时不重试。
+ * - **预算只在「稳定连接」后清零（Q16-01）**：建连（首个合法 bootstrap 帧）只记时刻，连接结束时撑过 2s
+ *   （WATCH_STABLE_CONNECTION_MS）才清零；建连后立刻被掐断 / 回调立刻抛错的连接按失败累计，
+ *   不会因为「每轮都先建连、先清零」而永远攒不到上限（永不休眠、不提示、静默无限重连）。
+ *   终态（merged/abandoned 的 done、task_deleted）后关流不看稳定性、直接停止订阅。
  */
 
 import { useEffect, useRef } from "react";
@@ -65,12 +69,14 @@ import {
   applyReconnectDecision,
   createDormantWaiter,
   freshWatchBudget,
+  settleWatchBudget,
   stepDormantNotice,
   withBootstrapNotice,
 } from "@/lib/watch-reconnect";
 import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import type { AssistantSnapshot } from "@/lib/assistant-live";
 import type { ThinkingSnapshot } from "@/lib/thinking-live";
+import type { StorageDegradedState } from "@/lib/storage-degraded";
 import type { TalkQueueItem } from "@/lib/talk-queue";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
 
@@ -163,6 +169,11 @@ export interface UseTaskWatchCallbacks {
    */
   onBackgroundSubagents?: (jobs: BackgroundSubagentJobView[]) => void;
   /**
+   * 存储降级状态（事件写盘失败：磁盘满 / 只读 / IO 错误…）——`{ code }` = 降级中，`null` = 没降级 / 已恢复。
+   * 调用方据此在事件流顶部画红条。每次连接的 bootstrap 会补发当前值，断线重连后不会停在旧状态。
+   */
+  onStorageDegraded?: (state: StorageDegradedState | null) => void;
+  /**
    * task_deleted / watch 410 / 已 hydrate 的 404 → 停重连。
    * 调用方接到后 `commitTaskDeleted`；503 unavailable 不可走此 sink。
    */
@@ -240,6 +251,9 @@ export const useTaskWatch = (
         let gotTerminalDone = false;
         // 收到 task_deleted / 410 / hydrated-404 后不再重连
         let gotTaskDeleted = false;
+        // 本次连接建连（首个合法 bootstrap 帧）的时刻；null = 还没建连。连接结束时据此判断撑没撑过稳定窗口
+        // （`as` 写法：让 TS 不把它窄化成 null——赋值发生在下面的回调闭包里）
+        let establishedAt = null as number | null;
         const forwardTaskUpdate = (t: Task) => {
           callbacksRef.current.onTaskUpdate?.(t);
         };
@@ -318,6 +332,10 @@ export const useTaskWatch = (
             if (cancelled) return;
             callbacksRef.current.onBackgroundSubagents?.(jobs);
           },
+          onStorageDegraded: (state) => {
+            if (cancelled) return;
+            callbacksRef.current.onStorageDegraded?.(state);
+          },
           onTaskDeleted: (deletedId) => {
             if (cancelled) return;
             gotTaskDeleted = true;
@@ -326,24 +344,24 @@ export const useTaskWatch = (
               callbacksRef.current.onTaskDeleted?.(deletedId);
             }
           },
-          // 首个合法 bootstrap task 帧即清零——不等流 EOF；
-          // 否则「成功建连后 reader 抛错」会把上轮 transient 累加到本轮
+          // 首个合法 bootstrap task 帧只记建连时刻；预算等连接结束时、看撑没撑过稳定窗口再清零（Q16-01）——
+          // 建连即清零会让「建连后立刻断」的连接每轮都先清零再记成第 1 次失败，永远攒不到上限
           onConnectionEstablished: () => {
-            Object.assign(budget, freshWatchBudget());
+            establishedAt = Date.now();
             // 休眠后重连成功：撤掉常驻的「重连」提示
             endDormantNotice("connected");
           },
         };
 
         try {
-          const { established } = await watchTaskStream(
-            taskId,
-            sseCallbacks,
-            ctrl.signal,
-          );
-          // 只有 established 后 clean EOF 才清 epoch；
-          // bootstrap 前空流走 retryable 预算（与 fetch reject 同账）
-          const eof = resolveWatchCleanEof({ established, ...budget });
+          await watchTaskStream(taskId, sseCallbacks, ctrl.signal);
+          // 终态 done / task_deleted 后服务端关流是「正常结束」：必须先于稳定性判定返回——
+          // merged 任务 bootstrap + done 后毫秒级关流，不能被当成「建连后立刻断开」而重连
+          if (cancelled || gotTerminalDone || gotTaskDeleted) return;
+          // 撑过稳定窗口才清预算（settleWatchBudget 内清零）；
+          // 没撑过 / 建连前就空流的 clean EOF 走 retryable 预算（与 fetch reject 同账）
+          const stable = settleWatchBudget(budget, establishedAt, Date.now());
+          const eof = resolveWatchCleanEof({ established: stable, ...budget });
           if (eof.kind === "epoch_reset") {
             budget.unavailableAttempts = eof.nextUnavailableAttempts;
             budget.transientFailures = eof.nextTransientFailures;
@@ -351,7 +369,11 @@ export const useTaskWatch = (
           } else if (eof.decision.action !== "terminate_deleted") {
             const outcome = await applyReconnectDecision(eof.decision, {
               budget,
-              error: new Error("SSE 流在建立前关闭"),
+              error: new Error(
+                establishedAt === null
+                  ? "SSE 流在建立前关闭"
+                  : "SSE 连接建立后立即断开",
+              ),
               ...decisionCtx,
             });
             if (outcome === "stop") return;
@@ -364,6 +386,9 @@ export const useTaskWatch = (
           ) {
             return;
           }
+          // 建连后撑过稳定窗口再断 / 抛错：先清零，再把这次记成新一轮的第 1 次失败（不把上轮累计带进来）；
+          // 没撑过（建连后立刻断、回调立刻抛错）、从未建连：预算原样，失败照常累计
+          settleWatchBudget(budget, establishedAt, Date.now());
           // 本 hook 仅在 enabled（已 hydrate）时运行 → 404 可 commit deleted
           const status =
             err instanceof ApiRequestError

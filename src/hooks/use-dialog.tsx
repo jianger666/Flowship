@@ -238,7 +238,10 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
             <AlertDialogHeader>
               <AlertDialogTitle>{state.opts.title}</AlertDialogTitle>
               {state.opts.description && (
-                <AlertDialogDescription>
+                // whitespace-pre-line：描述里的 \n 要真换行（批量删除的清单、强删的目录列表都是多行文本），
+                // 不加的话换行会被折成空格、清单挤成一行
+                // max-h + overflow-y-auto（X5-b）：描述长度由调用方决定，清单很长时描述自己滚、按钮始终在视口里
+                <AlertDialogDescription className="max-h-[min(50vh,20rem)] overflow-y-auto whitespace-pre-line">
                   {state.opts.description}
                 </AlertDialogDescription>
               )}

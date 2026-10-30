@@ -32,9 +32,19 @@ export const MR_INBOX_CACHE_TTL_MS = MR_INBOX_POLL_INTERVAL_MS - 60 * 1000;
 
 /**
  * 服务端单轮扫描总时限（N1-15）：超时返回已扫到的部分 + partial，不缓存。
- * 时限只在两步之间检查，最坏还会多等一次 meegle CLI（30s 超时）——50 + 30 < 客户端 90s。
+ * 前半段（排期 / 节点 / 评论的顺序循环）只在两步之间检查，最坏还会多等一次 meegle CLI（30s 超时）——50 + 30 < 客户端 90s；
+ * 后半段（并发池，见 {@link MR_INBOX_FETCH_CONCURRENCY}）到点直接放手返回、不再等在途请求（Q10-03）。
  */
 export const MR_INBOX_SCAN_DEADLINE_MS = 50 * 1000;
+
+/**
+ * 扫描后半段（逐 MR 拉详情 / 逐 bug 拉评论）的并发上限（Q10-03）。
+ * 以前是对全部候选 `Promise.all`：一次发出 N 个 GitLab 请求；逐 bug 拉评论还会一口气塞满 meegle 的进程级串行队列
+ *（排队时间不计超时，别的 meegle 操作——bug 流转、授权探测——全被堵在后面），而且这一段完全不看总时限。
+ * 4：GitLab 单次 GET 是百毫秒级、4 路并行已够快；meegle 队列里同时最多压 4 个。
+ * 到总时限放手返回时，最多还有这么多个在途请求自行跑完（结果丢弃）。
+ */
+export const MR_INBOX_FETCH_CONCURRENCY = 4;
 
 /** 客户端扫描 fetch 超时（N1-15）：必须大于服务端总时限，给服务端先返回 partial 的机会 */
 export const MR_INBOX_SCAN_CLIENT_TIMEOUT_MS = 90 * 1000;

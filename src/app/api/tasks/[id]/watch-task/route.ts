@@ -71,6 +71,7 @@ import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import { buildTalkQueueSnapshot } from "@/lib/server/task-talk-queue";
 import { isTailAnchorEvent } from "@/lib/tail-anchor";
 import {
+  getStorageDegraded,
   hasRestrictedQuestionInFlight,
   type TaskStreamEvent,
   subscribeTaskStream,
@@ -308,6 +309,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
           case "background_subagents":
             send({ type: "background_subagents", jobs: ev.jobs });
             break;
+          // 存储降级状态（事件写盘失败 / 恢复；纯内存）：界面据此显示 / 收起顶部红条
+          case "storage_degraded":
+            send({
+              type: "storage_degraded",
+              degraded: ev.degraded,
+              ...(ev.code ? { code: ev.code } : {}),
+            });
+            break;
           // DELETE 逻辑删除提交 → 通知客户端并关流
           case "task_deleted":
             send({ type: "task_deleted", taskId: ev.taskId });
@@ -354,6 +363,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
         send({
           type: "background_subagents",
           jobs: getBackgroundSubagentSnapshot(id),
+        });
+        // 存储降级的补位：中途打开页面 / 断线重连都收不到「降级 / 恢复」那几帧——降级中不补 → 用户看不到红条；
+        // 已恢复不补 → 断线前的红条会一直挂着。所以**无条件**发一帧当前值、让客户端对齐
+        const storageDegraded = getStorageDegraded(id);
+        send({
+          type: "storage_degraded",
+          degraded: storageDegraded !== null,
+          ...(storageDegraded ? { code: storageDegraded.code } : {}),
         });
         // 进行中正文的快照：无条件发一帧（对象 = 整段铺上再接着长；null = 没在吐字、前端清残留）。
         // 这段正文的落盘事件已经在 tail 里 = 其实已经结束（flush 与本次读 tail 交错），发 null 防幽灵。

@@ -15,7 +15,7 @@
 
 import type { AnchorHTMLAttributes } from "react";
 
-import { useImagePreview } from "@/components/ui/image-preview";
+import { InsideInteractive, useImagePreview } from "@/components/ui/image-preview";
 import { Tooltip } from "@/components/ui/tooltip";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
 import { isUncLikePath } from "@/lib/unc-path";
@@ -44,7 +44,7 @@ export const MarkdownLink = ({
           onClick={() => open([{ src, alt: href }])}
           className="cursor-zoom-in font-mono text-[0.9em] text-primary underline-offset-2 hover:underline"
         >
-          {children}
+          <InsideInteractive>{children}</InsideInteractive>
         </button>
       </Tooltip>
     );
@@ -60,7 +60,7 @@ export const MarkdownLink = ({
   }
   return (
     <a href={href} target="_blank" rel="noopener noreferrer" {...domProps}>
-      {children}
+      <InsideInteractive>{children}</InsideInteractive>
     </a>
   );
 };

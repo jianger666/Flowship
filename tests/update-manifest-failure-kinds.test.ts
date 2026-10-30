@@ -35,8 +35,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { assertMacStageSpace } from "../electron-app/disk-space.mjs";
+import { streamResponseToFile } from "../electron-app/dmg-download.mjs";
 import {
   UpdateVerifyManifestMissingError,
   UpdateVerifyMismatchError,
@@ -2927,11 +2930,19 @@ describe("③f F1-01：mac 暂存「先取清单、再下 dmg」（真实执行 
       setUpdateState: vi.fn(),
       fetch: dmgFetch,
       mainWindow: { setProgressBar: vi.fn() },
-      createWriteStream: vi.fn(() => ({
-        write: () => true,
-        once: () => undefined,
-        end: (cb: (e?: Error) => void) => cb(),
-      })),
+      // B2-4 / Q15-01：落盘改走 stream.pipeline（目的流必须是真实 Stream）→ 这里换成吞掉所有写入的真实 Writable；
+      // 并注入两个真实实现（磁盘预检 + 流式落盘）与一个空间充足的假 statfs。本组其余断言一字未改。
+      createWriteStream: vi.fn(
+        () =>
+          new Writable({
+            write(_chunk, _enc, cb) {
+              cb();
+            },
+          }),
+      ),
+      assertMacStageSpace,
+      streamResponseToFile,
+      statfsSync: vi.fn(() => ({ bavail: 100 * 1024 ** 3, bsize: 1 })),
       fs: {
         rm: vi.fn(async () => undefined),
         stat: vi.fn(async () => ({ size: Buffer.byteLength(DMG_BYTES) })),

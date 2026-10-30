@@ -125,6 +125,33 @@ export const formatShellFailureText = (opts: {
   return out || opts.message || "命令执行失败";
 };
 
+/**
+ * shell 回包的「状态行」（R14 Q11-04）：写在**回包开头**，不是末尾。
+ * 超预算时 `withModelBudget` 对 shell 保留「开头 + 结尾」，但改前这行挂在末尾、长输出又只留头部，
+ * 于是「失败 + 退出码」一起被砍，模型把失败当成功；被信号杀死（exitCode 为 null）更是连这行都没有。
+ *  - 退出码非 0 → `exit code N`；
+ *  - `null`（被信号终止，如 OOM 的 SIGKILL）→ `进程被信号终止，未取得退出码`；
+ *  - 输出超过收集上限被丢弃 → 说清楚「结尾不是真结尾」（否则「保留结尾」会给模型一个假的尾巴）。
+ * 成功且没丢输出 → 空串（不给成功的命令加噪声）。
+ */
+export const formatShellStatusNote = (opts: {
+  exitCode: number | null | undefined;
+  collectDropped?: boolean;
+}): string => {
+  const parts: string[] = [];
+  if (opts.exitCode === null) {
+    parts.push("进程被信号终止，未取得退出码");
+  } else if (opts.exitCode) {
+    parts.push(`exit code ${opts.exitCode}`);
+  }
+  if (opts.collectDropped) {
+    parts.push(
+      `输出超过 ${MAX_SHELL_OUTPUT_BYTES / 1024 / 1024}MB 收集上限，其后的内容没有收集`,
+    );
+  }
+  return parts.length ? `（${parts.join("；")}）` : "";
+};
+
 // ----------------- Cursor 参数别名 → pi 规范字段 -----------------
 // prompt 教 fileText / globPattern；pi schema 要 content / pattern。校验在 execute 前，
 // 别名必须先收成规范名、再删掉多余键，否则 TypeBox additionalProperties 会拒。
@@ -286,6 +313,8 @@ const shellTool = (
       // 声明在 try 外：超时/abort 抛错后 catch 仍能把已产生的部分输出带回给模型排障
       const chunks: Buffer[] = [];
       let total = 0;
+      // 收集上限命中后丢弃的输出（R14 Q11-04）：回包里要说清楚，免得模型把「前 10MB 的结尾」当成真结尾
+      let collectDropped = false;
       // 宿主注入变量剔除后的 env。GitLab token 变量（FLOWSHIP_GITLAB_TOKEN）不在黑名单里、默认继承——
       // 属主的会话（task / chat / 属主 one-shot）靠它调 GitLab API（见 git-token-env.ts）。
       // 谁会摘掉（omitGitToken）——真实接线情况（N3-01）：
@@ -302,7 +331,10 @@ const shellTool = (
       try {
         const { exitCode } = await (await resolveLocalBash()).exec(command, workCwd, {
           onData: (data) => {
-            if (total >= MAX_SHELL_OUTPUT_BYTES) return;
+            if (total >= MAX_SHELL_OUTPUT_BYTES) {
+              collectDropped = true;
+              return;
+            }
             chunks.push(data);
             total += data.length;
           },
@@ -315,10 +347,13 @@ const shellTool = (
           signal: signal ?? undefined,
         });
         const out = Buffer.concat(chunks).toString().trim();
-        // 失败时把退出码显式写进文本：details 字段只有宿主能看，模型只看 content
-        const exitNote = exitCode ? `\n（exit code ${exitCode}）` : "";
+        // 失败时把退出码显式写进文本：details 字段只有宿主能看，模型只看 content。
+        // 写在开头（见 formatShellStatusNote）：超预算保留头尾时，开头是唯一一定在的位置
+        const note = formatShellStatusNote({ exitCode, collectDropped });
         return {
-          content: [{ type: "text", text: (out || "(无输出)") + exitNote }],
+          content: [
+            { type: "text", text: (note ? `${note}\n` : "") + (out || "(无输出)") },
+          ],
           details: { exitCode: exitCode ?? -1 },
         };
       } catch (err) {
@@ -534,18 +569,44 @@ const withBypassGuard = (
 
 // ----------------- glob（= pi 的 find） -----------------
 
+/** glob 一次最多列出的条数（超出时回包里写明总数，R14 Q11-08） */
+export const GLOB_MAX_RESULTS = 500;
+
+/**
+ * glob 回包文本：排序后取前 {@link GLOB_MAX_RESULTS} 条，超出时追加「共 N 条」提示。
+ * 改前直接 `files.slice(0, 500)`：遍历序不稳定、被截的部分每次不一样，又没有任何提示，
+ * 模型很容易据此误判「没有某个文件」（R14 Q11-08）。排序用默认的 UTF-16 码元序——与区域设置无关、结果可复现。
+ */
+export const formatGlobResult = (
+  files: readonly string[],
+): { text: string; total: number; listed: number } => {
+  const sorted = [...files].sort();
+  const list = sorted.slice(0, GLOB_MAX_RESULTS);
+  if (list.length === 0) return { text: "(无匹配文件)", total: 0, listed: 0 };
+  const more = sorted.length - list.length;
+  const text =
+    more > 0
+      ? `${list.join("\n")}\n…（共 ${sorted.length} 条，仅列前 ${GLOB_MAX_RESULTS} 条；缩小 pattern 或指定 path）`
+      : list.join("\n");
+  return { text, total: sorted.length, listed: list.length };
+};
+
 const globTool = (cwd: string): ToolDefinition =>
   asTool({
     name: "glob",
     label: "找文件名",
     description:
-      "按 glob 模式（支持 ** 与 *）在任务工作目录下找匹配的文件路径、返回相对路径列表（最多 500 条）。",
+      "按 glob 模式（支持 ** 与 *）在任务工作目录下找匹配的文件路径、返回相对路径列表（按字典序，最多 500 条；超出时末尾注明总数）。",
     parameters: TBObject({
       pattern: TBString(),
       path: TBOptional(TBString()),
     }),
     prepareArguments: prepareGlobArgs,
-    execute: async (_toolCallId: string, params: unknown) => {
+    execute: async (
+      _toolCallId: string,
+      params: unknown,
+      signal?: AbortSignal,
+    ) => {
       const p = params as { pattern?: unknown; path?: unknown };
       const pattern = typeof p.pattern === "string" ? p.pattern.trim() : "";
       if (!pattern) {
@@ -559,16 +620,18 @@ const globTool = (cwd: string): ToolDefinition =>
           ? path.resolve(cwd, p.path.trim())
           : cwd;
       try {
-        const files = await glob(pattern, { cwd: base, absolute: false, nodir: true });
-        const list = files.slice(0, 500);
+        // signal：用户点停止 / 任务被停时别让一个 `**/*` 在大仓里白扫到底
+        const files = await glob(pattern, {
+          cwd: base,
+          absolute: false,
+          nodir: true,
+          ...(signal ? { signal } : {}),
+        });
+        const r = formatGlobResult(files);
         return {
-          content: [
-            {
-              type: "text",
-              text: list.length ? list.join("\n") : "(无匹配文件)",
-            },
-          ],
-          details: { count: list.length },
+          content: [{ type: "text", text: r.text }],
+          // count = 总匹配数（改前是被截断后的条数）；listed = 回包里实际列出的条数
+          details: { count: r.total, listed: r.listed },
         };
       } catch (err) {
         return {

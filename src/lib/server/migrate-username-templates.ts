@@ -15,7 +15,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { dataRoot, writePrivateFileAtomic } from "./data-root";
+import { dataRoot, stripBom, writePrivateFileAtomic } from "./data-root";
 import {
   isValidMetaShape,
   META_FILE,
@@ -86,7 +86,7 @@ export const migrateUsernameBranchTemplates = async (): Promise<number> => {
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(rawText);
+      parsed = JSON.parse(stripBom(rawText));
     } catch {
       console.warn(`[migrate-username] meta JSON 损坏、跳过 taskId=${id}`);
       continue;

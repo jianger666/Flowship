@@ -93,10 +93,20 @@ export const writeCompanyEnvFile = async (env: CompanyEnv): Promise<void> => {
 export const syncCompanyEnvFileFromSettings = async (): Promise<void> => {
   try {
     const result = await readSettingsFile();
-    let env: CompanyEnv = emptyCompanyEnv();
-    if (result.status === "ok") {
-      env = normalizeCompanyEnv(result.settings.companyEnv);
+    if (result.status === "error") {
+      // settings 读不出来（Windows 杀毒占用 / 半写 / JSON 坏了）≠ 没配公司环境：
+      // 不能拿空配置覆盖 company-env.json，否则这一轮 pg-exec / ssh-exec 全报「配置不存在」，
+      // 而设置页里的配置明明还在。保留上一次同步的内容；reason 含系统错误码和路径（读文件失败）或 JSON 出错位置，不含文件内容。
+      console.warn(
+        `[company-env-fs] settings 读取失败（${result.reason}），保留现有 company-env.json、本次不同步`,
+      );
+      return;
     }
+    // missing = 首次运行、还没有设置文件：照旧写空配置
+    const env: CompanyEnv =
+      result.status === "ok"
+        ? normalizeCompanyEnv(result.settings.companyEnv)
+        : emptyCompanyEnv();
     await writeCompanyEnvFile(env);
   } catch (err) {
     console.warn(

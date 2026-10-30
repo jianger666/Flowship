@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { getGlobalCursorDirs } from "./cursor-config";
+import { writeFileFsynced } from "./data-root";
 import { getToolsSkillsDir } from "./feishu-cli";
 import {
   getAppSkillsDir,
@@ -256,8 +257,9 @@ export const writeAppSkill = async (
   const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}`;
   try {
     await fs.mkdir(dir, { recursive: true });
-    // 先写临时文件再 rename 覆盖：写到一半失败（磁盘满 / 被打断）时旧 SKILL.md 不会被截成半截
-    await fs.writeFile(tmp, content, "utf-8");
+    // 先写临时文件再 rename 覆盖：写到一半失败（磁盘满 / 被打断）时旧 SKILL.md 不会被截成半截；
+    // rename 之前 fsync(tmp)（Q9-04）：断电后不会得到 0 字节的 SKILL.md——这是用户自己写的内容，丢了没处找
+    await writeFileFsynced(tmp, content);
     await fs.rename(tmp, file);
     return null;
   } catch (err) {

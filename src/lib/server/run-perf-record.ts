@@ -55,7 +55,116 @@ export interface ProcSnapshot {
   slowSeconds?: number;
   gcMax?: number;
   gcCount?: number;
+  /**
+   * X3（server 堆增长观测）：热 chat 会话总数（含 run 在跑的）。chat-runner 还没加载（探针没登记）则省略；
+   * 0 是有效值（会话都已回收——回收生效的直接证据），不能被当缺省丢掉。
+   */
+  chatHot?: number;
+  /**
+   * X3：热会话明细（最多 CHAT_HOT_DETAIL_MAX 条：SDK store 里数据量大的在前，取不到的按空闲从短到长）。
+   * 隐私：t = taskId（与记录顶层 taskId 同类，是 id 不是路径）；其余都是数字 / 布尔。
+   */
+  chatHotDetail?: ChatHotDetail[];
+  /** X3：自进程启动累计的会话回收次数（idle = 空闲 TTL / scheduledEnd = 定时 run 收尾 / watermark = 堆水位门） */
+  chatReclaim?: { idle: number; scheduledEnd: number; watermark: number };
+  /** X3：V8 堆明细（MB）。heapMB 只是 used；崩前要看的是 physical / external / malloced 与 detachedCtx（泄漏的分离上下文数） */
+  v8?: {
+    totalHeapMB: number;
+    physicalMB: number;
+    externalMB: number;
+    mallocedMB: number;
+    detachedCtx: number;
+  };
 }
+
+/** X3：一个热 chat 会话的遥测行 */
+export interface ChatHotDetail {
+  /** taskId */
+  t: string;
+  /** 距最近活跃（run 结束 / send）的秒数 */
+  idleS: number;
+  /** run 在跑 */
+  run?: true;
+  /** 在跑的后台子代理数（0 省略） */
+  bg?: number;
+  /** SDK store 里该会话的数据量（MB）；取不到省略 */
+  agentMB?: number;
+}
+
+/** run-perf 里热会话明细的条数上限：一行记录 < 4KB 的预算（见 tests/run-perf-record.test.ts）里留给它的份额 */
+export const CHAT_HOT_DETAIL_MAX = 4;
+
+/**
+ * X3：把「热会话 + 回收计数」整理成 proc 里的几个字段（纯逻辑，便于契约测试直接锁形状）。
+ * `hot === undefined`（探针没登记）→ 省略 chatHot / chatHotDetail；chatReclaim 是全局计数，始终给。
+ */
+export const buildChatProcTelemetry = (
+  hot:
+    | ReadonlyArray<{
+        taskId: string;
+        agentId: string;
+        idleMs: number;
+        runActive: boolean;
+        backgroundRunning: number;
+      }>
+    | undefined,
+  counts: { idle: number; scheduledEnd: number; watermark: number },
+  agentBytesOf?: (agentId: string) => number | undefined,
+): Pick<ProcSnapshot, "chatHot" | "chatHotDetail" | "chatReclaim"> => {
+  const chatReclaim = {
+    idle: counts.idle,
+    scheduledEnd: counts.scheduledEnd,
+    watermark: counts.watermark,
+  };
+  if (!hot) return { chatReclaim };
+  const rows = hot.map((h) => {
+    const bytes = agentBytesOf?.(h.agentId);
+    const row: ChatHotDetail = {
+      t: h.taskId,
+      idleS: Math.max(0, Math.round(h.idleMs / 1000)),
+    };
+    if (h.runActive) row.run = true;
+    if (h.backgroundRunning > 0) row.bg = h.backgroundRunning;
+    if (typeof bytes === "number" && Number.isFinite(bytes)) {
+      row.agentMB = Math.round((bytes / 1048576) * 10) / 10;
+    }
+    return row;
+  });
+  rows.sort(
+    (a, b) =>
+      (b.agentMB ?? -1) - (a.agentMB ?? -1) ||
+      a.idleS - b.idleS ||
+      (a.t < b.t ? -1 : a.t > b.t ? 1 : 0),
+  );
+  return {
+    chatHot: rows.length,
+    ...(rows.length > 0
+      ? { chatHotDetail: rows.slice(0, CHAT_HOT_DETAIL_MAX) }
+      : {}),
+    chatReclaim,
+  };
+};
+
+/** X3：v8.getHeapStatistics() 的相关字段 → proc.v8（MB 取整；字段缺失按 0） */
+export const buildV8Telemetry = (s: {
+  total_heap_size?: number;
+  total_physical_size?: number;
+  external_memory?: number;
+  malloced_memory?: number;
+  number_of_detached_contexts?: number;
+}): NonNullable<ProcSnapshot["v8"]> => {
+  const mb = (n: number | undefined): number =>
+    Math.round((Number.isFinite(n) ? (n as number) : 0) / 1048576);
+  return {
+    totalHeapMB: mb(s.total_heap_size),
+    physicalMB: mb(s.total_physical_size),
+    externalMB: mb(s.external_memory),
+    mallocedMB: mb(s.malloced_memory),
+    detachedCtx: Number.isFinite(s.number_of_detached_contexts)
+      ? (s.number_of_detached_contexts as number)
+      : 0,
+  };
+};
 
 export interface StoreSnapshot {
   mode: string;

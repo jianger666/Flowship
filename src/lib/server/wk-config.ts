@@ -31,7 +31,7 @@ import {
 } from "@/lib/wk-config";
 import type { WkConfig, WkConfigInput } from "@/lib/wk-config";
 
-import { dataRoot } from "./data-root";
+import { dataRoot, writeFileFsynced } from "./data-root";
 
 export {
   applyWkConfig,
@@ -135,7 +135,8 @@ export const writeWkConfig = async (cfg: WkConfigInput): Promise<void> => {
   await fs.mkdir(path.dirname(target), { recursive: true });
   const tmp = `${target}.tmp-${process.pid}`;
   try {
-    await fs.writeFile(tmp, next, "utf8");
+    // fsync(tmp) 之后才 rename：这份配置同事的工具也在读，断电后变成空文件会连他们的配置一起抹掉（Q9-04 同族）
+    await writeFileFsynced(tmp, next);
     await fs.rename(tmp, target);
   } catch (err) {
     await fs.rm(tmp, { force: true }).catch(() => {});

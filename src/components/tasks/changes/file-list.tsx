@@ -94,6 +94,7 @@ const baseLine = (repo: TaskRepoChanges, scopeKind: ScopeKind): string | null =>
   if (!b) return null;
   if (b.kind === "merge-base") return `相对 ${b.label} 的分叉点（${b.shortSha}）`;
   if (b.kind === "commit-parent") return `相对 ${b.label}（${b.shortSha}）`;
+  if (b.kind === "empty-tree") return "仓库还没有任何提交 · 列出目前写入的全部文件";
   return scopeKind === "uncommitted"
     ? "相对 HEAD · 只含未提交的改动"
     : "相对 HEAD · 未找到线上分支，只含未提交的改动";
@@ -117,6 +118,15 @@ const RepoScopeNote = ({
 }) => {
   if (repo.unavailable || !repo.base) return null;
   const note = "mt-0.5 text-[11px] text-muted-foreground";
+  // 空仓（还没有任何提交）：没有基线可比，不论什么范围 / 形态都只说这一句——
+  // 否则会落到下面「相对线上分支」「相对 HEAD」之类不适用的文案
+  if (repo.base.kind === "empty-tree") {
+    return (
+      <div className={note}>
+        还没有提交，没有基线可对比——列出的是目前写入的全部文件（含新建文件，不含被 .gitignore 忽略的）
+      </div>
+    );
+  }
   if (scopeKind === "commit") {
     return <div className={note}>只显示这个提交自己的改动（相对它的上一个提交）</div>;
   }
@@ -177,7 +187,9 @@ const RepoHeader = ({
             {repo.branch}
           </span>
         ) : (
-          !repo.unavailable && (
+          // 空仓读不出分支名（HEAD 还不指向任何提交），但那不是「游离 HEAD」
+          !repo.unavailable &&
+          repo.base?.kind !== "empty-tree" && (
             <Tooltip content="当前不在任何分支上（detached HEAD）">
               <span className="shrink-0 text-[11px] text-muted-foreground">游离 HEAD</span>
             </Tooltip>

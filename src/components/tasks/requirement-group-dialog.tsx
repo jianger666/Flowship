@@ -14,6 +14,11 @@
  *
  * 换关联是覆盖写，旧群立即收不到本任务的消息，所以覆盖时有显式 warning，
  * 主键走 destructive。所有业务失败都做内联展示（可改完重试），不只 toast 了事。
+ *
+ * 两处「群里是谁在用机器人」的提醒（第四轮 B4-4）：
+ * - 常驻一行「只绑定可信同事的内部群」（群里任何成员 @ 机器人都等于以属主身份读本机文件）；
+ *   第一次手动绑定前再确认一次，点过就记 localStorage、以后不打断（lib/trusted-group-ack）；
+ * - 绑完发现这个群上还有别的任务：toast 提示「群里的 @ 只会进其中一个」（lib/group-also-bound），不拦。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -31,6 +36,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useDialog } from "@/hooks/use-dialog";
+import { describeAlsoBoundBy } from "@/lib/group-also-bound";
 import {
   bindRequirementGroup,
   clearRequirementGroupBind,
@@ -39,6 +45,14 @@ import {
 } from "@/lib/task-store";
 import type { Task } from "@/lib/types";
 import { isImeComposing } from "@/lib/ime";
+import {
+  browserAckStorage,
+  hasTrustedGroupAck,
+  TRUSTED_GROUP_CONFIRM_LABEL,
+  TRUSTED_GROUP_CONFIRM_TITLE,
+  TRUSTED_GROUP_NOTICE,
+  writeTrustedGroupAck,
+} from "@/lib/trusted-group-ack";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -265,6 +279,18 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
       );
       return;
     }
+    // 第一次手动绑定：先告知「群里任何成员 @ 机器人都等于以你的身份读本机文件」，确认过一次就不再打断
+    // （常驻说明另在下面的绑定区；以「确认过没有」为准、不看当前有没有关联——只剩项目群默认的人同样没被告知过）
+    const ackStorage = browserAckStorage();
+    if (!hasTrustedGroupAck(ackStorage)) {
+      const trusted = await confirm({
+        title: TRUSTED_GROUP_CONFIRM_TITLE,
+        description: TRUSTED_GROUP_NOTICE,
+        confirmLabel: TRUSTED_GROUP_CONFIRM_LABEL,
+      });
+      if (!trusted) return;
+      writeTrustedGroupAck(ackStorage);
+    }
     // 覆盖写二次确认：旧群立即收不到本任务的消息，不是可以随手点的操作
     if (bound) {
       const ok = await confirm({
@@ -290,6 +316,11 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
           );
         } else {
           toast.success(r.chatName ? `已关联到「${r.chatName}」` : `已关联到 ${r.chatId}`);
+        }
+        // 这个群上还有别的任务也关联着：群里的 @ 只会进其中一个。绑多个是合法用法（比如拆分任务），
+        // 所以不拦、不二次确认，只在绑完后告诉用户一声（弹窗马上关，所以用停留久一点的 toast）
+        if (r.alsoBoundBy && r.alsoBoundBy.length > 0) {
+          toast.warning(describeAlsoBoundBy(r.alsoBoundBy), { duration: 10_000 });
         }
         onTaskUpdateRef.current(r.task);
         onOpenChange(false);
@@ -497,12 +528,14 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
               群 ID 获取：在飞书里打开目标群 → 点群头像进群设置 → 右下角“复制群 ID”。支持粘整段文本（自动提取 oc_ 开头那段，一次只贴一个群的 ID）。
             </p>
             <p className="text-xs text-muted-foreground">绑定前确认你的机器人已在目标群里，否则首次分享会提示手动添加。</p>
+            <p className="text-xs text-muted-foreground">{TRUSTED_GROUP_NOTICE}</p>
           </div>
         )}
 
         {mode === "auto" && (
           <div className="flex flex-col gap-1.5">
             {autoError && <p className="text-xs text-destructive">{autoError}</p>}
+            <p className="text-xs text-muted-foreground">{TRUSTED_GROUP_NOTICE}</p>
             {rebuild && (
               <div className="rounded-md border border-destructive/30 bg-destructive/5 p-2">
                 <p className="text-xs">

@@ -18,6 +18,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+import { gitEnv } from "./git-exec";
+
 const execFileAsync = promisify(execFile);
 
 // git log 单条 commit 头行的前缀标记（\x01 不会出现在 author 名里、天然分隔）
@@ -116,6 +118,8 @@ const runGitReadonly = async (
       cwd: repoDir,
       timeout: 30_000,
       maxBuffer: 20 * 1024 * 1024,
+      // 不需要 token：走 gitEnv() 剔宿主注入变量与 GitLab PAT、不等人输入（R14 Q10-04 / Q10-07；见 git-exec.ts）
+      env: gitEnv(),
     });
     return typeof stdout === "string" ? stdout : String(stdout);
   } catch {

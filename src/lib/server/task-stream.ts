@@ -14,6 +14,7 @@
 
 import { redactCopyIfHit, redactSecretsInText } from "./event-secret-redact";
 import { appendEvent } from "./task-fs";
+import { describeStorageDegraded } from "@/lib/storage-degraded";
 import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import type { Task, TaskEvent, ActionRecord } from "@/lib/types";
 import type { TaskFieldsSnapshot } from "./task-prompts";
@@ -55,6 +56,8 @@ export const stringifyMeta = (v: unknown): string => {
 //   - restricted_run: 旁路只读答疑 run 的活跃度信号（纯内存、不落盘、不进 runStatus）
 //   - background_subagents: chat 会话里「此刻还在后台跑的子代理」整份快照（纯内存、不落盘；
 //     主 AI 说完一轮后子代理可能还在干活，界面据此在输入框上方画「子代理在后台工作」条；bootstrap 补发当前值）
+//   - storage_degraded: 事件写盘失败 / 恢复的状态帧（纯内存、不落盘；只在状态或错误码变化时发；
+//     bootstrap 无条件补发当前值；界面据此在顶部画红条，见本文件「存储降级」一节）
 //   - task_deleted: DELETE 逻辑删除提交后通知既有 watcher 关流（纯内存、不落盘）
 //
 // `origin`（event / assistant_delta / done 三种帧）= 这条事件出自哪一路 run：
@@ -72,7 +75,9 @@ export type TaskStreamEvent =
   | { kind: "task"; task: Task }
   | { kind: "action"; action: ActionRecord }
   | { kind: "done"; task: Task; ok: boolean; origin?: string }
-  | { kind: "error"; message: string }
+  // 报错帧。默认 = 本轮 run / 连接出错（飞书私聊桥据此把进行中的回复卡片收尾成失败）。
+  // advisory:true = 仅给人看的提示（如存储降级 toast），**不代表 run 失败**：订阅者不得据此收尾 / 标失败。
+  | { kind: "error"; message: string; advisory?: boolean }
   // eventId（仅属主主链有）= 这一段正文落盘后那条 assistant_message 的预定 id：段内第一个 chunk 时定下、
   // 之后每帧相同、落盘时原样复用（与 thinking_delta 同套路）。watch-task 路由靠它判断「这段正文已经在
   // bootstrap 读到的 tail 里落盘了」，把订阅后才到的同段尾巴 delta 丢掉——否则重连瞬间会冒出一小截幽灵流式文字
@@ -92,6 +97,8 @@ export type TaskStreamEvent =
   | { kind: "talk_queue"; items: TalkQueueItem[] }
   /** chat 会话后台子代理在飞清单（整份快照、空数组 = 没有；纯内存、不落盘；bootstrap 补发当前值） */
   | { kind: "background_subagents"; jobs: BackgroundSubagentJobView[] }
+  /** 存储降级状态（degraded=false = 已恢复；code = 触发降级的 errno 码，界面按它区分文案；纯内存、不落盘；bootstrap 补发当前值） */
+  | { kind: "storage_degraded"; degraded: boolean; code?: string }
   | { kind: "task_deleted"; taskId: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;
@@ -550,6 +557,36 @@ export const subscribeAllTaskStreams = (
   };
 };
 
+// ----------------- 存储降级状态（事件写盘失败；逻辑见下方「存储降级」一节） -----------------
+
+const STORAGE_DEGRADED_KEY = "__flowshipStorageDegradedV1__";
+
+interface StorageDegradedState {
+  /**
+   * 当前是否处于降级。恢复只把它翻成 false、**不删记录**：节流时钟要跨「失败 → 恢复 → 又失败」保留，
+   * 否则磁盘临界（小事件写得进、大事件写不进）成败交替时，每次失败都被当成「首次降级」重新弹提示（审查 AI 预审 F1）。
+   * 记录只在任务被删（task_deleted）时整条清掉。
+   */
+  degraded: boolean;
+  /** 最近一次失败的 errno 码（降级中 = 当前码；已恢复 = 上次的码，仅作记录） */
+  code: string;
+  /** 最近一次写失败的时间；恢复的粘滞窗口（STORAGE_RECOVER_STICKY_MS）从这里起算 */
+  lastFailAt: number;
+  /** 上次发 error toast 的时间（0 = 还没发过）；磁盘满时每个增量都在失败，toast 必须节流 */
+  lastNoticeAt: number;
+}
+
+const getStorageDegradedMap = (): Map<string, StorageDegradedState> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, StorageDegradedState> | undefined
+  >;
+  if (!g[STORAGE_DEGRADED_KEY]) {
+    g[STORAGE_DEGRADED_KEY] = new Map();
+  }
+  return g[STORAGE_DEGRADED_KEY]!;
+};
+
 /**
  * 实时推流前的凭据脱敏（R1-01）：增量帧不经 appendEventLine（瞬时推送 / 延迟合并后才落盘），
  * agent 读 config.json / company-env.json 取出（或误打印）的 gitToken / apiKey / 公司环境密码会在屏幕上、飞书回流里实时明文显示。
@@ -596,6 +633,8 @@ const redactStreamEvent = (ev: TaskStreamEvent): TaskStreamEvent => {
 };
 
 export const publish = (taskId: string, rawEv: TaskStreamEvent): void => {
+  // 任务删了，存储降级记录整条清掉（恢复只翻标志、不删记录，所以这里是唯一的清理点；否则 globalThis Map 只增不减）
+  if (rawEv.kind === "task_deleted") getStorageDegradedMap().delete(taskId);
   // 脱敏失败绝不能挡推流（凭据文件读不到时 redact 内部已吞错；这里兜底防意外抛出）
   let ev = rawEv;
   try {
@@ -663,6 +702,143 @@ export const subscribeTaskStream = (
   };
 };
 
+// ----------------- 存储降级（事件写盘失败） -----------------
+//
+// R14 B2-2（Q9-01 = Q15-02）。旧行为：events.jsonl 写失败（磁盘满 / 只读 / IO 错误）→ writeEventAndPublish
+// 吞错返回 null，而 publish 挂在「写成功」之后——这条输出既没落盘、界面上也看不到，agent 却照常往下跑，
+// 用户什么提示都没有。现在：
+//   ① 没落盘的事件**仍然 publish**（带 id / ts、不带 seq）：在线的人这一刻看得见，只是刷新 / 重启后读不回来；
+//   ② 任务级「存储降级」标志（仅内存、重启即清）+ `storage_degraded` 流帧（只在「原先没降级」或错误码变了才发；
+//      bootstrap 无条件补发当前值），界面顶部红条常驻，直到存储恢复；
+//   ③ 提示 toast（`error` 帧）首次降级就发，之后每 60s 至多一条——磁盘满时每个增量都在失败，不能刷屏。
+//      节流时钟跨「失败 → 恢复 → 又失败」保留（恢复只翻标志、不删记录，见 StorageDegradedState.degraded）；
+//   ④ 恢复带粘滞：距最近一次写失败不足 STORAGE_RECOVER_STICKY_MS 的成功写不算恢复（红条保持、不发 degraded:false）——
+//      磁盘临界时小事件写得进、大事件写不进，成败会交替，不粘滞红条会跟着闪（审查 AI 预审 F1）。
+// 只认「磁盘类」errno；其它写入错误保持旧行为（调用方 warn、不推、不置标志）。
+// 范围：经 writeEventAndPublish / writeOwnedEventAndPublish / writeUserEventAndPublishStrict 写的事件；
+// 其它直接调 appendEvent 的路径不在此列（清单见 docs/HANDOFF.md 的 B2-2 小节）。
+
+const STORAGE_NOTICE_INTERVAL_MS = 60_000;
+/** 恢复粘滞窗口：距最近一次写失败不足这么久的成功写，不算「存储恢复」（红条保持、不发 degraded:false）。 */
+const STORAGE_RECOVER_STICKY_MS = 10_000;
+
+/** 算「磁盘类」写失败的 errno：磁盘满 / 配额 / 只读 / IO 错误 / 权限 / 被占用（瞬时重试穿透后）。 */
+const STORAGE_WRITE_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ENOSPC",
+  "EDQUOT",
+  "EROFS",
+  "EIO",
+  "EACCES",
+  "EPERM",
+  "EBUSY",
+]);
+
+export const storageWriteErrorCode = (err: unknown): string | null => {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && STORAGE_WRITE_ERROR_CODES.has(code)
+    ? code
+    : null;
+};
+
+/** 某任务当前的存储降级状态；没降级 = null。watch-task bootstrap 补帧用。 */
+export const getStorageDegraded = (
+  taskId: string,
+): { code: string } | null => {
+  const state = getStorageDegradedMap().get(taskId);
+  return state?.degraded ? { code: state.code } : null;
+};
+
+/** 测试专用：清空全部降级标志（不发帧）。 */
+export const __resetStorageDegradedForTests = (): void => {
+  getStorageDegradedMap().clear();
+};
+
+const markStorageDegraded = (
+  taskId: string,
+  code: string,
+  opts: { notice: boolean },
+): void => {
+  const map = getStorageDegradedMap();
+  const prev = map.get(taskId);
+  const now = Date.now();
+  const notice =
+    opts.notice &&
+    (!prev || now - prev.lastNoticeAt >= STORAGE_NOTICE_INTERVAL_MS);
+  map.set(taskId, {
+    degraded: true,
+    code,
+    lastFailAt: now,
+    lastNoticeAt: notice ? now : (prev?.lastNoticeAt ?? 0),
+  });
+  // 状态帧：原先没降级（首次，或已恢复后又失败）/ 错误码变了（磁盘满 → 变只读）才发，持续失败不刷帧
+  if (!prev?.degraded || prev.code !== code) {
+    publish(taskId, { kind: "storage_degraded", degraded: true, code });
+  }
+  if (notice) {
+    publish(taskId, {
+      kind: "error",
+      message: describeStorageDegraded(code).title,
+      // 仅提示、不代表 run 失败：飞书私聊桥看到普通 error 帧会把进行中的回复卡片收尾成失败（还挂「重试」按钮）
+      advisory: true,
+    });
+  }
+};
+
+/**
+ * 事件写盘成功 = 存储可能恢复了：翻标志并告诉界面收起红条。热路径——没降级时只是一次 Map.get。
+ * 恢复只翻 `degraded`、不删记录（节流时钟要保留）；且带粘滞：距最近一次写失败不足
+ * STORAGE_RECOVER_STICKY_MS 的成功写不算恢复——磁盘临界时成败会交替，不粘滞红条会跟着闪。
+ */
+const clearStorageDegradedOnCommit = (taskId: string): void => {
+  const state = getStorageDegradedMap().get(taskId);
+  if (!state || !state.degraded) return;
+  if (Date.now() - state.lastFailAt < STORAGE_RECOVER_STICKY_MS) return;
+  state.degraded = false;
+  publish(taskId, { kind: "storage_degraded", degraded: false });
+};
+
+/** write* 的 onCommitted：与落盘同序推事件 + 顺带确认存储恢复。 */
+const publishCommittedEvent = (
+  taskId: string,
+  event: TaskEvent,
+  origin?: string,
+): void => {
+  publish(taskId, { kind: "event", event, ...(origin ? { origin } : {}) });
+  clearStorageDegradedOnCommit(taskId);
+};
+
+/**
+ * best-effort 写入路径的 onPersistFailed：没落盘的事件仍推给在线订阅者，并置存储降级标志。
+ * 非磁盘类错误什么都不做（沿用旧行为：调用方 warn）。
+ *
+ * 推之前**必须自己再脱敏**：落盘前的脱敏是 appendFile 的参数求值时原地做的——序列化若在那之前就抛了，
+ * 事件根本没被脱敏；而 `redactStreamEvent` 对普通 event 帧默认「已在落盘时脱敏」、不再扫。
+ */
+const handleEventPersistFailed = (
+  taskId: string,
+  event: TaskEvent,
+  err: unknown,
+  origin?: string,
+): void => {
+  const code = storageWriteErrorCode(err);
+  if (!code) return;
+  let safe: TaskEvent | null = null;
+  try {
+    safe = redactCopyIfHit(event);
+  } catch (redactErr) {
+    // 宁可这一条不推，也不让凭据明文进推流 / 飞书回流
+    console.error("[task-stream] 未落盘事件脱敏失败、不推送：", redactErr);
+  }
+  if (safe) {
+    publish(taskId, {
+      kind: "event",
+      event: safe,
+      ...(origin ? { origin } : {}),
+    });
+  }
+  markStorageDegraded(taskId, code, { notice: true });
+};
+
 // 持久化 + publish 一体（防御性吞错、不让 IO 抖动挡 SDK 主流程）
 // V0.6.27：appendEvent 改返回 event 本身（轻量路径、不再 hydrate 全量 Task）
 /**
@@ -673,6 +849,8 @@ export const subscribeTaskStream = (
  * append 返 null（含 ENOENT）时不 publish。
  * publish 作为 onCommitted 进 append 链——写行成功后、链释放前同步推送，
  * 与磁盘顺序一致（不再等 meta.updatedAt touch 返回后才 publish）。
+ * 磁盘类写失败（磁盘满 / 只读 / IO 错误…，见「存储降级」一节）：仍返回 null，
+ * 但这条没落盘的事件会照样 publish 给在线订阅者，并置存储降级标志。
  */
 export const writeEventAndPublish = async (
   taskId: string,
@@ -681,9 +859,13 @@ export const writeEventAndPublish = async (
 ): Promise<TaskEvent | null> => {
   try {
     // publish 进 OrderedEventCommit 链，不再在 await append 之后另推
-    return await appendEvent(taskId, ev, lease, (event) => {
-      publish(taskId, { kind: "event", event });
-    });
+    return await appendEvent(
+      taskId,
+      ev,
+      lease,
+      (event) => publishCommittedEvent(taskId, event),
+      (event, err) => handleEventPersistFailed(taskId, event, err),
+    );
   } catch (err) {
     console.warn(
       `[task-stream] writeEventAndPublish 失败 task=${taskId} kind=${ev.kind}：`,
@@ -707,9 +889,19 @@ export const writeUserEventAndPublishStrict = async (
   lease?: () => boolean,
 ): Promise<TaskEvent | null> => {
   // 不吞错：appendEvent 已对非 ENOENT 透传 throw
-  return await appendEvent(taskId, ev, lease, (event) => {
-    publish(taskId, { kind: "event", event });
-  });
+  return await appendEvent(
+    taskId,
+    ev,
+    lease,
+    (event) => publishCommittedEvent(taskId, event),
+    // 用户输入落盘失败：调用方照旧拿到抛错（route 给 5xx / persistWarning，语义不变）。
+    // 这里只置存储降级标志（红条）：不推这条没落盘的用户消息（send 前失败要让用户重试，推了反而重复），
+    // 也不发 toast（route 已经在告诉用户）
+    (_event, err) => {
+      const code = storageWriteErrorCode(err);
+      if (code) markStorageDegraded(taskId, code, { notice: false });
+    },
+  );
 };
 
 /** send 后落盘失败时 HTTP body 用的固定文案 */
@@ -754,9 +946,13 @@ export const writeOwnedEventAndPublish = async (
         }
       : ev;
   try {
-    return await appendEvent(taskId, toWrite, lease, (event) => {
-      publish(taskId, { kind: "event", event, ...(origin ? { origin } : {}) });
-    });
+    return await appendEvent(
+      taskId,
+      toWrite,
+      lease,
+      (event) => publishCommittedEvent(taskId, event, origin),
+      (event, err) => handleEventPersistFailed(taskId, event, err, origin),
+    );
   } catch (err) {
     console.warn(
       `[task-stream] writeOwnedEventAndPublish 失败 task=${taskId} kind=${ev.kind}：`,

@@ -46,6 +46,10 @@ const render = (over: Partial<FileListProps> = {}): string =>
 
 const repoWith = (over: Partial<TaskRepoChanges>): TaskRepoChanges => makeRepo({ files: FILES, ...over });
 
+/** 空仓（还没有任何提交）的范围说明：整句钉住——用户在面板上看到的就是这一句（R14 Q4-03） */
+const EMPTY_TREE_NOTE =
+  "还没有提交，没有基线可对比——列出的是目前写入的全部文件（含新建文件，不含被 .gitignore 忽略的）";
+
 describe("FileList：目录树", () => {
   const html = render();
 
@@ -244,6 +248,19 @@ describe("FileList：仓头部", () => {
     expect(named).not.toContain("游离 HEAD");
   });
 
+  it("空仓（还没有任何提交）：基线行说清「列出的是目前写入的全部文件」，不说游离 HEAD、不说相对 HEAD / 线上分支（R14 Q4-03）", () => {
+    const base: TaskRepoChanges["base"] = { kind: "empty-tree", label: "空仓库", shortSha: "4b825dc" };
+    const html = render({ repos: [repoWith({ base, branch: null })] });
+    expect(html).toContain("仓库还没有任何提交 · 列出目前写入的全部文件");
+    expect(html).toContain(EMPTY_TREE_NOTE);
+    expect(html).not.toContain("游离 HEAD");
+    expect(html).not.toContain("相对 HEAD");
+    expect(html).not.toContain("相对线上分支");
+    expect(html).not.toContain("分叉点");
+    // 对照：真的游离 HEAD（有基线、没有分支名）仍然要说
+    expect(render({ repos: [repoWith({ branch: null })] })).toContain("游离 HEAD");
+  });
+
   it("降级成 HEAD（没找到线上分支）：基线行如实说只含未提交", () => {
     const html = render({
       repos: [repoWith({ base: { kind: "head", label: "HEAD", shortSha: "abc1234" } })],
@@ -297,6 +314,30 @@ describe("FileList：范围说明（仓头部下面那行小字）", () => {
     expect(
       note({ isolated: false, base: { kind: "head", label: "HEAD", shortSha: "abc1234" } }),
     ).toContain("任务直接在原仓库工作，改动可能混有你本地原有的未提交内容");
+  });
+
+  it("空仓：不论范围 / chat / task 形态，说明都只有「没有基线可对比」这一句（R14 Q4-03）", () => {
+    const base: TaskRepoChanges["base"] = { kind: "empty-tree", label: "空仓库", shortSha: "4b825dc" };
+    const shapes: Array<Partial<FileListProps>> = [
+      { scopeKind: "branch" },
+      { scopeKind: "uncommitted" },
+      { scopeKind: "branch", chat: true },
+    ];
+    for (const props of shapes) {
+      // isolated: false 是最容易落进别的文案的形态（会说「任务直接在原仓库工作」）
+      const html = note({ base, branch: null, isolated: false }, props);
+      const label = JSON.stringify(props);
+      expect(html, label).toContain(EMPTY_TREE_NOTE);
+      for (const other of [
+        "只显示还没提交的改动",
+        "相对线上分支",
+        "任务直接在原仓库工作",
+        "没找到可对比的线上分支",
+        "当前就在线上分支",
+      ]) {
+        expect(html, `${label} 不该出现「${other}」`).not.toContain(other);
+      }
+    }
   });
 
   it("task 在隔离 worktree 里：没有额外说明（改动就是它自己的）", () => {

@@ -22,9 +22,16 @@ export const entryKey = (repoPath: string, filePath: string): string =>
  * 已查看标记沿用到别的内容上，单文件 diff 缓存也命中旧内容（用户看到的是错的 diff）。
  * 指纹缺省（服务端没取到）时退回只比状态 + 行数。
  * 刻意不带路径（路径已经是 viewed 记录的 key，避免重复占 localStorage）。
+ *
+ * 第 4 段原来是「是否未跟踪」，现在恒写 0——**但这一段不能删**：
+ * - 为什么不再看 untracked：agent 对同一个文件 `git add` 之后，它从「未跟踪的合成项」变成「已跟踪的 diff 项」，
+ *   状态 / 行数 / 文件级指纹（两条路径都按 git blob 口径算）都没变，只有这一位 1→0，
+ *   用户已经看过的文件就会整体变黄；内容没变，「已查看」就不该失效。
+ * - 为什么保留这一段：面板已经发布过，用户的 localStorage 里存着按这个 6 段格式写下的标记，
+ *   删掉一段会让所有已存的「已查看」一次性失效。存量里当时是未跟踪的文件，标记里这一位是 1，会黄一次（可接受）。
  */
 export const viewedSignature = (f: TaskChangeFile): string =>
-  `${f.status}:${f.added}:${f.removed}:${f.untracked ? 1 : 0}:${f.whitespaceOnly ? 1 : 0}:${f.fingerprint ?? ""}`;
+  `${f.status}:${f.added}:${f.removed}:0:${f.whitespaceOnly ? 1 : 0}:${f.fingerprint ?? ""}`;
 
 /** diff 缓存 / 重拉用的签名（带路径，跨仓不撞） */
 export const fileSignature = (repoPath: string, f: TaskChangeFile): string =>

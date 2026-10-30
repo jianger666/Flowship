@@ -126,7 +126,10 @@ interface MrInboxContextValue {
   /** 批量标已读（POST 成功后再改本地 seenAtMs；失败抛错给调用方 toast） */
   markAllSeen: (urls: string[]) => Promise<void>;
   /** sha = 扫描那一刻源分支的 HEAD（entry.mr.headSha）：带上后作者再推新提交会被拒，避免合入没看过的改动 */
-  mergeMr: (mrUrl: string, sha?: string) => Promise<void>;
+  mergeMr: (
+    mrUrl: string,
+    sha?: string,
+  ) => Promise<{ alreadyMerged: boolean }>;
   /** 忽略条目（url = mrUrl 或 bugUrl）：从三组移除；返回快照供「撤销」 */
   ignoreItem: (url: string) => Promise<IgnoredSnapshot>;
   /** 撤销忽略：服务端取消忽略 + 本地塞回条目 + 后台强制重扫（常驻「已忽略」列表的恢复也走它，快照只带 url） */
@@ -155,6 +158,8 @@ interface MrInboxContextValue {
   }) => Promise<{
     targetStateLabel?: string;
     stillPendingFix?: boolean;
+    /** reject 已流转、但「打回原因」评论没发出去（Q21-02）：调用方提示用户去飞书补发 */
+    commentFailed?: boolean;
   }>;
 }
 
@@ -440,6 +445,10 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       }
       throw new Error(message);
     }
+    // 已合并过（双击 / 两个窗口 / 别人先合了）：服务端当成功返回、带 alreadyMerged；列表照样清掉
+    const merged = (await res.json().catch(() => ({}))) as {
+      alreadyMerged?: boolean;
+    };
     // 待测 MR：整条剔除；待回归 / 我的 BUG：只清 MR 关联（与 markBugMrMergedInCache 对齐）
     const clearBugMr = (it: BugInboxEntry): BugInboxEntry =>
       it.mrUrl === mrUrl ? stripBugMrFields(it) : it;
@@ -449,6 +458,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       myBugs: d.myBugs.map(clearBugMr),
       pendingRegression: d.pendingRegression.map(clearBugMr),
     }));
+    return { alreadyMerged: merged.alreadyMerged === true };
   }, [applyPatch]);
 
   /**
@@ -566,6 +576,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       const body = (await res.json().catch(() => ({}))) as {
         targetStateLabel?: string;
         stillPendingFix?: boolean;
+        commentFailed?: boolean;
       };
       const label =
         (typeof body.targetStateLabel === "string" && body.targetStateLabel) ||
@@ -600,6 +611,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       return {
         targetStateLabel: label || undefined,
         stillPendingFix: stillPending,
+        ...(body.commentFailed === true ? { commentFailed: true } : {}),
       };
     },
     [applyPatch],

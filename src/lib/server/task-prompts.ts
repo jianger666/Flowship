@@ -23,7 +23,7 @@ import { renderContextDocsSection } from "./context-docs-prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { detectAgentShellKind, type AgentShellKind } from "./agent-shell";
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
-import { formatRepoSectionForPrompt } from "@/lib/path-utils";
+import { formatRepoSectionForPrompt, repoTail } from "@/lib/path-utils";
 import { resolveReqId } from "@/lib/req-id";
 import {
   getTaskCwd,
@@ -691,7 +691,7 @@ const renderReqIdLine = (task: Task): string => {
 
 // 渲染「任务基本信息」的仓库段：非隔离 = 原样列原仓库路径；隔离 task 额外拼一段
 // worktree 语境说明（分支已由系统检出、禁自己 checkout、依赖要自装）
-const renderRepoSection = (task: Task): string => {
+export const renderRepoSection = (task: Task): string => {
   const workPaths = getTaskWorkRepoPaths(task);
   const base = formatRepoSectionForPrompt(workPaths, {
     // 混合场景必须用新 cwd 语义、否则 workPaths 聚合会漂到 $HOME
@@ -707,7 +707,7 @@ const renderRepoSection = (task: Task): string => {
 
   // 逐仓列：git 仓写已检出分支；非 git 仓标明原地使用（读快照、不 existsSync）
   const branchLines = task.repoPaths.map((p, i) => {
-    const tail = p.split("/").filter(Boolean).pop() ?? p;
+    const tail = repoTail(p);
     if (isTaskNonGitRepo(task, p)) {
       return `  - \`${tail}\`：非 git 目录、原地使用（\`${workPaths[i]}\`）`;
     }
@@ -765,7 +765,7 @@ export const renderRepoBranchSection = (task: Task): string => {
   let hasScript = false;
   for (let i = 0; i < repoPaths.length; i++) {
     const p = repoPaths[i];
-    const tail = p.split("/").filter(Boolean).pop() ?? p;
+    const tail = repoTail(p);
     const readonly = isTaskReadonlyRepo(task, p);
     if (readonly) hasReadonly = true;
     const script = isTaskScriptRepo(task, p);
@@ -804,7 +804,7 @@ export const renderRepoBranchSection = (task: Task): string => {
       "测试任务规则：禁止创建 feature 分支、禁止自行切到 test / dev 分支替代被测业务分支。",
     );
     if (missing.length > 0) {
-      const names = missing.map((p) => `\`${p.split("/").filter(Boolean).pop() ?? p}\``);
+      const names = missing.map((p) => `\`${repoTail(p)}\``);
       lines.push(
         `以下仓库的被测业务分支尚未就绪：${names.join("、")}。可以读取需求、现有目录结构和历史代码来设计测试用例 / 测试方案；但当前 checkout **不代表本需求实现**，不得据此执行需求验收、宣称测试通过或提交针对本需求实现的代码修改。需要验证实现时，先请用户在任务编辑中补充分支。`,
       );

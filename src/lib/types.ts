@@ -1125,6 +1125,12 @@ export interface GitBranchState {
    * 选择器据此置灰并说明原因。当前工作树自己的分支不算占用。
    */
   occupied?: Record<string, GitBranchOccupant>;
+  /**
+   * refs 超过读取上限（256MiB，几乎不可能）：目录确实是 git 仓、`current` 可信，但 `branches` 没读全（此时为空）。
+   * **目前前端没有消费这个字段**——超限时选择器仍显示成空列表（但不再是「非 git 仓」，Q10-02）；
+   * 以后要消费时，请提示「分支太多没读全」，别当成「这个仓没有分支」。缺省 = 读全了。
+   */
+  truncated?: boolean;
 }
 
 /**
@@ -1160,6 +1166,12 @@ export interface RepoBranchList {
    * 表单据此提示，别让用户以为在隔离区里干活（第三轮 D2a-03）。
    */
   notRoot?: boolean;
+  /**
+   * refs 超过读取上限（256MiB，几乎不可能）：目录确实是 git 仓、但 `branches` 没读全（此时为空）。
+   * **目前前端没有消费这个字段**（`use-repo-branches` 与各分支选择器都没读它）——超限时下拉仍是空的（但不再是「非 git 仓」，Q10-02）；
+   * 以后要消费时，请提示「分支太多没读全」，别当成「非 git 仓」或「这个仓没有分支」。缺省 = 读全了。
+   */
+  truncated?: boolean;
   /**
    * 服务端拒绝 / 探测失败的原因（Q4-01）：`/api/repo-branches` 回 400（UNC / 非本机路径等）时带上服务端 `error` 文案，
    * 前端展示它，而不是一律「非 git 仓库」。只有 `isRepo:false` 的失败结果会带。
@@ -1229,9 +1241,10 @@ export type TaskChangeScope =
  * - merge-base：HEAD 与「线上分支」的分叉点——任务分支上自己的提交 + 未提交改动都算「本任务的改动」
  * - head：找不到线上分支时的降级（或「只看未提交」范围），只能看 HEAD 之后的未提交改动
  * - commit-parent：看单个提交时，基线是该提交的第一个父提交
+ * - empty-tree：仓库还没有任何提交（HEAD 不存在）——拿空树当基线，已写入的文件全部算新增
  */
 export interface TaskRepoChangeBase {
-  kind: "merge-base" | "head" | "commit-parent";
+  kind: "merge-base" | "head" | "commit-parent" | "empty-tree";
   /** 展示用的参照名：origin/main / main / HEAD / abc1234^ */
   label: string;
   /** 基线 commit 的短 sha（展示用） */
@@ -1451,7 +1464,7 @@ export type QueueStateSseEnvelope = {
  * | 字段 | 类型 | 说明 |
  * |---|---|---|
  * | callId | string | 与 tool_call / tool_output_delta 配对（= SDK call_id） |
- * | name | string | 归一化工具名；MCP 为 `mcp:<server>:<tool>` |
+ * | name | string | 归一化工具名；MCP 为 `mcp:<server>:<tool>`（名字里的 `:` / `%` 转义成 `%3A` / `%25`，避免 server `a:b` + tool `c` 与 server `a` + tool `b:c` 撞成同一个名字） |
  * | status | "success" \| "error" \| "interrupted" | 完成态；interrupted = run 终结时未收到 SDK 完成帧 |
  * | output | string | 结果文本，上限 8KB（UTF-8 字节）；超限截断 |
  * | truncated | boolean? | output 被截断时为 true |
@@ -1783,6 +1796,12 @@ export interface Task {
    * 运行时字段、不落盘（meta.json 没有它）。
    */
   eventsTruncated?: boolean;
+  /**
+   * Q9-08：读 events.jsonl 时被跳过的「坏行」数（崩溃半行 / 断电后的全 0 填充 / 磁盘问题留下的、非空但解析不了的行）。
+   * 只在有坏行时带；只数这次读到的范围（尾部切片不会去数更早没读到的）。运行时字段、不落盘。
+   * 前端据此提示「有 N 条记录读不出来」，而不是让它们悄悄消失。
+   */
+  eventsSkipped?: number;
 }
 
 /**

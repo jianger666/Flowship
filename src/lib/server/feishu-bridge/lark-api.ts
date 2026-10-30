@@ -16,7 +16,7 @@ import { nonLocalPathReason } from "@/lib/unc-path";
 
 import { getBridgeDataDir } from "./bridge-config";
 import type { BotAppInfo, BotSelfInfo, SendMessageResult } from "./types";
-import { isTransientLarkError, LarkApiError } from "./types";
+import { isTransientLarkError, LARK_ARGV_TOO_LONG_CODE, LarkApiError } from "./types";
 
 const execFileAsync = promisify(nodeExecFile);
 
@@ -138,6 +138,41 @@ const tryParseJson = (text: string): unknown => {
 const asRecord = (v: unknown): JsonRecord | null =>
   v && typeof v === "object" && !Array.isArray(v) ? (v as JsonRecord) : null;
 
+/** 折叠空白并限长（CLI 失败摘要用） */
+const clipCliLine = (s: string, max = 300): string => {
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+};
+
+/**
+ * 把 Node `execFile` 的失败 message 瘦成人话（R14 B4-3 · Q12a-05）。
+ *
+ * 形态：`Command failed: <整条命令行>\n<stderr>`——命令行里是本机 lark-cli 路径 + 整个 `--data`
+ * （整卡 JSON、可达几十 KB、含任务正文）。直接当 `LarkApiError.message` 用有三个坏处：日志刷屏、
+ * 正文泄进事件流 / toast；`isTransientLarkMessage` 会拿 message 去匹配——正文里恰好有 "network" / "timeout"
+ * 就把一次业务失败判成瞬时。所以只取 `stderr` 最后一条有内容的行；stderr 是空的 / 没有，就退回
+ * 「lark-cli 调用失败（命令标签）」。**不去解析 message 本体**：命令行里若有裸换行（比如 `--text` 的多行文本），
+ * 切行会把正文当成 stderr。原始 stdout / stderr 仍原样挂在 `raw` 上，传输瞬时判据（`isTransientLarkError`）照样看得到。
+ * 不是 `Command failed:` 开头的 message 原样返回。
+ */
+const cliFailureMessage = (
+  message: string | undefined,
+  stderr: unknown,
+  api?: string,
+): string | undefined => {
+  if (typeof message !== "string" || !message.startsWith("Command failed:")) return message;
+  const lines =
+    typeof stderr === "string"
+      ? stderr
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean)
+      : [];
+  const last = lines[lines.length - 1];
+  if (last) return clipCliLine(last);
+  return api ? `lark-cli 调用失败（${api}）` : "lark-cli 调用失败";
+};
+
 /**
  * 命令标签（`api POST /open-apis/im/v1/chats` / `im +messages-send`）——
  * 取到第一个 `--flag` 为止。挂在 LarkApiError 上，错误里才看得出是哪次调用挂的。
@@ -160,6 +195,8 @@ export const normalizeLarkError = (
   err: unknown,
   fallbackMsg = "lark-cli 调用失败",
   api?: string,
+  /** 这次调用实际用的超时（ms）——超时文案要报实际值（卡片更新是短超时）；不传 = 默认 30s */
+  timeoutMs: number = LARK_TIMEOUT_MS,
 ): LarkApiError => {
   if (err instanceof LarkApiError) return err;
 
@@ -181,7 +218,7 @@ export const normalizeLarkError = (
     const msg =
       (typeof errorObj.message === "string" && errorObj.message) ||
       (typeof payload.msg === "string" && payload.msg) ||
-      e.message ||
+      cliFailureMessage(e.message, e.stderr, api) ||
       fallbackMsg;
     const violations =
       errorObj.permission_violations ??
@@ -219,14 +256,14 @@ export const normalizeLarkError = (
   }
 
   if (e.killed) {
-    return new LarkApiError(`lark-cli 超时（${LARK_TIMEOUT_MS}ms）`, {
+    return new LarkApiError(`lark-cli 超时（${timeoutMs}ms）`, {
       code: e.code,
       api,
       raw: { stdout: e.stdout, stderr: e.stderr },
     });
   }
 
-  return new LarkApiError(e.message || fallbackMsg, {
+  return new LarkApiError(cliFailureMessage(e.message, e.stderr, api) || fallbackMsg, {
     code: e.code,
     api,
     raw: { stdout: e.stdout, stderr: e.stderr },
@@ -327,6 +364,69 @@ const shouldRetryLark = (args: string[], err: LarkApiError): boolean =>
 const sleep = (ms: number): Promise<void> =>
   ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
 
+// ----------------- Windows 命令行长度预检（R14 B4-3 · Q12a-06） -----------------
+
+/**
+ * Windows `CreateProcess` 的命令行上限是 32767 个字符（UTF-16 码元）。lark-cli 的 `--data` 带着整卡 / 整段正文，
+ * 长轮必然超限：`spawn ENAMETOOLONG` 不是瞬时错误、永远不会自愈，每次 flush 都败。macOS / Linux 的 ARG_MAX
+ * 在 1 MB 上下，开发机测不出——所以这里只在 win32 预检。
+ * 软上限取 30_000：给二进制路径（MAX_PATH 260）和估算误差留 2.4k 余量。
+ */
+export const LARK_WIN_CMDLINE_SOFT_LIMIT = 30_000;
+/** 给 lark-cli 二进制路径预留的字符数（Windows MAX_PATH） */
+const WIN_BIN_PATH_ALLOWANCE = 260;
+
+/**
+ * 一个参数按 Windows 规则（libuv `quote_cmd_arg`）引起来之后的字符数：
+ * 含空格 / 制表符 / 引号才加引号；引号要转义成 `\"`、引号前的反斜杠翻倍；结尾的反斜杠翻倍。
+ * 整卡 JSON 里引号很多，转义能把长度放大到 2~3 倍——所以不能直接拿 `args.join(" ").length` 估。
+ * 只数长度、不拼字符串（单个参数可达几十万字符）。
+ */
+const windowsQuotedLength = (arg: string): number => {
+  if (arg.length === 0) return 2;
+  if (!/[ \t"]/.test(arg)) return arg.length;
+  let n = 2;
+  let backslashes = 0;
+  for (let i = 0; i < arg.length; i += 1) {
+    const c = arg.charCodeAt(i);
+    if (c === 92) {
+      backslashes += 1;
+    } else if (c === 34) {
+      n += backslashes * 2 + 2;
+      backslashes = 0;
+    } else {
+      n += backslashes + 1;
+      backslashes = 0;
+    }
+  }
+  return n + backslashes * 2;
+};
+
+/** 估算 `lark-cli <args>` 在 Windows 上的命令行长度（含二进制路径余量与参数间空格） */
+export const estimateWindowsCommandLength = (args: readonly string[]): number =>
+  args.reduce((sum, a) => sum + 1 + windowsQuotedLength(a), WIN_BIN_PATH_ALLOWANCE);
+
+let platformOverride: NodeJS.Platform | null = null;
+
+/** 单测伪装平台（在 macOS 上测 win32 预检）；传 null 复原。生产勿调 */
+export const __setLarkPlatformForTest = (p: NodeJS.Platform | null): void => {
+  platformOverride = p;
+};
+
+/**
+ * win32 命令行超长就地拒绝：不 spawn、不重试（`isTransientLarkError` 不认它）、带 `ARGV_TOO_LONG` 码，
+ * 调用方（card-stream）据此改发更短的内容。
+ */
+const assertArgvFits = (args: readonly string[], api: string): void => {
+  if ((platformOverride ?? process.platform) !== "win32") return;
+  const len = estimateWindowsCommandLength(args);
+  if (len <= LARK_WIN_CMDLINE_SOFT_LIMIT) return;
+  throw new LarkApiError(
+    `命令行过长（约 ${len} 字符，Windows 上限 32767），未发送给 lark-cli`,
+    { code: LARK_ARGV_TOO_LONG_CODE, api },
+  );
+};
+
 // ----------------- 底层执行 -----------------
 
 export interface RunLarkOpts {
@@ -337,32 +437,48 @@ export interface RunLarkOpts {
    * `auth status` 等命令不认 `--as` → 传 `none`。
    */
   as?: "bot" | "user" | "none";
+  /**
+   * 单次执行超时（ms），不传 = 30s。
+   * 所有飞书调用走同一条进程级单飞队列：一个「黑洞」请求占满默认超时，后面所有任务的发消息 / 入站回执都要陪等。
+   * 卡片更新这类「丢一次无所谓、之后会整包补发」的调用传短一点（R14 P1-1）。
+   */
+  timeoutMs?: number;
 }
+
+/**
+ * 解析超时：非有限正数一律回退默认——execFile 的 `timeout: 0` 是「永不超时」，
+ * 传进来 0 / 负数 / NaN 绝不能原样用。
+ */
+const resolveTimeoutMs = (t?: number): number =>
+  typeof t === "number" && Number.isFinite(t) && t > 0 ? t : LARK_TIMEOUT_MS;
 
 /** 跑一条 lark-cli 命令，返回解析后的 JSON 根对象 */
 export const runLark = async (
   args: string[],
   opts: RunLarkOpts = {},
-): Promise<JsonRecord> =>
-  enqueueLark(async () => {
+): Promise<JsonRecord> => {
+  // 默认补 --as bot --json（调用方已带 / as:none 则跳过）
+  const finalArgs = [...args];
+  const as = opts.as ?? "bot";
+  if (as !== "none" && !finalArgs.includes("--as")) {
+    finalArgs.push("--as", as);
+  }
+  if (!finalArgs.includes("--json") && !finalArgs.includes("--format")) {
+    finalArgs.push("--json");
+  }
+  // 命令标签随错误一起上抛：飞书参数校验类报错的 message 是无信息量的
+  // 「field validation failed」，不带上「哪条命令」根本没法定位
+  const api = describeLarkCommand(finalArgs);
+  // win32 命令行超长：注定失败的请求不该先去陪排队（更不该占着单飞队列），入队前就拒
+  assertArgvFits(finalArgs, api);
+  const timeoutMs = resolveTimeoutMs(opts.timeoutMs);
+  return enqueueLark(async () => {
     const bin = await resolveLarkCliBin();
-    // 默认补 --as bot --json（调用方已带 / as:none 则跳过）
-    const finalArgs = [...args];
-    const as = opts.as ?? "bot";
-    if (as !== "none" && !finalArgs.includes("--as")) {
-      finalArgs.push("--as", as);
-    }
-    if (!finalArgs.includes("--json") && !finalArgs.includes("--format")) {
-      finalArgs.push("--json");
-    }
-    // 命令标签随错误一起上抛：飞书参数校验类报错的 message 是无信息量的
-    // 「field validation failed」，不带上「哪条命令」根本没法定位
-    const api = describeLarkCommand(finalArgs);
     // 瞬时传输失败重试：闸在 shouldRetryLark（幂等命令 / 确定没发出去的失败才重试）
     for (let attempt = 0; ; attempt += 1) {
       try {
         const { stdout, stderr } = await execImpl(bin, finalArgs, {
-          timeout: LARK_TIMEOUT_MS,
+          timeout: timeoutMs,
           maxBuffer: LARK_MAX_BUFFER,
           cwd: opts.cwd,
           env: process.env,
@@ -377,7 +493,9 @@ export const runLark = async (
         return unwrapOk(parsed, api);
       } catch (err) {
         const normalized =
-          err instanceof LarkApiError ? err : normalizeLarkError(err, undefined, api);
+          err instanceof LarkApiError
+            ? err
+            : normalizeLarkError(err, undefined, api, timeoutMs);
         if (attempt >= LARK_MAX_RETRIES || !shouldRetryLark(finalArgs, normalized)) {
           throw normalized;
         }
@@ -389,6 +507,7 @@ export const runLark = async (
       }
     }
   });
+};
 
 /**
  * 裸调 OpenAPI：`lark-cli api <METHOD> <path> --as bot --data/--params --json`
@@ -403,6 +522,8 @@ export const larkApi = async (
     params?: unknown;
     file?: string;
     as?: RunLarkOpts["as"];
+    /** 单次执行超时（ms），不传 = 默认 30s；见 RunLarkOpts.timeoutMs */
+    timeoutMs?: RunLarkOpts["timeoutMs"];
   } = {},
 ): Promise<JsonRecord> => {
   const args = ["api", method.toUpperCase(), apiPath];
@@ -415,7 +536,10 @@ export const larkApi = async (
   if (opts.file) {
     args.push("--file", opts.file);
   }
-  return runLark(args, opts.as ? { as: opts.as } : {});
+  const runOpts: RunLarkOpts = {};
+  if (opts.as) runOpts.as = opts.as;
+  if (opts.timeoutMs !== undefined) runOpts.timeoutMs = opts.timeoutMs;
+  return runLark(args, runOpts);
 };
 
 // ----------------- 业务封装 -----------------
@@ -780,17 +904,24 @@ export const createCardEntity = async (
   return { card_id: cardId };
 };
 
+/** 卡片更新类调用的可选项（目前只有超时）；不传 = 与改前行为一致 */
+export interface CardCallOpts {
+  /** 单次执行超时（ms）；流式更新传短超时，别让一次黑洞请求占住单飞队列 30s（R14 P1-1） */
+  timeoutMs?: number;
+}
+
 /** 流式更新某 element 的 content（全量文本 + 递增 sequence） */
 export const updateCardElementContent = async (
   cardId: string,
   elementId: string,
   content: string,
   sequence: number,
+  callOpts: CardCallOpts = {},
 ): Promise<void> => {
   await larkApi(
     "PUT",
     `/open-apis/cardkit/v1/cards/${encodeURIComponent(cardId)}/elements/${encodeURIComponent(elementId)}/content`,
-    { data: { content, sequence } },
+    { data: { content, sequence }, timeoutMs: callOpts.timeoutMs },
   );
 };
 
@@ -802,6 +933,7 @@ export const batchUpdateCard = async (
   cardId: string,
   actions: unknown[],
   sequence: number,
+  callOpts: CardCallOpts = {},
 ): Promise<void> => {
   await larkApi(
     "POST",
@@ -811,6 +943,7 @@ export const batchUpdateCard = async (
         sequence,
         actions: JSON.stringify(actions),
       },
+      timeoutMs: callOpts.timeoutMs,
     },
   );
 };
@@ -823,6 +956,7 @@ export const updateCardEntity = async (
   cardId: string,
   cardJson: unknown,
   sequence: number,
+  callOpts: CardCallOpts = {},
 ): Promise<void> => {
   await larkApi("PUT", `/open-apis/cardkit/v1/cards/${encodeURIComponent(cardId)}`, {
     data: {
@@ -832,6 +966,7 @@ export const updateCardEntity = async (
       },
       sequence,
     },
+    timeoutMs: callOpts.timeoutMs,
   });
 };
 
@@ -840,6 +975,7 @@ export const patchCardSettings = async (
   cardId: string,
   settingsJson: unknown,
   sequence: number,
+  callOpts: CardCallOpts = {},
 ): Promise<void> => {
   await larkApi(
     "PATCH",
@@ -849,6 +985,7 @@ export const patchCardSettings = async (
         settings: JSON.stringify(settingsJson),
         sequence,
       },
+      timeoutMs: callOpts.timeoutMs,
     },
   );
 };

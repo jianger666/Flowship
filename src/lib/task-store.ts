@@ -17,6 +17,7 @@ import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 import { bootArgsForTask } from "./agent-provider";
 import { appendChangesQuery, type ChangesQuery } from "./changes/scope";
 import { normalizeCorruptTasks, type CorruptTaskInfo } from "./corrupt-task";
+import { parseAlsoBoundBy, type AlsoBoundTask } from "./group-also-bound";
 import { getSettings } from "./local-store";
 import { TASK_LIST_FETCH_TIMEOUT_MS } from "./task-list-poll";
 import {
@@ -33,6 +34,7 @@ import type { OutlineItem } from "./stream-outline";
 import { isTailAnchorEvent } from "./tail-anchor";
 import type { ThinkingSnapshot } from "./thinking-live";
 import type { ArchiveReport, DeleteWorktreeReportBody } from "./worktree-report";
+import type { StorageDegradedState } from "./storage-degraded";
 import type { TalkQueueItem } from "./talk-queue";
 import {
   type ActionRecord,
@@ -423,14 +425,25 @@ export const mergeTaskEvents = (prev: Task | null, next: Task): Task => {
   const events =
     newer.length > 0 ? [...prevEvents, ...newer] : prevEvents;
   const eventsTruncated = next.eventsTruncated ?? prev.eventsTruncated;
+  // 坏行数（Q9-08）同口径：快照没带（SSE 中途帧不是每帧都读 events）就沿用本地的，
+  // 免得「有记录读不出来」的提示在两帧之间闪一下；刷新页面 / 重新进入任务时以服务端为准
+  const eventsSkipped = next.eventsSkipped ?? prev.eventsSkipped;
   // 过期快照不得盖运行态：失败 done 若晚于唤醒后的 running 到达，
   // 会把顶栏打回「失败」、输入条解锁，而 agent 其实已经在跑。
   // lastRewind 两个分支都取 prev / next 里更新的：调用方已在合并前用 lastRewindNeedsResync 判过，
   // 这里推进它，之后每一帧带着同一条 lastRewind 的快照才不会反复触发重拉
   if (next.updatedAt < prev.updatedAt) {
-    return withNewerLastRewind({ ...prev, events, eventsTruncated }, prev, next);
+    return withNewerLastRewind(
+      { ...prev, events, eventsTruncated, eventsSkipped },
+      prev,
+      next,
+    );
   }
-  return withNewerLastRewind({ ...next, events, eventsTruncated }, prev, next);
+  return withNewerLastRewind(
+    { ...next, events, eventsTruncated, eventsSkipped },
+    prev,
+    next,
+  );
 };
 
 // ----------------- 创建 / 删除 / 配置 patch -----------------
@@ -853,6 +866,8 @@ interface SSEEnvelope {
     | "talk_queue"
     /** chat 会话后台子代理在飞清单（整份快照、纯内存；bootstrap 补发当前值） */
     | "background_subagents"
+    /** 存储降级状态（事件写盘失败 / 恢复；纯内存；bootstrap 补发当前值） */
+    | "storage_degraded"
     /** 任务已逻辑删除，客户端应停订阅、勿重连 */
     | "task_deleted";
   event?: TaskEvent;
@@ -894,6 +909,10 @@ interface SSEEnvelope {
   active?: boolean;
   /** background_subagents 帧：在飞清单（按不可信输入，经 parseBackgroundSubagentJobs 校验后才交给回调） */
   jobs?: unknown;
+  /** storage_degraded 帧：true = 事件写盘失败中（顶部红条）；false = 已恢复。非布尔的无效帧丢弃 */
+  degraded?: boolean;
+  /** storage_degraded 帧：触发降级的 errno 码（界面按它区分文案；缺省 = 未知） */
+  code?: string;
   /** talk_queue 帧：待送达队列条目（逐字段校验后才交给回调） */
   items?: Array<{
     id?: unknown;
@@ -1062,12 +1081,19 @@ export interface TaskStreamCallbacks {
    */
   onBackgroundSubagents?: (jobs: BackgroundSubagentJobView[]) => void;
   /**
+   * storage_degraded——事件写盘失败（磁盘满 / 只读 / IO 错误…）的状态帧；上层据此在事件流顶部画红条。
+   * 参数 = 当前降级状态：`{ code }`（code 空串 = 服务端没给）= 降级中；`null` = 没降级 / 已恢复。
+   * 每次连接的 bootstrap 会补发当前值，断线重连后不会停在旧状态；`degraded` 不是布尔的无效帧直接丢弃、不回调。
+   */
+  onStorageDegraded?: (state: StorageDegradedState | null) => void;
+  /**
    * task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
    */
   onTaskDeleted?: (taskId: string) => void;
   /**
    * 连接已建立——首个合法 bootstrap `task` 帧解析成功时回调一次。
-   * hook 用它在长连接尚未结束时清零 transient/unavailable 计数（不等流 EOF）。
+   * hook 用它记下建连时刻；重连预算要等连接结束时看「撑过 WATCH_STABLE_CONNECTION_MS 没有」再决定清不清零
+   * （建连即清零会让「建连后立刻断」的连接永远耗尽不了预算，见 Q16-01）。
    * 200 空流 / 协议解析前失败不得触发；每次连接至多一次。
    */
   onConnectionEstablished?: () => void;
@@ -1084,6 +1110,9 @@ export type WatchTaskStreamResult = {
  *
  * 返回 `{ established }`——bootstrap 前 clean EOF 时 established=false，
  * hook 不得把它当成功清零 epoch。
+ *
+ * 回调抛错 / 读流失败 / 被 abort 时：先 `reader.cancel()` 关掉底层连接再抛（否则服务端订阅者泄漏，见 Q16-01）；
+ * 自然读到 EOF 不用。
  */
 export const watchTaskStream = async (
   taskId: string,
@@ -1118,11 +1147,16 @@ export const watchTaskStream = async (
   let buffer = "";
   // 首个合法 task 帧才算建连成功；每连接至多通知一次
   let connectionEstablished = false;
+  // 是否自然读到了 EOF（服务端正常关流）：只有这种退出不需要我们主动关连接
+  let finished = false;
 
   try {
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        finished = true;
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       let sepIdx = buffer.indexOf("\n\n");
@@ -1253,6 +1287,16 @@ export const watchTaskStream = async (
             const parsed = parseBackgroundSubagentJobs(env.jobs);
             if (parsed !== undefined) callbacks.onBackgroundSubagents?.(parsed);
           } else if (
+            env.type === "storage_degraded" &&
+            typeof env.degraded === "boolean"
+          ) {
+            // 存储降级状态（顶部红条）：degraded 不是布尔的无效帧丢掉（不动本地状态）；code 缺省按空串（「其它」档文案）
+            callbacks.onStorageDegraded?.(
+              env.degraded
+                ? { code: typeof env.code === "string" ? env.code : "" }
+                : null,
+            );
+          } else if (
             env.type === "task_deleted" &&
             typeof env.taskId === "string"
           ) {
@@ -1264,6 +1308,11 @@ export const watchTaskStream = async (
       }
     }
   } finally {
+    // 不是自然读到 EOF 就退出（回调抛错 / read 抛错 / 被 abort）：连接还开着，光 releaseLock 不会关它——
+    // 服务端订阅者只在「请求 abort / ReadableStream.cancel / 终态关流」时退订，漏掉就每重连一轮泄漏 1 个（Q16-01）。
+    // cancel 在流已 errored 时会返回 rejected promise：吞掉，别盖掉原错误、也别变成 unhandledRejection；
+    // 不 await，免得阻塞 hook 的重连。
+    if (!finished) void reader.cancel().catch(() => {});
     try {
       reader.releaseLock();
     } catch {
@@ -2359,6 +2408,8 @@ export type BindRequirementGroupResult =
       overwritten: boolean;
       previousChatId?: string;
       membershipUnknown?: boolean;
+      /** 这个群上还有哪些别的任务也关联着（没有就不带）：群里的 @ 只会进其中一个，绑完告诉用户 */
+      alsoBoundBy?: AlsoBoundTask[];
       task: Task;
     }
   | {
@@ -2423,11 +2474,13 @@ export const bindRequirementGroup = async (
     overwritten?: unknown;
     previousChatId?: unknown;
     membershipUnknown?: unknown;
+    alsoBoundBy?: unknown;
     task?: unknown;
   };
   if (ok.ok !== true || typeof ok.chatId !== "string" || !ok.task) {
     throw new ApiRequestError("需求群响应异常", res.status || 500);
   }
+  const alsoBoundBy = parseAlsoBoundBy(ok.alsoBoundBy);
   return {
     ok: true,
     chatId: ok.chatId,
@@ -2435,6 +2488,7 @@ export const bindRequirementGroup = async (
     overwritten: ok.overwritten === true,
     ...(typeof ok.previousChatId === "string" ? { previousChatId: ok.previousChatId } : {}),
     ...(ok.membershipUnknown === true ? { membershipUnknown: true as const } : {}),
+    ...(alsoBoundBy.length > 0 ? { alsoBoundBy } : {}),
     task: ok.task as Task,
   };
 };

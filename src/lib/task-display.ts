@@ -20,6 +20,7 @@ import type {
 } from "./types";
 // ACTION_LABEL 单源在 types.ts（server action-gates / stop-task 同引）；此处 re-export 供 UI 原路径 import
 export { ACTION_LABEL } from "./types";
+import { repoTail } from "./path-utils";
 import { ACTION_LABEL } from "./types";
 
 // 原 CHAT_ATTACHMENT_ONLY_TEXT 占位文案已删：纯附件消息气泡直接空文本、
@@ -361,9 +362,8 @@ export const buildDefaultDailyTaskTitle = (
   repoPaths: readonly string[],
   now: Date = new Date(),
 ): string => {
-  const first = (repoPaths[0] ?? "").replace(/\/+$/, "");
-  const short =
-    first.split("/").filter(Boolean).pop() || first || "任务";
+  const first = (repoPaths[0] ?? "").replace(/[\\/]+$/, "");
+  const short = repoTail(first) || first || "任务";
   const when = now.toLocaleString("zh-CN", {
     month: "2-digit",
     day: "2-digit",

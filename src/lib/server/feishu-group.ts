@@ -55,9 +55,12 @@ import {
 import { mentionTag } from "@/lib/server/feishu-bridge/group-shared";
 import {
   describeLarkError,
-  isTransientLarkError,
   LarkApiError,
 } from "@/lib/server/feishu-bridge/types";
+import {
+  isBotNotInGroupSendError,
+  isChatGoneError,
+} from "@/lib/server/feishu-bridge/lark-errors";
 import {
   decodeWorkitemUrl,
   fetchMyIdentity,
@@ -409,49 +412,11 @@ export const resolveTaskStory = async (
 // ----------------- 错误映射 -----------------
 
 /**
- * 发群消息失败里代表「bot 不在群 / 没资格往这个群发」的飞书错误码
- * （官方 `POST /im/v1/messages` 错误码表）。命中即走 bot_not_in_group 引导弹窗——
- * 这几种在本产品语境下的补救动作是同一个：去群设置里把本机 bot 加进群 / 放开发言。
+ * 「bot 不在群」「群已解散」的判定在 `feishu-bridge/lark-errors`（纯函数、只依赖 types）：
+ * 发群失败提示（group-failure-notice）也要用，而它不能反向依赖本文件的 meegle 静态边。
+ * 这里 re-export `isBotNotInGroupSendError`，原调用方与测试照旧从本文件取。
  */
-const BOT_NOT_IN_GROUP_LARK_CODES = new Set<string>([
-  "230002", // The bot can not be outside the group（机器人不在群，主码）
-  "230013", // Bot has NO availability to this user（不在应用可用范围）
-  "230018", // 群设置禁止当前操作（如仅指定成员可发言）
-  "230027", // Lack of necessary permissions（如外部群未开共享）
-  "230035", // Send Message Permission deny（禁言 / 被屏蔽）
-]);
-
-/** 发送失败是否该判成「bot 不在群」——码优先、报文关键词兜底（CLI 偶尔丢 code） */
-export const isBotNotInGroupSendError = (err: unknown): boolean => {
-  if (!(err instanceof LarkApiError)) return false;
-  if (err.code !== undefined && BOT_NOT_IN_GROUP_LARK_CODES.has(String(err.code))) {
-    return true;
-  }
-  return /outside the group|not in the (?:chat|group)|机器人不在/i.test(
-    err.message ?? "",
-  );
-};
-
-/**
- * 读群信息失败时，飞书是否**明确表示这个群不存在 / 不可见**（解散、chat_id 失效）。
- *
- * 刻意只认「正面信号」、不用「排除法」：读群信息失败的原因还有缺 scope、网络抖、
- * CLI 超时、bot 被移出群——它们各有各的补救路径（补权限 / 重试 / 把机器人加回去），
- * 误判成「群没了」就是诱导用户白建一个新群、再攒一个孤儿群。判不准就当没判。
- */
-const CHAT_GONE_MESSAGE =
-  /chat\s*(?:id\s*)?(?:is\s*)?(?:not\s*found|not\s*exist|does\s*not\s*exist|invalid)|(?:dissolved|disbanded)|群(?:聊)?(?:不存在|已解散|已删除)/i;
-
-const isChatGoneError = (err: unknown): boolean => {
-  if (!(err instanceof LarkApiError)) return false;
-  // 网络抖 / 超时：重试能好，不是群没了
-  if (isTransientLarkError(err)) return false;
-  // bot 自己被移出群：补救是「把机器人加回去」，交给发送后的 bot_not_in_group 引导
-  if (isBotNotInGroupSendError(err)) return false;
-  // 缺 scope：补权限，不是群没了
-  if (err.permissionViolations || err.consoleUrl) return false;
-  return CHAT_GONE_MESSAGE.test(err.message ?? "");
-};
+export { isBotNotInGroupSendError };
 
 /**
  * 「拿不到身份」≠「没授权」。
@@ -1058,7 +1023,7 @@ export const describeBoundRequirementGroup = async (
  *    `bot_not_in_group`（带准确 bot 名，前端引导先加机器人再绑）；其它失败走通用映射。
  *    ⚠️ `bot_not_in_group` 的码表（230002 一族）是按**发消息失败**实测的，读群信息接口
  *    机器人不在群时是否同码**尚未真机验证**——若实测码不同，真机上会走到 502 通用错误
- *    而不是 409 引导。验证后把真实 code 补到 `BOT_NOT_IN_GROUP_LARK_CODES` 并更新此处注释。
+ *    而不是 409 引导。验证后把真实 code 补到 `feishu-bridge/lark-errors` 的 `BOT_NOT_IN_GROUP_LARK_CODES` 并更新此处注释。
  * 2. `probeSelfInChat`（user 身份）：本人不在目标群 → `owner_not_in_group` 直接拦
  *   （否则一绑就是新的死绑定）；鉴权/权限失败（user 未登录、缺 scope）→ 按
  *    `lark_not_authed` / `lark_permission` 直接抛（换绑是用户主动操作，拦一下是对的，

@@ -94,20 +94,19 @@ describe("trimLiveOutput：行数 + 字符数双封顶", () => {
   });
 });
 
-describe("reduceLiveToolOutputs：无换行长流缓冲有界、累计耗时不再 O(n²)", () => {
-  it("10MB 无换行流（5000 帧 × 2KB）：缓冲 ≤ 8192 字符、尾部是最新的内容、累计 < 1s（修复前 4.5s）", () => {
+describe("reduceLiveToolOutputs：无换行长流缓冲有界（修复前缓冲无界、累计耗时 O(n²)）", () => {
+  it("10MB 无换行流（5000 帧 × 2KB）：每一帧之后缓冲都 ≤ 8192 字符、尾部是最新的内容", () => {
+    // 不断言累计耗时（R14 Q18-02）：5000 次 expect 本身就占了大头，隔离跑 242ms、CPU 压力下 1.22s 会误红。
+    // 「耗时不 O(n²)」由逐帧的长度断言守着：修复前缓冲无界增长（每帧拷贝整段历史才累计 4.5s），第 5 帧就越过 8192、断言当场红。
     let s = {} as Record<string, string>;
-    const t0 = performance.now();
     for (let i = 0; i < 5000; i++) {
       const tag = String(i).padStart(5, "0");
       s = reduceLiveToolOutputs(s, delta("a", tag + "x".repeat(2043), i));
       expect(s.a!.length).toBeLessThanOrEqual(LIVE_OUTPUT_MAX_CHARS + 1);
     }
-    const dt = performance.now() - t0;
     expect(s.a!.length).toBeLessThanOrEqual(LIVE_OUTPUT_MAX_CHARS);
     expect(s.a!).toContain("04999"); // 最后一帧的标记在窗口内
     expect(s.a!).not.toContain("00000");
-    expect(dt).toBeLessThan(1000);
   });
 
   it("单帧超大（10MB 一次性）：缓冲仍有界、不抛", () => {

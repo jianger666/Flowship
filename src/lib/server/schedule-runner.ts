@@ -73,9 +73,28 @@ export interface ScheduleRunnerDeps {
   deliver: (req: DeliverRequest) => Promise<DeliverOutcome>;
   /** 往会话事件流写一条 info（错过 / 失败提示）。失败不得影响调度 */
   notify: (taskId: string, text: string, meta: Record<string, unknown>) => Promise<void>;
+  /** 一次 `deliver` 最多等多久（毫秒）；缺省 {@link SCHEDULE_DELIVER_TIMEOUT_MS}。主要给单测缩短用 */
+  deliverTimeoutMs?: number;
 }
 
 export const MISSED_NOTE = "应用当时没开或电脑睡眠，没有补发";
+
+/**
+ * R14 Q20-02：一次 `deps.deliver` 最多等多久。
+ * 下游（chat-inject / task-question-inject）任何一处 await 永不返回（磁盘 / SDK resume / 锁等待）时，
+ * 没有超时就会让该任务的 `tickingTasks` 永不释放——这个会话之后的全部定时都不再触发（连「错过」都不会记），直到重启。
+ * 超时按「结果不明」处理（同 deliver 抛错）：沿用同一个幂等键重试，下游认回放；投递窗口（10 分钟）里还有多次重试机会。
+ * 取 60 秒：远长于下游正常路径，又不会让同会话的其它定时被一次挂死拖太久。
+ */
+export const SCHEDULE_DELIVER_TIMEOUT_MS = 60_000;
+
+/** `deliver` 超时（见 {@link SCHEDULE_DELIVER_TIMEOUT_MS}）；单独成类只为让 catch 里能认出它、给更明确的原因 */
+class DeliverTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`投递超过 ${Math.round(timeoutMs / 1000)} 秒没返回（结果不明，稍后用同一个编号重试）`);
+    this.name = "DeliverTimeoutError";
+  }
+}
 
 const warn = (msg: string, err?: unknown): void => {
   console.warn(`[schedule] ${msg}`, err instanceof Error ? err.message : (err ?? ""));
@@ -285,22 +304,33 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
 
     const opts = { seq: p.seq, dueAt: p.dueAt, manual: p.manual };
     let outcome: DeliverOutcome;
+    // R14 Q20-02：deliver 外包超时——挂死的投递不能永远占着这个任务的 tick（见 SCHEDULE_DELIVER_TIMEOUT_MS）。
+    // 超时后被丢下的 deliver 若稍后才 reject：Promise.race 已订阅它，不会变成 unhandledRejection
+    const timeoutMs = deps.deliverTimeoutMs ?? SCHEDULE_DELIVER_TIMEOUT_MS;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      outcome = await deps.deliver({
-        taskId,
-        record: rec,
-        pending: p,
-        text: formatScheduleFireMessage(rec, { ...opts, now }),
-        meta: buildScheduleFireMeta(rec, opts),
-        clientItemId: `${rec.id}.${p.seq}.${attempt}`,
-      });
+      outcome = await Promise.race([
+        deps.deliver({
+          taskId,
+          record: rec,
+          pending: p,
+          text: formatScheduleFireMessage(rec, { ...opts, now }),
+          meta: buildScheduleFireMeta(rec, opts),
+          clientItemId: `${rec.id}.${p.seq}.${attempt}`,
+        }),
+        new Promise<never>((_, reject) => {
+          timeoutTimer = setTimeout(() => reject(new DeliverTimeoutError(timeoutMs)), timeoutMs);
+        }),
+      ]);
     } catch (err) {
-      // 抛出 = 下游可能已经受理了、只是没把结果带回来：结果不明
+      // 抛出 / 超时 = 下游可能已经受理了、只是没把结果带回来：结果不明
       markUnknown();
       outcome = {
         kind: "retry",
         reason: err instanceof Error ? err.message : String(err),
       };
+    } finally {
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
     }
 
     if (outcome.kind === "delivered") {
@@ -342,8 +372,13 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
     return "retry";
   };
 
-  const stepOne = async (taskId: string, id: string): Promise<void> => {
-    const now = deps.now();
+  /**
+   * `tickNow`（R14 Q20-01）：这一轮 tick 的**起点**时刻。「晚点」要度量的是调度器发现它到点的时刻，不是前面兄弟占用的时间——
+   * 同会话两条同刻到点的定时，第一条投递慢（会话要先恢复）占了 70 秒，轮到第二条时再取 `deps.now()` 会把它误判成
+   * 「应用当时没开或电脑睡眠」。睡眠唤醒后的 tick 起点本身已经晚了，仍会被正确判成错过。不传（单测直接调）= 现取。
+   */
+  const stepOne = async (taskId: string, id: string, tickNow?: number): Promise<void> => {
+    const now = tickNow ?? deps.now();
     const decided = await deps.mutate<StepDecision>(taskId, (list) => {
       const cur = list.find((r) => r.id === id);
       if (!cur) return { list, changed: false, result: { kind: "none" } };
@@ -381,13 +416,13 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
     if (rec?.pending) await attemptDelivery(taskId, rec);
   };
 
-  const step = async (taskId: string, id: string): Promise<void> => {
+  const step = async (taskId: string, id: string, tickNow?: number): Promise<void> => {
     const key = keyOf(taskId, id);
     const s = state();
     if (s.inflight.has(key)) return;
     s.inflight.add(key);
     try {
-      await stepOne(taskId, id);
+      await stepOne(taskId, id, tickNow);
     } catch (err) {
       warn(`调度出错 task=${taskId} id=${id}`, err);
     } finally {
@@ -437,11 +472,12 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
       deps.syncIndex?.(taskId, list);
       pruneStaleAttempts(taskId, list);
       // 只处理「真有事」的：有待投递的、或已到点 / 已晚点的。没到点的 active 不必抢任务锁（那把锁和 meta / 事件写入共用）
-      const now = deps.now();
-      const due = list.filter((r) => r.pending !== undefined || classifyDue(r, now) !== "not_due");
-      // 同一任务内逐条串行：多条同时到点时一条一条送进会话（并行会让它们同时通过「会话空闲」判断）
+      const tickNow = deps.now();
+      const due = list.filter((r) => r.pending !== undefined || classifyDue(r, tickNow) !== "not_due");
+      // 同一任务内逐条串行：多条同时到点时一条一条送进会话（并行会让它们同时通过「会话空闲」判断）。
+      // 每一条都用同一个 tickNow 判到点 / 晚点（R14 Q20-01，见 stepOne）：前一条慢不该让后一条被判成错过
       for (const r of due) {
-        await step(taskId, r.id);
+        await step(taskId, r.id, tickNow);
       }
     } finally {
       s.tickingTasks.delete(taskId);

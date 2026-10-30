@@ -22,6 +22,31 @@ const errno = (code: string): NodeJS.ErrnoException =>
   Object.assign(new Error(`${code}: simulated`), { code });
 const exists = (p: string): Promise<boolean> => fs.stat(p).then(() => true, () => false);
 
+/**
+ * 对进程级 `fs` 注入「一次性失败」：只有**路径里含 id** 的第一次调用走 onHit（用来删目录 + 抛 errno），
+ * 其余——别的任务、没人 await 的后台写盘——一律透传给真实实现。
+ * 为什么不直接 `mockImplementationOnce`：`fs` 是进程共享的，谁先调谁吃掉那一次。后台写盘
+ * （persistSeqSidecar、appendEvent 的 meta touch，见 tests/setup/hermetic-env.ts 的注释）会在 spy 装好后、目标调用前
+ * 调一下 `fs.rename`：断言「1 次」变成 2 次，或者该失败的那次没失败（R14 Q18-03，CPU 压力下复现过）。
+ * `touches` = 路径里含 id 的全部调用（只记本任务的），断言次数看它，不看 spy 的总次数。
+ */
+const failFirstTouchOf = (
+  method: "appendFile" | "rename",
+  id: string,
+  onHit: () => Promise<never>,
+): { touches: unknown[][] } => {
+  const real = fs[method].bind(fs) as unknown as (...args: unknown[]) => Promise<void>;
+  const touches: unknown[][] = [];
+  vi.spyOn(fs, method).mockImplementation(((...args: unknown[]) => {
+    // appendFile(path, data) 只看 path（data 是任意文本）；rename(from, to) 两个都是路径
+    const pathArgs = method === "rename" ? args.slice(0, 2) : args.slice(0, 1);
+    if (!pathArgs.some((p) => String(p).includes(id))) return real(...args);
+    touches.push(args);
+    return touches.length === 1 ? onHit() : real(...args);
+  }) as never);
+  return { touches };
+};
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -93,12 +118,12 @@ describe("第六轮 MTF-1：appendEventLine 在 macOS 式并发删除（open / a
   it("追加时任务目录被删并抛 EINVAL → 返回 false、不抛、目录不复活（macOS 真机复现 5/3600 `open:EINVAL`）", async () => {
     const id = "t_1700000060001_append_einval";
     await fs.mkdir(taskDir(id), { recursive: true });
-    const spy = vi.spyOn(fs, "appendFile").mockImplementationOnce(async () => {
+    const h = failFirstTouchOf("appendFile", id, async () => {
       await rmDirRetrying(taskDir(id));
       throw errno("EINVAL");
     });
     await expect(appendEventLine(id, ev("e1"))).resolves.toBe(false);
-    expect(spy).toHaveBeenCalledTimes(1);
+    expect(h.touches).toHaveLength(1);
     // 等后台 best-effort 的 seq sidecar 写完（目录没了它只会静默失败），确认没把目录写回来
     await new Promise((r) => setTimeout(r, 30));
     expect(await exists(taskDir(id))).toBe(false);
@@ -107,7 +132,7 @@ describe("第六轮 MTF-1：appendEventLine 在 macOS 式并发删除（open / a
   it("对照：EINVAL 但目录仍在 → 真错误，照常抛（不静默吞），且之后同一任务还能正常追加", async () => {
     const id = "t_1700000060002_append_einval_alive";
     await fs.mkdir(taskDir(id), { recursive: true });
-    vi.spyOn(fs, "appendFile").mockImplementationOnce(async () => {
+    failFirstTouchOf("appendFile", id, async () => {
       throw errno("EINVAL");
     });
     await expect(appendEventLine(id, ev("e1"))).rejects.toMatchObject({ code: "EINVAL" });
@@ -118,7 +143,7 @@ describe("第六轮 MTF-1：appendEventLine 在 macOS 式并发删除（open / a
   it("对照（旧树能用的情形）：ENOENT 仍降级为 false；目录在、写正常 → true", async () => {
     const id = "t_1700000060003_append_enoent";
     await fs.mkdir(taskDir(id), { recursive: true });
-    vi.spyOn(fs, "appendFile").mockImplementationOnce(async () => {
+    failFirstTouchOf("appendFile", id, async () => {
       await rmDirRetrying(taskDir(id));
       throw errno("ENOENT");
     });
@@ -133,23 +158,43 @@ describe("writeRewindPoints：macOS 式并发删除（rename 抛 EINVAL）也降
   it("rename 时任务目录被删并抛 EINVAL → 不抛、不复活目录、tmp 不残留", async () => {
     const id = "t_1700000050001_einval";
     await fs.mkdir(taskDir(id), { recursive: true });
-    const spy = vi.spyOn(fs, "rename").mockImplementationOnce(async () => {
+    const h = failFirstTouchOf("rename", id, async () => {
       await fs.rm(taskDir(id), { recursive: true, force: true });
       throw errno("EINVAL");
     });
     await expect(writeRewindPoints(id, [])).resolves.toBeUndefined();
-    expect(spy).toHaveBeenCalledTimes(1);
+    expect(h.touches).toHaveLength(1);
     expect(await exists(taskDir(id))).toBe(false);
   });
 
   it("对照：rename 抛 EINVAL 但目录仍在 → 是真错误，照常抛出（不静默吞）", async () => {
     const id = "t_1700000050002_einval_alive";
     await fs.mkdir(taskDir(id), { recursive: true });
-    vi.spyOn(fs, "rename").mockImplementationOnce(async () => {
+    failFirstTouchOf("rename", id, async () => {
       throw errno("EINVAL");
     });
     await expect(writeRewindPoints(id, [])).rejects.toMatchObject({ code: "EINVAL" });
     expect(await exists(getRewindPointsPath(id))).toBe(false);
+  });
+
+  it("R14 Q18-03：目标调用之前别的路径先 rename 了一次（后台写盘）→ 不吃掉注入的失败、也不算进本任务的次数", async () => {
+    // 确定性复现压力下偶发的「expected rename to be called 1 times, but got 2」：
+    // 修前（进程级 mockImplementationOnce）这次无关的 rename 会先把注入的失败吃掉——它自己抛 EINVAL、还把本任务目录删了。
+    const id = "t_1700000050004_einval_with_noise";
+    await fs.mkdir(taskDir(id), { recursive: true });
+    const noiseDir = path.join(TMP_ROOT, "unrelated-rename-noise");
+    await fs.mkdir(noiseDir, { recursive: true });
+    await fs.writeFile(path.join(noiseDir, "a"), "x");
+    const h = failFirstTouchOf("rename", id, async () => {
+      await fs.rm(taskDir(id), { recursive: true, force: true });
+      throw errno("EINVAL");
+    });
+    // spy 装好之后、目标调用之前，进程里别处调了一次 fs.rename
+    await fs.rename(path.join(noiseDir, "a"), path.join(noiseDir, "b"));
+    await expect(writeRewindPoints(id, [])).resolves.toBeUndefined();
+    expect(h.touches).toHaveLength(1);
+    expect(await exists(taskDir(id))).toBe(false); // 注入的失败落在了目标调用上：目录被删、writeRewindPoints 降级
+    expect(await exists(path.join(noiseDir, "b"))).toBe(true); // 无关的 rename 透传给了真实实现、照常生效
   });
 
   it("对照（旧树能用的情形）：目录在、rename 正常 → 照常落盘", async () => {

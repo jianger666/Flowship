@@ -5,6 +5,7 @@
  * 职责：把 SDK run.stream() 吐的每条消息翻译成 events.jsonl 事件 + SSE publish：
  *   - thinking / tool_call / tool_result / assistant（流式缓冲）/ status
  *   - compaction_start/end（自定义 pi 合成消息 → info 过程行；不 flush 正文）
+ *   - auto_retry_start（自定义 pi 合成消息 → flush 半截正文成独立一条 + info 说明行，重新生成的全文是新的一条）
  *   - artifact 写入检测（write/edit 命中 actions/ 路径 → 「在写 artifact」+ 落盘后刷 artifactUpdatedAt）
  *   - submit_work 特判（状态由 awaitingNotifier 管、这里只记 error）
  *
@@ -13,6 +14,7 @@
 
 import type { SDKMessage } from "@cursor/sdk";
 
+import { autoRetryEventMeta, autoRetryEventText } from "@/lib/auto-retry-display";
 import {
   compactionEventMeta,
   compactionEventText,
@@ -892,6 +894,26 @@ export const handleSdkMessage = async (
       kind: "info",
       text: compactionEventText({ start, aborted }),
       meta: compactionEventMeta({ start, aborted, reason }),
+    });
+    return;
+  }
+
+  // 自定义 pi 内层自动重试开始（R14 Q11-02）：pi 要把这条回复整个重新生成一遍，而出错的那半截已经推给 UI 了。
+  // 与 compaction 相反，这里**要** flush：把半截思考 / 正文落成独立的一条、再写一行说明，
+  // 重新生成的全文才是新的一条——不分开，半截和全文会被焊成同一条 assistant_message。
+  // 不删已经流出的字：用户看到过的内容不能凭空消失，说明行告诉他为什么会有两段。
+  if (rawType === "auto_retry_start") {
+    const retry = msg as unknown as {
+      attempt?: unknown;
+      maxAttempts?: unknown;
+    };
+    await flushThinkingBuffer(taskId, assistantCtx, stillCurrent, origin);
+    await assistantCtx.flush();
+    if (!stillCurrent()) return;
+    await writeEv({
+      kind: "info",
+      text: autoRetryEventText({ attempt: retry.attempt, max: retry.maxAttempts }),
+      meta: autoRetryEventMeta({ attempt: retry.attempt, max: retry.maxAttempts }),
     });
     return;
   }

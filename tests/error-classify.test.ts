@@ -27,6 +27,7 @@ import {
   planErrorActions,
   type ErrorKind,
 } from "@/lib/error-classify";
+import { EMPTY_REPLY_MESSAGE } from "@/lib/pi-run-settle";
 
 const readSrc = (...seg: string[]): string =>
   readFileSync(
@@ -300,6 +301,7 @@ describe("文案卫生：业务口径、中文、不泄露协议词 / 英文原�
     "context_overflow",
     "quota",
     "network",
+    "endpoint",
   ];
   const sample: Record<string, string> = {
     rate_limit: "429 Too Many Requests",
@@ -308,6 +310,7 @@ describe("文案卫生：业务口径、中文、不泄露协议词 / 英文原�
     context_overflow: "context_length_exceeded",
     quota: "insufficient_quota",
     network: "ECONNRESET",
+    endpoint: EMPTY_REPLY_MESSAGE,
   };
 
   it("每类都有非空 title / hint，且以中文为主", () => {
@@ -526,5 +529,201 @@ describe("接线源码契约", () => {
     expect(lib).not.toMatch(/from "react"/);
     expect(lib).not.toMatch(/\bdocument\.|\bwindow\.|\bnavigator\./);
     expect(lib).not.toContain("settings-link");
+  });
+});
+
+/**
+ * R14 Q11-01（P1-3）：自定义端点「回了东西、但不是模型回复」两种症状归一个 endpoint 类——
+ * 空响应（pi-run-settle.EMPTY_REPLY_MESSAGE，我们自己写的固定句）/ 回了网页（地址填成网页、网关登录页）。
+ * 原先网页落 unknown，红卡只摆一段 HTML 原文，用户不知道该去设置里检查接口地址；空响应原本根本不报错。
+ *
+ * 口径：只增不改——空响应是自家固定句、最先判；网页排在所有既有类之后，只吃原本落 unknown 的，
+ * 所以带状态码 / 网络特征词的网关页仍按原来的类走。
+ * `terminated`（undici 的流被对端中途掐断）不在此列：它是瞬时网络问题，归 network（评审意见 F2，见下一个 describe）。
+ */
+/** chat-runner / task-runner 实际拼出来的整串：result 只留前 200 字符，后面接 SDK result dump */
+const runnerWrapped = (result: string): string =>
+  `agent run status=error: ${result.slice(0, 200)}\n--- SDK result dump ---\n{"status":"error"}`;
+
+describe("classifyErrorText：端点 endpoint（空响应 / 回了网页）", () => {
+  it("空回复文案：单独一句 / runner 拼过的整串 / 带各路径前缀 → endpoint（不带 ^ 锚点）", () => {
+    expect(kindOf(EMPTY_REPLY_MESSAGE)).toBe("endpoint");
+    expect(kindOf(runnerWrapped(EMPTY_REPLY_MESSAGE))).toBe("endpoint");
+    for (const prefix of [
+      "答疑失败：",
+      "群答疑失败：",
+      "Task agent 失败：",
+      "Chat agent 异常：",
+      "唤醒当前阶段失败：",
+      "  答疑失败：",
+    ]) {
+      expect(kindOf(`${prefix}${EMPTY_REPLY_MESSAGE}`), prefix).toBe("endpoint");
+    }
+  });
+
+  it.each([
+    "<html><body>gateway login</body></html>",
+    '<!DOCTYPE html>\n<html lang="en"><head><title>Login</title></head></html>',
+    "404 <!DOCTYPE html><html><head><title>404 Not Found</title></head></html>",
+    "500 <html>500 Internal Server Error</html>",
+    "Unexpected response from provider: <HTML>\n<HEAD><TITLE>Error</TITLE></HEAD>",
+    "<!doctype  HTML>",
+    runnerWrapped("500 <html>500</html>"),
+  ])("端点回了网页（地址填成网页 / 网关登录页 / 错误页）→ endpoint：%j", (text) => {
+    expect(kindOf(text)).toBe("endpoint");
+  });
+
+  it("只增不改：带状态码 / 网络特征词的网关页仍按原来的类走，endpoint 只吃原本落 unknown 的", () => {
+    const page = "<html><body>x</body></html>";
+    expect(kindOf(`502 Bad Gateway\n${page}`)).toBe("network");
+    expect(kindOf(`503 Service Unavailable\n${page}`)).toBe("network");
+    expect(kindOf(`504 Gateway Timeout\n${page}`)).toBe("network");
+    expect(kindOf(`401 Unauthorized\n${page}`)).toBe("auth");
+    expect(kindOf(`403 Forbidden\n${page}`)).toBe("auth");
+    expect(kindOf(`429 Too Many Requests\n${page}`)).toBe("rate_limit");
+    expect(kindOf(`402 Payment Required\n${page}`)).toBe("quota");
+    expect(kindOf(`413 Payload Too Large\n${page}`)).toBe("context_overflow");
+  });
+
+  it.each([
+    "<htmlx>oops</htmlx>",
+    "render <HtmlProps> failed",
+    "see https://example.com/index.html for details",
+    "<div>hello</div>",
+    "<!DOCTYPE>",
+  ])("不是端点异常、保持原样展示（unknown）：%j", (text) => {
+    expect(kindOf(text)).toBe("unknown");
+  });
+
+  it("JSON 解析错误（Unexpected token '<'）仍 unknown：它没带出 HTML 文档标记，不能拿来断言「端点回了网页」", () => {
+    expect(kindOf("Unexpected token '<', \"<!DOCTYPE \"... is not valid JSON")).toBe("unknown");
+  });
+
+  it("只扫开头 6000 字符（与其它类同口径）：靠后的 HTML 不看；开头的 HTML 后面跟几十万字符也不卡", () => {
+    const filler = "x".repeat(200_000);
+    expect(kindOf(`${filler}\n<html>x</html>`)).toBe("unknown");
+    const t0 = Date.now();
+    expect(kindOf(`<html>x</html>\n${filler}`)).toBe("endpoint");
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it("文案：标题 / 建议点名「接口地址」，提示去设置检查（原串在详情里）", () => {
+    const c = classifyErrorText(EMPTY_REPLY_MESSAGE);
+    expect(c.kind).toBe("endpoint");
+    expect(c.title).toContain("没有返回正常内容");
+    expect(c.hint).toContain("接口地址");
+    expect(c.hint).toContain("设置");
+  });
+
+  it("planErrorActions：去设置（模型栏）+ 重试降为次要，chat / task 一样（同一个坏地址重试多半还是空）", () => {
+    // 与 terminated（network 类、重试是主按钮）的对照见下一个 describe
+    for (const mode of ["chat", "task"] as const) {
+      expect(planErrorActions("endpoint", { mode }), mode).toEqual({
+        settings: { focus: "model" },
+        newChat: false,
+        retry: "secondary",
+      });
+    }
+  });
+
+  it("buildErrorCardModel：命中 endpoint → 正文换成标题 + 建议；原串（含网页全文）进「查看详情」和复制串", () => {
+    const raw = "500 <html>500 Internal Server Error</html>";
+    const m = buildErrorCardModel(raw, "", { mode: "chat" });
+    expect(m.classification.kind).toBe("endpoint");
+    expect(m.headline).toBe(m.classification.title);
+    expect(m.hint).toBe(m.classification.hint);
+    expect(m.diagnostic).toBe(raw);
+    expect(m.copyText).toBe(
+      `${m.headline}\n${m.hint}\n\n${ERROR_DETAIL_HEADING}\n${raw}`,
+    );
+  });
+
+  it("文案出处：EMPTY_REPLY_MESSAGE 以「模型没有返回任何内容」开头，error-classify.ts 认的是同一句（改一边要跟着改另一边）", () => {
+    expect(EMPTY_REPLY_MESSAGE.startsWith("模型没有返回任何内容")).toBe(true);
+    expect(readSrc("lib", "error-classify.ts")).toContain("模型没有返回任何内容");
+    expect(readSrc("lib", "pi-run-settle.ts")).toContain("模型没有返回任何内容");
+  });
+});
+
+/**
+ * R14 Q11-01 评审意见 F2：undici 的 `TypeError: terminated`（响应体读到一半被对端关掉）归 network，不归 endpoint。
+ * 它是瞬时网络问题（网关空闲超时 / 后端重启 / 代理不支持流式），「重试」该是主按钮；
+ * 放进 endpoint 会把「去设置」顶成主按钮、还让人去查接口地址和模型名，对一次偶发断流是误导。
+ * 同时消掉一个不自洽：同一次故障，带 `other side closed` 的 cause 时本来就是 network，
+ * cause 没带出来时不能落成另一种卡。
+ */
+describe("classifyErrorText：terminated（流被对端中途掐断）→ network，重试是主按钮", () => {
+  it.each([
+    "terminated",
+    "TypeError: terminated",
+    "Error: terminated",
+    "Provider error: terminated",
+    "答疑失败：terminated",
+    "  terminated  ",
+    "agent run status=error: terminated",
+    runnerWrapped("terminated"),
+  ])("单独一个 terminated（cause 没带出来）→ network：%j", (text) => {
+    expect(kindOf(text)).toBe("network");
+  });
+
+  it("同一次故障带不带 cause 归同一类：cause 里有 other side closed 时仍是 network", () => {
+    expect(kindOf("TypeError: terminated\n  [cause]: Error: other side closed")).toBe("network");
+    expect(kindOf("TypeError: terminated")).toBe("network");
+  });
+
+  it("只增不改：限流 / 鉴权 / 额度等排在前面的类先判，terminated 只吃它们没命中的", () => {
+    expect(kindOf("401 Unauthorized\nTypeError: terminated")).toBe("auth");
+    expect(kindOf("429 Too Many Requests\nTypeError: terminated")).toBe("rate_limit");
+    expect(kindOf("insufficient_quota\nTypeError: terminated")).toBe("quota");
+  });
+
+  it.each([
+    "process terminated by signal SIGKILL",
+    "Task terminated by user",
+    "The session was terminated",
+    "Build terminated",
+    "terminated: false",
+    "子进程 terminated 了",
+  ])("不是流被掐断（后面还有内容 / 前面不是行首或冒号）→ 保持原样展示（unknown）：%j", (text) => {
+    expect(kindOf(text)).toBe("unknown");
+  });
+
+  it("只扫开头 6000 字符（与其它类同口径）：靠后的 terminated 不看", () => {
+    expect(kindOf(`${"x".repeat(200_000)}\nTypeError: terminated`)).toBe("unknown");
+  });
+
+  it("对抗输入不卡（正则没有回溯爆炸）：大量冒号 / 空白 / 空行 / 重复词，全部 unknown 且合计 < 500ms", () => {
+    const evil = [
+      ":".repeat(6000),
+      ": ".repeat(3000),
+      `${" ".repeat(6000)}x`,
+      "\n \t".repeat(2000),
+      "terminated ".repeat(600),
+      `:${" ".repeat(5900)}terminatedX`,
+    ];
+    const t0 = Date.now();
+    for (const text of evil) expect(kindOf(text)).toBe("unknown");
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it("卡片：给的是网络类的说明、不把一次偶发断流说成地址 / 模型名填错；不给「去设置」、重试是主按钮（chat / task 一样）", () => {
+    const c = classifyErrorText("TypeError: terminated");
+    expect(c.kind).toBe("network");
+    expect(c.hint).toContain("网络");
+    expect(c.hint).not.toContain("接口地址");
+    for (const mode of ["chat", "task"] as const) {
+      expect(planErrorActions(c.kind, { mode }), mode).toEqual({
+        settings: null,
+        newChat: false,
+        retry: "primary",
+      });
+    }
+    const m = buildErrorCardModel(runnerWrapped("TypeError: terminated"), "", { mode: "task" });
+    expect(m.classification.kind).toBe("network");
+    expect(m.headline).toBe(m.classification.title);
+  });
+
+  it("endpoint 的说明里不再提「连接被掐断」：那种情况归 network", () => {
+    expect(classifyErrorText(EMPTY_REPLY_MESSAGE).hint).not.toContain("掐断");
   });
 });

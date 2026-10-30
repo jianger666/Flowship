@@ -1058,6 +1058,7 @@ const ArtifactPanelImpl = ({
                     variant="ghost"
                     size="icon-xs"
                     className="ml-0.5"
+                    aria-label="上一处改动"
                     disabled={!diffData || !!diffError}
                     onClick={() => handleJumpHit("prev")}
                   >
@@ -1071,6 +1072,7 @@ const ArtifactPanelImpl = ({
                     type="button"
                     variant="ghost"
                     size="icon-xs"
+                    aria-label="下一处改动"
                     disabled={!diffData || !!diffError}
                     onClick={() => handleJumpHit("next")}
                   >

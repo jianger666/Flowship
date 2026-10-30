@@ -40,10 +40,12 @@ import {
   sendTextMessage as defaultSendTextMessage,
   uploadImage as defaultUploadImage,
 } from "./lark-api";
+import { classifyLarkFailure, describeLarkError, LarkApiError } from "./types";
 import type {
   CardStreamAppendAskOpts,
   CardStreamHandle,
   CardStreamOptions,
+  LarkFailureKind,
 } from "./types";
 
 // ----------------- 可注入依赖（单测 mock） -----------------
@@ -870,6 +872,68 @@ const withCard = (
   void ensureCardStarted(taskId, turn);
 };
 
+/**
+ * 卡片同步失败的原因拍成一行（给事件流 info 用）：LarkApiError 走结构化描述（带错误码 / api / log_id），
+ * 其它错误退回 message；折叠空白、限长，防止把整段 stderr 刷进事件流。
+ */
+const describeCardFailure = (err: unknown): string => {
+  const raw =
+    err instanceof LarkApiError
+      ? describeLarkError(err)
+      : err instanceof Error
+        ? err.message
+        : typeof err === "string"
+          ? err
+          : "";
+  const oneLine = raw.replace(/\s+/g, " ").trim();
+  if (!oneLine) return "原因未知";
+  return oneLine.length > 160 ? `${oneLine.slice(0, 159)}…` : oneLine;
+};
+
+/** 权限引导链接最长带多少字：超过就不带（见 cardFailureHint） */
+const AUTH_HINT_URL_MAX = 200;
+
+/**
+ * 按失败类别补一句「为什么 / 该怎么办」（R14 B4-3 · Q12a-07）：卡片的几类失败再试也没用，
+ * 光给一个飞书错误码用户看不懂。其它类别（限流 / 瞬时 / 序号冲突 / 流式被关 / 未知）返回空串，沿用原措辞。
+ */
+const cardFailureHint = (kind: LarkFailureKind, err: unknown): string => {
+  switch (kind) {
+    case "gone":
+      return "卡片已不存在（被删除，或超过飞书卡片实体 14 天的有效期）";
+    case "auth": {
+      const url = err instanceof LarkApiError ? err.consoleUrl : undefined;
+      // 链接过长就不带：截断的链接点不开，比没有更糟；也防 info 被一条超长 URL 撑爆
+      const link = url && url.length <= AUTH_HINT_URL_MAX ? `：${url}` : "";
+      return `机器人没有权限操作这张卡片，请到飞书开放平台检查应用权限${link}`;
+    }
+    case "too_long":
+      return "内容超过飞书卡片的大小上限";
+    default:
+      return "";
+  }
+};
+
+/** 熔断打开时当场落的 info 文案：致命故障（再试也不会好）按类别说清后果，普通熔断沿用 B1 的措辞 */
+const describeBreakerOpen = (info: {
+  consecutiveFails: number;
+  error: unknown;
+  fatalKind?: LarkFailureKind;
+}): string => {
+  const reason = describeCardFailure(info.error);
+  switch (info.fatalKind) {
+    case "gone":
+    case "auth":
+      return `飞书卡片无法继续更新（${reason}；${cardFailureHint(info.fatalKind, info.error)}），本轮不再同步到飞书，请在 Flowship 查看回复`;
+    case "too_long":
+      return `飞书卡片内容超出大小上限（${reason}），已暂停实时推送；回复结束时会发送截断版，完整回复请在 Flowship 查看`;
+    case "stream_closed":
+      return `飞书把卡片的流式更新关掉了（${reason}），多次重新打开仍失败，已暂停实时推送；回复结束时会再整卡同步一次`;
+    default:
+      return `飞书卡片连续 ${info.consecutiveFails} 次更新失败（${reason}），已暂停实时推送；回复结束时会再整卡同步一次`;
+  }
+};
+
 const ensureCardStarted = async (
   taskId: string,
   turn: TurnState,
@@ -887,6 +951,19 @@ const ensureCardStarted = async (
     const card = createCardStreamImpl(taskId, {
       title: turn.title,
       streaming: turn.streaming,
+      // 持续性故障（熔断后首次探测仍失败）就当场落一条 info——不用等 finalize：用户此刻就该知道飞书卡片在掉线
+      // （每张卡最多一条；1–2 秒的小抖动探测就恢复、card-stream 不会回调）
+      onBreakerOpen: (info) => {
+        void writeEventAndPublish(taskId, {
+          kind: "info",
+          text: describeBreakerOpen(info),
+        }).catch((logErr) => {
+          console.warn(
+            `[feishu-bridge/outbound] 写熔断提示 info 失败 task=${taskId}:`,
+            logErr instanceof Error ? logErr.message : logErr,
+          );
+        });
+      },
     });
     turn.card = card;
 
@@ -1159,25 +1236,36 @@ const handleAskUser = (
 
 /**
  * 流式卡 finalize 后追发短文本，让用户切走飞书后仍能收到完成推送。
- * 非流式不追（finalize 本就是第一次发卡、通知已在完成时）；stopped 不追（用户自己停的）。
+ * 非流式不追（finalize 本就是第一次发卡、通知已在完成时）——除非卡片没发出去（unsynced）：
+ * 那时用户在飞书里什么都收不到，必须追发；stopped 不追（用户自己停的）。
  * 发送失败只 warn，绝不打断 finalize 链（坑 #10）。
+ *
+ * unsynced = 终稿没落到飞书卡片 / 卡片同步还在持续失败：追发文案必须明说，不能再报「✅ 已完成」
+ * ——用户看到的卡片可能是半截内容，却收到一条「已完成」，会当真。
  */
 const maybeSendCompletionPing = async (
   taskId: string,
   turn: TurnState,
   opts: { ok: boolean; outcome?: "stopped" },
+  unsynced = false,
 ): Promise<void> => {
   // turn.streaming 在 ensureCardStarted 时定稿；undefined = 未建卡（本路径不会进来）
-  if (turn.streaming !== true) return;
+  if (turn.streaming !== true && !unsynced) return;
   if (opts.outcome === "stopped") return;
   // 每轮都追发（2026-07-21 用户拍板去掉原 30s 耗时门槛——卡片更新不推通知、追发是唯一推送）
   const elapsedMs = Date.now() - turn.turnStartedAt;
 
   let text: string;
   if (!opts.ok) {
-    text = "❌ 处理失败，可在卡片重试";
+    text = unsynced
+      ? "❌ 处理失败，飞书卡片没能同步（重试按钮可能不可用），请回 Flowship 查看"
+      : "❌ 处理失败，可在卡片重试";
   } else if (getPendingAsk(taskId)) {
-    text = "🙋 有问题等你回答";
+    text = unsynced
+      ? "🙋 有问题等你回答，但飞书卡片没能同步（选项按钮可能不可用），请回 Flowship 查看"
+      : "🙋 有问题等你回答";
+  } else if (unsynced) {
+    text = `⚠️ 回复没能同步到飞书卡片，请回 Flowship 查看（${formatDuration(elapsedMs)}）`;
   } else {
     // 耗时格式与 card-stream footer 同款（分秒、始终带秒）
     text = `✅ 已完成（${formatDuration(elapsedMs)}）`;
@@ -1246,17 +1334,24 @@ const finalizeTurn = async (
       outcome: opts.outcome,
     });
 
-    // 流式长轮完成后追发短文本推送（放在 finalize 之后、失败 info 之前）
-    await maybeSendCompletionPing(taskId, turn, opts);
+    // 终稿到没到飞书卡片，以 getHealth 为准：只有 finalizeOk === true 才算同步完整。
+    // false = 终稿没落成（含 start 就失败、这一轮飞书里根本没有卡）；undefined = 句柄没给出任何成功信号；
+    // breakerOpen = 此刻仍在持续失败。凡「没有明确成功信号」一律按没同步报，不报喜。
+    // 旧判据 getFailCount() >= 3 是整轮累计值——长轮里零星抖动 3 次就误报、而终稿其实早已到位；
+    // 反过来 finalize 自己失败时累计数可能只有 0~2，又一声不吭
+    const health = card.getHealth();
+    const unsynced = health.finalizeOk !== true || health.breakerOpen;
 
-    // review P1#4 / 坑 #10：连续出向失败要在 app 内可见（每轮最多一条 info）
-    const fails = card.getFailCount();
-    if (fails >= 3) {
+    // review P1#4 / 坑 #10：卡片没同步完整内容要在 app 内可见（每轮最多一条终态 info）。
+    // 先写 info、再追发：追发走同一条 lark 单飞队列，黑洞时可能排队等满 30s 超时——app 内提示不能被它拖慢
+    if (unsynced) {
       try {
+        // 失败类别明确的（卡片没了 / 没权限 / 内容超限）补一句原因与后果，不只丢一个飞书错误码
+        const hint = cardFailureHint(classifyLarkFailure(health.lastError), health.lastError);
         // 系统 info：写+publish 同链（对齐 chat-reply 清队通知写法）
         await writeEventAndPublish(taskId, {
           kind: "info",
-          text: `飞书卡片推送异常（${fails} 次失败），本轮回复可能未同步到飞书`,
+          text: `飞书卡片没能同步完整回复（${describeCardFailure(health.lastError)}${hint ? `；${hint}` : ""}），请在 Flowship 查看本轮回复`,
         });
       } catch (logErr) {
         console.warn(
@@ -1264,7 +1359,23 @@ const finalizeTurn = async (
           logErr instanceof Error ? logErr.message : logErr,
         );
       }
+    } else if (health.truncated) {
+      // 终稿落到了卡片、但是为了塞进飞书的大小上限被截断过：飞书里是截断版，要明说完整回复在哪
+      try {
+        await writeEventAndPublish(taskId, {
+          kind: "info",
+          text: "飞书卡片放不下完整回复（超过飞书卡片的大小上限），卡片里是截断版；完整回复请在 Flowship 查看",
+        });
+      } catch (logErr) {
+        console.warn(
+          `[feishu-bridge/outbound] 写截断提示 info 失败 task=${taskId}:`,
+          logErr instanceof Error ? logErr.message : logErr,
+        );
+      }
     }
+
+    // 流式长轮完成后追发短文本推送（unsynced 时文案明说没同步，不报「已完成」）
+    await maybeSendCompletionPing(taskId, turn, opts, unsynced);
   } catch (err) {
     console.warn(
       `[feishu-bridge/outbound] finalize 失败 task=${taskId}:`,
@@ -1299,6 +1410,10 @@ export const handleFeishuOutboundEvent = async (
   try {
     const enabled = await isBridgeEnabledCached();
     if (!enabled) return;
+
+    // 仅提示类的 error 帧（存储降级 toast 等，advisory:true）不代表本轮 run 失败：别当失败去收尾卡片——
+    // finalizeTurn(ok:false) 会终结进行中的回复卡片、挂「重试」按钮，而 run 其实还在继续
+    if (ev.kind === "error" && ev.advisory) return;
 
     // task / done 事件自带 Task——零成本刷新 mode/title 缓存（标题派生后卡片跟着新）
     if ((ev.kind === "task" || ev.kind === "done") && ev.task) {

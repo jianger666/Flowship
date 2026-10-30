@@ -42,8 +42,10 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { repoTail } from "@/lib/path-utils";
 import type { ActionRecord, Task } from "@/lib/types";
 
+import { gitEnv } from "./git-exec";
 import { stripHostInjectedEnv } from "./host-env";
 import { getActionArtifactPath } from "./task-fs-core";
 import {
@@ -489,8 +491,8 @@ const checkShip = async (
       // 粗匹配兜底：repo 末段名（如 crm-web）与 skip 关键词在 200 字窗口内相邻即算「写了原因」
       // 双向都判（仓名在前 / 关键词在前都算）——agent 自然语序两种都可能、单向会漏检（V0.6.1 review 修）
       // 已知局限：同名末段多仓（/a/client + /b/client）仍可能互相借用说明、公司场景不出现、留 V0.6.4 严格化
-      const repoTail = repo.split("/").filter(Boolean).pop() ?? repo;
-      const tailEsc = repoTail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // 取末段走 repoTail（认反斜杠）：Windows 路径 `C:\w\crm-web` 旧写法整条当仓名、artifact 里永远找不到（R14 Q7b-05）
+      const tailEsc = repoTail(repo).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const forward = new RegExp(`${tailEsc}[\\s\\S]{0,200}(${SKIP_KEYWORDS})`, "i");
       const backward = new RegExp(`(${SKIP_KEYWORDS})[\\s\\S]{0,200}${tailEsc}`, "i");
       if (!forward.test(content) && !backward.test(content)) {
@@ -658,8 +660,9 @@ const gitCapture = async (
       cwd: repoPath,
       timeout: timeoutMs,
       maxBuffer: FINGERPRINT_PART_CAP,
-      // 剔宿主注入变量：git 会读用户仓配置（fsmonitor 钩子 / 外部 diff 驱动 / textconv），不把宿主环境交出去（Q1-01）
-      env: stripHostInjectedEnv(),
+      // 剔宿主注入变量 + GitLab PAT：git 会读用户仓配置（fsmonitor 钩子 / 外部 diff 驱动 / textconv，都是任意命令），
+      // 不把宿主环境和凭据交出去（Q1-01 / R14 Q10-04；见 git-exec.ts）
+      env: gitEnv(),
     });
     return stdout;
   } catch {
@@ -677,8 +680,8 @@ const gitHashObjectStdinPaths = (
     const proc = spawn("git", ["hash-object", "--stdin-paths"], {
       cwd: repoPath,
       windowsHide: true,
-      // 同 gitCapture：hash-object 会跑用户仓配置的 clean 过滤器（filter.<n>.clean 是任意命令）（Q1-04）
-      env: stripHostInjectedEnv(),
+      // 同 gitCapture：hash-object 会跑用户仓配置的 clean 过滤器（filter.<n>.clean 是任意命令）（Q1-04）；PAT 同样不交
+      env: gitEnv(),
     });
     let out = "";
     const timer = setTimeout(() => {
@@ -1052,8 +1055,7 @@ const checkReadonlyRepos = async (
     if (!current) continue;
     const diffs = diffReadonlyRepoState(base, current);
     if (diffs.length > 0) {
-      const tail = original.split("/").filter(Boolean).pop() ?? original;
-      failParts.push(`${tail}（${diffs.join("；")}）`);
+      failParts.push(`${repoTail(original)}（${diffs.join("；")}）`);
     }
   }
   if (failParts.length === 0) {

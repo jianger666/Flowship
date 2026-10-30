@@ -20,6 +20,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { NextResponse } from "next/server";
+import { stripBom } from "@/lib/server/data-root";
 import { DATA_DIR, META_FILE, ensureDataDir, sanitizeId } from "@/lib/server/task-fs-core";
 import {
   cleanupStaleTaskWorktrees,
@@ -159,7 +160,7 @@ export const GET = async () => {
       let updatedAt = 0;
       try {
         const raw = JSON.parse(
-          await fs.readFile(path.join(dir, META_FILE), "utf8"),
+          stripBom(await fs.readFile(path.join(dir, META_FILE), "utf8")),
         ) as {
           title?: string;
           mode?: TaskMode;

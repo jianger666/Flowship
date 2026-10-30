@@ -39,6 +39,7 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useDialog } from "@/hooks/use-dialog";
+import { useMergeMr } from "@/hooks/use-merge-mr";
 import {
   useMrInbox,
   type BugInboxEntry,
@@ -56,6 +57,7 @@ import {
   describeIgnoredEntry,
   type IgnoredEntry,
 } from "@/lib/mr-inbox-ignored-meta";
+import { describeRegressionTransition } from "@/lib/mr-inbox-messages";
 import { formatInboxScanNotice } from "@/lib/mr-inbox-state";
 import {
   buildStoryUrlFromBug,
@@ -343,11 +345,10 @@ const IgnoredSection = () => {
 };
 
 const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
-  const { data, setSeen, mergeMr } = useMrInbox();
-  const { confirm } = useDialog();
+  const { data, setSeen } = useMrInbox();
   const handleIgnore = useIgnoreHandler(entry.mrUrl);
-  // 合并请求进行中（按钮 disabled + 转圈）
-  const [merging, setMerging] = useState(false);
+  // 合并（确认框 + 请求 + 提示 + 防重入）与待回归行共用一份：hooks/use-merge-mr.ts
+  const { merging, merge } = useMergeMr();
   const unread = entry.seenAtMs === null;
 
   const mrTitle =
@@ -357,26 +358,14 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
       return m ? `${m[1]} !${m[2]}` : entry.mrUrl;
     })();
 
-  const handleMerge = async () => {
-    const ok = await confirm({
-      title: "合并这个 MR？",
-      description: `${mrTitle}（${entry.mr?.sourceBranch} → ${entry.mr?.targetBranch}）`,
-      confirmLabel: "合并",
+  const handleMerge = () =>
+    merge({
+      mrUrl: entry.mrUrl,
+      title: mrTitle,
+      sourceBranch: entry.mr?.sourceBranch,
+      targetBranch: entry.mr?.targetBranch,
+      headSha: entry.mr?.headSha,
     });
-    if (!ok) return;
-    setMerging(true);
-    try {
-      // 带上扫描那一刻的源分支 HEAD：作者之后又推了新提交会被服务端拒绝，而不是把没看过的改动一并合入
-      await mergeMr(entry.mrUrl, entry.mr?.headSha);
-      toast.success("MR 已合并");
-    } catch (err) {
-      toast.error(
-        `合并失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      setMerging(false);
-    }
-  };
 
   return (
     <li
@@ -801,24 +790,38 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
 
 /** 待回归行：通过 / 不通过 + 关联 MR 可合时「合并」（语义独立、不耦合） */
 const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
-  const { data, setSeen, transitionBug, mergeMr } = useMrInbox();
+  const { data, setSeen, transitionBug } = useMrInbox();
   const { confirm, prompt } = useDialog();
   const handleIgnore = useIgnoreHandler(entry.bugUrl);
-  // pass / reject / merge 进行中（哪个按钮 busy）
-  const [busy, setBusy] = useState<"pass" | "reject" | "merge" | null>(null);
+  // pass / reject 进行中（哪个按钮 busy）；合并走共享 hook（hooks/use-merge-mr.ts）
+  const [busy, setBusy] = useState<"pass" | "reject" | null>(null);
+  const { merging, merge } = useMergeMr();
   const unread = entry.seenAtMs === null;
 
   const runTransition = async (action: "pass" | "reject", reason?: string) => {
     setBusy(action);
     try {
-      await transitionBug({
+      const result = await transitionBug({
         bugUrl: entry.bugUrl,
         projectKey: entry.projectKey,
         workItemId: entry.workItemId,
         action,
         reason,
       });
-      toast.success(action === "pass" ? "已标记通过并关闭" : "已打回并写评论");
+      const outcome = describeRegressionTransition(action, result);
+      if (outcome.level === "warning") {
+        // 已流转、但原因评论没发出去（Q21-02）：不是失败、也别说「已写评论」——给个「去飞书」补发
+        toast.warning(outcome.text, {
+          action: {
+            label: "去飞书",
+            onClick: () => {
+              window.open(entry.bugUrl, "_blank", "noopener,noreferrer");
+            },
+          },
+        });
+      } else {
+        toast.success(outcome.text);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const bugUrl =
@@ -863,26 +866,15 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
     await runTransition("reject", reason.trim());
   };
 
-  const handleMerge = async () => {
+  const handleMerge = () => {
     if (!entry.mrUrl || !entry.mr) return;
-    const mrTitle = entry.mr.title || entry.mrUrl;
-    const ok = await confirm({
-      title: "合并这个 MR？",
-      description: `${mrTitle}（${entry.mr.sourceBranch} → ${entry.mr.targetBranch}）`,
-      confirmLabel: "合并",
+    return merge({
+      mrUrl: entry.mrUrl,
+      title: entry.mr.title || entry.mrUrl,
+      sourceBranch: entry.mr.sourceBranch,
+      targetBranch: entry.mr.targetBranch,
+      headSha: entry.mr.headSha,
     });
-    if (!ok) return;
-    setBusy("merge");
-    try {
-      await mergeMr(entry.mrUrl, entry.mr.headSha);
-      toast.success("MR 已合并");
-    } catch (err) {
-      toast.error(
-        `合并失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      setBusy(null);
-    }
   };
 
   return (
@@ -949,7 +941,7 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           variant="ghost"
           size="sm"
           className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
-          disabled={busy !== null}
+          disabled={busy !== null || merging}
           onClick={() => void handlePass()}
         >
           {busy === "pass" ? (
@@ -963,7 +955,7 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           variant="ghost"
           size="sm"
           className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
-          disabled={busy !== null}
+          disabled={busy !== null || merging}
           onClick={() => void handleReject()}
         >
           {busy === "reject" ? (
@@ -979,10 +971,10 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
             variant="ghost"
             size="sm"
             className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
-            disabled={busy !== null}
+            disabled={busy !== null || merging}
             onClick={() => void handleMerge()}
           >
-            {busy === "merge" ? (
+            {merging ? (
               <RefreshCw className="size-3 animate-spin" />
             ) : (
               <GitMerge className="size-3" />

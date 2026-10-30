@@ -284,20 +284,34 @@ const fetchCatalogJson = async (): Promise<unknown> => {
 
 const loadIndexes = async (): Promise<{ index: Map<string, CatalogReasoning>; routeIndex: ModelsDevRouteIndex }> => {
   const json = await fetchCatalogJson();
-  return {
-    index: buildModelsDevIndex(json),
-    routeIndex: buildModelsDevRouteIndex(json),
-  };
+  const index = buildModelsDevIndex(json);
+  const routeIndex = buildModelsDevRouteIndex(json);
+  // 校园网 / 公司网关 / 代理常对任意 URL 回 200 + 合法 JSON（`{"error":…}` / `[]` / `{}`）：
+  // res.json() 成功、build 出来却是空表。这不是一份目录——当成功会把旧的好索引换成空表并缓存 24h，
+  // 期间所有自定义模型的 effort 档 / 上下文窗口 / 图像输入都查不到。两张表任一为空都按失败处理
+  // （真实目录两张表都有几百条；只有一张空 = 形状变了，同样不该覆盖旧索引）。
+  if (index.size === 0 || routeIndex.size === 0) {
+    throw new Error(
+      `models.dev 返回内容不是目录（模型 ${index.size} 条 / 带 api 的路由 ${routeIndex.size} 条）`,
+    );
+  }
+  return { index, routeIndex };
 };
 
-/** 24h 缓存；失败用旧索引，没有旧的就空表（列表照出、不猜档） */
+/**
+ * 24h 缓存。失败 / 内容不对用旧索引，没有旧的就空表（列表照出、不猜档）。
+ * 已有成功过的旧索引时是 stale-while-revalidate：过期后调用方立刻拿旧的、刷新放后台；
+ * 只有「从没成功过」才等（否则 24h 过期后断网的用户，每个调用方——含每次建 pi 会话的
+ * `buildRuntime`——每分钟都要陪着等满 2×20 秒，旧索引明明可用）。
+ */
 const refreshIndexes = async (): Promise<CatalogCache> => {
   const slot = cacheSlot();
   if (slot.ts > 0 && Date.now() - slot.ts < CACHE_TTL_MS) return slot;
   // 失败冷却期内别连打目录；空表也算「这次不画档」
   if (slot.errorUntil > Date.now()) return slot;
+  const hasStale = slot.ts > 0;
   if (slot.inflight) {
-    await slot.inflight;
+    if (!hasStale) await slot.inflight;
     return slot;
   }
   const pending = loadIndexes()
@@ -311,15 +325,18 @@ const refreshIndexes = async (): Promise<CatalogCache> => {
     .catch((err: unknown) => {
       slot.inflight = null;
       slot.errorUntil = Date.now() + ERROR_COOLDOWN_MS;
+      const msg = err instanceof Error ? err.message : err;
       if (slot.index.size === 0) {
+        console.warn("[models-dev] 目录拉取失败，effort 不画：", msg);
+      } else {
         console.warn(
-          "[models-dev] 目录拉取失败，effort 不画：",
-          err instanceof Error ? err.message : err,
+          `[models-dev] 目录刷新失败，沿用旧索引、${ERROR_COOLDOWN_MS / 1000} 秒后再试：`,
+          msg,
         );
       }
     });
   slot.inflight = pending;
-  await pending;
+  if (!hasStale) await pending;
   return slot;
 };
 

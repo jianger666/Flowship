@@ -26,14 +26,18 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import v8 from "node:v8";
 
 import type { ConversationStep, InteractionUpdate, Run } from "@cursor/sdk";
 
+import { getChatHotSessions, getChatReclaimCounts } from "./chat-reclaim";
 import { loopLagWindow } from "./loop-lag";
 import { normalizeToolName } from "./normalize-tool-name";
 import { appendPerfRecord, perfJournalEnabled } from "./perf-journal";
 import {
+  buildChatProcTelemetry,
   buildRunRecord,
+  buildV8Telemetry,
   createRunAccumulator,
   type ProcSnapshot,
   type RunOutcome,
@@ -203,12 +207,15 @@ const defaultEnvProvider: EnvProvider = async (agentId, fromMs, toMs) => {
       : {}),
   };
   let store: StoreSnapshot | undefined;
+  // X3：热会话明细里的 agentMB 要问 store；store 拿不到就只给 idleS 等
+  let agentBytesOf: ((id: string) => number | undefined) | undefined;
   try {
     // 动态 import + 只看不开：观测绝不能因为要写一行记录而触发 store 打开
     const { peekSdkStoreHandle } = await import("./sdk-agent-store");
     const { RUN_EVENTS_FILENAME } = await import("./sdk-store-quarantine");
     const handle = await peekSdkStoreHandle();
     if (handle) {
+      agentBytesOf = (id) => handle.fast?.agentStats(id)?.bytes;
       const total = handle.fast?.getStats();
       const mine = handle.fast?.agentStats(agentId);
       const mem = handle.memoryRunEvents?.getStats();
@@ -239,6 +246,22 @@ const defaultEnvProvider: EnvProvider = async (agentId, fromMs, toMs) => {
     }
   } catch {
     // 拿不到 store 信息就省略这一组
+  }
+  // X3（server 堆增长观测）：热 chat 会话 / 回收计数 / V8 堆明细。
+  // 为什么放进每个 run 的汇总：崩溃那一刻进程已经没了，只能靠崩前最后几行记录还原现场——
+  // 以前只有 heapMB(used)，看不出是「热会话在涨」「堆外在涨」还是「分离上下文泄漏」。
+  try {
+    Object.assign(
+      proc,
+      buildChatProcTelemetry(
+        getChatHotSessions(),
+        getChatReclaimCounts(),
+        agentBytesOf,
+      ),
+    );
+    proc.v8 = buildV8Telemetry(v8.getHeapStatistics());
+  } catch {
+    // 遥测取不到就省略，不影响这行记录
   }
   return { proc, store };
 };

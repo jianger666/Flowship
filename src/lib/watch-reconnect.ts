@@ -9,6 +9,7 @@
 
 import type { RunStatus } from "./types";
 import {
+  isStableWatchConnection,
   shouldResumeWatch,
   WATCH_DORMANT_RETRY_INTERVAL_MS,
   type WatchReconnectDecision,
@@ -29,6 +30,21 @@ export const freshWatchBudget = (): WatchBudget => ({
   transientFailures: 0,
   unavailableNotified: false,
 });
+
+/**
+ * 一条连接结束时结算预算（Q16-01）：建连后撑过稳定窗口才清零，返回是否稳定。
+ * 没撑过（建连后立刻被掐断 / 回调立刻抛错 / 从未建连）预算原样不动——失败照常累计，攒到上限才会进入休眠并提示。
+ * hook 在 clean EOF 与 reader 抛错两条路径上、算重连策略之前各调一次；建连只记时刻（establishedAt），不再清零。
+ */
+export const settleWatchBudget = (
+  budget: WatchBudget,
+  establishedAt: number | null,
+  endedAt: number,
+): boolean => {
+  const stable = isStableWatchConnection(establishedAt, endedAt);
+  if (stable) Object.assign(budget, freshWatchBudget());
+  return stable;
+};
 
 // ----------------- 休眠等待 -----------------
 

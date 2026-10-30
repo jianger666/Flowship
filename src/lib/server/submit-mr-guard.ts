@@ -14,6 +14,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import type { ChatTaskAction } from "./chat-pending";
+import { gitEnv } from "./git-exec";
 import type { Task } from "../types";
 import { parseHostFromRemoteUrl, parseProjectPathFromRemoteUrl } from "../git-remote";
 import {
@@ -60,7 +61,7 @@ export const deriveProjectPathFromRepo = async (
     const { stdout } = await execFileAsync(
       "git",
       ["config", "--get", "remote.origin.url"],
-      { cwd: repoPath, timeout: 10_000 },
+      { cwd: repoPath, timeout: 10_000, env: gitEnv() },
     );
     const url = stdout.trim();
     if (!url) return null;
@@ -78,7 +79,7 @@ export const deriveHostFromRepo = async (
     const { stdout } = await execFileAsync(
       "git",
       ["config", "--get", "remote.origin.url"],
-      { cwd: repoPath, timeout: 10_000 },
+      { cwd: repoPath, timeout: 10_000, env: gitEnv() },
     );
     const url = stdout.trim();
     if (!url) return null;

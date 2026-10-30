@@ -45,6 +45,7 @@ import { promisify } from "node:util";
 
 import { formatChangeScope } from "../changes/scope";
 import { getRepoWorkDirs } from "../path-utils";
+import { gitEnv } from "./git-exec";
 import {
   DEFAULT_HASH_LIMITS,
   MAX_HASH_TOTAL_BYTES,
@@ -170,6 +171,8 @@ interface GitRun {
   stdout: string;
   /** 输出超过 maxBuffer（调用方据此降级、不是普通失败） */
   overflow: boolean;
+  /** 失败时 git 自己正常退出的退出码；超时被杀 / 被信号终止 / spawn 失败时为 undefined */
+  exitCode?: number;
 }
 
 const runGit = async (
@@ -183,20 +186,19 @@ const runGit = async (
       timeout: opts?.timeoutMs ?? 20_000,
       maxBuffer: opts?.maxBuffer ?? MAX_LIST_BUFFER,
       encoding: "utf8",
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        // 只读预览：不要去刷新 index（会写 index.lock、跟 agent 的 git 操作抢锁）
-        GIT_OPTIONAL_LOCKS: "0",
-      },
+      // gitEnv()：剔宿主注入变量与 GitLab PAT（status / diff 会执行仓库配置里的 fsmonitor / 外部 diff 驱动 / textconv，
+      // 都是任意命令，见 git-exec.ts），并设 GIT_TERMINAL_PROMPT=0 / GCM_INTERACTIVE=never；
+      // GIT_OPTIONAL_LOCKS=0：只读预览不要去刷新 index（会写 index.lock、跟 agent 的 git 操作抢锁）
+      env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }),
     });
     return { ok: true, stdout, overflow: false };
   } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stdout?: string };
+    const e = err as NodeJS.ErrnoException & { stdout?: string; killed?: boolean; signal?: string | null };
     return {
       ok: false,
       stdout: typeof e.stdout === "string" ? e.stdout : "",
       overflow: e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      exitCode: typeof e.code === "number" && !e.killed && !e.signal ? e.code : undefined,
     };
   }
 };
@@ -389,6 +391,9 @@ interface ResolvedBase extends TaskRepoChangeBase {
 
 const SHA_RE = /^[0-9a-f]{40,64}$/;
 
+/** git 内置的空树对象名（SHA-1 仓）：任何仓里都能直接引用，不用先写进对象库 */
+const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /**
  * 线上分支候选（去重、按优先级）：
  * 手动指定 > 任务记录 > 设置页快照 > origin/HEAD > （仅 chat）常见默认分支名。
@@ -421,7 +426,32 @@ const baseBranchCandidates = async (
 };
 
 /**
- * 解析基线 commit。HEAD 都不存在（空仓）返回 null。
+ * HEAD 解不出来（刚 `git init`、还没有任何提交）：拿空树当基线，已写入的文件全部算新增——
+ * 与 git 官方 pre-commit 钩子样例同口径（「HEAD 解不出就当初始提交、对空树 diff」）。
+ * 典型场景：chat 里让 AI 新建目录、`git init`、搭项目，面板此前整片空白。
+ * 空树对象在 SHA-1 仓里任何时候都能直接引用（不用先写进对象库）；SHA-256 仓里这一步会失败，
+ * 仍返回 null，沿用「仓库还没有任何提交」的不可用提示。
+ * 已知局限：「HEAD 解不出」也包括 HEAD 本身损坏的极罕见情形，这里不区分，会被当成空仓展示。
+ */
+const resolveUnbornBase = async (dir: string): Promise<ResolvedBase | null> => {
+  const tree = await runGit(dir, [
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `${EMPTY_TREE_SHA}^{tree}`,
+  ]);
+  if (!tree.ok || tree.stdout.trim() !== EMPTY_TREE_SHA) return null;
+  return {
+    kind: "empty-tree",
+    label: "空仓库",
+    sha: EMPTY_TREE_SHA,
+    shortSha: EMPTY_TREE_SHA.slice(0, 7),
+    headSha: EMPTY_TREE_SHA,
+  };
+};
+
+/**
+ * 解析基线 commit。HEAD 不存在（空仓）时拿空树当基线（kind = empty-tree）；连空树都解不出才返回 null。
  * 远端引用优先（worktree 就是基于 origin/<base> 切的）、本地分支兜底。
  */
 const resolveBase = async (
@@ -432,7 +462,12 @@ const resolveBase = async (
 ): Promise<ResolvedBase | null> => {
   const head = await runGit(dir, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
   const headSha = head.stdout.trim();
-  if (!head.ok || !SHA_RE.test(headSha)) return null;
+  // 没有任何提交：手动指定的对比基线（override）在这里不适用，直接用空树。
+  // 只有 rev-parse 干净地答了「没有这个提交」（--quiet 下退出码 1）才算空仓；超时被杀 / 128（不是仓库、锁、权限）/
+  // spawn 失败是「读不出」，当空仓会把正常仓库的全部已跟踪文件列成新增——返回 null，沿用不可用提示
+  if (!head.ok || !SHA_RE.test(headSha)) {
+    return !head.ok && head.exitCode === 1 ? resolveUnbornBase(dir) : null;
+  }
 
   const requested = override?.trim() ?? "";
   const overrideOf = (applied: boolean): Pick<ResolvedBase, "override"> =>
@@ -546,7 +581,11 @@ const resolveScope = async (
       value: {
         revs: [resolved.headSha],
         includeUntracked: true,
-        base: { kind: "head", label: "HEAD", shortSha: resolved.headSha.slice(0, 7) },
+        // 空仓没有 HEAD 可言：沿用空树基线的展示，不然会被说成「相对 HEAD」
+        base:
+          resolved.kind === "empty-tree"
+            ? toBase(resolved)
+            : { kind: "head", label: "HEAD", shortSha: resolved.headSha.slice(0, 7) },
         resolved,
       },
     };
@@ -1357,6 +1396,8 @@ const readRepoCommits = async (
 
   const resolved = await resolveBase(root, task, repoPath, opts.baseRef);
   if (!resolved) return empty("no_head");
+  // 空仓（HEAD 还不存在）：没有提交可列，提示与「读不到 HEAD」同一句
+  if (resolved.kind === "empty-tree") return empty("no_head");
   const base = toBase(resolved);
   // 找不到线上分支就界定不了「分支上的提交」——不拿整段历史凑数
   if (resolved.kind !== "merge-base") return { ...empty("no_base"), base };

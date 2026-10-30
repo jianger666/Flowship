@@ -156,6 +156,32 @@ export const nextCardSequence = (cardId: string): number => {
   return next;
 };
 
+/** 序号冲突后向前跳多少（在 `last + 1` 之上再加）：覆盖「服务端那边比我们多走了几步」的情形 */
+const SEQ_CONFLICT_JUMP = 1000;
+
+/**
+ * 飞书回 300317（序号没严格递增）之后调用：把该卡序号直接抬到够高的位置，下一次 `nextCardSequence` 就不会再撞。
+ * 目标 = max(上次 + 1000, 墙钟秒 + 2h)——前者覆盖「别处多走了几步」、后者覆盖「重启后内存 / 盘上都没有记录，
+ * 而卡在上一个进程里已经走到了墙钟前方」（与冷启动 floor 同一套思路，见文件头）。返回抬高后的值（落在 int32 内）。
+ */
+export const bumpCardSequence = (cardId: string): number => {
+  hydrateFromDiskSync();
+  const map = getSeqMap();
+  const last = map.get(cardId) ?? 0;
+  const sec = Math.floor(Date.now() / 1000);
+  const bumped = Math.min(
+    Math.max(last + SEQ_CONFLICT_JUMP, sec + RESTART_SLACK_SEC),
+    INT32_MAX,
+  );
+  if (map.size >= SEQ_MAP_MAX && !map.has(cardId)) {
+    const keys = [...map.keys()].slice(0, Math.floor(SEQ_MAP_MAX / 2));
+    for (const k of keys) map.delete(k);
+  }
+  map.set(cardId, bumped);
+  schedulePersist();
+  return bumped;
+};
+
 /** 单测改节流间隔；传 null 恢复默认 */
 export const __setCardSeqPersistThrottleForTest = (ms: number | null): void => {
   persistThrottleMs = ms == null ? DEFAULT_PERSIST_THROTTLE_MS : ms;

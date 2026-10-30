@@ -137,6 +137,7 @@ import {
 } from "./sdk-deadline";
 import { CANCEL_WAIT_GRACE_MS, createCancelEscape } from "./run-wait";
 import { finalizeOpenToolCalls } from "./finalize-open-tools";
+import { RECONNECT_TOTAL_MAX, createReconnectBudget } from "./reconnect-budget";
 import {
   allocTaskRunInstanceId,
   publishTaskStreamEvent,
@@ -168,6 +169,7 @@ import {
   failQueuedItems,
   getChatQueueCount,
   getChatQueueGeneration,
+  getChatQueueInFlight,
   isMessageOperationTerminal,
   listQueuedChatAttachmentCounts,
   listQueuedChatMessages,
@@ -182,11 +184,29 @@ import {
   persistCheckpointForReply,
 } from "./chat-checkpoint";
 import {
+  getChatLifecycle,
   isChatRewindInProgress,
   isChatStartLeaseValid,
   releaseChatStart,
   tryReserveChatStart,
 } from "./chat-gate";
+import {
+  CHAT_SWEEP_INTERVAL_MS,
+  CHAT_WATERMARK_SOFT_RATIO,
+  SCHEDULED_RUN_RECLAIM_GRACE_MS,
+  chatReclaimBlockReason,
+  defaultChatUsageEstimator,
+  isScheduledRunText,
+  rankReclaimCandidates,
+  recordChatReclaim,
+  registerChatHotProbe,
+  type ChatHotSession,
+  type ChatReclaimBlock,
+  type ChatReclaimCandidate,
+  type ChatReclaimReason,
+  type ChatReclaimSnapshot,
+  type ChatUsageEstimator,
+} from "./chat-reclaim";
 
 // ----------------- 配置 -----------------
 
@@ -275,6 +295,18 @@ interface RunningChatRecord {
   pendingCloseBackground?: number;
   /** 在飞 steer 对「被重连替换」的订阅（steerChatRun 登记、落定即注销）；置标记时同步触发 */
   replacedWaiters?: Set<() => void>;
+  /**
+   * X3：本实例已受理的 run 序号（每次 send / 冷启动首包被 SDK 受理后 +1，见 markChatRunAccepted）。
+   * 为什么要有：定时 run 收尾后的回收宽限计时器要确认「宽限期间没有新 run 开始」——
+   * 新 run（用户回复 / 队列 drain / 后台结果唤醒）开始后，是否回收由那一轮自己的收尾决定。
+   */
+  runSeq?: number;
+  /**
+   * X3：最近一次受理的 run 是不是定时触发（按文本前缀认，见 isScheduledRunText）。每次受理都重算，
+   * 所以用户在定时 run 之后接一句话，这一轮就是 false、回到 12 分钟 TTL。
+   * 自动重连起的新实例不继承它（重连 prompt 不是定时文本）——该实例回落到 TTL 清扫，见 HANDOFF 的 X3 局限。
+   */
+  scheduledRun?: boolean;
 }
 
 /**
@@ -690,28 +722,208 @@ const closeChatSession = (
 
 // mem-governance① [设计决策]：chat 空闲 TTL 2h → 12min（同 task-runner 口径）。
 // 超期走 Agent.resume 接回，体感为 1~2s 冷启动。
+//
+// X3：TTL 不变；变的是「谁来判能不能回收」（三处共用 chatReclaimBlock）和「还有哪两条回收路径」——
+// 定时 run 收尾（scheduleReclaimAfterScheduledRun）与堆水位门（reclaimChatSessionsForWatermark）。
+// 背景：两边接力都是每 10 分钟来一条，会话永远等不到 12 分钟空闲；一个长会话在进程堆里占约 2 GB，
+// 约 6~7 小时堆耗尽、server 崩溃。证据与取舍见 HANDOFF 的 X3 小节。
 const CHAT_IDLE_TTL_MS = 12 * 60 * 1000;
-const CHAT_SWEEPER_KEY = "__flowshipChatSweeperV1__";
+const CHAT_SWEEPER_KEY = "__flowshipChatSweeperV2__";
+// V1（10 分钟拍点、守卫只看 runActive / 后台子代理）的 interval 在 dev hot reload 后可能还活着：
+// 先清掉，免得新旧两套口径同时在回收。
+const LEGACY_CHAT_SWEEPER_KEY = "__flowshipChatSweeperV1__";
+
+/** 回收守卫的现读快照（同步读、不 await——「判完立刻关」之间不能插进别的状态变化） */
+const reclaimSnapshotOf = (
+  taskId: string,
+  rec: RunningChatRecord,
+): ChatReclaimSnapshot => ({
+  hasAgent: rec.agent !== null,
+  lifecycle: getChatLifecycle(taskId),
+  runActive: rec.runActive,
+  // 还有后台子代理在跑：会话不能回收（关会话会把它们一并取消）
+  backgroundRunning:
+    getSubagentSessionControl(rec.agent)?.backgroundRunning() ?? 0,
+  // 队列里等着的 + flush 刚 dequeue 还没 send 成功的（in-flight 槽）
+  queueCount: getChatQueueCount(taskId) + getChatQueueInFlight(taskId),
+  draining: drainingQueues.has(taskId),
+  pendingAsk: !!getPendingAsk(taskId),
+  inflightSteers: rec.inflightSteers?.size ?? 0,
+  pendingBackgroundResults: pendingBackgroundResults.get(taskId)?.length ?? 0,
+  rewindInProgress: isChatRewindInProgress(taskId),
+});
+
+/** 这个会话现在能不能回收：null = 能；否则是原因。空闲清扫 / 定时 run 收尾 / 水位门三处共用同一口径 */
+const chatReclaimBlock = (
+  taskId: string,
+  rec: RunningChatRecord,
+): ChatReclaimBlock | null =>
+  chatReclaimBlockReason(reclaimSnapshotOf(taskId, rec));
+
+/**
+ * 回收一个热会话（keepPersisted：盘上 agentId 保留，下条消息 Agent.resume 接回）。
+ * 调用方必须刚在同一个同步段里用 chatReclaimBlock 确认过放行——这里不重复检查。
+ */
+const reclaimChatSession = (
+  taskId: string,
+  rec: RunningChatRecord,
+  reason: ChatReclaimReason,
+): boolean => {
+  console.log(
+    reason === "idle"
+      ? `[chat-runner] 会话空闲回收 task=${taskId}（可 resume 接回）`
+      : `[chat-runner] 会话回收 task=${taskId} reason=${reason}（可 resume 接回）`,
+  );
+  const closed = closeChatSession(taskId, rec.instanceId, {
+    keepPersisted: true,
+  });
+  // 三处调用方（空闲清扫 / 定时 run 收尾 / 水位门）都在「取表里的活记录 → chatReclaimBlock → 本函数」的同一同步段里，
+  // 所以这里 closeChatSession 恒返回 true；`if (closed)` 是防御（将来调用方若在中间加了 await 才可能为 false，那时不记回收计数）。
+  if (closed) recordChatReclaim(reason);
+  return closed;
+};
+
+/**
+ * 空闲清扫：距最近活跃超过 TTL、且守卫放行的会话回收。
+ * 导出是为了测试能传一个假的「现在」直接驱动，不必靠假时钟去推真 setInterval。返回本次回收数。
+ */
+export const sweepIdleChatSessions = (now: number = Date.now()): number => {
+  let n = 0;
+  for (const [taskId, rec] of runningChats) {
+    if (now - rec.lastActiveAt <= CHAT_IDLE_TTL_MS) continue;
+    if (chatReclaimBlock(taskId, rec) !== null) continue;
+    if (reclaimChatSession(taskId, rec, "idle")) n += 1;
+  }
+  return n;
+};
+
 {
   const g = globalThis as unknown as Record<string, NodeJS.Timeout | undefined>;
+  const legacy = g[LEGACY_CHAT_SWEEPER_KEY];
+  if (legacy) {
+    clearInterval(legacy);
+    g[LEGACY_CHAT_SWEEPER_KEY] = undefined;
+  }
   if (!g[CHAT_SWEEPER_KEY]) {
     g[CHAT_SWEEPER_KEY] = setInterval(() => {
-      const now = Date.now();
-      for (const [taskId, rec] of runningChats) {
-        if (rec.runActive) continue;
-        // 还有后台子代理在跑：会话不能回收（关会话会把它们一并取消）
-        if ((getSubagentSessionControl(rec.agent)?.backgroundRunning() ?? 0) > 0) {
-          continue;
-        }
-        if (now - rec.lastActiveAt > CHAT_IDLE_TTL_MS) {
-          console.log(`[chat-runner] 会话空闲回收 task=${taskId}（可 resume 接回）`);
-          closeChatSession(taskId, rec.instanceId, { keepPersisted: true });
-        }
+      // 清扫器自己抛错不能冒成 uncaughtException 把 server 带崩——防崩批里不能再添新的崩点
+      try {
+        sweepIdleChatSessions();
+      } catch (err) {
+        console.error("[chat-runner] 空闲清扫失败:", err);
       }
-    }, 10 * 60 * 1000);
+    }, CHAT_SWEEP_INTERVAL_MS);
     g[CHAT_SWEEPER_KEY]?.unref?.();
   }
 }
+
+let scheduledReclaimGraceMs = SCHEDULED_RUN_RECLAIM_GRACE_MS;
+/** 仅测试：缩短定时 run 收尾的回收宽限（不传 = 还原） */
+export const __setScheduledReclaimGraceMsForTests = (ms?: number): void => {
+  scheduledReclaimGraceMs = ms ?? SCHEDULED_RUN_RECLAIM_GRACE_MS;
+};
+
+/**
+ * X3(a)：定时触发的 run 自然结束 → 宽限后回收热会话。
+ * 为什么只管定时 run：用户 run 之后用户多半马上接着聊，12 分钟 TTL 够用；定时 run 之后下一条要隔 10~30 分钟，
+ * 留着热会话只是在堆里占着（实测长会话约 2 GB），下次 Agent.resume 一次（约 1~2 秒）就接回来。
+ * 宽限期满再判一遍：实例还是它、期间没有新 run 受理（runSeq 没变）、守卫放行才回收；
+ * 否则放弃——有新 run 的话由那一轮自己的收尾决定，被守卫挡住的（后台子代理 / 队列 / 待答…）退回 12 分钟 TTL 清扫。
+ */
+const scheduleReclaimAfterScheduledRun = (
+  taskId: string,
+  rec: RunningChatRecord,
+): void => {
+  const instanceId = rec.instanceId;
+  const seq = rec.runSeq ?? 0;
+  const timer = setTimeout(() => {
+    try {
+      const cur = runningChats.get(taskId);
+      if (!cur || cur.instanceId !== instanceId) return;
+      if ((cur.runSeq ?? 0) !== seq) return;
+      const blocked = chatReclaimBlock(taskId, cur);
+      if (blocked !== null) {
+        console.log(
+          `[chat-runner] 定时 run 收尾后暂不回收 task=${taskId}（${blocked}），交给空闲清扫`,
+        );
+        return;
+      }
+      reclaimChatSession(taskId, cur, "scheduled-end");
+    } catch (err) {
+      console.error(`[chat-runner] 定时 run 收尾回收失败 task=${taskId}:`, err);
+    }
+  }, scheduledReclaimGraceMs);
+  timer.unref?.();
+};
+
+/**
+ * 记一次 run 受理（agent.send / 冷启动首包被 SDK 受理、实例仍是当前后调）：
+ * runSeq +1，并按发给 agent 的文本认出这一轮是不是定时触发。
+ */
+const markChatRunAccepted = (
+  rec: RunningChatRecord,
+  agentText: string,
+): void => {
+  rec.runSeq = (rec.runSeq ?? 0) + 1;
+  rec.scheduledRun = isScheduledRunText(agentText);
+};
+
+/**
+ * X3(b)：堆水位门的回收动作——回收「空闲、守卫放行」的热会话，占用（SDK store 里该会话的数据量）从大到小，
+ * 永远不动 exceptTaskId（本次要服务的会话）。每回收一个就复读堆占用，降到软水位以下就停。
+ * ⚠️ V8 回收有滞后：刚关掉的会话对象要等下一次 GC 才真还堆，所以复读值未必立刻降——实机上多半会把
+ * 全部候选回收完。这是安全的（回收只是让会话变冷，下条消息 resume 接回），只是比「刚好够」多回收几个。
+ */
+export const reclaimChatSessionsForWatermark = async (opts: {
+  exceptTaskId?: string;
+  /** 当前堆占用比（used / limit）；调用方传 sdk-store-gc 的 heapPressure().ratio，测试可注入序列 */
+  heapRatio: () => number;
+  estimate?: ChatUsageEstimator;
+}): Promise<number> => {
+  const estimate = opts.estimate ?? defaultChatUsageEstimator;
+  const cands: ChatReclaimCandidate[] = [];
+  for (const [taskId, rec] of runningChats) {
+    if (taskId === opts.exceptTaskId) continue;
+    if (chatReclaimBlock(taskId, rec) !== null) continue;
+    cands.push({ taskId, usageBytes: 0, lastActiveAt: rec.lastActiveAt });
+  }
+  for (const c of cands) {
+    const agentId = runningChats.get(c.taskId)?.agentId;
+    if (!agentId) continue;
+    try {
+      c.usageBytes = (await estimate(agentId)) ?? 0;
+    } catch {
+      /* 估算只用来排顺序，取不到当 0 */
+    }
+  }
+  let n = 0;
+  for (const c of rankReclaimCandidates(cands, opts.exceptTaskId)) {
+    if (opts.heapRatio() < CHAT_WATERMARK_SOFT_RATIO) break;
+    const rec = runningChats.get(c.taskId);
+    if (!rec) continue;
+    // 估算有 await：回收前同步复核——期间可能已有新 run / 新队列项
+    if (chatReclaimBlock(c.taskId, rec) !== null) continue;
+    if (reclaimChatSession(c.taskId, rec, "watermark")) n += 1;
+  }
+  return n;
+};
+
+// X3(c)：run-perf 遥测经它读「现在有哪些热会话」（run-perf 不能反向 import 本模块：本模块 import 它）
+registerChatHotProbe((): ChatHotSession[] => {
+  const now = Date.now();
+  const out: ChatHotSession[] = [];
+  for (const [taskId, rec] of runningChats) {
+    out.push({
+      taskId,
+      agentId: rec.agentId,
+      idleMs: Math.max(0, now - rec.lastActiveAt),
+      runActive: rec.runActive,
+      backgroundRunning:
+        getSubagentSessionControl(rec.agent)?.backgroundRunning() ?? 0,
+    });
+  }
+  return out;
+});
 
 /**
  * 中断 chat（按 taskId）、返回是否真有会话被停。
@@ -1692,6 +1904,8 @@ export const runChatSession = async (
     // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 接回
     cur.agentId = agent.agentId;
     cur.agent = agent;
+    // X3：首包已受理——记序号并按首条消息文本认出这一轮是不是定时触发（冷启动路径的定时 run 同样要回收）
+    markChatRunAccepted(cur, firstMessage?.text ?? "");
     void setTaskSessionAgentId(task.id, agent.agentId);
 
     // 首轮成功后 fire-and-forget 用 SDK auto 生成短标题（搭车本轮 apiKey；
@@ -1822,6 +2036,9 @@ const registerChatNotifier = (
  * @param opts.startToken 调用方已持启动 lease 时传入（send-now 链路）：复用该
  *   lease、不自行 tryReserveChatStart、也不在 finally 代释放（owner 的 finally
  *   统一放）。不传则维持旧行为：自预约、finally 自释放。
+ * @param opts.onFatalError Agent.resume 抛了**确定性**错误（agent 不存在 / 凭据失效 / 模型下线…，已条件清锚点）时同步回调一次，
+ *   参数是那个错误（R14 Q8-05）。网络类失败（保留锚点、可重试）不回调。返回值仍是 null——没有这个回调，调用方分不清
+ *   「再试一次可能就好」和「再试也没用」（自动重连因此对确定性失败也白退避 5 次、最后报的还是最初的网络错）。
  * @returns claim 是实例化 token——成功返回注册的 instanceId，owner 后续
  *   send/release 必须带它做精确匹配；失败返 null。不再返布尔，防止旧 owner 越权
  *   操作 stop/forceClear 之后换上来的新实例。
@@ -1829,7 +2046,11 @@ const registerChatNotifier = (
 export const resumeChatSession = async (
   task: Task,
   bootArgs: { apiKey: string; model: ModelSelection },
-  opts: { claimRun?: boolean; startToken?: number } = {},
+  opts: {
+    claimRun?: boolean;
+    startToken?: number;
+    onFatalError?: (err: unknown) => void;
+  } = {},
 ): Promise<number | null> => {
   // 同步段：任何 await 之前完成门闩/预约检查（Node 单线程 check-and-set 原子）
   if (!task.sessionAgentId || runningChats.has(task.id)) return null;
@@ -1966,6 +2187,12 @@ export const resumeChatSession = async (
       `[chat-runner] task=${task.id} Agent.resume 失败（条件清锚点、降级新会话）`,
       err,
     );
+    // R14 Q8-05：把「确定性失败」告诉调用方（自动重连据此立即放弃，不再白退避）。回调只是记录，抛错不能影响这里的收尾
+    try {
+      opts.onFatalError?.(err);
+    } catch {
+      /* 回调只用于记录 */
+    }
     // 条件清（chat 侧）——finalGuard 每次 rename 前复查本闭包。
     // 必须现查（非入场快照）：内存无后继 session + 本链 start lease 仍 valid。
     if (task.sessionAgentId) {
@@ -1988,6 +2215,13 @@ export const resumeChatSession = async (
 
 const RECONNECT_MAX = 5;
 const RECONNECT_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000, 30_000];
+
+/**
+ * R14 Q8-05：自动重连链「放弃」时要报给用户的真因。确定性的 resume 失败（agent 不存在 / 凭据失效 / 模型下线…）
+ * 立刻放弃、并把那个错误记在这里，由 consumeChatRun 的放弃收尾使用——而不是白退避 5 次（≈59 秒）之后
+ * 报最初的网络错误，把真因只留在 console。链上的每一层递归共用同一个对象。
+ */
+type ReconnectOutcome = { giveUpErr?: unknown };
 
 // 服务端凭据兜底（重连时没有 client bootArgs）：读 config.json
 const readServerChatCreds = async (
@@ -2049,6 +2283,9 @@ const sleepWithCancel = async (
  *   门控键必须是 instanceId 而非 agentId——退避期间用户 chat-reply 会
  *   `Agent.resume(task.sessionAgentId)` 恢复同一持久化 agent，新实例 agentId 与
  *   stale 相同；instanceId 每次注册都换新号，才能区分「坏实例」和「用户新恢复的实例」。
+ * @param reconnectTotal 本条 consume 链此前累计的重连总次数（R14 Q8-04）——**不随「重连恢复后归零」重置**，
+ *   只做「每圈都先吐一点再断」这种无限环的硬上限兜底（RECONNECT_TOTAL_MAX，与 task 侧同口径）。
+ * @param outcome 放弃时的真因出口（见 ReconnectOutcome）；不传 = 不关心。
  */
 const tryChatAutoReconnect = async (
   task: Task,
@@ -2056,8 +2293,14 @@ const tryChatAutoReconnect = async (
   attempt: number,
   isCancelled: () => boolean,
   staleInstanceId: number | undefined,
+  reconnectTotal = 0,
+  outcome?: ReconnectOutcome,
 ): Promise<boolean> => {
   if (attempt > RECONNECT_MAX) return false;
+  // R14 Q8-04：attempt 会在「重连后真有产出」时归零（见 consumeChatRun 的 reconnectBudget），
+  // 这里另记一个不归零的总次数——「每圈都先吐一点再断」也不能无限重连下去
+  const total = reconnectTotal + 1;
+  if (total > RECONNECT_TOTAL_MAX) return false;
   const msg = err instanceof Error ? err.message : String(err);
   if (!isRetryableRunError(msg, err, attempt)) return false;
   if (isCancelled()) return false;
@@ -2081,6 +2324,8 @@ const tryChatAutoReconnect = async (
       attempt,
       isStopped,
       staleInstanceId,
+      total,
+      outcome,
     );
     if (!handled && stoppedByUser) {
       // 用户 stop 中断了重连（退避/resume 期间）：stop 路由已清队、归位 idle、
@@ -2110,6 +2355,9 @@ const runReconnectAttempt = async (
   attempt: number,
   isCancelled: () => boolean,
   staleInstanceId: number | undefined,
+  /** 已把本次计入的重连总次数（tryChatAutoReconnect 算好传来；递归 / 接力 consume 时原样往下带） */
+  reconnectTotal: number,
+  outcome?: ReconnectOutcome,
 ): Promise<boolean> => {
   const task = fresh;
   // preamble 授权收紧——仅「map 里仍是本 stale instance」才落盘；
@@ -2181,16 +2429,32 @@ const runReconnectAttempt = async (
   const creds = await readServerChatCreds(fresh);
   if (!creds) return false;
   // 重连方是 reconnect prompt 的 owner——认领首发，排队消息等本 run 结束后统一 flush
+  // R14 Q8-05：resume 抛了「确定性」错误（agent 不存在 / 凭据失效 / 模型下线…；resumeChatSession 已条件清锚点）
+  // 就记在这里——再退避重试也不会好。容器对象而不是 let：TS 不追踪回调里的赋值，let 会被窄化成 never
+  const resumeFailure: { fatal?: { err: unknown } } = {};
   const claimedInstanceId = await resumeChatSession(fresh, creds, {
     claimRun: true,
+    onFatalError: (e) => {
+      resumeFailure.fatal = { err: e };
+    },
   }).catch(() => null);
   if (claimedInstanceId === null) {
+    if (resumeFailure.fatal) {
+      // 立刻放弃：白退避 5 次（≈59 秒）只会让用户多等一分钟；放弃时报的是 resume 的真因，不是最初的网络错
+      if (outcome) outcome.giveUpErr = resumeFailure.fatal.err;
+      console.warn(
+        `[chat-runner] task=${fresh.id} 重连时 resume 遇确定性错误、不再重试（第 ${attempt} 次）`,
+      );
+      return false;
+    }
     return tryChatAutoReconnect(
       fresh,
       err,
       attempt + 1,
       isCancelled,
       staleInstanceId,
+      reconnectTotal,
+      outcome,
     );
   }
   const rec = runningChats.get(task.id);
@@ -2264,6 +2528,22 @@ const runReconnectAttempt = async (
     // 此前任何失败 / 停止出口都还没碰过暂存——它要么继续留给下一次重连、要么由链尾（consumeChatRun）统一清掉，
     // 不会出现「已放回新实例又随僵尸实例被关而静默丢掉」
     restoreStashedBackgroundResults(task.id, curAfterSend);
+    // R14 Q8-02：断线那一刻还没配对的 tool_call，旧会话再也不会给它完成帧（新会话从 reconnect prompt 重新开始），
+    // 不在这里闭合就会一直转圈、计入「运行中」，直到整轮结束才补一条位置错乱的「已中断」。
+    // 此时新 run 的流还没人消费、事件流里的未配对 tool_call 必然都是旧 run 留下的，闭合是安全的。
+    // 同时按 task 级口径停掉旧会话的后台 shell 追踪并把标记收成 ended(run-ended)（只是让界面不再转圈、不杀进程）——
+    // 与会话重建 / run 收尾一致。必须自己 try/catch：这里在 try 块内，抛出会被下面当成 send 失败、关掉刚接上的实例
+    try {
+      await finalizeOpenToolCalls(
+        task.id,
+        () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
+      );
+    } catch (finalizeErr) {
+      console.warn(
+        `[chat-runner] task=${task.id} 重连后闭合未完成工具失败（不影响续跑）:`,
+        finalizeErr,
+      );
+    }
     // owner 语境（重连链、send 后已验实例）——claimedInstanceId lease
     await writeOwnedEventAndPublish(
       task.id,
@@ -2274,7 +2554,7 @@ const runReconnectAttempt = async (
         meta: { kind: "reconnected", attempt },
       },
     );
-    await consumeChatRun(fresh, run, undefined, attempt);
+    await consumeChatRun(fresh, run, undefined, attempt, reconnectTotal);
     return true;
   } catch (sendErr) {
     // send pending 期间被用户 stop（claim cancel 已摘表 + 落标记）、随后 send
@@ -2296,6 +2576,8 @@ const runReconnectAttempt = async (
       attempt + 1,
       isCancelled,
       rec.instanceId,
+      reconnectTotal,
+      outcome,
     );
   }
 };
@@ -2360,6 +2642,9 @@ const finalizeChatRunIfCurrent = async (
     void flushChatQueue(taskId);
     // 这一轮结束期间到达、没来得及插进去的后台子代理结果：现在送（空闲则唤醒一轮）
     void drainBackgroundResults(taskId);
+    // X3(a)：定时触发的 run 自然结束 → 宽限后回收热会话（用户 run 保持 12 分钟 TTL）。
+    // 放在 flush / drain 之后：它们同步占位（drainingQueues / runActive），宽限期满的守卫能看见。
+    if (rec.scheduledRun) scheduleReclaimAfterScheduledRun(taskId, rec);
     return true;
   }
 
@@ -2707,7 +2992,13 @@ const consumeChatRun = async (
   externallyCancelled?: () => boolean,
   // V0.13.x 自动重连计数（tryChatAutoReconnect 递归时递增、防无限重连）
   reconnectAttempt = 0,
+  // R14 Q8-04：本条 consume 链累计的重连总次数（不随预算归零重置；RECONNECT_TOTAL_MAX 硬上限）
+  reconnectTotal = 0,
 ): Promise<void> => {
+  // R14 Q8-04：重连预算。重连后的会话真有产出（assistant 正文 / thinking / tool_call / usage）就归零——
+  // 否则一个跑几小时、期间断过几次网的会话，累计 5 次后下一次断线直接被判「放弃」，
+  // 而 task 侧早就是「恢复后归零」（reconnect-budget.ts 是两边共用的口径）
+  const reconnectBudget = createReconnectBudget(reconnectAttempt);
   let cancelled = false;
   // 24h 硬超时：跟用户点停止分开，未答提问打 askExpired（UI「已过期」）
   let hardTimedOut = false;
@@ -2780,6 +3071,13 @@ const consumeChatRun = async (
         perfFirstEventSeen = true;
         console.log(
           `[perf] task=${task.id} first-event ms=${Date.now() - perfStreamStart}`,
+        );
+      }
+      // R14 Q8-04：重连后的会话真有产出了 → 预算归零（system / status 不算，见 reconnect-budget.ts）。
+      // 放在 handleSdkMessage 之前：信号只关心「流上来了什么」，与本地落盘是否成功无关
+      if (reconnectBudget.noteSdkMessage(msg)) {
+        console.log(
+          `[chat-runner] task=${task.id} 重连后已收到新消息、重连预算归零`,
         );
       }
       // handleSdkMessage 内部已在 thinking / tool_call case 自己 flush buffer
@@ -2886,12 +3184,16 @@ const consumeChatRun = async (
     // V0.13.x：网络类失败先自动重连（重试 5 次、事件流显示「重连中」）
     // /J1：传入本 run 的 instanceId 作 staleInstanceId
     // 清队挪进 finalize error/cancelled——重连路径不再 fail-open 清队
+    const reconnectOutcome: ReconnectOutcome = {};
     const handled = await tryChatAutoReconnect(
       task,
       err,
-      reconnectAttempt + 1,
+      // 已用次数 + 1：重连后有过产出则 used 已归零，这次断线从「第 1 次」重新计
+      reconnectBudget.used + 1,
       () => cancelled || !!externallyCancelled?.(),
       myInstanceId >= 0 ? myInstanceId : undefined,
+      reconnectTotal,
+      reconnectOutcome,
     );
     // 重连链已走完（接管成功 / 放弃 / 被停止 / 让位）。接管成功时暂存的后台结果早已放回新实例；
     // 还留在暂存里的就是没等到可送会话的（放弃 / 停止 / 让位）——不留给以后的任何会话，
@@ -2906,11 +3208,20 @@ const consumeChatRun = async (
       // 表内仍是本实例（首轮就判不可重试等、未进退避）仍走常规 error 收尾；
       // 表内是别的实例 = 用户新起的 run，两条路径都不碰。
       const slotGone = myInstanceId >= 0 && !runningChats.has(task.id);
+      // R14 Q8-05：重连时 resume 遇确定性错误 → 报那个真因（agent 不存在 / 凭据失效…），不是最初的网络错；
+      // 最初的流错误仍记在日志里（它是起因）
+      const giveUpErr = reconnectOutcome.giveUpErr ?? err;
+      if (reconnectOutcome.giveUpErr !== undefined) {
+        console.warn(
+          `[chat-runner] task=${task.id} 自动重连因 resume 确定性失败放弃；起因的流错误:`,
+          err,
+        );
+      }
       if (slotGone) {
-        console.error("[chat-runner] task", task.id, "自动重连放弃:", err);
-        await finalizeReconnectGaveUp(task, err);
+        console.error("[chat-runner] task", task.id, "自动重连放弃:", giveUpErr);
+        await finalizeReconnectGaveUp(task, giveUpErr);
       } else {
-        await handleChatRunFailure(task, err, myInstanceId);
+        await handleChatRunFailure(task, giveUpErr, myInstanceId);
       }
     }
   } finally {
@@ -3385,6 +3696,8 @@ export const sendChatMessage = async (
     return wasCancelled ? "cancelled" : "owner_invalid";
   }
   rec.lastActiveAt = Date.now();
+  // X3：run 已受理——记序号并按文本认出这一轮是不是定时触发（收尾时据此决定要不要回收会话）
+  markChatRunAccepted(rec, text);
 
   // 切 running + fire-and-forget 消费
   //（此 await 期间若 stop：共享取消闭包已持 acceptedRun、会直接 cancel run）
@@ -3813,6 +4126,19 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
     !isChatRewindInProgress(taskId)
   ) {
     void flushChatQueue(taskId);
+  } else if (
+    // R14 Q8-01 兜底：drainBackgroundResults 撞上本轮 draining（或队列非空）会让位给用户排队的话；
+    // 本轮若没能发出任何消息（读任务失败清队 / 发送失败整队作废 / 队首作废…），就不会再有 run 收尾来调它，
+    // 攒着的后台结果会一直卡着——队列已空、会话空闲、确有攒着的结果时补一次（drain 对「没东西」直接返回、幂等）。
+    // 不看 rewind 门闩：rewind 恰好在 flush 收尾这几毫秒占着门闩时，drain 自己会处理——
+    // 会话空闲就 scheduleQueueDrainAfterGate 等门闩解除再补（回退若最终被拒，结果照样送出；成功则会话关闭、结果随之作废）；
+    // 这里若也拦着，就没有任何人再调 drain，结果会一直卡到下一轮收尾或用户发话（审查 AI R14 B3-3 预审 BQ11）
+    getChatQueueCount(taskId) === 0 &&
+    getPendingBackgroundResultCount(taskId) > 0 &&
+    !drainingQueues.has(taskId) &&
+    !isChatRunActive(taskId)
+  ) {
+    void drainBackgroundResults(taskId);
   }
 };
 
@@ -3977,6 +4303,17 @@ export const drainBackgroundResults = async (taskId: string): Promise<void> => {
   }
 
   // 空闲：唤醒一轮
+  // R14 Q8-01：用户排了队的话先走。run 收尾时 finalize 先 `void flushChatQueue`、再 `void drainBackgroundResults`——
+  // flush 在第一个 await 前已置 draining，这里若照旧直接 sendChatMessage，后台结果就抢在已排队的用户消息前面
+  // 起了下一轮（排队消息 202 之后被插队），用户那条还得再等一整轮。所以队列非空 / 正在排空 / 有出队在飞的那条时让位：
+  // 用户消息送出后那一轮收尾会再调本函数；若这一轮根本没发出消息（清队 / 发送失败），由 flushChatQueue 收尾补调
+  if (
+    getChatQueueCount(taskId) > 0 ||
+    drainingQueues.has(taskId) ||
+    getChatQueueInFlight(taskId) > 0
+  ) {
+    return;
+  }
   const batch = queued.splice(0);
   // 这批已 splice 出队、到达时也落过「将转交」，只有本函数手里拿着它：读任务抛错（meta 半写 / EIO）时
   // 不能让异常把它带走——外层只会 console.warn，用户就以为交给了主 AI，实际悄悄没了。如实补一句「未送达」

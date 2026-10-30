@@ -24,6 +24,7 @@ import {
   type Task,
   type TaskSummary,
 } from "@/lib/types";
+import { repoTail as repoPathTail } from "@/lib/path-utils";
 import { starredIdsForProvider } from "@/lib/starred-models";
 import {
   createTask,
@@ -146,7 +147,7 @@ const repoTailOfAll = (repoPaths: string[] | undefined): string[] => {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const p of repoPaths ?? []) {
-    const tail = p.trim().replace(/\/+$/, "").split("/").filter(Boolean).pop();
+    const tail = repoPathTail(p.trim().replace(/[\\/]+$/, ""));
     if (tail && !seen.has(tail)) {
       seen.add(tail);
       out.push(tail);

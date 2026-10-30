@@ -28,7 +28,7 @@ import { promisify } from "node:util";
 
 import type { RewindFailureCode } from "@/lib/rewind-failure";
 import type { Task, TaskEvent } from "@/lib/types";
-import { renameWithRetry } from "./data-root";
+import { renameWithRetry, writeFileFsynced } from "./data-root";
 import { isDirGoneError } from "./fs-gone";
 import {
   endChatRewind,
@@ -38,11 +38,12 @@ import {
 } from "./chat-gate";
 import { failQueuedItems, getChatQueueCount } from "./chat-queue";
 import { failpoint } from "./failpoints";
-import { stripHostInjectedEnv } from "./host-env";
+import { gitEnv } from "./git-exec";
 import { buildTargetFoldSet, isTargetTreeAlias } from "./rewind-target-alias";
 import {
   EVENTS_FILE,
   readEvents,
+  readEventsWithOffsets,
   readMetaV06,
   readMetaV06Evidence,
   taskDir,
@@ -198,9 +199,10 @@ const runGit = async (
       cwd: repoPath,
       timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
       maxBuffer: CHECKPOINT_GIT_MAX_BUFFER,
-      // 剔宿主注入变量（ELECTRON_RUN_AS_NODE / PORT / __NEXT_PRIVATE_* …）：read-tree -u / checkout 会触发用户仓的
-      // post-checkout / post-index-change 等钩子，钩子整份继承 server 环境会拿到这些变量（第四轮 Q3-14）
-      env: { ...stripHostInjectedEnv(), ...(opts.env ?? {}) },
+      // 走 gitEnv()：剔宿主注入变量（ELECTRON_RUN_AS_NODE / PORT / __NEXT_PRIVATE_* …）与 GitLab PAT——read-tree -u / checkout
+      // 会触发用户仓的 post-checkout / post-index-change 等钩子，钩子整份继承 server 环境会拿到它们（第四轮 Q3-14 / R14 Q10-04）；
+      // opts.env（如 GIT_INDEX_FILE）叠在最后
+      env: gitEnv(opts.env),
     });
     return {
       ok: true,
@@ -636,7 +638,8 @@ export const writeRewindPoints = async (
     .toString(36)
     .slice(2, 8)}`;
   try {
-    await fs.writeFile(tmpPath, body, "utf-8");
+    // fsync(tmp) 之后才 rename：防断电后 rewind_points 变空——回退点全丢（Q9-04）
+    await writeFileFsynced(tmpPath, body);
     await renameWithRetry(tmpPath, finalPath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
@@ -1119,16 +1122,21 @@ export const persistCheckpointForReply = async (
 
 // ----------------- 截断 events.jsonl -----------------
 
-/** 原子写文本文件（tmp + rename），供 events / 后置失败恢复复用 */
+/**
+ * 原子写文本文件（tmp（fsync）+ rename），供 events / 后置失败恢复复用。
+ *
+ * fsync(tmp) 之后才 rename（Q9-04）：回退重写是整份 events.jsonl 覆盖——断电后只有 tmp + rename 的话，
+ * 可能得到 0 字节的 events.jsonl，整段对话归零。`body` 是 Uint8Array 时按字节原样写（见 `writeFileFsynced`）。
+ */
 const atomicWriteTextFile = async (
   finalPath: string,
-  body: string,
+  body: string | Uint8Array,
 ): Promise<void> => {
   const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
     .toString(36)
     .slice(2, 8)}`;
   try {
-    await fs.writeFile(tmpPath, body, "utf-8");
+    await writeFileFsynced(tmpPath, body);
     await renameWithRetry(tmpPath, finalPath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
@@ -1136,13 +1144,16 @@ const atomicWriteTextFile = async (
   }
 };
 
-/** 读 events.jsonl 原文（文件不存在 → ""）；后置失败时写回用 */
-const readEventsRawText = async (taskId: string): Promise<string> => {
+/**
+ * 读 events.jsonl 的原始字节（文件不存在 → 空）；后置失败时写回用。
+ * 读字节、不读文本（Q9-08）：坏行里可能有非 UTF-8 的字节，转成字符串会被悄悄改写成 U+FFFD，写回的就不是原文了。
+ */
+const readEventsRawBytes = async (taskId: string): Promise<Buffer> => {
   const p = path.join(taskDir(taskId), EVENTS_FILE);
   try {
-    return await fs.readFile(p, "utf-8");
+    return await fs.readFile(p);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return Buffer.alloc(0);
     throw err;
   }
 };
@@ -1161,18 +1172,18 @@ export const truncateEventsBeforeEventId = async (
   eventId: string,
 ): Promise<{ kept: TaskEvent[]; truncatedCount: number } | null> =>
   withEventAppendChain(taskId, async () => {
-    const events = await readEvents(taskId);
+    // 带偏移读：要「保留目标之前的原文」（Q9-08），就得知道目标那一行从哪个字节开始
+    const { events, offsets, raw } = await readEventsWithOffsets(taskId);
     const idx = events.findIndex((e) => e.id === eventId);
     if (idx < 0) return null;
     const kept = events.slice(0, idx);
     const truncatedCount = events.length - kept.length;
 
+    // 目标行行首之前的字节原样保留——包括读不出来的坏行 / 空行 / CRLF。旧实现是「解析 → slice → 重新序列化」，
+    // 坏行在这一步被永久抹掉，而用户只是想「回退一下」；留着它，事后还有机会用 xxd / 手工修复捞回来。
+    // 正常文件（每行都是 JSON.stringify 写的）两种做法字节完全一致；kept 为空时得到空文件，与旧实现相同。
     const finalPath = path.join(taskDir(taskId), EVENTS_FILE);
-    const body =
-      kept.length === 0
-        ? ""
-        : kept.map((e) => JSON.stringify(e)).join("\n") + "\n";
-    await atomicWriteTextFile(finalPath, body);
+    await atomicWriteTextFile(finalPath, raw.subarray(0, offsets[idx]!));
     return { kept, truncatedCount };
   });
 
@@ -1182,15 +1193,28 @@ export const truncateEventsBeforeEventId = async (
  * - 备份之后文件只被追加（现状就是这种：走到这条补偿路径时截断没有成功、文件没动，期间只可能有旁路
  *   run 追加）→ 当前内容以备份为前缀，什么都不用做——原样写回备份反而会把这期间追加的行抹掉；
  * - 当前内容不以备份为前缀（文件被改写过，截断落了盘却走到这里，按设计不该发生）→ 写回备份，保持旧行为。
+ *
+ * `backup` 按**字节**比较、按字节写回（Q9-08：坏行里的非 UTF-8 字节不能被改写）；传 string 时按 UTF-8 编码，兼容旧调用方。
+ * 名字里的 Text 是历史遗留，为了不动所有引用它的测试而保留。
  */
 export const restoreEventsRawText = (
   taskId: string,
-  backup: string,
+  backup: Buffer | string,
 ): Promise<void> =>
   withEventAppendChain(taskId, async () => {
-    const current = await readEventsRawText(taskId);
-    if (current.startsWith(backup)) return;
-    await atomicWriteTextFile(path.join(taskDir(taskId), EVENTS_FILE), backup);
+    const backupBytes =
+      typeof backup === "string" ? Buffer.from(backup, "utf-8") : backup;
+    const current = await readEventsRawBytes(taskId);
+    if (
+      current.length >= backupBytes.length &&
+      current.subarray(0, backupBytes.length).equals(backupBytes)
+    ) {
+      return;
+    }
+    await atomicWriteTextFile(
+      path.join(taskDir(taskId), EVENTS_FILE),
+      backupBytes,
+    );
   });
 
 // ----------------- rewind 主流程 -----------------
@@ -1564,7 +1588,7 @@ export const executeChatRewind = async (
       }
 
       // 截断前备份 events 原文：后置写盘失败时原子写回（文件可能本就不存在）
-      const eventsRawBackup = await readEventsRawText(taskId);
+      const eventsRawBackup = await readEventsRawBytes(taskId);
 
       // 3–5) 截断 / 裁剪 rewind_points / 写 meta；失败则回滚仓 + 尽量恢复 events / points
       // closeSession 挪到写盘成功之后（纯内存、不会失败；门闩已挡新消息，无并发风险）

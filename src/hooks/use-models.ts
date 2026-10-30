@@ -138,6 +138,10 @@ export const useModels = (): UseModelsResult => {
     if (!silent) {
       setLoading(true);
       setError("");
+    } else {
+      // 静默请求自己不转圈，但它可能刚抢占了一条在飞的非静默请求：被抢占那条的 finally 因 aborted 不复位 loading，
+      // 这里不复位就永久卡在 true（刷新按钮一直转圈、custom provider 的「手填模型 ID」入口被一并藏起来）
+      setLoading(false);
     }
 
     try {
@@ -183,7 +187,7 @@ export const useModels = (): UseModelsResult => {
         toast.error(err instanceof Error ? err.message : String(err));
       }
     } finally {
-      // abort 的请求其 loading 状态已被新请求接管、这里别覆盖
+      // 被 abort 的请求，其 loading 已被新请求接管（非静默的新请求置 true、静默的新请求在入口复位）、这里别覆盖
       if (!ctrl.signal.aborted && !silent) setLoading(false);
     }
   }, []);

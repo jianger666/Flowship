@@ -67,3 +67,49 @@ export const checkUpdateTempSpace = (tmpDir, statfs, minMB = MIN_TEMP_FREE_MB) =
   const freeMB = bytesToMB(bytes);
   return { enough: freeMB >= minMB, freeMB, minMB };
 };
+
+/**
+ * mac 暂存更新需要的剩余空间（MB）：下载 dmg 和展开 .app 两份会同时在盘上（dmg 要到暂存结束的 finally 才删）。
+ * 依据：dmg 约 118–122MB（v1.9.37 的 GitHub release 资产大小：mac arm64 118.4MB / x64 122.4MB）+ 展开后的 Flowship.app 约 410MB
+ * （R14 B2-4 在开发机上 `du -sh /Applications/Flowship.app` 实测）≈ 530MB，留约 12–13% 余量取 600MB。
+ * 只用于**下载之前**的预检（downloadAndStageMacUpdateInner）；
+ * 量不到放行（口径同 checkUpdateTempSpace：宁可少拦也不能在量不准时把人挡在更新之外）。
+ * 包体明显增长时改这一处即可（弹框文案也读它）。
+ */
+export const MIN_MAC_STAGE_FREE_MB = 600;
+
+/** 空间文案：≥ 1GB 用 GB（一位小数），否则 MB。更新预检（StageNoSpaceError）和低磁盘通知（disk-watch.mjs）共用这一处。 */
+export const formatMB = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
+
+/**
+ * mac 暂存因磁盘剩余空间不足而被预检拦下。按**类型**判（isStageNoSpaceError），不匹配文案。
+ * 它发生在下载 dmg 之前、没花流量——重试 / 弹框策略据此区分于「下完才失败」的那类（见 update-verify-retry.mjs isCostlyStageFailure）。
+ */
+export class StageNoSpaceError extends Error {
+  /** @param {{ freeMB: number | null, minMB: number }} space */
+  constructor(space) {
+    super(
+      `磁盘剩余空间不足（约 ${formatMB(space.freeMB ?? 0)}），暂存更新至少需要 ${formatMB(space.minMB)}。请清理磁盘后再试。`,
+    );
+    this.name = "StageNoSpaceError";
+    this.code = "STAGE_NO_SPACE";
+    this.freeMB = space.freeMB;
+    this.minMB = space.minMB;
+  }
+}
+
+/** @param {unknown} err */
+export const isStageNoSpaceError = (err) => err instanceof StageNoSpaceError;
+
+/**
+ * mac 暂存的下载前预检：updates 目录所在盘不够 → 抛 StageNoSpaceError；够 / 量不到 → 返回量到的结果（给日志用）。
+ * @param {string} dir 一般传 updatesDirPath()（须已存在，statfs 才量得到）
+ * @param {(dir: string) => { bavail: number | bigint, bsize: number | bigint }} statfs 可注入
+ * @param {number} [minMB]
+ * @returns {{ enough: boolean, freeMB: number | null, minMB: number }}
+ */
+export const assertMacStageSpace = (dir, statfs, minMB = MIN_MAC_STAGE_FREE_MB) => {
+  const space = checkUpdateTempSpace(dir, statfs, minMB);
+  if (!space.enough) throw new StageNoSpaceError(space);
+  return space;
+};

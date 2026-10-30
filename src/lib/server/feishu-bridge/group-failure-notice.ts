@@ -12,7 +12,10 @@
  * 刻意不做的：不加纯文本降级出口——「群里别再新加 text / post 出口」是已定的决定（docs/feishu-group-collab.md），
  * 这里只让失败可见、不改发送方式。
  *
- * - 同一个群一分钟只记一条（各出口共用同一个节流 key）：连发的回执全挂时不刷屏；
+ * - 同一个群、同一类消息（`what`）一分钟只记一条（各出口共用同一张节流表）：连发的回执全挂时不刷屏；
+ *   不同类的失败各占各的名额——否则同一分钟里「回执」失败会把更重要的「答疑回复」失败吞掉，属主以为答案发出去了；
+ * - 认得出的原因（机器人被移出群 / 被禁言 / 群已解散 / 限流）直接说人话 + 给能照做的补救，
+ *   不再是英文原文 + 「到设置页检查」（被踢是协作群最常见的失败，设置页对它毫无帮助）；
  * - 永不抛：它跑在「已经出错」的路径上，不能把原本只 warn 的失败变成抛错、打断原有流程；
  * - info 事件不会被出向 tap 回灌进群（tap 只认 ask / 回答 / 产物这几类），不存在「失败 → 回执 → 再失败」的环。
  */
@@ -21,12 +24,17 @@ import { describeScopeShortage } from "@/lib/server/route-helpers";
 import { writeOwnedEventAndPublish } from "@/lib/server/task-stream";
 
 import { throttleOncePerMinute } from "./group-shared";
+import { classifyGroupSendFailure, type GroupSendFailureKind } from "./lark-errors";
 import { describeLarkError, LarkApiError } from "./types";
 
 const LOG = "[feishu-bridge/group-failure-notice]";
 
-/** 同一个群这条提示的节流 key（入向 / 出向 / 卡片回调共用，合起来一分钟一条） */
-const throttleKeyOf = (chatId: string): string => `group-reply-failed:${chatId}`;
+/**
+ * 这条提示的节流 key：群 + 哪类消息没发出去（入向 / 出向 / 卡片回调共用同一张表）。
+ * 没带 `what`（入向回执）沿用原 key 形态 `group-reply-failed:<chatId>`。
+ */
+const throttleKeyOf = (chatId: string, what?: string): string =>
+  what ? `group-reply-failed:${chatId}:${what}` : `group-reply-failed:${chatId}`;
 
 /** 事件正文里「原因」部分的最大长度 */
 const REASON_MAX = 300;
@@ -45,16 +53,51 @@ const firstNonEmptyLine = (s: string): string =>
  *
  * - 缺 scope：翻成人话（缺哪个 scope + 去哪开），scope 文案可能只出现在 stderr 里，所以三处一起看；
  * - 传输层失败且解析不出 JSON（`Command failed: <命令行>…`）：只取 stderr 首行——命令行会把 300 字占满、
- *   把真正的原因和飞书码 / log_id 截掉，还带着本机路径和请求体；没有 stderr 就说「没有错误输出」；
+ *   把真正的原因和飞书码 / log_id 截掉，还带着本机路径和请求体；没有 stderr 就说「没有错误输出」。
+ *   真实路径上的错误经过 `normalizeLarkError`（R14 B4-3），message 已被瘦成 stderr 最后一行（或 `lark-cli 调用失败（api）`），
+ *   不以 `Command failed:` 开头、不会走到这一支；这里兜的是没经过它、仍带着命令行的错误——
+ *   两边作用在互斥的 message 形态上，不会对同一条错误各取一次行；
  * - CLI 层面的失败（`raw` 是 `{stdout, stderr}`）里 `code` 是进程退出码 / 系统错误名，不是飞书错误码——不当「飞书 N」展示；
  * - 其它错误（含已解析出飞书错误码的）：带上飞书错误码 / 接口 / log_id 方便定位。
  *
  * `cardkitRelated`：这次失败看起来跟卡片实体（cardkit）有关——决定要不要附「文字走卡片、需要 cardkit:card:write」的说明
  * （机器人不在群 / 限流 / 超时也这么写会误导排查方向）。
  */
+export interface GroupSendFailureDescription {
+  reason: string;
+  cardkitRelated: boolean;
+  /** 认出的失败类别（`other` = 认不出，reason 是原始原因） */
+  kind: GroupSendFailureKind;
+  /** 认出类别时给的补救（没有 = 调用方用通用的「设置页检查」） */
+  hint?: string;
+}
+
+/** 认得出的几类失败：说人话的原因 + 能照做的补救。飞书错误码另附在 reason 末尾，方便对日志 */
+const KIND_COPY: Record<
+  Exclude<GroupSendFailureKind, "other">,
+  { reason: string; hint: string }
+> = {
+  bot_not_in_group: {
+    reason: "机器人已不在这个群里（可能被移出了群）",
+    hint: "请在群设置 → 机器人 → 添加机器人里，搜本机机器人的名字加回群，或在「需求群」弹窗换绑一个群",
+  },
+  no_send_permission: {
+    reason: "机器人在这个群里没有发言权限（被禁言，或群设置 / 应用可用范围限制了发言）",
+    hint: "请到群设置里检查机器人的发言权限（若是应用可用范围限制，需要管理员在开放平台调整），或在「需求群」弹窗换绑一个群",
+  },
+  chat_gone: {
+    reason: "这个群已经解散或失效",
+    hint: "请在「需求群」弹窗取消关联，或换绑 / 重建一个群",
+  },
+  rate_limited: {
+    reason: "飞书限流了",
+    hint: "稍等一会儿通常就恢复，之后再让它重发",
+  },
+};
+
 export const describeGroupSendFailure = (
   err: unknown,
-): { reason: string; cardkitRelated: boolean } => {
+): GroupSendFailureDescription => {
   const message = err instanceof Error ? err.message : String(err);
   const larkErr = err instanceof LarkApiError ? err : null;
   const rawObj =
@@ -67,6 +110,23 @@ export const describeGroupSendFailure = (
   const isCliFailure = !!rawObj && ("stdout" in rawObj || "stderr" in rawObj);
 
   const scope = describeScopeShortage([message, stderr, stdout].join("\n"));
+
+  // 缺 scope 另有专门的说法；其余先看是不是认得的几类（判定见 lark-errors，Command failed 形态的 message 不参与关键词匹配）
+  const kind: GroupSendFailureKind = scope ? "other" : classifyGroupSendFailure(err);
+  if (kind !== "other") {
+    const copy = KIND_COPY[kind];
+    // 飞书码 / log_id 照旧附上（对日志、找飞书支持用）；CLI 层失败的 code 是退出码，不当飞书码
+    const codeNote =
+      larkErr && larkErr.code !== undefined && !isCliFailure
+        ? `（飞书 ${String(larkErr.code)}${larkErr.logId ? ` · log_id=${larkErr.logId}` : ""}）`
+        : "";
+    return {
+      reason: `${copy.reason}${codeNote}`.slice(0, REASON_MAX),
+      cardkitRelated: false,
+      kind,
+      hint: copy.hint,
+    };
+  }
 
   let base = message;
   if (CLI_FAILURE_PREFIX.test(message)) {
@@ -94,7 +154,7 @@ export const describeGroupSendFailure = (
     /cardkit/i.test(larkErr?.api ?? "") ||
     /cardkit/i.test(base) ||
     /cardkit/i.test(stderr);
-  return { reason: reason.slice(0, REASON_MAX), cardkitRelated };
+  return { reason: reason.slice(0, REASON_MAX), cardkitRelated, kind: "other" };
 };
 
 /**
@@ -110,12 +170,14 @@ export const noteGroupSendFailure = async (
 ): Promise<void> => {
   try {
     if (!taskId) return;
-    if (!throttleOncePerMinute(throttleKeyOf(chatId))) return;
-    const { reason, cardkitRelated } = describeGroupSendFailure(err);
+    if (!throttleOncePerMinute(throttleKeyOf(chatId, what))) return;
+    const { reason, cardkitRelated, hint: kindHint } = describeGroupSendFailure(err);
     const subject = what ? `群里${what}没发出去` : "群里有一条回复没发出去";
-    const hint = cardkitRelated
-      ? "群里的文字走卡片发送（需要 cardkit:card:write），权限或接口异常时会这样；可到设置页飞书桥接检查"
-      : "可到设置页飞书桥接检查，详情见应用日志";
+    const hint =
+      kindHint ??
+      (cardkitRelated
+        ? "群里的文字走卡片发送（需要 cardkit:card:write），权限或接口异常时会这样；可到设置页飞书桥接检查"
+        : "可到设置页飞书桥接检查，详情见应用日志");
     await writeOwnedEventAndPublish(taskId, () => true, {
       kind: "info",
       text: `${subject}：${reason}。${hint}`,

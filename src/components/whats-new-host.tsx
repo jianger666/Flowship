@@ -139,7 +139,14 @@ export const WhatsNewHost = ({ children }: { children: ReactNode }) => {
               这个版本对你有用的变化
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-4">
+          {/*
+            正文自己滚（X5-a）：版本块的条数由数据决定（最多 MAX_BLOCKS 个版本、每版约 5 条），
+            三个版本约 900 px，高过常规窗口——只靠共用外壳的「遮罩滚」时，底下的「知道了」会被挤到屏幕外，
+            macOS 的滚动条又不常驻，看起来就是被截断。这里给正文一个上限、列表自己滚，标题和按钮始终在视口里
+            （60vh 与 32rem 取小：最小窗口高度 600 时，标题 + 正文 + 按钮也放得下）。
+            这是对 V0.5.4「Dialog 不内滚、只遮罩滚」约定的一个例外（数据驱动的长列表）；pr-1 给滚动条留位。
+          */}
+          <div className="max-h-[min(60vh,32rem)] space-y-4 overflow-y-auto pr-1">
             {(blocks ?? []).map((block) => (
               <div key={block.version}>
                 {blocks && blocks.length > 1 ? (

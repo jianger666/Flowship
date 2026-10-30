@@ -4,12 +4,14 @@
  * GET    → { larkCli, meegle, install, logins }（设置页轮询）
  * POST   → { action: "install" } 一键安装两个 CLI + 官方 skills
  *          { action: "login", tool: "lark-cli" | "meegle", meegleHost? } 发起登录
+ *          { action: "cancel-login", tool: "lark-cli" | "meegle" } 取消进行中的登录（幂等；不点也会在 10 分钟后自动取消）
  * DELETE → 卸载（bin + skills 删除、HOME 级登录态保留、重装即用）
  */
 
 import { NextResponse } from "next/server";
 
 import {
+  cancelLogin,
   getFeishuCliStatus,
   getInstallState,
   getLoginState,
@@ -60,6 +62,15 @@ export const POST = async (req: Request) => {
     const result = await startLogin(body.tool, { meegleHost: body.meegleHost });
     if (!result.ok) return errorResponse(result.error ?? "登录发起失败", 409);
     return NextResponse.json({ ok: true });
+  }
+
+  if (body.action === "cancel-login") {
+    if (body.tool !== "lark-cli" && body.tool !== "meegle") {
+      return errorResponse("tool 必须是 lark-cli 或 meegle");
+    }
+    // 幂等：没在登录也返回 ok（cancelled: false）；有子进程时等它真的退出才返回（最长约 5 秒）
+    const result = await cancelLogin(body.tool);
+    return NextResponse.json({ ok: true, ...result });
   }
 
   return errorResponse("未知 action");

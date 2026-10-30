@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Picker } from "@/components/ui/picker";
 import { SettingRow } from "@/components/ui/setting-row";
 import { FeishuBridgeBlock } from "@/components/settings/feishu-bridge-block";
+import { requestFeishuCli } from "@/lib/feishu-cli-client";
 import type { FeAiFlowSettings } from "@/lib/types";
 
 // 服务端状态形状（/api/system/feishu-cli GET）
@@ -132,12 +133,17 @@ export const FeishuCliSection = ({
   const handleInstall = async () => {
     setBusy(true);
     try {
-      await fetch("/api/system/feishu-cli", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "install" }),
-      });
-      toast.success("已开始下载安装（后台进行）");
+      const r = await requestFeishuCli("POST", { action: "install" });
+      if (!r.ok) {
+        toast.error(`安装发起失败：${r.message}`);
+      } else if (r.data.started === false) {
+        // 服务端已有一轮安装在后台跑（startInstall 返回 false）：不是错误，也不是「刚开始」
+        // 判 `=== false` 而不是 falsy：旧服务端不回 started 时仍按「已开始」处理
+        toast.info("安装已在进行中");
+      } else {
+        toast.success("已开始下载安装（后台进行）");
+      }
+      // 三种结果都刷新一次：状态行 / 轮询接管进度与错误显示
       void refresh();
     } finally {
       setBusy(false);
@@ -147,14 +153,9 @@ export const FeishuCliSection = ({
   const handleLogin = async (tool: "lark-cli" | "meegle") => {
     setBusy(true);
     try {
-      const res = await fetch("/api/system/feishu-cli", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "login", tool }),
-      });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) {
-        toast.error(data.error ?? "登录发起失败");
+      const r = await requestFeishuCli("POST", { action: "login", tool });
+      if (!r.ok) {
+        toast.error(`登录发起失败：${r.message}`);
         return;
       }
       toast.success("登录流程已启动、浏览器会自动打开授权页");
@@ -162,6 +163,18 @@ export const FeishuCliSection = ({
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleCancelLogin = async (tool: "lark-cli" | "meegle") => {
+    // 不进 busy：取消本来就是给「卡住了」的人用的，不该被别的操作锁住；服务端幂等、连点无害
+    const r = await requestFeishuCli("POST", { action: "cancel-login", tool });
+    if (!r.ok) {
+      toast.error(`取消失败：${r.message}`);
+      return;
+    }
+    // cancelled === false = 取消到达时登录已经自己结束了：不弹「已取消」误导人，直接刷新看真实状态
+    if (r.data.cancelled !== false) toast.info("已取消登录");
+    void refresh();
   };
 
   const handleUninstall = async () => {
@@ -173,10 +186,9 @@ export const FeishuCliSection = ({
     if (!ok) return;
     setBusy(true);
     try {
-      const res = await fetch("/api/system/feishu-cli", { method: "DELETE" });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) {
-        toast.error(data.error ?? "卸载失败");
+      const r = await requestFeishuCli("DELETE");
+      if (!r.ok) {
+        toast.error(`卸载失败：${r.message}`);
         return;
       }
       toast.success("已卸载");
@@ -236,6 +248,17 @@ export const FeishuCliSection = ({
                   {login?.running ? <Loader2 className="animate-spin" /> : <LogIn />}
                   登录
                 </Button>
+                {/* 登录中给「取消」：用户关了授权页 / CLI 卡住时，不用干等 10 分钟自动超时（不受 busy 禁用） */}
+                {login?.running && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    onClick={() => void handleCancelLogin(toolId as "lark-cli" | "meegle")}
+                  >
+                    取消
+                  </Button>
+                )}
               </>
             )}
             {/* 登录中：服务端已尝试自动开浏览器（首次登录分两步：建应用 → 授权、
@@ -250,7 +273,8 @@ export const FeishuCliSection = ({
                 浏览器没弹？点这里继续（建应用后还有一步授权）
               </a>
             )}
-            {login?.error && (
+            {/* 已登录就不再显示登录报错：上一次失败 / 超时的旧文案不该一直挂在「已登录」后面 */}
+            {!tool.loggedIn && login?.error && (
               <span className="text-xs text-destructive">{login.error}</span>
             )}
           </>

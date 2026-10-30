@@ -717,7 +717,9 @@ describe("记录器健壮性：不抛 / 路径穿越 / 节流 / 重复丢弃计�
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const taskId = await freshTask();
     const h = startSubagentRun(baseInit(taskId));
-    const writeSpy = vi.spyOn(fs, "writeFile");
+    // 观测点是 fs.open：原子写的 tmp 阶段走 writeFileFsynced（fs.open + fsync，Q9-04），不再是 fs.writeFile——
+    // 每次落盘恰好对 tmp 开一次文件，次数与改前的 writeFile 次数一一对应，节流语义不变
+    const writeSpy = vi.spyOn(fs, "open");
     const runFileWrites = (): number =>
       writeSpy.mock.calls.filter((c) => String(c[0]).includes(`${h.key}.json.tmp`)).length;
 

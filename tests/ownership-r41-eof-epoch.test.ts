@@ -3,6 +3,10 @@
  *
  * 镜像 useTaskWatch 控制流：watchTaskStream 返回 { established }，
  * 经 resolveWatchCleanEof 决定清零或记 retryable failure。
+ *
+ * R14 B6-1（Q16-01）起：hook 不再在建连当场清零，而是连接结束时看「建连后撑过稳定窗口没有」
+ * （settleWatchBudget）。本文件的镜像（runHookLikeOnce）已同步改成同源：`liveMs` 默认刚好撑过稳定窗口，
+ * 原有用例的语义不变；「没撑过」的行为由 ③ 里新增的用例、以及真跑 hook 的 tests/watch-stable-connection.test.ts 锁定。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -15,8 +19,10 @@ import {
   resolveWatchCleanEof,
   resolveWatchReconnectPolicy,
   WATCH_MAX_TRANSIENT_FAILURES,
+  WATCH_STABLE_CONNECTION_MS,
 } from "@/lib/task-terminal";
 import type { Task } from "@/lib/types";
+import { settleWatchBudget } from "@/lib/watch-reconnect";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -86,7 +92,11 @@ const streamBootstrapCleanEof = (task: Task) =>
   });
 
 /**
- * 镜像 useTaskWatch loop 的一次迭代结果（与 hook 同源：resolveWatchCleanEof）
+ * 镜像 useTaskWatch loop 的一次迭代结果（与 hook 同源：settleWatchBudget / resolveWatchCleanEof）
+ *
+ * 建连只记时刻；连接结束时（clean EOF / reader 抛错两条路径、算重连策略之前）按「撑过稳定窗口才清零」结算。
+ * `liveMs` = 建连后这条连接活了多久：默认刚好撑过稳定窗口（= 正常长连接后断开）；
+ * 传小于 WATCH_STABLE_CONNECTION_MS 的值 = 建连后立刻被关 / 被掐。返回里的 `established` 仍是「是否建过连」。
  */
 const runHookLikeOnce = async (
   taskId: string,
@@ -95,6 +105,7 @@ const runHookLikeOnce = async (
     transientFailures: number;
     unavailableNotified: boolean;
   },
+  liveMs: number = WATCH_STABLE_CONNECTION_MS,
 ): Promise<{
   counters: typeof counters;
   established: boolean;
@@ -103,17 +114,30 @@ const runHookLikeOnce = async (
 }> => {
   let { unavailableAttempts, transientFailures, unavailableNotified } =
     counters;
+  let establishedAt = null as number | null;
+  const settle = (): boolean => {
+    const budget = {
+      unavailableAttempts,
+      transientFailures,
+      unavailableNotified,
+    };
+    const stable = settleWatchBudget(
+      budget,
+      establishedAt,
+      establishedAt === null ? Date.now() : establishedAt + liveMs,
+    );
+    ({ unavailableAttempts, transientFailures, unavailableNotified } = budget);
+    return stable;
+  };
   try {
     const { established } = await watchTaskStream(taskId, {
       onConnectionEstablished: () => {
-        // reader-error 场景：当场清零（与 hook 一致）
-        unavailableAttempts = 0;
-        transientFailures = 0;
-        unavailableNotified = false;
+        establishedAt = Date.now();
       },
     });
+    const stable = settle();
     const eof = resolveWatchCleanEof({
-      established,
+      established: stable,
       unavailableAttempts,
       transientFailures,
       unavailableNotified,
@@ -170,6 +194,8 @@ const runHookLikeOnce = async (
         terminalDeleted: false,
       };
     }
+    // 与 hook 一致：建连后撑过稳定窗口再抛错的先清零；没撑过 / 从未建连的原样累计
+    settle();
     const status =
       err instanceof ApiRequestError
         ? err.status
@@ -308,8 +334,8 @@ describe("R41-EOF-② 连续空流 / 非法帧达 exhausted", () => {
   });
 });
 
-describe("R41-EOF-③ established 后 clean EOF 才清 epoch", () => {
-  it("task bootstrap → clean EOF：清零", async () => {
+describe("R41-EOF-③ 建连并撑过稳定窗口后才清 epoch", () => {
+  it("task bootstrap → 撑过稳定窗口后 clean EOF：清零", async () => {
     const taskId = "r41_boot_clean";
     const task = stubTask(taskId);
     // 先造一次 transient
@@ -333,7 +359,7 @@ describe("R41-EOF-③ established 后 clean EOF 才清 epoch", () => {
     expect(r.counters.unavailableAttempts).toBe(0);
   });
 
-  it("task bootstrap → reader error：从新 transient #1 起算", async () => {
+  it("task bootstrap → 撑过稳定窗口后 reader error：先清零，从新 transient #1 起算", async () => {
     const taskId = "r41_boot_drop";
     const task = stubTask(taskId);
     const counters = {
@@ -351,9 +377,100 @@ describe("R41-EOF-③ established 后 clean EOF 才清 epoch", () => {
       }),
     );
     const r = await runHookLikeOnce(taskId, counters);
-    // onConnectionEstablished 清零后 reader error → #1
+    // 撑过稳定窗口再 reader error：先清零（3 → 0），再把这次记成 #1
     expect(r.counters.transientFailures).toBe(1);
     expect(r.exhausted).toBe(false);
+  });
+
+  // ---- 以下三条：建连后没撑过稳定窗口（R14 B6-1 / Q16-01）。旧写法在建连当场清零，这三条在旧写法下结论全是反的 ----
+
+  it("task bootstrap → 建连后立刻 clean EOF（没撑过稳定窗口）：不清零，按失败累计 +1", async () => {
+    const taskId = "r41_boot_clean_short";
+    const task = stubTask(taskId);
+    const counters = {
+      unavailableAttempts: 2,
+      transientFailures: 1,
+      unavailableNotified: false,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        return new Response(streamBootstrapCleanEof(task), {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }),
+    );
+    const r = await runHookLikeOnce(
+      taskId,
+      counters,
+      WATCH_STABLE_CONNECTION_MS - 1,
+    );
+    // 建过连（established 是「建过连」），但没撑过窗口：旧的 1 保留并 +1，unavailable 计数也不被清
+    expect(r.established).toBe(true);
+    expect(r.counters.transientFailures).toBe(2);
+    expect(r.counters.unavailableAttempts).toBe(2);
+    expect(r.exhausted).toBe(false);
+  });
+
+  it("task bootstrap → 建连后立刻 reader error（没撑过稳定窗口）：不清零，3 → 4", async () => {
+    const taskId = "r41_boot_drop_short";
+    const task = stubTask(taskId);
+    const counters = {
+      unavailableAttempts: 0,
+      transientFailures: 3,
+      unavailableNotified: false,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        return new Response(streamBootstrapThenError(task), {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }),
+    );
+    const r = await runHookLikeOnce(taskId, counters, 0);
+    expect(r.counters.transientFailures).toBe(4);
+    expect(r.exhausted).toBe(false);
+  });
+
+  it("连续 6 次「建连后立刻断」→ terminate_exhausted；同样 6 次但每次都撑过稳定窗口 → 永不 exhausted", async () => {
+    const taskId = "r41_six_short_vs_stable";
+    const task = stubTask(taskId);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        return new Response(streamBootstrapThenError(task), {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }),
+    );
+
+    const runRounds = async (liveMs: number) => {
+      let counters = {
+        unavailableAttempts: 0,
+        transientFailures: 0,
+        unavailableNotified: false,
+      };
+      for (let i = 0; i < WATCH_MAX_TRANSIENT_FAILURES; i++) {
+        const r = await runHookLikeOnce(taskId, counters, liveMs);
+        counters = r.counters;
+        if (r.exhausted) return { exhausted: true, rounds: i + 1 };
+      }
+      return { exhausted: false, rounds: WATCH_MAX_TRANSIENT_FAILURES };
+    };
+
+    // 旧写法（建连即清零）下这一条永远不会 exhausted——就是「静默无限重连」
+    expect(await runRounds(WATCH_STABLE_CONNECTION_MS - 1)).toEqual({
+      exhausted: true,
+      rounds: WATCH_MAX_TRANSIENT_FAILURES,
+    });
+    expect(await runRounds(WATCH_STABLE_CONNECTION_MS)).toEqual({
+      exhausted: false,
+      rounds: WATCH_MAX_TRANSIENT_FAILURES,
+    });
   });
 });
 

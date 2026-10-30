@@ -5,7 +5,9 @@
  *   Body: { chatId: string } —— 群设置复制的群 ID（oc_ 开头，允许粘整段文本、
  *   服务端自动提取；一次只认一个，多个直接 invalid_input）。
  *   成功: { ok: true, chatId, chatName?, overwritten, previousChatId?,
- *     membershipUnknown?, task }
+ *     membershipUnknown?, alsoBoundBy?, task }
+ *   alsoBoundBy：这个群上**还有**哪些别的任务也本地关联着（[{ id, title }]，没有就不带）——
+ *   一个群绑多个任务是合法的，但群里的 @ 只会进其中一个，绑完让用户知道（B4-4 / Q12b-02）。
  * DELETE：取消本任务自带的群关联（回落读项目群默认）→ 回最新 task。
  *   成功: { ok: true, cleared, chatId?, task }
  *
@@ -20,6 +22,7 @@
 
 import {
   getTask,
+  listTasks,
   setTaskGroupAssociation,
 } from "@/lib/server/task-fs";
 import {
@@ -27,9 +30,40 @@ import {
   clearTaskGroupAssociation,
   FeishuGroupError,
 } from "@/lib/server/feishu-group";
+import {
+  findLocalCoBoundTasks,
+  toCoBoundTask,
+  type CoBoundTask,
+} from "@/lib/server/feishu-bridge/group-task-binding";
 import { errorResponse } from "@/lib/server/route-helpers";
 
 export const runtime = "nodejs";
+
+/** 响应里最多带几个同群任务（正常个位数；防异常数据撑大响应） */
+const ALSO_BOUND_MAX = 20;
+
+/**
+ * 这个群上还有哪些别的任务本地关联着（不含本任务，按最近更新倒序）。
+ * 只是提示用的增强信息：读不出来当没有，绝不能因为它让一次已经落盘的绑定变成失败。
+ */
+const findOtherBoundTasks = async (
+  taskId: string,
+  chatId: string,
+): Promise<CoBoundTask[]> => {
+  try {
+    const all = await listTasks();
+    return findLocalCoBoundTasks(all, { chatId, excludeTaskId: taskId })
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      .slice(0, ALSO_BOUND_MAX)
+      .map(toCoBoundTask);
+  } catch (err) {
+    console.warn(
+      `[requirement-group/bind] task=${taskId} 查同群其它任务失败（不影响绑定）:`,
+      err instanceof Error ? err.message : err,
+    );
+    return [];
+  }
+};
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -97,6 +131,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     // 落盘后重读：把最新的任务（含本地群关联）带回去，调用方直接刷 UI
     const updated = await getTask(id);
     if (!updated) return errorResponse("任务不存在或已删除", 404);
+    const alsoBoundBy = await findOtherBoundTasks(id, result.chatId);
     return new Response(
       JSON.stringify({
         ok: true,
@@ -107,6 +142,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
           : {}),
         ...(result.chatName ? { chatName: result.chatName } : {}),
         ...(result.membershipUnknown ? { membershipUnknown: true } : {}),
+        ...(alsoBoundBy.length > 0 ? { alsoBoundBy } : {}),
         task: updated,
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },

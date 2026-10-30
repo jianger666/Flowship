@@ -204,6 +204,7 @@ export const WkHarnessSection = () => {
                     type="button"
                     variant="outline"
                     size="icon"
+                    aria-label="选择 WK 产出目录"
                     disabled={picking}
                     onClick={() => void handlePickDocRepo()}
                   >

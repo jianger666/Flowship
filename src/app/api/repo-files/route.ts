@@ -5,6 +5,8 @@
  * - taskId 必填，root 必须是该 task.repoPaths 之一（防路径穿越扫任意盘）
  * - root 省略 = 扫 task 全部 repoPaths（多仓）
  * - q 文件名 / 路径模糊，上限 50 条；首次扫描按 root 缓存 60s
+ * - 索引被截断（仓里条目超过上限）时多回 `truncated: true`，让菜单能提示「候选可能不全」；
+ *   没截断时不带这个字段（旧客户端 / 旧响应形状不变）
  */
 
 import { NextResponse } from "next/server";
@@ -60,6 +62,6 @@ export const GET = async (req: Request) => {
     }
   }
 
-  const files = await searchTaskRepoFiles(task.repoPaths, q, { root });
-  return NextResponse.json({ files });
+  const { files, truncated } = await searchTaskRepoFiles(task.repoPaths, q, { root });
+  return NextResponse.json(truncated ? { files, truncated: true } : { files });
 };

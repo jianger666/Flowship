@@ -15,9 +15,30 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { McpServerConfig } from "@cursor/sdk";
 
 import { API_TOOL_NAME_MAX, mcpApiToolName } from "@/lib/mcp-tool-name";
+
+/**
+ * 单次 MCP 工具调用的超时（R14 Q11-06）：10 分钟没有任何响应 / 进度才算超时。
+ * SDK 默认只有 60 秒（`DEFAULT_REQUEST_TIMEOUT_MSEC`），而 pi 路径之前没传任何选项——
+ * 跑 build / 抓取 / 数据导出这类 MCP 工具，超过 1 分钟必报 `Request timed out`。
+ */
+export const MCP_TOOL_CALL_TIMEOUT_MS = 10 * 60_000;
+/**
+ * 服务端持续发进度时，单次调用的总时长上限（R14 Q11-06）：进度会让上面的超时重新计时，
+ * 没有总上限的话，一个永远在报进度的 server 能把这次调用挂到天荒地老（用户只能点停止）。
+ */
+export const MCP_TOOL_CALL_MAX_TOTAL_MS = 30 * 60_000;
+
+export interface McpCallOptions {
+  /**
+   * 用户点停止 / 任务被停时 abort：`callTool` 立即 reject，并向 server 发 `notifications/cancelled`。
+   * 之前 `execute` 把 pi 传来的 signal 丢了，点停止后这次调用要一直等到超时。
+   */
+  signal?: AbortSignal;
+}
 
 export interface BridgedMcpTool {
   /** 送给模型的 API 名：`mcp__server__tool` */
@@ -27,6 +48,7 @@ export interface BridgedMcpTool {
   inputSchema: unknown;
   call: (
     args: Record<string, unknown>,
+    opts?: McpCallOptions,
   ) => Promise<{
     content: Array<{ type: "text"; text: string }>;
     isError?: boolean;
@@ -67,10 +89,12 @@ const flattenContent = (
 export const connectMcpServer = async (
   serverName: string,
   cfg: McpServerConfig,
-): Promise<BridgedMcpServer> => {
-  const client = new Client({ name: "flowship", version: "0.1.0" });
+): Promise<BridgedMcpServer> =>
+  connectMcpServerWithTransport(serverName, buildMcpTransport(cfg));
 
-  let transport;
+/** 按配置造 transport：有 url → HTTP / SSE，否则 stdio 本地进程 */
+const buildMcpTransport = (cfg: McpServerConfig): Transport => {
+  let transport: Transport;
   if ("url" in cfg) {
     const url = new URL(cfg.url);
     const headers = cfg.headers as Record<string, string> | undefined;
@@ -89,8 +113,33 @@ export const connectMcpServer = async (
       env: cfg.env,
     });
   }
+  return transport;
+};
 
+/**
+ * 用造好的 transport 连接并桥接。单独导出：单测用 `InMemoryTransport` 配真 SDK server 对，
+ * 能测到真实的 abort / 超时语义，不必起子进程或 HTTP 服务。
+ * 连上之后任何一步失败（枚举工具抛错等）都要把 client 关掉再抛——否则 stdio 子进程 / HTTP 连接没人收
+ * （R14 Q11-05；`connect` 自己失败时 SDK 会自行关闭）。
+ */
+export const connectMcpServerWithTransport = async (
+  serverName: string,
+  transport: Transport,
+): Promise<BridgedMcpServer> => {
+  const client = new Client({ name: "flowship", version: "0.1.0" });
   await client.connect(transport);
+  try {
+    return await bridgeConnectedClient(serverName, client);
+  } catch (err) {
+    await client.close().catch(() => {});
+    throw err;
+  }
+};
+
+const bridgeConnectedClient = async (
+  serverName: string,
+  client: Client,
+): Promise<BridgedMcpServer> => {
   const listResult = await client.listTools();
   // 同一 server 下两个工具 sanitize 后可能撞名，短 hash 拆开
   const usedNames = new Set<string>();
@@ -116,8 +165,20 @@ export const connectMcpServer = async (
       ? `MCP ${serverName}.${t.name}：${t.description}`
       : `MCP 工具 ${serverName}.${t.name}`,
     inputSchema: t.inputSchema ?? {},
-    call: async (args: Record<string, unknown>) => {
-      const result = await client.callTool({ name: t.name, arguments: args });
+    call: async (args: Record<string, unknown>, opts?: McpCallOptions) => {
+      const result = await client.callTool(
+        { name: t.name, arguments: args },
+        undefined,
+        {
+          signal: opts?.signal,
+          timeout: MCP_TOOL_CALL_TIMEOUT_MS,
+          maxTotalTimeout: MCP_TOOL_CALL_MAX_TOTAL_MS,
+          // resetTimeoutOnProgress 只在请求带了进度处理器（SDK 据此才发 progressToken）时才有意义：
+          // 空函数就够——我们不展示进度，只要 server 一报进度就重新计超时
+          onprogress: () => {},
+          resetTimeoutOnProgress: true,
+        },
+      );
       return {
         content: flattenContent(result.content),
         isError: result.isError === true,

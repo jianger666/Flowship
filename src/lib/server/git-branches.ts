@@ -14,7 +14,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { occupantOf, occupiedBranchMessage } from "../git-branch-occupancy";
-import { stripHostInjectedEnv } from "./host-env";
+import { GIT_MAX_BUFFER, gitEnv } from "./git-exec";
 import type {
   GitBranchOccupant,
   GitBranchState,
@@ -40,7 +40,8 @@ const dirExists = async (dir: string): Promise<boolean> => {
  * 最佳努力更新远端 refs（2026-09：测试同事搜不到研发刚推的分支——之前只读本地已知 refs）。
  *
  * 约束：
- * - `GIT_TERMINAL_PROMPT=0`：没配好凭据时直接失败、不弹输入框把 server 挂住
+ * - env 走 gitEnv()：`GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never`——没配好凭据时直接失败、不弹输入框把 server 挂住；
+ *   同时剔宿主注入变量与 GitLab PAT（fetch 更新 refs 会触发 reference-transaction 钩子，见 git-exec.ts）
  * - 20s 超时兜底（没配 ssh key 的机器上 ssh 也可能等输入）
  * - 失败一律吞掉返回 false：离线 / 无 remote / 鉴权失败都降级用本地 refs，下拉框不受影响
  */
@@ -50,7 +51,7 @@ export const fetchRemoteRefs = async (dir: string): Promise<boolean> => {
     await execFileAsync("git", ["fetch", "--prune"], {
       cwd: dir,
       timeout: 20_000,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: gitEnv(),
     });
     return true;
   } catch {
@@ -116,7 +117,7 @@ const listWorktrees = async (dir: string): Promise<WorktreeEntry[]> => {
     const { stdout } = await execFileAsync(
       "git",
       ["worktree", "list", "--porcelain"],
-      { cwd: dir, timeout: 10_000 },
+      { cwd: dir, timeout: 10_000, env: gitEnv() },
     );
     return parseWorktreeList(stdout);
   } catch {
@@ -160,12 +161,55 @@ const readCurrentBranch = async (dir: string): Promise<string | null> => {
     const { stdout } = await execFileAsync(
       "git",
       ["rev-parse", "--abbrev-ref", "HEAD"],
-      { cwd: dir, timeout: 10_000 },
+      { cwd: dir, timeout: 10_000, env: gitEnv() },
     );
     const name = stdout.trim();
     return name && name !== "HEAD" ? name : null;
   } catch {
     return null;
+  }
+};
+
+/** 列 refs 的参数：本地 + 远端混列、按最近提交倒序（活跃分支排前面、两类场景都顺手） */
+const REF_LIST_ARGS = [
+  "for-each-ref",
+  "refs/heads",
+  "refs/remotes",
+  "--format=%(refname)",
+  "--sort=-committerdate",
+];
+
+/**
+ * 读 refs 清单（readGitBranchState / listRepoBranches 共用）。
+ *
+ * maxBuffer 放大到 GIT_MAX_BUFFER（Q10-02）：Node execFile 默认只有 1MiB，约 1.2 万条远端 ref 就超——
+ * 超了会抛错、被上层 catch 成「非 git 仓」，设置页分支下拉 / 任务页分支选择器静默消失（公司仓长期不 prune
+ * 已合并的远端分支，很容易到这个量级）。
+ * 就算真超了 256MiB（几百万条 ref，几乎不可能），也只标 `truncated`、不伪装成非仓库——
+ * 走到这里说明 git 已经把这个目录当仓库在读 refs。超限时 stdout 只是被截断的半截（最后一行可能是半个 ref 名），一律不用。
+ * 其它失败（ENOENT / 非 git 仓 / 超时）原样抛给调用方各自的 catch。
+ *
+ * 有意不加 `--count=N`（只取最近 N 条）：那会让更早的分支在下拉里静默搜不到——是新的静默截断。
+ */
+const readRefList = async (
+  dir: string,
+): Promise<{ stdout: string; truncated: boolean }> => {
+  try {
+    const { stdout } = await execFileAsync("git", REF_LIST_ARGS, {
+      cwd: dir,
+      timeout: 10_000,
+      maxBuffer: GIT_MAX_BUFFER,
+      env: gitEnv(),
+    });
+    return { stdout, truncated: false };
+  } catch (err) {
+    if (
+      (err as NodeJS.ErrnoException | null)?.code ===
+      "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+    ) {
+      return { stdout: "", truncated: true };
+    }
+    throw err;
   }
 };
 
@@ -185,7 +229,7 @@ export const readGitBranchState = async (
     const { stdout: head } = await execFileAsync(
       "git",
       ["rev-parse", "--abbrev-ref", "HEAD"],
-      { cwd: dir, timeout: 10_000 },
+      { cwd: dir, timeout: 10_000, env: gitEnv() },
     );
     const current = head.trim();
     const currentName = current && current !== "HEAD" ? current : null;
@@ -195,18 +239,8 @@ export const readGitBranchState = async (
     // git checkout 对纯远端名会自动建本地跟踪分支（--guess），列表里有就能选中。
     // 占用关系与分支列表并行读：多 spawn 一个 git、但不多一段串行等待（Windows 上 spawn 偏慢）。
     // 占用查询失败只当「没有占用」、不影响分支列表。
-    const [{ stdout: list }, occupied] = await Promise.all([
-      execFileAsync(
-        "git",
-        [
-          "for-each-ref",
-          "refs/heads",
-          "refs/remotes",
-          "--format=%(refname)",
-          "--sort=-committerdate",
-        ],
-        { cwd: dir, timeout: 10_000 },
-      ),
+    const [{ stdout: list, truncated }, occupied] = await Promise.all([
+      readRefList(dir),
       listWorktrees(dir).then((entries) =>
         buildBranchOccupancy(entries, currentName),
       ),
@@ -230,6 +264,8 @@ export const readGitBranchState = async (
       isRepo: true,
       current: currentName,
       branches,
+      // refs 超过读取上限时才带（几乎不可能；见 readRefList）：是仓库、只是没读全，别当成「没有分支」
+      ...(truncated ? { truncated: true } : {}),
       // 没有占用时不带这个字段（绝大多数仓都没有额外工作树、响应体保持跟以前一样）
       ...(Object.keys(occupied).length > 0 ? { occupied } : {}),
     };
@@ -256,17 +292,7 @@ export const listRepoBranches = async (
     // refresh：先更新远端 refs（研发刚推的分支不 fetch 本地根本没有）
     if (opts?.refresh) await fetchRemoteRefs(dir);
     // 一条命令混列本地 + 远端、按最近提交倒序（活跃分支排前面、两类场景都顺手）
-    const { stdout } = await execFileAsync(
-      "git",
-      [
-        "for-each-ref",
-        "refs/heads",
-        "refs/remotes",
-        "--format=%(refname)",
-        "--sort=-committerdate",
-      ],
-      { cwd: dir, timeout: 10_000 },
-    );
+    const { stdout, truncated } = await readRefList(dir);
     const seen = new Set<string>();
     for (const line of stdout.split("\n")) {
       const ref = line.trim();
@@ -285,7 +311,13 @@ export const listRepoBranches = async (
     }
     // 子目录（monorepo 的 packages/web 之类）：git 能列分支，但任务快照口径（目录下有 .git）判它「非 git」
     const notRoot = !existsSync(path.join(dir, ".git"));
-    return { isRepo: true, branches: [...seen], ...(notRoot ? { notRoot: true } : {}) };
+    return {
+      isRepo: true,
+      branches: [...seen],
+      // refs 超过读取上限时才带（几乎不可能；见 readRefList）：是仓库、只是没读全，别当成「非 git 仓」
+      ...(truncated ? { truncated: true } : {}),
+      ...(notRoot ? { notRoot: true } : {}),
+    };
   } catch (err) {
     // 三种失败分开诊断（同事 Windows「真 git 仓被报非 git」排查不动、被迫较真）：
     // ① 路径不存在（spawn cwd 不存在也报 ENOENT、必须先 stat 区分）
@@ -336,11 +368,11 @@ export const checkoutGitBranch = async (
     // 分支刚被删），若工作区恰有同名已跟踪文件，`git checkout b` 会静默把该文件从 index 还原、丢未提交改动
     //（实测 Updated 1 path from the index）；带 `--` 则直接 `fatal: invalid reference`。
     // 远端独有分支的 DWIM（自动建跟踪分支）在带 `--` 时照常生效（实测）。
-    // env 剔宿主注入变量：checkout 会触发用户仓的 post-checkout 钩子（见 host-env.ts / task-worktrees.runGit）
+    // env 走 gitEnv()：checkout 会触发用户仓的 post-checkout 钩子——剔宿主注入变量与 GitLab PAT（见 git-exec.ts / task-worktrees.runGit）
     await execFileAsync("git", ["checkout", b, "--"], {
       cwd: dir,
       timeout: 15_000,
-      env: stripHostInjectedEnv(),
+      env: gitEnv(),
     });
     return { ok: true };
   } catch (err) {

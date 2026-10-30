@@ -23,8 +23,8 @@ import path from "node:path";
 import { parseFrontmatter } from "./frontmatter";
 import type { McpServerConfig } from "@cursor/sdk";
 
-import { RESERVED_MCP_NAMES } from "../mcp-config";
-import { dataRoot } from "./data-root";
+import { RESERVED_MCP_NAMES, validateMcpServerConfig } from "../mcp-config";
+import { dataRoot, describeConfigReadError, stripBom } from "./data-root";
 
 /**
  * 全局 Cursor 配置目录候选（按优先级、取第一个能命中的）
@@ -42,6 +42,63 @@ export const getGlobalCursorDirs = (): string[] => {
 };
 
 /**
+ * app 的 config.json 读不出来时留一行日志（排障线索，进 main.log / 诊断包）。
+ * 文件不存在 = 没配过，是常态、静默；其它（JSON 坏了 / 权限 / 被占用）会让 MCP 与禁用名单悄悄变成空，
+ * 所以至少要有一行。调用方仍按空处理（行为不变）。
+ * 日志只写错误类别 / JSON 出错位置，**不带文件内容**：V8 的 JSON.parse 报错会把出错处附近的原文拼进 message，可能含密钥。
+ */
+const warnConfigReadFailure = (what: string, err: unknown): void => {
+  if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return;
+  console.warn(
+    `[cursor-config] config.json 读取失败，${what}按空处理：${describeConfigReadError(err)}`,
+  );
+};
+
+/** 单个规则文件的体积上限：规则全文常驻 prompt，误放进目录的超大文件（日志 / 导出）会撑爆上下文，用户还不知道为什么 */
+export const MAX_RULE_FILE_BYTES = 256 * 1024;
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * 只留「形状能用」的 MCP 条目：
+ * ① 值不是对象（手改 / 导入源里的 `"x": null` / 字符串 / 数组），下游（挂 MCP、能力页导入）会按对象取字段而自己炸；
+ * ② 是对象但形状不对（R14 B6-2 · Q6-04：`url` 写成数字等——起 agent 前的 OAuth 注入会抛 TypeError，
+ *    新任务和新对话一起起不来），判据见 validateMcpServerConfig。
+ * 丢掉的条目在日志里点名：只有条目名（②另带一句固定文案的原因，文案不含用户原值），不带内容。
+ */
+const pickMcpServerEntries = (
+  servers: Record<string, unknown>,
+  source: string,
+): Record<string, McpServerConfig> => {
+  const out: Record<string, McpServerConfig> = {};
+  const dropped: string[] = [];
+  const malformed: string[] = [];
+  for (const [name, cfg] of Object.entries(servers)) {
+    if (!isPlainObject(cfg)) {
+      dropped.push(name);
+      continue;
+    }
+    const reason = validateMcpServerConfig(cfg);
+    if (reason) malformed.push(`${name}（${reason}）`);
+    else out[name] = cfg as McpServerConfig;
+  }
+  if (dropped.length > 0) {
+    const shown = dropped.slice(0, 5).join("、");
+    console.warn(
+      `[cursor-config] ${source}里有 ${dropped.length} 个 MCP 条目不是对象，已忽略：${shown}${dropped.length > 5 ? " 等" : ""}`,
+    );
+  }
+  if (malformed.length > 0) {
+    const shown = malformed.slice(0, 5).join("、");
+    console.warn(
+      `[cursor-config] ${source}里有 ${malformed.length} 个 MCP 条目配置无效，已忽略：${shown}${malformed.length > 5 ? " 等" : ""}`,
+    );
+  }
+  return out;
+};
+
+/**
  * 读全局 `~/.cursor/mcp.json` → `{ name: McpServerConfig }`
  * - V0.13 起仅作**导入源**（能力页「从 Cursor 导入」dialog）、运行时不再读它
  * - 文件不存在 / 解析失败 → 返 `{}`（不抛；MCP 是可选能力）
@@ -54,10 +111,13 @@ export const readGlobalCursorMcpServers = async (): Promise<
     const file = path.join(dir, "mcp.json");
     try {
       const raw = await fs.readFile(file, "utf-8");
-      const parsed = JSON.parse(raw) as { mcpServers?: unknown };
+      const parsed = JSON.parse(stripBom(raw)) as { mcpServers?: unknown };
       const servers = parsed?.mcpServers;
       if (servers && typeof servers === "object" && !Array.isArray(servers)) {
-        return servers as Record<string, McpServerConfig>;
+        return pickMcpServerEntries(
+          servers as Record<string, unknown>,
+          "Cursor 全局 mcp.json ",
+        );
       }
     } catch {
       // 文件不存在 / JSON 坏 → 试下一个候选目录
@@ -72,13 +132,17 @@ export const readAppMcpServers = async (): Promise<
 > => {
   try {
     const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");
-    const parsed = JSON.parse(raw) as { mcpServers?: unknown };
+    const parsed = JSON.parse(stripBom(raw)) as { mcpServers?: unknown };
     const servers = parsed?.mcpServers;
     if (servers && typeof servers === "object" && !Array.isArray(servers)) {
-      return servers as Record<string, McpServerConfig>;
+      return pickMcpServerEntries(
+        servers as Record<string, unknown>,
+        "config.json 的 mcpServers ",
+      );
     }
-  } catch {
-    // 文件不存在 / 坏 JSON → 当空
+  } catch (err) {
+    // 文件不存在 = 没配过，静默；坏 JSON / 权限 / 被占用 → 仍按空处理，但留一行日志
+    warnConfigReadFailure("MCP 服务器", err);
   }
   return {};
 };
@@ -130,12 +194,14 @@ export const getAppRulesDir = (): string => path.join(dataRoot(), "rules");
 const readDisabledRules = async (): Promise<Set<string>> => {
   try {
     const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");
-    const parsed = JSON.parse(raw) as { disabledRules?: unknown };
+    const parsed = JSON.parse(stripBom(raw)) as { disabledRules?: unknown };
     const arr = parsed?.disabledRules;
     return new Set(
       Array.isArray(arr) ? arr.filter((s): s is string => typeof s === "string") : [],
     );
-  } catch {
+  } catch (err) {
+    // 读不出来 → 空集，用户禁用的规则会重新全开；所以非「文件不存在」要留一行日志
+    warnConfigReadFailure("禁用规则名单", err);
     return new Set();
   }
 };
@@ -168,6 +234,13 @@ export const readAppRulesForPrompt = async (): Promise<string> => {
   for (const file of files) {
     if (disabled.has(path.basename(file, path.extname(file)))) continue;
     try {
+      const size = (await fs.stat(file)).size;
+      if (size > MAX_RULE_FILE_BYTES) {
+        console.warn(
+          `[cursor-config] 规则文件过大（${size} 字节，上限 ${MAX_RULE_FILE_BYTES}），已跳过：${path.basename(file)}`,
+        );
+        continue;
+      }
       const parsed = parseFrontmatter(await fs.readFile(file, "utf-8"));
       // 老文件可能「只有 frontmatter description、正文为空」——退到 description、
       // 别把启用中的规则静默漏掉（Bugbot 揪出：UI 显示启用、prompt 里却没有）

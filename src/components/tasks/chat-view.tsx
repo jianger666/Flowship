@@ -30,6 +30,7 @@ import {
   type ChatWorkdirPickerHandle,
 } from "@/components/tasks/chat-workdir-picker";
 import { ChatMcpPicker } from "@/components/tasks/chat-mcp-picker";
+import { ArchivedNotice } from "@/components/tasks/archived-bar";
 import { ChatQueueBanner } from "@/components/tasks/chat-queue-banner";
 import { useSmoothStreaming } from "./use-smooth-streaming";
 import { useSmoothThinking } from "./use-smooth-thinking";
@@ -48,6 +49,10 @@ import {
   backgroundSubagentJobsEqual,
   type BackgroundSubagentJobView,
 } from "@/lib/background-subagents";
+import {
+  sameStorageDegraded,
+  type StorageDegradedState,
+} from "@/lib/storage-degraded";
 import { useDialog } from "@/hooks/use-dialog";
 import {
   clearChatOpLedger,
@@ -233,6 +238,10 @@ export const ChatView = ({
   const [backgroundSubagents, setBackgroundSubagents] = useState<
     BackgroundSubagentJobView[]
   >(NO_BACKGROUND_SUBAGENTS);
+  // 存储降级（SSE storage_degraded 帧维护；null = 没降级）：事件写盘失败期间事件流顶部常驻红条，
+  // 每次连接 bootstrap 补发当前值；切任务清空
+  const [storageDegraded, setStorageDegraded] =
+    useState<StorageDegradedState | null>(null);
   // Operation ledger（pending + settled + outcomes）——HTTP/SSE 同一 reducer
   const [pendingLocalReplies, setPendingLocalReplies] = useState<
     PendingLocalReply[]
@@ -342,6 +351,8 @@ export const ChatView = ({
     setRunActive(false);
     // 上个任务的后台子代理不能串到新任务（新任务连上 SSE 后 bootstrap 会补发它自己的）
     setBackgroundSubagents(NO_BACKGROUND_SUBAGENTS);
+    // 上个任务的存储降级红条同理不能串到新任务
+    setStorageDegraded(null);
     // 排队快照只对「本次挂载内登记的占位」有意义；切走后丢掉，免得越攒越多
     queuedAtSubmitRef.current = new Map();
     // 立即投影当前 ledger，再订阅后续 dispatch
@@ -485,6 +496,12 @@ export const ChatView = ({
     onBackgroundSubagents: (jobs) =>
       setBackgroundSubagents((prev) =>
         backgroundSubagentJobsEqual(prev, jobs) ? prev : jobs,
+      ),
+    // 存储降级（事件写盘失败）：与现值相同（bootstrap 补发 vs 实时帧常常同一份）就不 setState，
+    // 省一次整个聊天视图的重渲染
+    onStorageDegraded: (state) =>
+      setStorageDegraded((prev) =>
+        sameStorageDegraded(prev, state) ? prev : state,
       ),
     // msg 已是 runner 拼好的可读文案（「Chat agent 异常：…」），别再套一层
     // 「watch 出错」——那会误导成 SSE 断了，实际是 agent 挂了
@@ -1068,6 +1085,10 @@ export const ChatView = ({
         )}
       </div>
 
+      {/* 已归档提示 + 一键恢复（R14 B6-3 / Q3-03）：放在标题栏与内容区之间（ChatView 根是 h-full 的列，
+          别放进 page.tsx 的外层 wrapper——并列会把总高度撑出视口）；没归档时它自己返回 null */}
+      <ArchivedNotice task={task} onTaskUpdate={onTaskUpdate} />
+
       <div className="min-h-0 flex-1">
         <StreamActionsProvider value={streamActions}>
         <EventStream
@@ -1092,6 +1113,7 @@ export const ChatView = ({
           pendingLocalReplies={pendingForStream}
           queueBanner={queueBanner}
           backgroundSubagents={backgroundSubagents}
+          storageDegraded={storageDegraded}
           allowQueueWhileRunning
           onEditPending={handleEditPending}
           onDeletePending={handleDeletePending}

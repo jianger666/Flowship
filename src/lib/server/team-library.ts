@@ -35,7 +35,8 @@ import {
   listCustomActions,
   parseFlowshipActionMeta,
 } from "./custom-action-fs";
-import { dataRoot } from "./data-root";
+import { dataRoot, describeConfigReadError, stripBom } from "./data-root";
+import { gitEnv } from "./git-exec";
 import { createMR } from "./gitlab-client";
 import {
   assertTrustedGitHost,
@@ -278,11 +279,14 @@ export const buildAuthedGitArgs = (subArgs: string[]): string[] => [
   ...subArgs,
 ];
 
-/** 网络 git 操作的 env：继承进程 env + token（inline credential helper 从这读） */
-const buildGitTokenEnv = (token: string): NodeJS.ProcessEnv => ({
-  ...process.env,
-  [GIT_TOKEN_ENV]: token,
-});
+/**
+ * 网络 git 操作的 env：gitEnv()（剔宿主注入变量 + 剔 `FLOWSHIP_GITLAB_TOKEN` + 不等人输入，见 git-exec.ts）
+ * 再叠 token（inline credential helper 从 `TL_GIT_TOKEN` 读）。
+ * 子进程必须拿到 PAT 才能认证——这条通道的 PAT 只放在 `TL_GIT_TOKEN` 里；`FLOWSHIP_GITLAB_TOKEN` 没有任何 git 逻辑读它，剔掉不影响认证。
+ * 旧写法整份 `...process.env`：没有 `GIT_TERMINAL_PROMPT` 守卫（credential helper 吐了过期凭据 → 401 时，有控制终端的环境里 git 会停在提示上）。
+ */
+const buildGitTokenEnv = (token: string): NodeJS.ProcessEnv =>
+  gitEnv({ [GIT_TOKEN_ENV]: token });
 
 /** push 失败分类：保护分支拒绝（降级 MR）vs non-fast-forward（fetch+reset 重试）vs 其它 */
 export type PushRejectionKind = "protected" | "non-fast-forward" | "other";
@@ -500,13 +504,14 @@ export const getTeamLibraryConfig = async (): Promise<TeamLibraryConfig> => {
   let override: unknown = null;
   try {
     const raw = await fs.readFile(overrideConfigPath(), "utf-8");
-    override = JSON.parse(raw) as unknown;
+    override = JSON.parse(stripBom(raw)) as unknown;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") {
       console.warn(
         "[team-library] 读 team-library.json 失败、用默认配置:",
-        err instanceof Error ? err.message : err,
+        // 只说类别：V8 的 JSON 报错会夹带出错处附近的原文
+        describeConfigReadError(err),
       );
     }
   }
@@ -672,7 +677,7 @@ export const checkGitEgressTrusted = async (
       const { stdout } = await execFileAsync(
         "git",
         ["config", "--get", "remote.origin.url"],
-        { cwd, timeout: 10_000 },
+        { cwd, timeout: 10_000, env: gitEnv() },
       );
       url = String(stdout).trim();
     } catch {
@@ -696,8 +701,8 @@ const runGit = async (
       cwd,
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: 20 * 1024 * 1024,
-      // 不经 shell、防注入；env 仅网络操作显式传（credential helper 从 env 读 token）
-      ...(env ? { env } : {}),
+      // 不经 shell、防注入；网络操作显式传 buildGitTokenEnv（credential helper 从 env 读 token），其余本地操作走 gitEnv()
+      env: env ?? gitEnv(),
     });
     // 出口统一脱敏：即便上游哪天又把凭据带进 URL、这里兜底不外泄
     return {
@@ -745,13 +750,122 @@ const runGit = async (
   }
 };
 
+/** git 锁文件被视为「陈旧」的最小年龄（mtime 距今）：更新的锁可能属于正在跑的 git，不动 */
+export const STALE_GIT_LOCK_MIN_AGE_MS = 60_000;
+
+/** `.git/refs` 下找锁的最大目录深度（正常分支名 / 标签名远小于此；防异常深的目录拖慢 sync） */
+const GIT_LOCK_SCAN_MAX_DEPTH = 8;
+
+/**
+ * git 报这类 strerror 文案 = 环境问题（权限 / 文件被占用 / 磁盘空间）：缓存本身没坏，重新 clone 解决不了——
+ * 旧目录删不干净会半删（`cloneFresh` 里 `fs.rm` 的失败被吞）、新 clone 又因目标目录非空失败，缓存反而被毁、市场列表变空。
+ * `recloneBrokenCache` 遇到它一律保留缓存、如实报错，条件解除后下一轮自愈（基线本来就是这个行为）。
+ * 靠 strerror 文案判断（`gitEnv()` 没设 `LC_ALL=C`）：macOS / Windows 的 strerror 不本地化、Linux 可能本地化，
+ * 与 `classifyPushRejection` 同口径。export：单测按文案逐条验（`team-library-stale-lock.test.ts`）。
+ */
+export const isEnvironmentalGitError = (detail: string): boolean =>
+  /Permission denied|Operation not permitted|Device or resource busy|Invalid argument|No space left on device|Read-only file system|Disk quota exceeded|being used by another process/.test(
+    detail,
+  );
+
+/**
+ * 清掉主克隆里被杀的 git 进程留下的 `*.lock`（Q13-02）。
+ *
+ * 症状：sync / 上传中途被杀（退出 App、断电、崩溃）会在 `.git/` 留下 `index.lock` 等锁文件；
+ * `ensureRepoAt` 的探活（`rev-parse`）不需要锁、仍判「健康仓」，随后 `reset --hard` 要写 index → 报 File exists，
+ * 此后每次 sync 都失败，界面上没有任何修复入口。
+ *
+ * 范围：`.git/` 根下的 `*.lock`（index / HEAD / config / packed-refs / shallow …）+ `.git/refs/**` 下的 `*.lock`（ref 更新锁）。
+ * 不碰 `.git/objects`（对象库有自己的临时文件命名）、不碰 `gc.pid` 等非 `.lock` 文件、只动普通文件（目录 / 符号链接不动）。
+ *
+ * 判据：mtime 距今 ≥ minAgeMs 才删。仓锁内本进程没有并发 git，剩下的活锁只可能来自用户在终端里手动跑的 git；
+ * 年龄小的原样保留（宁可本轮失败、下轮自愈），并通过 skippedFresh 报给调用方。
+ * 删不掉（Windows 文件被占用等）一律吞掉：让后面的 git 命令自己报错。返回的路径相对 `.git/`、已排序。
+ * export：单测直接验阈值 / 范围（now 可注入、免真等）。
+ */
+export const clearStaleGitLocks = async (
+  repoDir: string,
+  opts?: { minAgeMs?: number; now?: number },
+): Promise<{ removed: string[]; skippedFresh: string[] }> => {
+  const gitDir = path.join(repoDir, ".git");
+  const minAgeMs = opts?.minAgeMs ?? STALE_GIT_LOCK_MIN_AGE_MS;
+  const now = opts?.now ?? Date.now();
+  const removed: string[] = [];
+  const skippedFresh: string[] = [];
+
+  const handleLock = async (abs: string): Promise<void> => {
+    const rel = path.relative(gitDir, abs).split(path.sep).join("/");
+    try {
+      const st = await fs.lstat(abs);
+      if (!st.isFile()) return;
+      if (now - st.mtimeMs < minAgeMs) {
+        skippedFresh.push(rel);
+        return;
+      }
+      await fs.rm(abs, { force: true });
+      removed.push(rel);
+    } catch {
+      // 读不到 / 删不掉：不处理，后面的 git 命令会给出真实错误
+    }
+  };
+
+  const walkRefs = async (dir: string, depth: number): Promise<void> => {
+    if (depth > GIT_LOCK_SCAN_MAX_DEPTH) return;
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const abs = path.join(dir, ent.name);
+      if (ent.isDirectory()) await walkRefs(abs, depth + 1);
+      else if (ent.isFile() && ent.name.endsWith(".lock")) await handleLock(abs);
+    }
+  };
+
+  let rootEntries;
+  try {
+    rootEntries = await fs.readdir(gitDir, { withFileTypes: true });
+  } catch {
+    return { removed, skippedFresh };
+  }
+  for (const ent of rootEntries) {
+    if (ent.isFile() && ent.name.endsWith(".lock")) {
+      await handleLock(path.join(gitDir, ent.name));
+    }
+  }
+  await walkRefs(path.join(gitDir, "refs"), 0);
+  return { removed: removed.sort(), skippedFresh: skippedFresh.sort() };
+};
+
+/**
+ * 本地缓存仓自检：索引读得出来、HEAD 解析得了。fetch 失败后用它区分「网络 / 认证 / 远端的问题」（仓没坏、别删）
+ * 与「本地仓损坏」（如索引被写坏：连 fetch 都会失败，之后每次同步都失败）。只读。
+ */
+const localRepoIsBroken = async (dir: string): Promise<boolean> => {
+  // 带一个必然无匹配的 pathspec：只验证「索引读得出来」，不输出一堆文件名
+  const index = await runGit(
+    ["ls-files", "--", ".flowship-probe-no-such-path"],
+    dir,
+  );
+  if (!index.ok) return true;
+  const head = await runGit(["rev-parse", "--verify", "-q", "HEAD"], dir);
+  return !head.ok;
+};
+
 /**
  * clone 或 fetch+hard-reset 到指定分支。
  * 认证走 inline credential helper + env token：origin / FETCH_HEAD 天然只有干净 URL。
  *
  * 半残自愈：`.git` 在但 `rev-parse --git-dir` 失败（clone 中途被杀等）→ 整目录删掉重 clone。
- * fetch/reset 失败仍返错、不删仓（网络抖动别误清缓存）；只有探活失败才删。
- * export：单测造半残 .git 验证自愈。
+ * 陈旧锁自愈（Q13-02）：健康仓在 fetch 之前先清被杀的 git 留下的 `*.lock`（见 clearStaleGitLocks）；
+ * 清锁后 `reset --hard` 仍失败（reset 是纯本地操作、不是网络抖动）、或 fetch 失败而本地自检不过
+ * （索引被写坏等，连 fetch 都读不了）→ 同样整仓重 clone。fetch 失败但本地自检通过 = 网络 / 认证 / 远端的问题，
+ * 仍返错、不删仓（网络抖动别误清缓存）；还有较新的锁（可能有 git 正在占用）时一律不删、等下一轮；
+ * git 报权限 / 文件被占用 / 磁盘空间这类环境问题（见 isEnvironmentalGitError）时同样不删——缓存没坏、重新 clone 也解决不了，
+ * 旧目录删不干净反而会把缓存毁掉一半：保留缓存、如实报错，条件解除后下一轮自愈。
+ * export：单测造半残 .git / 残留锁 / 损坏索引 / 只读目录验证自愈。
  */
 export const ensureRepoAt = async (opts: {
   dir: string;
@@ -771,8 +885,10 @@ export const ensureRepoAt = async (opts: {
     usableRepo = probe.ok;
   }
 
-  if (!usableRepo) {
-    // 空目录 / 半残 .git → 清掉再 clone（复用同一套 clone，不另写一份）
+  /** 整目录清掉再 clone：空目录 / 半残 .git / reset 失败后共用同一套 clone，不另写一份 */
+  const cloneFresh = async (): Promise<
+    { ok: true } | { ok: false; error: string }
+  > => {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     const clone = await runGit(
       buildAuthedGitArgs([
@@ -806,25 +922,151 @@ export const ensureRepoAt = async (opts: {
       }
     }
     return { ok: true };
+  };
+
+  if (!usableRepo) return cloneFresh();
+
+  // 已有健康仓：先清被杀的 git 留下的陈旧锁（Q13-02）——`remote set-url` 要写 config、`fetch` 要写 ref、
+  // `reset --hard` 要写 index，任何一把残留的锁都会让它们永久失败（set-url 的失败下面还不看返回值）
+  const locks = await clearStaleGitLocks(dir);
+  if (locks.removed.length > 0) {
+    console.warn(
+      `[team-library] 清除陈旧 git 锁文件（上次同步 / 上传被中断时留下）：${locks.removed.join("、")}`,
+    );
   }
 
-  // 已有健康仓：先修 origin URL（老版本 clone 可能残留带凭据的 URL）、再 fetch + hard reset
+  // 再修 origin URL（老版本 clone 可能残留带凭据的 URL）、再 fetch + hard reset
   await runGit(["remote", "set-url", "origin", cleanUrl], dir);
+
+  /**
+   * fetch / reset 失败后的收口：缓存确实坏了才整仓重 clone（缓存本来就是远端的副本）；
+   * 还有较新的锁（可能是用户终端里的 git 正在用这个目录）、或 git 报的是权限 / 文件被占用 / 磁盘空间这类环境问题
+   * （重新 clone 解决不了，删不干净还会把缓存毁掉一半）则一律不删、如实报错、等下一轮
+   */
+  const recloneBrokenCache = async (
+    stage: "fetch" | "reset",
+    detail: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> => {
+    if (locks.skippedFresh.length > 0) {
+      return {
+        ok: false,
+        error: `${stage} 失败：${detail}（还有较新的 git 锁文件 ${locks.skippedFresh.join("、")}，可能有 git 正在使用本地缓存，下次同步再试）`,
+      };
+    }
+    if (isEnvironmentalGitError(detail)) {
+      return {
+        ok: false,
+        error: `${stage} 失败：${detail}（权限 / 文件被占用 / 磁盘空间类问题，重新 clone 解决不了，已保留本地缓存）`,
+      };
+    }
+    console.warn(
+      `[team-library] ${stage} 失败且本地缓存已损坏、整仓重新 clone：`,
+      detail,
+    );
+    const recloned = await cloneFresh();
+    if (!recloned.ok) {
+      return {
+        ok: false,
+        error: `${stage} 失败：${detail}；整仓重新 clone 也失败：${recloned.error}`,
+      };
+    }
+    return recloned;
+  };
+
   const fetch = await runGit(
     buildAuthedGitArgs(["fetch", "origin", branch]),
     dir,
     env,
   );
   if (!fetch.ok) {
+    // fetch 失败多半是网络 / 认证 / 远端的问题——缓存没坏，不删（网络抖动别误清缓存）。
+    // 但本地缓存损坏（如索引被写坏）也会让 fetch 失败、而且之后每次都失败：
+    // 先做本地自检，自检不过才按「缓存坏了」处理
+    if (await localRepoIsBroken(dir)) {
+      return recloneBrokenCache("fetch", fetch.error);
+    }
     return { ok: false, error: `fetch 失败：${fetch.error}` };
   }
   const reset = await runGit(["reset", "--hard", "FETCH_HEAD"], dir);
   if (!reset.ok) {
-    return { ok: false, error: `reset 失败：${reset.error}` };
+    // reset 是纯本地操作：清完陈旧锁还失败不是网络抖动（索引 / 工作树损坏、有东西占着锁位）；
+    // 权限 / 文件被占用 / 磁盘空间这类环境问题缓存没坏，由 recloneBrokenCache 挡住、不删仓
+    return recloneBrokenCache("reset", reset.error);
   }
   // 清掉未跟踪脏文件（避免上次失败残留挡住下次拷贝）
   await runGit(["clean", "-fd"], dir);
   return { ok: true };
+};
+
+// ---------- 提交身份（Q13-07） ----------
+
+/**
+ * GitLab 身份 → 提交作者 / 提交者的环境变量。
+ * 邮箱：身份里的第一个邮箱；GitLab 没给任何邮箱时用它的 noreply 形态 `<userId>-<username>@users.noreply.<host>`
+ * （不写死 `flowship@local` 之类的假地址；host 是不带端口的主机名）。
+ * 名字 / 邮箱里的换行与尖括号会被 git 当成 ident 的分隔符，先剔掉。
+ * export：单测直接验口径。
+ */
+export const buildGitCommitIdentityEnv = (
+  identity: GitLabUploadIdentity,
+): Record<
+  | "GIT_AUTHOR_NAME"
+  | "GIT_AUTHOR_EMAIL"
+  | "GIT_COMMITTER_NAME"
+  | "GIT_COMMITTER_EMAIL",
+  string
+> => {
+  const clean = (s: string): string => s.replace(/[\r\n<>]/g, "").trim();
+  const username = clean(identity.username);
+  const name = clean(identity.name) || username || `user-${identity.userId}`;
+  const email =
+    clean(identity.emails[0] ?? "") ||
+    `${identity.userId}-${username}@users.noreply.${clean(identity.host)}`;
+  return {
+    GIT_AUTHOR_NAME: name,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: name,
+    GIT_COMMITTER_EMAIL: email,
+  };
+};
+
+/** 本机 git 能否给 commit / commit-tree 定出作者与提交者（环境变量 / 配置 / 自动推断 / useConfigOnly 一并按 git 自己的口径判） */
+const hasUsableGitIdentity = async (repoDir: string): Promise<boolean> => {
+  const author = await runGit(["var", "GIT_AUTHOR_IDENT"], repoDir);
+  if (!author.ok) return false;
+  const committer = await runGit(["var", "GIT_COMMITTER_IDENT"], repoDir);
+  return committer.ok;
+};
+
+/**
+ * `commit` / `commit-tree` 之前确认有提交身份（Q13-07）。
+ *
+ * 症状：没有全局 git 身份的机器（常见于 Windows / 新装机 / 容器）上 `git commit` 报
+ * `Author identity unknown` / `unable to auto-detect email address`，上传 / 镜像 / 写数据分支必败。
+ * macOS 往往能从「用户名@主机名」自动推断而成功，所以在开发机上不易复现。
+ *
+ * 取舍：**只在本机没有可用身份时才补**（`git var GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` 任一失败）——
+ * 本机已有身份的人（大多数）提交作者不变；要补时用 GitLab token 对应的身份，经环境变量注入，不写配置、不落盘。
+ * 返回：`env` 缺省 = 不用注入（原行为）；有值 = 传给 runGit 的 env（已叠在 gitEnv() 上）。
+ * 本机没身份、GitLab 身份也取不到 → 返回明确的中文错误（不再让 git 报一句看不懂的英文）。
+ * export：单测直接验三种分支。
+ */
+export const resolveCommitIdentityEnv = async (opts: {
+  repoDir: string;
+  repoUrl: string;
+  token: string;
+}): Promise<
+  { ok: true; env?: NodeJS.ProcessEnv } | { ok: false; error: string }
+> => {
+  if (await hasUsableGitIdentity(opts.repoDir)) return { ok: true };
+  const who = await getGitLabUploadIdentity(opts.repoUrl, opts.token);
+  if (!who.ok) {
+    return {
+      ok: false,
+      error: `本机 git 没有可用的提交身份（user.name / user.email 未配置），且无法从 GitLab 取得身份：${who.error}。请先在终端执行 git config --global user.name "你的名字" 与 git config --global user.email "你的邮箱"`,
+    };
+  }
+  return { ok: true, env: gitEnv(buildGitCommitIdentityEnv(who.identity)) };
 };
 
 // ---------- 文件拷贝 ----------
@@ -1170,6 +1412,78 @@ export const syncTeamLibrary = async (opts?: {
   }
 };
 
+// ---------- 失败出口回滚工作树（Q13-06） ----------
+
+/**
+ * 把主克隆的 HEAD / 暂存区 / 工作树恢复到 `baseSha`（reset --hard + clean -fd）。恢复失败只 warn、不抛：
+ * 调用方正要返回原始错误，恢复失败不该盖掉它；下次 sync 的 fetch+reset 会兜底。
+ */
+const restoreWorktreeTo = async (
+  repoDir: string,
+  baseSha: string,
+): Promise<void> => {
+  const reset = await runGit(["reset", "--hard", baseSha], repoDir);
+  if (!reset.ok) {
+    console.warn(
+      "[team-library] 失败后回滚工作树失败（下次 sync 兜底）:",
+      reset.error,
+    );
+    return;
+  }
+  const clean = await runGit(["clean", "-fd"], repoDir);
+  if (!clean.ok) {
+    console.warn(
+      "[team-library] 失败后清理未跟踪文件失败（下次 sync 兜底）:",
+      clean.error,
+    );
+  }
+};
+
+/**
+ * 写主克隆工作树的流程（上传 / 镜像 / 删除）的「失败即回滚」外壳（Q13-06）。
+ *
+ * 症状：这些流程先改工作树（拷 skill / 删目录 / 整库镜像），再 add / 敏感扫描 / commit / push；任何一步失败
+ * （敏感命中、push 被拒、全部 skill 准备失败、拷贝中途抛错…）此前都不恢复——没传上去的 skill 目录留在工作树里，
+ * 共享市场列表读本地工作树，用户看到「已在共享库」的幻影，一直留到下次 sync 的 reset + clean
+ * （若同时有残留锁，则永久，见 Q13-02）；删除失败则相反，本地目录没了、远端还在。
+ *
+ * 做法：入口记下 HEAD；`fn` 里**推送成功**后必须调 `done.committed()`——没调就返回、或抛异常，一律回滚到入口 HEAD。
+ * 默认回滚、成功才豁免：以后新增的失败出口天然被覆盖。成功（含保护分支降级 MR——fallbackToMR 自己已恢复克隆）不动。
+ * 判据**不能**看调用方的返回值：上传的 `ok` 在「push 已成功、个别 skill 准备失败」时也是 false，那种情况不能回滚。
+ * 入口 HEAD 取不到（空仓等）→ 不回滚、只 warn。
+ * 调用方须已持仓锁、并已 sync（入口时工作树是干净的，回滚不会丢别的改动——主克隆是缓存目录，没有人手改）。
+ * export：单测直接验「没标成功 / 抛错 → 回滚、标了成功 → 不动、恢复失败不盖原错误」。
+ */
+export const withWorktreeRollback = async <T>(
+  repoDir: string,
+  fn: (done: { committed: () => void }) => Promise<T>,
+): Promise<T> => {
+  const head = await runGit(["rev-parse", "HEAD"], repoDir);
+  const baseSha = head.ok ? head.stdout.trim() : "";
+  let committed = false;
+  const rollback = async (): Promise<void> => {
+    if (!baseSha) {
+      console.warn(
+        "[team-library] 取不到入口 HEAD、跳过失败后的工作树回滚（下次 sync 兜底）",
+      );
+      return;
+    }
+    await restoreWorktreeTo(repoDir, baseSha).catch(() => {});
+  };
+  try {
+    const result = await fn({
+      committed: () => {
+        committed = true;
+      },
+    });
+    if (!committed) await rollback();
+    return result;
+  } catch (err) {
+    if (!committed) await rollback();
+    throw err;
+  }
+};
+
 // ---------- commit + push（含冲突重试 + 保护分支 MR 降级） ----------
 
 type CommitPushResult =
@@ -1284,6 +1598,21 @@ const commitAndPush = async (opts: {
   // token 走 env + inline credential helper、push 用干净的 origin（不再拼 authed URL）
   const env = buildGitTokenEnv(token);
 
+  // 提交身份（Q13-07）：本机缺身份时才用 GitLab 身份补；探测 + 取身份只做一次（重试轮复用），
+  // 且放在「确有变更要提交」之后才触发——无变更的幂等返回不为它多起 git 进程
+  let identityEnv: Awaited<ReturnType<typeof resolveCommitIdentityEnv>> | null =
+    null;
+  const getIdentityEnv = async () => {
+    if (!identityEnv) {
+      identityEnv = await resolveCommitIdentityEnv({
+        repoDir,
+        repoUrl: cleanUrl,
+        token,
+      });
+    }
+    return identityEnv;
+  };
+
   const tryOnce = async (): Promise<
     | { ok: true }
     | {
@@ -1324,9 +1653,14 @@ const commitAndPush = async (opts: {
       };
     }
 
+    const who = await getIdentityEnv();
+    if (!who.ok) {
+      return { ok: false, error: who.error, kind: "other" };
+    }
     const commit = await runGit(
       ["commit", "-m", message, "--no-gpg-sign"],
       repoDir,
+      who.env,
     );
     if (!commit.ok) {
       return {
@@ -1517,6 +1851,7 @@ const showGitFile = async (
       cwd: repoDir,
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: 20 * 1024 * 1024,
+      env: gitEnv(),
     });
     return typeof stdout === "string" ? stdout : String(stdout);
   } catch {
@@ -1629,6 +1964,13 @@ const writeTeamLibraryBranchFileInternal = async (opts: {
     return { ok: false, error: "团队库尚未同步到本机（等启动 sync 完成后自动重试）" };
   }
   const env = buildGitTokenEnv(token);
+  // 提交身份（Q13-07）：commit-tree 同样要作者 / 提交者——本机缺身份时才用 GitLab 身份补（见 resolveCommitIdentityEnv）
+  const identityEnv = await resolveCommitIdentityEnv({
+    repoDir,
+    repoUrl: (await getTeamLibraryConfig()).repoUrl,
+    token,
+  });
+  if (!identityEnv.ok) return { ok: false, error: identityEnv.error };
   // 临时索引 + 暂存内容都放系统临时目录：绝不能落在仓库工作树里
   // （会被 `git clean -fd` 删、或被 upload 的 `git add -A` 捡走）
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "flowship-tl-"));
@@ -1706,6 +2048,7 @@ const writeTeamLibraryBranchFileInternal = async (opts: {
           message,
         ],
         repoDir,
+        identityEnv.env,
       );
       if (!committed.ok) {
         lastError = `git commit-tree 失败：${committed.error}`;
@@ -1993,53 +2336,60 @@ const uploadSkillsInternal = async (
     return results;
   };
 
-  let results = await stageAll();
-  const stagedOk = results.some((r) => r.ok);
-  if (!stagedOk) {
-    return { ok: false, results, error: "全部 skill 准备失败" };
-  }
+  // 失败即回滚（Q13-06）：stage 阶段已把 skill 拷进主克隆工作树；push 成功之前的任何失败出口（全部准备失败 /
+  // 敏感命中 / push 被拒 / 拷贝中途抛错…）都恢复到入口 HEAD，否则没传上去的 skill 会作为「已在共享库」的幻影留在本地市场列表里
+  return withWorktreeRollback<UploadSkillsResult>(repoDir, async (done) => {
+    let results = await stageAll();
+    const stagedOk = results.some((r) => r.ok);
+    if (!stagedOk) {
+      return { ok: false, results, error: "全部 skill 准备失败" };
+    }
 
-  const message = `feat(skills): 上传 ${unique.join(", ")} → ${category} from Flowship`;
-  const push = await commitAndPush({
-    repoDir,
-    cleanUrl: cfg.repoUrl,
-    branch: cfg.branch,
-    token,
-    message,
-    restage: async () => {
-      results = await stageAll();
-    },
-    // main 受保护（developer 无直推权限）→ 推临时分支 + 开 MR
-    mrFallback: {
-      tempBranch: buildUploadBranchName(unique),
-      description: [
-        "来自 Flowship 组共享库上传（main 受保护、自动降级为 MR）。",
-        "",
-        `分类：${category}`,
-        "包含 skill：",
-        ...unique.map((n) => `- ${n}`),
-      ].join("\n"),
-    },
-    // dialog「确认无敏感信息」勾选后带 force 放行误报
-    force: opts?.force === true,
-  });
+    const message = `feat(skills): 上传 ${unique.join(", ")} → ${category} from Flowship`;
+    const push = await commitAndPush({
+      repoDir,
+      cleanUrl: cfg.repoUrl,
+      branch: cfg.branch,
+      token,
+      message,
+      restage: async () => {
+        results = await stageAll();
+      },
+      // main 受保护（developer 无直推权限）→ 推临时分支 + 开 MR
+      mrFallback: {
+        tempBranch: buildUploadBranchName(unique),
+        description: [
+          "来自 Flowship 组共享库上传（main 受保护、自动降级为 MR）。",
+          "",
+          `分类：${category}`,
+          "包含 skill：",
+          ...unique.map((n) => `- ${n}`),
+        ].join("\n"),
+      },
+      // dialog「确认无敏感信息」勾选后带 force 放行误报
+      force: opts?.force === true,
+    });
 
-  if (!push.ok) {
+    if (!push.ok) {
+      return {
+        ok: false,
+        results: results.map((r) =>
+          r.ok ? { ...r, ok: false, error: push.error } : r,
+        ),
+        error: push.error,
+        ...(push.sensitiveHits ? { sensitiveHits: push.sensitiveHits } : {}),
+      };
+    }
+    // 推送成功（含保护分支降级 MR）：此后不再回滚——哪怕个别 skill 在 stage 阶段失败（allOk=false），
+    // 其余的已经推上去了
+    done.committed();
+    const allOk = results.every((r) => r.ok);
     return {
-      ok: false,
-      results: results.map((r) =>
-        r.ok ? { ...r, ok: false, error: push.error } : r,
-      ),
-      error: push.error,
-      ...(push.sensitiveHits ? { sensitiveHits: push.sensitiveHits } : {}),
+      ok: allOk,
+      results,
+      ...(push.pendingReview ? { pendingReview: true, mrUrl: push.mrUrl } : {}),
     };
-  }
-  const allOk = results.every((r) => r.ok);
-  return {
-    ok: allOk,
-    results,
-    ...(push.pendingReview ? { pendingReview: true, mrUrl: push.mrUrl } : {}),
-  };
+  });
 };
 
 /**
@@ -2160,31 +2510,35 @@ const mirrorKnowledgeBaseInternal = async (): Promise<{
     });
   };
 
-  try {
-    await stageMirror();
-  } catch (err) {
-    return {
-      ok: false,
-      error: `镜像拷贝失败：${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
+  // 失败即回滚（Q13-06）：整库镜像会先 rm 掉本地 knowledge/ 再重拷；镜像拷贝抛错 / 敏感命中 / push 失败都要把它恢复回来
+  return withWorktreeRollback(repoDir, async (done) => {
+    try {
+      await stageMirror();
+    } catch (err) {
+      return {
+        ok: false,
+        error: `镜像拷贝失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
 
-  const push = await commitAndPush({
-    repoDir,
-    cleanUrl: cfg.repoUrl,
-    branch: cfg.branch,
-    token,
-    message: "chore(knowledge): mirror wk-harness-platform from Flowship",
-    restage: stageMirror,
+    const push = await commitAndPush({
+      repoDir,
+      cleanUrl: cfg.repoUrl,
+      branch: cfg.branch,
+      token,
+      message: "chore(knowledge): mirror wk-harness-platform from Flowship",
+      restage: stageMirror,
+    });
+    if (!push.ok) {
+      return {
+        ok: false,
+        error: push.error,
+        ...(push.sensitiveHits ? { sensitiveHits: push.sensitiveHits } : {}),
+      };
+    }
+    done.committed();
+    return { ok: true };
   });
-  if (!push.ok) {
-    return {
-      ok: false,
-      error: push.error,
-      ...(push.sensitiveHits ? { sensitiveHits: push.sensitiveHits } : {}),
-    };
-  }
-  return { ok: true };
 };
 
 /**
@@ -2618,50 +2972,56 @@ const deleteFromTeamLibraryInternal = async (
     await fs.rm(hit.absDir, { recursive: true, force: true });
   };
 
-  await stageDelete();
+  // 失败即回滚（Q13-06）：stageDelete 已把本地 skill 目录删了；push 失败时要恢复回来，
+  // 否则本地市场列表里这条凭空消失、远端其实还在
+  return withWorktreeRollback<DeleteFromTeamLibraryResult>(repoDir, async (done) => {
+    await stageDelete();
 
-  const message = `chore(skills): 删除 ${needle}`;
-  const push = await commitAndPush({
-    repoDir,
-    cleanUrl: cfg.repoUrl,
-    branch: cfg.branch,
-    token,
-    message,
-    restage: stageDelete,
-    mrFallback: {
-      tempBranch: buildUploadBranchName([`delete-${needle}`]),
-      description: [
-        "来自 Flowship 组共享库删除（main 受保护、自动降级为 MR）。",
-        "",
-        `删除 skill：${needle}`,
-        `路径：${located.relDir}`,
-      ].join("\n"),
-    },
+    const message = `chore(skills): 删除 ${needle}`;
+    const push = await commitAndPush({
+      repoDir,
+      cleanUrl: cfg.repoUrl,
+      branch: cfg.branch,
+      token,
+      message,
+      restage: stageDelete,
+      mrFallback: {
+        tempBranch: buildUploadBranchName([`delete-${needle}`]),
+        description: [
+          "来自 Flowship 组共享库删除（main 受保护、自动降级为 MR）。",
+          "",
+          `删除 skill：${needle}`,
+          `路径：${located.relDir}`,
+        ].join("\n"),
+      },
+    });
+
+    if (!push.ok) return { ok: false, error: push.error };
+    // 推送成功：此后（清 skill-states / re-sync）再出什么事也不回滚——远端已经删掉了
+    done.committed();
+
+    // 保护分支降级：远端尚未删、本地 clone 已恢复——只回 MR、不清 states
+    if (push.pendingReview) {
+      return { ok: true, pendingReview: true, mrUrl: push.mrUrl };
+    }
+
+    // 直推成功：清本地 skill-states 该条 + 再 sync 对齐远端
+    const states = await readTeamSkillStates();
+    if (needle in states) {
+      delete states[needle];
+      await writeTeamSkillStates(states);
+    }
+    const resync = await syncInternal();
+    if (!resync.ok) {
+      // 远端已删成功、本地 sync 失败只 warn——下次启动 / 手动同步会兜底
+      console.warn(
+        "[team-library] 删除后 re-sync 失败:",
+        resync.error,
+      );
+    }
+
+    return { ok: true };
   });
-
-  if (!push.ok) return { ok: false, error: push.error };
-
-  // 保护分支降级：远端尚未删、本地 clone 已恢复——只回 MR、不清 states
-  if (push.pendingReview) {
-    return { ok: true, pendingReview: true, mrUrl: push.mrUrl };
-  }
-
-  // 直推成功：清本地 skill-states 该条 + 再 sync 对齐远端
-  const states = await readTeamSkillStates();
-  if (needle in states) {
-    delete states[needle];
-    await writeTeamSkillStates(states);
-  }
-  const resync = await syncInternal();
-  if (!resync.ok) {
-    // 远端已删成功、本地 sync 失败只 warn——下次启动 / 手动同步会兜底
-    console.warn(
-      "[team-library] 删除后 re-sync 失败:",
-      resync.error,
-    );
-  }
-
-  return { ok: true };
 };
 
 /**

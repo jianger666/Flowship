@@ -26,6 +26,7 @@
 import {
   registerModelSpillResult,
   spillModelFullOutput,
+  truncateHeadTail,
   truncateToLimit,
 } from "./tool-result-persist";
 
@@ -33,6 +34,12 @@ import {
 export const MODEL_OUTPUT_DEFAULT_BUDGET = 32 * 1024;
 /** read 单独 64KB（看代码要上下文） */
 export const MODEL_OUTPUT_READ_BUDGET = 64 * 1024;
+
+/**
+ * shell 超预算时保留的开头字节数，其余配额（约 24KB）全给结尾（R14 Q11-04）。
+ * 构建 / 测试命令的报错几乎都在输出末尾，旧口径「只留前 32KB」会把失败原因整段砍掉。
+ */
+export const SHELL_MODEL_HEAD_BYTES = 8 * 1024;
 
 export const budgetForTool = (toolName: string): number =>
   toolName === "read" ? MODEL_OUTPUT_READ_BUDGET : MODEL_OUTPUT_DEFAULT_BUDGET;
@@ -77,6 +84,8 @@ export type TruncatedModelOutput = {
  * 纯函数：超预算则截断 + 拼指引后缀。
  * 主体截断复用事件落盘同款 `truncateToLimit`（code-point 边界、后缀计入配额），
  * 中文不会被拦腰砍；指引后缀挂在配额之外（约 150～300B、可观测性优先）。
+ * shell 例外：用同一份落盘预览的 `truncateHeadTail`（头 {@link SHELL_MODEL_HEAD_BYTES} + 尾），
+ * 因为命令的失败原因在尾部（R14 Q11-04）；其余工具只留头部。
  * spillAbsPath 有值 → 后缀给落盘路径 + read/grep 取全文指引（V2）；
  * 无值 → 老缩小范围指引（V1 降级）。
  */
@@ -90,13 +99,21 @@ export const truncateModelOutput = (
   if (originalBytes <= budget) {
     return { text, truncated: false, originalBytes, givenBytes: originalBytes };
   }
-  const body = truncateToLimit(text, budget);
+  // shell：头 + 尾（报错在尾部）；其余工具仍只留头部。头部第一行是 shellTool 写的状态行
+  // （退出码 / 被信号终止 / 输出收集被截），所以不管怎么截它都在
+  const headTail = toolName === "shell";
+  const body = headTail
+    ? truncateHeadTail(text, budget, SHELL_MODEL_HEAD_BYTES)
+    : truncateToLimit(text, budget);
   const tail = spillAbsPath
     ? `完整全文已落盘到 ${spillAbsPath}，用 read offset/limit 分页读全，或 grep 搜关键词定位`
     : hintForTool(toolName);
   const out =
     `${body}\n…(模型输入已截断：原文 ${fmtBytes(originalBytes)}，` +
-    `本次只给前 ${fmtBytes(Buffer.byteLength(body, "utf-8"))}。${tail})`;
+    (headTail
+      ? `本次只给开头 ${fmtBytes(SHELL_MODEL_HEAD_BYTES)} + 结尾，共 ${fmtBytes(Buffer.byteLength(body, "utf-8"))}。`
+      : `本次只给前 ${fmtBytes(Buffer.byteLength(body, "utf-8"))}。`) +
+    `${tail})`;
   return {
     text: out,
     truncated: true,

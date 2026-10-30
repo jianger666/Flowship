@@ -14,6 +14,7 @@ import path from "node:path";
 
 import {
   buildScheduleRecord,
+  findDuplicateSchedule,
   isFinishedStatus,
   isValidScheduleRecord,
   markCancelled,
@@ -236,8 +237,9 @@ const replaceOne = (
 
 // ----------------- 业务操作 -----------------
 
+/** `deduped: true` = 已经有一条完全等价的活定时（R14 Q20-05），没有新建；`record` 是那条已有的 */
 export type CreateResult =
-  | { ok: true; record: ScheduleRecord }
+  | { ok: true; record: ScheduleRecord; deduped?: true }
   | { ok: false; error: string };
 
 export const createSchedule = async (
@@ -246,6 +248,9 @@ export const createSchedule = async (
   now: number = Date.now(),
 ): Promise<CreateResult> => {
   const out = await mutateSchedules<CreateResult>(taskId, (list) => {
+    // 先查重、后查上限：重复的请求不该因为「已满 20 条」被拒，也不该多占一个名额
+    const dup = findDuplicateSchedule(list, input);
+    if (dup) return { list, changed: false, result: { ok: true, record: dup, deduped: true } };
     const active = list.filter((r) => r.status === "active" || r.status === "paused").length;
     if (active >= SCHEDULE_MAX_ACTIVE_PER_TASK) {
       return {

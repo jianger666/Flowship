@@ -5,7 +5,10 @@
  * 只往**已绑定**的需求群发、不建群。
  * 发到需求群走 {@link shareToRequirementGroup}（卡片 `<at email>`）；
  * 换人（user_key → 邮箱）仍在本模块，没邮箱的不 @。
- * 对不上 / 没群 / bot 不在群一律静默：不抛、不写 error 事件、不弹引导。
+ * 没群一律静默（不是每个任务都用群）；其余没送达的——bot 不在群 / 测试人员换不出邮箱 / 发送失败 / 超时——
+ * 给属主留一条 info（可操作的话，见 {@link testerNotifyIssueText}）：这些 outcome 原来只回给 agent，
+ * 写不写进 artifact 全看模型，app 内零痕迹，属主会以为测试已被 @（B4-4 / Q12b-04）。
+ * 一律不抛、不写 error 事件、不弹引导；info 写失败只吞掉（不影响提测流程）。
  *
  * 依赖方向同 group-broadcast：本模块被 task-runner 静态引用，feishu-group /
  * meegle-cli / 注册表一律运行时动态 import。
@@ -277,6 +280,65 @@ export interface TesterNotifyOpts {
   emitInfo?: (text: string) => Promise<void> | void;
 }
 
+/** info 里「原因」部分的最大长度（FeishuGroupError / LarkApiError 的 message 都是整理过的，仍封个顶） */
+const ISSUE_REASON_MAX = 200;
+
+/** 没送达的几种情形——各自要告诉属主「发生了什么」和「接下来手动做什么」 */
+export type TesterNotifyIssue =
+  | { kind: "bot_not_in_group"; botLabel?: string }
+  | { kind: "no_identity"; names: string[] }
+  | { kind: "group_unreachable" }
+  | { kind: "owner_not_in_group" }
+  | { kind: "send_failed"; reason: string }
+  | { kind: "timeout" }
+  | { kind: "prepare_failed"; reason: string };
+
+const clipReason = (raw: string): string => {
+  const one = raw.replace(/\s+/g, " ").trim();
+  return one.length > ISSUE_REASON_MAX ? `${one.slice(0, ISSUE_REASON_MAX - 1)}…` : one;
+};
+
+/**
+ * 没送达时写给属主的那句 info（纯函数、单测按字面断言）。
+ *
+ * 每句都是「没发出去 + 为什么 + 现在该手动做什么」：提测通知是 ship 的最后一拍，之后没有人会再提醒测试，
+ * 属主得知道要自己去 @。没有「重发」说法——重发只在 ship 进行中由 agent 重调，这里拿不到。
+ */
+export const testerNotifyIssueText = (issue: TesterNotifyIssue): string => {
+  switch (issue.kind) {
+    case "bot_not_in_group": {
+      const who = issue.botLabel ? `机器人「${issue.botLabel}」` : "机器人";
+      return `提测通知没发出去：${who}不在需求群里（可能被移出了群）。请把它加回群，并手动 @ 测试人员`;
+    }
+    case "no_identity": {
+      const who = issue.names.length > 0 ? issue.names.join("、") : "测试人员";
+      return `提测通知没发出去：没能换出 ${who} 的飞书邮箱（工作项角色里没有、user search 也没查到），无法 @。请手动 @ 他们`;
+    }
+    case "group_unreachable":
+      return "提测通知没发出去：需求群已解散或失效。请在「需求群」弹窗换绑 / 重建一个群，并手动 @ 测试人员";
+    case "owner_not_in_group":
+      return "提测通知没发出去：你已不在需求群里。请先回到群里（或在「需求群」弹窗换绑），并手动 @ 测试人员";
+    case "send_failed":
+      return `提测通知发送失败（${clipReason(issue.reason)}）。请手动 @ 测试人员，或稍后重新提测`;
+    case "timeout":
+      return "提测通知超时，没能确认是否发出（可能已经发出，请到需求群看一眼）。没有的话请手动 @ 测试人员";
+    case "prepare_failed":
+      return `提测通知没能发出去（${clipReason(issue.reason)}）。请手动 @ 测试人员`;
+  }
+};
+
+/** 给属主留一条没送达的 info；永不抛（事件流写失败不能影响提测流程） */
+const emitIssue = async (
+  opts: TesterNotifyOpts,
+  issue: TesterNotifyIssue,
+): Promise<void> => {
+  try {
+    await opts.emitInfo?.(testerNotifyIssueText(issue));
+  } catch {
+    /* 事件流写失败不影响提测流程 */
+  }
+};
+
 const errText = (err: unknown): string =>
   err instanceof Error ? err.message : String(err);
 
@@ -288,6 +350,13 @@ const groupErrorCode = (err: unknown): string | undefined => {
     return rec.code;
   }
   return undefined;
+};
+
+/** FeishuGroupError.botLabel（bot_not_in_group 时带本机 bot 展示名）；同样不静态 import 那个类 */
+const groupErrorBotLabel = (err: unknown): string | undefined => {
+  if (!err || typeof err !== "object") return undefined;
+  const label = (err as { botLabel?: unknown }).botLabel;
+  return typeof label === "string" && label.trim() ? label.trim() : undefined;
 };
 
 const withTimeout = async <T>(
@@ -315,20 +384,30 @@ export const notifyShipTestersInGroup = async (
   task: Task,
   action: ActionRecord,
   opts: TesterNotifyOpts = {},
-): Promise<TesterNotifyOutcome> =>
-  withTimeout<TesterNotifyOutcome>(
-    runNotify(task, action, opts),
-    TESTER_NOTIFY_TIMEOUT_MS,
-    () => {
-      deps.warn(
-        `超时 task=${task.id} action=${action.id}、放弃（不影响提测完成）`,
-      );
-      return "failed";
-    },
-  ).catch((err): TesterNotifyOutcome => {
+): Promise<TesterNotifyOutcome> => {
+  let timedOut = false;
+  let outcome: TesterNotifyOutcome;
+  try {
+    outcome = await withTimeout<TesterNotifyOutcome>(
+      runNotify(task, action, opts),
+      TESTER_NOTIFY_TIMEOUT_MS,
+      () => {
+        timedOut = true;
+        deps.warn(
+          `超时 task=${task.id} action=${action.id}、放弃（不影响提测完成）`,
+        );
+        return "failed";
+      },
+    );
+  } catch (err) {
     deps.warn(`未捕获异常 task=${task.id} action=${action.id}：${errText(err)}`);
+    await emitIssue(opts, { kind: "prepare_failed", reason: errText(err) });
     return "failed";
-  });
+  }
+  // 超时：runNotify 还在后台跑、可能随后真的发出去（那时它自己会再写「已在需求群 @」）——所以这里说「没能确认」而不是「失败」
+  if (timedOut) await emitIssue(opts, { kind: "timeout" });
+  return outcome;
+};
 
 const runNotify = async (
   task: Task,
@@ -392,6 +471,8 @@ const runNotify = async (
     // 只走卡片：有邮箱才 @（`<at email>` 已证可渲染+推送），没邮箱的进 missed，不走 post。
     const cardTargets = at.filter((t) => t.email);
     if (cardTargets.length === 0) {
+      // 谁没换出来要点名：pickTesterAtTargets 里没邮箱的一律进 missedNames（展示名或 key），`at` 里全是有邮箱的
+      await emitIssue(opts, { kind: "no_identity", names: [...new Set(missedNames)] });
       return "skipped_no_open_ids";
     }
     if (!claimNotify(task.id, action.id)) return "skipped_duplicate";
@@ -416,14 +497,25 @@ const runNotify = async (
       releaseNotify(task.id, action.id);
       if (code === "bot_not_in_group") {
         deps.warn(
-          `bot 不在群，静默跳过 task=${task.id} action=${action.id}`,
+          `bot 不在群，已给属主留 info task=${task.id} action=${action.id}`,
         );
+        await emitIssue(opts, {
+          kind: "bot_not_in_group",
+          botLabel: groupErrorBotLabel(err),
+        });
         return "skipped_bot_not_in_group";
       }
       if (code === "no_group" || code === "no_story") {
         return "skipped_no_group";
       }
       deps.warn(`发送失败 task=${task.id}：${errText(err)}`);
+      if (code === "group_unreachable") {
+        await emitIssue(opts, { kind: "group_unreachable" });
+      } else if (code === "owner_not_in_group") {
+        await emitIssue(opts, { kind: "owner_not_in_group" });
+      } else {
+        await emitIssue(opts, { kind: "send_failed", reason: errText(err) });
+      }
       return "failed";
     }
 
@@ -442,6 +534,7 @@ const runNotify = async (
     return "sent";
   } catch (err) {
     deps.warn(`准备失败 task=${task.id}：${errText(err)}`);
+    await emitIssue(opts, { kind: "prepare_failed", reason: errText(err) });
     return "failed";
   }
 };
