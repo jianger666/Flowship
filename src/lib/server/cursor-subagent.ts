@@ -52,12 +52,19 @@
  *   - 同一个子代理同时只允许一个 run（resume 时占位，跑完释放）。
  *   - 登记表挂 globalThis（Next 多个路由 chunk 各 import 一份模块也共用）、有容量上限。
  *
+ * # 重复派发（同一个 toolCallId 又来一遍）
+ * SDK 会在**同一个运行里**把还没全部返回的工具调用整批重新派发：回调被同一个 toolCallId 再执行一遍
+ * （事件流里表现为同一个 callId 两条结果、多出一张没名字的卡，见 tool-display 的同 callId 结果去重）。
+ * 每次重复都是一个完整的子代理运行，所以这里按「会话 + toolCallId + 入参摘要」去重（{@link callReplayKey}）：
+ * 在飞的并入同一次、已成功的原样回放；失败 / 取消不缓存（重试要能真的再跑）；没有 toolCallId 的不去重。
+ * 拦不住的：SDK 自己执行的内置工具（shell / read / edit 等）的重复不经过这里；应用重启后新 link 的记录是空的。
+ *
  * # 子 agent 的边界
  * 不带系统工具（submit_work / ask_user…）、不带用户 MCP、不带 `subagent`/`task`——防递归与副作用。
  * explore = 只读白名单（read / grep / glob / ls）；其余 = 默认内置工具、去掉 `task`。
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { Agent as CursorAgent } from "@cursor/sdk";
 import type { ModelSelection, SDKCustomTool, ToolName } from "@cursor/sdk";
@@ -318,6 +325,51 @@ const textResult = (text: string, isError = false) => ({
   content: [{ type: "text" as const, text }],
   ...(isError ? { isError: true } : {}),
 });
+
+type SubagentToolReply = ReturnType<typeof textResult>;
+type SubagentExecuteArgs = Parameters<SDKCustomTool["execute"]>;
+
+// ----------------- 重复派发（同一次工具调用又来一遍） -----------------
+
+/**
+ * 一个 link（= 一个父会话）里最多记这么多条「已派发的调用」（在飞的 + 已成功的）；超出时先淘汰最老的**已结束**的
+ * （在飞的不淘汰：它的数量天然被真实并发限住）。防止长会话里无限涨。
+ */
+export const CALL_DEDUPE_MAX_ENTRIES = 64;
+
+/**
+ * 同一次工具调用被重复派发时的识别键 = 会话 id + toolCallId + 入参摘要。
+ *
+ * 为什么要这个：SDK 会在**同一个运行里**把还没全部返回的工具调用整批重新派发（实测：同一个 toolCallId 的回调被执行第二遍，
+ * 间隔从几十秒到近一小时不等，常常是并行的几个子代理在同一时刻被各重跑一遍；已经返回之后才重派也发生过）。
+ * 回调拿不到「这是重复」的信号，不拦的话每次重复都是一个完整的子代理运行：白烧 token，可写的子代理还会把活干两遍。
+ *
+ * - 没有 toolCallId（旧版 SDK / 裸调用）→ undefined，不去重，行为与以前一致；
+ * - 入参摘要：call id 理应唯一，但那是 SDK 的约定、不是我们能验证的保证（别的后端——自定义 agent 的网关——就出现过
+ *   重试时复用同一个 call id，见 tests/custom-agent-retry-dup.test.ts；那条链路不经过这里，管不到它）；所以同 id 但参数
+ *   不同就当新调用，宁可漏合并（回到以前的行为），也不能把另一件事当成重复、回放一个张冠李戴的结果；
+ * - sessionId：SDK 原生 Task 子会话有自己的 id，不同子会话里碰巧同名的 call id 不互相合并。
+ */
+const callReplayKey = (
+  args: unknown,
+  context: SubagentExecuteArgs[1] | undefined,
+): string | undefined => {
+  const id = context?.toolCallId;
+  if (typeof id !== "string" || !id) return undefined;
+  let digest: string;
+  try {
+    digest = createHash("sha1")
+      .update(JSON.stringify(args) ?? "")
+      .digest("hex");
+  } catch {
+    return undefined; // 入参序列化不了：不冒险，当没有 id
+  }
+  return `${context?.sessionId ?? ""}\u0000${id}\u0000${digest}`;
+};
+
+/** 能原样回放给重复派发的回执：只有成功的。错误 / 取消不缓存——重试要能真的再跑一次 */
+const isReplayableReply = (reply: SubagentToolReply): boolean =>
+  reply.isError !== true && reply.content[0]?.text !== CANCELLED_TEXT;
 
 // ----------------- 可 resume 的子代理登记表 -----------------
 
@@ -1048,6 +1100,65 @@ export const createCursorSubagentLink = (
     return typeof t === "string" && t.trim() ? t.trim() : undefined;
   };
 
+  /** 一次真正的派发：解析 → 起子代理 → 把结果收成工具回执（永不 reject 的部分都在这里兜住） */
+  const executeOnce = async (
+    args: SubagentExecuteArgs[0],
+    context: SubagentExecuteArgs[1] | undefined,
+  ): Promise<SubagentToolReply> => {
+    const parsed = parseSubagentRequest(args);
+    // 用法错误（prompt 空 / model / effort 无效）：isError 标出来，message 原样给模型改
+    if (!parsed.ok) return textResult(parsed.error, true);
+    try {
+      const out = await runSubagent(
+        parsed.request,
+        rawSubagentTypeOf(args),
+        context?.toolCallId,
+      );
+      return textResult(out || "(子任务无输出)");
+    } catch (err) {
+      if (err instanceof SubagentUsageError) {
+        return textResult(err.message, true);
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      // 取消不是失败：不加「子任务失败」前缀，也别当错误吓模型
+      if (msg === CANCELLED_TEXT) return textResult(CANCELLED_TEXT);
+      return textResult(`子任务失败：${msg}`, true);
+    }
+  };
+
+  /**
+   * 已派发的调用（键见 {@link callReplayKey}）：在飞的 → 重复派发并入同一次；已成功的 → 原样回放。
+   * 存的是 promise 本身，「在飞」和「已完成」走同一条路径；`settled` 只给淘汰用。
+   */
+  const dispatched = new Map<
+    string,
+    { reply: Promise<SubagentToolReply>; settled: boolean }
+  >();
+
+  const rememberDispatch = (
+    key: string,
+    reply: Promise<SubagentToolReply>,
+  ): void => {
+    const entry = { reply, settled: false };
+    dispatched.set(key, entry);
+    const forget = (): void => {
+      if (dispatched.get(key) === entry) dispatched.delete(key);
+    };
+    reply.then(
+      (r) => {
+        entry.settled = true;
+        if (!isReplayableReply(r)) forget(); // 失败 / 取消不留：下次同样的调用要能真的再跑
+      },
+      forget,
+    );
+    if (dispatched.size <= CALL_DEDUPE_MAX_ENTRIES) return;
+    for (const [k, e] of dispatched) {
+      if (!e.settled) continue;
+      dispatched.delete(k);
+      if (dispatched.size <= CALL_DEDUPE_MAX_ENTRIES) return;
+    }
+  };
+
   const tool: SDKCustomTool = {
     description: bg
       ? `${CURSOR_SUBAGENT_DESCRIPTION}${cursorSubagentBackgroundNote({ maxConcurrent, maxRuntimeMs })}`
@@ -1059,26 +1170,20 @@ export const createCursorSubagentLink = (
           : CURSOR_SUBAGENT_INPUT_JSON_SCHEMA,
       ),
     ) as NonNullable<SDKCustomTool["inputSchema"]>,
-    execute: async (args, context) => {
-      const parsed = parseSubagentRequest(args);
-      // 用法错误（prompt 空 / model / effort 无效）：isError 标出来，message 原样给模型改
-      if (!parsed.ok) return textResult(parsed.error, true);
-      try {
-        const out = await runSubagent(
-          parsed.request,
-          rawSubagentTypeOf(args),
-          context?.toolCallId,
+    execute: (args, context) => {
+      const key = callReplayKey(args, context);
+      if (!key) return executeOnce(args, context);
+      const seen = dispatched.get(key);
+      if (seen) {
+        // SDK 把同一次工具调用又派发了一遍：不再起第二个子代理（白烧 token、可写的会把活干两遍）
+        console.warn(
+          `[cursor-subagent] 同一次工具调用被重复派发（toolCallId=${context?.toolCallId}），${seen.settled ? "回放已完成的结果" : "并入仍在进行的那一次"}，没有再起子代理`,
         );
-        return textResult(out || "(子任务无输出)");
-      } catch (err) {
-        if (err instanceof SubagentUsageError) {
-          return textResult(err.message, true);
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        // 取消不是失败：不加「子任务失败」前缀，也别当错误吓模型
-        if (msg === CANCELLED_TEXT) return textResult(CANCELLED_TEXT);
-        return textResult(`子任务失败：${msg}`, true);
+        return seen.reply;
       }
+      const reply = executeOnce(args, context);
+      rememberDispatch(key, reply);
+      return reply;
     },
   };
 

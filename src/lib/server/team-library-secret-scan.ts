@@ -57,6 +57,102 @@ export const isProbablyBinaryText = (content: string): boolean => {
 };
 
 /**
+ * 含 NUL、但**扩展名明确是二进制格式**的文件不扫（图片 / 压缩包 / 字体 / 可执行 / 媒体 / 数据库 / 模型权重…）。
+ * 刻意只放「几乎总是二进制」的：`.db` / `.bin` / `.dat` 这类可能是文本的不放——
+ * 不在表里的含 NUL 文件会去掉 NUL 后照扫（宁可多扫、不漏）。
+ */
+const BINARY_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
+  // 图片
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "icns", "tif", "tiff", "heic", "avif", "psd",
+  // 压缩包 / 安装包
+  "zip", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "tar", "jar", "war", "apk", "ipa", "dmg", "iso", "whl",
+  // office（zip 容器）
+  "docx", "xlsx", "pptx", "odt", "ods",
+  // 字体
+  "woff", "woff2", "ttf", "otf", "eot",
+  // 可执行 / 库 / 字节码
+  "exe", "dll", "so", "dylib", "o", "a", "lib", "class", "pyc", "pyo", "wasm",
+  // 文档 / 媒体
+  "pdf", "mp3", "mp4", "m4a", "mov", "avi", "mkv", "wav", "flac", "ogg", "webm",
+  // 数据库 / 模型 / 数组
+  "sqlite", "sqlite3", "parquet", "npy", "npz", "pkl", "pickle", "onnx", "pt", "pth", "safetensors",
+]);
+
+/** 小写扩展名（不带点）；`.gitignore` 这类隐藏文件、没有点的文件返回空串 */
+const extensionOf = (relPath: string): string => {
+  const base = relPath.slice(
+    Math.max(relPath.lastIndexOf("/"), relPath.lastIndexOf("\\")) + 1,
+  );
+  const dot = base.lastIndexOf(".");
+  return dot <= 0 ? "" : base.slice(dot + 1).toLowerCase();
+};
+
+/**
+ * 无 BOM 的 UTF-16 的特征：英文 / 代码为主的文本里，ASCII 字符的高字节恒为 0，NUL 全落在同一侧的字节位上
+ * （小端落在奇数位、大端落在偶数位）；UTF-8 / 二进制里的零星 NUL 两侧是大致均匀的。
+ * 阈值取宽：一侧 NUL 占比 ≥ 10%、且另一侧 ≤ 它的 1/5（中英混排的 UTF-16 里 ASCII 只占一部分字符）。
+ * 太短（< 4 字节）不猜。
+ */
+const guessUtf16WithoutBom = (buf: Buffer): "le" | "be" | null => {
+  const n = Math.min(buf.length, 8192) & ~1;
+  if (n < 4) return null;
+  let evenNul = 0;
+  let oddNul = 0;
+  for (let i = 0; i < n; i += 2) {
+    if (buf[i] === 0) evenNul++;
+    if (buf[i + 1] === 0) oddNul++;
+  }
+  const pairs = n / 2;
+  const evenRatio = evenNul / pairs;
+  const oddRatio = oddNul / pairs;
+  if (oddRatio >= 0.1 && evenRatio * 5 <= oddRatio) return "le";
+  if (evenRatio >= 0.1 && oddRatio * 5 <= evenRatio) return "be";
+  return null;
+};
+
+const decodeUtf16 = (buf: Buffer, endian: "le" | "be"): string => {
+  // 奇数长度（被截断的文件）丢掉最后半个字符
+  const even = buf.subarray(0, buf.length - (buf.length % 2));
+  return endian === "le"
+    ? even.toString("utf16le")
+    : Buffer.from(even).swap16().toString("utf16le"); // swap16 原地交换，先复制一份
+};
+
+/**
+ * 把待上传文件的原始字节解成要扫的文本；`null` = 判定为二进制、不扫（Q13-04）。
+ *
+ * 以前是「含 NUL 一律跳过」：Windows 记事本的「Unicode」/ Windows PowerShell 5.x 的 `>` 重定向默认存的是 UTF-16
+ * （每个 ASCII 字符后跟一个 NUL；PowerShell 7 起默认 UTF-8），里面的明文口令整个文件被跳过、照传。现在：
+ * 1. BOM：`EF BB BF` → UTF-8（去 BOM）；`FF FE` → UTF-16LE；`FE FF` → UTF-16BE。
+ * 2. 没有 NUL → 按 UTF-8。
+ * 3. 有 NUL、无 BOM：NUL 集中在同一侧字节位上 → 按对应字节序的 UTF-16 解（见 `guessUtf16WithoutBom`）。
+ * 4. 其余有 NUL 的：扩展名明确是二进制格式 → null；不在表里 → 去掉 NUL 照扫（宁可多扫、不漏）。
+ * 5. 解码后的文本再做「非打印字符占比」判定——以前对**字节**做，UTF-16 的 NUL 字节会把纯文本误判成二进制。
+ */
+export const decodeForScan = (buf: Buffer, relPath: string): string | null => {
+  let text: string;
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    text = buf.subarray(3).toString("utf-8");
+  } else if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    text = decodeUtf16(buf.subarray(2), "le");
+  } else if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    text = decodeUtf16(buf.subarray(2), "be");
+  } else if (!buf.includes(0)) {
+    text = buf.toString("utf-8");
+  } else {
+    const guess = guessUtf16WithoutBom(buf);
+    if (guess) {
+      text = decodeUtf16(buf, guess);
+    } else if (BINARY_FILE_EXTENSIONS.has(extensionOf(relPath))) {
+      return null;
+    } else {
+      text = buf.toString("utf-8").split("\0").join("");
+    }
+  }
+  return isProbablyBinaryText(text) ? null : text;
+};
+
+/**
  * 明显占位符 / 空值 → 不当作真秘密（避免模板 skill 误报）
  * 例：【填写】、<password>、your-api-key、xxx、***、$ENV
  */
@@ -299,6 +395,22 @@ const BENIGN_KEY_SUFFIX_WORDS: ReadonlySet<string> = new Set([
 type KeySensitivity = "strong" | "token" | "weak" | null;
 
 /**
+ * 没有分隔符的「前缀 + password」复合词（`PGPASSWORD` / `DBPASSWORD` / `newpassword` / `confirmpassword`）：
+ * 按词拆分拆不开（全大写 / 全小写、中间没有下划线也没有大小写交界），整个键名只是一个词，以前整类漏报（R14 Q13-08）。
+ * 只认「以 password / passwd / passphrase 收尾、且比它们长」的词——前缀不能为空，所以 `password` 本身仍走整词匹配；
+ * 以它们**开头**的词（`passwordless`）不受影响。再加一个固定名字 `sshpass`（`SSHPASS=… sshpass -e ssh host`）。
+ * `pass` 本身太短太泛（bypass / compass / trespass），不收。用 `endsWith` 而不是正则：键名可以是任意长标识符，线性、不回溯。
+ */
+const COMPOUND_PASSWORD_SUFFIXES: readonly string[] = ["password", "passwd", "passphrase"];
+const isStrongCompoundWord = (w: string): boolean => {
+  if (w === "sshpass") return true;
+  for (const suffix of COMPOUND_PASSWORD_SUFFIXES) {
+    if (w.length > suffix.length && w.endsWith(suffix)) return true;
+  }
+  return false;
+};
+
+/**
  * 键名敏感度（按词判断，不是子串）：
  * - strong：password / passwd / pwd / secret / apikey / api_key / private_key / access_key … 任一
  * - token：只有 token 词（`max_tokens: 4096` 这类计数配置会被后续豁免）
@@ -314,7 +426,7 @@ export const classifyCredentialKey = (key: string): KeySensitivity => {
   let hasWeak = false;
   for (let i = 0; i < words.length; i++) {
     const w = words[i]!;
-    if (STRONG_KEY_WORDS.has(w)) return "strong";
+    if (STRONG_KEY_WORDS.has(w) || isStrongCompoundWord(w)) return "strong";
     if (w === "key" && i > 0 && KEY_PREFIX_WORDS.has(words[i - 1]!)) {
       return "strong";
     }
@@ -1110,6 +1222,293 @@ const looksLikeFilePath = (s: string): boolean => {
 const isBenignHighEntropyValue = (val: string): boolean =>
   UUID_RE.test(val) || DIGEST_VALUE_RE.test(val) || looksLikeFilePath(val);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 宽松写法补充规则（R14 Q13-08）
+//
+// 上面各步只认「ASCII 键名 + `=` / `:` + 非注释行」这一种形态。下面这些写法里口令照样躺在文件里，却整类漏报：
+//   ① 注释里被注释掉的配置：`# password: x`（整行以 `#` / `//` 开头 = 只扫私钥 / 连接串 / 令牌）
+//   ② npmrc 的 `//registry.npmjs.org/:_authToken=…`（`//` 开头，同样被当成注释行）
+//   ③ 全角分隔符 / 中文键名：`password：x`、`password＝x`、`密码：x`
+//   ④ 命令行参数：`--password=x`、`--password x`、`sshpass -p x`、`docker login -p x`、`redis-cli -a x`、`curl -u 用户:口令`
+//   ⑤ `Authorization: Basic <base64(用户:口令)>`
+//   （⑥ 不带分隔符的复合键名 `PGPASSWORD=x` 在 classifyCredentialKey 里补，不在这一段）
+// 每条规则都窄：只在形态确凿时才报，取值过滤复用 `secretPartOf` 那一套（占位符 / 环境变量引用 / 开关 / token 计数……），
+// 再加一层 `looseSecretValue`（示例口令词、变量名占位、shell 展开、括号包住的说明文字）。
+// 取值「不是明确赋值」的场合——注释里、空格分隔、中文键名之后——另要求「像口令」（`looksLikeLooseSecret`），
+// 挡住 `--password-policy strict`、`# password: required` 这类说明性文字。
+//
+// 正则写法：沿用上面的约束（见 KEY_VALUE_PAIR_RE 的注释）——每个量词都有上界、没有嵌套量词、
+// 「一段任意字符 + 后面再回溯」的结构只出现在 ≤200 字符的窗口里，且要先过 `includes` 触发词才会跑。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 补充规则的一条命中：`label` 进 snippet，`value` 是密文（调用方只拿去脱敏） */
+type LooseHit = { kind: SecretScanHit["kind"]; label: string; value: string };
+
+/**
+ * 文档 / 示例里常见的「假口令」词：`curl -u user:pass`、`Authorization: Basic dXNlcjpwYXNz`（解开就是 `user:pass`）。
+ * `isPlaceholderSecretValue` 没收这几个（普通键值对里 `password: pass` 照旧报）；补充规则是新增的，从严不从宽，单独认。
+ */
+const EXAMPLE_PASSWORD_WORD_RE = /^(?:pass|passwd|pwd|pw|passphrase|yourpassword|mypassword|mysecret)$/i;
+
+/** 全大写下划线标识符（`API_KEY` / `MY_TOKEN`）：命令行用法说明里的变量名占位，不是口令 */
+const ENV_NAME_LIKE_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/;
+
+/** 整个取值被括号包住（`[redacted]` / `(hidden)` / `{secret}`）：说明性文字。`s` 标志让 `.` 也能跨过换行，整条锚定、线性 */
+const BRACKETED_VALUE_RE = /^[[({].*[\])}]$/s;
+
+/** 取值里带 shell 展开（`$VAR` 开头 / `${…}` / `$(…)` / 反引号）：是引用，不是字面口令 */
+const hasShellExpansion = (v: string): boolean =>
+  v.startsWith("$") || v.includes("${") || v.includes("$(") || v.includes("`");
+
+/**
+ * 「像口令」：≥6 位、纯 ASCII 可打印字符（无空白）、含字母，并且有数字或字母数字 `_` `.` `-` 以外的符号。
+ * 比 `looksLikeWeakKeySecret`（≥8 位且字母数字都要有）宽：键名 / 命令本身是强信号，`# password: hunter2` 这种 7 位要拦；
+ * 又比「任何非占位符」窄：纯字母的单词（`required` / `Bearer` / `strict`——首字母大写也不算「大小写混合」）、
+ * 全大写词（`PASSWORD`）、小写 slug（`correct-horse`）、带中文的说明文字（`见1Password`）都当说明文字放过。
+ * 代价是纯字母的真口令在这几个场合会漏（明确赋值 `--password=correcthorse` 不受这关限制）。
+ * 语料差分（tests/team-library-secret-scan-gaps.test.ts 头注释）就是为了确认这一关挡住了仓库自己的中文说明文字。
+ */
+const looksLikeLooseSecret = (v: string): boolean =>
+  v.length >= 6 &&
+  /^[\x21-\x7e]+$/.test(v) &&
+  /[A-Za-z]/.test(v) &&
+  (/\d/.test(v) || /[^A-Za-z0-9_.-]/.test(v));
+
+/**
+ * 补充规则共用的取值过滤：在 `secretPartOf` 的基础上（占位符 / 结构值 / 开关 / token 计数 / weak 不像口令）
+ * 再挡掉示例口令词、变量名占位、shell 展开、括号包住的说明文字。通过返回去引号后的明文，被过滤返回 null。
+ */
+const looseSecretValue = (raw: string, sensitivity: SensitiveLevel): string | null => {
+  const secret = secretPartOf({ label: "", sensitivity, rawValue: raw, viaInherit: false });
+  if (
+    secret === null ||
+    EXAMPLE_PASSWORD_WORD_RE.test(secret) ||
+    ENV_NAME_LIKE_RE.test(secret) ||
+    hasShellExpansion(secret) ||
+    BRACKETED_VALUE_RE.test(secret)
+  ) {
+    return null;
+  }
+  return secret;
+};
+
+const COMMENT_PREFIX_RE = /^[ \t]*(?:#+|\/\/+)[ \t]*/;
+
+/**
+ * 注释正文里「被注释掉的配置行」：整段正文就是 `键 分隔符 取值`（可带列表符 `- ` / `* `），
+ * 不是句子中间夹一个冒号。键名 ≤64、取值 ≤512 字符，整条锚在开头只试一个起点，线性。
+ * 分隔符只认 ASCII 的 `:` / `=`：全角的 `：` / `＝` 由下面 ③ 的全角规则认领（注释行和普通行都跑它，命中的标签与取值一样），
+ * 这里再认一遍只会多一条被去重掉的命中。
+ */
+const COMMENT_KEY_VALUE_RE =
+  /^(?:[-*][ \t]+)?(["'`]?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1[ \t]*[:=][ \t]*("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`,;，；]{1,512})/;
+
+/** ① 注释里被注释掉的配置：`# password: hunter2xyz99`。只认强敏感键名（token / weak 类在注释里说明性用法太多） */
+const findCommentedConfigCredentials = (line: string): LooseHit[] => {
+  const head = COMMENT_PREFIX_RE.exec(line);
+  if (!head) return [];
+  const m = COMMENT_KEY_VALUE_RE.exec(line.slice(head[0].length));
+  if (!m) return [];
+  const key = m[2]!;
+  if (classifyCredentialKey(key) !== "strong") return [];
+  const secret = looseSecretValue(m[3]!, "strong");
+  if (secret === null || !looksLikeLooseSecret(secret)) return [];
+  return [{ kind: "credential-key", label: `${key}=`, value: secret }];
+};
+
+/**
+ * ② npmrc 认证行 `//registry.npmjs.org/:_authToken=<令牌>`：以 `//` 开头，被当成注释行、只扫私钥 / 连接串 / 带前缀的令牌，
+ * 旧式 UUID 令牌、Verdaccio / Artifactory 令牌、`_auth` / `_password` 的 base64 就整条漏报。
+ * 形态确凿（`//主机路径:` + `_authToken` / `_auth` / `_password` + `=`），不要求「像口令」；占位符 / `${NPM_TOKEN}` 照常放过。
+ * `\S{1,300}?` 是 ≤300 字符的窗口、整条锚在行首，只试一个起点。
+ */
+const NPMRC_AUTH_RE =
+  /^[ \t]*\/\/\S{1,300}?:(_authToken|_auth|_password)[ \t]*=[ \t]*("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`;]{1,512})/i;
+
+const findNpmrcCredentials = (line: string): LooseHit[] => {
+  const m = NPMRC_AUTH_RE.exec(line);
+  if (!m) return [];
+  const secret = looseSecretValue(m[2]!, "strong");
+  return secret === null ? [] : [{ kind: "credential-key", label: `${m[1]}=`, value: secret }];
+};
+
+const CN_KEY_HINT_RE = /密码|口令|密钥|秘钥|令牌|私钥|授权码/;
+const CN_KEY_VALUE_RE =
+  /(密码|口令|密钥|秘钥|令牌|私钥|授权码)[ \t]*[:：=＝][ \t]*("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`,;，；。]{1,512})/g;
+
+/** ③ 中文键名：`密码：Hunter2xyz99`。键名后面常跟说明文字，所以只认「像口令」的取值（纯 ASCII；`密码：请填写` / `密码：见密码管理器` 都不是） */
+const findChineseKeyCredentials = (line: string): LooseHit[] => {
+  const out: LooseHit[] = [];
+  if (!CN_KEY_HINT_RE.test(line)) return out;
+  for (const m of line.matchAll(CN_KEY_VALUE_RE)) {
+    const secret = looseSecretValue(m[2]!, "strong");
+    if (secret === null || !looksLikeLooseSecret(secret)) continue;
+    out.push({ kind: "credential-key", label: `${m[1]}=`, value: secret });
+  }
+  return out;
+};
+
+/**
+ * ③ ASCII 键名 + 全角分隔符：`password：hunter2xyz99`、`api_key＝abcd1234efgh5678`。
+ * 不能把整行的 `：` 换成 `:` 再走普通键值对流程（试过：中文文档里「`token：` + 中文说明」随处都是，
+ * 仓库自己 1800 个文件的语料差分里一下多出 40 条误报）。所以单独成规则：键名要过 `classifyCredentialKey`，
+ * 取值要「像口令」（纯 ASCII、含数字或符号、≥6 位），中文说明文字、`${…}` 引用、纯字母单词都不报。
+ */
+const FULLWIDTH_KEY_VALUE_RE =
+  /(?<![A-Za-z0-9_.-])(["'`]?)([A-Za-z_][A-Za-z0-9_.-]{0,63})\1[ \t]*[：＝][ \t]*("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`,;，；。]{1,512})/g;
+
+const findFullWidthKeyCredentials = (line: string): LooseHit[] => {
+  const out: LooseHit[] = [];
+  if (!line.includes("：") && !line.includes("＝")) return out;
+  for (const m of line.matchAll(FULLWIDTH_KEY_VALUE_RE)) {
+    const key = m[2]!;
+    const sensitivity = classifyCredentialKey(key);
+    if (sensitivity === null) continue;
+    const secret = looseSecretValue(m[3]!, sensitivity);
+    if (secret === null || !looksLikeLooseSecret(secret)) continue;
+    out.push({ kind: "credential-key", label: `${key}=`, value: secret });
+  }
+  return out;
+};
+
+/**
+ * ④ 命令行长参数 `--password=x` / `--password x` / `--api-key x`。键名走 `classifyCredentialKey`（拆词、收尾的
+ * file / name / ttl 等良性后缀都认），所以 `--password-file=/x`、`--token-ttl 3600`、`--max-tokens=4096` 不报。
+ * 值的首字符排除 `-`（下一个参数）、`<`（重定向）、`[` `{`（用法说明里的 `[password]`）和各种 shell 分隔符；
+ * 键名 ≤41、取值 ≤512 字符，没有无界量词。
+ */
+const CLI_FLAG_RE =
+  /(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_-]{1,40})(=|[ \t]+)("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`;|&<>()[\]{}-][^\s"'`;|&<>()]{0,511})/g;
+
+const findCliFlagCredentials = (line: string): LooseHit[] => {
+  const out: LooseHit[] = [];
+  if (!line.includes("--")) return out;
+  for (const m of line.matchAll(CLI_FLAG_RE)) {
+    const name = m[1]!;
+    // `--no-password` 是关闭开关，后面跟的不是口令
+    if (/^no[-_]/i.test(name)) continue;
+    const sensitivity = classifyCredentialKey(name);
+    if (sensitivity === null) continue;
+    const rawValue = m[3]!;
+    if (m[2] !== "=") {
+      // 空格分隔：下一个词可能只是别的参数 / 子命令 / 文件名（`--password-policy strict`）。
+      // 带引号的按引号内容判（含空白 = 说明文字）；不带引号的必须「像口令」
+      if (/^["']/.test(rawValue)) {
+        if (/\s/.test(rawValue)) continue;
+      } else if (!looksLikeLooseSecret(rawValue)) {
+        continue;
+      }
+    }
+    const secret = looseSecretValue(rawValue, sensitivity);
+    if (secret === null) continue;
+    out.push({ kind: "credential-key", label: `--${name}=`, value: secret });
+  }
+  return out;
+};
+
+// 某个命令后面的口令参数。命令词和参数之间只允许「不含 shell 分隔符的 ≤200 字符窗口」：
+// `docker login && ssh -p 22 host` 里的 `-p 22` 属于 ssh，不能被 docker 那条吃掉。
+// sshpass 的 `-p` 必须紧跟命令（只允许先带 `-e` / `-v`），否则 `sshpass -e ssh -p 2222 host` 的端口会被当成口令。
+const SSHPASS_RE =
+  /(?<![A-Za-z0-9_-])sshpass(?:[ \t]+-[ev])*[ \t]+-p[ \t]*("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`;|&<>()-][^\s"'`;|&<>()]{0,511})/g;
+const DOCKER_LOGIN_RE =
+  /(?<![A-Za-z0-9_-])docker[ \t]+login\b[^\n;&|]{0,200}?[ \t](?:-p|--password)(?:[ \t]+|=)("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`;|&<>()-][^\s"'`;|&<>()]{0,511})/g;
+const REDIS_CLI_RE =
+  /(?<![A-Za-z0-9_-])redis-cli\b[^\n;&|]{0,200}?[ \t]-a[ \t]+("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`;|&<>()-][^\s"'`;|&<>()]{0,511})/g;
+const CURL_USER_RE =
+  /(?<![A-Za-z0-9_-])curl\b[^\n;&|]{0,200}?[ \t](?:-u|--user)(?:[ \t]+|=)("[^"\n]{0,512}"|'[^'\n]{0,512}'|[^\s"'`;|&<>()]{1,512})/g;
+
+type CommandRule = {
+  /** 行里没有这个词就不跑正则（绝大多数行在这一步就结束） */
+  trigger: string;
+  /** 取值整体是 `用户:口令`（curl -u） */
+  userPass: boolean;
+  label: string;
+  re: RegExp;
+};
+
+const COMMAND_RULES: readonly CommandRule[] = [
+  { trigger: "sshpass", userPass: false, label: "sshpass -p ", re: SSHPASS_RE },
+  { trigger: "docker", userPass: false, label: "docker login 口令 ", re: DOCKER_LOGIN_RE },
+  { trigger: "redis-cli", userPass: false, label: "redis-cli -a ", re: REDIS_CLI_RE },
+  { trigger: "curl", userPass: true, label: "curl -u 口令 ", re: CURL_USER_RE },
+];
+
+/** ④ 带口令的命令：`sshpass -p x` / `docker login -p x` / `redis-cli -a x` / `curl -u 用户:口令` */
+const findCommandCredentials = (line: string): LooseHit[] => {
+  const out: LooseHit[] = [];
+  for (const rule of COMMAND_RULES) {
+    if (!line.includes(rule.trigger)) continue;
+    for (const m of line.matchAll(rule.re)) {
+      let value = m[1]!;
+      if (rule.userPass) {
+        const bare = value.replace(/^["']|["']$/g, "");
+        const colon = bare.indexOf(":");
+        // 没有冒号 = 只给了用户名（口令由 curl 交互询问）；冒号在开头 = 用户名为空（`-u :令牌`），冒号后面照样是口令
+        if (colon < 0) continue;
+        value = bare.slice(colon + 1);
+        // 口令里一个字母都没有的（`-u 1000:1000` 是 uid:gid）不当口令
+        if (!/[A-Za-z]/.test(value)) continue;
+      }
+      const secret = looseSecretValue(value, "strong");
+      if (secret === null) continue;
+      out.push({ kind: "credential-key", label: rule.label, value: secret });
+    }
+  }
+  return out;
+};
+
+const BASIC_AUTH_RE = /(?<![A-Za-z0-9_])basic[ \t]+([A-Za-z0-9+/]{8,512}={0,2})(?![A-Za-z0-9+/=])/gi;
+
+/**
+ * ⑤ `Authorization: Basic <base64(用户:口令)>`：行里要有 `authorization`，base64 要能解成「用户:口令」的可打印 ASCII，
+ * 口令不是占位符 / 示例口令词（文档里的 `Basic dXNlcjpwYXNz` 解开就是 `user:pass`）。
+ * 展示用的 `value` 取 base64 原文（脱敏后只留前 3 位），不回传解码后的口令。
+ */
+const findBasicAuthCredentials = (line: string): LooseHit[] => {
+  const out: LooseHit[] = [];
+  if (!/authorization/i.test(line)) return out;
+  for (const m of line.matchAll(BASIC_AUTH_RE)) {
+    const b64 = m[1]!;
+    const decoded = Buffer.from(b64, "base64").toString("utf8");
+    const colon = decoded.indexOf(":");
+    // 没有冒号 / 含不可打印字节 = 不是「用户:口令」；用户名为空（`:令牌`）照样算，口令取冒号后面的
+    if (colon < 0 || !/^[\x20-\x7e]+$/.test(decoded)) continue;
+    const password = decoded.slice(colon + 1);
+    if (!password || isPlaceholderSecretValue(password) || EXAMPLE_PASSWORD_WORD_RE.test(password)) continue;
+    out.push({ kind: "known-token", label: "Basic 认证 ", value: b64 });
+  }
+  return out;
+};
+
+/**
+ * 补充规则入口。`inComment` = 整行是 `#` / `//` 注释：多跑 ①②（被注释掉的配置 / npmrc 认证行）；
+ * 其余各条（中文键名、命令行参数、带口令的命令、Basic 认证）注释行和普通行都跑——注释里贴的命令示例照样是泄漏。
+ * 同一个值被多条规则命中（`docker login --password x` 同时满足长参数和 docker 两条）只留一条。
+ */
+const findLooseCredentials = (line: string, inComment: boolean): LooseHit[] => {
+  const all: LooseHit[] = [];
+  if (inComment) {
+    for (const h of findCommentedConfigCredentials(line)) all.push(h);
+    for (const h of findNpmrcCredentials(line)) all.push(h);
+  }
+  for (const h of findChineseKeyCredentials(line)) all.push(h);
+  for (const h of findFullWidthKeyCredentials(line)) all.push(h);
+  for (const h of findCliFlagCredentials(line)) all.push(h);
+  for (const h of findCommandCredentials(line)) all.push(h);
+  for (const h of findBasicAuthCredentials(line)) all.push(h);
+  if (all.length < 2) return all;
+  const seen = new Set<string>();
+  const out: LooseHit[] = [];
+  for (const h of all) {
+    const dedupeKey = `${h.kind}\u0000${h.value}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(h);
+  }
+  return out;
+};
+
 const pushHit = (
   hits: SecretScanHit[],
   file: string,
@@ -1162,8 +1561,16 @@ export const scanSensitiveFiles = (
           );
         }
         // 注释里贴的平台令牌同样要拦（sk- / ghp_ / glpat- / Bearer …）
+        let tokenHitInComment = false;
         for (const t of findKnownTokens(line)) {
+          tokenHitInComment = true;
           pushHit(hits, file.path, lineNo, "known-token", t.label, t.value);
+        }
+        // 被注释掉的配置 / npmrc 认证行 / 注释里贴的命令行示例（R14 Q13-08）；同行已有令牌命中就不重复报
+        if (!tokenHitInComment) {
+          for (const h of findLooseCredentials(line, true)) {
+            pushHit(hits, file.path, lineNo, h.kind, h.label, h.value);
+          }
         }
         continue;
       }
@@ -1254,9 +1661,19 @@ export const scanSensitiveFiles = (
 
       // 6) 值形态命中平台令牌（sk- / ghp_ / glpat- / xox*- / AKIA / Bearer；不依赖键名）
       //    同行已被 credential-key / high-entropy / webhook 地址覆盖就不重复报
+      let knownTokenHitOnLine = false;
       if (!credentialHitOnLine && !entropyHitOnLine && !webhookHitOnLine) {
         for (const t of findKnownTokens(line)) {
+          knownTokenHitOnLine = true;
           pushHit(hits, file.path, lineNo, "known-token", t.label, t.value);
+        }
+      }
+
+      // 7) 宽松写法补充规则（R14 Q13-08）：中文键名 / 命令行参数 / 带口令的命令 / Basic 认证。
+      //    同行已被前面任何一步覆盖就不重复报。
+      if (!credentialHitOnLine && !entropyHitOnLine && !webhookHitOnLine && !knownTokenHitOnLine) {
+        for (const h of findLooseCredentials(line, false)) {
+          pushHit(hits, file.path, lineNo, h.kind, h.label, h.value);
         }
       }
     }

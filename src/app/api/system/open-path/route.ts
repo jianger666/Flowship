@@ -3,6 +3,7 @@
  *
  * Body: { path: string } — 绝对路径；用系统默认应用打开。
  * 可执行 / 脚本 / 快捷方式等危险类型不会被运行，降级为「在文件管理器中显示」（响应带 revealed + notice）；
+ * 除了扩展名黑名单，macOS / Linux 还会读盘：解开符号链接后再判一次、带可执行位的普通文件也降级（Q14-01，见 `server/open-path-facts.ts`）；
  * UNC / 设备路径（任何平台）与 Windows 下非盘符路径一律 400（避免 SMB / NTLM 外泄），与 reveal-in-folder /
  * open-in-ide 同一份白名单 {@link nonLocalPathReason}（Q4-05：Windows 下 NT 命名空间前缀 UNC、`/C:/x`、`/c/Users` 等原先能走到 open）。
  */
@@ -15,6 +16,7 @@ import { NextResponse } from "next/server";
 
 import { buildOpenPathPlan } from "@/lib/local-file-os";
 import { stripHostInjectedEnv } from "@/lib/server/host-env";
+import { probeOpenPathFacts } from "@/lib/server/open-path-facts";
 import { nonLocalPathReason } from "@/lib/unc-path";
 
 export const runtime = "nodejs";
@@ -55,7 +57,9 @@ export const POST = async (req: Request) => {
     return NextResponse.json({ error: "path 必须是绝对路径" }, { status: 400 });
   }
 
-  const plan = buildOpenPathPlan(p, os.platform());
+  // Q14-01：扩展名黑名单看不出「无扩展名的可执行文件」「名字无害的符号链接」，先读盘再判（Windows / 读不到时无事实、行为不变）
+  const platform = os.platform();
+  const plan = buildOpenPathPlan(p, platform, await probeOpenPathFacts(p, platform));
   if (plan.kind === "reject") {
     return NextResponse.json({ error: plan.error }, { status: 400 });
   }

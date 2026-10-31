@@ -46,6 +46,8 @@ interface FakeChild extends EventEmitter {
 /** mock 的 spawn：记录调用、按队列吐结果 */
 const hoisted = vi.hoisted(() => ({
   calls: [] as {
+    /** spawn 的第一个参数（解释器：python3 / python / FLOWSHIP_PYTHON）——Q13-11 */
+    file: string;
     args: string[];
     cwd: string;
     env: NodeJS.ProcessEnv;
@@ -77,11 +79,12 @@ vi.mock("node:child_process", async (importOriginal) => {
   return {
     ...actual,
     spawn: (
-      _file: string,
+      file: string,
       args: string[],
       opts: { cwd: string; env: NodeJS.ProcessEnv; detached?: boolean },
     ) => {
       hoisted.calls.push({
+        file,
         args,
         cwd: opts.cwd,
         env: opts.env,
@@ -154,6 +157,7 @@ const {
   buildDeliverySyncArgs,
   buildPreflightArgs,
   buildStageArgs,
+  defaultPythonBin,
   evaluateWkAdvanceGate,
   planWkGate,
   preflightTimeoutMs,
@@ -1047,5 +1051,126 @@ describe("evaluateWkAdvanceGate（推进钩子的决策 + 事件）", () => {
       boom,
     );
     expect(result.decision).toBe("proceed");
+  });
+});
+
+/**
+ * Q13-11：python 解释器的默认名按平台选（Windows 一般只有 `python`，没有 `python3`），`FLOWSHIP_PYTHON` 仍然最优先。
+ *
+ * ⚠️ 没有 Windows 真机：这里只验「选名逻辑」与「spawn 的第一个参数跟着走」，「python 在 Windows 上真能起」是按官方安装器行为推的。
+ * 变异：默认名写死成 python3 / 写死成 python / 把 `defaultPythonBin()` 改成 `defaultPythonBin("linux")`（接线写死平台）/
+ * FLOWSHIP_PYTHON 不 trim / 空白串当有效值 / 提示里去掉 FLOWSHIP_PYTHON → 对应用例红。
+ */
+describe("python 解释器选择（Q13-11）", () => {
+  /** 临时改环境变量里的 FLOWSHIP_PYTHON（undefined = 删掉），跑完还原 */
+  const withPythonEnv = async (value: string | undefined, run: () => Promise<void>): Promise<void> => {
+    const saved = process.env.FLOWSHIP_PYTHON;
+    if (value === undefined) delete process.env.FLOWSHIP_PYTHON;
+    else process.env.FLOWSHIP_PYTHON = value;
+    try {
+      await run();
+    } finally {
+      if (saved === undefined) delete process.env.FLOWSHIP_PYTHON;
+      else process.env.FLOWSHIP_PYTHON = saved;
+    }
+  };
+
+  /** 临时把 process.platform 换成别的值（只包住一次 await，跑完还原） */
+  const withPlatform = async (platform: NodeJS.Platform, run: () => Promise<void>): Promise<void> => {
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...original, value: platform });
+    try {
+      await run();
+    } finally {
+      Object.defineProperty(process, "platform", original);
+    }
+  };
+
+  it("defaultPythonBin：Windows 默认 python，其余平台 python3", () => {
+    expect(defaultPythonBin("win32")).toBe("python");
+    for (const platform of ["darwin", "linux", "freebsd"] as const) {
+      expect(defaultPythonBin(platform)).toBe("python3");
+    }
+  });
+
+  it("defaultPythonBin 不传平台：跟当前 process.platform 走", () => {
+    expect(defaultPythonBin()).toBe(process.platform === "win32" ? "python" : "python3");
+  });
+
+  it("实际 spawn 的解释器：没设 FLOWSHIP_PYTHON → 当前平台的默认名（两个脚本都是）", async () => {
+    await setupHappyWorld();
+    const plan = await expectActive(makeTask());
+    await withPythonEnv(undefined, async () => {
+      await runWkPreflight(plan);
+    });
+    expect(hoisted.calls.map((c) => c.file)).toEqual([defaultPythonBin(), defaultPythonBin()]);
+  });
+
+  it("实际 spawn 的解释器：process.platform 是 win32 → python；换回 linux → python3（接线没写死平台）", async () => {
+    await setupHappyWorld();
+    const plan = await expectActive(makeTask());
+    await withPythonEnv(undefined, async () => {
+      await withPlatform("win32", async () => {
+        await runWkPreflight(plan);
+      });
+      expect(hoisted.calls.map((c) => c.file)).toEqual(["python", "python"]);
+      hoisted.calls.length = 0;
+      await withPlatform("linux", async () => {
+        await runWkPreflight(plan);
+      });
+      expect(hoisted.calls.map((c) => c.file)).toEqual(["python3", "python3"]);
+    });
+  });
+
+  it("FLOWSHIP_PYTHON 最优先（首尾空白去掉），平台怎么变都不影响", async () => {
+    await setupHappyWorld();
+    const plan = await expectActive(makeTask());
+    await withPythonEnv("  /opt/py/bin/python3.12  ", async () => {
+      await withPlatform("win32", async () => {
+        await runWkPreflight(plan);
+      });
+    });
+    expect(hoisted.calls.map((c) => c.file)).toEqual(["/opt/py/bin/python3.12", "/opt/py/bin/python3.12"]);
+  });
+
+  it("FLOWSHIP_PYTHON 是空白串：当没设，用平台默认名", async () => {
+    await setupHappyWorld();
+    const plan = await expectActive(makeTask());
+    await withPythonEnv("   ", async () => {
+      await runWkPreflight(plan);
+    });
+    expect(hoisted.calls.map((c) => c.file)).toEqual([defaultPythonBin(), defaultPythonBin()]);
+  });
+
+  it("解释器起不动：降级提示里说出是哪个解释器，并告诉用户可以用 FLOWSHIP_PYTHON 指定", async () => {
+    await setupHappyWorld();
+    const plan = await expectActive(makeTask());
+    hoisted.queue.push({ code: "ENOENT" });
+
+    let message = "";
+    await withPythonEnv(undefined, async () => {
+      const report = await runWkPreflight(plan);
+      expect(report.verdict).toBe("warn");
+      message = report.message;
+    });
+
+    expect(message).toContain(`本机起不动 ${defaultPythonBin()}`);
+    expect(message).toContain("FLOWSHIP_PYTHON");
+    // 第一个脚本就起不来、第二个必然同样起不来：仍然只 spawn 一次、只说一遍
+    expect(hoisted.calls).toHaveLength(1);
+    expect(message.match(/起不动/g)).toHaveLength(1);
+  });
+
+  it("指定了 FLOWSHIP_PYTHON 却起不动：提示里写的是用户指定的那个解释器", async () => {
+    await setupHappyWorld();
+    const plan = await expectActive(makeTask());
+    hoisted.queue.push({ code: "ENOENT" });
+
+    let message = "";
+    await withPythonEnv("/opt/py/bin/python3.12", async () => {
+      message = (await runWkPreflight(plan)).message;
+    });
+
+    expect(message).toContain("本机起不动 /opt/py/bin/python3.12");
   });
 });

@@ -73,6 +73,7 @@ import {
   type TeamSkillState,
 } from "./team-skill-states";
 import {
+  decodeForScan,
   formatSensitiveScanError,
   gateSensitiveUpload,
   scanSensitiveFiles,
@@ -99,6 +100,7 @@ export {
 
 // 敏感扫描纯函数 re-export（单测 / API 共用类型）
 export {
+  decodeForScan,
   formatSensitiveScanError,
   gateSensitiveUpload,
   isPlaceholderSecretValue,
@@ -1545,19 +1547,12 @@ const collectStagedTextFilesForScan = async (
     } catch {
       continue; // 偶发消失 / 目录项跳过
     }
-    // 二进制：NUL 或非打印占比过高
-    if (buf.includes(0)) continue;
-    const sample = buf.subarray(0, Math.min(buf.length, 8192));
-    let nonPrintable = 0;
-    for (let i = 0; i < sample.length; i++) {
-      const c = sample[i]!;
-      if (c === 9 || c === 10 || c === 13) continue;
-      if (c < 32 || c === 127) nonPrintable++;
-    }
-    if (sample.length > 0 && nonPrintable / sample.length > 0.1) continue;
+    // 解码 + 二进制判定（Q13-04）：UTF-16 / 夹着 NUL 的文本照扫，只有真二进制才跳过
+    const content = decodeForScan(buf, rel);
+    if (content === null) continue;
     out.push({
       path: rel.replace(/\\/g, "/"),
-      content: buf.toString("utf-8"),
+      content,
     });
   }
   return out;
@@ -2653,10 +2648,24 @@ export type LocateSharedSkillResult =
   | { ok: false; error: string };
 
 /**
+ * skill 名的「同名键」：NFC 规范化后转小写（Q13-01）。
+ *
+ * 大小写不敏感的文件系统（macOS APFS 默认 / Windows NTFS）上，`Foo` 与 `foo`、NFC 与 NFD 写法的 `é` 是**同一个目录**——
+ * 查重若按 `===` 严格比较，会把它们当成两个名字、判成 `new`，于是跳过「仅创建人可覆盖」的检查（只有 `overwrite` 才查），
+ * 落盘时却盖掉别人的目录、还把创建人改成自己。
+ * 不用 `toLocaleLowerCase`：结果不能随运行环境的 locale 变。
+ * 只做「小写 + NFC」这一层：文件系统自己的折叠表（NTFS 的 upcase 表、APFS 的 case folding）比这更细，
+ * 差异只在极少数非 ASCII 字符上，这里不去复刻。
+ */
+export const skillNameKey = (name: string): string =>
+  name.normalize("NFC").toLowerCase();
+
+/**
  * 上传前全库跨分类查重（纯逻辑、单测友好）。
  * - 不存在 → new
  * - 仅存在于目标分类 → overwrite（现状覆盖语义）
  * - 存在于其它分类 → conflict（挡串名；作者取 authors 索引、没有就省略）
+ * - 没有精确同名、但有 `skillNameKey` 相同的（仅大小写 / Unicode 规范化写法不同）→ conflict（Q13-01；同分类也拒收）
  */
 export type UploadNameConflictCheck =
   | { status: "new" }
@@ -2674,28 +2683,47 @@ export const checkUploadNameAcrossCategories = (
   entries: Array<{ category: string; name: string }>,
   authorsByRelDir?: Record<string, string>,
 ): UploadNameConflictCheck => {
-  const hits = entries.filter((e) => e.name === name);
-  const other = hits.find((h) => h.category !== targetCategory);
-  if (other) {
-    const relDir = `skills/${other.category}/${name}`;
+  /** 把库里已有的某一条拼成 conflict：创建人按**那一条自己的**目录名取（仅大小写不同时与上传名不是同一个 key） */
+  const conflictWith = (
+    hit: { category: string; name: string },
+    what: string,
+  ): UploadNameConflictCheck => {
+    const relDir = `skills/${hit.category}/${hit.name}`;
     const authorRaw = authorsByRelDir?.[relDir];
     const author =
       typeof authorRaw === "string" && authorRaw.trim()
         ? authorRaw.trim()
         : undefined;
-    const catLabel = labelTeamSharedCategory(other.category);
+    const catLabel = labelTeamSharedCategory(hit.category);
     const error = author
-      ? `库里已有同名 skill（分类 ${catLabel}、创建人 ${author}），请换名或联系对方`
-      : `库里已有同名 skill（分类 ${catLabel}），请换名或联系对方`;
+      ? `${what}（分类 ${catLabel}、创建人 ${author}），请换名或联系对方`
+      : `${what}（分类 ${catLabel}），请换名或联系对方`;
     return {
       status: "conflict",
-      category: other.category,
+      category: hit.category,
       ...(author ? { author } : {}),
       error,
     };
-  }
+  };
+
+  const hits = entries.filter((e) => e.name === name);
+  const other = hits.find((h) => h.category !== targetCategory);
+  if (other) return conflictWith(other, "库里已有同名 skill");
   if (hits.some((h) => h.category === targetCategory)) {
     return { status: "overwrite" };
+  }
+  // 没有精确同名：再按 skillNameKey 找「仅大小写 / Unicode 规范化写法不同」的（Q13-01）。
+  // 它们在大小写不敏感的文件系统上就是同一个目录——判成 new 会跳过「仅创建人可覆盖」的检查、直接盖掉别人的 skill。
+  // 同分类也拒收（不能走 overwrite：目录名不同，owner 检查读的是上传名对应的、不存在的目录）；
+  // 存在精确同名时不走这一支（上面已返回），所以库里已有的历史重名（Linux 上传产生）不会卡住创建人重传自己的那一条。
+  const key = skillNameKey(name);
+  const near = entries.filter((e) => skillNameKey(e.name) === key);
+  const nearest = near.find((e) => e.category === targetCategory) ?? near[0];
+  if (nearest) {
+    return conflictWith(
+      nearest,
+      `库里已有仅大小写 / 写法不同的同名 skill「${nearest.name}」`,
+    );
   }
   return { status: "new" };
 };

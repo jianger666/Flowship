@@ -59,8 +59,18 @@ import { stripHostInjectedEnv } from "./host-env";
 import { getTeamLibraryKnowledgeSkillsDir } from "./team-library-paths";
 import { readWkConfig } from "./wk-config";
 
-/** python 解释器（允许用户机器上换路径；默认吃 PATH 里的 python3） */
-const pythonBin = (): string => process.env.FLOWSHIP_PYTHON?.trim() || "python3";
+/**
+ * 默认的 python 解释器名（Q13-11）：Windows 上官方安装器 / 商店版装出来的是 `python.exe`（外加 `py.exe` 启动器），
+ * 多数机器没有 `python3.exe`——商店版还自带一个没装时只会弹商店的 `python3.exe` 占位别名；macOS / Linux 是 `python3`。
+ * 这只是「PATH 里默认找谁」：探不到时照旧走 unavailable 降级（门禁不阻塞推进）；解释器不在 PATH 里 / 想换版本，用 `FLOWSHIP_PYTHON` 指定。
+ * ⚠️ Windows 上「`python` 能起」是按官方安装器的行为推的，没有真机验证。
+ * export + `platform` 入参只为单测（不用去改写 `process.platform`）。
+ */
+export const defaultPythonBin = (platform: NodeJS.Platform = process.platform): string =>
+  platform === "win32" ? "python" : "python3";
+
+/** python 解释器：`FLOWSHIP_PYTHON`（允许用户机器上换路径）优先，否则按平台取默认名 */
+const pythonBin = (): string => process.env.FLOWSHIP_PYTHON?.trim() || defaultPythonBin();
 
 /**
  * 单次脚本超时，按「这条命令会不会走网络」分三档。
@@ -622,7 +632,7 @@ const degradedMessage = (
   if (result.outcome === "unavailable") {
     return result.reason === "no-script"
       ? `${label}跳过：团队库里没有这个脚本（去能力页同步团队库）`
-      : `${label}跳过：本机起不动 ${pythonBin()}`;
+      : `${label}跳过：本机起不动 ${pythonBin()}（解释器不在 PATH 里的话，可用环境变量 FLOWSHIP_PYTHON 指定）`;
   }
   if (result.outcome === "timeout") {
     return `${label}跳过：脚本超时未返回（或输出过大被中断）`;

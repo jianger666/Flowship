@@ -374,7 +374,122 @@ export const sweepStaleSkillImportLeftovers = async (
   return removed;
 };
 
-const replaceDirWithCopy = async (srcDir: string, dest: string): Promise<void> => {
+/**
+ * 拷一个 skill 目录的体量上限（Q13-10 的补充）。
+ * `copySkillTree` 把软链解引用成真内容：互相指向的目录、层层指向同一目录的钻石结构、pnpm 式 `node_modules` 会按路径成倍展开
+ * （旧行为不解引用，没有这个问题）——没有上限的话，一个来路不明的 skill 就能把大块磁盘拷进应用库、把导入卡住。
+ * 超了整个 skill 导入失败（不是拷一半就算成功），同名旧版不动。
+ *  - 条目 20 万：拷出去的每个条目算一条——文件、目录、解引用后的软链，另加 skill 目录自己；被跳过的断链 / 环不算；
+ *  - 字节 2 GiB：只算文件内容（指向文件的软链按目标文件的大小算，目录不算）。
+ * 两个都是「大于」才算超，恰好等于放行。
+ * 取值依据：正常 skill 的软链个位数、文件几十到几百个、总共几 MB，上限高出三个数量级以上；7 个目录两两互指（源 57 条拷出 27399 条）仍然放行；
+ * pnpm 式 `node_modules` 按展开判据数到约 20 万条时累计已超过 2 GiB（不解引用也有 40 万条）——两个上限都会被它冲破，哪个先到取决于遍历顺序，结果都是整个 skill 失败。
+ * 「大而没有软链」的真目录也计入：旧行为能导入的大 skill，只要在上限以内就不受影响。详见 HANDOFF B7-3 决策依据 ⑨。
+ */
+export const SKILL_COPY_MAX_ENTRIES = 200_000;
+export const SKILL_COPY_MAX_BYTES = 2 * 1024 ** 3;
+
+export interface SkillCopyLimits {
+  maxEntries: number;
+  maxBytes: number;
+}
+
+/** 默认上限是 2 GiB，显示成 GB；测试注入的小值显示成字节 */
+const formatLimitBytes = (n: number): string => (n >= 1024 ** 3 ? `${Number((n / 1024 ** 3).toFixed(1))} GB` : `${n} 字节`);
+
+/** 超限的报错文案：带 skill 目录名、上限数值和清理建议；不带临时目录路径（调用方看不懂它） */
+const tooLargeMessage = (skillName: string, limits: SkillCopyLimits): string =>
+  `目录 ${skillName} 展开后超过上限（${limits.maxEntries.toLocaleString("en-US")} 个文件 / 目录，或 ${formatLimitBytes(limits.maxBytes)}）：` +
+  "里面可能有 node_modules，或有互相指向的软链被逐个展开成了真内容。请清理后重试。";
+
+/**
+ * 把 skill 源目录拷成一份**自包含**的副本（Q13-10）。
+ *
+ * 旧写法 `fs.cp(src, tmp, { recursive: true })` 默认不解引用软链：
+ *  - `~/.cursor/skills/<name>` 本身是软链（agentskills 里常见的链接装法）→ 拷出来的 `dest` 还是一条软链，等于没拷；
+ *  - 目录里的软链被原样拷成软链，而且相对链会被改写成指向「源目录」的绝对路径——源一挪 / 删，导入的 skill 就坏。
+ *
+ * 现在：先取顶层的真目录（`realpath`）再拷，里面的软链一律解引用成真内容。两类软链**跳过、不让整个导入失败**：
+ *  - 断链（目标不存在）——旧行为是原样拷成断链、导入「成功」，这里不能退化成整条失败；
+ *  - 环——`fs.cp` 对解引用的软链没有环检测，会一路往里钻、直到系统的软链层数上限才停：多数形态以 ELOOP 让整个导入失败（旧行为不解引用，这类 skill 能导入）；
+ *    深层的 `realpath` 抛错若被下面 `filter` 里的 `catch` 当成断链吞掉，则变成嵌套复制几十层（Node 22 / macOS 实测 32 层）。两种：
+ *      ① 指向源目录自己或它的祖先——放行的话还会把兄弟 skill / 祖先里的其他文件一并拷进来；
+ *      ② 指向「从顶层走到这条软链所经过的某一层目录」（含它所在的那一层）：子目录里的 `self → .`、`a/b/up → ..`、
+ *         两个子目录互相指、目录外的共享目录里自带的环。判据：目标的真路径等于它各级上层目录的真路径之一。
+ *         **沿路径判、不是全局去重**：同一个目录被两条软链各指一次（`p → shared`、`q → shared`）不是环，各拷一份。
+ * 指向别处的软链（如 `shared/` 共享目录）照常拷内容。**不限制目标位置**：旧行为是把软链原样拷成软链、不读目标，
+ * 现在目录里指向目录外的软链会把对方整份内容拷进来——来路不明的 skill 里的软链能把本机上任何可读的文件 / 目录带进应用库，导入前要自己看一眼。
+ * 展开后的体量**设上限**（`SKILL_COPY_MAX_ENTRIES` / `SKILL_COPY_MAX_BYTES`）：互相指的目录、层层指向同一目录的钻石结构会按路径成倍展开
+ * （实测 7 个目录两两互指：源 57 条拷出 27399 条）；超了整个 skill 导入失败、不是静默截断，见 HANDOFF B7-3 决策依据 ⑨。
+ * `limits` 缺省取上面两个常量，只有测试注入小值时才传。
+ */
+const copySkillTree = async (
+  srcDir: string,
+  tmp: string,
+  limits: SkillCopyLimits = { maxEntries: SKILL_COPY_MAX_ENTRIES, maxBytes: SKILL_COPY_MAX_BYTES },
+): Promise<void> => {
+  const realSrc = await fs.realpath(srcDir);
+  // 上层目录的真路径：filter 对每个条目都会被问一遍，按目录缓存（fs.cp 对目录条目是串行处理的，Map 没有并发问题）
+  const realDirCache = new Map<string, string>();
+  const realDirOf = async (dir: string): Promise<string> => {
+    let real = realDirCache.get(dir);
+    if (real === undefined) {
+      real = await fs.realpath(dir);
+      realDirCache.set(dir, real);
+    }
+    return real;
+  };
+  // 软链的目标是不是「从顶层走到这条软链所经过的某一层目录」（含它所在的那一层）？是 = 环②：解引用后会一路往里钻。
+  // 比的是真路径；一直比到顶层为止（再往上的祖先由环①管）。
+  // 软链只有在目标的真路径不等于当前路径上任何一层时才放行，放行后它就在路径上了，所以沿一条路径被放行的目标互不相同、至多真目录总数个；
+  // 两次放行之间只有真下降，深度有限；故拷贝一定会停。
+  const pointsBackIntoOwnPath = async (link: string, target: string): Promise<boolean> => {
+    for (let dir = path.dirname(link); ; dir = path.dirname(dir)) {
+      if ((await realDirOf(dir)) === target) return true;
+      if (dir === realSrc || path.dirname(dir) === dir) return false;
+    }
+  };
+  // 这个条目拷不拷：不拷 → null；拷 → 它要拷多少字节（文件按大小，指向文件的软链按目标文件的大小，目录 0）。
+  // 判定过程中的任何报错（断链、读不了、拷贝中途被删）都当成「跳过这一条」。
+  const bytesToCopy = async (src: string): Promise<number | null> => {
+    try {
+      const lst = await fs.lstat(src);
+      if (!lst.isSymbolicLink()) return lst.isFile() ? lst.size : 0;
+      const target = await fs.realpath(src); // 断链会抛 → 落到 catch 跳过
+      // 环①：从目标走到源目录，不用爬出去（不是 ".." / "../x"，也不是跨盘的绝对路径）= 源目录就在目标里面
+      // （空串 = 就是它自己）= 指向它自己 / 祖先。".." 本身是「目标在源目录里面」（指向自己的子目录），不是环。
+      const rel = path.relative(target, realSrc);
+      const srcInsideTarget = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+      if (srcInsideTarget) return null;
+      // 环②：目标是路径上的某一层目录（子目录里指向自己 / 更高一层、互指、目录外的共享目录自带的环）
+      if (await pointsBackIntoOwnPath(src, target)) return null;
+      const st = await fs.stat(target);
+      return st.isFile() ? st.size : 0;
+    } catch {
+      return null;
+    }
+  };
+  // 计数和超限检查放在 bytesToCopy 的 try / catch 之外：超限的报错若落进 catch，会被当成「断链」吞掉——
+  // fs.cp 照常返回、导入「成功」但缺文件（静默截断，比失败更糟）。
+  let entries = 0;
+  let bytes = 0;
+  await fs.cp(realSrc, tmp, {
+    recursive: true,
+    dereference: true,
+    filter: async (src) => {
+      const size = await bytesToCopy(src);
+      if (size === null) return false;
+      entries += 1;
+      bytes += size;
+      if (entries > limits.maxEntries || bytes > limits.maxBytes) {
+        throw new Error(tooLargeMessage(path.basename(srcDir), limits));
+      }
+      return true;
+    },
+  });
+};
+
+const replaceDirWithCopy = async (srcDir: string, dest: string, limits?: SkillCopyLimits): Promise<void> => {
   const parent = path.dirname(dest);
   const stamp = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const tmp = path.join(path.dirname(parent), `${SKILL_IMPORT_TMP_PREFIX}${stamp}`);
@@ -385,7 +500,7 @@ const replaceDirWithCopy = async (srcDir: string, dest: string): Promise<void> =
   try {
     await fs.mkdir(parent, { recursive: true });
     try {
-      await fs.cp(srcDir, tmp, { recursive: true });
+      await copySkillTree(srcDir, tmp, limits);
     } catch (err) {
       // 报错里带的是临时目录路径，用户看不懂：换回目标 skill 路径（Q9-03e）
       if (err instanceof Error && err.message.includes(tmp)) {
@@ -418,13 +533,19 @@ const replaceDirWithCopy = async (srcDir: string, dest: string): Promise<void> =
  * 从全局 `~/.cursor/skills/` 导入（整目录拷贝、含 scripts 等附属文件——
  * SKILL.md 常引用同目录脚本、只拷 md 会导入残废 skill）。
  * @param names 要导入的 skill 目录名列表
- * @returns 实际导入成功的名字
+ * @param options.limits 单个 skill 展开后的体量上限，缺省取 `SKILL_COPY_MAX_ENTRIES` / `SKILL_COPY_MAX_BYTES`。**仅测试注入小值用**：API 路由不传、也不得把请求体里的任何值传进来——上限不能由 HTTP 调用方指定，否则保护就交给了调用者
+ * @returns 实际导入成功的名字；展开后超限的 skill 整个失败、进 failed
  */
 export const importSkillsFromCursor = async (
   names: string[],
+  options: { limits?: Partial<SkillCopyLimits> } = {},
 ): Promise<{ imported: string[]; failed: Array<{ name: string; error: string }> }> => {
   const imported: string[] = [];
   const failed: Array<{ name: string; error: string }> = [];
+  const limits: SkillCopyLimits = {
+    maxEntries: options.limits?.maxEntries ?? SKILL_COPY_MAX_ENTRIES,
+    maxBytes: options.limits?.maxBytes ?? SKILL_COPY_MAX_BYTES,
+  };
 
   // 找每个名字在哪个全局目录下（多候选目录取第一个命中的）
   const candidates = getGlobalCursorDirs().map((d) => path.join(d, "skills"));
@@ -452,7 +573,7 @@ export const importSkillsFromCursor = async (
       continue;
     }
     try {
-      await replaceDirWithCopy(srcDir, path.join(getAppSkillsDir(), name));
+      await replaceDirWithCopy(srcDir, path.join(getAppSkillsDir(), name), limits);
       imported.push(name);
     } catch (err) {
       failed.push({

@@ -28,6 +28,7 @@ import { getChatLifecycle } from "./chat-gate";
 import { failpoint } from "./failpoints";
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 import { stripHostInjectedEnv } from "./host-env";
+import { stripAnsi } from "@/lib/strip-ansi";
 import type { PreviewSlotStatus } from "@/lib/types";
 
 const execFileAsync = promisify(execFile);
@@ -599,7 +600,10 @@ const doStartPreview = async (
   };
 
   const onChunk = (chunk: Buffer): void => {
-    const lines = chunk.toString("utf8").split(/\r?\n/).filter(Boolean);
+    // 先剥 ANSI 转义再切行（Q13-09）：`buildPreviewEnv` 的 FORCE_COLOR=0 管不住 picocolors（vite）——它把 "0" 当真值、
+    // 反而上色，端口被 ESC 码夹在中间（`localhost:ESC[1m5173ESC[22m/`），URL_RE 探不到；整段上色时尾部的 ESC[39m 还会进地址。
+    // 日志尾巴（logTail）也跟着干净。
+    const lines = stripAnsi(chunk.toString("utf8")).split(/\r?\n/).filter(Boolean);
     slot.log.push(...lines);
     if (slot.log.length > MAX_LOG_LINES) {
       slot.log.splice(0, slot.log.length - MAX_LOG_LINES);

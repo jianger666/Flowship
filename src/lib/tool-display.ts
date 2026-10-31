@@ -814,6 +814,7 @@ const cachedOrphanResultBlock = (
  *
  * 历史双写兜底：同 callId 多条 tool_call 只出一块——args 取更长、id/ts 留第一条
  * （服务端新数据已修、已落盘历史仍可能双条，渲染层必须去重）。
+ * 同 callId 多条 tool_result（SDK 重派 / 历史双写）同理只出一块：配对的是**最后一条**，先到的不再合成孤儿块。
  *
  * 块 / verb 组对象按输入缓存复用（见 {@link CALL_BLOCK_CACHE}）；`noCache` 仅给等价性测试对拍用。
  */
@@ -870,6 +871,13 @@ export const mergeToolDisplayEvents = (
 
     if (ev.kind === "tool_result") {
       if (consumedResults.has(ev.id)) continue;
+      // 同 callId 的多条结果只留最后一条——就是上面 resultsByCallId（后写覆盖）里、tool_call 配对的那条。
+      // 先到的那几条走到下面会被合成「孤儿块」：没有 args，子代理卡片标题缺省「子代理任务」、没有模型徽标
+      // （用户截图：一张评审子代理卡旁边多出一张没名字的「子代理任务」）。
+      // 成因：SDK 在同一个运行里把还没全部返回的工具调用整批重新派发（同一个 callId 被执行第二遍、各回一条结果）；
+      // 旧历史里 read / shell 也有同 callId 隔几秒的双结果。没有 callId 的不在此列（getCallId 为空串、不进 resultsByCallId）。
+      const cid = getCallId(ev);
+      if (cid && resultsByCallId.get(cid) !== ev) continue;
       const meta = asToolResultMeta(ev.meta);
       if (!meta) {
         raw.push(ev);

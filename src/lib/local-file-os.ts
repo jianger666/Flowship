@@ -63,8 +63,9 @@ const winShellOpenSpec = (target: string): OsSpawnSpec => ({
 /**
  * 「用系统默认应用打开」会被 ShellExecute / LaunchServices 当成「执行」的扩展名（小写、不含点）。
  * 命中的文件一律不直接打开，降级为「在文件管理器中显示」。
- * 注意：这是黑名单，只能挡住已知危险类型；macOS 上无扩展名的 Unix 可执行文件
- * 纯函数层无法识别（需要 stat 可执行位），见 buildOpenPathPlan 注释。
+ * 注意：这是黑名单，只能挡住已知危险类型；macOS 上无扩展名的 Unix 可执行文件、
+ * 名字无害的符号链接，纯函数只看路径字符串认不出来——要读盘才知道，
+ * 由 route 先取 {@link OpenPathFacts} 再传给 buildOpenPathPlan（Q14-01）。
  */
 const WIN_EXECUTABLE_EXTS = new Set([
   "bat", "cmd", "com", "exe", "scr", "pif", "lnk", "url", "hta", "msi", "msp", "mst",
@@ -131,51 +132,86 @@ export type OpenPathPlan =
   | { kind: "reject"; error: string };
 
 /**
+ * 服务端读盘得到的、纯函数光看路径字符串认不出来的事实（Q14-01）。
+ *
+ * 只有扩展名黑名单时有两个洞：① 无扩展名（或扩展名无害）但带可执行位的文件——macOS 的 `open` 会在终端里运行它，
+ * Linux 的 `xdg-open` 也可能直接执行；② 名字无害的符号链接（`notes.txt → Foo.app`、`readme → /bin/ls`）：
+ * 黑名单只看链接自己的名字，系统打开时却会顺着链接走到目标。
+ * route 在调用 {@link buildOpenPathPlan} 之前读一次盘（见 `server/open-path-facts.ts`），把结果传进来；
+ * 不传（没读到 / Windows）就是原来的纯路径判断，行为不变。
+ */
+export interface OpenPathFacts {
+  /** 解开所有符号链接后的真实路径（fs.realpath）。省略 / 与原路径相同 = 没有符号链接要处理 */
+  realPath?: string;
+  /** 真实路径是「带可执行位（owner / group / other 任一）的普通文件」；目录不算。win32 没有可执行位，忽略 */
+  executableFile?: boolean;
+}
+
+/**
  * 「打开文件」的执行计划（纯函数、可单测）。
  * - 普通文件 / 目录：macOS `open`、Windows `rundll32 FileProtocolHandler`、Linux `xdg-open`
  * - 可执行 / 脚本 / 快捷方式等危险扩展名（大小写不敏感、处理尾部空格 / 点 / `::$DATA`）：
  *   降级为 buildRevealInFolderSpec，不执行
  * - Windows UNC / 设备路径、含双引号的路径（会破坏 explorer 的 /select,"..." 单 argv）：拒绝
+ * - `facts`（Q14-01，可选）：给了真实路径就把它和原路径**都**过一遍上面的判断，之后交给系统的也是真实路径
+ *   （不再经符号链接，缩小「检查之后、打开之前」链接被换掉的窗口）；`executableFile` 为真（macOS / Linux）同样降级为在文件管理器中显示
  */
 export const buildOpenPathPlan = (
   absPath: string,
   platform: NodeJS.Platform,
+  facts?: OpenPathFacts,
 ): OpenPathPlan => {
+  const real = facts?.realPath && facts.realPath !== absPath ? facts.realPath : undefined;
+  /** 要判断的路径：原路径；有真实路径时再加上它 */
+  const candidates = real ? [absPath, real] : [absPath];
+  /** 真正交给系统的路径 */
+  const target = real ?? absPath;
+
   if (platform === "win32") {
-    if (isWindowsUncPath(absPath)) {
-      return {
-        kind: "reject",
-        error: "出于安全考虑，不支持打开网络共享（UNC）路径",
-      };
-    }
-    if (absPath.includes('"')) {
-      return { kind: "reject", error: "路径含非法字符（双引号）" };
+    for (const c of candidates) {
+      if (isWindowsUncPath(c)) {
+        return {
+          kind: "reject",
+          error: "出于安全考虑，不支持打开网络共享（UNC）路径",
+        };
+      }
+      if (c.includes('"')) {
+        return { kind: "reject", error: "路径含非法字符（双引号）" };
+      }
     }
   }
 
-  const ext =
-    platform === "win32" ? windowsEffectiveExt(absPath) : posixEffectiveExt(absPath);
   const dangerous =
     platform === "win32"
       ? WIN_EXECUTABLE_EXTS
       : platform === "darwin"
         ? MAC_EXECUTABLE_EXTS
         : LINUX_EXECUTABLE_EXTS;
-  if ((ext && dangerous.has(ext)) || (platform === "darwin" && insideMacAppBundle(absPath))) {
+  for (const c of candidates) {
+    const ext = platform === "win32" ? windowsEffectiveExt(c) : posixEffectiveExt(c);
+    if ((ext && dangerous.has(ext)) || (platform === "darwin" && insideMacAppBundle(c))) {
+      return {
+        kind: "reveal",
+        spec: buildRevealInFolderSpec(target, platform),
+        notice: `出于安全考虑，不直接运行${ext ? ` .${ext} ` : "此"}文件，已改为在文件管理器中显示`,
+      };
+    }
+  }
+  if (platform !== "win32" && facts?.executableFile === true) {
     return {
       kind: "reveal",
-      spec: buildRevealInFolderSpec(absPath, platform),
-      notice: `出于安全考虑，不直接运行${ext ? ` .${ext} ` : "此"}文件，已改为在文件管理器中显示`,
+      spec: buildRevealInFolderSpec(target, platform),
+      notice: "出于安全考虑，不直接打开带可执行权限的文件，已改为在文件管理器中显示",
     };
   }
 
   if (platform === "darwin") {
-    return { kind: "open", spec: { command: "open", args: [absPath] } };
+    return { kind: "open", spec: { command: "open", args: [target] } };
   }
   if (platform === "win32") {
-    return { kind: "open", spec: winShellOpenSpec(toWindowsExplorerPath(absPath)) };
+    return { kind: "open", spec: winShellOpenSpec(toWindowsExplorerPath(target)) };
   }
-  return { kind: "open", spec: { command: "xdg-open", args: [absPath] } };
+  return { kind: "open", spec: { command: "xdg-open", args: [target] } };
 };
 
 /**

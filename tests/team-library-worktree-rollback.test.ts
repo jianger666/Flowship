@@ -209,57 +209,74 @@ describe("withWorktreeRollback：外壳语义", () => {
   });
 });
 
+// 端到端三组共用的夹具（每组各建一份自己的远端）：
+// 上传 / 删除各用例用的名字互不相同，失败的都回滚、不影响别的用例，可以共用一份；
+// 但镜像用例不行——成功的镜像会把远端 / 本地的 knowledge/ 换成新内容，而两个失败用例断言 old.md 还在、new.md 不存在。
+// 原先它们共用一份远端，靠「成功的放最后」的书写顺序碰巧都过；乱序（vitest --sequence.shuffle，种子 1002 / 1003）下成功的排在前面
+// 就会红。所以：镜像失败（两个都回滚、互不影响）一组，镜像成功单独一组。
+const alice = {
+  host: TL_E2E_HOST,
+  userId: 101,
+  username: "alice",
+  name: "Alice",
+  emails: ["alice@example.com"],
+};
+
+type E2eEnv = Awaited<ReturnType<typeof setupTeamLibraryE2E>>;
+
+/** 建一份本地远端：有 alice 的 qa/legacy（删除用例的对象）、旧的 knowledge/old.md（镜像要整体替换掉它） */
+const setupRollbackLibrary = async (): Promise<E2eEnv> => {
+  const e = await setupTeamLibraryE2E({
+    prefix: "fe-tl-rollback",
+    token: "tok-alice",
+    users: {
+      "tok-alice": {
+        id: 101,
+        username: "alice",
+        name: "Alice",
+        email: "alice@example.com",
+      },
+    },
+    seedFiles: {
+      // 远端已有 alice 的 skill：删除用例的对象
+      "skills/qa/legacy/SKILL.md": skillMd("legacy"),
+      "skills/qa/legacy/.flowship-owner.json": JSON.stringify(
+        ownerFromGitLabIdentity(alice),
+      ),
+      // 镜像要整体替换掉的旧 knowledge/
+      "knowledge/old.md": "old\n",
+    },
+    // 知识库源仓里只有 new.md：镜像会删 old.md、加 new.md
+    knowledgeSeed: { "new.md": "new\n" },
+  });
+  const synced = await syncTeamLibrary();
+  expect(synced.ok).toBe(true);
+  return e;
+};
+
+/** 失败后的统一断言：远端没动、本地与远端一致、工作树干净 */
+const expectRolledBackIn = async (env: E2eEnv, before: string): Promise<void> => {
+  expect(await env.remoteHead()).toBe(before);
+  expect(await env.localHead()).toBe(before);
+  expect(await env.localStatus()).toBe("");
+};
+
 describe("共享库写入口：失败即回滚（端到端，本地 bare 当远端）", () => {
-  let env: Awaited<ReturnType<typeof setupTeamLibraryE2E>>;
-  const alice = {
-    host: TL_E2E_HOST,
-    userId: 101,
-    username: "alice",
-    name: "Alice",
-    emails: ["alice@example.com"],
-  };
+  let env: E2eEnv;
 
   const skillDir = (category: string, name: string): string =>
     path.join(env.repoDir, "skills", category, name);
 
   beforeAll(async () => {
-    env = await setupTeamLibraryE2E({
-      prefix: "fe-tl-rollback",
-      token: "tok-alice",
-      users: {
-        "tok-alice": {
-          id: 101,
-          username: "alice",
-          name: "Alice",
-          email: "alice@example.com",
-        },
-      },
-      seedFiles: {
-        // 远端已有 alice 的 skill：删除用例的对象
-        "skills/qa/legacy/SKILL.md": skillMd("legacy"),
-        "skills/qa/legacy/.flowship-owner.json": JSON.stringify(
-          ownerFromGitLabIdentity(alice),
-        ),
-        // 镜像要整体替换掉的旧 knowledge/
-        "knowledge/old.md": "old\n",
-      },
-      // 知识库源仓里只有 new.md：镜像会删 old.md、加 new.md
-      knowledgeSeed: { "new.md": "new\n" },
-    });
-    const synced = await syncTeamLibrary();
-    expect(synced.ok).toBe(true);
+    env = await setupRollbackLibrary();
   }, T);
 
   afterAll(async () => {
     await env.cleanup();
   });
 
-  /** 失败后的统一断言：远端没动、本地与远端一致、工作树干净 */
-  const expectRolledBack = async (before: string): Promise<void> => {
-    expect(await env.remoteHead()).toBe(before);
-    expect(await env.localHead()).toBe(before);
-    expect(await env.localStatus()).toBe("");
-  };
+  const expectRolledBack = (before: string): Promise<void> =>
+    expectRolledBackIn(env, before);
 
   it(
     "上传：敏感命中 → 失败；暂存的 skill 目录被清掉、本地不留幻影",
@@ -413,6 +430,23 @@ describe("共享库写入口：失败即回滚（端到端，本地 bare 当远�
     T,
   );
 
+});
+
+describe("共享库写入口：镜像失败即回滚（端到端，本地 bare 当远端）", () => {
+  // 两个用例都以回滚收场、互不影响，可以共用一份远端；成功的镜像在后面单独一组
+  let env: E2eEnv;
+
+  beforeAll(async () => {
+    env = await setupRollbackLibrary();
+  }, T);
+
+  afterAll(async () => {
+    await env.cleanup();
+  });
+
+  const expectRolledBack = (before: string): Promise<void> =>
+    expectRolledBackIn(env, before);
+
   it(
     "镜像：push 被远端拒收 → 失败；被整体替换掉的本地 knowledge/ 恢复原样",
     async () => {
@@ -469,6 +503,23 @@ describe("共享库写入口：失败即回滚（端到端，本地 bare 当远�
     T,
   );
 
+});
+
+describe("共享库写入口：成功不回滚（删除 / 镜像，端到端，单独一份远端）", () => {
+  // 成功的镜像会把远端 / 本地的 knowledge/ 换成新内容，不能和上面两个镜像失败用例共用一份远端（原因见文件里夹具上方的说明）
+  let env: E2eEnv;
+
+  const skillDir = (category: string, name: string): string =>
+    path.join(env.repoDir, "skills", category, name);
+
+  beforeAll(async () => {
+    env = await setupRollbackLibrary();
+  }, T);
+
+  afterAll(async () => {
+    await env.cleanup();
+  });
+
   it(
     "对照：删除成功不被回滚——远端没有了、本地目录没了、本地与远端一致、工作树干净",
     async () => {
@@ -495,7 +546,6 @@ describe("共享库写入口：失败即回滚（端到端，本地 bare 当远�
     T,
   );
 
-  // 放在最后：成功的镜像会把远端 / 本地的 knowledge/ 换成新内容
   it(
     "对照：镜像成功不被回滚——远端 knowledge/ 换成新内容、本地与远端一致、工作树干净",
     async () => {

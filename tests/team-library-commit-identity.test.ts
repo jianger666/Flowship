@@ -251,6 +251,14 @@ describe("提交身份：本机没有 git 身份的机器（模拟）", () => {
   it(
     "接线·数据分支：本机没身份、GitLab 身份也取不到 → 明确报错、远端分支不动",
     async () => {
+      // 先让 Alice 写一版，保证 members 分支存在：这个用例不能靠「上一个用例先把分支建出来」（乱序时它可能排在前面，
+      // 分支还没有，`git rev-parse members` 就抛错）。内容与上一个用例的不同，免得乱序时互相吃掉对方的 changed: true。
+      const seeded = await writeTeamLibraryBranchFile({
+        relPath: "group-members.json",
+        mutate: () => '{"version":1,"members":{"seed":1}}\n',
+        message: "chore: 预置一版（让 members 分支存在）",
+      });
+      expect(seeded.ok).toBe(true);
       const before = await env.git(["rev-parse", "members"], env.bareDir);
       await env.setToken("tok-unknown");
       try {

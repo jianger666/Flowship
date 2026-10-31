@@ -18,7 +18,7 @@
  *   ② chat 标题生成（promptOnceCustom）只含最后一遍；
  *   ③ Anthropic 格式端点——**半截里的工具调用能真正亮起 running 的唯一路径**：
  *      旧卡补成 error + 重试后新卡 completed、没有残留 running；正常 tool_use 流程不被误补；
- *      同一个 call id 被网关复用时的真实表现（特征化，已知局限）。
+ *      同一个 call id 被网关复用时的真实表现（特征化：UI 只出最终结果这一张卡，见 R14 S2-a）。
  *
  * 为什么工具卡的用例用 Anthropic 格式：实测 pi-ai 对 OpenAI 兼容的流式响应是「整条流正常结束才吐出工具调用块」，
  * tool_call 吐到一半（含 finish_reason=tool_calls 之后）被掐断，都不会发 toolcall_end，半截里根本没有 running 卡
@@ -449,11 +449,13 @@ describe("Anthropic 格式端点：半截里的工具调用（Q11-02）", () => 
     expect(blocks.some((b) => b.status === "running")).toBe(false);
   }, 60_000);
 
-  it("【特征化·已知局限】网关重试时复用同一个 call id → 旧卡的 error 作为独立的一块留在边界处，最终结果归到第一张卡，没有残留 running", async () => {
+  it("【特征化】网关重试时复用同一个 call id → 事件里仍有补出来的 error 结果，但 UI 只出最终结果这一张卡（旧 error 不再多出一块），没有残留 running", async () => {
     // 同 callId 的第二次 running 会被 handleSdkMessage 的「二次 running 去重」吞掉；前端按 callId 配对时取最后一条
-    // tool_result（success）给第一张卡，前面那条补出来的 error 没人认领，就以一个独立的 error 块出现。
-    // 信息没丢、也不会一直转圈，只是多一块。真实网关的 call id 通常每次重新生成（上一条用例），复用比较少见；
-    // 不为这个改前端的配对逻辑（改动面大），这里钉住当前表现，以后有人动配对 / 去重逻辑时能看见影响
+    // tool_result（success）给这张卡。前面那条补出来的 error 结果：R14 S2-a 之前没人认领，会以一个独立的 error 块出现
+    // （当时这里钉的是 ["toolu_1:success", "toolu_1:error"]，注释写的是「只是多一块」）；S2-a 在 mergeToolDisplayEvents 里
+    // 让「同一个 callId 的多条 tool_result 只出最后一条」，所以现在 UI 只剩一张卡。事件流里两条结果都还在（下面 shape
+    // 断言）、重试说明行也在，信息没丢，也不会一直转圈。真实网关的 call id 通常每次重新生成（上一条用例），复用比较少见。
+    // 通用规则由 tests/tool-display-duplicate-result.test.ts 钉住；这里钉的是这条真实链路上的表现
     responder = ({ n }, res) => {
       if (n === 1) return aToolUseThenCut(res, "toolu_1");
       if (n === 2) return aToolUse(res, "toolu_1");
@@ -470,7 +472,7 @@ describe("Anthropic 格式端点：半截里的工具调用（Q11-02）", () => 
       "assistant_message:READ-DONE",
     ]);
     const blocks = uiToolBlocks(out.events);
-    expect(blockShape(blocks)).toEqual(["toolu_1:success", "toolu_1:error"]);
+    expect(blockShape(blocks)).toEqual(["toolu_1:success"]);
     expect(blocks.some((b) => b.status === "running")).toBe(false);
   }, 60_000);
 });

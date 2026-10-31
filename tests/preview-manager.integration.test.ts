@@ -372,3 +372,67 @@ describe("preview-manager（CR-10 / 按仓多位）", () => {
     20_000,
   );
 });
+
+/**
+ * Q13-09：dev server 输出里带 ANSI 转义时，访问地址照样探得到、日志尾巴是干净的。
+ *
+ * 真实来源：`buildPreviewEnv` 设了 FORCE_COLOR=0，但 picocolors（vite）判断的是 `!!env.FORCE_COLOR`，"0" 是真值，
+ * 反而上色，端口被 ESC 码夹在 `localhost:` 后面——旧实现的 URL_RE 要求 `localhost:` 紧跟数字，探不到，预览一直显示「无地址」。
+ * 下面的子进程不依赖任何真实 dev server，直接打印那种形态后常驻。
+ */
+describe("preview-manager：输出里的 ANSI 转义（Q13-09）", () => {
+  const ESC = "\u001b";
+
+  const writeChild = async (name: string, lines: string[]): Promise<string> => {
+    const file = path.join(TMP_ROOT, name);
+    await fs.writeFile(file, lines.join("\n"), "utf8");
+    return file;
+  };
+
+  const urlOf = (repo: string): string | null =>
+    getPreviewStatus().find((s) => s.repoPath === repo)?.url ?? null;
+
+  it("vite 形态（端口单独加粗、前面还有一行带清行码的日志）→ 探到干净的 URL，logTail 里没有 ESC", async () => {
+    const repo = "/repo/ansi-vite";
+    const child = await writeChild("ansi-vite.js", [
+      'const E = String.fromCharCode(27);',
+      'console.log(E + "[2K" + E + "[1Gcompiling" + E + "[0m");',
+      // 整行只有转义码（清行）：剥完是空行，不该在日志里留一条空串
+      'console.log(E + "[2K");',
+      // 第二行隔一会儿才来：探测不能只看第一个输出块
+      'setTimeout(() => console.log("  " + E + "[32m➜" + E + "[39m  " + E + "[1mLocal" + E + "[22m:   " + E + "[36mhttp://localhost:" + E + "[1m5173" + E + "[22m/" + E + "[39m"), 150);',
+      "setInterval(() => {}, 1e9);",
+    ]);
+    await startPreview(input("task-ansi-vite", `node "${child}"`, repo));
+    expect(await waitUntil(() => urlOf(repo) !== null, 10_000)).toBe(true);
+    expect(urlOf(repo)).toBe("http://localhost:5173/");
+    const tail = getPreviewStatus().find((s) => s.repoPath === repo)!.logTail;
+    expect(tail.join("\n")).not.toContain(ESC);
+    expect(tail.join("\n")).toContain("compiling");
+    expect(tail).not.toContain("");
+    expect(tail.join("\n")).toContain("Local:");
+  }, 20_000);
+
+  it("整段 URL 上色 + 监听地址 0.0.0.0：尾部的 ESC[39m 不进地址，0.0.0.0 仍换成 localhost", async () => {
+    const repo = "/repo/ansi-whole";
+    const child = await writeChild("ansi-whole.js", [
+      'const E = String.fromCharCode(27);',
+      'console.log(E + "[36mhttp://0.0.0.0:3000/" + E + "[39m");',
+      "setInterval(() => {}, 1e9);",
+    ]);
+    await startPreview(input("task-ansi-whole", `node "${child}"`, repo));
+    expect(await waitUntil(() => urlOf(repo) !== null, 10_000)).toBe(true);
+    expect(urlOf(repo)).toBe("http://localhost:3000/");
+  }, 20_000);
+
+  it("对照：不带 ANSI 的普通输出照常探到（没有被剥离逻辑弄坏）", async () => {
+    const repo = "/repo/ansi-plain";
+    const child = await writeChild("ansi-plain.js", [
+      'console.log("  Local:   http://127.0.0.1:4321/docs");',
+      "setInterval(() => {}, 1e9);",
+    ]);
+    await startPreview(input("task-ansi-plain", `node "${child}"`, repo));
+    expect(await waitUntil(() => urlOf(repo) !== null, 10_000)).toBe(true);
+    expect(urlOf(repo)).toBe("http://127.0.0.1:4321/docs");
+  }, 20_000);
+});
