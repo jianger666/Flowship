@@ -386,6 +386,20 @@ const capText = (text) => {
   return `${text.slice(0, OUTPUT_CAP)}\n…（输出已截断）`;
 };
 
+/**
+ * 受限运行身份（设计上：需求群非属主「旁路答疑」agent 的子进程环境会带 `FLOWSHIP_RUN_KIND=restricted`）。
+ * 目前没有任何路径设置该变量（受限 agent 没有 shell 工具、Cursor SDK 也没有 env 选项），这里是纵深防御占位；
+ * 哪天给受限 agent 放开 shell，必须先把注入点接上。
+ * 该身份下：即使实例配置了 `readonly:false`，也按只读执行（沿用下面同一套：词法扫描 + 库侧 BEGIN READ ONLY / extended protocol）。
+ * ⚠️ 纵深防御、不是边界：环境变量能被 `env -u` 摘掉；主防线是受限 agent 没有 shell、prompt 不暴露凭据路径与本脚本用法。
+ */
+export const isRestrictedRun = (env = process.env) =>
+  String(env.FLOWSHIP_RUN_KIND ?? "").trim().toLowerCase() === "restricted";
+
+/** 本次查询是否按只读执行：实例自己只读，或调用方是受限身份 */
+export const effectiveReadonly = (instanceReadonly, env = process.env) =>
+  instanceReadonly === true || isRestrictedRun(env);
+
 const main = async () => {
   const args = parseArgs(process.argv.slice(2));
   if (args.error) {
@@ -408,11 +422,13 @@ const main = async () => {
     return;
   }
 
-  if (entry.readonly) {
+  // 实例只读 或 受限身份（旁路答疑）→ 一律按只读执行，readonly:false 的实例也不例外
+  const readonlyRun = effectiveReadonly(entry.readonly);
+  if (readonlyRun) {
     const verdict = checkReadonlySql(args.sql);
     if (!verdict.ok) {
       fail(
-        `该实例只读，只允许单条 SELECT / 只读查询（${READONLY_REJECT_REASON[verdict.reason]}）`,
+        `${entry.readonly ? "该实例只读" : "受限身份（群答疑旁路）只读"}，只允许单条 SELECT / 只读查询（${READONLY_REJECT_REASON[verdict.reason]}）`,
       );
       return;
     }
@@ -432,7 +448,7 @@ const main = async () => {
   try {
     await client.connect();
     let result;
-    if (entry.readonly) {
+    if (readonlyRun) {
       // 库侧强制只读（不依赖上面的静态扫描）：
       // ① BEGIN READ ONLY：写操作 / DDL 由服务端拒绝；
       // ② extended protocol（Parse/Bind）：服务端只接受单条语句，`a; b`、`COMMIT; DROP ...`、

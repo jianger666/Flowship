@@ -32,7 +32,9 @@ import {
   type DiffPrefs,
 } from "@/lib/changes/prefs";
 import {
+  atLeastPrefix,
   canLoadChanges,
+  describeChangesTotals,
   shouldFallBackToBranch,
   shouldShowChangesEntry,
 } from "@/lib/changes/panel-state";
@@ -121,6 +123,8 @@ export const TaskChangesPanel = ({ task, size = "sm" }: Props) => {
   if (!enabled || !data || !shouldShowChangesEntry(data.repos, chat)) return null;
 
   const { totals } = data;
+  // 海量改动时 git 清单被缓冲上限截断：合计只是下限，别当精确值显示
+  const { filesAtLeast, linesAtLeast } = describeChangesTotals(data.repos);
   return (
     <>
       <Tooltip
@@ -135,9 +139,16 @@ export const TaskChangesPanel = ({ task, size = "sm" }: Props) => {
           改动
           {totals.files > 0 && (
             <span className="ml-1 inline-flex items-center gap-1.5 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] tabular-nums text-muted-foreground">
-              <span>{totals.files}</span>
-              <span className="text-success">+{totals.added}</span>
-              <span className="text-destructive">−{totals.removed}</span>
+              <span>
+                {atLeastPrefix(filesAtLeast)}
+                {totals.files}
+              </span>
+              <span className="text-success">
+                {atLeastPrefix(linesAtLeast)}+{totals.added}
+              </span>
+              <span className="text-destructive">
+                {atLeastPrefix(linesAtLeast)}−{totals.removed}
+              </span>
             </span>
           )}
         </Button>

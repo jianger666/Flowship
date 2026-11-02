@@ -14,9 +14,13 @@ import { RESERVED_MCP_NAMES } from "@/lib/mcp-config";
 import { isMcpToolName } from "@/lib/mcp-tool-name";
 import { humanizeToolErrorText } from "@/lib/tool-error-text";
 
-import { renameWithRetry } from "./data-root";
+import { renameWithRetry, supportsUnixFileMode } from "./data-root";
+import {
+  getEventRedactionReplacements,
+  redactSecretsInText,
+} from "./event-secret-redact";
 import { stringifyMeta } from "./task-stream";
-import { taskDir, TOOL_OUTPUTS_DIR } from "./task-fs-core";
+import { DELETED_TOMBSTONE_FILE, taskDir, TOOL_OUTPUTS_DIR } from "./task-fs-core";
 import { normalizeToolName } from "./normalize-tool-name";
 
 /** tool_result.meta.output 上限（UTF-8 字节） */
@@ -29,6 +33,71 @@ export const TOOL_OUTPUTS_MAX_FILES = 200;
 export const TOOL_OUTPUTS_MAX_BYTES = 50 * 1024 * 1024;
 
 const utf8ByteLength = (s: string): number => Buffer.byteLength(s, "utf8");
+
+/**
+ * 脱敏输入上限（UTF-16 码元，≈ 16MB 的 ASCII 文本）。
+ *
+ * 为什么要有：{@link redactSecretsInText} 是同步的——每个凭据（含编码变体）一次整串 `includes`，命中再 split/join，
+ * 线性但不是零成本（实测 9 个凭据时 64MB ≈ 30~40ms；凭据条目更多、或每行都命中时会放大），
+ * 又恰好跑在 tool_result 落盘这条所有工具共用的路径上，会阻塞事件循环；
+ * 超大输出（`cat` 一个几十 MB 的日志）本来也只有头尾有价值。
+ * 超过上限就只对「头 / 尾各一半窗口」脱敏，中间整体换成提示——**不是**把超出部分原样放行（那就成了明文旁路）。
+ */
+export const TOOL_OUTPUT_REDACT_MAX_CHARS = 16 * 1024 * 1024;
+
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+/** 当前最长的待脱敏凭据形态（原值 / 编码变体 / JSON 转义形态）的长度：切口处最多会劈开这么长的一段 */
+const longestSecretLength = (): number => {
+  let max = 0;
+  for (const s of getEventRedactionReplacements()) {
+    max = Math.max(
+      max,
+      s.value.length,
+      s.escaped?.length ?? 0,
+      s.escapedTwice?.length ?? 0,
+    );
+  }
+  return max;
+};
+
+/**
+ * 给 tool-output 全文脱敏（落盘 / 读取接口 / 迁移共用）。
+ *
+ * - 没配凭据 → 原样返回（无可脱敏，也不必为它截断数据）；
+ * - 长度 ≤ `maxChars` → 等同 {@link redactSecretsInText}（命中才拷贝，没命中零拷贝）；
+ * - 超过 → 头尾窗口各 `maxChars/2`，各自脱敏后，**再各削掉 `longestSecretLength()` 个字符**：
+ *   窗口切口可能恰好劈开一个凭据，被劈开的那一截（< 最长凭据长度）在窗口的最末 / 最前，认不出来也就换不掉，
+ *   削掉它才能保证不留半截明文；中间换成一行提示（含大致省略字符数）。
+ * `maxChars` 仅供单测传小值；生产一律用默认上限。
+ */
+export const redactToolOutputText = (
+  text: string,
+  maxChars: number = TOOL_OUTPUT_REDACT_MAX_CHARS,
+): string => {
+  if (getEventRedactionReplacements().length === 0) return text;
+  if (text.length <= maxChars) return redactSecretsInText(text);
+
+  const half = Math.max(1, Math.floor(maxChars / 2));
+  const margin = Math.min(longestSecretLength(), half);
+  const head = redactSecretsInText(text.slice(0, half));
+  const tail = redactSecretsInText(text.slice(text.length - half));
+  let headEnd = Math.max(0, head.length - margin);
+  // 别把代理对从中间劈开（落单的高位代理写盘会变成 U+FFFD）
+  if (headEnd > 0 && isHighSurrogate(head.charCodeAt(headEnd - 1))) headEnd -= 1;
+  let tailStart = Math.min(tail.length, margin);
+  if (tailStart < tail.length && isLowSurrogate(tail.charCodeAt(tailStart))) tailStart += 1;
+  const omitted = Math.max(0, text.length - 2 * (half - margin));
+  return (
+    `${head.slice(0, headEnd)}\n…(输出过大：已省略中间约 ${omitted} 字符；` +
+    `为避免凭据明文落盘，只保留头尾各约 ${half} 字符的脱敏内容)…\n${tail.slice(tailStart)}`
+  );
+};
+
+/** 脱敏本身失败时给 UI / 模型看的占位（连没有凭据的正文也不给：预览是拿原文切的、无法确认干净） */
+const REDACT_FAILED_NOTICE =
+  "（脱敏失败：为避免凭据明文落盘 / 外流，已省略这条工具输出的内容）";
 
 /**
  * 按 UTF-8 字节上限取前缀，落在 Unicode code point 边界
@@ -186,7 +255,8 @@ export const pruneToolOutputsDir = async (taskId: string): Promise<void> => {
   const dir = getToolOutputsDir(taskId);
   let entries: Array<{ name: string; mtimeMs: number; size: number }>;
   try {
-    const names = await fs.readdir(dir);
+    // 点号开头的是内部标记文件（如迁移完成标记 .redacted-v1），不是 tool-output、不参与计数 / 淘汰
+    const names = (await fs.readdir(dir)).filter((n) => !n.startsWith("."));
     entries = await Promise.all(
       names.map(async (name) => {
         const st = await fs.stat(path.join(dir, name));
@@ -214,6 +284,194 @@ export const pruneToolOutputsDir = async (taskId: string): Promise<void> => {
       );
     }
   }
+};
+
+// ----------------- 旧版明文 tool-output 的一次性迁移 -----------------
+//
+// 背景：改成「写盘前脱敏」之前落盘的 `tool-outputs/*.txt` 是 agent 命令的原始输出（可能含凭据）。
+// GET 接口读时会再脱敏（兜住展示），但**盘上的明文仍在**——被打进诊断包 / 备份 / 别的进程读到就是泄漏。
+// 所以启动期（boot recovery 末尾、后台、不挡启动）对旧文件做一次迁移：读 → 脱敏 → 有变化才原子写回（0600）。
+//
+// 一次性 + 幂等：目录扫完（含「无需改动」的文件）后写 `.redacted-v1` 标记 `{v:1,n:<当时已知凭据条数>}`，
+// 之后启动直接跳过该目录；标记里记条数是因为凭据集合当时可能不全（config 半写 / 某个来源暂时读不出来），
+// 之后条数变多就重扫一次。没有已知凭据时什么都不做、也不写标记（没东西可脱敏，凭据出现后再迁）。
+// 预算：每次启动最多检查 N 个文件 / M 字节——**在目录之间检查**（预算耗尽就不再开新目录），目录内不拆：
+// 一个目录要么扫完落标记、要么下次整个重来，不会出现「永远扫前 N 个」的饥饿。单次实际处理量 ≤ 预算 + 一个目录
+//（目录本身被 pruneToolOutputsDir 封顶在 200 文件 / 50MB）。
+// 失败一律吞掉只记日志（该目录不落标记、下次启动再试），不影响启动与业务。
+
+/** 迁移完成标记文件名（点号开头：pruneToolOutputsDir 不把它当 tool-output 计数 / 淘汰） */
+export const TOOL_OUTPUT_MIGRATE_MARKER = ".redacted-v1";
+/** 每次启动最多检查的文件数 / 读取字节数（目录之间检查，见上） */
+export const TOOL_OUTPUT_MIGRATE_MAX_FILES = 400;
+export const TOOL_OUTPUT_MIGRATE_MAX_BYTES = 64 * 1024 * 1024;
+/** 单个文件超过这个长度（UTF-16 码元）处理完后让出一轮事件循环（整串脱敏同步、大文件会占住主线程） */
+const MIGRATE_YIELD_MIN_CHARS = 1_000_000;
+/** 单个文件超过它不迁移（跳过并记日志；读时脱敏仍兜底）：避免一次把几百 MB 读进内存 */
+const TOOL_OUTPUT_MIGRATE_MAX_FILE_BYTES = 64 * 1024 * 1024;
+
+export type ToolOutputMigrationReport = {
+  /** 实际检查（读过）的文件数 */
+  filesChecked: number;
+  /** 其中因含凭据而被改写的文件数（只替换凭据、不截断内容） */
+  filesRewritten: number;
+  /** 读取的总字节数 */
+  bytesRead: number;
+  /** 本次扫完并落了标记的任务目录数 */
+  tasksDone: number;
+  /** 因预算耗尽而没轮到的任务（下次启动继续） */
+  budgetExhausted: boolean;
+};
+
+/** 读完 → 写回之间文件若被改过（同 callId 被重写）就放弃：不能拿旧内容的脱敏版覆盖新内容 */
+const rewriteToolOutputRedacted = async (
+  absPath: string,
+  body: string,
+  before: { atime: Date; mtime: Date; mtimeMs: number; size: number },
+): Promise<"rewritten" | "changed"> => {
+  const unixMode = supportsUnixFileMode();
+  const tmpPath = `${absPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await fs.writeFile(
+      tmpPath,
+      body,
+      unixMode ? { encoding: "utf-8", mode: 0o600 } : "utf-8",
+    );
+    // 保留原 mtime：pruneToolOutputsDir 按 mtime 淘汰「最老」的文件，迁移不能让老文件一夜之间比新文件还新
+    await fs.utimes(tmpPath, before.atime, before.mtime).catch(() => {});
+    const now = await fs.stat(absPath);
+    if (now.mtimeMs !== before.mtimeMs || now.size !== before.size) {
+      await fs.unlink(tmpPath).catch(() => {});
+      return "changed";
+    }
+    await renameWithRetry(tmpPath, absPath);
+    return "rewritten";
+  } catch (err) {
+    await fs.unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+};
+
+const errTag = (err: unknown): string =>
+  (err as NodeJS.ErrnoException | null | undefined)?.code ??
+  (err instanceof Error ? err.name : typeof err);
+
+const migrateOneToolOutputsDir = async (
+  taskId: string,
+  dir: string,
+  secretCount: number,
+  report: ToolOutputMigrationReport,
+): Promise<void> => {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch (err) {
+    // 没有 tool-outputs 目录（绝大多数任务）= 无事可做
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn(`[tool-result] 迁移旧 tool-output：列举目录失败 task=${taskId} err=${errTag(err)}`);
+    }
+    return;
+  }
+  const markerPath = path.join(dir, TOOL_OUTPUT_MIGRATE_MARKER);
+  if (names.includes(TOOL_OUTPUT_MIGRATE_MARKER)) {
+    try {
+      const m = JSON.parse(await fs.readFile(markerPath, "utf-8")) as { v?: unknown; n?: unknown };
+      if (m.v === 1 && typeof m.n === "number" && m.n >= secretCount) return;
+    } catch {
+      // 标记读不出来 / 内容不对 → 当没有，重扫（幂等，最多多读一遍）
+    }
+  }
+
+  let complete = true;
+  for (const name of names) {
+    // 只处理 `<callId>.txt`：标记 / `.tmp.*` 残留 / 别的东西都不碰
+    if (!name.endsWith(".txt")) continue;
+    const file = path.join(dir, name);
+    try {
+      const st = await fs.stat(file);
+      if (!st.isFile()) continue;
+      if (st.size > TOOL_OUTPUT_MIGRATE_MAX_FILE_BYTES) {
+        console.warn(`[tool-result] 迁移旧 tool-output：文件过大、跳过 task=${taskId} file=${name} size=${st.size}`);
+        continue;
+      }
+      const raw = await fs.readFile(file, "utf-8");
+      report.filesChecked += 1;
+      report.bytesRead += st.size;
+      // 迁移用「整串」脱敏、不走 redactToolOutputText 的头尾截断：那是落盘 / 读取路径为保事件循环做的取舍，
+      // 用在这里会把「本来干净、只是超过 16M 字符」的旧文件当成「有变化」写回，白白丢掉中间的全部内容
+      // （评审 R1-5）。迁移是启动后台任务、单文件 ≤ 64MB（TOOL_OUTPUT_MIGRATE_MAX_FILE_BYTES），整串脱敏 ≈ 几十 ms 量级。
+      const safe = redactSecretsInText(raw);
+      // 大文件整串脱敏会占住主线程几十~几百 ms（64MB 上限）：处理完一个大文件让出一轮事件循环，别连着霸占（评审 R3）。
+      // 只对大文件让出：小文件逐个 await setImmediate 没意义，还会白白拖慢迁移
+      if (raw.length > MIGRATE_YIELD_MIN_CHARS) await new Promise<void>((r) => setImmediate(r));
+      if (safe === raw) continue; // 已是脱敏版 / 本来就干净：不重写（不换 inode、不动 mtime、不截断）
+      const outcome = await rewriteToolOutputRedacted(file, safe, st);
+      if (outcome === "rewritten") report.filesRewritten += 1;
+      else complete = false; // 被并发改写：留给下次启动
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue; // 迁移期间被 prune / 删任务清掉了
+      complete = false;
+      console.warn(
+        `[tool-result] 迁移旧 tool-output 失败（下次启动重试）task=${taskId} file=${name} err=${errTag(err)}`,
+      );
+    }
+  }
+  if (!complete) return;
+  try {
+    await fs.writeFile(
+      markerPath,
+      JSON.stringify({ v: 1, n: secretCount }),
+      supportsUnixFileMode() ? { encoding: "utf-8", mode: 0o600 } : "utf-8",
+    );
+    report.tasksDone += 1;
+  } catch (err) {
+    console.warn(`[tool-result] 迁移旧 tool-output：写完成标记失败（下次启动会再扫一遍）task=${taskId} err=${errTag(err)}`);
+  }
+};
+
+/**
+ * 启动期一次性迁移：把旧版明文 tool-outputs 就地脱敏（见上方说明）。永不抛。
+ * @param taskIds 要处理的任务 id（调用方给 boot recovery 扫到的合法目录；非法 id / 带 tombstone 的目录这里再兜一道）
+ * @param budget  仅单测传小值；生产用默认
+ */
+export const migrateLegacyToolOutputs = async (
+  taskIds: readonly string[],
+  budget: { maxFiles?: number; maxBytes?: number } = {},
+): Promise<ToolOutputMigrationReport> => {
+  const report: ToolOutputMigrationReport = {
+    filesChecked: 0,
+    filesRewritten: 0,
+    bytesRead: 0,
+    tasksDone: 0,
+    budgetExhausted: false,
+  };
+  const maxFiles = budget.maxFiles ?? TOOL_OUTPUT_MIGRATE_MAX_FILES;
+  const maxBytes = budget.maxBytes ?? TOOL_OUTPUT_MIGRATE_MAX_BYTES;
+  let secretCount: number;
+  try {
+    secretCount = getEventRedactionReplacements().length;
+  } catch (err) {
+    console.warn(`[tool-result] 迁移旧 tool-output：读取脱敏凭据失败、跳过 err=${errTag(err)}`);
+    return report;
+  }
+  // 没有已知凭据 = 没有可脱敏的东西：不扫、不写标记（凭据出现后下次启动再迁）
+  if (secretCount === 0) return report;
+
+  for (const taskId of taskIds) {
+    if (report.filesChecked >= maxFiles || report.bytesRead >= maxBytes) {
+      report.budgetExhausted = true;
+      break;
+    }
+    try {
+      const tomb = path.join(taskDir(taskId), DELETED_TOMBSTONE_FILE);
+      if (await fs.access(tomb).then(() => true, () => false)) continue;
+      await migrateOneToolOutputsDir(taskId, getToolOutputsDir(taskId), secretCount, report);
+    } catch (err) {
+      // taskDir() 对非法 id 抛错等：只影响这一个任务
+      console.warn(`[tool-result] 迁移旧 tool-output：处理任务失败（跳过）task=${taskId} err=${errTag(err)}`);
+    }
+  }
+  return report;
 };
 
 export type ToolResultStatus = "success" | "error" | "interrupted";
@@ -508,21 +766,39 @@ export const resolveToolResultStatus = (
  * 非 recursive 的 mkdir 在父目录（taskDir）缺失时抛 ENOENT——调用方都已 try/catch 降级
  * （spillModelFullOutput 返回 null、persistTruncatedOutput 退回截断展示），不会拖垮工具执行。
  * `tool-outputs/` 已存在（EEXIST）是常态，吞掉。
+ *
+ * 脱敏 + 权限：全量输出是 agent 命令的原始 stdout/stderr（`printenv` / `cat config.json` / `curl -v` 都可能带凭据），
+ * 以前只有事件行（appendEventLine）与推流（task-stream.publish）脱敏，这里明文落盘、读取接口原样返回，
+ * 绕过了 event-secret-redact 的承诺。所以写盘前过 `redactToolOutputText`（精确值替换、不是正则，
+ * 线性扫描、有输入上限；不超限时只换凭据值、不动换行 / 行数，截断 / 分页逻辑不受影响），
+ * 并把目录收紧到 0700 / 文件 0600（win32 上权限位不可靠，跳过；chmod 失败只吞、不挡写）。
+ * `opts.redacted`：调用方已对 `full` 脱敏过（persistTruncatedOutput 要先脱敏再截预览），不再重复扫一遍。
  */
 const writeToolOutputAtomic = async (
   absPath: string,
   full: string,
+  opts?: { redacted?: boolean },
 ): Promise<void> => {
+  // 脱敏放在建目录之前：万一脱敏抛错（fail-closed，调用方降级为不落盘）也不会留下空目录
+  const body = opts?.redacted ? full : redactToolOutputText(full);
+  const dir = path.dirname(absPath);
+  const unixMode = supportsUnixFileMode();
   try {
-    await fs.mkdir(path.dirname(absPath));
+    await fs.mkdir(dir, unixMode ? { mode: 0o700 } : undefined);
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
   }
+  // 老版本建的目录是 0755：每次写顺手收紧（best-effort；失败不阻断业务写）
+  if (unixMode) await fs.chmod(dir, 0o700).catch(() => {});
   const tmpPath = `${absPath}.tmp.${process.pid}.${Math.random()
     .toString(36)
     .slice(2, 8)}`;
   try {
-    await fs.writeFile(tmpPath, full, "utf-8");
+    await fs.writeFile(
+      tmpPath,
+      body,
+      unixMode ? { encoding: "utf-8", mode: 0o600 } : "utf-8",
+    );
     await renameWithRetry(tmpPath, absPath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
@@ -616,10 +892,28 @@ export const persistTruncatedOutput = async (
   mode: OutputPreviewMode = "head",
 ): Promise<{ output: string; truncated?: boolean; fullPath?: string }> => {
   if (utf8ByteLength(full) <= limit) return { output: full };
+  // 超限才脱敏（小输出走事件行脱敏就够、不为每个工具结果多扫一遍）：先脱敏再截预览与落盘——
+  // 凭据恰好跨在预览截断点上时，先截再脱敏会留下半截明文（事件行脱敏认整段值、抓不到）。
+  // 脱敏放进保护范围：它若抛错（超大串 RangeError / 缓存读异常…）不能冒泡——emitToolResult 的外层 catch 会把整条
+  // tool_result 事件吞掉；更不能退回明文。降级 = 不落盘、不给预览，只给占位提示（fail-closed）。
+  let safeFull: string;
+  try {
+    safeFull = redactToolOutputText(full);
+  } catch (err) {
+    // 只记类别：err.message 可能含片段
+    console.warn(
+      `[tool-result] 脱敏失败、已省略输出且不落盘 task=${taskId} callId=${callId} err=${
+        err instanceof Error ? err.name : typeof err
+      }`,
+    );
+    return { output: REDACT_FAILED_NOTICE, truncated: true };
+  }
+  // 占位符通常比凭据短：脱敏后可能掉回上限内，此时没有「全量」可查，直接给全文、不落盘
+  if (utf8ByteLength(safeFull) <= limit) return { output: safeFull };
   const rel = toolOutputRelPath(callId);
   const abs = path.join(taskDir(taskId), rel);
   try {
-    await writeToolOutputAtomic(abs, full);
+    await writeToolOutputAtomic(abs, safeFull, { redacted: true });
     // 写入后 best-effort 清旧文件（超 200 / 50MB）
     void pruneToolOutputsDir(taskId);
   } catch (err) {
@@ -629,12 +923,12 @@ export const persistTruncatedOutput = async (
     );
     // 写盘失败仍截断展示，但不带 fullPath——前端不应出「查看完整输出」（点开会 404）
     return {
-      output: previewOutput(full, limit, mode),
+      output: previewOutput(safeFull, limit, mode),
       truncated: true,
     };
   }
   return {
-    output: previewOutput(full, limit, mode),
+    output: previewOutput(safeFull, limit, mode),
     truncated: true,
     fullPath: rel,
   };

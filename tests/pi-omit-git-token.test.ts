@@ -2,7 +2,9 @@
  * N3-01（pi 路径）：旁路会话的 shell / 子代理 bash 拿不到 GitLab PAT，属主会话照常拿得到
  *
  * 背景：GitLab PAT 放在 server 的 `process.env.FLOWSHIP_GITLAB_TOKEN`（git-token-env.ts），pi 的 shell 工具
- * 继承它。需求群「非属主答疑旁路」是工具全开的 honor-system agent，群里任何人让它 `printenv` 就能拿到。
+ * 继承它。需求群「非属主答疑旁路」是无身份会话；它现在只有 read / grep(/ glob) 白名单、没有 shell，
+ * 所以 `printenv` 这条路目前走不通，`omitGitToken` 是纵深防御——哪天给受限 agent 放开 shell，
+ * 群里任何人让它 `printenv` 就能拿到 PAT。本文件直接用真 shell 工具验证标记透传，不依赖受限 agent 有没有 shell。
  * 修法：旁路显式传 `omitGitToken: true`（agent-backend → custom-agent-backend → pi-coding-tools），
  * shell 工具、以及 `task` general 子代理的原生 bash 都用摘掉该变量的 env。
  *

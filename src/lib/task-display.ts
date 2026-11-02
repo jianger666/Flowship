@@ -21,6 +21,7 @@ import type {
 // ACTION_LABEL 单源在 types.ts（server action-gates / stop-task 同引）；此处 re-export 供 UI 原路径 import
 export { ACTION_LABEL } from "./types";
 import { repoTail } from "./path-utils";
+import { sliceHeadSafe } from "./text-slice";
 import { ACTION_LABEL } from "./types";
 
 // 原 CHAT_ATTACHMENT_ONLY_TEXT 占位文案已删：纯附件消息气泡直接空文本、
@@ -393,7 +394,7 @@ export const deriveChatTitleFromMessage = (text: string): string | null => {
     .trim();
   if (!cleaned) return null;
   const MAX = 24;
-  return cleaned.length > MAX ? `${cleaned.slice(0, MAX)}…` : cleaned;
+  return cleaned.length > MAX ? `${sliceHeadSafe(cleaned, MAX)}…` : cleaned;
 };
 
 // ===========================================

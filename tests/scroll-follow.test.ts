@@ -23,6 +23,7 @@ import {
   isDownIntentWheel,
   isEditableTarget,
   isScrollbarPointer,
+  isSpaceActivatesTarget,
   isUpIntentKey,
   isUpIntentTouch,
   isUpIntentWheel,
@@ -352,6 +353,27 @@ describe("用户上滚意图识别", () => {
     expect(isUpIntentKey("a")).toBe(false);
   });
 
+  it("Shift+空格 = 往上翻一屏（评审 R1-7）；不带 Shift 的空格不是上翻", () => {
+    expect(isUpIntentKey(" ", true)).toBe(true);
+    expect(isUpIntentKey(" ", false)).toBe(false);
+    expect(isUpIntentKey(" ")).toBe(false);
+    // Shift 只对空格有意义：Shift+a 之类仍不算
+    expect(isUpIntentKey("a", true)).toBe(false);
+  });
+
+  it("空格落在「空格 = 激活」的元素上不滚动：按钮 / summary / button·tab·switch… role", () => {
+    expect(isSpaceActivatesTarget("BUTTON", null)).toBe(true);
+    expect(isSpaceActivatesTarget("SUMMARY", null)).toBe(true);
+    expect(isSpaceActivatesTarget("DIV", "button")).toBe(true);
+    expect(isSpaceActivatesTarget("DIV", "tab")).toBe(true);
+    expect(isSpaceActivatesTarget("SPAN", "switch")).toBe(true);
+    expect(isSpaceActivatesTarget("DIV", null)).toBe(false);
+    expect(isSpaceActivatesTarget("DIV", undefined)).toBe(false);
+    expect(isSpaceActivatesTarget("DIV", "article")).toBe(false);
+    // 链接上空格会滚页面、不是激活
+    expect(isSpaceActivatesTarget("A", null)).toBe(false);
+  });
+
   it("可编辑元素里的按键不算滚动意图（事件流里内联着编辑框 / 答题卡）", () => {
     expect(isEditableTarget("TEXTAREA", false)).toBe(true);
     expect(isEditableTarget("INPUT", false)).toBe(true);
@@ -377,6 +399,12 @@ describe("用户往下翻输入识别（对称于上滚意图）", () => {
     expect(isDownIntentTouch(-30)).toBe(true);
     expect(isDownIntentTouch(-2)).toBe(false);
     expect(isDownIntentTouch(30)).toBe(false);
+  });
+
+  it("空格（不带 Shift）= 往下翻一屏；Shift+空格不是下翻", () => {
+    expect(isDownIntentKey(" ", false)).toBe(true);
+    expect(isDownIntentKey(" ")).toBe(true);
+    expect(isDownIntentKey(" ", true)).toBe(false);
   });
 
   it("键盘下翻键", () => {

@@ -41,6 +41,7 @@ import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 
 import { isAbsolutePathLike } from "@/lib/path-utils";
+import { nonLocalPathReason } from "@/lib/unc-path";
 import { isApiKeyFieldPresent } from "@/lib/agent-provider";
 import {
   errorResponse,
@@ -248,6 +249,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
     const trimmed = raw.trim();
     if (!isAbsolutePathLike(trimmed)) {
       return errorResponse(`attachments 必须是绝对路径：${raw}`);
+    }
+    // UNC / 网络共享 / 非本机磁盘形态在碰文件系统之前拒掉（Windows 上 stat UNC 会主动连 SMB 并带 NTLM 凭据，评审 P2）
+    const nonLocal = nonLocalPathReason(trimmed);
+    if (nonLocal) {
+      return errorResponse(`attachments 路径不可用：${nonLocal}：${raw}`);
     }
     const abs = path.resolve(trimmed);
     try {

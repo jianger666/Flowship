@@ -156,6 +156,9 @@ export const FeishuBoard = () => {
   const [meegleProject, setMeegleProject] = useState<MeegleProjectSetting>(() => ({
     ...DEFAULT_MEEGLE_PROJECT,
   }));
+  // settings 读完（成功或失败回落默认）之前不读缓存、不发请求：
+  // 否则首拉会拿硬编码默认空间发请求，用户改过空间时旧空间的缓存 / 响应会挂在新空间名下（点条目可能打开别的空间的工作项）
+  const [projectReady, setProjectReady] = useState(false);
   // 时间范围（接口按区间查、变化触发重拉）：默认今天前 3 天 ~ 后 10 天；
   // 改过的区间记 session（v1.1.x、切页回来不重置；重启回默认、防陈旧日期）
   const [range, setRange] = useState<DayRange>(() => {
@@ -168,34 +171,44 @@ export const FeishuBoard = () => {
 
   // 挂载后读 settings 里的默认空间（可能与硬编码默认不同）
   useEffect(() => {
-    void initSettings().then(() => {
+    let cancelled = false;
+    const apply = () => {
+      if (cancelled) return;
       const p = getSettings().meegleProject ?? DEFAULT_MEEGLE_PROJECT;
       setMeegleProject({
         key: p.key,
         name: p.name,
         ...(p.simpleName ? { simpleName: p.simpleName } : {}),
       });
-    });
+      setProjectReady(true);
+    };
+    // 读失败也要放行（getSettings 此时是默认值 → 默认空间），否则看板永远转圈
+    void initSettings().then(apply, apply);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // mount：先吃缓存秒开（按空间分 key）、再后台刷新。
   // v1.1.x 换 localStorage：跨重启也秒开（同事实测「启动很慢」、重启后 session 缓存
   // 全空、首屏干等飞书接口）——旧数据先亮、refreshing 转圈提示在刷
   useEffect(() => {
+    if (!projectReady) return;
+    // 换空间时上一个空间的响应必须先清掉：新空间没缓存时不能让旧空间的看板挂在新空间名下
+    let next: BoardResp | null = null;
     try {
       const cached = localStorage.getItem(`${CACHE_KEY}.${meegleProject.key}`);
       if (cached) {
         const parsed = JSON.parse(cached) as BoardResp;
         // 只吃 ok 缓存：老版本写过 not_authed / error 进缓存、首屏会闪降级引导
-        if (parsed.status === "ok") {
-          respRef.current = parsed;
-          setResp(parsed);
-        }
+        if (parsed.status === "ok") next = parsed;
       }
     } catch {
       /* 缓存坏了忽略 */
     }
-  }, [meegleProject.key]);
+    respRef.current = next;
+    setResp(next);
+  }, [meegleProject.key, projectReady]);
 
   const refresh = useCallback(async () => {
     // 新一轮开始先清掉上一轮静默重试，避免叠多个幽灵 timer
@@ -266,6 +279,7 @@ export const FeishuBoard = () => {
   }, [meegleProject.key, range, clearRetryTimer, scheduleSilentRetry]);
 
   useEffect(() => {
+    if (!projectReady) return;
     aliveRef.current = true;
     refreshRef.current = refresh;
     // 首拉立即发；之后区间 / 空间变化防抖 300ms，连点「往后平移」只发最后一次（D2a-04）
@@ -282,7 +296,7 @@ export const FeishuBoard = () => {
       clearRetryTimer();
       abortRef.current?.abort();
     };
-  }, [refresh, clearRetryTimer]);
+  }, [refresh, clearRetryTimer, projectReady]);
 
   // 点击工作项：有「仍存活」的任务直进（已归档的先恢复再进）、否则进预览（不盲信看板缓存里的 it.task）。
   // 判定与流程全在 lib/board-open（可测）：localStorage / 内存缓存里的 task id 删任务后不失效，

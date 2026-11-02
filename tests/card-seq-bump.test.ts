@@ -8,7 +8,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const TMP = path.join(os.tmpdir(), `feishu-bridge-seq-bump-${Date.now()}`);
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
@@ -124,4 +124,9 @@ describe("bumpCardSequence", () => {
     expect(nextCardSequence("fill_999")).toBe(NOW_SEC + 7201);
     expect(nextCardSequence("card_new")).toBe(NOW_SEC + 7201);
   });
+});
+
+// 整个文件跑完把临时数据目录整个删掉（beforeEach 只在下一个用例前清，最后一个用例的 data 目录会留在 tmpdir）
+afterAll(async () => {
+  await fs.rm(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });

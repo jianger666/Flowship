@@ -168,10 +168,11 @@ describe("收尾落盘抛错 → 会话闩锁仍释放（S12-01）", () => {
 });
 
 /**
- * R2-07：上面的用例走的是「自然 finished + 收尾抛错」。finished 分支本来就保留会话（只置
- * runActive=false），不是闩锁最容易残留的分支。真正会残留 runActive=true + 会话在表的是
- * error / cancelled 两条「必须摘表」的收尾——它们自己抛错、或根本没走到摘表时，
- * 闩锁就永久假 busy。下面逐条钉死：每条结束后 isChatRunActive=false 且会话已摘表。
+ * R2-07：上面的用例走的是「自然 finished + 收尾抛错」。注意 finished 分支的 `runActive=false`
+ * 现在放在「写 awaiting_user + 复查 lease」**之后**（见 chat-finalize-active-window.test.ts：撑住 runActive，
+ * 防止窗口内的 send 抢发），所以写盘抛错时它不会被顺手放掉——finished 分支同样可能残留 runActive=true，
+ * 上面的用例钉的就是「抛错后仍被释放」。下面补另外两条必须摘表的收尾：error / cancelled 自己抛错、
+ * 或根本没走到摘表时，闩锁同样会永久假 busy。逐条钉死：每条结束后 isChatRunActive=false 且会话已摘表。
  */
 describe("会残留闩锁的收尾分支（error / cancelled / 收尾抛错）→ 一律释放（R2-07）", () => {
   /** 起一个活 run：流在 gate 上挂着，cancel() 会放行 gate（模拟 SDK 取消后流结束） */

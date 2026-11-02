@@ -17,8 +17,12 @@ const isValidMs = (ms: unknown): ms is number =>
  */
 export const formatDurationPrecise = (ms: unknown): string | null => {
   if (!isValidMs(ms)) return null;
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const roundedMs = Math.round(ms);
+  // 999.5ms 起四舍五入后是 1000：不能出 "1000ms"，走下面的秒档
+  if (roundedMs < 1000) return `${roundedMs}ms`;
+  // 秒档先按 0.1s 取整再判断是否满一分钟：59.95s 起 toFixed(1) 会出 "60.0s"，应直接进分钟档
+  const tenths = Math.round(ms / 100);
+  if (tenths < 600) return `${(tenths / 10).toFixed(1)}s`;
   const totalSec = Math.round(ms / 1000);
   return `${Math.floor(totalSec / 60)}m${totalSec % 60}s`;
 };

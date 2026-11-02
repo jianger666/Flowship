@@ -36,7 +36,7 @@ import {
   parseFlowshipActionMeta,
 } from "./custom-action-fs";
 import { dataRoot, describeConfigReadError, stripBom } from "./data-root";
-import { gitEnv } from "./git-exec";
+import { gitEnv, withGitLongPaths } from "./git-exec";
 import { createMR } from "./gitlab-client";
 import {
   assertTrustedGitHost,
@@ -76,6 +76,7 @@ import {
   decodeForScan,
   formatSensitiveScanError,
   gateSensitiveUpload,
+  scanSensitiveFilenames,
   scanSensitiveFiles,
   type SecretScanFile,
   type SecretScanHit,
@@ -100,6 +101,7 @@ export {
 
 // 敏感扫描纯函数 re-export（单测 / API 共用类型）
 export {
+  classifySensitiveFilename,
   decodeForScan,
   formatSensitiveScanError,
   gateSensitiveUpload,
@@ -107,6 +109,7 @@ export {
   isProbablyBinaryText,
   looksHighEntropySecret,
   redactSecretValue,
+  scanSensitiveFilenames,
   scanSensitiveFiles,
   type SecretScanFile,
   type SecretScanHit,
@@ -893,14 +896,17 @@ export const ensureRepoAt = async (opts: {
   > => {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     const clone = await runGit(
-      buildAuthedGitArgs([
-        "clone",
-        "--branch",
-        branch,
-        "--single-branch",
-        cleanUrl,
-        dir,
-      ]),
+      buildAuthedGitArgs(
+        // Windows 深路径：仅这一次 clone 加 -c core.longpaths=true（非 Windows 原样；不写仓库 / 全局 git 配置）
+        withGitLongPaths([
+          "clone",
+          "--branch",
+          branch,
+          "--single-branch",
+          cleanUrl,
+          dir,
+        ]),
+      ),
       undefined,
       env,
     );
@@ -1523,21 +1529,26 @@ export const shouldScanStagedPath = (relPath: string): boolean => {
 /**
  * 读「已 staged、将推送」的新增/变更文本文件（跳过删除 / 二进制 / 豁免前缀）。
  * 在 git add -A 之后调用；路径相对 repoDir。
+ *
+ * 同时返回「需要过扫描的全部 staged 路径」（`paths`，含二进制 / 读不出来的）：文件名策略要看它们——
+ * 二进制（.p12 / .zip …）进不了内容扫描，不靠文件名就会被无声推上去。
  */
 const collectStagedTextFilesForScan = async (
   repoDir: string,
-): Promise<SecretScanFile[]> => {
+): Promise<{ files: SecretScanFile[]; paths: string[] }> => {
   // -z + ACMR：只看将写入远端的路径，NUL 分隔避空格坑
   const listed = await runGit(
     ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"],
     repoDir,
   );
-  if (!listed.ok || !listed.stdout) return [];
+  if (!listed.ok || !listed.stdout) return { files: [], paths: [] };
   const relPaths = listed.stdout.split("\0").filter(Boolean);
   const out: SecretScanFile[] = [];
+  const paths: string[] = [];
   for (const rel of relPaths) {
     // 豁免前缀先挡掉（顺带省掉整棵镜像树的读盘）
     if (!shouldScanStagedPath(rel)) continue;
+    paths.push(rel.replace(/\\/g, "/"));
     const abs = path.resolve(repoDir, rel);
     // 锚定仓内（防御 git 吐出奇怪路径）
     if (!isStrictlyInside(repoDir, abs)) continue;
@@ -1555,7 +1566,7 @@ const collectStagedTextFilesForScan = async (
       content,
     });
   }
-  return out;
+  return { files: out, paths };
 };
 
 const commitAndPush = async (opts: {
@@ -1636,8 +1647,9 @@ const commitAndPush = async (opts: {
     }
 
     // 推送前敏感扫描（force 放行误报）；命中则不 commit
-    const files = await collectStagedTextFilesForScan(repoDir);
-    const hits = scanSensitiveFiles(files);
+    const { files, paths } = await collectStagedTextFilesForScan(repoDir);
+    // 文件名策略（.env / 私钥 / 密钥库 / credentials / 压缩包）排在内容命中前面，同一套 force 闸门
+    const hits = [...scanSensitiveFilenames(paths), ...scanSensitiveFiles(files)];
     const gate = gateSensitiveUpload(hits, force);
     if (gate.blocked) {
       return {

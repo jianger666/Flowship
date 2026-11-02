@@ -18,6 +18,8 @@
  * 的这一份拷贝，不动 server 自身 process.env。
  */
 
+import { stripGitTokenEnv } from "./git-token-env";
+
 /**
  * 宿主注入、绝不允许泄进 agent shell 的变量黑名单。
  *
@@ -92,4 +94,18 @@ export function stripHostInjectedEnv(
   if (cleaned.NODE_ENV === "production") delete (cleaned as Record<string, string | undefined>).NODE_ENV;
   // 收窄回 ProcessEnv：剔除只减不增
   return cleaned as NodeJS.ProcessEnv;
+}
+
+/**
+ * 在 {@link stripHostInjectedEnv} 的基础上再摘掉 GitLab PAT（`FLOWSHIP_GITLAB_TOKEN`，大小写不敏感）。
+ *
+ * 给「不是 agent shell」的子进程用：打开系统文件管理器 / 用 IDE CLI 打开文件 / 只读 git 检查……
+ * 这些出口用不到 PAT，而它们常常是长寿命、会再派生子进程的 GUI 程序（IDE 起来后其内置终端、扩展宿主都继承这份 env），
+ * 把 PAT 带进去等于白白扩大暴露面（评审 P2：`stripHostInjectedEnv` 故意不剔 PAT，只适用于 agent shell 通道）。
+ * agent shell（pi shell 工具 / Cursor 本地 agent）仍用 `stripHostInjectedEnv`——那是有意让它继承 token 的通道。
+ */
+export function stripHostInjectedEnvAndGitToken(
+  base: Record<string, string | undefined> = process.env,
+): NodeJS.ProcessEnv {
+  return stripGitTokenEnv(stripHostInjectedEnv(base));
 }

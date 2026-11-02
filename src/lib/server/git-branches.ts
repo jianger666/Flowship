@@ -14,7 +14,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { occupantOf, occupiedBranchMessage } from "../git-branch-occupancy";
-import { GIT_MAX_BUFFER, gitEnv } from "./git-exec";
+import { CURRENT_BRANCH_ARGS, GIT_MAX_BUFFER, gitEnv, parseCurrentBranchOutput } from "./git-exec";
 import type {
   GitBranchOccupant,
   GitBranchState,
@@ -155,16 +155,19 @@ export const buildBranchOccupancy = async (
   return Object.fromEntries(occupied);
 };
 
-/** 当前分支名；detached HEAD（git 返回字面 "HEAD"）/ 非 git 仓 / 命令失败 → null */
+/**
+ * 当前分支的**精确**名；detached HEAD / unborn（空仓、HEAD 指向还没有提交的分支）/ 非 git 仓 / 命令失败 → null。
+ * 用 `--symbolic-full-name` 而不是 `--abbrev-ref`：后者在分支与同名 tag 并存时输出 `heads/<name>`，
+ * 占用检查与「切到当前分支自己」的名字比对就全错了（见 git-exec.ts 的 CURRENT_BRANCH_ARGS）。
+ */
 const readCurrentBranch = async (dir: string): Promise<string | null> => {
   try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["rev-parse", "--abbrev-ref", "HEAD"],
-      { cwd: dir, timeout: 10_000, env: gitEnv() },
-    );
-    const name = stdout.trim();
-    return name && name !== "HEAD" ? name : null;
+    const { stdout } = await execFileAsync("git", [...CURRENT_BRANCH_ARGS], {
+      cwd: dir,
+      timeout: 10_000,
+      env: gitEnv(),
+    });
+    return parseCurrentBranchOutput(stdout);
   } catch {
     return null;
   }
@@ -225,14 +228,14 @@ export const readGitBranchState = async (
   const empty: GitBranchState = { isRepo: false, current: null, branches: [] };
   if (!dir) return empty;
   try {
-    // 当前分支：detached HEAD 时 git 返回字面 "HEAD"、归一成 null
-    const { stdout: head } = await execFileAsync(
-      "git",
-      ["rev-parse", "--abbrev-ref", "HEAD"],
-      { cwd: dir, timeout: 10_000, env: gitEnv() },
-    );
-    const current = head.trim();
-    const currentName = current && current !== "HEAD" ? current : null;
+    // 当前分支（精确名，见 readCurrentBranch）：detached HEAD 归一成 null；
+    // unborn（还没有任何提交）时命令失败 → 抛进下面的 catch、照旧判 isRepo=false（保持既有行为，不在这里改语义）
+    const { stdout: head } = await execFileAsync("git", [...CURRENT_BRANCH_ARGS], {
+      cwd: dir,
+      timeout: 10_000,
+      env: gitEnv(),
+    });
+    const currentName = parseCurrentBranchOutput(head);
     // refresh：先更新远端 refs（研发刚推的分支不 fetch 本地根本没有）
     if (opts?.refresh) await fetchRemoteRefs(dir);
     // 本地 + 远端混列、去重（origin/ 前缀去掉）：刚 fetch 回来的远端分支也能切——
@@ -339,10 +342,69 @@ export const listRepoBranches = async (
   }
 };
 
+/** checkoutGitBranch 的切换目标判定结果（见 resolveCheckoutTarget） */
+type CheckoutTarget =
+  | { kind: "local" }
+  /** 只在**恰好一个**远端存在（且本地没有同名分支）：显式从该远端分支建跟踪分支 */
+  | { kind: "remote"; remote: string }
+  /** 多个远端都有同名分支：交给 git 自己的 DWIM / checkout.defaultRemote 裁决 */
+  | { kind: "remote-ambiguous" }
+  | { kind: "none" };
+
+/**
+ * `b` 指向哪种「已有的分支」：本地 `refs/heads/<b>`，或某个远端的 `refs/remotes/<remote>/<b>`（后者是 checkout 的 DWIM 来源）。
+ *
+ * 为什么要查 ref 而不是只看名字语法：`git checkout <x> --` 的 x 可以是任何 commit-ish——`HEAD~3`、sha、标签都会被检出成
+ * detached HEAD（用户以为在「切分支」，实际脱离了分支、之后提交没有分支指着）。而 40 位十六进制 sha 在语法上也是合法 refname，
+ * 光 `check-ref-format` 拦不住它；只有「refs/heads 或 refs/remotes 下真有这个名字」才是分支。
+ * 与 UI 列表同口径（列表就是这两个命名空间、远端去掉 remote 段），所以含 `/` `.` `_` 的合法分支名都不会被误拒。
+ *
+ * 远端是**精确匹配** `refs/remotes/<remote>/<b>`（remote 取自 `git remote`，所以含 `/` 的远端名也对）：
+ * 不能用 `endsWith("/<b>")`——`origin/feature/x` 会让 `x` 被误当成已有分支。`<remote>/HEAD` 是符号引用、不算分支。
+ *
+ * 读 ref 失败（git 异常 / 超时）→ 返回 null，调用方放行给 git 自己报错（不能因为探测失败就把合法切换挡死）。
+ */
+const resolveCheckoutTarget = async (dir: string, b: string): Promise<CheckoutTarget | null> => {
+  try {
+    try {
+      await execFileAsync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${b}`], {
+        cwd: dir,
+        timeout: 10_000,
+        env: gitEnv(),
+      });
+      return { kind: "local" };
+    } catch (err) {
+      // show-ref --verify --quiet：ref 不存在 = 退出码 1；其它（git 缺失 / 超时 / 非仓库）= 探测失败
+      if ((err as { code?: unknown } | null)?.code !== 1) return null;
+    }
+    if (b === "HEAD") return { kind: "none" };
+    const [refs, remotes] = await Promise.all([
+      execFileAsync("git", ["for-each-ref", "--format=%(refname)", "refs/remotes"], {
+        cwd: dir,
+        timeout: 10_000,
+        maxBuffer: GIT_MAX_BUFFER,
+        env: gitEnv(),
+      }),
+      execFileAsync("git", ["remote"], { cwd: dir, timeout: 10_000, env: gitEnv() }),
+    ]);
+    const refSet = new Set(refs.stdout.split("\n").map((r) => r.trim()).filter(Boolean));
+    const hit = remotes.stdout
+      .split("\n")
+      .map((r) => r.trim())
+      .filter(Boolean)
+      .filter((remote) => refSet.has(`refs/remotes/${remote}/${b}`));
+    if (hit.length === 0) return { kind: "none" };
+    return hit.length === 1 ? { kind: "remote", remote: hit[0]! } : { kind: "remote-ambiguous" };
+  } catch {
+    return null;
+  }
+};
+
 /**
  * 切换某目录的 git 分支（git checkout）。
  * 失败（分支不存在 / 工作区有未提交改动会被覆盖 / 非 git 仓）把 git stderr 带回、调用方 toast；
  * 分支被其他工作树占用时不进 git、直接返回带路径的说明（见下）。
+ * 目标必须是已有的本地 / 远端分支：`HEAD~3` / sha / 标签这类 commit-ish 会被 git 检出成 detached HEAD，一律拒绝。
  */
 export const checkoutGitBranch = async (
   dir: string,
@@ -363,13 +425,31 @@ export const checkoutGitBranch = async (
   ]);
   const occupant = occupantOf(await buildBranchOccupancy(entries, current), b);
   if (occupant) return { ok: false, error: occupiedBranchMessage(b, occupant) };
+  // 只能切到「已有的分支」：commit-ish（HEAD~3 / sha / 标签）会被 git 检出成 detached HEAD。
+  // 切到当前分支自己放行（此时 current 非 null、refs/heads/<current> 必然存在，`git checkout <current> --` 是 no-op）；
+  // unborn 的空仓 `readCurrentBranch` 返回 null（`rev-parse --symbolic-full-name HEAD` 在没有提交时失败），不走这条豁免：没有任何已有分支可切，
+  // 本地查不到 → 按「不存在」拒绝（git 自己也会报 `invalid reference`）。探测失败（null）放行给 git 自己报错。
+  const target = b === current ? ({ kind: "local" } as const) : await resolveCheckoutTarget(dir, b);
+  if (target?.kind === "none") {
+    return {
+      ok: false,
+      error: `分支「${b}」不存在：只能切换到已有的本地 / 远端分支（不能切到提交、标签或 HEAD~N 这类引用，否则会进入 detached HEAD）`,
+    };
+  }
   try {
     // 尾部 `--`：声明 b 只能是分支 / 提交、不能退化成路径。不带它时，分支名来自 UI（列表可能已过期、
     // 分支刚被删），若工作区恰有同名已跟踪文件，`git checkout b` 会静默把该文件从 index 还原、丢未提交改动
     //（实测 Updated 1 path from the index）；带 `--` 则直接 `fatal: invalid reference`。
-    // 远端独有分支的 DWIM（自动建跟踪分支）在带 `--` 时照常生效（实测）。
+    // 远端独有分支：只有一个远端有它时**显式**用完整 ref 建跟踪分支（`-b b --track refs/remotes/<remote>/b`），
+    // 不靠 DWIM——DWIM 要求 `b` 不能解析成别的 ref，远端分支恰有同名标签时 `git checkout b --` 会被标签抢走、
+    // 检出成 detached HEAD（实测）。本地有同名分支 + 同名标签时 git 优先切分支（带 ambiguous 警告），不受影响。
+    // 多个远端同名（remote-ambiguous）/ 探测失败（null）：回到 `git checkout b --`，由 git 的 DWIM / checkout.defaultRemote 裁决。
     // env 走 gitEnv()：checkout 会触发用户仓的 post-checkout 钩子——剔宿主注入变量与 GitLab PAT（见 git-exec.ts / task-worktrees.runGit）
-    await execFileAsync("git", ["checkout", b, "--"], {
+    const args =
+      target?.kind === "remote"
+        ? ["checkout", "-b", b, "--track", `refs/remotes/${target.remote}/${b}`, "--"]
+        : ["checkout", b, "--"];
+    await execFileAsync("git", args, {
       cwd: dir,
       timeout: 15_000,
       env: gitEnv(),

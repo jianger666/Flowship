@@ -15,17 +15,26 @@ import {
   rehypeBlockUncReferences,
   rehypeRewriteLocalImages,
 } from "@/lib/rehype-rewrite-local-images";
+import { rehypeStripMediaSources } from "@/lib/rehype-strip-media-sources";
+import { rehypeGateMermaidBlocks } from "@/lib/mermaid-rehype-gate";
 
 /**
- * rehype：传自定义列表也是整表替换。顺序 = raw → UNC 拦截 → 本地图改写 → sanitize → harden。
+ * rehype：传自定义列表也是整表替换。顺序 = raw → UNC 拦截 → 本地图改写 → sanitize → 剥 `<source>`/srcset → mermaid 外部资源闸 → harden。
+ * - mermaid 闸：源码含 `<img>` / `url()` / http(s) 地址等外部资源引用的 ```mermaid 块改成普通代码块（显示源码 + 提示），
+ *   不交给 mermaid 渲染——mermaid 对标签里的 `<img>` 不拦、渲染即发请求（见 lib/mermaid-source-gate / mermaid-rehype-gate）；
  * - UNC 拦截必须在 harden 之前（harden 会把 `//host/x` 改成 `/x`，host 被吞，之后没人认得出 UNC，Q4-06）；
- * - 本地图必须在 sanitize 前改写（file:// 会被剥 src）；artifact / 修订视图共用此表。
+ * - 本地图必须在 sanitize 前改写（file:// 会被剥 src）；artifact / 修订视图共用此表；
+ * - 剥 `<source>` / srcset 放在 sanitize 之后：sanitize 默认放行 `<picture><source srcset>`，那条远程请求由 `<source>` 自己触发、
+ *   组件层的 `img` 槽（MarkdownImage 的「远程图点击才加载」）管不到，必须在 AST 层拿掉（见 rehype-strip-media-sources）。
+ *   修订视图是在这张表上 map 出来的（revision-rehype-plugins），自动继承，不要在它那边另写。
  */
 export const STREAMDOWN_REHYPE_PLUGINS = [
   defaultRehypePlugins.raw,
   rehypeBlockUncReferences,
   rehypeRewriteLocalImages,
   defaultRehypePlugins.sanitize,
+  rehypeStripMediaSources,
+  rehypeGateMermaidBlocks,
   defaultRehypePlugins.harden,
 ];
 

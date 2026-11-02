@@ -73,11 +73,33 @@ const WIN_EXECUTABLE_EXTS = new Set([
   "cpl", "msc", "inf", "scf", "sct", "gadget", "application", "appref-ms", "settingcontent-ms",
   "library-ms", "search-ms", "diagcab", "xll", "appx", "msix", "appxbundle", "msixbundle",
   "dll", "sys", "drv", "ocx",
+  // 脚本语言解释器的文件关联（装了 Python / Perl / Ruby / PHP 的机器上双击 = 直接执行）
+  "py", "pyw", "pyc", "pyo", "pyz", "pyzw", "pl", "rb", "php", "ahk",
+  // PowerShell 控制台 / 旧版命名 + Monad 时代的脚本扩展名
+  "psc1", "psc2", "ps2", "ps2xml", "msh", "msh1", "msh2", "mshxml", "msh1xml", "msh2xml",
+  // 帮助 / 远程桌面 / ClickOnce / Java Web Start：打开即执行脚本或主动外连
+  "chm", "rdp", "xbap", "jnlp", "shs", "shb", "wsc",
+  // Access 老格式（可带宏 / 启动即执行）
+  "ade", "adp", "mde",
+  // 启用宏的 Office 文档（打开即提示启用宏；含模板 / 加载项 / 幻灯片放映的同族后缀）、Excel Web 查询 / 符号链接文本
+  "docm", "xlsm", "pptm", "dotm", "xltm", "potm", "ppam", "xlam", "sldm", "iqy", "slk",
+  // 主题文件（双击即套用到桌面，可引用 UNC 路径外连）、磁盘映像（双击即挂载，里面可带自启动内容）
+  "theme", "themepack", "deskthemepack", "iso", "vhd", "vhdx",
+  // shell 脚本：装了 WSL / Git Bash 的 Windows 上关联到 bash 直接执行。
+  // 只加在 Windows 侧——macOS 的 sh / bash 本来就在黑名单里，Linux 上 .sh 常被用户想打开看内容，不动
+  "sh", "bash",
 ]);
 const MAC_EXECUTABLE_EXTS = new Set([
   "app", "command", "terminal", "workflow", "pkg", "mpkg", "action", "tool", "sh", "csh", "zsh",
   "bash", "scpt", "scptd", "osax", "prefpane", "saver", "kext", "jar", "webloc", "inetloc",
   "fileloc",
+  // 磁盘映像（挂载后可带安装器 / 启动项）、配置描述文件（安装即改系统设置 / 信任证书 / VPN）、AppleScript 与自动化类
+  "dmg", "mobileconfig", "applescript", "service", "wflow", "shortcut",
+  // 可加载代码的 bundle 类目录（插件 / XPC 服务）：LaunchServices 打开等同加载 / 运行
+  "plugin", "bundle", "xpc",
+  // 其它磁盘映像（与 dmg 同由 DiskImageMounter 处理：打开 = 挂载，里面可带安装器 / 启动项）：
+  // ISO 光盘映像、CD/DVD 母盘 cdr、稀疏映像 / 稀疏包、老式 img / 自挂载映像 smi
+  "iso", "cdr", "sparseimage", "sparsebundle", "img", "smi",
 ]);
 const LINUX_EXECUTABLE_EXTS = new Set(["desktop", "appimage", "run", "bin", "jar"]);
 

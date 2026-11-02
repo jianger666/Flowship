@@ -104,12 +104,29 @@ export const loopbackSiteRelativeUrl = (url: string): string | null => {
   return `${u.pathname}${u.search}${u.hash}`;
 };
 
+/**
+ * file:// URL 的路径部分按 URL 规则百分号解码（`file:///Users/me/a%20b.png` → `/Users/me/a b.png`）。
+ * 标准 file URL（含 markdown 解析后的 normalizeUri 产物）里空格 / 中文都是编码态，
+ * 不解码就原样进 /api/local-image（服务端只解一层 query 编码），读的是不存在的 `a%20b.png` → 404。
+ * 只对 file:// 形态解码：裸本地路径里的 `%` 是文件名本身的字符，不能动。
+ * 兜底：非法 % 序列（`100%.png`）/ 解出 NUL 时原样返回、不抛错。
+ */
+const decodeFileUrlLocalPath = (url: string, localPath: string): string => {
+  if (!/^file:\/\//i.test(url)) return localPath;
+  try {
+    const decoded = decodeURIComponent(localPath);
+    return decoded.includes("\0") ? localPath : decoded;
+  } catch {
+    return localPath;
+  }
+};
+
 export const toLoadableImageSrc = (url: string): string => {
   // 回环主机的同源 API 绝对 URL：先折回站内路径，再走下面与相对形态一样的口径（Q4-04）
   const siteRelative = loopbackSiteRelativeUrl(url);
   if (siteRelative !== null) return toLoadableImageSrc(siteRelative);
   // `file:///C:/x` 去掉 `file://` 与盘符前多出的 `/`（R12-04）；其余照旧只剥 `file://`
-  const stripped = fileUrlToLocalPath(url);
+  const stripped = decodeFileUrlLocalPath(url, fileUrlToLocalPath(url));
   const isLocalAbs = isLocalAbsolutePath(stripped);
   // http(s) / data: / blob: / 相对路径（uploads 通道等）原样；本地绝对路径转通道。
   // `/api/...` `/uploads/...` 也以 / 开头——用已知站内前缀放行
@@ -119,6 +136,8 @@ export const toLoadableImageSrc = (url: string): string => {
   // 也不能原样放行（浏览器会把 `//host/…` / `\\host\…` 当 scheme-relative 去打 http://host/…）。
   // 返回空串：MarkdownImage 对空 src 直接不渲染；改写前拒绝、与平台无关（V10-01）
   if (isUncLikePath(url)) return "";
+  // 解码后才暴露的 UNC（`file:///%2F%2Fhost/…`）同样拒绝：编码不能绕过上面对原始 url 的判定
+  if (stripped !== url && isUncLikePath(stripped)) return "";
   if (!isLocalAbs) return url;
   // 站内白名单只认原始 url（不是剥过 file:// 的 stripped）：`file:///api/…` 不能借站内前缀的名义放行
   if (isTrustedSiteImagePath(url)) return url;

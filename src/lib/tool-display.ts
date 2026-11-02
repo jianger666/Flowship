@@ -1163,6 +1163,8 @@ const walkUnifiedDiff = (
     kind: DiffLineKind,
     raw: string,
     hunk: RegExpMatchArray | null,
+    /** 仅 context 行有值：这一行是 hunk 正文里「被编辑器剥了尾空格的空上下文行」（空串，但占旧 / 新各一行） */
+    blankInBody?: boolean,
   ) => void,
 ): void => {
   const rows = diff.split("\n");
@@ -1211,12 +1213,20 @@ const walkUnifiedDiff = (
       oldRemain = Math.max(0, oldRemain - 1);
       visit("del", raw, null);
     } else {
-      // 合法上下文以空格开头（空串 = 被编辑器剥了尾空格的空上下文行）；其余（\ No newline…）不计数
-      if (raw.startsWith(" ") || raw === "") {
+      // split("\n") 的**最后一个元素是空串当且仅当 diff 以 \n 结尾**——它是「末尾换行后的第 N+1 行」假象、不是内容，
+      // 无论是否还在 hunk 正文里（截断在行边界的 diff 也一样）都直接跳过，否则 tool-block 路径会多出一个幽灵行
+      // （评审 2026-11-01；最后一行真是被剥了空格的空上下文行时，它后面同样跟着换行、其后还有这个假象元素，不受影响）
+      if (raw === "" && i === rows.length - 1) continue;
+      // 空串 / 只剩 \r（CRLF 文件的空上下文行被剥了前导空格）只在 hunk 正文里才可能是
+      // 「被编辑器剥了尾空格的空上下文行」（占旧 / 新各一行、要计数 + 要有行号）
+      const inBody = oldRemain > 0 || newRemain > 0;
+      const blankInBody = (raw === "" || raw === "\r") && inBody;
+      // 合法上下文以空格开头；其余（\ No newline…）不计数
+      if (raw.startsWith(" ") || blankInBody) {
         oldRemain = Math.max(0, oldRemain - 1);
         newRemain = Math.max(0, newRemain - 1);
       }
-      visit("context", raw, null);
+      visit("context", raw, null, blankInBody);
     }
   }
 };
@@ -1246,7 +1256,7 @@ export const parseUnifiedDiff = (diff: string): DiffViewLine[] => {
   let oldLine: number | undefined;
   let newLine: number | undefined;
 
-  walkUnifiedDiff(diff, (kind, raw, hunk) => {
+  walkUnifiedDiff(diff, (kind, raw, hunk, blankInBody) => {
     switch (kind) {
       case "header":
         return;
@@ -1280,9 +1290,13 @@ export const parseUnifiedDiff = (diff: string): DiffViewLine[] => {
         return;
       }
       case "context": {
-        // 合法上下文以空格开头；其余（\ No newline…、截断残行等）当非法 → 行号缺省、不递推
-        if (raw.startsWith(" ")) {
-          const entry: DiffViewLine = { kind: "context", text: raw.slice(1) };
+        // 合法上下文以空格开头（hunk 正文里被剥了尾空格的空行 blankInBody 同样合法、文本为空串，
+        // 否则它不递推行号、后面所有行号整体漂一位）；其余（\ No newline…、截断残行等）当非法 → 行号缺省、不递推
+        if (raw.startsWith(" ") || blankInBody) {
+          const entry: DiffViewLine = {
+            kind: "context",
+            text: blankInBody ? "" : raw.slice(1),
+          };
           if (oldLine !== undefined) {
             entry.oldLine = oldLine;
             oldLine += 1;

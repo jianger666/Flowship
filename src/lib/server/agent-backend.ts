@@ -83,8 +83,10 @@ export type AgentCreateInput = CursorCreateInput & {
   backgroundSubagents?: boolean;
   /**
    * 本会话的 shell / 子代理 bash 不继承 FLOWSHIP_GITLAB_TOKEN（N3-01）。
-   * 只有需求群「非属主答疑旁路」（restricted-question.ts）传 true——它是工具全开的 honor-system agent、
-   * 输入来自群里任何能 @ 机器人的人。**新增任何由非属主输入驱动的会话也必须传 true**（显式标记是 fail-open 的，
+   * 只有需求群「非属主答疑旁路」（restricted-question.ts）传 true——它的输入来自群里任何能 @ 机器人的人。
+   * 受限 agent 现在只有 read / grep(/ glob) 白名单、没有 shell 工具，所以这个标记目前是纵深防御：
+   * 哪天给受限 agent 放开 shell，它就是挡住 `printenv` 拿 PAT 的那道。
+   * **新增任何由非属主输入驱动的会话也必须传 true**（显式标记是 fail-open 的，
    * 没传就默认带 token；之所以不按「无 callerToken」推断，是因为属主 one-shot 同样无 callerToken、却该保留）。
    * ⚠️ 只对 pi provider 有效：Cursor 路径的本地 agent shell 由 SDK 拉起、原样继承 server 的 process.env，
    * SDK 没有 env 选项、也不能临时删进程全局 env（会弄坏属主并行会话）——所以 Cursor 下该标记是空操作，
@@ -117,9 +119,11 @@ type FacadeExtras = {
 };
 
 /**
- * Cursor 内置白名单（read/grep only）。注：旁路已改 honor-system，两端默认全开、不接白名单；
- * READONLY_BUILTIN_TOOLS / pi-coding-tools.READONLY_CUSTOM_TOOL_NAMES（含 merge_test_mr）当前无人接线，
- * 留作单元覆盖，哪天收紧直接接回去。
+ * Cursor 内置白名单（read/grep only）：`readOnly: true` 时作为 `tools`（allowed-tools，SDK 服务端强制、本地无法验证）下发。
+ * 有真实接线：需求群受限答疑旁路（restricted-question.ts）传 `readOnly: true`——Cursor 路径用本数组，
+ * pi 路径用 custom-agent-backend 的 `RESTRICTED_READONLY_TOOL_NAMES`（pi-coding-tools.READONLY_CUSTOM_TOOL_NAMES
+ * 去掉 merge_test_mr，只剩 read / grep / glob）。受限 agent 因此没有 shell / 写类工具；
+ * 但 Cursor 路径的 read 由 SDK 本地执行、没有路径约束（见 restricted-question.ts 里的残余风险说明）。
  */
 export const READONLY_BUILTIN_TOOLS = ["read", "grep"] as const;
 

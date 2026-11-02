@@ -46,7 +46,6 @@ import { repoTail } from "@/lib/path-utils";
 import type { ActionRecord, Task } from "@/lib/types";
 
 import { gitEnv } from "./git-exec";
-import { stripHostInjectedEnv } from "./host-env";
 import { getActionArtifactPath } from "./task-fs-core";
 import {
   getTaskCwd,
@@ -1077,7 +1076,13 @@ interface ShellResult {
   notFound: boolean;
 }
 
-const runShell = (
+/** runShell 单路输出上限：超过后丢弃后续输出并留一行提示（防巨型 `status --porcelain` / `log` 撑爆 server 内存） */
+export const RUN_SHELL_OUTPUT_CAP = 16 * 1024 * 1024;
+/** 超时 SIGKILL 之后再等 close 的宽限；仍不来（孙进程占着管道）就不等了、直接返回 */
+export const RUN_SHELL_KILL_GRACE_MS = 2_000;
+
+/** 导出仅供测试（env 口径 / 超时后管道被孙进程占着 / 输出上限都要真跑子进程验证） */
+export const runShell = (
   cmd: string,
   args: string[],
   cwd: string,
@@ -1086,39 +1091,80 @@ const runShell = (
   new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let settled = false;
+    let killGraceTimer: NodeJS.Timeout | null = null;
+    const finish = (r: ShellResult): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (killGraceTimer) {
+        clearTimeout(killGraceTimer);
+        killGraceTimer = null;
+      }
+      resolve(r);
+    };
     // windowsHide：Windows 上从无控制台的 GUI 进程（Electron 壳）起 console 子进程
     // 会闪黑框、CREATE_NO_WINDOW 压掉（mac/linux 无此概念、传了无副作用）
-    // env 剔宿主注入变量：这里目前只跑 git 读命令（rev-parse / status / log），但 git 会读用户仓配置
-    // （fsmonitor 钩子、外部 diff 驱动等），与其它 spawn 出口保持一致、不把宿主环境交出去
+    // env 走 gitEnv（评审 P2）：这里目前只跑 git 读命令（rev-parse / status / log），而 git 会读用户仓配置
+    // （fsmonitor 钩子、外部 diff 驱动等）——钩子整份继承 env 就拿得到 GitLab PAT，所以与其它 git 出口一样剔宿主注入变量 + 剔 PAT +
+    // 不等人输入；GIT_OPTIONAL_LOCKS=0：只读检查不该去抢 index.lock、更不该因此让用户同时在跑的 git 命令失败
     const proc = spawn(cmd, args, {
       cwd,
       shell: false,
       windowsHide: true,
-      env: stripHostInjectedEnv(),
+      env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }),
     });
     let timer: NodeJS.Timeout | null = setTimeout(() => {
+      timer = null;
       try {
         proc.kill("SIGKILL");
       } catch {
         /* noop */
       }
       stderr += `\n[action-check] ${cmd} ${args.join(" ")} 超时 ${timeoutMs}ms、强杀`;
+      // git 的孙进程（钩子 / fsmonitor）可能继承了 stdout 管道：SIGKILL 只杀 git 本身时 close 事件要等到它们也退出、
+      // 可能永远不来，整个推进检查就挂住。宽限后不等了：销毁管道、按超时失败返回
+      killGraceTimer = setTimeout(() => {
+        killGraceTimer = null;
+        try {
+          proc.stdout?.destroy();
+          proc.stderr?.destroy();
+        } catch {
+          /* noop */
+        }
+        finish({ exitCode: -1, stdout, stderr, notFound: false });
+      }, RUN_SHELL_KILL_GRACE_MS);
     }, timeoutMs);
 
     proc.stdout?.on("data", (d) => {
+      if (stdout.length >= RUN_SHELL_OUTPUT_CAP) {
+        if (!stdoutTruncated) {
+          stdoutTruncated = true;
+          stdout += "\n[action-check] stdout 超过上限、后续输出已丢弃";
+        }
+        return;
+      }
       stdout += String(d);
     });
     proc.stderr?.on("data", (d) => {
+      if (stderr.length >= RUN_SHELL_OUTPUT_CAP) {
+        if (!stderrTruncated) {
+          stderrTruncated = true;
+          stderr += "\n[action-check] stderr 超过上限、后续输出已丢弃";
+        }
+        return;
+      }
       stderr += String(d);
     });
     proc.on("error", (err) => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
       const notFound =
         (err as NodeJS.ErrnoException).code === "ENOENT";
-      resolve({
+      finish({
         exitCode: -1,
         stdout,
         stderr: stderr + (notFound ? "" : `\n${err.message}`),
@@ -1126,11 +1172,7 @@ const runShell = (
       });
     });
     proc.on("close", (code) => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      resolve({
+      finish({
         exitCode: code ?? -1,
         stdout,
         stderr,

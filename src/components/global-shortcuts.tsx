@@ -15,6 +15,7 @@ import { useRouter } from "next/navigation";
 
 import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
+import { createModHotkeyHandler } from "@/components/hotkey-handler";
 import { isModCombo } from "@/lib/keyboard-shortcuts";
 
 export const GlobalShortcuts = () => {
@@ -31,13 +32,11 @@ export const GlobalShortcuts = () => {
   createChatRef.current = createChat;
 
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      // Cmd+N 带修饰键、输入框聚焦时也放行（不劫持普通打字）
-      if (isModCombo(e, "n")) {
-        e.preventDefault();
-        void createChatRef.current();
-      }
-    };
+    // Cmd+N 带修饰键、输入框聚焦时也放行（不劫持普通打字）；长按 repeat 帧只吞默认行为、不重复新建
+    const onKeyDown = createModHotkeyHandler(
+      (e: KeyboardEvent) => isModCombo(e, "n"),
+      () => void createChatRef.current(),
+    );
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);

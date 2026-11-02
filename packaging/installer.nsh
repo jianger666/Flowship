@@ -826,7 +826,8 @@
   Pop $3
   Pop $2
 
-  ; 更新路径不杀任何进程：主进程 before-quit 已按 server PID 精确清理；按镜像名杀
+  ; 更新路径不杀任何进程：主进程 before-quit 已按 server PID 精确清理（R8-4 订正：先关 server 的 stdin 请它优雅退出——
+  ; 清理后由 server 自己 taskkill /T /F 自杀整树；它不理会才由主进程 /T /F，不再是「同步 /T /F」）；按镜像名杀
   ; 分不清主程序 / server 子进程（同一个 exe 镜像），/T 更会顺手杀掉 electron-updater
   ; 派生的本安装器（旧目录已删、新文件没写完 = 更新完 App 没了）。只有用户手动安装
   ; （本安装器不是 Flowship 的子进程）才需要清隐形孤儿 server。

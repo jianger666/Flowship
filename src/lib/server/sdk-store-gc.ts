@@ -238,13 +238,40 @@ export const shouldKeepLine = (
   return live.has(agentId);
 };
 
+const BACKUP_PREFIX = ".gc-backup-";
+/**
+ * 备份目录里的「写完且校验通过」标记（最后一步才写）。没有它的备份目录 = 半截 / 旧版本留下的，
+ * 不算完整备份：pruneBackups 只在**新备份已带标记**之后才动旧的，且不会拿半截备份去顶掉完整备份。
+ * 不用 rename 目录来提交：Windows 上目录 rename 更容易被杀软占用拦住，标记文件只是一次小写入。
+ */
+const BACKUP_COMPLETE_MARK = ".complete";
+
+const isBackupDirName = (n: string): boolean => n.startsWith(BACKUP_PREFIX);
+
+const hasCompleteMark = async (dir: string, name: string): Promise<boolean> => {
+  try {
+    await fs.access(path.join(dir, name, BACKUP_COMPLETE_MARK));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 备份提交成功之后淘汰旧备份：只留最新的 KEEP_BACKUPS 份**完整**备份，其余（旧的完整备份、没有标记的
+ * 半截 / 旧版本备份）删掉。调用前新备份必须已写好标记，所以最坏情况下也至少剩这一份完整备份。
+ */
 const pruneBackups = async (dir: string): Promise<void> => {
   try {
-    const entries = await fs.readdir(dir);
-    const baks = entries.filter((n) => n.startsWith(".gc-backup-")).sort();
-    while (baks.length > KEEP_BACKUPS) {
-      const oldest = baks.shift()!;
-      await fs.rm(path.join(dir, oldest), { recursive: true, force: true });
+    const names = (await fs.readdir(dir)).filter(isBackupDirName).sort();
+    const complete: string[] = [];
+    const rest: string[] = [];
+    for (const n of names) (await hasCompleteMark(dir, n) ? complete : rest).push(n);
+    // 一份完整备份都没有（不该发生：调用前刚写完标记）→ 什么都不删，宁可多留
+    if (complete.length === 0) return;
+    const doomed = [...rest, ...complete.slice(0, Math.max(0, complete.length - KEEP_BACKUPS))];
+    for (const n of doomed) {
+      await fs.rm(path.join(dir, n), { recursive: true, force: true });
     }
   } catch {
     /* best-effort */
@@ -252,21 +279,69 @@ const pruneBackups = async (dir: string): Promise<void> => {
 };
 
 /**
- * 备份（只备四份 ndjson，不备整个目录）并裁剪旧备份。false = 备份目录都建不出来，调用方应跳过本轮。
- * store 路径下 checkpoints 可能正被追加：备份里最多多一个半行尾，恢复时 SDK / FastCheckpoints 都容忍。
+ * 备份（只备四份 ndjson，不备整个目录），**确认完整**后才裁剪旧备份。
+ * false = 备份没做成，调用方必须跳过本轮（不重写 store）；此时旧备份原样保留。
+ *
+ * 为什么这么严（备份是 GC 重写 store 之前唯一的后悔药）：
+ * 以前 `copyFile` 的错误被整个吞掉——磁盘写满只拷了一半时函数照样返回成功，随后 `pruneBackups`
+ * 把上一份完整备份删了（KEEP_BACKUPS=1），GC 再接着重写 store：手里只剩一份残缺备份。
+ * 现在：新备份**逐文件校验大小**、全部通过才写完成标记，标记落地后才淘汰旧备份；
+ * 任何一步失败 → 删掉这份半截备份、返回 false、不碰旧备份。
+ *
+ * 校验口径：拷贝前后各 stat 一次源文件，要求 `拷前大小 <= 备份大小 <= 拷后大小`。
+ * store 路径下 checkpoints 可能正被追加（只增不减），所以备份里最多多出一个半行尾，恢复时 SDK / FastCheckpoints 都容忍；
+ * 无并发写时就是「大小完全一致」。备份比拷前还小 = 没写完（磁盘满 / 被截断），源比备份小 = 源被截断过——都拒绝。
+ * 源文件缺失（ENOENT）照旧跳过这一份。
  */
 const backupStoreFiles = async (dir: string): Promise<boolean> => {
-  const bakDir = path.join(dir, `.gc-backup-${Date.now()}`);
+  const base = path.join(dir, `${BACKUP_PREFIX}${Date.now()}`);
+  // 本轮自己建的备份目录；失败只清它，绝不动别人（含同毫秒已存在的）备份
+  let bakDir: string | null = null;
   try {
-    await fs.mkdir(bakDir, { recursive: true });
-    for (const f of [CHECKPOINTS, RUNS, AGENTS, RUN_EVENTS]) {
+    for (let n = 0; bakDir === null; n += 1) {
+      const candidate = n === 0 ? base : `${base}-${n}`;
       try {
-        await fs.copyFile(path.join(dir, f), path.join(bakDir, f));
-      } catch {
-        /* 单文件缺失不管 */
+        await fs.mkdir(candidate, { recursive: false });
+        bakDir = candidate;
+      } catch (err) {
+        // 同毫秒已有同名目录：换个名字，不复用也不覆盖
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST" || n >= 20) throw err;
       }
     }
-  } catch {
+    const sizes: Record<string, number> = {};
+    for (const f of [CHECKPOINTS, RUNS, AGENTS, RUN_EVENTS]) {
+      const src = path.join(dir, f);
+      const dst = path.join(bakDir, f);
+      let sizeBefore: number;
+      try {
+        sizeBefore = (await fs.stat(src)).size;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue; // 单文件缺失不管
+        throw err;
+      }
+      await fs.copyFile(src, dst);
+      const copied = (await fs.stat(dst)).size;
+      const sizeAfter = (await fs.stat(src)).size;
+      if (copied < sizeBefore || copied > sizeAfter) {
+        throw new Error(
+          `备份 ${f} 大小校验失败（源 ${sizeBefore}→${sizeAfter} 字节，备份 ${copied} 字节），疑似磁盘写满 / 拷贝不完整`,
+        );
+      }
+      sizes[f] = copied;
+    }
+    // 最后一步：写完成标记。标记写不进去（磁盘满）同样算失败
+    await fs.writeFile(
+      path.join(bakDir, BACKUP_COMPLETE_MARK),
+      JSON.stringify({ at: Date.now(), sizes }),
+    );
+  } catch (err) {
+    console.warn(
+      "[sdk-store-gc] 备份没做成：本轮不重写 store、旧备份原样保留（磁盘空间 / 权限？）:",
+      err,
+    );
+    if (bakDir) {
+      await fs.rm(bakDir, { recursive: true, force: true }).catch(() => undefined);
+    }
     return false;
   }
   await pruneBackups(dir);

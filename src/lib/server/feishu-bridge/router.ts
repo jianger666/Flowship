@@ -40,6 +40,7 @@ import {
 } from "@/lib/agent-provider";
 
 import { injectPendingAskText } from "./ask-inject";
+import { placeAttachment } from "./attachment-store";
 import {
   isGroupChatMessage,
   routeGroupInboundMessage,
@@ -291,7 +292,21 @@ export type ParsedInboundContent = {
   images: Array<{ data: string; mimeType: string; filename?: string }>;
   attachments: string[];
   unsupported?: string;
+  /**
+   * 资源（图 / 文件 / 视频）**尚未下载**——只有 `parseInboundContent(msg, { deferDownloads: true })`
+   * 才会带，且仅当消息里确有资源可下。此时 `images` / `attachments` 为空、`text` 是不含下载结果的预解析正文。
+   * 用途：群里非属主的消息要先过鉴权 / 限流 / 忙线闸门，通过后才值得下载（见 group-route）；
+   * `resolve()` 才真正下载并返回完整解析结果（成功后缓存、失败可重试）。
+   */
+  deferred?: {
+    /** 待下载的资源里含图片（排队闸据此判「带图不排」，与下载后的 images.length>0 同口径） */
+    hasImages: boolean;
+    resolve: () => Promise<ParsedInboundContent>;
+  };
 };
+
+/** 预解析模式（只数资源、不下载）的探针：dry=true 时各下载点只计数后跳过 */
+type ResourceProbe = { dry: boolean; images: number; files: number };
 
 const tryParseJson = (s: string): unknown => {
   try {
@@ -317,6 +332,10 @@ const mimeFromExt = (p: string): string => {
 const fileToBase64Image = async (
   absPath: string,
 ): Promise<{ data: string; mimeType: string; filename: string } | null> => {
+  // 先 stat 再读：超限的图直接跳过，不把几十 MB 整个读进内存再判（旧实现 readFile 完才比大小）。
+  // 读完后再核一次（stat 与 read 之间文件可能还在变）
+  const st = await fs.stat(absPath);
+  if (st.size > MAX_IMAGE_BYTES) return null;
   const buf = await fs.readFile(absPath);
   if (buf.length > MAX_IMAGE_BYTES) return null;
   return {
@@ -357,20 +376,23 @@ const extractFileRef = (
 };
 
 /**
- * 已下载文件落附件：改名 + 50MB 上限（file / media 共用）。
+ * 已下载文件落附件：挪进 `attachments/<messageId>/` + 50MB 上限（file / media 共用）。
  * 下载文件 key → 落盘为附件路径的入口见 downloadFileAttachment。
+ *
+ * 文件名是发件人给的（可被构造）：旧实现直接 rename 成「bridge 目录顶层 + 发件人文件名」，
+ * 文件名叫 `bridge-state.json` / `card-map.json` 就把状态文件覆盖了、同名附件也互相覆盖。
+ * 现在走 attachment-store.placeAttachment：子目录 + 净化文件名 + 唯一前缀（见该模块头注释）。
  */
 const finalizeAttachment = async (
   abs: string,
   fileName: string,
+  messageId: string,
 ): Promise<{ path: string } | { error: string }> => {
-  // 下载产物可能无扩展名——尽量保留原文件名
-  const dest = path.join(path.dirname(abs), fileName.replace(/[/\\]/g, "_"));
   let finalPath = abs;
   try {
-    await fs.rename(abs, dest);
-    finalPath = dest;
+    finalPath = await placeAttachment(abs, fileName, messageId);
   } catch {
+    // 挪不动就沿用下载产物原路径（`dl-<ts>-<key>`，不会撞任何状态文件；TTL 清扫也认 dl-*）
     finalPath = abs;
   }
   // review P1#2：超过 50MB → 删临时文件 + 错误文案（route 侧 notifyOwnerError）
@@ -399,7 +421,7 @@ const downloadFileAttachment = async (
   fileName: string,
 ): Promise<{ path: string } | { error: string }> => {
   const abs = await deps.downloadMessageResource(messageId, fileKey, "file");
-  return finalizeAttachment(abs, fileName);
+  return finalizeAttachment(abs, fileName, messageId);
 };
 
 /** 大视频交代文案用：字节 → MB/GB（一档小数） */
@@ -422,6 +444,7 @@ const formatVideoDuration = (sec: number | null): string => {
 const extractMarkdownFiles = async (
   messageId: string,
   text: string,
+  probe?: ResourceProbe,
 ): Promise<{ text: string; attachments: string[] }> => {
   const attachments: string[] = [];
   const re = new RegExp(MD_FILE_LINK_RE.source, "g");
@@ -437,6 +460,11 @@ const extractMarkdownFiles = async (
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+  // 预解析：只数资源、剥占位，不下载
+  if (probe?.dry) {
+    probe.files += refs.length;
+    return { text: stripped, attachments };
+  }
   for (const ref of refs) {
     try {
       const r = await downloadFileAttachment(
@@ -464,6 +492,7 @@ const extractMarkdownImages = async (
     images: ParsedInboundContent["images"];
     totalBytes: number;
   } = { images: [], totalBytes: 0 },
+  probe?: ResourceProbe,
 ): Promise<{
   text: string;
   images: ParsedInboundContent["images"];
@@ -487,6 +516,12 @@ const extractMarkdownImages = async (
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
+  // 预解析：只数资源、剥占位，不下载
+  if (probe?.dry) {
+    probe.images += keys.length;
+    return { text: stripped, images, totalBytes };
+  }
 
   for (const key of keys) {
     if (images.length >= MAX_IMAGES) break;
@@ -516,18 +551,19 @@ const extractMarkdownImages = async (
 };
 
 /**
- * 按 message_type 解析为 chat-inject 可用载荷。
- * 不支持的类型设 unsupported 文案（调用方 bot 回执）。
+ * 按 message_type 解析为 chat-inject 可用载荷（实现体）。
+ * `probe.dry` = 预解析：各下载点只计数资源、跳过下载，见 {@link parseInboundContent} 的 deferDownloads。
  */
-export const parseInboundContent = async (
+const parseInboundContentImpl = async (
   msg: FeishuInboundMessage,
+  probe?: ResourceProbe,
 ): Promise<ParsedInboundContent> => {
   const type = msg.message_type;
   if (type === "text") {
     // text 也可能被 enrichment 成带 ![Image](img_…) / [名称](file_…) 的 markdown
     const rawText = parseTextContent(msg.content);
-    const md = await extractMarkdownImages(msg.message_id, rawText);
-    const mf = await extractMarkdownFiles(msg.message_id, md.text);
+    const md = await extractMarkdownImages(msg.message_id, rawText, undefined, probe);
+    const mf = await extractMarkdownFiles(msg.message_id, md.text, probe);
     return { text: mf.text, images: md.images, attachments: mf.attachments };
   }
 
@@ -546,6 +582,10 @@ export const parseInboundContent = async (
         attachments: [],
         unsupported: "图片消息缺少 image_key",
       };
+    }
+    if (probe?.dry) {
+      probe.images += 1;
+      return { text: "", images: [], attachments: [] };
     }
     const abs = await deps.downloadMessageResource(
       msg.message_id,
@@ -592,6 +632,10 @@ export const parseInboundContent = async (
         unsupported: "文件消息缺少 file_key",
       };
     }
+    if (probe?.dry) {
+      probe.files += 1;
+      return { text: "", images: [], attachments: [] };
+    }
     const r = await downloadFileAttachment(msg.message_id, fileKey, fileName);
     if ("error" in r) {
       return { text: "", images: [], attachments: [], unsupported: r.error };
@@ -624,7 +668,10 @@ export const parseInboundContent = async (
           (typeof o.image_key === "string" && o.image_key) ||
           (typeof o.file_key === "string" && o.file_key) ||
           "";
-        if (key && images.length < MAX_IMAGES) {
+        if (key && probe?.dry) {
+          // 预解析：只计数（dry 下 images 恒空，MAX_IMAGES 闸不适用）
+          probe.images += 1;
+        } else if (key && images.length < MAX_IMAGES) {
           try {
             const abs = await deps.downloadMessageResource(
               msg.message_id,
@@ -675,13 +722,14 @@ export const parseInboundContent = async (
         msg.message_id,
         textParts.join("").trim(),
         { images, totalBytes },
+        probe,
       );
-      const mf = await extractMarkdownFiles(msg.message_id, md.text);
+      const mf = await extractMarkdownFiles(msg.message_id, md.text, probe);
       return { text: mf.text, images: md.images, attachments: mf.attachments };
     }
     // enrichment markdown 字符串路径（真机验收实证形态）
-    const md = await extractMarkdownImages(msg.message_id, msg.content);
-    const mf = await extractMarkdownFiles(msg.message_id, md.text);
+    const md = await extractMarkdownImages(msg.message_id, msg.content, undefined, probe);
+    const mf = await extractMarkdownFiles(msg.message_id, md.text, probe);
     return { text: mf.text, images: md.images, attachments: mf.attachments };
   }
 
@@ -710,6 +758,12 @@ export const parseInboundContent = async (
         attachments: [],
         unsupported: "视频消息缺少 file_key",
       };
+    }
+    if (probe?.dry) {
+      // 预解析：封面（图）+ 视频本体（文件）都待下载；交代文案要看下载结果，留给 resolve 之后的完整解析
+      if (imageKey) probe.images += 1;
+      probe.files += 1;
+      return { text: "", images: [], attachments: [] };
     }
     const images: ParsedInboundContent["images"] = [];
     let totalBytes = 0;
@@ -776,7 +830,7 @@ export const parseInboundContent = async (
       };
     }
     if (size <= MAX_FILE_BYTES) {
-      const r = await finalizeAttachment(abs, "video.mp4");
+      const r = await finalizeAttachment(abs, "video.mp4", msg.message_id);
       if ("error" in r) {
         return { text: "", images, attachments: [], unsupported: r.error };
       }
@@ -836,6 +890,42 @@ export const parseInboundContent = async (
     images: [],
     attachments: [],
     unsupported: "暂不支持该消息类型",
+  };
+};
+
+/**
+ * 按 message_type 解析为 chat-inject 可用载荷。
+ * 不支持的类型设 unsupported 文案（调用方 bot 回执）。
+ *
+ * `deferDownloads`：只做预解析——不下载任何图 / 文件 / 视频，正文里的资源占位照常剥掉；
+ * 消息里确有资源时在返回值带 `deferred`（`hasImages` + `resolve()`），`resolve()` 才真正下载并给出完整结果
+ *（成功后缓存，失败不缓存、可重试）。给群里非属主的消息用：先过鉴权 / 限流 / 忙线闸门、通过了再下载，
+ * 免得陌生人的附件在门外就占满全局单飞的 lark 队列、拖住属主消息（见 group-route）。
+ * 没有资源（纯文本 / 卡片 / unsupported）时预解析结果就是最终结果、不带 `deferred`。
+ */
+export const parseInboundContent = async (
+  msg: FeishuInboundMessage,
+  opts?: { deferDownloads?: boolean },
+): Promise<ParsedInboundContent> => {
+  if (!opts?.deferDownloads) return parseInboundContentImpl(msg);
+  const probe: ResourceProbe = { dry: true, images: 0, files: 0 };
+  const dry = await parseInboundContentImpl(msg, probe);
+  if (dry.unsupported || probe.images + probe.files === 0) return dry;
+  let full: Promise<ParsedInboundContent> | null = null;
+  return {
+    ...dry,
+    deferred: {
+      hasImages: probe.images > 0,
+      resolve: () => {
+        if (!full) {
+          full = parseInboundContentImpl(msg).catch((err: unknown) => {
+            full = null; // 失败不缓存：排队回放等场景要能重试
+            throw err;
+          });
+        }
+        return full;
+      },
+    },
   };
 };
 

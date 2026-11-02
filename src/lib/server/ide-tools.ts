@@ -22,7 +22,7 @@ import path from "node:path";
 
 import type { JumpIde } from "@/lib/types";
 
-import { stripHostInjectedEnv } from "./host-env";
+import { stripHostInjectedEnvAndGitToken } from "./host-env";
 
 const execFileAsync = promisify(execFile);
 
@@ -428,6 +428,68 @@ export const listIdeToolsDetailed = async (): Promise<
 // ---------- 拉起 ----------
 
 /**
+ * 路径入口校验（纯函数）：必须是绝对路径、且不能以 `-` 开头。
+ *
+ * 为什么：路径是原样塞进 IDE CLI 的 argv 的。同源 POST `path:"--install-extension=/tmp/x.vsix"` 会被 VS Code 系
+ * CLI 当成选项解析（装任意扩展 = 代码执行）；JetBrains / xed 的参数解析同理。绝对路径（`/…` 或盘符 `C:\…`）
+ * 不可能以 `-` 开头，所以「绝对路径」是对所有 IDE 通用的兜底；单独再拒 `-` 开头是为了给出更清楚的报错。
+ * 与 open-path / reveal-in-folder 路由同口径（盘符形态在 posix 上也认，保持各入口一致）。
+ * 路由层先拦一次，这里再拦一次（openInIde 不应假设调用方都校验过）。
+ * @returns null = 通过；string = 给用户看的原因
+ */
+export const ideOpenPathRejectReason = (p: string): string | null => {
+  if (p.startsWith("-")) {
+    return "path 不能以 - 开头（会被 IDE 当成命令行选项）";
+  }
+  if (!path.isAbsolute(p) && !/^[a-zA-Z]:[\\/]/.test(p)) {
+    return "path 必须是绝对路径";
+  }
+  return null;
+};
+
+/**
+ * Windows 经 `cmd.exe /c` 拉起 .cmd / .bat（Toolbox 脚本）时，路径里的 cmd 元字符会被 cmd 解释：
+ * `&` `|` 是命令分隔 / 管道、`<` `>` 是重定向、`^` 是转义、`%VAR%` 会被展开、`"` 会提前闭合引号；
+ * 换行 / NUL 同样能截断命令行。Node 只在参数含空格时才加引号、且不会替 cmd 转义这些字符，
+ * 没法在不实测 Windows 的前提下保证「安全引用」稳妥，所以保守处理：含这些字符直接拒绝并说清楚。
+ * `!`：开了延迟变量展开（`cmd /v:on`、或注册表 `DelayedExpansion=1`——部分机器上被改过）时 `!VAR!` 会被展开，
+ * 且引号里也照样展开；默认关闭时 `!` 只是普通字符。代价是目录名里带 `!` 的项目在 .cmd 链路下跳不了 IDE
+ * （提示里让用户换目录 / 换工具），换来「不管那个开关怎么设都不会被展开」，目录名含 `!` 的概率远低于另几个字符。
+ * 只用于 cmd 链路——直接 spawn exe（含 mac / Linux）的 argv 不经 shell，`&` / `!` 之类是合法目录名字符，不拦。
+ * 括号 `( )` 不拦：`C:\Program Files (x86)\…` 很常见、在引号包裹的参数里也不是元字符。
+ * @returns null = 通过；string = 给用户看的原因
+ */
+export const cmdScriptPathRejectReason = (p: string): string | null =>
+  /[&|^%<>"!\r\n\0]/.test(p)
+    ? "路径含 cmd.exe 特殊字符（& | ^ % < > \" ! 或换行），无法安全交给 IDE 的 .cmd 启动脚本；请把项目挪到不含这些字符的目录，或去设置页换一个跳转工具"
+    : null;
+
+/**
+ * 拼 IDE CLI 的 argv（纯函数、不含 exec 本身）。
+ * - VS Code 系：行号 `-g <path>:N`；开目录（无行号 = 打开项目）用 `-n` 强制新窗口，别复用已有窗口把人家打开的项目顶掉。
+ *   路径前加 `--` 选项终止符：VS Code CLI（minimist）认 `--`，之后的参数一律当位置参数（文件 / 目录）——
+ *   已在 Cursor 自带的 cli.js 里确认（`n.indexOf("--")` 切分，且 argvHelper 往 `--` 之前插参数），
+ *   Windsurf / Trae 同为 VS Code 分支。
+ * - JetBrains：`--line N <path>`。**不加 `--`**：JetBrains 启动器自己解析 argv，没有「认 `--`」的文档或实测依据，
+ *   加了可能把 `--` 当文件名打开。靠 {@link ideOpenPathRejectReason} 的绝对路径校验兜底（绝对路径不会被当选项）。
+ * - Xcode（xed）同理：不加 `--`，靠绝对路径校验。
+ */
+export const buildIdeOpenArgs = (
+  ide: JumpIde,
+  absPath: string,
+  line?: number,
+): string[] => {
+  const family = IDE_SPECS[ide].family;
+  if (family === "xcode") {
+    return line ? ["--line", String(line), absPath] : [absPath];
+  }
+  if (family === "vscode") {
+    return line ? ["-g", "--", `${absPath}:${line}`] : ["-n", "--", absPath];
+  }
+  return line ? ["--line", String(line), absPath] : [absPath];
+};
+
+/**
  * 用指定 IDE 打开文件 / 目录（带可选行号）。
  * 协议不可靠的工具（JetBrains 系）走这里；cursor / vscode 前端直接 deep link 不进来。
  * @returns null = 成功；string = 给用户看的失败原因
@@ -437,35 +499,35 @@ export const openInIde = async (
   absPath: string,
   line?: number,
 ): Promise<string | null> => {
+  // 先校验再探测：非法路径不该触发任何磁盘 / 注册表探测，更不该走到 spawn
+  const pathReject = ideOpenPathRejectReason(absPath);
+  if (pathReject) return pathReject;
   const results = await detectAll();
   const tool = results[ide];
   if (!tool.available || !tool.exec) {
     return `本机没探测到 ${IDE_NAMES[ide]}——确认已安装、或去设置页换一个跳转工具`;
   }
+  // cmd.exe /c 链路（Toolbox .cmd 脚本）：路径里的 cmd 元字符会被当命令分隔 / 展开，spawn 之前拒绝
+  if (tool.isCmdScript) {
+    const cmdReject = cmdScriptPathRejectReason(absPath);
+    if (cmdReject) return cmdReject;
+  }
 
   // Xcode：不走 .app launcher（open --args 传不了文件定位）、用随 Xcode 安装的 xed CLI
   if (IDE_SPECS[ide].family === "xcode") {
     try {
-      const xedArgs = line ? ["--line", String(line), absPath] : [absPath];
-      await execFileAsync("xed", xedArgs, { timeout: 15_000 });
+      await execFileAsync("xed", buildIdeOpenArgs(ide, absPath, line), {
+        timeout: 15_000,
+      });
       return null;
     } catch (err) {
       return `拉起 Xcode 失败：${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
-  // 参数拼法：JetBrains `--line N <path>`；VS Code 系带行号 `-g <path>:N`、
-  // 开目录（无行号 = 打开项目）用 `-n` 强制新窗口——别复用已有窗口把人家打开的项目顶掉。
-  // JetBrains 开目录天然各项目各窗口、无需（也没有）新窗口 flag。
-  const isVsCodeFamily = IDE_SPECS[ide].family === "vscode";
-  const args: string[] = [];
-  if (isVsCodeFamily) {
-    if (line) args.push("-g", `${absPath}:${line}`);
-    else args.push("-n", absPath);
-  } else {
-    if (line) args.push("--line", String(line));
-    args.push(absPath);
-  }
+  // 参数拼法见 buildIdeOpenArgs（JetBrains `--line N <path>`；VS Code 系 `-g -- <path>:N` / `-n -- <path>`；
+  // JetBrains 开目录天然各项目各窗口、无需（也没有）新窗口 flag）
+  const args = buildIdeOpenArgs(ide, absPath, line);
 
   console.log(
     `[ide-tools] open ide=${ide} exec=${tool.exec} cmdScript=${!!tool.isCmdScript} args=${JSON.stringify(args)}`,
@@ -485,12 +547,13 @@ export const openInIde = async (
       ? ["cmd.exe", ["/d", "/s", "/c", tool.exec, ...args]]
       : [tool.exec, args];
     // env 剔宿主注入变量：VS Code / Cursor / Windsurf 都是 Electron 应用，吃到 ELECTRON_RUN_AS_NODE=1
-    // 会被当纯 node 跑、静默秒退（见 host-env.ts）；PORT / HOSTNAME 等也不该漏进 IDE 里的终端
+    // 会被当纯 node 跑、静默秒退（见 host-env.ts）；PORT / HOSTNAME 等也不该漏进 IDE 里的终端；
+    // GitLab PAT 同样剔掉：IDE 及其内置终端 / 扩展宿主不需要它，不能让它顺着环境变量扩散出去
     const child = spawn(cmd, cmdArgs as string[], {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
-      env: stripHostInjectedEnv(),
+      env: stripHostInjectedEnvAndGitToken(),
     });
     // 静默失败探测（V0.11.9、同事 Windows 实测「点了没反应」）：spawn 本身成功但进程
     // 秒退（脚本路径带空格被 cmd 拆坏 / exe 损坏）时原实现直接当成功、用户零反馈。

@@ -38,6 +38,7 @@ const {
   __resetGroupChatCacheForTest,
   __setGroupRouteDepsForTest,
   GROUP_BYPASS_RATE_LIMITED,
+  GROUP_RESTRICTED_QA_DENIED,
   pumpGroupQuestionQueue,
   routeGroupInboundMessage,
 } = await import("@/lib/server/feishu-bridge/group-route");
@@ -73,6 +74,7 @@ const taskSummary = (): TaskSummary =>
     actionCount: 0,
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
   }) as TaskSummary;
+// 群答疑默认关闭（P0 硬化）：本文件测旁路限流 / 回执，夹具显式开启
 const fullTask = (): Task =>
   ({ ...taskSummary(), actions: [], events: [] }) as unknown as Task;
 
@@ -420,12 +422,19 @@ describe("K2-02：排队回放被限流丢弃后，对真人提问人回一句�
     expect(texts[0]).toContain("12");
   });
 
-  it("机器人提问人：回放被丢弃仍整条静默（防环），且不吃掉它的提示名额", async () => {
+  it("机器人提问人：根本进不了受限答疑（准入闸拒绝）→ 不入队、回放时无事可做、全程静默（P0 硬化新语义，原「回放被丢弃仍静默」）", async () => {
+    // 机器人先于忙线被闸拦下：不启动、不入队，也就不存在「回放被限流丢弃」
     for (let i = 0; i < 4; i++) {
-      expect(await route(botMsg("ou_bota", `om_a${i}`))).toMatchObject({ kind: "sent" });
+      expect(await route(botMsg("ou_bota", `om_a${i}`))).toMatchObject({
+        kind: "skipped",
+        error: GROUP_RESTRICTED_QA_DENIED,
+      });
     }
     const release = goBusy();
-    expect(await route(botMsg("ou_bota", "om_aq"))).toMatchObject({ kind: "queued" });
+    expect(await route(botMsg("ou_bota", "om_aq"))).toMatchObject({
+      kind: "skipped",
+      error: GROUP_RESTRICTED_QA_DENIED,
+    });
     release();
     sendTextToChat.mockClear();
     handleTaskQuestionInject.mockClear();

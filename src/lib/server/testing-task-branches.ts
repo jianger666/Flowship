@@ -4,7 +4,7 @@ import path from "node:path";
 
 import type { GitBranchInfo, Task } from "@/lib/types";
 import { testingTaskConfiguredBranchRepoPaths } from "@/lib/testing-task";
-import { gitEnv } from "./git-exec";
+import { CURRENT_BRANCH_ARGS, gitEnv, parseCurrentBranchOutput } from "./git-exec";
 import {
   beginResourceJob,
   endResourceJob,
@@ -192,17 +192,20 @@ const refExists = async (
   }
 };
 
+// 当前分支的精确名（detached / unborn / 读失败 → ""）。不用 `symbolic-ref --short`：分支与同名 tag 并存时它输出 `heads/<名>`，
+// 下面按名字比对（是不是已经在目标分支）会全部对不上；改用 git-exec 的 CURRENT_BRANCH_ARGS（完整 ref 去掉 refs/heads/）。
 const currentBranchName = async (
   cwd: string,
   signal: AbortSignal,
 ): Promise<string> =>
-  (
-    await execGit(
-      cwd,
-      ["symbolic-ref", "--quiet", "--short", "HEAD"],
-      signal,
-    ).catch(() => ({ stdout: "", stderr: "" }))
-  ).stdout.trim();
+  parseCurrentBranchOutput(
+    (
+      await execGit(cwd, [...CURRENT_BRANCH_ARGS], signal).catch(() => ({
+        stdout: "",
+        stderr: "",
+      }))
+    ).stdout,
+  ) ?? "";
 
 const assertLease = (lease: () => boolean): void => {
   if (!lease()) throw new TestingBranchLeaseLostError();

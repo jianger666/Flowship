@@ -41,12 +41,19 @@ import { Label } from "@/components/ui/label";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, initSettings } from "@/lib/local-store";
 import { pathBasename, sameRepoPathList } from "@/lib/path-utils";
 import { normalizeReqId, reqIdPatchValue } from "@/lib/req-id";
 import { updateTaskFields } from "@/lib/task-store";
 import { isTestingRequirementTask } from "@/lib/testing-task";
 import type { RepoConfig, Task } from "@/lib/types";
+import { guardCloseWhileBusy, withTimeout } from "@/lib/with-timeout";
+
+// 保存请求的等待上限：fetch 本身无超时，保存中又拦着 Esc / X（见 handleOpenChange），
+// 请求挂住时靠它放行（改仓会建 worktree、可能较慢，所以给得宽松）。
+// 超时用 withTimeout 工厂形态：先 abort 掉 fetch 再报错，避免用户重试时旧请求还在飞；
+// abort 只断本端连接，服务端仍可能已处理完（所以超时文案写明「可能已保存成功」）
+const SAVE_TIMEOUT_MS = 60_000;
 
 interface Props {
   open: boolean;
@@ -97,8 +104,26 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   }, [open]);
 
   // settings 快照（仓选项 / 仓名展示 / 提交时取新仓分支快照都用它）
-  // mount 时读一次即可（编辑 task 期间不会同时改设置页仓库配置）
-  const settings = useMemo(() => getSettings(), []);
+  // 每次打开重取一次：dialog 组件在页面里常驻，首次 render 可能早于 initSettings 完成——
+  // 原先 mount 时求值一次就永久陈旧（拿到的是默认值：空仓列表、模板为空），新追加的仓拿不到分支快照。
+  // 打开期间设置页不会同时改仓库配置，所以只在 open 变化 / init 完成时刷新、不跟随实时变化（编辑中选项不跳）
+  const [settingsVersion, setSettingsVersion] = useState(0);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    // init 失败也不阻塞：getSettings() 此时是默认值，与改前一致
+    void initSettings().then(
+      () => {
+        if (!cancelled) setSettingsVersion((v) => v + 1);
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- open / settingsVersion 是「重取」的触发条件、不在函数体里引用
+  const settings = useMemo(() => getSettings(), [open, settingsVersion]);
   const settingsRepos = settings.repos;
 
   // 仓库名展示：settings.repos 查、查不到用路径尾段
@@ -172,7 +197,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
         );
       }
 
-      const updated = await updateTaskFields(task.id, {
+      const patch: Parameters<typeof updateTaskFields>[1] = {
         title: title.trim(),
         // 日常任务不传链接字段；需求任务只传非空 URL（禁止清空）
         ...(storyUrlLockedHas
@@ -197,7 +222,12 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
               addRepoBranchTemplates,
             }
           : {}),
-      });
+      };
+      const updated = await withTimeout(
+        (signal) => updateTaskFields(task.id, patch, { signal }),
+        SAVE_TIMEOUT_MS,
+        "请求超时（60 秒无响应），草稿已保留、可重试；服务端可能已保存成功，请以任务页为准",
+      );
       onSaved(updated);
       onOpenChange(false);
     } catch (err) {
@@ -207,9 +237,14 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     }
   };
 
+  // 保存中拦住 Esc / X：请求在途时关弹窗，失败时草稿会被下次打开的重灌冲掉、结果也没人盯着。
+  // 不会造成关不掉：成功 / 失败 / 超时（withTimeout）都会 setSubmitting(false) 解锁
+  const handleOpenChange = (next: boolean) =>
+    guardCloseWhileBusy(submitting, next, onOpenChange);
+
   return (
-    // disablePointerDismissal：带草稿表单，点外误关会丢编辑内容；Esc / X / 取消仍可关
-    <Dialog open={open} onOpenChange={onOpenChange} disablePointerDismissal>
+    // disablePointerDismissal：带草稿表单，点外误关会丢编辑内容；Esc / X / 取消在非保存中仍可关
+    <Dialog open={open} onOpenChange={handleOpenChange} disablePointerDismissal>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>任务基本信息</DialogTitle>

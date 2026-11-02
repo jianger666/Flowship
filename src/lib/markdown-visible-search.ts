@@ -13,6 +13,7 @@ import {
   type SearchableField,
   type SearchOccurrence,
 } from "@/lib/text-search-highlight";
+import { scanMermaidSource } from "@/lib/mermaid-source-gate";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
@@ -39,8 +40,15 @@ export const collectMarkdownVisibleTextSegments = (tree: MdastNode): string[] =>
         if (node.value) segments.push(node.value);
         return;
       case "code":
-        // mermaid 围栏渲染成图（svg 文字不是 DOM 正文、DOM 搜索侧整块忽略），模型里也不计（D3-02）
-        if (node.value && node.lang?.toLowerCase() !== "mermaid") segments.push(node.value);
+        // mermaid 围栏渲染成图（svg 文字不是 DOM 正文、DOM 搜索侧整块忽略），模型里也不计（D3-02）。
+        // 例外：含外部资源引用、被 mermaid 预扫闸（mermaid-rehype-gate）退回成普通代码块的围栏——DOM 里它就是一段可见源码、
+        // DOM 搜索会计，模型里也必须计，否则命中序号整体错位（R8-7）。判定用同一个纯函数 `scanMermaidSource`。
+        if (
+          node.value &&
+          (node.lang?.toLowerCase() !== "mermaid" || scanMermaidSource(node.value).blocked)
+        ) {
+          segments.push(node.value);
+        }
         return;
       case "image":
         // 图片 alt 不是 DOM 文本节点（渲染出来只有 <img alt>），DOM 侧永远搜不到；

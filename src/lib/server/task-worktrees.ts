@@ -25,7 +25,7 @@ import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { failpoint } from "./failpoints";
-import { GIT_MAX_BUFFER, gitEnv } from "./git-exec";
+import { GIT_MAX_BUFFER, gitEnv, withGitLongPaths } from "./git-exec";
 // ownership 快照与活跃态读无环叶子模块（静态 import 不构环——
 // 之前动态 import ./task-stream 躲环，在 Turbopack dev 下会拿到半初始化
 // namespace 报 `snapshotTaskOp is not a function`）。
@@ -1103,7 +1103,8 @@ const runWorktreeAdd = async (
 ): Promise<GitResult> => {
   const end = beginWorktreeAdd(await canonicalizeWorktreePath(workDir));
   try {
-    return await runGit(repoPath, addArgs, 120_000, job);
+    // Windows 深路径：本次调用临时开 core.longpaths（不改用户 / 仓库的 git 配置；非 Windows 原样）
+    return await runGit(repoPath, withGitLongPaths(addArgs), 120_000, job);
   } finally {
     end();
   }
@@ -3299,13 +3300,20 @@ const pruneUnmappedTaskWorktreeDirs = async (
     if (e.name.includes(ORPHANED_DIR_MARK)) continue;
     const workDir = path.join(taskDir, e.name);
     let repoPath = "";
-    try {
-      const gitFile = await fs.readFile(path.join(workDir, ".git"), "utf8");
-      const mainGitDir = parseMainGitDirFromPointer(gitFile);
-      if (mainGitDir) repoPath = path.dirname(mainGitDir);
-    } catch {
-      /* 不是 worktree 指针、下面 rm 兜底 */
+    const pointer = await readGitPointerFile(workDir);
+    if (pointer.kind === "error") {
+      // 读不到 ≠ 不是 worktree：非 ENOENT 的失败（EACCES / EBUSY / EIO …）不能走下面的 rm 兜底，留到下次 ensure 再处理
+      console.warn(
+        `[task-worktrees] 未映射 worktree 的 .git 指针读取失败（非 ENOENT）、保留目录不删：${workDir}：`,
+        (pointer.err as NodeJS.ErrnoException)?.code ?? pointer.err,
+      );
+      continue;
     }
+    if (pointer.kind === "pointer") {
+      const mainGitDir = parseMainGitDirFromPointer(pointer.text);
+      if (mainGitDir) repoPath = path.dirname(mainGitDir);
+    }
+    // missing（明确没有 .git）：非 worktree 残留、下面 rm 兜底
     // 任务还活着、解绑后残留的目录：能从 .git 指针反查出原仓就用任务分支记录对一下 HEAD；
     // 查不到（undefined）→ 沿用「HEAD 附着在哪个分支就记在哪个」
     const snap = await snapshotDirtyWorktree(workDir, {
@@ -3340,6 +3348,28 @@ const pruneUnmappedTaskWorktreeDirs = async (
 };
 
 /**
+ * 读 `<workDir>/.git` 指针文件，三态：
+ * - pointer：读到了（内容交给 parseMainGitDirFromPointer）；
+ * - missing：**明确** ENOENT / ENOTDIR——目录里压根没有 `.git`（依赖克隆残留的半截目录等），没有 git 状态可丢；
+ * - error：其它任何失败（EACCES / EBUSY / EPERM / EIO / EISDIR / EMFILE …，杀软占用、高负载下会瞬时出现）。
+ *   **「读不到」≠「不是 worktree」**：调用方必须保留目录（下次启动再处理），不得据此跳过 WIP 快照后直接删。
+ */
+type GitPointerRead =
+  | { kind: "pointer"; text: string }
+  | { kind: "missing" }
+  | { kind: "error"; err: unknown };
+
+const readGitPointerFile = async (workDir: string): Promise<GitPointerRead> => {
+  try {
+    return { kind: "pointer", text: await fs.readFile(path.join(workDir, ".git"), "utf8") };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "missing" };
+    return { kind: "error", err };
+  }
+};
+
+/**
  * 从 worktree `.git` 指针文件内容解析主仓公共 git dir。
  * 内容形如 `gitdir: <原仓>/.git/worktrees/<name>`——注意 git 在 Windows 上也写
  * **正斜杠**、不能用 path.sep 匹配（git 在 Windows 也写正斜杠、双端分隔符都认）。
@@ -3358,6 +3388,8 @@ export const parseMainGitDirFromPointer = (pointer: string): string | null => {
  * 覆盖：task 被删但清理失败 / 终结时 app 崩了没来得及清。
  * 反向解析原仓库：worktree 的 `.git` 指针（见 parseMainGitDirFromPointer）
  * 找到原仓库跑 `worktree prune` 清注册；脏工作区删前照样落 WIP 快照。全程 best-effort、绝不抛。
+ * 容器里改名隔离的 `<仓>.orphaned-<ts>`（损坏工作区、留给用户处理）不快照、不删，只回收容器里其余的项——
+ * 一个隔离目录不再拖住整个容器（含健康仓）永不回收。
  */
 export const cleanupOrphanTaskWorktrees = async (
   liveTaskIds: Set<string>,
@@ -3378,24 +3410,54 @@ export const cleanupOrphanTaskWorktrees = async (
       // 任一仓 WIP 快照失败 → 整棵孤儿目录本轮保留。
       // 开机自动清理≠用户主动删：保守保留防误伤；用户主动删走 removeTaskWorktrees 强制释放。
       let snapshotFailed = false;
+      // `.git` 指针读失败（非 ENOENT）：无法判断这是不是 worktree、有没有未提交改动 → 同样整棵保留
+      let pointerUnreadable = false;
+      // 容器里有 ensure 改名隔离的 `<仓>.orphaned-<ts>`（损坏工作区、保留用户未提交改动、有意「留给用户处理」）：
+      // 它既不参与快照（.git 已失效，git status 必失败 → 以前会让**整个容器**永远判「快照失败」、连同健康仓一起永不回收），
+      // 也不随容器被删——只回收容器里其余的项，隔离目录原样保留
+      let hasIsolated = false;
       const repoDirs = await fs.readdir(orphanDir, { withFileTypes: true });
       for (const r of repoDirs) {
         if (!r.isDirectory()) continue;
+        if (r.name.includes(ORPHANED_DIR_MARK)) {
+          hasIsolated = true;
+          continue;
+        }
         const workDir = path.join(orphanDir, r.name);
-        try {
-          const gitFile = await fs.readFile(path.join(workDir, ".git"), "utf8");
-          const mainGitDir = parseMainGitDirFromPointer(gitFile);
+        // 只有「明确没有 .git」（ENOENT）才算非 worktree 残留、可随目录删；
+        // EACCES / EBUSY / EIO 等一律不是「不存在」——以前这里 catch 全吞、跳过快照直接 rm，整个工作区的未提交改动就此丢失
+        const pointer = await readGitPointerFile(workDir);
+        if (pointer.kind === "error") {
+          pointerUnreadable = true;
+          console.warn(
+            `[task-worktrees] 孤儿 worktree 的 .git 指针读取失败（非 ENOENT），本轮保留目录：${workDir}：`,
+            (pointer.err as NodeJS.ErrnoException)?.code ?? pointer.err,
+          );
+          continue;
+        }
+        if (pointer.kind === "pointer") {
+          const mainGitDir = parseMainGitDirFromPointer(pointer.text);
           if (mainGitDir) mainGitDirs.add(mainGitDir);
-          // 未提交改动先落 WIP 快照（任务已删、不会 reopen：只写 ref、不动分支）；失败则整棵保留（开机保守）
+        }
+        // 未提交改动先落 WIP 快照（任务已删、不会 reopen：只写 ref、不动分支）；失败则整棵保留（开机保守）。
+        // 「没有 .git」时 snapshotDirtyWorktree 自己返回 clean；抛异常也按失败算（以前被 catch 吞掉 = 当成功删）
+        try {
           const snap = await snapshotDirtyWorktree(workDir, {
             taskId: e.name,
             dirName: r.name,
             taskBranch: null,
           });
           if (snap.kind === "failed") snapshotFailed = true;
-        } catch {
-          // .git 文件读不到（非 worktree 残留）、直接随目录删
+        } catch (err) {
+          snapshotFailed = true;
+          console.warn(`[task-worktrees] 孤儿 worktree WIP 快照抛错、本轮保留目录：${workDir}：`, err);
         }
+      }
+      if (pointerUnreadable) {
+        console.warn(
+          `[task-worktrees] 孤儿 worktree 有 .git 指针读不了、本轮保留目录（下次 boot 再试）：${orphanDir}`,
+        );
+        continue;
       }
       if (snapshotFailed) {
         console.warn(
@@ -3403,13 +3465,32 @@ export const cleanupOrphanTaskWorktrees = async (
         );
         continue;
       }
-      await fs.rm(orphanDir, { recursive: true, force: true });
+      // 这一轮真的删了东西吗：容器里只剩 `.orphaned-*`（上轮已回收完其余项）时是「无事可做」——
+      // 隔离目录有意永久保留，每次启动都会走到这里，必须静默，不能每次都打「已清理」（误导排查、刷日志）
+      let removedAny = false;
+      if (hasIsolated) {
+        // 只删「非隔离」的项（健康仓 worktree / 零散文件）；`.orphaned-*` 与容器本身保留。
+        // 目录是 rm 一半时抛错也没关系：外层 catch 记日志，下次启动继续（已删的不会再出现）
+        for (const name of await fs.readdir(orphanDir)) {
+          if (name.includes(ORPHANED_DIR_MARK)) continue;
+          await fs.rm(path.join(orphanDir, name), { recursive: true, force: true });
+          removedAny = true;
+        }
+      } else {
+        await fs.rm(orphanDir, { recursive: true, force: true });
+        removedAny = true;
+      }
+      if (!removedAny) continue;
       for (const gitDir of mainGitDirs) {
         // 目录刚被 rm 掉、登记可能还锁着 initializing（硬杀的 add 残留）：prune 清不掉被锁的，先解锁（R14 Q10-01）
         await unlockStaleInitializingZombies(path.dirname(gitDir));
         await runGit(path.dirname(gitDir), ["worktree", "prune"]);
       }
-      console.log(`[task-worktrees] 已清理孤儿 worktree：${orphanDir}`);
+      console.log(
+        hasIsolated
+          ? `[task-worktrees] 已清理孤儿 worktree（保留改名隔离的 ${ORPHANED_DIR_MARK}* 目录、留给用户处理）：${orphanDir}`
+          : `[task-worktrees] 已清理孤儿 worktree：${orphanDir}`,
+      );
     } catch (err) {
       console.warn(`[task-worktrees] 清理孤儿 worktree 失败（忽略）${orphanDir}：`, err);
     }

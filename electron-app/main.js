@@ -23,6 +23,7 @@ import {
   nativeImage,
   nativeTheme,
   Notification,
+  powerMonitor,
   powerSaveBlocker,
   shell,
   Tray,
@@ -37,8 +38,10 @@ import {
   readdirSync,
   existsSync,
   readFileSync,
+  renameSync,
   statSync,
   statfsSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import net from "node:net";
@@ -126,6 +129,27 @@ import {
   describeRenderGone,
   pickFreshReports,
 } from "./shell-crash.mjs";
+// 端口被占时占用者的身份判定与文案（只对确认是 Flowship 自己 server 的进程直接清理）：纯函数在 ./port-owner.mjs
+import {
+  buildForeignOwnerDialog,
+  buildPidCommandQuery,
+  buildServerPidRecord,
+  intersectPortOwners,
+  killPidList,
+  parseServerPidRecord,
+  planPortCleanup,
+  shouldClearServerPidRecord,
+} from "./port-owner.mjs";
+// Windows 退出时先礼后兵地停 server（stdin EOF + 不带 /F 的 taskkill → 限时 → /F；R1-2）：纯逻辑、预算常量与注入式依赖在 ./win-server-stop.mjs
+// （优雅路径上的「连进程树强杀」由 server 自己在清理后做，见该文件头 R8-4；withStdinEofExitEnv = 非 win32 显式删掉 stdin-EOF 开关，R8-7）
+import {
+  WIN_FORCE_TASKKILL_TIMEOUT_MS,
+  WIN_QUIT_WATCHDOG_MS,
+  isRecordCompatibleWithPid,
+  stopWinServer,
+  taskkillTimeoutFor,
+  withStdinEofExitEnv,
+} from "./win-server-stop.mjs";
 // 首次启动判定（标记按版本记、更新后的第一次启动同样按「首次」给宽限）：纯函数在 ./first-boot.mjs
 import {
   REGULAR_BOOT_TIMEOUT_MS,
@@ -237,6 +261,23 @@ const isAppUrl = (url) => isSameAppOrigin(url, { host: HOST, port: PORT });
 // 别名要拦、不能放行同 frame 导航（见 external-url.mjs 的 isSameAppOrigin 注释）
 const isCanonicalAppUrl = (url) => isCanonicalAppOrigin(url, { host: HOST, port: PORT });
 
+// IPC 发送方校验（评审 P2：11 个入口原来都不看 senderFrame）：只认「当前 frame 的 URL 是本应用 origin」。
+// 主窗是唯一带 preload 的窗口、只会 loadURL(BASE_URL)（will-navigate 拦掉了所有别的导航），所以正常调用方
+// 的 senderFrame.url 一定是本应用 origin；一旦渲染端被注入 / 嵌进别的 origin 的 frame，这里挡住它调
+// open-external / native-pick / install-update 等壳能力。senderFrame 拿不到（frame 已销毁 / 已导航）按不可信处理。
+// 被拒的调用只记一行日志（URL 只留前 80 字符：可能带 token / 本地路径）。
+const isTrustedIpcSender = (e, channel) => {
+  let url = "";
+  try {
+    url = String(e?.senderFrame?.url ?? "");
+  } catch {
+    url = "";
+  }
+  if (url !== "" && isCanonicalAppUrl(url)) return true;
+  log(`[ipc] 拒绝非本应用页面的 IPC：channel=${channel} frame=${url.slice(0, 80) || "(无)"}`);
+  return false;
+};
+
 // 外链白名单（isSafeExternalUrl、定义见 ./external-url.mjs）：http(s) + 系统设置深链，
 // setWindowOpenHandler 与 IPC open-external 共用，避免 window.open / IPC 成任意协议跳板。
 // IDE deep link（cursor:// / vscode://）只走同 frame 导航、由 will-navigate 单独放行 isIdeDeepLink，
@@ -273,6 +314,26 @@ const serverDir = app.isPackaged
 
 // server 子进程句柄（null = 没起 / 已退）
 let serverProc = null;
+// 正常退出（Cmd+Q / 托盘退出 / 自更新重启）时「优雅停 server」的两个标记（评审 P1：此前直接 SIGKILL、
+// server 的优雅退出钩子永远不执行；unix 走 SIGTERM、win32 走 stdin EOF + 不带 /F 的 taskkill，见 stopServer / R1-2）：
+// stopping = 已在停、别重复发起；done = 已停完、before-quit 可以放行
+let serverQuitStopping = false;
+let serverQuitDone = false;
+// 系统正在关机 / 重启 / 注销（powerMonitor 'shutdown'，Electron 文档只在 macOS / Linux 触发；Windows 上不会置位——
+// win32 关机时进程会被系统限时强收，优雅停多半来不及，见汇报里的已知限制）：此时不能 preventDefault 拖住退出（会打断关机），
+// before-quit 退回「同步强杀（unix 整组 SIGKILL / win32 taskkill /T /F）」的旧行为。
+// 用户可能在系统弹窗里取消注销 / 关机：标记不复位的话之后每次正常退出都会跳过优雅停（评审 R1-11），
+// 所以置位后 SYSTEM_SHUTDOWN_RESET_MS 内没真的退出就当「取消了」、复位。
+let systemShuttingDown = false;
+let systemShutdownResetTimer = null;
+const SYSTEM_SHUTDOWN_RESET_MS = 30_000;
+// 退出时优雅停 server 的总看门狗（评审 R1-11）：stopServer 最坏 2s（等 server）+ 1.5s（孙进程 TERM）+ 1s（SIGKILL 后回收）
+// 还可能叠加扫尾，before-quit 又 preventDefault 了——任何一步卡住都不能让 Cmd+Q / 注销一直退不出去。
+// win32（R8-4 起单独一档）：最坏 = WIN_STOP_GRACE_MS（4s）+ 强杀的 taskkill（≤ WIN_FORCE_TASKKILL_TIMEOUT_MS 4.5s）+ WIN_FORCE_REAP_MS（1s）= 9.5s，
+// 看门狗 WIN_QUIT_WATCHDOG_MS = 11s（9.5s + 1.5s 余量；到点后同步强杀最多再 4.5s，预算账与绝对最坏见 ./win-server-stop.mjs，tests/electron-win-graceful-stop.test.ts 钉死）。
+// unix 仍是 7s：最坏 2s + 1.5s + 1s + 扫尾，没有变长的理由。
+const SERVER_QUIT_WATCHDOG_UNIX_MS = 7000;
+const SERVER_QUIT_WATCHDOG_MS = process.platform === "win32" ? WIN_QUIT_WATCHDOG_MS : SERVER_QUIT_WATCHDOG_UNIX_MS;
 // 主窗口（真销毁后置 null；关窗 hide 时仍保留引用）
 let mainWindow = null;
 // 系统托盘（决策 #19：关窗不退出、驻留菜单栏 / 托盘）
@@ -315,6 +376,20 @@ const execFileP = (cmd, args) =>
   new Promise((resolve) => {
     execFile(cmd, args, { windowsHide: true }, (err, stdout) =>
       resolve(err ? "" : String(stdout)),
+    );
+  });
+
+// taskkill 的 promise 包装（win32 优雅停用）：与 execFileP 不同，它把退出码带回来——
+// 不带 /F 的 taskkill 对无窗口的 server 通常以 1（「只能强制终止」）失败、128 = 找不到进程，
+// stopWinServer 要靠退出码判断「请求有没有送达」。永不 reject；超时 / 起不来 = code 为 null（算失败）。
+// 超时按参数选（R8-4）：带 /F（强杀整树）4.5s、不带 /F 的请求 1.5s，见 taskkillTimeoutFor。
+const taskkillWin = (args) =>
+  new Promise((resolve) => {
+    execFile(
+      "taskkill",
+      args,
+      { windowsHide: true, timeout: taskkillTimeoutFor(args) },
+      (err, _stdout, stderr) => resolve({ code: err ? (typeof err.code === "number" ? err.code : null) : 0, stderr: String(stderr ?? "") }),
     );
   });
 
@@ -501,40 +576,138 @@ const findPortPids = async () => {
     .filter((n) => Number.isInteger(n) && n > 0);
 };
 
-const killPids = async (pids) => {
-  for (const pid of pids) {
-    if (process.platform === "win32") {
-      await execFileP("taskkill", ["/PID", String(pid), "/T", "/F"]);
-    } else {
+const killPids = async (pids, { group = false } = {}) => {
+  await killPidList(pids, {
+    group,
+    platform: process.platform,
+    kill: (pid, sig) => process.kill(pid, sig),
+    taskkill: (args) => execFileP("taskkill", args),
+  });
+};
+
+// server pid 记录（userData/server-pid.json）：mac / Linux 的 `ps` 看不到 server.js 路径（Next 改了进程标题），
+// 端口被占时靠「标题 + 这份记录里的 pid」认出上次没退干净的自家 server（见 ./port-owner.mjs）
+const serverPidRecordPath = () => path.join(app.getPath("userData"), "server-pid.json");
+const writeServerPidRecord = (pid) => {
+  // 原子写（tmp + rename）：写到一半被掐断不会留下半截 JSON（读侧本来也把坏数据当「无记录」，这里是少一种坏法）
+  let tmp = null;
+  try {
+    const file = serverPidRecordPath();
+    tmp = `${file}.tmp.${process.pid}`;
+    writeFileSync(tmp, buildServerPidRecord(pid, PORT));
+    renameSync(tmp, file);
+  } catch {
+    // 只是身份核对的辅助信息，写失败不挡启动（最坏退回「无法确认」文案）；
+    // 但 write / rename 中途抛错时别把 `.tmp.<pid>` 留在 userData 里（best-effort 删，删不掉也无所谓）
+    if (tmp) {
       try {
-        process.kill(pid, "SIGKILL");
+        unlinkSync(tmp);
       } catch {
-        // 进程已不在、忽略
+        // tmp 没写出来 / 已不在：无事可做
       }
     }
   }
 };
+const readRecordedServerPid = () => {
+  try {
+    return parseServerPidRecord(readFileSync(serverPidRecordPath(), "utf8"), { port: PORT });
+  } catch {
+    return null;
+  }
+};
+// 这个 server 退出了就把记录清掉（只清「记录的 pid 就是它」的：自动重启后新 server 已写了新记录，迟到的旧 exit 不能把它删了）
+const clearServerPidRecord = (pid) => {
+  try {
+    const recorded = parseServerPidRecord(readFileSync(serverPidRecordPath(), "utf8"));
+    if (shouldClearServerPidRecord(recorded, pid)) unlinkSync(serverPidRecordPath());
+  } catch {
+    // 没有记录 / 已被清 / 读不出来：无事可做
+  }
+};
+
+// 读进程完整命令行（身份判定用）；读不到（进程刚退 / 权限 / 超时）返回 null，由 classifyPortOwners 归「无法确认」。
+// 具体命令（unix ps / win32 PowerShell CIM）由 ./port-owner.mjs 的 buildPidCommandQuery 给出
+const getPidCommand = async (pid) => {
+  const q = buildPidCommandQuery(pid);
+  if (!q) return null;
+  const out = await new Promise((resolve) => {
+    execFile(q.cmd, q.args, { windowsHide: true, timeout: 5000 }, (err, stdout) =>
+      resolve(err ? "" : String(stdout)),
+    );
+  });
+  const t = out.trim();
+  return t === "" ? null : t;
+};
 
 /**
- * 确保端口（PORT）可用。被占说明上次未退干净的服务实例还在跑——
- * 弹 dialog 让用户确认后自动杀掉、拒绝则退出 app。
+ * 确保端口（PORT）可用。被占时先核实占用者身份（评审 P2：以前不核实、盲杀 lsof 查到的任意进程）：
+ * - 确认全是 Flowship 自己的 server：上次未退干净的旧实例，弹 dialog 让用户确认后自动杀掉（按进程组）、拒绝则退出 app。
+ *   身份判据：命令行含 app-server/server.js（win32），或 mac/Linux 上标题 `next-server (v…)` 且 pid 等于
+ *   userData/server-pid.json 里上次记录的 server pid（Next 改了进程标题、ps 看不到 server.js 路径）。
+ * - 有别的程序 / 无法确认身份：列出 pid 与命令行，默认「退出」，用户明确点「仍然关闭它」才杀。
  */
 const ensurePortFree = async () => {
   if (!(await isPortBusy())) return true;
-  const { response } = await dialog.showMessageBox({
-    type: "warning",
-    title: "端口被占用",
-    message: `检测到旧版服务占用了 ${PORT} 端口`,
-    detail: "点「确定」自动关闭旧服务并继续启动；点「退出」放弃本次启动。",
-    buttons: ["确定", "退出"],
-    defaultId: 0,
-    cancelId: 1,
-  });
-  if (response !== 0) return false;
 
-  const pids = await findPortPids();
-  log(`[main] 端口 ${PORT} 被占、用户确认清理 pids=${pids.join(",")}`);
-  await killPids(pids);
+  const rawPids = await findPortPids();
+  const owners = [];
+  for (const pid of rawPids) owners.push({ pid, command: await getPidCommand(pid) });
+  // 决策（身份分类 + 哪些 pid 组杀 / 单杀 / 弹哪种窗）全在 port-owner.mjs 的纯函数里，有行为测试
+  const plan = planPortCleanup(owners, { recordedServerPid: readRecordedServerPid() });
+  const owner = plan.classification;
+
+  if (plan.dialog !== "ours") {
+    const d = buildForeignOwnerDialog(PORT, owner);
+    log(
+      `[main] 端口 ${PORT} 被${owner.kind === "foreign" ? "其它程序" : "身份不明的进程"}占用：` +
+        owner.others.map((o) => `${o.pid}(${o.command ? "有命令行" : "无命令行"})`).join(","),
+    );
+    const { response } = await dialog.showMessageBox({
+      type: "warning",
+      title: d.title,
+      message: d.message,
+      detail: d.detail,
+      buttons: d.buttons,
+      defaultId: d.defaultId,
+      cancelId: d.cancelId,
+    });
+    if (response !== 1) return false;
+    log(`[main] 端口 ${PORT} 被占、用户明确选择关闭非 Flowship 占用者 pids=${rawPids.join(",")}`);
+  } else {
+    const { response } = await dialog.showMessageBox({
+      type: "warning",
+      title: "端口被占用",
+      message: `检测到旧版服务占用了 ${PORT} 端口`,
+      detail: "点「确定」自动关闭旧服务并继续启动；点「退出」放弃本次启动。",
+      buttons: ["确定", "退出"],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response !== 0) return false;
+    log(`[main] 端口 ${PORT} 被占、用户确认清理 pids=${rawPids.join(",")}`);
+  }
+
+  // none（lsof 没查到人 / 进程刚退）时 rawPids 为空：killPids 空转、下面照常等端口释放
+  // 弹窗期间（用户可能放着不管很久）上面拿到的 pid 可能已退出、并被系统复用给别的进程：
+  // 点按钮之后重查一次仍在监听该端口的 pid，与弹窗前确认过的名单取交集，只杀「前后都在监听」的。
+  // 重查失败（findPortPids 抛错）按「谁都确认不了」处理——不杀，下面照常等端口释放、没释放会明确报错让用户手动处理
+  let livePids = [];
+  try {
+    livePids = await findPortPids();
+  } catch (err) {
+    log(`[main] 端口 ${PORT} 用户确认后重查占用者失败、本次不杀任何进程：${err?.message || err}`);
+  }
+  const groupKill = intersectPortOwners(plan.groupKill, livePids);
+  const singleKill = intersectPortOwners(plan.singleKill, livePids);
+  const skipped = [...plan.groupKill, ...plan.singleKill].filter(
+    (p) => !groupKill.includes(p) && !singleKill.includes(p),
+  );
+  if (skipped.length > 0) {
+    log(`[main] 端口 ${PORT} 弹窗期间这些 pid 已不再监听、不杀（可能已退出 / pid 被复用）：${skipped.join(",")}`);
+  }
+  // 已确认是自家 server 的按进程组清（连孙进程），其余只杀被点名的那个 pid
+  await killPids(groupKill, { group: true });
+  await killPids(singleKill);
   // 等端口释放（最多 10s、TIME_WAIT 一般秒级）
   for (let i = 0; i < 20; i++) {
     if (!(await isPortBusy())) return true;
@@ -575,6 +748,89 @@ const serverNodeBin = () => {
   return process.execPath;
 };
 
+/**
+ * 给 server 发信号（unix）：**按进程组**发（server 以 detached 起、自成进程组，pgid === pid）——
+ * agent shell 的孙进程（pnpm test / dev server / git）和 server 同组，一起收到；只杀 server 一个 pid 的话
+ * 它们会被 launchd 收养、继续占端口 / 继续改工作树，下次启动的 boot-recovery 与它们形成双写者（评审 P1）。
+ * 组已不存在（ESRCH）或不是组长时退回单进程信号；win32 不走这里（taskkill /T /F）。
+ */
+const signalServerTree = (proc, signal) => {
+  if (!proc || !proc.pid) return;
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-proc.pid, signal);
+      return;
+    } catch {
+      // ESRCH（组已不在）/ 其它：落到单进程信号兜底
+    }
+  }
+  try {
+    proc.kill(signal);
+  } catch {
+    // 已退、忽略
+  }
+};
+
+/**
+ * 同步强杀 server（退出看门狗用）：unix = 整组 SIGKILL（signalServerTree）；win32 = `taskkill /PID <pid> /T /F` 连进程树
+ * （server 可能挂着 SDK agent / hook 子进程；只杀单进程会留孤儿占端口）。win32 只在句柄仍显示存活时才发（pid 复用防线）。
+ * 系统关机兜底（before-quit 末尾）因 windows-auto-update-contract 钉着那段字面量，保留原位内联、不走这里。
+ */
+const killServerTreeSync = (proc) => {
+  if (!proc || !proc.pid) return;
+  if (process.platform === "win32") {
+    if ((proc.exitCode ?? null) !== null || (proc.signalCode ?? null) !== null) return;
+    try {
+      execFileSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: WIN_FORCE_TASKKILL_TIMEOUT_MS,
+      });
+    } catch {
+      // 已退 / taskkill 失败：忽略（看门狗之后照常放行退出）
+    }
+    return;
+  }
+  signalServerTree(proc, "SIGKILL");
+};
+
+/** server 的进程组里还有没有活着的成员（kill(-pgid, 0) 只探测、不发信号；EPERM = 存在但无权，也算活着） */
+const serverGroupAlive = (pid) => {
+  if (!pid || process.platform === "win32") return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+};
+
+/**
+ * server 已退出后扫尾：此时才对整组发 SIGTERM（评审 R1-8：优雅阶段若一上来就整组 TERM，agent 的孙进程
+ * 在 server 收尾期间先后「失败」、污染它的收尾写盘；所以优雅阶段只 TERM server 自己，server 走完再惊动孙进程）。
+ * 孙进程收到 SIGTERM 后通常很快自己走完（git 会自清理、不留残留，硬杀才留）——最多再等 1.5s，仍活着的才整组 SIGKILL。
+ * 组里没人了（常态）立即返回、什么信号都不发。
+ */
+const sweepServerGroup = async (pid) => {
+  if (!serverGroupAlive(pid)) return;
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    // 组刚好空了 / 已退、忽略
+  }
+  const deadline = Date.now() + 1500;
+  while (serverGroupAlive(pid) && Date.now() < deadline) {
+    await sleep(100);
+  }
+  if (serverGroupAlive(pid)) {
+    log(`[main] server 进程组 ${pid} 仍有残留成员、整组 SIGKILL`);
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // 已退、忽略
+    }
+  }
+};
+
 const startServer = () => {
   const serverJs = path.join(serverDir, "server.js");
   // OOM 止血（2026-09-03 实测：长会话 + 子代理巨型回包常驻内存，默认堆 ~2G 跑 1 小时必爆
@@ -613,23 +869,36 @@ const startServer = () => {
   });
   const startedAt = Date.now();
   const proc = spawn(serverNodeBin(), [...serverNodeArgs, serverJs], {
-    env: {
-      ...process.env,
-      // 三件套：execPath 当 node 用（含孙进程继承、hooks 依赖）+ 端口 + 数据目录
-      ELECTRON_RUN_AS_NODE: "1",
-      PORT: String(PORT),
-      HOSTNAME: HOST,
-      FLOWSHIP_DATA_DIR: path.join(app.getPath("userData"), "data"),
-      // 观测用：run 汇总记录（run-perf.jsonl）带上版本与防节流实验开关状态，
-      // 用于 A/B 对比「空闲后首发 / TTFT」是否因此改善
-      FLOWSHIP_APP_VERSION: app.getVersion(),
-      FLOWSHIP_PREVENT_APP_NAP: getAppNapMode().enabled ? "1" : "0",
-    },
+    // win32 优雅停的真通道（R1-2）：壳退出时关 server 的 stdin、server 在 ensureExitHook 里监听 'end' 走与 SIGTERM
+    // 同一个清理函数（清理后自杀整树，R8-4）。只有壳会设这个变量——server 独立运行 / 测试 / stdin 被关的环境里不设、不会误退。
+    // R8-7：非 win32 **显式删掉**（withStdinEofExitEnv）——用户环境里若 export 了它，unix 的 stdio:"ignore"（/dev/null）立即 EOF、
+    // server 启动即退；win32 则无论继承到什么都覆盖成 "1"。unix 有 SIGTERM、不需要这条通道。
+    env: withStdinEofExitEnv(
+      {
+        ...process.env,
+        // 三件套：execPath 当 node 用（含孙进程继承、hooks 依赖）+ 端口 + 数据目录
+        ELECTRON_RUN_AS_NODE: "1",
+        PORT: String(PORT),
+        HOSTNAME: HOST,
+        FLOWSHIP_DATA_DIR: path.join(app.getPath("userData"), "data"),
+        // 观测用：run 汇总记录（run-perf.jsonl）带上版本与防节流实验开关状态，
+        // 用于 A/B 对比「空闲后首发 / TTFT」是否因此改善
+        FLOWSHIP_APP_VERSION: app.getVersion(),
+        FLOWSHIP_PREVENT_APP_NAP: getAppNapMode().enabled ? "1" : "0",
+      },
+      process.platform,
+    ),
     // cwd 不用管：standalone server.js 启动时自己 process.chdir(__dirname)
-    stdio: ["ignore", "pipe", "pipe"],
+    // stdin：unix "ignore"（不变）；win32 给一根管道（见上、退出时 end() 它当「请你优雅退出」）
+    stdio: [process.platform === "win32" ? "pipe" : "ignore", "pipe", "pipe"],
     windowsHide: true,
+    // unix：server 自成进程组（setsid），退出时按组发信号（见 signalServerTree）；win32 的树杀：server 自己在退出清理做完后
+    // `taskkill /PID <自己> /T /F` 自杀整树（R8-4，src/lib/server/win-self-tree-kill.ts）；它不理会 stdin EOF 时壳才 /T /F（见 stopWinServer）。
+    // 不 unref：stdio 管道仍挂着，行为与之前一致
+    detached: process.platform !== "win32",
   });
   serverProc = proc;
+  if (typeof proc.pid === "number") writeServerPidRecord(proc.pid);
   bootTimeline.mark("serverSpawn");
   log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")} nodeArgs=${serverNodeArgs.join(" ") || "（空）"}`);
   // ⚠️ 世代守卫（自更新失败恢复竞态）：stopServer 会先把 serverProc 置 null 再杀、
@@ -647,11 +916,14 @@ const startServer = () => {
       app.quit();
     }
   });
+  // win32 的 stdin 管道：我们从不写它，但 end() 时 server 已退 / 管道已断会触发 'error'（EPIPE）——没人监听就是主进程未捕获异常
+  proc.stdin?.on("error", () => {});
   proc.stdout.on("data", (d) => log(`[server] ${d}`.trimEnd()));
   proc.stderr.on("data", (d) => log(`[server:err] ${d}`.trimEnd()));
   // 退出处置在 onServerExit（决策 / 文案在 shell-crash.mjs，弹窗与自动重启在那里编排）。
   // (code, signal) 都要收：被信号杀掉（OOM killer 的 SIGKILL、V8 堆耗尽的 SIGABRT）时 code 是 null——旧实现只收 code、日志里是常量 `code=?`。
   proc.on("exit", (code, signal) => {
+    clearServerPidRecord(proc.pid);
     onServerExit({ proc, startedAt, code, signal }).catch((err) => {
       log(`[main] server 退出处置本身出错：${err?.message || err}`);
     });
@@ -663,29 +935,46 @@ const stopServer = async () => {
   const proc = serverProc;
   serverProc = null;
   if (process.platform === "win32") {
-    // win 下连进程树一起杀——server 可能挂着 SDK agent / hook 子进程
-    await execFileP("taskkill", ["/PID", String(proc.pid), "/T", "/F"]);
+    // win32（R1-2，与 unix 对称）：先请求关闭——关 server 的 stdin（server 侧 ensureExitHook 监听 'end'、走与 SIGTERM
+    // 同一个清理函数）+ 不带 /F 的 `taskkill /PID <pid> /T`；WIN_STOP_GRACE_MS 内没退 / 没有任何可用的优雅通道 → 再 `/T /F` 连进程树强杀
+    // （server 可能挂着 SDK agent / hook 子进程）。逻辑、预算与 pid 复用防线见 ./win-server-stop.mjs（注入式、有单测）。
+    // 未在 Windows 实机验证。
+    const res = await stopWinServer({
+      proc,
+      exec: taskkillWin,
+      sleep,
+      now: () => Date.now(),
+      log,
+      // pid 复用防线：server-pid.json 里的记录已不是它（被新实例覆盖）就不对这个 pid 强杀；没有记录（写失败 / 已清）照常
+      confirmIdentity: (pid) => isRecordCompatibleWithPid(readRecordedServerPid(), pid),
+    });
+    log(`[main] win32 停 server：${JSON.stringify(res)}`);
     return;
   }
-  // unix：先 SIGTERM 给 2s 优雅退出（server 自己有孤儿清理）、没退再 SIGKILL
-  proc.kill("SIGTERM");
+  // unix：先**只对 server 自己** SIGTERM，给 2s 优雅退出（它的退出钩子停 consumer / 预览 dev server / 托管子进程、
+  // 自己有孤儿清理）——不要一上来就整组 TERM，见 sweepServerGroup 的说明（R1-8）；没退再整组 SIGKILL
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    // 已退、忽略
+  }
   const dead = await Promise.race([
     new Promise((r) => proc.once("exit", () => r(true))),
     sleep(2000).then(() => false),
   ]);
-  if (!dead) {
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // 已退、忽略
-    }
-    // SIGKILL 后短等回收（最多 1s）：自更新失败恢复路径随后可能立刻 startServer、
-    // 不等的话新 server 有短暂 EADDRINUSE 撞旧监听 socket 的风险
-    await Promise.race([
-      new Promise((r) => proc.once("exit", () => r(true))),
-      sleep(1000),
-    ]);
+  if (dead) {
+    // server 自己退了：同组孙进程的扫尾（常态组里已没人、立即返回；有残留才整组 TERM → 1.5s → KILL）
+    await sweepServerGroup(proc.pid);
+    return;
   }
+  // 2s 没退：整组 SIGKILL（连同还没走的孙进程）
+  signalServerTree(proc, "SIGKILL");
+  // SIGKILL 后短等回收（最多 1s）：自更新失败恢复路径随后可能立刻 startServer、
+  // 不等的话新 server 有短暂 EADDRINUSE 撞旧监听 socket 的风险
+  await Promise.race([
+    new Promise((r) => proc.once("exit", () => r(true))),
+    sleep(1000),
+  ]);
 };
 
 // 轮询 server 直到 HTTP 200（上限默认 = 常规启动超时 REGULAR_BOOT_TIMEOUT_MS：冷盘 + Defender 下 30s 会误杀慢机器；
@@ -781,6 +1070,16 @@ const onServerExit = async ({ proc, startedAt, code, signal }) => {
   log(`[main] server 退出 ${describeExit(code, signal)} uptime=${Math.round(uptimeMs / 1000)}s quitting=${quitting} stale=${stale}`);
   const action = decideServerExit({ stale, quitting, uptimeMs, autoRestarts: serverAutoRestarts });
   if (action === "ignore") return;
+  // server 意外退出（崩溃 / OOM / 被杀）：它进程组里的孙进程（agent shell 的 pnpm test / dev server / git）还活着、
+  // 没有人会再管它们——自动重启后的 boot-recovery 把任务标成中断、旧进程却继续改工作树（双写者，评审 R1-10）。
+  // 重启 / 弹窗之前先扫尾（组里没人时立即返回；win32 的树杀由 server 自己在优雅退出时做、不理会 EOF 才由壳 /T /F，这里没有组可扫）
+  if (!stale && proc.pid && process.platform !== "win32") {
+    try {
+      await sweepServerGroup(proc.pid);
+    } catch (err) {
+      log(`[main] server 崩溃后扫尾进程组失败（忽略）：${err?.message || err}`);
+    }
+  }
   let restartFailed = false;
   if (action === "restart") {
     serverAutoRestarts += 1;
@@ -1047,7 +1346,10 @@ const revealMainWindow = (source) => {
 };
 
 // 页面首页真实内容渲出来（看板 / 就绪清单）→ 此刻切换、启动全程一屏 splash 到底
-ipcMain.on("app-content-ready", () => revealMainWindow("page-ipc"));
+ipcMain.on("app-content-ready", (e) => {
+  if (!isTrustedIpcSender(e, "app-content-ready")) return;
+  revealMainWindow("page-ipc");
+});
 
 // ---------- mac 改名自迁移（v1.1.x「Flowship」改名收尾） ----------
 //
@@ -1331,7 +1633,8 @@ const applyMenuBarIconVisible = (visible) => {
 };
 
 // 开机自启读写（设置页 UI 另代理；API 名 auto-launch-get / set 一字不差）
-ipcMain.handle("auto-launch-get", () => {
+ipcMain.handle("auto-launch-get", (e) => {
+  if (!isTrustedIpcSender(e, "auto-launch-get")) throw new Error("untrusted ipc sender");
   try {
     return !!app.getLoginItemSettings().openAtLogin;
   } catch (err) {
@@ -1339,7 +1642,8 @@ ipcMain.handle("auto-launch-get", () => {
     return false;
   }
 });
-ipcMain.handle("auto-launch-set", (_e, enabled) => {
+ipcMain.handle("auto-launch-set", (e, enabled) => {
+  if (!isTrustedIpcSender(e, "auto-launch-set")) throw new Error("untrusted ipc sender");
   try {
     app.setLoginItemSettings({ openAtLogin: enabled === true });
     log(`[auto-launch] set openAtLogin=${enabled === true}`);
@@ -1350,11 +1654,13 @@ ipcMain.handle("auto-launch-set", (_e, enabled) => {
 });
 
 // mac 菜单栏图标显隐（设置页仅 darwin 展示；Windows 不注册也没用，主进程直接忽略）
-ipcMain.handle("menu-bar-icon-get", () => {
+ipcMain.handle("menu-bar-icon-get", (e) => {
+  if (!isTrustedIpcSender(e, "menu-bar-icon-get")) throw new Error("untrusted ipc sender");
   if (!IS_MAC) return null;
   return readMenuBarIconVisible();
 });
-ipcMain.handle("menu-bar-icon-set", (_e, visible) => {
+ipcMain.handle("menu-bar-icon-set", (e, visible) => {
+  if (!isTrustedIpcSender(e, "menu-bar-icon-set")) throw new Error("untrusted ipc sender");
   if (!IS_MAC) return;
   const next = visible === true;
   try {
@@ -1440,12 +1746,16 @@ const createWindow = async () => {
     const unlockTimer = setTimeout(() => {
       closeConfirmShowing = false;
     }, 30_000);
-    ipcMain.once("app-close-confirm-result", (_e, confirmed) => {
+    // 不用 once：once 会被一个不可信发送方的调用先消费掉、真正的页面回复就丢了；可信的回复来了才摘掉监听
+    const onCloseConfirmResult = (e, confirmed) => {
+      if (!isTrustedIpcSender(e, "app-close-confirm-result")) return;
+      ipcMain.removeListener("app-close-confirm-result", onCloseConfirmResult);
       log(`[close] renderer 回复 confirmed=${confirmed}`);
       clearTimeout(unlockTimer);
       closeConfirmShowing = false;
       if (confirmed === true) quitAppForReal();
-    });
+    };
+    ipcMain.on("app-close-confirm-result", onCloseConfirmResult);
     // 页面没就绪（白屏/崩溃）时 renderer 弹不了——原生弹窗兜底（不再直接退出）
     if (!pageLoaded) {
       log("[close] 页面未就绪 → 原生确认兜底");
@@ -1588,7 +1898,8 @@ const createWindow = async () => {
 // 页面（preload 暴露的 window.__nativePicker.pick）→ 这里 → dialog.showOpenDialog。
 // 大方针（用户拍板）：桌面端文件 / 目录选择全部走原生 dialog.showOpenDialog；
 // 原 HTTP + osascript 兜底链路（浏览器 dev 用）已随网页版遗留一并删除。
-ipcMain.handle("native-pick", async (_e, opts) => {
+ipcMain.handle("native-pick", async (e, opts) => {
+  if (!isTrustedIpcSender(e, "native-pick")) throw new Error("untrusted ipc sender");
   const mode = opts?.mode === "folder" ? "folder" : "file";
   const multiple = opts?.multiple === true;
   const properties = [
@@ -1609,7 +1920,8 @@ ipcMain.handle("native-pick", async (_e, opts) => {
 // - mac：app.setBadgeCount（Dock 数字；0 清除）
 // - win：setOverlayIcon（renderer canvas 画的红圆白字 PNG dataUrl；无图则清）
 // linux：无统一角标 API、忽略（仍可发系统通知）
-ipcMain.on("inbox:set-badge", (_e, payload) => {
+ipcMain.on("inbox:set-badge", (e, payload) => {
+  if (!isTrustedIpcSender(e, "inbox:set-badge")) return;
   const count = Math.max(0, Math.floor(Number(payload?.count) || 0));
   try {
     if (IS_MAC) {
@@ -1652,7 +1964,8 @@ ipcMain.on("inbox:set-badge", (_e, payload) => {
 // IPC 过来发系统通知；点通知 → 聚焦窗口 + 回传 taskId 给页面路由跳转。
 // 通知只是「叫人回来」的信使、判断「什么时候该叫」全在页面侧（那边有完整任务状态）。
 // 收件箱增量通知也走同一通道（无 taskId、带 target:"inbox"：点通知聚焦窗口并让页面打开收件箱，N1-12）。
-ipcMain.on("task-notify", (_e, payload) => {
+ipcMain.on("task-notify", (e, payload) => {
+  if (!isTrustedIpcSender(e, "task-notify")) return;
   if (!Notification.isSupported()) return;
   const { title, body, taskId, target } = parseNotifyPayload(payload);
   try {
@@ -1687,7 +2000,8 @@ ipcMain.on("task-notify", (_e, payload) => {
 // ---------- 打开系统外链（设置页「系统设置里开启」通知权限等） ----------
 //
 // 白名单见顶部 isSafeExternalUrl——别让页面 IPC 成任意协议跳板。
-ipcMain.on("open-external", (_e, url) => {
+ipcMain.on("open-external", (e, url) => {
+  if (!isTrustedIpcSender(e, "open-external")) return;
   // 站内 URL 不交给系统浏览器（同 setWindowOpenHandler，第四轮 Q4-02）
   if (isAppUrl(url)) {
     log(`[open-external] 拒绝站内 URL：${String(url).slice(0, 80)}`);
@@ -1706,7 +2020,8 @@ ipcMain.on("open-external", (_e, url) => {
 //
 // 页面（next-themes）切换深浅色时、读应用真实 bg/fg 计算后的 rgb、IPC 过来更新
 // 右上角窗口控制按钮条的底色 / 图标色。mac 走 hiddenInset、无 overlay、直接忽略。
-ipcMain.on("set-titlebar-overlay", (_e, opts) => {
+ipcMain.on("set-titlebar-overlay", (e, opts) => {
+  if (!isTrustedIpcSender(e, "set-titlebar-overlay")) return;
   if (IS_MAC || !mainWindow || !opts) return;
   try {
     mainWindow.setTitleBarOverlay({
@@ -2664,8 +2979,9 @@ const runInstallWinUpdate = (version) =>
 // - 注册下载进度（任务栏进度条）/ 下载完成（置 ready）/ 出错事件、只注册一次防监听器泄漏
 // 确认后 quitAndInstall(true, true)：isSilent=true 走 NSIS /S 静默装（oneClick:false
 // 时不传会弹完整安装向导、与「点了立即更新」预期不符）、isForceRunAfter=true 装完自动拉起。
-// server 清理不在这做：quitAndInstall 内部走 app.quit() → before-quit 已同步 taskkill /T
-// 连树杀（蓝军 P0：若在这提前杀、quitAndInstall 失败不退出时 app 就成了没后端的僵尸）。
+// server 清理不在这做：quitAndInstall 内部走 app.quit() → before-quit 里先优雅停（stdin EOF + taskkill，限时 WIN_STOP_GRACE_MS）、
+// 没退再 taskkill /T /F 连树杀（R1-2；此前是同步 /F；优雅路径上的树杀由 server 自己在清理后做，R8-4），主进程在 server 停完之后才退（蓝军 P0：若在这提前杀、
+// quitAndInstall 失败不退出时 app 就成了没后端的僵尸）。
 const installWinUpdate = async (version) => {
   if (!winAutoUpdater) return;
   if (updateState.phase === "installing") return;
@@ -3090,14 +3406,23 @@ const manualCheckForUpdate = async () => {
 };
 
 // 设置页「检查更新」按钮 → preload window.__appUpdater.check() → 这里
-ipcMain.handle("check-for-update", () => manualCheckForUpdate());
+ipcMain.handle("check-for-update", (e) => {
+  if (!isTrustedIpcSender(e, "check-for-update")) throw new Error("untrusted ipc sender");
+  return manualCheckForUpdate();
+});
 
 // 页面 UpdateBadge mount / 刷新时拉全量更新状态（实时变化走 update-state 推送）
-ipcMain.handle("get-update-state", () => updateState);
+ipcMain.handle("get-update-state", (e) => {
+  if (!isTrustedIpcSender(e, "get-update-state")) throw new Error("untrusted ipc sender");
+  return updateState;
+});
 
 // 页面点「新版本」徽标 → preload window.__appUpdater.install()（正规 IPC、
 // 替代 app-update:// 伪协议导航；will-navigate 拦截仍保留兜底旧缓存页面）
-ipcMain.on("install-update", () => void installUpdateNow());
+ipcMain.on("install-update", (e) => {
+  if (!isTrustedIpcSender(e, "install-update")) return;
+  void installUpdateNow();
+});
 
 // ---------- 生命周期 ----------
 
@@ -3124,6 +3449,23 @@ if (!app.requestSingleInstanceLock()) {
     lagMonitor.start();
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")} protocol=${PROTOCOL_SCHEME}`);
     applyAppNapGuard();
+    // 系统关机 / 重启 / 注销：标记一下，before-quit 据此跳过「优雅停 server」（拖住退出会打断关机）
+    try {
+      powerMonitor.on("shutdown", () => {
+        systemShuttingDown = true;
+        log("[main] 系统即将关机 / 重启 / 注销：退出时同步整组杀 server、不等优雅退出");
+        // 用户取消了关机 / 注销时 app 还活着：过一阵复位，别让之后的正常退出一直跳过优雅停
+        if (systemShutdownResetTimer) clearTimeout(systemShutdownResetTimer);
+        systemShutdownResetTimer = setTimeout(() => {
+          systemShutdownResetTimer = null;
+          systemShuttingDown = false;
+          log("[main] 关机 / 注销信号后 app 仍在运行（多半是用户取消了）、复位关机标记");
+        }, SYSTEM_SHUTDOWN_RESET_MS);
+        systemShutdownResetTimer.unref?.();
+      });
+    } catch (err) {
+      log(`[main] powerMonitor shutdown 监听注册失败：${err?.message || err}`);
+    }
     // 机器快照（启动慢定位用：内存/CPU 不够的机器冷启动天然慢，先排除硬件因素）
     try {
       const cpus = os.cpus();
@@ -3441,6 +3783,43 @@ if (!app.requestSingleInstanceLock()) {
       }
       appNapBlockerId = null;
     }
+    // 优雅停 server——unix：SIGTERM → 最多 2s → SIGKILL（按进程组）；win32（R1-2）：stdin EOF + 不带 /F 的 taskkill
+    // → 最多 WIN_STOP_GRACE_MS → taskkill /T /F（见 stopServer；server 自己优雅退出时由它清理后自杀整树，R8-4）。此前这里直接 SIGKILL / taskkill /F，
+    // server 的优雅钩子（停飞书 consumer / 托管子进程 / keep-awake）正常退出时永远不执行，
+    // agent shell 的孙进程成孤儿继续改工作树（评审 P1）。before-quit 是同步钩子：preventDefault 等它停完
+    // 再 app.quit() 一次（第二次进来 serverQuitDone=true 放行，继续走下面的暂存更新逻辑）。
+    // 系统关机（systemShuttingDown）不走这里、退回下面的同步强杀（不能拖住关机）。
+    if (
+      !systemShuttingDown &&
+      !serverQuitDone &&
+      (serverProc || serverQuitStopping)
+    ) {
+      event.preventDefault();
+      if (!serverQuitStopping) {
+        serverQuitStopping = true;
+        // 看门狗：stopServer 内部每一步都有上限，但整体叠起来可能偏长、任何一步卡住也不该让退出悬着
+        // （stopServer 一开头就把 serverProc 置 null，所以句柄要先留一份给看门狗的兜底 SIGKILL 用）
+        const quitProc = serverProc;
+        const watchdog = setTimeout(() => {
+          if (serverQuitDone) return;
+          log(`[main] 退出时优雅停 server 超过 ${SERVER_QUIT_WATCHDOG_MS}ms、强杀（unix 整组 SIGKILL / win32 taskkill /T /F）后强制退出`);
+          killServerTreeSync(quitProc);
+          serverQuitDone = true;
+          app.quit();
+        }, SERVER_QUIT_WATCHDOG_MS);
+        void stopServer()
+          .catch((err) => {
+            log(`[main] 退出时停 server 出错：${err?.message || err}`);
+          })
+          .finally(() => {
+            clearTimeout(watchdog);
+            if (serverQuitDone) return; // 看门狗已经放行过一次
+            serverQuitDone = true;
+            app.quit();
+          });
+      }
+      return;
+    }
     if (serverProc) {
       try {
         if (process.platform === "win32") {
@@ -3453,7 +3832,8 @@ if (!app.requestSingleInstanceLock()) {
             timeout: 5000,
           });
         } else {
-          serverProc.kill("SIGKILL");
+          // 走到这里 = 系统正在关机（不能拖住退出）或兜底：同步整组 SIGKILL（连孙进程一起、不留孤儿）
+          signalServerTree(serverProc, "SIGKILL");
         }
       } catch {
         // 已退、忽略

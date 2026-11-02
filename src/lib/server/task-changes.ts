@@ -45,7 +45,7 @@ import { promisify } from "node:util";
 
 import { formatChangeScope } from "../changes/scope";
 import { getRepoWorkDirs } from "../path-utils";
-import { gitEnv } from "./git-exec";
+import { CURRENT_BRANCH_ARGS, gitEnv, parseCurrentBranchOutput } from "./git-exec";
 import {
   DEFAULT_HASH_LIMITS,
   MAX_HASH_TOTAL_BYTES,
@@ -338,6 +338,16 @@ export const parseRawZ = (out: string): Map<string, RawEntry> => {
   return map;
 };
 
+/**
+ * 输出超过 maxBuffer 被截断的 `-z` 流：砍掉末尾那个不完整的 token（最后一个 NUL 之后的半截内容）。
+ * 其余完整 token 原样保留，交给 parseNameStatusZ / parseNumstatZ——它们对「记录缺后半段」（如 `R100\0old\0`、
+ * `M\0`）都是遇到空 token 就停、丢掉那条残缺记录，不会把半截路径当成文件。
+ */
+export const trimToCompleteZTokens = (truncated: string): string => {
+  const i = truncated.lastIndexOf("\0");
+  return i < 0 ? "" : truncated.slice(0, i + 1);
+};
+
 /** `git ls-files -z` 输出 → 路径数组 */
 export const parseNulList = (out: string): string[] =>
   out.split("\0").filter((s) => s.length > 0);
@@ -610,10 +620,10 @@ const readAheadBehind = async (
   return r.ok ? parseLeftRightCount(r.stdout) : null;
 };
 
+/** 当前分支的精确名（detached / unborn / 读失败 → null）；分支与同名 tag 并存时 `--abbrev-ref` 会给 `heads/<name>`，见 git-exec 的 CURRENT_BRANCH_ARGS */
 const readBranchName = async (dir: string): Promise<string | null> => {
-  const r = await runGit(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  const name = r.stdout.trim();
-  return r.ok && name && name !== "HEAD" ? name : null;
+  const r = await runGit(dir, [...CURRENT_BRANCH_ARGS]);
+  return r.ok ? parseCurrentBranchOutput(r.stdout) : null;
 };
 
 // ----------------- 未跟踪文件 -----------------
@@ -986,15 +996,27 @@ export const readRepoChanges = async (
       ? readAheadBehind(root, resolved.ref)
       : Promise.resolve(null),
   ]);
-  // tracked 部分是主体：读不出来就整仓报错（不给半截清单误导）
-  if (!nameStatus.ok || !numstat.ok) return unavailable("git_error", { branch });
+  // tracked 部分是主体：读不出来就整仓报错（不给半截清单误导）。
+  // 例外：输出超过 MAX_LIST_BUFFER（海量改动，如误提交 node_modules / 构建产物 / 大规模格式化）不是「读不出来」：
+  // 以前这里也整仓 git_error、面板整个空白，连前面几百个文件都看不到。现在降级成「截断清单」——
+  // 取被截断流里完整的那部分记录、标 filesTruncated（前端已有该字段的提示）+ listOverflow（totals 是下限）；
+  // 此时 totals 只是已读到部分的合计（下限），不再是全量。
+  const usable = (r: GitRun): boolean => r.ok || r.overflow;
+  if (!usable(nameStatus) || !usable(numstat)) return unavailable("git_error", { branch });
+  const nameStatusOverflow = nameStatus.overflow;
+  const numstatOverflow = numstat.overflow;
 
-  const stats = parseNumstatZ(numstat.stdout);
-  const files: TaskChangeFile[] = parseNameStatusZ(nameStatus.stdout).map((e) => {
+  const stats = parseNumstatZ(
+    numstatOverflow ? trimToCompleteZTokens(numstat.stdout) : numstat.stdout,
+  );
+  const files: TaskChangeFile[] = parseNameStatusZ(
+    nameStatusOverflow ? trimToCompleteZTokens(nameStatus.stdout) : nameStatus.stdout,
+  ).map((e) => {
     const s = stats.get(e.path);
     // name-status 不带 -w、是完整清单；numstat 带 -w 时会把「只改了空白」的文件整行省略——
-    // 不特殊处理会被当成「没统计到 = 二进制 / 过大」，这里明确标成「仅空白」、行数记 0
-    const wsOnly = opts.ignoreWs === true && s === undefined;
+    // 不特殊处理会被当成「没统计到 = 二进制 / 过大」，这里明确标成「仅空白」、行数记 0。
+    // numstat 自己被截断时「没统计到」是读不全、不是只改了空白：不能误标
+    const wsOnly = opts.ignoreWs === true && s === undefined && !numstatOverflow;
     return {
       path: e.path,
       ...(e.oldPath ? { oldPath: e.oldPath } : {}),
@@ -1069,7 +1091,11 @@ export const readRepoChanges = async (
     }),
     emptyTotals(),
   );
-  const filesTruncated = files.length > MAX_CHANGE_FILES;
+  // 清单本身被缓冲上限截断时一定算「没列全」（即便截断后剩的条数没超过 MAX_CHANGE_FILES）
+  const filesTruncated = nameStatusOverflow || files.length > MAX_CHANGE_FILES;
+  // 任一清单流被缓冲上限截断：totals 只是已读到部分的合计（下限）——单独给标记，前端据此写「至少 N 个」而不是「共 N 个」
+  //（filesTruncated 只表示「files 没列全」，纯文件数超 500 时 totals 仍是精确全量，两者语义不同、不能互相代替）
+  const listOverflow = nameStatusOverflow || numstatOverflow;
   // 当前就在线上分支本身上：没有「分支上的提交」可看、只会有未提交 / 未推送的改动（UI 据此说明）
   const onBaseBranch =
     resolved.kind === "merge-base" && branch !== null && branch === resolved.baseName;
@@ -1088,6 +1114,7 @@ export const readRepoChanges = async (
     ...(counts ? { aheadOfBase: counts.ahead, behindBase: counts.behind } : {}),
     ...(resolved.override ? { baseOverride: resolved.override } : {}),
     ...(filesTruncated ? { filesTruncated: true } : {}),
+    ...(listOverflow ? { listOverflow: true } : {}),
     ...(untrackedSkipped ? { untrackedSkipped: true } : {}),
   };
 };

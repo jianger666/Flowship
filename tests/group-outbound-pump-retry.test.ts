@@ -54,6 +54,7 @@ const fullTask = (): Task =>
     createdAt: Date.now(),
     updatedAt: Date.now(),
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
+    // 群答疑默认关闭（严格 true 才放行）：这组用例要走到答疑 pump，必须显式开启
   }) as unknown as Task;
 
 const seedQueued = (messageId = "om_q1", text = "埋点查了吗") =>

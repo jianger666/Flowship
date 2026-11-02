@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { getBridgeDataDir } from "@/lib/server/feishu-bridge/bridge-config";
 import {
   addEndedChatTaskId,
   getCurrentChatTaskId,
@@ -47,6 +48,21 @@ const baseMsg = (
   content: "hello",
   ...overrides,
 });
+
+/**
+ * 附件落点断言：`<bridge>/attachments/<messageId>/<6 位 hex 前缀>-<净化后的原文件名>`。
+ * 文件名由发件人决定，不能再直接落在 bridge 顶层（会覆盖 bridge-state.json 等状态文件，见 attachment-store）。
+ */
+const expectPlacedAttachment = (
+  abs: string,
+  expectedName: string,
+  messageId = "om_test_1",
+): void => {
+  expect(path.basename(abs)).toMatch(/^[0-9a-f]{6}-/);
+  expect(path.basename(abs).slice(7)).toBe(expectedName);
+  expect(path.basename(path.dirname(abs))).toBe(messageId);
+  expect(path.basename(path.dirname(path.dirname(abs)))).toBe("attachments");
+};
 
 const mockTask = (overrides: Partial<TaskSummary> = {}): TaskSummary =>
   ({
@@ -135,6 +151,23 @@ describe("parseInboundContent markdown 图提取", () => {
     expect(parsed.images).toHaveLength(1);
   });
 
+  it("超过 10MB 的图：先 stat 判定、不把整个文件读进内存（旧实现 readFile 完才判大小）；图被跳过、临时文件照删", async () => {
+    const big = await makePng();
+    await fs.truncate(big, 11 * 1024 * 1024); // 稀疏文件：stat 为 11MB、几乎不占盘
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => big }));
+    const readSpy = vi.spyOn(fs, "readFile");
+    try {
+      const parsed = await parseInboundContent(
+        baseMsg({ message_type: "text", content: "看 ![图](img_v3_big_one)" }),
+      );
+      expect(parsed.images).toHaveLength(0);
+      expect(readSpy.mock.calls.some((c) => c[0] === big)).toBe(false);
+      await expect(fs.stat(big)).rejects.toThrow(); // 转完即删：超限的也不留
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   it("text 类型带 markdown 图同样提取", async () => {
     const png = await makePng();
     __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => png }));
@@ -203,10 +236,12 @@ describe("parseInboundContent 文件消息双形态", () => {
     }
   });
 
+  // 夹具文件放进 bridge 目录（与生产 downloadMessageResource 的落点一致）：
+  // 附件会被挪进 `<bridge>/attachments/<messageId>/`，不污染系统 tmp
   const makeTmpFile = async (): Promise<string> => {
     const p = path.join(
-      os.tmpdir(),
-      `feishu-file-${Date.now()}-${Math.random().toString(36).slice(2)}.bin`,
+      await getBridgeDataDir(),
+      `dl-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     );
     await fs.writeFile(p, "file-content");
     tmpFiles.push(p);
@@ -236,7 +271,7 @@ describe("parseInboundContent 文件消息双形态", () => {
       { key: "file_v3_0013o_63f1ec89-ded1-48d8-869a-8f9d24204b3g", type: "file" },
     ]);
     expect(parsed.attachments).toHaveLength(1);
-    expect(path.basename(parsed.attachments[0]!)).toBe("报告 v2.pdf");
+    expectPlacedAttachment(parsed.attachments[0]!, "报告 v2.pdf");
     tmpFiles.push(parsed.attachments[0]!);
   });
 
@@ -251,7 +286,7 @@ describe("parseInboundContent 文件消息双形态", () => {
     );
     expect(parsed.unsupported).toBeUndefined();
     expect(parsed.attachments).toHaveLength(1);
-    expect(path.basename(parsed.attachments[0]!)).toBe("notes.txt");
+    expectPlacedAttachment(parsed.attachments[0]!, "notes.txt");
     tmpFiles.push(parsed.attachments[0]!);
   });
 
@@ -269,7 +304,7 @@ describe("parseInboundContent 文件消息双形态", () => {
     );
     expect(parsed.unsupported).toBeUndefined();
     expect(parsed.attachments).toHaveLength(1);
-    expect(path.basename(parsed.attachments[0]!)).toBe("data.csv");
+    expectPlacedAttachment(parsed.attachments[0]!, "data.csv");
     tmpFiles.push(parsed.attachments[0]!);
   });
 
@@ -324,7 +359,8 @@ describe("parseInboundContent 视频消息 media", () => {
   };
 
   const makeTmpVideo = async (): Promise<string> => {
-    const p = path.join(os.tmpdir(), `feishu-video-${Date.now()}-${Math.random().toString(36).slice(2)}.bin`);
+    // 同上：放进 bridge 目录，视频本体会被挪进 attachments/<messageId>/
+    const p = path.join(await getBridgeDataDir(), `dl-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await fs.writeFile(p, "video-content");
     tmpFiles.push(p);
     return p;
@@ -358,7 +394,7 @@ describe("parseInboundContent 视频消息 media", () => {
     ]);
     expect(parsed.images).toHaveLength(1);
     expect(parsed.attachments).toHaveLength(1);
-    expect(path.basename(parsed.attachments[0]!)).toBe("video.mp4");
+    expectPlacedAttachment(parsed.attachments[0]!, "video.mp4");
     tmpFiles.push(parsed.attachments[0]!);
   });
 
@@ -1159,5 +1195,264 @@ describe("routeInboundMessage", () => {
     expect(sendText).toHaveBeenCalledWith("ou_owner", "文件超过 50MB 上限");
     expect(handleChat).not.toHaveBeenCalled();
     await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// P1：群里非属主的附件不能在鉴权 / 限流之前就下载，落盘文件名也不能由发件人决定。
+// router 侧提供「预解析 + 延后下载」（deferDownloads）与「净化 + 子目录 + 唯一前缀」的落点；
+// 闸门顺序（先过 owner / chat 型 / 忙线 / 限流、再 resolve）在 tests/group-route-attachment-gate.test.ts 钉。
+describe("parseInboundContent deferDownloads（非属主预解析：先不下载）", () => {
+  /** 在 bridge 目录顶层造一个「刚下载好」的产物（与 downloadMessageResource 的落点一致） */
+  const makeDownload = async (content = "file-content"): Promise<string> => {
+    const p = path.join(
+      await getBridgeDataDir(),
+      `dl-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    await fs.writeFile(p, content);
+    return p;
+  };
+  const makePng = async (): Promise<string> => {
+    const p = await makeDownload();
+    const buf = Buffer.alloc(64, 1);
+    buf.write("\x89PNG\r\n\x1a\n", 0);
+    await fs.writeFile(p, buf);
+    return p;
+  };
+  const fileMsg = (over: Partial<FeishuInboundMessage> = {}): FeishuInboundMessage =>
+    baseMsg({
+      message_type: "file",
+      content: JSON.stringify({ file_key: "file_v3_defer", file_name: "报告.pdf" }),
+      ...over,
+    });
+
+  it("文件消息：预解析不下载、带 deferred；resolve 才下载，落进 attachments/<messageId>/，再 resolve 命中缓存不重复下载", async () => {
+    const downloaded: string[] = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key) => {
+          downloaded.push(key);
+          return makeDownload();
+        },
+      }),
+    );
+
+    const pre = await parseInboundContent(fileMsg(), { deferDownloads: true });
+    expect(downloaded).toEqual([]); // 门外零下载
+    expect(pre.unsupported).toBeUndefined();
+    expect(pre.attachments).toEqual([]);
+    expect(pre.deferred).toBeDefined();
+    expect(pre.deferred!.hasImages).toBe(false);
+
+    const full = await pre.deferred!.resolve();
+    expect(downloaded).toEqual(["file_v3_defer"]);
+    expect(full.attachments).toHaveLength(1);
+    expectPlacedAttachment(full.attachments[0]!, "报告.pdf");
+    expect(full.deferred).toBeUndefined();
+
+    const again = await pre.deferred!.resolve();
+    expect(downloaded).toEqual(["file_v3_defer"]); // 缓存：不重复下载
+    expect(again).toBe(full);
+  });
+
+  it("图片消息：预解析 hasImages=true、不下载；resolve 后 images 才有", async () => {
+    const downloaded: string[] = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key) => {
+          downloaded.push(key);
+          return makePng();
+        },
+      }),
+    );
+    const pre = await parseInboundContent(
+      baseMsg({ message_type: "image", content: "![Image](img_v3_defer_key)" }),
+      { deferDownloads: true },
+    );
+    expect(downloaded).toEqual([]);
+    expect(pre.images).toEqual([]);
+    expect(pre.deferred?.hasImages).toBe(true);
+
+    const full = await pre.deferred!.resolve();
+    expect(downloaded).toEqual(["img_v3_defer_key"]);
+    expect(full.images).toHaveLength(1);
+  });
+
+  it("视频消息（封面 + 本体）：预解析既算图又算文件、不下载", async () => {
+    const downloaded: string[] = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key) => {
+          downloaded.push(key);
+          return makeDownload();
+        },
+      }),
+    );
+    const pre = await parseInboundContent(
+      baseMsg({
+        message_type: "media",
+        content: JSON.stringify({ file_key: "file_v3_video", image_key: "img_v3_cover" }),
+      }),
+      { deferDownloads: true },
+    );
+    expect(downloaded).toEqual([]);
+    expect(pre.deferred?.hasImages).toBe(true);
+  });
+
+  it("文本里的 markdown 图 / 文件链接：预解析的正文与完整解析一致（占位已剥）、不下载", async () => {
+    const downloaded: string[] = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key, type) => {
+          downloaded.push(key);
+          return type === "image" ? makePng() : makeDownload();
+        },
+      }),
+    );
+    const msg = baseMsg({
+      message_type: "text",
+      content: "看这张 ![图](img_v3_md_img) 和 [说明.txt](file_v3_md_file) 结束",
+    });
+    const pre = await parseInboundContent(msg, { deferDownloads: true });
+    expect(downloaded).toEqual([]);
+    expect(pre.deferred?.hasImages).toBe(true);
+
+    const full = await pre.deferred!.resolve();
+    expect(downloaded.sort()).toEqual(["file_v3_md_file", "img_v3_md_img"]);
+    expect(pre.text).toBe(full.text);
+    expect(pre.text).not.toContain("img_v3_md_img");
+    expect(pre.text).not.toContain("file_v3_md_file");
+  });
+
+  it("没有资源（纯文本）/ unsupported：不带 deferred，预解析结果即最终结果", async () => {
+    const text = await parseInboundContent(baseMsg({ content: "hello" }), { deferDownloads: true });
+    expect(text.text).toBe("hello");
+    expect(text.deferred).toBeUndefined();
+
+    const bad = await parseInboundContent(
+      baseMsg({ message_type: "file", content: "什么都不是" }),
+      { deferDownloads: true },
+    );
+    expect(bad.unsupported).toBe("文件消息缺少 file_key");
+    expect(bad.deferred).toBeUndefined();
+  });
+
+  it("不传 deferDownloads（属主 / p2p / 补拉）：立即下载、不带 deferred（与旧行为一致）", async () => {
+    const downloaded: string[] = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key) => {
+          downloaded.push(key);
+          return makeDownload();
+        },
+      }),
+    );
+    const parsed = await parseInboundContent(fileMsg());
+    expect(downloaded).toEqual(["file_v3_defer"]);
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.deferred).toBeUndefined();
+  });
+
+  it("resolve 失败不缓存：下载抛错 → resolve 拒绝；再 resolve 会重新下载（排队回放要能重试）", async () => {
+    let calls = 0;
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error("lark 超时");
+          return makeDownload();
+        },
+      }),
+    );
+    const pre = await parseInboundContent(fileMsg(), { deferDownloads: true });
+    await expect(pre.deferred!.resolve()).rejects.toThrow("lark 超时");
+    const full = await pre.deferred!.resolve();
+    expect(calls).toBe(2);
+    expect(full.attachments).toHaveLength(1);
+  });
+
+  it("resolve 后文件超 50MB：给 unsupported（调用方回执 + 退还限流名额），临时文件已删", async () => {
+    const big = await makeDownload();
+    const fh = await fs.open(big, "w");
+    await fh.truncate(60 * 1024 * 1024); // 稀疏文件：stat 报 60MB、实际不占盘
+    await fh.close();
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => big }));
+
+    const pre = await parseInboundContent(fileMsg(), { deferDownloads: true });
+    const full = await pre.deferred!.resolve();
+    expect(full.unsupported).toBe("文件超过 50MB 上限");
+    expect(full.attachments).toEqual([]);
+    const placed = path.join(await getBridgeDataDir(), "attachments", "om_test_1");
+    const left = await fs.readdir(placed).catch(() => [] as string[]);
+    expect(left).toEqual([]);
+  });
+});
+
+describe("入向附件落盘：发件人文件名不能覆盖 bridge 状态文件 / 同名附件互不覆盖", () => {
+  const makeDownload = async (content: string): Promise<string> => {
+    const p = path.join(
+      await getBridgeDataDir(),
+      `dl-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    await fs.writeFile(p, content);
+    return p;
+  };
+
+  it.each(["bridge-state.json", "card-map.json", "card-seq.json", "config.json"])(
+    "附件文件名 %s：同级状态文件原封不动、附件落进 attachments/<messageId>/ 且内容是发件人发的那份",
+    async (evilName) => {
+      const bridge = await getBridgeDataDir();
+      const statePath = path.join(bridge, evilName);
+      await fs.writeFile(statePath, "REAL-STATE");
+      __setRouterDepsForTest(
+        baseRouterDeps({ downloadMessageResource: async () => makeDownload("EVIL") }),
+      );
+
+      const parsed = await parseInboundContent(
+        baseMsg({
+          message_type: "file",
+          content: JSON.stringify({ file_key: "file_v3_evil", file_name: evilName }),
+        }),
+      );
+
+      expect(parsed.unsupported).toBeUndefined();
+      expect(await fs.readFile(statePath, "utf-8")).toBe("REAL-STATE"); // 旧实现这里变成 EVIL
+      expectPlacedAttachment(parsed.attachments[0]!, evilName);
+      expect(await fs.readFile(parsed.attachments[0]!, "utf-8")).toBe("EVIL");
+    },
+  );
+
+  it("文件名带路径穿越（../../）：落点仍在 attachments/<messageId>/ 之内", async () => {
+    const bridge = await getBridgeDataDir();
+    __setRouterDepsForTest(
+      baseRouterDeps({ downloadMessageResource: async () => makeDownload("x") }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "file",
+        content: JSON.stringify({ file_key: "file_v3_trav", file_name: "../../../escape.txt" }),
+      }),
+    );
+    const dest = parsed.attachments[0]!;
+    const rel = path.relative(path.join(bridge, "attachments", "om_test_1"), dest);
+    expect(rel.startsWith("..")).toBe(false);
+    expect(rel).toBe(path.basename(dest));
+  });
+
+  it("同一条消息、同名附件解析两次：两份都在、互不覆盖", async () => {
+    let n = 0;
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async () => makeDownload(`内容${(n += 1)}`),
+      }),
+    );
+    const msg = baseMsg({
+      message_type: "file",
+      content: JSON.stringify({ file_key: "file_v3_same", file_name: "同名.pdf" }),
+    });
+    const a = (await parseInboundContent(msg)).attachments[0]!;
+    const b = (await parseInboundContent(msg)).attachments[0]!;
+    expect(a).not.toBe(b);
+    expect(await fs.readFile(a, "utf-8")).toBe("内容1");
+    expect(await fs.readFile(b, "utf-8")).toBe("内容2");
   });
 });

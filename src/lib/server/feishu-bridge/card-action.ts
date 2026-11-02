@@ -622,7 +622,10 @@ const handleAskAction = async (
 
   // 送达成功——pending 在上面已原子摘走，这里不需要再清
   // 卡片答题成功 → 当前对话指针切到该卡 task（直发后续消息进同一对话）
-  void setCurrentChatTaskId(value.taskId);
+  // best-effort：指针刷新失败（bridge-state 读盘瞬时失败 / 写盘失败都会抛）不能变成未处理的 rejection
+  void Promise.resolve(setCurrentChatTaskId(value.taskId)).catch((err) =>
+    warnLark("setCurrentChatTaskId(ask 答完)", err),
+  );
 
   // 落 ask_user_reply（meta 对齐 ask-inject：askId / answers / source:"feishu"）
   const reqEvent = [...task.events]
@@ -668,6 +671,40 @@ const handleAskAction = async (
   });
 };
 
+/**
+ * 重试按钮的「已认领」登记：key = 卡片 messageId（没有就退回 taskId + 原文），value = 认领时刻。
+ *
+ * 为什么要：「🔄 已重试」的 patch 是 best-effort、而且在 inject 之前才发出去——用户双击时第二个
+ * card.action 事件到达时按钮多半还没被换掉；飞书对回调超时 / 失败还会重投同一次点击。
+ * 每个事件各自 inject 一次，同一句话就被当成两条用户消息重发（chat-inject 还会把第二条排进队、再跑一轮）。
+ * 认领放在 handleRetryAction 入口、同步完成（JS 单线程：检查 + 登记之间没有 await），不依赖 patch 成不成功。
+ * 进程内内存态足够：这是秒级的连点 / 重投竞态，跨重启的老卡再点一次本就该能重试。
+ */
+const retryClaims = new Map<string, number>();
+/** 认领时效：窗内同一张卡的重复点击一律吞掉；过期放行（按钮 patch 失败仍留着时用户能再点，不会永久锁死） */
+const RETRY_CLAIM_TTL_MS = 5 * 60_000;
+const RETRY_CLAIMS_MAX = 500;
+
+/** 认领；已被认领（且未过期）返回 false */
+const claimRetry = (key: string): boolean => {
+  const now = Date.now();
+  const at = retryClaims.get(key);
+  if (at !== undefined && now - at <= RETRY_CLAIM_TTL_MS) return false;
+  retryClaims.set(key, now);
+  // 防膨胀：先清过期的，仍超上限就从最老的（Map 按插入序）淘汰
+  if (retryClaims.size > RETRY_CLAIMS_MAX) {
+    for (const [k, t] of retryClaims) {
+      if (now - t > RETRY_CLAIM_TTL_MS) retryClaims.delete(k);
+    }
+    while (retryClaims.size > RETRY_CLAIMS_MAX) {
+      const oldest = retryClaims.keys().next().value;
+      if (oldest === undefined) break;
+      retryClaims.delete(oldest);
+    }
+  }
+  return true;
+};
+
 const handleRetryAction = async (
   value: RetryValue,
   messageId: string,
@@ -675,6 +712,13 @@ const handleRetryAction = async (
   const text = value.lastUserMessage?.trim() ?? "";
   if (!text) {
     console.warn(`${LOG} retry 缺少 lastUserMessage task=${value.taskId}`);
+    return;
+  }
+
+  // 连点 / 事件重投：同一张卡只认第一次点击（见 retryClaims）。inject 没成功会在下面释放认领。
+  const claimKey = `retry:${messageId || `${value.taskId}:${text}`}`;
+  if (!claimRetry(claimKey)) {
+    console.log(`${LOG} retry 重复点击、已忽略 task=${value.taskId} message=${messageId}`);
     return;
   }
 
@@ -713,6 +757,8 @@ const handleRetryAction = async (
         /* ignore */
       }
       console.warn(`${LOG} retry inject 失败 task=${value.taskId}: ${errText}`);
+      // 没发出去：释放认领，用户再点一次还能重试（别让一次失败的尝试把这张卡永久锁死）
+      retryClaims.delete(claimKey);
       try {
         const bot = await getBotAppInfo();
         await sendTextMessage(
@@ -724,6 +770,7 @@ const handleRetryAction = async (
       }
     }
   } catch (err) {
+    retryClaims.delete(claimKey);
     warnLark("handleChatReplyInject(retry)", err);
   }
 };
@@ -1118,4 +1165,5 @@ export const __resetCardActionRegistrationForTest = (): void => {
   const g = globalThis as unknown as Record<string, boolean | undefined>;
   g[CARD_ACTION_REG_KEY] = false;
   registerCardActionHandler(null);
+  retryClaims.clear();
 };

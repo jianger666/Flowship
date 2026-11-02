@@ -69,6 +69,7 @@ const taskSummary = (): TaskSummary =>
     mrs: [],
     actionCount: 0,
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
+    // 群答疑默认关闭（严格 true 才放行）：这组用例要走到受限答疑，必须显式开启
   }) as TaskSummary;
 
 const fullTask = (): Task =>

@@ -34,15 +34,22 @@ export type AssistantSnapshotPlan =
 /**
  * @param received 本地「已收到」的全部流式文本（含还没上屏、还在合帧队列里的）
  * @param snap 服务端快照；null = 此刻没有进行中的正文
+ * @param localSnapId 本地流式态当前绑定的快照段 id（上一次应用快照时记下的；本地没绑定过 = null / 缺省）。
+ *   与 snap.id 不同 = 本地残留的是另一段（上一段落盘时断线、没收到清流事件）：此时文本前缀判断没有意义
+ *   （旧段恰好是新段前缀会被 extend 成跨段拼接、新段恰好是旧段前缀会被 keep、后续帧接到旧段尾巴上），整段以服务端为准替换
  */
 export const planAssistantSnapshot = (
   received: string,
   snap: AssistantSnapshot | null,
+  localSnapId: string | null = null,
 ): AssistantSnapshotPlan => {
   if (snap === null || snap.text.length === 0) return { kind: "clear" };
   const text = snap.text;
   if (received === text) return { kind: "keep" };
   if (received.length === 0) return { kind: "replace", target: text };
+  if (localSnapId !== null && localSnapId !== snap.id) {
+    return { kind: "replace", target: text };
+  }
   if (text.startsWith(received)) return { kind: "extend", target: text };
   // 本地反而更长且以快照为前缀：不可能出现在正常时序里（快照 = 订阅前已发出的全部），保守地不动
   if (received.startsWith(text)) return { kind: "keep" };

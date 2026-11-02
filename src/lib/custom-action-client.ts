@@ -17,7 +17,9 @@ const handleJson = async <T>(res: Response): Promise<T> => {
   let body: unknown = null;
   try {
     body = await res.json();
-  } catch {
+  } catch (e) {
+    // 读响应体途中被 abort（保存超时掐请求）：必须原样抛出——吞成 null 后下游解构会冒出「Cannot destructure…」怪错误
+    if (e instanceof Error && e.name === "AbortError") throw e;
     // 无 body / 非 JSON、保持 null
   }
   if (!res.ok) {
@@ -36,13 +38,23 @@ export const fetchCustomActions = async (): Promise<CustomActionDef[]> => {
   return actions;
 };
 
+/**
+ * 新建 / 更新的可选 `signal`：配 `withTimeout((signal) => ...)` 做「超时即掐请求」。
+ * abort 只断本端连接——服务端可能已经保存成功，调用方的超时文案要提示「以列表为准」。
+ */
+export interface CustomActionReqOptions {
+  signal?: AbortSignal;
+}
+
 export const createCustomActionReq = async (
   input: CustomActionInput,
+  opts?: CustomActionReqOptions,
 ): Promise<CustomActionDef> => {
   const res = await fetch("/api/custom-actions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
+    ...(opts?.signal ? { signal: opts.signal } : {}),
   });
   const { action } = await handleJson<{ action: CustomActionDef }>(res);
   return action;
@@ -51,12 +63,14 @@ export const createCustomActionReq = async (
 export const updateCustomActionReq = async (
   id: string,
   patch: Partial<CustomActionInput>,
+  opts?: CustomActionReqOptions,
 ): Promise<CustomActionDef> => {
   // id 可能含 `team:` 等特殊字符，必须 encode 再拼 URL
   const res = await fetch(`/api/custom-actions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
+    ...(opts?.signal ? { signal: opts.signal } : {}),
   });
   const { action } = await handleJson<{ action: CustomActionDef }>(res);
   return action;

@@ -207,6 +207,29 @@ describe("OS 打开器（open-path / reveal-in-folder）：被拉起的应用不
     expect(env, "spawn 必须显式带 env（不带 = 整份继承）").toBeDefined();
     for (const k of Object.keys(SENTINELS)) expect(env, k).not.toHaveProperty(k);
   });
+
+  it("两个 OS 打开器都不把 GitLab PAT 带给被拉起的应用（评审 P2：长寿命 GUI 程序再派生的子进程会继承）", async () => {
+    const saved = process.env.FLOWSHIP_GITLAB_TOKEN;
+    process.env.FLOWSHIP_GITLAB_TOKEN = "glpat-should-not-leak";
+    try {
+      for (const mod of [
+        "@/app/api/system/open-path/route",
+        "@/app/api/system/reveal-in-folder/route",
+      ]) {
+        spawnMock.mockClear();
+        const { POST } = await import(mod);
+        const res = await POST(post("http://127.0.0.1/x", { path: path.join(os.tmpdir(), "a.txt") }));
+        expect(res.status).toBe(200);
+        const env = spawnedEnv();
+        expect(env, mod).toBeDefined();
+        expect(Object.keys(env ?? {}).some((k) => k.toUpperCase() === "FLOWSHIP_GITLAB_TOKEN"), mod).toBe(false);
+        expect(env?.PATH, mod).toBeTruthy();
+      }
+    } finally {
+      if (saved === undefined) delete process.env.FLOWSHIP_GITLAB_TOKEN;
+      else process.env.FLOWSHIP_GITLAB_TOKEN = saved;
+    }
+  });
 });
 
 describe("接线契约：没法在不起 IDE / python / 真 shell 的前提下直接跑的出口", () => {
@@ -217,24 +240,62 @@ describe("接线契约：没法在不起 IDE / python / 真 shell 的前提下�
     expect(s).toMatch(/from "\.\/host-env"/);
     const at = s.indexOf("const child = spawn(cmd, cmdArgs as string[], {");
     expect(at).toBeGreaterThan(0);
-    expect(s.slice(at, at + 400)).toContain("env: stripHostInjectedEnv()");
+    expect(s.slice(at, at + 500)).toContain("env: stripHostInjectedEnvAndGitToken()");
   });
 
-  it("action-checks：runShell 的 git 子进程带 stripHostInjectedEnv", () => {
+  it("action-checks：runShell 的 git 子进程走 gitEnv（= 剔宿主注入变量 + 剔 PAT + 不等人输入；行为见 action-checks-run-shell.test.ts）", () => {
     const s = src("src/lib/server/action-checks.ts");
-    expect(s).toMatch(/from "\.\/host-env"/);
+    expect(s).toMatch(/from "\.\/git-exec"/);
     const at = s.indexOf("const proc = spawn(cmd, args, {");
     expect(at).toBeGreaterThan(0);
-    expect(s.slice(at, at + 300)).toContain("env: stripHostInjectedEnv()");
+    expect(s.slice(at, at + 300)).toContain('env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" })');
   });
 
-  it("wk-gate：workflow-gate 的 python 脚本环境从 stripHostInjectedEnv 起步，而不是整份 process.env", () => {
+  it("wk-gate：workflow-gate 的 python 脚本环境从 stripHostInjectedEnvAndGitToken 起步（剔宿主注入变量 + 剔 GitLab PAT），而不是整份 process.env", () => {
     const s = src("src/lib/server/wk-gate.ts");
     expect(s).toMatch(/from "\.\/host-env"/);
+    // 只 import 带摘 PAT 的版本：裸的 stripHostInjectedEnv（故意不剔 PAT、只适用于 agent shell 通道）不该出现在这个文件里
+    expect(s).toMatch(/import \{ stripHostInjectedEnvAndGitToken \} from "\.\/host-env"/);
+    expect(s).not.toMatch(/\bstripHostInjectedEnv\(/);
     const at = s.indexOf("const scriptEnv = (plan: WkGatePlanActive)");
     expect(at).toBeGreaterThan(0);
-    const body = s.slice(at, at + 400);
-    expect(body).toContain("...stripHostInjectedEnv()");
+    const body = s.slice(at, at + 1400);
+    expect(body).toContain("...stripHostInjectedEnvAndGitToken()");
     expect(body).not.toContain("...process.env");
+  });
+
+  it("飞书出口（inbound consumer spawn / lark-api runLark / feishu-cli 登录 + opener）：env 都是 stripHostInjectedEnvAndGitToken()，不再整份 process.env（行为见 feishu-bridge-inbound / feishu-bridge-lark-api-env-strip / feishu-cli-login-env-strip）", () => {
+    for (const rel of [
+      "src/lib/server/feishu-bridge/inbound.ts",
+      "src/lib/server/feishu-bridge/lark-api.ts",
+      "src/lib/server/feishu-cli.ts",
+    ]) {
+      const s = src(rel);
+      expect(s, rel).toContain("stripHostInjectedEnvAndGitToken()");
+      expect(s, rel).not.toMatch(/\benv:\s*process\.env\b/);
+      expect(s, rel).not.toMatch(/\.\.\.process\.env\b/);
+    }
+  });
+
+  it("wk-gate 的 scriptEnv 行为等价：stripHostInjectedEnvAndGitToken 同时剔宿主变量与 PAT（含大小写变体）、保留 PATH 与 WK_*", async () => {
+    const { stripHostInjectedEnvAndGitToken } = await import("@/lib/server/host-env");
+    const pat = ["fake", "pat", "for", "wk", "gate", "env"].join("-");
+    const out = stripHostInjectedEnvAndGitToken({
+      PATH: "/usr/bin",
+      WK_REQUIRE_DELIVERY_BASELINE: "1",
+      WK_DELIVERY_HUB_TOKEN: "hub-token-is-not-the-gitlab-pat",
+      ELECTRON_RUN_AS_NODE: "1",
+      PORT: "8876",
+      FLOWSHIP_GITLAB_TOKEN: pat,
+      flowship_gitlab_token: pat,
+    });
+    expect(out.PATH).toBe("/usr/bin");
+    expect(out.WK_REQUIRE_DELIVERY_BASELINE).toBe("1");
+    expect(out.WK_DELIVERY_HUB_TOKEN).toBe("hub-token-is-not-the-gitlab-pat");
+    const keys = Object.keys(out).map((k) => k.toLowerCase());
+    expect(keys).not.toContain("flowship_gitlab_token");
+    expect(keys).not.toContain("electron_run_as_node");
+    expect(keys).not.toContain("port");
+    expect(JSON.stringify(out)).not.toContain(pat);
   });
 });

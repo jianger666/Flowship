@@ -145,3 +145,16 @@ describe("全局快捷键与命令面板", () => {
     expect(shortcutsDialog).toContain("getModFShortcutLabel(platform)");
   });
 });
+
+describe("⌘B 切侧栏（评审：主输入条里整个失效）", () => {
+  // 行为级断言在 tests/hotkey-handler.test.ts（模拟焦点在 contentEditable / textarea 上照样触发、repeat 不重复切）；
+  // 这里只钉接线：app-shell 的 ⌘B 走共用处理器、且不再读焦点元素
+  it("走 createModHotkeyHandler、不再对 contentEditable / INPUT / TEXTAREA 让行", () => {
+    const start = shell.indexOf("Cmd/Ctrl+B 切侧栏");
+    expect(start).toBeGreaterThan(0);
+    const body = shell.slice(start, shell.indexOf("Cmd/Ctrl+F", start));
+    expect(body).toContain("createModHotkeyHandler(isSidebarToggleCombo, toggleSidebar)");
+    expect(body).not.toContain("activeElement");
+    expect(body).not.toContain("isContentEditable");
+  });
+});

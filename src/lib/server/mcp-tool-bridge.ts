@@ -32,6 +32,15 @@ export const MCP_TOOL_CALL_TIMEOUT_MS = 10 * 60_000;
  */
 export const MCP_TOOL_CALL_MAX_TOTAL_MS = 30 * 60_000;
 
+/**
+ * 建连（含 initialize 握手）的超时：SDK 对 initialize 请求默认 60 秒，但 `transport.start()` 本身（SSE 等一个永远不来的
+ * `endpoint` 事件、HTTP 连接建不起来）不在请求超时里，server 不吭声就会无限挂住整轮 agent 创建。
+ * 保守取 60 秒：stdio 首次 `npx -y …` 要下包、冷启动慢，别把正常的慢启动误杀。
+ */
+export const MCP_CONNECT_TIMEOUT_MS = 60_000;
+/** 枚举工具（listTools）的超时：已建连后的一次普通请求，30 秒足够；超了抛错、由调用方跳过该 server */
+export const MCP_LIST_TOOLS_TIMEOUT_MS = 30_000;
+
 export interface McpCallOptions {
   /**
    * 用户点停止 / 任务被停时 abort：`callTool` 立即 reject，并向 server 发 `notifications/cancelled`。
@@ -125,11 +134,34 @@ const buildMcpTransport = (cfg: McpServerConfig): Transport => {
 export const connectMcpServerWithTransport = async (
   serverName: string,
   transport: Transport,
+  timeouts: { connectMs?: number; listToolsMs?: number } = {},
 ): Promise<BridgedMcpServer> => {
+  const connectMs = timeouts.connectMs ?? MCP_CONNECT_TIMEOUT_MS;
+  const listToolsMs = timeouts.listToolsMs ?? MCP_LIST_TOOLS_TIMEOUT_MS;
   const client = new Client({ name: "flowship", version: "0.1.0" });
-  await client.connect(transport);
+  // 整段建连的硬上限（覆盖 transport.start()）；超时就关掉 client（stdio 子进程 / HTTP 连接没人收就泄漏）再抛
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const connecting = client.connect(transport, { timeout: connectMs });
   try {
-    return await bridgeConnectedClient(serverName, client);
+    await Promise.race([
+      connecting,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`MCP「${serverName}」连接超时（${Math.round(connectMs / 1000)}s）`)),
+          connectMs,
+        );
+      }),
+    ]);
+  } catch (err) {
+    // 超时后 connect 仍可能晚些 reject（被 close 打断）：吞掉，免得 unhandledRejection
+    connecting.catch(() => {});
+    await client.close().catch(() => {});
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  try {
+    return await bridgeConnectedClient(serverName, client, listToolsMs);
   } catch (err) {
     await client.close().catch(() => {});
     throw err;
@@ -139,8 +171,9 @@ export const connectMcpServerWithTransport = async (
 const bridgeConnectedClient = async (
   serverName: string,
   client: Client,
+  listToolsMs: number,
 ): Promise<BridgedMcpServer> => {
-  const listResult = await client.listTools();
+  const listResult = await client.listTools(undefined, { timeout: listToolsMs });
   // 同一 server 下两个工具 sanitize 后可能撞名，短 hash 拆开
   const usedNames = new Set<string>();
   const uniqueApiName = (innerName: string): string => {
@@ -197,4 +230,54 @@ const bridgeConnectedClient = async (
       }
     },
   };
+};
+
+/**
+ * 跨 server 工具名去重（注册侧用）。单个 server 内的撞名 `bridgeConnectedClient` 已经用短 hash 拆开，
+ * 但不同 server 之间没人查：server 名经 `toApiSafeToolName` 清洗 / 截到 24 位后可能相同
+ * （`my.server` 与 `my_server`、前 24 位相同的长名字），同名工具就会得到同一个 API 名，
+ * pi 按名字注册 customTools 时后注册的覆盖先注册的——调用悄悄路由到「最后一个」server。
+ *
+ * 确定性规则（向后兼容：已有 prompt / skill 里引用的名字不变）：
+ * - 按传入顺序（调用方应保证是配置顺序）先到先得，**先注册的保留原名**；
+ * - 后到的撞名者改名为 `<原名截断>_<6 位 hash>`（hash = sha1(serverName \0 原名)，同一输入永远得到同一个名字；
+ *   万一新名又撞，再加盐重算），并 warn 一行（只含 server 名 / 工具名，不含任何参数）。
+ * 撞名者原来本就被覆盖、根本调不到，所以改名只会让它们「变得可调用」，不会改变任何已经生效的名字。
+ * 纯函数（除 warn）：不改传入对象，返回新数组；无撞名时原样返回同一批对象。
+ */
+export const dedupeBridgedToolNames = (
+  bridges: readonly BridgedMcpServer[],
+): BridgedMcpServer[] => {
+  const used = new Set<string>();
+  let touched = false;
+  const out = bridges.map((b) => {
+    let changed = false;
+    const tools = b.tools.map((t) => {
+      if (!used.has(t.name)) {
+        used.add(t.name);
+        return t;
+      }
+      let salt = 0;
+      let name: string;
+      do {
+        const hash = createHash("sha1")
+          .update(`${b.serverName}\0${t.name}${salt ? `\0${salt}` : ""}`)
+          .digest("hex")
+          .slice(0, 6);
+        const trimmed = t.name.slice(0, Math.max(1, API_TOOL_NAME_MAX - 1 - hash.length));
+        name = `${trimmed}_${hash}`;
+        salt++;
+      } while (used.has(name));
+      used.add(name);
+      console.warn(
+        `[mcp-tool-bridge] 工具名撞名：MCP「${b.serverName}」的 ${t.name} 与先注册的 server 重名，已改名为 ${name}`,
+      );
+      changed = true;
+      return { ...t, name };
+    });
+    if (!changed) return b;
+    touched = true;
+    return { ...b, tools };
+  });
+  return touched ? out : [...bridges];
 };

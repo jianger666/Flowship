@@ -39,31 +39,50 @@ const sliceCall = (source: string, marker: string): string => {
 
 describe("V17-02：群问答 tab 往返后事件流一律落在最后一条", () => {
   // 群问答 tab 把 Virtuoso 整个卸载（showQaPanel ? <GroupQaPanel/> : <Virtuoso/>），切回来是重新挂载：
-  // initialTopMostItemIndex 只在 mount 时读一次，读的是 initialTopRef。旧写法 initialTopRef 只在 null 时写一次、
-  // 只有切 task 才复位，切回来就用首次加载时的陈旧下标重挂（2026-10-17 用户拍板「进入一律落在最后一条」）
+  // initialTopMostItemIndex 只在 mount 时读一次。旧写法读的是 initialTopRef（只在 null 时写一次、只有切 task 才复位），
+  // 切回来就用首次加载时的陈旧下标重挂（2026-10-17 用户拍板「进入一律落在最后一条」）；
+  // 现在位置由模块级常量给（评审 K1），initialPositionedRef 只是「渲染期 latch 落过没有」的闸，进入 QA tab 时要开闸
   const qaEffect = sliceCall(
     eventStream,
     "useEffect(() => {\n    lastRangeStartRef.current = null;",
   );
 
-  it("[showQaPanel] effect 里进入群问答 tab 时把 initialTopRef 复位成 null（切回来由渲染期 latch 重新落在最后一条）", () => {
-    expect(qaEffect).toMatch(/if \(showQaPanel\) initialTopRef\.current = null;/);
+  it("[showQaPanel] effect 里进入群问答 tab 时把 initialPositionedRef 复位成 false（切回来由渲染期 latch 重新落在最后一条）", () => {
+    expect(qaEffect).toMatch(/if \(showQaPanel\) initialPositionedRef\.current = false;/);
     expect(eventStream).toContain("}, [showQaPanel]);");
   });
 
   it("只在「进入」时复位：离开群问答（showQaPanel 回到 false）不复位，免得渲染期 latch 之后又被无谓重置", () => {
-    // 无条件 `initialTopRef.current = null` 会在回到事件流后的那次 effect 里再清一次，
+    // 无条件 `initialPositionedRef.current = false` 会在回到事件流后的那次 effect 里再清一次，
     // 下一次渲染的 latch 会把用户刚上滚的跟随态强行拉回「跟随」
-    expect(qaEffect).not.toMatch(/^\s*initialTopRef\.current = null;/m);
+    expect(qaEffect).not.toMatch(/^\s*initialPositionedRef\.current = false;/m);
   });
 
-  it("渲染期 latch 还在：initialTopRef 为 null 且有条目时落在最后一条并恢复跟随（切回事件流那次渲染靠它）", () => {
+  it("渲染期 latch 还在：定位闸没落过且有条目时落在最后一条并恢复跟随（切回事件流那次渲染靠它）", () => {
+    // 评审 K1：latch 里多了 beginSettle（开启定位稳定期）；Virtuoso 的初始项改成「最后一项、底部对齐」常量
+    // 评审 R8-3：闸头必须带 `!showQaPanel`（JSX 里 Virtuoso 在树上的条件是 `!showQaPanel && items.length > 0`）——
+    // 没有它，QA tab 里的任何一次重渲都会在 Virtuoso 不在树上时把「进入 QA」刚开的闸消耗掉、白开 1.5s 稳定期，
+    // 停留超过 1.5s 再切回就不落底（行为见 tests/event-stream-remount-landing.test.ts）
     expect(eventStream).toMatch(
-      /if \(initialTopRef\.current === null && items\.length > 0\) \{\s*follow\.setFollowing\(true\);\s*initialTopRef\.current = items\.length - 1;/,
+      /if \(!initialPositionedRef\.current && !showQaPanel && items\.length > 0\) \{\s*follow\.setFollowing\(true\);[\s\S]*?follow\.beginSettle\(\);\s*initialPositionedRef\.current = true;/,
     );
+  });
+
+  it("列表清空（空态占位卸掉 Virtuoso）同样开闸：[listEmpty] effect 只在变空时复位闸与 range 缓存（评审 R8-3 同类路径）", () => {
+    const emptyEffect = sliceCall(
+      eventStream,
+      "useEffect(() => {\n    if (!listEmpty) return;",
+    );
+    expect(eventStream).toContain("const listEmpty = items.length === 0;");
+    expect(emptyEffect).toContain("initialPositionedRef.current = false;");
+    expect(emptyEffect).toContain("lastRangeStartRef.current = null;");
+    expect(eventStream).toContain("}, [listEmpty]);");
+    // Virtuoso 在树上的条件与 latch 守卫是一回事：JSX 仍是「QA → 空态 → Virtuoso」三选一
     expect(eventStream).toMatch(
-      /initialTopMostItemIndex=\{initialTopRef\.current \?\? items\.length - 1\}/,
+      /\{showQaPanel \? \(\s*<GroupQaPanel[\s\S]*?\) : items\.length === 0 \? \(/,
     );
+    // 评审 K1 根治：Virtuoso 不再传 initialTopMostItemIndex，落底由控制器接手（稳定期内挂上容器即起贴底链）
+    expect(eventStream).not.toMatch(/initialTopMostItemIndex=\{/);
   });
 });
 

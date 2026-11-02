@@ -45,7 +45,8 @@ dev action 的目标：把当前 task 各仓的代码改动送到该仓的 **dev
 ```bash
 cd <repoPath>
 DEV=<该仓 dev 分支>                          # 见「## 仓库分支配置」段、没配则跳过本仓
-FEATURE=$(git rev-parse --abbrev-ref HEAD)  # 已按普通/WK规则确定的业务源分支、全程不动它
+FEATURE=$(git branch --show-current)        # 已按普通/WK规则确定的业务源分支、全程不动它（不用 rev-parse --abbrev-ref：分支与标签同名时它输出 heads/xxx）
+[ -n "$FEATURE" ] || { echo "[error] 当前是 detached HEAD、不在任何分支上、停止本仓联调"; exit 1; }
 
 # fail-fast：fetch 不到 dev 直接退（远程没该分支 / 网络异常、别在脏状态上瞎合）
 if ! git fetch origin "$DEV" 2>&1; then
@@ -101,7 +102,8 @@ echo "[ok] DEV=$DEV HEAD=$HEAD_SHA pushed origin/$DEV"
 ```bash
 cd <repoPath>
 DEV=<该仓 dev 分支>
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BRANCH=$(git branch --show-current)
+[ -n "$BRANCH" ] || { echo "[error] 当前是 detached HEAD、不在任何分支上、停止本仓"; exit 1; }
 
 if ! git fetch origin "$DEV" 2>&1; then
   echo "[error] fetch origin/$DEV 失败、停止本仓"; exit 1

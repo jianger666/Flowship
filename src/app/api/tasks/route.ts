@@ -17,6 +17,7 @@ import {
   commitReadableTaskListResponse,
   createTask,
   listTasksWithCorrupt,
+  SettingsUnreadableError,
 } from "@/lib/server/task-fs";
 import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
 import { failpoint } from "@/lib/server/failpoints";
@@ -185,6 +186,16 @@ export const POST = async (req: Request) => {
     prewarmTaskWorkspace(task.id);
     return NextResponse.json({ task }, { status: 201 });
   } catch (err) {
+    // config.json 读不出来、无法确认只读仓标记：暂时性故障、重试可恢复 → 503，不是服务端 bug 的 500。
+    // `error` 放给人看的文案（前端 task-store 把它当 Error.message、各调用方 toast 直接显示），
+    // 稳定错误码另放 `code`（task-store 会透传成 ApiRequestError.code）
+    if (err instanceof SettingsUnreadableError) {
+      console.warn("[POST /api/tasks] 读取设置失败、已取消创建任务");
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.httpStatus },
+      );
+    }
     console.error("[POST /api/tasks] failed", err);
     return NextResponse.json({ error: "create_failed" }, { status: 500 });
   }

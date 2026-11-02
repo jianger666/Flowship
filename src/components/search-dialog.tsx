@@ -40,7 +40,9 @@ import { Input } from "@/components/ui/input";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
+import { createModHotkeyHandler } from "@/components/hotkey-handler";
 import { isModCombo } from "@/lib/keyboard-shortcuts";
+import { findOccurrenceRanges } from "@/lib/text-search-highlight";
 import type { TaskMode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { isImeComposing } from "@/lib/ime";
@@ -84,31 +86,26 @@ const modeLabel = (mode: TaskMode): string =>
  * 把 snippet / 标题里命中的 query 用 <mark> 高亮（大小写不敏感、逐段切）。
  */
 const highlightMatch = (text: string, query: string): ReactNode => {
-  const q = query.trim();
-  if (!q || !text) return text;
-  const lower = text.toLowerCase();
-  const needle = q.toLowerCase();
+  if (!query.trim() || !text) return text;
+  // 区间走 lib 的 findOccurrenceRanges：小写化可能改变长度（İ），不能直接拿小写串下标切原文
+  const ranges = findOccurrenceRanges(text, query);
+  if (ranges.length === 0) return text;
   const parts: ReactNode[] = [];
   let cursor = 0;
-  let i = 0;
-  while (cursor < text.length) {
-    const found = lower.indexOf(needle, cursor);
-    if (found < 0) {
-      parts.push(text.slice(cursor));
-      break;
-    }
-    if (found > cursor) parts.push(text.slice(cursor, found));
+  ranges.forEach((r, i) => {
+    if (r.start > cursor) parts.push(text.slice(cursor, r.start));
     parts.push(
       <mark
-        key={`m-${i++}`}
+        key={`m-${i}`}
         className="rounded-sm bg-primary/20 px-0.5 text-primary"
       >
-        {text.slice(found, found + q.length)}
+        {text.slice(r.start, r.end)}
       </mark>,
     );
-    cursor = found + q.length;
-  }
-  return parts.length === 1 ? parts[0] : parts;
+    cursor = r.end;
+  });
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return parts;
 };
 
 export const SearchDialog = ({
@@ -146,11 +143,11 @@ export const SearchDialog = ({
 
   // Cmd/Ctrl+K 全局唤起（mounted 期间生效）
   useEffect(() => {
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (!isModCombo(e, "k")) return;
-      e.preventDefault();
-      setOpen((v) => !v);
-    };
+    // 长按 repeat 帧只吞默认行为、不切换（否则按住时面板开关闪烁）
+    const onKeyDown = createModHotkeyHandler(
+      (e: globalThis.KeyboardEvent) => isModCombo(e, "k"),
+      () => setOpen((v) => !v),
+    );
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);

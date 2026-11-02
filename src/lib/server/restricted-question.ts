@@ -1,5 +1,6 @@
 /**
- * 需求群「非属主答疑」——独立的旁路通道（提示词讲规矩 + 身份隔离 + 事件流审计，不做执行层限制）
+ * 需求群「非属主答疑」——独立的旁路通道（提示词讲规矩 + 身份隔离 + read / grep(/ glob) 只读工具白名单 + 事件流审计；
+ * 受限 agent 没有 shell / 写类工具，但 read 的路径范围没有硬限制，见下面「残余」说明）
  *
  * # 为什么单独一个模块（双模型交叉 review 连报同族 P0 后的架构级收敛）
  *
@@ -28,10 +29,15 @@
  *    漏发一次，那条登记就一直挂着、直到 TTL 过期（群里永久无答）。
  * 5. prompt 由 buildRestrictedPrompt 组装（buildReadonlyUserMessage 打底用户话术 + 任务背景 +
  *    旁路公司环境脱敏声明），「# 边界」段永远排在最后。
- *    工具走两端默认全开（honor-system，内部用）；身份隔离（无 callerToken）+ 提示词 # 边界讲规矩，两边同一套话术。
- *    ⚠️ honor-system = 没有执行层边界：属主 OS 用户能读的凭据（config.json 里的 PAT / apiKey / 公司环境密码、
- *    ~/.ssh 等）它都够得着；pi provider 也只摘 PAT 的环境变量、不阻止读文件，Cursor provider 下连环境变量都摘不掉——
- *    只适合只有可信同事的内部群（详见下面 startRestrictedGroupQuestion 里的注释）。
+ *    安全硬化（P0 审计后）：① 准入闸：机器人发件人拒绝（真正生效的一道）。**没有「按群开关」**（第 11 轮起：用户决定答疑默认开，已绑定需求群里的非属主真人 @ 机器人就会起；第 7 轮的「按群显式开启、默认关」整个撤掉）；
+ *    ② `readOnly: true`——只剩 read / grep / glob，没有 shell / 写类（pi 路径本地装配强制；
+ *    Cursor 路径靠 SDK 的 allowed-tools 服务端强制、本地无法验证；不再是 honor-system）；
+ *    ③ 公司环境只给脱敏声明（loadBypassCompanyEnvSection：不同步凭据文件、不给路径、不给脚本用法）；
+ *    ④ 身份隔离（无 callerToken）+ 提示词 # 边界。
+ *    ⚠️ 残余：Cursor 路径的 read 由 SDK 本地执行、没有路径约束（pi 路径的 read 才有 isBypassBlockedReadPath 凭据文件守卫）；
+ *    prompt 里给了事件日志的绝对路径，agent 能推出数据根、进而读 config.json（provider key / GitLab PAT）与 company-env.json——
+ *    所以仍只适合可信内部群（详见下面 startRestrictedGroupQuestion 里的注释）。
+ *    准入闸里真正生效的只有「机器人发件人拒绝」；租户 / 外部成员闸当前拿不到数据、不生效（见 restricted-qa-gate.ts）。
  *    有 `groupContext` 时再多拼三段上下文（群里有谁 / 任务状态快照 / 群里最近聊天）+ 回复规矩，
  *    段落格式化见 feishu-bridge/group-answer-context.ts；拉取整体硬超时 3 秒、失败降级为空，不拖慢起 agent。
  *    答疑 agent 每个问题都是全新的、没有记忆——这些就是它对「群里刚发生了什么」的全部认知。
@@ -259,7 +265,7 @@ const loadGroupPromptSections = async (
 /**
  * 受限 prompt（纯函数、好读好审）。
  *
- * 旁路政策（极简两行）：三条红线，工具默认全开，规矩只写提示词。线上分支以设置页配置为准。
+ * 旁路政策：只读答疑（执行层只有 read / grep / glob），规矩同时写进提示词。线上分支以设置页配置为准。
  * 版式上「# 边界」**必须是最后一段**——模型对末段指令最敏感。
  * `tests/restricted-group-question.test.ts` 钉住这条版式。
  */
@@ -306,7 +312,7 @@ const buildRestrictedPrompt = (args: {
     // 回复协议（NO_REPLY / @ 规则 / 需属主确认标记）；排在「边界」之前——边界必须是最后一段
     ...(g ? section("# 回复规矩", g.replyRules) : []),
     "# 边界",
-    "- 非属主答疑，三条红线：不改任何文件；部署、发布、上线与线上分支先找属主确认；其余都可以干",
+    "- 非属主只读答疑，三条红线：不改任何文件、不执行命令（你手里只有 read / grep 这类只读工具，没有 shell）；部署、发布、上线与线上分支先找属主确认；查不到的如实说查不到，别猜",
     "- 答完自然结束回复",
     ...(g
       ? [
@@ -381,6 +387,23 @@ export const startRestrictedGroupQuestion = (
     };
 
     try {
+      // 起 agent 前重读盘上任务（fail-closed）：group-route 在入向判过准入，但从那之后到真起 agent 之间
+      // 任务可能被删 / 本地关联的群被换绑成别的群。以**盘上最新**为准——读不到任务（已删 / 读盘失败）不起；
+      // 任务本地关联的群（`feishuGroupChatId`）与本轮提问所在的群不是同一个也不起。
+      // 没有「按群开关」可查（第 11 轮起：答疑默认开；老 meta 里残留的 feishuGroupRestrictedQa 读盘时已丢弃）。
+      // 入场快照 `input.task` 不能代替这次重读（它可能是换绑之前的）。
+      // 只在两边都有值时才比：任务没有本地关联群（回落读工作项的项目群）时无从核对，不拦。
+      const gateTask = await getTask(task.id).catch(() => null);
+      if (!gateTask) {
+        await settle(false, "群答疑没启动：任务已不存在或读取失败");
+        return;
+      }
+      const askedChatId = input.groupContext?.chatId;
+      if (askedChatId && gateTask.feishuGroupChatId && gateTask.feishuGroupChatId !== askedChatId) {
+        await settle(false, "群答疑没启动：任务已换绑到别的群");
+        return;
+      }
+
       // 盘上已终态 → worktree 多半已清，起 agent 只会指向不存在的目录
       const repoStatus = await readTaskRepoStatusFresh(task.id);
       if (repoStatus === "merged" || repoStatus === "abandoned") {
@@ -435,30 +458,20 @@ export const startRestrictedGroupQuestion = (
         },
         origin,
       );
-      // 旁路 honor-system（内部用，防君子不防小人）：工具走两端默认全开，不接执行层白名单；
-      // 公司环境同样全量同步——含密码的 company-env.json 会进旁路上下文，事件流和模型厂商都看得到，
-      // 这是“全开”必须付的代价。唯一保留的是身份隔离：不传 callerToken，
-      // submit_work / submit_mr 等系统工具无身份可用（否则旁路能关掉属主的 action，这是正确性问题，
-      // 不是安全选项）；ask_user 同样不可用（群里没人能答它的提问）。审计靠事件流。
-      //
-      // ⚠️ 「全开」的代价不止公司环境密码（N3-01，老实写清楚，别误以为这里有边界）：
-      // 旁路 agent 以属主的 OS 用户身份跑工具全开的 shell / read，凡属主能读的它都够得着——
-      //   - config.json：GitLab PAT（gitToken）、Cursor / 自定义 provider 的 apiKey、公司环境密码；
-      //   - GitLab PAT 的环境变量 FLOWSHIP_GITLAB_TOKEN：pi provider 下环境变量已摘掉（下面 omitGitToken；
-      //     只摘变量、不阻止读文件——pi 的 read 照样能读上面的 config.json），
-      //     **Cursor provider 下摘不掉**——SDK 的本地 agent shell 原样继承 server 的 process.env，
-      //     没有 env 选项，又不能临时删进程全局 env（会把属主并行会话弄坏）；群里任何能 @ 机器人的人
-      //     让它 `printenv` 就能拿到 PAT；
-      //   - ~/.ssh、~/.aws、浏览器 / 其它工具的凭据文件等一切属主 OS 用户能读的东西。
-      // omitGitToken 只是收掉「最显眼」的一条路、不是边界；config.json 之类照样读得到。
-      // Cursor 默认路径的这条无身份旁路沿用同一局限；已拍板**不**用 `disallowedTools` / `local.customTools`
-      // 换掉内置 shell（Cursor 的 read 同样能读 config.json、没形成真边界；换 shell 还会影响工具块展示、有回归风险），
-      // 详见 git-token-env.ts 头部。
-      // 所以**旁路只适合只有可信同事的内部群**；把机器人拉进有外部人员 / 不可信成员的群 = 把属主的凭据交出去。
-      const { syncCompanyEnvFileFromSettings, loadCompanyEnvBriefSection } =
-        await import("./company-env-fs");
-      await syncCompanyEnvFileFromSettings();
-      const companyEnvSection = await loadCompanyEnvBriefSection();
+      // 旁路安全硬化（P0 审计后，不再是 honor-system）：
+      //   ① 准入：机器人发件人已在 group-route 闸拒掉（没有「按群开关」，第 11 轮起答疑默认开），上面 execute 开头再复核任务还在、没换绑；
+      //   ② 工具：`readOnly: true`——pi 路径只剩 read / grep / glob（shell / write / edit / delete / 子代理 / MCP /
+      //      merge_test_mr 一律没有，见 custom-agent-backend 的 restrictedReadOnly 装配），Cursor 路径用 SDK 的
+      //      `tools: ["read","grep"]` 白名单（allowed-tools 请求头，服务端强制）且不挂任何 customTools；
+      //   ③ 公司环境：只给脱敏声明（loadBypassCompanyEnvSection）——**不同步 company-env.json、不给凭据路径、
+      //      不给 ssh-exec / pg-exec 用法**（不传 allowDbQuery：本轮没有 shell、查不了库）；
+      //   ④ 身份隔离：不传 callerToken——submit_work / submit_mr 等系统工具无身份可用（否则旁路能关掉属主的 action），
+      //      ask_user 同样不可用。审计靠事件流。
+      // ⚠️ 残余风险（老实写）：read / grep 没有「凭据文件路径黑名单」——pi 路径的 read 有 isBypassBlockedReadPath 守卫
+      // （见 pi-coding-tools.checkBypassRead），Cursor 路径的 read 由 SDK 自己执行、没有这层守卫，
+      // 理论上仍能读属主 OS 用户可读的文件（config.json 等）。所以旁路仍只适合可信内部群（没有开关了，这条警示留在 docs/feishu-group-collab.md「诚实的局限」里）。
+      const { loadBypassCompanyEnvSection } = await import("./company-env-fs");
+      const companyEnvSection = await loadBypassCompanyEnvSection();
       if (!alive()) {
         await settle(false, "群答疑已取消");
         return;
@@ -470,8 +483,9 @@ export const startRestrictedGroupQuestion = (
           model: creds.model,
           // 自定义 provider（opencode 等）必须带上，否则 facade 按默认 cursor 建、拿自定义 key 去调 Cursor 会 401
           providerId: bypassProviderId,
-          // 旁路不做执行层限制：两端都走默认全开工具集（Cursor 标准工具集 / pi 全量编码工具），
-          // 规矩只写在提示词 # 边界里。身份照旧隔离（见上），审计靠事件流。
+          // 旁路只读：两端各走原生工具开关（Cursor `tools` 白名单 / pi 只读白名单），写类 / shell 在执行层就没有。
+          // tests/restricted-group-question.test.ts 钉住这里必须传 true。
+          readOnly: true,
           // 有 task 上下文：read 超 64KB 照样落盘给路径
           taskId: task.id,
           // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入。

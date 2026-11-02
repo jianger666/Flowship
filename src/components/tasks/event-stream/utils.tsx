@@ -21,6 +21,7 @@ import {
   UserCircle2,
 } from "lucide-react";
 
+import { sliceHeadSafe } from "@/lib/text-slice";
 import type { EventKind, TaskEvent } from "@/lib/types";
 
 // 中文 + 英文学名（团队沟通时英文锚点）
@@ -115,7 +116,7 @@ export { isChatStartupNoiseInfo } from "@/lib/event-stream-hidden";
 export const summarize = (text: string, max = 200): string => {
   const flat = text.replace(/\s+/g, " ").trim();
   if (flat.length <= max) return flat;
-  return `${flat.slice(0, max)}…`;
+  return `${sliceHeadSafe(flat, max)}…`;
 };
 
 // ===========================================

@@ -14,6 +14,7 @@ import {
   larkApi,
   patchCardSettings,
   runLark,
+  sendTextMessage,
   updateCardElementContent,
   updateCardEntity,
 } from "@/lib/server/feishu-bridge/lark-api";
@@ -39,6 +40,22 @@ afterEach(() => {
   __setLarkExecForTest(null);
   __resetLarkBinCacheForTest();
   __setLarkRetryBaseForTest(null);
+});
+
+describe("sendTextMessage：callOpts.timeoutMs 透传到 exec 的 timeout", () => {
+  // finalizeTurn 的预算压缩（剩余不足 30s 时把单发超时压短）全靠这一层透传；被改坏的话预算测试只测到 outbound 的 mock，抓不到
+  it("不传 = 默认 30s；传了就是传的值（且不影响后一次）", async () => {
+    const seen: number[] = [];
+    const okSend = JSON.stringify({ ok: true, data: { message_id: "om_x", chat_id: "oc_x" } });
+    __setLarkExecForTest(async (_bin, _args, opts) => {
+      seen.push(opts.timeout);
+      return { stdout: okSend, stderr: "" };
+    });
+    await sendTextMessage("ou_x", "你好");
+    await sendTextMessage("ou_x", "你好", { timeoutMs: 6500 });
+    await sendTextMessage("ou_x", "你好", {});
+    expect(seen).toEqual([DEFAULT_MS, 6500, DEFAULT_MS]);
+  });
 });
 
 describe("runLark / larkApi：timeoutMs", () => {
@@ -67,6 +84,29 @@ describe("runLark / larkApi：timeoutMs", () => {
       expect(seen).toEqual([DEFAULT_MS, DEFAULT_MS]);
     },
   );
+
+  // execFile 的 timeout 必须是无符号整数：小数直接抛 ERR_OUT_OF_RANGE（node 实测），
+  // 终稿预算用单调时钟算出的剩余值就是小数——不取整的话预算内的补发整条失败
+  it("小数超时向下取整成整数、至少 1ms（0.5 取整成 0 会变成「永不超时」）、过大的值封顶在 32 位整数", async () => {
+    const seen = recordTimeouts();
+    await runLark(["im", "+messages-send"], { timeoutMs: 1234.567 });
+    await runLark(["im", "+messages-send"], { timeoutMs: 0.5 });
+    await larkApi("GET", "/open-apis/x", { timeoutMs: 9999.999 });
+    await runLark(["im", "+messages-send"], { timeoutMs: 1e12 });
+    expect(seen).toEqual([1234, 1, 9999, 2_147_483_647]);
+    for (const t of seen) expect(Number.isInteger(t)).toBe(true);
+  });
+
+  it("sendTextMessage 的小数超时同样取整后再交给 exec", async () => {
+    const seen: number[] = [];
+    const okSend = JSON.stringify({ ok: true, data: { message_id: "om_x", chat_id: "oc_x" } });
+    __setLarkExecForTest(async (_bin, _args, opts) => {
+      seen.push(opts.timeout);
+      return { stdout: okSend, stderr: "" };
+    });
+    await sendTextMessage("ou_x", "你好", { timeoutMs: 6500.75 });
+    expect(seen).toEqual([6500]);
+  });
 
   it("超时（killed）的错误文案报这次调用实际用的超时值", async () => {
     __setLarkExecForTest(async () => {

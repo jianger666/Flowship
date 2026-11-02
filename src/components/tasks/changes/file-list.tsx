@@ -472,7 +472,7 @@ const RepoSection = ({
       )}
       {repo.filesTruncated && (
         <p className="px-2 py-1.5 text-[11px] text-warning">
-          改动文件太多，仅列出前 {repo.files.length} 个（共 {repo.totals.files} 个）
+          改动文件太多，仅列出前 {repo.files.length} 个（{repo.listOverflow ? "至少" : "共"} {repo.totals.files} 个）
         </p>
       )}
       {repo.untrackedSkipped && (

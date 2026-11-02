@@ -50,3 +50,22 @@ export const shouldFallBackToBranch = (
   !!repos &&
   repos.length > 0 &&
   repos.every((r) => r.unavailable === "scope_invalid");
+
+/**
+ * 改动合计的显示口径（文件数 / 行数各自是不是「下限」）。
+ *
+ * git 的清单类输出（name-status / numstat）超过缓冲上限时 `TaskRepoChanges.listOverflow` 为 true，`totals` 只是读到的部分：
+ * - name-status 被截断（`listOverflow && filesTruncated`）：文件数与行数都是下限；
+ * - 只有 numstat 被截断（`listOverflow && !filesTruncated`）：文件清单是全的、文件数精确，只有 `added` / `removed` 是下限。
+ * 单纯的 `filesTruncated`（文件数超 500、没发生缓冲溢出）`totals` 仍是精确全量，不算下限。
+ * 多仓：任一仓是下限，合计就是下限。
+ */
+export const describeChangesTotals = (
+  repos: readonly Pick<TaskRepoChanges, "listOverflow" | "filesTruncated">[],
+): { filesAtLeast: boolean; linesAtLeast: boolean } => ({
+  filesAtLeast: repos.some((r) => r.listOverflow === true && r.filesTruncated === true),
+  linesAtLeast: repos.some((r) => r.listOverflow === true),
+});
+
+/** 「≥」前缀（下限才带），拼在数字前：atLeast(true) → "≥"，false → "" */
+export const atLeastPrefix = (atLeast: boolean): string => (atLeast ? "≥" : "");

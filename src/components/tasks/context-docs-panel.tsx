@@ -48,6 +48,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { addContextDoc, removeContextDoc } from "@/lib/task-store";
+import { sliceHeadSafe, sliceTailSafe } from "@/lib/text-slice";
 import type { Task, TaskContextDoc, TaskContextDocType } from "@/lib/types";
 
 const renderTypeIcon = (type: TaskContextDocType) => {
@@ -67,7 +68,7 @@ const renderTypeIcon = (type: TaskContextDocType) => {
 const renderPreview = (doc: TaskContextDoc): string => {
   const c = doc.content.trim();
   if (doc.type === "text") {
-    return c.length > 80 ? `${c.slice(0, 80)}…` : c;
+    return c.length > 80 ? `${sliceHeadSafe(c, 80)}…` : c;
   }
   if (doc.type === "image") {
     // image 路径太长不友好、只显示文件名
@@ -75,7 +76,7 @@ const renderPreview = (doc: TaskContextDoc): string => {
     return idx >= 0 ? c.slice(idx + 1) : c;
   }
   if (c.length <= 60) return c;
-  return `${c.slice(0, 30)}…${c.slice(-25)}`;
+  return `${sliceHeadSafe(c, 30)}…${sliceTailSafe(c, 25)}`;
 };
 
 // 从 image doc 的 absPath 抠 filename、拼 /api/tasks/[id]/uploads/[filename]、给列表行渲染缩略图

@@ -18,8 +18,10 @@ export type SecretScanHit = {
     | "connection-string"
     | "pgpass"
     | "high-entropy"
-    /** 值形态命中常见平台令牌：sk- / ghp_ / glpat- / xox*- / AKIA / Bearer */
-    | "known-token";
+    /** 值形态命中常见平台令牌：sk- / ghp_ / glpat- / xox*- / AKIA / Bearer / JWT / AIza / sk_live_ / npm_ / LTAI / AKID */
+    | "known-token"
+    /** 文件名 / 扩展名本身就是敏感载体（.env / id_rsa / *.pem / *.p12 / credentials / 压缩包…），与内容无关 */
+    | "sensitive-file";
   /** 脱敏后的上下文片段（含键名提示，不含完整密文） */
   snippet: string;
 };
@@ -1023,26 +1025,105 @@ const KNOWN_TOKEN_RULES: ReadonlyArray<{
     re: /\bBearer\s+([A-Za-z0-9._~+/=-]{20}[A-Za-z0-9._~+/=-]*)/i,
     needDigitAndLetter: true,
   },
+  // —— 以下为「值形态」补充（团队库上传审计）：都是前缀特异 + 定长 / 下限长度，不靠键名 ——
+  {
+    // JWT：header / payload 都是 `{"…` 的 base64url，必以 `eyJ` 开头；三段各 ≥ 8 位。
+    // 只带前两段的（无签名）不拦；官方示例签名由 findKnownTokens 的 JWT_SAMPLE_SIGNATURES 放过。
+    label: "令牌(JWT) ",
+    re: /(?<![A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]{8}[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]{8}[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{8}[A-Za-z0-9_-]*)/,
+    needDigitAndLetter: false,
+  },
+  {
+    // Google API key：`AIza` + 35 位，整串恰好 39 位；右侧不能再接 token 字符（更长的串不是它）
+    label: "令牌(AIza) ",
+    re: /(?<![A-Za-z0-9_-])(AIza[A-Za-z0-9_-]{35})(?![A-Za-z0-9_-])/,
+    needDigitAndLetter: true,
+  },
+  {
+    // Stripe live 密钥（sk_live_ / rk_live_）：test 模式（sk_test_）不算生产密钥、不拦；pk_live_ 是公开可发布密钥、不拦
+    label: "令牌(Stripe live) ",
+    re: /(?<![A-Za-z0-9_])((?:sk|rk)_live_[A-Za-z0-9]{16}[A-Za-z0-9]*)/,
+    needDigitAndLetter: true,
+  },
+  {
+    // npm 令牌：`npm_` + 36 位字母数字（不含下划线，所以 `npm_config_*` / `npm_package_*` 这类环境变量名不会误中）
+    label: "令牌(npm) ",
+    re: /(?<![A-Za-z0-9_])(npm_[A-Za-z0-9]{36})(?![A-Za-z0-9])/,
+    needDigitAndLetter: true,
+  },
+  {
+    // 阿里云 AccessKeyId：`LTAI` + 12~20 位字母数字（常见 LTAI4G… / LTAI5t… 共 20~24 位）；要求含数字，挡住纯字母单词
+    label: "令牌(阿里云 LTAI) ",
+    re: /(?<![A-Za-z0-9])(LTAI[A-Za-z0-9]{12,20})(?![A-Za-z0-9])/,
+    needDigitAndLetter: true,
+  },
+  {
+    // 腾讯云 SecretId：`AKID` + 32 位字母数字
+    label: "令牌(腾讯云 AKID) ",
+    re: /(?<![A-Za-z0-9])(AKID[A-Za-z0-9]{32})(?![A-Za-z0-9])/,
+    needDigitAndLetter: true,
+  },
 ];
 
-/** 一行里命中的已知形态令牌（原值，调用方只拿去脱敏）；每条规则最多取首个 */
+/** jwt.io 首页的示例令牌签名：文档 / 测试里最常见的 JWT 样例，不是真密钥 */
+const JWT_SAMPLE_SIGNATURES: ReadonlySet<string> = new Set([
+  "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+]);
+
+/**
+ * 全局版规则正则：只给 `matchAll` 用（它内部克隆一份再迭代，不会改这里的 lastIndex）。
+ * **不要**在这些共享实例上调 `exec` / `test`——带 `g` 标志会留下 lastIndex，污染下一次调用。
+ */
+const KNOWN_TOKEN_RULES_GLOBAL: ReadonlyArray<{
+  rule: (typeof KNOWN_TOKEN_RULES)[number];
+  re: RegExp;
+}> = KNOWN_TOKEN_RULES.map((rule) => ({
+  rule,
+  re: new RegExp(rule.re.source, rule.re.flags.includes("g") ? rule.re.flags : `${rule.re.flags}g`),
+}));
+
+/** 一行里同一条规则最多报几个不同的令牌（一行塞几十个令牌的压缩 / 日志行，报前几个足够让人去处理这一行） */
+const MAX_KNOWN_TOKENS_PER_RULE_PER_LINE = 20;
+/** 一行里同一条规则最多检视几个候选匹配（含被占位符 / 弱形态过滤掉的）：封顶，防几 MB 的单行里海量占位串拖慢扫描 */
+const MAX_KNOWN_TOKEN_CANDIDATES_PER_RULE_PER_LINE = 1000;
+
+/**
+ * 一行里命中的已知形态令牌（原值，调用方只拿去脱敏）。
+ * 每条规则报出这一行里**全部**不同的命中（以前只取首个：`a=AKIA… b=AKIA…` 只出一条，处理完第一个再推又被拦第二个），
+ * 每条规则每行有上限（见上面两个常量）；同一个值在同一行重复出现只报一次。
+ */
 const findKnownTokens = (line: string): Array<{ label: string; value: string }> => {
   const out: Array<{ label: string; value: string }> = [];
-  for (const rule of KNOWN_TOKEN_RULES) {
-    const m = rule.re.exec(line);
-    if (!m) continue;
-    const value = m[1]!;
-    if (isPlaceholderSecretValue(value)) continue;
-    // 去掉前缀后全是 x / * / 点横线 = 文档里的占位示例（ghp_xxxxxxxx…）
-    const body = value.replace(
-      /^(?:github_pat_|gh[pousr]_|glpat-|xox[a-z]-|sk-|AKIA|ASIA|Bearer\s+)/i,
-      "",
-    );
-    if (/^[xX*•._-]+$/.test(body)) continue;
-    if (rule.needDigitAndLetter && !(/\d/.test(value) && /[A-Za-z]/.test(value))) {
-      continue;
+  for (const { rule, re } of KNOWN_TOKEN_RULES_GLOBAL) {
+    let candidates = 0;
+    let accepted = 0;
+    let seen: Set<string> | null = null;
+    for (const m of line.matchAll(re)) {
+      if (++candidates > MAX_KNOWN_TOKEN_CANDIDATES_PER_RULE_PER_LINE) break;
+      const value = m[1]!;
+      if (isPlaceholderSecretValue(value)) continue;
+      // 去掉前缀后全是 x / * / 点横线 = 文档里的占位示例（ghp_xxxxxxxx…）
+      const body = value.replace(
+        /^(?:github_pat_|gh[pousr]_|glpat-|xox[a-z]-|sk-|AKIA|ASIA|Bearer\s+|AIza|(?:sk|rk)_live_|npm_|LTAI|AKID)/i,
+        "",
+      );
+      if (/^[xX*•._-]+$/.test(body)) continue;
+      // jwt.io 官方示例签名放过（只有 JWT 规则是这种三段结构）
+      if (
+        rule.label === "令牌(JWT) " &&
+        JWT_SAMPLE_SIGNATURES.has(value.slice(value.lastIndexOf(".") + 1))
+      ) {
+        continue;
+      }
+      if (rule.needDigitAndLetter && !(/\d/.test(value) && /[A-Za-z]/.test(value))) {
+        continue;
+      }
+      if (seen === null) seen = new Set();
+      if (seen.has(value)) continue;
+      seen.add(value);
+      out.push({ label: rule.label, value });
+      if (++accepted >= MAX_KNOWN_TOKENS_PER_RULE_PER_LINE) break;
     }
-    out.push({ label: rule.label, value });
   }
   return out;
 };
@@ -1692,6 +1773,86 @@ export const gateSensitiveUpload = (
 ): { blocked: false } | { blocked: true; hits: SecretScanHit[] } => {
   if (force || hits.length === 0) return { blocked: false };
   return { blocked: true, hits: [...hits] };
+};
+
+/** `.env.<后缀>` 里「模板 / 示例」后缀：内容该有占位符，不按文件名拦（内容里真有口令照样被内容扫描抓） */
+const ENV_TEMPLATE_SUFFIXES: ReadonlySet<string> = new Set([
+  "example", "sample", "template", "tmpl", "tpl", "dist", "default", "defaults", "schema", "stub",
+]);
+
+/** 扩展名即密钥 / 证书私钥 / 密钥库载体（不含 .crt / .cer 这类纯公开证书） */
+const SENSITIVE_KEY_EXTENSIONS: ReadonlySet<string> = new Set([
+  "pem", "key", "p12", "pfx", "pkcs12", "jks", "keystore", "ppk", "p8", "kdbx",
+]);
+
+/** 压缩包：内容扫描读不进去（含 NUL 的二进制整个跳过），里面夹带 .env / 私钥照样推上去，所以也要明确提示 */
+const ARCHIVE_EXTENSIONS: ReadonlySet<string> = new Set([
+  "zip", "tar", "tgz", "gz", "bz2", "xz", "7z", "rar",
+]);
+
+/** 固定文件名的凭据文件（全小写比较） */
+const SENSITIVE_EXACT_BASENAMES: ReadonlySet<string> = new Set([
+  ".netrc", "_netrc", ".pgpass", ".htpasswd", ".git-credentials", ".pypirc", ".dockercfg",
+  "secrets.json", "secrets.yml", "secrets.yaml", "secrets.toml",
+]);
+
+/**
+ * 文件名 / 扩展名是否本身就是敏感载体；返回命中原因（中文短语），不敏感返回 null。纯函数、大小写不敏感。
+ * 覆盖：`.env` / `.env.<环境>` / `*.env`（模板后缀 `.env.example` 等放过）、SSH 私钥 `id_rsa` / `id_ed25519` …（`.pub` 放过）、
+ * 私钥 / 密钥库扩展名（pem key p12 pfx jks keystore …；文件名本身就是 `.pem` / `.key` 这种点开头的单段名也算）、
+ * `credentials` 类、`.netrc` / `.pgpass` 等固定凭据文件、压缩包。
+ * 取最后一段文件名判断，目录名不参与（`skills/x/.env/readme.md` 不算）。
+ */
+export const classifySensitiveFilename = (relPath: string): string | null => {
+  const norm = relPath.replace(/\\/g, "/");
+  const base = norm.slice(norm.lastIndexOf("/") + 1).toLowerCase();
+  if (!base) return null;
+
+  // .env / .env.production / prod.env（`.env.example` 这类模板后缀放过）
+  if (base === ".env" || base.startsWith(".env.") || base.endsWith(".env")) {
+    const lastSeg = base.slice(base.lastIndexOf(".") + 1);
+    if (base === ".env" || !ENV_TEMPLATE_SUFFIXES.has(lastSeg)) {
+      return "环境变量文件（.env）";
+    }
+    return null;
+  }
+
+  // SSH 私钥：id_rsa / id_ed25519 / id_rsa_deploy；公钥 .pub 放过
+  if (/^id_(?:rsa|dsa|ecdsa|ed25519)(?:[._-].*)?$/.test(base)) {
+    return base.endsWith(".pub") ? null : "SSH 私钥";
+  }
+
+  if (SENSITIVE_EXACT_BASENAMES.has(base)) return "凭据文件";
+  // credentials / .credentials / credentials.json / credentials.yaml …
+  if (/^\.?credentials(?:\.[a-z0-9]+)?$/.test(base)) return "凭据文件（credentials）";
+
+  // 点开头的单段名（`.pem` / `.key` / `.p12`）：extensionOf 把「点在最前」当作无扩展名，
+  // 这类文件名整个就是扩展名，去掉开头那个点后再判一次（`.env*` 已在上面单独处理，模板后缀语义不受影响）
+  const ext = base.lastIndexOf(".") === 0 ? base.slice(1) : extensionOf(base);
+  if (SENSITIVE_KEY_EXTENSIONS.has(ext)) return `私钥 / 证书密钥库文件（.${ext}）`;
+  if (ARCHIVE_EXTENSIONS.has(ext)) return `压缩包（.${ext}，内容无法扫描）`;
+  return null;
+};
+
+/**
+ * 按文件名策略扫描待上传路径：命中即出一条 `sensitive-file` 命中（file=路径、line=1、snippet 只含原因，不含任何内容）。
+ * 沿用内容扫描同一套语义：有命中且未 force → 阻断上传，UI 走同一块「疑似敏感信息」列表 + 「强制上传」勾选。
+ */
+export const scanSensitiveFilenames = (
+  paths: readonly string[],
+): SecretScanHit[] => {
+  const hits: SecretScanHit[] = [];
+  for (const p of paths) {
+    const reason = classifySensitiveFilename(p);
+    if (reason === null) continue;
+    hits.push({
+      file: p.replace(/\\/g, "/"),
+      line: 1,
+      kind: "sensitive-file",
+      snippet: `敏感文件名：${reason}`,
+    });
+  }
+  return hits;
 };
 
 /** 一行提示（UI / API error 字段） */

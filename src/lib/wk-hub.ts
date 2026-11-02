@@ -51,6 +51,22 @@ export const normalizeHubUrl = (raw: string): string | null => {
   return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
 };
 
+/**
+ * 两个 Hub 地址是否同源（协议 + 主机 + 端口）。任一边为空 / 不是合法 http(s) URL → false。
+ * 探活路由据此决定「能不能把已落盘的 Token 发给这次要探的地址」：Token 只属于配置里那一个 Hub，
+ * 不能被请求体里随便填的地址借去（评审 P2）。
+ */
+export const isSameHubOrigin = (a: string, b: string): boolean => {
+  const na = normalizeHubUrl(a);
+  const nb = normalizeHubUrl(b);
+  if (!na || !nb) return false;
+  try {
+    return new URL(na).origin === new URL(nb).origin;
+  } catch {
+    return false;
+  }
+};
+
 /** 探针 URL */
 export const hubProbeUrl = (baseUrl: string): string =>
   `${baseUrl}${HUB_ARTIFACT_STATE_PATH}?artifactKey=${encodeURIComponent(

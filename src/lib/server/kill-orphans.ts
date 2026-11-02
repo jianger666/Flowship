@@ -55,7 +55,11 @@
  * # 注意
  * - 仅 best-effort：失败只 log、不抛、不阻断停止流程。
  * - macOS / Linux 通用（依赖 `ps` + `lsof`）；Windows 没有这俩、入口直接跳过
- *   （孤儿风险仍在、但树杀由壳退出时 taskkill /T 兜底、不值得为此接 wmic/CIM）。
+ *   （孤儿风险仍在、不值得为此接 wmic/CIM）。树杀的兜底**不再是**「壳退出时同步 taskkill /T /F」（R8-4 订正）：
+ *   壳现在先关 server 的 stdin 请它优雅退出，server 自己 process.exit 之后壳这边没有可用的 /T（死 pid 找不到根）；
+ *   所以优雅退出路径上改由 **server 自己**在退出清理同步做完之后 `taskkill /PID <自己> /T /F` 自杀整树
+ *   （src/lib/server/win-self-tree-kill.ts，仅 win32 + 仅壳的 stdin-EOF 分支）；server 不理会 EOF 才由壳 `/T /F`。
+ *   树杀按父子链走：中间进程先退（`start /b` / 脱离父进程的孙进程）会断链，那一类仍可能残留——未在 Windows 实机验证。
  * - **不要在 force-new-agent（换新 agent）场景做延迟二次扫**——新 agent 会在同仓拉起带同样签名的 shell、
  *   会被误杀。调用方应传 `{ delayedRescan: false }` 只做即时扫；真正停止 / 自然结束 / 报错保持默认二次扫
  *   （见 task-runner resume 路径 + stop / finally）。
@@ -222,7 +226,7 @@ const killOrphansInRepos = async (
 ): Promise<void> => {
   // Windows：没有 ps / lsof、这套「按 cwd 扫孤儿」实施不了——直接跳过、
   // 不让每次停止任务都白跑 + 打 error 日志（本保护本就 best-effort、
-  // Windows 端 agent 子进程树最终由壳退出时 taskkill /T 兜底）
+  // Windows 端 agent 子进程树最终由 server 优雅退出时自己 taskkill /T /F 自杀整树兜底，见文件头 R8-4 订正）
   if (process.platform === "win32") return;
   if (!workDirs || workDirs.length === 0) return;
   const repos = workDirs.map((p) => path.resolve(p));
@@ -345,6 +349,12 @@ type ManagedChildEntry = {
   label: string;
   /** 优雅停止（stdin EOF / SIGTERM）；勿 kill -9 */
   stop: () => Promise<void> | void;
+  /**
+   * 可选：退出前最后一道**同步**强杀（`process.exit` 之前由退出钩子调，评审 R1-9）。
+   * 只给「优雅停止可能比退出钩子上限还久」的子进程（如预览 dev server：TERM → 等 2s → KILL）。
+   * 必须同步、不 await、不进任何队列；自己在调用时刻查「此刻还有哪些进程」（别捕获登记时的快照）。
+   */
+  forceKill?: () => void;
 };
 
 const MANAGED_KEY = "__flowshipManagedChildrenV1__";
@@ -358,17 +368,55 @@ const getManagedMap = (): Map<string, ManagedChildEntry> => {
   return g[MANAGED_KEY]!;
 };
 
+/**
+ * 强杀登记表：与 MANAGED 分开存——`stopAllManagedChildren` 会清空 MANAGED，
+ * 但强杀要在「优雅停止没在上限内做完」之后才跑、不能因为 stop 已经被调用过就丢了。
+ */
+const FORCE_KILL_KEY = "__flowshipManagedForceKillsV1__";
+
+const getForceKillMap = (): Map<string, { label: string; fn: () => void }> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, { label: string; fn: () => void }> | undefined
+  >;
+  if (!g[FORCE_KILL_KEY]) g[FORCE_KILL_KEY] = new Map();
+  return g[FORCE_KILL_KEY]!;
+};
+
 /** 登记长驻子进程（幂等按 id 覆盖） */
 export const registerManagedChild = (
   id: string,
   entry: ManagedChildEntry,
 ): void => {
   getManagedMap().set(id, entry);
+  if (entry.forceKill) {
+    getForceKillMap().set(id, { label: entry.label, fn: entry.forceKill });
+  } else {
+    getForceKillMap().delete(id);
+  }
 };
 
 /** 注销（子进程已自行退出时调） */
 export const unregisterManagedChild = (id: string): void => {
   getManagedMap().delete(id);
+  getForceKillMap().delete(id);
+};
+
+/**
+ * 退出钩子在 `process.exit` 之前调：同步跑所有登记过的强杀（见 {@link ManagedChildEntry.forceKill}）。
+ * 不抛、不 await；单个失败不影响其它。
+ */
+export const forceKillAllManagedChildrenSync = (): void => {
+  for (const [id, { label, fn }] of [...getForceKillMap().entries()]) {
+    try {
+      fn();
+    } catch (err) {
+      console.warn(
+        `[kill-orphans] 强杀托管子进程失败 id=${id} label=${label}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
 };
 
 /** server 退出前：停掉所有登记的长驻子进程（best-effort） */

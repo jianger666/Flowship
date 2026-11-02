@@ -53,6 +53,7 @@ const fullTask = (over: Partial<Task> = {}): Task =>
     createdAt: Date.now(),
     updatedAt: Date.now(),
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
+    // 群答疑默认关闭（P0 硬化）：本文件测排队回放，夹具显式开启
     ...over,
   }) as unknown as Task;
 

@@ -37,9 +37,11 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   return { ...actual, createAgentSession: hoisted.createAgentSession, SessionManager };
 });
 
-vi.mock("@/lib/server/mcp-tool-bridge", () => ({
-  connectMcpServer: hoisted.connectMcpServer,
-}));
+vi.mock("@/lib/server/mcp-tool-bridge", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/server/mcp-tool-bridge")>();
+  // 只替换 connectMcpServer；dedupeBridgedToolNames 等走真实现（注册侧会调它）
+  return { ...actual, connectMcpServer: hoisted.connectMcpServer };
+});
 
 const { createCustomAgent, resumeCustomAgent } = await import(
   "@/lib/server/custom-agent-backend"
@@ -189,6 +191,41 @@ describe("resumeCustomAgent · 确定性失败不连 MCP、桥接后失败要关
     await expect(
       resumeCustomAgent(path.join(TMP, "gone.jsonl"), input({ mcpServers: undefined })),
     ).rejects.toMatchObject({ code: "E_SESSION_MISSING" });
+  });
+});
+
+describe("跨 server 工具名撞名：注册给 pi 的 customTools 名字必须唯一，且各自仍调回自己的 server（评审 P2 接线）", { timeout: 5000 }, () => {
+  type ToolDef = {
+    name: string;
+    execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+  };
+
+  it("两个 server 的工具 API 名相同 → 先注册的保留原名，后到的改名；调用各自路由到自己的 call", async () => {
+    // 模拟 server 名清洗 / 截断后撞名：两个 bridge 的工具都叫 mcp__shared__do
+    bridges = { a: makeBridge("a"), b: makeBridge("b") };
+    bridges.a!.tools[0]!.name = "mcp__shared__do";
+    bridges.b!.tools[0]!.name = "mcp__shared__do";
+    hoisted.createAgentSession.mockResolvedValue({ session: makeSession() });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createCustomAgent(input());
+      const opts = hoisted.createAgentSession.mock.calls[0]![0] as { customTools: ToolDef[] };
+      const mcpTools = opts.customTools.filter((t) => t.name.startsWith("mcp__shared__do"));
+      expect(mcpTools).toHaveLength(2);
+      const names = mcpTools.map((t) => t.name);
+      expect(new Set(names).size).toBe(2);
+      // 先到先得：配置顺序里的第一个 server（a）保留原名，已有 prompt / skill 引用不变
+      expect(names[0]).toBe("mcp__shared__do");
+      expect(names[1]).toMatch(/^mcp__shared__do_[0-9a-f]{6}$/);
+      // 各自仍调回自己的 server（改名只改注册名，不改 call 闭包里的原 MCP 名）
+      await mcpTools[0]!.execute("c1", {});
+      await mcpTools[1]!.execute("c2", {});
+      expect(bridges.a!.call).toHaveBeenCalledTimes(1);
+      expect(bridges.b!.call).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

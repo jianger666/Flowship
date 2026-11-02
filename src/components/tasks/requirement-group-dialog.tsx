@@ -36,6 +36,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useDialog } from "@/hooks/use-dialog";
+import { createGenerationGuard, resolveFailureLanding, resolveLanding } from "@/lib/cancel-slot";
 import { describeAlsoBoundBy } from "@/lib/group-also-bound";
 import {
   bindRequirementGroup,
@@ -182,23 +183,64 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     }
   }, []);
 
+  // 请求在途时也允许关弹窗（Esc / X / 取消）：以前 busy 一律拦下，请求挂住（飞书 / 网络慢）时用户只能干等到服务端超时。
+  // 在途状态（autoBusy / bindBusy / clearing）住在本组件、不随弹窗内容卸载而丢——关掉再打开主按钮仍是转圈、
+  // 不会二次提交；请求落地后照常 toast + onTaskUpdate，用户不会错过结果。
   const close = useCallback(
     (next: boolean) => {
-      if (busy) return;
       onOpenChange(next);
     },
-    [busy, onOpenChange],
+    [onOpenChange],
+  );
+
+  // 打开代际：每次打开领新代号、关闭作废；**同一实例换任务（taskId 变、open 不翻转）也算换了一代**。
+  // 请求在途时用户可能关掉再重开（见上面 close 的说明）或调用方直接换任务，旧请求成功后的「关弹窗」
+  // 只对发起它的那一代生效——否则会把用户刚重新打开 / 刚切到的新任务的对话框关掉。
+  // toast / onTaskUpdate 不受影响（结果照常落地）；旧一代落地但弹窗还开着时刷新绑定卡（见 landSuccess）。
+  // 失败分支同口径（见 landFailure）：内联错误 / rebuild 引导只写给发起它的那一代，旧一代失败改 toast 兜底。
+  // cleanup 里 invalidate：依赖变化（关闭 / 换任务）后紧接着的 effect 体会重新 next()（同一次 flush、无异步窗口），
+  // 所以只有**卸载**时才真正落在「无存活代」——此后在途请求落地全部丢弃（不再回调 onOpenChange / 触发 refresh）
+  const [sessionGuard] = useState(createGenerationGuard);
+  useEffect(() => {
+    if (open) sessionGuard.next();
+    else sessionGuard.invalidate();
+    return () => sessionGuard.invalidate();
+  }, [open, taskId, sessionGuard]);
+  // 取「最新的」loadStatus：请求闭包里的 loadStatus 绑的是发请求时的 taskId，切任务后直接用会把旧任务状态刷进新任务的卡
+  const loadStatusRef = useRef(loadStatus);
+  loadStatusRef.current = loadStatus;
+  // 请求成功后的收尾：同一代 → 关弹窗；弹窗已换代但还开着 → 刷新绑定卡（旧请求改了绑定、新一代开场拉的状态已过期）；已关 → 无事
+  const landSuccess = useCallback(
+    (gen: number) => {
+      const action = resolveLanding(sessionGuard, gen);
+      if (action === "close") onOpenChange(false);
+      else if (action === "refresh") void loadStatusRef.current();
+    },
+    [onOpenChange, sessionGuard],
+  );
+  // 请求失败后的收尾：同一代 → 写内联错误 / rebuild 引导（applyInline）；弹窗已换代 / 已关 / 已卸载 → 不写内联状态
+  // （否则任务 A 在途请求失败，会把 A 的 rebuild 引导 / 错误带进已切到的任务 B 的弹窗），改 toast 兜底让用户仍知道失败；
+  // toastMessage 为 null 表示这类引导（如 needGroupRebuild）旧一代直接丢弃、不打扰——重开后再点一次就会重新得到。
+  // busy 标志（autoBusy / bindBusy / clearing）不走这里：它代表「还有请求在飞」、必须由发起它的请求自己清（见各 run* 的 finally）
+  const landFailure = useCallback(
+    (gen: number, toastMessage: string | null, applyInline: () => void) => {
+      if (resolveFailureLanding(sessionGuard, gen) === "inline") applyInline();
+      else if (toastMessage) toast.error(toastMessage);
+    },
+    [sessionGuard],
   );
 
   const runAuto = useCallback(async () => {
     if (busy) return;
     resetTransient();
+    const gen = sessionGuard.current();
+    const failAuto = (message: string) => landFailure(gen, message, () => setAutoError(message));
     setAutoBusy(true);
     try {
       const r = await ensureRequirementGroup(taskId);
       if (r.ok) {
         if (!r.chatId.trim()) {
-          setAutoError("需求群创建成功但缺少群 id");
+          failAuto("需求群创建成功但缺少群 id");
           return;
         }
         // membershipUnknown 别丢，没确认本人在群里必须告诉用户去看一眼
@@ -207,52 +249,63 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
           : r.chatName ? `需求群「${r.chatName}」已就绪` : "需求群已就绪";
         toast.success(r.membershipUnknown ? `${base}，但没确认你在群里，进群看一眼` : base);
         if (r.task) onTaskUpdateRef.current(r.task);
-        onOpenChange(false);
+        landSuccess(gen);
         return;
       }
       if (r.needGroupRebuild && r.chatId) {
-        setRebuild({ chatId: r.chatId, chatName: r.chatName });
+        const { chatId, chatName } = r;
+        landFailure(gen, null, () => setRebuild({ chatId, chatName }));
         return;
       }
-      setAutoError(r.error || "创建需求群失败");
+      failAuto(r.error || "创建需求群失败");
     } catch (err) {
-      setAutoError(err instanceof Error ? `创建需求群失败：${err.message}` : "创建需求群失败");
+      failAuto(err instanceof Error ? `创建需求群失败：${err.message}` : "创建需求群失败");
     } finally {
       setAutoBusy(false);
     }
-  }, [busy, onOpenChange, resetTransient, taskId]);
+  }, [busy, landFailure, landSuccess, resetTransient, sessionGuard, taskId]);
 
   const runRebuild = useCallback(async () => {
     if (!rebuild || busy) return;
+    // gen 必须在 await confirm 之前取：确认期间弹窗可能换了任务 / 被关 / 卸载，闭包里的 taskId、rebuild 还是旧上下文——
+    // 若 confirm 之后才取，拿到的是「新一代」的代号，旧任务的请求落地时会被当成当前代（关掉新任务的框、把错误写进新任务的卡）
+    const gen = sessionGuard.current();
     const ok = await confirm({
       title: rebuild.chatName ? `你已不在「${rebuild.chatName}」` : "你已不在原来的需求群",
       description: "重建一个需求群？只记本任务，飞书项目上的群绑定不受影响。",
       confirmLabel: "重新建群",
     });
     if (!ok) return;
+    // 确认期间已换代：用户确认的是旧上下文（旧任务的 chatId）、现在看到的是别的弹窗，不替他执行
+    if (!sessionGuard.isCurrent(gen)) return;
     resetTransient();
+    const failRebuild = (message: string) =>
+      landFailure(gen, message, () => {
+        setAutoError(message);
+        setRebuild(null);
+      });
     setAutoBusy(true);
     try {
       const r = await ensureRequirementGroup(taskId, { recreateFrom: rebuild.chatId });
       if (r.ok) {
         toast.success(r.chatName ? `已建群「${r.chatName}」` : "已建需求群");
         if (r.task) onTaskUpdateRef.current(r.task);
-        onOpenChange(false);
+        landSuccess(gen);
         return;
       }
       // 重建那一发不再套第二层引导，直接收口
-      setAutoError(r.error || "重建需求群失败");
-      setRebuild(null);
+      failRebuild(r.error || "重建需求群失败");
     } catch (err) {
-      setAutoError(err instanceof Error ? `重建失败：${err.message}` : "重建失败");
-      setRebuild(null);
+      failRebuild(err instanceof Error ? `重建失败：${err.message}` : "重建失败");
     } finally {
       setAutoBusy(false);
     }
-  }, [busy, confirm, onOpenChange, rebuild, resetTransient, taskId]);
+  }, [busy, landFailure, landSuccess, confirm, rebuild, resetTransient, sessionGuard, taskId]);
 
   const runBind = useCallback(async () => {
     if (busy) return;
+    // gen 在任何 await（两次 confirm）之前取，理由同 runRebuild
+    const gen = sessionGuard.current();
     setFieldError(null);
     setBindError(null);
     setBindBotLabel(null);
@@ -290,6 +343,8 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
       });
       if (!trusted) return;
       writeTrustedGroupAck(ackStorage);
+      // 确认期间已换代：不替用户继续（ack 是用户确认过的事实，已写入、以后不再打断）
+      if (!sessionGuard.isCurrent(gen)) return;
     }
     // 覆盖写二次确认：旧群立即收不到本任务的消息，不是可以随手点的操作
     if (bound) {
@@ -302,7 +357,10 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
         destructive: true,
       });
       if (!ok) return;
+      // 覆盖写是 destructive：确认期间弹窗已换代（换任务 / 关闭 / 卸载）就不执行——闭包里的 bound / parsed 是旧上下文
+      if (!sessionGuard.isCurrent(gen)) return;
     }
+    const failBind = (message: string) => landFailure(gen, message, () => setBindError(message));
     setBindBusy(true);
     try {
       const r = await bindRequirementGroup(taskId, parsed);
@@ -323,28 +381,32 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
           toast.warning(describeAlsoBoundBy(r.alsoBoundBy), { duration: 10_000 });
         }
         onTaskUpdateRef.current(r.task);
-        onOpenChange(false);
+        landSuccess(gen);
         return;
       }
       if (r.code === "invalid_input") {
-        setFieldError(r.error);
+        landFailure(gen, r.error, () => setFieldError(r.error));
         return;
       }
       if (r.code === "bot_not_in_group") {
-        setBindBotLabel(r.botLabel ?? null);
-        setBindError(r.error);
+        landFailure(gen, r.error, () => {
+          setBindBotLabel(r.botLabel ?? null);
+          setBindError(r.error);
+        });
         return;
       }
-      setBindError(r.error || "绑定失败");
+      failBind(r.error || "绑定失败");
     } catch (err) {
-      setBindError(err instanceof Error ? `绑定失败：${err.message}` : "绑定失败");
+      failBind(err instanceof Error ? `绑定失败：${err.message}` : "绑定失败");
     } finally {
       setBindBusy(false);
     }
-  }, [bound, busy, confirm, manualInput, onOpenChange, taskId]);
+  }, [bound, busy, landFailure, landSuccess, confirm, manualInput, sessionGuard, taskId]);
 
   const runClear = useCallback(async () => {
     if (!bound || busy) return;
+    // gen 在 await confirm 之前取，理由同 runRebuild
+    const gen = sessionGuard.current();
     const ok = await confirm({
       title: "取消关联？",
       description: "取消后回到项目群默认。飞书项目上的群绑定不受影响。",
@@ -352,19 +414,21 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
       destructive: true,
     });
     if (!ok) return;
+    // 确认期间已换代：destructive 操作不替用户执行（闭包里的 taskId 是旧上下文）
+    if (!sessionGuard.isCurrent(gen)) return;
     setClearing(true);
     try {
       const r = await clearRequirementGroupBind(taskId);
       // cleared=false 只可能发生在竞态（按钮只在 source=task 时渲染）：如实报，不谎报成功
       toast.success(r.cleared ? "已取消关联，回到项目群默认" : "本来就没有手动关联，已经是项目群默认");
       onTaskUpdateRef.current(r.task);
-      onOpenChange(false);
+      landSuccess(gen);
     } catch (err) {
       toast.error(err instanceof Error ? `取消关联失败：${err.message}` : "取消关联失败");
     } finally {
       setClearing(false);
     }
-  }, [bound, busy, confirm, onOpenChange, taskId]);
+  }, [bound, busy, landSuccess, confirm, sessionGuard, taskId]);
 
   // rebuild 存在时自动模式的主按钮即重建：再跑一遍不带 recreateFrom 的 runAuto 只会
   // 又撞回 needGroupRebuild、白转一圈，所以不给用户留第二个“该点哪个”的选择
@@ -547,8 +611,8 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
         )}
 
         <DialogFooter className="gap-2">
-          <Button type="button" variant="outline" disabled={busy} onClick={() => close(false)}>
-            取消
+          <Button type="button" variant="outline" onClick={() => close(false)}>
+            {busy ? "关闭" : "取消"}
           </Button>
           {mode === "auto" ? (
             <Button type="button" disabled={busy || noStory} onClick={() => void primary.onClick()} variant={primary.destructive ? "destructive" : "default"}>

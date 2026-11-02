@@ -1278,10 +1278,20 @@ export interface TaskRepoChanges {
   /** 当前分支就是线上分支本身（只会有未提交 / 未推送的改动） */
   onBaseBranch?: boolean;
   files: TaskChangeFile[];
-  /** files 里列出的全部文件的合计（files 被截断时仍按全量算） */
+  /**
+   * files 里列出的全部文件的合计（files 因文件数超上限被截断时仍按全量算）。
+   * 例外：`listOverflow` 为 true 时只是 git 已读到部分的合计——**下限**，不是全量。
+   */
   totals: { files: number; added: number; removed: number };
   /** 文件数超过上限、files 只列了前一部分 */
   filesTruncated?: boolean;
+  /**
+   * git 的清单类输出（name-status / numstat）超过缓冲上限、被截断读取（海量改动：误提交 node_modules / 构建产物 / 大规模格式化）。
+   * 此时 `totals` 是**下限**——前端应显示「至少 N 个文件 / ≥ N 行」，而不是「共 N 个」当精确值。
+   * - name-status 被截断：同时带 `filesTruncated`，`totals.files` 与行数都是下限；
+   * - 只有 numstat 被截断：文件清单是全的（`totals.files` 精确），但 `added` / `removed` 只是下限、部分文件行数为 null。
+   */
+  listOverflow?: boolean;
   /** 未跟踪文件清单读取失败 / 超限、新文件可能没列全 */
   untrackedSkipped?: boolean;
   /** 本次读取用的范围（原样回显，前端据此丢弃过期响应） */

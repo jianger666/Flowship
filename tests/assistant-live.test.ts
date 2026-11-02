@@ -60,6 +60,56 @@ describe("planAssistantSnapshot", () => {
   });
 });
 
+describe("planAssistantSnapshot：snap.id 比对（本地已绑定的快照段 id）", () => {
+  it("本地没绑定过 id（null / 缺省）：行为与改前完全一致（只看文本）", () => {
+    expect(planAssistantSnapshot("你好", snap("你好，世界"), null)).toEqual({
+      kind: "extend",
+      target: "你好，世界",
+    });
+    expect(planAssistantSnapshot("你好，世界", snap("你好"), null)).toEqual({ kind: "keep" });
+  });
+
+  it("id 相同：照旧按文本前缀走（extend / keep）", () => {
+    expect(planAssistantSnapshot("你好", snap("你好，世界"), "e1")).toEqual({
+      kind: "extend",
+      target: "你好，世界",
+    });
+    expect(planAssistantSnapshot("你好，世界", snap("你好"), "e1")).toEqual({ kind: "keep" });
+  });
+
+  it("id 不同、本地有残留（上一段没清掉）：即便文本互为前缀也整段替换，不 extend / keep 到别的段上", () => {
+    // 上一段本地更长、新段文本恰好是它的前缀：改前会 keep、把新段的后续帧接到旧段尾巴上
+    expect(planAssistantSnapshot("好的，世界", snap("好的"), "e0")).toEqual({
+      kind: "replace",
+      target: "好的",
+    });
+    // 新段更长、以旧段为前缀：改前会 extend（保留旧段已上屏长度），属于跨段拼接
+    expect(planAssistantSnapshot("好的", snap("好的，世界"), "e0")).toEqual({
+      kind: "replace",
+      target: "好的，世界",
+    });
+  });
+
+  it("id 不同但文本一致：视觉上无差别，不动（由调用方更新绑定 id）", () => {
+    expect(planAssistantSnapshot("一致", snap("一致"), "e0")).toEqual({ kind: "keep" });
+  });
+
+  it("id 不同但快照为空 / null：仍是 clear", () => {
+    expect(planAssistantSnapshot("残留", null, "e0")).toEqual({ kind: "clear" });
+    expect(planAssistantSnapshot("残留", snap(""), "e0")).toEqual({ kind: "clear" });
+  });
+
+  it("use-smooth-streaming 接线：记住已绑定的快照段 id、清流时复位、交给 planAssistantSnapshot", () => {
+    const src = readFileSync(
+      path.resolve(import.meta.dirname, "..", "src/components/tasks/use-smooth-streaming.ts"),
+      "utf-8",
+    );
+    expect(src).toContain("snapshotIdRef");
+    expect(src).toMatch(/snapshotIdRef\.current = null;/);
+    expect(src).toMatch(/planAssistantSnapshot\([\s\S]*?snapshotIdRef\.current,?\s*\)/);
+  });
+});
+
 describe("shouldClearStreamingOnEvent：bootstrap 回放不清流", () => {
   const msg = (extra: Partial<TaskEvent> = {}): TaskEvent =>
     ({ id: "x", ts: 1, kind: "assistant_message", text: "t", ...extra }) as TaskEvent;

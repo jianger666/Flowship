@@ -44,6 +44,9 @@
  * - **重试预算耗尽不再静默停更**：连续 6 次建连失败（约 22s 退避）后进入「休眠待重连」——
  *   提示一次（带 resume 句柄供「重连」按钮）、之后靠 online / 页面回可见 / 60s 兜底（仅可见且在线）
  *   自动重连，唤醒后预算清零；页面隐藏时不重试。
+ * - **重连等待可被唤醒**：干净断流后的 1s 等待 / 失败退避不只靠 setTimeout——窗口隐藏久了 Chromium 会把定时器节流到约每分钟一次，
+ *   回来后最长要停在断开状态一分钟。等待期间同时监听 `visibilitychange`（变回可见）和 `online`，任一触发立刻结束等待、马上重连
+ *   （listenWatchWake；结束 / 卸载必摘监听、SSR 安全）。
  * - **预算只在「稳定连接」后清零（Q16-01）**：建连（首个合法 bootstrap 帧）只记时刻，连接结束时撑过 2s
  *   （WATCH_STABLE_CONNECTION_MS）才清零；建连后立刻被掐断 / 回调立刻抛错的连接按失败累计，
  *   不会因为「每轮都先建连、先清零」而永远攒不到上限（永不休眠、不提示、静默无限重连）。
@@ -75,6 +78,7 @@ import {
 } from "@/lib/watch-reconnect";
 import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import type { AssistantSnapshot } from "@/lib/assistant-live";
+import type { LiveToolOutputSnapshotEntry } from "@/lib/live-tool-outputs";
 import type { ThinkingSnapshot } from "@/lib/thinking-live";
 import type { StorageDegradedState } from "@/lib/storage-degraded";
 import type { TalkQueueItem } from "@/lib/talk-queue";
@@ -90,6 +94,28 @@ export {
   WATCH_MAX_TRANSIENT_FAILURES,
   WATCH_UNAVAILABLE_BACKOFF_CAP_MS,
 } from "@/lib/task-terminal";
+
+/**
+ * 重连等待的唤醒源：页面变回可见（`visibilitychange` 且 `!document.hidden`）/ 网络恢复（`window` 的 `online`）——
+ * 任一触发就调 wake，让重连立刻开始而不是干等定时器（隐藏久了定时器会被浏览器节流到约每分钟一次）。
+ * 返回「摘监听」函数（幂等）；SSR / 无 window、document 的环境返回空操作，不抛。
+ * 只在等待期间挂（每次 delay 一对）、结束必摘，不常驻、不泄漏。
+ */
+export const listenWatchWake = (wake: () => void): (() => void) => {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return () => {};
+  }
+  const onVisibility = () => {
+    // 变成 hidden 不算：只有回到前台才值得立刻重连
+    if (!document.hidden) wake();
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  window.addEventListener("online", wake);
+  return () => {
+    document.removeEventListener("visibilitychange", onVisibility);
+    window.removeEventListener("online", wake);
+  };
+};
 
 export interface UseTaskWatchCallbacks {
   /**
@@ -115,6 +141,12 @@ export interface UseTaskWatchCallbacks {
    * 前端铺上再接着拼、不只剩后半截）；null = 没在吐字（清掉本地残留的流式文字）
    */
   onAssistantSnapshot?: (snapshot: AssistantSnapshot | null) => void;
+  /**
+   * 进行中 shell 输出的快照：每次（重）连接 bootstrap 恰好一帧（在正文快照之后、思考快照之前）。
+   * 数组 = 此刻在跑的 shell 各自已发出的尾部窗口——调用方按**替换**语义整份铺上直播缓冲
+   * （不是追加型 delta，否则会和重连后的增量重复）；空数组 = 没有在跑的 shell，清掉本地残留的直播缓冲
+   */
+  onToolOutputSnapshot?: (outputs: LiveToolOutputSnapshotEntry[]) => void;
   /** origin 有值 = 旁路群答疑 run 的 done，不是属主主 run 的（见 owner-run-signal.planDoneFrame） */
   onDone?: (task: Task, ok: boolean, origin?: string) => void;
   // SSE envelope 里的 error 帧（服务端主动发的协议错误）
@@ -208,14 +240,24 @@ export const useTaskWatch = (
       wakeBackoff = null;
     };
 
+    // 重连等待（干净断流后的 1s / 失败退避）：到点、页面变回可见 / 网络恢复（listenWatchWake）、卸载三条出口
+    // 都收敛到 finish——清定时器 + 摘监听 + resolve，幂等。
+    // 只靠 setTimeout 不够：窗口隐藏久了 Chromium 会把定时器节流到约每分钟一次，回来后最长要停在断开状态一分钟
     const delay = (ms: number) =>
       new Promise<void>((resolve) => {
-        wakeBackoff = resolve;
-        backoffTimer = setTimeout(() => {
-          backoffTimer = undefined;
+        let detachWake: () => void = () => {};
+        const finish = () => {
+          if (backoffTimer !== undefined) {
+            clearTimeout(backoffTimer);
+            backoffTimer = undefined;
+          }
+          detachWake();
           wakeBackoff = null;
           resolve();
-        }, ms);
+        };
+        wakeBackoff = finish;
+        backoffTimer = setTimeout(finish, ms);
+        detachWake = listenWatchWake(finish);
       });
 
     // 退避预算耗尽后的「休眠待重连」状态机在 lib/watch-reconnect.ts（可单测）：
@@ -292,6 +334,10 @@ export const useTaskWatch = (
           onAssistantSnapshot: (snapshot) => {
             if (cancelled) return;
             callbacksRef.current.onAssistantSnapshot?.(snapshot);
+          },
+          onToolOutputSnapshot: (outputs) => {
+            if (cancelled) return;
+            callbacksRef.current.onToolOutputSnapshot?.(outputs);
           },
           onDone: (t, ok, origin) => {
             if (cancelled) return;

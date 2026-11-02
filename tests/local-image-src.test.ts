@@ -117,3 +117,47 @@ describe("toLoadableImageSrc", () => {
     );
   });
 });
+
+describe("toLoadableImageSrc：file:// URL 的路径按 URL 规则百分号解码", () => {
+  // /api/local-image?path= 的 path 参数服务端只解一层 query 编码——本地路径必须是真实磁盘路径
+  const pathParam = (src: string): string =>
+    new URL(src, "http://x").searchParams.get("path") ?? "";
+
+  it("空格 / 中文 / 括号：%20 %E4%B8%AD 解回真实字符再进通道", () => {
+    const src = toLoadableImageSrc("file:///Users/me/a%20b/%E4%B8%AD%E6%96%87.png");
+    expect(src.startsWith("/api/local-image?path=")).toBe(true);
+    expect(new URL(src, "http://x").searchParams.get("path")).toBe("/Users/me/a b/中文.png");
+  });
+
+  it("Windows 盘符 file:///C:/…%20…：先去前导 / 再解码", () => {
+    const src = toLoadableImageSrc("file:///C:/Users/me/My%20Pics/a.png");
+    expect(new URL(src, "http://x").searchParams.get("path")).toBe("C:/Users/me/My Pics/a.png");
+  });
+
+  it("非法 % 序列兜底：不抛错、按原样（未解码）进通道", () => {
+    const src = toLoadableImageSrc("file:///Users/me/100%.png");
+    expect(new URL(src, "http://x").searchParams.get("path")).toBe("/Users/me/100%.png");
+    const bad = toLoadableImageSrc("file:///Users/me/%E4%B8.png");
+    expect(new URL(bad, "http://x").searchParams.get("path")).toBe("/Users/me/%E4%B8.png");
+  });
+
+  it("解出 NUL（%00）：不采用解码结果、原样（未解码）进通道", () => {
+    const src = toLoadableImageSrc("file:///Users/me/a%00.png");
+    expect(new URL(src, "http://x").searchParams.get("path")).toBe("/Users/me/a%00.png");
+  });
+
+  it("解码后变成 UNC 形态（%2F%2Fhost）：拒绝、返回空串，不能借编码绕过 UNC 守卫", () => {
+    expect(toLoadableImageSrc("file:///%2Fhost/share/a.png")).toBe("");
+    expect(toLoadableImageSrc("file:///%5C%5Chost/share/a.png")).toBe("");
+  });
+
+  it("裸本地路径里的 % 是文件名本身的字符：不解码", () => {
+    const src = toLoadableImageSrc("/Users/me/a%20b.png");
+    expect(pathParam(src)).toBe("/Users/me/a%20b.png");
+  });
+
+  it("普通 file:// 无编码路径：行为不变", () => {
+    const src = toLoadableImageSrc("file:///Users/me/a.png");
+    expect(new URL(src, "http://x").searchParams.get("path")).toBe("/Users/me/a.png");
+  });
+});

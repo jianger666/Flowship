@@ -19,6 +19,7 @@ import { formatDurationCoarse } from "@/lib/duration-display";
 import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
 import { liveOutputTailLine } from "@/lib/live-output-cap";
 import { THINKING_LIVE_LABEL, type LiveThinking } from "@/lib/thinking-live";
+import { sliceHeadSafe } from "@/lib/text-slice";
 import type { TaskEvent } from "@/lib/types";
 import {
   parseTaskToolArgs,
@@ -681,7 +682,7 @@ const DETAIL_MAX = 80;
 const clipDetail = (s: string, max = DETAIL_MAX): string => {
   const flat = s.replace(/\s+/g, " ").trim();
   if (flat.length <= max) return flat;
-  return `${flat.slice(0, max)}…`;
+  return `${sliceHeadSafe(flat, max)}…`;
 };
 
 /** liveOutput 取末行再截断 */

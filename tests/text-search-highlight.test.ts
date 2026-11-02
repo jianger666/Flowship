@@ -64,3 +64,53 @@ describe("跨平台快捷键标签", () => {
     expect(getModFShortcutLabel("linux")).toBe("Ctrl+F");
   });
 });
+
+describe("findOccurrenceRanges：toLowerCase 改变长度时偏移要映射回原文", () => {
+  // "İ".toLowerCase() === "i̇"（2 个码元），整串小写后下标会比原文靠后
+  const I_DOT = "\u0130";
+
+  it("İ 在命中前：命中区间按原文偏移、能切回原词", () => {
+    const text = `${I_DOT}${I_DOT}abc`;
+    const ranges = findOccurrenceRanges(text, "abc");
+    expect(ranges).toEqual([{ start: 2, end: 5 }]);
+    expect(text.slice(ranges[0].start, ranges[0].end)).toBe("abc");
+  });
+
+  it("命中本身包含 İ：区间覆盖整个原字符", () => {
+    const text = `x${I_DOT}y`;
+    const ranges = findOccurrenceRanges(text, `${I_DOT}y`);
+    expect(ranges.length).toBe(1);
+    expect(text.slice(ranges[0].start, ranges[0].end)).toBe(`${I_DOT}y`);
+  });
+
+  it("查询词带 İ 时区间长度按原文计，不是小写后的 q.length", () => {
+    const text = `a${I_DOT}b`;
+    const ranges = findOccurrenceRanges(text, I_DOT);
+    expect(ranges).toEqual([{ start: 1, end: 2 }]);
+  });
+
+  it("多处命中、中间夹 İ：每处都对得上原文", () => {
+    const text = `foo ${I_DOT} foo ${I_DOT}${I_DOT} FOO`;
+    const ranges = findOccurrenceRanges(text, "foo");
+    expect(ranges.map((r) => text.slice(r.start, r.end))).toEqual(["foo", "foo", "FOO"]);
+  });
+
+  it("区间不越界、不重叠、严格递增", () => {
+    const text = `${I_DOT}i${I_DOT}i${I_DOT}`;
+    const ranges = findOccurrenceRanges(text, "i");
+    let prevEnd = 0;
+    for (const r of ranges) {
+      expect(r.start).toBeGreaterThanOrEqual(prevEnd);
+      expect(r.end).toBeGreaterThan(r.start);
+      expect(r.end).toBeLessThanOrEqual(text.length);
+      prevEnd = r.end;
+    }
+  });
+
+  it("长度不变的普通文本（含中文 / emoji）行为不变", () => {
+    expect(findOccurrenceRanges("你好 Hello 😀 hello", "hello")).toEqual([
+      { start: 3, end: 8 },
+      { start: 12, end: 17 },
+    ]);
+  });
+});

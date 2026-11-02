@@ -31,6 +31,7 @@ import { pipeline } from "node:stream/promises";
 import { buildOpenUrlSpec } from "@/lib/local-file-os";
 
 import { dataRoot, renameWithRetry } from "./data-root";
+import { stripHostInjectedEnvAndGitToken } from "./host-env";
 import { enqueueMeegle } from "./meegle-queue";
 import {
   suspendBinaryUsers,
@@ -742,6 +743,30 @@ export const cancelAllLogins = async (): Promise<void> => {
   await Promise.all(LOGIN_TOOLS.map((tool) => cancelLogin(tool)));
 };
 
+/** meegle 默认 host（飞书项目国内版） */
+const DEFAULT_MEEGLE_HOST = "project.feishu.cn";
+
+/**
+ * 可写进 meegle 全局配置的 host 白名单：必须是 feishu.cn / larksuite.com / larkoffice.com / meegle.com 下的域名。
+ * 评审 P2：`meegleHost` 原来完全不校验、原样 `meegle config set host <host>` 写进全局配置（之后所有 meegle 调用与 OAuth 都会打向它），
+ * 还能以 `--xxx` 形态被 CLI 当选项解析；而设置页根本不传这个字段，等于一个白开的攻击面——白名单收窄、不影响现有 UI。
+ */
+const MEEGLE_HOST_ALLOWED =
+  /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:feishu\.cn|larksuite\.com|larkoffice\.com|meegle\.com)$/i;
+
+/**
+ * 归一并校验 meegle host：缺省 → 默认域名；容忍首尾空白、可选的 `https://` 前缀与末尾 `/`；
+ * 不在白名单（含带端口 / 路径 / 用户信息 / 空白 / 以 `-` 开头）→ null。
+ */
+export const normalizeMeegleHost = (raw: unknown): string | null => {
+  if (raw === undefined || raw === null) return DEFAULT_MEEGLE_HOST;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return DEFAULT_MEEGLE_HOST;
+  const bare = trimmed.replace(/^https:\/\//i, "").replace(/\/$/, "");
+  return MEEGLE_HOST_ALLOWED.test(bare) ? bare.toLowerCase() : null;
+};
+
 /**
  * 发起登录（后台 spawn、UI 轮询 getLoginState + 状态接口收敛）：
  * - lark-cli：没配置过 → `config init --new`（浏览器建应用 + 授权）；有配置 → `auth login --recommend`
@@ -751,6 +776,11 @@ export const startLogin = async (
   tool: "lark-cli" | "meegle",
   opts: { meegleHost?: string } = {},
 ): Promise<{ ok: boolean; error?: string }> => {
+  // host 校验放在登记登录状态之前：非法入参不该留下一个 running 的登录态
+  const meegleHost = tool === "meegle" ? normalizeMeegleHost(opts.meegleHost) : null;
+  if (tool === "meegle" && meegleHost === null) {
+    return { ok: false, error: "meegle host 不合法（只允许 feishu.cn / larksuite.com / larkoffice.com / meegle.com 下的域名）" };
+  }
   const logins = getLogins();
   const existing = logins.get(tool);
   if (existing?.running) return { ok: false, error: "登录流程已在进行中" };
@@ -770,7 +800,7 @@ export const startLogin = async (
     args = hasConfig ? ["auth", "login", "--recommend"] : ["config", "init", "--new"];
   } else {
     cmd = meegleBin();
-    const host = opts.meegleHost?.trim() || "project.feishu.cn";
+    const host = meegleHost ?? DEFAULT_MEEGLE_HOST;
     // config set/init 是短命调用 → 入 meegle 串行队列（防与看板探测并发撞凭据）
     try {
       await enqueueMeegle(() =>
@@ -824,7 +854,9 @@ export const startLogin = async (
     const child = spawn(cmd, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
-      env: process.env,
+      // 不带 GitLab PAT / 宿主注入变量（ELECTRON_RUN_AS_NODE 等）：登录进程会再派生浏览器 / 回调服务，
+      // PAT 与它无关；PATH / HOME / 代理等照常保留（stripHostInjectedEnvAndGitToken 只摘这两类）
+      env: stripHostInjectedEnvAndGitToken(),
     });
     // 登记子进程 + 总时限：超时 / 取消靠这两样才杀得到、也等得到它
     const children = getLoginChildren();
@@ -881,6 +913,8 @@ export const startLogin = async (
                   detached: true,
                   stdio: "ignore",
                   windowsHide: true,
+                  // 浏览器是长寿命 GUI 进程树，整份 env 会被它的子进程一路继承——不带 PAT / 宿主注入变量
+                  env: stripHostInjectedEnvAndGitToken(),
                 })
                   // 找不到 opener（ENOENT 等）会异步 emit error、不监听会变成未捕获异常
                   .on("error", () => {})

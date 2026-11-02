@@ -13,6 +13,7 @@ import path from "node:path";
 import { writePrivateFileAtomic } from "@/lib/server/data-root";
 
 import { getBridgeDataDir } from "./bridge-config";
+import { readJsonObjectForWrite } from "./json-store";
 
 /** 去重集合上限——防膨胀；超出淘汰最旧 */
 const PROCESSED_IDS_MAX = 2000;
@@ -81,29 +82,37 @@ const enqueueBridgeStateWrite = <T>(run: () => Promise<T>): Promise<T> => {
 const stateFilePath = async (): Promise<string> =>
   path.join(await getBridgeDataDir(), "bridge-state.json");
 
+/** 把盘上解析出的对象规整成 store（缺字段 / 类型不对的字段按空补） */
+const normalizeStore = (parsed: Partial<BridgeStateStore>): BridgeStateStore => {
+  return {
+    lastP2pChatId:
+      typeof parsed.lastP2pChatId === "string" ? parsed.lastP2pChatId : "",
+    processedMessageIds: Array.isArray(parsed.processedMessageIds)
+      ? parsed.processedMessageIds.filter((x): x is string => typeof x === "string")
+      : [],
+    lastInboundAt:
+      typeof parsed.lastInboundAt === "number" ? parsed.lastInboundAt : 0,
+    currentChatTaskId:
+      typeof parsed.currentChatTaskId === "string"
+        ? parsed.currentChatTaskId
+        : "",
+    endedChatTaskIds: Array.isArray(parsed.endedChatTaskIds)
+      ? parsed.endedChatTaskIds.filter(
+          (x): x is string => typeof x === "string",
+        )
+      : [],
+    awaitingChatSearch: parsed.awaitingChatSearch === true,
+  };
+};
+
+/**
+ * 纯读取用（getter / 热路径）：读失败宽松回空、不抛——只读路径别因此中断消息处理。
+ * 读改写**不要**用它（读失败回空再写回 = 抹掉全部历史），用 {@link readStoreForWrite}。
+ */
 const readStore = async (): Promise<BridgeStateStore> => {
   try {
     const raw = await fs.readFile(await stateFilePath(), "utf-8");
-    const parsed = JSON.parse(raw) as Partial<BridgeStateStore>;
-    return {
-      lastP2pChatId:
-        typeof parsed.lastP2pChatId === "string" ? parsed.lastP2pChatId : "",
-      processedMessageIds: Array.isArray(parsed.processedMessageIds)
-        ? parsed.processedMessageIds.filter((x): x is string => typeof x === "string")
-        : [],
-      lastInboundAt:
-        typeof parsed.lastInboundAt === "number" ? parsed.lastInboundAt : 0,
-      currentChatTaskId:
-        typeof parsed.currentChatTaskId === "string"
-          ? parsed.currentChatTaskId
-          : "",
-      endedChatTaskIds: Array.isArray(parsed.endedChatTaskIds)
-        ? parsed.endedChatTaskIds.filter(
-            (x): x is string => typeof x === "string",
-          )
-        : [],
-      awaitingChatSearch: parsed.awaitingChatSearch === true,
-    };
+    return normalizeStore(JSON.parse(raw) as Partial<BridgeStateStore>);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") {
@@ -114,6 +123,26 @@ const readStore = async (): Promise<BridgeStateStore> => {
     }
     return emptyStore();
   }
+};
+
+/**
+ * 读改写用的读：只有「文件不存在」或「内容坏了（已隔离）」才从空开始；
+ * 其它读错误抛出（调用方的整段 RMW 随之放弃，不会拿空状态覆盖盘上的历史）。见 json-store。
+ */
+const readStoreForWrite = async (): Promise<BridgeStateStore> => {
+  const parsed = await readJsonObjectForWrite(
+    await stateFilePath(),
+    "bridge-state",
+    // 字段类型不对（如 processedMessageIds 被改成字符串）：不悄悄当空，复制留证（缺字段不算）
+    (o) =>
+      (o.lastP2pChatId === undefined || typeof o.lastP2pChatId === "string") &&
+      (o.processedMessageIds === undefined || Array.isArray(o.processedMessageIds)) &&
+      (o.lastInboundAt === undefined || typeof o.lastInboundAt === "number") &&
+      (o.currentChatTaskId === undefined || typeof o.currentChatTaskId === "string") &&
+      (o.endedChatTaskIds === undefined || Array.isArray(o.endedChatTaskIds)) &&
+      (o.awaitingChatSearch === undefined || typeof o.awaitingChatSearch === "boolean"),
+  );
+  return parsed === null ? emptyStore() : normalizeStore(parsed as Partial<BridgeStateStore>);
 };
 
 const writeStore = async (store: BridgeStateStore): Promise<void> => {
@@ -129,7 +158,7 @@ const INBOUND_AT_WRITE_THROTTLE_MS = 60_000;
 /** 记「最近收到入向消息」时刻（节流写盘、跨重启保留） */
 export const rememberInboundReceivedAt = async (ts: number): Promise<void> => {
   return enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     if (ts - store.lastInboundAt < INBOUND_AT_WRITE_THROTTLE_MS) return;
     store.lastInboundAt = ts;
     await writeStore(store);
@@ -145,7 +174,7 @@ export const getPersistedLastInboundAt = async (): Promise<number> => {
 export const rememberP2pChatId = async (chatId: string): Promise<void> => {
   if (!chatId) return;
   return enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     if (store.lastP2pChatId === chatId) return;
     await writeStore({ ...store, lastP2pChatId: chatId });
   });
@@ -157,13 +186,38 @@ export const getLastP2pChatId = async (): Promise<string> => {
 };
 
 /**
+ * 区分「确实没有记录」与「状态文件读不出来」（getLastP2pChatId 两种情况都回空串、日志只能谎报）。
+ * unreadable=true：文件存在但读失败 / 内容损坏——此时回空串不代表没有 chatId。
+ * 只读、永不抛。
+ */
+export const peekLastP2pChatIdState = async (): Promise<{
+  chatId: string;
+  unreadable: boolean;
+}> => {
+  try {
+    const raw = await fs.readFile(await stateFilePath(), "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { chatId: "", unreadable: true };
+    }
+    return {
+      chatId: normalizeStore(parsed as Partial<BridgeStateStore>).lastP2pChatId,
+      unreadable: false,
+    };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return { chatId: "", unreadable: code !== "ENOENT" };
+  }
+};
+
+/**
  * 记下「当前对话」指针（空串 = 清除）。
  * 走写队列 RMW；同值幂等跳过写盘。
  */
 export const setCurrentChatTaskId = async (taskId: string): Promise<void> => {
   const next = typeof taskId === "string" ? taskId : "";
   return enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     if (store.currentChatTaskId === next) return;
     await writeStore({ ...store, currentChatTaskId: next });
   });
@@ -178,7 +232,7 @@ export const getCurrentChatTaskId = async (): Promise<string> => {
 export const addEndedChatTaskId = async (taskId: string): Promise<void> => {
   if (!taskId) return;
   return enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     const next = store.endedChatTaskIds.filter((id) => id !== taskId);
     next.push(taskId);
     while (next.length > ENDED_CHAT_IDS_MAX) next.shift();
@@ -193,7 +247,7 @@ export const addEndedChatTaskId = async (taskId: string): Promise<void> => {
 export const removeEndedChatTaskId = async (taskId: string): Promise<void> => {
   if (!taskId) return;
   return enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     if (!store.endedChatTaskIds.includes(taskId)) return;
     await writeStore({
       ...store,
@@ -214,7 +268,7 @@ export const getEndedChatTaskIds = async (): Promise<string[]> => {
 export const takeAwaitingChatSearch = async (): Promise<boolean> => {
   let was = false;
   await enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     was = store.awaitingChatSearch === true;
     if (was) await writeStore({ ...store, awaitingChatSearch: false });
   });
@@ -224,7 +278,7 @@ export const takeAwaitingChatSearch = async (): Promise<boolean> => {
 /** 置「搜对话」待关键词（遥控器 search_hint 点后调） */
 export const setAwaitingChatSearch = async (): Promise<void> => {
   return enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     if (store.awaitingChatSearch) return;
     await writeStore({ ...store, awaitingChatSearch: true });
   });
@@ -259,7 +313,7 @@ export const markProcessedMessageId = async (
 ): Promise<void> => {
   if (!messageId) return;
   return enqueueBridgeStateWrite(async () => {
-    const store = await readStore();
+    const store = await readStoreForWrite();
     const next = store.processedMessageIds.filter((id) => id !== messageId);
     next.push(messageId);
     while (next.length > PROCESSED_IDS_MAX) next.shift();

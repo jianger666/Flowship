@@ -10,6 +10,7 @@
  * 而且 artifact-panel 的「选中一段分享」和 hook 的出站处理共用同一份口径。
  */
 
+import { sliceHeadSafe } from "@/lib/text-slice";
 import type { ShareToGroupInput, ShareToGroupKind } from "@/lib/task-store";
 
 /** 进卡片的正文上限：防超长消息撑爆飞书卡片 markdown */
@@ -18,7 +19,7 @@ export const SHARE_TO_GROUP_CONTENT_MAX = 4000;
 /** 截断进卡片的正文（尾加省略号，方便人眼看出被截） */
 export const truncateShareContent = (text: string): string => {
   if (text.length <= SHARE_TO_GROUP_CONTENT_MAX) return text;
-  return `${text.slice(0, SHARE_TO_GROUP_CONTENT_MAX)}…`;
+  return `${sliceHeadSafe(text, SHARE_TO_GROUP_CONTENT_MAX)}…`;
 };
 
 /** 出站前按 kind 决定截不截断（见文件头） */

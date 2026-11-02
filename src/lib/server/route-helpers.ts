@@ -20,6 +20,7 @@ import { promises as fs } from "node:fs";
 import type { ModelSelection } from "@cursor/sdk";
 
 import { isAbsolutePathLike } from "@/lib/path-utils";
+import { nonLocalPathReason } from "@/lib/unc-path";
 import { sanitizeInboundCardText } from "@/lib/server/feishu-bridge/inbound-card-sanitize";
 import { MAX_SKILL_REFS } from "@/lib/protocol-signals";
 import type { ImageAttachmentInput } from "@/lib/server/task-artifacts";
@@ -351,6 +352,15 @@ export const parseAndValidateAttachments = async (
       return {
         ok: false,
         errorResponse: errorResponse(`attachments 必须是绝对路径：${item}`),
+      };
+    }
+    // UNC / 网络共享 / 非本机磁盘形态必须在碰文件系统之前拒掉：isAbsolutePathLike 把 `\\host\share` 也算绝对路径，
+    // Windows 上对它 fs.stat 会主动发起 SMB 连接并带 NTLM 凭据（评审 P2；与 read-text / local-image 等路由同一守卫）
+    const nonLocal = nonLocalPathReason(trimmed);
+    if (nonLocal) {
+      return {
+        ok: false,
+        errorResponse: errorResponse(`attachments 路径不可用：${nonLocal}：${item}`),
       };
     }
     const abs = path.resolve(trimmed);

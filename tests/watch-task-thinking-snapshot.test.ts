@@ -218,15 +218,18 @@ describe("bootstrap 帧序与 replay 标记", () => {
       "background_subagents",
       // B2-2：存储降级的当前值，bootstrap 无条件补一帧（没降级也发 {degraded:false}），位置固定在 background_subagents 之后、进行中快照之前
       "storage_degraded",
-      // 进行中正文快照紧挨在思考快照之前（同一类「重连补态」帧，bootstrap 末尾两帧）
+      // 进行中正文快照、shell 输出快照、思考快照（同一类「重连补态」帧，bootstrap 末尾三帧；shell 输出快照夹在正文与思考之间）
       "assistant_snapshot",
+      "tool_output_snapshot",
       "thinking_snapshot",
     ]);
     const events = frames.filter((f) => f.type === "event");
     expect(events.every((f) => f.replay === true)).toBe(true);
     expect(frames.at(-1)).toEqual({ type: "thinking_snapshot", live: null });
+    // 没有在跑的 shell：快照照发、outputs 为空数组（前端据此清残留的直播缓冲）
+    expect(frames.at(-2)).toEqual({ type: "tool_output_snapshot", outputs: [] });
     // 没有进行中的正文：assistant 快照照发、live 为 null
-    expect(frames.at(-2)).toEqual({ type: "assistant_snapshot", live: null });
+    expect(frames.at(-3)).toEqual({ type: "assistant_snapshot", live: null });
   });
 
   it("有进行中的思考：快照带 eventId / 已发出的文本 / 累计数 / 首帧时刻（字段口径与 thinking_delta 帧一致）", async () => {

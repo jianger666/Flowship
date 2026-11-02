@@ -24,6 +24,7 @@ import { usePathname } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
 import { AppSidebar } from "@/components/app-sidebar";
 import { isModCombo } from "@/lib/keyboard-shortcuts";
+import { createModHotkeyHandler, isSidebarToggleCombo } from "@/components/hotkey-handler";
 import {
   dispatchArtifactSearchFocus,
   dispatchEventStreamSearchFocus,
@@ -78,22 +79,12 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
     setSidebarOpen((v) => !v);
   }, []);
 
-  // Cmd/Ctrl+B 切侧栏（对标 VSCode / Cursor）；焦点在输入框时让行、不抢打字
+  // Cmd/Ctrl+B 切侧栏（对标 VSCode / Cursor）。
+  // 不看焦点：本仓没有富文本编辑器——主输入条是 Lexical PlainTextPlugin 的 ContentEditable、其余是 input / textarea，
+  // ⌘B 在它们里面都没有「加粗」之类的编辑语义。原先对 contentEditable 让行，会让主输入条里这个快捷键整个失效
+  // （评审：打字时想收侧栏得先点出去）。长按 repeat 帧只吞默认行为、不重复切（见 hotkey-handler）。
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() !== "b" || !(e.metaKey || e.ctrlKey)) return;
-      const el = document.activeElement as HTMLElement | null;
-      if (
-        el &&
-        (el.tagName === "INPUT" ||
-          el.tagName === "TEXTAREA" ||
-          el.isContentEditable)
-      ) {
-        return;
-      }
-      e.preventDefault();
-      toggleSidebar();
-    };
+    const onKeyDown = createModHotkeyHandler(isSidebarToggleCombo, toggleSidebar);
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleSidebar]);

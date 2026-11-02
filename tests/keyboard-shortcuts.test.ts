@@ -41,6 +41,45 @@ describe("isModCombo（Cmd/Ctrl+字母）", () => {
   });
 });
 
+describe("isModCombo 的平台口径（mac 只认 ⌘，其余 Ctrl / Meta 都认）", () => {
+  it("darwin：只认 metaKey——Ctrl+K / Ctrl+N / Ctrl+B / Ctrl+F 是 Emacs 式光标键，不能被全局快捷键吞掉", () => {
+    for (const k of ["k", "n", "b", "f"]) {
+      expect(isModCombo(key({ key: k, metaKey: true }), k, "darwin"), `⌘${k}`).toBe(true);
+      expect(isModCombo(key({ key: k, ctrlKey: true }), k, "darwin"), `Ctrl+${k}`).toBe(false);
+    }
+  });
+
+  it("darwin：⌘ 仍不吃 Alt / Shift", () => {
+    expect(isModCombo(key({ key: "k", metaKey: true, shiftKey: true }), "k", "darwin")).toBe(false);
+    expect(isModCombo(key({ key: "k", metaKey: true, altKey: true }), "k", "darwin")).toBe(false);
+  });
+
+  it("win32 / linux：Ctrl+K / Ctrl+N 照常命中（不破坏 Windows 的既有行为）", () => {
+    for (const platform of ["win32", "linux"] as const) {
+      expect(isModCombo(key({ key: "k", ctrlKey: true }), "k", platform), platform).toBe(true);
+      expect(isModCombo(key({ key: "n", ctrlKey: true }), "n", platform), platform).toBe(true);
+      expect(isModCombo(key({ key: "k", metaKey: true }), "k", platform), platform).toBe(true);
+    }
+  });
+
+  it("平台未知（SSR / 浏览器无壳 / 单测默认）：meta 与 ctrl 都认，与旧行为一致", () => {
+    expect(isModCombo(key({ key: "k", ctrlKey: true }), "k", "")).toBe(true);
+    expect(isModCombo(key({ key: "k", metaKey: true }), "k", "")).toBe(true);
+    expect(isModCombo(key({ key: "k", ctrlKey: true }), "k")).toBe(true);
+  });
+
+  it("不传 platform 时读壳平台（window.__shell.platform）：mac 壳里 Ctrl+K 不命中、⌘K 命中", async () => {
+    const { vi } = await import("vitest");
+    vi.stubGlobal("window", { __shell: { platform: "darwin" } });
+    try {
+      expect(isModCombo(key({ key: "k", ctrlKey: true }), "k")).toBe(false);
+      expect(isModCombo(key({ key: "k", metaKey: true }), "k")).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("isInsideSheet（焦点 / 按键目标是否在右侧抽屉里）", () => {
   /** 最小假节点：closest 只认抽屉选择器 */
   const node = (inside: boolean) => ({

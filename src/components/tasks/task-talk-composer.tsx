@@ -37,8 +37,10 @@ import { Picker } from "@/components/ui/picker";
 import { useModels } from "@/hooks/use-models";
 import { useProviderSwitch } from "@/hooks/use-provider-switch";
 import { useSubmitShortcut } from "@/hooks/use-settings";
+import { useShellPlatform } from "@/hooks/use-shell-platform";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { findPendingAskEvent } from "@/lib/ask-pending";
+import { getModShortcutLabel, isModCombo } from "@/lib/keyboard-shortcuts";
 import { getRunningQueuePlaceholder } from "@/lib/submit-shortcut";
 import { getSettings, isSettingsLoaded } from "@/lib/local-store";
 import {
@@ -124,6 +126,8 @@ export const TaskTalkComposer = ({
   const isRunning = runActive && !pendingAsk;
   // 运行中 placeholder 的键位跟个人提交快捷键走（默认 mod-enter、Enter 只会换行，U3b-04）
   const submitShortcut = useSubmitShortcut();
+  // 键位文案按平台显示（mount 后才读壳平台、SSR / 首次渲染为 ""→ Ctrl，不会 hydration 不一致）
+  const shellPlatform = useShellPlatform();
   // 运行中仍允许打字排队：输入区只被 submitting 锁；busy 另管模型 / 提供方切换（跑着不能换）
   const busy = submitting || isRunning;
 
@@ -308,11 +312,13 @@ export const TaskTalkComposer = ({
     // 只在挂载 / 切任务时认领一次：在飞 promise 同一班次内引用稳定
   }, [task.id]);
 
-  // Cmd/Ctrl+J 聚焦输入条（沿用原「再聊聊」快捷键、入口合一后指到这里）
+  // Cmd/Ctrl+J 聚焦输入条（沿用原「再聊聊」快捷键、入口合一后指到这里）。
+  // 走 isModCombo，与 ⌘K / ⌘N / ⌘B / ⌘End 同一口径：mac 只认 ⌘（Ctrl 组合留给文本框原生的 Emacs 式键位）、
+  // Windows / Linux 认 Ctrl；不吃 Shift / Alt（⌘⇧J / ⌘⌥J 不触发）
   const focusInput = rich.focus;
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() !== "j" || !(e.metaKey || e.ctrlKey)) return;
+      if (!isModCombo(e, "j")) return;
       e.preventDefault();
       focusInput();
     };
@@ -519,7 +525,7 @@ export const TaskTalkComposer = ({
               ? "可先答上方提问，也可在此继续说"
               : isRunning
                 ? getRunningQueuePlaceholder(submitShortcut)
-                : "想改、想问、贴图、/ 唤起 skill、@ 引用文件（⌘/Ctrl+J）"
+                : `想改、想问、贴图、/ 唤起 skill、@ 引用文件（${getModShortcutLabel(shellPlatform, "J")}）`
           }
           ariaLabel="跟 AI 说"
           // 只锁发送键（submitting：禁用 + 转圈）、不锁编辑器——跟 chat 输入岛一致（V5-01）

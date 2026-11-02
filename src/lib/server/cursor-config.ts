@@ -18,8 +18,8 @@
  */
 
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { getGlobalCursorDirs } from "./cursor-dirs";
 import { parseFrontmatter } from "./frontmatter";
 import type { McpServerConfig } from "@cursor/sdk";
 
@@ -27,19 +27,10 @@ import { RESERVED_MCP_NAMES, validateMcpServerConfig } from "../mcp-config";
 import { dataRoot, describeConfigReadError, stripBom } from "./data-root";
 
 /**
- * 全局 Cursor 配置目录候选（按优先级、取第一个能命中的）
- * - mac/linux/win 官方都是 home 下的 `.cursor/`（`os.homedir()` 自适配跨平台）
- * - win 旧版个别落在 `%APPDATA%/Cursor/`、加 fallback 兜底（官方文档以 home 为准）
+ * 全局 Cursor 配置目录候选（按优先级、取第一个能命中的）——实现在 `cursor-dirs.ts`
+ * （事件脱敏也要读同一份候选，见该文件头注释），这里原样导出，对外 API 不变。
  */
-export const getGlobalCursorDirs = (): string[] => {
-  const dirs: string[] = [];
-  const home = os.homedir();
-  if (home) dirs.push(path.join(home, ".cursor"));
-  if (process.platform === "win32" && process.env.APPDATA) {
-    dirs.push(path.join(process.env.APPDATA, "Cursor"));
-  }
-  return dirs;
-};
+export { getGlobalCursorDirs };
 
 /**
  * app 的 config.json 读不出来时留一行日志（排障线索，进 main.log / 诊断包）。

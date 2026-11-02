@@ -94,7 +94,8 @@ cd <repoPath>
 TARGET=<该仓测试分支、默认 test>
 
 # 探当前 branch（普通流程由 Flowship 检出；WK 流程已按「源分支」规则确认）
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BRANCH=$(git branch --show-current)   # 不用 rev-parse --abbrev-ref：分支与标签同名时它输出 heads/xxx
+[ -n "$BRANCH" ] || { echo "[error] 当前是 detached HEAD、不在任何分支上、停止本仓 ship"; exit 1; }
 
 # 拉一下 test 看本仓相对 test 有没有改动
 # fail-fast：fetch 失败（远程没 test 分支 / 网络异常）必须报错退出、
@@ -196,7 +197,8 @@ ask_user({
 ```bash
 cd <repoPath>
 TARGET=<该仓测试分支、默认 test>
-FEATURE=$(git rev-parse --abbrev-ref HEAD)   # 当前 feature 分支、下面全程不动它
+FEATURE=$(git branch --show-current)         # 当前 feature 分支、下面全程不动它（不用 rev-parse --abbrev-ref：分支与标签同名时它输出 heads/xxx）
+[ -n "$FEATURE" ] || { echo "[error] 当前是 detached HEAD、不在任何分支上、停止本仓智能解冲突"; exit 1; }
 CONFLICT="${FEATURE}__conflict"
 
 # fail-fast：fetch 不到 test 直接退、别在脏状态上瞎合

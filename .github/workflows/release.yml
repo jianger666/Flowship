@@ -9,16 +9,49 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    # 只认严格的 vX.Y.Z（GitHub tag 过滤器要求整串匹配）：`v*` 会放过 `vfoo` / `v1.2.3-rc.1` 这类
+    # 不是正式版本号的 tag——它们一样会触发整条流水线、走到签名与转正。仓库全部历史 tag 都是 vX.Y.Z。
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
 permissions:
   contents: write
 
 jobs:
+  # 发版前置闸：tag 必须是 vX.Y.Z（防过滤器被改松）、且它指向的提交已经在 main 上。
+  # 签名私钥只受「能推 tag」保护——任何有写权限的人在别的分支提交上打个 tag，就能让流水线拿私钥给任意包签名；
+  # 要求提交在 main 的祖先链上，就把「谁能发版」收窄成「谁能把提交合进 main」。
+  # 在 verify 之前跑：不过就什么都不做（不 build、不建 draft、不碰私钥）。
+  # 用法提示：先 push main、再 push tag（或同一条 `git push origin main <tag>`）；tag 先到、main 还没到会在这里红，补推 main 后重跑即可。
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # fetch-depth: 0：要完整历史才能判断祖先关系
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: tag 格式 + 提交在 main 上
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag「$GITHUB_REF_NAME」不是 vX.Y.Z、拒绝发版"
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::tag「$GITHUB_REF_NAME」指向的提交 $GITHUB_SHA 不在 origin/main 上、拒绝发版（先把提交合进 main 再打 tag）"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME → $GITHUB_SHA 在 main 上、放行"
+
   # 发版门禁（typecheck + eslint + 全量 vitest，定义在 ci.yml、与 PR / 手动触发共用一份）。
   # 不过就不往下走：不 build、不建 draft release、不出包——tag 已 push 也不会产生半成品 release，
   # 修好后删 tag 重打即可。
   verify:
+    needs: guard
     uses: ./.github/workflows/ci.yml
 
   build-release:
@@ -173,9 +206,15 @@ jobs:
   # 留 draft 不对外（fail-fast:false 只让兄弟 job 继续跑、不让残缺版变 published）。
   # 转正后 /releases/latest 才指向它、mac fetchLatestVersion / win electron-updater 这才查得到、
   # 且此刻 asset + manifest 已齐全——根治 v0.8.0「asset 没传完就被自更新下到残缺」的事故。
+  #
+  # environment: release —— 签名私钥（UPDATE_MANIFEST_PRIVATE_KEY）只有这个 job 用。
+  # 仓库设置里（一次性、需要仓库管理员）：Settings → Environments → release → 勾 Required reviewers，
+  # 并把 UPDATE_MANIFEST_PRIVATE_KEY 从仓库级 secret 挪成 environment 级 secret，签名就需要审批人点同意才会放行；
+  # 没配置时 GitHub 会按名字自动建一个无保护的 environment，行为与以前一致、不会卡发版。
   finalize:
     needs: electron
     runs-on: ubuntu-latest
+    environment: release
     steps:
       # 要用 scripts/generate-update-manifest.mjs（纯 node:crypto、不必 pnpm install）
       - uses: actions/checkout@v4
@@ -243,7 +282,9 @@ jobs:
             });
             const draft = releases.find((r) => r.tag_name === tag && r.draft);
             if (!draft) {
-              core.info(`没找到 tag=${tag} 的 draft release、跳过`);
+              // 不能静默成功：manifest 已签 / 已上传、却没有 draft 可转正，说明 release 被人手动转正或删除过——
+              // 流水线绿着但实际没发出东西 / 发出的不是这次产物，必须红出来让人看
+              core.setFailed(`没找到 tag=${tag} 的 draft release、拒绝静默跳过（是否被手动转正 / 删除过？）`);
               return;
             }
             await github.rest.repos.updateRelease({

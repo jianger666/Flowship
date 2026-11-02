@@ -716,7 +716,170 @@ const taskTool = (runSubagent: SubagentRunner): ToolDefinition =>
 
 // ----------------- delete（pi 无、补一个） -----------------
 
-const deleteTool = (cwd: string): ToolDefinition =>
+/** 路径是否在 root 之内（含 root 本身时 `allowEqual`）；两边都应是已归一 / 已 realpath 的绝对路径 */
+const isPathInside = (root: string, abs: string, allowEqual: boolean): boolean => {
+  const rel = path.relative(root, abs);
+  if (rel === "") return allowEqual;
+  // 「在外面」= 恰好是 `..` 或以 `..` + 分隔符开头；不能用 startsWith("..")——`..data` / `...hidden` 这类合法文件名会被误拦
+  if (rel === ".." || rel.startsWith(`..${path.sep}`)) return false;
+  return !path.isAbsolute(rel);
+};
+
+/** 去掉路径末尾的分隔符（保留根：`/`、`C:\`） */
+const stripTrailingSep = (p: string): string => {
+  const rootLen = path.parse(p).root.length;
+  let out = p;
+  while (out.length > rootLen && /[\\/]$/.test(out)) out = out.slice(0, -1);
+  return out;
+};
+
+/**
+ * 任务数据目录 `<dataRoot>/tasks/<taskId>/` 里 agent 合法需要删的子目录（小写）：只有 `workspace`——
+ * 任务专属可写工作目录（脚本 / 数据 / 中间产物的兜底落点）。
+ * `actions/`（artifact 文档、历史档案）**不放行**：上游 artifact 是已 ack 的历史档案（见 prompts/_shared.md「不要回头改上一个
+ * action 的 artifact」），当前 action 要改自己的产出用 `write` / `edit` 覆盖即可，没有「删掉」的合法场景；
+ * 放行 `actions/` 等于让 agent 能抹掉审阅 / 验收依据。
+ * 其余（`meta.json*` / `events.jsonl` / `.event-seq` / `tool-outputs` / `.deleted-tombstone` / 任务目录本身 / workspace 目录本身）
+ * 全是平台内部文件，一律拒绝——白名单而非黑名单，以后任务目录里新增的内部文件默认受保护。
+ * 与 task-fs-core 的 WORKSPACE_DIR 同名；这里不 import task-fs-core（不把整条任务存储依赖链拉进工具层），
+ * 漂移由 tests/pi-coding-tools-delete-clamp.test.ts 守着。
+ */
+const TASK_DIR_DELETABLE_ROOTS: ReadonlySet<string> = new Set(["workspace"]);
+
+/** relParts 是 `tasks/<taskId>/` 之下的路径段：是否落在放行的子目录「内部」 */
+const isDeletableInTaskDir = (relParts: readonly string[]): boolean => {
+  // 至少 `<放行目录>/<东西>`：放行目录本身（长度 1）不放行
+  if (relParts.length < 2) return false;
+  return TASK_DIR_DELETABLE_ROOTS.has(relParts[0]!.toLowerCase());
+};
+
+/** realpath 失败（路径不存在 / 权限）时退回归一后的原值：真删时 fs.rm 自己会报错 */
+const realOrSelf = async (p: string): Promise<string> => {
+  try {
+    return await fs.realpath(p);
+  } catch {
+    return path.normalize(p);
+  }
+};
+
+/**
+ * 这一段路径是不是 `.git`：小写比较；Windows 会静默丢掉段尾的空格 / 点、并把 `:` 之后当备用数据流，
+ * 所以 `.git.` / `.git ` / `.git::$DATA` 在 Windows 上就是 `.git`，这里一律按它处理（其它平台多拦几个怪名字无伤大雅）。
+ */
+const isGitDirName = (seg: string): boolean => {
+  let s = seg.toLowerCase();
+  const colon = s.indexOf(":");
+  if (colon >= 0) s = s.slice(0, colon);
+  return s.replace(/[\s.]+$/, "") === ".git";
+};
+
+/**
+ * delete 的目标校验（导出供单测）。以前只要 path 非空就 `fs.rm(recursive)`：`.` / `..` / 仓库根 / `.git` / 任意绝对路径
+ * 都能被递归删除，而非隔离任务的 cwd 就是用户的原仓库——未提交改动直接丢。现在：
+ * - 拒绝空路径、`.`、`..`（含 `./`、`a/..` 这类解析后等于 cwd 或其祖先的写法）；
+ * - 拒绝删 cwd 本身及其任何祖先（删祖先等于删 cwd）；
+ * - 目标必须落在 cwd 之内，或**当前任务**数据目录 `<dataRoot>/tasks/<taskId>/` 的 `workspace/` 内部
+ *   （见 TASK_DIR_DELETABLE_ROOTS；`actions/` 的 artifact 档案、meta / 事件日志 / tool-outputs 等平台内部文件、workspace 目录本身都不放行）；
+ *   `taskId` 由工具构造时的 spill 带进来，**拿不到就不给这个例外**（保守路径：只认 cwd）——否则任何任务都能删别的任务的事件和产物。
+ *   与旁路只读的钳制（`clampBypassBasePath`）同一口径；判定前对**父目录**做 realpath，符号链接目录指向外面也出不去
+ *   （目标本身是符号链接时 `fs.rm` 只删链接、不跟随）；
+ * - cwd 恰好包含平台数据根时（无仓库任务的 cwd 是 process.cwd()，dev 模式下 `data/` 在其中），数据根内部同样只认当前任务的 workspace/ 子目录；
+ * - 拒绝 `.git`（含其内部任何东西），拒绝仓库 / worktree 根（目录下有 `.git`）——整仓库删除请找用户。
+ *   `.git` 的所有判断都**大小写不敏感**（macOS / Windows 默认大小写不敏感文件系统，`.GIT` 就是 `.git`），
+ *   Windows 还会静默丢掉段尾的空格 / 点、认 `.git::$DATA` 这种备用数据流写法，一并按 `.git` 处理。
+ */
+export const checkDeleteTarget = async (
+  cwd: string,
+  rawTarget: string,
+  taskId?: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<{ ok: true; abs: string } | { ok: false; reason: string }> => {
+  const target = rawTarget.trim();
+  if (!target) return { ok: false, reason: "path 不能为空" };
+  const segments = target.split(/[\\/]+/).filter(Boolean);
+  if (segments.length > 0 && segments.every((seg) => seg === "." || seg === "..")) {
+    return { ok: false, reason: `拒绝删除：path 不能是「${target}」（会波及整个工作目录或其上级）。` };
+  }
+  // 去掉尾斜杠：`delete link/` 里 link 是符号链接时，POSIX 的 lstat / fs.rm 遇到尾斜杠会**跟随链接**——
+  // 实测 Node 22：`fs.rm("link/", { recursive: true })` 会把链接指向的整个目录（仓库根 / cwd 外的目录）删光、只留悬空的链接；
+  // 而下面的校验按「链接本身」放行。统一成「删链接本身」，后面校验与真删用同一个路径。
+  const abs = stripTrailingSep(
+    path.normalize(path.isAbsolute(target) ? target : path.resolve(cwd, target)),
+  );
+
+  const realCwd = await realOrSelf(cwd);
+  // 父目录 realpath 后再拼回文件名：符号链接目录不能当出口
+  const realAbs = path.join(await realOrSelf(path.dirname(abs)), path.basename(abs));
+
+  if (isPathInside(realAbs, realCwd, true)) {
+    return { ok: false, reason: "拒绝删除：目标是工作目录本身或它的上级目录。" };
+  }
+  const inCwd = isPathInside(realCwd, realAbs, false);
+  // 当前任务的数据目录 tasks/<taskId>/：严格在其内部（任务目录本身含 meta / 事件日志，不让删）。
+  // taskId 必须是单个安全路径段；没有 taskId（或不安全）就没有这个例外，只认 cwd。
+  const safeTaskId =
+    typeof taskId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(taskId) ? taskId : null;
+  const taskDir = safeTaskId
+    ? await realOrSelf(path.join(dataRoot(), "tasks", safeTaskId))
+    : null;
+  const inTaskDir = taskDir !== null && isPathInside(taskDir, realAbs, false);
+  if (!inCwd && !inTaskDir) {
+    return { ok: false, reason: `拒绝删除：只能删工作目录内的东西（${target} 越界）。` };
+  }
+  // cwd 包含平台数据根（无仓库任务的 cwd 是 process.cwd()，dev 模式下 `data/` 就在它里面）：
+  // 光靠「在 cwd 内」会放行数据根里的一切（别的任务的 meta / 事件日志、整个 data/ 本身）。
+  // 这种情况下数据根内部只认当前任务的 workspace/ 子目录（与 cwd 不含数据根时同一口径）；cwd 本身就在数据根里的
+  // （cwd = tasks/<id>/workspace）不受影响——那时数据根不在 cwd 之内、不会走到这里。
+  // 这一段的路径比较要折叠大小写：macOS / Windows 默认大小写不敏感，`delete Data` 就是 `data`；
+  // 用区分大小写的比较会让这道钳制 fail-open（`fs.rm` 照样删掉整个数据目录）。linux 保持大小写敏感。
+  const fold = foldsPathCase(platform) ? (v: string): string => v.toLowerCase() : (v: string): string => v;
+  const realDataRoot = await realOrSelf(dataRoot());
+  if (
+    inCwd &&
+    isPathInside(fold(realCwd), fold(realDataRoot), false) &&
+    isPathInside(fold(realDataRoot), fold(realAbs), true)
+  ) {
+    const okInTask =
+      inTaskDir && isDeletableInTaskDir(path.relative(taskDir as string, realAbs).split(path.sep));
+    if (!okInTask) {
+      return {
+        ok: false,
+        reason: `拒绝删除：${target} 在平台数据目录里（任务 meta / 事件日志 / 其它任务的产物），只能删当前任务工作目录（workspace/）里的内容。`,
+      };
+    }
+  }
+
+  const relParts = path
+    .relative(inCwd ? realCwd : (taskDir as string), realAbs)
+    .split(path.sep);
+  // 只靠任务目录例外放行时（不在 cwd 内），必须落在 workspace/ 内部；meta / 事件日志 / tool-outputs 等平台内部文件一律拒绝
+  if (!inCwd && !isDeletableInTaskDir(relParts)) {
+    return {
+      ok: false,
+      reason: `拒绝删除：${target} 是任务数据目录里的平台内部文件，只能删工作目录（workspace/）里的内容。`,
+    };
+  }
+  if (relParts.some(isGitDirName)) {
+    return { ok: false, reason: "拒绝删除：不能删 .git（版本库元数据）。" };
+  }
+  // 仓库 / worktree 根：目录下有 .git（目录或 worktree 的 gitdir 文件）。readdir 逐项按小写比，
+  // 不依赖底层文件系统是否区分大小写
+  try {
+    const st = await fs.lstat(realAbs);
+    if (st.isDirectory()) {
+      const names = await fs.readdir(realAbs);
+      if (names.some(isGitDirName)) {
+        return { ok: false, reason: "拒绝删除：目标是 git 仓库 / worktree 根目录，整库删除请找任务所有者。" };
+      }
+    }
+  } catch {
+    // 不存在 / 读不了：交给 fs.rm 自己报错
+  }
+  // 返回校验时用的真实路径（父目录已 realpath、无尾斜杠），真删与校验指向同一处
+  return { ok: true, abs: realAbs };
+};
+
+const deleteTool = (cwd: string, taskId?: string): ToolDefinition =>
   asTool({
     name: "delete",
     label: "删文件 / 目录",
@@ -733,7 +896,14 @@ const deleteTool = (cwd: string): ToolDefinition =>
           details: undefined,
         };
       }
-      const abs = path.isAbsolute(target) ? target : path.resolve(cwd, target);
+      const checked = await checkDeleteTarget(cwd, target, taskId);
+      if (!checked.ok) {
+        return {
+          content: [{ type: "text", text: checked.reason }],
+          details: undefined,
+        };
+      }
+      const abs = checked.abs;
       try {
         await fs.rm(abs, { recursive: true, force: false });
         return {
@@ -759,10 +929,12 @@ const deleteTool = (cwd: string): ToolDefinition =>
  *（服务端执行、只合 test 分支）。不推进、不改文件。
  * 写类（write/edit/delete）、子代理 task、系统工具、MCP、shell 全不给。
  * 白名单数组（custom-agent-backend 的 tools 白名单与这里保持一致）。
- * 注：旁路 honor-system 后不再走本数组（两端默认全开），此处转单元覆盖留着，哪天收紧直接接回去。
+ * 注：本数组**有真实接线**——需求群受限答疑旁路（restricted-question.ts 传 `readOnly: true`）的 pi 路径经
+ * custom-agent-backend 的 `RESTRICTED_READONLY_TOOL_NAMES` / `buildRestrictedReadOnlyToolDefs` 使用它，
+ * 并再去掉 `merge_test_mr`，最终受限 agent 只有 read / grep / glob（不是单测占位、也不是 honor-system 全开）。
  *
  * ⚠ 只读 shell（`readonlyShellTool` + `validateReadonlyShellCommand` 那套约 1700 行白名单守卫）已在 v1.9.33 删除：
- * 它没有调用方（没人传 `readOnly: true`），原定期限到了、不再顺延。最后一版带它的是 tag `v1.9.32`
+ * 它没有调用方（受限答疑虽然传 `readOnly: true`，但那一档只有 read / grep / glob、不含 shell），原定期限到了、不再顺延。最后一版带它的是 tag `v1.9.32`
  *（`git show v1.9.32:src/lib/server/pi-coding-tools.ts`）。要给只读轮次重新加 shell，先读 docs/HANDOFF.md
  * 「只读 shell 守卫整段删除」一节的「接线前必做清单」（路径操作数 realpath 再钳、git 外部程序选项拒绝等），别直接照搬旧版。
  */
@@ -807,7 +979,7 @@ export const buildCodingToolDefs = (
 ): ToolDefinition[] => [
   withModelBudget(shellTool(cwd, { omitGitToken: opts.omitGitToken === true }), spill),
   withModelBudget(globTool(cwd), spill),
-  withModelBudget(deleteTool(cwd), spill),
+  withModelBudget(deleteTool(cwd, spill?.taskId), spill),
   withModelBudget(taskTool(runSubagent), spill),
   ...buildNativeToolAliasWrappers(cwd, spill),
 ];

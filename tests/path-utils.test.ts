@@ -41,6 +41,11 @@ describe("shellQuotePath（复制路径给终端 cd 用）", () => {
     expect(shellQuotePath("/tmp/a$b`c")).toBe("'/tmp/a$b`c'");
   });
 
+  it("POSIX 路径文件名里的反斜杠不能裸放（会被 shell 当转义吃掉）：走单引号字面化", () => {
+    expect(shellQuotePath("/tmp/a\\b")).toBe("'/tmp/a\\b'");
+    expect(shellQuotePath("~/dir\\ name/x")).toBe("'~/dir\\ name/x'");
+  });
+
   it("无空格 Windows 反斜杠路径原样返回（cmd 不认单引号、别乱包）", () => {
     expect(shellQuotePath("D:\\IdeaProjects\\repo")).toBe("D:\\IdeaProjects\\repo");
   });
@@ -423,6 +428,19 @@ describe("getEffectiveCwd（Windows 多仓）", () => {
 
   it("跨盘符 → 空串（无公共目录、调用方 fallback）", () => {
     expect(getEffectiveCwd(["C:\\work\\a", "D:\\work\\b"])).toBe("");
+  });
+
+  it("Windows 盘符路径大小写不敏感（NTFS）：D:/Work 与 d:/work 是同一个父目录，输出沿用第一个路径的写法", () => {
+    expect(getEffectiveCwd(["D:\\Work\\a", "d:\\work\\b"])).toBe("D:/Work");
+    expect(getEffectiveCwd(["D:\\IdeaProjects\\x", "D:\\ideaprojects\\y", "d:\\IDEAPROJECTS\\z"])).toBe(
+      "D:/IdeaProjects",
+    );
+    // 真的不同的目录名仍然分开
+    expect(getEffectiveCwd(["D:\\Work\\a", "d:\\other\\b"])).toBe("D:/");
+  });
+
+  it("非 Windows 路径仍区分大小写（Linux 上 /a/Web 与 /a/web 是两个目录）", () => {
+    expect(getEffectiveCwd(["/a/Web/x", "/a/web/y"])).toBe("/a");
   });
 
   it("POSIX 多仓行为不变", () => {

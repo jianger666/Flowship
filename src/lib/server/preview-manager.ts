@@ -28,6 +28,7 @@ import { getChatLifecycle } from "./chat-gate";
 import { failpoint } from "./failpoints";
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 import { stripHostInjectedEnv } from "./host-env";
+import { registerManagedChild } from "./kill-orphans";
 import { stripAnsi } from "@/lib/strip-ansi";
 import type { PreviewSlotStatus } from "@/lib/types";
 
@@ -336,6 +337,17 @@ const processGroupAlive = (pid: number): boolean => {
 //   按「进程组是否仍在」轮询最多 2s、超时再对 -pid 发 KILL 兜底（组已空则提前返回）
 // - Windows（V0.11.1）：没有进程组负号语义、kill(-pid) 会抛——用 `taskkill /T /F` 杀整棵树
 //   （dev server 常见 node → webpack workers 多级子进程、只杀父进程会留孤儿占端口）
+
+// 正在走「TERM → 等 → KILL」的进程组 pid（slot 已从 map 摘掉、但组还没确认死）。
+// 退出时的同步强杀（forceKillAllPreviewsSync）除了在册 slot，也要覆盖这些「摘了但没死透」的组——
+// 否则 stop 进行到一半就 process.exit，等它的那一发 KILL 就丢了（评审 R1-9）。
+const STOPPING_PGIDS_KEY = "__flowshipPreviewStoppingPgidsV1__";
+const getStoppingPgids = (): Set<number> => {
+  const g = globalThis as unknown as Record<string, Set<number> | undefined>;
+  if (!g[STOPPING_PGIDS_KEY]) g[STOPPING_PGIDS_KEY] = new Set();
+  return g[STOPPING_PGIDS_KEY]!;
+};
+
 const killProcessGroup = async (pid: number): Promise<void> => {
   if (process.platform === "win32") {
     await new Promise<void>((resolve) => {
@@ -362,13 +374,49 @@ const killProcessGroup = async (pid: number): Promise<void> => {
     }
   };
   if (!tryKill("SIGTERM")) return;
-  const deadline = Date.now() + 2000;
-  while (Date.now() < deadline) {
+  const stopping = getStoppingPgids();
+  stopping.add(pid);
+  try {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      if (!processGroupAlive(pid)) return;
+      await new Promise((r) => setTimeout(r, 100));
+    }
     if (!processGroupAlive(pid)) return;
-    await new Promise((r) => setTimeout(r, 100));
+    tryKill("SIGKILL");
+  } finally {
+    stopping.delete(pid);
   }
-  if (!processGroupAlive(pid)) return;
-  tryKill("SIGKILL");
+};
+
+/**
+ * 退出前的**同步**最后一道强杀（process.exit 之前由退出钩子经 kill-orphans 调）：
+ * 对每个仍在册 slot 的进程组、以及「stop 进行到一半」的进程组直接发 SIGKILL。
+ *
+ * 为什么需要：优雅停（TERM → 等 2s → KILL）比退出钩子的 1.5s 上限还长，还排在预览全局串行队列里
+ * （前面有慢 start 就轮不到）；不听 SIGTERM 的 dev server 在 process.exit 时只收到过 TERM，
+ * 又因为是 detached 独立进程组、壳按 server 进程组的整组清理扫不到——会一直占着端口。
+ * 这里不进队列、不 await、不依赖优雅停的进度，调用时刻现查。
+ *
+ * 只对「组长还活着」的 slot 发（slot.proc 在 exit 后置 null）：组长早已退出的 pid 可能已被系统复用，
+ * 对 -pid 发 KILL 会误杀无关进程组——这种极端残留仍由下次启动的 pidfile 归属核验兜底。
+ * Windows 保持原样（taskkill 是异步子进程、没法在 exit 前同步完成；优雅停路径不变）。
+ */
+export const forceKillAllPreviewsSync = (): void => {
+  if (process.platform === "win32") return;
+  const pids = new Set<number>(getStoppingPgids());
+  for (const slot of getSlotsRef().values()) {
+    const pid = slot.proc?.pid;
+    if (pid && !slot.exited) pids.add(pid);
+  }
+  for (const pid of pids) {
+    if (pid <= 1) continue;
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // ESRCH（已死）/ EPERM：best-effort
+    }
+  }
 };
 
 /** 对单条 pidfile 记录做归属核验后 kill（匹配才杀、不匹配只丢记录） */
@@ -453,6 +501,24 @@ export const stopPreview = (repoPath: string): Promise<void> =>
 /** 停全部预览位（boot / DELETE 不带 repoPath / 全清用） */
 export const stopAllPreviews = (): Promise<void> => enqueue(doStopAllPreviews);
 
+// server 退出（SIGTERM → 退出钩子 stopAllManagedChildren）时一并停掉全部预览 dev server（评审 R1-9）：
+// 它们 spawn 时 `detached` 自成进程组，Electron 壳按 server 的进程组收尾时碰不到，
+// 不在这里停的话 Cmd+Q 之后 dev server 会一直占着端口 / 继续吃 CPU，直到下次启动的 pidfile 兜底（killStalePreview）才清。
+// 按 id 幂等覆盖（globalThis 登记表、dev HMR 不累积）；stop 不抛（doStopAllPreviews 内部 best-effort）
+// 包一层 try/catch：这是 import 时执行的副作用（task-fs 等一大批模块都会间接 import 本文件），
+// 登记失败（注册表不可用 / 测试里整个 mock 掉 kill-orphans 而没提供该导出）不能让整条 import 链炸掉——
+// 失败的代价只是退出时不主动停预览，下次启动仍有 pidfile 兜底（killStalePreview）。
+try {
+  registerManagedChild("preview-manager:all", {
+    label: "preview dev servers",
+    stop: () => stopAllPreviews(),
+    // 退出钩子在 process.exit 之前同步强杀（优雅停比钩子上限还久、且排在预览队列里）
+    forceKill: forceKillAllPreviewsSync,
+  });
+} catch (err) {
+  console.warn("[preview-manager] 登记退出钩子失败（忽略）：", err instanceof Error ? err.message : err);
+}
+
 /**
  * 停掉属于某 task 的所有 slot（删任务 / 终结任务前调用）。
  * 先等「启动中」归零（覆盖已过 route 闸、还在队列里的 start），再停已有 slot。
@@ -478,9 +544,16 @@ const doStopPreview = async (repoPath: string): Promise<void> => {
 
 const doStopAllPreviews = async (): Promise<void> => {
   const map = getSlotsRef();
-  const paths = [...map.keys()];
-  for (const repoPath of paths) {
-    await doStopPreview(repoPath);
+  const slots = [...map.entries()];
+  for (const [repoPath] of slots) map.delete(repoPath);
+  // 并行杀：每个 killProcessGroup 对不听 TERM 的进程最长等 2s，串行的话 N 个预览要 2N 秒、
+  // 远超退出钩子的 1.5s 上限（评审 R1-9）。pidfile 是数组读改写，清记录仍串行（并发 RMW 会互相覆盖）。
+  await Promise.allSettled(
+    slots.map(([, slot]) => (slot.proc?.pid ? killProcessGroup(slot.proc.pid) : undefined)),
+  );
+  for (const [, slot] of slots) {
+    // 只清自己那条（token 核验）
+    await clearPidFileIf(slot.token);
   }
 };
 

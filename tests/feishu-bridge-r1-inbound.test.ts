@@ -2,6 +2,8 @@
  * R1 入向/基建族：串行链 / 去重 / RMW 写队列 / retryable / keep-awake 身份
  */
 import { EventEmitter } from "node:events";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import type { ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -255,6 +257,86 @@ describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
       }),
     );
     expect(await hasProcessedMessageId("om_5xx_h")).toBe(false);
+  });
+});
+
+describe("记账三步（标记已处理 / 记 chatId / 推进补拉游标）各自 best-effort、互不连累", () => {
+  // root / Windows 下 chmod 000 挡不住读，无法构造「bridge-state 读不出来」——跳过
+  const canMakeUnreadable =
+    process.platform !== "win32" && (process.getuid?.() ?? 1) !== 0;
+
+  it.skipIf(!canMakeUnreadable)(
+    "bridge-state 持续不可读：消息照常注入、处理函数不抛，且补拉游标照样推进（否则游标停在原地，每次重连都把同一批消息再注入一遍）",
+    async () => {
+      const inject = vi.fn(async () => okInjectResponse());
+      routerDeps({ handleChatReplyInject: inject as never });
+      // 先落一份 bridge-state（之后把它弄成读不出来）
+      await markProcessedMessageId("om_seed");
+      const stateFile = path.join(TMP, "data", "feishu-bridge", "bridge-state.json");
+      await fs.chmod(stateFile, 0o000);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const createTime = String(Date.now() - 1_000);
+        await expect(
+          defaultMessageHandler(
+            baseRaw({ message_id: "om_unreadable", create_time: createTime }),
+          ),
+        ).resolves.toBe("handled"); // 不抛；记账失败也不能把已成功的消息当成「可重试失败」
+        expect(inject).toHaveBeenCalledTimes(1);
+        // 游标（card-map 另一份文件）推进了——补拉窗口越过这条
+        expect(await getLastProcessedTs()).toBe(createTime);
+        // 标记失败有迹可循
+        expect(warn.mock.calls.some((c) => String(c[0]).includes("标记已处理"))).toBe(true);
+      } finally {
+        warn.mockRestore();
+        await fs.chmod(stateFile, 0o600);
+      }
+      // 之前的去重历史没被读失败那次冲掉
+      expect(await hasProcessedMessageId("om_seed")).toBe(true);
+    },
+  );
+});
+
+describe("defaultMessageHandler 返回处理结果（补拉据此判断游标能不能越过）", () => {
+  it("可重试失败（5xx / getBotAppInfo 抖动）→ retryable_failed；成功注入 / 终态拒绝 / 去重命中 / 非消息事件 → handled", async () => {
+    // 5xx → retryable_failed
+    routerDeps({ handleChatReplyInject: async () => failInjectResponse(503, "upstream") });
+    expect(await defaultMessageHandler(baseRaw({ message_id: "om_o_5xx" }))).toBe("retryable_failed");
+    expect(await hasProcessedMessageId("om_o_5xx")).toBe(false);
+
+    // 成功 → handled；同一条再来（去重命中）→ handled
+    routerDeps({ handleChatReplyInject: async () => okInjectResponse() });
+    expect(await defaultMessageHandler(baseRaw({ message_id: "om_o_ok" }))).toBe("handled");
+    expect(await defaultMessageHandler(baseRaw({ message_id: "om_o_ok" }))).toBe("handled");
+
+    // 内容终态（409）→ handled（不重放：重放也还是被拒）
+    routerDeps({ handleChatReplyInject: async () => failInjectResponse(409, "排队已满") });
+    expect(await defaultMessageHandler(baseRaw({ message_id: "om_o_409" }))).toBe("handled");
+
+    // 不是消息事件 → handled（没有东西可重放）
+    expect(await defaultMessageHandler({ type: "something.else" })).toBe("handled");
+  });
+});
+
+describe("补拉批内出现失败后：handler 照常处理消息但不推进游标", () => {
+  it("defaultMessageHandler(raw, { skipCursorAdvance: true })：注入 + 标记已处理照常，补拉游标原地不动；不带该选项时推进（行为同旧）", async () => {
+    const inject = vi.fn(async () => okInjectResponse());
+    routerDeps({ handleChatReplyInject: inject as never });
+    const before = String(Date.now() - 600_000);
+    await setLastProcessedTs(before);
+
+    const t1 = String(Date.now() - 2_000);
+    await defaultMessageHandler(
+      baseRaw({ message_id: "om_skip_cursor", create_time: t1 }),
+      { skipCursorAdvance: true },
+    );
+    expect(inject).toHaveBeenCalledTimes(1);
+    expect(await hasProcessedMessageId("om_skip_cursor")).toBe(true); // 去重表保证之后重放安全
+    expect(await getLastProcessedTs()).toBe(before); // 游标没动
+
+    const t2 = String(Date.now() - 1_000);
+    await defaultMessageHandler(baseRaw({ message_id: "om_adv_cursor", create_time: t2 }));
+    expect(await getLastProcessedTs()).toBe(t2);
   });
 });
 

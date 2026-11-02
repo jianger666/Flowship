@@ -33,6 +33,10 @@
  *    跟不跟只看返回值、跟 isAtBottom 无关）。
  *    → 两个起点一起拆：跟随的贴底不再经过 scrollToIndex（控制器直接写 scrollTop、自己复查，
  *    可取消、用户一上滚就停，见 hooks/use-stream-follow），也不再给 Virtuoso 传 followOutput。
+ *    第三个起点——进入对话时的**初始定位**（Virtuoso 的 `initialTopMostItemIndex`）——也已拆掉（2026-11-02 评审 K1 根治）：
+ *    无头 Chrome 实测，切回正在流式的 chat、列表出现后 ≤150ms 上滚，栈里抓到 react-virtuoso 自己的
+ *    `scrollTo({ top, behavior: "auto" })` 把位置往底部拽。现在不再传 `initialTopMostItemIndex`，
+ *    「落到最后一条」由控制器在容器挂上时接手（`attachScroller` 在稳定期内起贴底链），同样可取消、上滚即停。
  *
  * 只放纯函数：DOM 事件接线在 hooks/use-stream-follow.ts。
  */
@@ -82,6 +86,27 @@ export const PIN_SETTLE_STABLE_FRAMES = 3;
  * 盯完靠下一个 chunk / 下一次渲染重新发起。
  */
 export const PIN_SETTLE_MAX_FRAMES = 30;
+
+/**
+ * 进入对话 / 任务后的「定位稳定期」（毫秒，2026-11-01 评审 K1）。
+ *
+ * 进入一个对话 / 任务时，初始落底由控制器自己的贴底链完成（2026-11-02 起 Virtuoso 不再传 `initialTopMostItemIndex`）：
+ * 列表还没测量时 `scrollHeight≈clientHeight`，贴底链会因为「连续 3 帧距底 ≤1」提前收工，随后测量完成列表增高，
+ * 就停在半路——此时没有任何上滚意图，跟随态仍是 true，却已经偏离底部、也没有「回到最新」出口
+ * （K1 之前 Virtuoso 的初始定位是另一条互不知情的 rAF 链，同样会造成这种错位）。稳定期内：
+ * - 贴底链不按「连续几帧贴着」收工、也不耗帧数预算，改由时间收口；
+ * - scroll 回调里发现「跟随中、无上滚意图、没有贴底链在跑、却离底很远」就重新请求贴底（漂移兜底）。
+ * 稳定期只由 `beginSettle()` 显式开启（渲染期的初始定位 latch 里调），所以只覆盖「刚进入」的这一小段，
+ * 稳定期之外的程序化 / 选区拖拽滚动不会被这条兜底拽回。
+ */
+export const MOUNT_SETTLE_MS = 1500;
+
+/**
+ * 「跟随中却离底超过这个距离」= 被程序化滚动带偏了（像素）。
+ * 漂移兜底（稳定期内）会据此重新贴底；稳定期外则据此让「回到最新」按钮出现（给用户一个出口）。
+ * 取 2 倍贴底带：比亚像素 / 一两行正文的正常抖动大、比一屏小得多。
+ */
+export const DRIFT_THRESHOLD_PX = FOLLOW_PIN_THRESHOLD * 2;
 
 /** 滚动容器几何（只取判定要用的三个值，方便单测构造） */
 export interface ScrollGeometry {
@@ -263,7 +288,36 @@ const UP_INTENT_KEYS: ReadonlySet<string> = new Set([
   "Home",
 ]);
 
-export const isUpIntentKey = (key: string): boolean => UP_INTENT_KEYS.has(key);
+/**
+ * 键盘上翻：↑ PageUp Home，以及 **Shift+空格**（浏览器里空格 = 往下翻一屏、Shift+空格 = 往上翻一屏）。
+ * 空格落在「空格 = 激活」的元素上（按钮 / summary…）时不滚动，由调用方先用 `isSpaceActivatesTarget` 过滤。
+ */
+export const isUpIntentKey = (key: string, shiftKey = false): boolean =>
+  UP_INTENT_KEYS.has(key) || (key === " " && shiftKey);
+
+/**
+ * 按空格时会被「激活」而不是滚动页面的元素：按钮 / summary / 带 button·tab·switch·checkbox·menuitem 这类 role 的元素。
+ * （input / textarea / select / contenteditable 另有 `isEditableTarget` 在前面拦掉。）
+ */
+export const isSpaceActivatesTarget = (
+  tagName: string,
+  role: string | null | undefined,
+): boolean =>
+  tagName === "BUTTON" ||
+  tagName === "SUMMARY" ||
+  (role != null && SPACE_ACTIVATING_ROLES.has(role));
+
+const SPACE_ACTIVATING_ROLES: ReadonlySet<string> = new Set([
+  "button",
+  "tab",
+  "switch",
+  "checkbox",
+  "radio",
+  "menuitem",
+  "menuitemcheckbox",
+  "menuitemradio",
+  "option",
+]);
 
 /** 滚轮：deltaY < 0 = 往上翻 */
 export const isUpIntentWheel = (deltaY: number): boolean => deltaY < 0;
@@ -323,8 +377,9 @@ const DOWN_INTENT_KEYS: ReadonlySet<string> = new Set([
   "End",
 ]);
 
-export const isDownIntentKey = (key: string): boolean =>
-  DOWN_INTENT_KEYS.has(key);
+/** 键盘下翻：↓ PageDown End，以及不带 Shift 的空格（同样先过 `isSpaceActivatesTarget`） */
+export const isDownIntentKey = (key: string, shiftKey = false): boolean =>
+  DOWN_INTENT_KEYS.has(key) || (key === " " && !shiftKey);
 
 /** 滚轮：deltaY > 0 = 往下翻 */
 export const isDownIntentWheel = (deltaY: number): boolean => deltaY > 0;

@@ -1,8 +1,10 @@
 /**
  * 旁路只读守卫（review P0 的回归护栏）：read / grep / glob 的凭据文件拦截与目录钳制。
  *
- * 注：旁路已改 honor-system（提示词-only），本文件转为 isBypassBlockedReadPath / clampBypassBasePath 等纯函数 + def 的
- * 单元覆盖，当前旁路运行时不再接线。留着：哪天想收紧，接回去就行，不用重写。
+ * 注：这些守卫**有真实接线**——需求群受限答疑旁路（restricted-question.ts 传 `readOnly: true`）的 pi 路径经
+ * custom-agent-backend 的 `buildRestrictedReadOnlyToolDefs` 使用 `buildReadOnlyToolDefs` 里这套带守卫的 read / grep / glob。
+ * 本文件是 isBypassBlockedReadPath / clampBypassBasePath 等纯函数 + def 的单元覆盖。
+ * Cursor 路径的 read 由 SDK 本地执行、**不走**这些守卫（没有路径约束），所以只适合可信内部群。
  * 只读 shell 的白名单守卫（validateReadonlyShellCommand 那一整套）已在 v1.9.33 删除（没有调用方、期限已到），
  * 对应的坏人 / 好人用例随它一起删了；要恢复先看 pi-coding-tools.ts 里 READONLY_CUSTOM_TOOL_NAMES 上的说明。
  *

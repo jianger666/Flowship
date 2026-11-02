@@ -4,7 +4,8 @@
  * 机制：旁路读守卫拦的是「数据目录根里的 config.json 及其备份族」+「任意位置的 company-env.json」，原先两侧都是逐字比较。
  * macOS（APFS 默认）/ Windows（NTFS 默认）的文件系统大小写不敏感：`<数据目录>/CONFIG.JSON` 与 `config.json` 是同一个文件，
  * 词法比较却认不出（数据目录目录名的大小写变体同理）；另外硬链接 / 符号链接换个名字也是同一个文件。
- * 当前没有调用方传 readOnly: true，所以是潜伏的；趁没人接线先补。
+ * 写这条测试时没有调用方传 readOnly: true、是潜伏的；现在需求群受限答疑（restricted-question.ts）传 `readOnly: true`，
+ * pi 路径的 read / grep / glob 经这个守卫，所以这个口子不再是潜伏的（Cursor 路径的 read 由 SDK 执行、不走本守卫）。
  *
  * 已拍板的修法（本测试钉住）：
  *   1. darwin / win32：词法比较两侧做 casefold（仅这两个平台；linux 保持大小写敏感）；

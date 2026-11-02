@@ -19,6 +19,7 @@
  * 前端不 import server 目录（无先例），所以 groupRun 的 key 在这里自己写一份。
  */
 
+import { sliceHeadSafe } from "@/lib/text-slice";
 import type { TaskEvent } from "@/lib/types";
 
 /**
@@ -241,7 +242,7 @@ export const oneLineAnswer = (text: string): string => {
       .split("\n")
       .map((s) => s.replace(/\s+/g, " ").trim())
       .find(Boolean) ?? "";
-  return line.length > 120 ? `${line.slice(0, 120)}…` : line;
+  return line.length > 120 ? `${sliceHeadSafe(line, 120)}…` : line;
 };
 
 /** 列表时间：MM-DD HH:mm（普通 formatTs 只有 HH:mm，跨天轮次不够用） */
@@ -485,7 +486,7 @@ export interface GroupRunStep {
 
 const clipLine = (s: string, max: number): string => {
   const line = s.replace(/\s+/g, " ").trim();
-  return line.length > max ? `${line.slice(0, max)}…` : line;
+  return line.length > max ? `${sliceHeadSafe(line, max)}…` : line;
 };
 
 /** 参数里最能说明「它在干嘛」的字段，按优先级挑第一个字符串 */

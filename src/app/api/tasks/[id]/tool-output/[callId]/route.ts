@@ -14,7 +14,10 @@ import path from "node:path";
 
 import { dataRoot } from "@/lib/server/data-root";
 import { TOOL_OUTPUTS_DIR } from "@/lib/server/task-fs-core";
-import { sanitizeCallIdForPath } from "@/lib/server/tool-result-persist";
+import {
+  redactToolOutputText,
+  sanitizeCallIdForPath,
+} from "@/lib/server/tool-result-persist";
 
 interface Ctx {
   params: Promise<{ id: string; callId: string }>;
@@ -47,17 +50,31 @@ export const GET = async (_req: Request, { params }: Ctx) => {
     `${safeName}.txt`,
   );
 
+  let raw: string;
   try {
-    const text = await fs.readFile(absPath, "utf-8");
-    return new Response(text, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        // 全量输出按 callId 唯一、可短缓存
-        "Cache-Control": "private, max-age=60",
-      },
-    });
+    raw = await fs.readFile(absPath, "utf-8");
   } catch {
     return errorJson("not_found", 404);
   }
+  // 读出来再脱敏一次：写盘端（tool-result-persist）已脱敏，这里兜住改动前落盘、尚未被启动期迁移处理的老文件
+  // （当时是原始 stdout 明文）与「写盘后才轮换 / 新增的凭据」。纯文本精确值替换、线性扫描、有输入上限
+  // （超大文件只回头尾脱敏窗口 + 提示，见 redactToolOutputText），没配凭据 / 没命中时原样返回，不动换行与行数。
+  // 脱敏抛错 = fail-closed：回 500、绝不把读到的原文发出去（也不当成 404——文件在，只是不能安全展示）。
+  let text: string;
+  try {
+    text = redactToolOutputText(raw);
+  } catch (err) {
+    console.warn(
+      `[tool-output] 读时脱敏失败、未返回内容 task=${id} err=${err instanceof Error ? err.name : typeof err}`,
+    );
+    return errorJson("redact_failed", 500);
+  }
+  return new Response(text, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      // 全量输出按 callId 唯一、可短缓存
+      "Cache-Control": "private, max-age=60",
+    },
+  });
 };

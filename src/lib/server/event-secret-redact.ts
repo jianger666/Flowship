@@ -9,12 +9,26 @@
  * 本模块是兜底：agent 仍可能 echo / printenv 该变量，或读 `config.json` / `company-env.json`
  * 取 apiKey、服务器 / PG / Redis 密码，这些精确值落盘 / 推流前一律替换成占位符（gitToken 同样继续脱敏）。
  *
- * 方案（两个入口，值集合共用）：
+ * 方案（几个入口，值集合共用）：
  *   1. 落盘：所有事件行都经 `task-fs-core.appendEventLine` 落盘——在那里把当前凭据的**精确值**
  *      替换成占位符（原地改事件对象，之后 publish 的也是脱敏版）。
  *   2. 实时推流：`tool_output_delta` / `assistant_delta` / `thinking_delta` 等增量帧不落盘（或延迟
  *      合并后才落盘），不经 appendEventLine——在 `task-stream.publish`（SSE 与飞书回流的唯一
  *      扇出点）推送前对其文本字段脱敏（命中才拷贝改写，未命中零额外开销）。
+ *   3. 工具输出全文文件（`tasks/<id>/tool-outputs/<callId>.txt`，UI「加载完整输出」读的那份）：
+ *      事件里的 tool_result 只带预览、走第 1 条；全文是另一份文件，不经 appendEventLine，要单独守三道
+ *      （实现都在 `tool-result-persist.ts` 与 `GET /api/tasks/[id]/tool-output/[callId]`）：
+ *      - 写时：`redactToolOutputText`（对本模块 `redactSecretsInText` 的包装）后再写，文件 0600 / 目录 0700。
+ *        fail-closed：脱敏本身抛错 → 不落盘、输出换成「脱敏失败」提示，绝不回退写明文；
+ *        输入上限 `TOOL_OUTPUT_REDACT_MAX_CHARS`（16M 字符）——超过的只留头尾各半、各自脱敏，中间换截断提示
+ *        （窗口边缘各削掉一条最长凭据的长度，防凭据被窗口切断留半截），任何路径都不输出未脱敏原文。
+ *      - 读时：GET 读出文件后再脱敏一遍（覆盖「凭据是写文件之后才配的」「旧版明文」）；脱敏抛错 → 500、不回明文。
+ *      - 旧文件迁移：boot recovery 末尾后台一次性把旧版明文就地脱敏（`migrateLegacyToolOutputs`；
+ *        每个任务的 `tool-outputs/.redacted-v1` 标记记录当时的凭据条数，条数没增加就不再扫；有预算、
+ *        失败吞掉、没配凭据时整个不跑）。
+ *   4. 其它外流点（诊断包、飞书出站 / 群消息、子代理过程记录与后台子代理清单、shell 实时输出桥、
+ *      累积型快照、排队消息摘要等）各自在出口直接调 `redactSecretsInText` / `redactCopyIfHit`，
+ *      不走上面三条；新增外流点请照这个口径补。
  * 精确匹配而不是正则猜：不会误伤别的字符串，也不依赖 token 前缀格式。
  *
  * 值集合（各用不同占位符；去重后长值优先，避免短值是长值子串时留下半截明文）：
@@ -53,14 +67,21 @@
  *     apiKey / 公司环境密码的 Basic 头、其它库的 URL 编码风格差异（`encodeURIComponent` 不编 `!'()*`，
  *     而 Python `quote` 会编；小写十六进制 `%2f`；`+` 代空格），以及把凭据拆成几段分别打印 —— 都**不覆盖**。
  *     脱敏是事后遮盖、不是隔离：真要让 agent 看不到凭据，只能走 env / credential helper 注入（见上）。
- *   - 已落盘的老 `events.jsonl` 仍是明文，不做迁移。
+ *   - 已落盘的老 `events.jsonl` 仍是明文，不做迁移（`tool-outputs/*.txt` 是例外：上面第 3 条有启动期一次性迁移，
+ *     因为那份存的是工具输出的整段原文、体量和泄漏面都比事件预览大）。迁移自身的局限：单个超过 64MB 的旧文件跳过
+ *     （读时脱敏仍兜住 GET）；只认迁移时已配置的凭据——之前轮换掉、已不在 config 里的旧凭据抹不掉。
+ *   - 配了凭据时，超过 `TOOL_OUTPUT_REDACT_MAX_CHARS` 的单条工具输出落盘版只剩头尾（中间被截断提示替换）；
+ *     这是为了让脱敏耗时有上界，换来的代价是超大输出的中段在「加载完整输出」里看不到。
  *   - 增量流里 token 被切在两个相邻增量帧时，单帧内无法精确匹配（实现「保留末尾 len-1 字符」的
  *     小缓冲要改动各流的收尾 / lease 失主 / 重连快照语义，不够便宜安全）。缓解：累积型消费者
  *     （thinking 快照、飞书 p2p 卡片正文、群回复正文）对**累积文本**再脱敏一次，能抓到跨帧的
  *     完整 token；落盘版（assistant_message / tool_result 整段）也是整段匹配。SSE 浏览器端只会
  *     短暂看到被切开的半截 token，之后落盘版替换为占位符。
- *   - 其它 settings 字段（如 `mcpServers` 的 headers / env 值）语义不明（env 里常是 `production`
- *     这类普通值），不纳入。
+ *   - 其它 settings 字段语义不明（env 里常是 `production` 这类普通值），不纳入。注意 `mcpServers` 的
+ *     headers / env 里**键名像凭据**的值、以及落盘的 MCP OAuth token 现在**已纳入**（`[REDACTED:mcpSecret]`，
+ *     见下方「MCP server 凭据」一节；键名不像凭据的、长度 < 8 的、`$VAR` 引用不收）。`~/.cursor/mcp.json`
+ *     （Cursor 自己的文件，运行时不读它，但 agent 照样能 `cat` 到）的 `mcpServers` 也按同一口径**只读**纳入
+ *     （第七轮；候选目录与能力页「从 Cursor 导入」同源，见 cursor-dirs.ts）。
  *   - 进程 env 里**除 FLOWSHIP_GITLAB_TOKEN 外**的敏感变量不覆盖：Flowship 自己只往 process.env 注入这一个凭据，
  *     其余（用户启动环境里自带的 `*_TOKEN` / `*_API_KEY` / `AWS_*` 等）来源与语义不可枚举，按变量名猜
  *     （如含 token / secret / password）既会漏、也会误伤普通值（如 `*_TOKEN_URL` 这类放的是地址的变量），
@@ -69,12 +90,14 @@
  *     gitToken 已改 env 注入（命令里只有变量名、不出现值——除非 agent 违规 echo 它）；
  *     apiKey / 公司环境密码仍靠 agent 读文件取，这部分根治同样要改成 env / credential helper 注入。
  *
- * 依赖方向：只依赖 data-root，不 import task-fs-core / task-stream（被它们引用，避免环）。
+ * 依赖方向：只依赖 data-root（及 git-token-env 里的一个常量，该模块对本模块无运行时依赖），
+ * 不 import task-fs-core / task-stream / tool-result-persist（它们都引用本模块，避免环）。
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { getGlobalCursorDirs } from "./cursor-dirs";
 import { dataRoot, stripBom } from "./data-root";
 // 只取常量：git-token-env 对 settings-fs 只有 type import（编译期擦除），没有运行时依赖，不会成环
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
@@ -83,6 +106,8 @@ import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 export const REDACTED_GIT_TOKEN = "[REDACTED:gitToken]";
 export const REDACTED_API_KEY = "[REDACTED:apiKey]";
 export const REDACTED_COMPANY_ENV = "[REDACTED:companyEnv]";
+/** MCP server 的凭据：settings.mcpServers 的 headers / env 里凭据类字段的值 + 落盘的 MCP OAuth token */
+export const REDACTED_MCP_SECRET = "[REDACTED:mcpSecret]";
 
 /**
  * 太短的值不脱敏：精确子串替换会把正文里的普通片段（如用户随手配的 "abc"）误伤成占位符。
@@ -128,7 +153,19 @@ export interface RedactionSecret {
  * 它只被下一次收缩写覆盖、普通保存不碰，所以比 `.bak` 活得更久：用户清空 key 时，旧 key 躺在它里面；
  * 而「上一次收缩时记下的旧 key」之后被轮换掉（config.json 里已是新值、`.bak` 也早被后续保存滚掉了）时，也会长期只躺在它里面——同一条泄漏路径。
  */
-type FileSlot = "config" | "configBackup" | "configBackupShrink" | "companyEnv";
+type FileSlot =
+  | "config"
+  | "configBackup"
+  | "configBackupShrink"
+  | "companyEnv"
+  /** `<dataRoot>/mcp-oauth/` 目录（每个 server 一个 json）：按**目录** stat 失效，见 `readMcpOAuthSecretsCached` */
+  | "mcpOAuth"
+  /**
+   * Cursor 全局 `mcp.json`（`getGlobalCursorDirs()` 的第 0 / 1 个候选目录各一个槽；win32 才会有第 2 个候选）。
+   * 与 cursor-config 取「第一个能读到的」不同，脱敏**每个候选都收**：宁可多遮、不能漏。
+   */
+  | "cursorMcp0"
+  | "cursorMcp1";
 
 type FileCache = {
   file: string;
@@ -148,6 +185,9 @@ type CacheHolder = {
     configBackup: RedactionSecret[];
     configBackupShrink: RedactionSecret[];
     companyEnv: RedactionSecret[];
+    mcpOAuth: RedactionSecret[];
+    cursorMcp0: RedactionSecret[];
+    cursorMcp1: RedactionSecret[];
     /** 合并时 `FLOWSHIP_GITLAB_TOKEN` 的值：env 变了（会话启动 / 设置保存会改它）就要重算 */
     envToken: string;
     /** 原值集合（去重、长值优先） */
@@ -158,9 +198,9 @@ type CacheHolder = {
 };
 
 // 缓存挂 globalThis：Next dev 多 chunk 下模块级变量不共享（同 task-fs-core 踩过的坑）
-// V3：merged 里新增 expanded（编码变体）；V4：新增 configBackup 槽；V5：新增 configBackupShrink 槽。
+// V3：merged 里新增 expanded（编码变体）；V4：新增 configBackup 槽；V5：新增 configBackupShrink 槽；V6：新增 mcpOAuth 槽；V7：新增 cursorMcp0 / cursorMcp1 槽。
 // 旧形状的缓存对象（dev HMR 残留）不能再复用——缺新槽 / 新字段会让 merged 的引用比对永远不等、或读到 undefined
-const CACHE_KEY = "__flowshipEventRedactSecretCacheV5__";
+const CACHE_KEY = "__flowshipEventRedactSecretCacheV7__";
 const getCacheHolder = (): CacheHolder => {
   const g = globalThis as unknown as Record<string, CacheHolder | undefined>;
   if (!g[CACHE_KEY]) {
@@ -170,6 +210,9 @@ const getCacheHolder = (): CacheHolder => {
         configBackup: null,
         configBackupShrink: null,
         companyEnv: null,
+        mcpOAuth: null,
+        cursorMcp0: null,
+        cursorMcp1: null,
       },
       merged: null,
     };
@@ -214,6 +257,350 @@ const collectCompanyEnvSecrets = (
   }
 };
 
+/**
+ * MCP server 凭据（headers / env / 顶层 url）。只纳入**键名像凭据**的值，不是整个 headers / env 一锅端（env 里常是 `production` / `true` 这类普通值，
+ * `Content-Type: application/json` 之类的头也 ≥ 8 位，整锅端会满屏误码）：
+ *   - 键名含 password / passwd / pwd / secret / token / api-key / access-key / private-key / credential /
+ *     authorization / cookie / bearer / signature，或独立的 `auth` / `key` / `dsn` / `jwt` / `sig` 词
+ *     （`X-Auth`、`MY_AUTH_KEY`、`MAPS_KEY`、`SENTRY_DSN`、URL 里的 `?sig=`），或以 `session` 开头的词
+ *     （`X-Session` / `SESSION_ID` / `sessionId`），或驼峰词尾（`appKey` / `userSession` / `userJwt`）；
+ *   - 键名以 url / uri / endpoint / host / path / file / dir / name / type / expires / ttl 结尾的**整串不收**
+ *     （`TOKEN_URL` / `API_KEY_FILE` 放的是地址 / 路径，不是秘密本身）；
+ *   - 值是环境变量引用（`$FOO` / `${FOO}` / `${env:FOO}` / `{{ FOO }}` / `%FOO%`）的不收——那不是明文；
+ *     `Bearer ${TOKEN}` 这类「认证方案 + 引用」同理整条不收（字面量 `${TOKEN}` 不是秘密，收了会把它打印的地方全涂掉）；
+ *   - 长度 < MIN_SECRET_LENGTH 的不收（pushSecret 统一把关：`true` / `1` / 短串不会被当密钥）。
+ * `Authorization: Bearer <令牌>` 这类带认证方案前缀的头，整串与令牌本身各收一条（agent 打印时两种写法都可能出现）。
+ *
+ * `args` 数组（stdio server 的命令行参数）：URL 形态参数里的 userinfo 密码 / 凭据名 query 参数、凭据名旗标的值（`--api-key xxx` /
+ * `--token=xxx`）、`KEY=VALUE`、`--header "Name: value"`，细则见 {@link collectMcpArgSecrets}；query 参数名额外认裸 `sign`。
+ *
+ * **URL 形态的值**（不论键名，含 `DATABASE_URL` 这类被 `*_URL` 豁免的键、以及 server 顶层 `url`）：不收整条 URL（它多半只是地址），
+ * 只抽 ① userinfo 里的**密码**段（`postgres://user:<密码>@host`）；② 凭据名 query 参数的**值**（`?token=` / `?api_key=` / `?sig=` …，
+ * 判定与键名同一口径）。密码 / 参数值是 `$FOO` 之类引用的不收；解码前后的写法各收一条。
+ */
+const MCP_CREDENTIAL_KEY_RE =
+  /(password|passwd|pwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credential|authorization|cookie|bearer|signature|(?:^|[-_.])(?:auth|key|dsn|jwt|sig)(?:$|[-_.])|(?:^|[-_.])session)/i;
+/** 驼峰词尾：`appKey` / `sessionId` / `userJwt`（上面那条带 i 标志，吃不到大小写边界，单列且大小写敏感） */
+const MCP_CREDENTIAL_CAMEL_KEY_RE = /[a-z0-9](?:Key|Session|Dsn|Jwt)(?:$|[A-Z_.-])/;
+const MCP_NON_SECRET_KEY_SUFFIX_RE =
+  /(?:url|uri|endpoint|host|path|file|dir|name|type|expires?|ttl|timeout|interval|method|mode)$/i;
+const ENV_REFERENCE_VALUE_RE =
+  /^(?:\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^{}]*\}\}|%[A-Za-z_][A-Za-z0-9_]*%)$/;
+const AUTH_SCHEME_PREFIX_RE = /^(?:Bearer|Basic|Token|Digest)\s+(.+)$/i;
+const URL_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
+
+const isMcpCredentialKey = (key: string): boolean =>
+  (MCP_CREDENTIAL_KEY_RE.test(key) || MCP_CREDENTIAL_CAMEL_KEY_RE.test(key)) &&
+  !MCP_NON_SECRET_KEY_SUFFIX_RE.test(key);
+
+const safeDecodeURIComponent = (v: string): string => {
+  try {
+    return decodeURIComponent(v);
+  } catch {
+    return v;
+  }
+};
+
+/** 引用占位（含 URL 里被百分号编码的 `%24%7BFOO%7D`）→ 不是明文 */
+const isEnvReference = (v: string): boolean =>
+  ENV_REFERENCE_VALUE_RE.test(v.trim()) || ENV_REFERENCE_VALUE_RE.test(safeDecodeURIComponent(v).trim());
+
+/** query 参数名：键名规则 + 裸 `sign`（`?sign=` / `?Sign=` / `?SIGN=` 是常见的签名参数；`signature` / `sig` 键名规则已含） */
+const isMcpQueryCredentialKey = (key: string): boolean =>
+  isMcpCredentialKey(key) || /^sign$/i.test(key);
+
+/** userinfo 里「密码」位置常见的占位字面量（真正的令牌放在用户名位置） */
+const USERINFO_PLACEHOLDER_PASSWORDS: ReadonlySet<string> = new Set([
+  "x-oauth-basic",
+  "x-access-token",
+  "x-token-auth",
+  "oauth2",
+  "x",
+]);
+
+const pushUrlPart = (out: RedactionSecret[], raw: string): void => {
+  if (!raw || isEnvReference(raw)) return;
+  pushSecret(out, raw, REDACTED_MCP_SECRET);
+  const decoded = safeDecodeURIComponent(raw);
+  if (decoded !== raw) pushSecret(out, decoded, REDACTED_MCP_SECRET);
+};
+
+/** URL 形态的值：只抽 userinfo 密码 + 凭据名 query 参数的值，绝不整条收 */
+const pushUrlCredentials = (out: RedactionSecret[], raw: string): void => {
+  const value = raw.trim();
+  if (!URL_VALUE_RE.test(value)) return;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return;
+  }
+  pushUrlPart(out, url.password);
+  // `https://<令牌>@host/…`（GitHub / GitLab 的 PAT 常这么写）：没有密码段时 userinfo 里唯一的那段可能就是凭据。
+  // 有密码时用户名只是账号名（`postgres://app_user:<密码>@h`）；没有密码但用户名像账号名（`ssh://deploy_user@h`）也不收：
+  // 只收「≥ 16 位、字母数字混合」的（PAT / API key 的形态），避免把 `deploy_user` 之类到处涂掉。
+  // 密码段是约定俗成的占位字面量时（`https://<PAT>:x-oauth-basic@github.com`、`oauth2` / `x-access-token` / `x`），令牌同样在用户名位置。
+  if (
+    (!url.password || USERINFO_PLACEHOLDER_PASSWORDS.has(url.password.toLowerCase())) &&
+    /^[\w.~%-]{16,}$/.test(url.username) &&
+    /\d/.test(url.username) &&
+    /[A-Za-z]/.test(url.username)
+  ) {
+    pushUrlPart(out, url.username);
+  }
+  const q = value.indexOf("?");
+  if (q < 0) return;
+  const hash = value.indexOf("#", q);
+  const query = value.slice(q + 1, hash >= 0 ? hash : undefined);
+  for (const part of query.split("&")) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) continue;
+    if (!isMcpQueryCredentialKey(safeDecodeURIComponent(part.slice(0, eq)))) continue;
+    pushUrlPart(out, part.slice(eq + 1));
+  }
+};
+
+const pushMcpKeyedValue = (
+  out: RedactionSecret[],
+  key: string,
+  raw: unknown,
+): void => {
+  if (typeof raw !== "string") return;
+  const value = raw.trim();
+  if (!value) return;
+  // URL 形态的值不论键名都抽凭据（`DATABASE_URL` 这类被键名后缀豁免的也要抽）
+  pushUrlCredentials(out, value);
+  if (!isMcpCredentialKey(key)) return;
+  if (ENV_REFERENCE_VALUE_RE.test(value)) return;
+  const scheme = AUTH_SCHEME_PREFIX_RE.exec(value);
+  // `Bearer ${TOKEN}` / `Basic %TOKEN%`：方案 + 引用，不是明文，整条不收
+  if (scheme && ENV_REFERENCE_VALUE_RE.test(scheme[1].trim())) return;
+  pushSecret(out, value, REDACTED_MCP_SECRET);
+  if (scheme) pushSecret(out, scheme[1], REDACTED_MCP_SECRET);
+};
+
+/** args 数组最多看多少项 / 单项最多多长（超了整项跳过）：配置里的 args 通常几项、几十字节，封顶只是防畸形输入拖慢 */
+const MCP_ARGS_MAX_COUNT = 256;
+const MCP_ARGS_MAX_LENGTH = 64 * 1024;
+/** 旗标形态：`-v` / `--token` / `--token=abc`（用来判断「裸旗标后面跟的是值还是另一个旗标」） */
+const MCP_FLAG_LIKE_RE = /^--?[A-Za-z][\w-]*(?:=|$)/;
+/** 带 `Name: value` 形态值的旗标（mcp-remote 的 `--header "Authorization: Bearer …"`、curl 风格 `-H`） */
+const MCP_HEADER_FLAG_RE = /^(?:--[Hh]eaders?|-H)$/;
+/** 值是 `KEY=VALUE` 的环境变量旗标（`--env=API_TOKEN=xxx`、`--env-var=…`；空格分隔的 `--env KEY=VAL` 下一项本来就是 KEY=VALUE，走通用分支） */
+const MCP_ENV_FLAG_RE = /^(?:env|environment|env-var|set-env)$/i;
+/** curl 风格的 basic auth 旗标，值是 `user:password`（只收冒号之后的密码段，没有冒号的是账号名，不收） */
+const MCP_BASIC_AUTH_FLAG_RE = /^(?:-u|--user|--proxy-user)$/;
+
+const pushMcpBasicAuth = (out: RedactionSecret[], raw: string): void => {
+  const value = stripMcpQuotes(raw.trim());
+  const i = value.indexOf(":");
+  if (i < 0) return;
+  const password = value.slice(i + 1);
+  if (!password || ENV_REFERENCE_VALUE_RE.test(password.trim())) return;
+  pushSecret(out, password, REDACTED_MCP_SECRET);
+};
+
+/** 单趟、线性的「像 shell 那样」切词：空白分隔，引号内的空白不切；引号本身保留（交给 stripMcpQuotes） */
+const splitMcpArgTokens = (text: string): string[] => {
+  const tokens: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+    } else if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+      if (cur) tokens.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) tokens.push(cur);
+  return tokens;
+};
+
+/** 去掉整个 token 外层的一对引号，以及 `--flag="value"` 里值外层的引号 */
+const stripMcpQuotes = (v: string): string =>
+  v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0] ? v.slice(1, -1) : v;
+
+const pushMcpHeaderPair = (out: RedactionSecret[], raw: string): void => {
+  const m = /^([^:=\s]+)\s*[:=]\s*(.*)$/s.exec(raw.trim());
+  if (m) pushMcpKeyedValue(out, m[1]!, m[2]!.trim());
+};
+
+/**
+ * `mcpServers.<x>.args`：命令行参数里的凭据。只认三种形态（都不整条收，避免误伤普通参数）：
+ * - URL 形态的 token（`server-postgres postgresql://u:p@h/db` 里的 `postgresql://…`）：userinfo 密码 + 凭据名 query 参数；
+ * - 凭据名旗标的值：`--api-key xxx`（下一项）/ `--token=xxx`（`=` 之后）/ `--password "a b"`；旗标名按 headers / env 同一套键名规则判定
+ *   （`--key-file` / `--keyboard-layout` / `--token-url` 这类路径 / 非凭据不收），值是 `$VAR` / `${VAR}` / `%VAR%` 引用的不收，
+ *   值长得像另一个旗标（`--token --verbose`）说明这个旗标没带值，不收；
+ * - `KEY=VALUE`（`-e API_TOKEN=xxx` / `DATABASE_URL=postgres://u:p@h/db`）：按键名规则同上；
+ * - `--header` / `-H` 的下一项 `Name: value`（mcp-remote 常用）：按 header 键名规则；
+ * - `-u` / `--user` / `--proxy-user`（curl 风格，仅当命令 / 参数里有 curl、wget 等才认，docker 的 `-u user:group` 不是密码）的 `user:password`：只收冒号后的密码段；
+ *   `--env=KEY=VALUE`：按 KEY 判定；
+ * - URL userinfo 只有一段（`https://<令牌>@host`，没有密码）：这一段就是凭据，收。
+ * 单项里带空白的（`["-c", "npx srv --token abc"]`）按引号感知切词后同样处理。单趟扫描、有数量 / 长度封顶，线性。
+ */
+const collectMcpArgSecrets = (args: unknown, out: RedactionSecret[], opts: { basicAuth?: boolean } = {}): void => {
+  if (!Array.isArray(args)) return;
+  const basicAuth = opts.basicAuth === true;
+  let pendingKey: string | null = null; // 上一个 token 是凭据名裸旗标 → 本 token 是它的值
+  let pendingHeader = false; // 上一个 token 是 --header / -H → 本 token 是 `Name: value`
+  let pendingBasic = false; // 上一个 token 是 -u / --user / --proxy-user → 本 token 是 `user:password`
+  const handle = (rawToken: string): void => {
+    const t = stripMcpQuotes(rawToken);
+    if (pendingHeader) {
+      pendingHeader = false;
+      pushMcpHeaderPair(out, t);
+      return;
+    }
+    if (pendingBasic) {
+      pendingBasic = false;
+      if (!MCP_FLAG_LIKE_RE.test(t)) {
+        pushMcpBasicAuth(out, t);
+        return;
+      }
+    }
+    if (pendingKey !== null) {
+      const key = pendingKey;
+      pendingKey = null;
+      if (!MCP_FLAG_LIKE_RE.test(t)) {
+        pushMcpKeyedValue(out, key, t);
+        return;
+      }
+    }
+    if (MCP_HEADER_FLAG_RE.test(t)) {
+      pendingHeader = true;
+      return;
+    }
+    if (basicAuth && MCP_BASIC_AUTH_FLAG_RE.test(t)) {
+      pendingBasic = true;
+      return;
+    }
+    const eq = t.indexOf("=");
+    if (t.startsWith("-")) {
+      const name = t.replace(/^-+/, "");
+      if (eq > 0) {
+        // --flag=value：value 外层可能还带引号（--token="abc"）
+        const flag = t.slice(0, eq);
+        const value = stripMcpQuotes(t.slice(eq + 1));
+        const flagName = flag.replace(/^-+/, "");
+        const valueEq = value.indexOf("=");
+        if (MCP_HEADER_FLAG_RE.test(flag)) pushMcpHeaderPair(out, value);
+        else if (basicAuth && MCP_BASIC_AUTH_FLAG_RE.test(flag)) pushMcpBasicAuth(out, value);
+        else if (MCP_ENV_FLAG_RE.test(flagName) && valueEq > 0) {
+          // `--env=API_TOKEN=xxx`：值本身是 KEY=VALUE，按键名规则判定
+          pushMcpKeyedValue(out, value.slice(0, valueEq), stripMcpQuotes(value.slice(valueEq + 1)));
+        } else pushMcpKeyedValue(out, flagName, value);
+      } else if (name && isMcpCredentialKey(name)) {
+        pendingKey = name;
+      }
+      return;
+    }
+    if (URL_VALUE_RE.test(t)) {
+      pushUrlCredentials(out, t);
+      return;
+    }
+    if (eq > 0) pushMcpKeyedValue(out, t.slice(0, eq), stripMcpQuotes(t.slice(eq + 1)));
+  };
+  let count = 0;
+  for (const item of args) {
+    if (++count > MCP_ARGS_MAX_COUNT) break;
+    if (typeof item !== "string" || item.length > MCP_ARGS_MAX_LENGTH) {
+      pendingKey = null;
+      pendingHeader = false;
+      pendingBasic = false;
+      continue;
+    }
+    const text = item.trim();
+    if (!text) continue;
+    // `--header` 的下一项整条就是 `Name: value`（含空白），不能先切词
+    if (pendingHeader) {
+      pendingHeader = false;
+      pushMcpHeaderPair(out, stripMcpQuotes(text));
+      continue;
+    }
+    // 凭据名裸旗标的下一项整条就是它的值（数组形态里值可以含空白：`["--password", "a b c"]`），也不切词
+    if (pendingKey !== null) {
+      const key = pendingKey;
+      pendingKey = null;
+      if (!MCP_FLAG_LIKE_RE.test(text)) {
+        pushMcpKeyedValue(out, key, stripMcpQuotes(text));
+        continue;
+      }
+    }
+    if (!/\s/.test(text)) {
+      handle(text);
+      continue;
+    }
+    // 带空白的一项：数组形态的整项 `--flag=带 空白 的值` 先按整项收一次，再按 shell 字符串（`["-c", "npx srv --token abc"]`）切词收一遍
+    const eq = text.indexOf("=");
+    if (text.startsWith("-") && eq > 0 && !/\s/.test(text.slice(0, eq))) handle(text);
+    for (const tok of splitMcpArgTokens(text)) handle(tok);
+  }
+};
+
+/**
+ * `-u` / `--user` 在 curl / wget / httpie 里是 `user:password`，在 docker 里是 `user:group`（`-u appuser:appgroup`）。
+ * 只有命令本身是 curl 类、或参数里出现 `curl` / `wget`（`sh -c "curl -u …"`）才按 basic auth 收，免得把组名当密码到处涂掉。
+ */
+const isCurlLikeMcpServer = (cfg: Record<string, unknown>): boolean => {
+  if (typeof cfg.command === "string" && /(?:^|[\\/])(?:curl|wget|http|https|xh)(?:\.exe)?$/i.test(cfg.command.trim())) {
+    return true;
+  }
+  return (
+    Array.isArray(cfg.args) &&
+    cfg.args.some((a) => typeof a === "string" && a.length <= MCP_ARGS_MAX_LENGTH && /\b(?:curl|wget)\b/.test(a))
+  );
+};
+
+/** `settings.mcpServers`：`{ <name>: { url?: string, args?: string[], headers?: Record, env?: Record, … } }`；形状不对的静默跳过 */
+const collectMcpServerSecrets = (servers: unknown, out: RedactionSecret[]): void => {
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) return;
+  for (const server of Object.values(servers as Record<string, unknown>)) {
+    if (!server || typeof server !== "object") continue;
+    const cfg = server as Record<string, unknown>;
+    // http / sse 型 server 的地址本身可能带 `?token=` / userinfo
+    if (typeof cfg.url === "string") pushUrlCredentials(out, cfg.url);
+    collectMcpArgSecrets(cfg.args, out, { basicAuth: isCurlLikeMcpServer(cfg) });
+    for (const field of ["headers", "env"] as const) {
+      const bag = cfg[field];
+      if (!bag || typeof bag !== "object" || Array.isArray(bag)) continue;
+      for (const [key, val] of Object.entries(bag as Record<string, unknown>)) {
+        pushMcpKeyedValue(out, key, val);
+      }
+    }
+  }
+};
+
+/**
+ * 落盘的 MCP OAuth 记录（`<dataRoot>/mcp-oauth/<sha256>.json`，见 mcp-oauth.ts 的 OAuthRecord）里的凭据：
+ * `tokens.access_token` / `refresh_token` / `id_token` 与 DCR 的 `client.client_secret`。
+ * 不 import mcp-oauth（本模块依赖方向受限，见文件头），按落盘形状读。
+ */
+const extractMcpOAuthRecordSecrets = (parsed: unknown): RedactionSecret[] => {
+  const out: RedactionSecret[] = [];
+  if (!parsed || typeof parsed !== "object") return out;
+  const rec = parsed as Record<string, unknown>;
+  const tokens = rec.tokens;
+  if (tokens && typeof tokens === "object") {
+    const t = tokens as Record<string, unknown>;
+    pushSecret(out, t.access_token, REDACTED_MCP_SECRET);
+    pushSecret(out, t.refresh_token, REDACTED_MCP_SECRET);
+    pushSecret(out, t.id_token, REDACTED_MCP_SECRET);
+  }
+  const client = rec.client;
+  if (client && typeof client === "object") {
+    pushSecret(out, (client as Record<string, unknown>).client_secret, REDACTED_MCP_SECRET);
+  }
+  return out;
+};
+
 /** `config.json`（settings）里的凭据：gitToken / apiKey / 自定义 provider 的 apiKey / companyEnv */
 const extractConfigSecrets = (parsed: unknown): RedactionSecret[] => {
   const out: RedactionSecret[] = [];
@@ -229,6 +616,15 @@ const extractConfigSecrets = (parsed: unknown): RedactionSecret[] => {
     }
   }
   collectCompanyEnvSecrets(cfg.companyEnv, out);
+  collectMcpServerSecrets(cfg.mcpServers, out);
+  return out;
+};
+
+/** Cursor 全局 `mcp.json`：根对象 `{ mcpServers: { … } }`，口径与 settings.mcpServers 完全一致 */
+const extractCursorMcpFileSecrets = (parsed: unknown): RedactionSecret[] => {
+  const out: RedactionSecret[] = [];
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return out;
+  collectMcpServerSecrets((parsed as Record<string, unknown>).mcpServers, out);
   return out;
 };
 
@@ -260,8 +656,22 @@ const readSecretsCached = (
   fileName: string,
   extract: (parsed: unknown) => RedactionSecret[],
 ): RedactionSecret[] => {
-  const holder = getCacheHolder();
   const file = path.join(dataRoot(), fileName);
+  return readSecretsCachedAt(slot, file, () =>
+    extract(JSON.parse(stripBom(readFileSync(file, "utf-8"))) as unknown),
+  );
+};
+
+/**
+ * `readSecretsCached` 的通用内核：按 `file`（文件或目录）的 stat 指纹缓存 `load()` 的结果。
+ * `load` 抛错的处理同上（ENOENT = 没配；其它 = 沿用上一次读成功的值、不动缓存条目）。
+ */
+const readSecretsCachedAt = (
+  slot: FileSlot,
+  file: string,
+  load: () => RedactionSecret[],
+): RedactionSecret[] => {
+  const holder = getCacheHolder();
   try {
     const st = statSync(file, { bigint: true });
     const hit = holder.files[slot];
@@ -275,9 +685,7 @@ const readSecretsCached = (
     ) {
       return hit.secrets;
     }
-    const secrets = extract(
-      JSON.parse(stripBom(readFileSync(file, "utf-8"))) as unknown,
-    );
+    const secrets = load();
     holder.files[slot] = {
       file,
       ino: st.ino,
@@ -299,6 +707,70 @@ const readSecretsCached = (
     const prev = holder.files[slot];
     return prev && prev.file === file ? prev.secrets : NO_SECRETS;
   }
+};
+
+/**
+ * `<dataRoot>/mcp-oauth/*.json` 里的 token（目录里每个 server 一个文件）。缓存按**目录** stat 失效：
+ * 记录文件是 tmp + rename 原子写（mcp-oauth.ts 的 writePrivateFileAtomic），任何新建 / 续期 / 清除都会改目录的
+ * mtime / ctime，所以热路径只多一次 stat；目录没变就复用上次的值集合（同一个数组引用，`resolveMerged` 靠引用比对）。
+ * 单个文件 JSON 损坏 → 跳过该文件（不抛，免得坏文件让每个事件都重读整个目录）；读文件抛 ENOENT 以外的错（半写 / EBUSY / 权限）
+ * → 整体抛出，由 `readSecretsCachedAt` 沿用上一次的值、不动缓存，下次再试。
+ */
+const readMcpOAuthSecretsCached = (): RedactionSecret[] => {
+  const dir = path.join(dataRoot(), "mcp-oauth");
+  return readSecretsCachedAt("mcpOAuth", dir, () => {
+    const out: RedactionSecret[] = [];
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".json")) continue;
+      let text: string;
+      try {
+        text = readFileSync(path.join(dir, name), "utf-8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue; // 读目录之后被删了
+        throw err;
+      }
+      try {
+        out.push(...extractMcpOAuthRecordSecrets(JSON.parse(stripBom(text)) as unknown));
+      } catch {
+        // 坏 JSON：跳过这一个文件
+      }
+    }
+    return out;
+  });
+};
+
+/** Cursor 全局 `mcp.json` 的体积上限：真实文件是几 KB；超过它多半不是配置文件，不读、不解析（沿用上一次的值） */
+const CURSOR_MCP_JSON_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Cursor 全局 `mcp.json` 里的 MCP 凭据（只读；缓存按文件 stat 失效，热路径每槽只多一次 stat）。
+ * `index` = 候选目录下标：该下标没有候选（非 win32 只有 1 个）→ 清槽、返回空集合。
+ * 文件不存在 / 读不出来的处理同 `readSecretsCachedAt`（ENOENT = 没配；其它沿用上次读成功的值）。
+ */
+const readCursorMcpSecretsCached = (index: 0 | 1): RedactionSecret[] => {
+  const slot: FileSlot = index === 0 ? "cursorMcp0" : "cursorMcp1";
+  const holder = getCacheHolder();
+  const dir = getGlobalCursorDirs()[index];
+  if (!dir) {
+    holder.files[slot] = null;
+    return NO_SECRETS;
+  }
+  const file = path.join(dir, "mcp.json");
+  // 上一次读成功的值（同一个文件才算）：坏文件 / 超大文件沿用它——并且**记下这次的 stat 指纹**，文件不再变就不再读
+  const prev = holder.files[slot];
+  const prevSecrets = prev && prev.file === file ? prev.secrets : NO_SECRETS;
+  return readSecretsCachedAt(slot, file, () => {
+    // 这是 Cursor 自己的文件（不是我们 tmp+rename 原子写的）：可能半写、可能被手改坏、可能被塞进超大文件。
+    // 不能让它每个事件帧都 read + parse 一遍（config.json 系的「读不出来就不记指纹」是因为它们是原子写、坏文件罕见）。
+    if (statSync(file).size > CURSOR_MCP_JSON_MAX_BYTES) return prevSecrets;
+    const text = stripBom(readFileSync(file, "utf-8"));
+    try {
+      return extractCursorMcpFileSecrets(JSON.parse(text) as unknown);
+    } catch (err) {
+      if (err instanceof SyntaxError) return prevSecrets; // 坏 JSON：记指纹、沿用上次的值；文件一变（含写完整）就会重读
+      throw err; // 其它（EBUSY / 权限）：交给 readSecretsCachedAt 的通用处理，不记指纹、下次再试
+    }
+  });
 };
 
 /** Flowship 注入的 git credential helper 用的 HTTP Basic 用户名（见 team-library.ts 的 INLINE_CREDENTIAL_HELPER） */
@@ -361,7 +833,7 @@ const expandWithEncodedVariants = (raw: RedactionSecret[]): RedactionSecret[] =>
 
 /**
  * 合并各处来源并缓存（原值集合 + 带变体的替换集合一起算、一起失效）。
- * 缓存键 = config / configBackup / configBackupShrink / companyEnv 四份来源数组的引用（文件 stat 没变就是同一个数组）
+ * 缓存键 = config / configBackup / configBackupShrink / companyEnv / mcpOAuth / cursorMcp0 / cursorMcp1 七份来源数组的引用（文件 stat 没变就是同一个数组）
  * + env 里 PAT 的当前值。
  */
 const resolveMerged = (): NonNullable<CacheHolder["merged"]> => {
@@ -382,6 +854,9 @@ const resolveMerged = (): NonNullable<CacheHolder["merged"]> => {
     "company-env.json",
     extractCompanyEnvFileSecrets,
   );
+  const mcpOAuth = readMcpOAuthSecretsCached();
+  const cursorMcp0 = readCursorMcpSecretsCached(0);
+  const cursorMcp1 = readCursorMcpSecretsCached(1);
   const envToken = process.env[GITLAB_TOKEN_ENV_NAME]?.trim() ?? "";
   const m = holder.merged;
   if (
@@ -390,6 +865,9 @@ const resolveMerged = (): NonNullable<CacheHolder["merged"]> => {
     m.configBackup === configBackup &&
     m.configBackupShrink === configBackupShrink &&
     m.companyEnv === companyEnv &&
+    m.mcpOAuth === mcpOAuth &&
+    m.cursorMcp0 === cursorMcp0 &&
+    m.cursorMcp1 === cursorMcp1 &&
     m.envToken === envToken
   ) {
     return m;
@@ -405,6 +883,9 @@ const resolveMerged = (): NonNullable<CacheHolder["merged"]> => {
     ...configBackup,
     ...configBackupShrink,
     ...companyEnv,
+    ...mcpOAuth,
+    ...cursorMcp0,
+    ...cursorMcp1,
   ]) {
     if (seen.has(s.value)) continue;
     seen.add(s.value);
@@ -416,6 +897,9 @@ const resolveMerged = (): NonNullable<CacheHolder["merged"]> => {
     configBackup,
     configBackupShrink,
     companyEnv,
+    mcpOAuth,
+    cursorMcp0,
+    cursorMcp1,
     envToken,
     out,
     expanded: expandWithEncodedVariants(out),
@@ -425,7 +909,7 @@ const resolveMerged = (): NonNullable<CacheHolder["merged"]> => {
 };
 
 /**
- * 当前需要脱敏的凭据**原值**集合（config.json + config.json.bak + config.json.bak.shrink + company-env.json + 进程 env 里的 GitLab PAT 合并）。
+ * 当前需要脱敏的凭据**原值**集合（config.json + config.json.bak + config.json.bak.shrink + company-env.json + MCP OAuth 记录 + Cursor 全局 mcp.json + 进程 env 里的 GitLab PAT 合并）。
  * 同值只留一条（先到先得：gitToken > apiKey > companyEnv）；长值在前，
  * 保证「短值恰好是长值子串」时先替换长的、不留半截明文。
  * 实际脱敏用的是 `getEventRedactionReplacements`（原值 + 编码变体）；这里只给「有哪些凭据」。

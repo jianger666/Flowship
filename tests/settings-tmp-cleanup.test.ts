@@ -95,10 +95,11 @@ describe("cleanupStaleSettingsTmpFiles", () => {
 
   it("名字只差一点的不动：别的文件的 tmp、corrupt 的 tmp、没有 tmp 段的、前缀不对的", async () => {
     const keep = [
-      // company-env.json 的原子写临时文件（writeCompanyEnvFile → writePrivateFileAtomic，形态与 config.json 的完全一样）。
-      // ⚠ 这里钉的是「本函数的作用域只限 config.json 家族」（K3-08 只针对这一族），**不是**「它不含凭据」：
-      // 崩溃遗留的 company-env.json.tmp.* 里同样是明文的服务器 / PG / Redis 等密码，目前没有任何地方清它（残余缺口，见 settings-fs.ts 注释）
-      "company-env.json.tmp.4242.abc",
+      // company-env.json 的 tmp 现在有自己的清理分支（见 tests/stale-tmp-sweep.test.ts：1 小时、严格匹配）；
+      // 这里留下它的「近亲」——名字只差一点的变体必须仍然保留
+      "company-env.json.tmp.my-copy",
+      "company-env.json.bak.tmp.4242.abc",
+      "xcompany-env.json.tmp.4242.abc",
       "config.json.corrupt-1760000000000.tmp.4242.abc",
       "config.json.tmp", // 没有 `.tmp.` 后缀段
       "xconfig.json.tmp.4242.abc",

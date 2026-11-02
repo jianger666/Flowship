@@ -136,7 +136,6 @@ describe("② npmrc 认证行", () => {
     expectBlocked(
       [
         [`//registry.npmjs.org/:_authToken=${FAKE_LEGACY_NPM_TOKEN}`, FAKE_LEGACY_NPM_TOKEN],
-        [`//registry.npmjs.org/:_authToken=${FAKE_NPM_TOKEN}`, FAKE_NPM_TOKEN],
         ["//registry.npmjs.org/:_auth=dXNlcjpwYXNzd29yZDEyMw==", "dXNlcjpwYXNzd29yZDEyMw=="],
         ["//npm.example.com/:_authToken=AbCd1234EfGh5678IjKl", "AbCd1234EfGh5678IjKl"],
         ["//npm.example.com:8080/repo/:_authToken=AbCd1234EfGh5678IjKl", "AbCd1234EfGh5678IjKl"],
@@ -145,6 +144,13 @@ describe("② npmrc 认证行", () => {
         ["//registry.npmjs.org/:_password=cGFzc3dvcmQxMjM=", "cGFzc3dvcmQxMjM="],
       ],
       "credential-key",
+      ".npmrc",
+    );
+    // 新式 `npm_` + 36 位令牌：值形态规则（known-token）在注释行里排在 npmrc 认证行规则前面先命中，仍是恰好 1 条、仍脱敏；
+    // 以前没有 npm_ 值形态规则时由 npmrc 规则兜成 credential-key，只是命中类型标签变了、照样被拦
+    expectBlocked(
+      [[`//registry.npmjs.org/:_authToken=${FAKE_NPM_TOKEN}`, FAKE_NPM_TOKEN]],
+      "known-token",
       ".npmrc",
     );
   });

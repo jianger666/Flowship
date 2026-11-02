@@ -214,12 +214,14 @@ const installHang = (name: string) => {
 const snapshotOf = (frames: Frame[]): Frame => frames.find((f) => f.type === "assistant_snapshot")!;
 
 describe("bootstrap：assistant_snapshot 帧", () => {
-  it("没有进行中的正文：快照帧照发、live 为 null，且紧挨在 thinking_snapshot 之前", async () => {
+  it("没有进行中的正文：快照帧照发、live 为 null，且排在 tool_output_snapshot / thinking_snapshot 之前（三帧依次紧挨）", async () => {
     const id = await alloc();
     const frames = await collect(await watch(id), hasThinkingSnapshot);
     expect(snapshotOf(frames)).toEqual({ type: "assistant_snapshot", live: null });
     const types = frames.map((f) => f.type);
-    expect(types.indexOf("assistant_snapshot")).toBe(types.indexOf("thinking_snapshot") - 1);
+    // shell 输出快照夹在正文快照与思考快照之间（见 tests/watch-task-tool-output-snapshot.test.ts）
+    expect(types.indexOf("tool_output_snapshot")).toBe(types.indexOf("assistant_snapshot") + 1);
+    expect(types.indexOf("thinking_snapshot")).toBe(types.indexOf("tool_output_snapshot") + 1);
   });
 
   it("有进行中的正文：快照带预定 eventId / 已发出的整段 / 字数；delta 帧带同一个 eventId", async () => {

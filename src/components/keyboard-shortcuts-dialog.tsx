@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { useShellPlatform } from "@/hooks/use-shell-platform";
+import { getModShortcutLabel } from "@/lib/keyboard-shortcuts";
 import { getModFShortcutLabel } from "@/lib/platform-shortcuts";
 import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
 
@@ -21,7 +22,7 @@ interface Props {
   onOpenChange: (open: boolean) => void;
 }
 
-/** 键位胶囊（Cmd/Ctrl+K 这类展示用、非交互） */
+/** 键位胶囊（⌘K / Ctrl+K 这类展示用、非交互；文案按平台由调用方给） */
 const Kbd = ({ children }: { children: string }) => (
   <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
     {children}
@@ -35,11 +36,11 @@ export const KeyboardShortcutsDialog = ({ open, onOpenChange }: Props) => {
 
   const rows: Array<{ label: string; keys: string[] }> = [
     { label: "搜索此栏", keys: [getModFShortcutLabel(platform)] },
-    { label: "搜索对话", keys: ["Cmd/Ctrl+K"] },
-    { label: "新建对话", keys: ["Cmd/Ctrl+N"] },
-    { label: "切换侧栏", keys: ["Cmd/Ctrl+B"] },
-    { label: "聚焦输入框（任务页）", keys: ["Cmd/Ctrl+J"] },
-    { label: "回到最新（事件流）", keys: ["Cmd/Ctrl+End"] },
+    { label: "搜索对话", keys: [getModShortcutLabel(platform, "K")] },
+    { label: "新建对话", keys: [getModShortcutLabel(platform, "N")] },
+    { label: "切换侧栏", keys: [getModShortcutLabel(platform, "B")] },
+    { label: "聚焦输入框（任务页）", keys: [getModShortcutLabel(platform, "J")] },
+    { label: "回到最新（事件流）", keys: [getModShortcutLabel(platform, "End")] },
     { label: "发送消息", keys: [submitKey] },
     { label: "运行中：排队发送", keys: [submitKey] },
     { label: "清空输入框", keys: ["Esc", "Esc"] },

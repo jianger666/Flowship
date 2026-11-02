@@ -15,7 +15,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 
 import { buildOpenPathPlan } from "@/lib/local-file-os";
-import { stripHostInjectedEnv } from "@/lib/server/host-env";
+import { stripHostInjectedEnvAndGitToken } from "@/lib/server/host-env";
 import { probeOpenPathFacts } from "@/lib/server/open-path-facts";
 import { nonLocalPathReason } from "@/lib/unc-path";
 
@@ -31,7 +31,7 @@ const runSpawn = (
     const child = spawn(command, args, {
       stdio: "ignore",
       detached: true,
-      env: stripHostInjectedEnv(),
+      env: stripHostInjectedEnvAndGitToken(),
     });
     child.on("error", () => resolve(`无法执行 ${command}`));
     child.on("exit", (code) => {

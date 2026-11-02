@@ -99,6 +99,7 @@ const taskSummary = (): TaskSummary =>
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
   }) as TaskSummary;
 
+// 群答疑默认关闭（P0 硬化）：本文件测排队 pump 接线，夹具显式开启
 const fullTask = (over: Partial<Task> = {}): Task =>
   ({ ...taskSummary(), actions: [], events: [], ...over }) as unknown as Task;
 

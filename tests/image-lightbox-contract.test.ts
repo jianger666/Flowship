@@ -28,6 +28,7 @@ import {
 
 import { createHookHarness, type HookHarness } from "./helpers/react-hook-stub";
 import { mainSrc } from "./helpers/main-slice";
+import { markRemoteImageLoaded, resetRemoteImageLoadedForTests } from "@/lib/remote-image-gate";
 
 type LightboxProps = ComponentProps<typeof ImageLightbox>;
 
@@ -66,6 +67,7 @@ const buttonTag = (html: string, label: string): string => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  resetRemoteImageLoadedForTests();
 });
 
 // ---------------------------------------------------------------------- ① 关闭键避开系统按钮条
@@ -307,7 +309,7 @@ const markdownImageHtml = (props: ComponentProps<typeof MarkdownImage>): string 
 
 describe("markdown 里的图：点开大图的是真按钮（Q19-02 ④）", () => {
   it("<button type=button> 包着 <img>，名字带上图的 alt", () => {
-    const html = markdownImageHtml({ src: "https://example.com/a.png", alt: "登录页截图" });
+    const html = markdownImageHtml({ src: "/api/tasks/t1/uploads/a.png", alt: "登录页截图" });
     const btn = buttonTag(html, "查看大图:登录页截图");
     expect(btn).toContain('type="button"');
     // img 在按钮里面，不再自己是点击目标
@@ -316,12 +318,12 @@ describe("markdown 里的图：点开大图的是真按钮（Q19-02 ④）", () 
     const close = html.indexOf("</button>", open);
     expect(img).toBeGreaterThan(open);
     expect(img).toBeLessThan(close);
-    expect(html).toContain('src="https://example.com/a.png"');
+    expect(html).toContain('src="/api/tasks/t1/uploads/a.png"');
     expect(html).toContain('alt="登录页截图"');
   });
 
   it("没有 alt 时名字退回「查看大图」；img 是装饰（alt 为空）", () => {
-    const html = markdownImageHtml({ src: "https://example.com/a.png" });
+    const html = markdownImageHtml({ src: "/api/tasks/t1/uploads/a.png" });
     expect(html).toContain('aria-label="查看大图"');
     expect(html).not.toContain("查看大图:");
     expect(html).toContain('alt=""');
@@ -333,7 +335,7 @@ describe("markdown 里的图：点开大图的是真按钮（Q19-02 ④）", () 
   });
 
   it("样式分工：按钮负责「可点」（cursor-zoom-in、整块、不超宽），img 保留原有外观且不再带 cursor-zoom-in", () => {
-    const html = markdownImageHtml({ src: "https://example.com/a.png", alt: "示意图" });
+    const html = markdownImageHtml({ src: "/api/tasks/t1/uploads/a.png", alt: "示意图" });
     const classesOf = (tag: string): string[] => (/class="([^"]*)"/.exec(tag)?.[1] ?? "").split(/\s+/);
     const btn = classesOf(buttonTag(html, "查看大图:示意图"));
     for (const c of ["block", "w-fit", "max-w-full", "cursor-zoom-in"]) expect(btn, `按钮缺 ${c}`).toContain(c);
@@ -342,6 +344,27 @@ describe("markdown 里的图：点开大图的是真按钮（Q19-02 ④）", () 
       expect(img, `图片缺 ${c}`).toContain(c);
     }
     expect(img).not.toContain("cursor-zoom-in");
+  });
+});
+
+describe("markdown 里的远程图：默认只有占位，点击加载后才是上面那个「查看大图」按钮（前端安全硬化）", () => {
+  const REMOTE = "https://example.com/a.png";
+
+  it("没点之前：没有 <img>、没有该 URL，只有一个带名字的「加载远程图片」按钮", () => {
+    const html = markdownImageHtml({ src: REMOTE, alt: "登录页截图" });
+    expect(html).not.toMatch(/<img\b/);
+    expect(html).not.toContain(REMOTE);
+    const btn = buttonTag(html, "加载远程图片（example.com）：登录页截图");
+    expect(btn).toContain('type="button"');
+    expect(html).not.toContain("查看大图");
+  });
+
+  it("点击加载（记进模块级 Set）之后：渲染成与本地图一样的「查看大图」按钮 + <img>", () => {
+    markRemoteImageLoaded(REMOTE);
+    const html = markdownImageHtml({ src: REMOTE, alt: "登录页截图" });
+    expect(buttonTag(html, "查看大图:登录页截图")).toContain('type="button"');
+    expect(html).toContain(`src="${REMOTE}"`);
+    expect(html).not.toContain("加载远程图片");
   });
 });
 
@@ -374,9 +397,9 @@ const attrNamesIn = (scope: string, tag: string): string[][] => {
 };
 
 describe("源码契约：渲染结果里看不到的接线（Q19-02）", () => {
-  it("MarkdownImage：onClick 挂在 <button> 上，<img> 上没有（点击目标是按钮，不是图片）", () => {
-    const buttons = attrNamesIn("MarkdownImage", "button");
-    const imgs = attrNamesIn("MarkdownImage", "img");
+  it("已加载的 markdown 图（renderLoadedMarkdownImage，MarkdownImage / 远程图点击加载后共用）：onClick 挂在 <button> 上，<img> 上没有（点击目标是按钮，不是图片）", () => {
+    const buttons = attrNamesIn("renderLoadedMarkdownImage", "button");
+    const imgs = attrNamesIn("renderLoadedMarkdownImage", "img");
     expect(buttons).toHaveLength(1);
     expect(buttons[0]).toEqual(expect.arrayContaining(["type", "onClick", "aria-label", "className"]));
     // 两个 <img>：button 里的那个没有 onClick；「外层已是链接 / 按钮」分支（InsideInteractive，链接里套图）里的那个自带 onClick——

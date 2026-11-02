@@ -1235,6 +1235,225 @@ const handleAskUser = (
 };
 
 /**
+ * 终稿卡片同步失败时，正文改用普通文本消息补发的单块上限（字符）。
+ * 留足余量：lark-cli 的 `--text` 走命令行，Windows 上限 32767 字符且引号转义会放大 2~3 倍
+ *（lark-api 的 win32 预检 30_000）；飞书文本消息本身的上限也远大于此。3500 字放大后仍 < 10k，稳。
+ */
+const FALLBACK_TEXT_CHUNK_CHARS = 3_500;
+/** 补发块数上限：超长正文（≈28k 字以上）不再刷屏，末尾提示去 Flowship 看全文——也避免撞飞书的发消息频控 */
+const FALLBACK_TEXT_MAX_CHUNKS = 8;
+
+/**
+ * 把正文切成不超过 `size` 的若干块（保序）。尽量在换行处断开（窗口后半段内找最后一个 `\n`），
+ * 找不到才硬切；硬切点落在代理对中间时回退一位，不拆 emoji / 生僻字。
+ */
+export const splitTextForFallback = (text: string, size = FALLBACK_TEXT_CHUNK_CHARS): string[] => {
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > size) {
+    let cut = rest.lastIndexOf("\n", size);
+    if (cut < size / 2) {
+      cut = size;
+      const code = rest.charCodeAt(cut - 1);
+      // 高代理项（0xD800–0xDBFF）落在块尾 = 把一个字符拆成两半，回退一位
+      if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+    }
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, "");
+  }
+  if (rest.length > 0) chunks.push(rest);
+  return chunks;
+};
+
+// ----------------- finalizeTurn 总预算 -----------------
+
+/**
+ * finalizeTurn 的总时间预算（评审：黑洞场景下各阶段各自满额、合计约 2 分钟占着全局单飞队列）。
+ *
+ * 阶段：卡片终稿（card-stream 自己有 ~40s 预算）→ 正文文字补发（最多 8 块、每块可能 30s 超时）→ 完成追发。
+ * 所有飞书调用共用同一条进程级单飞队列——黑洞时 finalize 每多占一秒，别的任务的发消息 / 入站回执就多陪等一秒。
+ * 预算从 finalizeTurn 入口算起（单调时钟）：超出就**放弃后续补发 / 追发并 warn**（app 内已有「飞书卡片没能同步」的 info，
+ * 用户仍能在 Flowship 看到完整回复），而不是把每一段都等满。
+ */
+const FINALIZE_TOTAL_BUDGET_MS = 60_000;
+let finalizeBudgetMs = FINALIZE_TOTAL_BUDGET_MS;
+
+/** 预算里至少还剩多少才值得再发一次（再短的超时只会白占队列一次、几乎不可能成功） */
+const FINALIZE_MIN_SEND_MS = 3_000;
+let finalizeMinSendMs = FINALIZE_MIN_SEND_MS;
+
+/** 单测调整 finalizeTurn 总预算（及「值得再发一次」的最小剩余）；传 null 复原 */
+export const __setFinalizeBudgetForTest = (ms: number | null, minSendMs?: number): void => {
+  finalizeBudgetMs = ms ?? FINALIZE_TOTAL_BUDGET_MS;
+  finalizeMinSendMs = ms === null ? FINALIZE_MIN_SEND_MS : (minSendMs ?? FINALIZE_MIN_SEND_MS);
+};
+
+/**
+ * 预算用单调时钟：休眠唤醒 / NTP 校时会让墙钟（Date.now）整段跳变——向前跳一小时，
+ * 预算就「瞬间耗尽」、补发和追发被直接跳过；向后跳则预算永不耗尽。performance.now() 不受影响。
+ */
+const monoNow = (): number => performance.now();
+/** lark-cli 单次调用的默认超时（lark-api LARK_TIMEOUT_MS）：剩余预算 ≥ 它时不额外传超时，保持原行为 */
+const LARK_DEFAULT_TIMEOUT_MS = 30_000;
+
+/** 总预算耗尽（用于补发中断；classifyLarkFailure 归 unknown，不会被当作可重试） */
+class FinalizeBudgetExhaustedError extends Error {
+  constructor(what: string) {
+    super(`finalize 总预算（${Math.round(finalizeBudgetMs / 1000)}s）已用尽，放弃${what}`);
+    this.name = "FinalizeBudgetExhaustedError";
+  }
+}
+
+/**
+ * 最多再等 `deadline`（单调时钟）：到点不再等、抛 FinalizeBudgetExhaustedError。
+ * ⚠️ 「不再等」不等于取消：lark-api 的全局单飞队列没有取消，已入队 / 已在跑的调用照常执行到自己的超时。
+ * 所以这给的是 **finalizeTurn 自身耗时**的上界（把队列排队、runLark 内部重试、getBotAppInfo 的等待都算进来），
+ * 不是对全局队列占用的严格上界——已放弃等待的那条仍可能在队列里晚一点发出（本模块从不重发，不会因此重复）。
+ */
+const raceDeadline = async <T>(p: Promise<T>, deadline: number, what: string): Promise<T> => {
+  if (!Number.isFinite(deadline)) return p;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new FinalizeBudgetExhaustedError(what)),
+          Math.max(0, deadline - monoNow()),
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+/**
+ * 在总预算内发一条文本：剩余不足一次有意义的发送 → 抛 FinalizeBudgetExhaustedError（不发）；
+ * 剩余不足默认超时 → 把单次超时压到剩余值，别让最后一发把预算拖爆（≥ 默认超时时不传第三参，行为同旧）；
+ * 整个调用（含队列排队、runLark 内部重试）再用 raceDeadline 兜一层，到点不再等。
+ */
+const sendTextBudgeted = async (
+  openId: string,
+  text: string,
+  deadline: number,
+  what = "后续补发",
+): Promise<void> => {
+  const remaining = deadline - monoNow();
+  if (remaining < finalizeMinSendMs) throw new FinalizeBudgetExhaustedError(what);
+  const call =
+    remaining < LARK_DEFAULT_TIMEOUT_MS
+      ? sendTextMessageImpl(openId, text, { timeoutMs: Math.max(1, Math.floor(remaining)) })
+      : sendTextMessageImpl(openId, text);
+  await raceDeadline(call, deadline, what);
+};
+
+/** 文字补发单块遇到限流时，重发前等多久（只重一次） */
+const FALLBACK_RETRY_DELAY_MS = 1_000;
+let fallbackRetryDelayMs = FALLBACK_RETRY_DELAY_MS;
+
+/** 单测调整补发重试的等待（0 = 不等）；传 null 复原 */
+export const __setFallbackRetryDelayForTest = (ms: number | null): void => {
+  fallbackRetryDelayMs = ms ?? FALLBACK_RETRY_DELAY_MS;
+};
+
+/**
+ * 补发单块：**只对限流（rate_limit）失败**等一会儿再发一次，其余原样抛。
+ *
+ * 为什么不是 transient：文本消息是「新增一条」、不幂等（卡片 PUT 才是整包覆盖、重放无害）。
+ * 限流是飞书明确拒收——这条消息一定没发出去，重发安全；而 transient（5xx / 断网 / 连接重置）
+ * 常见于「请求其实已被飞书受理、只是回包丢了」，重发会让用户收到重复的整段正文。
+ * 这与「写操作不盲目重试」的原则一致：宁可补发中断、app 内留痕让用户去 Flowship 看，也不刷出重复文字。
+ * 同理不重试 lark-cli 超时（分不清「没发出」和「回包丢了」，且会把黑洞拖得更长），
+ * 也不重试业务拒绝（auth / gone / 内容超限——重发多少次都一样）。
+ *
+ * 重发前等待与重发本身都受总预算约束（见 sendTextBudgeted / finalizeTurn）。
+ */
+const sendFallbackChunk = async (
+  openId: string,
+  text: string,
+  deadline: number,
+): Promise<void> => {
+  try {
+    await sendTextBudgeted(openId, text, deadline);
+  } catch (err) {
+    if (classifyLarkFailure(err) !== "rate_limit") throw err;
+    console.warn(
+      `[feishu-bridge/outbound] 终稿文字补发被限流（明确未发出），${fallbackRetryDelayMs}ms 后重发一次：`,
+      err instanceof Error ? err.message : err,
+    );
+    if (fallbackRetryDelayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, fallbackRetryDelayMs));
+    }
+    await sendTextBudgeted(openId, text, deadline);
+  }
+};
+
+/**
+ * 文字补发的结果：full = 全文都发出去了；truncated = 发了封顶的前 N 块、尾部按设计没发；
+ * partial = 中途失败只发出一部分；none = 想发但一块都没发出去；empty = 本轮没有可补发的正文（不算失败）
+ */
+type FallbackOutcome = {
+  status: "full" | "truncated" | "partial" | "none" | "empty";
+  sent: number;
+  total: number;
+  error?: unknown;
+};
+
+/**
+ * 终稿没落到飞书卡片（finalizeOk=false：重试用完仍失败 / 卡没了 / 没权限 / 内容超限收紧也塞不下）时，
+ * 把本轮正文分块作为普通文本消息补发——否则用户在飞书里只剩一张停在中间态的卡片 + 一句「请回 Flowship 查看」，
+ * 正文完全丢在 app 里。
+ *
+ * - 保序、逐块串行发；单块遇限流 / 瞬时失败重发一次（见 sendFallbackChunk），仍失败就停——
+ *   后面的块发出去也是缺了中间的，反而误导；
+ * - **绝不抛**：补发是兜底，不能影响 finalize 主流程（坑 #10）；失败原因随结果返回，由调用方写 app info；
+ * - 块数封顶（FALLBACK_TEXT_MAX_CHUNKS），超出部分以一句话收尾，指向 Flowship；
+ * - 正文里 finalize 前换上的 `![alt](img_key)` 图片在纯文本里没法渲染，折成「[图片]」。
+ */
+const sendUnsyncedAnswerAsText = async (
+  taskId: string,
+  answerText: string,
+  /** finalizeTurn 总预算的截止时刻（ms）；每块发送前核对，用尽就停（见 FINALIZE_TOTAL_BUDGET_MS） */
+  deadline: number,
+): Promise<FallbackOutcome> => {
+  const body = answerText
+    .replace(/!\[([^\]]*)\]\((img[_-][^)]*)\)/gi, (_m, alt: string) =>
+      alt.trim() ? `[图片：${alt.trim()}]` : "[图片]",
+    )
+    .trim();
+  if (!body) return { status: "empty", sent: 0, total: 0 };
+  let sent = 0;
+  let total = 0;
+  try {
+    const info = await raceDeadline(getBotAppInfoImpl(), deadline, "后续补发");
+    const all = splitTextForFallback(body);
+    const chunks = all.slice(0, FALLBACK_TEXT_MAX_CHUNKS);
+    const omitted = all.length > chunks.length;
+    total = chunks.length;
+    for (let i = 0; i < total; i += 1) {
+      const head =
+        i === 0
+          ? `⚠️ 飞书卡片没能同步，以下是完整回复（文字版${total > 1 ? `，共 ${total} 段` : ""}）：\n\n`
+          : `（${i + 1}/${total}）\n`;
+      const tail =
+        omitted && i === total - 1
+          ? "\n\n…（后续内容过长，未在飞书发送，完整回复请回 Flowship 查看）"
+          : "";
+      await sendFallbackChunk(info.ownerOpenId, `${head}${chunks[i]}${tail}`, deadline);
+      sent += 1;
+    }
+    return { status: omitted ? "truncated" : "full", sent, total };
+  } catch (err) {
+    console.warn(
+      `[feishu-bridge/outbound] 终稿文字补发失败 task=${taskId}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return { status: sent > 0 ? "partial" : "none", sent, total, error: err };
+  }
+};
+
+/**
  * 流式卡 finalize 后追发短文本，让用户切走飞书后仍能收到完成推送。
  * 非流式不追（finalize 本就是第一次发卡、通知已在完成时）——除非卡片没发出去（unsynced）：
  * 那时用户在飞书里什么都收不到，必须追发；stopped 不追（用户自己停的）。
@@ -1248,6 +1467,10 @@ const maybeSendCompletionPing = async (
   turn: TurnState,
   opts: { ok: boolean; outcome?: "stopped" },
   unsynced = false,
+  /** 文字补发已把完整回复发出去了（FallbackOutcome.status === "full"）：收尾文案要如实说，别还让用户「回 Flowship 查看」 */
+  fallbackDelivered = false,
+  /** finalizeTurn 总预算截止时刻；不传 = 不设限（仅测试直调时） */
+  deadline = Number.POSITIVE_INFINITY,
 ): Promise<void> => {
   // turn.streaming 在 ensureCardStarted 时定稿；undefined = 未建卡（本路径不会进来）
   if (turn.streaming !== true && !unsynced) return;
@@ -1264,6 +1487,8 @@ const maybeSendCompletionPing = async (
     text = unsynced
       ? "🙋 有问题等你回答，但飞书卡片没能同步（选项按钮可能不可用），请回 Flowship 查看"
       : "🙋 有问题等你回答";
+  } else if (unsynced && fallbackDelivered) {
+    text = `⚠️ 飞书卡片没能同步，完整回复已用文字版发在上面（${formatDuration(elapsedMs)}）`;
   } else if (unsynced) {
     text = `⚠️ 回复没能同步到飞书卡片，请回 Flowship 查看（${formatDuration(elapsedMs)}）`;
   } else {
@@ -1272,8 +1497,8 @@ const maybeSendCompletionPing = async (
   }
 
   try {
-    const info = await getBotAppInfoImpl();
-    await sendTextMessageImpl(info.ownerOpenId, text);
+    const info = await raceDeadline(getBotAppInfoImpl(), deadline, "完成追发");
+    await sendTextBudgeted(info.ownerOpenId, text, deadline, "完成追发");
   } catch (err) {
     console.warn(
       `[feishu-bridge/outbound] 完成追发失败 task=${taskId}:`,
@@ -1289,6 +1514,8 @@ const finalizeTurn = async (
 ): Promise<void> => {
   if (turn.finalized) return;
   turn.finalized = true;
+  // 总预算截止时刻（含等 start / 换图 / 卡片终稿）：后面的文字补发与完成追发都按它收口
+  const budgetDeadline = monoNow() + finalizeBudgetMs;
 
   // 若从未有 assistant 活动（没建卡）→ 直接清状态
   if (!turn.startPromise && !turn.started) {
@@ -1374,8 +1601,39 @@ const finalizeTurn = async (
       }
     }
 
-    // 流式长轮完成后追发短文本推送（unsynced 时文案明说没同步，不报「已完成」）
-    await maybeSendCompletionPing(taskId, turn, opts, unsynced);
+    // 终稿明确没落到卡片（finalizeOk === false，card-stream 已对限流 / 超时退避重试过仍失败）：
+    // 卡片停在最后一次打字机推送，正文只存在 app 里。把正文分块以普通文本补发（保序、不抛），
+    // 再发下面那句收尾提示——提示放最后，用户收到的最后一条推送仍是「没同步」的说明。
+    // 只补成功收尾的轮次：失败轮的 answerText 是半截、stop 是用户自己停的；
+    // finalizeOk 为 undefined / 仅熔断仍开的「结果未知」不补，免得卡片其实已到位时重复刷屏
+    let fallbackDelivered = false;
+    if (health.finalizeOk === false && opts.ok && opts.outcome !== "stopped") {
+      const fb = await sendUnsyncedAnswerAsText(taskId, turn.answerText, budgetDeadline);
+      fallbackDelivered = fb.status === "full";
+      // 补发没发全（一块都没发出去 / 中途失败）：飞书里用户什么都没收到或只收到半截，app 内要留痕说明原因
+      //（和上面「卡片没同步」的 info 是两件事：那条说卡片，这条说文字版兜底也没成）
+      if (fb.status === "none" || fb.status === "partial") {
+        try {
+          const reason = describeCardFailure(fb.error);
+          await writeEventAndPublish(taskId, {
+            kind: "info",
+            text:
+              fb.status === "partial"
+                ? `飞书文字版补发中途失败（${reason}），只发出了前 ${fb.sent}/${fb.total} 段，完整回复请在 Flowship 查看`
+                : `飞书文字版补发也失败了（${reason}），本轮回复没能送到飞书，请在 Flowship 查看`,
+          });
+        } catch (logErr) {
+          console.warn(
+            `[feishu-bridge/outbound] 写补发失败 info 失败 task=${taskId}:`,
+            logErr instanceof Error ? logErr.message : logErr,
+          );
+        }
+      }
+    }
+
+    // 流式长轮完成后追发短文本推送（unsynced 时文案明说没同步，不报「已完成」；
+    // 文字补发已发全时如实说「完整回复已用文字版发出」）
+    await maybeSendCompletionPing(taskId, turn, opts, unsynced, fallbackDelivered, budgetDeadline);
   } catch (err) {
     console.warn(
       `[feishu-bridge/outbound] finalize 失败 task=${taskId}:`,

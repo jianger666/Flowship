@@ -83,6 +83,7 @@ const taskSummary = (over: Partial<TaskSummary> = {}): TaskSummary =>
     ...over,
   }) as TaskSummary;
 
+// 群答疑默认关闭（P0 硬化）：本文件有「非属主旁路不传 queueIfBusy」用例，夹具显式开启
 const fullTask = (over: Partial<Task> = {}): Task =>
   ({ ...taskSummary(), actions: [], events: [], ...over }) as unknown as Task;
 

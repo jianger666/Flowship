@@ -11,7 +11,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 
 import { buildRevealInFolderSpec, isWindowsUncPath } from "@/lib/local-file-os";
-import { stripHostInjectedEnv } from "@/lib/server/host-env";
+import { stripHostInjectedEnvAndGitToken } from "@/lib/server/host-env";
 import { nonLocalPathReason } from "@/lib/unc-path";
 
 export const runtime = "nodejs";
@@ -26,7 +26,7 @@ const runSpawn = (
     const child = spawn(command, args, {
       stdio: "ignore",
       detached: true,
-      env: stripHostInjectedEnv(),
+      env: stripHostInjectedEnvAndGitToken(),
     });
     child.on("error", () => resolve(`无法执行 ${command}`));
     child.on("exit", (code) => {

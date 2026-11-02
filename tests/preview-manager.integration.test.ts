@@ -30,6 +30,7 @@ vi.mock("@/lib/server/task-fs", async (importOriginal) => {
   };
 });
 
+import { stopAllManagedChildren } from "@/lib/server/kill-orphans";
 import {
   getPreviewStatus,
   killStalePreview,
@@ -117,6 +118,22 @@ beforeAll(async () => {
 
 afterEach(async () => {
   await stopAllPreviews();
+});
+
+describe("server 退出钩子停全部预览（评审 R1-9）", () => {
+  it("stopAllManagedChildren（SIGTERM 退出钩子走的入口）会把在跑的 preview dev server 整组停掉", async () => {
+    const { status } = await startPreview(input("task-exit", "sleep 60", "/repo/exit-hook"));
+    expect(status.exited).toBe(false);
+    const rec = (await pidRecords()).find((r) => r.command === "sleep 60");
+    expect(rec?.pid).toBeTruthy();
+    const pid = rec!.pid;
+    expect(isProcessGroupAlive(pid)).toBe(true);
+
+    await stopAllManagedChildren();
+
+    expect(await waitUntil(() => !isProcessGroupAlive(pid), 5000)).toBe(true);
+    expect(getPreviewStatus().filter((s) => !s.exited)).toHaveLength(0);
+  });
 });
 
 describe("preview-manager（CR-10 / 按仓多位）", () => {

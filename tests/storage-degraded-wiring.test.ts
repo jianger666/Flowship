@@ -555,9 +555,11 @@ describe("event-stream.tsx：storageDegraded 非空时渲染 StorageDegradedBar"
     {
       name: "红条挪进虚拟列表里（<Virtuoso 之后）",
       rule: "outside-list",
+      // 先剥注释再变异：源码注释里可能出现字面量 `<Virtuoso/>`（如 R8-3 的说明注释），变异命中注释会被 checkEventStream 的
+      // stripComments 一并抹掉、变异等于没做
       apply: (s) =>
         mutate(
-          mutate(s, RENDER, ""),
+          mutate(stripComments(s), RENDER, ""),
           VIRTUOSO_TAG,
           "<Virtuoso data-x={storageDegraded ? <StorageDegradedBar state={storageDegraded} /> : null}",
         ),

@@ -336,14 +336,26 @@ class FileOAuthClientProvider implements OAuthClientProvider {
  *
  * 复用 SDK 的 `auth()`：没 token 时它会自动「发现 → DCR 注册（首次）→ 生成 PKCE 授权 URL →
  * 调 redirectToAuthorization」。这里先清掉旧 token/verifier、强制走授权流（重新授权也能用）、
- * 但保留已注册的 client + discovery 缓存（DCR 不必每次重来）。
+ * 同一个 server URL 下保留已注册的 client + discovery 缓存（DCR 不必每次重来）；URL 变了则整条旧记录作废。
  */
 export const startMcpOAuth = async (
   serverName: string,
   serverUrl: string,
 ): Promise<string> => {
-  // 先把 serverUrl 落盘（complete/refresh 要从 record 读它）
-  await patchRecord(serverName, serverUrl, { serverName, serverUrl });
+  // 先把 serverUrl 落盘（complete/refresh 要从 record 读它）。
+  // server URL 变了（同名 server 改绑到另一个地址）→ 旧 URL 下 DCR 注册的 client（client_id 属于旧授权服务器）、
+  // discovery 缓存（旧资源 / 授权服务器元数据）、tokens 都不能带到新地址：否则 auth() 会拿旧 client_id 去新授权服务器
+  // 发起授权（invalid_client），或沿用旧 discovery 把授权流打到旧授权服务器。URL 没变（重新授权）才保留 client + discovery。
+  await withServerLock(serverName, async () => {
+    const cur = await readRecord(serverName);
+    const urlChanged =
+      cur !== null &&
+      normalizeServerUrl(cur.serverUrl) !== normalizeServerUrl(serverUrl);
+    await writeRecord(
+      serverName,
+      urlChanged ? { serverName, serverUrl } : { ...(cur ?? {}), serverName, serverUrl },
+    );
+  });
 
   const provider = new FileOAuthClientProvider(serverName, serverUrl);
   // 重新授权场景：清旧 token + 半截的 verifier、强制走浏览器授权流

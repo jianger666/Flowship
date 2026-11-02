@@ -6,6 +6,7 @@
  */
 
 import { isImeComposing } from "@/lib/ime";
+import { getShellPlatform, isMacPlatform, type ShellPlatform } from "@/lib/platform-shortcuts";
 import type { SubmitShortcut } from "@/lib/types";
 
 /** 判定用的最小键盘事件形状（原生 / React 事件都能喂） */
@@ -23,13 +24,37 @@ export interface KeyComboEvent {
 
 /**
  * Cmd/Ctrl + 单字母组合（无 Alt / Shift——避免劫持 Cmd+Shift+K 这类系统位）。
- * mac 用 metaKey、win/linux 用 ctrlKey、两者等价接受。
+ *
+ * 平台口径：
+ * - darwin：**只认 metaKey（⌘）**。mac 的文本框原生支持 Emacs 式光标键（Ctrl+B 左移 / Ctrl+F 右移 / Ctrl+N 下移 /
+ *   Ctrl+K 删到行尾），Ctrl 一并接受只会把这些光标键吞掉；界面文案对应按平台显示——mac 写 ⌘、其它平台写 Ctrl
+ *   （见下面的 `getModShortcutLabel` / platform-shortcuts 的 ⌘F · Ctrl+F）；
+ * - win32 / linux：meta 与 ctrl 都认（Windows 的 Ctrl+K / Ctrl+N 是主口径；Win / Super 键组合到不了应用，认了无害）；
+ * - 未知（SSR / 浏览器无壳 / 单测默认）：与旧行为一致，meta 与 ctrl 都认。
+ *
+ * @param platform 默认读壳平台（`window.__shell.platform`）；单测里显式传即可覆盖各平台
  */
-export const isModCombo = (e: KeyComboEvent, key: string): boolean =>
-  (e.metaKey || e.ctrlKey) &&
+export const isModCombo = (
+  e: KeyComboEvent,
+  key: string,
+  platform: ShellPlatform = getShellPlatform(),
+): boolean =>
+  (isMacPlatform(platform) ? e.metaKey : e.metaKey || e.ctrlKey) &&
   !e.altKey &&
   !e.shiftKey &&
   e.key.toLowerCase() === key.toLowerCase();
+
+/**
+ * Mod + 键的界面文案：mac 写 `⌘K`，其它平台写 `Ctrl+K`（`key` 原样拼接，如 "K" / "End"）。
+ *
+ * 与 `isModCombo` 的平台口径、platform-shortcuts 的 `getModFShortcutLabel`（⌘F / Ctrl+F）同一套——
+ * 后者等价于 `getModShortcutLabel(platform, "F")`（见 tests/keyboard-shortcuts-labels.test.ts）。
+ * 平台未知（SSR / 首次渲染 / 浏览器无壳）按非 mac 渲染成 `Ctrl+…`：
+ * **组件里必须传 `useShellPlatform()` 的结果**——它在 SSR 与首次客户端渲染都是 ""，mount 后才切到 mac，
+ * 所以不会 hydration 不一致；不要在 render 里直接 `getShellPlatform()`（服务端 "" / 客户端 "darwin" 会对不上）。
+ */
+export const getModShortcutLabel = (platform: ShellPlatform, key: string): string =>
+  `${isMacPlatform(platform) ? "⌘" : "Ctrl+"}${key}`;
 
 /** 右侧抽屉（`Sheet` 的 SheetContent）根节点上的 data-slot，焦点归属判定用 */
 export const SHEET_CONTENT_SELECTOR = '[data-slot="sheet-content"]';

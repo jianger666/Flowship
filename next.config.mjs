@@ -53,8 +53,10 @@ const buildCspReportOnlyPolicy = (isProd) =>
     //   转出的 base64 内嵌图（preview-html-sanitize 只放行 data:image base64）、globals.css 里
     //   mask 用的 data:image/svg+xml
     // - blob:：src 里 <img> 暂无 blob 用法，作为保守放行（enforce 前若零上报可去掉）
-    // - https:：Markdown 里 AI 输出 / 飞书内容的远程图（Streamdown 的 harden 默认不限图片 host）、
-    //   docx 外链图。故意不放 http:：本地图一律走同源 /api/local-image，明文 http 图若出现会被上报，正好看看有没有
+    // - https:：Markdown 里 AI 输出 / 飞书内容的远程图——**默认不加载**（`![](https://…)` 只渲染「加载远程图片」占位，
+    //   用户点击后才出 <img>，见 src/lib/remote-image-gate.ts / image-preview.tsx），所以这里的 https: 只服务于
+    //   「用户点击加载」的那一张；docx 预览的外链图已在 preview-html-sanitize 里丢弃（只认 data:image base64）。
+    //   故意不放 http:：本地图一律走同源 /api/local-image，明文 http 图若出现会被上报，正好看看有没有
     // enforce 前收敛：https: 是内容驱动、很难列白名单——大概率保留，或改成「只允许 https + 同源」。
     "img-src 'self' data: blob: https:",
 

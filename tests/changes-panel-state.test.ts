@@ -7,7 +7,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  atLeastPrefix,
   canLoadChanges,
+  describeChangesTotals,
   shouldFallBackToBranch,
   shouldShowChangesEntry,
 } from "@/lib/changes/panel-state";
@@ -108,5 +110,47 @@ describe("shouldFallBackToBranch：选中的提交失效 → 自动切回整条�
   it("别的失败原因（git_error / not_git）不触发回落——那是读不到，不是提交失效", () => {
     expect(shouldFallBackToBranch(commit, [unavailable("git_error")], false)).toBe(false);
     expect(shouldFallBackToBranch(commit, [unavailable("not_git")], false)).toBe(false);
+  });
+});
+
+describe("describeChangesTotals：git 清单被缓冲上限截断时，合计是下限而不是精确值", () => {
+  it("没有溢出：文件数 / 行数都精确（含单纯的 filesTruncated：超 500 个文件但 totals 是全量）", () => {
+    expect(describeChangesTotals([])).toEqual({ filesAtLeast: false, linesAtLeast: false });
+    expect(describeChangesTotals([makeRepo({ repoPath: "/w/a", shortName: "a" })])).toEqual({
+      filesAtLeast: false,
+      linesAtLeast: false,
+    });
+    expect(
+      describeChangesTotals([makeRepo({ repoPath: "/w/a", shortName: "a", filesTruncated: true })]),
+    ).toEqual({ filesAtLeast: false, linesAtLeast: false });
+  });
+
+  it("name-status 被截断（listOverflow + filesTruncated）：文件数与行数都是下限", () => {
+    expect(
+      describeChangesTotals([
+        makeRepo({ repoPath: "/w/a", shortName: "a", filesTruncated: true, listOverflow: true }),
+      ]),
+    ).toEqual({ filesAtLeast: true, linesAtLeast: true });
+  });
+
+  it("只有 numstat 被截断（listOverflow、没有 filesTruncated）：文件数精确、行数是下限", () => {
+    expect(
+      describeChangesTotals([makeRepo({ repoPath: "/w/a", shortName: "a", listOverflow: true })]),
+    ).toEqual({ filesAtLeast: false, linesAtLeast: true });
+  });
+
+  it("多仓：任一仓是下限，合计就是下限", () => {
+    expect(
+      describeChangesTotals([
+        makeRepo({ repoPath: "/w/a", shortName: "a" }),
+        makeRepo({ repoPath: "/w/b", shortName: "b", listOverflow: true }),
+        makeRepo({ repoPath: "/w/c", shortName: "c", filesTruncated: true, listOverflow: true }),
+      ]),
+    ).toEqual({ filesAtLeast: true, linesAtLeast: true });
+  });
+
+  it("atLeastPrefix：下限带「≥」，精确值不带", () => {
+    expect(atLeastPrefix(true)).toBe("≥");
+    expect(atLeastPrefix(false)).toBe("");
   });
 });

@@ -21,6 +21,8 @@ import {
 } from "@/hooks/use-stream-follow";
 import {
   DOWN_INTENT_TTL_MS,
+  DRIFT_THRESHOLD_PX,
+  MOUNT_SETTLE_MS,
   PIN_SETTLE_MAX_FRAMES,
   PIN_SETTLE_STABLE_FRAMES,
 } from "@/lib/scroll-follow";
@@ -1267,5 +1269,613 @@ describe("换 / 摘滚动容器：手势态随旧容器清掉，跟随态不动"
     ctrl.setFollowing(true);
     swapTo(ctrl);
     expect(ctrl.isFollowing()).toBe(true);
+  });
+});
+
+// ---------- 评审 K1：切回生成中的对话，落点停在半路、跟随态仍为 true、没有任何出口 ----------
+
+describe("K1：进入对话后的定位稳定期（beginSettle）——贴底链按时间收口 + 漂移兜底", () => {
+  /** 列表还没测量：scrollHeight == clientHeight（评审里 K1 的触发前提） */
+  const UNMEASURED: Partial<ScrollerInit> = { top: 0, height: 800, client: 800 };
+
+  it("没开稳定期时行为不变：连续 N 帧贴着就收工（回归保护）", () => {
+    const { ctrl } = setupWithScroller({ top: 1200 });
+    ctrl.requestScrollToBottom();
+    for (let i = 0; i < PIN_SETTLE_STABLE_FRAMES; i++) flushFrame();
+    expect(pendingFrames()).toBe(0);
+  });
+
+  it("稳定期内：「连续几帧贴着」不收工（列表没测量时 scrollHeight≈clientHeight 会假性稳定）", () => {
+    const { ctrl } = setupWithScroller(UNMEASURED);
+    ctrl.beginSettle();
+    ctrl.requestScrollToBottom();
+    for (let i = 0; i < PIN_SETTLE_STABLE_FRAMES + PIN_SETTLE_MAX_FRAMES; i++) {
+      flushFrame();
+      expect(pendingFrames()).toBe(1); // 链还活着：既不按稳定帧数收工、也不耗帧数预算
+    }
+  });
+
+  it("稳定期内 Virtuoso 晚到的测量 / 落点：链还在盯、一量出高度就贴到真底部（K1 的核心场景）", () => {
+    const { ctrl, sc } = setupWithScroller(UNMEASURED);
+    ctrl.beginSettle();
+    ctrl.requestScrollToBottom();
+    for (let i = 0; i < 10; i++) flushFrame(); // 空转了好几帧（旧实现这里 3 帧就收工了）
+    sc.grow(1200); // 终于测量完：总高 2000、最大可滚 1200
+    flushFrame();
+    expect(sc.writes).toEqual([2000]);
+    expect(sc.top()).toBe(1200);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("稳定期一过：链按常规规则收工（不会永远空转）", () => {
+    const { ctrl } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    ctrl.requestScrollToBottom();
+    flushFrame();
+    expect(pendingFrames()).toBe(1);
+    clock = MOUNT_SETTLE_MS; // 恰好到点：now < settleUntil 不再成立
+    for (let i = 0; i < PIN_SETTLE_STABLE_FRAMES; i++) flushFrame();
+    expect(pendingFrames()).toBe(0);
+  });
+
+  it("稳定期内用户上滚：跟随关、链当场停（稳定期不是「不让用户走」的借口）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    ctrl.requestScrollToBottom();
+    flushFrame();
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(1000);
+    expect(ctrl.isFollowing()).toBe(false);
+    expect(pendingFrames()).toBe(0);
+    flushFrame();
+    expect(sc.writes).toEqual([]); // 绝不再写 scrollTop
+  });
+
+  it("漂移兜底：稳定期内、跟随中、无上滚意图、没有链在跑、离底很远 → 重新请求贴底", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    // Virtuoso 的初始定位 / 重试落在半路（没有任何用户输入）
+    sc.userScrollTo(1200 - DRIFT_THRESHOLD_PX - 400);
+    expect(ctrl.isFollowing()).toBe(true);
+    expect(pendingFrames()).toBe(1); // 已排了一条贴底链
+    flushFrame();
+    expect(sc.writes).toEqual([2000]);
+    expect(sc.top()).toBe(1200);
+  });
+
+  it("漂移不超过阈值不兜底（亚像素 / 一两行正文的正常抖动）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    sc.userScrollTo(1200 - DRIFT_THRESHOLD_PX);
+    expect(pendingFrames()).toBe(0);
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+  });
+
+  it("稳定期之外不做漂移兜底（选区拖拽 / 中键自动滚动这类没被识别成意图的滚动不该被空闲时拽回）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    clock = MOUNT_SETTLE_MS + 1;
+    sc.userScrollTo(300);
+    expect(ctrl.isFollowing()).toBe(true);
+    expect(pendingFrames()).toBe(0);
+    flushFrame();
+    expect(sc.writes).toEqual([]);
+  });
+
+  it("从没开过稳定期（beginSettle 没调）：同样不兜底", () => {
+    const { sc } = setupWithScroller({ top: 1200 });
+    sc.userScrollTo(300);
+    expect(pendingFrames()).toBe(0);
+  });
+
+  it("有上滚意图的 scroll 不兜底：稳定期内用户真上滚，跟随关、不被拽回", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(300);
+    expect(ctrl.isFollowing()).toBe(false);
+    expect(pendingFrames()).toBe(0);
+  });
+
+  it("已经有贴底链在跑时不重复排（漂移兜底只在「没有链在跑」时才请求）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    ctrl.requestScrollToBottom();
+    expect(rafCalls).toBe(1);
+    sc.userScrollTo(300); // 链正在跑：由它自己把人带回去
+    expect(rafCalls).toBe(1);
+  });
+
+  it("滑行（回到最新）期间不触发漂移兜底（别和滑行抢方向盘）——靠的是不变量「滑行只在 following=false 时才起」", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.beginSettle();
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(700); // 用户上滚离开、跟随关
+    expect(ctrl.isFollowing()).toBe(false);
+    ctrl.scrollToBottomSmooth(); // 开始滑行
+    expect(ctrl.isFollowing()).toBe(false); // 滑行期间跟随态保持 false：漂移兜底（要求 following=true）天然不成立
+    const framesBefore = rafCalls;
+    sc.userScrollTo(800); // 滑行自己写 scrollTop 引出的 scroll 事件
+    expect(rafCalls).toBe(framesBefore);
+    expect(ctrl.isFollowing()).toBe(false);
+    // 反过来：following=true 时「回到最新」不起滑行、直接开闸 + 贴底（所以「跟随中且在滑行」这个状态不存在）
+    ctrl.setFollowing(true);
+    const before = rafCalls;
+    ctrl.scrollToBottomSmooth();
+    expect(rafCalls).toBe(before + 1); // 只排了一条贴底链、没有滑行帧
+  });
+});
+
+describe("K1：stranded —— 跟随中却离底很远时「回到最新」要有出口（getAwaySnapshot）", () => {
+  /** 稳定期之外、无意图的程序化滚动带偏 */
+  const strand = (sc: FakeScroller) => sc.userScrollTo(300);
+
+  it("默认不在 away 态；上滚离开（following=false）就是 away", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(1000);
+    expect(ctrl.getSnapshot()).toBe(false);
+    expect(ctrl.getAwaySnapshot()).toBe(true);
+  });
+
+  it("跟随中、无意图、没有链在跑、离底超过阈值 → stranded：following 仍为 true，但 away=true、订阅者收到一次通知", async () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    const onChange = vi.fn();
+    ctrl.subscribe(onChange);
+    strand(sc);
+    expect(ctrl.getSnapshot()).toBe(true); // 跟随态不动
+    expect(ctrl.getAwaySnapshot()).toBe(true); // 但按钮要出来
+    await Promise.resolve();
+    expect(onChange).toHaveBeenCalledTimes(1);
+    // 同一状态下再来一个 scroll 不重复通知
+    sc.userScrollTo(250);
+    await Promise.resolve();
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("离底不超过阈值不算 stranded", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.userScrollTo(1200 - DRIFT_THRESHOLD_PX);
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+  });
+
+  it("贴底链在跑时不算 stranded（流式贴底的两帧间隙不闪按钮）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    ctrl.requestScrollToBottom();
+    strand(sc);
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+  });
+
+  it("流式内容增高（没有 scroll 事件）不会把跟随中的用户判成 stranded", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.grow(900); // 距底 900，但没有 scroll 事件——贴底链会在下一帧把它带回去
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+  });
+
+  it("滚回底部 → stranded 自动解除", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    strand(sc);
+    expect(ctrl.getAwaySnapshot()).toBe(true);
+    sc.userScrollTo(1200);
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+  });
+
+  it("点「回到最新」（requestScrollToBottom 起链）立刻解除 stranded，不等 scroll 事件", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    strand(sc);
+    expect(ctrl.getAwaySnapshot()).toBe(true);
+    ctrl.scrollToBottomSmooth(); // following=true 时直接开闸 + 贴底
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+    flushFrame();
+    expect(sc.top()).toBe(1200);
+  });
+
+  it("换 / 摘滚动容器时 stranded 作废", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    strand(sc);
+    expect(ctrl.getAwaySnapshot()).toBe(true);
+    ctrl.attachScroller(null);
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+  });
+});
+
+describe("K4：已经在最顶上再上滚不登记意图（滚不动、没有 scroll 事件来消费）", () => {
+  it("scrollTop=0 时滚轮 / 键盘上滚不登记；之后控制器自己贴底引出的 scroll 不会被当成用户上滚", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 0, height: 2000, client: 800 });
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.dispatch("keydown", key("ArrowUp"));
+    ctrl.requestScrollToBottom();
+    flushFrame();
+    sc.dispatch("scroll"); // 控制器自己写 scrollTop 引出的 scroll（立刻发生，远小于 TTL）
+    expect(sc.writes).toEqual([2000]);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("不在最顶上时上滚照常登记（不影响真实上滚）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(1100);
+    expect(ctrl.isFollowing()).toBe(false);
+  });
+});
+
+describe("K6：窗口从后台切回前台补一次贴底（visibilitychange）", () => {
+  type DocListener = () => void;
+  let docListeners: Map<string, Set<DocListener>>;
+  let visibility: "visible" | "hidden";
+
+  beforeEach(() => {
+    docListeners = new Map();
+    visibility = "visible";
+    vi.stubGlobal("document", {
+      get visibilityState() {
+        return visibility;
+      },
+      addEventListener: (type: string, fn: DocListener) =>
+        addTo(docListeners as unknown as Map<string, Set<Listener>>, type, fn),
+      removeEventListener: (type: string, fn: DocListener) =>
+        removeFrom(
+          docListeners as unknown as Map<string, Set<Listener>>,
+          type,
+          fn,
+        ),
+    });
+  });
+
+  const fireVisibility = () => {
+    for (const fn of [...(docListeners.get("visibilitychange") ?? [])]) fn();
+  };
+
+  it("挂上容器时注册、摘掉 / dispose 时注销", () => {
+    const { ctrl } = setupWithScroller();
+    expect(docListeners.get("visibilitychange")?.size).toBe(1);
+    ctrl.attachScroller(null);
+    expect(docListeners.get("visibilitychange")?.size ?? 0).toBe(0);
+    const again = setupWithScroller();
+    expect(docListeners.get("visibilitychange")?.size).toBe(1);
+    again.ctrl.dispose();
+    expect(docListeners.get("visibilitychange")?.size ?? 0).toBe(0);
+  });
+
+  it("可见 + 跟随中 → 排一次贴底", () => {
+    const { sc } = setupWithScroller({ top: 600 });
+    fireVisibility();
+    expect(pendingFrames()).toBe(1);
+    flushFrame();
+    expect(sc.writes).toEqual([2000]);
+  });
+
+  it("切到后台（hidden）不动", () => {
+    setupWithScroller({ top: 600 });
+    visibility = "hidden";
+    fireVisibility();
+    expect(pendingFrames()).toBe(0);
+  });
+
+  it("用户在翻历史（following=false）切回前台：不动他", () => {
+    const { ctrl } = setupWithScroller({ top: 600 });
+    ctrl.setFollowing(false);
+    fireVisibility();
+    expect(pendingFrames()).toBe(0);
+  });
+});
+
+describe("R1-7：拖选自动滚动 / 中键自动滚动 / Shift+空格也算用户上滚意图", () => {
+  /** 正文里（不是滚动条槽）的 pointerdown */
+  const bodyDown = (sc: FakeScroller, over: object = {}) =>
+    sc.dispatch("pointerdown", {
+      target: { tagName: "P" },
+      button: 0,
+      pointerType: "mouse",
+      offsetX: 100,
+      ...over,
+    });
+  const pointerUp = () => {
+    for (const fn of windowListeners.get("pointerup") ?? []) fn({});
+  };
+
+  it("鼠标主键按在正文里拖选：浏览器自己朝上自动滚 → 当上滚、跟随关、不被贴底拽回", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    bodyDown(sc);
+    sc.userScrollTo(1100); // 没有 wheel / key / touch，只有浏览器的拖选自动滚动
+    expect(ctrl.isFollowing()).toBe(false);
+    ctrl.requestScrollToBottom();
+    flushFrame();
+    expect(sc.writes).toEqual([]); // 绝不再写 scrollTop
+  });
+
+  it("拖选时朝下的 scroll 不算上滚（选中拖到底：不关跟随，也不会恢复，既定行为不变）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1000 });
+    bodyDown(sc);
+    sc.userScrollTo(1100);
+    expect(ctrl.isFollowing()).toBe(true); // 本来就在跟随、朝下滚不关
+  });
+
+  it("松手（pointerup）后不再算：之后无输入的程序化上滚不关跟随", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    bodyDown(sc);
+    pointerUp();
+    sc.userScrollTo(1190); // Virtuoso 补偿之类
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("pointercancel / 窗口失焦同样收尾", () => {
+    for (const evt of ["pointercancel", "blur"] as const) {
+      windowListeners = new Map();
+      const { ctrl, sc } = setupWithScroller({ top: 1200 });
+      bodyDown(sc);
+      for (const fn of windowListeners.get(evt) ?? []) fn({});
+      sc.userScrollTo(1190);
+      expect(ctrl.isFollowing()).toBe(true);
+    }
+  });
+
+  it("触摸 / 笔的 pointerdown 不算（它们走 touch 事件那条路，意图位不该被 pointer 状态重复记）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    bodyDown(sc, { pointerType: "touch" });
+    sc.userScrollTo(1190);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("中键按下 = 自动滚动会话开始：朝上的 scroll 当上滚；下一次任何按下结束会话", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    bodyDown(sc, { button: 1 });
+    pointerUp(); // 中键松开不结束会话（Windows 点击式自动滚动：松手后仍在自动滚）
+    sc.userScrollTo(1100);
+    expect(ctrl.isFollowing()).toBe(false);
+
+    // 回到底部恢复跟随（需要往下翻输入）后，再点一下 = 退出自动滚动
+    sc.dispatch("wheel", { deltaY: 100 });
+    sc.userScrollTo(1200);
+    expect(ctrl.isFollowing()).toBe(true);
+    bodyDown(sc, { button: 0 }); // 这次按下结束上一轮会话（同时开始一次拖选）
+    pointerUp();
+    sc.userScrollTo(1190);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("中键会话遇到窗口失焦也结束", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    bodyDown(sc, { button: 1 });
+    for (const fn of windowListeners.get("blur") ?? []) fn({});
+    sc.userScrollTo(1190);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("滚动条槽里的按下仍走原来的拖滚动条逻辑（不会同时记成拖选）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("pointerdown", {
+      target: sc.el,
+      offsetX: 905,
+      button: 0,
+      pointerType: "mouse",
+    });
+    pointerUp();
+    sc.userScrollTo(1190);
+    expect(ctrl.isFollowing()).toBe(true); // 松手后拖选标记也没残留
+  });
+
+  it("换 / 摘容器时 pointer 状态作废（旧容器上的 pointerup 永远不会来）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    bodyDown(sc);
+    const next = makeScroller({ ...GEOM, top: 1200 });
+    ctrl.attachScroller(next.el as unknown as HTMLElement);
+    next.userScrollTo(1190);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("挂 / 摘 pointercancel、blur 监听：各一份、不泄漏", () => {
+    const { ctrl } = setupWithScroller();
+    expect(countIn(windowListeners, "pointercancel")).toBe(1);
+    expect(countIn(windowListeners, "blur")).toBe(1);
+    ctrl.attachScroller(null);
+    expect(countIn(windowListeners, "pointercancel")).toBe(0);
+    expect(countIn(windowListeners, "blur")).toBe(0);
+  });
+
+  it("Shift+空格 = 上翻意图（目标是普通元素）：跟随关", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("keydown", { ...key(" "), shiftKey: true });
+    sc.userScrollTo(700);
+    expect(ctrl.isFollowing()).toBe(false);
+  });
+
+  it("空格（无 Shift）= 往下翻输入：能让回到底部的 scroll 恢复跟随", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("wheel", { deltaY: -100 });
+    sc.userScrollTo(1000);
+    expect(ctrl.isFollowing()).toBe(false);
+    sc.dispatch("keydown", { ...key(" "), shiftKey: false });
+    sc.userScrollTo(1190);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("焦点在按钮上按 Shift+空格：那是激活、不滚动 → 不登记意图（否则之后流式贴底的 scroll 会被误当上滚）", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("keydown", {
+      key: " ",
+      shiftKey: true,
+      target: { tagName: "BUTTON", isContentEditable: false },
+    });
+    sc.userScrollTo(1190); // 程序化小幅滚动，没有真实输入
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+
+  it("role=button 的元素同理；输入框里的空格 / Shift+空格仍被可编辑元素过滤拦住", () => {
+    const { ctrl, sc } = setupWithScroller({ top: 1200 });
+    sc.dispatch("keydown", {
+      key: " ",
+      shiftKey: true,
+      target: {
+        tagName: "DIV",
+        isContentEditable: false,
+        getAttribute: (n: string) => (n === "role" ? "button" : null),
+      },
+    });
+    sc.userScrollTo(1190);
+    expect(ctrl.isFollowing()).toBe(true);
+    sc.dispatch("keydown", { ...key(" ", "TEXTAREA"), shiftKey: true });
+    sc.userScrollTo(1180);
+    expect(ctrl.isFollowing()).toBe(true);
+  });
+});
+
+describe("R1：稳定期从容器挂上起重新计时 / 贴底链预算耗尽补算 stranded", () => {
+  it("稳定期是渲染期开的、容器晚挂：挂上那一刻重新计时（不会被渲染到挂载的耗时吃掉）", () => {
+    const { ctrl } = setup();
+    ctrl.beginSettle(); // 渲染期 latch
+    clock = MOUNT_SETTLE_MS - 100; // 大对话首次渲染 + 挂载慢，稳定期只剩 100ms
+    const sc = makeScroller({ top: 0, height: 800, client: 800 });
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    clock = MOUNT_SETTLE_MS + 500; // 旧实现这里早已过期
+    ctrl.requestScrollToBottom();
+    for (let i = 0; i < PIN_SETTLE_STABLE_FRAMES + 2; i++) {
+      flushFrame();
+      expect(pendingFrames()).toBe(1); // 仍在稳定期内：不按稳定帧数收工
+    }
+  });
+
+  it("没开过稳定期时挂容器不会凭空开启", () => {
+    const { ctrl } = setup();
+    clock = 10;
+    const sc = makeScroller({ ...GEOM });
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    ctrl.requestScrollToBottom();
+    for (let i = 0; i < PIN_SETTLE_STABLE_FRAMES; i++) flushFrame();
+    expect(pendingFrames()).toBe(0);
+  });
+
+  it("已过期的稳定期不会因为换容器复活", () => {
+    const { ctrl } = setup();
+    ctrl.beginSettle();
+    clock = MOUNT_SETTLE_MS + 1;
+    const sc = makeScroller({ ...GEOM });
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    ctrl.requestScrollToBottom();
+    for (let i = 0; i < PIN_SETTLE_STABLE_FRAMES; i++) flushFrame();
+    expect(pendingFrames()).toBe(0);
+  });
+
+  it("贴底链预算耗尽收工、人仍离底很远（没有 scroll 事件来重算）→ 补算 stranded，按钮有出口", () => {
+    // 列表一直没测量完：写 scrollTop 被夹在 0（最大可滚位置 0），距底远大于阈值，但没有任何 scroll 事件
+    const { ctrl, sc } = setupWithScroller({ top: 0, height: 2000, client: 800 });
+    // 把容器改成「写不动」：scrollTop 写入被夹回 0（模拟 Virtuoso 还没把总高撑起来）
+    sc.resize(800);
+    Object.defineProperty(sc.el, "scrollTop", {
+      get: () => 0,
+      set: () => undefined,
+      configurable: true,
+    });
+    expect(ctrl.getAwaySnapshot()).toBe(false);
+    ctrl.requestScrollToBottom();
+    for (let i = 0; i < PIN_SETTLE_MAX_FRAMES + 1; i++) flushFrame();
+    expect(pendingFrames()).toBe(0); // 预算耗尽、链收工
+    expect(ctrl.getSnapshot()).toBe(true); // 仍是跟随态
+    expect(ctrl.getAwaySnapshot()).toBe(true); // 但离底很远、按钮要出来
+  });
+});
+
+describe("K1 根治：首次落底由控制器接手（Virtuoso 不再传 initialTopMostItemIndex）", () => {
+  // 背景：Virtuoso 的初始定位走 scrollToIndex 重试链，没有取消接口、会把用户上滚拽回底部（无头 Chrome 实测，
+  // 栈里抓到 react-virtuoso 自己的 scrollTo）。现在「进入对话落到最后一条」= 渲染期 latch 开跟随 + beginSettle，
+  // 容器一挂上控制器就在稳定期内起贴底链（直接写 scrollTop、可取消）。
+  const FRESH: ScrollerInit = { top: 0, height: 2000, client: 800 };
+
+  it("稳定期内挂上容器（跟随中）：当帧就排了贴底、下一帧写到底——不依赖 items 变化的 effect 先到", () => {
+    const { ctrl, scrollToBottom } = setup();
+    ctrl.beginSettle(); // 渲染期 latch
+    const sc = makeScroller(FRESH);
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    expect(pendingFrames()).toBe(1);
+    flushFrame();
+    expect(sc.writes).toEqual([2000]);
+    expect(sc.top()).toBe(1200); // 被夹到最大可滚位置 = 真底
+    // 不走 Virtuoso 的 scrollToIndex 兜底（那是没有容器时才用的）
+    expect(scrollToBottom).not.toHaveBeenCalled();
+  });
+
+  it("首次落底的链在稳定期内按时间收口：列表之后增高（测量 / 流式快照项）会被继续贴住", () => {
+    const { ctrl } = setup();
+    ctrl.beginSettle();
+    const sc = makeScroller(FRESH);
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    flushFrame(); // 落底
+    // Virtuoso 测量完后总高变了 3 倍：稳定期内链仍活着、下一帧补贴
+    sc.grow(4000);
+    clock = 300;
+    flushFrame();
+    expect(sc.top()).toBe(sc.el.scrollHeight - sc.el.clientHeight);
+    expect(pendingFrames()).toBe(1); // 稳定期内不按稳定帧数收工
+  });
+
+  it("没开过稳定期 / 稳定期已过期 / 已不在跟随：挂容器不会自己起贴底（不凭空落底、不拽翻历史的人）", () => {
+    // 没开过
+    const a = setup();
+    const scA = makeScroller(FRESH);
+    a.ctrl.attachScroller(scA.el as unknown as HTMLElement);
+    expect(pendingFrames()).toBe(0);
+    expect(scA.writes).toEqual([]);
+    // 已过期
+    const b = setup();
+    b.ctrl.beginSettle();
+    clock = MOUNT_SETTLE_MS + 1;
+    const scB = makeScroller(FRESH);
+    b.ctrl.attachScroller(scB.el as unknown as HTMLElement);
+    expect(pendingFrames()).toBe(0);
+    expect(scB.writes).toEqual([]);
+    // 稳定期内但用户已经不跟随
+    clock = 0;
+    const c = setup();
+    c.ctrl.beginSettle();
+    c.ctrl.setFollowing(false);
+    const scC = makeScroller(FRESH);
+    c.ctrl.attachScroller(scC.el as unknown as HTMLElement);
+    expect(pendingFrames()).toBe(0);
+    expect(scC.writes).toEqual([]);
+  });
+
+  it("首次落底之后用户上滚：跟随当场关、链当场停、之后无论列表怎么长都不再写 scrollTop（不会被拉回）", () => {
+    const { ctrl } = setup();
+    ctrl.beginSettle();
+    const sc = makeScroller(FRESH);
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    flushFrame(); // 落底：top 1200
+    const writesAtLeave = sc.writes.length;
+    // 切回后 150ms 内上滚 250px（Virtuoso 重试链曾在这一刻之后把位置拽回）
+    clock = 150;
+    sc.dispatch("wheel", { deltaY: -250 });
+    sc.userScrollTo(950);
+    expect(ctrl.isFollowing()).toBe(false);
+    expect(pendingFrames()).toBe(0);
+    // 稳定期还没过、列表继续增高（流式快照项 +6000）：控制器一次都不再写
+    sc.grow(6000);
+    for (let i = 0; i < 30; i++) {
+      clock += 16;
+      ctrl.requestScrollToBottom(); // 即便 items effect / totalListHeightChanged 一直在请求
+      flushFrame();
+    }
+    expect(sc.writes.length).toBe(writesAtLeave);
+    expect(sc.top()).toBe(950);
+  });
+
+  it("上滚后再滚回底部：恢复跟随，之后的增高继续被贴住（场景 ⑤）", () => {
+    const { ctrl } = setup();
+    ctrl.beginSettle();
+    const sc = makeScroller(FRESH);
+    ctrl.attachScroller(sc.el as unknown as HTMLElement);
+    flushFrame();
+    clock = 150;
+    sc.dispatch("wheel", { deltaY: -250 });
+    sc.userScrollTo(950);
+    expect(ctrl.isFollowing()).toBe(false);
+    clock = 2000; // 稳定期之外
+    sc.dispatch("wheel", { deltaY: 400 });
+    sc.userScrollTo(1190); // 离底 10：进带、朝底部
+    expect(ctrl.isFollowing()).toBe(true);
+    sc.grow(500);
+    ctrl.requestScrollToBottom();
+    flushFrame();
+    expect(sc.top()).toBe(sc.el.scrollHeight - sc.el.clientHeight);
   });
 });

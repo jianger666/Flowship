@@ -229,6 +229,47 @@ describe("状态分级", () => {
     }
   });
 
+  it("3xx 跳转 → 视为存活（以前落到「服务异常」，健康的 server 被悄悄剔掉）；POST / GET 两条探法都一样", async () => {
+    for (const code of [301, 302, 307, 308]) {
+      stubFetch(() => statusResponse(code));
+      const viaPost = await probeOne({ type: "http", url: "http://mcp.test/mcp" });
+      expect(viaPost).toMatchObject({ status: "ok", httpCode: code });
+      vi.unstubAllGlobals();
+
+      stubFetch(() => statusResponse(code));
+      const viaGet = await probeOne({ type: "sse", url: "http://mcp.test/sse" });
+      expect(viaGet).toMatchObject({ status: "ok", httpCode: code });
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("3xx 只当存活信号：探测请求一律 redirect: manual、不跟随跳转（请求头不会被带去别的域）；filterHealthyMcp 不再剔掉它", async () => {
+    const inits: Array<RequestInit | undefined> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        inits.push(init);
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://other-domain.example.com/mcp" },
+        });
+      }),
+    );
+    const servers: Record<string, McpServerConfig> = {
+      moved: {
+        type: "http",
+        url: "http://mcp.test/mcp",
+        headers: { Authorization: "Bearer probe-test-token-0001" },
+      },
+    };
+    const { servers: healthy, dropped } = await filterHealthyMcp(servers);
+    expect(Object.keys(healthy)).toEqual(["moved"]);
+    expect(dropped).toEqual([]);
+    // 只发了一次、没有对 Location 再发请求；且显式 manual
+    expect(inits).toHaveLength(1);
+    expect(inits[0]?.redirect).toBe("manual");
+  });
+
   it("其它非 2xx（404 / 405 / 500）→ 服务异常，不是「需要授权」", async () => {
     for (const code of [404, 405, 500]) {
       stubFetch(() => statusResponse(code));

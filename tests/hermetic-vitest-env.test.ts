@@ -207,6 +207,27 @@ describe("B · 当前测试进程的实际环境（setupFiles 真的生效了）
     expect(fs.statSync(dir!).isDirectory()).toBe(true);
   });
 
+  it("os.tmpdir() 是本文件私有的 fvt-* 根：TMPDIR / TEMP / TMP 都指过去，数据目录就建在里面", () => {
+    const root = os.tmpdir();
+    expect(path.basename(root)).toMatch(/^fvt-/);
+    expect(process.env.TMPDIR).toBe(root);
+    expect(process.env.TEMP).toBe(root);
+    expect(process.env.TMP).toBe(root);
+    expect(process.env.FLOWSHIP_DATA_DIR!.startsWith(root + path.sep)).toBe(true);
+    // 这里 mkdtemp 的目录（不清）也落在私有根里，收尾由 setup 一起删（e2e 见 E 段）
+    const made = fs.mkdtempSync(path.join(os.tmpdir(), "b-probe-"));
+    expect(made.startsWith(root + path.sep)).toBe(true);
+    fs.rmSync(made, { recursive: true, force: true });
+  });
+
+  it("家目录已隔离：HOME / USERPROFILE / os.homedir() 都在私有 tmp 根里，本机真 ~/.cursor 读不到", () => {
+    const root = os.tmpdir();
+    expect(process.env.HOME!.startsWith(root + path.sep)).toBe(true);
+    expect(process.env.USERPROFILE).toBe(process.env.HOME);
+    expect(os.homedir()).toBe(process.env.HOME);
+    expect(fs.existsSync(path.join(os.homedir(), ".cursor"))).toBe(false);
+  });
+
   it("宿主注入变量一个都没有（除了被换成临时目录的 FLOWSHIP_DATA_DIR）", () => {
     for (const key of HOST_INJECTED_ENV_KEYS) {
       if (key === "FLOWSHIP_DATA_DIR") continue;
@@ -242,7 +263,29 @@ describe("C · 接线契约", () => {
     expect(src).toMatch(/applyHermeticEnv\(\s*process\.env/);
     expect(src).toMatch(/beforeEach\(\s*\(\)\s*=>\s*\{[\s\S]*assertEnvNotAppData\(process\.env\)/);
     expect(src).toMatch(/afterAll\(/);
-    expect(src).toMatch(/fs\.rmSync\(dataDir/);
+    // 结束时删 tmp 根（含 dataDir）；dataDir 自己也再删一次兜底
+    expect(src).toMatch(/\[tmpRoot,\s*dataDir\]/);
+    expect(src).toMatch(/fs\.rmSync\(dir,/);
+  });
+
+  it("setup 文件：先取真 tmpdir 建私有根，再把 TMPDIR / TEMP / TMP 指过去，dataDir 建在根里", () => {
+    const src = read("tests/setup/hermetic-env.ts");
+    const mk = src.indexOf('fs.mkdtempSync(path.join(os.tmpdir(), "fvt-"))');
+    const setTmp = src.indexOf("process.env.TMPDIR = tmpRoot");
+    const applyAt = src.indexOf("applyHermeticEnv(process.env");
+    expect(mk).toBeGreaterThan(0);
+    expect(setTmp).toBeGreaterThan(mk);
+    expect(applyAt).toBeGreaterThan(setTmp);
+    expect(src).toMatch(/process\.env\.TEMP = tmpRoot/);
+    expect(src).toMatch(/process\.env\.TMP = tmpRoot/);
+    expect(src).toMatch(/mkdtempSync\(path\.join\(tmpRoot,\s*"flowship-vitest-data-"\)\)/);
+  });
+
+  it("setup 文件：HOME / USERPROFILE 指向私有 tmp 根里的空目录（os.homedir() 不再是开发者真家目录）", () => {
+    const src = read("tests/setup/hermetic-env.ts");
+    expect(src).toMatch(/path\.join\(tmpRoot,\s*"home"\)/);
+    expect(src).toMatch(/process\.env\.HOME = fakeHome/);
+    expect(src).toMatch(/process\.env\.USERPROFILE = fakeHome/);
   });
 
   it("setup 文件名不带 .test：不会被 include 当成测试收集", () => {
@@ -311,5 +354,71 @@ describe("D · 端到端：继承了桌面包数据目录的环境真跑 vitest�
     expect(fs.readFileSync(metaFile, "utf-8")).toBe(metaText);
     expect(fs.existsSync(path.join(taskPath, "events.jsonl"))).toBe(false);
     expect(fs.readdirSync(path.join(fakeData, "tasks"))).toEqual([taskId]);
+  }, 150_000);
+});
+
+describe("E · 端到端：测试里 mkdtemp 了没清，文件收尾后 tmp 根整棵消失", () => {
+  const roots: string[] = [];
+  afterAll(() => {
+    for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
+  });
+
+  it("探针故意留一个目录不清：子 vitest 退出后，它的 tmp 根、泄漏目录、数据目录都不在了", () => {
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "flowship-tmp-root-e2e-"));
+    roots.push(outDir);
+    const outFile = path.join(outDir, "probe.json");
+
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (k.startsWith("VITEST") || k === "TEST") delete env[k];
+    }
+    env.FLOWSHIP_TMP_PROBE_OUT = outFile;
+
+    const vitestBin = path.join(REPO, "node_modules", "vitest", "vitest.mjs");
+    const r = spawnSync(process.execPath, [vitestBin, "run", "tests/tmp-root-probe.test.ts"], {
+      cwd: REPO,
+      env,
+      encoding: "utf-8",
+      timeout: 120_000,
+    });
+    const log = `${r.stdout}\n${r.stderr}`;
+    expect(r.status, log).toBe(0);
+    expect(log).toMatch(/2 passed/);
+
+    const rec = JSON.parse(fs.readFileSync(outFile, "utf-8")) as { tmpRoot: string; leaked: string; dataDir: string };
+    expect(path.basename(rec.tmpRoot)).toMatch(/^fvt-/);
+    // 子进程的私有根建在父进程（本测试文件）的私有根里，父根收尾时兜底；这里要的是子根在子进程退出时就已经没了
+    expect(rec.tmpRoot.startsWith(os.tmpdir() + path.sep)).toBe(true);
+    expect(fs.existsSync(rec.leaked)).toBe(false);
+    expect(fs.existsSync(rec.dataDir)).toBe(false);
+    expect(fs.existsSync(rec.tmpRoot)).toBe(false);
+  }, 150_000);
+
+  it("整个文件的用例全被 skip（vitest 不跑任何 hook）：worker 回收时兜底删根，不留 fvt-* 残留", () => {
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "flowship-tmp-root-skip-e2e-"));
+    roots.push(outDir);
+    const outFile = path.join(outDir, "probe.json");
+
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (k.startsWith("VITEST") || k === "TEST") delete env[k];
+    }
+    env.FLOWSHIP_TMP_PROBE_OUT = outFile;
+
+    const vitestBin = path.join(REPO, "node_modules", "vitest", "vitest.mjs");
+    const r = spawnSync(process.execPath, [vitestBin, "run", "tests/tmp-root-skip-probe.test.ts"], {
+      cwd: REPO,
+      env,
+      encoding: "utf-8",
+      timeout: 120_000,
+    });
+    const log = `${r.stdout}\n${r.stderr}`;
+    expect(r.status, log).toBe(0);
+    expect(log).toMatch(/skipped/);
+
+    const rec = JSON.parse(fs.readFileSync(outFile, "utf-8")) as { tmpRoot: string };
+    expect(path.basename(rec.tmpRoot)).toMatch(/^fvt-/);
+    expect(rec.tmpRoot.startsWith(os.tmpdir() + path.sep)).toBe(true);
+    expect(fs.existsSync(rec.tmpRoot)).toBe(false);
   }, 150_000);
 });

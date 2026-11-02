@@ -181,7 +181,7 @@ describe("按 prompt 里的命令序列在真 worktree 里跑一遍：主仓本�
 
     // —— 以下就是 action-dev.md 流程 A 的命令序列（DEV / FEATURE 取值同文档）——
     const DEV = "develop";
-    const FEATURE = git(wt, "rev-parse", "--abbrev-ref", "HEAD");
+    const FEATURE = git(wt, "branch", "--show-current"); // 与 action-dev.md 一致（不用 rev-parse --abbrev-ref，见文末同名标签用例）
     expect(FEATURE).toBe("feature/x");
     git(wt, "fetch", "origin", DEV);
     git(wt, "checkout", "--detach", `origin/${DEV}`);
@@ -269,5 +269,51 @@ describe("按 prompt 里的命令序列在真 worktree 里跑一遍：主仓本�
     expect(git(origin, "show", "develop:shared.txt")).toBe("colleague+feature");
     expect(git(wt, "branch", "--show-current")).toBe("feature/y");
     expect(git(main, "rev-parse", "develop")).toBe(localDevBefore);
+  });
+});
+
+describe("当前分支名的取法：不用 `rev-parse --abbrev-ref HEAD`（分支与标签同名时它输出 heads/xxx）", () => {
+  const allPrompts = readdirSync(PROMPTS_DIR).filter((f) => f.endsWith(".md"));
+
+  it("prompts/*.md 里没有任何 `$(git rev-parse --abbrev-ref …)` 取分支名的命令", () => {
+    for (const name of allPrompts) {
+      expect(read(name), name).not.toMatch(/\$\(\s*git\s+rev-parse\s+--abbrev-ref/);
+    }
+  });
+
+  it("action-dev / action-ship 的 FEATURE / BRANCH 赋值都用 `git branch --show-current`，且紧跟 detached HEAD（空串）的判断", () => {
+    for (const name of ["action-dev.md", "action-ship.md"]) {
+      const text = read(name);
+      const assigns = text.match(/^(?:FEATURE|BRANCH)=\$\(git [^)]*\)/gm) ?? [];
+      expect(assigns.length, name).toBeGreaterThan(0);
+      for (const a of assigns) expect(a, name).toContain("git branch --show-current");
+      for (const m of text.matchAll(/^(FEATURE|BRANCH)=\$\(git branch --show-current\)[^\n]*\n([^\n]*)\n/gm)) {
+        expect(m[2], `${name} ${m[1]}`).toContain(`[ -n "$${m[1]}" ]`);
+      }
+    }
+  });
+
+  it("action-build.md 的分支自检铁律也教 agent 用 `git branch --show-current`", () => {
+    const text = read("action-build.md");
+    expect(text).toContain("`git branch --show-current` 拿当前分支");
+    expect(text).not.toContain("`git rev-parse --abbrev-ref HEAD` 拿当前分支");
+  });
+
+  it("真 git：分支 foo 与标签 foo 并存时，--abbrev-ref 输出 heads/foo（旧写法的坑），branch --show-current 输出 foo；detached 时为空", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "branch-name-"));
+    try {
+      const g = (...args: string[]): string =>
+        execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd: dir, encoding: "utf8" }).trim();
+      g("init", "-q", "-b", "main");
+      g("commit", "-q", "--allow-empty", "-m", "init");
+      g("checkout", "-q", "-b", "foo");
+      g("tag", "foo");
+      expect(g("rev-parse", "--abbrev-ref", "HEAD")).toBe("heads/foo");
+      expect(g("branch", "--show-current")).toBe("foo");
+      g("checkout", "-q", "--detach");
+      expect(g("branch", "--show-current")).toBe("");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

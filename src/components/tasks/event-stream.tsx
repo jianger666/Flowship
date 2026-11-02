@@ -38,6 +38,7 @@ import { useRichInput } from "@/hooks/use-rich-input";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import {
   StreamFollowContext,
+  useIsAwayFromBottom,
   useIsFollowing,
   useStreamFollow,
   type StreamFollowController,
@@ -624,6 +625,20 @@ const VIRTUOSO_COMPONENTS = { Header: EarlierLoadingHeader };
 const VIEWPORT_OVERSCAN = { top: 0, bottom: 1500 };
 
 /**
+ * 初始定位（2026-11-02 评审 K1 根治）：**不再给 Virtuoso 传 `initialTopMostItemIndex`**，进入对话 / 任务时的
+ * 「落到最后一条」由跟随控制器负责——容器一挂上（`attachScroller`）、稳定期内就启动贴底链，直接写 scrollTop。
+ *
+ * 为什么不用 Virtuoso 的初始定位（`{ index: "LAST", align: "end" }`）：它走 scrollToIndex 的重试链，
+ * **没有取消接口、也没有总时长上限**（读 react-virtuoso 源码，`fe` store 的 scrollToIndex）：每次 scrollTo 都先清掉上一次的
+ * 1200ms 兜底定时器、再重新挂一个；同时盯 150ms，期间列表又变了（测量 / 异步增高 / 流式 chunk）就用同一目标再滚一遍，
+ * 不问用户有没有上滚。无头 Chrome 实测（2026-11-02，切回一个正在流式的 chat、列表出现后 ≤150ms 内上滚 3 × 250px）：
+ * 栈里能抓到 react-virtuoso 自己的 `scrollTo({ top, behavior: "auto" })` 在用户滚轮之后又把位置往底部拽（+110px / +390px）。
+ * 控制器这一侧的贴底链则是可取消的：上滚意图一到跟随当场关、链当场停（稳定期里也一样）。
+ *
+ * 内容测量未稳定的部分由稳定期（`MOUNT_SETTLE_MS`）里的贴底链按时间收口。
+ */
+
+/**
  * 粘性轮次横幅的显隐类（applyStickyTurn 命令式切换，必须是源码里的完整字面量才会被 Tailwind 生成）。
  * 用 invisible 而不是 hidden：visibility 参与 transition（淡出结束才真正不可点、淡入时立刻可见），
  * 淡出期间横幅仍占位但 root 是 pointer-events-none，不挡下面的正文。
@@ -665,6 +680,9 @@ const StreamFloatingBar = ({
   onBackToBottom: () => void;
 }) => {
   const following = useIsFollowing(follow);
+  // 几何兜底（评审 K1）：跟随态虽是 true、却被程序化滚动带到离底很远的地方（stranded）时，
+  // 按钮也要出现——否则 following=true 且离底很远时界面上没有任何出口
+  const away = useIsAwayFromBottom(follow);
   // 离开底部那一刻的尾锚点 + 条数基线。用 ref 不用 state：它是从 props 推出来的缓存、
   // 自己不该触发重渲；推进函数幂等，渲染期写安全（StrictMode 双渲同结果）
   const trackerRef = useRef(initNewItemsTracker(unitIds));
@@ -678,8 +696,8 @@ const StreamFloatingBar = ({
   );
   trackerRef.current = advanced.tracker;
   const newCount = advanced.newCount;
-  // 贴底跟随中 = 最新内容就在眼前，两条都不用出
-  if (following) return null;
+  // 贴底跟随中 = 最新内容就在眼前，两条都不用出（stranded 时 following 虽为 true、但并不在眼前，见上）
+  if (!away) return null;
 
   return (
     <>
@@ -932,9 +950,11 @@ const EventStreamImpl = ({
   // 老实现靠 Virtuoso 的 atBottomThreshold=120 兼职这件事——用户上滚 50px 仍算贴底、
   // 下一个 chunk 就把他拽回去 = 用户实测的「一滚就抖」。现在改成听用户手势意图。
   const follow = useStreamFollow(scrollToBottom);
-  // 初始滚动定位闸：首次有 items 时算一次、一律落在最后一条（不再按上次离开的位置恢复，见下方渲染期 latch）；
-  // null = 还没算（切 task 时重开）
-  const initialTopRef = useRef<number | null>(null);
+  // 初始滚动定位闸：首次有 items 时落一次位（一律落在最后一条、并恢复跟随，见下方渲染期 latch）；
+  // false = 还没落（切 task / 进群问答 tab / 列表清空时重开——后两者都是 Virtuoso 被卸掉、之后重新挂载；
+  // latch 只在「这一次渲染会挂上 Virtuoso」时消耗它，见渲染期 latch 处的说明）。只是个「落过没有」的闸——Virtuoso 的初始位置
+  // 由跟随控制器在容器挂上时直接写 scrollTop 落到底（Virtuoso 不再传 initialTopMostItemIndex），不读任何 ref 里的下标
+  const initialPositionedRef = useRef(false);
   // rangeChanged 去重：同一个 startIndex 重复回调直接短路（Virtuoso 重渲会重发同 range）
   const lastRangeStartRef = useRef<number | null>(null);
 
@@ -1001,11 +1021,13 @@ const EventStreamImpl = ({
   // 才不会因「同 startIndex 短路」跳过 sticky 重算（否则切回事件流粘顶头状态是旧的）。
   useEffect(() => {
     lastRangeStartRef.current = null;
-    // 进群问答 tab 时 Virtuoso 整个卸载、切回来是重新挂载，而 initialTopMostItemIndex 读的是 initialTopRef——
-    // 它只在为 null 时写一次、只有切 task 才复位，不清的话切回来会用首次加载时的陈旧下标重挂（V17-02）。
-    // 只在「进入」时清：切回事件流那次渲染的 latch（见下方「初始定位」）会重新落在最后一条并恢复跟随，
-    // 与进入对话 / 任务同一个行为（2026-10-17 用户拍板「进入一律落在最后一条」）
-    if (showQaPanel) initialTopRef.current = null;
+    // 进群问答 tab 时 Virtuoso 整个卸载、切回来是重新挂载（控制器的首次落底只在容器挂上 + 稳定期内触发一次）——
+    // 定位闸只在 false 时才会跑一次渲染期 latch、只有切 task 才复位，不开闸的话切回来那次渲染不会重新
+    // 恢复跟随 + 开稳定期（V17-02；旧实现这里还要防「用首次加载时的陈旧下标重挂」，现在位置由常量给、不再有这个问题）。
+    // 只在「进入」时开：切回事件流那次渲染的 latch（见下方「初始定位」）会重新落在最后一条并恢复跟随，
+    // 与进入对话 / 任务同一个行为（2026-10-17 用户拍板「进入一律落在最后一条」）。
+    // 配套：latch 带 `!showQaPanel` 守卫（评审 R8-3）——QA tab 里的重渲不能把这里刚开的闸消耗掉
+    if (showQaPanel) initialPositionedRef.current = false;
   }, [showQaPanel]);
   // agent 正好 ask_user 时自动切回事件流：QA 是只读 tab，问答卡+提示条+输入框全藏，
   // 用户盯着 QA 页收不到任何信号、agent 干等。只在 null→有 的上升沿切一次；
@@ -1666,7 +1688,7 @@ const EventStreamImpl = ({
     // 重开初始定位闸；跟随态**不在这里**改——它跟初始定位是同一个决定，
     // 统一由下面的渲染期 latch 出（effect 跑在渲染之后，在这里置 true 会把
     // 同一帧刚按锚点恢复出来的「非贴底」冲掉）
-    initialTopRef.current = null;
+    initialPositionedRef.current = false;
     lastRangeStartRef.current = null;
     stickyTurnIdRef.current = null;
     // 切 task：命令式藏 sticky（不走 setState；root 可能尚未挂上、下帧再清也行）。
@@ -2006,10 +2028,30 @@ const EventStreamImpl = ({
   // 想看上面的内容就往上滚——滚了之后的行为（上滚不被拽回、回到底部才恢复跟随）一点没变。
   //
   // 同一个控制器的通知走微任务，渲染期写它不会触发 React 的跨组件更新告警。
-  if (initialTopRef.current === null && items.length > 0) {
+  //
+  // **只在「这一次渲染真的会挂上 Virtuoso」时触发**（评审 R8-3）：`!showQaPanel && items.length > 0` 才是它在树上的条件
+  // （JSX 里 `showQaPanel ? <GroupQaPanel/> : items.length === 0 ? 空态 : <Virtuoso/>`）。进入 QA tab 的 effect 把闸开成 false 之后，
+  // QA tab 里的任何一次重渲（`onGroupQaVisibleChange` 触发父级 setState、事件 / 流式持续到来）若没有 `!showQaPanel` 守卫，
+  // 就会在 Virtuoso 根本不在树上的时候把闸消耗掉、白开一个 1.5s 稳定期——用户在 QA tab 停留超过 1.5s 再切回，
+  // latch 不再触发、稳定期早已过，`attachScroller` 挂上新容器时不落底（Virtuoso 从 scrollTop=0 重挂、不再传 initialTopMostItemIndex）。
+  // 闸的另一半（「Virtuoso 不在树上就开闸」）见上面的 [showQaPanel] effect 与下面的 [listEmpty] effect。
+  if (!initialPositionedRef.current && !showQaPanel && items.length > 0) {
     follow.setFollowing(true);
-    initialTopRef.current = items.length - 1;
+    // 开启「定位稳定期」（评审 K1）：Virtuoso 的初始定位与贴底链是两条互不知情的 rAF 链，
+    // 稳定期内贴底链按时间收口、scroll 回调带漂移兜底；幂等、渲染期写安全（同 setFollowing）
+    follow.beginSettle();
+    initialPositionedRef.current = true;
   }
+  // 列表清空（回退到最开头 / 事件窗口被整体换空）：JSX 里的空态占位把 Virtuoso 卸掉了，之后再有条目是**重新挂载**
+  // （从 scrollTop=0 起、不再传 initialTopMostItemIndex）——与进入群问答 tab 同一类「Virtuoso 不在树上」，同一个处理：
+  // 开闸，由上面的渲染期 latch 在「重新挂上 Virtuoso 的那次渲染」恢复跟随 + 开稳定期，落底交给 attachScroller。
+  // 只在「变空」时开（依赖是布尔）：有条目时不碰闸，免得 latch 之后又被无谓重置、把用户刚上滚的跟随态拉回去
+  const listEmpty = items.length === 0;
+  useEffect(() => {
+    if (!listEmpty) return;
+    initialPositionedRef.current = false;
+    lastRangeStartRef.current = null;
+  }, [listEmpty]);
 
   // 跟随最新（V0.8.3 引入、2026-07-28 收口成唯一入口）：
   //
@@ -2660,8 +2702,9 @@ const EventStreamImpl = ({
             totalListHeightChanged={onTotalHeightChanged}
             // 视口外预渲染余量：快滚时先露白再补齐同样被感知成「抖」
             increaseViewportBy={VIEWPORT_OVERSCAN}
-            // 初始定位：一律末尾（直接看最新事件）；只在 mount 时生效，所以切任务必须重挂（chat 在 EventStream 上、task 页在外层 ResizablePanelGroup 上都挂了 key={task.id}）
-            initialTopMostItemIndex={initialTopRef.current ?? items.length - 1}
+            // 初始定位：一律末尾（直接看最新事件）——**不传 initialTopMostItemIndex**（2026-11-02 评审 K1）：
+            // 它的 scrollToIndex 重试链没法取消、会把用户的上滚拽回底部；落底由跟随控制器在容器挂上时接手
+            // （attachScroller → 稳定期内贴底链）。切任务必须重挂（chat 在 EventStream 上、task 页在外层 ResizablePanelGroup 上都挂了 key={task.id}）
             // 每条 item 自带 padding；chat 形态窄列居中 + 按消息类型分配段落间距。
             // 注意：firstItemIndex 存在时 Virtuoso 传来的 idx 是「偏移后」的绝对索引、
             // 要先减回 firstItemIndex 才能对 items 数组做定位（分页 prepend 后不减必错位）

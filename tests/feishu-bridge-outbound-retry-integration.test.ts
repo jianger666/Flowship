@@ -96,9 +96,8 @@ const {
   __setBridgeEnabledForTest,
   handleFeishuOutboundEvent,
 } = await import("@/lib/server/feishu-bridge/outbound");
-const { __setCardStreamTimersForTest } = await import(
-  "@/lib/server/feishu-bridge/card-stream"
-);
+const { __setCardStreamTimersForTest, __setFinalRetryDelaysForTest } =
+  await import("@/lib/server/feishu-bridge/card-stream");
 const { __resetCardSeqForTest } = await import(
   "@/lib/server/feishu-bridge/card-seq"
 );
@@ -126,6 +125,17 @@ beforeEach(async () => {
   await __resetCardSeqForTest();
   __resetFeishuOutboundForTest();
   for (const fn of Object.values(larkMocks)) fn.mockClear();
+  // 「永久失败」用例对写类 mock 设了 mockRejectedValue，mockClear 不清实现——
+  // 复位成成功，免得失败串到后面的用例（终稿重试用例要自己控制第几发失败）
+  for (const fn of [
+    larkMocks.updateCardEntity,
+    larkMocks.updateCardElementContent,
+    larkMocks.patchCardSettings,
+    larkMocks.batchUpdateCard,
+  ]) {
+    fn.mockReset();
+    fn.mockResolvedValue(undefined);
+  }
   __setBridgeEnabledForTest(true);
   // 节流 timer 立即执行，避免 250ms 真等待
   __setCardStreamTimersForTest((cb) => {
@@ -137,6 +147,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   __setCardStreamTimersForTest(null);
+  __setFinalRetryDelaysForTest(null);
   __resetFeishuOutboundForTest();
   await __resetCardSeqForTest();
 });
@@ -335,6 +346,8 @@ describe("outbound → 真 card-stream：飞书卡片掉线的对外信号（R14
       m.mockRejectedValue(err);
     }
     appendEvent.mockClear();
+    // 终稿对限流会退避重发 2 次（默认 1s / 3s 真等待）：这里只关心重发次数与收尾信号，退避间隔压成 0
+    __setFinalRetryDelaysForTest([0, 0]);
     // 熔断探测定时器改成手动触发（本文件默认的「立即执行」会把探测当场消费掉）
     const timers: Array<() => void> = [];
     __setCardStreamTimersForTest((cb) => {
@@ -357,8 +370,9 @@ describe("outbound → 真 card-stream：飞书卡片掉线的对外信号（R14
       expect(texts).toEqual([]);
 
       // 2) 熔断窗口到期（拨快时钟，再手动触发已排好的探测定时器）→ 首次探测仍失败 → 才落 info
-      const realNow = Date.now.bind(Date);
-      const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 3000);
+      //    熔断窗口用单调时钟（card-stream 的 monoNow = performance.now()），所以拨快的是它、不是 Date.now
+      const realNow = performance.now.bind(performance);
+      const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => realNow() + 3000);
       try {
         for (const cb of timers.splice(0)) cb();
         await vi.waitFor(() =>
@@ -373,15 +387,22 @@ describe("outbound → 真 card-stream：飞书卡片掉线的对外信号（R14
       const beforeFinish = larkMocks.updateCardEntity.mock.calls.length;
       expect(beforeFinish).toBe(4);
 
-      // 3) done：finalize 强试一次（照发、失败）→ 终稿没落成 → 先落终态 info、再追发 ⚠️
+      // 3) done：finalize 强试一次（照发、失败）；限流属瞬时失败，再退避重发 2 次（共 3 发）仍失败
+      //    → 终稿没落成 → 先落终态 info；正文以文字补发（不再只剩一句「请回 Flowship 查看」）、最后追发 ⚠️
       await finishTurn(taskId);
-      expect(larkMocks.updateCardEntity.mock.calls.length).toBe(beforeFinish + 1);
+      expect(larkMocks.updateCardEntity.mock.calls.length).toBe(beforeFinish + 3);
       expect(texts).toHaveLength(2);
       expect(texts[1]).toContain("飞书卡片没能同步完整回复");
       expect(texts[1]).toContain("rate limited");
-      expect(pingTexts()).toHaveLength(1);
-      expect(pingTexts()[0]).toContain("⚠️ 回复没能同步到飞书卡片");
-      expect(pingTexts()[0]).not.toContain("✅");
+      // 正文共 8402 字（12×700 + 「开头」）→ 3 段文字补发（每段 ≤3500 字，保序）+ 最后 1 条 ⚠️ 收尾提示
+      expect(pingTexts()).toHaveLength(4);
+      expect(pingTexts()[0]).toContain("以下是完整回复（文字版，共 3 段）");
+      expect(pingTexts()[0]).toContain("开头"); // startTurn 推的首段正文在第一段
+      expect(pingTexts()[1]).toContain("（2/3）");
+      expect(pingTexts()[2]).toContain("（3/3）");
+      // 3 段都发成功 → 收尾如实说「完整回复已用文字版发在上面」（不再叫用户回 Flowship 看）
+      expect(pingTexts()[3]).toContain("⚠️ 飞书卡片没能同步，完整回复已用文字版发在上面");
+      expect(pingTexts()[3]).not.toContain("✅");
       // app 内提示不能被追发拖慢：终态 info（第 2 次 appendEvent）先于追发
       expect(appendEvent.mock.invocationCallOrder[1]!).toBeLessThan(
         larkMocks.sendTextMessage.mock.invocationCallOrder[0]!,
@@ -412,9 +433,33 @@ describe("outbound → 真 card-stream：飞书卡片掉线的对外信号（R14
       expect(texts).toHaveLength(1);
       expect(texts[0]).toContain("没能同步完整回复");
       expect(texts[0]).toContain("no permission");
+      // 正文以文字补发（飞书里一张卡都没有，正文只在 app 里）+ 最后一条仍是 ⚠️ 收尾提示
+      expect(pingTexts()).toHaveLength(2);
+      expect(pingTexts()[0]).toContain("以下是完整回复");
+      expect(pingTexts()[0]).toContain("答".repeat(700));
+      expect(pingTexts()[1]).toContain("⚠️ 飞书卡片没能同步，完整回复已用文字版发在上面");
+      expect(pingTexts()[1]).not.toContain("✅");
+    } finally {
+      stop();
+    }
+  });
+
+  it("终稿限流一次后重试成功：卡片落成、不补发文字、追发仍是「✅ 已完成」", async () => {
+    const taskId = "t_int_final_retry_ok";
+    __setFinalRetryDelaysForTest([0, 0]);
+    const { texts, stop } = collectInfos(taskId);
+    try {
+      await startTurn(taskId);
+      larkMocks.updateCardEntity.mockClear();
+      larkMocks.updateCardEntity.mockRejectedValueOnce(
+        new LarkApiError("rate limited", { code: 99991400 }),
+      );
+      await finishTurn(taskId);
+
+      expect(larkMocks.updateCardEntity).toHaveBeenCalledTimes(2); // 限流一发 + 重试一发成功
+      expect(texts).toEqual([]);
       expect(pingTexts()).toHaveLength(1);
-      expect(pingTexts()[0]).toContain("⚠️ 回复没能同步到飞书卡片");
-      expect(pingTexts()[0]).not.toContain("✅");
+      expect(pingTexts()[0]).toContain("✅ 已完成");
     } finally {
       stop();
     }

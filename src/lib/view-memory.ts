@@ -18,13 +18,30 @@ const ss = (): Storage | null => {
   }
 };
 
+// sessionStorage 写入兜底：配额满 / 存储被禁时 setItem / removeItem 会抛（saveDraft 每次按键都调，
+// 抛出去会把输入框 / effect 带崩）。记忆点丢了无妨、不能影响主流程，统一吞掉
+const ssSet = (key: string, value: string): void => {
+  try {
+    ss()?.setItem(key, value);
+  } catch {
+    /* 配额满 / 存储被禁：记忆丢了无妨 */
+  }
+};
+const ssRemove = (key: string): void => {
+  try {
+    ss()?.removeItem(key);
+  } catch {
+    /* 同上 */
+  }
+};
+
 // ---------- 最后浏览的对话（胶囊切回「对话」时优先落它、不是最近活跃那条） ----------
 
 const LAST_CHAT_KEY = "flowship:last-chat-id";
 
 /** 记住「最后浏览的对话」task id；切到胶囊其它页再切回时优先落它 */
 export const rememberLastChat = (taskId: string) => {
-  ss()?.setItem(LAST_CHAT_KEY, taskId);
+  ssSet(LAST_CHAT_KEY, taskId);
 };
 
 /** 读回最后浏览的对话 task id；没记过或存储不可用返回 null */
@@ -38,15 +55,13 @@ const LAST_WORK_KIND_KEY = "flowship:last-work-kind";
 
 /** 记住「最后浏览的工作台任务」task id；切到对话再切回时按 kind 决定回任务还是甘特 */
 export const rememberLastWork = (taskId: string) => {
-  const s = ss();
-  if (!s) return;
-  s.setItem(LAST_WORK_KEY, taskId);
-  s.setItem(LAST_WORK_KIND_KEY, "task");
+  ssSet(LAST_WORK_KEY, taskId);
+  ssSet(LAST_WORK_KIND_KEY, "task");
 };
 
 /** 记住「最后停在甘特」；切到对话再切回时回到甘特、而不是被拽到老任务 */
 export const rememberWorkBoard = () => {
-  ss()?.setItem(LAST_WORK_KIND_KEY, "board");
+  ssSet(LAST_WORK_KIND_KEY, "board");
 };
 
 /** 读回最后浏览的工作台任务 task id；没记过或存储不可用返回 null */
@@ -65,10 +80,8 @@ export const getLastWorkKind = (): "board" | "task" | null => {
  * 详情页闪一下空态才回甘特——多余的一跳。
  */
 export const clearLastWork = () => {
-  const s = ss();
-  if (!s) return;
-  s.removeItem(LAST_WORK_KEY);
-  s.setItem(LAST_WORK_KIND_KEY, "board");
+  ssRemove(LAST_WORK_KEY);
+  ssSet(LAST_WORK_KIND_KEY, "board");
 };
 
 // ---------- 输入草稿（按 task 记、发送后清；打了半段切页不丢） ----------
@@ -89,10 +102,8 @@ export const loadDraft = (scope: DraftScope, taskId: string): string =>
 
 /** 保存输入草稿；text 为空串时删除该草稿位（发送后清） */
 export const saveDraft = (scope: DraftScope, taskId: string, text: string) => {
-  const s = ss();
-  if (!s) return;
-  if (text) s.setItem(draftKey(scope, taskId), text);
-  else s.removeItem(draftKey(scope, taskId));
+  if (text) ssSet(draftKey(scope, taskId), text);
+  else ssRemove(draftKey(scope, taskId));
 };
 
 // ---------- 输入条附件快照（图 + 路径、切页/切任务不丢） ----------
@@ -276,24 +287,53 @@ const SEEN_KEY = "flowship:task-seen";
 // 防无限膨胀：只保留最近 300 个任务的记录
 const SEEN_CAP = 300;
 
-const readSeenMap = (): Record<string, number> => {
+// 模块级内存缓存：侧栏每行都问一次 getTaskSeenAt，原先每次都整份 JSON.parse（行数 × 任务数 次解析）。
+// 写入（markTaskSeen）同步更新；别的窗口 / 标签写了同一份 localStorage 时靠 storage 事件失效。
+// 没有 window / localStorage（SSR、测试）或读盘失败时不缓存（返回 {}、下次再试），不抛。
+let seenCache: Record<string, number> | null = null;
+let seenInvalidationBound = false;
+
+const bindSeenInvalidation = () => {
+  if (seenInvalidationBound) return;
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+  seenInvalidationBound = true;
+  window.addEventListener("storage", (e: StorageEvent) => {
+    // key === null：别处 clear() 了整个 localStorage
+    if (e.key === null || e.key === SEEN_KEY) seenCache = null;
+  });
+};
+
+/** 直读 localStorage 并解析（不经缓存）；读盘 / 解析失败或不是对象时返回 null */
+const readSeenMapFromStorage = (): Record<string, number> | null => {
   try {
     const raw = JSON.parse(localStorage.getItem(SEEN_KEY) ?? "{}") as unknown;
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
     const out: Record<string, number> = {};
     for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
       if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
     }
     return out;
   } catch {
-    return {};
+    return null;
   }
+};
+
+// 纯读路径走缓存；写路径（markTaskSeen）不能信缓存，见下。读不到（null）时返回 {} 且不缓存、下次再试
+const readSeenMap = (): Record<string, number> => {
+  if (seenCache) return seenCache;
+  const out = readSeenMapFromStorage();
+  if (!out) return {};
+  bindSeenInvalidation();
+  seenCache = out;
+  return out;
 };
 
 /** 标记任务详情已被打开（写入当前时间戳，超容量按最老裁剪） */
 export const markTaskSeen = (taskId: string) => {
   try {
-    const map = readSeenMap();
+    // 写前先重新读盘再合并：缓存可能是旧的（别的窗口 / 标签刚写过、storage 事件还没到或没触发），
+    // 用缓存做「读-改-写」会把对方这次的更新覆盖掉。缓存只服务纯读路径
+    const map = readSeenMapFromStorage() ?? {};
     map[taskId] = Date.now();
     const ids = Object.keys(map);
     if (ids.length > SEEN_CAP) {
@@ -304,6 +344,9 @@ export const markTaskSeen = (taskId: string) => {
         .forEach((id) => delete map[id]);
     }
     localStorage.setItem(SEEN_KEY, JSON.stringify(map));
+    // 写盘成功才更新缓存：写失败（配额 / 存储被禁）时缓存仍等于盘上内容、与改前一致
+    seenCache = map;
+    bindSeenInvalidation();
   } catch {
     /* 存储被禁忽略 */
   }
@@ -381,7 +424,7 @@ export const loadBoardRange = (): { from: number; to: number } | null => {
 
 /** 保存看板时间范围（会话级，重启后回默认防陈旧日期） */
 export const saveBoardRange = (range: { from: number; to: number }) => {
-  ss()?.setItem(BOARD_RANGE_KEY, JSON.stringify(range));
+  ssSet(BOARD_RANGE_KEY, JSON.stringify(range));
 };
 
 // ---------- 侧栏 chat 分组视图（跨重启保留、localStorage） ----------

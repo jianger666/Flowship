@@ -30,6 +30,7 @@ import {
   type BackgroundSubagentJobView,
 } from "./background-subagents";
 import type { AssistantSnapshot } from "./assistant-live";
+import type { LiveToolOutputSnapshotEntry } from "./live-tool-outputs";
 import type { OutlineItem } from "./stream-outline";
 import { isTailAnchorEvent } from "./tail-anchor";
 import type { ThinkingSnapshot } from "./thinking-live";
@@ -566,11 +567,17 @@ export const updateTaskFields = async (
     addRepoDevBranches?: Record<string, string>;
     addRepoBranchTemplates?: Record<string, string>;
   },
+  /**
+   * `signal`：调用方的取消信号（配 `withTimeout((signal) => ...)` 做「超时即掐请求」）。
+   * abort 只断本端连接——服务端可能已经保存成功，调用方的超时文案要提示「以任务页为准」。
+   */
+  opts?: { signal?: AbortSignal },
 ): Promise<Task> => {
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
+    ...(opts?.signal ? { signal: opts.signal } : {}),
   });
   const data = await handleJson<{ task: Task }>(res);
   return data.task;
@@ -854,6 +861,12 @@ interface SSEEnvelope {
      * null = 没在吐字。让切走再切回 / 重连的前端立刻看到已生成的全部、而不是只剩后半截
      */
     | "assistant_snapshot"
+    /**
+     * 进行中 shell 输出的快照（bootstrap 无条件一帧，在 assistant_snapshot 之后、thinking_snapshot 之前）：
+     * outputs = [{ callId, text }]（各在跑 shell 已发出的尾部窗口）；空数组 = 没有。
+     * 前端按**替换**语义整份铺上（不是追加型 delta），让切走再切回 / 重连的工具块实时输出不再是空的
+     */
+    | "tool_output_snapshot"
     /** 队列整队失败控制帧 */
     | "queue_failed"
     /** bootstrap 队列存活快照 */
@@ -890,6 +903,8 @@ interface SSEEnvelope {
     total?: unknown;
     since?: unknown;
   } | null;
+  /** tool_output_snapshot 帧：各在跑 shell 的尾部窗口；按「不可信输入」，经 parseToolOutputSnapshot 校验后才交给回调 */
+  outputs?: unknown;
   itemIds?: string[];
   reason?: string;
   /** bootstrap queue_state 有界终态 ledger */
@@ -972,6 +987,26 @@ const parseAssistantSnapshot = (
   return { id: eventId, text, total };
 };
 
+/**
+ * tool_output_snapshot 帧的 outputs 字段 → LiveToolOutputSnapshotEntry[]：
+ *   - 不是数组 → undefined（无效帧，调用方丢弃：宁可不动本地直播缓冲，也别拿脏数据覆盖它）；
+ *   - 数组 → 逐项校验（callId 非空串、text 非空字符串），不合法的条目单独丢掉；全丢光 / 空数组 = [] （合法的「没有在跑的 shell」，前端据此清残留）。
+ */
+const parseToolOutputSnapshot = (
+  outputs: unknown,
+): LiveToolOutputSnapshotEntry[] | undefined => {
+  if (!Array.isArray(outputs)) return undefined;
+  const out: LiveToolOutputSnapshotEntry[] = [];
+  for (const item of outputs as unknown[]) {
+    if (!item || typeof item !== "object") continue;
+    const { callId, text } = item as { callId?: unknown; text?: unknown };
+    if (typeof callId !== "string" || callId.length === 0) continue;
+    if (typeof text !== "string" || text.length === 0) continue;
+    out.push({ callId, text });
+  }
+  return out;
+};
+
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
   const dataLines = frame
     .split("\n")
@@ -1043,6 +1078,14 @@ export interface TaskStreamCallbacks {
    */
   onAssistantSnapshot?: (snapshot: AssistantSnapshot | null) => void;
   /**
+   * 进行中 shell 输出的快照（每次连接 bootstrap 恰好一帧，在正文快照之后、思考快照之前）：
+   *   - 数组 = 此刻在跑的 shell 各自已发出的尾部窗口——上层按**替换**语义整份铺上直播缓冲
+   *     （不是追加型 delta：快照之后的实时 delta 由服务端排在它后面回放，替换后接着追加才不重不漏）；
+   *   - 空数组 = 此刻没有在跑的 shell——上层清掉本地可能残留的直播缓冲。
+   * 无效帧（outputs 不是数组）直接丢弃、不回调。
+   */
+  onToolOutputSnapshot?: (outputs: LiveToolOutputSnapshotEntry[]) => void;
+  /**
    * 队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
    */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
@@ -1099,6 +1142,12 @@ export interface TaskStreamCallbacks {
   onConnectionEstablished?: () => void;
 }
 
+/**
+ * watch 流「读不到任何字节」的容忍上限。服务端心跳间隔 20s（watch-task route），90s ≈ 4 个心跳周期：
+ * 够宽、不会因为一两次抖动误重连；又远小于「界面一直停在断开时状态」的体验代价。
+ */
+export const WATCH_STREAM_IDLE_TIMEOUT_MS = 90_000;
+
 /** watch 流结束时是否曾建立（首个合法 task 帧） */
 export type WatchTaskStreamResult = {
   established: boolean;
@@ -1149,11 +1198,37 @@ export const watchTaskStream = async (
   let connectionEstablished = false;
   // 是否自然读到了 EOF（服务端正常关流）：只有这种退出不需要我们主动关连接
   let finished = false;
+  // 静默死连接看门狗：服务端每 ~20s 发一帧 `: ping` 注释帧；超过 WATCH_STREAM_IDLE_TIMEOUT_MS 连一个字节都没来，
+  // 说明连接已被代理 / 休眠 / 网络切换悄悄掐了（TCP 没 RST，read() 会永远挂住）——主动 cancel 并抛错，
+  // 交给 hook 走正常重连。没有它，界面会一直停在断开时的状态、没有任何提示。
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleTimedOut = false;
+  const clearIdle = () => {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+  const armIdle = () => {
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      idleTimedOut = true;
+      void reader.cancel().catch(() => {});
+    }, WATCH_STREAM_IDLE_TIMEOUT_MS);
+  };
 
   try {
     while (true) {
+      armIdle();
       const { value, done } = await reader.read();
+      clearIdle();
       if (done) {
+        // 是我们自己的看门狗 cancel 出来的「假 EOF」：当断流抛错，让 hook 重连（别当服务端正常关流）
+        if (idleTimedOut) {
+          throw new Error(
+            `watch 流静默超过 ${Math.round(WATCH_STREAM_IDLE_TIMEOUT_MS / 1000)}s（连接疑似已被悄悄断开），重连`,
+          );
+        }
         finished = true;
         break;
       }
@@ -1207,6 +1282,10 @@ export const watchTaskStream = async (
             // 无效帧丢弃（undefined）：不动本地状态；null / 合法对象才回调
             const snap = parseAssistantSnapshot(env.live);
             if (snap !== undefined) callbacks.onAssistantSnapshot?.(snap);
+          } else if (env.type === "tool_output_snapshot") {
+            // 无效帧丢弃（undefined）：不动本地直播缓冲；数组（含空数组 = 清残留）才回调
+            const outputs = parseToolOutputSnapshot(env.outputs);
+            if (outputs !== undefined) callbacks.onToolOutputSnapshot?.(outputs);
           } else if (env.type === "thinking_snapshot") {
             // 无效帧丢弃（undefined）：不动本地状态；null / 合法对象才回调
             const snap = parseThinkingSnapshot(env.live);
@@ -1312,6 +1391,7 @@ export const watchTaskStream = async (
     // 服务端订阅者只在「请求 abort / ReadableStream.cancel / 终态关流」时退订，漏掉就每重连一轮泄漏 1 个（Q16-01）。
     // cancel 在流已 errored 时会返回 rejected promise：吞掉，别盖掉原错误、也别变成 unhandledRejection；
     // 不 await，免得阻塞 hook 的重连。
+    clearIdle();
     if (!finished) void reader.cancel().catch(() => {});
     try {
       reader.releaseLock();

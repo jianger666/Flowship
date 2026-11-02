@@ -662,6 +662,15 @@ export const validateScheduleCreate = (
   const delay = delayArg.value;
   const every = everyArg.value;
   const maxRuns = maxRunsArg.value;
+  // at 传了非字符串（数字时间戳 / 对象 / 布尔）不能当「没给」静默忽略：配 delay_minutes 会悄悄按 delay 建、
+  // 配 every_minutes 会悄悄按间隔起算，模型还以为设对了。undefined / null 才是「没给」
+  if (args.at !== undefined && args.at !== null && typeof args.at !== "string") {
+    return {
+      ok: false,
+      error:
+        "at 必须是字符串：带时区偏移的完整 ISO 时间（如 2026-11-02T09:00:00+08:00），不要传数字时间戳 / 对象；要「N 分钟后」请用 delay_minutes。",
+    };
+  }
   const atRaw = typeof args.at === "string" ? args.at : "";
   const nowLocal = formatScheduleLocalIso(now);
 

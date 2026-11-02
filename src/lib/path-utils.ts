@@ -418,10 +418,16 @@ const getCommonParentDir = (paths: string[]): string => {
   if (norm.length === 1) return norm[0];
   const segArrays = norm.map((p) => p.split("/"));
   const minLen = Math.min(...segArrays.map((arr) => arr.length));
+  // Windows 盘符路径（NTFS 大小写不敏感）：`D:/Work/a` 与 `d:/work/b` 是同一个父目录，区分大小写会算出 ""、
+  // 让多仓任务的 effective cwd 退回 process.cwd()（评审 2026-11-01）。按小写比、输出沿用第一个路径的写法；
+  // 非 Windows 路径仍区分大小写（Linux 上 `/a/Web` 与 `/a/web` 是两个目录）
+  const caseInsensitive = norm.every((p) => /^[a-zA-Z]:(\/|$)/.test(p));
+  const same = (a: string | undefined, b: string | undefined): boolean =>
+    caseInsensitive ? a?.toLowerCase() === b?.toLowerCase() : a === b;
   const common: string[] = [];
   for (let i = 0; i < minLen; i++) {
     const seg = segArrays[0][i];
-    if (segArrays.every((arr) => arr[i] === seg)) {
+    if (segArrays.every((arr) => same(arr[i], seg))) {
       common.push(seg);
     } else {
       break;
@@ -478,9 +484,23 @@ export const getEffectiveCwd = (repoPaths: string[]): string => {
  * 多仓 artifact 路径前缀校验（隔离 task 的 cwd 是 worktrees/<taskId>、原仓库路径
  * 不在其下、getRepoShortNames 算不出短名）。确定性：只由 repoPaths 顺序决定。
  */
-export const getUniqueRepoDirNames = (repoPaths: string[]): string[] => {
+export const getUniqueRepoDirNames = (
+  repoPaths: string[],
+  opts: { caseInsensitive?: boolean } = {},
+): string[] => {
   // 探重循环而不是「第 N 次出现拼 -N」：后者会跟真实目录名撞车
   //（如 [web, web, web-2] → web / web-2 / web-2、两仓映射同一目录）
+  //
+  // 探重是否按**小写**比，取决于 worktree 所在文件系统（2026-11-01 评审）：
+  // - APFS（mac 默认）/ NTFS（Windows）大小写不敏感，`Web` 与 `web` 是同一个目录——区分大小写地去重会让两个仓
+  //   映射到同一个 worktree 目录，后一个仓的 `git worktree add` 撞车或把改动写进对方的工作区；
+  // - Linux（ext4 / xfs …）区分大小写：`[Web, web]` 在旧版本里就是 Web / web 两个目录、**目录名不落库、每次由
+  //   repoPaths 重算**——这里若也按小写比，老任务的第二仓会被重算成 web-2，指到磁盘上不存在的目录
+  //   （agent cwd 错、删任务找不到 web 目录留下孤儿、活任务兜底还会把真实存在的 web 当「未映射残留」剪掉）。
+  //   所以 Linux 保持原行为。
+  // 返回值始终保留各自的原始大小写（只是后来者会拿到 `-N` 后缀）。`caseInsensitive` 缺省按平台判定、测试可注入
+  const ci = opts.caseInsensitive ?? isCaseInsensitiveFsPlatform();
+  const key = (n: string): string => (ci ? n.toLowerCase() : n);
   const taken = new Set<string>();
   return repoPaths.map((p) => {
     const base =
@@ -488,10 +508,35 @@ export const getUniqueRepoDirNames = (repoPaths: string[]): string[] => {
       "repo";
     let name = base;
     let i = 2;
-    while (taken.has(name)) name = `${base}-${i++}`;
-    taken.add(name);
+    while (taken.has(key(name))) name = `${base}-${i++}`;
+    taken.add(key(name));
     return name;
   });
+};
+
+/**
+ * 当前平台的默认文件系统是否大小写不敏感（mac APFS / Windows NTFS：是；Linux：否）。
+ * client + server 共用：server 看 `process.platform`；浏览器端 `process.platform` 不可用（Next 的 polyfill 给
+ * `browser` / undefined），退回 `navigator` 嗅探——Electron 壳里前后端同机、两边结论一致。
+ * 判不出来时按「不敏感」处理：多一个 `-N` 后缀无害，误判成「敏感」才会让两个仓撞同一个目录。
+ * `env` 仅为单测注入（用对象而不是位置参数：`undefined` 会触发默认值、测不到「浏览器端」分支）。
+ */
+export const isCaseInsensitiveFsPlatform = (
+  env: { platform?: string | null; navigatorHint?: string | null } = {
+    platform: typeof process !== "undefined" ? process.platform : null,
+    navigatorHint:
+      typeof navigator !== "undefined" ? `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}` : null,
+  },
+): boolean => {
+  const { platform, navigatorHint } = env;
+  if (platform === "darwin" || platform === "win32") return true;
+  if (platform === "linux" || platform === "freebsd" || platform === "openbsd" || platform === "sunos" || platform === "aix") {
+    return false;
+  }
+  // 浏览器 / 未知：嗅探 navigator（Mac / Windows / iOS 不敏感；Linux / X11 / ChromeOS / Android（UA 带 Linux）敏感）
+  if (navigatorHint && /\b(Mac|Win|iPhone|iPad)/i.test(navigatorHint)) return true;
+  if (navigatorHint && /\b(Linux|X11|CrOS)/i.test(navigatorHint)) return false;
+  return true;
 };
 
 /** 任务仓列表是否同一份（顺序也算、短名去重按序分配） */
@@ -583,9 +628,12 @@ const isWindowsUncPath = (p: string): boolean => isUncLikePath(p);
  * - 其余（POSIX）→ 单引号 + `'\''` 转义（`$` / 反引号 / 空格全部字面化）
  */
 export const shellQuotePath = (p: string): string => {
-  if (/^[A-Za-z0-9._\-/~:\\]*$/.test(p)) return p;
+  const windowsLike = isWindowsAbsPath(p) || isWindowsUncPath(p);
+  // `\` 只在 Windows 形态里是路径分隔符、可原样；POSIX 路径文件名里的 `\` 会被 shell 当转义符吃掉，必须走引号
+  const safe = windowsLike ? /^[A-Za-z0-9._\-/~:\\]*$/ : /^[A-Za-z0-9._\-/~:]*$/;
+  if (safe.test(p)) return p;
   // Windows 带空格路径若套 POSIX 单引号，cmd 里 `cd '...'` 失败
-  if (isWindowsAbsPath(p) || isWindowsUncPath(p)) {
+  if (windowsLike) {
     return `"${p.replace(/"/g, "")}"`;
   }
   return `'${p.replace(/'/g, `'\\''`)}'`;

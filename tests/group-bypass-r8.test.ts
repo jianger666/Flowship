@@ -39,6 +39,7 @@ const {
   __resetGroupChatCacheForTest,
   __setGroupRouteDepsForTest,
   GROUP_BYPASS_RATE_LIMITED,
+  GROUP_RESTRICTED_QA_DENIED,
   pumpGroupQuestionQueue,
   routeGroupInboundMessage,
 } = await import("@/lib/server/feishu-bridge/group-route");
@@ -77,6 +78,7 @@ const taskSummary = (): TaskSummary =>
     actionCount: 0,
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
   }) as TaskSummary;
+// 群答疑默认关闭（P0 硬化）：本文件测旁路限流 / 回放提示，夹具显式开启
 const fullTask = (): Task =>
   ({ ...taskSummary(), actions: [], events: [] }) as unknown as Task;
 
@@ -430,7 +432,10 @@ describe("L3-04(b)：回放丢弃提示的认领与批量", () => {
           }),
         ),
         s.id,
-      ).toMatchObject({ kind: "queued" });
+        // P0 硬化：机器人发件人在忙线 / 排队判定之前就被受限答疑准入闸静默拒绝（根本进不了队），真人照常入队
+      ).toMatchObject(
+        s.bot ? { kind: "skipped", error: GROUP_RESTRICTED_QA_DENIED } : { kind: "queued" },
+      );
     }
     release();
     sendTextToChat.mockClear();

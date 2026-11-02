@@ -314,7 +314,10 @@ export const planBranchesForBuild = (
     //   防 checkout 静默失败 / 仍停在别的 task 分支上、agent 继续在错分支改代码（曾踩坑：
     //   agent 没切分支直接在别的需求 feature 分支上改、污染了那个分支）。
     lines.push("# 防御：确认确实切到目标分支（不对就停、绝不在错分支改代码）");
-    lines.push("CURRENT=$(git rev-parse --abbrev-ref HEAD)");
+    // 不用 `rev-parse --abbrev-ref HEAD`：分支 foo 与标签 foo 并存时它输出 `heads/foo`，会把正确分支误判为错分支。
+    // symbolic-ref 永远给全名 refs/heads/foo；detached HEAD 时为空（!= 目标，照样停）。
+    lines.push('CURRENT=$(git symbolic-ref -q HEAD || true)');
+    lines.push('CURRENT="${CURRENT#refs/heads/}"');
     lines.push(`if [ "$CURRENT" != ${qName} ]; then`);
     lines.push(
       `  echo "[error] 当前分支 $CURRENT != 目标分支 ${qName}、停止 build（不要在错分支改代码、调 ask_user 报告用户等处理）"`,

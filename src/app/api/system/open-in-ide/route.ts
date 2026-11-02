@@ -9,6 +9,8 @@
  * 返回 { ok: true } 或 { error: 给用户看的原因 }
  */
 
+import path from "node:path";
+
 import { NextResponse } from "next/server";
 import { openInIde } from "@/lib/server/ide-tools";
 import { JUMP_IDES, type JumpIde } from "@/lib/types";
@@ -35,6 +37,15 @@ export const POST = async (req: Request) => {
   // 与 open-path / reveal-in-folder 同口径拒绝，且在 spawn 之前
   const nonLocal = nonLocalPathReason(p);
   if (nonLocal) return NextResponse.json({ error: nonLocal }, { status: 400 });
+  // 必须是绝对路径、且不能以 `-` 开头：path 会原样进 IDE CLI 的 argv，
+  // `--install-extension=/tmp/x.vsix` 之类会被 VS Code 系 CLI 当选项解析（与 open-path / reveal-in-folder 同口径）。
+  // 放在 UNC 白名单之后（`//host/share` 在 posix 上 isAbsolute 为真）；openInIde 内部还会再校验一次
+  if (p.startsWith("-")) {
+    return NextResponse.json({ error: "path 不能以 - 开头" }, { status: 400 });
+  }
+  if (!path.isAbsolute(p) && !/^[a-zA-Z]:[\\/]/.test(p)) {
+    return NextResponse.json({ error: "path 必须是绝对路径" }, { status: 400 });
+  }
   const line =
     typeof body.line === "number" && Number.isFinite(body.line) && body.line > 0
       ? Math.floor(body.line)

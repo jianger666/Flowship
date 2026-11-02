@@ -10,21 +10,56 @@ export interface TextOccurrenceRange {
   end: number;
 }
 
-/** 非重叠 occurrence 区间（end 不含） */
+/**
+ * 小写化后的文本 + 「小写码元 → 原文区间」映射。
+ * `toLowerCase()` 可能改变长度（`"İ"`（U+0130）小写成两个码元 `i̇`），此时小写串里的下标不能直接当原文偏移用
+ * （DOM 高亮 / 导航定位会整体错位）。长度没变时 starts / ends 为 null（下标一一对应、零额外开销）。
+ */
+const lowerWithOffsetMap = (
+  text: string,
+): { lower: string; starts: number[] | null; ends: number[] | null } => {
+  const whole = text.toLowerCase();
+  if (whole.length === text.length) return { lower: whole, starts: null, ends: null };
+  // 逐码点小写：每个小写码元记下它来自原文哪个码点（[start, end)）
+  let lower = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (let i = 0; i < text.length; ) {
+    const ch = String.fromCodePoint(text.codePointAt(i) as number);
+    const lc = ch.toLowerCase();
+    for (let k = 0; k < lc.length; k += 1) {
+      starts.push(i);
+      ends.push(i + ch.length);
+    }
+    lower += lc;
+    i += ch.length;
+  }
+  return { lower, starts, ends };
+};
+
+/** 非重叠 occurrence 区间（end 不含；偏移都是**原文**的码元下标） */
 export const findOccurrenceRanges = (
   text: string,
   query: string,
 ): TextOccurrenceRange[] => {
   const q = normalizePaneSearchQuery(query);
   if (!q || !text) return [];
-  const lower = text.toLowerCase();
+  const { lower, starts, ends } = lowerWithOffsetMap(text);
   const ranges: TextOccurrenceRange[] = [];
   let cursor = 0;
-  while (cursor < text.length) {
+  // 原文空间里上一个命中的结束位置：命中落在同一个展开字符（İ）内部时避免区间重叠
+  let lastEnd = 0;
+  while (cursor < lower.length) {
     const found = lower.indexOf(q, cursor);
     if (found < 0) break;
-    ranges.push({ start: found, end: found + q.length });
-    cursor = found + q.length;
+    const matchEnd = found + q.length;
+    const start = starts ? starts[found] : found;
+    const end = ends ? ends[matchEnd - 1] : matchEnd;
+    if (start >= lastEnd) {
+      ranges.push({ start, end });
+      lastEnd = end;
+    }
+    cursor = matchEnd;
   }
   return ranges;
 };

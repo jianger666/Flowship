@@ -47,6 +47,9 @@ export const useSmoothStreaming = () => {
   const displayedLenRef = useRef(0);
   const deltaRafRef = useRef<number | null>(null);
   const smoothRafRef = useRef<number | null>(null);
+  // 本地流式态当前绑定的快照段 id（applySnapshot 记下、clearStreaming 复位）：
+  // 重连快照的 id 与它不同 = 本地残留的是上一段，planAssistantSnapshot 据此整段替换而不是按文本前缀拼接
+  const snapshotIdRef = useRef<string | null>(null);
 
   const smoothTick = useCallback(() => {
     const target = streamingTargetRef.current;
@@ -115,6 +118,20 @@ export const useSmoothStreaming = () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
   }, []);
 
+  // 卸载时取消还没触发的 rAF（评审 P3）：否则组件卸载后合帧 / 追赶回调仍会跑一帧、对已卸载的组件 setStreamingText，
+  // 追赶循环里还会继续排下一帧、直到把目标串吐完才停
+  useEffect(
+    () => () => {
+      for (const ref of [deltaRafRef, smoothRafRef]) {
+        if (ref.current != null) {
+          cancelAnimationFrame(ref.current);
+          ref.current = null;
+        }
+      }
+    },
+    [],
+  );
+
   /** 清流式态的唯一入口：同步丢弃未上屏的残留 + 取消所有未决 rAF */
   const clearStreaming = useCallback(() => {
     for (const ref of [deltaRafRef, smoothRafRef]) {
@@ -126,6 +143,7 @@ export const useSmoothStreaming = () => {
     pendingDeltaRef.current = "";
     streamingTargetRef.current = "";
     displayedLenRef.current = 0;
+    snapshotIdRef.current = null;
     setStreamingText("");
   }, []);
 
@@ -143,7 +161,10 @@ export const useSmoothStreaming = () => {
         // 「已收到」= 已并入目标串的 + 还在 rAF 合帧队列里的
         streamingTargetRef.current + pendingDeltaRef.current,
         snap,
+        snapshotIdRef.current,
       );
+      // 非 clear：本地流式态从此归属这一段（clear 走 clearStreaming 复位）
+      if (plan.kind !== "clear" && snap) snapshotIdRef.current = snap.id;
       if (plan.kind === "keep") return;
       if (plan.kind === "clear") {
         clearStreaming();

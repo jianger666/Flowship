@@ -40,6 +40,7 @@ import {
 } from "./task-stream";
 import { noteSubagentToolCall } from "./subagent-transcript";
 import { trackBackgroundShell } from "./shell-background-tracker";
+import { discardLiveShellOutput } from "./shell-output-bridge";
 import { buildToolResultMeta } from "./tool-result-persist";
 
 /**
@@ -215,20 +216,61 @@ const getToolCallRunningSeen = (): ToolCallRunningSeen => {
 };
 
 /**
+ * 去重 key 带 taskId：callId 由模型 / 提供方生成，自定义 provider（OpenAI 兼容网关、本地模型）常见
+ * `call_0` / `tool_1` 这类短序号 id，不同任务之间天然会撞；全局只按 callId 去重会把别的任务
+ * 的 running 事件吞掉（那张工具卡永远没有「开始」帧）。\0 作分隔符，callId 里不会出现。
+ */
+const toolCallRunningSeenKey = (taskId: string, callId: string): string =>
+  `${taskId}\0${callId}`;
+
+/**
  * 标记 callId 已写过 running；返回 false = 本条应跳过写盘。
  * completed / error 不走此门。
+ * ⚠️ 先标记后写盘：写盘没成功（落盘抛错 / 返回 null / 写前失主）必须调
+ * {@link unmarkToolCallRunningSeen} 回滚，否则同 callId 之后的重发（重连续流、SDK 补 args 的第二次
+ * running）会被误当成「已写过」吞掉——这张工具卡就永远没有开始帧（用 {@link commitToolCallRunning} 一并处理）。
  */
-const tryMarkToolCallRunningSeen = (callId: string): boolean => {
+const tryMarkToolCallRunningSeen = (taskId: string, callId: string): boolean => {
   if (!callId) return true;
+  const key = toolCallRunningSeenKey(taskId, callId);
   const state = getToolCallRunningSeen();
-  if (state.set.has(callId)) return false;
-  state.set.add(callId);
-  state.order.push(callId);
+  if (state.set.has(key)) return false;
+  state.set.add(key);
+  state.order.push(key);
   while (state.order.length > TOOL_CALL_RUNNING_SEEN_MAX) {
     const oldest = state.order.shift();
     if (oldest) state.set.delete(oldest);
   }
   return true;
+};
+
+/** 回滚 {@link tryMarkToolCallRunningSeen} 的标记（写盘没成功时调；幂等） */
+const unmarkToolCallRunningSeen = (taskId: string, callId: string): void => {
+  if (!callId) return;
+  const key = toolCallRunningSeenKey(taskId, callId);
+  const state = getToolCallRunningSeen();
+  if (!state.set.delete(key)) return;
+  const idx = state.order.lastIndexOf(key);
+  if (idx >= 0) state.order.splice(idx, 1);
+};
+
+/**
+ * 写 running 事件并对「没写成」回滚去重标记：写前已失主（不写）/ write 返回 null（落盘失败被吞、失主拒写、
+ * 任务目录已没了——appendEvent / writeOwnedEventAndPublish 的「没写成」都是 null）/ write 抛错，
+ * 都视为「这个 callId 的 running 还没落过」。抛错照常往上抛（不吞）。
+ */
+const commitToolCallRunning = async (
+  taskId: string,
+  callId: string,
+  stillCurrent: () => boolean,
+  write: () => Promise<unknown>,
+): Promise<void> => {
+  let committed = false;
+  try {
+    if (stillCurrent()) committed = (await write()) !== null;
+  } finally {
+    if (!committed) unmarkToolCallRunningSeen(taskId, callId);
+  }
 };
 
 /** 单测清空去重表（避免用例互相污染） */
@@ -410,6 +452,11 @@ const emitToolResult = async (
       `[sdk-message-handler] emitToolResult 失败 task=${taskId} call=${msg.call_id}`,
       err,
     );
+  } finally {
+    // 工具结果落地后（含落地失败 / 已失主）：这个 callId 的 shell 直播尾部立刻丢——最终输出已在 tool_result 事件里，
+    // 新订阅者再拿到它只会让已完成的工具块「复活」直播缓冲。SDK 出错时可能只有这条 tool_call 终态消息、没有
+    // tool-call-completed 更新（shell-output-bridge 靠后者清），所以这里补一道；幂等、同步、不抛
+    discardLiveShellOutput(taskId, msg.call_id);
   }
 };
 
@@ -966,25 +1013,30 @@ export const handleSdkMessage = async (
       // 答案进 stdout 之后清 askSeen，同一轮可以再问 / 交卷。
       if (assistantCtx.askSeen) {
         if (msg.status === "running") {
-          if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
+          if (!tryMarkToolCallRunningSeen(taskId, msg.call_id)) break;
           const { argsStr, truncateMax } = stringifyToolCallArgs(
             msg.name,
             msg.args,
           );
-          if (!stillCurrent()) return;
-          await appendEvent(taskId, {
-            kind: "tool_call",
-            text: `调用 ${msg.name}${
-              argsStr ? `:${truncate(argsStr, 120)}` : ""
-            }`,
-            meta: {
-              callId: msg.call_id,
-              name: msg.name,
-              innerToolName: innerToolName || undefined,
-              args: argsStr ? truncate(argsStr, truncateMax) : undefined,
-              muted: true,
-            },
-          }, stillCurrent);
+          if (!stillCurrent()) {
+            unmarkToolCallRunningSeen(taskId, msg.call_id);
+            return;
+          }
+          await commitToolCallRunning(taskId, msg.call_id, stillCurrent, () =>
+            appendEvent(taskId, {
+              kind: "tool_call",
+              text: `调用 ${msg.name}${
+                argsStr ? `:${truncate(argsStr, 120)}` : ""
+              }`,
+              meta: {
+                callId: msg.call_id,
+                name: msg.name,
+                innerToolName: innerToolName || undefined,
+                args: argsStr ? truncate(argsStr, truncateMax) : undefined,
+                muted: true,
+              },
+            }, stillCurrent),
+          );
         } else if (msg.status === "error") {
           await emitToolResult(taskId, msg, stillCurrent, origin, true);
         } else if (msg.status === "completed") {
@@ -1018,18 +1070,23 @@ export const handleSdkMessage = async (
         assistantCtx.artifactWritten = true;
         if (msg.status === "running") {
           // 同 callId 的二次 running（SDK 流式补 args）跳过，避免双工具块
-          if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
+          if (!tryMarkToolCallRunningSeen(taskId, msg.call_id)) break;
           const argsStr = stringifyMeta(msg.args);
-          if (!stillCurrent()) return;
-          await writeEv({
-            kind: "tool_call",
-            text: `agent 在写 artifact: ${possibleTarget}`,
-            meta: {
-              callId: msg.call_id,
-              name: msg.name,
-              args: argsStr ? truncate(argsStr) : undefined,
-            },
-          });
+          if (!stillCurrent()) {
+            unmarkToolCallRunningSeen(taskId, msg.call_id);
+            return;
+          }
+          await commitToolCallRunning(taskId, msg.call_id, stillCurrent, () =>
+            writeEv({
+              kind: "tool_call",
+              text: `agent 在写 artifact: ${possibleTarget}`,
+              meta: {
+                callId: msg.call_id,
+                name: msg.name,
+                args: argsStr ? truncate(argsStr) : undefined,
+              },
+            }),
+          );
           break;
         }
         if (msg.status === "error") {
@@ -1091,24 +1148,29 @@ export const handleSdkMessage = async (
 
       if (msg.status === "running") {
         // 同 callId 的二次 running（SDK 流式补 args）跳过，避免双工具块
-        if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
+        if (!tryMarkToolCallRunningSeen(taskId, msg.call_id)) break;
         const { argsStr, truncateMax } = stringifyToolCallArgs(
           msg.name,
           msg.args,
         );
-        if (!stillCurrent()) return;
-        await writeEv({
-          kind: "tool_call",
-          text: `调用 ${msg.name}${argsStr ? `:${truncate(argsStr, 120)}` : ""}`,
-          // callId 供前端与 tool_result / tool_output_delta 配对；
-          // innerToolName 给兜底 A 精确识别 MCP 工具（勿解析 truncate 后的 text）
-          meta: {
-            callId: msg.call_id,
-            name: msg.name,
-            innerToolName: innerToolName || undefined,
-            args: argsStr ? truncate(argsStr, truncateMax) : undefined,
-          },
-        });
+        if (!stillCurrent()) {
+          unmarkToolCallRunningSeen(taskId, msg.call_id);
+          return;
+        }
+        await commitToolCallRunning(taskId, msg.call_id, stillCurrent, () =>
+          writeEv({
+            kind: "tool_call",
+            text: `调用 ${msg.name}${argsStr ? `:${truncate(argsStr, 120)}` : ""}`,
+            // callId 供前端与 tool_result / tool_output_delta 配对；
+            // innerToolName 给兜底 A 精确识别 MCP 工具（勿解析 truncate 后的 text）
+            meta: {
+              callId: msg.call_id,
+              name: msg.name,
+              innerToolName: innerToolName || undefined,
+              args: argsStr ? truncate(argsStr, truncateMax) : undefined,
+            },
+          }),
+        );
       } else if (msg.status === "error") {
         await emitToolResult(taskId, msg, stillCurrent, origin);
       } else if (msg.status === "completed") {

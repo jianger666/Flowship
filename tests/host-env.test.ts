@@ -12,6 +12,7 @@ import { spawnSync } from "node:child_process";
 import {
   HOST_INJECTED_ENV_KEYS,
   stripHostInjectedEnv,
+  stripHostInjectedEnvAndGitToken,
   stripReportFlagsFromNodeOptions,
 } from "@/lib/server/host-env";
 
@@ -124,5 +125,30 @@ describe("Q1-06：server 自己的 NODE_ENV=production 不泄进用户命令（�
 
   it("不放进 HOST_INJECTED_ENV_KEYS（hermetic-env 据此表删键，会把 vitest 的 NODE_ENV=test 一起删掉）", () => {
     expect((HOST_INJECTED_ENV_KEYS as readonly string[]).includes("NODE_ENV")).toBe(false);
+  });
+});
+
+describe("stripHostInjectedEnvAndGitToken（非 agent shell 出口：IDE / OS 打开器等）", () => {
+  const base = {
+    ELECTRON_RUN_AS_NODE: "1",
+    PORT: "8876",
+    FLOWSHIP_GITLAB_TOKEN: "glpat-x",
+    flowship_gitlab_token: "glpat-y", // Windows 下 env 名不区分大小写
+    PATH: "/usr/bin",
+  };
+
+  it("既剔宿主注入变量、也剔 GitLab PAT（任意大小写），其余原样保留", () => {
+    const env = stripHostInjectedEnvAndGitToken(base);
+    expect(env).not.toHaveProperty("ELECTRON_RUN_AS_NODE");
+    expect(env).not.toHaveProperty("PORT");
+    expect(Object.keys(env).some((k) => k.toUpperCase() === "FLOWSHIP_GITLAB_TOKEN")).toBe(false);
+    expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("不改入参；且与 stripHostInjectedEnv 的区别仅在 PAT（agent shell 通道仍保留它）", () => {
+    const before = JSON.stringify(base);
+    stripHostInjectedEnvAndGitToken(base);
+    expect(JSON.stringify(base)).toBe(before);
+    expect(stripHostInjectedEnv(base).FLOWSHIP_GITLAB_TOKEN).toBe("glpat-x");
   });
 });

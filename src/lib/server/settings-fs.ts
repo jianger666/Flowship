@@ -392,7 +392,7 @@ export const writeSettingsFileAtomic = async (
  * 「可以删」的 tmp 文件名：数据目录顶层 config.json 家族的原子写临时文件，**严格**是 writePrivateFileAtomic 的产物形态
  * `<目标>.tmp.<数字 pid>.<Math.random().toString(36).slice(2)>`（见 data-root.ts）。
  * 目标只认 config.json / config.json.bak / config.json.bak.shrink 三种；`.corrupt-<ts>` 是 writeFile 直写的、没有 tmp 阶段，
- * 别的文件（company-env.json 等）的 tmp 也不归这里管（见 cleanupStaleSettingsTmpFiles 的「作用域」说明）。
+ * company-env.json 的 tmp 有自己的正则与更保守的年龄（STALE_COMPANY_ENV_TMP_FILE_RE，见 cleanupStaleSettingsTmpFiles 的「作用域」说明）。
  *
  * 为什么不沿用 pi-coding-tools 的 CONFIG_FILE_FAMILY_RE（它的 tmp 分支是 `\.tmp\..+`）：那是**读拦截**口径，宁可多拦；
  * 拿它做**删除**，用户手工留在数据目录里的 `config.json.tmp.my-copy` 也会被删（第八轮实证）。两边口径不同是有意的：
@@ -410,11 +410,22 @@ const STALE_SETTINGS_TMP_FILE_RE = /^config\.json(?:\.bak(?:\.shrink)?)?\.tmp\.\
  */
 export const STALE_SETTINGS_TMP_MIN_AGE_MS = 10 * 60 * 1000;
 
+/**
+ * company-env.json 的原子写临时文件（writeCompanyEnvFile → writePrivateFileAtomic 的产物形态，与 config.json 家族完全一样）：
+ * `company-env.json.tmp.<数字 pid>.<随机段>`。里面是明文的服务器 / PG / Redis / Nacos 等密码，崩溃遗留后没人清。
+ * 同样**严格**匹配：只认这一个目标，`company-env.json.tmp.my-copy` / `company-env.json.bak.tmp.*` / 正式文件本体都不碰。
+ */
+const STALE_COMPANY_ENV_TMP_FILE_RE = /^company-env\.json\.tmp\.\d+\.[a-z0-9]+$/;
+/** company-env tmp 的最小年龄：比 config.json 家族更保守——1 小时以上只可能是崩溃遗留 */
+export const STALE_COMPANY_ENV_TMP_MIN_AGE_MS = 60 * 60 * 1000;
+
 export interface CleanupStaleTmpOptions {
   /** 当前时间（ms），测试注入；默认 Date.now() */
   now?: number;
-  /** 早于这个年龄才清（ms），默认 STALE_SETTINGS_TMP_MIN_AGE_MS */
+  /** config.json 家族：早于这个年龄才清（ms），默认 STALE_SETTINGS_TMP_MIN_AGE_MS */
   minAgeMs?: number;
+  /** company-env.json 的 tmp：早于这个年龄才清（ms），默认 STALE_COMPANY_ENV_TMP_MIN_AGE_MS */
+  companyEnvMinAgeMs?: number;
 }
 
 /**
@@ -428,11 +439,10 @@ export interface CleanupStaleTmpOptions {
  * 幂等；任何失败只 warn 文件名（不含内容）、绝不抛。
  * 不进 settings 写锁：它只碰早已被放弃的旧 tmp，与正在进行的写（新 tmp）互不相交。
  *
- * 作用域（已知缺口）：只管 config.json 家族。`company-env.json.tmp.<pid>.<rand>`（writeCompanyEnvFile 同样经
- * writePrivateFileAtomic 写出）崩溃遗留后里面同样是明文的服务器 / PG / Redis 等密码，**目前没有任何地方清它**
- * （全仓没有别的 tmp 清理器；pi-coding-tools 的旁路读拦截对 company-env.json 也只认精确文件名、不含它的 tmp）。
- * tests/settings-tmp-cleanup.test.ts 把它钉成「保留」，钉的是这个作用域、不是「它不含凭据」。要补就把 company-env.json
- * 加进目标集合，并同步评估读拦截。
+ * 作用域：config.json 家族（10 分钟）+ company-env.json 的 tmp（`company-env.json.tmp.<pid>.<rand>`，1 小时——
+ * writeCompanyEnvFile 同样经 writePrivateFileAtomic 写出，崩溃遗留后里面同样是明文的服务器 / PG / Redis 等密码，
+ * 以前这里没覆盖它、全仓也没有别的 tmp 清理器）。两族各自严格匹配、各自的最小年龄，互不放宽。
+ * 仍不覆盖的：pi-coding-tools 的旁路读拦截对 company-env.json 只认精确文件名、不含它的 tmp（读拦截另评估，不在这里）。
  *
  * @returns 实际删除的个数
  */
@@ -457,13 +467,15 @@ export const cleanupStaleSettingsTmpFiles = async (
       }
       return 0;
     }
+    const companyEnvMinAgeMs = opts.companyEnvMinAgeMs ?? STALE_COMPANY_ENV_TMP_MIN_AGE_MS;
     for (const name of names) {
-      if (!STALE_SETTINGS_TMP_FILE_RE.test(name)) continue;
+      const isSettingsTmp = STALE_SETTINGS_TMP_FILE_RE.test(name);
+      if (!isSettingsTmp && !STALE_COMPANY_ENV_TMP_FILE_RE.test(name)) continue;
       const full = path.join(dir, name);
       try {
         const st = await fs.lstat(full);
         if (!st.isFile()) continue;
-        if (now - st.mtimeMs <= minAgeMs) continue;
+        if (now - st.mtimeMs <= (isSettingsTmp ? minAgeMs : companyEnvMinAgeMs)) continue;
         await fs.unlink(full);
         removed += 1;
       } catch (err) {

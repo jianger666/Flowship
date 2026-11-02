@@ -12,6 +12,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { getLarkCliBin } from "@/lib/server/feishu-cli";
+import { stripHostInjectedEnvAndGitToken } from "@/lib/server/host-env";
 import { nonLocalPathReason } from "@/lib/unc-path";
 
 import { getBridgeDataDir } from "./bridge-config";
@@ -445,12 +446,21 @@ export interface RunLarkOpts {
   timeoutMs?: number;
 }
 
+/** execFile `timeout` 的上限（setTimeout 的 32 位有符号整数上限，超了 Node 会改成 1ms）。 */
+const MAX_EXEC_TIMEOUT_MS = 2_147_483_647;
+
 /**
  * 解析超时：非有限正数一律回退默认——execFile 的 `timeout: 0` 是「永不超时」，
  * 传进来 0 / 负数 / NaN 绝不能原样用。
+ *
+ * 结果一定是**正整数**：execFile 的 `timeout` 必须是无符号整数，小数（如终稿预算用单调时钟算出的
+ * `deadline - performance.now()` = 1234.567）会直接抛 ERR_OUT_OF_RANGE，让预算内的补发整个失败。
+ * 向下取整并至少 1ms（0.5 取整成 0 会变成「永不超时」）。
  */
-const resolveTimeoutMs = (t?: number): number =>
-  typeof t === "number" && Number.isFinite(t) && t > 0 ? t : LARK_TIMEOUT_MS;
+const resolveTimeoutMs = (t?: number): number => {
+  if (typeof t !== "number" || !Number.isFinite(t) || t <= 0) return LARK_TIMEOUT_MS;
+  return Math.min(MAX_EXEC_TIMEOUT_MS, Math.max(1, Math.floor(t)));
+};
 
 /** 跑一条 lark-cli 命令，返回解析后的 JSON 根对象 */
 export const runLark = async (
@@ -481,7 +491,8 @@ export const runLark = async (
           timeout: timeoutMs,
           maxBuffer: LARK_MAX_BUFFER,
           cwd: opts.cwd,
-          env: process.env,
+          // 只减不增：摘掉宿主注入变量和 GitLab PAT（PATH / HOME / 代理保留）；每次调用现取，反映当前 process.env
+          env: stripHostInjectedEnvAndGitToken(),
         });
         const parsed = tryParseJson(stdout) ?? tryParseJson(stderr);
         if (!parsed) {
@@ -548,15 +559,13 @@ export const larkApi = async (
 export const sendTextMessage = async (
   openId: string,
   text: string,
+  /** 可选：单次执行超时（ms），不传 = 默认 30s。终稿补发 / 完成追发在总预算快用完时传短一点（见 outbound finalizeTurn） */
+  callOpts: { timeoutMs?: number } = {},
 ): Promise<SendMessageResult> => {
-  const rec = await runLark([
-    "im",
-    "+messages-send",
-    "--user-id",
-    openId,
-    "--text",
-    text,
-  ]);
+  const rec = await runLark(
+    ["im", "+messages-send", "--user-id", openId, "--text", text],
+    callOpts.timeoutMs !== undefined ? { timeoutMs: callOpts.timeoutMs } : {},
+  );
   return extractSendResult(rec);
 };
 
@@ -603,21 +612,26 @@ export const sendFileMessageToChat = async (
 export const sendCardMessage = async (
   openId: string,
   cardId: string,
+  /** 不传 = 默认超时（与改前一致）；card-stream 终稿路径按剩余总预算传 */
+  callOpts: CardCallOpts = {},
 ): Promise<SendMessageResult> => {
   const content = JSON.stringify({
     type: "card",
     data: { card_id: cardId },
   });
-  const rec = await runLark([
-    "im",
-    "+messages-send",
-    "--user-id",
-    openId,
-    "--msg-type",
-    "interactive",
-    "--content",
-    content,
-  ]);
+  const rec = await runLark(
+    [
+      "im",
+      "+messages-send",
+      "--user-id",
+      openId,
+      "--msg-type",
+      "interactive",
+      "--content",
+      content,
+    ],
+    callOpts.timeoutMs !== undefined ? { timeoutMs: callOpts.timeoutMs } : {},
+  );
   return extractSendResult(rec);
 };
 
@@ -886,12 +900,15 @@ const extractSendResult = (rec: JsonRecord): SendMessageResult => {
  */
 export const createCardEntity = async (
   cardJson: unknown,
+  /** 不传 = 默认超时（与改前一致）；card-stream 终稿路径按剩余总预算传 */
+  callOpts: CardCallOpts = {},
 ): Promise<{ card_id: string }> => {
   const rec = await larkApi("POST", "/open-apis/cardkit/v1/cards", {
     data: {
       type: "card_json",
       data: JSON.stringify(cardJson),
     },
+    timeoutMs: callOpts.timeoutMs,
   });
   const data = asRecord(rec.data) ?? rec;
   const cardId =
@@ -1028,6 +1045,25 @@ export const uploadImage = async (filePath: string): Promise<string> => {
   return key;
 };
 
+/** 清掉某次下载留下的半截产物（`<outName>` 或 CLI 按 Content-Disposition 改出的 `<outName>.<ext>`）；永不抛 */
+const removePartialDownload = async (dir: string, outName: string): Promise<void> => {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return; // 清理只是卫生
+  }
+  for (const n of names) {
+    if (n !== outName && !n.startsWith(`${outName}.`)) continue;
+    // 每条各自 try/catch：某个文件删不掉（Windows 上被杀软 / 预览占用的 EBUSY / EPERM）不该让同批其余半截残留
+    try {
+      await fs.rm(path.join(dir, n), { force: true });
+    } catch {
+      // 删不掉的留给 30 天 TTL 清扫兜底
+    }
+  }
+};
+
 /**
  * 下载消息内图片/文件到本地临时路径并返回绝对路径。
  * CLI 要求 `--output` 相对路径 → 在 bridge 目录下以 cwd 执行。
@@ -1040,21 +1076,28 @@ export const downloadMessageResource = async (
   const dir = await getBridgeDataDir();
   const safeKey = fileKey.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
   const outName = `dl-${Date.now()}-${safeKey}`;
-  await runLark(
-    [
-      "im",
-      "+messages-resources-download",
-      "--message-id",
-      messageId,
-      "--file-key",
-      fileKey,
-      "--type",
-      type,
-      "--output",
-      outName,
-    ],
-    { cwd: dir },
-  );
+  try {
+    await runLark(
+      [
+        "im",
+        "+messages-resources-download",
+        "--message-id",
+        messageId,
+        "--file-key",
+        fileKey,
+        "--type",
+        type,
+        "--output",
+        outName,
+      ],
+      { cwd: dir },
+    );
+  } catch (err) {
+    // 超时被杀 / 中途失败：CLI 可能已写出半截产物。没人持有它的路径，不删就只剩 30 天 TTL 清扫兜底
+    // （大文件下载超时一次就是几十 MB 的残留）——按本次唯一前缀 best-effort 清掉再上抛
+    await removePartialDownload(dir, outName);
+    throw err;
+  }
   const abs = path.join(dir, outName);
   // CLI 可能按 Content-Disposition 改扩展名——列目录找前缀匹配
   try {

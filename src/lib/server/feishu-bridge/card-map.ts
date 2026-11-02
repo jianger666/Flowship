@@ -18,6 +18,7 @@ import path from "node:path";
 import { writePrivateFileAtomic } from "@/lib/server/data-root";
 
 import { getBridgeDataDir } from "./bridge-config";
+import { readJsonObjectForWrite } from "./json-store";
 import type { CardMapEntry, CardMapStore } from "./types";
 
 /** 映射条数上限——防膨胀；超出淘汰最旧 */
@@ -64,25 +65,48 @@ const emptyStore = (): CardMapStore => ({
   lastProcessedTs: "",
 });
 
-/** 读盘；缺文件 / 坏 JSON → 空 store（不抛） */
+/** 把盘上解析出的对象规整成 store（缺字段 / 类型不对的条目丢掉） */
+const normalizeStore = (parsed: Partial<CardMapStore>): CardMapStore => {
+  const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+  return {
+    entries: entries.filter(
+      (e): e is CardMapEntry =>
+        !!e &&
+        typeof e.messageId === "string" &&
+        typeof e.cardId === "string" &&
+        typeof e.taskId === "string" &&
+        typeof e.createdAt === "number",
+    ),
+    lastProcessedTs:
+      typeof parsed.lastProcessedTs === "string" ? parsed.lastProcessedTs : "",
+  };
+};
+
+/**
+ * 读改写用的读：只有「文件不存在」或「内容坏了（已隔离）」才从空开始；
+ * 其它读错误抛出（整段 RMW 随之放弃，不会拿空 store 覆盖盘上的历史）。见 json-store。
+ */
+const readCardMapStoreForWrite = async (): Promise<CardMapStore> => {
+  const parsed = await readJsonObjectForWrite(
+    await mapFilePath(),
+    "card-map",
+    // 字段类型不对（如 entries 被改成字符串）：不悄悄当空，复制留证（缺字段不算，那是新文件的正常形态）
+    (o) =>
+      (o.entries === undefined || Array.isArray(o.entries)) &&
+      (o.lastProcessedTs === undefined || typeof o.lastProcessedTs === "string"),
+  );
+  return parsed === null ? emptyStore() : normalizeStore(parsed as Partial<CardMapStore>);
+};
+
+/**
+ * 读盘（纯读取用）；缺文件 / 坏 JSON / 读失败 → 空 store（不抛——只读路径别中断消息处理）。
+ * 读改写**不要**用它（读失败回空再写回 = 抹掉全部历史），用 {@link readCardMapStoreForWrite}。
+ */
 export const readCardMapStore = async (): Promise<CardMapStore> => {
   const file = await mapFilePath();
   try {
     const raw = await fs.readFile(file, "utf-8");
-    const parsed = JSON.parse(raw) as Partial<CardMapStore>;
-    const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
-    return {
-      entries: entries.filter(
-        (e): e is CardMapEntry =>
-          !!e &&
-          typeof e.messageId === "string" &&
-          typeof e.cardId === "string" &&
-          typeof e.taskId === "string" &&
-          typeof e.createdAt === "number",
-      ),
-      lastProcessedTs:
-        typeof parsed.lastProcessedTs === "string" ? parsed.lastProcessedTs : "",
-    };
+    return normalizeStore(JSON.parse(raw) as Partial<CardMapStore>);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") {
@@ -107,7 +131,7 @@ export const writeCardMapStore = async (store: CardMapStore): Promise<void> =>
  */
 export const rememberCardMessage = async (entry: CardMapEntry): Promise<void> =>
   enqueueCardMapWrite(async () => {
-    const store = await readCardMapStore();
+    const store = await readCardMapStoreForWrite();
     const next = store.entries.filter((e) => e.messageId !== entry.messageId);
     next.push(entry);
     while (next.length > cardMapMaxRuntime) next.shift();
@@ -134,7 +158,7 @@ export const rememberAskCard = async (entry: {
   askId: string;
 }): Promise<void> =>
   enqueueCardMapWrite(async () => {
-    const store = await readCardMapStore();
+    const store = await readCardMapStoreForWrite();
     const existing = store.entries.find((e) => e.messageId === entry.messageId);
     const next = store.entries.filter((e) => e.messageId !== entry.messageId);
     next.push({
@@ -190,7 +214,7 @@ export const getLastProcessedTs = async (): Promise<string> => {
 
 export const setLastProcessedTs = async (ts: string): Promise<void> =>
   enqueueCardMapWrite(async () => {
-    const store = await readCardMapStore();
+    const store = await readCardMapStoreForWrite();
     const file = await mapFilePath();
     await writePrivateFileAtomic(
       file,

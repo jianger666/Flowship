@@ -467,7 +467,7 @@ describe("III. 源码契约（防回退）", () => {
   const startServerSrc = sliceMainFn("startServer");
 
   it("server 的 exit 回调收 (code, signal) 并交给 onServerExit，且带 .catch（处置本身出错不能变成未处理的 rejection）；旧的常量 `code=?` 与单按钮弹窗已删", () => {
-    expect(startServerSrc).toMatch(/proc\.on\("exit", \(code, signal\) => \{\s*onServerExit\(\{ proc, startedAt, code, signal \}\)\.catch\(/);
+    expect(startServerSrc).toMatch(/proc\.on\("exit", \(code, signal\) => \{\s*(?:clearServerPidRecord\(proc\.pid\);\s*)?onServerExit\(\{ proc, startedAt, code, signal \}\)\.catch\(/);
     expect(mainSrc).not.toContain('code ?? "?"');
     expect(mainSrc).not.toContain('dialog.showErrorBox(\n        "服务异常退出"');
     expect(startServerSrc.indexOf("const startedAt = Date.now();")).toBeGreaterThan(-1);

@@ -11,6 +11,7 @@
  * 不经 HTTP MCP。
  */
 
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { SDKCustomTool, SDKJsonValue } from "@cursor/sdk";
@@ -547,6 +548,53 @@ const createCustomActionDef: FlowshipToolDef = {
 
 // ----------------- 分享群 share_to_group -----------------
 
+// 服务端短窗幂等：断线重连 / 会话恢复后模型常把「刚发过的那张卡」原样再调一遍，没有这道门就会
+// 在需求群里刷出两张一模一样的卡。口径对齐 notify_group_testers 的 claimNotify（见
+// feishu-bridge/group-tester-notify.ts）：发之前占位、**明确失败就退坑**让重试放行、成功占位保留；
+// 区别是这里按「同 task + 同内容哈希」且只管一个短窗（用户确实想再发一次相同内容 → 等窗口过去或改一个字）。
+/** 去重窗口：同一任务相同内容在这么久之内重复调用 → 跳过（不当失败） */
+export const SHARE_TO_GROUP_DEDUP_WINDOW_MS = 2 * 60_000;
+/** 去重表容量上限（防无界）：超限先清过期、仍超限丢最旧 */
+const SHARE_TO_GROUP_DEDUP_MAX = 200;
+const SHARE_TO_GROUP_DEDUP_KEY = "__flowshipShareToGroupDedupV1__";
+
+/** key → 过期时刻（ms）。挂 globalThis：dev hot reload 后表不丢 */
+const getShareToGroupDedup = (): Map<string, number> => {
+  const g = globalThis as unknown as Record<string, Map<string, number> | undefined>;
+  if (!g[SHARE_TO_GROUP_DEDUP_KEY]) g[SHARE_TO_GROUP_DEDUP_KEY] = new Map();
+  return g[SHARE_TO_GROUP_DEDUP_KEY]!;
+};
+
+/** 同 task + 同发送内容（kind / title / content / links / at 全相同）才算重复；只存哈希、不存正文 */
+const shareToGroupDedupKey = (taskId: string, input: unknown): string =>
+  `${taskId}:${createHash("sha256").update(JSON.stringify(input)).digest("hex")}`;
+
+/** true = 抢到占位（可以发）；false = 窗口内已发过 / 正在发同一内容（跳过） */
+const claimShareToGroup = (key: string, now = Date.now()): boolean => {
+  const table = getShareToGroupDedup();
+  for (const [k, expiresAt] of table) {
+    if (expiresAt <= now) table.delete(k);
+  }
+  if (table.has(key)) return false;
+  while (table.size >= SHARE_TO_GROUP_DEDUP_MAX) {
+    const oldest = table.keys().next().value;
+    if (oldest === undefined) break;
+    table.delete(oldest);
+  }
+  table.set(key, now + SHARE_TO_GROUP_DEDUP_WINDOW_MS);
+  return true;
+};
+
+/** 发送明确失败时退坑：失败的那次不算「发过」，模型 / 用户重试要能放行 */
+const releaseShareToGroup = (key: string): void => {
+  getShareToGroupDedup().delete(key);
+};
+
+/** 单测清空去重表 */
+export const __resetShareToGroupDedupForTest = (): void => {
+  getShareToGroupDedup().clear();
+};
+
 const shareToGroupDef: FlowshipToolDef = {
   name: "share_to_group",
   label: "分享到飞书需求群（产物 / 疑问 / 进展）",
@@ -558,6 +606,7 @@ const shareToGroupDef: FlowshipToolDef = {
     "at 是通用 @：传中文名或邮箱，卡片正文自动 @ 并推送；精确匹配才@，换不出/重名进返回的 at.unresolved（不挡发送）。artifact 卡无正文、at 会全进 unresolved。",
     "本工具只往任务已绑定的需求群发，不会自动建群：任务还没绑群时返回 code=no_group，把 error 原文转告用户（需先在任务页飞书协作入口创建/绑定需求群）。",
     "返回 { ok, chatName?, messageId?, docMessageId? } 或 { ok:false, error, code? }——失败如实转告用户、不要自行重试。",
+    "防重：同一任务在 2 分钟内重复发送完全相同的内容（标题 / 正文 / 链接 / @ 都一样）会被跳过，返回 { ok:true, skipped:true, outcome:\"skipped_duplicate\" }——这不是失败，说明上一张卡已经发出，不用再发；如确需重发，请稍候再试或改动内容。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),
@@ -582,28 +631,43 @@ const shareToGroupDef: FlowshipToolDef = {
     if (!task) {
       return text(JSON.stringify({ ok: false, error: "任务不存在" }));
     }
-    try {
-      const result = await shareToRequirementGroup(
-        task,
-        {
-          kind: (["artifact", "message", "question"].includes(str(args.kind))
-            ? str(args.kind)
-            : "message") as "artifact" | "message" | "question",
-          title: str(args.title) || undefined,
-          content: str(args.content),
-          links: Array.isArray(args.links)
-            ? (args.links as Array<{ label: unknown; url: unknown }>).map(
-                (l) => ({ label: str(l.label), url: str(l.url) }),
-              )
-            : undefined,
-          at: Array.isArray(args.at)
-            ? (args.at as unknown[]).map((n) => str(n)).filter((n) => n.trim())
-            : undefined,
-        },
-        { verifyOwnerMembership: true },
+    const shareInput = {
+      kind: (["artifact", "message", "question"].includes(str(args.kind))
+        ? str(args.kind)
+        : "message") as "artifact" | "message" | "question",
+      title: str(args.title) || undefined,
+      content: str(args.content),
+      links: Array.isArray(args.links)
+        ? (args.links as Array<{ label: unknown; url: unknown }>).map(
+            (l) => ({ label: str(l.label), url: str(l.url) }),
+          )
+        : undefined,
+      at: Array.isArray(args.at)
+        ? (args.at as unknown[]).map((n) => str(n)).filter((n) => n.trim())
+        : undefined,
+    };
+    // 发之前占位（并发的同内容调用也只放第一个进去）；跳过不当失败：ok:true + outcome
+    const dedupKey = shareToGroupDedupKey(taskId, shareInput);
+    if (!claimShareToGroup(dedupKey)) {
+      return text(
+        JSON.stringify({
+          ok: true,
+          skipped: true,
+          outcome: "skipped_duplicate",
+          message:
+            "2 分钟内已向需求群发过相同内容的卡片（或同一内容正在发送），本次已跳过、不是失败。" +
+            "如确需重发，请稍候再试或改动内容。",
+        }),
       );
+    }
+    try {
+      const result = await shareToRequirementGroup(task, shareInput, {
+        verifyOwnerMembership: true,
+      });
       return text(JSON.stringify({ ok: true, ...result }));
     } catch (err) {
+      // 发送抛错 = 这次没发成：退坑，让重试 / 用户再来一次能放行
+      releaseShareToGroup(dedupKey);
       if (err instanceof FeishuGroupError) {
         return text(
           JSON.stringify({

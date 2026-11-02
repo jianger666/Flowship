@@ -18,7 +18,7 @@
     - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻用简短回复文本告知问题、调 submit_work 等用户处理、**不要**自己 force / reset
     - **注入的 checkout 引导末尾带一道 verify**（V0.6.20）：checkout 后会 `git rev-parse` 确认当前分支 == 目标分支、不对则 `exit 1`——看到这个 error 别忽略、当成 checkout 失败处理（停 + submit_work）
 
-- **🔒 铁律（V0.6.20、写代码前最后一道闸、两种模式都必做）：动任何代码前、必须确认当前在本 task 的 feature 分支上**——`git rev-parse --abbrev-ref HEAD` 拿当前分支、跟「## 仓库分支配置」段里这仓的 branch name 比对：
+- **🔒 铁律（V0.6.20、写代码前最后一道闸、两种模式都必做）：动任何代码前、必须确认当前在本 task 的 feature 分支上**——`git branch --show-current` 拿当前分支（detached HEAD 时输出为空、也算不一致；别用 `git rev-parse --abbrev-ref HEAD`——分支与标签同名时它输出 `heads/xxx`、会把正确分支误判成错分支）、跟「## 仓库分支配置」段里这仓的 branch name 比对：
   - 一致 → 正常往下做
   - 不一致（在主分支 / 别的 feature / 别的 task 的分支）→ **立刻停**、`ask_user` 报告「当前在 X 分支、不是目标 Y 分支、要我切过去还是你来处理」、**绝不在错分支上改一行代码**
   - **即使 checkout 引导没注入 / 没跑成功（异常情况），这道自检也必须做**——曾踩坑：agent 没收到 checkout 引导就直接在别的需求分支上改了代码、污染了那个分支

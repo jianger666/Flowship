@@ -4,7 +4,8 @@
  * ① 每个发送人最多占 2 个排队槽（超出走原「满了」口径：真人收忙线文案、机器人静默）。
  * ② 非属主旁路 run 按 task 的 10 分钟滑动窗，窗内最多**启动** 12 次（第六轮口径：起了 run 才计，
  *    另有每发送人 4 次的子限额）；超限**静默丢弃**（不回群消息），
- *    且只写一条节流的 info 事件（每类每窗最多一条）。属主自己、答 pendingAsk 不受限。
+ *    且只写一条节流的 info 事件（每类每窗最多一条）。属主自己不受限；非属主答 pendingAsk 也过同一道闸，
+ *    但它不起旁路 run——答成功即退还名额（窗口没满就不占额度），窗口已满则同样被丢弃。
  *
  * 路由级用例走真实 routeGroupInboundMessage / pump，只 mock 最外层的注入与发群消息。
  * 第六轮口径的路由级验收（忙线拒收不占名额 / 回放起 run 才计 / 个人限额 / 重投去重 / 失败退还）
@@ -70,6 +71,7 @@ const taskSummary = (): TaskSummary =>
     actionCount: 0,
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
   }) as TaskSummary;
+// 群答疑默认关闭（P0 硬化）：本文件测旁路限流，夹具显式开启
 const fullTask = (): Task =>
   ({ ...taskSummary(), actions: [], events: [] }) as unknown as Task;
 
@@ -219,7 +221,32 @@ describe("G3-02 ②：非属主旁路 run 的 task 级滑动窗（10 分钟 / �
     expect(infoEvents()).toHaveLength(0);
   });
 
-  it("答 agent 的 ask_user（pendingAsk）不计入、不受限", async () => {
+  it("非属主答 pendingAsk 也过限流闸：窗口刷满后被静默丢弃（pendingAsk 不动）；属主答不受限", async () => {
+    for (let i = 0; i < 12; i++) {
+      expect(
+        await routeGroupInboundMessage(msg(`ou_u${i}`, `om_s${i}`), ctx),
+      ).toMatchObject({ kind: "sent" });
+    }
+    installDeps({ getPendingAsk: () => ({ askId: "ask-1", questions: [] }) });
+    sendTextToChat.mockClear();
+
+    const r = await routeGroupInboundMessage(
+      msg("ou_late", "om_late_ask", { content: "@Flowship 选 B" }),
+      ctx,
+    );
+    expect(r).toMatchObject({ kind: "skipped" });
+    expect(injectPendingAskText).not.toHaveBeenCalled();
+    expect(sendTextToChat).not.toHaveBeenCalled();
+
+    const owner = await routeGroupInboundMessage(
+      msg(OWNER, "om_owner_ask", { content: "@Flowship 选 A" }),
+      ctx,
+    );
+    expect(owner).toMatchObject({ kind: "sent" });
+    expect(injectPendingAskText).toHaveBeenCalledTimes(1);
+  });
+
+  it("答 agent 的 ask_user（pendingAsk）不占名额：答成功即退还、不进 12 次计数（窗口没满时不受限）", async () => {
     installDeps({ getPendingAsk: () => ({ askId: "ask-1", questions: [] }) });
     for (let i = 0; i < 15; i++) {
       const r = await routeGroupInboundMessage(
@@ -320,22 +347,19 @@ describe("G3-02 ①：每个发送人最多占 2 个排队槽", () => {
     });
   });
 
-  it("机器人发件人超槽位：照常拒绝，但整条静默（系统回执对机器人静默）", async () => {
+  it("机器人发件人在旁路忙线时也不占排队槽位：准入闸先于忙线 / 排队，整条静默（P0 硬化新语义，原「超槽位照常拒绝」）", async () => {
     await withBusy(async () => {
       const bot = (id: string) =>
         msg("ou_otherbot", id, { sender_type: "app" } as never);
-      expect(await routeGroupInboundMessage(bot("om_b1"), ctx)).toMatchObject({
-        kind: "queued",
-      });
-      expect(await routeGroupInboundMessage(bot("om_b2"), ctx)).toMatchObject({
-        kind: "queued",
-      });
       sendTextToChat.mockClear();
-      expect(await routeGroupInboundMessage(bot("om_b3"), ctx)).toMatchObject({
-        kind: "skipped",
-      });
+      for (const id of ["om_b1", "om_b2", "om_b3"]) {
+        expect(await routeGroupInboundMessage(bot(id), ctx)).toMatchObject({
+          kind: "skipped",
+          error: "群答疑未放行（已静默忽略）",
+        });
+      }
       expect(sendTextToChat).not.toHaveBeenCalled();
-      expect(shared.groupQuestionQueueLength(TASK)).toBe(2);
+      expect(shared.groupQuestionQueueLength(TASK)).toBe(0);
     });
   });
 });

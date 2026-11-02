@@ -2624,8 +2624,14 @@ const finalizeChatRunIfCurrent = async (
 
   if (outcome === "finished") {
     // 自然结束：会话保留，只归位 awaiting_user + done + flush
-    rec.runActive = false;
     rec.lastActiveAt = Date.now();
+    // ⚠️ runActive 必须撑到「写盘完成 + 复查 lease」之后、与 publish(done) 同步相邻地才放：
+    // instanceId 在 run 与 run 之间不变（同一会话），isCurrent() 只能挡「换会话」、挡不住「同一会话的新一轮」。
+    // 若在 await 写盘前就放掉，窗口内进来的 send 见 runActive=false 直接 agent.send 并占位 true，
+    // 随后本 run 的 done 才发出——前端把它当成新一轮结束、提前清流式气泡 / 解锁输入，
+    // 本 run 的 awaiting_user 写入也可能盖掉新一轮刚写的 running。
+    // 撑住 runActive 期间到的 send 拿 busy 入队，由下面的 flushChatQueue 顺序送出。
+    await failpoint("chat.finalize.beforeStatusWrite");
     const doneTask = await setTaskRunStatusIfRunOwner(
       taskId,
       "awaiting_user",
@@ -2633,6 +2639,8 @@ const finalizeChatRunIfCurrent = async (
     );
     // 写盘 await 后失主 → 不 publish / 不 flush（避免清 B 前端 streaming）
     if (!isCurrent()) return false;
+    // 与下面 publish(done) / flush 之间不得再 await（新 send 只能在 done 发出之后才拿得到 idle）
+    rec.runActive = false;
     if (doneTask) publish(taskId, { kind: "task", task: doneTask });
     publish(taskId, {
       kind: "done",

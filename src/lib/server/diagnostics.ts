@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { dataRoot, describeConfigReadError, stripBom } from "./data-root";
+import { redactSecretsInText } from "./event-secret-redact";
 import { listIdeToolsDetailed } from "./ide-tools";
 
 // main.log 尾部截取量——太大发飞书费劲、300KB 足够覆盖最近几小时
@@ -29,6 +30,33 @@ const INSTALLER_LOG_TAIL_BYTES = 64 * 1024;
 const maskSecret = (v: unknown): string => {
   if (typeof v !== "string" || v.length === 0) return "（未配置）";
   return `${v.slice(0, 6)}…（长度 ${v.length}）`;
+};
+
+/**
+ * 日志文本脱敏（评审 P2：诊断包里的 main.log / installer.log 尾部原样带出，而用户会把它发给别人排查）。
+ * 两层：
+ *  1. 已知凭据的精确值（gitToken / apiKey / 公司环境口令及其编码变体）——与事件落盘同一套 `redactSecretsInText`；
+ *  2. 常见凭据形态的通用兜底（日志里可能出现的、不在上面清单里的：别处的 token、curl -v 的头、带口令的 URL）。
+ * 通用兜底只抓高置信形态，宁可漏一点也不把日志改得没法读；它是兜底、不是保证——原则仍是日志里不该打印凭据。
+ */
+export const redactDiagnosticText = (text: string): string => {
+  if (!text) return text;
+  let out = redactSecretsInText(text);
+  // GitLab 家族令牌（PAT / deploy / CI / feed / OAuth 应用 secret）
+  out = out.replace(/\bgl(?:pat|dt|cbt|ptt|rt|oas|soat|ffct)-[A-Za-z0-9_-]{16,}/g, "gl***-[REDACTED]");
+  // OpenAI 风格 / 常见 sk- 前缀密钥
+  out = out.replace(/\bsk-[A-Za-z0-9_-]{20,}/g, "sk-[REDACTED]");
+  // Authorization / Bearer 头（整个取值）
+  out = out.replace(/(\bAuthorization\s*[:=]\s*(?:Bearer|Basic|Token)?\s*)[A-Za-z0-9._~+\/=-]{8,}/gi, "$1[REDACTED]");
+  out = out.replace(/(\bBearer\s+)[A-Za-z0-9._~+\/-]{16,}=*/gi, "$1[REDACTED]");
+  // URL 里的 userinfo 口令：scheme://user:pass@host
+  out = out.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:)[^\/\s@]+@/gi, "$1[REDACTED]@");
+  // 凭据命名的 key=value / key: value（取值 ≥ 12 个字符才算，短值多半是状态词）
+  out = out.replace(
+    /(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|passwd|token)["']?\s*[=:]\s*["']?)[^\s"'&,;]{12,}/gi,
+    "$1[REDACTED]",
+  );
+  return out;
 };
 
 // 读 config.json 并脱敏成概要文本。
@@ -154,7 +182,7 @@ export const exportDiagnostics = async (appVersion?: string): Promise<string> =>
     readInstallerLogTail(),
   ]);
 
-  const content = [
+  const rawContent = [
     "===== Flowship 诊断包 =====",
     `导出时间: ${new Date().toISOString()}`,
     `app 版本: ${appVersion || "（未知、可能是 dev / 旧壳）"}`,
@@ -179,6 +207,8 @@ export const exportDiagnostics = async (appVersion?: string): Promise<string> =>
     `===== main.log 尾部（最后 ${Math.round(LOG_TAIL_BYTES / 1024)}KB） =====`,
     logTail,
   ].join("\n");
+  // 整份内容过一遍日志脱敏（config 概要已按固定格式脱过，这里主要管 main.log / installer.log 尾部）
+  const content = redactDiagnosticText(rawContent);
 
   // 时间戳文件名（本地时间、精确到分、重复导出不覆盖）
   const ts = new Date();

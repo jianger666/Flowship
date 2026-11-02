@@ -71,14 +71,14 @@ describe("sanitizePreviewHtml：保留正常排版", () => {
     );
   });
 
-  it("img：data:image base64 与 http(s) 保留，alt 保留", () => {
+  it("img：data:image base64 保留（含 alt / 尺寸）；http(s) 外链图的 src 被丢弃（不自动发请求）", () => {
     const data = "data:image/png;base64,iVBORw0KGgo=";
     const out = sanitizePreviewHtml(
-      `<p><img src="${data}" alt="图"/><img src="https://x.test/a.png" width="100"></p>`,
+      `<p><img src="${data}" alt="图" width="50"/><img src="https://x.test/a.png" width="100"><img src="HTTP://x.test/b.png"><img src="//x.test/c.png"></p>`,
     );
-    expect(out).toBe(
-      `<p><img src="${data}" alt="图"><img src="https://x.test/a.png" width="100"></p>`,
-    );
+    expect(out).toBe(`<p><img src="${data}" alt="图" width="50"><img width="100"><img><img></p>`);
+    expect(out).not.toMatch(/x\.test/);
+    expect(sanitizePreviewHtml(out)).toBe(out);
   });
 
   it("文本里的实体与孤立 < > 被安全处理", () => {
@@ -158,19 +158,22 @@ describe("sanitizePreviewHtml：XSS 载荷全部剔除", () => {
     expect(sanitizePreviewHtml('<img src="javascript:alert(1)" onerror="x">')).toBe("<img>");
   });
 
-  it("src 里实体编码的引号不能逃逸出属性（输出仍是只有 src 一个属性的 img）", () => {
-    const out = sanitizePreviewHtml('<img src="https://a.test/x&quot; onerror=&quot;alert(1)">');
-    // onerror 只是被转义后的 src 值内部文本、不是独立属性
-    expect(out).toBe('<img src="https://a.test/x&quot; onerror=&quot;alert(1)">');
-    expect(out.match(/<img\s+([a-z-]+)=/)?.[1]).toBe("src");
+  it("属性值里实体编码的引号不能逃逸出属性（输出仍是只有 title 一个属性的 img）", () => {
+    // src 现在只认 base64 data:image，引号进不去；逃逸面剩下 alt / title 这类文本属性
+    const out = sanitizePreviewHtml('<img title="x&quot; onerror=&quot;alert(1)">');
+    // onerror 只是被转义后的 title 值内部文本、不是独立属性
+    expect(out).toBe('<img title="x&quot; onerror=&quot;alert(1)">');
+    expect(out.match(/<img\s+([a-z-]+)=/)?.[1]).toBe("title");
     expect(out.match(/\s[a-z-]+="/g)).toHaveLength(1);
     expect(sanitizePreviewHtml(out)).toBe(out);
+    // src 里带引号的 payload：不是合法 base64 data:image，整个 src 被丢弃
+    expect(sanitizePreviewHtml('<img src="data:image/png;base64,AAA&quot; onerror=&quot;alert(1)">')).toBe("<img>");
   });
 
   it("属性值里的引号 / 尖括号输出时被转义", () => {
-    const out = sanitizePreviewHtml('<img src="https://a.test/a.png" alt="&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;">');
+    const out = sanitizePreviewHtml('<img src="data:image/png;base64,AAAA" alt="&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;">');
     expect(out).toBe(
-      '<img src="https://a.test/a.png" alt="&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;">',
+      '<img src="data:image/png;base64,AAAA" alt="&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;">',
     );
     expectSafe(out);
   });

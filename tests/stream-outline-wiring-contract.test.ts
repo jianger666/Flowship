@@ -447,12 +447,13 @@ describe("不变量：事件窗口被整体替换只发生在回退路径（时�
     );
   });
 
-  it("页面的 resyncEvents 只有回退触发的三个入口（lastRewindNeedsResync / SSE 回退标记 / 合并结果的 resync）", () => {
+  it("页面的 resyncEvents 只有回退触发的四个入口（lastRewindNeedsResync / task 模式 SSE 回退标记 / chat 模式 SSE 回退标记 / 合并结果的 resync）", () => {
     const page = lines(["app", "tasks", "[id]", "page.tsx"]);
     expect(page).toMatch(/lastRewindNeedsResync\(cur, next\)\) \{[\s\S]{0,260}resyncEventsRef\.current\?\.\(\)/);
-    expect(page).toContain("if (cur && rewindNeedsResync(cur, ev)) void resyncEvents();");
+    // 同一句出现两处：task 模式 useTaskWatch.onEvent（与 chat 路径同语义）+ chat 模式 onEventAppend
+    expect(page.split("if (cur && rewindNeedsResync(cur, ev)) void resyncEvents();").length - 1).toBe(2);
     expect(page).toContain("if (resync) void resyncEvents();");
-    expect((page.match(/void resyncEvents\(\)/g) ?? []).length).toBe(2);
+    expect((page.match(/void resyncEvents\(\)/g) ?? []).length).toBe(3);
     expect((page.match(/resyncEventsRef\.current\?\.\(\)/g) ?? []).length).toBe(1);
   });
 });

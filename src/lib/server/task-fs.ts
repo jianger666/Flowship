@@ -94,6 +94,7 @@ import {
 import { isAppUserDataPath } from "./app-data-dir";
 import { dataRoot, writeFileFsynced } from "./data-root";
 import { readSettingsFile } from "./settings-fs";
+import { getEventRedactionReplacements } from "./event-secret-redact";
 import {
   killStalePreview,
   stopPreviewsForTask,
@@ -126,10 +127,12 @@ import {
   readMetaV06,
   readMetaV06EvidenceSync,
   restoreMetaFromBackup,
+  sweepStaleMetaTmpFiles,
   taskDir,
   withTaskLock,
   prepareMetaWrite,
   readSessionAgentIdSync,
+  sanitizeId,
   writeMeta,
   type TaskMetaV06,
 } from "./task-fs-core";
@@ -153,13 +156,28 @@ const isDeleteBusyError = (err: unknown): boolean => {
 
 // ----------------- 仓库 flag 快照（只读 / 脚本仓）-----------------
 
-/** 读 settings.repos 算「只读 / 脚本仓」快照（失败 / 无匹配 → 各自 undefined） */
+type RepoFlagPaths = {
+  readonly: string[] | undefined;
+  script: string[] | undefined;
+};
+
+/**
+ * 读 settings.repos 算「只读 / 脚本仓」快照。
+ *
+ * 返回三种结果：
+ * - 对象：读到了（含 config.json 不存在 = 没配过仓）→ 无匹配时各自 undefined，表示「确认没有只读 / 脚本仓」；
+ * - `null`：**读取出错**（Windows 杀软占用 / 手改 JSON 没写完 / 权限）。这不等于「没有只读仓」——
+ *   以前把读失败转成空配置、`readonlyRepoPaths` 被写成 undefined 落进 meta，且快照之后不再重算，
+ *   下游 submit-mr-guard / action-checks / task-worktrees / task-changes 就永远当它是可写仓、「只读仓」标记被永久清掉。
+ *   调用方必须区分处理（建任务重试、更新仓库保留 meta 里原值），参照 company-env-fs 对 error 状态「保留现状、不覆盖」的口径。
+ */
 const snapshotRepoFlagPaths = async (
   repoPaths: string[],
-): Promise<{ readonly: string[] | undefined; script: string[] | undefined }> => {
-  const result = await readSettingsFile().catch(
-    () => ({ status: "error" as const, reason: "read_failed" }),
-  );
+): Promise<RepoFlagPaths | null> => {
+  // 没有仓库就没有「只读 / 脚本仓」可言：结果与 config 内容无关，不必读（config 读失败也不该挡住无仓的 chat）
+  if (repoPaths.length === 0) return { readonly: undefined, script: undefined };
+  const result = await readSettingsFile().catch(() => null);
+  if (!result || result.status === "error") return null;
   const settings = result.status === "ok" ? result.settings : null;
   const repos = Array.isArray(settings?.repos) ? settings.repos : [];
   // config.json 里 repos 是宽松 JSON、只收带 path 的条目
@@ -171,6 +189,84 @@ const snapshotRepoFlagPaths = async (
     readonly: computeReadonlyRepoPaths(repoPaths, entries),
     script: computeScriptRepoPaths(repoPaths, entries),
   };
+};
+
+/** 建任务读 config 失败后的重试间隔：杀软 / 同步盘的瞬时占用通常几十毫秒内释放 */
+const REPO_FLAG_RETRY_DELAY_MS = 100;
+
+/** 读快照；出错（null）→ 等一下重试一次（杀软 / 同步盘的瞬时占用通常几十毫秒内释放），仍失败返回 null */
+const snapshotRepoFlagPathsWithRetry = async (
+  repoPaths: string[],
+): Promise<RepoFlagPaths | null> => {
+  const first = await snapshotRepoFlagPaths(repoPaths);
+  if (first) return first;
+  await new Promise<void>((resolve) =>
+    setTimeout(resolve, REPO_FLAG_RETRY_DELAY_MS),
+  );
+  return snapshotRepoFlagPaths(repoPaths);
+};
+
+/**
+ * 建任务用：读 config 出错（null）→ 等一下重试一次；仍失败就抛 {@link SettingsUnreadableError}、不建任务。
+ * 带着「空快照」建出的任务，只读仓标记会被永久清掉（快照之后不再重算），宁可让用户重试一次。
+ */
+const snapshotRepoFlagPathsForCreate = async (
+  repoPaths: string[],
+): Promise<RepoFlagPaths> => {
+  const flags = await snapshotRepoFlagPathsWithRetry(repoPaths);
+  if (!flags) throw new SettingsUnreadableError("创建任务");
+  return flags;
+};
+
+/**
+ * 更新仓库用（updateTaskFields 阶段 1 / setTaskRepoPaths）：**新加**的仓必须能确认只读标记。
+ *
+ * 为什么：读 config 失败时 {@link applyRepoFlagSnapshot} 只能「保留 meta 里原值」，而新加的仓在原值里没有记录——
+ * 它会被当成可写仓，只读保护在不知情下被绕过（建任务那条路已经为此拒绝，更新这条路要同口径）。
+ * 取舍：选「拒绝」而不是「新仓默认只读」——默认只读会让 agent 在用户刚选的目录里静默改不了文件，
+ * 且快照之后不再重算、用户无从自行纠正；拒绝只让这一次修改失败（提示稍后重试），重试即恢复，影响更小。
+ * 范围：只在确有新仓时才拒绝；只删 / 只换序没有「未知标记」，读不出来仍保留原值（不为此挡住用户的解绑操作）。
+ *
+ * @returns 有新仓 → 读到的快照（非 null，读不到已抛错；updateTaskFields 阶段 2 重读失败时拿它兜底）；无新仓 → null（不读 config）
+ */
+const requireRepoFlagsForAddedRepos = async (
+  oldPaths: string[],
+  nextPaths: string[],
+): Promise<RepoFlagPaths | null> => {
+  if (!nextPaths.some((p) => !oldPaths.includes(p))) return null;
+  const flags = await snapshotRepoFlagPathsWithRetry(nextPaths);
+  if (!flags) throw new SettingsUnreadableError("修改仓库");
+  return flags;
+};
+
+/**
+ * 更新仓库路径时应用快照：读到了（对象）→ 照常覆盖；读取出错（null）→ **保留 meta 里原值、不覆盖**
+ * （只剔除已不在新 repoPaths 里的仓——仓都解绑了，它的标记留着没意义，也避免提示词里提到已解绑的仓）。
+ * 与 company-env-fs 对 error 状态的口径一致：读不出来 ≠ 没配，不能拿空配置覆盖现状。
+ * 仅适用于**没有新加仓**的更新：有新仓时调用方已先过 {@link requireRepoFlagsForAddedRepos}，读不出来在那里就拒绝了。
+ * 调用前 `meta.repoPaths` 必须已是新值。
+ */
+const applyRepoFlagSnapshot = (
+  meta: TaskMetaV06,
+  flags: RepoFlagPaths | null,
+): void => {
+  if (flags) {
+    meta.readonlyRepoPaths = flags.readonly;
+    meta.scriptRepoPaths = flags.script;
+    return;
+  }
+  console.warn(
+    `[task-fs] 读 config.json 失败、保留任务里原有的只读 / 脚本仓标记（不覆盖）id=${meta.id}`,
+  );
+  const bound = new Set(meta.repoPaths);
+  const prune = (old: string[] | undefined): string[] | undefined => {
+    if (!old) return old;
+    const kept = old.filter((p) => bound.has(p));
+    if (kept.length === old.length) return old;
+    return kept.length > 0 ? kept : undefined;
+  };
+  meta.readonlyRepoPaths = prune(meta.readonlyRepoPaths);
+  meta.scriptRepoPaths = prune(meta.scriptRepoPaths);
 };
 
 // ----------------- 上下文文档（V0.3、V0.6 不变）-----------------
@@ -746,6 +842,32 @@ const recoverDeletionJournals = async (): Promise<void> => {
   }
 };
 
+/** 目录名是否满足 task id 白名单（与 `taskDir()` / `sanitizeId` 同一口径，不另抄一份正则） */
+const isValidTaskDirName = (name: string): boolean => {
+  try {
+    sanitizeId(name);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 列出 `tasks/` 下的**合法任务目录 id**（readdir + isDirectory + id 白名单）。
+ *
+ * 为什么：用户 / 备份脚本会在 `tasks/` 里放 `abc copy`、`abc.bak` 这类目录。
+ * 以前三处扫描（tombstone 清扫 / boot recovery / listTasksWithCorrupt）都把目录名直接当 id，
+ * 一进 `taskDir()` 就在白名单校验处抛错——boot recovery 整体 reject 被顶层 `.catch` 吞掉、promise 还已缓存不重试
+ * （僵尸 running 任务不标 error、孤儿 worktree 不清、SDK store GC 不跑），`/api/tasks` 直接 500、侧栏整个为空。
+ * 这里统一滤掉不合法的目录名（不是任务、不碰也不删）；readdir 本身失败仍抛给调用方，各自按原口径处理。
+ */
+export const listTaskDirIds = async (): Promise<string[]> => {
+  const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
+  return entries
+    .filter((e) => e.isDirectory() && isValidTaskDirName(e.name))
+    .map((e) => e.name);
+};
+
 /**
  * 清扫 deleteTask 降级留下的 tombstone 目录。
  * 只删带 `.deleted-tombstone` 的——tasks 下 bench/fixture 等手工目录绝不能误删。
@@ -758,25 +880,25 @@ const cleanupTombstonedTaskDirs = async (): Promise<void> => {
 
   let ids: string[];
   try {
-    const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
-    ids = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    ids = await listTaskDirIds();
   } catch (err) {
     console.warn("[task-fs] tombstone 清扫: 读 DATA_DIR 失败", err);
     return;
   }
   for (const name of ids) {
-    const tomb = await probeDeleteTombstone(name);
-    // unknown → 跳过本轮（不误删）
-    if (tomb.kind === "unknown") {
-      console.error(
-        `[task-fs] tombstone 清扫: access 未知、本轮跳过 id=${name}`,
-        tomb.error,
-      );
-      continue;
-    }
-    if (tomb.kind === "absent") continue;
-    // journal 路径已在 recoverDeletionJournals 处理过则目录应已消失；残留 = 无 journal 遗留
+    // 每个 id 单独兜底：一个目录出意外（探针 / 清扫抛错）不能拖垮其余目录、更不能让 boot recovery 整体中止
     try {
+      const tomb = await probeDeleteTombstone(name);
+      // unknown → 跳过本轮（不误删）
+      if (tomb.kind === "unknown") {
+        console.error(
+          `[task-fs] tombstone 清扫: access 未知、本轮跳过 id=${name}`,
+          tomb.error,
+        );
+        continue;
+      }
+      if (tomb.kind === "absent") continue;
+      // journal 路径已在 recoverDeletionJournals 处理过则目录应已消失；残留 = 无 journal 遗留
       await recoverDeletedTaskArtifacts(name);
       console.log(`[task-fs] tombstone 清扫: 已删 id=${name}`);
     } catch (err) {
@@ -788,17 +910,238 @@ const cleanupTombstonedTaskDirs = async (): Promise<void> => {
   }
 };
 
+// ----------------- boot recovery：失败的 id 只重试它自己 -----------------
+//
+// ensureBootRecovery 整进程只缓存一个 promise（RECOVERY_FLAG，很多测试直接塞 Promise.resolve() 跳过恢复，契约不能动），
+// 以前某个任务恢复时的瞬时失败（Windows 杀软占着 meta.json / EBUSY / 追加事件失败 / readdir(DATA_DIR) 失败）
+// = 本进程内永久跳过：那个僵尸 running 任务只能等下次重启才被标 error，侧栏一直转圈。
+// 现在失败的 id 记进全局失败表，冷却期后由 ensureBootRecovery 的后续调用在后台**只重试这些 id**（成功的不重做）。
+// 重试比首轮多两道闸，因为此刻本进程里可能已经有 run 在跑，首轮「没有任何读写在跑」的前提不再成立：
+//   ① 持任务锁、锁内重读 meta；② 只处理 meta.updatedAt < 本进程 boot 时刻的僵尸——本进程里任何 run 的启动
+//   （setTaskRunStatus / appendAction…）都会写 meta 把 updatedAt 推到 boot 之后，所以这条判据不会误杀新 run。
+// 重试**不**重做首轮的收尾（孤儿 worktree 清扫 / 预览进程清理 / SDK store GC）：它们对「当时的活任务集合」敏感、
+// 事后补做有误删本进程新资源的风险，留给下次启动。
+
+const RECOVERY_RETRY_KEY = "__flowshipBootRecoveryRetryV1__";
+/** 失败后多久才允许下一轮重试（列表 2s 轮询一次，不能每次都重试） */
+const RECOVERY_RETRY_COOLDOWN_MS = 30_000;
+/** 每个 id 最多再试几次，超过放弃（日志说明、等下次启动） */
+const RECOVERY_RETRY_MAX_ATTEMPTS = 3;
+
+type BootRetryState = {
+  /** 恢复没做成的任务 id → 已重试次数 */
+  failed: Map<string, number>;
+  /** 顶层 readdir(DATA_DIR) 失败：首轮整体没跑，重试时重新列目录 */
+  listFailed: boolean;
+  /** 本进程 boot recovery 开始的时刻：重试只处理 updatedAt 早于它的僵尸 */
+  bootAt: number;
+  lastAttemptAt: number;
+  sweeping: boolean;
+};
+
+const getBootRetryState = (): BootRetryState => {
+  const g = globalThis as unknown as Record<string, BootRetryState | undefined>;
+  return (g[RECOVERY_RETRY_KEY] ??= {
+    failed: new Map(),
+    listFailed: false,
+    bootAt: Date.now(),
+    lastAttemptAt: 0,
+    sweeping: false,
+  });
+};
+
+/** 单任务恢复结果 */
+type RecoverTaskResult = {
+  /** 算「存活」（清孤儿 worktree 时保守保留；读不了状态的也算） */
+  live: boolean;
+  /** 把 running 僵尸标成了 error */
+  recovered: boolean;
+  /** 瞬时失败、没处理完 → 记进失败表稍后重试 */
+  retry: boolean;
+};
+
+/**
+ * 把 running 僵尸标 error：先追加 error 事件、再改 meta。失败返回 false（调用方记失败表重试）。
+ * 注意：事件追加成功而写 meta 失败时，重试会再追加一条同文案事件（双重故障、极少见，接受）。
+ */
+const markZombieTaskError = async (id: string, meta: TaskMetaV06): Promise<boolean> => {
+  // 写 error 事件 + 标 runStatus=error
+  const event: TaskEvent = {
+    id: newEventId(),
+    ts: Date.now(),
+    kind: "error",
+    // task / chat 共用：文案单一来源 lib/stop-copy（D8-06，与停止确认框 / 停止后 info 同一说法）
+    text: BOOT_RECOVERY_TEXT,
+  };
+  try {
+    await appendEventLine(id, event);
+  } catch (err) {
+    console.warn(
+      `[task-fs] boot recovery: 追加 error 事件失败 id=${id}`,
+      err,
+    );
+    return false;
+  }
+
+  meta.runStatus = "error";
+  meta.updatedAt = event.ts;
+  // 当前 action 如果在跑、标 error
+  if (meta.currentActionId) {
+    const action = meta.actions.find((a) => a.id === meta.currentActionId);
+    if (action && (action.status === "running" || action.status === "awaiting_ack")) {
+      action.status = "error";
+      action.endedAt = event.ts;
+    }
+  }
+  try {
+    await writeMeta(meta);
+    return true;
+  } catch (err) {
+    console.warn(`[task-fs] boot recovery: 写 meta 失败 id=${id}`, err);
+    return false;
+  }
+};
+
+// 单个任务目录的恢复流程（提成函数：调用方每个 id 单独 try/catch，一个坏目录不能让整轮恢复中止）
+const recoverOneTask = async (id: string): Promise<RecoverTaskResult> => {
+  if (await exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE))) {
+    return { live: false, recovered: false, retry: false };
+  }
+  // 崩溃遗留的 meta.json.tmp.* / meta.json.bak.tmp.*（超过 1 小时、文件名精确匹配）顺手清掉；绝不抛、不动正式文件
+  await sweepStaleMetaTmpFiles(id);
+  // meta.json 内容损坏（崩溃留下空文件 / 降级后新枚举读不了）且 meta.json.bak 有效 → 先用 .bak 恢复，
+  // 再走下面的正常 recovery（恢复出来的 meta 若还是 running 照样会被标 error）。
+  // 放在启动期而不是每次读时回落：此刻没有任何读写在跑，不会覆盖用户手改到一半的 meta；
+  // 没有 .bak / 恢复失败则原样往下走（读不出来 → 当存活、由 listTasksWithCorrupt 暴露）。
+  await restoreMetaFromBackup(id).catch(() => undefined);
+  let raw: unknown | null;
+  try {
+    raw = await readMetaRaw(id);
+  } catch (err) {
+    console.warn(`[task-fs] boot recovery: 读 meta 失败 id=${id}`, err);
+    return { live: true, recovered: false, retry: true };
+  }
+  if (!raw) return { live: false, recovered: false, retry: false };
+  if (!isValidMetaShape(raw)) {
+    // V0.5 残留 / schema 破损 → 不参与 recovery
+    return { live: true, recovered: false, retry: false };
+  }
+
+  const meta = raw;
+  const live = meta.repoStatus !== "merged" && meta.repoStatus !== "abandoned";
+  // V0.11.1：awaiting_user 不再标 error——这是新模型的正常静息态（agent 答完 / 交卷完
+  // run 已自然结束、没有「断掉的连接」可言）。会话内存虽丢、但 sessionAgentId 落盘了、
+  // 用户下一步操作（再聊聊 / 答弹窗 / 发消息 / 续用推进）会 Agent.resume 无缝接回。
+  // 只有 running（run 真在跑时进程死了）才是僵尸、标 error。
+  if (meta.runStatus !== "running") return { live, recovered: false, retry: false };
+
+  const ok = await markZombieTaskError(id, meta);
+  return { live, recovered: ok, retry: !ok };
+};
+
+/** 重试单个 id：持锁、锁内重读；返回 true = 已了结（不必再试），false = 仍失败 */
+const retryRecoverOneTask = (id: string, bootAt: number): Promise<boolean> =>
+  withTaskLock(id, async () => {
+    if (await exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE))) return true;
+    let raw: unknown | null;
+    try {
+      raw = await readMetaRaw(id);
+    } catch (err) {
+      console.warn(`[task-fs] boot recovery: 读 meta 失败 id=${id}（重试）`, err);
+      return false;
+    }
+    if (!raw || !isValidMetaShape(raw)) return true;
+    if (raw.runStatus !== "running") return true;
+    // 本进程 boot 之后又被写过 = run 已在本进程里启动，不是上个进程留下的僵尸，别误杀
+    if (raw.updatedAt >= bootAt) return true;
+    const ok = await markZombieTaskError(id, raw);
+    if (ok) console.log(`[task-fs] boot recovery 重试：已把僵尸 task 标为 error id=${id}`);
+    return ok;
+  });
+
+const retryFailedBootRecovery = async (st: BootRetryState): Promise<void> => {
+  if (st.listFailed) {
+    let ids: string[];
+    try {
+      ids = await listTaskDirIds();
+    } catch (err) {
+      console.warn("[task-fs] boot recovery 重试: 读 DATA_DIR 仍失败（下个冷却期再试）", err);
+      return;
+    }
+    st.listFailed = false;
+    // 首轮整体没跑：每个目录都是「没处理过」，并入失败表（已有的计数保留）
+    for (const id of ids) if (!st.failed.has(id)) st.failed.set(id, 0);
+  }
+  for (const [id, attempts] of [...st.failed]) {
+    let done = false;
+    try {
+      done = await retryRecoverOneTask(id, st.bootAt);
+    } catch (err) {
+      console.warn(`[task-fs] boot recovery 重试: 处理任务目录失败 id=${id}`, err);
+    }
+    if (done) {
+      st.failed.delete(id);
+    } else if (attempts + 1 >= RECOVERY_RETRY_MAX_ATTEMPTS) {
+      st.failed.delete(id);
+      console.warn(`[task-fs] boot recovery 重试: id=${id} 已重试 ${RECOVERY_RETRY_MAX_ATTEMPTS} 次仍失败，放弃（下次启动再恢复）`);
+    } else {
+      st.failed.set(id, attempts + 1);
+    }
+  }
+};
+
+/** ensureBootRecovery 后续调用的入口：有失败项且过了冷却期才在后台起一轮（单飞、不挡调用方、永不抛） */
+const scheduleBootRecoveryRetry = (): void => {
+  const st = (globalThis as unknown as Record<string, BootRetryState | undefined>)[RECOVERY_RETRY_KEY];
+  if (!st || st.sweeping || (st.failed.size === 0 && !st.listFailed)) return;
+  const now = Date.now();
+  if (now - st.lastAttemptAt < RECOVERY_RETRY_COOLDOWN_MS) return;
+  st.sweeping = true;
+  st.lastAttemptAt = now;
+  void retryFailedBootRecovery(st)
+    .catch((err) => console.warn("[task-fs] boot recovery 重试顶层异常（已吞）：", err))
+    .finally(() => {
+      st.sweeping = false;
+    });
+};
+
+/**
+ * 旧版明文 tool-outputs 的一次性脱敏迁移（后台、有预算、失败吞掉；细节见 tool-result-persist.migrateLegacyToolOutputs）。
+ * 动态 import：tool-result-persist 静态依赖 task-stream，而 task-stream 依赖本文件（静态会成环，同 closeTaskSession 的写法）。
+ * 没有已知凭据时连 import 都不做——测试 / 没配 key 的机器零开销，也不会在测试收尾后还有悬空的 import。
+ */
+const scheduleLegacyToolOutputMigration = (ids: string[]): void => {
+  try {
+    if (ids.length === 0 || getEventRedactionReplacements().length === 0) return;
+  } catch {
+    return;
+  }
+  void import("./tool-result-persist")
+    .then((m) => m.migrateLegacyToolOutputs(ids))
+    .then((r) => {
+      if (r.filesRewritten > 0) {
+        console.log(`[task-fs] 旧 tool-output 脱敏迁移：检查 ${r.filesChecked} 个文件、改写 ${r.filesRewritten} 个${r.budgetExhausted ? "（预算用完、其余下次启动继续）" : ""}`);
+      }
+    })
+    .catch((err) => console.warn("[task-fs] 旧 tool-output 脱敏迁移失败（已吞）：", err));
+};
+
 const runBootRecovery = async (): Promise<void> => {
+  const retry = getBootRetryState();
+  retry.bootAt = Date.now();
+  retry.lastAttemptAt = retry.bootAt;
+  retry.failed.clear();
+  retry.listFailed = false;
   await ensureDataDir();
   // 先清 tombstone 残留（句柄已随进程重启释放），再扫 zombie runStatus
   await cleanupTombstonedTaskDirs();
 
   let ids: string[];
   try {
-    const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
-    ids = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    ids = await listTaskDirIds();
   } catch (err) {
     console.warn("[task-fs] boot recovery: 读 DATA_DIR 失败", err);
+    retry.listFailed = true; // 首轮整体没跑：冷却期后重新列目录再补
     return;
   }
 
@@ -808,72 +1151,17 @@ const runBootRecovery = async (): Promise<void> => {
   // 含 tombstone 的目录一律跳过（清扫失败残留时不能当存活、也不能写 boot-recovery error）。
   const liveTaskIds = new Set<string>();
   for (const id of ids) {
-    if (await exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE))) continue;
-    // meta.json 内容损坏（崩溃留下空文件 / 降级后新枚举读不了）且 meta.json.bak 有效 → 先用 .bak 恢复，
-    // 再走下面的正常 recovery（恢复出来的 meta 若还是 running 照样会被标 error）。
-    // 放在启动期而不是每次读时回落：此刻没有任何读写在跑，不会覆盖用户手改到一半的 meta；
-    // 没有 .bak / 恢复失败则原样往下走（读不出来 → 当存活、由 listTasksWithCorrupt 暴露）。
-    await restoreMetaFromBackup(id).catch(() => undefined);
-    let raw: unknown | null;
     try {
-      raw = await readMetaRaw(id);
+      const r = await recoverOneTask(id);
+      if (r.live) liveTaskIds.add(id);
+      if (r.recovered) recovered++;
+      if (r.retry) retry.failed.set(id, 0);
     } catch (err) {
-      console.warn(`[task-fs] boot recovery: 读 meta 失败 id=${id}`, err);
+      // 兜底：流程里任何没被内层 try 接住的意外都只影响这一个目录。
+      // 读不了状态的保守当存活（与「读 meta 失败」同口径：宁可留着孤儿 worktree 也不误删）
+      console.warn(`[task-fs] boot recovery: 处理任务目录失败（跳过）id=${id}`, err);
       liveTaskIds.add(id);
-      continue;
-    }
-    if (!raw) continue;
-    if (!isValidMetaShape(raw)) {
-      // V0.5 残留 / schema 破损 → 不参与 recovery
-      liveTaskIds.add(id);
-      continue;
-    }
-
-    const meta = raw;
-    if (meta.repoStatus !== "merged" && meta.repoStatus !== "abandoned") {
-      liveTaskIds.add(id);
-    }
-    // V0.11.1：awaiting_user 不再标 error——这是新模型的正常静息态（agent 答完 / 交卷完
-    // run 已自然结束、没有「断掉的连接」可言）。会话内存虽丢、但 sessionAgentId 落盘了、
-    // 用户下一步操作（再聊聊 / 答弹窗 / 发消息 / 续用推进）会 Agent.resume 无缝接回。
-    // 只有 running（run 真在跑时进程死了）才是僵尸、标 error。
-    if (meta.runStatus !== "running") {
-      continue;
-    }
-
-    // 写 error 事件 + 标 runStatus=error
-    const event: TaskEvent = {
-      id: newEventId(),
-      ts: Date.now(),
-      kind: "error",
-      // task / chat 共用：文案单一来源 lib/stop-copy（D8-06，与停止确认框 / 停止后 info 同一说法）
-      text: BOOT_RECOVERY_TEXT,
-    };
-    try {
-      await appendEventLine(id, event);
-    } catch (err) {
-      console.warn(
-        `[task-fs] boot recovery: 追加 error 事件失败 id=${id}`,
-        err,
-      );
-      continue;
-    }
-
-    meta.runStatus = "error";
-    meta.updatedAt = event.ts;
-    // 当前 action 如果在跑、标 error
-    if (meta.currentActionId) {
-      const action = meta.actions.find((a) => a.id === meta.currentActionId);
-      if (action && (action.status === "running" || action.status === "awaiting_ack")) {
-        action.status = "error";
-        action.endedAt = event.ts;
-      }
-    }
-    try {
-      await writeMeta(meta);
-      recovered++;
-    } catch (err) {
-      console.warn(`[task-fs] boot recovery: 写 meta 失败 id=${id}`, err);
+      retry.failed.set(id, 0);
     }
   }
 
@@ -892,12 +1180,17 @@ const runBootRecovery = async (): Promise<void> => {
   // 2026-09-04 OOM 根治：SDK JSONL store 瘦身（只删孤儿 agent 行、活的不动）。
   // 扔后台跑、不挡启动（GC 流式实现，自己不爆堆）；失败内部吞掉。
   maybeGcSdkStore();
+
+  // 旧版明文 tool-outputs 的一次性脱敏迁移：同样扔后台、不挡启动
+  scheduleLegacyToolOutputMigration(ids);
 };
 
 const ensureBootRecovery = async (): Promise<void> => {
   const g = globalThis as unknown as Record<string, Promise<void> | undefined>;
   if (g[RECOVERY_FLAG]) {
     await g[RECOVERY_FLAG];
+    // 首轮有没做成的 id → 冷却期后在后台只重试它们（不挡本次调用）
+    scheduleBootRecoveryRetry();
     return;
   }
   // 测试进程摸到桌面包的数据目录：恢复动作（把 running 的聊天标 error / 清 worktree / 杀预览进程 /
@@ -1049,6 +1342,24 @@ export const commitReadableTaskListResponse = <T extends { id: string }>(
 ): NextResponse => NextResponse.json(wrap(filterCommittedReads(items)));
 
 /**
+ * 处理某个任务目录时出了意外（读 meta 的 I/O 失败 / hydrate 抛错…）→ 给列表补一条 `read_error` 的 corrupt 条目，
+ * 别让任务从侧栏静默消失、用户却不知道它还在磁盘上。
+ * reason 只含 errno / 异常类名：`err.message` 可能夹带 meta 文件内容片段（readMetaRaw 的解析失败消息会回显前 200 字符），
+ * 与 CorruptTaskInfo 「不回显文件内容」的约定一致。`read_error` 的展示文案本身就说「可能只是暂时读取失败」，不承诺自动恢复。
+ */
+const unreadableTaskInfo = (id: string, err: unknown): CorruptTaskInfo => {
+  const code = (err as NodeJS.ErrnoException | null | undefined)?.code;
+  const kind = typeof code === "string" && code ? code : err instanceof Error ? err.name : typeof err;
+  return {
+    id,
+    kind: "read_error",
+    reason: `处理该任务目录时出错（${kind}）`,
+    metaPath: path.join(taskDir(id), META_FILE),
+    backupValid: false,
+  };
+};
+
+/**
  * 列表 + 「损坏的任务」。
  *
  * 为什么另给 corrupt 数组、而不是把损坏任务塞进 tasks：tasks 会被所有权 / boot recovery /
@@ -1064,41 +1375,55 @@ export const listTasksWithCorrupt = async (): Promise<{
 }> => {
   await ensureBootRecovery();
   await ensureDataDir();
-  const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
-  const ids = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  // 只取合法 id 的目录（`abc copy` / `abc.bak` 这类手工目录不是任务，以前会在 taskDir() 白名单处抛错 → 整个列表 500）
+  const ids = await listTaskDirIds();
 
   const summaries: TaskSummary[] = [];
   const corrupt: CorruptTaskInfo[] = [];
   for (const id of ids) {
-    // 双保险：tombstone / committed journal 存在一律 skip
-    const gate = evaluateTaskVisibility(id);
-    if (gate.visibility !== "readable") {
-      // 以前这里直接 continue——meta 损坏的任务从侧栏静默消失、用户不知道它还在磁盘上
-      if (gate.metaUnknown) {
-        const info = inspectMetaCorruptionSync(id);
-        if (info) corrupt.push(info);
-      }
-      continue;
-    }
-    let raw: unknown | null;
+    // 每个 id 单独兜底：一个目录出意外（探针 / meta 形状畸形致 hydrate 抛错…）只让它自己从列表消失，
+    // 不能让 /api/tasks 整体 500、侧栏整个为空
     try {
-      raw = await readMetaRaw(id);
-    } catch (err) {
-      console.warn(`[task-fs] listTasks: 读 meta 失败 id=${id}`, err);
-      continue;
-    }
-    // 读 meta 后可挂起——矩阵在此注入 tombstone，验证 push 前复查生效
-    await failpoint("listTasks.afterReadMeta");
-    if (!raw) continue;
-    if (!isValidMetaShape(raw)) {
-      // V0.5 残留 / schema 破损 → 不显示
-      continue;
-    }
+      // 双保险：tombstone / committed journal 存在一律 skip
+      const gate = evaluateTaskVisibility(id);
+      if (gate.visibility !== "readable") {
+        // 以前这里直接 continue——meta 损坏的任务从侧栏静默消失、用户不知道它还在磁盘上
+        if (gate.metaUnknown) {
+          const info = inspectMetaCorruptionSync(id);
+          if (info) corrupt.push(info);
+        }
+        continue;
+      }
+      let raw: unknown | null;
+      try {
+        raw = await readMetaRaw(id);
+      } catch (err) {
+        console.warn(`[task-fs] listTasks: 读 meta 失败 id=${id}`, err);
+        // 不静默丢：进 corrupt（read_error），侧栏能提示「它还在、只是暂时读不出来」
+        corrupt.push(unreadableTaskInfo(id, err));
+        continue;
+      }
+      // 读 meta 后可挂起——矩阵在此注入 tombstone，验证 push 前复查生效
+      await failpoint("listTasks.afterReadMeta");
+      if (!raw) continue;
+      if (!isValidMetaShape(raw)) {
+        // V0.5 残留 / schema 破损 → 不显示
+        continue;
+      }
 
-    const summary = hydrateTaskSummary(raw);
-    // push 前同步复查——防「无 tombstone 入场 → 读 meta 挂起 → DELETE 200」回灌
-    if (!assertTaskReadable(id)) continue;
-    summaries.push(summary);
+      const summary = hydrateTaskSummary(raw);
+      // push 前同步复查——防「无 tombstone 入场 → 读 meta 挂起 → DELETE 200」回灌
+      if (!assertTaskReadable(id)) continue;
+      summaries.push(summary);
+    } catch (err) {
+      console.warn(`[task-fs] listTasks: 处理任务目录失败（跳过）id=${id}`, err);
+      // 只让这一个任务不进 tasks，但要在 corrupt 里留名字（以前这里静默丢，任务凭空消失）
+      try {
+        corrupt.push(unreadableTaskInfo(id, err));
+      } catch {
+        // taskDir 校验已在 listTaskDirIds 做过、这里理论上不会抛；兜底保证「一个 id 出意外不拖垮整张列表」
+      }
+    }
   }
   // 循环结束后最终过滤——A 已 push 后仍可能 await B/C，期间 A 被删须剔除
   return { tasks: filterCommittedReads(summaries), corrupt };
@@ -1440,7 +1765,8 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
   }
 
   // 只读 / 脚本仓快照：从 settings.repos 匹配（server 端读 config.json、不信 client 传）
-  const repoFlags = await snapshotRepoFlagPaths(trimmedRepoPaths);
+  // 读 config 出错会重试一次、仍失败则抛错（不带空快照建任务，否则只读标记永久丢失）
+  const repoFlags = await snapshotRepoFlagPathsForCreate(trimmedRepoPaths);
 
   const meta: TaskMetaV06 = {
     id: newTaskId(),
@@ -2082,10 +2408,35 @@ export interface UpdateTaskFieldsInput {
 export class TaskFieldUpdateError extends Error {
   constructor(
     message: string,
-    readonly httpStatus: 400 | 409,
+    readonly httpStatus: 400 | 409 | 503,
   ) {
     super(message);
     this.name = "TaskFieldUpdateError";
+  }
+}
+
+/**
+ * 读 config.json 失败（Windows 杀软占用 / 手改 JSON 没写完 / 权限），无法确认新仓是不是只读仓。
+ * 建任务（`action = "创建任务"`）与更新仓库（`"修改仓库"`）共用：路由层据此回 503 + 可读文案，
+ * 而不是泛化的 500 `create_failed` / 400 `bad_request`（前端 toast 直接显示 `error` 字符串）。
+ *
+ * 继承 {@link TaskFieldUpdateError} 是有意的：`PATCH /api/tasks/[id]` 已有的
+ * `instanceof TaskFieldUpdateError` 分支会把它按 `httpStatus` + `message` 映射出去，两条更新路径不用再改那个路由；
+ * `POST /api/tasks` 则按本类单独映射成 503 + `code: "settings_unreadable"`。
+ * 文案不含 config 内容 / 异常消息（只说「读不了」+ 怎么办），可原样展示给用户。
+ */
+export class SettingsUnreadableError extends TaskFieldUpdateError {
+  /** 稳定错误码（响应体 `code` 字段；前端 task-store 会透传成 ApiRequestError.code） */
+  readonly code = "settings_unreadable" as const;
+
+  constructor(action: "创建任务" | "修改仓库") {
+    super(
+      action === "创建任务"
+        ? "读取设置（config.json）失败，无法确认哪些仓库是只读仓；为避免只读标记丢失，已取消创建任务。请稍后重试，并检查 config.json 是否被其它程序占用或内容不完整"
+        : "读取设置（config.json）失败，无法确认新增的仓库是否为只读仓；为避免只读保护被绕过，已取消修改仓库。请稍后重试，并检查 config.json 是否被其它程序占用或内容不完整",
+      503,
+    );
+    this.name = "SettingsUnreadableError";
   }
 }
 
@@ -2216,6 +2567,8 @@ const applyRepoReplaceMeta = async (
   nextPaths: string[],
   oldPaths: string[],
   input: UpdateTaskFieldsInput,
+  /** 阶段 1 已确认过的快照（有新仓时必非 null）：阶段 2 重读失败时兜底，免得新仓标记在两段锁之间丢掉 */
+  flagsHint: RepoFlagPaths | null,
 ): Promise<string[]> => {
   const unboundRepoPaths: string[] = [];
   const newSet = new Set(nextPaths);
@@ -2246,9 +2599,12 @@ const applyRepoReplaceMeta = async (
   );
   meta.repoFeatureBranches = pruneRepoMap(meta.repoFeatureBranches, newSet);
   meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
-  const flags = await snapshotRepoFlagPaths(meta.repoPaths);
-  meta.readonlyRepoPaths = flags.readonly;
-  meta.scriptRepoPaths = flags.script;
+  // 阶段 2 现读一次（阶段 1 之后用户可能改过配置）；读不出来 → 先用阶段 1 的快照，
+  // 都没有（无新仓、config 坏了）→ null = 保留 meta 里原值、不覆盖（见 applyRepoFlagSnapshot）
+  applyRepoFlagSnapshot(
+    meta,
+    (await snapshotRepoFlagPaths(meta.repoPaths)) ?? flagsHint,
+  );
   // gitBranches 跟 featureBranches 解耦：解绑即使没改被测分支也要剪掉该仓记录
   if (meta.gitBranches) {
     meta.gitBranches = meta.gitBranches.filter((b) => newSet.has(b.repoPath));
@@ -2317,6 +2673,8 @@ export const updateTaskFields = async (
       oldPaths: string[];
       nextPaths: string[];
       taskLike: WorktreeTaskLike;
+      /** 新加仓的只读 / 脚本仓快照（无新仓为 null），阶段 2 重读失败时兜底 */
+      flagsHint: RepoFlagPaths | null;
     } | null = null;
 
     if (input.repoPaths !== undefined) {
@@ -2329,6 +2687,8 @@ export const updateTaskFields = async (
           oldPaths: [...meta.repoPaths],
           nextPaths,
           taskLike: snapshotWorktreeTaskLike(meta),
+          // 新仓的只读标记确认不了就在这里拒绝：早于阶段 1 落盘与锁外的 git 拆 / 挪，不留「worktree 已动、meta 没跟上」的半截状态
+          flagsHint: await requireRepoFlagsForAddedRepos(meta.repoPaths, nextPaths),
         };
       }
     }
@@ -2377,6 +2737,7 @@ export const updateTaskFields = async (
       phase1.nextPaths,
       phase1.oldPaths,
       input,
+      phase1.flagsHint,
     );
     applyQaFeatureBranches(meta, input);
     meta.updatedAt = Date.now();
@@ -2521,14 +2882,16 @@ export const setTaskRepoPaths = async (
   withTaskLock(id, async () => {
     const meta = await readMetaV06(id);
     if (!meta) return null;
-    meta.repoPaths = repoPaths
+    const nextPaths = repoPaths
       .map((p) => p.trim().replace(/\/+$/, ""))
       .filter((p) => p.length > 0);
+    // 有新加的仓而 config 读不出来 → 抛 SettingsUnreadableError（早于任何改动；meta 是局部对象、没落盘）
+    const addedFlags = await requireRepoFlagsForAddedRepos(meta.repoPaths, nextPaths);
+    meta.repoPaths = nextPaths;
     // chat 重选工作目录也要刷新快照（cwd / 路径映射契约同一份）
     meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
-    const flags = await snapshotRepoFlagPaths(meta.repoPaths);
-    meta.readonlyRepoPaths = flags.readonly;
-    meta.scriptRepoPaths = flags.script;
+    // 有新仓 → 用刚确认过的快照；无新仓 → 现读，读出错（null）保留 meta 里原值、不覆盖（见 applyRepoFlagSnapshot）
+    applyRepoFlagSnapshot(meta, addedFlags ?? (await snapshotRepoFlagPaths(meta.repoPaths)));
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);

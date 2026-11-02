@@ -351,13 +351,17 @@ describe("进入对话 / 任务一律落在最后一条、处于「跟随最新�
   });
 
   it("初始定位 latch：第一次有 items 就开跟随、并把 Virtuoso 的初始项定为最后一条（无条件、不看任何记忆）", () => {
+    // 评审 R8-3：闸头带 `!showQaPanel`——latch 只在「这一次渲染真的会挂上 Virtuoso」时消耗定位闸
+    // （QA tab 里的重渲不能把进入 QA 时刚开的闸白白消耗掉；行为见 tests/event-stream-remount-landing.test.ts）
     const latch = between(
       code,
-      "if (initialTopRef.current === null && items.length > 0) {",
+      "if (!initialPositionedRef.current && !showQaPanel && items.length > 0) {",
       "\n  }\n",
     );
     expect(latch).toContain("follow.setFollowing(true);");
-    expect(latch).toContain("initialTopRef.current = items.length - 1;");
+    // 评审 K1：进入时开启定位稳定期（贴底链按时间收口 + 漂移兜底）
+    expect(latch).toContain("follow.beginSettle();");
+    expect(latch).toContain("initialPositionedRef.current = true;");
     // 不再有任何分支会把它改成别的位置 / 非跟随态
     expect(latch).not.toContain("setFollowing(false)");
     // 闸本身就是 if 的头；头之后的函数体里不许再有分支
@@ -365,10 +369,33 @@ describe("进入对话 / 任务一律落在最后一条、处于「跟随最新�
     expect(latch).not.toContain("findIndex");
   });
 
-  it("Virtuoso 的初始项取这个 latch（无 latch 时也是最后一条）", () => {
-    expect(code).toContain(
-      "initialTopMostItemIndex={initialTopRef.current ?? items.length - 1}",
+  it("Virtuoso 不再传 initialTopMostItemIndex（评审 K1 根治）：它的 scrollToIndex 重试链没有取消接口、会把用户上滚拽回底部", () => {
+    // 无头 Chrome 实测：切回正在流式的 chat、列表出现后 ≤150ms 上滚，栈里能抓到 react-virtuoso 自己的 scrollTo 把位置拽回。
+    // 初始落底改由跟随控制器接手（attachScroller → 稳定期内贴底链，直接写 scrollTop、可取消）。
+    // 剥掉注释再断言：注释里解释「为什么不传」时会提到这些词，不能算数
+    const noComments = stripComments(eventStream);
+    expect(noComments).not.toContain("initialTopMostItemIndex");
+    expect(noComments).not.toContain("INITIAL_TOP_LOCATION");
+    // 旧的「存下标」写法已退役：不许再有 initialTopRef（它曾是死写入——值没人读、只当闸用）
+    expect(code).not.toContain("initialTopRef");
+  });
+
+  it("没有初始下标后，落底仍由渲染期 latch 保证：开跟随 + 开稳定期（控制器在容器挂上时据此启动首次贴底）", () => {
+    const attach = between(
+      followHook,
+      "const attachScroller = (",
+      "// 全部 passive",
     );
+    // 稳定期内挂上容器 → 稳定期重新计时 + 跟随中就起贴底链（不依赖 items 变化的 effect 先到）
+    expect(attach).toMatch(
+      /if \(isSettling\(\)\) \{[\s\S]*?settleUntil = now\(\) \+ MOUNT_SETTLE_MS;[\s\S]*?if \(following\) requestScrollToBottom\(\);[\s\S]*?\}/,
+    );
+    expect(code).toContain("follow.beginSettle();");
+  });
+
+  it("悬浮的「回到最新」按钮看几何兜底快照（following 之外还有 stranded）：跟随中却被带偏时用户也有出口（评审 K1）", () => {
+    expect(code).toContain("useIsAwayFromBottom(follow)");
+    expect(code).toContain("if (!away) return null;");
   });
 
   it("rangeChanged 只算 sticky 轮次头、不写任何记忆", () => {

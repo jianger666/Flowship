@@ -42,7 +42,6 @@ import {
   type ThemeInput,
 } from "streamdown";
 import { code as streamdownCode } from "@streamdown/code";
-import { mermaid as streamdownMermaid } from "@streamdown/mermaid";
 import { math as streamdownMath } from "@streamdown/math";
 import { cjk as streamdownCjk } from "@streamdown/cjk";
 import "katex/dist/katex.min.css";
@@ -51,7 +50,8 @@ import "streamdown/styles.css";
 // Streamdown 插件 / 主题（模块级一份、Shiki 高亮器有初始化开销）
 const ARTIFACT_STREAMDOWN_PLUGINS = {
   code: streamdownCode,
-  mermaid: streamdownMermaid,
+  // 带外部资源预扫闸的 mermaid（不能用上游单例：标签里的 <img> / url() 渲染即发请求，R7-1），与对话 / 修订视图共用同一份
+  mermaid: GATED_MERMAID,
   math: streamdownMath,
   cjk: streamdownCjk,
 };
@@ -69,6 +69,7 @@ const ARTIFACT_REMARK_PLUGINS = [
 
 import { MarkdownLink } from "@/components/markdown-link";
 import {
+  GATED_MERMAID,
   MARKDOWN_PROSE_DOCUMENT,
   STREAMDOWN_CONTROLS,
   STREAMDOWN_REHYPE_PLUGINS,

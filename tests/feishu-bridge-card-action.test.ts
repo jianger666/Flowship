@@ -1007,6 +1007,89 @@ describe("handleCardActionEvent", () => {
     expect(actionsJson).toContain("🔄 已重试");
   });
 
+  describe("retry 去重：同一张卡的重试只认第一次（连点 / 事件重投不重复发消息）", () => {
+    const retryClick = (messageId = "om_card") =>
+      handleCardActionEvent({
+        operator_id: OWNER,
+        message_id: messageId,
+        action_value: {
+          kind: "retry",
+          taskId: "task-1",
+          lastUserMessage: "上次的问题",
+        },
+      });
+
+    it("双击（两个 card.action 事件几乎同时到）：只重发一次，不是两条同样的用户消息", async () => {
+      // 旧实现：「已重试」patch 是 best-effort 且在 inject 之前才发出去——第二个事件到达时按钮多半还没被换掉，
+      // 每个事件都会各自 inject 一次，同一句话被重发两遍（chat-inject 还会把第二条排进队、再跑一轮）
+      await Promise.all([retryClick(), retryClick()]);
+
+      expect(handleChatReplyInject).toHaveBeenCalledTimes(1);
+    });
+
+    it("事件重投（先后到达、间隔很久也在窗内）：同一张卡仍只重发一次", async () => {
+      await retryClick();
+      await retryClick();
+      await retryClick();
+
+      expect(handleChatReplyInject).toHaveBeenCalledTimes(1);
+    });
+
+    it("不同卡片的重试互不影响：各发一次", async () => {
+      findTaskByMessageId.mockImplementation((async (id: string) => ({
+        messageId: id,
+        cardId: `card_${id}`,
+        taskId: "task-1",
+        createdAt: Date.now(),
+      })) as never);
+
+      await retryClick("om_card_a");
+      await retryClick("om_card_b");
+
+      expect(handleChatReplyInject).toHaveBeenCalledTimes(2);
+    });
+
+    it("第一次 inject 没成功（非 2xx）→ 释放认领：再点一次可以重试，不会被一个失败的尝试永久吞掉", async () => {
+      handleChatReplyInject
+        .mockResolvedValueOnce(new Response(JSON.stringify({ error: "上一轮还在跑" }), { status: 409 }))
+        .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+
+      await retryClick();
+      expect(handleChatReplyInject).toHaveBeenCalledTimes(1);
+      await retryClick();
+
+      expect(handleChatReplyInject).toHaveBeenCalledTimes(2);
+    });
+
+    it("第一次 inject 抛错 → 同样释放认领", async () => {
+      handleChatReplyInject
+        .mockRejectedValueOnce(new Error("inject boom"))
+        .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+
+      await retryClick();
+      await retryClick();
+
+      expect(handleChatReplyInject).toHaveBeenCalledTimes(2);
+    });
+
+    it("认领有时效（5 分钟）：过期后同一张卡还能再重试（按钮 patch 失败仍留着时的兜底），不会永久锁死", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(1_000_000);
+        await retryClick();
+        vi.setSystemTime(1_000_000 + 4 * 60_000);
+        await retryClick();
+        expect(handleChatReplyInject).toHaveBeenCalledTimes(1);
+
+        vi.setSystemTime(1_000_000 + 5 * 60_000 + 1);
+        await retryClick();
+        expect(handleChatReplyInject).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("依赖抛错不向外抛", async () => {
     getBotAppInfo.mockRejectedValue(new Error("boom"));
     await expect(

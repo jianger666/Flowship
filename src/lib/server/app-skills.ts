@@ -297,10 +297,18 @@ const deletionRootFor = async (
 };
 
 /**
- * 删除任意可管理源 skill（整目录删、含附属文件）；不存在也当成功（幂等）。
+ * 删除任意可管理源 skill（整目录删、含附属文件）。
  * 可管理源 = app 自管 / 飞书 CLI / 全局 ~/.agents/skills / 项目 <repo>/.agents/skills
  * （都是用户意向安装/加入的，允许真删；飞书 CLI 源重装 lark-cli 可能装回、接受）。
  * builtin / team 只读 → 返回用户可读原因。
+ *
+ * `name` 是 SKILL.md frontmatter 里的名字（设置页列表给的就是它），**不一定等于目录名**。以前直接 `rm(<根>/<name>)`：
+ * 名字与目录名不一致时目标目录根本不存在，`force: true` 让它「删除成功」、skill 原样还在；更糟的是恰好有个
+ * 别的 skill 的目录叫这个名字时，删掉的是那一个。现在按 frontmatter 名定位**真实目录**：
+ * - 扫根目录，找声明了这个名字的 SKILL.md；多个同名时优先目录名也等于它的那个，仍有歧义 → 明确失败、什么都不删；
+ * - 没有任何 SKILL.md 声明这个名字：`<根>/<name>` 目录还在（SKILL.md 缺 description / 损坏的残缺目录）→ 按旧行为清掉它；
+ *   连目录都没有 → 返回「未找到」（不再把「什么都没删」报成成功）；
+ * - 真实目录必须严格落在根目录之内（不删根本身）；目录里还装着别的 skill（分组目录）→ 拒绝整目录删除。
  */
 export const deleteSkillBySource = async (
   name: string,
@@ -314,9 +322,52 @@ export const deleteSkillBySource = async (
   if (!root) return "仓库未在设置里登记，拒绝删除项目级 skill";
   // 锚定校验：目标必须真落在根目录下（isSafeSkillName 已拦穿越字符、这里双保险）
   const resolvedRoot = path.resolve(root);
-  const target = path.resolve(resolvedRoot, name);
-  if (!target.startsWith(resolvedRoot + path.sep)) return "skill 路径非法";
+  const inside = (p: string): boolean => p.startsWith(resolvedRoot + path.sep);
+  const direct = path.resolve(resolvedRoot, name);
+  if (!inside(direct)) return "skill 路径非法";
+
+  const lstatOrNull = async (p: string) => fs.lstat(p).catch(() => null);
+
   try {
+    const entries = await scanSkillsDir(resolvedRoot);
+    const matches = entries.filter((e) => e.name === name);
+    let target: string | null = null;
+    if (matches.length === 0) {
+      if (!(await lstatOrNull(direct))) {
+        return `未找到 skill「${name}」（${resolvedRoot} 下没有目录名或 SKILL.md 名字是它的 skill），未删除任何东西。`;
+      }
+      target = direct; // 残缺目录（SKILL.md 缺 description / 损坏）：目录名 = 名字、旧行为照旧清掉
+    } else {
+      const candidates = matches.length > 1
+        ? matches.filter((m) => path.basename(path.dirname(m.absPath)) === name)
+        : matches;
+      if (candidates.length !== 1) {
+        return `有 ${matches.length} 个 skill 都叫「${name}」，无法确定删哪一个，未删除任何东西。请到目录里手动清理。`;
+      }
+      const dir = path.resolve(path.dirname(candidates[0]!.absPath));
+      if (inside(dir)) {
+        target = dir;
+      } else if (
+        // 目录级符号链接装法：扫描给的是链接解析后的真实路径；只删链接本身、不碰链接指向的真目录
+        (await lstatOrNull(direct))?.isSymbolicLink() &&
+        (await fs.realpath(direct).catch(() => "")) === dir
+      ) {
+        target = direct;
+      } else {
+        return `无法安全定位 skill「${name}」所在的目录，未删除任何东西。`;
+      }
+    }
+    // 分组目录：目标目录里还有别的 skill，整目录删会连带删掉它们
+    const targetReal = await fs.realpath(target).catch(() => target);
+    const others = entries.filter(
+      (e) =>
+        e.name !== name &&
+        (path.resolve(e.absPath).startsWith(targetReal + path.sep) ||
+          path.resolve(e.absPath).startsWith(target + path.sep)),
+    );
+    if (others.length > 0) {
+      return `「${path.relative(resolvedRoot, target)}」目录下还有其它 skill（${others.map((o) => o.name).join("、")}），拒绝整目录删除。`;
+    }
     await fs.rm(target, { recursive: true, force: true });
     return null;
   } catch (err) {

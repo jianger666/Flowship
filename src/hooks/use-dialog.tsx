@@ -55,6 +55,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { Input } from "@/components/ui/input";
+import { createCancelSlot } from "@/lib/cancel-slot";
 import { isImeComposing } from "@/lib/ime";
 
 // Confirm 配置
@@ -149,43 +150,34 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
   // confirm 的「确认」键 ref——弹窗打开时把初始焦点落在它上（回车即确认、由 defaultFocus 控制）
   const confirmActionRef = useRef<HTMLButtonElement>(null);
 
-  // 卸载时 resolve 残留的 promise 避免泄漏（很罕见但保险）
-  const stateRef = useRef(state);
-  stateRef.current = state;
-  useEffect(
-    () => () => {
-      const cur = stateRef.current;
-      if (cur.kind === "confirm") {
-        if (cur.withCheckbox) {
-          (cur.resolve as (v: ConfirmWithCheckboxResult | null) => void)(null);
-        } else {
-          (cur.resolve as (v: boolean) => void)(false);
-        }
-      }
-      if (cur.kind === "prompt") cur.resolve(null);
-    },
-    [],
-  );
+  // 单槽取消登记：新的 confirm / prompt 顶替旧的时，旧的 Promise 用取消语义 resolve
+  // （confirm → false / 带勾选 → null、prompt → null），否则调用方的 await 永远 pending；
+  // 卸载时同理兜底 resolve 残留的那一个
+  const [slot] = useState(createCancelSlot);
+  useEffect(() => () => slot.flush(), [slot]);
 
   const confirm = useCallback(((opts: ConfirmOptions) => {
     const withCheckbox = typeof opts.checkboxLabel === "string" && opts.checkboxLabel.length > 0;
     setConfirmChecked(false);
     if (withCheckbox) {
       return new Promise<ConfirmWithCheckboxResult | null>((resolve) => {
+        slot.take(() => resolve(null));
         setState({ kind: "confirm", opts, resolve, withCheckbox: true });
       });
     }
     return new Promise<boolean>((resolve) => {
+      slot.take(() => resolve(false));
       setState({ kind: "confirm", opts, resolve, withCheckbox: false });
     });
-  }) as DialogContextValue["confirm"], []);
+  }) as DialogContextValue["confirm"], [slot]);
 
   const prompt = useCallback((opts: PromptOptions) => {
     setPromptValue(opts.defaultValue ?? "");
     return new Promise<string | null>((resolve) => {
+      slot.take(() => resolve(null));
       setState({ kind: "prompt", opts, resolve });
     });
-  }, []);
+  }, [slot]);
 
   // 关 confirm：无 checkbox → boolean；有 checkbox → 取消 null / 确认 { ok, checked }
   const closeConfirm = (ok: boolean) => {
@@ -198,6 +190,7 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
     } else {
       (state.resolve as (v: boolean) => void)(ok);
     }
+    slot.release();
     setState({ kind: "none" });
   };
 
@@ -207,6 +200,7 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
     const final =
       result !== null && (state.opts.trim ?? true) ? result.trim() : result;
     state.resolve(final);
+    slot.release();
     setState({ kind: "none" });
   };
 

@@ -14,7 +14,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   CardStreamHandle,
@@ -534,17 +534,72 @@ describe("finalize / append 在熔断中仍强试一次", () => {
     });
   });
 
-  it("finalize 整卡 PUT 失败 → finalizeOk=false、lastError 是原错误、不抛、不再往下发 patch", async () => {
+  it("finalize 整卡 PUT 失败 → finalizeOk=false、lastError 是原错误、不抛、只 best-effort 关一次流式", async () => {
     const stream = await startStream();
     await warmUp(stream);
     const err = rateLimited();
     updateCardEntity.mockRejectedValue(err);
 
-    await expect(stream.finalize({ ok: true })).resolves.toBeUndefined();
+    // 契约变更（原：限流一次就判死、整卡 PUT 只发 1 次）：终稿是最后一发、没有下一帧来补，
+    // 限流 / 瞬时 / 超时现在会退避重发（默认 1s、3s 两次，共 3 发，每发新序号）——
+    // 否则一次限流就让卡片永远停在打字机中间态。重试用尽仍失败才 finalizeOk=false，
+    // 且失败仍只记一次账（getFailCount=1，不是 3）、lastError 还是原错误、不关流式 patch。
+    // 重试的细节（成功、新序号、哪些错误不重试）见 failure-kinds 测试的「终稿瞬时失败重试」。
+    // 重试用尽后会 best-effort 关一次 streaming_mode（别让卡在飞书侧一直「生成中」；失败吞掉，见 failure-kinds）。
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000 + 3_000);
+    await expect(fin).resolves.toBeUndefined();
 
+    expect(updateCardEntity).toHaveBeenCalledTimes(3);
     expect(stream.getHealth()).toMatchObject({ finalizeOk: false, lastError: err });
     expect(stream.getFailCount()).toBe(1);
-    expect(patchCardSettings).not.toHaveBeenCalled();
+    expect(patchCardSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("熔断已开时终稿遇 lark-cli 超时不再重试：只强试这一发（已知飞书不通，不再空等 2×(退避+15s)）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    await tripBreaker(stream);
+    expect(stream.getHealth().breakerOpen).toBe(true);
+    updateCardEntity.mockClear();
+    patchCardSettings.mockClear();
+    const timeout = new LarkApiError("lark-cli 超时（15000ms）", { api: "api PUT /cards/c" });
+    updateCardEntity.mockRejectedValue(timeout);
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(fin).resolves.toBeUndefined();
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(1); // 旧：3
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: false, lastError: timeout });
+    expect(patchCardSettings).not.toHaveBeenCalled(); // 熔断开着：关流式也不再多押一发
+  });
+
+  it("熔断没开时 lark-cli 超时照常重试（对照：只有「已知不通」才免重试）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    expect(stream.getHealth().breakerOpen).toBe(false);
+    updateCardEntity.mockRejectedValue(new LarkApiError("lark-cli 超时（15000ms）", { api: "api PUT /cards/c" }));
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(3);
+  });
+
+  it("熔断已开时终稿遇限流（服务端明确在回话）仍然重试", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    await tripBreaker(stream);
+    updateCardEntity.mockClear();
+    updateCardEntity.mockRejectedValue(rateLimited());
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(3);
   });
 
   it("终稿内容已落成、只是关 streaming_mode 失败 → finalizeOk 仍为 true（内容完整，不该报没同步）", async () => {
@@ -631,7 +686,10 @@ describe("finalize / append 在熔断中仍强试一次", () => {
     updateCardEntity.mockRejectedValue(rateLimited());
     updateCardElementContent.mockRejectedValue(rateLimited());
     await tripBreaker(stream2);
-    await stream2.finalize({ ok: true });
+    // 限流的终稿会退避重发（共 3 发），推进假时间让它跑完
+    const fin2 = stream2.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000 + 3_000);
+    await fin2;
     expect(pendingTimers()).toBe(0);
   });
 });
@@ -694,9 +752,10 @@ describe("风暴验收", () => {
     expect(stream.getHealth().breakerOpen).toBe(true);
 
     // finalize 在持续失败下照样能收尾：失败如实标记、不抛、不挂
-    await expect(
-      stream.finalize({ ok: false, error: "x" }),
-    ).resolves.toBeUndefined();
+    // （限流的终稿会退避重发 2 次，推进假时间让它跑完；总量断言在 finalize 之前，不受影响）
+    const fin = stream.finalize({ ok: false, error: "x" });
+    await vi.advanceTimersByTimeAsync(1_000 + 3_000);
+    await expect(fin).resolves.toBeUndefined();
     expect(stream.getHealth().finalizeOk).toBe(false);
   });
 });
@@ -1071,4 +1130,44 @@ describe("失败回滚：思考区（process）和正文（answer）的「已推
     ];
     expect(probe[2]).toBe(answer);
   });
+});
+
+// 终稿预算 / 熔断窗口用单调时钟：墙钟（Date.now）整段跳变（休眠唤醒 / 校时）不能影响它们。
+// vi.setSystemTime 只改伪造的墙钟、不动 performance.now()——正好模拟「墙钟跳了、单调时钟没动」。
+describe("单调时钟：墙钟跳变不影响终稿预算 / 熔断窗口", () => {
+  it("终稿整卡 PUT 第一发期间墙钟向前跳 1 小时：预算没耗尽，仍照常退避重试（旧 Date.now 逻辑下预算瞬间用尽 → 不重试 → finalizeOk=false）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity
+      .mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 3_600_000); // 这一发期间墙钟跳了 1 小时
+        throw rateLimited();
+      })
+      .mockResolvedValue(undefined);
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000 + 3_000);
+    await expect(fin).resolves.toBeUndefined();
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(2); // 第一发失败 + 一次重试
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
+  });
+
+  it("熔断打开后墙钟向后跳 1 小时：窗口仍按真实流逝的 2s 到期、半开探测照常放行并恢复（旧逻辑下窗口被拉长一小时，探测被挡）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    await tripBreaker(stream);
+    expect(stream.getHealth().breakerOpen).toBe(true);
+    updateCardElementContent.mockResolvedValue(undefined); // lark 恢复
+    vi.setSystemTime(Date.now() - 3_600_000); // 墙钟回拨 1 小时
+
+    await vi.advanceTimersByTimeAsync(2000); // 真实流逝 2s = 熔断窗口
+
+    expect(stream.getHealth()).toMatchObject({ breakerOpen: false, consecutiveFails: 0 });
+  });
+});
+
+// 整个文件跑完把临时数据目录整个删掉（beforeEach 只在下一个用例前清，最后一个用例的 data 目录会留在 tmpdir）
+afterAll(async () => {
+  await fs.rm(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });

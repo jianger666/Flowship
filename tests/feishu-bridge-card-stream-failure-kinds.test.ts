@@ -14,7 +14,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CardStreamHandle, CardStreamOptions } from "@/lib/server/feishu-bridge/types";
 
@@ -52,9 +52,10 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   getBotAppInfo,
 }));
 
-const { createCardStream, __setCardStreamTimersForTest } = await import(
+const { createCardStream, __setCardStreamTimersForTest, __setFinalBudgetForTest } = await import(
   "@/lib/server/feishu-bridge/card-stream"
 );
+const { getBridgeDataDir } = await import("@/lib/server/feishu-bridge/bridge-config");
 const { flushCardSeqToDisk, __resetCardSeqForTest } = await import(
   "@/lib/server/feishu-bridge/card-seq"
 );
@@ -185,6 +186,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   __setCardStreamTimersForTest(null);
+  __setFinalBudgetForTest(null);
   vi.useRealTimers();
   vi.restoreAllMocks();
   await flushCardSeqToDisk();
@@ -993,4 +995,343 @@ describe("交界：通知次数 / 收尾之后 / 重开排队 / 收紧的边界"
     expect(sendCardMessage).not.toHaveBeenCalled();
     expect(stream.getHealth().finalizeOk).toBe(false);
   });
+});
+
+describe("终稿瞬时失败重试（限流 / 5xx / lark-cli 超时：退避重发，用尽才 finalizeOk=false）", () => {
+  /** lark-cli 单次调用超时（normalizeLarkError killed 分支）：code 为空，classifyLarkFailure 认成 unknown，要按固定文案认 */
+  const cliTimeout = (): InstanceType<typeof LarkApiError> =>
+    new LarkApiError("lark-cli 超时（15000ms）", { api: "api PUT /open-apis/cardkit/v1/cards/c" });
+  const transientReset = (): InstanceType<typeof LarkApiError> =>
+    new LarkApiError("read ECONNRESET", { api: "api PUT /open-apis/cardkit/v1/cards/c" });
+
+  it("限流两次后成功：共 3 发、间隔 1s → 3s、每发用新的递增序号，成功后正常关流式、不计失败", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity.mockRejectedValueOnce(rateLimited()).mockRejectedValueOnce(rateLimited());
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(updateCardEntity).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(updateCardEntity).toHaveBeenCalledTimes(1); // 第一档退避 1s 还没到
+    await vi.advanceTimersByTimeAsync(1);
+    expect(updateCardEntity).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(updateCardEntity).toHaveBeenCalledTimes(2); // 第二档退避 3s 还没到
+    await vi.advanceTimersByTimeAsync(1);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(3);
+    const seqs = [0, 1, 2].map(entitySeq);
+    expect(seqs[1]!).toBeGreaterThan(seqs[0]!);
+    expect(seqs[2]!).toBeGreaterThan(seqs[1]!);
+    expect(patchCardSettings).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true, breakerOpen: false });
+    expect(stream.getFailCount()).toBe(0); // 重试内部的失败不记账：最终成功就是成功
+    expect(pendingTimers()).toBe(0);
+  });
+
+  it.each([
+    ["transient（ECONNRESET）", transientReset],
+    ["lark-cli 超时（code 为空的 unknown，按固定文案认）", cliTimeout],
+  ])("%s：重试一次成功 → finalizeOk=true", async (_label, mk) => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity.mockRejectedValueOnce(mk());
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(2);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
+    expect(patchCardSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("重试用尽（共 3 发）仍失败：finalizeOk=false、lastError 是最后一次的原错误、只记一次账、不关流式、不抛", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    const err = rateLimited();
+    updateCardEntity.mockRejectedValue(err);
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000 + 3_000);
+    await expect(fin).resolves.toBeUndefined();
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(3);
+    // 终稿没落成，但卡片还挂在 streaming_mode：用尽后 best-effort 关一次（见下面「重试用尽后 best-effort 关流式」）
+    expect(patchCardSettings).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: false, lastError: err });
+    expect(stream.getFailCount()).toBe(1);
+    expect(pendingTimers()).toBe(0);
+  });
+
+  it.each([
+    ["unknown（认不出的错误）", (): unknown => new Error("boom")],
+    ["gone（卡没了）", cardGone],
+    ["auth（没权限）", noScope],
+    ["stream_closed（流式被关）", streamClosed],
+  ])("%s：重发多少次结果都一样，不重试（只发 1 次）、也不等退避", async (_label, mk) => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity.mockRejectedValue(mk());
+
+    // 不推进假时间：若误进了退避，finalize 会一直挂着、这里就超时
+    await stream.finalize({ ok: true });
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth().finalizeOk).toBe(false);
+  });
+
+  it("与 too_long 收紧互不干扰：先超限收紧一档、再限流退避、第 3 发成功（收紧后的内容保持）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    grow(stream, 30_000); // flush 成功，内容 30700 字
+    await settle();
+    updateCardEntity.mockClear();
+    updateCardEntity.mockRejectedValueOnce(sizeLimit()).mockRejectedValueOnce(rateLimited());
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(3);
+    expect([0, 1, 2].map((i) => answerOf(entityJson(i)).length)).toEqual([30_700, 10_000, 10_000]);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true, truncated: true });
+  });
+
+  it("非流式：建卡这一发限流 → 退避后重发，卡只发一次", async () => {
+    const stream = await startStream({ streaming: false });
+    stream.pushAnswer("答案");
+    createCardEntity.mockClear();
+    createCardEntity.mockRejectedValueOnce(rateLimited());
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await fin;
+
+    expect(createCardEntity).toHaveBeenCalledTimes(2);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
+  });
+});
+
+describe("终稿总时间预算（≈40s）：重试不再把 finalize 拖到近 100s", () => {
+  /** 按调用方传的 timeoutMs 才失败的黑洞：模拟 lark-cli 吃满单次超时后报「lark-cli 超时（Nms）」 */
+  const blackholeUntilTimeout = async (...args: unknown[]): Promise<void> => {
+    const ms = (args[3] as { timeoutMs?: number } | undefined)?.timeoutMs ?? 30_000;
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
+    throw new LarkApiError(`lark-cli 超时（${ms}ms）`, { api: "api PUT /open-apis/cardkit/v1/cards/c" });
+  };
+  const timeoutOf = (n: number): number | undefined =>
+    (updateCardEntity.mock.calls[n] as unknown as [string, unknown, number, { timeoutMs?: number }])[3]?.timeoutMs;
+
+  it("每发都吃满 15s 超时：第 3 发的超时被压到剩余额度，整个终稿尝试在 40s 内收口（旧：15+1+15+3+15=49s）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity.mockImplementation(blackholeUntilTimeout);
+
+    const t0 = Date.now();
+    let doneAt = 0;
+    const fin = stream.finalize({ ok: true }).then(() => {
+      doneAt = Date.now();
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(3);
+    expect([0, 1, 2].map(timeoutOf)).toEqual([15_000, 15_000, 6_000]);
+    expect(doneAt - t0).toBeLessThanOrEqual(40_000);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: false });
+  });
+
+  it("预算只剩不足一发的最短超时：直接放弃，不再空等退避后试一发注定来不及的", async () => {
+    __setFinalBudgetForTest(16_500); // 第 1 发吃满 15s 后只剩 1.5s，退避 1s 后更不够一发（最短 3s）
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity.mockImplementation(blackholeUntilTimeout);
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: false });
+  });
+
+  it("预算内成功不受影响：限流两次后成功，各发仍拿满 15s 超时", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity.mockRejectedValueOnce(rateLimited()).mockRejectedValueOnce(rateLimited());
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(4_000);
+    await fin;
+
+    expect([0, 1, 2].map(timeoutOf)).toEqual([15_000, 15_000, 15_000]);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
+  });
+});
+
+describe("整卡 PUT 已成功后：思考区 batch 回写失败只 warn，不判「没同步」（否则会把已送达的正文再以文字补发一遍）", () => {
+  it("batch 限流失败 → finalizeOk 仍为 true、整卡 PUT 只发 1 次（旧：整段被 putFinal 重试 3 遍后判失败）、仍关流式", async () => {
+    const stream = await startStream();
+    stream.pushProcess("想".repeat(700));
+    await warmUp(stream);
+    batchUpdateCard.mockRejectedValue(rateLimited());
+
+    await stream.finalize({ ok: true });
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(1);
+    expect(batchUpdateCard).toHaveBeenCalledTimes(1);
+    expect(patchCardSettings).toHaveBeenCalledTimes(1); // 照样关 streaming_mode
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
+    expect(stream.getFailCount()).toBe(1); // 仍计入累计失败（可观测），但不是终稿失败
+    expect(pendingTimers()).toBe(0);
+  });
+
+  it("batch 遇到不可重试的错误（unknown）同样不拖垮终稿", async () => {
+    const stream = await startStream();
+    stream.pushProcess("想".repeat(700));
+    await warmUp(stream);
+    batchUpdateCard.mockRejectedValue(new Error("boom"));
+
+    await stream.finalize({ ok: true });
+
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
+    expect(updateCardEntity).toHaveBeenCalledTimes(1);
+  });
+
+  it("batch 失败时 PUT 本身的瞬时重试仍然有效（重试只包 PUT）：PUT 限流一次后成功，再 batch 一次", async () => {
+    const stream = await startStream();
+    stream.pushProcess("想".repeat(700));
+    await warmUp(stream);
+    updateCardEntity.mockRejectedValueOnce(rateLimited());
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await fin;
+
+    expect(updateCardEntity).toHaveBeenCalledTimes(2);
+    expect(batchUpdateCard).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
+  });
+});
+
+describe("终稿重试用尽后 best-effort 关一次 streaming_mode（别让卡片在飞书侧一直显示「生成中」到自动超时）", () => {
+  it("用尽后发一次 streaming_mode:false 的 settings patch；终稿失败仍如实记（finalizeOk=false、lastError 为 PUT 的原错误）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    const err = rateLimited();
+    updateCardEntity.mockRejectedValue(err);
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(4_000);
+    await fin;
+
+    expect(patchCardSettings).toHaveBeenCalledTimes(1);
+    const [cardId, settings] = patchCardSettings.mock.calls[0] as unknown as [string, { config: Record<string, unknown> }];
+    expect(cardId).toBe("card_kinds");
+    expect(settings.config).toMatchObject({ streaming_mode: false });
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: false, lastError: err });
+  });
+
+  it("关流式也失败：吞掉——不抛、不覆盖 lastError、不多记一次账、不多一个定时器", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    const err = rateLimited();
+    updateCardEntity.mockRejectedValue(err);
+    patchCardSettings.mockRejectedValue(new Error("close boom"));
+
+    const fin = stream.finalize({ ok: true });
+    await vi.advanceTimersByTimeAsync(4_000);
+    await expect(fin).resolves.toBeUndefined();
+
+    expect(patchCardSettings).toHaveBeenCalledTimes(1); // 只试一次
+    expect(stream.getHealth()).toMatchObject({ finalizeOk: false, lastError: err });
+    expect(stream.getFailCount()).toBe(1);
+    expect(pendingTimers()).toBe(0);
+  });
+
+  it.each([
+    ["gone（卡没了）", cardGone],
+    ["auth（没权限）", noScope],
+    ["stream_closed（流式已被飞书关掉）", streamClosed],
+  ])("%s：关也是白等 / 已经关了，不发", async (_label, mk) => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardEntity.mockRejectedValue(mk());
+
+    await stream.finalize({ ok: true });
+
+    expect(patchCardSettings).not.toHaveBeenCalled();
+    expect(stream.getHealth().finalizeOk).toBe(false);
+  });
+
+  it("终稿成功时关流式只发一次（不因本改动多发）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+
+    await stream.finalize({ ok: true });
+
+    expect(patchCardSettings).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth().finalizeOk).toBe(true);
+  });
+});
+
+describe("start()：卡已发出后，本地登记（card-map）失败不能把整卡回滚成「没卡」", () => {
+  it("rememberCardMessage 失败（card-map.json 被占成目录）→ 卡已建已发的事实保留：ids 在、started 生效、后续 push 照常流式、不判 startFailed", async () => {
+    // 让 card-map 的读改写必然失败：同名目录占住路径
+    await fs.mkdir(path.join(await getBridgeDataDir(), "card-map.json"), { recursive: true });
+    const stream = createCardStream("t_kinds_remember_fail", { title: "测" });
+
+    await stream.start();
+
+    // 旧实现：整段在一个 try 里，登记抛错 → started=false、ids 清空、记 startFailed——
+    // 用户飞书里明明已经有一张卡，后面却一帧都不再推，终稿还会判「没同步」再补发全文
+    expect(stream.getIds()).toEqual({ messageId: "om_test", cardId: "card_kinds" });
+
+    grow(stream);
+    await settle();
+    expect(updateCardElementContent).toHaveBeenCalled(); // 流式照常推
+
+    await stream.finalize({ ok: true });
+    expect(stream.getHealth().finalizeOk).toBe(true);
+    expect(updateCardEntity).toHaveBeenCalled();
+  });
+});
+
+describe("非流式：sendCardMessage 失败 / 超时时的「不确定送达」取舍（有意为之，钉住）", () => {
+  it("建卡成功但发卡超时 → finalizeOk=false（按没送达处理，outbound 会把正文以文字补发）；不重发卡（否则可能发出两张）", async () => {
+    // 取舍：lark-cli 超时分不清「消息没发出」和「发出了但回包丢了」。这里选「按失败处理」——
+    // 宁可偶尔重复一份正文（卡 + 文字版），也不让用户看不到结果。
+    // 对照流式终稿：整卡 PUT 已知成功就绝不补发（见上面 batch 失败的用例）——「已知落成」才免补发，「不确定」不免。
+    const stream = await startStream({ streaming: false });
+    stream.pushAnswer("答案");
+    sendCardMessage.mockRejectedValue(
+      new LarkApiError("lark-cli 超时（30000ms）", { api: "im +messages-send" }),
+    );
+
+    await stream.finalize({ ok: true });
+
+    expect(createCardEntity).toHaveBeenCalledTimes(1);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1); // 不重发
+    expect(stream.getHealth().finalizeOk).toBe(false);
+  });
+
+  it("建卡 + 发卡成功、只是本地登记 card-map 失败 → 仍算送达（finalizeOk=true）", async () => {
+    await fs.mkdir(path.join(await getBridgeDataDir(), "card-map.json"), { recursive: true });
+    const stream = await startStream({ streaming: false });
+    stream.pushAnswer("答案");
+
+    await stream.finalize({ ok: true });
+
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth().finalizeOk).toBe(true);
+  });
+});
+
+// 整个文件跑完把临时数据目录整个删掉（beforeEach 只在下一个用例前清，最后一个用例的 data 目录会留在 tmpdir）
+afterAll(async () => {
+  await fs.rm(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });

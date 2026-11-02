@@ -183,9 +183,15 @@ export const normalizeSettings = (
 ): FeAiFlowSettings => {
   if (!parsed || typeof parsed !== "object") return cloneDefaultSettings();
 
-  // 非对象项过滤掉（脏 config 里可能混进 string / null）
+  // 非对象项过滤掉（脏 config 里可能混进 string / null）；path 不是非空字符串的项同样过滤：
+  // 手改过的 config.json 里 `{name:"x"}` / `{path:123}` 会让侧栏按路径分组时 `.split` / `.startsWith` 抛 TypeError、
+  // 应用壳白屏（评审 2026-11-01）。这类项没有路径就没有任何可用语义，丢掉比让整页崩好；下次落盘从 config.json 抹掉
   const repos = (Array.isArray(parsed.repos) ? parsed.repos : [])
     .filter((r): r is NonNullable<typeof r> & object => !!r && typeof r === "object")
+    .filter((r) => {
+      const p = (r as { path?: unknown }).path;
+      return typeof p === "string" && p.trim() !== "";
+    })
     .map((r) => {
       // 只读 / 脚本仓开关：只认显式 true、其它（缺省 / 脏值）当关
       const row = { ...(r as FeAiFlowSettings["repos"][number]) };
@@ -443,6 +449,39 @@ export const initSettings = (): Promise<void> => {
 // CR-08：客户端写队列——连续快速保存串行落盘、后发请求不可能被先发的整对象覆盖
 let writeQueue: Promise<void> = Promise.resolve();
 
+/** 在途保存数（乐观写 cache 之后、服务端结果回来之前） */
+let inFlightSaves = 0;
+/**
+ * 有保存失败、但回滚不了（后发的乐观改动已经叠在它之上：`cache !== next`）——内存里留着一份磁盘上没有的值。
+ * 等在途保存全部结束后用磁盘真值对一次账（评审 2026-11-01：并发保存下失败回滚会让内存与磁盘分叉，重启后改动丢失）。
+ *
+ * 只有对账**真正落地**（磁盘真值已写进 cache）才复位：对账被后发保存作废 / GET 失败 / 磁盘无文件时标记保留，
+ * 下一次保存结束（在途清零）时再对一次——不复位就不会漏（R1-17：旧实现在发 GET 之前就复位，
+ * 作废 / 失败分支之后没人再重试，分叉永久留在内存里）。
+ */
+let needsResync = false;
+/** 每次保存起算 +1：对账的 GET 期间又有新保存就放弃这次对账（别用旧快照盖掉新的乐观值） */
+let saveSeq = 0;
+
+/**
+ * 用磁盘上的真实配置对账内存 cache（只在「失败回滚不了」的并发场景下调；best-effort、失败不挡）。
+ * 对账期间又有新的保存发起 / 仍有在途保存 → 放弃并保留 needsResync（下一次保存结束时会再对账）。
+ */
+const resyncCacheFromDisk = async (): Promise<void> => {
+  const seq = saveSeq;
+  try {
+    const res = await fetch(API_FULL);
+    if (!res.ok) return;
+    const data = (await res.json()) as { exists?: boolean; settings?: unknown };
+    if (!data.exists || !data.settings) return;
+    if (seq !== saveSeq || inFlightSaves > 0) return;
+    cache = normalizeSettings(data.settings as Partial<FeAiFlowSettings>);
+    needsResync = false;
+  } catch {
+    // 对账失败不挡、标记保留：下一次保存结束 / 重新加载会再对齐
+  }
+};
+
 /**
  * 最近一次被服务端拒绝的保存带回的原因（`error` 文案；没有就是 null）。
  * 设置页的 4xx toast 用它说明「为什么被拒」，而不是只给通用「请检查输入」（第四轮 Q2-03）。
@@ -491,6 +530,8 @@ export const saveSettingsDetailed = async (
   const prev = cache;
   cache = next;
   if (!isBrowser()) return { ok: false };
+  inFlightSaves += 1;
+  saveSeq += 1;
   // 权威写：挂到串行队列尾（保序）、await 服务端结果（失败不再被静默当成功）
   const attempt = writeQueue.then(() =>
     changedKeys && changedKeys.length > 0
@@ -509,11 +550,18 @@ export const saveSettingsDetailed = async (
   } catch (err) {
     console.error("[local-store] 写 config.json 失败", err);
     if (cache === next) cache = prev;
+    // 回滚不了：后发的保存已经把乐观值叠在这次失败的写入之上（cache !== next）——
+    // 内存里留着一份磁盘上没有的值，等在途保存都结束后用磁盘真值对账（见 resyncCacheFromDisk）
+    else needsResync = true;
     lastRejectReason =
       err instanceof SettingsPutError && !/^HTTP \d+$/.test(err.message)
         ? err.message
         : null;
     return { ok: false, status: err instanceof SettingsPutError ? err.status : undefined };
+  } finally {
+    inFlightSaves -= 1;
+    // 不在这里复位 needsResync：对账落地后才复位（见 resyncCacheFromDisk）
+    if (inFlightSaves === 0 && needsResync) void resyncCacheFromDisk();
   }
 };
 

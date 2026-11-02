@@ -32,6 +32,11 @@ import {
 } from "@/lib/custom-action-client";
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { guardCloseWhileBusy, withTimeout } from "@/lib/with-timeout";
+
+// 保存请求的等待上限：fetch 本身无超时，保存中又拦着 Esc / X（见 handleOpenChange），请求挂住时靠它放行。
+// 超时用 withTimeout 工厂形态：先 abort 掉 fetch 再报错；abort 只断本端连接，服务端仍可能已保存成功
+const SAVE_TIMEOUT_MS = 30_000;
 
 // 主 skill 下拉选项：正常 skill + 「已选但本机没有」的合成灰项（编辑旧定义时可能出现）
 type EditorSkillOption = SkillOption & { missing?: boolean };
@@ -152,9 +157,14 @@ export const CustomActionEditor = ({
         output: draft.output,
         placeholder: draft.placeholder,
       };
-      const saved = editing
-        ? await updateCustomActionReq(editing.id, payload)
-        : await createCustomActionReq(payload);
+      const saved = await withTimeout(
+        (signal) =>
+          editing
+            ? updateCustomActionReq(editing.id, payload, { signal })
+            : createCustomActionReq(payload, { signal }),
+        SAVE_TIMEOUT_MS,
+        "请求超时（30 秒无响应），草稿已保留、可重试；服务端可能已保存成功，请以列表为准",
+      );
       // 成功：弹窗关 + 列表刷新自表达，不 toast
       onSaved(saved);
       onOpenChange(false);
@@ -165,8 +175,13 @@ export const CustomActionEditor = ({
     }
   };
 
+  // 保存中拦住 Esc / X：请求在途时关弹窗，失败时草稿会被下次打开的重灌冲掉、结果也没人盯着。
+  // 不会造成关不掉：成功 / 失败 / 超时（withTimeout）都会 setSaving(false) 解锁
+  const handleOpenChange = (next: boolean) =>
+    guardCloseWhileBusy(saving, next, onOpenChange);
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange} disablePointerDismissal>
+    <Dialog open={open} onOpenChange={handleOpenChange} disablePointerDismissal>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>

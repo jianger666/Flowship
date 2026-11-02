@@ -7,7 +7,7 @@
  * 2. 设置页 / 任务面板可视（probeMcpHealthAll）：给每个 MCP 标连通状态、不再只有开关。
  *
  * 探测方式跟 mcp-oauth.probeOAuthRequired 一致——发一个 MCP initialize、看 HTTP 响应：
- * - 2xx                 → ok（正常）
+ * - 2xx / 3xx           → ok（正常 / 跳转也算活着，探测不跟随跳转）
  * - 401/403/其它/连不上 → fail（失败、原因落 detail、前端失败可点开看日志）
  * stdio（无 url）本地进程没法 HTTP 探测、乐观标 ok（保留注入、交给 SDK 起进程）。
  *
@@ -257,6 +257,17 @@ const classifyAttempt = (
   // 2xx：正常
   if (r.httpCode >= 200 && r.httpCode < 300) {
     return { name, status: "ok", httpCode: r.httpCode };
+  }
+  // 3xx：服务活着（http→https / 补尾斜杠 / 换路径的跳转都算）。探测用 redirect: "manual"、不跟随跳转——
+  // 请求头（含 OAuth token / API key）不会被带去别的域；以前落到下面的「服务异常」分支，健康的 server 会被悄悄剔掉。
+  // 真正连的时候由 SDK 的 transport 自己处理跳转。
+  if (r.httpCode >= 300 && r.httpCode < 400) {
+    return {
+      name,
+      status: "ok",
+      httpCode: r.httpCode,
+      detail: `HTTP ${r.httpCode} 跳转（探测未跟随跳转，视为服务存活）\nURL：${url}`,
+    };
   }
   // 401/403：需要授权（远程 OAuth MCP 没授权 / token 失效）
   if (r.httpCode === 401 || r.httpCode === 403) {

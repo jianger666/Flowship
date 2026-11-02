@@ -80,8 +80,15 @@ export const ensurePrivateDir = async (dir: string): Promise<void> => {
 };
 
 /**
+ * renameWithRetry 的退避间隔（ms）：第 N 次失败后等第 N 项再试，共 9 次尝试、累计约 2.95s。
+ * 以前是 5 次 × 50·(n+1) 总共只等约 750ms——杀软（Defender 实时扫描 / 全盘扫描）占着目标文件常常超过 1 秒，
+ * 穿透后 meta / 设置写失败。只对 EPERM / EACCES / EBUSY 重试（其它错误码立即抛），所以拉长只影响真被占用的场景。
+ */
+export const RENAME_RETRY_DELAYS_MS = [50, 100, 200, 300, 400, 500, 600, 800] as const;
+
+/**
  * Windows：目标文件被并发读 / 杀软扫描持有句柄时 rename 会 EPERM/EBUSY
- * （同事线上实测、mac/linux 无此语义）——短退避重试几轮；重试穿透才抛。
+ * （同事线上实测、mac/linux 无此语义）——短退避重试几轮（累计约 3s，见 RENAME_RETRY_DELAYS_MS）；重试穿透才抛。
  * writePrivateFileAtomic / writeMeta 共用，避免两处重试策略漂移。
  *
  * @param beforeAttempt 每次真正调用 fs.rename 前同步验；false → 抛
@@ -93,7 +100,7 @@ export const renameWithRetry = async (
   beforeAttempt?: () => boolean,
 ): Promise<void> => {
   let lastErr: unknown;
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt <= RENAME_RETRY_DELAYS_MS.length; attempt++) {
     // 循环内每次尝试前插桩 + lease——首轮 EPERM 退避期间换主仍拦得住
     await failpoint("rename.beforeAttempt");
     if (beforeAttempt && !beforeAttempt()) {
@@ -106,7 +113,9 @@ export const renameWithRetry = async (
       lastErr = err;
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw err;
-      await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
+      // 最后一次失败后不再白等：直接把原始错误抛出去
+      if (attempt >= RENAME_RETRY_DELAYS_MS.length) break;
+      await new Promise((r) => setTimeout(r, RENAME_RETRY_DELAYS_MS[attempt]));
     }
   }
   throw lastErr;

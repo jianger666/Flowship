@@ -12,24 +12,16 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
   type RefObject,
 } from "react";
 import {
   Streamdown,
-  defaultRemarkPlugins,
   type Components,
   type ThemeInput,
 } from "streamdown";
 import { code as streamdownCode } from "@streamdown/code";
-import { mermaid as streamdownMermaid } from "@streamdown/mermaid";
-import { math as streamdownMath } from "@streamdown/math";
-import { cjk as streamdownCjk } from "@streamdown/cjk";
 
-import {
-  STREAMDOWN_CONTROLS,
-  STREAMDOWN_REHYPE_PLUGINS,
-} from "@/components/markdown-text";
+import { GATED_MERMAID, STREAMDOWN_CONTROLS } from "@/components/markdown-text";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -39,29 +31,26 @@ import {
 } from "@/components/ui/dialog";
 import {
   buildRevisionView,
-  remarkSentinelToRevision,
   type BlockMark,
   type RevisionStats,
 } from "@/lib/md-revision";
-import { remarkAnnotateRevisionBlocks } from "@/lib/remark-annotate-revision-blocks";
-import { remarkCodeReference } from "@/lib/remark-code-reference";
-import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
-import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
+import { createRevisionRemarkPlugins } from "@/lib/revision-render-chain";
+import {
+  REVISION_REHYPE_PLUGINS,
+  RevisionDel,
+  RevisionIns,
+} from "@/lib/revision-rehype-plugins";
+import { REVISION_SYNTAX_PLUGINS } from "@/lib/revision-syntax-plugins";
 import { cn } from "@/lib/utils";
 
+// math / cjk 与 md-revision 的 parse 侧共用同一份常量（revision-syntax-plugins.ts），不各写各的
 const PLUGINS = {
   code: streamdownCode,
-  mermaid: streamdownMermaid,
-  math: streamdownMath,
-  cjk: streamdownCjk,
+  // 带外部资源预扫闸的 mermaid（不能用上游单例：标签里的 <img> / url() 渲染即发请求，R7-1），与对话 / 产物栏共用同一份
+  mermaid: GATED_MERMAID,
+  ...REVISION_SYNTAX_PLUGINS,
 };
 const SHIKI_THEME: [ThemeInput, ThemeInput] = ["github-light", "github-dark"];
-
-/** 新增：success 底衬；删除：destructive 底衬 + 删除线——两个 token 浅深两套都调过对比度 */
-const REVISION_INS_CLASS =
-  "rounded-[2px] bg-success/15 px-0.5 text-success no-underline";
-const REVISION_DEL_CLASS =
-  "rounded-[2px] bg-destructive/15 px-0.5 text-destructive line-through decoration-destructive/70";
 
 interface Props {
   oldMd: string;
@@ -97,53 +86,34 @@ export const ArtifactRevisionView = ({
 
   const { mergedMd, blockMarks } = revisionView;
 
+  // 插件表（含顺序约束）与测试共用 createRevisionRemarkPlugins；降级为无标记纯渲染时不再消费哨兵码位
+  const leakFallback = revisionView.stats.leakFallback === true;
   const remarkPlugins = useMemo(
-    () => [
-      ...Object.values(defaultRemarkPlugins),
-      remarkCodeReference,
-      remarkKeepTrailingUnderscore,
-      remarkTrimAutolinkCjk,
-      remarkSentinelToRevision,
-      remarkAnnotateRevisionBlocks(blockMarks),
-    ],
-    [blockMarks],
+    () => createRevisionRemarkPlugins(blockMarks, { sentinels: !leakFallback }),
+    [blockMarks, leakFallback],
   );
 
-  const components = useMemo((): Components => {
-    const Ins = ({
-      children,
-      ...rest
-    }: {
-      children?: ReactNode;
-      [key: string]: unknown;
-    }) => (
-      <ins data-revision-hit="ins" className={REVISION_INS_CLASS} {...rest}>
-        {children}
-      </ins>
-    );
-    const Del = ({
-      children,
-      ...rest
-    }: {
-      children?: ReactNode;
-      [key: string]: unknown;
-    }) => (
-      <del data-revision-hit="del" className={REVISION_DEL_CLASS} {...rest}>
-        {children}
-      </del>
-    );
-    return {
-      ...baseComponents,
-      ins: Ins,
-      del: Del,
-    } as unknown as Components;
-  }, [baseComponents]);
+  // ins / del 只对修订渲染链打了标记的元素套修订样式 + hit（正文原生的 ~~删除线~~ / <del> 不算改动，见 RevisionDel）
+  const components = useMemo(
+    (): Components =>
+      ({
+        ...baseComponents,
+        ins: RevisionIns,
+        del: RevisionDel,
+      }) as unknown as Components,
+    [baseComponents],
+  );
 
   return (
     <>
       {revisionView.stats.degraded && (
         <div className="mb-3 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
           文档过大、已简化为块级修订
+        </div>
+      )}
+      {revisionView.stats.leakFallback && (
+        <div className="mb-3 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
+          修订标记渲染异常，已显示无标记的最新版本
         </div>
       )}
       <div
@@ -155,6 +125,8 @@ export const ArtifactRevisionView = ({
           "[&_[data-revision-status=added]]:border-l-[3px] [&_[data-revision-status=added]]:border-success [&_[data-revision-status=added]]:bg-success/5",
           "[&_[data-revision-status=removed]]:border-l-[3px] [&_[data-revision-status=removed]]:border-destructive [&_[data-revision-status=removed]]:bg-destructive/5 [&_[data-revision-status=removed]]:opacity-80",
           "[&_[data-revision-status=modified]]:border-l-[3px] [&_[data-revision-status=modified]]:border-warning [&_[data-revision-status=modified]]:bg-warning/5",
+          // <hr> 是 0 高度元素：背景 / pl-3 都不可见，左边条只剩 3px 的角；改成直接给分隔线本身上色，否则新增 / 删除的分隔线看不出状态
+          "[&_hr[data-revision-status=added]]:border-success [&_hr[data-revision-status=removed]]:border-destructive [&_hr[data-revision-status=modified]]:border-warning",
           className,
         )}
       >
@@ -164,7 +136,8 @@ export const ArtifactRevisionView = ({
             shikiTheme={SHIKI_THEME}
             plugins={PLUGINS}
             remarkPlugins={remarkPlugins}
-            rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
+            // 共用表基础上多放行块级 data-revision-hit（否则被 sanitize 剥掉，「下一处改动」够不到整块增删 / 只改格式的块）
+            rehypePlugins={REVISION_REHYPE_PLUGINS}
             components={components}
             controls={STREAMDOWN_CONTROLS}
           >
@@ -274,6 +247,23 @@ const RevisionModifiedBadges = ({
       if (t2) clearTimeout(t2);
     };
   }, [measure, mergedMd, blockMarks]);
+
+  // 角标是绝对定位的：窗口 / 侧栏缩放、Shiki / 图片晚到导致块高度变化时，只测一次的坐标会错位——
+  // 盯住 root 的尺寸变化重测（rAF 合并，避免同帧多次 setState）
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root || typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(measure);
+    });
+    ro.observe(root);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [measure, rootRef]);
 
   if (badges.length === 0) return null;
   return (

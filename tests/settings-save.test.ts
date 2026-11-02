@@ -43,6 +43,10 @@ interface PendingCall {
   resolve: (res: Response) => void;
 }
 let pendingCalls: PendingCall[] = [];
+/** GET /api/settings/full 返回的「磁盘真值」（对账用；默认就是默认配置） */
+let diskSnapshot: unknown = DEFAULT_SETTINGS;
+/** 非 null 时 GET /full 不立刻返回、把放行函数推进来（让测试卡在「对账 GET 在飞」这一刻） */
+let heldGets: Array<() => void> | null = null;
 
 const okResponse = (): Response =>
   new Response(JSON.stringify({ ok: true, settings: {} }), {
@@ -63,15 +67,18 @@ beforeAll(async () => {
       // 单测里 GET /api/settings/full 自动放行成功，只把真正的 PUT 记进 pendingCalls
       const method = (init?.method ?? "GET").toUpperCase();
       if (String(url).includes("/api/settings/full") && method === "GET") {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({ exists: true, settings: DEFAULT_SETTINGS }),
-            {
-              status: 200,
-              headers: { "Content-Type": "application/json" },
-            },
-          ),
-        );
+        const body = JSON.stringify({ exists: true, settings: diskSnapshot });
+        const make = () =>
+          new Response(body, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        if (heldGets) {
+          return new Promise<Response>((resolve) => {
+            heldGets!.push(() => resolve(make()));
+          });
+        }
+        return Promise.resolve(make());
       }
       return new Promise<Response>((resolve) => {
         pendingCalls.push({
@@ -88,6 +95,8 @@ beforeAll(async () => {
 
 afterEach(() => {
   pendingCalls = [];
+  diskSnapshot = DEFAULT_SETTINGS;
+  heldGets = null;
 });
 
 describe("saveSettings（CR-08）", () => {
@@ -142,6 +151,91 @@ describe("saveSettings（CR-08）", () => {
     expect(getSettings().apiKey).toBe("已落盘");
   });
 
+  it("并发保存下先发的失败、后发的叠在它之上成功：内存不能留着磁盘上没有的值（评审 2026-11-01：失败回滚按引用判断、回滚不了就分叉）", async () => {
+    const base = getSettings();
+    // A：改 apiKey（会失败）；B：基于 A 的乐观 cache 改 gitToken（字段级 PATCH，只带 gitToken）
+    const a = saveSettings({ ...base, apiKey: "A-失败值" }, ["apiKey"]);
+    const b = saveSettings({ ...getSettings(), gitToken: "B-成功值" }, ["gitToken"]);
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    pendingCalls[0].resolve(errResponse());
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(2));
+    // 磁盘真值：A 没落盘、B 落了
+    diskSnapshot = { ...base, gitToken: "B-成功值" };
+    pendingCalls[1].resolve(okResponse());
+    await expect(a).resolves.toBe(false);
+    await expect(b).resolves.toBe(true);
+    // 乐观 cache 此刻还带着 A 的值；对账是异步的、等它把 cache 拉回磁盘真值
+    await vi.waitFor(() => expect(getSettings().apiKey).toBe(base.apiKey));
+    expect(getSettings().gitToken).toBe("B-成功值");
+  });
+
+  it("对账期间又发起了新保存：放弃这次对账、不拿旧快照盖掉新的乐观值", async () => {
+    const base = getSettings();
+    const a = saveSettings({ ...base, apiKey: "A-失败值" }, ["apiKey"]);
+    const b = saveSettings({ ...getSettings(), gitToken: "B" }, ["gitToken"]);
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    pendingCalls[0].resolve(errResponse());
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(2));
+    diskSnapshot = { ...base };
+    heldGets = []; // 对账 GET 先卡住
+    pendingCalls[1].resolve(okResponse());
+    await expect(a).resolves.toBe(false);
+    await expect(b).resolves.toBe(true);
+    await vi.waitFor(() => expect(heldGets!.length).toBe(1));
+    // 对账 GET 在飞时用户又改了一项：seq 变了 → 对账结果作废
+    const c = saveSettings({ ...getSettings(), gitToken: "C-新值" }, ["gitToken"]);
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(3));
+    heldGets[0]!(); // 放行旧快照（gitToken 还是 base 的）
+    await new Promise((r) => setTimeout(r, 20));
+    // 旧快照被作废：新的乐观值还在、A 的失败值也还没被对账掉（对账被放弃，标记保留）
+    expect(getSettings().gitToken).toBe("C-新值");
+    expect(getSettings().apiKey).toBe("A-失败值");
+    // C 落盘后在途清零 → 标记还在 → 再对账一次、这次落地（R1-17：旧实现标记已在发 GET 前复位，之后没人重试）
+    heldGets = null;
+    diskSnapshot = { ...base, gitToken: "C-新值" };
+    pendingCalls[2].resolve(okResponse());
+    await expect(c).resolves.toBe(true);
+    await vi.waitFor(() => expect(getSettings().apiKey).toBe(base.apiKey));
+    expect(getSettings().gitToken).toBe("C-新值");
+  });
+
+  it("对账 GET 失败：标记保留，下一次保存结束时再对账（不永久分叉）", async () => {
+    const base = getSettings();
+    const a = saveSettings({ ...base, apiKey: "A-失败值" }, ["apiKey"]);
+    const b = saveSettings({ ...getSettings(), gitToken: "B" }, ["gitToken"]);
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    pendingCalls[0].resolve(errResponse());
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(2));
+    // 第一次对账的 GET 返回 500
+    const realFetch = globalThis.fetch;
+    let getFailed = 0;
+    vi.stubGlobal("fetch", (url: string, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (String(url).includes("/api/settings/full") && method === "GET" && getFailed === 0) {
+        getFailed += 1;
+        return Promise.resolve(new Response("{}", { status: 500 }));
+      }
+      return realFetch(url, init);
+    });
+    try {
+      pendingCalls[1].resolve(okResponse());
+      await expect(a).resolves.toBe(false);
+      await expect(b).resolves.toBe(true);
+      await vi.waitFor(() => expect(getFailed).toBe(1));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(getSettings().apiKey).toBe("A-失败值"); // 对账失败、仍分叉
+      // 下一次保存结束 → 再对账（这次放行 GET）
+      diskSnapshot = { ...base, gitToken: "C" };
+      const c = saveSettings({ ...getSettings(), gitToken: "C" }, ["gitToken"]);
+      await vi.waitFor(() => expect(pendingCalls.length).toBe(3));
+      pendingCalls[2].resolve(okResponse());
+      await expect(c).resolves.toBe(true);
+      await vi.waitFor(() => expect(getSettings().apiKey).toBe(base.apiKey));
+    } finally {
+      vi.stubGlobal("fetch", realFetch);
+    }
+  });
+
   it("F6-03：运行中途某次 PUT 撞上 500 settings_unreadable → 仍只是普通保存失败（false + 回滚），不记粘性的「不可读」状态", async () => {
     // 有意的取舍：这可能是瞬时错误（Windows 杀软 / 同步盘短暂占住文件），粘性暂停会让设置页在文件恢复后
     // 还一直拒绝保存；「不可读」状态只在读取阶段（initSettings 的 GET /full）记录
@@ -190,6 +284,22 @@ describe("normalizeSettings 健壮性", () => {
     });
     expect(s.apiKey).toBe("");
     expect(s.repos).toEqual([{ name: "ok", path: "/ok" }]);
+  });
+
+  it("repos[].path 不是非空字符串的项过滤掉（手改 config.json 的脏项会让侧栏按路径分组抛 TypeError、壳白屏）", () => {
+    const s = normalizeSettings({
+      repos: [
+        { name: "ok", path: "/ok" },
+        { name: "无路径" } as never,
+        { name: "数字路径", path: 123 } as never,
+        { name: "空路径", path: "" },
+        { name: "空白路径", path: "   " },
+        { name: "null 路径", path: null } as never,
+        { name: "也ok", path: "D:\\\\work\\\\b", readonly: true },
+      ],
+    });
+    expect(s.repos.map((r) => r.path)).toEqual(["/ok", "D:\\\\work\\\\b"]);
+    expect(s.repos[1]?.readonly).toBe(true);
   });
 });
 

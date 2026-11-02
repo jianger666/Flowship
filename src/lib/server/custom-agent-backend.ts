@@ -82,7 +82,11 @@ import {
 import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
 import { listModelOptions } from "./model-catalog";
-import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
+import {
+  connectMcpServer,
+  dedupeBridgedToolNames,
+  type BridgedMcpServer,
+} from "./mcp-tool-bridge";
 import {
   buildCodingToolDefs,
   buildGitTokenFreeBashTool,
@@ -97,6 +101,26 @@ import {
 import { withModelBudget, type ModelBudgetSpill } from "./tool-output-budget";
 import { loadSkillsForTask } from "./skills-loader";
 import { injectSdkRgPath } from "./sdk-platform-bin";
+import { CANCEL_WAIT_GRACE_MS } from "./run-wait";
+
+/**
+ * `readOnly: true` 会话（需求群受限答疑，restricted-question.ts）的 pi 工具集：**只剩 read / grep / glob**。
+ *
+ * 比 pi-coding-tools 里的 `buildReadOnlyToolDefs` 再收一档：去掉 `merge_test_mr`——它虽然「只合 test 分支」，
+ * 但仍是服务端执行的写副作用（合 MR），不能交给群里非属主驱动。pi-coding-tools 那份集合保持原样（它自己有单测覆盖），
+ * 在这里过滤、不动 pi-coding-tools。`tests/restricted-readonly-wiring.test.ts` 钉住：create / resume 两条路径的
+ * customTools 与 `tools` 白名单里都没有 merge_test_mr / shell / write / edit / delete / task。
+ */
+const RESTRICTED_EXCLUDED_TOOLS: ReadonlySet<string> = new Set(["merge_test_mr"]);
+export const RESTRICTED_READONLY_TOOL_NAMES: readonly string[] =
+  READONLY_CUSTOM_TOOL_NAMES.filter((n) => !RESTRICTED_EXCLUDED_TOOLS.has(n));
+export const buildRestrictedReadOnlyToolDefs = (
+  cwd: string,
+  spill?: ModelBudgetSpill,
+) =>
+  buildReadOnlyToolDefs(cwd, spill).filter(
+    (d) => !RESTRICTED_EXCLUDED_TOOLS.has(String((d as { name?: unknown }).name)),
+  );
 
 const PROVIDER_ID = "flowship-custom";
 // pi 原生里名字跟规范面一致的内置工具（read/grep/edit/write）；
@@ -359,7 +383,11 @@ const bridgeUserMcpServers = async (
       }
     }),
   );
-  const bridges = entries.filter((b): b is BridgedMcpServer => b !== null);
+  // 跨 server 撞名去重：先注册（配置顺序）的保留原名，后到的改名 + warn；否则后注册的 server 会悄悄覆盖前一个的同名工具。
+  // entries 是 Promise.all 按 Object.entries(servers) 的顺序返回的，顺序 = 配置顺序、确定
+  const bridges = dedupeBridgedToolNames(
+    entries.filter((b): b is BridgedMcpServer => b !== null),
+  );
   const toolDefs: ToolDefinition[] = bridges.flatMap((b) =>
     b.tools.map(
       (t) =>
@@ -797,6 +825,17 @@ const buildCustomTools = (
 type RunWaitResult = { status: "finished" | "cancelled" | "error"; result?: string };
 
 /**
+ * `run.cancel()` 之后给 pi 的收尾宽限：超时仍没等到 agent_settled / agent_end，就由适配器自己按「已取消」收尾。
+ *
+ * 为什么必须在适配器里做：chat-runner / task-runner 的 cancelEscape 只罩着 `run.wait()`，而它排在
+ * `for await (run.stream())` **之后**——stream 一旦因为 pi 没有再吐终态事件（abort 没换来 agent_settled：
+ * 连着半开连接的 provider、abort 与收尾事件交错丢失）而永不结束，consume 根本走不到 wait，
+ * 逃生口也就永远不会触发，停止键救不回来、界面一直「运行中」。适配器收尾 = stream 自然结束 + wait 返回 cancelled。
+ * 只在**用户 / 系统取消之后**才起计时，没人取消永远不触发（正常长任务、长 shell 不受影响）。
+ */
+export const PI_CANCEL_SETTLE_GRACE_MS = CANCEL_WAIT_GRACE_MS;
+
+/**
  * pi 事件 → Flowship run 的翻译器（一次 send 一个）。
  * 导出只为事件级单测（tests/pi-run-adapter.test.ts 喂合成事件，不起 HTTP / 真会话）；业务代码走 createCustomAgent。
  */
@@ -804,6 +843,14 @@ export class PiRunAdapter {
   id: string;
   requestId: string;
   private buffer: SDKMessage[] = [];
+  /**
+   * stream() 在「没有新消息、也没结束」时挂在这里等唤醒（push / settle 触发）——取代原先 16ms 一拍的轮询：
+   * 轮询让每个在跑的 run 在空闲（等模型 / 等工具几分钟到几小时）时也不停地空转定时器。
+   * 检查缓冲与登记唤醒者在同一个同步段里完成，没有「检查完、登记前来了新消息」的丢唤醒窗口。
+   */
+  private wakers: Array<() => void> = [];
+  /** cancel() 之后的收尾宽限计时器（见 PI_CANCEL_SETTLE_GRACE_MS）；settle 时清掉 */
+  private cancelEscapeTimer: ReturnType<typeof setTimeout> | null = null;
   private toolArgs = new Map<string, { name: string; args: unknown }>();
   /**
    * 已推出 running、还没等到执行结果的工具调用 id。pi 对「以错误收尾的 assistant 消息」不会执行里面的工具，
@@ -848,6 +895,15 @@ export class PiRunAdapter {
   private push(msg: SDKMessage): void {
     if (this.ended) return;
     this.buffer.push(msg);
+    this.wake();
+  }
+
+  /** 唤醒挂在 stream() 里等新消息 / 结束的消费者（幂等、同步） */
+  private wake(): void {
+    if (this.wakers.length === 0) return;
+    const pending = this.wakers;
+    this.wakers = [];
+    for (const w of pending) w();
   }
 
   private fireDelta(update: InteractionUpdate): void {
@@ -869,7 +925,13 @@ export class PiRunAdapter {
   private settle(result: RunWaitResult): void {
     if (this.ended) return;
     this.ended = true;
+    if (this.cancelEscapeTimer) {
+      clearTimeout(this.cancelEscapeTimer);
+      this.cancelEscapeTimer = null;
+    }
     this.endResolve?.(result);
+    // 结束要叫醒还挂着的 stream()：它见 ended 会把缓冲吐完后返回
+    this.wake();
     // 收尾即退订（R14 Q11-03）。之前 unsub 只存不用：同一会话每多一轮，这个 run 的监听者就多留一个，
     // 收尾后下一轮的增量（bash 输出 / 文本 / 工具调用）还会灌进它的 onDelta / onStep。
     // 必须放到微任务里退、不能同步：settle 常在 pi 的事件派发里被调用，pi 的 _emit 是 for…of 遍历监听数组、
@@ -1119,6 +1181,19 @@ export class PiRunAdapter {
 
   cancel(): Promise<void> {
     this.cancelled = true;
+    // 逃生口：abort 发出去之后 pi 若迟迟不吐终态事件，宽限期满由适配器自己按 cancelled 收尾（见常量注释）
+    if (!this.ended && !this.cancelEscapeTimer) {
+      this.cancelEscapeTimer = setTimeout(() => {
+        this.cancelEscapeTimer = null;
+        if (this.ended) return;
+        console.warn(
+          `[custom-agent-backend] run=${this.id} cancel 后 ${PI_CANCEL_SETTLE_GRACE_MS / 1000}s 仍未收尾、按已取消强制结束`,
+        );
+        this.settle({ status: "cancelled" });
+      }, PI_CANCEL_SETTLE_GRACE_MS);
+      // 不阻止进程退出（Electron 内嵌 server 正常退出时不该被它拖住）
+      this.cancelEscapeTimer.unref?.();
+    }
     return Promise.resolve(this.session.abort()).catch(() => {});
   }
 
@@ -1130,9 +1205,11 @@ export class PiRunAdapter {
         continue;
       }
       if (this.ended) return;
-      // 等新消息或结束（低频轮询——cursor SDK 侧用真正的流、这里用微轮询兜底，
-      // 16ms 一 tick 对事件吞吐足够且实现简单可靠）
-      await new Promise((r) => setTimeout(r, 16));
+      // 等新消息或结束：事件驱动（push / settle 唤醒）。上面的检查与下面登记唤醒者之间没有 await，
+      // 不会丢唤醒。yield 期间到的消息下一圈由 `i < buffer.length` 接住
+      await new Promise<void>((resolve) => {
+        this.wakers.push(resolve);
+      });
     }
   }
 
@@ -1198,10 +1275,10 @@ export const createCustomAgent = async (
     // pi 的 `tools` 选项是「允许工具白名单」，必须把 customTools（含 MCP 桥接工具）
     // 的名字也列进去；否则只传 NATIVE_TOOLS 会把 flowShipTools / 编码工具 / MCP 工具
     // 全部过滤掉，模型只看到 read/edit/write/grep。
-    // 只读轮次：白名单 + customTools 双收敛（read/grep/glob/合test-MR，写类 / shell 不给）。
-    // 注：旁路 honor-system 后不再传 readOnly，此分支当前无人接线，留作收紧时直接用。
+    // 只读轮次：白名单 + customTools 双收敛（read/grep/glob，写类 / shell / 子代理 / MCP / merge_test_mr 不给）。
+    // 接线方：需求群受限答疑（restricted-question.ts 传 readOnly:true，经 agent-backend facade 下发）。
     const customTools = readOnly
-      ? buildReadOnlyToolDefs(
+      ? buildRestrictedReadOnlyToolDefs(
           cwd,
           input.taskId ? { taskId: input.taskId } : undefined,
         )
@@ -1220,7 +1297,7 @@ export const createCustomAgent = async (
       model,
       thinkingLevel,
       tools: readOnly
-        ? [...READONLY_CUSTOM_TOOL_NAMES]
+        ? [...RESTRICTED_READONLY_TOOL_NAMES]
         : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
       customTools,
       sessionManager: SessionManager.create(cwd, piSessionDir()),
@@ -1276,9 +1353,9 @@ export const resumeCustomAgent = async (
   // 桥接 MCP 之后抛错（createAgentSession 等）同样没有 adapter 来关 → 这里收（同 createCustomAgent）
   try {
     // 同 createCustomAgent：白名单必须包含全部 customTools，否则续会话同样丢掉 MCP/编码工具。
-    // 只读分支同上，当前无人接线（旁路 honor-system 不传 readOnly），留作收紧时直接用。
+    // 只读分支同上（与 createCustomAgent 同一套受限只读工具集）。
     const customTools = readOnly
-      ? buildReadOnlyToolDefs(
+      ? buildRestrictedReadOnlyToolDefs(
           cwd,
           input.taskId ? { taskId: input.taskId } : undefined,
         )
@@ -1297,7 +1374,7 @@ export const resumeCustomAgent = async (
       model,
       thinkingLevel,
       tools: readOnly
-        ? [...READONLY_CUSTOM_TOOL_NAMES]
+        ? [...RESTRICTED_READONLY_TOOL_NAMES]
         : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
       customTools,
       sessionManager,

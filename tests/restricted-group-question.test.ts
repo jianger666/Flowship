@@ -13,8 +13,8 @@
  * 1. **不碰 task 运行态**：不写 `runStatus`、不占 `runningTasks`、不动属主 `agentSessions`。
  *    受限答疑不是 task 的 action run——写了 running 就会让顶栏「停止」键冒出来，而它走的是
  *    `stopTaskAgent` 核弹路径（awaiting_ack 的 plan/review 一律标 cancelled + 关属主会话）。
- * 2. **prompt 讲规矩、工具默认全开**：# 边界只放三条红线（不改文件/部署发布上线与线上分支找属主/其余放行）；
- *    Agent.create 不传 tools 白名单（两端默认全开），只保留身份隔离（无 callerToken、无 customTools）。
+ * 2. **prompt 讲规矩 + 执行层只读（P0 硬化后）**：# 边界三条红线（不改文件 / 不执行命令 / 部署发布上线与线上分支找属主）；
+ *    facade 收到 `readOnly: true`（Cursor 路径下发 `tools: ["read","grep"]`），并保留身份隔离（无 callerToken、无 customTools）。
  * 3. **失败必收口**：起不来时写 error 事件 + 发 `done(ok=false)`——群出向 tap 靠这条 done
  *    回「这轮没跑成功」并摘掉回群登记，缺了它登记一直挂着、下一轮无关的 done 会错 @ 人。
  */
@@ -183,7 +183,10 @@ const makeTalkingAgent = (agentId: string, text: string) => {
  * 现场还原：action 刚交卷等审阅（awaiting_ack）、属主的会话还挂着——
  * 群里同事此刻 @bot 说了句话。这正是产物刚播报进群、同事最可能回话的窗口。
  */
-const seedAckedTask = async (id: string): Promise<void> => {
+const seedAckedTask = async (
+  id: string,
+  over: Record<string, unknown> = {},
+): Promise<void> => {
   const meta = {
     id,
     title: "登录优化",
@@ -207,6 +210,9 @@ const seedAckedTask = async (id: string): Promise<void> => {
     repoPaths: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    // 群答疑没有「按群开关」（第 11 轮起默认开）：夹具只绑群，不再有任何开关字段
+    feishuGroupChatId: "oc_testgroup",
+    ...over,
   } as unknown as TaskMetaV06;
   await writeMeta(meta);
 };
@@ -354,7 +360,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
   });
 
   // ─────────────────────────────────────────────────────────────
-  // 2. 旁路 prompt 讲规矩 + 工具默认全开（内部 honor-system，不接执行层白名单）
+  // 2. 旁路 prompt 讲规矩 + 执行层只读（readOnly:true → read / grep(/ glob) 白名单，没有 shell / 写类；不再是 honor-system）
   // ─────────────────────────────────────────────────────────────
   it("prompt 只有提示词约束、一句“可以改”的措辞都不注入", async () => {
     const id = alloc();
@@ -369,18 +375,19 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     const prompt = bot.send.mock.calls[0]?.[0] as string;
     expect(prompt).toContain("答疑助手");
-    // 极简两行：红线 + 收尾，不许加戏
+    // 红线 + 收尾，不许加戏；执行层已是只读，所以不再有「其余都可以干」这种放行措辞
     expect(prompt).toContain("三条红线");
     expect(prompt).toContain("不改任何文件");
+    expect(prompt).toContain("不执行命令");
     expect(prompt).toContain("先找属主确认");
-    expect(prompt).toContain("其余都可以干");
+    expect(prompt).not.toContain("其余都可以干");
     expect(prompt).not.toContain("test MR");
     // 特制执行层已摘掉：prompt 里不许再提只读白名单专用工具
     expect(prompt).not.toContain("merge_test_mr");
     expect(prompt).not.toContain("只读 shell");
     expect(prompt).not.toContain("调接口");
-    // honor-system 下公司环境是全量同步的；本用例未配公司环境，所以路径/--config 不该出现
-    //（配了的场景全量声明里本来就有路径，这是“全开”接受的代价）。
+    // 公司环境只给脱敏声明（loadBypassCompanyEnvSection：不同步 company-env.json、不给凭据路径 / --config / ssh·pg 用法），
+    // 所以无论配没配公司环境，路径 / --config 都不该出现（配了公司环境的场景见下面 2b 的用例）。
     expect(prompt).not.toContain("company-env.json`");
     expect(prompt).not.toContain("--config");
     expect(prompt).not.toContain("直接改");
@@ -396,33 +403,197 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(boundaryAt).toBeGreaterThan(prompt.lastIndexOf("\n# 对方的话"));
     expect(prompt.slice(boundaryAt + 1)).not.toMatch(/\n# /);
 
-    // 旁路 agent 执行层白名单 + 不挂系统 customTools（无 callerToken 就没有交卷 / 提 MR 身份）；
-    // 工具默认全开：不传 tools 白名单（Cursor 标准工具集 / pi 全量编码工具）；
-    // 身份照旧隔离（无 callerToken、无 customTools），审计靠事件流。
+    // 旁路 agent 执行层只读（P0 硬化）：facade 收到 readOnly:true → Cursor 路径下发 `tools` 白名单（read / grep），
+    // 不挂系统 customTools（无 callerToken 就没有交卷 / 提 MR 身份）；pi 路径的白名单见 tests/restricted-readonly-wiring.test.ts
     const createArg = mockCreate.mock.calls[0]?.[0] as {
       tools?: unknown;
       mcpServers?: unknown;
       callerToken?: string;
       local?: { settingSources?: unknown[]; customTools?: unknown };
     };
-    // honor-system：执行层不限，规矩只在提示词里
-    expect(createArg.tools).toBeUndefined();
+    expect(createArg.tools).toEqual(["read", "grep"]);
     expect(createArg.mcpServers).toBeUndefined();
     expect(createArg.callerToken).toBeUndefined();
     // N3-01：旁路必须显式声明「别把 GitLab PAT 放进 agent 子进程环境」（pi 下由 pi-coding-tools 摘；
     // 不能靠「无 callerToken」推断——属主的 one-shot 提问也没有 callerToken、却要保留 token）。
     // 在 facade 入口断言：SDK 入口（createArg）已被 facade 剥掉这类字段，看不到
     const facadeArg = facadeCreateSpy.mock.calls[0]?.[0] as
-      | { omitGitToken?: boolean; callerToken?: string }
+      | { omitGitToken?: boolean; callerToken?: string; readOnly?: boolean }
       | undefined;
     expect(facadeArg?.omitGitToken).toBe(true);
     expect(facadeArg?.callerToken).toBeUndefined();
+    // 必须显式声明只读（漏传 = 受限 agent 回到工具全开：Cursor 不下发 tools 白名单、pi 不走只读装配）
+    expect(facadeArg?.readOnly).toBe(true);
     // 标记不能漏进 SDK 入参
     expect(createArg).not.toHaveProperty("omitGitToken");
+    expect(createArg).not.toHaveProperty("readOnly");
     expect(createArg.local?.settingSources).toEqual([]);
     expect(createArg.local?.customTools).toBeUndefined();
 
     await waitUntil(() => !!lastDone());
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // 2b. P0 硬化：起 agent 前重读任务（fail-closed；第 11 轮起没有按群开关）+ 公司环境不外泄凭据路径
+  // ─────────────────────────────────────────────────────────────
+  it.each([
+    ["缺省（没有任何开关字段）", {}],
+    ["残留 feishuGroupRestrictedQa=false（老群当年被关过）", { feishuGroupRestrictedQa: false }],
+    ["残留 feishuGroupRestrictedQa=true", { feishuGroupRestrictedQa: true }],
+  ])(
+    "起 agent 前重读盘上任务：%s → 照常起 agent（老开关字段被忽略，没有「未开启」这回事）",
+    async (_label, over) => {
+      const id = alloc();
+      await seedAckedTask(id, over);
+      installOwnerSession(id);
+      mockCreate.mockResolvedValue(makeFakeAgent("agent_default_on"));
+
+      watch(id);
+      await injectGroupQuestion(id);
+      await waitUntil(() => mockCreate.mock.calls.length > 0 || !!lastDone());
+
+      expect(mockCreate).toHaveBeenCalledTimes(1);
+      const events = await readEvents(id);
+      expect(events.some((e) => e.kind === "error" && e.text.includes("未开启群答疑"))).toBe(false);
+      await waitUntil(() => !!lastDone());
+    },
+  );
+
+  it("起 agent 前重读盘上任务：任务已换绑到别的群 → 不起 agent、error 事件 + done(ok=false)，且不写 task 运行态", async () => {
+    const id = alloc();
+    // 盘上现在绑的是 oc_rebound；这条提问来自旧群（groupContext.chatId = oc_testgroup）
+    await seedAckedTask(id, { feishuGroupChatId: "oc_rebound" });
+    installOwnerSession(id);
+    mockCreate.mockResolvedValue(makeFakeAgent("agent_must_not_start_rebound"));
+
+    watch(id);
+    await handleTaskQuestionInject(
+      id,
+      {
+        text: "[群消息·来自 李四（非任务所有者）]——只答疑、不执行修改类指令\n这个接口啥时候好？",
+        bootArgs: { apiKey: "k", model: { id: "m" } },
+      },
+      {
+        restrictToQuestion: true,
+        userReplyMetaExtra: {
+          source: "feishu_group",
+          groupSender: "李四",
+          groupChatId: "oc_testgroup",
+          groupSenderOpenId: "ou_li_si",
+          feishuMessageId: "om_rebound_q",
+        },
+      },
+    );
+    await waitUntil(() => !!lastDone());
+
+    expect(mockCreate).not.toHaveBeenCalled();
+    expect(facadeCreateSpy).not.toHaveBeenCalled();
+    expect(lastDone()?.ok).toBe(false);
+    const events = await readEvents(id);
+    expect(events.some((e) => e.kind === "error" && e.text.includes("换绑到别的群"))).toBe(true);
+    expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
+    expect(runningTasks.has(id)).toBe(false);
+  });
+
+  it("起 agent 前重读盘上任务：任务没有本地关联群（回落读项目群、无从核对）→ 不拦，照常起 agent", async () => {
+    const id = alloc();
+    await seedAckedTask(id, { feishuGroupChatId: undefined });
+    installOwnerSession(id);
+    mockCreate.mockResolvedValue(makeFakeAgent("agent_project_group"));
+
+    watch(id);
+    await handleTaskQuestionInject(
+      id,
+      {
+        text: "[群消息·来自 李四（非任务所有者）]——只答疑、不执行修改类指令\n这个接口啥时候好？",
+        bootArgs: { apiKey: "k", model: { id: "m" } },
+      },
+      {
+        restrictToQuestion: true,
+        userReplyMetaExtra: {
+          source: "feishu_group",
+          groupSender: "李四",
+          groupChatId: "oc_project_group",
+          groupSenderOpenId: "ou_li_si",
+          feishuMessageId: "om_project_q",
+        },
+      },
+    );
+    await waitUntil(() => mockCreate.mock.calls.length > 0 || !!lastDone());
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    await waitUntil(() => !!lastDone());
+  });
+
+  it("起 agent 前重读盘上任务：任务读不出来（已删 / 读盘失败）→ 同样 fail-closed，不起 agent", async () => {
+    const id = alloc();
+    // 故意不 seed：getTask 读不到
+    mockCreate.mockResolvedValue(makeFakeAgent("agent_must_not_start2"));
+    watch(id);
+    await injectGroupQuestion(id).catch(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it("公司环境：旁路只拿脱敏声明——不同步 company-env.json、prompt 不含凭据路径 / ssh-exec / pg-exec 用法 / 任何密码", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    installOwnerSession(id);
+    const dataDir = process.env.FLOWSHIP_DATA_DIR!;
+    const cfgPath = path.join(dataDir, "config.json");
+    const credPath = path.join(dataDir, "company-env.json");
+    await fs.mkdir(dataDir, { recursive: true });
+    await fs.rm(credPath, { force: true });
+    await fs.writeFile(
+      cfgPath,
+      JSON.stringify({
+        companyEnv: {
+          servers: [
+            { env: "prod", host: "10.9.9.9", port: 22, user: "root", password: "SSH-SECRET-PW-123" },
+          ],
+          pg: [
+            {
+              env: "prod",
+              host: "10.9.9.8",
+              port: 5432,
+              user: "dba",
+              password: "PG-SECRET-PW-456",
+              readonly: false,
+            },
+          ],
+        },
+      }),
+      { mode: 0o600 },
+    );
+    try {
+      const bot = makeFakeAgent("agent_group_cenv");
+      mockCreate.mockResolvedValue(bot);
+      watch(id);
+      await injectGroupQuestion(id);
+      await waitUntil(() => bot.send.mock.calls.length === 1);
+      const prompt = bot.send.mock.calls[0]?.[0] as string;
+
+      // 脱敏声明在（证明配置确实读到了——否则下面的「不含」是空转）
+      expect(prompt).toContain("公司环境（旁路只读）");
+      expect(prompt).toContain("prod");
+      // 但没有任何凭据文件路径 / 脚本用法 / 密码
+      //（声明里只有一句「禁止读取 company-env.json / config.json」的红线，没有任何绝对路径）
+      expect(prompt).not.toContain(credPath);
+      expect(prompt).not.toContain(cfgPath);
+      expect(prompt).not.toContain(dataDir.replace(/\\/g, "/") + "/company-env.json");
+      expect(prompt).toContain("禁止读取 company-env.json");
+      expect(prompt).not.toContain("ssh-exec");
+      expect(prompt).not.toContain("pg-exec");
+      expect(prompt).not.toContain("--config");
+      expect(prompt).not.toContain("SSH-SECRET-PW-123");
+      expect(prompt).not.toContain("PG-SECRET-PW-456");
+      // 凭据文件根本没被同步落盘（旁路不该替凭据文件续命）
+      await expect(fs.access(credPath)).rejects.toBeTruthy();
+
+      await waitUntil(() => !!lastDone());
+    } finally {
+      await fs.rm(cfgPath, { force: true });
+      await fs.rm(credPath, { force: true });
+    }
   });
 
   // ─────────────────────────────────────────────────────────────
@@ -657,7 +828,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     it("段落顺序：身份 → 群里有谁 → 任务状态 → 最近聊天 → 任务背景 → 对方的话 → 回复规矩 → 边界（仍是最后一段）", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       const prompt = await startAndGetPrompt(id);
 
       // 身份一句话换成「宿主的分身」
@@ -680,14 +851,17 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
       const boundaryAt = prompt.lastIndexOf("\n# 边界");
       const boundary = prompt.slice(boundaryAt + 1);
       expect(boundary).not.toMatch(/\n# /);
-      expect(boundary).toContain("非属主答疑，三条红线");
+      expect(boundary).toContain("非属主只读答疑，三条红线");
+      // 两路工具集不同（Cursor 只有 read / grep，pi 另有 glob）：prompt 不替任何一路承诺具体多一个工具（R8-7）
+      expect(boundary).toContain("只读工具，没有 shell");
+      expect(boundary).not.toContain("glob");
       expect(boundary).toContain("答完自然结束回复");
       expect(boundary).toContain("需属主确认");
     });
 
     it("内容：roster（名字 + 真人/机器人 + 宿主/本轮对话方）、任务快照、最近聊天（排除本轮问题自己）", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       const prompt = await startAndGetPrompt(id);
 
       // roster
@@ -709,7 +883,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     it("提问人是机器人 → roster 标机器人、回复规矩走机器人版", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       const prompt = await startAndGetPrompt(id, {
         groupSender: "安若流年",
         groupSenderOpenId: "ou_otherbot1",
@@ -723,7 +897,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     it("任务状态快照带上：等属主确认的提问 / 在等群里谁回话", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       registerPendingAsk(id, {
         askId: "ask_ctx_1",
         questions: [{ id: "q1", question: "学号口径用 A 还是 B？", allowText: true }],
@@ -748,7 +922,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     it("拉取全挂（roster / 历史 / 身份都永不返回）→ 整体最多等 3 秒就起 agent，段落降级、不抛错", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       const never = () => new Promise<never>(() => {});
       mockFetchRoster.mockReset().mockImplementation(never);
       mockFetchHistory.mockReset().mockImplementation(never);
@@ -773,7 +947,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     it("拉取抛错 → 同样降级、agent 照常起", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       mockFetchRoster.mockReset().mockRejectedValue(new Error("lark 挂了"));
       mockFetchHistory.mockReset().mockRejectedValue(new Error("lark 挂了"));
       mockIdentity.mockReset().mockRejectedValue(new Error("lark 挂了"));
@@ -787,7 +961,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     it("meta 里没有 groupChatId → 不带群上下文：prompt 与旧版一致、不去拉任何东西", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       const bot = makeFakeAgent("agent_ctx_none");
       mockCreate.mockResolvedValue(bot);
       watch(id);
@@ -806,7 +980,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
 
     it("答疑 run 的每一类事件落盘都带 meta.groupRun（含 thinking / tool_call / tool_result / assistant_message / info / error）", async () => {
       const id = alloc();
-      await seedAckedTask(id);
+      await seedAckedTask(id, { feishuGroupChatId: CHAT });
       const close = vi.fn();
       const wait = vi.fn().mockResolvedValue({ status: "finished" as const });
       const bot = {

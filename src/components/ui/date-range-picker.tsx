@@ -20,6 +20,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { resolveRangeClick } from "@/lib/date-range-click";
 import { cn } from "@/lib/utils";
 
 export interface DayRange {
@@ -68,12 +69,16 @@ export const DateRangePicker = ({ value, onChange, className }: Props) => {
   const [open, setOpen] = useState(false);
   // 日历上的半选状态（选了 from 还没选 to）
   const [draft, setDraft] = useState<DateRange | undefined>(undefined);
+  // 第一下点击的日期（0 点 ms）；null = 还没点过。区间的提交只由「第二下点击 / 快捷项」触发，
+  // 不用库的 onSelect（它把已生效的完整区间当 selected，第一下点击就产出完整区间并提交，见 date-range-click.ts）
+  const [anchor, setAnchor] = useState<number | null>(null);
 
   const presets = buildPresets();
 
   const commit = (from: number, to: number) => {
     onChange({ from, to });
     setDraft(undefined);
+    setAnchor(null);
     setOpen(false);
   };
 
@@ -82,7 +87,10 @@ export const DateRangePicker = ({ value, onChange, className }: Props) => {
       open={open}
       onOpenChange={(o) => {
         setOpen(o);
-        if (!o) setDraft(undefined);
+        if (!o) {
+          setDraft(undefined);
+          setAnchor(null);
+        }
       }}
     >
       <PopoverTrigger
@@ -107,11 +115,14 @@ export const DateRangePicker = ({ value, onChange, className }: Props) => {
               draft ?? { from: new Date(value.from), to: new Date(value.to) }
             }
             defaultMonth={new Date(value.from)}
-            onSelect={(range) => {
-              setDraft(range);
-              if (range?.from && range.to && range.from.getTime() !== range.to.getTime()) {
-                commit(day0(range.from), day0(range.to));
+            onDayClick={(day) => {
+              const r = resolveRangeClick(anchor, day0(day));
+              if (r.kind === "anchor") {
+                setAnchor(r.anchor);
+                setDraft({ from: new Date(r.anchor), to: undefined });
+                return;
               }
+              commit(r.from, r.to);
             }}
           />
           <div className="flex flex-wrap gap-1.5 border-t pt-2">

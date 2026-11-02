@@ -36,6 +36,7 @@ import {
 import { parseFileQuery } from "@/lib/changes/file-filter";
 import { ancestorDirIds, buildFileTree } from "@/lib/changes/file-tree";
 import { resolveChangesHotkey, type ChangesHotkey } from "@/lib/changes/hotkeys";
+import { atLeastPrefix, describeChangesTotals } from "@/lib/changes/panel-state";
 import type { DiffPrefs } from "@/lib/changes/prefs";
 import { changesQueryKey, type ChangesQuery } from "@/lib/changes/scope";
 import {
@@ -310,6 +311,7 @@ export const ChangesSheet = ({
 
   // ---------- 渲染 ----------
   const { totals } = data;
+  const { filesAtLeast, linesAtLeast } = describeChangesTotals(repos);
   const singleBranch = repos.length === 1 ? repos[0]?.branch : null;
 
   return (
@@ -326,7 +328,7 @@ export const ChangesSheet = ({
           <SheetTitle>{chat ? "当前分支的代码改动" : "代码改动"}</SheetTitle>
           <SheetDescription>
             {totals.files > 0
-              ? `${totals.files} 个文件 · +${totals.added} −${totals.removed}`
+              ? `${atLeastPrefix(filesAtLeast)}${totals.files} 个文件 · ${atLeastPrefix(linesAtLeast)}+${totals.added} ${atLeastPrefix(linesAtLeast)}−${totals.removed}`
               : EMPTY_TEXT[query.scope.kind]}
             {chat && singleBranch ? ` · ${singleBranch}` : ""}
             {running && " · 运行中，自动刷新"}

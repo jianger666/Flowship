@@ -24,6 +24,15 @@ describe("formatDurationPrecise", () => {
     expect(formatDurationPrecise(134_000)).toBe("2m14s");
   });
 
+  it("取整进位边界：59.95s 起直接进分钟档（不出 60.0s）；999.5ms 起进秒档（不出 1000ms）", () => {
+    expect(formatDurationPrecise(59_949)).toBe("59.9s");
+    expect(formatDurationPrecise(59_950)).toBe("1m0s");
+    expect(formatDurationPrecise(59_999)).toBe("1m0s");
+    expect(formatDurationPrecise(999.4)).toBe("999ms");
+    expect(formatDurationPrecise(999.5)).toBe("1.0s");
+    expect(formatDurationPrecise(999.9)).toBe("1.0s");
+  });
+
   it("脏 meta（缺失 / 字符串 / NaN / 负数）一律返 null、调用方直接不渲染", () => {
     expect(formatDurationPrecise(undefined)).toBeNull();
     expect(formatDurationPrecise(null)).toBeNull();

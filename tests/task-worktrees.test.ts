@@ -426,6 +426,24 @@ describe("getUniqueRepoDirNames / getRepoWorkDirs / formatRepoSection / storyId"
     ]);
   });
 
+  it("大小写不敏感的文件系统（APFS / NTFS）上 Web 与 web 是同一目录：探重按小写比，原始大小写保留（评审 2026-11-01）", () => {
+    // 显式声明「不敏感」：缺省按平台判定（Linux 保持区分大小写，见 unique-repo-dir-names-platform.test.ts），这里不依赖跑测试的机器
+    const ci = { caseInsensitive: true };
+    // 旧实现区分大小写：[Web, web] 产出 [Web, web]——两仓映射到同一个 worktree 目录
+    expect(getUniqueRepoDirNames(["/a/Web", "/b/web"], ci)).toEqual(["Web", "web-2"]);
+    expect(getUniqueRepoDirNames(["/a/web", "/b/WEB", "/c/Web"], ci)).toEqual([
+      "web",
+      "WEB-2",
+      "Web-3",
+    ]);
+    // 后缀与已有目录名只差大小写也算撞车
+    expect(getUniqueRepoDirNames(["/a/web", "/b/Web", "/c/WEB-2"], ci)).toEqual([
+      "web",
+      "Web-2",
+      "WEB-2-2",
+    ]);
+  });
+
   it("解绑同 basename 的靠前仓：按旧短名拆、剩余仓从 foo-2 挪到 foo", () => {
     const planned = planWorktreeDirChanges(
       ["/a/foo", "/b/foo"],

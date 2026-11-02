@@ -6,7 +6,7 @@
  * 一句话：**用户主动上滚就立刻停跟随，滚回底部就恢复**——判定逻辑在
  * `@/lib/scroll-follow`（纯函数、可单测），这里只负责 DOM 事件接线 + 状态托管。
  *
- * 三个设计要点（都是踩过的坑）：
+ * 设计要点（都是踩过的坑；编号按出现先后、不按时间）：
  * 1. **跟随态是 ref 不是 state**：滚动是热路径，setState 会把整个 EventStream
  *    重渲一遍（几百条 item 的 itemContent 全部重建）；需要跟着变的只有
  *    「AI 在等你回答」悬浮条那一颗子树 → 走 useSyncExternalStore 订阅。
@@ -23,19 +23,39 @@
  *    在变大——输入没过期 + 朝底部走 + 进贴底带，三样齐了才恢复。浏览器平滑滚动动画的后续帧、
  *    Virtuoso 的补偿 scrollBy 都是「朝底部、进了带」的程序化滚动，没有往下翻输入就骗不了它
  *    （用户实测的「往回滚一点又弹回底部」）。
+ * 5. **视口高度变化要补一条贴底**：composer 变高 / 窗口缩放时视口变矮，原先靠 Virtuoso 自己的
+ *    「视口变矮就贴底」路径；那条路径跟「内容增高就贴底」共用一个闸门、被我们一起关掉了
+ *    （见 scroll-follow 的 VIRTUOSO_NEVER_AT_BOTTOM），这里用 ResizeObserver 补回来、受跟随态约束。
  * 6. **「回到最新」是一小段缓动、不是瞬移**（2026-10-17）：`scrollToBottomSmooth` 控制器自己逐帧写
  *    scrollTop（每帧重读终点、内容在长也追得上），滑行期间跟随态保持 false（流式的贴底请求不跟它抢），
  *    落地才开闸；用户上滚 / 拖滚动条 / 点别处跳转（public setFollowing）当场取消。
  *    太远（> 3 个视口）或「减少动态效果」直接跳。
- * 5. **视口高度变化要补一条贴底**：composer 变高 / 窗口缩放时视口变矮，原先靠 Virtuoso 自己的
- *    「视口变矮就贴底」路径；那条路径跟「内容增高就贴底」共用一个闸门、被我们一起关掉了
- *    （见 scroll-follow 的 VIRTUOSO_NEVER_AT_BOTTOM），这里用 ResizeObserver 补回来、受跟随态约束。
+ * 7. **进入对话后的「定位稳定期」**（2026-11-01 评审 K1）：Virtuoso 的初始定位与我们的贴底链是两条互不知情的
+ *    rAF 链，列表没测量时贴底链会假性「稳定」提前收工、Virtuoso 随后落点就停在半路——`beginSettle()` 开启
+ *    `MOUNT_SETTLE_MS` 的稳定期：贴底链按时间收口，scroll 回调带漂移兜底（跟随中、无意图、离底很远 → 重新贴底）。
+ *    稳定期之外若仍出现「跟随中却离底很远」，只让「回到最新」按钮出现（`getAwaySnapshot`），不动滚动位置。
+ *    稳定期从容器挂上起重新计时（渲染期开的、挂载前的耗时不该吃掉它）。
+ * 8. **没有手势事件的上滚**（评审 R1-7）：拖选文字拖到边缘的浏览器自动滚动、中键自动滚动都不产生 wheel / touch / key，
+ *    靠 pointerdown 记下「鼠标主键按在正文里 / 中键会话」，这两种状态下**朝上**的 scroll 按用户上滚意图算；
+ *    Shift+空格是键盘上翻（空格落在按钮 / summary 上是激活、不滚动，不登记）。
+ * 9. **首次落底由控制器接手、Virtuoso 不再传 `initialTopMostItemIndex`**（2026-11-02 评审 K1 根治）：
+ *    Virtuoso 的初始定位走 scrollToIndex 重试链——没有取消接口、每次重试重置 1200ms 兜底、没有总时长上限，
+ *    无头 Chrome 实测切回正在流式的 chat 后 ≤150ms 内上滚会被它自己的 `scrollTo` 拽回。现在 `attachScroller` 在稳定期内
+ *    （渲染期 latch 已 `beginSettle`）、跟随中挂上容器就起贴底链（直接写 scrollTop、可取消）；稳定期之外 / 已不在跟随 / 没开过稳定期时
+ *    挂容器不会自己落底。
+ *    **「Virtuoso 重挂」的每条路径都得让渲染期 latch 在「重挂的那次渲染」里跑**（评审 R8-3）：群问答 tab 往返、列表清空后再有条目——
+ *    latch 带 `!showQaPanel` 守卫（QA 里的重渲不能把进入 QA 时刚开的闸消耗掉），清空时由 [listEmpty] effect 开闸。
+ *    窗口级「后台→前台」Virtuoso 不重挂、`initialTopMostItemIndex` 只在 mount 时读一次，去掉它对这条路径没有影响：
+ *    后台期间排着的贴底帧（rAF 暂停）恢复后照常执行，`onVisibilityChange` 补一次贴底，稳定期即便在后台耗尽，
+ *    列表增高时的 totalListHeightChanged / items effect 仍会重新起链（行为见 tests/event-stream-remount-landing.test.ts）。
  */
 
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from "react";
 
 import {
   DOWN_INTENT_TTL_MS,
+  DRIFT_THRESHOLD_PX,
+  MOUNT_SETTLE_MS,
   PIN_SETTLE_MAX_FRAMES,
   PIN_SETTLE_STABLE_FRAMES,
   distanceFromBottom,
@@ -44,6 +64,7 @@ import {
   isDownIntentWheel,
   isEditableTarget,
   isScrollbarPointer,
+  isSpaceActivatesTarget,
   isUpIntentKey,
   isUpIntentTouch,
   isUpIntentWheel,
@@ -69,9 +90,20 @@ export interface StreamFollowController {
    * 滑行期间跟随态保持 false；用户上滚、拖滚动条、任何 public setFollowing 调用都会取消滑行。
    */
   scrollToBottomSmooth: () => void;
+  /**
+   * 开启「定位稳定期」（`MOUNT_SETTLE_MS`）：进入对话 / 任务时由初始定位 latch 调用（渲染期、幂等）。
+   * 期间贴底链按时间收口、scroll 回调带漂移兜底——原因见 scroll-follow 的 MOUNT_SETTLE_MS（评审 K1）。
+   */
+  beginSettle: () => void;
   /** 订阅跟随态翻转（useSyncExternalStore） */
   subscribe: (onChange: () => void) => () => void;
   getSnapshot: () => boolean;
+  /**
+   * 「离开了底部」的几何兜底快照：`!following || stranded`。
+   * stranded = 跟随态仍为 true，却被程序化滚动带到离底很远的地方（没有任何上滚意图）。
+   * 悬浮的「回到最新」按钮看它而不是只看 following——以后再出新的滚动竞态，用户也有出口（评审 K1 修法 4）。
+   */
+  getAwaySnapshot: () => boolean;
   /** 卸载清理：摘监听 + 取消未执行的 rAF */
   dispose: () => void;
 }
@@ -123,6 +155,13 @@ export const createStreamFollowController = (
   let intentUpAt = Number.NEGATIVE_INFINITY;
   /** 正在拖原生滚动条：拖动期间每次 scroll 都按用户意图算 */
   let draggingScrollbar = false;
+  /**
+   * 鼠标主键按在正文里（拖选文字）/ 中键自动滚动会话中：浏览器自己的「拖到边缘自动滚」和「中键自动滚动」不产生
+   * wheel / touch / key 事件，意图位永远置不上——跟随中的用户会在下一次贴底写里被拽回（评审 R1-7 / 原 P2-3）。
+   * 这两种状态下**朝上**的 scroll 按用户上滚意图算（朝下不算：选中拖到底 / 中键滚到底不恢复跟随，见 HANDOFF 既定行为）。
+   */
+  let selectingByPointer = false;
+  let autoScrollSession = false;
   /** 触摸起点 Y（判断手指往下拖 = 往上翻历史） */
   let touchStartY = 0;
   let touchStartX = 0;
@@ -130,6 +169,13 @@ export const createStreamFollowController = (
   let lastScrollTop = 0;
   /** 最近一次用户「往下翻」输入的时间：恢复跟随要求它还在有效期内（程序化滚动没有输入） */
   let downIntentAt = Number.NEGATIVE_INFINITY;
+  /** 定位稳定期的结束时间（`beginSettle` 写；默认从未开启）：稳定期内贴底链按时间收口 + 漂移兜底 */
+  let settleUntil = Number.NEGATIVE_INFINITY;
+  /**
+   * 「跟随中却离底很远」：scroll 回调里算（没有贴底链在跑、没有滑行、离底 > DRIFT_THRESHOLD_PX）。
+   * 只影响悬浮按钮的显隐（getAwaySnapshot），不改跟随态本身。
+   */
+  let stranded = false;
 
   const notify = () => {
     for (const listener of listeners) listener();
@@ -157,7 +203,11 @@ export const createStreamFollowController = (
     if (next === following) return;
     following = next;
     // 用户离开底部：还没执行的贴底 / 复查作废（帧回调里还会再看一眼跟随态，双保险）
-    if (!next) cancelPin();
+    if (!next) {
+      cancelPin();
+      // 跟随态本身已经是「离开」：按钮由 following 负责，stranded 只描述「following=true 却离底很远」
+      stranded = false;
+    }
     // 微任务通知：允许渲染期写入（初始定位恢复）而不触发 React 跨组件更新告警
     queueMicrotask(notify);
   };
@@ -169,6 +219,33 @@ export const createStreamFollowController = (
   const setFollowing = (next: boolean) => {
     cancelSmooth();
     applyFollowing(next);
+  };
+
+  /** 稳定期是否还在（`beginSettle` 之后 MOUNT_SETTLE_MS 内） */
+  const isSettling = () => now() < settleUntil;
+
+  /** 改 stranded：翻转才通知（微任务，与 applyFollowing 同口径） */
+  const setStranded = (next: boolean) => {
+    if (next === stranded) return;
+    stranded = next;
+    queueMicrotask(notify);
+  };
+
+  /**
+   * 重算 stranded：跟随中 + 没有贴底链在跑 + 离底超过 DRIFT_THRESHOLD_PX。
+   * 在 scroll 回调里调（流式内容增高不产生 scroll 事件，所以不会在两帧贴底的间隙里闪按钮），
+   * 以及贴底链**预算耗尽收工**时调一次——链没把人带回底部（列表一直没测量完 / 内容一直在长）
+   * 又没有 scroll 事件来触发重算，按钮就永远不出现（评审 R1：stranded 只在 scroll 里重算）。
+   */
+  const recomputeStranded = () => {
+    // 不用再判滑行：滑行只在 following=false 时才会起（scrollToBottomSmooth 对 following=true 直接开闸），
+    // 滑行期间 `following` 恒为 false、这里天然不成立
+    setStranded(
+      scroller !== null &&
+        following &&
+        scrollRaf === null &&
+        distanceFromBottom(scroller) > DRIFT_THRESHOLD_PX,
+    );
   };
 
   /** 用「当前几何 + 上滚意图 + 往下翻输入 + 本次滚动方向」跑一次状态机 */
@@ -199,15 +276,32 @@ export const createStreamFollowController = (
   const onScroll = () => {
     if (!scroller) return;
     // 过期的意图当没有：它对应的手势没引出过 scroll，眼前这个 scroll 是程序化的（V2-02）
-    const intent =
-      now() - intentUpAt <= UP_INTENT_TTL_MS || draggingScrollbar;
-    intentUpAt = Number.NEGATIVE_INFINITY;
     // 每个 scroll 事件都要更新基准（不能只在挂上时记一次）：用户先上滚很远、再往下滚回来时，
     // 「往下」是相对上一帧而言的
     const top = scroller.scrollTop;
     const scrollDelta = top - lastScrollTop;
     lastScrollTop = top;
+    const intent =
+      now() - intentUpAt <= UP_INTENT_TTL_MS ||
+      draggingScrollbar ||
+      // 拖选 / 中键自动滚动：浏览器自己滚、没有手势事件——朝上的 scroll 就是用户在往上翻（评审 R1-7）
+      ((selectingByPointer || autoScrollSession) && scrollDelta < 0);
+    intentUpAt = Number.NEGATIVE_INFINITY;
     evaluate(intent, now() - downIntentAt <= DOWN_INTENT_TTL_MS, scrollDelta);
+    // 漂移兜底（评审 K1，只在定位稳定期内）：跟随中、这次 scroll 没有上滚意图（Virtuoso 的初始定位 /
+    // 重试 / 补偿落了点）、没有贴底链在跑（滑行期间 following 恒为 false、不会走到这），却已经离底很远——请求重新贴底。
+    // 上滚手势会先把 following 置 false，所以不会和用户抢；稳定期之外不做（选区拖拽 / 中键自动滚动
+    // 这类没被识别成意图的滚动，不该被这条兜底在空闲时拽回底部）。
+    if (
+      following &&
+      !intent &&
+      scrollRaf === null &&
+      isSettling() &&
+      distanceFromBottom(scroller) > DRIFT_THRESHOLD_PX
+    ) {
+      requestScrollToBottom();
+    }
+    recomputeStranded();
   };
 
   /**
@@ -224,6 +318,9 @@ export const createStreamFollowController = (
     downIntentAt = Number.NEGATIVE_INFINITY;
     cancelSmooth();
     if (scroller && scroller.scrollHeight <= scroller.clientHeight) return;
+    // 已经在最顶上再上滚（评审 K4）：滚不动、不会有 scroll 事件来消费意图，残留的意图会被随后
+    // 控制器自己贴底写 scrollTop 引出的 scroll 消费、被当成「用户上滚」误关跟随
+    if (scroller && scroller.scrollTop <= 0) return;
     intentUpAt = now();
   };
 
@@ -273,7 +370,16 @@ export const createStreamFollowController = (
     if (target && isEditableTarget(target.tagName, target.isContentEditable)) {
       return;
     }
-    if (isUpIntentKey(e.key)) {
+    // 空格：焦点在按钮 / summary / role=button 这类「空格 = 激活」的元素上时它不滚动、只触发点击，
+    // 登记意图会让之后流式贴底写的 scroll 把它误当成用户上滚（评审 N1 同类问题）
+    if (
+      e.key === " " &&
+      target &&
+      isSpaceActivatesTarget(target.tagName, target.getAttribute?.("role") ?? null)
+    ) {
+      return;
+    }
+    if (isUpIntentKey(e.key, e.shiftKey)) {
       // 焦点在内层可滚区里且它还没滚到顶：↑ / PageUp / Home 由内层消化，外层不滚（评审 R3，与滚轮 / 触摸同口径）
       if (
         isUpScrollHandledElsewhere(
@@ -285,22 +391,37 @@ export const createStreamFollowController = (
         return;
       }
       markUpIntent();
-    } else if (isDownIntentKey(e.key)) markDownIntent();
+    } else if (isDownIntentKey(e.key, e.shiftKey)) markDownIntent();
   };
 
   const onPointerDown = (e: PointerEvent) => {
+    if (!scroller) return;
+    // 任何新的按下都结束上一轮「中键自动滚动」（Windows：自动滚动模式下再点一下 = 退出）
+    autoScrollSession = false;
     // 滚动条槽不是子元素、命中时 target 就是容器本身；offsetX 才有可比性
-    if (!scroller || e.target !== scroller) return;
-    if (isScrollbarPointer(e.offsetX, scroller.clientWidth)) {
-      draggingScrollbar = true;
-      cancelSmooth();
-      // 点轨道翻页可能是往下翻：松手后的动画帧要能把人带回贴底（拖动期间仍按上滚意图算）
-      markDownIntent();
+    if (e.target === scroller) {
+      if (isScrollbarPointer(e.offsetX, scroller.clientWidth)) {
+        draggingScrollbar = true;
+        cancelSmooth();
+        // 点轨道翻页可能是往下翻：松手后的动画帧要能把人带回贴底（拖动期间仍按上滚意图算）
+        markDownIntent();
+      }
+      return;
     }
+    // 落在正文里：中键 = 浏览器自动滚动会话的开始；鼠标主键 = 拖选文字的开始（触摸 / 笔走 touch 事件那条路）
+    if (e.button === 1) autoScrollSession = true;
+    else if (e.button === 0 && e.pointerType === "mouse") selectingByPointer = true;
   };
 
   const onPointerUp = () => {
     draggingScrollbar = false;
+    selectingByPointer = false;
+  };
+
+  /** 窗口失焦：中键自动滚动会话没机会收到「再点一下」，失焦就当结束 */
+  const onWindowBlur = () => {
+    autoScrollSession = false;
+    selectingByPointer = false;
   };
 
   /**
@@ -318,17 +439,27 @@ export const createStreamFollowController = (
         scrollToBottomRef.current();
         return;
       }
+      // 定位稳定期内（评审 K1）：Virtuoso 的初始定位要等测量 + 4 个 rAF 才落点、之后还会重试，
+      // 「连续 3 帧贴着」在列表没测量时（scrollHeight≈clientHeight）会假性成立而提前收工，
+      // 所以不按稳定帧数收工、也不耗帧数预算，改由时间收口（稳定期一过按下面常规规则走完）
+      const settling = isSettling();
       if (distanceFromBottom(scroller) <= ALREADY_AT_BOTTOM_EPS) {
-        // 贴着了：再盯几帧——Virtuoso 刚渲染的新项测完高度后总高可能又变、把距底拉开
-        progress.stable += 1;
-        if (progress.stable >= PIN_SETTLE_STABLE_FRAMES) return;
+        if (settling) {
+          progress.stable = 0;
+        } else {
+          // 贴着了：再盯几帧——Virtuoso 刚渲染的新项测完高度后总高可能又变、把距底拉开
+          progress.stable += 1;
+          if (progress.stable >= PIN_SETTLE_STABLE_FRAMES) return;
+        }
       } else {
         progress.stable = 0;
         // 浏览器会把过大的值夹到最大可滚位置
         scroller.scrollTop = scroller.scrollHeight;
       }
-      progress.budget -= 1;
-      if (progress.budget > 0) schedulePin(progress);
+      if (!settling) progress.budget -= 1;
+      if (settling || progress.budget > 0) schedulePin(progress);
+      // 预算耗尽收工、人还没被带回底部（没有 scroll 事件会来重算）：补算一次 stranded，让「回到最新」有出口
+      else recomputeStranded();
     });
   };
 
@@ -336,6 +467,23 @@ export const createStreamFollowController = (
     // 已经有一条链在跑（排着队 / 复查中）：合并进去，它每帧都会重新看几何
     if (scrollRaf !== null) return;
     schedulePin({ stable: 0, budget: PIN_SETTLE_MAX_FRAMES });
+    // 链一起来就不算「被带偏」了：按钮会随着贴底落地自然收起（stranded 只在没有链在跑时才成立）
+    setStranded(false);
+  };
+
+  const beginSettle = () => {
+    settleUntil = now() + MOUNT_SETTLE_MS;
+  };
+
+  /**
+   * 窗口从后台切回前台（评审 K6 / K1）：后台期间 rAF 暂停、定时器被节流，回来时视口可能不在底部
+   * （内容在后台期间长了）。跟随中就补一次贴底；用户在翻历史（following=false）不动他。
+   */
+  const onVisibilityChange = () => {
+    if (typeof document === "undefined" || document.visibilityState !== "visible") {
+      return;
+    }
+    if (following) requestScrollToBottom();
   };
 
   const scrollToBottomSmooth = () => {
@@ -390,9 +538,16 @@ export const createStreamFollowController = (
     scroller.removeEventListener("keydown", onKeyDown);
     scroller.removeEventListener("pointerdown", onPointerDown);
     window.removeEventListener("pointerup", onPointerUp);
+    window.removeEventListener("pointercancel", onPointerUp);
+    window.removeEventListener("blur", onWindowBlur);
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
     viewportObserver?.disconnect();
     viewportObserver = null;
     scroller = null;
+    // stranded 是跟着旧 scroller 的几何算的：换容器 / 卸载时作废（不通知——此刻没有人再等它）
+    stranded = false;
     // 手势态是跟着旧 scroller 的：不清的话，拖着滚动条时容器被换掉（Virtuoso 重挂 / 卸载）收不到 pointerup，
     // `draggingScrollbar` 会粘到新容器上、把它之后每一次程序化滚动都当成用户上滚；
     // 没过期的「往下翻」输入同理，会被新容器上的程序化滚动借去恢复跟随。
@@ -402,6 +557,8 @@ export const createStreamFollowController = (
     // 这里若复位成 true，会把「恢复到上次翻到的位置（不贴底）」的结果在挂载那一刻覆盖掉。
     intentUpAt = Number.NEGATIVE_INFINITY;
     draggingScrollbar = false;
+    selectingByPointer = false;
+    autoScrollSession = false;
     touchStartY = 0;
     touchStartX = 0;
     downIntentAt = Number.NEGATIVE_INFINITY;
@@ -415,6 +572,16 @@ export const createStreamFollowController = (
     if (!next) return;
     scroller = next;
     lastScrollTop = next.scrollTop;
+    // 稳定期是渲染期（latch）开的、而 Virtuoso 的初始定位在它之后才真正开始（挂载 → 测量 → 4 个 rAF 才落点）：
+    // 首次渲染重的对话（大量 markdown / 代码块）会把 1.5s 吃掉一大半——容器一挂上，已开的稳定期从此刻重新计时
+    // （没开过 / 已过期的不动：不能凭空复活）
+    if (isSettling()) {
+      settleUntil = now() + MOUNT_SETTLE_MS;
+      // 首次落底（评审 K1 根治）：不再给 Virtuoso 传 initialTopMostItemIndex，进入对话 / 任务的「落到最后一条」由这里接手——
+      // 稳定期内、跟随中、容器一挂上就起贴底链（直接写 scrollTop、可取消）；稳定期里它按时间收口，
+      // 用户一上滚跟随当场关、链当场停。不依赖 items 变化的 effect 先到（那条 effect 可能早于容器挂上、请求落空）
+      if (following) requestScrollToBottom();
+    }
     // 全部 passive：我们只观察、不 preventDefault，别拖慢原生滚动
     scroller.addEventListener("scroll", onScroll, { passive: true });
     scroller.addEventListener("wheel", onWheel, { passive: true });
@@ -424,6 +591,14 @@ export const createStreamFollowController = (
     scroller.addEventListener("pointerdown", onPointerDown, { passive: true });
     // pointerup 挂 window：拖着滚动条把鼠标移出容器再松手也能收尾
     window.addEventListener("pointerup", onPointerUp, { passive: true });
+    window.addEventListener("pointercancel", onPointerUp, { passive: true });
+    window.addEventListener("blur", onWindowBlur, { passive: true });
+    // 切回前台补一次贴底（评审 K6）；单测里没有 document 就跳过
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange, {
+        passive: true,
+      });
+    }
     // 视口高度变化（composer 变高 / 窗口缩放）：跟随中就重新贴底。
     // Virtuoso 自己有一条「视口变矮 → 贴底」的路径，但它跟「内容增高自动贴底」共用同一个
     // atBottomThreshold 判定、被我们一起关掉了（原因见 scroll-follow 的 VIRTUOSO_NEVER_AT_BOTTOM），
@@ -447,11 +622,13 @@ export const createStreamFollowController = (
     setFollowing,
     requestScrollToBottom,
     scrollToBottomSmooth,
+    beginSettle,
     subscribe: (onChange) => {
       listeners.add(onChange);
       return () => listeners.delete(onChange);
     },
     getSnapshot: () => following,
+    getAwaySnapshot: () => !following || stranded,
     dispose: () => {
       detach();
       cancelPin();
@@ -484,6 +661,17 @@ export const useStreamFollow = (
 /** 订阅跟随态（只在真正需要随之显隐的小子树里调、别在事件流主组件里调） */
 export const useIsFollowing = (ctrl: StreamFollowController): boolean =>
   useSyncExternalStore(ctrl.subscribe, ctrl.getSnapshot, ctrl.getSnapshot);
+
+/**
+ * 订阅「离开了底部」（`!following || stranded`，见 getAwaySnapshot）：悬浮的「回到最新」按钮用它决定显隐，
+ * 跟随态虽然是 true、却被带偏到离底很远的地方时，用户也有出口。
+ */
+export const useIsAwayFromBottom = (ctrl: StreamFollowController): boolean =>
+  useSyncExternalStore(
+    ctrl.subscribe,
+    ctrl.getAwaySnapshot,
+    ctrl.getAwaySnapshot,
+  );
 
 /**
  * 把控制器透给深层子组件（工作过程组的自动折叠要看「用户是不是在翻历史」）。

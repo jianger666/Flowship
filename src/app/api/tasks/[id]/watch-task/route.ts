@@ -51,6 +51,18 @@
  *   - 这段思考的落盘事件已经在 tail 里 → 发 live:null（思考其实已结束，别复活幽灵「思考中」）；
  *   - bootstrap 回放的历史 event 帧带 `replay: true`：前端不能把「重新读一遍旧账」当成
  *     「刚发生了一个落盘事件 = 这段思考结束了」而清掉刚从快照接上的实时态。
+ *
+ * 进行中 shell 输出的快照（帧 `tool_output_snapshot`，与上面两个快照同套路）：
+ *   shell 实时输出（ephemeral `tool_output_delta`）同样是纯内存帧、从不回放，前端直播缓冲又只活在 ChatView 本地 state 里——
+ *   agent 跑长 shell 时切走再切回 / SSE 重连，工具块实时输出是空的、之后也只有「切回那一刻起的增量」。
+ *   所以 bootstrap 里（assistant_snapshot 之后、thinking_snapshot 之前）**无条件**补一帧：
+ *   outputs = [{ callId, text }]（每个在跑的 shell 已发出的尾部窗口 ≤20 行 / ≤8KB；空数组 = 没有，前端据此清残留）。
+ *   - 前端按**替换**语义整份铺上（不是追加型 delta：否则会和重连后的增量重复）；
+ *   - 订阅与读快照同步配对（同上、中间没有 await）；
+ *   - tail 里已有对应 tool_result 的 callId 不带（最终输出已在那条事件的 meta 里，别复活幽灵直播）。
+ *
+ * bootstrap 每一帧各自 try/catch（`bootstrapStep`）：任一帧的构造 / 序列化抛错只丢那一帧，
+ * 不会让排在它后面的快照帧（assistant / tool_output / thinking）整体丢失、前端残留旧的实时态。
  */
 
 import {
@@ -62,6 +74,7 @@ import {
   getLiveAssistantSnapshot,
   getLiveThinkingSnapshot,
 } from "@/lib/server/sdk-message-handler";
+import { getLiveShellOutputSnapshot } from "@/lib/server/shell-output-bridge";
 import { getBackgroundSubagentSnapshot } from "@/lib/server/subagent-background";
 import {
   getTaskVisibility,
@@ -94,6 +107,14 @@ export const maxDuration = 300;
 
 // bootstrap 默认只带最近这么多条事件（?tail= 可覆盖）——长对话打开秒开、更早的上拉分页
 const DEFAULT_TAIL = 300;
+
+// SSE 心跳间隔：bootstrap 之后每隔这么久发一帧注释帧（`: ping`）。
+// why：长对话里 agent 可能几分钟没有任何帧（长 shell / 等用户答复），中间的反向代理 / 系统休眠后的 NAT
+// 常在 ~60s 空闲时静默掐连接——不发心跳，连接死了两端都不知道、前端卡在「运行中」不再更新。
+// 注释帧（以 `:` 开头、没有 data: 行）对客户端是 no-op：task-store 的 parseSseEvent 只认 data: 行，
+// 这种帧解析为 null 被忽略。20s 留足余量（常见空闲阈值 60s）又不至于刷屏。
+const HEARTBEAT_INTERVAL_MS = 20_000;
+const HEARTBEAT_FRAME = ": ping\n\n";
 
 // 中途 task/done 帧统一剥掉 events：事件只经 event 帧走、别每帧重传全量日志
 const stripEvents = (task: Task): Task => ({ ...task, events: [] });
@@ -137,16 +158,31 @@ export const GET = async (req: Request, { params }: Ctx) => {
   const thinkingSnap = getLiveThinkingSnapshot(id);
   // 进行中正文的快照同理（紧跟、同样不能隔 await）：快照 = 订阅那一刻之前已发出的整段
   const assistantSnap = getLiveAssistantSnapshot(id);
+  // 进行中 shell 输出的快照同理（紧跟、同样不能隔 await）：快照 = 订阅那一刻之前已发出的各 callId 尾部窗口
+  const shellOutputSnap = getLiveShellOutputSnapshot(id);
+
+  // 心跳定时器（bootstrap 完成后才起；cleanup 一并清掉，避免流没了定时器还在转）
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   // 幂等清理：ReadableStream.cancel / req.signal abort / closeStream 都可能触发，防 double-clean
   const cleanup = () => {
     unsubscribeFn?.();
     unsubscribeFn = null;
     liveDispatch = null;
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
   };
 
   // 异常断连（tab 关 / 代理掐流）不一定走 cancel——挂 AbortSignal 兜底退订
   req.signal.addEventListener("abort", cleanup, { once: true });
+  // 客户端在订阅之前就已断开（await params 期间）：abort 事件早发过了、上面的监听器永远不会触发——
+  // 不补这道检查，订阅就挂到进程结束（下面返回的流没人读、也就没人 cancel）
+  if (req.signal.aborted) {
+    cleanup();
+    return new Response(null, { status: 499 });
+  }
 
   // 订阅已挂上：此 await 期间产生的事件进 buffer，不会丢
   // 尾部反向读、不整文件 parse
@@ -159,6 +195,11 @@ export const GET = async (req: Request, { params }: Ctx) => {
   } catch (err) {
     cleanup();
     throw err;
+  }
+  // 读盘 await 期间客户端已断开（abort 监听器已经 cleanup 过）：别再为一个没人读的连接构造整条流
+  if (req.signal.aborted) {
+    cleanup();
+    return new Response(null, { status: 499 });
   }
   // 可读性三态——deleted→410+task_deleted；unavailable→503（不发 task_deleted）
   const visibility = getTaskVisibility(id);
@@ -328,70 +369,112 @@ export const GET = async (req: Request, { params }: Ctx) => {
       // 装上直通入口：bootstrapping 关掉后新事件走这里
       liveDispatch = dispatchStreamEvent;
 
-      try {
-        // bootstrap task 帧不带 events（事件走下面的 event 帧）、但带 eventsTruncated
-        // 让客户端知道「还有更早的、可上拉分页」
+      // bootstrap 的每一帧各自 try/catch：任一帧的构造 / 序列化抛错只丢那一帧，
+      // 不能像「整段同一个 try」那样让排在后面的快照帧（assistant / tool_output / thinking）整体丢失——
+      // 丢了快照 = 前端不知道该清残留的实时态（评审 P3）
+      const bootstrapStep = (name: string, build: () => void) => {
+        try {
+          build();
+        } catch (err) {
+          console.error(`[watch-task] bootstrap ${name} 失败:`, err);
+        }
+      };
+
+      // bootstrap task 帧不带 events（事件走下面的 event 帧）、但带 eventsTruncated
+      // 让客户端知道「还有更早的、可上拉分页」
+      bootstrapStep("task", () => {
         send({
           type: "task",
           task: { ...stripEvents(initial), eventsTruncated: truncated },
         });
-        for (const ev of tailEvents) {
+      });
+      for (const ev of tailEvents) {
+        // 逐条隔离：一条事件序列化失败不连累其余 tail 事件（先记 id 再发，去重不受影响）
+        bootstrapStep("event", () => {
           rememberEventId(ev.id);
           // replay：这是重新读一遍的旧账、不是刚发生的事（前端据此不清实时思考态）
           send({ type: "event", event: ev, replay: true });
-        }
-        // bootstrap 附带 queue itemIds（旧字段兼容）+
-        // 完整 operationSnapshot（含 accepting/persisted，关闭 ghost→delivered 窗口）+
-        // recentSettled ledger。
+        });
+      }
+      // bootstrap 附带 queue itemIds（旧字段兼容）+
+      // 完整 operationSnapshot（含 accepting/persisted，关闭 ghost→delivered 窗口）+
+      // recentSettled ledger。
+      bootstrapStep("queue_state", () => {
         send({
           type: "queue_state",
           itemIds: listChatQueueItemIds(id),
           operationSnapshot: listMessageOperationSnapshot(id),
           recentSettled: listRecentSettled(id),
         });
-        // 旁路答疑在飞与否的补位：中途打开页面 / 断线重连都收不到 register/unregister
-        // 那两帧——在飞不补 → 工具块被当脏数据渲染「已中断」；已结束不补 → 断线前的
-        // true 会一直挂着（转圈不停）。所以**无条件**发一帧当前值、让客户端对齐。
+      });
+      // 旁路答疑在飞与否的补位：中途打开页面 / 断线重连都收不到 register/unregister
+      // 那两帧——在飞不补 → 工具块被当脏数据渲染「已中断」；已结束不补 → 断线前的
+      // true 会一直挂着（转圈不停）。所以**无条件**发一帧当前值、让客户端对齐。
+      bootstrapStep("restricted_run", () => {
         send({
           type: "restricted_run",
           active: hasRestrictedQuestionInFlight(id),
         });
+      });
+      bootstrapStep("talk_queue", () => {
         send({ type: "talk_queue", items: buildTalkQueueSnapshot(id) });
-        // 后台子代理在飞清单的补位：中途打开页面 / 切走再切回 / 断线重连都收不到「转入后台 / 收尾」
-        // 那几帧——在跑不补 → 用户看不到子代理还在干活；已结束不补 → 断线前的非空清单会一直挂着。
-        // 所以**无条件**发一帧当前整份（空数组 = 没有），客户端整份替换
+      });
+      // 后台子代理在飞清单的补位：中途打开页面 / 切走再切回 / 断线重连都收不到「转入后台 / 收尾」
+      // 那几帧——在跑不补 → 用户看不到子代理还在干活；已结束不补 → 断线前的非空清单会一直挂着。
+      // 所以**无条件**发一帧当前整份（空数组 = 没有），客户端整份替换
+      bootstrapStep("background_subagents", () => {
         send({
           type: "background_subagents",
           jobs: getBackgroundSubagentSnapshot(id),
         });
-        // 存储降级的补位：中途打开页面 / 断线重连都收不到「降级 / 恢复」那几帧——降级中不补 → 用户看不到红条；
-        // 已恢复不补 → 断线前的红条会一直挂着。所以**无条件**发一帧当前值、让客户端对齐
+      });
+      // 存储降级的补位：中途打开页面 / 断线重连都收不到「降级 / 恢复」那几帧——降级中不补 → 用户看不到红条；
+      // 已恢复不补 → 断线前的红条会一直挂着。所以**无条件**发一帧当前值、让客户端对齐
+      bootstrapStep("storage_degraded", () => {
         const storageDegraded = getStorageDegraded(id);
         send({
           type: "storage_degraded",
           degraded: storageDegraded !== null,
           ...(storageDegraded ? { code: storageDegraded.code } : {}),
         });
-        // 进行中正文的快照：无条件发一帧（对象 = 整段铺上再接着长；null = 没在吐字、前端清残留）。
-        // 这段正文的落盘事件已经在 tail 里 = 其实已经结束（flush 与本次读 tail 交错），发 null 防幽灵。
-        // 不能对快照的 eventId 调 rememberEventId：后来真正落盘的 assistant_message 会被当重复丢掉，前端就收不到清流信号
+      });
+      // 进行中正文的快照：无条件发一帧（对象 = 整段铺上再接着长；null = 没在吐字、前端清残留）。
+      // 这段正文的落盘事件已经在 tail 里 = 其实已经结束（flush 与本次读 tail 交错），发 null 防幽灵。
+      // 不能对快照的 eventId 调 rememberEventId：后来真正落盘的 assistant_message 会被当重复丢掉，前端就收不到清流信号
+      bootstrapStep("assistant_snapshot", () => {
         const assistantLive =
           assistantSnap &&
           !tailEvents.some((e) => e.id === assistantSnap.eventId)
             ? assistantSnap
             : null;
         send({ type: "assistant_snapshot", live: assistantLive });
-        // 进行中思考的快照：无条件发一帧（对象 = 接着长；null = 没在思考、前端清残留）。
-        // 这段思考的落盘事件已经在 tail 里 = 思考其实结束了（节流状态还没来得及清），发 null 防幽灵
+      });
+      // 进行中 shell 输出的快照：无条件发一帧（outputs = 各在跑 shell 已发出的尾部窗口；空数组 = 没有、前端清残留）。
+      // tail 里已有对应 tool_result 的 callId 不带：它其实已经结束（tool-call-completed 与读 tail 交错），最终输出在那条事件的 meta 里，
+      // 带上会让前端把一个已完成工具块的直播缓冲「复活」。
+      // 前端按**替换**语义整份铺上、之后的 delta 排在本帧后面回放（订阅与读快照同步配对，不重不漏）
+      bootstrapStep("tool_output_snapshot", () => {
+        const finishedCallIds = new Set<string>();
+        for (const e of tailEvents) {
+          if (e.kind === "tool_result" && typeof e.meta?.callId === "string") {
+            finishedCallIds.add(e.meta.callId);
+          }
+        }
+        send({
+          type: "tool_output_snapshot",
+          outputs: shellOutputSnap.filter((o) => !finishedCallIds.has(o.callId)),
+        });
+      });
+      // 进行中思考的快照：无条件发一帧（对象 = 接着长；null = 没在思考、前端清残留）。
+      // 这段思考的落盘事件已经在 tail 里 = 思考其实结束了（节流状态还没来得及清），发 null 防幽灵
+      bootstrapStep("thinking_snapshot", () => {
         const liveSnap =
           thinkingSnap &&
           !tailEvents.some((e) => e.id === thinkingSnap.eventId)
             ? thinkingSnap
             : null;
         send({ type: "thinking_snapshot", live: liveSnap });
-      } catch (err) {
-        console.error("[watch-task] bootstrap failed:", err);
-      }
+      });
 
       // 先回放 buffer（与快照重叠的 event 被 sentEventIds 丢掉），再转直通
       bootstrapping = false;
@@ -410,6 +493,22 @@ export const GET = async (req: Request, { params }: Ctx) => {
           ok: initial.repoStatus === "merged",
         });
         closeStream();
+      }
+
+      // 心跳：bootstrap（含终态直接关流的情况）之后才起——start 内部没有 await，所以 bootstrap 帧与心跳不会交错。
+      // 流已关 / 已 cleanup（unsubscribeFn 为空）就不起。写失败（连接已断）= safeEnqueue 内部置 closed，
+      // 下一拍据此 closeStream 退订，不会对着死连接一直发
+      if (!closed && unsubscribeFn) {
+        heartbeatTimer = setInterval(() => {
+          if (closed) {
+            closeStream();
+            return;
+          }
+          safeEnqueue(HEARTBEAT_FRAME);
+          if (closed) closeStream();
+        }, HEARTBEAT_INTERVAL_MS);
+        // 不让心跳定时器单独拖住进程退出（Electron 退出时 server 子进程要能干净结束）
+        heartbeatTimer.unref?.();
       }
     },
     cancel() {

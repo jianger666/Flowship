@@ -55,7 +55,7 @@ import {
   getTaskWorkRepoPaths,
   type WorktreeTaskLike,
 } from "./task-worktrees";
-import { stripHostInjectedEnv } from "./host-env";
+import { stripHostInjectedEnvAndGitToken } from "./host-env";
 import { getTeamLibraryKnowledgeSkillsDir } from "./team-library-paths";
 import { readWkConfig } from "./wk-config";
 
@@ -607,7 +607,11 @@ const scriptEnv = (plan: WkGatePlanActive): NodeJS.ProcessEnv => ({
   // 从剔掉宿主注入变量的环境起步：脚本是项目方维护的 python，里面会再起 git / pnpm 等子进程（触发用户仓钩子），
   // 整份继承 server 环境会把 ELECTRON_RUN_AS_NODE / PORT / __NEXT_PRIVATE_STANDALONE_CONFIG 一路带下去。
   // （WK_REQUIRE_DELIVERY_BASELINE 等 WK_ 开关仍原样继承，见上方 isWkTruthy 的读取）
-  ...stripHostInjectedEnv(),
+  // 另摘掉 GitLab PAT（FLOWSHIP_GITLAB_TOKEN）：它是留给 agent shell 的凭据通道，wk 脚本用不到——
+  // 核实过 wk-harness 的全部 python 脚本：读的只有 WK_* 开关与 WK_DELIVERY_HUB_TOKEN（hub 自己的令牌，不受影响），
+  // 没有任何一处引用 GitLab PAT、也没有 git 联网操作；脚本又会再起 git / pnpm 子进程，PAT 带下去只会扩大暴露面。
+  // 以后某个脚本真要用 PAT，请显式只给那一个脚本传，而不是把它放回这里。
+  ...stripHostInjectedEnvAndGitToken(),
   WK_DOC_ROOT: plan.docRepoPath,
   WK_REQ_ID: plan.reqId,
   PYTHONIOENCODING: "utf-8",

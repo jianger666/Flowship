@@ -5,6 +5,8 @@
  * 二期：bug MQL 解析 / 状态白名单 / bug URL / 角色分组显隐 / 改bug 指令预填
  */
 
+import { sliceHeadSafe } from "@/lib/text-slice";
+
 /** 测试节点名（宽松包含匹配；多命中时取最短名，优先精确「测试」） */
 export const NODE_NAME_TEST = "测试";
 
@@ -275,9 +277,11 @@ export const pickLatestMrUrlFromComments = (
  */
 export const extractMrUrlsFromText = (text: string): string[] => {
   if (!text) return [];
-  // 允许 URL 后跟 ) ] " ' 等收尾符，捕获组不含它们
+  // 允许 URL 后跟 ) ] " ' 等收尾符，捕获组不含它们。
+  // 中段（host + 项目路径）给 1024 上限：无上限时「大量重复的 http://」每个起点都懒扫到串尾才失败，
+  // 整体二次方（21 万码元实测 5 秒+、卡死渲染 / 轮询线程）；有上限后是 起点数 × 1024 的线性
   const re =
-    /https?:\/\/[^\s<>"'）】\]]+?\/-\/merge_requests\/\d+/gi;
+    /https?:\/\/[^\s<>"'）】\]]{1,1024}?\/-\/merge_requests\/\d+/gi;
   const found: string[] = [];
   const seen = new Set<string>();
   let m: RegExpExecArray | null;
@@ -345,7 +349,9 @@ export const parseGitlabMrUrl = (
     host,
     projectPath,
     iid,
-    canonicalUrl: `${protocol}://${host}/${projectPath}/-/merge_requests/${iid}`,
+    // host 大小写不敏感（DNS）：小写进 key，否则 `GitLab.Example.com` 与 `gitlab.example.com` 的同一条 MR
+    // 会得到两个 canonicalUrl（去重 / 已读 / 忽略对不上）；projectPath 大小写敏感，保持原样
+    canonicalUrl: `${protocol}://${host.toLowerCase()}/${projectPath}/-/merge_requests/${iid}`,
   };
 };
 
@@ -416,7 +422,7 @@ export const truncateCommentSnippet = (
     .replace(/\s+/g, " ")
     .trim();
   if (cleaned.length <= maxLen) return cleaned;
-  return `${cleaned.slice(0, maxLen - 1)}…`;
+  return `${sliceHeadSafe(cleaned, maxLen - 1)}…`;
 };
 
 /** 未读 badge 文案：超 99 显示 99+ */

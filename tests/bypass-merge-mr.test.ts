@@ -1,7 +1,10 @@
 /**
  * 旁路合 test MR（bypass-merge-mr）：test 分支专用、线上分支与未知分支默认拒绝。
  *
- * 注：旁路已改 honor-system（提示词-only），本工具当前未接线，转为单元覆盖留着。
+ * 注：本工具目前**没有接线**：受限答疑旁路虽然传 `readOnly: true`，但 custom-agent-backend 的
+ * `RESTRICTED_READONLY_TOOL_NAMES` / `buildRestrictedReadOnlyToolDefs` 把 merge_test_mr 过滤掉了
+ *（tests/restricted-readonly-wiring.test.ts 钉住），受限 agent 只有 read / grep / glob。
+ * 本文件是对 `buildReadOnlyToolDefs` 里这个工具本身的单元覆盖。
  *
  * 钉四件事：
  * 1. 目标分支守卫（纯函数）：测试分支放行、线上分支拒绝、其余拒绝；

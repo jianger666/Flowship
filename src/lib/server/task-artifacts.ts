@@ -303,17 +303,26 @@ export const snapshotActionArtifact = async (
 
     const next = [...list, rev];
 
+    // 先只在内存里算出要淘汰哪些旧 revision；**文件等 meta 落盘成功后再删**。
+    // 以前这里边 shift 边 unlink、writeMeta 在最后——writeMeta 失败（磁盘满 / 被占用）时旧文件已经没了，
+    // 而 meta 仍记着它们：修订列表里留下点开就 404 的「幽灵」revision，且最老的历史版本永久丢失。
+    const evicted: ArtifactRevision[] = [];
     while (next.length > MAX_REVISIONS_PER_ACTION) {
       const oldest = next.shift();
-      if (oldest) {
-        await fs
-          .unlink(path.join(taskDir(taskId), oldest.path))
-          .catch(() => {});
-      }
+      if (oldest) evicted.push(oldest);
     }
     action.revisions = next;
     meta.updatedAt = now;
-    await writeMeta(meta);
+    try {
+      await writeMeta(meta);
+    } catch (err) {
+      // meta 没写成：新快照文件没人引用了，清掉（best-effort）；旧 revision 文件原封不动
+      await fs.unlink(revAbsPath).catch(() => {});
+      throw err;
+    }
+    for (const old of evicted) {
+      await fs.unlink(path.join(taskDir(taskId), old.path)).catch(() => {});
+    }
     return rev;
   });
 
@@ -530,6 +539,8 @@ export const setActionArtifactExcluded = async (
     const action = meta.actions[idx]!;
 
     let nextArtifactPath = action.artifactPath;
+    // 已经挪过的文件（writeMeta 失败时要挪回去）
+    let moved: { fromAbs: string; toAbs: string } | null = null;
     // 有 artifact 记录就同步挪文件 + 改字段；目标位置 = 隐藏子目录（划除）或正常目录（恢复）
     if (action.artifactPath) {
       const filename = actionArtifactFilename(action.n, action.type);
@@ -539,10 +550,19 @@ export const setActionArtifactExcluded = async (
       if (action.artifactPath !== targetRel) {
         const fromAbs = path.join(taskDir(taskId), action.artifactPath);
         const toAbs = path.join(taskDir(taskId), targetRel);
-        // 文件可能不存在（agent 没写成功）——只改字段、不报错
-        if (await exists(fromAbs)) {
+        // 文件可能不存在（agent 没写成功）——只改字段、不报错。
+        // 「不存在」只认明确 ENOENT：EACCES / EIO 等不能当没有文件，否则 meta 改指新位置、文件却留在原处 =「产出不存在」
+        let fromExists = true;
+        try {
+          await fs.access(fromAbs);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+          fromExists = false;
+        }
+        if (fromExists) {
           await fs.mkdir(path.dirname(toAbs), { recursive: true });
           await fs.rename(fromAbs, toAbs);
+          moved = { fromAbs, toAbs };
         }
         nextArtifactPath = targetRel;
       }
@@ -554,6 +574,53 @@ export const setActionArtifactExcluded = async (
       ...meta.actions.slice(idx + 1),
     ];
     meta.updatedAt = Date.now();
-    await writeMeta(meta);
+    try {
+      await writeMeta(meta);
+    } catch (err) {
+      // meta 没落盘：磁盘上的 artifactPath 还指着老位置，而文件已经挪走了——UI 会显示「产出不存在」、
+      // 文件却躺在 .excluded/ 里。把 rename 回滚，让「文件位置」与「meta」重新一致。
+      if (moved) {
+        try {
+          await fs.rename(moved.toAbs, moved.fromAbs);
+        } catch (rollbackErr) {
+          // 回滚也失败：不能装作没事——记日志并抛明确错误，让上层 / 用户知道文件现在在哪
+          console.error(
+            `[task-artifacts] 划除 / 恢复回滚失败 task=${taskId} action=${actionId}：artifact 留在 ${moved.toAbs}（meta 仍指向 ${moved.fromAbs}）`,
+            rollbackErr,
+          );
+          throw new ArtifactMoveRollbackError(taskId, actionId, moved.toAbs, moved.fromAbs);
+        }
+      }
+      throw err;
+    }
     return await hydrateTask(meta);
   });
+
+/**
+ * 划除 / 恢复时 meta 写失败、且把 artifact 挪回原处也失败：文件与 meta 此刻不一致，需要人工介入。
+ * message 点明文件现在的位置（给日志 / 报错用，不含文件内容）。
+ */
+export class ArtifactMoveRollbackError extends Error {
+  readonly taskId: string;
+  readonly actionId: string;
+  /** artifact 文件当前实际所在 */
+  readonly currentPath: string;
+  /** meta 仍然记着的位置（也是应该挪回的位置） */
+  readonly expectedPath: string;
+  constructor(
+    taskId: string,
+    actionId: string,
+    currentPath: string,
+    expectedPath: string,
+  ) {
+    super(
+      `划除 / 恢复失败，且产出文件回滚失败：文件现在在 ${currentPath}，任务记录仍指向 ${expectedPath}，` +
+        "请手动把文件移回去（或重试）",
+    );
+    this.name = "ArtifactMoveRollbackError";
+    this.taskId = taskId;
+    this.actionId = actionId;
+    this.currentPath = currentPath;
+    this.expectedPath = expectedPath;
+  }
+}

@@ -12,7 +12,7 @@
  * 数据布局说明见 task-fs.ts 顶部注释。
  */
 
-import { createReadStream, readFileSync } from "node:fs";
+import { createReadStream, readFileSync, renameSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
@@ -410,13 +410,22 @@ export const withTaskLock = async <T>(
 
 /**
  * 读 meta.json、返回 raw JSON
- * - 文件不存在 → null
+ * - 文件**明确**不存在（ENOENT / ENOTDIR）→ null
+ * - 其它读失败（EACCES / EBUSY / EIO …）→ 抛错：不能当「不存在」。
+ *   以前先 `exists()` 预探、它把任何错误都吞成 false，瞬时 I/O 故障下 boot recovery 会把活任务当成
+ *   「没有 meta = 非存活任务」，其 worktree 被当孤儿清掉。
  * - 文件破损 / V0.5 残留 → 抛错（让上层决定 skip 还是 propagate）
  */
 export const readMetaRaw = async (id: string): Promise<unknown | null> => {
   const p = path.join(taskDir(id), META_FILE);
-  if (!(await exists(p))) return null;
-  const raw = await fs.readFile(p, "utf-8");
+  let raw: string;
+  try {
+    raw = await fs.readFile(p, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw err;
+  }
   if (raw.trim().length === 0) {
     throw new Error(
       `meta.json 为空 taskId=${id}（可能上次进程写一半挂了、检查 data/tasks/${id}/）`,
@@ -587,12 +596,17 @@ export const inspectMetaCorruptionSync = (id: string): CorruptTaskInfo | null =>
  * - 旧文件不存在（首次写）→ 不动
  * - 旧文件本身已坏（空 / 非 JSON / schema 不合）→ **不动 .bak**：坏文件不能顶掉好备份
  * - 失败只 warn、不挡主写：备份是兜底、不是前置条件
- * - 用 fs.writeFile 直写而不是 tmp+rename：.bak 先于主文件 rename 写完，写 .bak 中途崩溃时主文件
- *   仍是完整的旧版（rename 还没发生），下次写会重新滚备份，不存在「主文件与 .bak 同时是坏的」窗口；
- *   同时避免多走一次 renameWithRetry（它挂着 rename.beforeAttempt failpoint，测试靠它定位 meta 的 rename）。
- * - 开销：多一次读 + 校验 + 写（实测 24KB meta 约 +0.7ms，其中 zod 校验约 0.03ms）。
+ * - tmp（fsync）+ rename 原子写：以前直接 fs.writeFile 覆盖 .bak——写 .bak 中途崩溃 / 磁盘写满会把**上一份好备份**截成半截
+ *   （这期间主文件虽然还是完整的旧版，但「主文件之后再损坏」时就没有好备份可恢复了）。
+ *   现在先写 `meta.json.bak.tmp.<pid>.<rand>`（writeFileFsynced：写完 fsync，断电后也不会出现 0 字节 .bak）再 rename 覆盖：
+ *   任何时刻 .bak 要么是旧的完整版、要么是新的完整版。
+ *   这里**不走** renameWithRetry、也不走 `fs.promises.rename`（理由见下面 renameSync 处的注释：测试靠它们的调用序号定位 meta 的 rename）；
+ *   .bak 只是兜底，所以只做一个小的就地重试（Windows 杀软占用的 EPERM / EBUSY / EACCES），重试穿透就 warn、不挡主写。
+ *   崩溃遗留的 tmp 由 sweepStaleMetaTmpFiles 在启动期清扫。
+ * - 开销：多一次读 + 校验 + 写 + rename（实测 24KB meta 约 +0.7ms，其中 zod 校验约 0.03ms）。
  */
 const refreshMetaBackup = async (metaFile: string): Promise<void> => {
+  let tmpPath: string | null = null;
   try {
     let oldText: string;
     try {
@@ -602,12 +616,29 @@ const refreshMetaBackup = async (metaFile: string): Promise<void> => {
       throw err;
     }
     if (!parseMetaText(oldText).ok) return;
-    await fs.writeFile(
-      path.join(path.dirname(metaFile), META_BACKUP_FILE),
-      oldText,
-      "utf-8",
-    );
+    const bakPath = path.join(path.dirname(metaFile), META_BACKUP_FILE);
+    const bakTmp = `${bakPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+    tmpPath = bakTmp;
+    // fsync(tmp) 之后才 rename：只有 tmp + rename 时，断电可能出现「rename 已持久化、tmp 数据块没落盘」——.bak 变成 0 字节 / 半截，
+    // 而它恰恰是「meta.json 之后损坏」时唯一的恢复来源。writeFileFsynced 只用 `fs.open` + `fh.sync()`，不走 `fs.promises.rename`
+    // （不影响下面 renameSync 注释里说的、测试靠 promises.rename 调用序号定位 meta rename 的约定）；fsync 失败它自己只 warn、不挡写
+    await writeFileFsynced(bakTmp, oldText);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        // 用同步 renameSync（几十 KB 的小文件、微秒级）而不是 `fs.promises.rename`：
+        // 既有的所有权 / Windows 重试测试靠 spy `fs.promises.rename` 的**调用序号**定位「meta.json 的那次 rename」
+        // （如 ownership-r27：第 1 次注入 EPERM），.bak 在主 rename 之前，多走一次 promises.rename 会吃掉那次注入、整组错位。
+        renameSync(bakTmp, bakPath);
+        tmpPath = null;
+        break;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (attempt >= 3 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) throw err;
+        await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
+      }
+    }
   } catch (err) {
+    if (tmpPath) await fs.unlink(tmpPath).catch(() => {});
     console.warn(
       `[task-fs] 刷新 meta.json.bak 失败（忽略、不挡主写）：${
         (err as NodeJS.ErrnoException)?.code ??
@@ -615,6 +646,61 @@ const refreshMetaBackup = async (metaFile: string): Promise<void> => {
       }`,
     );
   }
+};
+
+/**
+ * 「可以删」的 meta 临时文件名：任务目录顶层的 `meta.json.tmp.<数字 pid>.<随机段>` 与 `meta.json.bak.tmp.<数字 pid>.<随机段>`
+ * （prepareMetaWrite / restoreMetaFromBackup / refreshMetaBackup 的产物形态；随机段是 `Math.random().toString(36)` 的子串）。
+ * **严格**匹配、不用宽口径：用户手工留在任务目录里的 `meta.json.tmp.my-copy`、`meta.json.bak` 本体一概不动。
+ */
+const STALE_META_TMP_RE = /^meta\.json(?:\.bak)?\.tmp\.\d+\.[a-z0-9]+$/;
+/** 遗留 meta tmp 的最小年龄：一次原子写从建 tmp 到 rename 是毫秒级，1 小时以上只可能是崩溃留下的 */
+export const STALE_META_TMP_MIN_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * 启动期清掉某个任务目录里崩溃遗留的 meta 临时文件（prepare 写完 tmp、rename 前进程被杀）。
+ * 只删：任务目录**顶层**、文件名严格匹配 STALE_META_TMP_RE、`lstat` 确认是普通文件（目录 / 软链不碰）、mtime 早于 1 小时。
+ * 幂等；任何失败只 warn 文件名（不含内容）、绝不抛。不进任务锁——它只碰早已被放弃的旧 tmp，与正在进行的写（新 tmp）不相交。
+ *
+ * @returns 实际删除的个数
+ */
+export const sweepStaleMetaTmpFiles = async (
+  id: string,
+  opts: { now?: number; minAgeMs?: number } = {},
+): Promise<number> => {
+  let removed = 0;
+  try {
+    const dir = taskDir(id);
+    const now = opts.now ?? Date.now();
+    const minAgeMs = opts.minAgeMs ?? STALE_META_TMP_MIN_AGE_MS;
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch {
+      return 0; // 目录没了 / 读不了：没什么可清
+    }
+    for (const name of names) {
+      if (!STALE_META_TMP_RE.test(name)) continue;
+      const full = path.join(dir, name);
+      try {
+        const st = await fs.lstat(full);
+        if (!st.isFile()) continue;
+        if (now - st.mtimeMs <= minAgeMs) continue;
+        await fs.unlink(full);
+        removed += 1;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+        console.warn(
+          `[task-fs] 清理遗留 meta 临时文件 ${name} 失败（不阻断）：${
+            (err as NodeJS.ErrnoException)?.code ?? "unknown"
+          }`,
+        );
+      }
+    }
+  } catch {
+    /* 绝不抛 */
+  }
+  return removed;
 };
 
 export type MetaRestoreResult =

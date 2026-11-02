@@ -9,7 +9,7 @@
  * - 本组件：整条设为可拖动窗口区（-webkit-app-region: drag）、交互元素 no-drag。
  *
  * 布局三段：
- *   左：侧栏展开 / 收起 toggle（⌘/Ctrl+B 同效、状态由 AppShell 持有；mac 让开左上角交通灯）
+ *   左：侧栏展开 / 收起 toggle（⌘B（mac）/ Ctrl+B（其它）同效、tooltip 文案按平台显示；状态由 AppShell 持有；mac 让开左上角交通灯）
  *   中：品牌（logo + 名字、点击回首页）——absolute 居中、跨页最稳的锚点
  *   右：功能键（更新 / 主题 / 设置；win 让出右上角窗口控制按钮位）
  *
@@ -31,6 +31,8 @@ import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useAppMode, type AppMode } from "@/hooks/use-app-mode";
 import { useTaskList } from "@/hooks/use-task-list";
+import { getModShortcutLabel } from "@/lib/keyboard-shortcuts";
+import { normalizeShellPlatform } from "@/lib/platform-shortcuts";
 import { getLastWorkId, getLastWorkKind } from "@/lib/view-memory";
 import {
   syncTitleBarOverlayTheme,
@@ -177,6 +179,9 @@ export const AppHeader = ({
 
   const isWin = platform === "win32";
   const isMac = platform === "darwin";
+  // 侧栏 toggle 的键位文案：mac ⌘B、其它 Ctrl+B。platform 是 mount 后才读的 state（SSR / 首次渲染为 ""），
+  // 首屏先按 Ctrl+B 渲染、mac 上 mount 后切 ⌘B，不会 hydration 不一致
+  const sidebarToggleKeys = getModShortcutLabel(normalizeShellPlatform(platform), "B");
 
   return (
     <header
@@ -195,7 +200,7 @@ export const AppHeader = ({
           isMac && "pl-22",
         )}
       >
-        <Tooltip content={sidebarOpen ? "收起侧栏（⌘/Ctrl+B）" : "展开侧栏（⌘/Ctrl+B）"}>
+        <Tooltip content={`${sidebarOpen ? "收起侧栏" : "展开侧栏"}（${sidebarToggleKeys}）`}>
           <Button
             variant="ghost"
             size="icon-sm"

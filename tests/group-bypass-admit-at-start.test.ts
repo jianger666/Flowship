@@ -37,6 +37,7 @@ const {
   __resetGroupChatCacheForTest,
   __setGroupRouteDepsForTest,
   GROUP_BYPASS_RATE_LIMITED,
+  GROUP_RESTRICTED_QA_DENIED,
   GROUP_RESTRICTED_QUESTION_RUNNING,
   pumpGroupQuestionQueue,
   routeGroupInboundMessage,
@@ -70,6 +71,7 @@ const taskSummary = (): TaskSummary =>
     actionCount: 0,
     feishuStoryUrl: "https://project.feishu.cn/space/story/detail/10001",
   }) as TaskSummary;
+// 群答疑默认关闭（P0 硬化）：本文件测旁路准入点，夹具显式开启
 const fullTask = (): Task =>
   ({ ...taskSummary(), actions: [], events: [] }) as unknown as Task;
 
@@ -374,29 +376,27 @@ describe("③ 每发送人子限额（窗内最多启动 4 次，总上限 12 �
     expect(after[1]!.text).not.toContain("王小明");
   });
 
-  it("机器人发件人同样受个人限额：有 open_id 按 open_id、没 open_id 退回 app_id；互不串桶；全程静默", async () => {
-    // A：有 open_id
-    for (let i = 0; i < 4; i++) {
-      expect(await route(botMsg("ou_bota", `om_a${i}`))).toMatchObject({ kind: "sent" });
-    }
-    expect(await route(botMsg("ou_bota", "om_a4"))).toMatchObject({
-      kind: "skipped",
-      error: GROUP_BYPASS_RATE_LIMITED,
-    });
-    // B：sender_id 为空、只有 app_id
+  it("机器人发件人（有 open_id / 只有 app_id）都过不了受限答疑准入闸：整条静默、不启动、不占任何名额（P0 硬化新语义，原「机器人同样受个人限额」）", async () => {
+    // 原用例钉「机器人按 open_id / app_id 分桶受个人限额」——机器人现在到不了旁路准入点，分桶键的纯函数口径
+    // 由 group-bypass-limit 的纯函数层继续覆盖；这里钉：闸先于准入点、机器人不会消耗额度
     const appOnly = (id: string, app: string) =>
       botMsg("", id, { sender_app_id: app, sender_name: "" } as never);
-    for (let i = 0; i < 4; i++) {
-      expect(await route(appOnly(`om_b${i}`, "cli_b"))).toMatchObject({ kind: "sent" });
+    for (let i = 0; i < 6; i++) {
+      expect(await route(botMsg("ou_bota", `om_a${i}`))).toMatchObject({
+        kind: "skipped",
+        error: GROUP_RESTRICTED_QA_DENIED,
+      });
+      expect(await route(appOnly(`om_b${i}`, "cli_b"))).toMatchObject({
+        kind: "skipped",
+        error: GROUP_RESTRICTED_QA_DENIED,
+      });
     }
-    expect(await route(appOnly("om_b4", "cli_b"))).toMatchObject({
-      kind: "skipped",
-      error: GROUP_BYPASS_RATE_LIMITED,
-    });
-    // 另一个 app_id 不串桶
-    expect(await route(appOnly("om_c0", "cli_c"))).toMatchObject({ kind: "sent" });
-    // 被限的机器人收不到任何回群（系统回执对机器人静默 + 限流本就不回群）
+    // 没有任何回群（拒绝是静默的）
     expect(sentTexts()).toEqual([]);
+    // 机器人一个名额都没占：真人照常能启动满个人额度 4 次
+    for (let i = 0; i < 4; i++) {
+      expect(await route(msg("ou_human", `om_h${i}`))).toMatchObject({ kind: "sent" });
+    }
   });
 });
 

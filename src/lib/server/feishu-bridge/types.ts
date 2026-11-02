@@ -137,6 +137,11 @@ export interface FeishuInboundMessage {
   sender_app_id?: string;
   /** 发送方机器人 open_id（ou_xxx，bot 消息才有；关联判定时与 sender_id 二选一） */
   sender_bot_open_id?: string;
+  /**
+   * 发送人所属租户（只收「确属发件人」的 tenant_key，不收 header 里的应用租户）。
+   * 当前 lark-cli compact 事件里没有 tenant_key，生产里恒为空；群答疑租户闸暂不生效（缺了就不拦）。
+   */
+  sender_tenant_key?: string;
   /** 发送人姓名（enrichment 有时带；缺则由成员映射表兜底） */
   sender_name?: string;
   /** 群消息里被 @ 的人（p2p 无）——判「有没有 @ 本机 bot」用 */

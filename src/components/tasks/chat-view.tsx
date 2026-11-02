@@ -226,8 +226,15 @@ export const ChatView = ({
   // 初值吃 task 当前态：打开 / 切回一个正在运行的会话，首个 commit 就是「在跑」（D9-03）
   const [runActive, setRunActive] = useState(() => task.runStatus === "running");
   // shell 流式输出：callId → 尾部窗口文本（ephemeral，不进 task.events）；与 task 页共用同一个 hook
-  const { liveToolOutputs, absorbLiveToolOutputEvent, clearLiveToolOutputs } =
-    useLiveToolOutputs();
+  // applyToolOutputSnapshot：每次（重）连接 bootstrap 的「进行中 shell 输出」快照——切到别的对话再切回（本组件重挂、
+  // 挂载时直播缓冲被清空）/ SSE 重连后，按**替换**语义整份铺上各在跑 shell 的尾部窗口，工具块实时输出不再是空的、
+  // 也不只剩「切回那一刻起的增量」；之后的实时 delta 排在快照后面追加，不重不漏
+  const {
+    liveToolOutputs,
+    absorbLiveToolOutputEvent,
+    clearLiveToolOutputs,
+    applyToolOutputSnapshot,
+  } = useLiveToolOutputs();
   // P5：排队条（第 N 条）；null = 无排队
   const [queuedCount, setQueuedCount] = useState<number | null>(null);
   // 排队条「自动弹开」信号：订阅到的实时 dispatch 里发现「从无到有」时递增（恢复路径不递增，见 onLedgerLive）
@@ -491,6 +498,8 @@ export const ChatView = ({
     onThinkingDelta: pushThinkingDelta,
     onThinkingSnapshot: applySnapshot,
     onAssistantSnapshot: applyAssistantSnapshot,
+    // shell 直播输出快照：替换（不是追加）整份直播缓冲；与现值相同就不重渲染（hook 内 reducer 返回原引用）
+    onToolOutputSnapshot: applyToolOutputSnapshot,
     // 后台子代理在飞清单：整份替换；与现值相同（bootstrap 补发 vs 实时帧常常同一份）就不 setState，
     // 省一次整个聊天视图的重渲染
     onBackgroundSubagents: (jobs) =>

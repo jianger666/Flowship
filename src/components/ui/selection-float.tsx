@@ -13,6 +13,10 @@
  *   按钮 unmount 掉 → 这一下点了个空
  * - `mouseup` 里用 rAF 再读选区：部分浏览器在 mouseup 那一刻 selection 还没 commit
  * - 跨容器选区（anchor / focus 不在同一容器）一律不出按钮
+ * - 选区拖到容器**外**再松手：mouseup 不会落在容器上，所以另在 document 上兜一个 mouseup
+ *   （target 在容器内的交给容器自己的 onMouseUp，避免重复触发）
+ * - 长选区的顶边可能滚出视口：按钮锚点夹到视口顶部以下（见 computeSelectionFloatPosition），
+ *   否则按钮落在视口之外够不着
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
@@ -32,6 +36,34 @@ interface UseSelectionFloatOpts {
   /** 选中文本上限；不传 = 不截断 */
   maxLength?: number;
 }
+
+/** 按钮锚点距视口顶部的最小距离：按钮自身约 26px 高（-translate-y-full 向上长），再留点边距 */
+export const SELECTION_FLOAT_MIN_VIEWPORT_TOP = 48;
+/** 按钮水平中心距容器左右边的最小距离（按钮 -translate-x-1/2，宽约 80px） */
+export const SELECTION_FLOAT_MIN_EDGE = 44;
+
+/**
+ * 浮动按钮相对容器的位置（纯函数、可测）。
+ * - 竖直：默认贴选区顶边；顶边已滚出视口（长选区）时夹到视口顶部以下，但不越过选区底边
+ * - 水平：选区外接矩形中心，夹在容器左右边内（容器比两侧留白还窄时放中间）
+ */
+export const computeSelectionFloatPosition = (
+  rect: { top: number; bottom: number; left: number; width: number },
+  containerRect: { top: number; left: number; width: number },
+): { top: number; left: number } => {
+  const anchorY = Math.max(
+    rect.top,
+    Math.min(SELECTION_FLOAT_MIN_VIEWPORT_TOP, rect.bottom),
+  );
+  const rawLeft = rect.left - containerRect.left + rect.width / 2;
+  const minLeft = SELECTION_FLOAT_MIN_EDGE;
+  const maxLeft = containerRect.width - SELECTION_FLOAT_MIN_EDGE;
+  const left =
+    maxLeft <= minLeft
+      ? containerRect.width / 2
+      : Math.min(Math.max(rawLeft, minLeft), maxLeft);
+  return { top: anchorY - containerRect.top, left };
+};
 
 /**
  * 选区检测 + 浮动按钮定位。
@@ -111,8 +143,7 @@ export const useSelectionFloat = ({
       const rect = sel.getRangeAt(0).getBoundingClientRect();
       const containerRect = container.getBoundingClientRect();
       setSelection({
-        top: rect.top - containerRect.top,
-        left: rect.left - containerRect.left + rect.width / 2,
+        ...computeSelectionFloatPosition(rect, containerRect),
         text:
           maxLength !== undefined && trimmed.length > maxLength
             ? trimmed.slice(0, maxLength)
@@ -120,6 +151,19 @@ export const useSelectionFloat = ({
       });
     });
   }, [maxLength]);
+
+  // 选区从容器内拖到容器外再松手：mouseup 不会冒泡到容器，这里在 document 上兜一次。
+  // target 在容器内的由容器 onMouseUp 处理（两边都响应会各排一个 rAF、重复 setState）
+  useEffect(() => {
+    if (!enabled) return;
+    const onDocumentMouseUp = (e: MouseEvent) => {
+      const container = containerRef.current;
+      if (container && e.target instanceof Node && container.contains(e.target)) return;
+      handleMouseUp();
+    };
+    document.addEventListener("mouseup", onDocumentMouseUp);
+    return () => document.removeEventListener("mouseup", onDocumentMouseUp);
+  }, [enabled, handleMouseUp]);
 
   return {
     containerRef,

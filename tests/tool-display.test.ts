@@ -820,6 +820,60 @@ describe("parseUnifiedDiff", () => {
     expect(lines.map((l) => l.kind)).toEqual(["hunk", "del", "add", "hunk", "del"]);
   });
 
+  it("hunk 正文里被编辑器剥了尾空格的空上下文行：占旧 / 新各一行、有行号、后续行号不漂（评审 2026-11-01）", () => {
+    // 旧行为：空串当「非法上下文」——无行号、不递推，后面所有行号整体少算一行
+    const diff = ["@@ -1,4 +1,4 @@", " a", "", "-b", "+B", " c"].join("\n");
+    expect(parseUnifiedDiff(diff)).toEqual([
+      { kind: "hunk", text: "" },
+      { kind: "context", oldLine: 1, newLine: 1, text: "a" },
+      { kind: "context", oldLine: 2, newLine: 2, text: "" },
+      { kind: "del", oldLine: 3, text: "b" },
+      { kind: "add", newLine: 3, text: "B" },
+      { kind: "context", oldLine: 4, newLine: 4, text: "c" },
+    ]);
+  });
+
+  it("末尾换行不产生幽灵行：diff 以 \\n 结尾时，split 留下的末尾空串不是一行内容", () => {
+    const withNewline = ["@@ -1,2 +1,2 @@", "-a", "+A", " tail", ""].join("\n");
+    const without = withNewline.slice(0, -1);
+    expect(parseUnifiedDiff(withNewline)).toEqual(parseUnifiedDiff(without));
+    expect(parseUnifiedDiff(withNewline).at(-1)).toEqual({
+      kind: "context",
+      oldLine: 2,
+      newLine: 2,
+      text: "tail",
+    });
+    // 统计口径不受影响
+    expect(countDiffStats(withNewline)).toEqual({ added: 1, removed: 1 });
+  });
+
+  it("截断在行边界（hunk 正文没读完、diff 以换行结尾）：末尾那个空串同样只是 split 的假象，不产生带行号的幽灵行", () => {
+    const diff = ["@@ -1,3 +1,3 @@", " a", ""].join("\n");
+    expect(parseUnifiedDiff(diff).at(-1)).toEqual({
+      kind: "context",
+      oldLine: 1,
+      newLine: 1,
+      text: "a",
+    });
+    // 末尾真有一行被剥了空格的空上下文行（它后面跟着换行）：仍然算一行
+    const withBlank = ["@@ -1,3 +1,3 @@", " a", "", ""].join("\n");
+    expect(parseUnifiedDiff(withBlank).at(-1)).toEqual({
+      kind: "context",
+      oldLine: 2,
+      newLine: 2,
+      text: "",
+    });
+  });
+
+  it("CRLF 文件里被剥了前导空格的空上下文行（只剩 \\r）：占行、有行号，后续行号不漂", () => {
+    const diff = ["@@ -1,4 +1,4 @@", " a\r", "\r", "-b\r", "+B\r", " c\r"].join("\n");
+    const rows = parseUnifiedDiff(diff);
+    expect(rows[2]).toEqual({ kind: "context", oldLine: 2, newLine: 2, text: "" });
+    expect(rows[3]).toMatchObject({ kind: "del", oldLine: 3 });
+    expect(rows[4]).toMatchObject({ kind: "add", newLine: 3 });
+    expect(rows[5]).toMatchObject({ kind: "context", oldLine: 4, newLine: 4 });
+  });
+
   it("截断残行 / 空输入容错", () => {
     expect(parseUnifiedDiff("")).toEqual([]);
     expect(parseUnifiedDiff("@@ -1,2 +1,2 @@")).toEqual([

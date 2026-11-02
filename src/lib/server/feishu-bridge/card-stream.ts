@@ -81,6 +81,65 @@ const ERROR_TEXT_MAX = 240;
 const SHRINK_ANSWER_BUDGETS = [10_000, 5_000, 2_500] as const;
 /** 序号冲突（300317）一轮失败里最多自愈几次（任一次成功后复位）；仍冲突就按普通失败计入熔断 */
 const SEQ_HEALS_PER_EPISODE = 1;
+/**
+ * 终稿全量 PUT 遇到瞬时失败（限流 / 5xx / lark-cli 超时）时的退避重试间隔：每个元素 = 一次重试前等多久，
+ * 即最多重试 2 次（共 3 发）、间隔 1s → 3s。
+ *
+ * 为什么终稿要重试（流式中间帧不用）：中间帧丢了下一帧会带全量补上；终稿是最后一发，没人再补——
+ * 旧实现一次失败就 `finalizeOk=false`、卡片永远停在最后一次打字机推送（streaming_mode 也没关），
+ * 而限流 / 超时恰恰是「再等一两秒就好」的失败。为什么重试安全：终稿是整卡全量 PUT（覆盖式、幂等），
+ * 超时但其实已生效的那种，重发一遍只是同样的内容；每次重试都由 fn 向 card-seq 要新的递增序号。
+ * 次数克制：终稿在互斥链上、outbound 的 finalize 在等它，单发最长 15s，别无限拖。
+ */
+const FINAL_RETRY_DELAYS_MS: readonly number[] = [1_000, 3_000];
+let finalRetryDelaysMs: readonly number[] = FINAL_RETRY_DELAYS_MS;
+
+/** 单测调整终稿重试间隔（`[]` = 不重试、`[0, 0]` = 重试但不等）；传 null 复原。0 / 负数不起定时器 */
+export const __setFinalRetryDelaysForTest = (
+  delays: readonly number[] | null,
+): void => {
+  finalRetryDelaysMs = delays ?? FINAL_RETRY_DELAYS_MS;
+};
+
+/**
+ * 终稿「从开始到放弃」的总时间预算（整卡 PUT 的各次尝试 + 退避 + 之后的思考区回写 / 关流式）。
+ *
+ * 为什么要总预算：单发上限 15s，再叠 2 次退避重试，最坏 15+1+15+3+15 ≈ 49s；熔断已开 / 飞书黑洞时
+ * 这段时间全压在 enqueueCardOp 互斥链上（outbound 的 finalize 在等它、同一张卡的后续操作也排在后面），
+ * 用户盯着一张「生成中」的卡等将近一分钟才等到文字补发。预算把它封在 ≈40s：每发的超时取
+ * min(15s, 剩余额度)，剩余不够一发（{@link FINAL_MIN_ATTEMPT_MS}）就不再重试。
+ */
+const FINAL_TOTAL_BUDGET_MS = 40_000;
+/** 预算快用完时一发还值得试的最短超时；低于它就不再起新的一发（退避后也一样） */
+const FINAL_MIN_ATTEMPT_MS = 3_000;
+let finalTotalBudgetMs = FINAL_TOTAL_BUDGET_MS;
+
+/** 单测调整终稿总预算（ms）；传 null 复原 */
+export const __setFinalBudgetForTest = (ms: number | null): void => {
+  finalTotalBudgetMs = ms ?? FINAL_TOTAL_BUDGET_MS;
+};
+
+const sleepMs = (ms: number): Promise<void> =>
+  ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+
+/** lark-cli 单次调用超时（`normalizeLarkError` 的 killed 分支）的固定文案前缀——code 为空，classifyLarkFailure 认不出 */
+const LARK_CLI_TIMEOUT_RE = /^lark-cli 超时（\d+ms）/;
+
+/**
+ * 终稿这一发失败值不值得原样重发：限流（rate_limit）/ 瞬时（transient：5xx、断网、200810 等）/ lark-cli 超时。
+ * 分类沿用 `classifyLarkFailure`（单一来源）。业务拒绝（gone / auth）、内容超限（too_long，走收紧）、
+ * 序号冲突（走抬序号自愈）、流式被关、认不出的 unknown 一律不在这里重试——重发多少次都是同一个结果，
+ * 或者另有专门的自愈路径。超时在分类器里是 unknown，所以单独按固定文案认。
+ */
+const isRetryableFinalFailure = (err: unknown): boolean => {
+  const kind = classifyLarkFailure(err);
+  if (kind === "rate_limit" || kind === "transient") return true;
+  return (
+    kind === "unknown" &&
+    err instanceof LarkApiError &&
+    LARK_CLI_TIMEOUT_RE.test(err.message)
+  );
+};
 /** 流式模式被飞书关掉（200850 超时自动关 / 300309）后：一张卡最多重新打开几次、两次重开最少间隔 */
 const STREAM_REOPEN_MAX = 8;
 const STREAM_REOPEN_MIN_GAP_MS = 30_000;
@@ -94,6 +153,14 @@ const ELEMENT_FOOTER = "md_footer";
 const ELEMENT_QUOTE = "md_quote";
 /** Hermes 同款正文 / timeline / footer 之间的分割线 */
 const ELEMENT_DIVIDER = "main_divider";
+
+/**
+ * 计时（终稿预算 / 熔断窗口 / 重开间隔）用单调时钟：休眠唤醒 / NTP 校时会让墙钟（Date.now）整段跳变——
+ * 向前跳，终稿预算「瞬间耗尽」、不再重试终稿 PUT；向后跳，熔断窗口被拉长、半开探测迟迟不放行。
+ * performance.now() 不受影响。⚠️ 只用于「相对时长」；写进卡片 / 事件的时间戳（createdAt）与展示用的
+ * 转圈帧仍是墙钟 Date.now()，与预算无关。
+ */
+const monoNow = (): number => performance.now();
 
 /** Hermes footer 旋转 spinner 帧（流式期间） */
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -493,7 +560,7 @@ export const createCardStream = (
   /** 连续失败次数；任一次成功清零 */
   let consecutiveFails = 0;
   /**
-   * 熔断打开到何时（ms 时间戳），0 = 关。到期即「半开」：放行一次探测——
+   * 熔断打开到何时（monoNow() 单调时钟的 ms 时刻，不是墙钟），0 = 关。到期即「半开」：放行一次探测——
    * 失败立刻再跳闸（退避翻倍），成功则全部清零。
    */
   let breakerOpenUntil = 0;
@@ -522,7 +589,7 @@ export const createCardStream = (
   let seqHealsLeft = SEQ_HEALS_PER_EPISODE;
   /** 流式重开：已重开次数 / 上次重开时间 / 是否已有一个重开 op 在排 */
   let streamReopens = 0;
-  let lastReopenAt = 0;
+  let lastReopenAt = Number.NEGATIVE_INFINITY; // 单调时钟，没重开过 = -∞（别用 0：假时钟 / 刚启动时 monoNow() 可能就是 0）
   let reopenQueued = false;
   /** finalize 已经在执行（致命故障在这时才发现，不再单独通知——outbound 的终态 info 会说） */
   let finalizing = false;
@@ -589,7 +656,7 @@ export const createCardStream = (
 
   /** 熔断是否打开（到期即「半开」：此时返回 false，放行一次探测）；致命故障 = 一直打开、永不半开 */
   const isBreakerOpen = (): boolean =>
-    fatalKind !== undefined || breakerOpenUntil > Date.now();
+    fatalKind !== undefined || breakerOpenUntil > monoNow();
 
   const clearFlushTimer = (): void => {
     if (flushTimer !== null) {
@@ -628,7 +695,7 @@ export const createCardStream = (
    */
   const armBreakerProbe = (): void => {
     clearFlushTimer();
-    const wait = Math.max(FLUSH_INTERVAL_MS, breakerOpenUntil - Date.now());
+    const wait = Math.max(FLUSH_INTERVAL_MS, breakerOpenUntil - monoNow());
     flushTimer = scheduleTimer(() => {
       flushTimer = null;
       if (finalized) return;
@@ -700,13 +767,13 @@ export const createCardStream = (
     if (!cardId || finalized || finalizing) return false;
     if (reopenQueued) return true;
     if (streamReopens >= STREAM_REOPEN_MAX) return false;
-    if (lastReopenAt > 0 && Date.now() - lastReopenAt < STREAM_REOPEN_MIN_GAP_MS) return false;
+    if (monoNow() - lastReopenAt < STREAM_REOPEN_MIN_GAP_MS) return false;
     reopenQueued = true;
     void enqueueCardOp(async () => {
       reopenQueued = false;
       if (finalized || finalizing || !cardId) return;
       streamReopens += 1;
-      lastReopenAt = Date.now();
+      lastReopenAt = monoNow();
       try {
         await patchCardSettings(
           cardId,
@@ -766,7 +833,7 @@ export const createCardStream = (
       BREAKER_BACKOFF_BASE_MS * 2 ** (breakerTrips - 1),
       BREAKER_BACKOFF_MAX_MS,
     );
-    breakerOpenUntil = Date.now() + retryInMs;
+    breakerOpenUntil = monoNow() + retryInMs;
     breakerEverOpened = true;
     // 持续性故障才对外通知：首次探测仍失败 = 第 2 次跳闸（小抖动探测就恢复，不打扰用户）。
     // 通知前就进 finalize 的卡不会有这条——outbound 在终态另写一条 info，信号不丢
@@ -911,6 +978,17 @@ export const createCardStream = (
     );
   };
 
+  /** 只做全量 PUT 实体（不含思考区 batch 回写）。终稿路径要把「PUT 落成」和「batch 回写」拆开记账 */
+  const putEntityOnly = async (
+    timeoutMs: number = CARD_OP_TIMEOUT_MS,
+  ): Promise<void> => {
+    if (!cardId) return;
+    syncFlushedFromDesired();
+    await updateCardEntity(cardId, rebuildCardJson(true), nextSeq(), {
+      timeoutMs,
+    });
+  };
+
   /**
    * 全量 PUT 实体后，再用 batch 回写思考区。
    * 真机：CardKit 全量 PUT 在 streaming_mode 下可能丢 collapsible_panel 嵌套 content，
@@ -919,12 +997,8 @@ export const createCardStream = (
   const putEntityThenReassertProcess = async (
     timeoutMs: number = CARD_OP_TIMEOUT_MS,
   ): Promise<void> => {
-    if (!cardId) return;
-    syncFlushedFromDesired();
-    await updateCardEntity(cardId, rebuildCardJson(true), nextSeq(), {
-      timeoutMs,
-    });
-    if (processFlushed) {
+    await putEntityOnly(timeoutMs);
+    if (cardId && processFlushed) {
       await batchPutProcess(processFlushed, timeoutMs);
     }
   };
@@ -1119,12 +1193,6 @@ export const createCardStream = (
       messageId = sent.message_id;
       started = true;
       startFailed = false;
-      await rememberCardMessage({
-        messageId,
-        cardId,
-        taskId,
-        createdAt: Date.now(),
-      });
     } catch (err) {
       // start 失败：标记 started=false，后续 push 空操作；finalize 据 startFailed 记「没同步」
       started = false;
@@ -1132,6 +1200,20 @@ export const createCardStream = (
       cardId = undefined;
       messageId = undefined;
       recordFailure("start", err);
+      return;
+    }
+    // 卡已建已发（用户飞书里已经有这张卡）——本地登记（card-map，供「回复卡片」锚定）单独兜：
+    // 它失败只丢锚定能力，绝不能回滚成 started=false / 清 ids（旧实现与建卡、发卡共用一个 try：
+    // 登记抛错 → 后续一帧都不再推、终稿还判「没同步」再把全文文字补发一遍，而用户那张卡其实早就发出去了）
+    try {
+      await rememberCardMessage({
+        messageId: messageId!,
+        cardId: cardId!,
+        taskId,
+        createdAt: Date.now(),
+      });
+    } catch (err) {
+      warnFail("rememberCardMessage(start)", err);
     }
   };
 
@@ -1321,25 +1403,59 @@ export const createCardStream = (
     }
   };
 
+  /** 终稿总预算的截止时刻（finalize 在链上开始终稿那一刻定，见 beginFinalBudget） */
+  let finalDeadline = Infinity;
+  const beginFinalBudget = (): void => {
+    finalDeadline = monoNow() + finalTotalBudgetMs;
+  };
+  /** 终稿阶段「一发」的超时：封顶 15s，预算快用完就压到剩余额度，但至少留一发能跑完的最短时间 */
+  const finalStepTimeout = (): number =>
+    Math.min(
+      CARD_FINALIZE_TIMEOUT_MS,
+      Math.max(finalDeadline - monoNow(), FINAL_MIN_ATTEMPT_MS),
+    );
+
   /**
    * 终稿这一发的就地自愈（失败是「被拒绝」而不是写了一半，重发没有副作用）：
    * ① 序号冲突（300317）→ 抬高该卡序号重发一次；
    * ② 内容超限（`too_long`：卡片体积 / Windows 命令行）→ 终稿收紧一档（正文预算 10k → 5k → 2.5k 字）整包重发。
-   * 其它错误 / 档位用完 → 原样抛给调用方记账。`fn` 必须每次都从头重算要发的内容（收紧靠 canonical* 读 shrinkLevel）。
+   * ③ 瞬时失败（限流 / 5xx / lark-cli 超时，见 `isRetryableFinalFailure`）→ 退避后原样重发，最多 2 次
+   *    （间隔见 FINAL_RETRY_DELAYS_MS）。终稿是最后一发、没有下一帧来补，一次失败就让卡片永远停在中间态不可取。
+   *    例外：熔断在 finalize 开始时就已打开 = 飞书这边已知不通，lark-cli 超时（黑洞）不再重试——
+   *    再等 2 个「退避 + 15s 超时」只是把用户的文字补发推迟半分钟；限流 / 5xx 这类「服务端明确在回话」的仍重试。
+   * 所有重发（含 ①②）合计受总预算约束（FINAL_TOTAL_BUDGET_MS ≈ 40s，每发超时取 min(15s, 剩余额度)，
+   * 剩余不够一发就不再起新的一发）。
+   * 其它错误 / 档位用完 / 重试用尽 / 预算用尽 → 原样抛给调用方记账（finalizeOk=false，outbound 会把正文以文字补发）。
+   *
+   * ⚠️ `fn` 只能包「终稿落成」那一发（整卡 PUT / 建卡）：这里的「成功」被调用方当成「内容已送达」，
+   * 其后的收尾（思考区 batch 回写、关 streaming_mode）失败不能让整段回头重来、更不能判「没同步」。
+   * `fn` 必须每次都从头重算要发的内容（收紧靠 canonical* 读 shrinkLevel）、自己取新序号（nextSeq），
+   * 并把收到的 `timeoutMs` 用在这一发上。
    */
-  const putFinal = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const putFinal = async <T>(
+    fn: (timeoutMs: number) => Promise<T>,
+  ): Promise<T> => {
+    const breakerWasOpen = isBreakerOpen();
     let healed = false;
+    let retries = 0;
+    /** 预算里还够再起一发（含先睡 delay 毫秒） */
+    const canAttemptAfter = (delay: number): boolean =>
+      finalDeadline - monoNow() - delay >= FINAL_MIN_ATTEMPT_MS;
     for (;;) {
       try {
-        return await fn();
+        return await fn(finalStepTimeout());
       } catch (err) {
         const kind = classifyLarkFailure(err);
-        if (kind === "seq_conflict" && cardId && !healed) {
+        if (kind === "seq_conflict" && cardId && !healed && canAttemptAfter(0)) {
           healed = true;
           bumpCardSequence(cardId);
           continue;
         }
-        if (kind === "too_long" && shrinkLevel < SHRINK_ANSWER_BUDGETS.length - 1) {
+        if (
+          kind === "too_long" &&
+          shrinkLevel < SHRINK_ANSWER_BUDGETS.length - 1 &&
+          canAttemptAfter(0)
+        ) {
           shrinkLevel += 1;
           console.warn(
             `[feishu-bridge/card-stream] 终稿超出飞书卡片上限，正文收紧到 ${SHRINK_ANSWER_BUDGETS[shrinkLevel]} 字重发：`,
@@ -1347,8 +1463,51 @@ export const createCardStream = (
           );
           continue;
         }
+        // lark-cli 单次超时（分类器里是 unknown，按固定文案认）= 黑洞，而不是服务端回了话
+        const timedOut = err instanceof LarkApiError && LARK_CLI_TIMEOUT_RE.test(err.message);
+        if (
+          retries < finalRetryDelaysMs.length &&
+          isRetryableFinalFailure(err) &&
+          !(breakerWasOpen && timedOut) &&
+          canAttemptAfter(finalRetryDelaysMs[retries]!)
+        ) {
+          const delay = finalRetryDelaysMs[retries]!;
+          retries += 1;
+          console.warn(
+            `[feishu-bridge/card-stream] 终稿遇到瞬时失败，${delay}ms 后重发（第 ${retries}/${finalRetryDelaysMs.length} 次重试）：`,
+            failureSummary(err),
+          );
+          await sleepMs(delay);
+          continue;
+        }
         throw err;
       }
+    }
+  };
+
+  /**
+   * 终稿用尽仍没落成后，best-effort 把 streaming_mode 关掉一次：否则卡片在飞书侧一直挂着「生成中」直到
+   * 飞书自己超时（最长约 10 分钟），而文字补发早就把完整回复发出去了，用户看到的是两条互相矛盾的信息。
+   * 失败一律吞掉（只打日志、不记账、不进熔断、不覆盖 lastError）——它是锦上添花，不能再给终稿失败添新故障。
+   * 不发的情形：卡没了 / 没权限（关也是白等）、流式已被飞书关掉（不用再关）、熔断开着（飞书整体不通，不再多押一发）。
+   */
+  const closeStreamingBestEffort = async (cause: unknown): Promise<void> => {
+    if (!cardId) return;
+    const kind = classifyLarkFailure(cause);
+    if (kind === "gone" || kind === "auth" || kind === "stream_closed") return;
+    if (isBreakerOpen()) return;
+    try {
+      await patchCardSettings(
+        cardId,
+        { config: { streaming_mode: false, update_multi: true } },
+        nextSeq(),
+        { timeoutMs: finalStepTimeout() },
+      );
+    } catch (closeErr) {
+      console.warn(
+        "[feishu-bridge/card-stream] 终稿失败后 best-effort 关流式也失败（已忽略）:",
+        failureSummary(closeErr),
+      );
     }
   };
 
@@ -1381,25 +1540,38 @@ export const createCardStream = (
       // —— 非流式：一次性建普通卡（引用+思考+正文+ask/retry+footer）——
       if (!streamingEnabled) {
         try {
-          const created = await putFinal(async () => {
+          beginFinalBudget();
+          const created = await putFinal(async (timeoutMs) => {
             answerDesired = closeUnclosedCodeFence(canonicalAnswer());
             processDesired = closeUnclosedCodeFence(canonicalProcess());
             syncFlushedFromDesired();
-            return createCardEntity(rebuildCardJson(false));
+            return createCardEntity(rebuildCardJson(false), { timeoutMs });
           });
           cardId = created.card_id;
           const openId = await resolveOpenId();
-          const sent = await sendCardMessage(openId, cardId);
+          // 「不确定送达」的取舍（有意为之）：发卡这一步超时 / 报错时，分不清「消息没发出」与
+          // 「发出了、只是回包丢了」，且不能重发（重发可能让用户收到两张卡）。这里一律按「没送达」处理——
+          // 抛出 → finalizeOk=false → outbound 把正文以文字补发。代价：极少数「其实已送达」的会多收一份文字版；
+          // 换来的是「宁可重复、也不让用户看不到结果」。对照流式终稿：整卡 PUT **已知成功**就绝不补发（见下），
+          // 「已知落成」才免补发，「不确定」不免。
+          const sent = await sendCardMessage(openId, cardId, {
+            timeoutMs: finalStepTimeout(),
+          });
           messageId = sent.message_id;
           // 卡片消息已发出——用户已经能看到完整内容；下面的本地登记失败不算「没同步」
           finalizeOk = true;
           recordSuccess();
-          await rememberCardMessage({
-            messageId,
-            cardId,
-            taskId,
-            createdAt: Date.now(),
-          });
+          // 登记 / 索引 / 盘水位各自兜底：任何一项失败都不能挡住后面几项
+          try {
+            await rememberCardMessage({
+              messageId,
+              cardId,
+              taskId,
+              createdAt: Date.now(),
+            });
+          } catch (err) {
+            warnFail("rememberCardMessage(finalize)", err);
+          }
           // 非流式：ask 元素在 append 时还没卡可记、建完卡在这里补上索引
           await rememberAskCardRef();
           // 非流式从未开 streaming_mode，无需 patch 关流；仍刷 seq 盘水位（card-action 可能后续 patch）
@@ -1423,30 +1595,44 @@ export const createCardStream = (
       await doFlush();
 
       try {
-        // footer + header 全量 PUT + batch 回写思考区（纯思考轮 P0：防嵌套 content 被抹）。
-        // 序号冲突 / 内容超限在 putFinal 里就地自愈（每次重试都从头重算要发的内容）
-        await putFinal(async () => {
+        // footer + header 全量 PUT。序号冲突 / 内容超限 / 瞬时失败在 putFinal 里就地自愈
+        //（每次重试都从头重算要发的内容；总时间受 FINAL_TOTAL_BUDGET_MS 约束）。
+        // putFinal 只包这一发 PUT：它成功 = 终稿已落到卡片，思考区 batch 回写不在里面——
+        // 否则 batch 失败会让整卡 PUT 回头重发、最终判 finalizeOk=false，把已经送达的正文再以文字补发一遍
+        beginFinalBudget();
+        await putFinal(async (timeoutMs) => {
           // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）
           // 先写回 desired，再 sync——保证 finalize 全量 PUT / batch 回写同源
           answerDesired = closeUnclosedCodeFence(canonicalAnswer());
           processDesired = closeUnclosedCodeFence(canonicalProcess());
           syncFlushedFromDesired();
-          await putEntityThenReassertProcess(CARD_FINALIZE_TIMEOUT_MS);
+          await putEntityOnly(timeoutMs);
         });
         // 终稿内容已落到卡片。熔断中走到这里也是照发的（强试一次）——成功就是恢复的最好证据
         finalizeOk = true;
         recordSuccess();
+        // batch 回写思考区（纯思考轮 P0：全量 PUT 可能丢嵌套 content，batch 是嵌套区唯一可靠通道）：
+        // 失败只 warn——正文已完整送达，最坏是思考区不全；不改 finalizeOk、不阻止下面关流式
+        if (processFlushed) {
+          try {
+            await batchPutProcess(processFlushed, finalStepTimeout());
+          } catch (err) {
+            warnFail("finalize(reassert process)", err);
+          }
+        }
         // 关 streaming_mode：失败只意味着卡片在飞书侧继续显示「生成中」直到自动结束，内容已完整，不改 finalizeOk
         await patchCardSettings(
           cardId,
           { config: { streaming_mode: false, update_multi: true } },
           nextSeq(),
-          { timeoutMs: CARD_FINALIZE_TIMEOUT_MS },
+          { timeoutMs: finalStepTimeout() },
         );
         // R1-3：finalize 后立即刷 seq，避免进程随后退出丢高水位
         await flushCardSeqToDisk();
       } catch (err) {
         noteFinalizeFailure("finalize", err);
+        // 终稿没落成：卡片还挂在 streaming_mode，best-effort 关一次（失败吞掉）
+        if (finalizeOk !== true) await closeStreamingBestEffort(err);
       } finally {
         finalized = true;
         headerDirty = false;

@@ -229,8 +229,14 @@ const TaskDetailPage = () => {
   }, []);
   // 运行中 shell 的直播输出（callId → 尾部 20 行，ephemeral、不进 task.events）；与 ChatView 共用同一个 hook。
   // 只当 prop 传给 EventStream，别拿它喂要扫全量 events 的 memo（HANDOFF「别进 activeStatus memo」）
-  const { liveToolOutputs, absorbLiveToolOutputEvent, clearLiveToolOutputs } =
-    useLiveToolOutputs();
+  // applyToolOutputSnapshot：每次（重）连接 bootstrap 的「进行中 shell 输出」快照（整份替换），切走再切回 /
+  // 重连后工具块不再是空的
+  const {
+    liveToolOutputs,
+    absorbLiveToolOutputEvent,
+    clearLiveToolOutputs,
+    applyToolOutputSnapshot,
+  } = useLiveToolOutputs();
   // 旁路（需求群受限答疑）run 在不在飞：不再进页面状态（第四轮 Q5-01）——它的过程事件整条被
   // isHiddenFromEventStream 藏进「群问答」tab，主流里没有旁路工具块要画；并进「运行中」只会让组尾冒出
   // 「处理中…」转圈。SSE 的 restricted_run 帧仍会发，只是页面不消费。
@@ -584,11 +590,14 @@ const TaskDetailPage = () => {
         // 它的回答落盘不该把属主正在吐的字清掉（D9-01）
         // bootstrap 回放的历史尾部（meta.replay）同样不清——由紧随其后的 assistant_snapshot 对齐（见 shouldClearStreamingOnEvent）
         if (shouldClearStreamingOnEvent(ev, meta)) clearStreaming();
-        setTask((prev) => {
-          if (!prev) return prev;
-          if (prev.events.some((e) => e.id === ev.id)) return prev;
-          return { ...prev, events: [...prev.events, ev] };
-        });
+        // 与 chat 路径（下方 ChatView 的 onEventAppend）同一套追加语义：按 id 去重 + 回放里比本地窗口首条还早的事件丢弃
+        // （不接到末尾乱序）+ 回退标记事件先截断被删的后半段、本地窗口对不齐时完整重拉。
+        // 原先这里是裸追加：别的窗口回退使日志变短后重连，bootstrap 回放比本地更早的尾部会被接到末尾、时间序错乱
+        const cur = taskRef.current;
+        if (cur && rewindNeedsResync(cur, ev)) void resyncEvents();
+        setTask((prev) =>
+          prev ? appendTaskEvent(prev, ev, { replay: meta?.replay === true }) : prev,
+        );
       },
       onTaskUpdate: absorbTask,
       onActionUpdate: (action) => {
@@ -625,6 +634,7 @@ const TaskDetailPage = () => {
       },
       onAssistantDelta: pushDelta,
       onAssistantSnapshot: applyAssistantSnapshot,
+      onToolOutputSnapshot: applyToolOutputSnapshot,
       onTalkQueue: setTalkQueue,
       // 与现值相同（bootstrap 补发 vs 实时帧常常同一份）就不 setState，省一次整页重渲染
       onStorageDegraded: (state) =>

@@ -19,15 +19,18 @@
  *     真正防外发的是服务端侧的可信 host 绑定（trusted-git-host.ts），它只管 server 自己发的请求。
  *   - process.env 是进程级全局：所有 task / chat 共用同一个值（本来就是同一个 settings.gitToken）。
  *     子进程（lark-cli、meegle…）若原样继承 env 也会看到它（MCP stdio 走 SDK 默认的白名单 env、不继承）。
- *   - **无身份会话也看得到它（N3-01）**：需求群的「非属主答疑旁路」（restricted-question.ts）是工具全开的
- *     honor-system agent（不传 callerToken），群里任何能 @ 机器人的人让它 `printenv` 就能拿到 PAT。
+ *   - **无身份会话也看得到它（N3-01）**：需求群的「非属主答疑旁路」（restricted-question.ts）是无身份会话（不传 callerToken）。
+ *     它现在只有 read / grep(/ glob) 只读白名单、没有 shell 工具，所以 `printenv` 这条路目前走不通；
+ *     下面这些是纵深防御——**哪天给受限 agent 放开 shell，群里任何能 @ 机器人的人让它 `printenv` 就能拿到 PAT**。
+ *     （N3-01 当时旁路还是工具全开的 honor-system agent，下面按 provider 的收口分析是按那个形态写的、放开 shell 时仍适用。）
  *     收口情况按 provider 不同：
  *       - pi provider：旁路显式传 `omitGitToken: true`（agent-backend → custom-agent-backend → pi-coding-tools），
  *         shell 工具与 `task` 子代理的 bash 都用摘掉本变量的 env（见 stripGitTokenEnv）——
  *         **只摘环境变量、不阻止读文件**：pi 的 `read` / shell 照样能读 config.json 里的 gitToken（M1-02）；
  *       - **Cursor provider：摘不掉**——本地 agent 的 shell 由 SDK 拉起、原样继承 server 的 process.env，
  *         SDK（1.0.37）没有给本地 agent 的 env 选项；而 process.env 是进程全局，临时删它会把属主并行会话也弄坏。
- *         所以 Cursor 路径的无身份旁路**会继承这个变量**、`printenv` 仍能拿到 PAT——这条无身份通道沿用上面的局限。
+ *         所以 Cursor 路径的无身份旁路**会继承这个变量**（若它有 shell，`printenv` 就能拿到 PAT；现在受限 agent 没有 shell，
+ *         但 Cursor 的 `read` 没有路径约束、照样能读 config.json 里的 gitToken）——这条无身份通道沿用上面的局限。
  *         **已拍板不采用 `disallowedTools` / `local.customTools` 换掉内置 shell**：理由是 Cursor 的 `read`
  *         同样能读 config.json，换 shell 并没有形成真边界；而替换内置 shell 会影响工具块展示、有回归风险，得不偿失。
  *     旁路本来就能读 config.json（含 PAT / apiKey / 公司环境密码）、~/.ssh 等属主 OS 用户能读的一切——
