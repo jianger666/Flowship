@@ -244,7 +244,8 @@ describe("task(log) 与 chat 对话外观统一", () => {
     // 不许再有 log 专属的第二套 assistant / user 渲染：EventRow 里的 MarkdownText 只有两处，
     // 都在这段共用分支里——AI 回复正文（text={ev.text}）、飞书群机器人的用户气泡（text={displayText}，chat / log 同一处）
     expect(countOf(eventRow, "<MarkdownText")).toBe(2);
-    expect(countOf(eventRow, "<MarkdownText\n          size={isLog")).toBe(1);
+    // （正文外面包了一层 MediaMessageScope——音视频对比组 + 媒体条——所以缩进比原来深一层）
+    expect(countOf(eventRow, "<MarkdownText\n            size={isLog")).toBe(1);
     expect(countOf(eventRow, "<MarkdownText text={displayText}")).toBe(1);
   });
 

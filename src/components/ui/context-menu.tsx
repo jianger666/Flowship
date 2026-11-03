@@ -11,10 +11,14 @@ const ContextMenuTrigger = ContextMenuPrimitive.Trigger;
 
 const ContextMenuContent = ({
   className,
+  positionerClassName,
   ...props
-}: ContextMenuPrimitive.Popup.Props) => (
+}: ContextMenuPrimitive.Popup.Props & {
+  /** 定位层的 class：默认 z-50；从更高层（如 z-200 的图片灯箱）里弹菜单时用它把层级抬上去 */
+  positionerClassName?: string;
+}) => (
   <ContextMenuPrimitive.Portal>
-    <ContextMenuPrimitive.Positioner className="isolate z-50">
+    <ContextMenuPrimitive.Positioner className={cn("isolate z-50", positionerClassName)}>
       <ContextMenuPrimitive.Popup
         data-slot="context-menu-content"
         className={cn(

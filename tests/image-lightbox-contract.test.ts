@@ -7,6 +7,7 @@
  *    灯箱根不显式 no-drag 的话，顶部那一条点了只会拖窗口。
  *  ③ 打开后焦点留在触发它的缩略图上（被遮住的页面里），键盘 / 读屏用户按 Tab 会乱跳，关闭后焦点也丢了。
  *  ④ markdown 里的图是 `<img onClick>`——键盘 Tab 不到、读屏也不报「可点」，灯箱对只用键盘的人整个不可达。
+ *  ⑤ 大图右键「复制图片」：菜单弹层在 portal 里，层级要高过灯箱（z-200）、点菜单不能冒泡把灯箱关掉。
  *
  * 本仓没有 jsdom：结构用 `renderToStaticMarkup` 看真实输出，焦点逻辑用 `helpers/react-hook-stub` 的槽位桩
  * 让 effect / cleanup 真跑，系统按钮条的高度直接从 `electron-app/main.js` 里读（改了那边，这边自动跟着红）。
@@ -25,10 +26,21 @@ import {
   MarkdownImage,
   type PreviewImage,
 } from "@/components/ui/image-preview";
+import {
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import { copyImageToClipboard } from "@/lib/copy-image";
+import { toast } from "sonner";
 
 import { createHookHarness, type HookHarness } from "./helpers/react-hook-stub";
 import { mainSrc } from "./helpers/main-slice";
 import { markRemoteImageLoaded, resetRemoteImageLoadedForTests } from "@/lib/remote-image-gate";
+
+// 右键「复制图片」的真正落地（canvas / 剪贴板）在 tests/copy-image.test.ts 里测；这里只看灯箱怎么接线
+vi.mock("@/lib/copy-image", () => ({ copyImageToClipboard: vi.fn() }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 type LightboxProps = ComponentProps<typeof ImageLightbox>;
 
@@ -416,5 +428,74 @@ describe("源码契约：渲染结果里看不到的接线（Q19-02）", () => {
     expect(at).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(at);
     expect(IMAGE_PREVIEW_SRC.slice(at, end)).toMatch(/\{state && \(\s*<ImageLightbox\b/);
+  });
+});
+
+// ---------------------------------------------------------------------- ⑤ 右键复制图片
+
+describe("大图右键「复制图片」（Q19-02 ⑤）", () => {
+  const setupMenu = (over: Partial<LightboxProps> = {}) => {
+    vi.stubGlobal("document", { activeElement: null });
+    const h = createHookHarness();
+    const root = h.render(() => ImageLightbox(lightboxProps(over)));
+    if (!root) throw new Error("灯箱没渲染出来");
+    const els = flatten(root);
+    const find = (type: unknown): El => {
+      const el = els.find((e) => e.type === type);
+      if (!el) throw new Error("元素树里没找到目标组件");
+      return el;
+    };
+    return { els, trigger: find(ContextMenuTrigger), content: find(ContextMenuContent), item: find(ContextMenuItem) };
+  };
+
+  it("大图（<img>）包在右键触发区里；菜单只有一项「复制图片」", () => {
+    const { trigger, item } = setupMenu();
+    const inside = flatten(trigger.props.children);
+    expect(inside.some((e) => e.type === "img")).toBe(true);
+    expect(flatten(item.props.children).some((e) => typeof e.type !== "string")).toBe(true); // 图标
+    expect(JSON.stringify(item.props.children)).toContain("复制图片");
+  });
+
+  it("菜单层级高过灯箱根（否则弹出来被盖在灯箱底下）", () => {
+    const { content } = setupMenu();
+    const rootCls = /class="([^"]*)"/.exec(rootTag(lightboxHtml()))?.[1] ?? "";
+    const rootZ = Number(/(?:^|\s)z-(\d+)(?:\s|$)/.exec(rootCls)?.[1]);
+    const menuZ = Number(/(?:^|\s)z-(\d+)(?:\s|$)/.exec(String(content.props.positionerClassName))?.[1]);
+    expect(rootZ).toBeGreaterThan(0);
+    expect(menuZ).toBeGreaterThan(rootZ);
+  });
+
+  it("点菜单拦住冒泡（portal 里的点击仍会沿 React 树冒泡到灯箱根、把灯箱关掉）", () => {
+    const { content } = setupMenu();
+    const e = { stopPropagation: vi.fn() };
+    (content.props.onClick as (ev: unknown) => void)(e);
+    expect(e.stopPropagation).toHaveBeenCalledTimes(1);
+  });
+
+  it("点「复制图片」：复制的是当前这一张（切到第二张就是第二张），成功后提示", async () => {
+    vi.mocked(copyImageToClipboard).mockReset().mockResolvedValue(undefined);
+    vi.mocked(toast.success).mockClear();
+    const { item } = setupMenu({ index: 1 });
+    (item.props.onClick as () => void)();
+    expect(copyImageToClipboard).toHaveBeenCalledTimes(1);
+    expect(copyImageToClipboard).toHaveBeenCalledWith("/b.png");
+    await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("已复制图片"));
+  });
+
+  it("复制失败：把原因（lib 抛的中文文案）原样提示给用户，不静默", async () => {
+    vi.mocked(copyImageToClipboard).mockReset().mockRejectedValue(new Error("这张图来自外部站点，浏览器不允许复制"));
+    vi.mocked(toast.error).mockClear();
+    const { item } = setupMenu();
+    (item.props.onClick as () => void)();
+    await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith("这张图来自外部站点，浏览器不允许复制"));
+    expect(copyImageToClipboard).toHaveBeenCalledWith("/a.png");
+  });
+
+  it("抛的不是 Error 时用兜底文案", async () => {
+    vi.mocked(copyImageToClipboard).mockReset().mockRejectedValue("boom");
+    vi.mocked(toast.error).mockClear();
+    const { item } = setupMenu();
+    (item.props.onClick as () => void)();
+    await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith("复制图片失败"));
   });
 });

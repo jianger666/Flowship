@@ -47,6 +47,7 @@ import {
   resolveStreamdownMode,
 } from "@/lib/streamdown-options";
 import { MarkdownLink } from "@/components/markdown-link";
+import { MediaPathChip } from "@/components/media/media-path-chip";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { Tooltip } from "@/components/ui/tooltip";
 import {
@@ -62,6 +63,7 @@ import {
   pathDisplayLabel,
 } from "@/lib/path-utils";
 import { wrapLocalMarkdownImageDestinations } from "@/lib/local-image-src";
+import { parseMediaRefToken, resolveMediaRef } from "@/lib/media/media-ref";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
@@ -203,6 +205,19 @@ const buildMarkdownComponents = (
       [key: string]: unknown;
     }) => {
       const text = String(children ?? "");
+      // 音视频引用（含 `#t=12.4,15` 时间片段）必须最先判：后面的 parsePathSegments 会把 `#t=…` 里的冒号 / 数字误读成行号
+      const mediaRef = parseMediaRefToken(text);
+      const mediaResolved = mediaRef ? resolveMediaRef(mediaRef, linker.baseDir) : null;
+      if (mediaResolved) {
+        return (
+          <MediaPathChip
+            absolute={mediaResolved.absolute}
+            start={mediaResolved.start}
+            end={mediaResolved.end}
+            className={PATH_CODE_SIZE[size]}
+          />
+        );
+      }
       const caption = parseCodeRefCaption(text);
       const pathText = caption?.path ?? text;
       const line = caption?.line;

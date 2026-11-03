@@ -19,6 +19,12 @@ describe("detectLocalFileKind", () => {
     expect(detectLocalFileKind("sheet.xlsx")).toBe("xlsx");
     expect(detectLocalFileKind("deck.pptx")).toBe("pptx");
     expect(detectLocalFileKind("app.exe")).toBe("binary");
+    expect(detectLocalFileKind("/a/preview_720p.mp4")).toBe("video");
+    expect(detectLocalFileKind("clip.MOV")).toBe("video");
+    expect(detectLocalFileKind("/a/b/take 1.wav")).toBe("audio");
+    expect(detectLocalFileKind("mp3")).toBe("audio");
+    // ts 是 TypeScript 源码、不是 MPEG-TS 视频
+    expect(detectLocalFileKind("a.ts")).toBe("code");
     expect(detectLocalFileKind("noext")).toBe("unknown");
   });
 });
@@ -49,6 +55,12 @@ describe("resolveLocalFileOpenTarget", () => {
     expect(resolveLocalFileOpenTarget("/tmp/screenshot.png")).toBe("preview");
     expect(resolveLocalFileOpenTarget("/tmp/report.pdf")).toBe("preview");
   });
+
+  it("音视频进全局播放器（带行号后缀也一样）", () => {
+    expect(resolveLocalFileOpenTarget("/tmp/preview_720p.mp4")).toBe("media");
+    expect(resolveLocalFileOpenTarget("/tmp/bpm-160.mp3")).toBe("media");
+    expect(resolveLocalFileOpenTarget("/tmp/bpm-160.mp3", 3)).toBe("media");
+  });
 });
 
 describe("canOpenInIde / canPreviewInSheet", () => {
@@ -62,6 +74,9 @@ describe("canOpenInIde / canPreviewInSheet", () => {
   it("Sheet 可预览类型", () => {
     expect(canPreviewInSheet("docx")).toBe(true);
     expect(canPreviewInSheet("pptx")).toBe(false);
+    // 音视频不进 Sheet 预览（走播放器悬浮窗）
+    expect(canPreviewInSheet("video")).toBe(false);
+    expect(canPreviewInSheet("audio")).toBe(false);
   });
 });
 

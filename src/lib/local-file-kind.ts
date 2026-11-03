@@ -5,7 +5,9 @@
  * 分类规则，散着写「md 能不能在 IDE 开」必漂移。
  */
 
-/** 预览 Sheet 里怎么渲染 */
+import { detectMediaKind } from "@/lib/media/media-kind";
+
+/** 预览 Sheet 里怎么渲染（音视频不进 Sheet：走全局播放器悬浮窗，见 media-player-dock） */
 export type LocalFileKind =
   | "markdown"
   | "code"
@@ -15,6 +17,8 @@ export type LocalFileKind =
   | "docx"
   | "xlsx"
   | "pptx"
+  | "video"
+  | "audio"
   | "binary"
   | "unknown";
 
@@ -73,6 +77,8 @@ export const detectLocalFileKind = (pathOrExt: string): LocalFileKind => {
     .replace(/^\./, "");
   if (!ext) return "unknown";
   if (ext === "md") return "markdown";
+  const media = detectMediaKind(ext);
+  if (media) return media;
   if (IMAGE_EXT.has(ext)) return "image";
   if (ext === "pdf") return "pdf";
   if (ext === "docx") return "docx";
@@ -111,12 +117,13 @@ export const shouldOpenLocalFileInBrowser = (absolutePath: string): boolean => {
   return p.endsWith(".html") || p.endsWith(".htm");
 };
 
-export type LocalFileOpenTarget = "browser" | "ide" | "preview";
+export type LocalFileOpenTarget = "browser" | "ide" | "preview" | "media";
 
 /**
  * 本地文件链接的主动作：
  * - HTML 无行号是可运行产物，去浏览器看渲染结果；
  * - HTML 有行号及其他代码文件是源码导航，去用户配置的 IDE；
+ * - 音视频进全局播放器悬浮窗；
  * - 文档、图片等留在 Flowship 预览。
  */
 export const resolveLocalFileOpenTarget = (
@@ -126,9 +133,9 @@ export const resolveLocalFileOpenTarget = (
   if (shouldOpenLocalFileInBrowser(absolutePath) && line == null) {
     return "browser";
   }
-  if (detectLocalFileKind(absolutePath) === "code") {
-    return "ide";
-  }
+  const kind = detectLocalFileKind(absolutePath);
+  if (kind === "video" || kind === "audio") return "media";
+  if (kind === "code") return "ide";
   return "preview";
 };
 

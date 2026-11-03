@@ -9,20 +9,38 @@
  *   setWindowOpenHandler 拦下转系统默认浏览器）
  * - 本地绝对路径且是**图片**（v1.0、AI 生成二维码 / 图表场景）→ 可点、
  *   站内 lightbox 预览（走 /api/local-image 通道）
+ * - 本地绝对路径且是**音视频**（可带 `#t=12.4,15` 时间片段）→ 可点、进全局播放器悬浮窗
  * - 其它（相对路径 / file:// 等 AI 幻觉链接、点了必 404）→ 渲染成等宽纯文本、
  *   不可点、保留可复制
  */
 
 import type { AnchorHTMLAttributes } from "react";
 
+import { MediaPathChip } from "@/components/media/media-path-chip";
 import { InsideInteractive, useImagePreview } from "@/components/ui/image-preview";
 import { Tooltip } from "@/components/ui/tooltip";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
+import { parseMediaRefToken, resolveMediaRef } from "@/lib/media/media-ref";
 import { isUncLikePath } from "@/lib/unc-path";
 
 const CLICKABLE = /^https?:\/\//;
 // 本地绝对路径（POSIX / Windows 盘符、含 file:// 前缀）+ 图片扩展名
 const LOCAL_IMAGE = /^(file:\/\/)?(\/|[a-zA-Z]:[\\/]).*\.(png|jpe?g|webp|gif|bmp)$/i;
+// 本地绝对路径（POSIX / Windows 盘符、含 file:// 前缀）：音视频判定交给 parseMediaRefToken（含 #t= 片段）
+const LOCAL_ABS = /^(file:\/\/)?(\/|[a-zA-Z]:[\\/])/;
+
+/** markdown 链接 href → 音视频引用（href 里的空格等可能被编码成 %20，先解码） */
+const resolveMediaHref = (href: string | undefined) => {
+  if (!href || !LOCAL_ABS.test(href) || isUncLikePath(href)) return null;
+  let decoded = href;
+  try {
+    decoded = decodeURI(href);
+  } catch {
+    // 编码残缺：按原样试
+  }
+  const ref = parseMediaRefToken(decoded.startsWith("file://") ? decoded.slice("file://".length) : decoded);
+  return ref ? resolveMediaRef(ref) : null;
+};
 
 export const MarkdownLink = ({
   href,
@@ -33,6 +51,14 @@ export const MarkdownLink = ({
   const { node, ...domProps } = rest;
   void node;
   const { open } = useImagePreview();
+  const media = resolveMediaHref(href);
+  if (media) {
+    return (
+      <MediaPathChip absolute={media.absolute} start={media.start} end={media.end} className="text-[0.9em]">
+        {children}
+      </MediaPathChip>
+    );
+  }
   // UNC 形态（`//host/a.png`）虽然匹配 LOCAL_IMAGE，但被安全守卫有意挡掉、src 会是空串——
   // 不进可点的灯箱按钮（点开是空白全屏），落到下面的纯文本分支，路径仍可见 / 可复制（R12-03）
   if (href && LOCAL_IMAGE.test(href) && !isUncLikePath(href)) {

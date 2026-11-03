@@ -44,6 +44,7 @@ import {
   MARKDOWN_REPLY_TEXT,
   MarkdownText,
 } from "@/components/markdown-text";
+import { MediaMessageScope } from "@/components/media/media-message-scope";
 import { SearchHighlightText } from "@/components/ui/search-highlight-text";
 import {
   isCompactionInfo,
@@ -930,13 +931,17 @@ const EventRowImpl = ({
       // 纵览事件流时不用一路滚过去。chat 没有这个头：对话正文永远展开
       // 流式中强制展开：流式头不可折叠，用户之前手动收起过的同 id 行不会存在（流式项 id 是新的）
       const showBody = !isLog || !collapsed || streaming;
+      // MediaMessageScope：这条回复里的音视频自动成一个对比组，定稿后在正文后挂媒体条（卡片）。
+      // 包装层恒存在，流式 → 定稿时 MarkdownText 不会被重挂
       const assistantBody = (
-        <MarkdownText
-          size={isLog ? "default" : "reply"}
-          text={ev.text}
-          streaming={streaming}
-          baseDir={markdownBaseDir}
-        />
+        <MediaMessageScope text={ev.text} baseDir={markdownBaseDir} streaming={streaming}>
+          <MarkdownText
+            size={isLog ? "default" : "reply"}
+            text={ev.text}
+            streaming={streaming}
+            baseDir={markdownBaseDir}
+          />
+        </MediaMessageScope>
       );
       return (
         <div

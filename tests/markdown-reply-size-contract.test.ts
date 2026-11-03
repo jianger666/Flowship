@@ -53,9 +53,9 @@ describe("对话正文 15px：字号落在 prose 元素上", () => {
     expect(md).toContain('size = "default",');
   });
 
-  it("路径 code：default 档 0.85em、reply 档 text-xs；三处渲染都走 PATH_CODE_SIZE", () => {
+  it("路径 code：default 档 0.85em、reply 档 text-xs；四处渲染（含音视频播放入口 chip）都走 PATH_CODE_SIZE", () => {
     expect(md).toMatch(/default: "text-\[0\.85em\]",\s*reply: "text-xs",/);
-    expect(md.match(/PATH_CODE_SIZE\[size\]/g) ?? []).toHaveLength(3);
+    expect(md.match(/PATH_CODE_SIZE\[size\]/g) ?? []).toHaveLength(4);
     // 0.85em 字面量只该剩映射表里这一处：reply 档（15px 基准）下它会变 12.75px，落到阶梯之外
     expect(md.match(/text-\[0\.85em\]/g) ?? []).toHaveLength(1);
   });

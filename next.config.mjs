@@ -24,8 +24,9 @@ const CSP_REPORT_PATH = "/api/csp-report";
  */
 const buildCspReportOnlyPolicy = (isProd) =>
   [
-    // 兜底：未单独列出的类型（manifest / media / prefetch 等）只允许同源。
-    // 本项目没有 <video> / <audio> / <form>，没有 next/font，也没有任何 <link> 外链样式 / 字体。
+    // 兜底：未单独列出的类型（manifest / prefetch 等）只允许同源。
+    // 本项目没有 <form>，没有 next/font，也没有任何 <link> 外链样式 / 字体。
+    // 音视频播放器（components/media）有 <video>，下面单独列了 media-src。
     "default-src 'self'",
 
     // script-src —— 暂时最宽的一项：
@@ -59,6 +60,11 @@ const buildCspReportOnlyPolicy = (isProd) =>
     //   故意不放 http:：本地图一律走同源 /api/local-image，明文 http 图若出现会被上报，正好看看有没有
     // enforce 前收敛：https: 是内容驱动、很难列白名单——大概率保留，或改成「只允许 https + 同源」。
     "img-src 'self' data: blob: https:",
+
+    // media-src：音视频播放器的 <video src> / <track src> 全是同源的 /api/local-media*（本机磁盘文件经同源路由流式输出，
+    // 见 lib/server/local-media.ts）；封面 / 缩略图是 canvas 生成的 data: URL，只给 <img> 用，不进 media。
+    // 显式写出是为了「想收紧 default-src 时不会误伤播放」；不放 blob: / https:——没有远程或 blob 媒体用法。
+    "media-src 'self'",
 
     // font-src：katex.min.css 的 @font-face 是相对路径（fonts/KaTeX_*.woff2），打包后落在
     // /_next/static/media（同源），小字体可能被内联成 data:。没有 next/font、没有 Google Fonts / CDN。

@@ -116,6 +116,11 @@ describe("策略内容：关键指令不能丢", () => {
     }
   });
 
+  it("音视频播放器需要 media-src：同源即可，不放行 blob: / 远程来源", async () => {
+    const dirs = parsePolicy(await policyOf());
+    expect(dirs["media-src"]).toEqual(["'self'"]);
+  });
+
   it("没有 upgrade-insecure-requests / block-all-mixed-content（页面是 http://127.0.0.1，会让子资源全挂）", async () => {
     const policy = await policyOf();
     expect(policy).not.toContain("upgrade-insecure-requests");

@@ -8,6 +8,7 @@
  * - TaskListProvider：全局任务列表（侧栏 + 各页面共享、统一刷新 / 同步）
  * - ImagePreviewProvider：全局图片 lightbox（ImageThumb 点击站内看大图）
  * - LocalFilePreviewProvider：本地路径点击 → 居中预览弹窗（pathDisplayLabel 展示）
+ * - MediaPlayerHost：音视频播放器悬浮窗（点音视频路径 / 媒体卡片唤起，懒加载）
  * - 后续如果接 react-query / jotai 等也都加在这里
  */
 
@@ -20,6 +21,7 @@ import { LocalFilePreviewProvider } from "@/components/ui/local-file-preview";
 import { CloseConfirmHandler } from "@/components/close-confirm-handler";
 import { DeepLinkHandler } from "@/components/deep-link-handler";
 import { GlobalShortcuts } from "@/components/global-shortcuts";
+import { MediaPlayerHost } from "@/components/media/media-player-host";
 import { SearchDialog } from "@/components/search-dialog";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { WhatsNewHost } from "@/components/whats-new-host";
@@ -77,6 +79,8 @@ export const Providers = ({ children }: ProvidersProps) => {
               {/* Cmd/Ctrl+K 命令面板：无侧栏按钮、仅快捷键唤起 */}
               <SearchDialog showTrigger={false} />
               {children}
+              {/* 音视频播放器悬浮窗：有播放会话才懒加载挂出；挂在根上、滚动 / 切任务都不打断播放 */}
+              <MediaPlayerHost />
             </MrInboxProvider>
           </TaskListProvider>
           </LocalFilePreviewProvider>

@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useMediaGroup } from "@/components/media/media-group-state";
 import {
   resolveLocalFileAbsolute,
   useLocalFilePreview,
@@ -50,6 +51,7 @@ import {
   requestOpenLocalPath,
   requestRevealLocalPath,
 } from "@/lib/local-file-open";
+import { openMediaInGroup } from "@/lib/media/media-open";
 import { pathDisplayLabel } from "@/lib/path-utils";
 import { JUMP_IDE_LABEL } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -164,6 +166,7 @@ export const LocalFileLink = ({
   showActions = false,
 }: LocalFileLinkProps) => {
   const { open, ide: jumpIde } = useLocalFilePreview();
+  const mediaGroup = useMediaGroup();
   const target = linker.resolveFor(path, line);
 
   if (!target) {
@@ -204,6 +207,11 @@ export const LocalFileLink = ({
   };
 
   const openPreview = () => {
+    // 音视频不进预览弹窗：进全局播放器（同一条消息里的音视频自动成对比组）
+    if (openTarget === "media") {
+      openMediaInGroup(mediaGroup, { absolute: target.absolute });
+      return;
+    }
     open(line != null ? `${path}:${line}` : path, {
       baseDir: linker.baseDir,
       line: effectiveLine,
@@ -241,7 +249,9 @@ export const LocalFileLink = ({
       ? "点击在浏览器打开"
       : openTarget === "ide"
         ? `点击在 ${JUMP_IDE_LABEL[jumpIde]} 打开${effectiveLine != null ? `第 ${effectiveLine} 行` : ""}`
-        : "点击在 Flowship 预览";
+        : openTarget === "media"
+          ? "点击在播放器打开"
+          : "点击在 Flowship 预览";
   const tooltipContent = `${defaultActionLabel}，右键选择打开方式\n${locationLabel}`;
   const primary =
     openTarget === "ide" && ideAnchor ? (
@@ -266,10 +276,15 @@ export const LocalFileLink = ({
     );
   const menuProps = {
     isHtml: shouldOpenLocalFileInBrowser(target.absolute),
-    canPreview: canPreviewInSheet(kind),
+    canPreview: canPreviewInSheet(kind) || openTarget === "media",
     ideAnchor,
     ideLabel: JUMP_IDE_LABEL[jumpIde],
-    previewLabel: kind === "code" ? "在 Flowship 预览源码" : "在 Flowship 预览",
+    previewLabel:
+      openTarget === "media"
+        ? "在播放器打开"
+        : kind === "code"
+          ? "在 Flowship 预览源码"
+          : "在 Flowship 预览",
     onBrowserOpen: launchInBrowser,
     onPreview: openPreview,
     onReveal: revealInFolder,

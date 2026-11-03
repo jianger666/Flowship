@@ -12,6 +12,7 @@
  * - `ImageThumb`：统一缩略图（点击进 lightbox、可选 onRemove 显示移除 X、可传同组图支持左右切换）
  *
  * lightbox 自绘（不引库）：点背景 / Esc / 右上 X 关、多图左右切换 + 键盘 ←→、open 期间锁 body 滚动；
+ * 大图上右键可「复制图片」（PNG 写进系统剪贴板，见 lib/copy-image）；
  * 打开时焦点移进灯箱（`ImageLightbox`）、关闭时还给触发它的元素。
  */
 
@@ -25,10 +26,18 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { ChevronLeft, ChevronRight, ImageDown, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Copy, ImageDown, X } from "lucide-react";
+import { toast } from "sonner";
 
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useTitleBarOverlayDim } from "@/hooks/use-titlebar-overlay-dim";
+import { copyImageToClipboard } from "@/lib/copy-image";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
 import {
   blockedImageText,
@@ -115,6 +124,13 @@ export const ImageLightbox = ({ images, index, onClose, onGo }: ImageLightboxPro
   if (!current) return null;
   const multi = images.length > 1;
 
+  const copyCurrent = () => {
+    void copyImageToClipboard(current.src).then(
+      () => toast.success("已复制图片"),
+      (e: unknown) => toast.error(e instanceof Error ? e.message : "复制图片失败"),
+    );
+  };
+
   return (
     // z 取高于 Dialog（base-ui dialog 约 z-50）、保证从弹窗里点图也能盖住
     // [-webkit-app-region:no-drag]：灯箱盖在 header 的拖拽区上，而 Electron 的拖拽区按像素矩形算、不看 z-index，
@@ -170,14 +186,30 @@ export const ImageLightbox = ({ images, index, onClose, onGo }: ImageLightboxPro
         </>
       )}
 
-      {/* 大图：点图本身不关（只点背景关） */}
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        src={current.src}
-        alt={current.alt ?? ""}
-        onClick={(e) => e.stopPropagation()}
-        className="max-h-[90vh] max-w-[90vw] rounded-md object-contain shadow-2xl"
-      />
+      {/* 大图：点图本身不关（只点背景关）；右键 → 复制图片。
+          菜单弹层在 portal 里、但 React 事件仍会沿组件树冒泡到根的 onClick（= 关灯箱）——Content 上显式拦住；
+          positionerClassName 把菜单抬到灯箱（z-200）之上，不然会被盖在灯箱底下 */}
+      <ContextMenu>
+        <ContextMenuTrigger render={<div className="flex" />}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={current.src}
+            alt={current.alt ?? ""}
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[90vh] max-w-[90vw] rounded-md object-contain shadow-2xl"
+          />
+        </ContextMenuTrigger>
+        <ContextMenuContent
+          positionerClassName="z-210"
+          className="min-w-36"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <ContextMenuItem onClick={copyCurrent}>
+            <Copy className="size-3.5" />
+            复制图片
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
     </div>
   );
 };

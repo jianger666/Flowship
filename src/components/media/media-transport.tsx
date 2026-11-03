@@ -1,0 +1,358 @@
+"use client";
+
+/**
+ * 播放器控制区：两排。
+ * 第一排 = 传输（上一个 / 后退 / 播放 / 前进 / 下一个 / 逐帧 / 时间 / 倍速 / 音量）；
+ * 第二排 = 工具（A-B / 字幕 / 循环 / 画中画 / 全屏 / 大窗 / 更多）。
+ * 所有按钮只发 MediaCommand（与键盘快捷键同一套），真正执行在 media-player-dock。
+ */
+
+import type { ReactElement, ReactNode } from "react";
+import {
+  Captions,
+  CaptionsOff,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  ExternalLink,
+  FastForward,
+  FolderOpen,
+  Keyboard,
+  Maximize,
+  MoreHorizontal,
+  Minimize,
+  Pause,
+  PictureInPicture2,
+  Play,
+  RectangleHorizontal,
+  Repeat,
+  Repeat1,
+  RefreshCw,
+  Rewind,
+  SkipBack,
+  SkipForward,
+  Volume1,
+  Volume2,
+  VolumeX,
+  X,
+} from "lucide-react";
+
+import { Tooltip } from "@/components/ui/tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import type { AbRange } from "@/components/media/media-seek-bar";
+import type { MediaElementState } from "@/components/media/use-media-element-state";
+import type { MediaKind } from "@/lib/media/media-kind";
+import { RATES, type LoopMode } from "@/lib/media/media-memory";
+import type { MediaCommand } from "@/lib/media/media-shortcuts";
+import { formatClock } from "@/lib/media/media-time";
+import { cn } from "@/lib/utils";
+
+export type DockMode = "float" | "theater" | "mini";
+
+export interface MoreAction {
+  key: string;
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+}
+
+export interface TransportProps {
+  kind: MediaKind;
+  state: MediaElementState;
+  rate: number;
+  volume: number;
+  muted: boolean;
+  loop: LoopMode;
+  ab: AbRange;
+  groupSize: number;
+  hasCaptionTracks: boolean;
+  captionsOn: boolean;
+  fps: { value: number; estimated: boolean };
+  pipSupported: boolean;
+  isFullscreen: boolean;
+  mode: DockMode;
+  onCommand: (cmd: MediaCommand) => void;
+  onSetRate: (rate: number) => void;
+  onSetVolume: (volume: number) => void;
+  moreActions: MoreAction[];
+}
+
+const BTN =
+  "inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors " +
+  "hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40 " +
+  "[&_svg]:size-4 [&_svg]:shrink-0";
+
+const Ctl = ({
+  label,
+  shortcut,
+  onClick,
+  active,
+  disabled,
+  className,
+  children,
+}: {
+  label: string;
+  shortcut?: string;
+  onClick: () => void;
+  active?: boolean;
+  disabled?: boolean;
+  className?: string;
+  children: ReactNode;
+}): ReactElement => (
+  <Tooltip content={shortcut ? `${label}（${shortcut}）` : label}>
+    <button
+      type="button"
+      aria-label={label}
+      aria-pressed={active === undefined ? undefined : active}
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(BTN, active && "bg-primary/12 text-primary hover:bg-primary/18 hover:text-primary", className)}
+    >
+      {children}
+    </button>
+  </Tooltip>
+);
+
+const formatRate = (r: number): string => `${Number.isInteger(r) ? r : r.toString()}×`;
+
+const VolumeIcon = ({ volume, muted }: { volume: number; muted: boolean }) =>
+  muted || volume === 0 ? <VolumeX /> : volume < 0.5 ? <Volume1 /> : <Volume2 />;
+
+export const MediaTransport = ({
+  kind,
+  state,
+  rate,
+  volume,
+  muted,
+  loop,
+  ab,
+  groupSize,
+  hasCaptionTracks,
+  captionsOn,
+  fps,
+  pipSupported,
+  isFullscreen,
+  mode,
+  onCommand,
+  onSetRate,
+  onSetVolume,
+  moreActions,
+}: TransportProps) => {
+  const isVideo = kind === "video";
+  const playing = !state.paused && !state.ended;
+  const abActive = ab.a !== null || ab.b !== null;
+  // 暂停时多显示一位小数（逐帧对点用），播放时不抖
+  const clockDigits = state.paused && isVideo ? 2 : 0;
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-0.5">
+        {groupSize > 1 && (
+          <Ctl label="上一个" shortcut="PageUp" onClick={() => onCommand({ type: "prev" })}>
+            <SkipBack />
+          </Ctl>
+        )}
+        <Ctl label="后退 5 秒" shortcut="←" onClick={() => onCommand({ type: "seekBy", seconds: -5 })}>
+          <Rewind />
+        </Ctl>
+        <Tooltip content={playing ? "暂停（空格）" : "播放（空格）"}>
+          <button
+            type="button"
+            aria-label={playing ? "暂停" : "播放"}
+            onClick={() => onCommand({ type: "toggle" })}
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring [&_svg]:size-4"
+          >
+            {playing ? <Pause /> : <Play className="translate-x-px" />}
+          </button>
+        </Tooltip>
+        <Ctl label="前进 5 秒" shortcut="→" onClick={() => onCommand({ type: "seekBy", seconds: 5 })}>
+          <FastForward />
+        </Ctl>
+        {groupSize > 1 && (
+          <Ctl label="下一个" shortcut="PageDown" onClick={() => onCommand({ type: "next" })}>
+            <SkipForward />
+          </Ctl>
+        )}
+        {isVideo && (
+          <span className="mx-0.5 flex items-center">
+            <Ctl
+              label="上一帧"
+              shortcut=","
+              onClick={() => onCommand({ type: "frame", dir: -1 })}
+              disabled={!state.ready}
+              className="w-5"
+            >
+              <ChevronLeft />
+            </Ctl>
+            <Ctl
+              label="下一帧"
+              shortcut="."
+              onClick={() => onCommand({ type: "frame", dir: 1 })}
+              disabled={!state.ready}
+              className="w-5"
+            >
+              <ChevronRight />
+            </Ctl>
+          </span>
+        )}
+        <Tooltip
+          content={
+            isVideo
+              ? `点击时间也能输入跳转。帧率 ${fps.value}${fps.estimated ? "（估算）" : "（默认）"}`
+              : "点击时间可输入跳转"
+          }
+        >
+          <button
+            type="button"
+            onClick={() => onCommand({ type: "gotoTime" })}
+            className="ml-1 min-w-0 truncate rounded px-1 font-mono text-xs tabular-nums text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="输入时间跳转"
+          >
+            {formatClock(state.time, { digits: clockDigits })}
+            <span className="text-muted-foreground"> / {formatClock(state.duration)}</span>
+          </button>
+        </Tooltip>
+        <span className="flex-1" />
+        <DropdownMenu>
+          <Tooltip content="播放速度（[ ] 调整，\\ 复位）">
+            <DropdownMenuTrigger
+              aria-label={`播放速度 ${formatRate(rate)}`}
+              className={cn(
+                BTN,
+                "w-auto px-1.5 font-mono text-xs tabular-nums",
+                rate !== 1 && "bg-primary/12 text-primary",
+              )}
+            >
+              {formatRate(rate)}
+            </DropdownMenuTrigger>
+          </Tooltip>
+          <DropdownMenuContent align="end" side="top" className="min-w-24">
+            {RATES.map((r) => (
+              <DropdownMenuItem key={r} onClick={() => onSetRate(r)} className="justify-between font-mono text-xs">
+                {formatRate(r)}
+                {r === rate && <span className="text-primary">●</span>}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <div className="group/vol flex items-center">
+          <Ctl label={muted ? "取消静音" : "静音"} shortcut="M" onClick={() => onCommand({ type: "mute" })}>
+            <VolumeIcon volume={volume} muted={muted} />
+          </Ctl>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={muted ? 0 : volume}
+            onChange={(e) => onSetVolume(Number(e.target.value))}
+            aria-label="音量"
+            className="h-1 w-14 cursor-pointer accent-primary"
+          />
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-0.5">
+        <Ctl
+          label="设 A 点（区间起点）"
+          shortcut="I"
+          onClick={() => onCommand({ type: "abIn" })}
+          active={ab.a !== null}
+          className="w-auto px-1.5 font-mono text-xs"
+        >
+          A{ab.a !== null && <span className="ml-0.5 text-[11px]">{formatClock(ab.a, { digits: 1 })}</span>}
+        </Ctl>
+        <Ctl
+          label="设 B 点（区间终点）"
+          shortcut="O"
+          onClick={() => onCommand({ type: "abOut" })}
+          active={ab.b !== null}
+          className="w-auto px-1.5 font-mono text-xs"
+        >
+          B{ab.b !== null && <span className="ml-0.5 text-[11px]">{formatClock(ab.b, { digits: 1 })}</span>}
+        </Ctl>
+        {abActive && (
+          <Ctl label="清除 A-B 区间" shortcut="X" onClick={() => onCommand({ type: "abClear" })}>
+            <X />
+          </Ctl>
+        )}
+        {isVideo && hasCaptionTracks && (
+          <>
+            <span className="mx-1 h-4 w-px bg-border" />
+            <Ctl label={captionsOn ? "关闭字幕" : "打开字幕"} shortcut="C" onClick={() => onCommand({ type: "captions" })} active={captionsOn}>
+              {captionsOn ? <Captions /> : <CaptionsOff />}
+            </Ctl>
+          </>
+        )}
+        <span className="flex-1" />
+        <Ctl
+          label={loop === "off" ? "循环：关" : loop === "one" ? "循环：单个" : "循环：整组"}
+          shortcut="R"
+          onClick={() => onCommand({ type: "loop" })}
+          active={loop !== "off"}
+        >
+          {loop === "one" ? <Repeat1 /> : <Repeat />}
+        </Ctl>
+        {isVideo && pipSupported && (
+          <Ctl label="画中画" shortcut="P" onClick={() => onCommand({ type: "pip" })} active={state.pip} disabled={!state.ready}>
+            <PictureInPicture2 />
+          </Ctl>
+        )}
+        {isVideo && (
+          <Ctl
+            label={isFullscreen ? "退出全屏" : "全屏"}
+            shortcut="F"
+            onClick={() => onCommand({ type: "fullscreen" })}
+            active={isFullscreen}
+          >
+            {isFullscreen ? <Minimize /> : <Maximize />}
+          </Ctl>
+        )}
+        <Ctl
+          label={mode === "theater" ? "退出大窗" : "大窗"}
+          shortcut="T"
+          onClick={() => onCommand({ type: "theater" })}
+          active={mode === "theater"}
+        >
+          <RectangleHorizontal />
+        </Ctl>
+        <DropdownMenu>
+          <Tooltip content="更多">
+            <DropdownMenuTrigger aria-label="更多" className={BTN}>
+              <MoreHorizontal />
+            </DropdownMenuTrigger>
+          </Tooltip>
+          <DropdownMenuContent align="end" side="top" className="min-w-52">
+            {moreActions.map((a) => (
+              <DropdownMenuItem key={a.key} onClick={a.onClick} disabled={a.disabled}>
+                {a.icon}
+                {a.label}
+              </DropdownMenuItem>
+            ))}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => onCommand({ type: "help" })}>
+              <Keyboard className="size-3.5" />
+              键盘快捷键
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </div>
+  );
+};
+
+/** 「更多」菜单里常用的图标（dock 组装动作时用，避免它再单独引一遍 lucide） */
+export const MORE_ICONS = {
+  reveal: <FolderOpen className="size-3.5" />,
+  external: <ExternalLink className="size-3.5" />,
+  copy: <Copy className="size-3.5" />,
+  reload: <RefreshCw className="size-3.5" />,
+  captions: <Captions className="size-3.5" />,
+} as const;

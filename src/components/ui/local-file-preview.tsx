@@ -32,6 +32,8 @@ import {
 import { Tooltip } from "@/components/ui/tooltip";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { canOpenInIde, type LocalFileKind } from "@/lib/local-file-kind";
+import { detectMediaKind } from "@/lib/media/media-kind";
+import { openMedia } from "@/lib/media/player-store";
 import {
   pathBasename,
   pathDisplayLabel,
@@ -126,6 +128,11 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
     // pathLike 可带 :line 后缀；resolveIdeTarget 与 IDE 跳转共用解析
     const target = resolveIdeTarget(pathLike, opts?.baseDir);
     if (!target) return;
+    // 音视频不进文档预览窗：统一进全局播放器（任何走 open() 的入口——产物栏 / 文件列表 / 搜索——都自动获得播放）
+    if (detectMediaKind(target.absolute)) {
+      openMedia([{ path: target.absolute }]);
+      return;
+    }
     setState({
       pathLike,
       absolutePath: target.absolute,
