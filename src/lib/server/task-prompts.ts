@@ -21,6 +21,7 @@ import {
 } from "./task-fs-core";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
+import { mediaDisplayPromptSection } from "./media-display-prompt";
 import { detectAgentShellKind, type AgentShellKind } from "./agent-shell";
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 import { formatRepoSectionForPrompt, repoTail } from "@/lib/path-utils";
@@ -297,11 +298,16 @@ const loadFileSafe = async (rel: string): Promise<string> => {
 
 const loadSharedPrompt = async (task: Task): Promise<string> => {
   const tpl = await loadFileSafe(SHARED_PROMPT_FILE);
-  return fillTemplate(tpl, {
+  const filled = fillTemplate(tpl, {
     // V0.10：隔离 task 的 repoPath 占位符 = worktree cwd（agent 实际干活的地方）
     repoPath: getTaskCwd(task),
     taskId: task.id,
   });
+  // 本地音视频展示写法：单一源在 media-display-prompt.ts（chat 的 buildInitialPrompt 用同一段），
+  // 纯 md 的 _shared.md 引不了 TS helper，所以在这里追加到 sharedRules 末尾。
+  // 追加发生在预算计算之前（buildSuperPromptWithBudget 里 sharedRules 的 bytes 由本函数的返回值算），
+  // 所以字节计入 L1、永不被裁。_shared.md §3 第 5 条的「不要写绝对路径」对音视频有一句例外指向它。
+  return `${filled.replace(/\s+$/, "")}\n\n${mediaDisplayPromptSection()}\n`;
 };
 
 // 加载某个 action 的 prompt、填模板变量

@@ -24,7 +24,6 @@ export interface MediaElementState {
   waiting: boolean;
   /** 已经拿到元数据（能读时长 / 尺寸） */
   ready: boolean;
-  buffered: Array<[number, number]>;
   error: MediaErrorInfo | null;
   videoWidth: number;
   videoHeight: number;
@@ -38,7 +37,6 @@ export const INITIAL_MEDIA_STATE: MediaElementState = {
   ended: false,
   waiting: false,
   ready: false,
-  buffered: [],
   error: null,
   videoWidth: 0,
   videoHeight: 0,
@@ -54,16 +52,6 @@ const ERROR_KINDS: Record<number, MediaErrorInfo["kind"]> = {
 
 const TICK_INTERVAL_MS = 66;
 
-const readBuffered = (v: HTMLVideoElement): Array<[number, number]> => {
-  const out: Array<[number, number]> = [];
-  const ranges = v.buffered;
-  for (let i = 0; i < ranges.length; i++) out.push([ranges.start(i), ranges.end(i)]);
-  return out;
-};
-
-const sameBuffered = (a: Array<[number, number]>, b: Array<[number, number]>): boolean =>
-  a.length === b.length && a.every((r, i) => r[0] === b[i]![0] && r[1] === b[i]![1]);
-
 const read = (v: HTMLVideoElement): MediaElementState => {
   const code = v.error?.code ?? 0;
   const duration = Number.isFinite(v.duration) ? v.duration : 0;
@@ -75,7 +63,6 @@ const read = (v: HTMLVideoElement): MediaElementState => {
     // readyState < 3（HAVE_FUTURE_DATA）且在播放意图下 = 在缓冲
     waiting: !v.paused && v.readyState < 3 && v.error === null && !v.ended,
     ready: v.readyState >= 1,
-    buffered: readBuffered(v),
     error: code ? { code, kind: ERROR_KINDS[code] ?? "unknown" } : null,
     videoWidth: v.videoWidth,
     videoHeight: v.videoHeight,
@@ -93,8 +80,7 @@ const same = (a: MediaElementState, b: MediaElementState): boolean =>
   a.error?.code === b.error?.code &&
   a.videoWidth === b.videoWidth &&
   a.videoHeight === b.videoHeight &&
-  a.pip === b.pip &&
-  sameBuffered(a.buffered, b.buffered);
+  a.pip === b.pip;
 
 const EVENTS = [
   "loadstart",
@@ -109,7 +95,6 @@ const EVENTS = [
   "stalled",
   "seeking",
   "seeked",
-  "progress",
   "timeupdate",
   "ended",
   "error",

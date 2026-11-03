@@ -1,24 +1,22 @@
 "use client";
 
 /**
- * 视频进度条：已播 / 已缓冲 / A-B 区间 / 悬停时间 + 缩略图。
+ * 视频进度条：已播 / 悬停时间 + 缩略图。
+ * 本地文件没有「缓冲」可言（文件就在本机，随时能 Range 读），所以不画缓冲段——
+ * 之前画过，淡淡的一截一截深色看不出含义，反而像 bug。
  * 指针交互（点击跳转、拖动、悬停）走 use-timeline-pointer，与音频波形共用。
  */
 
 import { useRef, useState } from "react";
 
 import { useTimelinePointer } from "@/components/media/use-timeline-pointer";
-import type { AbRange } from "@/lib/media/media-ab";
 import { clampNumber, formatClock } from "@/lib/media/media-time";
 import type { SeekThumbnail } from "@/components/media/use-seek-thumbnail";
 import { cn } from "@/lib/utils";
 
-export type { AbRange };
-
 export interface TimelineProps {
   time: number;
   duration: number;
-  ab: AbRange;
   onSeek: (t: number) => void;
   onHoverTime?: (t: number | null) => void;
   onScrubChange?: (scrubbing: boolean) => void;
@@ -29,28 +27,15 @@ export interface TimelineProps {
 const pct = (t: number, duration: number): number =>
   duration > 0 ? clampNumber((t / duration) * 100, 0, 100) : 0;
 
-/** A-B 区间的百分比跨度：只有 A 时从 A 到末尾，只有 B 时从开头到 B */
-export const abSpan = (ab: AbRange, duration: number): { left: number; width: number } | null => {
-  if (ab.a === null && ab.b === null) return null;
-  const a = ab.a ?? 0;
-  const b = ab.b ?? duration;
-  const lo = Math.min(a, b);
-  const hi = Math.max(a, b);
-  const left = pct(lo, duration);
-  return { left, width: Math.max(0.3, pct(hi, duration) - left) };
-};
-
 export const MediaSeekBar = ({
   time,
   duration,
-  buffered,
-  ab,
   onSeek,
   onHoverTime,
   onScrubChange,
   thumbnail,
   disabled,
-}: TimelineProps & { buffered: Array<[number, number]> }) => {
+}: TimelineProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ t: number; x: number } | null>(null);
 
@@ -72,7 +57,6 @@ export const MediaSeekBar = ({
   });
 
   const shown = scrubTime ?? time;
-  const span = abSpan(ab, duration);
   const width = ref.current?.clientWidth ?? 0;
   // 悬停气泡水平方向夹在条内，避免贴边时被裁掉
   const half = thumbnail ? thumbnail.width / 2 + 4 : 28;
@@ -95,19 +79,6 @@ export const MediaSeekBar = ({
       {...handlers}
     >
       <div className="relative h-1 w-full rounded-full bg-muted-foreground/25 transition-[height] duration-100 group-hover/seek:h-1.5">
-        {buffered.map(([s, e], i) => (
-          <div
-            key={i}
-            className="absolute inset-y-0 rounded-full bg-muted-foreground/30"
-            style={{ left: `${pct(s, duration)}%`, width: `${Math.max(0, pct(e, duration) - pct(s, duration))}%` }}
-          />
-        ))}
-        {span && (
-          <div
-            className={cn("absolute -inset-y-0.5 rounded-sm", ab.enabled ? "bg-warning/45" : "bg-warning/25")}
-            style={{ left: `${span.left}%`, width: `${span.width}%` }}
-          />
-        )}
         <div
           className="absolute inset-y-0 left-0 rounded-full bg-primary"
           style={{ width: `${pct(shown, duration)}%` }}

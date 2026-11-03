@@ -72,6 +72,7 @@ import {
 import { failpoint } from "./failpoints";
 import { interruptWaits } from "./session-wait";
 import { chatTurnProtocolSection } from "./turn-discipline";
+import { mediaDisplayPromptSection } from "./media-display-prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { supersedePendingAsks } from "./ask-supersede";
 import { renderContextDocsSection } from "./context-docs-prompt";
@@ -1306,6 +1307,9 @@ const buildInitialPrompt = (
     "   - skill 触发是判断性的、不是每轮都读、按描述匹配场景再读",
     "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
     "",
+    // 本地音视频展示写法（单一源 media-display-prompt；task 侧在 task-prompts 的 sharedRules 末尾追加同一段）
+    mediaDisplayPromptSection(),
+    "",
     `## 任务 cwd（agent shell / read 默认基准目录）：${formatRepoSectionForPrompt(task.repoPaths, {
       nonGitRepoPaths: task.nonGitRepoPaths,
       originalRepoPaths: task.repoPaths,
@@ -1382,6 +1386,9 @@ const buildInitialPrompt = (
 
   return lines.join("\n");
 };
+
+/** 仅供测试：直接调 chat 起手 prompt 的拼装（生产代码只在 runChat 里调 buildInitialPrompt） */
+export const __buildChatInitialPromptForTest = buildInitialPrompt;
 
 /**
  * 起手姿势段

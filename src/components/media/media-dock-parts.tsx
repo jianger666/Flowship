@@ -2,10 +2,10 @@
 
 /**
  * 播放窗的小零件：缩放把手、对比组标签、提示条、快捷键帮助。
- * 都是无状态展示件，逻辑在 media-player-dock。
+ * 基本是无状态展示件（GroupTabs 只有一个「切换后滚进视野」的副作用），逻辑在 media-player-dock。
  */
 
-import type { PointerEvent, ReactNode } from "react";
+import { useEffect, useRef, type PointerEvent, type ReactNode } from "react";
 import { AlertTriangle, AudioLines, Film, Info, X } from "lucide-react";
 
 import type { ResizeEdge } from "@/lib/media/media-geometry";
@@ -43,7 +43,11 @@ export const ResizeHandles = ({
   </>
 );
 
-/** 对比组标签：一排文件，点哪个切到哪个（保持播放进度由 dock 负责） */
+/**
+ * 对比组标签：一排文件，点哪个切到哪个（保持播放进度由 dock 负责）。
+ * 标签平分一行（最窄 6rem、最宽 11rem），文件多了才横向滚动；切换后把选中的那个滚进视野——
+ * 之前 2 个标签在窄窗里第 2 个被挤出右边缘，选中的是谁都看不见。
+ */
 export const GroupTabs = ({
   items,
   index,
@@ -54,38 +58,48 @@ export const GroupTabs = ({
   index: number;
   playingPath: string | null;
   onSelect: (i: number) => void;
-}) => (
-  <div
-    role="tablist"
-    aria-label="对比组"
-    className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/60 px-2 py-1.5 [scrollbar-width:thin]"
-  >
-    {items.map((it, i) => {
-      const active = i === index;
-      const Icon = detectMediaKind(it.path) === "audio" ? AudioLines : Film;
-      return (
-        <Tooltip key={it.path} content={it.path}>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={active}
-            onClick={() => onSelect(i)}
-            className={cn(
-              "inline-flex max-w-44 shrink-0 items-center gap-1.5 rounded-md border px-2 py-1 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-              active
-                ? "border-primary/40 bg-primary/10 text-foreground"
-                : "border-transparent bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
-            )}
-          >
-            <span className="font-mono text-[11px] tabular-nums opacity-70">{i + 1}</span>
-            <Icon className={cn("size-3 shrink-0", it.path === playingPath && "text-primary")} />
-            <span className="truncate">{pathBasename(it.path)}</span>
-          </button>
-        </Tooltip>
-      );
-    })}
-  </div>
-);
+}) => {
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // 按 aria-selected 找选中的标签（Tooltip 会接管 trigger 的 ref，不在按钮上挂 ref）
+    listRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [index]);
+  return (
+    <div
+      ref={listRef}
+      role="tablist"
+      aria-label="对比组"
+      className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/60 px-2 py-1.5 [scrollbar-width:thin]"
+    >
+      {items.map((it, i) => {
+        const active = i === index;
+        const Icon = detectMediaKind(it.path) === "audio" ? AudioLines : Film;
+        return (
+          <Tooltip key={it.path} content={it.path}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={active}
+              onClick={() => onSelect(i)}
+              className={cn(
+                "inline-flex min-w-24 max-w-44 grow basis-24 items-center gap-1.5 rounded-md border px-2 py-1 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                active
+                  ? "border-primary/40 bg-primary/10 text-foreground"
+                  : "border-transparent bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
+              )}
+            >
+              <span className="font-mono text-[11px] tabular-nums opacity-70">{i + 1}</span>
+              <Icon className={cn("size-3 shrink-0", it.path === playingPath && "text-primary")} />
+              <span className="min-w-0 truncate">{pathBasename(it.path)}</span>
+            </button>
+          </Tooltip>
+        );
+      })}
+    </div>
+  );
+};
 
 export type BannerTone = "info" | "warning" | "error";
 
@@ -151,10 +165,8 @@ const SHORTCUT_ROWS: Array<[string, string]> = [
   ["[ ]  \\", "降速 / 升速 / 复位 1×"],
   ["↑ ↓", "音量"],
   ["M", "静音"],
-  ["I  O  X", "设 A 点 / 设 B 点 / 清除区间"],
   ["R", "循环：关 → 单个 → 整组"],
   ["F  P  C", "全屏 / 画中画 / 字幕（视频）"],
-  ["T", "大窗"],
   ["0–9", "对比组：切换第几个；单个文件：跳到 0–90%"],
   ["Home  End", "跳到开头 / 结尾"],
   ["PageUp  PageDown", "上一个 / 下一个（对比组）"],
@@ -189,6 +201,7 @@ export const ShortcutHelp = ({ onClose }: { onClose: () => void }) => (
       ))}
       <li className="pt-2 text-[11px] leading-relaxed text-muted-foreground">
         快捷键在鼠标悬停在播放窗上、或焦点在播放窗内时生效；在输入框里打字不会触发。
+        全屏时鼠标几秒不动会自动收起控件，动一下鼠标或按任意键就回来；暂停时一直显示。
       </li>
     </ul>
   </div>

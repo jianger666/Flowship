@@ -14,9 +14,9 @@ import { detectMediaKind } from "@/lib/media/media-kind";
 export interface MediaItem {
   /** 绝对路径 */
   path: string;
-  /** 从这里开始播（秒）；有 end 时作为 A-B 区间的起点 */
+  /** 从这里开始播（秒） */
   start?: number;
-  /** 区间终点（秒） */
+  /** 终点（秒）：和 start 一起给时，播到这里就暂停（不循环）；用户手动拖进度即取消 */
   end?: number;
 }
 

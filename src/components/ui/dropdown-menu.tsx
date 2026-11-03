@@ -7,6 +7,7 @@
 
 import { Menu as MenuPrimitive } from "@base-ui/react/menu";
 
+import { usePopupContainer } from "@/components/ui/popup-container";
 import { cn } from "@/lib/utils";
 
 const DropdownMenu = MenuPrimitive.Root;
@@ -23,26 +24,30 @@ const DropdownMenuContent = ({
   Pick<
     MenuPrimitive.Positioner.Props,
     "side" | "sideOffset" | "align" | "alignOffset"
-  >) => (
-  <MenuPrimitive.Portal>
-    <MenuPrimitive.Positioner
-      side={side}
-      sideOffset={sideOffset}
-      align={align}
-      alignOffset={alignOffset}
-      className="isolate z-50"
-    >
-      <MenuPrimitive.Popup
-        data-slot="dropdown-menu-content"
-        className={cn(
-          "relative z-50 max-h-(--available-height) min-w-32 origin-(--transform-origin) overflow-y-auto rounded-lg bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
-          className,
-        )}
-        {...props}
-      />
-    </MenuPrimitive.Positioner>
-  </MenuPrimitive.Portal>
-);
+  >) => {
+  // 全屏时浮层要挂进全屏元素才看得见（见 popup-container）；默认 null = <body>
+  const container = usePopupContainer();
+  return (
+    <MenuPrimitive.Portal container={container}>
+      <MenuPrimitive.Positioner
+        side={side}
+        sideOffset={sideOffset}
+        align={align}
+        alignOffset={alignOffset}
+        className="isolate z-50"
+      >
+        <MenuPrimitive.Popup
+          data-slot="dropdown-menu-content"
+          className={cn(
+            "relative z-50 max-h-(--available-height) min-w-32 origin-(--transform-origin) overflow-y-auto rounded-lg bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+            className,
+          )}
+          {...props}
+        />
+      </MenuPrimitive.Positioner>
+    </MenuPrimitive.Portal>
+  );
+};
 
 const DropdownMenuItem = ({
   className,

@@ -150,7 +150,7 @@ describe("openMedia：开会话", () => {
     expect(input).toEqual(copy);
   });
 
-  it("start / end 随项保存（A-B 区间的起点终点）", () => {
+  it("start / end 随项保存（片段的起点终点）", () => {
     openMedia([{ path: "/m/a.mp4", start: 3, end: 9 }, B], { index: 0 });
     expect(getPlayerSnapshot().session?.items[0]).toEqual({ path: "/m/a.mp4", start: 3, end: 9 });
   });

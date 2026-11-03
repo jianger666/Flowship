@@ -8,6 +8,7 @@
  *
  * 一个 <video> 元素管所有（音频也用它，只是不显示画面）：换文件只换 src，全屏 / 画中画 / 系统媒体键都不断。
  * 播放位置、倍速、音量、窗口位置都记在本机（media-memory）。
+ * 全屏时顶栏 / 控制区叠在画面上，鼠标几秒不动就收起（规则见 media-chrome）；窗口模式不自动隐藏。
  * 所有操作（按钮 / 键盘 / 系统媒体键）汇到 `exec(command)` 一个入口。
  */
 
@@ -41,6 +42,7 @@ import {
   ShortcutHelp,
 } from "@/components/media/media-dock-parts";
 import { MediaSeekBar } from "@/components/media/media-seek-bar";
+import { MediaTimelineRow } from "@/components/media/media-timeline-row";
 import {
   MORE_ICONS,
   MediaTransport,
@@ -57,21 +59,15 @@ import {
   useMediaFileInfo,
   versionFromEtag,
 } from "@/components/media/use-media-file-info";
+import { useIdleHide } from "@/components/media/use-idle-hide";
 import { useMediaSession } from "@/components/media/use-media-session";
 import { useSeekThumbnail } from "@/components/media/use-seek-thumbnail";
 import { useWaveformPeaks } from "@/components/media/use-waveform-peaks";
+import { PopupContainerProvider } from "@/components/ui/popup-container";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { requestOpenLocalPath, requestRevealLocalPath } from "@/lib/local-file-open";
-import {
-  EMPTY_AB,
-  abLoopJump,
-  cycleIndex,
-  decideEndAction,
-  makeAb,
-  nextLoopMode,
-  type AbRange,
-} from "@/lib/media/media-ab";
+import { IDLE_HIDE_MS, chromeVisible } from "@/lib/media/media-chrome";
 import { DEFAULT_FPS, estimateFpsFromDeltas, stepFrameTarget } from "@/lib/media/media-frame";
 import {
   DOCK_MARGIN,
@@ -85,6 +81,7 @@ import {
   type Viewport,
 } from "@/lib/media/media-geometry";
 import { detectMediaKind } from "@/lib/media/media-kind";
+import { cycleIndex, decideEndAction, nextLoopMode, segmentStopAt } from "@/lib/media/media-loop";
 import {
   resumePositionFor,
   type DockGeometry,
@@ -102,7 +99,6 @@ import {
 import { pathBasename, shortenHomePathDisplay } from "@/lib/path-utils";
 import { cn } from "@/lib/utils";
 
-const THEATER_MARGIN = 24;
 const NO_TRACKS: Array<{ path: string; label: string }> = [];
 const FPS_SAMPLE_MAX = 40;
 
@@ -167,6 +163,12 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   const { prompt } = useDialog();
 
   const rootRef = useRef<HTMLDivElement>(null);
+  // 全屏时浮层（菜单 / 提示）要挂进全屏元素才看得见，所以除了 ref 还要把根元素放进 state 里传给 Provider
+  const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null);
+  const attachRoot = useCallback((el: HTMLDivElement | null) => {
+    rootRef.current = el;
+    setRootEl(el);
+  }, []);
   const videoRef = useRef<HTMLVideoElement>(null);
   const state = useMediaElementState(videoRef);
 
@@ -205,16 +207,9 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   const autoGeo = useMemo(() => defaultGeometry(kind, aspect, vp), [kind, aspect, vp]);
   const floatGeo = userGeo ? clampGeometry(userGeo, vp) : autoGeo;
   const rect: DockGeometry =
-    mode === "theater"
-      ? {
-          x: THEATER_MARGIN,
-          y: THEATER_MARGIN,
-          w: Math.max(300, vp.width - THEATER_MARGIN * 2),
-          h: Math.max(200, vp.height - THEATER_MARGIN * 2),
-        }
-      : mode === "mini"
-        ? { x: vp.width - MINI_W - DOCK_MARGIN, y: vp.height - MINI_H - DOCK_MARGIN, w: MINI_W, h: MINI_H }
-        : floatGeo;
+    mode === "mini"
+      ? { x: vp.width - MINI_W - DOCK_MARGIN, y: vp.height - MINI_H - DOCK_MARGIN, w: MINI_W, h: MINI_H }
+      : floatGeo;
 
   // 拖动 / 缩放
   const dragRef = useRef<{
@@ -232,7 +227,7 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
     edge?: ResizeEdge,
   ) => {
     if (e.button !== 0 || isFullscreen) return;
-    if (mode === "theater" || mode === "mini") return;
+    if (mode === "mini") return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     dragRef.current = {
@@ -277,18 +272,13 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   const infoFailure = info && !info.ok ? describeMediaInfoFailure(info.status) : null;
 
   const pendingRef = useRef<PendingStart | null>(null);
-  const carryRef = useRef<{ time: number; play: boolean; ab: AbRange } | null>(null);
+  const carryRef = useRef<{ time: number; play: boolean } | null>(null);
   const lastPathRef = useRef<string | null>(null);
   const pathRef = useRef(path);
   pathRef.current = path;
   const [resumedFrom, setResumedFrom] = useState<number | null>(null);
-  const [ab, setAbState] = useState<AbRange>(EMPTY_AB);
-  const abRef = useRef(ab);
-  const setAb = useCallback((a: number | null, b: number | null) => {
-    const next = makeAb(a, b);
-    abRef.current = next;
-    setAbState(next);
-  }, []);
+  // `path#t=起,止` 带终点的引用：播到终点就停。用户自己拖进度 / 键盘跳转 = 接管，取消这个终点
+  const [segEnd, setSegEnd] = useState<number | null>(null);
 
   // 新请求（点了卡片 / 路径 / 切对比组）：决定从哪里开始播。
   // 用 layout effect：待办起点必须赶在 loadedmetadata 之前就位（passive effect 可能晚于一次很快的元数据事件）
@@ -303,20 +293,20 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
     if (isNewPath) {
       if (carry) {
         pendingRef.current = { time: carry.time, play: carry.play };
-        setAb(carry.ab.a, carry.ab.b);
+        setSegEnd(null);
       } else {
         pendingRef.current = { time: it.start !== undefined ? it.start : "resume", play: true };
-        if (it.start !== undefined && it.end !== undefined) setAb(it.start, it.end);
-        else setAb(null, null);
+        setSegEnd(it.start !== undefined && it.end !== undefined && it.end > it.start ? it.end : null);
       }
       setResumedFrom(null);
     } else {
       if (it.start !== undefined) {
         v.currentTime = it.start;
-        if (it.end !== undefined) setAb(it.start, it.end);
+        setSegEnd(it.end !== undefined && it.end > it.start ? it.end : null);
         void v.play().catch(() => {});
-      } else if (v.paused) {
-        void v.play().catch(() => {});
+      } else {
+        setSegEnd(null);
+        if (v.paused) void v.play().catch(() => {});
       }
     }
     // 只在新请求时触发；items / index 变化一定伴随 reqNonce 变化
@@ -442,22 +432,24 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
     };
   }, [isVideo]);
 
-  // ---------- A-B 区间循环（rAF 精确到帧级，不靠 4Hz 的 timeupdate） ----------
+  // ---------- 片段到点停（rAF 精确到帧级，不靠 4Hz 的 timeupdate；没有片段时不跑） ----------
   useEffect(() => {
-    if (state.paused) return;
+    if (state.paused || segEnd === null) return;
     let raf = 0;
     const tick = () => {
       const v = videoRef.current;
-      const r = abRef.current;
-      if (v) {
-        const jump = abLoopJump(r, v.currentTime);
-        if (jump !== null) v.currentTime = jump;
+      const stopAt = v ? segmentStopAt(segEnd, v.currentTime) : null;
+      if (v && stopAt !== null) {
+        v.pause();
+        v.currentTime = stopAt;
+        setSegEnd(null);
+        return;
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [state.paused]);
+  }, [state.paused, segEnd]);
 
   // ---------- 位置记忆 ----------
   const liveRef = useRef({ path, time: 0, duration: 0, ready: false });
@@ -540,8 +532,8 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   }, [state.error, fileChanged, info, reload]);
 
   // ---------- 命令执行 ----------
-  const live = useRef({ state, prefs, tracks, trackIndex, session, isFullscreen, mode });
-  live.current = { state, prefs, tracks, trackIndex, session, isFullscreen, mode };
+  const live = useRef({ state, prefs, tracks, trackIndex, session });
+  live.current = { state, prefs, tracks, trackIndex, session };
 
   const setRate = useCallback((rate: number) => patchPrefs({ rate }), [patchPrefs]);
   const setVolume = useCallback(
@@ -556,12 +548,13 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
       const cur = live.current;
       const dur = Number.isFinite(v.duration) ? v.duration : 0;
       const seek = (t: number) => {
+        setSegEnd(null);
         v.currentTime = clampNumber(t, 0, dur > 0 ? dur : Math.max(0, t));
       };
       switch (cmd.type) {
         case "toggle": {
           if (v.paused || v.ended) {
-            if (v.ended) v.currentTime = abRef.current.enabled && abRef.current.a !== null ? abRef.current.a : 0;
+            if (v.ended) v.currentTime = 0;
             void v.play().catch(() => {});
           } else {
             v.pause();
@@ -581,6 +574,7 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
           if (dur > 0) seek((dur * cmd.percent) / 100);
           break;
         case "frame":
+          setSegEnd(null);
           v.pause();
           v.currentTime = stepFrameTarget(v.currentTime, fpsRef.current.value, cmd.dir, dur);
           break;
@@ -595,15 +589,6 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
           break;
         case "mute":
           patchPrefs({ muted: !cur.prefs.muted });
-          break;
-        case "abIn":
-          setAb(v.currentTime, abRef.current.b);
-          break;
-        case "abOut":
-          setAb(abRef.current.a, v.currentTime);
-          break;
-        case "abClear":
-          setAb(null, null);
           break;
         case "loop":
           patchPrefs({ loop: nextLoopMode(cur.prefs.loop) });
@@ -629,11 +614,8 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
           else void root.requestFullscreen().catch(() => toast.error("无法进入全屏"));
           break;
         }
-        case "theater":
-          setMode(cur.mode === "theater" ? "float" : "theater");
-          break;
         case "item": {
-          carryRef.current = { time: v.currentTime, play: !v.paused, ab: abRef.current };
+          carryRef.current = { time: v.currentTime, play: !v.paused };
           selectMediaIndex(cmd.index);
           break;
         }
@@ -642,7 +624,7 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
           const n = cur.session.items.length;
           if (n < 2) break;
           const idx = cycleIndex(cur.session.index, n, cmd.type === "next" ? 1 : -1);
-          carryRef.current = { time: v.currentTime, play: !v.paused, ab: abRef.current };
+          carryRef.current = { time: v.currentTime, play: !v.paused };
           selectMediaIndex(idx);
           break;
         }
@@ -651,6 +633,8 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
           break;
         case "gotoTime": {
           void (async () => {
+            // 对话框挂在 <body> 上，全屏时会被盖在全屏元素下面看不见：先退出全屏再弹
+            if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
             const input = await prompt({
               title: "跳转到",
               description: "输入秒数或时间，例如 90、1:30、1m30s",
@@ -666,22 +650,22 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
         }
       }
     },
-    [patchPrefs, prompt, setAb, setRate, setVolume],
+    [patchPrefs, prompt, setRate, setVolume],
   );
 
-  // 播放结束：单个循环 / 整组循环 / A 点回跳
+  // 播放结束：单个循环 / 整组循环
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
     const onEnded = () => {
       const { prefs: p, session: s } = live.current;
-      const action = decideEndAction(abRef.current, p.loop, s.index, s.items.length);
-      if (action.type === "restart-ab" || action.type === "restart") {
+      const action = decideEndAction(p.loop, s.index, s.items.length);
+      if (action.type === "restart") {
         v.currentTime = action.to;
         void v.play().catch(() => {});
       } else if (action.type === "next-item") {
         // 整组循环：下一个从头播（不续播上次的位置）
-        carryRef.current = { time: 0, play: true, ab: EMPTY_AB };
+        carryRef.current = { time: 0, play: true };
         selectMediaIndex(action.index);
       }
     };
@@ -701,14 +685,9 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!active() || isEditableTarget(e.target)) return;
       if (e.key === "Escape") {
-        // 先关帮助，再退大窗（全屏的 Esc 由浏览器自己处理）
+        // Esc 先关帮助（全屏的 Esc 由浏览器自己处理）
         if (showHelp) {
           setShowHelp(false);
-          e.preventDefault();
-          return;
-        }
-        if (live.current.mode === "theater" && !live.current.isFullscreen) {
-          setMode("float");
           e.preventDefault();
           return;
         }
@@ -753,7 +732,10 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
     onSeekBy: (s) => exec({ type: "seekBy", seconds: s }),
     onSeekTo: (t) => {
       const v = videoRef.current;
-      if (v) v.currentTime = t;
+      if (v) {
+        setSegEnd(null);
+        v.currentTime = t;
+      }
     },
     onPrev: groupSize > 1 ? () => exec({ type: "prev" }) : undefined,
     onNext: groupSize > 1 ? () => exec({ type: "next" }) : undefined,
@@ -766,13 +748,14 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
 
   const seekTo = useCallback((t: number) => {
     const v = videoRef.current;
-    if (v) v.currentTime = clampNumber(t, 0, Number.isFinite(v.duration) ? v.duration : t);
+    if (!v) return;
+    setSegEnd(null);
+    v.currentTime = clampNumber(t, 0, Number.isFinite(v.duration) ? v.duration : t);
   }, []);
 
   const timelineProps = {
     time: state.time,
     duration: state.duration,
-    ab,
     onSeek: seekTo,
     disabled: !state.ready || !!state.error,
   };
@@ -817,17 +800,32 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   const showSpinner = !state.error && !infoFailure && (!state.ready || state.waiting);
   const errorMessage = state.error ? (infoFailure ?? errorText(state.error.kind)) : infoFailure;
 
+  // 全屏：鼠标几秒不动就收起顶栏 / 控制区 / 鼠标指针；暂停、开着菜单 / 帮助 / 有报错时不收
+  const { idle, onPointerMove: onIdleMove } = useIdleHide(isFullscreen, IDLE_HIDE_MS);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const chromeShown = chromeVisible({
+    fullscreen: isFullscreen,
+    paused: !playing,
+    idle,
+    pinned: menuOpen || showHelp || !!errorMessage,
+  });
+  const chromeHidden = isFullscreen && !chromeShown;
+  // 全屏时顶栏 / 控制区绝对定位叠在画面上（画面铺满，没有白边）；窗口模式用 contents 让子元素照旧参与纵向排布
+  const overlay = (edge: "top" | "bottom"): string =>
+    cn(
+      isFullscreen
+        ? cn(
+            "dark absolute inset-x-0 z-20 flex flex-col text-foreground transition-opacity duration-200 motion-reduce:transition-none",
+            edge === "top" ? "top-0" : "bottom-0",
+          )
+        : "contents",
+      chromeHidden && "pointer-events-none opacity-0",
+    );
+
   return (
-    <>
-      {mode === "theater" && !isFullscreen && (
-        <div
-          aria-hidden
-          className="fixed inset-0 z-[39] bg-black/55 backdrop-blur-[1px]"
-          onClick={() => setMode("float")}
-        />
-      )}
+    <PopupContainerProvider value={isFullscreen ? (rootEl ?? undefined) : undefined}>
       <div
-        ref={rootRef}
+        ref={attachRoot}
         role="region"
         aria-label={`播放器：${title}`}
         tabIndex={-1}
@@ -838,149 +836,165 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
         onPointerLeave={() => {
           hoverRef.current = false;
         }}
-        // 拖动 / 缩放时指针被捕获在顶栏或把手上，事件冒泡到这里统一处理
-        onPointerMove={onDragMove}
+        // 拖动 / 缩放时指针被捕获在顶栏或把手上，事件冒泡到这里统一处理；全屏下同一个事件顺便喂给「静止计时」
+        onPointerMove={(e) => {
+          onDragMove(e);
+          onIdleMove(e);
+        }}
         onPointerUp={onDragEnd}
         onPointerCancel={onDragEnd}
         className={cn(
           "fixed z-40 flex flex-col overflow-hidden rounded-xl border border-border bg-background text-foreground shadow-2xl outline-none",
           "ring-1 ring-foreground/5",
+          isFullscreen && "rounded-none border-0 bg-black shadow-none ring-0",
+          chromeHidden && "cursor-none",
         )}
         style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
       >
-        {/* 顶栏：拖动把手 + 标题 + 窗口按钮（收起成条时兼做迷你控制条） */}
-        <div
-          onPointerDown={(e) => {
-            if ((e.target as HTMLElement).closest("button")) return;
-            beginDrag("move", e);
-          }}
-          className={cn(
-            "flex shrink-0 items-center gap-1.5 border-b border-border/70 bg-muted/30 px-2",
-            mode === "mini" ? "h-full border-b-0" : "h-9",
-            mode === "float" && !isFullscreen ? "cursor-grab active:cursor-grabbing" : "",
+        <div className={overlay("top")}>
+          {isFullscreen && (
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[calc(100%+2rem)] bg-linear-to-b from-black/80 via-black/45 to-transparent"
+            />
           )}
-        >
-          {mode === "mini" ? (
-            <button
-              type="button"
-              aria-label={playing ? "暂停" : "播放"}
-              onClick={() => exec({ type: "toggle" })}
-              className="inline-flex size-7 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground outline-none hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5 translate-x-px" />}
-            </button>
-          ) : (
-            <KindIcon className="size-4 shrink-0 text-muted-foreground" />
-          )}
-          <Tooltip content={path}>
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-xs font-medium leading-tight">{title}</div>
-              <div className="truncate text-[11px] leading-tight text-muted-foreground">
-                {mode === "mini"
-                  ? `${formatClock(state.time)} / ${formatClock(state.duration)}`
-                  : [
-                      formatBytes(info?.size ?? 0),
-                      shortenHomePathDisplay(path.slice(0, Math.max(0, path.length - title.length - 1))),
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-              </div>
-            </div>
-          </Tooltip>
-          {!isFullscreen && (
-            <Tooltip content={mode === "mini" ? "展开" : "收成一条（继续播放）"}>
+          {/* 顶栏：拖动把手 + 标题 + 窗口按钮（收起成条时兼做迷你控制条） */}
+          <div
+            onPointerDown={(e) => {
+              if ((e.target as HTMLElement).closest("button")) return;
+              beginDrag("move", e);
+            }}
+            className={cn(
+              "flex shrink-0 items-center gap-1.5 px-2",
+              mode === "mini"
+                ? "h-full"
+                : cn("h-9", isFullscreen ? "bg-transparent" : "border-b border-border/70 bg-muted/30"),
+              mode === "float" && !isFullscreen ? "cursor-grab active:cursor-grabbing" : "",
+            )}
+          >
+            {mode === "mini" ? (
               <button
                 type="button"
-                aria-label={mode === "mini" ? "展开播放器" : "收成一条"}
-                onClick={() => setMode(mode === "mini" ? "float" : "mini")}
+                aria-label={playing ? "暂停" : "播放"}
+                onClick={() => exec({ type: "toggle" })}
+                className="inline-flex size-7 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground outline-none hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5 translate-x-px" />}
+              </button>
+            ) : (
+              <KindIcon className="size-4 shrink-0 text-muted-foreground" />
+            )}
+            <Tooltip content={path}>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-xs font-medium leading-tight">{title}</div>
+                <div className="truncate text-[11px] leading-tight text-muted-foreground">
+                  {mode === "mini"
+                    ? `${formatClock(state.time)} / ${formatClock(state.duration)}`
+                    : [
+                        formatBytes(info?.size ?? 0),
+                        shortenHomePathDisplay(path.slice(0, Math.max(0, path.length - title.length - 1))),
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                </div>
+              </div>
+            </Tooltip>
+            {!isFullscreen && (
+              <Tooltip content={mode === "mini" ? "展开" : "收成一条（继续播放）"}>
+                <button
+                  type="button"
+                  aria-label={mode === "mini" ? "展开播放器" : "收成一条"}
+                  onClick={() => setMode(mode === "mini" ? "float" : "mini")}
+                  className="inline-flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {mode === "mini" ? <Maximize2 className="size-3.5" /> : <Minus className="size-3.5" />}
+                </button>
+              </Tooltip>
+            )}
+            <Tooltip content="关闭">
+              <button
+                type="button"
+                aria-label="关闭播放器"
+                onClick={() => closeMedia()}
                 className="inline-flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
               >
-                {mode === "mini" ? <Maximize2 className="size-3.5" /> : <Minus className="size-3.5" />}
+                <X className="size-4" />
               </button>
             </Tooltip>
+          </div>
+
+          {mode !== "mini" && groupSize > 1 && (
+            <GroupTabs
+              items={session.items}
+              index={session.index}
+              playingPath={playing ? path : null}
+              onSelect={(i) => exec({ type: "item", index: i })}
+            />
           )}
-          <Tooltip content="关闭">
-            <button
-              type="button"
-              aria-label="关闭播放器"
-              onClick={() => closeMedia()}
-              className="inline-flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+
+          {mode !== "mini" && fileChanged && !state.error && (
+            <DockBanner
+              tone="warning"
+              actions={<BannerButton onClick={() => void reload()}>重新加载</BannerButton>}
             >
-              <X className="size-4" />
-            </button>
-          </Tooltip>
+              文件已更新（可能刚被重新生成）。重新加载会保留当前位置。
+            </DockBanner>
+          )}
+          {mode !== "mini" && errorMessage && (
+            <DockBanner
+              tone="error"
+              actions={
+                <>
+                  <BannerButton onClick={() => void reload()}>重试</BannerButton>
+                  <BannerButton
+                    onClick={() =>
+                      void requestOpenLocalPath(path).catch((e: unknown) =>
+                        toast.error(e instanceof Error ? e.message : "打开失败"),
+                      )
+                    }
+                  >
+                    系统播放器打开
+                  </BannerButton>
+                  <BannerButton
+                    onClick={() =>
+                      void requestRevealLocalPath(path).catch((e: unknown) =>
+                        toast.error(e instanceof Error ? e.message : "在文件夹中显示失败"),
+                      )
+                    }
+                  >
+                    在文件夹显示
+                  </BannerButton>
+                </>
+              }
+            >
+              {errorMessage}
+            </DockBanner>
+          )}
+          {mode !== "mini" && resumedFrom !== null && !errorMessage && (
+            <DockBanner
+              tone="info"
+              onDismiss={() => setResumedFrom(null)}
+              actions={
+                <BannerButton
+                  onClick={() => {
+                    seekTo(0);
+                    setResumedFrom(null);
+                  }}
+                >
+                  从头播放
+                </BannerButton>
+              }
+            >
+              已从上次的 {formatClock(resumedFrom)} 继续。
+            </DockBanner>
+          )}
         </div>
 
-        {mode !== "mini" && groupSize > 1 && (
-          <GroupTabs
-            items={session.items}
-            index={session.index}
-            playingPath={playing ? path : null}
-            onSelect={(i) => exec({ type: "item", index: i })}
-          />
-        )}
-
-        {mode !== "mini" && fileChanged && !state.error && (
-          <DockBanner
-            tone="warning"
-            actions={<BannerButton onClick={() => void reload()}>重新加载</BannerButton>}
-          >
-            文件已更新（可能刚被重新生成）。重新加载会保留当前位置。
-          </DockBanner>
-        )}
-        {mode !== "mini" && errorMessage && (
-          <DockBanner
-            tone="error"
-            actions={
-              <>
-                <BannerButton onClick={() => void reload()}>重试</BannerButton>
-                <BannerButton
-                  onClick={() =>
-                    void requestOpenLocalPath(path).catch((e: unknown) =>
-                      toast.error(e instanceof Error ? e.message : "打开失败"),
-                    )
-                  }
-                >
-                  系统播放器打开
-                </BannerButton>
-                <BannerButton
-                  onClick={() =>
-                    void requestRevealLocalPath(path).catch((e: unknown) =>
-                      toast.error(e instanceof Error ? e.message : "在文件夹中显示失败"),
-                    )
-                  }
-                >
-                  在文件夹显示
-                </BannerButton>
-              </>
-            }
-          >
-            {errorMessage}
-          </DockBanner>
-        )}
-        {mode !== "mini" && resumedFrom !== null && !errorMessage && (
-          <DockBanner
-            tone="info"
-            onDismiss={() => setResumedFrom(null)}
-            actions={
-              <BannerButton
-                onClick={() => {
-                  seekTo(0);
-                  setResumedFrom(null);
-                }}
-              >
-                从头播放
-              </BannerButton>
-            }
-          >
-            已从上次的 {formatClock(resumedFrom)} 继续。
-          </DockBanner>
-        )}
-
-        {/* 画面区：<video> 常驻（音频不显示画面、收成一条时隐藏），换文件只换 src */}
+        {/* 画面区：<video> 常驻（音频不显示画面、收成一条时隐藏），换文件只换 src；全屏时铺满整个屏幕，顶栏 / 控制区叠在上面 */}
         <div
           className={cn(
-            "relative min-h-0 flex-1 overflow-hidden",
+            "overflow-hidden",
+            isFullscreen ? "absolute inset-0" : "relative min-h-0 flex-1",
             mode === "mini" && "hidden",
             isVideo ? "bg-black" : "bg-muted/30",
           )}
@@ -1038,54 +1052,66 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
           )}
         </div>
 
-        {mode !== "mini" && (
-          <div className="shrink-0 px-3 pt-1.5">
-            {isVideo || wave.status === "skipped" || wave.status === "error" ? (
-              <MediaSeekBar
-                {...timelineProps}
-                buffered={state.buffered}
-                thumbnail={thumb}
-                onHoverTime={(t) => {
-                  if (t !== null) requestThumb(t);
-                }}
-              />
-            ) : (
-              <MediaWaveform
-                {...timelineProps}
-                peaks={wave.status === "ready" ? wave.peaks : null}
-              />
-            )}
-          </div>
-        )}
-
-        {mode !== "mini" && (
-          <div className="shrink-0 px-2 pt-0.5 pb-2">
-            <MediaTransport
-              kind={kind}
-              state={state}
-              rate={prefs.rate}
-              volume={prefs.volume}
-              muted={prefs.muted}
-              loop={prefs.loop}
-              ab={ab}
-              groupSize={groupSize}
-              hasCaptionTracks={tracks.length > 0}
-              captionsOn={captionsOn}
-              fps={fps}
-              pipSupported={typeof document !== "undefined" && document.pictureInPictureEnabled === true}
-              isFullscreen={isFullscreen}
-              mode={mode}
-              onCommand={exec}
-              onSetRate={setRate}
-              onSetVolume={setVolume}
-              moreActions={moreActions}
+        <div className={overlay("bottom")}>
+          {isFullscreen && (
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-x-0 bottom-0 -z-10 h-[calc(100%+3rem)] bg-linear-to-t from-black/85 via-black/55 to-transparent"
             />
-          </div>
-        )}
+          )}
+          {mode !== "mini" && (
+            <MediaTimelineRow
+              time={state.time}
+              duration={state.duration}
+              isVideo={isVideo}
+              fps={fps}
+              onGotoTime={() => exec({ type: "gotoTime" })}
+            >
+              {isVideo || wave.status === "skipped" || wave.status === "error" ? (
+                <MediaSeekBar
+                  {...timelineProps}
+                  thumbnail={thumb}
+                  onHoverTime={(t) => {
+                    if (t !== null) requestThumb(t);
+                  }}
+                />
+              ) : (
+                <MediaWaveform
+                  {...timelineProps}
+                  peaks={wave.status === "ready" ? wave.peaks : null}
+                />
+              )}
+            </MediaTimelineRow>
+          )}
+
+          {mode !== "mini" && (
+            // @container：按控制区自身的宽度（不是屏幕宽度）决定音量滑块等是否出现，见 media-transport
+            <div className="@container shrink-0 px-2 pt-0.5 pb-2">
+              <MediaTransport
+                kind={kind}
+                state={state}
+                rate={prefs.rate}
+                volume={prefs.volume}
+                muted={prefs.muted}
+                loop={prefs.loop}
+                groupSize={groupSize}
+                hasCaptionTracks={tracks.length > 0}
+                captionsOn={captionsOn}
+                pipSupported={typeof document !== "undefined" && document.pictureInPictureEnabled === true}
+                isFullscreen={isFullscreen}
+                onCommand={exec}
+                onSetRate={setRate}
+                onSetVolume={setVolume}
+                moreActions={moreActions}
+                onMenuOpenChange={setMenuOpen}
+              />
+            </div>
+          )}
+        </div>
 
         {mode === "float" && !isFullscreen && <ResizeHandles onStart={(edge, e) => beginDrag("resize", e, edge)} />}
         {showHelp && <ShortcutHelp onClose={() => setShowHelp(false)} />}
       </div>
-    </>
+    </PopupContainerProvider>
   );
 };

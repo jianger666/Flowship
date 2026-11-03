@@ -19,6 +19,7 @@
 import * as React from "react";
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
 
+import { usePopupContainer } from "@/components/ui/popup-container";
 import { cn } from "@/lib/utils";
 
 interface TooltipProps {
@@ -39,13 +40,15 @@ export const Tooltip = ({
   delay = 300,
   className,
 }: TooltipProps) => {
+  // 全屏时浮层要挂进全屏元素才看得见（见 popup-container）；默认 null = <body>
+  const container = usePopupContainer();
   if (content == null || content === "") return children;
   return (
     <TooltipPrimitive.Provider delay={delay}>
       {/* disableHoverablePopup：Positioner 在 open 时走 inert → pointer-events:none（见 usePositioner） */}
       <TooltipPrimitive.Root disableHoverablePopup>
         <TooltipPrimitive.Trigger render={children} />
-        <TooltipPrimitive.Portal>
+        <TooltipPrimitive.Portal container={container}>
           <TooltipPrimitive.Positioner
             side={side}
             sideOffset={sideOffset}

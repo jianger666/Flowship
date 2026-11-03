@@ -1,10 +1,14 @@
 "use client";
 
 /**
- * 播放器控制区：两排。
- * 第一排 = 传输（上一个 / 后退 / 播放 / 前进 / 下一个 / 逐帧 / 时间 / 倍速 / 音量）；
- * 第二排 = 工具（A-B / 字幕 / 循环 / 画中画 / 全屏 / 大窗 / 更多）。
+ * 播放器控制区：两排（时间 + 进度条另在 media-timeline-row）。
+ * 第一排 = 传输（上一个 / 后退 / 播放 / 前进 / 下一个 / 倍速 / 音量）；
+ * 第二排 = 工具（逐帧 / 字幕 / 循环 / 画中画 / 全屏 / 更多）。
  * 所有按钮只发 MediaCommand（与键盘快捷键同一套），真正执行在 media-player-dock。
+ *
+ * 窄窗口不挤：悬浮窗最窄 300px，第一排最坏情况（有对比组）也只占 ~235px；
+ * 音量滑块再占 ~60px，所以只在控制区够宽（@sm = 384px）时才出现，窄时只留静音键。
+ * 以前时间文字和逐帧键都挤在第一排，窄窗里时间被截成「0…」、音量滑块被挤出窗外。
  */
 
 import type { ReactElement, ReactNode } from "react";
@@ -24,7 +28,6 @@ import {
   Pause,
   PictureInPicture2,
   Play,
-  RectangleHorizontal,
   Repeat,
   Repeat1,
   RefreshCw,
@@ -34,7 +37,6 @@ import {
   Volume1,
   Volume2,
   VolumeX,
-  X,
 } from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
@@ -45,15 +47,13 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { AbRange } from "@/components/media/media-seek-bar";
 import type { MediaElementState } from "@/components/media/use-media-element-state";
 import type { MediaKind } from "@/lib/media/media-kind";
 import { RATES, type LoopMode } from "@/lib/media/media-memory";
 import type { MediaCommand } from "@/lib/media/media-shortcuts";
-import { formatClock } from "@/lib/media/media-time";
 import { cn } from "@/lib/utils";
 
-export type DockMode = "float" | "theater" | "mini";
+export type DockMode = "float" | "mini";
 
 export interface MoreAction {
   key: string;
@@ -70,18 +70,17 @@ export interface TransportProps {
   volume: number;
   muted: boolean;
   loop: LoopMode;
-  ab: AbRange;
   groupSize: number;
   hasCaptionTracks: boolean;
   captionsOn: boolean;
-  fps: { value: number; estimated: boolean };
   pipSupported: boolean;
   isFullscreen: boolean;
-  mode: DockMode;
   onCommand: (cmd: MediaCommand) => void;
   onSetRate: (rate: number) => void;
   onSetVolume: (volume: number) => void;
   moreActions: MoreAction[];
+  /** 倍速 / 更多菜单展开收起：全屏自动隐藏控件时，菜单开着不能收 */
+  onMenuOpenChange?: (open: boolean) => void;
 }
 
 const BTN =
@@ -132,24 +131,19 @@ export const MediaTransport = ({
   volume,
   muted,
   loop,
-  ab,
   groupSize,
   hasCaptionTracks,
   captionsOn,
-  fps,
   pipSupported,
   isFullscreen,
-  mode,
   onCommand,
   onSetRate,
   onSetVolume,
   moreActions,
+  onMenuOpenChange,
 }: TransportProps) => {
   const isVideo = kind === "video";
   const playing = !state.paused && !state.ended;
-  const abActive = ab.a !== null || ab.b !== null;
-  // 暂停时多显示一位小数（逐帧对点用），播放时不抖
-  const clockDigits = state.paused && isVideo ? 2 : 0;
 
   return (
     <div className="flex flex-col gap-1">
@@ -180,47 +174,8 @@ export const MediaTransport = ({
             <SkipForward />
           </Ctl>
         )}
-        {isVideo && (
-          <span className="mx-0.5 flex items-center">
-            <Ctl
-              label="上一帧"
-              shortcut=","
-              onClick={() => onCommand({ type: "frame", dir: -1 })}
-              disabled={!state.ready}
-              className="w-5"
-            >
-              <ChevronLeft />
-            </Ctl>
-            <Ctl
-              label="下一帧"
-              shortcut="."
-              onClick={() => onCommand({ type: "frame", dir: 1 })}
-              disabled={!state.ready}
-              className="w-5"
-            >
-              <ChevronRight />
-            </Ctl>
-          </span>
-        )}
-        <Tooltip
-          content={
-            isVideo
-              ? `点击时间也能输入跳转。帧率 ${fps.value}${fps.estimated ? "（估算）" : "（默认）"}`
-              : "点击时间可输入跳转"
-          }
-        >
-          <button
-            type="button"
-            onClick={() => onCommand({ type: "gotoTime" })}
-            className="ml-1 min-w-0 truncate rounded px-1 font-mono text-xs tabular-nums text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label="输入时间跳转"
-          >
-            {formatClock(state.time, { digits: clockDigits })}
-            <span className="text-muted-foreground"> / {formatClock(state.duration)}</span>
-          </button>
-        </Tooltip>
-        <span className="flex-1" />
-        <DropdownMenu>
+        <span className="min-w-0 flex-1" />
+        <DropdownMenu onOpenChange={onMenuOpenChange}>
           <Tooltip content="播放速度（[ ] 调整，\\ 复位）">
             <DropdownMenuTrigger
               aria-label={`播放速度 ${formatRate(rate)}`}
@@ -242,10 +197,11 @@ export const MediaTransport = ({
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
-        <div className="group/vol flex items-center">
+        <div className="flex shrink-0 items-center">
           <Ctl label={muted ? "取消静音" : "静音"} shortcut="M" onClick={() => onCommand({ type: "mute" })}>
             <VolumeIcon volume={volume} muted={muted} />
           </Ctl>
+          {/* 窄控制区不放滑块（会把右侧挤出窗外），静音键 + 键盘 ↑↓ 够用；够宽再出现 */}
           <input
             type="range"
             min={0}
@@ -254,34 +210,33 @@ export const MediaTransport = ({
             value={muted ? 0 : volume}
             onChange={(e) => onSetVolume(Number(e.target.value))}
             aria-label="音量"
-            className="h-1 w-14 cursor-pointer accent-primary"
+            className="hidden h-1 w-14 cursor-pointer accent-primary @sm:block"
           />
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-0.5">
-        <Ctl
-          label="设 A 点（区间起点）"
-          shortcut="I"
-          onClick={() => onCommand({ type: "abIn" })}
-          active={ab.a !== null}
-          className="w-auto px-1.5 font-mono text-xs"
-        >
-          A{ab.a !== null && <span className="ml-0.5 text-[11px]">{formatClock(ab.a, { digits: 1 })}</span>}
-        </Ctl>
-        <Ctl
-          label="设 B 点（区间终点）"
-          shortcut="O"
-          onClick={() => onCommand({ type: "abOut" })}
-          active={ab.b !== null}
-          className="w-auto px-1.5 font-mono text-xs"
-        >
-          B{ab.b !== null && <span className="ml-0.5 text-[11px]">{formatClock(ab.b, { digits: 1 })}</span>}
-        </Ctl>
-        {abActive && (
-          <Ctl label="清除 A-B 区间" shortcut="X" onClick={() => onCommand({ type: "abClear" })}>
-            <X />
-          </Ctl>
+      <div className="flex items-center gap-0.5">
+        {isVideo && (
+          <>
+            <Ctl
+              label="上一帧"
+              shortcut=","
+              onClick={() => onCommand({ type: "frame", dir: -1 })}
+              disabled={!state.ready}
+              className="w-6"
+            >
+              <ChevronLeft />
+            </Ctl>
+            <Ctl
+              label="下一帧"
+              shortcut="."
+              onClick={() => onCommand({ type: "frame", dir: 1 })}
+              disabled={!state.ready}
+              className="w-6"
+            >
+              <ChevronRight />
+            </Ctl>
+          </>
         )}
         {isVideo && hasCaptionTracks && (
           <>
@@ -291,7 +246,7 @@ export const MediaTransport = ({
             </Ctl>
           </>
         )}
-        <span className="flex-1" />
+        <span className="min-w-0 flex-1" />
         <Ctl
           label={loop === "off" ? "循环：关" : loop === "one" ? "循环：单个" : "循环：整组"}
           shortcut="R"
@@ -315,15 +270,7 @@ export const MediaTransport = ({
             {isFullscreen ? <Minimize /> : <Maximize />}
           </Ctl>
         )}
-        <Ctl
-          label={mode === "theater" ? "退出大窗" : "大窗"}
-          shortcut="T"
-          onClick={() => onCommand({ type: "theater" })}
-          active={mode === "theater"}
-        >
-          <RectangleHorizontal />
-        </Ctl>
-        <DropdownMenu>
+        <DropdownMenu onOpenChange={onMenuOpenChange}>
           <Tooltip content="更多">
             <DropdownMenuTrigger aria-label="更多" className={BTN}>
               <MoreHorizontal />

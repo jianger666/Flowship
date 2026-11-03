@@ -2,13 +2,13 @@
 
 /**
  * 音频波形：两层 canvas（淡的底 + 实的已播层，已播层用 clip-path 按进度裁），
- * 进度变化只改 CSS，不重画 canvas。A-B 区间叠在上面。
+ * 进度变化只改 CSS，不重画 canvas。
  * 峰值没到之前画一排低矮占位条（布局不跳），指针交互照常可用。
  */
 
 import { useEffect, useRef, useState } from "react";
 
-import { abSpan, type TimelineProps } from "@/components/media/media-seek-bar";
+import type { TimelineProps } from "@/components/media/media-seek-bar";
 import { useTimelinePointer } from "@/components/media/use-timeline-pointer";
 import { clampNumber, formatClock } from "@/lib/media/media-time";
 import { cn } from "@/lib/utils";
@@ -55,7 +55,6 @@ export const MediaWaveform = ({
   peaks,
   time,
   duration,
-  ab,
   onSeek,
   onHoverTime,
   onScrubChange,
@@ -96,7 +95,6 @@ export const MediaWaveform = ({
 
   const shown = scrubTime ?? time;
   const progress = duration > 0 ? clampNumber((shown / duration) * 100, 0, 100) : 0;
-  const span = abSpan(ab, duration);
 
   return (
     <div
@@ -114,12 +112,6 @@ export const MediaWaveform = ({
       )}
       {...handlers}
     >
-      {span && (
-        <div
-          className={cn("absolute inset-y-0", ab.enabled ? "bg-warning/25" : "bg-warning/12")}
-          style={{ left: `${span.left}%`, width: `${span.width}%` }}
-        />
-      )}
       <canvas ref={baseRef} className="pointer-events-none absolute inset-0 size-full" />
       <canvas
         ref={playedRef}

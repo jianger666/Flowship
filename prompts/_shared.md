@@ -45,7 +45,7 @@ artifact 里任何**文件位置引用**（task 改动 / 关键参考 / 实施�
 2. **已知行号就写**——`path:line` 或 `path:line-line` 格式（如 `packages/tch-sc/src/components/TaskInfo.vue:120-156`）；前端 markdown 自动渲染成 Cursor 可点链接、用户审 artifact 时一键跳代码
 3. **不知道行号就只写文件路径**——不要瞎编行号
 4. **同一文件多次出现都写完整路径**——build / review agent 按行匹配、basename 简写(如 `selList.vue`)和裸冒号续接(如 `:414-503` 这种没前缀的)都让它找不到、只能 grep 浪费 token。一个文件同一行内列多段、每段都补完整 path、不要省
-5. **不要写绝对路径**（`~/Documents/...` / `/Users/foo/...`）——agent 在 `{{repoPath}}` 下跑、绝对路径换台机器就失效
+5. **不要写绝对路径**（`~/Documents/...` / `/Users/foo/...`）——agent 在 `{{repoPath}}` 下跑、绝对路径换台机器就失效。**例外：引用本机音视频文件**时按下文「本地音视频展示」一节的写法（行内代码 + 绝对路径或相对 cwd 的路径都可以，markdown 链接只能写绝对路径）
 6. **严禁「同上 / 同前 / ↑ / 上同 / ditto」类省略词**（V0.6.0.1 加、用户实测踩过）——表格里多条 row 引用同一文件、每条都把完整 path 写全；agent 自我感觉「读起来重复」是 OK 的、用户拿这些 path 是为了点击跳转、省略词等于让 row 失去 affordance。表格列空间不够也不准缩水成「同上」、要么换段落形式、要么把同一文件的多个引用合并到一行（用顿号分隔多个 `path:line`）
 
 > **多仓场景**：`{{repoPath}}` 是公共父目录（不是 git 仓库自身）、相对路径**首段必须是子仓目录名**（例 `projA/apps/foo/bar.vue`、不是直接 `apps/foo/bar.vue`）；详见 super-prompt 顶部「任务输入」段列出的子仓名清单。

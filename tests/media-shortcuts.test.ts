@@ -57,17 +57,19 @@ describe("resolveMediaShortcut：每个键的映射", () => {
     expect(press("ArrowDown")).toEqual({ type: "volumeBy", delta: -0.05 });
   });
 
-  it("静音 / A-B 点 / 循环", () => {
+  it("静音 / 循环", () => {
     expect(press("m")).toEqual({ type: "mute" });
-    expect(press("i")).toEqual({ type: "abIn" });
-    expect(press("o")).toEqual({ type: "abOut" });
-    expect(press("x")).toEqual({ type: "abClear" });
     expect(press("r")).toEqual({ type: "loop" });
   });
 
-  it("大窗 / 帮助", () => {
-    expect(press("t")).toEqual({ type: "theater" });
+  it("帮助", () => {
     expect(press("?", VIDEO, { shiftKey: true })).toEqual({ type: "help" });
+  });
+
+  it("已经去掉的功能（A-B 区间 / 大窗）不再占键：i o x t 返回 null，不吞按键", () => {
+    for (const key of ["i", "o", "x", "t", "I", "O", "X", "T"]) {
+      expect(press(key), key).toBeNull();
+    }
   });
 
   it("Home / End 跳到开头 / 结尾", () => {
@@ -89,7 +91,7 @@ describe("resolveMediaShortcut：每个键的映射", () => {
   });
 
   it("音频同样能用的键不受 kind 影响", () => {
-    for (const key of [" ", "k", "j", "l", "m", "i", "o", "x", "r", "t", "[", "]", "ArrowLeft", "Home"]) {
+    for (const key of [" ", "k", "j", "l", "m", "r", "[", "]", "ArrowLeft", "Home"]) {
       expect(press(key, AUDIO), key).not.toBeNull();
       expect(press(key, AUDIO)).toEqual(press(key, VIDEO));
     }

@@ -2,7 +2,7 @@
  * 播放器快捷键：按键 → 命令（纯函数，组件只负责执行命令）
  *
  * 键位参照 YouTube / 剪辑软件的肌肉记忆：空格 / K 播放，J / L 后退前进 10 秒，← → 5 秒，
- * `,` `.` 逐帧，I / O 设 A-B 点，数字键（有对比组时）切换第几个文件。
+ * `,` `.` 逐帧，数字键（有对比组时）切换第几个文件。
  * 带 ⌘ / Ctrl / Alt 的组合一律不处理——留给应用的全局快捷键（⌘K / ⌘B 等）。
  */
 
@@ -20,12 +20,8 @@ export type MediaCommand =
   | { type: "rateReset" }
   | { type: "volumeBy"; delta: number }
   | { type: "mute" }
-  | { type: "abIn" }
-  | { type: "abOut" }
-  | { type: "abClear" }
   | { type: "loop" }
   | { type: "fullscreen" }
-  | { type: "theater" }
   | { type: "pip" }
   | { type: "captions" }
   | { type: "item"; index: number }
@@ -87,18 +83,10 @@ export const resolveMediaShortcut = (
       return { type: "volumeBy", delta: -0.05 };
     case "m":
       return { type: "mute" };
-    case "i":
-      return { type: "abIn" };
-    case "o":
-      return { type: "abOut" };
-    case "x":
-      return { type: "abClear" };
     case "r":
       return { type: "loop" };
     case "f":
       return ctx.kind === "video" ? { type: "fullscreen" } : null;
-    case "t":
-      return { type: "theater" };
     case "p":
       return ctx.kind === "video" ? { type: "pip" } : null;
     case "c":
