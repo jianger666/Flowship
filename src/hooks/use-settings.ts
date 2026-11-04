@@ -178,6 +178,8 @@ const FIELD_EQ_KIND = {
   feishuChatBridge: "boolFalse",
   isolateWorktreeDefault: "boolTrue",
   feishuBridgeKeepAwake: "boolTrue",
+  feishuGroupNonOwnerGuard: "boolTrue",
+  feishuGroupAllowBots: "boolTrue",
   teamKnowledgeEnabled: "boolTrue",
   repos: "repos",
   disabledMcpServers: "stringSet",
@@ -396,6 +398,16 @@ export const useSettings = (): UseSettingsResult => {
       ),
       feishuBridgeKeepAwake: !isFieldEqual(
         "feishuBridgeKeepAwake",
+        settings,
+        savedSettings,
+      ),
+      feishuGroupNonOwnerGuard: !isFieldEqual(
+        "feishuGroupNonOwnerGuard",
+        settings,
+        savedSettings,
+      ),
+      feishuGroupAllowBots: !isFieldEqual(
+        "feishuGroupAllowBots",
         settings,
         savedSettings,
       ),

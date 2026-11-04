@@ -43,6 +43,13 @@ import {
 } from "@/lib/server/task-stream";
 
 export const TALK_QUEUE_MAX = 10;
+/**
+ * 群里非属主（group_other）在 task 待送达队列里最多占几条：独立于总上限 {@link TALK_QUEUE_MAX}，
+ * 否则陌生人连发几条就把属主自己的输入条挤成 409「排队已满」。
+ */
+export const TALK_QUEUE_GROUP_OTHER_MAX = 5;
+/** 同一个发言人在 group_other 里最多占几条（与旧群问题队列的每人 2 槽同口径） */
+export const TALK_QUEUE_GROUP_OTHER_MAX_PER_SENDER = 2;
 /** 排队条目最长躺内存时间（重放仍走完整校验，图 base64 可接受） */
 export const TALK_QUEUE_TTL_MS = 30 * 60 * 1000;
 
@@ -58,9 +65,11 @@ export type TalkQueueStoredItem = {
   options: TaskQuestionInjectOptions;
   senderName?: string;
   senderIsBot?: boolean;
+  /** 发言人稳定 id（group_other 的每人槽位按它算；展示名经常拿不到） */
+  senderKey?: string;
   preview: string;
   createdAt: number;
-  /** 幂等键：app clientItemId（群来源目前不传） */
+  /** 幂等键：app clientItemId / group_other 的飞书 message_id（其余群来源不传） */
   dedupeKey?: string;
   /**
    * 入队时正文的指纹（与空闲直送的去重 key 同口径，见 task-inject-shared）。只在带 dedupeKey 时记。
@@ -233,7 +242,11 @@ export const classifyReplayConflict = async (res: Response): Promise<ReplayConfl
  * 丢弃时把完整原文放进事件 meta 的来源：**用户自己的话**（app 输入条 / 群属主）。
  * 托办回执（group_reply）是外部机器人的回执，不是用户要重发的话，只留单行摘要、不把全文存进 meta。
  */
-const USER_TEXT_SOURCES: readonly TalkQueueOwnedSource[] = ["app", "group_owner"];
+const USER_TEXT_SOURCES: readonly TalkQueueOwnedSource[] = [
+  "app",
+  "group_owner",
+  "group_other",
+];
 
 const bodyTextOf = (item: TalkQueueStoredItem): string => {
   const raw = (item.rawBody as { text?: unknown } | null | undefined)?.text;
@@ -261,7 +274,10 @@ const discardWithInfo = async (
   taskId: string,
   reason: string,
   item: TalkQueueStoredItem,
+  /** group_other 才用：决定给群里发言人回哪一句（见 notifyGroupOtherDropped） */
+  dropReason: GroupOtherDropReason = "failed",
 ): Promise<void> => {
+  notifyGroupOtherDropped(taskId, item, dropReason, reason);
   const header = `排队的消息没送出去：${oneLine(reason)}`;
   const text = userTextOf(item);
   let notice: ReturnType<typeof buildDroppedQueueNotice>;
@@ -314,6 +330,62 @@ export const buildReplayOptions = (
   },
 });
 
+// ----------------- group_other 被丢弃时给群里的人回一句 -----------------
+//
+// 非属主的消息入队时群里已经回过「收到，排队了」——后来被丢（过期 / 任务被停 / 属主在 app 里删了 /
+// 重放失败）就不能静默：必须有人告诉发言人没接住。本模块不依赖飞书（依赖方向：task 侧不 import 群模块），
+// 所以只暴露一个钩子，由群出向模块在 bootstrap 时注册；没注册（单测 / 桥接关）就什么都不发。
+
+export type GroupOtherDropReason =
+  | "expired"
+  | "stopped"
+  | "deleted"
+  | "failed"
+  /** 任务终结 / 归档 / 删除时整队清（clearTalkQueue 的无 onlySources 调用） */
+  | "closed";
+
+export type GroupOtherDroppedInfo = {
+  taskId: string;
+  reason: GroupOtherDropReason;
+  /** failed 时的人话原因 */
+  detail?: string;
+  /** 入队时 userReplyMetaExtra（groupChatId / feishuMessageId / groupSender / groupSenderOpenId / groupSenderIsBot） */
+  meta: Record<string, unknown> | undefined;
+  senderIsBot: boolean;
+};
+
+const DROP_HANDLER_KEY = "__flowshipTalkQueueGroupOtherDropHandlerV1__";
+
+export const setTalkQueueGroupOtherDropHandler = (
+  fn: ((info: GroupOtherDroppedInfo) => void) | null,
+): void => {
+  (globalThis as unknown as Record<string, unknown>)[DROP_HANDLER_KEY] = fn;
+};
+
+const notifyGroupOtherDropped = (
+  taskId: string,
+  item: TalkQueueStoredItem,
+  reason: GroupOtherDropReason,
+  detail?: string,
+): void => {
+  if (item.source !== "group_other") return;
+  const fn = (globalThis as unknown as Record<string, unknown>)[
+    DROP_HANDLER_KEY
+  ] as ((info: GroupOtherDroppedInfo) => void) | null | undefined;
+  if (!fn) return;
+  try {
+    fn({
+      taskId,
+      reason,
+      ...(detail ? { detail } : {}),
+      meta: item.options.userReplyMetaExtra,
+      senderIsBot: item.senderIsBot === true,
+    });
+  } catch (err) {
+    console.warn(`[task-talk-queue] group_other 丢弃回执钩子抛错 task=${taskId}:`, err);
+  }
+};
+
 /** 清掉所有超过 TTL 的条目（不管任务忙不忙：躺满 30 分钟就该让用户知道没送出去） */
 const sweepExpired = (taskId: string): void => {
   const st = getState();
@@ -326,7 +398,7 @@ const sweepExpired = (taskId: string): void => {
   if (keep.length === 0) st.queues.delete(taskId);
   else st.queues.set(taskId, keep);
   for (const e of expired) {
-    void discardWithInfo(taskId, "排队超过 30 分钟已过期", e);
+    void discardWithInfo(taskId, "排队超过 30 分钟已过期", e, "expired");
   }
   publishSnapshot(taskId);
 };
@@ -354,7 +426,10 @@ const drainOnce = async (taskId: string): Promise<void> => {
     stopDrainTimerIfIdle(taskId);
     return;
   }
-  const item = q.shift()!;
+  // 属主 / app / 托办回执优先，群里非属主（group_other）的垫后：陌生人排了一串也不能挡住属主自己的话；
+  // 同类之间仍保持入队先后（FIFO）。没有 group_other 时与原先的 shift() 完全一致。
+  const pickIdx = q.findIndex((e) => e.source !== "group_other");
+  const item = q.splice(pickIdx >= 0 ? pickIdx : 0, 1)[0]!;
   if (q.length === 0) st.queues.delete(taskId);
   publishSnapshot(taskId);
 
@@ -365,10 +440,16 @@ const drainOnce = async (taskId: string): Promise<void> => {
     // 群来源按设计保留），此时注入链会走唤醒分支，外部机器人的回执就把刚停下的 agent 叫醒了。
     // 所以重放前必须再判一次会话；不在就丢弃并写 info（不静默，属主能在事件流看到去向）。
     // 只管 group_reply：属主本人的话（app / group_owner）本来就允许在空闲时唤醒。
-    if (item.source === "group_reply" && !agentSessions.has(taskId)) {
+    // group_other（群里非属主并入同会话）同理：没有活会话就不并入——绝不唤醒 / 起一次性 agent。
+    if (
+      (item.source === "group_reply" || item.source === "group_other") &&
+      !agentSessions.has(taskId)
+    ) {
       await discardWithInfo(
         taskId,
-        "会话已断开，托办回执不会自动唤醒 agent",
+        item.source === "group_other"
+          ? "会话已断开，群成员排队的消息不会自动唤醒 agent"
+          : "会话已断开，托办回执不会自动唤醒 agent",
         item,
       );
       return;
@@ -383,14 +464,21 @@ const drainOnce = async (taskId: string): Promise<void> => {
     );
     if (res.ok || res.status === 202) return;
     const conflict = await classifyReplayConflict(res);
-    if (conflict === "stopping" && STOP_CLEARED_SOURCES.includes(item.source)) {
+    if (
+      conflict === "stopping" &&
+      (STOP_CLEARED_SOURCES.includes(item.source) ||
+        item.source === "group_other")
+    ) {
       // 重放恰好落在 stop 收尾窗口：这一条早被 shift 出队，stop 的清队（在 await 之后才跑）清不到它。
       // stop 要清的来源（app）在这里等价地丢掉——放回队首的话，stop 结束后会被重放成一次用户点了停止
       // 之后的意外新 run。群来源（stop 保留的）走下面的放回，stop 结束后照常送达。写 info 不静默。
       await discardWithInfo(
         taskId,
-        "任务被停止，输入条排的队已按停止清除",
+        item.source === "group_other"
+          ? "任务被停止，群成员排队的消息已按停止清除"
+          : "任务被停止，输入条排的队已按停止清除",
         item,
+        "stopped",
       );
       return;
     }
@@ -450,13 +538,18 @@ export type EnqueueTalkMessageInput = {
   options: TaskQuestionInjectOptions;
   senderName?: string;
   senderIsBot?: boolean;
+  /** group_other：发言人稳定 id（每人槽位按它算） */
+  senderKey?: string;
   preview?: string;
   clientItemId?: string;
 };
 
 export type EnqueueTalkMessageResult =
   | { ok: true; itemId: string; position: number; duplicate?: true }
-  | { ok: false; reason: "full" | "closing" };
+  | {
+      ok: false;
+      reason: "full" | "closing" | "group_other_full" | "group_other_sender_full";
+    };
 
 /** 入队；满队返回 reason=full，任务正在停止 / 删除 / 终结返回 reason=closing */
 export const enqueueTalkMessage = (
@@ -511,6 +604,22 @@ export const enqueueTalkMessage = (
   if (q.length >= TALK_QUEUE_MAX) {
     return { ok: false, reason: "full" };
   }
+  // 群里非属主：独立上限 + 每人槽位（暂存区里的也算占着）。总上限之外再卡一道，保证属主输入条始终有余量
+  if (input.source === "group_other") {
+    const held = st.held.get(taskId) ?? [];
+    const mine = [...q, ...held].filter((e) => e.source === "group_other");
+    if (mine.length >= TALK_QUEUE_GROUP_OTHER_MAX) {
+      return { ok: false, reason: "group_other_full" };
+    }
+    const key = input.senderKey?.trim();
+    if (
+      key &&
+      mine.filter((e) => e.senderKey === key).length >=
+        TALK_QUEUE_GROUP_OTHER_MAX_PER_SENDER
+    ) {
+      return { ok: false, reason: "group_other_sender_full" };
+    }
+  }
 
   const item: TalkQueueStoredItem = {
     itemId: allocItemId(),
@@ -522,6 +631,7 @@ export const enqueueTalkMessage = (
     },
     ...(input.senderName ? { senderName: input.senderName } : {}),
     ...(input.senderIsBot ? { senderIsBot: true } : {}),
+    ...(input.senderKey?.trim() ? { senderKey: input.senderKey.trim() } : {}),
     preview: input.preview?.trim() || previewFromBody(input.rawBody),
     createdAt: Date.now(),
     ...(dedupeKey && bodyFingerprint ? { dedupeKey, bodyFingerprint } : {}),
@@ -726,9 +836,11 @@ export const removeTalkQueueItems = (
     if (!q) continue;
     const idx = q.findIndex((e) => e.itemId === id);
     if (idx >= 0) {
-      q.splice(idx, 1);
+      const [gone] = q.splice(idx, 1);
       removed.push(id);
       if (q.length === 0) st.queues.delete(taskId);
+      // 属主在 app 里把别人排的这条删了：发言人收到过「收到，排队了」，要告诉他没接住
+      if (gone) notifyGroupOtherDropped(taskId, gone, "deleted");
     }
   }
   if (removed.length > 0) {
@@ -798,10 +910,15 @@ export const clearTalkQueue = (
     if (!only) {
       n += q.length;
       st.queues.delete(taskId);
+      // 整队清（终结 / 归档 / 删除）：排着的群成员消息不能静默消失，让发言人知道没处理
+      for (const e of q) notifyGroupOtherDropped(taskId, e, "closed");
     } else {
       const keep = q.filter((e) => !only.includes(e.source));
       const removed = q.length - keep.length;
       n += removed;
+      for (const e of q) {
+        if (only.includes(e.source)) notifyGroupOtherDropped(taskId, e, "closed");
+      }
       if (keep.length === 0) st.queues.delete(taskId);
       else st.queues.set(taskId, keep);
     }
@@ -832,6 +949,35 @@ export const clearTalkQueueCapturing = (
     items: droppedNoticeItemsOf(removing),
     count: clearTalkQueue(taskId, opts),
   };
+};
+
+/**
+ * 停止时清掉群里非属主（group_other）排的队，并让发言人知道（回群）+ 属主在事件流里留一行 info。
+ *
+ * 为什么 stop 要清它们（而 group_owner / group_reply 保留）：停止会关掉会话——非属主的消息本来就**不许**
+ * 唤醒 / 新起 agent（见 task-question-inject 的 groupNonOwner），留着只会在停止后重放时 100% 落到「没有会话」被丢；
+ * 与其让陌生人干等 30 分钟，不如停止时就明确交代。与 stop 的 `onlySources: ["app"]` 是**两步**（那一步的口径与
+ * tests/talk-queue-clear-callsites.test.ts 钉死的「群来源保留」不变）。
+ * 返回清掉几条。同步取走 + 异步写 info / 回群，失败只告警。
+ */
+export const clearGroupOtherQueueOnStop = (taskId: string): number => {
+  const st = getState();
+  const q = st.queues.get(taskId);
+  if (!q || q.length === 0) return 0;
+  const removed = q.filter((e) => e.source === "group_other");
+  if (removed.length === 0) return 0;
+  const keep = q.filter((e) => e.source !== "group_other");
+  if (keep.length === 0) st.queues.delete(taskId);
+  else st.queues.set(taskId, keep);
+  for (const e of removed) notifyGroupOtherDropped(taskId, e, "stopped");
+  publishSnapshot(taskId);
+  stopDrainTimerIfIdle(taskId);
+  void noticeTalkQueueDropped(taskId, {
+    header: `已停止，${removed.length} 条群成员排队的消息已清除（已在群里告知对方重新 @）`,
+    count: removed.length,
+    items: [],
+  });
+  return removed.length;
 };
 
 /** 被丢弃的条目 → 「未送达」卡片行：用户自己的话取脱敏全文，附件只取数量占位，外部回执 / 空条不进卡 */

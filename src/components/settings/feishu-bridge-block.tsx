@@ -35,6 +35,7 @@ import {
   isFeishuConsumerBlocking,
   type FeishuCheckTone,
 } from "@/lib/feishu-bridge-display";
+import { GROUP_NON_OWNER_GUARD_PROMPT_PREVIEW } from "@/lib/group-non-owner-prompt";
 import { formatRelative } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
 
@@ -149,9 +150,19 @@ const OpenAuthLink = ({ href, label = "去开通" }: { href: string; label?: str
 export const FeishuBridgeBlock = ({
   feishuChatBridge,
   onFeishuChatBridgeChange,
+  feishuGroupNonOwnerGuard,
+  onFeishuGroupNonOwnerGuardChange,
+  feishuGroupAllowBots,
+  onFeishuGroupAllowBotsChange,
 }: {
   feishuChatBridge: boolean;
   onFeishuChatBridgeChange: (next: boolean) => void;
+  /** 群里非宿主成员的提示词约束（全局，默认开；见 group-non-owner-prompt） */
+  feishuGroupNonOwnerGuard: boolean;
+  onFeishuGroupNonOwnerGuardChange: (next: boolean) => void;
+  /** 群里别的机器人 @ 本机机器人是否受理（全局，默认开） */
+  feishuGroupAllowBots: boolean;
+  onFeishuGroupAllowBotsChange: (next: boolean) => void;
 }) => {
   // 探测结果快照（null = 尚未拉到）
   const [status, setStatus] = useState<BridgeStatusPayload | null>(null);
@@ -395,6 +406,62 @@ export const FeishuBridgeBlock = ({
               {welcomeBusy ? <Loader2 className="animate-spin" /> : null}
               机器人打招呼
             </Button>
+          </div>
+
+          {/* 群里非宿主成员 @ 机器人：并入宿主同一个会话后，「只答疑不改代码」靠提示词 + 系统工具硬拒。
+              关 = 群成员与宿主同权（与 lk-harness 项目群一致）——文案必须说清，别让人以为「关 = 恢复旧的受限行为」 */}
+          <div className="space-y-2 border-t pt-3">
+            <SettingRow
+              label="限制群里非宿主成员（只答疑、不改代码）"
+              className="py-0"
+              hint={
+                <>
+                  开：非宿主成员 @ 机器人，只回答问题，不改文件、不推进任务。Flowship 的交卷 / 提问 / 定时 /
+                  分享群等系统工具这一轮一律被拒；使用自定义模型（pi）时这一轮还只开放读文件 / 搜索，
+                  使用 Cursor 模型时读写文件、跑命令没有硬闸、只靠提示词约束。
+                  <br />
+                  关：群成员与宿主<b>同权</b>，@ 机器人说的话和宿主一样处理、不限制工具与改文件（agent 仍可能自行调用
+                  交卷 / 提问 / 定时等系统工具，与 lk-harness 项目群一致）；仅有的区别是：不会触发群里的「推进」口令、
+                  不会顶掉你待答的提问、也不会唤醒已休眠的会话（会话不在时只走只读答疑）。
+                </>
+              }
+              control={
+                <Switch
+                  checked={feishuGroupNonOwnerGuard}
+                  onCheckedChange={onFeishuGroupNonOwnerGuardChange}
+                />
+              }
+            />
+            <details className="rounded-md border px-3 py-2 text-xs">
+              <summary className="cursor-pointer select-none text-muted-foreground">
+                查看提示词（只读）
+              </summary>
+              <pre className="mt-2 whitespace-pre-wrap wrap-anywhere text-muted-foreground">
+                {GROUP_NON_OWNER_GUARD_PROMPT_PREVIEW}
+              </pre>
+              <p className="mt-2 text-muted-foreground">
+                上面这段会追加在每条非宿主群消息的最后；「{"{发言人}"}」运行时替换成对方的群昵称。
+              </p>
+            </details>
+            <SettingRow
+              label="受理群里其他机器人的 @"
+              className="py-0"
+              hint={
+                <>
+                  开：别的机器人在需求群里 @ 本机机器人，和真人一样受理（与 lk-harness 的群内机器人协作一致）。
+                  机器人的消息<b>不受上面那个开关影响、始终按「只答疑、不改代码」处理</b>；提示词要求它不回「收到」
+                  之类的客套，回复也不会自动 @ 对方（要它自己写 @名字），避免两个机器人互相 @ 成环。
+                  <br />
+                  关：机器人发来的 @ 一律静默忽略（只在任务事件流里留一条提示）。
+                </>
+              }
+              control={
+                <Switch
+                  checked={feishuGroupAllowBots}
+                  onCheckedChange={onFeishuGroupAllowBotsChange}
+                />
+              }
+            />
           </div>
         </div>
       )}

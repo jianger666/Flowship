@@ -128,10 +128,16 @@ export const GroupQaRoundCard = memo(function GroupQaRoundCard({
   expanded,
   onToggle,
   events,
+  inline = false,
 }: {
   round: GroupQaRound;
   expanded: boolean;
   onToggle: () => void;
+  /**
+   * 内联在主事件流里的形态：行首多一个「群问答」小标签（流里没有 tab 标题可依托），
+   * 外框由调用方（group-qa-inline-row）画，所以这里不要列表用的分隔线。
+   */
+  inline?: boolean;
   /** 任务全量事件：「查看过程」按 meta.groupRun === round.key 从里面挑；不传则不显示过程块 */
   events: readonly TaskEvent[];
 }) {
@@ -149,7 +155,7 @@ export const GroupQaRoundCard = memo(function GroupQaRoundCard({
   return (
     <div
       id={groupQaRoundDomId(round.key)}
-      className="border-b border-border/50 last:border-b-0"
+      className={inline ? undefined : "border-b border-border/50 last:border-b-0"}
     >
       <button
         type="button"
@@ -157,6 +163,11 @@ export const GroupQaRoundCard = memo(function GroupQaRoundCard({
         aria-expanded={expanded}
         className="flex w-full items-baseline gap-2 px-4 py-2.5 text-left hover:bg-muted/40"
       >
+        {inline && (
+          <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
+            群问答
+          </span>
+        )}
         <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground">
           {formatGroupQaTs(round.ts)}
         </span>

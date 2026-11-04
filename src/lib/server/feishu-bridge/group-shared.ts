@@ -659,6 +659,11 @@ export interface PendingGroupReply {
    */
   sourceMessageId?: string;
   /**
+   * 并入属主同一个会话的非属主一轮（出向从 user_reply 事件现建的登记）：它没有独立的旁路 run，
+   * 这一轮就在主事件流里——回群照常，但**不写群问答 tab 汇总**（新数据不再进 tab）。
+   */
+  sameSession?: boolean;
+  /**
    * **唯一投递判据**：只有 `origin` 等于它的流事件才能攒进本条登记 / flush 它。
    * - `null`  = 属主主链（那条链上的事件不带 origin）
    * - 非 null = 旁路 run 的 token（恒等于本条登记自己的 token）

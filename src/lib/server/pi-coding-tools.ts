@@ -49,6 +49,7 @@ import {
 } from "@/lib/subagent-spec";
 import { withModelBudget, type ModelBudgetSpill } from "./tool-output-budget";
 import { buildMergeTestMrTool } from "./bypass-merge-mr";
+import { touchNonOwnerTurn } from "./non-owner-turn-guard";
 
 const asTool = (d: unknown): ToolDefinition => d as ToolDefinition;
 
@@ -976,13 +977,36 @@ export const buildCodingToolDefs = (
    * 判据与接线见 shellTool 里的注释）。默认（属主会话）照常继承。
    */
   opts: { omitGitToken?: boolean } = {},
-): ToolDefinition[] => [
-  withModelBudget(shellTool(cwd, { omitGitToken: opts.omitGitToken === true }), spill),
-  withModelBudget(globTool(cwd), spill),
-  withModelBudget(deleteTool(cwd, spill?.taskId), spill),
-  withModelBudget(taskTool(runSubagent), spill),
-  ...buildNativeToolAliasWrappers(cwd, spill),
-];
+): ToolDefinition[] => {
+  const taskId = spill?.taskId;
+  // 群里非属主并入同会话的那一轮（non-owner-turn-guard 有标记）：read / grep / glob 套与只读旁路同一套执行层守卫
+  // （凭据文件拦 + 目录钳制）。标记在 execute 那一刻才查——同一份工具定义属主的轮次零影响；
+  // 标记只在「提示词开关开 + 本轮是非属主」时才有，开关关 = 同权、不拦。
+  const guardedWhileNonOwnerTurn = (
+    def: ToolDefinition,
+    makeCheck: (c: string, t: string) => (params: unknown) => string | null,
+  ): ToolDefinition => {
+    if (!taskId) return def;
+    const check = makeCheck(cwd, taskId);
+    return withBypassGuard(def, (params) =>
+      // 命中即续期（超长的纯 read / grep 一轮也不能被固定 TTL 熬过期，第 20 轮评审 N1）
+      touchNonOwnerTurn(taskId) ? check(params) : null,
+    );
+  };
+  const native = buildNativeToolAliasWrappers(cwd, spill).map((d) => {
+    const name = (d as { name?: unknown }).name;
+    if (name === "read") return guardedWhileNonOwnerTurn(d, checkBypassRead);
+    if (name === "grep") return guardedWhileNonOwnerTurn(d, checkBypassSearchBase);
+    return d;
+  });
+  return [
+    withModelBudget(shellTool(cwd, { omitGitToken: opts.omitGitToken === true }), spill),
+    guardedWhileNonOwnerTurn(withModelBudget(globTool(cwd), spill), checkBypassSearchBase),
+    withModelBudget(deleteTool(cwd, spill?.taskId), spill),
+    withModelBudget(taskTool(runSubagent), spill),
+    ...native,
+  ];
+};
 
 /**
  * 摘掉 GitLab token 的 pi 原生 `bash`——给「无 GitLab 凭证」会话的 general 子代理用。

@@ -42,6 +42,11 @@ const {
   pumpGroupQuestionQueue,
   routeGroupInboundMessage,
 } = await import("@/lib/server/feishu-bridge/group-route");
+// 这份文件的用例都钉在「机器人发件人一律被准入闸拒绝」的口径上（P0 硬化）。2026-11-04 起设置「受理群里其他机器人的 @」
+// 默认开，所以这里显式把它钉回关——只改 setup、断言一字未动；放开后的语义见 tests/group-bots-allowed.test.ts。
+const { __setGroupBotsAllowedForTest } = await import(
+  "@/lib/server/group-non-owner-guard-config"
+);
 const shared = await import("@/lib/server/feishu-bridge/group-shared");
 const { __resetGroupRosterForTest } = await import(
   "@/lib/server/feishu-bridge/group-roster"
@@ -138,6 +143,7 @@ const installDeps = (over: Record<string, unknown> = {}) =>
   } as never);
 
 beforeEach(() => {
+  __setGroupBotsAllowedForTest(false);
   __resetGroupRosterForTest();
   __resetGroupChatCacheForTest();
   shared.__resetGroupReplyStateForTest();

@@ -12,6 +12,13 @@
 import { isHiddenFromEventStream } from "./event-stream-hidden";
 import type { ActionRecord, TaskEvent } from "./types";
 
+/**
+ * 并入同会话的群成员（非属主）的话：对主事件流可见（不属于「被藏起来」那一类、过不了 isHiddenFromEventStream
+ * 的闸），但**不是属主自己说的**——↑ 历史同样不能收，否则属主按 ↑ 会把别人的话填进自己的输入框。
+ */
+const isNonOwnerGroupTurn = (ev: TaskEvent): boolean =>
+  ev.meta?.groupNonOwnerTurn === true;
+
 /** 相邻重复不入列（连着发两条一样的、↑ 不该按两下才动） */
 const pushIfNotRepeat = (out: string[], text: string): void => {
   const t = text.trim();
@@ -33,7 +40,7 @@ export const buildInputHistory = (events: TaskEvent[]): string[] => {
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i]!;
     if (ev.kind !== "user_reply") continue;
-    if (isHiddenFromEventStream(ev)) continue;
+    if (isHiddenFromEventStream(ev) || isNonOwnerGroupTurn(ev)) continue;
     pushIfNotRepeat(out, ev.text ?? "");
   }
   return out;
@@ -54,7 +61,7 @@ export const buildTaskInputHistory = (
 ): string[] => {
   const entries: Array<{ ts: number; order: number; text: string }> = [];
   for (const ev of events) {
-    if (ev.kind !== "user_reply" || isHiddenFromEventStream(ev)) continue;
+    if (ev.kind !== "user_reply" || isHiddenFromEventStream(ev) || isNonOwnerGroupTurn(ev)) continue;
     entries.push({ ts: ev.ts, order: entries.length, text: ev.text ?? "" });
   }
   for (const a of actions) {

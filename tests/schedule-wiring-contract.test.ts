@@ -22,17 +22,23 @@ describe("到点消息走普通用户消息的路径，但不抢用户的东西�
 
   it("task-question-inject：定时触发不 snapshot 产物 / 不认领跳过 / 不唤醒阶段", () => {
     const s = src("src/lib/server/task-question-inject.ts");
-    expect(s).toMatch(/const ackAction =\s*questionOnly \|\| options\.scheduledTrigger\s*\?\s*undefined/);
+    // `guarded` = questionOnly（只读旁路）|| 群里非属主并入活会话（groupNonOwner）——两者都不 ack / 不 askSkip / 不唤醒，
+    // 比原先只认 questionOnly 的口径更宽（questionOnly 仍包含在内）；定时触发这一项照旧
+    expect(s).toMatch(/const guarded = questionOnly \|\| nonOwner;/);
+    expect(s).toMatch(/const ackAction =\s*guarded \|\| options\.scheduledTrigger\s*\?\s*undefined/);
     expect(s).toMatch(
-      /const askSkip =\s*questionOnly \|\| options\.correlatedAnswer \|\| options\.scheduledTrigger\s*\?\s*null/,
+      /const askSkip =\s*guarded \|\| options\.correlatedAnswer \|\| options\.scheduledTrigger\s*\?\s*null/,
     );
-    expect(s).toMatch(/const canResume =\s*!questionOnly &&\s*!options\.scheduledTrigger &&/);
+    expect(s).toMatch(/const canResume =\s*!guarded &&\s*!options\.scheduledTrigger &&/);
   });
 
   it("task-question-inject：scheduledTrigger 一路传到两个最终封装文本的地方（有会话 send / 一次性 agent），脚注才不会掉回「用户的插话」", () => {
     const s = src("src/lib/server/task-question-inject.ts");
-    // deliverTaskQuestion(... , timing, options.scheduledTrigger === true)
-    expect(s).toMatch(/\btiming,\s*options\.scheduledTrigger === true,\s*\),/);
+    // deliverTaskQuestion(... , timing, options.scheduledTrigger === true, <groupNonOwner>)
+    // 末位新增了「群里非属主」参数（nonOwner ? {...} : undefined）；scheduledTrigger 仍紧挨在 timing 之后
+    expect(s).toMatch(
+      /\btiming,\s*options\.scheduledTrigger === true,\s*nonOwner\s*\?\s*\{[\s\S]*?\}\s*:\s*undefined,\s*\),/,
+    );
     // startOneShotQuestion(... , opGen, options.scheduledTrigger === true)
     expect(s).toMatch(/\bopGen,\s*options\.scheduledTrigger === true,\s*\);/);
     const runner = src("src/lib/server/task-runner.ts");
@@ -259,8 +265,9 @@ describe("UI 接线（review 🟡 修复）", () => {
     expect(s).toContain("const isScheduleMsg = isScheduleUserReply(ev);");
     expect(s).toContain("ev.meta.scheduleTitle");
     expect(s).toContain("定时触发 · ${scheduleTitle}");
-    expect(s).toMatch(/onResend &&\s*!isScheduleMsg && \{/);
-    expect(s).toMatch(/editHandler &&\s*!isScheduleMsg && \{/);
+    // 并入同会话的群成员（非宿主）的话也不给重发 / 编辑（以属主身份把别人的话再说一遍）：在 !isScheduleMsg 之后再加一道
+    expect(s).toMatch(/onResend &&\s*!isScheduleMsg &&\s*!isNonOwnerGroupMsg && \{/);
+    expect(s).toMatch(/editHandler &&\s*!isScheduleMsg &&\s*!isNonOwnerGroupMsg && \{/);
     expect(s).toMatch(/canRewind && \{/);
   });
 

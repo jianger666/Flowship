@@ -1086,6 +1086,8 @@ const EventRowImpl = ({
       // （`[群消息·来自 X]` / 全角托办回执头）不是写给人看的，展示去噪正文 + 发言人名。
       // 只改展示：重发 / 编辑仍用原 ev.text（前缀是给 agent 的上下文，原样重发语义才对）。
       const isGroupMsg = ev.meta?.source === "feishu_group";
+      // 并入同会话的群成员（非宿主）的话：不是属主说的——不给「原样重发 / 编辑」（重发 = 以属主身份把别人的话再说一遍）
+      const isNonOwnerGroupMsg = isGroupMsg && ev.meta?.groupNonOwnerTurn === true;
       const groupSender =
         isGroupMsg && typeof ev.meta?.groupSender === "string"
           ? ev.meta.groupSender.trim()
@@ -1125,14 +1127,16 @@ const EventRowImpl = ({
                 disabled: !!rewindingEventId,
               },
               onResend &&
-                !isScheduleMsg && {
+                !isScheduleMsg &&
+                !isNonOwnerGroupMsg && {
                 key: "resend",
                 icon: <RotateCcw className="size-3" />,
                 label: "原样重发这条消息",
                 onClick: () => void runResend(ev.text, ev),
               },
               editHandler &&
-                !isScheduleMsg && {
+                !isScheduleMsg &&
+                !isNonOwnerGroupMsg && {
                 key: "edit",
                 icon: <PencilLine className="size-3" />,
                 label: onEditInPlace
@@ -1173,6 +1177,12 @@ const EventRowImpl = ({
                 <MessageSquareText className="size-3" />
                 {groupSender ? `飞书群 · ${groupSender}` : "来自飞书群"}
               </span>
+              {/* 非宿主标只认服务端明写的 groupNonOwnerTurn（并入同会话的群成员） */}
+              {isNonOwnerGroupMsg && (
+                <Badge variant="outline" size="xs">
+                  非宿主
+                </Badge>
+              )}
               {/* 机器人标只认服务端明写的 groupSenderIsBot；没写就不显示（不猜） */}
               {ev.meta?.groupSenderIsBot === true && (
                 <Badge variant="secondary" size="xs">

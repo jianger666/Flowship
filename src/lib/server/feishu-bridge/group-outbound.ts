@@ -34,6 +34,10 @@ import {
 } from "@/lib/server/task-stream";
 import { buildGroupQaSummaryEvent } from "@/lib/group-qa";
 import { getTask } from "@/lib/server/task-fs";
+import {
+  setTalkQueueGroupOtherDropHandler,
+  type GroupOtherDroppedInfo,
+} from "@/lib/server/task-talk-queue";
 import { ACTION_LABEL, type Task } from "@/lib/types";
 
 import {
@@ -61,6 +65,7 @@ import {
   releaseGroupAdvancePick,
   releaseGroupAdvancePickByAction,
   releaseGroupArtifactCard,
+  rememberGroupReply,
   renewGroupReply,
   setGroupAdvanceExpiryHandler,
   setGroupQuestionDroppedHandler,
@@ -743,7 +748,8 @@ const flushQuestionReply = async (
   // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
   // 发送炸了也记（ok:false）：答案躺 tab 里至少能复制，不至于两边全静默。
   // publish 不带 origin：投不进任何登记、不触发回群。
-  if (entry.runTag) {
+  // 并入同会话的非属主一轮不写（sameSession）：它的问与答都在主事件流里，不再往群问答 tab 灌新数据
+  if (entry.runTag && !entry.sameSession) {
     await writeEventAndPublish(
       taskId,
       buildGroupQaSummaryEvent({
@@ -877,6 +883,8 @@ export const handleDroppedQuestionReply = (
   reason: GroupQuestionDroppedReason,
 ): void => {
   if (dropped.kind !== "question") return;
+  // 并入同会话的非属主一轮：不写群问答 tab 汇总（新数据不进 tab）；属主在主事件流里本就看得到这一轮
+  if (dropped.sameSession) return;
   void (async () => {
     try {
       await writeEventAndPublish(
@@ -897,6 +905,81 @@ export const handleDroppedQuestionReply = (
       );
     } catch (err) {
       warn(`掉落问题汇总 task=${taskId}`, err);
+    }
+  })();
+};
+
+// ----------------- 并入同会话的非属主一轮（从 user_reply 事件现建登记） -----------------
+//
+// 非属主的群消息进属主同一个活会话、逐条各跑一轮（见 task-question-inject 的 groupNonOwner）。
+// 这一轮的 user_reply 事件在**送达成功之后**才落盘，且 meta 里带着回群所需的一切
+//（groupChatId / feishuMessageId / groupSender / groupSenderOpenId / groupSenderIsBot + groupNonOwnerTurn 标记）。
+// 登记就从这条事件现建（restricted 通道、不占属主单格）：
+//   - 登记与 run 严格同序（同一条 per-task 串行链里：user_reply → 本轮 delta / tool_call / message → done），
+//     不存在「登记早于 run」带来的覆盖 / 错投窗口；
+//   - 空闲直送、排队重放（TTQ drain）是同一条路，不需要预登记、也不需要重放闭包；
+//   - 主链帧本来不带 origin，turns 表把「这一轮」的 runTag 当作它们的有效 origin，delta / tool_call / done
+//     就能对号入座，且不会误碰属主那一格（advance / 属主问答）。
+// 已知缝隙：user_reply 落盘与首批 delta 不是原子的——极快的首帧可能先到（此时该 delta 因无登记被丢弃，
+// 只会少答案开头几个字、不会错投）。
+
+type NonOwnerTurnMeta = {
+  chatId: string;
+  openId: string;
+  name: string;
+  messageId?: string;
+  isBot: boolean;
+};
+
+const readNonOwnerTurnMeta = (
+  meta: Record<string, unknown> | undefined,
+): NonOwnerTurnMeta | null => {
+  if (!meta || meta.groupNonOwnerTurn !== true) return null;
+  const chatId = typeof meta.groupChatId === "string" ? meta.groupChatId : "";
+  const openId =
+    typeof meta.groupSenderOpenId === "string" ? meta.groupSenderOpenId : "";
+  if (!chatId || !openId) return null;
+  return {
+    chatId,
+    openId,
+    name: typeof meta.groupSender === "string" ? meta.groupSender : "",
+    ...(typeof meta.feishuMessageId === "string" && meta.feishuMessageId
+      ? { messageId: meta.feishuMessageId }
+      : {}),
+    isBot: meta.groupSenderIsBot === true,
+  };
+};
+
+/** 任务队列里排着的非属主消息被丢弃（过期 / 被停 / 被删 / 重放失败）→ 给发言人回一句，别让人干等 */
+const GROUP_OTHER_DROP_TEXT: Record<
+  GroupOtherDroppedInfo["reason"],
+  (detail?: string) => string
+> = {
+  expired: () => "你这条排队太久没轮到处理（已过期），麻烦重新 @ 我一次",
+  stopped: () => "任务被停止了，你这条排队的消息没处理，等任务恢复后再 @ 我一次",
+  deleted: () => "你这条排队的消息被宿主移出队列了，没有处理",
+  closed: () => "这个任务已经结束（或被删除），你这条排队的消息没有处理",
+  failed: (detail) =>
+    `你这条排队的消息没处理上${detail ? `（${detail}）` : ""}，麻烦再 @ 我一次`,
+};
+
+export const handleGroupOtherDropped = (info: GroupOtherDroppedInfo): void => {
+  // 机器人发言人静默（防互 @ 成环，与回群协议同口径）
+  if (info.senderIsBot) return;
+  const m = readNonOwnerTurnMeta(
+    info.meta ? { ...info.meta, groupNonOwnerTurn: true } : undefined,
+  );
+  if (!m) return;
+  void (async () => {
+    try {
+      if (!(await isBridgeEnabledCached())) return;
+      await sendReceipt(
+        info.taskId,
+        m.chatId,
+        `${mentionTag(m.openId, m.name)} ${GROUP_OTHER_DROP_TEXT[info.reason](info.detail)}`,
+      );
+    } catch (err) {
+      warn(`非属主排队丢弃回执 task=${info.taskId}`, err);
     }
   })();
 };
@@ -924,22 +1007,41 @@ export const handleGroupOutboundEvent = async (
     // 只放行这三种低频的终态 / 进展帧；assistant_delta / event 仍被预筛拦掉（每 token 一发）。
     const isPumpFrame =
       ev.kind === "done" || ev.kind === "task" || ev.kind === "action";
+    // 并入同会话的非属主一轮的起点（user_reply 带 groupNonOwnerTurn）：要穿过预筛现建登记；
+    // 以及这一轮进行中的 turn（登记被挤 / 过期后仍要在 done 清 turn）。同步零 IO。
+    const turns = getReg().turns;
+    const isNonOwnerTurnStart =
+      ev.kind === "event" &&
+      ev.event.kind === "user_reply" &&
+      !ev.origin &&
+      ev.event.meta?.groupNonOwnerTurn === true;
     if (
       !isAsk &&
       !isAskVoid &&
+      !isNonOwnerTurnStart &&
+      !turns.has(taskId) &&
       !hasGroupReplies(taskId) &&
       !(isPumpFrame && groupQuestionQueueLength(taskId) > 0)
     ) {
       return;
     }
     // 桥接总开关关掉时整条群链不跑（与 p2p 出向同口径）；带 8s 缓存、别每个 delta 读盘
-    if (!(await isBridgeEnabledCached())) return;
+    if (!(await isBridgeEnabledCached())) {
+      // 主链 done 无论如何收掉 turn，免得开关关着时它一直挂着
+      if (ev.kind === "done" && !ev.origin) turns.delete(taskId);
+      return;
+    }
 
-    // 这条事件出自哪一路 run（属主主链不带 origin → null）——投递的唯一判据
+    // 这条事件出自哪一路 run（属主主链不带 origin → null）——投递的唯一判据。
+    // 并入同会话的非属主一轮在主链上、帧不带 origin：用这一轮的 runTag 当有效 origin（turns 表）
     const runTag =
-      (ev.kind === "event" || ev.kind === "assistant_delta" || ev.kind === "done"
+      ((ev.kind === "event" ||
+      ev.kind === "assistant_delta" ||
+      ev.kind === "done"
         ? ev.origin
-        : undefined) ?? null;
+        : undefined) ??
+        turns.get(taskId)) ||
+      null;
 
     if (ev.kind === "assistant_delta") {
       appendGroupReplyAnswer(taskId, runTag, ev.text);
@@ -949,6 +1051,8 @@ export const handleGroupOutboundEvent = async (
       try {
         await flushGroupReply(taskId, runTag, ev.ok);
       } finally {
+        // 主链的 done = 并入同会话的那一轮到此为止（无论登记还在不在）
+        if (!ev.origin) turns.delete(taskId);
         // 上一轮答完 → 泵排队（空队秒回；还忙就放回队首等下一轮）。
         // 放 finally：回群发送炸了也不能把排队饿死（外层整段吞异常）。
         try {
@@ -972,6 +1076,37 @@ export const handleGroupOutboundEvent = async (
       return;
     }
     if (ev.kind !== "event") return;
+
+    // 主链上又有一条 user_reply：新一轮开始了。
+    // ① 上一轮非属主的 turn 还没等到 done 就被打断（属主在 app 里「立即发送」等）→ 收口成失败，别让发言人干等；
+    // ② 这条自己就是非属主一轮的起点 → 从它的 meta 现建登记，并把 runTag 记进 turns。
+    // 旁路答疑的问题事件（meta.restrictedRunTag）是另一条线、不在主链上，既不算新一轮也不打断这一轮
+    if (
+      ev.event.kind === "user_reply" &&
+      !ev.origin &&
+      typeof ev.event.meta?.restrictedRunTag !== "string"
+    ) {
+      const stale = turns.get(taskId);
+      if (stale) {
+        turns.delete(taskId);
+        await flushGroupReply(taskId, stale, false);
+      }
+      const m = readNonOwnerTurnMeta(ev.event.meta);
+      if (m) {
+        const handle = rememberGroupReply(taskId, {
+          chatId: m.chatId,
+          requesterOpenId: m.openId,
+          requesterName: m.name,
+          kind: "question",
+          requesterIsBot: m.isBot,
+          ...(m.messageId ? { sourceMessageId: m.messageId } : {}),
+          sameSession: true,
+          channel: "restricted",
+        });
+        if (handle?.runTag) turns.set(taskId, handle.runTag);
+      }
+      return;
+    }
 
     if (ev.event.kind === "ask_user_request") {
       await handleAskUserRequest(taskId, ev.event.meta);
@@ -1008,6 +1143,11 @@ type GroupOutboundGlobal = {
   unsub: (() => void) | null;
   /** per-task 串行链——publish 是同步 fanout、handle 内有 await，不入链会交错 */
   chains: Map<string, Promise<void>>;
+  /**
+   * 并入同会话的非属主一轮：taskId → 这一轮登记的 runTag（主链帧不带 origin、靠它对号入座）。
+   * 只在 per-task 串行链里读写；主链 done / 被新 user_reply 打断时清掉。
+   */
+  turns: Map<string, string>;
 };
 
 const getReg = (): GroupOutboundGlobal => {
@@ -1016,8 +1156,15 @@ const getReg = (): GroupOutboundGlobal => {
     GroupOutboundGlobal | undefined
   >;
   if (!g[REG_KEY]) {
-    g[REG_KEY] = { registered: false, unsub: null, chains: new Map() };
+    g[REG_KEY] = {
+      registered: false,
+      unsub: null,
+      chains: new Map(),
+      turns: new Map(),
+    };
   }
+  // 热更新后沿用的旧 globalThis 注册表可能没有 turns（旧版本建的）：补上
+  g[REG_KEY]!.turns ??= new Map();
   return g[REG_KEY]!;
 };
 
@@ -1032,6 +1179,8 @@ export const ensureFeishuGroupOutboundRegistered = (): void => {
   });
   // question 登记被静默摘掉时写 ok:false 汇总（只进 tab、不回群，十六轮 P3）
   setGroupQuestionDroppedHandler(handleDroppedQuestionReply);
+  // task 待送达队列里排着的非属主消息被丢弃 → 给发言人回一句（task 侧不 import 群模块，靠这个钩子）
+  setTalkQueueGroupOtherDropHandler(handleGroupOtherDropped);
   reg.unsub = subscribeAllTaskStreams((taskId, ev) => {
     const prev = reg.chains.get(taskId) ?? Promise.resolve();
     reg.chains.set(
@@ -1049,8 +1198,10 @@ export const __resetGroupOutboundForTest = (): void => {
   reg.unsub = null;
   reg.registered = false;
   reg.chains.clear();
+  reg.turns.clear();
   clearPumpRetries();
   setGroupAdvanceExpiryHandler(null);
   setGroupQuestionDroppedHandler(null);
+  setTalkQueueGroupOtherDropHandler(null);
   bridgeEnabledCache = null;
 };

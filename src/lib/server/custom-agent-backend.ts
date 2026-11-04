@@ -80,7 +80,12 @@ import {
 } from "@/lib/subagent-spec";
 
 import { dataRoot } from "./data-root";
-import { flowShipTools } from "./flowship-tools";
+import { flowShipTools, invokeFlowshipTool } from "./flowship-tools";
+import {
+  buildNonOwnerToolDenied,
+  NON_OWNER_TURN_ALLOWED_TOOLS,
+} from "@/lib/group-non-owner-prompt";
+import { isNonOwnerTurnActive, touchNonOwnerTurn } from "./non-owner-turn-guard";
 import { listModelOptions } from "./model-catalog";
 import {
   connectMcpServer,
@@ -767,6 +772,37 @@ export const runPiSubagent = async (
  * Flowship 自有工具 + 规范编码工具 → pi ToolDefinition[]。
  * 编码工具（shell/glob/delete/task）由 buildCodingToolDefs 提供、task 的 runSubagent 闭包绑好父会话模型上下文 / cwd。
  */
+/**
+ * 非属主并入同会话的那一轮（non-owner-turn-guard 有标记）：**execute 层**硬拒一切不在白名单里的工具
+ *（shell / write / edit / delete / task / MCP 桥接 / Flowship 系统工具……）。
+ *
+ * 为什么在 pi 的 `setActiveToolsByName` 收窄之外再来一道：收窄只在「下一轮 prompt 生效」的语义上读过源码、没真跑过，
+ * 且 best-effort（抛错只告警）——万一没生效，工具还在模型眼前。这一道不依赖那个钩子：标记在 execute 那一刻才查，
+ * 不在白名单的名字一律回 `[DENIED]`。read / grep / glob 不在这里拦（它们放行但另有凭据文件 + 目录钳制守卫，
+ * 见 pi-coding-tools.buildCodingToolDefs），`wait` 无副作用放行。Cursor 后端的内置工具没有这个咽喉，仍只靠提示词。
+ * 标记只在「提示词开关开 + 本轮是非属主」时才有 → 属主的轮次与开关关闭时完全透传。
+ */
+const withNonOwnerTurnDeny = (def: ToolDefinition, taskId: string): ToolDefinition => {
+  const name = String((def as { name?: unknown }).name ?? "");
+  if (NON_OWNER_TURN_PI_TOOL_NAMES.includes(name)) return def;
+  const prev = (
+    def as unknown as { execute: (...args: unknown[]) => Promise<unknown> }
+  ).execute.bind(def);
+  return {
+    ...(def as unknown as Record<string, unknown>),
+    execute: async (...args: unknown[]) => {
+      // 命中即续期：这一轮还在调工具，标记就不能被固定 TTL 熬过期（第 20 轮评审 N1）
+      if (touchNonOwnerTurn(taskId)) {
+        return {
+          content: [{ type: "text", text: buildNonOwnerToolDenied(name) }],
+          details: undefined,
+        };
+      }
+      return prev(...args);
+    },
+  } as unknown as ToolDefinition;
+};
+
 const buildCustomTools = (
   callerToken: string | undefined,
   cwd: string,
@@ -776,7 +812,7 @@ const buildCustomTools = (
 ): ToolDefinition[] => {
   // V2 落盘配置：全工具共用（编码工具 + MCP 桥接）；无 taskId → V1 后缀
   const spill: ModelBudgetSpill | undefined = taskId ? { taskId } : undefined;
-  return [
+  const all: ToolDefinition[] = [
     ...(callerToken
       ? flowShipTools.map(
         (t) =>
@@ -792,7 +828,8 @@ const buildCustomTools = (
               params: unknown,
               signal?: AbortSignal,
             ) => {
-              const r = await t.handler(
+              const r = await invokeFlowshipTool(
+                t,
                 params as Record<string, unknown>,
                 callerToken,
                 { ...(taskId ? { taskId } : {}), ...(signal ? { signal } : {}) },
@@ -818,6 +855,8 @@ const buildCustomTools = (
     // D1：MCP 桥接工具回包无上限，全包输出预算；flowShipTools（submit_work/ask_user）输出小、不碰
     ...mcpToolDefs.map((d) => withModelBudget(d, spill)),
   ];
+  // 无 taskId（oneshot / 标题生成）没有「非属主轮」的概念，原样返回
+  return taskId ? all.map((d) => withNonOwnerTurnDeny(d, taskId)) : all;
 };
 
 // ----------------- run 适配器 -----------------
@@ -1227,14 +1266,53 @@ interface PiAgentAdapter {
 }
 
 /** create / resume 共用：起 AgentSession + 包成 adapter */
+/**
+ * 群里非属主并入同会话的那一轮（non-owner-turn-guard 有标记）在 pi 上**额外**收窄工具集：
+ * 只剩 read / grep / glob + 无副作用的 wait——写文件 / shell / 删除 / 子代理 / MCP / 系统工具这一轮全部下线。
+ * 这是在「提示词约束 + 系统工具硬拒」之上再加的一层（Cursor 后端没有按轮次改工具集的钩子、做不到，
+ * 那边这些内置工具只剩提示词约束）。
+ *
+ * 切换用 pi 的 `setActiveToolsByName`（0.84.x：只启用注册表里有的名字、重建系统提示词、下一轮 prompt 生效）。
+ * 代价：切进 / 切出各让一次系统提示词缓存失效（非属主轮本来就低频）。
+ * 恢复是**惰性**的：下一次非属主标记不在的 send 才切回完整集（不需要「轮次结束」钩子，也不怕漏清）。
+ * best-effort：切换抛错只告警、不挡这一轮（兜底仍有提示词 + 系统工具硬拒）。
+ */
+export const NON_OWNER_TURN_PI_TOOL_NAMES: readonly string[] = [
+  ...RESTRICTED_READONLY_TOOL_NAMES,
+  ...NON_OWNER_TURN_ALLOWED_TOOLS,
+];
+
 const buildAdapter = async (
   session: AgentSession,
   agentId: string,
   onClose?: () => void,
+  taskId?: string,
 ): Promise<PiAgentAdapter> => {
+  /** 非 null = 当前工具集被收窄过，值是收窄前的完整工具名（下次非属主标记不在时按它切回） */
+  let restoreToolNames: string[] | null = null;
+  const applyTurnToolSet = (): void => {
+    if (!taskId) return;
+    try {
+      const narrow = isNonOwnerTurnActive(taskId);
+      if (narrow && !restoreToolNames) {
+        restoreToolNames = session.getActiveToolNames();
+        session.setActiveToolsByName([...NON_OWNER_TURN_PI_TOOL_NAMES]);
+      } else if (!narrow && restoreToolNames) {
+        const full = restoreToolNames;
+        restoreToolNames = null;
+        session.setActiveToolsByName(full);
+      }
+    } catch (err) {
+      console.warn(
+        `[custom-agent] 按轮次切换工具集失败（task=${taskId}）：`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  };
   return {
     agentId,
     send(prompt: string, opts: SendOptions): Promise<PiRunAdapter> {
+      applyTurnToolSet();
       const run = new PiRunAdapter(session, opts);
       const unsub = session.subscribe((ev) => run.onEvent(ev));
       run.bindUnsubscribe(unsub);
@@ -1303,7 +1381,13 @@ export const createCustomAgent = async (
       sessionManager: SessionManager.create(cwd, piSessionDir()),
     });
     const agentId = session.sessionFile ?? session.sessionId;
-    return buildAdapter(session, agentId, mcp.closeAll);
+    // 只读旁路（readOnly）本来就只有 read/grep/glob、不参与「非属主轮收窄」
+    return buildAdapter(
+      session,
+      agentId,
+      mcp.closeAll,
+      readOnly ? undefined : input.taskId,
+    );
   } catch (err) {
     closeMcpQuietly(mcp);
     throw err;
@@ -1379,7 +1463,13 @@ export const resumeCustomAgent = async (
       customTools,
       sessionManager,
     });
-    return buildAdapter(session, agentId, mcp.closeAll);
+    // 只读旁路（readOnly）本来就只有 read/grep/glob、不参与「非属主轮收窄」
+    return buildAdapter(
+      session,
+      agentId,
+      mcp.closeAll,
+      readOnly ? undefined : input.taskId,
+    );
   } catch (err) {
     closeMcpQuietly(mcp);
     throw err;

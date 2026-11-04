@@ -54,7 +54,12 @@ import {
 } from "@/lib/event-stream-rhythm";
 import { pruneAskDrafts } from "@/lib/ask-draft";
 import { askIdOfEvent, findPendingAskEvent } from "@/lib/ask-pending";
-import { collectGroupQaRounds, pickRoundsNeedingOwner } from "@/lib/group-qa";
+import {
+  collectGroupQaRounds,
+  groupQaRoundOfSummaryEvent,
+  isGroupQaSummaryEvent,
+  pickRoundsNeedingOwner,
+} from "@/lib/group-qa";
 import { deriveGroupQaScope } from "@/lib/group-qa-scope";
 import {
   deriveSearchScopeNotice,
@@ -180,6 +185,7 @@ import {
   ToolBlockRow,
   ToolVerbGroupRow,
 } from "./event-stream/tool-block";
+import { GroupQaInlineRow } from "./group-qa-inline-row";
 import { GroupQaPanel } from "./group-qa-panel";
 import { ActiveStatusLine } from "./event-stream/active-status-line";
 import { BackgroundSubagentsBar } from "./background-subagents-bar";
@@ -1001,6 +1007,11 @@ const EventStreamImpl = ({
   const groupQaRounds = useMemo(
     () => collectGroupQaRounds(task.events ?? []),
     [task.events],
+  );
+  // 做完的旁路轮次以内联卡出现在事件流里：汇总事件按 runTag 找回自己的轮次（带问题原文）
+  const groupQaRoundsByKey = useMemo(
+    () => new Map(groupQaRounds.map((r) => [r.key, r] as const)),
+    [groupQaRounds],
   );
   // 还有没有更早的可拉（初值来自 task.eventsTruncated、之后由分页响应维护）。
   // 声明放这里而不是分页那一段：群问答只统计已加载的事件，tab 要据此说明范围（D8-01）
@@ -2840,6 +2851,14 @@ const EventStreamImpl = ({
                 ) : item.kind === "info" && item.meta?.kind === "reconnecting" ? (
                   // V0.13.x 自动重连过程行（spinner、同 thinking 一档的细行）
                   <ReconnectingRow ev={item} events={task.events} />
+                ) : isGroupQaSummaryEvent(item) &&
+                  groupQaRoundOfSummaryEvent(item, groupQaRoundsByKey) ? (
+                  // 做完的群问答旁路轮次（无活会话降级通道 / 老版本数据）：问 + 答一张卡，内联在事件流里
+                  <GroupQaInlineRow
+                    ev={item}
+                    roundsByKey={groupQaRoundsByKey}
+                    events={task.events}
+                  />
                 ) : isCompactionInfo(item) ? (
                   // 自定义 pi 压缩：跟重连同档，不要走普通 info 灰细线
                   <CompactionRow ev={item} events={task.events} isRunning={isRunning} />

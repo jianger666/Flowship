@@ -221,6 +221,11 @@ import {
   type RunningCheck,
   type TaskOpHandle,
 } from "./task-stream";
+import {
+  beginNonOwnerTurn,
+  clearNonOwnerTurn,
+  endNonOwnerTurn,
+} from "./non-owner-turn-guard";
 import { buildScheduleInfoMeta, SCHEDULE_ONE_SHOT_BOUNDARY_LINES } from "@/lib/schedule";
 import { buildMrNoticeEvent, formatFinalizeNotice } from "@/lib/task-event-text";
 import { cancelAllSchedulesForTask, restoreArchiveCancelledSchedulesDetailed } from "./schedule-store";
@@ -533,6 +538,8 @@ export const closeTaskSession = (
     return false;
   }
   agentSessions.delete(taskId);
+  // 会话没了，其上的「非属主轮」工具硬拒标记也没有意义——无条件清（宁多清别漏清）
+  clearNonOwnerTurn(taskId);
   // 会话是当前的 → 注册表里的 notifier / handler 必属于它、无条件注销安全
   setChatAwaitingNotifier(taskId, null);
   setChatTaskActionHandler(taskId, null);
@@ -4659,6 +4666,8 @@ const consumeSessionRun = async (
      * 状态写门控走 isOpOwner；observer 的 release 是 no-op。
      */
     opHandle: TaskOpHandle;
+    /** 非属主轮的按轮次标记 token（sendToTaskSessionBody 登记）：本函数最外层 finally 按它收口 */
+    nonOwnerTurnToken?: string;
   },
 ): Promise<void> => {
   let cancelled = false;
@@ -5625,6 +5634,8 @@ const consumeSessionRun = async (
       }
     }
   } finally {
+    // 非属主轮结束：先于一切收尾释放按轮次的工具硬拒标记（按 token，不误清后继）
+    endNonOwnerTurn(task.id, opts.nonOwnerTurnToken);
     // 收尾持有者闭合未配对 tool running（cancel / error / finished 共用入口）
     // 必须在 release 之前；失主（已被后继 claim）lease 拒写、不伤 B
     // R14 Q7b-02：闭合本身抛错（读事件尾部 / 停后台 shell 跟踪失败：Windows 杀软 / 句柄占用 / EIO / ENOSPC）不能挡住下面的释放——
@@ -5951,6 +5962,12 @@ export const deliverTaskQuestion = async (
   timing?: (entry: string) => void,
   /** 定时到点的消息（不是用户插话）：封装脚注换成「系统定时触发」版本，见 buildAgentMessage.scheduled */
   scheduled?: boolean,
+  /**
+   * 群里**非属主**触发的一轮（并入同会话路径）。`guard` 为真（提示词开关开）时：
+   * 脚注换成「只答疑」约束段，且这一轮的 Flowship 系统工具被硬拒（non-owner-turn-guard）。
+   * 开关关时传 `{ guard: false }`——只是不加约束，仍不带 ackContext / 不 resume（调用方保证）。
+   */
+  groupNonOwner?: { name: string; guard: boolean; isBot?: boolean },
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
     task,
@@ -5961,10 +5978,24 @@ export const deliverTaskQuestion = async (
       attachmentPaths,
       ackContext,
       scheduled,
+      ...(groupNonOwner?.guard
+        ? {
+            groupNonOwnerGuard: {
+              name: groupNonOwner.name,
+              ...(groupNonOwner.isBot ? { isBot: true } : {}),
+            },
+          }
+        : {}),
     }),
     ackContext
       ? { creds, errorActionId: ackContext.actionId, opGen, timing }
-      : { creds, questionRun: true, opGen, timing },
+      : {
+          creds,
+          questionRun: true,
+          opGen,
+          timing,
+          ...(groupNonOwner?.guard ? { nonOwnerTurn: true } : {}),
+        },
   );
 
 /**
@@ -6448,6 +6479,8 @@ const sendToTaskSession = async (
     opGen?: number;
     /** 分节计时收集器（deliver 子阶段透出给 question-timing） */
     timing?: (entry: string) => void;
+    /** 本轮由群里非属主触发且提示词开关开：send 前登记按轮次标记，系统工具硬拒（见 non-owner-turn-guard） */
+    nonOwnerTurn?: boolean;
   } = {},
 ): Promise<SendTaskSessionResult> => {
   // admission 在进 runWithTaskSendSerial 之前同步捕获——
@@ -6475,11 +6508,16 @@ const sendToTaskSessionBody = async (
     entryOpHandle: TaskOpHandle;
     /** 分节计时收集器（deliver 子阶段透出给 question-timing） */
     timing?: (entry: string) => void;
+    nonOwnerTurn?: boolean;
   },
 ): Promise<SendTaskSessionResult> => {
   // 由 sendToTaskSession 入口传入（禁止出队后自取 opGen / observer）
   const opGen = opts.opGen!;
   const entryOpHandle = opts.entryOpHandle;
+  // 非属主轮的按轮次标记（见 non-owner-turn-guard）：send 前登记、交给 consume 后由它收口；
+  // 没走到 consume 的出口（send 失败 / stale / 让位）由本函数 finally 兜底清
+  let nonOwnerToken: string | undefined;
+  let nonOwnerHandedOff = false;
   beginTaskStarting(task.id);
   try {
     // 每处 stale 显式返 "stale"，不得折叠成 false/no_session
@@ -6507,6 +6545,8 @@ const sendToTaskSessionBody = async (
     }
     // drain 期间同 gen claim 也要让位（纯 gen 比对看不见）
     if (entryLost()) return "stale";
+    // 上一轮已排空：属主自己的 send 起点无条件清掉可能残留的非属主标记（漏清 = 属主的 submit_work 被拒）
+    if (!opts.nonOwnerTurn) clearNonOwnerTurn(task.id);
     // 堆内存门：高压直接抛（冒到 UI，不建新 agent——no_session 分流会起新会话、反向加重内存）。
     // try/finally 会放行 starting 态，安全。调用方用 instanceof HeapPressureError 识别。
     try {
@@ -6612,6 +6652,8 @@ const sendToTaskSessionBody = async (
       return "stale";
     };
     let run: SessionRun;
+    // 非属主轮：必须在 agent.send **之前**登记（send 一返回 agent 就可能开始调工具）
+    if (opts.nonOwnerTurn) nonOwnerToken = beginNonOwnerTurn(task.id);
     try {
       const runKind =
         opts.runKind ?? (opts.questionRun ? "question" : "task-followup");
@@ -6751,10 +6793,12 @@ const sendToTaskSessionBody = async (
     }
     // consume 直接用入场 entryOpHandle——禁止 send 后再 snapshotTaskOp
     // .catch 是兜底：consume 内部已 try/catch/finally 全包，万一仍有漏网也只记日志、不变 unhandledRejection（R14 Q7b-02）
+    nonOwnerHandedOff = true;
     void consumeSessionRun(task, agent, run, {
       errorActionId: opts.errorActionId,
       questionRun: opts.questionRun,
       opHandle: entryOpHandle,
+      nonOwnerTurnToken: nonOwnerToken,
     }).catch((err) => {
       console.error(
         `[task-runner] sendToTaskSession: task=${task.id} consume 异常退出`,
@@ -6763,6 +6807,8 @@ const sendToTaskSessionBody = async (
     });
     return "sent";
   } finally {
+    // 没交给 consume 的出口（send 抛错 / stale / 让位）：标记没人收口，这里清
+    if (!nonOwnerHandedOff) endNonOwnerTurn(task.id, nonOwnerToken);
     endTaskStarting(task.id);
   }
 };

@@ -173,6 +173,18 @@ export const readGroupQaSummary = (ev: TaskEvent): GroupQaSummaryMeta | null => 
   };
 };
 
+/**
+ * 汇总事件 → 它对应的轮次（事件流内联卡用）。
+ * 汇总缺 runTag（脏数据）/ 轮次表里没有 = null，调用方落回普通 info 细线，不画卡。
+ */
+export const groupQaRoundOfSummaryEvent = (
+  ev: TaskEvent,
+  roundsByKey: ReadonlyMap<string, GroupQaRound>,
+): GroupQaRound | null => {
+  const s = readGroupQaSummary(ev);
+  return s ? (roundsByKey.get(s.runTag) ?? null) : null;
+};
+
 /** 群问题事件（新老都有；新的有 runTag，老的走 legacy 配对） */
 const isGroupQuestionEventAny = (ev: TaskEvent): boolean =>
   ev.kind === "user_reply" && metaOf(ev).source === "feishu_group";
@@ -253,7 +265,8 @@ export const formatGroupQaTs = (ts: number): string => {
 };
 
 /**
- * 不进 tab 配对的问题事件：推进占格 / 关联回执喂会话（都没 runTag，进 temporal 就是幻影轮）。
+ * 不进 tab 配对的问题事件：推进占格 / 关联回执喂会话（都没 runTag，进 temporal 就是幻影轮）/
+ * 并入同会话的非属主一轮（groupNonOwnerTurn，答案在主事件流里）。
  * legacy 第二遍与兜底反查表共用这一个，保持一致（防御性对齐：哪天汇总链路一改，
  * 兜底也不会把汇总配到占格/回执问题上）。主流程显隐不受影响。
  */
@@ -261,6 +274,9 @@ const isQaExcludedQuestion = (ev: TaskEvent): boolean => {
   const m = metaOf(ev);
   return (
     m.advancePreempted === true ||
+    // 并入同会话的非属主一轮（2026-11-04）：问与答都在主事件流里，不进群问答 tab——
+    // 否则 temporal 配对会把它当「历史」轮列进来、还会让 tab 对新数据冒出来
+    m.groupNonOwnerTurn === true ||
     m.correlatedAnswer === true ||
     typeof m.correlatedAnswer === "string"
   );

@@ -43,6 +43,8 @@ import type {
 import { getPendingAsk } from "@/lib/server/chat-pending";
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
 import { buildGroupQaSummaryEvent, cleanGroupQuestionText } from "@/lib/group-qa";
+import { buildNonOwnerGroupHeader } from "@/lib/group-non-owner-prompt";
+import { isGroupBotsAllowed } from "@/lib/server/group-non-owner-guard-config";
 import { handleTaskQuestionInject } from "@/lib/server/task-question-inject";
 import { getTask, listTasks } from "@/lib/server/task-fs";
 import { advanceTask } from "@/lib/server/task-runner";
@@ -1272,6 +1274,18 @@ const injectGroupMessage = async (args: {
   // 回放走普通消息的只读旁路：旁路不碰活会话，与 pendingAsk 并存无冲突。
   const hasPendingAsk = !args.fromPump && !!deps.getPendingAsk(taskId);
 
+  // 非属主 + task 型普通消息 + **活会话在场** → 并入属主的同一个会话（逐条，不合批）：不再起只读旁路 agent。
+  // 状态机级拦点（不 ack / 不 askSkip / 不唤醒 / 不新起 agent）由注入链的 groupNonOwner 保证，提示词约束与系统工具
+  // 硬拒由设置里的开关决定（见 group-non-owner-prompt）。没有活会话 → 仍走原只读旁路（降级通道，硬约束）。
+  // 答 pendingAsk / 关联回执喂会话各有自己的门，不算在内。回群不预登记：由出向从这条消息写下的 user_reply 事件
+  // 现建登记（group-outbound 的 non-owner turn，按事件顺序对号入座、没有覆盖 / 错投窗口）。
+  const sameSessionNonOwner =
+    !isOwner &&
+    task.mode !== "chat" &&
+    !hasPendingAsk &&
+    !feedIntoSession &&
+    agentSessions.has(taskId);
+
   // 非属主旁路 run 的 per-task 滑动窗硬上限（G3-02，第六轮口径）：互 @ 熔断删除后唯一的速率闸。
   // 名额只在旁路 run **真正启动**的那一刻扣：admit 点在本函数下方——忙线 / 队满 / 槽位 /
   // 启动凭据都通过之后、紧接着登记回群凭据与注入起 run（admit → 注入调用之间没有 await；
@@ -1355,9 +1369,12 @@ const injectGroupMessage = async (args: {
   // 放在忙线 / 排队判定之前：被拒的机器人发件人不能还被「忙线」「在排队了」之类回执刷屏。
   // 排队回放（fromPump）也走这里——排队期间发件人不合规，回放时照样拒。
   // 属主本人 / chat 型 / 答 pendingAsk / feed 会话的关联回执不经过本闸（各有自己的门）。
-  const restrictedQaDenial = (): RestrictedQaDenyReason | null => {
+  const restrictedQaDenial = async (): Promise<RestrictedQaDenyReason | null> => {
+    const senderIsBot = args.requesterIsBot === true;
     const decision = decideRestrictedQaAdmission({
-      senderIsBot: args.requesterIsBot === true,
+      senderIsBot,
+      // 设置「受理群里其他机器人的 @」：只在发件人是机器人时才去读（真人消息不为它多读一次盘）；读不到 → false（fail-closed）
+      allowBots: senderIsBot ? await isGroupBotsAllowed() : false,
       senderTenantKey: args.senderTenantKey,
       ownTenantKey: getOwnTenantKey(),
       senderExternal: args.senderExternal,
@@ -1386,7 +1403,7 @@ const injectGroupMessage = async (args: {
     };
   };
   if (!isOwner && task.mode !== "chat" && !hasPendingAsk && !feedIntoSession) {
-    const denied = restrictedQaDenial();
+    const denied = await restrictedQaDenial();
     if (denied) return denyRestrictedQa(denied);
   }
 
@@ -1394,8 +1411,11 @@ const injectGroupMessage = async (args: {
     hasPendingAsk || feedIntoSession ? null : groupMessageBusyReason(task);
   // 属主 task 型主链正忙：不在群侧拒收，交给注入链入 task 待送达队列（见下方 queueIfBusy）。
   // 只豁免「主链在跑」；旁路答疑在飞仍按原口径拒（那条是群侧串行闸、不是主链排队）。
+  // 并入同会话的非属主同理：忙时交给注入链入 task 待送达队列（group_other），不在群侧拒收 / 进旧群队列；
+  // 旁路在飞（GROUP_RESTRICTED_QUESTION_RUNNING）对它也不构成忙线——旁路事件带 origin、与主链各走各的登记。
   const busyReason =
-    isOwner && task.mode !== "chat" && rawBusyReason === GROUP_TASK_RUNNING
+    (isOwner && task.mode !== "chat" && rawBusyReason === GROUP_TASK_RUNNING) ||
+    sameSessionNonOwner
       ? null
       : rawBusyReason;
   if (busyReason) {
@@ -1484,6 +1504,21 @@ const injectGroupMessage = async (args: {
     return { kind: "skipped", messageId, taskId, error: busyReason };
   }
 
+  // 并入同会话的非属主 + 带图 + 主链正忙：不排队（图 base64 要在内存躺到 TTL、陌生人连发带图能占满槽位半小时；
+  // 图重发成本低），忙线直接拒收。空闲直送照常走注入链的图片校验落盘。
+  if (
+    sameSessionNonOwner &&
+    (runningTasks.has(task.id) || task.runStatus === "running") &&
+    (parsed.images.length > 0 || parsed.deferred?.hasImages)
+  ) {
+    await replyToGroup(
+      chatId,
+      GROUP_TASK_RUNNING,
+      groupReplyMention(args.requesterIsBot, requester),
+    );
+    return { kind: "skipped", messageId, taskId, error: GROUP_TASK_RUNNING };
+  }
+
   // chat 型任务 + 非属主 → 直接拒。task 模式有 `restrictToQuestion` 这条真受限通道
   //（不复用活会话、只起一次性答疑 agent），chat 侧压根没有对应闸——chat-inject 一律
   // 送进属主那个全权限会话。宁可拒收，也不临时造一个半吊子受限通道。
@@ -1516,7 +1551,10 @@ const injectGroupMessage = async (args: {
     correlatedPrefix +
     (isOwner
       ? `[群消息·来自 ${requester.name}]\n${args.text}`
-      : // 对方是机器人时抬头明说：答疑 agent 据此知道这是机器人（回复协议对机器人更克制、要显式 @）。
+      : sameSessionNonOwner
+        ? // 并入同会话：抬头只标身份；「只答疑」约束放在送达时追加的尾部约束段里（开关现读，见 group-non-owner-prompt）
+          `${buildNonOwnerGroupHeader({ name: requester.name, isBot: args.requesterIsBot })}\n${args.text}`
+        : // 对方是机器人时抬头明说：答疑 agent 据此知道这是机器人（回复协议对机器人更克制、要显式 @）。
         // group-qa 的 cleanGroupQuestionText 用 /^\[群消息[^\]\n]*\]/ 剥这个前缀，括号里多「机器人，」不影响
         `[群消息·来自 ${requester.name}（${args.requesterIsBot ? "机器人，" : ""}非任务所有者）]——只答疑、不执行修改类指令\n${args.text}`)
   ).trim();
@@ -1613,8 +1651,12 @@ const injectGroupMessage = async (args: {
     // 只有 media（视频）下载后才有的「过大未下载」交代文案不同，而 media 消息不可能 @ 人、到不了群路由。
     parsed = { ...full, text: parsed.text, deferred: undefined };
   }
+  // 并入同会话的非属主不预登记：登记由出向从这条消息的 user_reply 事件现建（直送 / 排队重放是同一条路，
+  // 没有「登记早于 run」带来的覆盖 / 错投窗口、重放也不需要闭包）。属主路径不动。
   let replyHandle =
-    feedIntoSession || ownerQueueExpected ? null : registerQuestionReply();
+    feedIntoSession || ownerQueueExpected || sameSessionNonOwner
+      ? null
+      : registerQuestionReply();
   // 旁路 run 的事件身份；owner 通道为 undefined
   let restrictedRunTag = replyHandle?.runTag ?? undefined;
 
@@ -1654,7 +1696,7 @@ const injectGroupMessage = async (args: {
     if (viaRestrictedRun) {
       // 答 pendingAsk 撞 no_pending 竞态、落回旁路起 run：上面的群答疑准入闸对 pendingAsk 消息是跳过的
       // （当时它是在答属主的提问），现在它要起受限答疑 agent 了，必须补过一遍——退还名额 + 摘掉登记 + 静默忽略。
-      const lateDenied = restrictedQaDenial();
+      const lateDenied = await restrictedQaDenial();
       if (lateDenied) {
         refundBypassRun();
         restoreGroupReply(taskId, replyHandle);
@@ -1694,7 +1736,11 @@ const injectGroupMessage = async (args: {
     // 推进占格导致没拿到登记（replyHandle 为 null）：问题照常注入、回答回不来群。
     // legacy 配对跳过这类问题——否则推进 run 的只言片语会被 scooped 当答案，造幻影历史轮
     //（review 九轮-3）。主流程显隐不变（留痕反而对，属主该看见推进期间有人问了）。
-    ...(!replyHandle && viaRestrictedRun ? { advancePreempted: true as const } : {}),
+    ...(!replyHandle && viaRestrictedRun && !sameSessionNonOwner
+      ? { advancePreempted: true as const }
+      : {}),
+    // 并入同会话的非属主：出向据此从 user_reply 事件现建回群登记；UI / chat-turns 据此识别「非属主的话」
+    ...(sameSessionNonOwner ? { groupNonOwnerTurn: true as const } : {}),
     // 关联命中留痕：事件流里能看出这条是托办事项的回执（出问 message_id）
     ...(correlated
       ? { correlatedAnswer: correlated.entry.messageId }
@@ -1703,7 +1749,7 @@ const injectGroupMessage = async (args: {
   };
   // feedIntoSession 时走属主语义（restrictToQuestion:false + correlatedAnswer 上下文）；
   // 否则非属主一律只答疑（原语义不动）。
-  const useOwnerInject = isOwner || feedIntoSession;
+  const useOwnerInject = isOwner || feedIntoSession || sameSessionNonOwner;
   let resp: Response;
   try {
     resp =
@@ -1727,9 +1773,19 @@ const injectGroupMessage = async (args: {
               attachments:
                 parsed.attachments.length > 0 ? parsed.attachments : undefined,
               bootArgs,
+              // 并入同会话的非属主：飞书消息 id 当幂等键（直送去重；入队去重见 queueIfBusy.clientItemId）
+              ...(sameSessionNonOwner ? { clientItemId: messageId } : {}),
             },
             {
               userReplyMetaExtra: metaExtra,
+              ...(sameSessionNonOwner
+                ? {
+                    groupNonOwner: {
+                      name: requester.name,
+                      ...(args.requesterIsBot ? { isBot: true as const } : {}),
+                    },
+                  }
+                : {}),
               // 非属主：只答疑——不 snapshot / 不把 awaiting_ack 打回 running（原 revise 语义）、
               // 会话断了也只起一次性答疑 agent，绝不唤醒当前 action 的全权限 agent。
               // 关联命中喂会话是唯一的例外（出问登记两门已过，且活会话在场）。
@@ -1738,14 +1794,19 @@ const injectGroupMessage = async (args: {
               // 属主本人的话 / 托办回执：agent 正在跑时入 task 待送达队列（202）而不是 409 丢掉
               //（回执丢了就是真实案例：对接后端机器人时用户觉得「没有排队机制」）。
               // 非属主的只读答疑旁路走群模块自己的队列，不传。
-              ...(isOwner || feedIntoSession
+              ...(isOwner || feedIntoSession || sameSessionNonOwner
                 ? {
                     queueIfBusy: {
                       source: feedIntoSession
                         ? ("group_reply" as const)
-                        : ("group_owner" as const),
+                        : sameSessionNonOwner
+                          ? ("group_other" as const)
+                          : ("group_owner" as const),
                       senderName: requester.name,
                       senderIsBot: args.requesterIsBot,
+                      ...(sameSessionNonOwner
+                        ? { senderKey: requester.openId, clientItemId: messageId }
+                        : {}),
                       preview:
                         args.text.replace(/\s+/g, " ").trim().slice(0, 120) ||
                         "(附图/附件)",
@@ -1789,8 +1850,10 @@ const injectGroupMessage = async (args: {
     // 其余 202（chat-inject 的 chat 队列 / 无标记的 task 202）走后面原回执，行为不变。
     if (resp.status === 202) {
       restoreGroupReply(taskId, replyHandle);
-      // 202 = 没有 run 开跑（旁路通道正常到不了这里；真到了也不该占旁路名额）
-      refundBypassRun();
+      // 202 = 没有 run 开跑（旁路通道正常到不了这里；真到了也不该占旁路名额）。
+      // 并入同会话的非属主例外：它排进 task 待送达队列、重放时**不会**再过准入闸，限流名额就在入队这一刻扣、不退
+      //（队列本身有独立上限 + 每人槽位兜底），否则排队等于绕过 per-sender 滑动窗。
+      if (!sameSessionNonOwner) refundBypassRun();
       // task 模式 + `queued: true` = 进了 task 待送达队列（没有 run 开跑，登记已在上面摘掉）：
       // 属主的话回一句「这轮跑完就处理」；托办回执本来就不回群，保持静默。
       // 关联登记入队时就 burn：文本已存进队列、重放不再需要它，留着反而会被下一句复读二次消费。
@@ -1799,7 +1862,7 @@ const injectGroupMessage = async (args: {
         if (!feedIntoSession) {
           await replyToGroup(
             chatId,
-            "收到，当前这轮跑完就处理",
+            sameSessionNonOwner ? "收到，当前这轮跑完就答你" : "收到，当前这轮跑完就处理",
             groupReplyMention(args.requesterIsBot, requester),
           );
         }

@@ -84,6 +84,7 @@ import {
   enqueueTalkMessage,
   removeTalkQueueItemsByDedupe,
 } from "@/lib/server/task-talk-queue";
+import { isGroupNonOwnerGuardEnabled } from "@/lib/server/group-non-owner-guard-config";
 
 export interface TaskQuestionBody {
   text?: string;
@@ -145,6 +146,19 @@ export interface TaskQuestionInjectOptions {
    */
   restrictedRunTag?: string;
   /**
+   * 群里**非属主**的消息**并入属主的同一个活会话**（逐条）：有活会话时的新路径，取代 restrictToQuestion 的旁路。
+   * 与 {@link restrictToQuestion} 的区别只在「送不送活会话」，以下**状态机级拦点恒定生效**（与提示词开关无关）：
+   * - 不带 ackContext（不 snapshot 产物、不把 awaiting_ack 打回 running、不触发重新交卷）；
+   * - 不认领 askSkip（陌生人一句话不能作废属主待答的提问）；
+   * - 不唤醒（resume）、不新起一次性 agent、**不带 creds 调 deliver**（休眠会话也不会被它复活成全权限）：
+   *   没有活会话 / 送不进去 → 直接 409，由群入向回话；群入向本来就只在「有活会话」时才走这条路；
+   * - 不等排空、不强清假死 run（`abortStuckRunForSend` 会掐掉属主正在流的收尾旁白）：忙就入 task 待送达队列。
+   * 提示词开关开时再加：消息尾部「只答疑」约束段 + 该轮 Flowship 系统工具硬拒（见 group-non-owner-prompt）。
+   * `name` = 发言人展示名，写进约束段。`isBot` = 发言人是别的机器人：**始终**按开的口径处理（不看提示词开关；
+   * 约束段用机器人变体），「关 = 同权」只留给真人。
+   */
+  groupNonOwner?: { name: string; isBot?: boolean };
+  /**
    * 关联回执（出问登记两门已过）：以属主语义注入当数据，但与普通属主消息两处不同——
    * ① 不认领 askSkip（不许外部回执顶掉属主的待答提问）；② 正文包不可信数据头。
    * 只由 group-route 在 correlated 命中且活会话在场时置 true。
@@ -166,14 +180,20 @@ export interface TaskQuestionInjectOptions {
    * 重放时必须清掉，防止 drain 遇到「刚好又忙」再入队死循环。
    */
   queueIfBusy?: {
-    source: "app" | "group_owner" | "group_reply";
+    source: "app" | "group_owner" | "group_reply" | "group_other";
     senderName?: string;
     senderIsBot?: boolean;
+    /** group_other：发言人稳定 id（队内每人槽位按它算） */
+    senderKey?: string;
     preview?: string;
-    /** 幂等键（app 前端生成；同键重复入队只算一条） */
+    /** 幂等键（app 前端生成 / group_other 取飞书 message_id；同键重复入队只算一条） */
     clientItemId?: string;
   };
 }
+
+/** 非属主并入活会话但会话不在 / 送不进去时的回话（群入向原样回群，所以写给群里的人看） */
+export const NON_OWNER_NO_SESSION_MESSAGE =
+  "任务当前没有可用的会话，这条先没接住，稍后再 @ 我一次（或让任务所有者在 Flowship 里唤醒任务）";
 
 /**
  * 把群入向写进 `userReplyMetaExtra` 的来源标记还原成答疑旁路要的 groupContext。
@@ -695,6 +715,9 @@ const runTaskQuestionInject = async (
   };
   // 只答疑（群里非属主）：下面三处按它剪掉写路径——活会话送达 / ackContext / resume 唤醒
   const questionOnly = options.restrictToQuestion === true;
+  // 群里非属主并入活会话：与 questionOnly 共享「不 ack / 不 askSkip / 不唤醒」，但会 send 进活会话
+  const nonOwner = !questionOnly && !!options.groupNonOwner;
+  const guarded = questionOnly || nonOwner;
 
   const text = (body.text ?? "").trim();
   const imagesResult = parseAndValidateImages(body.images, MAX_IMAGES);
@@ -737,6 +760,7 @@ const runTaskQuestionInject = async (
       options: { ...options, queueIfBusy: undefined },
       senderName: qOpt.senderName,
       senderIsBot: qOpt.senderIsBot,
+      senderKey: qOpt.senderKey,
       preview: qOpt.preview,
       clientItemId: qOpt.clientItemId,
     });
@@ -746,6 +770,15 @@ const runTaskQuestionInject = async (
       // 状态码与入口 lifecycle 闸一致用 409（状态冲突、非请求本身有误）
       if (r.reason === "closing") {
         return lifecycleBlockedResponse(getChatLifecycle(id));
+      }
+      // 群里非属主排队的上限（独立于总上限，保证属主输入条始终有余量）：文案直接回给群里的人
+      if (r.reason === "group_other_full" || r.reason === "group_other_sender_full") {
+        return errorResponse(
+          r.reason === "group_other_sender_full"
+            ? "你前面已经有 2 条在排队了，等它们处理完再发"
+            : "排队的人太多了（最多 5 条），等这一轮处理完再 @ 我",
+          409,
+        );
       }
       return errorResponse("排队已满（最多 10 条），等当前这轮跑完再发", 409);
     }
@@ -780,6 +813,11 @@ const runTaskQuestionInject = async (
   if (task.mode === "chat") {
     return errorResponse("chat 对话直接在输入框发消息即可", 409);
   }
+  // 非属主并入活会话：没有活会话就不并入（群入向只在有活会话时才走本路径，这里是竞态兜底）。
+  // 绝不退化成唤醒 / 一次性 agent——那两条都是带写权限的全权限 agent。
+  if (nonOwner && !agentSessions.has(task.id)) {
+    return errorResponse(NON_OWNER_NO_SESSION_MESSAGE, 409);
+  }
   // 有 pendingAsk 也不硬拦输入条：用户可绕过答题卡直接说话，那组提问按「隐式跳过」
   // 收口（见下方 beginAskSkip）。旧逻辑「先回答上方提问」在网断 / 会话死后把输入条
   // 和答题卡对锁——只能重新推进（同事反馈）。
@@ -810,7 +848,8 @@ const runTaskQuestionInject = async (
       drainStatus === "cancelled" ||
       drainStatus === "error" ||
       task.runStatus === "idle";
-    if (waitingForDrain) {
+    // 非属主不等排空、不强清假死 run（abortStuckRunForSend 会掐掉属主正在流的收尾旁白）：忙就排队
+    if (waitingForDrain && !nonOwner) {
       let stopped = await sendTimed("drainWait", waitForTaskToStop(task.id, 20_000));
       if (!stopped) {
         // 排空超时 = run 假死（stop 后收尾卡住、runningTasks 永不摘除）——
@@ -895,7 +934,7 @@ const runTaskQuestionInject = async (
   // 当前产出在等审阅（awaiting_ack）= 原「再聊聊」场景：先 snapshot artifact 版本
   //（用户可能要求改、保留改前版本）、消息附「处理完重新交卷」上下文。
   // questionOnly 直接当没有 ack 上下文——非属主的一句话不该改产物、更不该重交卷
-  const ackAction = questionOnly || options.scheduledTrigger
+  const ackAction = guarded || options.scheduledTrigger
     ? undefined
     : task.actions.find(
         (a) => a.id === task.currentActionId && a.status === "awaiting_ack",
@@ -925,7 +964,7 @@ const runTaskQuestionInject = async (
   // B1：隐式跳过认领用的事件同样只看尾部（与上面 pendingAskOpen 同一快照语义；
   // 认领本身走 takePendingAskIf 原子注册，不依赖全量）。
   const askSkip =
-    questionOnly || options.correlatedAnswer || options.scheduledTrigger
+    guarded || options.correlatedAnswer || options.scheduledTrigger
       ? null
       : beginAskSkip({ ...task, events: askEvents });
   if (askSkip?.claimed) skipRef.handle = askSkip;
@@ -965,7 +1004,7 @@ const runTaskQuestionInject = async (
       drainStatus === "cancelled" ||
       drainStatus === "error" ||
       task.runStatus === "idle";
-    if (!waitingForDrain) {
+    if (!waitingForDrain || nonOwner) {
       const queued = tryQueueWhenBusy(opGen);
       if (queued) return queued;
       return busyResponse("agent 正在跑、等它说完这轮再问");
@@ -977,6 +1016,10 @@ const runTaskQuestionInject = async (
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
   // 两种「不送达」都视为无会话续接意图（走下方分流），不是 stale
   // 内存高压：deliver 内直接抛 HeapPressureError（不建新 agent），转 503 友好提示。
+  // 非属主并入：提示词开关**送达时现读**（排队消息按重放那一刻的值算，改开关对活会话即时生效）
+  const nonOwnerGuardOn = nonOwner
+    ? options.groupNonOwner?.isBot === true || (await isGroupNonOwnerGuardEnabled())
+    : false;
   let deliverResult: "sent" | "no_session" | "stale" | "send_failed";
   try {
     deliverResult =
@@ -988,18 +1031,29 @@ const runTaskQuestionInject = async (
               task,
               agentText,
               imageAbsPaths,
-              {
-                apiKey,
-                model,
-                // 恢复会话时 submit_mr 桥要用（与下面唤醒分支同口径）；
-                // 入口没带也不要紧——resumeTaskSession 会回落服务端 config.json
-                gitToken: body.bootArgs?.gitToken?.trim() || undefined,
-              },
+              // 非属主**不传 creds**：deliver 内「内存无会话 + 有 creds → resumeTaskSession」会把休眠会话复活成
+              // 全权限会话；不传则无内存会话时直接 no_session（下面 409）
+              nonOwner
+                ? undefined
+                : {
+                    apiKey,
+                    model,
+                    // 恢复会话时 submit_mr 桥要用（与下面唤醒分支同口径）；
+                    // 入口没带也不要紧——resumeTaskSession 会回落服务端 config.json
+                    gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+                  },
               ackContext,
               attachmentPaths.length > 0 ? attachmentPaths : undefined,
               opGen,
               timing,
               options.scheduledTrigger === true,
+              nonOwner
+                ? {
+                    name: options.groupNonOwner?.name?.trim() || "群成员",
+                    guard: nonOwnerGuardOn,
+                    ...(options.groupNonOwner?.isBot === true ? { isBot: true } : {}),
+                  }
+                : undefined,
             ),
           );
   } catch (err) {
@@ -1015,6 +1069,11 @@ const runTaskQuestionInject = async (
     return staleResponse(task.id);
   }
   const sent = viaWait || deliverResult === "sent";
+  // 非属主没送进活会话（会话刚断 / send 失败）：到此为止，**绝不**落到唤醒 / 一次性 agent（全权限）。
+  // 409 让群入向回一句人话；群入向本来就只在有活会话时才选这条路径。
+  if (nonOwner && !sent) {
+    return errorResponse(NON_OWNER_NO_SESSION_MESSAGE, 409);
+  }
 
   // 会话接不回时的分流（V0.11.9 用户拍板「输入条覆盖旧重启、不多一条 action 链」）：
   // - 当前 action 停在半路（error / cancelled / 僵死 running）→ **唤醒模式**：
@@ -1027,7 +1086,7 @@ const runTaskQuestionInject = async (
   // 非属主的消息只配落到下面那条只读旁路（restricted-question）
   const currentAction = task.actions.find((a) => a.id === task.currentActionId);
   const canResume =
-    !questionOnly &&
+    !guarded &&
     !options.scheduledTrigger &&
     !sent &&
     !!currentAction &&

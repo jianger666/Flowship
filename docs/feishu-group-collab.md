@@ -17,6 +17,52 @@
 - **后来者**若 bot 不在群（他没被注册表带进来）→ 引导弹窗手动加一次；加完即可直接发
 - 发送人是各自的 bot（每人 Flowship 配自己的飞书自建应用，lark-cli 双身份）
 
+## 非属主消息并入同一个会话（2026-11-04，用户：「合并进同一个、同时问就排队，和 lk-harness 保持一致」）
+
+### 决策与信任模型
+
+- 群里非属主（`sender_id !== ownerOpenId`）@ 机器人，**有活会话（`agentSessions.has(taskId)`）、非 chat 型、没有待答 ask、不是关联喂回** → 走「同会话」路径（`group-route.sameSessionNonOwner`）；否则仍走原只读旁路（降级通道，一行没删）。
+- **逐条各跑一轮**：不合批、属主与非属主也不合批；同时问就排队（`group_other` 来源，独立上限 5 条 + 每人 2 条，不占属主那 10 格；重放时属主消息优先）。
+- **信任模型 = lk-harness 的项目群**：群成员**能看任务内容**（用户拍板「1. 可以，和 lk-harness 一样」）。事件都在主事件流里，**新数据不再写群问答 tab**。
+- **机器人发言人（2026-11-04 放开）**：准入闸 `decideRestrictedQaAdmission` 新增 `allowBots`；设置 `feishuGroupAllowBots`（设置 → 连接 → 飞书集成，**默认开**；文件不存在 → 开；**文件损坏 / 读不到 → 关，fail-closed**）。这**推翻了原先 `bot_sender` 一律拒收**（下文「答疑旁路的准入闸」第 2 条在该开关开着时不再成立；同会话与旁路降级通道共用同一道闸，所以降级通道也跟着放开）。机器人始终按 guard 开处理（不看 `feishuGroupNonOwnerGuard`）、用**机器人版约束段**（克制：回复里要自己写 `@名字`、没问实质问题整段只回 `NO_REPLY`、别客套）；系统回执对机器人静默；限流照样适用（每发言人 4 次 / 总 12 次 / 10 分钟）；带图不排队。出向本来就按 `requesterIsBot` 处理（不自动补 @、`NO_REPLY` 静默、失败静默）。**防互 @ 成环只靠提示词协议 + 限流，没有结构性断路。**
+
+### 「不能动代码」三层（别当成硬隔离）
+
+| 层 | 开关 | 机制 | 强度 |
+|---|---|---|---|
+| ① 提示词 | 设置 → 连接 → 飞书集成，全局 `feishuGroupNonOwnerGuard`，**默认开**；**关 = 群成员与属主同权** | `chat-pending` user_message 分支：开 = 追加「只答疑」约束段（**最后一段**，取代默认脚注）；关 = 只留身份抬头 | 软（honor system） |
+| ② 本轮系统工具硬拒 | 随开关 | `non-owner-turn-guard`（globalThis 按 taskId 标记，token 化；**滑动 TTL 45 分钟**：这一轮每次调工具——含放行的 `wait`、被拒的试探、pi 的只读工具——就 `touchNonOwnerTurn` 续期，TTL 只兜「漏清后再没有任何工具调用」；第 20 轮 N1 修了「连调两次 30 分钟 `wait` 把固定窗口熬过期」）+ `flowship-tools.invokeFlowshipTool`（pi / Cursor 唯一共同咽喉，**先查再放行**；`ctx.taskId` 命中续期，模型自填的 `args.task_id` 只查不续）只放行 `wait` | **硬**（Flowship 系统工具：submit_work / ask_user / schedule / share_to_group / subagent … 含以后新增的） |
+| ③a pi 额外收窄 | 随开关 | `custom-agent-backend.buildAdapter` 该轮 `setActiveToolsByName(read/grep/glob/wait)`，下一次非标记 send 惰性恢复 | 硬，但**仅 pi**、best-effort（失败只告警） |
+| ③b pi execute 级硬拒 | 随开关 | `buildCustomTools` 给每个不在 `NON_OWNER_TURN_PI_TOOL_NAMES`（read/grep/glob/wait）里的 customTool 套 `withNonOwnerTurnDeny`：标记在场时 execute 返回 `[DENIED]`——**不依赖 ③a**，收窄失败 / pi 改语义时 shell / edit / write / delete 也过不去 | 硬，**仅 pi** |
+| ③c pi 只读工具守卫 | 随开关 | `pi-coding-tools.guardedWhileNonOwnerTurn`：该轮 read / grep / glob 走凭据文件拦截 + 目录夹紧（复用旁路的 `checkBypassRead` / `checkBypassSearchBase`），**仅标记在场时**查，属主自己的 read 不受影响 | 硬，**仅 pi** |
+
+**恒定生效（与开关无关）**：`groupNonOwner` 选项 → 不带 ackContext（不把等审阅的产物打回 running）、不认领待答 ask 的隐式跳过、**不 resume 休眠会话 / 不起一次性 agent**（不给 `deliverTaskQuestion` 传 creds；会话不在 → 409 `NON_OWNER_NO_SESSION_MESSAGE`）、不触发群里的「推进」口令（非属主推进仍回「仅任务所有者可推进」）。**这不等于「agent 不会自己调 `submit_work` / `ask_user` / `schedule`」**：提示词开关**关**时没有标记、不拦任何系统工具（第 20 轮评审 N2）。
+
+**残余风险（已知、没有消除）**：**Cursor 后端**没有按轮次改工具集的钩子，内置的写文件 / 跑命令 / read 只靠提示词（读令牌类文件在 Cursor 后端也只靠提示词）；pi 的 ③a/③b/③c 都只有假工具 + 单测验证、没真跑过 pi 会话；身份抬头是可伪造的文本（lk-harness 是结构化 JSON），硬拒走服务端标记而不是抬头。
+
+### 回群登记：由事件现建、不再预登记
+
+`user_reply` 事件（`meta.groupNonOwnerTurn=true`，**在投递成功之后才写**，meta 带 `groupChatId / feishuMessageId / groupSender / groupSenderOpenId / groupSenderIsBot`）在 `group-outbound` 的 per-task 串行链里**现建**一条 restricted 通道登记（`sameSession:true`）并写 `turns[taskId]=runTag`；主链帧没有 `origin`，就用 `turns` 里的 runTag 当有效 origin；`done` flush 并清 turn。好处：登记与 run 同序，没有「登记早于 run」的错投 / 覆盖窗口，排队重放也不需要闭包。
+
+- 被新的主链 `user_reply`（不带 `restrictedRunTag`）打断 → 上一轮收口成失败回群；旁路问题事件不算新一轮。
+- sameSession 不写群问答 tab 摘要（且并入同会话的问题事件 `groupNonOwnerTurn` 被 tab 的 temporal 配对排除，不会被当成「历史」轮列进来）；桥接关闭期间的 `done` 也清 turn。
+- **丢弃都回群交代**（`setTalkQueueGroupOtherDropHandler`，GO 引 TTQ、反向不引；机器人静默）：排队过期 / 属主在 app 里删 / 停止 / 重放时没会话 / 重放失败 / 任务终结·归档·删除整队清（`closed`：「这个任务已经结束（或被删除），你这条排队的消息没有处理」）。停止清 group_other 是 `stop-task` 里**单独一步**（`clearGroupOtherQueueOnStop`），`STOP_CLEARED_SOURCES=["app"]` 的口径（「停止保留群来源」）没动。
+- 限流（`admitGroupBypassRun`）仍在入向决策点；**202 排队不退名额**（重放不再过准入闸，退了就能绕过滑动窗）。带图 + 主链正忙 → 不排队、回忙线（队列条目不存图）；空闲带图照常直送。
+
+### 已接受的缝隙
+
+首批 delta 可能先于 `user_reply` 落盘到达（只会少答案开头几个字、不会错投）；停止 / `ask_user` 引起的 `done` 可能把半截答案 flush 到群；陌生人的一轮会让 `runStatus=running`、可被顶栏停止键打断（并回群告知）；终态任务（merged / abandoned）有活会话时由主会话回答；同会话路径**没有** roster / 近期群聊上下文（旁路有）；陌生人触发 `shouldRotateSession` 可能关掉属主的热会话；pi 每个非属主轮切入 / 切出各让一次系统提示词缓存失效。
+
+### 未端到端验证
+
+禁止起 dev server / 调真飞书 → **没有真机 / 真飞书 / 真模型实测**；pi 的 `setActiveToolsByName` 只读了源码（下一轮 prompt 生效、重建系统提示词）+ 假 session 测调用时机，没真跑 pi 会话。
+
+### 群问答并进事件流（2026-11-04，用户「我推荐你全部都做了」）
+
+旁路答疑（无活会话降级通道 + 老版本数据）做完的轮次，不必再切「群问答」tab：`isHiddenFromEventStream` 只藏**旁路问题事件**（`restrictedRunTag`）和**过程事件**（`groupRun`），**轮次汇总事件（`groupQaSummary`）不再藏**，事件流里用 `GroupQaInlineRow`（复用 `GroupQaRoundCard`，行首「群问答」标签）画成一张卡：问 + 答、不回复淡化、「待你决定」标、展开看问题原文与「查看过程」。汇总 → 轮次由 `groupQaRoundOfSummaryEvent` 按 runTag 配（问题被分页裁掉时仍有卡，问题显示「（未知问题）」）。**tab 没删**：降级通道 / 老数据 / 进行中与被打断的轮次（没有汇总，蓝点提示）/「待你决定」汇总 / 过程查看还要它；它与 Virtuoso 滚动跟随深度耦合、有源码契约测试钉着，且没有浏览器可验证 UI，删它风险大于收益。**UI 只有 SSR + 源码契约测试，没在真机 / 浏览器里看过**（卡片在虚拟列表里的高度变化、与滚动跟随的交互未验证）。
+
+测试：`group-non-owner-guard` / `group-same-session-route` / `group-same-session-outbound` / `task-question-inject-group-non-owner` / `task-talk-queue-group-other` / `stop-clears-group-other` / `non-owner-turn-lifecycle` / `pi-non-owner-turn-tools` / `pi-non-owner-turn-exec-gate` / `group-qa-same-session-excluded` / `group-bots-allowed` / `group-qa-inline-row`；既有测试只改了期望（`feishu-group-inbound` 2 处、`schedule-wiring-contract` 3 处、`edit-rewind` 1 处、`event-stream-hidden` 1 处，另有 6 个文件为「机器人关」语义在 `beforeEach` 里 pin 了 `__setGroupBotsAllowedForTest(false)`，清单见 HANDOFF）。
+
 ## 日常任务（没有飞书工作项）也能用需求群（2026-11-04）
 
 日常任务 = `feishuStoryUrl` 为空（`lib/lightweight-task.ts`）。以前它在入口处被一刀切拦掉（「需求群」按钮不显示、分享入口隐藏、
@@ -628,6 +674,9 @@ group-outbound.handleGroupOutboundEvent
 
 非属主推进（打字或点选择卡按钮）→ 回「仅任务所有者可推进」，不起 agent。
 
+> **2026-11-04 起口径变了**：**有活会话**时，非属主的普通文本不再走下面这套「只读旁路」，而是**并入同一个任务会话、逐条各跑一轮**（见本文「非属主消息并入同一个会话」一节）；
+> 下面的 `restrictToQuestion` 旁路现在是**没有活会话时的降级通道**（硬约束：非属主绝不唤醒 / 新起全权限 agent）。以下表格对旁路本身仍成立。
+
 ### 非属主消息的 `restrictToQuestion`（写路径硬拦）
 
 「@bot 说句话」也能驱动写：task 模式下这条消息会走 `handleTaskQuestionInject`，
@@ -966,13 +1015,13 @@ agent 自己在群里 @ 别人要数据、再登记 `expect_group_reply` 时，*
    **已绑定需求群里的非属主真人 @ 机器人，默认就会触发受限只读答疑**，不再有开关控件、没有 PATCH 接口、取消关联 / 换绑也不再「清开关」。
    盘上老 meta 里残留的 `feishuGroupRestrictedQa` 字段读盘时直接丢弃（不进 `Task`、不迁移、不挡放行）。
    这也消掉了第七轮留下的一个升级回退：老群升级后不会再「静默停掉非属主答疑」。
-2. **机器人发件人拒绝**：lark-cli compact 事件里有 `sender_type`（user / bot），bot 一律拒。
+2. **机器人发件人拒绝**：lark-cli compact 事件里有 `sender_type`（user / bot）。**2026-11-04 起受设置 `feishuGroupAllowBots` 控制（默认开 = 放行，见上文「机器人发言人」）；开关关 / 设置读不到时 bot 一律拒（原行为）。**
 3. **租户闸 / 外部成员闸：当前不生效**——compact 事件里没有 `tenant_key`、也没有 external 标记（第七轮审查方用本机
    `lark-cli event schema im.message.receive_v1` 核对过）。代码里的租户学习 / 比对只是为将来数据源补上预留（只认 `sender.tenant_key` /
    `sender_tenant_key` / 顶层 `tenant_key`；`header.tenant_key` 是应用所在租户、不是发件人，第八轮已不再当兜底）。
    想真做租户闸：走 `group-roster.ts` 拉的成员列表，**先确认成员项里有 `tenant_key` 再做**。
 
-所以真正生效的是「机器人发件人拒绝 + 只读工具白名单 + 事件流 / 回群的精确值脱敏」。**不过这道准入闸的两条路径**（设计取舍，没变）：
+所以真正生效的是「（`feishuGroupAllowBots` 关时的）机器人发件人拒绝 + 只读工具白名单 + 事件流 / 回群的精确值脱敏」。**不过这道准入闸的两条路径**（设计取舍，没变）：
 属主会话里有 `pendingAsk` 待答提问时任何能 @ 机器人的人仍可答；feed 进活会话的关联回执同理。机器人发件人被拒时静默、不回群提示，只给属主留一条节流 info。
 **用户已知情并拍板的风险（第 11 轮）**：开关没了，所有已绑定需求群里的非属主真人都能 @ 机器人触发答疑；Cursor 路径的 `read` 没有路径约束
 （下一节第一条），所以这个功能仍然**只适合可信内部群**——群里有外部人员或不认识的机器人时别把 task 绑进去。
@@ -1287,6 +1336,10 @@ action 仍 `running`、`runStatus` 是 `awaiting_user`，两道准入都放行�
 `isAdvanceResultToGroupEnabled` / `getGroupAutoBroadcastMode`）与注入契约一行不用动。
 固定值由 `tests/feishu-group-collab-policy.test.ts` 钉住（含「盘上残留老 `groupCollab`
 字段也不生效」），另在出向 / 播报两个测试里各接一次真实读取点。
+
+> **2026-11-04 例外**：新增**一个**设置项 `feishuGroupNonOwnerGuard`（设置 → 连接 → 飞书集成，全局，默认开；关 = 群成员与属主同权）——
+> 这**推翻了**上面 2026-07-28「不挂设置」的口径，仅限这一个（用户拍板：想和 lk-harness 一样可一键放开）。`GROUP_COLLAB_POLICY` 三个键与「`groupCollab` 字段已删」不变。
+> 见本文「非属主消息并入同一个会话」。
 
 ⚠️ 老用户 config.json 里的 `groupCollab` 残留由 `normalizeSettings` 的退役键清理抹掉
 （与 `username` / `gitHost` 同处），下次落盘即消失、读取侧一律不看它。

@@ -63,6 +63,10 @@ export const FeishuCliSection = ({
   onMeegleProjectChange,
   feishuChatBridge,
   onFeishuChatBridgeChange,
+  feishuGroupNonOwnerGuard,
+  onFeishuGroupNonOwnerGuardChange,
+  feishuGroupAllowBots,
+  onFeishuGroupAllowBotsChange,
 }: {
   meegleProject: MeegleProjectSetting;
   /** 选中即落盘（父级 saveFieldValue） */
@@ -70,6 +74,12 @@ export const FeishuCliSection = ({
   /** 消息桥接全局开关（决策 #3） */
   feishuChatBridge: boolean;
   onFeishuChatBridgeChange: (next: boolean) => void;
+  /** 群里非宿主成员的提示词约束（默认开） */
+  feishuGroupNonOwnerGuard: boolean;
+  onFeishuGroupNonOwnerGuardChange: (next: boolean) => void;
+  /** 群里别的机器人 @ 本机机器人是否受理（默认开） */
+  feishuGroupAllowBots: boolean;
+  onFeishuGroupAllowBotsChange: (next: boolean) => void;
 }) => {
   const { confirm } = useDialog();
   // 服务端状态快照（轮询）
@@ -365,6 +375,10 @@ export const FeishuCliSection = ({
         <FeishuBridgeBlock
           feishuChatBridge={feishuChatBridge}
           onFeishuChatBridgeChange={onFeishuChatBridgeChange}
+          feishuGroupNonOwnerGuard={feishuGroupNonOwnerGuard}
+          onFeishuGroupNonOwnerGuardChange={onFeishuGroupNonOwnerGuardChange}
+          feishuGroupAllowBots={feishuGroupAllowBots}
+          onFeishuGroupAllowBotsChange={onFeishuGroupAllowBotsChange}
         />
       </div>
     </div>

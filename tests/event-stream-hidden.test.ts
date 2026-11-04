@@ -144,7 +144,7 @@ describe("isHiddenFromEventStream", () => {
     );
   });
 
-  it("群问答 tab 的内容主流程默认隐藏（非属主群问题 + 轮次汇总）", () => {
+  it("群问答：旁路问题主流程隐藏；轮次汇总不再隐藏（2026-11-04 内联成卡，见 group-qa-inline-row.test）", () => {
     // 非属主群问题（带配对键）：藏，切 tab 看
     expect(
       isHiddenFromEventStream(
@@ -153,14 +153,14 @@ describe("isHiddenFromEventStream", () => {
         }),
       ),
     ).toBe(true);
-    // 轮次汇总：藏
+    // 轮次汇总：不藏（做完的旁路轮次以内联卡出现在事件流里）
     expect(
       isHiddenFromEventStream(
         ev("info", {
           meta: { groupQaSummary: { runTag: "tok1" } },
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
     // 属主群消息（无 runTag）：留在主流程
     expect(
       isHiddenFromEventStream(

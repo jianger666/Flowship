@@ -44,6 +44,11 @@ const {
   SKIP_GROUP_SELF,
   stripMentions,
 } = await import("@/lib/server/feishu-bridge/group-route");
+// 这份文件的用例都钉在「机器人发件人一律被准入闸拒绝」的口径上（P0 硬化）。2026-11-04 起设置「受理群里其他机器人的 @」
+// 默认开，所以这里显式把它钉回关——只改 setup、断言一字未动；放开后的语义见 tests/group-bots-allowed.test.ts。
+const { __setGroupBotsAllowedForTest } = await import(
+  "@/lib/server/group-non-owner-guard-config"
+);
 
 const {
   __resetGroupAdvancePickForTest,
@@ -216,6 +221,7 @@ const baseDeps = (over: Record<string, unknown> = {}) => ({
 });
 
 beforeEach(() => {
+  __setGroupBotsAllowedForTest(false);
   __resetGroupRosterForTest();
   __resetGroupChatCacheForTest();
   __resetGroupReplyStateForTest();
@@ -2024,14 +2030,16 @@ describe("出问登记关联消费", () => {
     // 吃掉后静默：不建回群登记，群里不再回
     expect(soleGroupReply()).toBeNull();
 
-    // 同一条再来一次：登记已焚 → 落回只读
+    // 同一条再来一次：登记已焚 → 落回普通非属主语义。活会话仍在 → 现在是「并入同会话」
+    // （restrictToQuestion:false + groupNonOwner，只答疑约束由注入链的提示词 / 工具硬拒承担），不再起只读旁路
     const r2 = await routeGroupInboundMessage(
       taoziMsg({ message_id: "om_g2" }),
       ctx,
     );
     expect(r2).toMatchObject({ kind: "sent" });
     expect(injectOptsOf(handleTaskQuestionInject, 1)).toMatchObject({
-      restrictToQuestion: true,
+      restrictToQuestion: false,
+      groupNonOwner: { name: expect.any(String) },
     });
     expect(injectOptsOf(handleTaskQuestionInject, 1)).not.toHaveProperty(
       "correlatedAnswer",
@@ -2089,9 +2097,10 @@ describe("出问登记关联消费", () => {
       ctx,
     );
     expect(r).toMatchObject({ kind: "sent" });
-    // 没进关联：普通只读语义，不带 correlatedAnswer
+    // 没进关联：普通非属主语义（活会话在 → 并入同会话 + groupNonOwner，不是属主权限的关联喂会话），不带 correlatedAnswer
     expect(injectOptsOf(handleTaskQuestionInject)).toMatchObject({
-      restrictToQuestion: true,
+      restrictToQuestion: false,
+      groupNonOwner: { name: expect.any(String) },
     });
     expect(injectOptsOf(handleTaskQuestionInject)).not.toHaveProperty(
       "correlatedAnswer",

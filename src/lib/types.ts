@@ -497,6 +497,20 @@ export interface FeAiFlowSettings {
    */
   feishuBridgeKeepAwake?: boolean;
   /**
+   * 需求群里**非属主**的消息并入属主同一个活会话后的「提示词级约束」开关（设置 → 连接 → 飞书集成，全局）。
+   * 默认开；显式 false 才关。开 = 该条消息尾部追加「只答疑、不改代码」约束 + 该轮 Flowship 系统工具硬拒；
+   * 关 = 群成员与属主**同权**（与 lk-harness 项目群一致）。文案与实际提示词见 `group-non-owner-prompt.ts`。
+   */
+  feishuGroupNonOwnerGuard?: boolean;
+  /**
+   * 需求群里**别的机器人** @ 本机机器人时是否受理（设置 → 连接 → 飞书集成，全局）。
+   * 默认开；显式 false 才关（关 = 机器人发件人一律静默忽略，沿用 P0 准入闸的老口径）。
+   * 与 lk-harness 的群内机器人协作保持一致。机器人的消息**无论提示词开关开关**都按「只答疑」约束处理
+   * （`feishuGroupNonOwnerGuard` 关只对真人同权）；不回「收到」之类的客套、不自动 @ 对方（防互 @ 成环）。
+   * 读取失败（设置文件损坏）→ 按「不受理」处理（fail-closed）。
+   */
+  feishuGroupAllowBots?: boolean;
+  /**
    * 团队规范总开关（Skills 区「团队规范」组头）= 一键隔离 wk 知识库那套。
    * 默认 true：日常注入 `knowledge/skills/` + loadSkillsForTask 按仓匹配；
    * 推进面板可出挂载 knowledge skill 的自定义 action。

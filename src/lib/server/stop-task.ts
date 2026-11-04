@@ -34,7 +34,11 @@ import {
   writeEventAndPublish,
 } from "./task-stream";
 import { cancelChatRun, failQueuedItemsCapturingTexts } from "./chat-runner";
-import { clearTalkQueueCapturing, noticeTalkQueueDropped } from "./task-talk-queue";
+import {
+  clearGroupOtherQueueOnStop,
+  clearTalkQueueCapturing,
+  noticeTalkQueueDropped,
+} from "./task-talk-queue";
 import { stopNoticeText } from "@/lib/stop-copy";
 import {
   beginChatLifecycle,
@@ -148,6 +152,9 @@ const runStopTaskAgent = async (
     // 用户点停止：清掉输入条排的队，群来源保留、空闲后照常送达。
     // 清队处必须同步取走被清条目的文本（清完就没了）；「未送达」事件等下面「用户停止了…」落盘后再写（D8-04）
     const droppedTalk = clearTalkQueueCapturing(id, { onlySources: ["app"] });
+    // 群里非属主（group_other）排的队：停止会关会话，它们不许唤醒 / 新起 agent，留着必丢——这里就清掉并回群交代
+    // （与上面 app 的清队是两步：「群来源保留」的口径对 group_owner / group_reply 不变）
+    clearGroupOtherQueueOnStop(id);
     // 撤销启动 lease（标 cancelled），owner 在 checkpoint 窗口内复查失效后中止；
     // 不用 clearChatGate——不能清正在进行的 rewind 门闩（rewind 侧 finally 自己 endChatRewind）
     cancelChatStart(id);

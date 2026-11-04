@@ -20,6 +20,7 @@
 
 import type { ActionType, PlanBatch } from "../types";
 import { SIGNALS, buildNextActionHead } from "../protocol-signals";
+import { buildNonOwnerGuardFootnote } from "../group-non-owner-prompt";
 import { cancelAskWait, resetAskWaitForTest } from "./ask-wait";
 import { interruptWaits } from "./session-wait";
 
@@ -699,6 +700,10 @@ export type AgentMessage = {
   // 保留 [USER_MESSAGE] 抬头（协议信号 / 通道不变），但脚注不能再说「这是用户的插话、先判断纯疑问还是修改要求」——
   // 那会和 _super.md 里「不要走疑问 / 修改二分类、也不要当成用户在改需求」自相矛盾
   scheduled?: boolean;
+  // user_message：这条是需求群里**非属主**发来的、**且提示词开关开着**——脚注换成「只答疑」约束段
+  //（见 group-non-owner-prompt）。取代而不是追加默认脚注：默认脚注里「修改要求才动手改」与约束互相打架，
+  // 且约束必须是整条消息的最后一段。开关关 / 属主消息都不传。
+  groupNonOwnerGuard?: { name: string; isBot?: boolean };
   // next_action 的元数据（拼 [NEXT_ACTION ...] 头）
   nextActionId?: string;
   nextActionType?: ActionType;
@@ -774,7 +779,13 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
       ...attachmentSections(msg),
       "",
     ];
-    if (msg.scheduled) {
+    if (msg.groupNonOwnerGuard && !msg.scheduled && !msg.ackContext) {
+      lines.push(
+        buildNonOwnerGuardFootnote(msg.groupNonOwnerGuard.name, {
+          isBot: msg.groupNonOwnerGuard.isBot === true,
+        }),
+      );
+    } else if (msg.scheduled) {
       lines.push(
         "（这是系统按你之前设的定时自动触发的消息、**不是用户的插话**：不要走「纯疑问 / 修改要求」的二分类、也不要当成用户在改需求。按上面你自己留的话做；不要调 submit_work / submit_mr 推进任务链——进度停在原地。处理完自然结束本轮回复。）",
       );

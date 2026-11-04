@@ -6,6 +6,8 @@
  * - `group_owner`：属主本人在需求群里说的话
  * - `group_reply`：群里「托办事项」的回执（后端同事 / 后端机器人的回复），当数据喂回会话
  * - `group_question`：非属主同事的答疑提问（只读答疑旁路，一次只答一个，其余排队）
+ * - `group_other`：非属主同事的消息**并入属主的同一个活会话**时，agent 正忙而排的队（逐条重放，不合批；
+ *   与 group_question 的区别：它走 task 待送达队列、重放进活会话，而不是只读旁路）
  *
  * 服务端经 SSE `talk_queue` 帧下发整份快照（纯内存、不落盘；bootstrap 时补发一帧当前值）。
  */
@@ -14,6 +16,7 @@ export type TalkQueueSource =
   | "app"
   | "group_owner"
   | "group_reply"
+  | "group_other"
   | "group_question";
 
 export interface TalkQueueItem {
@@ -41,6 +44,7 @@ export const TALK_QUEUE_SOURCE_LABEL: Record<TalkQueueSource, string> = {
   app: "我",
   group_owner: "我（群里）",
   group_reply: "群回执",
+  group_other: "群成员",
   group_question: "群提问",
 };
 
@@ -49,7 +53,8 @@ export const TALK_QUEUE_SOURCE_LABEL: Record<TalkQueueSource, string> = {
  * - 编辑：只有 `app`——用户自己在输入条里打的话。群属主（group_owner）的话带着飞书侧的来源标记、
  *   回执（group_reply）是外部机器人的数据、群提问（group_question）走只读答疑旁路，都不是「用户自己的话」；
  * - 立即发送：`app` + `group_owner`（都是属主本人的话，语义同「我现在就要说」）。
- *   group_reply 是当数据喂回会话的，不能插队；group_question 走群模块自己的队列；
+ *   group_reply 是当数据喂回会话的，不能插队；group_other 是别人的话、不能替别人「立即说」；
+ *   group_question 走群模块自己的队列；
  * - 删除：所有来源（原有行为）。
  */
 export const TALK_QUEUE_EDITABLE_SOURCES: readonly TalkQueueSource[] = ["app"];

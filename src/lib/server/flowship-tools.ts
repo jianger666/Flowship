@@ -51,7 +51,12 @@ import {
   type ScheduleRecord,
 } from "@/lib/schedule";
 import { WAIT_TOOL_NAME } from "@/lib/wait-display";
+import {
+  NON_OWNER_TURN_ALLOWED_TOOLS,
+  buildNonOwnerToolDenied,
+} from "@/lib/group-non-owner-prompt";
 import { buildAskWaitCurl, openAskWait } from "./ask-wait";
+import { isNonOwnerTurnActive, touchNonOwnerTurn } from "./non-owner-turn-guard";
 import { cancelSchedule, createSchedule, readSchedules } from "./schedule-store";
 import { createCustomAction } from "./custom-action-fs";
 import {
@@ -997,6 +1002,38 @@ export const flowShipTools: FlowshipToolDef[] = [
 ];
 
 /**
+ * 所有 Flowship 系统工具的**统一调用入口**（pi / Cursor 两条后端都经它，见 custom-agent-backend /
+ * buildSdkCustomTools）：在 handler 之前做「本轮是否由群里非属主触发」的硬拒。
+ *
+ * 为什么放这里：两条后端的工具集都是建会话时一次性挂好的，没有按轮次改工具集的钩子；这是它们唯一共同的
+ * 咽喉。拒绝走白名单（只放行 {@link NON_OWNER_TURN_ALLOWED_TOOLS}），新增系统工具默认被拒、不会漏。
+ * 只拦 Flowship 系统工具——写文件 / 跑命令这类内置工具不经这里：pi 后端另有按轮次收窄工具集
+ *（custom-agent-backend.buildAdapter），Cursor 后端只靠提示词约束（见 group-non-owner-prompt）。
+ */
+export const invokeFlowshipTool = async (
+  tool: FlowshipToolDef,
+  args: Record<string, unknown>,
+  callerToken: string | undefined,
+  ctx?: FlowshipToolContext,
+): Promise<{ content: FlowshipToolContent }> => {
+  // 先查（带续期）再按白名单放行：wait 虽放行，也要刷新标记——否则同一轮里连调两次 30 分钟的 wait
+  // 就能把固定 TTL 熬过期，之后 submit_work / ask_user / schedule 全放行（第 20 轮评审 N1）。
+  // ctx.taskId 是工具构建处闭包的真任务 → 续期；args.task_id 是模型自己填的 → 只查不续
+  // （模型填别的 task_id 反正过不了 callerToken 校验，这里只是不留「靠填错 id 绕闸」的口子，
+  // 也不让它靠填别人的 id 去把别的任务的标记续命）。
+  const nonOwnerTurn =
+    touchNonOwnerTurn(ctx?.taskId) ||
+    isNonOwnerTurnActive(typeof args?.task_id === "string" ? args.task_id : undefined);
+  if (nonOwnerTurn && !NON_OWNER_TURN_ALLOWED_TOOLS.includes(tool.name)) {
+    console.warn(
+      `[flowship-tools] 非属主触发的一轮、已拒绝系统工具 ${tool.name} task=${ctx?.taskId ?? "-"}`,
+    );
+    return text(buildNonOwnerToolDenied(tool.name));
+  }
+  return tool.handler(args, callerToken, ctx);
+};
+
+/**
  * Cursor SDK 把 `local.customTools` 注册成这个合成 MCP server。
  * 事件流里 `args.providerIdentifier` 会是它（旧会话仍可能是 `flowshipChat`）。
  */
@@ -1041,7 +1078,8 @@ export const buildSdkCustomTools = (
         // 各 handler 里的 getTask 也在 try 之外）要转成「文本 + isError」回给模型——与 pi 桥 /
         // `subagent` 工具同口径；SDK 对 execute 抛错怎么呈现读不到，别指望它给一句能自修复的话
         try {
-          const r = await t.handler(
+          const r = await invokeFlowshipTool(
+            t,
             (args ?? {}) as Record<string, unknown>,
             callerToken,
             ctx,

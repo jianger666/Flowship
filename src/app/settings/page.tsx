@@ -444,6 +444,14 @@ const SettingsPage = () => {
                 onFeishuChatBridgeChange={(v) =>
                   saveFieldValue("feishuChatBridge", v)
                 }
+                feishuGroupNonOwnerGuard={settings.feishuGroupNonOwnerGuard !== false}
+                onFeishuGroupNonOwnerGuardChange={(v) =>
+                  saveFieldValue("feishuGroupNonOwnerGuard", v)
+                }
+                feishuGroupAllowBots={settings.feishuGroupAllowBots !== false}
+                onFeishuGroupAllowBotsChange={(v) =>
+                  saveFieldValue("feishuGroupAllowBots", v)
+                }
               />
               <Separator />
               <CompanyEnvSection
