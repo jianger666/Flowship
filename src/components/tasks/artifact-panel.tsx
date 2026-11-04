@@ -322,8 +322,8 @@ interface Props {
   priorPlans?: Array<{ n: number }>;
   onArtifactRefClick?: (ref: ActionArtifactRef) => void;
   /**
-   * 是否可「分享到需求群 / 打开需求群」。日常轻量任务（无飞书链接）为 false → 隐藏按钮。
-   * 由父组件用 isLightweightDailyTask 判定后传入。
+   * 是否可「分享到需求群 / 打开需求群」。日常任务（无飞书链接）与需求任务一样可用（群关联只存在任务本地、
+   * 不依赖工作项），所以详情页现在恒传 true；保留为 prop 只是让别处复用产物面板时能关掉。缺省 false。
    */
   canShareToGroup?: boolean;
 }
@@ -357,7 +357,7 @@ const ArtifactPanelImpl = ({
     () => buildMarkdownComponents(pathLinker, repoShortNames, onArtifactRefClick),
     [pathLinker, repoShortNames, onArtifactRefClick],
   );
-  // 分享到需求群（确认 dialog + API；日常任务 canShareToGroup=false 不渲按钮）
+  // 分享到需求群（确认 dialog + API；canShareToGroup=false 不渲按钮）
   // guideDialog = bot 不在群时的手动添加引导（叠在确认 dialog 之上、加完可原地重试）
   const { runShare, guideDialog } = useShareToGroup();
   const [shareOpen, setShareOpen] = useState(false); // 分享确认 dialog 开关

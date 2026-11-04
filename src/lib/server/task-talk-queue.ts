@@ -9,7 +9,13 @@
  * TTL：超过 TALK_QUEUE_TTL_MS 未送达 → 丢弃并写 info 事件（不静默）。
  */
 
-import type { TalkQueueItem, TalkQueueSource } from "@/lib/talk-queue";
+import {
+  TALK_QUEUE_EDIT_MAX_CHARS,
+  TALK_QUEUE_SEND_NOW_SOURCES,
+  canEditTalkQueueItem,
+  type TalkQueueItem,
+  type TalkQueueSource,
+} from "@/lib/talk-queue";
 import {
   buildDroppedQueueNotice,
   describeDroppedAttachments,
@@ -62,6 +68,13 @@ export type TalkQueueStoredItem = {
    * 直送成功后也据此摘掉同一条（K2-05）。
    */
   bodyFingerprint?: string;
+  /**
+   * 编辑前用过的正文指纹（同一个 dedupeKey 下）。编辑会让 `bodyFingerprint` 变成新正文的指纹，
+   * 此时客户端若因响应丢失、用同一个 clientItemId + **原文**重试原 POST，只比新指纹会认不出它、
+   * 把原文又排进队里（用户明明改过了）。所以旧指纹留作别名：重试命中同一条（回同一个 itemId、duplicate:true），
+   * 直送成功时的「摘掉队列里同一条」（removeTalkQueueItemsByDedupe）也认别名。
+   */
+  supersededFingerprints?: string[];
 };
 
 type TalkQueueGlobalState = {
@@ -69,6 +82,13 @@ type TalkQueueGlobalState = {
   nextSeq: number;
   drainTimers: Map<string, ReturnType<typeof setInterval>>;
   drainInFlight: Set<string>;
+  /**
+   * 「立即发送」窗口内被救出、暂存中的其余排队（按任务）。**不在 `queues` 里**——stop 的清队碰不到它们（救援语义），
+   * 但快照 / 列表仍然带上它们（标 `held`）：窗口常常是好几秒（先注入失败 → stop 整个任务 → 再注入），
+   * 这期间若快照里它们凭空消失，排队条会降到 0 整条消失、放回后又 0→N 自动弹开，用户以为消息丢了（第十七轮 N1）。
+   * 只由 beginTalkQueueSendNow 写入、endTalkQueueSendNow 清掉。
+   */
+  held: Map<string, TalkQueueStoredItem[]>;
 };
 
 const GLOBAL_KEY = "__flowshipTaskTalkQueueV1__";
@@ -82,11 +102,13 @@ const getState = (): TalkQueueGlobalState => {
       nextSeq: 1,
       drainTimers: new Map(),
       drainInFlight: new Set(),
+      held: new Map(),
     };
   }
   const s = g[GLOBAL_KEY]!;
   if (!s.drainTimers) s.drainTimers = new Map();
   if (!s.drainInFlight) s.drainInFlight = new Set();
+  if (!s.held) s.held = new Map();
   if (typeof s.nextSeq !== "number" || s.nextSeq < 1) s.nextSeq = 1;
   return s;
 };
@@ -96,6 +118,9 @@ const allocItemId = (): string => {
   const id = `tq_${st.nextSeq++}`;
   return id;
 };
+
+/** itemId 形如 `tq_<序号>`，序号单调递增——同毫秒入队的两条靠它排稳定次序（放回时合并排序用） */
+const seqOfItemId = (itemId: string): number => Number(itemId.replace(/^tq_/, "")) || 0;
 
 const previewFromBody = (rawBody: unknown): string => {
   const text =
@@ -111,6 +136,13 @@ const previewFromBody = (rawBody: unknown): string => {
   return "(空正文)";
 };
 
+/** 条目带的图片 / 文件个数（rawBody 里的 images + attachments） */
+const attachmentCountOf = (rawBody: unknown): number => {
+  const raw = rawBody as { images?: unknown; attachments?: unknown } | null | undefined;
+  const n = (v: unknown): number => (Array.isArray(v) ? v.length : 0);
+  return n(raw?.images) + n(raw?.attachments);
+};
+
 const ownedToView = (item: TalkQueueStoredItem): TalkQueueItem => ({
   id: item.itemId,
   source: item.source,
@@ -118,7 +150,18 @@ const ownedToView = (item: TalkQueueStoredItem): TalkQueueItem => ({
   ...(item.senderIsBot ? { senderIsBot: true } : {}),
   preview: item.preview,
   createdAt: item.createdAt,
+  ...(attachmentCountOf(item.rawBody) > 0 ? { hasAttachments: true as const } : {}),
 });
+
+/** 条目的 dedupeKey + 正文指纹（含编辑前的别名）是否命中 (key, fingerprint) */
+const matchesDedupe = (
+  e: TalkQueueStoredItem,
+  key: string,
+  fingerprint: string,
+): boolean =>
+  e.dedupeKey === key &&
+  (e.bodyFingerprint === fingerprint ||
+    (e.supersededFingerprints?.includes(fingerprint) ?? false));
 
 const publishSnapshot = (taskId: string): void => {
   publishTaskStreamEvent(taskId, {
@@ -167,8 +210,8 @@ const STOP_CLEARED_SOURCES: readonly TalkQueueOwnedSource[] = ["app"];
  * 认不出，被当非忙丢弃（第七轮 K2-03）。**文案子串仍保留作兜底**（老调用方 / 测试替身只回文案、不带 code
  * 时仍认得；只认「正在跑 / 等它说完」，**不**认「正在停止」——停止中靠 phase 标记）。
  */
-type ReplayConflict = "busy" | "stopping" | "other";
-const classifyReplayConflict = async (res: Response): Promise<ReplayConflict> => {
+export type ReplayConflict = "busy" | "stopping" | "other";
+export const classifyReplayConflict = async (res: Response): Promise<ReplayConflict> => {
   if (res.status !== 409) return "other";
   try {
     const data = (await res.clone().json()) as {
@@ -255,6 +298,22 @@ const putBackToHead = (taskId: string, item: TalkQueueStoredItem): void => {
   publishSnapshot(taskId);
 };
 
+/**
+ * 重放一条排队消息用的注入选项（drain 与「立即发送」共用同一份，免得两边的 meta 漂移）。
+ * 必须清 queueIfBusy：否则重放遇到「刚好又忙」会再入队，形成死循环。
+ */
+export const buildReplayOptions = (
+  item: Pick<TalkQueueStoredItem, "options" | "createdAt">,
+): TaskQuestionInjectOptions => ({
+  ...item.options,
+  queueIfBusy: undefined,
+  userReplyMetaExtra: {
+    ...(item.options.userReplyMetaExtra ?? {}),
+    fromQueue: true,
+    queuedAt: item.createdAt,
+  },
+});
+
 /** 清掉所有超过 TTL 的条目（不管任务忙不忙：躺满 30 分钟就该让用户知道没送出去） */
 const sweepExpired = (taskId: string): void => {
   const st = getState();
@@ -317,20 +376,10 @@ const drainOnce = async (taskId: string): Promise<void> => {
     const { handleTaskQuestionInject } = await import(
       "@/lib/server/task-question-inject"
     );
-    // 重放必须清 queueIfBusy：否则 drain 遇到「刚好又忙」会再入队，形成死循环
-    const replayOptions: TaskQuestionInjectOptions = {
-      ...item.options,
-      queueIfBusy: undefined,
-      userReplyMetaExtra: {
-        ...(item.options.userReplyMetaExtra ?? {}),
-        fromQueue: true,
-        queuedAt: item.createdAt,
-      },
-    };
     const res = await handleTaskQuestionInject(
       taskId,
       item.rawBody,
-      replayOptions,
+      buildReplayOptions(item),
     );
     if (res.ok || res.status === 202) return;
     const conflict = await classifyReplayConflict(res);
@@ -435,15 +484,25 @@ export const enqueueTalkMessage = (
     ? fingerprintTaskQuestionBody(input.rawBody)
     : undefined;
   if (dedupeKey) {
-    const idx = q.findIndex(
-      (e) => e.dedupeKey === dedupeKey && e.bodyFingerprint === bodyFingerprint,
-    );
+    const idx = q.findIndex((e) => matchesDedupe(e, dedupeKey, bodyFingerprint!));
     if (idx >= 0) {
       publishSnapshot(taskId);
       return {
         ok: true,
         itemId: q[idx]!.itemId,
         position: idx + 1,
+        duplicate: true,
+      };
+    }
+    // 暂存中（立即发送窗口里被救出的）也算「已经排着」：此时来的原 POST 重试若当新条入队，
+    // 放回后同一句话就有两条、会被注入两遍
+    const held = st.held.get(taskId) ?? [];
+    const heldIdx = held.findIndex((e) => matchesDedupe(e, dedupeKey, bodyFingerprint!));
+    if (heldIdx >= 0) {
+      return {
+        ok: true,
+        itemId: held[heldIdx]!.itemId,
+        position: q.length + heldIdx + 1,
         duplicate: true,
       };
     }
@@ -473,9 +532,168 @@ export const enqueueTalkMessage = (
   return { ok: true, itemId: item.itemId, position: q.length };
 };
 
+export type UpdateTalkQueueItemResult =
+  | { ok: true; item: TalkQueueItem }
+  | { ok: false; reason: "gone" | "not_editable" | "empty" | "too_long" };
+
+/**
+ * 原地改一条排队消息的正文（同步、无 await——和 drain 的 shift 之间没有交错窗口）。
+ *
+ * - 位置、`createdAt`（TTL 起点）、图片 / 文件都不变；`rawBody.text` 与 `preview` 同步更新，
+ *   重放的就是编辑后的文本；
+ * - 只认 app 来源（canEditTalkQueueItem）；群来源 / 回执不是「用户自己的话」；
+ * - 已出队（drain 已 shift、正在重放 / 立即发送中）找不到 → `gone`，调用方回 409；
+ * - 清空文字只在这条带图片 / 文件时允许（注入端要求 text / images / attachments 至少一项非空）；
+ * - 带 dedupeKey 的条目：指纹换成新正文的，旧指纹留作别名（见 TalkQueueStoredItem.supersededFingerprints）。
+ */
+export const updateTalkQueueItemText = (
+  taskId: string,
+  itemId: string,
+  text: string,
+): UpdateTalkQueueItemResult => {
+  const q = getState().queues.get(taskId);
+  const item = q?.find((e) => e.itemId === itemId);
+  if (!item) return { ok: false, reason: "gone" };
+  if (!canEditTalkQueueItem(item)) return { ok: false, reason: "not_editable" };
+  const next = text.trim();
+  if (next.length > TALK_QUEUE_EDIT_MAX_CHARS) return { ok: false, reason: "too_long" };
+  if (!next && attachmentCountOf(item.rawBody) === 0) return { ok: false, reason: "empty" };
+
+  const rawBody = {
+    ...((item.rawBody && typeof item.rawBody === "object" ? item.rawBody : {}) as Record<
+      string,
+      unknown
+    >),
+    text: next,
+  };
+  if (item.dedupeKey && item.bodyFingerprint) {
+    const nextFingerprint = fingerprintTaskQuestionBody(rawBody);
+    if (nextFingerprint !== item.bodyFingerprint) {
+      item.supersededFingerprints = [
+        ...(item.supersededFingerprints ?? []),
+        item.bodyFingerprint,
+      ];
+      item.bodyFingerprint = nextFingerprint;
+    }
+  }
+  item.rawBody = rawBody;
+  item.preview = previewFromBody(rawBody);
+  publishSnapshot(taskId);
+  return { ok: true, item: ownedToView(item) };
+};
+
+/**
+ * 编辑用的完整正文（只给可编辑的 app 来源；快照里的 preview 只有 ≤120 字、不能拿来编辑）。
+ * 按需取、不塞进每个 SSE 帧——正文可能很长，而帧是整份快照、每次队列变动都重发。
+ */
+export const listTalkQueueEditTexts = (taskId: string): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const e of getState().queues.get(taskId) ?? []) {
+    if (!canEditTalkQueueItem(e)) continue;
+    out[e.itemId] = bodyTextOf(e);
+  }
+  return out;
+};
+
+export type BeginTalkSendNowResult =
+  | { ok: true; item: TalkQueueStoredItem; rest: TalkQueueStoredItem[] }
+  | { ok: false; reason: "gone" | "not_allowed" | "drain_busy" };
+
+/**
+ * 「立即发送」第一步（同步）：把目标条取出队列 + 把 stop 会清掉的来源（app）的**其余排队救出来**。
+ *
+ * 为什么要救：stop 的清队（stop-task 的 `clearTalkQueueCapturing(id, { onlySources: ["app"] })`）会把
+ * app 来源的整队清掉、还写一条「未送达」提示——先 stop 再起新 run 的话，用户排的其余几条就凭空没了
+ * （chat 实测踩过：点一条立即发送、其余 4 条丢 3 条）。所以必须在 stop 之前取走，之后由 {@link endTalkQueueSendNow} 放回。
+ *
+ * 救出的条目进**暂存区**（`held`，不在 `queues` 里 = stop 清不到），但快照 / 列表仍然带上它们并标 `held`：
+ * 窗口常常是好几秒，快照里它们若凭空消失，排队条会降到 0 整条消失、放回后又 0→N 自动弹开，用户以为消息丢了
+ * （第十七轮 N1）。暂存期间它们不可编辑 / 删除 / 立即发送（都在 `queues` 里找不到 → 按「已不在队里」拒）。
+ *
+ * 同时占住该任务的 drain 锁：整个立即发送期间定时 drain 不得再重放别的条（会和我们并发起 run、打乱顺序）。
+ * 锁被别人占着（drain 正在重放另一条）→ `drain_busy`、什么都不动，调用方让用户稍后再点。
+ * 成功返回后调用方**必须**在 finally 里调 {@link endTalkQueueSendNow}（放回 + 释放锁）。
+ */
+export const beginTalkQueueSendNow = (
+  taskId: string,
+  itemId: string,
+): BeginTalkSendNowResult => {
+  const st = getState();
+  if (st.drainInFlight.has(taskId)) return { ok: false, reason: "drain_busy" };
+  const q = st.queues.get(taskId);
+  const idx = q ? q.findIndex((e) => e.itemId === itemId) : -1;
+  if (!q || idx < 0) return { ok: false, reason: "gone" };
+  const target = q[idx]!;
+  if (!TALK_QUEUE_SEND_NOW_SOURCES.includes(target.source)) {
+    return { ok: false, reason: "not_allowed" };
+  }
+  q.splice(idx, 1);
+  const rest = q.filter((e) => STOP_CLEARED_SOURCES.includes(e.source));
+  if (rest.length > 0) {
+    const keep = q.filter((e) => !STOP_CLEARED_SOURCES.includes(e.source));
+    if (keep.length === 0) st.queues.delete(taskId);
+    else st.queues.set(taskId, keep);
+  } else if (q.length === 0) {
+    st.queues.delete(taskId);
+  }
+  st.drainInFlight.add(taskId);
+  // 暂存区（独立副本）：不在 queues 里 = stop 清不到；但快照仍带它们（见 TalkQueueGlobalState.held）
+  if (rest.length > 0) st.held.set(taskId, [...rest]);
+  publishSnapshot(taskId);
+  return { ok: true, item: target, rest };
+};
+
+/**
+ * 「立即发送」收尾（同步）：放回没送出去的 + 其余救出来的，释放 drain 锁。
+ * - `putBack`：目标条没发出去（stop / 起新 run 失败）才传——放回队首，保持第一位；
+ * - `rest`：救出来的其余条目，按原有先后放回（和窗口内新到的、以及没被救的群来源条目按入队时间合并，稳定排序）。
+ *   整批放回、**不判队列已满**：这些消息用户早已收到过 202，在这里丢掉就是静默丢消息；
+ *   代价是窗口内又排了新消息时，队列会暂时超过 TALK_QUEUE_MAX（只是不再收新的，直到降下来）。
+ * 重放用的是原条目对象（rawBody / options / createdAt 原样），TTL 不重新起算。
+ * 放回以**暂存区为准**（`rest` 里不在暂存区的——窗口内被去重键摘掉的——不放回），同时清空暂存区。
+ */
+export const endTalkQueueSendNow = (
+  taskId: string,
+  args: { putBack?: TalkQueueStoredItem; rest: readonly TalkQueueStoredItem[] },
+): void => {
+  const st = getState();
+  const cur = st.queues.get(taskId) ?? [];
+  // 以暂存区为准：窗口内被「按去重键摘掉」的（同一句话已被直送）不能再放回，否则重放成二次注入
+  const stillHeld = new Set((st.held.get(taskId) ?? []).map((e) => e.itemId));
+  st.held.delete(taskId);
+  const rest = args.rest.filter((e) => stillHeld.has(e.itemId));
+  const merged = [...rest, ...cur].sort(
+    (a, b) => a.createdAt - b.createdAt || seqOfItemId(a.itemId) - seqOfItemId(b.itemId),
+  );
+  if (args.putBack) merged.unshift(args.putBack);
+  if (merged.length === 0) st.queues.delete(taskId);
+  else st.queues.set(taskId, merged);
+  st.drainInFlight.delete(taskId);
+  if (merged.length > 0) ensureDrainTimer(taskId);
+  publishSnapshot(taskId);
+  stopDrainTimerIfIdle(taskId);
+};
+
 /** 本模块队列条目（不含 group_question） */
-export const listTalkQueue = (taskId: string): TalkQueueItem[] =>
-  (getState().queues.get(taskId) ?? []).map(ownedToView);
+export const listTalkQueue = (taskId: string): TalkQueueItem[] => {
+  const st = getState();
+  const queued = st.queues.get(taskId) ?? [];
+  const held = st.held.get(taskId) ?? [];
+  if (held.length === 0) return queued.map(ownedToView);
+  // 立即发送窗口内：暂存的其余条仍出现在列表里（标 held、暂时不可操作），与队里剩下的按入队先后合并——
+  // 它们放回后就是这个次序；条数在整个窗口内保持稳定，不会掉到 0 再 0→N
+  const rows = [
+    ...queued.map((e) => ({ e, held: false })),
+    ...held.map((e) => ({ e, held: true })),
+  ].sort(
+    (a, b) =>
+      a.e.createdAt - b.e.createdAt || seqOfItemId(a.e.itemId) - seqOfItemId(b.e.itemId),
+  );
+  return rows.map(({ e, held: isHeld }) => ({
+    ...ownedToView(e),
+    ...(isHeld ? { held: true as const } : {}),
+  }));
+};
 
 /** UI / SSE 用：合并本模块 + 群 group_question */
 export const buildTalkQueueSnapshot = (taskId: string): TalkQueueItem[] => {
@@ -537,15 +755,26 @@ export const removeTalkQueueItemsByDedupe = (
   bodyFingerprint: string,
 ): number => {
   const st = getState();
+  let removed = 0;
+  // 暂存中的（立即发送窗口里被救出的）同样要摘：它们放回后会重放，同一句话已被直送就是二次注入
+  const held = st.held.get(taskId);
+  if (held && held.length > 0) {
+    const heldKeep = held.filter((e) => !matchesDedupe(e, clientItemId, bodyFingerprint));
+    removed += held.length - heldKeep.length;
+    if (heldKeep.length === 0) st.held.delete(taskId);
+    else st.held.set(taskId, heldKeep);
+  }
   const q = st.queues.get(taskId);
-  if (!q || q.length === 0) return 0;
-  const keep = q.filter(
-    (e) => !(e.dedupeKey === clientItemId && e.bodyFingerprint === bodyFingerprint),
-  );
-  const removed = q.length - keep.length;
+  if (q && q.length > 0) {
+    const keep = q.filter((e) => !matchesDedupe(e, clientItemId, bodyFingerprint));
+    const n = q.length - keep.length;
+    removed += n;
+    if (n > 0) {
+      if (keep.length === 0) st.queues.delete(taskId);
+      else st.queues.set(taskId, keep);
+    }
+  }
   if (removed === 0) return 0;
-  if (keep.length === 0) st.queues.delete(taskId);
-  else st.queues.set(taskId, keep);
   publishSnapshot(taskId);
   stopDrainTimerIfIdle(taskId);
   return removed;
@@ -599,6 +828,16 @@ export const clearTalkQueueCapturing = (
   const removing = (getState().queues.get(taskId) ?? []).filter(
     (e) => !only || only.includes(e.source),
   );
+  return {
+    items: droppedNoticeItemsOf(removing),
+    count: clearTalkQueue(taskId, opts),
+  };
+};
+
+/** 被丢弃的条目 → 「未送达」卡片行：用户自己的话取脱敏全文，附件只取数量占位，外部回执 / 空条不进卡 */
+const droppedNoticeItemsOf = (
+  removing: readonly TalkQueueStoredItem[],
+): DroppedNoticeItem[] => {
   const items: DroppedNoticeItem[] = [];
   for (const e of removing) {
     const text = userTextOf(e);
@@ -608,7 +847,27 @@ export const clearTalkQueueCapturing = (
       items.push({ itemId: e.itemId, text, ...(attachments ? { attachments } : {}) });
     }
   }
-  return { count: clearTalkQueue(taskId, opts), items };
+  return items;
+};
+
+/** 这个来源的排队会被「停止」清掉吗（与 stop-task 的 onlySources 同口径；立即发送编排据此分流） */
+export const isStopClearedTalkSource = (source: TalkQueueSource): boolean =>
+  (STOP_CLEARED_SOURCES as readonly TalkQueueSource[]).includes(source);
+
+/**
+ * 「立即发送」撞上别人发起的 stop 时，被救出来的 app 来源条目按 stop 的清队语义处理：
+ * 不放回（放回 = stop 结束后被重放成一次点了停止之后的意外新 run），落与 stop 同款的「未送达」卡片。
+ * 失败只告警（noticeTalkQueueDropped 内部兜底）。
+ */
+export const noticeTalkQueueSendNowDropped = async (
+  taskId: string,
+  items: readonly TalkQueueStoredItem[],
+): Promise<void> => {
+  await noticeTalkQueueDropped(taskId, {
+    header: `已停止，${items.length} 条排队消息未送达、请重新发送`,
+    count: items.length,
+    items: droppedNoticeItemsOf(items),
+  });
 };
 
 /**
@@ -640,6 +899,7 @@ export const __resetTaskTalkQueueForTest = (): void => {
   for (const t of st.drainTimers.values()) clearInterval(t);
   st.drainTimers.clear();
   st.drainInFlight.clear();
+  st.held.clear();
   st.queues.clear();
   st.nextSeq = 1;
 };

@@ -409,6 +409,19 @@ export const resolveTaskStory = async (
   };
 };
 
+/**
+ * 日常任务（`feishuStoryUrl` 为空）没有工作项可读：返回 `null`，调用方走「只认本任务本地关联 / 按任务标题新建」。
+ * 链接非空才解析（链接写坏了照旧抛 `no_story`，不悄悄当成日常任务）。
+ *
+ * 需求群的关联本来就只存在任务本地（工作项碰都不碰）；工作项只在三处被「读」：项目群默认回落、建群时的群名 /
+ * 角色成员、分享卡上的需求名 / @ 名字反查——这三处没有工作项就各自退化（无回落 / 标题当群名 + 只拉本人 / 标题当需求名），
+ * 绝不因此拒绝日常任务使用需求群。
+ */
+const resolveOptionalTaskStory = async (
+  task: Pick<Task, "feishuStoryUrl">,
+): Promise<ResolvedStory | null> =>
+  (task.feishuStoryUrl ?? "").trim() ? resolveTaskStory(task) : null;
+
 // ----------------- 错误映射 -----------------
 
 /**
@@ -490,13 +503,13 @@ const mapExternalError = async (err: unknown): Promise<FeishuGroupError> => {
 // ----------------- 群管理 -----------------
 
 /**
- * 建群拉谁：工作项角色成员邮箱 → 注册表反查 open_id / bot app_id。
+ * 建群拉谁：工作项角色成员邮箱 → 注册表反查 open_id / bot app_id（日常任务无工作项 → 只拉发起人本人）。
  *
  * **绝不抛**——注册表是增强路径。meegle 查角色挂了 / 团队库没同步下来 / 一个人都
  * 没命中，一律退回「只拉发起人本人」（老行为），绝不因此挡住建群。
  */
 const resolveGroupInvites = async (
-  story: ResolvedStory,
+  story: ResolvedStory | null,
   ownerOpenId: string,
   ownBotAppId: string,
 ): Promise<GroupCreationTargets> => {
@@ -507,6 +520,8 @@ const resolveGroupInvites = async (
       roleEmails: [],
       registry: emptyGroupMemberRegistry(),
     });
+  // 日常任务没有工作项 = 没有角色成员可查：只拉发起人本人（和上面「查不到」同一个退路）
+  if (!story) return ownerOnly();
 
   try {
     const emails = await getDeps().fetchRoleMemberEmails(
@@ -744,8 +759,8 @@ const persistCreatedGroup = async (
  * 幂等取/建本任务关联的群。
  * 1) 本任务自带的关联优先：过一道可用性校验（`verifyOwnerMembership`），
  *    本人已不在群 / 群没了就抛结构化错误让前端引导重建，否则直接返回
- * 2) 无本地关联 → 回落读工作项 `group_type` 的项目群（**只读**，从不写）
- * 3) 都没有（或用户确认重建）→ bot 建群（带发起人 + 注册表命中的角色成员和他们的 bot）
+ * 2) 无本地关联 → 回落读工作项 `group_type` 的项目群（**只读**，从不写；日常任务没有工作项、无此步）
+ * 3) 都没有（或用户确认重建）→ bot 建群（带发起人 + 注册表命中的角色成员和他们的 bot；日常任务只带发起人本人 + 本机 bot，群名用任务标题）
  *    并经 `persistLocalGroup` 存到本任务（`allowCreate: false` 时到此为止、抛 `no_group`）
  *
  * 项目群绑定永远不动：新建的群只记在任务本地，别人的机器、别人的任务不受影响。
@@ -757,7 +772,7 @@ export const ensureRequirementGroup = async (
   // 用到群协作 = 本机身份该进注册表（后台跑、静默失败、不阻塞本次建群）
   getDeps().scheduleSelfRegister();
   try {
-    const story = await resolveTaskStory(task);
+    const story = await resolveOptionalTaskStory(task);
     // 用户已在引导弹窗里确认「我不在这个群、重建一个」——只对**当前仍是这一条**的
     // 关联生效；期间已经被换成别的群就当普通复用（照常校验），别白建一个
     const staleId = opts.recreateFrom?.trim() || undefined;
@@ -784,11 +799,10 @@ export const ensureRequirementGroup = async (
       getDeps().warn(`按用户确认重建需求群：丢弃本任务失效关联 ${local.chatId}`);
     }
 
-    // —— 2) 回落读项目群（只读） ——
-    const existing = await getDeps().fetchGroupType(
-      story.workItemId,
-      story.projectKey,
-    );
+    // —— 2) 回落读项目群（只读）——日常任务没有工作项、没有项目群可回落 ——
+    const existing = story
+      ? await getDeps().fetchGroupType(story.workItemId, story.projectKey)
+      : null;
     const existingId = existing?.groupId?.trim();
     if (existingId && (existing?.value === "auto" || existing?.value === "bind")) {
       if (staleId === existingId) {
@@ -847,12 +861,16 @@ export const ensureRequirementGroup = async (
       const botInfo = await getDeps().getBotInfo();
       const ownerOpenId = botInfo.ownerOpenId.trim();
 
-      const workitemName = await getDeps().fetchWorkitemName(
-        story.workItemId,
-        story.projectKey,
-      );
+      // 日常任务没有工作项：群名用任务标题（标题也空才退到任务 id，群名不能是「需求群」三个字光杆）
+      const workitemName = story
+        ? await getDeps().fetchWorkitemName(story.workItemId, story.projectKey)
+        : "";
 
-      const reqName = (workitemName || task.title || story.workItemId).trim();
+      // 逐个 trim 再取第一个非空：纯空白的标题（truthy）不能把后面的兜底挡掉
+      const reqName =
+        [workitemName, task.title, story?.workItemId, task.id]
+          .map((v) => (v ?? "").trim())
+          .find(Boolean) ?? "";
       chatName = `${reqName}需求群`;
 
       const invites = await resolveGroupInvites(
@@ -957,8 +975,8 @@ export interface BoundGroupStatus {
  * 与 getBoundGroupChatId 的分工：那个是回流热路径的轻量 id 查询（失败返 null）；
  * 这个是用户主动打开设置时的一次性富查询（群名 + 本人在不在群），失败 fail-open
  * 尽量返回（群名读不到就不带，本人在不在查不出就标 membershipUnknown）。
- * 本任务无自带关联、项目群也没有 → 返回 null；
- * 未关联工作项时抛 `no_story`（前端据此展示“未关联工作项”态）。
+ * 本任务无自带关联、项目群也没有 → 返回 null（日常任务没有工作项、没有项目群可回落，同样返回 null）；
+ * 飞书链接非空却解析不出工作项 id 时抛 `no_story`（前端据此展示“未关联工作项”态）。
  */
 export const describeBoundRequirementGroup = async (
   task: Pick<Task, "feishuStoryUrl" | "feishuGroupChatId" | "feishuGroupChatName">,
@@ -975,7 +993,9 @@ export const describeBoundRequirementGroup = async (
     source = "task";
     snapshotName = local.chatName;
   } else {
-    const story = await resolveTaskStory(task);
+    const story = await resolveOptionalTaskStory(task);
+    // 日常任务（无工作项）又没有本地关联：没有项目群可回落 = 还没关联（不是错误，弹窗照常给「自动创建 / 绑定已有群」）
+    if (!story) return null;
     let existing: WorkitemGroupType | null;
     try {
       existing = await getDeps().fetchGroupType(story.workItemId, story.projectKey);
@@ -1040,7 +1060,8 @@ export const bindExistingRequirementGroup = async (
 ): Promise<BindExistingGroupResult> => {
   getDeps().scheduleSelfRegister();
   try {
-    await resolveTaskStory(task);
+    // 手动绑定本来就不读工作项：这里只是「飞书链接写坏了就先拦下」。日常任务（链接为空）直接放行
+    await resolveOptionalTaskStory(task);
     const chatId = extractBindChatId(rawChatId);
     const local = getTaskLocalGroup(task);
 
@@ -1366,14 +1387,14 @@ type AtCandidate = { email: string; name?: string };
  * 名字 → 邮箱（通用 @ 的公共解析，两阶段、每次现查、不落表）。
  *
  * - 传进来的就是邮箱：直接用，不查。
- * - 第一阶段：工作项角色成员（精确比名字）+ 本地注册表反查（精确比名字），命中唯一邮箱即收。
+ * - 第一阶段：工作项角色成员（精确比名字；日常任务无工作项则跳过这一源）+ 本地注册表反查（精确比名字），命中唯一邮箱即收。
  * - 第二阶段：第一阶段没命中的名字，打包调一次 meegle `user search` 再比一轮。
  * - 精确才 @：一个名字对出 0 个邮箱 → not_found，对出 2+ 个 → ambiguous，一律不@、只报。
  * - 任何一步挂了（meegle 没登录 / 超时 / 注册表读不到）：当没命中处理，绝不抛、不挡发送。
  */
 export const resolveShareAts = async (
   names: string[],
-  story: Pick<ResolvedStory, "workItemId" | "projectKey">,
+  story: Pick<ResolvedStory, "workItemId" | "projectKey"> | null,
 ): Promise<{ emails: string[]; notified: string[]; unresolved: ShareAtResult["unresolved"] }> => {
   const notified: string[] = [];
   const unresolved: ShareAtResult["unresolved"] = [];
@@ -1403,10 +1424,13 @@ export const resolveShareAts = async (
   if (wanted.length === 0) return { emails, notified, unresolved };
 
   let roles: AtCandidate[] = [];
-  try {
-    roles = await getDeps().fetchRoleMembersFull(story.workItemId, story.projectKey);
-  } catch {
-    roles = [];
+  // 日常任务没有工作项 = 没有角色成员可比：只靠本地注册表 + user search
+  if (story) {
+    try {
+      roles = await getDeps().fetchRoleMembersFull(story.workItemId, story.projectKey);
+    } catch {
+      roles = [];
+    }
   }
   let registry: GroupMemberRegistry | null = null;
   try {
@@ -1585,16 +1609,19 @@ export const shareToRequirementGroup = async (
     }
 
     const cardKind = parseShareKind(input.kind);
-    const story = await resolveTaskStory(task);
+    const story = await resolveOptionalTaskStory(task);
     let requirementName = task.title;
-    try {
-      const workitemName = await getDeps().fetchWorkitemName(
-        story.workItemId,
-        story.projectKey,
-      );
-      if (workitemName?.trim()) requirementName = workitemName.trim();
-    } catch {
-      /* 标题用 task.title 兜底 */
+    // 日常任务没有工作项：需求名就是任务标题
+    if (story) {
+      try {
+        const workitemName = await getDeps().fetchWorkitemName(
+          story.workItemId,
+          story.projectKey,
+        );
+        if (workitemName?.trim()) requirementName = workitemName.trim();
+      } catch {
+        /* 标题用 task.title 兜底 */
+      }
     }
 
     const senderName = await getDeps().resolveSenderName();

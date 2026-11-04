@@ -104,6 +104,72 @@ describe("ensureRequirementGroup", () => {
     expect(createChat).not.toHaveBeenCalled();
   });
 
+  describe("日常任务（没有飞书链接）", () => {
+    const daily = (over: Partial<Task> = {}): Task =>
+      baseTask({ feishuStoryUrl: undefined, title: "修登录页", ...over });
+
+    it("没有本地关联：群名用任务标题、只拉本人，不读工作项（项目群回落 / 工作项名 / 角色成员都不碰），新群记本任务本地", async () => {
+      const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_daily" });
+      const persistLocalGroup = vi.fn().mockResolvedValue(undefined);
+      const fetchGroupType = vi.fn();
+      const fetchWorkitemName = vi.fn();
+      const fetchRoleMemberEmails = vi.fn();
+      const decodeUrl = vi.fn();
+      __setFeishuGroupDepsForTest({
+        ...noRegistryDeps,
+        fetchRoleMemberEmails,
+        fetchGroupType,
+        fetchWorkitemName,
+        decodeUrl,
+        createChat,
+        getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
+      });
+
+      const r = await ensureRequirementGroup(daily(), { persistLocalGroup });
+
+      expect(r).toEqual({ chatId: "oc_daily", created: true, source: "task", chatName: "修登录页需求群" });
+      expect(createChat).toHaveBeenCalledWith({ name: "修登录页需求群", userIdList: ["ou_me"] });
+      expect(persistLocalGroup).toHaveBeenCalledWith("oc_daily", "修登录页需求群");
+      expect(fetchGroupType).not.toHaveBeenCalled();
+      expect(fetchWorkitemName).not.toHaveBeenCalled();
+      expect(fetchRoleMemberEmails).not.toHaveBeenCalled();
+      expect(decodeUrl).not.toHaveBeenCalled();
+    });
+
+    it("已有本地关联：直接复用，不建群", async () => {
+      const createChat = vi.fn();
+      __setFeishuGroupDepsForTest({ ...noRegistryDeps, createChat, fetchGroupType: vi.fn() });
+      const r = await ensureRequirementGroup(
+        daily({ feishuGroupChatId: "oc_have", feishuGroupChatName: "已有群" }),
+        { persistLocalGroup: async () => undefined },
+      );
+      expect(r).toMatchObject({ chatId: "oc_have", created: false, source: "task", chatName: "已有群" });
+      expect(createChat).not.toHaveBeenCalled();
+    });
+
+    it("没群且不许建（allowCreate:false，自动播报 / 提测 @）→ no_group，仍不建群", async () => {
+      const createChat = vi.fn();
+      __setFeishuGroupDepsForTest({ ...noRegistryDeps, createChat });
+      await expect(
+        ensureRequirementGroup(daily(), { allowCreate: false, persistLocalGroup: async () => undefined }),
+      ).rejects.toMatchObject({ code: "no_group" });
+      expect(createChat).not.toHaveBeenCalled();
+    });
+
+    it("标题也是空的 → 群名退到任务 id（不会建出一个光杆「需求群」）", async () => {
+      const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_x" });
+      __setFeishuGroupDepsForTest({
+        ...noRegistryDeps,
+        createChat,
+        getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
+      });
+      await ensureRequirementGroup(daily({ title: "  ", id: "t_abc" }), {
+        persistLocalGroup: async () => undefined,
+      });
+      expect(createChat).toHaveBeenCalledWith({ name: "t_abc需求群", userIdList: ["ou_me"] });
+    });
+  });
+
   it("注册表没人命中：建群只拉发起人本人、不带 bot_id_list", async () => {
     const warnings: string[] = [];
     // 新语义只读工作项一次（无 bind、无回读）；多余的 once 值留着无害
@@ -1009,13 +1075,59 @@ describe("bot 不在群判定 / shareToRequirementGroup", () => {
     expect(JSON.stringify(cardArg)).not.toContain("查看工作项");
   });
 
-  it("缺飞书链接 → no_story", async () => {
+  it("日常任务（没有飞书链接）：分享照常走本任务本地群，需求名 = 任务标题，一次工作项都不读", async () => {
+    const sendCard = vi.fn().mockResolvedValue({ chat_id: "oc_daily", message_id: "om_d", card_id: "c" });
+    const fetchGroupType = vi.fn();
+    const fetchWorkitemName = vi.fn();
+    const decodeUrl = vi.fn();
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      sendCard,
+      sendDoc: stubDoc(),
+      fetchGroupType,
+      fetchWorkitemName,
+      decodeUrl,
+      resolveSenderName: async () => "测试用户",
+    });
+    const r = await shareToRequirementGroup(
+      baseTask({ feishuStoryUrl: undefined, feishuGroupChatId: "oc_daily", feishuGroupChatName: "日常群", title: "修登录页" }),
+      { kind: "message", content: "进展" },
+    );
+    expect(r).toMatchObject({ chatId: "oc_daily", messageId: "om_d", created: false, source: "task" });
+    expect(JSON.stringify(sendCard.mock.calls[0]![1])).toContain("修登录页");
+    expect(fetchGroupType).not.toHaveBeenCalled();
+    expect(fetchWorkitemName).not.toHaveBeenCalled();
+    expect(decodeUrl).not.toHaveBeenCalled();
+  });
+
+  it("日常任务带 @：没有工作项角色可比，只靠注册表 / user search，不会去读角色", async () => {
+    const fetchRoleMembersFull = vi.fn();
+    __setFeishuGroupDepsForTest({
+      ...noRegistryDeps,
+      sendCard: vi.fn().mockResolvedValue({ chat_id: "oc_daily", message_id: "om_d", card_id: "c" }),
+      fetchRoleMembersFull,
+      readMemberRegistry: async () =>
+        registryOf({ "li@example.com": { openId: "ou_li", botAppId: "cli_x", name: "李四", updatedAt: 1 } }),
+      searchUsers: vi.fn(async () => []),
+      parseSearchMap: async () => ({}),
+      resolveSenderName: async () => "测试用户",
+    });
+    const r = await shareToRequirementGroup(
+      baseTask({ feishuStoryUrl: undefined, feishuGroupChatId: "oc_daily" }),
+      { kind: "message", content: "看一下", at: ["李四"] },
+    );
+    expect(r.at).toEqual({ notified: ["李四"], unresolved: [] });
+    expect(fetchRoleMembersFull).not.toHaveBeenCalled();
+  });
+
+  it("飞书链接写坏了（非空却解析不出工作项）→ 仍抛 no_story，不悄悄当成日常任务", async () => {
+    __setFeishuGroupDepsForTest({ ...noRegistryDeps, decodeUrl: async () => null });
     await expect(
-      shareToRequirementGroup(baseTask({ feishuStoryUrl: undefined }), {
+      shareToRequirementGroup(baseTask({ feishuStoryUrl: "not-a-story-link" }), {
         kind: "message",
         content: "x",
       }),
-    ).rejects.toBeInstanceOf(FeishuGroupError);
+    ).rejects.toMatchObject({ code: "no_story" });
   });
 });
 

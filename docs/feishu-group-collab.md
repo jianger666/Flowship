@@ -17,6 +17,25 @@
 - **后来者**若 bot 不在群（他没被注册表带进来）→ 引导弹窗手动加一次；加完即可直接发
 - 发送人是各自的 bot（每人 Flowship 配自己的飞书自建应用，lark-cli 双身份）
 
+## 日常任务（没有飞书工作项）也能用需求群（2026-11-04）
+
+日常任务 = `feishuStoryUrl` 为空（`lib/lightweight-task.ts`）。以前它在入口处被一刀切拦掉（「需求群」按钮不显示、分享入口隐藏、
+服务端 `resolveTaskStory` 抛 `no_story`）。但需求群的关联本来就**只存在任务本地**（`feishuGroupChatId`），群回流 / 播报反查
+（`getBoundGroupChatId`、`isGroupRouteCandidate`）也早就是「本地关联优先、不需要工作项」。工作项只在三处被**读**，现在各自退化：
+
+| 读工作项的地方 | 有工作项 | 日常任务（没有） |
+|---|---|---|
+| 项目群默认回落（`group_type`，只读） | 无本地关联时回落 | 没有回落 → 「还没关联」（`describeBoundRequirementGroup` 返回 `null`，不再抛 `no_story`） |
+| 建群：群名 / 拉谁 | 工作项名；角色成员 → 注册表 → 他们的 bot | **任务标题**（标题也空 → 任务 id）；只拉发起人本人 + 本机 bot |
+| 分享卡：需求名 / `at` 名字反查 | 工作项名；工作项角色成员参与反查 | 任务标题；只靠注册表 + user search |
+
+- 实现：`feishu-group.ts` 的 `resolveOptionalTaskStory`（链接为空 → `null`；**链接非空却解析不出 → 仍抛 `no_story`**，不悄悄当日常任务）。
+  `ensureRequirementGroup` / `bindExistingRequirementGroup` / `describeBoundRequirementGroup` / `shareToRequirementGroup` / `resolveShareAts` 都改走它。
+- UI：任务头「需求群」按钮、产物面板「分享到群」与选区分享、task 事件流里 AI 回复的「分享到需求群」对日常任务都显示（chat 形态不放开）；弹窗文案按 `hasStory`
+  区分（日常任务不提「项目群默认」「飞书项目上的群绑定」；自动创建说明为「按任务标题建群…只拉你本人和你的机器人」）。
+- **仍然不支持的一处**：提测后在群里 **@ 测试人员**（`group-tester-notify`）——测试人员名单来自飞书工作项，日常任务没有，照旧 `skipped_lightweight`。
+- 自动播报常驻 `off`，去掉「轻量任务」预筛后对线上没有可见变化，只是口径与正式任务一致。
+
 ## 权限边界（已实测，不可事后补救）
 
 | 能力 | 结果 |
@@ -1032,11 +1051,13 @@ agent 自己在群里 @ 别人要数据、再登记 `expect_group_reply` 时，*
 没带 `queueIfBusy` 的老调用方行为不变，仍 409「agent 正在跑、等它说完这轮再问」。
 「真在跑」指的是主链确实在跑，不是收尾 drain 窗口（`awaiting_ack` / `cancelled` / `error` / `idle` 的收尾期不排）。
 
-**UI**：任务输入框运行中**可以继续输入**，Enter = 入队（`queueMode = isRunning`，不做乐观气泡，成功提示
-「已排队，当前这轮跑完自动发送」）。输入框上方是队列横幅 `TalkQueueBanner`：有条目时显示
-「n 条消息排队中，当前这轮跑完自动送达」，可展开面板看来源标签（我 / 我（群里）/ 群回执 / 群提问）、发话人、
-机器人徽标、≤120 字预览，每条可撤回（`DELETE`）；队列从无到有时自动弹开一次，关了等下一轮 0→N 再弹。
-横幅数据只认 SSE 快照，不另拉接口。
+**UI**：任务输入框运行中**可以继续输入**，Enter = 入队（`queueMode = isRunning`，不做乐观气泡，**入队不弹成功 toast**，
+与 chat 一致——排队条自己就是反馈）。输入框上方是队列横幅 `TalkQueueBanner`（面板与 chat 共用 `queue-banner.tsx`）：
+有条目时显示「n 条排队中 · 点击管理」，可展开面板看来源标签（我 / 我（群里）/ 群回执 / 群提问）、发话人、
+机器人徽标、≤120 字预览；队列从无到有时自动弹开一次，关了等下一轮 0→N 再弹。横幅数据只认 SSE 快照，不另拉接口。
+每条能做什么按来源：删除（所有来源，`DELETE`）；**编辑**（只有我自己输入条排的 `app`，`PUT`，点编辑时 `GET ?full=1`
+取完整正文）；**立即发送**（`app` + `group_owner`，`POST { action: "send_now" }`：先直接注入，agent 在跑才停止这一轮再发，
+其余排队保留；编排见 `task-talk-queue-send-now.ts`）。群回执 / 群提问只能删。
 
 **群里属主消息**：忽略「群忙线」闸——`groupMessageBusyReason` 返回 `GROUP_TASK_RUNNING` 且发件人是属主、task 模式时，
 群侧不再拒收，交给注入链入队。⚠️ 只豁免「主链在跑」；**旁路答疑在飞仍按原口径拒收**（那是群侧串行闸、不是主链排队）。
@@ -1356,7 +1377,7 @@ runActionPostCheck（后台、独立 check 租约）
 
 | 顺序 | 条件 | 结果 | 原因 |
 |------|------|------|------|
-| 1 | 轻量任务（无 `feishuStoryUrl`） | `skipped_lightweight` | 没工作项 = 没需求群 |
+| 1 | ~~轻量任务（无 `feishuStoryUrl`）~~ | —（已去掉） | 2026-11-04 起日常任务与正式任务同口径：需求群关联只存在任务本地、不依赖工作项，有没有群看第 6 条 |
 | 2 | 档位不匹配（**固定 `off` → 常驻走这条**） | `skipped_mode` | 自动播报已关死；读档失败也按「不播」保守处理 |
 | 3 | 该 task 有 `advance` 群回流登记 + `advanceResultToGroup` 开 | `skipped_group_reply` | 让位给 `group-outbound`，绝不发两张卡 |
 | 4 | 桥接总开关关 | `skipped_bridge_off` | 与出向同口径 |
@@ -1431,7 +1452,7 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 - 两条入口的失败引导都收在 `useShareToGroup`：bot 不在群 → `BotAddGuideDialog`；
   本人不在群 / 群没了 → `useDialog().confirm`「重新建群」（禁原生 confirm）。
   重建后的那一发**不再接引导**（`guided: false`），失败一律 toast 收口——不让引导链绕回自己
-- 两个入口都只在**非轻量任务**（有飞书工作项）时出现；修订视图下关掉选区分享
+- 产物面板两个入口对日常任务（无飞书工作项）和需求任务一样出现（2026-11-04 前日常任务被隐藏）；事件流里 AI 回复的「分享到需求群」只对 task(log) 形态放开，**chat 形态仍按「有飞书链接才出现」**（chat 没有「需求群」入口，放开会凭空给每个对话建群）；修订视图下关掉选区分享
   （那时正文是 diff 标记、选出来带增删痕迹）
 - 确认弹窗**不放正文预览**：内容形态已是「卡片 + md 文件」、弹窗里塞一大块灰底摘要
   用户反馈「看着都不知道啥意思」，只留一句「把「<action 标题>」的完整产物发到需求群？」
@@ -1511,7 +1532,7 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
   **登记表本身**（属主单格但 advance 不被 question 顶掉 + 旁路并存、跨通道回滚互不干扰、
   容量上限、TTL 过期、`hasGroupAdvanceReplyFor` 只认精确 actionId、
   **回滚放回过期 advance 但不放回过期 question**）
-- `tests/feishu-group-broadcast.test.ts`：三档判定、轻量任务 / 桥接关 / 无产物跳过、
+- `tests/feishu-group-broadcast.test.ts`：三档判定、日常任务与正式任务同口径（绑群照播 / 没绑群 `skipped_no_group`）/ 桥接关 / 无产物跳过、
   **没绑群不建群**、让位群内推进、防重（含失败退坑、含 flush 已占坑）、
   失败降级成 info 且不抛、MR 按钮只取本 action
 - `tests/feishu-group-tester-notify.test.ts`：提测需求群 @ 测试（注册表换 open_id /

@@ -256,7 +256,7 @@ describe("Enter 提交 / 确认处必须带 IME 判断（AST：同一函数体�
     const mustUseHelper = [
       "hooks/use-dialog.tsx",
       "components/tasks/requirement-group-dialog.tsx",
-      "components/tasks/chat-queue-banner.tsx",
+      "components/tasks/queue-banner.tsx",
       "components/tasks/event-stream-search-bar.tsx",
     ];
     for (const rel of mustUseHelper) {

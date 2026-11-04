@@ -154,6 +154,7 @@ export const pulseHits = (src: string): string[] => {
 /** 这批修过的文件（相对 src/）。新修一个文件就加进来（见文件头） */
 const FIXED_FILES = [
   "components/tasks/chat-queue-banner.tsx",
+  "components/tasks/queue-banner.tsx",
   "components/tasks/talk-queue-banner.tsx",
   "components/tasks/event-stream.tsx",
   "components/tasks/advance-dialog.tsx",

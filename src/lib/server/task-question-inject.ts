@@ -231,7 +231,7 @@ const stoppingResponse = (message: string): Response =>
  * deleting / finalizing / reopening 重放也不会好，不打（见 task-inject-shared 的 TASK_INJECT_BUSY_CODE）。
  * 传 null（lifecycle 已放开）落到「稍后再试」文案、不打标记。
  */
-const lifecycleBlockedResponse = (life: ChatLifecyclePhase | null): Response =>
+export const lifecycleBlockedResponse = (life: ChatLifecyclePhase | null): Response =>
   life === "stopping"
     ? stoppingResponse(lifecycleBlockedMessage(life))
     : errorResponse(lifecycleBlockedMessage(life), 409);

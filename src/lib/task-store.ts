@@ -36,7 +36,7 @@ import { isTailAnchorEvent } from "./tail-anchor";
 import type { ThinkingSnapshot } from "./thinking-live";
 import type { ArchiveReport, DeleteWorktreeReportBody } from "./worktree-report";
 import type { StorageDegradedState } from "./storage-degraded";
-import type { TalkQueueItem } from "./talk-queue";
+import { TALK_QUEUE_GONE_CODE, type TalkQueueItem } from "./talk-queue";
 import {
   type ActionRecord,
   type ArtifactRevision,
@@ -1754,6 +1754,71 @@ export const removeTalkQueueItems = async (
   );
   const data = await handleJson<{ ok: true; removedIds: string[] }>(res);
   return data.removedIds;
+};
+
+/** 排队条目已不在队里（已送出 / 正在送出 / 已被删）：编辑 / 立即发送撞上它的 409，调用方静默对齐、不当错误弹 */
+export const isTalkQueueItemGone = (err: unknown): boolean =>
+  err instanceof ApiRequestError && err.status === 409 && err.code === TALK_QUEUE_GONE_CODE;
+
+/**
+ * 可编辑排队条目的完整正文 `{ [itemId]: text }`（GET ?full=1）。
+ * 快照（SSE talk_queue 帧）里的 preview 只有 ≤120 字，拿来编辑会把长消息截断；所以点「编辑」时才按需取。
+ */
+export const fetchTalkQueueEditTexts = async (
+  taskId: string,
+): Promise<Record<string, string>> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/talk-queue?full=1`,
+    { cache: "no-store" },
+  );
+  const data = await handleJson<{ items: TalkQueueItem[]; texts?: Record<string, string> }>(res);
+  return data.texts ?? {};
+};
+
+/**
+ * 排队消息原地改文字：仍在原位置排队。撞上「已送出」抛 409（用 {@link isTalkQueueItemGone} 判），
+ * 其余失败（不可编辑 / 超长 / 清空纯文字条）抛带服务端文案的错。
+ */
+export const updateTalkQueueItem = async (
+  taskId: string,
+  itemId: string,
+  text: string,
+): Promise<TalkQueueItem> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/talk-queue`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ itemId, text }),
+    },
+  );
+  const data = await handleJson<{ ok: true; item: TalkQueueItem }>(res);
+  return data.item;
+};
+
+/**
+ * 排队消息「立即发送」：server 原子编排（task-talk-queue-send-now）。
+ * 空闲时直接发；agent 在跑才先停止这一轮再发（其余排队保留）。已送出的返回 `"gone"`（不抛）。
+ */
+export const sendTalkQueueItemNow = async (
+  taskId: string,
+  itemId: string,
+): Promise<"sent" | "gone"> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/talk-queue`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "send_now", itemId }),
+    },
+  );
+  try {
+    await handleJson<{ ok: true; itemId: string }>(res);
+    return "sent";
+  } catch (err) {
+    if (isTalkQueueItemGone(err)) return "gone";
+    throw err;
+  }
 };
 
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道

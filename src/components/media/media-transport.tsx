@@ -2,12 +2,13 @@
 
 /**
  * 播放器控制区：两排（时间 + 进度条另在 media-timeline-row）。
- * 第一排 = 传输（上一个 / 后退 / 播放 / 前进 / 下一个 / 倍速 / 音量）；
+ * 第一排 = 传输：三栏对称（`grid-cols-[1fr_auto_1fr]`）——中间是 上一个 / 后退 / 播放 / 前进 / 下一个（真正居中，
+ * 不随两侧内容宽度偏移），左栏倍速、右栏音量；
  * 第二排 = 工具（逐帧 / 字幕 / 循环 / 画中画 / 全屏 / 更多）。
  * 所有按钮只发 MediaCommand（与键盘快捷键同一套），真正执行在 media-player-dock。
  *
- * 窄窗口不挤：悬浮窗最窄 300px，第一排最坏情况（有对比组）也只占 ~235px；
- * 音量滑块再占 ~60px，所以只在控制区够宽（@sm = 384px）时才出现，窄时只留静音键。
+ * 窄窗口不挤：悬浮窗最窄 300px（控制区 282px）。居中要两侧栏等宽，所以按「中间 152px（有对比组时的五个按钮）+ 2 × 48px
+ * （较宽的一侧是倍速按钮）= 248px」算，放得下；音量滑块再占 ~56px，所以只在控制区够宽（@sm = 384px）时才出现，窄时只留静音键。
  * 以前时间文字和逐帧键都挤在第一排，窄窗里时间被截成「0…」、音量滑块被挤出窗外。
  */
 
@@ -147,57 +148,63 @@ export const MediaTransport = ({
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex items-center gap-0.5">
-        {groupSize > 1 && (
-          <Ctl label="上一个" shortcut="PageUp" onClick={() => onCommand({ type: "prev" })}>
-            <SkipBack />
+      {/* 三栏等分两侧：中间那组永远在控制区正中（以前贴着左边，和常见播放器的习惯相反） */}
+      <div className="grid grid-cols-[1fr_auto_1fr] items-center">
+        <div className="flex items-center justify-start">
+          <DropdownMenu onOpenChange={onMenuOpenChange}>
+            <Tooltip content="播放速度（[ ] 调整，\\ 复位）">
+              <DropdownMenuTrigger
+                aria-label={`播放速度 ${formatRate(rate)}`}
+                className={cn(
+                  BTN,
+                  "w-auto px-1.5 font-mono text-xs tabular-nums",
+                  rate !== 1 && "bg-primary/12 text-primary",
+                )}
+              >
+                {formatRate(rate)}
+              </DropdownMenuTrigger>
+            </Tooltip>
+            <DropdownMenuContent align="start" side="top" className="min-w-24">
+              {RATES.map((r) => (
+                <DropdownMenuItem key={r} onClick={() => onSetRate(r)} className="justify-between font-mono text-xs">
+                  {formatRate(r)}
+                  {r === rate && <span className="text-primary">●</span>}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        <div className="flex items-center gap-0.5">
+          {groupSize > 1 && (
+            <Ctl label="上一个" shortcut="PageUp" onClick={() => onCommand({ type: "prev" })}>
+              <SkipBack />
+            </Ctl>
+          )}
+          <Ctl label="后退 5 秒" shortcut="←" onClick={() => onCommand({ type: "seekBy", seconds: -5 })}>
+            <Rewind />
           </Ctl>
-        )}
-        <Ctl label="后退 5 秒" shortcut="←" onClick={() => onCommand({ type: "seekBy", seconds: -5 })}>
-          <Rewind />
-        </Ctl>
-        <Tooltip content={playing ? "暂停（空格）" : "播放（空格）"}>
-          <button
-            type="button"
-            aria-label={playing ? "暂停" : "播放"}
-            onClick={() => onCommand({ type: "toggle" })}
-            className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring [&_svg]:size-4"
-          >
-            {playing ? <Pause /> : <Play className="translate-x-px" />}
-          </button>
-        </Tooltip>
-        <Ctl label="前进 5 秒" shortcut="→" onClick={() => onCommand({ type: "seekBy", seconds: 5 })}>
-          <FastForward />
-        </Ctl>
-        {groupSize > 1 && (
-          <Ctl label="下一个" shortcut="PageDown" onClick={() => onCommand({ type: "next" })}>
-            <SkipForward />
-          </Ctl>
-        )}
-        <span className="min-w-0 flex-1" />
-        <DropdownMenu onOpenChange={onMenuOpenChange}>
-          <Tooltip content="播放速度（[ ] 调整，\\ 复位）">
-            <DropdownMenuTrigger
-              aria-label={`播放速度 ${formatRate(rate)}`}
-              className={cn(
-                BTN,
-                "w-auto px-1.5 font-mono text-xs tabular-nums",
-                rate !== 1 && "bg-primary/12 text-primary",
-              )}
+          <Tooltip content={playing ? "暂停（空格）" : "播放（空格）"}>
+            <button
+              type="button"
+              aria-label={playing ? "暂停" : "播放"}
+              onClick={() => onCommand({ type: "toggle" })}
+              className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring [&_svg]:size-4"
             >
-              {formatRate(rate)}
-            </DropdownMenuTrigger>
+              {playing ? <Pause /> : <Play className="translate-x-px" />}
+            </button>
           </Tooltip>
-          <DropdownMenuContent align="end" side="top" className="min-w-24">
-            {RATES.map((r) => (
-              <DropdownMenuItem key={r} onClick={() => onSetRate(r)} className="justify-between font-mono text-xs">
-                {formatRate(r)}
-                {r === rate && <span className="text-primary">●</span>}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <div className="flex shrink-0 items-center">
+          <Ctl label="前进 5 秒" shortcut="→" onClick={() => onCommand({ type: "seekBy", seconds: 5 })}>
+            <FastForward />
+          </Ctl>
+          {groupSize > 1 && (
+            <Ctl label="下一个" shortcut="PageDown" onClick={() => onCommand({ type: "next" })}>
+              <SkipForward />
+            </Ctl>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end">
           <Ctl label={muted ? "取消静音" : "静音"} shortcut="M" onClick={() => onCommand({ type: "mute" })}>
             <VolumeIcon volume={volume} muted={muted} />
           </Ctl>

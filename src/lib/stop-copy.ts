@@ -21,11 +21,12 @@ export const resumeHintFor = (mode: string | undefined): string =>
 
 /**
  * 停止会清掉的排队条数：只有输入条（app 来源）的；群来源（属主群话 / 托办回执 / 群提问）保留、空闲后照常送达
+ * ；正为「立即发送」让位而暂存（held）的也不算——它们不在队列里、停止清不到，窗口结束后照常放回
  * （与服务端 stop-task 的 `clearTalkQueue(id, { onlySources: ["app"] })` 同口径）。
  */
 export const stoppableQueuedCount = (
-  items: readonly { source: string }[] | null | undefined,
-): number => (items ?? []).filter((it) => it.source === "app").length;
+  items: readonly { source: string; held?: boolean }[] | null | undefined,
+): number => (items ?? []).filter((it) => it.source === "app" && !it.held).length;
 
 /**
  * task 页「停止当前 action？」确认框的正文。

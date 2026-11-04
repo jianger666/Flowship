@@ -1,169 +1,111 @@
 "use client";
 
 /**
- * task 模式「待送达」队列：一行提示条 + 可展开面板（来源标签 / 预览 / 删除）。
+ * task 模式「待送达」队列的提示条——面板本体在 queue-banner（与 chat 共用），这里只接 task 的数据来源与动作：
  *
- * 数据只认 SSE `talk_queue` 帧的整份快照（每次连接 bootstrap 都会补发），不另拉接口——
- * 删除走 DELETE，服务端删完会再推一帧快照，条数自然回落；
+ * - 条目只认 SSE `talk_queue` 帧的整份快照（每次连接 bootstrap 都会补发），不另拉接口；
+ *   编辑 / 删除 / 立即发送后服务端都会再推一帧快照，列表与条数自然更新；
+ * - 一行能做什么由来源决定（lib/talk-queue 的 canEditTalkQueueItem / canSendNowTalkQueueItem，服务端同样校验）：
+ *   我自己输入条排的（app）可编辑 / 立即发送 / 删除；群里属主的话可立即发送 / 删除；群回执、群提问只能删；
+ * - 「立即发送」只有「打断重发」一条路（task-talk-queue-send-now）：agent 在跑时先确认再停这一轮；
+ * - 编辑要完整正文：快照里的 preview 只有 ≤120 字，点「编辑」时才 GET ?full=1 取，别把长消息截断了。
+ *
  * 与 chat 的排队条一致：排队从无到有时自动弹开一次（用户要常驻感知），关了等下一轮 0→N 再弹。
+ * 「从无到有」在这里由条数变化判定：prevCountRef 初值取挂载时的条数（N1：进入一个本来就有排队的任务不算，不弹）。
  */
 
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight, Trash2 } from "lucide-react";
-import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { EmptyHint } from "@/components/ui/empty-hint";
+import { QueueBanner, type QueueBannerAdapter, type QueueRow } from "@/components/tasks/queue-banner";
+import { shouldAutoOpenQueue, taskSendNowCopy } from "@/lib/queue-banner";
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
-import { Tooltip } from "@/components/ui/tooltip";
-import { removeTalkQueueItems, type TalkQueueItem } from "@/lib/task-store";
-import { TALK_QUEUE_SOURCE_LABEL } from "@/lib/talk-queue";
+  canEditTalkQueueItem,
+  canSendNowTalkQueueItem,
+  TALK_QUEUE_SOURCE_LABEL,
+} from "@/lib/talk-queue";
+import {
+  fetchTalkQueueEditTexts,
+  isTalkQueueItemGone,
+  removeTalkQueueItems,
+  sendTalkQueueItemNow,
+  updateTalkQueueItem,
+  type TalkQueueItem,
+} from "@/lib/task-store";
+import type { Task } from "@/lib/types";
 
 interface Props {
-  taskId: string;
+  task: Task;
   /** SSE 实时快照（整份，含群里排队的提问） */
   talkQueue: TalkQueueItem[];
 }
 
-export const TalkQueueBanner = ({ taskId, talkQueue }: Props) => {
+const rowOf = (it: TalkQueueItem): QueueRow => ({
+  id: it.id,
+  text: it.preview,
+  canEdit: canEditTalkQueueItem(it),
+  canSendNow: canSendNowTalkQueueItem(it),
+  allowEmptyEdit: it.hasAttachments === true,
+  held: it.held === true,
+  prefix: (
+    <>
+      <Badge variant="secondary" className="text-[11px]">
+        {TALK_QUEUE_SOURCE_LABEL[it.source] ?? it.source}
+      </Badge>
+      {it.senderName ? (
+        <span className="text-muted-foreground">
+          {it.senderName}
+          {it.senderIsBot ? (
+            <Badge variant="outline" className="ml-1 px-1 py-0 text-[11px]">
+              机器人
+            </Badge>
+          ) : null}
+        </span>
+      ) : null}
+    </>
+  ),
+});
+
+export const TalkQueueBanner = ({ task, talkQueue }: Props) => {
+  const taskId = task.id;
   const queuedCount = talkQueue.length;
-  // 面板开关
-  const [open, setOpen] = useState(false);
-  // 删除飞行中的条目 id（行内按钮 disabled 防连点；快照里消失后无需再清）
-  const [deleting, setDeleting] = useState<ReadonlySet<string>>(new Set());
-  // 面板是不是「自动弹开」的：自动弹开时不抢焦点（用户正在输入框里打字，焦点被抢到第一个按钮上，
-  // 接着打的字落不进输入框、按空格 / 回车会直接触发按钮——第二轮 review U3b-02）；手动点开照常聚焦
-  const [autoOpened, setAutoOpened] = useState(false);
-  // 上一次的条数：用来识别「从无到有」的那一下。
+  // 「排队从无到有」的信号：条数 0→N 时递增（面板只认变化）。
   // 初值取挂载时的条数（N1）：进入一个本来就有排队的任务不算「从无到有」，不弹（否则切回来时
   // composer 的自动聚焦会被弹层抢走）
   const prevCountRef = useRef(queuedCount);
+  const [autoOpenTick, setAutoOpenTick] = useState(0);
 
   useEffect(() => {
     const prev = prevCountRef.current;
     prevCountRef.current = queuedCount;
-    if (prev <= 0 && queuedCount > 0) {
-      setAutoOpened(true);
-      setOpen(true);
-    }
+    if (shouldAutoOpenQueue(prev, queuedCount)) setAutoOpenTick((t) => t + 1);
   }, [queuedCount]);
 
-  const handleOpenChange = (next: boolean) => {
-    // 用户手动开 / 关：之后再开都按正常交互处理（聚焦进弹层）
-    setAutoOpened(false);
-    setOpen(next);
+  const adapter: QueueBannerAdapter = {
+    loadEditText: async (row) => (await fetchTalkQueueEditTexts(taskId))[row.id] ?? null,
+    save: async (row, text) => {
+      try {
+        const updated = await updateTalkQueueItem(taskId, row.id, text);
+        return { text: updated.preview };
+      } catch (err) {
+        if (isTalkQueueItemGone(err)) return "gone";
+        throw err;
+      }
+    },
+    remove: async (row) => {
+      await removeTalkQueueItems(taskId, [row.id]);
+    },
+    // bootArgs（apiKey / model）入队时已随消息存在服务端，不用再传
+    prepareSendNow: (row) => () => sendTalkQueueItemNow(taskId, row.id),
+    sendNowCopy: () => taskSendNowCopy(task.runStatus === "running"),
   };
-
-  const handleDelete = (itemId: string) => {
-    setDeleting((prev) => new Set(prev).add(itemId));
-    void removeTalkQueueItems(taskId, [itemId])
-      .catch((err) => {
-        toast.error(`删除失败：${(err as Error).message}`);
-      })
-      .finally(() => {
-        setDeleting((prev) => {
-          const next = new Set(prev);
-          next.delete(itemId);
-          return next;
-        });
-      });
-  };
-
-  if (queuedCount <= 0) return null;
 
   return (
-    <Popover open={open} onOpenChange={handleOpenChange}>
-      {/* hover 提示走 Tooltip、不用原生 title（规范「Hover 提示」）。PopoverTrigger.render 必须是可交互 DOM，
-          Tooltip 不透传 onClick / ref，塞进 render 会让点击打不开面板——所以包在外层 span（同 chat-mcp-picker）；
-          原先挂在 button 上的 mx / mb 与 flex 版式搬到外层 span，button 用 flex-1 铺满 */}
-      <Tooltip content="点击管理排队消息">
-        <span className="mx-2.5 mb-1.5 flex">
-          <PopoverTrigger
-            render={
-              <button
-                type="button"
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-full border border-primary/30 bg-primary/10 px-3 py-1.5 text-left text-xs font-medium text-foreground shadow-sm transition-colors hover:bg-primary/15"
-              >
-                {/* 静态点：事件流 v2「动效同屏只留一处主动效」——同屏已有状态行 shimmer，
-                    排队条的点不再 animate-ping（它也没登记 prefers-reduced-motion 静止态） */}
-                <span className="size-2 shrink-0 rounded-full bg-primary" aria-hidden />
-                <span className="inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-primary-foreground">
-                  {queuedCount}
-                </span>
-                <span className="min-w-0 flex-1 truncate">
-                  条消息排队中，当前这轮跑完自动送达
-                </span>
-                <ChevronRight className="size-3.5 shrink-0 opacity-70" />
-              </button>
-            }
-          />
-        </span>
-      </Tooltip>
-      <PopoverContent
-        align="start"
-        className="w-80 p-2"
-        initialFocus={!autoOpened}
-      >
-        <div className="mb-1.5 px-1 text-xs font-medium">排队中的消息</div>
-        {talkQueue.length === 0 ? (
-          <EmptyHint className="px-1 py-2">队列已空</EmptyHint>
-        ) : (
-          <ul className="max-h-64 space-y-1 overflow-y-auto">
-            {talkQueue.map((it) => (
-              <li
-                key={it.id}
-                className="flex items-start gap-2 rounded-md border border-border/60 px-2 py-1.5 text-xs"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="mb-0.5 flex flex-wrap items-center gap-1">
-                    <Badge variant="secondary" className="text-[11px]">
-                      {TALK_QUEUE_SOURCE_LABEL[it.source] ?? it.source}
-                    </Badge>
-                    {it.senderName ? (
-                      <span className="text-muted-foreground">
-                        {it.senderName}
-                        {it.senderIsBot ? (
-                          <Badge
-                            variant="outline"
-                            className="ml-1 px-1 py-0 text-[11px]"
-                          >
-                            机器人
-                          </Badge>
-                        ) : null}
-                      </span>
-                    ) : null}
-                  </div>
-                  <p className="line-clamp-3 whitespace-pre-wrap break-words text-foreground/90">
-                    {it.preview}
-                  </p>
-                </div>
-                {/* 删除飞行中 Button 是原生 disabled、收不到鼠标事件——Tooltip 挂外层 span；
-                    纯图标钮补 aria-label */}
-                <Tooltip content="从队列移除">
-                  <span className="inline-flex shrink-0">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label="从队列移除"
-                      disabled={deleting.has(it.id)}
-                      className="text-muted-foreground hover:text-destructive"
-                      onClick={() => handleDelete(it.id)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </span>
-                </Tooltip>
-              </li>
-            ))}
-          </ul>
-        )}
-      </PopoverContent>
-    </Popover>
+    <QueueBanner
+      queuedCount={queuedCount}
+      autoOpenTick={autoOpenTick}
+      adapter={adapter}
+      rows={talkQueue.map(rowOf)}
+    />
   );
 };

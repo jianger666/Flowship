@@ -29,8 +29,9 @@ interface Props {
 export const TaskUtilityActions = ({ task, onTaskUpdate }: Props) => {
   const [openingTaskDir, setOpeningTaskDir] = useState(false);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
-  // 需求任务才显示「需求群」（日常轻量任务无飞书工作项）
-  const showRequirementGroup = !isLightweightDailyTask(task);
+  // 日常任务（无飞书工作项）和需求任务一样能用需求群：关联只存在任务本地、不依赖工作项；
+  // 只是没有工作项可读，建群时用任务标题当群名、只拉本人（弹窗里的文案按 hasStory 区分）
+  const hasStory = !isLightweightDailyTask(task);
   const taskDirPath = task.taskDirPath?.trim() ?? "";
 
   const openTaskFolder = async () => {
@@ -59,27 +60,24 @@ export const TaskUtilityActions = ({ task, onTaskUpdate }: Props) => {
 
   return (
     <>
-      {showRequirementGroup && (
-        <Tooltip content="需求群设置（自动创建 / 绑定已有群）">
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            onClick={() => setGroupDialogOpen(true)}
-          >
-            <Users className="size-3" />
-            需求群
-          </Button>
-        </Tooltip>
-      )}
-      {showRequirementGroup && (
-        <RequirementGroupDialog
-          open={groupDialogOpen}
-          onOpenChange={setGroupDialogOpen}
-          taskId={task.id}
-          onTaskUpdate={onTaskUpdate ?? (() => {})}
-        />
-      )}
+      <Tooltip content="需求群设置（自动创建 / 绑定已有群）">
+        <Button
+          variant="ghost"
+          size="sm"
+          className={BTN_CLS}
+          onClick={() => setGroupDialogOpen(true)}
+        >
+          <Users className="size-3" />
+          需求群
+        </Button>
+      </Tooltip>
+      <RequirementGroupDialog
+        open={groupDialogOpen}
+        onOpenChange={setGroupDialogOpen}
+        taskId={task.id}
+        hasStory={hasStory}
+        onTaskUpdate={onTaskUpdate ?? (() => {})}
+      />
       {taskDirPath && (
         <Tooltip content="在文件管理器打开任务文件夹">
           <Button

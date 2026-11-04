@@ -1550,7 +1550,7 @@ const TaskDetailPage = () => {
                     effectiveBatches={effectiveBatches}
                     priorPlans={priorPlans}
                     onArtifactRefClick={handleArtifactRefClick}
-                    canShareToGroup={!isLightweightDailyTask(task)}
+                    canShareToGroup
                   />
                 ) : (
                   <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
@@ -1617,7 +1617,7 @@ const TaskDetailPage = () => {
                   群问答 tab 可见时隐藏：只读 tab 下输入框会误导用户在此发言 */}
               {groupQaVisible ? null : (
                 <>
-                <TalkQueueBanner taskId={task.id} talkQueue={talkQueue} />
+                <TalkQueueBanner task={task} talkQueue={talkQueue} />
                 {/* 会话里已设的定时（AI 给自己设的「到点叫我」）；没有时整条收起。chat 的同一条在 EventStream 里 */}
                 <ScheduleChip taskId={task.id} events={task.events} inset />
                 <TaskTalkComposer

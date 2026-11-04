@@ -75,10 +75,33 @@ describe("控制区：窄窗口不把控件挤出去", () => {
   });
 
   it("悬浮窗最窄 300px：第一排最坏情况（有对比组）的固定宽度加起来放得下", () => {
-    // 按钮 size-7 = 28px × 4（上一个 / 后退 / 前进 / 下一个）+ 播放键 size-8 = 32px
-    // + 倍速 ≤ 48px + 静音 28px + 各间隙 ≤ 16px；控制区 = 窗宽 - 边框 2 - 内边距 16
-    const fixed = 28 * 4 + 32 + 48 + 28 + 16;
-    expect(fixed).toBeLessThanOrEqual(DOCK_MIN_W - 2 - 16);
+    // 中间一组 = 按钮 size-7 = 28px × 4（上一个 / 后退 / 前进 / 下一个）+ 播放键 size-8 = 32px + 4 个 gap-0.5 = 8px
+    // 两侧栏等宽才能让中间真居中：每侧按较宽的那个算 = 倍速 ≤ 48px（静音键只有 28px）；
+    // 控制区 = 窗宽 - 边框 2 - 内边距 16
+    const centre = 28 * 4 + 32 + 4 * 2;
+    const side = 48;
+    expect(centre + 2 * side).toBeLessThanOrEqual(DOCK_MIN_W - 2 - 16);
+  });
+
+  it("第一排三栏对称：中间一组（上一个 / 后退 / 播放 / 前进 / 下一个）居中，倍速在左、音量在右", () => {
+    const html = renderTransport({ groupSize: 2 });
+    // 结构：两侧 1fr 等宽、中间 auto——中间不随两侧内容宽度偏移
+    expect(html).toContain("grid-cols-[1fr_auto_1fr]");
+    // 次序：倍速 → 上一个 → 后退 → 播放 → 前进 → 下一个 → 静音 → 音量
+    const order = ["播放速度 1×", "上一个", "后退 5 秒", "播放", "前进 5 秒", "下一个", "静音", "音量"].map((label) =>
+      html.indexOf(`aria-label="${label}"`),
+    );
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
+  it("不是对比组时中间只有 后退 / 播放 / 前进，仍然居中（没有上一个 / 下一个）", () => {
+    const html = renderTransport({ groupSize: 1 });
+    expect(html).toContain("grid-cols-[1fr_auto_1fr]");
+    expect(html).not.toContain('aria-label="上一个"');
+    expect(html).not.toContain('aria-label="下一个"');
+    expect(html.indexOf('aria-label="后退 5 秒"')).toBeLessThan(html.indexOf('aria-label="播放"'));
+    expect(html.indexOf('aria-label="播放"')).toBeLessThan(html.indexOf('aria-label="前进 5 秒"'));
   });
 
   it("时间放在进度条两端：已播 / 总时长，已播的宽度按总时长字数预留（数字跳动不推着进度条抖）", () => {

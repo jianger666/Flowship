@@ -60,6 +60,11 @@ interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   taskId: string;
+  /**
+   * 任务有没有飞书工作项（日常任务 = false）。决定几处文案：没有工作项就没有「项目群默认」可回落，
+   * 自动创建用任务标题当群名、只拉本人。缺省按有工作项（原文案）。
+   */
+  hasStory?: boolean;
   /** 关联变更后把服务端回的最新任务刷回页面（不经过它页面里的任务就是旧的） */
   onTaskUpdate: (task: Task) => void;
 }
@@ -84,7 +89,7 @@ const extractChatId = (raw: string): string | null => {
 };
 const countChatIds = (raw: string): number => (raw ?? "").match(CHAT_ID_PATTERN)?.length ?? 0;
 
-export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdate }: Props) => {
+export const RequirementGroupDialog = ({ open, onOpenChange, taskId, hasStory = true, onTaskUpdate }: Props) => {
   const { confirm } = useDialog();
   const [mode, setMode] = useState<Mode>("auto");
   // 当前关联
@@ -272,7 +277,9 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     const gen = sessionGuard.current();
     const ok = await confirm({
       title: rebuild.chatName ? `你已不在「${rebuild.chatName}」` : "你已不在原来的需求群",
-      description: "重建一个需求群？只记本任务，飞书项目上的群绑定不受影响。",
+      description: hasStory
+        ? "重建一个需求群？只记本任务，飞书项目上的群绑定不受影响。"
+        : "重建一个需求群？只记本任务。",
       confirmLabel: "重新建群",
     });
     if (!ok) return;
@@ -300,7 +307,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     } finally {
       setAutoBusy(false);
     }
-  }, [busy, landFailure, landSuccess, confirm, rebuild, resetTransient, sessionGuard, taskId]);
+  }, [busy, hasStory, landFailure, landSuccess, confirm, rebuild, resetTransient, sessionGuard, taskId]);
 
   const runBind = useCallback(async () => {
     if (busy) return;
@@ -350,9 +357,11 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     if (bound) {
       const ok = await confirm({
         title: "确认换关联的群？",
-        description: bound.chatName
-          ? `本任务将从「${bound.chatName}」换到 ${parsed}，旧群不再收到本任务的消息。飞书项目上的群绑定不受影响。`
-          : `本任务将换到 ${parsed}，旧群不再收到本任务的消息。飞书项目上的群绑定不受影响。`,
+        description:
+          (bound.chatName
+            ? `本任务将从「${bound.chatName}」换到 ${parsed}，旧群不再收到本任务的消息。`
+            : `本任务将换到 ${parsed}，旧群不再收到本任务的消息。`) +
+          (hasStory ? "飞书项目上的群绑定不受影响。" : ""),
         confirmLabel: "确认更换",
         destructive: true,
       });
@@ -401,7 +410,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     } finally {
       setBindBusy(false);
     }
-  }, [bound, busy, landFailure, landSuccess, confirm, manualInput, sessionGuard, taskId]);
+  }, [bound, busy, hasStory, landFailure, landSuccess, confirm, manualInput, sessionGuard, taskId]);
 
   const runClear = useCallback(async () => {
     if (!bound || busy) return;
@@ -409,7 +418,9 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     const gen = sessionGuard.current();
     const ok = await confirm({
       title: "取消关联？",
-      description: "取消后回到项目群默认。飞书项目上的群绑定不受影响。",
+      description: hasStory
+        ? "取消后回到项目群默认。飞书项目上的群绑定不受影响。"
+        : "取消后本任务不再关联需求群（群本身不会解散）。",
       confirmLabel: "取消关联",
       destructive: true,
     });
@@ -420,7 +431,11 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     try {
       const r = await clearRequirementGroupBind(taskId);
       // cleared=false 只可能发生在竞态（按钮只在 source=task 时渲染）：如实报，不谎报成功
-      toast.success(r.cleared ? "已取消关联，回到项目群默认" : "本来就没有手动关联，已经是项目群默认");
+      toast.success(
+        r.cleared
+          ? hasStory ? "已取消关联，回到项目群默认" : "已取消关联"
+          : hasStory ? "本来就没有手动关联，已经是项目群默认" : "本来就没有关联需求群",
+      );
       onTaskUpdateRef.current(r.task);
       landSuccess(gen);
     } catch (err) {
@@ -428,7 +443,7 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
     } finally {
       setClearing(false);
     }
-  }, [bound, busy, landSuccess, confirm, sessionGuard, taskId]);
+  }, [bound, busy, hasStory, landSuccess, confirm, sessionGuard, taskId]);
 
   // rebuild 存在时自动模式的主按钮即重建：再跑一遍不带 recreateFrom 的 runAuto 只会
   // 又撞回 needGroupRebuild、白转一圈，所以不给用户留第二个“该点哪个”的选择
@@ -527,7 +542,9 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, onTaskUpdat
             )}
           >
             <span className="block text-sm font-medium">自动创建</span>
-            <span className="mt-0.5 block text-xs text-muted-foreground">按工作项建群并关联到本任务，首建自动拉入相关人</span>
+            <span className="mt-0.5 block text-xs text-muted-foreground">
+              {hasStory ? "按工作项建群并关联到本任务，首建自动拉入相关人" : "按任务标题建群并关联到本任务，首建只拉你本人和你的机器人"}
+            </span>
           </button>
           <button
             type="button"

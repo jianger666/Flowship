@@ -656,10 +656,13 @@ const EventRowImpl = ({
     onMouseUp: onAssistantMouseUp,
     clear: clearQuoteSelection,
   } = useSelectionFloat({ enabled: !!onQuote, maxLength: QUOTE_MAX_LENGTH });
-  // 分享到需求群：日常任务隐藏；飞行中 spinner 防双击
+  // 分享到需求群：飞行中 spinner 防双击
   // guideDialog = bot 不在群时的手动添加引导（平时是 null、只在两个能分享的分支里渲染）
   const { runShare, guideDialog } = useShareToGroup();
-  const canShareToGroup = !isLightweightDailyTask(task);
+  // 这条动作条 chat 与 task(log) 共用，不能整个放开：chat 对话基本都没有飞书链接、页面上也没有「需求群」入口——
+  // 放开就是每条 AI 回复都多一个按钮、点了按对话标题真建一个看不见也取消不了的飞书群（第 19 轮 M1）。
+  // 所以：task(log) 形态的日常任务（要放开的，它有任务头「需求群」入口）恒可分享；chat 形态保持原样（有飞书链接才有）。
+  const canShareToGroup = variant === "log" || !isLightweightDailyTask(task);
   const [sharingMessage, setSharingMessage] = useState(false);
 
   const handleShareAssistant = async () => {

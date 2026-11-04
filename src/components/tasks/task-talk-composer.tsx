@@ -285,7 +285,8 @@ export const TaskTalkComposer = ({
       (result) => {
         if (!alive) return;
         if (result.queued) {
-          toast.success("已排队，当前这轮跑完自动发送");
+          // 入队不弹成功 toast：输入条上方的排队条（TalkQueueBanner）自己就是反馈，并会在「从无到有」时自动弹开
+          // ——与 chat 的排队保持一致，不再多一条转瞬即逝的提示
           if (valueRef.current === pending.text) resetRef.current();
           return;
         }
@@ -487,10 +488,8 @@ export const TaskTalkComposer = ({
       // 成功（含 202 入队）：下一条换新 id
       settleTalkClientItemId(task.id, clientItemId);
       const result = outcome.result;
-      if (result.queued) {
-        toast.success("已排队，当前这轮跑完自动发送");
-        return;
-      }
+      // 入队（202）：不弹成功 toast，输入条上方的排队条就是反馈（同上；chat 排队也不弹）
+      if (result.queued) return;
       // send 后落盘失败——不可忽略提示
       if (result.persistWarning) {
         toast.error(

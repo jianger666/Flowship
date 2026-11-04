@@ -274,8 +274,8 @@ describe("播报闭环", () => {
     expect(shareToGroup).not.toHaveBeenCalled();
   });
 
-  it("轻量任务（无飞书链接）跳过——同步预筛，连设置都不读", async () => {
-    const shareToGroup = vi.fn(async () => ({}));
+  it("日常任务（无飞书链接）与正式任务同口径：不被链接预筛拦下，绑了群就照常走设置 → 发", async () => {
+    const shareToGroup = vi.fn(async () => ({ chatId: "oc_x", messageId: "om_x" }));
     const getMode = vi.fn(async () => "all");
     __setGroupBroadcastDepsForTest(
       baseDeps({ shareToGroup, getMode }) as never,
@@ -287,8 +287,24 @@ describe("播报闭环", () => {
       action,
     );
 
-    expect(out).toBe("skipped_lightweight");
-    expect(getMode).not.toHaveBeenCalled();
+    expect(out).toBe("sent");
+    expect(getMode).toHaveBeenCalled();
+    expect(shareToGroup).toHaveBeenCalledTimes(1);
+  });
+
+  it("日常任务没绑群 → 同样 skipped_no_group（只读不建群，和正式任务一样）", async () => {
+    const shareToGroup = vi.fn(async () => ({}));
+    __setGroupBroadcastDepsForTest(
+      baseDeps({ shareToGroup, getBoundGroupChatId: async () => null }) as never,
+    );
+    const action = shipAction();
+
+    const out = await broadcastActionCompletion(
+      taskOf(action, { feishuStoryUrl: "" }),
+      action,
+    );
+
+    expect(out).toBe("skipped_no_group");
     expect(shareToGroup).not.toHaveBeenCalled();
   });
 

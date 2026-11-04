@@ -263,11 +263,34 @@ describe("bindExistingRequirementGroup（只写本任务本地）", () => {
     ).rejects.toThrow("meta 写盘失败");
   });
 
-  it("未关联工作项 → no_story（需求群只给需求任务用）", async () => {
-    __setFeishuGroupDepsForTest({ ...baseDeps } as never);
+  it("日常任务（没有飞书链接）照常绑定：不读工作项、只校验目标群、落本任务本地", async () => {
+    const fetchGroupType = vi.fn();
+    const decodeUrl = vi.fn();
+    const persist = vi.fn().mockResolvedValue(undefined);
+    __setFeishuGroupDepsForTest({
+      ...baseDeps,
+      decodeUrl,
+      fetchGroupType,
+      fetchChatInfo: async () => ({ chatId: "oc_new", name: "日常群" }),
+      probeSelfInChat: async () => true,
+    } as never);
+    const r = await bindExistingRequirementGroup(
+      baseTask({ feishuStoryUrl: undefined }),
+      "oc_new",
+      persist,
+    );
+    expect(r).toMatchObject({ chatId: "oc_new", chatName: "日常群", overwritten: false, source: "task" });
+    expect(persist).toHaveBeenCalledWith("oc_new", "日常群");
+    // 没有工作项：绝不去读（更不会写）
+    expect(fetchGroupType).not.toHaveBeenCalled();
+    expect(decodeUrl).not.toHaveBeenCalled();
+  });
+
+  it("飞书链接写坏了（非空却解析不出工作项）→ 仍然 no_story，不悄悄当成日常任务", async () => {
+    __setFeishuGroupDepsForTest({ ...baseDeps, decodeUrl: async () => null } as never);
     await expect(
       bindExistingRequirementGroup(
-        baseTask({ feishuStoryUrl: undefined }),
+        baseTask({ feishuStoryUrl: "not-a-story-link" }),
         "oc_new",
         noopPersist,
       ),
@@ -368,6 +391,15 @@ describe("describeBoundRequirementGroup", () => {
       probeSelfInChat: async () => true,
     } as never);
     await expect(describeBoundRequirementGroup(baseTask())).resolves.toBeNull();
+  });
+
+  it("日常任务（无飞书链接）又没有本地关联 → null（不抛 no_story、不读工作项）：弹窗照常给「自动创建 / 绑定已有群」", async () => {
+    const fetchGroupType = vi.fn();
+    __setFeishuGroupDepsForTest({ ...baseDeps, fetchGroupType } as never);
+    await expect(
+      describeBoundRequirementGroup(baseTask({ feishuStoryUrl: undefined })),
+    ).resolves.toBeNull();
+    expect(fetchGroupType).not.toHaveBeenCalled();
   });
 
   it.each(["", "   "])("本地 id 为空/空白（%j）→ 当无关联走项目群", async (groupId) => {

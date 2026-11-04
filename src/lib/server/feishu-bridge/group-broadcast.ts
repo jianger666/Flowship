@@ -38,7 +38,6 @@
 
 import { promises as fs } from "node:fs";
 
-import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { repoTail } from "@/lib/path-utils";
 import type { ShareLink, ShareToGroupInput } from "@/lib/server/feishu-group";
 import { getActionArtifactPath } from "@/lib/server/task-fs-core";
@@ -71,7 +70,6 @@ const MAX_MR_LINKS = 10;
 export type BroadcastOutcome =
   | "sent"
   | "failed"
-  | "skipped_lightweight"
   | "skipped_mode"
   | "skipped_bridge_off"
   | "skipped_duplicate"
@@ -230,8 +228,8 @@ const runBroadcast = async (
 ): Promise<BroadcastOutcome> => {
   // —— 同步零 IO 预筛（每个 action 完成都会走这里、别上来就读盘）——
 
-  // 轻量任务没有飞书工作项 = 没有需求群可发
-  if (isLightweightDailyTask(task)) return "skipped_lightweight";
+  // 日常任务（无飞书链接）与正式任务同口径：需求群的关联只存在任务本地、不依赖工作项，
+  // 有没有群由下面的「绑定准入闸」（getBoundGroupChatId 只读）判断，不在这里按链接一刀切。
 
   // 群内推进让位给 group-outbound：它会在 done 事件里发同一份产物，
   // 两边都发就是群里连着两张一样的卡

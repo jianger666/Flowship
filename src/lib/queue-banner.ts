@@ -123,6 +123,28 @@ export const sendNowCopy = (mode: SendNowMode): SendNowCopy =>
         },
       };
 
+/**
+ * task 模式的「立即发送」文案。task 只有「打断重发」一条路（task-talk-queue-send-now 顶部说明了为什么没有 steer）：
+ * - `runActive`（agent 正在跑）：服务端会先中断这一轮再发这条，要先确认、如实说明后果——
+ *   task 比 chat 多一层 action 容器，打断的是当前 action 的运行，agent 正在改代码 / 写产物时可能留下半成品
+ *   （与「停止当前 action？」确认框同一口径、同一句话，见 lib/stop-copy 的 stopConfirmDescription）；
+ *   中断后用这条消息继续本步（注入端走唤醒续跑）；
+ * - 没在跑：这条本来就会在 1 秒内被送出，「立即发送」只是不等那一拍，没有副作用、不用确认。
+ * 其余排队消息两种情形下都会保留、之后依次发送（服务端在 stop 之前把它们救出来再放回）。
+ */
+export const taskSendNowCopy = (runActive: boolean): SendNowCopy =>
+  runActive
+    ? {
+        tooltip: "立即发送（会先中断 AI 正在进行的这一轮，再用这条继续）",
+        confirm: {
+          title: "立即发送这条？",
+          description:
+            "会先中断正在跑的 agent（如果它正在改代码、可能留下半成品），再用这条消息继续本步。其余排队消息会保留、之后依次发送。",
+          confirmLabel: "停止并发送",
+        },
+      }
+    : { tooltip: "立即发送", confirm: null };
+
 // ───────────── 行内编辑的快捷键 ─────────────
 
 /** 键盘事件的最小形状（React 合成事件 / 原生事件 / 测试最小对象都能直接传；IME 口径同 lib/ime） */
@@ -138,6 +160,16 @@ export interface QueueEditKeyAction {
   /** 拦住冒泡：Esc 只退出编辑，不能再冒到弹层的 Esc 关闭（先退出编辑、再按一次才关弹层，V14-05） */
   stopPropagation: boolean;
 }
+
+/**
+ * 行内编辑保存前的校验：返回要提交的文本；null = 不提交（静默忽略）。
+ * 纯文字条清空了不提交（空消息发不出去，chat 口径一直是静默忽略）；
+ * 带图片 / 文件的条允许清空文字（只剩附件也能发，服务端同口径放行）。
+ */
+export const queueEditDraftToSave = (draft: string, allowEmpty: boolean): string | null => {
+  const text = draft.trim();
+  return text || allowEmpty ? text : null;
+};
 
 export const queueEditKeyAction = (e: QueueEditKeyInput): QueueEditKeyAction | null => {
   // 输入法组合输入中的 Enter / Esc（选词 / 取消候选）归输入法，不归编辑框

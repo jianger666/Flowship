@@ -275,7 +275,11 @@ describe("真实 ledger + chat-view 同款订阅逻辑：自动弹开 tick 只�
 });
 
 describe("接线契约（补充；行为已由上面的纯函数测试锁住）", () => {
-  const banner = source("src/components/tasks/chat-queue-banner.tsx");
+  // 面板本体已收进 chat / task 共用的 queue-banner；chat 外壳只接数据来源与动作。
+  // 下面的断言各自读它真正所在的文件（期望本身没变）
+  const panel = source("src/components/tasks/queue-banner.tsx");
+  const chatShell = source("src/components/tasks/chat-queue-banner.tsx");
+  const banner = `${panel}\n${chatShell}`;
   const chatView = source("src/components/tasks/chat-view.tsx");
 
   it("chat-view 常驻挂载排队条，不再用「条数 > 0」条件挂载（那会让自动弹开死码）", () => {
@@ -289,13 +293,14 @@ describe("接线契约（补充；行为已由上面的纯函数测试锁住）"
   });
 
   it("排队条 0 条返回 null 在所有 hook 之后（常驻挂载下 hook 顺序不能变）", () => {
-    const firstReturnNull = banner.indexOf("return null");
+    const firstReturnNull = panel.indexOf("return null");
     expect(firstReturnNull).toBeGreaterThan(-1);
     // 最后一个 hook 调用必须在它之前
     const lastHook = Math.max(
-      banner.lastIndexOf("useState("),
-      banner.lastIndexOf("useRef("),
-      banner.lastIndexOf("useEffect("),
+      panel.lastIndexOf("useState("),
+      panel.lastIndexOf("useRef("),
+      panel.lastIndexOf("useEffect("),
+      panel.lastIndexOf("useDialog("),
     );
     expect(lastHook).toBeLessThan(firstReturnNull);
   });
