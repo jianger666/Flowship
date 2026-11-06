@@ -767,7 +767,7 @@ describe("routeGroupInboundMessage", () => {
       source: "feishu_group",
       groupChatId: CHAT,
       groupSender: "张三",
-      // 提问人稳定 id（sender_name 经常拿不到）；属主通道没有 runTag，进不了群问答 tab
+      // 提问人稳定 id（sender_name 经常拿不到）；属主通道没有 runTag，进不了群问答卡
       groupSenderOpenId: OWNER,
     });
     expect(opts.userReplyMetaExtra.restrictedRunTag).toBeUndefined();
@@ -1679,7 +1679,7 @@ describe("非属主群消息只答疑", () => {
     // 受限通道恒走一次性 agent——没凭据它只会 400，群里等于没人应答
     expect(body.bootArgs?.apiKey).toBe("sk-test");
     expect(opts.userReplyMetaExtra?.source).toBe("feishu_group");
-    // 群问答 tab 配对键：问题事件带本轮 runTag + 提问人稳定 id
+    // 群问答卡配对键：问题事件带本轮 runTag + 提问人稳定 id
     const meta = opts.userReplyMetaExtra as Record<string, unknown>;
     expect(typeof meta.restrictedRunTag).toBe("string");
     expect(meta.groupSenderOpenId).toBe(OTHER);
@@ -2869,7 +2869,7 @@ describe("review 四轮：清扫/补泵循环/回放抛错", () => {
 });
 
 describe("review 五轮：回放抛错回执", () => {
-  it("回放注入抛错 → 回一句没接住 + 队空（不卡队，汇总进 tab 由 builder 单测覆盖）", async () => {
+  it("回放注入抛错 → 回一句没接住 + 队空（不卡队，汇总由 builder 单测覆盖）", async () => {
     const handleTaskQuestionInject = vi.fn(
       async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );

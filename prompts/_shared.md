@@ -105,7 +105,7 @@ artifact 末尾有 `## 修改记录` 顶层段（初稿不写、有修正才写�
 - **改动文件**：<改了哪些文件、用完整相对路径 + 行号、对应 §3 规则>
   - build action 这里写代码改动文件（如 `apps/.../selList.vue:271-279`）
   - review action 这里写「影响位置」（如 `3-review.md` 的「实现偏差 1」、`1-plan.md §2.2` 这种 artifact 内 / 外的修改位置）
-  - ship action 这里写「修改字段」（如 commit message / PR body / 飞书评论）
+  - ship action 这里写「修改字段」（如 commit message / PR body / 飞书评论）；只改了本地代码、没重新推送的，写「仅本地改动、未推送」（用户没要求时不要为了「同步」去重新 push / 提 MR / 评论）
 - **概要**：1-2 句说明改了什么、为什么改
 
 ### 修改 2：...

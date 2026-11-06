@@ -1,14 +1,15 @@
 /**
- * card-stream：flush 合并 + 失败熔断（R14 P1-1 / A1 · Q12a-01..04）
+ * card-stream：flush 合并 + 失败后的拉长重试间隔（原 R14 P1-1 计数熔断已删，改为失败间隔重试）
  *
- * 线上形态：飞书限流 / 断网 / 黑洞时，节流器照 250ms 一次地发整卡 PUT（argv 可达数十 KB），
+ * 线上形态（改前）：飞书限流 / 断网 / 黑洞时，节流器照 250ms 一次地发整卡 PUT（argv 可达数十 KB），
  * 失败既不回滚「已推」快照也不退避，needHeader 路径还把 headerDirty 粘住——一轮长回复下来
  * 几千个 lark-cli 子进程；它们又全排在进程级单飞队列里，别的任务的飞书写操作一起陪等。
- * finalize 失败更是没有任何对外信号（只 console.warn），用户只会收到一条「✅ 已完成」。
+ * 现在的做法：失败时回滚快照，并让下一次尝试的间隔按连续失败次数拉长（500ms → 1s → 2s → 4s → 5s 封顶），
+ * 不再有「暂停推流 / 半开探测 / 次数上限」。文件名沿用 breaker 只是为了不挪测试历史。
  *
  * 这里用假时间 + 假 lark-api 钉住：
- *   合并（不丢最后一次内容）/ 熔断（阈值、半开探测、退避翻倍封顶、恢复清零）/
- *   失败回滚后补发完整全量 / finalize 与 append 在熔断中仍强试一次 /
+ *   合并（不丢最后一次内容）/ 失败间隔（拉长、封顶、恢复清零、不被 push 绕过）/
+ *   失败回滚后补发完整全量 / 连续失败 ≥3 次时终稿与 append 仍强试一次 /
  *   对外健康度 / 超时参数 / 5 分钟永久失败的请求总量。
  */
 import { promises as fs } from "node:fs";
@@ -121,13 +122,16 @@ const warmUp = async (stream: CardStreamHandle): Promise<void> => {
   patchCardSettings.mockClear();
 };
 
-/** 让正文 content PUT 连续失败 3 次 → 熔断打开（窗口 2s） */
-const tripBreaker = async (stream: CardStreamHandle): Promise<void> => {
+/**
+ * 让正文 content PUT 连续失败 3 次（飞书「已知不通」）：首发失败 → 500ms 后第 2 发失败 → 1s 后第 3 发失败，
+ * 此时下一次重试定时器（2s）已排好。
+ */
+const failThrice = async (stream: CardStreamHandle): Promise<void> => {
   updateCardElementContent.mockRejectedValue(rateLimited());
-  for (let i = 0; i < 3; i++) {
-    grow(stream);
-    await settle();
-  }
+  grow(stream);
+  await settle();
+  await vi.advanceTimersByTimeAsync(500);
+  await vi.advanceTimersByTimeAsync(1000);
 };
 
 beforeEach(async () => {
@@ -193,8 +197,8 @@ describe("初始健康度", () => {
     expect(stream.getHealth()).toEqual({
       failCount: 0,
       consecutiveFails: 0,
-      breakerOpen: false,
-      breakerEverOpened: false,
+      fatalActive: false,
+      fatalEver: false,
       finalizeOk: undefined,
       lastError: undefined,
     });
@@ -204,7 +208,7 @@ describe("初始健康度", () => {
     expect(stream.getHealth()).toMatchObject({
       failCount: 1,
       consecutiveFails: 1,
-      breakerOpen: false,
+      fatalActive: false,
     });
     expect(stream.getHealth().lastError).toBeInstanceOf(Error);
   });
@@ -247,250 +251,156 @@ describe("flush 合并", () => {
   });
 });
 
-describe("熔断：阈值 / 退避 / 恢复", () => {
-  it("连续 3 次失败 → 熔断打开；之后无论 push 多少次都不再发请求", async () => {
-    const stream = await startStream();
+describe("失败间隔重试：拉长 / 封顶 / 恢复清零", () => {
+  it("失败后间隔 500ms → 1s → 2s → 4s → 5s 封顶；间隔内零请求（push 也绕不过）、到期恰好一发；全程不进致命态", async () => {
+    const onFatal = vi.fn();
+    const stream = await startStream({ onFatal });
     await warmUp(stream);
-    await tripBreaker(stream);
-    expect(updateCardElementContent).toHaveBeenCalledTimes(3);
-    expect(stream.getHealth()).toMatchObject({
-      breakerOpen: true,
-      consecutiveFails: 3,
-      breakerEverOpened: true,
-    });
+    updateCardElementContent.mockRejectedValue(rateLimited());
+    grow(stream); // 首发立刻出（字数阈值），失败
+    await settle();
+    let calls = 1;
+    expect(updateCardElementContent).toHaveBeenCalledTimes(calls);
 
-    for (let i = 0; i < 50; i++) {
-      grow(stream);
-      await settle();
+    for (const gapMs of [500, 1000, 2000, 4000, 5000, 5000, 5000]) {
+      grow(stream); // 间隔内持续有新内容（每次都越过字数阈值）
+      await vi.advanceTimersByTimeAsync(gapMs - 1);
+      expect(updateCardElementContent).toHaveBeenCalledTimes(calls); // 间隔内零请求
+      await vi.advanceTimersByTimeAsync(1); // 到期 → 恰好一发
+      calls += 1;
+      expect(updateCardElementContent).toHaveBeenCalledTimes(calls);
     }
-    expect(updateCardElementContent).toHaveBeenCalledTimes(3);
+    expect(stream.getHealth()).toMatchObject({ fatalActive: false, fatalEver: false });
+    expect(onFatal).not.toHaveBeenCalled(); // 普通失败不通知、不暂停
   });
 
-  it("中间只要有一次成功就清零连续计数：2 败 + 1 成 + 2 败 → 不开熔断", async () => {
+  it("失败期间无论 push 多少次：不发请求、同一时刻只有一个重试定时器", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    await failThrice(stream);
+    expect(updateCardElementContent).toHaveBeenCalledTimes(3);
+    expect(stream.getHealth()).toMatchObject({ consecutiveFails: 3, fatalActive: false });
+    expect(pendingTimers()).toBe(1);
+
+    for (let i = 0; i < 200; i++) grow(stream);
+    await settle();
+    expect(updateCardElementContent).toHaveBeenCalledTimes(3);
+    expect(pendingTimers()).toBe(1);
+  });
+
+  it("重试成功 → 连续计数清零、不再自驱，之后恢复正常 250ms / 字数节流", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    await failThrice(stream);
+    updateCardElementContent.mockResolvedValue(undefined); // lark 恢复
+    await vi.advanceTimersByTimeAsync(2000); // 第 4 发（重试）成功
+    expect(updateCardElementContent).toHaveBeenCalledTimes(4);
+    expect(stream.getHealth()).toMatchObject({ fatalActive: false, consecutiveFails: 0 });
+    expect(pendingTimers()).toBe(0); // 成功后不再有自驱定时器
+
+    grow(stream); // 字数够了：立刻发，不再等间隔
+    await settle();
+    expect(updateCardElementContent).toHaveBeenCalledTimes(5);
+  });
+
+  it("恢复后再失败：间隔重新从 500ms 起，不是接着上次拉长的 4s", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    await failThrice(stream);
+    await vi.advanceTimersByTimeAsync(2000); // 第 4 发仍失败 → 下次 4s
+    updateCardElementContent.mockResolvedValue(undefined);
+    await vi.advanceTimersByTimeAsync(4000); // 第 5 发成功 → 清零
+    expect(stream.getHealth().consecutiveFails).toBe(0);
+
+    updateCardElementContent.mockRejectedValue(rateLimited());
+    grow(stream); // 新一轮首发失败
+    await settle();
+    const calls = updateCardElementContent.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(499);
+    expect(updateCardElementContent).toHaveBeenCalledTimes(calls);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(updateCardElementContent).toHaveBeenCalledTimes(calls + 1);
+  });
+
+  it("中间只要有一次成功就清零连续计数：2 败 + 1 成 + 1 败 → 连续失败是 1，不是 3", async () => {
     const stream = await startStream();
     await warmUp(stream);
     updateCardElementContent
       .mockRejectedValueOnce(rateLimited())
       .mockRejectedValueOnce(rateLimited())
       .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(rateLimited())
       .mockRejectedValueOnce(rateLimited());
-    for (let i = 0; i < 5; i++) {
-      grow(stream);
-      await settle();
-    }
-    expect(updateCardElementContent).toHaveBeenCalledTimes(5);
-    expect(stream.getHealth()).toMatchObject({
-      breakerOpen: false,
-      consecutiveFails: 2,
-      breakerEverOpened: false,
-    });
-    expect(stream.getFailCount()).toBe(4);
-  });
-
-  it("到期半开探测失败 → 立刻再跳闸、退避翻倍 2s→4s→8s→16s→30s 封顶；窗口内零请求、到期恰好一发探测", async () => {
-    const stream = await startStream();
-    await warmUp(stream);
-    await tripBreaker(stream);
-    let calls = 3;
-    expect(updateCardElementContent).toHaveBeenCalledTimes(calls);
-
-    for (const windowMs of [2000, 4000, 8000, 16000, 30000, 30000]) {
-      grow(stream); // 窗口内持续有新内容
-      await vi.advanceTimersByTimeAsync(windowMs - 1);
-      expect(updateCardElementContent).toHaveBeenCalledTimes(calls); // 窗口内零请求
-      await vi.advanceTimersByTimeAsync(1); // 到期 → 半开探测
-      calls += 1;
-      expect(updateCardElementContent).toHaveBeenCalledTimes(calls); // 恰好一发
-      expect(stream.getHealth().breakerOpen).toBe(true); // 探测失败 → 立刻再跳闸
-    }
-  });
-
-  it("探测成功 → 恢复：熔断解除、连续计数清零，之后恢复正常 250ms / 字数节流", async () => {
-    const stream = await startStream();
-    await warmUp(stream);
-    await tripBreaker(stream);
-    updateCardElementContent.mockResolvedValue(undefined); // lark 恢复
-    await vi.advanceTimersByTimeAsync(2000); // 探测
-    expect(stream.getHealth()).toMatchObject({
-      breakerOpen: false,
-      consecutiveFails: 0,
-    });
-    const before = updateCardElementContent.mock.calls.length;
-    grow(stream);
+    grow(stream); // 败 #1
     await settle();
-    expect(updateCardElementContent).toHaveBeenCalledTimes(before + 1);
-  });
-
-  it("探测成功后退避清零：再次跳闸又从 2s 起，不是接着上次的 16s", async () => {
-    const stream = await startStream();
-    await warmUp(stream);
-    await tripBreaker(stream);
-    // 探测失败两次：窗口涨到 8s
-    await vi.advanceTimersByTimeAsync(2000);
-    await vi.advanceTimersByTimeAsync(4000);
-    expect(stream.getHealth().breakerOpen).toBe(true);
-    // 恢复成功
-    updateCardElementContent.mockResolvedValue(undefined);
-    await vi.advanceTimersByTimeAsync(8000);
-    expect(stream.getHealth().breakerOpen).toBe(false);
-
-    // 再次连续失败 3 次 → 新窗口应是 2s
-    updateCardElementContent.mockRejectedValue(rateLimited());
-    for (let i = 0; i < 3; i++) {
-      grow(stream);
-      await settle();
-    }
-    const calls = updateCardElementContent.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(updateCardElementContent).toHaveBeenCalledTimes(calls);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(updateCardElementContent).toHaveBeenCalledTimes(calls + 1);
-  });
-
-  it("熔断期间同一时刻只有一个探测定时器，不随 push 次数增长", async () => {
-    const stream = await startStream();
-    await warmUp(stream);
-    await tripBreaker(stream);
-    expect(pendingTimers()).toBe(1);
-    for (let i = 0; i < 200; i++) grow(stream);
+    await vi.advanceTimersByTimeAsync(500); // 败 #2
+    expect(stream.getHealth().consecutiveFails).toBe(2);
+    await vi.advanceTimersByTimeAsync(1000); // 成
+    expect(stream.getHealth().consecutiveFails).toBe(0);
+    grow(stream); // 败 #3（新一轮）
     await settle();
-    expect(pendingTimers()).toBe(1);
-  });
-
-  it("跳闸后即使再没有新 push 也会自己探测；探测补发的是完整全量（失败那发不会因快照已推进而被吞）", async () => {
-    const stream = await startStream();
-    await warmUp(stream);
-    await tripBreaker(stream);
-    expect(updateCardElementContent).toHaveBeenCalledTimes(3);
-
-    updateCardElementContent.mockResolvedValue(undefined); // lark 恢复，之后再没有任何 push
-    await vi.advanceTimersByTimeAsync(2000);
     expect(updateCardElementContent).toHaveBeenCalledTimes(4);
-    expect(updateCardElementContent.mock.calls.at(-1)![2]).toBe(answer);
-    expect(stream.getHealth()).toMatchObject({
-      breakerOpen: false,
-      consecutiveFails: 0,
-    });
+    expect(stream.getHealth()).toMatchObject({ consecutiveFails: 1, fatalActive: false });
+    expect(stream.getFailCount()).toBe(3);
   });
 
-  it("header 整卡 PUT 失败 → headerDirty 粘住：恢复后补发整卡 PUT，且带最新 header", async () => {
+  it("没有新 push 也会自己重试；补发的是完整全量（失败那发不会因快照已推进而被吞）", async () => {
+    const stream = await startStream();
+    await warmUp(stream);
+    updateCardElementContent.mockRejectedValueOnce(rateLimited());
+    grow(stream);
+    await settle(); // 失败，之后再没有任何 push
+    expect(updateCardElementContent).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(updateCardElementContent).toHaveBeenCalledTimes(2);
+    expect(updateCardElementContent.mock.calls.at(-1)![2]).toBe(answer);
+    expect(stream.getHealth()).toMatchObject({ fatalActive: false, consecutiveFails: 0 });
+  });
+
+  it("header 整卡 PUT 失败 → headerDirty 粘住：间隔内的 header 变更不绕过间隔，恢复后补发整卡 PUT 且带最新 header", async () => {
     const stream = await startStream();
     await warmUp(stream);
     updateCardEntity.mockRejectedValue(rateLimited());
-    for (let i = 0; i < 3; i++) {
-      stream.setHeaderStatus(`步骤${i}`, "blue");
-      await vi.advanceTimersByTimeAsync(250); // setHeaderStatus 走 250ms 节流
-    }
-    expect(updateCardEntity).toHaveBeenCalledTimes(3);
-    expect(stream.getHealth().breakerOpen).toBe(true);
+    stream.setHeaderStatus("步骤0", "blue");
+    await vi.advanceTimersByTimeAsync(250); // setHeaderStatus 走 250ms 节流
+    expect(updateCardEntity).toHaveBeenCalledTimes(1);
+    expect(stream.getHealth().consecutiveFails).toBe(1);
+
+    stream.setHeaderStatus("步骤1", "blue");
+    stream.setHeaderStatus("步骤2", "blue");
+    await vi.advanceTimersByTimeAsync(499);
+    expect(updateCardEntity).toHaveBeenCalledTimes(1); // 失败间隔 500ms 内不重发
 
     updateCardEntity.mockResolvedValue(undefined);
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(updateCardEntity).toHaveBeenCalledTimes(4);
-    expect(JSON.stringify(updateCardEntity.mock.calls.at(-1)![1])).toContain(
-      "步骤2",
-    );
-    expect(stream.getHealth().breakerOpen).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(updateCardEntity).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(updateCardEntity.mock.calls.at(-1)![1])).toContain("步骤2");
+    expect(stream.getHealth()).toMatchObject({ fatalActive: false, consecutiveFails: 0 });
   });
 
-  it("onBreakerOpen：小抖动（3 连败跳闸、首次探测就恢复）不通知", async () => {
-    const onBreakerOpen = vi.fn();
-    const stream = await startStream({ onBreakerOpen });
-    await warmUp(stream);
-    await tripBreaker(stream); // 第 1 次跳闸
-    expect(stream.getHealth().breakerOpen).toBe(true);
-    expect(onBreakerOpen).not.toHaveBeenCalled();
-
-    updateCardElementContent.mockResolvedValue(undefined); // 2s 后的首次探测成功
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(stream.getHealth()).toMatchObject({
-      breakerOpen: false,
-      consecutiveFails: 0,
-      breakerEverOpened: true, // 开过熔断，只是没打扰用户
-    });
-    expect(onBreakerOpen).not.toHaveBeenCalled();
-  });
-
-  it("onBreakerOpen：首次探测仍失败才通知一次（每张卡最多一次：之后继续失败 / 恢复后再跳闸都不重复）", async () => {
-    const onBreakerOpen = vi.fn();
-    const stream = await startStream({ onBreakerOpen });
-    await warmUp(stream);
-    await tripBreaker(stream);
-    expect(onBreakerOpen).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(2000); // 首次探测仍失败 → 第 2 次跳闸
-    expect(onBreakerOpen).toHaveBeenCalledTimes(1);
-    expect(onBreakerOpen).toHaveBeenCalledWith({
-      consecutiveFails: 4,
-      retryInMs: 4000,
-      error: expect.any(LarkApiError),
-    });
-
-    await vi.advanceTimersByTimeAsync(4000); // 第 2 次探测仍失败 → 第 3 次跳闸：不重复
-    expect(onBreakerOpen).toHaveBeenCalledTimes(1);
-
-    updateCardElementContent.mockResolvedValue(undefined);
-    await vi.advanceTimersByTimeAsync(8000); // 恢复
-    expect(stream.getHealth().breakerOpen).toBe(false);
-    await tripBreaker(stream); // 恢复后再次 3 连败跳闸
-    await vi.advanceTimersByTimeAsync(2000); // 首次探测又失败：满足通知条件，但这张卡已通知过
-    expect(stream.getHealth().breakerOpen).toBe(true);
-    expect(onBreakerOpen).toHaveBeenCalledTimes(1);
-  });
-
-  it("onBreakerOpen 回调自己抛错：不破坏状态机——探测定时器照常排上、之后仍能恢复", async () => {
-    const onBreakerOpen = vi.fn(() => {
-      throw new Error("cb boom");
-    });
-    const stream = await startStream({ onBreakerOpen });
-    await warmUp(stream);
-    await tripBreaker(stream);
-    await vi.advanceTimersByTimeAsync(2000); // 首次探测仍失败 → 第 2 次跳闸 → 回调抛错
-    expect(onBreakerOpen).toHaveBeenCalledTimes(1);
-    expect(stream.getHealth().breakerOpen).toBe(true);
-    expect(pendingTimers()).toBe(1); // 回调抛错没打断 recordFailure：下一次探测照常排上了
-
-    updateCardElementContent.mockResolvedValue(undefined);
-    await vi.advanceTimersByTimeAsync(4000);
-    expect(stream.getHealth().breakerOpen).toBe(false);
-  });
-
-  it("header 整卡 PUT 的成功也算恢复：连败 2 次后成功一次 → 连续失败清零，再败 2 次不跳闸", async () => {
+  it("header 整卡 PUT 的成功也算恢复：连败 2 次后成功一次 → 连续失败清零，再败一次只记 1", async () => {
     const stream = await startStream();
     await warmUp(stream);
     updateCardEntity.mockRejectedValue(rateLimited());
-    for (let i = 0; i < 2; i++) {
-      stream.setHeaderStatus(`步骤${i}`, "blue");
-      await vi.advanceTimersByTimeAsync(250); // setHeaderStatus 走 250ms 节流
-    }
+    stream.setHeaderStatus("步骤0", "blue");
+    await vi.advanceTimersByTimeAsync(250); // 败 #1
+    await vi.advanceTimersByTimeAsync(500); // 败 #2（重试）
     expect(stream.getHealth().consecutiveFails).toBe(2);
 
     updateCardEntity.mockResolvedValue(undefined);
-    stream.setHeaderStatus("步骤2", "blue");
-    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(1000); // 重试成功
     expect(stream.getHealth().consecutiveFails).toBe(0); // header 路径的成功也清零
 
     updateCardEntity.mockRejectedValue(rateLimited());
-    for (let i = 3; i < 5; i++) {
-      stream.setHeaderStatus(`步骤${i}`, "blue");
-      await vi.advanceTimersByTimeAsync(250);
-    }
-    expect(stream.getHealth()).toMatchObject({
-      consecutiveFails: 2,
-      breakerOpen: false,
-    });
+    stream.setHeaderStatus("步骤1", "blue");
+    await vi.advanceTimersByTimeAsync(250);
+    expect(stream.getHealth()).toMatchObject({ consecutiveFails: 1, fatalActive: false });
   });
 
-  it("跳闸时若还挂着一个待决的节流定时器：探测定时器取代它，不并存", async () => {
+  it("失败时若还挂着一个待决的节流定时器：重试定时器取代它，不并存", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    updateCardElementContent.mockRejectedValue(rateLimited());
-    for (let i = 0; i < 2; i++) {
-      grow(stream);
-      await settle();
-    }
-    // 第 3 次 flush 挂在途中；这期间来了一个小增量（< 600 字）→ 排上 250ms 节流定时器
+    // 一发 flush 挂在途中；这期间来了一个小增量（< 600 字）→ 排上 250ms 节流定时器
     const g = gate();
     updateCardElementContent.mockImplementationOnce(async () => {
       await g.p;
@@ -502,18 +412,39 @@ describe("熔断：阈值 / 退避 / 恢复", () => {
     stream.pushAnswer(answer);
     expect(pendingTimers()).toBe(1);
 
-    g.release(); // 第 3 次失败 → 跳闸 → 排探测
+    g.release(); // 在途那发失败 → 排重试
     await settle();
-    expect(stream.getHealth().breakerOpen).toBe(true);
-    expect(pendingTimers()).toBe(1); // 只剩探测定时器：节流定时器被清掉了
+    expect(stream.getHealth().consecutiveFails).toBe(1);
+    expect(pendingTimers()).toBe(1); // 只剩重试定时器：节流定时器被清掉了
+  });
+
+  it("致命故障才通知：onFatal 回调自己抛错也不破坏状态机，之后任一次成功写仍能恢复", async () => {
+    const onFatal = vi.fn(() => {
+      throw new Error("cb boom");
+    });
+    const stream = await startStream({ onFatal });
+    await warmUp(stream);
+    updateCardElementContent.mockRejectedValueOnce(
+      new LarkApiError("The card entity does not exist", { code: 200740 }),
+    );
+    grow(stream);
+    await settle();
+    expect(onFatal).toHaveBeenCalledTimes(1);
+    expect(onFatal).toHaveBeenCalledWith({
+      consecutiveFails: 0,
+      error: expect.any(LarkApiError),
+      fatalKind: "gone",
+    });
+    expect(stream.getHealth()).toMatchObject({ fatalActive: true, fatalKind: "gone" });
+    expect(pendingTimers()).toBe(0); // 致命：不排任何重试定时器
   });
 });
 
-describe("finalize / append 在熔断中仍强试一次", () => {
-  it("熔断中 finalize：不先刷余量，但整卡 PUT 照发；成功则 finalizeOk=true 且熔断解除", async () => {
+describe("连续失败 ≥3 次（飞书已知不通）时 finalize / append 仍强试一次", () => {
+  it("已知不通时 finalize：不先刷余量，但整卡 PUT 照发；成功则 finalizeOk=true 且连续失败清零", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream);
+    await failThrice(stream);
     updateCardElementContent.mockClear();
     updateCardEntity.mockClear();
     patchCardSettings.mockClear();
@@ -521,7 +452,7 @@ describe("finalize / append 在熔断中仍强试一次", () => {
 
     await stream.finalize({ ok: true, durationMs: 1000 });
 
-    expect(updateCardElementContent).not.toHaveBeenCalled(); // 熔断中 doFlush 直接放过
+    expect(updateCardElementContent).not.toHaveBeenCalled(); // 已知不通：finalize 不先刷余量（整卡 PUT 本来就带全量）
     expect(updateCardEntity).toHaveBeenCalledTimes(1); // 整卡 PUT 带终稿
     expect(JSON.stringify(updateCardEntity.mock.calls[0]![1])).toContain(
       answer.slice(0, 20),
@@ -529,7 +460,7 @@ describe("finalize / append 在熔断中仍强试一次", () => {
     expect(patchCardSettings).toHaveBeenCalledTimes(1);
     expect(stream.getHealth()).toMatchObject({
       finalizeOk: true,
-      breakerOpen: false,
+      fatalActive: false,
       consecutiveFails: 0,
     });
   });
@@ -556,11 +487,11 @@ describe("finalize / append 在熔断中仍强试一次", () => {
     expect(patchCardSettings).toHaveBeenCalledTimes(1);
   });
 
-  it("熔断已开时终稿遇 lark-cli 超时不再重试：只强试这一发（已知飞书不通，不再空等 2×(退避+15s)）", async () => {
+  it("已知不通时终稿遇 lark-cli 超时不再重试：只强试这一发（不再空等 2×(退避+15s)）", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream);
-    expect(stream.getHealth().breakerOpen).toBe(true);
+    await failThrice(stream);
+    expect(stream.getHealth().consecutiveFails).toBe(3);
     updateCardEntity.mockClear();
     patchCardSettings.mockClear();
     const timeout = new LarkApiError("lark-cli 超时（15000ms）", { api: "api PUT /cards/c" });
@@ -572,13 +503,13 @@ describe("finalize / append 在熔断中仍强试一次", () => {
 
     expect(updateCardEntity).toHaveBeenCalledTimes(1); // 旧：3
     expect(stream.getHealth()).toMatchObject({ finalizeOk: false, lastError: timeout });
-    expect(patchCardSettings).not.toHaveBeenCalled(); // 熔断开着：关流式也不再多押一发
+    expect(patchCardSettings).not.toHaveBeenCalled(); // 已知不通：关流式也不再多押一发
   });
 
-  it("熔断没开时 lark-cli 超时照常重试（对照：只有「已知不通」才免重试）", async () => {
+  it("没连续失败时 lark-cli 超时照常重试（对照：只有「已知不通」才免重试）", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    expect(stream.getHealth().breakerOpen).toBe(false);
+    expect(stream.getHealth().consecutiveFails).toBe(0);
     updateCardEntity.mockRejectedValue(new LarkApiError("lark-cli 超时（15000ms）", { api: "api PUT /cards/c" }));
 
     const fin = stream.finalize({ ok: true });
@@ -588,10 +519,10 @@ describe("finalize / append 在熔断中仍强试一次", () => {
     expect(updateCardEntity).toHaveBeenCalledTimes(3);
   });
 
-  it("熔断已开时终稿遇限流（服务端明确在回话）仍然重试", async () => {
+  it("已知不通时终稿遇限流（服务端明确在回话）仍然重试", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream);
+    await failThrice(stream);
     updateCardEntity.mockClear();
     updateCardEntity.mockRejectedValue(rateLimited());
 
@@ -630,25 +561,25 @@ describe("finalize / append 在熔断中仍强试一次", () => {
     expect(sendCardMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("熔断中 appendRetryButton 仍发 batch（强试一次），成功即恢复", async () => {
+  it("已知不通时 appendRetryButton 仍发 batch（强试一次），成功即恢复", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream);
+    await failThrice(stream);
     batchUpdateCard.mockClear();
 
     await stream.appendRetryButton("重试这句");
 
     expect(batchUpdateCard).toHaveBeenCalledTimes(1);
     expect(stream.getHealth()).toMatchObject({
-      breakerOpen: false,
+      fatalActive: false,
       consecutiveFails: 0,
     });
   });
 
-  it("熔断中 appendAskUser 仍发 batch + header 整卡 PUT（强试一次），成功即恢复", async () => {
+  it("已知不通时 appendAskUser 仍发 batch + header 整卡 PUT（强试一次），成功即恢复", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream);
+    await failThrice(stream);
     batchUpdateCard.mockClear();
     updateCardEntity.mockClear();
 
@@ -666,26 +597,26 @@ describe("finalize / append 在熔断中仍强试一次", () => {
     expect(batchUpdateCard).toHaveBeenCalledTimes(1);
     expect(updateCardEntity).toHaveBeenCalledTimes(1);
     expect(stream.getHealth()).toMatchObject({
-      breakerOpen: false,
+      fatalActive: false,
       consecutiveFails: 0,
     });
   });
 
-  it("finalize 之后不残留任何定时器（熔断期的探测定时器被清掉）", async () => {
+  it("finalize 之后不残留任何定时器（失败期的重试定时器被清掉）", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream);
+    await failThrice(stream);
     expect(pendingTimers()).toBe(1);
 
     await stream.finalize({ ok: true });
     expect(pendingTimers()).toBe(0);
 
-    // 失败的 finalize 也一样：它的 recordFailure 不能在 finalized 前再排一个探测
+    // 失败的 finalize 也一样：它的 recordFailure 不能在 finalized 前再排一个重试
     const stream2 = await startStream();
     await warmUp(stream2);
     updateCardEntity.mockRejectedValue(rateLimited());
     updateCardElementContent.mockRejectedValue(rateLimited());
-    await tripBreaker(stream2);
+    await failThrice(stream2);
     // 限流的终稿会退避重发（共 3 发），推进假时间让它跑完
     const fin2 = stream2.finalize({ ok: true });
     await vi.advanceTimersByTimeAsync(1_000 + 3_000);
@@ -731,7 +662,7 @@ describe("超时参数", () => {
 });
 
 describe("风暴验收", () => {
-  it("永久失败 + 5 分钟持续 push：请求总量被熔断压到个位数十（改前每 250ms 一发 ≈ 1200）", async () => {
+  it("永久失败 + 5 分钟持续 push：请求总量被失败间隔压到每分钟十来发（改前每 250ms 一发 ≈ 1200；原熔断 ≤25，现在更多——这是去掉熔断的代价）", async () => {
     const stream = await startStream();
     await warmUp(stream);
     updateCardElementContent.mockRejectedValue(rateLimited());
@@ -748,8 +679,10 @@ describe("风暴验收", () => {
       updateCardElementContent.mock.calls.length +
       updateCardEntity.mock.calls.length +
       batchUpdateCard.mock.calls.length;
-    expect(total).toBeLessThanOrEqual(25);
-    expect(stream.getHealth().breakerOpen).toBe(true);
+    // 间隔 0.5 + 1 + 2 + 4 s 后稳定在 5s 一发：300s ≈ 4 + 58 ≈ 62 发。上限留余量、下限钉住「没有死掉 / 没有暂停」
+    expect(total).toBeLessThanOrEqual(80);
+    expect(total).toBeGreaterThanOrEqual(40);
+    expect(stream.getHealth()).toMatchObject({ fatalActive: false, fatalEver: false });
 
     // finalize 在持续失败下照样能收尾：失败如实标记、不抛、不挂
     // （限流的终稿会退避重发 2 次，推进假时间让它跑完；总量断言在 finalize 之前，不受影响）
@@ -760,7 +693,7 @@ describe("风暴验收", () => {
   });
 });
 
-describe("探测定时器的生命周期边界", () => {
+describe("重试定时器的生命周期边界", () => {
   const callCounts = (): number[] =>
     [updateCardElementContent, updateCardEntity, batchUpdateCard, patchCardSettings].map(
       (m) => m.mock.calls.length,
@@ -769,7 +702,7 @@ describe("探测定时器的生命周期边界", () => {
   it("finalize 之后再推进 10 分钟：请求数不再增加，也没有任何定时器", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream);
+    await failThrice(stream);
     await stream.finalize({ ok: true });
     const mark = callCounts();
 
@@ -778,17 +711,12 @@ describe("探测定时器的生命周期边界", () => {
     expect(pendingTimers()).toBe(0);
   });
 
-  it("finalize 排在一个正在失败的 flush 后面：失败跳闸时排的探测定时器，被 finalize 收尾清掉，不漏到 finalize 之后", async () => {
+  it("finalize 排在一个正在失败的 flush 后面：失败时排的重试定时器，被 finalize 收尾清掉，不漏到 finalize 之后", async () => {
     const stream = await startStream();
     await warmUp(stream);
     updateCardElementContent.mockRejectedValue(rateLimited());
-    for (let i = 0; i < 2; i++) {
-      grow(stream);
-      await settle();
-    }
-    expect(stream.getHealth().breakerOpen).toBe(false); // 已连败 2 次，再败一次就跳闸
 
-    // 第 3 次 flush 卡在途中；finalize 排在它后面；随后让它失败 → 跳闸（此刻 finalized 仍是 false，会排探测）
+    // 一发 flush 卡在途中；finalize 排在它后面；随后让它失败（此刻 finalize 还没开始、finalized 仍是 false，会排重试）
     const g = gate();
     updateCardElementContent.mockImplementationOnce(async () => {
       await g.p;
@@ -800,47 +728,29 @@ describe("探测定时器的生命周期边界", () => {
     g.release();
     await fin;
 
-    expect(stream.getHealth().breakerEverOpened).toBe(true);
+    expect(stream.getHealth().finalizeOk).toBe(true);
     expect(pendingTimers()).toBe(0);
     const mark = callCounts();
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(callCounts()).toEqual(mark);
   });
 
-  it("没有 finalize、没有新 push、lark 永久失败：自驱探测最多 10 次就停，之后零请求零定时器", async () => {
+  it("没有 finalize、没有新 push、lark 永久失败：一直按 ≤5s 间隔自驱重试，没有次数上限（去掉熔断的代价）；finalize 后停", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream); // 3 次失败
-    await vi.advanceTimersByTimeAsync(30 * 60_000);
-    expect(updateCardElementContent).toHaveBeenCalledTimes(3 + 10);
-    expect(pendingTimers()).toBe(0);
-
+    await failThrice(stream); // 3 次失败
     await vi.advanceTimersByTimeAsync(10 * 60_000);
-    expect(updateCardElementContent).toHaveBeenCalledTimes(3 + 10);
+    // 600s / 5s ≈ 120 发（原熔断版本 3 + 10 发后就停了）
+    const calls = updateCardElementContent.mock.calls.length;
+    expect(calls).toBeGreaterThan(100);
+    expect(calls).toBeLessThanOrEqual(130);
+    expect(pendingTimers()).toBe(1); // 仍在自驱
+
+    await stream.finalize({ ok: true });
     expect(pendingTimers()).toBe(0);
-  });
-
-  it("自驱停了之后又来了新 push：由 push 驱动重新探测（还活着的流不会永远没有恢复机会）", async () => {
-    const stream = await startStream();
-    await warmUp(stream);
-    await tripBreaker(stream);
-    await vi.advanceTimersByTimeAsync(30 * 60_000); // 自驱探测已封顶、熔断窗口早已过期
-    expect(updateCardElementContent).toHaveBeenCalledTimes(13);
-
-    grow(stream); // 半开：这一发本身就是探测（仍失败）
-    await settle();
-    expect(updateCardElementContent).toHaveBeenCalledTimes(14);
-    expect(pendingTimers()).toBe(0); // 自驱已封顶，失败后不再自己续约
-
-    grow(stream); // 熔断窗内的 push：不发请求，但重新排上探测
-    await settle();
-    expect(updateCardElementContent).toHaveBeenCalledTimes(14);
-    expect(pendingTimers()).toBe(1);
-
-    updateCardElementContent.mockResolvedValue(undefined); // lark 恢复
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(updateCardElementContent).toHaveBeenCalledTimes(15);
-    expect(stream.getHealth().breakerOpen).toBe(false);
+    const mark = callCounts();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(callCounts()).toEqual(mark);
   });
 });
 
@@ -859,16 +769,13 @@ describe("失败原因瘦身（lark-cli 的 execFile 错误 message 动辄几十
       },
     );
 
-  it("LarkApiError：lastError / onBreakerOpen 的 error / console.warn 都被截断，不保留 raw，结构化字段保留", async () => {
-    const onBreakerOpen = vi.fn();
-    const stream = await startStream({ onBreakerOpen });
+  it("LarkApiError：lastError / onFatal 的 error / console.warn 都被截断，不保留 raw，结构化字段保留", async () => {
+    const stream = await startStream();
     await warmUp(stream);
     updateCardElementContent.mockRejectedValue(hugeError());
-    for (let i = 0; i < 3; i++) {
-      grow(stream);
-      await settle();
-    }
-    await vi.advanceTimersByTimeAsync(2000); // 首次探测仍失败 → 第 2 次跳闸 → onBreakerOpen
+    grow(stream);
+    await settle();
+    await vi.advanceTimersByTimeAsync(500); // 再失败一次（重试）
 
     const err = stream.getHealth().lastError as InstanceType<typeof LarkApiError>;
     expect(err).toBeInstanceOf(LarkApiError);
@@ -883,7 +790,18 @@ describe("失败原因瘦身（lark-cli 的 execFile 错误 message 动辄几十
       fieldViolations: [{ field: "body.elements[3].content", description: "invalid" }],
     });
 
-    const cbErr = onBreakerOpen.mock.calls[0]![0].error as InstanceType<typeof LarkApiError>;
+    // onFatal 回调里的 error 同样瘦身（致命故障才回调：200740 = 卡片不存在）
+    const onFatal = vi.fn();
+    updateCardElementContent.mockResolvedValue(undefined); // 热身那一发要成功
+    const stream2 = await startStream({ onFatal });
+    await warmUp(stream2);
+    updateCardElementContent.mockRejectedValue(
+      new LarkApiError(hugeError().message, { code: 200740, raw: { stderr: "y".repeat(30_000) } }),
+    );
+    grow(stream2);
+    await settle();
+    expect(onFatal).toHaveBeenCalledTimes(1);
+    const cbErr = onFatal.mock.calls[0]![0].error as InstanceType<typeof LarkApiError>;
     expect(cbErr.message.length).toBeLessThanOrEqual(240);
     expect(cbErr.raw).toBeUndefined();
 
@@ -901,8 +819,7 @@ describe("失败原因瘦身（lark-cli 的 execFile 错误 message 动辄几十
     expect((stream.getHealth().lastError as Error).message.length).toBeLessThanOrEqual(240);
 
     updateCardElementContent.mockRejectedValueOnce("s".repeat(30_000));
-    grow(stream);
-    await settle();
+    await vi.advanceTimersByTimeAsync(500); // 失败间隔到期的重试
     expect(String(stream.getHealth().lastError).length).toBeLessThanOrEqual(240);
   });
 });
@@ -1092,49 +1009,47 @@ describe("appendAskUser / appendRetryButton 的超时参数与失败计入", () 
 });
 
 describe("失败回滚：思考区（process）和正文（answer）的「已推」快照各自回滚", () => {
-  it("只有思考区变化时 batch 连败 3 次跳闸，恢复后的探测必须把思考区补发（process 的快照也要回滚）", async () => {
+  it("只有思考区变化时 batch 连败 2 次，恢复后的重试必须把思考区补发（process 的快照也要回滚）", async () => {
     const stream = await startStream();
     await warmUp(stream);
     batchUpdateCard.mockRejectedValue(rateLimited());
-    let process = "";
-    for (let i = 0; i < 3; i++) {
-      process += "思".repeat(700);
-      stream.pushProcess(process);
-      await settle();
-    }
-    expect(batchUpdateCard).toHaveBeenCalledTimes(3);
-    expect(stream.getHealth().breakerOpen).toBe(true);
+    const process = "思".repeat(700);
+    stream.pushProcess(process);
+    await settle(); // 败 #1
+    await vi.advanceTimersByTimeAsync(500); // 败 #2（重试）
+    expect(batchUpdateCard).toHaveBeenCalledTimes(2);
+    expect(stream.getHealth().consecutiveFails).toBe(2);
 
-    // 恢复：到期探测。快照没回滚的话，「已推」已经等于「应推」，探测会判成没变化直接放过，思考区一直空到 finalize
+    // 恢复：到期重试。快照没回滚的话，「已推」已经等于「应推」，重试会判成没变化直接放过，思考区一直空到 finalize
     batchUpdateCard.mockResolvedValue(undefined);
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(batchUpdateCard).toHaveBeenCalledTimes(4);
-    const probe = batchUpdateCard.mock.calls.at(-1) as unknown as [string, unknown];
-    expect(JSON.stringify(probe[1])).toContain(process);
-    expect(stream.getHealth().breakerOpen).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(batchUpdateCard).toHaveBeenCalledTimes(3);
+    const retry = batchUpdateCard.mock.calls.at(-1) as unknown as [string, unknown];
+    expect(JSON.stringify(retry[1])).toContain(process);
+    expect(stream.getHealth().consecutiveFails).toBe(0);
   });
 
-  it("只有正文变化时 content PUT 连败 3 次跳闸，恢复后的探测必须把正文补发（answer 的快照也要回滚）", async () => {
+  it("只有正文变化时 content PUT 连败 3 次，恢复后的重试必须把正文补发（answer 的快照也要回滚）", async () => {
     const stream = await startStream();
     await warmUp(stream);
-    await tripBreaker(stream); // 3 次 grow 都失败
+    await failThrice(stream); // 3 次都失败
     expect(updateCardElementContent).toHaveBeenCalledTimes(3);
 
     updateCardElementContent.mockResolvedValue(undefined);
     await vi.advanceTimersByTimeAsync(2000);
     expect(updateCardElementContent).toHaveBeenCalledTimes(4);
-    const probe = updateCardElementContent.mock.calls.at(-1) as unknown as [
+    const retry = updateCardElementContent.mock.calls.at(-1) as unknown as [
       string,
       string,
       string,
     ];
-    expect(probe[2]).toBe(answer);
+    expect(retry[2]).toBe(answer);
   });
 });
 
-// 终稿预算 / 熔断窗口用单调时钟：墙钟（Date.now）整段跳变（休眠唤醒 / 校时）不能影响它们。
+// 终稿预算用单调时钟：墙钟（Date.now）整段跳变（休眠唤醒 / 校时）不能影响它们。
 // vi.setSystemTime 只改伪造的墙钟、不动 performance.now()——正好模拟「墙钟跳了、单调时钟没动」。
-describe("单调时钟：墙钟跳变不影响终稿预算 / 熔断窗口", () => {
+describe("单调时钟：墙钟跳变不影响终稿预算", () => {
   it("终稿整卡 PUT 第一发期间墙钟向前跳 1 小时：预算没耗尽，仍照常退避重试（旧 Date.now 逻辑下预算瞬间用尽 → 不重试 → finalizeOk=false）", async () => {
     const stream = await startStream();
     await warmUp(stream);
@@ -1151,19 +1066,6 @@ describe("单调时钟：墙钟跳变不影响终稿预算 / 熔断窗口", () =
 
     expect(updateCardEntity).toHaveBeenCalledTimes(2); // 第一发失败 + 一次重试
     expect(stream.getHealth()).toMatchObject({ finalizeOk: true });
-  });
-
-  it("熔断打开后墙钟向后跳 1 小时：窗口仍按真实流逝的 2s 到期、半开探测照常放行并恢复（旧逻辑下窗口被拉长一小时，探测被挡）", async () => {
-    const stream = await startStream();
-    await warmUp(stream);
-    await tripBreaker(stream);
-    expect(stream.getHealth().breakerOpen).toBe(true);
-    updateCardElementContent.mockResolvedValue(undefined); // lark 恢复
-    vi.setSystemTime(Date.now() - 3_600_000); // 墙钟回拨 1 小时
-
-    await vi.advanceTimersByTimeAsync(2000); // 真实流逝 2s = 熔断窗口
-
-    expect(stream.getHealth()).toMatchObject({ breakerOpen: false, consecutiveFails: 0 });
   });
 });
 

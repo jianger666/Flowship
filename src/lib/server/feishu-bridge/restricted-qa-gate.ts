@@ -11,11 +11,12 @@
  *    盘上老 meta 里残留的 `feishuGroupRestrictedQa` 字段读盘时直接丢弃（不再进 `Task`、不会再挡放行，也不需要迁移）。
  *    所以这个功能**只适合可信内部群**：Cursor 路径的 `read` 没有路径约束，prompt 里有事件日志绝对路径、能推出数据根，
  *    进而读到 `config.json` / `company-env.json`（见 docs/feishu-group-collab.md「诚实的局限」）。
- * 1. **机器人发件人**：sender 是 app / bot（`isGroupBotSender`）→ 拒绝。[生效，**除非设置放开**]
+ * 1. **机器人发件人**：sender 是 app / bot（`isGroupBotSender`）且调用方没传 `allowBots: true` → 拒绝。
  *    lark-cli compact 事件里有 `sender_type`（user / bot）这个真实数据源。
- *    ⚠ 2026-11-04 起设置项 `feishuGroupAllowBots`（默认开、与 lk-harness 的群内机器人协作一致）开着时，调用方传
- *    `allowBots: true`、这一条不再拒；关 / 读设置失败 → 仍是老口径（拒）。放开后机器人的消息**始终**按「只答疑」约束处理
- *    （不吃提示词开关、不自动 @ 对方、不客套，见 group-non-owner-prompt）。
+ *    ⚠ 2026-11-04 起生产路径（group-route）对机器人**恒传** `allowBots: true`（2026-11-05 起连设置项也没了：
+ *    机器人的 @ 一律受理、和真人一致），这一条在生产里不再拒；本条判定留着给纯函数 / 单测的覆盖缝。
+ *    受理后机器人的消息默认**始终**按「只答疑」约束处理（不吃提示词开关、不自动 @ 对方、不客套，见 group-non-owner-prompt；
+ *    设置「机器人与真人同权」打开后才跟真人一样看提示词开关）。
  *    机器人「送托办回执」走出问登记（feed 进属主会话）那条路，不经过本闸。
  * 2. **租户校验** [当前不生效]：判定逻辑是「senderTenantKey 与本租户都拿得到且不一致 → 拒绝」，任何一边拿不到就不拦。
  *    但本机 `lark-cli event schema im.message.receive_v1` 的 compact 输出里**没有 `tenant_key`**
@@ -24,7 +25,8 @@
  * 3. **外部成员** [当前不生效]：判定逻辑是调用方给出 `senderExternal === true` → 拒绝；
  *    compact 事件里没有 external 标记，目前没有任何调用方会传它，拿不到就不拦。
  *
- * 所以**真正生效的只有 1 机器人发件人拒绝**（再加受限 agent 的 read/grep(/glob) 只读工具白名单、事件流 / 回群的精确值脱敏）；
+ * 所以生产里这道闸**实际上不拦任何人**（1 对机器人恒放行、2、3 拿不到数据）；真正生效的防线是受限 agent 的
+ * read/grep(/glob) 只读工具白名单、事件流 / 回群的精确值脱敏、机器人消息恒按「只答疑」约束。
  * 2、3 不要当成已有的防线，也不要在文案 / 文档里写成「租户一致才放行 / 外部租户成员会被拒」。
  *
  * 本模块不碰 IO；调用方（group-route）负责「拒绝后静默 + 留一条 app 事件」。
@@ -44,7 +46,7 @@ export interface RestrictedQaAdmissionInput {
   /** 发件人是不是机器人（路由层 isGroupBotSender 判的） */
   senderIsBot: boolean;
   /**
-   * 设置项 `feishuGroupAllowBots`（默认开、2026-11-04 起）：为 true 时机器人发件人不再被 bot_sender 拒绝。
+   * 为 true 时机器人发件人不再被 bot_sender 拒绝（生产路径对机器人恒传 true，见文件头 1）。
    * **缺省 / false = 沿用老口径（拒）**——调用方不传就等于没放开，所以旧调用点与旧单测零影响。
    */
   allowBots?: boolean;
@@ -95,7 +97,7 @@ export const describeRestrictedQaDenial = (
   const who = requesterName.trim() || "群成员";
   switch (reason) {
     case "bot_sender":
-      return `群答疑已拒绝：${who} 是机器人，当前设置不受理机器人的 @（设置 → 连接 → 飞书集成 里可放开；已静默忽略）`;
+      return `群答疑已拒绝：${who} 是机器人（已静默忽略）`;
     case "tenant_mismatch":
       // 仅在事件带了发件人 tenant_key 时才可能走到；当前 lark-cli compact 事件没有该字段，生产里暂不会触发
       return `群答疑已拒绝：${who} 与本机器人不在同一租户（外部成员，已静默忽略）`;

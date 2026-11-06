@@ -1,14 +1,13 @@
 /**
- * 评审 R8-3：Virtuoso 被卸掉再重挂（群问答 tab 往返 / 列表清空后又有条目）必须重新落到最后一条
+ * 评审 R8-3：Virtuoso 被卸掉再重挂（列表清空后又有条目）必须重新落到最后一条
  *
  * 背景：去掉 `initialTopMostItemIndex` 之后，「进入对话落到最后一条」= 渲染期 latch（setFollowing(true) + beginSettle）
  * + `attachScroller` 在稳定期内挂上容器时起贴底链。latch 只有「定位闸」为 false 时才跑一次；
- * 进入 QA tab 的 effect 把闸开成 false，**如果 latch 没有按 `showQaPanel` 守卫**，QA tab 里任何一次重渲
- * （onGroupQaVisibleChange 触发父级 setState、事件 / 流式持续到来）就会在 Virtuoso 不在树上时把闸消耗掉、
- * 白开一个 1.5s 稳定期——停留超过 1.5s 再切回，latch 不再触发、稳定期已过、新容器不落底（Virtuoso 从 scrollTop=0 重挂）。
+ * 列表清空的 effect 把闸开成 false，之后重新有条目那次渲染 latch 才会落底。
+ * （2026-11-05 去掉「群问答」页签之前，页签往返是另一条「Virtuoso 重挂」路径，连同它的 effect / 守卫已删除。）
  *
  * UI 在 node 环境跑不起来，这里用「**执行源码里的真实片段**」代替手抄一份模型：
- * 从 event-stream.tsx 里把渲染期 latch 和两个「开闸」effect 的函数体原样截出来、`new Function` 跑，
+ * 从 event-stream.tsx 里把渲染期 latch 和「开闸」effect 的函数体原样截出来、`new Function` 跑，
  * 配真实的跟随控制器——谁改了守卫 / 改了 effect，这里是行为级红，而不只是字符串匹配。
  * （另有源码契约钉住形状：tests/event-stream-scroll-contract / event-stream-flow-b-contract。）
  *
@@ -46,12 +45,6 @@ const LATCH_SRC = between(
   "if (!initialPositionedRef.current",
   "  // 列表清空（回退到最开头",
 );
-/** [showQaPanel] effect 的函数体 */
-const QA_EFFECT_BODY = between(
-  eventStream,
-  "useEffect(() => {\n    lastRangeStartRef.current = null;",
-  "}, [showQaPanel]);",
-).replace("useEffect(() => {", "");
 /** [listEmpty] effect 的函数体 */
 const EMPTY_EFFECT_BODY = between(
   eventStream,
@@ -155,26 +148,13 @@ const BOTTOM = 1200;
 
 const runLatch = new Function(
   "initialPositionedRef",
-  "showQaPanel",
   "items",
   "follow",
   LATCH_SRC,
 ) as (
   ref: { current: boolean },
-  showQaPanel: boolean,
   items: unknown[],
   follow: StreamFollowController,
-) => void;
-
-const runQaEffect = new Function(
-  "lastRangeStartRef",
-  "initialPositionedRef",
-  "showQaPanel",
-  QA_EFFECT_BODY,
-) as (
-  range: { current: number | null },
-  ref: { current: boolean },
-  showQaPanel: boolean,
 ) => void;
 
 const runEmptyEffect = new Function(
@@ -193,19 +173,13 @@ const makeStream = () => {
   const ctrl = createStreamFollowController({ current: vi.fn() }, () => clock);
   const initialPositionedRef = { current: false };
   const lastRangeStartRef: { current: number | null } = { current: null };
-  let prevShowQa: boolean | undefined;
   let prevEmpty: boolean | undefined;
   let mountedScroller: ReturnType<typeof makeScroller> | null = null;
 
-  const render = (showQaPanel: boolean, itemCount: number) => {
-    runLatch(
-      initialPositionedRef,
-      showQaPanel,
-      new Array(itemCount).fill(0),
-      ctrl,
-    );
-    // JSX：showQaPanel ? QA : items.length === 0 ? 空态 : <Virtuoso/>
-    const virtuosoInTree = !showQaPanel && itemCount > 0;
+  const render = (itemCount: number) => {
+    runLatch(initialPositionedRef, new Array(itemCount).fill(0), ctrl);
+    // JSX：items.length === 0 ? 空态 : <Virtuoso/>
+    const virtuosoInTree = itemCount > 0;
     if (!virtuosoInTree && mountedScroller) {
       ctrl.attachScroller(null); // Virtuoso 卸载：scrollerRef(null)
       mountedScroller = null;
@@ -217,10 +191,6 @@ const makeStream = () => {
       mountedScroller = freshScroller;
       ctrl.attachScroller(freshScroller.el);
     }
-    if (prevShowQa !== showQaPanel) {
-      runQaEffect(lastRangeStartRef, initialPositionedRef, showQaPanel);
-      prevShowQa = showQaPanel;
-    }
     const listEmpty = itemCount === 0;
     if (prevEmpty !== listEmpty) {
       runEmptyEffect(listEmpty, initialPositionedRef, lastRangeStartRef);
@@ -231,95 +201,39 @@ const makeStream = () => {
   return { ctrl, render, initialPositionedRef, lastRangeStartRef };
 };
 
-describe("R8-3：群问答 tab 往返——QA 里重渲不能把定位闸白白消耗掉", () => {
-  it("进入 QA → QA 里重渲 N 次 → 停留超过稳定期 → 切回：latch 重新 setFollowing + beginSettle、新容器落到底", () => {
+describe("渲染期 latch：只落一次", () => {
+  it("首次有条目落到底；之后的重渲不会再把用户刚上滚的跟随态拉回去", () => {
     const s = makeStream();
-    // 进入事件流：首次有条目
-    const first = s.render(false, 50);
-    expect(first).not.toBeNull();
+    const first = s.render(10);
     flushFrame();
     expect(first!.top()).toBe(BOTTOM);
     expect(s.initialPositionedRef.current).toBe(true);
-
-    // 用户上滚读历史（跟随关）→ 进 QA tab
-    s.ctrl.setFollowing(false);
-    clock = 1000;
-    s.render(true, 50);
-    expect(s.initialPositionedRef.current).toBe(false); // 进入 QA 开闸
-    expect(s.ctrl.isFollowing()).toBe(false);
-
-    // QA tab 里的重渲（父级 setState / 新事件）：闸不能被消耗、稳定期不能被白开、跟随态不能被碰
-    clock = 1200;
-    for (let i = 0; i < 5; i++) s.render(true, 50 + i);
-    expect(s.initialPositionedRef.current).toBe(false);
-    expect(s.ctrl.isFollowing()).toBe(false);
-    expect(pendingFrames()).toBe(0);
-
-    // 停留远超稳定期后切回
-    clock = 1200 + MOUNT_SETTLE_MS * 4;
-    const back = s.render(false, 55);
-    expect(back).not.toBeNull();
-    expect(s.ctrl.isFollowing()).toBe(true); // latch 重新恢复跟随
-    expect(pendingFrames()).toBe(1); // attachScroller 在新稳定期内起了贴底链
-    flushFrame();
-    expect(back!.writes).toEqual([2000]);
-    expect(back!.top()).toBe(BOTTOM);
-  });
-
-  it("在 QA 里停留不到稳定期就切回，同样落底（不退化）", () => {
-    const s = makeStream();
-    s.render(false, 10);
-    flushFrame();
-    s.render(true, 10);
-    clock = 300;
-    s.render(true, 11);
-    clock = 600;
-    const back = s.render(false, 11);
-    flushFrame();
-    expect(back!.top()).toBe(BOTTOM);
-  });
-
-  it("切回之后 latch 只跑一次：之后的重渲不会再把用户刚上滚的跟随态拉回去", () => {
-    const s = makeStream();
-    s.render(false, 10);
-    flushFrame();
-    s.render(true, 10);
+    s.ctrl.setFollowing(false); // 用户上滚
     clock = 5000;
-    const back = s.render(false, 10);
-    flushFrame();
-    s.ctrl.setFollowing(false); // 切回后用户马上上滚
-    for (let i = 0; i < 5; i++) s.render(false, 10 + i);
+    for (let i = 0; i < 5; i++) s.render(10 + i);
     expect(s.ctrl.isFollowing()).toBe(false);
     expect(pendingFrames()).toBe(0);
-    expect(back!.writes).toEqual([2000]); // 没有任何多余写入
-  });
-
-  it("[showQaPanel] effect 只在「进入」时开闸：离开 QA 的那次提交不会再把闸复位", () => {
-    const s = makeStream();
-    s.render(false, 10);
-    s.render(true, 10);
-    s.render(false, 10); // 切回：latch 已消耗闸
-    expect(s.initialPositionedRef.current).toBe(true);
+    expect(first!.writes).toEqual([2000]); // 没有任何多余写入
   });
 });
 
 describe("R8-3 同类：列表清空后再有条目也是重挂 Virtuoso", () => {
   it("有条目 → 清空（回退到最开头）→ 停留超过稳定期 → 又有条目：重新落底", () => {
     const s = makeStream();
-    const first = s.render(false, 30);
+    const first = s.render(30);
     flushFrame();
     expect(first!.top()).toBe(BOTTOM);
     s.ctrl.setFollowing(false); // 用户上滚过
 
     clock = 1000;
-    s.render(false, 0); // 空态占位把 Virtuoso 卸掉
+    s.render(0); // 空态占位把 Virtuoso 卸掉
     expect(s.initialPositionedRef.current).toBe(false);
     expect(s.lastRangeStartRef.current).toBeNull();
     clock = 1000 + MOUNT_SETTLE_MS * 3;
-    s.render(false, 0); // 空态里的重渲不触发 latch（items.length === 0）
+    s.render(0); // 空态里的重渲不触发 latch（items.length === 0）
     expect(s.ctrl.isFollowing()).toBe(false);
 
-    const again = s.render(false, 2);
+    const again = s.render(2);
     expect(again).not.toBeNull();
     expect(s.ctrl.isFollowing()).toBe(true);
     flushFrame();
@@ -328,9 +242,9 @@ describe("R8-3 同类：列表清空后再有条目也是重挂 Virtuoso", () =>
 
   it("首次进入时列表本来就是空的：不影响之后第一次有条目时的 latch", () => {
     const s = makeStream();
-    expect(s.render(false, 0)).toBeNull();
+    expect(s.render(0)).toBeNull();
     clock = 4000;
-    const first = s.render(false, 3);
+    const first = s.render(3);
     flushFrame();
     expect(first!.top()).toBe(BOTTOM);
   });

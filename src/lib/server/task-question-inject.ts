@@ -84,7 +84,10 @@ import {
   enqueueTalkMessage,
   removeTalkQueueItemsByDedupe,
 } from "@/lib/server/task-talk-queue";
-import { isGroupNonOwnerGuardEnabled } from "@/lib/server/group-non-owner-guard-config";
+import {
+  isGroupBotsEqualRights,
+  isGroupNonOwnerGuardEnabled,
+} from "@/lib/server/group-non-owner-guard-config";
 
 export interface TaskQuestionBody {
   text?: string;
@@ -154,10 +157,10 @@ export interface TaskQuestionInjectOptions {
    *   没有活会话 / 送不进去 → 直接 409，由群入向回话；群入向本来就只在「有活会话」时才走这条路；
    * - 不等排空、不强清假死 run（`abortStuckRunForSend` 会掐掉属主正在流的收尾旁白）：忙就入 task 待送达队列。
    * 提示词开关开时再加：消息尾部「只答疑」约束段 + 该轮 Flowship 系统工具硬拒（见 group-non-owner-prompt）。
-   * `name` = 发言人展示名，写进约束段。`isBot` = 发言人是别的机器人：**始终**按开的口径处理（不看提示词开关；
-   * 约束段用机器人变体），「关 = 同权」只留给真人。
+   * `name` = 发言人展示名，写进约束段。`isBot` = 发言人是别的机器人：默认**始终**按开的口径处理（不看提示词开关；
+   * 约束段用机器人变体）；设置「机器人与真人同权」打开后才跟真人一样看开关（开关关 = 同权，但仍带防成环的克制提示）。
    */
-  groupNonOwner?: { name: string; isBot?: boolean };
+  groupNonOwner?: { name: string; isBot?: boolean; openId?: string };
   /**
    * 关联回执（出问登记两门已过）：以属主语义注入当数据，但与普通属主消息两处不同——
    * ① 不认领 askSkip（不许外部回执顶掉属主的待答提问）；② 正文包不可信数据头。
@@ -940,7 +943,11 @@ const runTaskQuestionInject = async (
         (a) => a.id === task.currentActionId && a.status === "awaiting_ack",
       );
   const ackContext = ackAction
-    ? { actionId: ackAction.id, artifactPath: ackAction.artifactPath ?? undefined }
+    ? {
+        actionId: ackAction.id,
+        artifactPath: ackAction.artifactPath ?? undefined,
+        actionType: ackAction.type,
+      }
     : undefined;
   if (ackAction?.artifactPath) {
     await snapshotActionArtifact(task.id, ackAction.id).catch((err) => {
@@ -1017,8 +1024,11 @@ const runTaskQuestionInject = async (
   // 两种「不送达」都视为无会话续接意图（走下方分流），不是 stale
   // 内存高压：deliver 内直接抛 HeapPressureError（不建新 agent），转 503 友好提示。
   // 非属主并入：提示词开关**送达时现读**（排队消息按重放那一刻的值算，改开关对活会话即时生效）
+  // 机器人默认**始终**按开的口径（只答疑）；设置「机器人与真人同权」打开后才跟真人一样看提示词开关。
+  // 机器人且没开同权 → 不需要读提示词开关（读了也不改变结果）。
   const nonOwnerGuardOn = nonOwner
-    ? options.groupNonOwner?.isBot === true || (await isGroupNonOwnerGuardEnabled())
+    ? (options.groupNonOwner?.isBot === true && !(await isGroupBotsEqualRights())) ||
+      (await isGroupNonOwnerGuardEnabled())
     : false;
   let deliverResult: "sent" | "no_session" | "stale" | "send_failed";
   try {
@@ -1052,6 +1062,9 @@ const runTaskQuestionInject = async (
                     name: options.groupNonOwner?.name?.trim() || "群成员",
                     guard: nonOwnerGuardOn,
                     ...(options.groupNonOwner?.isBot === true ? { isBot: true } : {}),
+                    ...(options.groupNonOwner?.openId
+                      ? { openId: options.groupNonOwner.openId }
+                      : {}),
                   }
                 : undefined,
             ),
@@ -1336,7 +1349,7 @@ const runTaskQuestionInject = async (
     await writeEventAndPublish(task.id, {
       kind: "info",
       actionId: task.currentActionId ?? undefined,
-      text: "正在启动答疑 agent（群里非任务所有者的提问）…",
+      text: "群里有人提问：由只读答疑 agent 回答（不动代码），做完后这里会出一张问答卡…",
     });
     startRestrictedGroupQuestion({
       task,

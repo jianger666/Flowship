@@ -349,7 +349,7 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 
 - `[USER_MESSAGE]`（带〈产出审阅中〉）→ 按 super-prompt「[USER_MESSAGE] 统一处理」。**改类**落地后用 `edit` 把本轮修正追加到 review artifact 的 `## 修改记录` 段末尾（格式 / 禁项见「跨 action 共享规范 §5.1」）、重新跑 git diff 复核
   - **特例·用户对 bug 表态（V0.6.17）**：若 feedback 是对「## bug 复审」里某条 🔴/🟡 的处理决定（「这个不用改」「二期再说」「这个本次修」）→ 复述确认后、把裁决追加到「## bug 复审 → ### 用户裁决」子段（**bug 本体保留**、别从表里删——bug 是事实、裁决是决定）、review 本身**不改代码**。后续 build 读 review 就知道哪些 bug 用户已否决、**不重复问**（决定链落 md）。
-- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行、**绝对不自动进入 ship**
+- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行、**不要自己进入 ship**（用户明确说过「复核没问题就提测」之类才用 `advance_next` 登记，见 super-prompt）
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
 
@@ -537,4 +537,4 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 - **拍板口径显性留痕**：plan artifact 内联的 `> ✅ ask_user 已确认` 备注、每条都列到「plan 拍板口径复核」段、给 ✅ 一致 / ⚠️ 跑偏 / N/A 没用到 结论、不要让拍板复核留在隐性假设里溜过去
 - **写完 → ask_user → 交卷**：顺序不能颠倒、ask_user 没问完就交卷等于闭环没合上
 - **分批需求两层 review（V0.6.23）**：[NEXT_ACTION] 带 `[REVIEW_SCOPE]` 时按它定增量 / 集成（见 §4.5）——增量别把「没 build 的批次」当 bug 报、集成重点查批次之间打不打架
-- **绝对不自动进入下一 action**：不要自己跑 ship——下一手由用户在 UI 选
+- **不要自己进入下一 action**：不要在本轮里跑 ship。默认下一手由用户在 UI 选；用户明确说过「没问题就提测」「有问题就自己改、改完再复核」之类，才用 `advance_next` 登记（见 super-prompt），由系统代他推进——提测（ship）这类有对外副作用的一步必须是他点名要的

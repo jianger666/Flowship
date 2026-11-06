@@ -1,13 +1,13 @@
 /**
- * 并入同会话的非属主一轮（meta.groupNonOwnerTurn）不进群问答 tab。
+ * 并入同会话的非属主一轮（meta.groupNonOwnerTurn）不算旁路问答轮。
  *
  * 老逻辑里，任何没有 restrictedRunTag 的群问题都会走 temporal「历史」配对——并入同会话之后，非属主的问与答都在
- * 主事件流里，若仍被配成「历史」轮，tab 就会对新数据冒出来（与「新数据不再写群问答 tab」矛盾）。
+ * 主事件流里（普通气泡 + 回复），若仍被配成「历史」轮，就会多出一份重复的问答卡。
  */
 import { describe, expect, it } from "vitest";
 
-import { collectGroupQaRounds } from "@/lib/group-qa";
-import { deriveGroupQaScope } from "@/lib/group-qa-scope";
+import { isHiddenFromEventStream } from "@/lib/event-stream-hidden";
+import { collectGroupQaRounds, isGroupQaQuestionEvent } from "@/lib/group-qa";
 import type { TaskEvent } from "@/lib/types";
 
 let seq = 0;
@@ -16,7 +16,7 @@ const ev = (over: Partial<TaskEvent> & { kind: TaskEvent["kind"] }): TaskEvent =
 
 const NOW = 1_000_000 + 60_000;
 
-describe("同会话非属主一轮不进 tab", () => {
+describe("同会话非属主一轮不算旁路问答轮", () => {
   const sameSession = () => [
     ev({
       kind: "user_reply",
@@ -30,15 +30,11 @@ describe("同会话非属主一轮不进 tab", () => {
     expect(collectGroupQaRounds(sameSession(), NOW)).toEqual([]);
   });
 
-  it("tab 不出现（没有别的轮次、也没有更早的未加载事件）", () => {
-    const rounds = collectGroupQaRounds(sameSession(), NOW);
-    const scope = deriveGroupQaScope({
-      roundCount: rounds.length,
-      hasMoreEarlier: false,
-      hasGroup: true,
-      isChat: false,
-    });
-    expect(scope.showTab).toBe(false);
+  it("问题事件不是旁路问题、也不被事件流隐藏：问与答都以普通消息留在事件流里", () => {
+    const [question, answer] = sameSession();
+    expect(isGroupQaQuestionEvent(question!)).toBe(false);
+    expect(isHiddenFromEventStream(question!, { isChat: false })).toBe(false);
+    expect(isHiddenFromEventStream(answer!, { isChat: false })).toBe(false);
   });
 
   it("对照：同样形状但没有 groupNonOwnerTurn 标记 → 仍是历史轮（老数据口径不变）", () => {

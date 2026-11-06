@@ -2,7 +2,7 @@
  * G4-06：输入框 ↑ 历史不能带出「事件流里被藏起来的」user_reply。
  *
  * 背景：群里非属主的提问是以 user_reply 落盘的（meta.source=feishu_group + restrictedRunTag），
- * 事件流靠 isHiddenFromEventStream 把它藏进「群问答」tab；buildInputHistory 以前只看
+ * 事件流靠 isHiddenFromEventStream 把它藏起来（只在问答卡的「查看过程」里）；buildInputHistory 以前只看
  * kind === "user_reply"，陌生人的问题就会出现在属主输入框的 ↑ 历史里，一按 ↑ 就把别人的话填进去。
  * 隐藏口径只认 isHiddenFromEventStream 这一个闸，这里既测具体场景、也测「与闸一致」的契约。
  *

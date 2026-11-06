@@ -232,6 +232,17 @@
   }
 }
 
+/* 文件预览的页内查找（CSS Custom Highlight API，见 components/preview/use-doc-find）：
+ * 命中画在文字上、不改 DOM。当前命中比其它命中更实一档。 */
+::highlight(preview-find) {
+  background-color: color-mix(in oklab, var(--warning) 35%, transparent);
+  color: inherit;
+}
+::highlight(preview-find-active) {
+  background-color: color-mix(in oklab, var(--warning) 70%, transparent);
+  color: inherit;
+}
+
 /* ---------- 全局滚动条（V0.7.13 建、2026-08 提可见性、2026-09-09 去轨道线） ----------
    用户实测：8px + 整条轨道底色像一条通顶通底的分割线（聊天区右侧最明显）。
    新规范：无轨道（透明）+ 圆角 pill 拇指 + 收细到 6px。

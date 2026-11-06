@@ -13,11 +13,13 @@
  */
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ExternalLink,
   FolderOpen,
   Loader2,
+  Maximize2,
+  Minimize2,
   SquareCode,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -32,6 +34,7 @@ import {
 import { Tooltip } from "@/components/ui/tooltip";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { canOpenInIde, type LocalFileKind } from "@/lib/local-file-kind";
+import { formatBytes, formatModified } from "@/lib/preview/format";
 import { detectMediaKind } from "@/lib/media/media-kind";
 import { openMedia } from "@/lib/media/player-store";
 import {
@@ -42,6 +45,7 @@ import {
 } from "@/lib/path-utils";
 import { JUMP_IDE_LABEL } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useDialog } from "@/hooks/use-dialog";
 import { useJumpIde } from "@/hooks/use-settings";
 import {
   LocalFilePreviewContext,
@@ -64,7 +68,7 @@ const LocalFilePreviewBody = dynamic(
   {
     ssr: false,
     loading: () => (
-      <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
+      <div className="flex h-full items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin" />
         加载中…
       </div>
@@ -108,20 +112,74 @@ const extBadgeLabel = (absolutePath: string, kind?: LocalFileKind | null): strin
   return kind ?? "file";
 };
 
+const WIDE_KEY = "flowship.preview.wide";
+/** 磁盘上的文件有没有变：轮询间隔（只在窗口开着、标签页可见时跑，一次一个很小的 stat） */
+const STAT_POLL_MS = 2500;
+
 export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) => {
   const ide = useJumpIde();
+  const { confirm } = useDialog();
+  const confirmRef = useRef(confirm);
+  confirmRef.current = confirm;
+
   // open 与 state 拆开：关窗先 open=false 走 DialogContent 退场动画，再清 state
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<PreviewState | null>(null);
   const [payload, setPayload] = useState<LocalFilePreviewPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // xlsx 工作表序号：切换时只重新请求那一张（服务端只解析选中的 sheet）
+  const [sheetIndex, setSheetIndex] = useState(0);
+  const [switchingSheet, setSwitchingSheet] = useState(false);
+  // reloadNonce：不换文件、只重新读一遍（保存后 / 磁盘变化 / 手动重新加载），静默进行、不闪「加载中」
+  const [reloadNonce, setReloadNonce] = useState(0);
+  // resetKey：用户明确选择「丢弃未保存的修改并重新加载」时递增，编辑器据此重置草稿
+  const [resetKey, setResetKey] = useState(0);
+  const [stale, setStale] = useState<"changed" | "missing" | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  const inflightRef = useRef(false);
+  const loadedPathRef = useRef<string | null>(null);
+  const shownPathRef = useRef<string | null>(null);
+  const [wide, setWide] = useState(false);
+
+  // 放大 / 标准偏好：SSR 阶段没有 localStorage，挂载后再读（Provider 在根布局里会被服务端渲染，不能首帧就读）
+  useEffect(() => {
+    try {
+      setWide(window.localStorage.getItem(WIDE_KEY) === "1");
+    } catch {
+      // 读不到就用默认
+    }
+  }, []);
+  const toggleWide = () => {
+    setWide((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(WIDE_KEY, next ? "1" : "0");
+      } catch {
+        // 存不下不影响本次
+      }
+      return next;
+    });
+  };
+
+  const handleDirtyChange = useCallback((next: boolean) => {
+    dirtyRef.current = next;
+    setDirty(next);
+  }, []);
 
   const clearPreviewData = useCallback(() => {
     setState(null);
     setPayload(null);
     setError(null);
     setLoading(false);
+    setSheetIndex(0);
+    setSwitchingSheet(false);
+    setStale(null);
+    setDirty(false);
+    dirtyRef.current = false;
+    loadedPathRef.current = null;
+    shownPathRef.current = null;
   }, []);
 
   const openPreview = useCallback((pathLike: string, opts?: OpenLocalFileOptions) => {
@@ -133,13 +191,34 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
       openMedia([{ path: target.absolute }]);
       return;
     }
-    setState({
+    const next: PreviewState = {
       pathLike,
       absolutePath: target.absolute,
       baseDir: opts?.baseDir,
       line: opts?.line ?? target.line,
-    });
-    setOpen(true);
+    };
+    void (async () => {
+      // 正在编辑且有未保存修改时，从别处点开另一个文件：不能悄悄把草稿换掉
+      if (dirtyRef.current) {
+        const ok = await confirmRef.current({
+          title: "放弃未保存的修改？",
+          description: "当前文件有未保存的修改，打开另一个文件会丢失它们。",
+          confirmLabel: "放弃修改并打开",
+          destructive: true,
+          defaultFocus: "cancel",
+        });
+        if (!ok) return;
+        dirtyRef.current = false;
+        setDirty(false);
+      }
+      // 换了文件：工作表序号 / 过期提示都属于上一个文件，清掉
+      if (shownPathRef.current && shownPathRef.current !== next.absolutePath) {
+        setSheetIndex(0);
+        setStale(null);
+      }
+      setState(next);
+      setOpen(true);
+    })();
   }, []);
   const previewContext = useMemo(
     () => ({ open: openPreview, ide }),
@@ -153,36 +232,145 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
     return () => window.clearTimeout(t);
   }, [open, clearPreviewData]);
 
+  const absolutePath = state?.absolutePath ?? null;
+  shownPathRef.current = absolutePath;
   useEffect(() => {
-    if (!state) return;
+    if (!absolutePath) return;
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-    setPayload(null);
+    // 换了文件 → 完整加载（清空旧内容、显示加载中）；同一文件的重新读取（保存后 / 磁盘变化 / 切 sheet）→ 静默，旧内容保留到新内容到位
+    const fresh = loadedPathRef.current !== absolutePath;
+    inflightRef.current = true;
+    if (fresh) {
+      setLoading(true);
+      setError(null);
+      setPayload(null);
+    }
     void (async () => {
       try {
-        const res = await fetch(
-          `/api/system/read-local-file?path=${encodeURIComponent(state.absolutePath)}`,
-        );
+        const url =
+          `/api/system/read-local-file?path=${encodeURIComponent(absolutePath)}` +
+          (sheetIndex > 0 ? `&sheet=${sheetIndex}` : "");
+        const res = await fetch(url);
         const json = (await res.json()) as LocalFilePreviewPayload & { error?: string };
         if (cancelled) return;
         if (!res.ok) {
-          setError(json.error ?? `加载失败（HTTP ${res.status}）`);
+          // 静默刷新失败（例如 agent 正在写文件，读到半截）：保留旧内容，下一轮轮询会再试
+          if (fresh) setError(json.error ?? `加载失败（HTTP ${res.status}）`);
           return;
         }
+        loadedPathRef.current = absolutePath;
         setPayload(json);
+        setError(null);
       } catch (e) {
-        if (!cancelled) {
+        if (!cancelled && fresh) {
           setError(e instanceof Error ? e.message : String(e));
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          inflightRef.current = false;
+          setLoading(false);
+          setSwitchingSheet(false);
+        }
       }
     })();
     return () => {
       cancelled = true;
+      inflightRef.current = false;
     };
-  }, [state]);
+  }, [absolutePath, sheetIndex, reloadNonce]);
+
+  // 轮询磁盘修改时间：没有未保存修改 → 静默刷新（agent 正在改的文件会实时跟上）；有 → 只提示，不替用户做决定
+  const loadedMtime = payload?.mtimeMs ?? null;
+  useEffect(() => {
+    if (!open || !absolutePath || loadedMtime === null) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const tick = async () => {
+      if (document.visibilityState === "visible" && !inflightRef.current) {
+        try {
+          const res = await fetch(`/api/system/local-file-stat?path=${encodeURIComponent(absolutePath)}`);
+          if (!cancelled && res.ok) {
+            const st = (await res.json()) as { exists: boolean; mtimeMs: number };
+            if (!cancelled) {
+              if (!st.exists) setStale("missing");
+              else if (st.mtimeMs !== loadedMtime) {
+                if (dirtyRef.current) setStale("changed");
+                else {
+                  setStale(null);
+                  setReloadNonce((n) => n + 1);
+                }
+              } else {
+                setStale(null);
+              }
+            }
+          }
+        } catch {
+          // 网络抖动：下一轮再看
+        }
+      }
+      if (!cancelled) timer = window.setTimeout(() => void tick(), STAT_POLL_MS);
+    };
+    timer = window.setTimeout(() => void tick(), STAT_POLL_MS);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [open, absolutePath, loadedMtime]);
+
+  /** 编辑器保存成功：原子地更新 text / mtime / size（轮询据此不把自己的写入当成外部修改），再静默刷新衍生数据（表格 / 树 / 预览） */
+  const handleSaved = useCallback((r: { text: string; mtimeMs: number; size: number }) => {
+    setPayload((p) => (p ? { ...p, text: r.text, mtimeMs: r.mtimeMs, size: r.size, truncated: false } : p));
+    setStale(null);
+    setReloadNonce((n) => n + 1);
+  }, []);
+
+  /** 丢弃草稿、重新读盘（冲突条里「放弃我的修改并重新加载」；调用方已经让用户明确选择过了） */
+  const reloadDiscarding = useCallback(() => {
+    setResetKey((k) => k + 1);
+    setReloadNonce((n) => n + 1);
+    setStale(null);
+  }, []);
+
+  const handleReloadClick = async () => {
+    if (dirtyRef.current) {
+      const ok = await confirm({
+        title: "放弃未保存的修改？",
+        description: "重新加载会用磁盘上的最新内容替换编辑区。",
+        confirmLabel: "放弃修改并重新加载",
+        destructive: true,
+        defaultFocus: "cancel",
+      });
+      if (!ok) return;
+    }
+    reloadDiscarding();
+  };
+
+  /** 关窗：有未保存修改先问一句（Esc / 点遮罩 / 右上角 X 都走这里） */
+  const requestClose = useCallback(() => {
+    if (!dirtyRef.current) {
+      setOpen(false);
+      return;
+    }
+    void (async () => {
+      const ok = await confirmRef.current({
+        title: "放弃未保存的修改？",
+        description: "关闭预览后，没保存的修改会丢失。",
+        confirmLabel: "放弃修改并关闭",
+        destructive: true,
+        defaultFocus: "cancel",
+      });
+      if (ok) {
+        dirtyRef.current = false;
+        setDirty(false);
+        setOpen(false);
+      }
+    })();
+  }, []);
+
+  const handleSelectSheet = useCallback((index: number) => {
+    setSwitchingSheet(true);
+    setSheetIndex(index);
+  }, []);
 
   const handleReveal = () => {
     if (!state) return;
@@ -239,15 +427,18 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
       <Dialog
         open={open}
         onOpenChange={(next) => {
-          if (!next) setOpen(false);
+          if (!next) requestClose();
         }}
       >
         <DialogContent
           className={cn(
             // bg-background：跟产物栏同一纸面色；别用 Dialog 默认 bg-popover（浅色更白），
             // 否则 Streamdown 表格 bg-background / 表头叠色会跟外面漂开。
-            "flex max-h-[min(90vh,calc(100vh-48px))] w-full flex-col gap-0 overflow-hidden bg-background p-0 text-foreground",
-            "sm:max-w-[min(960px,80vw,calc(100vw-48px))]",
+            // 固定高度（不随内容伸缩）：虚拟列表 / 编辑器 / 图片查看器都需要一个确定高度的容器，也避免加载前后窗口大小跳动。
+            "flex h-[min(90vh,calc(100vh-48px))] max-h-[min(90vh,calc(100vh-48px))] w-full flex-col gap-0 overflow-hidden bg-background p-0 text-foreground",
+            wide
+              ? "sm:max-w-[min(1400px,96vw,calc(100vw-48px))]"
+              : "sm:max-w-[min(960px,80vw,calc(100vw-48px))]",
           )}
         >
           {state ? (
@@ -267,21 +458,41 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
                     <Tooltip content={state.absolutePath}>
                       <span className="block truncate">{displayLabel}</span>
                     </Tooltip>
+                    {dirty && <span className="ml-1.5 text-xs font-normal text-warning">● 未保存</span>}
                   </DialogTitle>
                   <DialogDescription className="sr-only">
                     {state.absolutePath}
                   </DialogDescription>
-                  <Tooltip content="点击复制路径">
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyPath()}
-                      className="mt-0.5 block max-w-full truncate text-left font-mono text-[11px] text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline"
-                    >
-                      {pathShown}
-                    </button>
-                  </Tooltip>
+                  <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
+                    <Tooltip content="点击复制路径">
+                      <button
+                        type="button"
+                        onClick={() => void handleCopyPath()}
+                        className="min-w-0 truncate text-left font-mono underline-offset-2 transition-colors hover:text-foreground hover:underline"
+                      >
+                        {pathShown}
+                      </button>
+                    </Tooltip>
+                    {payload && (
+                      <span className="shrink-0 tabular-nums">
+                        {formatBytes(payload.size)} · {formatModified(payload.mtimeMs)}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <div className="flex shrink-0 items-center rounded-md border border-border/70 bg-background p-0.5">
+                  <Tooltip content={wide ? "缩小窗口" : "放大窗口"}>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={wide ? "缩小窗口" : "放大窗口"}
+                      className="size-7 text-muted-foreground"
+                      onClick={toggleWide}
+                    >
+                      {wide ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+                    </Button>
+                  </Tooltip>
                   <Tooltip content="在文件夹中显示">
                     <Button
                       type="button"
@@ -326,8 +537,39 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
                   )}
                 </div>
               </div>
-              <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-5 py-4">
-                <LocalFilePreviewBody data={payload} loading={loading} error={error} />
+              {stale && (
+                <div role="status" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-warning/40 bg-warning/10 px-3 py-1.5 text-xs text-foreground">
+                  <span>
+                    {stale === "missing"
+                      ? "这个文件已被删除或移走，下面显示的是之前载入的内容。"
+                      : "文件在磁盘上被修改了，而你有未保存的修改，所以没有自动刷新。"}
+                  </span>
+                  {stale === "changed" && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="xs"
+                      className="ml-auto h-6 px-2"
+                      onClick={() => void handleReloadClick()}
+                    >
+                      放弃我的修改并重新加载
+                    </Button>
+                  )}
+                </div>
+              )}
+              <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto">
+                <LocalFilePreviewBody
+                  data={payload}
+                  loading={loading}
+                  error={error}
+                  line={state.line}
+                  resetKey={resetKey}
+                  onDirtyChange={handleDirtyChange}
+                  onSaved={handleSaved}
+                  onRequestReload={reloadDiscarding}
+                  onSelectSheet={handleSelectSheet}
+                  sheetLoading={switchingSheet}
+                />
               </div>
             </>
           ) : null}

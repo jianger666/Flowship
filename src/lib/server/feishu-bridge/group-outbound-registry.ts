@@ -117,7 +117,7 @@ const pruneExpired = (
 };
 /**
  * 按 task 整项清（删任务/终结/归档链调用：条目虽没秘密，空壳也别留）。
- * 和熔断表、排队同一套路（review 十轮-1）。
+ * 和排队同一套路（review 十轮-1）。
  */
 export const clearCorrelatedEntries = (taskId: string): void => {
   if (taskId) getRegistry().delete(taskId);

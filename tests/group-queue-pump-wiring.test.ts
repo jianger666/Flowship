@@ -343,7 +343,7 @@ describe("G3-04：回放的排队问题遇到 pending ask，不被当成 agent a
   });
 });
 
-// ----------------- G3-02：发送人槽位 + 旁路 run 滑动窗 -----------------
+// ----------------- G3-02：发送人槽位（旁路 run 滑动窗限流 2026-11-06 已删除） -----------------
 
 describe("G3-02：每发送人最多 2 个排队槽", () => {
   it("同一发送人第 3 条落回忙线拒收（原口径），别的发送人仍能排；重投不占槽", async () => {
@@ -365,80 +365,6 @@ describe("G3-02：每发送人最多 2 个排队槽", () => {
     // 飞书重投已在队里的 om_1：幂等、不被槽位上限误拒
     expect(await routeGroupInboundMessage(fromLi("om_1"), ctx)).toMatchObject({ kind: "queued" });
     expect(groupQuestionQueueLength("task-1")).toBe(3);
-  });
-});
-
-describe("G3-02：非属主旁路 run 的 10 分钟滑动窗（窗内最多 12 个）", () => {
-  const runOne = (i: number) =>
-    routeGroupInboundMessage(
-      groupMsg({
-        message_id: `om_w${i}`,
-        // 轮换发送人：这条用例测的是 per-task 窗，不是 per-sender 槽位
-        sender_id: `ou_s${i % 6}`,
-        sender_name: `同事${i % 6}`,
-        content: `@Flowship 问题 ${i}`,
-      }),
-      ctx,
-    );
-  const infoCalls = () =>
-    writeOwnedEventAndPublish.mock.calls.filter(
-      (c) => (c[2] as { kind?: string } | undefined)?.kind === "info",
-    );
-
-  it("第 13 个起静默丢弃（不回群、不进注入链），只写一条节流 info；窗口滑过后恢复", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const t0 = new Date("2026-10-15T08:00:00Z").getTime();
-    vi.setSystemTime(t0);
-    const { handleTaskQuestionInject, sendTextToChat } = setup();
-
-    for (let i = 1; i <= 12; i++) {
-      expect(await runOne(i)).toMatchObject({ kind: "sent" });
-    }
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(12);
-    sendTextToChat.mockClear();
-
-    const r13 = await runOne(13);
-    expect(r13).toMatchObject({ kind: "skipped" });
-    const r14 = await runOne(14);
-    expect(r14).toMatchObject({ kind: "skipped" });
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(12);
-    // 静默：群里一个字都不回（也不 @ 提问人）
-    expect(sendTextToChat).not.toHaveBeenCalled();
-    // 每窗最多一条 info（给属主看的，不进群）
-    expect(infoCalls()).toHaveLength(1);
-
-    // 窗口滑过：恢复放行
-    vi.setSystemTime(t0 + 10 * 60 * 1000 + 1);
-    expect(await runOne(15)).toMatchObject({ kind: "sent" });
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(13);
-  });
-
-  it("属主自己不受限；窗口耗尽期间属主消息照常注入", async () => {
-    const { handleTaskQuestionInject } = setup();
-    for (let i = 1; i <= 12; i++) await runOne(i);
-    expect(await runOne(13)).toMatchObject({ kind: "skipped" });
-    const before = handleTaskQuestionInject.mock.calls.length;
-    const r = await routeGroupInboundMessage(fromOwner("om_owner_1"), ctx);
-    expect(r).toMatchObject({ kind: "sent" });
-    expect(handleTaskQuestionInject.mock.calls.length).toBe(before + 1);
-  });
-
-  it("窗是 per-task：别的任务不共享额度", async () => {
-    const { handleTaskQuestionInject } = setup();
-    for (let i = 1; i <= 12; i++) await runOne(i);
-    expect(await runOne(13)).toMatchObject({ kind: "skipped" });
-    // 另一个任务（另一群）的非属主提问不受影响
-    const r = await routeGroupInboundMessage(
-      groupMsg({
-        message_id: "om_other_task",
-        chat_id: OTHER_CHAT,
-        sender_id: LI,
-        sender_name: "李四",
-      }),
-      ctx,
-    );
-    expect(r).toMatchObject({ kind: "sent" });
-    expect(handleTaskQuestionInject.mock.calls.length).toBe(13);
   });
 });
 

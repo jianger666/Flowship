@@ -38,7 +38,7 @@ export const shouldClearStreamingOnEvent = (
  *   - `isRunning`：**与 `mainRunActive` 同值**，不再并入旁路群答疑 run。
  *
  * 为什么不再并入旁路：当初并入是怕旁路 run 写进流里的工具被画成「已中断」；但旁路过程事件早已整条被
- * `isHiddenFromEventStream`（`meta.groupRun`）藏进「群问答」tab，主流里没有旁路工具块可画。
+ * `isHiddenFromEventStream`（`meta.groupRun`）藏进群问答卡，主流里没有旁路工具块可画。
  * 继续并入只剩副作用——仅旁路在飞、属主空闲时，组尾冒出「处理中…」转圈、历史组被撑开、
  * 末项是属主消息时还追加「等待 AI」占位（状态行说「没在跑」，组尾说「处理中」，口径打架）。
  * 两个字段保留是为了 EventStream 的 `isRunning`（必填）/ `mainRunActive`（可选）两个 prop 都能照旧传。

@@ -856,7 +856,9 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
       expect(boundary).toContain("只读工具，没有 shell");
       expect(boundary).not.toContain("glob");
       expect(boundary).toContain("答完自然结束回复");
-      expect(boundary).toContain("需属主确认");
+      expect(boundary).toContain("不替属主拍板");
+      // 回复协议已下线：旧的「需属主确认」标记不再教给 agent
+      expect(prompt).not.toContain("需属主确认");
     });
 
     it("内容：roster（名字 + 真人/机器人 + 宿主/本轮对话方）、任务快照、最近聊天（排除本轮问题自己）", async () => {
@@ -876,9 +878,13 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
       // 最近聊天：李安那句（没 @ 本机 bot，只有这里看得到）在；本轮问题自己被排除
       expect(prompt).toContain("[16:29] 李安：口径你看着办吧");
       expect(prompt).not.toContain("这条是本轮问题自己");
-      // 回复规矩（真人提问人版本）
+      // roster 带 open_id（agent 要 @ 人就得有 id）；@ 的写法固定为 <at user_id> 标签
+      expect(prompt).toMatch(/李四（真人、本轮对话方）：open_id ou_/);
+      expect(prompt).toContain('<at user_id="open_id">名字</at>');
+      // 回复规矩（真人提问人版本）：系统自动 @，不再教 `@名字` 换真 @
       expect(prompt).toContain("NO_REPLY");
-      expect(prompt).toContain("提问方是真人");
+      expect(prompt).toContain("提问方是真人：系统会自动在回复开头 @ 他");
+      expect(prompt).not.toContain("名字必须与下面完全一致");
     });
 
     it("提问人是机器人 → roster 标机器人、回复规矩走机器人版", async () => {
@@ -891,7 +897,7 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
       });
 
       expect(prompt).toContain("安若流年（机器人、本轮对话方）");
-      expect(prompt).toContain("提问方是机器人");
+      expect(prompt).toContain("提问方是机器人，系统**不会**替你 @ 它");
       expect(prompt).not.toContain("提问方是真人");
     });
 
@@ -1032,7 +1038,9 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
       const runInfos = byKind("info").filter((e) => e.text.startsWith("群答疑："));
       expect(runInfos.length).toBeGreaterThan(0);
       for (const e of runInfos) expect(e.meta?.groupRun).toBe("tag-ctx-1");
-      const acceptInfo = byKind("info").find((e) => e.text.includes("正在启动答疑 agent（群里"));
+      const acceptInfo = byKind("info").find((e) => e.text.startsWith("群里有人提问"));
+      // 先断言找得到：文案一改 find 落空，下面的 undefined?.meta 会永远过（第 22 轮 F1）
+      expect(acceptInfo).toBeDefined();
       expect(acceptInfo?.meta?.groupRun).toBeUndefined();
     });
 

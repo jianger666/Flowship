@@ -43,8 +43,8 @@
  *    无头 Chrome 实测切回正在流式的 chat 后 ≤150ms 内上滚会被它自己的 `scrollTo` 拽回。现在 `attachScroller` 在稳定期内
  *    （渲染期 latch 已 `beginSettle`）、跟随中挂上容器就起贴底链（直接写 scrollTop、可取消）；稳定期之外 / 已不在跟随 / 没开过稳定期时
  *    挂容器不会自己落底。
- *    **「Virtuoso 重挂」的每条路径都得让渲染期 latch 在「重挂的那次渲染」里跑**（评审 R8-3）：群问答 tab 往返、列表清空后再有条目——
- *    latch 带 `!showQaPanel` 守卫（QA 里的重渲不能把进入 QA 时刚开的闸消耗掉），清空时由 [listEmpty] effect 开闸。
+ *    **「Virtuoso 重挂」的每条路径都得让渲染期 latch 在「重挂的那次渲染」里跑**（评审 R8-3）：列表清空后再有条目——
+ *    清空时由 [listEmpty] effect 开闸，渲染期 latch 在重挂那次渲染里落底。（原先还有「群问答」页签往返这一条路径，页签已于 2026-11-05 去掉。）
  *    窗口级「后台→前台」Virtuoso 不重挂、`initialTopMostItemIndex` 只在 mount 时读一次，去掉它对这条路径没有影响：
  *    后台期间排着的贴底帧（rAF 暂停）恢复后照常执行，`onVisibilityChange` 补一次贴底，稳定期即便在后台耗尽，
  *    列表增高时的 totalListHeightChanged / items effect 仍会重新起链（行为见 tests/event-stream-remount-landing.test.ts）。

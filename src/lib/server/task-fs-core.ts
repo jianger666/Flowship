@@ -233,6 +233,8 @@ export interface TaskMetaV06 {
   feishuGroupChatId?: string;
   /** 本任务关联群的群名快照（展示用） */
   feishuGroupChatName?: string;
+  /** 群答疑回复是否流式的任务级覆盖（详见 types.ts Task.feishuGroupStreaming；缺省 = 跟随全局） */
+  feishuGroupStreaming?: boolean;
   /** 手填的 wk 需求编号（详见 types.ts Task.reqId；空 = 这个 task 没有 REQ-ID） */
   reqId?: string;
   contextDocs?: TaskContextDoc[];
@@ -1987,6 +1989,7 @@ export const assembleTask = (
   feishuStoryUrl: meta.feishuStoryUrl,
   feishuGroupChatId: meta.feishuGroupChatId,
   feishuGroupChatName: meta.feishuGroupChatName,
+  feishuGroupStreaming: meta.feishuGroupStreaming,
   reqId: meta.reqId,
   contextDocs: meta.contextDocs,
   disabledMcpServers: meta.disabledMcpServers,
@@ -2066,6 +2069,7 @@ export const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     // 本任务群关联进摘要：群回流按摘要扫任务（省得为反查读全量事件），缺了本地关联就不可见
     feishuGroupChatId: meta.feishuGroupChatId,
     feishuGroupChatName: meta.feishuGroupChatName,
+    feishuGroupStreaming: meta.feishuGroupStreaming,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
     pinned: meta.pinned,

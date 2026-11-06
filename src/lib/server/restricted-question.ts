@@ -29,7 +29,7 @@
  *    漏发一次，那条登记就一直挂着、直到 TTL 过期（群里永久无答）。
  * 5. prompt 由 buildRestrictedPrompt 组装（buildReadonlyUserMessage 打底用户话术 + 任务背景 +
  *    旁路公司环境脱敏声明），「# 边界」段永远排在最后。
- *    安全硬化（P0 审计后）：① 准入闸：机器人发件人拒绝（真正生效的一道）。**没有「按群开关」**（第 11 轮起：用户决定答疑默认开，已绑定需求群里的非属主真人 @ 机器人就会起；第 7 轮的「按群显式开启、默认关」整个撤掉）；
+ *    安全硬化（P0 审计后）：① 准入闸（机器人的 @ 一律受理、和真人一致，仍只答疑）。**没有「按群开关」**（第 11 轮起：用户决定答疑默认开，已绑定需求群里的非属主真人 @ 机器人就会起；第 7 轮的「按群显式开启、默认关」整个撤掉）；
  *    ② `readOnly: true`——只剩 read / grep / glob，没有 shell / 写类（pi 路径本地装配强制；
  *    Cursor 路径靠 SDK 的 allowed-tools 服务端强制、本地无法验证；不再是 honor-system）；
  *    ③ 公司环境只给脱敏声明（loadBypassCompanyEnvSection：不同步凭据文件、不给路径、不给脚本用法）；
@@ -37,7 +37,7 @@
  *    ⚠️ 残余：Cursor 路径的 read 由 SDK 本地执行、没有路径约束（pi 路径的 read 才有 isBypassBlockedReadPath 凭据文件守卫）；
  *    prompt 里给了事件日志的绝对路径，agent 能推出数据根、进而读 config.json（provider key / GitLab PAT）与 company-env.json——
  *    所以仍只适合可信内部群（详见下面 startRestrictedGroupQuestion 里的注释）。
- *    准入闸里真正生效的只有「机器人发件人拒绝」；租户 / 外部成员闸当前拿不到数据、不生效（见 restricted-qa-gate.ts）。
+ *    准入闸里租户 / 外部成员两道当前拿不到数据、不生效，机器人也恒放行（见 restricted-qa-gate.ts），所以防线靠 ②③④。
  *    有 `groupContext` 时再多拼三段上下文（群里有谁 / 任务状态快照 / 群里最近聊天）+ 回复规矩，
  *    段落格式化见 feishu-bridge/group-answer-context.ts；拉取整体硬超时 3 秒、失败降级为空，不拖慢起 agent。
  *    答疑 agent 每个问题都是全新的、没有记忆——这些就是它对「群里刚发生了什么」的全部认知。
@@ -59,6 +59,7 @@ import { buildReadonlyUserMessage, getPendingAsk } from "./chat-pending";
 import {
   buildTaskStateSnapshot,
   formatRecentChatSection,
+  formatReplyRulesSection,
   formatRosterSection,
 } from "./feishu-bridge/group-answer-context";
 import { finalizeSideRunBackgroundShells } from "./finalize-open-tools";
@@ -131,7 +132,7 @@ interface GroupPromptSections {
   roster: string[];
   state: string[];
   chat: string[];
-  /** `buildGroupReplyRules` 的输出 */
+  /** `formatReplyRulesSection` 的输出 */
   replyRules: string[];
 }
 
@@ -182,7 +183,7 @@ const loadGroupPromptSections = async (
   // 每个模块只 import 一次、各项共用同一个 promise（别让并行的 8 项各自重复动态 import 同一模块）
   const rosterMod = lazyImport(() => import("./feishu-bridge/group-roster"));
   const larkMod = lazyImport(() => import("./feishu-bridge/lark-api"));
-  const [roster, history, identity, selfOpenId, selfName, waiting, queued, rules] =
+  const [roster, history, identity, selfOpenId, selfName, waiting, queued] =
     await Promise.all([
       softTimeout(async () => (await rosterMod()).fetchGroupRoster(gc.chatId), null),
       softTimeout(
@@ -210,10 +211,6 @@ const loadGroupPromptSections = async (
         const m = await import("./feishu-bridge/group-shared");
         return m.groupQuestionQueueLength(task.id);
       }, 0),
-      softTimeout(async () => {
-        const m = await import("./feishu-bridge/group-reply-protocol");
-        return m.buildGroupReplyRules({ requesterIsBot: gc.requester.isBot });
-      }, [] as string[]),
     ]);
 
   const members = roster?.members ?? [];
@@ -258,7 +255,7 @@ const loadGroupPromptSections = async (
       selfOpenId: selfOpenId ?? undefined,
       selfName: selfName ?? undefined,
     }),
-    replyRules: rules,
+    replyRules: formatReplyRulesSection({ requesterIsBot: gc.requester.isBot }),
   };
 };
 
@@ -309,14 +306,14 @@ const buildRestrictedPrompt = (args: {
     "# 对方的话",
     args.askedText,
     "",
-    // 回复协议（NO_REPLY / @ 规则 / 需属主确认标记）；排在「边界」之前——边界必须是最后一段
+    // 回复守则（NO_REPLY / @ 写法 / 不替属主拍板）；排在「边界」之前——边界必须是最后一段
     ...(g ? section("# 回复规矩", g.replyRules) : []),
     "# 边界",
     "- 非属主只读答疑，三条红线：不改任何文件、不执行命令（你手里只有 read / grep 这类只读工具，没有 shell）；部署、发布、上线与线上分支先找属主确认；查不到的如实说查不到，别猜",
     "- 答完自然结束回复",
     ...(g
       ? [
-          "- 需要属主拍板的事不要替他答应，用「回复规矩」里的「需属主确认」标记转给他",
+          "- 需要属主拍板的事不要替他答应，按「回复规矩」里「不替属主拍板」处理",
         ]
       : []),
   ].join("\n");

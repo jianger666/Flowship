@@ -444,13 +444,17 @@ const SettingsPage = () => {
                 onFeishuChatBridgeChange={(v) =>
                   saveFieldValue("feishuChatBridge", v)
                 }
+                feishuBridgeStreaming={settings.feishuBridgeStreaming !== false}
+                onFeishuBridgeStreamingChange={(v) =>
+                  saveFieldValue("feishuBridgeStreaming", v)
+                }
                 feishuGroupNonOwnerGuard={settings.feishuGroupNonOwnerGuard !== false}
                 onFeishuGroupNonOwnerGuardChange={(v) =>
                   saveFieldValue("feishuGroupNonOwnerGuard", v)
                 }
-                feishuGroupAllowBots={settings.feishuGroupAllowBots !== false}
-                onFeishuGroupAllowBotsChange={(v) =>
-                  saveFieldValue("feishuGroupAllowBots", v)
+                feishuGroupBotsEqualRights={settings.feishuGroupBotsEqualRights === true}
+                onFeishuGroupBotsEqualRightsChange={(v) =>
+                  saveFieldValue("feishuGroupBotsEqualRights", v)
                 }
               />
               <Separator />

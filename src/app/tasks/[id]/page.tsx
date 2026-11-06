@@ -238,7 +238,7 @@ const TaskDetailPage = () => {
     applyToolOutputSnapshot,
   } = useLiveToolOutputs();
   // 旁路（需求群受限答疑）run 在不在飞：不再进页面状态（第四轮 Q5-01）——它的过程事件整条被
-  // isHiddenFromEventStream 藏进「群问答」tab，主流里没有旁路工具块要画；并进「运行中」只会让组尾冒出
+  // isHiddenFromEventStream 藏起来（过程只在轮次卡的「查看过程」里），主流里没有旁路工具块要画；并进「运行中」只会让组尾冒出
   // 「处理中…」转圈。SSE 的 restricted_run 帧仍会发，只是页面不消费。
   // 主 run 进行中 latch：runStatus 一进入 running 就锁上，只在 done 事件（或重连时服务端快照校准）才松。
   // 服务端已经让「交卷后收尾旁白还在跑」期间 runStatus 保持 running（task-runner 的 runActionPostCheck 里
@@ -260,8 +260,6 @@ const TaskDetailPage = () => {
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
-  // 群问答 tab 可见时隐藏底部输入条（只读 tab 下输入框会误导用户在此发言）
-  const [groupQaVisible, setGroupQaVisible] = useState(false);
   // task 模式待送达队列（SSE talk_queue 帧维护整份快照；切任务清空，新任务 bootstrap 会补发）
   const [talkQueue, setTalkQueue] = useState<TalkQueueItem[]>([]);
   // 存储降级（SSE storage_degraded 帧维护；null = 没降级）：事件写盘失败期间事件流顶部常驻红条；
@@ -1601,37 +1599,31 @@ const TaskDetailPage = () => {
                       local: true,
                     }))}
                   // 必传：漏了会让运行中的长 shell / subagent 被当成脏数据渲染成「已中断」。
-                  // 旁路答疑（需求群非属主提问）的过程事件整条隐藏在「群问答」tab，不并进来（Q5-01）
+                  // 旁路答疑（需求群非属主提问）的过程事件不并进主事件流（只在轮次卡的「查看过程」里，Q5-01）
                   isRunning={runFlags.isRunning}
                   // 属主主 run：错误卡「当轮失败」资格 / 状态行 / 状态槽 / 组尾占位只看它（与 isRunning 同值，保留两个 prop）
                   mainRunActive={runFlags.mainRunActive}
                   onPrependEvents={handlePrependEvents}
                   onTaskUpdate={absorbTask}
-                  onGroupQaVisibleChange={setGroupQaVisible}
                   // 事件写盘失败（磁盘满 / 只读…）期间事件流顶部常驻红条；SSE storage_degraded 帧维护
                   storageDegraded={storageDegraded}
                 />
                 </StreamActionsProvider>
               </div>
-              {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文）
-                  群问答 tab 可见时隐藏：只读 tab 下输入框会误导用户在此发言 */}
-              {groupQaVisible ? null : (
-                <>
-                <TalkQueueBanner task={task} talkQueue={talkQueue} />
-                {/* 会话里已设的定时（AI 给自己设的「到点叫我」）；没有时整条收起。chat 的同一条在 EventStream 里 */}
-                <ScheduleChip taskId={task.id} events={task.events} inset />
-                <TaskTalkComposer
-                  task={task}
-                  onTaskUpdate={absorbTask}
-                  onStop={() => void handleStop()}
-                  stopping={stopping}
-                  // 吃 runFlags.mainRunActive（含 runStatus 补位）：裸 latch 初值 false，打开正在跑的 task 首帧会画「发送」键（Q5-05）
-                  runActive={runFlags.mainRunActive}
-                  onPendingAdd={addTalkPending}
-                  onPendingRemove={removeTalkPending}
-                />
-                </>
-              )}
+              {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文） */}
+              <TalkQueueBanner task={task} talkQueue={talkQueue} />
+              {/* 会话里已设的定时（AI 给自己设的「到点叫我」）；没有时整条收起。chat 的同一条在 EventStream 里 */}
+              <ScheduleChip taskId={task.id} events={task.events} inset />
+              <TaskTalkComposer
+                task={task}
+                onTaskUpdate={absorbTask}
+                onStop={() => void handleStop()}
+                stopping={stopping}
+                // 吃 runFlags.mainRunActive（含 runStatus 补位）：裸 latch 初值 false，打开正在跑的 task 首帧会画「发送」键（Q5-05）
+                runActive={runFlags.mainRunActive}
+                onPendingAdd={addTalkPending}
+                onPendingRemove={removeTalkPending}
+              />
             </aside>
           </ResizablePanel>
         </ResizablePanelGroup>

@@ -184,20 +184,17 @@ export interface CardMapStore {
   lastProcessedTs: string;
 }
 
-/** 卡片熔断器打开时的回调入参（card-stream → outbound） */
-export interface CardStreamBreakerInfo {
+/** 卡片发生致命故障时的回调入参（card-stream → outbound） */
+export interface CardStreamFatalInfo {
   /** 连续失败次数 */
   consecutiveFails: number;
-  /** 多久后放行下一次探测（ms） */
-  retryInMs: number;
   /** 最近一次失败（已瘦身：一行摘要 + 错误码 / 命令 / log_id 等结构化字段，不带 raw） */
   error: unknown;
   /**
-   * 仅「致命」故障才有（B4-3）：这类故障再试也不会好，熔断不会半开探测——
+   * 致命故障类别（B4-3）：这类故障再试也不会好，card-stream 不再自己重试、只等 finalize 收尾——
    * `gone` / `auth`：本轮不再同步到飞书；`too_long`：结束时发截断版；`stream_closed`：流式重开次数用完、结束时整卡同步一次。
-   * 普通熔断（连续失败 / 限流 / 瞬时）没有这个字段，对象形状与 B1 完全一致。
    */
-  fatalKind?: LarkFailureKind;
+  fatalKind: LarkFailureKind;
 }
 
 /** createCardStream 构造选项 */
@@ -213,12 +210,12 @@ export interface CardStreamOptions {
    */
   streaming?: boolean;
   /**
-   * 持续性故障才调：熔断累计第 2 次跳闸（= 首次探测仍失败）时调一次，每张卡最多一次。
-   * 1–2 秒的小抖动 3 连败即跳闸、首次探测就恢复了——那种不会调，免得给用户一条转瞬即逝的「已暂停」。
+   * 致命故障（再试也不会好：卡没了 / 没权限 / 内容超限 / 流式重开用完）才调，每张卡最多一次。
+   * 普通失败（限流 / 瞬时 / 未知）只拉长重试间隔、不回调——不再有「连续失败 → 暂停」的熔断。
    * 用途：outbound 当场落一条 info——不用等 finalize，用户此刻就知道「飞书卡片在掉线」。
    * 回调自己抛的异常会被吞：观测回调不能拖垮卡片流。
    */
-  onBreakerOpen?: (info: CardStreamBreakerInfo) => void;
+  onFatal?: (info: CardStreamFatalInfo) => void;
 }
 
 /** start() 时可选的 app 侧回显 */
@@ -257,17 +254,17 @@ export interface CardStreamFinalizeOpts {
 /**
  * 卡片同步健康度：outbound 用它判定「用户在飞书里看到的是不是完整回复」。
  * 累计失败数（failCount）会随偶发抖动只增不减，不能当「现在是否同步失败」的依据——
- * 看 finalizeOk（终稿到没到）和 breakerOpen（此刻是否在持续失败）。
+ * 看 finalizeOk（终稿到没到）和 fatalActive（此刻是否处于未恢复的致命故障）。
  */
 export interface CardStreamHealth {
   /** lark 调用累计失败次数（同 getFailCount） */
   failCount: number;
   /** 当前连续失败次数；任一次成功即清零 */
   consecutiveFails: number;
-  /** 熔断器此刻是否打开（打开 = 近期在持续失败，流式更新被暂停、只放行探测） */
-  breakerOpen: boolean;
-  /** 本卡生命周期内熔断器是否打开过（后来恢复了也算：中途丢过流式更新） */
-  breakerEverOpened: boolean;
+  /** 此刻是否处于未恢复的致命故障（= `fatalKind !== undefined`；任一次写成功即恢复） */
+  fatalActive: boolean;
+  /** 本卡生命周期内是否发生过致命故障（后来恢复了也算：中途丢过流式更新） */
+  fatalEver: boolean;
   /**
    * 终稿内容是否落到了飞书卡片：undefined = 还没 finalize；true = 已落成；
    * false = 没落成——含「start 就失败、这一轮飞书里根本没有卡」（用户看到的可能是半截内容，也可能什么都没有）。
@@ -276,7 +273,7 @@ export interface CardStreamHealth {
   finalizeOk?: boolean;
   /** 最近一次失败（已瘦身：一行摘要 + 结构化字段，不带 raw；可能是 LarkApiError） */
   lastError?: unknown;
-  /** 致命故障的类别（见 `CardStreamBreakerInfo.fatalKind`）；没有致命故障 = undefined */
+  /** 致命故障的类别（见 `CardStreamFatalInfo.fatalKind`）；没有致命故障 = undefined */
   fatalKind?: LarkFailureKind;
   /**
    * 终稿为了塞进飞书卡片被截断过（卡片体积 / 命令行超限，B4-3）：true = 飞书里是截断版、完整回复在 app 里；
@@ -306,7 +303,7 @@ export interface CardStreamHandle {
    * 只增不减、偶发抖动也会累加——判断「现在是否同步失败」请用 getHealth。
    */
   getFailCount: () => number;
-  /** 当前同步健康度（熔断器 + finalize 结果） */
+  /** 当前同步健康度（致命故障态 + finalize 结果） */
   getHealth: () => CardStreamHealth;
   /** 发出后的飞书 message_id / card_id（start 成功后才有） */
   getIds: () => { messageId?: string; cardId?: string };
@@ -415,7 +412,7 @@ export const isTransientLarkError = (err: unknown): boolean => {
  * - `auth`：权限 / 身份（缺 scope、token 失效、应用无权操作这张卡、机器人不在会话）——再试也没用
  * - `too_long`：内容 / 参数超限（卡片体积 200860、本地命令行超长 ARGV_TOO_LONG / ENAMETOOLONG）——要缩内容
  * - `transient`：传输瞬时（断网 / 超时 / 5xx / 卡片正在交互中 200810）——退避后重试
- * - `unknown`：认不出来——按保守默认处理（连续失败熔断）
+ * - `unknown`：认不出来——按保守默认处理（当普通失败：拉长重试间隔）
  *
  * ⚠️ 错误码取自飞书开放平台 CardKit / 通用错误码文档，其中仓库内**有真机样例**的只有
  * 99991672 / 230002 / 300317（见各处注释）；其余没有真机样例，认不出就落到 `unknown`，不会误判成致命。

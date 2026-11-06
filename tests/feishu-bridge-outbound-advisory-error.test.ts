@@ -63,8 +63,8 @@ const makeCard = () => ({
   getHealth: () => ({
     failCount: 0,
     consecutiveFails: 0,
-    breakerOpen: false,
-    breakerEverOpened: false,
+    fatalActive: false,
+    fatalEver: false,
     finalizeOk: true as boolean | undefined,
     lastError: undefined as unknown,
   }),

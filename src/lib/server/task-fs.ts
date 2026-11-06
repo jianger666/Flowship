@@ -2659,6 +2659,27 @@ export const setTaskGroupAssociation = async (
     return hydrateTask(meta);
   });
 
+/**
+ * 写本任务「群答疑回复是否流式」的任务级覆盖（需求群弹窗里的开关）。
+ *
+ * - `true` / `false` = 这个任务自己的选择；`null` = 清掉覆盖、跟随设置页的全局「流式回复」。
+ * - 只改这一个字段、**不刷 `updatedAt`**：这是个偏好开关，不是「刚操作了任务」——
+ *   刷了会让任务顶到列表最前、清侧栏琥珀点（跟群关联那种「刚动手」的口径不同）。
+ * - 返回 hydrate 后的最新 Task；任务不存在返回 null。
+ */
+export const setTaskGroupStreaming = async (
+  id: string,
+  value: boolean | null,
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    if (value === null) delete meta.feishuGroupStreaming;
+    else meta.feishuGroupStreaming = value;
+    await writeMeta(meta);
+    return hydrateTask(meta);
+  });
+
 export const updateTaskFields = async (
   id: string,
   input: UpdateTaskFieldsInput,

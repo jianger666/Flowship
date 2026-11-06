@@ -63,15 +63,15 @@ export const isHiddenFromEventStream = (
   // 回合内工具失败误写成 kind=error（红卡留给整轮崩溃）
   if (isInTurnToolErrorEvent(ev)) return true;
   // 旁路答疑（无活会话降级通道 / 老版本数据）的问题事件：藏。问与答由下面的「轮次汇总」内联卡
-  // 一并呈现（卡里带问题原文），群问答 tab 留作完整列表 + 「待你决定」汇总 + 进行中轮次 + 过程。
+  // 一并呈现（卡里带问题原文）；过程在卡的「查看过程」里。
   // 属主群消息（无 runTag）不在此列。
-  // 注意：轮次汇总事件（groupQaSummary）**不再隐藏**——2026-11-04「群问答并进事件流」：
-  // 做完的旁路轮次直接以卡片形态出现在事件流里（见 group-qa-inline-row），不必切 tab 才看得到。
-  // 进行中 / 被打断（没有汇总）的轮次仍只在 tab（tab 上的蓝点提示）。
+  // 注意：轮次汇总事件（groupQaSummary）**不隐藏**——2026-11-04「群问答并进事件流」、
+  // 2026-11-05 去掉「群问答」页签：做完的旁路轮次直接以卡片形态出现在事件流里（见 group-qa-inline-row），
+  // 群里的提问只有事件流这一个去处。进行中的轮次靠开跑时落的那条 info 提示；被打断（没有汇总）的不留卡。
   if (isGroupQaQuestionEvent(ev)) return true;
-  // 答疑旁路 run 的过程事件（meta.groupRun = runTag，不论 kind）：归「群问答」tab 的「查看过程」，
+  // 答疑旁路 run 的过程事件（meta.groupRun = runTag，不论 kind）：归问答卡的「查看过程」，
   // 不混进属主自己的会话。error 也在此列——它是别人提问触发的旁路 run 失败，不是属主自己运行的错误，
-  // 属主主流不该被它吹爆（失败本身 tab 里该轮有「失败」标 + 过程里有 error 行）。
+  // 属主主流不该被它吹爆（失败本身该轮的问答卡有「失败」标 + 过程里有 error 行）。
   // 「属主自己运行的错误永远可见」的既有原则不受影响：属主主链的事件不会带 groupRun。
   if (groupRunTagOf(ev) !== "") return true;
   if (opts?.isChat) {

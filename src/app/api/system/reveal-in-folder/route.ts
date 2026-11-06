@@ -19,7 +19,7 @@ export const runtime = "nodejs";
 const runSpawn = (
   command: string,
   args: string[],
-  opts?: { ignoreNonZeroExit?: boolean },
+  opts?: { ignoreNonZeroExit?: boolean; windowsVerbatimArguments?: boolean },
 ): Promise<string | null> =>
   new Promise((resolve) => {
     // env 剔宿主注入变量（同 open-path，R10b-05）：被拉起的文件管理器 / 其默认处理程序不继承宿主变量
@@ -27,6 +27,8 @@ const runSpawn = (
       stdio: "ignore",
       detached: true,
       env: stripHostInjectedEnvAndGitToken(),
+      // Windows 的 explorer /select,"…" 不能让 Node 重新加引号（见 OsSpawnSpec.windowsVerbatimArguments）；其它平台忽略
+      ...(opts?.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
     child.on("error", () => resolve(`无法执行 ${command}`));
     child.on("exit", (code) => {
@@ -61,11 +63,12 @@ export const POST = async (req: Request) => {
     );
   }
 
-  const { command, args, ignoreNonZeroExit } = buildRevealInFolderSpec(
-    p,
-    os.platform(),
-  );
-  const failure = await runSpawn(command, args, { ignoreNonZeroExit });
+  const { command, args, ignoreNonZeroExit, windowsVerbatimArguments } =
+    buildRevealInFolderSpec(p, os.platform());
+  const failure = await runSpawn(command, args, {
+    ignoreNonZeroExit,
+    windowsVerbatimArguments,
+  });
   if (failure) return NextResponse.json({ error: failure }, { status: 400 });
   return NextResponse.json({ ok: true });
 };

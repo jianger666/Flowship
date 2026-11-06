@@ -36,16 +36,22 @@ import {
   GROUP_NON_OWNER_GUARD_DEFAULT,
   GROUP_NON_OWNER_GUARD_PROMPT_PREVIEW,
   NON_OWNER_TURN_ALLOWED_TOOLS,
+  buildBotEtiquetteNote,
   buildNonOwnerGroupHeader,
   buildNonOwnerGuardFootnote,
   buildNonOwnerToolDenied,
 } from "@/lib/group-non-owner-prompt";
+import { isFieldEqual } from "@/hooks/use-settings";
+import { DEFAULT_SETTINGS, normalizeSettings } from "@/lib/local-store";
 import { buildAgentMessage } from "@/lib/server/chat-pending";
 import {
   invokeFlowshipTool,
   type FlowshipToolDef,
 } from "@/lib/server/flowship-tools";
-import { isGroupNonOwnerGuardEnabled } from "@/lib/server/group-non-owner-guard-config";
+import {
+  isGroupBotsEqualRights,
+  isGroupNonOwnerGuardEnabled,
+} from "@/lib/server/group-non-owner-guard-config";
 import {
   NON_OWNER_TURN_TTL_MS,
   __resetNonOwnerTurnGuardForTest,
@@ -69,7 +75,7 @@ describe("提示词模块（纯字符串）", () => {
     );
   });
 
-  it("约束段：四条规则 + 点名发言人 + NO_REPLY / 需属主确认 / @宿主 的回复约定", () => {
+  it("约束段：四条规则 + 点名发言人 + NO_REPLY 的回复约定（回复协议已下线：不再有需属主确认标记 / @宿主）", () => {
     const t = buildNonOwnerGuardFootnote("李四");
     expect(t).toContain("李四");
     expect(t).toContain("只答疑");
@@ -79,9 +85,9 @@ describe("提示词模块（纯字符串）", () => {
     }
     expect(t).toContain("令牌");
     expect(t).toContain("NO_REPLY");
-    expect(t).toContain("[[需属主确认");
-    expect(t).toContain("@李四");
-    expect(t).toContain("@宿主");
+    expect(t).not.toContain("[[需属主确认");
+    expect(t).not.toContain("@宿主");
+    expect(t).toContain("自动 @ 提问人");
   });
 
   it("设置页预览与实际发送同一份（占位符 {发言人}）", () => {
@@ -136,6 +142,144 @@ describe("buildAgentMessage：约束段取代默认脚注、且是最后一段",
     });
     expect(ack).not.toContain("非任务所有者「");
     expect(ack).toContain("〈产出审阅中〉");
+  });
+});
+
+describe("机器人克制提示（同权但仍防互 @ 成环）", () => {
+  const base = {
+    kind: "user_message" as const,
+    text: "[群消息·来自 别家机器人（机器人，非任务所有者）]\n这个接口返回啥？",
+  };
+
+  it("buildBotEtiquetteNote：只有克制规则（必须 @ 它 / 没问实质问题 NO_REPLY / 别客套），**没有**「只答疑」限制", () => {
+    const t = buildBotEtiquetteNote("别家机器人");
+    expect(t).toContain("机器人「别家机器人」");
+    expect(t).toContain("必须在正文里 @ 它");
+    expect(buildBotEtiquetteNote("别家机器人", "ou_otherbot")).toContain(
+      '<at user_id="ou_otherbot">别家机器人</at>',
+    );
+    expect(t).toContain("NO_REPLY");
+    expect(t).toContain("别回「收到」");
+    expect(t).not.toContain("不修改任何文件");
+    expect(t).not.toContain("不调用 submit_work");
+  });
+
+  it("与约束段里机器人变体的第 4 条是同一份规则（不漂移）", () => {
+    const rule = buildBotEtiquetteNote("别家机器人").replace(/^（[^。]*。/, "").replace(/）$/, "");
+    expect(buildNonOwnerGuardFootnote("别家机器人", { isBot: true })).toContain(`4. ${rule}`);
+  });
+
+  it("buildAgentMessage：groupBotEtiquette → 默认脚注 + 克制提示在最后；没带约束段", () => {
+    const out = buildAgentMessage({ ...base, groupBotEtiquette: { name: "别家机器人" } });
+    expect(out).toContain("**修改要求**才动手改");
+    expect(out.endsWith(buildBotEtiquetteNote("别家机器人"))).toBe(true);
+    expect(out).not.toContain("本轮规则：");
+  });
+
+  it("带了约束段就不重复追加克制提示（约束段里已含同一份规则）", () => {
+    const out = buildAgentMessage({
+      ...base,
+      groupNonOwnerGuard: { name: "别家机器人", isBot: true },
+      groupBotEtiquette: { name: "别家机器人" },
+    });
+    expect(out.endsWith(buildNonOwnerGuardFootnote("别家机器人", { isBot: true }))).toBe(true);
+    expect(out.split("两个机器人互相客气会无限循环下去").length - 1).toBe(1);
+  });
+
+  it("不传 groupBotEtiquette（真人 / 属主）：不出现克制提示", () => {
+    expect(buildAgentMessage(base)).not.toContain("别回「收到」");
+  });
+});
+
+describe("机器人与真人同权：设置读取（isGroupBotsEqualRights）", () => {
+  const BASE = { apiKey: "", defaultModel: { id: "" }, repos: [] };
+  const write = (extra: Record<string, unknown> = {}) =>
+    fs.writeFile(settingsFilePath(), JSON.stringify({ ...BASE, ...extra }), "utf-8");
+  const readDisk = async (): Promise<Record<string, unknown>> =>
+    JSON.parse(await fs.readFile(settingsFilePath(), "utf-8")) as Record<string, unknown>;
+
+  beforeEach(async () => {
+    await fs.rm(TMP_ROOT, { recursive: true, force: true });
+    await fs.mkdir(TMP_ROOT, { recursive: true });
+  });
+
+  it("没有设置文件 / 缺省字段 → 关（默认：机器人只答疑）", async () => {
+    expect(await isGroupBotsEqualRights()).toBe(false);
+    await write();
+    expect(await isGroupBotsEqualRights()).toBe(false);
+  });
+
+  it("只认显式 true：true → 开；false / 脏值（字符串 \"true\"、1）→ 关", async () => {
+    await write({ feishuGroupBotsEqualRights: true });
+    expect(await isGroupBotsEqualRights()).toBe(true);
+    await write({ feishuGroupBotsEqualRights: false });
+    expect(await isGroupBotsEqualRights()).toBe(false);
+    await write({ feishuGroupBotsEqualRights: "true" });
+    expect(await isGroupBotsEqualRights()).toBe(false);
+    await write({ feishuGroupBotsEqualRights: 1 });
+    expect(await isGroupBotsEqualRights()).toBe(false);
+  });
+
+  it("设置文件损坏 → 关（fail-closed，宁可多约束），不抛", async () => {
+    await fs.writeFile(settingsFilePath(), "{ not json", "utf-8");
+    expect(await isGroupBotsEqualRights()).toBe(false);
+  });
+
+  it("读设置**抛错**（readSettingsFile 直接 reject，不是 status 非 ok）→ 关（fail-closed）；提示词开关同口径 → 开（默认）", async () => {
+    // 第 21 轮评审 T1：现有用例只钉了 status !== "ok" 分支，没钉 catch 分支（catch 里 return true 即读盘抛错时 fail-open 放机器人同权）；
+    // 同第 20 轮 M5b：doMock 换掉 settings-fs，在全新模块实例里验证
+    vi.resetModules();
+    vi.doMock("@/lib/server/settings-fs", () => ({
+      readSettingsFile: async () => {
+        throw new Error("EIO: simulated disk failure");
+      },
+    }));
+    try {
+      const fresh = await import("@/lib/server/group-non-owner-guard-config");
+      expect(await fresh.isGroupBotsEqualRights()).toBe(false);
+      expect(await fresh.isGroupNonOwnerGuardEnabled()).toBe(true);
+    } finally {
+      vi.doUnmock("@/lib/server/settings-fs");
+      vi.resetModules();
+    }
+  });
+
+  it("设置页「有未保存改动」的比较（isFieldEqual）：缺省 ≡ false，与 true 不等（第 21 轮评审 T2：归类写成 boolTrue 会误报）", () => {
+    const base = { apiKey: "", defaultModel: { id: "" }, repos: [] } as never;
+    const on = { ...(base as object), feishuGroupBotsEqualRights: true } as never;
+    const off = { ...(base as object), feishuGroupBotsEqualRights: false } as never;
+    expect(isFieldEqual("feishuGroupBotsEqualRights", base, off)).toBe(true);
+    expect(isFieldEqual("feishuGroupBotsEqualRights", base, base)).toBe(true);
+    expect(isFieldEqual("feishuGroupBotsEqualRights", base, on)).toBe(false);
+    expect(isFieldEqual("feishuGroupBotsEqualRights", off, on)).toBe(false);
+  });
+
+  it("设置页读到的值（normalizeSettings）：默认 false；只认显式 true；不影响提示词开关的默认", () => {
+    expect(DEFAULT_SETTINGS.feishuGroupBotsEqualRights).toBe(false);
+    expect(normalizeSettings({}).feishuGroupBotsEqualRights).toBe(false);
+    expect(normalizeSettings(null).feishuGroupBotsEqualRights).toBe(false);
+    expect(
+      normalizeSettings({ feishuGroupBotsEqualRights: true }).feishuGroupBotsEqualRights,
+    ).toBe(true);
+    expect(
+      normalizeSettings({ feishuGroupBotsEqualRights: "true" as unknown as boolean })
+        .feishuGroupBotsEqualRights,
+    ).toBe(false);
+    expect(normalizeSettings({}).feishuGroupNonOwnerGuard).toBe(true);
+  });
+
+  it("PATCH 字段级保存放行并落盘（KNOWN_SETTINGS_KEYS 登记过），随后现读即生效", async () => {
+    await write();
+    const res = await PATCH(
+      new Request("http://localhost/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ patch: { feishuGroupBotsEqualRights: true } }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect((await readDisk()).feishuGroupBotsEqualRights).toBe(true);
+    expect(await isGroupBotsEqualRights()).toBe(true);
   });
 });
 

@@ -16,6 +16,7 @@ import { stripHostInjectedEnvAndGitToken } from "@/lib/server/host-env";
 import { nonLocalPathReason } from "@/lib/unc-path";
 
 import { getBridgeDataDir } from "./bridge-config";
+import { CARD_BASE_CONFIG } from "./card-config";
 import type { BotAppInfo, BotSelfInfo, SendMessageResult } from "./types";
 import { isTransientLarkError, LARK_ARGV_TOO_LONG_CODE, LarkApiError } from "./types";
 
@@ -698,7 +699,7 @@ const CARD_MD_SEGMENT_RE =
 /**
  * 把「发 text / post 时代」的正文转成卡片 markdown 能正确渲染的写法（纯函数）：
  *
- * 1. **@ 语法不同**：上游（`group-shared.mentionTag`、回复协议、提测 @）统一产出
+ * 1. **@ 语法不同**：上游（`group-shared.mentionTag`、agent 回复里的 @ 标签、提测 @）统一产出
  *    `<at user_id="ou_x">名</at>`——text / post 认这个；卡片 markdown 要写 `<at id=ou_x></at>`
  *    （显示名由飞书按 id 自动补）。上游不跟着改：协议解析 / 切块防切断都围着旧写法转，
  *    只在最后一跳转换。id 不合法 → 退化成 `@名`，至少看得出在叫谁。
@@ -740,6 +741,9 @@ const summarizeForCard = (text: string): string =>
     .slice(0, CARD_SUMMARY_MAX)
     .join("");
 
+/** 文本卡里那个 markdown 元素的 id（群答疑流式卡按它推打字机内容） */
+export const MARKDOWN_CARD_ELEMENT_ID = "md_text";
+
 /**
  * 群里「一段文字」的卡片：无 header、无 footer、只有一个 markdown 元素——
  * 视觉上尽量接近一条普通消息，系统回执（「已开始跑 XX」）不至于变成一张张大卡刷屏。
@@ -747,19 +751,40 @@ const summarizeForCard = (text: string): string =>
  */
 export const buildMarkdownCardJson = (
   markdown: string,
+  opts: {
+    /**
+     * 群答疑流式（group-card-stream）：`true` = 开 CardKit streaming_mode（打字机，摘要写「生成中」）；
+     * `false` = 显式关（流式卡收尾的整卡 PUT 必须带 false，否则飞书侧一直显示「生成中」）；
+     * 省略 = 普通静态卡，config 与改前逐字一致。
+     */
+    streaming?: boolean;
+  } = {},
 ): Record<string, unknown> => {
   const summary = summarizeForCard(markdown);
+  const streaming = opts.streaming;
   return {
     schema: "2.0",
     config: {
-      update_multi: true,
-      ...(summary ? { summary: { content: summary } } : {}),
+      ...(streaming === undefined ? {} : { streaming_mode: streaming }),
+      ...CARD_BASE_CONFIG,
+      ...(streaming === true
+        ? {
+            summary: { content: "生成中" },
+            streaming_config: {
+              print_frequency_ms: { default: 70 },
+              print_step: { default: 1 },
+              print_strategy: "fast",
+            },
+          }
+        : summary
+          ? { summary: { content: summary } }
+          : {}),
     },
     body: {
       elements: [
         {
           tag: "markdown",
-          element_id: "md_text",
+          element_id: MARKDOWN_CARD_ELEMENT_ID,
           content: toCardMarkdown(markdown),
         },
       ],
@@ -1140,23 +1165,92 @@ export const parseMgetMessages = (
 };
 
 /**
- * 按 message_id 单条取消息正文（关联消费：空 @ 指回卡片时把被指内容取回来）。
+ * `+messages-mget` 单条详情（引用消息用）：正文 + 类型 + 发送人 + 所在群。
+ *
+ * 字段形态与 `+chat-messages-list`（parseHistoryResponse）同源（lark-cli 同一套 compact 转换）：
+ * `sender.{id, sender_type(user|app), name, open_bot_id}`；机器人的 `sender.id` 是 app_id（cli_…）、
+ * 真正能 @ 的 open_id 在 `open_bot_id`。取不到的字段一律空串 / unknown，调用方按「缺了就不判」处理。
+ */
+export interface InboundMessageDetail {
+  text: string;
+  msgType: string;
+  /** 回包里的 message_id（缺则空串） */
+  messageId: string;
+  /** 所在会话（回包有才有；调用方据此核对「引用的确实是本群的消息」） */
+  chatId: string;
+  /** 已撤回 / 已删除 */
+  deleted: boolean;
+  sender: {
+    kind: "user" | "bot" | "unknown";
+    /** 能 @ 的 open_id（机器人取 open_bot_id，缺了退化成 id） */
+    openId: string;
+    /** 发送方的全部稳定 id（id / open_bot_id），判「是不是本机机器人自己」多格比对用 */
+    ids: string[];
+    name: string;
+  };
+}
+
+const mgetStr = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** `+messages-mget` 回包 → 详情数组（纯函数；与 parseMgetMessages 同一份 data 抽取口径） */
+export const parseMgetMessageDetails = (rec: unknown): InboundMessageDetail[] => {
+  const raw = rec as { data?: unknown } | null | undefined;
+  const data =
+    raw?.data !== undefined
+      ? (raw.data as Record<string, unknown>)
+      : (rec as Record<string, unknown>);
+  const msgs = Array.isArray(data?.messages)
+    ? (data.messages as Array<Record<string, unknown>>)
+    : [];
+  return msgs.map((m) => {
+    const sender =
+      m.sender && typeof m.sender === "object"
+        ? (m.sender as Record<string, unknown>)
+        : {};
+    const senderType = mgetStr(sender.sender_type);
+    const kind: InboundMessageDetail["sender"]["kind"] =
+      senderType === "app" || senderType === "bot"
+        ? "bot"
+        : senderType === "user"
+          ? "user"
+          : "unknown";
+    const id = mgetStr(sender.id);
+    const openBotId = mgetStr(sender.open_bot_id);
+    return {
+      text: mgetStr(m.content),
+      msgType: mgetStr(m.msg_type) || mgetStr(m.message_type),
+      messageId: mgetStr(m.message_id),
+      chatId: mgetStr(m.chat_id),
+      deleted: m.deleted === true,
+      sender: {
+        kind,
+        openId: kind === "bot" ? openBotId || id : id,
+        ids: [id, openBotId].filter(Boolean),
+        name: mgetStr(sender.name),
+      },
+    };
+  });
+};
+
+/**
+ * 按 message_id 单条取消息（正文 + 发送人 + 所在群）——引用 / 回复上下文用。
  * best-effort：bot 身份先试（群历史同身份曾 230027），失败再试 user，
- * 都失败返回 null（调用方按原逻辑走，不抛、不重试——15s race 只截返回，
+ * 都失败返回 null（调用方按原逻辑走，不抛、不重试——超时只截返回，
  * 底下 runLark 仍占进程级串行队列直到自身 30s 超时；重试只会越堵越死）。interactive 原样返回 content，
  * 由调用方跑 extractInteractiveText。
  */
-export const fetchInboundMessageText = async (
+export const fetchInboundMessageDetail = async (
   messageId: string,
   /** 调用方超时预算ms：默认 15s。入向串行链上的 best-effort 路径传小值（如 5s）——
    * 取不到就按原逻辑走（fail-closed），别把全链（含属主 p2p）堵在后面等。 */
   timeoutMs = 15_000,
-): Promise<{ text: string; msgType: string } | null> => {
+): Promise<InboundMessageDetail | null> => {
   if (!messageId) return null;
   // 入向串行链上跑：总耗时封顶，超时/失败一律 null（调用方按原逻辑走，不抛）。
-  const timeout = new Promise<null>((r) =>
-    setTimeout(() => r(null), timeoutMs),
-  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((r) => {
+    timer = setTimeout(() => r(null), timeoutMs);
+  });
   const work = (async () => {
     for (const as of ["bot", "user"] as const) {
       try {
@@ -1164,16 +1258,32 @@ export const fetchInboundMessageText = async (
           ["im", "+messages-mget", "--message-ids", messageId],
           { as },
         );
-        const first = parseMgetMessages(rec)[0];
-        if (!first || !first.content) return null;
-        return { text: first.content, msgType: first.msgType };
+        const first = parseMgetMessageDetails(rec)[0];
+        if (!first || !first.text) return null;
+        return first;
       } catch {
         // 换下一种身份再试；都失败由外层返回 null
       }
     }
     return null;
   })();
-  return Promise.race([work, timeout]);
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+/**
+ * 按 message_id 单条取消息正文（关联消费：空 @ 指回卡片时把被指内容取回来）。
+ * 语义同 {@link fetchInboundMessageDetail}，只返回正文 + 类型。
+ */
+export const fetchInboundMessageText = async (
+  messageId: string,
+  timeoutMs = 15_000,
+): Promise<{ text: string; msgType: string } | null> => {
+  const d = await fetchInboundMessageDetail(messageId, timeoutMs);
+  return d ? { text: d.text, msgType: d.msgType } : null;
 };
 
 /** 给消息加表情回执 */

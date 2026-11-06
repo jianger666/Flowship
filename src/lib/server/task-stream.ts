@@ -924,7 +924,7 @@ export const PERSIST_FAIL_RETRY_MESSAGE = "消息保存失败、请重试" as co
  *   ① restricted-question 本体（info / error）② sdk-message-handler（thinking / assistant_message /
  *   tool_call / tool_result / info，origin 由 restricted-question 透传，属主主链不传）：这两类就是答疑 run
  *   的事件，该打标；③ group-route 排队回放失败写的 ok:false 汇总（origin 是随机串、只为防投递）：
- *   它是要在群问答 tab / 主流里看见的汇总，不能被折叠，必须传 `{ tagGroupRun: false }`。
+ *   它是要在群问答卡 / 主流里看见的汇总，不能被折叠，必须传 `{ tagGroupRun: false }`。
  */
 export const writeOwnedEventAndPublish = async (
   taskId: string,

@@ -77,6 +77,7 @@ export const TaskUtilityActions = ({ task, onTaskUpdate }: Props) => {
         taskId={task.id}
         hasStory={hasStory}
         onTaskUpdate={onTaskUpdate ?? (() => {})}
+        groupStreaming={task.feishuGroupStreaming}
       />
       {taskDirPath && (
         <Tooltip content="在文件管理器打开任务文件夹">

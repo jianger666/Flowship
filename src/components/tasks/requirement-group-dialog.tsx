@@ -19,6 +19,9 @@
  * - 常驻一行「只绑定可信同事的内部群」（群里任何成员 @ 机器人都等于以属主身份读本机文件）；
  *   第一次手动绑定前再确认一次，点过就记 localStorage、以后不打断（lib/trusted-group-ack）；
  * - 绑完发现这个群上还有别的任务：toast 提示「群里的 @ 只会进其中一个」（lib/group-also-bound），不拦。
+ *
+ * 「群里 AI 的回复方式」三选一（跟随全局 / 流式 / 整条发送，2026-11-06）：任务级覆盖，存 `task.feishuGroupStreaming`，
+ * 只在已有关联的群时显示；点选即存（乐观更新，失败回滚 + toast），不跟「绑定 / 创建」那套主按钮绑在一起。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -43,7 +46,14 @@ import {
   clearRequirementGroupBind,
   ensureRequirementGroup,
   getRequirementGroupStatus,
+  setRequirementGroupStreaming,
 } from "@/lib/task-store";
+import {
+  GROUP_STREAMING_OPTIONS,
+  groupStreamingChoiceOf,
+  groupStreamingValueOf,
+  type GroupStreamingChoice,
+} from "@/lib/group-streaming-choice";
 import type { Task } from "@/lib/types";
 import { isImeComposing } from "@/lib/ime";
 import {
@@ -67,6 +77,8 @@ interface Props {
   hasStory?: boolean;
   /** 关联变更后把服务端回的最新任务刷回页面（不经过它页面里的任务就是旧的） */
   onTaskUpdate: (task: Task) => void;
+  /** 本任务当前的「群回复是否流式」覆盖（`task.feishuGroupStreaming`；缺省 = 跟随全局） */
+  groupStreaming?: boolean;
 }
 
 type Mode = "auto" | "manual";
@@ -89,7 +101,14 @@ const extractChatId = (raw: string): string | null => {
 };
 const countChatIds = (raw: string): number => (raw ?? "").match(CHAT_ID_PATTERN)?.length ?? 0;
 
-export const RequirementGroupDialog = ({ open, onOpenChange, taskId, hasStory = true, onTaskUpdate }: Props) => {
+export const RequirementGroupDialog = ({
+  open,
+  onOpenChange,
+  taskId,
+  hasStory = true,
+  onTaskUpdate,
+  groupStreaming,
+}: Props) => {
   const { confirm } = useDialog();
   const [mode, setMode] = useState<Mode>("auto");
   // 当前关联
@@ -116,6 +135,14 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, hasStory = 
   const loadSeqRef = useRef(0);
   const onTaskUpdateRef = useRef(onTaskUpdate);
   onTaskUpdateRef.current = onTaskUpdate;
+  // 群回复方式：本地值跟着任务字段走（任务刷新 / 切任务时同步），点选时先乐观更新、失败回滚
+  const [streamChoice, setStreamChoice] = useState<GroupStreamingChoice>(() => groupStreamingChoiceOf(groupStreaming));
+  const [streamBusy, setStreamBusy] = useState(false);
+  const streamTaskRef = useRef(taskId);
+  streamTaskRef.current = taskId;
+  useEffect(() => {
+    setStreamChoice(groupStreamingChoiceOf(groupStreaming));
+  }, [groupStreaming, taskId]);
 
   const resetTransient = useCallback(() => {
     setFieldError(null);
@@ -445,6 +472,27 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, hasStory = 
     }
   }, [bound, busy, hasStory, landSuccess, confirm, sessionGuard, taskId]);
 
+  const pickStreaming = useCallback(
+    async (next: GroupStreamingChoice) => {
+      if (streamBusy || next === streamChoice) return;
+      const forTask = taskId;
+      const prev = streamChoice;
+      setStreamChoice(next);
+      setStreamBusy(true);
+      try {
+        const r = await setRequirementGroupStreaming(forTask, groupStreamingValueOf(next));
+        onTaskUpdateRef.current(r.task);
+      } catch (err) {
+        // 请求在途时换了任务：旧任务的失败不回滚新任务的选项，toast 兜底让用户仍知道没存上
+        if (streamTaskRef.current === forTask) setStreamChoice(prev);
+        toast.error(err instanceof Error ? `保存失败：${err.message}` : "保存失败");
+      } finally {
+        setStreamBusy(false);
+      }
+    },
+    [streamBusy, streamChoice, taskId],
+  );
+
   // rebuild 存在时自动模式的主按钮即重建：再跑一遍不带 recreateFrom 的 runAuto 只会
   // 又撞回 needGroupRebuild、白转一圈，所以不给用户留第二个“该点哪个”的选择
   const primary = mode === "auto"
@@ -527,6 +575,35 @@ export const RequirementGroupDialog = ({ open, onOpenChange, taskId, hasStory = 
             </div>
           )}
         </div>
+
+        {/* 群里 AI 的回复方式：只在已有关联的群时显示 */}
+        {!statusLoading && !statusError && !noStory && bound && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-sm font-medium">群里 AI 的回复方式</span>
+            <div className="grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="群里 AI 的回复方式">
+              {GROUP_STREAMING_OPTIONS.map((o) => (
+                <button
+                  key={o.choice}
+                  type="button"
+                  role="radio"
+                  aria-checked={streamChoice === o.choice}
+                  disabled={streamBusy}
+                  onClick={() => void pickStreaming(o.choice)}
+                  className={cn(
+                    "rounded-md border px-2 py-1.5 text-sm transition-colors",
+                    streamChoice === o.choice ? "border-ring bg-accent/60" : "hover:bg-muted/60",
+                  )}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {GROUP_STREAMING_OPTIONS.find((o) => o.choice === streamChoice)?.hint}
+              只管这个任务的群；飞书私聊的流式看设置页的全局开关。
+            </p>
+          </div>
+        )}
 
         {/* 双模式 */}
         <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="关联方式">

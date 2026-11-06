@@ -88,8 +88,9 @@ const KNOWN_SETTINGS_KEYS = [
   "meegleProject",
   "feishuChatBridge",
   "feishuBridgeKeepAwake",
+  "feishuBridgeStreaming",
   "feishuGroupNonOwnerGuard",
-  "feishuGroupAllowBots",
+  "feishuGroupBotsEqualRights",
   "teamKnowledgeEnabled",
   "companyEnv",
 ] as const satisfies readonly (keyof FeAiFlowSettings)[];

@@ -141,9 +141,10 @@ beforeEach(() => {
     isBridgeEnabled: async () => true,
     sendMarkdown,
     sendText: sendTextToChat,
-    fetchRoster: async () => ({ members: [] }),
-    resolveOwner: async () => undefined,
-    getSelfOpenId: async () => null,
+    isStreamingEnabled: async () => false,
+    createGroupCardStream: () => {
+      throw new Error("测试不该走真流式卡");
+    },
     pumpGroupQuestionQueue: async () => {},
   } as never);
 });

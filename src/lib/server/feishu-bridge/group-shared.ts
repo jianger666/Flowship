@@ -48,7 +48,7 @@ import type { ParsedInboundContent } from "./router";
 // 属主 / chat 型 / 答 pendingAsk / **feed 进活会话的**关联回执不排（属主用 app 当主通道，关联数据有时效性）。
 // 注意：**没有活会话的关联回执会排**（它按普通非属主消息走只读旁路，旁路在飞时就是忙线、照常入队）；
 // 入队时不焚登记，回放时 injectGroupMessage 重算 correlated——登记若已在排队期间被焚 / 过期，
-// 回放就按普通消息处理（数据头与 correlatedAnswer 标记随之丢失，且计个人额度；第八轮 L3-03 核实）。
+// 回放就按普通消息处理（数据头与 correlatedAnswer 标记随之丢失；第八轮 L3-03 核实）。
 // 有界：最多攒这么多，满了落回忙线拒收；TTL 过期丢弃（发件人是人才回一句，机器人静默）。
 // 同一条消息（message_id）重复入队（飞书重投 / 重放）只算一次。
 // 队列变化会通知订阅者（task-talk-queue 据此把「群里排队中」推给 UI）。
@@ -62,15 +62,6 @@ export const GROUP_QUESTION_QUEUE_TTL_MS = 30 * 60 * 1000;
  * 就能独占整队。2 个够正常追问一次，又让别人至少有 8 个槽。
  */
 export const GROUP_QUESTION_QUEUE_MAX_PER_SENDER = 2;
-/** 非属主旁路 run 的 per-task 滑动窗长度（G3-02） */
-export const GROUP_BYPASS_RUN_WINDOW_MS = 10 * 60 * 1000;
-/** 滑动窗内最多**启动**几个非属主旁路 run（G3-02，第六轮口径：起了 run 才计）；超限静默丢弃 */
-export const GROUP_BYPASS_RUN_WINDOW_MAX = 12;
-/**
- * 滑动窗内同一发送人最多**启动**几次旁路 run（第六轮）——总上限 12 不变，
- * 这条防「一个人 / 一个机器人把 12 个名额独吞、饿死别人」。
- */
-export const GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER = 4;
 /** 排队中的一个群问题：injectGroupMessage 入参的子集 + 启动凭据快照 */
 export interface QueuedGroupQuestion {
   messageId: string;
@@ -97,39 +88,6 @@ const QUEUE_STATE_KEY = "__flowshipGroupQuestionQueueStateV1__";
 type GroupQuestionQueueState = {
   queues: Map<string, QueuedGroupQuestion[]>;
   listeners: Set<(taskId: string) => void>;
-  /**
-   * 非属主旁路 run 的滑动窗（G3-02，与队列同属「群问答准入」状态，复用这一份 globalThis 状态）：
-   * stamps = 窗内已**启动**的 run（时间 / 发送人 / message_id，message_id 用来重投去重与失败退还）；
-   * noticeAt = 上一次发「总限额」info 的时刻；senderNotices = 各发送人上一次被发「个人限额」info 的时刻
-   * （按发送人分桶：A 撞线提示过，不能吞掉 B 的——属主要知道每个被限的人是谁）；
-   * dropHints = 各发送人上一次收到「排队回放被限流丢弃」群内提示的时刻（K2-02，每窗每人一条）。
-   * 三类各自节流、互不吞对方的提示。
-   */
-  bypassWindows: Map<string, GroupBypassWindow>;
-  /** 合成 messageId 的自增序号（L3-05；只用于日志可读，不参与任何判定） */
-  anonSeq: number;
-};
-type GroupBypassStamp = {
-  t: number;
-  sender: string;
-  messageId: string;
-  /**
-   * 这次启动是关联回执（命中出问登记的托办回执，K2-01）：计总限额、不计个人限额。
-   * 缺省 = 普通消息（旧形状的 stamp 没有这个字段，按普通算）。
-   */
-  receipt?: true;
-  /**
-   * 调用方没给 messageId、由本模块合成 id（`anon:<自增>`）记下的名额（第八轮 L3-05）。
-   * 这类 stamp **不参与**按 id 的重投去重与退还——合成 id 只是占位、不是调用方认得的 id，
-   * 否则一个字面恰为 `anon:3` 的真实 id 会撞上它（被当重投吞掉、或被误退还）。
-   */
-  anon?: true;
-};
-type GroupBypassWindow = {
-  stamps: GroupBypassStamp[];
-  noticeAt: number;
-  senderNotices: Map<string, number>;
-  dropHints: Map<string, number>;
 };
 const getQueueState = (): GroupQuestionQueueState => {
   const g = globalThis as unknown as Record<
@@ -140,15 +98,9 @@ const getQueueState = (): GroupQuestionQueueState => {
     g[QUEUE_STATE_KEY] = {
       queues: new Map(),
       listeners: new Set(),
-      bypassWindows: new Map(),
-      anonSeq: 0,
     };
   }
-  const s = g[QUEUE_STATE_KEY]!;
-  // 同进程热更前已建出的旧形状状态：补齐新字段，别让它 undefined
-  if (!s.bypassWindows) s.bypassWindows = new Map();
-  if (typeof s.anonSeq !== "number") s.anonSeq = 0;
-  return s;
+  return g[QUEUE_STATE_KEY]!;
 };
 const groupQuestionQueues = getQueueState().queues;
 
@@ -238,7 +190,7 @@ export const enqueueGroupQuestion = (
   }
   // 发送人槽位（G3-02）：放在幂等与队满判定之后——重投不算新占位、队满先报队满。
   // 过期条目上面已清掉，不会拿死槽位误拒新问题。
-  // 槽位 key 与限流 key 同口径（第八轮 L3-04：此前是裸 `openId || name`——无 open_id 的机器人按展示名
+  // 槽位 key 见 groupBypassSenderKey（第八轮 L3-04：此前是裸 `openId || name`——无 open_id 的机器人按展示名
   // 连坐 / 改名多占槽，展示名写成别人 open_id 的发送人与真人同 key）。
   if (opts?.maxPerSender !== undefined) {
     const sender = groupBypassSenderKey(entry.requester, entry.senderIds);
@@ -304,8 +256,6 @@ export const unshiftGroupQuestionQueue = (
 export const clearGroupQuestionQueue = (taskId: string): number => {
   const q = groupQuestionQueues.get(taskId);
   groupQuestionQueues.delete(taskId);
-  // 任务终结 / 归档 / 删除：滑动窗状态也随之作废，别把 taskId 攒成长跑进程的内存泄漏
-  getQueueState().bypassWindows.delete(taskId);
   const n = q?.length ?? 0;
   if (n > 0) notifyGroupQueueChanged(taskId);
   return n;
@@ -329,15 +279,16 @@ export const groupQuestionQueueLength = (taskId: string): number =>
   groupQuestionQueues.get(taskId)?.length ?? 0;
 
 /**
- * 旁路 run 的「发送人」口径（每人子限额的分桶键）：open_id（机器人同样适用）→
+ * 群问答排队的「发送人」口径（每人排队槽位的分桶键；原先同一个 key 也给旁路 run 滑动窗限流用，限流 2026-11-06 已删，
+ * 这里只剩队内槽位在用）：open_id（机器人同样适用）→
  * 其余服务端稳定 ID 格（bot open_id / app_id）→ 展示名兜底，兜底时加 `name:` 前缀（K2-09）→
  * 连名字都没有（缺失 / 空串 / 全空白）时是 `anon:`（第八轮 L3-04：此前拼出 `name:undefined`）。
- * 队内槽位（enqueueGroupQuestion）也用这同一个 key（第八轮 L3-04：此前是裸 `openId || name`）。
+ * 队内槽位（enqueueGroupQuestion）用这个 key（第八轮 L3-04：此前是裸 `openId || name`）。
  *
  * 为什么兜底要加前缀：展示名是用户可改的自由文本，不加前缀时一个展示名叫 `ou_xxx` 的无 id
  * 发送人会和真 `ou_xxx` 落进同一个桶（互相连坐 / 或被冒充者借走别人的额度）。前缀把两个命名空间
  * 分开：稳定 ID 永远是 `ou_` / `cli_` 之类的服务端下发串，不会以 `name:` / `anon:` 开头。
- * `anon:` 桶是所有「无 id 无名」发送人共用的一个桶——保守聚合（认不出是谁，就当同一个人限）。
+ * `anon:` 桶是所有「无 id 无名」发送人共用的一个桶——保守聚合（认不出是谁，就当同一个人算槽位）。
  */
 export const groupBypassSenderKey = (
   requester: { openId: string; name: string },
@@ -348,233 +299,6 @@ export const groupBypassSenderKey = (
   // 运行时 name 可能缺失（类型是 string，但入向清洗之前的形状不保证）
   const name = typeof requester.name === "string" ? requester.name : "";
   return name.trim() ? `name:${name}` : "anon:";
-};
-
-/** {@link admitGroupBypassRun} 的结果 */
-export type GroupBypassAdmit =
-  | {
-      allowed: true;
-      notify: false;
-      /**
-       * 本次调用是否**新记了一个名额**。false = 同一 message_id 重投、名额早已计过（幂等放行）；
-       * 起 run 失败要退还时，只有 counted:true 的那次才有名额可退（见 {@link releaseGroupBypassRun}）。
-       * 例外：空 messageId（合成 id 占位）是 counted:true 但**退不掉**——退还对它是 no-op、保守不退。
-       */
-      counted: boolean;
-    }
-  | {
-      allowed: false;
-      /** 本次是否该写那条节流 info（总限额 / 个人限额各自每窗最多一条） */
-      notify: boolean;
-      /** 撞上的是总限额还是该发送人的个人限额（info 文案据此区分） */
-      scope: "total" | "sender";
-    };
-
-/**
- * 非属主旁路 run 准入（G3-02，第六轮口径修正）：per-task 滑动窗，窗内最多
- * {@link GROUP_BYPASS_RUN_WINDOW_MAX} 次**启动**、同一发送人最多
- * {@link GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER} 次。
- *
- * 「互 @ 熔断」整套删掉后，没有任何按 task / 时间窗的计数——两个机器人互 @、或任何群成员
- * 持续 @，都能持续烧属主额度（队列上限 10 只限积压、不限速率）。这里补一道保守的硬上限：
- * 超限由调用方**静默丢弃**（不回群消息，防对端机器人被喂噪音再续环），并只在 `notify`
- * 为 true 时写一条 info 事件让属主知道。
- *
- * **只拦真正花钱的 run**，所以调用方必须在「忙线 / 队满 / 槽位 / 启动凭据都过了」之后、紧接着起 run
- * 的那一刻才调——被忙线 / 队满拒收的、入队等回放的、被限流丢弃的都不占名额；排队回放在真正起 run 时
- * 计一次。起 run 失败（注入抛错 / 非 200）调 {@link releaseGroupBypassRun} 退还。
- *
- * **原子的只有「判定 + 计数」本身**（本函数同步、无 await，两条并发消息不会同时挤进最后一个名额）。
- * 它与忙线判定**不是**原子的：调用方在忙线判定之后还要 `await loadBootContext()` 才走到这里，
- * 并发的两条消息可能都通过忙线判定、各自起 run——忙线闸是「串行意图」而非硬互斥，名额总量由这里守住。
- * 调用方能保证的只有：本函数返回到「注入调用」之间没有 await（无 pendingAsk 时）。
- *
- * - 只有被放行并起 run 的才进窗口：被拒的不续窗，攻击者不能靠狂发把窗口一直锁死
- * - 同一 message_id 重投（飞书至少一次投递 / 补拉）：窗内已计过的不再计、直接幂等放行
- *   （不被「已满」挡住——它早已被受理过；真正的重复处理由入向的已处理去重负责）
- * - **空 messageId 用合成 id（`anon:<自增>`）照常计数、照常受限额约束（第八轮 L3-05，推翻第七轮 K2-09
- *   「空 id 放行不计数」）**：此前连调多少次都 `{allowed:true, counted:false}`，限流器 fail-open。
- *   生产上到不了（入向 `normalizeInboundEvent` 在没有 message_id 时整条丢弃，排队回放用的是队列项自带的 id），
- *   但换个入口 / 漏传 id 的调用方就是后门。合成 id 的 stamp 带 `anon` 标记，**不参与**按 id 的重投去重与退还，
- *   所以与任何真实 id（包括字面恰为 `anon:N` 的）互不冲突；没有 id 就无从按 id 重投去重——两次空 id 调用
- *   就是两次启动。**退还不了、保守不退**（{@link releaseGroupBypassRun} 对空 id 恒返回 false）：多占的名额
- *   随 stamp 一起在窗口（10 分钟）滑过后自然过期，不是永久占位（第七轮「永久占着」的理由不成立）。
- *   返回 `counted:true`（名额确实新记了），但调用方的退还对它是 no-op。
- * - 先判总限额再判个人限额（总额满了所有人都进不来，提示点总额更有用）
- * - **关联回执（`correlatedReceipt`，K2-01）只计总限额、不计个人限额**：命中出问登记的托办回执
- *   是属主自己托办的数据回流（登记两门已过、送达即焚，数量受登记约束），没有活会话时走只读旁路起 run；
- *   若计入个人额度，同一目标 10 分钟内第 5 次回执会被静默丢掉、托办的数据就丢了。仍计总限额，
- *   总量上限不被它绕过；它的 stamp 也不进个人计数，不会反过来挤占该人后续普通提问的额度。
- * - 总限额的节流 info 每窗最多一条；个人限额的**按发送人分桶**、每人每窗最多一条（K2-08：此前所有人
- *   共用一个计时，A 撞线提示过后 B 撞线会被吞掉，属主只知道有人被限、不知道是谁）
- * - 属主自己、答 pendingAsk（走活会话）、feed 进活会话的关联回执、chat 型都不经过这里，由调用方负责
- * now 参数只给单测用。
- */
-export const admitGroupBypassRun = (
-  taskId: string,
-  who: { sender: string; messageId: string; correlatedReceipt?: boolean },
-  now: number = Date.now(),
-): GroupBypassAdmit => {
-  const state = getQueueState();
-  const { bypassWindows } = state;
-  // 空 messageId：合成 id 占位（只在真正被放行、要记 stamp 时才自增，见下）
-  const synthetic = !who.messageId;
-  // 顺手清掉已过窗且提示也过期的 task，长跑进程别攒内存
-  for (const [id, other] of bypassWindows) {
-    if (id === taskId) continue;
-    if (isBypassWindowIdle(other, now)) bypassWindows.delete(id);
-  }
-  const w = ensureBypassWindow(taskId);
-  w.stamps = w.stamps.filter((s) => now - s.t < GROUP_BYPASS_RUN_WINDOW_MS);
-  pruneBypassNotices(w, now);
-
-  // 重投去重只认调用方给的真实 id：合成 stamp（anon）不参与，空 id 调用本身也不去重
-  if (
-    !synthetic &&
-    w.stamps.some((s) => !s.anon && s.messageId === who.messageId)
-  ) {
-    return { allowed: true, notify: false, counted: false };
-  }
-
-  // 超限：提示每类每窗最多一条（以上一次提示起算一整个窗口；个人限额按发送人各算各的）
-  const deny = (scope: "total" | "sender"): GroupBypassAdmit => {
-    const last =
-      scope === "total"
-        ? w.noticeAt
-        : (w.senderNotices.get(who.sender) ?? Number.NEGATIVE_INFINITY);
-    const notify = now - last >= GROUP_BYPASS_RUN_WINDOW_MS;
-    if (notify) {
-      if (scope === "total") w.noticeAt = now;
-      else w.senderNotices.set(who.sender, now);
-    }
-    return { allowed: false, notify, scope };
-  };
-  if (w.stamps.length >= GROUP_BYPASS_RUN_WINDOW_MAX) return deny("total");
-  if (!who.correlatedReceipt) {
-    // 个人计数不含回执 stamp：回执不占该人后续普通提问的额度
-    const used = w.stamps.filter((s) => !s.receipt && s.sender === who.sender).length;
-    if (used >= GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER) return deny("sender");
-  }
-
-  w.stamps.push({
-    t: now,
-    sender: who.sender,
-    messageId: synthetic ? `anon:${++state.anonSeq}` : who.messageId,
-    ...(synthetic ? { anon: true as const } : {}),
-    ...(who.correlatedReceipt ? { receipt: true as const } : {}),
-  });
-  return { allowed: true, notify: false, counted: true };
-};
-
-/**
- * 取 / 建该 task 的旁路窗口，并把热更前旧形状补齐：旧窗口没有 `senderNotices` / `dropHints`
- * （旧版是单个 `senderNoticeAt` 数字，此处直接忽略——最坏多发一次提示）；旧 stamps 是裸时间戳，
- * `s.t` 为 undefined → `now - s.t` 是 NaN → 调用方的过滤自然丢掉，无需另判。
- */
-const ensureBypassWindow = (taskId: string): GroupBypassWindow => {
-  const { bypassWindows } = getQueueState();
-  const w: GroupBypassWindow = bypassWindows.get(taskId) ?? {
-    stamps: [],
-    noticeAt: Number.NEGATIVE_INFINITY,
-    senderNotices: new Map(),
-    dropHints: new Map(),
-  };
-  if (!(w.senderNotices instanceof Map)) w.senderNotices = new Map();
-  if (!(w.dropHints instanceof Map)) w.dropHints = new Map();
-  if (typeof w.noticeAt !== "number") w.noticeAt = Number.NEGATIVE_INFINITY;
-  if (!Array.isArray(w.stamps)) w.stamps = [];
-  bypassWindows.set(taskId, w);
-  return w;
-};
-
-/** 摘掉已过一整窗的分桶提示记录（每人一条，不清会随发送人数线性增长） */
-const pruneBypassNotices = (w: GroupBypassWindow, now: number): void => {
-  for (const book of [w.senderNotices, w.dropHints]) {
-    for (const [sender, at] of book) {
-      if (now - at >= GROUP_BYPASS_RUN_WINDOW_MS) book.delete(sender);
-    }
-  }
-};
-
-/** 窗口已「空」：窗内没有 stamp、总提示 / 各人提示也都过期——可整项删（形状可能是热更前的旧形状） */
-const isBypassWindowIdle = (w: GroupBypassWindow, now: number): boolean => {
-  const old = (at: unknown): boolean =>
-    typeof at !== "number" || now - at >= GROUP_BYPASS_RUN_WINDOW_MS;
-  const stamps: GroupBypassStamp[] = Array.isArray(w.stamps) ? w.stamps : [];
-  return (
-    stamps.every((s) => now - s.t >= GROUP_BYPASS_RUN_WINDOW_MS) &&
-    old(w.noticeAt) &&
-    (w.senderNotices instanceof Map
-      ? [...w.senderNotices.values()].every(old)
-      : true) &&
-    (w.dropHints instanceof Map ? [...w.dropHints.values()].every(old) : true)
-  );
-};
-
-/**
- * 排队回放被限流丢弃后，要不要给提问人回那一句群内提示（K2-02）：每窗（10 分钟）每人最多一条，
- * 返回 true = 本次该发（同时记下时刻），false = 这个人本窗已提示过。
- *
- * 为什么只有回放要提示：入队时已回过「答完就答你」，这是承诺；回放遇限流被丢弃等于食言，必须交代。
- * 即时到达的消息被限流静默丢弃（没承诺过、且对端若是机器人任何回执都是续环素材），不调这里。
- * 机器人提问人调用方不要调（系统回执对机器人一律静默），免得白占它的名额。
- * 与 {@link admitGroupBypassRun} 的 info 节流分开记账：info 是给属主看的，这条是给提问人看的。
- *
- * **调用方应「先 {@link peekGroupBypassDropHint} 看有没有名额、发送成功后才调本函数认领」**（第八轮 L3-04）：
- * 先认领再发，发送失败时名额已耗、这个人在本窗里再也等不到那一句。本函数仍是「检查 + 记录」的原子形态，
- * 保持原语义（返回 true = 这次抢到了名额并已记录）。
- * now 参数只给单测用。
- */
-export const claimGroupBypassDropHint = (
-  taskId: string,
-  sender: string,
-  now: number = Date.now(),
-): boolean => {
-  if (!taskId) return false;
-  const w = ensureBypassWindow(taskId);
-  pruneBypassNotices(w, now);
-  const last = w.dropHints.get(sender);
-  if (last !== undefined && now - last < GROUP_BYPASS_RUN_WINDOW_MS) return false;
-  w.dropHints.set(sender, now);
-  return true;
-};
-
-/**
- * 只读版的 {@link claimGroupBypassDropHint}：这个人本窗还有没有回放丢弃提示的名额（true = 还没提示过、可以发）。
- * **不记录、不建窗口**——发送成功后再调 claim 认领；发送失败就什么都不用做（名额没耗）。
- * now 参数只给单测用。
- */
-export const peekGroupBypassDropHint = (
-  taskId: string,
-  sender: string,
-  now: number = Date.now(),
-): boolean => {
-  if (!taskId) return false;
-  const w = getQueueState().bypassWindows.get(taskId);
-  const last = w && w.dropHints instanceof Map ? w.dropHints.get(sender) : undefined;
-  return last === undefined || now - last >= GROUP_BYPASS_RUN_WINDOW_MS;
-};
-
-/**
- * 退还一个旁路 run 名额（起 run 失败路径专用）：按 message_id 摘掉窗内那条计数，摘到返回 true。
- *
- * 只该由 {@link admitGroupBypassRun} 返回 `counted: true` 的那次调用在「注入抛错 / 非 200、
- * 没有 run 开跑」时调——名额的语义是「真启动了的 run」，没启动就不该占。窗口早已滑过去（计数已被
- * 清掉）时什么都不做。返回后窗口里同一 message_id 不再有计数，飞书重投时按新到处理、只计一次。
- */
-export const releaseGroupBypassRun = (
-  taskId: string,
-  messageId: string,
-): boolean => {
-  // 空 id 退不了（合成 stamp 没有调用方认得的 id，第八轮 L3-05：保守不退）；
-  // 合成 stamp（anon）也不会被某个字面相同的真实 id 误摘
-  if (!messageId) return false;
-  const w = getQueueState().bypassWindows.get(taskId);
-  if (!w) return false;
-  const idx = w.stamps.findIndex((s) => !s.anon && s.messageId === messageId);
-  if (idx < 0) return false;
-  w.stamps.splice(idx, 1);
-  return true;
 };
 
 /**
@@ -616,7 +340,7 @@ export interface PendingGroupReply {
   /**
    * 提问人是不是机器人（group-route 入向判定后传进来）。
    * 出向据此决定：失败 / 空回答时机器人提问人静默（不让两个机器人互 @ 成环）、
-   * 回复协议里「没写 @ 时要不要自动补 @提问人」。缺省 = 真人。
+   * 出向「要不要在回复开头自动 @ 提问人」的依据：机器人不补（想让它看见，agent 自己写 @ 标签）。缺省 = 真人。
    */
   requesterIsBot?: boolean;
   /**
@@ -654,13 +378,13 @@ export interface PendingGroupReply {
    */
   token: string;
   /**
-   * 入向群消息 id（UI 群问答 tab 配对备用：user_reply meta.feishuMessageId == 它）。
+   * 入向群消息 id（UI 群问答卡配对备用：user_reply meta.feishuMessageId == 它）。
    * flush 写汇总事件时原样带过去， temporal 配对兜底（no_pending 竞态落回旁路时问题事件没有 runTag）。
    */
   sourceMessageId?: string;
   /**
    * 并入属主同一个会话的非属主一轮（出向从 user_reply 事件现建的登记）：它没有独立的旁路 run，
-   * 这一轮就在主事件流里——回群照常，但**不写群问答 tab 汇总**（新数据不再进 tab）。
+   * 这一轮就在主事件流里——回群照常，但**不写群问答卡汇总**（新数据不再生成旁路问答卡）。
    */
   sameSession?: boolean;
   /**
@@ -714,7 +438,7 @@ export type GroupQuestionDroppedReason = "expired" | "evicted";
 /**
  * 「这条 question 登记没等到收口就被摘了」的通知钩子——由出向层注册。
  * advance 到期有收口协议三选一，question 只有“摘”：频率极低（2h 挂起的 run、
- * 8 路并发答疑），摘时写一条 ok:false 汇总进 tab、群里不再回（2h 前的 @ 再弹
+ * 8 路并发答疑），摘时写一条 ok:false 汇总（事件流里出一张失败的问答卡）、群里不再回（2h 前的 @ 再弹
  * 出来更吓人）。没注册时静默摘（老行为）。
  */
 export type GroupQuestionDroppedHandler = (
@@ -905,7 +629,7 @@ export const rememberGroupReply = (
     // 全是 advance（属主单格、正常到不了这里）——宁可超一格也不丢产物
     if (idx < 0) break;
     const [evicted] = list.splice(idx, 1);
-    // 挤掉也别静默吞：这轮的回答此后无处投递，tab 里会残半轮“回答中”——
+    // 挤掉也别静默吞：这轮的回答此后无处投递，没有汇总就是一轮永远没有下文的提问——
     // 推给出向钩子写 ok:false 汇总（十六轮 P3，和到期摘同口径）
     if (evicted) state.onQuestionDropped?.(taskId, evicted, "evicted");
   }
@@ -1118,14 +842,13 @@ export const takeGroupReplyByToken = (
 export const __resetGroupReplyStateForTest = (): void => {
   getState().byTask.clear();
   groupQuestionQueues.clear();
-  getQueueState().bypassWindows.clear();
 };
 
 // ----------------- 通用节流（回群提示 / 日志防刷） -----------------
 //
 // 原「机器人互 @ 熔断」已整体移除：互 @ 成环不再靠计数拦截，改由两件事从源头掐——
 // ① 系统回执（忙线 / 排队 / 失败）对机器人发件人一律静默，不给对方的上下文喂噪音；
-// ② 答疑 agent 自己按提示词判断该不该回、@ 谁，没话可说就输出 NO_REPLY（见 group-outbound）。
+// ② 答疑 agent 自己按提示词判断该不该回、@ 谁，没话可说首行写 NO_REPLY（见 group-silent-reply / group-outbound）。
 
 /**
  * per-key 节流：同一 key 一分钟内只放行一次（身份服务抖时 warn / 提示不刷屏）。
@@ -1408,7 +1131,7 @@ export const sanitizeGroupMemberName = (raw: unknown): string => {
 /**
  * 群内 @ 标签的**内部统一写法**：`<at user_id="ou_xxx">名字</at>`（text / post 原生认它）。
  * 群里文字现在发的是文本卡，卡片 markdown 要写 `<at id=ou_xxx></at>`——
- * 由 `lark-api.toCardMarkdown` 在最后一跳转换，上游（回复协议 / 切块 / 各回执）仍只认这一种写法。
+ * 由 `lark-api.toCardMarkdown` 在最后一跳转换，上游（agent 的回复 / 切块 / 各回执）仍只认这一种写法。
  * open_id 缺失时退化成纯文本「@名字」（至少让人看得出在叫谁）。
  */
 export const mentionTag = (openId: string, name: string): string => {

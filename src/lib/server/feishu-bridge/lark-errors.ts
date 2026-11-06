@@ -102,7 +102,7 @@ export const isChatGoneError = (err: unknown): boolean => {
 
 /**
  * 发群失败的分类——只用来给「发群失败提示」选一句读得懂的原因和一条能照做的补救，
- * 不参与重试 / 熔断决策（那是 card-stream 的事）。
+ * 不参与重试决策（那是 card-stream 的事）。
  *
  * - `bot_not_in_group`：机器人已不在群里（被移出）。补救：加回群 / 换绑；
  * - `no_send_permission`：机器人还在群里但没有发言资格（被禁言、群设置限制、外部群未开共享、不在应用可用范围）；

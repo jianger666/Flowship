@@ -20,7 +20,10 @@
 
 import type { ActionType, PlanBatch } from "../types";
 import { SIGNALS, buildNextActionHead } from "../protocol-signals";
-import { buildNonOwnerGuardFootnote } from "../group-non-owner-prompt";
+import {
+  buildBotEtiquetteNote,
+  buildNonOwnerGuardFootnote,
+} from "../group-non-owner-prompt";
 import { cancelAskWait, resetAskWaitForTest } from "./ask-wait";
 import { interruptWaits } from "./session-wait";
 
@@ -694,8 +697,10 @@ export type AgentMessage = {
   imagePaths?: string[];
   // 文件 / 目录附件绝对路径（拼 [ATTACHED_PATHS] 段）
   attachmentPaths?: string[];
-  // user_message：当前有产出在等审阅时的上下文（服务端附加、要求处理完重新交卷）
-  ackContext?: { actionId: string; artifactPath?: string };
+  // user_message：当前有产出在等审阅时的上下文（服务端附加、要求处理完重新交卷）。
+  // actionType 是那份产出的动作类型：提测 / 联调这类「对外动作已经做完」的，脚注会多一段
+  //「重新交卷 ≠ 再提测一遍」的说明（见 buildExternalEffectNote），让 AI 按用户这句话自己判断
+  ackContext?: { actionId: string; artifactPath?: string; actionType?: ActionType };
   // user_message：这条是**定时到点**由系统发的（`[SCHEDULE_FIRED …]`），不是用户在任务页说的话。
   // 保留 [USER_MESSAGE] 抬头（协议信号 / 通道不变），但脚注不能再说「这是用户的插话、先判断纯疑问还是修改要求」——
   // 那会和 _super.md 里「不要走疑问 / 修改二分类、也不要当成用户在改需求」自相矛盾
@@ -703,7 +708,11 @@ export type AgentMessage = {
   // user_message：这条是需求群里**非属主**发来的、**且提示词开关开着**——脚注换成「只答疑」约束段
   //（见 group-non-owner-prompt）。取代而不是追加默认脚注：默认脚注里「修改要求才动手改」与约束互相打架，
   // 且约束必须是整条消息的最后一段。开关关 / 属主消息都不传。
-  groupNonOwnerGuard?: { name: string; isBot?: boolean };
+  groupNonOwnerGuard?: { name: string; isBot?: boolean; openId?: string };
+  // user_message：这条是群里**机器人**发来的、**且没带「只答疑」约束段**（设置「机器人与真人同权」开着、
+  // 同时「限制群里非宿主成员」关着 = 同权）。照常用默认脚注，只在后面追加防互 @ 成环的克制规则
+  //（见 group-non-owner-prompt 的 buildBotEtiquetteNote）。带了 groupNonOwnerGuard 时不用传（约束段里已含同一份规则）。
+  groupBotEtiquette?: { name: string; openId?: string };
   // next_action 的元数据（拼 [NEXT_ACTION ...] 头）
   nextActionId?: string;
   nextActionType?: ActionType;
@@ -752,6 +761,33 @@ export const buildReadonlyUserMessage = (msg: {
   [SIGNALS.USER_MESSAGE, "", msg.text, ...attachmentSections(msg)].join("\n");
 
 /**
+ * 动作本身就是「对外动作」的类型：提测（push + MR + 飞书评论 + 群 @ 测试）、联调（推 dev 分支 / 提 PR）。
+ * 这类动作交卷时对外的事已经做完了。
+ */
+const EXTERNAL_EFFECT_ACTION_LABELS: Partial<Record<ActionType, string>> = {
+  ship: "提测",
+  dev: "联调",
+};
+
+/**
+ * 产出审阅中的消息，若那份产出是提测 / 联调：补一段说明，**把「要不要再对外做一遍」交给 AI 按用户这句话判断**。
+ *
+ * 为什么要有这段：脚注要求「无论问还是改都重新交卷」，agent 又还带着整套提测剧本的上下文——
+ * 用户在提测之后说「这里再改下代码」，它很容易把「修改」理解成「提测这一步要重做」，改完又 push / 提 MR / 评论 / @ 测试，
+ * 测试被无谓地再通知一遍。这里不加任何硬拦截（用户明确要再提测时它照做），只把「重新交卷只是刷新记录」讲明白。
+ * 其它动作类型（plan / build / review / 自定义）返回空串，脚注保持原样。
+ */
+export const buildExternalEffectNote = (actionType: ActionType | undefined): string => {
+  const label = actionType ? EXTERNAL_EFFECT_ACTION_LABELS[actionType] : undefined;
+  if (!label) return "";
+  return [
+    `这份产出是「${label}」：push / MR / 评论 / 群通知这些对外的事上一轮已经做完了，这里的「重新交卷」只是刷新这份记录，**不等于要再${label}一遍**。`,
+    `用户这句话要什么你就做什么：要你改代码就只改本地工作区，不要顺手重新 push / 提 MR / 评论 / @ 测试人员；用户明确说了要再${label} / 更新 MR / 通知，再去做对外那几步。`,
+    `只改了本地的话，回复里直接说清楚「这次修改只在本地、MR 里还没有」，要不要再${label}由用户定（他可以直接对你说，也可以再推进一次）；修改记录里同样写明「仅本地改动、未推送」。`,
+  ].join("");
+};
+
+/**
  * 把用户操作序列化成发给 agent 的消息文本（`agent.send(text)`）。
  * 头部信号字面量（[NEXT_ACTION] / [USER_MESSAGE] / [USER_REPLY]…）与 prompts 的
  * 解读约定一致、由 tests/protocol-signals.test.ts 守护。
@@ -783,6 +819,7 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
       lines.push(
         buildNonOwnerGuardFootnote(msg.groupNonOwnerGuard.name, {
           isBot: msg.groupNonOwnerGuard.isBot === true,
+          openId: msg.groupNonOwnerGuard.openId,
         }),
       );
     } else if (msg.scheduled) {
@@ -790,15 +827,25 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
         "（这是系统按你之前设的定时自动触发的消息、**不是用户的插话**：不要走「纯疑问 / 修改要求」的二分类、也不要当成用户在改需求。按上面你自己留的话做；不要调 submit_work / submit_mr 推进任务链——进度停在原地。处理完自然结束本轮回复。）",
       );
     } else if (msg.ackContext) {
+      // 提测 / 联调：多一段「重新交卷 ≠ 再对外做一遍」；其它动作类型为空串
+      const externalNote = buildExternalEffectNote(msg.ackContext.actionType);
       // 「〈产出审阅中〉」字面量必须保留——_super.md 教 agent 的判卷闸门就是这个词
       //（审计揪过：文案与 prompt 字面对不上、agent 可能漏交卷）
       lines.push(
-        `〈产出审阅中〉你有一份产出正在等用户审阅（action_id=${msg.ackContext.actionId}${msg.ackContext.artifactPath ? `、artifact=${msg.ackContext.artifactPath}` : ""}）。先判断这条消息的性质：**纯疑问**就直接回答、别把问题当成改动指令；**修改意见**才动 artifact / 代码（模糊的先 ask_user 复述确认）。无论问还是改：先调 submit_work（同 action_id）重新交卷，拿到 \`[SUBMITTED]\` 后再把答案 / 改动说明说给用户，然后结束回复。不要输出「这是纯疑问 / 我将…」之类的分类旁白、直接给内容。`,
+        `〈产出审阅中〉你有一份产出正在等用户审阅（action_id=${msg.ackContext.actionId}${msg.ackContext.artifactPath ? `、artifact=${msg.ackContext.artifactPath}` : ""}）。先判断这条消息的性质：**纯疑问**就直接回答、别把问题当成改动指令；**修改意见**才动 artifact / 代码（模糊的先 ask_user 复述确认）。无论问还是改：先调 submit_work（同 action_id）重新交卷，拿到 \`[SUBMITTED]\` 后再把答案 / 改动说明说给用户，然后结束回复。不要输出「这是纯疑问 / 我将…」之类的分类旁白、直接给内容。${externalNote ? `\n${externalNote}` : ""}`,
       );
     } else {
       lines.push(
         "（这是任务过程中用户的插话、不是推进指令。先判断性质：**纯疑问**就直接回答、别把问题当成改动指令；**修改要求**才动手改（改完说明改了什么）。不要调 submit_work / submit_mr 推进任务链——进度停在原地、等用户自己推进。处理完自然结束本轮回复。）",
       );
+      if (msg.groupBotEtiquette) {
+        lines.push(
+          buildBotEtiquetteNote(
+            msg.groupBotEtiquette.name,
+            msg.groupBotEtiquette.openId,
+          ),
+        );
+      }
     }
     return lines.join("\n");
   }

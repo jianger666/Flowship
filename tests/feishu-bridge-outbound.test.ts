@@ -60,14 +60,14 @@ const { isFeishuBridgeStreamingEnabled } = await import(
   "@/lib/server/feishu-bridge/bridge-config"
 );
 
-/** 假句柄 getHealth 的默认值：终稿落成、熔断没开（用例按需覆盖） */
+/** 假句柄 getHealth 的默认值：终稿落成、没有致命故障（用例按需覆盖） */
 const okHealth = vi.hoisted(
   () =>
     (over: Record<string, unknown> = {}) => ({
       failCount: 0,
       consecutiveFails: 0,
-      breakerOpen: false,
-      breakerEverOpened: false,
+      fatalActive: false,
+      fatalEver: false,
       finalizeOk: true as boolean | undefined,
       lastError: undefined as unknown,
       ...over,
@@ -308,7 +308,7 @@ describe("turn 状态机", () => {
     expect(cardFactory.create).toHaveBeenCalledWith(taskId, {
       title: "测对话",
       streaming: true,
-      onBreakerOpen: expect.any(Function),
+      onFatal: expect.any(Function),
     });
     const card = cardFactory.cards[0]!;
     expect(card.start).toHaveBeenCalled();
@@ -784,7 +784,7 @@ describe("turn 状态机", () => {
   });
 
   // review P1#4 / 坑 #10 + R14 P1-1：飞书卡片没同步完整内容 → app 内必须可见、飞书侧追发不能报喜。
-  // 判据是「终稿没落成 / 熔断仍开」，不再是整轮累计失败次数
+  // 判据是「终稿没落成 / 致命故障未恢复」，不再是整轮累计失败次数
   // （旧 failCount>=3：偶发抖动 3 次就误报，而 finalize 自己失败时累计数可能只有 0~2、又一声不吭）
   it("终稿没落到卡片（finalizeOk=false）→ app 内 info 带原因 + 飞书追发明说没同步、不报「已完成」", async () => {
     await runTurnWithHealth({
@@ -809,22 +809,22 @@ describe("turn 状态机", () => {
     expect(lastPing()).not.toContain("已完成");
   });
 
-  it("累计失败数很大、但终稿已落成且熔断已恢复 → 不报警，追发仍是「已完成」（旧判据 failCount>=3 的误报）", async () => {
+  it("累计失败数很大、但终稿已落成且致命故障已恢复 → 不报警，追发仍是「已完成」（旧判据 failCount>=3 的误报）", async () => {
     await runTurnWithHealth({
       taskId: "t_failvis_recovered",
-      health: { failCount: 99, breakerEverOpened: true, finalizeOk: true },
+      health: { failCount: 99, fatalEver: true, finalizeOk: true },
     });
     expect(infoTexts()).toHaveLength(0);
     expect(sendTextMessage).toHaveBeenCalledTimes(1);
     expect(lastPing()).toContain("已完成");
   });
 
-  it("熔断此刻仍开着（终稿结果未知）→ 同样算没同步", async () => {
+  it("致命故障此刻仍未恢复（终稿结果未知）→ 同样算没同步", async () => {
     await runTurnWithHealth({
       taskId: "t_failvis_breaker",
       health: {
-        breakerOpen: true,
-        breakerEverOpened: true,
+        fatalActive: true,
+        fatalEver: true,
         finalizeOk: undefined,
         lastError: new Error("lark-cli 超时（8000ms）"),
       },
@@ -844,12 +844,12 @@ describe("turn 状态机", () => {
     expect(infoTexts()[0]).toContain("原因未知");
   });
 
-  it("句柄没给出任何成功信号（finalizeOk=undefined、熔断也没开，例如建卡就失败）→ 按没同步报，不报喜", async () => {
+  it("句柄没给出任何成功信号（finalizeOk=undefined、也没有致命故障，例如建卡就失败）→ 按没同步报，不报喜", async () => {
     await runTurnWithHealth({
       taskId: "t_failvis_nosignal",
       health: {
         finalizeOk: undefined,
-        breakerOpen: false,
+        fatalActive: false,
         lastError: new Error("建卡失败：no permission"),
       },
     });
@@ -861,12 +861,12 @@ describe("turn 状态机", () => {
     expect(lastPing()).not.toContain("已完成");
   });
 
-  it("终稿落成但熔断标志仍开着（此刻仍在持续失败）→ 同样按没同步报，不报喜", async () => {
+  it("终稿落成但致命故障标志仍开着（此刻仍未恢复）→ 同样按没同步报，不报喜", async () => {
     await runTurnWithHealth({
       taskId: "t_failvis_contradict",
       health: {
         finalizeOk: true,
-        breakerOpen: true,
+        fatalActive: true,
         lastError: new Error("rate limited"),
       },
     });
@@ -914,21 +914,21 @@ describe("turn 状态机", () => {
     expect(infos[0]!.length).toBeLessThanOrEqual(400);
     expect(infos[0]).not.toContain(BIG_MARK);
 
-    // 熔断提示同理
+    // 致命故障提示同理
     writeEventAndPublish.mockClear();
     const createOpts = (
       cardFactory.create.mock.calls.at(-1) as unknown as [
         string,
         {
-          onBreakerOpen?: (info: {
+          onFatal?: (info: {
             consecutiveFails: number;
-            retryInMs: number;
             error: unknown;
+            fatalKind: string;
           }) => void;
         },
       ]
     )[1];
-    createOpts.onBreakerOpen!({ consecutiveFails: 3, retryInMs: 2000, error: huge });
+    createOpts.onFatal!({ consecutiveFails: 0, error: huge, fatalKind: "gone" });
     await flush();
     const brk = infoTexts();
     expect(brk).toHaveLength(1);
@@ -936,7 +936,7 @@ describe("turn 状态机", () => {
     expect(brk[0]).not.toContain(BIG_MARK);
   });
 
-  it("熔断一打开就当场写 info（不等 finalize）；回调里写 info 失败也不传播", async () => {
+  it("致命故障一发生就当场写 info（不等 finalize）；回调里写 info 失败也不传播", async () => {
     const taskId = "t_breaker_info";
     publishTaskStreamEvent(taskId, makeEvent("user_reply", "问"));
     publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "答" });
@@ -945,36 +945,36 @@ describe("turn 状态机", () => {
       cardFactory.create.mock.calls[0] as unknown as [
         string,
         {
-          onBreakerOpen?: (info: {
+          onFatal?: (info: {
             consecutiveFails: number;
-            retryInMs: number;
             error: unknown;
+            fatalKind: string;
           }) => void;
         },
       ]
     )[1];
-    expect(typeof createOpts.onBreakerOpen).toBe("function");
+    expect(typeof createOpts.onFatal).toBe("function");
 
-    createOpts.onBreakerOpen!({
-      consecutiveFails: 3,
-      retryInMs: 2000,
-      error: new LarkApiError("rate limited", { code: 99991400 }),
+    createOpts.onFatal!({
+      consecutiveFails: 0,
+      error: new LarkApiError("The card entity does not exist", { code: 200740 }),
+      fatalKind: "gone",
     });
     await flush();
     const infos = infoTexts();
     expect(infos).toHaveLength(1);
-    expect(infos[0]).toContain("连续 3 次");
-    expect(infos[0]).toContain("rate limited");
+    expect(infos[0]).toContain("飞书卡片无法继续更新");
+    expect(infos[0]).toContain("The card entity does not exist");
     // 此刻这一轮还没结束：没有追发
     expect(sendTextMessage).not.toHaveBeenCalled();
 
     // 写 info 自己失败：回调吞掉，不抛、不留未处理的 rejection（vitest 会把后者判红）
     writeEventAndPublish.mockRejectedValueOnce(new Error("disk full"));
     expect(() =>
-      createOpts.onBreakerOpen!({
-        consecutiveFails: 4,
-        retryInMs: 4000,
+      createOpts.onFatal!({
+        consecutiveFails: 0,
         error: new Error("x"),
+        fatalKind: "gone",
       }),
     ).not.toThrow();
     await flush();
@@ -1078,7 +1078,7 @@ describe("流式开关冻结", () => {
     expect(cardFactory.create).toHaveBeenCalledWith(taskId, {
       title: "测对话",
       streaming: true,
-      onBreakerOpen: expect.any(Function),
+      onFatal: expect.any(Function),
     });
     expect(isFeishuBridgeStreamingEnabled).toHaveBeenCalledTimes(1);
 
@@ -1181,7 +1181,7 @@ describe("流式完成追发短文本", () => {
     expect(cardFactory.create).toHaveBeenCalledWith("t_ping_nostream", {
       title: "测对话",
       streaming: false,
-      onBreakerOpen: expect.any(Function),
+      onFatal: expect.any(Function),
     });
     expect(sendTextMessage).not.toHaveBeenCalled();
   });
@@ -1211,10 +1211,10 @@ describe("流式完成追发短文本", () => {
     expect(lastPing()).not.toContain("已完成");
   });
 
-  it("没同步、且没发出文字补发（结果未知：finalizeOk=undefined 仅熔断仍开）：仍是「请回 Flowship 查看」的原文案", async () => {
+  it("没同步、且没发出文字补发（结果未知：finalizeOk=undefined 仅致命态未恢复）：仍是「请回 Flowship 查看」的原文案", async () => {
     await runTurnWithHealth({
       taskId: "t_ping_unsynced_nofb",
-      health: { finalizeOk: undefined, breakerOpen: true },
+      health: { finalizeOk: undefined, fatalActive: true },
     });
     expect(sendTextMessage).toHaveBeenCalledTimes(1); // 只有收尾提示、没有补发
     expect(lastPing()).toContain("⚠️ 回复没能同步到飞书卡片，请回 Flowship 查看（");
@@ -1377,7 +1377,7 @@ describe("终稿没落成 → 正文文字补发", () => {
 
   it.each([
     ["终稿已落成（finalizeOk=true）", { finalizeOk: true }, true, "awaiting_user"],
-    ["结果未知（finalizeOk=undefined、仅熔断仍开）：卡片可能其实已到位，免得重复刷屏", { finalizeOk: undefined, breakerOpen: true }, true, "awaiting_user"],
+    ["结果未知（finalizeOk=undefined、仅致命态未恢复）：卡片可能其实已到位，免得重复刷屏", { finalizeOk: undefined, fatalActive: true }, true, "awaiting_user"],
     ["失败轮（ok=false）：answerText 只是半截", { finalizeOk: false }, false, "awaiting_user"],
     ["用户自己停的（stopped）", { finalizeOk: false }, true, "idle"],
   ])("不补发：%s", async (_label, health, ok, runStatus) => {

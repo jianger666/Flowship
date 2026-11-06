@@ -42,6 +42,7 @@ describe("buildRevealInFolderSpec", () => {
       command: "explorer.exe",
       args: ['/select,"D:\\repositories\\git\\foo\\bar.txt"'],
       ignoreNonZeroExit: true,
+      windowsVerbatimArguments: true,
     });
   });
 
@@ -50,6 +51,7 @@ describe("buildRevealInFolderSpec", () => {
       command: "explorer.exe",
       args: ['/select,"C:\\foo\\bar.txt"'],
       ignoreNonZeroExit: true,
+      windowsVerbatimArguments: true,
     });
   });
 });

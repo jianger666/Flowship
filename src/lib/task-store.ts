@@ -2639,6 +2639,47 @@ export const bindRequirementGroup = async (
 };
 
 /**
+ * 设置本任务「群答疑回复是否流式」的任务级覆盖：true / false = 本任务自己的选择（盖过全局「流式回复」），
+ * null = 清掉、跟随全局。成功带最新任务；失败抛 ApiRequestError（弹窗 toast + 回滚乐观值）。
+ */
+export const setRequirementGroupStreaming = async (
+  taskId: string,
+  streaming: boolean | null,
+): Promise<{ ok: true; task: Task }> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/requirement-group/streaming`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ streaming }),
+    },
+  );
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ApiRequestError(`HTTP ${res.status}`, res.status);
+  }
+  if (!res.ok) {
+    const err =
+      typeof data === "object" && data !== null && "error" in data
+        ? (data as { error?: unknown })
+        : {};
+    throw new ApiRequestError(
+      typeof err.error === "string" && err.error.trim()
+        ? err.error.trim()
+        : `保存失败（HTTP ${res.status}）`,
+      res.status,
+    );
+  }
+  const ok = data as { ok?: unknown; task?: unknown };
+  if (ok.ok !== true || !ok.task) {
+    throw new ApiRequestError("保存响应异常", res.status || 500);
+  }
+  return { ok: true, task: ok.task as Task };
+};
+
+/**
  * 取消本任务自带的群关联（回落读项目群默认）。成功带最新任务；
  * 本来就没自带关联也算成功（cleared=false）。HTTP / 解析失败抛 ApiRequestError。
  */

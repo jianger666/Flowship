@@ -162,6 +162,8 @@ export const baseRouterDeps = (
   }),
   listSkillsWithSource: async () => [],
   prewarmTaskWorkspace: () => undefined,
+  // 取回被回复 / 引用的那条消息：默认「取不到」＝当没引用，绝不能打真飞书（同 larkApi 那条铁律）
+  fetchInboundMessageDetail: async () => null,
   ...overrides,
 });
 

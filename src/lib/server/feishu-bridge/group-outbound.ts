@@ -5,9 +5,10 @@
  *
  * 1. **ask 卡发群**：agent 调 ask_user → 若开了「问题同步到需求群」且该任务绑了群，
  *    把答题卡也发一份到群（跨角色答题；按钮回调是 card.action.trigger、天然只到属主本机）
- * 2. **回答回群**：群里 @bot 提的问题，只攒「最后一次工具调用之后」那段文字，done 时按
- *    回复协议（group-reply-protocol）落地：agent 可选择 NO_REPLY 不发、`@名字` 换成真 @。
- *    机器人提问人失败 / 空回答一律静默（防两个机器人互 @ 成环）。
+ * 2. **回答回群**：群里 @bot 提的问题，边出边推一张流式卡（group-card-stream；开关 = 任务级覆盖 > 设置页
+ *    全局「流式回复」），只认「最后一次工具调用之后」那段当终稿，done 时整卡换成终稿。
+ *    不再有回复协议（2026-11-06 撤）：agent 写什么发什么，只剩首行 NO_REPLY 不发（group-silent-reply）、
+ *    真人提问人开头固定 @。机器人提问人失败 / 空回答一律静默（防两个机器人互 @ 成环）。
  *    群里的文字（回答正文 / 短状态回执）一律发**文本卡**（`lark-api.sendMarkdownCardToChat`），
  *    不再发 text / post；上游仍按 `<at user_id>` 拼 @，发送前统一转成卡片写法。
  *    攒 / flush **只认事件 origin 与登记 runTag 相等的那一路 run**（token 化投递协议、
@@ -43,14 +44,18 @@ import { ACTION_LABEL, type Task } from "@/lib/types";
 import {
   isAdvanceResultToGroupEnabled,
   isAskToGroupEnabled,
+  isFeishuBridgeStreamingEnabled,
   isFeishuChatBridgeEnabled,
 } from "./bridge-config";
 import { parseAskVoidMarker, settleAskCardsOnVoidMarker } from "./ask-stale";
 import { rememberAskCard } from "./card-map";
 import { buildGroupAskCardJson } from "./group-ask-card";
 import { noteGroupSendFailure } from "./group-failure-notice";
-import type { GroupMember } from "./group-contract";
-import { parseGroupReply } from "./group-reply-protocol";
+import {
+  createGroupCardStream,
+  type GroupCardStream,
+} from "./group-card-stream";
+import { isSilentGroupReply, judgeGroupReply } from "./group-silent-reply";
 import {
   acceptGroupReplyMessage,
   appendGroupReplyAnswer,
@@ -110,15 +115,10 @@ export interface GroupOutboundDeps {
    * 这里动态 import（出向挂在 bootstrap 启动链上，静态连边会成环，见下注释）。
    */
   pumpGroupQuestionQueue: (taskId: string) => Promise<void>;
-  /**
-   * 群成员名单（回复协议把 `@名字` 换成真 @ 的唯一来源）。只用 `.members`；
-   * 拿不到 / 超时按空处理（照常发、只是不带真 @）。
-   */
-  fetchRoster: (chatId: string) => Promise<{ members: GroupMember[] }>;
-  /** 任务属主 = 本机登录用户；拿不到返 undefined（`@宿主` 不解析、「需属主确认」降级成纯文本） */
-  resolveOwner: () => Promise<{ openId: string; name: string } | undefined>;
-  /** 本机机器人自己的 open_id（协议保证绝不 @ 自己）；拿不到返 null / undefined */
-  getSelfOpenId: () => Promise<string | null | undefined>;
+  /** 全局「流式回复」开关（设置页）；任务级覆盖在 isGroupStreamingEnabled 里叠加 */
+  isStreamingEnabled: () => Promise<boolean>;
+  /** 建一张群答疑流式卡（按 chat_id 发到群里；首次 push 才真建卡） */
+  createGroupCardStream: (chatId: string) => GroupCardStream;
 }
 
 /**
@@ -147,16 +147,8 @@ const defaultDeps = (): GroupOutboundDeps => ({
   readArtifact: (absPath) => fs.readFile(absPath, "utf-8"),
   pumpGroupQuestionQueue: (taskId) =>
     import("./group-route").then((m) => m.pumpGroupQuestionQueue(taskId)),
-  // roster / lark-api 的身份接口同样走动态 import：它们的依赖链比出向厚，
-  // 静态连边会让只 mock 出向依赖的单测在 import 阶段就拉起整串（同上注释）
-  fetchRoster: async (chatId) =>
-    (await import("./group-roster")).fetchGroupRoster(chatId),
-  resolveOwner: async () => {
-    const id = await (await import("./lark-api")).getLarkLocalIdentity();
-    if (!id?.openId) return undefined;
-    return { openId: id.openId, name: id.userName ?? "" };
-  },
-  getSelfOpenId: async () => (await import("./lark-api")).getBotOpenId(),
+  isStreamingEnabled: isFeishuBridgeStreamingEnabled,
+  createGroupCardStream: (chatId) => createGroupCardStream({ chatId }),
 });
 
 let deps: GroupOutboundDeps = defaultDeps();
@@ -506,16 +498,21 @@ const flushGroupAdvanceReply = async (
 
 // ----------------- 答疑回复（question 登记）的出向落地 -----------------
 //
-// 旧设计的坑（2026-10-14 对接后端机器人「安若流年」）：整轮文字全发 + 无条件真 @ 回提问人 +
-// 失败时 @ 一句「去 Flowship 看事件流」→ 两个机器人互 @ 成环、对端上下文被带偏。
-// 现在系统只忠实落地答疑 agent 的决定（回不回 / @ 谁，协议见 group-contract），
-// 自己不再替它加戏：机器人提问人失败 / 空回答一律静默，群里绝不出现「Flowship / 事件流」。
+// 2026-11-06 用户拍板：「协议不用管，AI 自己判断就行」+「群里流式跟着 lk-harness 的来」——
+// 原先的回复协议（`@名字` 换真 @ / `[[需属主确认]]` 标记 / NO_REPLY 的各种变体）整套删掉：
+// 群里发的就是 agent 写的原样（卡片 markdown，`<at user_id>` 由 lark-api 转卡片写法），
+// 边出边推（group-card-stream）。只留两条系统层规矩：
+// ① 回复首行是 NO_REPLY → 不发（group-silent-reply；流式下首行没写完不起卡）；
+// ② 提问人是真人 → 系统在开头固定 @ 他（机器人不补：想让机器人看见，AI 自己写 @）；
+//    机器人提问人失败 / 空回答一律静默（群里绝不出现「Flowship / 事件流」）。
+// 答案仍是「最后一次工具调用之后那段」——中途「我先查一下…」的旁白不进最终回复
+//（流式中会短暂出现在卡上，收尾整卡换成终稿）。
 
 /** 真人提问人：这轮跑失败时发给群的中性提示（外部同事没有 Flowship，别让他去看事件流） */
 const GROUP_FAIL_HINT = "这轮我没答上来，麻烦再 @ 我一次";
 /** 真人提问人：这轮跑成功但没有任何文字时的提示 */
 const GROUP_EMPTY_HINT = "这轮我没整理出回复，麻烦再 @ 我一次";
-/** 机器人提问人时群里不发、只进「群问答」tab 的审计文案（tab 在属主的 Flowship 里，可以提 ta） */
+/** 机器人提问人时群里不发、只进群问答卡的审计文案（问答卡在属主的 Flowship 里，可以提 ta） */
 const BOT_FAIL_NOTE = "这轮没跑成功（提问方是机器人，群里未回复）";
 const BOT_EMPTY_NOTE = "这轮没有文字回复（提问方是机器人，群里未回复）";
 
@@ -523,33 +520,6 @@ const BOT_EMPTY_NOTE = "这轮没有文字回复（提问方是机器人，群�
 export const GROUP_REPLY_CHUNK_MAX = 1800;
 export const GROUP_REPLY_MAX_CHUNKS = 3;
 const GROUP_REPLY_OMITTED_TAIL = "（内容较长，后半已省略）";
-
-/** roster / 属主 / 机器人 open_id 每个外部调用的硬超时：慢一点就当没有，绝不拖住回群 */
-const EXTERNAL_LOOKUP_TIMEOUT_MS = 3_000;
-
-const withTimeout = async <T>(
-  label: string,
-  op: () => Promise<T>,
-  fallback: T,
-): Promise<T> => {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      Promise.resolve().then(op),
-      new Promise<T>((resolve) => {
-        timer = setTimeout(() => {
-          warn(`${label} 超时`, `${EXTERNAL_LOOKUP_TIMEOUT_MS}ms`);
-          resolve(fallback);
-        }, EXTERNAL_LOOKUP_TIMEOUT_MS);
-      }),
-    ]);
-  } catch (err) {
-    warn(label, err);
-    return fallback;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-};
 
 /**
  * 一段文本里的 `max` 位置不能落在 `<at ...>名字</at>` 中间：切断标签群里就是一堆乱码。
@@ -631,16 +601,95 @@ export const splitGroupReplyChunks = (
   return kept;
 };
 
-/** tab 里存的答案：把 `<at user_id="ou_x">名字</at>` 还原成 `@名字`（tab 不渲染飞书标签） */
+/** 问答卡里存的答案：把 `<at user_id="ou_x">名字</at>` 还原成 `@名字`（问答卡不渲染飞书标签） */
 const atTagsToPlain = (text: string): string =>
   text.replace(/<at\b[^>]*>([\s\S]*?)<\/at>/gi, (_m, name: string) =>
     name.trim() ? `@${name.trim()}` : "",
   );
 
+/** 发言前缀：真人提问人固定 @ 他（`atRequester === false` 的旧登记不补）；机器人不补 */
+const replyPrefix = (entry: PendingGroupReply): string =>
+  entry.requesterIsBot === true ||
+  entry.atRequester === false ||
+  !entry.requesterOpenId
+    ? ""
+    : `${mentionTag(entry.requesterOpenId, entry.requesterName)} `;
+
+// ----------------- 群答疑流式卡（per 登记） -----------------
+
+/** 一条登记的流式状态：enabled = 本轮开不开流式（首个 delta 读一次定稿）；stream = 卡（判定要说话后才建） */
+type GroupStreamState = {
+  enabled: boolean;
+  stream?: GroupCardStream;
+  /** 最近一次推给卡的全文（落盘版 / 同文重复帧不重复推） */
+  lastPushed?: string;
+};
+
+/** 同时在飞的流式状态上限（防登记被各种路径悄悄摘掉后泄漏；超限丢最老的） */
+const GROUP_STREAM_STATES_MAX = 64;
+
+/** 这个任务的群回复要不要流式：任务级覆盖（需求群弹窗）> 全局「流式回复」；读不到按全局 */
+const isGroupStreamingEnabled = async (taskId: string): Promise<boolean> => {
+  try {
+    const task = await deps.getTask(taskId);
+    const override = task?.feishuGroupStreaming;
+    if (typeof override === "boolean") return override;
+  } catch (err) {
+    warn(`读任务级流式开关 task=${taskId}`, err);
+  }
+  try {
+    return await deps.isStreamingEnabled();
+  } catch (err) {
+    warn("读全局流式开关", err);
+    return true;
+  }
+};
+
 /**
- * question 登记收口（已 take）：按「最终段 + 回复协议」决定群里发什么、tab 记什么。
- * 整条链外部 IO（roster / 属主 / 机器人 open_id）各自 3s 硬超时 + 退化成空，
- * 绝不让它们阻塞或拖垮回群；整段仍在 handleGroupOutboundEvent 的 try/catch 里。
+ * 回答文本又长了（delta / 落盘版兜底）：把「当前要发的文本」推给流式卡。
+ * 只在判定「要说话」之后才建卡（NO_REPLY / 空回复不会在群里留下卡）；一轮的开关值在首个 delta 读一次定稿。
+ */
+const streamGroupReply = async (
+  taskId: string,
+  runTag: string | null,
+): Promise<void> => {
+  const entry = peekGroupReply(taskId, runTag);
+  if (!entry || entry.kind !== "question") return;
+  const { streams } = getReg();
+  let st = streams.get(entry.token);
+  if (!st) {
+    if (streams.size >= GROUP_STREAM_STATES_MAX) {
+      const oldest = streams.keys().next().value;
+      if (oldest !== undefined) streams.delete(oldest);
+    }
+    st = { enabled: true };
+    streams.set(entry.token, st);
+    st.enabled = await isGroupStreamingEnabled(taskId);
+  }
+  if (!st.enabled) return;
+  const text = finalGroupReplyText(entry);
+  // 每次都重新判：首行没写完（可能是 NO_REPLY）先别起卡；判成沉默就不推——
+  // 已经起了卡的话，卡保持上一次推过的内容（新一段写成 NO_REPLY 不能把「NO_REPLY」字样推到群里）
+  const verdict = judgeGroupReply(text);
+  if (verdict !== "speak") return;
+  const full = `${replyPrefix(entry)}${text}`;
+  if (full === st.lastPushed) return;
+  st.stream ??= deps.createGroupCardStream(entry.chatId);
+  st.stream.push(full);
+  st.lastPushed = full;
+};
+
+/** 摘掉一条登记的流式状态（收口 / 被摘都走这里）；返回它让调用方决定怎么收尾 */
+const takeStreamState = (token: string): GroupStreamState | undefined => {
+  const { streams } = getReg();
+  const st = streams.get(token);
+  streams.delete(token);
+  return st;
+};
+
+/**
+ * question 登记收口（已 take）：按「最终段」决定群里发什么、问答卡记什么。
+ * 有流式卡就把卡收尾成终稿（多余的块另发文本卡），没有就直接发文本卡。
  */
 const flushQuestionReply = async (
   taskId: string,
@@ -651,15 +700,17 @@ const flushQuestionReply = async (
   const askerName = entry.requesterName.trim();
   const at = mentionTag(entry.requesterOpenId, entry.requesterName);
   const finalText = finalGroupReplyText(entry);
+  const stream = takeStreamState(entry.token)?.stream;
+  const prefix = replyPrefix(entry);
 
   let toSend: string[] = [];
   let recorded = "";
   let noReply = false;
-  let needsOwner: string | undefined;
   let mentioned: string[] = [];
 
   if (!ok) {
-    // 失败：机器人提问人一个字都不发（对端把群消息当上下文，发了就是污染 + 可能再触发它回话）
+    // 失败：机器人提问人一个字都不发（对端把群消息当上下文，发了就是污染 + 可能再触发它回话）；
+    // 但流式卡若已经在群里了，就让它保持已有内容收尾（不能一直挂着「生成中」）
     if (askerIsBot) {
       recorded = BOT_FAIL_NOTE;
     } else {
@@ -675,80 +726,46 @@ const flushQuestionReply = async (
       recorded = `${askerName ? `@${askerName} ` : ""}${GROUP_EMPTY_HINT}`;
       mentioned = [askerName || "你"];
     }
+  } else if (isSilentGroupReply(finalText)) {
+    // agent 自己选择不回：群里零消息；原话存进问答卡供审计
+    noReply = true;
+    recorded = finalText;
   } else {
-    const [members, owner, selfOpenId] = await Promise.all([
-      withTimeout(
-        "roster",
-        async () => (await deps.fetchRoster(entry.chatId)).members ?? [],
-        [] as GroupMember[],
-      ),
-      withTimeout("属主身份", () => deps.resolveOwner(), undefined),
-      withTimeout("机器人 open_id", () => deps.getSelfOpenId(), null),
-    ]);
-    const parsed = parseGroupReply(finalText, {
-      members,
-      ...(owner?.openId ? { owner } : {}),
-      requester: {
-        openId: entry.requesterOpenId,
-        name: entry.requesterName,
-        isBot: askerIsBot,
-      },
-      ...(selfOpenId ? { selfOpenId } : {}),
-    });
-    if (parsed.kind === "silent") {
-      // agent 自己选择不回：群里零消息；原话存 tab 供审计
-      noReply = true;
-      recorded = finalText;
-    } else {
-      toSend = splitGroupReplyChunks(parsed.text);
-      recorded = atTagsToPlain(toSend.join("\n\n"));
-      mentioned = parsed.mentions.map((m) => m.name);
-      needsOwner = parsed.needsOwner;
-    }
+    toSend = splitGroupReplyChunks(`${prefix}${finalText}`);
+    recorded = atTagsToPlain(toSend.join("\n\n"));
+    if (prefix) mentioned = [askerName || "你"];
   }
 
-  // 发送炸了也写汇总（review C 二轮）：外层整段吞异常，不写 tab 与群就两边全静默、没处查。
+  // 发送炸了也写汇总（review C 二轮）：外层整段吞异常，不写问答卡与群就两边全静默、没处查。
   // take 先摘，写两次不可能 duplicate。多块发送遇到第一个失败就停（后面的没有意义）。
   let sendOk = true;
-  for (const chunk of toSend) {
-    try {
-      // 不再拼 head：该有的 @ 已经在 text 里（协议自动补 / agent 自己写的）
-      await deps.sendMarkdown(entry.chatId, chunk);
-    } catch (err) {
+  if (stream) {
+    // 卡已在群里：无论成败都要收尾；toSend 为空（机器人失败 / 静默）= 保持卡上已有内容、只关流式
+    const res = await stream.finalize(toSend);
+    if (!res.delivered) {
       sendOk = false;
-      warn(`回答回群发送失败 task=${taskId}`, err);
-      // 答疑回复没发出去：除了群问答 tab 的 ok:false 汇总，主事件流也留一条 info 让属主看得见
-      await noteGroupSendFailure(taskId, entry.chatId, err, "答疑回复");
-      break;
+      warn(`回答回群发送失败 task=${taskId}`, res.error);
+      await noteGroupSendFailure(taskId, entry.chatId, res.error, "答疑回复");
+    }
+  } else {
+    for (const chunk of toSend) {
+      try {
+        // 不再拼 head：该有的 @ 已经在 text 里（固定前缀 / agent 自己写的）
+        await deps.sendMarkdown(entry.chatId, chunk);
+      } catch (err) {
+        sendOk = false;
+        warn(`回答回群发送失败 task=${taskId}`, err);
+        // 答疑回复没发出去：除了群问答卡的 ok:false 汇总，主事件流也留一条 info 让属主看得见
+        await noteGroupSendFailure(taskId, entry.chatId, err, "答疑回复");
+        break;
+      }
     }
   }
 
-  // 需属主确认：写主事件流 info（不带 origin、不带 groupRun / groupQaSummary，
-  // 不被 event-stream-hidden 的现有规则藏掉），属主在 app 里能一眼看到待办。
-  // 发群失败也要写——属主需要知道有人在等他。
-  if (needsOwner) {
-    try {
-      await writeEventAndPublish(taskId, {
-        kind: "info",
-        text: `群里有事等你拍板（来自 ${askerName || "群成员"}）：${needsOwner}`,
-        meta: {
-          groupNeedsOwner: {
-            runTag: entry.runTag ?? "",
-            askerName: askerName || "群成员",
-            askerOpenId: entry.requesterOpenId,
-            note: needsOwner,
-          },
-        },
-      });
-    } catch (err) {
-      warn(`写需属主确认事件 task=${taskId}`, err);
-    }
-  }
-
-  // 群问答 tab 的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
-  // 发送炸了也记（ok:false）：答案躺 tab 里至少能复制，不至于两边全静默。
+  // 群问答卡的聚合记录（只记旁路 restricted 轮：runTag 非空；属主通道不记）。
+  // 发送炸了也记（ok:false）：答案躺问答卡里至少能复制，不至于两边全静默。
   // publish 不带 origin：投不进任何登记、不触发回群。
-  // 并入同会话的非属主一轮不写（sameSession）：它的问与答都在主事件流里，不再往群问答 tab 灌新数据
+  // 并入同会话的非属主一轮不写（sameSession）：它的问与答都在主事件流里，不再往群问答卡灌新数据
   if (entry.runTag && !entry.sameSession) {
     await writeEventAndPublish(
       taskId,
@@ -763,7 +780,6 @@ const flushQuestionReply = async (
         ok: sendOk && ok,
         askerIsBot,
         ...(noReply ? { noReply: true } : {}),
-        ...(needsOwner ? { needsOwner } : {}),
         ...(mentioned.length > 0 ? { mentioned } : {}),
         startedAt: entry.startedAt,
         durationMs: Math.max(0, Date.now() - entry.startedAt),
@@ -872,7 +888,7 @@ export const reviewExpiredGroupAdvance = async (
 /**
  * question 登记没等到收口就被摘了（2h 到期 / 超 8 条被挤）→ 写一条 ok:false 汇总。
  *
- * 对应 advance 的收口回执，但只写 tab、不回群：2h 前的 @ 此刻再弹出来更吓人。
+ * 对应 advance 的收口回执，但只写问答卡、不回群：2h 前的 @ 此刻再弹出来更吓人。
  * runTag 沿用登记的（restricted 旁路 = 问题事件 restrictedRunTag，精确配对）；
  * 属主通道没有 runTag，用 `dropped:<token>` 另起 + questionMessageId 兜底配对。
  * 整段吞异常——这是收尾补偿，绝不能影响主链（对外可测）。
@@ -883,7 +899,14 @@ export const handleDroppedQuestionReply = (
   reason: GroupQuestionDroppedReason,
 ): void => {
   if (dropped.kind !== "question") return;
-  // 并入同会话的非属主一轮：不写群问答 tab 汇总（新数据不进 tab）；属主在主事件流里本就看得到这一轮
+  // 已经起了流式卡的登记被摘：卡不能一直挂着「生成中」——按卡上已有内容收尾（不补任何文字）
+  const droppedStream = takeStreamState(dropped.token)?.stream;
+  if (droppedStream) {
+    void droppedStream.finalize([]).catch((err) => {
+      warn(`被摘登记的流式卡收尾 task=${taskId}`, err);
+    });
+  }
+  // 并入同会话的非属主一轮：不写群问答卡汇总（新数据不再生成旁路问答卡）；属主在主事件流里本就看得到这一轮
   if (dropped.sameSession) return;
   void (async () => {
     try {
@@ -1045,6 +1068,7 @@ export const handleGroupOutboundEvent = async (
 
     if (ev.kind === "assistant_delta") {
       appendGroupReplyAnswer(taskId, runTag, ev.text);
+      await streamGroupReply(taskId, runTag);
       return;
     }
     if (ev.kind === "done") {
@@ -1128,6 +1152,8 @@ export const handleGroupOutboundEvent = async (
       // delta 已攒过就别重复追加（完整消息是同一段文字的落盘版）；
       // 晚于 tool_call 到达的落盘版由登记里的「待认领段落」去重，见 acceptGroupReplyMessage
       acceptGroupReplyMessage(taskId, runTag, ev.event.text);
+      // 没有 delta、只有落盘版的兜底路径：这里也要推给流式卡
+      await streamGroupReply(taskId, runTag);
     }
   } catch (err) {
     warn(`处理事件 task=${taskId}`, err);
@@ -1148,6 +1174,8 @@ type GroupOutboundGlobal = {
    * 只在 per-task 串行链里读写；主链 done / 被新 user_reply 打断时清掉。
    */
   turns: Map<string, string>;
+  /** 群答疑流式卡的 per 登记状态（token → 状态）；收口 / 被摘时清掉 */
+  streams: Map<string, GroupStreamState>;
 };
 
 const getReg = (): GroupOutboundGlobal => {
@@ -1161,10 +1189,12 @@ const getReg = (): GroupOutboundGlobal => {
       unsub: null,
       chains: new Map(),
       turns: new Map(),
+      streams: new Map(),
     };
   }
-  // 热更新后沿用的旧 globalThis 注册表可能没有 turns（旧版本建的）：补上
+  // 热更新后沿用的旧 globalThis 注册表可能没有 turns / streams（旧版本建的）：补上
   g[REG_KEY]!.turns ??= new Map();
+  g[REG_KEY]!.streams ??= new Map();
   return g[REG_KEY]!;
 };
 
@@ -1177,7 +1207,7 @@ export const ensureFeishuGroupOutboundRegistered = (): void => {
   setGroupAdvanceExpiryHandler((taskId, token) => {
     void reviewExpiredGroupAdvance(taskId, token);
   });
-  // question 登记被静默摘掉时写 ok:false 汇总（只进 tab、不回群，十六轮 P3）
+  // question 登记被静默摘掉时写 ok:false 汇总（只写问答卡、不回群，十六轮 P3）
   setGroupQuestionDroppedHandler(handleDroppedQuestionReply);
   // task 待送达队列里排着的非属主消息被丢弃 → 给发言人回一句（task 侧不 import 群模块，靠这个钩子）
   setTalkQueueGroupOtherDropHandler(handleGroupOtherDropped);
@@ -1199,6 +1229,7 @@ export const __resetGroupOutboundForTest = (): void => {
   reg.registered = false;
   reg.chains.clear();
   reg.turns.clear();
+  reg.streams.clear();
   clearPumpRetries();
   setGroupAdvanceExpiryHandler(null);
   setGroupQuestionDroppedHandler(null);

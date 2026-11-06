@@ -1,16 +1,17 @@
 /**
  * 群问答「并进事件流」：做完的旁路答疑轮次（轮次汇总事件）内联成一张卡，出现在主事件流里。
  *
- * 口径（2026-11-04，用户拍板「全部都在事件流里」；无活会话降级通道 + 老版本数据仍走旁路，所以 tab 没删）：
+ * 口径（2026-11-04 用户拍板「全部都在事件流里」；2026-11-05 去掉「群问答」页签、事件流是唯一去处。
+ * 无活会话时的只读旁路答疑通道仍在，它的结果就是这张内联卡）：
  * - 单一隐藏闸：旁路问题事件（restrictedRunTag）仍藏；**轮次汇总事件不再藏**
  * - 汇总 → 轮次 的配对复用 collectGroupQaRounds 的结果（卡里带问题原文），脏数据 / 没配上 = null（落回 info 细线）
- * - 进行中 / 被打断（没有汇总）的轮次不在流里——只在 tab（蓝点提示）
+ * - 进行中的轮次靠开跑时落的一条 info 提示；被打断（没有汇总）的轮次不留卡
  * - 过程事件（meta.groupRun）仍藏
  * - 并入同会话的非属主一轮（groupNonOwnerTurn）不产生汇总、不进这里
  *
  * 没有 jsdom / 浏览器：真实像素与滚动行为不在这里验证。SSR 渲染 + 源码接线契约。
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -187,14 +188,25 @@ describe("事件流接线契约", () => {
     );
   });
 
-  it("轮次表由 collectGroupQaRounds 的结果按 key 建（与 tab 同一个数据源，不另算一份）", () => {
+  it("轮次表由 collectGroupQaRounds 的结果按 key 建（不另算一份）", () => {
     expect(stream).toMatch(
       /groupQaRoundsByKey = useMemo\(\s*\(\) => new Map\(groupQaRounds\.map/,
     );
   });
 
-  it("群问答 tab 仍在（降级通道 + 老数据 + 进行中 / 过程 / 待你决定汇总要用）", () => {
-    expect(stream).toContain("<GroupQaPanel");
+  it("没有单独的「群问答」页签：事件流是群里提问的唯一去处（2026-11-05 去掉页签）", () => {
+    expect(stream).not.toContain("GroupQaPanel");
+    expect(stream).not.toContain("showGroupQa");
+    expect(stream).not.toContain("onGroupQaVisibleChange");
+    expect(stream).not.toMatch(/群问答[（(]/);
+    expect(existsSync(path.resolve(import.meta.dirname, "..", "src/components/tasks/group-qa-panel.tsx"))).toBe(false);
+    expect(existsSync(path.resolve(import.meta.dirname, "..", "src/lib/group-qa-scope.ts"))).toBe(false);
+  });
+
+  it("任务页不再因页签隐藏底部输入条", () => {
+    const page = readSrc("src/app/tasks/[id]/page.tsx");
+    expect(page).not.toContain("groupQaVisible");
+    expect(page).not.toContain("onGroupQaVisibleChange");
   });
 
   it("隐藏闸里不再有汇总事件分支（只认问题事件），且不再 import isGroupQaSummaryEvent", () => {

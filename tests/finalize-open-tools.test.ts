@@ -259,7 +259,7 @@ describe("finalizeOpenToolCalls（run cancel 后闭合）", () => {
   });
 });
 
-// G2-02：群答疑旁路 run 的事件整条链都带 meta.groupRun（UI 据此把它折进「群问答」tab、不进属主主流）。
+// G2-02：群答疑旁路 run 的事件整条链都带 meta.groupRun（UI 据此把它折进问答卡的「查看过程」、不进属主主流）。
 // 属主 run 收尾时扫到旁路遗留的未闭合 tool_call，补写的 tool_result 若不带同一个标，
 // 就成了「call 被藏、result 露在主流里」的孤儿中断块。
 describe("群答疑旁路遗留的 tool_call（G2-02）", () => {

@@ -87,6 +87,7 @@ import {
   type DockGeometry,
   type MediaPrefs,
 } from "@/lib/media/media-memory";
+import { watchUserSeek, type ResumeNoticeWatch } from "@/lib/media/media-resume-notice";
 import { resolveMediaShortcut, stepRate, type MediaCommand } from "@/lib/media/media-shortcuts";
 import { clampNumber, formatBytes, formatClock, parseClock } from "@/lib/media/media-time";
 import { localMediaSubtitleUrl, localMediaSubtitlesUrl, localMediaUrl } from "@/lib/media/media-url";
@@ -277,6 +278,8 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   const pathRef = useRef(path);
   pathRef.current = path;
   const [resumedFrom, setResumedFrom] = useState<number | null>(null);
+  // 「已从上次位置继续」提示的 seek 监听器：续播自己的那一跳要在它这儿登记，别把刚出现的提示收掉
+  const resumeWatchRef = useRef<ResumeNoticeWatch | null>(null);
   // `path#t=起,止` 带终点的引用：播到终点就停。用户自己拖进度 / 键盘跳转 = 接管，取消这个终点
   const [segEnd, setSegEnd] = useState<number | null>(null);
 
@@ -313,6 +316,19 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.reqNonce]);
 
+  // 「已从上次位置继续」的提示：用户自己动了进度（拖进度条 / 键盘跳转 / 跳转到… / 媒体键）后它就不再描述现状，收掉。
+  // 用 layout effect 且排在下面「元数据到了」那个 effect 之前：监听必须赶在 loadedmetadata 触发续播那一跳之前就位
+  useLayoutEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const watch = watchUserSeek(v, () => setResumedFrom(null));
+    resumeWatchRef.current = watch;
+    return () => {
+      watch.stop();
+      resumeWatchRef.current = null;
+    };
+  }, []);
+
   // 元数据到了：套用待办的起点（续播 / 指定时间 / 对比组切换保持进度）、播放
   useLayoutEffect(() => {
     const v = videoRef.current;
@@ -332,7 +348,11 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
       } else {
         t = clampNumber(p.time, 0, dur > 0 ? Math.max(0, dur - 0.05) : p.time);
       }
-      if (t > 0) v.currentTime = t;
+      if (t > 0) {
+        // 续播这一跳不是用户动的进度：先登记，紧随其后的 seeked 不收提示
+        if (p.time === "resume") resumeWatchRef.current?.expectResumeJump(t);
+        v.currentTime = t;
+      }
       if (p.play) void v.play().catch(() => {});
     };
     v.addEventListener("loadedmetadata", onMeta);

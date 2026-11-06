@@ -351,11 +351,11 @@ describe("进入对话 / 任务一律落在最后一条、处于「跟随最新�
   });
 
   it("初始定位 latch：第一次有 items 就开跟随、并把 Virtuoso 的初始项定为最后一条（无条件、不看任何记忆）", () => {
-    // 评审 R8-3：闸头带 `!showQaPanel`——latch 只在「这一次渲染真的会挂上 Virtuoso」时消耗定位闸
-    // （QA tab 里的重渲不能把进入 QA 时刚开的闸白白消耗掉；行为见 tests/event-stream-remount-landing.test.ts）
+    // 评审 R8-3：latch 只在「这一次渲染真的会挂上 Virtuoso」（items.length > 0）时消耗定位闸
+    // （行为见 tests/event-stream-remount-landing.test.ts）
     const latch = between(
       code,
-      "if (!initialPositionedRef.current && !showQaPanel && items.length > 0) {",
+      "if (!initialPositionedRef.current && items.length > 0) {",
       "\n  }\n",
     );
     expect(latch).toContain("follow.setFollowing(true);");

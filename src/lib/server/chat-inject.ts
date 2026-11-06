@@ -151,6 +151,12 @@ export interface ChatInjectOptions {
    * user_reply 落盘）与普通消息完全一致。
    */
   scheduledTrigger?: boolean;
+  /**
+   * 只给 agent 看的上下文（拼在用户原文**后面**、不进事件气泡、不参与指纹）。
+   * 用途：飞书单聊里回复 / 引用了某条消息时，被引用的那条以引用块交给 agent。
+   * 只能由服务端可信调用方经 options 传入——**不要**做成请求体字段（否则任何 HTTP 客户端都能往 agent 消息里塞内容）。
+   */
+  agentContext?: string;
 }
 
 const MAX_IMAGES_PER_REPLY = 6;
@@ -428,7 +434,12 @@ const runChatReplyInject = async (
 
   // 事件 = 用户原文；agent = 跳过上下文 + skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）
   // （URL 自动抓取投喂做过又撤了——2026-07-21 用户实测收益不大问题多、链接交给 agent 自己解析）
-  const agentText = askSkip.hint + buildSkillDirective(skills) + text;
+  // agentContext（引用块等）跟在原文后；原文为空（纯附件）时先垫占位，免得 agent 只看到一个孤零零的引用块
+  const agentContextTail = options.agentContext
+    ? `${text.length > 0 ? "\n\n" : fallbackText ? `${fallbackText}\n\n` : ""}${options.agentContext}`
+    : "";
+  const agentText =
+    askSkip.hint + buildSkillDirective(skills) + text + agentContextTail;
 
   // Phase 3：绑定 workdir 的 chat 在 agent 开工前打 git tree 快照（失败不挡发消息）
   const tryCaptureCheckpoint = async (): Promise<CaptureCheckpointResult> => {

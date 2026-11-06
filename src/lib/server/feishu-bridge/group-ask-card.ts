@@ -10,6 +10,7 @@
  * 卡片实体不同、id 撞不上；答完置态的 patch 也就能跟 p2p 走同一套 helper。
  */
 
+import { CARD_BASE_CONFIG } from "./card-config";
 import {
   askOptionElementId,
   askQuestionElementId,
@@ -86,7 +87,7 @@ export const buildGroupAskCardJson = (
 
   return {
     schema: "2.0",
-    config: { update_multi: true },
+    config: { ...CARD_BASE_CONFIG },
     header: {
       title: {
         tag: "plain_text",

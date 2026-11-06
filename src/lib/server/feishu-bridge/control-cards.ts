@@ -7,6 +7,7 @@
  * 单测不需要 mock 本模块。
  */
 
+import { CARD_BASE_CONFIG } from "./card-config";
 import { shortHash } from "./card-stream";
 import type { CardButtonValue, PanelCommand } from "./types";
 
@@ -49,7 +50,7 @@ const cardShell = (
   elements: unknown[],
 ): Record<string, unknown> => ({
   schema: "2.0",
-  config: { update_multi: true },
+  config: { ...CARD_BASE_CONFIG },
   header: {
     title: { tag: "plain_text", content: title },
     template: "blue",

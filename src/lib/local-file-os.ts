@@ -16,6 +16,16 @@ export interface OsSpawnSpec {
    * route 对这类 command 应忽略 exit code（只认 spawn error）。
    */
   ignoreNonZeroExit?: boolean;
+  /**
+   * Windows 专用：spawn 时传 `windowsVerbatimArguments: true`，args 原样拼进命令行、不再由 Node 重新加引号。
+   *
+   * 为什么 `explorer /select,"…"` 必须这样：Node 在 Windows 上对「含空格 / 双引号」的 argv 会整体包一层引号、
+   * 并把里面的 `"` 转成 `\"`——`/select,"C:\a\b.html"` 会变成 `"/select,\"C:\a\b.html\""`。
+   * explorer 自己解析命令行、不认 `\"` 这种转义，认不出要选的文件，就只会打开默认文件夹（文档 / 此电脑），
+   * 表现为「在文件管理器中显示」点了没定位到文件。原样传就是 `explorer.exe /select,"C:\a\b.html"`，
+   * 与在 cmd 里手敲 / `exec` 同款。非 Windows 平台这个选项被 Node 忽略。
+   */
+  windowsVerbatimArguments?: boolean;
 }
 
 /** Windows 路径交给 explorer 前必须用反斜杠：正斜杠会被当成 /switch（打开错目录 / Documents） */
@@ -32,12 +42,14 @@ export const buildRevealInFolderSpec = (
   }
   if (platform === "win32") {
     // 正斜杠会被 explorer 当成 /switch（打开错目录）；空格路径需引号。
-    // 单 argv `/select,"C:\a b\f"` 与 Electron shell.showItemInFolder 同款。
+    // 单 argv `/select,"C:\a b\f"`，且必须 windowsVerbatimArguments——否则 Node 会把里面的引号转义成 `\"`，
+    // explorer 不认、不选中文件（见 OsSpawnSpec.windowsVerbatimArguments）。
     const winPath = toWindowsExplorerPath(absPath);
     return {
       command: "explorer.exe",
       args: [`/select,"${winPath}"`],
       ignoreNonZeroExit: true,
+      windowsVerbatimArguments: true,
     };
   }
   // Linux 等：xdg-open 父目录（无法选中文件本身、比完全没反应强）

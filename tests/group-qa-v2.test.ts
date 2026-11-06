@@ -2,7 +2,7 @@
  * 群协作 v2 对 group-qa 的扩展：
  * - 汇总事件新增可选字段（askerIsBot / noReply / needsOwner / mentioned / startedAt / durationMs）
  *   的写入 / 读出 / 容错 / 向后兼容；
- * - 聚合透传到 GroupQaRound；pickRoundsNeedingOwner；
+ * - 聚合透传到 GroupQaRound；
  * - 「查看过程」的数据源 collectGroupRunSteps（meta.groupRun 归属 + 精简 + 30 条封顶）。
  *
  * 契约见 server/feishu-bridge/group-contract.ts 末尾「落盘事件的 meta 约定」。
@@ -14,14 +14,11 @@ import {
   collectGroupQaRounds,
   collectGroupRunSteps,
   GROUP_QA_ANSWERING_RECENT_MS,
-  GROUP_QA_NEEDS_OWNER_RECENT_MS,
   GROUP_RUN_META_KEY,
   GROUP_RUN_STEPS_LIMIT,
   groupRunTagOf,
-  pickRoundsNeedingOwner,
   readGroupQaSummary,
   summarizeGroupRunToolArgs,
-  type GroupQaRound,
 } from "@/lib/group-qa";
 import type { TaskEvent } from "@/lib/types";
 
@@ -330,73 +327,6 @@ describe("collectGroupQaRounds：新字段透传", () => {
     );
     expect(r.answering).toBe(true);
     expect(r.askerIsBot).toBe(true);
-  });
-});
-
-describe("pickRoundsNeedingOwner", () => {
-  const round = (over: Partial<GroupQaRound>): GroupQaRound => ({
-    key: "k",
-    ts: NOW - 1000,
-    askerName: "A",
-    askerOpenId: "ou",
-    questionText: "",
-    answerText: "",
-    ok: true,
-    answering: false,
-    legacy: false,
-    ...over,
-  });
-
-  it("只留 needsOwner 非空的，按时间从新到旧", () => {
-    const rounds = [
-      round({ key: "a", ts: NOW - 3000, needsOwner: "甲" }),
-      round({ key: "b", ts: NOW - 2000 }),
-      round({ key: "c", ts: NOW - 1000, needsOwner: "丙" }),
-      round({ key: "d", ts: NOW - 500, needsOwner: "   " }),
-      round({ key: "e", ts: NOW - 100, needsOwner: "" }),
-    ];
-    expect(pickRoundsNeedingOwner(rounds, { now: NOW }).map((r) => r.key)).toEqual(
-      ["c", "a"],
-    );
-  });
-
-  it("超出时间窗（默认 24h）的不再顶在 tab 顶部；窗口可调", () => {
-    const old = round({
-      key: "old",
-      ts: NOW - GROUP_QA_NEEDS_OWNER_RECENT_MS - 1,
-      needsOwner: "旧",
-    });
-    const edge = round({
-      key: "edge",
-      ts: NOW - GROUP_QA_NEEDS_OWNER_RECENT_MS,
-      needsOwner: "边界",
-    });
-    expect(pickRoundsNeedingOwner([old, edge], { now: NOW }).map((r) => r.key)).toEqual(
-      ["edge"],
-    );
-    expect(
-      pickRoundsNeedingOwner([old, edge], { now: NOW, maxAgeMs: Infinity }).map(
-        (r) => r.key,
-      ),
-    ).toEqual(["edge", "old"]);
-  });
-
-  it("空输入 / 无待决定 → 空数组；不改入参顺序", () => {
-    expect(pickRoundsNeedingOwner([], { now: NOW })).toEqual([]);
-    const rounds = [
-      round({ key: "x", ts: NOW - 2000, needsOwner: "x" }),
-      round({ key: "y", ts: NOW - 1000, needsOwner: "y" }),
-    ];
-    pickRoundsNeedingOwner(rounds, { now: NOW });
-    expect(rounds.map((r) => r.key)).toEqual(["x", "y"]);
-    expect(
-      pickRoundsNeedingOwner([round({ key: "z" })], { now: NOW }),
-    ).toEqual([]);
-  });
-
-  it("不传 opts 用当前时间（刚发生的算近）", () => {
-    const r = round({ key: "now", ts: Date.now() - 1000, needsOwner: "n" });
-    expect(pickRoundsNeedingOwner([r]).map((x) => x.key)).toEqual(["now"]);
   });
 });
 

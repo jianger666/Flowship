@@ -107,9 +107,11 @@ const baseDeps = (over: Record<string, unknown> = {}) => ({
   isAskToGroupEnabled: async () => true,
   isAdvanceResultToGroupEnabled: async () => true,
   readArtifact: async () => "# 复核报告\n\n没发现问题",
-  fetchRoster: async () => ({ members: [] }),
-  resolveOwner: async () => undefined,
-  getSelfOpenId: async () => null,
+  // 群答疑回复默认走「一次性发文本卡」（流式关）；真流式卡会起 lark-cli，这里一律桩掉
+  isStreamingEnabled: async () => false,
+  createGroupCardStream: () => {
+    throw new Error("测试不该走真流式卡");
+  },
   ...over,
 });
 

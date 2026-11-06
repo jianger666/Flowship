@@ -52,6 +52,7 @@ import {
   sendInteractiveCardToChat,
   sendMarkdownCardToChat,
 } from "@/lib/server/feishu-bridge/lark-api";
+import { CARD_BASE_CONFIG } from "@/lib/server/feishu-bridge/card-config";
 import { mentionTag } from "@/lib/server/feishu-bridge/group-shared";
 import {
   describeLarkError,
@@ -1307,7 +1308,7 @@ export const buildShareCardJson = (opts: {
 
   return {
     schema: "2.0",
-    config: { update_multi: true },
+    config: { ...CARD_BASE_CONFIG },
     header: {
       title: { tag: "plain_text", content: headerTitle.slice(0, 50) },
       template: meta.template,

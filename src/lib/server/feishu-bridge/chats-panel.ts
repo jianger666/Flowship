@@ -45,6 +45,7 @@ import {
   findCustomProvider,
   migrateProviderSettings,
 } from "@/lib/agent-provider";
+import { CARD_BASE_CONFIG } from "./card-config";
 import { shortHash } from "./card-stream";
 import {
   getBotAppInfo,
@@ -182,7 +183,7 @@ const panelShell = (
   template = "blue",
 ): Record<string, unknown> => ({
   schema: "2.0",
-  config: { update_multi: true },
+  config: { ...CARD_BASE_CONFIG },
   header: {
     title: { tag: "plain_text", content: title.slice(0, 50) },
     template,

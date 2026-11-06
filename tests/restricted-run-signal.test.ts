@@ -129,7 +129,7 @@ describe("客户端分发：SSE restricted_run → onRestrictedRun", () => {
 // UI 组件在 node 环境跑不起来（见 vitest.config.ts），页面与路由这两段靠源码契约守——
 // 与 tests/event-stream-run-active.test.ts 同款手法
 describe("接线契约", () => {
-  it("任务详情页不再把旁路信号并进运行态（第四轮 Q5-01）：旁路过程事件整条藏在「群问答」tab", () => {
+  it("任务详情页不再把旁路信号并进运行态（第四轮 Q5-01）：旁路过程事件整条被藏起来（只在问答卡的「查看过程」里）", () => {
     const source = readSrc("app", "tasks", "[id]", "page.tsx");
     // 旧：订阅 onRestrictedRun 并进 isRunning——结果是仅旁路在飞时组尾冒出「处理中…」转圈。
     // 现在页面不订阅、不保存旁路状态；SSE 帧与服务端 bootstrap 补帧仍保留（别的消费者可用，见下一条）。

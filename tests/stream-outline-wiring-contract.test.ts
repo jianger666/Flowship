@@ -8,7 +8,7 @@
  *      不另起「整窗替换」（评审 RC2：窗口整体换掉会让 Virtuoso 视口锚定失效）；
  *   3. 拉取期间不提前停跟随（失败 / 封顶时不用恢复，不会把用户从底部拽走）；
  *   4. 窗口已含全部历史时不发大纲请求；回退后重拉；失败只 warn 不打扰用户；
- *   5. 时间线只在事件流视图渲染（群问答 tab 是另一份只读列表）；
+ *   5. 时间线在事件流里无条件渲染（2026-11-05 起没有别的页签视图了）；
  *   6. 路由走和 events 同一套可见性闸（commitReadableTaskResponse / taskVisibilityErrorResponse）。
  */
 import { readFileSync, readdirSync } from "node:fs";
@@ -207,10 +207,11 @@ describe("event-stream 接线：loadEarlier 的 until 模式", () => {
 });
 
 describe("event-stream 接线：渲染", () => {
-  it("时间线只在事件流视图渲染（!showQaPanel），带稳定 props；chat 贴内容列、task 贴最左缘", () => {
+  it("时间线在事件流里无条件渲染（没有别的页签视图了），带稳定 props；chat 贴内容列、task 贴最左缘", () => {
     expect(code).toMatch(
-      /\{!showQaPanel && \(\s*<StreamOutlineRail\s+items=\{railItems\}\s+activeStore=\{outlineActiveStore\}\s+onJump=\{onOutlineJump\}\s+jumpingId=\{jumpingId\}\s+anchor=\{isChat \? "column" : "edge"\}\s*\/>\s*\)\}/,
+      /<StreamOutlineRail\s+items=\{railItems\}\s+activeStore=\{outlineActiveStore\}\s+onJump=\{onOutlineJump\}\s+jumpingId=\{jumpingId\}\s+anchor=\{isChat \? "column" : "edge"\}\s*\/>/,
     );
+    expect(code).not.toContain("showQaPanel");
   });
 
   it("chat 把手的 48rem 与事件流里 chat 内容列的 max-w-3xl 同宽（改一处必须改另一处，否则把手会悬在离正文很远的地方）", () => {

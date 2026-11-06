@@ -7,6 +7,7 @@
 
 import { getFeishuCliStatus } from "@/lib/server/feishu-cli";
 
+import { CARD_BASE_CONFIG } from "./card-config";
 import {
   createCardEntity,
   getBotAppInfo,
@@ -62,7 +63,7 @@ const RECEIVE_SCOPE_EQUIVALENTS = [
 /** 探测用最小 JSON 2.0 卡（只建实体不发送，验证 cardkit:card:write） */
 const PROBE_CARD_JSON = {
   schema: "2.0",
-  config: { streaming_mode: false, update_multi: true },
+  config: { streaming_mode: false, ...CARD_BASE_CONFIG },
   header: {
     title: { tag: "plain_text", content: "Flowship probe" },
     template: "blue" as const,

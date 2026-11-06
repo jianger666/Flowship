@@ -1,10 +1,10 @@
 /**
  * outbound：按失败类别给用户说清「为什么 / 后果 / 去哪看」（R14 B4-3 · Q12a-07）
  *
- * B1 只会说「飞书卡片连续 N 次更新失败」。可有几类失败是「再试也不会好」的——卡片没了、没权限、内容超限、
+ * 改前只会说「飞书卡片连续 N 次更新失败」。可有几类失败是「再试也不会好」的——卡片没了、没权限、内容超限、
  * 流式被飞书关掉重开也没用——光丢一个飞书错误码，用户既看不懂、也不知道这一轮飞书里最终会是什么样。
- * 这里钉住：熔断当场的 info（onBreakerOpen）、收尾没同步的 info（health.lastError）、终稿被截断的 info（health.truncated），
- * 按类别各说各的；限流 / 瞬时 / 未知仍是 B1 原措辞。文案整句钉死——用户读的就是这句话。
+ * 这里钉住：致命故障当场的 info（onFatal）、收尾没同步的 info（health.lastError）、终稿被截断的 info（health.truncated），
+ * 按类别各说各的（原「连续 N 次更新失败」的熔断措辞随计数熔断一起删了）。文案整句钉死——用户读的就是这句话。
  *
  * mock card-stream 工厂 + 事件源，不碰真实 lark-cli。
  */
@@ -52,8 +52,8 @@ const okHealth = vi.hoisted(
     (over: Record<string, unknown> = {}) => ({
       failCount: 0,
       consecutiveFails: 0,
-      breakerOpen: false,
-      breakerEverOpened: false,
+      fatalActive: false,
+      fatalEver: false,
       finalizeOk: true as boolean | undefined,
       lastError: undefined as unknown,
       ...over,
@@ -143,15 +143,14 @@ const runTurnWithHealth = async (taskId: string, health: Record<string, unknown>
   return cardFactory.cards.at(-1)!;
 };
 
-type BreakerInfo = {
+type FatalInfo = {
   consecutiveFails: number;
-  retryInMs: number;
   error: unknown;
   fatalKind?: string;
 };
 
-/** 起一轮（只到建卡），再用 createCardStream 收到的 onBreakerOpen 回调模拟「熔断打开」 */
-const openBreaker = async (taskId: string, info: BreakerInfo): Promise<string[]> => {
+/** 起一轮（只到建卡），再用 createCardStream 收到的 onFatal 回调模拟「致命故障发生」 */
+const fireFatal = async (taskId: string, info: FatalInfo): Promise<string[]> => {
   cardFactory.create.mockImplementationOnce(() => {
     const card = makeCard({});
     cardFactory.cards.push(card);
@@ -164,10 +163,10 @@ const openBreaker = async (taskId: string, info: BreakerInfo): Promise<string[]>
   publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "答" });
   await flush();
   const createOpts = (
-    cardFactory.create.mock.calls.at(-1) as unknown as [string, { onBreakerOpen?: (i: BreakerInfo) => void }]
+    cardFactory.create.mock.calls.at(-1) as unknown as [string, { onFatal?: (i: FatalInfo) => void }]
   )[1];
-  expect(typeof createOpts.onBreakerOpen).toBe("function");
-  createOpts.onBreakerOpen!(info);
+  expect(typeof createOpts.onFatal).toBe("function");
+  createOpts.onFatal!(info);
   await flush();
   return infoTexts();
 };
@@ -216,18 +215,10 @@ const HINT_GONE = "卡片已不存在（被删除，或超过飞书卡片实体 
 const HINT_AUTH = "机器人没有权限操作这张卡片，请到飞书开放平台检查应用权限";
 const HINT_TOO_LONG = "内容超过飞书卡片的大小上限";
 
-describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别说清后果，普通熔断沿用 B1 措辞", () => {
-  it("没有 fatalKind（普通 3 连败熔断）：B1 原句不变", async () => {
-    const infos = await openBreaker("t_ob_default", { consecutiveFails: 3, retryInMs: 2000, error: RATE() });
-    expect(infos).toEqual([
-      "飞书卡片连续 3 次更新失败（rate limited（飞书 99991400）），已暂停实时推送；回复结束时会再整卡同步一次",
-    ]);
-  });
-
+describe("致命故障当场的 info（onFatal）：按类别说清后果", () => {
   it("gone：卡片已不存在 + 本轮不再同步 + 去 Flowship 看；不再说「连续 N 次」「会再整卡同步一次」", async () => {
-    const infos = await openBreaker("t_ob_gone", {
+    const infos = await fireFatal("t_ob_gone", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: GONE(),
       fatalKind: "gone",
     });
@@ -239,9 +230,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
   });
 
   it("auth：说明机器人没权限 + 带权限引导链接", async () => {
-    const infos = await openBreaker("t_ob_auth", {
+    const infos = await fireFatal("t_ob_auth", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: AUTH(AUTH_URL),
       fatalKind: "auth",
     });
@@ -251,9 +241,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
   });
 
   it("auth 没有引导链接：不留「：」尾巴", async () => {
-    const infos = await openBreaker("t_ob_auth_nourl", {
+    const infos = await fireFatal("t_ob_auth_nourl", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: AUTH(),
       fatalKind: "auth",
     });
@@ -264,9 +253,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
   it("auth 的引导链接 ≤ 200 字照带；超过 200 字不带（截断的链接点不开，也防 info 被撑爆）", async () => {
     const at200 = `https://open.feishu.cn/${"a".repeat(200 - "https://open.feishu.cn/".length)}`;
     expect(at200.length).toBe(200);
-    const ok = await openBreaker("t_ob_auth_200", {
+    const ok = await fireFatal("t_ob_auth_200", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: AUTH(at200),
       fatalKind: "auth",
     });
@@ -274,9 +262,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
 
     writeEventAndPublish.mockClear();
     const at201 = `${at200}a`;
-    const dropped = await openBreaker("t_ob_auth_201", {
+    const dropped = await fireFatal("t_ob_auth_201", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: AUTH(at201),
       fatalKind: "auth",
     });
@@ -285,9 +272,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
   });
 
   it("auth 但错误不是 LarkApiError（没有链接可带）：照常出文案", async () => {
-    const infos = await openBreaker("t_ob_auth_native", {
+    const infos = await fireFatal("t_ob_auth_native", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: new Error("denied"),
       fatalKind: "auth",
     });
@@ -295,9 +281,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
   });
 
   it("too_long：内容超出上限 + 回复结束时发截断版 + 完整回复在 Flowship", async () => {
-    const infos = await openBreaker("t_ob_toolong", {
+    const infos = await fireFatal("t_ob_toolong", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: TOO_LONG(),
       fatalKind: "too_long",
     });
@@ -307,9 +292,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
   });
 
   it("stream_closed：流式被飞书关掉、多次重新打开仍失败 + 回复结束时会再整卡同步一次", async () => {
-    const infos = await openBreaker("t_ob_closed", {
+    const infos = await fireFatal("t_ob_closed", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: CLOSED(),
       fatalKind: "stream_closed",
     });
@@ -318,20 +302,20 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
     ]);
   });
 
-  it("不认识的 fatalKind 字符串：退回 B1 原句（防御：新增类别没配文案时不会出空 / 乱句）", async () => {
-    const infos = await openBreaker("t_ob_unknown_kind", {
+  it("不认识的 fatalKind 字符串：退回通用句（防御：新增类别没配文案时不会出空 / 乱句）", async () => {
+    const infos = await fireFatal("t_ob_unknown_kind", {
       consecutiveFails: 4,
-      retryInMs: 0,
       error: RATE(),
       fatalKind: "rate_limit",
     });
-    expect(infos[0]).toContain("飞书卡片连续 4 次更新失败");
+    expect(infos).toEqual([
+      "飞书卡片无法继续实时更新（rate limited（飞书 99991400）），回复结束时会再整卡同步一次",
+    ]);
   });
 
   it("文案按 fatalKind 来（卡片流已经定了性），不在这里重新分类错误", async () => {
-    const infos = await openBreaker("t_ob_trust_kind", {
+    const infos = await fireFatal("t_ob_trust_kind", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: RATE(), // 错误本身是限流码
       fatalKind: "gone",
     });
@@ -343,9 +327,8 @@ describe("熔断打开当场的 info（onBreakerOpen）：致命故障按类别�
     const huge = new LarkApiError(`Command failed: lark-cli api PUT /x --data ${BIG}${"字".repeat(30_000)}`, {
       code: 200860,
     });
-    const infos = await openBreaker("t_ob_huge", {
+    const infos = await fireFatal("t_ob_huge", {
       consecutiveFails: 0,
-      retryInMs: 0,
       error: huge,
       fatalKind: "too_long",
     });
@@ -435,10 +418,10 @@ describe("终稿被截断（health.truncated）：飞书里是截断版，要明
     expect(infos[0]).not.toContain("截断版");
   });
 
-  it("truncated 但熔断此刻仍开着（算没同步）→ 同样只有「没能同步」那一条", async () => {
+  it("truncated 但致命故障此刻仍未恢复（算没同步）→ 同样只有「没能同步」那一条", async () => {
     await runTurnWithHealth("t_tr_breaker", {
       finalizeOk: true,
-      breakerOpen: true,
+      fatalActive: true,
       truncated: true,
       lastError: TOO_LONG(),
     });

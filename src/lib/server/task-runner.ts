@@ -131,6 +131,7 @@ import {
   ADVANCE_STALE_MESSAGE,
   isAdvanceExpectationStale,
 } from "./advance-expectation";
+import { resetAutoAdvanceSteps } from "./advance-chain";
 import {
   SDK_CREATE_RESUME_TIMEOUT_MS,
   SDK_SEND_TIMEOUT_MS,
@@ -906,6 +907,12 @@ export interface AdvanceTaskInput {
    * 缺省则 advanceTask 导出入口在进串行队列前同步取。
    */
   opGen?: number;
+  /**
+   * 来自「AI 按用户的话自动推进」（advance-chain-runner）。只有一个作用：不清零自动推进的连续计数。
+   * 其余调用方（UI 路由 / 飞书群推进 / 选择卡）都是人手推进、不带它——人手推进一次计数就清零，
+   * 这是 review → build → review 自动回环的轮数上限能「重新给额度」的唯一入口。
+   */
+  viaAutoChain?: boolean;
 }
 
 
@@ -1119,6 +1126,8 @@ export const advanceTask = async (
   // admission token 在进任何 promise chain（含 runAdvanceExclusive 排队）之前同步捕获——
   // 否则 A2 排队期间 stop bump，出队后才取会拍到新值、冒充 stop 后的新意图
   const opGen = input.opGen ?? getTaskOpGeneration(input.task.id);
+  // 人手推进 → 自动推进的连续计数清零（同步、在排队之前：排队期间也算用户已经来过）
+  if (!input.viaAutoChain) resetAutoAdvanceSteps(input.task.id);
   return runAdvanceExclusive(input.task.id, () =>
     advanceTaskInner({ ...input, opGen }),
   );
@@ -5954,7 +5963,7 @@ export const deliverTaskQuestion = async (
   text: string,
   imagePaths?: string[],
   creds?: SessionCreds,
-  ackContext?: { actionId: string; artifactPath?: string },
+  ackContext?: { actionId: string; artifactPath?: string; actionType?: ActionType },
   attachmentPaths?: string[],
   /** 路由入场 admission token；缺省则 send 入口同步取 */
   opGen?: number,
@@ -5963,11 +5972,18 @@ export const deliverTaskQuestion = async (
   /** 定时到点的消息（不是用户插话）：封装脚注换成「系统定时触发」版本，见 buildAgentMessage.scheduled */
   scheduled?: boolean,
   /**
-   * 群里**非属主**触发的一轮（并入同会话路径）。`guard` 为真（提示词开关开）时：
+   * 群里**非属主**触发的一轮（并入同会话路径）。`guard` 为真（提示词开关开、或发言人是机器人且没开「机器人与真人同权」）时：
    * 脚注换成「只答疑」约束段，且这一轮的 Flowship 系统工具被硬拒（non-owner-turn-guard）。
-   * 开关关时传 `{ guard: false }`——只是不加约束，仍不带 ackContext / 不 resume（调用方保证）。
+   * 开关关时传 `{ guard: false }`——只是不加约束，仍不带 ackContext / 不 resume（调用方保证）；
+   * 其中发言人是机器人（`isBot`）时仍追加防互 @ 成环的克制提示。
    */
-  groupNonOwner?: { name: string; guard: boolean; isBot?: boolean },
+  groupNonOwner?: {
+    name: string;
+    guard: boolean;
+    isBot?: boolean;
+    /** 发言人 open_id：机器人变体提示词里给出 @ 标签的写法 */
+    openId?: string;
+  },
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
     task,
@@ -5983,9 +5999,18 @@ export const deliverTaskQuestion = async (
             groupNonOwnerGuard: {
               name: groupNonOwner.name,
               ...(groupNonOwner.isBot ? { isBot: true } : {}),
+              ...(groupNonOwner.openId ? { openId: groupNonOwner.openId } : {}),
             },
           }
-        : {}),
+        : // 机器人 + 没约束（「机器人与真人同权」开着且提示词开关关着）：同权，但仍带防互 @ 成环的克制规则
+          groupNonOwner?.isBot
+          ? {
+              groupBotEtiquette: {
+                name: groupNonOwner.name,
+                ...(groupNonOwner.openId ? { openId: groupNonOwner.openId } : {}),
+              },
+            }
+          : {}),
     }),
     ackContext
       ? { creds, errorActionId: ackContext.actionId, opGen, timing }

@@ -1,14 +1,15 @@
 /**
- * 设置「受理群里其他机器人的 @」（feishuGroupAllowBots，默认开，2026-11-04 起）。
+ * 群里其他机器人的 @：一律受理、和真人一致（2026-11-04 放开；2026-11-05 起连设置项也去掉了，不需要配置）。
  *
  * 分层钉死：
- * - 准入闸 decideRestrictedQaAdmission：allowBots 缺省 / false = 老口径（拒）；true 才放过机器人；租户 / 外部闸照常
- * - 设置读取 isGroupBotsAllowed：文件不存在 → 默认开；显式 false → 关；缺字段 → 开；**文件坏 → 关（fail-closed）**
+ * - 准入闸 decideRestrictedQaAdmission：allowBots 缺省 / false = 老口径（拒，只剩单测覆盖缝能走到）；true 才放过机器人；租户 / 外部闸照常
+ * - isGroupBotsAllowed：**恒为 true**，不读设置文件（旧版本存下的 feishuGroupAllowBots 键、文件坏、读盘抛错都不影响）；
+ *   仅 `__setGroupBotsAllowedForTest(false)` 能压成 false（给 6 个老测试文件钉「机器人被拒」旧路径）
  * - 路由（真实 routeGroupInboundMessage、mock 注入与发群消息）：
  *   · 有活会话：机器人并入同会话（groupNonOwner.isBot=true、抬头写「机器人，」、meta 带 groupSenderIsBot）；系统回执静默
  *   · 忙：入 group_other 队列（senderIsBot），不向群里回「收到」（对机器人静默）
  *   · 没有活会话：走只读旁路（降级通道），不是唤醒；机器人同样受 per-sender 限流
- *   · 设置关：机器人整条静默被拒（对照）
+ *   · 覆盖缝压成「不受理」：机器人整条静默被拒（对照，生产里走不到）
  * - 提示词：机器人变体约束段（必须自己写 @名字、没问实质问题 NO_REPLY、不客套）；真人变体字面不变
  *
  * 全 mock 外部调用——禁止真调飞书。
@@ -42,7 +43,6 @@ const {
   __resetGroupAdvancePickForTest,
   __resetGroupReplyStateForTest,
   __resetThrottleForTest,
-  GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER,
   listGroupReplies,
 } = await import("@/lib/server/feishu-bridge/group-shared");
 const { __resetOutboundRegistryForTest } = await import(
@@ -95,57 +95,48 @@ describe("准入闸：allowBots", () => {
   });
 });
 
-// ---------------------------------------------------------------- 设置读取
+// ---------------------------------------------------------------- 恒受理（没有设置项）
 
-describe("isGroupBotsAllowed（读真实设置文件）", () => {
+describe("isGroupBotsAllowed（没有设置项：恒受理）", () => {
   const cfg = path.join(DATA, "config.json");
   beforeEach(() => __setGroupBotsAllowedForTest(null));
   afterEach(() => rmSync(cfg, { force: true }));
 
-  it("设置文件不存在（首次启动）→ 默认开", async () => {
+  it("设置文件不存在（首次启动）→ 受理", async () => {
     expect(await isGroupBotsAllowed()).toBe(true);
   });
 
-  it("文件在、没有这个字段 → 开（缺省 = 开）", async () => {
-    writeFileSync(cfg, JSON.stringify({ feishuChatBridge: true }));
+  it("旧版本存下的 feishuGroupAllowBots:false 不再起作用（设置项已删，机器人照样受理）", async () => {
+    writeFileSync(cfg, JSON.stringify({ feishuChatBridge: true, feishuGroupAllowBots: false }));
     expect(await isGroupBotsAllowed()).toBe(true);
   });
 
-  it("显式 false → 关；显式 true → 开", async () => {
-    writeFileSync(cfg, JSON.stringify({ feishuGroupAllowBots: false }));
-    expect(await isGroupBotsAllowed()).toBe(false);
-    writeFileSync(cfg, JSON.stringify({ feishuGroupAllowBots: true }));
-    expect(await isGroupBotsAllowed()).toBe(true);
-  });
-
-  it("文件坏（JSON 不合法）→ 关（fail-closed：这是放开准入、读不准就别放）", async () => {
+  it("文件坏（JSON 不合法）→ 照样受理（不读盘、没有 fail-closed 这回事）", async () => {
     writeFileSync(cfg, "{ not json");
-    expect(await isGroupBotsAllowed()).toBe(false);
+    expect(await isGroupBotsAllowed()).toBe(true);
   });
 
-  it("读设置**抛错**（不是 status 非 ok，而是 readSettingsFile 直接 reject）：机器人 → 关（fail-closed）；提示词开关 → 开（默认）", async () => {
-    // 第 20 轮评审 M5b：现有用例只钉了 status !== "ok" 分支，没钉 catch 分支；
-    // 文档写的是「两者都 fail-closed」。用 doMock 换掉 settings-fs，在全新模块实例里验证
+  it("读设置**抛错**：机器人照样受理且根本不读盘；提示词开关 → 开（默认，宁可多约束）", async () => {
+    // 第 20 轮评审 M5b：提示词开关的 catch 分支要钉；机器人这边不再读盘，用 doMock 换掉 settings-fs 验证「没读」
     vi.resetModules();
-    vi.doMock("@/lib/server/settings-fs", () => ({
-      readSettingsFile: async () => {
-        throw new Error("EIO: simulated disk failure");
-      },
-    }));
+    const readSettingsFile = vi.fn(async () => {
+      throw new Error("EIO: simulated disk failure");
+    });
+    vi.doMock("@/lib/server/settings-fs", () => ({ readSettingsFile }));
     try {
       const fresh = await import("@/lib/server/group-non-owner-guard-config");
       fresh.__setGroupBotsAllowedForTest(null);
-      expect(await fresh.isGroupBotsAllowed()).toBe(false);
-      // 提示词开关是相反方向的 fail-safe：读不到 → 取默认（开），宁可多约束
+      expect(await fresh.isGroupBotsAllowed()).toBe(true);
+      expect(readSettingsFile).not.toHaveBeenCalled();
       expect(await fresh.isGroupNonOwnerGuardEnabled()).toBe(true);
+      expect(readSettingsFile).toHaveBeenCalledTimes(1);
     } finally {
       vi.doUnmock("@/lib/server/settings-fs");
       vi.resetModules();
     }
   });
 
-  it("单测覆盖优先于读盘（false 钉住老口径、null 还原）", async () => {
-    writeFileSync(cfg, JSON.stringify({ feishuGroupAllowBots: true }));
+  it("单测覆盖缝：false 钉住老口径、null 还原", async () => {
     __setGroupBotsAllowedForTest(false);
     expect(await isGroupBotsAllowed()).toBe(false);
     __setGroupBotsAllowedForTest(null);
@@ -156,10 +147,13 @@ describe("isGroupBotsAllowed（读真实设置文件）", () => {
 // ---------------------------------------------------------------- 提示词
 
 describe("提示词：机器人变体", () => {
-  it("机器人变体：必须自己写 @名字 / 没问实质问题 NO_REPLY / 别客套；仍是最后一段的约束（只答疑、不改文件）", () => {
+  it("机器人变体：必须自己 @ 它 / 没问实质问题 NO_REPLY / 别客套；仍是最后一段的约束（只答疑、不改文件）", () => {
     const t = buildNonOwnerGuardFootnote("别家机器人", { isBot: true });
     expect(t).toContain("机器人「别家机器人」");
-    expect(t).toContain("必须在正文里写 @别家机器人");
+    expect(t).toContain("必须在正文里 @ 它");
+    // 回复协议已下线：不再教 `@名字` / 需属主确认标记 / @宿主
+    expect(t).not.toContain("[[需属主确认");
+    expect(t).not.toContain("@宿主");
     expect(t).toContain("NO_REPLY");
     expect(t).toContain("别回「收到」");
     expect(t).toContain("不修改任何文件");
@@ -167,10 +161,20 @@ describe("提示词：机器人变体", () => {
     expect(t.endsWith("处理完自然结束本轮回复。）")).toBe(true);
   });
 
-  it("真人变体字面不变：不提机器人、有「想 @ 提问人就写」", () => {
+  it("机器人变体带 open_id 时给出 @ 标签的固定写法（没有 id 就不给）", () => {
+    const withId = buildNonOwnerGuardFootnote("别家机器人", { isBot: true, openId: "ou_otherbot" });
+    expect(withId).toContain('<at user_id="ou_otherbot">别家机器人</at>');
+    expect(buildNonOwnerGuardFootnote("别家机器人", { isBot: true })).not.toContain("<at ");
+    // 昵称里的尖括号 / 引号不能破坏标签
+    expect(buildNonOwnerGuardFootnote('a<b>"c', { isBot: true, openId: "ou_x" })).toContain(
+      '<at user_id="ou_x">abc</at>',
+    );
+  });
+
+  it("真人变体：系统自动 @ 提问人（不用自己写）、不提机器人", () => {
     const t = buildNonOwnerGuardFootnote("李四");
     expect(t).toContain("非任务所有者「李四」");
-    expect(t).toContain("想 @ 提问人就写 @李四");
+    expect(t).toContain("系统会在回复开头自动 @ 提问人");
     expect(t).not.toContain("机器人");
     // isBot:false 与不传等价
     expect(buildNonOwnerGuardFootnote("李四", { isBot: false })).toBe(t);
@@ -279,7 +283,7 @@ afterEach(() => {
   agentSessions.delete("task-1");
 });
 
-describe("路由：设置开（默认）+ 有活会话 → 机器人并入同会话", () => {
+describe("路由：有活会话 → 机器人并入同会话（恒受理）", () => {
   it("注入参数：groupNonOwner.isBot=true、非只读通道；抬头写「机器人，」；meta 带 groupSenderIsBot + groupNonOwnerTurn；不预登记；系统回执静默", async () => {
     agentSessions.set("task-1", {} as never);
     const handleTaskQuestionInject = vi.fn(async () => jsonRes({ ok: true }, 200));
@@ -327,7 +331,7 @@ describe("路由：设置开（默认）+ 有活会话 → 机器人并入同会
     expect(sendTextToChat).not.toHaveBeenCalled();
   });
 
-  it("机器人同样受 per-sender 限流（防互 @ 成环的速率兜底）：同一机器人窗口内第 N+1 次被静默丢弃", async () => {
+  it("没有速率限制：同一机器人连发 6 条（旧的 per-sender 滑动窗是 4 次）全部入 task 待送达队列，且对机器人始终静默（防环靠提示词 + 系统回执静默）", async () => {
     agentSessions.set("task-1", {} as never);
     const handleTaskQuestionInject = vi.fn(async () => queuedRes());
     const sendTextToChat = vi.fn(async () => ({ chat_id: CHAT, message_id: "om_r" }));
@@ -339,16 +343,13 @@ describe("路由：设置开（默认）+ 有活会话 → 机器人并入同会
         listTasks: async () => [taskSummary({ runStatus: "running" })],
       }) as never,
     );
-    const n = GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER;
+    const n = 6;
     for (let i = 0; i < n; i++) {
       const r = await routeGroupInboundMessage(botMsg({ message_id: `om_b${i}` }), ctx);
       expect(r).toMatchObject({ kind: "queued" });
     }
-    const over = await routeGroupInboundMessage(botMsg({ message_id: "om_over" }), ctx);
-    expect(over.kind).not.toBe("queued");
-    expect(over.kind).not.toBe("sent");
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(n);
-    // 限流丢弃对机器人静默（不给对端喂噪音）
+    // 对机器人的系统回执一律静默（不给对端喂噪音）
     expect(sendTextToChat).not.toHaveBeenCalled();
   });
 
@@ -367,7 +368,7 @@ describe("路由：设置开（默认）+ 有活会话 → 机器人并入同会
   });
 });
 
-describe("路由：设置关 → 机器人整条静默被拒（对照）", () => {
+describe("路由：覆盖缝压成「不受理」→ 机器人整条静默被拒（对照，生产里走不到）", () => {
   it("有活会话也一样：不注入、不排队、不回群，结果 skipped + GROUP_RESTRICTED_QA_DENIED", async () => {
     __setGroupBotsAllowedForTest(false);
     agentSessions.set("task-1", {} as never);
@@ -380,7 +381,7 @@ describe("路由：设置关 → 机器人整条静默被拒（对照）", () =>
     expect(sendTextToChat).not.toHaveBeenCalled();
   });
 
-  it("设置读不到（文件坏）同样拒（fail-closed）：走真实读取而不是覆盖", async () => {
+  it("设置文件坏也不影响受理：不走覆盖缝、走真实路径，机器人照样并入同会话（不再有 fail-closed）", async () => {
     __setGroupBotsAllowedForTest(null);
     writeFileSync(path.join(DATA, "config.json"), "{ not json");
     try {
@@ -388,14 +389,16 @@ describe("路由：设置关 → 机器人整条静默被拒（对照）", () =>
       const handleTaskQuestionInject = vi.fn(async () => jsonRes({ ok: true }, 200));
       __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
       const r = await routeGroupInboundMessage(botMsg(), ctx);
-      expect(r).toMatchObject({ kind: "skipped", error: GROUP_RESTRICTED_QA_DENIED });
-      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+      expect(r).toMatchObject({ kind: "sent" });
+      expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+        groupNonOwner: { isBot: true },
+      });
     } finally {
       rmSync(path.join(DATA, "config.json"), { force: true });
     }
   });
 
-  it("真人不受这个设置影响（设置关时真人照常并入同会话，且不为它读设置）", async () => {
+  it("真人不受影响（覆盖缝压成「不受理」时真人照常并入同会话，且不为它读设置）", async () => {
     __setGroupBotsAllowedForTest(false);
     agentSessions.set("task-1", {} as never);
     const handleTaskQuestionInject = vi.fn(async () => jsonRes({ ok: true }, 200));

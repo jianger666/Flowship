@@ -2,7 +2,7 @@
  * UI 字号下限守卫：`.cursor/rules/ui-conventions.mdc` 明令「不许再出现 10px」
  * （字号阶梯最小一档是 11px `text-[11px]`）。
  *
- * 规则靠人记会漂：group-qa-panel 曾留着 4 处 `text-[10px]`（含 `/70` 透明度叠加，浅色下对比度 < 3.3:1）。
+ * 规则靠人记会漂：群问答卡（原 group-qa-panel）曾留着 4 处 `text-[10px]`（含 `/70` 透明度叠加，浅色下对比度 < 3.3:1）。
  * 这里全 src 扫一遍，新增 ≤10px 的文字类直接红。
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -35,11 +35,8 @@ describe("UI 字号下限 ≥ 11px", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("群问答面板（曾违规处）及其单轮卡片的文字不再叠透明度", () => {
-    for (const rel of [
-      "components/tasks/group-qa-panel.tsx",
-      "components/tasks/group-qa-round-card.tsx",
-    ]) {
+  it("群问答单轮卡片（曾违规处）的文字不再叠透明度", () => {
+    for (const rel of ["components/tasks/group-qa-round-card.tsx"]) {
       const text = readFileSync(path.join(SRC, rel), "utf-8");
       expect(text, rel).not.toMatch(/text-muted-foreground\/\d+/);
     }

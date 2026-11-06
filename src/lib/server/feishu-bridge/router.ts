@@ -58,8 +58,11 @@ import {
   defaultExtractVideoPreview,
   type VideoPreview,
 } from "./video-frames";
+import { buildQuotedBlock, resolveQuoteAnchorId } from "./group-quote";
+import { resolveInboundQuote, type InboundQuote } from "./inbound-quote";
 import {
   downloadMessageResource,
+  fetchInboundMessageDetail,
   getBotAppInfo,
   larkApi,
   sendTextMessage,
@@ -83,6 +86,13 @@ const MAX_TOTAL_IMAGE_BYTES = 30 * 1024 * 1024;
 /** review P1#2：入向文件体积上限（方案 4.5 降级「超大 → bot 回提示」） */
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const TITLE_PREFIX_LEN = 20;
+/** 单次注入的附件路径上限（对齐 chat-inject 的 MAX_ATTACHMENTS_PER_REPLY；引用里的附件只往余量里塞） */
+const MAX_ATTACHMENTS = 10;
+/**
+ * 引用的是机器人自己的旧回复时给 agent 的字数上限。单聊里「回复某张卡片」本来就是用来路由到那个对话的
+ * （agent 上文已有完整内容），不压的话每次回复卡片都会重复塞一大段；留开头足够认出是哪一条。
+ */
+const QUOTE_SELF_TEXT_MAX_CHARS = 800;
 
 // ----------------- 命令扩展点（S3c 注册） -----------------
 
@@ -236,6 +246,8 @@ type RouterDeps = {
   prewarmTaskWorkspace: typeof prewarmTaskWorkspace;
   /** 大视频抽帧预览（best-effort，失败返回 null，调用方退化处理） */
   extractVideoPreview: typeof defaultExtractVideoPreview;
+  /** 取回被回复 / 引用的那条消息（best-effort，取不到返回 null） */
+  fetchInboundMessageDetail: typeof fetchInboundMessageDetail;
 };
 
 let deps: RouterDeps = {
@@ -255,6 +267,7 @@ let deps: RouterDeps = {
   listSkillsWithSource,
   prewarmTaskWorkspace,
   extractVideoPreview: defaultExtractVideoPreview,
+  fetchInboundMessageDetail,
 };
 
 /** 单测替换依赖；传 null 恢复 */
@@ -279,6 +292,7 @@ export const __setRouterDepsForTest = (
       listSkillsWithSource,
       prewarmTaskWorkspace,
       extractVideoPreview: defaultExtractVideoPreview,
+      fetchInboundMessageDetail,
     };
     return;
   }
@@ -1258,30 +1272,47 @@ export const sendTaskBoundText = async (
   }
 };
 
+const nonEmptyStr = (v: unknown): v is string =>
+  typeof v === "string" && v.length > 0;
+
+/** 「回复」上下文：`ids` 给 card-map 反查路由用、`parentId` 是用户点「回复」的那条（给引用用） */
+export type ReplyContext = {
+  ids: string[];
+  /** 直接回复的父消息 id（事件取 reply_to → parent_id → root_id；REST 反查取 parent_id → root_id） */
+  parentId?: string;
+};
+
 /**
- * 解析「回复」锚定 id：优先事件自带的 root_id / parent_id；两者都缺时按
+ * 解析「回复」上下文：优先事件自带的 root_id / parent_id / reply_to；三者都缺时按
  * message_id 反查一次 REST 消息详情补齐。
  *
- * 实证（2026-07-19、真实消息 om_x100b6afcc99c68a0b2a3e1bca85c0ce）：
- * - lark-cli `event consume im.message.receive_v1` 的 NDJSON schema **不含**
- *   root_id / parent_id（`event schema` 输出可证）——事件路径拿不到被回复消息 id、
- *   这是「回复卡片仍提示多对话」的根因；
- * - REST `GET /open-apis/im/v1/messages/:message_id` 两个字段都有：
- *   直接回复时 root_id === parent_id === 被回复消息 id、可对上 card-map。
+ * 实证（2026-07-19、真实消息 om_x100b6afcc99c68a0b2a3e1bca85c0ce）：当时的 lark-cli
+ * `event consume im.message.receive_v1` 的 NDJSON schema **不含** root_id / parent_id，
+ * 事件路径拿不到被回复消息 id、这是「回复卡片仍提示多对话」的根因；
+ * REST `GET /open-apis/im/v1/messages/:message_id` 两个字段都有：
+ * 直接回复时 root_id === parent_id === 被回复消息 id、可对上 card-map。
+ *
+ * 2026-11-05 复核：本机 lark-cli 1.0.79 的 `event schema im.message.receive_v1` 已带
+ * `reply_to`（直接回复的父消息 id）/ `root_id` / `thread_id`——新版本回复事件自带锚点、不会走反查；
+ * 反查只剩两种情况：老版本 lark-cli、或这条根本不是回复（后者每条普通消息仍会多一次 REST，
+ * 事件规整后分不出「字段缺」与「字段空」，没敢直接去掉）。
  * 反查失败静默返回空（走活跃 chat 兜底），不阻断注入。
  */
-export const resolveReplyAnchorIds = async (
+export const resolveReplyContext = async (
   msg: FeishuInboundMessage,
-): Promise<string[]> => {
-  // 直接回复时 root_id === parent_id——去重避免同一 id 查两次盘
+): Promise<ReplyContext> => {
+  // 直接回复时 root_id === parent_id === reply_to——去重避免同一 id 查几次盘
   const own = [
     ...new Set(
-      [msg.root_id, msg.parent_id].filter(
-        (v): v is string => typeof v === "string" && v.length > 0,
-      ),
+      [msg.root_id, msg.parent_id, msg.reply_to].filter(nonEmptyStr),
     ),
   ];
-  if (own.length > 0) return own;
+  if (own.length > 0) {
+    return {
+      ids: own,
+      parentId: [msg.reply_to, msg.parent_id, msg.root_id].find(nonEmptyStr),
+    };
+  }
   try {
     const rec = await deps.larkApi(
       "GET",
@@ -1290,23 +1321,25 @@ export const resolveReplyAnchorIds = async (
     const data = (rec.data as Record<string, unknown> | undefined) ?? rec;
     const items = Array.isArray(data.items) ? data.items : [];
     const first = items[0];
-    if (!first || typeof first !== "object") return [];
+    if (!first || typeof first !== "object") return { ids: [] };
     const it = first as Record<string, unknown>;
-    return [
-      ...new Set(
-        [it.root_id, it.parent_id].filter(
-          (v): v is string => typeof v === "string" && v.length > 0,
-        ),
-      ),
-    ];
+    return {
+      ids: [...new Set([it.root_id, it.parent_id].filter(nonEmptyStr))],
+      parentId: [it.parent_id, it.root_id].find(nonEmptyStr),
+    };
   } catch (err) {
     console.warn(
       "[feishu-bridge/router] 反查消息 parent/root 失败（忽略、走活跃兜底）:",
       err instanceof Error ? err.message : err,
     );
-    return [];
+    return { ids: [] };
   }
 };
+
+/** 只要路由用的锚定 id（commands 的 /stop 等沿用） */
+export const resolveReplyAnchorIds = async (
+  msg: FeishuInboundMessage,
+): Promise<string[]> => (await resolveReplyContext(msg)).ids;
 
 /**
  * 路由一条入向消息。幂等由调用方（inbound）按 message_id 去重。
@@ -1331,8 +1364,11 @@ export const routeInboundMessage = async (
     return { kind: "skipped", messageId: msg.message_id, error: SKIP_NOT_P2P };
   }
   let ownerOpenId: string;
+  let botAppId = "";
   try {
-    ownerOpenId = (await deps.getBotAppInfo()).ownerOpenId;
+    const appInfo = await deps.getBotAppInfo();
+    ownerOpenId = appInfo.ownerOpenId;
+    botAppId = appInfo.appId ?? "";
   } catch (err) {
     const error = `无法获取 bot 身份：${err instanceof Error ? err.message : String(err)}`;
     const payload: InjectResultPayload = {
@@ -1468,7 +1504,8 @@ export const routeInboundMessage = async (
 
   // 4) 定位 taskId：回复锚定 > 当前对话指针（不看活跃窗）> 活跃数兜底
   let taskId: string | undefined;
-  for (const anchorId of await resolveReplyAnchorIds(msg)) {
+  const replyCtx = await resolveReplyContext(msg);
+  for (const anchorId of replyCtx.ids) {
     const hit = await deps.findTaskByMessageId(anchorId);
     // 清理卡等「非 task 绑定」提示的 card-map 条目 taskId 为空串——不当锚定
     if (hit?.taskId) {
@@ -1583,15 +1620,55 @@ export const routeInboundMessage = async (
     return payload;
   }
 
+  // 回复 / 引用了某条消息 → 被引用的那条也交给 agent（此前单聊里回复只用来路由、被引用内容 agent 看不到）。
+  // 放在待答提问分支之后：
+  // 那条路径的文本是「答案」、不该夹引用；也放在 bootArgs 校验之后：注定失败的消息不白占一次取回。
+  // 取不到 / 已撤回 / 不是本会话 → 当没引用。
+  const quoteAnchor = resolveQuoteAnchorId({
+    message_id: msg.message_id,
+    reply_to: replyCtx.parentId,
+  });
+  let quote: InboundQuote | null = null;
+  if (quoteAnchor) {
+    quote = await resolveInboundQuote({
+      msg,
+      anchorId: quoteAnchor,
+      isOwner: true,
+      selfIds: [botAppId],
+      parseContent: parseInboundContent,
+      lookupName: () => undefined,
+      logPrefix: "[feishu-bridge/router]",
+      userFallbackLabel: "用户",
+      selfTextMaxChars: QUOTE_SELF_TEXT_MAX_CHARS,
+      fetchDetail: deps.fetchInboundMessageDetail,
+    }).catch(() => null);
+  }
+  // 引用里的图 / 附件只往余量里塞（chat-inject 对数量有上限）
+  const injectImages = quote
+    ? [
+        ...parsed.images,
+        ...quote.images.slice(0, Math.max(0, MAX_IMAGES - parsed.images.length)),
+      ]
+    : parsed.images;
+  const injectAttachments = quote
+    ? [
+        ...parsed.attachments,
+        ...quote.attachments.slice(
+          0,
+          Math.max(0, MAX_ATTACHMENTS - parsed.attachments.length),
+        ),
+      ]
+    : parsed.attachments;
+
   let resp: Response;
   try {
     resp = await deps.handleChatReplyInject(
       taskId,
       {
         text,
-        images: parsed.images.length > 0 ? parsed.images : undefined,
+        images: injectImages.length > 0 ? injectImages : undefined,
         attachments:
-          parsed.attachments.length > 0 ? parsed.attachments : undefined,
+          injectAttachments.length > 0 ? injectAttachments : undefined,
         skills,
         bootArgs,
       },
@@ -1600,7 +1677,19 @@ export const routeInboundMessage = async (
         userReplyMetaExtra: {
           source: "feishu",
           feishuMessageId: msg.message_id,
+          ...(quote ? { quotedMessageId: quote.messageId } : {}),
         },
+        // 引用块只进 agent 的消息、不进事件气泡（与 skill 指引 / ATTACHED_* 同口径）
+        ...(quote
+          ? {
+              agentContext: buildQuotedBlock({
+                messageId: quote.messageId,
+                senderLabel: quote.senderLabel,
+                text: quote.text,
+                truncated: quote.truncated,
+              }),
+            }
+          : {}),
       },
     );
   } catch (err) {

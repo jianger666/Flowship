@@ -452,19 +452,29 @@ const rendersImage = (file: string): boolean => {
 describe("全仓入口护栏：新增的图片 / markdown 渲染入口必须过评审（否则这里红）", () => {
   const files = listSrc("src");
 
-  it("真正渲染 <img> 的只有 image-preview（受控）与本地文件预览（本地媒体通道）；next/image 一个都没有", () => {
+  it("真正渲染 <img> 的只有 image-preview（受控）与预览窗的图片查看器（本地媒体通道 / SVG blob）；预览正文自己不再渲染 <img>；next/image 一个都没有", () => {
+    // 2026-11-06：预览窗升级后，原先写在 local-file-preview-body 里的 <img> 搬进了独立的图片查看器（缩放 / 旋转 / 平移）。
+    // 名单里「预览正文」换成「图片查看器」；它的 src 来源由下面一条钉死。
     const hits = files.filter(rendersImage).sort();
     expect(hits).toEqual([
+      "src/components/preview/image-viewer.tsx",
       "src/components/ui/image-preview.tsx",
-      "src/components/ui/local-file-preview-body.tsx",
     ]);
   });
 
-  it("local-file-preview-body 里的 <img> 只吃服务端给的本地媒体路径（mediaPath），不吃 markdown", () => {
-    const src = read("src/components/ui/local-file-preview-body.tsx");
-    expect(src).toMatch(/<img\s+src=\{data\.mediaPath\}/);
-    // 它渲染 markdown 一律走 MarkdownText（img 槽有闸门）
-    expect(src).not.toMatch(/from\s+["']streamdown["']/);
+  it("图片查看器的 <img> 只吃调用方给的 src；调用方只有两个：预览正文（服务端给的本地媒体路径 mediaPath）与 SVG 查看器（blob URL），都不吃 markdown", () => {
+    expect(read("src/components/preview/image-viewer.tsx")).toMatch(/<img\s+src=\{src\}/);
+    const body = read("src/components/ui/local-file-preview-body.tsx");
+    expect(body).toContain("withVersion(data.mediaPath, data.mtimeMs)");
+    // 预览正文渲染 markdown 一律走 MarkdownViewer → MarkdownText（img 槽有闸门）
+    expect(body).not.toMatch(/from\s+["']streamdown["']/);
+    expect(read("src/components/preview/svg-viewer.tsx")).toContain("URL.createObjectURL(");
+    // 新增任何第三个 ImageViewer 调用方都要过评审（改这个名单）
+    const callers = files.filter((f) => f.endsWith(".tsx") && /<ImageViewer\b/.test(read(f))).sort();
+    expect(callers).toEqual([
+      "src/components/preview/svg-viewer.tsx",
+      "src/components/ui/local-file-preview-body.tsx",
+    ]);
   });
 
   it("直接 <Streamdown> 的只有 markdown-text / artifact-panel / artifact-revision-view，且 img 槽都接到 MarkdownImage", () => {

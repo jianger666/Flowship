@@ -184,7 +184,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 按 super-prompt 交卷。结论说清改了哪几个文件 / 实现了什么 / 校验过没 / 有无遗留。
 
 - `[USER_MESSAGE]`（带〈产出审阅中〉）→ 按 super-prompt「[USER_MESSAGE] 统一处理」。**改类**落地后用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾（格式 / 禁项见「跨 action 共享规范 §5.1」）
-- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行、**绝对不自动进入 review**
+- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行、**不要自己进入 review**（用户明确说过「改完自动复核」之类才用 `advance_next` 登记，见 super-prompt）
 
 ## 自检（V0.6.3 起：runner 不再自动跑项目 typecheck/lint/test；交付诚实性检查（artifact 必备段 / 越权检测等）仍会跑——build 质量靠你自检 + 用户人眼把关）
 
@@ -291,5 +291,5 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 - **不写无信息密度的注释**：「调用接口」「返回 null」这种废话注释不要加。中文注释、解释「为什么」不解释「是什么」
 - **跑 shell 慢的命令**：只有 plan / 用户明确要求的安装依赖或全量 build（默认都不跑、见严格约束 5 与 §2）才可能耗时几分钟；确实要跑时别因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
 - **写完后按 super-prompt 交卷**：结论说清改了哪几个文件 / 实现了什么 / typecheck·lint 过没 / 有无遗留；别说「我改完了你看下」这类空话
-- **绝对不自动进入下一 action**：不要自己跑 review / ship——下一手由用户在 UI 选
+- **不要自己进入下一 action**：不要在本轮里跑 review / ship。默认下一手由用户在 UI 选；用户明确说过「改完直接复核 / 提测」之类，才用 `advance_next` 登记（见 super-prompt），由系统代他推进——ship 这类有对外副作用的一步必须是他点名要的
 - **分批 build 只做被指定的批次**：[NEXT_ACTION] 带 `[BUILD_BATCHES]` 时严守本次批次范围、别顺手把别的批次也做了（那样 review / 进度推导就乱了）；artifact 总览记清「本次完成批次」

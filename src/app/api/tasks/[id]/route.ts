@@ -683,7 +683,7 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 群问答排队同理：条目带 boot.apiKey，任务没了必须清、不然永久躺内存（review 六轮-2）
     clearGroupQuestionQueue(id);
     clearTalkQueue(id);
-    // 出问关联表同清：空壳也不留（review 十轮-1，和熔断表、排队同一套路）
+    // 出问关联表同清：空壳也不留（review 十轮-1，和排队同一套路）
     clearCorrelatedEntries(id);
     // 删任务清队也走唯一终态 sink——已 202 的排队消息发 queue_failed（deleted）、
     // 前端按 itemId 清占位（原裸 clearChatQueue 会留幽灵 pending）

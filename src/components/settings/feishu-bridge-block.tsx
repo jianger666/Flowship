@@ -150,19 +150,24 @@ const OpenAuthLink = ({ href, label = "去开通" }: { href: string; label?: str
 export const FeishuBridgeBlock = ({
   feishuChatBridge,
   onFeishuChatBridgeChange,
+  feishuBridgeStreaming,
+  onFeishuBridgeStreamingChange,
   feishuGroupNonOwnerGuard,
   onFeishuGroupNonOwnerGuardChange,
-  feishuGroupAllowBots,
-  onFeishuGroupAllowBotsChange,
+  feishuGroupBotsEqualRights,
+  onFeishuGroupBotsEqualRightsChange,
 }: {
   feishuChatBridge: boolean;
   onFeishuChatBridgeChange: (next: boolean) => void;
+  /** 飞书私聊流式回复（全局，默认开：关则回复完成后一次性发整张卡） */
+  feishuBridgeStreaming: boolean;
+  onFeishuBridgeStreamingChange: (next: boolean) => void;
   /** 群里非宿主成员的提示词约束（全局，默认开；见 group-non-owner-prompt） */
   feishuGroupNonOwnerGuard: boolean;
   onFeishuGroupNonOwnerGuardChange: (next: boolean) => void;
-  /** 群里别的机器人 @ 本机机器人是否受理（全局，默认开） */
-  feishuGroupAllowBots: boolean;
-  onFeishuGroupAllowBotsChange: (next: boolean) => void;
+  /** 机器人与真人同权（全局，默认关：别的机器人 @ 始终只答疑） */
+  feishuGroupBotsEqualRights: boolean;
+  onFeishuGroupBotsEqualRightsChange: (next: boolean) => void;
 }) => {
   // 探测结果快照（null = 尚未拉到）
   const [status, setStatus] = useState<BridgeStatusPayload | null>(null);
@@ -408,21 +413,31 @@ export const FeishuBridgeBlock = ({
             </Button>
           </div>
 
+          <SettingRow
+            label="流式回复"
+            className="py-0"
+            hint="开：飞书里 AI 的回复边写边出现。关：写完后一次性发整张卡。某个任务的群可在「需求群」弹窗里单独改。"
+            control={
+              <Switch
+                checked={feishuBridgeStreaming}
+                onCheckedChange={onFeishuBridgeStreamingChange}
+              />
+            }
+          />
+
           {/* 群里非宿主成员 @ 机器人：并入宿主同一个会话后，「只答疑不改代码」靠提示词 + 系统工具硬拒。
-              关 = 群成员与宿主同权（与 lk-harness 项目群一致）——文案必须说清，别让人以为「关 = 恢复旧的受限行为」 */}
+              关 = 群成员与宿主同权——文案必须说清，别让人以为「关 = 恢复旧的受限行为」 */}
           <div className="space-y-2 border-t pt-3">
             <SettingRow
               label="限制群里非宿主成员（只答疑、不改代码）"
               className="py-0"
               hint={
                 <>
-                  开：非宿主成员 @ 机器人，只回答问题，不改文件、不推进任务。Flowship 的交卷 / 提问 / 定时 /
-                  分享群等系统工具这一轮一律被拒；使用自定义模型（pi）时这一轮还只开放读文件 / 搜索，
-                  使用 Cursor 模型时读写文件、跑命令没有硬闸、只靠提示词约束。
+                  开：非宿主成员 @ 机器人时只答疑，不改文件、不推进任务，交卷 / 提问 / 定时等工具一律被拒。
+                  自定义模型只开放读文件 / 搜索；Cursor 模型没有硬限制，只靠提示词。
                   <br />
-                  关：群成员与宿主<b>同权</b>，@ 机器人说的话和宿主一样处理、不限制工具与改文件（agent 仍可能自行调用
-                  交卷 / 提问 / 定时等系统工具，与 lk-harness 项目群一致）；仅有的区别是：不会触发群里的「推进」口令、
-                  不会顶掉你待答的提问、也不会唤醒已休眠的会话（会话不在时只走只读答疑）。
+                  关：群成员与宿主<b>同权</b>，不限制工具和改文件。仅有的区别：不会触发群里的「推进」、
+                  不会顶掉你待答的提问、不会唤醒已休眠的会话。
                 </>
               }
               control={
@@ -444,21 +459,19 @@ export const FeishuBridgeBlock = ({
               </p>
             </details>
             <SettingRow
-              label="受理群里其他机器人的 @"
+              label="机器人与真人同权"
               className="py-0"
               hint={
                 <>
-                  开：别的机器人在需求群里 @ 本机机器人，和真人一样受理（与 lk-harness 的群内机器人协作一致）。
-                  机器人的消息<b>不受上面那个开关影响、始终按「只答疑、不改代码」处理</b>；提示词要求它不回「收到」
-                  之类的客套，回复也不会自动 @ 对方（要它自己写 @名字），避免两个机器人互相 @ 成环。
+                  关：别的机器人 @ 本机机器人时只答疑，不改代码。
                   <br />
-                  关：机器人发来的 @ 一律静默忽略（只在任务事件流里留一条提示）。
+                  开：机器人和群成员一样，按上面的开关处理（上面关了，机器人也能让 agent 改文件）。
                 </>
               }
               control={
                 <Switch
-                  checked={feishuGroupAllowBots}
-                  onCheckedChange={onFeishuGroupAllowBotsChange}
+                  checked={feishuGroupBotsEqualRights}
+                  onCheckedChange={onFeishuGroupBotsEqualRightsChange}
                 />
               }
             />

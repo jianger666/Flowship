@@ -12,6 +12,7 @@
 
 import type { AdvanceOptionGroup } from "@/lib/server/advance-options";
 
+import { CARD_BASE_CONFIG } from "./card-config";
 import type { CardButtonValue } from "./types";
 
 /** 按钮上限——飞书卡片不宜堆太多按钮，超出的提示去应用内选 */
@@ -121,7 +122,7 @@ export const buildGroupAdvanceCardJson = (
 
   return {
     schema: "2.0",
-    config: { update_multi: true },
+    config: { ...CARD_BASE_CONFIG },
     header: {
       title: {
         tag: "plain_text",

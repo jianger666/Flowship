@@ -1,8 +1,8 @@
 /**
- * P1：群里非属主的附件，必须先过鉴权 / 限流 / 忙线闸门、通过了才下载。
+ * P1：群里非属主的附件，必须先过鉴权 / 准入 / 忙线闸门、通过了才下载（旁路滑动窗限流 2026-11-06 已整套删除，相关用例随之删除）。
  *
- * 旧实现在第 5 步一律先 `parseContent`（= 下载图 / 文件 / 视频），再判是不是属主、要不要限流：
- * 陌生人（或对端机器人）刷文件会占满全局单飞的 lark 队列，拖住属主的消息；被限流 / 拒收的消息也白下了一遍。
+ * 旧实现在第 5 步一律先 `parseContent`（= 下载图 / 文件 / 视频），再判是不是属主、要不要受理：
+ * 陌生人（或对端机器人）刷文件会占满全局单飞的 lark 队列，拖住属主的消息；被拒收的消息也白下了一遍。
  * 现在非属主只做「预解析」（`deferDownloads`：拿正文 + 知道有没有资源，不下载），
  * 闸门全过之后在 injectGroupMessage 里 `deferred.resolve()` 才真正下载。属主本人照旧即时下载。
  *
@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FeishuInboundMessage } from "@/lib/server/feishu-bridge/types";
 import type { Task, TaskSummary } from "@/lib/types";
 
-// 旁路限流的 info 事件走真实落盘太重——mock 掉写入口
+// info 事件走真实落盘太重——mock 掉写入口
 const writeOwnedEventAndPublish = vi.hoisted(() =>
   vi.fn(async () => ({ id: "ev_mock" })),
 );
@@ -229,41 +229,6 @@ describe("非属主：预解析不下载，闸门全拦下的消息零下载", (
     expect(sentTexts().some((t) => t.includes(GROUP_CHAT_NOT_OWNER))).toBe(true);
   });
 
-  it("旁路滑动窗限流（总限额 12 次）已满：第 13 个带附件的被静默丢弃，零下载", async () => {
-    for (let i = 0; i < 12; i++) {
-      // 纯文本：占满名额，不涉及下载
-      const r = await routeGroupInboundMessage(
-        msg(`ou_u${i}`, `om_t${i}`, "@Flowship 查下埋点"),
-        ctx,
-      );
-      expect(r).toMatchObject({ kind: "sent" });
-    }
-    downloads = [];
-    sendTextToChat.mockClear();
-
-    const r = await routeGroupInboundMessage(msg("ou_u13", "om_att13"), ctx);
-
-    expect(r).toMatchObject({ kind: "skipped" });
-    expect(downloads).toEqual([]); // 被限流的陌生人附件白下一遍的老问题
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(12);
-    expect(sendTextToChat).not.toHaveBeenCalled(); // 限流静默
-  });
-
-  it("个人限额（每人 4 次）已满：同一人第 5 个带附件的被丢弃，零下载", async () => {
-    for (let i = 0; i < 4; i++) {
-      await routeGroupInboundMessage(
-        msg("ou_chatty", `om_c${i}`, "@Flowship 问题"),
-        ctx,
-      );
-    }
-    downloads = [];
-
-    const r = await routeGroupInboundMessage(msg("ou_chatty", "om_c_att"), ctx);
-
-    expect(r).toMatchObject({ kind: "skipped" });
-    expect(downloads).toEqual([]);
-  });
-
   it("忙线 + 带图（带图不排队）：忙线拒收，零下载", async () => {
     const inFlight = { cancelled: false, cancel: () => {} };
     registerRestrictedQuestion(TASK, inFlight);
@@ -304,51 +269,11 @@ describe("非属主：预解析不下载，闸门全拦下的消息零下载", (
   });
 });
 
-describe("非属主答 pendingAsk 也过限流闸：被拦下的零下载、不动 pendingAsk；答成功不占名额", () => {
+describe("答 pendingAsk 的附件：没有限流闸（2026-11-06 删除），非属主带图答 pendingAsk 照常下载并送达；属主同样即时下载", () => {
   const withPendingAsk = () =>
     installDeps({ getPendingAsk: () => ({ askId: "ask-1", questions: [] }) });
 
-  it("旁路窗总限额（12 次）已被刷满：非属主带图答 pendingAsk 被静默丢弃——零下载、不消费 pendingAsk、群里不回", async () => {
-    for (let i = 0; i < 12; i++) {
-      const r = await routeGroupInboundMessage(
-        msg(`ou_u${i}`, `om_f${i}`, "@Flowship 查下埋点"),
-        ctx,
-      );
-      expect(r).toMatchObject({ kind: "sent" });
-    }
-    downloads = [];
-    sendTextToChat.mockClear();
-    withPendingAsk();
-
-    const r = await routeGroupInboundMessage(
-      msg("ou_late", "om_ask_att", "@Flowship 选这个 [附件]"),
-      ctx,
-    );
-
-    expect(r).toMatchObject({ kind: "skipped" });
-    expect(downloads).toEqual([]); // 旧实现：pendingAsk 免检，这里白下一遍
-    expect(injectPendingAskText).not.toHaveBeenCalled();
-    expect(sendTextToChat).not.toHaveBeenCalled(); // 限流静默
-  });
-
-  it("个人限额（每人 4 次）已满：同一人带图答 pendingAsk 同样被丢弃，零下载", async () => {
-    for (let i = 0; i < 4; i++) {
-      await routeGroupInboundMessage(msg("ou_chatty", `om_pc${i}`, "@Flowship 问题"), ctx);
-    }
-    downloads = [];
-    withPendingAsk();
-
-    const r = await routeGroupInboundMessage(
-      msg("ou_chatty", "om_pc_att", "@Flowship 选 B [图]"),
-      ctx,
-    );
-
-    expect(r).toMatchObject({ kind: "skipped" });
-    expect(downloads).toEqual([]);
-    expect(injectPendingAskText).not.toHaveBeenCalled();
-  });
-
-  it("答 pendingAsk 成功不占名额（它不起旁路 run）：同一人连答 6 次（> 个人上限 4）都成功，之后他的普通提问仍被受理", async () => {
+  it("没有限流：同一人连答 6 次 pendingAsk（旧的个人上限是 4）都成功，之后他的普通提问仍被受理", async () => {
     withPendingAsk();
     for (let i = 0; i < 6; i++) {
       const r = await routeGroupInboundMessage(
@@ -369,47 +294,7 @@ describe("非属主答 pendingAsk 也过限流闸：被拦下的零下载、不�
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
   });
 
-  it("答 pendingAsk 失败（非 no_pending）：名额同样退还，不白占", async () => {
-    injectPendingAskText.mockImplementation(async () => ({
-      ok: false as const,
-      reason: "failed" as const,
-      error: "注入失败",
-    }));
-    withPendingAsk();
-    for (let i = 0; i < 6; i++) {
-      const r = await routeGroupInboundMessage(
-        msg("ou_helper", `om_pf${i}`, "@Flowship 选这个"),
-        ctx,
-      );
-      expect(r).toMatchObject({ kind: "failed" });
-    }
-    // 6 次失败都没占名额：个人额度（4）没被吃掉，随后普通提问仍受理
-    installDeps();
-    expect(
-      await routeGroupInboundMessage(msg("ou_helper", "om_pf_after", "@Flowship 再问"), ctx),
-    ).toMatchObject({ kind: "sent" });
-  });
-
-  it("答 pendingAsk 撞 no_pending 落回旁路：名额沿用准入点 ① 扣的那一个（个人上限 4：第 5 条被丢弃，且不重复扣）", async () => {
-    injectPendingAskText.mockImplementation(async () => ({
-      ok: false as const,
-      reason: "no_pending" as const,
-      error: "没有待答提问",
-    }));
-    withPendingAsk();
-    for (let i = 0; i < 4; i++) {
-      expect(
-        await routeGroupInboundMessage(msg("ou_race", `om_race${i}`, "@Flowship 选这个"), ctx),
-      ).toMatchObject({ kind: "sent" });
-    }
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(4);
-    expect(
-      await routeGroupInboundMessage(msg("ou_race", "om_race4", "@Flowship 选这个"), ctx),
-    ).toMatchObject({ kind: "skipped" });
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(4);
-  });
-
-  it("属主答 pendingAsk 不过限流闸（属主不受限）：窗口刷满后仍即时下载并送达", async () => {
+  it("属主答 pendingAsk：即时下载并送达（群里先有 12 个人提问也不受影响）", async () => {
     for (let i = 0; i < 12; i++) {
       await routeGroupInboundMessage(msg(`ou_u${i}`, `om_g${i}`, "@Flowship 查下埋点"), ctx);
     }
@@ -483,7 +368,7 @@ describe("非属主：闸门全过 → 才下载一次、注入带上资源", ()
   });
 });
 
-describe("非属主：下载阶段失败 / 不支持 → 回执 + 退还旁路名额，不起 run", () => {
+describe("非属主：下载阶段失败 / 不支持 → 回执，不起 run", () => {
   it("下载抛错：failed 且 retryable（等补拉重投）、群里回原因、不注入", async () => {
     downloadOverride = async () => {
       throw new Error("lark 下载超时");
@@ -513,41 +398,4 @@ describe("非属主：下载阶段失败 / 不支持 → 回执 + 退还旁路�
     expect(sentTexts().some((t) => t.includes("文件超过 50MB 上限"))).toBe(true);
   });
 
-  it("下载失败不占名额：12 条下载失败之后，下一条正常消息照常受理（名额已退还）", async () => {
-    downloadOverride = async () => {
-      throw new Error("lark 下载超时");
-    };
-    for (let i = 0; i < 12; i++) {
-      const r = await routeGroupInboundMessage(msg(`ou_f${i}`, `om_f${i}`), ctx);
-      expect(r).toMatchObject({ kind: "failed" });
-    }
-    downloadOverride = null;
-
-    const r = await routeGroupInboundMessage(
-      msg("ou_next", "om_next", "@Flowship 正常问题"),
-      ctx,
-    );
-
-    expect(r).toMatchObject({ kind: "sent" }); // 若名额没退还，这里是 skipped（被限流）
-    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
-  });
-
-  it("下载后不支持同样退还名额", async () => {
-    downloadOverride = async () => ({
-      text: "",
-      images: [],
-      attachments: [],
-      unsupported: "文件超过 50MB 上限",
-    });
-    for (let i = 0; i < 12; i++) {
-      await routeGroupInboundMessage(msg(`ou_g${i}`, `om_g${i}`), ctx);
-    }
-    downloadOverride = null;
-
-    const r = await routeGroupInboundMessage(
-      msg("ou_next", "om_next2", "@Flowship 正常问题"),
-      ctx,
-    );
-    expect(r).toMatchObject({ kind: "sent" });
-  });
 });

@@ -63,10 +63,12 @@ export const FeishuCliSection = ({
   onMeegleProjectChange,
   feishuChatBridge,
   onFeishuChatBridgeChange,
+  feishuBridgeStreaming,
+  onFeishuBridgeStreamingChange,
   feishuGroupNonOwnerGuard,
   onFeishuGroupNonOwnerGuardChange,
-  feishuGroupAllowBots,
-  onFeishuGroupAllowBotsChange,
+  feishuGroupBotsEqualRights,
+  onFeishuGroupBotsEqualRightsChange,
 }: {
   meegleProject: MeegleProjectSetting;
   /** 选中即落盘（父级 saveFieldValue） */
@@ -74,12 +76,15 @@ export const FeishuCliSection = ({
   /** 消息桥接全局开关（决策 #3） */
   feishuChatBridge: boolean;
   onFeishuChatBridgeChange: (next: boolean) => void;
+  /** 飞书私聊流式回复（默认开） */
+  feishuBridgeStreaming: boolean;
+  onFeishuBridgeStreamingChange: (next: boolean) => void;
   /** 群里非宿主成员的提示词约束（默认开） */
   feishuGroupNonOwnerGuard: boolean;
   onFeishuGroupNonOwnerGuardChange: (next: boolean) => void;
-  /** 群里别的机器人 @ 本机机器人是否受理（默认开） */
-  feishuGroupAllowBots: boolean;
-  onFeishuGroupAllowBotsChange: (next: boolean) => void;
+  /** 机器人与真人同权（默认关：机器人始终只答疑） */
+  feishuGroupBotsEqualRights: boolean;
+  onFeishuGroupBotsEqualRightsChange: (next: boolean) => void;
 }) => {
   const { confirm } = useDialog();
   // 服务端状态快照（轮询）
@@ -375,10 +380,12 @@ export const FeishuCliSection = ({
         <FeishuBridgeBlock
           feishuChatBridge={feishuChatBridge}
           onFeishuChatBridgeChange={onFeishuChatBridgeChange}
+          feishuBridgeStreaming={feishuBridgeStreaming}
+          onFeishuBridgeStreamingChange={onFeishuBridgeStreamingChange}
           feishuGroupNonOwnerGuard={feishuGroupNonOwnerGuard}
           onFeishuGroupNonOwnerGuardChange={onFeishuGroupNonOwnerGuardChange}
-          feishuGroupAllowBots={feishuGroupAllowBots}
-          onFeishuGroupAllowBotsChange={onFeishuGroupAllowBotsChange}
+          feishuGroupBotsEqualRights={feishuGroupBotsEqualRights}
+          onFeishuGroupBotsEqualRightsChange={onFeishuGroupBotsEqualRightsChange}
         />
       </div>
     </div>

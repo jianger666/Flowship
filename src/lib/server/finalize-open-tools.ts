@@ -32,7 +32,7 @@ export type OpenToolCall = {
   actionId?: string;
   /**
    * 这条 tool_call 属于哪一轮群答疑旁路 run（`meta.groupRun` = runTag）；属主自己的工具没有。
-   * 补写的终态必须带回同一个标——旁路事件整条链靠它被 UI 折进「群问答」tab，
+   * 补写的终态必须带回同一个标——旁路事件整条链靠它被 UI 折进群问答卡，
    * 漏了标，call 被藏、result 却露在属主主流里，成了一块孤儿「已中断」。
    */
   groupRun?: string;

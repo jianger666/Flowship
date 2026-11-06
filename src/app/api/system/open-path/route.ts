@@ -24,7 +24,7 @@ export const runtime = "nodejs";
 const runSpawn = (
   command: string,
   args: string[],
-  opts?: { ignoreNonZeroExit?: boolean },
+  opts?: { ignoreNonZeroExit?: boolean; windowsVerbatimArguments?: boolean },
 ): Promise<string | null> =>
   new Promise((resolve) => {
     // env 剔宿主注入变量：默认应用常是 Electron 系（VS Code 等），吃到 ELECTRON_RUN_AS_NODE=1 会被当纯 node 秒退（R10b-05）
@@ -32,6 +32,8 @@ const runSpawn = (
       stdio: "ignore",
       detached: true,
       env: stripHostInjectedEnvAndGitToken(),
+      // Windows 的 explorer /select,"…" 不能让 Node 重新加引号（见 OsSpawnSpec.windowsVerbatimArguments）；其它平台忽略
+      ...(opts?.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
     child.on("error", () => resolve(`无法执行 ${command}`));
     child.on("exit", (code) => {
@@ -63,8 +65,11 @@ export const POST = async (req: Request) => {
   if (plan.kind === "reject") {
     return NextResponse.json({ error: plan.error }, { status: 400 });
   }
-  const { command, args, ignoreNonZeroExit } = plan.spec;
-  const failure = await runSpawn(command, args, { ignoreNonZeroExit });
+  const { command, args, ignoreNonZeroExit, windowsVerbatimArguments } = plan.spec;
+  const failure = await runSpawn(command, args, {
+    ignoreNonZeroExit,
+    windowsVerbatimArguments,
+  });
   if (failure) return NextResponse.json({ error: failure }, { status: 400 });
   if (plan.kind === "reveal") {
     return NextResponse.json({ ok: true, revealed: true, notice: plan.notice });

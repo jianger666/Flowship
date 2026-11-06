@@ -37,7 +37,6 @@ const {
   __resetGroupAdvancePickForTest,
   __resetGroupReplyStateForTest,
   __resetThrottleForTest,
-  GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER,
   listGroupReplies,
 } = await import("@/lib/server/feishu-bridge/group-shared");
 const { __resetOutboundRegistryForTest } = await import(
@@ -180,7 +179,8 @@ describe("非属主 + 活会话 → 并入同会话", () => {
     const opts = optsOf(handleTaskQuestionInject);
     expect(opts).toMatchObject({
       restrictToQuestion: false,
-      groupNonOwner: { name: "李四" },
+      // openId 随行：机器人变体提示词要给出 @ 标签的固定写法（回复协议下线后系统不再替它 @名字 换真 @）
+      groupNonOwner: { name: "李四", openId: STRANGER },
     });
     // 抬头只标身份（约束段由注入链送达时按设置开关追加）
     const text = String(bodyOf(handleTaskQuestionInject).text);
@@ -262,7 +262,9 @@ describe("非属主 + 活会话 → 并入同会话", () => {
     expect(sentTexts(sendTextToChat).join("\n")).toContain("排队的人太多了");
   });
 
-  it("202 排队不退限流名额：同一人排满 per-sender 窗口后，下一条被限流丢弃（排队不能绕过滑动窗）", async () => {
+  it("没有速率限制：同一人连发 6 条（旧的 per-sender 滑动窗是 4 次）全部排进 task 待送达队列、逐条注入", async () => {
+    // 2026-11-06：旁路 / 并入同会话的 per-sender 滑动窗限流已整套删除（用户：「什么熔断机制都可以去掉」）。
+    // 积压上限由 task 待送达队列自己的容量与「每人排队槽位」管，不在群路由里按时间窗计数。
     agentSessions.set("task-1", {} as never);
     const handleTaskQuestionInject = vi.fn(async () => queuedRes());
     __setGroupRouteDepsForTest(
@@ -272,7 +274,7 @@ describe("非属主 + 活会话 → 并入同会话", () => {
         listTasks: async () => [taskSummary({ runStatus: "running" })],
       }) as never,
     );
-    const n = GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER;
+    const n = 6;
     for (let i = 0; i < n; i++) {
       const r = await routeGroupInboundMessage(
         groupMsg({ message_id: `om_q${i}` }),
@@ -280,12 +282,6 @@ describe("非属主 + 活会话 → 并入同会话", () => {
       );
       expect(r).toMatchObject({ kind: "queued" });
     }
-    const over = await routeGroupInboundMessage(
-      groupMsg({ message_id: "om_over" }),
-      ctx,
-    );
-    expect(over.kind).not.toBe("queued");
-    expect(over.kind).not.toBe("sent");
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(n);
   });
 });

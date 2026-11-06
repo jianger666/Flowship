@@ -15,6 +15,7 @@ import {
   dropAskCardSettledView,
   getAskCardSettledView,
 } from "./ask-settle-state";
+import { CARD_BASE_CONFIG } from "./card-config";
 import { rememberAskCard, rememberCardMessage } from "./card-map";
 import { bumpCardSequence, flushCardSeqToDisk, nextCardSequence } from "./card-seq";
 import {
@@ -45,14 +46,20 @@ const FLUSH_INTERVAL_MS = 250;
 const FLUSH_CHAR_THRESHOLD = 600;
 
 /**
- * 熔断：连续失败 N 次后暂停流式更新（R14 P1-1）。
- * 为什么要有：flush 失败既不回滚也不退避，节流器照 250ms 一次地发整卡 PUT（argv 可达数十 KB）——
- * 飞书限流 / 断网 / 黑洞时变成 lark-cli 子进程风暴，还会占死「全进程单飞」的 lark 队列，拖垮别的任务。
+ * 失败后的重试间隔上限。
+ * 流式 flush 失败后，下一次尝试的间隔 = min(250ms × 2^连续失败次数, 5s)：500ms → 1s → 2s → 4s → 5s 封顶，
+ * 任一次成功立刻回到 250ms / 字数节流。取代原来的「连续 3 次失败 → 熔断暂停 → 半开探测 → 第 2 次跳闸才通知」：
+ * 不再有「暂停推流」的状态，也不再有「N 次后放弃自驱」的次数上限——只靠失败后间隔拉长来防风暴
+ * （失败时回滚「已推」快照，所以重试一定是整包补发，不会漏内容）。
+ * 代价（接受）：飞书整体黑洞（lark-cli 每发等满 8s 超时）时，这张卡会以「≈8s 超时 + ≤5s 间隔」的节奏一直重试到 finalize，
+ * 占着全进程单飞的 lark 队列约六成时间；原熔断把它压到 ≤30s 一发且最多 10 发。
  */
-const BREAKER_FAIL_THRESHOLD = 3;
-/** 熔断退避：首次 2s，每次探测仍失败就翻倍，封顶 30s */
-const BREAKER_BACKOFF_BASE_MS = 2_000;
-const BREAKER_BACKOFF_MAX_MS = 30_000;
+const FLUSH_RETRY_MAX_MS = 5_000;
+/**
+ * 连续失败达到这个次数（或已有致命故障）就视为「飞书这边已知不通」。
+ * 只用于终稿的两个省时决定——黑洞超时不再重试、终稿失败后不再多押一发「关流式」——不影响流式更新的节奏、也不暂停任何推送。
+ */
+const KNOWN_UNREACHABLE_FAILS = 3;
 /**
  * 卡片更新类调用的单次超时。lark 调用进程级单飞，默认 30s 对流式更新太长：
  * 一个黑洞请求会让所有任务的飞书写操作陪等 30s。
@@ -60,16 +67,6 @@ const BREAKER_BACKOFF_MAX_MS = 30_000;
 const CARD_OP_TIMEOUT_MS = 8_000;
 /** 终稿（finalize）单次超时：它决定用户能不能看到完整回复，弱网下多给点时间，别轻易判失败 */
 const CARD_FINALIZE_TIMEOUT_MS = 15_000;
-/**
- * 自驱探测封顶：卡一直没收尾、lark 又一直挂时，别在后台永远每 ≤30s 打一发。
- * 超过这个次数（约 3.5 分钟）就不再自己续约；之后只有新的 push（说明这一轮还活着）或 finalize 才会再试。
- */
-const BREAKER_MAX_AUTO_PROBES = 10;
-/**
- * 累计跳闸几次才对外通知（onBreakerOpen）：2 = 首次探测仍失败。
- * 1–2 秒的小抖动会 3 连败即跳闸、2s 后的首次探测就恢复了——这种不该给用户一条「已暂停实时推送」
- */
-const BREAKER_NOTIFY_MIN_TRIPS = 2;
 /** 失败原因存入 / 打日志前的限长：lark-cli 的 execFile 错误 message 动辄几十 KB（含整卡 --data） */
 const ERROR_TEXT_MAX = 240;
 /**
@@ -79,7 +76,7 @@ const ERROR_TEXT_MAX = 240;
  * 逐档收紧重发没有副作用。
  */
 const SHRINK_ANSWER_BUDGETS = [10_000, 5_000, 2_500] as const;
-/** 序号冲突（300317）一轮失败里最多自愈几次（任一次成功后复位）；仍冲突就按普通失败计入熔断 */
+/** 序号冲突（300317）一轮失败里最多自愈几次（任一次成功后复位）；仍冲突就按普通失败计数 */
 const SEQ_HEALS_PER_EPISODE = 1;
 /**
  * 终稿全量 PUT 遇到瞬时失败（限流 / 5xx / lark-cli 超时）时的退避重试间隔：每个元素 = 一次重试前等多久，
@@ -104,7 +101,7 @@ export const __setFinalRetryDelaysForTest = (
 /**
  * 终稿「从开始到放弃」的总时间预算（整卡 PUT 的各次尝试 + 退避 + 之后的思考区回写 / 关流式）。
  *
- * 为什么要总预算：单发上限 15s，再叠 2 次退避重试，最坏 15+1+15+3+15 ≈ 49s；熔断已开 / 飞书黑洞时
+ * 为什么要总预算：单发上限 15s，再叠 2 次退避重试，最坏 15+1+15+3+15 ≈ 49s；飞书黑洞时
  * 这段时间全压在 enqueueCardOp 互斥链上（outbound 的 finalize 在等它、同一张卡的后续操作也排在后面），
  * 用户盯着一张「生成中」的卡等将近一分钟才等到文字补发。预算把它封在 ≈40s：每发的超时取
  * min(15s, 剩余额度)，剩余不够一发（{@link FINAL_MIN_ATTEMPT_MS}）就不再重试。
@@ -155,8 +152,8 @@ const ELEMENT_QUOTE = "md_quote";
 const ELEMENT_DIVIDER = "main_divider";
 
 /**
- * 计时（终稿预算 / 熔断窗口 / 重开间隔）用单调时钟：休眠唤醒 / NTP 校时会让墙钟（Date.now）整段跳变——
- * 向前跳，终稿预算「瞬间耗尽」、不再重试终稿 PUT；向后跳，熔断窗口被拉长、半开探测迟迟不放行。
+ * 计时（终稿预算 / 重开间隔）用单调时钟：休眠唤醒 / NTP 校时会让墙钟（Date.now）整段跳变——
+ * 向前跳，终稿预算「瞬间耗尽」、不再重试终稿 PUT；向后跳，重开间隔被拉长、迟迟不放行。
  * performance.now() 不受影响。⚠️ 只用于「相对时长」；写进卡片 / 事件的时间戳（createdAt）与展示用的
  * 转圈帧仍是墙钟 Date.now()，与预算无关。
  */
@@ -456,7 +453,7 @@ export const buildStreamingCardJson = (opts: {
   const streamingMode = opts.streamingMode !== false;
   const config: Record<string, unknown> = {
     streaming_mode: streamingMode,
-    update_multi: true,
+    ...CARD_BASE_CONFIG,
     // 通知摘要：有 subtitle 用它，否则按模板给中性文案（对齐 Hermes config.summary）
     summary: {
       content:
@@ -556,20 +553,10 @@ export const createCardStream = (
   let messageId: string | undefined;
   /** lark 调用失败累计 */
   let failCount = 0;
-  // —— 熔断器（R14 P1-1）——
-  /** 连续失败次数；任一次成功清零 */
+  /** 连续失败次数（决定下一次重试的间隔，见 FLUSH_RETRY_MAX_MS）；任一次成功清零 */
   let consecutiveFails = 0;
-  /**
-   * 熔断打开到何时（monoNow() 单调时钟的 ms 时刻，不是墙钟），0 = 关。到期即「半开」：放行一次探测——
-   * 失败立刻再跳闸（退避翻倍），成功则全部清零。
-   */
-  let breakerOpenUntil = 0;
-  /** 连续跳闸次数（决定退避翻倍；成功清零） */
-  let breakerTrips = 0;
-  /** 本卡生命周期内是否开过熔断（后来恢复了也算） */
-  let breakerEverOpened = false;
-  /** onBreakerOpen 是否已调过（每张卡最多一次） */
-  let breakerNotified = false;
+  /** 本卡生命周期内是否发生过致命故障（后来恢复了也算：中途丢过流式更新） */
+  let fatalEver = false;
   /** finalize 的终稿内容是否落到了卡片：undefined = 还没 finalize */
   let finalizeOk: boolean | undefined;
   /** start() 失败（建卡 / 发卡没成）：这一轮飞书里从头到尾没有卡，finalize 必须记成「没同步」 */
@@ -577,9 +564,9 @@ export const createCardStream = (
   /** 最近一次 lark 失败（已瘦身：一行摘要 + 错误码 / 命令 / log_id / 违规字段等结构化字段，不带 raw，见 slimError） */
   let lastError: unknown;
   // —— 失败分类驱动的状态（R14 B4-3 · Q12a-06 / 07）——
-  /** 致命故障类别：设了就不再半开探测（再试也不会好），只剩 finalize 收尾；任一次写成功（= 恢复的证据）清掉 */
+  /** 致命故障类别：设了就不再自己重试（再试也不会好），只剩 finalize 收尾；任一次写成功（= 恢复的证据）清掉 */
   let fatalKind: LarkFailureKind | undefined;
-  /** 致命故障的对外通知是否已发（与普通熔断的 breakerNotified 各一次：「不会好了」是新信息） */
+  /** 致命故障的对外通知是否已发（每张卡最多一次） */
   let fatalNotified = false;
   /** 内容超限后的收紧档位：-1 = 不收紧；见 SHRINK_ANSWER_BUDGETS */
   let shrinkLevel = -1;
@@ -654,9 +641,9 @@ export const createCardStream = (
     );
   };
 
-  /** 熔断是否打开（到期即「半开」：此时返回 false，放行一次探测）；致命故障 = 一直打开、永不半开 */
-  const isBreakerOpen = (): boolean =>
-    fatalKind !== undefined || breakerOpenUntil > monoNow();
+  /** 飞书是否已知不通（见 KNOWN_UNREACHABLE_FAILS）：致命故障，或连续失败达阈值 */
+  const knownUnreachable = (): boolean =>
+    fatalKind !== undefined || consecutiveFails >= KNOWN_UNREACHABLE_FAILS;
 
   const clearFlushTimer = (): void => {
     if (flushTimer !== null) {
@@ -689,13 +676,13 @@ export const createCardStream = (
   };
 
   /**
-   * 熔断期间的探测定时器：到期放行一次 flush（半开）。
+   * 失败后的重试定时器：间隔随连续失败次数拉长（FLUSH_RETRY_MAX_MS 封顶），到期再放行一次 flush。
    * 不能只靠 push 触发——模型在长工具调用里没有新输出时没人再调 scheduleFlush，
-   * 卡片就永远等不到恢复探测。同一时刻只留这一个定时器（先清掉可能已排的 250ms 节流定时器）。
+   * 失败那一发落下的内容就一直补不上。同一时刻只留这一个定时器（先清掉可能已排的 250ms 节流定时器）。
    */
-  const armBreakerProbe = (): void => {
+  const armRetryTimer = (): void => {
     clearFlushTimer();
-    const wait = Math.max(FLUSH_INTERVAL_MS, breakerOpenUntil - monoNow());
+    const wait = Math.min(FLUSH_INTERVAL_MS * 2 ** consecutiveFails, FLUSH_RETRY_MAX_MS);
     flushTimer = scheduleTimer(() => {
       flushTimer = null;
       if (finalized) return;
@@ -706,10 +693,11 @@ export const createCardStream = (
   const scheduleFlush = (): void => {
     // 非流式：不发中间态；流式且卡未建：等 start 成功后再刷
     if (finalized || !started || !streamingEnabled || !cardId) return;
-    // 熔断中：不再按 250ms / 字数起 flush（每一发都会撞墙），只留到期探测定时器
-    if (isBreakerOpen()) {
-      // 致命故障没有「到期探测」：不排任何定时器，只等 finalize
-      if (flushTimer === null && fatalKind === undefined) armBreakerProbe();
+    // 致命故障：不排任何定时器，只等 finalize
+    if (fatalKind !== undefined) return;
+    // 刚失败过：只按退避定时器重试，不走「字数够了立刻发 / 250ms 节流」的快路径（否则每个 push 都撞一次墙）
+    if (consecutiveFails > 0) {
+      if (flushTimer === null) armRetryTimer();
       return;
     }
     if (pendingChars >= FLUSH_CHAR_THRESHOLD) {
@@ -725,35 +713,30 @@ export const createCardStream = (
   };
 
   /**
-   * 对外通知「飞书卡片在掉线」（outbound 当场落一条 info）。普通熔断与致命故障各最多一次；
-   * 回调自己抛的异常吞掉——观测回调不能拖垮卡片流。普通熔断的入参形状与 B1 完全一致（不带 fatalKind）。
+   * 对外通知「飞书卡片在掉线」（致命故障才通知，outbound 当场落一条 info），每张卡最多一次；
+   * 回调自己抛的异常吞掉——观测回调不能拖垮卡片流。
    */
-  const notifyBreakerOpen = (retryInMs: number, fatal?: LarkFailureKind): void => {
-    if (fatal ? fatalNotified : breakerNotified) return;
-    if (fatal) fatalNotified = true;
-    else breakerNotified = true;
+  const notifyFatal = (kind: LarkFailureKind): void => {
+    if (fatalNotified) return;
+    fatalNotified = true;
     try {
-      opts.onBreakerOpen?.(
-        fatal
-          ? { consecutiveFails, retryInMs, error: lastError, fatalKind: fatal }
-          : { consecutiveFails, retryInMs, error: lastError },
-      );
+      opts.onFatal?.({ consecutiveFails, error: lastError, fatalKind: kind });
     } catch {
       // 观测回调不能拖垮卡片流
     }
   };
 
   /**
-   * 致命故障（再试也不会好）：熔断一直开着、不再半开探测，清掉待决的节流 / 探测定时器，只剩 finalize 收尾。
+   * 致命故障（再试也不会好）：不再自己重试，清掉待决的节流 / 重试定时器，只剩 finalize 收尾。
    * `too_long` 同时把终稿收紧到第一档（finalize 的第一发就用缩短的内容，不白撞一次）。
    * finalize 已经在跑时不再单独通知——outbound 的终态 info 会说。
    */
   const goFatal = (kind: LarkFailureKind): void => {
     fatalKind = kind;
-    breakerEverOpened = true;
+    fatalEver = true;
     if (kind === "too_long") shrinkLevel = Math.max(shrinkLevel, 0);
     clearFlushTimer();
-    if (!finalizing) notifyBreakerOpen(0, kind);
+    if (!finalizing) notifyFatal(kind);
   };
 
   /**
@@ -777,12 +760,12 @@ export const createCardStream = (
       try {
         await patchCardSettings(
           cardId,
-          { config: { streaming_mode: true, update_multi: true } },
+          { config: { streaming_mode: true, ...CARD_BASE_CONFIG } },
           nextSeq(),
           { timeoutMs: CARD_OP_TIMEOUT_MS },
         );
       } catch (err) {
-        // 重开本身失败：计入失败（间隔没到，不会再递归重开），之后走普通熔断
+        // 重开本身失败：计入失败（间隔没到，不会再递归重开），之后走普通的失败间隔重试
         recordFailure("reopenStream", err);
         return;
       }
@@ -793,11 +776,11 @@ export const createCardStream = (
   };
 
   /**
-   * 记一次 lark 写失败：累计 + 连续计数；连续失败达阈值即跳闸（退避 2s → 4s → … 封顶 30s）。
+   * 记一次 lark 写失败：累计 + 连续计数，并按连续失败次数拉长间隔排好下一次重试（FLUSH_RETRY_MAX_MS 封顶）。
    * 互斥链保证同一时刻只有一个写在跑，计数不会并发错乱。
    *
    * B4-3：先按 `classifyLarkFailure` 分类，几类「再试也没用 / 可自愈」的失败走各自的策略，其余（限流 / 瞬时 / 未知）
-   * 照旧走连续 3 次熔断：
+   * 走上面的失败间隔重试：
    * - `gone`（卡片没了）/ `auth`（没权限）/ `too_long`（内容超限）→ 致命：停掉中间态（goFatal）；
    * - `seq_conflict`（300317）→ 抬高该卡序号、马上重排一次 flush，不计入连续失败（一轮最多一次，仍冲突就按普通失败）；
    * - `stream_closed`（流式被关）→ 重新打开流式（reopenStream）；次数用完 → 致命。
@@ -827,35 +810,16 @@ export const createCardStream = (
       }
     }
     consecutiveFails += 1;
-    if (consecutiveFails < BREAKER_FAIL_THRESHOLD) return;
-    breakerTrips += 1;
-    const retryInMs = Math.min(
-      BREAKER_BACKOFF_BASE_MS * 2 ** (breakerTrips - 1),
-      BREAKER_BACKOFF_MAX_MS,
-    );
-    breakerOpenUntil = monoNow() + retryInMs;
-    breakerEverOpened = true;
-    // 持续性故障才对外通知：首次探测仍失败 = 第 2 次跳闸（小抖动探测就恢复，不打扰用户）。
-    // 通知前就进 finalize 的卡不会有这条——outbound 在终态另写一条 info，信号不丢
-    if (breakerTrips >= BREAKER_NOTIFY_MIN_TRIPS) notifyBreakerOpen(retryInMs);
-    // 流式进行中：排好到期探测（终稿 / 非流式 / 卡未建不需要）。自驱探测有次数上限（BREAKER_MAX_AUTO_PROBES）：
-    // 超过后不再续约，只等新的 push（scheduleFlush 的熔断分支会重新 arm）或 finalize
-    if (
-      started &&
-      !finalized &&
-      streamingEnabled &&
-      cardId &&
-      breakerTrips <= BREAKER_MAX_AUTO_PROBES
-    ) {
-      armBreakerProbe();
+    // 流式进行中：按拉长后的间隔排好下一次重试（终稿 / 非流式 / 卡未建不需要）。
+    // 没有次数上限：卡一直没收尾、lark 又一直挂时会一直按 ≤5s 的间隔重试到 finalize——这是去掉熔断的代价，见 FLUSH_RETRY_MAX_MS
+    if (started && !finalized && !finalizing && streamingEnabled && cardId) {
+      armRetryTimer();
     }
   };
 
-  /** 一次 lark 写成功：连续失败清零、熔断关闭（探测成功 = 恢复）；致命故障 / 序号自愈余量一并复位 */
+  /** 一次 lark 写成功：连续失败清零（回到 250ms / 字数节流）；致命故障 / 序号自愈余量一并复位 */
   const recordSuccess = (): void => {
     consecutiveFails = 0;
-    breakerTrips = 0;
-    breakerOpenUntil = 0;
     fatalKind = undefined;
     seqHealsLeft = SEQ_HEALS_PER_EPISODE;
   };
@@ -863,7 +827,7 @@ export const createCardStream = (
   /**
    * finalize 失败的统一记账。终稿内容已经落到卡片（finalizeOk 已为 true）、只是收尾的小事
    * （关 streaming_mode / 本地登记）失败 → 只 warn，不算「没同步」；否则终稿没落成，
-   * finalizeOk = false 并计入熔断（outbound 据此给用户明确提示，不再静默）。
+   * finalizeOk = false 并计入失败（outbound 据此给用户明确提示，不再静默）。
    */
   const noteFinalizeFailure = (label: string, err: unknown): void => {
     if (finalizeOk === true) {
@@ -1005,9 +969,9 @@ export const createCardStream = (
 
   const doFlush = async (): Promise<void> => {
     if (!cardId || finalized || !streamingEnabled) return;
-    // 熔断中：这一发必然撞墙，直接放过（内容留在 desired 里，到期探测 / finalize 整包补发）。
-    // finalize / append 在链上先调本函数、再做各自的写——它们自己的写不看熔断（强试一次），所以这里 return 不影响它们
-    if (isBreakerOpen()) return;
+    // 致命故障：这一发必然撞墙，直接放过（内容留在 desired 里，finalize 整包补发）。
+    // finalize / append 在链上先调本函数、再做各自的写——它们自己的写不看致命态（强试一次），所以这里 return 不影响它们
+    if (fatalKind !== undefined) return;
 
     const nextProcess = canonicalProcess();
     const nextAnswer = canonicalAnswer();
@@ -1065,7 +1029,7 @@ export const createCardStream = (
       }
       recordSuccess();
     } catch (err) {
-      // 回滚「已推」快照（见上）。回滚必须和熔断一起做：没有熔断时，回滚会让每个排队的 flush 都重发整卡
+      // 回滚「已推」快照（见上）。回滚靠 recordFailure 里排的失败间隔重试限速：没有间隔的话，回滚会让每个排队的 flush 都重发整卡
       processFlushed = prevProcessFlushed;
       answerFlushed = prevAnswerFlushed;
       // header 失败时恢复脏标记，便于下次再试
@@ -1421,7 +1385,7 @@ export const createCardStream = (
    * ② 内容超限（`too_long`：卡片体积 / Windows 命令行）→ 终稿收紧一档（正文预算 10k → 5k → 2.5k 字）整包重发。
    * ③ 瞬时失败（限流 / 5xx / lark-cli 超时，见 `isRetryableFinalFailure`）→ 退避后原样重发，最多 2 次
    *    （间隔见 FINAL_RETRY_DELAYS_MS）。终稿是最后一发、没有下一帧来补，一次失败就让卡片永远停在中间态不可取。
-   *    例外：熔断在 finalize 开始时就已打开 = 飞书这边已知不通，lark-cli 超时（黑洞）不再重试——
+   *    例外：finalize 开始时飞书已知不通（knownUnreachable：致命故障 / 连续失败 ≥ 3 次），lark-cli 超时（黑洞）不再重试——
    *    再等 2 个「退避 + 15s 超时」只是把用户的文字补发推迟半分钟；限流 / 5xx 这类「服务端明确在回话」的仍重试。
    * 所有重发（含 ①②）合计受总预算约束（FINAL_TOTAL_BUDGET_MS ≈ 40s，每发超时取 min(15s, 剩余额度)，
    * 剩余不够一发就不再起新的一发）。
@@ -1435,7 +1399,7 @@ export const createCardStream = (
   const putFinal = async <T>(
     fn: (timeoutMs: number) => Promise<T>,
   ): Promise<T> => {
-    const breakerWasOpen = isBreakerOpen();
+    const unreachableAtStart = knownUnreachable();
     let healed = false;
     let retries = 0;
     /** 预算里还够再起一发（含先睡 delay 毫秒） */
@@ -1468,7 +1432,7 @@ export const createCardStream = (
         if (
           retries < finalRetryDelaysMs.length &&
           isRetryableFinalFailure(err) &&
-          !(breakerWasOpen && timedOut) &&
+          !(unreachableAtStart && timedOut) &&
           canAttemptAfter(finalRetryDelaysMs[retries]!)
         ) {
           const delay = finalRetryDelaysMs[retries]!;
@@ -1488,18 +1452,18 @@ export const createCardStream = (
   /**
    * 终稿用尽仍没落成后，best-effort 把 streaming_mode 关掉一次：否则卡片在飞书侧一直挂着「生成中」直到
    * 飞书自己超时（最长约 10 分钟），而文字补发早就把完整回复发出去了，用户看到的是两条互相矛盾的信息。
-   * 失败一律吞掉（只打日志、不记账、不进熔断、不覆盖 lastError）——它是锦上添花，不能再给终稿失败添新故障。
-   * 不发的情形：卡没了 / 没权限（关也是白等）、流式已被飞书关掉（不用再关）、熔断开着（飞书整体不通，不再多押一发）。
+   * 失败一律吞掉（只打日志、不记账、不覆盖 lastError）——它是锦上添花，不能再给终稿失败添新故障。
+   * 不发的情形：卡没了 / 没权限（关也是白等）、流式已被飞书关掉（不用再关）、飞书已知不通（knownUnreachable，不再多押一发）。
    */
   const closeStreamingBestEffort = async (cause: unknown): Promise<void> => {
     if (!cardId) return;
     const kind = classifyLarkFailure(cause);
     if (kind === "gone" || kind === "auth" || kind === "stream_closed") return;
-    if (isBreakerOpen()) return;
+    if (knownUnreachable()) return;
     try {
       await patchCardSettings(
         cardId,
-        { config: { streaming_mode: false, update_multi: true } },
+        { config: { streaming_mode: false, ...CARD_BASE_CONFIG } },
         nextSeq(),
         { timeoutMs: finalStepTimeout() },
       );
@@ -1591,8 +1555,9 @@ export const createCardStream = (
         finalized = true;
         return;
       }
-      // 链上刷完过程/正文（与在途 flush 互斥，R1-13d）
-      await doFlush();
+      // 链上刷完过程/正文（与在途 flush 互斥，R1-13d）。飞书已知不通时不先刷：下面的整卡 PUT 本来就带全量，
+      // 先刷只是多等一个注定失败的超时
+      if (!knownUnreachable()) await doFlush();
 
       try {
         // footer + header 全量 PUT。序号冲突 / 内容超限 / 瞬时失败在 putFinal 里就地自愈
@@ -1608,7 +1573,7 @@ export const createCardStream = (
           syncFlushedFromDesired();
           await putEntityOnly(timeoutMs);
         });
-        // 终稿内容已落到卡片。熔断中走到这里也是照发的（强试一次）——成功就是恢复的最好证据
+        // 终稿内容已落到卡片。致命故障 / 连续失败期间走到这里也是照发的（强试一次）——成功就是恢复的最好证据
         finalizeOk = true;
         recordSuccess();
         // batch 回写思考区（纯思考轮 P0：全量 PUT 可能丢嵌套 content，batch 是嵌套区唯一可靠通道）：
@@ -1623,7 +1588,7 @@ export const createCardStream = (
         // 关 streaming_mode：失败只意味着卡片在飞书侧继续显示「生成中」直到自动结束，内容已完整，不改 finalizeOk
         await patchCardSettings(
           cardId,
-          { config: { streaming_mode: false, update_multi: true } },
+          { config: { streaming_mode: false, ...CARD_BASE_CONFIG } },
           nextSeq(),
           { timeoutMs: finalStepTimeout() },
         );
@@ -1653,8 +1618,8 @@ export const createCardStream = (
     getHealth: (): CardStreamHealth => ({
       failCount,
       consecutiveFails,
-      breakerOpen: isBreakerOpen(),
-      breakerEverOpened,
+      fatalActive: fatalKind !== undefined,
+      fatalEver,
       finalizeOk,
       lastError,
       fatalKind,

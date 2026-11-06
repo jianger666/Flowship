@@ -914,11 +914,10 @@ const cardFailureHint = (kind: LarkFailureKind, err: unknown): string => {
   }
 };
 
-/** 熔断打开时当场落的 info 文案：致命故障（再试也不会好）按类别说清后果，普通熔断沿用 B1 的措辞 */
-const describeBreakerOpen = (info: {
-  consecutiveFails: number;
+/** 致命故障（再试也不会好）发生时当场落的 info 文案：按类别说清后果 */
+const describeFatal = (info: {
   error: unknown;
-  fatalKind?: LarkFailureKind;
+  fatalKind: LarkFailureKind;
 }): string => {
   const reason = describeCardFailure(info.error);
   switch (info.fatalKind) {
@@ -930,7 +929,7 @@ const describeBreakerOpen = (info: {
     case "stream_closed":
       return `飞书把卡片的流式更新关掉了（${reason}），多次重新打开仍失败，已暂停实时推送；回复结束时会再整卡同步一次`;
     default:
-      return `飞书卡片连续 ${info.consecutiveFails} 次更新失败（${reason}），已暂停实时推送；回复结束时会再整卡同步一次`;
+      return `飞书卡片无法继续实时更新（${reason}），回复结束时会再整卡同步一次`;
   }
 };
 
@@ -951,15 +950,15 @@ const ensureCardStarted = async (
     const card = createCardStreamImpl(taskId, {
       title: turn.title,
       streaming: turn.streaming,
-      // 持续性故障（熔断后首次探测仍失败）就当场落一条 info——不用等 finalize：用户此刻就该知道飞书卡片在掉线
-      // （每张卡最多一条；1–2 秒的小抖动探测就恢复、card-stream 不会回调）
-      onBreakerOpen: (info) => {
+      // 致命故障（卡没了 / 没权限 / 内容超限 / 流式重开用完）就当场落一条 info——不用等 finalize：用户此刻就该知道飞书卡片在掉线
+      // （每张卡最多一条；普通失败只拉长重试间隔、card-stream 不会回调）
+      onFatal: (info) => {
         void writeEventAndPublish(taskId, {
           kind: "info",
-          text: describeBreakerOpen(info),
+          text: describeFatal(info),
         }).catch((logErr) => {
           console.warn(
-            `[feishu-bridge/outbound] 写熔断提示 info 失败 task=${taskId}:`,
+            `[feishu-bridge/outbound] 写致命故障提示 info 失败 task=${taskId}:`,
             logErr instanceof Error ? logErr.message : logErr,
           );
         });
@@ -1563,11 +1562,11 @@ const finalizeTurn = async (
 
     // 终稿到没到飞书卡片，以 getHealth 为准：只有 finalizeOk === true 才算同步完整。
     // false = 终稿没落成（含 start 就失败、这一轮飞书里根本没有卡）；undefined = 句柄没给出任何成功信号；
-    // breakerOpen = 此刻仍在持续失败。凡「没有明确成功信号」一律按没同步报，不报喜。
+    // fatalActive = 此刻仍处于未恢复的致命故障。凡「没有明确成功信号」一律按没同步报，不报喜。
     // 旧判据 getFailCount() >= 3 是整轮累计值——长轮里零星抖动 3 次就误报、而终稿其实早已到位；
     // 反过来 finalize 自己失败时累计数可能只有 0~2，又一声不吭
     const health = card.getHealth();
-    const unsynced = health.finalizeOk !== true || health.breakerOpen;
+    const unsynced = health.finalizeOk !== true || health.fatalActive;
 
     // review P1#4 / 坑 #10：卡片没同步完整内容要在 app 内可见（每轮最多一条终态 info）。
     // 先写 info、再追发：追发走同一条 lark 单飞队列，黑洞时可能排队等满 30s 超时——app 内提示不能被它拖慢
@@ -1605,7 +1604,7 @@ const finalizeTurn = async (
     // 卡片停在最后一次打字机推送，正文只存在 app 里。把正文分块以普通文本补发（保序、不抛），
     // 再发下面那句收尾提示——提示放最后，用户收到的最后一条推送仍是「没同步」的说明。
     // 只补成功收尾的轮次：失败轮的 answerText 是半截、stop 是用户自己停的；
-    // finalizeOk 为 undefined / 仅熔断仍开的「结果未知」不补，免得卡片其实已到位时重复刷屏
+    // finalizeOk 为 undefined / 仅致命态未恢复的「结果未知」不补，免得卡片其实已到位时重复刷屏
     let fallbackDelivered = false;
     if (health.finalizeOk === false && opts.ok && opts.outcome !== "stopped") {
       const fb = await sendUnsyncedAnswerAsText(taskId, turn.answerText, budgetDeadline);

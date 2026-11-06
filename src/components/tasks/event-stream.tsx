@@ -58,9 +58,7 @@ import {
   collectGroupQaRounds,
   groupQaRoundOfSummaryEvent,
   isGroupQaSummaryEvent,
-  pickRoundsNeedingOwner,
 } from "@/lib/group-qa";
-import { deriveGroupQaScope } from "@/lib/group-qa-scope";
 import {
   deriveSearchScopeNotice,
   findRenderIndexForEventId,
@@ -186,7 +184,6 @@ import {
   ToolVerbGroupRow,
 } from "./event-stream/tool-block";
 import { GroupQaInlineRow } from "./group-qa-inline-row";
-import { GroupQaPanel } from "./group-qa-panel";
 import { ActiveStatusLine } from "./event-stream/active-status-line";
 import { BackgroundSubagentsBar } from "./background-subagents-bar";
 import { ScheduleChip } from "./schedule-chip";
@@ -465,7 +462,7 @@ interface Props {
    * **属主主 run** 在跑（不含旁路群答疑 run）。错误卡的「当轮失败」资格、底部状态行及其占位槽、
    * 组尾「处理中…」只看属主的 run——否则主任务失败后群里来一个提问，错误卡整张翻篇
    * （恢复入口消失、样式变灰），旁路结束又弹回来（D6-02），空闲任务也会为旁路撑开一个空状态槽（R3-05）。
-   * 第四轮 Q5-01 起 task 页的 `isRunning` 也不再并入旁路在飞（旁路过程事件整条藏在「群问答」tab，
+   * 第四轮 Q5-01 起 task 页的 `isRunning` 也不再并入旁路在飞（旁路过程事件整条藏起来、只在轮次卡的「查看过程」里，
    * 主流里没有旁路工具块可画），所以两者在 task 页同值；缺省 = isRunning（chat 没有旁路）。
    */
   mainRunActive?: boolean;
@@ -481,8 +478,6 @@ interface Props {
   onPrependEvents?: (events: TaskEvent[]) => void;
   /** 答题卡提交成功：把接口返回的 task 合进页面（完成信号由提交者发出，不单等 SSE） */
   onTaskUpdate?: (task: Task) => void;
-  /** 群问答 tab 显隐变化（父页面据此隐藏底部输入条：只读 tab 下输入框会误导） */
-  onGroupQaVisibleChange?: (visible: boolean) => void;
   /** shell 流式输出：callId → 已累积文本（尾部窗口由父组件维护） */
   liveToolOutputs?: Record<string, string>;
   /**
@@ -844,7 +839,6 @@ const EventStreamImpl = ({
   variant = "log",
   onPrependEvents,
   onTaskUpdate,
-  onGroupQaVisibleChange,
   liveToolOutputs,
   liveThinking,
   onRewind,
@@ -957,8 +951,8 @@ const EventStreamImpl = ({
   // 下一个 chunk 就把他拽回去 = 用户实测的「一滚就抖」。现在改成听用户手势意图。
   const follow = useStreamFollow(scrollToBottom);
   // 初始滚动定位闸：首次有 items 时落一次位（一律落在最后一条、并恢复跟随，见下方渲染期 latch）；
-  // false = 还没落（切 task / 进群问答 tab / 列表清空时重开——后两者都是 Virtuoso 被卸掉、之后重新挂载；
-  // latch 只在「这一次渲染会挂上 Virtuoso」时消耗它，见渲染期 latch 处的说明）。只是个「落过没有」的闸——Virtuoso 的初始位置
+  // false = 还没落（切 task / 列表清空时重开——后者是 Virtuoso 被卸掉、之后重新挂载）。
+  // 只是个「落过没有」的闸——Virtuoso 的初始位置
   // 由跟随控制器在容器挂上时直接写 scrollTop 落到底（Virtuoso 不再传 initialTopMostItemIndex），不读任何 ref 里的下标
   const initialPositionedRef = useRef(false);
   // rangeChanged 去重：同一个 startIndex 重复回调直接短路（Virtuoso 重渲会重发同 range）
@@ -992,8 +986,6 @@ const EventStreamImpl = ({
   //
   // 第一层：只吃真实事件（滤噪声 → thinking 合并 → tool 配对 → 工作过程分组）。
   // isRunning=false 时 coerce 脏 running 工具 →「已中断」（chat / task 共用）
-  // 群问答 tab：有旁路问答轮次时才出现；切过去只读呈现，主流程事件流不受影响
-  const [showGroupQa, setShowGroupQa] = useState(false);
   // 后台在跑的子代理 id 集合：chat-view 对清单做了相等判断（没变不换引用），这里按引用 memo 即可
   const backgroundJobIds = useMemo(
     () => backgroundJobIdSet(backgroundSubagents),
@@ -1003,7 +995,9 @@ const EventStreamImpl = ({
     () => buildStreamItems(task.events, isChat, isRunning, backgroundJobIds),
     [task.events, isChat, isRunning, backgroundJobIds],
   );
-  // 群问答轮次（原始事件聚合，不走主流程过滤管线；chat 形态无群桥接不展示）
+  // 群问答轮次（原始事件聚合，不走主流程过滤管线；chat 形态无群桥接不展示）。
+  // 群里非属主的提问只有两种去处，都在这一条事件流里：有活会话 → 并进同一会话（普通气泡，带「非宿主」标）；
+  // 没有活会话 → 只读旁路答疑，做完以一张「问 + 答」内联卡落在这里（汇总事件处）。不再有单独的「群问答」页签。
   const groupQaRounds = useMemo(
     () => collectGroupQaRounds(task.events ?? []),
     [task.events],
@@ -1013,52 +1007,8 @@ const EventStreamImpl = ({
     () => new Map(groupQaRounds.map((r) => [r.key, r] as const)),
     [groupQaRounds],
   );
-  // 还有没有更早的可拉（初值来自 task.eventsTruncated、之后由分页响应维护）。
-  // 声明放这里而不是分页那一段：群问答只统计已加载的事件，tab 要据此说明范围（D8-01）
+  // 还有没有更早的可拉（初值来自 task.eventsTruncated、之后由分页响应维护）
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
-  const groupQaScope = deriveGroupQaScope({
-    roundCount: groupQaRounds.length,
-    hasMoreEarlier,
-    hasGroup: !!task.feishuGroupChatId,
-    isChat,
-  });
-  const showQaPanel = showGroupQa && groupQaScope.showTab;
-  // 群问答是只读 tab：通知父页面隐藏底部输入条（否则输入框会误导用户在此发言）
-  useEffect(() => {
-    onGroupQaVisibleChange?.(showQaPanel);
-    return () => onGroupQaVisibleChange?.(false);
-  }, [showQaPanel, onGroupQaVisibleChange]);
-  // 进出 QA tab 时 Virtuoso 会卸载/重挂：range 起点缓存清掉，下一次 rangeChanged
-  // 才不会因「同 startIndex 短路」跳过 sticky 重算（否则切回事件流粘顶头状态是旧的）。
-  useEffect(() => {
-    lastRangeStartRef.current = null;
-    // 进群问答 tab 时 Virtuoso 整个卸载、切回来是重新挂载（控制器的首次落底只在容器挂上 + 稳定期内触发一次）——
-    // 定位闸只在 false 时才会跑一次渲染期 latch、只有切 task 才复位，不开闸的话切回来那次渲染不会重新
-    // 恢复跟随 + 开稳定期（V17-02；旧实现这里还要防「用首次加载时的陈旧下标重挂」，现在位置由常量给、不再有这个问题）。
-    // 只在「进入」时开：切回事件流那次渲染的 latch（见下方「初始定位」）会重新落在最后一条并恢复跟随，
-    // 与进入对话 / 任务同一个行为（2026-10-17 用户拍板「进入一律落在最后一条」）。
-    // 配套：latch 带 `!showQaPanel` 守卫（评审 R8-3）——QA tab 里的重渲不能把这里刚开的闸消耗掉
-    if (showQaPanel) initialPositionedRef.current = false;
-  }, [showQaPanel]);
-  // agent 正好 ask_user 时自动切回事件流：QA 是只读 tab，问答卡+提示条+输入框全藏，
-  // 用户盯着 QA 页收不到任何信号、agent 干等。只在 null→有 的上升沿切一次；
-  // 之后用户爱看哪看哪（ask 等人期间最可能要翻 QA 再回追问，不能每次点 QA 都被踢回）。
-  const prevHadPendingAskRef = useRef(false);
-  useEffect(() => {
-    const has = !!pendingAskEvent;
-    const rose = has && !prevHadPendingAskRef.current;
-    prevHadPendingAskRef.current = has;
-    if (rose && showQaPanel) setShowGroupQa(false);
-  }, [pendingAskEvent, showQaPanel]);
-  // 进行中轮次 → tab 上亮蓝点（主流程里它完全隐身，不给提示用户不知道有人问了，review P1-4）。
-  // 已知局限：answering 按快照时间算，无新事件就不重算——崩溃打断的那轮蓝点会常亮到下个事件到来。
-  // 故意的：这组件有过输入卡顿 perf 坑，不加分钟级 tick；下个事件（属主说句话）到就灭。
-  const groupQaAnswering = groupQaRounds.some((r) => r.answering);
-  // 答疑 agent 标了「需属主确认」的轮次数（24h 内）：tab 上亮 brand 点，群里有事等属主拍板时不至于没人发现。
-  const groupQaNeedsOwnerCount = useMemo(
-    () => pickRoundsNeedingOwner(groupQaRounds).length,
-    [groupQaRounds],
-  );
 
   // 第二层：未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的
   // 漏网），渲染层兜底保证答题卡不被顶走（纯显示排序、数据不动、2026-07-23 用户实测痛点）。
@@ -1227,14 +1177,8 @@ const EventStreamImpl = ({
     null,
   );
 
-  // 切 task 回事件流（群问答 tab 是任务内视图，别串台）；搜一激活也切回（搜索只查主流程）
-  // review P2-8：搜的时候停在 QA tab 里容易懵。
-  useEffect(() => {
-    setShowGroupQa(false);
-  }, [task.id]);
   const activateStreamSearch = useCallback(() => {
     setActivePaneSearchScope("event-stream");
-    setShowGroupQa(false);
     setSearchActive(true);
     searchInputRef.current?.focus();
     requestAnimationFrame(() => {
@@ -1669,7 +1613,6 @@ const EventStreamImpl = ({
 
   // ---------- v1.0.x 事件懒加载（上拉分页） ----------
   // firstItemIndex：Virtuoso prepend 保滚动位置的官方机制——头部插 N 个 item 就减 N
-  // （hasMoreEarlier / setHasMoreEarlier 的声明提到了「群问答 tab」那一段之前——tab 的范围提示要用它）
   // 拉取飞行中（顶部小 spinner、渲染用）
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   // 上一次拉取失败（顶部显示手动重试；下一次开拉时清掉）
@@ -2040,13 +1983,9 @@ const EventStreamImpl = ({
   //
   // 同一个控制器的通知走微任务，渲染期写它不会触发 React 的跨组件更新告警。
   //
-  // **只在「这一次渲染真的会挂上 Virtuoso」时触发**（评审 R8-3）：`!showQaPanel && items.length > 0` 才是它在树上的条件
-  // （JSX 里 `showQaPanel ? <GroupQaPanel/> : items.length === 0 ? 空态 : <Virtuoso/>`）。进入 QA tab 的 effect 把闸开成 false 之后，
-  // QA tab 里的任何一次重渲（`onGroupQaVisibleChange` 触发父级 setState、事件 / 流式持续到来）若没有 `!showQaPanel` 守卫，
-  // 就会在 Virtuoso 根本不在树上的时候把闸消耗掉、白开一个 1.5s 稳定期——用户在 QA tab 停留超过 1.5s 再切回，
-  // latch 不再触发、稳定期早已过，`attachScroller` 挂上新容器时不落底（Virtuoso 从 scrollTop=0 重挂、不再传 initialTopMostItemIndex）。
-  // 闸的另一半（「Virtuoso 不在树上就开闸」）见上面的 [showQaPanel] effect 与下面的 [listEmpty] effect。
-  if (!initialPositionedRef.current && !showQaPanel && items.length > 0) {
+  // **只在「这一次渲染真的会挂上 Virtuoso」时触发**（`items.length > 0` 就是它在树上的条件；
+  // JSX 里 `items.length === 0 ? 空态 : <Virtuoso/>`）。闸的另一半（「Virtuoso 不在树上就开闸」）见下面的 [listEmpty] effect。
+  if (!initialPositionedRef.current && items.length > 0) {
     follow.setFollowing(true);
     // 开启「定位稳定期」（评审 K1）：Virtuoso 的初始定位与贴底链是两条互不知情的 rAF 链，
     // 稳定期内贴底链按时间收口、scroll 回调带漂移兜底；幂等、渲染期写安全（同 setFollowing）
@@ -2054,7 +1993,7 @@ const EventStreamImpl = ({
     initialPositionedRef.current = true;
   }
   // 列表清空（回退到最开头 / 事件窗口被整体换空）：JSX 里的空态占位把 Virtuoso 卸掉了，之后再有条目是**重新挂载**
-  // （从 scrollTop=0 起、不再传 initialTopMostItemIndex）——与进入群问答 tab 同一类「Virtuoso 不在树上」，同一个处理：
+  // （从 scrollTop=0 起、不再传 initialTopMostItemIndex）：
   // 开闸，由上面的渲染期 latch 在「重新挂上 Virtuoso 的那次渲染」恢复跟随 + 开稳定期，落底交给 attachScroller。
   // 只在「变空」时开（依赖是布尔）：有条目时不碰闸，免得 latch 之后又被无谓重置、把用户刚上滚的跟随态拉回去
   const listEmpty = items.length === 0;
@@ -2424,8 +2363,7 @@ const EventStreamImpl = ({
   // 搜索范围提示：还有更早事件没加载时，搜索只覆盖已加载那段——有无命中都要说明，
   // 并复用上拉分页（loadEarlier）给「加载更早的再搜」入口；加载后 items 变、命中自动重算
   const searchScopeNotice = deriveSearchScopeNotice({
-    // 群问答 tab 下展示的是只读 QA 列表、搜索不作用于它，提示条也不出
-    filtering: isSearchFiltering && !showQaPanel,
+    filtering: isSearchFiltering,
     hasMoreEarlier,
     loadedCount: task.events.length,
     canLoadEarlier: !!onPrependEvents,
@@ -2470,62 +2408,13 @@ const EventStreamImpl = ({
           inputRef={searchInputRef}
           placeholder="搜索 AI 回复…"
           ariaLabel="搜索 AI 回复"
-          // 搜索激活态 leading 让位（V13-04）：tab 是 flex-1、Input 也是 flex-1，两者平分剩余宽度——
-          // 307px 的事件流栏里 Input 只剩约 71px（有群问答 tab 时约 25px）。搜索一激活就已切回事件流
-          // （activateStreamSearch 里 setShowGroupQa(false)），tab 此刻没有用处；关掉搜索后原样回来
+          // 搜索激活态 leading 让位（V13-04）：标题是 flex-1、Input 也是 flex-1，两者平分剩余宽度——
+          // 307px 的事件流栏里 Input 只剩约 71px。搜索一激活标题就没有用处；关掉搜索后原样回来
           leading={
             searchActive ? null : (
-            <span className="flex flex-1 items-center gap-3">
-              <button
-                type="button"
-                onClick={() => setShowGroupQa(false)}
-                className={cn(
-                  "text-xs",
-                  !showQaPanel
-                    ? "font-medium text-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
+              <span className="flex-1 text-xs font-medium text-foreground">
                 事件流
-              </button>
-              {groupQaScope.showTab && (
-                <button
-                  type="button"
-                  onClick={() => setShowGroupQa(true)}
-                  className={cn(
-                    "flex items-center gap-1 text-xs tabular-nums",
-                    showQaPanel
-                      ? "font-medium text-foreground"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  {/* 窗口只含最近一段事件时计数带「+」（至少这么多），范围说明在面板顶部 */}
-                  群问答{groupQaScope.countText && `（${groupQaScope.countText}）`}
-                  {/* 状态点一律静态（事件流 v2「动效同屏只留一处主动效」）；
-                      点只有颜色，role=img + aria-label 给读屏，hover 提示走 Tooltip（不用原生 title） */}
-                  {groupQaAnswering && (
-                    <Tooltip content="群里有提问正在回答">
-                      <span
-                        role="img"
-                        aria-label="群里有提问正在回答"
-                        className="inline-block size-1.5 rounded-full bg-info"
-                      />
-                    </Tooltip>
-                  )}
-                  {groupQaNeedsOwnerCount > 0 && (
-                    <Tooltip
-                      content={`有 ${groupQaNeedsOwnerCount} 件事等你在群问答里拍板`}
-                    >
-                      <span
-                        role="img"
-                        aria-label={`有 ${groupQaNeedsOwnerCount} 件事等你在群问答里拍板`}
-                        className="inline-block size-1.5 rounded-full bg-brand"
-                      />
-                    </Tooltip>
-                  )}
-                </button>
-              )}
-            </span>
+              </span>
             )
           }
           className="h-10 shrink-0 border-b px-4"
@@ -2576,49 +2465,43 @@ const EventStreamImpl = ({
           )}
         {/* E1 sticky 轮次头：默认 hidden，rangeChanged 里命令式显隐（见 applyStickyTurn）。
             chat / task 都启用：task 事件流里用户也会直接发消息提问（user_reply）、
-            回滚看历史时同样需要「回到最近提问」的锚。
-            群问答 tab 下不渲染：它是事件流的轮次锚，浮在只读 QA 列表上会挡住首行
-            （QA 有自己的独立滚动容器，rangeChanged 早已停发，sticky 会卡在旧文案）。 */}
-        {!showQaPanel && (
+            回滚看历史时同样需要「回到最近提问」的锚。 */}
         <div
           ref={stickyRootRef}
           // 初始 = 隐藏态（STICKY_HIDDEN_CLASSES）；显隐由 applyStickyTurn 命令式切两组类、
           // 走淡入淡出 + 4px 位移，不再 display:none 一下出现 / 消失（那是原来「横幅突然蹦出来」的手感）
           className="pointer-events-none invisible absolute inset-x-0 top-0 z-10 -translate-y-1 opacity-0 transition-[opacity,translate,visibility] duration-150 ease-out motion-reduce:transition-none"
         >
-            <div className="mx-auto w-full max-w-3xl px-6">
-              <Tooltip content="回到本轮开头">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const id = stickyTurnIdRef.current;
-                    if (!id) return;
-                    const idx = itemsRef.current.findIndex((it) => it.id === id);
-                    // 走 jumpToItem：先停跟随再滚（流式时直接 scrollToIndex 会被贴底拽回，见其注释）
-                    if (idx >= 0) jumpToItem(idx, "start", "smooth");
-                  }}
-                  // 事件流 v2：不透明底 + 完整边 + 轻阴影。旧版 bg-background/75 + backdrop-blur
-                  // 实测挡不住下面的正文（半透明条上叠着正文第一行、两行字糊在一起）——
-                  // 浮在内容之上的东西必须是实心面，才读得出「这是浮层、不是正文」
-                  className="pointer-events-auto flex w-full cursor-pointer items-center gap-2 rounded-b-lg border-x border-b border-border bg-background px-3 py-1.5 text-left text-xs text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
-                >
-                  <span className="shrink-0 font-medium text-foreground">
-                    本轮提问
-                  </span>
-                  <span
-                    ref={stickyTextRef}
-                    className="min-w-0 flex-1 truncate"
-                  />
-                </button>
-              </Tooltip>
-            </div>
+          <div className="mx-auto w-full max-w-3xl px-6">
+            <Tooltip content="回到本轮开头">
+              <button
+                type="button"
+                onClick={() => {
+                  const id = stickyTurnIdRef.current;
+                  if (!id) return;
+                  const idx = itemsRef.current.findIndex((it) => it.id === id);
+                  // 走 jumpToItem：先停跟随再滚（流式时直接 scrollToIndex 会被贴底拽回，见其注释）
+                  if (idx >= 0) jumpToItem(idx, "start", "smooth");
+                }}
+                // 事件流 v2：不透明底 + 完整边 + 轻阴影。旧版 bg-background/75 + backdrop-blur
+                // 实测挡不住下面的正文（半透明条上叠着正文第一行、两行字糊在一起）——
+                // 浮在内容之上的东西必须是实心面，才读得出「这是浮层、不是正文」
+                className="pointer-events-auto flex w-full cursor-pointer items-center gap-2 rounded-b-lg border-x border-b border-border bg-background px-3 py-1.5 text-left text-xs text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <span className="shrink-0 font-medium text-foreground">
+                  本轮提问
+                </span>
+                <span
+                  ref={stickyTextRef}
+                  className="min-w-0 flex-1 truncate"
+                />
+              </button>
+            </Tooltip>
           </div>
-        )}
+        </div>
         {/* 底部悬浮层：回到最新（带新增条数）+ 未答提问提示条。
             显隐由子组件自己订阅跟随态，主组件不参与（滚动路径零重渲）。
-            key 挂 task.id：详情页内切任务不重挂 EventStream、计数基线得跟着重来
-            群问答 tab 下不渲染：计数口径是事件流的，浮在 QA 上文不对题。 */}
-        {!showQaPanel && (
+            key 挂 task.id：详情页内切任务不重挂 EventStream、计数基线得跟着重来 */}
         <StreamFloatingBar
           key={task.id}
           follow={follow}
@@ -2628,28 +2511,17 @@ const EventStreamImpl = ({
           onJumpToAsk={jumpToPendingAsk}
           onBackToBottom={backToBottom}
         />
-        )}
-        {/* 左侧提问时间线：只在事件流视图（群问答 tab 是另一份只读列表、轮次口径不同）。
+        {/* 左侧提问时间线。
             chat 内容居中、两侧是大片空白：把手贴内容列左缘（贴最左缘离正文几百 px、没人注意得到）；
             task 内容铺满：贴最左缘就是正文旁 */}
-        {!showQaPanel && (
-          <StreamOutlineRail
-            items={railItems}
-            activeStore={outlineActiveStore}
-            onJump={onOutlineJump}
-            jumpingId={jumpingId}
-            anchor={isChat ? "column" : "edge"}
-          />
-        )}
-        {showQaPanel ? (
-          <GroupQaPanel
-            rounds={groupQaRounds}
-            events={task.events}
-            scopeNotice={groupQaScope.notice}
-            onLoadEarlier={onPrependEvents ? () => void loadEarlier() : undefined}
-            loadingEarlier={loadingEarlier}
-          />
-        ) : items.length === 0 ? (
+        <StreamOutlineRail
+          items={railItems}
+          activeStore={outlineActiveStore}
+          onJump={onOutlineJump}
+          jumpingId={jumpingId}
+          anchor={isChat ? "column" : "edge"}
+        />
+        {items.length === 0 ? (
           <div
             className={cn(
               "p-4 text-xs text-muted-foreground",

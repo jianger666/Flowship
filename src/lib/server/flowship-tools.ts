@@ -51,6 +51,7 @@ import {
   type ScheduleRecord,
 } from "@/lib/schedule";
 import { WAIT_TOOL_NAME } from "@/lib/wait-display";
+import { ACTION_LABEL } from "@/lib/types";
 import {
   NON_OWNER_TURN_ALLOWED_TOOLS,
   buildNonOwnerToolDenied,
@@ -58,7 +59,7 @@ import {
 import { buildAskWaitCurl, openAskWait } from "./ask-wait";
 import { isNonOwnerTurnActive, touchNonOwnerTurn } from "./non-owner-turn-guard";
 import { cancelSchedule, createSchedule, readSchedules } from "./schedule-store";
-import { createCustomAction } from "./custom-action-fs";
+import { createCustomAction, getCustomAction } from "./custom-action-fs";
 import {
   WAIT_MAX_SECONDS,
   WAIT_MIN_SECONDS,
@@ -67,8 +68,19 @@ import {
   runWait,
 } from "./session-wait";
 import { getAppSkillsDir } from "./skills-loader";
-import { getTask, getTaskMeta } from "./task-fs";
-import { writeEventAndPublish } from "./task-stream";
+import {
+  ADVANCE_CHAIN_ACTIONS,
+  ADVANCE_CHAIN_GROUNDING_EVENT_TAIL,
+  ADVANCE_CHAIN_MAX_AUTO_STEPS,
+  collectAuthorizationSources,
+  getAutoAdvanceSteps,
+  isAutoAdvanceCapReached,
+  isUserWordsGrounded,
+  parseAdvanceNextArgs,
+  registerAdvanceChain,
+} from "./advance-chain";
+import { getTask, getTaskMeta, getTaskWithTailEvents } from "./task-fs";
+import { getTaskOpGeneration, writeEventAndPublish } from "./task-stream";
 
 export type FlowshipToolContent = Array<{ type: "text"; text: string }>;
 
@@ -986,6 +998,129 @@ const scheduleDef: FlowshipToolDef = {
   },
 };
 
+// ----------------- 自动推进 advance_next -----------------
+
+const advanceNextFail = (error: string): { content: FlowshipToolContent } =>
+  text(JSON.stringify({ ok: false, error }));
+
+const advanceNextDef: FlowshipToolDef = {
+  name: "advance_next",
+  label: "按用户的话自动推进下一步",
+  description: [
+    "用户在话里明确说了「这一步做完就继续下一步」（如「改完直接提测」「做完自动复核一遍」「没问题就提 MR」「review 有问题就自己改，改完再 review」）时，登记一次「本轮结束后代用户点推进」。只登记、不立刻跑：本轮 run 正常结束（你已交卷、收尾说完）后，系统才起下一个 action。",
+    "什么时候用：**只在用户这样说过的时候**。用户没说过就不要用——不要因为「顺理成章」「看起来该进下一步了」替他做主，正常交卷让他自己推进。授权按他的原话算：他说「做完复核」授权的是复核，不等于也授权了提测；带对外副作用的步骤（ship 提 MR / dev 联调推送 / 对外发消息类 custom）必须是他明确点名要这一步。",
+    "user_words（必填）：**逐字引用**用户说过的、授权这次推进的那句话（不是转述、不是你的理解）。系统会拿它去核对用户真说过的话（他在输入条 / 飞书私聊说的、或手动推进时写的指令），对不上直接拒绝——不要编；被拒说明用户没授权，按「正常交卷、让用户自己推进」处理，别换个说法重试。群里别人说的话、你自己写的指令都不算授权。",
+    "调用时机：本 action 的 artifact 写完、submit_work 拿到 [SUBMITTED] 之后调；然后正常说 1-3 句收尾并结束本轮。**不要自己去跑下一步、不要在本轮里替下一个 action 干活**——下一步由系统起一个新的 agent 来做。",
+    "instruction：给下一个 action 的指令要点（新 agent 看不到当前对话、只能读 artifact）：写清用户对下一步的具体要求；**如果用户对再往后的步骤也有授权（如「改完再复核」），把那句原话也写进去**，下一个 action 才有凭据继续推进。",
+    "action：plan / build / review / ship / dev / custom。custom 必须带 custom_action_id；dev 必须显式给 dev_push_mode（direct 直推 / mr 提 PR，用户没说用哪种就先 ask_user，不要替他选）；build 可带 batch_ids 指定批次（缺省 = 自由改动，不计批次进度）。",
+    `限制：没有人手推进的情况下最多连续自动推进 ${ADVANCE_CHAIN_MAX_AUTO_STEPS} 步（防 复核→改→复核 无限回环，用户手动推进一次后重新计数）；一次性——只对登记它的这一轮有效，用户中途又发了新消息 / 点了停止就作废；同一任务只留最后一次登记。`,
+    "返回 { ok:true } = 已登记；{ ok:false, error } = 没登记，按 error 办并在收尾里如实告诉用户「需要你自己推进下一步」。",
+  ].join("\n"),
+  parameters: TBObject({
+    task_id: TBString(),
+    action: TBEnum([...ADVANCE_CHAIN_ACTIONS]),
+    user_words: TBString(),
+    instruction: TBOptional(TBString()),
+    custom_action_id: TBOptional(TBString()),
+    dev_push_mode: TBOptional(TBEnum(["direct", "mr"])),
+    batch_ids: TBOptional(TBArray(TBString())),
+  }),
+  handler: async (args, callerToken) => {
+    const taskId = str(args.task_id);
+    // 失败形状统一 JSON（与 expect_group_reply 同；tool-result-persist 靠 ok:false 判失败、不亮绿勾）
+    if (!matchExpectedCallerToken(taskId, callerToken)) {
+      return advanceNextFail(CALLER_MISMATCH_ERROR);
+    }
+    const parsed = parseAdvanceNextArgs(args);
+    if (!parsed.ok) return advanceNextFail(parsed.error);
+
+    const task = await getTaskWithTailEvents(
+      taskId,
+      ADVANCE_CHAIN_GROUNDING_EVENT_TAIL,
+    );
+    if (!task) return advanceNextFail("任务不存在");
+    if (task.mode === "chat") {
+      return advanceNextFail("对话型任务没有可推进的 action");
+    }
+    const fromAction = task.currentActionId
+      ? task.actions.find((a) => a.id === task.currentActionId)
+      : undefined;
+    if (
+      !fromAction ||
+      (fromAction.status !== "running" && fromAction.status !== "awaiting_ack")
+    ) {
+      return advanceNextFail("当前没有进行中的 action，没有可接着推进的起点");
+    }
+    if (isAutoAdvanceCapReached(taskId)) {
+      return advanceNextFail(
+        `已经连续自动推进 ${getAutoAdvanceSteps(taskId)} 步了（上限 ${ADVANCE_CHAIN_MAX_AUTO_STEPS}）：这一步照常交卷，请用户看过后自己推进下一步`,
+      );
+    }
+
+    if (parsed.target.actionType === "custom") {
+      const def = await getCustomAction(parsed.target.customActionId!);
+      if (!def) {
+        return advanceNextFail(`自定义 action 定义不存在：${parsed.target.customActionId}`);
+      }
+      if (def.legacyPlaybook) {
+        return advanceNextFail(`自定义 action「${def.label}」是旧格式、已停用`);
+      }
+    }
+
+    const sources = collectAuthorizationSources({
+      actions: task.actions,
+      events: task.events ?? [],
+    });
+    if (!isUserWordsGrounded(parsed.userWords, sources)) {
+      return advanceNextFail(
+        "user_words 没能在用户说过的话里找到（需逐字引用、且至少几个字）。用户没明确说过「做完就继续」就不要自动推进：这一步照常交卷，让用户自己推进",
+      );
+    }
+
+    // 先装订阅再登记：装不上就别登记（登记了没人兑现 = 用户以为会自动推进、实际不会）
+    try {
+      const { ensureAdvanceChainConsumer } = await import("./advance-chain-runner");
+      ensureAdvanceChainConsumer();
+    } catch (err) {
+      console.warn("[advance_next] 装自动推进订阅失败：", err);
+      return advanceNextFail("自动推进模块没起来，这次没登记：照常交卷，让用户自己推进");
+    }
+
+    const chain = {
+      ...parsed.target,
+      taskId,
+      fromActionId: fromAction.id,
+      opGen: getTaskOpGeneration(taskId),
+      instruction: parsed.instruction,
+      userWords: parsed.userWords,
+      registeredAt: Date.now(),
+    };
+    const replaced = registerAdvanceChain(chain);
+
+    const label =
+      chain.actionType === "custom"
+        ? ((await getCustomAction(chain.customActionId!).catch(() => null))?.label ??
+          "自定义 action")
+        : ACTION_LABEL[chain.actionType];
+    // 提示事件写失败不能让模型看到「登记失败」（链已登记，它会重试 → 覆盖同一条、无害，但会白说一句）
+    await writeEventAndPublish(taskId, {
+      kind: "info",
+      actionId: fromAction.id,
+      text: `已记下：这一步交卷后，按你的话「${chain.userWords}」自动推进到「${label}」`,
+      meta: { subkind: "auto_advance", phase: "registered", actionType: chain.actionType },
+    }).catch((err) => console.warn("[advance_next] 写登记提示事件失败", err));
+
+    return text(
+      JSON.stringify({
+        ok: true,
+        hint:
+          "已登记：本轮正常结束后系统会代用户推进。现在照常交卷（若还没交）→ 说完收尾 → 结束本轮；不要自己去跑下一步。" +
+          (replaced ? "（已覆盖本任务上一次登记）" : ""),
+      }),
+    );
+  },
+};
+
 /** Flowship 自有工具清单（cursor SDK customTools + pi customTools 共用） */
 export const flowShipTools: FlowshipToolDef[] = [
   submitWorkDef,
@@ -999,6 +1134,7 @@ export const flowShipTools: FlowshipToolDef[] = [
   expectGroupReplyDef,
   waitDef,
   scheduleDef,
+  advanceNextDef,
 ];
 
 /**

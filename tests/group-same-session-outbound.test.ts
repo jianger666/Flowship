@@ -4,7 +4,7 @@
  * 钉死的语义：
  * - 带 groupNonOwnerTurn 的主链 user_reply（无 origin）→ 现建 restricted 登记（sameSession），
  *   不预登记、不占属主单格；这一轮主链帧（delta / tool_call / message / done 都不带 origin）按 turns 表对号入座
- * - done → 回群（@ 提问人）；不写群问答 tab 汇总（新数据不进 tab）
+ * - done → 回群（@ 提问人）；不写旁路问答汇总（新数据不再生成旁路问答卡）
  * - 属主那一格（runTag=null）的登记全程不被碰
  * - 上一轮没等到 done 就来了新的主链 user_reply → 上一轮收口成失败（不让发言人干等）
  * - 旁路答疑的问题事件（restrictedRunTag）不是主链新一轮：既不建登记也不打断
@@ -98,16 +98,11 @@ const baseDeps = () => ({
   isAdvanceResultToGroupEnabled: async () => true,
   readArtifact: async () => "# 报告",
   pumpGroupQuestionQueue: vi.fn(async () => {}),
-  fetchRoster: async () => ({
-    members: [
-      { openId: STRANGER.openId, name: STRANGER.name, kind: "user" as const },
-      { openId: OTHER.openId, name: OTHER.name, kind: "user" as const },
-      { openId: OWNER.openId, name: OWNER.name, kind: "user" as const },
-      { openId: BOTASKER.openId, name: BOTASKER.name, kind: "bot" as const },
-    ],
-  }),
-  resolveOwner: async () => OWNER,
-  getSelfOpenId: async () => "ou_self_bot",
+  // 群答疑回复默认走「一次性发文本卡」（流式关）；真流式卡会起 lark-cli，这里一律桩掉
+  isStreamingEnabled: async () => false,
+  createGroupCardStream: () => {
+    throw new Error("测试不该走真流式卡");
+  },
 });
 
 const use = () => {
@@ -204,7 +199,7 @@ afterEach(() => {
 });
 
 describe("user_reply 现建登记 + 主链帧对号入座", () => {
-  it("非属主一轮：user_reply → delta → done，回群 @ 提问人，且不写群问答 tab 汇总", async () => {
+  it("非属主一轮：user_reply → delta → done，回群 @ 提问人，且不写旁路问答汇总", async () => {
     const deps = use();
     await nonOwnerUserReply();
     // 登记已现建：restricted 通道（runTag 非空）、sameSession、不占属主那一格
@@ -246,7 +241,7 @@ describe("user_reply 现建登记 + 主链帧对号入座", () => {
     expect(body).not.toContain("我先翻下代码");
   });
 
-  it("失败的一轮：真人提问人收到中性提示、仍不写 tab 汇总", async () => {
+  it("失败的一轮：真人提问人收到中性提示、仍不写旁路问答汇总", async () => {
     const deps = use();
     await nonOwnerUserReply();
     await delta("半截");
@@ -287,14 +282,15 @@ describe("user_reply 现建登记 + 主链帧对号入座", () => {
     expect(body).not.toContain(BOTASKER.openId);
   });
 
-  it("机器人提问人 + 回答里自己写了 @名字：真 @ 上它（它才看得见）", async () => {
+  it("机器人提问人 + 回答里自己写了 @ 标签：原样放行（它才看得见；系统不再把 @名字 换成真 @）", async () => {
     const deps = use();
+    const tag = `<at user_id="${BOTASKER.openId}">${BOTASKER.name}</at>`;
     await nonOwnerUserReply(BOTASKER, { groupSenderIsBot: true });
-    await delta(`@${BOTASKER.name} 返回用户信息 JSON。`);
-    await message(`@${BOTASKER.name} 返回用户信息 JSON。`);
+    await delta(`${tag} 返回用户信息 JSON。`);
+    await message(`${tag} 返回用户信息 JSON。`);
     await done(true);
     expect(deps.sendMarkdown).toHaveBeenCalledTimes(1);
-    expect(sentTexts(deps.sendMarkdown)[0]!).toContain(BOTASKER.openId);
+    expect(sentTexts(deps.sendMarkdown)[0]!).toBe(`${tag} 返回用户信息 JSON。`);
   });
 
   it("缺 groupChatId / groupSenderOpenId 的 user_reply 不建登记（fail-closed）", async () => {

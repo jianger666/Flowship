@@ -84,7 +84,7 @@ const {
   beginNonOwnerTurn,
   isNonOwnerTurnActive,
 } = await import("@/lib/server/non-owner-turn-guard");
-const { buildNonOwnerGuardFootnote } = await import(
+const { buildBotEtiquetteNote, buildNonOwnerGuardFootnote } = await import(
   "@/lib/group-non-owner-prompt"
 );
 
@@ -183,7 +183,7 @@ describe("非属主一轮的按轮次标记生命周期", () => {
   const newProbe = (): Probe => ({ activeAtSend: [], texts: [] });
   const deliver = async (
     id: string,
-    groupNonOwner?: { name: string; guard: boolean; isBot?: boolean },
+    groupNonOwner?: { name: string; guard: boolean; isBot?: boolean; openId?: string },
   ) =>
     deliverTaskQuestion(
       (await getTask(id))!,
@@ -243,7 +243,7 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     ).toBe(true);
   });
 
-  it("机器人发言人（guard:true + isBot）：标记已登记 + 消息带**机器人变体**约束段（必须自己写 @名字 / NO_REPLY）", async () => {
+  it("机器人发言人（guard:true + isBot）：标记已登记 + 消息带**机器人变体**约束段（必须自己 @ 它 / NO_REPLY）", async () => {
     const id = alloc();
     await writeMeta(makeMeta(id));
     const probe = newProbe();
@@ -253,9 +253,33 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     expect(probe.activeAtSend).toEqual([true]);
     const text = probe.texts[0]!;
     expect(text.endsWith(buildNonOwnerGuardFootnote("别家机器人", { isBot: true }))).toBe(true);
-    expect(text).toContain("必须在正文里写 @别家机器人");
+    expect(text).toContain("必须在正文里 @ 它");
     // 与真人变体不同（不是同一段）
     expect(text.endsWith(buildNonOwnerGuardFootnote("别家机器人"))).toBe(false);
+  });
+
+  it("机器人发言人带 openId：约束段里给出 @ 标签的固定写法（agent 才写得出能 @ 到它的标签）", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id));
+    const probe = newProbe();
+    installSession(id, probe);
+
+    expect(
+      await deliver(id, { name: "别家机器人", guard: true, isBot: true, openId: "ou_otherbot" }),
+    ).toBe("sent");
+    expect(probe.texts[0]!).toContain('<at user_id="ou_otherbot">别家机器人</at>');
+  });
+
+  it("机器人 + guard:false 带 openId：克制提示里同样给出标签写法", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id));
+    const probe = newProbe();
+    installSession(id, probe);
+
+    expect(
+      await deliver(id, { name: "别家机器人", guard: false, isBot: true, openId: "ou_otherbot" }),
+    ).toBe("sent");
+    expect(probe.texts[0]!).toContain('<at user_id="ou_otherbot">别家机器人</at>');
   });
 
   it("guard 关：不登记标记、不加约束段（群成员与属主同权）", async () => {
@@ -267,6 +291,35 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     expect(await deliver(id, { name: "李四", guard: false })).toBe("sent");
     expect(probe.activeAtSend).toEqual([false]);
     expect(probe.texts[0]).not.toContain("非任务所有者「");
+  });
+
+  it("机器人 + guard:false（「机器人与真人同权」开着且提示词开关关着）：不登记标记、没有「只答疑」约束，但仍带防成环的克制提示", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id));
+    const probe = newProbe();
+    installSession(id, probe);
+
+    expect(await deliver(id, { name: "别家机器人", guard: false, isBot: true })).toBe("sent");
+    expect(probe.activeAtSend).toEqual([false]);
+    const text = probe.texts[0]!;
+    // 同权：没有约束段、没有「不修改任何文件」
+    expect(text).not.toContain("不修改任何文件");
+    expect(text).not.toContain("本轮规则：");
+    // 默认脚注保留（与真人 guard 关一致），后面追加克制提示（防互 @ 成环）
+    expect(text).toContain("**修改要求**才动手改");
+    expect(text.endsWith(buildBotEtiquetteNote("别家机器人"))).toBe(true);
+    expect(text).toContain("必须在正文里 @ 它");
+    expect(text).toContain("别回「收到」");
+  });
+
+  it("真人 + guard:false：不追加克制提示（只有机器人才需要）", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id));
+    const probe = newProbe();
+    installSession(id, probe);
+
+    expect(await deliver(id, { name: "李四", guard: false })).toBe("sent");
+    expect(probe.texts[0]).not.toContain("别回「收到」");
   });
 
   it("属主紧随其后的 send：起点无条件清掉上一轮漏下的标记（不会被拒系统工具）", async () => {

@@ -146,6 +146,7 @@ const walkCentralDirectory = (
   buf: Buffer,
   label: string,
   onEntry: (entry: CentralEntry) => void,
+  maxEntries: number = MAX_OFFICE_ZIP_ENTRIES,
 ): void => {
   const eocd = findEocd(buf);
 
@@ -174,9 +175,9 @@ const walkCentralDirectory = (
   // 两者不一致就是在让两个解析器看到不同的目录（守卫只检查前几个、xlsx 解开全部）
   if (entryCountThisDisk !== entryCount) throw malformed();
 
-  if (entryCount > MAX_OFFICE_ZIP_ENTRIES) {
+  if (entryCount > maxEntries) {
     throw new Error(
-      `${label} 内部文件数过多（${entryCount} > ${MAX_OFFICE_ZIP_ENTRIES}），疑似恶意压缩包，已拒绝预览`,
+      `${label} 内部文件数过多（${entryCount} > ${maxEntries}），疑似恶意压缩包，已拒绝预览`,
     );
   }
 
@@ -485,3 +486,89 @@ export const withSoftTimeout = <T>(
       },
     );
   });
+
+// ───────────────────────── 预览用的读取接口（pptx 抽文本 / 压缩包列目录） ─────────────────────────
+
+/** 压缩包「列目录」的条目数上限：比 Office 文档宽得多（node_modules 打成 zip 动辄几万个），但仍要有个头 */
+export const MAX_ARCHIVE_LIST_ENTRIES = 200_000;
+
+export interface ZipListEntry {
+  name: string;
+  /** 解压后大小（中央目录声明值，可能被谎报——只用于展示，不据此分配内存） */
+  declaredSize: number;
+  compressedSize: number;
+}
+
+/**
+ * 列出 zip 的条目（不解压、不读数据区）。结构校验与 Office 守卫共用同一份中央目录解析，
+ * 只是条目数上限换成 MAX_ARCHIVE_LIST_ENTRIES（压缩包预览只列清单，没有「解析器展开」的风险）。
+ */
+export const listZipEntries = (
+  buf: Buffer,
+  label = "zip",
+  maxEntries: number = MAX_ARCHIVE_LIST_ENTRIES,
+): ZipListEntry[] => {
+  const out: ZipListEntry[] = [];
+  walkCentralDirectory(
+    buf,
+    label,
+    ({ name, declaredSize, compressedSize }) =>
+      out.push({ name, declaredSize, compressedSize: Math.max(0, compressedSize) }),
+    maxEntries,
+  );
+  return out;
+};
+
+const unsupportedMethod = (label: string, method: number): Error =>
+  new Error(`${label} 内含不支持的压缩方式（${method}），无法预览`);
+
+/**
+ * 读出 zip 里**一个**条目的内容（调用方应已通过 assertSafeOfficeZipDeep）。
+ * 解压带 maxOutputLength 上限：超过 maxBytes 抛 code=ENTRY_TOO_LARGE 的 Error，调用方可据此跳过该条目。
+ * 找不到条目返回 null；加密 / 不认识的压缩方式 / 数据损坏抛可读错误。
+ */
+export const readZipEntry = async (
+  buf: Buffer,
+  name: string,
+  maxBytes: number,
+  label = "zip",
+): Promise<Buffer | null> => {
+  const hits: CentralEntry[] = [];
+  walkCentralDirectory(buf, label, (e) => {
+    if (hits.length === 0 && e.name === name) hits.push(e);
+  });
+  const entry = hits[0];
+  if (!entry) return null;
+  const { dataStart, localFlags } = locateEntryData(buf, entry, label);
+  if (((entry.flags | localFlags) & FLAG_ENCRYPTED_MASK) !== 0) throw encryptedEntry(label);
+
+  if (entry.method === METHOD_STORED) {
+    const size = entry.compressedSize;
+    if (size < 0 || dataStart + size > buf.length || size !== entry.declaredSize) {
+      throw headerMismatch(label);
+    }
+    if (size > maxBytes) throw tooLargeEntry(label);
+    return Buffer.from(buf.subarray(dataStart, dataStart + size));
+  }
+  if (entry.method === METHOD_DEFLATE) {
+    const end = entry.compressedSize >= 0 ? dataStart + entry.compressedSize : buf.length;
+    if (end > buf.length) throw headerMismatch(label);
+    return new Promise<Buffer>((resolve, reject) => {
+      zlib.inflateRaw(
+        buf.subarray(dataStart, end),
+        { maxOutputLength: Math.max(1, maxBytes) },
+        (err, out) => {
+          if (!err) return resolve(out);
+          if ((err as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") {
+            return reject(tooLargeEntry(label));
+          }
+          reject(corruptedEntry(label));
+        },
+      );
+    });
+  }
+  throw unsupportedMethod(label, entry.method);
+};
+
+const tooLargeEntry = (label: string): Error =>
+  Object.assign(new Error(`${label} 内的某个文件超过读取上限`), { code: "ENTRY_TOO_LARGE" });

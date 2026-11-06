@@ -188,6 +188,20 @@ const FIXED_FILES = [
   "components/tasks/changes/file-list.tsx",
   "components/tasks/changes/scope-toolbar.tsx",
   "components/tasks/changes/shared.tsx",
+  // 文件预览窗升级（2026-11-06）：各类型查看器 + 外壳；颜色只走语义 token、不用中间 opacity / blur、hover 提示一律 Tooltip
+  "components/preview/archive-viewer.tsx",
+  "components/preview/code-viewer.tsx",
+  "components/preview/csv-viewer.tsx",
+  "components/preview/document-pane.tsx",
+  "components/preview/image-viewer.tsx",
+  "components/preview/json-viewer.tsx",
+  "components/preview/markdown-viewer.tsx",
+  "components/preview/preview-ui.tsx",
+  "components/preview/slides-viewer.tsx",
+  "components/preview/svg-viewer.tsx",
+  "components/preview/table-viewer.tsx",
+  "components/ui/local-file-preview.tsx",
+  "components/ui/local-file-preview-body.tsx",
 ] as const;
 
 /**
@@ -327,13 +341,9 @@ describe("局部断言", () => {
     }
   });
 
-  it("群问答 tab 的状态点是静态的：回答中那颗不再 animate-pulse，且点本身 role=img + aria-label", () => {
-    const i = stream.indexOf("群里有提问正在回答");
-    expect(i).toBeGreaterThan(-1);
-    const dot = stream.slice(i - 200, i + 300);
-    expect(dot).toContain('role="img"');
-    expect(dot).toContain("bg-info");
-    expect(dot).not.toContain("animate-pulse");
+  it("「群问答」页签的状态点（回答中 / 待你决定）已随页签一起删除（2026-11-05），事件流里不再有这两颗点", () => {
+    expect(stream).not.toContain("群里有提问正在回答");
+    expect(stream).not.toContain("等你在群问答里拍板");
   });
 
   it("停止键文字走 text-primary-foreground（深色下白字只有 2.89:1）", () => {

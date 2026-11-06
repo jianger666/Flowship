@@ -103,10 +103,11 @@ const baseDeps = (over: Record<string, unknown> = {}) => ({
   isAskToGroupEnabled: async () => true,
   isAdvanceResultToGroupEnabled: async () => true,
   readArtifact: async () => "# 复核报告\n\n没发现问题",
-  // 答疑回复收口要查群成员 / 属主 / 机器人 open_id——默认依赖会真起 lark-cli，这里一律桩掉
-  fetchRoster: async () => ({ members: [] }),
-  resolveOwner: async () => undefined,
-  getSelfOpenId: async () => null,
+  // 群答疑回复默认走「一次性发文本卡」（流式关）；真流式卡会起 lark-cli，这里一律桩掉
+  isStreamingEnabled: async () => false,
+  createGroupCardStream: () => {
+    throw new Error("测试不该走真流式卡");
+  },
   ...over,
 });
 
@@ -1668,15 +1669,8 @@ describe("truncateForGroup", () => {
 });
 
 // 旧语义「机器人提问也无条件真 @ 回去」已废：两个机器人互 @ 成环跑了 9 轮。
-// 现在机器人提问人没被 agent 写 @ 就不补，想让它看见得 agent 自己写 `@名字`（协议第 4 条）。
+// 现在机器人提问人不自动补 @，想让它看见得 agent 自己写 `<at user_id>` 标签（回复协议 2026-11-06 已下线，标签原样放行）。
 describe("回群 @（机器人提问人：不自动补 @，agent 自己写才真 @）", () => {
-  const botRoster = {
-    fetchRoster: async () => ({
-      members: [
-        { openId: "ou_otherbot", name: "江涛CLI", kind: "bot" as const },
-      ],
-    }),
-  };
 
   it("机器人提问 + agent 没写 @ → 原文照发、不补真 @（有意防环）", async () => {
     const sendMarkdown = vi.fn(async () => ({
@@ -1685,7 +1679,7 @@ describe("回群 @（机器人提问人：不自动补 @，agent 自己写才真
     }));
     const sendText = vi.fn();
     __setGroupOutboundDepsForTest(
-      baseDeps({ sendMarkdown, sendText, ...botRoster }) as never,
+      baseDeps({ sendMarkdown, sendText }) as never,
     );
     const h = rememberGroupReply("task-1", {
       chatId: CHAT,
@@ -1718,9 +1712,7 @@ describe("回群 @（机器人提问人：不自动补 @，agent 自己写才真
       chat_id: CHAT,
       message_id: "om_md",
     }));
-    __setGroupOutboundDepsForTest(
-      baseDeps({ sendMarkdown, ...botRoster }) as never,
-    );
+    __setGroupOutboundDepsForTest(baseDeps({ sendMarkdown }) as never);
     const h = rememberGroupReply("task-1", {
       chatId: CHAT,
       requesterOpenId: "ou_otherbot",
@@ -1731,7 +1723,7 @@ describe("回群 @（机器人提问人：不自动补 @，agent 自己写才真
     })!;
     await handleGroupOutboundEvent("task-1", {
       kind: "assistant_delta",
-      text: "@江涛CLI 埋点已确认上报",
+      text: '<at user_id="ou_otherbot">江涛CLI</at> 埋点已确认上报',
       origin: h.runTag!,
     });
     await handleGroupOutboundEvent("task-1", {

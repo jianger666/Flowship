@@ -258,7 +258,8 @@ describe("会话活着 + 产出在等审阅", () => {
     const resp = await handleTaskQuestionInject(TASK_ID, body, {});
 
     expect(resp.status).toBe(200);
-    expect(deliveredAckContext()).toMatchObject({ actionId: "act-9" });
+    // actionType 跟着带过去：脚注靠它判断这份产出是不是提测 / 联调
+    expect(deliveredAckContext()).toMatchObject({ actionId: "act-9", actionType: "review" });
     expect(snapshotActionArtifact).toHaveBeenCalledTimes(1);
     expect(patchActionAndRunStatusIfOpFresh).toHaveBeenCalledTimes(1);
   });

@@ -343,16 +343,16 @@ describe("不该注入的地方没注入", () => {
     ]);
   });
 
-  it("飞书群答疑只读 prompt（restricted-question / group-reply-protocol）既不引用也不含这一段", async () => {
+  it("飞书群答疑只读 prompt（restricted-question / group-answer-context）既不引用也不含这一段", async () => {
     for (const rel of [
       "src/lib/server/restricted-question.ts",
-      "src/lib/server/feishu-bridge/group-reply-protocol.ts",
+      "src/lib/server/feishu-bridge/group-answer-context.ts",
     ]) {
       expect(readSrc(rel), rel).not.toContain("media-display-prompt");
       expect(readSrc(rel), rel).not.toContain("mediaDisplayPromptSection");
     }
-    const { buildGroupReplyRules } = await import("@/lib/server/feishu-bridge/group-reply-protocol");
-    const rules = buildGroupReplyRules({ requesterIsBot: false }).join("\n");
+    const { formatReplyRulesSection } = await import("@/lib/server/feishu-bridge/group-answer-context");
+    const rules = formatReplyRulesSection({ requesterIsBot: false }).join("\n");
     expect(rules).not.toContain(MEDIA_DISPLAY_PROMPT_TITLE);
     expect(rules).not.toContain("本地音视频展示");
   });

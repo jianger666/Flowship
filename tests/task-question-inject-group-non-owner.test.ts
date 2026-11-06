@@ -23,6 +23,7 @@ const {
   getTaskMeta,
   getTaskWithTailEvents,
   getPendingAsk,
+  isGroupBotsEqualRights,
   isGroupNonOwnerGuardEnabled,
   isTaskOpStale,
   patchActionAndRunStatusIfOpFresh,
@@ -54,6 +55,7 @@ const {
     getTaskMeta,
     getTaskWithTailEvents,
     getPendingAsk: vi.fn<AnyFn>(() => null),
+    isGroupBotsEqualRights: vi.fn<AnyFn>(async () => false),
     isGroupNonOwnerGuardEnabled: vi.fn<AnyFn>(async () => true),
     isTaskOpStale: vi.fn<AnyFn>(() => false),
     patchActionAndRunStatusIfOpFresh: vi.fn<AnyFn>(async () => null),
@@ -101,6 +103,7 @@ vi.mock("@/lib/server/restricted-question", () => ({
   startRestrictedGroupQuestion,
 }));
 vi.mock("@/lib/server/group-non-owner-guard-config", () => ({
+  isGroupBotsEqualRights,
   isGroupNonOwnerGuardEnabled,
 }));
 vi.mock("@/lib/server/task-stream", () => ({
@@ -202,6 +205,7 @@ beforeEach(() => {
   isTaskOpStale.mockReturnValue(false);
   getPendingAsk.mockReturnValue(null);
   isGroupNonOwnerGuardEnabled.mockResolvedValue(true);
+  isGroupBotsEqualRights.mockResolvedValue(false);
   deliverTaskQuestion.mockResolvedValue("sent");
   writeUserEventAndPublishStrict.mockResolvedValue({ id: "e1" });
   setTaskRunStatusIfRunOwner.mockImplementation(async () => ackTask());
@@ -264,6 +268,54 @@ describe("活会话在场（awaiting_ack）：只送会话、不动审阅态", (
     expect(deliverArgs()[9]).toEqual({ name: "别家机器人", guard: true, isBot: true });
     // 机器人不需要去读那个开关（读了也不改变结果）——不为它多读一次盘
     expect(isGroupNonOwnerGuardEnabled).not.toHaveBeenCalled();
+  });
+
+  it("发言人 open_id 原样随行到 deliver（提示词里给机器人 @ 标签的写法要用它）；没带就没有该字段", async () => {
+    agentSessions.set(TASK_ID, {});
+    await handleTaskQuestionInject(
+      TASK_ID,
+      body,
+      nonOwnerOpts({ groupNonOwner: { name: "别家机器人", isBot: true, openId: "ou_otherbot" } }),
+    );
+    expect(deliverArgs()[9]).toEqual({
+      name: "别家机器人",
+      guard: true,
+      isBot: true,
+      openId: "ou_otherbot",
+    });
+  });
+
+  it("机器人 + 「机器人与真人同权」开 + 提示词开关开：guard=true（跟随开关），带 isBot 标记", async () => {
+    agentSessions.set(TASK_ID, {});
+    isGroupBotsEqualRights.mockResolvedValue(true);
+    isGroupNonOwnerGuardEnabled.mockResolvedValue(true);
+    await handleTaskQuestionInject(
+      TASK_ID,
+      body,
+      nonOwnerOpts({ groupNonOwner: { name: "别家机器人", isBot: true } }),
+    );
+    expect(deliverArgs()[9]).toEqual({ name: "别家机器人", guard: true, isBot: true });
+  });
+
+  it("机器人 + 「机器人与真人同权」开 + 提示词开关关：guard=false（同权），仍带 isBot 标记（供追加克制提示）", async () => {
+    agentSessions.set(TASK_ID, {});
+    isGroupBotsEqualRights.mockResolvedValue(true);
+    isGroupNonOwnerGuardEnabled.mockResolvedValue(false);
+    await handleTaskQuestionInject(
+      TASK_ID,
+      body,
+      nonOwnerOpts({ groupNonOwner: { name: "别家机器人", isBot: true } }),
+    );
+    expect(deliverArgs()[9]).toEqual({ name: "别家机器人", guard: false, isBot: true });
+  });
+
+  it("「机器人与真人同权」开着不影响真人（真人照旧只看提示词开关），也不为真人多读它", async () => {
+    agentSessions.set(TASK_ID, {});
+    isGroupBotsEqualRights.mockResolvedValue(true);
+    isGroupNonOwnerGuardEnabled.mockResolvedValue(false);
+    await handleTaskQuestionInject(TASK_ID, body, nonOwnerOpts());
+    expect(deliverArgs()[9]).toEqual({ name: "李四", guard: false });
+    expect(isGroupBotsEqualRights).not.toHaveBeenCalled();
   });
 
   it("没传发言人名：兜底「群成员」", async () => {

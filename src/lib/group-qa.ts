@@ -1,5 +1,5 @@
 /**
- * 群问答 tab 的聚合逻辑（纯函数）：问题事件 + 轮次汇总事件 → 一轮一行。
+ * 群问答一轮的聚合逻辑（纯函数）：问题事件 + 轮次汇总事件 → 一轮一条（事件流里的内联卡取它）。
  *
  * 配对键（按可靠度）：
  * 1. meta.restrictedRunTag（问题） == meta.groupQaSummary.runTag（汇总）——精确配对；
@@ -14,7 +14,7 @@
  *
  * 2026-10-14 群协作 v2：汇总事件新增可选字段（askerIsBot / noReply / needsOwner / mentioned /
  * startedAt / durationMs，契约见 server/feishu-bridge/group-contract.ts 末尾），旧数据没有、
- * 一律向后兼容；答疑旁路 run 的每条过程事件带 meta.groupRun = runTag，归「群问答」tab 的
+ * 一律向后兼容；答疑旁路 run 的每条过程事件带 meta.groupRun = runTag，归问答卡的
  * 「查看过程」，主事件流默认隐藏（见 event-stream-hidden）。
  * 前端不 import server 目录（无先例），所以 groupRun 的 key 在这里自己写一份。
  */
@@ -138,7 +138,7 @@ const readExtra = (s: Record<string, unknown>): GroupQaSummaryExtraMeta =>
   });
 
 /**
- * 非属主群问题（带配对键 restrictedRunTag 的才进 tab；属主群消息、
+ * 非属主群问题（带配对键 restrictedRunTag 的才算一轮；属主群消息、
  * 历史问题（无 runTag）走 legacy 配对）。
  */
 export const isGroupQaQuestionEvent = (ev: TaskEvent): boolean => {
@@ -193,7 +193,7 @@ const isGroupQuestionEventAny = (ev: TaskEvent): boolean =>
  * 提问正文去噪（展示用）：剥 [群消息·来自…] 前缀、全角关联回执前缀与飞书原生 <at> 标签残留。
  * 有名字的 @ 留个 @Name（知道还圈了谁），空名字的整段丢掉。
  * 前缀只认 [群消息 / ［群里托办事项 开头——`[Bug] xxx` 这类正常内容不许吃（review P2-5）。
- * 全角这行必须剥：readonly 关联轮进 tab，首行不能是内部指令（提示词外泄）。
+ * 全角这行必须剥：readonly 关联轮要展示在卡上，首行不能是内部指令（提示词外泄）。
  * 配行不配括号：about 是自由文本、里面可能有 `］`，配到第一个括号就收会剩半截指令；前缀恒占首行，行尾即边界。
  */
 export const cleanGroupQuestionText = (text: string): string =>
@@ -265,7 +265,7 @@ export const formatGroupQaTs = (ts: number): string => {
 };
 
 /**
- * 不进 tab 配对的问题事件：推进占格 / 关联回执喂会话（都没 runTag，进 temporal 就是幻影轮）/
+ * 不参与配对的问题事件：推进占格 / 关联回执喂会话（都没 runTag，进 temporal 就是幻影轮）/
  * 并入同会话的非属主一轮（groupNonOwnerTurn，答案在主事件流里）。
  * legacy 第二遍与兜底反查表共用这一个，保持一致（防御性对齐：哪天汇总链路一改，
  * 兜底也不会把汇总配到占格/回执问题上）。主流程显隐不受影响。
@@ -274,8 +274,8 @@ const isQaExcludedQuestion = (ev: TaskEvent): boolean => {
   const m = metaOf(ev);
   return (
     m.advancePreempted === true ||
-    // 并入同会话的非属主一轮（2026-11-04）：问与答都在主事件流里，不进群问答 tab——
-    // 否则 temporal 配对会把它当「历史」轮列进来、还会让 tab 对新数据冒出来
+    // 并入同会话的非属主一轮（2026-11-04）：问与答都在主事件流里，不算旁路轮——
+    // 否则 temporal 配对会把它当「历史」轮列进来、让卡对新数据冒出来
     m.groupNonOwnerTurn === true ||
     m.correlatedAnswer === true ||
     typeof m.correlatedAnswer === "string"
@@ -430,7 +430,7 @@ export const collectGroupQaRounds = (
       // 推进占格 / 关联回执喂会话都不进 temporal 配对：它们没 runTag，
       // 放任 temporal 会把属主会话的只言片语 scooped 当答案、造幻影历史轮
       // （advancePreempted=review 九轮-3；correlatedAnswer=本轮补齐）。
-      // 主流程里它们照常展示，只是不进 tab。
+      // 主流程里它们照常展示，只是不算旁路轮。
       // 注：pendingAskAnswer 标记已退役（ask-inject 不再写）——收口靠 kind === "ask_user_reply"，
       // 任何答复都是边界，不要再找这个标记。
       if (isQaExcludedQuestion(ev)) {
@@ -452,30 +452,6 @@ export const collectGroupQaRounds = (
   flushLegacy();
   rounds.sort((a, b) => b.ts - a.ts);
   return rounds;
-};
-
-/** 「待你决定」的时间窗：超过这么久的待确认不再顶在 tab 顶部（没有「已处理」状态可记，不设窗会永远吵） */
-export const GROUP_QA_NEEDS_OWNER_RECENT_MS = 24 * 60 * 60 * 1000;
-
-/**
- * 需要属主拍板的轮次：needsOwner 非空、且在时间窗内（默认 24h），按问题时间从新到旧。
- * 纯函数、不改入参；tab 顶部「待你决定」区与标签上的红点都吃它。
- * 第二参数可选（不破坏契约签名）：测试注入 now / 调窗口。
- */
-export const pickRoundsNeedingOwner = (
-  rounds: GroupQaRound[],
-  opts?: { now?: number; maxAgeMs?: number },
-): GroupQaRound[] => {
-  const now = opts?.now ?? Date.now();
-  const maxAge = opts?.maxAgeMs ?? GROUP_QA_NEEDS_OWNER_RECENT_MS;
-  return rounds
-    .filter(
-      (r) =>
-        typeof r.needsOwner === "string" &&
-        r.needsOwner.trim() !== "" &&
-        now - r.ts <= maxAge,
-    )
-    .sort((a, b) => b.ts - a.ts);
 };
 
 // ----------------- 答疑 run 的过程事件（「查看过程」折叠块的数据源） -----------------

@@ -37,38 +37,25 @@ const sliceCall = (source: string, marker: string): string => {
   throw new Error(`括号没配平：${marker}`);
 };
 
-describe("V17-02：群问答 tab 往返后事件流一律落在最后一条", () => {
-  // 群问答 tab 把 Virtuoso 整个卸载（showQaPanel ? <GroupQaPanel/> : <Virtuoso/>），切回来是重新挂载：
-  // initialTopMostItemIndex 只在 mount 时读一次。旧写法读的是 initialTopRef（只在 null 时写一次、只有切 task 才复位），
-  // 切回来就用首次加载时的陈旧下标重挂（2026-10-17 用户拍板「进入一律落在最后一条」）；
-  // 现在位置由模块级常量给（评审 K1），initialPositionedRef 只是「渲染期 latch 落过没有」的闸，进入 QA tab 时要开闸
-  const qaEffect = sliceCall(
-    eventStream,
-    "useEffect(() => {\n    lastRangeStartRef.current = null;",
-  );
-
-  it("[showQaPanel] effect 里进入群问答 tab 时把 initialPositionedRef 复位成 false（切回来由渲染期 latch 重新落在最后一条）", () => {
-    expect(qaEffect).toMatch(/if \(showQaPanel\) initialPositionedRef\.current = false;/);
-    expect(eventStream).toContain("}, [showQaPanel]);");
+describe("V17-02：Virtuoso 重挂（列表清空后又有条目）后事件流一律落在最后一条", () => {
+  // 空态占位把 Virtuoso 卸掉，之后再有条目是重新挂载：initialTopMostItemIndex 只在 mount 时读一次。
+  // 位置由控制器接手（评审 K1），initialPositionedRef 只是「渲染期 latch 落过没有」的闸。
+  // （2026-11-05 去掉「群问答」页签：原先页签往返那条重挂路径、[showQaPanel] effect 与 `!showQaPanel` 守卫一并删除。）
+  it("没有任何「群问答」页签残留：不再有 showQaPanel / showGroupQa / GroupQaPanel", () => {
+    expect(eventStream).not.toContain("showQaPanel");
+    expect(eventStream).not.toContain("showGroupQa");
+    expect(eventStream).not.toContain("GroupQaPanel");
   });
 
-  it("只在「进入」时复位：离开群问答（showQaPanel 回到 false）不复位，免得渲染期 latch 之后又被无谓重置", () => {
-    // 无条件 `initialPositionedRef.current = false` 会在回到事件流后的那次 effect 里再清一次，
-    // 下一次渲染的 latch 会把用户刚上滚的跟随态强行拉回「跟随」
-    expect(qaEffect).not.toMatch(/^\s*initialPositionedRef\.current = false;/m);
-  });
-
-  it("渲染期 latch 还在：定位闸没落过且有条目时落在最后一条并恢复跟随（切回事件流那次渲染靠它）", () => {
+  it("渲染期 latch 还在：定位闸没落过且有条目时落在最后一条并恢复跟随", () => {
     // 评审 K1：latch 里多了 beginSettle（开启定位稳定期）；Virtuoso 的初始项改成「最后一项、底部对齐」常量
-    // 评审 R8-3：闸头必须带 `!showQaPanel`（JSX 里 Virtuoso 在树上的条件是 `!showQaPanel && items.length > 0`）——
-    // 没有它，QA tab 里的任何一次重渲都会在 Virtuoso 不在树上时把「进入 QA」刚开的闸消耗掉、白开 1.5s 稳定期，
-    // 停留超过 1.5s 再切回就不落底（行为见 tests/event-stream-remount-landing.test.ts）
+    // Virtuoso 在树上的条件就是 `items.length > 0`（行为见 tests/event-stream-remount-landing.test.ts）
     expect(eventStream).toMatch(
-      /if \(!initialPositionedRef\.current && !showQaPanel && items\.length > 0\) \{\s*follow\.setFollowing\(true\);[\s\S]*?follow\.beginSettle\(\);\s*initialPositionedRef\.current = true;/,
+      /if \(!initialPositionedRef\.current && items\.length > 0\) \{\s*follow\.setFollowing\(true\);[\s\S]*?follow\.beginSettle\(\);\s*initialPositionedRef\.current = true;/,
     );
   });
 
-  it("列表清空（空态占位卸掉 Virtuoso）同样开闸：[listEmpty] effect 只在变空时复位闸与 range 缓存（评审 R8-3 同类路径）", () => {
+  it("列表清空（空态占位卸掉 Virtuoso）开闸：[listEmpty] effect 只在变空时复位闸与 range 缓存（评审 R8-3 同类路径）", () => {
     const emptyEffect = sliceCall(
       eventStream,
       "useEffect(() => {\n    if (!listEmpty) return;",
@@ -77,19 +64,16 @@ describe("V17-02：群问答 tab 往返后事件流一律落在最后一条", ()
     expect(emptyEffect).toContain("initialPositionedRef.current = false;");
     expect(emptyEffect).toContain("lastRangeStartRef.current = null;");
     expect(eventStream).toContain("}, [listEmpty]);");
-    // Virtuoso 在树上的条件与 latch 守卫是一回事：JSX 仍是「QA → 空态 → Virtuoso」三选一
-    expect(eventStream).toMatch(
-      /\{showQaPanel \? \(\s*<GroupQaPanel[\s\S]*?\) : items\.length === 0 \? \(/,
-    );
+    // Virtuoso 在树上的条件与 latch 守卫是一回事：JSX 是「空态 → Virtuoso」二选一
+    expect(eventStream).toMatch(/\{items\.length === 0 \? \(/);
     // 评审 K1 根治：Virtuoso 不再传 initialTopMostItemIndex，落底由控制器接手（稳定期内挂上容器即起贴底链）
     expect(eventStream).not.toMatch(/initialTopMostItemIndex=\{/);
   });
 });
 
 describe("V13-04：窄栏下 Cmd+F 搜索框不被 leading 挤成几个字宽", () => {
-  // log 形态标题栏：leading（「事件流 / 群问答（N）」tab）是 flex-1，搜索激活后又有 flex-1 的 Input，
-  // 两者平分剩余宽度——307px 的事件流栏里 Input 只剩约 71px（有群问答 tab 时约 25px）。
-  // 搜索一激活就切回事件流（activateStreamSearch 里 setShowGroupQa(false)），tab 此刻没有用处 → 让位。
+  // log 形态标题栏：leading（「事件流」标题）是 flex-1，搜索激活后又有 flex-1 的 Input，
+  // 两者平分剩余宽度——307px 的事件流栏里 Input 只剩约 71px。搜索一激活标题没有用处 → 让位。
   const logBar = (() => {
     const start = eventStream.indexOf("{!isChat && (\n        <EventStreamSearchBar");
     expect(start).toBeGreaterThanOrEqual(0);
@@ -100,11 +84,10 @@ describe("V13-04：窄栏下 Cmd+F 搜索框不被 leading 挤成几个字宽", 
     expect(logBar).toMatch(/leading=\{\s*searchActive\s*\?\s*null\s*:/);
   });
 
-  it("搜索激活时仍保留 tab 的数据来源：不删群问答 tab 本身（非激活态照旧渲染）", () => {
+  it("非激活态仍渲染「事件流」标题；标题栏里不再有「群问答」页签（2026-11-05 去掉）", () => {
     expect(logBar).toContain("事件流");
-    // 计数 / 是否出 tab 走 deriveGroupQaScope（窗口被截断时带「+」、0 轮但绑了群也出 tab；D8-01，行为见 tests/group-qa-scope.test.ts）
-    expect(logBar).toContain("groupQaScope.showTab");
-    expect(logBar).toContain("群问答{groupQaScope.countText");
+    expect(logBar).not.toContain("群问答");
+    expect(logBar).not.toContain("groupQaScope");
   });
 
   it("与产物面板共用的 EventStreamSearchBar 组件本身不动：让位逻辑只在 event-stream 的调用处", () => {

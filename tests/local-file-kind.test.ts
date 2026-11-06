@@ -73,7 +73,8 @@ describe("canOpenInIde / canPreviewInSheet", () => {
 
   it("Sheet 可预览类型", () => {
     expect(canPreviewInSheet("docx")).toBe(true);
-    expect(canPreviewInSheet("pptx")).toBe(false);
+    // pptx 现在有文本大纲预览（标题 / 要点 / 备注），不再是「无法预览」
+    expect(canPreviewInSheet("pptx")).toBe(true);
     // 音视频不进 Sheet 预览（走播放器悬浮窗）
     expect(canPreviewInSheet("video")).toBe(false);
     expect(canPreviewInSheet("audio")).toBe(false);

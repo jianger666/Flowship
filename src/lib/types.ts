@@ -497,19 +497,28 @@ export interface FeAiFlowSettings {
    */
   feishuBridgeKeepAwake?: boolean;
   /**
+   * 飞书「流式回复」（CardKit 打字机，设置 → 连接 → 飞书集成，全局）。默认开；显式 false 才关。
+   * 关 = 一轮里不推中间状态，AI 回复完成后一次性发整张卡。作用于 app chat → 飞书私聊卡（outbound.ts）
+   * 与群答疑回复（group-outbound.ts）；群里每个任务可在需求群弹窗里单独覆盖（`Task.feishuGroupStreaming`）。
+   * 每轮首次建卡时读一次，中途改设置不影响本轮。
+   * 读取失败（设置文件损坏）→ 按「开」处理（保持原有行为）。
+   * （2026-07-20 加、2026-08-27 v1.9.4 撤掉、2026-11-06 加回。）
+   */
+  feishuBridgeStreaming?: boolean;
+  /**
    * 需求群里**非属主**的消息并入属主同一个活会话后的「提示词级约束」开关（设置 → 连接 → 飞书集成，全局）。
    * 默认开；显式 false 才关。开 = 该条消息尾部追加「只答疑、不改代码」约束 + 该轮 Flowship 系统工具硬拒；
-   * 关 = 群成员与属主**同权**（与 lk-harness 项目群一致）。文案与实际提示词见 `group-non-owner-prompt.ts`。
+   * 关 = 群成员与属主**同权**。文案与实际提示词见 `group-non-owner-prompt.ts`。
    */
   feishuGroupNonOwnerGuard?: boolean;
   /**
-   * 需求群里**别的机器人** @ 本机机器人时是否受理（设置 → 连接 → 飞书集成，全局）。
-   * 默认开；显式 false 才关（关 = 机器人发件人一律静默忽略，沿用 P0 准入闸的老口径）。
-   * 与 lk-harness 的群内机器人协作保持一致。机器人的消息**无论提示词开关开关**都按「只答疑」约束处理
-   * （`feishuGroupNonOwnerGuard` 关只对真人同权）；不回「收到」之类的客套、不自动 @ 对方（防互 @ 成环）。
-   * 读取失败（设置文件损坏）→ 按「不受理」处理（fail-closed）。
+   * 「机器人与真人同权」（设置 → 连接 → 飞书集成，全局）。**默认关；只认显式 true 才开**。
+   * 需求群里别的机器人 @ 本机机器人一律受理；关 = 机器人的消息**始终**按「只答疑、不改代码」处理（不看
+   * `feishuGroupNonOwnerGuard`）；开 = 机器人和群里的真人成员一样**跟随** `feishuGroupNonOwnerGuard`
+   * （那个开关关了，机器人也能让 agent 改文件）。防互 @ 成环的约束（不客套、没问实质问题就 NO_REPLY）两种口径都保留。
+   * 读取失败（设置文件损坏）→ 按「关」处理（fail-closed，宁可多约束）。
    */
-  feishuGroupAllowBots?: boolean;
+  feishuGroupBotsEqualRights?: boolean;
   /**
    * 团队规范总开关（Skills 区「团队规范」组头）= 一键隔离 wk 知识库那套。
    * 默认 true：日常注入 `knowledge/skills/` + loadSkillsForTask 按仓匹配；
@@ -1726,6 +1735,13 @@ export interface Task {
   feishuGroupChatId?: string;
   /** 本任务关联群的群名快照（展示用，真名以读群接口为准） */
   feishuGroupChatName?: string;
+  /**
+   * 本任务群答疑回复要不要流式（需求群弹窗里的开关）。
+   * - `true` / `false` = 这个任务自己的选择，盖过设置页的全局「流式回复」。
+   * - 缺省 = 跟随全局。
+   * 只管群里的回复；飞书私聊（单聊）的流式只看全局开关。
+   */
+  feishuGroupStreaming?: boolean;
   /**
    * 团队 wk-harness 规范的需求编号（**只认用户手填、系统不派生**、见 `req-id.ts`）。
    * - 新建表单 / 详情页编辑弹窗都能填、两处输入框都默认留空

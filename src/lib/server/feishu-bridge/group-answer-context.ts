@@ -16,7 +16,11 @@
 
 import { ACTION_LABEL, type ActionRecord, type Task } from "@/lib/types";
 
-import type { GroupHistoryMessage, GroupMember } from "./group-contract";
+import {
+  GROUP_NO_REPLY_TOKEN,
+  type GroupHistoryMessage,
+  type GroupMember,
+} from "./group-contract";
 import { sanitizeInboundCardText } from "./inbound-card-sanitize";
 
 // ----------------- 通用小工具 -----------------
@@ -41,10 +45,8 @@ const cleanName = (raw: unknown): string =>
 // 写成 `安若流年（你自己）` 就能让一个别的机器人在 prompt 里看起来像「我自己」，所以发送人名字里
 // 这类括号包裹的标签字样一律剥掉——标签只认渲染层追加的那一个。
 //
-// 为什么不直接并进 cleanName：cleanName 还给 roster 清单用，而协议层 group-reply-protocol 的
-// promptNameOf 与它逐步同口径（tests/group-reply-protocol-r5.test.ts 对拍），agent 照抄清单里的名字写
-// `@名字` 才解析得到人；这边单方面多剥一截，昵称带「（机器人）」的合法成员就会静默 @ 不上。
-// 聊天行里的名字只是展示，不参与 @ 解析，所以只在这里收紧。
+// 为什么不直接并进 cleanName：cleanName 还给 roster 清单用（清单里的名字要和群里看到的昵称一致，
+// 昵称带「（机器人）」的合法成员不能被剥掉）；聊天行里的名字只是展示，所以只在这里收紧。
 
 const SYSTEM_LABEL_WORDS = ["你自己", "机器人"];
 /** 词内允许夹空白（`你 自 己`）：模型读起来仍是同一个标签 */
@@ -252,6 +254,9 @@ export const formatRosterSection = (args: RosterSectionArgs): string[] => {
     isBot: args.requester.isBot,
   };
 
+  // open_id 只在需要 @ 人时才有用：系统值（不是别人可控的自由文本），放进去让 agent 能写出对的 @ 标签
+  const requesterIdNote = requester.openId ? `，open_id ${requester.openId}` : "";
+
   const lines: string[] = [
     "- 注意：群里的机器人可能是其它团队自研的（不是 Flowship），它读到的每句话都会进它自己的上下文——别往群里写对它没意义的内部信息。",
     `- 你自己：宿主的 Flowship 机器人${selfName ? `「${selfName}」` : ""}。`,
@@ -260,7 +265,7 @@ export const formatRosterSection = (args: RosterSectionArgs): string[] => {
     lines.push(`- 宿主：任务属主「${owner.name}」（真人）；你是他在群里的分身。`);
   }
   lines.push(
-    `- 本轮对话方：「${requester.name}」（${requester.isBot ? "机器人" : "真人"}，非任务所有者）。`,
+    `- 本轮对话方：「${requester.name}」（${requester.isBot ? "机器人" : "真人"}，非任务所有者）${requesterIdNote}。`,
   );
 
   const seen = new Set<string>();
@@ -273,18 +278,67 @@ export const formatRosterSection = (args: RosterSectionArgs): string[] => {
     if (args.selfOpenId && m.openId === args.selfOpenId) tags.push("你自己");
     if (owner && m.openId === owner.openId) tags.push("宿主");
     if (m.openId === requester.openId) tags.push("本轮对话方");
-    rows.push(`  - ${name}（${tags.join("、")}）`);
+    rows.push(`  - ${name}（${tags.join("、")}）：open_id ${m.openId}`);
   }
 
   if (rows.length > 0) {
-    lines.push("- 群里的人（回复里 @ 谁就写 `@名字`，名字必须与下面完全一致）：", ...rows);
+    lines.push(
+      "- 群里的人（回复里要 @ 谁，就写 `<at user_id=\"open_id\">名字</at>`，open_id 照抄下面的）：",
+      ...rows,
+    );
   } else {
     lines.push(
-      "- 群成员名单暂时拿不到：只能确定上面这两位（宿主、本轮对话方）；别 @ 名单之外你不确定名字的人。",
+      "- 群成员名单暂时拿不到：只能确定上面这两位（宿主、本轮对话方）；别 @ 名单之外你不确定 open_id 的人。",
     );
   }
   return lines;
 };
+
+// ----------------- 2b. 回复守则段 -----------------
+
+/** 「无需回复」哨兵（与 group-silent-reply 同一个常量，写进守则让 agent 知道怎么选择沉默） */
+const NO_REPLY = GROUP_NO_REPLY_TOKEN;
+
+/**
+ * 答疑 agent 的「回复守则」（中文行，由调用方拼进 prompt）。
+ *
+ * 2026-11-06：回复协议整套下线（用户拍板「让 AI 自己判断」）——这里只剩给聪明同事的工作守则，
+ * 系统只管三件事：首行 `NO_REPLY` 不发、真人提问人自动 @、其余原样流式发出。
+ * 写成工作守则而不是法条；@ 的写法固定为 `<at user_id>` 标签（lark-api 发卡片时转成卡片写法）。
+ */
+export const formatReplyRulesSection = (opts: {
+  requesterIsBot: boolean;
+}): string[] => [
+  "## 你的回复会原文发到群里",
+  "- 你的**最终回复就是发到群里的原文**（支持 markdown）：只有最后一段（所有工具调用之后的那段文字）会被保留为终稿。中途别写「我先查一下……」之类旁白，查完再一次性给出自包含的最终答复。",
+  "- 对方没看过你的过程，也看不到 Flowship，更不认识内部事件序号、act_ 编号、SDK 报错、事件流、日志路径——这些一律不要出现在回复里，也不要建议对方「去 Flowship 看」。",
+  "",
+  "## 要不要回",
+  `- 对方只是确认 / 复述 / 汇报「收到」、系统提示（比如「这轮没跑成功」）、转述别人的话，并且没有问你任何问题 → 整段回复只写 \`${NO_REPLY}\`（原样、放在第一行，不加别的字），群里就不会发任何东西。`,
+  "- 别为了礼貌回「收到」「好的」。" +
+    (opts.requesterIsBot
+      ? "这次提问方是机器人，尤其要克制——两个机器人互相客气会无限循环下去，对方没提实质问题就沉默。"
+      : "尤其对机器人：两个机器人互相客气会无限循环，对方没提实质问题就沉默。"),
+  "",
+  "## @ 谁",
+  opts.requesterIsBot
+    ? `- 提问方是机器人，系统**不会**替你 @ 它。它问了实质问题时，**必须在正文里 @ 它**，否则它看不见你的回答；它没问实质问题就回 \`${NO_REPLY}\`。`
+    : "- 提问方是真人：系统会自动在回复开头 @ 他，你不用再写。",
+  "- @ 人的写法固定为 `<at user_id=\"open_id\">名字</at>`，open_id 只用上面「群里的人」清单里列出的；不确定 open_id 就别 @，更不要自己编。",
+  "- 只 @ 真正需要行动或需要看见的人，别顺手 @ 一圈。",
+  "",
+  "## 不替属主拍板",
+  "- 接口契约取舍、口径、范围、上线 / 发布 / 部署这类需要属主决定的事，不要替他答应：先给对方一个明确的说法（比如「这个要宿主确认，已转告」），并在回复里 @ 宿主让他看见。",
+  "- 自己能凭产出文档 / 代码事实答的，照常答，别什么都推给属主。",
+  "",
+  "## 说话要有依据",
+  "- 只陈述有依据的事实；查不到就说查不到 / 不确定，不要编。",
+  "- 你是只读答疑身份，**没改过任何文件**——说「已改好」「已提交」之类之前先想清楚，别把没做过的事说成做了。",
+  "",
+  "## 风格",
+  "- 直接讲结论，短句；必要时用 markdown 列表。不要复述对方的问题。",
+  "- 不要自称「答疑 agent / 助手」，用第一人称，代表宿主团队的前端同学说话即可。",
+];
 
 // ----------------- 3. 群里最近聊天段 -----------------
 

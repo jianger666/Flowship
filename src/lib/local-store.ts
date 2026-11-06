@@ -82,10 +82,12 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   // 飞书消息桥接：默认关（决策 #3）；插电防休眠默认开（决策 #14）
   feishuChatBridge: false,
   feishuBridgeKeepAwake: true,
+  // 飞书私聊流式回复：默认开；显式 false 才关
+  feishuBridgeStreaming: true,
   // 群里非属主消息的提示词约束：默认开（2026-11-04 用户拍板）
   feishuGroupNonOwnerGuard: true,
-  // 群里别的机器人 @ 本机机器人：默认受理（2026-11-04 用户拍板「机器人放开、与 lk-harness 保持一致」）
-  feishuGroupAllowBots: true,
+  // 机器人与真人同权：默认关（机器人始终只答疑）
+  feishuGroupBotsEqualRights: false,
   // 团队规范总开关：默认开（日常注入 knowledge）；显式 false 才关
   teamKnowledgeEnabled: true,
   // 公司环境：默认空（设置页「环境配置」填写；运行时同步 company-env.json）
@@ -282,10 +284,12 @@ export const normalizeSettings = (
     feishuChatBridge: parsed.feishuChatBridge === true,
     // 插电防休眠：缺省 / 非 false → true（决策 #14）
     feishuBridgeKeepAwake: parsed.feishuBridgeKeepAwake !== false,
+    // 流式回复：缺省 / 非 false → true（显式 false 才关）
+    feishuBridgeStreaming: parsed.feishuBridgeStreaming !== false,
     // 群里非属主消息的提示词约束：缺省 / 非 false → true（显式 false 才关）
     feishuGroupNonOwnerGuard: parsed.feishuGroupNonOwnerGuard !== false,
-    // 群里别的机器人 @：缺省 / 非 false → true（显式 false 才关）
-    feishuGroupAllowBots: parsed.feishuGroupAllowBots !== false,
+    // 机器人与真人同权：只认显式 true（缺省 / 坏值 → 关）
+    feishuGroupBotsEqualRights: parsed.feishuGroupBotsEqualRights === true,
     // 团队规范总开关：缺省 / 非 false → true（显式 false 才关）
     teamKnowledgeEnabled: parsed.teamKnowledgeEnabled !== false,
     // 公司环境：缺 / 坏 → 空配置（不挡启动）

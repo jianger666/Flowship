@@ -28,6 +28,8 @@
  * - 机器人互 @ 防环：**不再计数熔断**。改由两条规矩从源头掐——
  *   ① 系统回执对机器人整条静默（replyToGroup 的 mention=null），不给对方上下文喂噪音；
  *   ② 答疑 agent 的提示词里写明「谁该 @ / 什么时候不用回」，没话可说输出 NO_REPLY（出向不发）。
+ *   （2026-11-06 起回复协议——`@名字` 换真 @ / 需属主确认标记 / NO_REPLY 变体——整套撤了，
+ *   只留「首行 NO_REPLY 不发、真人提问人开头固定 @」；成不成环交给 agent 自己判断，见 group-silent-reply。）
  *
  * 依赖方向：只从 router **type-only** import（避免 router ↔ group-route 运行时成环）；
  * 需要 router 拥有的 parseInboundContent / loadBridgeBootContext 由 router 以 ctx 传入。
@@ -75,22 +77,14 @@ import {
   buildGroupAdvanceCardJson,
 } from "./group-advance-card";
 import {
-  admitGroupBypassRun,
   bindGroupAdvancePickAction,
   claimGroupAdvancePick,
-  claimGroupBypassDropHint,
-  GROUP_BYPASS_RUN_WINDOW_MAX,
-  GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER,
-  GROUP_BYPASS_RUN_WINDOW_MS,
   GROUP_MEMBER_FALLBACK_NAME,
   GROUP_QUESTION_QUEUE_MAX_PER_SENDER,
-  groupBypassSenderKey,
   markGroupBotIdentityUsable,
   mentionTag,
   newGroupAdvancePickId,
-  peekGroupBypassDropHint,
   releaseGroupAdvancePick,
-  releaseGroupBypassRun,
   enqueueGroupQuestion,
   rememberGroupReply,
   sweepThrottleMarks,
@@ -101,22 +95,18 @@ import {
   retagGroupReplyToRestricted,
   sanitizeGroupMemberName,
   setGroupReplyActionId,
-  type GroupBypassAdmit,
   type GroupReplyHandle,
 } from "./group-shared";
 import {
   getBotAppInfo,
   getBotDisplayName,
   getBotOpenId,
-  fetchInboundMessageText,
   sendInteractiveCardToChat,
   sendMarkdownCardToChat,
 } from "./lark-api";
-import {
-  describeScopeShortage,
-  extractInteractiveText,
-  parseTextContent,
-} from "@/lib/server/route-helpers";
+import { buildQuotedBlock, resolveQuoteAnchorId } from "./group-quote";
+import { resolveInboundQuote } from "./inbound-quote";
+import { describeScopeShortage } from "@/lib/server/route-helpers";
 import type {
   InjectResultPayload,
   ParsedInboundContent,
@@ -178,11 +168,6 @@ export const GROUP_TASK_RUNNING = "任务正在跑、等这一轮结束再问";
 export const GROUP_RESTRICTED_QUESTION_RUNNING =
   "群答疑还在跑、等它答完再来";
 
-/**
- * 非属主旁路 run 超过滑动窗上限时的 skipped 原因（G3-02）。只进返回值 / 日志，
- * **不回群**——对端若是机器人，任何回执都会成为它下一轮 @ 的素材。
- */
-export const GROUP_BYPASS_RATE_LIMITED = "群答疑受理过于频繁、已限流";
 /**
  * 非属主消息没过群答疑准入闸：静默忽略、不回群。
  * 当前真正会触发的只有「未开启 / 机器人发件人」；「外部租户 / 外部成员」要事件带 tenant_key / external 标记才可能触发，
@@ -275,7 +260,7 @@ export const __setGroupRouteDepsForTest = (
 export interface GroupRouteCtx {
   /**
    * `deferDownloads`：只预解析、不下载附件，返回值带 `deferred`（见 router.parseInboundContent）。
-   * 非属主的消息走这个：先过鉴权 / 限流 / 忙线闸门，通过后才在 injectGroupMessage 里 resolve 下载。
+   * 非属主的消息走这个：先过鉴权 / 准入 / 忙线闸门，通过后才在 injectGroupMessage 里 resolve 下载。
    */
   parseContent: (
     msg: FeishuInboundMessage,
@@ -652,7 +637,7 @@ const noteGroupReplyFailure = async (
 /**
  * 回群。**返回 true = 已发出**；false = 静默（对机器人）或发送失败（失败只 warn、不抛；
  * 同时在任务事件流留一条 info，见 {@link noteGroupReplyFailure}）。
- * 绝大多数调用方不关心结果；要「发成功才认领名额」的（回放丢弃提示，见 sendBypassDropHints）看返回值。
+ * 绝大多数调用方不关心结果。
  */
 const replyToGroup = async (
   chatId: string,
@@ -677,84 +662,6 @@ const replyToGroup = async (
     );
     await noteGroupReplyFailure(chatId, err);
     return false;
-  }
-};
-
-/** 一条「排队回放被限流丢弃」的待提示（pump 一轮内攒起来，轮末统一发，见 sendBypassDropHints） */
-interface BypassDropHint {
-  chatId: string;
-  /** 要 @ 的提问人（机器人提问人不会走到这里：静默、不占名额） */
-  mention: { openId: string; name: string };
-  /** 限流分桶 key（groupBypassSenderKey）：提示名额按它认领 */
-  sender: string;
-  scope: "total" | "sender";
-}
-
-/** pump 一轮里最多**单发**几条回放丢弃提示；其余合并成一句（防入向串行链被一串 await 堵住） */
-const BYPASS_DROP_HINT_SINGLE_MAX = 3;
-
-/**
- * 发「排队回放被限流丢弃」的群内提示（K2-02 / 第八轮 L3-04）。
- *
- * - **先看名额（peek）、发送成功后才认领**：此前先认领再发，发送失败时名额已耗，这个人本窗再也等不到那一句。
- *   发送失败 → 名额不耗，下一次被丢弃的回放仍会再试。
- * - **同批同人只试一次**：同一批里同一个人有多条被丢，只取第一条、只发一次——发送失败也不在本批里重试
- *   （防群接口抖动时每条被丢的消息都打一次 API）。跨批会再试，但每条被丢弃的回放出队后不会回头，
- *   所以重试次数以「被丢弃的回放条数」为上界，不会无限。
- * - **一批最多单发 {@link BYPASS_DROP_HINT_SINGLE_MAX} 条，其余合并成一句**（`@甲 @乙 …`）：
- *   pump 在入向串行链里 await，最多 10 条（队列上限）依次发会把后面的入向消息堵住；现在一批最多 4 次发送。
- *   合并句点名每一个被丢弃的人（他们都要知道自己的消息没被回答），不回显原文。
- *   合并句成功 → 被点名的人名额一并认领；失败 → 都不耗。其余只剩 1 个人时不合并（「你们 / 这几条」对一个人说不通），
- *   按单发文案发第 4 条。
- * - 按 chatId 分组各自计 3+1（同一 task 正常只绑一个群，多群时每群各算）。
- *
- * 机器人提问人不进来（调用方在 mention 为 null 时就不收集）：不占 3 条预算、不占名额。
- */
-const sendBypassDropHints = async (
-  taskId: string,
-  notices: readonly BypassDropHint[],
-): Promise<void> => {
-  if (notices.length === 0) return;
-  const windowMin = GROUP_BYPASS_RUN_WINDOW_MS / 60_000;
-  const seen = new Set<string>();
-  const byChat = new Map<string, BypassDropHint[]>();
-  for (const n of notices) {
-    if (seen.has(n.sender)) continue;
-    seen.add(n.sender);
-    if (!peekGroupBypassDropHint(taskId, n.sender)) continue;
-    const list = byChat.get(n.chatId) ?? [];
-    list.push(n);
-    byChat.set(n.chatId, list);
-  }
-  const singleText = (n: BypassDropHint): string =>
-    n.scope === "total"
-      ? `你排队的这条没有被回答：群答疑近 ${windowMin} 分钟已启动满 ${GROUP_BYPASS_RUN_WINDOW_MAX} 次、触发限流，窗口滑过后可以再问一次`
-      : `你排队的这条没有被回答：你近 ${windowMin} 分钟已提问 ${GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER} 次、触发个人限流，窗口滑过后可以再问一次`;
-  for (const [chatId, list] of byChat) {
-    for (const n of list.slice(0, BYPASS_DROP_HINT_SINGLE_MAX)) {
-      if (await replyToGroup(chatId, singleText(n), n.mention)) {
-        claimGroupBypassDropHint(taskId, n.sender);
-      }
-    }
-    const rest = list.slice(BYPASS_DROP_HINT_SINGLE_MAX);
-    if (rest.length === 0) continue;
-    if (rest.length === 1) {
-      // 只剩一个人：合并句的「你们 / 这几条」对一个人说不通，也会丢掉他撞的是哪种限额——
-      // 按单发文案发（仍是第 4 次发送，一批最多 4 次的上界不变）
-      const only = rest[0]!;
-      if (await replyToGroup(chatId, singleText(only), only.mention)) {
-        claimGroupBypassDropHint(taskId, only.sender);
-      }
-      continue;
-    }
-    const tags = rest.map((n) => mentionTag(n.mention.openId, n.mention.name)).join(" ");
-    // 合并句不区分被丢的是总限额还是个人限额：第 4 个起必然是总限额（总额满后所有人判总限额，个人限额只在
-    // 总额未满时才判）——推演、未单独验证；统一文案把两个上限都点明，不依赖这条推演
-    const merged = `${tags} 你们排队的这几条没有被回答：群答疑近 ${windowMin} 分钟的启动名额已用完（总共 ${GROUP_BYPASS_RUN_WINDOW_MAX} 次、每人 ${GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER} 次）、触发限流，窗口滑过后可以再问一次`;
-    // mention 传 undefined：@ 标签已在正文里拼好，不再加前缀
-    if (await replyToGroup(chatId, merged, undefined)) {
-      for (const n of rest) claimGroupBypassDropHint(taskId, n.sender);
-    }
   }
 };
 
@@ -1230,12 +1137,6 @@ const injectGroupMessage = async (args: {
   refSource?: { messageId: string };
   /** 排队回放：忙时不再二次入队，静默等下一轮 draining */
   fromPump?: boolean;
-  /**
-   * 排队回放被限流丢弃时，把「要不要给提问人提示」交给调用方（pump）攒着、轮末统一发
-   * （最多单发 3 条、其余合并，见 sendBypassDropHints）。不传 = 就地发这一条（只有 pump 会传 fromPump，
-   * 这条兜底保证没有收集器时提示照旧发出、不丢）。
-   */
-  onDropHint?: (hint: BypassDropHint) => void;
 }): Promise<InjectResultPayload> => {
   const { taskId, chatId, requester, messageId, isOwner } = args;
   // let：非属主的待下载资源（parsed.deferred）在闸门全过之后 resolve 成完整解析结果、替换这里
@@ -1286,86 +1187,12 @@ const injectGroupMessage = async (args: {
     !feedIntoSession &&
     agentSessions.has(taskId);
 
-  // 非属主旁路 run 的 per-task 滑动窗硬上限（G3-02，第六轮口径）：互 @ 熔断删除后唯一的速率闸。
-  // 名额只在旁路 run **真正启动**的那一刻扣：admit 点在本函数下方——忙线 / 队满 / 槽位 /
-  // 启动凭据都通过之后、紧接着登记回群凭据与注入起 run（admit → 注入调用之间没有 await；
-  // 但**忙线判定与 admit 之间有** `await loadBootContext()`，两者不是原子的——忙线闸是串行意图、
-  // 不是硬互斥，并发的两条消息可能都通过忙线判定，名额总量由 admit 本身守住），共两处
-  //（见 admitBypassRun 的调用点）：
-  //  ① 普通消息 / 排队回放（fromPump）：在登记回群凭据（rememberGroupReply）**之前**判，
-  //     被限流丢弃的消息对回群登记表零副作用（登记有容量上限、挤掉最老一条后回滚放不回来）；
-  //  ② 答 pendingAsk 撞 no_pending 竞态落回旁路：这条消息即将起 run，此刻补判（已登记、丢弃时回滚）。
-  // 因此：被忙线 / 队满 / 槽位拒收的、入队等回放的（入队不计、回放起 run 时才计一次）、
-  // 被限流丢弃的都不占名额；属主自己 / 答 pendingAsk 成功 / feed 进活会话的关联回执 / chat 型不起旁路 run、
-  // 不经过。**没有活会话的关联回执会走只读旁路起 run、要过这里，但只计总限额、不计个人限额**（K2-01，
-  // 见 admitGroupBypassRun 的 `correlatedReceipt`）：托办的数据回流不该因个人额度被静默丢掉。
-  // 超限静默丢弃（不回群：对端若是机器人，任何回执都是它下一轮 @ 的素材），
-  // 只写一条节流 info 让属主在 app 里知道（总限额每窗一条、个人限额每人每窗一条，文案区分、不带原文）。
-  // 例外：**排队回放**被丢弃时入队 ack 已承诺过「答完就答你」，对真人提问人补一句群内提示
-  //（每窗每人一条，机器人静默，见 dropRateLimitedBypass）。
-  // 同一 message_id 重投窗内只计一次；起 run 失败（注入抛错 / 非 200）退还名额（见下方 refundBypassRun）。
-  const bypassSender = groupBypassSenderKey(requester, args.senderIds);
-  /** 本次调用是否新记了一个旁路名额（false = 没计 / 重投已计过——只有 true 的才有名额可退） */
-  let bypassCounted = false;
-  const admitBypassRun = (): GroupBypassAdmit => {
-    const admit = admitGroupBypassRun(taskId, {
-      sender: bypassSender,
-      messageId,
-      // 命中出问登记的关联回执：只计总限额（K2-01）
-      ...(correlated ? { correlatedReceipt: true } : {}),
-    });
-    if (admit.allowed) bypassCounted = admit.counted;
-    return admit;
-  };
-  const dropRateLimitedBypass = async (
-    admit: Extract<GroupBypassAdmit, { allowed: false }>,
-  ): Promise<InjectResultPayload> => {
-    const windowMin = GROUP_BYPASS_RUN_WINDOW_MS / 60_000;
-    if (admit.notify) {
-      await writeOwnedEventAndPublish(taskId, () => true, {
-        kind: "info",
-        text:
-          admit.scope === "total"
-            ? `群答疑已限流（总限额）：近 ${windowMin} 分钟内已启动 ${GROUP_BYPASS_RUN_WINDOW_MAX} 次非属主群答疑，之后到达的会被静默丢弃（群里不回消息），窗口滑过后自动恢复；本窗口只提示这一次`
-            : `群答疑已限流（个人限额）：${requester.name} 近 ${windowMin} 分钟内已启动 ${GROUP_BYPASS_RUN_WINDOW_MAX_PER_SENDER} 次非属主群答疑，其后到达的该发送人的提问会被静默丢弃（群里不回消息），窗口滑过后自动恢复；该发送人本窗口只提示这一次`,
-      });
-    }
-    console.warn(
-      `${LOG} 非属主群问题超滑动窗${admit.scope === "total" ? "总" : "个人"}限额、静默丢弃 task=${taskId} message=${messageId}`,
-    );
-    // 排队回放被丢弃（K2-02）：入队时回过「答完就答你」，这里不交代就是食言。只对真人提问人说
-    //（机器人的系统回执一律静默防环——mention 为 null），且每窗每人一条，防刷屏；
-    // 先判 mention、机器人不收集（不占预算也不占名额）。不回显原文：限流提示不该把正文再贴回群里。
-    // 第八轮 L3-04：这里**不再就地认领名额 + 发送**——交给 pump 攒到轮末统一发（最多单发 3 条、其余合并），
-    // 且发送成功后才认领名额（见 sendBypassDropHints）。
-    if (args.fromPump) {
-      const mention = groupReplyMention(args.requesterIsBot, requester);
-      if (mention) {
-        const hint: BypassDropHint = {
-          chatId,
-          mention,
-          sender: bypassSender,
-          scope: admit.scope,
-        };
-        if (args.onDropHint) args.onDropHint(hint);
-        else await sendBypassDropHints(taskId, [hint]);
-      }
-    }
-    return { kind: "skipped", messageId, taskId, error: GROUP_BYPASS_RATE_LIMITED };
-  };
-  /** 起 run 失败（注入抛错 / 非 200）：退还本次新记的名额——没启动的 run 不该占，飞书重投时按新到只计一次 */
-  const refundBypassRun = (): void => {
-    if (!bypassCounted) return;
-    bypassCounted = false;
-    releaseGroupBypassRun(taskId, messageId);
-  };
-
   // 群答疑准入闸（P0 安全硬化，见 restricted-qa-gate.ts）：非属主、task 型、既不是答 pendingAsk 也不是 feed 进活会话的
-  // 关联回执 = 这条消息要起受限答疑 agent。必须过：非机器人发件人（这道是真正生效的）；
+  // 关联回执 = 这条消息要起受限答疑 agent。过闸：机器人发件人恒放行（没有设置项、和真人一致，仍只答疑）；
   // 租户一致 / 非外部成员两道要事件带 tenant_key / external 标记才比，当前 lark-cli compact 事件里没有 → 生产里暂不生效（拿不到就不拦）。
   // **没有「按群开关」**（第 11 轮起，用户决定「答疑默认开、不要开关」）：已绑定需求群里的非属主真人默认放行；
   // 盘上老 meta 里残留的 feishuGroupRestrictedQa 字段读盘时就被丢弃，这里不看它。
-  // 不过 → **静默忽略**（不回群、不排队、不占限流名额、不下载附件），只给属主在事件流里留一条节流 info。
+  // 不过 → **静默忽略**（不回群、不排队、不下载附件），只给属主在事件流里留一条节流 info。
   // 放在忙线 / 排队判定之前：被拒的机器人发件人不能还被「忙线」「在排队了」之类回执刷屏。
   // 排队回放（fromPump）也走这里——排队期间发件人不合规，回放时照样拒。
   // 属主本人 / chat 型 / 答 pendingAsk / feed 会话的关联回执不经过本闸（各有自己的门）。
@@ -1373,8 +1200,8 @@ const injectGroupMessage = async (args: {
     const senderIsBot = args.requesterIsBot === true;
     const decision = decideRestrictedQaAdmission({
       senderIsBot,
-      // 设置「受理群里其他机器人的 @」：只在发件人是机器人时才去读（真人消息不为它多读一次盘）；读不到 → false（fail-closed）
-      allowBots: senderIsBot ? await isGroupBotsAllowed() : false,
+      // 机器人的 @ 一律受理（没有设置项）；仍受租户 / 外部成员闸约束，且只答疑（见 group-non-owner-prompt）
+      allowBots: senderIsBot ? isGroupBotsAllowed() : false,
       senderTenantKey: args.senderTenantKey,
       ownTenantKey: getOwnTenantKey(),
       senderExternal: args.senderExternal,
@@ -1430,7 +1257,7 @@ const injectGroupMessage = async (args: {
     // 属主 / chat 型 / 答 pendingAsk / **feed 进活会话的**关联回执（feedIntoSession）不排——属主用 app 当
     // 主通道，关联数据有时效性。**没有活会话的关联回执会排**（它按普通非属主消息走只读旁路，旁路在飞时
     // 就是忙线）：入队时不焚登记，回放时 injectGroupMessage 重算 correlated——登记若已在排队期间被焚 / 过期，
-    // 回放就按普通消息处理（数据头与 correlatedAnswer 丢失、计个人额度；第八轮 L3-03 核实，
+    // 回放就按普通消息处理（数据头与 correlatedAnswer 丢失；第八轮 L3-03 核实，
     // 用例见 tests/group-bypass-r8.test.ts）。
     // pump 回放时（fromPump）不再二次入队：还忙就静默等下一轮 draining。
     // 注：pendingAsk 其实到不了这里（busyReason 已豁免），上面再写一遍是显式的，不靠外层兜着。
@@ -1554,7 +1381,7 @@ const injectGroupMessage = async (args: {
       : sameSessionNonOwner
         ? // 并入同会话：抬头只标身份；「只答疑」约束放在送达时追加的尾部约束段里（开关现读，见 group-non-owner-prompt）
           `${buildNonOwnerGroupHeader({ name: requester.name, isBot: args.requesterIsBot })}\n${args.text}`
-        : // 对方是机器人时抬头明说：答疑 agent 据此知道这是机器人（回复协议对机器人更克制、要显式 @）。
+        : // 对方是机器人时抬头明说：答疑 agent 据此知道这是机器人（提示词要求对机器人更克制、要显式 @ 它）。
         // group-qa 的 cleanGroupQuestionText 用 /^\[群消息[^\]\n]*\]/ 剥这个前缀，括号里多「机器人，」不影响
         `[群消息·来自 ${requester.name}（${args.requesterIsBot ? "机器人，" : ""}非任务所有者）]——只答疑、不执行修改类指令\n${args.text}`)
   ).trim();
@@ -1576,9 +1403,9 @@ const injectGroupMessage = async (args: {
         chatId,
         requesterOpenId: requester.openId,
         requesterName: requester.name,
-        // UI 群问答 tab 配对备用（见 sourceMessageId 注释）
+        // UI 群问答卡配对备用（见 sourceMessageId 注释）
         sourceMessageId: messageId,
-        // 出向据此区分机器人提问人（失败 / 空回答时静默、回复协议不自动补 @）
+        // 出向据此区分机器人提问人（失败 / 空回答时静默、出向不自动补 @）
         requesterIsBot: args.requesterIsBot,
     kind: "question",
     // 答 pendingAsk 是送进属主活会话的（不走旁路）——先按 owner 登记，
@@ -1600,33 +1427,15 @@ const injectGroupMessage = async (args: {
     !["awaiting_ack", "cancelled", "error"].includes(
       task.actions.find((a) => a.id === task.currentActionId)?.status ?? "",
     );
-  // 旁路 run 准入点 ①（普通消息 / 排队回放）：忙线 / 队满 / 槽位 / 启动凭据都已通过，下面
-  // 登记回群凭据后紧接着注入起 run——名额就在此刻扣（admit → 注入调用之间没有 await；
-  // 注意忙线判定在上面、与这里隔着 `await loadBootContext()`，并不原子，见 group-shared 里 admitGroupBypassRun 与本文件 admitBypassRun 的注释）。
-  // 必须在 registerQuestionReply **之前**：被限流丢弃的消息不能碰登记表（有容量上限，
-  // 登记会挤掉最老一条，丢弃时的回滚放不回来）。答 pendingAsk 的走准入点 ②（下面 no_pending 分支）。
-  //
-  // 非属主答 pendingAsk 也过这道闸（G3-02 补口径）：它不起旁路 run，所以**占的名额答成功即退还**（见下方 pendingAsk
-  // 成功分支的 refundBypassRun——速率口径仍是「起了 run 才计」），但**检查照做**：
-  // 窗口已被刷满时，这条消息被静默丢弃、pendingAsk 不动、附件一个字节都不下载。旧实现对 pendingAsk 整条路径免检，
-  // 非属主只要在有待答提问时往群里发带附件的消息，就能在限流之外白拿一次 lark 下载（单文件至多 50MB，占全局单飞的 lark 队列）。
-  // 竞态落回旁路（no_pending）的消息继续占着这里扣的名额——它马上要起 run，不用再判一次（旧的准入点 ②）。
-  const gatedAtAdmit =
-    !isOwner && !feedIntoSession && (viaRestrictedRun || hasPendingAsk);
-  if (gatedAtAdmit) {
-    const admit = admitBypassRun();
-    if (!admit.allowed) return dropRateLimitedBypass(admit);
-  }
-  // 非属主的待下载资源（图 / 文件 / 视频）：上面的闸门——chat 型非属主拒收、忙线 / 排队、
-  // 旁路滑动窗限流——都通过了，到这里才真正下载（被拦下的消息零下载）。
+  // 非属主的待下载资源（图 / 文件 / 视频）：上面的闸门——chat 型非属主拒收、群答疑准入闸、忙线 / 排队——
+  // 都通过了，到这里才真正下载（被拦下的消息零下载）。
   // 必须在 registerQuestionReply 之前：下载要等全局单飞的 lark 队列，失败 / 不支持时不该留着回群登记。
   if (parsed.deferred) {
     let full: ParsedInboundContent;
     try {
       full = await parsed.deferred.resolve();
     } catch (err) {
-      // 与第 5 步同口径：基础设施类失败可重试（补拉重投）；这条没起 run、退还已扣的旁路名额
-      refundBypassRun();
+      // 与第 5 步同口径：基础设施类失败可重试（补拉重投）
       const error = `解析消息失败：${err instanceof Error ? err.message : String(err)}`;
       await replyToGroup(
         chatId,
@@ -1636,7 +1445,6 @@ const injectGroupMessage = async (args: {
       return { kind: "failed", messageId, taskId, error, retryable: true };
     }
     if (full.unsupported) {
-      refundBypassRun();
       const reply = unsupportedReplyText({
         taskId,
         chatId,
@@ -1674,13 +1482,10 @@ const injectGroupMessage = async (args: {
     if (askResult.ok) {
       // 一问一答：关联登记在这里消费掉（当了答题答案，不再二次消费）
       if (correlated) burnCorrelatedEntry(taskId, correlated.entry.messageId);
-      // 答案送进了属主活会话、没起旁路 run：退还准入点 ① 扣的名额（见那里的注释）
-      refundBypassRun();
       return { kind: "sent", messageId, taskId };
     }
     // no_pending 竞态（刚被别人答掉）→ 落普通消息；其它失败回群（机器人不 @，review 九轮-1）
     if (askResult.reason !== "no_pending") {
-      refundBypassRun();
       restoreGroupReply(taskId, replyHandle);
       await replyToGroup(
         chatId,
@@ -1695,15 +1500,13 @@ const injectGroupMessage = async (args: {
     // 并存、直接补一条自己的
     if (viaRestrictedRun) {
       // 答 pendingAsk 撞 no_pending 竞态、落回旁路起 run：上面的群答疑准入闸对 pendingAsk 消息是跳过的
-      // （当时它是在答属主的提问），现在它要起受限答疑 agent 了，必须补过一遍——退还名额 + 摘掉登记 + 静默忽略。
+      // （当时它是在答属主的提问），现在它要起受限答疑 agent 了，必须补过一遍——摘掉登记 + 静默忽略。
       const lateDenied = await restrictedQaDenial();
       if (lateDenied) {
-        refundBypassRun();
         restoreGroupReply(taskId, replyHandle);
         return denyRestrictedQa(lateDenied);
       }
-      // 这条消息没被当答案吃掉、即将落回旁路起 run：准入点 ① 已对它判过并占着名额（pendingAsk 消息也过 ①），
-      // 这里不用再判。已按 owner 通道登记过——下面改挂到旁路 token 上。
+      // 这条消息没被当答案吃掉、即将落回旁路起 run：已按 owner 通道登记过——下面改挂到旁路 token 上。
       restrictedRunTag =
         retagGroupReplyToRestricted(taskId, replyHandle) ?? undefined;
       if (!restrictedRunTag) {
@@ -1728,7 +1531,7 @@ const injectGroupMessage = async (args: {
     groupChatId: chatId,
     groupSender: requester.name,
     // 群问答 UI 聚合键：提问人稳定 id（sender_name 经常拿不到，只能看到“群成员”）；
-    // restrictedRunTag = 这轮旁路回答汇总事件的配对键（属主通道没有，进不了群问答 tab）
+    // restrictedRunTag = 这轮旁路回答汇总事件的配对键（属主通道没有，进不了群问答卡）
     groupSenderOpenId: requester.openId,
     // 提问人是机器人才写（真人不写）：答疑旁路据此挑回复规矩、UI 打「机器人」徽标
     ...(args.requesterIsBot ? { groupSenderIsBot: true as const } : {}),
@@ -1782,6 +1585,7 @@ const injectGroupMessage = async (args: {
                 ? {
                     groupNonOwner: {
                       name: requester.name,
+                      openId: requester.openId,
                       ...(args.requesterIsBot ? { isBot: true as const } : {}),
                     },
                   }
@@ -1820,9 +1624,8 @@ const injectGroupMessage = async (args: {
   } catch (err) {
     // 没注入进去就别挂着登记——否则该任务下一轮无关的 done 会把结果误发进群
     restoreGroupReply(taskId, replyHandle);
-    // 注入抛错 = 没有 run 开跑（受限答疑的 handler 起 run 是最后一步 fire-and-forget、之后不会再抛）：
-    // 退还旁路名额；可重试失败等补拉重投时按新到处理、只计一次
-    refundBypassRun();
+    // 注入抛错 = 没有 run 开跑（受限答疑的 handler 起 run 是最后一步 fire-and-forget、之后不会再抛）；
+    // 可重试失败等补拉重投时按新到处理
     const rawError = err instanceof Error ? err.message : String(err);
     // scope 缺失翻译成人话（缺哪些 + 去哪开），拼在原始错误后面
     const hint = describeScopeShortage(rawError);
@@ -1850,10 +1653,6 @@ const injectGroupMessage = async (args: {
     // 其余 202（chat-inject 的 chat 队列 / 无标记的 task 202）走后面原回执，行为不变。
     if (resp.status === 202) {
       restoreGroupReply(taskId, replyHandle);
-      // 202 = 没有 run 开跑（旁路通道正常到不了这里；真到了也不该占旁路名额）。
-      // 并入同会话的非属主例外：它排进 task 待送达队列、重放时**不会**再过准入闸，限流名额就在入队这一刻扣、不退
-      //（队列本身有独立上限 + 每人槽位兜底），否则排队等于绕过 per-sender 滑动窗。
-      if (!sameSessionNonOwner) refundBypassRun();
       // task 模式 + `queued: true` = 进了 task 待送达队列（没有 run 开跑，登记已在上面摘掉）：
       // 属主的话回一句「这轮跑完就处理」；托办回执本来就不回群，保持静默。
       // 关联登记入队时就 burn：文本已存进队列、重放不再需要它，留着反而会被下一句复读二次消费。
@@ -1880,8 +1679,7 @@ const injectGroupMessage = async (args: {
     return { kind: "sent", messageId, taskId, text: args.text || undefined };
   }
   restoreGroupReply(taskId, replyHandle);
-  // 非 2xx：起 run 前就被拦下（stale 闸 / 参数校验 / 生命周期冲突等），没有 run 开跑——退还名额
-  refundBypassRun();
+  // 非 2xx：起 run 前就被拦下（stale 闸 / 参数校验 / 生命周期冲突等），没有 run 开跑
   const error = await readInjectError(resp);
   await replyToGroup(
     chatId,
@@ -1918,9 +1716,6 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
     // 忙是 break 走 while 条件、不直接 return——直接 return 会留 stale Wanted（review 五轮-3）
     do {
       questionPumpWanted.delete(taskId);
-      // 本轮里「回放被限流丢弃」的待提示：攒到轮末统一发（最多单发 3 条、其余合并成一句，
-      // 且发送成功才认领名额——见 sendBypassDropHints；第八轮 L3-04）。
-      const dropHints: BypassDropHint[] = [];
       for (;;) {
         const { head, expired } = shiftGroupQuestionQueue(taskId);
         // 过期丢弃要给用户交代（入队时承诺过“答完就答你”）；机器人发件人整条静默（review 八轮-1/八轮-2）。
@@ -1950,13 +1745,10 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
             senderIds: head.senderIds,
             ...(head.requesterIsBot ? { requesterIsBot: true as const } : {}),
             fromPump: true,
-            onDropHint: (hint) => {
-              dropHints.push(hint);
-            },
           });
         } catch (err) {
-          // 回放注入抛错：写 ok:false 汇总（tab 看得到）+ 回一句（人类才回，机器人静默；review 五轮-2，
-          // 呼应 outbound 失败轮进 tab）。origin 随机：投不进任何登记。
+          // 回放注入抛错：写 ok:false 汇总（问答卡看得到）+ 回一句（人类才回，机器人静默；review 五轮-2，
+          // 呼应 outbound 失败轮写问答卡）。origin 随机：投不进任何登记。
           const errText = err instanceof Error ? err.message : String(err);
           console.warn(
             `${LOG} 排队回放注入抛错 task=${taskId} message=${head.messageId}：`,
@@ -1975,12 +1767,12 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
               askerOpenId: head.requester.openId,
               askerName: head.requester.name,
               questionMessageId: head.messageId,
-              // tab 里别留无头轮：带上原问截断（review 六轮-5）
+              // 问答卡里别留无头轮：带上原问截断（review 六轮-5）
               answer: `原问“${cleanGroupQuestionText(head.text).slice(0, 80)}”回放失败：${errText}`,
               ok: false,
             }),
             `pump-fail-${Date.now().toString(36)}`,
-            // 这个 origin 只为防投递；该汇总要在群问答 tab / 主流里看得见，不能被打 groupRun 折叠掉
+            // 这个 origin 只为防投递；该汇总要在群问答卡 / 主流里看得见，不能被打 groupRun 折叠掉
             { tagGroupRun: false },
           );
           continue;
@@ -1996,8 +1788,6 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
         }
         // sent/failed/其它 skip：本轮已收口（失败路径注入链自己回过群），继续下一条
       }
-      // 本轮收尾：把攒着的回放丢弃提示发出去（break 出循环——队空 / 还忙——都会走到这里）
-      await sendBypassDropHints(taskId, dropHints);
     } while (questionPumpWanted.delete(taskId));
   } finally {
     questionPumpRunning.delete(taskId);
@@ -2091,10 +1881,13 @@ export const routeGroupInboundMessage = async (
   // 1) bot 身份（判 @ + 判属主都要）。三个查询同一后端（lark-cli）、同一抖动模式，一块 try、同一个失败信封：
   // openId 不能 fallback 空串（空=认不出任何 @+自环检查失效）；名字只是 @ 判定的兜底，取不到才置空。
   let ownerOpenId = "";
+  let botAppId = "";
   let botOpenId: string | null = "";
   let appName: string | undefined;
   try {
-    ownerOpenId = (await deps.getBotAppInfo()).ownerOpenId;
+    const appInfo = await deps.getBotAppInfo();
+    ownerOpenId = appInfo.ownerOpenId;
+    botAppId = appInfo.appId ?? "";
     botOpenId = await deps.getBotOpenId();
     appName = (await deps.getBotDisplayName()) ?? undefined;
   } catch (err) {
@@ -2179,10 +1972,10 @@ export const routeGroupInboundMessage = async (
   }
 
   // 5) 解析正文（图 / 文件下载复用 p2p 那套）
-  // 属主身份提前判（原在第 6 步）：非属主的附件不能在鉴权 / 限流之前就下载——
+  // 属主身份提前判（原在第 6 步）：非属主的附件不能在鉴权 / 闸门之前就下载——
   // 旧实现一律先下载，陌生人（或对端机器人）刷文件会占满全局单飞的 lark 队列、拖住属主的消息，
   // 且落盘文件名由发件人决定（见 attachment-store 头注释）。非属主只做预解析（拿正文 + 知道有没有资源），
-  // 闸门（advance 非属主拒绝 / chat 型非属主拒绝 / 忙线与排队 / 旁路滑动窗限流）都过了之后，
+  // 闸门（advance 非属主拒绝 / chat 型非属主拒绝 / 群答疑准入闸 / 忙线与排队）都过了之后，
   // 才在 injectGroupMessage 里 resolve 真正下载；被闸门拦下的消息零下载。属主本人照旧即时下载。
   const isOwner = !!ownerOpenId && msg.sender_id === ownerOpenId;
   // 属主（应用 owner）一定在本租户：他的消息若带了「确属发件人」的 tenant_key，就记作本机器人的租户（群答疑租户闸比对用）。
@@ -2229,8 +2022,26 @@ export const routeGroupInboundMessage = async (
     ),
   };
   const text = stripMentions(parsed.text, [appName ?? ""]);
+
+  // 回复 / 引用了某条消息 → 取回被引用的那条（任何带回复锚点的群消息都取，不只是正文为空的那种）。
+  // 用户这句话本身就是「推进」命令时不取：命令只看用户自己写的那句，
+  // 取回既慢（占 lark 队列、最多 5s）又没用。取不到 / 被限流 / 不是本群的消息 → 当没引用，消息照常走。
+  const anchorId = resolveQuoteAnchorId(msg);
+  const quote =
+    anchorId && !(text.length > 0 && parseGroupCommand(text).kind === "advance")
+      ? await resolveInboundQuote({
+          msg,
+          anchorId,
+          isOwner,
+          selfIds: [botOpenId, botAppId],
+          parseContent: ctx.parseContent,
+          lookupName: lookupGroupMemberName,
+          logPrefix: LOG,
+        })
+      : null;
+
   // 空 @ 不再完全无声：先打日志，再看有没有指回的消息（bot 常发“纯 @ + thread 指回卡片”）
-  // ——有就把被指内容取回来拼上继续走；取不到才按空消息跳过（fail-closed）。
+  // ——有就把被指内容拼上继续走；取不到才按空消息跳过（fail-closed）。
   let effectiveText = text;
   let refSource: { messageId: string } | undefined;
   if (
@@ -2239,34 +2050,42 @@ export const routeGroupInboundMessage = async (
     parsed.attachments.length === 0 &&
     !parsed.deferred
   ) {
-    const refId = msg.reply_to || msg.root_id || msg.parent_id || "";
     console.warn(
-      `${LOG} 空消息跳过 message=${messageId} chat=${msg.chat_id} sender=${msg.sender_id} reply_to=${refId}`,
+      `${LOG} 空消息跳过 message=${messageId} chat=${msg.chat_id} sender=${msg.sender_id} reply_to=${anchorId ?? ""}`,
     );
-    if (refId) {
-      // best-effort 取被指消息：预算 5s（入向串行链上，取不到就按空消息 skip，
-      // fail-closed——不能让群里一条空 @ 把后面的属主 p2p 堵住）
-      const ref = await fetchInboundMessageText(refId, 5_000).catch(() => null);
-      // 取回的 text 型 content 可能是 `{"text":"..."}` JSON 壳：先剥壳再拼，
-      // 否则 @ 占位和 JSON 壳进命令解析/上下文（壳先剥掉，agent 看到的是干净正文）
-      const refRaw = ref
-        ? ref.msgType === "interactive"
-          ? (extractInteractiveText(ref.text) ?? "")
-          : parseTextContent(ref.text)
-        : "";
+    if (quote) {
+      // quote.text 已剥壳 / 还原 @ 占位（agent 看到的是干净正文），拼上用户自己的空 @ 一起走
       const combined = stripMentions(
-        `${parsed.text}\n${refRaw}`,
+        `${parsed.text}\n${quote.text}`,
         [appName ?? ""],
       ).trim();
       if (combined) {
         effectiveText = combined;
-        refSource = { messageId: refId };
+        refSource = { messageId: quote.messageId };
       }
     }
     if (!refSource) {
       return { kind: "skipped", messageId, taskId, error: "空消息" };
     }
   }
+  // 属主引用里的图 / 附件随本条一起交给 agent（非属主不下载，quote 里恒空）
+  if (quote && (quote.images.length > 0 || quote.attachments.length > 0)) {
+    parsed = {
+      ...parsed,
+      images: [...parsed.images, ...quote.images],
+      attachments: [...parsed.attachments, ...quote.attachments],
+    };
+  }
+  // 正文非空时，引用以独立块跟在用户这句话后面（空 @ 的情形已把引用并进正文、不重复）
+  const quoteBlock =
+    quote && !refSource
+      ? buildQuotedBlock({
+          messageId: quote.messageId,
+          senderLabel: quote.senderLabel,
+          text: quote.text,
+          truncated: quote.truncated,
+        })
+      : "";
 
   // 6) 命令 / 普通消息分流（isOwner 已在第 5 步前判过）
   const cmd = parseGroupCommand(effectiveText);
@@ -2300,7 +2119,7 @@ export const routeGroupInboundMessage = async (
     chatId: msg.chat_id,
     // 纯图/纯附件 @ 进来正文是空的：给一句兜底，和 pendingAsk 路径的 "(附图/附件)" 对齐
     //（review 十轮-3；到这里时上面空消息门已保证三者至少其一非空）
-    text: effectiveText || "(附图/附件)",
+    text: `${effectiveText || "(附图/附件)"}${quoteBlock ? `\n\n${quoteBlock}` : ""}`,
     parsed,
     requester,
     isOwner,

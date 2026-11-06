@@ -47,9 +47,22 @@ export const isFeishuBridgeKeepAwakeEnabled = async (): Promise<boolean> => {
   return v !== false;
 };
 
-/** 飞书卡片打字机：不再挂设置，恒开 */
-export const isFeishuBridgeStreamingEnabled = async (): Promise<boolean> =>
-  true;
+/**
+ * 飞书卡片打字机（设置 → 连接 → 飞书集成「流式回复」，默认开；私聊卡与群答疑回复共用，群里的任务级覆盖见
+ * `Task.feishuGroupStreaming`、在 group-outbound 里叠加）。
+ * 关 = 一轮里不推中间状态，完成后一次性发整张卡。2026-08-27 曾撤掉设置、恒开，2026-11-06 加回。
+ * 读取失败（含 readSettingsFile 直接抛错）/ 缺省 / 非 false → 开（保持原有行为）；
+ * outbound 每轮首次建卡时读一次——这里抛了会让整张卡建不起来，所以不往外抛。
+ */
+export const isFeishuBridgeStreamingEnabled = async (): Promise<boolean> => {
+  try {
+    const result = await readSettingsFile();
+    if (result.status !== "ok") return true;
+    return result.settings.feishuBridgeStreaming !== false;
+  } catch {
+    return true;
+  }
+};
 
 /**
  * 需求群协作行为：**固定策略、不再是用户设置**（2026-07-28 用户拍板砍掉三个开关，
