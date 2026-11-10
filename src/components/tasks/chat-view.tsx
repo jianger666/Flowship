@@ -22,6 +22,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pencil } from "lucide-react";
 import { toast } from "sonner";
 
+import { BrowserToggleButton } from "@/components/browser/browser-toggle-button";
+import { ChatBrowserSplit } from "@/components/browser/chat-browser-split";
+import { useChatBrowserPane } from "@/components/browser/use-chat-browser-pane";
 import { ChatProviderModelPicker } from "@/components/tasks/chat-provider-model-picker";
 import { BranchSwitcher } from "@/components/tasks/branch-switcher";
 import { TaskChangesPanel } from "@/components/tasks/task-changes-panel";
@@ -161,6 +164,8 @@ export const ChatView = ({
   onPrependEvents,
   onTaskDeleted,
 }: Props) => {
+  // 右侧内置浏览器栏：开合 / 宽度记忆 / 自动展开都收在这个 hook 里（默认收起，没打开过零开销）
+  const browserPane = useChatBrowserPane(task.id);
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
@@ -1084,6 +1089,8 @@ export const ChatView = ({
               「发送前要选的上下文」，页面级入口该在页面头部。xs 尺寸 = 标题栏一行的高度，
               入口异步出现 / 消失时标题栏不跳。换工作目录就整个重挂，免得带着上一个目录的范围 / 基线 */}
           <div className="flex shrink-0 items-center gap-2">
+            {/* 内置浏览器入口（仅桌面端渲染） */}
+            <BrowserToggleButton taskId={task.id} open={browserPane.open} onToggle={browserPane.toggle} />
             <TaskChangesPanel key={`${task.id}:${task.workCwd ?? ""}`} task={task} size="xs" />
           </div>
         </div>
@@ -1098,7 +1105,7 @@ export const ChatView = ({
           别放进 page.tsx 的外层 wrapper——并列会把总高度撑出视口）；没归档时它自己返回 null */}
       <ArchivedNotice task={task} onTaskUpdate={onTaskUpdate} />
 
-      <div className="min-h-0 flex-1">
+      <ChatBrowserSplit taskId={task.id} pane={browserPane}>
         <StreamActionsProvider value={streamActions}>
         <EventStream
           key={task.id}
@@ -1142,7 +1149,7 @@ export const ChatView = ({
           }
         />
         </StreamActionsProvider>
-      </div>
+      </ChatBrowserSplit>
     </div>
     </ComposerSessionProvider>
   );

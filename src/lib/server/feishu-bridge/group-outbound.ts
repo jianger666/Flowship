@@ -6,7 +6,9 @@
  * 1. **ask 卡发群**：agent 调 ask_user → 若开了「问题同步到需求群」且该任务绑了群，
  *    把答题卡也发一份到群（跨角色答题；按钮回调是 card.action.trigger、天然只到属主本机）
  * 2. **回答回群**：群里 @bot 提的问题，边出边推一张流式卡（group-card-stream；开关 = 任务级覆盖 > 设置页
- *    全局「流式回复」），只认「最后一次工具调用之后」那段当终稿，done 时整卡换成终稿。
+ *    全局「流式回复」）。版式照私聊流式卡：正文 = **累积全文**（已收段落 + 当前段，只增不换）、
+ *    思考 / 工具进「思考与工具」折叠面板、收尾 header 变已完成 / 处理失败并带耗时 · 模型；done 时整卡定稿。
+ *    （2026-11-09 前只推 / 只发「最后一次工具调用之后」那段，卡上永远只有一句话——已撤。）
  *    不再有回复协议（2026-11-06 撤）：agent 写什么发什么，只剩首行 NO_REPLY 不发（group-silent-reply）、
  *    真人提问人开头固定 @。机器人提问人失败 / 空回答一律静默（防两个机器人互 @ 成环）。
  *    群里的文字（回答正文 / 短状态回执）一律发**文本卡**（`lark-api.sendMarkdownCardToChat`），
@@ -25,6 +27,8 @@
  */
 
 import { promises as fs } from "node:fs";
+
+import { redactSecretsInText } from "@/lib/server/event-secret-redact";
 
 import type { ShareToGroupInput } from "@/lib/server/feishu-group";
 import { getActionArtifactPath } from "@/lib/server/task-fs-core";
@@ -55,14 +59,13 @@ import {
   createGroupCardStream,
   type GroupCardStream,
 } from "./group-card-stream";
-import { isSilentGroupReply, judgeGroupReply } from "./group-silent-reply";
 import {
   acceptGroupReplyMessage,
   appendGroupReplyAnswer,
   claimGroupArtifactCard,
   closeGroupReplySegment,
-  finalGroupReplyText,
   groupQuestionQueueLength,
+  hasAnyGroupReplyText,
   hasGroupReplies,
   mentionTag,
   peekGroupReply,
@@ -76,6 +79,7 @@ import {
   setGroupQuestionDroppedHandler,
   takeGroupReplyByToken,
   truncateForGroup,
+  visibleGroupReplyText,
   type GroupQuestionDroppedReason,
   type PendingGroupReply,
 } from "./group-shared";
@@ -83,6 +87,12 @@ import {
   sendInteractiveCardToChat,
   sendMarkdownCardToChat,
 } from "./lark-api";
+import {
+  argsSummaryFromMeta,
+  renderProcess,
+  toolNameFromMeta,
+  type ProcessPart,
+} from "./outbound";
 import type { CardStreamAskQuestion } from "./types";
 
 const LOG = "[feishu-bridge/group-outbound]";
@@ -117,8 +127,11 @@ export interface GroupOutboundDeps {
   pumpGroupQuestionQueue: (taskId: string) => Promise<void>;
   /** 全局「流式回复」开关（设置页）；任务级覆盖在 isGroupStreamingEnabled 里叠加 */
   isStreamingEnabled: () => Promise<boolean>;
-  /** 建一张群答疑流式卡（按 chat_id 发到群里；首次 push 才真建卡） */
-  createGroupCardStream: (chatId: string) => GroupCardStream;
+  /** 建一张群答疑流式卡（按 chat_id 发到群里；首次 push 才真建卡）。`title` = 卡片 header 标题（任务标题） */
+  createGroupCardStream: (
+    chatId: string,
+    opts?: { title?: string },
+  ) => GroupCardStream;
 }
 
 /**
@@ -148,7 +161,8 @@ const defaultDeps = (): GroupOutboundDeps => ({
   pumpGroupQuestionQueue: (taskId) =>
     import("./group-route").then((m) => m.pumpGroupQuestionQueue(taskId)),
   isStreamingEnabled: isFeishuBridgeStreamingEnabled,
-  createGroupCardStream: (chatId) => createGroupCardStream({ chatId }),
+  createGroupCardStream: (chatId, opts) =>
+    createGroupCardStream({ chatId, title: opts?.title }),
 });
 
 let deps: GroupOutboundDeps = defaultDeps();
@@ -617,37 +631,204 @@ const replyPrefix = (entry: PendingGroupReply): string =>
 
 // ----------------- 群答疑流式卡（per 登记） -----------------
 
-/** 一条登记的流式状态：enabled = 本轮开不开流式（首个 delta 读一次定稿）；stream = 卡（判定要说话后才建） */
+/**
+ * 群答疑卡里要不要放「思考与工具」折叠面板（私聊卡有、群卡 2026-11-09 起照抄）。
+ *
+ * ⚠️ 面板内容 = agent 的思考原文 + 工具名 / 参数摘要（命令、文件路径；凭据类已脱敏），**群里所有人都看得见**，
+ * 而不只是属主——若觉得对外暴露太多，把它改成 false：卡退回「header + 正文 + footer」，不再累积 / 推送过程区。
+ */
+const GROUP_CARD_SHOW_PROCESS = true;
+/** 单段思考累积上限（防一次超长思考把内存撑大；面板里本来就只展示前 1200 字） */
+const GROUP_THINKING_TEXT_MAX = 8_000;
+
+/** 一条登记的流式状态：enabled = 本轮开不开流式（首次事件读一次定稿）；stream = 卡（判定要说话后才建） */
 type GroupStreamState = {
   enabled: boolean;
+  /** 卡片 header 标题（任务标题）与 footer 模型名（建状态时读一次） */
+  title?: string;
+  model?: string;
   stream?: GroupCardStream;
   /** 最近一次推给卡的全文（落盘版 / 同文重复帧不重复推） */
   lastPushed?: string;
+  /** 过程区（思考 / 工具）累积；没建卡前也攒，建卡时一并带上 */
+  parts: ProcessPart[];
+  /** 工具 callId → parts 下标（tool_result 回填状态用） */
+  toolIndex: Map<string, number>;
+  /** 最近一次渲染出的过程区 markdown（没变就不重复推） */
+  lastProcess?: string;
+  /** 渲染过程区时「正文是否已开始」（开放思考段在正文开始后置 completed；变化时才重渲染） */
+  answerStarted?: boolean;
 };
 
 /** 同时在飞的流式状态上限（防登记被各种路径悄悄摘掉后泄漏；超限丢最老的） */
 const GROUP_STREAM_STATES_MAX = 64;
 
-/** 这个任务的群回复要不要流式：任务级覆盖（需求群弹窗）> 全局「流式回复」；读不到按全局 */
-const isGroupStreamingEnabled = async (taskId: string): Promise<boolean> => {
+/**
+ * 这个任务的群回复要不要流式：任务级覆盖（需求群弹窗）> 全局「流式回复」；读不到按全局。
+ * 顺带读卡片 header 标题（任务标题）/ footer 模型名——同一次 getTask，不多读盘。
+ */
+const readGroupStreamConfig = async (
+  taskId: string,
+): Promise<{ enabled: boolean; title?: string; model?: string }> => {
+  let title: string | undefined;
+  let model: string | undefined;
   try {
     const task = await deps.getTask(taskId);
+    title = task?.title?.trim() || undefined;
+    model = task?.model?.id || undefined;
     const override = task?.feishuGroupStreaming;
-    if (typeof override === "boolean") return override;
+    if (typeof override === "boolean") return { enabled: override, title, model };
   } catch (err) {
     warn(`读任务级流式开关 task=${taskId}`, err);
   }
   try {
-    return await deps.isStreamingEnabled();
+    return { enabled: await deps.isStreamingEnabled(), title, model };
   } catch (err) {
     warn("读全局流式开关", err);
-    return true;
+    return { enabled: true, title, model };
+  }
+};
+
+/** 取（没有就建）一条登记的流式状态；开关 / 标题 / 模型在建状态时读一次定稿 */
+const ensureStreamState = async (
+  taskId: string,
+  entry: PendingGroupReply,
+): Promise<GroupStreamState> => {
+  const { streams } = getReg();
+  const hit = streams.get(entry.token);
+  if (hit) return hit;
+  if (streams.size >= GROUP_STREAM_STATES_MAX) {
+    const oldest = streams.keys().next().value;
+    if (oldest !== undefined) streams.delete(oldest);
+  }
+  const st: GroupStreamState = {
+    enabled: true,
+    parts: [],
+    toolIndex: new Map(),
+  };
+  streams.set(entry.token, st);
+  const cfg = await readGroupStreamConfig(taskId);
+  st.enabled = cfg.enabled;
+  st.title = cfg.title;
+  st.model = cfg.model;
+  return st;
+};
+
+/**
+ * 重渲染过程区（思考 / 工具时间线，同私聊卡的 `renderProcess`）；`force` = 建卡时无条件推一次。
+ * 没建卡时只记在状态里（建卡那刻 `force` 带上），**绝不因过程更新而建卡**（保 NO_REPLY 零消息）。
+ */
+const syncProcess = (
+  st: GroupStreamState,
+  entry: PendingGroupReply,
+  force = false,
+): void => {
+  if (!GROUP_CARD_SHOW_PROCESS) return;
+  const started = hasAnyGroupReplyText(entry);
+  st.answerStarted = started;
+  const text = renderProcess(st.parts, started);
+  if (text === st.lastProcess && !force) return;
+  st.lastProcess = text;
+  if (text || force) st.stream?.pushProcess(text);
+};
+
+/** 一条流事件里取过程区需要的几个字段（thinking / tool_call / tool_result） */
+type ProcessEventLike = {
+  kind: string;
+  text?: string;
+  meta?: Record<string, unknown> | undefined;
+};
+
+/** 把 thinking / tool_call / tool_result 累积进 parts（逻辑逐条对齐 outbound 的 handleThinking / handleToolCall / handleToolResult） */
+const applyProcessEvent = (
+  st: GroupStreamState,
+  event: ProcessEventLike,
+): void => {
+  const meta = event.meta as Parameters<typeof toolNameFromMeta>[0];
+  if (event.kind === "thinking") {
+    const text = redactSecretsInText((event.text ?? "").trim());
+    if (!text) return;
+    // SDK 会把一次连贯思考拆成多条 thinking 事件：中间没有工具调用就并进同一「思考 N」段
+    const last = st.parts.at(-1);
+    if (last?.kind === "thinking") {
+      if (last.text.length < GROUP_THINKING_TEXT_MAX) {
+        last.text = `${last.text}\n\n${text}`;
+      }
+    } else {
+      st.parts.push({ kind: "thinking", text });
+    }
+    return;
+  }
+  const callId =
+    (meta && typeof meta.callId === "string" && meta.callId) || "";
+  const name = toolNameFromMeta(meta);
+  const argsSummary = argsSummaryFromMeta(meta, event.text ?? "");
+  if (event.kind === "tool_call") {
+    const id = callId || `anon_${st.parts.length + 1}`;
+    const idx = st.toolIndex.get(id);
+    const part = idx != null ? st.parts[idx] : undefined;
+    if (part && part.kind === "tool") {
+      part.name = name;
+      part.argsSummary = argsSummary;
+      part.status = "running";
+    } else {
+      st.toolIndex.set(id, st.parts.length);
+      st.parts.push({
+        kind: "tool",
+        callId: id,
+        name,
+        argsSummary,
+        status: "running",
+      });
+    }
+    return;
+  }
+  if (event.kind === "tool_result") {
+    const ok =
+      !(meta && typeof meta.status === "string" && meta.status === "error");
+    const idx = callId ? st.toolIndex.get(callId) : undefined;
+    const part = idx != null ? st.parts[idx] : undefined;
+    if (part && part.kind === "tool") {
+      part.status = ok ? "ok" : "err";
+      // result 常不带 args——保留 call 时的摘要
+      if (argsSummary && argsSummary !== "…") part.argsSummary = argsSummary;
+    } else {
+      // 没见过 running（偶发只落 result）→ 直接追加完成行
+      st.parts.push({
+        kind: "tool",
+        callId: callId || `result_${st.parts.length + 1}`,
+        name: toolNameFromMeta(meta, "tool"),
+        argsSummary,
+        status: ok ? "ok" : "err",
+      });
+    }
   }
 };
 
 /**
- * 回答文本又长了（delta / 落盘版兜底）：把「当前要发的文本」推给流式卡。
- * 只在判定「要说话」之后才建卡（NO_REPLY / 空回复不会在群里留下卡）；一轮的开关值在首个 delta 读一次定稿。
+ * 过程事件（thinking / tool_call / tool_result）：累积进该登记的过程区，已建卡就推给卡。
+ * 只认 runTag 对得上的那条登记（属主 run 的工具调用不进同事的答疑卡）。
+ */
+const handleGroupProcessEvent = async (
+  taskId: string,
+  runTag: string | null,
+  event: ProcessEventLike,
+): Promise<void> => {
+  if (!GROUP_CARD_SHOW_PROCESS) return;
+  const entry = peekGroupReply(taskId, runTag);
+  if (!entry || entry.kind !== "question") return;
+  const st = await ensureStreamState(taskId, entry);
+  if (!st.enabled) return;
+  applyProcessEvent(st, event);
+  syncProcess(st, entry);
+};
+
+/**
+ * 回答文本又长了（delta / 落盘版兜底）：把「累积全文」（已收段落 + 当前段）推给流式卡。
+ * 只在有可见正文之后才建卡（NO_REPLY / 空回复不会在群里留下卡）；一轮的开关值在首次事件读一次定稿。
+ *
+ * 推的是**累积全文**（{@link visibleGroupReplyText}）、只增不换——和私聊流式卡一样；
+ * 此前只推「当前段」，agent 每调一次工具整句就被换掉，卡上永远只有一句话。
  */
 const streamGroupReply = async (
   taskId: string,
@@ -655,26 +836,22 @@ const streamGroupReply = async (
 ): Promise<void> => {
   const entry = peekGroupReply(taskId, runTag);
   if (!entry || entry.kind !== "question") return;
-  const { streams } = getReg();
-  let st = streams.get(entry.token);
-  if (!st) {
-    if (streams.size >= GROUP_STREAM_STATES_MAX) {
-      const oldest = streams.keys().next().value;
-      if (oldest !== undefined) streams.delete(oldest);
-    }
-    st = { enabled: true };
-    streams.set(entry.token, st);
-    st.enabled = await isGroupStreamingEnabled(taskId);
-  }
+  const st = await ensureStreamState(taskId, entry);
   if (!st.enabled) return;
-  const text = finalGroupReplyText(entry);
-  // 每次都重新判：首行没写完（可能是 NO_REPLY）先别起卡；判成沉默就不推——
-  // 已经起了卡的话，卡保持上一次推过的内容（新一段写成 NO_REPLY 不能把「NO_REPLY」字样推到群里）
-  const verdict = judgeGroupReply(text);
-  if (verdict !== "speak") return;
+  // 每次都重新判：首行没写完（可能是 NO_REPLY）先别起卡；当前段判成沉默就不显示它——
+  // 已经起了卡的话，卡保持已有内容（新一段写成 NO_REPLY 不能把「NO_REPLY」字样推到群里）
+  const text = visibleGroupReplyText(entry, false);
+  if (!text) return;
   const full = `${replyPrefix(entry)}${text}`;
+  if (!st.stream) {
+    st.stream = deps.createGroupCardStream(entry.chatId, { title: st.title });
+    // 建卡前攒下的过程区（先调了几次工具才开口）随首帧一起带上
+    syncProcess(st, entry, true);
+  } else if (st.answerStarted !== true) {
+    // 正文刚开始：过程区里「进行中」的思考段收敛成 completed
+    syncProcess(st, entry);
+  }
   if (full === st.lastPushed) return;
-  st.stream ??= deps.createGroupCardStream(entry.chatId);
   st.stream.push(full);
   st.lastPushed = full;
 };
@@ -688,8 +865,9 @@ const takeStreamState = (token: string): GroupStreamState | undefined => {
 };
 
 /**
- * question 登记收口（已 take）：按「最终段」决定群里发什么、问答卡记什么。
- * 有流式卡就把卡收尾成终稿（多余的块另发文本卡），没有就直接发文本卡。
+ * question 登记收口（已 take）：按「累积全文」（已收段落 + 当前段，见 visibleGroupReplyText）决定群里发什么、问答卡记什么。
+ * 有流式卡就把卡收尾成终稿（整份累积全文进卡、header 变已完成 / 处理失败、footer 写耗时 · 模型），
+ * 没有就切块直接发文本卡（≤3 块）。
  */
 const flushQuestionReply = async (
   taskId: string,
@@ -699,26 +877,35 @@ const flushQuestionReply = async (
   const askerIsBot = entry.requesterIsBot === true;
   const askerName = entry.requesterName.trim();
   const at = mentionTag(entry.requesterOpenId, entry.requesterName);
-  const finalText = finalGroupReplyText(entry);
-  const stream = takeStreamState(entry.token)?.stream;
+  // 累积全文（final=true：最后一段是 NO_REPLY 则整轮静默）；anyText 区分「一个字没说」与「说了但全是 NO_REPLY」
+  const finalText = visibleGroupReplyText(entry, true);
+  const anyText = hasAnyGroupReplyText(entry);
+  const streamState = takeStreamState(entry.token);
+  const stream = streamState?.stream;
   const prefix = replyPrefix(entry);
 
   let toSend: string[] = [];
+  /** 给流式卡的整份终稿（累积全文）；不给 = 第 1 块进卡、其余块另发（旧行为） */
+  let cardBody: string | undefined;
   let recorded = "";
   let noReply = false;
   let mentioned: string[] = [];
 
   if (!ok) {
     // 失败：机器人提问人一个字都不发（对端把群消息当上下文，发了就是污染 + 可能再触发它回话）；
-    // 但流式卡若已经在群里了，就让它保持已有内容收尾（不能一直挂着「生成中」）
+    // 但流式卡若已经在群里了，就让它保持已有内容收尾（不能一直挂着「生成中」）——
+    // 真人提问人：卡上保留已累积的正文，末尾补一句失败提示（红色 header / footer「处理失败」）
     if (askerIsBot) {
       recorded = BOT_FAIL_NOTE;
     } else {
       toSend = [`${at} ${GROUP_FAIL_HINT}`];
+      cardBody = finalText
+        ? `${prefix}${finalText}\n\n${at} ${GROUP_FAIL_HINT}`
+        : undefined;
       recorded = `${askerName ? `@${askerName} ` : ""}${GROUP_FAIL_HINT}`;
       mentioned = [askerName || "你"];
     }
-  } else if (!finalText) {
+  } else if (!anyText) {
     if (askerIsBot) {
       recorded = BOT_EMPTY_NOTE;
     } else {
@@ -726,12 +913,17 @@ const flushQuestionReply = async (
       recorded = `${askerName ? `@${askerName} ` : ""}${GROUP_EMPTY_HINT}`;
       mentioned = [askerName || "你"];
     }
-  } else if (isSilentGroupReply(finalText)) {
-    // agent 自己选择不回：群里零消息；原话存进问答卡供审计
+  } else if (!finalText) {
+    // agent 自己选择不回（最后一段是 NO_REPLY）：群里零消息；原话存进问答卡供审计。
+    // 若卡因更早的旁白已经起了：保持卡上已有内容、只关流式（不再追加）
     noReply = true;
-    recorded = finalText;
+    recorded = [...(entry.closedSegments ?? []), entry.answer.trim()]
+      .filter(Boolean)
+      .join("\n\n");
   } else {
     toSend = splitGroupReplyChunks(`${prefix}${finalText}`);
+    // 流式卡里放整份累积全文（卡片没有 1800 字的单条限制；超长由 group-card-stream 按飞书体积上限收紧）
+    cardBody = `${prefix}${finalText}`;
     recorded = atTagsToPlain(toSend.join("\n\n"));
     if (prefix) mentioned = [askerName || "你"];
   }
@@ -741,7 +933,12 @@ const flushQuestionReply = async (
   let sendOk = true;
   if (stream) {
     // 卡已在群里：无论成败都要收尾；toSend 为空（机器人失败 / 静默）= 保持卡上已有内容、只关流式
-    const res = await stream.finalize(toSend);
+    const res = await stream.finalize(toSend, {
+      ...(cardBody ? { body: cardBody } : {}),
+      outcome: ok ? "ok" : "failed",
+      durationMs: Math.max(0, Date.now() - entry.startedAt),
+      ...(streamState?.model ? { model: streamState.model } : {}),
+    });
     if (!res.delivered) {
       sendOk = false;
       warn(`回答回群发送失败 task=${taskId}`, res.error);
@@ -1142,10 +1339,16 @@ export const handleGroupOutboundEvent = async (
       );
       return;
     }
-    // 本 run 又调了工具 → 当前段收成「上一段」，答案只认最后一次工具调用之后的文字。
+    // 本 run 又调了工具 → 当前段收成已收段落（累积全文照旧：已收段落 + 当前段，只是分了段，NO_REPLY 按段判）；
+    // 同时把这次工具调用记进卡片的「思考与工具」过程区。
     // pi 与 Cursor SDK 两条后端的工具调用经 sdk-message-handler 统一落成 kind=tool_call
     if (ev.event.kind === "tool_call") {
       closeGroupReplySegment(taskId, runTag);
+      await handleGroupProcessEvent(taskId, runTag, ev.event);
+      return;
+    }
+    if (ev.event.kind === "thinking" || ev.event.kind === "tool_result") {
+      await handleGroupProcessEvent(taskId, runTag, ev.event);
       return;
     }
     if (ev.event.kind === "assistant_message") {

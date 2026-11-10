@@ -41,7 +41,8 @@ export const SvgViewer = (props: CodeViewerProps) => {
 
   if (effective === "image") {
     // url 在 effect 里生成：首帧先占位，别闪一下源码视图
-    return url ? <ImageViewer src={url} alt={pathBasename(props.path)} size={props.size} leading={tabs} /> : <div className="h-full" />;
+    // vector：复制图片时 SVG 要放大后再栅格化（小图标）、无固有尺寸按显示用的 300×150 兜底（见 lib/copy-image）
+    return url ? <ImageViewer src={url} alt={pathBasename(props.path)} size={props.size} leading={tabs} vector /> : <div className="h-full" />;
   }
   return <CodeViewer {...props} onDirtyChange={handleDirty} leading={tabs} />;
 };

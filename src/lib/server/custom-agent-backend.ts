@@ -81,6 +81,8 @@ import {
 
 import { dataRoot } from "./data-root";
 import { flowShipTools, invokeFlowshipTool } from "./flowship-tools";
+import { getBrowserTools } from "./browser/tools";
+import { stripImageBlocks } from "./browser/image-redact";
 import {
   buildNonOwnerToolDenied,
   NON_OWNER_TURN_ALLOWED_TOOLS,
@@ -803,6 +805,25 @@ const withNonOwnerTurnDeny = (def: ToolDefinition, taskId: string): ToolDefiniti
   } as unknown as ToolDefinition;
 };
 
+/**
+ * Flowship 工具结果 → pi ToolResult。
+ * - pi 的 execute 没有 isError 字段：失败必须**抛错**，agent-loop 才会按 isError 呈现给模型
+ *   （content 里的文案本来就是模型能自修复的话，原样作为错误信息；失败结果里不会有图片块）；
+ * - 成功结果里的 image 块原样透传：pi 的 ToolResultMessage.content 支持 ImageContent；
+ *   非视觉模型由 pi-ai 的 transformMessages 自动降级为占位文字「(tool image omitted: model does not support images)」，不会报错。
+ */
+const piToolResult = (
+  toolName: string,
+  r: Awaited<ReturnType<typeof invokeFlowshipTool>>,
+): { content: Awaited<ReturnType<typeof invokeFlowshipTool>>["content"]; details: undefined } => {
+  if (r.isError) {
+    throw new Error(
+      r.content.map((c) => (c.type === "text" ? c.text : "")).join("\n").trim() || `工具 ${toolName} 失败`,
+    );
+  }
+  return { content: r.content, details: undefined };
+};
+
 const buildCustomTools = (
   callerToken: string | undefined,
   cwd: string,
@@ -834,11 +855,35 @@ const buildCustomTools = (
                 callerToken,
                 { ...(taskId ? { taskId } : {}), ...(signal ? { signal } : {}) },
               );
-              return { content: r.content, details: undefined };
+              return piToolResult(t.name, r);
             },
           }) as unknown as ToolDefinition,
       )
     : []),
+    // 浏览器工具：不在 flowShipTools 常量里（见 buildSdkCustomTools 的同款说明），按会话追加；仍走 invokeFlowshipTool。
+    // 与上面的映射刻意分开写、不合并成一个数组再 map：tests/wait-tool.test.ts 按源码字面钉着上面那一段的形状
+    ...(callerToken
+      ? getBrowserTools({ taskId, readOnly: false }).map(
+          (t) =>
+            ({
+              name: t.name,
+              label: t.label,
+              description: t.description,
+              parameters: t.parameters,
+              // signal 接到请求上：run 被取消时 wait_for / ask_user_to_act 立刻退出（主进程也会收到 cancel）
+              execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal) =>
+                piToolResult(
+                  t.name,
+                  await invokeFlowshipTool(
+                    t,
+                    params as Record<string, unknown>,
+                    callerToken,
+                    { ...(taskId ? { taskId } : {}), ...(signal ? { signal } : {}) },
+                  ),
+                ),
+            }) as unknown as ToolDefinition,
+        )
+      : []),
     ...buildCodingToolDefs(
       cwd,
       (req, signal, c) =>
@@ -858,6 +903,9 @@ const buildCustomTools = (
   // 无 taskId（oneshot / 标题生成）没有「非属主轮」的概念，原样返回
   return taskId ? all.map((d) => withNonOwnerTurnDeny(d, taskId)) : all;
 };
+
+/** 仅供单测：直接验证 pi 自有工具（含浏览器工具）的注册与结果形状（图片透传 / 失败抛错），不起真会话 */
+export const __buildCustomToolsForTest = buildCustomTools;
 
 // ----------------- run 适配器 -----------------
 
@@ -1148,7 +1196,8 @@ export class PiRunAdapter {
             name: cached.name,
             args: cached.args,
             status: ev.isError ? "error" : "completed",
-            result: ev.result,
+            // 截图 base64 只给模型看：事件流 / 落盘 / SSE 里只留占位文字
+            result: stripImageBlocks(ev.result),
           } as unknown as SDKMessage);
           this.fireDelta({
             type: "tool-call-completed",
@@ -1157,7 +1206,10 @@ export class PiRunAdapter {
               type: cached.name === "bash" ? "shell" : cached.name,
               result: {
                 status: ev.isError ? "error" : "success",
-                value: typeof ev.result === "object" ? ev.result : { output: ev.result },
+                value:
+                  typeof ev.result === "object"
+                    ? stripImageBlocks(ev.result)
+                    : { output: ev.result },
               },
             },
           } as unknown as InteractionUpdate);

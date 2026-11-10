@@ -79,10 +79,24 @@ import {
   parseAdvanceNextArgs,
   registerAdvanceChain,
 } from "./advance-chain";
+import { getBrowserTools } from "./browser/tools";
 import { getTask, getTaskMeta, getTaskWithTailEvents } from "./task-fs";
 import { getTaskOpGeneration, writeEventAndPublish } from "./task-stream";
 
-export type FlowshipToolContent = Array<{ type: "text"; text: string }>;
+/**
+ * 工具结果内容块。`image` 目前只有 browser_screenshot 用：两条后端都原样透传给模型
+ * （Cursor SDK 的 SDKCustomToolContent 与 pi 的 ToolResult content 都原生支持 image 块）。
+ */
+export type FlowshipToolContent = Array<
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string }
+>;
+
+/** 工具结果：`isError` 让后端把它按「失败的工具调用」呈现给模型（文案仍在 content 里，是模型能自修复的话） */
+export interface FlowshipToolResult {
+  content: FlowshipToolContent;
+  isError?: boolean;
+}
 
 /**
  * 工具回调的运行时上下文（两条后端各自能给多少给多少，全可选）。
@@ -113,7 +127,7 @@ export interface FlowshipToolDef {
     args: Record<string, unknown>,
     callerToken: string | undefined,
     ctx?: FlowshipToolContext,
-  ) => Promise<{ content: FlowshipToolContent }>;
+  ) => Promise<FlowshipToolResult>;
 }
 
 const text = (t: string): { content: FlowshipToolContent } => ({
@@ -1151,7 +1165,7 @@ export const invokeFlowshipTool = async (
   args: Record<string, unknown>,
   callerToken: string | undefined,
   ctx?: FlowshipToolContext,
-): Promise<{ content: FlowshipToolContent }> => {
+): Promise<FlowshipToolResult> => {
   // 先查（带续期）再按白名单放行：wait 虽放行，也要刷新标记——否则同一轮里连调两次 30 分钟的 wait
   // 就能把固定 TTL 熬过期，之后 submit_work / ask_user / schedule 全放行（第 20 轮评审 N1）。
   // ctx.taskId 是工具构建处闭包的真任务 → 续期；args.task_id 是模型自己填的 → 只查不续
@@ -1205,7 +1219,10 @@ export const buildSdkCustomTools = (
           ...(opts.waitScope ? { scope: opts.waitScope } : {}),
         }
       : undefined;
-  for (const t of flowShipTools) {
+  // 浏览器工具不进 flowShipTools 常量（它是静态清单、不少测试按它的长度 / 名字断言）：
+  // 按会话动态追加——只有桌面壳在、有 taskId 才有；到这里一定是正式会话（readOnly / oneshot 没有 callerToken、不会调本函数）
+  const browserTools = getBrowserTools({ taskId: opts?.taskId, readOnly: false });
+  for (const t of [...flowShipTools, ...browserTools]) {
     tools[t.name] = {
       description: t.description,
       inputSchema: typeBoxToJsonSchema(t.parameters),
@@ -1220,7 +1237,8 @@ export const buildSdkCustomTools = (
             callerToken,
             ctx,
           );
-          return { content: r.content };
+          // content 原样透传（含 image 块）；isError 只在为真时带上，保持旧工具的回包形状不变
+          return { content: r.content, ...(r.isError ? { isError: true } : {}) };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[flowship-tools] 工具 ${t.name} 执行抛错、已转成 isError 回包：`, msg);

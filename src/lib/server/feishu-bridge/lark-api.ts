@@ -729,7 +729,7 @@ export const toCardMarkdown = (text: string): string => {
 /** 会话列表 / 推送预览的摘要长度（卡片默认预览是「[卡片]」，看不出说了什么） */
 const CARD_SUMMARY_MAX = 50;
 
-const summarizeForCard = (text: string): string =>
+export const summarizeForCard = (text: string): string =>
   Array.from(
     text
       .replace(/<at user_id="[^"<>\s]*">([^<>]*)<\/at>/g, "@$1")

@@ -189,7 +189,9 @@ describe("ask_user 工具 / dispatchAskUser（真 dispatch）", () => {
     return { id, token, notifier };
   };
   const askTool = () => flowShipTools.find((t) => t.name === "ask_user")!;
-  const textOf = (r: { content: Array<{ text: string }> }) => r.content.map((c) => c.text).join("\n");
+  // content 现在是 text | image 的联合（browser_screenshot 会带图），这里只关心文字块
+  const textOf = (r: { content: Array<{ type: string; text?: string }> }) =>
+    r.content.map((c) => c.text ?? "").join("\n");
 
   it("questions 缺失 / 空数组 → 不登记、不通知、文案点名并明确「不要去执行 curl」（改前：登记 + ASK_SUBMITTED）", async () => {
     const { id, token, notifier } = await setup();

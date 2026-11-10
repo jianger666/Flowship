@@ -223,7 +223,9 @@ describe("详情页接线契约", () => {
     expect(chat).toContain('import { ArchivedNotice } from "@/components/tasks/archived-bar"');
     const header = chat.indexOf('<div className="border-b px-6 py-2.5">');
     const at = chat.indexOf(notice);
-    const body = chat.indexOf('<div className="min-h-0 flex-1">');
+    // 内容区的锚点：原来是裸的 <div className="min-h-0 flex-1">，加内置浏览器右栏后换成了 ChatBrowserSplit
+    // （它内部自带同一层 min-h-0 flex-1 容器）。锚点只用来定位「内容区从哪开始」，要保护的是「提示条在标题栏之后、内容区之前」
+    const body = chat.indexOf("<ChatBrowserSplit taskId={task.id} pane={browserPane}>");
     expect(header).toBeGreaterThan(-1);
     expect(at).toBeGreaterThan(header);
     expect(body).toBeGreaterThan(at);

@@ -59,6 +59,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   repos: [],
   jumpIde: "cursor",
   submitShortcut: "mod-enter",
+  // 网页链接 / 本地 HTML：默认内置浏览器
+  linkOpenMode: "builtin",
   gitToken: "",
   // 留空 = 运行时回退内置兜底（feature/{storyId}-{taskTitle}）、不再预填进设置页
   branchTemplate: "",
@@ -90,6 +92,16 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   feishuGroupBotsEqualRights: false,
   // 团队规范总开关：默认开（日常注入 knowledge）；显式 false 才关
   teamKnowledgeEnabled: true,
+  // 内置浏览器：evaluate / 录输入值都默认关（只认显式 true）
+  browserEvaluateEnabled: false,
+  browserRecordInputValues: false,
+  // 内置浏览器增强包 E2（契约 §15）：登录态读写 / 页面权限默认关；本机证书放行 / 网络响应体读取 / 高级调试工具组默认开；标签上限 20
+  browserStorageAccess: false,
+  browserPagePermissions: false,
+  browserTrustLoopbackCerts: true,
+  browserNetworkBodyRead: true,
+  browserAdvancedTools: true,
+  browserMaxTabs: 20,
   // 公司环境：默认空（设置页「环境配置」填写；运行时同步 company-env.json）
   companyEnv: emptyCompanyEnv(),
 };
@@ -238,6 +250,8 @@ export const normalizeSettings = (
     // 提交快捷键：旧配置没有 / 手改坏时回退当前默认行为
     submitShortcut:
       parsed.submitShortcut === "enter" ? "enter" : "mod-enter",
+    // 链接打开方式：只认显式 "system"，缺省 / 手改坏都是内置
+    linkOpenMode: parsed.linkOpenMode === "system" ? "system" : "builtin",
     // V0.6.1 加：ship PAT 明文存（用户拍板可接受）；host 不进 settings
     gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",
     // V0.6.7：全局默认分支命名模板；V0.12.x 起留空合法（运行时回退内置兜底）
@@ -292,6 +306,21 @@ export const normalizeSettings = (
     feishuGroupBotsEqualRights: parsed.feishuGroupBotsEqualRights === true,
     // 团队规范总开关：缺省 / 非 false → true（显式 false 才关）
     teamKnowledgeEnabled: parsed.teamKnowledgeEnabled !== false,
+    // 内置浏览器两个开关：只认显式 true（缺省 / 坏值 → 关）
+    browserEvaluateEnabled: parsed.browserEvaluateEnabled === true,
+    browserRecordInputValues: parsed.browserRecordInputValues === true,
+    browserStorageAccess: parsed.browserStorageAccess === true,
+    browserPagePermissions: parsed.browserPagePermissions === true,
+    browserTrustLoopbackCerts: parsed.browserTrustLoopbackCerts !== false,
+    browserNetworkBodyRead: parsed.browserNetworkBodyRead !== false,
+    browserAdvancedTools: parsed.browserAdvancedTools !== false,
+    browserMaxTabs:
+      typeof parsed.browserMaxTabs === "number" &&
+      Number.isInteger(parsed.browserMaxTabs) &&
+      parsed.browserMaxTabs >= 5 &&
+      parsed.browserMaxTabs <= 60
+        ? parsed.browserMaxTabs
+        : 20,
     // 公司环境：缺 / 坏 → 空配置（不挡启动）
     companyEnv: normalizeCompanyEnv(parsed.companyEnv),
   };

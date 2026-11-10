@@ -20,13 +20,17 @@ import {
   compactionEventText,
 } from "@/lib/compaction-display";
 import {
+  CURSOR_CUSTOM_TOOLS_SERVER,
   extractSubagentCallArgs,
+  isCursorBrowserCall,
+  toBrowserDisplayCall,
   toSubagentDisplayCall,
   toWaitDisplayCall,
   type SubagentDisplayLookup,
 } from "@/lib/cursor-subagent-display";
 import { appendThinkingText } from "@/lib/thinking-live";
 
+import { redactBrowserToolCallMessage } from "./browser/redact-args";
 import { appendEvent, getTask, patchActionIfOwner } from "./task-fs";
 import { newEventId } from "./task-fs-core";
 import { redactSecretsInText } from "./event-secret-redact";
@@ -417,6 +421,8 @@ const emitToolResult = async (
   origin?: string,
   /** 消音审计：事件照常落盘但带 muted 标记、UI 不渲染 */
   muted?: boolean,
+  /** 展示改写前的 MCP 外壳身份（仅浏览器工具；见 handleSdkMessage 里的 browserStatusFrom）——判 status 用 */
+  statusFrom?: { rawName: string; args?: unknown },
 ): Promise<void> => {
   try {
     const meta = await buildToolResultMeta({
@@ -426,6 +432,7 @@ const emitToolResult = async (
       args: msg.args,
       result: msg.result,
       msgStatus: msg.status,
+      statusFrom,
     });
     // 代表性插桩——tool_result 构建 await 之后、写事件复查之前
     await failpoint("sdkmsg.beforeEventWrite");
@@ -893,18 +900,45 @@ export const handleSdkMessage = async (
   // Cursor 的 `subagent` 自定义工具（MCP 外壳）改写成与 pi / 原生同形的 `task`，
   // 子代理卡片、状态行、model / effort 徽标才认得出；`wait` 同理改写成扁平的 `wait`
   // （状态行「等待中」+ 跳过按钮、工具块摘要按名字认它）。其它消息原样（同一引用）
+  // 浏览器工具（browser_type / browser_fill_form / browser_press_key …）的明文入参在这里一次性脱敏成
+  // `[已隐藏 N 字符]`（R1-02）：这是 SDK（Cursor）与 pi 两条路径的共同咽喉，下面 tool_call 事件的三处写入
+  //（askSeen 消音审计的 appendEvent、artifact 写入的 writeEv、普通 running 的 writeEv）以及 SSE 广播、
+  // 飞书回流、事件流摘要读到的都是脱敏后的 args。只改展示 / 落盘用的副本，工具真实入参（模型与 SDK 手里的）不动。
   const msg: SDKMessage =
     rawMsg.type === "tool_call"
-      ? toWaitDisplayCall(
-          toSubagentDisplayCall(rawMsg, {
-            parentModel: assistantCtx.subagentParentModel,
-            ...assistantCtx.subagentDisplayLookup,
-          }),
+      ? redactBrowserToolCallMessage(
+          // browser_* 先拆 MCP 外壳成扁平 `browser_xxx`（折叠行摘要按名字认它）再脱敏：redact 两种形态都认，顺序不影响安全
+          toBrowserDisplayCall(
+            toWaitDisplayCall(
+              toSubagentDisplayCall(rawMsg, {
+                parentModel: assistantCtx.subagentParentModel,
+                ...assistantCtx.subagentDisplayLookup,
+              }),
+            ),
+          ),
         )
       : rawMsg;
   // 入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
   const stillCurrent = lease;
   if (!stillCurrent()) return;
+  // 浏览器工具的 tool_result：展示名保持上面改写出的扁平 `browser_xxx`（工具块的名字取 tool_result.meta.name 优先，
+  // 折叠行摘要按 `browser_` 前缀认它），但 status 要按**改写前**的 MCP 外壳身份判——Cursor 信封里工具级失败是
+  // status:"success" + value.isError:true，只有认得出 MCP 名才会落成 error（R2-01）。只传 server / tool 两个名字，不带入参。
+  const browserStatusFrom =
+    rawMsg.type === "tool_call" && isCursorBrowserCall(rawMsg)
+      ? {
+          rawName: "mcp",
+          args: {
+            providerIdentifier: CURSOR_CUSTOM_TOOLS_SERVER,
+            toolName: (rawMsg.args as Record<string, unknown>).toolName,
+          },
+        }
+      : undefined;
+  const emitResult = (
+    m: Extract<SDKMessage, { type: "tool_call" }>,
+    muted?: boolean,
+  ): Promise<void> =>
+    emitToolResult(taskId, m, stillCurrent, origin, muted, browserStatusFrom);
   // 非 assistant 消息可能触发任何事件写入——先冲已缓冲的 delta 保住时序
   //（assistant 分支不冲：连续文本 chunk 要合并进同一帧）
   if (msg.type !== "assistant") flushPendingAssistantDeltas(taskId);
@@ -1038,9 +1072,9 @@ export const handleSdkMessage = async (
             }, stillCurrent),
           );
         } else if (msg.status === "error") {
-          await emitToolResult(taskId, msg, stillCurrent, origin, true);
+          await emitResult(msg, true);
         } else if (msg.status === "completed") {
-          await emitToolResult(taskId, msg, stillCurrent, origin, true);
+          await emitResult(msg, true);
           maybeClearAskSeenAfterWaitReply(assistantCtx, msg);
         }
         break;
@@ -1090,11 +1124,11 @@ export const handleSdkMessage = async (
           break;
         }
         if (msg.status === "error") {
-          await emitToolResult(taskId, msg, stillCurrent, origin);
+          await emitResult(msg);
           break;
         }
         // 写成功：先落 tool_result（给前端看 diff/摘要），再刷 artifact 面板
-        await emitToolResult(taskId, msg, stillCurrent, origin);
+        await emitResult(msg);
         {
           const m = normalizedTarget.match(/actions\/(\d+)-[a-z]+\.md$/);
           if (m) {
@@ -1172,10 +1206,10 @@ export const handleSdkMessage = async (
           }),
         );
       } else if (msg.status === "error") {
-        await emitToolResult(taskId, msg, stillCurrent, origin);
+        await emitResult(msg);
       } else if (msg.status === "completed") {
         // Phase 1：completed 结果落盘（此前完全忽略 → shell/read 输出用户看不见）
-        await emitToolResult(taskId, msg, stillCurrent, origin);
+        await emitResult(msg);
         maybeClearAskSeenAfterWaitReply(assistantCtx, msg);
       }
 

@@ -125,6 +125,13 @@ import {
   type DepPrepareEntry,
   type EnsureWorktreesOptions,
 } from "./task-worktrees";
+import {
+  buildBranchDriftNotice,
+  describeBranchDrift,
+  detectBranchDrift,
+  TaskBranchGuardError,
+  type BranchDrift,
+} from "./task-branch-guard";
 import { summarizeDepDirs } from "./worktree-deps";
 import { repoTail, sameRepoPathList } from "@/lib/path-utils";
 import {
@@ -304,6 +311,7 @@ import {
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import { TASK_RESUME_HINT, resumeHintFor } from "@/lib/stop-copy";
 import { supersedePendingAsks } from "./ask-supersede";
+import { closeBrowserSession } from "./browser/bridge";
 
 /**
  * V1：在途请求是否已因 stop/DELETE/finalize 作废。
@@ -2394,6 +2402,9 @@ export const archiveTaskWithReport = async (
       (n) => `会话已归档，${n} 个定时一并取消（取消归档时会恢复）`,
       { restorable: true },
     );
+    // 内置浏览器会话（标签页 / 登录态之外的运行时：视图、CDP、缓冲）随归档释放；best-effort、无桌面壳时无操作。
+    // 放在取消定时之后、早退分支之前：chat / 非 worktree 的早退路径同样要释放
+    closeBrowserSession(taskId);
     // 非任务模式 / 非隔离工作区任务：只翻标记（chat 沿用“后台继续跑”语义）
     // （条件字面保持原样：tests/schedule-wiring-contract 钉着「取消定时在这个早退之前」）
     if (task.mode === "chat" || !isWorktreeTask(task)) {
@@ -3269,6 +3280,101 @@ export const ensureWorkspaceReady = async (
   }
   if (!isWorktreeTask(task)) return;
   await ensureTaskWorktrees(task, lease, opts);
+};
+
+/** 切回失败的 git 明细只留第一行、限长（toast / 队列丢弃事件都是单行展示） */
+const firstLineOf = (text: string, max = 240): string => {
+  const line = text.split("\n").find((l) => l.trim()) ?? "";
+  const t = line.trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+};
+
+/**
+ * 用户的话 / ask 答复 / 推进续接送进**存活会话**之前，确认仓库还在任务分支上。
+ *
+ * 为什么需要（用户反馈）：用户在 IDE 里把仓库切到 master、回 Flowship 让 AI 改代码，AI 直接在 master 上改了。
+ * 起 agent 的路径（推进 / 唤醒 / resume）都会先 ensure 分支，但给活会话 send 一条消息不会——会话活着、cwd 没变，
+ * 分支被切走了没人知道。见 task-branch-guard.ts 头注释。
+ *
+ * 三种仓的处置（口径定义见 {@link BranchGuardMode}）：
+ * - worktree（隔离任务）/ testing（测试任务）：runner 硬切回（复用推进路径同一份实现、有未提交改动会拒绝），
+ *   切完写一条 info 让用户看到发生了什么；切不回来 → 抛 {@link TaskBranchGuardError}、这条消息不送给 AI
+ *   （宁可让用户先处理，也不带病让 AI 在错分支上改代码）
+ * - in-place（原仓直跑）：不替用户切，返回一段提醒由调用方附在消息末尾（软约束）
+ *
+ * 只读探测失败 / 没有任何仓需要管 → 直接放行（热路径每仓一条 `git rev-parse`）。
+ *
+ * @param lease 失主（stop / 重发等）→ 抛 {@link WorktreeLeaseLostError}，调用方按「stale」让位
+ * @returns 需要附在消息末尾的提醒；无漂移 / 已硬切回 → undefined
+ */
+export const guardTaskBranchForUserTurn = async (
+  task: Task,
+  lease: () => boolean,
+): Promise<string | undefined> => {
+  let drifts: BranchDrift[];
+  try {
+    drifts = await detectBranchDrift(task);
+  } catch (err) {
+    // 探测是纯只读的尽力护栏：探不出来不挡发送（推进 / 唤醒路径仍会硬校验）
+    console.warn(`[task-runner] 分支漂移探测失败（放行）task=${task.id}`, err);
+    return undefined;
+  }
+  if (drifts.length === 0) return undefined;
+  if (!lease()) throw new WorktreeLeaseLostError();
+
+  const hard = drifts.filter((d) => d.mode !== "in-place");
+  const soft = drifts.filter((d) => d.mode === "in-place");
+
+  if (hard.length > 0) {
+    const summary = hard.map(describeBranchDrift).join("；");
+    try {
+      if (hard.some((d) => d.mode === "worktree")) {
+        // 与推进 / resume 同一个入口：flowship 选择下会 hot checkout 回任务分支、失败抛带 git 原因的错
+        await ensureTaskWorktrees(task, lease, { deferDepClone: true });
+      }
+      if (hard.some((d) => d.mode === "testing")) {
+        const infos = await prepareTestingTaskBranches(task, lease);
+        for (const info of infos) await upsertGitBranch(task.id, info, lease);
+      }
+      // 切完复核一次：ensure 里有「找不到分支就跳过」等宽松分支，不能让它悄悄变成没切却放行
+      const remaining = (await detectBranchDrift(task)).filter(
+        (d) => d.mode !== "in-place",
+      );
+      if (remaining.length > 0) {
+        throw new Error(
+          `切回后仍不在任务分支：${remaining.map(describeBranchDrift).join("；")}`,
+        );
+      }
+    } catch (err) {
+      if (
+        err instanceof WorktreeLeaseLostError ||
+        err instanceof TestingBranchLeaseLostError
+      ) {
+        throw new WorktreeLeaseLostError();
+      }
+      const reason = firstLineOf(err instanceof Error ? err.message : String(err));
+      console.warn(
+        `[task-runner] 发送前切回任务分支失败 task=${task.id}（${summary}）：${reason}`,
+      );
+      throw new TaskBranchGuardError(
+        `发送前检测到仓库被切到了别的分支（${summary}），自动切回失败：${reason}。` +
+          "为避免 AI 在错误的分支上改代码，这次内容没有送给 AI——请先把仓库切回任务分支（或处理未提交的改动），再重新发送。",
+      );
+    }
+    await writeOwnedEventAndPublish(task.id, lease, {
+      kind: "info",
+      text: `检测到仓库被切到了别的分支（${summary}），已自动切回任务分支再继续`,
+    }).catch(() => {});
+  }
+
+  if (soft.length === 0) return undefined;
+  const notice = buildBranchDriftNotice(soft);
+  if (!notice) return undefined;
+  await writeOwnedEventAndPublish(task.id, lease, {
+    kind: "info",
+    text: `检测到仓库当前分支与任务分支不一致（${soft.map(describeBranchDrift).join("；")}），已提醒 AI 改代码前先切回任务分支`,
+  }).catch(() => {});
+  return notice;
 };
 
 /**
@@ -5943,11 +6049,19 @@ export const deliverAskReply = async (
   creds?: SessionCreds,
   /** 路由入场 admission token；缺省则 send 入口同步取 */
   opGen?: number,
+  /** 路由已在 fulfillAskWait 之前守过分支（guardTaskBranchForUserTurn）、这里别再守一遍 */
+  skipBranchGuard?: boolean,
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
     task,
     buildAgentMessage({ kind: "user_reply", text: replyText, imagePaths }),
-    { errorActionId, creds, runKind: "task-ask-reply", opGen },
+    {
+      errorActionId,
+      creds,
+      runKind: "task-ask-reply",
+      opGen,
+      ...(skipBranchGuard ? { skipBranchGuard: true } : {}),
+    },
   );
 
 /**
@@ -5984,6 +6098,8 @@ export const deliverTaskQuestion = async (
     /** 发言人 open_id：机器人变体提示词里给出 @ 标签的写法 */
     openId?: string;
   },
+  /** 调用方已在更早处守过分支（见 guardTaskBranchForUserTurn）、这里别再守一遍 */
+  skipBranchGuard?: boolean,
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
     task,
@@ -6013,13 +6129,20 @@ export const deliverTaskQuestion = async (
           : {}),
     }),
     ackContext
-      ? { creds, errorActionId: ackContext.actionId, opGen, timing }
+      ? {
+          creds,
+          errorActionId: ackContext.actionId,
+          opGen,
+          timing,
+          ...(skipBranchGuard ? { skipBranchGuard: true } : {}),
+        }
       : {
           creds,
           questionRun: true,
           opGen,
           timing,
           ...(groupNonOwner?.guard ? { nonOwnerTurn: true } : {}),
+          ...(skipBranchGuard ? { skipBranchGuard: true } : {}),
         },
   );
 
@@ -6506,6 +6629,8 @@ const sendToTaskSession = async (
     timing?: (entry: string) => void;
     /** 本轮由群里非属主触发且提示词开关开：send 前登记按轮次标记，系统工具硬拒（见 non-owner-turn-guard） */
     nonOwnerTurn?: boolean;
+    /** 调用方已自己做过 guardTaskBranchForUserTurn（ask-reply 路由在 fulfillAskWait 之前就守过）：别再守一遍、免得 in-place 提醒附两次 */
+    skipBranchGuard?: boolean;
   } = {},
 ): Promise<SendTaskSessionResult> => {
   // admission 在进 runWithTaskSendSerial 之前同步捕获——
@@ -6534,6 +6659,7 @@ const sendToTaskSessionBody = async (
     /** 分节计时收集器（deliver 子阶段透出给 question-timing） */
     timing?: (entry: string) => void;
     nonOwnerTurn?: boolean;
+    skipBranchGuard?: boolean;
   },
 ): Promise<SendTaskSessionResult> => {
   // 由 sendToTaskSession 入口传入（禁止出队后自取 opGen / observer）
@@ -6654,6 +6780,21 @@ const sendToTaskSessionBody = async (
       }
       return "stale";
     }
+    // 存活会话：送之前确认仓库仍在任务分支（用户可能在 IDE 里切走了——见 guardTaskBranchForUserTurn）。
+    // 本轮刚 resume 的会话不用再看：resumeTaskSession 里 ensureWorkspaceReady 刚硬校验过。
+    // 非属主轮（群里别人的提问）不碰：它只答疑、不该顺手动属主的仓库；也不会走到改代码。
+    // 放在登记非属主标记 / agent.send 之前——抛错 / 让位时没有任何需要回滚的状态，活会话原样留着。
+    let branchNotice: string | undefined;
+    if (!resumedThisCall && !opts.nonOwnerTurn && !opts.skipBranchGuard) {
+      try {
+        branchNotice = await guardTaskBranchForUserTurn(task, () => !entryLost());
+      } catch (err) {
+        if (err instanceof WorktreeLeaseLostError) return "stale";
+        throw err;
+      }
+      if (entryLost()) return "stale";
+    }
+    const sendText = branchNotice ? `${text}\n\n${branchNotice}` : text;
     const agent = session.agent as AgentInstance;
     // 受理时记下 session instanceId——后续关会话 / restore 按号门控
     const mySessionInstanceId = session.instanceId;
@@ -6686,11 +6827,11 @@ const sendToTaskSessionBody = async (
         taskId: task.id,
         agentId: agent.agentId,
         runKind,
-        promptBytes: Buffer.byteLength(text, "utf-8"),
+        promptBytes: Buffer.byteLength(sendText, "utf-8"),
       });
       run = await markTimed("agentSend", () =>
         withSdkDeadline(
-          agent.send(text, {
+          agent.send(sendText, {
             onDelta: composeOnDelta(
               perfTracker.onDelta,
               // 续接 / 问一问 send 绑入场 opHandle

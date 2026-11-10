@@ -64,7 +64,7 @@ const warn = (msg: string, err?: unknown): void => {
  * 会话绑定的自定义提供方已被删除 → 返回 `{ danglingProvider }`（调用方据此拒投、写明原因），
  * 不能照常 bootArgsForTask：它会落回 Cursor 凭据、定时消息（含会话上下文）悄悄走云端（第四轮 Q2-02）。
  */
-const loadBootArgs = async (
+export const loadBootArgs = async (
   task: NonNullable<Awaited<ReturnType<typeof getTaskMeta>>>,
 ): Promise<
   | { apiKey: string; model: { id: string; params?: Array<{ id: string; value: string }> } }

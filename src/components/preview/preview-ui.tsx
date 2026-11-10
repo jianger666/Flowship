@@ -42,21 +42,25 @@ export const PreviewToolbar = ({
 export const ToolButton = ({
   label,
   shortcut,
+  tooltip,
   onClick,
   active,
   disabled,
   children,
   className,
 }: {
+  /** aria-label；没有 `tooltip` 时也是 hover 提示 */
   label: string;
   shortcut?: string;
+  /** hover 提示文案（缺省 = label）。aria-label 仍是 label——提示可以随状态变（如「当前环境不支持…」），读屏名字不变 */
+  tooltip?: string;
   onClick: () => void;
   active?: boolean;
   disabled?: boolean;
   children: ReactNode;
   className?: string;
-}) => (
-  <Tooltip content={shortcut ? `${label}（${shortcut}）` : label}>
+}) => {
+  const button = (
     <Button
       type="button"
       variant="ghost"
@@ -69,8 +73,20 @@ export const ToolButton = ({
     >
       {children}
     </Button>
-  </Tooltip>
-);
+  );
+  const text = tooltip ?? label;
+  return (
+    <Tooltip content={shortcut ? `${text}（${shortcut}）` : text}>
+      {/* 置灰的 <button> 带 disabled:pointer-events-none，自己收不到 hover，提示永远弹不出来；
+          套一层 span 当 trigger（hover 落在 span 上），置灰按钮才能解释「为什么不能点」。
+          ⚠ 是否套 span 只看调用点「有没有传 disabled」（!== undefined），不看它此刻是真是假：trigger 元素在
+          span ↔ button 之间来回换，Base UI 的 hover 监听还绑在被卸掉的旧节点上，提示会永久失效
+          （真 Chromium 实测：图片先「加载中（置灰）」后「可点」，提示再也弹不出来）。
+          所以传了 disabled 的调用点要一直传 boolean（别写成 `disabled={x || undefined}`）；从不传的调用点 DOM 与以前一样 */}
+      {disabled !== undefined ? <span className="inline-flex">{button}</span> : button}
+    </Tooltip>
+  );
+};
 
 /** 带文字的小按钮（保存 / 放弃 / 编辑 …） */
 export const TextButton = ({

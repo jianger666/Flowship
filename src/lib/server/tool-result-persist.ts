@@ -10,6 +10,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { isBrowserToolName } from "@/lib/browser-tool-display";
 import { RESERVED_MCP_NAMES } from "@/lib/mcp-config";
 import { isMcpToolName } from "@/lib/mcp-tool-name";
 import { humanizeToolErrorText } from "@/lib/tool-error-text";
@@ -19,6 +20,7 @@ import {
   getEventRedactionReplacements,
   redactSecretsInText,
 } from "./event-secret-redact";
+import { stripImageBlocks } from "./browser/image-redact";
 import { stringifyMeta } from "./task-stream";
 import { DELETED_TOMBSTONE_FILE, taskDir, TOOL_OUTPUTS_DIR } from "./task-fs-core";
 import { normalizeToolName } from "./normalize-tool-name";
@@ -533,6 +535,10 @@ export const extractToolOutputText = (
   if (result == null) return "";
   if (typeof result === "string") return humanizeToolErrorText(result) || result;
 
+  // 截图 base64（browser_screenshot）不进事件流 / 落盘文件：下面不少分支会 JSON.stringify 整个结果，
+  // 一张图就是几百 KB。stripImageBlocks 没有图片时原样返回同一引用，对其它工具零影响
+  result = stripImageBlocks(result);
+
   const env = asRecord(result) as ResultEnvelope | null;
   if (!env) return stringifyMeta(result);
 
@@ -741,8 +747,12 @@ export const resolveToolResultStatus = (
   if (msgStatus === "error") return "error";
   const env = asRecord(result) as ResultEnvelope | null;
   if (env?.status === "error") return "error";
+  // MCP 的工具级失败（`value.isError`）：Cursor 的信封是 status:"success" + value.isError:true，只有这一位能看出失败。
+  // 浏览器工具的扁平名（`browser_xxx`）也按 MCP 形态认（R2-01）：Cursor 路径下展示层会把 MCP 外壳拆成扁平名再落事件，
+  // 名字一变就认不出 MCP、失败的浏览器操作被落成 success。不会产生假阳性——pi 路径的扁平名结果没有 value 信封，
+  // 且这里只在 `isError === true` 时才判 error。
   if (
-    isMcpToolName(toolName) &&
+    (isMcpToolName(toolName) || isBrowserToolName(toolName)) &&
     env?.value &&
     env.value.isError === true
   ) {
@@ -942,6 +952,13 @@ type InlineBuildArgs = {
   args?: unknown;
   result?: unknown;
   msgStatus: string;
+  /**
+   * 展示改写**之前**的调用身份（只放 MCP 外壳的 `{ rawName:"mcp", args:{providerIdentifier, toolName} }`，不放任何入参）。
+   * 传了就用它归一出的名字判 status：展示层会把浏览器工具的 MCP 外壳拆成扁平 `browser_xxx`（工具块的名字取
+   * tool_result.meta.name 优先，折叠行摘要按 `browser_` 前缀认它，所以 meta.name 必须保持扁平），
+   * 而 `value.isError` 的判定以 MCP 名为前提（R2-01）。不传 = 与 rawName / args 同一份。
+   */
+  statusFrom?: { rawName: string; args?: unknown };
 };
 
 type BuildArgs = InlineBuildArgs & {
@@ -964,6 +981,16 @@ const resolveResultToolName = (input: InlineBuildArgs): string => {
     },
   });
 };
+
+/** 判 status 用的工具名：有 statusFrom（展示改写前的身份）用它，否则与展示名同一份 */
+const resolveStatusToolName = (input: InlineBuildArgs, displayName: string): string =>
+  input.statusFrom
+    ? resolveResultToolName({
+        ...input,
+        rawName: input.statusFrom.rawName,
+        args: input.statusFrom.args,
+      })
+    : displayName;
 
 /**
  * 按绝对路径读落盘文件：只认「本次调用应有的那个文件」，对不上直接 null。
@@ -1013,7 +1040,11 @@ export const buildToolResultMeta = async (
 ): Promise<ToolResultMeta> => {
   const name = resolveResultToolName(input);
 
-  const status = resolveToolResultStatus(input.msgStatus, name, input.result);
+  const status = resolveToolResultStatus(
+    input.msgStatus,
+    resolveStatusToolName(input, name),
+    input.result,
+  );
   // 抽文本按 SDK 原始工具名（shell/read/edit…）；MCP 走 stringify 兜底
   const outputText = extractToolOutputText(input.rawName, input.result);
   // shell 预览取头 + 尾（报错常在尾部）；其余工具只取头部
@@ -1060,7 +1091,11 @@ export const buildInlineToolResultMeta = (
   input: InlineBuildArgs,
 ): ToolResultMeta => {
   const name = resolveResultToolName(input);
-  const status = resolveToolResultStatus(input.msgStatus, name, input.result);
+  const status = resolveToolResultStatus(
+    input.msgStatus,
+    resolveStatusToolName(input, name),
+    input.result,
+  );
   const outputText = extractToolOutputText(input.rawName, input.result);
   const persisted =
     utf8ByteLength(outputText) > TOOL_RESULT_OUTPUT_LIMIT

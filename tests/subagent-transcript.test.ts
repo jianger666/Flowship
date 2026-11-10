@@ -123,6 +123,31 @@ describe("记：消息 → 和主事件流同形的 TaskEvent", () => {
     expect(result.meta).toMatchObject({ callId: "c1", name: "read", status: "success" });
   });
 
+  it("浏览器工具明文入参不落进转录（text 摘要 / meta.args / 落盘文件都查；Cursor SDK 外壳与扁平名两种形状）；非浏览器工具原样", async () => {
+    const taskId = await freshTask();
+    const h = startSubagentRun(baseInit(taskId));
+    const SECRET = "PW-Zk9!hunter2-明文";
+    h.onMessage({ type: "tool_call", call_id: "b1", name: "browser_type", args: { ref: "e7", text: SECRET, secret: true }, status: "running" });
+    h.onMessage({
+      type: "tool_call",
+      call_id: "b2",
+      name: "mcp",
+      args: { providerIdentifier: "custom-user-tools", toolName: "browser_fill_form", args: { fields: [{ ref: "e3", value: SECRET }] } },
+      status: "running",
+    });
+    h.onMessage(toolCall("c1", "running", { args: { path: "src/auth/login.ts" } }));
+    const snap = (await getSubagentRunSnapshot(taskId, { key: h.key }))!;
+    expect(JSON.stringify(snap.events)).not.toContain(SECRET);
+    expect(String(snap.events.find((e) => e.meta?.callId === "b1")!.meta?.args)).toContain("e7"); // ref 这类无害字段保留
+    expect(String(snap.events.find((e) => e.meta?.callId === "c1")!.meta?.args)).toContain("src/auth/login.ts");
+    h.finish({ status: "done", result: "好了" });
+    await __flushSubagentRunWritesForTests();
+    const file = path.join(taskDir(taskId), "subagent-runs", `${h.key}.json`);
+    const onDisk = await fs.readFile(file, "utf-8");
+    expect(onDisk).not.toContain(SECRET);
+    expect(onDisk).toContain("browser_type"); // 事件本身还在，只是入参被脱敏
+  });
+
   it("工具报错 → tool_result.status=error", async () => {
     const taskId = await freshTask();
     const h = startSubagentRun(baseInit(taskId));

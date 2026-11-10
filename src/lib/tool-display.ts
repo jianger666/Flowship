@@ -17,6 +17,7 @@ import { isAbsolutePathLike } from "@/lib/path-utils";
 import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
 import { SCHEDULE_TOOL_NAME, scheduleToolSummary } from "@/lib/schedule";
 import { WAIT_TOOL_NAME, waitToolSummary } from "@/lib/wait-display";
+import { browserToolSummary, isBrowserToolName } from "@/lib/browser-tool-display";
 
 /** SSE ephemeral：不进 task.events / 不进持久 rows */
 export const isEphemeralToolOutputDelta = (ev: TaskEvent): boolean =>
@@ -1351,6 +1352,12 @@ export const toolBlockSummary = (block: ToolBlock): string => {
   if (n === SCHEDULE_TOOL_NAME) {
     const scheduleSummary = scheduleToolSummary(block.args);
     if (scheduleSummary) return scheduleSummary;
+  }
+
+  // 内置浏览器工具：把入参翻成人话（点击 e12 / 打开 host/path），解析不出就回落到通用逻辑
+  if (isBrowserToolName(n)) {
+    const browserSummary = browserToolSummary(n, block.args);
+    if (browserSummary) return browserSummary;
   }
 
   // edit / write：路径 + 行统计

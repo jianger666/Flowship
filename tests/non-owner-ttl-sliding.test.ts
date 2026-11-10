@@ -26,7 +26,7 @@ const mkTool = (name: string) => {
     handler,
   };
 };
-const textOf = (r: { content: Array<{ text?: string }> }) =>
+const textOf = (r: { content: Array<{ type: string; text?: string }> }) =>
   r.content.map((c) => c.text ?? "").join("");
 const at = (hhmm: string) => vi.setSystemTime(new Date(`2026-11-04T${hhmm}:00Z`));
 const call = (tool: never, args: Record<string, unknown>, taskId: string) =>

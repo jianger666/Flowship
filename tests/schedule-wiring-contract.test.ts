@@ -34,10 +34,11 @@ describe("到点消息走普通用户消息的路径，但不抢用户的东西�
 
   it("task-question-inject：scheduledTrigger 一路传到两个最终封装文本的地方（有会话 send / 一次性 agent），脚注才不会掉回「用户的插话」", () => {
     const s = src("src/lib/server/task-question-inject.ts");
-    // deliverTaskQuestion(... , timing, options.scheduledTrigger === true, <groupNonOwner>)
-    // 末位新增了「群里非属主」参数（nonOwner ? {...} : undefined）；scheduledTrigger 仍紧挨在 timing 之后
+    // deliverTaskQuestion(... , timing, options.scheduledTrigger === true, <groupNonOwner>, branchGuarded)
+    // 末位新增了「群里非属主」参数（nonOwner ? {...} : undefined）与「分支守卫已守过」标记（branchGuarded）；
+    // scheduledTrigger 仍紧挨在 timing 之后
     expect(s).toMatch(
-      /\btiming,\s*options\.scheduledTrigger === true,\s*nonOwner\s*\?\s*\{[\s\S]*?\}\s*:\s*undefined,\s*\),/,
+      /\btiming,\s*options\.scheduledTrigger === true,\s*nonOwner\s*\?\s*\{[\s\S]*?\}\s*:\s*undefined,\s*branchGuarded,\s*\),/,
     );
     // startOneShotQuestion(... , opGen, options.scheduledTrigger === true)
     expect(s).toMatch(/\bopGen,\s*options\.scheduledTrigger === true,\s*\);/);
@@ -132,7 +133,9 @@ describe("启动锚点与进程内状态", () => {
   it("调度器启动放在 bootstrap 的 finally：飞书桥接任一步抛错也不能让定时跟着起不来；vitest 下不起", () => {
     const s = src("src/lib/server/feishu-bridge/bootstrap.ts");
     const fn = s.slice(s.indexOf("export const ensureFeishuBridgeBootstrapped"));
-    expect(fn).toMatch(/\}\s*finally\s*\{\s*startScheduleRunner\(\);\s*\}/);
+    // finally 里允许再挂别的「必须独立于飞书桥接成败」的启动项（目前只有内置浏览器的交还处理器），但调度器必须是第一项
+    expect(fn).toMatch(/\}\s*finally\s*\{\s*startScheduleRunner\(\);(\s*startBrowserHandback\(\);)?\s*\}/);
+    expect(fn).toMatch(/\}\s*finally\s*\{[^}]*startBrowserHandback\(\);/);
     // 在 finally 之前、桥接自己的 VITEST 早退不能把调度器启动一起短路掉（return 会走 finally，但启动函数自己也要守 VITEST）
     const starter = s.slice(s.indexOf("const startScheduleRunner"), s.indexOf("export const ensureFeishuBridgeBootstrapped"));
     expect(starter).toContain("if (process.env.VITEST) return;");

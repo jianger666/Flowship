@@ -452,14 +452,33 @@ const rendersImage = (file: string): boolean => {
 describe("全仓入口护栏：新增的图片 / markdown 渲染入口必须过评审（否则这里红）", () => {
   const files = listSrc("src");
 
-  it("真正渲染 <img> 的只有 image-preview（受控）与预览窗的图片查看器（本地媒体通道 / SVG blob）；预览正文自己不再渲染 <img>；next/image 一个都没有", () => {
+  it("真正渲染 <img> 的只有 image-preview（受控）、预览窗的图片查看器（本地媒体通道 / SVG blob）与内置浏览器面板的两处（遮盖占位图 / favicon）；预览正文自己不再渲染 <img>；next/image 一个都没有", () => {
     // 2026-11-06：预览窗升级后，原先写在 local-file-preview-body 里的 <img> 搬进了独立的图片查看器（缩放 / 旋转 / 平移）。
     // 名单里「预览正文」换成「图片查看器」；它的 src 来源由下面一条钉死。
+    // 2026-11-07：内置浏览器面板新增两处 <img>，来源由再下面一条钉死。
     const hits = files.filter(rendersImage).sort();
     expect(hits).toEqual([
+      "src/components/browser/browser-panel.tsx",
+      "src/components/browser/browser-viewport.tsx",
       "src/components/preview/image-viewer.tsx",
       "src/components/ui/image-preview.tsx",
     ]);
+  });
+
+  it("内置浏览器面板的两处 <img> 的 src 来源被钉死：遮盖占位图只吃主进程 setCovered 给的 dataURL；favicon 只吃 safeFaviconSrc（仅 https / data:image 位图，拒回环 / 内网 / 应用同源）且不带 Referer，都不吃 markdown / 模型输出", () => {
+    // 这两处不属于「markdown 里的远程图被模型诱导去拼 URL 外泄」那类风险：
+    // - 遮盖占位图：src 是主进程截图转的 dataURL，不发任何网络请求；
+    // - favicon：URL 由用户正在浏览的页面决定（该域名本来就被浏览器面板访问过），拿不到 Flowship 的任何数据；
+    //   safeFaviconSrc 挡掉 javascript: / file: 等，no-referrer 保证不把 Flowship 的地址带出去。
+    const viewport = read("src/components/browser/browser-viewport.tsx");
+    expect(viewport).toMatch(/<img\s+src=\{coverImage\}/);
+    expect(read("src/components/browser/use-overlay-cover.ts")).toContain("await bridge.setCovered(taskId, true)");
+    const panel = read("src/components/browser/browser-panel.tsx");
+    expect(panel).toContain("safeFaviconSrc(tab.favicon)");
+    expect(panel).toMatch(/<img\s+src=\{src\}[^>]*referrerPolicy="no-referrer"/s);
+    // 面板里的 <img> 恰好这一处；多一处就要过评审
+    expect(panel.match(/<img\b/g)).toHaveLength(1);
+    expect(viewport.match(/<img\b/g)).toHaveLength(1);
   });
 
   it("图片查看器的 <img> 只吃调用方给的 src；调用方只有两个：预览正文（服务端给的本地媒体路径 mediaPath）与 SVG 查看器（blob URL），都不吃 markdown", () => {

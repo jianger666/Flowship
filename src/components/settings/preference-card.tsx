@@ -23,6 +23,11 @@ import {
   findUnknownPlaceholders,
   renderBranchName,
 } from "@/lib/branch-template";
+import {
+  LINK_OPEN_MODES,
+  LINK_OPEN_MODE_LABEL,
+  normalizeLinkOpenMode,
+} from "@/lib/builtin-open";
 import { openSystemNotificationSettings } from "@/lib/shell-notify";
 import { SUBMIT_SHORTCUT_LABEL } from "@/lib/submit-shortcut";
 import { roleSupportsWorktree } from "@/lib/role-worktree";
@@ -32,6 +37,7 @@ import {
   USER_ROLE_LABEL,
   USER_ROLES,
   type JumpIde,
+  type LinkOpenMode,
   type SubmitShortcut,
   type UserRole,
 } from "@/lib/types";
@@ -40,6 +46,9 @@ interface PreferenceSectionsProps {
   // 代码跳转 IDE
   jumpIde: JumpIde;
   onJumpIdeChange: (next: JumpIde) => void;
+  // 网页链接 / 本地 HTML 默认打开方式
+  linkOpenMode: LinkOpenMode;
+  onLinkOpenModeChange: (next: LinkOpenMode) => void;
   // 我的角色（身份注入视角锚点）
   userRole: UserRole | undefined;
   onUserRoleChange: (next: UserRole) => void;
@@ -66,6 +75,8 @@ interface PreferenceSectionsProps {
 export const PreferenceSections = ({
   jumpIde,
   onJumpIdeChange,
+  linkOpenMode,
+  onLinkOpenModeChange,
   userRole,
   onUserRoleChange,
   branchTemplate,
@@ -264,6 +275,22 @@ export const PreferenceSections = ({
             ).map((id) => ({
               value: id,
               label: JUMP_IDE_LABEL[id],
+            }))}
+          />
+        }
+      />
+
+      <SettingRow
+        label="链接默认打开方式"
+        hint="聊天和产物里的网页链接、HTML 文件。登录授权类链接、网页版、没有任务的页面始终用系统浏览器；右键可单次改用另一种"
+        control={
+          <Picker
+            className="w-44"
+            value={linkOpenMode}
+            onChange={(v) => onLinkOpenModeChange(normalizeLinkOpenMode(v))}
+            options={LINK_OPEN_MODES.map((id) => ({
+              value: id,
+              label: LINK_OPEN_MODE_LABEL[id],
             }))}
           />
         }

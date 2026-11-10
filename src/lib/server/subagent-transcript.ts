@@ -46,6 +46,7 @@ import {
 } from "@/lib/subagent-run";
 import type { TaskEvent } from "@/lib/types";
 
+import { redactBrowserToolCallMessage } from "./browser/redact-args";
 import { writePrivateFileAtomic } from "./data-root";
 import { redactCopyIfHit } from "./event-secret-redact";
 import { DELETED_TOMBSTONE_FILE, taskDir, withTaskLock } from "./task-fs-core";
@@ -485,7 +486,12 @@ const onText = (
   bump(rec);
 };
 
-const onToolCall = (rec: RunRecord, msg: Record<string, unknown>): void => {
+const onToolCall = (rec: RunRecord, rawMsg: Record<string, unknown>): void => {
+  // 浏览器工具里「会往页面写内容」的入参（browser_type 的 text / browser_fill_form 的字段值 / browser_dialog 的 prompt_text /
+  // browser_press_key 的单字符键）不落盘：与主流 sdk-message-handler 同一道闸（redact-args）。
+  // 范围仅此：browser_evaluate 的表达式是 AI 自己写的代码，刻意不脱敏（用户要能审计）；upload 的 paths 是磁盘路径、不是秘密，同样不动。
+  // 子代理一般拿不到 browser_* 工具，这里是兜底——万一拿到了，落进转录文件的也只会是脱敏后的 args（与 R1-02 同一类问题）
+  const msg = redactBrowserToolCallMessage(rawMsg);
   rec.open = null;
   const status = typeof msg.status === "string" ? msg.status : "running";
   const name = typeof msg.name === "string" && msg.name ? msg.name : "tool";

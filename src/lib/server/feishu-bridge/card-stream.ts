@@ -144,8 +144,9 @@ const STREAM_REOPEN_MIN_GAP_MS = 30_000;
 const CONTENT_SOFT_LIMIT = 95_000;
 const TRUNCATE_HINT = "\n\n内容过长，完整回复在 app 内查看";
 
-const ELEMENT_PROCESS = "md_process";
-const ELEMENT_ANSWER = "md_answer";
+/** 过程区 / 正文区 element_id：群答疑流式卡（group-card-stream）与私聊卡共用同一套布局，按同名 id 推内容 */
+export const ELEMENT_PROCESS = "md_process";
+export const ELEMENT_ANSWER = "md_answer";
 const ELEMENT_FOOTER = "md_footer";
 const ELEMENT_QUOTE = "md_quote";
 /** Hermes 同款正文 / timeline / footer 之间的分割线 */

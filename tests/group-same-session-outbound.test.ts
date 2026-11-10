@@ -227,7 +227,7 @@ describe("user_reply 现建登记 + 主链帧对号入座", () => {
     expect(listGroupReplies(TASK)).toHaveLength(0);
   });
 
-  it("只发最终段：中途旁白（工具调用之前）不进群", async () => {
+  it("发累积全文（2026-11-09 起不再只发最终段）：工具调用前后各段都进群、按序用空行拼、各一份", async () => {
     const deps = use();
     await nonOwnerUserReply();
     await delta("我先翻下代码…");
@@ -236,9 +236,11 @@ describe("user_reply 现建登记 + 主链帧对号入座", () => {
     await delta("结论：周五联调。");
     await message("结论：周五联调。");
     await done(true);
+    expect(deps.sendMarkdown).toHaveBeenCalledTimes(1);
     const body = sentTexts(deps.sendMarkdown)[0]!;
-    expect(body).toContain("结论：周五联调。");
-    expect(body).not.toContain("我先翻下代码");
+    expect(body).toContain("我先翻下代码…\n\n结论：周五联调。");
+    expect(body.match(/我先翻下代码/g)).toHaveLength(1);
+    expect(body.match(/结论：周五联调/g)).toHaveLength(1);
   });
 
   it("失败的一轮：真人提问人收到中性提示、仍不写旁路问答汇总", async () => {

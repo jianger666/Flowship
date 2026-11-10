@@ -444,8 +444,8 @@ describe("Q20-05 store 层：createSchedule 去重（真实落盘）", () => {
 
 describe("Q20-05 工具层：schedule create 的回执（[SCHEDULED] / [ALREADY_SCHEDULED]）", () => {
   const def = flowShipTools.find((t) => t.name === SCHEDULE_TOOL_NAME)!;
-  const textOf = (r: { content: Array<{ type: "text"; text: string }> }): string =>
-    r.content.map((c) => c.text).join("");
+  const textOf = (r: { content: Array<{ type: string; text?: string }> }): string =>
+    r.content.map((c) => c.text ?? "").join("");
 
   /** 当前 agent 实例登记的 callerToken = "tok"（schedule 有副作用、先验它），同 schedule-tool.test */
   const freshToolTask = async (): Promise<string> => {

@@ -172,8 +172,8 @@ const taskInfoFromTask = (task: Task, at = Date.now()): ModeCacheEntry => ({
 
 // ----------------- turn 状态机 -----------------
 
-/** 过程区一行：思考段落或工具 timeline */
-type ProcessPart =
+/** 过程区一行：思考段落或工具 timeline（群答疑流式卡 group-outbound 复用同一套渲染） */
+export type ProcessPart =
   | { kind: "thinking"; text: string }
   | {
       kind: "tool";
@@ -555,7 +555,10 @@ const selectTimelineParts = (
  * - 正文一旦开始、开放思考立即置 completed（Hermes record_answer_started）
  * （折叠面板 chrome 在 card-stream；这里只拼 md_process 内容）
  */
-const renderProcess = (parts: ProcessPart[], answerStarted: boolean): string => {
+export const renderProcess = (
+  parts: ProcessPart[],
+  answerStarted: boolean,
+): string => {
   // 思考编号按全量 parts 计（折叠不重排「思考 N」序号，与 Hermes 记录期编号一致）
   const thinkingNo = new Map<number, number>();
   let thinkingIdx = 0;
@@ -721,7 +724,10 @@ const parseEchoAttachments = (meta: TaskEvent["meta"]): string[] => {
   return out;
 };
 
-const toolNameFromMeta = (meta: TaskEvent["meta"], fallback = "tool"): string => {
+export const toolNameFromMeta = (
+  meta: TaskEvent["meta"],
+  fallback = "tool",
+): string => {
   if (!meta) return fallback;
   const inner =
     typeof meta.innerToolName === "string" && meta.innerToolName
@@ -732,7 +738,10 @@ const toolNameFromMeta = (meta: TaskEvent["meta"], fallback = "tool"): string =>
   return inner || name || fallback;
 };
 
-const argsSummaryFromMeta = (meta: TaskEvent["meta"], text: string): string => {
+export const argsSummaryFromMeta = (
+  meta: TaskEvent["meta"],
+  text: string,
+): string => {
   if (meta && typeof meta.args === "string" && meta.args) {
     // 优先抽 command/path 等关键字段，timeline / subtitle 更干净
     const extracted = extractToolPreviewTarget(meta.args);

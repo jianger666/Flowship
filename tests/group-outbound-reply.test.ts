@@ -1,15 +1,19 @@
 /**
- * 群答疑出向（question 登记）：只发最终段 + 流式群卡。
+ * 群答疑出向（question 登记）：发累积全文（已收段落 + 当前段）+ 流式群卡（照私聊卡版式）。
+ *
+ * 2026-11-09 改：此前「只发最后一次工具调用之后那段」，流式卡上永远只有一句话、每调一次工具整句被换掉
+ *（用户截图反馈）；现在群里看到的是累积全文（只增不换），思考 / 工具进折叠面板。下面凡写「最终段」的
+ * 历史描述都以这条为准。
  *
  * 背景（2026-10-14 对接后端机器人「安若流年」）：旧设计整轮文字全发、无条件真 @ 回提问人、
  * 失败也 @ 一句「去 Flowship 看事件流」→ 两个机器人互 @ 成环、对端上下文被带偏。
  * 2026-11-06 用户拍板「协议不用管、让 AI 自己判断」：回复协议（@名字换真 @ / 需属主确认标记 / NO_REPLY 变体）
  * 整套下线，系统只剩三件事——首行 NO_REPLY 不发、真人提问人开头固定 @、其余原样发（群里跟私聊一样流式）。
  * 这里钉死：
- * - 答案 = 最后一次工具调用之后那段（assistant_message 落盘版早 / 晚于 tool_call 都不重复、不丢字）
+ * - 答案 = 累积全文：各段落（按工具调用分段）用空行拼起来（assistant_message 落盘版早 / 晚于 tool_call 都不重复、不丢字）
  * - 机器人提问人失败 / 空回答静默；真人只收中性提示，群里绝不出现 Flowship / 事件流
  * - 首行 NO_REPLY 不发群；真人提问人固定 @；agent 自己写的 @ 标签原样放行
- * - 流式：判定要说话才起卡、卡上推当前段、收尾整卡换终稿；开关 = 任务级覆盖 > 全局
+ * - 流式：判定要说话才起卡、卡上推累积全文（只增不换）、过程区进折叠面板、收尾整卡定稿；开关 = 任务级覆盖 > 全局
  * - 超长切 ≤3 条、每条 ≤1800 字、尾巴不提 Flowship
  *
  * 全部 mock 外部调用——**禁止真调飞书**（流式卡也是假的）。
@@ -65,6 +69,8 @@ const TASK = "task-1";
 const HUMAN = { openId: "ou_zhang", name: "张三" };
 const BOT = { openId: "ou_anruo", name: "安若流年" };
 const OWNER = { openId: "ou_owner", name: "宿主小王" };
+/** 真人提问人的固定 @ 前缀（含尾随空格） */
+const HUMAN_AT = '<at user_id="ou_zhang">张三</at> ';
 
 const fullTask = (): Task =>
   ({
@@ -201,8 +207,8 @@ afterEach(() => {
   __resetGroupReplyStateForTest();
 });
 
-describe("只发最终段（最后一次工具调用之后）", () => {
-  it("中途旁白不进群：只发工具调用之后的那段", async () => {
+describe("发累积全文（已收段落 + 当前段，按工具调用分段、空行拼接）", () => {
+  it("中途旁白也进群、按时间序用空行拼：一条消息、每段恰好一份", async () => {
     const deps = use();
     const tag = register();
     await delta("我先查一下接口文档…", tag);
@@ -217,9 +223,9 @@ describe("只发最终段（最后一次工具调用之后）", () => {
 
     expect(deps.sendMarkdown).toHaveBeenCalledTimes(1);
     const body = sentTexts(deps.sendMarkdown)[0]!;
-    expect(body).toContain("结论：接口周五联调。");
-    expect(body).not.toContain("我先查一下");
-    expect(body).not.toContain("埋点配置");
+    expect(body).toBe(
+      `${HUMAN_AT}我先查一下接口文档…\n\n再看看埋点配置。\n\n结论：接口周五联调。`,
+    );
   });
 
   it("真实顺序（delta → assistant_message → tool_call）：落盘版不重复、不丢字", async () => {
@@ -228,10 +234,11 @@ describe("只发最终段（最后一次工具调用之后）", () => {
     await delta("第一段旁白", tag);
     await message("第一段旁白", tag);
     await toolCall(tag);
-    // tool_call 之后：当前段清空，上一段收进 lastSegment，待认领列表为空（落盘版已见过）
+    // tool_call 之后：当前段清空，上一段收进 closedSegments（lastSegment 仍记最近一段），待认领列表为空（落盘版已见过）
     const [entry] = listGroupReplies(TASK);
     expect(entry!.answer).toBe("");
     expect(entry!.lastSegment).toBe("第一段旁白");
+    expect(entry!.closedSegments).toEqual(["第一段旁白"]);
     expect(entry!.awaitingMessages ?? []).toEqual([]);
     await delta("最终", tag);
     await delta("答复", tag);
@@ -251,10 +258,10 @@ describe("只发最终段（最后一次工具调用之后）", () => {
     await done(true, tag);
     expect(sentTexts(deps.sendMarkdown)).toHaveLength(1);
     const body = sentTexts(deps.sendMarkdown)[0]!;
-    expect(body).toContain("最终答复");
-    expect(body).not.toContain("第一段旁白");
-    // 没有重复（"最终答复最终答复"）
+    // 两段各一份：晚到的落盘版既不重复追加进新段，也不把已收段落吞掉
+    expect(body).toBe(`${HUMAN_AT}第一段旁白\n\n最终答复`);
     expect(body.match(/最终答复/g)).toHaveLength(1);
+    expect(body.match(/第一段旁白/g)).toHaveLength(1);
   });
 
   it("落盘版晚到且新段 delta 已经开始：仍认出重复、新段不被吞", async () => {
@@ -268,8 +275,7 @@ describe("只发最终段（最后一次工具调用之后）", () => {
     expect(listGroupReplies(TASK)[0]!.answer).toBe("最终答复");
     await done(true, tag);
     const body = sentTexts(deps.sendMarkdown)[0]!;
-    expect(body).toContain("最终答复");
-    expect(body).not.toContain("第一段旁白");
+    expect(body).toBe(`${HUMAN_AT}第一段旁白\n\n最终答复`);
   });
 
   it("没有 delta 只有落盘版（兜底）：照常追加；工具调用后收段", async () => {
@@ -281,15 +287,16 @@ describe("只发最终段（最后一次工具调用之后）", () => {
     const [entry] = listGroupReplies(TASK);
     expect(entry!.answer).toBe("");
     expect(entry!.lastSegment).toBe("只有落盘版的一段");
+    expect(entry!.closedSegments).toEqual(["只有落盘版的一段"]);
   });
 
-  it("最后一次工具调用之后没再说话 → 回退上一非空段（恰好一份、不重复）", async () => {
+  it("最后一次工具调用之后没再说话 → 已收的那段照发（恰好一份、不重复）", async () => {
     const deps = use();
     const tag = register();
     await delta("答案写在工具调用之前", tag);
     await toolCall(tag);
     await message("答案写在工具调用之前", tag); // 晚到的落盘版
-    await toolCall(tag); // 连续工具调用、中间没有文字：lastSegment 不能被清掉
+    await toolCall(tag); // 连续工具调用、中间没有文字：已收段落不能被清掉
     await done(true, tag);
     expect(deps.sendMarkdown).toHaveBeenCalledTimes(1);
     const body = sentTexts(deps.sendMarkdown)[0]!;
@@ -328,6 +335,46 @@ describe("只发最终段（最后一次工具调用之后）", () => {
       text: "推进旁白二",
     } as never);
     expect(listGroupReplies(TASK)[0]!.answer).toBe("推进旁白一推进旁白二");
+    expect(listGroupReplies(TASK)[0]!.closedSegments).toBeUndefined();
+  });
+
+  it("先旁白、最后一段写成 NO_REPLY → 整轮静默（旁白不当答案发出去），汇总存全部原话", async () => {
+    const deps = use();
+    const tag = register(HUMAN);
+    await delta("我先看看这条是不是问我的…", tag);
+    await toolCall(tag);
+    await delta("NO_REPLY", tag);
+    await done(true, tag);
+    expect(deps.sendMarkdown).not.toHaveBeenCalled();
+    const s = summaryOf()!;
+    expect(s.noReply).toBe(true);
+    expect(s.ok).toBe(true);
+    expect(s.answer).toBe("我先看看这条是不是问我的…\n\nNO_REPLY");
+  });
+
+  it("中间某一段是 NO_REPLY、最后一段正常说话 → 只丢那一段，其余照发", async () => {
+    const deps = use();
+    const tag = register(BOT, true);
+    await delta("前情提要", tag);
+    await toolCall(tag);
+    await delta("NO_REPLY", tag);
+    await toolCall(tag);
+    await delta("最终结论", tag);
+    await done(true, tag);
+    expect(sentTexts(deps.sendMarkdown)).toEqual(["前情提要\n\n最终结论"]);
+  });
+
+  it("closedSegments 有上限（200）：超了丢最早的，不无限涨", async () => {
+    use();
+    const tag = register(BOT, true);
+    for (let i = 0; i < 205; i += 1) {
+      await delta(`段${i}`, tag);
+      await toolCall(tag);
+    }
+    const closed = listGroupReplies(TASK)[0]!.closedSegments!;
+    expect(closed).toHaveLength(200);
+    expect(closed[0]).toBe("段5");
+    expect(closed.at(-1)).toBe("段204");
   });
 });
 
@@ -609,10 +656,21 @@ describe("汇总事件新字段", () => {
 
 type FakeStream = {
   chatId: string;
+  /** createGroupCardStream 的第二参（卡片标题） */
+  title?: string;
   pushes: string[];
+  /** pushProcess 收到的过程区 markdown（按推送顺序） */
+  processes: string[];
+  /** finalize 收到的块 */
   finalized: string[][];
+  /** finalize 收到的收尾选项（与 finalized 一一对应） */
+  finalizeOpts: Array<Record<string, unknown> | undefined>;
   push: (text: string) => void;
-  finalize: (chunks: string[]) => Promise<{
+  pushProcess: (text: string) => void;
+  finalize: (
+    chunks: string[],
+    opts?: Record<string, unknown>,
+  ) => Promise<{
     delivered: boolean;
     error?: unknown;
     streamed: boolean;
@@ -628,16 +686,23 @@ const makeStreams = (
   },
 ) => {
   const created: FakeStream[] = [];
-  const factory = (chatId: string): never => {
+  const factory = (chatId: string, opts?: { title?: string }): never => {
     const st: FakeStream = {
       chatId,
+      title: opts?.title,
       pushes: [],
+      processes: [],
       finalized: [],
+      finalizeOpts: [],
       push: (text) => {
         st.pushes.push(text);
       },
-      finalize: async (chunks) => {
+      pushProcess: (text) => {
+        st.processes.push(text);
+      },
+      finalize: async (chunks, finOpts) => {
         st.finalized.push(chunks);
+        st.finalizeOpts.push(finOpts);
         return result;
       },
       isStarted: () => st.pushes.length > 0,
@@ -672,7 +737,7 @@ describe("流式群卡：边出边推、收尾整卡换终稿", () => {
 
     expect(created).toHaveLength(1);
     expect(created[0]!.chatId).toBe(CHAT);
-    // 每次推「当前段全文」（含真人提问人的固定前缀），不是增量
+    // 每次推「累积全文」（含真人提问人的固定前缀），不是增量
     expect(created[0]!.pushes).toEqual([
       '<at user_id="ou_zhang">张三</at> 结论：',
       '<at user_id="ou_zhang">张三</at> 结论：接口周五联调。',
@@ -730,7 +795,7 @@ describe("流式群卡：边出边推、收尾整卡换终稿", () => {
     expect(created[0]!.pushes).toEqual(["Nginx 配置在 conf.d 下"]);
   });
 
-  it("工具调用前后：卡上推当前段；终稿只认最后一段（中途旁白不进终稿）", async () => {
+  it("工具调用前后：卡上推累积全文、只增不换（前一次永远是后一次的前缀）；终稿 = 全部段落", async () => {
     const { created } = useStreaming();
     const tag = register(BOT, true);
     await delta("我先查一下接口文档…", tag);
@@ -742,9 +807,15 @@ describe("流式群卡：边出边推、收尾整卡换终稿", () => {
     expect(created).toHaveLength(1);
     expect(created[0]!.pushes).toEqual([
       "我先查一下接口文档…",
-      "结论：周五联调。",
+      "我先查一下接口文档…\n\n结论：周五联调。",
     ]);
-    expect(created[0]!.finalized).toEqual([["结论：周五联调。"]]);
+    // 只增不换：每一帧都以上一帧为前缀（打字机 / 用户看到的不会整句被替换）
+    const p = created[0]!.pushes;
+    for (let i = 1; i < p.length; i += 1) expect(p[i]!.startsWith(p[i - 1]!)).toBe(true);
+    const fin = "我先查一下接口文档…\n\n结论：周五联调。";
+    expect(created[0]!.finalized).toEqual([[fin]]);
+    // 整份累积全文进卡（不是第 1 块）
+    expect(created[0]!.finalizeOpts[0]).toMatchObject({ body: fin, outcome: "ok" });
   });
 
   it("没有 delta、只有落盘版（兜底路径）也会推给流式卡", async () => {
@@ -764,13 +835,14 @@ describe("流式群卡：边出边推、收尾整卡换终稿", () => {
     await delta("NO_REPLY", tag);
     await done(true, tag);
     expect(created[0]!.pushes).toEqual(["我先查一下…"]);
-    // 收尾 = 不带任何新块（卡保持已有内容）
+    // 收尾 = 不带任何新块、不带 body（卡保持已有内容）
     expect(created[0]!.finalized).toEqual([[]]);
+    expect(created[0]!.finalizeOpts[0]).not.toHaveProperty("body");
     expect(deps.sendMarkdown).not.toHaveBeenCalled();
     expect(summaryOf()!.noReply).toBe(true);
   });
 
-  it("超长终稿：切块传给 finalize（第 1 块整卡、其余块由流式卡另发）", async () => {
+  it("超长终稿：切块仍传给 finalize（卡落不下去时的文本卡兜底），但卡里放整份累积全文", async () => {
     const { created } = useStreaming();
     const tag = register(HUMAN);
     const text = ["甲".repeat(1500), "乙".repeat(1500), "丙".repeat(1500)].join("\n\n");
@@ -780,6 +852,9 @@ describe("流式群卡：边出边推、收尾整卡换终稿", () => {
     expect(chunks).toHaveLength(3);
     expect(chunks![0]).toContain('<at user_id="ou_zhang">张三</at>');
     expect(chunks![1]).not.toContain("<at");
+    expect(created[0]!.finalizeOpts[0]!.body).toBe(
+      `<at user_id="ou_zhang">张三</at> ${text}`,
+    );
   });
 
   it("同一条登记的流只建一次；两条登记各自一张卡、互不串", async () => {
@@ -830,6 +905,208 @@ describe("流式群卡：边出边推、收尾整卡换终稿", () => {
       text: "推进旁白",
     } as never);
     expect(created).toHaveLength(0);
+  });
+});
+
+// ----------------- 过程区（思考与工具折叠面板，照私聊卡） -----------------
+
+const thinking = (text: string, origin?: string) =>
+  handleGroupOutboundEvent(TASK, {
+    kind: "event",
+    ...(origin ? { origin } : {}),
+    event: { id: `e-th-${++seq}`, seq, ts: Date.now(), kind: "thinking", text },
+  } as never);
+const toolStart = (
+  callId: string,
+  name: string,
+  args: string,
+  origin?: string,
+) =>
+  handleGroupOutboundEvent(TASK, {
+    kind: "event",
+    ...(origin ? { origin } : {}),
+    event: {
+      id: `e-tc-${++seq}`,
+      seq,
+      ts: Date.now(),
+      kind: "tool_call",
+      text: `调用 ${name}`,
+      meta: { callId, name, args },
+    },
+  } as never);
+/** 真实 tool_result 的 meta 里带 args（buildToolResultMeta），text 只是「工具完成 X」 */
+const toolEnd = (
+  callId: string,
+  name: string,
+  status: "ok" | "error",
+  origin?: string,
+  args?: string,
+) =>
+  handleGroupOutboundEvent(TASK, {
+    kind: "event",
+    ...(origin ? { origin } : {}),
+    event: {
+      id: `e-tr-${++seq}`,
+      seq,
+      ts: Date.now(),
+      kind: "tool_result",
+      text: status === "error" ? `工具失败 ${name}` : `工具完成 ${name}`,
+      meta: { callId, name, status, ...(args ? { args } : {}) },
+    },
+  } as never);
+
+describe("流式群卡：过程区（思考与工具折叠面板）", () => {
+  it("先调工具后开口：过程事件本身不建卡；开口建卡时带上任务标题与此前攒下的过程区", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await thinking("先看一下仓库结构", tag);
+    await toolStart("c1", "Shell", JSON.stringify({ command: "ls src" }), tag);
+    await toolEnd("c1", "Shell", "ok", tag, JSON.stringify({ command: "ls src" }));
+    expect(created).toHaveLength(0); // 还没开口：群里零消息（NO_REPLY 零消息语义不被过程事件破坏）
+    await delta("结论：入口在 src/app", tag);
+    expect(created).toHaveLength(1);
+    expect(created[0]!.title).toBe("登录优化");
+    const proc = created[0]!.processes.at(-1)!;
+    expect(proc).toContain("**思考 1** · completed");
+    expect(proc).toContain("先看一下仓库结构");
+    expect(proc).toContain("`Shell` · completed");
+    expect(proc).toContain("ls src");
+    // 先给过程区、再给正文（建卡的首帧就带过程区）
+    expect(created[0]!.processes.length).toBeGreaterThan(0);
+    expect(created[0]!.pushes).toEqual(["结论：入口在 src/app"]);
+  });
+
+  it("已起卡后：tool_call 推 running，tool_result 回填 completed / failed", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("我查一下", tag);
+    await toolStart("c1", "Read", JSON.stringify({ path: "a.ts" }), tag);
+    expect(created[0]!.processes.at(-1)).toContain("`Read` · running");
+    await toolEnd("c1", "Read", "ok", tag);
+    expect(created[0]!.processes.at(-1)).toContain("`Read` · completed");
+    await toolStart("c2", "Shell", JSON.stringify({ command: "false" }), tag);
+    await toolEnd("c2", "Shell", "error", tag);
+    const last = created[0]!.processes.at(-1)!;
+    expect(last).toContain("`Read` · completed");
+    expect(last).toContain("`Shell` · failed");
+  });
+
+  it("连续几条 thinking（中间没有工具）合并成同一段「思考 N」；被工具隔开才新开一段", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开头", tag);
+    await thinking("第一句思考", tag);
+    await thinking("第二句思考", tag);
+    await toolStart("c1", "Read", "{}", tag);
+    await thinking("工具后的思考", tag);
+    const proc = created[0]!.processes.at(-1)!;
+    expect(proc).toContain("**思考 1** · completed\n第一句思考\n\n第二句思考");
+    expect(proc).toContain("**思考 2** · completed\n工具后的思考");
+  });
+
+  it("过程区没变就不重复推（同一帧重复事件 / 纯 delta 不触发）", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    const n = created[0]!.processes.length;
+    await delta("，继续", tag);
+    await delta("，再继续", tag);
+    expect(created[0]!.processes).toHaveLength(n);
+  });
+
+  it("别的 run（属主主链 / 别人的旁路）的过程事件不进本条登记的卡", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    const other = register({ openId: "ou_li", name: "李四" });
+    await delta("本条在说", tag);
+    const n = created[0]!.processes.length;
+    await toolStart("x1", "Shell", JSON.stringify({ command: "rm -rf /tmp/x" }), other);
+    await toolStart("x2", "Shell", JSON.stringify({ command: "whoami" })); // 属主主链：无 origin
+    await thinking("别人的思考", other);
+    expect(created).toHaveLength(1);
+    expect(created[0]!.processes).toHaveLength(n);
+    expect(created[0]!.processes.join("\n")).not.toMatch(/rm -rf|whoami|别人的思考/);
+  });
+
+  it("属主主链的卡不收「找不到登记的 origin」的过程事件（对不上 runTag 一律丢弃，不回落到属主那格）", async () => {
+    const { created } = useStreaming();
+    rememberGroupReply(TASK, {
+      chatId: CHAT,
+      requesterOpenId: HUMAN.openId,
+      requesterName: HUMAN.name,
+      kind: "question",
+      channel: "owner",
+    });
+    await handleGroupOutboundEvent(TASK, {
+      kind: "assistant_delta",
+      text: "属主这轮的答复",
+    } as never);
+    expect(created).toHaveLength(1);
+    const n = created[0]!.processes.length;
+    await toolStart("z1", "Shell", JSON.stringify({ command: "cat /etc/passwd" }), "tok_unregistered");
+    await thinking("陌生 run 的思考", "tok_unregistered");
+    expect(created[0]!.processes).toHaveLength(n);
+    expect(created[0]!.processes.join("\n")).not.toMatch(/passwd|陌生 run/);
+    // 属主主链自己的事件照常进
+    await toolStart("z2", "Read", JSON.stringify({ path: "a.ts" }));
+    expect(created[0]!.processes.at(-1)).toContain("`Read` · running");
+  });
+
+  it("NO_REPLY + 只调了工具：不起卡、群里零消息（过程区也不会单独留一张卡）", async () => {
+    const { deps, created } = useStreaming();
+    const tag = register(BOT, true);
+    await thinking("这条不关我事？", tag);
+    await toolStart("c1", "Read", "{}", tag);
+    await toolEnd("c1", "Read", "ok", tag);
+    await delta("NO_REPLY", tag);
+    await done(true, tag);
+    expect(created).toHaveLength(0);
+    expect(deps.sendMarkdown).not.toHaveBeenCalled();
+    expect(summaryOf()!.noReply).toBe(true);
+  });
+
+  it("流式开关关：过程事件不起卡、不推过程区；done 照旧一次性发文本卡（老路径）", async () => {
+    const { deps, created } = useStreaming({ isStreamingEnabled: async () => false });
+    const tag = register(BOT, true);
+    await thinking("想一下", tag);
+    await toolStart("c1", "Read", "{}", tag);
+    await delta("答复", tag);
+    await done(true, tag);
+    expect(created).toHaveLength(0);
+    expect(sentTexts(deps.sendMarkdown)).toEqual(["答复"]);
+  });
+
+  it("advance 登记的过程事件不起流式状态（推进走分享卡、不走答疑卡）", async () => {
+    const { created } = useStreaming();
+    rememberGroupReply(TASK, {
+      chatId: CHAT,
+      requesterOpenId: OWNER.openId,
+      requesterName: OWNER.name,
+      kind: "advance",
+      channel: "owner",
+    });
+    await thinking("推进中的思考");
+    await toolStart("c1", "Shell", "{}");
+    expect(created).toHaveLength(0);
+  });
+
+  it("收尾带耗时与模型：outcome=ok、durationMs=这一轮耗时、model=任务模型", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-09T10:00:00Z"));
+    const { created } = useStreaming({
+      getTask: async () => ({ ...fullTask(), model: { id: "claude-sonnet-5" } }),
+    });
+    const tag = register(BOT, true);
+    const t0 = Date.now();
+    await delta("答复", tag);
+    vi.setSystemTime(new Date(t0 + 12_345));
+    await done(true, tag);
+    expect(created[0]!.finalizeOpts[0]).toMatchObject({
+      outcome: "ok",
+      durationMs: 12_345,
+      model: "claude-sonnet-5",
+      body: "答复",
+    });
   });
 });
 
@@ -896,19 +1173,24 @@ describe("流式群卡：开关（任务级覆盖 > 全局）", () => {
 });
 
 describe("流式群卡：失败 / 空回答 / 被摘", () => {
-  it("真人提问人失败：已起的卡改成中性提示收尾（不留半截内容），汇总 ok:false", async () => {
+  it("真人提问人失败：已起的卡保留已累积正文、末尾补中性提示，header 置失败态；汇总 ok:false 且 answer 不含半截内容", async () => {
     const { created, deps } = useStreaming();
     const tag = register(HUMAN);
     await delta("半截输出", tag);
     await done(false, tag);
-    expect(created[0]!.finalized).toEqual([
-      ['<at user_id="ou_zhang">张三</at> 这轮我没答上来，麻烦再 @ 我一次'],
-    ]);
+    const hint = '<at user_id="ou_zhang">张三</at> 这轮我没答上来，麻烦再 @ 我一次';
+    // 文本卡兜底块仍只有提示（卡落不下去时群里至少有一句人话）
+    expect(created[0]!.finalized).toEqual([[hint]]);
+    expect(created[0]!.finalizeOpts[0]).toMatchObject({
+      outcome: "failed",
+      body: `<at user_id="ou_zhang">张三</at> 半截输出\n\n${hint}`,
+    });
     expect(deps.sendMarkdown).not.toHaveBeenCalled();
     const s = summaryOf()!;
     expect(s.ok).toBe(false);
     expect(String(s.answer)).not.toContain("半截输出");
   });
+
 
   it("机器人提问人失败：卡保持已有内容收尾（不补任何文字）；汇总 ok:false", async () => {
     const { created } = useStreaming();
@@ -916,6 +1198,9 @@ describe("流式群卡：失败 / 空回答 / 被摘", () => {
     await delta("半截输出", tag);
     await done(false, tag);
     expect(created[0]!.finalized).toEqual([[]]);
+    // 卡内容不动（不带 body），但 header 置失败态
+    expect(created[0]!.finalizeOpts[0]).toMatchObject({ outcome: "failed" });
+    expect(created[0]!.finalizeOpts[0]).not.toHaveProperty("body");
     expect(summaryOf()!.ok).toBe(false);
   });
 

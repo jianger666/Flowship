@@ -934,33 +934,49 @@ finally 兜底）都只经它发一次 `done`。`done` 是群出向 tap 回群 +
 
 ### 群答疑流式卡（`group-card-stream.ts` + `group-outbound.ts` 的 `streamGroupReply`）
 
-- **同私聊一条路**：CardKit 卡实体（`createCardEntity`）→ 按 `chat_id` 发进群（`sendCardMessageToChat`）→ 打字机推全文
-  （`updateCardElementContent`，单元素 `md_text`）→ 收尾整卡 PUT 成终稿（`streaming_mode:false` + 真摘要）。
-  卡片版式与「文本卡」一致（无头无尾、单个 markdown 元素），`width_mode:"fill"`。
-- **只在判定要说话后才建卡**（见上「首行 NO_REPLY」）；一轮一张卡，卡上推的是**当前段**全文（含真人提问人的 @ 前缀）：
-  agent 中途「我先查一下…」的旁白会短暂出现在卡上，调工具后换成下一段；**终稿仍只认最后一次工具调用之后那段**
-  （没有最后一段就退回上一个非空段，语义同旧版）。起卡之后新一段写成 `NO_REPLY` 不会把这几个字推上卡
-  （卡保持上一次内容并收尾）。
-- **节流 / 失败**：每 300ms 最多推一次最新全文、单飞；刷新失败只记日志、之后照常再试，失败越多间隔越长（`min(300·2ⁿ, 5s)`），
-  **没有熔断**。收尾：终稿 PUT 重试（0.8s / 2s 后各一次），仍失败就把全部块另发成文本卡兜底；没建成卡（建卡 / 发卡失败）
-  全部块走文本卡——群里总有完整答案。多块（超长）：第 1 块整卡，其余块另发文本卡。
+- **版式照私聊流式卡**（2026-11-09 改：此前是「无头无尾、单个 `md_text`」的极简卡 + 只推当前段，卡上永远只有一句话、
+  每调一次工具整句被换掉，看着像卡死——用户截图反馈）：CardKit 卡实体（`createCardEntity`，版式直接用私聊的
+  `buildStreamingCardJson`）→ 按 `chat_id` 发进群（`sendCardMessageToChat`）→ header（任务标题 + 状态色）/
+  「思考与工具 · N 次工具调用」折叠面板（`md_process`）/ 正文（`md_answer`，打字机 `updateCardElementContent`）/ 分割线 /
+  footer（流式中 spinner「生成中」，收尾「耗时 · 模型」）；收尾 = 整卡 PUT（header 变「已完成」绿 / 失败红，摘要用正文开头）→
+  过程区 `batch_update` 回写（嵌套元素流式 PUT 静默无效、整卡 PUT 可能丢嵌套内容，与私聊卡同一条真机结论）→ `PATCH settings`
+  关 `streaming_mode`。`width_mode:"fill"`。
+- **只在判定要说话后才建卡**（见上「首行 NO_REPLY」）：过程事件（思考 / 工具）本身**不建卡**，只攒着、开口建卡时一并带上——
+  所以「没开口前一直在调工具」那段时间群里仍是零消息（与改前一致）。一轮一张卡，**正文 = 累积全文**
+  （已收段落 + 当前段，空行拼接，只增不换，含真人提问人的 @ 前缀）：agent 中途「我先查一下…」留在卡上，后面的段落接在后面。
+  NO_REPLY 按「段」判：起卡之后新一段写成 `NO_REPLY` 不会把这几个字推上卡（卡保持已有内容并收尾）；**收口时最后一段是
+  `NO_REPLY` → 整轮静默**（旁白不当答案发）。
+- **过程区（思考 / 工具）的可见范围**：折叠面板里是 agent 的思考原文 + 工具名 / 参数摘要（凭据类已脱敏），**群里所有人都看得见**，
+  不只属主。嫌暴露太多：`group-outbound.ts` 的 `GROUP_CARD_SHOW_PROCESS` 改 `false`，卡退回 header + 正文 + footer。
+- **节流 / 失败**：每 300ms 最多推一次最新全文 / 过程区、单飞（一轮里先过程区后正文）；刷新失败只记日志、之后照常再试，
+  失败越多间隔越长（`min(300·2ⁿ, 5s)`），**没有熔断**。收尾：终稿 PUT 重试（0.8s / 2s 后各一次），仍失败就把全部块
+  （按 1800 字切好的 ≤3 块）另发成文本卡兜底；没建成卡（建卡 / 发卡失败）全部块走文本卡——群里总有完整答案。
+  **内容超限**（飞书卡片 30KB，`too_long`）：同私聊卡逐档收紧正文预算 10k → 5k → 2.5k 字（过程区取一半）、带「后半已省略」提示，
+  就地重发、不占重试次数；流式中间帧撞上限也往下收一档。卡里放**整份累积全文**（不再是切块后的第 1 块）。
 - **开关**：任务级覆盖 `task.feishuGroupStreaming`（需求群弹窗「群里 AI 的回复方式」：跟随全局 / 流式 / 整条发送，
   `PUT /api/tasks/[id]/requirement-group/streaming`）> 设置页全局「流式回复」（`feishuBridgeStreaming`，私聊也用它）。
   每轮第一个 delta 读一次定稿，中途改开关不影响本轮；读任务 / 读设置抛错都按「开」处理。关 = 回复完成后一次性发文本卡（老路径）。
 - **登记被摘**（2h 到期 / 超 8 条被挤）：已起的卡按已有内容收尾，不挂「生成中」；`streams` 状态表收口 / 被摘即清，另有 64 条上限兜底。
 - **没验证**：没在真飞书群里实测——流式卡 @ 的**通知是否推送**、**别的机器人会不会因为卡片里的 @ 收到事件**都不确定
   （参考项目含 @ 的发送走纯文本消息正是因为卡片 @ 当时没触发机器人事件；我们群里本来就只发卡）；
-  群里的卡 `update` 权限 / 限频只凭 p2p 同一套接口推断。
+  群里的卡 `update` 权限 / 限频只凭 p2p 同一套接口推断。2026-11-09 的新版式（折叠面板 + 过程区 `batch_update` +
+  整卡 PUT 后 `PATCH settings` 关流式 + 摘要换成正文开头）同样**没在真飞书群里看过**：这套调用序列照抄私聊卡（私聊有真机验证），
+  但群聊里 `update_element` 嵌套元素是否同样生效、折叠面板在群里的渲染、终态摘要是否被 PATCH 冲掉，都是推断。
 
 ### 出向：只发什么、怎么发（`flushQuestionReply`）
 
-> 2026-11-06：下面提到的 `parseGroupReply` / `needsOwner` / roster 解析已随协议删除；收口现在是「有流式卡就收尾成终稿、没有就发文本卡」，其余（只发最终段、分段去重、超长切块）仍然成立。
+> 2026-11-06：下面提到的 `parseGroupReply` / `needsOwner` / roster 解析已随协议删除；收口现在是「有流式卡就收尾成终稿、没有就发文本卡」，其余（分段去重、超长切块）仍然成立；**「只发最终段」已于 2026-11-09 撤销**，见下一条。
 
-- **只发「最终段」**：最后一次工具调用之后的那段文字（`closeGroupReplySegment`：本 run 每次调工具就把当前段收进
-  `lastSegment`；`finalGroupReplyText` 取当前段、空则退回上一个非空段）。
-  ⚠️ 为什么不是整轮拼接：整轮拼接会把「我先查一下……」的旁白和英文残句原样发给外部同事 / 对端机器人，
-  对端把它们当对话内容喂进自己的上下文。规矩也这样要求 agent：「中途别写旁白，查完一次性给自包含的答复」。
-  只认 `runTag` 对得上的那条登记——属主 run 的工具调用绝不会截断同事的答疑段落。
+- **发「累积全文」（2026-11-09 起；此前是「只发最终段」）**：已收段落 + 当前段，空行拼接
+  （`closeGroupReplySegment`：本 run 每次调工具就把当前段收进 `closedSegments`〔上限 200，超了丢最早的〕并记 `lastSegment`；
+  `visibleGroupReplyText(entry, final)` 拼出全文）。`finalGroupReplyText`（旧语义：当前段，空则退回上一非空段）已不再被出向使用。
+  文本卡路径（没开流式 / 没建成卡）照旧按 1800 字切 ≤3 块发；流式卡路径整份累积全文进卡。
+  ⚠️ **代价**：agent 中途「我先查一下……」的旁白和英文残句现在会原样发给外部同事 / **对端机器人**，
+  对端会把它们当对话内容喂进自己的上下文——这正是当初改成「只发最终段」要避免的事；撤销是用户拍板
+  （理由：流式卡上永远只有一句话、像卡死；要和私聊流式卡一致）。提示词里仍要求 agent「中途别写旁白，查完一次性给自包含的答复」，
+  能少一些旁白；若对端机器人被旁白带偏，可回头只对 `requesterIsBot` 的登记收窄成最终段（`visibleGroupReplyText` 一处改动）。
+  静默（`NO_REPLY`）按「段」判：逐段过滤 NO_REPLY 段；收口时**最后一段**是 NO_REPLY → 整轮静默。
+  只认 `runTag` 对得上的那条登记——属主 run 的工具调用绝不会截断同事的答疑段落、也不进同事卡的过程区。
 - **分段去重（`assistant_message` 晚到的竞态）**：正常顺序是 delta* → assistant_message → tool_call，当前段的落盘版
   早已见过；万一落盘版晚于 tool_call 到达，被收掉的段落文本记进 `awaitingMessages`，
   `acceptGroupReplyMessage` 凭它认出重复并丢弃（必须排在「当前段已有 delta 就丢弃」之前判，否则下一段的 delta
@@ -1577,7 +1593,7 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
 - `tests/advance-options.test.ts`：server 复算的可推进清单与推进弹窗同口径
   （布局顺序显隐 / 分组序 / 日常任务只列自定义 / 关 skill / 团队规范开关 / legacy 滤除）
 - `tests/feishu-group-outbound.test.ts`：ask 卡发群（两个开关 + 未绑群）、回答攒 delta
-  后按回复协议回群（**文本卡**、不是 text / post；只发最终段、真人提问人才自动补 @，细节见 `group-outbound-reply`）、done 后登记摘除、推进产物走 share 卡、share 失败降级发文本、
+  后按回复协议回群（**文本卡**、不是 text / post；发累积全文（2026-11-09 前是只发最终段）、真人提问人才自动补 @，细节见 `group-outbound-reply`）、done 后登记摘除、推进产物走 share 卡、share 失败降级发文本、
   **产物卡先占再发**（播报已占坑就不发第二张 / 发失败退坑）；
   **token 化投递**（属主 done 先到不动旁路登记 / 两条登记并存各投各的 / stop 补发的
   无 origin done 不误 flush / 多位同事各自 token / assistant_message 兜底也认 origin）、
@@ -1664,8 +1680,9 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
   裸 `@ou_` / `@名字(ou_…)` / `<at>` 标签还原、`<card>` 外壳拆除（页脚不再被 `</card>` 挡成「非文末」）、
   JSON 卡片 `collapsible_panel` 子树跳过、20000 截断在净化之后；`tests/inbound-card-sanitize-r6.test.ts`（第六轮 H1-06）：
   无配对 `▲` 的面板头只剥「面板头 + 缩进的面板体」、不再一路剥到文末（要点列表后的正文保留）
-- `tests/group-outbound-reply.test.ts`（mock 外部调用）：**只发最终段**（旁白不进群 / delta→assistant_message→tool_call 真实顺序不重复不丢字 /
-  落盘版晚到仍认得重复 / 别的 run 的 tool_call 不截断本条 / advance 登记不分段）、**失败 / 空回答**（机器人静默、真人中性提示且
+- `tests/group-outbound-reply.test.ts`（mock 外部调用）：**发累积全文**（各段按序空行拼 / delta→assistant_message→tool_call 真实顺序不重复不丢字 /
+  落盘版晚到仍认得重复 / 别的 run 的 tool_call 不截断本条 / advance 登记不分段 / 末段 NO_REPLY 整轮静默 / closedSegments 上限）、
+  **流式群卡过程区**（先调工具后开口不建卡、建卡带上先前过程区、running→completed/failed 回填、thinking 合并、别的 run 不串、关流式不推）、**失败 / 空回答**（机器人静默、真人中性提示且
   不含 Flowship / 事件流）、`NO_REPLY` 与 `@名字` 落地、**需属主确认**（写主事件流 `groupNeedsOwner` info、发群失败也写、无属主降级）、
   **超长切块**（≤1800 字 ×3、不切断 at 标签、尾巴不提 Flowship、后续块不补 @）、汇总新字段、外部查询挂死 3 秒硬超时不阻塞
 - `tests/task-stream-group-run-meta.test.ts`：`writeOwnedEventAndPublish` 带 origin → 落盘 `meta.groupRun`（不覆盖事件自带 meta）、

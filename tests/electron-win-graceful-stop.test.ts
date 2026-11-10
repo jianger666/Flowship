@@ -612,6 +612,8 @@ describe("main.js 的 startServer：spawn 的 env / stdio（切源码真跑，sp
         log: vi.fn(),
         dialog: { showErrorBox: vi.fn() },
         onServerExit: vi.fn(async () => {}),
+        // 内置浏览器：startServer 里 spawn 之后会对新 proc 挂 server 通道（替身，不关心内部）
+        browserManager: { attachServerChannel: vi.fn() },
       },
       mainDecls("serverProc", "quitting"),
       "return { startServer };",
@@ -657,7 +659,8 @@ describe("main.js 的 startServer：spawn 的 env / stdio（切源码真跑，sp
 
 describe("main.js 接线契约（源码）", () => {
   it("spawn：win32 才给 server 一根 stdin 管道并设 FLOWSHIP_EXIT_ON_STDIN_EOF；unix 仍是 \"ignore\"（stdio 配置不变）；stdin 的 error 有监听", () => {
-    expect(mainSrc).toContain('stdio: [process.platform === "win32" ? "pipe" : "ignore", "pipe", "pipe"],');
+    // 内置浏览器（docs/BROWSER-AUTOMATION.md §8.1）起：stdio 末尾追加第 4 路 "ipc"（server ⇄ 主进程双向通道），前三路不变
+    expect(mainSrc).toContain('stdio: [process.platform === "win32" ? "pipe" : "ignore", "pipe", "pipe", "ipc"],');
     // R8-7：env 经 withStdinEofExitEnv（非 win32 显式删掉、win32 覆盖成 "1"），不再有「只在 win32 展开、其它平台透传用户值」的写法
     expect(mainSrc).toContain("env: withStdinEofExitEnv(");
     expect(mainSrc).not.toContain('...(process.platform === "win32" ? { FLOWSHIP_EXIT_ON_STDIN_EOF: "1" } : {}),');

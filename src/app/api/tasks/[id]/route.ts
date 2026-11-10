@@ -83,6 +83,7 @@ import {
   isChatRewindInProgress,
 } from "@/lib/server/chat-gate";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
+import { closeBrowserSession } from "@/lib/server/browser/bridge";
 import { isValidReqId } from "@/lib/req-id";
 import { firstNonLocalRepoPath } from "@/lib/unc-path";
 import { isTailAnchorEvent } from "@/lib/tail-anchor";
@@ -692,6 +693,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // DELETE 到达时 owner 能感知并中止（勿只 release——旧请求无从发现）。
     cancelChatStart(id);
     cleanupChatTaskState(id);
+    // 内置浏览器会话随任务删除而关（视图 / CDP / 缓冲）；best-effort、无桌面壳时无操作
+    closeBrowserSession(id);
     // 清 action 屏障 Map——防 DELETE 后工具 wait 永久挂死泄漏
     clearActionSideEffects(id);
     // V0.8.18：连带杀掉可能还在后台跑的后置 check 子进程（删 task 后 check 跑完也无处落、防孤儿）

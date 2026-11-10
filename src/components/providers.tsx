@@ -18,6 +18,7 @@ import { useEffect, type ReactNode } from "react";
 import { DialogProvider } from "@/hooks/use-dialog";
 import { ImagePreviewProvider } from "@/components/ui/image-preview";
 import { LocalFilePreviewProvider } from "@/components/ui/local-file-preview";
+import { BrowserAskWatcher } from "@/components/browser/browser-ask-watcher";
 import { CloseConfirmHandler } from "@/components/close-confirm-handler";
 import { DeepLinkHandler } from "@/components/deep-link-handler";
 import { GlobalShortcuts } from "@/components/global-shortcuts";
@@ -71,6 +72,8 @@ export const Providers = ({ children }: ProvidersProps) => {
             <MrInboxProvider>
               {/* 任务转入「等你回复」且窗口在后台 → 系统通知 + Dock 角标（点通知跳详情页） */}
               <TaskAttentionWatcher />
+              {/* 内置浏览器：AI 请用户在浏览器里操作一下（不在该任务页 / 窗口在后台时叫人回来） */}
+              <BrowserAskWatcher />
               {/* 飞书卡片深链 flowship://tasks/<id> → 路由跳对应任务页 */}
               <DeepLinkHandler />
               <CloseConfirmHandler />

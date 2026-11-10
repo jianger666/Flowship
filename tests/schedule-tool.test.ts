@@ -46,8 +46,8 @@ const { setChatTaskActionHandler, getExpectedCallerToken } = await import("@/lib
 
 const def = flowShipTools.find((t) => t.name === SCHEDULE_TOOL_NAME)!;
 
-const textOf = (r: { content: Array<{ type: "text"; text: string }> }): string =>
-  r.content.map((c) => c.text).join("");
+const textOf = (r: { content: Array<{ type: string; text?: string }> }): string =>
+  r.content.map((c) => c.text ?? "").join("");
 
 let seq = 0;
 const freshTask = async (): Promise<string> => {

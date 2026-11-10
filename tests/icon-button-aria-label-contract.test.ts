@@ -318,9 +318,9 @@ const loadPureFn = <F extends (...args: never[]) => unknown>(file: string, name:
 describe("工作区操作条：纯图标按钮的名字都带仓名（Q19-01）", () => {
   const FILE = "components/tasks/workspace-actions.tsx";
 
-  it("workspace-actions.tsx 里每个 aria-label 都经 iconLabel（动作 +（仓名））生成，共 7 个", () => {
+  it("workspace-actions.tsx 里每个 aria-label 都经 iconLabel（动作 +（仓名））生成，共 8 个", () => {
     const labels = ariaLabelValues(FILE);
-    expect(labels).toHaveLength(7);
+    expect(labels).toHaveLength(8);
     for (const v of labels) expect(v, v).toContain("iconLabel(");
   });
 
@@ -330,9 +330,10 @@ describe("工作区操作条：纯图标按钮的名字都带仓名（Q19-01）"
     expect(iconLabel("停止预览 dev server", "group/projA")).toBe("停止预览 dev server（group/projA）");
   });
 
-  it("7 个名字的动作文案与仓名来源逐个钉住（与各自 Tooltip 同文；「启动预览」例外：Tooltip 是命令本身，名字补了动词）", () => {
+  it("8 个名字的动作文案与仓名来源逐个钉住（与各自 Tooltip 同文；「启动预览」例外：Tooltip 是命令本身，名字补了动词）", () => {
     expect(ariaLabelValues(FILE)).toEqual([
       "{iconLabel(`打开 ${mine.url}`, repoName)}",
+      '{iconLabel("在内置浏览器打开预览", repoName)}',
       '{iconLabel("停止预览 dev server", repoName)}',
       '{iconLabel("用同一命令重新启动预览", repoName)}',
       "{iconLabel(`启动预览:${c.command}`, repoName)}",

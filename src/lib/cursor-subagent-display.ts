@@ -190,6 +190,36 @@ export const toWaitDisplayCall = <M extends ToolCallShape>(msg: M): M => {
   return next as M;
 };
 
+/** 内置浏览器工具名前缀（与 browser-tool-display 的 BROWSER_TOOL_PREFIX 同值；这里不 import 以免与展示层互相依赖） */
+const BROWSER_TOOL_NAME_PREFIX = "browser_";
+
+/** 是不是我们的 `browser_*` 工具调用（Cursor 的 MCP 外壳；pi 里它本来就叫 `browser_xxx`、不需要改写） */
+export const isCursorBrowserCall = (msg: ToolCallShape): boolean => {
+  if (msg.name !== "mcp") return false;
+  if (!isRecord(msg.args)) return false;
+  const tool = msg.args.toolName;
+  return (
+    msg.args.providerIdentifier === CURSOR_CUSTOM_TOOLS_SERVER &&
+    typeof tool === "string" &&
+    tool.startsWith(BROWSER_TOOL_NAME_PREFIX)
+  );
+};
+
+/**
+ * 把 `browser_*` 的 MCP 调用改写成扁平的 `browser_xxx`（name → 内层工具名，args → 真入参）；其它消息原样返回（同一引用）。
+ *
+ * 为什么要改（R1 评审 sa 提示）：折叠行摘要（`browserToolSummary`）按工具名前缀 + 扁平入参认它，pi 路径本来就是这个形状；
+ * 不改的话 Cursor 下就是一个 `mcp`、摘要退化成整段外壳 JSON。
+ * **只改 name / args，不动 result**：浏览器工具的结果可能带截图（图片内容块），拆信封取文本会丢图；
+ * 结果落盘 / 展示沿用原来的 MCP 信封处理。只改展示用的副本，不动 SDK 原消息。
+ */
+export const toBrowserDisplayCall = <M extends ToolCallShape>(msg: M): M => {
+  if (!isCursorBrowserCall(msg)) return msg;
+  const outer = msg.args as Record<string, unknown>;
+  const inner = isRecord(outer.args) ? outer.args : {};
+  return { ...(msg as Record<string, unknown>), name: outer.toolName as string, args: inner } as M;
+};
+
 /**
  * 把 `subagent` 的 MCP 调用改写成 `task` 的展示形状；其它消息原样返回（同一引用）。
  *  - name → "task"，args → 真入参（扁平；传了 ctx.parentModel 时徽标字段换成实际生效值）

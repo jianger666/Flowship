@@ -497,9 +497,26 @@ export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
 };
 
 /**
+ * 服务端重建的占位：bootstrap 的 `operationSnapshot` 只带 itemId + phase，重建出来的占位没有正文、没有指纹
+ * （本窗口真实登记的占位恒有指纹——哪怕是纯附件消息）。判据与 `lib/queue-banner.isServerRebuiltPlaceholder` 同源、
+ * 多加一条「正文为空」，免得误伤测试里省略指纹的手工构造。
+ */
+const isRebuiltPlaceholder = (p: { payloadFingerprint?: string; displayText?: string }): boolean =>
+  !p.payloadFingerprint && (p.displayText ?? "") === "";
+
+/**
  * SSE 重连 bootstrap 对账。
  * unknown recentSettled 走同一 product join——不得硬写降 persistence。
  * active 分支只单调 join：可升 persistence，不得清 network / unknown（无因果版本）。
+ *
+ * 重建占位的存活判据（幽灵「N 条排队中」、点开却「队列已空」的修复）：
+ * 快照里的 `accepting` 不等于「在排队」——刚 claim、还没入队的请求，以及被 409 软拒绝（定时遇忙 / 停止中 / 队满…）
+ * 后静默 release 的请求，都曾短暂是 `accepting`，而 release 不发任何帧。若 bootstrap 恰好撞在窗口里，
+ * 旧逻辑会把它重建成占位，之后又因「不在 serverSet」被当成真幽灵永久保留（标 networkUncertain、不 delivered）——
+ * 重建占位没有正文也没有指纹，既画不出来也无法重试，只会在排队条上凭空多一个数。所以：
+ * - 重建：`accepting` 只有出现在服务端队列 / in-flight（`serverItemIds`）里才重建；`persisted` 照旧（落盘后本地隐藏、不计数）；
+ * - 保留：已有的重建占位只有「仍在服务端队列 / in-flight」或「快照里已 persisted」才留，其余（已被释放 / 终态 / 未知终态）直接丢。
+ * 本窗口真实登记的占位（有指纹）不受影响，仍走原来的真幽灵 / uncertain 口径。
  */
 export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -518,6 +535,8 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
     .filter((e) => e.itemId && isMessageOpActivePhase(e.phase))
     .map((e) => e.itemId);
   const serverSet = new Set([...serverItemIds, ...activeFromSnapshot]);
+  // 真正「在排队 / 在送」的 id（队内 + in-flight）；与 serverSet 的区别：不含只在 snapshot 里 accepting 的
+  const queueIdSet = new Set(serverItemIds);
   const snapshotById = new Map(
     operationSnapshot
       .filter((e) => e.itemId)
@@ -548,6 +567,17 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
 
   for (const p of pending) {
     const cur = readProduct(p);
+    // 重建占位（无正文 / 无指纹）：只有「仍在服务端队列 / in-flight」或「快照里已 persisted」才留。
+    // 它既画不出来也无法重试，留着只会在排队条上凭空多一个数（见函数头注释）。放在 serverSet 判断之前：
+    // 「只在 snapshot 里 accepting、不在队里」的重建占位也要丢（那正是被软拒绝后静默 release 的请求）。
+    if (
+      isRebuiltPlaceholder(p) &&
+      !queueIdSet.has(p.itemId) &&
+      snapshotById.get(p.itemId)?.phase !== "persisted"
+    ) {
+      seenPending.add(p.itemId);
+      continue;
+    }
     // 仍在服务端存活集合 → 保留；snapshot 只可提升 persistence（单调 join）。
     // 不得 clearAllUncertainty——bootstrap 无 attempt generation，不能反驳
     // 本地 network reject / unknown terminal；保留 uncertain 投影是 fail-closed。
@@ -590,6 +620,9 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
     if (!snap.itemId || !isMessageOpActivePhase(snap.phase)) continue;
     if (seenPending.has(snap.itemId) || settledSet.has(snap.itemId)) continue;
     if (knownLedgerSet.has(snap.itemId)) continue;
+    // `accepting` 只有真在队列 / in-flight 里才重建：刚 claim 未入队、或马上被软拒绝 release 的请求不是「排队」，
+    // 重建了也没有任何后续帧能把它清掉（见函数头注释）。persisted 照旧重建（本地隐藏、不计数）
+    if (snap.phase !== "persisted" && !queueIdSet.has(snap.itemId)) continue;
     const product = initialProductState();
     const withPers =
       snap.phase === "persisted"

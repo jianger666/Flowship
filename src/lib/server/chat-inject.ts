@@ -115,6 +115,7 @@ import {
   stringSetEquals,
 } from "@/lib/server/route-helpers";
 import { TASK_INJECT_BUSY_CODE } from "./task-inject-shared";
+import { buildBrowserActivityNote, shouldAttachBrowserNote } from "./browser/activity";
 
 
 export interface ChatInjectBody {
@@ -435,9 +436,20 @@ const runChatReplyInject = async (
   // 事件 = 用户原文；agent = 跳过上下文 + skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）
   // （URL 自动抓取投喂做过又撤了——2026-07-21 用户实测收益不大问题多、链接交给 agent 自己解析）
   // agentContext（引用块等）跟在原文后；原文为空（纯附件）时先垫占位，免得 agent 只看到一个孤零零的引用块
-  const agentContextTail = options.agentContext
-    ? `${text.length > 0 ? "\n\n" : fallbackText ? `${fallbackText}\n\n` : ""}${options.agentContext}`
-    : "";
+  // 内置浏览器·路径 2：用户本人发消息时附上他在浏览器里「AI 还没看到」的操作摘要（只摘要 + 当前页面，不附快照）。
+  // 只给属主本人的消息（输入条 / 飞书私聊）；定时到点 / 群里别人的话 / 浏览器交还本身都不附（见 shouldAttachBrowserNote）。
+  // 摘要拼进 agentText：入队时存的就是 agentText，所以排队重放不会丢（markSeen 在拉取时已推进）。bridge 不可用 → null，零开销。
+  const browserNote =
+    !options.scheduledTrigger && shouldAttachBrowserNote(options.userReplyMetaExtra)
+      ? await buildBrowserActivityNote(task.id)
+      : null;
+  const contextParts = [options.agentContext, browserNote].filter(
+    (p): p is string => typeof p === "string" && p.length > 0,
+  );
+  const agentContextTail =
+    contextParts.length > 0
+      ? `${text.length > 0 ? "\n\n" : fallbackText ? `${fallbackText}\n\n` : ""}${contextParts.join("\n\n")}`
+      : "";
   const agentText =
     askSkip.hint + buildSkillDirective(skills) + text + agentContextTail;
 

@@ -18,6 +18,7 @@ import {
   Copy,
   ExternalLink,
   FileTerminal,
+  Globe,
   Loader2,
   Play,
   Square,
@@ -26,6 +27,8 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
+import { requestOpenInBrowser } from "@/components/browser/browser-panel-bridge";
+import { useBrowserAvailable } from "@/components/browser/use-browser-session";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import {
@@ -56,6 +59,8 @@ const BTN_CLS = "size-6 shrink-0 justify-center p-0 text-muted-foreground hover:
 const iconLabel = (action: string, repoName: string): string => `${action}（${repoName}）`;
 
 export const WorkspaceActions = ({ task }: Props) => {
+  // 内置浏览器只在桌面端有：网页版不画「在内置浏览器打开」
+  const browserAvailable = useBrowserAvailable();
   // 设置快照（jumpIde + 每仓预览命令）——挂载时读一次、设置页改完回来重新挂载自然刷新
   const [prefs, setPrefs] = useState<{
     jumpIde: JumpIde;
@@ -206,6 +211,24 @@ export const WorkspaceActions = ({ task }: Props) => {
                 }
               >
                 <ExternalLink className="size-3.5" />
+              </Button>
+            </Tooltip>
+          )}
+          {mine.url && browserAvailable && (
+            <Tooltip content="在内置浏览器打开预览">
+              <Button
+                variant="ghost"
+                size="sm"
+                className={BTN_CLS}
+                aria-label={iconLabel("在内置浏览器打开预览", repoName)}
+                onClick={() => {
+                  // 展开任务页的浏览器面板并导航；没人接单（页面里没有浏览器面板）时提示，不静默失败
+                  if (!requestOpenInBrowser(task.id, mine.url as string)) {
+                    toast.info("当前页面没有内置浏览器面板");
+                  }
+                }}
+              >
+                <Globe className="size-3.5" />
               </Button>
             </Tooltip>
           )}

@@ -42,6 +42,16 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { BrowserPanel } from "@/components/browser/browser-panel";
+import {
+  prepareBrowserPaneEntry,
+  resolveTaskLeftPaneMinSize,
+} from "@/components/browser/browser-layout-memory";
+import { createUserCloseIntent } from "@/components/browser/browser-auto-open";
+import { registerBrowserPanelOpener } from "@/components/browser/browser-panel-bridge";
+import { BrowserToggleButton } from "@/components/browser/browser-toggle-button";
+import { LeftPaneSwitch, type LeftPaneTab } from "@/components/browser/left-pane-switch";
+import { useBrowserAutoOpen } from "@/components/browser/use-browser-auto-open";
 import { MrInboxTaskBanner } from "@/components/mr-inbox/mr-inbox-task-banner";
 import { ActionWorkbenchHeader } from "@/components/tasks/action-workbench-header";
 import { AdvanceDialog } from "@/components/tasks/advance-dialog";
@@ -112,6 +122,7 @@ import {
   resolveArtifactDefaultPercent,
 } from "@/lib/task-split-layout";
 import { isEphemeralToolOutputDelta } from "@/lib/tool-display";
+import { cn } from "@/lib/utils";
 
 import { getSettings } from "@/lib/local-store";
 import {
@@ -341,6 +352,8 @@ const TaskDetailPage = () => {
     setRunActive(false);
     // 折叠态属于上一个任务的 Group（key=task.id、切任务会重挂）；新 Group 总是展开着挂
     setArtifactCollapsed(false);
+    // 左栏标签同理：浏览器标签属于上一个任务的会话，新任务回到「产物」
+    setLeftTab("artifact");
   }, [id, clearStreaming]);
 
   // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松——
@@ -741,8 +754,11 @@ const TaskDetailPage = () => {
   // defaultSize 写不了 CSS max()：由主区容器的 ref 回调在挂载时量一次宽度（提交阶段、绘制前），
   // 量到之前不挂 Group，免得先按旧默认 70/30 挂一遍再换。窗口之后再缩放由 Panel 的 px 下限兜住，不用 observer。
   const [mainWidth, setMainWidth] = useState<number | null>(null);
+  // 同时留下元素本身：切到浏览器标签时要按「此刻」的分栏组宽度换算栏宽（mainWidth 只在挂载时量一次，窗口缩放后是旧值）
+  const mainElRef = useRef<HTMLDivElement | null>(null);
   const mainWidthRef = useCallback((el: HTMLDivElement | null) => {
     if (el) setMainWidth(el.clientWidth);
+    mainElRef.current = el;
   }, []);
   const artifactDefaultPercent = resolveArtifactDefaultPercent({
     persisted: task?.uiLayout?.artifactPanelSize,
@@ -751,15 +767,73 @@ const TaskDetailPage = () => {
   // 产物栏折叠：Panel 命令式句柄 + 折叠态（由 Panel 的 onResize 回写，拖到最小宽度以下自动折叠时也同步）
   const artifactPanelRef = usePanelRef();
   const [artifactCollapsed, setArtifactCollapsed] = useState(false);
-  // 折叠态同步给「搜索此栏」路由：折叠后 Cmd/Ctrl+F 不再落进看不见的产物搜索框（R9a-01）；离开页面复位
+  // 左栏当前内容：产物 / 内置浏览器（仅桌面端有入口）。ArtifactPanel 始终挂着、只是隐藏，切回来不丢滚动与选区
+  const [leftTab, setLeftTab] = useState<LeftPaneTab>("artifact");
+  // 折叠态同步给「搜索此栏」路由：折叠后 Cmd/Ctrl+F 不再落进看不见的产物搜索框（R9a-01）；
+  // 左栏切到浏览器时产物区同样看不见，一并算折叠；离开页面复位
   useEffect(() => {
-    setArtifactPaneCollapsed(artifactCollapsed);
-  }, [artifactCollapsed]);
+    setArtifactPaneCollapsed(artifactCollapsed || leftTab === "browser");
+  }, [artifactCollapsed, leftTab]);
   useEffect(() => () => setArtifactPaneCollapsed(false), []);
+  // 「用户主动收起浏览器面板」的意图（R2-14 ③）：点头部按钮 / 点「产物」标签 / 点折叠按钮时先 mark，
+  // 自动展开 hook 靠它区分「用户关的」与「布局库自己折叠 / 夹取的」——后者不能记成「用户已收起」。
+  // 拖分隔条（或键盘调整）的意图由下面的 userResizeIntentRef 表达，两者在 isUserClosePane 里合并
+  const userCloseIntentRef = useRef(createUserCloseIntent());
+  // R9a-03：只有用户在分隔条上真拖 / 按键之后产生的 onLayoutChanged 才写回；
+  // 挂载 / 窗口缩放重算也会触发它，不拦的话窄窗口打开任务会把已存比例改写成「窗口校准后的值」
+  // （声明提前到这里：自动展开 hook 的 isUserClosePane 也要读它）
+  const userResizeIntentRef = useRef(createUserResizeIntent());
+  const isUserClosePane = useCallback(() => {
+    const now = Date.now();
+    return userCloseIntentRef.current.isRecent(now) || userResizeIntentRef.current.isActive(now);
+  }, []);
   const toggleArtifactPanel = useCallback(() => {
     if (artifactPanelRef.current?.isCollapsed()) artifactPanelRef.current?.expand();
-    else artifactPanelRef.current?.collapse();
+    else {
+      userCloseIntentRef.current.mark(Date.now());
+      artifactPanelRef.current?.collapse();
+    }
   }, [artifactPanelRef]);
+  // 浏览器面板：展开（必要时先把折叠的左栏展开）/ 头部入口开关 / 自动展开与「在内置浏览器打开」共用。
+  // 顺序很关键（R2-14 ③）：先在**旧约束**仍有效时把栏展开 / 放宽到浏览器标签的像素下限，再换标签——
+  // 换标签会让 minSize 变成像素下限、库随即按新约束重新校验当前宽度（< 下限一半直接折叠），
+  // 而在 setLeftTab 之后再 expand() 读到的还是旧约束。决策与操作顺序见 prepareBrowserPaneEntry（纯逻辑，有单测）；
+  // 真窗口里库的表现未验证
+  const showBrowserPane = useCallback(() => {
+    prepareBrowserPaneEntry(artifactPanelRef.current, mainElRef.current?.clientWidth);
+    setLeftTab("browser");
+  }, [artifactPanelRef]);
+  const browserPaneOpen = leftTab === "browser" && !artifactCollapsed;
+  const toggleBrowserPane = useCallback(() => {
+    // 收起 = 切回产物（不是把整个左栏折掉）：用户多半是想回去看产物
+    if (browserPaneOpen) {
+      userCloseIntentRef.current.mark(Date.now());
+      setLeftTab("artifact");
+    } else showBrowserPane();
+  }, [browserPaneOpen, showBrowserPane]);
+  // 左栏顶部的「产物 | 浏览器」分段切换：切到浏览器也要先放宽栏宽（与头部入口同一条路径），切回产物是用户收起
+  const onLeftTabChange = useCallback(
+    (tab: LeftPaneTab) => {
+      if (tab === "browser") showBrowserPane();
+      else {
+        userCloseIntentRef.current.mark(Date.now());
+        setLeftTab(tab);
+      }
+    },
+    [showBrowserPane],
+  );
+  const browserTaskId = task && task.mode !== "chat" ? task.id : null;
+  useEffect(() => {
+    if (!browserTaskId) return;
+    return registerBrowserPanelOpener(browserTaskId, showBrowserPane);
+  }, [browserTaskId, showBrowserPane]);
+  // AI 开始用浏览器 / 请用户操作时自动展开（只对当前显示的任务；手动收起后本轮不再自动弹）
+  useBrowserAutoOpen({
+    taskId: browserTaskId,
+    panelOpen: browserPaneOpen,
+    onOpen: showBrowserPane,
+    isUserClose: isUserClosePane,
+  });
 
   // 事件流行内动作（错误卡「重试」）：与 chat 的 ChatView 同语义——把最后一条用户消息
   // 原样再发（图 / 路径附件 / skill 引用一起带回），走任务统一消息通道 submitTaskQuestion。
@@ -826,9 +900,7 @@ const TaskDetailPage = () => {
     [task, absorbTask],
   );
 
-  // R9a-03：只有用户在分隔条上真拖 / 按键之后产生的 onLayoutChanged 才写回；
-  // 挂载 / 窗口缩放重算也会触发它，不拦的话窄窗口打开任务会把已存比例改写成「窗口校准后的值」
-  const userResizeIntentRef = useRef(createUserResizeIntent());
+  // userResizeIntentRef 的声明与 R9a-03 的说明在上面（浏览器面板那一段，自动展开 hook 也要读它）
   useEffect(() => {
     const onPointerEnd = () => userResizeIntentRef.current.pointerUp(Date.now());
     window.addEventListener("pointerup", onPointerEnd);
@@ -1438,6 +1510,13 @@ const TaskDetailPage = () => {
           {/* 代码改动预览：各仓相对线上分支的净改动（数据直接读 git、不用再开 IDE 翻）；
               key=task.id：切任务时清掉上一个任务的清单 / 选中态 */}
           <TaskChangesPanel key={task.id} task={task} />
+          {/* 内置浏览器入口（仅桌面端渲染；AI 在用 / 等你操作时带状态点） */}
+          <BrowserToggleButton
+            taskId={task.id}
+            open={browserPaneOpen}
+            onToggle={toggleBrowserPane}
+            size="sm"
+          />
           <div className="h-4 w-px shrink-0 bg-border" />
           <TaskUtilityActions task={task} onTaskUpdate={absorbTask} />
           {/* 产物栏折叠：窄窗口下把整行宽度让给事件流（V13 窄栏策略）；拖分隔条到最小宽度以下也会自动折叠。
@@ -1502,7 +1581,8 @@ const TaskDetailPage = () => {
             id="artifact"
             panelRef={artifactPanelRef}
             defaultSize={`${artifactDefaultPercent}%`}
-            minSize="20%"
+            // 产物标签 20%；浏览器标签激活时换像素下限（960px 窗口下 20% 只有 ~140px，浏览器工具栏没法用，R1-37）
+            minSize={resolveTaskLeftPaneMinSize(leftTab === "browser")}
             maxSize={`${ARTIFACT_PANEL_MAX_PERCENT}%`}
             // 可折叠：拖到 minSize 以下自动折叠成 0、或点头部的折叠按钮；
             // 事件流栏不设 maxSize（默认 100%），折叠后才能把整行宽度吃满
@@ -1514,6 +1594,9 @@ const TaskDetailPage = () => {
           >
             {/* 折叠态面板子树仍挂载（宽度 0）：加 inert 让它退出 Tab 序与读屏（R9a-06） */}
             <div className="flex h-full flex-col" inert={artifactCollapsed}>
+            <LeftPaneSwitch value={leftTab} onChange={onLeftTabChange} />
+            {/* 浏览器标签下产物区只是隐藏、不卸载（ArtifactPanel 内部状态 / 滚动位置保留） */}
+            <div className={cn("flex min-h-0 flex-1 flex-col", leftTab === "browser" && "hidden")}>
               <ActionWorkbenchHeader
                 actions={task.actions}
                 selectedActionId={selectedActionId}
@@ -1559,6 +1642,13 @@ const TaskDetailPage = () => {
                   </div>
                 )}
               </div>
+            </div>
+            {/* 浏览器只在它的标签下渲染：没打开过的用户零开销；切走即卸载（视图 detach，会话仍在主进程里） */}
+            {leftTab === "browser" && (
+              <div className="min-h-0 flex-1">
+                <BrowserPanel taskId={task.id} />
+              </div>
+            )}
             </div>
           </ResizablePanel>
           <ResizableHandle withHandle />

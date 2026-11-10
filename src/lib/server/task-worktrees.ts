@@ -1317,6 +1317,19 @@ const defaultBranchSelection = (
 };
 
 /**
+ * 隔离 task「现在应该检出哪条分支」——与 {@link ensureTaskWorktrees} 默认选择（不传 branchSelection）
+ * 完全同口径的纯函数：flowship = 按模板规划的任务分支；wk 且已有显式记录 = 记录的业务分支；其余（detached）= 不规定分支。
+ * 给「输入条消息送进存活会话前」的分支漂移探测用（见 task-branch-guard.ts）：探测与 ensure 的期望必须是同一张表，
+ * 否则探测认为漂移、ensure 却不会切（或反过来）。
+ */
+export const resolveExpectedWorktreeBranches = (task: Task): GitBranchInfo[] => {
+  const selection = defaultBranchSelection(task);
+  if (selection.kind === "flowship") return planWorktreeBranchInfos(task);
+  if (selection.kind === "explicit") return selection.infos;
+  return [];
+};
+
+/**
  * 确保本 task 每个仓的 worktree 都存在且检出了任务分支（幂等、可反复调）。
  *
  * 单仓流程：

@@ -145,3 +145,104 @@ contextBridge.exposeInMainWorld("__shell", {
   /** @param {{ count: number, dataUrl?: string }} payload */
   setInboxBadge: (payload) => ipcRenderer.send("inbox:set-badge", payload),
 });
+
+// 内置浏览器桥（docs/BROWSER-AUTOMATION.md §5 / §8.2）：面板（React）经这里驱动主进程的 BrowserManager。
+// - 只有主窗口带本 preload；浏览器 view 自己**没有** preload（页面碰不到这些 IPC），主进程每个 browser:* 入口
+//   还会再过 isTrustedIpcSender（只认本应用 origin）
+// - 高频的 setBounds（拖分栏 / 缩放）走 send（单向、无返回值），其余有返回值的走 invoke，无返回值的动作走 send
+// - onState / onPicked：ipcRenderer.on 订阅主进程推送，返回取消订阅函数
+contextBridge.exposeInMainWorld("__browser", {
+  // —— 视图生命周期 ——
+  /** 懒创建会话、把视图搬到主窗口并设 bounds @returns {Promise<object>} BrowserState */
+  attach: (taskId, bounds) => ipcRenderer.invoke("browser:attach", taskId, bounds),
+  /** 高频：renderer 侧 rAF 节流后调用，不等返回 */
+  setBounds: (taskId, bounds) => ipcRenderer.send("browser:setBounds", taskId, bounds),
+  /** 搬回停车场（面板卸载 / 离开任务页） */
+  detach: (taskId) => ipcRenderer.send("browser:detach", taskId),
+  /** covered=true：截图 + 隐藏视图并返回 jpeg dataURL；covered=false：恢复。失败 null @returns {Promise<string|null>} */
+  setCovered: (taskId, covered) => ipcRenderer.invoke("browser:setCovered", taskId, covered === true),
+  // —— 用户导航 ——
+  /** @returns {Promise<{ ok: boolean, error?: string }>} */
+  navigate: (taskId, input) => ipcRenderer.invoke("browser:navigate", taskId, input),
+  back: (taskId) => ipcRenderer.send("browser:back", taskId),
+  forward: (taskId) => ipcRenderer.send("browser:forward", taskId),
+  reload: (taskId) => ipcRenderer.send("browser:reload", taskId),
+  stop: (taskId) => ipcRenderer.send("browser:stop", taskId),
+  /** @returns {Promise<string|null>} 新 tab 的 id */
+  newTab: (taskId, url) => ipcRenderer.invoke("browser:newTab", taskId, url),
+  selectTab: (taskId, tabId) => ipcRenderer.send("browser:selectTab", taskId, tabId),
+  closeTab: (taskId, tabId) => ipcRenderer.send("browser:closeTab", taskId, tabId),
+  // —— 谁在操作 ——
+  /** 用户接管：解锁输入、中断 AI 当前动作 */
+  takeover: (taskId) => ipcRenderer.send("browser:takeover", taskId),
+  /** 交还给 AI（可带一句话） */
+  handback: (taskId, note) => ipcRenderer.send("browser:handback", taskId, note),
+  /** 响应 ask_user_to_act："done" | "skipped" */
+  answerAsk: (taskId, outcome, note) => ipcRenderer.send("browser:answerAsk", taskId, outcome, note),
+  // —— 元素拾取 ——
+  startPick: (taskId) => ipcRenderer.send("browser:startPick", taskId),
+  cancelPick: (taskId) => ipcRenderer.send("browser:cancelPick", taskId),
+  // —— 状态 ——
+  /** @returns {Promise<object|null>} BrowserState */
+  getState: (taskId) => ipcRenderer.invoke("browser:getState", taskId),
+  /**
+   * 订阅全部任务的状态推送（主进程 50ms 去抖）。返回取消订阅函数。
+   * @param {(taskId: string, state: object) => void} callback
+   */
+  onState: (callback) => {
+    const listener = (_event, taskId, state) => callback(taskId, state);
+    ipcRenderer.on("browser:state", listener);
+    return () => ipcRenderer.removeListener("browser:state", listener);
+  },
+  /**
+   * 订阅元素拾取结果。返回取消订阅函数。
+   * @param {(taskId: string, picked: object) => void} callback
+   */
+  onPicked: (callback) => {
+    const listener = (_event, taskId, picked) => callback(taskId, picked);
+    ipcRenderer.on("browser:picked", listener);
+    return () => ipcRenderer.removeListener("browser:picked", listener);
+  },
+  /** 清登录态（cookies / storage） @returns {Promise<void>} */
+  clearBrowsingData: () => ipcRenderer.invoke("browser:clearBrowsingData"),
+  // —— V4 用户侧（契约 §14.3）：缩放 / 页内查找 / DevTools / 下载 / 对话框 / 模拟；主进程实现在 browser/user-features.mjs ——
+  /** 缩放当前 tab："in" | "out" | "reset" */
+  zoom: (taskId, action) => ipcRenderer.send("browser:zoom", taskId, action),
+  /** 页内查找：opts = { forward?, findNext?, matchCase? }；text 为空等价于 stopFind */
+  find: (taskId, text, opts) => ipcRenderer.send("browser:find", taskId, text, opts),
+  stopFind: (taskId) => ipcRenderer.send("browser:stopFind", taskId),
+  /** 订阅查找进度 { taskId, activeMatchOrdinal, matches }。返回取消订阅函数 */
+  onFound: (callback) => {
+    const listener = (_event, found) => callback(found);
+    ipcRenderer.on("browser:found", listener);
+    return () => ipcRenderer.removeListener("browser:found", listener);
+  },
+  /** 订阅「页面持有焦点时按了 Cmd/Ctrl+F」→ 面板该打开查找条了。返回取消订阅函数 */
+  onFindRequested: (callback) => {
+    const listener = (_event, taskId) => callback(taskId);
+    ipcRenderer.on("browser:findRequested", listener);
+    return () => ipcRenderer.removeListener("browser:findRequested", listener);
+  },
+  openDevTools: (taskId) => ipcRenderer.send("browser:openDevTools", taskId),
+  /** 在文件夹中显示 / 打开下载：只传会话内的下载 id，路径永远由主进程从登记表取 @returns {Promise<{ ok: boolean, error?: string }>} */
+  revealDownload: (taskId, id) => ipcRenderer.invoke("browser:revealDownload", taskId, id),
+  openDownload: (taskId, id) => ipcRenderer.invoke("browser:openDownload", taskId, id),
+  /** 处理挂起的 JS 对话框 */
+  answerDialog: (taskId, accept, promptText) => ipcRenderer.send("browser:answerDialog", taskId, accept, promptText),
+  /** 清掉当前 tab 的设备 / 环境模拟 */
+  resetEmulation: (taskId) => ipcRenderer.send("browser:resetEmulation", taskId),
+  // —— 增强包 E2（契约 §15.1）——
+  /**
+   * 通用扩展通道：`ext(name, taskId, ...args)`，name 必须是主进程模块登记过的白名单名字（`prompt.answer` / `netrules.clear` / `debug.resume` / `record.stop` …）。
+   * 会话不存在返回 null；名字未登记会 reject。
+   * @returns {Promise<unknown>}
+   */
+  ext: (name, taskId, ...args) => ipcRenderer.invoke("browser:ext", name, taskId, ...args),
+  // —— R7：本地 HTML 默认走内置浏览器 ——
+  /**
+   * 把本地 .html / .htm 登记成一次性 token 的只读 loopback URL（`http://<token>.localhost:<端口>/<文件名>`，每个 token 一个 origin），不用 file:。
+   * 只传绝对路径；范围 / 敏感文件 / 大小校验都在主进程。永不 reject：失败返回 { ok:false, error }，调用方回退系统打开。
+   * @returns {Promise<{ ok: true, url: string, scope: "dir" | "file" } | { ok: false, error: string }>}
+   */
+  serveLocalHtml: (absPath) => ipcRenderer.invoke("browser:serveLocalHtml", absPath),
+});

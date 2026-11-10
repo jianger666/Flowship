@@ -40,6 +40,18 @@ const startScheduleRunner = (): void => {
     .catch((err) => console.warn("[schedule] 启动失败", err));
 };
 
+/**
+ * 内置浏览器的「交还给 AI」处理器同样借这个锚点（它要把消息注入会话，模块图含 @cursor/sdk，不能挂 instrumentation）。
+ * bridge 本身在 instrumentation 里已提前握手；handback 事件若先于这里注册到达，bridge 会短暂缓存、注册后补发。
+ * 无 IPC 通道（dev:web / headless）时 ensureBrowserHandbackRegistered 内部直接返回。vitest 下不挂。
+ */
+const startBrowserHandback = (): void => {
+  if (process.env.VITEST) return;
+  void import("../browser/handback")
+    .then((m) => m.ensureBrowserHandbackRegistered())
+    .catch((err) => console.warn("[browser] handback 注册失败", err));
+};
+
 /** server 启动时调一次；重复调用无副作用 */
 export const ensureFeishuBridgeBootstrapped = (): void => {
   try {
@@ -57,5 +69,6 @@ export const ensureFeishuBridgeBootstrapped = (): void => {
     ensureBridgeRuntimePolling();
   } finally {
     startScheduleRunner();
+    startBrowserHandback();
   }
 };

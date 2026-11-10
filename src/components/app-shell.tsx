@@ -116,6 +116,9 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!isModCombo(e, "f")) return;
+      // 已被更近的处理者接管（浏览器面板的查找条、预览里的查找框等 preventDefault 过）就别再弹对话流 / 产物搜索条，
+      // 否则任务页上 Cmd/Ctrl+F 会双触发、抢走焦点（R1-15）
+      if (e.defaultPrevented) return;
       const scope = resolvePaneSearchScope(
         getActivePaneSearchScope(),
         pathname,

@@ -57,6 +57,7 @@ import {
 import { RepoCard } from "@/components/settings/repo-card";
 import { GitLabSection } from "@/components/settings/git-card";
 import { PreferenceSections } from "@/components/settings/preference-card";
+import { BrowserSection } from "@/components/settings/browser-card";
 import { CompanyEnvSection } from "@/components/settings/company-env-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
 import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
@@ -492,6 +493,8 @@ const SettingsPage = () => {
               <PreferenceSections
                 jumpIde={settings.jumpIde ?? "cursor"}
                 onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
+                linkOpenMode={settings.linkOpenMode ?? "builtin"}
+                onLinkOpenModeChange={(v) => saveFieldValue("linkOpenMode", v)}
                 userRole={settings.userRole}
                 onUserRoleChange={(v) => saveFieldValue("userRole", v)}
                 branchTemplate={settings.branchTemplate ?? ""}
@@ -514,6 +517,50 @@ const SettingsPage = () => {
                   saveFieldValue("feishuBridgeKeepAwake", v)
                 }
                 />
+            </CardContent>
+          </Card>,
+        )}
+
+        {/* ---- 内置浏览器（桌面端）：evaluate / 录输入值开关 + 清登录态；不进左侧锚点导航，不动现有分组 ---- */}
+        {wrapCard(
+          "browser",
+          <Card>
+            <CardHeader>
+              <CardTitle>内置浏览器</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <BrowserSection
+                evaluateEnabled={settings.browserEvaluateEnabled === true}
+                onEvaluateEnabledChange={(v) =>
+                  saveFieldValue("browserEvaluateEnabled", v)
+                }
+                recordInputValues={settings.browserRecordInputValues === true}
+                onRecordInputValuesChange={(v) =>
+                  saveFieldValue("browserRecordInputValues", v)
+                }
+                storageAccess={settings.browserStorageAccess === true}
+                onStorageAccessChange={(v) =>
+                  saveFieldValue("browserStorageAccess", v)
+                }
+                pagePermissions={settings.browserPagePermissions === true}
+                onPagePermissionsChange={(v) =>
+                  saveFieldValue("browserPagePermissions", v)
+                }
+                trustLoopbackCerts={settings.browserTrustLoopbackCerts !== false}
+                onTrustLoopbackCertsChange={(v) =>
+                  saveFieldValue("browserTrustLoopbackCerts", v)
+                }
+                networkBodyRead={settings.browserNetworkBodyRead !== false}
+                onNetworkBodyReadChange={(v) =>
+                  saveFieldValue("browserNetworkBodyRead", v)
+                }
+                advancedTools={settings.browserAdvancedTools !== false}
+                onAdvancedToolsChange={(v) =>
+                  saveFieldValue("browserAdvancedTools", v)
+                }
+                maxTabs={settings.browserMaxTabs ?? 20}
+                onMaxTabsChange={(v) => saveFieldValue("browserMaxTabs", v)}
+              />
             </CardContent>
           </Card>,
         )}

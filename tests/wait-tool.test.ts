@@ -25,8 +25,8 @@ import {
 
 const waitDef = flowShipTools.find((t) => t.name === WAIT_TOOL_NAME)!;
 
-const textOf = (r: { content: Array<{ type: "text"; text: string }> }): string =>
-  r.content.map((c) => c.text).join("");
+const textOf = (r: { content: Array<{ type: string; text?: string }> }): string =>
+  r.content.map((c) => c.text ?? "").join("");
 
 beforeEach(() => {
   vi.useFakeTimers();

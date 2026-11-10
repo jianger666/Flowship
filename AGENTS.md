@@ -26,6 +26,13 @@
 
 > ⚠️ agent shell 环境坑：宿主（Electron）拉起 app-server 时注入了 `ELECTRON_RUN_AS_NODE=1`、`PORT`、`HOSTNAME`、`FLOWSHIP_DATA_DIR`、`__NEXT_PRIVATE_STANDALONE_CONFIG` 等变量。带着这些裸启动 Electron 二进制 / `open xxx.app` 会静默秒退（被当纯 node 跑）、`next build/dev` 会报 `generate is not a function`。`stripHostInjectedEnv()`（见 `src/lib/server/host-env.ts`）**只清洗了 pi provider 的 shell 工具**；**Cursor provider 的本地 agent shell 由 Cursor SDK 内部拉起，SDK（1.0.37）没有给本地 agent 的 env 选项，会原样继承 server 的整份 env**——实测 `PORT=8876`、`HOSTNAME`、`FLOWSHIP_DATA_DIR=<正式数据目录>`、`__NEXT_PRIVATE_*` 都在。所以在 Cursor 会话的 shell 里，凡是会碰数据目录 / 端口的命令（`next dev/build`、起服务、手写脚本）先清：`env -u ELECTRON_RUN_AS_NODE -u FLOWSHIP_DATA_DIR -u FLOWSHIP_PORT -u PORT -u HOSTNAME -u __NEXT_PRIVATE_STANDALONE_CONFIG -u __NEXT_PRIVATE_ORIGIN -u NEXT_DEPLOYMENT_ID <命令>`。**vitest 不用自己清**：`tests/setup/hermetic-env.ts` 在每个测试 worker 起跑前把数据目录指到临时目录并剔掉这些变量，`task-fs` 的 `ensureBootRecovery` 另有运行时防线（VITEST 下数据目录若是正式 userData 就拒绝执行 boot-recovery，判定见 `src/lib/server/app-data-dir.ts`），跑测试不会再改到正式数据里的任务状态。自写脚本要 spawn 子进程时也应传清洗后的 env，参考 `scripts/electron-test-restart.mjs` 的 `cleanEnv()`。
 
+### 跑无头 Electron 脚本（e2e / 探针）：必须走启动器
+
+- agent 要在后台起 Electron 跑自写脚本（`scripts/browser-e2e/*.cjs` 之类）时，**一律** `node scripts/browser-e2e/run.mjs <脚本> [--timeout 秒]`，**不要**直接起 `node_modules/electron/dist/.../Electron <脚本>`。
+- 原因（2026-11-07 事故）：脚本有语法错误或主进程抛未捕获异常时，Electron 默认弹**原生模态错误框**（"A JavaScript error occurred in the main process"）并挂住等人点「好」——弹在用户屏幕上、进程也不退出。启动器先 `node --check` 预检（语法错误只在终端报、不起 Electron）、再经 bootstrap 把未捕获异常 / dialog 改成打印 + 非零退出、超时整组杀、不留 Dock 图标，并且已清洗宿主注入的环境变量，不必再手写那串 `env -u …`。
+- **钥匙串弹窗（2026-11-07 第二起事故）**：内置浏览器的 partition 是 `persist:` 的，Chromium 启动就要去 macOS 钥匙串取 Cookie 加密密钥（服务名 `Electron Safe Storage`、账户名 `Electron Key`）；用户机器上默认钥匙串缺失 / 锁着时，每起一次 Electron 就弹一次「找不到用于储存 “Electron Key” 的钥匙串」。bootstrap 已在 app ready 之前设了 `--use-mock-keychain`（linux 为 `password-store=basic`），所以**只要走启动器就不会碰系统钥匙串**——这也是又一个不能绕过启动器、直接起 Electron 的理由。
+- 脚本自己仍要：userData 指向临时目录、窗口 `show:false`、跑完 `app.exit(0)`；只起 node_modules 里那份 Electron，不碰 Flowship / FlowshipTest 桌面包与 8676 / 8776 / 8876。
+
 ### 默认：网页热更新（最快）
 
 - **日常改 UI 验证默认走 `pnpm dev:web`**：起 `next dev --turbo` 在 **8676**，自动清掉宿主注入的 `__NEXT_PRIVATE_STANDALONE_CONFIG` / `NEXT_DEPLOYMENT_ID` / `FLOWSHIP_DATA_DIR`（前两个会让 `next build/dev` 报 `generate is not a function`，后者常被注入成正式包数据目录）、再把数据目录写死到 `fe-ai-flow-test`、起完自动开 `http://localhost:8676/settings`。HMR 秒刷新，改完 typecheck/lint 过即可让用户刷新看效果，**不打包壳**。要换端口/数据目录用 `DEV_WEB_PORT` / `DEV_WEB_DATA_DIR`，别用 `PORT` / `FLOWSHIP_DATA_DIR`。`pnpm start` 同样是 `next dev --turbo`（默认 8876，别跟正式桌面包抢端口）。

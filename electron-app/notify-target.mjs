@@ -11,6 +11,21 @@
 export const NOTIFY_TARGETS = ["inbox"];
 
 /**
+ * 通知文字的单行清洗（R3-09，纵深防御）：渲染进程已经剥过一遍，但 payload 来自 IPC、不能假设发送方都剥了——
+ * 折叠空白，再剥控制字符 / 格式字符（U+202E 方向控制、零宽、BOM、Unicode tag），最后截断。
+ * @param {string} s
+ * @param {number} max
+ */
+const cleanLine = (s, max) =>
+  s
+    .replace(/\uFEFF/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}\p{Variation_Selector}\u{E0000}-\u{E007F}]/gu, "") // 与 src/lib/one-line.ts 的 stripFormatChars 同一份（R4 复审 R3-09）
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+
+/**
  * 把页面传来的 payload 收敛成主进程要用的形状（防御性：IPC 入参不可信）。
  * @param {unknown} payload
  * @returns {{ title: string, body: string, taskId: string, target: string }}
@@ -18,8 +33,8 @@ export const NOTIFY_TARGETS = ["inbox"];
 export const parseNotifyPayload = (payload) => {
   const p = payload && typeof payload === "object" ? payload : {};
   const title =
-    typeof p.title === "string" && p.title ? p.title.slice(0, 80) : "Flowship";
-  const body = typeof p.body === "string" ? p.body.slice(0, 200) : "";
+    (typeof p.title === "string" ? cleanLine(p.title, 80) : "") || "Flowship";
+  const body = typeof p.body === "string" ? cleanLine(p.body, 200) : "";
   const taskId = typeof p.taskId === "string" ? p.taskId : "";
   // taskId 优先：同时带了两者按任务跳（任务通知语义更具体）
   const target =

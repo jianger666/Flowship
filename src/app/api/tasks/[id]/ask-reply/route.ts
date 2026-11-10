@@ -58,7 +58,13 @@ import {
 } from "@/lib/server/chat-pending";
 import { HeapPressureError } from "@/lib/server/sdk-store-gc";
 import {
+  TASK_BRANCH_GUARD_CODE,
+  TaskBranchGuardError,
+} from "@/lib/server/task-branch-guard";
+import { WorktreeLeaseLostError } from "@/lib/server/task-worktrees";
+import {
   deliverAskReply,
+  guardTaskBranchForUserTurn,
   isTaskOpStale,
   resumeCurrentActionWithMessage,
   supersedePendingAsks,
@@ -769,9 +775,35 @@ const handleAskReply = async (
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
+  // 答案送回 AI 之前确认仓库还在任务分支上：用户常在 AI 等答案的这段时间去 IDE 看别的分支（切到 master），
+  // 回来答完题 AI 就在 master 上接着改了。curl 路径（下面 fulfillAskWait）不经过 sendToTaskSession、
+  // 所以这里先守；守完告诉 deliverAskReply 别再守一遍（in-place 的提醒会附两次）。chat 没有任务分支，不守。
+  let liveAgentText = agentText;
+  let branchGuarded = false;
+  if (!isChat) {
+    try {
+      const notice = await guardTaskBranchForUserTurn(
+        task,
+        () => !isTaskOpStale(task.id, opGen),
+      );
+      if (notice) liveAgentText = `${agentText}\n\n${notice}`;
+      branchGuarded = true;
+    } catch (err) {
+      // 没送出去：答案登记放回、用户处理完分支后可以重答
+      giveBackPending();
+      if (err instanceof WorktreeLeaseLostError) {
+        return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+      }
+      if (err instanceof TaskBranchGuardError) {
+        return errorResponse(err.message, 409, { code: TASK_BRANCH_GUARD_CODE });
+      }
+      throw err;
+    }
+  }
+
   // 同一轮 curl 已挂上（或秒答后在时限内挂上）：答案写进 stdout，不 send。
   // 时限内没挂上才走原来的 send，避免和还在路上的 curl 撞车。
-  const viaWait = await fulfillAskWait(task.id, askId, agentText);
+  const viaWait = await fulfillAskWait(task.id, askId, liveAgentText);
   if (isTaskOpStale(task.id, opGen) && !viaWait) {
     giveBackPending();
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
@@ -820,11 +852,12 @@ const handleAskReply = async (
     try {
       deliverResult = await deliverAskReply(
         task,
-        agentText,
+        liveAgentText,
         allAbsPaths.length > 0 ? allAbsPaths : undefined,
         reqEvent.actionId,
         boot,
         opGen,
+        branchGuarded,
       );
     } catch (err) {
       if (err instanceof HeapPressureError) {

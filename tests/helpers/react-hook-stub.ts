@@ -16,7 +16,7 @@
  *
  * 注意：
  *  - setState 只改槽位、不会自动重渲染——要读最新值请再 render 一次（和真 React 一样，返回值是 render 时的快照）；
- *  - 只实现了 useRef / useState / useCallback / useMemo / useEffect / useLayoutEffect / useId，用到别的 hook 会直接抛错；
+ *  - 只实现了 useRef / useState / useCallback / useMemo / useEffect / useLayoutEffect / useId / useSyncExternalStore（只读 getSnapshot），用到别的 hook 会直接抛错；
  *  - 依赖 React 内部字段（__CLIENT_INTERNALS_…）：React 升级后桩不够用会抛错，提醒重新评估这批测试。
  */
 import React from "react";
@@ -117,6 +117,9 @@ export const createHookHarness = (): HookHarness => {
     },
     useCallback: (fn: unknown) => fn,
     useMemo: (fn: () => unknown) => fn(),
+    // 客户端语义：每次 render 读一次 getSnapshot（不订阅——桩里没有「外部变化触发重渲」）。
+    // 要看服务端 / 水合首帧（getServerSnapshot）请用 renderToStaticMarkup，它走的就是服务端快照
+    useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
     useId: () => "hook-stub-id",
     useEffect: effectHook,
     useLayoutEffect: effectHook,

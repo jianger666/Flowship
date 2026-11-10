@@ -23,6 +23,7 @@ const config = [
       "next-env.d.ts", // Next 生成文件（triple-slash reference 是它的固定形态）
       "src/components/ui/**", // shadcn 生成的、不让规则去管
       "scripts/**",
+      "electron-app/browser/vendor/**", // 第三方压缩产物（axe-core，MPL-2.0，原样拷贝、不改）
     ],
   },
   {

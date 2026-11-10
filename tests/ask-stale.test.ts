@@ -38,6 +38,10 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   batchUpdateCard,
   sendInteractiveCardToChat,
   sendMarkdownCardToChat,
+  // group-outbound 现在经 ./outbound 复用过程区渲染；outbound 在模块加载时就会读这三项
+  getBotAppInfo: vi.fn(),
+  sendTextMessage: vi.fn(),
+  uploadImage: vi.fn(),
 }));
 
 const {

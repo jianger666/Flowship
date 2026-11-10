@@ -92,6 +92,8 @@ vi.mock("@/lib/server/chat-pending", () => ({
   wasAskTakenRecently: vi.fn(() => false),
 }));
 vi.mock("@/lib/server/task-runner", () => ({
+  // 分支漂移守卫（本测试不关心分支、恒放行）
+  guardTaskBranchForUserTurn: async () => undefined,
   deliverTaskQuestion,
   isTaskOpStale,
   resumeCurrentActionWithMessage,

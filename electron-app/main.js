@@ -17,6 +17,7 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   Menu,
@@ -27,6 +28,9 @@ import {
   powerSaveBlocker,
   shell,
   Tray,
+  // 内置浏览器（docs/BROWSER-AUTOMATION.md）：每个 tab 是一个 WebContentsView，session 用来配独立 partition 的权限 / 下载
+  session,
+  WebContentsView,
 } from "electron";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -197,6 +201,10 @@ import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
 import { buildServerNodeArgs } from "./node-options.mjs";
 // 系统通知 payload 解析（taskId / target:"inbox" 点击去向，N1-12）：./notify-target.mjs
 import { parseNotifyPayload } from "./notify-target.mjs";
+// 内置浏览器（AI 可操作 / 用户可操作 / AI 知道用户做了什么，契约见 docs/BROWSER-AUTOMATION.md §8）：
+// createBrowserManager 总入口在 ./browser/index.mjs；createIsAppUrl 只判「本应用自己的 origin（回环别名 + 自己的 server 端口）」
+import { createBrowserManager } from "./browser/index.mjs";
+import { createIsAppUrl } from "./browser/app-origin.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -357,6 +365,34 @@ const shellLogger = createShellLogger({
   getLogFile: () => path.join(app.getPath("userData"), "logs", "main.log"),
 });
 const log = shellLogger.log;
+
+// ---------- 内置浏览器（docs/BROWSER-AUTOMATION.md §8.1 / §8.2）----------
+// 工厂本身是懒的：停车场窗口 / 会话 / server 通道都在首次用到时才创建，模块加载期不碰窗口。
+// - isAppUrl：只拦 Flowship 自己的 origin（回环别名 + 自己的 server 端口 PORT）；用户预览自己项目的 localhost:3000 必须放行。
+//   不复用上面那份 isAppUrl（external-url.mjs 的 isSameAppOrigin，只认 http:、服务于外链 / will-navigate），
+//   这份在 ./browser/app-origin.mjs（http / https 都按端口判，纯函数、有单测 tests/browser-app-origin.test.ts）
+// - isTrustedIpcSender：browser:* 每个入口的第一件事（契约 §5）；契约的签名是 (event)，壳里的是 (e, channel)，这里补个默认 channel 名
+const browserManager = createBrowserManager({
+  app,
+  BrowserWindow,
+  WebContentsView,
+  session,
+  ipcMain,
+  nativeImage,
+  // V4 用户侧（右键菜单 / 复制链接 / 下载「显示」「打开」）：只注入、逻辑全在 browser/user-features.mjs
+  Menu,
+  clipboard,
+  shell,
+  getMainWindow: () => mainWindow,
+  isAppUrl: createIsAppUrl(() => PORT),
+  isTrustedIpcSender: (e, channel) => isTrustedIpcSender(e, channel ?? "browser:*"),
+  log,
+});
+// 停车场窗口是常驻隐藏窗口，不算「用户窗口」：window-all-closed 的判定要忽略它（见 app.on("window-all-closed")）
+const hasUserWindows = () =>
+  BrowserWindow.getAllWindows().some((w) => !w.isDestroyed() && !browserManager.isParkingWindow(w));
+// 内置浏览器 destroy 不可逆、只做一次：放在 will-quit（退出已确定）里，见 app.on("will-quit")
+let browserManagerDestroyed = false;
 // stdout / stderr 的 EPIPE：从终端 / 管道启动、对端关掉后 console.log 会异步 emit 'error'，没有监听就是 uncaughtException。
 // 日志已经落盘，这里吞掉即可；监听里不能再 console.log（会递归）。
 for (const stream of [process.stdout, process.stderr]) stream?.on?.("error", () => {});
@@ -890,7 +926,9 @@ const startServer = () => {
     ),
     // cwd 不用管：standalone server.js 启动时自己 process.chdir(__dirname)
     // stdin：unix "ignore"（不变）；win32 给一根管道（见上、退出时 end() 它当「请你优雅退出」）
-    stdio: [process.platform === "win32" ? "pipe" : "ignore", "pipe", "pipe"],
+    // 第 4 路 "ipc"：内置浏览器的 server ⇄ 主进程双向 JSON 通道（Node 自带、孙进程拿不到；docs/BROWSER-AUTOMATION.md §1 / §4）。
+    // 追加在末尾，前三路（stdin / stdout / stderr）的行为与既有处理完全不变。
+    stdio: [process.platform === "win32" ? "pipe" : "ignore", "pipe", "pipe", "ipc"],
     windowsHide: true,
     // unix：server 自成进程组（setsid），退出时按组发信号（见 signalServerTree）；win32 的树杀：server 自己在退出清理做完后
     // `taskkill /PID <自己> /T /F` 自杀整树（R8-4，src/lib/server/win-self-tree-kill.ts）；它不理会 stdin EOF 时壳才 /T /F（见 stopWinServer）。
@@ -898,6 +936,14 @@ const startServer = () => {
     detached: process.platform !== "win32",
   });
   serverProc = proc;
+  // 内置浏览器：每次 spawn（含 server 崩溃 / 更新失败后的重启）都对**新 proc** 立刻挂通道；
+  // 旧 proc 上挂起的请求由 manager 以 CANCELLED 结束，浏览器会话本身在主进程里不丢。
+  // proc.on("message") 只给 bridge 用、不碰下面的 stdout / stderr 处理；挂通道失败只记日志、绝不挡 server 启动
+  try {
+    browserManager.attachServerChannel(proc);
+  } catch (err) {
+    log(`[main] 内置浏览器挂 server 通道失败（不影响 server 启动）：${err?.message || err}`);
+  }
   if (typeof proc.pid === "number") writeServerPidRecord(proc.pid);
   bootTimeline.mark("serverSpawn");
   log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")} nodeArgs=${serverNodeArgs.join(" ") || "（空）"}`);
@@ -2517,14 +2563,20 @@ const applyStagedUpdate = async ({ relaunch, pendingMarker = relaunch } = {}) =>
     //    触发 lazy-load 半新半旧（延迟替换方案要解决的原始问题域）。
     // 退出路径（relaunch=false）server 已在 before-quit 被杀；启动兜底 serverProc=null 秒过。
     quitting = true;
+    // R3-06：app.exit(0) 不触发 before-quit（那里才置位浏览器的退出标志）——这条路径要自己置位，
+    // 否则面板开着时主窗口被销毁 → detach → getParkingWindow() 会在退出途中重建停车场窗口（与 R1-09 / R1-32 的 SIGTRAP 同类）。
+    // 失败分支（下面 catch）对称复位。
+    browserManager.setQuitting(true);
     await stopServer();
   }
   const updatesDir = updatesDirPath();
-  mkdirSync(updatesDir, { recursive: true });
   // 旧 app 先挪到暂存（同卷 rename 原子）；新包同卷 rename 优先、跨卷再 ditto
   const stagedOld = path.join(updatesDir, `old-${Date.now()}.app`);
   log(`[updater] 套用暂存 v${meta.version} → ${appPath}`);
   try {
+    // R4-04 ⑦：mkdir 也在 try 里——它失败（权限 / 磁盘满）同样要走下面 catch 的复位（quitting / setQuitting / 拉回 server），
+    // 放在 try 外面会让「server 已停、quitting=true」的状态永久残留。
+    mkdirSync(updatesDir, { recursive: true });
     await fs.rename(appPath, stagedOld);
     try {
       try {
@@ -2544,6 +2596,7 @@ const applyStagedUpdate = async ({ relaunch, pendingMarker = relaunch } = {}) =>
     // 启动兜底路径（改盘前 server 本就没起）不拉——whenReady 后续流程自己会 startServer。
     if (relaunch) {
       quitting = false;
+      browserManager.setQuitting(false);
       if (hadRunningServer && !serverProc) startServer();
     }
     throw err;
@@ -3160,6 +3213,7 @@ const ensureWinAutoUpdater = async () => {
       });
     } else if (updateState.phase === "installing" && serverProc) {
       quitting = false;
+      browserManager.setQuitting(false);
       setUpdateState({
         phase: "ready",
         error: String(err?.message || err),
@@ -3449,6 +3503,13 @@ if (!app.requestSingleInstanceLock()) {
     lagMonitor.start();
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")} protocol=${PROTOCOL_SCHEME}`);
     applyAppNapGuard();
+    // 内置浏览器：注册全部 browser:* IPC（每个 handler 第一件事过 isTrustedIpcSender，见 ./browser/index.mjs）。
+    // 放在主窗 / splash 创建之前：页面一加载就可能调 window.__browser，handler 必须先就位；失败只记日志、不挡启动
+    try {
+      browserManager.registerIpc();
+    } catch (err) {
+      log(`[main] 内置浏览器注册 IPC 失败（浏览器面板不可用，不影响其它功能）：${err?.message || err}`);
+    }
     // 系统关机 / 重启 / 注销：标记一下，before-quit 据此跳过「优雅停 server」（拖住退出会打断关机）
     try {
       powerMonitor.on("shutdown", () => {
@@ -3762,10 +3823,41 @@ if (!app.requestSingleInstanceLock()) {
   // 真退出时所有窗口销毁才走到这（关窗 hide 不会触发）。
   // 保留：停 server + quit，与 Tray / Cmd+Q / 自更新重启路径一致。
   app.on("window-all-closed", async () => {
+    // 内置浏览器的停车场窗口是常驻隐藏窗口、不算用户窗口：还有别的用户窗口就别退（防御性判定；
+    // Electron 自己只在「一个窗口都没有」时才发这个事件，停车场在时由下面的 browser-window-created 监听手动补发）
+    if (hasUserWindows()) return;
     log("[main] 所有窗口关闭、停 server 并退出");
     quitting = true;
     await stopServer();
     app.quit();
+  });
+
+  // 内置浏览器的「窗口全关」补发（Windows / Linux 关主窗口仍要能退出）：
+  // 停车场窗口（show:false、skipTaskbar）一直活着 ⇒ Electron 永远等不到「所有窗口关闭」、window-all-closed 不会自己触发。
+  // 这里在每个窗口 closed 时判断「除停车场外没有用户窗口了、但停车场还在」→ 手动 emit 一次，走上面原有的退出逻辑（停 server + quit）。
+  // 真退出（quitting=true：Cmd+Q / Tray 退出 / 自更新）不补发——app.quit() 本来就会关光所有窗口（含停车场；内置浏览器在 will-quit 里 destroy）。
+  // mac 的「关窗不退出」不受影响：Cmd+W 是 hide、点 X 是二次确认，主窗对象一直在，hasUserWindows() 恒为 true。
+  app.on("browser-window-created", (_event, win) => {
+    win.once("closed", () => {
+      if (quitting || hasUserWindows()) return;
+      // 一个窗口都不剩时 Electron 会自己发，别重复
+      if (BrowserWindow.getAllWindows().every((w) => w.isDestroyed())) return;
+      log("[main] 只剩内置浏览器的停车场窗口、按「所有窗口关闭」处理");
+      app.emit("window-all-closed");
+    });
+  });
+
+  // 内置浏览器：销毁所有会话 / view / 停车场窗口 / server 通道（挂起的请求以 CANCELLED 结束）。
+  // 只有退出已确定要发生（所有 before-quit 都没 preventDefault、窗口都已关）才会进 will-quit，所以不可逆的 destroy 放这里；
+  // 只做一次（will-quit 理论上也只来一次，标志位兜底）。destroy 出错也不挡退出。
+  app.on("will-quit", () => {
+    if (browserManagerDestroyed) return;
+    browserManagerDestroyed = true;
+    try {
+      browserManager.destroy();
+    } catch (err) {
+      log(`[main] 内置浏览器销毁出错（不挡退出）：${err?.message || err}`);
+    }
   });
 
   // 退出路径：杀 server 孤儿 + mac 套用暂存更新（不 relaunch）。
@@ -3775,6 +3867,9 @@ if (!app.requestSingleInstanceLock()) {
   // 也先置 quitting，同一门控不会误拦。
   app.on("before-quit", (event) => {
     quitting = true;
+    // 内置浏览器：退出进入最终通过——此后不再新建停车场窗口 / tab（评审 R1-32）。下面任何一条 preventDefault（退出被推迟）都会复位它，
+    // 推迟后的 app.quit() 再次进到这里时重新置位
+    browserManager.setQuitting(true);
     if (appNapBlockerId !== null) {
       try {
         powerSaveBlocker.stop(appNapBlockerId);
@@ -3783,6 +3878,10 @@ if (!app.requestSingleInstanceLock()) {
       }
       appNapBlockerId = null;
     }
+    // 内置浏览器的销毁**不在这里**：before-quit 可以被 preventDefault（下面「优雅停 server」就会拦一次、mac 套用暂存更新也会拦），
+    // 而 browserManager.destroy() 不可逆——放这里的话，退出一旦中途被取消，整个会话期内置浏览器就永久不可用（评审 R1-32）。
+    // 改在 will-quit（只有退出确定要发生才会进来）销毁；停车场窗口不会拖住 app.quit()（真 Electron 实测：
+    // 停车场窗口活着时 app.quit() 照常走到 will-quit，scripts/browser-e2e/r1-lifecycle.cjs「quit-with-parking」）。
     // 优雅停 server——unix：SIGTERM → 最多 2s → SIGKILL（按进程组）；win32（R1-2）：stdin EOF + 不带 /F 的 taskkill
     // → 最多 WIN_STOP_GRACE_MS → taskkill /T /F（见 stopServer；server 自己优雅退出时由它清理后自杀整树，R8-4）。此前这里直接 SIGKILL / taskkill /F，
     // server 的优雅钩子（停飞书 consumer / 托管子进程 / keep-awake）正常退出时永远不执行，
@@ -3795,6 +3894,7 @@ if (!app.requestSingleInstanceLock()) {
       (serverProc || serverQuitStopping)
     ) {
       event.preventDefault();
+      browserManager.setQuitting(false); // 退出被推迟（优雅停 server 期间浏览器照常可用），app.quit() 再来一次时会重新置位
       if (!serverQuitStopping) {
         serverQuitStopping = true;
         // 看门狗：stopServer 内部每一步都有上限，但整体叠起来可能偏长、任何一步卡住也不该让退出悬着
@@ -3859,6 +3959,7 @@ if (!app.requestSingleInstanceLock()) {
       }
       if (shouldApply) {
         event.preventDefault();
+        // 这条路径以 app.exit(0) 收尾（成败都退），所以不复位 setQuitting——app.exit 会先销毁窗口，此时再新建停车场窗口 = SIGTRAP
         applyingStagedOnQuit = true;
         void applyStagedUpdateOnQuit().finally(() => {
           app.exit(0);

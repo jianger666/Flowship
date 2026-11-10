@@ -12,7 +12,8 @@ const artifactPanel = readSrc("src/components/tasks/artifact-panel.tsx");
 describe("本地文件打开方式", () => {
   it("行内链接支持右键菜单及全部显式动作", () => {
     expect(localFileLink).toContain("<ContextMenu>");
-    expect(localFileLink).toContain("在浏览器打开");
+    expect(localFileLink).toContain("在内置浏览器打开");
+    expect(localFileLink).toContain("在系统浏览器打开");
     expect(localFileLink).toContain("在 Flowship 预览源码");
     expect(localFileLink).toContain("在文件管理器中显示");
     expect(localFileLink).toContain("复制路径");

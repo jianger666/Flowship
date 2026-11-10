@@ -72,6 +72,7 @@ const KNOWN_SETTINGS_KEYS = [
   "customProviders",
   "jumpIde",
   "submitShortcut",
+  "linkOpenMode",
   "userRole",
   "gitToken",
   "repos",
@@ -93,6 +94,14 @@ const KNOWN_SETTINGS_KEYS = [
   "feishuGroupBotsEqualRights",
   "teamKnowledgeEnabled",
   "companyEnv",
+  "browserEvaluateEnabled",
+  "browserRecordInputValues",
+  "browserStorageAccess",
+  "browserPagePermissions",
+  "browserTrustLoopbackCerts",
+  "browserNetworkBodyRead",
+  "browserAdvancedTools",
+  "browserMaxTabs",
 ] as const satisfies readonly (keyof FeAiFlowSettings)[];
 
 const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
@@ -360,6 +369,38 @@ const getSettingsWriteChain = (): { current: Promise<unknown> } => {
   return g[SETTINGS_WRITE_CHAIN_KEY]!;
 };
 
+// 「写盘成功之后」的订阅（目前只有内置浏览器的 config 推送用）。挂 globalThis：多 bundle / HMR 下共用一份，
+// 不然订阅者挂在 A 实例、写盘发生在 B 实例，永远收不到。
+const SETTINGS_WRITTEN_KEY = "__flowshipSettingsWrittenListenersV1__";
+type SettingsWrittenListener = (settings: Record<string, unknown>) => void;
+const getSettingsWrittenListeners = (): Set<SettingsWrittenListener> => {
+  const g = globalThis as unknown as Record<string, Set<SettingsWrittenListener> | undefined>;
+  if (!g[SETTINGS_WRITTEN_KEY]) g[SETTINGS_WRITTEN_KEY] = new Set();
+  return g[SETTINGS_WRITTEN_KEY]!;
+};
+
+/** 订阅 config.json 写盘成功事件（回调拿到刚写入的完整 settings；回调抛错不影响保存）。返回取消函数 */
+export const onSettingsWritten = (cb: SettingsWrittenListener): (() => void) => {
+  const set = getSettingsWrittenListeners();
+  set.add(cb);
+  return () => {
+    set.delete(cb);
+  };
+};
+
+const notifySettingsWritten = (settings: Record<string, unknown>): void => {
+  for (const cb of [...getSettingsWrittenListeners()]) {
+    try {
+      cb(settings);
+    } catch (err) {
+      console.warn(
+        "[settings-fs] 写盘订阅回调出错（忽略）:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+};
+
 /** 串行执行 settings 写侧临界区（RMW / 裸写共用同一条链） */
 export const withSettingsWriteLock = async <T>(
   fn: () => Promise<T>,
@@ -388,6 +429,7 @@ export const writeSettingsFileAtomic = async (
       settingsFilePath(),
       JSON.stringify(settings, null, 2),
     );
+    notifySettingsWritten(settings);
   });
 };
 
@@ -692,6 +734,7 @@ const putSettingsFileLocked = async (
     settingsFilePath(),
     JSON.stringify(settings, null, 2),
   );
+  notifySettingsWritten(settings);
   return { status: "ok" as const, settings, previous };
 };
 

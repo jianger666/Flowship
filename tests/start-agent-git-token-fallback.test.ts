@@ -342,6 +342,7 @@ describe("新建 agent 的 submit_mr 桥 Token 回落（internalStartAgent）", 
     const agent = (await mockCreate.mock.results[0]!.value) as ReturnType<
       typeof makeHangingAgent
     >;
+    await waitUntil(() => agent.send.mock.calls.length > 0); // 同 R6-44：send 在会话落表之后才异步发出
     const sentPrompts = JSON.stringify(agent.send.mock.calls);
     expect(sentPrompts).not.toContain(SERVER_TOKEN);
     // 回落后「GitLab 访问」段照常注入（只写环境变量名、不含值）：入口没带 ≠ settings 没配
@@ -357,6 +358,8 @@ describe("新建 agent 的 submit_mr 桥 Token 回落（internalStartAgent）", 
     const agent = (await mockCreate.mock.results[0]!.value) as ReturnType<
       typeof makeHangingAgent
     >;
+    // R6-44：advanceAndGetBridge 只等会话落表（agentId 已登记），`send` 在其后异步发出——先等它被调用，再断言内容（否则负载高时偶发空）
+    await waitUntil(() => agent.send.mock.calls.length > 0);
     expect(agent.send).toHaveBeenCalled();
     expect(JSON.stringify(agent.send.mock.calls)).not.toContain(
       "FLOWSHIP_GITLAB_TOKEN",

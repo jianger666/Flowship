@@ -151,6 +151,27 @@ export const runWait = (opts: {
     timer.id = setTimeout(() => finish("done"), plannedMs);
   });
 
+// 「取消」类唤醒的订阅：停止 / 删除 / 实例被取消都会走 interruptWaits(key, "cancel")，
+// 这是全仓唯一一个所有停止路径都经过的点。内置浏览器的挂起请求（wait_for / ask_user_to_act 可能挂 30 分钟）
+// 也要在这时被取消，所以让它订阅这里——本模块仍是叶子（只放回调，不 import 任何业务模块）。
+// 即使当时没有 `wait` 在睡也要通知：浏览器请求并不登记在本表里。
+type CancelListener = (key: string) => void;
+const CANCEL_LISTENERS_KEY = "__flowshipSessionWaitCancelListenersV1__";
+const cancelListeners = (): Set<CancelListener> => {
+  const g = globalThis as unknown as Record<string, Set<CancelListener> | undefined>;
+  if (!g[CANCEL_LISTENERS_KEY]) g[CANCEL_LISTENERS_KEY] = new Set();
+  return g[CANCEL_LISTENERS_KEY]!;
+};
+
+/** 订阅「某 key（taskId 或 agent scope）被取消」；返回取消订阅函数 */
+export const onWaitsCancelled = (cb: CancelListener): (() => void) => {
+  const set = cancelListeners();
+  set.add(cb);
+  return () => {
+    set.delete(cb);
+  };
+};
+
 /**
  * 唤醒某个 key（taskId）下所有在等的 `wait`；返回唤醒了几个。
  * 无人在等 / key 为空 = 0（调用方不用先判断「有没有人在等」，停止 / 插话路径可以无脑调）。
@@ -160,6 +181,15 @@ export const interruptWaits = (
   reason: WaitInterruptReason,
 ): number => {
   if (!key) return 0;
+  if (reason === "cancel") {
+    for (const cb of [...cancelListeners()]) {
+      try {
+        cb(key);
+      } catch {
+        // 订阅者出错不能挡住停止路径
+      }
+    }
+  }
   const set = waiters().get(key);
   if (!set || set.size === 0) return 0;
   // 复制一份再唤醒：wake 会同步把自己从 set 里删掉

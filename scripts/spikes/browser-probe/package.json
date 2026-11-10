@@ -1,0 +1,7 @@
+{
+  "name": "flowship-browser-probe",
+  "version": "0.0.0",
+  "private": true,
+  "description": "内嵌浏览器（WebContentsView + CDP）P0 技术探针——一次性脚本、不进主干",
+  "main": "main.cjs"
+}

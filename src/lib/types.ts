@@ -154,6 +154,9 @@ export const JUMP_IDE_USES_PROTOCOL: Record<JumpIde, boolean> = {
 
 export type SubmitShortcut = "mod-enter" | "enter";
 
+/** 网页链接 / 本地 HTML 默认打开方式（决策与流程见 lib/builtin-open.ts） */
+export type LinkOpenMode = "builtin" | "system";
+
 /** 用户在设置页选的角色——告诉 AI 你的工作视角/身份（注入任务与对话的发起人信息） */
 export type UserRole = "fe" | "be" | "qa" | "other";
 
@@ -423,6 +426,11 @@ export interface FeAiFlowSettings {
   /** 输入框提交快捷键：默认 Cmd/Ctrl+Enter，Enter 换行 */
   submitShortcut?: SubmitShortcut;
   /**
+   * 聊天 / 产物区里的网页链接与本地 HTML 默认怎么打开：`builtin`（默认）= 当前任务的内置浏览器新标签，`system` = 系统浏览器。
+   * 只认显式 `"system"`，其余（缺省 / 脏值）都是内置。不在桌面端 / 没有任务上下文 / 登录授权类链接时无论怎么选都走系统浏览器。
+   */
+  linkOpenMode?: LinkOpenMode;
+  /**
    * 我的角色（设置页偏好 / 首页就绪清单必填）。
    * 注入 prompt「发起人」行（姓名 + 角色），作为 AI 的工作视角/身份锚点。
    */
@@ -527,6 +535,31 @@ export interface FeAiFlowSettings {
    * 共享 skills/ 无总开关（市场模型、按 skill 安装/卸载）。
    */
   teamKnowledgeEnabled?: boolean;
+  /**
+   * 内置浏览器：允许 AI 在页面里执行 JS（`browser_evaluate`）。**默认关；只认显式 true**。
+   * 关 = 不给 AI 注册 evaluate 工具、主进程也拒（DISABLED）。设置页「内置浏览器」组。
+   */
+  browserEvaluateEnabled?: boolean;
+  /**
+   * 内置浏览器：用户操作记录里带上输入的**值**（默认只记长度与字段名）。**默认关；只认显式 true**。
+   * 密码框的值无论开关都不记。
+   */
+  browserRecordInputValues?: boolean;
+  /**
+   * 内置浏览器（契约 §15 A1）：允许 AI 读写登录态——cookie / localStorage / sessionStorage 的**明文值**、写入、删除、清空、导入导出。
+   * 关 = 只能看到名字与属性（值只显示「长度 + 前 4 位」）。**默认关；只认显式 true**。
+   */
+  browserStorageAccess?: boolean;
+  /** 内置浏览器（契约 §15 A8）：允许 AI 授予 / 拒绝页面权限（`browser_permissions grant|deny|reset`）。**默认关；只认显式 true** */
+  browserPagePermissions?: boolean;
+  /** 内置浏览器（契约 §15 A4）：自动放行真正本机（localhost / *.localhost / 127.0.0.0/8 / ::1；R6-23：不含 *.local，它走询问）的自签名证书错误。**默认开；显式 false 才关** */
+  browserTrustLoopbackCerts?: boolean;
+  /** 内置浏览器（契约 §15 A7）：允许 AI 读取网络请求 / 响应体（已走脱敏管线）。**默认开；显式 false 才关** */
+  browserNetworkBodyRead?: boolean;
+  /** 内置浏览器（契约 §15）：注册「高级调试」工具组（network_rules / perf / sources / debug）。**默认开；显式 false 才关**；对新开始的会话生效 */
+  browserAdvancedTools?: boolean;
+  /** 内置浏览器（契约 §15 C6）：单个任务同时打开的标签页上限，5–60，缺省 20 */
+  browserMaxTabs?: number;
   /**
    * 公司环境配置（服务器 / PG / 日志 / XXL / Nacos / ELK / SLS / HTTP API）。
    * 排查类 action 用；运行时同步到 `<dataRoot>/company-env.json` 供 skill 读。

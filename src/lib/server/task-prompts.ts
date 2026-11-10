@@ -22,6 +22,7 @@ import {
 import { renderContextDocsSection } from "./context-docs-prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { mediaDisplayPromptSection } from "./media-display-prompt";
+import { browserPromptSection } from "./browser/prompt";
 import { detectAgentShellKind, type AgentShellKind } from "./agent-shell";
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 import { formatRepoSectionForPrompt, repoTail } from "@/lib/path-utils";
@@ -303,11 +304,13 @@ const loadSharedPrompt = async (task: Task): Promise<string> => {
     repoPath: getTaskCwd(task),
     taskId: task.id,
   });
-  // 本地音视频展示写法：单一源在 media-display-prompt.ts（chat 的 buildInitialPrompt 用同一段），
+  // 本地文件展示写法（展示 / 交付给用户的本机文件，不止音视频）：单一源在 media-display-prompt.ts（chat 的 buildInitialPrompt 用同一段），
   // 纯 md 的 _shared.md 引不了 TS helper，所以在这里追加到 sharedRules 末尾。
   // 追加发生在预算计算之前（buildSuperPromptWithBudget 里 sharedRules 的 bytes 由本函数的返回值算），
-  // 所以字节计入 L1、永不被裁。_shared.md §3 第 5 条的「不要写绝对路径」对音视频有一句例外指向它。
-  return `${filled.replace(/\s+$/, "")}\n\n${mediaDisplayPromptSection()}\n`;
+  // 所以字节计入 L1、永不被裁。_shared.md §3 第 5 条的「不要写绝对路径」对展示 / 交付给用户的文件有一句例外指向它。
+  // 内置浏览器一节同理（单一源在 browser/prompt.ts；chat 侧同一段）：无桌面壳时返回空串、不占 token
+  const browserSection = browserPromptSection();
+  return `${filled.replace(/\s+$/, "")}\n\n${mediaDisplayPromptSection()}${browserSection ? `\n\n${browserSection}` : ""}\n`;
 };
 
 // 加载某个 action 的 prompt、填模板变量

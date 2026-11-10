@@ -73,6 +73,7 @@ import { failpoint } from "./failpoints";
 import { interruptWaits } from "./session-wait";
 import { chatTurnProtocolSection } from "./turn-discipline";
 import { mediaDisplayPromptSection } from "./media-display-prompt";
+import { browserPromptSection } from "./browser/prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { supersedePendingAsks } from "./ask-supersede";
 import { renderContextDocsSection } from "./context-docs-prompt";
@@ -1307,9 +1308,12 @@ const buildInitialPrompt = (
     "   - skill 触发是判断性的、不是每轮都读、按描述匹配场景再读",
     "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
     "",
-    // 本地音视频展示写法（单一源 media-display-prompt；task 侧在 task-prompts 的 sharedRules 末尾追加同一段）
+    // 本地文件展示写法（展示 / 交付给用户的本机文件都写完整绝对路径；单一源 media-display-prompt；task 侧在 task-prompts 的 sharedRules 末尾追加同一段）
     mediaDisplayPromptSection(),
     "",
+    // 内置浏览器一节（单一源 browser/prompt.ts；task 侧在 task-prompts 的 sharedRules 末尾追加同一段）。
+    // 无桌面壳 / 握手失败时为空串——没有工具就不描述工具
+    ...(browserPromptSection() ? [browserPromptSection(), ""] : []),
     `## 任务 cwd（agent shell / read 默认基准目录）：${formatRepoSectionForPrompt(task.repoPaths, {
       nonGitRepoPaths: task.nonGitRepoPaths,
       originalRepoPaths: task.repoPaths,

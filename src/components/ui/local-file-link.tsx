@@ -13,10 +13,16 @@ import {
   ExternalLink,
   Eye,
   FolderOpen,
+  Globe,
   MoreHorizontal,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  openLocalHtmlInBuiltin,
+  readLinkOpenMode,
+} from "@/components/browser/open-in-builtin";
+import { useBrowserAvailable } from "@/components/browser/use-browser-session";
 import { useMediaGroup } from "@/components/media/media-group-state";
 import {
   resolveLocalFileAbsolute,
@@ -89,19 +95,36 @@ interface LocalFileLinkProps {
 interface LocalFileMenuItemsProps {
   variant: "context" | "dropdown";
   isHtml: boolean;
+  /** 出「在内置浏览器打开」（桌面端才有；undefined = 不出） */
+  onBuiltinOpen?: () => void;
   canPreview: boolean;
   ideAnchor: ReturnType<typeof getIdeAnchorProps>;
   ideLabel: string;
   previewLabel: string;
+  /** 在系统浏览器打开（HTML：交给系统默认应用，与原行为一致） */
   onBrowserOpen: () => void;
   onPreview: () => void;
   onReveal: () => void;
   onCopy: () => void;
 }
 
+/**
+ * tooltip 首行（浏览器类链接）：它只在 tooltip 的 Popup 挂载时渲染，所以 `readLinkOpenMode()` 读到的是「此刻」的设置。
+ * 不能在 LocalFileLink 的渲染里读——设置页切换后，已渲染的链接不会重渲，tooltip 会一直是旧文案。
+ * （导出仅供测试：tests/browser-open-hint.test.ts 直接渲染它验证文案随「此刻」的设置变化。）
+ */
+export const BrowserOpenHint = ({ builtinBridge }: { builtinBridge: boolean }) => (
+  <>
+    {readLinkOpenMode() === "builtin" && builtinBridge
+      ? "点击在内置浏览器打开"
+      : "点击在系统浏览器打开"}
+  </>
+);
+
 const LocalFileMenuItems = ({
   variant,
   isHtml,
+  onBuiltinOpen,
   canPreview,
   ideAnchor,
   ideLabel,
@@ -119,10 +142,16 @@ const LocalFileMenuItems = ({
 
   return (
     <>
+      {isHtml && onBuiltinOpen && (
+        <Item onClick={onBuiltinOpen}>
+          <Globe className="size-3.5" />
+          在内置浏览器打开
+        </Item>
+      )}
       {isHtml && (
         <Item onClick={onBrowserOpen}>
           <ExternalLink className="size-3.5" />
-          在浏览器打开
+          在系统浏览器打开
         </Item>
       )}
       {ideAnchor && (
@@ -167,6 +196,8 @@ export const LocalFileLink = ({
 }: LocalFileLinkProps) => {
   const { open, ide: jumpIde } = useLocalFilePreview();
   const mediaGroup = useMediaGroup();
+  // 桥是否存在：SSR / 水合首帧恒 false，水合后更新；决定右键菜单是否出「在内置浏览器打开」
+  const builtinBridge = useBrowserAvailable();
   const target = linker.resolveFor(path, line);
 
   if (!target) {
@@ -196,14 +227,24 @@ export const LocalFileLink = ({
     linkClassName ?? "font-mono text-info underline-offset-2 hover:underline",
   );
 
+  const reportOpenFailure = (err: unknown) => {
+    toast.error(
+      err instanceof Error ? `浏览器打开失败：${err.message}` : "浏览器打开失败",
+    );
+  };
+  /** 左键默认：按设置「链接默认打开方式」——内置（当前任务的内置浏览器新标签）/ 系统；环境不允许时自动回退系统 */
   const launchInBrowser = () => {
-    void requestOpenLocalPath(target.absolute).catch((err) => {
-      toast.error(
-        err instanceof Error
-          ? `浏览器打开失败：${err.message}`
-          : "浏览器打开失败",
-      );
-    });
+    void openLocalHtmlInBuiltin(target.absolute).catch(reportOpenFailure);
+  };
+  /** 右键「在内置浏览器打开」：无视「默认系统」的设置；环境不允许仍回退系统 */
+  const launchInBuiltin = () => {
+    void openLocalHtmlInBuiltin(target.absolute, { forceBuiltin: true }).catch(
+      reportOpenFailure,
+    );
+  };
+  /** 右键「在系统浏览器打开」：系统默认应用（原行为） */
+  const launchInSystem = () => {
+    void requestOpenLocalPath(target.absolute).catch(reportOpenFailure);
   };
 
   const openPreview = () => {
@@ -244,15 +285,22 @@ export const LocalFileLink = ({
   };
 
   const locationLabel = `${target.absolute}${effectiveLine != null ? `:${effectiveLine}` : ""}`;
+  // 浏览器类：首行文案由 BrowserOpenHint 在 tooltip 真正打开（Popup 挂载）时才读设置，所以设置页切换「链接默认打开方式」后
+  // 不用等本组件重新渲染，下一次悬停看到的就是新的（R7-09-4）
   const defaultActionLabel =
     openTarget === "browser"
-      ? "点击在浏览器打开"
+      ? <BrowserOpenHint builtinBridge={builtinBridge} />
       : openTarget === "ide"
         ? `点击在 ${JUMP_IDE_LABEL[jumpIde]} 打开${effectiveLine != null ? `第 ${effectiveLine} 行` : ""}`
         : openTarget === "media"
           ? "点击在播放器打开"
           : "点击在 Flowship 预览";
-  const tooltipContent = `${defaultActionLabel}，右键选择打开方式\n${locationLabel}`;
+  const tooltipContent = (
+    <>
+      {defaultActionLabel}，右键选择打开方式{"\n"}
+      {locationLabel}
+    </>
+  );
   const primary =
     openTarget === "ide" && ideAnchor ? (
       <Tooltip content={tooltipContent}>
@@ -276,6 +324,8 @@ export const LocalFileLink = ({
     );
   const menuProps = {
     isHtml: shouldOpenLocalFileInBrowser(target.absolute),
+    // 桌面端才出；当前页面没有任务上下文时点了会自动回退系统（决策在 lib/builtin-open）
+    onBuiltinOpen: builtinBridge ? launchInBuiltin : undefined,
     canPreview: canPreviewInSheet(kind) || openTarget === "media",
     ideAnchor,
     ideLabel: JUMP_IDE_LABEL[jumpIde],
@@ -285,7 +335,7 @@ export const LocalFileLink = ({
         : kind === "code"
           ? "在 Flowship 预览源码"
           : "在 Flowship 预览",
-    onBrowserOpen: launchInBrowser,
+    onBrowserOpen: launchInSystem,
     onPreview: openPreview,
     onReveal: revealInFolder,
     onCopy: copyPath,

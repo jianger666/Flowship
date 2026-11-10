@@ -155,6 +155,7 @@ type FieldEqKind =
   | "stringEmpty"
   | "boolFalse"
   | "boolTrue"
+  | "numberOr20"
   | "repos"
   | "stringSet"
   | "mcpServers"
@@ -172,6 +173,7 @@ const FIELD_EQ_KIND = {
   branchTemplate: "stringEmpty",
   jumpIde: "stringEmpty",
   submitShortcut: "stringEmpty",
+  linkOpenMode: "stringEmpty",
   userRole: "stringEmpty",
   reuseAgentDefault: "boolFalse",
   agentShellGitBash: "boolFalse",
@@ -182,6 +184,14 @@ const FIELD_EQ_KIND = {
   feishuGroupNonOwnerGuard: "boolTrue",
   feishuGroupBotsEqualRights: "boolFalse",
   teamKnowledgeEnabled: "boolTrue",
+  browserEvaluateEnabled: "boolFalse",
+  browserRecordInputValues: "boolFalse",
+  browserStorageAccess: "boolFalse",
+  browserPagePermissions: "boolFalse",
+  browserTrustLoopbackCerts: "boolTrue",
+  browserNetworkBodyRead: "boolTrue",
+  browserAdvancedTools: "boolTrue",
+  browserMaxTabs: "numberOr20",
   repos: "repos",
   disabledMcpServers: "stringSet",
   disabledSkills: "stringSet",
@@ -216,6 +226,8 @@ export const isFieldEqual = (
       return (a[key] ?? false) === (b[key] ?? false);
     case "boolTrue":
       return (a[key] ?? true) === (b[key] ?? true);
+    case "numberOr20":
+      return ((a[key] as number | undefined) ?? 20) === ((b[key] as number | undefined) ?? 20);
     case "repos": {
       // CR-09：完整比较 RepoConfig 全部持久字段（稳定序列化、undefined 归一空串）
       if (a.repos.length !== b.repos.length) return false;
@@ -361,6 +373,7 @@ export const useSettings = (): UseSettingsResult => {
       repos: !isFieldEqual("repos", settings, savedSettings),
       jumpIde: !isFieldEqual("jumpIde", settings, savedSettings),
       submitShortcut: !isFieldEqual("submitShortcut", settings, savedSettings),
+      linkOpenMode: !isFieldEqual("linkOpenMode", settings, savedSettings),
       userRole: !isFieldEqual("userRole", settings, savedSettings),
       branchTemplate: !isFieldEqual("branchTemplate", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),
@@ -422,6 +435,22 @@ export const useSettings = (): UseSettingsResult => {
         settings,
         savedSettings,
       ),
+      browserEvaluateEnabled: !isFieldEqual(
+        "browserEvaluateEnabled",
+        settings,
+        savedSettings,
+      ),
+      browserRecordInputValues: !isFieldEqual(
+        "browserRecordInputValues",
+        settings,
+        savedSettings,
+      ),
+      browserStorageAccess: !isFieldEqual("browserStorageAccess", settings, savedSettings),
+      browserPagePermissions: !isFieldEqual("browserPagePermissions", settings, savedSettings),
+      browserTrustLoopbackCerts: !isFieldEqual("browserTrustLoopbackCerts", settings, savedSettings),
+      browserNetworkBodyRead: !isFieldEqual("browserNetworkBodyRead", settings, savedSettings),
+      browserAdvancedTools: !isFieldEqual("browserAdvancedTools", settings, savedSettings),
+      browserMaxTabs: !isFieldEqual("browserMaxTabs", settings, savedSettings),
       companyEnv: !isFieldEqual("companyEnv", settings, savedSettings),
       provider: !isFieldEqual("provider", settings, savedSettings),
       customProviders: !isFieldEqual("customProviders", settings, savedSettings),

@@ -39,6 +39,7 @@
  */
 
 import { redactSecretsInText } from "@/lib/server/event-secret-redact";
+import { isSilentGroupReply, judgeGroupReply } from "./group-silent-reply";
 import type { ParsedInboundContent } from "./router";
 
 // ----------------- 群问答排队 -----------------
@@ -345,15 +346,20 @@ export interface PendingGroupReply {
   requesterIsBot?: boolean;
   /**
    * 累积的「当前这一段」回答文本（assistant_delta / assistant_message 攒）。
-   * 语义是**最后一次工具调用之后的那段文字**——每遇到本 run 的 tool_call 就收段
-   *（见 {@link closeGroupReplySegment}），中途「我先查一下…」之类旁白不进群。
+   * 每遇到本 run 的 tool_call 就收段（见 {@link closeGroupReplySegment}）——收掉的段落进
+   * {@link PendingGroupReply.closedSegments}，群里看到的是「已收段落 + 当前段」的**累积全文**
+   *（{@link visibleGroupReplyText}，2026-11-09 起；此前只发最后一次工具调用之后那段，
+   * 流式卡上就成了永远只有一句话、每次调工具整句被替换）。
    */
   answer: string;
-  /**
-   * 上一个被工具调用截断的非空段落。flush 时 `answer` 为空（最后一次工具调用后
-   * agent 没再说话）就退回它，免得「答案写在工具调用之前」时整轮空回答。
-   */
+  /** 最近一个被工具调用截断的非空段落（旧语义的遗留字段：现在只作调试 / 单测可见，不再参与「发什么」的判定） */
   lastSegment: string;
+  /**
+   * 本 run 里已被 tool_call 收段的全部非空段落（trim 后、按时间序）。
+   * 群里发的终稿 = 这些 + 当前段 `answer`，用空行拼（{@link visibleGroupReplyText}）。
+   * 有界：{@link CLOSED_SEGMENTS_MAX}，超了丢最早的。
+   */
+  closedSegments?: string[];
   /** 登记时刻（汇总事件算 durationMs 用）；与 createdAt 同值、语义独立 */
   startedAt: number;
   /**
@@ -578,6 +584,7 @@ export const rememberGroupReply = (
     PendingGroupReply,
     | "answer"
     | "lastSegment"
+    | "closedSegments"
     | "startedAt"
     | "awaitingMessages"
     | "answerMessageSeen"
@@ -755,11 +762,16 @@ export const appendGroupReplyAnswer = (
 /** awaitingMessages 的容量（极端长链路里的工具调用数上限，防无限涨） */
 const AWAITING_MESSAGES_MAX = 50;
 
+/** closedSegments 容量（极端长链路里的工具调用数上限，防无限涨；超了丢最早的） */
+const CLOSED_SEGMENTS_MAX = 200;
+
 /**
- * 本 run 又调了一次工具 → 当前段结束：非空就存进 `lastSegment`、`answer` 清空。
+ * 本 run 又调了一次工具 → 当前段结束：非空就追加进 `closedSegments`（并记 `lastSegment`）、`answer` 清空。
  *
- * 为什么要分段：答疑回复原先是整轮所有文字拼在一起，「我先查一下…」旁白和英文残句
- * 全发给了外部同事。现在只认「最后一次工具调用之后」的那段。
+ * 分段的目的**不再是「只发最后一段」**（2026-11-09 撤：那样流式卡上永远只有一句话、每调一次工具整句换掉，
+ * 看起来像卡死）——而是让群里的内容按「段」累积：终稿 / 流式正文 = 全部段落用空行拼起来
+ *（见 visibleGroupReplyText），与私聊流式卡「正文只增不换」的体验一致。
+ * 分段本身仍要保留：NO_REPLY 是按「段」判的、`assistant_message` 落盘版去重也要靠它。
  *
  * 事件真实顺序（sdk-message-handler）：tool_call 消息进来先冲 delta、再 `assistantCtx.flush()`
  * 落 assistant_message，最后才写 tool_call 事件——即 delta* → assistant_message → tool_call，
@@ -776,6 +788,10 @@ export const closeGroupReplySegment = (
   const seg = entry.answer.trim();
   if (!seg) return;
   entry.lastSegment = seg;
+  const closed = entry.closedSegments ?? [];
+  closed.push(seg);
+  if (closed.length > CLOSED_SEGMENTS_MAX) closed.shift();
+  entry.closedSegments = closed;
   entry.answer = "";
   if (!entry.answerMessageSeen) {
     const waiting = entry.awaitingMessages ?? [];
@@ -813,10 +829,50 @@ export const acceptGroupReplyMessage = (
   appendGroupReplyAnswer(taskId, runTag, text);
 };
 
-/** 这条登记最终该发的文本：当前段，空则退回上一非空段 */
+/**
+ * 旧语义：当前段，空则退回上一非空段。**已不再被出向使用**（2026-11-09 起群里发累积全文，
+ * 见 visibleGroupReplyText），仅保留给外部调用 / 单测。
+ */
 export const finalGroupReplyText = (
   entry: Pick<PendingGroupReply, "answer" | "lastSegment">,
 ): string => entry.answer.trim() || (entry.lastSegment ?? "").trim();
+
+/**
+ * 群里应该看到的**累积全文**：已收段落 + 当前段，用空行拼（只增不换——后一次一定以前一次为前缀，
+ * 打字机 / 前缀守卫友好；中途「我先查一下…」也会留在卡上，和私聊流式卡一致）。
+ *
+ * 静默（NO_REPLY，见 group-silent-reply）按「段」处理：
+ * - 逐段：首行是 NO_REPLY 的段落不进群；
+ * - `final=false`（流式中）：当前段用 `judgeGroupReply` 判，`undecided`（`NO_RE` 半截）/ `silent` 暂不显示，
+ *   只显示它前面已收的段落；
+ * - `final=true`（收口）：**最后一段**（当前段，没有就是最后一个已收段）是 NO_REPLY 则整轮静默、返回 ""——
+ *   agent 先旁白几句、最后又判定「这条不关我事」时，别把旁白当答案发出去。
+ */
+export const visibleGroupReplyText = (
+  entry: Pick<PendingGroupReply, "answer" | "closedSegments">,
+  final: boolean,
+): string => {
+  const closed = entry.closedSegments ?? [];
+  const current = entry.answer.trim();
+  if (final) {
+    const last = current || closed[closed.length - 1] || "";
+    if (last && isSilentGroupReply(last)) return "";
+  }
+  const parts = closed.filter((s) => s && !isSilentGroupReply(s));
+  if (current) {
+    const keep = final
+      ? !isSilentGroupReply(current)
+      : judgeGroupReply(current) === "speak";
+    if (keep) parts.push(current);
+  }
+  return parts.join("\n\n");
+};
+
+/** 这轮是否一个字都没说过（已收段落 + 当前段全空）——区分「空回答」与「全是 NO_REPLY」 */
+export const hasAnyGroupReplyText = (
+  entry: Pick<PendingGroupReply, "answer" | "closedSegments">,
+): boolean =>
+  entry.answer.trim() !== "" || (entry.closedSegments?.length ?? 0) > 0;
 
 /**
  * 取出并摘掉指定 token 的那条登记（无则 null）。

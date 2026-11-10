@@ -11,6 +11,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { resolveTaskLeftPaneMinSize } from "@/components/browser/browser-layout-memory";
+
 import {
   ARTIFACT_PANEL_MAX_PERCENT,
   EVENT_STREAM_DEFAULT_MIN_PX,
@@ -101,7 +103,11 @@ describe("task 详情页布局接线", () => {
     const panel = page.slice(i, page.indexOf("<aside", i));
     expect(panel).not.toMatch(/maxSize=/);
     const a = page.indexOf('id="artifact"');
-    expect(page.slice(a, page.indexOf(">", page.indexOf("onResize", a)))).toContain('minSize="20%"');
+    // R1-37：产物标签下仍是 20%（resolveTaskLeftPaneMinSize(false)），浏览器标签激活时换像素下限（见 tests/browser-ui-logic.test.ts）
+    expect(page.slice(a, page.indexOf(">", page.indexOf("onResize", a)))).toContain(
+      'minSize={resolveTaskLeftPaneMinSize(leftTab === "browser")}',
+    );
+    expect(resolveTaskLeftPaneMinSize(false)).toBe("20%");
   });
 
   it("默认宽度走 resolveArtifactDefaultPercent(量到的容器宽度)；量到之前不挂 Group（避免先按 70/30 挂、再重挂）", () => {

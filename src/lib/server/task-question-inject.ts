@@ -33,6 +33,7 @@ import {
   setTaskRunStatusIfRunOwner,
 } from "@/lib/server/task-fs";
 import { appendTimingLog } from "./timing-log";
+import { buildBrowserActivityNote, shouldAttachBrowserNote } from "./browser/activity";
 import {
   saveImageAttachments,
   snapshotActionArtifact,
@@ -49,8 +50,14 @@ import {
 } from "@/lib/server/restricted-question";
 import { HeapPressureError } from "@/lib/server/sdk-store-gc";
 import {
+  TASK_BRANCH_GUARD_CODE,
+  TaskBranchGuardError,
+} from "@/lib/server/task-branch-guard";
+import { WorktreeLeaseLostError } from "@/lib/server/task-worktrees";
+import {
   abortStuckRunForSend,
   deliverTaskQuestion,
+  guardTaskBranchForUserTurn,
   isTaskOpStale,
   resumeCurrentActionWithMessage,
   startOneShotQuestion,
@@ -177,6 +184,12 @@ export interface TaskQuestionInjectOptions {
    * 与 {@link restrictToQuestion} 不同，它仍然复用活会话、保留全权限（定时是 AI 自己给自己设的）。
    */
   scheduledTrigger?: boolean;
+  /**
+   * 只给 agent 看的上下文（拼在用户原文**后面**、不进 user_reply 气泡）。
+   * 用途：内置浏览器的「交还给 AI」把用户在浏览器里的操作摘要交给 agent，气泡里只显示用户自己的话。
+   * 与 chat-inject 同名选项同语义；只能由服务端可信调用方经 options 传入，**不要**做成请求体字段。
+   */
+  agentContext?: string;
   /**
    * agent 真在跑时入队而非 409（仅 app 输入条 / 属主群消息 / 托办回执用；只答疑旁路不走这里）。
    * 入队后 202 `{ queued: true }`，由 task-talk-queue 在 task 空闲后串行重放。
@@ -721,6 +734,8 @@ const runTaskQuestionInject = async (
   // 群里非属主并入活会话：与 questionOnly 共享「不 ack / 不 askSkip / 不唤醒」，但会 send 进活会话
   const nonOwner = !questionOnly && !!options.groupNonOwner;
   const guarded = questionOnly || nonOwner;
+  // 内置浏览器活动摘要（拉取点在下方 agentText 前；声明提到这里是因为 tryQueueWhenBusy 的闭包要读它）
+  let browserNote: string | null = null;
 
   const text = (body.text ?? "").trim();
   const imagesResult = parseAndValidateImages(body.images, MAX_IMAGES);
@@ -760,7 +775,13 @@ const runTaskQuestionInject = async (
     const r = enqueueTalkMessage(id, {
       source: qOpt.source,
       rawBody,
-      options: { ...options, queueIfBusy: undefined },
+      options: {
+        ...options,
+        queueIfBusy: undefined,
+        ...(browserNote
+          ? { agentContext: [options.agentContext, browserNote].filter(Boolean).join("\n\n") }
+          : {}),
+      },
       senderName: qOpt.senderName,
       senderIsBot: qOpt.senderIsBot,
       senderKey: qOpt.senderKey,
@@ -975,6 +996,19 @@ const runTaskQuestionInject = async (
       ? null
       : beginAskSkip({ ...task, events: askEvents });
   if (askSkip?.claimed) skipRef.handle = askSkip;
+  // 内置浏览器·路径 2：用户本人发消息时，附上他在浏览器里「AI 还没看到」的操作摘要（只摘要 + 当前页面，不附整页快照）。
+  // 只给属主本人的消息（输入条 / 飞书私聊）：群里别人的话、关联回执、定时消息都不附——
+  // 附了等于把属主的浏览器操作细节交给陌生人触发的那一轮。bridge 不可用 / 没有新操作 → null，零开销。
+  // 注意 markSeen 在拉取时就推进了：之后若这条消息被入队（下面 tryQueueWhenBusy），摘要要跟着进队列
+  // （重放时重新拉只会拿到「更新的」操作、旧的已被标记送达），所以入队选项里把它并进 agentContext。
+  if (
+    !guarded &&
+    !options.correlatedAnswer &&
+    !options.scheduledTrigger &&
+    shouldAttachBrowserNote(options.userReplyMetaExtra)
+  ) {
+    browserNote = await buildBrowserActivityNote(task.id);
+  }
   // 事件用用户原文；发给 agent 的带跳过上下文 + skill 指引（三条分流共用）。
   // 关联回执包一层不可信数据头：进的是全权限会话，模型必须只当数据用。
   const agentText =
@@ -983,13 +1017,38 @@ const runTaskQuestionInject = async (
       : "") +
     (askSkip?.hint ?? "") +
     buildSkillDirective(skills) +
-    text;
+    text +
+    // agentContext 跟在原文后（见选项注释）；浏览器活动摘要（路径 2）同样从这里进
+    (options.agentContext ? `\n\n${options.agentContext}` : "") +
+    (browserNote ? `\n\n${browserNote}` : "");
+
+  // 有待答提问被隐式跳过时，同一轮 curl 多半还挂着：正文会直接写进 stdout、不经过 sendToTaskSession 里的分支守卫——
+  // 用户正是在 AI 等答案的这段时间去 IDE 切了分支最常见，所以这里先守（与 sendToTaskSession 同一个函数）。
+  // 守完把「已守」传给 deliver、避免它再守一遍（in-place 的提醒会附两次）。
+  let branchGuarded = false;
+  let liveAgentText = agentText;
+  if (askSkip?.claimed) {
+    try {
+      const notice = await guardTaskBranchForUserTurn(
+        task,
+        () => !isTaskOpStale(task.id, opGen),
+      );
+      if (notice) liveAgentText = `${agentText}\n\n${notice}`;
+      branchGuarded = true;
+    } catch (err) {
+      if (err instanceof WorktreeLeaseLostError) return staleResponse(task.id);
+      if (err instanceof TaskBranchGuardError) {
+        return errorResponse(err.message, 409, { code: TASK_BRANCH_GUARD_CODE });
+      }
+      throw err;
+    }
+  }
 
   // 同一轮 curl 还挂着：跳过正文写进 stdout，本轮继续。写进去了就不要 send。
   const viaWait = askSkip
     ? await sendTimed(
         "askSkipWait",
-        fulfillAskSkipViaWait(task.id, askSkip, agentText, {
+        fulfillAskSkipViaWait(task.id, askSkip, liveAgentText, {
           imageAbsPaths,
           attachmentPaths:
             attachmentPaths.length > 0 ? attachmentPaths : undefined,
@@ -1039,7 +1098,7 @@ const runTaskQuestionInject = async (
             "deliver",
             deliverTaskQuestion(
               task,
-              agentText,
+              liveAgentText,
               imageAbsPaths,
               // 非属主**不传 creds**：deliver 内「内存无会话 + 有 creds → resumeTaskSession」会把休眠会话复活成
               // 全权限会话；不传则无内存会话时直接 no_session（下面 409）
@@ -1067,11 +1126,21 @@ const runTaskQuestionInject = async (
                       : {}),
                   }
                 : undefined,
+              branchGuarded,
             ),
           );
   } catch (err) {
     if (err instanceof HeapPressureError) {
       return errorResponse(err.message, 503);
+    }
+    // 仓库被切走且没能切回：这条消息没送给 AI（宁可让用户先处理，也不让 AI 在错分支上改代码）。
+    // 409 + 固定 code、文案不含「正在跑 / 等它说完」——排队重放据此判 other、直接丢弃并把原因写进事件，不会无限放回。
+    if (err instanceof TaskBranchGuardError) {
+      return errorResponse(err.message, 409, { code: TASK_BRANCH_GUARD_CODE });
+    }
+    // 守卫中途失主（stop / 重发）：与 deliver 返回 stale 同口径
+    if (err instanceof WorktreeLeaseLostError) {
+      return staleResponse(task.id);
     }
     throw err;
   }

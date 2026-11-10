@@ -202,7 +202,31 @@ const FIXED_FILES = [
   "components/preview/table-viewer.tsx",
   "components/ui/local-file-preview.tsx",
   "components/ui/local-file-preview-body.tsx",
+  // 内置浏览器 V4 用户侧 UI（2026-11-07）+ 面板 / 视口（R1-33：之前只有 browser-v4-ui.test 里手列的 5 个文件被扫，面板与视口没覆盖）。
+  // 颜色只走语义 token、hover 提示一律 Tooltip、动画带 motion-reduce
+  "components/browser/browser-find-bar.tsx",
+  "components/browser/browser-downloads.tsx",
+  "components/browser/browser-dialog-bar.tsx",
+  "components/browser/browser-extra-bars.tsx",
+  "components/browser/browser-prompt-bar.tsx",
+  "components/browser/browser-state-bars.tsx",
+  "components/browser/browser-icon-button.tsx",
+  "components/browser/browser-panel.tsx",
+  "components/browser/browser-viewport.tsx",
+  // R2-14 ④：以前只登记了上面 6 个，其余 browser UI 文件（入口按钮 / 左栏切换 / chat 分栏 / 不可用占位 / 全局通知 Watcher /
+  // 设置页卡片）都在扫描之外。下面「内置浏览器 UI 全量登记」会按目录枚举，新增 .tsx 不登记就红
+  "components/browser/browser-toggle-button.tsx",
+  "components/browser/left-pane-switch.tsx",
+  "components/browser/chat-browser-split.tsx",
+  "components/browser/browser-unavailable.tsx",
+  "components/browser/browser-ask-watcher.tsx",
+  "components/settings/browser-card.tsx",
 ] as const;
+
+/** 内置浏览器的 UI 文件（FIXED_FILES 里属于它的那部分）：下面几条针对它的专项规则用 */
+const BROWSER_UI_FILES = FIXED_FILES.filter(
+  (f) => f.startsWith("components/browser/") || f === "components/settings/browser-card.tsx",
+);
 
 /**
  * 允许保留原生 `title=` 的文件 → 必须写理由（目前没有）。
@@ -317,6 +341,36 @@ describe("已修文件：不回到 ui-conventions 禁止的写法", () => {
     ]) {
       expect(midOpacityHits(stripComments(read(f))), f).toEqual([]);
     }
+  });
+});
+
+describe("内置浏览器 UI：全量登记 + 专项规则（R2-14 ④ ⑤）", () => {
+  it("src/components/browser/ 下全部 .tsx + settings/browser-card.tsx 都登记在 FIXED_FILES（新增文件不登记就红）", () => {
+    const onDisk = [
+      ...readdirSync(path.join(srcDir, "components", "browser"))
+        .filter((f) => f.endsWith(".tsx"))
+        .map((f) => `components/browser/${f}`),
+      "components/settings/browser-card.tsx",
+    ].sort();
+    const registered = new Set<string>(FIXED_FILES);
+    expect(onDisk.filter((f) => !registered.has(f))).toEqual([]);
+    // 守卫自身没有空转：目录枚举确实枚举到了东西
+    expect(onDisk.length).toBeGreaterThanOrEqual(12);
+    expect(BROWSER_UI_FILES.length).toBe(onDisk.length);
+  });
+
+  it("没有 20–99 的中间 opacity（图标装饰也用 text-muted-foreground，不叠 opacity-60）", () => {
+    for (const f of BROWSER_UI_FILES) expect(midOpacityHits(stripComments(read(f))), f).toEqual([]);
+  });
+
+  it("没有任何 animate-pulse（连带 motion-reduce:animate-none 的也不要：同屏只留一处主动效，加载态用静态表达）", () => {
+    for (const f of BROWSER_UI_FILES) expect(stripComments(read(f)), f).not.toMatch(/\banimate-pulse\b/);
+  });
+
+  it("设置页清除登录数据走 useDialog().confirm，不再自制两步确认", () => {
+    const card = stripComments(read("components/settings/browser-card.tsx"));
+    expect(card).toContain("useDialog");
+    expect(card).not.toMatch(/CONFIRM_WINDOW_MS|确认清除|setConfirming|\bsetTimeout\b/);
   });
 });
 

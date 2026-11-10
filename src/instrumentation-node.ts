@@ -36,6 +36,19 @@ export const registerNode = (): void => {
       );
     });
 
+  // 内置浏览器 IPC 桥：尽早发 hello 握手（hello-ack 要在用户第一次开会话之前就位，
+  // 工具注册是同步判 isAvailable 的）。只加载轻量的 bridge.ts（只依赖类型与设置读取）——
+  // 重逻辑（handback 注入）走飞书 bootstrap 同一个锚点，原因见下面「飞书桥接不能挂这里」。
+  // 没有 IPC 通道（dev:web / 纯 headless）时 initBrowserBridge 立刻返回；失败只 warn、不阻断启动。
+  void import("./lib/server/browser/bridge")
+    .then((m) => m.initBrowserBridge())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 内置浏览器桥启动失败（不阻断）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+
   // test 实例的 lark-cli 配置隔离（2026-07-19 用户拍板）：
   // lark-cli 默认读全局 ~/.lark-cli/config.json——test 和正式会绑同一个飞书机器人、
   // 事件互抢。test 实例把配置目录指到独立目录（绑独立机器人）；

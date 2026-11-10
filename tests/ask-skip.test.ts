@@ -33,6 +33,7 @@ const {
   getTask,
   getTaskMeta,
   getTaskWithTailEvents,
+  guardTaskBranchForUserTurn,
   hasChatSession,
   isTaskOpStale,
   patchActionAndRunStatusIfOpFresh,
@@ -71,6 +72,7 @@ const {
     getTask,
     getTaskMeta,
     getTaskWithTailEvents,
+    guardTaskBranchForUserTurn: vi.fn<AnyFn>(async () => undefined),
     hasChatSession: vi.fn<AnyFn>(() => true),
     isTaskOpStale: vi.fn<AnyFn>(() => false),
     patchActionAndRunStatusIfOpFresh: vi.fn<AnyFn>(async () => null),
@@ -104,6 +106,8 @@ vi.mock("@/lib/server/task-artifacts", () => ({
   snapshotActionArtifact,
 }));
 vi.mock("@/lib/server/task-runner", () => ({
+  // 分支漂移守卫：默认放行（beforeEach 复位）；分支守卫的用例里按需 mock 返回提醒 / 抛错
+  guardTaskBranchForUserTurn,
   deliverAskReply,
   deliverTaskQuestion,
   isTaskOpStale,
@@ -157,6 +161,9 @@ const { ASK_SKIP_AGENT_HINT, beginAskSkip, buildAskWaitSkipReply } = await impor
 const { findPendingAskEvent, isAskSkipped } = await import("@/lib/ask-pending");
 const { handleTaskQuestionInject } = await import(
   "@/lib/server/task-question-inject"
+);
+const { TASK_BRANCH_GUARD_CODE, TaskBranchGuardError } = await import(
+  "@/lib/server/task-branch-guard"
 );
 const { POST: askReplyPost } = await import(
   "@/app/api/tasks/[id]/ask-reply/route"
@@ -230,6 +237,7 @@ beforeEach(() => {
   getChatLifecycle.mockReturnValue(null);
   deliverTaskQuestion.mockResolvedValue("sent");
   deliverAskReply.mockResolvedValue("sent");
+  guardTaskBranchForUserTurn.mockResolvedValue(undefined);
   resumeCurrentActionWithMessage.mockResolvedValue(undefined);
   writeEventAndPublish.mockResolvedValue({ id: "ev_skip" });
   writeUserEventAndPublishStrict.mockResolvedValue({ id: "e1" });
@@ -546,6 +554,105 @@ describe("task 模式发新消息 = 跳过提问", () => {
     expect(agentText).toBe(body.text);
     expect(skipEvents()).toHaveLength(0);
   });
+
+  // ── 分支漂移守卫：用户常在 AI 等答案的时候去 IDE 切了分支（切到 master），回来直接在输入条说话 ──
+  describe("分支漂移守卫（用户在 IDE 切走分支后回来发消息）", () => {
+    const NOTICE = "〈分支漂移〉测试提醒";
+
+    it("curl 挂着：守卫先于写 stdout，in-place 提醒跟正文一起进 stdout（这条路径不经过 sendToTaskSession）", async () => {
+      const token = seedPendingAsk();
+      getTask.mockImplementation(async () => ({
+        ...taskWithAsk(token),
+        runStatus: "running",
+      }) as unknown as Task);
+      runningTasks.set(TASK_ID, {});
+      guardTaskBranchForUserTurn.mockResolvedValue(NOTICE);
+      openAskWait({ taskId: TASK_ID, askId: ASK_ID, token });
+      const chunks: string[] = [];
+      attachAskWaiter(TASK_ID, token, { write: (c) => chunks.push(c), close: () => {} });
+
+      const resp = await handleTaskQuestionInject(TASK_ID, body);
+
+      expect(resp.status).toBe(200);
+      expect(guardTaskBranchForUserTurn).toHaveBeenCalledTimes(1);
+      expect(deliverTaskQuestion).not.toHaveBeenCalled();
+      const out = chunks.join("");
+      expect(out).toContain("走方案 B");
+      expect(out).toContain(NOTICE);
+      // 提醒在用户原文之后
+      expect(out.indexOf("走方案 B")).toBeLessThan(out.indexOf(NOTICE));
+    });
+
+    it("curl 挂着 + 守卫抛 TaskBranchGuardError（硬切回失败）→ 409 + 固定 code、不写 stdout、登记放回、不写跳过事件", async () => {
+      const token = seedPendingAsk();
+      getTask.mockImplementation(async () => ({
+        ...taskWithAsk(token),
+        runStatus: "running",
+      }) as unknown as Task);
+      runningTasks.set(TASK_ID, {});
+      guardTaskBranchForUserTurn.mockRejectedValue(
+        new TaskBranchGuardError("仓库被切到了 master、自动切回失败"),
+      );
+      openAskWait({ taskId: TASK_ID, askId: ASK_ID, token });
+      const chunks: string[] = [];
+      attachAskWaiter(TASK_ID, token, { write: (c) => chunks.push(c), close: () => {} });
+
+      const resp = await handleTaskQuestionInject(TASK_ID, body);
+
+      expect(resp.status).toBe(409);
+      const data = (await resp.json()) as { error: string; code?: string };
+      expect(data.code).toBe(TASK_BRANCH_GUARD_CODE);
+      expect(data.error).toContain("自动切回失败");
+      // 排队重放按这两个词判 busy（无限放回）——文案不能撞上
+      expect(data.error).not.toMatch(/正在跑|等它说完/);
+      expect(chunks).toEqual([]);
+      expect(deliverTaskQuestion).not.toHaveBeenCalled();
+      expect(skipEvents()).toHaveLength(0);
+      expect(getPendingAsk(TASK_ID)?.askId).toBe(ASK_ID);
+    });
+
+    it("send 路径：已守过的提醒并进送给 deliver 的文本，且告诉 deliver「已守过」（第 11 个参数 true）、避免提醒附两次", async () => {
+      const token = seedPendingAsk();
+      getTask.mockImplementation(async () => taskWithAsk(token));
+      guardTaskBranchForUserTurn.mockResolvedValue(NOTICE);
+
+      const resp = await handleTaskQuestionInject(TASK_ID, body);
+
+      expect(resp.status).toBe(200);
+      const call = (deliverTaskQuestion as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls[0]!;
+      expect(String(call[1])).toContain(NOTICE);
+      expect(call[10]).toBe(true);
+    });
+
+    it("没有待答提问：注入层不守（交给 sendToTaskSession 守），deliver 的「已守过」为 false", async () => {
+      getTask.mockImplementation(
+        async () => ({ ...taskWithAsk("tok"), events: [] }) as unknown as Task,
+      );
+
+      await handleTaskQuestionInject(TASK_ID, body);
+
+      expect(guardTaskBranchForUserTurn).not.toHaveBeenCalled();
+      const call = (deliverTaskQuestion as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls[0]!;
+      expect(call[10]).toBe(false);
+    });
+
+    it("deliver 里抛 TaskBranchGuardError（无待答提问的普通消息）→ 409 + code、没写任何用户事件", async () => {
+      getTask.mockImplementation(
+        async () => ({ ...taskWithAsk("tok"), events: [] }) as unknown as Task,
+      );
+      deliverTaskQuestion.mockRejectedValue(
+        new TaskBranchGuardError("仓库被切到了 master、自动切回失败"),
+      );
+
+      const resp = await handleTaskQuestionInject(TASK_ID, body);
+
+      expect(resp.status).toBe(409);
+      expect(((await resp.json()) as { code?: string }).code).toBe(TASK_BRANCH_GUARD_CODE);
+      expect(writeUserEventAndPublishStrict).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -589,6 +696,39 @@ describe("ask-reply：这组提问已跳过", () => {
     expect(deliverAskReply).toHaveBeenCalledTimes(1);
     // 答完也走同一个卡片收口点（HANDOFF 记的欠账：从 app 答完群里那张卡不置态）
     expect(settleAskCards).toHaveBeenCalledTimes(1);
+  });
+
+  it("分支漂移守卫：答案送回 AI 之前先守；in-place 提醒并进答案、deliver 收到「已守过」(最后一个参数 true)", async () => {
+    const token = seedPendingAsk();
+    getTask.mockImplementation(async () => taskWithAsk(token));
+    guardTaskBranchForUserTurn.mockResolvedValue("〈分支漂移〉测试提醒");
+
+    const resp = await post();
+
+    expect(resp.status).toBe(200);
+    expect(guardTaskBranchForUserTurn).toHaveBeenCalledTimes(1);
+    const call = (deliverAskReply as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0]!;
+    expect(String(call[1])).toContain("方案 A");
+    expect(String(call[1])).toContain("〈分支漂移〉测试提醒");
+    expect(call[6]).toBe(true);
+  });
+
+  it("分支漂移守卫抛 TaskBranchGuardError → 409 + 固定 code、答案没投递、登记放回（用户处理完分支可重答）", async () => {
+    const token = seedPendingAsk();
+    getTask.mockImplementation(async () => taskWithAsk(token));
+    guardTaskBranchForUserTurn.mockRejectedValue(
+      new TaskBranchGuardError("仓库被切到了 master、自动切回失败"),
+    );
+
+    const resp = await post();
+
+    expect(resp.status).toBe(409);
+    const data = (await resp.json()) as { error: string; code?: string };
+    expect(data.code).toBe(TASK_BRANCH_GUARD_CODE);
+    expect(data.error).toContain("自动切回失败");
+    expect(deliverAskReply).not.toHaveBeenCalled();
+    expect(getPendingAsk(TASK_ID)?.askId).toBe(ASK_ID);
   });
 
   it("答题链摘走登记之后、跳过认领必然落空（并发只有一个赢）", async () => {

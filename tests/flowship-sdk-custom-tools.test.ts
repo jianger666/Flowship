@@ -57,6 +57,7 @@ describe("buildSdkCustomTools", () => {
       { task_id: "task-x", action_id: "act-1" },
       "not-the-owner",
     );
-    expect(result.content[0]?.text).toContain("接管");
+    const first = result.content[0];
+    expect(first?.type === "text" ? first.text : "").toContain("接管");
   });
 });
