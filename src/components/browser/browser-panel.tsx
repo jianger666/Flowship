@@ -32,7 +32,9 @@ import {
   Hand,
   Info,
   Loader2,
+  Maximize2,
   MessageSquarePlus,
+  Minimize2,
   MousePointerClick,
   MoreHorizontal,
   Plus,
@@ -109,6 +111,18 @@ import { useBrowserAvailable, useBrowserSession } from "./use-browser-session";
 interface BrowserPanelProps {
   taskId: string;
   className?: string;
+  /**
+   * 关闭浏览器面板（收起抽屉，会话仍在后台）：工具栏最右一个 X。不传 = 不画。
+   * 以前只能再点一次头部的「浏览器」入口才关得掉，抽屉自己里面没有关闭入口。
+   */
+  onClose?: () => void;
+  /**
+   * 「放大浏览器」：折叠旁边的栏（对话页 = 对话；工作台 = 事件流），让浏览器占满整行；再点还原。
+   * 不传 onToggleMaximize = 不画。coverTarget 只用于按钮文案里「盖住的是谁」。
+   */
+  maximized?: boolean;
+  onToggleMaximize?: () => void;
+  coverTarget?: string;
 }
 
 /** 拾取结果 → 输入框：文本走 composer-insert-bridge，截图走「粘贴图片」的现成通道 */
@@ -457,7 +471,14 @@ const EmptyState = () => (
   </div>
 );
 
-const BrowserPanelInner = ({ taskId, className }: BrowserPanelProps) => {
+const BrowserPanelInner = ({
+  taskId,
+  className,
+  onClose,
+  maximized = false,
+  onToggleMaximize,
+  coverTarget = "对话",
+}: BrowserPanelProps) => {
   const { state } = useBrowserSession(taskId);
   const { confirm } = useDialog();
 
@@ -803,6 +824,23 @@ const BrowserPanelInner = ({ taskId, className }: BrowserPanelProps) => {
           </DropdownMenuContent>
         </DropdownMenu>
 
+        {/* 面板级操作放最右、与页面级工具隔开：放大（盖住旁边的栏）/ 关闭抽屉。
+            关闭用 X、放大用 Maximize2：loading 时最左的 X 是「停止加载」，靠 tooltip 与位置区分 */}
+        {onToggleMaximize && (
+          <IconButton
+            label={maximized ? `还原（重新显示${coverTarget}）` : `放大浏览器，盖住${coverTarget}`}
+            pressed={maximized}
+            onClick={onToggleMaximize}
+          >
+            {maximized ? <Minimize2 /> : <Maximize2 />}
+          </IconButton>
+        )}
+        {onClose && (
+          <IconButton label="关闭浏览器" onClick={onClose}>
+            <X />
+          </IconButton>
+        )}
+
         {/* 加载进度：主进程只给 loading 布尔、没有百分比——画一条静态细线（无 aria-valuenow = 不确定进度）。
             不用 animate-pulse：ui-conventions「同屏只留一处主动效」，加载中的动态已经有标签页里的 spinner（R2-14 ⑤） */}
         {loading && (
@@ -839,8 +877,8 @@ const BrowserPanelInner = ({ taskId, className }: BrowserPanelProps) => {
  * 面板入口。没有 `window.__browser`（网页版 / 旧壳 / SSR）→「仅桌面端可用」，不报错。
  * 内层以 taskId 为 key：切任务时整块重建，避免上一个任务的「启动意图 / 草稿」串过去。
  */
-export const BrowserPanel = ({ taskId, className }: BrowserPanelProps) => {
+export const BrowserPanel = ({ taskId, className, ...panelProps }: BrowserPanelProps) => {
   const available = useBrowserAvailable();
   if (!available) return <BrowserUnavailable className={className} />;
-  return <BrowserPanelInner key={taskId} taskId={taskId} className={className} />;
+  return <BrowserPanelInner key={taskId} taskId={taskId} className={className} {...panelProps} />;
 };

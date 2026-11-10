@@ -32,6 +32,8 @@ import {
   Loader2,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Pencil,
   RefreshCw,
   RotateCcw,
@@ -105,6 +107,8 @@ import { useUiPerfReporter } from "@/hooks/use-ui-perf-reporter";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useLiveToolOutputs } from "@/hooks/use-live-tool-outputs";
 import { findPendingAskEvent } from "@/lib/ask-pending";
+import { pendingAskIdOf } from "@/lib/ask-reveal";
+import { useRevealOnNewAsk } from "@/hooks/use-reveal-on-new-ask";
 import {
   latestActionId,
   resolveSelectedActionOnChange,
@@ -119,6 +123,7 @@ import {
   EVENT_STREAM_MIN_PX,
   isArtifactCollapsedSize,
   isValidArtifactPanelSize,
+  planSplitToggle,
   resolveArtifactDefaultPercent,
 } from "@/lib/task-split-layout";
 import { isEphemeralToolOutputDelta } from "@/lib/tool-display";
@@ -134,7 +139,7 @@ import {
   classifyTaskDetailResult,
   type LoadOutcome,
 } from "@/lib/load-outcome";
-import { setArtifactPaneCollapsed } from "@/lib/pane-search";
+import { setArtifactPaneCollapsed, setEventStreamPaneCollapsed } from "@/lib/pane-search";
 import {
   createUserResizeIntent,
   isSeparatorTarget,
@@ -352,6 +357,7 @@ const TaskDetailPage = () => {
     setRunActive(false);
     // 折叠态属于上一个任务的 Group（key=task.id、切任务会重挂）；新 Group 总是展开着挂
     setArtifactCollapsed(false);
+    setEventStreamCollapsed(false);
     // 左栏标签同理：浏览器标签属于上一个任务的会话，新任务回到「产物」
     setLeftTab("artifact");
   }, [id, clearStreaming]);
@@ -767,6 +773,9 @@ const TaskDetailPage = () => {
   // 产物栏折叠：Panel 命令式句柄 + 折叠态（由 Panel 的 onResize 回写，拖到最小宽度以下自动折叠时也同步）
   const artifactPanelRef = usePanelRef();
   const [artifactCollapsed, setArtifactCollapsed] = useState(false);
+  // 事件流栏同样可折叠（把整行让给浏览器 / 产物）：句柄 + 折叠态，由 Panel 的 onResize 回写（拖到下限以下自动折叠时也同步）
+  const eventStreamPanelRef = usePanelRef();
+  const [eventStreamCollapsed, setEventStreamCollapsed] = useState(false);
   // 左栏当前内容：产物 / 内置浏览器（仅桌面端有入口）。ArtifactPanel 始终挂着、只是隐藏，切回来不丢滚动与选区
   const [leftTab, setLeftTab] = useState<LeftPaneTab>("artifact");
   // 折叠态同步给「搜索此栏」路由：折叠后 Cmd/Ctrl+F 不再落进看不见的产物搜索框（R9a-01）；
@@ -775,6 +784,11 @@ const TaskDetailPage = () => {
     setArtifactPaneCollapsed(artifactCollapsed || leftTab === "browser");
   }, [artifactCollapsed, leftTab]);
   useEffect(() => () => setArtifactPaneCollapsed(false), []);
+  // 事件流折叠同理：折叠后 Cmd/Ctrl+F 不再落进看不见的事件流搜索框
+  useEffect(() => {
+    setEventStreamPaneCollapsed(eventStreamCollapsed);
+  }, [eventStreamCollapsed]);
+  useEffect(() => () => setEventStreamPaneCollapsed(false), []);
   // 「用户主动收起浏览器面板」的意图（R2-14 ③）：点头部按钮 / 点「产物」标签 / 点折叠按钮时先 mark，
   // 自动展开 hook 靠它区分「用户关的」与「布局库自己折叠 / 夹取的」——后者不能记成「用户已收起」。
   // 拖分隔条（或键盘调整）的意图由下面的 userResizeIntentRef 表达，两者在 isUserClosePane 里合并
@@ -787,13 +801,30 @@ const TaskDetailPage = () => {
     const now = Date.now();
     return userCloseIntentRef.current.isRecent(now) || userResizeIntentRef.current.isActive(now);
   }, []);
-  const toggleArtifactPanel = useCallback(() => {
-    if (artifactPanelRef.current?.isCollapsed()) artifactPanelRef.current?.expand();
-    else {
-      userCloseIntentRef.current.mark(Date.now());
-      artifactPanelRef.current?.collapse();
-    }
-  }, [artifactPanelRef]);
+  // 两栏的折叠按钮：折叠一栏时若另一栏已折叠，先把另一栏展开（planSplitToggle），永远至少有一栏看得见
+  const toggleSplitPane = useCallback(
+    (target: "artifact" | "event-stream") => {
+      const artifact = artifactPanelRef.current;
+      const eventStream = eventStreamPanelRef.current;
+      const plan = planSplitToggle({
+        target,
+        artifactCollapsed: artifact?.isCollapsed() ?? false,
+        eventStreamCollapsed: eventStream?.isCollapsed() ?? false,
+      });
+      if (plan.expandFirst === "artifact") artifact?.expand();
+      if (plan.expandFirst === "event-stream") eventStream?.expand();
+      const panel = target === "artifact" ? artifact : eventStream;
+      if (plan.action === "expand") panel?.expand();
+      else {
+        // 折叠产物栏会连带关掉浏览器（浏览器住在产物栏里），算「用户主动收起」
+        if (target === "artifact") userCloseIntentRef.current.mark(Date.now());
+        panel?.collapse();
+      }
+    },
+    [artifactPanelRef, eventStreamPanelRef],
+  );
+  const toggleArtifactPanel = useCallback(() => toggleSplitPane("artifact"), [toggleSplitPane]);
+  const toggleEventStreamPanel = useCallback(() => toggleSplitPane("event-stream"), [toggleSplitPane]);
   // 浏览器面板：展开（必要时先把折叠的左栏展开）/ 头部入口开关 / 自动展开与「在内置浏览器打开」共用。
   // 顺序很关键（R2-14 ③）：先在**旧约束**仍有效时把栏展开 / 放宽到浏览器标签的像素下限，再换标签——
   // 换标签会让 minSize 变成像素下限、库随即按新约束重新校验当前宽度（< 下限一半直接折叠），
@@ -804,23 +835,55 @@ const TaskDetailPage = () => {
     setLeftTab("browser");
   }, [artifactPanelRef]);
   const browserPaneOpen = leftTab === "browser" && !artifactCollapsed;
+  // 「放大浏览器」= 折叠事件流栏、浏览器占满整行。记下这次折叠是不是放大造成的：
+  // 关闭浏览器 / 切回产物时只有「放大造成的」才自动把事件流还原；用户自己用头部按钮折叠的事件流，不替他展开
+  const browserMaximizedRef = useRef(false);
+  const restoreEventStreamFromMaximize = useCallback(() => {
+    if (!browserMaximizedRef.current) return;
+    browserMaximizedRef.current = false;
+    if (eventStreamPanelRef.current?.isCollapsed()) eventStreamPanelRef.current.expand();
+  }, [eventStreamPanelRef]);
+  const toggleBrowserMaximize = useCallback(() => {
+    const eventStream = eventStreamPanelRef.current;
+    if (!eventStream) return;
+    if (eventStream.isCollapsed()) {
+      browserMaximizedRef.current = false;
+      eventStream.expand();
+    } else {
+      browserMaximizedRef.current = true;
+      eventStream.collapse();
+    }
+  }, [eventStreamPanelRef]);
+  // 关闭浏览器 = 切回产物（不是把整个左栏折掉）：用户多半是想回去看产物
+  const closeBrowserPane = useCallback(() => {
+    userCloseIntentRef.current.mark(Date.now());
+    restoreEventStreamFromMaximize();
+    setLeftTab("artifact");
+  }, [restoreEventStreamFromMaximize]);
   const toggleBrowserPane = useCallback(() => {
-    // 收起 = 切回产物（不是把整个左栏折掉）：用户多半是想回去看产物
-    if (browserPaneOpen) {
-      userCloseIntentRef.current.mark(Date.now());
-      setLeftTab("artifact");
-    } else showBrowserPane();
-  }, [browserPaneOpen, showBrowserPane]);
+    if (browserPaneOpen) closeBrowserPane();
+    else showBrowserPane();
+  }, [browserPaneOpen, closeBrowserPane, showBrowserPane]);
   // 左栏顶部的「产物 | 浏览器」分段切换：切到浏览器也要先放宽栏宽（与头部入口同一条路径），切回产物是用户收起
   const onLeftTabChange = useCallback(
     (tab: LeftPaneTab) => {
       if (tab === "browser") showBrowserPane();
       else {
         userCloseIntentRef.current.mark(Date.now());
+        restoreEventStreamFromMaximize();
         setLeftTab(tab);
       }
     },
-    [showBrowserPane],
+    [showBrowserPane, restoreEventStreamFromMaximize],
+  );
+  // 「放大」把事件流折叠了，而 ask_user 答题卡就在事件流里：这时来了新的待回答提问，把放大造成的折叠还原（审核 R8-05 ①）。
+  // 只管放大造成的（browserMaximizedRef）；用户自己折叠的事件流不替他展开。askId 的上升沿检测见 useRevealOnNewAsk
+  const taskEventsForAsk = task?.events;
+  const pendingAskId = useMemo(() => pendingAskIdOf(taskEventsForAsk), [taskEventsForAsk]);
+  useRevealOnNewAsk(
+    pendingAskId,
+    () => browserMaximizedRef.current && !!eventStreamPanelRef.current?.isCollapsed(),
+    restoreEventStreamFromMaximize,
   );
   const browserTaskId = task && task.mode !== "chat" ? task.id : null;
   useEffect(() => {
@@ -1538,6 +1601,20 @@ const TaskDetailPage = () => {
               {artifactCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
             </Button>
           </Tooltip>
+          {/* 事件流栏折叠：把整行宽度让给产物 / 浏览器（浏览器标签下 = 放大浏览器）；拖分隔条到事件流下限以下也会自动折叠。
+              折叠后输入条跟着事件流栏一起收起，再点这里展开回到折叠前的宽度 */}
+          <Tooltip content={eventStreamCollapsed ? "展开事件流" : "收起事件流，产物 / 浏览器占满宽度"}>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-sm"
+              onClick={toggleEventStreamPanel}
+              aria-label="事件流栏"
+              aria-expanded={!eventStreamCollapsed}
+            >
+              {eventStreamCollapsed ? <PanelRightOpen /> : <PanelRightClose />}
+            </Button>
+          </Tooltip>
         </div>
         {/* 提测收件箱提醒条：本需求（feishuStoryUrl 对应工作项）有未读待测 MR 时挂出 */}
         <MrInboxTaskBanner feishuStoryUrl={task.feishuStoryUrl} className="mt-3" />
@@ -1646,7 +1723,13 @@ const TaskDetailPage = () => {
             {/* 浏览器只在它的标签下渲染：没打开过的用户零开销；切走即卸载（视图 detach，会话仍在主进程里） */}
             {leftTab === "browser" && (
               <div className="min-h-0 flex-1">
-                <BrowserPanel taskId={task.id} />
+                <BrowserPanel
+                  taskId={task.id}
+                  onClose={closeBrowserPane}
+                  maximized={eventStreamCollapsed}
+                  onToggleMaximize={toggleBrowserMaximize}
+                  coverTarget="事件流"
+                />
               </div>
             )}
             </div>
@@ -1654,11 +1737,30 @@ const TaskDetailPage = () => {
           <ResizableHandle withHandle />
           <ResizablePanel
             id="event-stream"
+            panelRef={eventStreamPanelRef}
             defaultSize={`${100 - artifactDefaultPercent}%`}
             // 像素下限：低于 ~320px 表格 / 答题卡 / 搜索框全部失效（以前是 20%、默认窗口里实际只有 ~307px）
             minSize={`${EVENT_STREAM_MIN_PX}px`}
+            // 可折叠：拖到下限一半以下自动折叠成 0、或点头部的折叠按钮；折叠后产物栏（maxSize 100%）吃满整行
+            collapsible
+            collapsedSize={0}
+            onResize={(size) => {
+              const collapsed = isArtifactCollapsedSize(size.asPercentage);
+              // 不管谁展开的（拖分隔条 / 头部按钮 / 放大按钮还原）：事件流重新露出来，「放大造成的折叠」就结束了
+              if (!collapsed) browserMaximizedRef.current = false;
+              setEventStreamCollapsed(collapsed);
+            }}
+            // Panel 内层默认 overflow:auto（内联样式）：折叠成 0 宽时内容（固定 min-width）会冒出横向滚动条，折叠态改成直接裁掉
+            style={eventStreamCollapsed ? { overflow: "hidden" } : undefined}
           >
-            <aside className="flex h-full flex-col">
+            {/* 内容固定按至少 EVENT_STREAM_MIN_PX 排版、折叠时只是被外层裁掉——不重排：
+                0 宽下每个字一行会让事件流的滚动位置 / 虚拟列表高度缓存全乱，展开后回不到原位。
+                折叠态子树 inert：退出 Tab 序与读屏（含底部输入条） */}
+            <aside
+              className="flex h-full flex-col"
+              style={{ minWidth: EVENT_STREAM_MIN_PX }}
+              inert={eventStreamCollapsed}
+            >
               {/* min-h-0 + flex-1：EventStream 根节点是 h-full、必须给它一个「刨掉底部输入条后」
                   的确定高度容器、否则总高超 100%、事件流滚不到底（V0.11.9 加输入条时踩过） */}
               <div className="min-h-0 flex-1">

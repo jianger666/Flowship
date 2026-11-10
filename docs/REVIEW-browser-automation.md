@@ -1905,3 +1905,134 @@ R7-15 处理完毕，「处理」栏已填、状态 `[已修]`；`STATE: 待复�
 唯一留的是 HANDOFF 里三处过期数字 / 说法（P5，见上），不挡。**局限不变**：真模型遵从率是用户手测项；没有真点 Flowship 窗口里的 jpg 预览；这一轮没有跑真 Electron（没碰 `electron-app/` / 渲染 / 解析代码）。
 
 （R7 复审补改复核结束；`STATE: 收敛`。）
+
+---
+
+## R8 复审（reviewer，2026-11-10 16:45）：v1.9.46 发版之后、开发 AI 在工作区里新改的东西（未提交）
+
+用户说「继续review下」。审的范围 = `git status` 里全部未提交改动：**①崩溃热修**（`electron-app/browser/tab.mjs` + 2 个新测试 / e2e）；**②聊天页浏览器「放大 / 关闭」+ 宽度上限放宽**；**③任务页事件流栏可折叠 + 放大**；**④全局侧栏可拖拽调宽**。我只读代码 + 写本文件，没有动代码 / 测试 / 提交。
+
+**先说最要紧的（给用户）**：**已经发布的 v1.9.46 带着一个会让主进程闪退的 bug**（页面里有 Worker——例如打开百度——时对 worker 会话 `Target.detachFromTarget` → SIGSEGV）。**修复在工作区里（R8-01），还没提交、没发版**。修复本身我验证通过；但同一批未提交改动里的②（聊天页放大）有一个 P1（R8-02），**不建议把这批整个发出去**。建议：只把 ①（`tab.mjs` + 两个测试 + e2e 脚本 + 文档里崩溃那几段）单独提交，热修发 v1.9.47；②③④ 等 R8-02 修完再发。发版文案仍要用户亲口同意，我不替用户拍板。
+
+**门禁（工作区当前状态，我独立跑）**：`tsc --noEmit` rc=0；`eslint . --max-warnings 0` rc=0；全量 `vitest run` **26355 条通过 / 0 失败**。真 Electron：开发的 `scripts/browser-e2e/r8-worker-no-detach.cjs`（经 `run.mjs`）**6/6**；我自己的独立探针 `/tmp/rv14-E/probe.cjs` **8/8**（blob Worker / SharedWorker / ServiceWorker / 跨站 iframe：只附加 iframe 目标，全程没有 `detachFromTarget`）。
+
+**独立验证方法**：①**真库 harness**——用 vite 把真 `useChatBrowserPane` + 真 `ChatBrowserSplit`（只把 `BrowserPanel` 换成桩）打成页面，放进真 Electron 里用真 `react-resizable-panels` 4.11.1 跑、真鼠标拖动（`/tmp/rv14-H/`，不进仓库）；任务页太重，没法直接挂，用的是它 Panel 配置和回调的**逐字复刻**（所以任务页结论是「逻辑对」，不是「页面本体实测」）。②**变异**——沙盒里（`/tmp/rv14-M`，node_modules 软链、不碰仓库）对新增 / 改动的 8 个测试文件（234 条）手写 53 个变异：**51 红 / 2 存活**（见 R8-04）。
+
+**发现（5 条）**：
+
+| 条目 | 级别 | 一句话 |
+|---|---|---|
+| R8-01 | P1（修复已通过） | 崩溃热修验证通过；**已发布的 v1.9.46 仍带崩溃**，修复没提交，要不要热修发版是用户的决定 |
+| R8-02 | P1 **已修，待复审** | 聊天页「放大」后，「还原」/ 头部「浏览器」按钮 / 面板 X **全部静默无效**，只能拖分隔条 |
+| R8-03 | P3 **已修，待复审** | 挂载路径不夹取：记住的宽度 ≥85% 时，窄一点的容器里页面一打开就被盖住（叠加 R8-02 就更糟） |
+| R8-04 | P3 **已修，待复审** | 测试缺口：R8-02 这种「库行为」测试完全没覆盖；变异存活 1 条真缺口 |
+| R8-05 | P4 ①已做 ②留给用户手测 | 记录项（盖住时的待回答提示、侧栏手柄与相邻元素叠放要真窗口手测） |
+
+### R8-01 [P1] [复审通过] 崩溃热修：`Target.setAutoAttach` 加 `filter`、不再对非 iframe 会话 `detachFromTarget`
+- 位置：`electron-app/browser/tab.mjs` 的 `AUTO_ATTACH_PARAMS`、`#setupSession`、`#onAttached`；`tests/browser-tab-auto-attach.test.ts`（10 条）；`scripts/browser-e2e/r8-worker-no-detach.cjs`。
+- 结论：**修复正确**。`filter: [{type:"iframe"}, {exclude:true}]`（先放行 iframe、再排除全部）让 Chromium 根本不把 worker / service worker / shared worker 附加给我们，也就不用 detach——崩溃路径整个消失；主会话与每个 OOPIF 子会话共用同一份参数（子会话里的 worker 也不会被附加）。
+- 证据：已验证。①开发的 e2e 6/6；②我的独立探针 8/8（见上）；③沙盒变异 T01–T09（去掉 filter / 顺序颠倒 / 只留 iframe / 加回 detach / `flatten:false` / `waitForDebuggerOnStart:true` / 非 iframe 也登记 / 主会话不带 filter / `autoAttach:false`）**9/9 全红**。
+- **没验证的**：我**没有**去跑旧代码重放崩溃（会 SIGSEGV 主进程、可能弹 macOS 崩溃对话框），「修复前确实会崩」依据是开发记录的事故现场，不是我复现的。
+- **发版状态（给用户）**：v1.9.46 的 tag 里是旧代码，**用户机器上装的就是带崩溃的版本**；修复只在工作区。建议见上面「先说最要紧的」。工作区里这四处是可以单独拆出来的：`tab.mjs`、`tests/browser-tab-auto-attach.test.ts`、`scripts/browser-e2e/r8-worker-no-detach.cjs`、`docs/BROWSER-AUTOMATION.md` 里崩溃那几段（同一个文件里还混着布局功能的改动，需要 `git add -p` 挑）。
+- 处理（开发 AI 填）：**无需改代码**（你说修复本身验证通过）。提交 / 发版没有做——要用户点头，发版文案要用户亲口同意。建议的拆分与你一致：只提交 `electron-app/browser/tab.mjs`、`tests/browser-tab-auto-attach.test.ts`、`scripts/browser-e2e/r8-worker-no-detach.cjs`、`docs/BROWSER-AUTOMATION.md` 里崩溃那几段（该文件还混着布局功能的改动，要 `git add -p` 挑），热修发 v1.9.47；布局功能（②③④）现在 R8-02 已修，但仍等你复审后再说。
+- 复审（reviewer 填）：复审通过（本轮）。
+
+### R8-02 [P1] [复审通过] 聊天页「放大」之后，「还原」/ 头部「浏览器」按钮 / 面板里的 X 全部静默无效——盖住态没有按钮能出来
+- 位置：`src/components/browser/use-chat-browser-pane.ts` 的 `toggleCover`（L121–L135，还原分支 L129–L130）、`setOpen`（L70–L91，L85 `panel.resize`、L87 `panel.collapse`）、`close`（L103–L107）；`chat-browser-split.tsx` L52（对话栏 `collapsible`）。
+- 问题：放大 = `browserPanel.resize("100%")`，库把对话栏折叠成 0。**对话栏已折叠时，对「另一个」Panel（浏览器栏）调 `resize()` / `collapse()` 在 `react-resizable-panels` 4.11.1 里是静默无效（不抛错）**，而这三处全都只对浏览器栏下命令，外面还包了 `try/catch`。结果在盖住态里：①面板里的「还原」（`toggleCover`）没反应；②头部「浏览器」按钮（`toggle → setOpen(false) → panel.collapse()`）没反应；③面板 X（`close → setOpen(false)`）没反应。唯一出口是把分隔条从主区最左缘（x≈0–6px）拖出来——而那个位置恰好紧挨着本轮新加的全局侧栏拖拽手柄（见 R8-05 ②，仅 CSS 推断、没真窗口测）。这是新功能「放大」的**主路径**（放大后想还原），不是边角。
+- 证据：已验证（真 Electron + 真库 + 真 hook / 真 `ChatBrowserSplit`，`/tmp/rv14-H/run/chat2.cjs`，1400px 宽、记住 42%）：A2 点开 → 对话 808.5 / 浏览器 585.5；A3 放大 → 对话 0 / 浏览器 1394、`chatInert=true`、内层 `overflow:hidden`（这一步本身正确）；**A4 点「还原」→ 布局完全没变；A5 点头部「浏览器」按钮 → 完全没变；A6 点面板 X → 完全没变**（`open` 回读仍是 `true`）。库行为的对照实验 `/tmp/rv14-H/run/fix.cjs` / `fix2.cjs`：对**浏览器栏** `resize(42%)`（现有写法）→ 无变化；对浏览器栏 `collapse()` → 无变化；对**对话栏** `expand()` → 320 / 1074（回到下限）；对话栏 `resize("58%")` → 808.5 / 585.5（精确还原）；`group.setLayout({58, 42})` → 同样精确还原；盖住态 `main.resize("100%")` 或 `group.setLayout({main:100, browser:0})` → 对话 1394 / 浏览器 0（整栏关闭，`browserCollapsed=true`）；窄窗口 700px 里按「记住 42% 夹到对话 320px」算出的 54.3% 对话栏 `resize` → 320 / 374。
+- 建议（上面的做法都在真库里验证过）：给 `chat-main` 也拿一个 `usePanelRef`（或用 `useGroupRef`）放进 hook。①还原：`main.resize(`${100 - percent}%`)`，`percent = resolveChatBrowserOpenPercent(记住值, 容器宽)`（已经有这个函数，现在是拿它去 resize 浏览器栏——命令发给了错的 Panel）；②盖住态下的关闭（`setOpen(false)` / `close` / 头部 toggle）：先 `main.resize("100%")`（或 `group.setLayout({ "chat-main": 100, "chat-browser": 0 })`），再走原来的状态回写；③不要只靠 `try/catch` 吞掉：命令发完读一次 `isCollapsed()` / 尺寸，没生效就走兜底，不然这类「静默无效」永远看不见。
+- 测试：这个缺陷现有测试**一条都拦不住**（R8-04）。修的时候加真库的回归（建议放 `scripts/browser-e2e/`，用 `run.mjs`；我的 harness 可以拿去改）：放大→还原回到约定宽度；放大→头部按钮→整栏收起、对话占满；放大→X→同上；放大后窗口缩窄再还原（夹在对话 320px）；单测里可以用「假 panel / group 句柄」钉死「盖住态下命令发给对话栏 / 走 `setLayout`，不是发给浏览器栏」。注意 `tests/browser-pane-cover.test.ts` 里「还原 = 记住的宽度（经夹取）」那条源码文本断言钉的正是出错的那行，修的时候要同步改。
+- 处理（开发 AI 填）：**已修，真库验证。** 根因就是你说的那条：盖住态下对浏览器栏（最后一个 Panel）缩小，库特判成「什么都不变」，三个入口全发给了浏览器栏。
+  - **修法**：命令发给谁收成一处——`browser-layout-memory.ts` 新增 `applyChatSplitCommand({kind: cover | restore | close}, {main, browser, group})`。还原 = **对话栏** `resize(100 − 浏览器宽度%)`（浏览器宽度仍经 `resolveChatBrowserOpenPercent` 夹到对话 ≥320px）；盖住态下关闭 = **对话栏** `resize(100%)`（浏览器栏随之折叠）；没盖住时关闭 / 放大照旧发给浏览器栏。**发完回读折叠态**，没生效就用 `Group.setLayout` 兜底（你实验过的 `{58,42}` / `{100,0}` 那条路），返回值告诉调用方最终有没有生效，不再靠 try/catch 吞掉。`use-chat-browser-pane.ts` 给 `chat-main` 也拿了 `usePanelRef`、给 Group 拿了 `useGroupRef`（`chat-browser-split.tsx` 传下去）；`setOpen(false)`（头部按钮 / 面板 X 都走它）与 `toggleCover` 都改走命令层，「是否盖住」以对话栏的折叠态为准（React 里的 `chatCovered` 只做兜底，可能慢一拍）。
+  - **真库验证**（`scripts/browser-e2e/r9-chat-split-cover.cjs`，由你的 harness 改成仓库内自包含版本，见 R8-04）：1400px / 记住 42%：A4 放大后点「还原」→ **808.5 / 585.5，与放大前逐像素一致**；A5 放大后点头部「浏览器」→ 整栏收起、对话 1400 / 浏览器 0、`open=false`；A6 放大后点面板 X → 同上；A7 放大 → X → 再点「浏览器」打开 → 回到 808.5、不盖住、对话可交互；A8 放大后容器缩到 700 再还原 → 对话 394 / 浏览器 300（夹在下限内）；A9–A11 见 R8-05 ①。你原来的 `chat2.cjs` 我也在修后的源码上重跑了：**14 / 15**，唯一的红是 C3——那条断言写死了「记忆仍是 42」，而你同一个页面里 B 段已经把记忆写成 85（我在 r9 里改成「拖之前 / 拖之后对比」：77.04 → 77.04，且 ≠ 100），意图（盖住的 100% 不写进记忆）是满足的。
+  - **测试**：`tests/browser-pane-cover.test.ts` 里钉错那行的源码文本断言已同步改掉（现在钉「放大 / 还原 / 关闭都走 `applyChatSplitCommand`」「不再直接 `panel.collapse()` / `panel.resize("100%")`」「Group 与对话栏句柄交给 hook」「Panel id 与常量一致」）；新增**假句柄**单测（见 R8-04）。变异（命令层）：还原发给浏览器栏且去兜底 / 关闭一律 `browser.collapse()` 且去兜底 / 挂载修复空转，分别 **5 / 2 / 2 条红**。
+- 复审（reviewer 填）：**复审通过。** 已验证（修后的源码，真 Electron + 真 `react-resizable-panels` 4.11.1 + 真 hook / 真 `ChatBrowserSplit`、`BrowserPanel` 为桩）：①我自己的 harness 在修后的源码上重放 `/tmp/rv14-H/run/chat2.cjs`（1400px、记住 42%）：**A4 放大后点「还原」→ 808.5 / 585.5（与放大前一致）；A5 头部「浏览器」按钮 → 对话 1400 / 浏览器 0、`open=false`；A6 面板 X → 同**——这三项修前全是红的（布局纹丝不动）；A3 放大本身、B1 / C1 / C2 / C4–C6 / D1 / D2 照旧绿，14 / 15，唯一的红是 C3（断言写死「记忆仍是 42」，而同一个页面里 B 段已把记忆写成 85，是我脚本的陈旧期望，开发的说明属实，不是缺陷）。②新写 `/tmp/rv14-H/run/reveal.cjs` **7 / 7**：浏览器没开时 `revealChat` 不动；开着没盖住时 `revealChat` 不会反过来盖住；放大 → `revealChat` 精确还原到 808.5 / 585.5；放大 → X 整栏关闭；再打开回到 42%、不盖住；**放大 / 还原连做 5 轮不漂移**。③开发的 `r9-chat-split-cover.cjs` 我经 `run.mjs` 独立重跑 **26 / 26**，脚本没往仓库里留产物（`git status` 与 `node_modules/.vite-temp` 都干净）。④命令层变异（沙盒）：还原发给浏览器栏 / 去掉还原兜底 / 还原返回值取反 / 关闭一律 `browser.collapse()` / 去掉关闭兜底 / 去掉放大兜底 **6 / 6 红**，全是行为级（假句柄）断言红的，不是源码文本；hook 接线类（绕过命令层直接 `collapse` / 打开或还原不夹取 / `toggleCover` 只信 React 盖住态）**4 / 4 红**（这几条靠源码契约）。命令层的设计我认可：命令发给对话栏、发完回读折叠态、没生效走 `setLayout` 兜底、返回值如实。
+  - **没验证的**：`BrowserPanel` 在 harness 里是桩，所以真面板里放大 / X 按钮的 `onClick` → `pane.toggleCover` / `pane.close` 这一段只有源码契约钉着（r9 也一样）；真 App 窗口没碰。
+
+### R8-03 [P3] [复审通过] 挂载路径没夹取：记住的宽度 ≥85% 时，在放不下 320px 的容器里页面一打开就被盖住
+- 位置：`use-chat-browser-pane.ts` L65–L68（`initial`）→ `chat-browser-split.tsx` L46 / L71（`defaultSize`）；`browser-layout-memory.ts`（`isValidChatBrowserPercent` 本轮放宽到 25–90）。
+- 问题：「打开」路径（`setOpen`）用 `resolveChatBrowserOpenPercent` 把记住的宽度夹到「对话栏 ≥ 320px」，但「挂载」路径（切任务 / 重进聊天页、`open` 在内存里是 true）把记住的百分比**原样**当 `defaultSize`。上限从 70 放到 90、对话栏又改成 `collapsible` 之后，库对「小于最小宽度一半」的 `defaultSize` 直接折叠——页面一打开对话栏就是 0（被盖住），再叠加 R8-02 点按钮还原不了。
+- 证据：已验证（真库，`/tmp/rv14-H/run/mount.cjs`，容器宽 / 记住百分比 → 对话 / 浏览器）：1000 / 42% → 577 / 417 正常；1000 / 80% → 320 / 674（库夹到下限，正常）；**1000 / 85% → 0 / 994 盖住；1000 / 90% → 0 / 994 盖住；1400 / 90% → 0 / 1394 盖住**；800 / 76% → 320 / 474 正常。
+- 现实触发条件（我评 P3 的原因）：记住 85–90% 要在 ≥ 约 2133px 宽的分栏组里才拖得出来（对话栏停在 320px），即大屏 / 外接显示器；而 `open` 是内存态、不跨重启，所以要在同一次运行里，在更窄的容器里重挂（换任务、换窗口大小、或者本轮新加的侧栏被拖到 480px 把主区挤窄）。不常见；但一旦触发，R8-02 修之前没有按钮能恢复。
+- 建议：挂载后也夹一次。`defaultSize` 在首次渲染前拿不到容器宽，可行做法：挂载后在 `useLayoutEffect` 里对 `initial.open` 的情况用 `resolveChatBrowserOpenPercent(记住值, wrapperRef.current.clientWidth)` 调一次 `group.setLayout`（或 `main.resize`）；或者把「可记住上限」收回到不会触发折叠的范围。**这条建议我没有在真库里验证过**（只验证了「挂载路径不夹取」这个现象和「打开路径夹取有效」），请修完后用 1000 / 85%、1000 / 90%、1400 / 90% 三个点回归。
+- 测试：把上面三个点放进真库回归；`resolveChatBrowserOpenPercent` 的纯函数测试已有，缺的是「挂载路径调用它」的钉子。
+- 处理（开发 AI 填）：**已修，真库验证。** 取你建议里的第一种：挂载后在 `useLayoutEffect` 里修一次（只在 `initial.open` 时）——`repairChatSplitAfterMount`：挂载时对话栏已被折叠（而「盖住」是一次性放大状态、从不持久化，所以挂载时折叠一定是库的产物，不是用户意图）→ 走命令层 `restore` 回到 `resolveChatBrowserOpenPercent(记住值, 容器宽)`；没折叠就不动。
+  - **你担心的「layout effect 时库是否就绪」**：实测可用——挂载后读到的就是修正后的宽度。（headless 窗口看不到「是否闪过一帧被盖住」，这点没验证。）
+  - **三个点回归**（r9 的 B2–B4，外加 B5 / B6）：1000px / 85% → **320 / 674**（修前 0 / 994）；1000px / 90% → **320 / 674**；1400px / 90% → **320 / 1074**（修前 0 / 1394）；800px / 76% → 320 / 474；1000px / 42%（放得下）→ 577 / 417，不被夹取改写。点按钮打开路径（B1：1000px / 85% → 320 / 674）仍正常。
+  - **测试**：`repairChatSplitAfterMount` 的假句柄单测（挂载正常不动 / 记住 85%·1000px 折叠 → 还原到对话恰好 320px / 量不到宽度按记住值 / 句柄缺失·isCollapsed 抛错不抛）；hook 源码契约钉「`useLayoutEffect` + `if (!initial.open) return;` + 调 `repairChatSplitAfterMount(splitHandles(), initial.percent, wrapperRef.current?.clientWidth)`」。
+- 复审（reviewer 填）：**复审通过。** 已验证（真库，`/tmp/rv14-H/run/mount.cjs`，修后的源码）：容器宽 / 记住% → 对话 / 浏览器：**1000 / 85% → 320 / 674（修前 0 / 994）；1000 / 90% → 320 / 674；1400 / 90% → 320 / 1074（修前 0 / 1394）**；1000 / 80% → 320 / 674；800 / 76% → 320 / 474；1000 / 42%（放得下）→ 577 / 417，没被改写，`covered=false`。**我多测了开发没写的一条路径：切任务**——ChatView 在不同对话间复用同一个 hook、`initial` 随 `taskId` 变化、`Group` 按 `key` 重挂，layout effect 要在这条路径上也重跑才对。`/tmp/rv14-H/run/switch.cjs`（t1 未开 → 切到已开着的 t2 → 切回 → 再切回，四组容器 / 记忆：1000/85、1000/90、1400/90、1000/42）**12 / 12**：t2 挂载后都是 320 / 674、320 / 674、320 / 1074、576.5 / 417.5，`covered=false`；t1 未开时对话占满；来回切不漂移。（我的脚本第一版把 `check` 的参数传错、断言形同虚设，发现后改正并重跑，上面是改正后的真结果。）变异：挂载修复空转 / 条件取反 / 修复时不夹取 **3 / 3 红**（前两个靠行为级假句柄，空转靠源码契约）。
+  - **没验证的**：layout effect 能否保证「用户一帧都没看到被盖住的页面」——headless 窗口看不到绘制帧；开发也如实写了没验证。即使闪一帧，R8-02 修完后一点「还原」也能恢复，评 P4，不挡。
+
+### R8-04 [P3] [复审通过] 测试缺口：新增的布局测试是「纯函数 + 源码文本」，没有任何一条跑过真库；变异存活 1 条真缺口
+- 位置：`tests/browser-pane-cover.test.ts`、`tests/browser-pane-layout.test.ts`、`tests/sidebar-width.test.ts`、`tests/task-split-layout.test.ts`、`tests/pane-search.test.ts`、`tests/browser-tab-auto-attach.test.ts`、`tests/browser-ui-logic.test.ts`、`tests/ime-enter-contract.test.ts`（8 个文件 234 条）。
+- 证据：已验证。沙盒基线 8/8 文件、234/234；我手写 53 个变异（T 自动附加 9 / S 侧栏 16 / L 任务页分栏 13 / C 聊天页分栏 15）：**51 红 / 2 存活**。
+  - **存活 L06（真缺口）**：把 `closeBrowserPane`（`src/app/tasks/[id]/page.tsx` L856–L860）里的 `restoreEventStreamFromMaximize()` 删掉，**全套仍绿**。行为差异是真的：放大状态下点 X 关浏览器后，事件流不再自动还原（文档承诺「放大造成的折叠，关闭 / 切回产物时自动还原」；我的任务页复刻里 T8 验证了现在的写法是对的）。补一条钉 `closeBrowserPane` 与 `onLeftTabChange` 的 else 分支里都调了它的断言。
+  - 存活 C09 是**等价变异**：`close` 里的 `mark(...)` 删掉后，`setOpen` 内部对「关闭」本来就会 mark，不用补。
+  - **51 个红里有 23 个是靠「源码文本契约」红的**（S10–S13、S15–S16、L07–L13、C05–C08、C10–C15）。它们钉的是「代码怎么写」，不是「行为」——所以 R8-02 里出错的那行（还原 = 对浏览器栏 `resize(记住宽度)`）恰恰被 C15 那条文本断言牢牢钉着；这类测试对「换一种等价写法」会红、对「写法没变但库里行为不对」不会红。
+  - 其余 28 个红是真行为断言（`AUTO_ATTACH_PARAMS` 形状、`#onAttached` 对非 iframe 不 detach / 不登记、`resolveSidebarDrag` / `resolveSidebarKey` / `clampSidebarWidth`、`planSplitToggle`、`resolvePaneSearchScope`、`resolveChatBrowserOpenPercent`、`isChatCoveredSize`）。这部分质量不错。
+- 建议：①补 L06 那条；②R8-02 / R8-03 的真库回归（见各条）；③以后「依赖第三方布局库命令式语义」的功能，别只写源码文本断言——node 环境里没有布局，但可以用假句柄测「命令发给了谁」，真行为放 `scripts/browser-e2e/`。
+- 处理（开发 AI 填）：**已修。**
+  - **L06（真缺口）**：`tests/browser-pane-layout.test.ts` 新增一条钉死——`restoreEventStreamFromMaximize` 只在「放大造成的」时动、先复位标记再展开；`toggleBrowserMaximize` 先记标记再折叠；`closeBrowserPane` 先还原事件流、再切回产物；`onLeftTabChange` 只有切回产物的 else 分支还原、切到浏览器不还原；事件流展开时标记复位。变异：删掉 `closeBrowserPane` 里的还原 → 红；删掉 `onLeftTabChange` else 分支里的还原 → 红（改前全套仍绿）。C09 等价变异按你说的不补。
+  - **真库回归**：`scripts/browser-e2e/r9-chat-split-cover.cjs` + `scripts/browser-e2e/layout-harness/`（`harness.tsx` / `stub-browser-panel.tsx` / `vite.config.mjs`）。把你的 harness 改成仓库内自包含：脚本自己定位 vitest 带来的 vite、以 `ELECTRON_RUN_AS_NODE` 起子进程打包到临时目录（不往仓库写产物）、再在无头 Electron 里跑，经 `run.mjs` 启动：`node scripts/browser-e2e/run.mjs scripts/browser-e2e/r9-chat-split-cover.cjs --timeout 120`。**26 / 26**：A 按钮路径 11 项（含放大 → 还原 / 头部按钮 / X、放大 → X → 再开、放大后缩窄再还原、`revealChat`）、B 夹取与挂载 6 项、C 真鼠标拖分隔条 6 项、D 缩窄 3 项 + 1 条只记录的逐级缩窄扫描（C3 已改成拖前 / 拖后对比）。
+  - **假句柄单测**（`tests/browser-pane-cover.test.ts` 现 31 条，其中假句柄 13 条）：模型里内置库的那条特判（盖住态下对浏览器栏缩小 = 静默无效，并有「模型自检」那条防止模型自己写偏），断言「命令发给了谁」「没生效走 `setLayout` 兜底」「兜底也没生效返回 false」「句柄缺失 / 库抛错不抛」。
+  - **同时留意到（不是缺陷，已写进 r9）**：记住的占比很大（76%）时容器一步跳窄（1400 → 640，如取消最大化 / 换显示器），对话栏会按比例掉到一半以下（约 154px）被库折叠成盖住态——预期行为，关键是有出口：r9 的 D3 / D4 验证「被盖住 → 点还原 → 对话 320px」。逐级缩窄（1100 → 900 → 800 → 700 → 640）时对话栏一直 ≥334px、不会折叠。你 R8 里 D2「记录实际表现」看到的 0 / 634 就是这一种（同页面里记忆已被 C6 写成 76.54）。
+- 复审（reviewer 填）：**复审通过。** 已验证：沙盒（`/tmp/rv14-M`，把修后的 `src/` / `electron-app/` 与 9 个相关测试文件重新拷过去，基线 **9 个文件 / 262 条全绿**；我没有在仓库里跑任何变异）。对新增 / 改动的代码我写了 **30 个新变异：29 红 / 1 存活**。①**L06 的 5 个变异（`closeBrowserPane` 不还原事件流 / 切回产物标签不还原 / 切到浏览器标签也还原 / `restoreEventStreamFromMaximize` 不判放大标记 / `toggleBrowserMaximize` 折叠前不记标记）全红**——修前 L06 是存活的，真缺口补上了；②命令层 6 个 + 挂载修复 2 个（假句柄，行为级）全红；③`ask-reveal` 判定 3 个（电平触发 / 不看是否被遮住 / 提问消失也触发）全红；④`tab.mjs` 的 `filter` 回归 1 个红（崩溃修复仍被钉着）。**唯一存活 N20**（`useRevealOnNewAsk` 的 effect 里去掉 `prevAskIdRef.current = askId`）：effect 只在 `askId` 变化时才跑、`askId` 又是唯一的，去掉后行为只在「同一个 askId 先消失又原样回来」时才不同（比如事件被整体刷新、短暂丢了又回来），属于近等价变异，不补。
+  - **仍要老实说的**：新增的接线类断言（N09–N15、N19、N21–N24、L06）大多还是源码文本契约；但命令层与判定逻辑现在是行为级覆盖，真库行为有 r9（26 项）。**r9 是手动脚本（`run.mjs`），不在 vitest / CI 里**——以后改 `use-chat-browser-pane.ts` / `browser-layout-memory.ts` 的命令层，请手动跑一遍（命令已写在 `docs/BROWSER-AUTOMATION.md`）。P4，不挡。
+
+### R8-05 [P4] [复审通过] 记录项（「建议做」的做；不挡收敛，除非用户另有要求）
+1. **盖住 / 折叠时，待回答的提问没有显眼提示**：聊天页放大后对话栏 `inert` + 宽 0、任务页事件流折叠后同理，普通 `ask_user` 卡片就在被藏起来的那一栏里。`browser_ask_user_to_act` 有全局系统通知（`BrowserAskWatcher`），普通提问我没找到对应的提示出口（只看了代码，没真跑）。建议：被盖住 / 折叠期间来了待回答的提问，在浏览器面板工具栏或头部给个角标，或者自动还原。
+2. **全局侧栏拖拽手柄的叠放要真窗口手测**：`SidebarResizeHandle` 是 6px、`relative z-20` 的绝对定位条（展开时 `-left-0.5`、收起时 `left-0`），会跨进主区最左 2–3px。三个相邻元素：①聊天页盖住态下**唯一的出口**——主区最左缘的分隔条（R8-02）；②任务页产物栏折叠后挨着侧栏的分隔条；③原生 `WebContentsView`（盖在 HTML 之上，z-index 管不了它）。这三处我都是**从 CSS 推断**，**没有在真 App 窗口里测过**——需要用户（或开发）手测：侧栏展开时能不能抓到对话栏盖住态的分隔条；浏览器的原生视图贴着侧栏边缘时手柄会不会被遮挡 / 抓不住。
+3. 已查、**不是问题**（写下来免得谁再查一遍）：①任务页切任务时 `browserMaximizedRef` 没显式复位，但新 Group 挂载时事件流栏的 `onResize`（`!collapsed` → 复位）会兜住（我的任务页复刻里放大后重挂：`maxRef` true → false，T15）；②事件流已折叠时再点折叠产物栏：先展开事件流再折叠产物，不会两栏都空（T14）；③任务页放大 / 还原 / 放大后关浏览器 / 用户自己折叠后关浏览器不替他展开（T6–T9）、产物已折叠时点折叠事件流（T5）、真鼠标拖动折叠（拖到 0 才折叠、不会半折）都符合预期；④窗口缩到放不下 320 + 300 时对话栏被库折叠（盖住）——只有主区 < 640 才会发生，而侧栏最大宽度已按「主区 ≥ 640」夹取、窗口最小 960，所以实际到不了。
+- 处理（开发 AI 填）：① **已做（自动还原）**；② **留给用户手测**；③ 无需处理。
+  - ① 取你建议的「自动还原」：新增 `src/lib/ask-reveal.ts`（`pendingAskIdOf` + `shouldRevealForNewAsk`）与 `src/hooks/use-reveal-on-new-ask.ts`，**新的待回答提问出现（askId 上升沿）且答题卡所在的栏正被「放大」遮住时**，把被遮住的栏还原。聊天页：对话栏盖住态 → `pane.revealChat()`（只还原、不会反过来盖住；浏览器没开也不动）；任务页：`browserMaximizedRef`（放大造成的）且事件流此刻折叠 → `restoreEventStreamFromMaximize()`——**用户自己折叠的事件流不替他展开**（头部的「待回答」徽标还在）。只认上升沿：同一条提问事件增长不重复触发（用户看过后自己再放大，不会被反复拉回来）；页面打开时就在等的提问不算新（那时本来没有遮挡）；旧提问被作废、直接换成新提问（id 变了）算新的。测试：`tests/ask-reveal.test.ts`（新，11 条：判定口径 + 一条整段时间线 + 两页接线契约：判据 / 还原动作 / 声明顺序 / 在 `if (!task)` 早返回之前）；真库 r9 的 A9–A11（盖住态 `revealChat` → 还原到放大前宽度；没盖住 / 浏览器没开 → 不动）。**没验证的**：任务页是接线契约 + 你复刻里验证过的 `restoreEventStreamFromMaximize`，不是整页真跑；`BrowserAskWatcher`（`browser_ask_user_to_act`）是另一套机制、没动。
+  - ② **没有操作真 App 窗口**（AGENTS.md：用户没明确要求时 Agent 不得操作 / 截图 App），留给用户手测，建议三项：侧栏展开时能不能抓到聊天页盖住态的分隔条（盖住态现在有三个按钮出口，这条已不是唯一出口）；任务页产物栏折叠后挨着侧栏的分隔条能不能抓；浏览器原生视图贴着侧栏边缘时拖拽手柄会不会被遮挡 / 抓不住。
+  - ③ 已查不是问题的几条，认可。
+- 复审（reviewer 填）：**复审通过。** ①自动还原：已验证（真库，`reveal.cjs` R1–R4，见 R8-02）：浏览器没开不动；开着没盖住不会反过来盖住；盖住态 `revealChat` 精确还原；还原后再调不动。变异：判定 3 个、聊天页接线 2 个（换成 `toggleCover` 会反向盖住 / 去掉被遮住判断）、任务页接线 2 个（不判「放大造成」/ 不还原）**全红**。**补充一个事实**（不是缺陷）：聊天页的判据是 `chatCovered`，所以「用户自己拖分隔条把对话挤没」也会在新提问来时还原——答题卡同样被藏着，这个行为合理。任务页只还原「放大造成的」折叠、用户自己折叠的不替他展开，这一点靠接线契约 + 我早先在复刻里验证过的 `restoreEventStreamFromMaximize`（T8 / T9），**不是整页真跑**，开发的说明与我的结论一致。②留给用户手测：认可（不操作真 App 窗口）。③无需处理：认可。
+
+### 下一步（开发）
+R8-02（P1）→ R8-03 / R8-04（P3）→ R8-05 的 ①（建议做）；②是用户 / 开发手测项，处理栏写「已手测 / 留给用户」即可。**R8-01 不需要再改代码**，但提交和发版要用户点头（文案要用户亲口同意）。处理栏写清做了什么，置 `[已修]`，`STATE` 改 `待复审`。我下一轮只复审 R8-02 ~ R8-05，不扩大范围。
+
+**局限（如实）**：①没有操作真 Flowship App 窗口（侧栏手柄叠放、原生视图遮挡、真实的聊天页 / 任务页整页行为都没测）；任务页结论基于复刻；②没有重放旧代码的崩溃（见 R8-01）；③R8-03 的修法没在真库验证；④全量 vitest 一次通过；harness 与变异脚本都在 `/tmp/rv14-*`，不进仓库。
+
+（R8 复审结束；`STATE: 待处理`。）
+
+---
+
+### R8 开发处理（2026-11-10）
+
+R8-02 ~ R8-05 处理完毕，各条「处理」栏已填、状态 `[已修]`；`STATE: 待复审`。R8-01 无需改代码（提交 / 发版要用户点头，见该条「处理」）。
+
+**门禁（全部在最后一次代码 / 测试改动之后跑的）**：`pnpm exec tsc --noEmit` 0 错；`pnpm exec eslint . --max-warnings 0` 干净；全量 `pnpm exec vitest run`：**1193 个文件通过 + 3 个整文件跳过（共 1196）、26383 条通过 / 19 条跳过（均为既有的条件跳过）、0 失败**；真 Electron（经 `run.mjs`）：`r9-chat-split-cover.cjs` **26 / 26**（新增）。`r8-worker-no-detach.cjs`（崩溃回归）本轮没有改动相关代码，没有重跑。
+
+**本轮新增 / 改动**：
+- 源码：`browser-layout-memory.ts`（`applyChatSplitCommand` / `repairChatSplitAfterMount` / 面板 id 常量）、`use-chat-browser-pane.ts`（`mainPanelRef` / `groupRef` / 命令层 / 挂载修复 / `revealChat`）、`chat-browser-split.tsx`（句柄传下去）、`chat-view.tsx` 与 `tasks/[id]/page.tsx`（接 `useRevealOnNewAsk`）、新增 `src/lib/ask-reveal.ts`、`src/hooks/use-reveal-on-new-ask.ts`。
+- 测试：`tests/browser-pane-cover.test.ts`（过时的源码文本断言改掉 + 假句柄单测）、`tests/browser-pane-layout.test.ts`（L06）、新增 `tests/ask-reveal.test.ts`（11 条）。
+- 真库回归：新增 `scripts/browser-e2e/r9-chat-split-cover.cjs` + `scripts/browser-e2e/layout-harness/`（你的 harness 的仓库内自包含版）。
+- 文档：`docs/BROWSER-AUTOMATION.md` 的「面板位置」一行补了库特判与对策、挂载修复、新提问自动还原、r9 脚本。
+
+**变异（沙盒外、在仓库里改完立刻还原并 `cmp` 核对字节一致）**：命令层 3 个（还原发给浏览器栏且去兜底 5 红 / 关闭一律 `browser.collapse()` 且去兜底 2 红 / 挂载修复空转 2 红）、L06 2 个（去掉 `closeBrowserPane` 里的还原 1 红 / 去掉 `onLeftTabChange` else 分支里的还原 1 红）——**5 / 5 全红**。
+
+**如实说明**：① 没有操作真 Flowship App 窗口（AGENTS.md 不允许；R8-05 ② 留给用户）；任务页的自动还原是接线契约 + 你复刻里验证过的 `restoreEventStreamFromMaximize`，不是整页真跑；② 挂载修复在 headless 窗口里验证的是「挂载后的布局」，**看不到是否闪过一帧被盖住**；③ r9 的 harness 把 `BrowserPanel` 换成了桩（与你的做法一致），所以真浏览器面板里的 X / 放大按钮点击链路没有在这条回归里覆盖——按钮的 `onClick` 到 `pane.close` / `pane.toggleCover` 的接线由源码契约钉；④ 没有 commit / stash / checkout / reset / push，没碰 8676 / 8776 / 8876 端口。
+
+（R8 开发处理完毕；`STATE: 待复审`。）
+
+---
+
+## R8 复审（reviewer，2026-11-10 17:25，第二轮）
+
+用户让我蹲着等开发处理完再复审。开发把 R8-02 ~ R8-05 标 `[已修]`、`STATE` 改 `待复审` 后，我只复审了这四条，没扩大范围，没派子代理。**结论：R8-01 ~ R8-05 全部 `[复审通过]`，没有新增 P0 / P1，`STATE` 翻成 `收敛`。**
+
+**门禁**（我这边、开发最后一次改动之后重跑；之后仓库里没有再被改过）：`tsc --noEmit` rc=0；`eslint . --max-warnings 0` rc=0；全量 `vitest run` **1193 个文件通过 + 3 跳过、26383 条通过 / 19 跳过 / 0 失败**，与开发报的数字一致。真 Electron：开发的 `r9-chat-split-cover.cjs` **26 / 26**、`r8-worker-no-detach.cjs`（崩溃回归）**6 / 6**——两条都经 `run.mjs` 独立重跑；`electron-app/browser/tab.mjs` 修改时间与内容与上一轮复审时一致（15:54，没动）。
+
+**独立验证**：真库 harness 在修后的源码上重放（`chat2.cjs` 14 / 15、`mount.cjs` 全部挂载点、新写的 `reveal.cjs` 7 / 7、`switch.cjs` 12 / 12——切任务路径是我额外加的，开发没写）；沙盒变异 30 个 **29 红 / 1 存活**（近等价，见 R8-04）。细节在各条的「复审」栏。
+
+**不挡收敛的 P4（不开新条目）**：①`r9` 是手动脚本、不在 CI 里，改命令层前后请手动跑；②挂载修复是否会闪一帧、`BrowserPanel` 真按钮的点击链路——headless 与桩都验证不到。
+
+**仍然留给用户的（我 / 开发都不操作真 App 窗口）**：
+1. **R8-05 ② 手测三项**：侧栏展开时能不能抓到聊天页盖住态的分隔条（现在盖住态有三个按钮出口，这条已不是唯一出口）；任务页产物栏折叠后挨着侧栏的分隔条能不能抓；浏览器原生视图贴着侧栏边缘时拖拽手柄会不会被遮挡。
+2. **发版**：**已经发布的 v1.9.46 仍带 worker 闪退 bug**（修复在工作区、没提交）。建议把崩溃修复（`tab.mjs` + 两个相关测试 / e2e + 文档里崩溃那几段）单独提交、热修发 v1.9.47；布局 / 侧栏 / 自动还原这批现在也复审通过了，用户也可以选择一起发。**提交和发版（含文案）都要用户亲口同意，我不打 tag、不发版。**
+
+**局限（如实）**：没有操作真 Flowship App 窗口；任务页的结论基于复刻 + 接线契约；没有重放旧代码的崩溃；harness 与变异脚本都在 `/tmp/rv14-*`，不进仓库。
+
+（R8 复审第二轮结束；`STATE: 收敛`。reviewer 一侧的定时任务随之取消。）

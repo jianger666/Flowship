@@ -816,10 +816,14 @@ describe("chat 浏览器栏布局记忆", () => {
     };
   };
 
-  it("宽度合法范围 25–70；非法 / 缺失回默认", () => {
+  it("宽度合法范围 25–90（100% = 盖住对话，是一次性的放大状态，不记）；非法 / 缺失回默认", () => {
     expect(isValidChatBrowserPercent(42)).toBe(true);
+    expect(isValidChatBrowserPercent(25)).toBe(true);
+    expect(isValidChatBrowserPercent(90)).toBe(true);
     expect(isValidChatBrowserPercent(0)).toBe(false);
-    expect(isValidChatBrowserPercent(90)).toBe(false);
+    expect(isValidChatBrowserPercent(24.9)).toBe(false);
+    expect(isValidChatBrowserPercent(90.1)).toBe(false);
+    expect(isValidChatBrowserPercent(100)).toBe(false);
     expect(isValidChatBrowserPercent(NaN)).toBe(false);
     expect(resolveChatBrowserPercent(null)).toBe(CHAT_BROWSER_DEFAULT_PERCENT);
     expect(resolveChatBrowserPercent(33.333)).toBe(33.33);

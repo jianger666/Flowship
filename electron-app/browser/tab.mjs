@@ -45,6 +45,21 @@ import { checkUrl, isSafeFaviconUrl } from "./url-policy.mjs";
 export const PARKING_BOUNDS = Object.freeze({ x: 0, y: 0, width: 1280, height: 800 });
 export const BROWSER_PARTITION = "persist:flowship-browser";
 /**
+ * `Target.setAutoAttach` 的入参（主会话与每个 OOPIF 子会话共用）。
+ *
+ * 只自动附加 iframe（跨站 iframe 要子会话才读得到树 / 点得中）：`filter` 按顺序首条命中生效，第一条放行 iframe，第二条 `{ exclude: true }`
+ * 排除其余全部类型。**不能省略 filter**：省略时 worker / service worker / shared worker 都会被附加，而页面一旦创建 Web Worker
+ * （baidu.com 首页就起 blob: Worker），Electron 42.4.0（Chromium 148）对这些会话的 `Target.detachFromTarget` 会让主进程 SIGSEGV 闪退
+ * （2026-11-10 v1.9.46 事故；`tests/browser-tab-auto-attach.test.ts` 钉住这个形状）。
+ * 以前附加了又立刻 detach 的做法就是触发点；现在从源头就不附加它们，也省掉了每个 worker 的一来一回。
+ */
+export const AUTO_ATTACH_PARAMS = Object.freeze({
+  autoAttach: true,
+  waitForDebuggerOnStart: false,
+  flatten: true,
+  filter: Object.freeze([Object.freeze({ type: "iframe" }), Object.freeze({ exclude: true })]),
+});
+/**
  * 浏览器自己发起的导航（AI navigate / 用户地址栏 / 新建标签带 URL）之后，多久内出现的同 URL 下载仍算「我们发起的」
  * （R1-10：wc.loadURL 引出的下载 hasUserGesture 恒为 false）。这是下限；navigate 带的超时更长时取超时（R3-07 ①：
  * 「导出报表」类接口生成要 20 秒，will-download 到来时 15 秒的令牌已过期会被误拦），封顶 BROWSER_NAV_DOWNLOAD_MAX_MS。
@@ -824,7 +839,7 @@ export class BrowserTab {
       s("Log.enable"),
       s("Emulation.setFocusEmulationEnabled", { enabled: true }),
     ]);
-    await s("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
+    await s("Target.setAutoAttach", AUTO_ATTACH_PARAMS);
     await this.#installPageScripts(sessionId);
     for (const hook of [...this.sessionHooks]) {
       try {
@@ -997,8 +1012,10 @@ export class BrowserTab {
     const { sessionId, targetInfo } = params ?? {};
     if (!sessionId) return;
     if (targetInfo?.type !== "iframe") {
-      // worker / service worker 等：不需要，立刻放掉，省得调试器拖慢它们
-      void this.send("Target.detachFromTarget", { sessionId }, parentSessionId, 5000).catch(() => {});
+      // 正常到不了这里：AUTO_ATTACH_PARAMS 带了 iframe 过滤器，worker / service worker 根本不会被附加。
+      // **绝不能**在这里回 Target.detachFromTarget（以前的做法）：Electron 42.4.0（Chromium 148）上，页面一创建 Web Worker
+      // （baidu.com 首页就会起 blob: Worker），对它的会话发 detachFromTarget 会让主进程 SIGSEGV 直接闪退（2026-11-10 v1.9.46 事故）。
+      // 万一过滤器哪天失效漏进来：留着不动即可，没人往这个会话发命令，开销可以忽略。
       return;
     }
     this.children.set(sessionId, { sessionId, targetId: targetInfo.targetId, parentSessionId: parentSessionId ?? null });

@@ -13,16 +13,17 @@
  *    切到另一页型时恢复该页型的自动默认（用 ref 记「上次自动应用的页型」判断切换沿）
  *
  * 职责：
- *  - 持侧栏展开 / 收起态、Cmd/Ctrl+B 快捷切换
+ *  - 持侧栏展开 / 收起态、Cmd/Ctrl+B 快捷切换；侧栏宽度可拖右缘调整（SidebarResizeHandle）、拖窄自动收起
  *  - 主区滚动 → scrolled 状态传给顶栏（保留原「滚动才显分隔线」体验）
  *  - 路由切换时主区归顶 + 重置 scrolled
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { usePathname } from "next/navigation";
 
 import { AppHeader } from "@/components/app-header";
 import { AppSidebar } from "@/components/app-sidebar";
+import { SidebarResizeHandle } from "@/components/sidebar-resize-handle";
 import { isModCombo } from "@/lib/keyboard-shortcuts";
 import { createModHotkeyHandler, isSidebarToggleCombo } from "@/components/hotkey-handler";
 import {
@@ -30,10 +31,29 @@ import {
   dispatchEventStreamSearchFocus,
   getActivePaneSearchScope,
   isArtifactPaneCollapsed,
+  isEventStreamPaneCollapsed,
   resolvePaneSearchScope,
   setActivePaneSearchScope,
   type PaneSearchScope,
 } from "@/lib/pane-search";
+import {
+  SIDEBAR_DEFAULT_WIDTH,
+  clampSidebarWidth,
+  getSidebarWidthServerSnapshot,
+  getSidebarWidthSnapshot,
+  maxSidebarWidth,
+  setSidebarWidth,
+  subscribeSidebarWidth,
+  type SidebarDragResult,
+} from "@/lib/sidebar-width";
+
+// 视口宽度：夹取侧栏最大宽度用（主区至少留 SIDEBAR_MAIN_MIN_WIDTH）。服务端 / hydration 阶段给 0 = 量不到，只按绝对上限夹
+const subscribeViewportWidth = (onChange: () => void) => {
+  window.addEventListener("resize", onChange);
+  return () => window.removeEventListener("resize", onChange);
+};
+const getViewportWidthSnapshot = () => window.innerWidth;
+const getViewportWidthServerSnapshot = () => 0;
 
 // 页型：board（看板首页、默认展——2026-07-13 用户拍板「和对话保持一致、别切来切去
 // 一收一放」）/ standalone（设置 / 能力 / 会话管理页、默认收——这类页有自己的内部导航、任务侧栏
@@ -77,6 +97,35 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
 
   const toggleSidebar = useCallback(() => {
     setSidebarOpen((v) => !v);
+  }, []);
+  const collapseSidebar = useCallback(() => setSidebarOpen(false), []);
+
+  // 侧栏宽度：全局一个值、记在 localStorage（规则 / 夹取 / 收起阈值见 lib/sidebar-width，有单测）。
+  // 窗口变窄时只在渲染里夹一下有效宽度，不改写存的值——窗口放大回来侧栏回到用户拖出来的宽度
+  const storedSidebarWidth = useSyncExternalStore(
+    subscribeSidebarWidth,
+    getSidebarWidthSnapshot,
+    getSidebarWidthServerSnapshot,
+  );
+  const viewportWidth = useSyncExternalStore(
+    subscribeViewportWidth,
+    getViewportWidthSnapshot,
+    getViewportWidthServerSnapshot,
+  );
+  const sidebarWidth = clampSidebarWidth(storedSidebarWidth, viewportWidth);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
+  // 拖动 / 键盘：开合与宽度一起走（拖到很窄 = 收起，从收起态拖出来 = 展开）。拖动中不写盘，松手时写一次
+  const handleSidebarChange = useCallback((next: SidebarDragResult) => {
+    setSidebarOpen(next.open);
+    if (next.width !== null) setSidebarWidth(next.width, { persist: false });
+  }, []);
+  const handleSidebarResizingChange = useCallback((resizing: boolean) => {
+    setSidebarResizing(resizing);
+    if (!resizing) setSidebarWidth(getSidebarWidthSnapshot());
+  }, []);
+  const handleSidebarReset = useCallback(() => {
+    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH);
+    setSidebarOpen(true);
   }, []);
 
   // Cmd/Ctrl+B 切侧栏（对标 VSCode / Cursor）。
@@ -123,6 +172,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
         getActivePaneSearchScope(),
         pathname,
         isArtifactPaneCollapsed(),
+        isEventStreamPaneCollapsed(),
       );
       if (!scope) return;
       e.preventDefault();
@@ -155,7 +205,20 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
         scrolled={scrolled}
       />
       <div className="flex min-h-0 flex-1">
-        <AppSidebar open={sidebarOpen} />
+        <AppSidebar
+          open={sidebarOpen}
+          width={sidebarWidth}
+          resizing={sidebarResizing}
+          onCollapse={collapseSidebar}
+        />
+        <SidebarResizeHandle
+          open={sidebarOpen}
+          width={sidebarWidth}
+          maxWidth={maxSidebarWidth(viewportWidth)}
+          onChange={handleSidebarChange}
+          onResizingChange={handleSidebarResizingChange}
+          onReset={handleSidebarReset}
+        />
         <main
           ref={mainRef}
           onScroll={handleMainScroll}

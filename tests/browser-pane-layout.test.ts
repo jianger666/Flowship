@@ -303,13 +303,44 @@ describe("接线（源码契约）", () => {
     expect(body.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(body.indexOf("setLeftTab(tab)"));
   });
 
-  it("用户收起的三个入口都先 mark 意图再改状态：头部按钮收起浏览器 / 折叠按钮 collapse / 切回产物标签", () => {
+  it("用户收起的入口都先 mark 意图再改状态：头部按钮 / 浏览器面板自己的 X（同走 closeBrowserPane）、折叠按钮 collapse、切回产物标签", () => {
+    // 头部「浏览器」按钮收起 = closeBrowserPane；浏览器面板里的 X（onClose）也是它：mark 在 setLeftTab 之前
     const toggle = callbackBody(page, "toggleBrowserPane");
-    expect(toggle.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
-    expect(toggle.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(toggle.indexOf('setLeftTab("artifact")'));
-    const art = callbackBody(page, "toggleArtifactPanel");
-    expect(art.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
-    expect(art.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(art.indexOf(".collapse()"));
+    expect(toggle).toContain("closeBrowserPane()");
+    const close = callbackBody(page, "closeBrowserPane");
+    expect(close.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
+    expect(close.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(close.indexOf('setLeftTab("artifact")'));
+    expect(page).toMatch(/<BrowserPanel[^>]*onClose=\{closeBrowserPane\}/);
+    // 产物栏折叠按钮：toggleArtifactPanel → toggleSplitPane("artifact")，折叠产物栏（= 连带关掉浏览器）前先 mark
+    expect(callbackBody(page, "toggleArtifactPanel")).toContain('toggleSplitPane("artifact")');
+    const split = callbackBody(page, "toggleSplitPane");
+    expect(split.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
+    expect(split.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(split.indexOf("panel?.collapse()"));
+  });
+
+  it("任务页「放大」= 折叠事件流：关闭浏览器 / 切回产物都要把「放大造成的」折叠还原；用户自己折叠的不替他展开（R8-04 L06）", () => {
+    // 还原函数：只有放大造成的才动，且先复位标记再展开
+    const restore = callbackBody(page, "restoreEventStreamFromMaximize");
+    expect(restore).toContain("if (!browserMaximizedRef.current) return;");
+    expect(restore.indexOf("browserMaximizedRef.current = false")).toBeLessThan(restore.indexOf(".expand()"));
+    expect(restore).toContain("isCollapsed()");
+    // 放大：先记「是放大造成的」、再折叠；已折叠时再点 = 还原并清标记
+    const max = callbackBody(page, "toggleBrowserMaximize");
+    expect(max.indexOf("browserMaximizedRef.current = true")).toBeGreaterThan(-1);
+    expect(max.indexOf("browserMaximizedRef.current = true")).toBeLessThan(max.indexOf("eventStream.collapse()"));
+    // 关闭浏览器（头部按钮与面板 X 都走它）：先还原事件流、再切回产物
+    const close = callbackBody(page, "closeBrowserPane");
+    expect(close).toContain("restoreEventStreamFromMaximize()");
+    expect(close.indexOf("restoreEventStreamFromMaximize()")).toBeLessThan(close.indexOf('setLeftTab("artifact")'));
+    // 分段切换：只有切回产物的分支还原；切到浏览器不还原（放大中切到浏览器不该把事件流弹出来）
+    const tab = callbackBody(page, "onLeftTabChange");
+    const iElse = tab.indexOf("else {");
+    expect(iElse).toBeGreaterThan(-1);
+    expect(tab.slice(0, iElse)).not.toContain("restoreEventStreamFromMaximize()");
+    expect(tab.slice(iElse)).toContain("restoreEventStreamFromMaximize()");
+    expect(tab.slice(iElse).indexOf("restoreEventStreamFromMaximize()")).toBeLessThan(tab.slice(iElse).indexOf("setLeftTab(tab)"));
+    // 事件流被用户拖开 / 展开后，「放大」标记随之复位（切任务重挂 Group 时也靠它兜底）
+    expect(page).toContain("if (!collapsed) browserMaximizedRef.current = false;");
   });
 
   it("自动展开 hook 拿到 isUserClose（= mark 意图 或 分隔条拖拽意图）；userResizeIntentRef 只声明一次、在使用之前", () => {

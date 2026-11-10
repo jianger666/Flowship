@@ -11,9 +11,19 @@ export const CHAT_BROWSER_WIDTH_KEY = "flowship.chat-browser-width";
 
 /** 默认宽度（占整个分栏组的百分比） */
 export const CHAT_BROWSER_DEFAULT_PERCENT = 42;
-/** 合法范围：太窄浏览器没法用、太宽把对话挤没了 */
+/** 记住的宽度的合法范围：太窄浏览器没法用 */
 export const CHAT_BROWSER_MIN_PERCENT = 25;
-export const CHAT_BROWSER_MAX_PERCENT = 70;
+/**
+ * 浏览器栏的 maxSize（%）= 100：允许盖住整个对话栏（对话栏 collapsible，被挤到像素下限的一半以下就折叠成 0）。
+ * 以前是 70，再加对话栏 320px 的像素下限，1000px 宽的主区里浏览器最多 ~680px——「最宽也没多宽」。
+ */
+export const CHAT_BROWSER_MAX_PERCENT = 100;
+/**
+ * 能被**记住**的最大宽度（%）。盖住对话栏时浏览器是 100%，不在此列：那是一次性的「放大」状态，
+ * 不写进记忆——否则下次打开浏览器就直接盖住对话，用户得先还原。
+ * 90 而不是 70：大屏上用户拖到 80% 多也是对话还剩 300px 以上的合理宽度，应该被记住。
+ */
+export const CHAT_BROWSER_REMEMBER_MAX_PERCENT = 90;
 
 /** 对话栏的像素下限（与 task 页事件流栏同口径：再窄输入框 / 答题卡就失效） */
 export const CHAT_MAIN_MIN_PX = 320;
@@ -114,7 +124,131 @@ export const isValidChatBrowserPercent = (v: unknown): v is number =>
   typeof v === "number" &&
   Number.isFinite(v) &&
   v >= CHAT_BROWSER_MIN_PERCENT &&
-  v <= CHAT_BROWSER_MAX_PERCENT;
+  v <= CHAT_BROWSER_REMEMBER_MAX_PERCENT;
+
+/**
+ * 点「浏览器」打开面板时要 resize 到的百分比：记住的宽度，但不能让对话栏落到像素下限以下。
+ * 对话栏现在是 collapsible——命令式 resize 把它挤到下限的一半以下，库会直接把它折叠（= 打开浏览器的同时对话消失），
+ * 这不是用户点「浏览器」想要的。窗口比记宽度时小（换显示器 / 侧栏被拖宽了）就会这样。
+ * 量不到分栏组宽度时原样返回；窗口窄到连「对话下限 + 浏览器下限」都放不下，保浏览器下限（这时库自己会裁决）。
+ */
+export const resolveChatBrowserOpenPercent = (
+  rememberedPercent: number,
+  groupWidthPx: number | null | undefined,
+): number => {
+  if (typeof groupWidthPx !== "number" || !Number.isFinite(groupWidthPx) || groupWidthPx <= 0) {
+    return rememberedPercent;
+  }
+  const maxPercent = (1 - CHAT_MAIN_MIN_PX / groupWidthPx) * 100;
+  const minPercent = (CHAT_BROWSER_MIN_PX / groupWidthPx) * 100;
+  const clamped = Math.max(minPercent, Math.min(rememberedPercent, maxPercent));
+  return Math.round(clamped * 100) / 100;
+};
+
+/** 对话栏当前宽度（占分栏组的百分比）是否已被浏览器盖住（collapsedSize=0；同 isArtifactCollapsedSize 口径） */
+export const isChatCoveredSize = (chatMainPercent: number): boolean => chatMainPercent < 0.5;
+
+export const CHAT_MAIN_PANEL_ID = "chat-main";
+export const CHAT_BROWSER_PANEL_ID = "chat-browser";
+
+/** chat 分栏里 Panel 命令式句柄用到的方法（结构类型：库的 PanelImperativeHandle 满足它，测试里用假的） */
+export interface ChatPanelHandleLike {
+  resize: (size: string) => void;
+  collapse: () => void;
+  isCollapsed: () => boolean;
+}
+
+/** Group 句柄用到的方法（库的 GroupImperativeHandle 满足它） */
+export interface ChatGroupHandleLike {
+  setLayout: (layout: Record<string, number>) => unknown;
+}
+
+export interface ChatSplitHandles {
+  main: ChatPanelHandleLike | null | undefined;
+  browser: ChatPanelHandleLike | null | undefined;
+  group: ChatGroupHandleLike | null | undefined;
+}
+
+export type ChatSplitCommand =
+  /** 放大：浏览器栏占满，对话栏折叠成 0 */
+  | { kind: "cover" }
+  /** 还原：回到「浏览器栏 = browserPercent」 */
+  | { kind: "restore"; browserPercent: number }
+  /** 关闭浏览器：对话栏占满，浏览器栏折叠成 0 */
+  | { kind: "close" };
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+/**
+ * 对 chat 分栏下命令——**命令发给哪个 Panel 是关键**，所以收成一处、有单测、有真库回归（scripts/browser-e2e/r9-chat-split-cover.cjs）。
+ *
+ * 为什么不能一律对浏览器栏下命令：react-resizable-panels 4.11.1 对「最后一个 Panel 缩小、且它前面的 Panel 全是折叠态」
+ * 有一条特判——直接把它设成 100 − 前面之和（= 100），即**什么都不变、也不抛错**。盖住态下对话栏折叠、浏览器栏是最后一个，
+ * 所以对浏览器栏的 resize(记住宽度) / collapse() 全部静默无效（审核 R8-02：还原 / 头部按钮 / X 都失灵）。
+ * 因此：还原 = 让**对话栏**展开到 100 − 浏览器宽度；盖住态下关闭 = 让**对话栏**占满（浏览器栏随之折叠）。
+ *
+ * 发完命令回读折叠态：没生效就用 Group 的 setLayout 兜底（它直接给出整份布局，不走 delta 特判），
+ * 不再靠 try/catch 把「静默无效」吞掉。返回 true = 最终生效了（含走了兜底）。
+ */
+export const applyChatSplitCommand = (cmd: ChatSplitCommand, handles: ChatSplitHandles): boolean => {
+  const { main, browser, group } = handles;
+  if (!main || !browser) return false;
+  const fallback = (layout: { main: number; browser: number }) => {
+    try {
+      group?.setLayout({ [CHAT_MAIN_PANEL_ID]: layout.main, [CHAT_BROWSER_PANEL_ID]: layout.browser });
+    } catch {
+      // Group 已卸载 / 约束冲突：保持现状
+    }
+  };
+  try {
+    switch (cmd.kind) {
+      case "cover": {
+        browser.resize("100%");
+        if (!main.isCollapsed()) fallback({ main: 0, browser: 100 });
+        return main.isCollapsed();
+      }
+      case "restore": {
+        const browserPercent = round2(cmd.browserPercent);
+        const mainPercent = round2(100 - browserPercent);
+        main.resize(`${mainPercent}%`);
+        if (main.isCollapsed()) fallback({ main: mainPercent, browser: browserPercent });
+        return !main.isCollapsed();
+      }
+      case "close": {
+        // 以布局本身（对话栏是不是折叠）为准，不信 React 里可能慢一拍的 chatCovered
+        if (main.isCollapsed()) main.resize("100%");
+        else browser.collapse();
+        if (!browser.isCollapsed()) fallback({ main: 100, browser: 0 });
+        return browser.isCollapsed();
+      }
+    }
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 挂载后修一次：挂载路径（切任务 / 重进聊天页、open 在内存里是 true）把记住的百分比原样当 defaultSize，
+ * 记住 85–90% 而容器放不下 320px 对话栏时，库在注册时就把对话栏折叠了——页面一打开就是被盖住的（审核 R8-03）。
+ * 「被盖住」是一次性的放大状态、从不持久化，所以挂载时对话栏折叠一定是库的产物，不是用户意图 → 还原到夹取后的宽度。
+ * 没折叠（正常，或库只是夹到了下限）就不动。返回 true = 做了修复。
+ */
+export const repairChatSplitAfterMount = (
+  handles: ChatSplitHandles,
+  rememberedPercent: number,
+  groupWidthPx: number | null | undefined,
+): boolean => {
+  try {
+    if (!handles.main?.isCollapsed()) return false;
+  } catch {
+    // Panel 还没注册完：交回库按它的规则处理
+    return false;
+  }
+  return applyChatSplitCommand(
+    { kind: "restore", browserPercent: resolveChatBrowserOpenPercent(rememberedPercent, groupWidthPx) },
+    handles,
+  );
+};
 
 /** 存的值有效就用，否则默认；两位小数 */
 export const resolveChatBrowserPercent = (stored: unknown): number => {

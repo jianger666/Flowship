@@ -30,10 +30,24 @@ export const setArtifactPaneCollapsed = (collapsed: boolean): void => {
 
 export const isArtifactPaneCollapsed = (): boolean => artifactPaneCollapsed;
 
+/**
+ * 任务页的事件流栏当前是不是折叠的（写入时机同上）。
+ * 事件流栏现在也能折叠（腾地方给浏览器）：折叠态子树同样仍挂载（宽度 0 + inert），
+ * Cmd/Ctrl+F 若还路由到事件流，输入会落进看不见的搜索框。
+ */
+let eventStreamPaneCollapsed = false;
+
+export const setEventStreamPaneCollapsed = (collapsed: boolean): void => {
+  eventStreamPaneCollapsed = collapsed;
+};
+
+export const isEventStreamPaneCollapsed = (): boolean => eventStreamPaneCollapsed;
+
 /** 测试 / 路由默认：重置作用域记忆 */
 export const resetActivePaneSearchScope = (): void => {
   activeScope = null;
   artifactPaneCollapsed = false;
+  eventStreamPaneCollapsed = false;
 };
 
 export const isTaskDetailPath = (pathname: string): boolean =>
@@ -49,11 +63,17 @@ export const resolvePaneSearchScope = (
   pathname: string,
   /** 产物栏已折叠：落到产物栏的结果改路由到事件流（唯一看得见的栏） */
   artifactCollapsed = false,
+  /** 事件流栏已折叠：落到事件流的结果改路由到产物栏；两栏都看不见（浏览器标签 + 事件流折叠）→ 不拦截 */
+  eventStreamCollapsed = false,
 ): PaneSearchScope | null => {
   if (!isTaskDetailPath(pathname)) return null;
   const resolved: PaneSearchScope =
     scope === "event-stream" || scope === "artifact" ? scope : "artifact";
-  return artifactCollapsed && resolved === "artifact" ? "event-stream" : resolved;
+  const visible = (s: PaneSearchScope): boolean =>
+    s === "artifact" ? !artifactCollapsed : !eventStreamCollapsed;
+  if (visible(resolved)) return resolved;
+  const other: PaneSearchScope = resolved === "artifact" ? "event-stream" : "artifact";
+  return visible(other) ? other : null;
 };
 
 export const dispatchArtifactSearchFocus = (): void => {

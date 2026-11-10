@@ -46,6 +46,13 @@ const EXEMPT: ExemptEntry[] = [
     reason:
       "这里是 `if (Enter) return;` 把 Enter 让给 Lexical KEY_ENTER_COMMAND；提交判定在 shouldSubmitNative（已带 isImeComposing）",
   },
+  {
+    file: "lib/sidebar-width.ts",
+    fn: "resolveSidebarKey",
+    expr: 'case "Enter"',
+    reason:
+      "侧栏右缘分隔条（div role=separator，不是文本输入）聚焦时 Enter 开合侧栏；焦点不在输入框里，不会有 IME 组合",
+  },
 ];
 
 /**

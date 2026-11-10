@@ -101,6 +101,8 @@ import {
 import { effectiveQueueCount, nextQueueAutoOpenTickForPending } from "@/lib/queue-banner";
 import { prepareRunArgs } from "@/lib/run-args";
 import { findPendingAskEvent } from "@/lib/ask-pending";
+import { pendingAskIdOf } from "@/lib/ask-reveal";
+import { useRevealOnNewAsk } from "@/hooks/use-reveal-on-new-ask";
 import { effectiveRunActive } from "@/lib/owner-run-signal";
 import { deriveChatHeaderRunBadge } from "@/lib/task-header-status";
 import {
@@ -166,6 +168,10 @@ export const ChatView = ({
 }: Props) => {
   // 右侧内置浏览器栏：开合 / 宽度记忆 / 自动展开都收在这个 hook 里（默认收起，没打开过零开销）
   const browserPane = useChatBrowserPane(task.id);
+  // 浏览器「放大」盖住了对话栏时来了新的待回答提问（答题卡就在被盖住的栏里）→ 自动还原（审核 R8-05 ①）。
+  // 只看 askId 的上升沿，按 events 引用缓存（流式吐字不重扫）
+  const pendingAskId = useMemo(() => pendingAskIdOf(task.events), [task.events]);
+  useRevealOnNewAsk(pendingAskId, () => browserPane.chatCovered, browserPane.revealChat);
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空

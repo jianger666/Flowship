@@ -24,8 +24,12 @@ export const EVENT_STREAM_DEFAULT_PERCENT = 30;
  * 未折叠时这条上限由产物栏的 minSize 保证，这里只用来给默认宽度封顶。
  */
 export const EVENT_STREAM_MAX_PERCENT = 80;
-/** 产物栏的 maxSize（%）——事件流因此至少留 20%（不过像素下限 EVENT_STREAM_MIN_PX 通常更紧） */
-export const ARTIFACT_PANEL_MAX_PERCENT = 80;
+/**
+ * 产物栏的 maxSize（%）。以前是 80（事件流不可折叠、至少留 20%）；事件流栏现在也能折叠（把整行让给浏览器 / 产物），
+ * 折叠后产物栏必须能占满 100%，否则库会把 20% 还给事件流、折叠不住。
+ * 事件流不会因此被「盖没」：拖到它的像素下限（EVENT_STREAM_MIN_PX）以下只会夹住，再往下过一半才折叠。
+ */
+export const ARTIFACT_PANEL_MAX_PERCENT = 100;
 /** 没有已存布局、也量不到容器宽度时的旧默认（产物栏 70%） */
 export const FALLBACK_ARTIFACT_PERCENT = 70;
 
@@ -67,4 +71,29 @@ export const resolveArtifactDefaultPercent = (input: {
     EVENT_STREAM_MAX_PERCENT,
   );
   return round2(100 - eventPercent);
+};
+
+export type SplitPane = "artifact" | "event-stream";
+
+export interface SplitTogglePlan {
+  action: "collapse" | "expand";
+  /** collapse 之前要先展开的另一栏：两栏都折叠就是一片空白，且库对「两栏同时为 0」的布局没有定义 */
+  expandFirst: SplitPane | null;
+}
+
+/**
+ * 点某一栏的折叠 / 展开按钮该做什么（纯决策，页面按它命令式驱动 Panel）。
+ * 折叠目标栏时若另一栏已经折叠了 → 先把另一栏展开（等于「换边」），永远至少有一栏看得见。
+ */
+export const planSplitToggle = (input: {
+  target: SplitPane;
+  artifactCollapsed: boolean;
+  eventStreamCollapsed: boolean;
+}): SplitTogglePlan => {
+  const { target, artifactCollapsed, eventStreamCollapsed } = input;
+  const targetCollapsed = target === "artifact" ? artifactCollapsed : eventStreamCollapsed;
+  if (targetCollapsed) return { action: "expand", expandFirst: null };
+  const otherCollapsed = target === "artifact" ? eventStreamCollapsed : artifactCollapsed;
+  const other: SplitPane = target === "artifact" ? "event-stream" : "artifact";
+  return { action: "collapse", expandFirst: otherCollapsed ? other : null };
 };

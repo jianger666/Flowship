@@ -30,6 +30,7 @@ import {
   ChevronRight,
   ChevronUp,
   Loader2,
+  PanelLeftClose,
   Plus,
   RefreshCw,
 } from "lucide-react";
@@ -145,7 +146,17 @@ const buildTimeGroups = (sorted: TaskSummary[], now: number): TimeGroup[] => {
   }));
 };
 
-export const AppSidebar = ({ open }: { open: boolean }) => {
+interface AppSidebarProps {
+  open: boolean;
+  /** 展开时的宽度（px）：由 AppShell 持有（可拖动 / 持久化，规则见 lib/sidebar-width） */
+  width: number;
+  /** 正在拖右缘：关掉宽度过渡动画，否则宽度会跟不上指针、拖起来发黏 */
+  resizing?: boolean;
+  /** 侧栏顶部的「收起」按钮（与顶栏开关、⌘B 同一个动作；不传就不画） */
+  onCollapse?: () => void;
+}
+
+export const AppSidebar = ({ open, width, resizing = false, onCollapse }: AppSidebarProps) => {
   const router = useRouter();
   const params = useParams<{ id?: string }>();
   const activeId = params?.id;
@@ -618,12 +629,14 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       // 收起态整棵退出 Tab 序 / 读屏：仅 aria-hidden 时里面的按钮（含底部损坏任务提示）仍能被 Tab 聚焦（V7-12 余项）
       inert={!open}
       className={cn(
-        "h-full shrink-0 overflow-hidden border-r border-border/60 bg-muted/30 transition-[width] duration-200 ease-out motion-reduce:transition-none",
-        open ? "w-64" : "w-0",
+        "h-full shrink-0 overflow-hidden border-r border-border/60 bg-muted/30",
+        // 开合有 200ms 宽度过渡；拖右缘时必须关掉（见 resizing 的注释）
+        !resizing && "transition-[width] duration-200 ease-out motion-reduce:transition-none",
       )}
+      style={{ width: open ? width : 0 }}
     >
       {/* 固定内容宽度、收起时被外层裁掉、不挤压换行 */}
-      <div className="flex h-full w-64 flex-col">
+      <div className="flex h-full flex-col" style={{ width }}>
         {/* 顶部（v1.0 按模式变）：对话模式 =「新建对话」主按钮；
             工作台模式 = 小标题（任务只从看板点工作项进、没有新建入口） */}
         <div className="flex items-center gap-1 p-2 pb-1">
@@ -644,6 +657,20 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
             <div className="flex h-9 flex-1 items-center px-3 text-xs font-medium text-muted-foreground">
               进行中的任务
             </div>
+          )}
+          {onCollapse && (
+            <Tooltip content="收起侧栏" side="bottom" delay={200}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="shrink-0 text-muted-foreground"
+                onClick={onCollapse}
+                aria-label="收起侧栏"
+              >
+                <PanelLeftClose />
+              </Button>
+            </Tooltip>
           )}
         </div>
 
