@@ -459,13 +459,30 @@ describe("outbound → 真 card-stream：飞书卡片掉线的对外信号（R14
     const { texts, stop } = collectInfos(taskId);
     try {
       await startTurn(taskId);
-      larkMocks.updateCardEntity.mockClear();
-      larkMocks.updateCardEntity.mockRejectedValueOnce(
-        new LarkApiError("rate limited", { code: 99991400 }),
+      // 只让「终稿」那一发（header 转绿 = finalize 的整卡 PUT）吃一次限流。
+      // 不能用 mockClear + mockRejectedValueOnce：startTurn 只等到「卡已发出」，建卡链后面
+      // 紧跟的首发整卡 PUT（蓝色「生成中」）在慢机器上会落在 mockClear 之后，被它抢走这次限流，
+      // 终稿反而一发成功、总次数也变成 3（CI 上就这么偶发红过）。
+      let finalRateLimited = false;
+      larkMocks.updateCardEntity.mockImplementation(
+        async (_cardId: string, json: { header?: { template?: string } }) => {
+          if (!finalRateLimited && json?.header?.template === "green") {
+            finalRateLimited = true;
+            throw new LarkApiError("rate limited", { code: 99991400 });
+          }
+          return undefined;
+        },
       );
       await finishTurn(taskId);
 
-      expect(larkMocks.updateCardEntity).toHaveBeenCalledTimes(2); // 限流一发 + 重试一发成功
+      // 终稿整卡 PUT：限流一发 + 重试一发成功（蓝色的中途 PUT 不计）
+      const finalPuts = (
+        larkMocks.updateCardEntity.mock.calls as unknown as Array<
+          [string, { header?: { template?: string } }]
+        >
+      ).filter((c) => c[1]?.header?.template === "green");
+      expect(finalPuts).toHaveLength(2);
+      expect(finalRateLimited).toBe(true);
       expect(texts).toEqual([]);
       expect(pingTexts()).toHaveLength(1);
       expect(pingTexts()[0]).toContain("✅ 已完成");
