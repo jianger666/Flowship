@@ -16,7 +16,7 @@ import {
   stripAgentPanels,
 } from "@/lib/server/feishu-bridge/inbound-card-sanitize";
 
-import { doublingRatio, LINEAR_RATIO_MAX } from "./helpers/scaling-ratio";
+import { doublingRatio, LINEAR_RATIO_MAX, TIMING_RETRY } from "./helpers/scaling-ratio";
 
 describe("L4-08 · 标题形态的头与 ▲ 之间隔着别的头：不配对，头之后的正文保留", () => {
   it("报告复现：`请 review` 不再被吞", () => {
@@ -101,7 +101,7 @@ describe("L4-08 · 线性：n → 2n 耗时比", () => {
     "大量带 ▲ 的真面板": (n) => "▶ 💭 t\n  x\n▲\n".repeat(n),
   };
   for (const [name, build] of Object.entries(cases)) {
-    it(name, () => {
+    it(name, { retry: TIMING_RETRY }, () => {
       const ratio = doublingRatio((n) => {
         const raw = build(n);
         return () => sanitizeInboundCardText(raw);

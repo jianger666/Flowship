@@ -14,7 +14,7 @@ import {
   stripAgentPanels,
 } from "@/lib/server/feishu-bridge/inbound-card-sanitize";
 
-import { doublingRatio, LINEAR_RATIO_MAX } from "./helpers/scaling-ratio";
+import { doublingRatio, LINEAR_RATIO_MAX, TIMING_RETRY } from "./helpers/scaling-ratio";
 
 describe("H1-06 · 没有 ▲ 的面板头只剥到「面板体」结束", () => {
   it("报告复现：▶ 🔧 要点列表后面的「请 review」不被吞", () => {
@@ -90,7 +90,7 @@ describe("H1-06 · 没有 ▲ 的面板头只剥到「面板体」结束", () =>
       "复现形态重复": (n) => "本轮改动：\n▶ 🔧 修复登录\n▶ 🔧 补充测试\n请 review\n".repeat(n),
     };
     for (const [name, build] of Object.entries(cases)) {
-      it(name, () => {
+      it(name, { retry: TIMING_RETRY }, () => {
         const ratio = doublingRatio((n) => {
           const raw = build(n);
           return () => sanitizeInboundCardText(raw);

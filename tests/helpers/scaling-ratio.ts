@@ -136,5 +136,16 @@ export const doublingRatio = (
 /** 线性 ≈ 2、二次型 ≈ 4：取 3 判线性（见文件头说明） */
 export const LINEAR_RATIO_MAX = 3;
 
+/**
+ * 用 doublingRatio 的「真实时钟」线性断言在 vitest 里的重试次数（`it(name, { retry: TIMING_RETRY }, fn)`）。
+ *
+ * 为什么要：GitHub 共享 runner（Linux）上 CPU 时间也被虚拟化的 steal / 同核争用污染——线性实现偶发量出 3.6
+ * （v1.9.48 发版门禁红过一次，同一份代码前面十来个版本都绿），v1.9.38 里真二次型反过来量出 2.96；
+ * doublingRatio 自己的多轮取最小只能压住「一小段」抖动，压不住「整条用例前后都吵」。
+ * 失败后让 vitest 整条重跑（重新 make、重新测），是同一个问题的更外一层：只有连测 TIMING_RETRY + 1 次都超阈值才红。
+ * 真二次型每次都 ≈ 4，重试不会把它放过去；只在红灯路径上多花时间，绿灯不受影响。
+ */
+export const TIMING_RETRY = 2;
+
 /** doublingRatio 默认最多测几轮（第十轮：3，独立重测取最小比值） */
 export const DOUBLING_ROUNDS = 3;

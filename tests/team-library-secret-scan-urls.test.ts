@@ -37,7 +37,7 @@ import {
   type SecretScanFile,
 } from "@/lib/server/team-library-secret-scan";
 
-import { doublingRatio, LINEAR_RATIO_MAX } from "./helpers/scaling-ratio";
+import { doublingRatio, LINEAR_RATIO_MAX, TIMING_RETRY } from "./helpers/scaling-ratio";
 
 const scan = (content: string) =>
   scanSensitiveFiles([{ path: "skills/fe/demo/SKILL.md", content }]);
@@ -462,7 +462,7 @@ describe("新增逻辑（URL 抹除 / webhook 判定 / 逐个候选）在超大�
     // Telegram 规则：每个起点最多试 16 位数字就失败；起点只在「前一个字符不是数字」处
     ["大量 `<id>:` 之后不是 A", (n) => "1234567890123456:".repeat(n), 100_000],
     ["大量 `<id>:A` 之后凑不够 token 字符", (n) => "12345678:A".repeat(n), 100_000],
-  ])("倍增比值：%s", (_name, build, n) => {
+  ])("倍增比值：%s", { retry: TIMING_RETRY }, (_name, build, n) => {
     const ratio = doublingRatio((size) => {
       const content = build(size);
       return () => scanOne(content);
