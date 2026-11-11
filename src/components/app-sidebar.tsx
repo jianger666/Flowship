@@ -30,7 +30,6 @@ import {
   ChevronRight,
   ChevronUp,
   Loader2,
-  PanelLeftClose,
   Plus,
   RefreshCw,
 } from "lucide-react";
@@ -152,11 +151,11 @@ interface AppSidebarProps {
   width: number;
   /** 正在拖右缘：关掉宽度过渡动画，否则宽度会跟不上指针、拖起来发黏 */
   resizing?: boolean;
-  /** 侧栏顶部的「收起」按钮（与顶栏开关、⌘B 同一个动作；不传就不画） */
-  onCollapse?: () => void;
 }
 
-export const AppSidebar = ({ open, width, resizing = false, onCollapse }: AppSidebarProps) => {
+// 收起 / 展开侧栏只有一个入口：顶栏左上角（红绿灯右侧）固定位置的开关（AppHeader，⌘B / Ctrl+B 同效）。
+// 这里不再放第二个「收起」按钮——收起后它跟着侧栏一起消失，用户就找不到展开在哪（2026-11-10 用户反馈）
+export const AppSidebar = ({ open, width, resizing = false }: AppSidebarProps) => {
   const router = useRouter();
   const params = useParams<{ id?: string }>();
   const activeId = params?.id;
@@ -657,20 +656,6 @@ export const AppSidebar = ({ open, width, resizing = false, onCollapse }: AppSid
             <div className="flex h-9 flex-1 items-center px-3 text-xs font-medium text-muted-foreground">
               进行中的任务
             </div>
-          )}
-          {onCollapse && (
-            <Tooltip content="收起侧栏" side="bottom" delay={200}>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                className="shrink-0 text-muted-foreground"
-                onClick={onCollapse}
-                aria-label="收起侧栏"
-              >
-                <PanelLeftClose />
-              </Button>
-            </Tooltip>
           )}
         </div>
 

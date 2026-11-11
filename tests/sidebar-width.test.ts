@@ -232,12 +232,26 @@ describe("接线契约（源码）", () => {
     expect(shell).toMatch(/setSidebarWidth\(SIDEBAR_DEFAULT_WIDTH\);\s*setSidebarOpen\(true\)/);
   });
 
-  it("AppSidebar：宽度受控（不再写死 w-64），拖动时关掉宽度过渡，顶部有「收起侧栏」按钮", () => {
+  it("AppSidebar：宽度受控（不再写死 w-64），拖动时关掉宽度过渡", () => {
     expect(sidebar).not.toContain('"w-64"');
     expect(sidebar).toMatch(/style=\{\{ width: open \? width : 0 \}\}/);
     expect(sidebar).toMatch(/!resizing && "transition-\[width\]/);
-    expect(sidebar).toContain('aria-label="收起侧栏"');
-    expect(sidebar).toContain("onClick={onCollapse}");
+  });
+
+  it("收起 / 展开侧栏只有一个入口：顶栏固定位置的开关，图标随状态变；侧栏里不再有第二个「收起」按钮（用户反馈：收起后找不到展开在哪）", () => {
+    // 侧栏里没有收起按钮、AppShell 也不再传 onCollapse
+    expect(sidebar).not.toContain("onCollapse");
+    expect(sidebar).not.toContain('aria-label="收起侧栏"');
+    expect(sidebar).not.toContain("PanelLeftClose");
+    expect(shell).not.toContain("onCollapse");
+    expect(shell).not.toContain("collapseSidebar");
+    // 顶栏开关：展开时「收起」图标、收起后「展开」图标，文案与 aria 同步；⌘B / Ctrl+B 仍走同一个 toggleSidebar
+    const header = strip(read("src/components/app-header.tsx"));
+    expect(header).toContain("{sidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}");
+    expect(header).toContain('aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}');
+    expect(header.match(/onClick=\{onToggleSidebar\}/g)).toHaveLength(1);
+    expect(shell).toContain("onToggleSidebar={toggleSidebar}");
+    expect(shell).toContain("createModHotkeyHandler(isSidebarToggleCombo, toggleSidebar)");
   });
 
   it("手柄：ARIA separator + 可聚焦、双击复位、拖动期间锁全局光标与选区、只认主键", () => {

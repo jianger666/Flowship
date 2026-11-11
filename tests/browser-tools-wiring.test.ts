@@ -88,7 +88,7 @@ describe("Cursor：buildSdkCustomTools", () => {
     expect(Object.keys(buildSdkCustomTools("tok", { taskId: "t1" }))).toContain("browser_evaluate");
   });
 
-  it("withFlowshipSdkCustomTools：无 callerToken（readOnly / oneshot）不挂任何系统与浏览器工具", () => {
+  it("withFlowshipSdkCustomTools：无 callerToken（readOnly / 受限答疑）不挂任何系统与浏览器工具", () => {
     install();
     const local = withFlowshipSdkCustomTools({}, undefined, undefined, { taskId: "t1" }) as { customTools?: unknown };
     expect(local.customTools).toBeUndefined();

@@ -53,7 +53,7 @@ export const createPermissionsTools = (kit: BrowserToolKit): FlowshipToolDef[] =
         const emulated = Array.isArray(r.emulatedGeolocation) ? r.emulatedGeolocation : [];
         b.trusted(
           `页面权限现状：AI 授权开关${r.enabled ? "已开启" : "未开启（grant / deny / reset 不可用）"}；本会话授予 / 拒绝记录 ${grants.length} 条${emulated.length ? `；有 ${emulated.length} 个标签页的定位模拟生效（对应站点自动允许定位）` : ""}。` +
-            "默认页面请求权限会弹提示由用户决定；摄像头 / 麦克风 / 屏幕共享 / USB 等永远拒绝。",
+            "默认页面请求权限（含摄像头 / 麦克风）会弹提示由用户决定；屏幕共享 / USB 等永远拒绝。",
         );
         const lines: string[] = [];
         if (r.currentOrigin) lines.push(`当前页面：${clipEntry(r.currentOrigin, 200)}`);
@@ -88,10 +88,10 @@ export const createPermissionsTools = (kit: BrowserToolKit): FlowshipToolDef[] =
     label: "浏览器·页面权限",
     description:
       "查看 / 管理页面权限（定位、通知、剪贴板读取等）：list 总可用，grant / deny / reset 要用户在设置里开启「允许 AI 授予页面权限」；默认页面请求权限由用户在提示里决定，用 browser_emulate 设了位置后当前站点的定位自动允许。" +
-      "摄像头 / 麦克风 / 屏幕共享 / USB 永远拒绝，授予只在本会话内存里按站点（origin）生效。",
+      "屏幕共享 / USB 永远拒绝；摄像头 / 麦克风和其它权限一样可授予、但涉及隐私只在用户明确要求时才授予（microphone 与 camera 是两个独立授予，只授予用户要求的那个；写 media = 两个一起），授予只在本会话内存里按站点（origin）生效。",
     parameters: TBObject({
       action: TBEnum([...PERMISSION_TOOL_ACTIONS]),
-      permission: TBOptional(TBString({ description: "权限名：geolocation / notifications / clipboard-read / midi / sensors … （grant / deny 必填；reset 不给 = 该站点全部）" })),
+      permission: TBOptional(TBString({ description: "权限名：geolocation / notifications / clipboard-read / microphone / camera / midi / sensors … （grant / deny 必填；reset 不给 = 该站点全部）" })),
       origin: TBOptional(TBString({ description: "站点，如 https://example.com；缺省 = 当前页面所在站点（reset 缺省 = 全部站点）" })),
       tab_id: TBOptional(TBString()),
     }),

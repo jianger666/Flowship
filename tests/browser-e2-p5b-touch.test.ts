@@ -5,8 +5,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { OP_HELPERS } from "../electron-app/browser/index.mjs";
+import { createHandlers as createInputHandlers, peekHeldButtons } from "../electron-app/browser/ops/input.mjs";
 import { createHandlers, normalize } from "../electron-app/browser/ops/touch.mjs";
-import { HELD_BUTTON_CLICK_MESSAGE } from "../electron-app/browser/secret-field.mjs";
 import {
   describeTouch,
   normalizeTouchArgs,
@@ -43,7 +43,7 @@ describe("normalizeTouchArgs：参数校验", () => {
     expect(norm({ action: "tap", ref: "e1", tabId: "t2" })).toMatchObject({ tabId: "t2" });
   });
 
-  it("只放行白名单字段：没有任何文本入参，传了 text / value 也不会透传（红线 3）", () => {
+  it("只放行白名单字段：没有任何文本入参，传了 text / value 也不会透传", () => {
     const out = norm({ action: "tap", ref: "e1", text: "hunter2", value: "x", key: "Enter" });
     expect(Object.keys(out).sort()).toEqual(["action", "durationMs", "ref"]);
   });
@@ -447,50 +447,59 @@ describe("ops/touch：编排", () => {
     await expect(m.handlers.touch("task", undefined as never)).rejects.toMatchObject({ code: "BAD_ARGS" });
   });
 
-  // R6-30 四轮复审 P3①：AI 还按着 browser_mouse 的键时，触摸手势（可能合成兼容鼠标事件）会在没探过的位置动鼠标——派发之前先拒
-  describe("鼠标键还按着时先拒（R6-30 四轮复审 P3①）", () => {
+  // 产品决策：不再因为「AI 还按着 browser_mouse 的键」拒绝别的输入工具——touch 手势照常执行，也不碰鼠标的按下态（按下态仍由 browser_mouse up / 接管 / 取消去收尾）
+  describe("browser_mouse 的键还按着时 touch 照常执行", () => {
     const GESTURES: Array<Record<string, unknown>> = [
       { action: "tap", x: 100, y: 100, durationMs: 0 },
-      { action: "long_press", x: 100, y: 100, durationMs: 500 },
+      { action: "long_press", x: 100, y: 100, durationMs: 200 },
       { action: "swipe", x: 100, y: 100, direction: "left", distance: 50, durationMs: 100 },
       { action: "pinch", x: 200, y: 300, scale: 2, durationMs: 100 },
     ];
 
-    it.each(GESTURES)("%j：BAD_ARGS（HELD_BUTTON_CLICK_MESSAGE），不 locate、不开触屏模拟、0 个触屏事件", async (args) => {
+    /** 用真 ops/input.mjs 的 browser_mouse 在同一个假 tab 上按下左键（down 之后不 up）；返回它派发过的鼠标事件（会随后续动作增长） */
+    const holdLeftButton = async (m: ReturnType<typeof makeOp>) => {
+      const mouseEvents: Array<Record<string, unknown>> = [];
+      const input = createInputHandlers({
+        requireSession: () => ({ runAction: m.runActionSpy }),
+        actions: {
+          modifierBits: () => 0,
+          v1Internals: {
+            aiScope: async (_t: unknown, fn: () => Promise<unknown>) => fn(),
+            beforeState: () => ({}),
+            actionResult: () => ({}),
+            showAction: async () => {},
+            mouse: async (_t: unknown, p: Record<string, unknown>) => void mouseEvents.push(p),
+            settle: async () => {},
+          },
+        },
+      } as never) as { mouse: (t: string, a: Record<string, unknown>) => Promise<unknown> };
+      await input.mouse("task", { action: "down", x: 10, y: 10, button: "left" });
+      expect(peekHeldButtons(m.tab).bits).toBe(1);
+      expect(mouseEvents.map((e) => e.type)).toEqual(["mouseMoved", "mousePressed"]);
+      return mouseEvents;
+    };
+
+    it.each(GESTURES)("%j：照常开触屏模拟、派发触屏事件、恢复；鼠标的按下态原样保留，也没有多发鼠标事件", async (args) => {
       const m = makeOp();
-      m.tab.heldButtonBits = () => 1;
-      await expect(m.handlers.touch("task", args)).rejects.toMatchObject({ code: "BAD_ARGS", message: HELD_BUTTON_CLICK_MESSAGE });
-      expect(m.sent).toHaveLength(0);
-      expect(m.locate).not.toHaveBeenCalled();
+      const mouseEvents = await holdLeftButton(m);
+      await m.handlers.touch("task", args);
+      expect(m.order[0]).toBe("Emulation.setTouchEmulationEnabled:true");
+      expect(m.order[m.order.length - 1]).toBe("Emulation.setTouchEmulationEnabled:false");
+      expect(m.order).toContain("touch:touchStart");
+      expect(m.order).toContain("touch:touchEnd");
+      expect(m.order).not.toContain("touch:touchCancel");
+      expect(peekHeldButtons(m.tab).bits).toBe(1);
+      expect(mouseEvents).toHaveLength(2); // 只有 down 的 mouseMoved + mousePressed
     });
 
-    it("ref 形式的 tap 也先拒（连 locate 的滚入视野都不做）", async () => {
+    it("ref 形式的 tap 也照常 locate 并点按；按下态原样保留", async () => {
       const m = makeOp();
-      m.tab.heldButtonBits = () => 2;
-      await expect(m.handlers.touch("task", { action: "tap", ref: "e3", durationMs: 0 })).rejects.toMatchObject({ code: "BAD_ARGS", message: HELD_BUTTON_CLICK_MESSAGE });
-      expect(m.locate).not.toHaveBeenCalled();
-      expect(m.sent).toHaveLength(0);
-    });
-
-    it("放开之后（heldButtonBits 回 0）恢复；读取按下态出错按「按着」拒（fail-closed）；从没挂过 heldButtonBits 的 tab 照常", async () => {
-      const m = makeOp();
-      m.tab.heldButtonBits = () => 1;
-      await expect(m.handlers.touch("task", GESTURES[0])).rejects.toMatchObject({ message: HELD_BUTTON_CLICK_MESSAGE });
-      m.tab.heldButtonBits = () => 0;
-      await m.handlers.touch("task", GESTURES[0]);
+      const mouseEvents = await holdLeftButton(m);
+      await m.handlers.touch("task", { action: "tap", ref: "e3", durationMs: 0 });
+      expect(m.locate).toHaveBeenCalledWith(m.tab, "e3", expect.anything());
       expect(m.order).toEqual(["Emulation.setTouchEmulationEnabled:true", "touch:touchStart", "touch:touchEnd", "Emulation.setTouchEmulationEnabled:false"]);
-
-      const thrown = makeOp();
-      thrown.tab.heldButtonBits = () => {
-        throw new Error("boom");
-      };
-      await expect(thrown.handlers.touch("task", GESTURES[0])).rejects.toMatchObject({ code: "BAD_ARGS", message: HELD_BUTTON_CLICK_MESSAGE });
-      expect(thrown.sent).toHaveLength(0);
-
-      const never = makeOp();
-      expect(never.tab.heldButtonBits).toBeUndefined();
-      await never.handlers.touch("task", GESTURES[0]);
-      expect(never.sent.length).toBeGreaterThan(0);
+      expect(peekHeldButtons(m.tab).bits).toBe(1);
+      expect(mouseEvents).toHaveLength(2);
     });
   });
 });

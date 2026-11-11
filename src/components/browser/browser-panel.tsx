@@ -81,6 +81,8 @@ import {
   canZoomIn,
   canZoomOut,
   emulationLabelOf,
+  fitScaleLabelOf,
+  fitScalePercentOf,
   formatZoomLabel,
   isFindShortcut,
   readDownloads,
@@ -148,12 +150,15 @@ const IconButton = ({
   onClick,
   disabled,
   pressed,
+  size = "icon-sm",
   children,
 }: {
   label: string;
   onClick: () => void;
   disabled?: boolean;
   pressed?: boolean;
+  /** 模拟条这种紧凑的一行用 icon-xs（24px），工具栏默认 icon-sm（28px） */
+  size?: "icon-sm" | "icon-xs";
   children: ReactNode;
 }) => (
   // 工具栏在视口上方：tooltip 一律朝上，免得气泡落在视口里（原生视图盖在 HTML 之上，会触发整块遮盖）
@@ -161,7 +166,7 @@ const IconButton = ({
     <Button
       type="button"
       variant={pressed ? "secondary" : "ghost"}
-      size="icon-sm"
+      size={size}
       aria-label={label}
       aria-pressed={pressed}
       disabled={disabled}
@@ -624,6 +629,9 @@ const BrowserPanelInner = ({
   // V4 新增状态：全部可选字段，老壳缺省按「无」处理
   const zoomLabel = formatZoomLabel(activeTab?.zoom);
   const emulationLabel = emulationLabelOf(activeTab);
+  // 设备视口比面板大时页面被整体缩小：给个「适应 72%」，免得用户以为页面本身变小了
+  const fitLabel = fitScaleLabelOf(activeTab);
+  const fitPercent = fitScalePercentOf(activeTab);
   const downloads = useMemo(() => readDownloads(state?.downloads), [state?.downloads]);
   const bridgeCaps = typeof window === "undefined" ? undefined : window.__browser;
   const canOpenDevTools = typeof bridgeCaps?.openDevTools === "function";
@@ -660,197 +668,216 @@ const BrowserPanelInner = ({
         }
       }}
     >
-      {/* 工具栏 */}
-      <div className="relative flex shrink-0 items-center gap-1 border-b px-2 py-1.5">
-        <IconButton
-          label="后退"
-          disabled={!activeTab?.canGoBack}
-          onClick={() => window.__browser?.back(taskId)}
+      {/* 工具栏。整行不换行：唯一能压缩的是地址栏（min-w-0 flex-1），其余按钮都是 shrink-0。
+          外层 @container：按面板自己的宽度（不是窗口宽度）收紧——面板最窄 300px，再塞缩放标签 + 下载钮地址栏就被压没、
+          按钮挤出面板（R9-05）。窄于 360px：缩放标签让位（「更多」菜单里仍有重置缩放）、间距 / 左右留白收紧。
+          内层 min-w-0 overflow-hidden 是最后一道兜底：真有放不下的组合，宁可裁掉也别把面板撑出横向滚动条 */}
+      <div className="@container min-w-0 shrink-0">
+        <div
+          data-slot="browser-toolbar"
+          className="relative flex min-w-0 items-center gap-1 overflow-hidden border-b px-2 py-1.5 @max-[360px]:gap-0.5 @max-[360px]:px-1"
         >
-          <ArrowLeft />
-        </IconButton>
-        <IconButton
-          label="前进"
-          disabled={!activeTab?.canGoForward}
-          onClick={() => window.__browser?.forward(taskId)}
-        >
-          <ArrowRight />
-        </IconButton>
-        {loading ? (
-          <IconButton label="停止加载" onClick={() => window.__browser?.stop(taskId)}>
-            <X />
-          </IconButton>
-        ) : (
           <IconButton
-            label="刷新"
-            disabled={!exists}
-            onClick={() => window.__browser?.reload(taskId)}
+            label="后退"
+            disabled={!activeTab?.canGoBack}
+            onClick={() => window.__browser?.back(taskId)}
           >
-            <RotateCw />
+            <ArrowLeft />
           </IconButton>
-        )}
-
-        {picking ? (
-          // 拾取模式：地址栏位置换成提示（Esc / 按钮都能取消）
-          <div
-            role="status"
-            className="flex h-7 min-w-0 flex-1 items-center gap-2 rounded-lg border border-primary/40 bg-primary/5 px-2.5 text-xs"
+          <IconButton
+            label="前进"
+            disabled={!activeTab?.canGoForward}
+            onClick={() => window.__browser?.forward(taskId)}
           >
-            <MousePointerClick className="size-3.5 shrink-0 text-primary" aria-hidden />
-            <span className="min-w-0 flex-1 truncate">正在拾取，点击页面元素；Esc 取消</span>
-          </div>
-        ) : (
-          <form onSubmit={onSubmitAddress} className="min-w-0 flex-1">
-            <Input
-              type="text"
-              value={addressValue}
-              aria-label="地址栏"
-              placeholder={exists ? "输入网址或搜索词" : "输入网址开始浏览"}
-              spellCheck={false}
-              autoComplete="off"
-              className="h-7 text-xs md:text-xs"
-              onFocus={(e) => {
-                setDraft(currentUrl);
-                setEditing(true);
-                e.currentTarget.select();
-              }}
-              onBlur={() => setEditing(false)}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") {
-                  setEditing(false);
-                  e.currentTarget.blur();
-                }
-              }}
-            />
-          </form>
-        )}
-
-        {/* 设备 / 环境模拟标签（V5 生产 TabInfo.emulation）：标签 + 重置 */}
-        {emulationLabel && (
-          <div className="flex shrink-0 items-center rounded-md bg-info/10 pl-1.5">
-            <Tooltip content={`模拟中：${emulationLabel}`} side="top">
-              <span className="max-w-28 truncate text-[11px] text-info">{emulationLabel}</span>
-            </Tooltip>
-            <IconButton label="重置设备模拟" onClick={() => window.__browser?.resetEmulation?.(taskId)}>
-              <RotateCcw />
+            <ArrowRight />
+          </IconButton>
+          {loading ? (
+            <IconButton label="停止加载" onClick={() => window.__browser?.stop(taskId)}>
+              <X />
             </IconButton>
-          </div>
-        )}
+          ) : (
+            <IconButton
+              label="刷新"
+              disabled={!exists}
+              onClick={() => window.__browser?.reload(taskId)}
+            >
+              <RotateCw />
+            </IconButton>
+          )}
 
-        {/* 缩放 ≠ 100% 才显示；点一下重置 */}
-        {zoomLabel && (
-          <Tooltip content="点击重置缩放" side="top">
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost"
-              aria-label={`缩放 ${zoomLabel}，点击重置`}
-              onClick={() => window.__browser?.zoom?.(taskId, "reset")}
-              className="shrink-0 tabular-nums"
+          {picking ? (
+            // 拾取模式：地址栏位置换成提示（Esc / 按钮都能取消）
+            <div
+              role="status"
+              className="flex h-7 min-w-0 flex-1 items-center gap-2 rounded-lg border border-primary/40 bg-primary/5 px-2.5 text-xs"
             >
-              {zoomLabel}
-            </Button>
-          </Tooltip>
-        )}
+              <MousePointerClick className="size-3.5 shrink-0 text-primary" aria-hidden />
+              <span className="min-w-0 flex-1 truncate">正在拾取，点击页面元素；Esc 取消</span>
+            </div>
+          ) : (
+            <form onSubmit={onSubmitAddress} className="min-w-0 flex-1">
+              <Input
+                type="text"
+                value={addressValue}
+                aria-label="地址栏"
+                placeholder={exists ? "输入网址或搜索词" : "输入网址开始浏览"}
+                spellCheck={false}
+                autoComplete="off"
+                className="h-7 text-xs md:text-xs"
+                onFocus={(e) => {
+                  setDraft(currentUrl);
+                  setEditing(true);
+                  e.currentTarget.select();
+                }}
+                onBlur={() => setEditing(false)}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setEditing(false);
+                    e.currentTarget.blur();
+                  }
+                }}
+              />
+            </form>
+          )}
 
-        <BrowserDownloads taskId={taskId} downloads={downloads} />
+          {/* 缩放 ≠ 100% 才显示；点一下重置。工具栏窄于 360px 时先让位（「更多」菜单里仍有重置缩放） */}
+          {zoomLabel && (
+            <Tooltip content="点击重置缩放" side="top">
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                aria-label={`缩放 ${zoomLabel}，点击重置`}
+                onClick={() => window.__browser?.zoom?.(taskId, "reset")}
+                className="shrink-0 tabular-nums @max-[360px]:hidden"
+              >
+                {zoomLabel}
+              </Button>
+            </Tooltip>
+          )}
 
-        <IconButton
-          label={picking ? "取消拾取元素" : "拾取元素"}
-          pressed={picking}
-          disabled={!exists}
-          onClick={() =>
-            picking ? window.__browser?.cancelPick(taskId) : window.__browser?.startPick(taskId)
-          }
-        >
-          <MousePointerClick />
-        </IconButton>
+          <BrowserDownloads taskId={taskId} downloads={downloads} />
 
-        <DropdownMenu>
-          <Tooltip content="更多" side="top">
-            <DropdownMenuTrigger
-              aria-label="更多"
-              className={cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), "shrink-0")}
-            >
-              <MoreHorizontal />
-            </DropdownMenuTrigger>
-          </Tooltip>
-          <DropdownMenuContent align="end" className="min-w-52">
-            <DropdownMenuItem onClick={openFind} disabled={!exists}>
-              <Search className="size-3.5" />
-              在页面中查找
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => window.__browser?.zoom?.(taskId, "in")}
-              disabled={!exists || !canZoomIn(activeTab?.zoom)}
-            >
-              <ZoomIn className="size-3.5" />
-              放大
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => window.__browser?.zoom?.(taskId, "out")}
-              disabled={!exists || !canZoomOut(activeTab?.zoom)}
-            >
-              <ZoomOut className="size-3.5" />
-              缩小
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => window.__browser?.zoom?.(taskId, "reset")}
-              disabled={!exists || !zoomLabel}
-            >
-              <RotateCcw className="size-3.5" />
-              重置缩放
-            </DropdownMenuItem>
-            {canOpenDevTools && (
-              <DropdownMenuItem onClick={() => window.__browser?.openDevTools?.(taskId)} disabled={!exists}>
-                <Code className="size-3.5" />
-                开发者工具
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={openExternal}
-              disabled={!isExternalOpenableUrl(activeTab?.url)}
-            >
-              <ExternalLink className="size-3.5" />
-              在系统浏览器打开当前页
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={() => void clearData()} className="text-destructive">
-              <Trash2 className="size-3.5" />
-              清除登录数据
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-
-        {/* 面板级操作放最右、与页面级工具隔开：放大（盖住旁边的栏）/ 关闭抽屉。
-            关闭用 X、放大用 Maximize2：loading 时最左的 X 是「停止加载」，靠 tooltip 与位置区分 */}
-        {onToggleMaximize && (
           <IconButton
-            label={maximized ? `还原（重新显示${coverTarget}）` : `放大浏览器，盖住${coverTarget}`}
-            pressed={maximized}
-            onClick={onToggleMaximize}
+            label={picking ? "取消拾取元素" : "拾取元素"}
+            pressed={picking}
+            disabled={!exists}
+            onClick={() =>
+              picking ? window.__browser?.cancelPick(taskId) : window.__browser?.startPick(taskId)
+            }
           >
-            {maximized ? <Minimize2 /> : <Maximize2 />}
+            <MousePointerClick />
           </IconButton>
-        )}
-        {onClose && (
-          <IconButton label="关闭浏览器" onClick={onClose}>
-            <X />
-          </IconButton>
-        )}
 
-        {/* 加载进度：主进程只给 loading 布尔、没有百分比——画一条静态细线（无 aria-valuenow = 不确定进度）。
-            不用 animate-pulse：ui-conventions「同屏只留一处主动效」，加载中的动态已经有标签页里的 spinner（R2-14 ⑤） */}
-        {loading && (
-          <div
-            className="pointer-events-none absolute inset-x-0 bottom-0 h-0.5 bg-info"
-            role="progressbar"
-            aria-label="页面加载中"
-          />
-        )}
+          <DropdownMenu>
+            <Tooltip content="更多" side="top">
+              <DropdownMenuTrigger
+                aria-label="更多"
+                className={cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), "shrink-0")}
+              >
+                <MoreHorizontal />
+              </DropdownMenuTrigger>
+            </Tooltip>
+            <DropdownMenuContent align="end" className="min-w-52">
+              <DropdownMenuItem onClick={openFind} disabled={!exists}>
+                <Search className="size-3.5" />
+                在页面中查找
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => window.__browser?.zoom?.(taskId, "in")}
+                disabled={!exists || !canZoomIn(activeTab?.zoom)}
+              >
+                <ZoomIn className="size-3.5" />
+                放大
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => window.__browser?.zoom?.(taskId, "out")}
+                disabled={!exists || !canZoomOut(activeTab?.zoom)}
+              >
+                <ZoomOut className="size-3.5" />
+                缩小
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => window.__browser?.zoom?.(taskId, "reset")}
+                disabled={!exists || !zoomLabel}
+              >
+                <RotateCcw className="size-3.5" />
+                重置缩放
+              </DropdownMenuItem>
+              {canOpenDevTools && (
+                <DropdownMenuItem onClick={() => window.__browser?.openDevTools?.(taskId)} disabled={!exists}>
+                  <Code className="size-3.5" />
+                  开发者工具
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={openExternal}
+                disabled={!isExternalOpenableUrl(activeTab?.url)}
+              >
+                <ExternalLink className="size-3.5" />
+                在系统浏览器打开当前页
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => void clearData()} className="text-destructive">
+                <Trash2 className="size-3.5" />
+                清除登录数据
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {/* 面板级操作放最右、与页面级工具隔开：放大（盖住旁边的栏）/ 关闭抽屉。
+              关闭用 X、放大用 Maximize2：loading 时最左的 X 是「停止加载」，靠 tooltip 与位置区分 */}
+          {onToggleMaximize && (
+            <IconButton
+              label={maximized ? `还原（重新显示${coverTarget}）` : `放大浏览器，盖住${coverTarget}`}
+              pressed={maximized}
+              onClick={onToggleMaximize}
+            >
+              {maximized ? <Minimize2 /> : <Maximize2 />}
+            </IconButton>
+          )}
+          {onClose && (
+            <IconButton label="关闭浏览器" onClick={onClose}>
+              <X />
+            </IconButton>
+          )}
+
+          {/* 加载进度：主进程只给 loading 布尔、没有百分比——画一条静态细线（无 aria-valuenow = 不确定进度）。
+              不用 animate-pulse：ui-conventions「同屏只留一处主动效」，加载中的动态已经有标签页里的 spinner（R2-14 ⑤） */}
+          {loading && (
+            <div
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-0.5 bg-info"
+              role="progressbar"
+              aria-label="页面加载中"
+            />
+          )}
+        </div>
       </div>
+
+      {/* 设备 / 环境模拟条（V5 生产 TabInfo.emulation）：独占一整行，不再和地址栏抢工具栏宽度（R9-05：以前挤在工具栏里，
+          窄面板 + 「适应 xx%」时地址栏被压到 22px、右侧按钮被挤出面板）。「适应 xx%」是独立的 shrink-0 徽标：
+          摘要太长时只截摘要，不会先把它截掉。tooltip 朝上：朝下会落进视口，原生视图盖在 HTML 之上会触发整块遮盖 */}
+      {emulationLabel && (
+        <div
+          data-slot="browser-emulation-bar"
+          className="flex min-w-0 shrink-0 items-center gap-1 border-b bg-info/10 py-0.5 pr-1.5 pl-2.5 text-[11px] text-info"
+        >
+          <Tooltip
+            content={fitPercent !== null ? `模拟中：${emulationLabel}（页面已整体缩小到 ${fitPercent}% 以放进面板，放大面板可恢复）` : `模拟中：${emulationLabel}`}
+            side="top"
+          >
+            <span className="flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="min-w-0 truncate">模拟中：{emulationLabel}</span>
+              {fitLabel && <span className="shrink-0 tabular-nums">{fitLabel}</span>}
+            </span>
+          </Tooltip>
+          <IconButton size="icon-xs" label="重置设备模拟" onClick={() => window.__browser?.resetEmulation?.(taskId)}>
+            <RotateCcw />
+          </IconButton>
+        </div>
+      )}
 
       {state && state.tabs.length > 0 && <TabStrip taskId={taskId} tabs={state.tabs} />}
 

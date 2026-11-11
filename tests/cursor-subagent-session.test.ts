@@ -118,11 +118,11 @@ describe("子 agent 的创建选项（边界）", () => {
     expect(childSend).toHaveBeenCalledWith("干活");
   });
 
-  it("explore：只给读 / 搜白名单，且不再叠 disallowedTools", async () => {
+  it("explore：只给读 / 搜 / 联网白名单，且不再叠 disallowedTools", async () => {
     await run(mk(), { prompt: "只看不改", subagentType: "explore" });
     const o = lastCreate();
     expect(o.tools).toEqual([...CURSOR_SUBAGENT_READONLY_TOOLS]);
-    expect(o.tools).toEqual(["read", "grep", "glob", "ls"]);
+    expect(o.tools).toEqual(["read", "grep", "glob", "ls", "webSearch", "webFetch"]);
     expect(o).not.toHaveProperty("disallowedTools");
   });
 
@@ -267,13 +267,14 @@ describe("resume：真实 SDK 路径（Agent.resume）", () => {
     expect(childClose).toHaveBeenCalledTimes(2); // create 那次、resume 那次各关一次
   });
 
-  it("explore：resume 时仍只给读 / 搜白名单（否则只读子代理接回来就拿到写权限）", async () => {
+  it("explore：resume 时仍只给读 / 搜 / 联网白名单（否则只读子代理接回来就拿到写权限，或丢了联网）", async () => {
     const link = mk("sk-resume-b");
     nextChildId("sdk-child-ro");
     await run(link, { prompt: "只看", subagentType: "explore" });
     await run(link, { prompt: "再看", resume: "sdk-child-ro" });
     const resumeOpts = mockResume.mock.calls[0][1] as Opts;
     expect(resumeOpts.tools).toEqual([...CURSOR_SUBAGENT_READONLY_TOOLS]);
+    expect(resumeOpts.tools).toEqual(["read", "grep", "glob", "ls", "webSearch", "webFetch"]);
     expect(resumeOpts).not.toHaveProperty("disallowedTools");
   });
 

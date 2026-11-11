@@ -5,8 +5,9 @@
  *  - `list` 总可用（只读）；`grant / deny / reset` 要设置开关 `pagePermissions`——**主进程独立校验**（不信 server 的工具注册），
  *    关着返回 ACCESS_DISABLED（server 把它翻成「去 设置 → 内置浏览器 → 允许 AI 授予页面权限 打开」）；
  *  - 用户接管期间 grant / deny / reset 一律 USER_CONTROL（与 dialog 一致：接管意味着用户要掌控，权限是用户的决定）；
- *  - Flowship 自己的 origin、永远拒绝的权限（摄像头 / 麦克风 / 屏幕共享 / USB / HID / 串口 / openExternal …）返回 DENIED，
+ *  - Flowship 自己的 origin、永远拒绝的权限（屏幕共享 / USB / HID / 串口 / openExternal …）返回 DENIED，
  *    AI 即使开了开关也放不开——这与用户在提示条里的选择无关，是硬规则；
+ *    摄像头 / 麦克风不在其中：和定位等一样归「询问」，开关打开时 AI 可以授予 / 拒绝（`camera` / `microphone` 各自独立，`media` = 两个一起）；
  *  - 授予只存会话内存（按 origin），AI 写入的条目标 source:"ai"，用户关掉开关后立刻失效（策略里读实时的 config）；
  *  - 三个改动类动作都写一条 actor:"ai" 的活动记录（用户在面板时间线上能看到 AI 改了什么权限）。
  *
@@ -18,9 +19,17 @@ import {
   ASKABLE_PERMISSIONS,
   canonicalPermission,
   isNeverPermission,
+  MEDIA_ATOMS,
+  MEDIA_PERMISSION,
   originOf,
   parseOriginArg,
 } from "../permission-policy.mjs";
+
+/** 报错里列给 AI 的可选权限名：询问类 + 合称 `media`（= 麦克风 + 摄像头） */
+const PERMISSION_CHOICES = Object.freeze([...ASKABLE_PERMISSIONS, MEDIA_PERMISSION]);
+
+/** 入参权限名 → 实际要读写的独立权限名：`media` 展开成麦克风 + 摄像头，其余就是它自己 */
+const targetsOf = (perm) => (perm === MEDIA_PERMISSION ? [...MEDIA_ATOMS] : [perm]);
 import { BrowserError } from "../server-channel.mjs";
 
 export const OPS = Object.freeze(["permissions"]);
@@ -46,10 +55,10 @@ export const normalize = (op, args, h) => {
       const origin = h.optStr(args, "origin", 300);
       if (action === "list") return h.withTab(args, { action });
       if ((action === "grant" || action === "deny") && permission === undefined) {
-        throw h.bad(`${action} 需要 permission 参数（可选：${[...ASKABLE_PERMISSIONS].join(" / ")}）`);
+        throw h.bad(`${action} 需要 permission 参数（可选：${PERMISSION_CHOICES.join(" / ")}）`);
       }
       if (permission !== undefined && canonicalPermission(permission) === null) {
-        throw h.bad(`参数 permission 不是合法的权限名（可选：${[...ASKABLE_PERMISSIONS].join(" / ")}）`);
+        throw h.bad(`参数 permission 不是合法的权限名（可选：${PERMISSION_CHOICES.join(" / ")}）`);
       }
       return h.withTab(args, {
         action,
@@ -159,8 +168,12 @@ export const createHandlers = (deps) => {
         const perm = a.permission;
         const origin = a.origin !== undefined ? resolveOrigin(session, a) : undefined;
         // reset 是收紧动作：两份授予表（普通 / 无痕）都清，不让 AI 以为清了其实无痕那份还在
-        const resetArgs = { ...(origin !== undefined ? { origin } : {}), ...(perm !== undefined ? { permission: perm } : {}) };
-        const cleared = state.grants.reset(resetArgs) + (state.incognitoGrants?.reset(resetArgs) ?? 0);
+        // perm 是 `media`（合称）时，麦克风与摄像头两项都清
+        let cleared = 0;
+        for (const p of perm !== undefined ? targetsOf(perm) : [undefined]) {
+          const resetArgs = { ...(origin !== undefined ? { origin } : {}), ...(p !== undefined ? { permission: p } : {}) };
+          cleared += state.grants.reset(resetArgs) + (state.incognitoGrants?.reset(resetArgs) ?? 0);
+        }
         state.cooldown.clear();
         const scope = `${origin !== undefined ? hostOf(origin) : "全部站点"}${perm !== undefined ? `的「${permissionLabel(perm)}」` : "的"}授予记录`;
         logAi(session, session.tabs?.find((t) => t.id === session.activeTabId), `重置了${scope}（清除 ${cleared} 条）`);
@@ -170,14 +183,17 @@ export const createHandlers = (deps) => {
 
       // grant / deny：先过硬规则
       const perm = a.permission;
-      if (isNeverPermission(perm)) {
-        throw new BrowserError("DENIED", `「${permissionLabel(perm)}」（${perm}）是永久拒绝的权限，AI 与用户提示都无法放开`);
-      }
-      if (ALLOWED_PERMISSIONS.includes(perm)) {
-        return { action: a.action, permission: perm, note: "该权限本来就默认允许，无需授予" };
-      }
-      if (!ASKABLE_PERMISSIONS.includes(perm)) {
-        throw new BrowserError("BAD_ARGS", `不支持的权限名「${String(perm).slice(0, 40)}」（可选：${ASKABLE_PERMISSIONS.join(" / ")}）`);
+      // `media`（合称）= 麦克风 + 摄像头，两项本来就都是询问类，不用过下面三道名单
+      if (perm !== MEDIA_PERMISSION) {
+        if (isNeverPermission(perm)) {
+          throw new BrowserError("DENIED", `「${permissionLabel(perm)}」（${perm}）是永久拒绝的权限，AI 与用户提示都无法放开`);
+        }
+        if (ALLOWED_PERMISSIONS.includes(perm)) {
+          return { action: a.action, permission: perm, note: "该权限本来就默认允许，无需授予" };
+        }
+        if (!ASKABLE_PERMISSIONS.includes(perm)) {
+          throw new BrowserError("BAD_ARGS", `不支持的权限名「${String(perm).slice(0, 40)}」（可选：${PERMISSION_CHOICES.join(" / ")}）`);
+        }
       }
       const origin = resolveOrigin(session, a);
       if (isAppOrigin(origin)) throw new BrowserError("DENIED", "不能给 Flowship 自己的页面授予或拒绝权限");
@@ -191,8 +207,10 @@ export const createHandlers = (deps) => {
       })();
       // R6-22：只写目标 tab 所在 partition 的那一份——在普通标签上授予，不会让同源无痕标签也生效
       const grants = state.grantsFor(tab);
-      const ok = a.action === "grant" ? grants.allow(origin, perm, "ai") : grants.deny(origin, perm, "ai");
-      if (!ok) throw new BrowserError("DENIED", "本会话的权限记录已满，请先 permissions reset 清理后再试");
+      for (const p of targetsOf(perm)) {
+        const ok = a.action === "grant" ? grants.allow(origin, p, "ai") : grants.deny(origin, p, "ai");
+        if (!ok) throw new BrowserError("DENIED", "本会话的权限记录已满，请先 permissions reset 清理后再试");
+      }
       // 通知：把就在该 origin 上的标签的「通知代理」预先装好（页面常先读 Notification.permission 再决定要不要请求）；装不上不影响授予记录本身，
       // 页面之后真正请求通知权限时 request 处理器会再装一次、仍失败才拒绝
       if (a.action === "grant") await deps.permissionGate?.prepareGrant?.(session, origin, perm);

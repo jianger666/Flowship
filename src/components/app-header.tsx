@@ -20,7 +20,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { AlarmClock, Blocks, LayoutDashboard, MessageSquare, MessageSquareText, PanelLeft, Settings } from "lucide-react";
+import { AlarmClock, Blocks, LayoutDashboard, MessageSquare, MessageSquareText, PanelLeftClose, PanelLeftOpen, Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 
@@ -200,14 +200,17 @@ export const AppHeader = ({
           isMac && "pl-22",
         )}
       >
+        {/* 收起 / 展开侧栏的**唯一**入口（侧栏里不再放第二个按钮——收起后它跟着侧栏消失，用户找不到展开在哪）。
+            图标随状态变：展开时是「收起」图标、收起后是「展开」图标；尺寸与右侧功能图标一致 */}
         <Tooltip content={`${sidebarOpen ? "收起侧栏" : "展开侧栏"}（${sidebarToggleKeys}）`}>
           <Button
             variant="ghost"
             size="icon-sm"
+            className="[&_svg:not([class*='size-'])]:size-4.5"
             onClick={onToggleSidebar}
             aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
           >
-            <PanelLeft />
+            {sidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}
           </Button>
         </Tooltip>
       </div>

@@ -92,14 +92,17 @@ import {
   cancelPending,
   cancelPendingIf,
   clearAskTakenMark,
+  clearOneShotCallerTokenIf,
   getPendingAsk,
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
+  setOneShotCallerToken,
   unsetChatAwaitingNotifierIf,
   unsetChatTaskActionHandlerIf,
   type AwaitingNotifier,
   type ChatTaskActionHandler,
 } from "./chat-pending";
+import { ONE_SHOT_SYSTEM_TOOL_NAMES } from "./one-shot-tools";
 import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
 import { validateSubmitMr } from "./submit-mr-guard";
 import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
@@ -6147,12 +6150,17 @@ export const deliverTaskQuestion = async (
   );
 
 /**
- * V0.11.9 问一问兜底：会话接不回（agent 报错过 / 停过 / 隔了几天早没了）时、
- * 起一个**一次性**轻量 Q&A agent 回答（用户拍板「接不回来另起一个没问题」）。
+ * V0.11.9 问一问兜底：会话接不回（agent 报错过 / 停过 / 隔了几天早没了 / 任务还没推进过）时、
+ * 起一个**一次性** agent 回答（用户拍板「接不回来另起一个没问题」）。
  *
- * 跟正式会话的区别（有意为之）：
- * - 不注入 action playbook / 不挂系统 customTools（没有交卷 / 提问 / MR 语义、也调不了）
- * - 不注册 agentSessions / 不落盘锚点——它只懂答疑、不能被后续「续用推进」误当正式会话
+ * 它是**属主自己的 agent**：用户在任务页说的话它都认真办——疑问就答、要改就改、
+ * 要「之后再看」的事可以自己设定时。跟正式会话的区别只有「没有 action 这条链」（有意为之）：
+ * - 不注入 action playbook；系统工具只挂不依赖 action 的（{@link ONE_SHOT_SYSTEM_TOOL_NAMES}：定时 / 等待，
+ *   外加浏览器工具与子代理），交卷 / 提问 / 提 MR / 推进这类要靠 action 与 notifier 的不挂
+ *   （以前一个系统工具都不挂，于是「任务没推进过」就建不了定时）
+ * - 运行期间登记一个 callerToken（只写期望 token、不注册 notifier / handler，见 setOneShotCallerToken），
+ *   定时这类要验身份的工具才认它；收尾只摘自己的，被正式会话接管 / stop 摘了就不动
+ * - 不注册 agentSessions / 不落盘锚点——它不能被后续「续用推进」误当正式会话
  * - 答完 close、下次再问再起（低频场景、冷启动可接受）
  *
  * ⚠️ 本函数是**属主自己的**通道（任务页输入条）：agent 能动手改小改动，且它是这个 task
@@ -6185,6 +6193,8 @@ export const startOneShotQuestion = (
     // instanceId 在受理段分配，catch/consume 共用——
     // 绝不再从全局 runningTasks 读（表已被 B 换掉时会误拿 B 的号）
     let oneshotInstanceId: number | undefined;
+    // 本 one-shot 登记的 callerToken（受理段里分配，finally 只摘自己的）
+    let oneshotCallerToken: string | undefined;
     /**
      * stale 中止只关自己的 agent / 飞行窗——不写 task 级 runStatus。
      * 状态归 bump 方（stop/DELETE）收尾；旧 one-shot 无条件恢复 prevRunStatus
@@ -6321,12 +6331,21 @@ export const startOneShotQuestion = (
           );
           // SDK local 无 env 透传 → 启动前同步 company-env.json
           await syncCompanyEnvFileFromSettings();
+          // 解析提供方放在登记 token 之前：它抛错时还没有任何需要收的东西
+          const oneshotProviderId = await resolveProviderIdForCreate(task);
+          // 登记本 one-shot 的 callerToken：本段在 per-task 串行链里，上面已验过没有正式 run / 活会话占位，
+          // 正式启动也要进同一条链，所以槽是空的、不会和它互相覆盖。失败路径统一由外层 finally 摘（只摘自己的）
+          oneshotCallerToken = String(allocTaskRunInstanceId());
+          setOneShotCallerToken(task.id, oneshotCallerToken);
           const created = await withSdkDeadline(
             Agent.create({
               apiKey: creds.apiKey,
               model: creds.model,
               // 与入口同口径：悬空提供方直接抛（受理段排队期间设置被改也不会静默落回 Cursor）
-              providerId: await resolveProviderIdForCreate(task),
+              providerId: oneshotProviderId,
+              // 系统工具只挂不依赖 action 的（定时 / 等待），交卷 / 提问这类不挂——见 one-shot-tools.ts
+              callerToken: oneshotCallerToken,
+              systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES,
               taskId: task.id,
               // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
               local: { cwd: effectiveCwd, settingSources: [] },
@@ -6386,8 +6405,8 @@ export const startOneShotQuestion = (
           // 要改就改，只是不推进任务链（本 agent 没有 action 上下文）。
           const prompt = [
             scheduled
-              ? `你是任务「${task.title}」的临时助手。下面是系统按会话里设过的定时自动触发的一条消息（不是用户刚说的话）：按其中你当时留的话处理，不要当成用户在提问或改需求。`
-              : `你是任务「${task.title}」的临时助手。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手。`,
+              ? `你在任务「${task.title}」里工作。下面是系统按会话里设过的定时自动触发的一条消息（不是用户刚说的话）：按其中你当时留的话处理，不要当成用户在提问或改需求。`
+              : `你在任务「${task.title}」里工作。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手；要「之后再做 / 定期看」的事，用 schedule 工具设定时。`,
             "",
             ...backgroundLines,
             "",
@@ -6403,6 +6422,7 @@ export const startOneShotQuestion = (
               : [
                   "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
                   "- 大改动（整段功能 / 跨多文件重构）→ 说明建议、引导用户点「推进」走正式阶段（你没有任务链上下文、别硬扛）",
+                  "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）可以用",
                   "- 不要提交 commit / 提 MR、处理完自然结束回复",
                 ]),
           ].join("\n");
@@ -6535,6 +6555,8 @@ export const startOneShotQuestion = (
       } catch {
         /* noop */
       }
+      // 摘掉自己登记的 callerToken（只摘自己的：期间被正式会话换了 / 被 stop 摘了都不动）
+      if (oneshotCallerToken) clearOneShotCallerTokenIf(task.id, oneshotCallerToken);
       endTaskStarting(task.id);
     }
   })();

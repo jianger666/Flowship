@@ -12,7 +12,18 @@
  * 与 electron 的耦合只有「被注入进来的 WebContentsView 类 + 停车场窗口」，所以单测可以用假对象驱动大部分逻辑。
  */
 import { captureAxFrames, collectSnapshotCandidates, formatAxSnapshot, visibilityKey } from "./ax-snapshot.mjs";
-import { describeEmulation, mergeEmulation, toCdpCommands } from "./emulation.mjs";
+import {
+  describeEmulation,
+  fitBoundsToEmulation,
+  fitScaleFor,
+  fitViewportOf,
+  mergeEmulation,
+  sameViewFit,
+  scaleInputParams,
+  toCdpCommands,
+  viewportMetricsCommand,
+  withFitScale,
+} from "./emulation.mjs";
 import { assertBase64WithinCap, FULLPAGE_SHOT_HINT, FULLPAGE_SHOT_MAX_BYTES } from "./output-caps.mjs";
 import {
   clampClipToViewport,
@@ -228,6 +239,28 @@ export class BrowserTab {
   #lastInputAt = 0;
   /** R3-06：`moveToParking(null)`（应用在退出、没有停车场窗口）把 `parentWindow` 置空后，`destroyed` 里的 hostGone 判断会恒为假；留个标记，别让「宿主已走」因置空而丢失 */
   #hostLeft = false;
+  /**
+   * 占位 div 的矩形（DIP，渲染端汇报、已按宿主缩放换算）——只在视图挂在主窗口时有值，停车场里是 null。
+   * 视图实际用的矩形 = 它按设备模拟收窄后的结果（见 emulation.mjs 的 fitBoundsToEmulation），
+   * 所以必须记着原始槽位：模拟变化 / 重置时要用它重新摆视图，渲染端不会为此再汇报一次 bounds。
+   */
+  #slot = null;
+  /** 视图占槽位的比例（0..1）；没被模拟收窄时为 null。遮盖占位图靠它摆到视图所在的位置（TabInfo.viewFit） */
+  viewFit = null;
+  /**
+   * 缩放适配（契约 §14.4）：页面**已生效**的缩放比例（最近一次 `setDeviceMetricsOverride` 成功时的 scale；1 = 不缩放）。
+   * 决定原生视图的大小（= floor(模拟尺寸 × 它)）——页面渲染成什么样，视图就收成什么样，两者不会错开。
+   */
+  #fitScale = 1;
+  /**
+   * 最近一次**发出**的 scale（发送时就更新，失败回滚）。AI 的输入坐标按它补偿：CDP 命令在同一会话里按序执行，
+   * 排在缩放命令之后发出的输入，落地时用的就是这个比例（等应答再切会让这段时间里的点击差 1/scale 倍）。
+   */
+  #inputScale = 1;
+  /** 已有一个「按最新槽位重算缩放」的任务在模拟队列里等着：拖面板每帧都来一次 setBounds，合并成一个，永远只补最新的 */
+  #refitQueued = false;
+  /** 最近一次通知渲染端的缩放百分比（整数）；只有它变了才推状态（拖面板时不必每帧推） */
+  #notifiedFitPct = 100;
 
   /**
    * @param {{
@@ -380,6 +413,8 @@ export class BrowserTab {
   #park(parkingWindow) {
     if (this.destroyed) return;
     this.#hostLeft = false;
+    this.#slot = null;
+    this.viewFit = null;
     parkingWindow.contentView.addChildView(this.view);
     this.parentWindow = parkingWindow;
     this.view.setBounds({ ...PARKING_BOUNDS });
@@ -404,6 +439,8 @@ export class BrowserTab {
     const parent = this.parentWindow;
     this.parentWindow = null;
     this.#hostLeft = true;
+    this.#slot = null;
+    this.viewFit = null;
     try {
       if (parent && !(typeof parent.isDestroyed === "function" && parent.isDestroyed())) parent.contentView.removeChildView(this.view);
     } catch {
@@ -417,7 +454,9 @@ export class BrowserTab {
     this.#hostLeft = false;
     mainWindow.contentView.addChildView(this.view);
     this.parentWindow = mainWindow;
-    this.view.setBounds(bounds);
+    this.#slot = bounds;
+    this.#applySlot();
+    this.#scheduleRefit();
     this.view.setVisible(visible);
     try {
       this.wc.setAudioMuted(false);
@@ -427,7 +466,80 @@ export class BrowserTab {
   }
 
   setBounds(bounds) {
-    if (!this.destroyed) this.view.setBounds(bounds);
+    if (this.destroyed) return;
+    this.#slot = bounds;
+    this.#applySlot();
+    this.#scheduleRefit();
+  }
+
+  /**
+   * 把槽位按当前设备模拟收窄后摆到视图上（居中、顶部对齐；没有模拟 / 模拟视口不比槽位小 = 原样）。
+   * 只在挂在主窗口时有槽位；停车场里的视图用固定的 PARKING_BOUNDS，不走这里。
+   *
+   * R9-03：`viewFit`（视图占槽位的比例）随槽位宽 / 高变——A 模式（模拟视口比槽位小、不缩放）拖面板、B 模式里被高度限制的缩放拖宽，
+   * 缩放百分比都不变、`viewFit` 却变了。渲染端遮盖占位图按它定位，所以它变了就要推状态（`onChange` 下游本来就是去抖的，拖面板每帧调也只合并成一次推送）；
+   * 光靠 `#refit` 里「整数百分比变了才通知」会漏掉这种情况，遮盖图一出现就按旧比例摆一下。
+   */
+  #applySlot() {
+    if (this.destroyed || !this.#slot) return;
+    const { bounds, fit } = fitBoundsToEmulation(this.#slot, this.emulation, this.#fitScale);
+    const fitChanged = !sameViewFit(this.viewFit, fit);
+    this.viewFit = fit;
+    this.view.setBounds(bounds);
+    if (fitChanged) this.hooks.onChange();
+  }
+
+  /**
+   * 该用的缩放比例：模拟视口（宽高都明确）比槽位大 → 整体缩小适应（不放大）；否则 1。
+   * 停车场里（没有槽位）沿用当前比例，不为看不见的视图来回改——回到面板时 attach 会按新槽位重算。
+   */
+  #desiredFitScale(emulation = this.emulation) {
+    if (!fitViewportOf(emulation)) return 1;
+    if (!this.#slot) return this.#fitScale;
+    return fitScaleFor(this.#slot, emulation);
+  }
+
+  /**
+   * 排一个「按最新槽位重算缩放」的任务进模拟队列（与 emulate / reset 串行，不会和它们交叉发 CDP）。
+   * 同一时刻队列里最多一个：拖面板每帧一次 setBounds，任务执行时读的是**当时最新**的槽位。
+   */
+  #scheduleRefit() {
+    if (this.destroyed || this.#refitQueued) return;
+    // 没有可缩放的视口、当前也没在缩放：槽位怎么变都与 CDP 无关
+    if (this.#inputScale === 1 && !fitViewportOf(this.emulation)) return;
+    this.#refitQueued = true;
+    void this.#enqueueEmulation(async () => {
+      this.#refitQueued = false;
+      await this.#refit();
+    }).catch(() => {});
+  }
+
+  /**
+   * 让「页面实际的缩放」追上「槽位要求的缩放」：不一样就单独重发一条视口覆盖（带新 scale），成功后视图收成新大小。
+   * 永不抛出（失败只记日志，视图仍按已生效的比例摆）。必须在模拟队列里调（见 #scheduleRefit / #applyEmulationNow）。
+   */
+  async #refit() {
+    try {
+      if (this.destroyed) return;
+      if (this.cdpReady) {
+        const want = this.#desiredFitScale();
+        if (want !== this.#inputScale) {
+          const cmd = viewportMetricsCommand(this.emulation, want);
+          if (cmd) {
+            const failed = await this.#runEmulationCommands([cmd]);
+            if (failed.length > 0) this.log(`[browser:${this.id}] 缩放适配失败（页面保持原比例）：${failed.join("；")}`);
+          }
+        }
+      }
+      this.#applySlot();
+      const pct = Math.round(this.#fitScale * 100);
+      if (pct !== this.#notifiedFitPct) {
+        this.#notifiedFitPct = pct;
+        this.hooks.onChange();
+      }
+    } catch (err) {
+      this.log(`[browser:${this.id}] 缩放适配出错（已忽略）：${err?.message || err}`);
+    }
   }
 
   setVisible(visible) {
@@ -521,6 +633,10 @@ export class BrowserTab {
       isActive: isActive === true,
       // 设备 / 环境模拟的人话摘要（无模拟为 null）
       emulation: describeEmulation(this.emulation),
+      // 视图被模拟收窄时，它占占位 div 的比例（遮盖占位图靠它摆位置）；没收窄时不带，普通标签的 info 形状不变
+      ...(this.viewFit ? { viewFit: { ...this.viewFit } } : {}),
+      // 缩放适配生效时（页面被整体缩小以放进面板）的比例，0..1；没缩放时不带。只用于工具栏提示，不进 AI 看到的模拟摘要
+      ...(this.#fitScale < 1 ? { fitScale: this.#fitScale } : {}),
       // E2·A6：无痕标签（只在为真时带，普通标签的 info 形状不变）
       ...(this.incognito ? { incognito: true } : {}),
     };
@@ -671,10 +787,12 @@ export class BrowserTab {
   /** 向主会话（或子会话）发 CDP 命令；带超时，避免页面卡死时把整个 op 链拖死 */
   send(method, params = {}, sessionId = null, timeoutMs = CDP_TIMEOUT_MS) {
     if (this.#wcGone()) return Promise.reject(new BrowserError("TAB_NOT_FOUND", "标签页已关闭"));
+    // 缩放适配生效时，AI 给的是页面 CSS 坐标、CDP 输入要的是视图坐标：在这唯一的出口统一乘 scale（契约 §14.4；全仓只有这里碰 debugger.sendCommand）
+    const wire = this.#inputScale < 1 ? scaleInputParams(method, params, this.#inputScale) : params;
     let p;
     try {
       const dbg = this.wc.debugger;
-      p = sessionId ? dbg.sendCommand(method, params, sessionId) : dbg.sendCommand(method, params);
+      p = sessionId ? dbg.sendCommand(method, wire, sessionId) : dbg.sendCommand(method, wire);
     } catch (err) {
       // 检查与访问之间 wc 被销毁：同步抛出变成 rejection，调用方统一按「标签页已关闭」处理
       return Promise.reject(new BrowserError("TAB_NOT_FOUND", `标签页已关闭（${String(err?.message || err).slice(0, 60)}）`));
@@ -764,6 +882,9 @@ export class BrowserTab {
       dbg.on("message", (_e, method, params, sessionId) => this.#onCdpMessage(method, params, sessionId || null));
       dbg.on("detach", (_e, reason) => {
         this.cdpReady = false;
+        // debugger 断开 = 页面里的视口覆盖（含缩放）都没了；重新 attach 后由 #replayEmulation 按状态重放
+        this.#inputScale = 1;
+        this.#fitScale = 1;
         this.log(`[browser:${this.id}] debugger 断开 reason=${reason}`);
         this.#fireContextLost("detach");
       });
@@ -772,6 +893,7 @@ export class BrowserTab {
     this.cdpReady = true;
     // debugger 重新 attach 后之前的覆盖都没了：按 tab 上存的状态重放（只对主会话，OOPIF 子会话不处理）
     await this.#replayEmulation();
+    this.#applySlot(); // 重放里的缩放比例可能变了：视图跟着收成对应大小
     await this.#syncMainFrameId();
     // 控制权在 CDP 就绪前就可能已经切到 ai（新 tab 诞生于 AI 驱动期间）：这里补上锁
     if (this.desiredIgnore) await this.#applyIgnore(true);
@@ -1619,9 +1741,17 @@ export class BrowserTab {
   async #runEmulationCommands(commands) {
     const failed = [];
     for (const { method, params } of commands) {
+      // 视口覆盖 / 清除会改变页面的缩放比例：输入补偿用的比例在**发出时**就切（同一会话按序执行），视图用的比例等**应答成功**再切
+      const isMetrics = method === "Emulation.setDeviceMetricsOverride";
+      const isClear = method === "Emulation.clearDeviceMetricsOverride";
+      const nextScale = isMetrics ? (typeof params?.scale === "number" ? params.scale : 1) : 1;
+      const prevInputScale = this.#inputScale;
+      if (isMetrics || isClear) this.#inputScale = nextScale;
       try {
         await this.send(method, params, null, 5000);
+        if (isMetrics || isClear) this.#fitScale = nextScale;
       } catch (err) {
+        if (isMetrics || isClear) this.#inputScale = prevInputScale;
         const msg = String(err?.message || err);
         // 时区 / 语言：CDP 报「已有覆盖」时先清再设一次（状态重放与 CDP 里残留的覆盖撞车时会发生）
         if (/already in effect/i.test(msg) && /(Timezone|Locale)/.test(method)) {
@@ -1642,7 +1772,7 @@ export class BrowserTab {
   }
 
   async #replayEmulation() {
-    const commands = toCdpCommands(this.emulation);
+    const commands = withFitScale(toCdpCommands(this.emulation), this.#desiredFitScale());
     if (commands.length === 0) return;
     const failed = await this.#runEmulationCommands(commands);
     if (failed.length > 0) this.log(`[browser:${this.id}] 重放设备模拟部分失败：${failed.join("；")}`);
@@ -1677,16 +1807,19 @@ export class BrowserTab {
     const prev = this.emulation;
     const next = mergeEmulation(prev, patch);
     this.emulation = next;
-    const failed = await this.#runEmulationCommands(toCdpCommands(next, prev));
+    const failed = await this.#runEmulationCommands(withFitScale(toCdpCommands(next, prev), this.#desiredFitScale(next)));
     if (failed.length > 0) {
       // 评审 R1-24：失败不能留下「状态说是 next、页面里只套了一半」的错位——状态回滚到 prev，
       // 并尽力把页面里已套上的部分撤回（从 next 退回 prev 的差量命令；撤回自己失败只记日志，状态已按 prev 为准）
       this.emulation = prev;
-      const undoFailed = await this.#runEmulationCommands(toCdpCommands(prev, next));
+      const undoFailed = await this.#runEmulationCommands(withFitScale(toCdpCommands(prev, next), this.#desiredFitScale(prev)));
       if (undoFailed.length > 0) this.log(`[browser:${this.id}] 模拟失败后的回滚也有部分失败：${undoFailed.join("；")}`);
+      await this.#refit(); // 视图尺寸 / 缩放跟着回滚后的状态走（槽位没变，但 this.emulation 已经变回 prev）
       this.hooks.onChange();
       throw new BrowserError("INTERNAL", `设备模拟设置失败，已恢复原状：${failed.join("；")}`);
     }
+    // 视口尺寸变了（换设备 / 改宽高 / 重置）：缩放比例要按新模拟重算、视图要跟着收窄或放回整个槽位，渲染端不会为此再汇报 bounds
+    await this.#refit();
     this.hooks.onChange();
     for (const fn of [...this.emulationHooks]) {
       try {

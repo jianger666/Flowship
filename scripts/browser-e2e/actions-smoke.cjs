@@ -140,24 +140,24 @@ const main = async () => {
   await call("type", { ref, text: "x" });
   check("type-clear", "默认先清空再输入", (await ev("document.getElementById('txt').value")) === "x");
 
-  // R1-02：密码框拒绝 type（与 fill_form 同源文案，指向 browser_ask_user_to_act），值保持为空、不留日志
+  // 密码框与普通文本框一视同仁：type / press_key 都能写进去（只比长度，不把明文读回来）；读取侧遮罩与「不入日志」见下面的 privacy / snapshot 断言
   ({ ref } = await snapRef("密码"));
   const pwdTry = await tryCall("type", { ref, text: "s3cret-PW" });
   check(
-    "type-pwd-rejected",
-    "密码框拒绝 type（BAD_ARGS + 指向 browser_ask_user_to_act），值保持为空",
-    pwdTry.ok === false && pwdTry.code === "BAD_ARGS" && /browser_ask_user_to_act/.test(pwdTry.message ?? "") && (await ev("document.getElementById('pwd').value")) === "",
-    pwdTry,
+    "type-pwd-ok",
+    "密码框照常 type（不再被拒），值落到页面",
+    pwdTry.ok === true && (await ev("document.getElementById('pwd').value.length")) === "s3cret-PW".length,
+    pwdTry.ok ? "ok" : pwdTry,
   );
-  // R1-25：焦点在密码框时 press_key 拒绝单字符键；Enter 等功能键不受限
   await ev("document.getElementById('pwd').focus()");
   const pkTry = await tryCall("press_key", { key: "a" });
   check(
-    "press-key-pwd-rejected",
-    "焦点在密码框时 press_key 单字符被拒绝（值仍为空）",
-    pkTry.ok === false && pkTry.code === "BAD_ARGS" && (await ev("document.getElementById('pwd').value")) === "",
-    pkTry,
+    "press-key-pwd-ok",
+    "焦点在密码框时 press_key 单字符照常输入",
+    pkTry.ok === true && (await ev("document.getElementById('pwd').value.length")) === "s3cret-PW".length + 1,
+    pkTry.ok ? "ok" : pkTry,
   );
+  check("pwd-snapshot-masked", "[sec] 写入之后，snapshot 里没有密码明文（读取侧遮罩仍在）", !(await call("snapshot", {})).text.includes("s3cret-PW"));
   const pkEnter = await tryCall("press_key", { key: "Tab" });
   check("press-key-pwd-tab", "焦点在密码框时 Tab 仍可按", pkEnter.ok === true, pkEnter);
 

@@ -30,9 +30,10 @@ const setup = async (cfg: Partial<P1Config> = {}, url = `${A}/page`) => {
   /** 经 normalizeOpArgs（真实分发前的校验）再交给 handler */
   const call = (args: Record<string, unknown>) => handlers.permissions("task-p1", normalizeOpArgs("permissions", args));
   const aiEntries = () => (env.session.activityLog.list() as Array<{ actor: string; kind: string; summary: string }>).filter((e) => e.actor === "ai" && e.kind === "permission");
-  const request = (permission: string, requestingUrl = `${A}/page`) => {
+  /** extra：并进 Electron 的 details（如 media 的 mediaTypes） */
+  const request = (permission: string, requestingUrl = `${A}/page`, extra: Record<string, unknown> = {}) => {
     const cb = vi.fn();
-    gate.handleRequest(tab.wc, permission, cb, { requestingUrl, isMainFrame: true });
+    gate.handleRequest(tab.wc, permission, cb, { requestingUrl, isMainFrame: true, ...extra });
     return cb;
   };
   return { ...env, gate, tab, handlers, call, aiEntries, scheduleState, request };
@@ -172,15 +173,66 @@ describe("grant / deny / reset", () => {
 
   it("永远拒绝的权限（含别名）→ DENIED，AI 开着开关也放不开；不写授予、不写日志", async () => {
     const s = await setup({ pagePermissions: true });
-    for (const permission of ["media", "camera", "microphone", "display-capture", "usb", "hid", "serial", "openExternal", "fullscreen", "fileSystem"]) {
+    for (const permission of ["display-capture", "screen", "usb", "hid", "serial", "openExternal", "fullscreen", "fileSystem"]) {
       expect(await codeOf(s.call({ action: "grant", permission })), permission).toBe("DENIED");
       expect(await codeOf(s.call({ action: "deny", permission })), permission).toBe("DENIED");
     }
     expect(getPermissionState(s.session).grants.size).toBe(0);
     expect(s.aiEntries()).toHaveLength(0);
     // gate 仍然拒绝
-    const cb = s.request("media");
+    const cb = s.request("display-capture");
     expect(cb).toHaveBeenCalledWith(false);
+  });
+
+  it("麦克风 / 摄像头不再是红线：AI 的 grant / deny 能写进授予表（要开着「AI 管理页面权限」），gate 随之放行 / 拒绝；两者互相独立", async () => {
+    const s = await setup({ pagePermissions: true });
+    const audio = { mediaTypes: ["audio"] };
+    const video = { mediaTypes: ["video"] };
+    // 只授予麦克风（别名 mic / audio 同义）：摄像头不被连带
+    expect(await s.call({ action: "grant", permission: "microphone" })).toEqual({ action: "grant", permission: "microphone", origin: A });
+    const grants = getPermissionState(s.session).grants;
+    expect(grants.get(A, "microphone")).toMatchObject({ decision: "allow", source: "ai" });
+    expect(grants.get(A, "camera")).toBeUndefined();
+    expect(s.request("media", undefined, audio)).toHaveBeenCalledWith(true);
+    expect(s.gate.handleCheck(s.tab.wc, "media", A, { isMainFrame: true, mediaType: "audio" })).toBe(true);
+    expect(s.gate.handleCheck(s.tab.wc, "media", A, { isMainFrame: true, mediaType: "video" })).toBe(false);
+    // 单独拒绝摄像头（别名 video 同义）：只影响摄像头
+    expect(await s.call({ action: "deny", permission: "video" })).toEqual({ action: "deny", permission: "camera", origin: A });
+    expect(s.request("media", undefined, video)).toHaveBeenCalledWith(false);
+    expect(s.request("media", undefined, audio)).toHaveBeenCalledWith(true);
+    expect(s.gate.handleCheck(s.tab.wc, "media", A, { isMainFrame: true, mediaType: "audio" })).toBe(true);
+    // 没开「AI 管理页面权限」：AI 不能授予
+    const off = await setup({ pagePermissions: false });
+    expect(await codeOf(off.call({ action: "grant", permission: "media" }))).toBe("ACCESS_DISABLED");
+    expect(await codeOf(off.call({ action: "grant", permission: "camera" }))).toBe("ACCESS_DISABLED");
+    expect(getPermissionState(off.session).grants.size).toBe(0);
+  });
+
+  it("R9-02：permission 写 media = 麦克风 + 摄像头一起（grant / deny / reset 都是两项）；授予表里只有这两个独立条目", async () => {
+    const s = await setup({ pagePermissions: true });
+    const grants = getPermissionState(s.session).grants;
+    expect(await s.call({ action: "grant", permission: "media" })).toEqual({ action: "grant", permission: "media", origin: A });
+    expect(grants.get(A, "microphone")).toMatchObject({ decision: "allow", source: "ai" });
+    expect(grants.get(A, "camera")).toMatchObject({ decision: "allow", source: "ai" });
+    expect(grants.get(A, "media")).toBeUndefined();
+    expect(grants.size).toBe(2);
+    expect(s.request("media", undefined, { mediaTypes: ["audio", "video"] })).toHaveBeenCalledWith(true);
+    expect(s.aiEntries().at(-1)?.summary).toContain("摄像头 + 麦克风");
+    // reset media：两项都清，返回条数 2；只 reset 其中一个则只清一个
+    expect(await s.call({ action: "reset", permission: "media" })).toMatchObject({ cleared: 2, permission: "media" });
+    expect(grants.size).toBe(0);
+    await s.call({ action: "grant", permission: "media" });
+    expect(await s.call({ action: "reset", permission: "camera" })).toMatchObject({ cleared: 1, permission: "camera" });
+    expect(grants.get(A, "microphone")).toBeDefined();
+    expect(grants.get(A, "camera")).toBeUndefined();
+    // deny media：两项都记显式拒绝
+    await s.call({ action: "reset" });
+    expect(await s.call({ action: "deny", permission: "Media" })).toEqual({ action: "deny", permission: "media", origin: A });
+    expect(grants.get(A, "microphone")).toMatchObject({ decision: "deny", source: "ai" });
+    expect(grants.get(A, "camera")).toMatchObject({ decision: "deny", source: "ai" });
+    // list 里列出的是两条独立记录（AI 看到的名字可以直接拿去 reset）
+    const listed = (await s.call({ action: "list" })) as { grants: Array<{ permission: string }> };
+    expect(listed.grants.map((g) => g.permission).sort()).toEqual(["camera", "microphone"]);
   });
 
   it("Flowship 自己的 origin → DENIED（显式 origin 或当前页面都一样）", async () => {
@@ -197,6 +249,10 @@ describe("grant / deny / reset", () => {
     expect(await codeOf(s.call({ action: "grant", permission: "brand-new-permission" }))).toBe("BAD_ARGS");
     const r = (await s.call({ action: "grant", permission: "clipboard-sanitized-write" })) as { note: string };
     expect(r.note).toContain("默认允许");
+    expect(getPermissionState(s.session).grants.size).toBe(0);
+    // speaker-selection 现在也是默认放行：grant / deny 都只提示、不写记录（摄像头 / 麦克风不在此列，是询问类，见上面两条）
+    const sp = (await s.call({ action: "grant", permission: "speaker-selection" })) as { note: string };
+    expect(sp.note).toContain("默认允许");
     expect(getPermissionState(s.session).grants.size).toBe(0);
   });
 

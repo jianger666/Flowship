@@ -1,8 +1,8 @@
 /**
  * Cursor 路径 `subagent` 的接线（Agent facade）：谁有、谁没有、取消联动有没有装上。
  *
- * 正式会话（有 callerToken、非只读）才挂；oneshot / 受限答疑 / 只读轮次没有 callerToken 或被拦，
- * 子代理能写文件 / 跑命令，不能出现在这些受限通道里。
+ * 有 callerToken 且非只读的会话才挂（正式会话、属主一次性 agent——后者见 tests/one-shot-system-tools.test.ts）；
+ * 受限答疑 / 只读轮次没有 callerToken 或被拦，子代理能写文件 / 跑命令，不能出现在这些受限通道里。
  */
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
@@ -61,7 +61,7 @@ describe("Agent.create / resume（Cursor 路）：subagent 的挂载范围", () 
     expect(tools?.subagent?.description).toContain("effort");
   });
 
-  it("没有 callerToken（oneshot / 受限答疑）：不挂任何 customTools，也就没有 subagent", async () => {
+  it("没有 callerToken（受限答疑等）：不挂任何 customTools，也就没有 subagent", async () => {
     mockCreate.mockClear();
     await Agent.create({ ...baseInput } as never);
     expect(customToolsOf(mockCreate.mock.calls[0][0])).toBeUndefined();

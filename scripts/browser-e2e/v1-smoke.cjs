@@ -1,6 +1,6 @@
 "use strict";
 /**
- * V1「输入类」真 Electron 冒烟：mouse（click / double_click / wheel / down-move-up / 越界）、fill_form（含密码拒绝与 submit）、
+ * V1「输入类」真 Electron 冒烟：mouse（click / double_click / wheel / down-move-up / 越界）、fill_form（含密码框填写与 submit）、
  * click.modifiers（Ctrl/Cmd+点击）、snapshot.query、wait_for 新条件（urlContains / networkIdle / refVisible）、screenshot 的 viewportW/H。
  *
  * 只能经启动器运行（AGENTS.md「跑无头 Electron 脚本必须走启动器」）：
@@ -210,7 +210,7 @@ const main = async () => {
   const qCase2 = await call("snapshot", { query: "提交" });
   check("query-case", "query 大小写不敏感（提交 命中；SUBMIT 对中文按钮无命中属预期）", /命中 \d+ 行/.test(qCase2.text) && /没有匹配/.test(qCase.text), { a: qCase.text.slice(0, 40), b: qCase2.text.split("\n")[0] });
 
-  // ── fill_form：含密码拒绝、submit 被跳过 ──
+  // ── fill_form：密码框照常填写、有失败项时 submit 被跳过 ──
   await call("type", { ref: (await refs(["姓名"]))["姓名"], text: "" }); // 清空
   let r = await refs(["姓名", "邮箱", "密码", "同意条款", "订阅通知", "城市", "提交"]);
   const f1 = await call("fill_form", {
@@ -221,12 +221,13 @@ const main = async () => {
       { ref: r["同意条款"], checked: true },
       { ref: r["订阅通知"], checked: true }, // 已勾：不能被点掉
       { ref: r["城市"], values: ["上海"] },
+      { ref: "e99999", value: "x" }, // 故意失败的一项：用来验证「有失败项时不提交」
     ],
     submitRef: r["提交"],
   });
   const byRef = Object.fromEntries(f1.results.map((x) => [x.ref, x]));
   const pwdRes = byRef[r["密码"]];
-  check("fill-pwd-rejected", "密码框被拒绝（ok:false，指向 browser_ask_user_to_act），密码框保持为空", pwdRes && pwdRes.ok === false && /browser_ask_user_to_act/.test(pwdRes.error) && (await ev("document.getElementById('pwd').value")) === "", pwdRes);
+  check("fill-pwd-ok", "密码框与普通框一样被填上（ok:true，值落到页面）", pwdRes && pwdRes.ok === true && (await ev("document.getElementById('pwd').value")) === "s3cret-PW", pwdRes);
   check(
     "fill-others-ok",
     "其它项照常：文本 / 复选 / 下拉都成功，已勾选的复选框 checked:true 不会被点掉",

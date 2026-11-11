@@ -38,7 +38,7 @@ const num = (h, args, key, { min, max, dflt, integer = false } = {}) => {
 };
 
 /**
- * touch 参数规整（纯函数）。只放行白名单字段——这个工具**没有任何文本入参**，不可能成为往密码框输入字符的通道（红线 3）。
+ * touch 参数规整（纯函数）。只放行白名单字段——这个工具**没有任何文本入参**，不产生字符输入。
  * 目标二选一：`ref`（元素中心）或 `x`+`y`（视口 CSS 像素）。
  * @returns {{ action: string, ref?: string, x?: number, y?: number, durationMs: number, toX?: number, toY?: number, direction?: string, distance?: number, scale?: number, tabId?: string }}
  */

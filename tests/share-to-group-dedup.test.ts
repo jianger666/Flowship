@@ -164,7 +164,9 @@ describe("share_to_group 短窗去重", () => {
         }),
     );
     const first = call({ content: "并发" });
-    await new Promise((r) => setImmediate(r)); // 让第一个进到 await 里
+    // 等第一个真正走到「发送」（此时占位已经落下）再发第二个。以前这里只让出一个宏任务（setImmediate）：
+    // 全量并行跑、fs 读得慢时第一个还没到发送处，第二个就抢走了这条「只生效一次」的慢 mock、永远挂到 5s 超时。
+    await vi.waitFor(() => expect(hoisted.shareToRequirementGroup).toHaveBeenCalledTimes(1));
     const second = await call({ content: "并发" });
     expect(second.outcome).toBe("skipped_duplicate");
     release();

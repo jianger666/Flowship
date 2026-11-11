@@ -810,8 +810,9 @@ export const createBrowserManager = (deps) => {
       ses.on("will-download", onWillDownload);
     }
     // E2·P1（A8）：权限决策交给 permission-gate（permission-policy 的纯决策 + 用户提示 + 定位模拟自动授权 + 通知代理）。
-    // 安全底线不变：摄像头 / 麦克风 / 屏幕共享 / USB … 永远拒绝；找不到所属 tab / 会话、未知权限名、不透明来源一律拒绝；
-    // 只放行「页面写剪贴板」这种无隐私面的，其余要么用户在提示条里决定、要么 AI 在设置开关打开时授予。
+    // 安全底线不变：屏幕共享 / USB / HID / 串口 / openExternal … 永远拒绝；找不到所属 tab / 会话、未知权限名、不透明来源一律拒绝；
+    // 摄像头 / 麦克风与定位等一样归「询问」（麦克风与摄像头是两个独立授予）：用户在提示条里点允许，或设置开关打开后由 AI 授予，
+    // 其余（无人处理 / 跨源子框架）拒绝；只直接放行「页面写剪贴板」「选择扬声器」这类无隐私面的（口径见 permission-policy.mjs 头注释）。
     // 请求 / 检查两个处理器只装这一次（R1-32 的「失败重试」语义不变：任何一步抛错都不登记 configuredPartitions）
     ses.setPermissionRequestHandler(permissionGate.handleRequest);
     if (typeof ses.setPermissionCheckHandler === "function") ses.setPermissionCheckHandler(permissionGate.handleCheck);

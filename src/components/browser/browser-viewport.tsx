@@ -22,6 +22,8 @@ import { Loader2 } from "lucide-react";
 import type { BrowserState } from "@/lib/browser-bridge-types";
 import { cn } from "@/lib/utils";
 import { getBrowserStore } from "./browser-state-store";
+import { viewFitCssOf } from "./browser-user-logic";
+import { useActiveViewFit } from "./use-browser-session";
 import { useOverlayCover } from "./use-overlay-cover";
 import {
   boundsEqual,
@@ -65,6 +67,8 @@ const BrowserViewportImpl = ({
   });
   const reevaluateRef = useRef(reevaluate);
   reevaluateRef.current = reevaluate;
+  // 设备模拟把原生视图收窄（居中、顶部对齐）时，遮盖占位图要摆在同一个位置，否则会被拉伸成整个占位 div
+  const coverBox = viewFitCssOf(useActiveViewFit(taskId));
 
   useEffect(() => {
     const bridge = window.__browser;
@@ -163,7 +167,8 @@ const BrowserViewportImpl = ({
             src={coverImage}
             alt=""
             draggable={false}
-            className="absolute inset-0 size-full select-none object-fill"
+            className={cn("absolute select-none object-fill", !coverBox && "inset-0 size-full")}
+            style={coverBox ?? undefined}
           />
         ) : (
           <div className="absolute inset-0 flex items-center justify-center bg-muted/60 text-xs text-muted-foreground">

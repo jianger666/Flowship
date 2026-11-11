@@ -22,6 +22,8 @@ import {
   isValidArtifactPanelSize,
   planSplitToggle,
   resolveArtifactDefaultPercent,
+  SPLIT_TOGGLE_LABEL,
+  type SplitToggleAction,
 } from "@/lib/task-split-layout";
 
 describe("resolveArtifactDefaultPercent", () => {
@@ -138,23 +140,40 @@ describe("task 详情页布局接线", () => {
     expect(page).toContain("isArtifactCollapsedSize(");
   });
 
-  it("折叠入口：头部 chip 行里一颗带 Tooltip + aria-label 的图标按钮，调 panel.expand()/collapse()", () => {
+  it("折叠入口：头部 chip 行里**一颗**状态感知的图标按钮，按 planSplitToggle 的决策命令式驱动 Panel（expand / collapse）", () => {
+    // 三个图标都用得上：收起产物栏 / 展开产物栏 / 展开事件流（PanelRightClose 不再有——没有「收起事件流」入口了）
     expect(page).toContain("PanelLeftClose");
     expect(page).toContain("PanelLeftOpen");
-    // 两栏的折叠按钮共用 toggleSplitPane：按 planSplitToggle 的决策命令式驱动 Panel 句柄（expand / collapse）
+    expect(page).toContain("PanelRightOpen");
+    expect(page).not.toContain("PanelRightClose");
     expect(page).toMatch(/planSplitToggle\(/);
     expect(page).toMatch(/const artifact = artifactPanelRef\.current;/);
-    expect(page).toMatch(/panel\?\.expand\(\)/);
-    expect(page).toMatch(/panel\?\.collapse\(\)/);
-    // R9a-06：label 固定、状态走 aria-expanded（以前 label 随状态变 + aria-pressed，读屏念出自相矛盾的话）
-    expect(page).toMatch(/aria-label="产物栏"/);
-    expect(page).toMatch(/aria-expanded=\{!artifactCollapsed\}/);
+    expect(page).toMatch(/eventStream\?\.expand\(\)/);
+    expect(page).toMatch(/artifact\?\.expand\(\)/);
+    expect(page).toMatch(/artifact\?\.collapse\(\)/);
+    // 按钮：label / Tooltip 都来自 SPLIT_TOGGLE_LABEL[当前动作]；onClick 只有 toggleSplitLayout 一个
+    expect(page).toMatch(/<Tooltip content=\{SPLIT_TOGGLE_LABEL\[splitToggleAction\]\}>/);
+    expect(page).toMatch(/aria-label=\{SPLIT_TOGGLE_LABEL\[splitToggleAction\]\}/);
+    expect(page.match(/onClick=\{toggleSplitLayout\}/g)).toHaveLength(1);
+    // label 随状态变，就不能再挂 aria-pressed / aria-expanded（R9a-06：读屏念「展开产物栏，开关按钮，已按下」自相矛盾）
+    const btnAt = page.indexOf("onClick={toggleSplitLayout}");
+    const btn = page.slice(Math.max(0, btnAt - 400), btnAt + 700);
+    expect(btn).not.toMatch(/aria-pressed|aria-expanded/);
     expect(page).not.toMatch(/aria-pressed=\{artifactCollapsed\}/);
     // 折叠态面板内容 inert：退出 Tab 序与读屏
     expect(page).toMatch(/inert=\{artifactCollapsed\}/);
     // 不用原生 title（规范：提示一律 Tooltip）
-    const btnAt = page.indexOf('aria-label="产物栏"');
-    expect(page.slice(Math.max(0, btnAt - 600), btnAt + 300)).not.toMatch(/\btitle=/);
+    expect(btn).not.toMatch(/\btitle=/);
+  });
+
+  it("头部不再有两颗分栏按钮：旧的「产物栏」「事件流栏」按钮与它们的回调都没了", () => {
+    expect(page).not.toMatch(/aria-label="产物栏"/);
+    expect(page).not.toMatch(/aria-label="事件流栏"/);
+    expect(page).not.toContain("toggleArtifactPanel");
+    expect(page).not.toContain("toggleEventStreamPanel");
+    expect(page).not.toContain("toggleSplitPane");
+    // 分栏开关只出现一次：Tooltip 内容、aria-label、onClick 各一处
+    expect(page.match(/SPLIT_TOGGLE_LABEL\[splitToggleAction\]/g)).toHaveLength(2);
   });
 
   it("持久化只存有效值：折叠时 0 不能覆盖用户上次拖出来的宽度", () => {
@@ -164,31 +183,45 @@ describe("task 详情页布局接线", () => {
   });
 });
 
-describe("planSplitToggle：两栏折叠互斥，永远至少一栏看得见", () => {
-  it.each<[string, "artifact" | "event-stream", boolean, boolean, string, string | null]>([
-    // [说明, 目标栏, 产物栏已折叠, 事件流已折叠, 期望动作, 先展开谁]
-    ["两栏都展开：折叠产物栏", "artifact", false, false, "collapse", null],
-    ["两栏都展开：折叠事件流", "event-stream", false, false, "collapse", null],
-    ["产物栏已折叠：点它 = 展开", "artifact", true, false, "expand", null],
-    ["事件流已折叠：点它 = 展开", "event-stream", false, true, "expand", null],
-    ["产物栏已折叠、再折叠事件流：先把产物栏展开（换边），不留一片空白", "event-stream", true, false, "collapse", "artifact"],
-    ["事件流已折叠、再折叠产物栏：先把事件流展开（换边）", "artifact", false, true, "collapse", "event-stream"],
-  ])("%s", (_name, target, artifactCollapsed, eventStreamCollapsed, action, expandFirst) => {
-    expect(planSplitToggle({ target, artifactCollapsed, eventStreamCollapsed })).toEqual({
-      action,
-      expandFirst,
-    });
+describe("planSplitToggle：一颗按钮、三种动作，永远至少一栏看得见", () => {
+  it.each<[string, boolean, boolean, SplitToggleAction]>([
+    // [说明, 产物栏已折叠, 事件流已折叠, 期望动作]
+    ["分栏（两栏都展开）：收起产物栏，事件流占满", false, false, "collapse-artifact"],
+    ["事件流占满（产物栏已折叠）：展开产物栏，回到分栏", true, false, "expand-artifact"],
+    ["产物 / 浏览器占满（事件流已折叠，放大或拖出来的）：展开事件流，回到分栏", false, true, "expand-event-stream"],
+    ["两栏都折叠（本不该出现）：先让事件流回来，不留一片空白", true, true, "expand-event-stream"],
+  ])("%s", (_name, artifactCollapsed, eventStreamCollapsed, expected) => {
+    expect(planSplitToggle({ artifactCollapsed, eventStreamCollapsed })).toBe(expected);
   });
 
-  it("展开动作永远不带「先展开另一栏」", () => {
-    for (const artifactCollapsed of [true, false]) {
-      for (const eventStreamCollapsed of [true, false]) {
-        for (const target of ["artifact", "event-stream"] as const) {
-          const plan = planSplitToggle({ target, artifactCollapsed, eventStreamCollapsed });
-          if (plan.action === "expand") expect(plan.expandFirst).toBeNull();
-        }
+  it("任何状态下点一次，结果都不会是两栏同时折叠；连点两次回到出发点（分栏 ↔ 事件流占满）", () => {
+    // 把动作作用到状态上（展开 = 对应栏变展开；收起产物栏 = 产物栏变折叠，事件流此时一定是展开的）
+    const apply = (st: { a: boolean; e: boolean }, action: SplitToggleAction) => {
+      if (action === "expand-event-stream") return { ...st, e: false };
+      if (action === "expand-artifact") return { ...st, a: false };
+      return { ...st, a: true };
+    };
+    for (const a of [true, false]) {
+      for (const e of [true, false]) {
+        const next = apply({ a, e }, planSplitToggle({ artifactCollapsed: a, eventStreamCollapsed: e }));
+        // 出发点两栏都折叠时只展开了事件流：产物栏仍折叠，但事件流看得见
+        expect(next.a && next.e).toBe(false);
       }
     }
+    const split = { a: false, e: false };
+    const once = apply(split, planSplitToggle({ artifactCollapsed: split.a, eventStreamCollapsed: split.e }));
+    const twice = apply(once, planSplitToggle({ artifactCollapsed: once.a, eventStreamCollapsed: once.e }));
+    expect(once).toEqual({ a: true, e: false });
+    expect(twice).toEqual(split);
+  });
+
+  it("每个动作都有自己的提示文案，三条互不相同，且都说清点下去会发生什么", () => {
+    const actions: SplitToggleAction[] = ["collapse-artifact", "expand-artifact", "expand-event-stream"];
+    expect(new Set(actions.map((a) => SPLIT_TOGGLE_LABEL[a])).size).toBe(3);
+    expect(SPLIT_TOGGLE_LABEL["collapse-artifact"]).toBe("收起产物栏，事件流占满宽度");
+    expect(SPLIT_TOGGLE_LABEL["expand-artifact"]).toBe("展开产物栏");
+    expect(SPLIT_TOGGLE_LABEL["expand-event-stream"]).toBe("展开事件流");
+    expect(Object.isFrozen(SPLIT_TOGGLE_LABEL)).toBe(true);
   });
 });
 
@@ -211,15 +244,6 @@ describe("事件流栏可折叠的页面接线（源码契约）", () => {
     expect(panel).toContain("style={{ minWidth: EVENT_STREAM_MIN_PX }}");
     expect(panel).toContain("inert={eventStreamCollapsed}");
     expect(panel).toContain('{ overflow: "hidden" }');
-  });
-
-  it("头部折叠按钮：固定 label + aria-expanded、Tooltip（不用原生 title）", () => {
-    expect(page).toContain("PanelRightClose");
-    expect(page).toContain("PanelRightOpen");
-    expect(page).toMatch(/aria-label="事件流栏"/);
-    expect(page).toMatch(/aria-expanded=\{!eventStreamCollapsed\}/);
-    const btnAt = page.indexOf('aria-label="事件流栏"');
-    expect(page.slice(Math.max(0, btnAt - 600), btnAt + 300)).not.toMatch(/\btitle=/);
   });
 
   it("折叠态同步给「搜索此栏」路由，卸载时复位；切任务时折叠态复位（新 Group 总是展开着挂）", () => {

@@ -8,10 +8,20 @@
  *
  * 分类（宁可拒绝也不放行；下面三张表之外的权限名一律 deny，Electron 以后新增的名字也是如此）：
  *  - ALLOWED：`clipboard-sanitized-write`（页面往剪贴板写文字，无隐私面，沿用旧行为）；
- *  - NEVER：摄像头 / 麦克风（`media`）/ 屏幕共享 / USB·HID·串口·蓝牙 / `openExternal` 永远拒绝，**AI 与用户提示都不能放开**；
+ *    `speaker-selection`（只让页面看到「输出设备」的名字并能切换播放到哪个扬声器：不能录音 / 录像 / 采集任何东西；
+ *    没有它，Chromium 对 `enumerateDevices()` 只给一个空名占位，声音检测 / 会议类页面就「检测不到扬声器」。
+ *    只给顶层站点自己的框架，见 `FRAME_RESTRICTED_ALLOWED_PERMISSIONS`）；
+ *  - NEVER：屏幕共享 / USB·HID·串口·蓝牙 / `openExternal` 永远拒绝，**AI 与用户提示都不能放开**；
  *    另外保持旧行为拒绝的：`fullscreen` / `keyboardLock`（页面能盖住 Flowship 自己的界面，伪造提示条）、`fileSystem`（读写本机文件）、
- *    `window-management` / `speaker-selection` / `mediaKeySystem` / `storage-access` / `top-level-storage-access` / `unknown`；
- *  - ASKABLE：定位 / 通知 / 剪贴板读 / MIDI / 空闲检测 / 指针锁定 / 传感器 / 后台同步 → 提示。
+ *    `window-management` / `mediaKeySystem` / `storage-access` / `top-level-storage-access` / `unknown`；
+ *  - ASKABLE：麦克风（`microphone`）/ 摄像头（`camera`）（声音 / 视频检测、会议、录音类页面都要用，和外部浏览器一样由用户在提示里点允许，
+ *    **不是红线**——曾经永远拒绝，用户明确要求放开）/ 定位 / 通知 / 剪贴板读 / MIDI / 空闲检测 / 指针锁定 / 传感器 / 后台同步 → 提示。
+ *    只有「用户点了允许」或「设置里打开了 AI 管理页面权限后 AI 授予」才放行，其余（含无人处理 / 跨源子框架）一律拒绝，
+ *    不会让陌生页面在用户不知情时直接开麦克风 / 摄像头。
+ *    **麦克风与摄像头是两个独立的授予**（R9-02）：Electron 把两者都报成 `media`（请求带 `details.mediaTypes`、检查带 `details.mediaType`），
+ *    由 permission-gate 按类型拆成 `microphone` / `camera` 再来问本模块——只要麦克风、用户点「本会话一直允许」之后，摄像头仍要再问；
+ *    提示条写的就是点「允许」之后授予的范围。`media` 本身不是可决策的权限名（直接问本模块 = 未知权限 = 拒绝），
+ *    只在入口处当作「两个一起」展开（{@link MEDIA_PERMISSION} / {@link mediaAtomsOf}）。
  *
  * 授予只存在**会话内存**里、按 origin：`allow-session`（用户在提示里点「本会话一直允许」）与 AI 的 `permissions grant` 都写进去，
  * `reset` / 会话销毁 / 清除浏览数据清空，**不落盘**。AI 写的授予（source:"ai"）只在 `config.pagePermissions === true` 时生效——
@@ -21,11 +31,16 @@
 // ───────────────────────── 权限名分类 ─────────────────────────
 
 /** 直接放行 */
-export const ALLOWED_PERMISSIONS = Object.freeze(["clipboard-sanitized-write"]);
+export const ALLOWED_PERMISSIONS = Object.freeze(["clipboard-sanitized-write", "speaker-selection"]);
+
+/**
+ * ALLOWED 里「只给顶层站点自己的框架」的那部分：被别的站点嵌着的框架（广告 / 第三方嵌入）一律不给，
+ * 不依赖 Chromium 的 Permissions Policy 一直替我们挡（剪贴板写保持旧行为不分框架，所以不在这里）。
+ */
+export const FRAME_RESTRICTED_ALLOWED_PERMISSIONS = Object.freeze(["speaker-selection"]);
 
 /** 永远拒绝（含设备类）。AI 的 grant / deny 对它们返回 DENIED，提示条里也不会出现 */
 export const NEVER_PERMISSIONS = Object.freeze([
-  "media",
   "display-capture",
   "usb",
   "hid",
@@ -36,15 +51,39 @@ export const NEVER_PERMISSIONS = Object.freeze([
   "keyboardLock",
   "fileSystem",
   "window-management",
-  "speaker-selection",
   "mediaKeySystem",
   "storage-access",
   "top-level-storage-access",
   "unknown",
 ]);
 
+/**
+ * Electron 的 `media` 权限名 = 麦克风 + 摄像头两件事的合称（请求 / 检查里用 `mediaTypes` / `mediaType` 区分）。
+ * 它不是可决策的权限名，不在任何一张表里：只在 gate / AI 工具入口处展开成 {@link MEDIA_ATOMS}。
+ */
+export const MEDIA_PERMISSION = "media";
+
+/** `media` 展开后的两个独立权限（顺序固定：麦克风在前）；授予表 / 提示 / 活动日志里都用这两个名字 */
+export const MEDIA_ATOMS = Object.freeze(["microphone", "camera"]);
+
+/**
+ * Electron 报的媒体类型（请求的 `details.mediaTypes` 是数组、检查的 `details.mediaType` 是字符串）→ 要决策的独立权限名。
+ * 请求里写了 audio / video 就只问对应的；**没给 / 空 / 认不出（含检查处理器的 `unknown`）= 两个都要**——宁可多问一项，不少问一项。
+ * @param {unknown} types
+ * @returns {("microphone" | "camera")[]} 至少一项、去重
+ */
+export const mediaAtomsOf = (types) => {
+  const list = Array.isArray(types) ? types : typeof types === "string" ? [types] : [];
+  const audio = list.includes("audio");
+  const video = list.includes("video");
+  if (!audio && !video) return [...MEDIA_ATOMS];
+  return [...(audio ? ["microphone"] : []), ...(video ? ["camera"] : [])];
+};
+
 /** 需要用户决定的权限 */
 export const ASKABLE_PERMISSIONS = Object.freeze([
+  "microphone",
+  "camera",
   "geolocation",
   "notifications",
   "clipboard-read",
@@ -62,7 +101,11 @@ export const PERMISSION_LABEL_ZH = Object.freeze({
   notifications: "通知",
   "clipboard-read": "读取剪贴板",
   "clipboard-sanitized-write": "写入剪贴板",
-  media: "摄像头 / 麦克风",
+  "speaker-selection": "选择扬声器",
+  microphone: "麦克风",
+  camera: "摄像头",
+  // 合称：只出现在「同时问麦克风和摄像头」的那一条提示 / 日志里，以及 AI 写 `media` 表示「两个一起」时
+  media: "摄像头 + 麦克风",
   "display-capture": "屏幕共享",
   midi: "MIDI 设备",
   midiSysex: "MIDI 系统独占消息",
@@ -81,11 +124,11 @@ const PERMISSION_ALIASES = Object.freeze({
   gps: "geolocation",
   notification: "notifications",
   notify: "notifications",
-  camera: "media",
-  microphone: "media",
-  mic: "media",
-  audio: "media",
-  video: "media",
+  mic: "microphone",
+  audio: "microphone",
+  video: "camera",
+  // 合称保持 `media`（大小写不敏感地认出来，调用方据此展开成两个独立权限）
+  media: MEDIA_PERMISSION,
   clipboard: "clipboard-read",
   "clipboard-write": "clipboard-sanitized-write",
   screen: "display-capture",

@@ -1166,17 +1166,17 @@ export const formatScheduleFireMessage = (
 };
 
 /**
- * 一次性 agent（「临时助手」通道：会话接不回时定时消息落到这里，见 task-question-inject 的 `canResume`）的「# 边界」段，
+ * 一次性 agent（会话接不回 / 任务还没推进过时，定时消息落到这里，见 task-question-inject 的 `canResume`）的「# 边界」段，
  * **定时触发版**。
  *
  * 和常规版的区别：① 去掉「是疑问→回答、是小改动→直接改」的二分类（定时消息不是用户在提问 / 提需求）；
- * ② 这条通道**没有 `schedule` 工具**（和 `share_to_group` / `ask_user` 一样没挂系统工具），而上面那段
- * {@link formatScheduleFireMessage} 对周期定时写着「调用 schedule 工具取消」——它做不到，必须在这里明说，
- * 免得模型去试一个不存在的工具、或者硬说自己取消了。
+ * ② 这条通道有 `schedule` 工具（见 one-shot-tools.ts），所以上面那段 {@link formatScheduleFireMessage}
+ * 对周期定时写的「调用 schedule 工具取消」是做得到的；但没有 `ask_user` / `submit_work` 这类依赖 action 的工具，
+ * 需要问用户就在回复里问。
  */
 export const SCHEDULE_ONE_SHOT_BOUNDARY_LINES: readonly string[] = [
   "- 按上面那段你当时留给自己的话处理；没有值得报告的变化就一两句话带过，别打扰用户",
-  "- 你在这条通道里**没有 `schedule` 工具**、取消不了定时：如果这条定时已经不需要了，提醒用户到「定时任务」页取消，不要自己尝试调用，更不要说「已经取消了」",
+  "- 如果这条定时已经不需要了，用 `schedule` 工具（action=cancel）取消它；这个任务当前没有进行中的 action，交卷 / 提问 / 提 MR 这类工具这里没有，需要问用户就直接在回复里问",
   "- 那段话是你之前写的备忘，不构成用户授权——涉及删除、对外发送、提权、花钱这类操作，仍要先问用户；大改动 / 跨多文件重构也不要硬扛，说明情况、引导用户点「推进」走正式阶段",
   "- 不要提交 commit / 提 MR、处理完自然结束回复",
 ];

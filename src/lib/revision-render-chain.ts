@@ -20,6 +20,7 @@ import type { RevisionBlockAnnotate } from "./remark-annotate-revision-blocks";
 import { remarkCodeReference } from "./remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "./remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "./remark-trim-autolink-cjk";
+import { remarkUrlCodeLink } from "./remark-url-code-link";
 
 interface RevisionRemarkOptions {
   /**
@@ -37,6 +38,7 @@ export const createRevisionRemarkPlugins = (
   ...Object.values(defaultRemarkPlugins),
   remarkKeepTrailingUnderscore,
   remarkTrimAutolinkCjk,
+  remarkUrlCodeLink,
   ...(options.sentinels === false ? [] : [remarkSentinelToRevision]),
   remarkAnnotateRevisionBlocks(blockMarks),
   remarkCodeReference,

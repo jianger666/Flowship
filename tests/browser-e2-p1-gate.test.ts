@@ -43,7 +43,7 @@ const setup = async (cfg: Partial<P1Config> = {}, url = `${A}/page`) => {
 };
 
 describe("请求处理器：硬规则（不弹提示）", () => {
-  it.each(["media", "display-capture", "usb", "hid", "serial", "openExternal", "fullscreen", "keyboardLock", "fileSystem", "unknown"])("%s：直接拒绝，回调恰好一次，不产生提示", async (permission) => {
+  it.each(["display-capture", "usb", "hid", "serial", "openExternal", "fullscreen", "keyboardLock", "fileSystem", "unknown"])("%s：直接拒绝，回调恰好一次，不产生提示", async (permission) => {
     const s = await setup();
     const cb = s.request(permission);
     await flush();
@@ -58,6 +58,34 @@ describe("请求处理器：硬规则（不弹提示）", () => {
     const cb = s.request("clipboard-sanitized-write");
     expect(cb).toHaveBeenCalledWith(true);
     expect(s.check("clipboard-sanitized-write")).toBe(true);
+  });
+
+  it("speaker-selection：顶层 / 同源子框架放行（请求与检查口径一致），不弹提示；跨源子框架（被别的站点嵌着）一律拒绝", async () => {
+    const s = await setup();
+    // 顶层
+    const top = s.request("speaker-selection");
+    expect(top).toHaveBeenCalledTimes(1);
+    expect(top).toHaveBeenCalledWith(true);
+    expect(s.check("speaker-selection")).toBe(true);
+    // 同源子框架
+    const same = s.request("speaker-selection", { requestingUrl: `${A}/frame`, isMainFrame: false });
+    expect(same).toHaveBeenCalledWith(true);
+    expect(s.check("speaker-selection", A, { isMainFrame: false })).toBe(true);
+    // 跨源子框架：请求 / 检查都拒绝；embeddingOrigin ≠ 请求来源也拒绝
+    const cross = s.request("speaker-selection", { requestingUrl: `${B}/frame`, isMainFrame: false });
+    expect(cross).toHaveBeenCalledTimes(1);
+    expect(cross).toHaveBeenCalledWith(false);
+    expect(s.check("speaker-selection", B, { isMainFrame: false })).toBe(false);
+    expect(s.check("speaker-selection", A, { isMainFrame: false, embeddingOrigin: B })).toBe(false);
+    expect(s.check("speaker-selection", B, { isMainFrame: false, embeddingOrigin: A })).toBe(false);
+    await flush();
+    expect(s.session.prompts.size()).toBe(0);
+  });
+
+  it("speaker-selection：Flowship 自己的 origin 仍什么都不给", async () => {
+    const s = await setup({}, `${APP_ORIGIN}/x`);
+    expect(s.request("speaker-selection", { requestingUrl: `${APP_ORIGIN}/x`, isMainFrame: true })).toHaveBeenCalledWith(false);
+    expect(s.check("speaker-selection", APP_ORIGIN)).toBe(false);
   });
 
   it("找不到所属 tab（wc 是陌生对象 / null）→ 拒绝；检查处理器同样", async () => {
@@ -122,6 +150,173 @@ describe("请求处理器：硬规则（不弹提示）", () => {
 });
 
 describe("请求处理器：询问用户", () => {
+  it("麦克风：发 permission 提示（detail=microphone），用户允许才放行；仅这一次时检查处理器不认，本会话一直允许后才认", async () => {
+    const s = await setup();
+    // 没授予之前：检查处理器不认（不弹提示）
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "audio" })).toBe(false);
+    expect(s.session.prompts.size()).toBe(0);
+    // 请求：弹提示、回调等用户；提示写的就是这次要的（只要音频 = 麦克风）
+    const cb = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio"] });
+    await flush();
+    const p = firstPrompt(s.session, "permission");
+    expect(p.detail).toEqual({ permission: "microphone", origin: A });
+    expect(cb).not.toHaveBeenCalled();
+    s.session.prompts.answer(p.id, { action: "allow" });
+    await flush();
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith(true);
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "audio" })).toBe(false); // 仅这一次
+    // 本会话一直允许：之后同 origin 的音频请求不再弹提示，检查处理器（enumerateDevices 取设备名、permissions.query）也认
+    const cb2 = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio"] });
+    await flush();
+    s.session.prompts.answer(firstPrompt(s.session, "permission").id, { action: "allow-session" });
+    await flush();
+    expect(cb2).toHaveBeenCalledWith(true);
+    const cb3 = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio"] });
+    await flush();
+    expect(cb3).toHaveBeenCalledWith(true);
+    expect(s.session.prompts.size()).toBe(0);
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "audio" })).toBe(true);
+    // 授予按 origin：别的站点仍然拒绝
+    expect(s.check("media", B, { isMainFrame: true, mediaType: "audio" })).toBe(false);
+  });
+
+  it("R9-02：麦克风与摄像头是两个独立授予——只授予麦克风后，摄像头的请求仍要弹提示、检查处理器也不报摄像头已授予", async () => {
+    const s = await setup();
+    const audio = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio"] });
+    await flush();
+    s.session.prompts.answer(firstPrompt(s.session, "permission").id, { action: "allow-session" });
+    await flush();
+    expect(audio).toHaveBeenCalledWith(true);
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "audio" })).toBe(true);
+    // 摄像头没被连带：检查（enumerateDevices 的摄像头名字、permissions.query(camera)）不认；unknown（不知道是哪个）也不认——要两个都授予过
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "video" })).toBe(false);
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "unknown" })).toBe(false);
+    expect(s.check("media")).toBe(false);
+    // 摄像头请求：重新弹提示，写的是「摄像头」，回调等用户
+    const video = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["video"] });
+    await flush();
+    const p = firstPrompt(s.session, "permission");
+    expect(p.detail).toEqual({ permission: "camera", origin: A });
+    expect(video).not.toHaveBeenCalled();
+    s.session.prompts.answer(p.id, { action: "allow-session" });
+    await flush();
+    expect(video).toHaveBeenCalledWith(true);
+    // 两个都授予后：video / unknown / 不带类型的检查都认
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "video" })).toBe(true);
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "unknown" })).toBe(true);
+    expect(s.check("media")).toBe(true);
+    // 反过来：只授予摄像头的站点，麦克风照样要问
+    const onlyCam = await setup({}, `${B}/page`);
+    const cam = onlyCam.request("media", { requestingUrl: `${B}/page`, isMainFrame: true, mediaTypes: ["video"] });
+    await flush();
+    onlyCam.session.prompts.answer(firstPrompt(onlyCam.session, "permission").id, { action: "allow-session" });
+    await flush();
+    expect(cam).toHaveBeenCalledWith(true);
+    expect(onlyCam.check("media", B, { isMainFrame: true, mediaType: "audio" })).toBe(false);
+  });
+
+  it("R9-02：同时要麦克风和摄像头 → 只弹一条提示（detail=media，合称）；「本会话一直允许」两项各记一条授予；没给 mediaTypes 也按两个都要", async () => {
+    const s = await setup();
+    const both = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio", "video"] });
+    await flush();
+    expect(s.session.prompts.size()).toBe(1);
+    const p = firstPrompt(s.session, "permission");
+    expect(p.detail).toEqual({ permission: "media", origin: A });
+    s.session.prompts.answer(p.id, { action: "allow-session" });
+    await flush();
+    expect(both).toHaveBeenCalledWith(true);
+    const grants = getPermissionState(s.session).grants;
+    expect(grants.get(A, "microphone")).toMatchObject({ decision: "allow", source: "user" });
+    expect(grants.get(A, "camera")).toMatchObject({ decision: "allow", source: "user" });
+    expect(grants.get(A, "media")).toBeUndefined(); // 授予表里没有合称这一条
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "audio" })).toBe(true);
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "video" })).toBe(true);
+
+    // 没给 mediaTypes（认不出类型）= 两个都要
+    const other = await setup({}, `${B}/page`);
+    const unknownTypes = other.request("media", { requestingUrl: `${B}/page`, isMainFrame: true });
+    await flush();
+    expect(firstPrompt(other.session, "permission").detail).toEqual({ permission: "media", origin: B });
+    other.session.prompts.answer(firstPrompt(other.session, "permission").id, { action: "deny" });
+    await flush();
+    expect(unknownTypes).toHaveBeenCalledWith(false);
+  });
+
+  it("R9-02：只问还没授予的那一项——麦克风已授予、页面又要「麦克风 + 摄像头」时，提示只写摄像头；允许后只新增摄像头的授予", async () => {
+    const s = await setup();
+    getPermissionState(s.session).grants.allow(A, "microphone", "user");
+    const cb = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio", "video"] });
+    await flush();
+    const p = firstPrompt(s.session, "permission");
+    expect(p.detail).toEqual({ permission: "camera", origin: A });
+    s.session.prompts.answer(p.id, { action: "allow" }); // 仅这一次：回调放行，但不新增授予
+    await flush();
+    expect(cb).toHaveBeenCalledWith(true);
+    expect(getPermissionState(s.session).grants.get(A, "camera")).toBeUndefined();
+    expect(s.check("media", A, { isMainFrame: true, mediaType: "video" })).toBe(false);
+  });
+
+  it("R9-02：任何一项被显式拒绝（AI 的 deny）→ 合并请求直接拒绝、不弹提示；只要另一项的请求照常询问", async () => {
+    const s = await setup();
+    getPermissionState(s.session).grants.deny(A, "camera", "ai");
+    const both = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio", "video"] });
+    await flush();
+    expect(both).toHaveBeenCalledWith(false);
+    expect(s.session.prompts.size()).toBe(0);
+    const video = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["video"] });
+    await flush();
+    expect(video).toHaveBeenCalledWith(false);
+    expect(s.session.prompts.size()).toBe(0);
+    // 麦克风没被拒：照常弹提示
+    const audio = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio"] });
+    await flush();
+    expect(firstPrompt(s.session, "permission").detail).toEqual({ permission: "microphone", origin: A });
+    expect(audio).not.toHaveBeenCalled();
+  });
+
+  it("media：用户拒绝 / 无人处理 / 跨源子框架 / Flowship 自己的页面 → 都不放行", async () => {
+    const s = await setup();
+    const denied = s.request("media");
+    await flush();
+    s.session.prompts.answer(firstPrompt(s.session, "permission").id, { action: "deny" });
+    await flush();
+    expect(denied).toHaveBeenCalledWith(false);
+    // 冷却期内同请求直接拒绝，不再弹；冷却按项记：刚拒绝了「麦克风 + 摄像头」，只要麦克风 / 只要摄像头的请求也不重复弹
+    const again = s.request("media");
+    const againAudio = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio"] });
+    const againVideo = s.request("media", { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["video"] });
+    await flush();
+    expect(again).toHaveBeenCalledWith(false);
+    expect(againAudio).toHaveBeenCalledWith(false);
+    expect(againVideo).toHaveBeenCalledWith(false);
+    expect(s.session.prompts.size()).toBe(0);
+    await vi.advanceTimersByTimeAsync(PERMISSION_COOLDOWN_MS + 1000);
+    // 无人处理：60 秒后按拒绝，回调恰好一次
+    const timeout = s.request("media");
+    await flush();
+    expect(s.session.prompts.size()).toBe(1);
+    await vi.advanceTimersByTimeAsync(PERMISSION_PROMPT_TIMEOUT_MS + 10);
+    expect(timeout).toHaveBeenCalledTimes(1);
+    expect(timeout).toHaveBeenCalledWith(false);
+    // 跨源子框架（被别的站点嵌着）：授予是按顶层站点给的，不让嵌进来的第三方蹭
+    for (const origin of [A, B]) {
+      getPermissionState(s.session).grants.allow(origin, "microphone", "user");
+      getPermissionState(s.session).grants.allow(origin, "camera", "user");
+    }
+    const cross = s.request("media", { requestingUrl: `${B}/f`, isMainFrame: false, mediaTypes: ["audio"] });
+    await flush();
+    expect(cross).toHaveBeenCalledWith(false);
+    expect(s.check("media", B, { isMainFrame: false, embeddingOrigin: A })).toBe(false);
+    expect(s.check("media", A, { isMainFrame: false, embeddingOrigin: B })).toBe(false);
+    expect(s.check("media", A, { isMainFrame: false })).toBe(true); // 同源子框架照常
+    // Flowship 自己的页面：即使有授予记录也什么都不给
+    const app = await setup({}, `${APP_ORIGIN}/x`);
+    expect(app.request("media", { requestingUrl: `${APP_ORIGIN}/x`, isMainFrame: true })).toHaveBeenCalledWith(false);
+    expect(app.check("media", APP_ORIGIN)).toBe(false);
+    expect(app.session.prompts.size()).toBe(0);
+  });
+
   it("geolocation：发 permission 提示（detail 只有权限名 / origin），allow = 仅这一次", async () => {
     const s = await setup();
     const cb = s.request("geolocation");

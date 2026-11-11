@@ -2,7 +2,7 @@
  * 用户侧新增 UI 的纯逻辑（契约 §14.3，V4）：缩放标签 / 查找条 / 下载列表 / 对话框条 / 模拟标签。
  * 无 DOM、无 window：组件只管渲染，这里的判定都能在 vitest 里直接断言。
  */
-import type { DialogInfo, DownloadInfo, TabInfo } from "@/lib/browser-bridge-types";
+import type { DialogInfo, DownloadInfo, TabInfo, ViewFit } from "@/lib/browser-bridge-types";
 import { isImeComposing, type ImeEventLike } from "@/lib/ime";
 import { clipOneLine } from "@/lib/one-line";
 
@@ -260,4 +260,44 @@ export const describeDialogBar = (dialog: DialogInfo | null | undefined): Dialog
 export const emulationLabelOf = (tab: Pick<TabInfo, "emulation"> | null | undefined): string | null => {
   const e = tab?.emulation;
   return typeof e === "string" && e.trim() !== "" ? e.trim() : null;
+};
+
+// ───────────────────────── 设备模拟下的视图适配 ─────────────────────────
+
+/**
+ * 缩放适配生效时的整数百分比（如 72）；没缩放 / 非法（非有限数、≤0、≥1）= null。
+ * 口径与主进程一致（tab.mjs `#refit`：`Math.round(scale * 100)`，**100 = 不缩放**）：取整后到 100 的
+ * （0.995 ≤ s < 1，实际只缩了不到半个百分点）也算没缩放，不显示「适应 100%」（R9-07 ①）。
+ * 取整显示：拖面板时比例每帧都在变，百分比整数变了才有必要重绘（主进程也只在整数百分比变化时推状态）。
+ */
+export const fitScalePercentOf = (tab: Pick<TabInfo, "fitScale"> | null | undefined): number | null => {
+  const s = tab?.fitScale;
+  if (typeof s !== "number" || !Number.isFinite(s) || s <= 0 || s >= 1) return null;
+  const pct = Math.max(1, Math.round(s * 100));
+  return pct >= 100 ? null : pct;
+};
+
+/** 缩放适配生效时模拟条上的徽标（如「适应 72%」）；没缩放 = null。数字只由 {@link fitScalePercentOf} 一处算出 */
+export const fitScaleLabelOf = (tab: Pick<TabInfo, "fitScale"> | null | undefined): string | null => {
+  const pct = fitScalePercentOf(tab);
+  return pct === null ? null : `适应 ${pct}%`;
+};
+
+const isFrac = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
+
+/**
+ * 原生视图被设备模拟收窄后，遮盖占位图要摆的位置（相对占位 div 的百分比，所以不受宿主缩放 / 面板尺寸影响）。
+ * 缺省 / 非法（非有限数、负数、宽高 ≤ 0、超出占位 div）= null，调用方退回「铺满占位 div」——宁可拉伸也别把图摆到看不见的地方。
+ */
+export const viewFitCssOf = (
+  fit: ViewFit | null | undefined,
+): { left: string; top: string; width: string; height: string } | null => {
+  if (!fit) return null;
+  const { left, top, width, height } = fit;
+  if (!isFrac(left) || !isFrac(top) || !isFrac(width) || !isFrac(height)) return null;
+  if (left < 0 || top < 0 || width <= 0 || height <= 0) return null;
+  // 浮点误差留一点余量（居中时 left + width 可能是 1.0000000000000002）
+  if (left + width > 1.0001 || top + height > 1.0001) return null;
+  const pct = (n: number) => `${Number((n * 100).toFixed(3))}%`;
+  return { left: pct(left), top: pct(top), width: pct(width), height: pct(height) };
 };

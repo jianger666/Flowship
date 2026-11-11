@@ -419,6 +419,50 @@ describe("captureAxFrames：敏感字段探测与节点上限（R1-25 / R1-29）
     expect(text.match(/\[已隐藏\]/g)).toHaveLength(2);
   });
 
+  it("R10 X01：探针「没抛错但没给出明确的 false」也 fail closed——没有 objectId / 页内异常 / 返回值不是布尔，都按敏感；只有明确的 false 才露值", async () => {
+    // 上面那条只覆盖了「callFunctionOn 抛错」（走 catch）。放开写入侧之后读取侧遮罩是唯一防线，
+    // 这三种「不抛错、但没答案」的路径全靠 `let secret = true` 这个初值兜底，单独钉住。
+    const nodes = [
+      ax(1, "RootWebArea", { children: [2, 3, 4, 5, 6, 7] }),
+      ax(2, "textbox", { backend: 30, name: "无objectId", parent: 1, value: "V-NO-OBJECT" }),
+      ax(3, "textbox", { backend: 31, name: "页内异常", parent: 1, value: "V-EXCEPTION" }),
+      ax(4, "textbox", { backend: 32, name: "字符串false", parent: 1, value: "V-STRING" }),
+      ax(5, "textbox", { backend: 33, name: "数字0", parent: 1, value: "V-ZERO" }),
+      ax(6, "textbox", { backend: 34, name: "缺value", parent: 1, value: "V-MISSING" }),
+      ax(7, "textbox", { backend: 35, name: "明确非敏感", parent: 1, value: "V-PLAIN" }),
+    ];
+    const objToBackend = new Map<string, number>();
+    const send = async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "F1" }, childFrames: [] } };
+      if (method === "Accessibility.getFullAXTree") return { nodes };
+      if (method === "DOM.resolveNode") {
+        const backend = params.backendNodeId as number;
+        if (backend === 30) return {}; // 节点解析不出对象
+        const id = `obj-${backend}`;
+        objToBackend.set(id, backend);
+        return { object: { objectId: id } };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        const backend = objToBackend.get(params.objectId as string);
+        // 异常时即使带着一个 false 的 value 也不能信
+        if (backend === 31) return { exceptionDetails: { text: "boom" }, result: { value: false } };
+        if (backend === 32) return { result: { value: "false" } };
+        if (backend === 33) return { result: { value: 0 } };
+        if (backend === 34) return { result: {} };
+        return { result: { value: false } }; // 35：探针明确说「不是敏感字段」
+      }
+      return {};
+    };
+    const frames = await captureAxFrames({ send: send as never, childSessions: [] });
+    expect([...(frames[0] as { secretNodes: Set<number> }).secretNodes].sort()).toEqual([30, 31, 32, 33, 34]);
+    const text = formatAxSnapshot({ frames }).text;
+    for (const leaked of ["V-NO-OBJECT", "V-EXCEPTION", "V-STRING", "V-ZERO", "V-MISSING"]) {
+      expect(text, leaked).not.toContain(leaked);
+    }
+    expect(text.match(/\[已隐藏\]/g)).toHaveLength(5);
+    expect(text).toContain('"V-PLAIN"'); // 对照：明确的 false 才露值，不是「一律遮」
+  });
+
   it("探测数量封顶（MAX_SECRET_PROBES）：超出的部分直接按敏感处理，不再发 CDP", async () => {
     const N = MAX_SECRET_PROBES + 10;
     const nodes = [

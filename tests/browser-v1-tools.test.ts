@@ -9,7 +9,6 @@ import { browserToolSummary } from "@/lib/browser-tool-display";
 import { UNTRUSTED_REMINDER } from "@/lib/server/browser/content";
 import { __resetBrowserSettingsForTest } from "@/lib/server/browser/settings";
 import {
-  FILL_FORM_PASSWORD_MESSAGE,
   argModifiers,
   describeMouseDone,
   getBrowserTools,
@@ -17,7 +16,6 @@ import {
 } from "@/lib/server/browser/tools";
 import type { FlowshipToolDef, FlowshipToolResult } from "@/lib/server/flowship-tools";
 
-import { PASSWORD_REJECT_MESSAGE } from "../electron-app/browser/ops/input.mjs";
 import { installFakeBrowser, type FakeBrowser } from "./helpers/browser-bridge-fake";
 
 const TASK = "task-v1";
@@ -58,7 +56,13 @@ describe("注册", () => {
       expect((t.parameters as { type?: string }).type).toBe("object");
     }
     expect(tool("browser_mouse").description).toContain("视口 CSS 像素");
-    expect(tool("browser_fill_form").description).toContain("browser_ask_user_to_act");
+    // 密码框不再被拒绝：描述不能再让 AI 以为「密码 / 验证码得交给用户」
+    expect(tool("browser_fill_form").description).toContain("密码框也可以直接填");
+    // 只在「手里没有的凭据 / 短信验证码」时才指向 ask_user_to_act，且不能再出现「不允许 / 不能填 / 拒绝」这类口径
+    expect(tool("browser_fill_form").description).toContain("手里没有的凭据");
+    expect(tool("browser_fill_form").description).not.toMatch(/不允许|不能(代)?(填|输入)|拒绝/);
+    expect(tool("browser_type").description).toContain("密码框也可以直接输入");
+    expect(tool("browser_type").description).not.toContain("browser_ask_user_to_act");
     expect(tool("browser_snapshot").description).toContain("query");
   });
 });
@@ -239,13 +243,13 @@ describe("browser_fill_form", () => {
     expect(() => parseFillFields([{ ref: "e1", values: [] }])).toThrow(/values/);
   });
 
-  it("发 op fill_form（fields + submitRef）；逐项列出成败；密码拒绝文案保持可信（它在指路）", async () => {
+  it("发 op fill_form（fields + submitRef）；逐项列出成败（密码框与普通框一样处理）", async () => {
     const f = withBrowser({
       fill_form: () => ({
         ...page,
         results: [
           { ref: "e1", ok: true },
-          { ref: "e2", ok: false, error: FILL_FORM_PASSWORD_MESSAGE },
+          { ref: "e2", ok: false, error: "元素 e2 当前不可操作" },
         ],
         submit: { ref: "e9", ok: false, error: "有 1 项填写失败，已跳过提交。" },
       }),
@@ -262,10 +266,9 @@ describe("browser_fill_form", () => {
     const t = textOf(r);
     expect(t).toContain("成功 1/2 项，失败 1 项");
     expect(t).toContain("- e1 ✓");
-    // 密码拒绝：原文出现且不在不可信标签内
-    const pwdLine = t.split("\n").find((l) => l.startsWith("- e2 ✗")) ?? "";
-    expect(pwdLine).toContain("browser_ask_user_to_act");
-    expect(pwdLine).not.toContain("<untrusted_page_content");
+    // 失败项的详情可能含页面文字：一律内联包成不可信
+    const failLine = t.split("\n").find((l) => l.startsWith("- e2 ✗")) ?? "";
+    expect(failLine).toContain("<untrusted_page_content");
     // 提交被跳过的说明（来自主进程、含「已跳过」）以不可信内联包装
     expect(t).toContain("- 提交 e9 ✗");
   });
@@ -296,10 +299,6 @@ describe("browser_fill_form", () => {
     const r = await call("browser_fill_form", { fields: [] });
     expect(r.isError).toBe(true);
     expect(f.calls.filter((c) => c.op === "fill_form").length).toBe(0);
-  });
-
-  it("server 的密码拒绝文案与主进程 PASSWORD_REJECT_MESSAGE 逐字一致（两边各存一份，这里钉死）", () => {
-    expect(FILL_FORM_PASSWORD_MESSAGE).toBe(PASSWORD_REJECT_MESSAGE);
   });
 });
 

@@ -34,6 +34,22 @@ export interface OutboundQuestionEntry {
   createdAt: number;
   /** 有效期 ms（默认 2 小时） */
   ttlMs: number;
+  /**
+   * 「这件事最初是谁在群里提的」：登记时 agent 正在服务某位**真人**在群里发的消息（属主通道的回群登记还在）才有。
+   * 对方回执被喂回会话后，这一轮的输出就发回群里 @ 他（上下文在群里就聚焦群里，不再只留在 Flowship）；
+   * 没有（任务是在 Flowship 里发起的 / 提问人是机器人）= 维持旧行为：吃掉回执、群里不再回。
+   * 只存稳定 ID（open_id）与清洗过的名字；机器人提问人不记（防互 @ 成环）。
+   */
+  replyTo?: OutboundReplyTo;
+}
+
+export interface OutboundReplyTo {
+  /** 最初提问的真人在群里的 open_id（@ 他用） */
+  requesterOpenId: string;
+  /** 清洗过的展示名（@ 标签 / 事件 meta 用） */
+  requesterName: string;
+  /** 提问发生的群：回执也是在这个群里来的才回（不同群不串） */
+  chatId: string;
 }
 
 const REGISTRY_KEY = "__flowshipGroupOutboundRegistryV1__";
@@ -74,6 +90,23 @@ const norm = (s: string): string => s.trim().toLowerCase();
  * 没有一条针对“名字可改”，缓释不成立。不知道 id 就去成员列表查，查不到问用户要。
  */
 export const OUTBOUND_TARGET_RE = /^(ou|cli)_[A-Za-z0-9]+$/;
+
+/**
+ * replyTo 准入：只收真人（`ou_` 开头的 open_id；`cli_` 是应用 / 机器人，一律不记）、有群 id、名字是字符串。
+ * 不合格就当没有——退回旧行为（吃掉回执、群里不再回），绝不因为它脏了而拦住出问登记。
+ */
+const normalizeReplyTo = (
+  r: OutboundReplyTo | undefined,
+): OutboundReplyTo | null => {
+  if (!r || typeof r !== "object") return null;
+  const requesterOpenId =
+    typeof r.requesterOpenId === "string" ? r.requesterOpenId.trim() : "";
+  const chatId = typeof r.chatId === "string" ? r.chatId.trim() : "";
+  if (!/^ou_[A-Za-z0-9]+$/.test(requesterOpenId) || !chatId) return null;
+  const requesterName =
+    typeof r.requesterName === "string" ? r.requesterName.trim().slice(0, 64) : "";
+  return { requesterOpenId, requesterName, chatId };
+};
 
 /**
  * 是否有在途登记（发件人对 + 窗口内，不看要素）。
@@ -132,6 +165,8 @@ export const registerOutboundQuestion = (entry: {
   keywords?: string[];
   about?: string;
   ttlMs?: number;
+  /** 最初在群里提问的真人（见 {@link OutboundQuestionEntry.replyTo}）；缺省 / 不合法 = 不记 */
+  replyTo?: OutboundReplyTo;
 }): { ok: true; replaced?: string } | { ok: false; error: string } => {
   const taskId = entry.taskId.trim();
   const messageId = entry.messageId.trim();
@@ -177,6 +212,9 @@ export const registerOutboundQuestion = (entry: {
       typeof entry.ttlMs === "number" && entry.ttlMs > 0
         ? entry.ttlMs
         : OUTBOUND_QUESTION_TTL_MS,
+    ...(normalizeReplyTo(entry.replyTo)
+      ? { replyTo: normalizeReplyTo(entry.replyTo)! }
+      : {}),
   };
   // 同 messageId 覆盖 + 同任务同群同目标只留最新（一次只等一件事，多问串行）。
   // 空串当通配（和 match/hasPending 一致：未绑定时占位的空 chatId 能命中任何群）——
@@ -252,6 +290,7 @@ export const listLiveOutboundQuestions = (
   pruneExpired(taskId, now, getRegistry().get(taskId) ?? []).map((e) => ({
     ...e,
     keywords: [...e.keywords],
+    ...(e.replyTo ? { replyTo: { ...e.replyTo } } : {}),
   }));
 
 /** 消费即焚（命中后调用；幂等）。烧空就整项删，不留空壳（review 十轮-1） */

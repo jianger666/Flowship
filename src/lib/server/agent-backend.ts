@@ -70,8 +70,14 @@ type CursorPromptInput = Parameters<typeof CursorAgent.prompt>[1];
 /** facade 额外字段，传给 SDK 前会剥掉 */
 export type AgentCreateInput = CursorCreateInput & {
   providerId?: string;
-  /** 正式会话身份；有值才挂系统 customTools。oneshot / 受限答疑不传。 */
+  /** 会话身份；有值才挂系统 customTools（正式会话、属主一次性 agent）。受限答疑不传。 */
   callerToken?: string;
+  /**
+   * 只挂这些名字的 Flowship 系统工具（不传 = 全挂）。属主一次性 agent（task 页还没有会话时的那条通道）传
+   * `ONE_SHOT_SYSTEM_TOOL_NAMES`（one-shot-tools.ts）：定时 / 等待这类不依赖 action 的才有，交卷 / 提问这类不挂。
+   * 浏览器工具与子代理不受它影响。只在有 callerToken 时才起作用。
+   */
+  systemToolNames?: readonly string[];
   /** 只读轮次：两边走各自原生工具开关（cursor tools 白名单 / pi 白名单），写类工具执行层拒掉 */
   readOnly?: boolean;
   /** 任务 id：custom 后端做超预算全量落盘用；Cursor 路径不下发给 SDK，只用来给后台子代理的收尾事件定投递键 */
@@ -87,7 +93,7 @@ export type AgentCreateInput = CursorCreateInput & {
    * 受限 agent 现在只有 read / grep(/ glob) 白名单、没有 shell 工具，所以这个标记目前是纵深防御：
    * 哪天给受限 agent 放开 shell，它就是挡住 `printenv` 拿 PAT 的那道。
    * **新增任何由非属主输入驱动的会话也必须传 true**（显式标记是 fail-open 的，
-   * 没传就默认带 token；之所以不按「无 callerToken」推断，是因为属主 one-shot 同样无 callerToken、却该保留）。
+   * 没传就默认带 token；之所以不按「无 callerToken」推断，是为了不把「有没有身份」和「该不该带 token」绑死：属主 one-shot 也有 callerToken、同样该保留）。
    * ⚠️ 只对 pi provider 有效：Cursor 路径的本地 agent shell 由 SDK 拉起、原样继承 server 的 process.env，
    * SDK 没有 env 选项、也不能临时删进程全局 env（会弄坏属主并行会话）——所以 Cursor 下该标记是空操作，
    * 不下发给 SDK（见 git-token-env.ts 头部）。
@@ -97,6 +103,8 @@ export type AgentCreateInput = CursorCreateInput & {
 export type AgentResumeInput = NonNullable<CursorResumeInput> & {
   providerId?: string;
   callerToken?: string;
+  /** 同 create */
+  systemToolNames?: readonly string[];
   readOnly?: boolean;
   /** 同 create */
   taskId?: string;
@@ -112,6 +120,7 @@ export type AgentPromptInput = NonNullable<CursorPromptInput> & {
 type FacadeExtras = {
   providerId?: string;
   callerToken?: string;
+  systemToolNames?: readonly string[];
   readOnly?: boolean;
   taskId?: string;
   backgroundSubagents?: boolean;
@@ -132,6 +141,7 @@ const stripFacadeExtras = <T extends FacadeExtras>(
 ): {
   providerId?: string;
   callerToken?: string;
+  systemToolNames?: readonly string[];
   readOnly?: boolean;
   taskId?: string;
   backgroundSubagents?: boolean;
@@ -140,6 +150,7 @@ const stripFacadeExtras = <T extends FacadeExtras>(
     T,
     | "providerId"
     | "callerToken"
+    | "systemToolNames"
     | "readOnly"
     | "taskId"
     | "backgroundSubagents"
@@ -149,6 +160,7 @@ const stripFacadeExtras = <T extends FacadeExtras>(
   const {
     providerId,
     callerToken,
+    systemToolNames,
     readOnly,
     taskId,
     backgroundSubagents,
@@ -158,6 +170,7 @@ const stripFacadeExtras = <T extends FacadeExtras>(
   return {
     providerId,
     callerToken,
+    systemToolNames,
     readOnly,
     taskId,
     backgroundSubagents,
@@ -169,7 +182,7 @@ const stripFacadeExtras = <T extends FacadeExtras>(
 /**
  * Cursor 路径：正式会话把系统工具挂进 local.customTools。
  * 同时挂 `subagent`（能指定模型 / effort、能 resume 的子代理）——只在挂系统工具时
- * 才有（oneshot / 受限答疑 / 只读轮次没有 callerToken，也就没有子代理）。
+ * 才有（受限答疑 / 只读轮次没有 callerToken，也就没有子代理；属主一次性 agent 有 callerToken，系统工具收窄到 systemToolNames，子代理照挂）。
  * 挂了它就**同时关掉 SDK 原生 `task`**（加进 `disallowedTools`）：原生 task 本地固定用 composer 系、
  * 选不了模型，留着会让模型顺手选到它、子任务悄悄降级。没挂 `subagent` 的会话不动。
  * `disallowedTools` 不持久化，create / resume 每次都要传——两条路径都经过这里。
@@ -187,6 +200,8 @@ const attachFlowshipTools = <
   callerToken: string | undefined,
   /** chat 会话：开后台运行，收尾事件按 taskId 投递；缺任一项 = 一律前台 */
   background?: { taskId?: string; enabled?: boolean },
+  /** 只挂这些名字的系统工具（不传 = 全挂），见 AgentCreateInput.systemToolNames */
+  systemToolNames?: readonly string[],
 ): { input: T; subagent: SubagentLink | undefined } => {
   if (!callerToken) return { input, subagent: undefined };
   // 本 agent 实例的 `wait` 等待 scope：run 被取消 / 会话被关时（懒重启、错误收尾、超时……）
@@ -225,7 +240,7 @@ const attachFlowshipTools = <
         { [CURSOR_SUBAGENT_TOOL_NAME]: subagent.tool },
         // taskId 给 `wait`：停止 / 插话 / 「跳过等待」按它唤醒（background.taskId 在两条路径都会传）；
         // waitScope：本实例被取消 / 关闭时按它唤醒
-        { taskId: background?.taskId, waitScope },
+        { taskId: background?.taskId, waitScope, ...(systemToolNames ? { systemToolNames } : {}) },
       ),
       disallowedTools: withNativeTaskDisabled(input.disallowedTools),
     },
@@ -327,6 +342,7 @@ export const Agent = {
     const {
       providerId,
       callerToken,
+      systemToolNames,
       readOnly,
       taskId,
       backgroundSubagents,
@@ -346,16 +362,22 @@ export const Agent = {
         ...sanitized,
         ...creds,
         callerToken: effectiveCallerToken,
+        ...(systemToolNames ? { systemToolNames } : {}),
         ...(readOnly ? { readOnly: true } : {}),
         // 仅 pi 路径下发：Cursor 路径摘不掉 token（SDK 继承 server env），见 AgentCreateInput.omitGitToken
         ...(omitGitToken ? { omitGitToken: true } : {}),
         ...(taskId ? { taskId } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
-    const attached = attachFlowshipTools(sanitized, effectiveCallerToken, {
-      taskId,
-      enabled: backgroundSubagents,
-    });
+    const attached = attachFlowshipTools(
+      sanitized,
+      effectiveCallerToken,
+      {
+        taskId,
+        enabled: backgroundSubagents,
+      },
+      systemToolNames,
+    );
     const withTools = await withCursorJsonlStore(attached.input);
     const agent = await CursorAgent.create(withTools);
     return attached.subagent ? attached.subagent.attach(agent) : agent;
@@ -368,6 +390,7 @@ export const Agent = {
     const {
       providerId,
       callerToken,
+      systemToolNames,
       readOnly,
       taskId,
       backgroundSubagents,
@@ -390,15 +413,21 @@ export const Agent = {
         ...sanitized,
         ...creds,
         callerToken: effectiveCallerToken,
+        ...(systemToolNames ? { systemToolNames } : {}),
         ...(readOnly ? { readOnly: true } : {}),
         ...(omitGitToken ? { omitGitToken: true } : {}),
         ...(taskId ? { taskId } : {}),
       } as CustomAgentInput) as unknown as AgentInstance;
     }
-    const attachedResume = attachFlowshipTools(sanitized, effectiveCallerToken, {
-      taskId,
-      enabled: backgroundSubagents,
-    });
+    const attachedResume = attachFlowshipTools(
+      sanitized,
+      effectiveCallerToken,
+      {
+        taskId,
+        enabled: backgroundSubagents,
+      },
+      systemToolNames,
+    );
     const withToolsResume = await withCursorJsonlStore(attachedResume.input);
     const agent = await CursorAgent.resume(agentId, withToolsResume);
     return attachedResume.subagent

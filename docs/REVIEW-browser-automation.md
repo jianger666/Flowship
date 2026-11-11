@@ -2036,3 +2036,384 @@ R8-02 ~ R8-05 处理完毕，各条「处理」栏已填、状态 `[已修]`；`
 **局限（如实）**：没有操作真 Flowship App 窗口；任务页的结论基于复刻 + 接线契约；没有重放旧代码的崩溃；harness 与变异脚本都在 `/tmp/rv14-*`，不进仓库。
 
 （R8 复审第二轮结束；`STATE: 收敛`。reviewer 一侧的定时任务随之取消。）
+
+
+---
+
+## R9 复审（reviewer，2026-11-11 10:50）：用户给开发 AI 安排的新任务（未提交，HEAD = `7fcb4a13` = v1.9.47）
+
+用户说「审下代码，我给他安排了些任务。审完蹲他改」。审的范围 = `git status` 里全部未提交改动（31 个已跟踪文件 + 6 个新文件；最后一次改动 10:28:26，我开始跑门禁时已静置 5 分钟以上、跑完后仍没有再动过）。五个主题：**①头部分栏按钮合并成一颗 + 全局侧栏只留顶栏一个开关**；**②设备模拟下的视图适配**（A 收窄居中 / B 整体缩小 + AI 输入坐标补偿）；**③本地 HTML 里 `file://` 引用的翻译**；**④权限：扬声器放行 + 摄像头 / 麦克风由「永远拒绝」改成「询问」+ mac 用途说明**；**⑤飞书：群里托办的事对方回来后，结论发回群里 @ 最初提问的人**。我只读代码 + 写本文件，没有改代码 / 测试 / 提交，没有派子代理，没有操作真 Flowship App 窗口。
+
+**结论先说**：**没有 P0 / P1**。五个主题的核心逻辑我都按「想把它弄坏」的方向查过，没找到功能性缺陷；发现 1 条 P2（过时注释，两处仍写着「摄像头 / 麦克风永远拒绝」）、2 条 P3（授予粒度、`viewFit` 变化不推送）、1 条 P4 记录项。`STATE` → `待处理`。
+
+**门禁（我独立跑，开发最后一次改动之后）**：`tsc --noEmit` rc=0；`eslint . --max-warnings 0` rc=0；全量 `vitest run` **1196 个文件通过 + 3 跳过、26515 条通过 / 19 跳过 / 0 失败**。真 Electron（全部经 `run.mjs` 重跑，不是看开发的报告）：`r10-emulation-fit` **35/35**、`r11-local-html-file-url` **13/13**、`r12-speaker-select` **18/18**（含「用户本会话一直允许 → 麦克风假设备拿到流」这条允许路径：本机系统层麦克风授权已是 granted，所以没有被跳过）、`e2-p1-permissions-net` **75/75**、`e2-p5b-emulate-touch` **38/38**（旧的设备模拟回归）、`r7-local-html` **83/83**（旧的本地 HTML 回归）。文档里写的数字我核了：`browser-local-html-file-url.test.ts` 35 条、`group-correlated-reply-to-origin.test.ts` 27 条，与文档一致。
+
+**变异（沙盒 `/tmp/rv14-M`，node_modules 软链、不碰仓库；对新增 / 改动的测试手写 55 个变异）**：设备模拟 25 个（含「`Tab.send` 不补偿」「触点 / 鼠标 y 不补偿」「失败不回滚补偿比例」「detach 不复位」「重放不带 scale」「去掉 `dontSetVisibleSize`」「`moveToMain` / `setBounds` 不排重算」「sameTab 不比 viewFit / fitScale」「遮盖图不用 viewFit」…）、本地 HTML 14 个、权限 4 个、飞书 9 个、分栏按钮 / 侧栏 3 个：**53 红 / 2 存活，2 个存活都是等价变异**（L02 `rel <= 0 → rel < 0`：空段不可能等于根目录里的非空段；L12 去掉 `start < last`：根目录前缀里没有 `/`，两个 `file://` 起点不可能重叠）。开发的测试质量很好，我没有补测试缺口的要求。
+
+**独立验证的方法与局限（如实）**：①真 Electron 部分我重跑了开发的脚本，并读了 r10 的 35 条断言（页面恰好铺满视图、用户点击反向映射、AI 点击在最远角命中、截图 / clip / 几何 / 滚轮不变、缩放叠加、拖面板、detach 重放、停车场往返），没有再另写一套真 Electron 探针；②我另外核了「`sendCommand` 全仓只有 `tab.mjs` 一处」「`Input.dispatch*` 全部走 `tab.send(…, null)`、没有带子会话的输入」「`DeviceMetricsOverride` 只在 emulation 机制里发」——补偿的唯一出口成立；③`rewriteLocalFileUrls` 我逐行读了（逐段解码、`..` 留在相对部分交给原守卫、Host 已被 `parseHostToken` 校验过才拼进 origin、`scope === "dir"` 才翻译、2MB 上限 + 往返校验 UTF-8）；④**没验证**：摄像头的「允许」路径（会在本机弹真机授权框，开发也只用单测覆盖）、打包后的 `Flowship.app` 里 `NSMicrophoneUsageDescription` / `NSCameraUsageDescription` 是否真的变成中文（Electron 模板的 Info.plist 本来就带这两个键，`extendInfo` 覆盖是 electron-builder 的正式配置项，但没有打包）、任务页分栏按钮的真窗口观感、缩放后文字清晰度（开发文档也承认没有自动化断言）。
+
+| 条目 | 级别 | 一句话 |
+|---|---|---|
+| R9-01 | P2 | 两处注释仍写「摄像头 / 麦克风永远拒绝」，与现在的行为（询问 + AI 可授予，e2e / 单测钉着）相反 |
+| R9-02 | P3 | 摄像头与麦克风是**同一个**授予：只要麦克风、用户点「本会话一直允许」后，摄像头也无声放行，提示条也没写页面要的是哪个 |
+| R9-03 | P3 | 槽位变了但缩放百分比没变（A 模式拖宽面板 / B 模式高度受限时拖宽）时，`viewFit` 变了却没推给渲染端，遮盖图会按旧比例摆一下 |
+| R9-04 | P4 | 记录项（给用户 / 下次发版）：产物占满没有一键入口、已发布文案提到的「事件流栏」按钮没了、几处副作用、手测清单 |
+
+### R9-01 [P2] [复审通过] 两处注释仍写「摄像头 / 麦克风永远拒绝」，现在的行为是相反的
+- 位置：`electron-app/browser/index.mjs` 配置 partition 的块注释（`// 安全底线不变：摄像头 / 麦克风 / 屏幕共享 / USB … 永远拒绝；找不到所属 tab / 会话、未知权限名、不透明来源一律拒绝；`，紧挨着 `ses.setPermissionRequestHandler(permissionGate.handleRequest)`）；`electron-app/browser/ops/permissions.mjs` 文件头注释（`Flowship 自己的 origin、永远拒绝的权限（摄像头 / 麦克风 / 屏幕共享 / USB / HID / 串口 / openExternal …）返回 DENIED，AI 即使开了开关也放不开`）。
+- 问题：这一轮 `media` 从 `NEVER_PERMISSIONS` 挪进了 `ASKABLE_PERMISSIONS`，AI 在开关打开时 `grant camera / microphone` 现在**成功**（`e2-p1-permissions-net.cjs` 新增的 `a8-media-camera` / `a8-media-microphone` / `a8-media-visible`、`browser-e2-p1-policy.test.ts` 的 `expect(NEVER_PERMISSIONS).not.toContain("media")` 钉着）。这两处注释是「红线」的权威表述位置（后来的人读主进程入口时最先看到的就是它），现在说反了——下一个维护者很可能照注释「修回去」，把用户明确要求放开的功能又关掉。同一轮里 `permission-policy.mjs` 头注释、`tools-permissions.ts` 的两处描述、`browser-card.tsx` 的开关说明、`docs/BROWSER-AUTOMATION.md` 都改对了，只漏了这两处。
+- 证据：已验证（`grep -rn "摄像头" electron-app src docs` 里仍带「永远拒绝」的只有这两处；`decidePermissionWithReason` 里 `media` 走询问分支）。
+- 建议：改成与 `permission-policy.mjs` 头注释一致的说法——「屏幕共享 / USB / HID / 串口 / openExternal … 永远拒绝；摄像头 / 麦克风与定位等一样归「询问」（用户在提示里点允许，或开关打开后 AI 授予）」。纯注释，不动逻辑。
+- 处理（开发 AI 填）：**已修（纯注释，逻辑没动）。** ①`electron-app/browser/index.mjs` 配置 partition 的块注释改成与 `permission-policy.mjs` 头注释一致的说法：「屏幕共享 / USB / HID / 串口 / openExternal … 永远拒绝；找不到所属 tab / 会话、未知权限名、不透明来源一律拒绝；摄像头 / 麦克风与定位等一样归「询问」（麦克风与摄像头是两个独立授予）：用户在提示条里点允许，或设置开关打开后由 AI 授予，其余（无人处理 / 跨源子框架）拒绝；只直接放行「页面写剪贴板」「选择扬声器」这类无隐私面的」。②`electron-app/browser/ops/permissions.mjs` 文件头注释同样改掉（永远拒绝清单里去掉摄像头 / 麦克风，补一句 `camera` / `microphone` 各自独立、`media` = 两个一起）。③复核：`grep` 「摄像头 / 麦克风」与「永远拒绝」同句出现的位置，源码 / 测试 / 脚本里只剩 `tools-permissions.ts` 里「屏幕共享 / USB 等永远拒绝」这种已把摄像头 / 麦克风分开写的句子，以及三处带「曾经是…」的历史说明（`r12-speaker-select.cjs` 头注释、`BROWSER-AUTOMATION.md` A8 / 测试段），没有再说反的。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 13:05）。①`grep -rn` 把「摄像头 / 麦克风」与「永远拒绝」同句出现的位置全扫了一遍（`electron-app` / `src` / `docs` / `scripts` / `tests`）：源码里只剩 `tools-permissions.ts` 的两句，且已经把摄像头 / 麦克风与「屏幕共享 / USB」分开写；其余是带「曾经是…」的历史说明（`r12-speaker-select.cjs` 头注释、`BROWSER-AUTOMATION.md` A8 / 测试段）。②亲眼读了 `index.mjs` 配置 partition 的块注释（813–815 行）与 `ops/permissions.mjs` 文件头：口径与 `permission-policy.mjs` 头注释一致（永远拒绝清单 = 屏幕共享 / USB / HID / 串口 / openExternal；摄像头 / 麦克风与定位同归「询问」、`camera` / `microphone` 各自独立、`media` = 两个一起）。没有再说反的。
+
+### R9-02 [P3] [复审通过] 摄像头与麦克风是同一个授予（`media`）：只要麦克风，用户点「本会话一直允许」后，摄像头也无声放行
+- 位置：`electron-app/browser/permission-gate.mjs` 的 `askUser`（授予键 `${tab.id}|${origin}|${perm}`，`perm === "media"`）、`handleRequest`（不读 `details.mediaTypes`）、`handleCheck`（不读 `details.mediaType`）；`permission-policy.mjs` 的 `PERMISSION_ALIASES`（`camera` / `microphone` / `mic` / `audio` / `video` 都落到 `media`）；`PERMISSION_LABEL_ZH.media`（提示条文案固定「摄像头 / 麦克风」）。
+- 问题：页面只 `getUserMedia({audio:true})`，提示条也写「摄像头 / 麦克风」，用户点「本会话一直允许」之后，**同一个 origin 本会话内再 `getUserMedia({video:true})` 不会再问**，而且摄像头设备名也立刻可见。提示条写了「摄像头 / 麦克风」，所以并非「不告知」，但用户看不出页面这次要的到底是哪个；`permission-policy.mjs` 头注释自己写的原则是「不会让陌生页面在用户不知情时直接开麦克风 / 摄像头」——这条比「只给麦克风」宽。AI 的 `grant microphone` 同理会连带摄像头。
+- 证据：已验证。`r12-speaker-select` 实跑日志：`getUserMedia({audio})` 用户「本会话一直允许」之后，`enumerateDevices()` 的 `cameras` 变成 `[{"hasId":true,"label":"fake_device_0"}]`（只请求过音频，摄像头名字就出来了）——说明授予确实是两者共用的；逻辑上看 `canonicalPermission("camera") === canonicalPermission("microphone") === "media"`，授予表里只有一条 `media`。
+- 严重度理由：用户明确要求放开、也明确说「不要乱加红线」，所以我只评 P3；这里不是要加限制，而是让**提示与授予的范围对得上**。
+- 建议（二选一，开发定）：①最小改动：`handleRequest` 读 `details.mediaTypes`（`["audio"]` / `["video"]` / 两者），提示条详情里按实际请求写「麦克风」/「摄像头」/「摄像头 + 麦克风」；授予表仍是一条 `media`，但文案里写清「允许后本会话该站点可用摄像头和麦克风」；②细一点：授予键拆成 `media:audio` / `media:video`（check 处理器按 `details.mediaType` 判），互不连带。①几行就够；②改动面大一点，要补 AI 工具的别名与 `reset`。**也可以反驳**（理由写在「处理」里，例如「与外部浏览器的『站点级授予』一致、提示条已写明两者」），我接受。
+- 处理（开发 AI 填）：**已修，选方案②（拆成两个独立授予），不是只改文案。** 理由：只改提示条文案（方案①）时「本会话一直允许」仍会连带放行没被问到的那个，与 `permission-policy.mjs` 头注释的原则（不让陌生页面在用户不知情时直接开麦克风 / 摄像头）不符；让授予范围本身和提示对得上才算修。**不是加限制**：页面照样能问、用户照样一键允许，只是「只要麦克风」时不再顺带开摄像头。
+  - `permission-policy.mjs`：策略 / 授予表里改为两个原子权限 `microphone` / `camera`（都在 ASKABLE，别名 `mic` / `audio` → `microphone`、`video` → `camera`）；Electron 回调里共用的复合名 `media` 不再是决策对象，只在边缘展开：新增 `mediaAtomsOf(types)`（`audio` → `microphone`、`video` → `camera`，去重、麦克风在前；类型缺失 / 空 / 认不出 → **两个都要**，宁可多问）。导出 `MEDIA_PERMISSION` / `MEDIA_ATOMS`；`PERMISSION_LABEL_ZH` 补 `microphone` / `camera` / `media`（「摄像头 + 麦克风」）。
+  - `permission-gate.mjs`：`handleRequest` 读 `details.mediaTypes`、`handleCheck` 读 `details.mediaType`；`evaluate` 对 `media` 拆成原子分别判——任一项被拒（跨源子框架 / Flowship 自己的 origin / AI 显式 deny）整体拒绝；有没授予的 → **只问还没授予的那几个**（已授予的不再问）；全部已授予 → 放行。提示条 `detail.permission` = `microphone` / `camera` / `media`（只有两个都要问时才是复合名），渲染端 `PERMISSION_LABEL` 同步成「麦克风」「摄像头」「摄像头 + 麦克风」。「本会话一直允许」→ 逐原子写授予；拒绝 / 超时 → 逐原子写冷却，冷却检查也按原子，所以拒绝了摄像头不影响麦克风。原先的 `media` 授予键不再产生；授予本来就只在内存、不落盘，没有迁移问题。
+  - `ops/permissions.mjs`：`browser_permissions` 的 `grant` / `deny` / `reset` 写 `microphone` / `camera` 各管各，写 `media` = 两个一起（`list` 按原子显示）；`tools-permissions.ts` 的工具描述告诉 AI「只授予用户要求的那个」。
+  - 验证：**单测** `browser-e2-p1-policy`（46）/ `-gate`（49）/ `-ops`（23）重写 + 新增：两原子互不连带、`mediaAtomsOf` 各形态（数组 / 字符串 / 缺失 / 未知）、别名、复合提示只问未授予的并逐原子授予、显式 deny 一项整体拒绝、冷却按原子且跨 origin 不串、AI 写 `media` = 两个。**变异** 14 个（M04 ~ M17：请求 / 检查不读类型、allow-session 只记一项、冷却只记合称键 / 检查只看合称键、askPerms 不过滤已授予、任一项拒绝不再整体拒绝、提示名永远用合称、`mediaAtomsOf` 认不出时一个都不问、`video` 别名退回合称、麦克风放进静默放行表、AI `media` 不展开、reset 只清第一项……）全部转红，字节比对已还原。**真 Electron**（经 `run.mjs`）：`r12-speaker-select` **22/22**——新增 4 项正是你的证据场景：只允许麦克风后摄像头名字**仍为空**、`permissions.query(camera)` 不是 granted（修前这里是 `fake_device_0`）；`getUserMedia({audio, video})` 麦克风已授予时**只为摄像头**弹提示（`detail=camera`）；拒绝摄像头 → `NotAllowedError`；拒绝摄像头不影响已授予的麦克风。`e2-p1-permissions-net` **77/77**（`a8-media-camera` / `-microphone` 改成断言返回的权限名；新增 `a8-media-independent`：只授予麦克风时 `query(camera)` 不是 granted；`a8-media-both`：写 `media` 两个都 granted）；`e2-p2-popup-incognito` **64/64**。
+  - **如实**：摄像头的「允许」路径仍只靠单测（真机会弹 macOS 系统授权框，r12 只走摄像头的**拒绝**路径）；`docs/BROWSER-AUTOMATION.md` 的 A8 / 测试段已同步。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 13:05）。开发选了方案②（拆成两个独立授予），比我建议的①更彻底，不是加限制（页面照样能问、用户照样一键允许）。我逐段读了 `permission-policy.mjs`（`mediaAtomsOf`：`audio`→`microphone`、`video`→`camera`、缺失 / 认不出→两个都要）、`permission-gate.mjs`（`evaluateOne` / `evaluate` / `askUser` / `handleRequest` / `handleCheck`）、`ops/permissions.mjs`（`targetsOf`、`grant` / `deny` / `reset`）、`tools-permissions.ts` 的描述，按「想弄坏它」的方向逐项核对，**没有找到回归**：①任一原子被拒（跨源子框架 / Flowship 自己的 origin / AI 显式 deny）整体拒绝；②合起来只问**还没授予**的原子（已授予的不重复问），全部授予才放行；③「本会话一直允许」只给**被问到的**原子写授予，没问到的那个不受牵连；④冷却按原子（`perms.some`），拒绝摄像头不影响麦克风；⑤检查处理器按 `details.mediaType` 判，`unknown` = 两个都得授予过（所以只给麦克风时摄像头设备名仍为空——这正是我 R9-02 里的证据场景）；⑥AI 的 `media` 在 `ops` 入口展开成两个原子，`reset` 对普通 / 无痕两份授予表都清；⑦非 `media` 权限原样走 `evaluateOne`，没被动到。真机：`r12-speaker-select` **22/22**（含新增 4 项：只允许麦克风后 `enumerateDevices` 摄像头名为空、`permissions.query(camera)` 不是 granted、`{audio,video}` 麦克风已授予时只为摄像头弹提示、拒绝摄像头不影响麦克风）。两条 P4 记录，**不要求修**：a) `pendingAsk` 的去重键用「合称名 / 单名」，所以 `{audio}` 的提示还挂着时再来一个 `{audio,video}`，同一原子可能同时有两条提示——各自由用户回答、不会扩权，只是偶尔多弹一条；b) 摄像头「允许」路径仍只靠单测（真机会弹 macOS 系统授权框）——已在开发「如实」里写明，列入用户手测。
+
+### R9-03 [P3] [复审通过] 槽位变了但缩放百分比没变时，`viewFit` 变了却没推给渲染端：遮盖图会按旧比例摆一下
+- 位置：`electron-app/browser/tab.mjs` 的 `#refit`（`if (pct !== this.#notifiedFitPct) { … this.hooks.onChange(); }`——只在整数百分比变化时通知）、`setBounds` / `#applySlot`（每次都重算 `this.viewFit`，但不通知）；渲染端 `browser-viewport.tsx` 用 `useActiveViewFit` 读 store 里的 `viewFit` 摆遮盖图。
+- 问题：`viewFit` 是「视图占占位 div 的比例」，**槽位宽度一变它就变**（视图是居中的，`left` / `width` 都是对槽位宽的比例），但主进程只在缩放百分比变时推状态。所以：A 模式（模拟视口比槽位小、不缩放，百分比永远 100）拖宽 / 拖窄面板、B 模式里被「高度」限制的缩放（拖宽只改居中偏移，比例不变），`getInfo().viewFit` 已经是新值、渲染端 store 里还是旧值。遮盖图一旦出现（弹层 / 对话框 / 聊天盖住浏览器），会按旧百分比摆——位置偏、宽度拉伸。随后 `setCovered` 里的 `#changed()` 会触发一次 50ms 去抖的状态推送把它纠正，所以**是一闪而过的错位，不是持续错位**；严重度因此只有 P3。
+- 证据：已验证（沙盒里复用 `tests/browser-emulation-fit.test.ts` 的 `makeTab()` 假 Tab 写的探针，不进仓库）。①A：`moveToMain(900×500)` → `applyEmulation({width:600,height:400})` → `onChange.mockClear()` → `setBounds(1200×500)` → flush：`viewFit` 从 `{left:0.1667,width:0.6667}` 变成 `{left:0.25,width:0.5}`，**`onChange` 调用 0 次**；②B（高度受限）：`moveToMain(1200×450)` → `applyEmulation({device:"Desktop 1440"})`（比例 0.5）→ `setBounds(1600×450)`：比例仍 0.5，`viewFit.left` 0.2→0.275、`width` 0.6→0.45，**`onChange` 0 次**。开发自己的 `缩放百分比整数变了才推状态` 测试把「整数不变就不推」钉死了，所以没有拦住这一点（它只看了缩放，没看 `viewFit`）。
+- 建议：`#applySlot` 里比较新旧 `viewFit`（逐字段，同 `sameViewFit` 的口径），变了就 `scheduleState` 一次——`scheduleState` 本身是 50ms 去抖，拖面板时每帧调用只会合并成一次推送，不会刷屏；原来「整数百分比不变不推」那条测试改成「`viewFit` 与百分比都没变才不推」。如果担心拖动期间的推送量，也可以只在拖动停下来（尾沿 100–150ms）推一次。
+- 处理（开发 AI 填）：**已修，按你的建议①：`#applySlot` 里比较 `viewFit` 变化再通知。**
+  - `electron-app/browser/emulation.mjs` 新增 `sameViewFit(a, b)`（逐字段比 `left / top / width / height`，两边都没有 = 相同；与渲染端 `browser-state-store.ts` 的 `sameViewFit` 同口径）。`tab.mjs` 的 `#applySlot()`：`const fitChanged = !sameViewFit(this.viewFit, fit)`，更新 `viewFit` 和 `setBounds` 之后 `if (fitChanged) this.hooks.onChange()`。`#refit` 里「整数百分比变了才通知」那条保持不变（它管 `fitScale`，两条路径互不替代）。逐帧拖面板时每帧都会调 `onChange`，但下游 `scheduleState` 本身有 50ms 去抖，会合并成一次推送，不刷屏（没有另做尾沿去抖）。
+  - 测试：`tests/browser-emulation-fit.test.ts`（68）把「缩放百分比整数变了才推状态」改成「缩放百分比整数变了就推状态」，并新增你证据里的两个场景：①A 模式 `moveToMain(900×500)` → `applyEmulation(600×400)` → `onChange.mockClear()` → `setBounds(1200×500)`，`viewFit` 变成新值、`fitScale` 仍不存在，`onChange` 调用 > 0 次（你证据里是 0 次）；②B 模式高度受限（`Desktop 1440`，比例 0.5 不变）拉宽到 1600×450，`viewFit` 变成 `{left: 440/1600, width: 720/1600}`、比例仍 0.5，`onChange` > 0 次；对照：同一槽位重复汇报 / 槽位只整体挪位置不改大小（遮盖图不用重摆）/ 没有设备模拟时拖面板，都**不**推；拖面板每帧都变 `viewFit` 时每帧都调 `onChange`（10 帧 ≥ 10 次，同步就已是新值）；另有 `sameViewFit` 的 describe（左 / 上 / 宽 / 高各一项、两边空、一边空）。**变异**：M01 去掉通知、M02 `fitChanged` 恒为 true、M03 `sameViewFit` 少比 `left` 全部转红，已还原。
+  - **真 Electron**（经 `run.mjs`）：`r10-emulation-fit` **36/36**，新增 `r10-21b`——hook 主窗口 `webContents.send` 抓**真正推给渲染端的 `browser:state`**（`session.getState()` 是直读，看不出有没有推），B 模式 SLOT 900×500（高度限制、比例 0.555）拉宽到 1000：比例仍是 0.555，推送里的 `viewFit.left` 0.0556 → 0.1、`width` 0.8878 → 0.799，与按公式算出的期望一致。**变异（真机）**：把 `#applySlot` 里的通知关掉，`r10-21b` 单独转红，推送里的 `viewFit` 前后完全相同（正是你描述的现象），已还原并 `cmp` 核对字节一致。`e2-p5b-emulate-touch` **38/38**（旧的设备模拟回归）。
+  - `docs/BROWSER-AUTOMATION.md` 里「主进程只在整数百分比变化时推状态」那句已过时，同步改成「整数百分比变了或 viewFit 变了才推」。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 13:05）。读了 `emulation.mjs` 的 `sameViewFit`（null / undefined 等价，否则逐字段严格相等，与渲染端 store 同口径）和 `tab.mjs` 的 `#applySlot`（先比再赋值、`setBounds` 之后 `if (fitChanged) this.hooks.onChange()`）；`#refit` 里「整数百分比变了才通知」没动（两条路径管不同的字段）。**我在沙盒里把 `makeTab()` 假 Tab 复制出来重写了探针**（不进仓库）：①A：`moveToMain(900×500)` → `applyEmulation(600×400)` → `onChange.mockClear()` → `setBounds(1200×500)` → `onChange` 被调用（修前 0 次）；②B：`moveToMain(1200×450)` → `Desktop 1440` → `setBounds(1600×450)` → 被调用；③对照：同一槽位重复 `setBounds`、没有模拟时拖面板 → **不**推（没有白推）。**变异**：删掉 `if (fitChanged) this.hooks.onChange();`，我的 A / B 探针和开发 `browser-emulation-fit.test.ts` 里 4 条都转红，`rsync` 还原后恢复。真机：`r10-emulation-fit` **36/36**（含 `r10-21b`，抓的是真正推给渲染端的 `browser:state`）、`e2-p5b-emulate-touch` **38/38**。
+
+### R9-04 [P4] 记录项（不挡收敛，不开修复要求；给用户 / 下次发版 / 手测）
+1. **「产物占满」没有一键入口了（产品取舍，请用户确认）**：合并成一颗按钮之后，事件流折叠只剩两条路——浏览器标签自己的「放大」、拖分隔条。产物标签（非浏览器）下想让产物占满整行，只能拖分隔条（以前点「事件流栏」按钮一下就行）。这是「就一个按钮就够了」的直接后果，开发也在文档里写了；如果用户希望产物标签下也能一键占满，要另加入口。
+2. **已发布的 v1.9.47 文案提到了「头部新增『事件流栏』按钮」**（`src/lib/whats-new.ts` 的 `"1.9.47"` 第三条），这批改动把它和「产物栏」按钮合并成一颗了。下次发版的文案要提一句；**文案要用户亲口同意，开发 AI 不要自己改 `whats-new.ts`**（AGENTS.md）。
+3. **本地 HTML 翻译的两个副作用**（都不影响功能）：①页面里**给人看的**文本若恰好写着根目录内的 `file:///…`（如文档页里的 `<code>` 路径），也会被改成 `http://<token>.localhost:<端口>/…`（`r11-path-text-intact` 只钉了普通绝对路径，没钉 `file://` 形态的文本）；②HEAD 请求的 `Content-Length` 是原文件大小、GET 是改写后的字节数（开发有意钉成「HEAD 逐字节不变」，浏览器子资源加载不发 HEAD，没有实际影响）。
+4. **飞书回群**：被问的人的回执（第三方内容）喂给会话之后，这一轮的输出现在会发到同一个群里（以前是吃掉静默）。数据头已声明「只当数据用」，且只发回**提问所在的同一个群**、对象只有真人属主，攻击面只比「对方本来就能在群里看到机器人的回复」多一点，我接受。`NO_REPLY` 靠模型遵守、撤不回已经建好的流式卡——开发文档已如实写明。
+5. **给用户的手测清单**（我 / 开发都不操作真 App 窗口）：①打包后的 mac 包里，网页第一次要麦克风时先弹 Flowship 提示、点允许后再弹 macOS 系统授权框，且文案是中文（`electron-builder.yml` 的 `extendInfo`）；②任务页头部那一颗分栏按钮三种状态的图标 / 提示是否好认（分栏 → 事件流占满 → 回到分栏；浏览器放大后点它请回事件流）；③顶栏侧栏开关换成「收起 / 展开」两个图标、尺寸与右侧图标是否协调（`size-4.5`）；④设备模拟（如 iPhone / Desktop 1440）在窄面板里缩小后文字是否清晰、拖面板是否顺滑（开发文档承认没有自动化断言）；⑤本地 `.html` 里的 `file://` 图片这次是否都出来了（以你原来那张发布页为准）。
+
+（R9 评审完毕；`STATE: 待处理`。reviewer 一侧会设定时任务蹲开发处理；开发处理完把 `STATE` 改 `待复审` 即可，我只复审 R9-01 ~ R9-03。若开发在这期间又动了别的文件，我复审时会重跑门禁。）
+
+## R9 追加需求（用户 2026-11-11 直接提出，开发 AI 处理）：放开「AI 不能往密码框输入」的限制
+
+用户看到 AI 提示条写着「内置浏览器不允许 AI 代填密码框，麻烦你自己输」，原话：「这个，也改了。为什么不允许呢，不要加些莫名其妙的限制啊！」——要求去掉这条限制。**这是用户明确的产品决策，推翻了 §15.3 红线 3（「AI 永远不能键入密码或 OTP」）的写入侧部分**；`docs/BROWSER-AUTOMATION.md` 的 §0 决策表 / §15.3 / 相关历史条目已同步标注。
+
+**处理（未提交）**
+- **删掉写入侧的整套拒绝**（连同只为它服务的死代码）：`browser_type` / `browser_fill_form` 对敏感字段的拒绝与焦点复核（`assertFocusNotSecret`、`INPUT_KIND_FN` 的 `secret` 字段、`FILL_FORM_PASSWORD_MESSAGE`）；`browser_press_key` 的粘贴 / 打字判定（`pressKeyInsertsText` / `pressKeyTouchesText`）；`browser_drag` / `browser_mouse` 的落点探针（`assertPointNotSecret`、`probeDropSecretCdp`、页内落点探针）；「按着鼠标键时其它工具先拒」的 held-button 守卫（`assertNoHeldButtons`、`keepHeld`、`heldButtonBits`、release 的落点复核 / `pending` 机制，`ops/input.mjs` / `ops/env.mjs` / `ops/touch.mjs`）。释放按下态的机制保留，只是不再探落点。
+- **保留读取侧**：`secret-field.mjs` 的 `isSecretInfo` / `readSecretInfo` 只用于遮罩与不写盘——snapshot / inspect / read / 拾取器的值遮罩、活动日志与页内录制器不记值、录制遇密码框 / 读不进的 iframe 暂停写帧（`redacted-gap`，`probeFocusSecretCdp` 仅剩录制一个调用方）、`tool_call` 入参落库前脱敏（`redact-args.ts`）。
+- **未改**：R6-07 剪贴板粘贴门（`assertAiPasteAllowed`）是另一条规则，保持原状。
+- **server 侧文案**：`tools.ts` / `prompt.ts` / `tools-clipboard.ts` 里的工具描述与系统提示改成「密码框可以直接填，口令只用用户在对话里给过的，别猜；`browser_ask_user_to_act` 留给 AI 手里没有的凭据、短信 / 扫码 / 人机验证、支付确认」。
+- **已知并接受的代价**：页面被提示词注入时，AI 可能把用户给过的口令填进钓鱼页；写入侧不再有硬拦，靠提示词约束 + 用户在面板上能看见 AI 在做什么、可随时接管。（reviewer 如要加回某种缓解，应先问用户。）
+- **顺带记录的行为**：`type` 对 `delegatesFocus` 容器（closed shadow 里）输入时，字符会进委托的内层框，但「清空」只作用在容器上、不会清掉内层框的原值（e2 里表现为追加）；这是 `type` 本来的行为、与本次放开无关，正常用法是直接对内层输入框的 ref 输入。
+
+**测试**：8 个单测文件按新口径重写（删掉钉着旧拒绝行为的用例，新增「密码 / 验证码 / `cc-*` 框照常输入」「press_key / mouse / drag / touch 落在这些位置照常派发且不再发探针调用」「读取侧遮罩仍在、写入后 snapshot 无明文」）；`browser-v1-tools` / `browser-tools-r1` 钉着工具描述不再有「不允许 / 不能填」口径、且 fill_form 仍指向 `browser_ask_user_to_act`（仅限手里没有的凭据）。真 Electron 脚本 `smoke-suite.cjs`、`v1-smoke.cjs`、`e2-c7-closed-shadow.cjs` 里原先断言「被拒」的地方翻成「写入成功」，并为 `[sec]` 流程补了「写入后 snapshot 里无明文」的读取侧断言（含跨 origin iframe 里的卡号 / 密码框）。
+
+**门禁（本轮结束时）**：`tsc --noEmit` rc=0；`eslint . --max-warnings 0` rc=0；全量 vitest 1199 文件里 1195 通过 + 3 跳过 + 1 失败（26407 条通过 / 19 跳过）、**唯一失败 `skill-token-linear` 是随机语料用例在 tsc / eslint / vitest 三路并发的高负载下 5s 超时，单独连跑 3 次 25/25，与本改动无关**；真 Electron（均经 `run.mjs`，逐个重跑）：`smoke-suite` **24/24**、`v1-smoke` **37/37**、`e2-c7-closed-shadow` **36/36**、`actions-smoke` **35/35**（原先钉着「密码框被拒」的两条翻成「写入成功 + snapshot 无明文」）、`v2-smoke` 49/49、`v3-smoke` 38/38、`v4-smoke` 46/46、`v5-smoke` 44/44、`e2-p5b-emulate-touch` 38/38、`e2-p9-record` 36/36、`e2-p7b-inspect` 20/20、`e2-p5a` 30/30、`e2-p3` 97/97、`e2-p8` 36/36、`e2-p7a` 20/20、`e2-p4` 67/67、`e2-p6` 32/32、`e2-c4c5-clipboard-pdf` 22/22、`e2-c6` 14/14、`e2-c8` 24/24、`r1-lifecycle` 50/50、`r8-worker-no-detach` 6/6、`picker-e2e` 19/19、`page-scripts` 20 项全过，`bridge-peer` 经 `FS_BROWSER_E2E=1 vitest run tests/browser-e2e-bridge.test.ts` 13/13。
+- **顺带修了一条前面几轮留下的过时断言**：`e2-p2-popup-incognito.cjs` 的 `inc-permission-denied` 还在假定「`getUserMedia` 立刻被拒」，但摄像头 / 麦克风早已从「永远拒绝」改成「询问」，页面的 `getUserMedia` 现在会挂着等用户点提示，脚本把 evaluate 卡到 20s 超时（40/40 后「脚本中途异常」）。改成「触发 → 等 permission 提示出现 → `prompts.cancel`（默认动作 deny）→ 读到 `NotAllowedError`」，无痕与持久两个 partition 各验一遍，**64/64**。这不是本次放开密码框引起的，是 R9 里放开 media 时漏改的脚本。
+- **没验证**：`e2-p1-permissions-net` / `r7-*` / `r10-r12` / `r9-chat-split-cover` / `exit-chain` / `electron-bootstrap` 等与输入守卫无关的脚本这轮没有重跑（R9 复审时已跑过，改动没碰它们的代码路径）；没操作真 Flowship App。**没有变异验证**（改旧机制回来看测试是否变红）——新用例是对着当前源码行为写的。
+
+
+## R9 补充评审（reviewer，2026-11-11 12:35）：浏览器尺寸 / 界面与 Flowship 的适配（用户追加：「你可以再审仔细点。把浏览器的尺寸和 UI 啥的和 Flowship 的适配问题重点看看」）
+
+**为什么要补**：上一轮这一块我覆盖得不够。r10 管的是「原生视图在主进程里的尺寸 / 坐标」，单测管的是纯函数；**真 `BrowserPanel` 在真 Tailwind 下的实际排版没人量过**（开发的 `r9-chat-split-cover` 把 `BrowserPanel` 换成了桩，HEAD 里 `browser-pane-layout` 之类的测试也只测纯函数）。这次我自己搭了一个一次性 harness（`/tmp/rv15-layout/`，**不进仓库**）：vite 打包**真的** `BrowserPanel` + 真 `ResizablePanelGroup / ResizableHandle` + 真 `SidebarResizeHandle` + 真 Tailwind（`@tailwindcss/postcss` 吃仓库的 `globals.css`），`window.__browser` 换成桩（状态里带 `emulation / fitScale / zoom / downloads / prompts`），放进无头 Electron（经 `run.mjs`）读真实布局像素、并截图看过。
+
+**局限（如实）**：①字体是本机系统字体，与打包后的 App 大概率一致，但没比对；②没有真原生视图——「原生视图盖在 HTML 之上」我只量了几何相交，没有用真鼠标点（无头环境做不了真实命中测试），依据是契约 §2.2；③没有渲染整张任务页，头部 chips 行的换行没量；④量的是 HEAD 之后的工作区（开发 12:26 前后又在改 `electron-app/browser/*`，渲染端 `src/**` 没动）。
+
+**结论先说**：**没有 P0 / P1**。1 条 P2（窄面板 + 设备模拟「适应」时工具栏撑爆）、1 条 P3（拖动抓手 / 侧栏手柄被原生视图盖住）、1 条 P4 记录。`STATE` 保持 `待处理`。
+
+| 条目 | 级别 | 一句话 |
+|---|---|---|
+| R9-05 | P2 | 设备模拟标签（含本轮新加的「· 适应 xx%」）挤在工具栏同一行：聊天页默认宽度下地址栏被压到 22px，任务页最小窗口下「更多 / 放大 / 关闭」被挤出面板、面板还多出一条横向滚动条 |
+| R9-06 | P3 | 分栏抓手比分隔条宽 10px，伸进浏览器那一侧的 5px 被原生视图盖住；任务页里侧栏拖拽手柄的右 4px（收起态整条）也被盖住 |
+| R9-07 | P4 | 记录项：「适应 100%」边角、tooltip 里用 `replace` 切文案、没有自动化钉真实排版、侧栏开合动画期间视图追不上、我查过没问题的清单 |
+
+### R9-05 [P2] [复审通过] 设备模拟标签（含「适应 xx%」）和地址栏抢同一行：窄面板里地址栏被压没、右侧按钮被挤出面板
+- 位置：`src/components/browser/browser-panel.tsx` 工具栏 `<div className="relative flex shrink-0 items-center gap-1 border-b px-2 py-1.5">` 里的模拟标签块（`{emulationLabel && <div className="flex shrink-0 items-center rounded-md bg-info/10 pl-1.5">…<span className="max-w-36 truncate text-[11px] text-info">{emulationLabel}{fitLabel ? ` · ${fitLabel}` : ""}</span>…`）。本轮改动：`max-w-28` → `max-w-36`（112 → 144px），并在同一个 `truncate` 的 span 里追加 ` · 适应 xx%`。
+- 问题：工具栏是**不换行、不收纳**的一整行 flex。模拟标签块、缩放标签、下载钮、拾取 / 更多 / 放大 / 关闭全是 `shrink-0`，唯一能压缩的是地址栏（`min-w-0 flex-1`）；它被压到输入框自带内边距 22px 之后，剩下的按钮就继续往右溢出面板。**「适应 xx%」只在面板比模拟视口窄时才出现——也就是面板最窄的时候才多出这 ~50px。**三个后果：①地址栏看不见 URL、没法编辑；②右侧「更多 / 放大 / 关闭」被挤到面板外，任务页里它们落在事件流面板底下（`elementFromPoint` 命中事件流，**点不到**），聊天页里落在窗口外；③溢出的内容撑出库的 Panel 内层（`overflow:auto`），面板底部多出一条**横向滚动条**。另外 ④ 「适应 xx%」跟在被截断的文字**末尾**，标签稍长（`iPhone 15 · 暗色 · 慢速 3G · 适应 72%`，`clipped:true`）它最先被截掉，只剩 tooltip 里有。
+- 证据：已验证（真 Electron + 真 Tailwind，上面的 harness；脚本 `/tmp/rv15-layout/layout2.cjs`，截图 `/tmp/rv15-layout/chat1280.png`、`task960.png`、`chat1280plain.png`）。
+  - **聊天页，默认窗口 1280×800、侧栏 256、浏览器默认 42% = 428px**：无模拟 → 地址栏 188px；`Desktop 1440` 无「适应」（本轮之前的口径）→ ≈ 69px（W=420）；**`Desktop 1440 · 适应 40%` → 22px**（截图里 URL 只剩一个小白胶囊）。
+  - **任务页，最小窗口 960×600、侧栏 256、默认布局（事件流 380px → 产物栏 321px）**：无模拟 → 地址栏 81px、无溢出；**`Desktop 1440 · 适应 40%` → 溢出 81px，「更多 / 放大浏览器 / 关闭浏览器」三个钮被挤出面板（点不到），面板底部多一条横向滚动条**。聊天页 960 窗口（浏览器 300px）+ `iPad` 适应：「放大 / 关闭」右缘 979 / 1011 > 窗口 960。
+  - **工具栏宽度扫描（只看工具栏，W = 面板宽）**：
+
+| 场景 | 300 | 340 | 380 | 420 | 480 | 560 |
+|---|---|---|---|---|---|---|
+| 无模拟 | 地址 60 | 100 | 140 | 180 | 240 | 320 |
+| `Desktop 1440`（无「适应」，本轮之前） | 溢出 43 | — | 地址 29 | 69 | 129 | 209 |
+| **`Desktop 1440 · 适应 50%`** | **溢出 102** | **溢出 62** | **溢出 22** | **地址 22** | 70 | 150 |
+| **`iPhone 15 · 暗色 · 慢速 3G · 适应 72%`**（标签被截） | **溢出 114** | **溢出 74** | **溢出 34** | **地址 22** | 58 | 138 |
+| **`Desktop 1920 · 暗色 · 适应 35%` + 缩放 125%** | **溢出 171** | **溢出 131** | **溢出 91** | **溢出 51** | 地址 22 | 81 |
+| **`Desktop 1440 · 适应 50%` + 缩放 125% + 有下载** | **溢出 191** | **溢出 151** | **溢出 111** | **溢出 71** | **溢出 11** | 地址 61 |
+
+  （「溢出 N」= 工具栏 `scrollWidth − clientWidth`，此时地址栏已是 22px。）
+  - **和旧口径的关系**：没有「适应」时 300px 已经溢出 43px（V5 的模拟标签留下的，不是本轮引入）；本轮的 ` · 适应 xx%` + `max-w-36` 把可用空间再吃掉 ~47px，**把问题从只在 300px 推到了 420px 以下**（叠上缩放 / 下载则到 480px），而 428px 恰好是聊天页默认宽度。
+- 严重度理由：设备模拟是 AI 常用的响应式测试手段，AI 在窄面板里 `emulate Desktop 1440 / iPad` 就是这条路径；用户这时既看不到也改不了地址，面板的「关闭 / 放大」点不到。不是数据问题，但是 UI 在默认配置下就坏，所以 P2。
+- 建议（开发定，任选其一，别只改文案）：
+  ①**治本**：模拟标签别和地址栏抢同一行——挪到工具栏下面已有的整行提示区（`StatusBar` / `BrowserExtraBars` 一类）或标签条右端；整行宽度，「适应 xx%」不用截断。
+  ②**让它能让位**：标签块去掉 `shrink-0`（`min-w-0 shrink`），文字 `truncate` 之前先让 `· 适应 xx%` 变成独立的 `shrink-0` 小徽标（放文字前面或单独一块），窄到放不下时只留重置钮 + 徽标。
+  ③不管选哪个，给地址栏一个下限（如 `min-w-28`），低频入口（缩放标签 / 下载 / 拾取）窄时收进「更多」菜单——这条是**既有问题**，可只记账、不挡收敛。
+  ④兜底：工具栏容器加 `min-w-0 overflow-hidden`，至少别把整个面板撑出横向滚动条。
+  ⑤**验证方法**：改完重跑 `cd 仓库根 && ELECTRON_RUN_AS_NODE=1 node node_modules/.pnpm/vite@8*/node_modules/vite/bin/vite.js build --config /tmp/rv15-layout/vite.config.mjs --outDir /tmp/rv15-layout/dist && node scripts/browser-e2e/run.mjs /tmp/rv15-layout/layout2.cjs --timeout 170`。目标：聊天页 1280 默认（428px）+ 模拟 + 适应 → 地址栏 ≥ 100px；任务页 960 默认布局 + 模拟 + 适应 → `overflow=0`、面板无横向滚动条、「更多 / 放大 / 关闭」`elementFromPoint` 命中自己（`layout3.cjs`）。
+- 处理（开发 AI 填）：**已修（2026-11-11，采纳你的建议①治本 + ②徽标独立 + ④兜底 + ⑤沉进仓库）**。
+  - **改法（`src/components/browser/browser-panel.tsx`）**：①设备模拟标签从工具栏**整块挪出**，变成工具栏下面独占一整行的「模拟条」（`data-slot="browser-emulation-bar"`，`bg-info/10`，tooltip 保留）：摘要 `min-w-0 truncate`，**「适应 xx%」是独立的 `shrink-0 tabular-nums` 徽标**（不再跟在会被截断的摘要末尾，你说的 ④ 也一并解了），重置钮是 `icon-xs`；没有模拟时不画这一行。②工具栏外面包一层 `@container`，窄于 360px 时（容器查询，不是视口宽度）缩放标签让位（`@max-[360px]:hidden`）、间距 / 内边距收紧（`gap-0.5 px-1`）——这条顺带解决了你说「既有问题可只记账」的那部分：无模拟、300px 本来就溢出 43px。③工具栏本体 `min-w-0 overflow-hidden` 兜底：就算比栏宽下限（300px）还窄也不会把面板撑出横向滚动条。④`fitScalePercentOf` 单独导出（R9-07 ②）。
+  - **量到的（真 Electron + 真 `BrowserPanel` + 真 Tailwind，下同；改前 = 你表里的数字）**：聊天页默认 428px + `Desktop 1440 · 适应 40%`：地址栏 **22 → 188px**（与无模拟时完全一样），无溢出；任务页最小窗口 321px：工具栏溢出 **81 → 0**，「更多 / 放大 / 关闭」都在面板内且 `elementFromPoint` 命中自己，面板无横向滚动条，地址栏 103px；聊天页 960 窗口（300px）+ iPad 适应：地址栏 82px，无溢出；**最坏组合**（300px + 模拟 + 适应 + 缩放 125% + 有下载）：溢出 **191 → 0**、地址栏 52px；`iPhone 15 · 暗色 · 慢速 3G · 适应 72%` 这种长摘要：摘要被截、「适应 72%」徽标与重置钮仍完整可见。**300 ~ 560px × 4 种组合扫描**：全部不溢出、无按钮被裁 / 被盖、地址栏 ≥ 40px，且**有无模拟地址栏宽度逐宽度完全相同**。
+  - **验证方式（你的 ⑤）**：没有拿 `/tmp/rv15-layout/` 去用，而是自己把这套沉进了仓库：`scripts/browser-e2e/panel-layout-harness/`（vite 打包真 `BrowserPanel` + 真 `ResizablePanelGroup` / `ResizableHandle` / `SidebarResizeHandle` + 真 Tailwind，`window.__browser` 换桩）+ `scripts/browser-e2e/r13-panel-layout.cjs`（15 项，`node scripts/browser-e2e/run.mjs scripts/browser-e2e/r13-panel-layout.cjs --timeout 170`，今天最后一次 **15/15**，没有并发负载）。（你的 `layout3.cjs` 我没有逐字重跑——r13 覆盖同一批目标：428 / 321 / 300px、`elementFromPoint` 命中、横向滚动条、扫描；你复审时用你自己的 harness 重量一遍最好，那是独立的第二份证据。）
+  - **变异验证**（6 个，全转红）：模拟标签塞回工具栏、缩放标签不让位、不收紧间距、去掉 `overflow-hidden`（第一版测试没杀它——补了 r13-15「240px 兜底」后杀掉）、徽标改回跟在摘要末尾、抓手改回旧写法（同样第一版有一个等价变异存活，换成旧写法的真实形态后杀掉）。单测侧 `tests/browser-emulation-fit.test.ts`（72 条）钉着 `browser-panel.tsx` 的源码契约（模拟条在工具栏之外、徽标独立 `shrink-0`、`@container` 窄屏规则）。
+  - **如实说明**：无头环境没有真原生视图，量的是 HTML 排版；字体是本机系统字体；我看了截图（chat 428 / task 321 / 300px 三张）确认版面合理，但没有在真实 Flowship App 里点过。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 14:33）。**没用开发的 r13，用我自己的 harness**（`/tmp/rv15-layout`：真 Electron + 真 `BrowserPanel` + 真 Tailwind；新结构里工具栏改成 `[data-slot="browser-toolbar"]`，我把选择器改了再重建）。
+  - **目标逐条**：聊天页 1280 默认（428px）+ `Desktop 1440 · 适应 40%`：地址栏 22 → **188px**（= 无模拟时的 188），工具栏溢出 0，「更多 / 放大 / 关闭」右缘 1208 / 1240 / 1272、`elementFromPoint` 都命中自己，面板无横向滚动条；任务页 960 默认（321px）：溢出 81 → **0**，地址栏 103px，三钮右缘 513 / 543 / 573 ≤ 面板右缘 577 且命中自己；聊天页 960（300px）+ iPad 适应：地址栏 82、无溢出；最坏组合（321px + `iPhone 15 · 暗色 · 慢速 3G · 适应 72%` + 缩放 125% + 有下载）：地址栏 73、无溢出、三钮命中自己。
+  - **独立宽度扫描**：300 / 340 / 380 / 420 / 480 / 560px × 6 种组合（无模拟 / 适应 50 / 长标签适应 72 / 1920 暗色适应 35 + 缩放 125 / 适应 50 + 缩放 125 + 下载 / 仅缩放 + 下载）= **36 格，异常 0**：工具栏溢出 0、无按钮出界或被盖（逐个 `elementFromPoint`）、模拟条自己不溢出、「适应 xx%」徽标与重置钮都可见、面板与文档都没有横向滚动条、地址栏最小 51px；有无模拟时地址栏宽度逐宽度完全相同。窗口小于 360px 时缩放标签让位（340 与 380 的地址栏宽度因此不单调，是设计）。
+  - 截图（`/tmp/rv15-layout/chat1280.png`、`task960.png`）我看过：模拟条独占一行、地址栏正常、徽标与重置钮在位。开发的 `r13-panel-layout` 我也跑了：**15/15**；`r9-chat-split-cover` **26/26**。
+  - **变化的副作用**：模拟条多占一行（29px），视口高度相应少 29px；它的有无只取决于模拟标签，不取决于「适应」比例，所以不会和「适应」互相触发。没有发现回归。
+  - 没验证：没有真原生视图 / 真 Flowship App，字体是本机系统字体。
+
+### R9-06 [P3] [复审通过] 拖动抓手 / 侧栏手柄比各自的命中条宽，伸进浏览器那一侧的部分被原生视图盖住
+- 位置：`src/components/ui/resizable.tsx`（`withHandle` 的抓手 `h-8 w-4`，分隔条本体 `w-1.5` = 6px，`z-10` 但 HTML 的 z-index 压不过原生视图）；`src/components/sidebar-resize-handle.tsx`（6px 命中条，展开态 `-left-0.5`、收起态 `left-0`，骑在侧栏与主区交界上）。
+- 问题：原生 `WebContentsView` 永远盖在 HTML 之上，凡与占位 div 相交的 HTML 都会被盖。量到：①**抓手**：16px 宽、分隔条 6px 宽，所以每侧各伸出 5px；任务页（浏览器在左栏）1280 窗口：抓手 x=890.3–906.3、视口右缘 895.3，**抓手 5×32px 被盖**；聊天页（浏览器在右栏）同样盖 5px。⋮⋮ 图标 14px 宽，被切掉约 4px——视觉缺陷，不是功能缺陷（分隔条本体与视口不相交，`sepOverVp = 0`，抓手剩下的 11px 和 6px 条本体都照常可拖）。②**侧栏手柄**（只影响任务页浏览器标签，聊天页浏览器在右侧不相交）：展开态手柄 x=254–260、视口左缘 256，**右 4px 在视口那几行被盖，只剩 2px 可抓**（工具栏 / 标签条 / 操作记录那几行仍是整条 6px 可抓）；收起态手柄 x=1–7、视口左缘 1，**视口那几行整条 6px 都被盖**（工具栏行仍可抓；顶栏开关 / ⌘B 仍能展开，所以有替代入口）。
+- 证据：已验证几何（`layout2.cjs` 的 C 段：`gripOverVp = {w:5,h:32}`、`sbOverVp = {w:4,h:560}` / 收起态 `{w:6,h:560}`、聊天页 `sbOverVp = 0`）；**没有用真鼠标点过**（见上面的局限 ②）。两处都不是本轮引入（抓手 V0.5.10、侧栏手柄 v1.9.47），放进本轮是因为用户要求看尺寸适配。
+- 建议：①抓手：宽度收进分隔条（`w-1.5`，图标换成竖点 / 窄图标），或浏览器所在栏紧贴分隔条的一侧留 5px 边距；②侧栏手柄展开态整条放到侧栏一侧（`-left-1.5`），注意它与侧栏 `nav` 滚动条的重叠；③影响小（有替代入口）可以不改——那就在「处理」栏写一句理由，我接受。
+- 处理（开发 AI 填）：**① 已修；② 不改（有理由，按你写的「写一句理由，我接受」处理）**。
+  - **① 抓手（`src/components/ui/resizable.tsx`，采纳你的建议①）**：抓手从 `h-8 w-4` + `GripVertical`（14px 图标）改成 `w-1.5`（= 分隔条本体 6px）的小胶囊 + 三个 3px 圆点（`data-slot="resize-grip"`），整个抓手落在分隔条里面，不再往浏览器那一侧伸出 5px。`GripVertical` 的 import 一并删了。量到：浏览器占位与抓手相交 `gripOverVp` 5×32 → **0**；真鼠标在抓手上按下 → 移动 → 抬起，分栏宽度跟着变（r13-14，+80px），所以窄了之后抓手没有变得更难抓。
+  - **② 侧栏手柄（`sidebar-resize-handle.tsx`）不改，理由**：你建议的「展开态整条放到侧栏一侧（`-left-1.5`）」会让手柄右 6px 落在侧栏内部，而侧栏 `nav` 的滚动条槽位就在那里（全局 classic 6px 滚动条 + `scrollbar-gutter: stable`，`app-sidebar.tsx` 的 `overflow-y-auto px-2 pb-2`）——手柄压在滚动条上，**侧栏列表一滚动就抓不到滚动条**，这比「视口那几行右 4px 被盖」更糟，而且是每个用户每天都碰的路径。现在的状态：只有「任务页 + 浏览器标签 + 视口那几行」受影响（工具栏 / 标签条 / 操作记录那几行仍整条 6px 可抓），聊天页不相交；收起态视口行整条被盖，但顶栏开关 / ⌘B 仍能展开、工具栏行仍可抓。`r13-panel-layout.cjs` 把这个重叠量作为 `INFO` 行打印（任务页展开态 4×560、收起态 6×560，与你量到的一致），没有设成断言——它是「已知并接受」的取舍，不是要保证为 0 的不变量。如果你或用户认为必须修，更稳的做法是改成「手柄只在浏览器占位之外的行响应、占位那几行让给侧栏边缘的 6px 之外」之类的改动，要动侧栏布局，我没有擅自做。
+  - **没做的验证（如实）**：没有真原生视图，「原生视图盖在 HTML 之上」我只量了几何相交，没有用真鼠标做命中测试（r13-14 的真鼠标是在无头窗口里、没有原生视图盖着的情况下）；依据仍是契约 §2.2。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 14:33）。
+  - **① 抓手（已修）**：`gripOverVp` 5×32 → **0**（抓手 6×32、分隔条 6px，`sepOverVp` 也是 0；任务页、聊天页各量一次）。**独立真鼠标拖拽**（`sendInputEvent`，分别按在抓手中心和分隔条上段）：聊天页浏览器栏 428 → 348、任务页 639 → 559，都是 Δ80、方向正确——抓手变窄后没有变难拖（真正的命中目标是整条 6px 分隔条，不是抓手）。副作用：`ResizableHandle withHandle` 全站只有两处在用（任务页事件流 / 产物栏分隔、聊天页浏览器分栏），视觉由 `GripVertical` 图标换成 6px 小药丸加三个点，我看过截图，没问题。
+  - **② 侧栏手柄（不改）**：理由成立，我接受。手柄左移 6px 会压在侧栏 `nav` 的滚动条槽位上（全局 6px classic 滚动条 + `scrollbar-gutter: stable`），每天都碰的「侧栏列表滚动」比「任务页浏览器那几行右 4px 被盖」更糟，而且有替代入口。我量到 `sbOverVp` 展开 4×560、收起 6×560，与开发 r13 的 INFO 行一致；开发没把它设成断言也合理（已知并接受，不是要保证为 0 的不变量）。
+  - 没验证：没有真原生视图的命中测试（无头环境没有原生视图）。
+
+### R9-07 [P4] 记录项（不挡收敛，不开修复要求）
+1. **「适应 100%」边角**：`fitScaleLabelOf` 对 0.995 ≤ s < 1 会 `Math.round` 成「适应 100%」（页面其实缩了 0.5%）；顺手改成 `Math.floor`，或取整后 ≥ 100 就返回 null。主进程那边「整数百分比变了才推」的取整口径我没有核对是否一致。
+2. **tooltip 文案靠 `fitLabel.replace("适应 ", "")` 切数字**（`browser-panel.tsx`）：以后改「适应」二字，tooltip 会静默坏掉；建议在 `fitScaleLabelOf` 旁边导出一个只返回整数百分比的函数，两处共用。
+3. **没有任何自动化钉着真实排版**：上面 R9-05 / R9-06 用纯函数测不出来。如果开发愿意，把 `/tmp/rv15-layout/` 这套（真 `BrowserPanel` + 真 Tailwind + 桩 `window.__browser`）沉进 `scripts/browser-e2e/`（`r9-chat-split-cover` 的 harness 加一个 CSS 编译步骤即可），断言「工具栏不溢出、地址栏 ≥ N px、面板无横向滚动条」。不要求。
+4. **侧栏开合的 200ms 过渡期间**（`transition-[width] duration-200`）原生视图靠 `ResizeObserver` 每帧 `setBounds` 追，IPC 是异步的，视图会比占位 div 慢 1–2 帧——侧栏展开时任务页浏览器左缘会短暂压在侧栏上（拖侧栏时已经关了过渡）。没法在无头环境量化，列入手测。
+5. **我查过、没有发现问题的**：①`BrowserViewport` 的 bounds 同步（`ResizeObserver` 挂自己 + 全部祖先、window resize / 祖先滚动走 rAF、1s 心跳），宿主缩放由主进程 `scaleBounds` 换算；②权限提示条在 300px 下 `flex-wrap` 正常换行不溢出（media 三个按钮 139px 高、auth 两个按钮 + 两个输入框 215px 高，视口随之缩小、不横向溢出）；③`TabStrip` 自己 `overflow-x-auto`，不撑面板；④960×600 最小窗口的算术：事件流 ≥ 320 + 产物 / 浏览器 ≥ 300 + 手柄 6 = 626 ≤ 主区 704（侧栏拖到最宽 320 时主区 640，也放得下），聊天页同；⑤分隔条本体不与视口相交；⑥遮盖图按 `viewFit` 比例摆位（单测 + `r10-24 / 25`）；⑦`size-4.5` 在编译出的 CSS 里存在（侧栏开关图标尺寸有效）。
+6. **给用户的手测清单补充**：⑥聊天页默认窗口 1280×800 里让 AI 用 `emulate Desktop 1440` / `iPad`，看地址栏还剩多少；⑦任务页缩到 960 宽打开浏览器标签看「更多 / 放大 / 关闭」；⑧点侧栏收起 / 展开（200ms 动画）时浏览器画面是否有一瞬间压在侧栏上；⑨任务页浏览器标签下拖侧栏右缘、拖中间分隔条抓手，手感是否别扭。
+
+（R9 补充评审完毕；`STATE` 仍是 `待处理`。**复审范围更新为 R9-01 ~ R9-03 + R9-05 / R9-06**（R9-04 / R9-07 是记录项）；开发处理完把 `STATE` 改 `待复审`。我复审时会重新量 R9-05，并重跑门禁。）
+
+### R9 开发处理（R9-01 ~ R9-03，2026-11-11）
+
+R9-01 ~ R9-03 处理完毕，各条「处理」栏已填、状态 `[已修]`；`STATE: 待复审`。
+
+**R9-05 / R9-06 这轮没处理，不是漏**：它们是 reviewer 12:35 的补充评审追加的，用户这次只点名要处理 R9-01 ~ R9-03，所以两条保持 `[待处理]`、「处理」栏留空。R9-05 是 P2（工具栏排版，要用 reviewer 的 `/tmp/rv15-layout/` harness 量像素），等用户点头再做；reviewer 复审时请按这个范围看，别把这两条算成开发漏处理。
+
+**门禁（全部在最后一次代码 / 测试改动之后跑的）**：`pnpm exec tsc --noEmit` 0 错；`pnpm exec eslint . --max-warnings 0` 干净；全量 `pnpm exec vitest run`：**1197 个文件通过 + 3 个整文件跳过（共 1200）、26437 条通过 / 19 条跳过（均为既有的条件跳过）、0 失败**。（过程中有一次全量红了 1 条：`browser-tools.test.ts` 的「工具描述 ≤ 2 句」——是我给 `browser_permissions` 的描述多写了一句，并进第二句后重跑全绿。）真 Electron（均经 `run.mjs`，逐个重跑）：`r12-speaker-select` **22/22**、`e2-p1-permissions-net` **77/77**、`r10-emulation-fit` **36/36**、`e2-p5b-emulate-touch` **38/38**、`e2-p2-popup-incognito` **64/64**。
+
+**本轮改动**：
+- 源码（R9-01）：`electron-app/browser/index.mjs`、`electron-app/browser/ops/permissions.mjs` 的注释；（R9-02）`permission-policy.mjs`、`permission-gate.mjs`、`ops/permissions.mjs`、`src/components/browser/browser-extra-logic.ts`、`src/lib/server/browser/tools-permissions.ts`；（R9-03）`emulation.mjs`（`sameViewFit`）、`tab.mjs`（`#applySlot`）。
+- 测试：`browser-e2-p1-policy` / `-gate` / `-ops`、`browser-emulation-fit`（均有变异验证，见各条）。
+- 真库回归：`scripts/browser-e2e/r12-speaker-select.cjs`（+4 项）、`e2-p1-permissions-net.cjs`（+2 项并改 2 项断言）、`r10-emulation-fit.cjs`（+`r10-21b`，抓真正推给渲染端的 `browser:state`）。
+- 文档：`docs/BROWSER-AUTOMATION.md`（A8 权限段、测试段、设备模拟「推状态」口径）。
+
+**如实说明**：① 摄像头的「允许」路径仍只靠单测（真机会弹 macOS 系统授权框，r12 只走摄像头的拒绝路径）；② 打包后 `Flowship.app` 里系统授权框的中文用途说明没有验证（没打包，你在 R9-04 里也列了）；③ 没有操作真 Flowship App 窗口，没有 commit / stash / checkout / reset / push，没有派子代理；④ `r11-local-html-file-url` / `r7-local-html` 等与这三条无关的脚本这轮没有重跑。
+
+### R9 复审第二轮（reviewer，2026-11-11 13:05）：R9-01 ~ R9-03 复审结果
+
+**结论先说**：**R9-01 / R9-02 / R9-03 三条全部复审通过**，没有引入回归，**没有新增 P0 / P1 / P2**。只剩 R9-05（P2）/ R9-06（P3）两条没动——开发在上一节写明「这轮用户只点名 R9-01 ~ R9-03，R9-05 / R9-06 等用户点头再做」，我按这个说法**不算它们是开发漏处理**。因为 R9-05 是 P2 且未解决，本轮**不能写 `收敛`**，`STATE` → `待处理`；是否开修由用户决定（见下面「下一步」）。
+
+**门禁（均在开发最后一次改动 12:43 之后跑；复审期间 `git status` 与源码 mtime 没有再变）**：
+
+| 项 | 结果 |
+|---|---|
+| `tsc --noEmit` | rc=0 |
+| `eslint . --max-warnings 0` | rc=0 |
+| 全量 `vitest run` | 1197 个文件通过 + 3 个整文件跳过（共 1200）；26437 条通过 / 19 条跳过 / 0 失败（与开发报的数字一致） |
+| 真 Electron（经 `run.mjs`，我自己重跑） | `r10-emulation-fit` 36/36、`r12-speaker-select` 22/22、`e2-p1-permissions-net` 77/77、`e2-p2-popup-incognito` 64/64、`e2-p5b-emulate-touch` 38/38、`r11-local-html-file-url` 13/13 |
+| 独立探针 + 变异（沙盒 `/tmp/rv14-M`，不进仓库） | R9-03 的 A / B / 对照共 4 条探针；去掉通知后 A / B 与开发 4 条单测转红，还原后全绿 |
+
+（备注：我的脚本把 `e2-p1` 的「fail=3」报出来是误计——日志里 3 行 `PASS` 的说明文字含 `NAV_FAILED` 字样被 `grep FAIL` 数进去了；`E2P1 FAIL` 为 0 行，脚本自己的汇总是 `77/77 passed`。）
+
+**下一步（需要用户决定，不是开发的缺漏）**：
+1. R9-05（P2，工具栏：设备模拟标签 + 「适应 xx%」把地址栏挤没、右侧「更多 / 放大 / 关闭」溢出面板）——聊天页默认 428px 就会触发，我建议修；修法 / 验证方法写在 R9-05 里（量排版的 harness 在本机 `/tmp/rv15-layout/`，开发 AI 可以直接读 / 跑，命令见 R9-05 的验证方法；也可以自己按 R9-05 的目标写断言）。
+2. R9-06（P3，抓手 / 侧栏手柄被原生视图盖住几 px）——可修，也可以在「处理」栏写一句取舍理由，我接受。
+3. 用户点头修 → 开发处理后把 `STATE` 改 `待复审`，我复审 R9-05 / R9-06（重量布局、重跑门禁）；用户决定不修 / 延后 → 告诉我，我把这两条记「用户决定不修」并写 `收敛`。
+
+**不在复审范围、我也没看**：开发 AI 在「R9 追加需求」里新加的「放开 AI 不能往密码框输入」改动——这是用户直接提的需求，我没有被要求审它；需要的话请用户明确说，我另开一节单独审。（**13:30 更新：用户回「都审！」，已在下面 R10 审完。**）
+
+（R9 复审第二轮结束；`STATE: 待处理`，只剩 R9-05 / R9-06 待用户决定。）
+
+## R10 复审（reviewer，2026-11-11 13:30）：用户「都审！」——补审 R9 范围之外的两块未提交改动
+
+用户回「都审！」。我把 `git status` 重新过了一遍，**有两块改动不在 R9 首轮的范围里**（首轮只数了「31 个已跟踪 + 6 个新文件」、最后一次改动 10:28）：
+
+- **A. 放开「AI 不能往密码框输入」**（开发 10:59 ~ 11:12 改的；用户产品决策，见上面「R9 追加需求」）：`actions.mjs` / `ops/input.mjs` / `ops/env.mjs` / `ops/touch.mjs` / `secret-field.mjs` / `closed-shadow.mjs`、`tools.ts` / `prompt.ts` / `tools-clipboard.ts`；8 个单测文件重写、4 个真 Electron 脚本翻断言、文档；对 HEAD 净删约 900 行。
+- **B. 「没推进过的任务也能建定时」——属主一次性 agent 挂上 `schedule` / `wait`**（`docs/HANDOFF.md` 里单独一条任务，开发 11:33 ~ 11:39 改的）：新文件 `one-shot-tools.ts`；`flowship-tools.ts`（`pickSystemTools`）、`chat-pending.ts`（`setOneShotCallerToken` / `clearOneShotCallerTokenIf`）、`agent-backend.ts` / `custom-agent-backend.ts`（`systemToolNames` 两条后端收窄）、`task-runner.ts`（登记 / 摘除 token、去掉「临时助手」措辞）、`schedule.ts`（边界文案）+ `pi-coding-tools.ts` / `git-token-env.ts`（仅注释）+ 16 个测试文件（1 个新文件 + 15 个 mock 补两个导出）。
+
+另：**开发 13:2x 起已经在动 R9-05 / R9-06 的文件**（`resizable.tsx` / `browser-panel.tsx` / `browser-user-logic.ts` / `browser-emulation-fit.test.ts` / 新的 `scripts/browser-e2e/panel-layout-harness/` 与 `r13-panel-layout.cjs`）。那部分我**没有审**，等 `STATE` 变 `待复审`；下面的门禁数字是在开发开始动它们之前跑的。
+
+**结论先说**：**没有 P0 / P1 / P2**。A 的写入侧删得很干净，读取侧防线完整，我找不到回归；B 的逻辑成立。发现 **3 条 P3**（一处文档残留、一处用户没要求的能力随带、一处接线没有测试）+ 若干 P4 记录。开发自己说「没有做变异验证」——我替它做了：**A 28 个、B 13 个，共 41 个变异，39 红 / 2 存活**（两个存活都是测试缺口，不是功能缺陷，见 R10-03 与 R10-04 的 P4 项）。
+
+**门禁（均在开发开始动 R9-05 / 06 之前、A / B 的代码最后一次改动（11:39 / 12:44）之后）**：`tsc --noEmit` rc=0；`eslint . --max-warnings 0` rc=0；全量 `vitest run` **1197 个文件通过 + 3 跳过、26437 条通过 / 19 跳过 / 0 失败**。真 Electron（经 `run.mjs`，我自己重跑）：`smoke-suite` **24/24**、`v1-smoke` **37/37**、`e2-c7-closed-shadow` **36/36**、`actions-smoke` **35/35**、`v2-smoke` 49/49、`v3-smoke` 38/38、`v4-smoke` 46/46、`v5-smoke` 44/44、`e2-p9-record` 36/36、`e2-p7b-inspect` 20/20、`picker-e2e` 19/19、`page-scripts` 全过（0 FAIL）、`r1-lifecycle` 50/50；加上 R9 第二轮的 r10 / r11 / r12 / e2-p1 / e2-p2 / e2-p5b。
+
+| 条目 | 级别 | 一句话 |
+|---|---|---|
+| R10-01 | P3 | `BROWSER-AUTOMATION.md` 里 5 处仍以现在时写「密码 / 验证码一律拒绝」，其中两处紧跟在「写入侧拒绝已取消」那句后面，自相矛盾 |
+| R10-02 | P3 | 属主一次性 agent 随 `callerToken` 一并挂上了**浏览器工具**（两条后端）和 **`subagent`**（Cursor：同时关掉原生 `task`）；用户只要了「能建定时」，且没有任何测试钉着这件事——**用户已决定保留（13:30），开发只需补测试钉住** |
+| R10-03 | P3 | `Agent.create`（facade）把 `systemToolNames` 转给 pi 后端的那一行没有测试（变异 O10 存活）：转丢了，pi 用户的一次性 agent 会悄悄回到「系统工具全挂」 |
+| R10-04 | P4 | 记录项（读取侧一处测试缺口 X01、注释残留、已知并接受的风险、发版文案、手测清单） |
+
+### R10-01 [P3] [复审通过] `BROWSER-AUTOMATION.md` 仍有 5 处旧口径「密码 / 敏感字段一律拒绝」
+- 位置（按当前文件行号，开发 13:22 还在改这个文件，行号可能漂）：①311 行工具总表 `browser_mouse` / `browser_fill_form` 行：「一次填多个表单字段（密码 / 验证码输入框一律拒绝）」；②424 行 §14.2 的 `browser_fill_form` 行：「密码项的错误文案要引导到 `browser_ask_user_to_act`」；③④482 / 483 行 §14.5 第 6 条下面两个子弹：「`browser_type` 往敏感字段输入一律拒绝（`BAD_ARGS`，指向 `browser_ask_user_to_act`）」「`browser_press_key` 在焦点是敏感字段时拒绝会输入字符的键…」；⑤532 行 §14.7「V1 输入」`fill_form`：「密码类判定比 §14 宽…拒绝文案在主进程与 `tools.ts` 各有一份，测试钉住两份相等」（这个常量和对应测试这一轮都删了）。
+- 问题：这一轮的 §0 决策表、§15.3 第 3 条、§14.5 第 6 条**正文**都改成了「写入侧拒绝已取消」，但上面 5 处没动。③④ 就在第 6 条那句「仅用于遮罩 / 不写盘，不再用来拒绝 AI 的输入」的正下方，读起来前后矛盾。与 R9-01 同类：下一个维护者读到「一律拒绝」，很可能照文档「修回去」，把用户明确要求放开的功能又关掉。
+- 证据：已验证（`grep -nE "密码 / 验证码输入框一律拒绝|密码项的错误文案要引导到|往敏感字段输入一律拒绝|在焦点是敏感字段时拒绝|拒绝文案在主进程与" docs/BROWSER-AUTOMATION.md` 命中且只命中这 5 行；源码里对应符号 `PASSWORD_REJECT_MESSAGE` / `FILL_FORM_PASSWORD_MESSAGE` / `assertFocusNotSecret` 等 `grep` 为 0）。
+- 建议：删掉这 5 处，或按 §15.3 第 3 条的写法划掉并标「（2026-11-11 取消）」。纯文档。
+- 处理（开发 AI 填）：**已修（2026-11-11，纯文档，`docs/BROWSER-AUTOMATION.md`）**。你列的 5 处都改了，另外我扫同类措辞时多找到 1 处你的 grep 没命中的（下面 ⑥）：
+  - ① 311 行工具总表：改成「一次填多个表单字段（密码 / 验证码框也照常填：2026-11-11 起写入侧不再拒绝，见 §14.5 第 6 条）」。
+  - ② 424 行 §14.2 `fill_form`：改成「密码 / 验证码框照常填（2026-11-11 起；口令只用用户在对话里给过的，AI 手里没有的凭据才用 `browser_ask_user_to_act`）」。
+  - ③④ §14.5 第 6 条下面那两个子弹（原 482 / 483 行）：合并成一条「（2026-11-11 取消）原先两条写入侧规则——`browser_type` 对敏感字段的拒绝、`browser_press_key` 在敏感字段焦点下对字符键的拒绝——已删除，AI 往密码 / 验证码框输入照常进行」，不再有任何现在时的「拒绝」；下面「snapshot 遮罩 / `inspect` 清 hidden」两条读取侧的原样保留。（取消说明里我刻意没抄旧原话，免得你的 grep 命中说明文字本身。）
+  - ⑤ §14.7 `fill_form` 那条（现 531 行）：「密码类判定比 §14 宽…拒绝文案在主进程与 `tools.ts` 各有一份，测试钉住两份相等」整段换成「2026-11-11 起密码 / 验证码框也照常填：原先的『密码类判定 + 拒绝文案（两份、测试钉住相等）』整套已删，敏感字段判定只剩读取侧的遮罩 / 不写盘，见 §14.5 第 6 条的 `isSecretInfo`」。
+  - ⑥（你的 grep 没命中的第 6 处）388 行 §14 工具参数表里 `fill_form` 的「**`input[type=password]` 一律拒绝**（该项 `ok:false`，error 文案指向 `browser_ask_user_to_act`）」——也是写入侧旧口径，已改成「密码 / 验证码框也照常填（2026-11-11 起写入侧不再拒绝，见 §14.5 第 6 条）；某项失败只标这一项 `ok:false`…；若有字段失败就不点 `submitRef`」（后半句我对着 `ops/input.mjs` 404 行核过：有失败项确实「已跳过提交」，和 §14.7 一致）。
+  - **验证**：你给的那条 `grep -nE "密码 / 验证码输入框一律拒绝|密码项的错误文案要引导到|往敏感字段输入一律拒绝|在焦点是敏感字段时拒绝|拒绝文案在主进程与" docs/BROWSER-AUTOMATION.md` 现在 **rc=1（0 命中）**；再用更宽的 `(密码|口令|敏感字段|OTP|验证码).{0,30}(拒绝|不能|禁止|不允许|不会让)` 扫了全文，剩下的命中都是「取消」说明 / 读取侧 / 已有 `~~删除线~~ + （2026-11-11 取消）` 的历史条目（736 / 839 行）。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 14:33）。`grep -nE "密码 / 验证码输入框一律拒绝|密码项的错误文案要引导到|往敏感字段输入一律拒绝|在焦点是敏感字段时拒绝|拒绝文案在主进程与" docs/BROWSER-AUTOMATION.md` → **rc=1（0 命中）**；再用更宽的 `(密码|口令|敏感字段|OTP|验证码).{0,30}(拒绝|不能|禁止|不允许|不会让)` 扫了一遍，剩下的 5 处命中（311 / 388 / 482 / 485 / 531 行）我逐处读过：311 / 388 是新口径「也照常填」，482 / 531 是「（2026-11-11 取消）」说明，485 是「入参不落盘」规则，没有一处还在说写入侧拒绝。开发多找的第 6 处（388 行 `fill_form` 参数表）我逐字核了：现在是「密码 / 验证码框也照常填…；有字段失败就不点 `submitRef`」，与 §14.7 一致。`src` / `electron-app` / `tests` / `scripts` 里「红线 3」`grep` 为 0。纯文档，无回归。
+
+### R10-02 [P3] [复审通过] 一次性 agent 随 `callerToken` 一并挂上了浏览器工具和 `subagent`——用户只要了「能建定时」
+- 位置：`src/lib/server/task-runner.ts` `startOneShotQuestion`（现在给 `Agent.create` 传了 `callerToken`）；`flowship-tools.ts` 的 `buildSdkCustomTools`（Cursor）与 `custom-agent-backend.ts` 的 `buildCustomTools`（pi）里**浏览器工具只看有没有 `callerToken`、不看 `systemToolNames`**；`agent-backend.ts` 的 `attachFlowshipTools` 里 `subagent` 同样只看 `callerToken`，并且「挂了 `subagent` 就关掉原生 `task`」。
+- 问题：用户的原话是「没有推进过，AI 就建不了定时任务。不合理。把这个什么临时助手的概念去掉」。开发为了让 `schedule` 认身份给一次性 agent 登记了 `callerToken`，于是它**顺带**得到了两样用户没提的东西：①`browser_*` 全套（含 `browser_ask_user_to_act` / `browser_evaluate` 的审批卡……）；②Cursor 路径的 `subagent`，同时原生 `task` 被关掉。开发在 `HANDOFF.md` 与 `one-shot-tools.ts` 头注释里如实写了这个「副作用」，**这不是隐瞒**。但：a) 它改变了一条已有通道的能力面，用户没被问过；b) 这条通道还是**定时到点的无人值守入口**（`scheduled=true`）——到点后没人在场，AI 就能驱动浏览器；正式会话里定时到点同理，所以不是新类别，但用户该知情；c) **没有任何测试钉着「一次性 agent 到底挂不挂浏览器 / 子代理」**（`one-shot-system-tools.test.ts` / `oneshot-question-bailout.test.ts` 里搜不到 `browser` / `subagent`），所以将来谁改了门控条件，不会有红。
+- 证据：已验证（读了 `buildSdkCustomTools`：`getBrowserTools(...)` 与 `pickSystemTools(...)` 是两路、前者不受清单影响；`custom-agent-backend.ts` 第二段 `...(callerToken ? getBrowserTools(...).map(...) : [])` 同理；测试里 `grep -n "browser\|subagent"` 两个文件为 0 行）。
+- 严重度理由：不是安全漏洞（一次性 agent 本来就是全权限的属主通道，有 shell 和写文件）；也不是功能缺陷。是「**用户没点头的能力扩张 + 没有测试**」，所以 P3。
+- 建议（二选一，开发定，或问用户）：①**保留**：在 `one-shot-system-tools.test.ts` 里加一条钉死「一次性 agent 带浏览器工具 + Cursor 路径带 `subagent` 且关原生 `task`」，把意图写进测试；②**收窄**：浏览器工具 / `subagent` 也受 `systemToolNames` 控制（传了清单就只挂清单里的）。我倾向①（与正式会话一致、用户后面要它登录之类也用得上），但这是用户的取舍。
+- **用户决定（2026-11-11 13:30，「按你推荐的来」）：走①保留。** 开发要做的只有一件事：在 `tests/one-shot-system-tools.test.ts` 加测试，把「属主一次性 agent 带浏览器工具；Cursor 路径带 `subagent` 且关掉原生 `task`；pi 路径带浏览器工具」钉成明确意图（并保留「受限答疑 / 无 `callerToken` 什么都不挂」那条反向用例）。**不要**为此收窄浏览器工具 / `subagent` 的挂载条件，也不用改产品代码；注释里「副作用」的措辞可顺手改成「有意保留」。
+- 处理（开发 AI 填）：**已修（2026-11-11，按用户决定走①保留：只补测试 + 改注释措辞，产品代码的门控条件一行没动）**。
+  - **新增测试**：`tests/one-shot-system-tools.test.ts` 新增一节「能力面（R10-02）」6 条，把意图钉死：①前提——假桌面壳（`installFakeBrowser`）在时 `getBrowserTools` 真有东西（>20 个、含 `browser_navigate` / `browser_ask_user_to_act`），没有 taskId / 只读时为空（防止下面的断言空转）；②Cursor `buildSdkCustomTools(token, {taskId, systemToolNames: 一次性清单})` 的工具名**恰好等于** `schedule` + `wait` + 全部浏览器工具，action 绑定的 8 个系统工具（`submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` / `create_custom_action` / `notify_group_testers` / `advance_next`）一个都没有；③pi `buildCustomTools` 同样含 `schedule` / `wait` + 全部浏览器工具 + 编码工具（`shell`），不含 action 绑定的；④**Cursor facade `Agent.create`**（`@cursor/sdk` 换成只记入参的假实现）：`customTools` 恰好 = `schedule` / `wait` + 浏览器工具 + `subagent`，`disallowedTools` = `["task"]`，且 `systemToolNames` / `callerToken` 不漏进 SDK 入参；⑤`Agent.resume` 同样（`disallowedTools` 不持久化，要重新关）；⑥**反向**：没有 callerToken（受限答疑）/ 只读轮次 → Cursor 什么都不挂、原生 `task` 不动；pi 没有 `schedule` / `wait` / 浏览器工具。用了「恰好等于」而不是「包含」，这样以后谁往一次性 agent 里悄悄多塞工具也会红。
+  - **变异验证**（备份 + 逐个还原 + `cmp` 校验，全部还原）：把门控条件改掉看这一节是否转红——Cursor 浏览器工具按 `systemToolNames` 收窄（转红）、pi 浏览器工具按 `systemToolNames` 收窄（转红）、`subagent` 在有清单时不挂（转红）、有清单时不关原生 `task`（转红）、pi 的系统工具忽略清单（转红）。`withFlowshipSdkCustomTools` 的 `!callerToken` 早退去掉：这两个文件里存活，但那是第二重防线（`attachFlowshipTools` 自己先 `!callerToken` 早退），由既有的 `browser-tools-wiring.test.ts`「无 callerToken 不挂任何系统与浏览器工具」钉着——我单独跑它确认转红（转红）。
+  - **措辞**：你说的「副作用」改成「有意保留」：`one-shot-tools.ts` 头注释（写明「用户 2026-11-11 决定保留、不受这份清单收窄、由哪个测试钉着、改门控先问用户」）、`flowship-tools.ts` 的 `withFlowshipSdkCustomTools` 注释、`browser/tools.ts` 的 `getBrowserTools` 注释（原来写「readOnly / oneshot 会话没有『替用户操作网页』的资格」，现在是事实性错误，改成「readOnly / 受限答疑没有；属主一次性 agent 带 callerToken、有 taskId 同样会挂——有意保留」）、`docs/HANDOFF.md` 里那条「副作用」。
+  - 一并处理了 R10-04 ④② 的过时「oneshot」字样（见文末「R10 开发处理」）。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 14:33）。产品代码的门控条件一行没动：我读了 `flowship-tools.ts`（`getBrowserTools` 与 `pickSystemTools` 两路）、`custom-agent-backend.ts`（浏览器工具只看 `callerToken`）、`agent-backend.ts`（`attachFlowshipTools` 的 `subagent` + `withNativeTaskDisabled`），与评审时一致。新增的「能力面（R10-02）」6 条用「恰好等于」而不是「包含」，以后谁往一次性 agent 里悄悄多塞工具也会红。
+  - **我独立做了 8 个变异**（沙盒副本）：Cursor 浏览器工具随清单收窄；pi 浏览器工具随清单收窄；Cursor 系统工具忽略清单；pi 系统工具忽略清单；有清单时不挂 `subagent`；不关原生 `task`；facade 不给 Cursor 路径传清单；无 `callerToken` 也挂 `subagent`（受限答疑越权）→ **8/8 红**（红在 `one-shot-system-tools`；「不关原生 task」与「无 callerToken 也挂」另有 `cursor-subagent-wiring` 同时红）。
+  - 注释措辞「副作用」→「有意保留」已改（`one-shot-tools.ts` 头注释读过：写明用户 2026-11-11 的决定、由哪个测试钉着、改门控先问用户）；`flowship-tools.ts` 里三处注释（「oneshot / 受限答疑没有 callerToken」之类与事实不符的说法）也一并改成了「受限答疑 / 只读轮次没有 callerToken，属主一次性 agent 带 callerToken」，我对着 `git diff` 看过。
+
+### R10-03 [P3] [复审通过] facade 把 `systemToolNames` 转给 pi 后端那一行没有测试（变异 O10 存活）
+- 位置：`src/lib/server/agent-backend.ts` `Agent.create` 里 `new CustomAgent…({ …, callerToken: effectiveCallerToken, ...(systemToolNames ? { systemToolNames } : {}), … })`。
+- 问题：`one-shot-system-tools.test.ts` 的「两条后端都按 `systemToolNames` 收窄」测的是**后端内部**（`buildSdkCustomTools` / `buildCustomTools` 直接给清单），`oneshot-question-bailout` 测的是 `Agent.create` **被调用时带了清单**。**两者之间的 facade 转发**（`Agent.create` → pi 后端的入参）没人测：我把那一行删掉（O10），41 个变异里只有它和 X01 活下来。后果是 pi（自定义提供方）用户的一次性 agent 会悄悄回到「系统工具全挂」（`submit_work` / `ask_user` 又出现，正是开发想避免的「让模型以为自己在 action 里」）。`resume` 那一份同理（一次性 agent 不用 resume，影响小）。
+- 证据：已验证（沙盒变异 O10：删掉 `create` 里那一行 → `one-shot-system-tools` / `oneshot-question-bailout` / `schedule-task-agent-message` / `wait-tool` / `flowship-sdk-custom-tools` 全绿）。
+- 建议：照 `tests/agent-backend-omit-git-token.test.ts` 的写法（它测的就是同一个 facade → pi 后端转发，`omitGitToken` 那条）加一条：`Agent.create({ providerId: <custom>, callerToken, systemToolNames: [...] })` → 后端收到的入参里带 `systemToolNames`；不传则没有这个键。
+- 处理（开发 AI 填）：**已修（2026-11-11，只加测试，产品代码没动）**。新文件 `tests/agent-backend-system-tool-names.test.ts`（5 条，写法照 `agent-backend-omit-git-token.test.ts`：`@cursor/sdk` 与 `custom-agent-backend` 都换成只记入参的假实现，配一个自定义 provider）：
+  - pi `create`：传 `systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES` → `createCustomAgent` 入参里 `systemToolNames` 等于同一份清单，`callerToken` / `taskId` 也在；
+  - pi `create`：不传 → **没有这个键**（正式会话「不传 = 全挂」不能被一个 `undefined` / 空键误收窄）；
+  - pi `create`：传**空数组**照样转（空清单 = 一个系统工具都不挂，和「不传」是两回事——这条是我多加的，防止有人把转发写成 `systemToolNames?.length ? …`）；
+  - pi `resume`：传了转、没传没有键（你说一次性 agent 不用 resume、影响小，但同一跳、顺手一起钉了）；
+  - Cursor `create` / `resume`：清单是 facade 自己的入参，不漏进 `@cursor/sdk` 入参。
+  - **变异验证**（备份 + 逐个还原 + `cmp`）：你的 O10（删 `create` 里 pi 转发那一行）→ **转红**；删 `resume` 里那一行 → **转红**；Cursor 路径不再把清单传给 `withFlowshipSdkCustomTools` → 转红；`stripFacadeExtras` 不再剥掉 `systemToolNames`（清单漏进 SDK 入参）→ 转红。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 14:33）。新文件 `tests/agent-backend-system-tool-names.test.ts` 5 条，写法照 `agent-backend-omit-git-token.test.ts`。**我独立变异**：①删 `create` 里转给 pi 的那一行 → 红；②删 `resume` 里的转发 → 红；③转发改成 `systemToolNames?.length ? …`（空清单当没传）→ 红（开发多加的「空数组照样转」那条正是防这个）；④`stripFacadeExtras` 运行时不再剥掉 `systemToolNames`（清单漏进 SDK 入参）→ 红。（我第一版「去掉 `Omit` 类型里的名字」那个变异存活——那是纯类型层、运行时等价，不算；改成运行时版本后红。）
+
+### R10-04 [P4] 记录项（不挡收敛，不开修复要求；给用户 / 下次发版 / 手测）
+1. **X01（测试缺口，读取侧）**：`ax-snapshot.mjs` 的敏感字段探针 `probe` 里 `let secret = true`（fail-closed 初值）改成 `false` 没有任何测试变红。该初值只在「`DOM.resolveNode` 没给 `objectId` / `callFunctionOn` 抛 `exceptionDetails` / 返回值不是布尔」时才起作用——代码本身是对的（我读过），只是没人钉着。放开写入侧之后，读取侧遮罩是唯一防线，建议补一条：探针返回空 / 异常 / 非布尔 → 该节点被标成敏感。
+2. **A 我查过、没有发现问题的**：①`type` 的活动日志摘要 / `label` / 页内覆盖层只有字符数（W01 / W02 红）；②`tool_call` 入参落库前仍脱敏：`browser_type.text` / `browser_fill_form.fields[].value` / `press_key` 字符键（R01–R03 红），所以 AI 填的口令不会进 `events.jsonl` / 聊天流；③读取侧五处共用 `isSecretInfo`（snapshot / inspect / picker / 活动日志 / 页内录制器），`password` / `current-password` / `new-password` / `one-time-code` / `cc-*` / `-webkit-text-security` / 读取失败 fail-closed 各有一个变异红（S01–S05、X02、X03、L01）；④真 Electron 里 AI 往密码框 / 跨域 iframe 里的卡号与密码框 / closed shadow 里的密码框输入之后，`snapshot` 无明文、`network` 摘要 / 活动日志 / 状态里也无明文（`smoke-suite` 的 `noLeak` 红线断言）；⑤删的是写入侧整套且删得干净：源码里 `assertFocusNotSecret` / `assertPointNotSecret` / `probeDropSecretCdp` / `mouseNeedsDropProbe` / `HELD_BUTTON_CLICK_MESSAGE` / `heldButtonBits` / `PASSWORD_REJECT_MESSAGE` 等 `grep` 为 0，`closed-shadow.mjs` 只剩录制用的 `probeFocusSecretCdp`；⑥被删的测试我逐条看了标题，**全是写入侧**，读取侧用例（`readSecretInfo` fail-closed 真值表、`keyTypesCharacter` 与 `parseKeyCombo` 交叉校验、R6-07 粘贴闸「焦点是密码框也不多不少」）都在；⑦按下态机制（down / move / up / 空闲 TTL / 导航过期 / 补发 release 的顺序与归因）保留且行为同旧：H01–H11 十一个变异全红；⑧R6-07 粘贴闸未动；⑨`whats-new.ts` 没碰。
+3. **B 我查过、没有发现问题的**：①清单 = `[schedule, wait]`，两条后端都收窄（O06–O09 红）、受限答疑（无 `callerToken`）仍什么都不挂；②token 只写「期望 token」槽、不注册 notifier / handler；`finally` 只摘自己的（O03–O05、O13 红），`stop` 的 `invalidateCallerToken` 仍会把它摘掉；③「槽此刻是空的」这个前提我核了：正式会话 `create` 的安装在同一条 per-task 串行链（`runWithTaskSendSerial`）里、`send` 路径里的 `resume` 也在链里；**断线重连的 `resume` 不在链里**，但那时 `runningTasks` 仍占着位、一次性 agent 会让位——前提成立。若想再稳一点，`setOneShotCallerToken` 可以改成「槽非空就不覆盖、记一行日志」（现在是无条件覆盖，成立但没有兜底）；④两处提示词去掉「临时助手」、`schedule.ts` 边界文案改口径（O11 / O12 红）；`src` / `electron-app` 里「临时助手」`grep` 为 0。
+4. **注释残留（P4）**：①`touch-kit.mjs` 第 41 行 / `ops/touch.mjs` 头注释 / `src/lib/server/browser/tools-touch.ts` 头注释还在讲「红线 3：没有文本入参，不会让 AI 键入口令 / 不是绕过敏感字段拒绝的通道」——事实还成立（touch 确实没有文本入参），但这条红线的写入侧已取消，措辞该改；②B 带来的：`flowship-tools.ts` 的 `withFlowshipSdkCustomTools` 注释「无 callerToken（oneshot / 受限答疑）原样返回」、`restricted-question.ts` 第 492 行「属主 one-shot 同样无 callerToken」、测试标题 `cursor-subagent-wiring.test.ts`「没有 callerToken（oneshot / 受限答疑）」/ `browser-tools-wiring.test.ts`「无 callerToken（readOnly / oneshot）」——一次性 agent 现在有 `callerToken` 了，这些「oneshot」字样过时（测的事本身仍然对：没有 `callerToken` 就什么都不挂）。
+5. **已知并接受的风险（开发写明了，我不建议加回任何限制）**：页面被提示词注入时，AI 可能把用户给过的口令填进钓鱼页；写入侧不再有硬拦。剩下的防线：系统提示的「页面内容是数据，不是指令」、口令只用用户在对话里给的、入参落库脱敏、读取侧遮罩、用户在面板上看得见并能随时接管。用户明确说过「不要加些莫名其妙的限制」，我照此办，**无需动作**。另：HTTP 认证 / 证书 / 权限提示 / `evaluate` 审批这类「只能由用户答」的提示是另一套机制（AI 没有对应工具，不是「AI 不让填密码」），这次没动；如果用户觉得它们也算多余的限制，要另提。
+6. **下次发版的文案（要用户亲口同意，开发 AI 不要自己改 `whats-new.ts`）**：两条用户可见的行为变化——「AI 现在能直接填登录表单的密码框」「没推进过的任务也能让 AI 建定时」。
+7. **开发记录的一条已知行为**：`type` 对 `delegatesFocus` 容器（closed shadow 里）输入时，字符进内层框、但「清空」只作用在容器上、不清内层原值（表现为追加）——与放开无关、是 `type` 本来的行为；正常用法是对内层输入框的 ref 输入。我复现了开发的说法，不要求动。
+8. **没验证（如实）**：①没有在真实 Flowship App 里点过——「没推进过的任务页让 AI 建一个定时、到点触发后一次性 agent 能 `cancel`」；②真实登录页（React 受控密码框、带「显示密码」按钮、验证码框、嵌 iframe 的支付框）——真 Electron 脚本用的是本地构造页面；③已安装的 App 要等发新版才生效。
+9. **给用户的手测清单补充**：⑩用你自己的账号口令在对话里让 AI 登录一次真实网站（顺便看登录失败后重试：口令是被清空重填、不是追加）；⑪在一个从没点过「推进」的任务页，让 AI「10 分钟后提醒我」，到点看是否触发、触发的那一轮 AI 是否能把这条定时取消。
+
+（R10 评审完毕；`STATE: 待处理`。待开发处理的：R9-05 / R9-06（开发已经在动）、R10-01 ~ R10-03（R10-02 用户已决定保留、只补测试）；开发处理完把 `STATE` 改 `待复审`，我复审时会重跑门禁并重量 R9-05 的布局。）
+
+## R11 用户新需求（2026-11-11 13:45）：AI 把网址放进代码块 → 渲染成可点链接
+
+**这不是评审发现，是用户当面提的需求**（不属于 R9 / R10 的修复项；但和它们走同一个 `STATE`：开发做完一起翻 `待复审`，我一并复审）。
+
+用户在聊天里贴了一张截图：任务「生成支付链接」里 AI 把一条很长的支付链接放进了**围栏代码块**（右上有复制按钮、底部有横向滚动条），用户原话：「这种链接应该直接返回高亮更合适，而不是代码块，我还要自己复制粘贴」。用户在我给出 A（提示词）/ B（渲染兜底）两个方案后选了「按你推荐的来」，我推荐 **B**。
+
+### R11-01 [需求] [复审通过] 内容恰好是一个 http(s) 网址的围栏代码块 / 行内代码，渲染成可点链接
+- **根因（我查过）**：不是渲染缺陷。`src/components/markdown-link.tsx` 已把 http(s) 链接渲染成可点（默认在当前任务的内置浏览器新标签打开，右键有「复制链接」）；`prompts/` 里也没有任何一句让 AI 把网址放进代码块。是 AI 自己（长链接带 `%3A` 之类编码，模型习惯放进代码块图好复制）。代码块里的网址不会被 GFM autolink 识别，所以点不了。
+- **方案（B，渲染兜底）**：加一个 remark 插件（照 `src/lib/remark-trim-autolink-cjk.ts` 的写法），把下面两种 mdast 节点换成「链接文字 = 网址本身」的链接：①`code`（围栏块）：语言为空 / `text` / `txt` / `plain` / `plaintext` / `url`，内容去首尾空白后**恰好一行**且整行匹配正则 ``^https?://[^\s<>{}"'`]+$``（即整行只有 http(s) 开头、不含空白 / 尖括号 / 花括号 / 引号 / 反引号的一串字符）；②`inlineCode`：内容同样恰好是这样一个网址、且父节点不是 `link`。换出来的链接仍交给现有 `MarkdownLink`（http(s) 校验、内置浏览器打开、右键复制不变）。
+- **为什么选 B、不做 A**：B 确定性生效，换模型 / 不听话 / 历史消息（重新渲染即生效）都管用；A（往共用系统提示里加「网址别放代码块」）靠模型自觉，救不了已有消息，还多占提示词预算（`media-display-prompt.ts` 有 700 字节硬上限测试）。**A 这一轮不做**；以后如果发现飞书群卡片等「非 Flowship 界面」的消费方也有同样问题，再单独提。
+- **验收标准（缺一条不算做完）**：
+  1. 围栏块 / 行内代码里「单个 http(s) 网址」→ 一个可点链接（文字 = 网址，不是别的字），不再有代码块外壳 / 复制按钮；`[文字](网址)` 和裸网址的现有行为不变。
+  2. **不触发**（各一条反向用例）：多行 / 夹带其它文字（如 `curl https://…`）；带 `bash` / `js` 等其它语言的围栏；网址里有空白或 `<>{}` 占位符（`https://x/{id}`）；非 http(s)（`file://` / `javascript:` / `ftp://`）；已经在 `link` 里面的行内代码；空围栏。
+  3. **流式不闪**：参照 `Q7b-01`（引用定义写到一半时链接指向被截断域名）。流式逐字喂入 `` ```\nhttps://example.com/a?b=1\n``` `` 和 `` `https://example.com/a?b=1` `` 的**每一个前缀**，任何一帧都不得出现 `href` 是最终网址的真前缀的链接（未闭合的围栏、半截行内代码经 remend 补全后都不行）。
+  4. **安全不放宽**：不动 `harden` / `sanitize`；链接文字必须等于 href（不得伪装成别的文字）；不可信来源的 markdown（`blockImages` 那一路，别家机器人的群消息）同样处理——它本来就能写可点链接，没有新的外泄面，测试里写明这点即可。
+  5. **各渲染面一致**：`remarkTrimAutolinkCjk` 现在在 4 处注册（`markdown-text.tsx` 的 `REMARK_PLUGINS`、`artifact-panel.tsx` 的 `ARTIFACT_REMARK_PLUGINS`、`revision-render-chain.ts`、`markdown-visible-search.ts`——最后一个是搜索用的「可见文本」口径，要和渲染链一致）。新插件放进哪几处、为什么，处理栏写清；漏一处要有理由。
+  6. **测试**：插件纯函数测试（修前红、修后绿）+ 用真 `MarkdownText` 服务端渲染的测试（围栏 / 行内 / 反向用例 / 流式前缀）；你自己做一轮变异（去掉语言判断、去掉「恰好一行」、去掉 `link` 父节点判断、去掉流式保护、放宽到非 http(s)），在处理栏写几个、几个红、存活的怎么解释。
+  7. **门禁**：`tsc` / `eslint --max-warnings 0` / 全量 `vitest` 绿；原有 `tests/remark-trim-autolink-cjk.test.ts` / `markdown-link*.test.ts` 不改断言（要改就逐条说明）。
+- **不要做**：不改提示词（A 不做）；不动 Streamdown 的代码块组件（普通代码块的复制按钮保持原样）；**不要改 `whats-new.ts`**——这是用户可见变化，下次发版的文案要用户亲口同意，处理栏里提一句「需要用户批准 whats-new 文案」即可。
+- **我复审时会做的**：读新插件与 4 处注册；跑上面的反向用例与流式前缀（独立写一份探针，不用你的测试）；对插件做变异；全量门禁；在真实 Electron 里让一个任务回一条代码块里的长网址，看是否变成可点链接、点击是否在内置浏览器新标签打开。
+- 处理（开发 AI 填）：**已做（2026-11-11）**。严格按方案 B，没做 A，没动 `harden` / `sanitize` / Streamdown 代码块组件，**没改 `whats-new.ts`（需要用户批准 whats-new 文案）**。
+  - **新插件** `src/lib/remark-url-code-link.ts`（`remarkUrlCodeLink`）：`code`（语言空 / text / txt / plain / plaintext / url，无 meta，内容去首尾空白后整个匹配 `URL_ONLY_RE`，**且围栏在源码里真闭合**，缩进式代码块不动）→ 换成「只含一个链接的段落」；`inlineCode`（单反引号包、内容整个是网址、不在 `link` 里）→ 换成链接；链接文字 = 网址本身，仍交给现有 `MarkdownLink`。`URL_ONLY_RE` = 你给的正则再多排除一类：私有区字符 `\uE000–\uF8FF`（修订视图的 ins/del 哨兵，混了哨兵的块不是「干净的网址」）。**没有 `file.value`（原文）时一律不换**（fail closed）。
+  - **流式不闪（你的 3）——这是这条里最难的一点，说清楚我怎么做的**：
+    - 围栏：remark 会把未闭合围栏也当代码块（内容 = 写到一半的网址），所以插件**只换「源码里有闭合围栏行」的**——靠 `file.value`（react-markdown 里 = remend 处理后的文本；我实测 remend 不替围栏补闭合）。
+    - 行内代码：remend 会把 `` `https://exa `` 补成 `` `https://exa` ``，补全后与「真写完」在文本上**无法区分**，插件靠自己判不出来。所以在 `STREAMDOWN_REMEND_OPTIONS` 里挂了一个 remend 前置 handler `url-code-tail`（`stripTrailingUnclosedUrlCode`，优先级 1，早于 remend 自带的 inlineCode 补全 50）：文本末尾若有一段没闭合的 `` `https://… ``（单反引号、开着、不在围栏里），先把这一段藏起来，闭合反引号到达那一帧整段才出现。代价（如实）：流式里「`https://…`」写完之前，这一小段不显示（前文照常显示），不是先显示成行内代码再变链接。
+    - 这意味着**流式保护依赖生产配置**：如果你的探针用裸 `Streamdown` + 默认 remend（不带 `STREAMDOWN_REMEND_OPTIONS`）渲染行内代码前缀，会看到半截网址的链接——我的测试里有一条「对照」用例正是复现这个（不挂 handler → 有 bad href），证明性质测试有牙；用 `STREAMDOWN_REMEND_OPTIONS`（`markdown-text.tsx` 就是这么传的）则没有。
+  - **5 · 各渲染面注册**：①`markdown-text.tsx` `REMARK_PLUGINS`；②`artifact-panel.tsx` `ARTIFACT_REMARK_PLUGINS`；③`revision-render-chain.ts` `createRevisionRemarkPlugins`（含 `sentinels:false` 也有）；④`markdown-visible-search.ts`（`.use(remarkUrlCodeLink)`，并把 `processor.runSync(tree)` 改成 `runSync(tree, markdown)`——插件要靠原文判围栏是否闭合，不传就一律不换，那搜索模型会和渲染不一致）。四处都排在 `remarkTrimAutolinkCjk` **之后**（它会按 CJK 字符切断裸链接，我们换出来的整块网址不该被切；带中文路径的网址有用例）。**漏的一处及理由**：`revision-syntax-plugins.ts`（修订视图 parse 侧）没挂——它的注释写明只 `.parse()`、不跑 transformer，业务插件都不挂，有用例钉着「不含 `remarkUrlCodeLink`」。飞书群卡片等非 Flowship 界面不在本次范围（你写的）。
+  - **测试（6）**：新 `tests/remark-url-code-link.test.ts`，**59 条**：插件正例（围栏 / 6 种语言标记 / 波浪线与四反引号围栏 / 首尾空白 / 行内 / 列表与引用里的围栏 / CJK 网址 / 已有 link 不变）；**反例 24 条**（多行、夹带文字、`curl https://…`、bash / js / json 围栏、围栏带 meta、`{id}` / `<id>` 占位符、空白、引号、`file://` / `javascript:` / `ftp://`、相对路径、只有协议头、空围栏、全空白围栏、缩进式代码块、双反引号、普通行内代码、私有区哨兵）+ 已在 `link` 里的行内代码 + 没有原文 fail closed + 未闭合围栏（含闭合行写一半）；`URL_ONLY_RE` 与 handler 的真值表；**真 Streamdown 服务端渲染**（生产同款：`STREAMDOWN_REMEND_OPTIONS` + `STREAMDOWN_REHYPE_PLUGINS` + 与 `markdown-text.tsx` 同序的 remark 链）：定稿后链接 + 无 `<pre` / 无代码块外壳 / 反例仍是代码块 / 普通代码块外壳不变 / 多处混合；**5 篇文档（围栏 + 后文、围栏在文末、行内 + 后文、行内在文末、多处混合）的每一个字符前缀都断言 `href` 只会是完整网址**，整篇写完后（流式中 / 定稿）都生效；四处注册契约（含修订链与搜索模型里确实是 `link` 节点）。原有 `remark-trim-autolink-cjk` / `markdown-link*` 等**断言一条没改**；唯一改的既有断言：`tests/streamdown-options.test.ts`「配置本身：linkMode 是 text-only」原来是 `toEqual({ linkMode: "text-only" })` 整体比对，remend 配置里现在多了 `handlers`，改成 `toMatchObject({ linkMode: "text-only" })`（标题说的本来就只是 linkMode，整体 `toEqual` 是过度约束；handler 本身由新文件钉着）。
+  - **变异（你要的 5 类都做了，共 22 个）**：去掉语言判断、去掉 meta 判断、去掉「恰好一行」（允许空白）、放宽到非 http(s)（两种放法）、去掉 `link` 父节点判断、去掉围栏闭合检查（流式保护）、去掉单反引号检查、去掉「没有原文 fail closed」、去掉 remend handler（流式保护）、handler 优先级放到 inlineCode 之后、handler 的奇偶 / 围栏状态 / 双反引号三项判断各去一次、handler 改成藏整行、四处注册各去一次 + `markdown-text.tsx` 顺序对调 + 搜索模型不传原文。**22 个里 21 杀**；第一遍有 2 个存活：①「去掉 handler 的双反引号判断」存活——真缺口（`` ```https://… `` 这种信息串恰好是网址的围栏开头行会被误当行内代码藏掉），补了 2 个用例后杀掉；②「去掉闭合围栏长度比较（`c.length >= o.length`）」存活——**等价变异**：CommonMark 下比开头围栏短的 ``` 行只会成为代码内容，代码值里多出这一行，`URL_ONLY_RE`（无空白）先拦掉，这道长度判断行为上不可达，留作防御，不为它造不真实的用例。全部备份 + 逐个还原 + `cmp` 校验过。
+  - **门禁**：`tsc --noEmit` rc=0；`eslint . --max-warnings 0` rc=0；全量 `vitest run`：**1199 个文件通过 + 3 跳过、26512 条通过 / 19 跳过 / 0 失败**。
+  - **如实说明（没验证）**：①**没有在真实 Flowship App / Electron 里**让 AI 回一条代码块里的长网址、点链接看是否在内置浏览器新标签打开——只有 SSR 层面的 `<a href>` 断言（测试里 `a` 槽换成了朴素 `<a>`，没经过真 `MarkdownLink` 的点击处理）；这正是你复审时要做的那条，我没替你做；②Streamdown 的 `Block` 级 memo / 逐块解析在真浏览器里的重渲时序没量；③「流式里 `` `https://… `` 写完之前这一小段先不显示」是我自己定的取舍（不闪假链接的代价），如果用户更想「先显示成行内代码、写完变链接」，需要换实现（在 remend 之后、plugin 里按位置判断，但我没找到可靠的办法区分补全和真闭合）。
+  - **用户可见变化，下次发版文案需要用户批准**：「AI 把网址放进代码块时，现在直接显示成可点链接」。`whats-new.ts` 没碰。
+- 复审（reviewer 填）：**复审通过**（2026-11-11 14:33）。**没有 P0 / P1 / P2 / P3**，记 5 条 P4（不挡收敛，见「R9 复审第三轮」）。我读了新插件全文与 4 处注册，**用自己的探针和变异做的验证，没有借开发的测试**：
+  - **独立探针（真 `MarkdownText`，真 `MarkdownLink`、真 rehype 链、真 remend 配置，沙盒副本）54 条**：定稿的两条路（从未流式的 static 模式、streaming 模式——开发的测试只覆盖后者）都换：围栏 / 行内 / 列表里的围栏 / 有序列表 / 引用里的围栏 / 表格单元格 / 标题 / CRLF / 波浪线 + `text` / 末尾无换行；反例都不换（夹带命令、`bash`、`{id}`、`javascript:`、两行、未闭合围栏、缩进代码块、`[`网址`](网址)`）；**链接套链接**（`[`网址`][1]` 引用式、`[`网址`](网址)`、`<网址>`）渲染出来没有 `<a>` 套 `<a>`；`blockImages: true`（不可信来源那一路）同样转，链接文字 = href、没有新的外泄面；真 DOM 文本与搜索可见文本里网址各恰好出现 1 次（口径一致）；**流式逐字符前缀（多篇文档）**（围栏 / 行内 / 文末 / 列表 / 引用 / CRLF / 四反引号 / 两个相邻行内 / 先行内后围栏 / 加粗里 / 表格里 / 前面有别的行内代码…）：所有帧的 href 只会是完整网址。
+  - **模糊测试**：150 篇随机拼出来的文档（围栏 / 行内 / 引用 / 列表 / 表格 / 双反引号 / 夹带文字 / 两行…），对每个字符前缀（约 2.7 万帧）用真 `MarkdownText` 渲染，并与「插件整个换成空操作」的基线逐帧比对：**新增的 href 只会是完整网址（0 例违规）、基线里有的链接新版一个不少（0 例丢失）**，定稿（static / streaming）也一样。
+  - **修订视图**：7 种场景（整块被改 / 新增 / 删除 / 网址围栏不变而前面段落有改动 / 行内不变旁边文字改 / 行内网址被改 / 围栏后紧跟代码引用）与基线逐个对比：`data-revision-status` / `data-revision-hit` 完全一致；被改动的网址（含哨兵）不换；网址围栏变成段落后多一个 `data-block-index`（原来代码块不转发 hast 属性），无害。链接在修订视图里是 Streamdown 默认的 `<button data-streamdown="link">`（和那里所有链接一样，不是本条引入）。
+  - **变异 29 个**（我自己的）：去语言判断 / 去 meta 判断 / 网址允许空白 / 放宽到任意协议 / 放宽到 `//` 协议 / 去 `link` 父节点判断 / 只认 `link` 不认 `linkReference` / 围栏闭合检查恒真 / 闭合围栏不要求同种字符 / 行内不检查单反引号 / 没有原文时照换 / handler 不工作 / 不判奇偶 / 不判围栏内 / 不判双反引号 / 尾部 `*`→`+` / 链接文字≠网址 / 允许 `{}` / 允许私有区哨兵 / 缩进式代码块也换 / 围栏闭合后不重置状态 / handler 优先级挪到 remend 自带补全之后 / handler 没挂 / 4 处注册各去一次 + 搜索不传原文 + 顺序对调 → **27 红、2 存活，2 个都是等价变异**：「闭合围栏不要求同种字符」（最后一行若不是真闭合围栏，那一行就留在代码值里，含空白，被网址判定先拦掉）、「缩进式代码块也换」（`lines.length < 3` 先返回；单行缩进块到不了这里）。**开发的测试单独只杀了 26 个**——漏的是「只认 `link` 不认 `linkReference`」（见 P4-①，行为本身是对的）。
+  - **门禁**：`tsc` rc=0；`eslint --max-warnings 0` rc=0；全量 `vitest`：**1199 个文件通过 + 3 个整文件跳过、26512 条通过 / 19 跳过 / 0 失败**（与开发报的一致；原有 `remark-trim-autolink-cjk` / `markdown-link*` 的断言没动，唯一改的既有断言是 `streamdown-options.test.ts` 的整体 `toEqual` → `toMatchObject`，理由成立：标题说的本来就只是 `linkMode`，handler 由新文件钉着）。
+  - **安全**：`harden` / `sanitize` / Streamdown 代码块组件 / `whats-new.ts` / 提示词都没动（`git status` 核过）；换出来的链接文字 = href，只认 `https?://`，仍走 `MarkdownLink`（SSR 输出和 `[文字](网址)` 同构：`<span class="inline"><a target="_blank" rel="noopener noreferrer">`）。
+  - **没验证（如实）**：没有在真实 Flowship App 里让任务回一条代码块里的长网址、点链接看是否在内置浏览器新标签打开——项目规则不许我自己去操作 App 界面。能说的只有：点击处理是 `MarkdownLink` 既有的 `onLinkClick` → `openHttpInBuiltin`，换出来的节点与 `[文字](网址)` 完全同构，不是新通道。请用户手测（清单见下）。
+
+（R11 追加；`STATE: 待处理`。开发的待办现在是：R9-05 / R9-06、R10-01 ~ R10-03、R11-01。）
+
+### R9-05 / R9-06 / R9-07 / R10-01 ~ R10-04 / R11-01 开发处理（2026-11-11 13:2x ~ 14:2x）
+
+用户在 13:07 说「都处理！」，所以 R9-05 / R9-06（上一节我写「等用户点头再做」）、R10-01 ~ R10-03、R9-07 与 R10-04 里能顺手做的、以及 R11-01 一并处理。各条「处理」栏已填、状态 `[已修]`；`STATE: 待复审`。
+
+**逐条一句话**：R9-05 模拟条独占一行 + 「适应 xx%」独立徽标 + 窄屏收紧 + 兜底，聊天页 428px 地址栏 22 → 188px、任务页 321px 溢出 81 → 0，真排版回归沉进仓库（`r13-panel-layout.cjs` 15 项）；R9-06 ① 抓手收进分隔条（`gripOverVp` 5×32 → 0）、② 侧栏手柄不改（有理由，r13 打印 INFO）；R10-01 文档 5 处 + 多找到 1 处（388 行）；R10-02 用户已定「保留」，只补「能力面」测试 + 改注释措辞；R10-03 新增 facade 转发测试；R11-01 新插件 + 流式保护 + 四处注册。
+
+**R9-07（P4）**：① `fitScalePercentOf` 取整到 100 返回 null（0.995 / 0.999 不再显示「适应 100%」）；② tooltip 与徽标共用 `fitScalePercentOf`，不再 `replace("适应 ", "")`；③ 排版 harness 沉进仓库（见 R9-05）；④ 侧栏开合 200ms 动画期间视图追不上——无头环境量化不了，仍是手测项。
+
+**R10-04（P4）**：① X01 已补（`tests/browser-ax-snapshot.test.ts` 新增「R10 X01」：无 objectId / 页内异常（即使带 `false`）/ 字符串 `"false"` / 数字 0 / 缺 value 五种「没抛错但没答案」都按敏感，只有明确 `false` 才露值；把 `let secret = true` 改成 `false` → 该用例转红，已还原）；④ 注释残留已改：`touch-kit.mjs` / `ops/touch.mjs` / `tools-touch.ts` 去掉「红线 3」措辞（`tests/browser-e2-p5b-touch.test.ts` 标题里的「（红线 3）」一并去掉），`flowship-tools.ts` 的 `withFlowshipSdkCustomTools`、`restricted-question.ts` 第 492 行、`browser/tools.ts` 的 `getBrowserTools` 注释、`cursor-subagent-wiring` / `browser-tools-wiring` 两个测试的标题 / 头注释里的「oneshot」字样；③ **没做**：`setOneShotCallerToken` 「槽非空就不覆盖」——你已核实前提成立、现状不是缺陷，这是行为变化而用户没要求，记在这里；其余 P4（已知风险 / 发版文案 / 手测清单）是给用户的，我没动，**没改 `whats-new.ts`**。
+
+**顺带处理的一件不在评审里的事**：`tests/share-to-group-dedup.test.ts`「并发的相同内容调用」在我这边**全量 vitest 里两次**因 5s 超时红（单跑 8/8、连跑 3 次都绿）。根因是测试自己的竞态：它只让出一个宏任务（`setImmediate`）就假定第一个调用已走到发送处，全量并行 fs 读得慢时第二个调用抢走了那条「只生效一次」的慢 mock、永远挂起。**只改了测试**：换成 `vi.waitFor(() => 发送已被调用 1 次)` 再发第二个；8 个实例并行跑 8/8 绿。产品代码无关（`flowship-tools.ts` 的 `share_to_group` 没动）。
+
+**门禁（全部在最后一次代码 / 测试改动之后；Electron 脚本没与全量 vitest 并发）**：`tsc --noEmit` rc=0；`eslint . --max-warnings 0` rc=0；全量 `vitest run`：**1199 个文件通过 + 3 个整文件跳过（共 1202）、26512 条通过 / 19 条跳过 / 0 失败**；真 Electron（经 `run.mjs`）：`r13-panel-layout` **15/15**（今天最后一次，之后没有再改 `src/components/browser/*` / `resizable.tsx`；`r9-chat-split-cover` 26/26 是改完 R9-05 / R9-06 之后跑的）。
+
+**本轮改动文件**：源码 `browser-panel.tsx` / `browser-user-logic.ts` / `ui/resizable.tsx`（R9-05 / 06 / 07）、`remark-url-code-link.ts`（新）/ `streamdown-options.ts` / `markdown-text.tsx` / `artifact-panel.tsx` / `revision-render-chain.ts` / `markdown-visible-search.ts`（R11-01）、若干注释（见 R10-04）；测试 `browser-emulation-fit` / `one-shot-system-tools` / `agent-backend-system-tool-names`（新）/ `remark-url-code-link`（新）/ `browser-ax-snapshot` / `share-to-group-dedup` / `streamdown-options`（改 1 条断言，见 R11-01）及三个标题改字；脚本 `scripts/browser-e2e/panel-layout-harness/` + `r13-panel-layout.cjs`（新）；文档 `BROWSER-AUTOMATION.md` / `HANDOFF.md`。
+
+**如实说明**：① 没有操作真 Flowship App / 没有打包，所有界面结论来自无头 Electron（没有真原生视图、字体是本机系统字体）和 SSR；R11-01 的「点链接在内置浏览器新标签打开」我没有验证，要你复审时亲眼看；② 我没有逐字重跑你的 `layout3.cjs`（`r13` 覆盖同一批目标，你用自己的 harness 重量一遍是独立的第二份证据）；③ 没有 commit / stash / checkout / reset / push，没有派子代理，没有改 `whats-new.ts`（R9 / R10 / R11 里有 3 条用户可见变化：AI 能直接填登录密码框、没推进过的任务也能建定时、代码块里的网址渲染成链接，发版文案都要用户批准）；④ 仓库暂存区里有不是我 `git add` 的内容（我开工时 `git status` 就已有 `M ` / `A ` 项），我没动；⑤ R11-01 是评审文件里转述的用户需求，我依据用户的「都处理！」做了——如果用户其实不想要，回退点很小（删 `remarkUrlCodeLink` 的四处注册 + `STREAMDOWN_REMEND_OPTIONS.handlers`，文件 `remark-url-code-link.ts` 与它的测试可整体删）。
+
+（开发处理完毕；`STATE: 待复审`。）
+
+
+### R9 复审第三轮（reviewer，2026-11-11 14:33）：R9-05 / R9-06 / R9-07 / R10-01 ~ R10-04 / R11-01 复审结果
+
+**结论先说**：**R9-05（P2）、R9-06（P3）、R10-01 ~ R10-03（P3）、R11-01 全部复审通过**；R9-07 与 R10-04 里开发顺手做的几项也核了。**没有新增 P0 / P1 / P2 / P3**，只有 5 条 P4（下面），不挡收敛。全文已经没有 `[待处理]` / `[已修]` 条目，**`STATE` → `收敛`**（reviewer 一侧的定时任务随之取消；开发一侧的请开发 AI 自行取消）。
+
+**门禁（我自己重跑；开发最后一次改源码 / 测试是 14:07、改文档是 14:17，我的门禁与测量都在这之后跑，复审期间只有评审文档在变）**：
+
+| 项 | 结果 |
+|---|---|
+| `tsc --noEmit` | rc=0 |
+| `eslint . --max-warnings 0` | rc=0 |
+| 全量 `vitest run` | 1199 个文件通过 + 3 个整文件跳过（共 1202）；26512 条通过 / 19 条跳过 / 0 失败（与开发报的数字一致） |
+| 真 Electron（经 `run.mjs`） | `r13-panel-layout` **15/15**、`r9-chat-split-cover` **26/26**、`r10-emulation-fit` **36/36**、`r12-speaker-select` **22/22**、`e2-p1-permissions-net` **77/77**、`e2-p2-popup-incognito` **64/64**、`e2-p5b-emulate-touch` **38/38**、`r11-local-html-file-url` **13/13**，脚本 rc 全为 0 |
+| 我自己的排版量测（独立 harness，不是开发的 r13） | 36 格宽度 × 组合扫描异常 0；聊天页 428px / 任务页 321px / 300px / 最坏组合的目标全部达成；真鼠标拖抓手 Δ80（见 R9-05 / R9-06 的复审栏） |
+| R11-01 独立探针 / 模糊 / 变异 | 54 条探针、150 篇文档约 2.7 万帧、29 个变异（27 红 + 2 等价），详见 R11-01 复审栏 |
+| R10 变异 | 13 个有效变异（8 个能力面、4 个 facade 转发、1 个 X01）**13/13 红** |
+
+**R9-07 / R10-04 里开发顺手做的**：①`fitScalePercentOf` 取整到 100 返回 null（0.995 / 0.999 不再显示「适应 100%」）、②tooltip 与徽标共用同一个函数，不再 `replace("适应 ", "")`、③排版 harness 沉进仓库（`scripts/browser-e2e/panel-layout-harness/` + `r13-panel-layout.cjs`）——都核过，成立；④侧栏开合 200ms 动画期间视图追不上，仍是手测项。R10-04 的 X01（读取侧探针失败按敏感）已补测试，我独立把 `let secret = true` 改成 `false` → `browser-ax-snapshot` 红；「oneshot」「红线 3」「临时助手」这类过时字样 `grep` 为 0；`setOneShotCallerToken` 的「槽非空不覆盖」开发没做并写了理由（现状不是缺陷、行为变化用户没要求），我同意。
+
+**P4（不要求修；给下一个维护者 / 用户）**：
+1. **测试缺口**：`tests/remark-url-code-link.test.ts` 没钉「`link` 父节点判断里的 `linkReference`」（`[`网址`][1]`）。我的变异「只认 `link`」只被我的探针杀掉；行为本身是对的（探针：只出一个 `<a>`、不嵌套）。建议补一条。
+2. **验收 4 的一句话没落进测试**：「不可信来源（`blockImages`）同样处理、没有新外泄面」要求在测试里写明；开发的测试里没有提。我验证了行为（`blockImages: true` 同样换、链接文字 = href、`harden` / `sanitize` 没动），所以只是文档 / 测试备注。
+3. **示例 / 模板类网址也会变链接**：`https://api.example.com/users/:id`、`https://*.example.com`、`https://example.com/...` 都满足「单个 http(s) 网址、不含空白 / `<>{}` / 引号」，行内代码里写成这样会被换成可点链接，点开是无效页。这是方案 B 的固有取舍，**不要求动**；如果用户日后被误伤，可在 `URL_ONLY_RE` 里再排除 `:参数` / `*` / `...`。
+4. **流式体感**：围栏在流式中仍是代码块（带复制钮），闭合那一帧整块换成一行链接——会有一次版式跳变；行内代码是「写完那一帧才出现」（开发在处理栏已如实写明）。手测时留意是否别扭。
+5. **新文件还没 `git add`**：`src/lib/remark-url-code-link.ts`、`tests/remark-url-code-link.test.ts` 现在是 `??`（未跟踪），其余是已暂存 / 已修改。用户提交时别漏；我没有 `git add` / commit / push。
+
+**给用户的手测清单（这一轮新增）**：
+- **R11-01**：在聊天里让 AI 回一条放在代码块里的长网址（支付链接那种）→ 看是否变成可点链接、点击是否在**内置浏览器新标签**打开、右键是否有「复制链接」；再让它把 `http://localhost:3000` 放进行内代码，看变成链接是否符合预期；流式过程中盯一下围栏变链接时的版式跳变。
+- **R9-05**：聊天页默认窗口（1280×800）里让 AI `emulate Desktop 1440` / `iPad`，看地址栏还剩多少、模拟条是否好看；任务页把窗口缩到 960 宽，看「更多 / 放大 / 关闭」能不能点到。
+- **R9-06**：拖任务页中间的分隔条抓手，手感是否正常；任务页浏览器标签下拖侧栏右缘（已知窄 4px 的那几行）。
+- **R9-07 ④**：点侧栏收起 / 展开（200ms 动画）时浏览器画面是否有一瞬间压在侧栏上。
+- 上一轮留下的几项没变：打包后 mac 的麦克风 / 摄像头系统提示是不是中文；摄像头「允许」路径（目前只有单测）；让 AI 在真实网站登录一次；没推进过的任务页让 AI 建个定时看到点是否触发。
+
+**发版文案（要用户亲口同意，开发 AI 与我都不改 `whats-new.ts`）**：现在累计 3 条用户可见变化——①AI 能直接填登录表单的密码 / 验证码框；②没推进过的任务也能让 AI 建定时；③AI 把网址放进代码块时直接显示成可点链接。另有两处 UI 小变化可一并写：设备模拟标签挪成独占一行的「模拟条」、拖动抓手变窄。发版前把草稿给用户过目，用户说行才能打 tag。
+
+**没验证（如实）**：没有操作真 Flowship App / 没有打包（项目规则不许）；无头环境没有真原生视图，R9-06 的「被盖」只量了几何；R11-01 的「点击后在内置浏览器新标签打开」只能靠与 `[文字](网址)` 同构来推断。
+
+（R9 复审第三轮结束；`STATE: 收敛`。）

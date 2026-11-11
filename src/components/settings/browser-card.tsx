@@ -124,7 +124,7 @@ export const BrowserSection = ({
       />
       <SettingRow
         label="允许 AI 授予页面权限"
-        hint="开启后 AI 可以代你对页面请求的权限（定位、通知、读剪贴板等）点允许或拒绝；默认关闭，页面请求权限时由你在面板上决定。摄像头和麦克风永远默认拒绝"
+        hint="开启后 AI 可以代你对页面请求的权限（定位、通知、读剪贴板等）点允许或拒绝；默认关闭，页面请求权限时由你在面板上决定。摄像头和麦克风也一样：网页（如声音 / 视频检测、会议页）第一次请求时会在面板上问你，不会静默打开"
         control={<Switch checked={pagePermissions} onCheckedChange={onPagePermissionsChange} />}
       />
       <SettingRow

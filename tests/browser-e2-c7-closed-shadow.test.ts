@@ -1,8 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- 假 tab / 页面元素与被测 .mjs 无类型声明，any 是刻意的 */
 /**
- * E2·P10 · C7：closed shadow root 里的敏感字段判定补强（closed-shadow.mjs）。
+ * E2·P10 · C7：closed shadow root 里的敏感字段判定补强（closed-shadow.mjs）。**只服务读取侧**：录屏遇到聚焦的敏感输入框就丢帧（`probeFocusSecretCdp`），
+ * 以及 wait_for / read 对 closed shadow 内可见文字的收集。AI 往 closed root 里的密码框键入不受限制，原先「type / press_key / drag 复核 closed 焦点 / 落点」的用例已随之删除。
  *
- * 漏洞背景：页内探针只认 `el.shadowRoot`（open），closed 时 `host.shadowRoot === null`，焦点 / 落点停在 host → 判 safe。
+ * 漏洞背景：页内探针只认 `el.shadowRoot`（open），closed 时 `host.shadowRoot === null`，焦点停在 host → 判 safe（录屏会把 closed 里正在输入的密码框画面写盘）。
  * 这里用 vm 在假元素上**真跑**页内函数（NEXT_FOCUS_OPEN_FN / ROOT_ACTIVE_FN / SECRET_ELEMENT_PROBE_SOURCE …），
  * 用脚本化的假 CDP 复现 `DOM.describeNode` → `DOM.resolveNode` → `Runtime.callFunctionOn` 的穿透链路。真浏览器见 scripts/browser-e2e/e2-c7-closed-shadow.cjs。
  */
@@ -10,18 +11,8 @@ import vm from "node:vm";
 
 import { describe, expect, it } from "vitest";
 
-import * as actions from "../electron-app/browser/actions.mjs";
-import {
-  MAX_SHADOW_DEPTH,
-  closedRootIds,
-  closedShadowTextFromTree,
-  collectClosedShadowText,
-  mergeVerdicts,
-  probeDropSecretCdp,
-  probeFocusSecretCdp,
-} from "../electron-app/browser/closed-shadow.mjs";
+import { MAX_SHADOW_DEPTH, closedRootIds, closedShadowTextFromTree, collectClosedShadowText, probeFocusSecretCdp } from "../electron-app/browser/closed-shadow.mjs";
 import { createHandlers as createReadHandlers } from "../electron-app/browser/ops/read.mjs";
-import { SECRET_PRESS_KEY_MESSAGE, SECRET_DROP_MESSAGE } from "../electron-app/browser/secret-field.mjs";
 
 type El = Record<string, any>;
 
@@ -42,18 +33,17 @@ const PW = () => el("input", { type: "password" });
 const PLAIN = () => el("input", { type: "text" });
 
 /** closed shadow root：host.shadowRoot 仍是 null，只有 CDP（__closed）拿得到 */
-const closedRoot = (opts: { active?: El | null; at?: El | null }) => {
-  const root: El = { __id: backendSeq++, activeElement: opts.active ?? null, elementFromPoint: () => opts.at ?? null };
+const closedRoot = (opts: { active?: El | null }) => {
+  const root: El = { __id: backendSeq++, activeElement: opts.active ?? null };
   return root;
 };
 const hostWith = (root: El, tag = "x-host") => el(tag, {}, { __closed: root });
 /** open shadow root：页内函数能直接穿 */
-const openHostWith = (active: El | null, at?: El | null) =>
-  el("x-open", {}, { shadowRoot: { activeElement: active, elementFromPoint: () => at ?? null } });
+const openHostWith = (active: El | null) => el("x-open", {}, { shadowRoot: { activeElement: active } });
 
 /**
  * 脚本化的假 CDP：对象图在 JS 里，页内函数源码用 vm 真跑。
- * @param doc 页面级 document（activeElement / elementFromPoint）
+ * @param doc 页面级 document（activeElement）
  */
 const makeTab = (doc: El, fail: Partial<Record<string, boolean>> = {}) => {
   const objs = new Map<string, any>();
@@ -113,7 +103,7 @@ const makeTab = (doc: El, fail: Partial<Record<string, boolean>> = {}) => {
   return tab;
 };
 
-describe("closedRootIds / mergeVerdicts（纯函数）", () => {
+describe("closedRootIds（纯函数）", () => {
   it("只挑 closed 的 shadow root；open / 脏数据 / 非整数 id 全忽略", () => {
     expect(
       closedRootIds({
@@ -131,17 +121,6 @@ describe("closedRootIds / mergeVerdicts（纯函数）", () => {
     expect(closedRootIds(undefined)).toEqual([]);
     expect(closedRootIds({ node: {} })).toEqual([]);
     expect(closedRootIds({ node: { shadowRoots: "x" } })).toEqual([]);
-  });
-
-  it("合并只升级不降级：任一 secret → secret；都 safe 才 safe；其余 unknown", () => {
-    expect(mergeVerdicts("safe", "secret")).toBe("secret");
-    expect(mergeVerdicts("secret", "safe")).toBe("secret");
-    expect(mergeVerdicts("secret", "unknown")).toBe("secret");
-    expect(mergeVerdicts("safe", "safe")).toBe("safe");
-    expect(mergeVerdicts("safe", "unknown")).toBe("unknown");
-    expect(mergeVerdicts("unknown", "safe")).toBe("unknown");
-    expect(mergeVerdicts("safe", undefined)).toBe("unknown");
-    expect(mergeVerdicts(undefined, "safe")).toBe("unknown");
   });
 });
 
@@ -212,75 +191,6 @@ describe("probeFocusSecretCdp：焦点在 closed shadow root 里", () => {
       },
     });
     expect(await probeFocusSecretCdp(makeTab({ activeElement: hostWith(closedRoot({ active: hostile })) }), null)).toBe("secret");
-  });
-});
-
-describe("probeDropSecretCdp：拖放落点在 closed shadow root 里", () => {
-  const entry = { backendNodeId: 9, sessionId: null };
-
-  it("落点处 host 压着 closed 里的密码框 → secret；普通框 → safe", async () => {
-    const hostPw = hostWith(closedRoot({ at: PW() }));
-    expect(await probeDropSecretCdp(makeTab({ elementFromPoint: () => hostPw }), entry, 5, 5)).toBe("secret");
-    const hostPlain = hostWith(closedRoot({ at: PLAIN() }));
-    expect(await probeDropSecretCdp(makeTab({ elementFromPoint: () => hostPlain }), entry, 5, 5)).toBe("safe");
-  });
-
-  it("closed 嵌套 closed / open 套 closed", async () => {
-    const nested = hostWith(closedRoot({ at: hostWith(closedRoot({ at: PW() })) }));
-    expect(await probeDropSecretCdp(makeTab({ elementFromPoint: () => nested }), entry, 1, 1)).toBe("secret");
-    const mixed = openHostWith(hostWith(closedRoot({ at: PW() })), undefined);
-    (mixed.shadowRoot as any).elementFromPoint = () => hostWith(closedRoot({ at: PW() }));
-    expect(await probeDropSecretCdp(makeTab({ elementFromPoint: () => mixed }), entry, 1, 1)).toBe("secret");
-  });
-
-  it("落点探不到元素 / CDP 出错 / 层数耗尽 → unknown（与页内探针同口径）", async () => {
-    expect(await probeDropSecretCdp(makeTab({ elementFromPoint: () => null }), entry, 5, 5)).toBe("unknown");
-    const host = hostWith(closedRoot({ at: PLAIN() }));
-    expect(await probeDropSecretCdp(makeTab({ elementFromPoint: () => host }, { "DOM.describeNode": true }), entry, 5, 5)).toBe("unknown");
-    let deep: El = PW();
-    for (let i = 0; i < MAX_SHADOW_DEPTH + 2; i++) deep = hostWith(closedRoot({ at: deep }));
-    expect(await probeDropSecretCdp(makeTab({ elementFromPoint: () => deep }), entry, 5, 5)).toBe("unknown");
-  });
-});
-
-describe("actions 接线：assertFocusNotSecret / drag 落点会调 closed 复核", () => {
-  it("无 ref：页内探针 safe（停在 host）+ CDP 复核 secret → 抛 BAD_ARGS（SECRET_PRESS_KEY_MESSAGE）", async () => {
-    // 页内 ACTIVE_SECRET_PROBE 在 vm 里跑：host.shadowRoot === null → 停在 host → safe；复核再穿 closed 发现密码框
-    const host = hostWith(closedRoot({ active: PW() }));
-    const tab = makeTab({ activeElement: host });
-    const realSend = tab.send;
-    // Runtime.evaluate：returnByValue:false（复核取引用）走假 CDP；returnByValue:true（页内探针）在 vm 里跑表达式
-    tab.send = async (method: string, params: any = {}) => {
-      if (method === "Runtime.evaluate" && params.returnByValue === true) {
-        const ctx = vm.createContext({ window: win, document: { activeElement: host }, getComputedStyle: win.getComputedStyle });
-        return { result: { value: vm.runInContext(params.expression, ctx) } };
-      }
-      return realSend(method, params);
-    };
-    await expect(actions.assertFocusNotSecret(tab, null, undefined)).rejects.toMatchObject({ code: "BAD_ARGS", message: SECRET_PRESS_KEY_MESSAGE });
-    expect(tab.calls).toContain("DOM.describeNode");
-  });
-
-  it("无 ref：closed 里是普通框 → 放行；复核异常 → 拒绝（unknown 文案）", async () => {
-    const mk = (fail: Partial<Record<string, boolean>>, active: El) => {
-      const host = hostWith(closedRoot({ active }));
-      const tab = makeTab({ activeElement: host }, fail);
-      const realSend = tab.send;
-      tab.send = async (method: string, params: any = {}) => {
-        if (method === "Runtime.evaluate" && params.returnByValue === true) {
-          const ctx = vm.createContext({ window: win, document: { activeElement: host }, getComputedStyle: win.getComputedStyle });
-          return { result: { value: vm.runInContext(params.expression, ctx) } };
-        }
-        return realSend(method, params);
-      };
-      return tab;
-    };
-    await expect(actions.assertFocusNotSecret(mk({}, PLAIN()), null, undefined)).resolves.toBeUndefined();
-    await expect(actions.assertFocusNotSecret(mk({ "DOM.describeNode": true }, PLAIN()), null, undefined)).rejects.toMatchObject({ code: "BAD_ARGS" });
-  });
-
-  it("文案钉死：SECRET_DROP_MESSAGE 仍指向 browser_ask_user_to_act（drag 复核复用同一条）", () => {
-    expect(SECRET_DROP_MESSAGE).toContain("browser_ask_user_to_act");
   });
 });
 

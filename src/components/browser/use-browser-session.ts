@@ -12,7 +12,8 @@
 
 import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
 
-import type { BrowserState } from "@/lib/browser-bridge-types";
+import type { BrowserState, ViewFit } from "@/lib/browser-bridge-types";
+import { findActiveTab } from "./browser-status";
 import {
   IDLE_SIGNALS,
   deriveSignals,
@@ -58,6 +59,28 @@ export const useBrowserSession = (taskId: string | null | undefined): BrowserSes
   const state = useSyncExternalStore(subscribe, getSnapshot, () => null);
 
   return useMemo(() => (available ? { available, state } : UNAVAILABLE), [available, state]);
+};
+
+/**
+ * 激活 tab 的 `viewFit`（设备模拟收窄视图后它占占位 div 的比例；没收窄 = null）。
+ * 只给 BrowserViewport 的遮盖占位图用：快照是 store 里那份 tab 对象上的字段，store 对内容没变的 tab 保持引用，
+ * 所以 tabs / recent 再怎么高频推送，这里的快照引用不变、不会重渲。
+ */
+export const useActiveViewFit = (taskId: string | null | undefined): ViewFit | null => {
+  const available = useBrowserAvailable();
+  const active = available && !!taskId;
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      if (!active || !taskId) return () => {};
+      return getBrowserStore().subscribe(taskId, onChange);
+    },
+    [active, taskId],
+  );
+  const getSnapshot = useCallback(
+    () => (active && taskId ? (findActiveTab(getBrowserStore().getState(taskId))?.viewFit ?? null) : null),
+    [active, taskId],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot, () => null);
 };
 
 export interface BrowserSignalsView extends BrowserSignals {

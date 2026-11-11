@@ -80,7 +80,7 @@ import {
 } from "@/lib/subagent-spec";
 
 import { dataRoot } from "./data-root";
-import { flowShipTools, invokeFlowshipTool } from "./flowship-tools";
+import { invokeFlowshipTool, pickSystemTools } from "./flowship-tools";
 import { getBrowserTools } from "./browser/tools";
 import { stripImageBlocks } from "./browser/image-redact";
 import {
@@ -194,8 +194,10 @@ export interface CustomAgentInput {
   local?: { cwd?: string; settingSources?: unknown; customTools?: unknown };
   // cursor 形状里带 mcpServers；pi 无 MCP、用户 MCP 在这里桥成 customTools
   mcpServers?: unknown;
-  /** 正式会话身份；无值则不挂交卷/提问等系统工具（oneshot / 受限答疑） */
+  /** 会话身份；无值则不挂交卷/提问等系统工具（受限答疑 / 标题生成等无身份调用） */
   callerToken?: string;
+  /** 只挂这些名字的 Flowship 系统工具（不传 = 全挂）；属主一次性 agent 收窄到 ONE_SHOT_SYSTEM_TOOL_NAMES。浏览器工具不受影响 */
+  systemToolNames?: readonly string[];
   /**
    * 任务 id：透传给 withModelBudget 做超预算全量落盘（V2）。
    * 无值（title 生成等 oneshot）→ V1 后缀，不落盘。
@@ -205,7 +207,7 @@ export interface CustomAgentInput {
   readOnly?: boolean;
   /**
    * 本会话的 shell / 子代理 bash 不继承 FLOWSHIP_GITLAB_TOKEN（需求群非属主答疑旁路传 true，N3-01）。
-   * 显式标记而不是「无 callerToken」推断：属主的 one-shot 同样无 callerToken、却该保留 token。
+   * 显式标记而不是「无 callerToken」推断：不把「有没有身份」和「该不该带 token」绑死，属主 one-shot 也有 callerToken、同样该保留。
    * 只对 pi provider 有效；Cursor provider 的 shell 继承 server env、摘不掉（见 git-token-env.ts）。
    */
   omitGitToken?: boolean;
@@ -833,9 +835,11 @@ const buildCustomTools = (
 ): ToolDefinition[] => {
   // V2 落盘配置：全工具共用（编码工具 + MCP 桥接）；无 taskId → V1 后缀
   const spill: ModelBudgetSpill | undefined = taskId ? { taskId } : undefined;
+  // 要挂哪些 Flowship 系统工具：正式会话全挂；属主一次性 agent 只挂不依赖 action 的（见 ONE_SHOT_SYSTEM_TOOL_NAMES）
+  const systemTools = pickSystemTools(parent.input.systemToolNames);
   const all: ToolDefinition[] = [
     ...(callerToken
-      ? flowShipTools.map(
+      ? systemTools.map(
         (t) =>
           ({
             name: t.name,
@@ -900,7 +904,7 @@ const buildCustomTools = (
     // D1：MCP 桥接工具回包无上限，全包输出预算；flowShipTools（submit_work/ask_user）输出小、不碰
     ...mcpToolDefs.map((d) => withModelBudget(d, spill)),
   ];
-  // 无 taskId（oneshot / 标题生成）没有「非属主轮」的概念，原样返回
+  // 无 taskId（标题生成等一次性调用）没有「非属主轮」的概念，原样返回
   return taskId ? all.map((d) => withNonOwnerTurnDeny(d, taskId)) : all;
 };
 

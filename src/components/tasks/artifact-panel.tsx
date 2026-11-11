@@ -65,6 +65,7 @@ const ARTIFACT_REMARK_PLUGINS = [
   remarkCodeReference,
   remarkKeepTrailingUnderscore,
   remarkTrimAutolinkCjk,
+  remarkUrlCodeLink,
 ];
 
 import { MarkdownLink } from "@/components/markdown-link";
@@ -129,6 +130,7 @@ import {
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
+import { remarkUrlCodeLink } from "@/lib/remark-url-code-link";
 import {
   ACTION_LABEL_EN,
   ACTION_LABEL_SHORT,

@@ -35,7 +35,7 @@
  *         同样能读 config.json，换 shell 并没有形成真边界；而替换内置 shell 会影响工具块展示、有回归风险，得不偿失。
  *     旁路本来就能读 config.json（含 PAT / apiKey / 公司环境密码）、~/.ssh 等属主 OS 用户能读的一切——
  *     环境变量只是最显眼的一条路，不是唯一一条；所以旁路只适合只有可信同事的内部群。
- *     属主自己的无身份通道（startOneShotQuestion，无 callerToken 但是全权限属主通道）不传该标记、照常继承。
+ *     属主自己的一次性通道（startOneShotQuestion，全权限属主通道；它的 callerToken 只用来挂定时 / 等待）不传该标记、照常继承。
  *   - 无 token 时必须 delete（不是留空串）：空串变量会让 `[ -n "$FLOWSHIP_GITLAB_TOKEN" ]` 之类判断误判「已配置」。
  */
 

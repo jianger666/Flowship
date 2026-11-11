@@ -311,11 +311,11 @@ describe("接线（源码契约）", () => {
     expect(close.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
     expect(close.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(close.indexOf('setLeftTab("artifact")'));
     expect(page).toMatch(/<BrowserPanel[^>]*onClose=\{closeBrowserPane\}/);
-    // 产物栏折叠按钮：toggleArtifactPanel → toggleSplitPane("artifact")，折叠产物栏（= 连带关掉浏览器）前先 mark
-    expect(callbackBody(page, "toggleArtifactPanel")).toContain('toggleSplitPane("artifact")');
-    const split = callbackBody(page, "toggleSplitPane");
+    // 头部唯一的分栏按钮：toggleSplitLayout 收起产物栏（= 连带关掉浏览器）前先 mark；展开类动作不 mark
+    const split = callbackBody(page, "toggleSplitLayout");
     expect(split.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
-    expect(split.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(split.indexOf("panel?.collapse()"));
+    expect(split.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(split.indexOf("artifact?.collapse()"));
+    expect(split.match(/userCloseIntentRef\.current\.mark\(/g)).toHaveLength(1);
   });
 
   it("任务页「放大」= 折叠事件流：关闭浏览器 / 切回产物都要把「放大造成的」折叠还原；用户自己折叠的不替他展开（R8-04 L06）", () => {

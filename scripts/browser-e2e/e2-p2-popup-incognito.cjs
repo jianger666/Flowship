@@ -13,7 +13,7 @@
  *   - tabs new {incognito:true} → 内存 partition、TabInfo.incognito；与持久档案 cookie / localStorage 双向隔离；
  *   - 弹窗继承无痕 partition（读得到无痕 cookie、读不到持久 cookie），先关弹窗不清无痕标签的数据；
  *   - browser:clearBrowsingData 只清持久档案；
- *   - 权限 / 下载守卫对无痕 partition 生效（getUserMedia 被拒、脚本下载被拦、手势下载放行）；
+ *   - 权限 / 下载守卫对无痕 partition 生效（getUserMedia 弹权限提示、无人处理即默认拒绝，脚本下载被拦、手势下载放行）；
  *   - 关标签后 partition 被清空、没有 tab 再引用；复用 partition 的新无痕标签读不到上一个的数据；
  *   - 无痕标签计入 maxTabs。
  *
@@ -364,10 +364,24 @@ const main = async () => {
   check("iso-inc-to-persist-cookie", "无痕 tab 设的 cookie 在持久 tab 读不到（持久的 p 仍在）", !(await ev("document.cookie", "t1")).includes("i=incog") && (await ev("document.cookie", "t1")).includes("p=persist"), await ev("document.cookie", "t1"));
   check("iso-inc-to-persist-ls", "无痕 tab 设的 localStorage 在持久 tab 读不到", (await ev("localStorage.getItem('ik')", "t1")) === null);
 
-  // partition 配置对无痕生效：权限（getUserMedia 一律拒）、下载守卫
-  const gum = (id) => ev("navigator.mediaDevices.getUserMedia({ video: true }).then(function(){ return 'granted'; }, function(e){ return e.name; })", id);
-  const gumInc = await gum(incId);
-  check("inc-permission-denied", "无痕 partition 的权限处理器生效：getUserMedia 被拒（NotAllowedError，与持久档案一致）", gumInc === "NotAllowedError" && (await gum("t1")) === "NotAllowedError", { inc: gumInc });
+  // partition 配置对无痕生效：权限（摄像头 / 麦克风归「询问」：弹提示，没人处理 = 默认拒绝）、下载守卫
+  // getUserMedia 会一直挂着等用户点提示，所以不能像以前那样直接 await 它（那会把 evaluate 卡到超时）：
+  // 先触发、等 permission 提示出现、用 prompts.cancel 走「默认动作 deny」，再读页面拿到的结果
+  const gumViaPrompt = async (id) => {
+    await ev("window.__gum = 'pending'; navigator.mediaDevices.getUserMedia({ video: true }).then(function(){ window.__gum = 'granted'; }, function(e){ window.__gum = e.name; }); 1", id);
+    const pr = await waitFor(() => sessionObj().prompts.list().find((p) => p.kind === "permission" && p.tabId === id), 8000);
+    if (pr) sessionObj().prompts.cancel(pr.id);
+    const res = await waitFor(async () => { const v = await ev("window.__gum", id); return v !== "pending" ? v : null; }, 8000);
+    return { prompted: !!pr, res };
+  };
+  const gumInc = await gumViaPrompt(incId);
+  const gumPersist = await gumViaPrompt("t1");
+  check(
+    "inc-permission-denied",
+    "无痕 partition 的权限处理器生效：getUserMedia 弹出权限提示、无人处理 → NotAllowedError（与持久档案一致）",
+    gumInc.prompted && gumInc.res === "NotAllowedError" && gumPersist.prompted && gumPersist.res === "NotAllowedError",
+    { inc: gumInc, persist: gumPersist },
+  );
   const incSes = session.fromPartition(incPart);
   check("inc-download-hook", "无痕 partition 装了 will-download 守卫", incSes.listenerCount("will-download") >= 1, incSes.listenerCount("will-download"));
   await ev("(function(){ var a = document.createElement('a'); a.href = '/file.bin'; a.download = 'x.txt'; document.body.appendChild(a); a.click(); })(); 1", incId);

@@ -87,6 +87,8 @@ vi.mock("@/lib/server/chat-pending", () => ({
   getPendingAsk: vi.fn(),
   setChatAwaitingNotifier: vi.fn(),
   setChatTaskActionHandler: vi.fn(),
+  setOneShotCallerToken: vi.fn(),
+  clearOneShotCallerTokenIf: vi.fn(),
   unsetChatAwaitingNotifierIf: vi.fn(),
   unsetChatTaskActionHandlerIf: vi.fn(),
 }));

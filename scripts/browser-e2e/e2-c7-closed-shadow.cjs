@@ -1,7 +1,7 @@
 "use strict";
 /**
  * E2·P10 · C7 冒烟（真 Electron + 真 CDP）：`attachShadow({mode:"closed"})` 下各 op 的行为，
- * 重点是 **secret-field 在 closed shadow root 里的漏判风险**（AI 不能往 closed 里的密码框键入）。
+ * 重点：closed 里的密码框 —— **读取侧**（snapshot 值遮罩）仍然生效；**写入侧**（type / fill_form / press_key / mouse / drag）不再有任何限制。
  *
  * 只能经启动器运行：
  *   node scripts/browser-e2e/run.mjs scripts/browser-e2e/e2-c7-closed-shadow.cjs --timeout 150
@@ -148,131 +148,100 @@ const main = async () => {
   };
   console.log("  [refs]", JSON.stringify(R));
 
-  // ═══════════ 安全重点：closed 里的密码框 ═══════════
+  // ═══════════ closed 里的密码框：读取侧遮罩仍在，写入不再受限 ═══════════
   check("sec-snap-refs", "snapshot（AX 穿透）能给出 closed 内按钮 / 普通框 / 密码框 / 嵌套密码框的 ref", !!(R.cBtn && R.cIn && R.cPw && R.cSel && R.nPw && R.nIn), R);
   check("sec-snap-nopw", "snapshot 文本里没有 closed / open / 委托 / 嵌套密码框的明文值", !/CLOSEDPW|OPENPW|DELEGPW|NESTPW/.test(text));
 
   const pwVal = (which) => ev(`window.${which}.getElementById('p').value`);
-  const pwUntouched = async () =>
-    (await pwVal("__CL")) === "CLOSEDPW" && (await pwVal("__DG")) === "DELEGPW" && (await pwVal("__NI")) === "NESTPW";
 
+  // 写入侧：AI 往密码框里输入不再有任何限制（type / fill_form / press_key / mouse / drag），closed shadow 里的也一样
   const typeClosedPw = await tryCall("type", { ref: R.cPw, text: "hunter2" });
-  check("sec-type-closed-pw", "type 到 closed 内密码框 → 被拒（BAD_ARGS）", !typeClosedPw.ok && typeClosedPw.code === "BAD_ARGS", typeClosedPw.message?.slice(0, 40));
+  check("pw-type-closed", "type 到 closed 内密码框成功（不再被拒），值落到页面", typeClosedPw.ok && (await pwVal("__CL")) === "hunter2", typeClosedPw.message?.slice(0, 60));
 
-  const fillClosedPw = await tryCall("fill_form", { fields: [{ ref: R.cPw, value: "hunter2" }] });
-  // fill_form 逐项记成败（整体不抛）：该项必须 ok:false 且带密码拒绝文案，密码框值不变
+  const fillClosedPw = await tryCall("fill_form", { fields: [{ ref: R.cPw, value: "via-fill-pw" }] });
   const fillJson = JSON.stringify(fillClosedPw.ok ? fillClosedPw.value : fillClosedPw);
-  check(
-    "sec-fill-closed-pw",
-    "fill_form 到 closed 内密码框 → 该项被拒（ok:false + 密码文案），值没变",
-    (!fillClosedPw.ok || (/"ok":false/.test(fillJson) && !/"ok":true/.test(fillJson) && /密码/.test(fillJson))) && (await pwVal("__CL")) === "CLOSEDPW",
-    fillJson.slice(0, 120),
-  );
+  check("pw-fill-closed", "fill_form 到 closed 内密码框 → 该项 ok:true，值落到页面", fillClosedPw.ok && /"ok":true/.test(fillJson) && !/"ok":false/.test(fillJson) && (await pwVal("__CL")) === "via-fill-pw", fillJson.slice(0, 120));
 
-  // click 本身允许；随后无 ref 的 press_key 往「当前焦点」键入——焦点在 closed 内密码框，必须拒绝
+  // click 之后无 ref 的 press_key 往「当前焦点」键入：焦点在 closed 内密码框，字符键照常输入；Enter 也放行
   await call("click", { ref: R.cPw });
   const pkAfterClick = await tryCall("press_key", { key: "a" });
-  check("sec-presskey-after-click", "click closed 密码框后 press_key(无 ref) 字符键 → 被拒", !pkAfterClick.ok && pkAfterClick.code === "BAD_ARGS", pkAfterClick);
-  const pkPaste = await tryCall("press_key", { key: "Control+v" });
-  check("sec-presskey-paste", "焦点在 closed 密码框时 Ctrl+V 粘贴 → 被拒", !pkPaste.ok && pkPaste.code === "BAD_ARGS", pkPaste);
+  check("pw-presskey-after-click", "click closed 密码框后 press_key(无 ref) 字符键放行，字符进了密码框", pkAfterClick.ok && (await pwVal("__CL")).endsWith("a"), pkAfterClick.message?.slice(0, 60));
   const pkEnter = await tryCall("press_key", { key: "Enter" });
-  check("sec-presskey-enter-ok", "功能键 Enter 仍放行（不误伤）", pkEnter.ok, pkEnter.message);
+  check("pw-presskey-enter-ok", "功能键 Enter 放行", pkEnter.ok, pkEnter.message);
 
   const pkRef = await tryCall("press_key", { key: "b", ref: R.cPw });
-  check("sec-presskey-ref", "press_key 带 ref=closed 密码框 → 被拒", !pkRef.ok && pkRef.code === "BAD_ARGS", pkRef);
+  check("pw-presskey-ref", "press_key 带 ref=closed 密码框放行，字符进了密码框", pkRef.ok && (await pwVal("__CL")).endsWith("b"), pkRef.message?.slice(0, 60));
 
   // 先点别处把焦点拿走，再用 mouse 坐标点中 closed 密码框（不经 ref），再 press_key
   await call("click", { ref: R.cIn });
   const rect = await ev(`(function(){var r = window.__CL.getElementById('p').getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2};})()`);
   await call("mouse", { action: "click", x: rect.x, y: rect.y });
   const pkMouse = await tryCall("press_key", { key: "c" });
-  check("sec-mouse-then-key", "mouse 坐标点中 closed 密码框后 press_key → 被拒", !pkMouse.ok && pkMouse.code === "BAD_ARGS", pkMouse);
+  check("pw-mouse-then-key", "mouse 坐标点中 closed 密码框后 press_key 放行", pkMouse.ok && (await pwVal("__CL")).endsWith("c"), pkMouse.message?.slice(0, 60));
 
   // 嵌套 closed（closed 里再套 closed）里的密码框
   await call("click", { ref: R.nPw });
   const pkNested = await tryCall("press_key", { key: "d" });
-  check("sec-nested-closed", "嵌套 closed 里的密码框拿到焦点后 press_key → 被拒", !pkNested.ok && pkNested.code === "BAD_ARGS", pkNested);
+  check("pw-nested-closed", "嵌套 closed 里的密码框拿到焦点后 press_key 放行", pkNested.ok && (await pwVal("__NI")).endsWith("d"), pkNested.message?.slice(0, 60));
 
-  // delegatesFocus 容器：type 到容器 ref，DOM.focus 把焦点委托进 closed 里的第一个可聚焦元素（密码框）
+  // delegatesFocus 容器：type 到容器 ref，DOM.focus 把焦点委托进 closed 里的第一个可聚焦元素（密码框）——照常输入
   if (R.dGroup) {
     const typeDeleg = await tryCall("type", { ref: R.dGroup, text: "hunter2" });
     const dgActive = await ev(`window.__DG.activeElement && window.__DG.activeElement.id`);
-    // 焦点要么没进密码框（那就什么都没键入），要么进去了且必须被拒；两种都不能让 DELEGPW 变
     check(
-      "sec-type-delegated-container",
-      "type 到 delegatesFocus 容器（焦点会落进 closed 密码框）→ 被拒，密码框值不变",
-      (await pwVal("__DG")) === "DELEGPW" && (dgActive !== "p" || (!typeDeleg.ok && typeDeleg.code === "BAD_ARGS")),
+      "pw-type-delegated-container",
+      "type 到 delegatesFocus 容器不报错；焦点委托进了 closed 密码框时字符真的进去了",
+      typeDeleg.ok && (dgActive !== "p" || (await pwVal("__DG")).endsWith("hunter2")), // 清空动作作用在容器上、不会清到委托进去的内层框，所以只断言「字符进去了」
       { dgActive, typeDeleg: typeDeleg.ok ? "ok" : typeDeleg.code },
     );
   } else {
-    check("sec-type-delegated-container", "（容器没有 ref，改用 press_key 无 ref 经 Tab 聚焦）", true, "no-ref");
+    check("pw-type-delegated-container", "（容器没有 ref，跳过）", true, "no-ref");
   }
 
-  // 焦点探测的另一条路：Tab 键把焦点移进 closed 内的密码框（Tab 是功能键，放行），再按字符键
+  // Tab 键把焦点移进 closed 内的密码框，再按字符键
   await call("click", { ref: R.cIn });
   await call("press_key", { key: "Tab" });
   const afterTab = await ev(`window.__CL.activeElement && window.__CL.activeElement.id`);
   if (afterTab === "p") {
     const pkTab = await tryCall("press_key", { key: "e" });
-    check("sec-tab-into-pw", "Tab 把焦点移进 closed 密码框后 press_key → 被拒", !pkTab.ok && pkTab.code === "BAD_ARGS", pkTab);
+    check("pw-tab-into-pw", "Tab 把焦点移进 closed 密码框后 press_key 放行", pkTab.ok && (await pwVal("__CL")).endsWith("e"), pkTab.message?.slice(0, 60));
   } else {
-    check("sec-tab-into-pw", "（Tab 没有落到密码框，跳过）", true, afterTab);
+    check("pw-tab-into-pw", "（Tab 没有落到密码框，跳过）", true, afterTab);
   }
 
-  // R6-03：closed root 里的 iframe（同站可读 / 沙箱读不进）获焦后，press_key 必须被拒（以前读不进的 iframe 被判 safe）
+  // closed root 里的 iframe（同站可读 / 沙箱读不进）获焦后，press_key 同样放行（以前读不进的 iframe 会被拒）
   for (const [id, label] of [["fa", "同站可读 iframe（里面是密码框）"], ["fs", "沙箱 iframe（读不进，里面是密码框）"]]) {
     await call("click", { ref: R.cIn }); // 先把焦点拿回来
     const fr = await ev(`(function(){var r = window.__FR.getElementById('${id}').getBoundingClientRect(); return {x: r.left + 30, y: r.top + 18};})()`);
     await call("mouse", { action: "click", x: fr.x, y: fr.y });
     const pkFrame = await tryCall("press_key", { key: "x" });
-    check(`sec-closed-iframe-${id}`, `焦点进了 closed root 内的${label} → press_key 被拒（BAD_ARGS）`, !pkFrame.ok && pkFrame.code === "BAD_ARGS", pkFrame.message?.slice(0, 60));
-    if (id === "fs") check("sec-closed-iframe-msg", "沙箱 iframe 的拒绝文案可自修复（内嵌框架 + 让用户操作）", !pkFrame.ok && /内嵌框架/.test(pkFrame.message ?? "") && /browser_ask_user_to_act/.test(pkFrame.message ?? ""), pkFrame.message?.slice(0, 80));
+    check(`pw-closed-iframe-${id}`, `焦点进了 closed root 内的${label} → press_key 放行（不再因读不进 iframe 而拒绝）`, pkFrame.ok, pkFrame.message?.slice(0, 60));
   }
 
-  // R6-30：browser_mouse 的中键点击（Linux 下是粘贴）/ 拖放释放落点落在 closed 密码框或 iframe 上 → 被拒
+  // browser_mouse：中键点击 / 拖放释放落在 closed 密码框或 iframe 上，不再被拒
   const cpRect = await ev(`(function(){var r = window.__CL.getElementById('p').getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2};})()`);
   const midPw = await tryCall("mouse", { action: "click", button: "middle", x: cpRect.x, y: cpRect.y });
-  check("sec-mouse-middle-closed-pw", "mouse 中键点击 closed 密码框 → 被拒（BAD_ARGS）", !midPw.ok && midPw.code === "BAD_ARGS", midPw.message?.slice(0, 50));
+  check("pw-mouse-middle-closed-pw", "mouse 中键点击 closed 密码框放行", midPw.ok, midPw.message?.slice(0, 50));
   const faRect = await ev(`(function(){var r = window.__FR.getElementById('fa').getBoundingClientRect(); return {x: r.left + 30, y: r.top + 18};})()`);
   const midFrame = await tryCall("mouse", { action: "click", button: "middle", x: faRect.x, y: faRect.y });
-  check("sec-mouse-middle-iframe", "mouse 中键点击 closed 内 iframe → 被拒（unknown，fail-closed）", !midFrame.ok && midFrame.code === "BAD_ARGS", midFrame.message?.slice(0, 50));
+  check("pw-mouse-middle-iframe", "mouse 中键点击 closed 内 iframe 放行", midFrame.ok, midFrame.message?.slice(0, 50));
   const bRect = await ev(`(function(){var r = window.__CL.getElementById('b').getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2};})()`);
   await call("mouse", { action: "down", x: bRect.x, y: bRect.y });
   await call("mouse", { action: "move", x: cpRect.x, y: cpRect.y });
   const upPw = await tryCall("mouse", { action: "up", x: cpRect.x, y: cpRect.y });
-  check("sec-mouse-up-on-closed-pw", "mouse 拖到 closed 密码框上 up → 被拒", !upPw.ok && upPw.code === "BAD_ARGS", upPw.message?.slice(0, 50));
+  check("pw-mouse-up-on-closed-pw", "mouse 拖到 closed 密码框上 up 放行（按下态正常释放）", upPw.ok, upPw.message?.slice(0, 50));
   const topRect = await ev(`(function(){var r = document.getElementById('top-plain').getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2};})()`);
-  const upPlain = await tryCall("mouse", { action: "up", x: topRect.x, y: topRect.y });
-  check("ctl-mouse-up-on-plain", "换到普通框 up 放行（按下态被正常释放）", upPlain.ok, upPlain.message?.slice(0, 50));
   const midPlain = await tryCall("mouse", { action: "click", button: "middle", x: topRect.x, y: topRect.y });
   check("ctl-mouse-middle-plain", "中键点击普通框放行", midPlain.ok, midPlain.message?.slice(0, 50));
 
-  // R6-30 三轮复审（A / B / C）：不靠鼠标轨迹猜落点——up 一律探落点；按着键时其它工具的点击先拒
-  // ① B：按着左键时 browser_click 被拒（它的 mouseReleased 会在点击位置结束按住的拖放），文案说明按下状态
+  // 按着左键时 browser_click 不再被拒（不再有「按下状态」守卫）；之后 up 正常收尾
   await call("mouse", { action: "down", x: topRect.x, y: topRect.y });
   const heldClick = await tryCall("click", { ref: R.cIn });
-  check("sec-mouse-held-click-refused", "browser_mouse 按着左键时 browser_click 被拒（BAD_ARGS，文案说明按下状态）", !heldClick.ok && heldClick.code === "BAD_ARGS" && /按下状态/.test(heldClick.message ?? ""), heldClick.message?.slice(0, 60));
-  // ② A：down 之后**不经过任何鼠标动作**，在同一坐标叠一个顶层密码框（等价 browser_scroll / 页面脚本 / 异步内容换了元素）→ 原地 up 被拒，密码框仍为空
-  await ev(
-    `(function(){var e=document.createElement('input'); e.id='shift-pw'; e.type='password'; e.setAttribute('aria-label','叠上来的密码框'); e.style.cssText='position:fixed;left:${Math.round(topRect.x - 40)}px;top:${Math.round(topRect.y - 12)}px;width:80px;height:24px;z-index:99999;margin:0'; document.body.appendChild(e); return true;})()`,
-  );
-  const upShift = await tryCall("mouse", { action: "up", x: topRect.x, y: topRect.y });
-  check("sec-mouse-up-after-shift", "down 之后没有任何鼠标动作、同一坐标下换成了密码框 → 原地 up 被拒（不再有「原地不探」）", !upShift.ok && upShift.code === "BAD_ARGS", upShift.message?.slice(0, 50));
-  check("sec-mouse-shift-pw-empty", "被拒之后叠上来的顶层密码框仍是空的", (await ev(`document.getElementById('shift-pw').value`)) === "");
-  // ③ C 的出路：移走密码框后 up 放行并收尾；之后 browser_click 恢复可用
-  await ev(`document.getElementById('shift-pw').remove()`);
-  const upCleared = await tryCall("mouse", { action: "up", x: topRect.x, y: topRect.y });
-  check("ctl-mouse-up-after-remove", "密码框移走后 up 放行（按下态收尾）", upCleared.ok, upCleared.message?.slice(0, 50));
-  const clickAfterUp = await tryCall("click", { ref: R.cIn });
-  check("ctl-click-after-up", "up 之后 browser_click 恢复可用", clickAfterUp.ok, clickAfterUp.message?.slice(0, 50));
-  // ④ A：原地 down→up 落在 closed 密码框也拒（点它请用 browser_click）；换到普通框 up 收尾
-  await call("mouse", { action: "down", x: cpRect.x, y: cpRect.y });
-  const upInplace = await tryCall("mouse", { action: "up", x: cpRect.x, y: cpRect.y });
-  check("sec-mouse-inplace-up-closed-pw", "原地 down→up 落在 closed 密码框 → 被拒（up 一律探落点）", !upInplace.ok && upInplace.code === "BAD_ARGS", upInplace.message?.slice(0, 50));
+  check("ctl-mouse-held-click-ok", "browser_mouse 按着左键时 browser_click 照常执行", heldClick.ok, heldClick.message?.slice(0, 60));
   const upEnd = await tryCall("mouse", { action: "up", x: topRect.x, y: topRect.y });
-  check("ctl-mouse-up-end", "换到普通框 up 收尾放行", upEnd.ok, upEnd.message?.slice(0, 50));
-
-  check("sec-pw-untouched", "全程之后 closed / 委托 / 嵌套三个密码框的值都没被改动", await pwUntouched(), { c: await pwVal("__CL"), d: await pwVal("__DG"), n: await pwVal("__NI") });
+  check("ctl-mouse-up-end", "up 放行收尾", upEnd.ok, upEnd.message?.slice(0, 50));
+  const clickAfterUp = await tryCall("click", { ref: R.cIn });
+  check("ctl-click-after-up", "up 之后 browser_click 仍可用", clickAfterUp.ok, clickAfterUp.message?.slice(0, 50));
 
   // 对照组：普通框不能被误伤
   const typeClosedIn = await tryCall("type", { ref: R.cIn, text: "hello" });
@@ -289,17 +258,19 @@ const main = async () => {
   const fillPlain = await tryCall("fill_form", { fields: [{ ref: R.cIn, value: "via-fill" }] });
   check("ctl-fill-closed-plain", "fill_form 到 closed 普通框成功", fillPlain.ok && (await ev(`window.__CL.getElementById('i').value`)) === "via-fill", fillPlain.message);
 
-  // drag 落点：把 closed 按钮拖到「委托密码框」上，落点处元素在 closed 里（elementFromPoint 只返回 host）
+  // drag 落点：把 closed 按钮拖到「委托密码框」上 / 容器中心，不再被拒
   if (R.dPw && R.cBtn) {
     const dragPw = await tryCall("drag", { fromRef: R.cBtn, toRef: R.dPw });
-    check("sec-drag-onto-closed-pw", "drag 落到 closed 密码框 → 被拒", !dragPw.ok && dragPw.code === "BAD_ARGS", dragPw);
+    check("pw-drag-onto-closed-pw", "drag 落到 closed 密码框放行", dragPw.ok, dragPw.message?.slice(0, 60));
   }
   if (R.dGroup && R.cBtn) {
     const dragHost = await tryCall("drag", { fromRef: R.cBtn, toRef: R.dGroup });
-    // 容器（host）中心落点正好压着 closed 里的第一个控件（密码框）：落点探针必须穿透 closed 看到它
-    const centerEl = await ev(`(function(){var h=document.getElementById('xd');var r=h.getBoundingClientRect();return window.__DG.elementFromPoint(r.left+r.width/2,r.top+r.height/2) && window.__DG.elementFromPoint(r.left+r.width/2,r.top+r.height/2).id;})()`);
-    check("sec-drag-onto-host-center", "drag 落到 closed host 中心（压着密码框）→ 被拒（或落点不是密码框）", !dragHost.ok || centerEl !== "p", { centerEl, dragHost });
+    check("pw-drag-onto-host-center", "drag 落到 closed host 中心（压着密码框）放行", dragHost.ok, dragHost.message?.slice(0, 60));
   }
+
+  // 读取侧遮罩不受写入放开的影响：写进去的值照样不会出现在 snapshot 里
+  const textAfterWrite = await snap();
+  check("sec-snap-nopw-after-write", "往密码框写入之后，snapshot 里仍没有这些密码框的明文值（hunter2 / via-fill-pw 等）", !/hunter2|via-fill-pw|CLOSEDPW|OPENPW|DELEGPW|NESTPW/.test(textAfterWrite));
 
   // ═══════════ 其余 op 逐项 ═══════════
   await call("navigate", { url: `${base}/` });

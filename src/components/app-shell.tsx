@@ -98,8 +98,6 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const toggleSidebar = useCallback(() => {
     setSidebarOpen((v) => !v);
   }, []);
-  const collapseSidebar = useCallback(() => setSidebarOpen(false), []);
-
   // 侧栏宽度：全局一个值、记在 localStorage（规则 / 夹取 / 收起阈值见 lib/sidebar-width，有单测）。
   // 窗口变窄时只在渲染里夹一下有效宽度，不改写存的值——窗口放大回来侧栏回到用户拖出来的宽度
   const storedSidebarWidth = useSyncExternalStore(
@@ -209,7 +207,6 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
           open={sidebarOpen}
           width={sidebarWidth}
           resizing={sidebarResizing}
-          onCollapse={collapseSidebar}
         />
         <SidebarResizeHandle
           open={sidebarOpen}

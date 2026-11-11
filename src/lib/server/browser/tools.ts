@@ -731,7 +731,7 @@ const hoverTool: FlowshipToolDef = {
 const typeTool: FlowshipToolDef = {
   name: "browser_type",
   label: "浏览器·输入文字",
-  description: "向输入框（ref）输入文字，默认先清空；submit=true 输入后按回车。密码 / 验证码请用 browser_ask_user_to_act 让用户自己输。",
+  description: "向输入框（ref）输入文字，默认先清空；submit=true 输入后按回车。密码框也可以直接输入（口令用用户给你的，别猜）。",
   parameters: TBObject({
     ref: REF_SCHEMA,
     text: TBString(),
@@ -1263,7 +1263,7 @@ const askTool: FlowshipToolDef = {
   name: "browser_ask_user_to_act",
   label: "浏览器·请用户操作",
   description:
-    "请用户亲自在浏览器里完成一步（登录、输验证码、支付确认等）并阻塞等待，直到用户点「完成」或「放弃」。message 写清楚要用户做什么。",
+    "请用户亲自在浏览器里完成一步（你拿不到的账号口令、短信 / 扫码验证、人机验证、支付确认等）并阻塞等待，直到用户点「完成」或「放弃」。message 写清楚要用户做什么。",
   parameters: TBObject({ message: TBString() }),
   handler: guarded(async (args, ctx) => {
     const message = reqStr(args, "message").trim().slice(0, 500);
@@ -1378,10 +1378,6 @@ export interface FillFieldInput {
   values?: string[];
 }
 
-/** 主进程对密码 / 验证码字段的固定拒绝文案（与 electron-app/browser/ops/input.mjs 的 PASSWORD_REJECT_MESSAGE 逐字一致，测试钉死） */
-export const FILL_FORM_PASSWORD_MESSAGE =
-  "这是密码 / 验证码类输入框，AI 不会代填（避免口令进入对话上下文）。请调用 browser_ask_user_to_act 请用户自己输入，用户完成后再继续";
-
 /**
  * fields 宽松解析：数组或 JSON 字符串；每项 ref + 且仅 value / checked / values 之一。
  * value 收字符串与数字（模型常把数字写成裸数字）；checked 收布尔与 "true" / "false"；values 收数组或单个字符串。
@@ -1433,13 +1429,12 @@ interface FillFormResult extends ActionResult {
   submit?: { ref: string; ok: boolean; error?: string };
 }
 
-/** fill_form 结果渲染：逐项列成败。错误详情可能含页面文字（元素名 / 选项）→ 内联包装为不可信；密码拒绝是我们自己的固定文案，保持可信（它在指路）。 */
+/** fill_form 结果渲染：逐项列成败。错误详情可能含页面文字（元素名 / 选项）→ 内联包装为不可信。 */
 export const renderFillForm = (r: FillFormResult, b: ToolResultBuilder, total: number): void => {
   const results = r?.results ?? [];
   const ok = results.filter((x) => x.ok).length;
   const showErr = (msg: string | undefined): string => {
     if (!msg) return "失败";
-    if (msg === FILL_FORM_PASSWORD_MESSAGE) return msg;
     b.markUntrusted();
     return wrapUntrustedInline(msg.slice(0, 300));
   };
@@ -1457,7 +1452,7 @@ const fillFormTool: FlowshipToolDef = {
   name: "browser_fill_form",
   label: "浏览器·填写表单",
   description:
-    "一次填多个表单字段（≤30）：文本 value、勾选 checked（状态不同才点）、原生下拉 values；submit_ref 可选（全部成功才点）；逐项返回成败。密码 / 验证码框一律拒绝，请改用 browser_ask_user_to_act 让用户自己输。",
+    "一次填多个表单字段（≤30）：文本 value、勾选 checked（状态不同才点）、原生下拉 values；submit_ref 可选（全部成功才点）；逐项返回成败。登录表单里的账号 / 密码框也可以直接填（口令用用户给你的，别猜；手里没有的凭据、短信验证码请用 browser_ask_user_to_act）。",
   parameters: TBObject({
     fields: TBArray(
       TBObject({
@@ -2134,7 +2129,7 @@ export const BROWSER_TOOL_NAMES: readonly string[] = [...BASE_TOOLS.map((t) => t
 
 /**
  * 当前会话该注册哪些浏览器工具。
- * 条件：bridge 可用 + 有 taskId + 非只读（readOnly / oneshot 会话没有「替用户操作网页」的资格）。
+ * 条件：bridge 可用 + 有 taskId + 非只读（readOnly / 受限答疑没有「替用户操作网页」的资格；属主一次性 agent 带 callerToken、有 taskId，同样会挂——有意保留，见 tests/one-shot-system-tools.test.ts）。
  */
 /**
  * 契约 §15.1：增强包 E2 的工具模块（`tools-*.ts`）通过这份 kit 复用本文件的内部积木——它们不能 import 本文件

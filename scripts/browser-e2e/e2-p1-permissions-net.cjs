@@ -217,10 +217,29 @@ const main = async () => {
 
   // 打开开关后：永远拒绝的权限 DENIED；grant / deny / reset 生效
   manager.onConfig({ pagePermissions: true });
-  for (const name of ["camera", "microphone", "display-capture", "usb", "openExternal"]) {
+  for (const name of ["display-capture", "usb", "openExternal"]) {
     const r = await tryCall("permissions", { action: "grant", permission: name });
     check(`a8-never-${name}`, `grant ${name} → DENIED（永远拒绝，开关开着也放不开）`, !r.ok && r.code === "DENIED", r.message);
   }
+  // 摄像头 / 麦克风不再是红线（camera / microphone 是两个独立的授予，写 media = 两个一起）：开关开着 AI 可以授予 / 拒绝，页面 permissions.query 口径一致
+  for (const name of ["camera", "microphone"]) {
+    const r = await tryCall("permissions", { action: "grant", permission: name });
+    check(`a8-media-${name}`, `grant ${name} → 生效（归询问类，不再是 DENIED）`, r.ok === true && r.value?.action === "grant" && r.value?.permission === name, r.message ?? r);
+  }
+  const qm = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
+  check("a8-media-visible", "AI 授予麦克风后页面 permissions.query(microphone) 看到 granted", qm === "granted", qm);
+  // R9-02：互不连带——只授予麦克风时摄像头仍不是 granted；写 media 才是两个一起
+  await call("permissions", { action: "reset" });
+  await call("permissions", { action: "grant", permission: "microphone" });
+  const qm2 = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
+  const qc2 = await ev("navigator.permissions.query({ name: 'camera' }).then(s => s.state)");
+  check("a8-media-independent", "只授予麦克风：query(microphone)=granted，query(camera) 不是 granted（互不连带）", qm2 === "granted" && qc2 !== "granted", { qm2, qc2 });
+  await call("permissions", { action: "reset" });
+  const rBoth = await tryCall("permissions", { action: "grant", permission: "media" });
+  const qm3 = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
+  const qc3 = await ev("navigator.permissions.query({ name: 'camera' }).then(s => s.state)");
+  check("a8-media-both", "grant media = 麦克风 + 摄像头一起：两者 query 都是 granted", rBoth.ok === true && rBoth.value?.permission === "media" && qm3 === "granted" && qc3 === "granted", { rBoth: rBoth.value ?? rBoth.message, qm3, qc3 });
+  await call("permissions", { action: "reset" });
   const rApp = await tryCall("permissions", { action: "grant", permission: "geolocation", origin: `https://127.0.0.1:${ports.app}` });
   check("a8-app-origin", "给 Flowship 自己的 origin grant → DENIED", !rApp.ok && rApp.code === "DENIED", rApp.message);
   const rBad = await tryCall("permissions", { action: "grant", permission: "geolocation", origin: "javascript:alert(1)" });

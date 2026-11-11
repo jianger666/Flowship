@@ -2,13 +2,15 @@
 /**
  * R6 真机回归：closed-shadow 的 CDP 探测必须各自独占 objectGroup。
  *
- * 现象：录屏每帧会用 `probeFocusSecretCdp` 复核焦点，与 AI 的 type / click 的焦点复核并发。以前所有探测共用一个固定 group，
- * 先跑完的那个 `Runtime.releaseObjectGroup` 会让另一个手里的 objectId 失效（"Could not find object with given id"）→ 探针抛错 → unknown →
- * type 被误拒（真机 smoke-suite FLOW 24 约 1/4 概率复现）。fail-closed 没漏，但会误伤。
+ * 现象：录屏每帧会用 `probeFocusSecretCdp` 复核焦点（它现在只剩录屏这一个调用方；AI 的 type / press_key / drag 已不再做焦点 / 落点复核）。
+ * 只要有两次探测并发，且共用一个固定 group，先跑完的那个 `Runtime.releaseObjectGroup` 就会让另一个手里的 objectId 失效
+ * （"Could not find object with given id"）→ 探针抛错 → unknown → 误判成「无法确认」。
+ * 当年的真机 smoke-suite FLOW 24 约 1/4 概率复现（那时并发的另一方是 AI 的 type 焦点复核，表现为 type 被误拒）。fail-closed 没漏，但会误伤；
+ * 现在即使调用方只剩录屏，「每次探测独占 group」这条约束照旧要钉住。
  */
 import { describe, expect, it } from "vitest";
 
-import { IS_FRAME_FN, NEXT_FOCUS_OPEN_FN, probeDropSecretCdp, probeFocusSecretCdp } from "../electron-app/browser/closed-shadow.mjs";
+import { IS_FRAME_FN, NEXT_FOCUS_OPEN_FN, probeFocusSecretCdp } from "../electron-app/browser/closed-shadow.mjs";
 import { SECRET_ELEMENT_PROBE_SOURCE } from "../electron-app/browser/secret-field.mjs";
 
 /** 带「对象按 group 存活」语义的假 CDP：release 某 group 后，该 group 的 objectId 再被用就报 Could not find object */
@@ -83,21 +85,5 @@ describe("closed-shadow 探测：每次探测独占 objectGroup（R6 真机回�
     expect(started).toBe(true);
     expect(await pB).toBe("safe");
     expect(a).toBe("safe");
-  });
-
-  it("落点探测同样：并发的焦点探测 release 不影响落点探测", async () => {
-    let started = false;
-    let pB: Promise<string> | null = null;
-    const tab: any = makeTab(async (method, params) => {
-      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration) === SECRET_ELEMENT_PROBE_SOURCE && !started) {
-        started = true;
-        pB = probeFocusSecretCdp(tab, null);
-        await pB;
-      }
-    });
-    const a = await probeDropSecretCdp(tab, null, 10, 10);
-    expect(started).toBe(true);
-    expect(a).toBe("safe");
-    expect(await pB).toBe("safe");
   });
 });

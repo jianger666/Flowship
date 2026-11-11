@@ -74,7 +74,10 @@ export const PERMISSION_LABEL: Record<string, string> = {
   notifications: "通知",
   "clipboard-read": "读取剪贴板",
   "clipboard-sanitized-write": "写入剪贴板",
-  media: "摄像头 / 麦克风",
+  // 麦克风与摄像头是两个独立的授予：提示条写的就是点「允许」之后授予的范围；`media` 是「同时问两个」时的合称
+  microphone: "麦克风",
+  camera: "摄像头",
+  media: "摄像头 + 麦克风",
   "background-sync": "后台同步",
   sensors: "传感器",
   midi: "MIDI 设备",

@@ -61,7 +61,8 @@
  *
  * # 子 agent 的边界
  * 不带系统工具（submit_work / ask_user…）、不带用户 MCP、不带 `subagent`/`task`——防递归与副作用。
- * explore = 只读白名单（read / grep / glob / ls）；其余 = 默认内置工具、去掉 `task`。
+ * explore = 只读白名单（read / grep / glob / ls + 联网 webSearch / webFetch，见 CURSOR_SUBAGENT_READONLY_TOOLS）；
+ * 其余 = 默认内置工具、去掉 `task`。
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -111,12 +112,25 @@ import {
 } from "./subagent-parent-model";
 import type { SubagentRunHandle, SubagentRunInit } from "./subagent-transcript";
 
-/** explore（只读）：读 / 搜，不写文件、不跑命令（与 pi 的 read/grep/find/ls 对齐） */
+/**
+ * explore（只读）：读 / 搜本地文件 + 联网搜索 / 抓网页，不写文件、不跑命令。
+ *
+ * 本地部分与 pi 的 read/grep/find/ls 对齐；`webSearch` / `webFetch` 是 Cursor SDK 的内置联网工具
+ * （2026-11-11 用户要求「让 explore 也能搜网页」加的）。**pi 路径没有这两个工具**（连父会话都没有联网工具，
+ * 只有 general 子代理靠 bash 里的 curl），所以 pi 的 explore 仍是纯本地只读，两端在这一点上不一致。
+ *
+ * ⚠ 取舍：explore 现在「能读本机文件 + 能发网络请求」，理论上存在「读到敏感内容再塞进抓取的网址」这条外泄路径
+ * （general 子代理有 shell，本来就有这条路；explore 以前没有）。要收回只摘 `webFetch`（只留 `webSearch`）
+ * 或把两个都摘掉即可，`tests/cursor-subagent.test.ts` 的白名单断言会同步要改。
+ * 只读的边界仍然是：没有 shell / edit / write / delete / mcp / task。
+ */
 export const CURSOR_SUBAGENT_READONLY_TOOLS: ToolName[] = [
   "read",
   "grep",
   "glob",
   "ls",
+  "webSearch",
+  "webFetch",
 ];
 
 /**
@@ -125,6 +139,7 @@ export const CURSOR_SUBAGENT_READONLY_TOOLS: ToolName[] = [
  */
 export const CURSOR_SUBAGENT_DESCRIPTION =
   SUBAGENT_TOOL_DESCRIPTION +
+  "本会话里 explore 除了读 / 搜本地文件，还能联网搜索、抓取网页（仍不写文件、不跑命令）。" +
   "同一轮里可以并行发起多个本工具调用（并行执行）。" +
   "每次成功返回的末尾会给出这个子代理的 id；之后想让同一个子代理接着做（追问、补充、让它改刚才的结果），" +
   "再调本工具并传 resume=<该 id>：它记得之前的全部上下文，不用重讲背景；此时 model / effort / subagentType 沿用原来的、不要再填。" +
@@ -1398,7 +1413,7 @@ const childAgentOptions = (
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
     settingSources: [],
   },
-  // explore：只给读 / 搜白名单；其余：默认内置工具、去掉 task 防递归
+  // explore：只给读 / 搜 / 联网白名单；其余：默认内置工具、去掉 task 防递归
   ...(explore
     ? { tools: [...CURSOR_SUBAGENT_READONLY_TOOLS] }
     : { disallowedTools: withNativeTaskDisabled(undefined) }),

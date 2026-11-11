@@ -32,7 +32,6 @@ import {
   Loader2,
   PanelLeftClose,
   PanelLeftOpen,
-  PanelRightClose,
   PanelRightOpen,
   Pencil,
   RefreshCw,
@@ -125,6 +124,7 @@ import {
   isValidArtifactPanelSize,
   planSplitToggle,
   resolveArtifactDefaultPercent,
+  SPLIT_TOGGLE_LABEL,
 } from "@/lib/task-split-layout";
 import { isEphemeralToolOutputDelta } from "@/lib/tool-display";
 import { cn } from "@/lib/utils";
@@ -801,30 +801,25 @@ const TaskDetailPage = () => {
     const now = Date.now();
     return userCloseIntentRef.current.isRecent(now) || userResizeIntentRef.current.isActive(now);
   }, []);
-  // 两栏的折叠按钮：折叠一栏时若另一栏已折叠，先把另一栏展开（planSplitToggle），永远至少有一栏看得见
-  const toggleSplitPane = useCallback(
-    (target: "artifact" | "event-stream") => {
-      const artifact = artifactPanelRef.current;
-      const eventStream = eventStreamPanelRef.current;
-      const plan = planSplitToggle({
-        target,
-        artifactCollapsed: artifact?.isCollapsed() ?? false,
-        eventStreamCollapsed: eventStream?.isCollapsed() ?? false,
-      });
-      if (plan.expandFirst === "artifact") artifact?.expand();
-      if (plan.expandFirst === "event-stream") eventStream?.expand();
-      const panel = target === "artifact" ? artifact : eventStream;
-      if (plan.action === "expand") panel?.expand();
-      else {
-        // 折叠产物栏会连带关掉浏览器（浏览器住在产物栏里），算「用户主动收起」
-        if (target === "artifact") userCloseIntentRef.current.mark(Date.now());
-        panel?.collapse();
-      }
-    },
-    [artifactPanelRef, eventStreamPanelRef],
-  );
-  const toggleArtifactPanel = useCallback(() => toggleSplitPane("artifact"), [toggleSplitPane]);
-  const toggleEventStreamPanel = useCallback(() => toggleSplitPane("event-stream"), [toggleSplitPane]);
+  // 头部**唯一**的分栏按钮（状态感知，三种动作见 planSplitToggle）：分栏 → 事件流占满 → 回到分栏；
+  // 产物 / 浏览器占满（放大 / 拖分隔条造成的）时同一颗按钮把事件流请回来。命令式驱动 Panel，读的是句柄上「此刻」的折叠态
+  const toggleSplitLayout = useCallback(() => {
+    const artifact = artifactPanelRef.current;
+    const eventStream = eventStreamPanelRef.current;
+    const action = planSplitToggle({
+      artifactCollapsed: artifact?.isCollapsed() ?? false,
+      eventStreamCollapsed: eventStream?.isCollapsed() ?? false,
+    });
+    if (action === "expand-event-stream") eventStream?.expand();
+    else if (action === "expand-artifact") artifact?.expand();
+    else {
+      // 折叠产物栏会连带关掉浏览器（浏览器住在产物栏里），算「用户主动收起」
+      userCloseIntentRef.current.mark(Date.now());
+      artifact?.collapse();
+    }
+  }, [artifactPanelRef, eventStreamPanelRef]);
+  // 渲染用：按钮此刻的动作（图标 / 提示 / 读屏名都由它决定）；与上面的回调同一个纯函数、同一份状态口径
+  const splitToggleAction = planSplitToggle({ artifactCollapsed, eventStreamCollapsed });
   // 浏览器面板：展开（必要时先把折叠的左栏展开）/ 头部入口开关 / 自动展开与「在内置浏览器打开」共用。
   // 顺序很关键（R2-14 ③）：先在**旧约束**仍有效时把栏展开 / 放宽到浏览器标签的像素下限，再换标签——
   // 换标签会让 minSize 变成像素下限、库随即按新约束重新校验当前宽度（< 下限一半直接折叠），
@@ -1582,37 +1577,27 @@ const TaskDetailPage = () => {
           />
           <div className="h-4 w-px shrink-0 bg-border" />
           <TaskUtilityActions task={task} onTaskUpdate={absorbTask} />
-          {/* 产物栏折叠：窄窗口下把整行宽度让给事件流（V13 窄栏策略）；拖分隔条到最小宽度以下也会自动折叠。
-              折叠后产物区 / 时间线隐藏、再点展开回到折叠前的宽度 */}
-          <Tooltip
-            content={artifactCollapsed ? "展开产物栏" : "收起产物栏，事件流占满宽度"}
-          >
+          {/* 左右分栏的**唯一**开关（状态感知，动作与文案见 planSplitToggle / SPLIT_TOGGLE_LABEL）：
+              分栏时点它 = 收起产物栏、事件流占满（窄窗口把整行宽度让给事件流，V13 窄栏策略）；
+              事件流占满时点它 = 展开产物栏；产物 / 浏览器占满（浏览器「放大」或拖分隔条造成的）时点它 = 把事件流请回来。
+              以前这里是「产物栏」「事件流栏」两颗图标几乎一样的按钮，事件流占满时两颗都在往产物那边切，用户分不清。
+              图标与读屏名都随状态变（和侧栏开关同一套做法），不再另挂 aria-pressed / aria-expanded；拖分隔条到下限以下同样会自动折叠 */}
+          <Tooltip content={SPLIT_TOGGLE_LABEL[splitToggleAction]}>
             <Button
               type="button"
               variant="outline"
               size="icon-sm"
               className="ml-auto"
-              onClick={toggleArtifactPanel}
-              // label 固定、状态用 aria-expanded 表达（以前 label 随状态变 + aria-pressed 再说一遍且方向相反，
-              // 读屏念「展开产物栏，开关按钮，已按下」自相矛盾，R9a-06）
-              aria-label="产物栏"
-              aria-expanded={!artifactCollapsed}
+              onClick={toggleSplitLayout}
+              aria-label={SPLIT_TOGGLE_LABEL[splitToggleAction]}
             >
-              {artifactCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
-            </Button>
-          </Tooltip>
-          {/* 事件流栏折叠：把整行宽度让给产物 / 浏览器（浏览器标签下 = 放大浏览器）；拖分隔条到事件流下限以下也会自动折叠。
-              折叠后输入条跟着事件流栏一起收起，再点这里展开回到折叠前的宽度 */}
-          <Tooltip content={eventStreamCollapsed ? "展开事件流" : "收起事件流，产物 / 浏览器占满宽度"}>
-            <Button
-              type="button"
-              variant="outline"
-              size="icon-sm"
-              onClick={toggleEventStreamPanel}
-              aria-label="事件流栏"
-              aria-expanded={!eventStreamCollapsed}
-            >
-              {eventStreamCollapsed ? <PanelRightOpen /> : <PanelRightClose />}
+              {splitToggleAction === "collapse-artifact" ? (
+                <PanelLeftClose />
+              ) : splitToggleAction === "expand-artifact" ? (
+                <PanelLeftOpen />
+              ) : (
+                <PanelRightOpen />
+              )}
             </Button>
           </Tooltip>
         </div>

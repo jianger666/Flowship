@@ -122,7 +122,7 @@ const flow = (name, fn) => FLOWS.push({ name, fn });
 
 // ═══════════════════════ 流程 ═══════════════════════
 
-flow("登录：type 用户名 + 用户接管输密码 + 302 dashboard [sec]", async (c) => {
+flow("登录：type 用户名 + type 密码框 + 302 dashboard [sec]", async (c) => {
   const fx = await c.http({
     "/login": (req, res, url, body) => {
       if (req.method === "POST") {
@@ -138,19 +138,11 @@ flow("登录：type 用户名 + 用户接管输密码 + 302 dashboard [sec]", as
   await c.call("navigate", { url: `${fx.base}/login` });
   const t = (await c.call("snapshot", {})).text;
   await c.call("type", { ref: refOf(t, "用户名"), text: USER });
-  const rej = await c.tryCall("type", { ref: refOf(t, "密码"), text: "x-ai-typed" });
-  c.check("type 对 password 框被拒（提示 ask_user_to_act）", !rej.ok && /ask_user_to_act/.test(rej.message), rej.code);
-  const ask = c.call("ask_user_to_act", { message: "请输入密码", timeoutMs: 20000 });
-  await waitFor(() => c.sess().controller === "user", 4000);
-  const wc = c.sess().activeTab.wc;
-  await wc.executeJavaScript("document.getElementById('p').focus()");
-  wc.insertText(PW);
-  await sleep(200);
-  c.sess().answerAsk("done");
-  const askRes = await ask;
-  c.check("用户输入 + 完成 → ask 返回 done", askRes.outcome === "done", askRes.outcome);
+  const typed = await c.tryCall("type", { ref: refOf(t, "密码"), text: PW });
+  // 只比长度、不把明文读出来：evaluate 的返回值会进 op 输出，被下面的红线断言扫到（登录成功本身就证明值是对的）
+  c.check("type 对 password 框照常输入（不再被拒）", typed.ok && (await c.ev(`document.getElementById('p').value.length`)) === PW.length, typed.ok ? "ok" : typed.message);
   const t2 = (await c.call("snapshot", {})).text;
-  c.check("密码值进了页面，但 snapshot / ask 结果里没有明文", (await c.ev(`document.getElementById('p').value.length`)) === PW.length && !t2.includes(PW) && !JSON.stringify(askRes).includes(PW));
+  c.check("密码值进了页面，但 snapshot 里没有明文（读取侧遮罩仍在）", (await c.ev(`document.getElementById('p').value.length`)) === PW.length && !t2.includes(PW));
   await c.call("click", { ref: refOf(t2, "登录") });
   c.check("302 → /dashboard 且服务端认得 cookie", !!(await c.waitUrl("/dashboard")) && /欢迎回来/.test((await c.call("snapshot", {})).text));
   const net = JSON.stringify((await c.call("network", { limit: 100 })).entries);
@@ -211,8 +203,9 @@ flow("多步表单：fill_form 全类型 + 校验失败 → 修正 → 成功页
   const f1 = await c.call("fill_form", { fields: [...base, { ref: R("确认密码"), value: "pw-typed-by-ai" }], submitRef: R("提交") });
   console.log("  [info] fill_form results:", JSON.stringify(f1.results).slice(0, 700), "date=", await c.ev("document.getElementById('d').value"));
   const pw = f1.results.find((x) => x.ref === R("确认密码"));
-  c.check("[sec] 密码框被拒且保持为空（指向 ask_user_to_act）", pw && pw.ok === false && /ask_user_to_act/.test(pw.error) && (await c.ev("document.getElementById('pw2').value")) === "");
+  c.check("密码框与普通框一样被填上（ok:true，值落到页面）", pw && pw.ok === true && (await c.ev("document.getElementById('pw2').value")) === "pw-typed-by-ai");
   const t2 = (await c.call("snapshot", {})).text;
+  c.check("[sec] 密码框被 AI 填进去之后，snapshot 里没有明文（读取侧遮罩仍在）", !t2.includes("pw-typed-by-ai"));
   const f2 = await c.call("fill_form", { fields: [{ ref: refOf(t2, "同意条款"), checked: true }], submitRef: refOf(t2, "提交") });
   c.check("勾选同意后提交成功", f2.submit?.ok !== false);
   const wr = await c.tryCall("wait_for", { text: "提交成功", timeoutMs: 8000 });
@@ -236,7 +229,7 @@ flow("无限滚动：IntersectionObserver 3 批 + scroll until_stable 有上限 
   c.check("整个滚动耗时 < 30s", Date.now() - t0 < 30000);
 });
 
-flow("iframe 支付页：跨 origin iframe + 卡号/密码 AI 不可填 [sec]", async (c) => {
+flow("iframe 支付页：跨 origin iframe 内的卡号 / 密码框也能 type [sec]", async (c) => {
   const pay = await c.http({
     "/pay": (req, res) => res.end(page("支付", `<input aria-label="卡号" autocomplete="cc-number"><input type="password" aria-label="支付密码"><button onclick="parent.postMessage('paid','*')">确认支付</button>`)),
   });
@@ -249,8 +242,10 @@ flow("iframe 支付页：跨 origin iframe + 卡号/密码 AI 不可填 [sec]", 
   c.check("snapshot 列出跨 origin iframe 内的元素", /卡号/.test(t) && /确认支付/.test(t) && /支付密码/.test(t), t.slice(0, 300));
   const cc = await c.tryCall("type", { ref: refOf(t, "卡号"), text: "4111111111111111" });
   const pw = await c.tryCall("type", { ref: refOf(t, "支付密码"), text: "123456" });
-  c.check("[sec] type 对卡号（cc-number）与密码被拒", !cc.ok && !pw.ok && /ask_user_to_act/.test(`${cc.message}${pw.message}`), [cc.code, pw.code]);
-  await c.call("click", { ref: refOf(t, "确认支付") });
+  c.check("type 对卡号（cc-number）与密码照常成功", cc.ok && pw.ok, [cc.code, pw.code]);
+  const tAfter = (await c.call("snapshot", {})).text;
+  c.check("[sec] 卡号 / 密码写入 iframe 之后，snapshot 里没有明文（读取侧遮罩仍在）", !tAfter.includes("4111111111111111") && !tAfter.includes("123456"), tAfter.slice(0, 300));
+  await c.call("click", { ref: refOf(tAfter, "确认支付") }); // 重新 snapshot 会让旧 ref 作废，用最新的
   c.check("click 提交按钮可用（父页收到 paid）", (await waitFor(async () => (await c.ev("window.__paid")) === "paid", 4000)) !== null);
 });
 
@@ -570,7 +565,7 @@ flow("Shadow DOM：open 可用，closed 不泄露密码框值 [sec]", async (c) 
     await c.call("click", { ref: cb });
     c.check("closed shadow 已被支持：按钮 click 生效", (await c.ev("window.__closed")) === 1);
     const cpw = refOf(t, "ClosedPw");
-    if (cpw) c.check("[sec] closed 里的密码框 type 被拒", !(await c.tryCall("type", { ref: cpw, text: "x" })).ok);
+    if (cpw) c.check("closed 里的密码框 type 也能输入（不再被拒）", (await c.tryCall("type", { ref: cpw, text: "x" })).ok);
   }
   c.check("[sec] snapshot / evaluate 之外的读取不泄露 closed 密码框值", !t.includes("closedPW-zz91"));
 });

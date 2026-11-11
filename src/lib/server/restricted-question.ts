@@ -489,7 +489,8 @@ export const startRestrictedGroupQuestion = (
           // 不传 callerToken：系统工具（交卷 / 提问 / 提 MR）按无身份处理，推进本来就走不了任务链。
           local: { cwd, settingSources: [] },
           // pi provider：shell 与子代理 bash 摘掉 FLOWSHIP_GITLAB_TOKEN（N3-01）。必须显式传、
-          // 不能靠「无 callerToken」推断——属主 one-shot 同样无 callerToken、却该保留 token。
+          // 不能靠「无 callerToken」来区分：这里本来就不传 callerToken，是否摘 token 是另一件事、要显式表达
+          // （属主一次性 agent 现在带 callerToken、且该保留 token，两者靠这个标记分开）。
           // 只摘环境变量、不阻止读文件；Cursor provider 下是空操作（SDK 继承 server env、摘不掉，见上方注释与 git-token-env.ts）。
           // tests/restricted-group-question.test.ts 钉住这里必须传 true。
           omitGitToken: true,

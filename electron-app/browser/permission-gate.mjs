@@ -22,6 +22,9 @@ import {
   canonicalPermission,
   createPermissionGrants,
   decidePermissionWithReason,
+  FRAME_RESTRICTED_ALLOWED_PERMISSIONS,
+  MEDIA_PERMISSION,
+  mediaAtomsOf,
   originOf,
   PERMISSION_LABEL_ZH,
 } from "./permission-policy.mjs";
@@ -217,11 +220,10 @@ export const createPermissionGate = (deps) => {
   };
 
   /**
-   * 一次权限判定。`frame`：{ isMainFrame, top, forceCross? }——跨源子框架（origin ≠ 顶层 origin，或检查处理器报了 embeddingOrigin）一律拒绝，
+   * 一次权限判定（单个、独立的权限名）。`frame`：{ isMainFrame, top, forceCross? }——跨源子框架（origin ≠ 顶层 origin，或检查处理器报了 embeddingOrigin）一律拒绝，
    * 授予是按「顶层站点」给的，不能让嵌进来的第三方 iframe 蹭到；通知只给主框架（stub 只装在主框架主世界）。
    */
-  const evaluate = (owner, permission, origin, frame) => {
-    const perm = canonicalPermission(permission) ?? String(permission);
+  const evaluateOne = (owner, perm, origin, frame) => {
     const base = decidePermissionWithReason({
       permission: perm,
       origin,
@@ -230,13 +232,32 @@ export const createPermissionGate = (deps) => {
       emulatedGeolocationOrigins: geoOriginsOf(owner.tab),
       isAppOrigin: isAppOrigin(origin) || isAppOrigin(frame.top),
     });
-    // 「无隐私面的放行项」（剪贴板写）保持旧行为不分框架；其余（授予 / 模拟放行，以及要询问的）只给顶层站点自己的框架
-    if (base.decision === "allow" ? base.reason !== "allowed" : base.decision === "ask") {
+    // 「无隐私面的放行项」（剪贴板写）保持旧行为不分框架；其余（授予 / 模拟放行，以及要询问的，
+    // 还有 FRAME_RESTRICTED_ALLOWED_PERMISSIONS 里的放行项如扬声器名）只给顶层站点自己的框架
+    const frameFree = base.reason === "allowed" && !FRAME_RESTRICTED_ALLOWED_PERMISSIONS.includes(perm);
+    if (base.decision === "allow" ? !frameFree : base.decision === "ask") {
       const cross = !frame.isMainFrame && (frame.forceCross === true || origin !== frame.top);
       if (cross) return { perm, decision: "deny", reason: "cross-origin-frame" };
       if (perm === "notifications" && !frame.isMainFrame) return { perm, decision: "deny", reason: "notifications-main-frame-only" };
     }
     return { perm, ...base };
+  };
+
+  /**
+   * 判定入口。Electron 把麦克风和摄像头都报成 `media`（R9-02）：按请求的类型（`mediaTypes` / `mediaType`）拆成 `microphone` / `camera`
+   * 各自独立判定，再合并——任何一项被拒 / 被显式拒绝 = 拒绝；其余还没授予的合起来问一次（`askPerms` 只含还没授予的那几项，已授予的不重复问）；
+   * 全部已授予才放行。非 `media` 的权限原样走 {@link evaluateOne}。
+   * @param {unknown} [mediaTypes] 请求的 `details.mediaTypes`（数组）或检查的 `details.mediaType`（字符串）；只对 `media` 有意义
+   */
+  const evaluate = (owner, permission, origin, frame, mediaTypes) => {
+    const perm = canonicalPermission(permission) ?? String(permission);
+    if (perm !== MEDIA_PERMISSION) return evaluateOne(owner, perm, origin, frame);
+    const parts = mediaAtomsOf(mediaTypes).map((atom) => evaluateOne(owner, atom, origin, frame));
+    const denied = parts.find((p) => p.decision === "deny");
+    if (denied) return { perm: MEDIA_PERMISSION, decision: "deny", reason: denied.reason };
+    const askPerms = parts.filter((p) => p.decision === "ask").map((p) => p.perm);
+    if (askPerms.length > 0) return { perm: MEDIA_PERMISSION, decision: "ask", reason: "needs-user", askPerms };
+    return { perm: MEDIA_PERMISSION, decision: "allow", reason: parts[0].reason };
   };
 
   // ── 通知代理 ──
@@ -320,11 +341,19 @@ export const createPermissionGate = (deps) => {
 
   // ── 询问用户 ──
 
-  const askUser = (owner, perm, origin) => {
+  /**
+   * @param {string[]} perms 这一次要问的独立权限名（通常 1 个；同时问麦克风和摄像头时是 2 个）。
+   *   提示条 / 日志写的就是点「允许」之后授予的范围：1 个写它自己（麦克风 / 摄像头 / 定位…），2 个写合称 `media`（摄像头 + 麦克风）；
+   *   「本会话一直允许」把这几项各记一条授予，没问到的那一项（如只问了麦克风时的摄像头）不受牵连。
+   */
+  const askUser = (owner, perms, origin) => {
     const { session, tab } = owner;
     const state = getPermissionState(session, now);
-    const key = `${tab.id}|${origin}|${perm}`;
-    if ((state.cooldown.get(key) ?? 0) > now()) return Promise.resolve(false);
+    const perm = perms.length > 1 ? MEDIA_PERMISSION : perms[0];
+    const keyOf = (p) => `${tab.id}|${origin}|${p}`;
+    // 冷却按每一项记：刚拒绝过「麦克风 + 摄像头」，30 秒内只要麦克风的请求也不重复弹
+    if (perms.some((p) => (state.cooldown.get(keyOf(p)) ?? 0) > now())) return Promise.resolve(false);
+    const key = keyOf(perm);
     let pending = state.pendingAsk.get(key);
     if (!pending) {
       tabStateOf(tab).session = session;
@@ -340,7 +369,7 @@ export const createPermissionGate = (deps) => {
           state.pendingAsk.delete(key);
           const label = permissionLabel(perm);
           if (ans?.action === "allow" || ans?.action === "allow-session") {
-            if (ans.action === "allow-session") state.grantsFor(tab).allow(origin, perm, "user");
+            if (ans.action === "allow-session") for (const p of perms) state.grantsFor(tab).allow(origin, p, "user");
             safeSystemLog(owner, "permission", `用户${ans.action === "allow-session" ? "在本会话内一直允许" : "允许了一次"}${hostOfOrigin(origin)}的「${label}」权限`);
             return true;
           }
@@ -355,7 +384,7 @@ export const createPermissionGate = (deps) => {
             return false;
           }
           if (state.cooldown.size >= MAX_COOLDOWN_ENTRIES) state.cooldown.clear();
-          state.cooldown.set(key, now() + PERMISSION_COOLDOWN_MS);
+          for (const p of perms) state.cooldown.set(keyOf(p), now() + PERMISSION_COOLDOWN_MS);
           safeSystemLog(owner, "permission", `${ans?.timedOut ? "无人处理，已自动拒绝" : "已拒绝"}${hostOfOrigin(origin)}的「${label}」权限请求`);
           return false;
         });
@@ -383,7 +412,8 @@ export const createPermissionGate = (deps) => {
       if (!alive(owner)) return done(false);
       const origin = originOf(details?.requestingUrl);
       const frame = { isMainFrame: details?.isMainFrame !== false, top: originOf(owner.tab.url) };
-      const v = evaluate(owner, permission, origin, frame);
+      // `details.mediaTypes`：只对 media 有意义（["audio"] / ["video"] / 两者），决定问麦克风、摄像头还是两个
+      const v = evaluate(owner, permission, origin, frame, details?.mediaTypes);
       if (v.decision === "deny") return done(false);
       const finish = (allowed) => {
         if (!allowed) return done(false);
@@ -392,7 +422,7 @@ export const createPermissionGate = (deps) => {
         void ensureNotifStub(owner.tab).then(done, () => done(false));
       };
       if (v.decision === "allow") return finish(true);
-      void askUser(owner, v.perm, origin).then(
+      void askUser(owner, v.askPerms ?? [v.perm], origin).then(
         (allowed) => finish(allowed && alive(owner)),
         () => done(false),
       );
@@ -413,7 +443,8 @@ export const createPermissionGate = (deps) => {
       const embedding = originOf(details?.embeddingOrigin);
       const forceCross = embedding !== null && embedding !== origin;
       const isMainFrame = details?.isMainFrame !== false && !forceCross;
-      const v = evaluate(owner, permission, origin, { isMainFrame, top, forceCross });
+      // `details.mediaType`（audio / video / unknown）：只对 media 有意义；该类型没授予就不报 granted（unknown = 两个都得授予过）
+      const v = evaluate(owner, permission, origin, { isMainFrame, top, forceCross }, details?.mediaType);
       if (v.decision !== "allow") return false;
       // 通知：代理没装好时不报告已授予（否则页面会读到 granted 然后直接弹真通知）
       if (v.perm === "notifications" && !tabStateOf(owner.tab).notifReady) return false;

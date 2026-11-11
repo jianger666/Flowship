@@ -508,3 +508,148 @@ export const toCdpCommands = (state, prev) => {
 
 /** reset：清掉 prev 里有的所有方面（= toCdpCommands({}, prev)） */
 export const resetCommands = (prev) => toCdpCommands({}, prev ?? {});
+
+// ───────────────────────── 视图适配（模拟视口 vs 占位 div） ─────────────────────────
+//
+// 设备模拟把页面视口固定成 `width × height`（DIP）。原生视图（占位 div 那么大）和它不一样大时：
+//   - 视图比它大：多出来的是**白板**（A：视图收窄、水平居中、顶部对齐，DevTools 设备模式的摆法）；
+//   - 视图比它小：页面被**裁切**（B：整体缩小适应——CDP `scale`，等价 DevTools 的「Fit to window」）。
+//
+// B 的实现与实测约束（真 Electron 探针，见 scripts/browser-e2e/r10-emulation-fit.cjs 与契约 §14.4）：
+//   1. `scale` 必须和 `dontSetVisibleSize:true` 一起给——不给时 Chromium 会再按「视图/模拟尺寸」缩一次（0.6 变 0.36），
+//      且结果取决于设置顺序；给了之后任何顺序下页面都恰好铺满「模拟尺寸 × scale」的视图；
+//   2. 页面看到的一切不变：innerWidth / innerHeight、媒体查询、DOM 几何（getContentQuads / getBoxModel / 布局指标）、
+//      CDP 截图（含 clip）、滚轮距离都仍是模拟尺寸下的 CSS 像素；
+//   3. 用户真实点击：Chromium 自己按 scale 反向映射，不用处理；
+//   4. **CDP 输入坐标是视图坐标、不是 CSS 坐标**：AI 的 `Input.dispatchMouseEvent` / `dispatchTouchEvent` / `dispatchDragEvent`
+//      的 x / y 必须乘以 scale（滚轮 delta 不用）——见 {@link scaleInputParams}，由 `Tab.send` 统一补偿。
+
+const positiveInt = (n) => (typeof n === "number" && Number.isFinite(n) && n >= 1 ? Math.floor(n) : 0);
+
+/** 缩放适配的下限：模拟视口比槽位大 10 倍以上时不再缩（缩到看不清没意义），退回 A 的裁切 */
+export const MIN_FIT_SCALE = 0.1;
+
+/** scale 的精度：向下取整到 3 位小数，保证 `floor(模拟尺寸 × scale)` 一定放得进槽位，也让「拖面板每帧都改一点点」的 CDP 命令数可控 */
+const SCALE_PRECISION = 1000;
+
+/**
+ * 能做缩放适配的视口尺寸：宽和高都明确才行。只给宽或高（另一维自适应）时没有「整页该缩成多大」的答案——
+ * 另一维取多少取决于槽位，而它又随缩放变，所以这种模拟只走 A（收窄 + 居中），不缩放。
+ * @returns {{ width: number, height: number } | null}
+ */
+export const fitViewportOf = (emulation) => {
+  const s = emulation && typeof emulation === "object" ? emulation : {};
+  const width = positiveInt(s.width);
+  const height = positiveInt(s.height);
+  return width && height ? { width, height } : null;
+};
+
+/**
+ * 槽位里该用的缩放比例：`min(1, 槽位宽 / 模拟宽, 槽位高 / 模拟高)`，向下取 3 位小数；不放大。
+ * 返回 1 = 不缩放（没有可适配的视口 / 槽位已够大 / 缩放比例低于 {@link MIN_FIT_SCALE}）。
+ */
+export const fitScaleFor = (slot, emulation) => {
+  const vp = fitViewportOf(emulation);
+  if (!vp || !slot || !(slot.width > 0) || !(slot.height > 0)) return 1;
+  const raw = Math.min(1, slot.width / vp.width, slot.height / vp.height);
+  if (raw >= 1) return 1;
+  const s = Math.floor(raw * SCALE_PRECISION) / SCALE_PRECISION;
+  return s >= MIN_FIT_SCALE ? s : 1;
+};
+
+/**
+ * 把槽位按设备模拟（和当前缩放比例）收成原生视图该用的矩形：**水平居中、顶部对齐**，不放大。
+ *
+ * @param {{ x: number, y: number, width: number, height: number }} slot 占位 div 的矩形（已取整、已按宿主缩放换算成 DIP）
+ * @param {object | null | undefined} emulation tab.emulation 状态（只读 width / height；0 / 缺省 = 自适应）
+ * @param {number} [scale] 页面当前**已生效**的缩放比例（< 1 才有意义；缺省 / ≥ 1 = 不缩放）。视图尺寸 = floor(模拟尺寸 × scale)
+ * @returns {{ bounds: { x: number, y: number, width: number, height: number },
+ *             fit: { left: number, top: number, width: number, height: number } | null }}
+ *   bounds = 原生视图实际该用的矩形；fit = 它占槽位的比例（0..1，与宿主缩放无关），没收窄时为 null——
+ *   遮盖占位图要按它摆在同一个位置，否则会被拉伸成整个槽位
+ */
+export const fitBoundsToEmulation = (slot, emulation, scale = 1) => {
+  const none = { bounds: slot, fit: null };
+  if (!slot || !(slot.width > 0) || !(slot.height > 0)) return none;
+  const s = emulation && typeof emulation === "object" ? emulation : {};
+  const k = typeof scale === "number" && Number.isFinite(scale) && scale > 0 && scale < 1 ? scale : 1;
+  const ew = positiveInt(s.width);
+  const eh = positiveInt(s.height);
+  if (!ew && !eh) return none;
+  const shrink = (n) => (k < 1 ? Math.max(1, Math.floor(n * k)) : n);
+  const width = ew ? Math.min(slot.width, shrink(ew)) : slot.width;
+  const height = eh ? Math.min(slot.height, shrink(eh)) : slot.height;
+  if (width === slot.width && height === slot.height) return none;
+  const dx = Math.floor((slot.width - width) / 2);
+  return {
+    bounds: { x: slot.x + dx, y: slot.y, width, height },
+    fit: { left: dx / slot.width, top: 0, width: width / slot.width, height: height / slot.height },
+  };
+};
+
+/**
+ * 两个 `viewFit`（{@link fitBoundsToEmulation} 的 `fit`）是否相同：null / undefined 等价（都是「视图没被模拟收窄」），否则逐字段严格相等。
+ * 与渲染端 store 的 `sameViewFit`（`src/components/browser/browser-state-store.ts`）同一口径——主进程只在它「渲染端会判为变了」时才推状态，
+ * 两边口径不同就会出现「主进程以为没变没推、渲染端其实旧了」或反过来白推。
+ * @param {{ left: number, top: number, width: number, height: number } | null | undefined} a
+ * @param {{ left: number, top: number, width: number, height: number } | null | undefined} b
+ */
+export const sameViewFit = (a, b) => {
+  if (!a || !b) return !a && !b;
+  return a.left === b.left && a.top === b.top && a.width === b.width && a.height === b.height;
+};
+
+/**
+ * 当前模拟状态的「视口覆盖」命令（带缩放比例）；没有视口项（只有 touch / 外观类）= null。
+ * 与 `toCdpCommands` 里 viewport 方面发的 `Emulation.setDeviceMetricsOverride` 参数一致，只是多了 scale——
+ * 缩放比例变了而状态没变（拖面板）时用它单独重发一条。
+ */
+export const viewportMetricsCommand = (state, scale = 1) => {
+  const s = state && typeof state === "object" ? state : {};
+  const metrics = s.width !== undefined || s.height !== undefined || s.deviceScaleFactor !== undefined || s.mobile !== undefined;
+  if (!metrics) return null;
+  return withFitScale(
+    [
+      {
+        method: "Emulation.setDeviceMetricsOverride",
+        params: { width: s.width ?? 0, height: s.height ?? 0, deviceScaleFactor: s.deviceScaleFactor ?? 0, mobile: s.mobile === true },
+      },
+    ],
+    scale,
+  )[0];
+};
+
+/**
+ * 给命令序列里的 `Emulation.setDeviceMetricsOverride` 加上缩放参数（scale < 1 时才加；同时必须带 dontSetVisibleSize，原因见本节开头）。
+ * 不改入参。
+ */
+export const withFitScale = (commands, scale) => {
+  if (!(typeof scale === "number" && scale > 0 && scale < 1)) return commands;
+  return commands.map((c) =>
+    c.method === "Emulation.setDeviceMetricsOverride" ? { ...c, params: { ...c.params, scale, dontSetVisibleSize: true } } : c,
+  );
+};
+
+/** 带「视口坐标」的 CDP 输入方法：缩放生效时 x / y 要乘 scale（滚轮的 deltaX / deltaY 不用） */
+export const INPUT_COORD_METHODS = Object.freeze(["Input.dispatchMouseEvent", "Input.dispatchTouchEvent", "Input.dispatchDragEvent"]);
+
+/** 仓库里用到、但不带坐标的 CDP 输入方法（不需要补偿）。新增任何 `Input.*` 都必须归到这两个清单之一，由测试钉死 */
+export const INPUT_PLAIN_METHODS = Object.freeze(["Input.dispatchKeyEvent", "Input.insertText", "Input.setIgnoreInputEvents", "Input.setInterceptDrags"]);
+
+/**
+ * AI 的输入坐标是页面 CSS 像素，而 CDP 输入要的是**视图**坐标：缩放适配生效（scale < 1）时要乘以 scale，
+ * 页面才会在 CSS 坐标 (x, y) 收到事件。scale ≥ 1 / 非输入方法原样返回同一个对象。不改入参。
+ */
+export const scaleInputParams = (method, params, scale) => {
+  if (!(typeof scale === "number" && scale > 0 && scale < 1)) return params;
+  if (!params || typeof params !== "object") return params;
+  const k = (n) => (typeof n === "number" && Number.isFinite(n) ? n * scale : n);
+  if (method === "Input.dispatchMouseEvent" || method === "Input.dispatchDragEvent") {
+    return { ...params, x: k(params.x), y: k(params.y) };
+  }
+  if (method === "Input.dispatchTouchEvent") {
+    if (!Array.isArray(params.touchPoints)) return params;
+    return { ...params, touchPoints: params.touchPoints.map((p) => (p && typeof p === "object" ? { ...p, x: k(p.x), y: k(p.y) } : p)) };
+  }
+  return params;
+};

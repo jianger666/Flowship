@@ -6,10 +6,9 @@
  *   临时开触屏模拟 → `Input.dispatchTouchEvent` → 恢复 → 动作后稳定期。
  * 一律走 `session.runAction`（队列 / AI 归因 / 接管打断 / 活动日志 actor ai 与 click 一致）。
  *
- * 红线 3：本工具没有任何文本入参，也不产生字符输入——对敏感输入框的触屏点击只会聚焦，不会让 AI 键入口令；
+ * 本工具没有任何文本入参，也不产生字符输入——对输入框（含密码框）的触屏点击只会聚焦、不会输入字符；（2026-11-11 起 AI 往密码框输入本身已不再被拦，这里只是如实描述它不是输入通道）
  * 页面隔离，所以 Flowship origin 无关（AI 永远进不了 Flowship 自己的页面，见 url-policy）。
  */
-import { HELD_BUTTON_CLICK_MESSAGE, heldButtonBitsOf } from "../secret-field.mjs";
 import { BrowserError } from "../server-channel.mjs";
 import { describeTouch, normalizeTouchArgs, planGesture, runGesture, swipeEnd, withTouchEmulation } from "../touch-kit.mjs";
 import { checkMousePoint } from "./input.mjs";
@@ -38,8 +37,6 @@ export const createHandlers = (deps) => {
     session.runAction({ op: "touch", tabId: a.tabId, signal }, (ctx) =>
       I.aiScope(ctx.tab, async () => {
         const tab = ctx.tab;
-        // R6-30 四轮复审 P3①：AI 还按着 browser_mouse 的键时，触摸手势（可能合成兼容鼠标事件）会在没探过的位置动鼠标——派发（含临时开触屏模拟）之前先拒
-        if (heldButtonBitsOf(tab) !== 0) throw new BrowserError("BAD_ARGS", HELD_BUTTON_CLICK_MESSAGE);
         await tab.ensureCdp();
         const before = I.beforeState(tab);
         // 目标 → 视口坐标：ref 走与 click 同款的 locate（含遮挡检查：被浮层盖住的元素触摸也点不到）；坐标要落在视口内

@@ -10,13 +10,11 @@ import { describeModifiers, modifierBits } from "../electron-app/browser/actions
 import { filterSnapshotText } from "../electron-app/browser/ax-snapshot.mjs";
 import { ALL_OPS, createIdleTracker, normalizeOpArgs } from "../electron-app/browser/index.mjs";
 import {
-  PASSWORD_REJECT_MESSAGE,
   checkMousePoint,
   createHandlers,
   describeFillForm,
   describeMouseAction,
   isFatalFillError,
-  isSecretField,
   normalizeModifiers,
 } from "../electron-app/browser/ops/input.mjs";
 import { BrowserError } from "../electron-app/browser/server-channel.mjs";
@@ -303,20 +301,7 @@ describe("fill_form 参数校验", () => {
   });
 });
 
-describe("敏感字段判定 / 摘要 / 致命错误", () => {
-  it("isSecretField：type=password 或 autocomplete 含 password / one-time-code", () => {
-    expect(isSecretField({ type: "password" })).toBe(true);
-    expect(isSecretField({ type: "PASSWORD" })).toBe(true);
-    expect(isSecretField({ type: "text", autocomplete: "one-time-code" })).toBe(true);
-    expect(isSecretField({ type: "text", autocomplete: "current-password" })).toBe(true);
-    expect(isSecretField({ type: "text", autocomplete: "section-a new-password" })).toBe(true);
-    expect(isSecretField({ type: "text", autocomplete: "email" })).toBe(false);
-    expect(isSecretField({ type: "text", autocomplete: "" })).toBe(false);
-    expect(isSecretField(null)).toBe(false);
-  });
-  it("拒绝文案指向 browser_ask_user_to_act", () => {
-    expect(PASSWORD_REJECT_MESSAGE).toContain("browser_ask_user_to_act");
-  });
+describe("摘要 / 致命错误", () => {
   it("describeFillForm 只写数量", () => {
     expect(describeFillForm(3, 3, undefined)).toBe("填写了表单 3/3 项");
     expect(describeFillForm(3, 2, "skipped")).toBe("填写了表单 2/3 项，失败 1 项，因有失败项已跳过提交");
@@ -336,13 +321,13 @@ describe("敏感字段判定 / 摘要 / 致命错误", () => {
 
 /** 假 v1Internals：记录调用，callOnNode 按页内函数源码分流返回预设 */
 const makeHarness = (opts: {
-  fieldInfo?: Record<string, { type?: string; autocomplete?: string }>;
   checked?: Record<string, { kind: string; checked: boolean; disabled?: boolean }>;
   failRefs?: Set<string>;
   viewport?: { viewportW: number; viewportH: number };
 }) => {
   const calls: Array<{ fn: string; args: any }> = [];
   const mouseEvents: any[] = [];
+  const probedFns: string[] = []; // callOnNode 收到的页内函数（fill_form 填文本框时不应再探字段类型）
   const checkedState = { ...(opts.checked ?? {}) };
   const tab = {
     ensureCdp: async () => {},
@@ -356,7 +341,6 @@ const makeHarness = (opts: {
   };
   const CHECKED_STATE_FN = "CHECKED_STATE_FN";
   const I: any = {
-    assertPointNotSecret: async () => {}, // R6-30：落点探针在 tests/browser-r6-s2-shadow-frame.test.ts 里真跑，这里只关心派发顺序
     aiScope: async (_tab: unknown, fn: () => Promise<unknown>) => fn(),
     beforeState: () => ({}),
     actionResult: () => ({ tabId: "t1", url: "https://a.test/", title: "A", navigated: false }),
@@ -366,8 +350,9 @@ const makeHarness = (opts: {
     settle: async () => {},
     CHECKED_STATE_FN,
     callOnNode: async (_t: unknown, entry: any, _ref: string, fn: string) => {
+      probedFns.push(fn);
       if (fn === CHECKED_STATE_FN) return checkedState[entry.ref] ?? { kind: "other" };
-      return opts.fieldInfo?.[entry.ref] ?? { tag: "input", type: "text", autocomplete: "" };
+      return { tag: "input", type: "text", autocomplete: "" };
     },
     typeBody: async (_s: unknown, _c: unknown, a: any) => void calls.push({ fn: "type", args: a }),
     selectBody: async (_s: unknown, _c: unknown, a: any) => {
@@ -385,27 +370,24 @@ const makeHarness = (opts: {
       fn({ tab, signal: undefined, check: () => {}, describe: (d: any) => described.push(d) }),
   };
   const handlers = createHandlers({ actions: { v1Internals: I, modifierBits }, requireSession: () => session });
-  return { handlers, calls, mouseEvents, described, checkedState };
+  return { handlers, calls, mouseEvents, described, checkedState, probedFns };
 };
 
 describe("fill_form handler（假 session）", () => {
-  it("密码字段被拒绝（ok:false，指向 browser_ask_user_to_act）且不会调用 type；其它项照常", async () => {
-    const h = makeHarness({ fieldInfo: { e2: { type: "password" } } });
+  it("文本字段（含登录表单的账号 / 密码框）一律直接 type：不探字段类型、全部 ok；填写的值不进日志文案", async () => {
+    const h = makeHarness({});
     const r: any = await h.handlers.fill_form("t", {
-      fields: [{ ref: "e1", value: "u" }, { ref: "e2", value: "secret" }, { ref: "e3", value: "z" }],
+      fields: [{ ref: "e1", value: "u" }, { ref: "e2", value: "secret-pw" }, { ref: "e3", value: "z" }],
     });
-    expect(r.results.map((x: any) => x.ok)).toEqual([true, false, true]);
-    expect(r.results[1].error).toBe(PASSWORD_REJECT_MESSAGE);
-    expect(h.calls.filter((c) => c.fn === "type").map((c) => c.args.ref)).toEqual(["e1", "e3"]);
-    // 密码值绝不进入任何日志文案
-    expect(JSON.stringify(h.described)).not.toContain("secret");
-  });
-
-  it("autocomplete=one-time-code 的文本框同样拒绝", async () => {
-    const h = makeHarness({ fieldInfo: { e1: { type: "text", autocomplete: "one-time-code" } } });
-    const r: any = await h.handlers.fill_form("t", { fields: [{ ref: "e1", value: "123456" }] });
-    expect(r.results[0].ok).toBe(false);
-    expect(h.calls.length).toBe(0);
+    expect(r.results.map((x: any) => x.ok)).toEqual([true, true, true]);
+    expect(h.calls.filter((c) => c.fn === "type").map((c) => [c.args.ref, c.args.text])).toEqual([
+      ["e1", "u"],
+      ["e2", "secret-pw"],
+      ["e3", "z"],
+    ]);
+    expect(h.probedFns).toEqual([]);
+    // 填写的值绝不进入任何日志文案
+    expect(JSON.stringify(h.described)).not.toContain("secret-pw");
   });
 
   it("单字段失败不中断后续字段；results 逐项给成败", async () => {
@@ -451,7 +433,7 @@ describe("fill_form handler（假 session）", () => {
     expect(ok.calls[1].args.ref).toBe("e9");
     expect(ok.described.at(-1).kind).toBe("submit");
 
-    const part = makeHarness({ fieldInfo: { e1: { type: "password" } } });
+    const part = makeHarness({ failRefs: new Set(["e1"]) });
     const r2: any = await part.handlers.fill_form("t", { fields: [{ ref: "e1", value: "p" }], submitRef: "e9" });
     expect(r2.submit.ok).toBe(false);
     expect(r2.submit.error).toContain("已跳过提交");

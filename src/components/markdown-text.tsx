@@ -67,6 +67,7 @@ import { parseMediaRefToken, resolveMediaRef } from "@/lib/media/media-ref";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
+import { remarkUrlCodeLink } from "@/lib/remark-url-code-link";
 
 // mermaid：**不能直接用上游的 `mermaid` 单例**——它对标签里的 `<img>` / classDef 的 `url()` 不拦，渲染即向外发请求
 // （追踪像素 / 数据外带，R7-1）。这里 = 上游插件 + 安全配置（dompurifyConfig 禁图片 / 媒体 / 样式标签）+ render 前预扫闸
@@ -97,6 +98,8 @@ const REMARK_PLUGINS = [
   remarkCodeReference,
   remarkKeepTrailingUnderscore,
   remarkTrimAutolinkCjk,
+  // 必须在 remarkTrimAutolinkCjk 之后：它会按 CJK 字符切断「裸链接」，我们换出来的整块网址不该被切（R11-01）
+  remarkUrlCodeLink,
 ];
 // rehype 插件链：列表本体在 lib/streamdown-options.ts（纯 .ts，测试能拿真实插件链跑 Streamdown）；这里原样再导出，
 // artifact-panel / artifact-revision-view 的导入路径不变。顺序 = raw → UNC 拦截 → 本地图改写 → sanitize → harden。

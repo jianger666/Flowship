@@ -1027,6 +1027,35 @@ agent 自己在群里 @ 别人要数据、再登记 `expect_group_reply` 时，*
 没 @ 到本机机器人，本机根本收不到回复——登记了也等不到。其余约定同工具描述：一条只问一件事、写清要什么形态的
 答案；对方是机器人时再加一句「只回实质答案，不用回复『收到』」，免得两边互相客套成环。
 
+### 出问回来后在哪儿回：上下文在群里就聚焦群里（2026-11-11）
+
+用户反馈两件事：① 用户在群里 @ 机器人「你问下国标字段名」，机器人在**同一个群**里 @ 国标问完，又在群里发一条「已在需求群 @国标，问他…」——
+用户本来就在群里看着，纯噪音；② 国标在群里回了，回执被喂回会话后 agent 的结论**只出现在 Flowship、群里没有下文**（旧设计「吃掉就闭嘴」），
+用户觉得反常识——**上下文在群里就该聚焦群里，在 Flowship 里聊就聚焦 Flowship**。
+
+做法（两处都小）：
+
+1. **同群问完不复述（纯提示词，零代码路径）**：`expect_group_reply` 工具描述新增「回话位置跟着上下文走」一段——
+   这一轮是用户在群里让你去问的（输入带 `[群消息·来自…]` 抬头）且你问在同一个群里 → 收尾整段第一行只写 `NO_REPLY`
+   （沿用既有哨兵：首行 `NO_REPLY` 整段不外发，下面可另起行写给 Flowship 里看的说明），不要再在群里复述「我已经问了谁」；
+   用户是在 Flowship 里让你去问的 → 照常告诉用户。⚠️ 靠模型遵守；`NO_REPLY` 也撤不回「前面叙述已经创建的流式卡」。
+2. **回执回来后结论发回群里、@ 最初提问的人（`replyTo`）**：`expect_group_reply` 的 handler 登记出问时，
+   若该任务属主通道里有一条**真人**的群提问登记（`runTag === null && kind === "question" && !requesterIsBot`，即用户正在群里等结果）→
+   把 `{ requesterOpenId, requesterName, chatId }` 记进出问登记（`OutboundQuestionEntry.replyTo`；registry 只收 `ou_` 形态 + 非空 chatId，其余不记）。
+   之后国标的回执命中并**喂回活会话**（`group-route.ts` 的 feed 路）时，若 `replyTo.chatId === 回执所在群`，就把这一轮的输出
+   登记成回群（属主通道、`question`、真人 → 出向自动在开头 @ 最初提问的人，**不是 @ 国标**），数据头里告诉 agent「你这一轮的回复会发回群里、
+   @ 最初提问的人，直接对他讲结论、不复述；确实没有要说的就整段只写 NO_REPLY」。
+
+不变 / 边界（都有单测钉死，`tests/group-correlated-reply-to-origin.test.ts`）：
+
+- **Flowship 里发起的任务不变**：没有真人群提问登记 → 不记 `replyTo` → 回执喂回后照旧静默（agent 的结论在 Flowship 里）。
+- **提问人是机器人不回群**：沿用防环（机器人 ↔ 机器人互 @ 成环）；旁路（restricted）通道、推进（advance）登记也不记。
+- **主链在跑时不预登记（G3-05 同款）**：预登记会把在飞那一轮的属主单格挤进 `previous`，注入返回前的 delta 全落在随后被摘掉的新登记上。
+  判据同 `ownerQueueExpected`（`running` 且当前 action 不在 `awaiting_ack / cancelled / error`）；预期排队却真回了 200（收尾窗口）→ 补登记；
+  **202 排队 = 没有 run 开跑，保持静默**（结论只在 app 里，这是已知局限）。空闲时则必须在注入**之前**登记（新 run 最早的 delta 不落空）。
+- 注入失败（非 2xx / 抛异常）摘掉刚建的登记；属主那一格被在飞的推进登记占着时不顶掉它；回执发件人不是被问的人 → 不命中。
+- 回执即焚、不串群（`replyTo.chatId` 与回执所在群不同则不登记）。
+
 ### 答疑旁路的准入闸（第七 / 八轮；第 11 轮起没有「按群开关」）
 
 非属主（群里别的真人）@ 机器人时，进旁路答疑之前要过一道闸（`feishu-bridge/restricted-qa-gate.ts`，`group-route.ts` 早期判定 + 排队回放时复判 +
@@ -1132,7 +1161,7 @@ agent 自己在群里 @ 别人要数据、再登记 `expect_group_reply` 时，*
 群侧不再拒收，交给注入链入队。⚠️ 只豁免「主链在跑」；**旁路答疑在飞仍按原口径拒收**（那是群侧串行闸、不是主链排队）。
 ⚠️ **文档与实现的已知偏差（G3-09，没修）**：实现里豁免的判据只是 `isOwner && rawBusy === GROUP_TASK_RUNNING`，
 主链与旁路**同时**在飞时属主消息仍被豁免、进了队列，回放可能与旁路并行；「旁路在飞仍拒收」只对没有主链在跑的情形成立。
-入队后回群一句「收到，当前这轮跑完就处理」；托办回执入队**静默**（回执本来就不回群），关联登记入队时就 burn
+入队后回群一句「收到，当前这轮跑完就处理」；托办回执入队**静默**（排队 = 没有 run 开跑；结论回群只对「真的喂进了活会话」的那条路生效，见「出问回来后在哪儿回」），关联登记入队时就 burn
 （文本已存进队列，留着会被下一句复读二次消费）；两者都摘掉回群登记（没有 run 开跑，留着会被下一轮无关的 done 误收）。
 机器人发件人的回执文案照例静默（`groupReplyMention`）。
 
@@ -1711,6 +1740,8 @@ info 写失败都吞掉。调用方拿到返回值也不需要做任何事（返
   每类事件带 `groupRun`）
 - 其余群相关：`tests/group-outbound-registry.test.ts`（出问登记：发件人 / 窗口期两门、关键词仅备注、一问一答即焚）、
   `tests/expect-group-reply.test.ts`（`expect_group_reply` handler：caller 校验 / target 形态 / 成功登记）、
+  `tests/group-correlated-reply-to-origin.test.ts`（27，2026-11-11：出问登记 `replyTo` 的收 / 不收、工具何时记、回执喂回后登记回群 / 不预登记 / 200 补登记 / 202 静默 / 失败摘登记 / 推进不被顶掉、
+  出向真的 @ 最初提问的人、首行 `NO_REPLY` 零消息；10 个变异验证过，含「注入进行中那一刻的登记快照」）、
   `tests/bridge-group-scopes.test.ts`（群权限探针 + scope 缺失翻译）、`tests/feishu-group-collab-policy.test.ts`（行为固定化、
   老 `groupCollab` 配置不再生效）、`tests/meegle-group-type-parse.test.ts`（`group_type` 按值形状兜底）、
   `tests/requirement-group-client.test.ts`（死绑定 code → `needGroupRebuild`）

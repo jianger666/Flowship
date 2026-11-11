@@ -12,22 +12,7 @@
  */
 import { BrowserError } from "./server-channel.mjs";
 import { aiWriteLedgerOf, isPasteCombo, pasteRejection } from "./clipboard-policy.mjs";
-import { mergeVerdicts, probeDropSecretCdp, probeFocusSecretCdp } from "./closed-shadow.mjs";
 import { runUntilStable, UNTIL_STABLE_EXPR } from "./scroll-kit.mjs";
-import {
-  ACTIVE_SECRET_PROBE_SOURCE,
-  DROP_TARGET_SECRET_PROBE_SOURCE,
-  HELD_BUTTON_CLICK_MESSAGE,
-  PASSWORD_REJECT_MESSAGE,
-  SECRET_DROP_MESSAGE,
-  SECRET_FIELD_FNS_SOURCE,
-  SECRET_PRESS_KEY_MESSAGE,
-  UNKNOWN_DROP_MESSAGE,
-  UNKNOWN_FIELD_TYPE_MESSAGE,
-  UNKNOWN_FOCUS_PRESS_KEY_MESSAGE,
-  UNKNOWN_FOCUS_TYPE_MESSAGE,
-  heldButtonBitsOf,
-} from "./secret-field.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -414,21 +399,17 @@ const OCCLUSION_FN = `function (x, y) {
   } catch (e) { return { hit: 'skip' }; }
 }`;
 
-// 输入控件分类。`secret`：密码 / 验证码 / 银行卡 / 被 -webkit-text-security 遮罩的字段（规则来自 secret-field.mjs，R1-02 / R1-25）
+// 输入控件分类（type 用：判断能不能输入、是不是日期 / 时间这类分段控件）
 const INPUT_KIND_FN = `function () {
-  ${SECRET_FIELD_FNS_SOURCE}
   var el = this;
   var tag = String(el.tagName || '').toLowerCase();
   var type = String(el.type || '').toLowerCase();
   var textTypes = ['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number', 'date', 'datetime-local', 'month', 'time', 'week'];
   var ro = !!(el.readOnly || el.disabled);
-  // 探针自己出错按「是敏感字段」处理（fail-closed，R2-03）：与 ACTIVE / ELEMENT 两个探针同向
-  var secret = true;
-  try { secret = isSecretInfo(readSecretInfo(el)); } catch (e) { secret = true; }
-  if (tag === 'textarea') return { kind: 'textarea', readOnly: ro, secret: secret };
-  if (tag === 'input') return { kind: textTypes.indexOf(type) >= 0 ? 'input' : 'noninput', type: type, readOnly: ro, secret: secret };
-  if (el.isContentEditable) return { kind: 'editable', readOnly: false, secret: secret };
-  return { kind: 'other', readOnly: false, secret: secret };
+  if (tag === 'textarea') return { kind: 'textarea', readOnly: ro };
+  if (tag === 'input') return { kind: textTypes.indexOf(type) >= 0 ? 'input' : 'noninput', type: type, readOnly: ro };
+  if (el.isContentEditable) return { kind: 'editable', readOnly: false };
+  return { kind: 'other', readOnly: false };
 }`;
 
 // input / textarea 清空：用原生 setter（React 受控组件才会感知）并派发 input 事件；contenteditable 全选等 Delete
@@ -673,11 +654,6 @@ const BUTTON_BITS = { left: 1, right: 2, middle: 4 };
 
 const mouse = (tab, params) => tab.send("Input.dispatchMouseEvent", params, null, 5000);
 
-/** 该 tab 还有 AI 按着没放的鼠标键 → BAD_ARGS（R6-30 三轮复审②；调用方须在派发任何鼠标事件之前调用） */
-const assertNoHeldButtons = (tab) => {
-  if (heldButtonBitsOf(tab) !== 0) throw new BrowserError("BAD_ARGS", HELD_BUTTON_CLICK_MESSAGE);
-};
-
 /**
  * 修饰键名数组 → CDP modifiers 位掩码（V1：click / mouse 的 modifiers 参数）。
  * 未知名字忽略（参数校验在 index.mjs / ops/input.mjs 的 normalize 里做，这里只管换算）。
@@ -697,14 +673,8 @@ export const describeModifiers = (list) => {
 /**
  * 点击序列：先移动到位，再按下 / 抬起 clickCount 次。
  * modifiers：CDP 位掩码，带在每个鼠标事件上（Blink 据此判断 Ctrl/Cmd+点击链接 = 新标签页、Shift+点击 = 新窗口等）。
- *
- * R6-30 三轮复审②：AI 用 `browser_mouse action=down` 按着键时，这里的 `mouseReleased` 会在点击位置结束按住的拖放，而点击位置没经过落点探针
- * （密码框 / 无法检查的 iframe 会收到被拖的文字）——所以**所有**经这里点击的工具（click / type 的点击兜底 / fill_form / ……）在派发任何事件之前，
- * 只要该 tab 还有没放的键就一律拒绝，让 AI 先 `browser_mouse action=up`（`up` 会检查落点）。
- * `browser_mouse` 自己的 click 在按着别的键时是有意的（右键点击同时按着左键），它自己在派发前已按「持键点击」探过落点，传 `keepHeld: true` 跳过本守卫。
  */
-const mouseClickAt = async (tab, { x, y }, { button = "left", clickCount = 1, modifiers = 0, keepHeld = false } = {}) => {
-  if (!keepHeld) assertNoHeldButtons(tab);
+const mouseClickAt = async (tab, { x, y }, { button = "left", clickCount = 1, modifiers = 0 } = {}) => {
   const bit = BUTTON_BITS[button] ?? 1;
   await mouse(tab, { type: "mouseMoved", x, y, button: "none", buttons: 0, modifiers });
   for (let n = 1; n <= clickCount; n++) {
@@ -767,7 +737,6 @@ export const hover = (session, args, { signal } = {}) =>
   session.runAction({ op: "hover", tabId: args.tabId, signal }, (ctx) =>
     aiScope(ctx.tab, async () => {
       const tab = ctx.tab;
-      assertNoHeldButtons(tab); // R6-30 四轮复审 P3①：按着键时 hover 的 mouseMoved 会把指针挪到没探过的位置
       const before = beforeState(tab);
       const target = await locate(tab, args.ref, ctx);
       ctx.describe({ kind: "click", summary: `悬停在${target.label}上`, label: `悬停 ${target.label}`, target: targetOf(target.entry, args.ref) });
@@ -800,11 +769,6 @@ const typeBody = async (session, ctx, args, { quick = false } = {}) => {
   const before = beforeState(tab);
   const target = await locate(tab, args.ref, ctx, { checkOcclusion: false });
   const info = await callOnNode(tab, target.entry, args.ref, INPUT_KIND_FN);
-  // R1-02：密码 / 验证码 / 银行卡类字段一律不让 AI 输入（与 fill_form 同源文案）。放在任何 describe / 输入派发之前，
-  // 活动日志与覆盖层都不会留下「在密码框输入了 N 个字符」这类痕迹。
-  if (info?.secret === true) throw new BrowserError("BAD_ARGS", PASSWORD_REJECT_MESSAGE);
-  // 探针没给出明确的 secret:false（返回空 / 形状不对）也不放行（R2-03 fail-open → fail-closed）
-  if (info?.secret !== false) throw new BrowserError("BAD_ARGS", UNKNOWN_FIELD_TYPE_MESSAGE);
   if (info?.kind === "noninput") {
     throw new BrowserError("BAD_ARGS", `元素 ${args.ref}（${target.label}）不是可输入文字的控件（类型 ${info.type || "未知"}）。勾选 / 按钮类请用 browser_click，选择下拉请用 browser_select`);
   }
@@ -828,9 +792,6 @@ const typeBody = async (session, ctx, args, { quick = false } = {}) => {
     } catch {
       await mouseClickAt(tab, target.point);
     }
-    // R2-03：上面探的是 ref 节点本身；真正拿到焦点的可能是别的元素（ref 指向包着密码框的容器，DOM.focus 抛错后点中心，
-    // 焦点落到里面的密码框）。清空（Delete 键）与输入之前都要确认「实际焦点」不是敏感字段
-    await assertFocusNotSecret(tab, target.entry, args.ref, TYPE_FOCUS_MESSAGES);
     if (clear) {
       const cleared = await callOnNode(tab, target.entry, args.ref, CLEAR_FN);
       if (cleared?.kind === "editable") {
@@ -840,8 +801,6 @@ const typeBody = async (session, ctx, args, { quick = false } = {}) => {
       await callOnNode(tab, target.entry, args.ref, CARET_END_FN);
     }
     ctx.check();
-    // 清空 / 移光标的脚本可能又动了焦点：insertText 与 Enter 之前再确认一次
-    await assertFocusNotSecret(tab, target.entry, args.ref, TYPE_FOCUS_MESSAGES);
     if (temporal) {
       // 分段控件：clear 阶段已经把值清空；text 非空时用原生 setter 写入并回读校验
       if (text !== "") {
@@ -870,58 +829,6 @@ export const type = (session, args, { signal } = {}) =>
   session.runAction({ op: "type", tabId: args.tabId, signal }, (ctx) => aiScope(ctx.tab, () => typeBody(session, ctx, args)));
 
 // ───────────────────────── press_key ─────────────────────────
-
-/**
- * 这个按键会往焦点输入框里写入字符吗？parseKeyCombo 只在「没有 Ctrl / Meta / Alt」时才给 text；
- * Enter 的 text 是 "\r"（换行 / 提交，不泄漏口令内容），不算。Space 的 text 是 " "，算。
- */
-export const pressKeyInsertsText = (parsed) => typeof parsed?.text === "string" && parsed.text !== "\r";
-
-/**
- * 这个按键会往焦点字段里写入 / 粘贴 / 剪切 / 复制文本吗？比 {@link pressKeyInsertsText} 多覆盖（R2-03）：
- * - 编辑命令 paste / cut / copy（Ctrl/Cmd+V / X / C）：粘贴能把别处复制来的内容塞进密码框，复制 / 剪切能把被 CSS 遮罩的字段内容带进剪贴板
- *   （Blink 只对 type=password 禁止复制，text-security 遮罩的 text 框可以复制）；
- * - 不经 `commands` 的原生键位：Shift+Insert（粘贴）、Ctrl+Insert（复制）、Shift+Delete（剪切）、macOS 的 Ctrl+Y（yank，把 kill 缓冲区贴回来）。
- * 其余 Ctrl / Meta 组合（全选 / 撤销 / 方向键 …）、Enter / Tab / 功能键不受限。
- */
-export const pressKeyTouchesText = (parsed) => {
-  if (pressKeyInsertsText(parsed)) return true;
-  if (Array.isArray(parsed?.commands) && parsed.commands.some((c) => c === "paste" || c === "cut" || c === "copy")) return true;
-  const key = String(parsed?.key ?? "").toLowerCase();
-  const mods = Array.isArray(parsed?.modifierList) ? parsed.modifierList : [];
-  if (key === "insert" && (mods.includes("Shift") || mods.includes("Control"))) return true;
-  if (key === "delete" && mods.includes("Shift")) return true;
-  if (key === "y" && mods.includes("Control")) return true;
-  return false;
-};
-
-/** type 在聚焦之后核对「实际焦点」用的两句拒绝文案（与 press_key 的按键文案区分开） */
-const TYPE_FOCUS_MESSAGES = { secret: PASSWORD_REJECT_MESSAGE, unknown: UNKNOWN_FOCUS_TYPE_MESSAGE };
-
-/**
- * 焦点必须不是敏感字段：有 ref 时在该元素所在 frame 里查（OOPIF 也能查），否则查主页面的 activeElement。
- * 穿透 shadow root 与同源 iframe；跨域 iframe 看不进去 / 探针异常 → 一律拒绝（宁可误拒也不泄漏）。
- */
-export const assertFocusNotSecret = async (tab, entry, ref, messages = {}) => {
-  const secretMessage = messages.secret ?? SECRET_PRESS_KEY_MESSAGE;
-  const unknownMessage = messages.unknown ?? UNKNOWN_FOCUS_PRESS_KEY_MESSAGE;
-  let verdict;
-  if (entry) {
-    verdict = await callOnNode(tab, entry, ref, ACTIVE_SECRET_PROBE_SOURCE);
-  } else {
-    try {
-      const r = await tab.send("Runtime.evaluate", { expression: `(${ACTIVE_SECRET_PROBE_SOURCE}).call(null)`, returnByValue: true, silent: true });
-      verdict = r?.result?.value;
-    } catch {
-      verdict = "unknown";
-    }
-  }
-  // C7：页内探针只认 open shadow root；它说 safe 时再用 CDP 穿透 closed shadow root 复核（只会把 safe 升级成 secret / unknown）
-  if (verdict === "safe") verdict = mergeVerdicts(verdict, await probeFocusSecretCdp(tab, entry ?? null));
-  if (verdict === "safe") return;
-  if (verdict === "secret") throw new BrowserError("BAD_ARGS", secretMessage);
-  throw new BrowserError("BAD_ARGS", unknownMessage);
-};
 
 /**
  * R6-07：粘贴键的剪贴板闸门。`clipboard` 由 index.mjs 注入（Electron 的 clipboard，只用 readText；不注入 = 读不到 → 拒，fail-closed）。
@@ -967,9 +874,6 @@ export const pressKey = (session, args, { signal, clipboard } = {}) =>
             throw tab.mapNodeError(err, args.ref);
           }
         }
-        // R1-25 / R2-03：焦点是密码 / 验证码 / 银行卡类字段（或确认不了）时，不许按「会输入 / 粘贴 / 剪切 / 复制文本」的键
-        //（Enter / Tab / 功能键 / 其它 Ctrl 组合键不受限）
-        if (pressKeyTouchesText(parsed)) await assertFocusNotSecret(tab, entry, args.ref);
         // R6-07：粘贴键只放行「AI 本轮自己 browser_clipboard write 写入」的剪贴板；用户复制的内容不许被贴进页面再靠回显读出
         if (isPasteCombo(parsed)) assertAiPasteAllowed(session, clipboard);
         ctx.check();
@@ -1161,8 +1065,6 @@ export const drag = (session, args, { signal } = {}) =>
   session.runAction({ op: "drag", tabId: args.tabId, signal }, (ctx) =>
     aiScope(ctx.tab, async () => {
       const tab = ctx.tab;
-      // R6-30 三轮复审②：AI 还按着 browser_mouse 的键时，drag 自己的 press / release 会把那次按住的拖放结束在 drag 的落点上（只探了 toRef，没探按住的那次）——先拒
-      assertNoHeldButtons(tab);
       const before = beforeState(tab);
       const from = await locate(tab, args.fromRef, ctx);
       const to = await locate(tab, args.toRef, ctx, { checkOcclusion: false });
@@ -1176,12 +1078,6 @@ export const drag = (session, args, { signal } = {}) =>
       });
       await showAction(tab, from2, `拖动 ${from2.label}`, "drag", ctx);
       ctx.check();
-      // R2-03：拖放目标（落点处）是密码 / 验证码 / 银行卡类字段，或确认不了 → 不拖（文字拖进密码框 = 绕过 type 的拒绝）
-      let dropVerdict = await callOnNode(tab, to.entry, args.toRef, DROP_TARGET_SECRET_PROBE_SOURCE, [to.local.x, to.local.y]).catch(() => "unknown");
-      // C7：落点在 closed shadow root 里时 elementFromPoint 只会返回 host，页内探针看不到里面——用 CDP 穿透复核
-      if (dropVerdict === "safe") dropVerdict = mergeVerdicts(dropVerdict, await probeDropSecretCdp(tab, to.entry, to.local.x, to.local.y));
-      if (dropVerdict === "secret") throw new BrowserError("BAD_ARGS", SECRET_DROP_MESSAGE);
-      if (dropVerdict !== "safe") throw new BrowserError("BAD_ARGS", UNKNOWN_DROP_MESSAGE);
 
       let dragData = null;
       const off = tab.onCdpEvent((method, params) => {
@@ -1274,39 +1170,7 @@ const CHECKED_STATE_FN = `function () {
  * mouse / fill_form 在 ops/input.mjs 里实现，但必须与 click / type / select 共用同一套「定位 → 归因 → 稳定期」内核，
  * 所以把内部件集中导出而不是复制一份。仅限 V1 的 ops/input.mjs 使用，别的切片不要依赖这个对象。
  */
-/**
- * R6-30：browser_mouse 的「释放 / 中键点击」落点（主页面视口坐标）必须不是敏感字段。
- * 拖放落进密码框 = 文字被塞进去；Linux 下中键点击 = 粘贴 PRIMARY 选区——都绕过 type / press_key 的敏感字段拒绝。
- * 与 drag 同一机制：页内探针（含同源 iframe / open shadow）→ safe 时 CDP 复核（closed shadow；命中 iframe 一律 unknown）。
- * secret / unknown 都抛 BAD_ARGS（fail-closed）；`suffix` 给调用方补充「怎么自修复」的话。
- * `opts.timeoutMs`：页内探针那条 CDP 命令的超时（缺省 = tab 默认 20s）。取消 / 接管路径的「补发释放」复核用短超时，别让卡死的页面把收尾拖住。
- */
-export const assertPointNotSecret = async (tab, x, y, suffix = "", opts = {}) => {
-  let verdict;
-  try {
-    // this 固定为 documentElement：DROP_TARGET_SECRET_PROBE 会先判 this 自己（this 缺省会落到 window，读样式抛错 → 误判 secret）
-    const r = await tab.send(
-      "Runtime.evaluate",
-      {
-        expression: `(${DROP_TARGET_SECRET_PROBE_SOURCE}).call(document.documentElement, ${Number(x)}, ${Number(y)})`,
-        returnByValue: true,
-        silent: true,
-      },
-      null,
-      Number.isFinite(opts?.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : undefined,
-    );
-    verdict = r?.result?.value;
-  } catch {
-    verdict = "unknown";
-  }
-  if (verdict === "safe") verdict = mergeVerdicts(verdict, await probeDropSecretCdp(tab, null, x, y));
-  if (verdict === "safe") return;
-  if (verdict === "secret") throw new BrowserError("BAD_ARGS", SECRET_DROP_MESSAGE + suffix);
-  throw new BrowserError("BAD_ARGS", UNKNOWN_DROP_MESSAGE + suffix);
-};
-
 export const v1Internals = Object.freeze({
-  assertPointNotSecret,
   aiScope,
   beforeState,
   actionResult,

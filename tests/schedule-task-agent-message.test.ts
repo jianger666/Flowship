@@ -205,10 +205,13 @@ describe("task 模式：定时消息最终发给 agent 的文本", () => {
     expect(prompt).not.toContain("# 用户的话");
     expect(prompt).not.toContain("用户在任务页说了句话");
     expect(prompt).not.toContain("这是任务过程中用户的插话");
-    // 「# 边界」段也是定时口径：没有「疑问 / 小改动」二分类；明说这条通道没有 schedule 工具、取消要提醒用户去定时任务页
+    // 「# 边界」段也是定时口径：没有「疑问 / 小改动」二分类；这条通道有 schedule 工具、不再让模型「提醒用户去定时任务页取消」
     const boundary = prompt.slice(prompt.indexOf("# 边界"));
-    expect(boundary).toContain("没有 `schedule` 工具");
-    expect(boundary).toContain("定时任务」页取消");
+    expect(boundary).toContain("用 `schedule` 工具（action=cancel）取消它");
+    expect(boundary).not.toContain("没有 `schedule` 工具");
+    expect(boundary).not.toContain("定时任务」页取消");
+    // 身份：不再自称「临时助手」
+    expect(prompt).not.toContain("临时助手");
     expect(boundary).not.toContain("是疑问 → 直接回答");
     expect(boundary).not.toContain("是小改动要求 → 直接改");
     // 其余边界不丢：不提交 / 不提 MR、需要授权的操作先问用户
@@ -245,10 +248,14 @@ describe("task 模式：定时消息最终发给 agent 的文本", () => {
     expect(prompt).toContain("这是任务过程中用户的插话");
     expect(prompt).not.toContain("# 定时触发的消息");
     expect(prompt).not.toContain("定时自动触发");
-    // 常规边界原样（含二分类），不带定时版的 schedule 工具说明
+    // 常规边界原样（含二分类），不带定时版的「取消这条定时」说明
     const boundary = prompt.slice(prompt.indexOf("# 边界"));
     expect(boundary).toContain("是疑问 → 直接回答；是小改动要求 → 直接改");
-    expect(boundary).not.toContain("schedule");
+    expect(boundary).not.toContain("action=cancel");
+    // 不再自称「临时助手」；开头告诉它能用 schedule 设定时，边界里如实说没有 action 相关工具
+    expect(prompt).not.toContain("临时助手");
+    expect(prompt).toContain("用 schedule 工具设定时");
+    expect(boundary).toContain("交卷 / 提问 / 提 MR 这类工具这里没有");
   });
 });
 

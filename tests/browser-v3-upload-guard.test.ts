@@ -8,7 +8,6 @@ import { EXTRA_OPS } from "../electron-app/browser/ops/index.mjs";
 import { OPS, createHandlers, describeUpload, normalize, taskDataAllowDirs } from "../electron-app/browser/ops/env.mjs";
 import { OP_HELPERS } from "../electron-app/browser/index.mjs";
 import { createDownloadRegistry } from "../electron-app/browser/downloads.mjs";
-import { HELD_BUTTON_CLICK_MESSAGE } from "../electron-app/browser/secret-field.mjs";
 import {
   MAX_UPLOAD_BYTES,
   checkUploadShape,
@@ -334,59 +333,6 @@ describe("upload handler：setFileInputFiles 之前必须复检（R1-27）", () 
     });
     await expect(handlers.upload("task_1", args)).rejects.toMatchObject({ code: "BAD_ARGS", message: expect.stringMatching(/消失/) });
     expect(setCalls(sent)).toEqual([]);
-  });
-});
-
-describe("upload 按钮路径：AI 还按着 browser_mouse 的键时先拒（R6-30 三轮复审 B）", () => {
-  const mkButtonUpload = (heldBits: number) => {
-    const sent: Array<[string, unknown]> = [];
-    const tab = {
-      id: "t1",
-      url: "https://a.test/",
-      title: "A",
-      navCommitted: 0,
-      navStarted: 0,
-      ensureCdp: async () => {},
-      setAI: async () => {},
-      withAiInput: async (fn: () => Promise<unknown>) => fn(),
-      onCdpEvent: () => () => {},
-      heldButtonBits: () => heldBits,
-      resolveRef: () => ({ role: "button", name: "上传", backendNodeId: 9, sessionId: null }),
-      send: async (method: string, params: unknown) => {
-        sent.push([method, params]);
-        return {};
-      },
-      mapNodeError: (e: unknown) => e,
-    };
-    const session = {
-      tabSeq: 1,
-      tabs: [tab],
-      runAction: async (_o: unknown, fn: (ctx: unknown) => Promise<unknown>) => fn({ tab, describe: () => {}, signal: undefined, tabSeqAtStart: 1 }),
-    };
-    const handlers = createHandlers({
-      app: { getPath: () => "/ud" },
-      log: () => {},
-      getSession: () => session,
-      requireSession: () => session,
-      actions: {
-        labelOf: () => "上传按钮",
-        callOnNode: async () => ({ isFileInput: false }), // ref 是按钮 → 路径 B（点击 + 拦截文件选择框）
-        locate: async () => ({ point: { x: 10, y: 10 }, label: "上传按钮" }),
-        settle: async () => {},
-      },
-      abortable: (p: Promise<unknown>) => p,
-      guardFs: makeSwappableFs().fs,
-    }) as unknown as { upload: (t: string, a: { ref: string; paths: string[] }) => Promise<unknown> };
-    return { sent, handlers };
-  };
-
-  it("tab 上还有没放的键：BAD_ARGS（HELD_BUTTON_CLICK_MESSAGE），一个 Input.dispatchMouseEvent 都不发，文件选择框拦截已关、没发 setFileInputFiles", async () => {
-    const { sent, handlers } = mkButtonUpload(1);
-    await expect(handlers.upload("task_1", { ref: "e1", paths: ["/work/proj/a.png"] })).rejects.toMatchObject({ code: "BAD_ARGS", message: HELD_BUTTON_CLICK_MESSAGE });
-    expect(sent.filter(([m]) => m === "Input.dispatchMouseEvent")).toEqual([]);
-    expect(sent.filter(([m]) => m === "DOM.setFileInputFiles")).toEqual([]);
-    const intercepts = sent.filter(([m]) => m === "Page.setInterceptFileChooserDialog").map(([, p]) => (p as { enabled: boolean }).enabled);
-    expect(intercepts).toEqual([true, false]); // 开过、也关掉了（不留下「选择框一直被拦」）
   });
 });
 

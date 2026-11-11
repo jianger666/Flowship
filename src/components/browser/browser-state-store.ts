@@ -17,7 +17,14 @@ import type {
   DialogInfo,
   DownloadInfo,
   TabInfo,
+  ViewFit,
 } from "@/lib/browser-bridge-types";
+
+/** 缺省 / null 等价：都是「视图没被模拟收窄」。逐字段比（主进程每次推送都是新反序列化出来的对象，不能 `===`） */
+const sameViewFit = (a: ViewFit | null | undefined, b: ViewFit | null | undefined): boolean => {
+  if (!a || !b) return !a && !b;
+  return a.left === b.left && a.top === b.top && a.width === b.width && a.height === b.height;
+};
 
 const sameTab = (a: TabInfo, b: TabInfo): boolean =>
   a.id === b.id &&
@@ -30,7 +37,11 @@ const sameTab = (a: TabInfo, b: TabInfo): boolean =>
   a.isActive === b.isActive &&
   // V4 的缩放标签 / 模拟标签读这两个字段：漏比的话缩放（⌘=）或模拟变了、别的字段没变时 UI 冻结（R1-12）
   a.zoom === b.zoom &&
-  (a.emulation ?? null) === (b.emulation ?? null);
+  (a.emulation ?? null) === (b.emulation ?? null) &&
+  // 遮盖占位图按它定位：漏比的话换设备 / 拖面板宽度后，遮盖图还摆在旧位置
+  sameViewFit(a.viewFit, b.viewFit) &&
+  // 工具栏「适应 xx%」提示读它；缺省 = 没缩放
+  (a.fitScale ?? 1) === (b.fitScale ?? 1);
 
 const sameTabs = (a: readonly TabInfo[], b: readonly TabInfo[]): boolean =>
   a.length === b.length && a.every((t, i) => sameTab(t, b[i]!));

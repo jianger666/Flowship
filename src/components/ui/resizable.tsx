@@ -12,7 +12,7 @@
  * 本文件按 4.x API 直接 re-export：
  * - `ResizablePanelGroup`（直 re-export `Group`、Group 自带 inline style display/flex/width/height、不要再用 className 覆盖）
  * - `ResizablePanel`（直 re-export `Panel`、id / defaultSize / minSize / maxSize）
- * - `ResizableHandle`（包 `Separator`、`withHandle` 显示中间 grip 图标）
+ * - `ResizableHandle`（包 `Separator`、`withHandle` 显示中间 grip 小药丸：宽度不超过分隔条本体，见下方 R9-06 注释）
  *
  * 持久化用法（V0.5.10 task.uiLayout）：
  * - Group 上接 `onLayoutChanged`、释放鼠标后才触发（区别于 onLayoutChange 在拖动中高频触发）
@@ -26,7 +26,6 @@
  * - 用 lib 自带 `data-separator=active/focus` 走拖动 / 聚焦态颜色、不要自己写 group/handle
  */
 
-import { GripVertical } from "lucide-react";
 import { Group, Panel, Separator } from "react-resizable-panels";
 
 import { cn } from "@/lib/utils";
@@ -67,8 +66,16 @@ const ResizableHandle = ({
     {...props}
   >
     {withHandle && (
-      <div className="z-10 flex h-8 w-4 items-center justify-center rounded-sm border bg-border transition-colors hover:bg-primary/20">
-        <GripVertical className="h-3.5 w-3.5" />
+      // 抓手宽度不能超过分隔条本体（w-1.5 = 6px）：内置浏览器的原生视图永远盖在 HTML 之上，抓手伸出分隔条的部分
+      // 只要落在浏览器占位上就被盖掉（R9-06：原来 w-4 每侧伸出 5px，⋮⋮ 图标被切掉约 4px）。
+      // 所以不用 14px 宽的 GripVertical 图标，改成 6px 宽的小药丸 + 纵向三个点（纵向 group 时整体转 90°，见上面的 rotate-90）
+      <div
+        data-slot="resize-grip"
+        className="z-10 flex h-8 w-1.5 flex-col items-center justify-center gap-[3px] rounded-full bg-muted-foreground/30 transition-colors hover:bg-primary/40"
+      >
+        <span className="size-[3px] rounded-full bg-foreground/60" />
+        <span className="size-[3px] rounded-full bg-foreground/60" />
+        <span className="size-[3px] rounded-full bg-foreground/60" />
       </div>
     )}
   </Separator>

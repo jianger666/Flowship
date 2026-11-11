@@ -32,6 +32,11 @@
  *     不能让它靠空闲连接耗尽主进程的 fd；
  * 10. **端口**：绝不使用 Flowship 自己的端口 / 8676 / 8776 / 8876（随机到了就换一个），同端口同时监听 `[::1]`（Chromium 对 `*.localhost`
  *     会同时试 IPv6 与 IPv4，只听 IPv4 时别的进程抢先占 `[::1]:<同端口>` 就能收到带 token 的请求）；`[::1]` 被占就换端口，没有 IPv6 回环就只听 IPv4。
+ * 11. **`file://` 引用的翻译（不是放开 `file:`）**：AI / 脚本生成的 HTML 常把图片 / 样式写成 `file:///<绝对路径>`，换成 http 来源后 Chromium 一律拒绝
+ *     加载 `file:` 子资源（裂图）。回送 HTML / CSS / JS 文本时，把「解码后恰好落在本服务根目录之内」的 `file://` URL 的**根目录前缀**换成本服务自己的
+ *     `http://<token>.localhost:<端口>/`（`rewriteLocalFileUrls`）；根目录之外的 `file://` 原样不动（仍然加载不了，这是设计）。
+ *     翻译后的请求照走上面 1–9 的全部守卫（`..` / 敏感文件 / 符号链接逃逸照拒），页面**能访问到的文件集合不变**——只是把本来就能用相对路径访问的资源
+ *     换成了它在页面里的 `file://` 写法。只处理整体 GET 的 ≤ 2MB UTF-8 文本；Range / HEAD / 大文件 / 单文件模式 / 没有 `file://` 引用的响应与以前逐字节一致。
  *
  * 所有拒绝一律返回同一个 404（Host / 方法 / 跨站 / 过大 / Range 不可满足除外）——不给探测路径是否存在的口子。
  * 销毁后服务不能复活：`revokeAll` 自增 generation，在途的 `open` / 启动流程在每个 await 之后都会核对（R7-04）。
@@ -46,6 +51,9 @@ import nodePath from "node:path";
 import { pipeline } from "node:stream";
 
 import { FLOWSHIP_KNOWN_PORTS } from "./app-origin.mjs";
+
+/** 单个文本响应做 `file://` 翻译时整体读进内存的上限（字节）；超过的原样流式发送（连接数上限 64 × 2MB 是瞬时内存的最坏值） */
+export const LOCAL_HTML_REWRITE_MAX_BYTES = 2 * 1024 * 1024;
 
 /** 滑动空闲过期：每次成功的请求都会续期 */
 export const LOCAL_HTML_IDLE_TTL_MS = 30 * 60_000;
@@ -374,6 +382,117 @@ export const isInsideRoot = (root, child, path = nodePath) => {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 };
 
+// ───────────────────────── `file://` 引用翻译（纯函数） ─────────────────────────
+
+/** `file:///` 或 `file://localhost/`（大小写不敏感）；匹配到的最后一个字符就是路径开头的 `/` */
+const FILE_URL_START_SOURCE = "file:\\/\\/(?:localhost)?\\/";
+/** 单个路径段允许的最大长度（字符）：防止病态输入里 indexOf 一路扫到文末 */
+const MAX_URL_SEGMENT_CHARS = 1024;
+
+const normalizeSegment = (seg, platform) => {
+  const n = seg.normalize("NFC");
+  return platform === "win32" ? n.toLowerCase() : n;
+};
+const safeDecode = (seg) => {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
+  }
+};
+/** 根目录 → 规范化后的路径段（posix `/Users/a` → [Users, a]；win32 `C:\Users\a` → [c:, users, a]）；没有任何段（文件系统根）返回 null */
+const rootSegments = (root, platform) => {
+  if (typeof root !== "string" || root === "") return null;
+  const segs = root.split(platform === "win32" ? /[\\/]+/ : "/").filter(Boolean).map((x) => normalizeSegment(x, platform));
+  return segs.length > 0 ? segs : null;
+};
+
+/**
+ * 在 `text[from..]` 处按「逐段解码后与根目录各段相等、且根目录后面还有一个 `/`」匹配；匹配返回根目录前缀结束的下标（含那个 `/`），否则 -1。
+ * 逐段解码而不是做字符串前缀比较：同一个目录可以被写成全编码 / 只编码中文 / 不编码 / 大小写不同的十六进制，URL 里各段的编码方式也可以不一致
+ * （例如 `…/episodes/2026-11-09-%E6%AC%A7…/发布_180/` 只有一段被编码）。
+ */
+const matchRootAt = (text, from, rootSegLists, platform) => {
+  for (const segs of rootSegLists) {
+    let pos = from;
+    let ok = true;
+    for (const seg of segs) {
+      const rel = text.slice(pos, pos + MAX_URL_SEGMENT_CHARS + 1).indexOf("/");
+      if (rel <= 0 || rel > MAX_URL_SEGMENT_CHARS) {
+        ok = false;
+        break;
+      }
+      if (normalizeSegment(safeDecode(text.slice(pos, pos + rel)), platform) !== seg) {
+        ok = false;
+        break;
+      }
+      pos += rel + 1;
+    }
+    if (ok) return pos;
+  }
+  return -1;
+};
+
+/**
+ * 把文本里「落在根目录之内的 `file://` URL」的**根目录前缀**换成 `<origin>/`（其余部分——相对根目录的路径与它的编码——原样保留，
+ * 之后由服务自己的请求守卫逐段解码 / 校验）。不在任何根目录之内的 `file://`（别的目录 / 上一级 / 根目录的兄弟目录前缀相同的目录）一律不动。
+ * @param {string} text
+ * @param {{ roots: string[], origin: string, platform?: string }} opts roots：同一个根目录的各种写法（用户写的路径 + realpath）；origin：`http://<token>.localhost:<端口>`（无尾斜杠）
+ * @returns {{ text: string, count: number }}
+ */
+export const rewriteLocalFileUrls = (text, { roots, origin, platform = process.platform }) => {
+  if (typeof text !== "string" || text === "" || !Array.isArray(roots)) return { text, count: 0 };
+  const lists = [];
+  const seen = new Set();
+  for (const r of roots) {
+    const segs = rootSegments(r, platform);
+    if (!segs || seen.has(segs.join("/"))) continue;
+    seen.add(segs.join("/"));
+    lists.push(segs);
+  }
+  if (lists.length === 0) return { text, count: 0 };
+  let out = "";
+  let last = 0;
+  let count = 0;
+  for (const m of text.matchAll(new RegExp(FILE_URL_START_SOURCE, "gi"))) {
+    const start = m.index;
+    if (start < last) continue;
+    const end = matchRootAt(text, start + m[0].length, lists, platform);
+    if (end < 0) continue;
+    out += `${text.slice(last, start)}${origin}/`;
+    last = end;
+    count += 1;
+  }
+  if (count === 0) return { text, count: 0 };
+  return { text: out + text.slice(last), count };
+};
+
+/** 哪些响应要做 `file://` 翻译：UTF-8 的 HTML（`htmlContentType` 对声明了别的 charset 的页面不带 charset → 不碰）、CSS、JS */
+const isRewritableType = (type) => /^(?:text\/html; charset=utf-8|text\/css|text\/javascript)/.test(type);
+
+/** 把整个文件读进 Buffer（最多 size 字节：读的过程中文件被截断就按实际读到的算） */
+const readExactly = async (fh, size) => {
+  const buf = Buffer.alloc(size);
+  let off = 0;
+  while (off < size) {
+    const { bytesRead } = await fh.read(buf, off, size - off, off);
+    if (bytesRead === 0) break;
+    off += bytesRead;
+  }
+  return off === size ? buf : buf.subarray(0, off);
+};
+
+/**
+ * Buffer 版：不是合法 UTF-8（来回编码不相等）→ 不碰（避免把乱码字节写坏）；没有可翻译的引用 → null（调用方继续走原样的流式发送）。
+ * @returns {Buffer | null}
+ */
+const rewriteBuffer = (buf, opts) => {
+  const text = buf.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(buf)) return null;
+  const r = rewriteLocalFileUrls(text, opts);
+  return r.count > 0 ? Buffer.from(r.text, "utf8") : null;
+};
+
 // ───────────────────────── 服务 ─────────────────────────
 
 /**
@@ -383,7 +502,7 @@ export const isInsideRoot = (root, child, path = nodePath) => {
  *   isReservedPort?: (port: number) => boolean,
  *   limits?: {
  *     idleTtlMs?: number, maxAgeMs?: number, maxTokens?: number, maxFileBytes?: number,
- *     maxConnections?: number, headersTimeoutMs?: number, requestTimeoutMs?: number, keepAliveTimeoutMs?: number, connectionsCheckIntervalMs?: number,
+ *     rewriteMaxBytes?: number, maxConnections?: number, headersTimeoutMs?: number, requestTimeoutMs?: number, keepAliveTimeoutMs?: number, connectionsCheckIntervalMs?: number,
  *   },
  * }} [deps] isReservedPort：除了 Flowship 约定端口（8676 / 8776 / 8876）以外还不能用的端口（壳注入「Flowship 自己的端口」）
  */
@@ -400,6 +519,7 @@ export const createLocalHtmlServer = (deps = {}) => {
   const maxAgeMs = deps.limits?.maxAgeMs ?? LOCAL_HTML_MAX_AGE_MS;
   const maxTokens = deps.limits?.maxTokens ?? LOCAL_HTML_MAX_TOKENS;
   const maxFileBytes = deps.limits?.maxFileBytes ?? LOCAL_HTML_MAX_FILE_BYTES;
+  const rewriteMaxBytes = deps.limits?.rewriteMaxBytes ?? LOCAL_HTML_REWRITE_MAX_BYTES;
   const maxConnections = deps.limits?.maxConnections ?? LOCAL_HTML_MAX_CONNECTIONS;
   const headersTimeoutMs = deps.limits?.headersTimeoutMs ?? LOCAL_HTML_HEADERS_TIMEOUT_MS;
   const requestTimeoutMs = deps.limits?.requestTimeoutMs ?? LOCAL_HTML_REQUEST_TIMEOUT_MS;
@@ -407,7 +527,7 @@ export const createLocalHtmlServer = (deps = {}) => {
   const connectionsCheckIntervalMs = deps.limits?.connectionsCheckIntervalMs ?? LOCAL_HTML_CONNECTIONS_CHECK_INTERVAL_MS;
   const isReservedPort = (p) => FLOWSHIP_KNOWN_PORTS.includes(p) || (typeof deps.isReservedPort === "function" && deps.isReservedPort(p) === true);
 
-  /** @type {Map<string, { realRoot: string, entryReal: string, scope: "dir" | "file", createdAt: number, lastUsedAt: number }>} */
+  /** @type {Map<string, { realRoot: string, roots: string[], entryReal: string, scope: "dir" | "file", createdAt: number, lastUsedAt: number }>} roots：同一个根目录的写法（realpath + 用户打开时用的路径，后者仅在它 realpath 后确实是同一目录时才有），给 `file://` 翻译用 */
   const tokens = new Map();
   /** 监听中的 http.Server：IPv4 回环一个，`[::1]` 可选一个（同端口） */
   let servers = [];
@@ -547,6 +667,19 @@ export const createLocalHtmlServer = (deps = {}) => {
         return reply(res, 416, "", { "Content-Range": `bytes */${st.size}`, "Accept-Ranges": "bytes" });
       }
       const partial = range !== null;
+      // `file://` 引用翻译（头部第 11 条）：只在「整体 GET 的 UTF-8 HTML / CSS / JS、目录模式、不大」时做；其它情况以及没有可翻译引用时，
+      // 走下面原样的流式发送（读过一遍不影响后面按位置读）
+      if (!partial && req.method === "GET" && hit.entry.scope === "dir" && st.size > 0 && st.size <= rewriteMaxBytes && isRewritableType(type)) {
+        const body = await readExactly(fh, st.size);
+        const rewritten = rewriteBuffer(body, { roots: hit.entry.roots, origin: `http://${req.headers.host}`, platform });
+        if (rewritten) {
+          await fh.close();
+          fh = null;
+          // 内容变了：不宣称 Accept-Ranges，Content-Length 按改写后的算
+          res.writeHead(200, { ...SECURITY_HEADERS, "Content-Type": type, "Content-Length": rewritten.length });
+          return res.end(rewritten);
+        }
+      }
       const start = partial ? range.start : 0;
       const end = partial ? range.end : st.size - 1;
       const headers = { ...SECURITY_HEADERS, "Accept-Ranges": "bytes", "Content-Type": type, "Content-Length": partial ? end - start + 1 : st.size };
@@ -698,6 +831,9 @@ export const createLocalHtmlServer = (deps = {}) => {
     if (st.size > maxFileBytes) return { ok: false, error: "文件太大（超过 50MB）" };
 
     const realRoot = path.dirname(entryReal);
+    // 用户打开时写的目录（可能经符号链接 / 别名）：仅当它 realpath 后确实就是 realRoot 才算同一个目录（入口自己是指向别处的链接时不算，免得把 /a/x.png 当成 /b/x.png）
+    const logicalRoot = path.dirname(path.resolve(absPath));
+    const roots = logicalRoot !== realRoot && (await realpathOrNull(logicalRoot)) === realRoot ? [logicalRoot, realRoot] : [realRoot];
     const broad = isBroadRoot(realRoot, {
       path,
       platform,
@@ -728,7 +864,7 @@ export const createLocalHtmlServer = (deps = {}) => {
     }
     // 小写 hex：主机名会被浏览器小写化，token 字母表必须本来就是小写；48 个字符 = 192 位，单个 DNS label ≤ 63
     const token = crypto.randomBytes(24).toString("hex");
-    tokens.set(token, { realRoot, entryReal, scope, createdAt: t, lastUsedAt: t });
+    tokens.set(token, { realRoot, roots, entryReal, scope, createdAt: t, lastUsedAt: t });
     log(`[browser] 本地 HTML 已登记（范围 ${scope}，当前 ${tokens.size} 个有效）`);
     return { ok: true, url: `http://${token}.localhost:${port}/${encodeURIComponent(entryName)}`, scope };
   };

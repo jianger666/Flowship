@@ -80,7 +80,7 @@ export const createClipboardTools = (kit: BrowserToolKit): FlowshipToolDef[] => 
     label: "浏览器·剪贴板",
     description:
       "读写系统剪贴板（隐私受限）：write 写入文字；读取只能拿到「自 watch_start 以来发生的变化」、绝不返回用户原有的剪贴板内容（流程：watch_start → 点页面上的「复制」按钮 → read）。" +
-      "往页面输入框填字请用 browser_type / browser_fill_form（密码类敏感框 AI 不能输入），用户接管浏览器期间不可用。",
+      "往页面输入框填字请用 browser_type / browser_fill_form，用户接管浏览器期间不可用。",
     parameters: TBObject({
       action: TBEnum([...CLIPBOARD_TOOL_ACTIONS]),
       text: TBOptional(TBString({ description: "write 必填：要写入剪贴板的文字（≤ 100000 字符）" })),

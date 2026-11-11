@@ -17,6 +17,7 @@ import {
 } from "@/lib/rehype-rewrite-local-images";
 import { rehypeStripMediaSources } from "@/lib/rehype-strip-media-sources";
 import { rehypeGateMermaidBlocks } from "@/lib/mermaid-rehype-gate";
+import { stripTrailingUnclosedUrlCode } from "@/lib/remark-url-code-link";
 
 /**
  * rehype：传自定义列表也是整表替换。顺序 = raw → UNC 拦截 → 本地图改写 → sanitize → 剥 `<source>`/srcset → mermaid 外部资源闸 → harden。
@@ -46,9 +47,16 @@ export const STREAMDOWN_REHYPE_PLUGINS = [
  * 被替换成灰色的 `文字 [blocked]`（还带原生 title `Blocked URL: undefined`）——
  * 每个链接在写完前都会闪一下英文（2026-10-20 第二轮 review V15-02，实测前缀里 81% 受影响）。
  * `text-only` 直接把没写完的链接显示成纯文字，链接写完那一帧再变成可点链接。
+ *
+ * handlers：`url-code-tail`（R11-01）——remark-url-code-link 会把「内容恰好是网址的行内代码」换成可点链接，
+ * 而 remend 会把流式尾部的 `` `https://exa `` 补成 `` `https://exa` ``，补全后与「真写完」无法区分、
+ * 会闪出 href 是半截网址的链接。优先级 1 = 早于 remend 自带的 inlineCode 补全（50），先把这段没写完的藏起来。
  */
 export const STREAMDOWN_REMEND_OPTIONS: NonNullable<StreamdownProps["remend"]> =
-  { linkMode: "text-only" };
+  {
+    linkMode: "text-only",
+    handlers: [{ name: "url-code-tail", handle: stripTrailingUnclosedUrlCode, priority: 1 }],
+  };
 
 /**
  * Streamdown 内置控件（代码块复制、mermaid 全屏 / 下载、表格复制 / 下载、外链确认、图片兜底）的中文文案。

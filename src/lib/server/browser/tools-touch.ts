@@ -2,7 +2,7 @@
  * 增强包 E2 · C2 browser_touch（server 工具定义）：tap / long_press / swipe / pinch 触屏手势。
  * 主进程实现在 electron-app/browser/ops/touch.mjs，纯逻辑在 electron-app/browser/touch-kit.mjs（server 先拦一道参数，主进程独立再校验）。
  *
- * 红线 3：这个工具**没有文本入参**，不产生字符输入，不是绕过敏感字段拒绝的通道。
+ * 这个工具**没有文本入参**，不产生字符输入（文字输入走 browser_type / browser_fill_form；2026-11-11 起写入侧对密码框已不再拒绝）。
  * 积木从 `kit` 取（见 tools.ts 的 buildToolKit）；不要 import "./tools"（成环），类型用 `import type`。
  */
 import { Enum as TBEnum, Number as TBNumber, Object as TBObject, Optional as TBOptional } from "typebox/type";

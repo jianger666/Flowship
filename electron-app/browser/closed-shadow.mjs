@@ -1,19 +1,17 @@
 /**
- * closed shadow root 下的「敏感字段」判定补强（E2·P10 / C7）。
+ * closed shadow root 下的「敏感字段」判定补强（E2·P10 / C7）。**只服务读取侧**（录屏遇到可见 / 聚焦的敏感输入框就丢帧）；AI 往敏感框里输入不受限制。
  *
  * # 漏洞（真机证明过）
- * `secret-field.mjs` 的页内焦点 / 落点探针靠 `el.shadowRoot.activeElement` 逐层下钻——**只认 open shadow root**。
+ * 页内焦点探针靠 `el.shadowRoot.activeElement` 逐层下钻——**只认 open shadow root**。
  * `attachShadow({mode:"closed"})` 时 `host.shadowRoot === null`：`document.activeElement` 停在 host 上，host 自己不是密码框，
- * 探针就判 `safe`。于是 AI 点击（click ref / mouse 坐标 / Tab）closed 里的 `<input type=password>` 后，
- * `press_key` 的字符键 / 粘贴、type 到「会把焦点委托进 closed 的容器」、drag 落点，全都绕过了「AI 不代填密码」的红线。
- * （`type` 直接传密码框 ref 不受影响：那条路探的是 ref 节点自己，不经过 shadowRoot 遍历。）
+ * 探针就判 `safe`，于是录屏会把 closed 里正在输入的密码框画面写进磁盘。
  *
  * # 修法（只升级、不降级）
  * 原页内探针先跑；它给出 `safe` 时，这里再用 **CDP** 穿透 closed root 复核——
  * `DOM.describeNode{objectId}` 会列出 host 的 `shadowRoots`（含 closed，且带 `shadowRootType`），
  * `DOM.resolveNode{backendNodeId: shadowRoot}` 拿到 ShadowRoot 对象本身的引用（closed 只是不经 `host.shadowRoot` 暴露，
  * 引用拿到了照样能读 `activeElement` / `elementFromPoint`），逐层下钻到真正的焦点 / 落点元素，最后用统一的
- * `SECRET_ELEMENT_PROBE_SOURCE` 判它自己（不依赖 shadowRoot 遍历）。任何一步出错 / 层数耗尽 → `unknown`（调用方按「拒绝」处理，fail-closed）。
+ * `SECRET_ELEMENT_PROBE_SOURCE` 判它自己（不依赖 shadowRoot 遍历）。任何一步出错 / 层数耗尽 → `unknown`（调用方按「不确定」处理，fail-closed）。
  *
  * 不引入新的主世界注入：这些函数都是 `Runtime.callFunctionOn` 的一次性函数体，用完 `releaseObjectGroup`。
  * 与已知缺口一致（§14.9）：主世界探针能被「覆盖 ShadowRoot.prototype.activeElement 的页面」骗，这条路挡不住。
@@ -52,24 +50,6 @@ export const ROOT_ACTIVE_FN = `function () { try { return this.activeElement || 
 
 /** this = 任意元素：它所在 document 的 activeElement */
 const DOC_ACTIVE_FN = `function () { try { return (this.ownerDocument || document).activeElement || null; } catch (e) { return null; } }`;
-
-/** this = 元素；(x, y) 是它所在 frame 的视口坐标：该点处的元素 */
-const DOC_POINT_FN = `function (x, y) { try { return (this.ownerDocument || document).elementFromPoint(x, y) || null; } catch (e) { return null; } }`;
-
-/** this = 元素：它自己的 open shadow root 在 (x, y) 处更深一层的元素（与自己相同 / 没有则 null） */
-export const NEXT_POINT_OPEN_FN = `function (x, y) {
-  try {
-    var sr = this.shadowRoot;
-    if (sr && typeof sr.elementFromPoint === 'function') {
-      var inner = sr.elementFromPoint(x, y);
-      if (inner && inner !== this) return inner;
-    }
-  } catch (e) {}
-  return null;
-}`;
-
-/** this = ShadowRoot 对象：root 内 (x, y) 处的元素 */
-export const ROOT_POINT_FN = `function (x, y) { try { return (typeof this.elementFromPoint === 'function' && this.elementFromPoint(x, y)) || null; } catch (e) { return null; } }`;
 
 const isNodeRef = (r) => !!r && r.subtype === "node" && typeof r.objectId === "string" && r.objectId !== "";
 
@@ -199,60 +179,6 @@ export const probeFocusSecretCdp = async (tab, entry) => {
   }
 };
 
-/**
- * 拖放落点复核：落点 (x, y)（目标元素所在 frame 的视口坐标）处真正会接收 drop 的元素（穿透 open + closed shadow root）是不是敏感字段。
- * R6-30：落点（含 closed root 内的落点）命中 iframe / frame → 一律 unknown（fail-closed）。不做 iframe 偏移换算：
- * 换算要处理边框 / 缩放 / OOPIF，做错就是 fail-open；拖放落进 iframe 本来就很少，拒掉让用户操作的代价可接受。
- * `entry` 为 null 时查主页面视口坐标 (x, y)（browser_mouse 没有 ref，坐标就是视口坐标）。
- * @returns {Promise<"secret"|"safe"|"unknown">}
- */
-export const probeDropSecretCdp = async (tab, entry, x, y) => {
-  const sid = entry?.sessionId ?? null;
-  const group = newGroup();
-  try {
-    let cur;
-    if (entry) {
-      const r = await tab.send("DOM.resolveNode", { backendNodeId: entry.backendNodeId, objectGroup: group }, sid, 5000);
-      const base = r?.object?.objectId;
-      if (!base) return "unknown";
-      cur = await callFn(tab, sid, group, base, DOC_POINT_FN, [x, y]);
-    } else {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return "unknown";
-      const r = await tab.send(
-        "Runtime.evaluate",
-        { expression: `document.elementFromPoint(${Number(x)}, ${Number(y)})`, returnByValue: false, silent: true, objectGroup: group },
-        null,
-        5000,
-      );
-      cur = r?.result;
-    }
-    if (!isNodeRef(cur)) return "unknown"; // 与页内探针同口径：落点探不到元素按不确定拒
-    for (let depth = 0; depth < MAX_SHADOW_DEPTH; depth++) {
-      if (await isFrameEl(tab, sid, group, cur.objectId)) return "unknown";
-      const nextOpen = await callFn(tab, sid, group, cur.objectId, NEXT_POINT_OPEN_FN, [x, y]);
-      if (isNodeRef(nextOpen)) {
-        cur = nextOpen;
-        continue;
-      }
-      let moved = false;
-      for (const rootObj of await closedRootObjects(tab, sid, group, cur.objectId)) {
-        const inner = await callFn(tab, sid, group, rootObj, ROOT_POINT_FN, [x, y]);
-        if (isNodeRef(inner)) {
-          cur = inner;
-          moved = true;
-          break;
-        }
-      }
-      if (!moved) return await finalVerdict(tab, sid, group, cur.objectId);
-    }
-    return "unknown";
-  } catch {
-    return "unknown";
-  } finally {
-    await release(tab, sid, group);
-  }
-};
-
 // ───────────────────────── closed shadow 里的可见文字（wait_for text / read 补充） ─────────────────────────
 
 /** getDocument 树的遍历预算：节点数 / 输出字符数，超了截断（只影响「能不能看见 closed 里的文字」，不影响安全判定） */
@@ -319,16 +245,4 @@ export const collectClosedShadowText = async (tab) => {
   } catch {
     return "";
   }
-};
-
-/**
- * 合并「页内探针」与「CDP closed 复核」两个判决：任何一个 secret → secret；否则任何一个 unknown → unknown；都 safe 才 safe（纯函数，有单测）。
- * @param {unknown} a
- * @param {unknown} b
- * @returns {"secret"|"safe"|"unknown"}
- */
-export const mergeVerdicts = (a, b) => {
-  if (a === "secret" || b === "secret") return "secret";
-  if (a === "safe" && b === "safe") return "safe";
-  return "unknown";
 };

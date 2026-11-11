@@ -454,6 +454,29 @@ export const matchExpectedCallerToken = (
 export const getExpectedCallerToken = (taskId: string): string | null =>
   expectedCallerTokens.get(taskId) ?? null;
 
+/**
+ * 属主一次性 agent（task 页还没有会话时，输入条 / 定时到点落到的那条通道，`startOneShotQuestion`）登记自己的身份：
+ * **只写期望 token**，不注册 awaiting notifier / task action handler——它没有 action，交卷 / 提问这类工具也不会挂给它。
+ * 有这个 token，`schedule` 这类要先验 callerToken 的工具才认它（没登记 = 一律 fail-closed 拒绝）。
+ *
+ * 调用方保证此刻没有活会话 / 在飞的正式 run（`startOneShotQuestion` 在受理段里先验过），所以这个槽是空的；
+ * 之后若有正式会话接管，它自己的 `setChatTaskActionHandler(..., callerToken)` 会把 token 换掉，一次性 agent 此后的
+ * 定时调用就按「任务已被新 agent 接管」被拒——与正式会话之间的接管语义一致。
+ */
+export const setOneShotCallerToken = (taskId: string, callerToken: string): void => {
+  expectedCallerTokens.set(taskId, callerToken);
+};
+
+/**
+ * 一次性 agent 收尾时摘掉自己的 token：**只有仍是自己的才删**——
+ * 期间被正式会话换了 / 被 stop 摘了，都不能把别人的 token 误删（线性化：同步比对 + delete，无 await）。
+ */
+export const clearOneShotCallerTokenIf = (taskId: string, callerToken: string): boolean => {
+  if (expectedCallerTokens.get(taskId) !== callerToken) return false;
+  expectedCallerTokens.delete(taskId);
+  return true;
+};
+
 // ----------------- notifier / handler 注册表（runner ↔ flowship-tools 桥） -----------------
 
 /**

@@ -322,8 +322,8 @@ const shellTool = (
       //   - 需求群「非属主答疑旁路」（restricted-question.ts）：显式传 `omitGitToken: true`，
       //     经 agent-backend facade → custom-agent-backend → buildCodingToolDefs 传到这里；
       //     它的 `task` 子代理的 bash 另走 buildGitTokenFreeBashTool（同一规则，否则能绕）。
-      //   - 判据是「显式标记」而不是「无 callerToken」：属主自己的 startOneShotQuestion 同样没有
-      //     callerToken（没有交卷 / 提问身份），却是全权限的属主通道、不该被摘。
+      //   - 判据是「显式标记」而不是「有没有 callerToken」：属主自己的 startOneShotQuestion 是全权限的属主通道
+      //     （它的 callerToken 只用来挂定时 / 等待，不代表「正式会话」）、不该被摘；两件事不绑死。
       // ⚠️ 只覆盖 pi provider：Cursor provider 的 shell 由 SDK 拉起、原样继承 server env，摘不掉
       // （见 git-token-env.ts 头部）。这里**只摘环境变量、不阻止读文件**：pi 的 `read` / shell 照样能读
       // config.json（M1-02）/ ~/.ssh——只是收掉最显眼的一条路，不是边界。

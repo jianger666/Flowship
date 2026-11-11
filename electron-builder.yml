@@ -91,6 +91,11 @@ mac:
     - target: dmg
   # 不签名（内部分发、首次打开需右键 →「打开」过 Gatekeeper）
   identity: null
+  # 内置浏览器里的网页（声音 / 视频检测、会议、录音页）用麦克风 / 摄像头时，macOS 系统授权框显示的说明文案。
+  # Electron 模板的 Info.plist 本来就带这两个键（英文通用句），这里覆盖成中文、说清楚是谁在用、先问过用户。
+  extendInfo:
+    NSMicrophoneUsageDescription: "Flowship 内置浏览器里的网页（如声音检测、会议、录音页面）需要使用麦克风。首次使用某个网站时，Flowship 会先征得你的同意。"
+    NSCameraUsageDescription: "Flowship 内置浏览器里的网页（如视频检测、会议页面）需要使用摄像头。首次使用某个网站时，Flowship 会先征得你的同意。"
 
 dmg:
   # UDBZ=bzip2（V0.11.4、实测 215MB → 118MB、-45%）。原 ULFO（LZFSE）为挂载速度选的、

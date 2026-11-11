@@ -77,6 +77,12 @@ const {
 const { clearChatGate, endChatLifecycle } = await import(
   "@/lib/server/chat-gate"
 );
+const {
+  CALLER_MISMATCH_ERROR,
+  cleanupChatTaskState,
+  getExpectedCallerToken,
+  setOneShotCallerToken,
+} = await import("@/lib/server/chat-pending");
 const { startOneShotQuestion } = await import("@/lib/server/task-runner");
 const { getTask, setTaskRunStatus } = await import("@/lib/server/task-fs");
 
@@ -204,6 +210,7 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
       clearChatGate(id);
       endChatLifecycle(id);
       revokeTaskOps(id);
+      cleanupChatTaskState(id);
     }
     // close 路径有 fire-and-forget 落盘，等一拍再删目录（同族测试的既定手法）
     await sleep(30);
@@ -232,16 +239,34 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
     expect(prompt).not.toContain("只读答疑");
     expect(prompt).not.toContain("禁止新建 / 修改 / 删除任何文件");
 
-    // 一次性 agent 不挂系统 customTools / 用户 MCP（交卷、提 MR 这些工具压根不该出现）
+    // 一次性 agent 不挂用户 MCP；系统工具只挂不依赖 action 的（定时 / 等待）：
+    // 交卷、提问、提 MR、推进这些要靠 action 与 notifier 的工具压根不该出现
     const createArg = mockCreate.mock.calls[0]?.[0] as {
       mcpServers?: unknown;
       callerToken?: string;
-      local?: { settingSources?: unknown[]; customTools?: unknown };
+      local?: { settingSources?: unknown[]; customTools?: Record<string, unknown> };
     };
     expect(createArg.mcpServers).toBeUndefined();
+    // callerToken 是 facade 的额外字段、传给 SDK 前就剥掉了，所以这里读不到——工具有没有挂看 customTools
     expect(createArg.callerToken).toBeUndefined();
     expect(createArg.local?.settingSources).toEqual([]);
-    expect(createArg.local?.customTools).toBeUndefined();
+    const toolNames = Object.keys(createArg.local?.customTools ?? {});
+    expect(toolNames).toContain("schedule");
+    expect(toolNames).toContain("wait");
+    for (const forbidden of [
+      "submit_work",
+      "ask_user",
+      "submit_mr",
+      "set_feishu_testers",
+      "set_plan_batches",
+      "create_custom_action",
+      "notify_group_testers",
+      "advance_next",
+    ]) {
+      expect(toolNames, `一次性 agent 不该有 ${forbidden}`).not.toContain(forbidden);
+    }
+    // 身份：不再自称「临时助手」
+    expect(prompt).not.toContain("临时助手");
 
     expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
     expect(lastDone()?.ok).toBe(true);
@@ -315,6 +340,85 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
     expect(oneshot.close).toHaveBeenCalled();
     expect(runningTasks.has(id)).toBe(false);
     expect(lastDone()?.ok).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // 没推进过 / 没会话的任务也要能建定时：一次性 agent 运行期间登记自己的 callerToken，
+  // 交给 SDK 的 schedule 工具才过得了 matchExpectedCallerToken；收尾只摘自己的
+  // ─────────────────────────────────────────────────────────────
+  type SdkTool = { execute: (args: unknown, ctx?: unknown) => Promise<{ content: Array<{ text?: string }> }> };
+  type CreateArg = { local: { customTools: Record<string, SdkTool> } };
+  const toolText = async (tool: SdkTool, args: Record<string, unknown>): Promise<string> =>
+    (await tool.execute(args, undefined)).content.map((c) => c.text ?? "").join("");
+  const emptyRun = (agent: ReturnType<typeof makeFakeAgent>) => ({
+    stream: async function* () {
+      /* 空流 */
+    },
+    wait: agent.wait,
+    cancel: agent.cancel,
+  });
+
+  it("运行期间 schedule 工具认一次性 agent 的 token（能建定时）；收尾摘掉后同一个工具被拒", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const oneshot = makeFakeAgent("agent_sched");
+    let tokenAtCreate: string | null = null;
+    let listedDuringRun = "";
+    mockCreate.mockImplementation(async () => {
+      tokenAtCreate = getExpectedCallerToken(id);
+      return oneshot;
+    });
+    oneshot.send.mockImplementation(async () => {
+      const tools = (mockCreate.mock.calls[0]?.[0] as CreateArg).local.customTools;
+      // 真实调一次工具：不是 [CALLER_MISMATCH] 即认了这个 token
+      listedDuringRun = await toolText(tools.schedule!, { action: "list" });
+      return emptyRun(oneshot);
+    });
+
+    await startLikeRoute(id);
+    await waitUntil(() => !isTaskStarting(id));
+
+    // create 之前就登记好了（工具一挂上就可能被调）
+    expect(tokenAtCreate).toBeTruthy();
+    expect(listedDuringRun).not.toBe(CALLER_MISMATCH_ERROR);
+    // 收尾：只摘自己的 → 槽清空、同一个工具再调被拒
+    expect(getExpectedCallerToken(id)).toBeNull();
+    const tools = (mockCreate.mock.calls[0]?.[0] as CreateArg).local.customTools;
+    expect(await toolText(tools.schedule!, { action: "list" })).toBe(CALLER_MISMATCH_ERROR);
+  });
+
+  it("运行期间被正式会话接管（token 槽被换）→ 收尾不误删别人的 token", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const oneshot = makeFakeAgent("agent_takeover");
+    mockCreate.mockResolvedValue(oneshot);
+    oneshot.send.mockImplementation(async () => {
+      setOneShotCallerToken(id, "formal-session-token");
+      return emptyRun(oneshot);
+    });
+
+    await startLikeRoute(id);
+    await waitUntil(() => !isTaskStarting(id));
+
+    expect(getExpectedCallerToken(id)).toBe("formal-session-token");
+  });
+
+  it("Agent.create 抛错 / 让位给活会话：都不留下 token（让位的那条根本没登记过）", async () => {
+    const failId = alloc();
+    await seedAckedTask(failId);
+    mockCreate.mockRejectedValue(new Error("create boom"));
+    await startLikeRoute(failId);
+    await waitUntil(() => !isTaskStarting(failId));
+    expect(getExpectedCallerToken(failId)).toBeNull();
+
+    mockCreate.mockReset();
+    const yieldId = alloc();
+    await seedAckedTask(yieldId);
+    installOwnerSession(yieldId);
+    await startLikeRoute(yieldId);
+    await waitUntil(() => !isTaskStarting(yieldId));
+    expect(mockCreate).not.toHaveBeenCalled();
+    expect(getExpectedCallerToken(yieldId)).toBeNull();
   });
 
   it("真 run 在飞时让位且绝不动 runStatus（那个 running 是后继的）", async () => {

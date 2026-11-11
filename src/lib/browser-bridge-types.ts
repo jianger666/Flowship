@@ -34,6 +34,24 @@ export interface TabInfo {
   zoom?: number;
   /** 无痕标签（契约 §15 A6）：独立的内存 partition，关闭即销毁；缺省 / false = 共享的持久档案 */
   incognito?: boolean;
+  /**
+   * 设备模拟把原生视图收窄后，它占占位 div 的比例（契约 §14.4「设备模拟下的视图适配」）：0..1，与宿主缩放无关。
+   * 只给遮盖占位图定位用；视图没被收窄（无模拟 / 模拟视口不比占位 div 小）时缺省 = 铺满整个占位 div。
+   */
+  viewFit?: ViewFit;
+  /**
+   * 缩放适配生效时（设备模拟的视口比面板大，页面被整体缩小以放进面板）的比例，0..1（契约 §14.4）。
+   * 没缩放时缺省。只用于工具栏提示；页面看到的视口、AI 的截图和点击坐标都不受它影响。
+   */
+  fitScale?: number;
+}
+
+/** 原生视图在占位 div 里的位置，全部是占位 div 宽 / 高的比例（0..1） */
+export interface ViewFit {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
 }
 
 /** 会话里谁在操作（契约 §6） */

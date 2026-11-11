@@ -1,28 +1,21 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- 假元素 / 假 CDP 与被测 .mjs 无类型声明，any 是刻意的 */
 /**
- * R6-36：三个「框架」探针都要认 iframe / frame / object / embed / fencedframe，且只有 contentDocument 读得进才下钻，否则 unknown（录制则计 opaque）。
- *   ① secret-field.mjs 的页内焦点探针 ACTIVE_SECRET_PROBE_SOURCE 与落点探针 DROP_TARGET_SECRET_PROBE_SOURCE；
- *   ② closed-shadow.mjs 的 IS_FRAME_FN / NEXT_FOCUS_OPEN_FN（CDP 复核，经 probeFocusSecretCdp / probeDropSecretCdp）；
+ * R6-36：读取侧的「框架」探针都要认 iframe / frame / object / embed / fencedframe，且只有 contentDocument 读得进才下钻，否则 unknown（录制则计 opaque）。
+ *   ① secret-field.mjs 的 isFrameLikeTag / FRAME_TAGS / FRAME_TAG_FN_SOURCE（唯一判定源）；
+ *   ② closed-shadow.mjs 的 IS_FRAME_FN / NEXT_FOCUS_OPEN_FN（CDP 复核，经 probeFocusSecretCdp；录屏每帧用它复核焦点）；
  *   ③ record-policy.mjs 的 SECRET_VISIBLE_PROBE_SOURCE（录制每帧的可见敏感框探针）。
  * 全部用 vm 在假 DOM 上真跑（与 browser-r6-s2-shadow-frame / browser-r6-s2-record-opaque 同构）。
  * 修之前：`<object>` / `<embed>` / `<fencedframe>` 被当普通元素判 safe → 里面的密码 / 验证码框 fail-closed 失效。
+ * 注意：页内焦点探针 / 落点探针（ACTIVE_SECRET_PROBE_SOURCE / DROP_TARGET_SECRET_PROBE_SOURCE）与 probeDropSecretCdp / assertPointNotSecret
+ * 已随「AI 可以往敏感输入框里输入」的产品决策删除，对应用例一并移除；这里只测保留的读取侧探针。
  */
 import vm from "node:vm";
 
 import { describe, expect, it } from "vitest";
 
-import * as actions from "../electron-app/browser/actions.mjs";
-import { IS_FRAME_FN, probeDropSecretCdp, probeFocusSecretCdp } from "../electron-app/browser/closed-shadow.mjs";
+import { IS_FRAME_FN, probeFocusSecretCdp } from "../electron-app/browser/closed-shadow.mjs";
 import { SECRET_VISIBLE_PROBE_SOURCE, readProbeVerdict } from "../electron-app/browser/record-policy.mjs";
-import {
-  ACTIVE_SECRET_PROBE_SOURCE,
-  DROP_TARGET_SECRET_PROBE_SOURCE,
-  FRAME_TAGS,
-  FRAME_TAG_FN_SOURCE,
-  SECRET_DROP_MESSAGE,
-  UNKNOWN_DROP_MESSAGE,
-  isFrameLikeTag,
-} from "../electron-app/browser/secret-field.mjs";
+import { FRAME_TAGS, FRAME_TAG_FN_SOURCE, isFrameLikeTag } from "../electron-app/browser/secret-field.mjs";
 import { PLAIN, PW, closedRoot, crossOriginFrame, docOf, el, hostWith, makeCdpTab, noDocFrame, nullDocFrame, readableFrame, runProbe } from "./helpers/browser-r6b-fake-dom";
 
 /** 三种「不是 iframe / frame」的新增框架类标签 */
@@ -69,58 +62,7 @@ describe("R6-36 唯一判定源：isFrameLikeTag / FRAME_TAGS / FRAME_TAG_FN_SOU
   });
 });
 
-describe("R6-36 页内焦点探针 ACTIVE_SECRET_PROBE_SOURCE", () => {
-  const verdict = (active: any) => runProbe(ACTIVE_SECRET_PROBE_SOURCE, docOf(active), null);
-
-  it.each(NEW_TAGS)("焦点在 <%s>：contentDocument 读不进 → unknown（修之前是 safe）", (tag) => {
-    for (const frame of unreadable(tag)) expect(verdict(frame), `${tag}`).toBe("unknown");
-  });
-
-  it("焦点在可读的 <object>：里面焦点是 password → secret；是普通框 → safe（读得进就照常判，不误伤）", () => {
-    expect(verdict(readableFrame(PW(), "object"))).toBe("secret");
-    expect(verdict(readableFrame(PLAIN(), "object"))).toBe("safe");
-  });
-
-  it("嵌套：iframe → object → password 逐层下钻判 secret；iframe → embed 到头读不进 → unknown", () => {
-    expect(verdict(readableFrame(readableFrame(PW(), "object")))).toBe("secret");
-    expect(verdict(readableFrame(noDocFrame("embed")))).toBe("unknown");
-  });
-
-  it("对照（旧行为不变）：iframe / frame 读不进 unknown、读得进照常判；普通框 safe；没有焦点 safe", () => {
-    expect(verdict(crossOriginFrame("iframe"))).toBe("unknown");
-    expect(verdict(nullDocFrame("frame"))).toBe("unknown");
-    expect(verdict(readableFrame(PW(), "frame"))).toBe("secret");
-    expect(verdict(PLAIN())).toBe("safe");
-    expect(verdict(null)).toBe("safe");
-  });
-});
-
-describe("R6-36 页内落点探针 DROP_TARGET_SECRET_PROBE_SOURCE", () => {
-  /** 落点 (10,10) 处的元素 = hit；this 是普通容器（与 drag 的目标元素同形） */
-  const verdict = (hit: any) => {
-    const doc = docOf(null, () => hit);
-    const self = el("div", {}, { ownerDocument: doc });
-    return runProbe(DROP_TARGET_SECRET_PROBE_SOURCE, doc, self, [10, 10]);
-  };
-
-  it.each(NEW_TAGS)("落点是 <%s>：contentDocument 读不进 → unknown（修之前是 safe）", (tag) => {
-    for (const frame of unreadable(tag)) expect(verdict(frame), `${tag}`).toBe("unknown");
-  });
-
-  it("落点是可读的 <object>：里面落点是 password → secret；普通框 → safe", () => {
-    expect(verdict(readableFrame(PW(), "object"))).toBe("secret");
-    expect(verdict(readableFrame(PLAIN(), "object"))).toBe("safe");
-  });
-
-  it("对照：iframe / frame 旧行为不变；落点直接是 password → secret；普通框 → safe", () => {
-    expect(verdict(crossOriginFrame("iframe"))).toBe("unknown");
-    expect(verdict(readableFrame(PW(), "frame"))).toBe("secret");
-    expect(verdict(PW())).toBe("secret");
-    expect(verdict(PLAIN())).toBe("safe");
-  });
-});
-
-describe("R6-36 CDP 复核（closed-shadow.mjs）：probeFocusSecretCdp / probeDropSecretCdp", () => {
+describe("R6-36 CDP 复核（closed-shadow.mjs）：probeFocusSecretCdp", () => {
   it.each(NEW_TAGS)("焦点在 closed root 内的 <%s>（读不进）→ unknown", async (tag) => {
     for (const frame of unreadable(tag)) {
       expect(await probeFocusSecretCdp(makeCdpTab(docOf(hostWith(closedRoot({ active: frame })))), null), tag).toBe("unknown");
@@ -137,27 +79,6 @@ describe("R6-36 CDP 复核（closed-shadow.mjs）：probeFocusSecretCdp / probeD
     expect(await probeFocusSecretCdp(makeCdpTab(docOf(readableFrame(PW(), "object"))), null)).toBe("secret");
     expect(await probeFocusSecretCdp(makeCdpTab(docOf(readableFrame(PLAIN(), "object"))), null)).toBe("safe");
     expect(await probeFocusSecretCdp(makeCdpTab(docOf(hostWith(closedRoot({ active: readableFrame(PW(), "object") })))), null)).toBe("secret");
-  });
-
-  it.each(NEW_TAGS)("落点是 <%s>（读不读得进都一样）→ unknown：CDP 复核不做偏移换算，框架类落点一律拒", async (tag) => {
-    const hits = [...unreadable(tag), ...(tag === "object" ? [readableFrame(PLAIN(), "object")] : [])];
-    for (const hit of hits) {
-      expect(await probeDropSecretCdp(makeCdpTab(docOf(null, () => hit)), null, 10, 10), tag).toBe("unknown");
-    }
-  });
-
-  it("对照：落点 password → secret；普通框 → safe；iframe → unknown（旧行为不变）", async () => {
-    const at = (e: any) => makeCdpTab(docOf(null, () => e));
-    expect(await probeDropSecretCdp(at(PW()), null, 10, 10)).toBe("secret");
-    expect(await probeDropSecretCdp(at(PLAIN()), null, 10, 10)).toBe("safe");
-    expect(await probeDropSecretCdp(at(readableFrame(PLAIN())), null, 10, 10)).toBe("unknown");
-  });
-
-  it("端到端 assertPointNotSecret：落点是「可读 <object>、里面是普通框」→ 页内探针 safe，但 CDP 复核 unknown → 被拒（UNKNOWN_DROP_MESSAGE）", async () => {
-    const tab = makeCdpTab(docOf(null, () => readableFrame(PLAIN(), "object")));
-    await expect(actions.assertPointNotSecret(tab, 10, 10)).rejects.toMatchObject({ code: "BAD_ARGS", message: UNKNOWN_DROP_MESSAGE });
-    const pwTab = makeCdpTab(docOf(null, () => readableFrame(PW(), "object")));
-    await expect(actions.assertPointNotSecret(pwTab, 10, 10)).rejects.toMatchObject({ code: "BAD_ARGS", message: SECRET_DROP_MESSAGE });
   });
 });
 
@@ -233,7 +154,7 @@ describe("R6-36 录制探针 SECRET_VISIBLE_PROBE_SOURCE", () => {
 
 /**
  * XHTML 文档里 `<h:iframe>` 是真 iframe：`tagName` 是 `H:IFRAME`，只有 `localName` 是 `iframe`。
- * 修之前三个探针都按 `tagName` 判框架 → 当普通元素判 safe；改成 `localName || tagName`。
+ * 修之前探针都按 `tagName` 判框架 → 当普通元素判 safe；改成 `localName || tagName`（现存的读取侧探针：IS_FRAME_FN / NEXT_FOCUS_OPEN_FN / 录制探针）。
  * （HTML 文档里同名的 `<h:iframe>` 是未知元素，localName 就是 `h:iframe`——不是框架，对照用例钉住「没有去前缀」。）
  */
 const withLocalName = <T extends Record<string, any>>(e: T, localName: string): T => Object.defineProperty(e, "localName", { value: localName, configurable: true });
@@ -243,23 +164,6 @@ const prefixed = (frame: Record<string, any>, localName = "iframe") => {
 };
 
 describe("R6-30 ④：带命名空间前缀的框架元素不能被当普通元素判 safe", () => {
-  it("页内焦点探针：焦点在读不进的 <h:iframe> → unknown；可读的 → 照常下钻", () => {
-    const verdict = (active: any) => runProbe(ACTIVE_SECRET_PROBE_SOURCE, docOf(active), null);
-    expect(verdict(prefixed(crossOriginFrame()))).toBe("unknown");
-    expect(verdict(prefixed(nullDocFrame()))).toBe("unknown");
-    expect(verdict(prefixed(readableFrame(PW())))).toBe("secret");
-    expect(verdict(prefixed(readableFrame(PLAIN())))).toBe("safe");
-  });
-
-  it("页内落点探针：落点是读不进的 <h:iframe> → unknown", () => {
-    const verdict = (hit: any) => {
-      const doc = docOf(null, () => hit);
-      return runProbe(DROP_TARGET_SECRET_PROBE_SOURCE, doc, el("div", {}, { ownerDocument: doc }), [10, 10]);
-    };
-    expect(verdict(prefixed(crossOriginFrame()))).toBe("unknown");
-    expect(verdict(prefixed(nullDocFrame()))).toBe("unknown");
-  });
-
   it("IS_FRAME_FN / NEXT_FOCUS_OPEN_FN（CDP 复核）：<h:iframe>、<h:object> 都按框架处理", async () => {
     expect(runProbe(IS_FRAME_FN, docOf(null), prefixed(el("iframe")))).toBe(true);
     expect(runProbe(IS_FRAME_FN, docOf(null), prefixed(el("object"), "object"))).toBe(true);
@@ -275,9 +179,9 @@ describe("R6-30 ④：带命名空间前缀的框架元素不能被当普通元�
     expect(readProbeVerdict(asRes(r))).toBe("unknown");
   });
 
-  it("对照（精确判断、没有去前缀）：HTML 里的未知元素 <h:iframe>（localName 就是 h:iframe）不是框架；无 localName 的旧形态回落 tagName", () => {
+  it("对照（精确判断、没有去前缀）：HTML 里的未知元素 <h:iframe>（localName 就是 h:iframe）不是框架；无 localName 的旧形态回落 tagName", async () => {
     const hostile = el("h:iframe", {}, { localName: "h:iframe", contentDocument: null });
-    expect(runProbe(ACTIVE_SECRET_PROBE_SOURCE, docOf(hostile), null)).toBe("safe");
+    expect(await probeFocusSecretCdp(makeCdpTab(docOf(hostile)), null)).toBe("safe");
     expect(runProbe(IS_FRAME_FN, docOf(null), hostile)).toBe(false);
     // 老的假元素没有 localName：回落到 tagName，iframe 照旧被认出
     expect(runProbe(IS_FRAME_FN, docOf(null), el("iframe"))).toBe(true);

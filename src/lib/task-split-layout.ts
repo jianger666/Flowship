@@ -73,27 +73,32 @@ export const resolveArtifactDefaultPercent = (input: {
   return round2(100 - eventPercent);
 };
 
-export type SplitPane = "artifact" | "event-stream";
-
-export interface SplitTogglePlan {
-  action: "collapse" | "expand";
-  /** collapse 之前要先展开的另一栏：两栏都折叠就是一片空白，且库对「两栏同时为 0」的布局没有定义 */
-  expandFirst: SplitPane | null;
-}
+/**
+ * 头部「分栏」按钮的三种动作。左右两栏一共只有三种布局：分栏 / 事件流占满（产物栏折叠）/ 产物·浏览器占满（事件流折叠）。
+ * 头部只放**一颗**状态感知的按钮（以前是「产物栏」「事件流栏」两颗：事件流占满时两颗都在往产物那边切，图标又几乎一样，
+ * 用户分不清；浏览器自己的「放大」按钮已经管着「产物·浏览器占满」）：
+ *  - `collapse-artifact`：分栏 → 事件流占满；
+ *  - `expand-artifact`：事件流占满 → 回到分栏；
+ *  - `expand-event-stream`：产物 / 浏览器占满（放大、拖分隔条造成的）→ 回到分栏。
+ */
+export type SplitToggleAction = "collapse-artifact" | "expand-artifact" | "expand-event-stream";
 
 /**
- * 点某一栏的折叠 / 展开按钮该做什么（纯决策，页面按它命令式驱动 Panel）。
- * 折叠目标栏时若另一栏已经折叠了 → 先把另一栏展开（等于「换边」），永远至少有一栏看得见。
+ * 按钮此刻该做什么（纯决策，页面按它命令式驱动 Panel）。
+ * 事件流折叠优先于产物栏折叠：「两栏都折叠」本不该出现（库对它没有定义），万一出现先让事件流回来，永远至少有一栏看得见。
  */
 export const planSplitToggle = (input: {
-  target: SplitPane;
   artifactCollapsed: boolean;
   eventStreamCollapsed: boolean;
-}): SplitTogglePlan => {
-  const { target, artifactCollapsed, eventStreamCollapsed } = input;
-  const targetCollapsed = target === "artifact" ? artifactCollapsed : eventStreamCollapsed;
-  if (targetCollapsed) return { action: "expand", expandFirst: null };
-  const otherCollapsed = target === "artifact" ? eventStreamCollapsed : artifactCollapsed;
-  const other: SplitPane = target === "artifact" ? "event-stream" : "artifact";
-  return { action: "collapse", expandFirst: otherCollapsed ? other : null };
+}): SplitToggleAction => {
+  if (input.eventStreamCollapsed) return "expand-event-stream";
+  if (input.artifactCollapsed) return "expand-artifact";
+  return "collapse-artifact";
 };
+
+/** 按钮的提示 / 读屏名（读屏念的就是点下去会发生的事；不再另挂 aria-pressed / aria-expanded，免得和随状态变的名字自相矛盾） */
+export const SPLIT_TOGGLE_LABEL: Readonly<Record<SplitToggleAction, string>> = Object.freeze({
+  "collapse-artifact": "收起产物栏，事件流占满宽度",
+  "expand-artifact": "展开产物栏",
+  "expand-event-stream": "展开事件流",
+});

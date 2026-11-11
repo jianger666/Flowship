@@ -13,7 +13,6 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { BrowserError } from "../server-channel.mjs";
-import { HELD_BUTTON_CLICK_MESSAGE, heldButtonBitsOf } from "../secret-field.mjs";
 import { MAX_UPLOAD_FILES, revalidateUploadFiles, validateUploadFiles } from "../upload-guard.mjs";
 
 export const OPS = Object.freeze(["upload", "downloads"]);
@@ -106,8 +105,6 @@ const findNewTab = (session, tabSeqAtStart) =>
 
 /** 点一下目标中心（按钮路径用）。输入锁 / AI 归因由 tab.withAiInput 包裹。 */
 const clickAt = async (tab, { x, y }) => {
-  // R6-30 三轮复审②：AI 还按着 browser_mouse 的键时，这里的 mouseReleased 会把按住的拖放结束在按钮上（落点没探过）——派发前先拒
-  if (heldButtonBitsOf(tab) !== 0) throw new BrowserError("BAD_ARGS", HELD_BUTTON_CLICK_MESSAGE);
   const send = (params) => tab.send("Input.dispatchMouseEvent", params, null, 5000);
   await send({ type: "mouseMoved", x, y, button: "none", buttons: 0 });
   await send({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });

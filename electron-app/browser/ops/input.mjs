@@ -6,13 +6,10 @@
  * - 两个 op 都是「动作类」，一律走 `session.runAction`（串行 / USER_CONTROL / 接管打断 / AI 归因 / 活动日志），
  *   并包在 `aiScope` 里（locate 阶段的 scrollIntoView 也会触发页内事件，必须被标成 AI，否则成了「用户滚动」）。
  * - fill_form 的逐字段动作复用 actions.mjs 里 click / type / select 的内部主体（`v1Internals`），不复制第二份。
- * - 纯逻辑（参数校验、坐标检查、文案、敏感字段判定）全部导出，单测在 tests/browser-v1-*.test.ts。
+ * - 纯逻辑（参数校验、坐标检查、文案）全部导出，单测在 tests/browser-v1-*.test.ts。
  * - 页面来的文字不可信：本文件产生的 summary / label 只含坐标、数量、ref，不含任何输入值。
  */
 import { BrowserError } from "../server-channel.mjs";
-import { PASSWORD_REJECT_MESSAGE, SECRET_FIELD_FNS_SOURCE, isSecretInfo } from "../secret-field.mjs";
-
-export { PASSWORD_REJECT_MESSAGE };
 
 export const OPS = Object.freeze(["mouse", "fill_form"]);
 
@@ -154,13 +151,6 @@ export const describeMouseAction = (a) => {
   }
 };
 
-/**
- * 敏感字段判定（R1-25：与活动日志 / 页内录制器 / snapshot / inspect / picker 共用 secret-field.mjs 的同一份规则）：
- * type=password、autocomplete 为 current-password / new-password / one-time-code / cc-*、computed -webkit-text-security 为 disc / circle / square。
- * info = `{ type, autocomplete, textSecurity }`。
- */
-export const isSecretField = (info) => isSecretInfo(info);
-
 /** fill_form 的活动日志摘要：只写数量，不写任何字段值。 */
 export const describeFillForm = (total, okCount, submit) => {
   const failed = total - okCount;
@@ -175,22 +165,6 @@ export const isFatalFillError = (err, signal) => signal?.aborted === true || (er
 
 const errMessage = (err) => String(err?.message ?? err).slice(0, 400);
 
-// ───────────────────────── 页内探针 ─────────────────────────
-
-// 读字段的 type / autocomplete / computed text-security（fill_form 判敏感字段用；this = 目标元素）。
-// 与 isSecretField 同一份规则：页内适配器 readSecretInfo 来自 secret-field.mjs 的源码嵌入。
-const FIELD_PROBE_FN = `function () {
-  ${SECRET_FIELD_FNS_SOURCE}
-  var el = this;
-  var info = readSecretInfo(el);
-  return {
-    tag: String(el.tagName || '').toLowerCase(),
-    type: info.type,
-    autocomplete: info.autocomplete.toLowerCase(),
-    textSecurity: info.textSecurity
-  };
-}`;
-
 // ───────────────────────── handler ─────────────────────────
 
 /**
@@ -198,7 +172,7 @@ const FIELD_PROBE_FN = `function () {
  * R1-28：状态带「按下的位置 / 时间 / 当时的导航计数」，才能在动作被取消 / 出错 / 过期（导航、超时）时补发 mouseReleased 并清掉，
  * 不会让后续调用带着一个早已不存在的按下态。
  */
-const pressedState = new WeakMap(); // tab → { bits, x, y, dx, dy, at, nav, pending? }（dx / dy = 按下起点；pending = 自动释放因落点不安全被跳过、按下态保留，见 R6-30 三轮复审 C）
+const pressedState = new WeakMap(); // tab → { bits, x, y, at, nav }
 /**
  * 按下态的**空闲**超时：距离最近一次 down / up / move / wheel 超过它就当 AI 忘了抬起（模型一次思考 + 工具往返远小于它）。
  * R2-08：以前只在 down / up 时刷新，AI 用 down + 多次 move 画画超过 2 分钟会被强制 release；现在 move / wheel 也续期。
@@ -219,121 +193,36 @@ export const peekHeldButtons = (tab, now = Date.now()) => {
   return expired ? { bits: 0, stale: st } : { bits: st.bits, stale: null };
 };
 
-/**
- * R6-30：这次 mouse 动作要不要先复核落点不是敏感字段（纯函数，有单测）。
- * - **任何键的 up 一律探**（R6-30 三轮复审 A）：落点下面是不是密码框，不能靠「鼠标自己的轨迹」推断——
- *   `browser_scroll` / `press_key` PageDown / `evaluate` / 页面自己的脚本 / 异步内容都能在不经过任何 mouse 动作的情况下让起点下面换成密码框，
- *   所以「原地 up」「≤ 4px 抖动」「回到起点」这类轨迹豁免全部取消。代价：`browser_mouse` 的 down / up 原地点密码框 / 无法检查的 iframe 会被拒——
- *   点它请用 `browser_click`（没按住时不受影响，本来就允许）；
- * - 中键（button=middle）的 down / up / click / double_click：Linux 下中键点击 = 粘贴 PRIMARY 选区；
- * - 键仍按着时的 click / double_click：click 会在落点派发 mouseReleased——等于在那里结束之前按住的拖放，与 up 同类，一样要探。
- * 没按住时的 click、move、wheel、左 / 右键 down 不受限（AI 点击密码框本身是允许的，被拒的是往里塞内容）。
- * @param {{ action: string, button?: string, x: number, y: number }} a
- * @param {{ bits: number } | null | undefined} held 当前有效的按下态（没有则 null）
- */
-export const mouseNeedsDropProbe = (a, held) => {
-  if (a.action === "up") return true;
-  if (a.button === "middle" && ["down", "click", "double_click"].includes(a.action)) return true;
-  return Boolean(held?.bits) && (a.action === "click" || a.action === "double_click");
-};
-
-/** 在 ms 毫秒内没有结果就当 fallback（promise 拒绝也当 fallback）；超时后被丢下的 promise 继续在后台跑、结果忽略 */
-const withDeadline = (promise, ms, fallback) =>
-  new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(fallback), ms);
-    promise.then(
-      (v) => {
-        clearTimeout(timer);
-        resolve(v);
-      },
-      () => {
-        clearTimeout(timer);
-        resolve(fallback);
-      },
-    );
-  });
 export const createHandlers = (deps) => {
   const I = deps.actions.v1Internals;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /**
-   * 按住期间的 move / wheel / 其它键的 click：续期、更新「将来补 release 的位置」（没有按下态时什么都不做）。
-   * 不再维护「是否被拖离 / 滚动过」之类的轨迹标记：要不要探落点不看鼠标轨迹（R6-30 三轮复审 A：up / 补发 release 一律探）。
-   */
+  /** 按住期间的 move / wheel / 其它键的 click：续期、更新「将来补 release 的位置」（没有按下态时什么都不做） */
   const touchHeld = (tab, x, y) => {
     const st = pressedState.get(tab);
     if (!st || !st.bits) return;
     pressedState.set(tab, { ...st, x, y, at: Date.now() });
   };
 
-  /** 补发 mouseReleased 前复核落点（最后位置 + 起点）的**整体**时限：取消 / 接管收尾不能被一个卡死的页面拖住（超时 = 不确定 = 不发 release） */
-  const RELEASE_PROBE_TIMEOUT_MS = 3000;
-
-  /** (x, y) 是不是确认安全的释放点：探针说 safe 才算；secret / unknown / 探针出错 / 探针缺失 / 坐标非法一律不算 */
-  const pointSafe = async (tab, x, y) => {
-    if (typeof I.assertPointNotSecret !== "function" || !Number.isFinite(x) || !Number.isFinite(y)) return false;
-    try {
-      await I.assertPointNotSecret(tab, x, y, "", { timeoutMs: RELEASE_PROBE_TIMEOUT_MS });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  /**
-   * 补发 release 的**计划**（只读探针，不派发任何输入）：返回 `{ at, moveBack }`，或 null = 不发 release。
-   * 放在 `withAiInput` 之外、整体限时：探针要走好几条 CDP 命令（每条最长 5s），放进输入窗口里会把「已解锁 + AI flag 置位」的窗口拖得很长，
-   * 而 `timeoutMs` 只限第一条命令（R6-30 二轮复审③）。
-   */
-  const planRelease = async (tab, st) => {
-    const plan = async () => {
-      // 一律先探最后位置（不看「有没有拖离 / 滚动」：落点下面的元素可能被任何非鼠标路径换掉，见 mouseNeedsDropProbe）
-      if (await pointSafe(tab, st.x, st.y)) return { at: { x: st.x, y: st.y }, moveBack: false };
-      // 最后位置不安全 / 确认不了：改在按下起点释放——但起点也要复核（wheel 可能已把密码框滚到起点下面）；起点也不安全就一个 release 都不发
-      if (!Number.isFinite(st.dx) || !Number.isFinite(st.dy)) return null;
-      if (!(await pointSafe(tab, st.dx, st.dy))) return null;
-      return { at: { x: st.dx, y: st.dy }, moveBack: true };
-    };
-    return withDeadline(plan(), RELEASE_PROBE_TIMEOUT_MS, null);
-  };
-
-  /** 按计划派发（先挪回起点再逐键 release）；失败一律吞掉 */
-  const sendRelease = async (tab, st, plan) => {
-    const { at } = plan;
-    if (plan.moveBack) {
-      const first = BUTTON_NAMES.find(([, b]) => st.bits & b)?.[0] ?? "left";
-      await I.mouse(tab, { type: "mouseMoved", x: at.x, y: at.y, button: first, buttons: st.bits }).catch(() => {});
-    }
+  /** 在最后位置逐键 release；失败一律吞掉 */
+  const sendRelease = async (tab, st) => {
     let left = st.bits;
     for (const [name, b] of BUTTON_NAMES) {
       if (!(left & b)) continue;
       left &= ~b;
-      await I.mouse(tab, { type: "mouseReleased", x: at.x, y: at.y, button: name, buttons: left, clickCount: 1 }).catch(() => {});
+      await I.mouse(tab, { type: "mouseReleased", x: st.x, y: st.y, button: name, buttons: left, clickCount: 1 }).catch(() => {});
     }
   };
 
   /**
    * 补发 mouseReleased 并清状态（先清再发：即使发送失败，状态也不再残留；并发的第二个调用看不到状态，什么都不发）。失败一律吞掉。
-   *
-   * R6-30（复审）：`ask_user_to_act` / 用户接管 / 任务取消 / 动作出错 / 空闲 120s 过期补发，都走这里，而「最后位置」是 AI 自己 move 到的——
-   * 可能正是密码 / 验证码框（拖放会把按住的文字落进去）。所以**一律**先复核最后位置（R6-30 三轮复审 A：不看鼠标轨迹）：
-   *  - 探针 safe → 在最后位置释放；
-   *  - secret / unknown（含探针出错）→ **改在按下起点释放**（先把指针挪回起点），但起点也要探；
-   *  - 起点也不安全 / 确认不了 / 没有起点 / 整个复核超过 3s → **不发任何事件，并保留按下态**（标 `pending`，R6-30 三轮复审 C，选「保留 + 拦后续点击」而不是「发取消」）：
-   *    此时页面其实仍处于按下态，把它当成「已经松开」会让后面的 click 在敏感点真的 press + release。保留之后：其它工具的点击被 `heldButtonBitsOf` 守卫拒绝，
-   *    `browser_mouse` 的 `up` 在任意（探过的）安全位置仍能释放，导航 / tab 关闭自然结束。
-   * 探针在 `withAiInput` 之外跑；`withAiInput` 只围着真正的派发（出错时直接再发一次：release 本身也吞错）。
+   * `ask_user_to_act` / 用户接管 / 任务取消 / 动作出错 / 空闲 120s 过期补发，都走这里：在最后位置把按着的键逐个松开。
+   * `withAiInput` 只围着真正的派发（出错时直接再发一次：release 本身也吞错）。
    */
   const releaseHeld = async (tab, st = pressedState.get(tab)) => {
     pressedState.delete(tab);
     if (!st || !st.bits) return;
-    const plan = await planRelease(tab, st);
-    if (!plan) {
-      // 期间已经有新的按下态（并发的 down）就别覆盖它；at / nav 刷新，免得保留下来的状态立刻又被当成 stale 反复探
-      if (!pressedState.has(tab)) pressedState.set(tab, { ...st, pending: true, at: Date.now(), nav: tab.navCommitted ?? 0 });
-      return;
-    }
-    const send = () => sendRelease(tab, st, plan);
+    const send = () => sendRelease(tab, st);
     await tab.withAiInput(send).catch(() => send());
   };
 
@@ -344,13 +233,10 @@ export const createHandlers = (deps) => {
    */
   const ensureReleaser = (tab) => {
     if (typeof tab.releaseHeldButtons === "function") return;
-    // 其它会派发鼠标点击的工具（actions.mjs 的 click / type / drag、ops/env.mjs 的 upload）读它判断「是不是还有没放的键」（R6-30 三轮复审 B）；
-    // 直接读按下态、不看过期——空闲 120s / 导航之后的陈旧按下态在被补发 release 之前也算按着
-    tab.heldButtonBits = () => pressedState.get(tab)?.bits ?? 0;
     tab.releaseHeldButtons = async () => {
       const st = pressedState.get(tab);
       if (!st || !st.bits) return;
-      await releaseHeld(tab, st); // 探针在 withAiInput 之外、派发在里面（见 releaseHeld）；失败自己吞
+      await releaseHeld(tab, st);
     };
   };
 
@@ -379,23 +265,6 @@ export const createHandlers = (deps) => {
         // 视口尺寸取当前 layout metrics：坐标超界要在派发任何事件之前就拒绝
         const m = await tab.layoutMetrics();
         checkMousePoint(a.x, a.y, { width: m.viewportW, height: m.viewportH });
-        // R6-30：释放 / 拖放落点、中键点击（Linux 下 = 粘贴）落在密码 / 验证码类字段或无法检查的 iframe 上 → 派发任何事件之前就拒
-        {
-          const pk = peekHeldButtons(tab);
-          if (mouseNeedsDropProbe(a, { bits: pk.bits })) {
-            const clicking = a.action === "click" || a.action === "double_click";
-            await I.assertPointNotSecret(
-              tab,
-              a.x,
-              a.y,
-              pk.bits
-                ? clicking
-                  ? "（鼠标键仍处于按下状态，此时点击会在落点结束按住的拖放：请把落点换到非敏感位置，或先在安全位置 action=up 释放再点击）"
-                  : "（鼠标键仍处于按下状态：请把落点换到非敏感位置再 action=up，或先 up 释放）"
-                : "",
-            );
-          }
-        }
         const before = I.beforeState(tab);
         const d = describeMouseAction(a);
         ctx.describe({ kind: d.kind, summary: d.summary, label: d.label });
@@ -426,8 +295,7 @@ export const createHandlers = (deps) => {
             case "click":
             case "double_click": {
               settleNav = true;
-              // keepHeld：按着左键再右键 click 是 browser_mouse 的有意用法，落点上面已按「持键点击」探过；其它工具的点击没有这个豁免（actions.mjs 的 mouseClickAt 守卫）
-              await I.mouseClickAt(tab, point, { button: a.button, clickCount: a.action === "double_click" ? 2 : 1, modifiers: mods, keepHeld: true });
+              await I.mouseClickAt(tab, point, { button: a.button, clickCount: a.action === "double_click" ? 2 : 1, modifiers: mods });
               // R6-30 二轮复审②：click 自己就是一次 press + release，会把同一个键的按下态结束掉——不清的话 pressedState 留着旧值，
               // 之后的 move 会带着 buttons:1。别的键仍按着就保留它们（并按这次落点更新位置）。
               const rest = heldBits() & ~bit;
@@ -443,9 +311,7 @@ export const createHandlers = (deps) => {
               const held = heldBits();
               await I.mouse(tab, { type: "mouseMoved", x: a.x, y: a.y, button: "none", buttons: held, modifiers: mods });
               // 先登记再派发：mousePressed 发出后即便超时 / 被取消，catch 里也知道要补 release（对没按下的键发 release 无害）
-              // dx / dy = 本轮按下的起点（补发 release 在最后位置不安全时的回退点）；已有按住的键就沿用最早的起点
-              const prev = held ? pressedState.get(tab) : null;
-              pressedState.set(tab, { bits: held | bit, x: a.x, y: a.y, dx: prev?.dx ?? a.x, dy: prev?.dy ?? a.y, at: Date.now(), nav: tab.navCommitted ?? 0 });
+              pressedState.set(tab, { bits: held | bit, x: a.x, y: a.y, at: Date.now(), nav: tab.navCommitted ?? 0 });
               ensureReleaser(tab);
               await I.mouse(tab, { type: "mousePressed", x: a.x, y: a.y, button: a.button, buttons: held | bit, clickCount: 1, modifiers: mods });
               break;
@@ -483,8 +349,6 @@ export const createHandlers = (deps) => {
     const tab = sub.tab;
     const entry = tab.resolveRef(f.ref);
     if (f.value !== undefined) {
-      const info = await I.callOnNode(tab, entry, f.ref, FIELD_PROBE_FN);
-      if (isSecretField(info)) throw new BrowserError("BAD_ARGS", PASSWORD_REJECT_MESSAGE);
       await I.typeBody(session, sub, { ref: f.ref, text: f.value, clear: true, submit: false }, { quick: true });
       return;
     }
@@ -537,7 +401,7 @@ export const createHandlers = (deps) => {
           if (okCount < total) {
             // 表单没填全就提交可能触发校验报错 / 锁账号：不提交，交给 AI 先处理失败项
             submitState = "skipped";
-            submit = { ref: a.submitRef, ok: false, error: `有 ${total - okCount} 项填写失败，已跳过提交。请先处理失败项（密码 / 验证码用 browser_ask_user_to_act），再用 browser_click 点提交` };
+            submit = { ref: a.submitRef, ok: false, error: `有 ${total - okCount} 项填写失败，已跳过提交。请先处理失败项，再用 browser_click 点提交` };
           } else {
             try {
               await I.clickBody(session, sub, { ref: a.submitRef });

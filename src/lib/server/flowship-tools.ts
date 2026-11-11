@@ -790,6 +790,7 @@ const expectGroupReplyDef: FlowshipToolDef = {
     "调用时机：先登记再发——查到对方 open_id 后先调本工具占位（message_id 随手填个唯一串，每次换一个，如 pending-1、pending-2，别复用同一个占位串——同串会被当成同一条去重），再去群里发真 @ 消息；对方秒回也漏不掉。若已发出，拿到回执立刻补登（同目标只留最新，重复登无害）。message_id 取回执里的 message_id（om_xxx）只用于对账，不参与判定；target 必须是 @ 标签里的 user_id/open_id（ou_xxx / cli_xxx，原样抄）。不知道 id 时不许填显示名凑合（填了直接拒单——群昵称随手可改，精确相等防不住改名冒充）：先用成员列表查（群成员详情里能看到 ou_xxx），查不到就问用户要；keywords/about 都是备注（1-5 个关键词或一句话在等什么事，给模型看，不做硬拦）。",
     "出问措辞（决定对方的回复能不能被本机收到）：群里那条消息正文里必须明写「请直接 @本机机器人（写上它的展示名）回复」——对方（尤其是别的机器人）默认会 @ 它自己的负责人而不是你，没 @ 到本机机器人，本机根本收不到回复。一条只问一件事、写清要什么形态的答案；对方是机器人时再加一句「只回实质答案，不用回复『收到』」，免得两边互相客套成环。",
     "不调 = 对方回来只走普通只读答疑，不会当答案数据消费。有效期默认 2 小时（一问一答、消费即焚；ttl_minutes 可改，单位分钟）；一次只等一件事，上一个没回来先别问下一个；内容不够最多补问一次，补问前需重新登记；占位后尽快发真 @（占位传 ttl_minutes: 10，发出后再补登正式登记），别留长时间空窗。",
+    "回话位置跟着上下文走：本轮若是用户在群里发消息触发的（用户消息以 `[群消息·来自 …]` 开头），你这一轮的回复会自动发回那个群，而对方回来后你喂回会话的那一轮结论也会自动发回群里 @ 最初提问的人——所以用户在群里让你去问、你也是在同一个群里问的，那条 @ 消息群里的人都看得见，收尾**不要再在群里复述「我已经 @ 了谁、问了什么」**：整段回复的第一行只写 NO_REPLY（群里就一条消息都不发；这一轮中间也别写会发到群里的旁白），下面可另起行写一句给 Flowship 里看的说明（不会外发）。结论等对方回来再说。用户是在 Flowship 里（不是群里）让你去问的，则照常告诉用户你问了谁、问了什么，对方回来后的结论也只留在 Flowship。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),
@@ -826,12 +827,32 @@ const expectGroupReplyDef: FlowshipToolDef = {
     } catch {
       // 查不到不挡登记
     }
+    // 这件事最初是谁在群里提的：agent 此刻正在服务某位真人在群里发的消息（属主通道的回群登记还在、且提问人不是机器人）。
+    // 对方回执被喂回会话后，这一轮的结论就发回群里 @ 他（见 group-route 的 feedIntoSession）；
+    // 任务是在 Flowship 里发起的 / 提问人是机器人 / 没有登记 → 不记，维持旧行为（吃掉回执、群里不再回）。
+    let replyTo: { requesterOpenId: string; requesterName: string; chatId: string } | undefined;
+    try {
+      const { listGroupReplies } = await import("./feishu-bridge/group-shared");
+      const origin = listGroupReplies(taskId).find(
+        (e) => e.runTag === null && e.kind === "question" && e.requesterIsBot !== true,
+      );
+      if (origin && origin.chatId) {
+        replyTo = {
+          requesterOpenId: origin.requesterOpenId,
+          requesterName: origin.requesterName,
+          chatId: origin.chatId,
+        };
+      }
+    } catch {
+      // 查不到不挡登记
+    }
     const r = registerOutboundQuestion({
       taskId,
       chatId,
       messageId: str(args.message_id),
       target: str(args.target),
       keywords,
+      ...(replyTo ? { replyTo } : {}),
       ...(about.trim() ? { about: about.trim() } : {}),
       // 占位传小的 ttl（如 10 分钟），正式问不传（默认 2 小时）；非法值回落默认，不断登记。
       ...(typeof ttlMinutesRaw === "number" &&
@@ -1152,6 +1173,14 @@ export const flowShipTools: FlowshipToolDef[] = [
 ];
 
 /**
+ * 按名字收窄要挂给会话的 Flowship 系统工具（Cursor 的 `buildSdkCustomTools` 与 pi 的 `buildCustomTools` 共用，两条后端同一口径）。
+ * 不传 / 传 undefined = 全挂（正式会话）；传了就只留名字在清单里的、顺序保持 `flowShipTools` 的原顺序。
+ * 属主一次性 agent 传的清单见 `one-shot-tools.ts` 的 `ONE_SHOT_SYSTEM_TOOL_NAMES`。
+ */
+export const pickSystemTools = (names?: readonly string[]): FlowshipToolDef[] =>
+  names ? flowShipTools.filter((t) => names.includes(t.name)) : flowShipTools;
+
+/**
  * 所有 Flowship 系统工具的**统一调用入口**（pi / Cursor 两条后端都经它，见 custom-agent-backend /
  * buildSdkCustomTools）：在 handler 之前做「本轮是否由群里非属主触发」的硬拒。
  *
@@ -1200,15 +1229,17 @@ const typeBoxToJsonSchema = (schema: unknown): Record<string, SDKJsonValue> => {
 
 /**
  * 给 @cursor/sdk `local.customTools` 用。execute 闭包带 callerToken，
- * 不再把身份塞进 HTTP MCP URL。oneshot / 受限答疑不要调这个。
+ * 不再把身份塞进 HTTP MCP URL。受限答疑（群里非属主的只读旁路）不要调这个。
  */
 export const buildSdkCustomTools = (
   callerToken: string,
   /**
    * 会话所属任务 / agent 实例：`wait` 据 taskId 被停止 / 插话 / 跳过唤醒，据 waitScope 被
-   * 「这个实例的 run 被取消 / 会话被关」唤醒（见 FlowshipToolContext）
+   * 「这个实例的 run 被取消 / 会话被关」唤醒（见 FlowshipToolContext）；
+   * systemToolNames：只挂这些名字的 Flowship 系统工具（不传 = 全挂）；属主一次性 agent 用它收窄到
+   * `ONE_SHOT_SYSTEM_TOOL_NAMES`（one-shot-tools.ts）。浏览器工具不受它影响。
    */
-  opts?: { taskId?: string; waitScope?: string },
+  opts?: { taskId?: string; waitScope?: string; systemToolNames?: readonly string[] },
 ): Record<string, SDKCustomTool> => {
   const tools: Record<string, SDKCustomTool> = {};
   // Cursor 的 customTool 回调没有 AbortSignal（见 session-wait 头注释），这里只能给 taskId / scope
@@ -1220,9 +1251,10 @@ export const buildSdkCustomTools = (
         }
       : undefined;
   // 浏览器工具不进 flowShipTools 常量（它是静态清单、不少测试按它的长度 / 名字断言）：
-  // 按会话动态追加——只有桌面壳在、有 taskId 才有；到这里一定是正式会话（readOnly / oneshot 没有 callerToken、不会调本函数）
+  // 按会话动态追加——只有桌面壳在、有 taskId 才有；到这里一定带 callerToken（readOnly / 受限答疑没有 callerToken、不会调本函数）
   const browserTools = getBrowserTools({ taskId: opts?.taskId, readOnly: false });
-  for (const t of [...flowShipTools, ...browserTools]) {
+  const systemTools = pickSystemTools(opts?.systemToolNames);
+  for (const t of [...systemTools, ...browserTools]) {
     tools[t.name] = {
       description: t.description,
       inputSchema: typeBoxToJsonSchema(t.parameters),
@@ -1255,14 +1287,15 @@ export const buildSdkCustomTools = (
 
 /**
  * 正式会话：把系统工具挂进 `local.customTools`。已有 customTools 不覆盖。
- * 无 callerToken（oneshot / 受限答疑）原样返回。
+ * 无 callerToken（受限答疑 / 只读轮次）原样返回。属主一次性 agent 带 callerToken，会挂上（清单由 systemToolNames 收窄，
+ * 浏览器工具与额外工具照挂——有意保留，见 tests/one-shot-system-tools.test.ts）。
  */
 export const withFlowshipSdkCustomTools = <T extends object>(
   local: T | undefined,
   callerToken: string | undefined,
   /** 与系统工具一起挂的额外工具（如 `subagent`）；只在这里挂系统工具时才带上 */
   extraTools?: Record<string, SDKCustomTool>,
-  opts?: { taskId?: string; waitScope?: string },
+  opts?: { taskId?: string; waitScope?: string; systemToolNames?: readonly string[] },
 ): T | (T & { customTools: Record<string, SDKCustomTool> }) => {
   if (!callerToken) return (local ?? {}) as T;
   if (

@@ -24,7 +24,11 @@ import {
   getSubagentDisplayLookup,
   getSubagentParentModel,
 } from "@/lib/server/subagent-parent-model";
-import { SUBAGENT_INPUT_JSON_SCHEMA, type ModelCatalogEntry } from "@/lib/subagent-spec";
+import {
+  SUBAGENT_INPUT_JSON_SCHEMA,
+  SUBAGENT_TOOL_DESCRIPTION,
+  type ModelCatalogEntry,
+} from "@/lib/subagent-spec";
 
 // ----------------- 假依赖 -----------------
 
@@ -184,8 +188,38 @@ describe("subagent 工具定义", () => {
     expect(Object.keys(SUBAGENT_INPUT_JSON_SCHEMA.properties)).not.toContain("resume");
   });
 
-  it("explore 白名单只有读 / 搜", () => {
-    expect([...CURSOR_SUBAGENT_READONLY_TOOLS].sort()).toEqual(["glob", "grep", "ls", "read"]);
+  it("explore 白名单：读 / 搜本地文件 + 联网搜索 / 抓网页（2026-11-11 加），再没有别的", () => {
+    expect([...CURSOR_SUBAGENT_READONLY_TOOLS].sort()).toEqual([
+      "glob",
+      "grep",
+      "ls",
+      "read",
+      "webFetch",
+      "webSearch",
+    ]);
+  });
+
+  it("explore 仍然是只读：白名单里没有 shell / edit / write / delete / mcp / task 等能写、能跑命令、能递归的工具", () => {
+    const tools = new Set<string>(CURSOR_SUBAGENT_READONLY_TOOLS);
+    for (const banned of [
+      "shell",
+      "edit",
+      "write",
+      "delete",
+      "applyAgentDiff",
+      "mcp",
+      "task",
+      "generateImage",
+      "updateTodos",
+      "askQuestion",
+    ]) {
+      expect(tools.has(banned), banned).toBe(false);
+    }
+  });
+
+  it("工具描述告诉模型：本会话里 explore 也能联网（pi 的 task 共用文案没有这句——pi 没有联网工具）", () => {
+    expect(CURSOR_SUBAGENT_DESCRIPTION).toContain("explore 除了读 / 搜本地文件，还能联网搜索、抓取网页");
+    expect(SUBAGENT_TOOL_DESCRIPTION).not.toContain("联网");
   });
 });
 

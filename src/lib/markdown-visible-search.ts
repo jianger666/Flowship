@@ -17,6 +17,7 @@ import { scanMermaidSource } from "@/lib/mermaid-source-gate";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
+import { remarkUrlCodeLink } from "@/lib/remark-url-code-link";
 
 type MdastNode = {
   type: string;
@@ -83,7 +84,8 @@ const buildMarkdownProcessor = () =>
     .use(remarkGfm)
     .use(remarkCodeReference)
     .use(remarkKeepTrailingUnderscore)
-    .use(remarkTrimAutolinkCjk);
+    .use(remarkTrimAutolinkCjk)
+    .use(remarkUrlCodeLink);
 
 let cachedProcessor: ReturnType<typeof buildMarkdownProcessor> | null = null;
 
@@ -95,7 +97,8 @@ const getMarkdownProcessor = () => {
 export const markdownToMdast = (markdown: string): MdastNode => {
   const processor = getMarkdownProcessor();
   const tree = processor.parse(markdown);
-  return processor.runSync(tree) as MdastNode;
+  // 第二个参数 = 原文：remarkUrlCodeLink 要靠它判断围栏是否真的闭合（没有原文就一律不换）
+  return processor.runSync(tree, markdown) as MdastNode;
 };
 
 /** 单段 fallback（测试 / 调试） */

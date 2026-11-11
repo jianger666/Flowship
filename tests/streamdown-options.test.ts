@@ -93,7 +93,9 @@ describe("V15-02 流式中的链接不再闪「文字 [blocked]」", () => {
   });
 
   it("配置本身：linkMode 是 text-only", () => {
-    expect(STREAMDOWN_REMEND_OPTIONS).toEqual({ linkMode: "text-only" });
+    // R11-01：同一份配置里还挂了 remend 前置 handler（url-code-tail，见 tests/remark-url-code-link.test.ts）；
+    // 这条只关心 linkMode，所以不再整体 toEqual
+    expect(STREAMDOWN_REMEND_OPTIONS).toMatchObject({ linkMode: "text-only" });
   });
 
   it("接线：MarkdownText 把它传给 Streamdown 的 remend prop", () => {

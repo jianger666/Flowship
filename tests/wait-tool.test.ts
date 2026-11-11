@@ -238,7 +238,8 @@ describe("pi 适配：execute 第三位 signal 与 taskId 必须透传（源码�
     path.resolve(import.meta.dirname, "..", "src", "lib", "server", "custom-agent-backend.ts"),
     "utf-8",
   );
-  const start = src.indexOf("? flowShipTools.map(");
+  // 系统工具清单经 pickSystemTools 收窄后再映射（正式会话全挂、属主一次性 agent 只挂 schedule / wait）
+  const start = src.indexOf("? systemTools.map(");
   const end = src.indexOf("...buildCodingToolDefs(", start);
   const block = src.slice(start, end);
 

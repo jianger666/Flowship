@@ -7,12 +7,16 @@ import { describe, expect, it } from "vitest";
 import {
   ALLOWED_PERMISSIONS,
   ASKABLE_PERMISSIONS,
+  FRAME_RESTRICTED_ALLOWED_PERMISSIONS,
   MAX_GRANT_ENTRIES,
+  MEDIA_ATOMS,
+  MEDIA_PERMISSION,
   NEVER_PERMISSIONS,
   canonicalPermission,
   createPermissionGrants,
   decidePermission,
   decidePermissionWithReason,
+  mediaAtomsOf,
   originOf,
   parseOriginArg,
 } from "../electron-app/browser/permission-policy.mjs";
@@ -21,7 +25,7 @@ const A = "https://a.example.com";
 const B = "https://b.example.com";
 
 describe("decidePermission：永远拒绝 / 无隐私面放行", () => {
-  it.each(["media", "display-capture", "usb", "hid", "serial", "bluetooth", "openExternal", "fullscreen", "keyboardLock", "fileSystem", "window-management", "unknown"])(
+  it.each(["display-capture", "usb", "hid", "serial", "bluetooth", "openExternal", "fullscreen", "keyboardLock", "fileSystem", "window-management", "unknown"])(
     "永远拒绝：%s（即使有授予记录、AI 开关开着、模拟生效）",
     (permission) => {
       const grants = createPermissionGrants();
@@ -35,6 +39,98 @@ describe("decidePermission：永远拒绝 / 无隐私面放行", () => {
   it("clipboard-sanitized-write 直接放行（含 origin 为 null 的不透明来源）", () => {
     expect(decidePermission({ permission: "clipboard-sanitized-write", origin: A })).toBe("allow");
     expect(decidePermission({ permission: "clipboard-sanitized-write", origin: null })).toBe("allow");
+  });
+
+  it("speaker-selection 放行（让页面看到扬声器名字并切换输出设备，否则声音检测页只能看到一个空名占位）", () => {
+    expect(ALLOWED_PERMISSIONS).toContain("speaker-selection");
+    expect(NEVER_PERMISSIONS).not.toContain("speaker-selection");
+    expect(decidePermissionWithReason({ permission: "speaker-selection", origin: A })).toEqual({ decision: "allow", reason: "allowed" });
+  });
+
+  it.each(["microphone", "camera"])(
+    "%s（麦克风 / 摄像头各是一个独立的授予）不再是红线：归「询问」——没授予 → ask；用户授予 → allow；其余沿用询问类的规则",
+    (permission) => {
+      expect(NEVER_PERMISSIONS).not.toContain(permission);
+      expect(ALLOWED_PERMISSIONS).not.toContain(permission); // 也不是静默放行：陌生页面不能在用户不知情时开麦克风 / 摄像头
+      expect(ASKABLE_PERMISSIONS).toContain(permission);
+      expect(decidePermissionWithReason({ permission, origin: A, grants: createPermissionGrants() })).toEqual({ decision: "ask", reason: "needs-user" });
+      // 用户在提示里点了「本会话一直允许」→ 放行；按 origin 隔离
+      const grants = createPermissionGrants();
+      grants.allow(A, permission, "user");
+      expect(decidePermissionWithReason({ permission, origin: A, grants })).toEqual({ decision: "allow", reason: "grant-user" });
+      expect(decidePermission({ permission, origin: B, grants })).toBe("ask");
+      // AI 写的授予只在设置里打开「AI 管理页面权限」时才生效
+      const ai = createPermissionGrants();
+      ai.allow(A, permission, "ai");
+      expect(decidePermission({ permission, origin: A, grants: ai, config: { pagePermissions: false } })).toBe("ask");
+      expect(decidePermission({ permission, origin: A, grants: ai, config: { pagePermissions: true } })).toBe("allow");
+      // 显式拒绝记录优先；不透明来源（about:blank / data:）不弹提示直接拒绝；Flowship 自己的 origin 什么都不给
+      const denied = createPermissionGrants();
+      denied.deny(A, permission, "ai");
+      expect(decidePermissionWithReason({ permission, origin: A, grants: denied })).toEqual({ decision: "deny", reason: "explicit-deny-ai" });
+      expect(decidePermissionWithReason({ permission, origin: null })).toEqual({ decision: "deny", reason: "opaque-origin" });
+      expect(decidePermissionWithReason({ permission, origin: A, grants, isAppOrigin: true })).toEqual({ decision: "deny", reason: "app-origin" });
+    },
+  );
+
+  it("R9-02：麦克风与摄像头互不连带——只授予麦克风时摄像头仍要问，反过来也一样；显式拒绝一个也不影响另一个", () => {
+    const grants = createPermissionGrants();
+    grants.allow(A, "microphone", "user");
+    expect(decidePermission({ permission: "microphone", origin: A, grants })).toBe("allow");
+    expect(decidePermission({ permission: "camera", origin: A, grants })).toBe("ask");
+    const cam = createPermissionGrants();
+    cam.allow(A, "camera", "user");
+    expect(decidePermission({ permission: "camera", origin: A, grants: cam })).toBe("allow");
+    expect(decidePermission({ permission: "microphone", origin: A, grants: cam })).toBe("ask");
+    const deny = createPermissionGrants();
+    deny.deny(A, "microphone", "ai");
+    expect(decidePermission({ permission: "microphone", origin: A, grants: deny })).toBe("deny");
+    expect(decidePermission({ permission: "camera", origin: A, grants: deny })).toBe("ask");
+  });
+
+  it("R9-02：`media`（Electron 的合称）不是可决策的权限名——直接问策略 = 未知权限 = 拒绝（只在 gate / AI 工具入口处展开成麦克风 + 摄像头）", () => {
+    expect(MEDIA_PERMISSION).toBe("media");
+    expect([...MEDIA_ATOMS]).toEqual(["microphone", "camera"]);
+    for (const list of [ASKABLE_PERMISSIONS, ALLOWED_PERMISSIONS, NEVER_PERMISSIONS]) expect(list).not.toContain("media");
+    const grants = createPermissionGrants();
+    grants.allow(A, "media", "user");
+    expect(decidePermissionWithReason({ permission: "media", origin: A, grants })).toEqual({ decision: "deny", reason: "unknown-permission" });
+    // 别名：camera / video → camera；microphone / mic / audio → microphone；合称大小写不敏感地认出来
+    for (const alias of ["camera", "video", "Video"]) expect(canonicalPermission(alias)).toBe("camera");
+    for (const alias of ["microphone", "mic", "audio", "Audio"]) expect(canonicalPermission(alias)).toBe("microphone");
+    for (const alias of ["media", "Media", "MEDIA"]) expect(canonicalPermission(alias)).toBe("media");
+  });
+
+  it("R9-02：mediaAtomsOf——请求写了 audio / video 就只问对应的；没给 / 空 / 认不出（含检查处理器的 unknown）= 两个都要", () => {
+    expect(mediaAtomsOf(["audio"])).toEqual(["microphone"]);
+    expect(mediaAtomsOf(["video"])).toEqual(["camera"]);
+    expect(mediaAtomsOf(["video", "audio"])).toEqual(["microphone", "camera"]); // 顺序固定：麦克风在前
+    expect(mediaAtomsOf(["audio", "audio"])).toEqual(["microphone"]); // 去重
+    expect(mediaAtomsOf("audio")).toEqual(["microphone"]); // 检查处理器给的是字符串
+    expect(mediaAtomsOf("video")).toEqual(["camera"]);
+    for (const none of [undefined, null, [], "unknown", ["unknown"], ["screen"], 42, {}]) {
+      expect(mediaAtomsOf(none), JSON.stringify(none)).toEqual(["microphone", "camera"]);
+    }
+    // 夹带未知类型：只认 audio / video，不因为多了个陌生项就退化成「两个都要」
+    expect(mediaAtomsOf(["audio", "screen"])).toEqual(["microphone"]);
+    // 返回的是新数组，改它不会污染常量
+    const r = mediaAtomsOf(undefined);
+    r.pop();
+    expect([...MEDIA_ATOMS]).toEqual(["microphone", "camera"]);
+  });
+
+  it("屏幕共享（display-capture）等其余设备类仍永远拒绝，放开 media 没有连带放开它们", () => {
+    const grants = createPermissionGrants();
+    for (const permission of ["display-capture", "usb", "hid", "serial", "bluetooth", "openExternal"]) {
+      grants.allow(A, permission, "user");
+      expect(decidePermissionWithReason({ permission, origin: A, grants, config: { pagePermissions: true } }), permission).toEqual({ decision: "deny", reason: "never" });
+    }
+    for (const alias of ["screen", "screen-capture", "screen-share"]) expect(canonicalPermission(alias)).toBe("display-capture");
+  });
+
+  it("FRAME_RESTRICTED_ALLOWED_PERMISSIONS 必须是 ALLOWED 的子集，且只含 speaker-selection（剪贴板写保持旧行为不分框架）", () => {
+    for (const p of FRAME_RESTRICTED_ALLOWED_PERMISSIONS) expect(ALLOWED_PERMISSIONS).toContain(p);
+    expect([...FRAME_RESTRICTED_ALLOWED_PERMISSIONS]).toEqual(["speaker-selection"]);
   });
 
   it("Flowship 自己的 origin：什么都不给，连无隐私面的放行项也拒绝", () => {
@@ -94,9 +190,12 @@ describe("decidePermission：询问 / 授予 / 定位模拟", () => {
     expect(decidePermission({ permission: "geolocation", origin: A, grants: base.grants, emulatedGeolocationOrigins: [] })).toBe("ask");
   });
 
-  it("权限名别名在决策里也被规整（location → geolocation，camera → media）", () => {
+  it("权限名别名在决策里也被规整（location → geolocation，mic → microphone，video → camera）", () => {
     expect(decidePermission({ permission: "location", origin: A, grants: createPermissionGrants(), emulatedGeolocationOrigins: [A] })).toBe("allow");
-    expect(decidePermission({ permission: "camera", origin: A })).toBe("deny");
+    expect(decidePermission({ permission: "mic", origin: A })).toBe("ask"); // mic → microphone：要问用户
+    const grants = createPermissionGrants();
+    grants.allow(A, "camera", "user");
+    expect(decidePermission({ permission: "video", origin: A, grants })).toBe("allow"); // video → camera：命中摄像头的授予
   });
 });
 
@@ -106,7 +205,7 @@ describe("canonicalPermission / originOf / parseOriginArg", () => {
     expect(canonicalPermission("notification")).toBe("notifications");
     expect(canonicalPermission("MIDISYSEX")).toBe("midiSysex");
     expect(canonicalPermission("pointer-lock")).toBe("pointerLock");
-    expect(canonicalPermission("microphone")).toBe("media");
+    expect(canonicalPermission("microphone")).toBe("microphone");
     expect(canonicalPermission("something-new")).toBe("something-new");
     expect(canonicalPermission("bad name!")).toBeNull();
     expect(canonicalPermission("")).toBeNull();
