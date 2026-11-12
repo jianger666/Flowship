@@ -559,13 +559,17 @@ describe("重启后残留 dev server 必须被清掉（2026-11-12 端口 +1）",
         | undefined;
       expect(rec?.pid).toBeTruthy();
       const pid = rec!.pid;
-      // 前提自检：确实是事故里的形态（sh 已 exec 成命令本体、命令名带路径）——不是这个形态这条回放就没意义
+      // 前提自检：事故形态是「sh 已 exec 成命令本体、命令名带路径」——但这只在 macOS 的 sh 上成立；
+      // Linux CI（ubuntu 的 /bin/sh 是 dash，`-c` 不 exec）里 ps 看到的是 `/bin/sh -c fakeyarn custom`，
+      // 那是另一种已知形态（pidLooksOurs 表里的 sh -c 形态），本回放照样要验「丢内存态后能杀净 + pidfile 清空 + 指纹一致」。
+      // 所以严格形态只在 darwin 钉死，其余平台只要求命令行里有这条命令（v1.9.49 门禁在 Linux 上红过一次）。
       const ps = psCommandOf(pid);
       expect(ps).toContain("fakeyarn custom");
-      expect(ps).toMatch(/\/fakeyarn custom$/);
+      if (process.platform === "darwin") expect(ps).toMatch(/\/fakeyarn custom$/);
       // 新记录带启动时间指纹
       expect(rec!.startedFp).toBeTruthy();
-      expect(rec!.startedFp).toBe(await getProcessStartFingerprint(pid));
+      // 与产品同口径（lstart 只有秒精度、Linux 上会随 NTP 校时漂 1~2 秒）：用 fingerprintsMatch，不要求字符串逐字相等
+      expect(fingerprintsMatch(rec!.startedFp!, (await getProcessStartFingerprint(pid))!)).toBe(true);
 
       dropInMemoryState();
       expect(isAlive(pid)).toBe(true);
