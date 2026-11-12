@@ -110,7 +110,8 @@ describe("存储页不列出 / 不统计 config.json 同族文件", () => {
     // DATA_DIR 在 task-fs-core 加载时按 FLOWSHIP_DATA_DIR 求值：env 设好之后再动态加载
     const { GET } = await import("@/app/api/system/storage/route");
 
-    const before = await GET();
+    const req = () => new Request("http://local/api/system/storage");
+    const before = await GET(req());
     expect(before.status).toBe(200);
     const beforeBody = (await before.json()) as {
       totalBytes: number;
@@ -120,7 +121,7 @@ describe("存储页不列出 / 不统计 config.json 同族文件", () => {
     expect(beforeBody.entries.map((e) => e.id)).toEqual(["t-live"]);
 
     writeFamilyFiles();
-    const after = await GET();
+    const after = await GET(req());
     expect(after.status).toBe(200);
     const afterText = await after.text();
     const afterBody = JSON.parse(afterText) as typeof beforeBody;

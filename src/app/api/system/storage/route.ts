@@ -120,12 +120,14 @@ const worktreeBytesOf = async (id: string): Promise<number | null> => {
   return getAnySize(worktreeKey(id));
 };
 
-export const GET = async (req?: Request) => {
+// ⚠️ `req` 必须是必填：Next 的路由类型校验（`next build` 的「Linting and checking validity of types」）
+// 只认第一个参数是 `Request | NextRequest`，写成 `req?: Request` 会让整个构建红（v1.9.49 首发就栽在这里）。
+export const GET = async (req: Request) => {
   try {
     await ensureDataDir();
     await loadSizeCache();
     // 「重新统计」：整表作废重量（普通进页面 / 删除后的刷新都走缓存、不碰磁盘）
-    if (req && new URL(req.url).searchParams.get("refresh") === "1") clearSizeCache();
+    if (new URL(req.url).searchParams.get("refresh") === "1") clearSizeCache();
     const worktreesRoot = getWorktreesRoot();
 
     const dirents = await fs.readdir(DATA_DIR, { withFileTypes: true });

@@ -158,7 +158,7 @@ interface Body {
   worktreeScan: { pending: number; failed: number; measuredAt: number | null };
 }
 const get = async (url?: string): Promise<Body> => {
-  const res = await GET(url ? new Request(url) : undefined);
+  const res = await GET(new Request(url ?? "http://local/api/system/storage"));
   expect(res.status).toBe(200);
   return (await res.json()) as Body;
 };
