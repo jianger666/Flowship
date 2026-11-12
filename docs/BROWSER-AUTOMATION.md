@@ -944,3 +944,70 @@ E1 收尾时用探针（真 Electron）发现「`browser_network` 里看不到�
 - **授权链接启发式在代码托管 / 文档站的误判（R7-14-1，接受）**：`github.com/org/repo/tree/feature/login`、`…/blob/main/src/login/index.ts`、`github.com/topics/oauth2`、`auth0.com/docs`、`developers.google.com/identity/protocols/oauth2`、`docs.spring.io/…/oauth2/…` 这类会被判授权、改走系统浏览器；reviewer 的 212 条难例里 83 条。代价只是多开一次系统浏览器，与「宁可多判」一致，**没做**主机 / 路径白名单（`github.com` 的 `/blob/` `/tree/` `/compare/` `/topics/`、`docs.` / `developer(s).` 主机首段）：名单会越补越长，每加一条就多一个「漏判」入口。反向的漏判（240 条里 27 条：`github.com/sessions/two-factor`、`microsoft.com/devicelogin`、`login.jsp` / `login.action`、`wp-login.php`、`#/login` 这类 hash 路由）代价是在内置浏览器里登录——持久分区会保留，接受；用户也随时可以右键「在系统浏览器打开」。
 - **渲染端 `isSameAppOrigin` 与主进程 `app-origin` 口径不一致（R7-14-2，接受）**：渲染端只认「同端口 + 回环别名」，主进程 `checkUrl` 还把 `127.0.0.2:P`、`foo.localhost:P`、`localhost.:P`、`[::]:P`、`[::ffff:127.0.0.1]:P` 以及 FlowshipTest 里的 8876 / 8676（反之亦然）当站内拦截。渲染端判「内置」、主进程拦下时，用户看到的是 toast「内置浏览器打不开这个地址」而不是回退系统浏览器。极少见、不是安全问题（主进程是最终防线，红线 1 不受影响），所以没改渲染端口径（让两边完全一致需要把端口集合和别名规则从主进程搬到渲染端，会引入第二份「Flowship 自己是谁」的定义）。**可选的后续**：`openInNewTab` 返回 null 且不是右键显式意图时回退系统浏览器。
 - **静态服务对「还没证明自己有 token」的请求的占槽（R7-14-3，已做）**：405 / 无效 Host 403 / 跨站 403 现在回 `Connection: close`（见 §16.2「协议面」）。剩下的是**持有有效 token 的请求**：它们保持 keep-alive（页面要复用连接），本机进程若拿到 token（本来就等于读了该目录的权限）可以占槽——不属于「没有 token 的探测」。`maxRequestsPerSocket` 没设：它对页面（一个 HTML 页面发几十个请求）有副作用。
+
+## 17. R14：对「跨源带请求体」的请求下终结命令会让 Chromium 崩溃（2026-11-11 正式包 v1.9.47 闪退）
+
+### 17.1 事故
+
+2026-11-11 16:29，正式版 Flowship v1.9.47 整个进程闪退，所有在跑的任务被打断（重启后 3 个任务被标成 error）。崩溃报告 `~/Library/Logs/DiagnosticReports/Flowship-2026-11-11-162931.ips`：主线程 `CrBrowserMain`、`EXC_BAD_ACCESS`、地址 `0xefefefefefeff01f`——`0xEF` 是 PartitionAlloc 对「已释放但仍被引用」内存的填充值，即 **Chromium 浏览器进程里的释放后使用**，不是我们的 JS 逻辑错误（栈里的函数名是剥符号后的最近导出符号，不可信）。
+
+触发链（来自任务事件流）：AI 调 `browser_network_rules`，`action=mock`，pattern 只匹配某个接口路径（200 + JSON body），设置成功；2 秒后 `browser_click` 点了会触发该请求的按钮，点击返回「与桌面壳的连接已断开」。被 mock 的是页面 → 同 site 不同 origin 的 API 的**带 JSON 请求体的 POST**。
+
+### 17.2 根因（真 Electron 无头实测，Electron 42.4.0 / Chromium 148.0.7778.254；Chromium 自己的 bug，我们改不了）
+
+对「**CORS 模式、带请求体、跨源**（同 site 不同端口也算）」的 XHR / fetch，下**任何终结命令**都崩：
+
+| 命令 / 形态 | 结果 |
+|---|---|
+| `Fetch.fulfillRequest`（mock） | **崩** |
+| `Fetch.failRequest`（block / fail；`errorReason` 换 Failed / Aborted / ConnectionRefused / BlockedByClient / AccessDenied 都一样） | **崩** |
+| 以上两条的变量：POST / PUT / PATCH；`application/json` / `text/plain`；mock 的 body 大小、有无 ACAO 头 | 都**崩**，与这些无关 |
+| `Fetch.continueRequest`（含改写 `url`） | 不崩 |
+| 跨源 GET / DELETE；跨源 POST **不带体**；同源 GET / POST / PUT 的 fulfill / fail | 不崩 |
+| CORS 预检（`OPTIONS`，没有体）的 fulfill / fail；sendBeacon、表单导航（非 CORS 模式）的 fail | 不崩 |
+
+**事故简报里最初写「fail / block 不崩」是被 CORS 预检混淆了**：`application/json` 的跨源 POST 会先发预检，fail 规则把预检先失败，真正带体的 POST 根本没发出来；换成不触发预检的 `text/plain` POST 配 fail / block 规则同样 SIGSEGV。所以防护**不能**只拦 mock、也**不能**把 mock 改发 `failRequest`。
+
+「Electron 42.11.18 / 43.8.8 同样崩」这条来自事故简报（它说是实测的），本轮没有复测；没查到上游 bug 编号。
+
+### 17.3 防护（只动「终结命令」这条路径，没有重构规则引擎）
+
+`electron-app/browser/net-rules-engine.mjs`：
+
+- **判定** `terminalWouldCrashChromium(request)` = 带请求体 且 不能**确认**同源。「带体」只要一个信号就算（`hasPostData === true` / `postData` 非空 / `postDataEntries` 非空）；「确认同源」= 请求头有 `Origin` 且与请求 URL 的 origin 完全一致，缺 `Origin`、`Origin: null`、任一边解析失败都按「不是同源」。**宁可误拦也不漏拦**（sendBeacon / 表单导航因为也带体、也跨源，会被一并拒绝）。
+- **处置**：block / fail / mock 命中这种请求时，`decideForRequest` 改判 `refuse`——**不发任何终结命令，也不放行真请求**（mock / block 的目的通常就是别让真 POST 打到后端，放行会产生真实副作用）。`refuse` 发的是 `Fetch.continueRequest` 并把 `url` 改写到 `REFUSE_URL`（`http://127.0.0.1:1/…`，端口 1 在 Chromium 受限端口表里，**连接之前**就被拒，net::ERR_UNSAFE_PORT）：页面看到网络错误，请求体 / Cookie / Authorization 不会离开本机。实测：改写目标是可连接端口时后端确实收到了改写后的请求（证明改写生效）；是受限端口时监听器没收到任何连接。
+- `refuse` 自己失败时**不**退回原样 `continueRequest`（那等于把要拒绝的真请求放出去），只记日志；这是「失败退回放行」不变量唯一的例外（见 `createPauseController` 头注释第 2 条）。
+- 命中的规则 `hits` 照常计数；`onRuled` 打标：block / fail 的 `ruled` 不变（`errorText` 变成 `net::ERR_UNSAFE_PORT`），mock 打 `ruled: "mock-refused"`（`tab.mjs` 把它同样算「失败」，`network-render.ts` 的固定中文标签「mock被安全拒绝(跨源带体请求不可模拟,请求已失败)」）；主进程日志留一行（不写 URL，query 里可能有凭据）。
+- 不受影响：同源带体、跨源 GET、跨源不带体的 mock 仍正常 fulfill；CORS 预检仍由系统 204 代答；`isAppUrl`（Flowship 自身 origin）仍永不拦截。
+
+### 17.4 AI 看到的变化（`src/lib/server/browser/tools-net-rules.ts`）
+
+- 工具描述并进一小句：mock 不能用于跨源且带请求体（POST / PUT / PATCH）的请求，会被直接拒绝，需要时改用 `browser_evaluate` 替换页面里的 fetch / XHR 或 mock 同源接口（受工具描述「≤ 2 句」与体量预算守卫约束，所以只有一句）。
+- mock 设置成功后的返回提示带完整限制说明（不占每轮 prompt）；block / fail 设置成功后的提示说明这类请求会以 `net::ERR_UNSAFE_PORT` 失败——这是正常的拒绝，不是真实网络故障。
+
+### 17.5 测试与验证证据（2026-11-11）
+
+- 引擎单测 `tests/browser-e2-p4-engine.test.ts`（假 CDP；含「危险类只发带改写 url 的 `continueRequest`，绝无 `failRequest` / `fulfillRequest`」、同源 / GET / 不带体 / 缺 Origin / 预检）、ops 层 `tests/browser-e2-p4-ops.test.ts`（条目打 `mock-refused` 且算失败）、工具层 `tests/browser-e2-p4-tools.test.ts`（描述 / 提示 / 标记不可伪造）；三个文件合计 209 条通过。
+- 真机回归 `scripts/browser-e2e/r14-mock-no-fulfill-crash.cjs`（经 `node scripts/browser-e2e/run.mjs … --timeout 120`）：35 项全过——跨源 JSON POST + mock + 真点击不崩、页面看到网络错误、真后端没收到这个 POST（拒绝而不是放行），预检由系统 204 代答（后端也没收到 OPTIONS）；text/plain、PUT / PATCH、fetch、同 site 不同端口、sendBeacon 同样；block / fail 对同类请求不崩；同源 POST / 跨源 GET / 跨源不带体的 mock 仍生效；旁路记录证明全程没有任何「带体 + 跨源」的暂停请求收到过 fulfill / fail；没有主进程 uncaughtException。
+- 单形态探针 `scripts/browser-e2e/r14-mock-fulfill-probe.cjs`：每种形态用环境变量单独起一个 Electron（崩了整个进程就没了），开关见文件头；复现崩溃时必须走启动器。
+- **变异验证 14 个全被杀**（每次变异前从金本快照还原、结束后与金本逐字节比对）：判定恒 false、只防 mock、拒绝失败退回放行、拒绝改回 `failRequest`、缺 Origin 视为同源、忽略 `hasPostData`、`REFUSE_URL` 改成可连接端口、`Origin: null` 当同源、拒绝时不改写 url、`tab.mjs` / `network-render.ts` 去掉 `mock-refused`、`ruled` 标记丢失、`mockRefused` 丢失、`isAppUrl` 红线削弱。其中判定恒 false / 只防 mock / 拒绝改回 `failRequest` / 缺 Origin / 忽略 `hasPostData` / 拒绝时不改写 url 这 6 个在真机回归里表现为 Electron SIGSEGV（崩溃本身就是失败信号）。
+
+### 17.6 未验证与残余风险
+
+1. **没有在真 Flowship App 里复现 / 验证**（项目规则不许操作 App 界面）：结论来自无头 Electron（42.4.0）与单测。
+2. `REFUSE_URL` 依赖「端口 1 在 Chromium 受限端口表里」：若将来 Chromium 改了该表、且本机恰好有进程在 `127.0.0.1:1` 监听，被拒绝的请求（含请求体）会被它收到。风险很低（tcpmux 端口基本无人监听），但这是防护的一个隐含前提。
+3. 判定是保守启发式：带体但**缺 `Origin` 头**的同源请求也会被当成危险拒绝（误拦，不会漏拦）。
+4. 这是 Chromium bug，升级 Electron 前应重跑 `r14-mock-no-fulfill-crash.cjs` 与 `r14-mock-fulfill-probe.cjs`（各形态）：若上游修了，可以考虑放宽；在那之前不要放宽判定。
+5. 调查崩溃的实验会在本机留下一批 `Electron-*.ips` 崩溃报告（`~/Library/Logs/DiagnosticReports/`），不是新的线上问题。
+
+## 18. 任务页头部的「浏览器紧凑态」（2026-11-11 用户反馈：「上面的内容几乎占了一半的空间，浏览器只有一半的视口」）
+
+- **问题**：任务页头部（标题行 + 仓库 / 分支两排 + 测试链接 + 辅助入口 chip 行，约 130px）加上浏览器自己的「产物 | 浏览器」切换行、工具栏、标签栏、状态条，叠在视口上方；800px 高的窗口里视口只剩一半。
+- **做法**（`src/app/tasks/[id]/page.tsx` + `src/lib/task-header-compact.ts`）：**浏览器真的看得见时**（`browserPaneOpen` = 浏览器标签激活且产物栏没折叠）头部只留一行——返回 / 标题 / 状态徽标 / 推进·停止·恢复（「已合入 / 放弃」入口 2026-11-12 起已删除、终结统一走归档），再加两颗小图标：分栏按钮（从 chip 行搬来，不然浏览器标签下没有入口能还原事件流）和「任务详情」展开钮。仓库 / 分支、MR 链接、基本信息 / 任务上下文 / MCP / 批次进度 / 改动 / 浏览器 / 需求群 / 任务文件夹都收进「任务详情」，点一下展开。
+- **收起 = `hidden`，不卸载**：改动面板 / 批次进度的状态与已拉的数据展开后还在，不会重新请求。提测提醒横幅是告警，紧凑态也照常显示。
+- **记忆**：展开态记在本机 localStorage（`flowship.task-header-details-in-browser`，全局一个值，不分任务），默认收起；切回「产物」标签或产物栏折叠（事件流占满）时头部完全还原，与改动前一致。
+- **预览胶囊在紧凑态保留**（R15-03）：点预览端口进内置浏览器之后，用户最常用的操作恰恰是「看着页面想看日志 / 重启 / 停」，所以**有预览位（或启动请求在途）的仓**在紧凑态仍留预览胶囊本身（含 ▾ 菜单里的停止 / 重启 / 查看日志）；同卡片里的 IDE 打开 / 复制路径 / 分支切换收起，多仓时才带一个弱化的仓名；没有预览的仓整张收起。实现上 `WorkspaceActions` 全程只有一个实例、永不卸载（`compact` 只改 CSS 类：`hidden` / `contents`），所以切换紧凑态不会丢分支切换器 / 预览轮询的状态。
+- **分栏按钮位置只看左栏标签**（R15-21）：左栏在「浏览器」标签时分栏按钮固定在标题行（不是看头部是否紧凑）。产物栏折叠会连带关掉浏览器、头部从紧凑回完整，旧写法下按钮会因此从标题行卸载、在 chip 行最右重新挂载（头部一行撑三行、页面整体下移、键盘焦点丢到 body）；现在位置不随之变化。
+- **左栏标签记忆**（2026-11-12 用户反馈：「切走再切回来可以定位到上次的 tab」）：每个任务上次停在哪个左栏标签（产物 | 浏览器）记在本机 localStorage（`flowship.task-left-tab`，`src/lib/task-left-tab-memory.ts`），切走再回来时定位回去。只记「浏览器」（产物是默认值，不占位；切回产物就删掉那条），最多 100 个任务、最久没动的先淘汰；坏 JSON / 存储不可用一律当没记过。恢复只在这个任务**加载完成、分栏已挂载（量得到宽度）、浏览器面板可用**之后发生一次，走 `showBrowserPane`（先放宽栏宽再切标签，与「点端口进浏览器」同一条路径），之后用户怎么切都以用户为准；切任务时的状态复位**不写**记忆，不会把上一个任务的标签写给下一个任务。网页热更没有浏览器页签（`useBrowserAvailable()` 为 false）时不恢复、也不会误清记忆。
+- **没验证（如实）**：没有在真 Flowship App 里看过——项目规则不许操作界面，网页热更（`pnpm dev:web`）又没有浏览器页签（`useBrowserAvailable()` 为 false），只能打 test 包或在桌面包里看。契约测试 `tests/task-header-compact.test.ts`（纯逻辑 + 页面源码接线，16 个变异全被杀）守住行为，但真实省了多少像素、「任务详情」展开钮的位置顺不顺手，要用户亲眼看。
+- **没做**：浏览器面板自己的几行（切换行 / 工具栏 / 标签栏 / 状态条，合计约 100px）没动——状态条每次 AI 接管 / 交还都会变内容，若随状态增删一行，页面视口会跟着跳（页面内容重排、滚动位置变），所以只能固定高度；标签栏只有一个标签时可隐藏，但「新建标签页」按钮就没处放了，要动得先想好它的新位置。

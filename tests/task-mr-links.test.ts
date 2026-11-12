@@ -274,7 +274,7 @@ describe("页面接线契约", () => {
   const comp = read("src/components/tasks/task-mr-links.tsx");
   /** 去掉注释后的组件代码（注释里要解释「为什么不展示状态」，会出现 status 字样） */
   const compCode = comp.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  const WS = "<WorkspaceActions task={task} />";
+  const WS = "<WorkspaceActions task={task} compact={headerCompact} />";
 
   it("page.tsx import 并挂了 TaskMrLinks，且紧跟在 WorkspaceActions 后面（v1.7.1 悄悄丢过一次）", () => {
     expect(page).toContain('import { TaskMrLinks } from "@/components/tasks/task-mr-links";');
@@ -282,9 +282,9 @@ describe("页面接线契约", () => {
     const ml = page.indexOf("<TaskMrLinks");
     expect(ws).toBeGreaterThan(-1);
     expect(ml).toBeGreaterThan(ws);
-    // 两者之间只允许有注释
+    // 两者之间只允许有注释，以及 MR 链接自己的「紧凑态收起」容器（WorkspaceActions 在容器外：预览胶囊紧凑态也要可见）
     const between = page.slice(ws + WS.length, ml).replace(/\{\/\*[\s\S]*?\*\/\}/g, "");
-    expect(between.trim()).toBe("");
+    expect(between.trim()).toBe('<div className={cn(headerCompact && "hidden")}>');
   });
 
   it("只传它需要的三个 props，不传整个 task（叶子只拿自己要的字段）", () => {

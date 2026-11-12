@@ -277,10 +277,10 @@ describe("接线（源码契约）", () => {
     throw new Error(`${name} 括号不配对`);
   };
 
-  it("showBrowserPane：先 prepareBrowserPaneEntry（旧约束下展开 / 放宽）、后 setLeftTab(\"browser\")；不再在换标签之后 expand()", () => {
+  it("showBrowserPane：先 prepareBrowserPaneEntry（旧约束下展开 / 放宽）、后 switchLeftTab(\"browser\")（= 换标签并记忆）；不再在换标签之后 expand()", () => {
     const body = callbackBody(page, "showBrowserPane");
     const iPrepare = body.indexOf("prepareBrowserPaneEntry(");
-    const iSet = body.indexOf('setLeftTab("browser")');
+    const iSet = body.indexOf('switchLeftTab("browser")');
     expect(iPrepare).toBeGreaterThan(-1);
     expect(iSet).toBeGreaterThan(iPrepare);
     expect(body).not.toContain(".expand()");
@@ -296,11 +296,11 @@ describe("接线（源码契约）", () => {
 
   it("左栏「产物 | 浏览器」分段切换走 onLeftTabChange：切到浏览器与头部入口同一条路径，切回产物是用户收起", () => {
     expect(page).toContain("<LeftPaneSwitch value={leftTab} onChange={onLeftTabChange} />");
-    expect(page).not.toMatch(/<LeftPaneSwitch[^>]*onChange=\{setLeftTab\}/);
+    expect(page).not.toMatch(/<LeftPaneSwitch[^>]*onChange=\{(?:setLeftTab|switchLeftTab)\}/);
     const body = callbackBody(page, "onLeftTabChange");
     expect(body).toContain("showBrowserPane()");
     expect(body.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
-    expect(body.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(body.indexOf("setLeftTab(tab)"));
+    expect(body.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(body.indexOf("switchLeftTab(tab)"));
   });
 
   it("用户收起的入口都先 mark 意图再改状态：头部按钮 / 浏览器面板自己的 X（同走 closeBrowserPane）、折叠按钮 collapse、切回产物标签", () => {
@@ -309,7 +309,7 @@ describe("接线（源码契约）", () => {
     expect(toggle).toContain("closeBrowserPane()");
     const close = callbackBody(page, "closeBrowserPane");
     expect(close.indexOf("userCloseIntentRef.current.mark(")).toBeGreaterThan(-1);
-    expect(close.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(close.indexOf('setLeftTab("artifact")'));
+    expect(close.indexOf("userCloseIntentRef.current.mark(")).toBeLessThan(close.indexOf('switchLeftTab("artifact")'));
     expect(page).toMatch(/<BrowserPanel[^>]*onClose=\{closeBrowserPane\}/);
     // 头部唯一的分栏按钮：toggleSplitLayout 收起产物栏（= 连带关掉浏览器）前先 mark；展开类动作不 mark
     const split = callbackBody(page, "toggleSplitLayout");
@@ -331,14 +331,14 @@ describe("接线（源码契约）", () => {
     // 关闭浏览器（头部按钮与面板 X 都走它）：先还原事件流、再切回产物
     const close = callbackBody(page, "closeBrowserPane");
     expect(close).toContain("restoreEventStreamFromMaximize()");
-    expect(close.indexOf("restoreEventStreamFromMaximize()")).toBeLessThan(close.indexOf('setLeftTab("artifact")'));
+    expect(close.indexOf("restoreEventStreamFromMaximize()")).toBeLessThan(close.indexOf('switchLeftTab("artifact")'));
     // 分段切换：只有切回产物的分支还原；切到浏览器不还原（放大中切到浏览器不该把事件流弹出来）
     const tab = callbackBody(page, "onLeftTabChange");
     const iElse = tab.indexOf("else {");
     expect(iElse).toBeGreaterThan(-1);
     expect(tab.slice(0, iElse)).not.toContain("restoreEventStreamFromMaximize()");
     expect(tab.slice(iElse)).toContain("restoreEventStreamFromMaximize()");
-    expect(tab.slice(iElse).indexOf("restoreEventStreamFromMaximize()")).toBeLessThan(tab.slice(iElse).indexOf("setLeftTab(tab)"));
+    expect(tab.slice(iElse).indexOf("restoreEventStreamFromMaximize()")).toBeLessThan(tab.slice(iElse).indexOf("switchLeftTab(tab)"));
     // 事件流被用户拖开 / 展开后，「放大」标记随之复位（切任务重挂 Group 时也靠它兜底）
     expect(page).toContain("if (!collapsed) browserMaximizedRef.current = false;");
   });
@@ -352,9 +352,19 @@ describe("接线（源码契约）", () => {
     expect(page.indexOf("const userResizeIntentRef")).toBeLessThan(page.indexOf("const isUserClosePane"));
   });
 
-  it("全页只有 showBrowserPane 之外没有别处直接 setLeftTab(\"browser\")（绕过就没有先放宽）", () => {
-    const hits = page.match(/setLeftTab\("browser"\)/g) ?? [];
-    expect(hits).toHaveLength(1);
+  it("切到浏览器只有 showBrowserPane 一处（绕过就没有先放宽）；setLeftTab 只剩 switchLeftTab 本体与切任务时的复位两处，不会有人绕过记忆", () => {
+    // 换到浏览器标签一律经 switchLeftTab("browser")，且只在 showBrowserPane 里
+    expect(page.match(/switchLeftTab\("browser"\)/g) ?? []).toHaveLength(1);
+    expect(callbackBody(page, "showBrowserPane")).toContain('switchLeftTab("browser")');
+    // 不允许直接 setLeftTab("browser")：那样既绕过先放宽、也绕过左栏标签记忆
+    expect(page).not.toContain('setLeftTab("browser")');
+    // setLeftTab 的全部调用：switchLeftTab 本体（setLeftTab(tab)）+ 切任务时复位成产物（不写记忆）
+    expect(page.match(/setLeftTab\(/g) ?? []).toHaveLength(2);
+    expect(page.match(/setLeftTab\("artifact"\)/g) ?? []).toHaveLength(1);
+    expect(page.match(/setLeftTab\(tab\)/g) ?? []).toHaveLength(1);
+    // 按「单词」数（评审 R16-08）：`/setLeftTab\(/` 抓不到 `onChange={setLeftTab}` 这种把 setter 直接递出去的旁路。
+    // 全部出现 = useState 的声明 1 处 + 上面两处调用；多一处引用就是有人拿到了裸 setter
+    expect(page.match(/\bsetLeftTab\b/g) ?? []).toHaveLength(3);
   });
 
   it("自动展开 hook：isUserClose 缺省 = 一律当用户收起（旧行为，向后兼容）；有传才按它判", () => {

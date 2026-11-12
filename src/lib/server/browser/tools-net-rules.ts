@@ -76,6 +76,21 @@ interface NetRulesResult {
   otherTabsWithRules?: number;
 }
 
+/**
+ * R14（2026-11-11 正式包闪退）：对「带请求体且跨源」的请求调 Fetch.fulfillRequest 会让 Chromium 浏览器进程崩溃，主进程对这类请求的 mock 一律改成让请求失败（不放行真请求）。
+ * 两段都是固定话术（无任何外部输入）：
+ *  - SHORT 并进工具描述（每轮 prompt 都带，受「≤ 2 句」与体量预算守卫约束，所以只有一小句，且不能含句号）；
+ *  - LONG 是 mock 设置成功后的返回提示（不占每轮 prompt），把限制、现象、替代办法讲全，让模型在设规则时就知道、不要等点击后才撞上。
+ */
+const MOCK_LIMIT_SHORT = "mock 不能用于跨源且带请求体（POST / PUT / PATCH）的请求，会被直接拒绝，需要时改用 browser_evaluate 替换页面里的 fetch / XHR 或 mock 同源接口";
+const MOCK_LIMIT_LONG =
+  "【mock 的限制】跨源且带请求体（POST / PUT / PATCH）的请求不能 mock：命中时会被直接拒绝——请求失败（页面看到网络错误）、不会放行到真实后端，browser_network 里该请求带「mock被安全拒绝」标记（原因：Chromium 对这类请求做 mock 会让整个浏览器进程崩溃）。" +
+  "同源请求、GET / DELETE、不带请求体的请求不受影响。需要模拟这类接口时：用 browser_evaluate 在页面里替换 fetch / XMLHttpRequest（它受审批控制：总闸没开时会弹审批卡让用户决定，被拒就别绕路），或改 mock 同源接口。";
+
+/** block / fail 命中「跨源且带请求体」的请求时同样走安全拒绝：请求照样失败，只是失败原因显示为 ERR_UNSAFE_PORT。固定话术，只拼进 block / fail 设置成功的提示 */
+const BLOCK_FAIL_UNSAFE_PORT_NOTE =
+  "对跨源且带请求体（POST / PUT / PATCH）的请求，系统用安全方式让它在本机立刻失败（不外发），browser_network 里这类请求的失败原因会显示为 net::ERR_UNSAFE_PORT——这是正常的拒绝，不是真实网络故障。";
+
 const RULE_ID_RE = /^r\d{1,6}$/;
 const safeRuleId = (v: unknown): string => (typeof v === "string" && RULE_ID_RE.test(v) ? v : "?");
 const safeAction = (v: unknown): string => (typeof v === "string" && v in ACTION_ZH ? v : "?");
@@ -131,7 +146,8 @@ export const createNetRulesTools = (kit: BrowserToolKit): FlowshipToolDef[] => {
       `已设置网络规则 ${safeRuleId(v.id)}（${ACTION_ZH[action] ?? "?"}）：本标签页现有 ${safeInt(r?.count) || 1}/${safeInt(r?.limit) || 20} 条。` +
         "只对这个标签页生效，标签页关闭 / clear / 会话结束就失效；用户接管浏览器期间自动暂停，交还后恢复；Flowship 自身页面永远不受影响。" +
         (action === "set_headers" ? "头的值不会出现在任何输出里。" : "") +
-        (action === "mock" ? "跨域请求会自动回显 Origin 作为 Access-Control-Allow-Origin，CORS 预检由系统代答。" : "") +
+        (action === "mock" ? "跨域请求会自动回显 Origin 作为 Access-Control-Allow-Origin，CORS 预检由系统代答。" + MOCK_LIMIT_LONG : "") +
+        (action === "block" || action === "fail" ? BLOCK_FAIL_UNSAFE_PORT_NOTE : "") +
         "被处理的请求在 browser_network 里带 ⚑ 标记；规则对已经发出的请求不生效，需要重新触发。",
     );
     b.untrusted(ruleLine(v));
@@ -142,7 +158,7 @@ export const createNetRulesTools = (kit: BrowserToolKit): FlowshipToolDef[] => {
     label: "浏览器·网络规则",
     description:
       "拦截 / 改写当前标签页的网络请求（高级调试）：action=block 屏蔽、set_headers 加请求头、mock 返回假响应、fail 制造失败、delay 延迟，list 查看、clear 清除（可带 rule_id）；pattern 用 * 通配匹配整个 URL（以 http(s):// 或 * 开头、不能含空格）。" +
-      "每个标签页最多 20 条、不落盘、用户接管时自动暂停，请求头的值不会出现在任何输出里，Flowship 自身页面永不受影响，被处理的请求在 browser_network 里带 ⚑ 标记。",
+      `每个标签页最多 20 条、不落盘、用户接管时自动暂停，请求头的值不会出现在任何输出里，Flowship 自身页面永不受影响，被处理的请求在 browser_network 里带 ⚑ 标记；${MOCK_LIMIT_SHORT}。`,
     parameters: TBObject({
       action: TBEnum([...NET_RULE_TOOL_ACTIONS]),
       pattern: TBOptional(

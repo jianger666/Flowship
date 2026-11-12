@@ -25,6 +25,7 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  Eraser,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -39,7 +40,23 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskList } from "@/hooks/use-task-list";
+import {
+  buildCachesCleanedToast,
+  buildCachesConfirmDescription,
+  buildNothingToCleanMessage,
+  isNothingToClean,
+  type CachesCleanupResult,
+  type CachesSummary,
+} from "@/lib/cache-cleanup-text";
 import { deriveListLoadView } from "@/lib/load-outcome";
+import {
+  isSizeSortReady,
+  STORAGE_FETCH_TIMEOUT_MS,
+  STORAGE_POLL_MS,
+  stepPoll,
+  worktreeSizeState,
+  type PollOutcome,
+} from "@/lib/storage-scan-state";
 import { formatRelative, REPO_STATUS_LABEL } from "@/lib/task-display";
 import { hasBackgroundSubagents } from "@/lib/task-background";
 import { setTaskArchivedWithReport } from "@/lib/task-store";
@@ -105,13 +122,24 @@ const DELETE_UNCOMMITTED_NOTE =
 interface StorageEntry {
   id: string;
   bytes: number;
-  worktreeBytes: number;
+  /** null = 后台还在量（统计中）或量不出（见 worktreeSizeState） */
+  worktreeBytes: number | null;
+}
+
+interface StaleWorktreeRow {
+  id: string;
+  /** null = 后台还在量（统计中） */
+  bytes: number | null;
 }
 
 interface StorageInfo {
   totalBytes: number;
   entries: StorageEntry[];
-  staleWorktrees: Array<{ id: string; bytes: number }>;
+  staleWorktrees: StaleWorktreeRow[];
+  /** 后台还在量的工作区个数（>0 时本页隔几秒再拉一次、拉的是服务端缓存） */
+  worktreePending: number;
+  /** 已量出的工作区占用里最旧一条的统计时间（毫秒；没有 = null） */
+  worktreeMeasuredAt: number | null;
 }
 
 const formatBytes = (n: number): string => {
@@ -159,13 +187,28 @@ const SessionsPage = () => {
   // ---- 存储扫描（只读占用、跟会话表拼同一行） ----
   const [storage, setStorage] = useState<StorageInfo | null>(null);
   const [scanning, setScanning] = useState(false);
+  // 静默轮询放弃的原因（超时 / 连续失败）：非 null 时不再轮询、「重新统计」按钮可点、界面不再一直「统计中」
+  const [pollGaveUp, setPollGaveUp] = useState<"timeout" | "errors" | null>(null);
+  // 「清理缓存」进行中（先拉概览再确认再清理，整段防双击）
+  const [releasingCaches, setReleasingCaches] = useState(false);
 
-  const scan = useCallback(async () => {
-    setScanning(true);
+  // refresh：用户点「重新统计」才整表重量；平时（进页面 / 删完刷新 / 后台量尺轮询）一律读服务端缓存、不碰磁盘。
+  // silent：轮询用，不转圈、失败也不弹 toast。
+  // 返回本次请求是否成功 + 服务端还剩几个工作区在量（轮询据此做失败退避 / 收尾，见 stepPoll）
+  const scan = useCallback(async (opts?: { refresh?: boolean; silent?: boolean }): Promise<PollOutcome> => {
+    if (!opts?.silent) setScanning(true);
+    // 请求要有超时：fetch 一旦挂住就永远不返回，轮询链停在 await 上、按钮永久禁用（评审 R16-06）
+    const aborter = new AbortController();
+    const abortTimer = setTimeout(() => aborter.abort(), STORAGE_FETCH_TIMEOUT_MS);
     try {
-      const res = await fetch("/api/system/storage", { cache: "no-store" });
+      const res = await fetch(
+        `/api/system/storage${opts?.refresh ? "?refresh=1" : ""}`,
+        { cache: "no-store", signal: aborter.signal },
+      );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const raw = (await res.json()) as Partial<StorageInfo>;
+      const raw = (await res.json()) as Partial<StorageInfo> & {
+        worktreeScan?: { pending?: number; measuredAt?: number | null };
+      };
       setStorage({
         totalBytes: raw.totalBytes ?? 0,
         entries: Array.isArray(raw.entries)
@@ -173,23 +216,68 @@ const SessionsPage = () => {
               id: e.id,
               bytes: e.bytes ?? 0,
               worktreeBytes:
-                typeof e.worktreeBytes === "number" ? e.worktreeBytes : 0,
+                typeof e.worktreeBytes === "number" ? e.worktreeBytes : null,
             }))
           : [],
         staleWorktrees: Array.isArray(raw.staleWorktrees)
-          ? raw.staleWorktrees
+          ? raw.staleWorktrees.map((s) => ({
+              id: s.id,
+              bytes: typeof s.bytes === "number" ? s.bytes : null,
+            }))
           : [],
+        worktreePending: raw.worktreeScan?.pending ?? 0,
+        worktreeMeasuredAt: raw.worktreeScan?.measuredAt ?? null,
       });
+      // 后台量完了：上一轮「放弃轮询」的标记作废
+      const pending = raw.worktreeScan?.pending ?? 0;
+      if (pending <= 0) setPollGaveUp(null);
+      return { ok: true, pending };
     } catch (err) {
-      toast.error(`扫描存储失败：${(err as Error).message}`);
+      if (!opts?.silent) {
+        const reason = (err as Error).name === "AbortError" ? "请求超时" : (err as Error).message;
+        toast.error(`扫描存储失败：${reason}`);
+      }
+      return { ok: false, pending: 0 };
     } finally {
-      setScanning(false);
+      clearTimeout(abortTimer);
+      if (!opts?.silent) setScanning(false);
     }
   }, []);
 
   useEffect(() => {
     void scan();
   }, [scan]);
+
+  // 后台还在量工作区（缓存没有 / 过期）：隔几秒静默再拉一次，量完自动停。
+  // 轮询由这条独立的定时链驱动（评审 R15-01）：请求失败也排下一次（指数退避），
+  // 连续失败 / 超过最长时长就明确放弃（pollGaveUp）——界面据此改成「统计超时 / 失败」并放开「重新统计」，不会永远转圈。
+  const worktreePending = storage?.worktreePending ?? 0;
+  // 还有工作区在统计（且页面没放弃轮询）
+  const worktreeMeasuring = worktreePending > 0 && pollGaveUp === null;
+  useEffect(() => {
+    if (!worktreeMeasuring) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const startedAt = Date.now();
+    let failures = 0;
+    const schedule = (delayMs: number) => {
+      timer = setTimeout(async () => {
+        const outcome = await scan({ silent: true });
+        if (cancelled) return;
+        // 失败计数 / 「量完了就收尾（不算超时）」/ 退避 / 放弃都在 stepPoll 里（纯函数，有单测）
+        const step = stepPoll({ startedAt, failures }, outcome, Date.now());
+        failures = step.failures;
+        const next = step.decision;
+        if (next.action === "giveup") setPollGaveUp(next.reason);
+        else if (next.action === "wait") schedule(next.delayMs);
+      }, delayMs);
+    };
+    schedule(STORAGE_POLL_MS);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [worktreeMeasuring, scan]);
 
   // 进页补拉一次列表：「30 天未活跃」快捷选中要靠行上的 hasLiveSchedule 判「带定时」，
   // 而详情页回灌（upsertTask）的行不带它、会把它冲掉——刚在详情页看过的旧会话可能因此被误选。
@@ -201,11 +289,12 @@ const SessionsPage = () => {
   const sizeById = useMemo(() => {
     const m = new Map<
       string,
-      { total: number; bytes: number; worktreeBytes: number }
+      { total: number; bytes: number; worktreeBytes: number | null }
     >();
     for (const e of storage?.entries ?? []) {
       m.set(e.id, {
-        total: e.bytes + e.worktreeBytes,
+        // 工作区还在量（null）的先按 0 计：总数是「已统计部分」，量完下一轮轮询自然补上
+        total: e.bytes + (e.worktreeBytes ?? 0),
         bytes: e.bytes,
         worktreeBytes: e.worktreeBytes,
       });
@@ -218,9 +307,25 @@ const SessionsPage = () => {
     return m;
   }, [storage]);
 
+  // 没数的工作区是「统计中」还是「量不出」（后台量完 / 页面放弃轮询后不会再变，别一直转圈）
+  const wtState = (bytes: number | null) =>
+    worktreeSizeState(bytes, { pending: worktreePending, gaveUp: pollGaveUp !== null });
+  // 工作区占用拿不到数的个数（统计中 + 量不出）：这些行 / 合计里的数字是「至少」
+  const unknownWorktrees = useMemo(
+    () =>
+      (storage?.entries ?? []).filter((e) => e.worktreeBytes === null).length +
+      (storage?.staleWorktrees ?? []).filter((s) => s.bytes === null).length,
+    [storage],
+  );
+
   const sizeTip = (id: string): string => {
     const s = sizeById.get(id);
     if (!s) return "占用扫描中";
+    if (s.worktreeBytes === null) {
+      return wtState(null) === "measuring"
+        ? `任务数据 ${formatBytes(s.bytes)}（工作区占用统计中…，合计是已统计部分）`
+        : `任务数据 ${formatBytes(s.bytes)}（工作区占用量不出——可能超时或目录读不了；点「重新统计」再试，合计是已统计部分）`;
+    }
     if (s.worktreeBytes > 0) {
       return `共 ${formatBytes(s.total)}（任务数据 ${formatBytes(s.bytes)} + 工作区 ${formatBytes(s.worktreeBytes)}）`;
     }
@@ -265,6 +370,14 @@ const SessionsPage = () => {
     [filterBase],
   );
 
+  // 「按占用」：工作区还在统计时行会随轮询跳（最大的行从底部跳到顶部、可能点错行），统计完（或放弃轮询）才开放
+  const sizeSortReady = isSizeSortReady({
+    hasStorage: storage !== null,
+    pending: worktreePending,
+    gaveUp: pollGaveUp !== null,
+  });
+  const effectiveSort: SortKey = sort === "size" && !sizeSortReady ? "recent" : sort;
+
   const visible = useMemo(() => {
     const rows = tasks.filter((t) => {
       if (filter === "active" && t.archived) return false;
@@ -275,16 +388,27 @@ const SessionsPage = () => {
       return matchesSessionQuery(t, query);
     });
     // 占用没扫完时 size 全 0、排出来是假顺序，回落按最近（按钮侧同时禁用）
-    if (sort === "size" && storage) {
+    if (sort === "size" && sizeSortReady) {
       return [...rows].sort(
         (a, b) =>
           (sizeById.get(b.id)?.total ?? 0) - (sizeById.get(a.id)?.total ?? 0),
       );
     }
     return [...rows].sort((a, b) => b.updatedAt - a.updatedAt);
-  }, [tasks, filter, modeFilter, query, sort, sizeById, storage]);
+  }, [tasks, filter, modeFilter, query, sort, sizeById, sizeSortReady]);
 
   // 顶上总量跟着当前筛选项走（状态/类型/搜索），别用全量 totalBytes
+  // 合计后面的注记：统计中 / 放弃轮询（超时或连续失败）/ 后台量完仍有量不出的
+  const worktreeStatusNote = worktreeMeasuring
+    ? "（工作区统计中…）"
+    : pollGaveUp === "errors"
+      ? "（工作区统计失败，可以「继续等待」或「重新统计」）"
+      : pollGaveUp === "timeout"
+        ? "（工作区统计超时，可以「继续等待」或「重新统计」）"
+        : unknownWorktrees > 0
+          ? `（${unknownWorktrees} 个工作区量不出，合计偏小）`
+          : "";
+
   const visibleBytes = useMemo(
     () => visible.reduce((s, t) => s + (sizeById.get(t.id)?.total ?? 0), 0),
     [visible, sizeById],
@@ -373,8 +497,9 @@ const SessionsPage = () => {
 
   // 扫描完成前 sizeById 是空 Map，pickedBytes 算出来是 0——别展示假数
   const sizesReady = storage !== null;
+  // 后台还在量工作区时，已勾选里的工作区可能还没算进去：说「至少」，别给用户一个偏小的假数
   const pickedBytesText = sizesReady
-    ? `约 ${formatBytes(pickedBytes)}`
+    ? `${unknownWorktrees > 0 ? "至少约" : "约"} ${formatBytes(pickedBytes)}`
     : "占用统计中";
 
   const markBusy = (id: string, busy: boolean) => {
@@ -492,9 +617,11 @@ const SessionsPage = () => {
   const handleDelete = async (task: TaskSummary) => {
     if (busyIds.has(task.id)) return;
     const size = sizeById.get(task.id)?.total;
+    // 工作区占用没量出来时，合计只是任务数据部分：说「至少」
+    const sizeQualifier = sizeById.get(task.id)?.worktreeBytes === null ? "至少约" : "约";
     const ok = await confirm({
       title: "彻底删除？",
-      description: `「${task.title}」将被永久删除、连同 data/tasks/${task.id}/ 整个目录${size ? `（约 ${formatBytes(size)}）` : ""}、不可恢复。${isWorktreeTaskLike(task) ? DELETE_UNCOMMITTED_NOTE : ""}`,
+      description: `「${task.title}」将被永久删除、连同 data/tasks/${task.id}/ 整个目录${size ? `（${sizeQualifier} ${formatBytes(size)}）` : ""}、不可恢复。${isWorktreeTaskLike(task) ? DELETE_UNCOMMITTED_NOTE : ""}`,
       destructive: true,
       confirmLabel: "彻底删除",
     });
@@ -611,10 +738,10 @@ const SessionsPage = () => {
     return interpretStaleDeleteResponse(res.status, body);
   };
 
-  const handleDeleteStale = async (s: { id: string; bytes: number }) => {
+  const handleDeleteStale = async (s: StaleWorktreeRow) => {
     const ok = await confirm({
       title: "删除残留工作区？",
-      description: `${s.id}（约 ${formatBytes(s.bytes)}）、不可恢复。其中可能有未提交的代码：会先尽量存成快照，存不下的会再问你一次。`,
+      description: `${s.id}${s.bytes === null ? "" : `（约 ${formatBytes(s.bytes)}）`}、不可恢复。其中可能有未提交的代码：会先尽量存成快照，存不下的会再问你一次。`,
       destructive: true,
       confirmLabel: "删除",
     });
@@ -645,6 +772,42 @@ const SessionsPage = () => {
       void scan();
     } catch (err) {
       toast.error(withDeleteFailurePrefix((err as Error).message));
+    }
+  };
+
+  // 清理无用缓存：已归档会话还占着的对话缓存 + 没有会话引用的对话文件。先看概览、没东西就不弹框；确认后才动手。
+  // 只在用户点了才跑（不在启动时自动清）。会话内容 / 事件记录 / 代码不受影响，见 session-cache-release.ts。
+  const handleReleaseCaches = async () => {
+    if (releasingCaches) return;
+    setReleasingCaches(true);
+    try {
+      const sumRes = await fetch("/api/system/storage/caches", { cache: "no-store" });
+      if (!sumRes.ok) throw new Error(`HTTP ${sumRes.status}`);
+      const summary = (await sumRes.json()) as CachesSummary;
+      if (isNothingToClean(summary)) {
+        toast.info(buildNothingToCleanMessage(summary));
+        return;
+      }
+      const ok = await confirm({
+        title: "清理无用缓存？",
+        description: buildCachesConfirmDescription(summary),
+        confirmLabel: "清理",
+      });
+      if (!ok) return;
+      const res = await fetch("/api/system/storage/caches", { method: "POST" });
+      const body = (await res.json().catch(() => null)) as
+        | (CachesCleanupResult & { error?: string })
+        | { error?: string }
+        | null;
+      if (!res.ok || !body || !("ok" in body)) {
+        throw new Error((body && "error" in body && body.error) || `HTTP ${res.status}`);
+      }
+      toast.success(buildCachesCleanedToast(body));
+      void scan();
+    } catch (err) {
+      toast.error(`清理缓存失败：${(err as Error).message}`);
+    } finally {
+      setReleasingCaches(false);
     }
   };
 
@@ -741,14 +904,18 @@ const SessionsPage = () => {
           </div>
           <div className="flex items-center gap-1 self-start rounded-full bg-muted/60 p-0.5 sm:self-auto">
           {SORTS.map((s) => {
-            const active = sort === s.key;
-            const unavailable = s.key === "size" && !storage;
+            const active = effectiveSort === s.key;
+            const unavailable = s.key === "size" && !sizeSortReady;
             return (
               // 原生 disabled 的 button 收不到鼠标事件、Tooltip 直接挂它上面不会出——挂外层 span；
               // 可用时 content 为空、Tooltip 不挂气泡（只剩一个 inline-flex 外层 span）
               <Tooltip
                 key={s.key}
-                content={unavailable ? "占用扫描完成后可用" : undefined}
+                content={
+                  unavailable
+                    ? "占用统计完成后可用（统计中行的位置会跳、容易点错）"
+                    : undefined
+                }
               >
                 <span className="inline-flex">
                   <button
@@ -783,24 +950,66 @@ const SessionsPage = () => {
             <span>
               共 {visible.length} 个
               {storage
-                ? ` · 占用 ${formatBytes(visibleBytes)}`
+                ? ` · 占用 ${formatBytes(visibleBytes)}${worktreeStatusNote}`
                 : " · 占用扫描中…"}
               {staleList.length > 0 && ` · ${staleList.length} 个残留工作区`}
-            </span>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="ml-auto h-7 px-2 text-xs text-muted-foreground"
-              disabled={scanning}
-              onClick={() => void scan()}
-            >
-              {scanning ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="size-3.5" />
+              {/* 放弃轮询时服务端多半还在量（睡眠唤醒后时钟跳变 / 网络抖动也会触发放弃）：
+                  「继续等待」只重起轮询、不作废缓存；「重新统计」会整表重量、丢掉已量出的进度（评审 R16-06） */}
+              {pollGaveUp !== null && worktreePending > 0 && (
+                <button
+                  type="button"
+                  className="ml-1 underline underline-offset-2 hover:text-foreground"
+                  onClick={() => setPollGaveUp(null)}
+                >
+                  继续等待
+                </button>
               )}
-              重新扫描
-            </Button>
+            </span>
+            <Tooltip content="释放已归档会话占着的对话缓存、删除没有会话引用的对话文件（会话内容和事件记录不受影响）">
+              <span className="ml-auto inline-flex">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs text-muted-foreground"
+                  disabled={releasingCaches}
+                  onClick={() => void handleReleaseCaches()}
+                >
+                  {releasingCaches ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Eraser className="size-3.5" />
+                  )}
+                  清理缓存
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip
+              content={
+                storage?.worktreeMeasuredAt
+                  ? `工作区占用是 ${formatRelative(storage.worktreeMeasuredAt)} 的统计（几 GB 的工作区一次要量十几秒，平时用缓存）；点这里重新量`
+                  : "重新统计占用（工作区几 GB 一个、会花一会儿）"
+              }
+            >
+              <span className="inline-flex">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs text-muted-foreground"
+                  disabled={scanning || worktreeMeasuring}
+                  onClick={() => {
+                    setPollGaveUp(null);
+                    void scan({ refresh: true });
+                  }}
+                >
+                  {scanning || worktreeMeasuring ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="size-3.5" />
+                  )}
+                  重新统计
+                </Button>
+              </span>
+            </Tooltip>
           </div>
           {managing && (
             <div className="flex flex-wrap items-center gap-2 border-b bg-muted/30 px-4 py-2">
@@ -1007,6 +1216,10 @@ const SessionsPage = () => {
                           <Tooltip content={sizeTip(t.id)}>
                             <span className="shrink-0 font-mono whitespace-nowrap">
                               {formatBytes(size)}
+                              {/* 工作区还没量出来（统计中 / 量不出）：数字只含任务数据，加「+」标出来，别当成最终值 */}
+                              {sizeById.get(t.id)?.worktreeBytes === null && (
+                                <span aria-hidden>+</span>
+                              )}
                             </span>
                           </Tooltip>
                         </>
@@ -1069,7 +1282,11 @@ const SessionsPage = () => {
                       </span>
                     </Tooltip>
                     <span className="shrink-0 font-mono text-xs whitespace-nowrap text-muted-foreground">
-                      {formatBytes(s.bytes)}
+                      {s.bytes === null
+                        ? wtState(null) === "measuring"
+                          ? "统计中…"
+                          : "量不出"
+                        : formatBytes(s.bytes)}
                     </span>
                     <Tooltip content="删除残留工作区">
                       <Button

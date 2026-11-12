@@ -2417,3 +2417,498 @@ R9-01 ~ R9-03 处理完毕，各条「处理」栏已填、状态 `[已修]`；`
 **没验证（如实）**：没有操作真 Flowship App / 没有打包（项目规则不许）；无头环境没有真原生视图，R9-06 的「被盖」只量了几何；R11-01 的「点击后在内置浏览器新标签打开」只能靠与 `[文字](网址)` 同构来推断。
 
 （R9 复审第三轮结束；`STATE: 收敛`。）
+
+## R14 事故记录与开发处理（用户直接安排，2026-11-11；v1.9.49 的内容，未提交）
+
+> 这不是 reviewer 提的条目，是一次线上事故的修复记录。**本节没有改 `STATE`（仍是收敛）**——需要 reviewer 复核时，请用户把 `STATE` 改成「待复审」。完整的技术口径见 `docs/BROWSER-AUTOMATION.md` §17。
+
+**事故**：2026-11-11 16:29 正式版 v1.9.47 整个进程闪退（崩溃报告 `Flowship-2026-11-11-162931.ips`：`CrBrowserMain`、`EXC_BAD_ACCESS`、`0xefefef…`＝Chromium 浏览器进程释放后使用）。触发链：AI 对某个接口路径设了 `browser_network_rules mock`，2 秒后 `browser_click` 触发了那个**跨源、带 JSON 体的 POST**。
+
+**结论（真 Electron 实测，42.4.0）**：对「CORS 模式 + 带请求体 + 跨源」的请求下任何终结命令都会崩——`Fetch.fulfillRequest` 崩，**`Fetch.failRequest` 也崩**（任何 errorReason）；`continueRequest`（含改写 url）、跨源 GET / DELETE / 不带体 POST、同源请求、预检不崩。事故简报最初的「fail / block 不崩」是被 CORS 预检混淆的，开发中用 text/plain POST（不触发预检）推翻了它，所以原方案（命中时改发 `failRequest`）不可行。
+
+**修法**：block / fail / mock 命中「带体且不能确认同源」的请求时，不发任何终结命令、也不放行真请求，改发 `continueRequest` 把 url 改写到 Chromium 受限端口（连接前就被拒，页面看到网络错误、请求体不外发）；mock 的网络条目打 `mock-refused` 并算失败；工具描述 / 设置提示写清限制与替代办法（`browser_evaluate` 替换 fetch / XHR，或 mock 同源接口）。
+
+**证据**：引擎 / ops / 工具三个测试文件 209 条通过；真机回归 `r14-mock-no-fulfill-crash.cjs` 35/35；变异验证 14 个全被杀（含 6 个在真机回归里表现为 SIGSEGV）；`tsc` / `eslint` 通过；全量 vitest 见交付报告。
+
+**变异验证里踩到的坑（记给下一个维护者）**：变异脚本不能放后台跑——宿主会在 shell 调用结束时杀掉后台进程，变异（如「判定恒 false」）就会留在源码里；上一个开发会话正是这样把引擎弄脏、基线变红。现在的做法是前台执行、每次变异前从一份金本快照还原、脚本收到 SIGTERM / SIGHUP / SIGINT 时先还原再退出、结束时逐字节比对。
+
+**没验证（如实）**：没有在真 Flowship App 里复现 / 验证；Electron 42.11.18 / 43.8.8 同样会崩只是事故简报的说法，没有复测；`REFUSE_URL` 依赖端口 1 在 Chromium 受限端口表里（见 §17.6）。调查崩溃的实验在本机留下了一批 `Electron-*.ips` 崩溃报告，不是线上新问题。
+
+**改动文件**：`electron-app/browser/net-rules-engine.mjs`、`electron-app/browser/tab.mjs`、`src/lib/server/browser/network-render.ts`、`src/lib/server/browser/tools-net-rules.ts`；测试 `tests/browser-e2-p4-engine.test.ts` / `-ops.test.ts` / `-tools.test.ts` / `tests/helpers/browser-e2-p4-fakes.ts`；脚本 `scripts/browser-e2e/r14-mock-no-fulfill-crash.cjs`（新，回归）、`r14-mock-fulfill-probe.cjs`（新，单形态探针）；文档 `BROWSER-AUTOMATION.md` §17、本节。**新文件还没 `git add`**，提交时别漏。没有 commit / push / tag，没有改 `whats-new.ts`（这条修复是否写进 v1.9.49 更新说明，要用户批准文案）。
+
+## R15 复审（reviewer，2026-11-12 09:5x）：用户「继续审核代码」——审两个开发会话留在工作区里的全部未提交改动（HEAD = `d356a756` = v1.9.48）
+
+范围 = `git status` 里 25 个已修改文件 + 17 个未跟踪项。两个来源：**①** R14 崩溃修复（会话 `t_1794050517806_xkwvyr`）；**②** `t_1794389097554_m3qepz` 的四块：头部浏览器紧凑态（§18）、预览进程清理 + 胶囊 UI、会话管理页量尺缓存、移除「已合入 / 放弃」按钮 + 归档释放会话缓存 / 工作区。m3qepz 点名要重点看：归档释放缓存与 stop / delete 的并发、预览管理器的指纹 / `killOneStaleRecord` / 主进程退出时同组清理、预览胶囊 UI。
+
+**结论先说**：**没有 P0 / P1。** P2 × 5、P3 × 16、P4 × 2（R15-17 是核后不成立的记录、R15-23 汇总了几条小记录项）。R14 的修法我认可（独立复现、独立验证，见下）；没有发现会误删用户数据的路径。`STATE` → `待处理`。
+
+**先更正我自己**：11-11 16:47 我交给用户转给开发 AI 的根因简报写了「`fail` / `block` 不崩、命中时改发 `failRequest`」，**这是错的**——我当时的 json 跨源 POST 先发 CORS 预检，`fail` 规则把预检先失败了，带体的 POST 根本没发出去，被混淆成了「不崩」。我在 HEAD 引擎上重测：`text/plain` 跨源 POST（不触发预检）下 `fail` / `block` / `mock` **全部 SIGSEGV**。开发 AI 推翻我的结论、改用「`continueRequest` 改写 url 到受限端口」是对的。（Electron 42.11.18 / 43.8.8 我也复现过 `fulfill` 崩，不止 42.4.0。）
+
+**门禁（我独立跑；最后一次改动之后）**：`tsc --noEmit` rc=0；`eslint .` rc=0；全量 `vitest run` **1205 个文件通过（3 跳过）、26679 条通过 / 19 跳过 / 0 失败**（后台跑、等到 `FULL_DONE exit=0`）；真 Electron 回归 `node scripts/browser-e2e/run.mjs scripts/browser-e2e/r14-mock-no-fulfill-crash.cjs` **35/35**（含全局不变量：运行期间 12 个「带体 + 跨源」暂停请求没有一个收到过 `fulfillRequest` / `failRequest`，12 个都被就地拒绝）；分支仍是 `main`。
+
+**我自己补的、开发 AI 没做的验证**
+1. **公网 HTTPS 页面**（`/tmp` 一次性脚本，不入库）：真页面 `https://example.com`，跨源 `POST https://httpbin.org/post`，`mock` / `block` / `fail` × fetch `text/plain` / fetch JSON（带预检）/ XHR = 9 个组合，**全部 1～9 毫秒本机失败**，无崩溃、无挂起（8 秒检测）、无权限弹窗（`setPermissionRequestHandler` 零次触发），`errorText = net::ERR_UNSAFE_PORT`，`ruled` 为 `mock-refused` / `block` / `fail`；对照「跨源 GET + mock」照常 `fulfill`；`http://example.com` 页面上 `block` 同样正常。这补上了「拒绝地址是 `http://127.0.0.1:1`，从公网 https 页面发出会不会撞混合内容 / 本地网络访问权限」的空白——不会。
+2. **归档释放缓存的「孤儿」定义是否完整**：任务上唯一持久化的会话锚点是 `sessionAgentId`（`src/lib/types.ts:1804`）；全仓 `Agent.resume` 的调用点（`task-runner.ts:5986`、`chat-runner.ts:2127`）取的都是 `task.sessionAgentId`；`chat-checkpoint.ts` 回退时是把锚点清成 `undefined`、下一条消息开新会话，不回头引用旧文件；`SessionManager.open` 只在 `custom-agent-backend.ts:1486` 按这个锚点打开。**没有找到「不在活名单里、却会被回头打开」的会话文件。** 真实数据：`pi-sessions` 681 个文件 / 185 个被任务引用（其中 182 个已归档）/ 孤儿 496 个，与开发报的数字一致；最新文件停在 10-14。
+3. **`du` 非 0 退出的行为（实测，见 R15-02）**；**543 个任务目录 4 路并发 `du` 实测 0.8 秒**（见 R15-17）；**worktree 容器目录 mtime 实测稳定**（容器根只有各仓库目录，mtime 停在 11-10，里面的仓库 11-11 还在变）。
+
+**子代理说明（如实）**：预览清理 / 存储统计与会话页 / 任务页与预览界面三块，我各派了一个只读子代理读码，**它们的结论我一条一条回源码核对过原文才采信**；下表「核」列：**自**＝我亲自核实（读码或实测）、**读**＝子代理读码所得、我对过引用原文但没有运行验证。有 3 处我实测后**推翻 / 降级**了子代理的判断（R15-17、R15-08、R15-09）。
+
+| 条目 | 级别 | 核 | 一句话 |
+|---|---|---|---|
+| R15-01 | P2 | 自 | 会话管理页轮询链在「静默请求失败 / 10 分钟上限」时静默断掉，「重新统计」按钮永久禁用 |
+| R15-02 | P2 | 自（实测） | `du` 遇到不可读 / 被并发删除的文件会**输出合计并退出 1**，`dirSize` 把已有合计丢掉、改走无超时的逐文件遍历，并堵住单路队列 |
+| R15-03 | P2 | 自 | 浏览器可见（头部紧凑）时，预览胶囊连同 ▾ 菜单（停止 / 重启 / 日志）被整块藏起；§18 没写这一条 |
+| R15-04 | P2 | 自 | 「组长不在、组还在 → 按组杀」分支没有任何归属证据，且 `ps` 自己失败也当成「进程不存在」 |
+| R15-05 | P2 | 读 + 自（Windows 确有发行） | Windows 上没有启动时间指纹，PID 复用防线仍只有映像名；与「校验以指纹为准」的说法不符（存量，非本次引入） |
+| R15-06 | P3 | 自 | `tab.mjs` 的注释写「引擎改发 failRequest」，已过时 |
+| R15-07 | P3 | 自 | 清理缓存 / 归档释放不在释放时复核「仍是已归档」 |
+| R15-08 | P3 | 自 | 日志弹窗「打开期间加快刷新」被 `onRefresh` 每次渲染换引用不断重置（有 4 秒慢轮询兜底） |
+| R15-09 | P3 | 自（顺序）+ 读（命中概率） | 重启时轮询落进服务端「删旧槽 → 起新槽」空窗，胶囊闪回「▶ 预览」、日志弹窗被强制关掉 |
+| R15-10 | P3 | 自 | 指纹的 `ps` 没固定 `TZ`，跨 DST / 改时区后会判成「PID 已被复用」→ 漏杀（方向安全） |
+| R15-11 | P3 | 自 | 指纹 / 命令行的 `ps` 调用没有 timeout，且跑在全局串行队列里 |
+| R15-12 | P3 | 自 | 旧记录的命令行退路 ② 匹配过宽（别处的 `yarn dev` 与事故形态完全一样） |
+| R15-13 | P3 | 自 | 「命令后台化（`yarn dev &`）」的行为变化（主进程一退连同组服务清掉）用户看不到说明 |
+| R15-14 | P3 | 读 | 「已退出」后胶囊菜单仍提供「在内置浏览器打开 / 打开 / 复制地址」，指向已失效地址 |
+| R15-15 | P3 | 读 | 弹窗「复制日志」没有 `try/catch`（`navigator.clipboard` 可能 `undefined`），日志为空也提示「已复制」 |
+| R15-16 | P3 | 自 | 清理缓存 / 孤儿读不出时 `isNothingToClean` 仍为 true → 弹「没有需要清理的缓存」，实际是「这类没法判断」 |
+| R15-17 | P4 | 自（实测推翻子代理 P2） | 任务数据目录的量尺仍在请求里等：实测 543 个目录 0.8 秒，不是问题；仅记录 |
+| R15-18 | P3 | 读 | 时钟回拨后 `getFreshSize` 永远判「新鲜」（`now - e.at` 为负） |
+| R15-19 | P3 | 读 | 统计中的行显示偏小的数字（不含 worktree）且可按大小排序，轮询期间行会跳 |
+| R15-20 | P3 | 读 | 删除 `/finalize` 后残留的过期注释 / 文档（`task-store.ts:12`、`reopen/route.ts:6`、`docs/HANDOFF.md`） |
+| R15-21 | P3 | 读 | 紧凑态在「收起产物栏」时切回完整，分栏按钮在两个位置间换，页面整体下移 |
+| R15-22 | P3 | 自 + 读 | 测试证明力：多处只钉源码字符串、关键行为（预览清理的「真重启」、轮询状态机、并发两个 GET、TTL 过期、缓存损坏、`pruneSizeCache`）没有行为用例 |
+| R15-23 | P4 | 读 | 记录项：落盘临时文件名无随机段且 `persistNow` 不互斥；`route.ts` 注释「拉的是缓存、不碰磁盘」不准确；弹窗标题没写「最近 50 行」；`storage-du-concurrency` 的 `pending` 断言对时序敏感（我没复跑验证）；`finalize-ui-removed.test.ts` 的 `\bFlag\b` 过于敏感 |
+
+### R15-01 [P2] [复审通过] 会话管理页轮询链会静默断掉，「重新统计」按钮永久禁用
+- 位置：`src/app/sessions/page.tsx` 的 `scan`（`catch` / `finally`）与轮询 `useEffect`（依赖 `[worktreePending, storage, scan]`）；按钮 `disabled={scanning || worktreePending > 0}`。
+- 问题：下一个定时器只由「`storage` 变了」这个事件排出来。静默轮询失败时 `catch` 只吞错、不调 `setStorage`，依赖没变，effect 不再运行；到 `STORAGE_POLL_MAX_MS` 上限时直接 `return`，同样不再排。两种情况下 `worktreePending` 仍 > 0，所以按钮一直禁用 + 转圈、顶部一直挂「工作区统计中…」，只能整页重载。
+- 证据：已核对原文——`catch (err) { if (!opts?.silent) toast.error(...) } finally { if (!opts?.silent) setScanning(false); }`；`if (Date.now() - pollStartedAt.current > STORAGE_POLL_MAX_MS) return;`。实际触发：Mac 合盖休眠 / server 重启期间一次轮询失败；或 R15-02 让队列 10 分钟没跑完。**没有用真页面复现**（只读代码）。
+- 建议：轮询由独立的 timeout 链驱动，失败也排下一次（带重试上限）；到上限时把状态改成「统计超时，点重新统计」并让按钮可点。
+- 处理（开发 AI 填）：**已修，纯逻辑 + 接线契约测试；没有在真页面里看。** 根因就是你说的：下一次轮询只靠「`storage` 变了」排出来，静默失败 / 到上限时链条断掉而 `pending` 仍 > 0。
+  - **修法**：轮询抽成独立 effect 里的定时链（依赖只有 `worktreeMeasuring` / `scan`，**不含 `storage`**），决策放进纯函数 `src/lib/storage-scan-state.ts` 的 `decideNextPoll`：请求失败**也排下一次**（间隔 ×2、最多放大 8 倍）；连续失败 5 次 → 放弃（`errors`），一轮超过 10 分钟 → 放弃（`timeout`）。放弃后页面状态 `pollGaveUp` 非 null：「重新统计」按钮禁用只看 `scanning || worktreeMeasuring`（放弃后可点），合计后面的注记改成「工作区统计失败 / 超时，点「重新统计」重试」；点「重新统计」清掉放弃标记并重新起一轮。`scan` 现在返回本次是否成功，供轮询退避。
+  - **测试**：`tests/storage-scan-state.test.ts`（新）——`decideNextPoll` 的退避序列 / 失败上限 / 超时边界（刚好到上限还继续）/ 两条件同时满足时报 errors；页面接线契约钉死「轮询 effect 依赖不含 `storage`」「失败走 `else schedule(...)`」「按钮 disabled 不再看 `worktreePending`」。没有真渲染一遍组件（仓库里没有 React 测试渲染环境），所以 effect 的定时行为靠「纯函数 + 源码契约」，不是行为测试，这是局限。
+
+### R15-02 [P2] [复审通过] `du` 非 0 退出时丢掉已输出的合计，改走无超时的 JS 遍历，并堵住单路队列
+- 位置：`src/lib/server/dir-size.ts` 的 `dirSize`（`try { execFileAsync("du", ["-sk", dir], …) } catch { /* du 超时 / 未装 / 权限 → 走 walk */ }`）；`storage-size-cache.ts` 的 `drain`（单路）。
+- 问题：活 worktree 里 agent 可能正在装依赖 / 构建 / 删文件，`du` 遇到不可读或被并发删掉的文件会输出合计、**退出码 1**。`promisify(execFile)` 因此抛错，但完整合计就在 `err.stdout` 里，被 `catch` 丢掉，转入 `dirSizeWalk`（逐文件 `fs.stat`，无超时、无并发），几十万文件要分钟级；`drain` 是单路，后面所有 worktree 排在它后面，`pending` 长时间 > 0，叠加 R15-01 就是 UI 卡死。
+- 证据（**我实测**，`/tmp` 里造一个含 `chmod 000` 子目录的目录）：`du -sk` 输出 `2932	/tmp/du-probe-…` 同时 `exit=1`；`promisify(execFile)("du", ["-sk", dir])` → `THROWN code=1 stdout="2932\t/tmp/du-probe-…\n" stderr="du: …/locked: Permission denied"`。次要：walk 累加的是表观大小（`(await fs.stat(p)).size`），`du -sk` 是块占用，同一个 key 两次测量口径会跳变。旧代码也有这条回退，但新的单路队列把它的后果放大了。
+- 建议：`du` 抛错时先解析 `err.stdout`（有合计就用）；非 Windows 不回退 walk，保留旧值并标「量不出」；walk 加 deadline。
+- 处理（开发 AI 填）：**已修，行为测试 + 变异。**
+  - **修法**（`dir-size.ts` / `storage-size-cache.ts` / `route.ts`）：`dirSize` 现在返回 `number | null`。① `du` 非 0 退出时**先解析 `err.stdout`**，有合计就用（和你实测的 `exit=1 + stdout="2932\t…"` 同形态）；② `du` 在但没量成（超时被杀 / 无输出 / 输出解析不了）→ `null`（量不出），**不再回退无超时的逐文件遍历**；③ 只有 `du` 不存在（`ENOENT`）或 Windows 才走 Node 遍历，并带整体期限（120 秒，超了也是 `null`）；`du` 调用带 `timeout` / `maxBuffer`。队列侧：`null` 不写缓存、保留旧值（如有），记入 `failed`（带时间），`SCAN_FAILURE_RETRY_MS`（5 分钟）内同一目录不再排队；手动「重新统计」清掉失败记录；`worktreeScan.failed` 回给前端，前端据此标「量不出」而不是一直转圈（见 R15-19）。路由里任务数据目录量不出时用旧值 / 0 顶着、**不缓存失败**。
+  - **口径**：`du -sk` 是块占用、Node 遍历累加表观大小，两者不可比；同一个 key 现在不会在两条路径间来回切（有 `du` 就只用 `du`）。文件头注释写明了。
+  - **测试**（`tests/storage-du-concurrency.test.ts`，du mock 可按目录切 `ok / exit1 / killed / enoent / empty`）：`dirSize` 直测 7 条（不存在 = 0、exit1 取合计、killed = null 且**证明没走遍历**——遍历会得 5000 而不是 null、empty = null、ENOENT 才走遍历得 5000、遍历期限 = null、du 带 timeout/maxBuffer）；路由级 4 条（exit1 合计照常进缓存、killed → null + 不转圈 + `failed` = N + 退避期内连续三次 GET 不再起 du + 手动重新统计后恢复、以前量出过这次量不出 → 保留旧值、任务数据量不出失败不进缓存）。**变异 11 个**（去掉 stdout 捞合计 / 去掉「非 ENOENT 返回 null」/ 去掉 `now < e.at` / 去掉加载时丢未来时间戳 / 去掉退避 / 去掉落盘串行 / 去掉在途去重 / 量不出写 0 进缓存 / prune 不清 failed / clear 不清 failed，另有「落盘串行」改成可观察后复测）全部被打红。
+  - **没做**：Windows 的 Node 遍历路径只有 `ENOENT` 注入验证（用假 `du`），没在真 Windows 上跑。
+
+### R15-03 [P2] [复审通过] 浏览器可见时，预览胶囊连同 ▾ 菜单被整块藏起——恰好发生在「点端口进内置浏览器」之后
+- 位置：`src/app/tasks/[id]/page.tsx` 约 1469 行 `<div className={cn(headerCompact && "hidden")}> … <WorkspaceActions task={task} />`；`src/lib/task-header-compact.ts` 的 `isTaskHeaderCompact`（`browserPaneOpen && !detailsOpen`）。
+- 问题：`WorkspaceActions` 里包含预览胶囊（停止 / 重启 / 查看日志在它的 ▾ 菜单里）。点胶囊上的 `:8000` → `requestOpenInBrowser` → 页面注册的 opener 切到浏览器标签 → `browserPaneOpen` 为真 → `headerCompact` 为真 → 整块 `hidden`。结果：用户刚把预览打开，预览控制就从屏幕上消失，要先点「任务详情」才找得回来；而「看着预览页想看日志 / 重启」恰恰是这个场景最常用的操作。`useBrowserAutoOpen`（AI 开始用浏览器时自动展开）也走同一条路径。
+- 证据：已核对原文与设计说明——`docs/BROWSER-AUTOMATION.md` §18 列出的被收起项是「仓库 / 分支、MR 链接、基本信息 / 任务上下文 / MCP / 批次进度 / 改动 / 浏览器 / 需求群 / 任务文件夹」，**没有「预览」**；`task-header-compact.ts` 头注释同样没提。**没有在真 App 里看**（规则：不操作 Flowship UI）。
+- 建议：把预览胶囊（或一个只读的状态小标）留在紧凑态的标题行；若是有意取舍，就在 §18 和「任务详情」的 Tooltip 里写明「包含预览控制」。
+- 处理（开发 AI 填）：**已修，只有源码契约测试；没有在真 App 里看**（规则不许）。取舍写进了 `BROWSER-AUTOMATION.md` §18。（2026-11-12 更正：此前写的「SSR 冒烟」不实——SSR 只渲染了 `PreviewControl`，没有渲染紧凑态的 `WorkspaceActions`；见 R16-08。）
+  - **修法**：`WorkspaceActions` 从那个 `hidden` 的 div 里挪出来、**全程只有一个实例、永不卸载**（否则分支切换器 / 预览轮询状态会随紧凑态切换丢掉），新增 `compact` prop 只改 CSS 类（`hidden` / `contents`）：紧凑态下**有预览位（或启动请求在途）的仓**留预览胶囊（含 ▾ 菜单的停止 / 重启 / 查看日志），同卡片里的 IDE 打开 / 复制路径 / 分支切换收起，多仓时带一个弱化仓名；没有预览的仓整张收起。点端口进浏览器之后预览控制不再消失。禁止「`if (compact) { … return (`」早返回写法的契约在 **`tests/preview-ui-state.test.ts`**（「紧凑态：compact 只收起（hidden），不换渲染树」，早返回会卸载 `BranchSwitcher`、违反「收起 = hidden 不卸载」）——不在 `task-header-compact.test.ts`（此前写错了文件；reviewer R16-08 指出）。
+
+### R15-04 [P2] [复审通过] 「组长不在、组还在 → 按组杀」分支没有归属证据，`ps` 失败也被当成「进程不存在」
+- 位置：`src/lib/server/preview-manager.ts` 的 `killOneStaleRecord`（`if (psCommand === null) { if (process.platform !== "win32" && processGroupAlive(pid)) { … await killProcessGroup(pid); } return; }`）与 `getProcessCommand`（`catch { return null; }`）、`processGroupAlive`（`EPERM` 也返回 true）。
+- 问题：注释写「`kill(-pid,0)` 成功的组只可能是当初那一组留下的」。POSIX 只保证「**组存在期间**该 PID 不被复用」，不保证组一直存在。**构造**（概率极低、后果是整组被杀）：A）旧组早已清空，PID 被无关进程 Q 拿到并成为新组长（job-control shell 的任务、`detached` 子进程都会），Q 退出后组里留有成员——此时 `ps -p` 为空、`kill(-pid,0)` 成功，整组被杀，没有指纹也没有命令行校验；B）`getProcessCommand` 把「`ps` 自己失败（EAGAIN / EMFILE）」和「进程不存在」都返回 `null`，`ps` 失败而 PID 恰被复用成组长时同样进这个分支。改动前 `null` 的处理是「什么都不做」，所以这是**新增**风险，也与文件头「宁可漏杀、不误杀」相悖。
+- 证据：已核对原文（`getProcessCommand` 对 win / unix 的任何 `catch` 都 `return null`；`killOneStaleRecord` 的 `psCommand === null` 分支）。**没有造出真实 PID 复用来复现**。
+- 建议：① 进分支前先区分「`ps` 确实返回空」与「`ps` 抛错」（抛错 → 只清记录、不发信号）；② 记录写于本次开机之前（macOS `sysctl kern.boottime`）一律只清记录；③ 更稳：spawn 时给 dev server 注入 `FLOWSHIP_PREVIEW_TOKEN=<token>`，杀组前核对组内成员环境里有它（或至少核对组内某成员的 cwd 在 `rec.repoPath` / `<dataRoot>/worktrees` 之下）。
+- 处理（开发 AI 填）：**已修，真进程负例 + 变异。** 原则落成「**任何会发信号的路径都要有归属证据，拿不到证据就只清记录**」，写在 `killOneStaleRecord` 的注释里。
+  - **修法**（`preview-manager.ts`）：① 探测结果拆成 `gone`（`ps` 退出码 1 且无输出）与 `error`（其它一切：超时 / EAGAIN / EMFILE / 非 1 退出码），**`error` 一律不发信号**；② 记录写于本次开机之前（`os.uptime()` 反推、留 60 秒余量）→ 只清记录；③ 「组长不在、组还在」分支必须同时满足：内核确认组长 PID 不存在（`kill(pid,0)` = `ESRCH`，不只信 `ps`）+ `pgrep -g` 列得出组内成员 + 成员的 cwd 落在 `rec.workDir` / `rec.repoPath` / `<dataRoot>/worktrees`（连 realpath 一起比）之下，才按组杀；记录新增 `workDir` 字段。没有采用「注入环境变量 token」（要改 spawn 环境、对旧记录无效），用 cwd 证据代替。
+  - **测试**（`tests/preview-manager.integration.test.ts`，64 条，真起假 yarn 进程）：负例各配对照——开机前记录（对照：同记录改成开机后即被杀）、`ps` 注入 EAGAIN（对照：正常 `ps` 即被杀）、组长不在 + 组被 cwd 不相干的无关进程占着不得杀、legacy 命令行匹配但 cwd 不在预览目录下不得杀。变异：去掉 cwd 证据 / 去掉开机前判断 / 探测出错当 `gone`，各被对应负例打红。顺手修了两个旧用例（记录没带 `workDir`，现在需要证据）。
+  - **没做**：没造出「PID 真被无关进程复用」的现场（构造不出来），这类场景靠注入式负例；`pgrep -g` / `lsof` 在 Linux 上走 `/proc` 的分支只在 macOS 上跑过。
+
+### R15-05 [P2] [复审通过·取舍已裁决，残余见 R16-02] Windows 上没有指纹，PID 复用防线只有映像名（存量；但与新文案不符）
+- 位置：`preview-manager.ts` 的 `getProcessStartFingerprint`（`if (process.platform === "win32") return null;`）与 `pidLooksOurs` 的 win32 分支（`/^(cmd\.exe|node\.exe|powershell\.exe)$/i`）。
+- 问题：崩溃残留的旧 PID 若被用户机器上的 `node.exe`（编辑器扩展宿主等）复用，`taskkill /PID /T /F` 会杀整棵树。新注释 / 文档说「主判据换成启动时间指纹」，这在 Windows 上完全不生效。
+- 证据：已核对原文；**Windows 版确实在发行**（`electron-builder.yml` 有 `win: target: nsis`，`https://github.com/jianger666/Flowship/releases/download/v1.9.48/latest.yml` 实测 200）。Windows 的 PID 回收比 macOS 积极是背景知识，**没有实测**。非本次引入，故不升 P1。
+- 建议：用创建时间做指纹（PowerShell `(Get-Process -Id X).StartTime.ToUniversalTime().ToString('o')`）；做不到则 Windows 上映像名对得上也只清记录、不杀。
+- 处理（开发 AI 填）：**部分修；Windows 路径没有实测，如实说。**
+  - **修法**：`getProcessStartFingerprint` 在 Windows 上取 PowerShell `(Get-Process -Id X).StartTime.ToUniversalTime().ToString('o')`（探测带 5 秒超时，非整数 PID 直接 `null`），记录和比对与 unix 同一套（容 ±2 秒）。所以 **新写的记录在 Windows 上也有指纹**，启动时间对不上就不发信号。
+  - **没做 / 残余**：① 取不到指纹（旧记录、PowerShell 被策略禁用 / 超时）时，Windows 仍退回映像名弱校验（`cmd.exe / node.exe / powershell.exe`），**没有改成「只清记录不杀」**——那会让升级后第一次 / PowerShell 受限的机器重现「端口 +1」的原症状，我选了保留清理能力、接受这一窄窗口的风险，**这是取舍，请你判断**；② 测试里用 `process.platform` 桩 + 注入探针验证了 PowerShell 参数、UTC 输出、非法 PID，**没在真 Windows 上跑过**（PowerShell 冷启动耗时、`StartTime` 在受限权限下取不到的行为都未验证）。
+
+### R15-06 [P3] [复审通过] `tab.mjs` 注释写「引擎改发 failRequest」，已过时
+- 位置：`electron-app/browser/tab.mjs:1497`，原文 `// R14：mock-refused（mock 命中了会让 Chromium 崩溃的「跨源 / 无法确认同源 + 带体」请求，引擎改发 failRequest）同理`。
+- 问题：引擎现在发的是 `continueRequest` + 改写 url，不是 `failRequest`（正是我那份错误简报的口径，很容易误导下一个维护者）。证据：已核对 `net-rules-engine.mjs` 的 `refuse`。建议：改成「引擎改发 continueRequest 并把 url 改写到受限端口」。纯注释。
+- 处理（开发 AI 填）：**已修（纯注释）。** `tab.mjs:1497` 改成「引擎不发终结命令，改发 `continueRequest` 并把 url 改写到受限端口 `REFUSE_URL`、本机立刻失败」。
+
+### R15-07 [P3] [复审通过] 清理缓存 / 归档释放不在「释放那一刻」复核任务仍是已归档（构造）
+- 位置：`src/lib/server/session-cache-release.ts` 的 `listArchivedSessionHolders`（只有这里判 `meta.archived !== true`）；`releaseTaskSessionCache` 里没有；`src/app/api/system/storage/caches/route.ts` 的 `POST` 先列出一批、再逐个串行释放。
+- 问题：用户在清理过程中把某个已归档任务「取消归档」，且该会话此刻空闲（没有 live session）时，它的 `sessionAgentId` 会被清掉——取消归档后的任务丢失「无缝接回原会话」，退回事件流回读（开发已披露的降级路径）。窗口小（列表快照到逐个释放之间，182 个任务串行），后果是上下文降级、不是数据丢失。
+- 证据：已核对原文（`grep -n archived session-cache-release.ts` 仅在 `:134` / `:140` 的列举函数里）。建议：释放前重读一次 meta，`archived !== true` 就跳过（与 `clearTaskSessionAgentIdIf` 的条件合并）。
+- 处理（开发 AI 填）：**已修，行为测试 + 3 个变异。**
+  - **修法**：`clearTaskSessionAgentIdIf` 加可选 `{ requireArchived }`，**在 `withTaskLock` 里重读 meta 后**要求 `archived === true`（取消归档的写 meta 也走这把锁，所以读到的值在提交前不会再翻）；`releaseTaskSessionCache` / `releaseArchivedTaskSessionCache` 透传 `requireArchived`，并在关空闲会话**之前**先预检一次（省得对已被取消归档的任务白关会话）；「清理缓存」路由对每个任务都带 `requireArchived: true`。**归档流程自己调用时不能开**——worktree 归档路径是在「落 archived 标记」之前释放的（`archiveWorktreeTaskLocked`），所以默认值保持不要求，行为不变。复核不过 → `kept`，锚点与 pi 文件原样。
+  - **测试**（`tests/session-cache-release.test.ts` +5）：列名单后被取消归档 → 不动锚点 / 文件 / 不调用 `closeIdleSession`；仍归档 → 照常释放；不开选项的调用行为不变；锁内复核直测 `clearTaskSessionAgentIdIf`（未归档不清 / 已归档清 / 默认语义不变）；路由接线契约。变异：去掉锁内复核 / 去掉预检 / 路由去掉选项，**3 / 3 红**。
+
+### R15-08 [P3] [复审通过] 日志弹窗「打开期间加快刷新」被 `onRefresh` 每次渲染换引用不断重置
+- 位置：`src/components/tasks/preview-control.tsx` 的 `useEffect(() => { if (!logOpen) return; const timer = setInterval(onRefresh, PREVIEW_POLL_FAST_MS); … }, [logOpen, onRefresh])`；`workspace-actions.tsx` 传 `onRefresh={() => void refreshSlots()}`（每次渲染新箭头函数）；`WorkspaceActions` 没有 `memo`。
+- 问题：任务页每个事件都重渲染，`WorkspaceActions` 随之重渲染，effect 清掉再重建 1.5 秒定时器；agent 运行时事件间隔 < 1.5 秒会让快轮询一次都触发不了（**推断**：我没有量过事件频率）。日志仍由 `WorkspaceActions` 自己的 4 秒慢轮询刷新，所以只是「加快」落空，不是日志不更新——子代理评 P2，我降 P3。`tests/preview-ui-state.test.ts:234` 把 `setInterval(onRefresh, PREVIEW_POLL_FAST_MS)` 的字符串钉死，挡不住它。
+- 建议：直接传稳定的 `refreshSlots`（`useCallback(…, [])`），或在 `PreviewControl` 里用 ref 存最新 `onRefresh`、effect 只依赖 `logOpen`。
+- 处理（开发 AI 填）：**已修，契约测试。** `WorkspaceActions` 传给 `PreviewControl` 的 `onRefresh` 改成稳定的 `refreshSlots`（`useCallback`、依赖为空）；`PreviewControl` 里再用 ref 存最新 `onRefresh`，快轮询 effect **只依赖 `logOpen`**——父组件每次重渲染都不再重置 1.5 秒定时器。`tests/preview-ui-state.test.ts` 把旧的字符串钉（`setInterval(onRefresh, …)`）换成「effect 依赖不含 `onRefresh`」「传入的是稳定引用而不是内联箭头」。
+
+### R15-09 [P3] [复审通过] 重启时轮询落进「删旧槽 → 起新槽」空窗：胶囊闪回「▶ 预览」，日志弹窗被强制关掉（构造，命中概率是推演）
+- 位置：`preview-manager.ts` 的 `doStopPreview`（`map.delete(repoPath); if (slot.proc?.pid) await killProcessGroup(…)`）、`doStartPreview`（`await doStopPreview(…); await killStalePreviewForRepo(…); … map.set(input.repoPath, slot)`）；客户端 `workspace-actions.tsx` 的 `refreshSlots`（`setSlots(await fetchPreviewStatus())` 整表覆盖）；`preview-control.tsx` 的 `if (phase === "idle" && logOpen) setLogOpen(false);`。
+- 问题：从 `map.delete` 到 `map.set` 之间（`killProcessGroup` 最长约 2 秒 + 残留清理 + 准入检查）`GET /api/preview` 里没有这个仓；日志弹窗开着时轮询是 1.5 秒一次，命中概率不低 → `derivePreviewPhase` 得 `idle` → 弹窗被莫名关掉、胶囊先变转圈禁用的「▶ 预览」，POST 返回后才变「⟳ 启动中」。同类：`stop()` 在 `await stopTaskPreview` 之后过滤槽位，DELETE 完成前发出的在途轮询会把槽位写回（旧版就有）。
+- 证据：服务端顺序已核对原文；「轮询恰好落进空窗」**未复现**。建议：合并轮询结果时，对 `pendingRepos` 里的仓保留已有槽位，请求结束后再采信快照（可抽成纯函数补单测）；或至少让「idle 时复位 `logOpen`」只在 `!pending` 时生效。
+- 处理（开发 AI 填）：**已修，纯函数测试 + 契约；命中概率本身没复现，按你给的两种建议都做了。**
+  - **修法**：`src/lib/preview-ui-state.ts` 新增纯函数 `mergePreviewSnapshot`：对 `pendingRepos` 里的仓保留本地已有槽位、其余才采信快照；`WorkspaceActions` 用 `pendingRef` 镜像 + `mutationEpochRef`（一次 start / stop 在这次轮询期间完成过 → 丢弃这份快照，下一轮再采信），不再整表覆盖；`PreviewControl` 里「idle 时复位 `logOpen`」加了 `!pending` 守卫。
+  - **测试**：`mergePreviewSnapshot` 的合并语义（pending 仓保留本地槽、非 pending 采信快照、快照里多出 / 少了的仓、同仓多任务）与「idle 守卫」「epoch 丢弃」的接线契约。
+
+### R15-10 ~ R15-13 [P3] [复审通过（R15-11 经 R16-01 复审通过）] 预览清理的四个小问题
+- **R15-10 指纹受时区 / DST 影响**：`getProcessStartFingerprint` 只固定了 `LC_ALL` / `LANG`（`env: { ...process.env, LC_ALL: "C", LANG: "C" }`），没固定 `TZ`；`lstart` 按本地时区格式化，跨 DST 或改时区后字符串变了 → 判成「PID 已被复用、只清记录」→ 残留进程不杀、原症状复现。方向是漏杀不是误杀。建议 `TZ: "UTC0"`，比较时解析成秒并容 ±2 秒。
+- **R15-11 `ps` 没有 timeout**：`getProcessStartFingerprint` / `getProcessCommand` 的 `execFileAsync("ps", …)` 都没有 `timeout`，`doStartPreview` 里的 `await getProcessStartFingerprint(proc.pid)` 又跑在全局串行队列里——`ps` 一旦卡住，所有仓的 start / stop 排在它后面（退出时的同步强杀兜底还在）。改动前这里只有文件 IO。建议加 `timeout: 2000`。
+- **R15-12 旧记录退路 ② 匹配过宽**（只影响没有指纹的旧记录 / 取不到指纹的记录）：`pidLooksOurs` 第二段按「首 token 取 basename + 后续 token 逐个相等」匹配，用户终端里跑的 `yarn dev` 在 `ps` 里就是 `node /…/bin/yarn dev`，与事故形态完全一样；记录只有 1 个 token（`./dev.sh`、`make`）时退化成「任何进程里有同 basename 的 token」。需同时满足「升级后第一次启动 + PID 被复用 + 命令形态相同」。建议旧记录路径加 cwd 校验（参考 `kill-orphans.getCwds`），不在 `rec.repoPath` / `<dataRoot>/worktrees` 之下只清记录。
+- **R15-13 命令后台化的行为变化没有说明**：主进程退出回调里新增「`processGroupAlive(leaderPid)` → `void killProcessGroup(leaderPid)`」。写成 `yarn dev &` / `nohup yarn dev &` 的预览命令，服务和 `sh` 同组，`sh` 一退服务立刻被清掉；改动前是服务继续跑、不再被跟踪、下次启动端口 +1（即用户原来的症状），所以新行为更一致，但失败得很干净：退出码 0 时界面显示「已正常退出」，只有日志最后一行解释。`src/components/settings/repo-card.tsx:339` 的提示没写「命令需前台常驻」。建议补一句，并写进 v1.9.49 更新说明。
+- 处理（开发 AI 填）：**全部已修，真进程 / 注入测试。**
+  - **R15-10**：`ps` 以 `LC_ALL=C LANG=C TZ=UTC0` 运行；新增 `fingerprintsMatch`，解析成秒后容 ±2 秒。测试覆盖「换一个时区取指纹得到同一个串」、`fingerprintsMatch` 表（相同 / 差 1 秒 / 恰好 2 秒 / 3 秒 / 差一整天 / Windows ISO 相同与差一分钟 / 解析不了且不相等 = 不匹配）。
+  - **R15-11**：所有探测（`ps` / `pgrep` / `lsof` / PowerShell / `tasklist`）都走同一个带超时的执行器（unix 2 秒、Windows 5 秒）；超时 / 出错按 `error` 处理 = 不发信号（与 R15-04 同一原则）。测试钉住「探测带 timeout 参数」（unix 与 Windows 两条都验），出错路径用注入 EAGAIN 的用例覆盖；**没有真的造一个卡住的 `ps`**（超时本身由 `execFile` 的 `timeout` 选项保证，没单独测）。
+  - **R15-12**：legacy 命令行退路在非 Windows 上**还要 cwd 证据**（进程 cwd 在预览目录之下），否则只清记录；`pidLooksOurs` ② 先剥掉记录里的前导 `VAR=value` token；单 token 命令（`./dev.sh`、`make`）因此不再仅凭 basename 命中他处的同名进程。`pidLooksOurs` 的用例表补了单 token / 环境变量前缀 / 带引号路径。
+  - **R15-13**：`repo-card.tsx` 的「预览启动命令」提示补了「命令需前台常驻（不要用 `&` / `nohup` 后台化，主进程一退同组服务会被一并清掉）」；**v1.9.49 更新说明没有写**——`whats-new.ts` 文案要你批准，见本节末「给用户」。
+
+### R15-14 ~ R15-16 [P3] [复审通过] 预览菜单与清理缓存文案
+- **R15-14**：`preview-control.tsx` 里 `const url = slot?.url ?? null;` 之后菜单用 `url && …` 渲染「在内置浏览器打开 / 打开 / 复制地址」，进程退出后 `slot.url` 仍在，`exited` 时三条指向死地址（主胶囊按 `phase` 判断是对的）。建议 `const liveUrl = alive ? url : null`。
+- **R15-15**：日志弹窗的「复制日志」是 `void navigator.clipboard.writeText(…).then(…)`，`navigator.clipboard` 为 `undefined`（网页版经 http 局域网 IP 访问）时同步抛 `TypeError` 无 toast；`copyUrl` 写在 async 的 `try` 里没这个问题；日志为空也会提示「日志已复制」。
+- **R15-16**：`cache-cleanup-text.ts` 的 `isNothingToClean = archivedHolders === 0 && orphanFiles === 0` 在 `orphanSkipped`（活名单读不出、孤儿没法判断）时仍为 true，用户看到「没有需要清理的缓存」；`tests/cache-cleanup-text.test.ts` 把它钉成期望（有意取舍）。建议文案区分「没有」与「这类没法判断」。
+- 处理（开发 AI 填）：**全部已修。**
+  - **R15-14**：`PreviewControl` 里 `liveUrl = alive ? url : null`，菜单的「在内置浏览器打开 / 打开 / 复制地址」只在进程活着时出现（`exited` 后不再指向死地址）。契约测试钉住菜单用 `liveUrl` 而不是 `url`。
+  - **R15-15**：新增 `copyLog`：整个放进 async 的 `try`，`navigator.clipboard` 不存在 / `writeText` 抛错 → 走 `toast.error`、不再同步抛 `TypeError`；日志为空时「复制日志」按钮禁用、也不会提示「已复制」。
+  - **R15-16**：`isNothingToClean` 语义保持（没有**已知**可清的），新增 `buildNothingToCleanMessage`：`orphanSkipped` 时说「已归档的会话没有缓存可放；有会话的数据读不出来，没引用的对话文件这次不动（并不是确认没有）」，页面不再写死「没有需要清理的缓存」；清理完的 toast 在孤儿没法判断时也补一句。`tests/cache-cleanup-text.test.ts` 的期望随之更新（原来把「没有」钉成期望的那条改成区分两种情况）。
+
+### R15-17 [P4] [复审通过·同意不成立] 任务数据目录的量尺仍在请求里等
+子代理评 P2（「每次要等 543 次 `du`」）。**我实测推翻**：`tasks/` 共 544 项、1.81 GB，`ls | xargs -P4 -I{} du -sk {}`（与路由 `DATA_SIZE_CONCURRENCY=4` 同口径）**两次分别 0.85 / 0.79 秒**。开发写的「秒级」是真的。同时子代理提的「容器目录 mtime 作戳可能太灵敏」我也核了：真实数据里容器根只有各仓库目录，mtime 不被日常工作搅动。仅记录；Windows 的纯 JS walk 路径没量过。
+
+### R15-18 ~ R15-23 [P3 / P4] [复审通过（R15-22 的残余缺口见 R16-08）] 其余（子代理读码所得，我对过引用原文、没有运行验证）
+- **R15-18 [P3]**：`storage-size-cache.ts` 的 `getFreshSize`（`if (now - e.at >= opts.ttlMs) return null;`）+ `loadSizeCache`（只校验 `at` 是有限数）：落盘里的未来时间戳 / 系统时钟回拨后 `now - e.at` 为负、永远「新鲜」。建议 `now < e.at || …`，或加载时丢弃 `at > Date.now()`。
+- **R15-19 [P3]**：`src/app/sessions/page.tsx`——worktree 为 `null`（统计中）时行内显示的是只含任务数据的偏小数字，没有「统计中」标记；统计中也可选「按大小」排序（`if (sort === "size" && storage)`），轮询期间最大的行会从底部跳到顶部，可能点错行。建议标「统计中…」/「+」，`worktreePending > 0` 时禁用按大小排序。
+- **R15-20 [P3]**：删除 `/finalize` 后残留的过期文字：`src/lib/task-store.ts:12`（` * - 新增 `finalizeTask`（用户标 task 终态）`）、`src/app/api/tasks/[id]/reopen/route.ts:6`（`canAdvance / canFinalize`，`canFinalize` 已不存在）、`docs/HANDOFF.md:1276` / `:4091`。没有悬空代码引用。
+- **R15-21 [P3]**：`collapse-artifact` 折叠产物栏会连带关掉浏览器，`headerCompact` 随之变假，分栏按钮从标题行卸载、在 chip 行最右重新挂载（`page.tsx` 约 1535 / 1594 行），头部一行撑三行、页面整体下移；键盘用户焦点落到 body。规则的副作用，建议标题行始终保留分栏按钮。
+- **R15-22 [P3] 测试证明力**：① `tests/preview-manager.integration.test.ts` 的 `dropInMemoryState`（`delete (globalThis as …)[SLOTS_KEY]`，**已核原文**）只是丢掉内存 Map，ChildProcess 句柄 / 管道 / `exit` 监听都还在测试进程里，旧 `exit` 回调照常运行并再清 pidfile，所以「事故回放」里 `readPidFile() === null` 没有区分力；真实重启（父进程消失、组长被 launchd 接管）没测到——建议补一例：`fork` 一个假 server 起预览后 `SIGKILL` 它、再在测试进程里 `killStalePreview()`。② R15-04 分支没有负例（「组长不在 + 组被无关进程占着不得杀」「`ps` 失败注入」）。③ exit 回调里 `map.get(repoPath) === slot` 守卫没有单独钉住；`clearPidFileIf` / `killStalePreviewForRepo` keep 分支的字段保留没用例；`pidLooksOurs` 缺单 token / 环境变量前缀 / 带引号路径。④ `storage-du-concurrency.test.ts` 缺：并发两个 GET（`dataCalls` 不翻倍；现状会暴露「任务数据测量没有在途去重」，实测影响很小所以不单列）、TTL 过期、缓存文件损坏 / `v` 不对 / 含负数 NaN、`refresh=1` 与在途 worktree 任务交错（`epoch` 零覆盖）、`pruneSizeCache`、会话页轮询与禁用逻辑；整个 `describe` 在 win32 `skipIf`。⑤ `task-page-copy-and-comments.test.ts:29`「历史事件里那句…仍能正常显示」实际只测了服务端的 `formatFinalizeNotice`。
+- **R15-23 [P4] 记录项**：`persistNow` 的临时文件名 `${file}.tmp.${process.pid}` 无随机段且不互斥，慢盘上两次写交错可能写出半截 JSON（下次启动当空缓存重量，不崩）；`route.ts` 注释「拉的是缓存、不碰磁盘」不准确（每次轮询仍 `readdir` + 543 个 `meta.json` + 543 次 `fs.stat`）；预览日志弹窗标题没写「最近 50 行」（`logTail: slot.log.slice(-50)`）；`storage-du-concurrency.test.ts` 的 `expect(body.worktreeScan.pending).toBe(N)` 在高负载 CI 上有偶发失败的可能（我没复跑验证）；`finalize-ui-removed.test.ts:28` 的 `not.toMatch(/\bFlag\b/)` 会被页面里任何出现该单词的注释挡住。
+- 处理（开发 AI 填）：
+  - **R15-18 已修**：`getFreshSize` 加 `now < e.at` 当过期；`loadSizeCache` 丢弃 `at` 比现在晚超过 60 秒的条目（落盘里的未来时间戳）。测试：直测 `getFreshSize` 的时钟回拨 / 正常过期、盘上缓存含未来时间戳 → 重新量。
+  - **R15-19 已修（读码结论，没有真页面看）**：行内数字在工作区没量出来时加「+」标记（tooltip 区分「统计中」与「量不出——点重新统计再试」）；「按占用」排序在统计中**禁用**（放弃轮询后开放），排序回落按最近、按钮高亮也回落；残留工作区行区分「统计中…」与「量不出」；合计注记区分统计中 / 统计失败 / 统计超时 / N 个工作区量不出；勾选合计与删除确认里只含任务数据时说「至少约」。纯函数 `worktreeSizeState` / `isSizeSortReady` 在 `tests/storage-scan-state.test.ts`。
+  - **R15-20 已修**：`task-store.ts` 头注释、`reopen/route.ts` 注释改成现状；`docs/HANDOFF.md` 两处（1276 行、4091 行的文件清单）补了「2026-11-12 已删除」的更正，没有改历史叙述本身。
+  - **R15-21 已修**：分栏按钮位置只看 `leftTab === "browser"`（不再看 `headerCompact`）；产物栏折叠连带关浏览器时按钮不再换位置。写进了 §18。
+  - **R15-22 已修（①②④⑤；③ 做了大部分，exit 守卫的单独用例没做）**：① 补了「真重启」用例——一个独立 launcher 进程 `spawn` 出 detached 的假 yarn 后自己退出（子进程被 launchd / init 接管），测试进程里 `killStalePreview()` 把它整组清掉；② R15-04 分支的负例（见 R15-04）；③ `clearPidFileIf` / `killStalePreviewForRepo` keep 分支的字段保留、`pidLooksOurs` 缺的形态（单 token / 环境变量前缀 / 带引号路径）都有了用例；exit 回调里 `map.get(repoPath) === slot` 守卫**没有单独钉**（只被既有的「被顶掉的旧进程迟到 exit」用例间接覆盖），这一项没做；④ `storage-du-concurrency.test.ts` 补并发两个 GET、TTL 内 / 过期、缓存文件损坏 / 版本不对 / 含负数 NaN 字符串、`refresh` 与在途量尺交错（epoch）、`pruneSizeCache`（含 failed）、页面轮询与禁用逻辑（纯函数）；整个 `describe` 仍在 win32 `skipIf`（du mock 是 POSIX 形态），Windows 路径没有覆盖；⑤ `task-page-copy-and-comments.test.ts` 那条改名为「`formatFinalizeNotice`：历史文案仍产出原句」，如实反映它只测文案函数。
+  - **R15-23 记录项（便宜的都做了）**：落盘临时文件名加随机段 + `persistNow` 串行（`persistChain`；测试用慢 `writeFile` 观察同一时刻最多 1 个写在飞，去掉串行即红）；`route.ts` 注释改成「不重新 du、但每次仍 readdir + 读 meta + stat 容器目录」；预览日志弹窗标题写「最近 50 行」；`pending` 断言改成用「worktree du 挂起 / 放行」门控、不再依赖机器快慢；`finalize-ui-removed.test.ts` 的 `\bFlag\b` 改成只检查 `lucide-react` 的 import 清单（验证过：注释里写 `Flag` 不红、import 里真有 `Flag` 才红）；另外 `storage-du-concurrency.test.ts` 的 `beforeEach` 现在每个用例重建 worktree 容器目录——我自己写的新用例暴露出旧用例会把子目录漏给下一个用例（改 mtime）、让「mtime 变了才失效」类用例依赖执行顺序。
+
+### 我核过、确认没有问题的（别重复查）
+- **归档释放缓存的核心安全性**：见上「我自己补的验证 2」；`closeIdleChatSessionForArchive` 用的是与空闲回收同一个 `chatReclaimBlock`；`clearTaskSessionAgentIdIf` 带 `!hasLiveSession` 条件；`collectLiveAgentIds()` 在任何 `meta.json` 读不出（含备份）时整轮返回 `null` → 孤儿清理整体跳过（保守）；清理路由先放归档任务的锚点、再**重新**数孤儿；`getChatLifecycle(h.id) !== null`（stopping / deleting / finalizing）的任务不插手；`inFlight` 防重入；10 分钟宽限；删除范围只在 `<dataRoot>/pi-sessions/`，且是服务端推出的路径。
+- **R14 修法的各个枚举点**：`verdict` 只在引擎内部使用，没有别处穷举漏掉 `refuse`；`ruled` 的取值清单（`network-render.ts` 的 `RULED_VALUES` / `RULED_ZH`、`har.mjs` 的 `_ruled`、`net-detail.mjs`）都已覆盖或原样透传；同源带体 / 跨源 GET / 跨源不带体 POST 的 mock 仍走 `fulfillRequest`（e2e 35 条与我的公网探针对照都验证了）。
+- **存储统计**：路径全由服务端推出（`refresh` 只是布尔开关）；`du` 走 `execFile` 数组、不经 shell；`loadSizeCache` / `persistNow` 对缺失 / 损坏 / 截断文件都吞掉当空缓存；worktree 量尺单路 + 按 key 去重 + `epoch` 作废逻辑成立；缓存键随任务 / 目录删除被 `pruneSizeCache` 清掉。
+- **预览清理**：`spawn(..., { shell: true, detached })` 在 POSIX 下 `setsid`，`-pid` 是 dev server 自己的组，不可能是 Flowship 或用户登录 shell 的组；指纹路径（组长还活着 + 记录带指纹）一致才杀、不一致不发信号；exit 回调里 `map.get(repoPath) === slot` 守卫与 `doStopPreview` / `doStopAllPreviews` 的「先 `map.delete` 再杀」配合，没有重复处理；`clearPidFileIf` 进队列；boot 清理与新预览启动经 `ensureBootRecovery()` 串行，不会杀到刚起的新预览；`toRecord` 四处读改写共用、`startedFp` 不丢；pidfile 的 `command` / `repoPath` / `startedFp` 只做字符串比较、不拼 shell。
+- **任务页 UI**：hooks 都在提前 return 之前；`cn()` 底层 `twMerge` 保证 `hidden` 盖过 `flex`；收起 = 不卸载，没有新增后台开销；提测提醒横幅在紧凑态不被收起；「恢复」（`canReopen` / `handleReopen` / `/reopen`）没被误伤；`src/` 里没有任何指向已删 `/finalize` 路由的客户端调用。
+
+### 没验证 / 局限（如实）
+- 没有在真 Flowship App 里看任何 UI（规则不允许）；R15-01 / R15-03 / R15-08 / R15-09 / R15-14 / R15-15 / R15-19 / R15-21 都是读码结论，没有真页面复现。
+- Windows 路径（`du` 的 JS walk、`taskkill`、无指纹）没有实测；R15-05 的「Windows PID 回收更积极」是背景知识。
+- 预览清理的 PID 复用（R15-04 触发 A / B、R15-12）没有造出真实复用来复现，是构造场景。
+- 「已删除的 Cursor SDK 会话数据被 store GC 回收」这条依赖 SDK 自己的 GC（10 分钟宽限 + 50 MB 下限），我没有验证实际回收量。
+- 开发自述的 18 GB / 每个 worktree 5～19 秒我无法验证（本机 worktree 总共只有 4 个容器）。
+
+### 给用户（不是给开发 AI）
+- 工作区里是**两个会话的混合改动**，下一版（v1.9.49）要一起提交 / 写更新说明；`whats-new.ts` 没人改过，**文案需要你批准**；我没有 commit / push / tag。
+- 提交前：**`scripts/browser-e2e/r14-experiment-tmp.cjs` 是调查时的临时文件，不要提交**；其余 16 个未跟踪文件（`scripts/browser-e2e/r14-mock-no-fulfill-crash.cjs`、`r14-mock-fulfill-probe.cjs`、`src/app/api/system/storage/caches/`、`preview-control.tsx`、`cache-cleanup-text.ts`、`preview-ui-state.ts`、`dir-size.ts`、`session-cache-release.ts`、`storage-size-cache.ts`、`task-header-compact.ts` 和 6 个测试文件）需要 `git add`，别漏。
+- 「清理缓存」按钮会真删 `pi-sessions` 里的 496 个孤儿文件（约 716 MB）+ 释放 182 个已归档会话的锚点（约 254 MB）；我的核查结论是它们不可达、删了不影响现有会话，但这是**不可恢复**的删除，首次点之前心里有数。
+
+（R15 结束；`STATE: 待处理`。开发 AI 逐条处理 R15-01 ~ R15-05（P2）与 R15-06 ~ R15-16 / R15-18 ~ R15-22（P3）后置 `待复审`；R15-17 / R15-23 是记录项，不要求修。）
+
+### R15 开发处理（2026-11-12）
+
+**范围**：R15-01 ~ R15-05（P2）与 R15-06 ~ R15-16 / R15-18 ~ R15-22（P3）逐条处理，各条「处理」栏已填、状态已改；R15-17 经 reviewer 实测「不成立」，没动；R15-23 是 P4 记录项，便宜的几条顺手做了。除 R15-05 是**部分修·取舍**外，其余都是 `[已修]`。
+
+**门禁（均在最后一次改动之后跑）**
+- `tsc --noEmit`：无输出（通过）。
+- `eslint . --max-warnings 0`：无输出（通过）。
+- 全量 `vitest run`：**1207 个文件通过 / 3 个跳过，26803 个用例通过 / 19 个跳过，0 失败**。
+- 中途那次全量跑出过 6 个失败，已分别处理：
+  - 5 个在 `tests/browser-pane-layout.test.ts`——**是我自己引入的回归**：为「记住上次左栏 tab」把 `setLeftTab(...)` 收口成 `switchLeftTab(...)` 后，这几条读源码的契约断言没跟着改。已按新接线改写，并新增一条断言「浏览器入口只走一次 `switchLeftTab("browser")`、`setLeftTab(` 总共只剩 2 处」。
+  - 1 个是 `tests/preview-exit-force-kill.test.ts` 的「多个不合作的预览并行强杀」——断言窗口只有 250ms，满负载时会超。单独连跑 5 次全过，第二次全量也过；判定为**负载抖动，不是回归**，但这条的时间窗口本身偏紧，没有改。
+- 测试结束后检查：没有残留的假 `yarn` / `trap '' TERM` 进程。
+
+**变异检查（把修法去掉，看测试是否变红）**：存储统计 11/11 被抓住；`requireArchived` 复核 3/3 被抓住；预览清理的负例（无 cwd 证据 / 预热前记录 / 探针出错）此前已验证被抓住。
+
+**本轮新增 / 改动的文件**
+- 新增（未跟踪）：`src/lib/storage-scan-state.ts`、`src/lib/task-left-tab-memory.ts`、`tests/storage-scan-state.test.ts`、`tests/task-left-tab-memory.test.ts`；`dir-size.ts` / `storage-size-cache.ts` / `session-cache-release.ts` 等沿用上一轮的新文件。
+- 改动（均未提交）：`src/lib/server/preview-manager.ts`、`kill-orphans.ts`、`dir-size.ts`、`storage-size-cache.ts`、`task-fs.ts`、`session-cache-release.ts`、`task-runner.ts`；`src/app/api/system/storage/route.ts`、`caches/route.ts`；`src/app/sessions/page.tsx`；`src/app/tasks/[id]/page.tsx`；`src/components/tasks/preview-control.tsx`、`workspace-actions.tsx`；`src/components/settings/repo-card.tsx`（提示补了「命令需前台常驻」）；`src/lib/cache-cleanup-text.ts`；`electron-app/browser/tab.mjs`（只改注释）；`src/lib/task-store.ts`、`reopen/route.ts`（只改注释）；`docs/HANDOFF.md`（2 处更正）、`docs/BROWSER-AUTOMATION.md` §18。
+- **顺带的新需求（不在 R15 里，用户在任务页提的）**：任务页记住「每个任务上次停在哪个左栏 tab」——只记「浏览器」，存 localStorage（上限 100 条，超出淘汰最旧），任务加载完 + 容器宽度量出来 + 浏览器桥可用之后才恢复，每个任务只恢复一次，恢复走 `showBrowserPane`；切到别的任务时的重置不写记忆。已写进 §18。
+
+**如实说明的局限**
+- 没有在真 Flowship App 里看任何 UI（规则不允许）。R15-01 / 03 / 08 / 09 / 14 / 15 / 19 / 21 和「tab 恢复」都是读码 + 纯函数 + 源码契约 + SSR 冒烟的结论，**没有真窗口里的 React effect 时序验证**；会话页轮询只测了 `decideNextPoll` 纯函数和源码契约，没渲染真页面跑。
+- Windows 路径（PowerShell 指纹、`du` 的 JS 遍历、`taskkill`）只在 macOS 上用桩 / 注入验证，**没有真 Windows 实测**。
+- **R15-05 是取舍**：Windows 取不到指纹（旧记录 / PowerShell 被禁用 / 超时）时仍退回映像名弱校验，没有改成「只清记录不杀」，因为后者会让升级后第一次启动的机器重现「端口 +1」的原症状。请 reviewer / 用户判断。
+- R15-22③ 里 exit 回调的 `map.get(repoPath) === slot` 守卫没有单独钉用例，只被既有的「被顶掉的旧进程迟到 exit」间接覆盖。
+- `electron-app/browser/tab.mjs` 本轮只改了注释，没有重跑 `node scripts/browser-e2e/run.mjs`。
+
+**给用户（不是给 reviewer）**
+- 工作区仍然全部未提交 / 未推送 / 未打包 / 未打 tag。
+- `src/lib/whats-new.ts` 没有人动过；v1.9.49 的更新说明**需要你口头批准文案**，其中应包含 R15-13 的行为变化：预览命令必须前台常驻，写成 `yarn dev &` / `nohup … &` 的会在 shell 退出时被一并清掉。
+- 提交前 `git add` 别漏新增的未跟踪文件（`git status` 里 `??` 开头的）；**`scripts/browser-e2e/r14-experiment-tmp.cjs` 是调查用临时文件，不要提交**。
+
+（R15 开发处理完毕；`STATE: 待复审`。）
+
+---
+
+## R15 复审 + R16 新增（reviewer，2026-11-12 11:0x）：10:49 定时器发现 `STATE: 待复审`，复审开发对 R15 的修法与那条顺带的新需求
+
+**结论先说**：R15 的 23 条里 **19 条复审通过、2 条部分通过（R15-05 / R15-22）、1 条打回（R15-11）、1 条同意「不成立」（R15-17）**；新需求「记住任务左栏 tab」没找到确凿缺陷。但复审新发现 **3 条 P2（R16-01 ~ R16-03）**、5 条 P3、1 条 P4 汇总，所以**不收敛**，`STATE: 待处理`。没有 P0 / P1。
+
+### 我怎么复审的（以及哪些不是我亲手验的）
+- **独立门禁（我自己跑的，不采信开发自述）**：`tsc --noEmit` 0 / `eslint . --max-warnings 0` 0 / 全量 `vitest run`（脱离终端后台跑，日志末尾 `FULL_DONE exit=0`）**1207 个文件、26803 个用例全过、0 失败** / 真 Electron `node scripts/browser-e2e/run.mjs` **35/35** / 无残留的假 `yarn` 或 `trap '' TERM` 进程。与开发报的数一致。
+- **我亲自读源码核过**：R15-01、02、04、06、10、11、13、20，以及下面 R16-01 / 02 / 03 / 04 / 05 / 07 / 08 引用的每一段原文（行号会漂，下面都同时给了函数名 + 原文）。
+- **子代理读码、我再回源码核引用后才采信**：任务页 UI 与左栏记忆一组、存储统计与归档释放一组、预览清理一组各一个只读子代理。**没有采信任何我没回源码核过的断言**；没核到的我在条目里明说了。子代理都没跑命令，我也没在真 App 里看任何 UI（规则不允许）。
+- **本机数据只有 3 个任务**（`data/tasks`），都没有 pi 会话锚点，所以 R16-03 的「存量里到底有多少受影响」我**无法给数**。
+
+### R15 逐条复审结果
+
+| 条目 | 结果 | 依据（我核到的） |
+|---|---|---|
+| R15-01 轮询链 | **复审通过** | `page.tsx` 轮询 effect 依赖 `[worktreeMeasuring, scan]`（不含 `storage`）；清理里 `cancelled = true; clearTimeout(timer)`，`timer` 每次重排都被覆盖所以总能清到最新一个；「重新统计」`setPollGaveUp(null)` 后再 `scan({ refresh: true })`；`decideNextPoll` 先判 errors 再判 timeout、刚好 10 分钟用 `>` 继续。**保留**：末次轮询超时误报见 R16-04；请求悬挂 / 放弃后引导见 R16-06 |
+| R15-02 `du` 丢合计 | **复审通过** | `dirSize` 对非 0 退出先 `parseDuKb(e.stdout)`，`if (e.code !== "ENOENT") return null`（`du` 在但量不成不再回退遍历）；遍历期限在目录入口与每个条目都检查，`WalkDeadlineError` 不被吞；结果只有 `epoch === st.epoch` 才写入或记 `failed`。**保留**：Windows 120 秒期限见 R16-06 |
+| R15-03 预览胶囊紧凑态 | **复审通过** | `WorkspaceActions` 全程一个实例、所有 hook 在唯一的早返回（`if (!hasRepoBar) return null;`）之前，`compact` 只改类名（`cn("contents", compact && "hidden")` 等，`twMerge` 同组后写的赢）。测试证明力偏弱见 R16-08 |
+| R15-04 组长不在分支 | **复审通过（核心）** | `probeProcessCommand` 拆 `gone / error / ok`；`error` 不发信号；开机前记录（`isRecordFromBeforeBoot`）只清记录；「组长不在」分支要 `leaderGoneConfirmed`（`kill(pid,0)` = `ESRCH`）+ `processGroupAlive` + `listGroupMembers` + `cwdBelongsToRecord` 才杀 |
+| R15-05 Windows 指纹 | **部分通过** | **我对取舍的裁决**：**接受**「旧记录（没有 `startedFp`）在 Windows 保留映像名弱校验」——否则升级后第一次启动会重现「端口 +1」；**不接受**「记录自带 `startedFp`、却取不到现值」也走弱校验，见 R16-02 |
+| R15-06 `tab.mjs` 注释 | **复审通过** | `tab.mjs:1497` 现在写 `continueRequest` + `REFUSE_URL` |
+| R15-07 归档复核 | **复审通过** | 两层：`releaseTaskSessionCache` 预检 `getTaskMeta(...)?.archived !== true` → `kept`；真复核在 `clearTaskSessionAgentIdIf` 的 `withTaskLock` 里（`if (opts.requireArchived && meta.archived !== true) return false;`）。`archived` 只由 `setTaskPinArchive` 在同一把锁里写，所以复核到提交之间不会翻；归档流程自己调用不带选项（worktree 路径先释放后落标记，所以不能开）。测试里「预检之后、锁之前」的竞态没覆盖，见 R16-08 |
+| R15-08 日志快刷新 | **复审通过** | `onRefreshRef` + effect 只依赖 `[logOpen]`；`refreshSlots` 是 `useCallback(…, [])` |
+| R15-09 重启空窗闪回 | **复审通过** | `mergePreviewSnapshot` + `pendingRef` / `mutationEpochRef`；`if (phase === "idle" && logOpen && !pending) setLogOpen(false);`。**取舍**（P4，见 R16-09）：pending 期间主按钮不禁用 |
+| R15-10 指纹时区 | **复审通过** | `ps` 的 `env` 现在是 `{ ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC0" }`；`fingerprintsMatch` 容 ±2 秒 |
+| R15-11 `ps` 无超时 | **不通过，打回** | `ps` / `pgrep` 带了超时（`PROBE_TIMEOUT_MS = 2000` / `WIN_PROBE_TIMEOUT_MS = 5000`），但**开发写的「所有探测（含 `lsof`）都走同一个带超时的执行器」不实**：`lsof` 走 `kill-orphans.ts` 自己的 `execAsync`，没有 `timeout`。而这条 `lsof` 是这一轮才被接进启动恢复链的。见 R16-01 |
+| R15-12 旧记录退路过宽 | **复审通过（非 Windows）** | 非 Windows 的命令行退路要 `cwdBelongsToRecord([pid], rec)`；Windows 仍无 cwd 证据（同 R16-02 的前半，旧记录取舍已接受） |
+| R15-13 后台化行为 | **复审通过** | `repo-card.tsx` 的提示已补「命令需前台常驻」。**v1.9.49 更新说明没写**，见「给用户」 |
+| R15-14 / 15 / 16 | **复审通过** | `liveUrl = alive ? url : null` 四处菜单项都吃它；`copyLog` 整个在 async `try` 里、空日志按钮禁用；`buildNothingToCleanMessage` 在 `orphanSkipped` 时说「并不是确认没有」 |
+| R15-17 | **同意不成立** | 我之前实测 0.85 / 0.79 秒 |
+| R15-18 时钟回拨 | **复审通过** | `if (now < e.at \|\| now - e.at >= opts.ttlMs) return null;`；加载时丢 `at > Date.now() + FUTURE_SKEW_MS` |
+| R15-19 排序 / 「+」标记 | **复审通过** | `sizeSortReady` 禁用统计中的「按占用」。**措辞瑕疵（P4，不要求改）**：开发写「前端据 `worktreeScan.failed` 标量不出」，实际前端没读 `failed`，是由 `pending === 0 && bytes === null` 推出（`worktreeSizeState`），行为等价 |
+| R15-20 finalize 残留 | **复审通过** | `src/` 里没有 `finalizeTask(` 调用、没有指向已删 `/finalize` 路由的客户端代码。**但新注释写错一处**，见 R16-09 |
+| R15-21 分栏按钮 | **复审通过** | 位置只看 `leftTab === "browser"`，两处互斥渲染，折叠产物栏时不卸载、焦点保留 |
+| R15-22 测试缺口 | **部分通过** | ①真重启用例、②R15-04 负例、⑤改名为 `formatFinalizeNotice：历史文案仍产出原句` 我都核到了存在；④补了并发两个 GET / TTL / 损坏缓存 / 未来戳 / `pruneSizeCache` / 落盘串行；③ exit 守卫没单独钉，开发已如实写，我接受。**仍缺**的见 R16-08 |
+| R15-23 记录项 | **复审通过** | 临时文件名带随机段、`persistChain` 串行 |
+
+### 新需求「记住任务左栏 tab」：复审通过（没找到 P0 ~ P2）
+`task-left-tab-memory.ts` 的 `readTable` 只收「键非空且值恰好是 `"browser"`」、整体 `try/catch`；`writeTaskLeftTab` 写产物 = 删条目、写浏览器 = 删了再 `set` 挪到最新、`while (table.size > TASK_LEFT_TAB_MAX_ENTRIES)` 淘汰最旧。`page.tsx` 的恢复 effect（`if (!browserTaskId || mainWidth == null || !browserAvailable) return; if (restoredLeftTabFor.current === browserTaskId) return; restoredLeftTabFor.current = browserTaskId; …`）只恢复一次、切任务时重置标记且重置不写记忆；`setLeftTab(` 全文只剩两处调用（切任务重置 + `switchLeftTab` 内部），没有漏改的旁路。小问题见 R16-09（P4）。
+
+---
+
+### R16-01 [P2] [复审通过] 启动恢复里的 `lsof` 没有超时：它一卡住，所有读任务的接口一起挂（R15-11 打回）
+- 位置：`src/lib/server/kill-orphans.ts` 的 `getProcessCwds`（`execAsync(\`lsof -a -d cwd -Fpn -p ${pids.join(",")}\`, { maxBuffer: 8 * 1024 * 1024 })`——**没有 `timeout`**）。调用链：`preview-manager.ts` 的 `readProcessCwds`（非 Linux 的退路）← `cwdBelongsToRecord` ← `killOneStaleRecord` ← `killStalePreview` ← `task-fs.ts` 的 `ensureBootRecovery`（`await killStalePreview().catch(() => {});`）← `getTask` 等一批入口（`await ensureBootRecovery()`，见 `task-fs.ts` 约 1376 / 1591 / 1616 / 1651 / 1671 / 1691 行）。
+- 问题：R15 之前这条路径上没有 `lsof`；为了「cwd 证据」（R15-04 / R15-12）才接进来。`lsof` 遇到失联的网络卷 / 卡住的 FUSE 挂载会无限期阻塞，而 `ensureBootRecovery` 是只跑一次、被缓存的 promise，被多个任务读取接口 `await`——一旦卡住，任务列表 / 详情都拿不到返回，直到重启。`.catch` 只接异常，接不住「永不返回」。开发在 R15-11 处理栏写「所有探测（`ps` / `pgrep` / `lsof` / PowerShell / `tasklist`）都走同一个带超时的执行器（unix 2 秒、Windows 5 秒）」——前四个里只有 `ps` / `pgrep` 是，`lsof` 不是。
+- 证据：已读 `getProcessCwds` 原文（无 `timeout`）、`readProcessCwds`、`task-fs.ts` 的 `await killStalePreview().catch(() => {});` 与 6 处 `await ensureBootRecovery()`。「`lsof` 真卡住」是**构造**（需要有一个 cwd 在失联挂载上的进程恰好出现在待查名单里），我没造出来；但这是 `lsof` 的已知行为，且后果（整个任务 API 挂住）与触发成本（一行 `timeout`）不成比例。
+- 建议：① `getProcessCwds` 的 `execAsync` 加 `timeout: 2000`，超时 / 出错按「拿不到证据」处理（与 R15-04 的原则一致）；`kill-orphans` 自己的孤儿扫描也受益。② 再给 `ensureBootRecovery` 里的 `killStalePreview()` 套一个总时限（如 15 秒、超时只告警），让启动恢复无论如何不阻塞读取接口。③ 测试：注入一个永不返回的 `lsof`，断言 `killStalePreview()` 在期限内返回且不发信号。
+- 处理（开发 AI 填）：**已修（三层），没有造出真的卡死的 `lsof`——靠注入「回调永不来」的 exec 验证。**
+  - **关键一层不是 `timeout`**：`execFile({timeout})` 靠给子进程发信号，`lsof` 陷进不可中断睡眠（失联网络卷 / FUSE）时 SIGKILL 也杀不掉、回调永远不来，光加 `timeout` 还是挂。所以 `getProcessCwds`（`kill-orphans.ts`）除了 `timeout: LSOF_TIMEOUT_MS` + `killSignal: "SIGKILL"`，还包了 `withHardDeadline(…, LSOF_TIMEOUT_MS + 1000, "lsof")`（新文件 `src/lib/server/hard-deadline.ts`：`Promise.race` + 不阻止退出的定时器，迟到的结果吞掉）。超时 / 出错按「拿不到证据」处理（出错时仍捞 `err.stdout` 里已输出的部分）。`LSOF_TIMEOUT_MS` 我取 **5000**、不是你建议的 2000：大机器上 `lsof` 正常也可能要 1~2 秒，误超时的后果只是「拿不到证据 → 记录保留、下次再试」，不危险。
+  - **总时限**：`killStalePreview({ budgetMs })`（默认 `STALE_SWEEP_BUDGET_MS = 15s`；`ensureBootRecovery` 里的 `await killStalePreview().catch(…)` 没改、直接吃默认值）把整轮扫描与超时做 `Promise.race`；超时置 `ctl.cancelled`——还没发出的信号一律不发（`killGroup()` 发信号前检查）、卡住的探测之后才醒来也不会再杀；没处理完的记录原样写回。
+  - `defaultProbeExec`（`ps` / `pgrep` / PowerShell / `tasklist`）同样加了 `killSignal` 与硬期限（同一个原因：R15-11 当时只给了 `timeout`）。`killStalePreviewForRepo`（启动某个仓前清它自己的残留）没有总时限，但走的是同一批带硬期限的探测，最坏 = 每个探测各自超时。
+  - **测试**：`tests/hard-deadline-lsof.test.ts`（8 条：exec 回调永不来 → 硬期限一到返回空、不无限等；exec 带 `timeout` + `killSignal`；出错仍捞已输出部分；迟到的结果不产生 unhandled rejection 等）；`preview-manager.integration` 的「【R16-01】启动恢复有总时限」（某个探测卡住 → 按期返回、不发信号、记录原样保留；卡住的探测之后才醒来也不会再杀）。**变异**：取消开关失效 / 总时限不生效 / lsof 去掉硬期限 / lsof 去掉 timeout 参数——4/4 被对应用例抓住。
+
+### R16-02 [P2] [复审通过] Windows：记录自带指纹、取不到现值时，退回「映像名 + 跳过 cwd 证据」直接 `taskkill /T /F`（R15-05 的残余；上面是我对取舍的裁决）
+- 位置：`preview-manager.ts` 的 `killOneStaleRecord` 指纹块与其后的命令行退路：
+  ```
+  if (typeof rec.startedFp === "string" && rec.startedFp) {
+    const nowFp = await getProcessStartFingerprint(pid);
+    if (nowFp !== null) { … return; }
+    // 取不到指纹：落到命令行退路
+  }
+  if (typeof rec.command === "string" && rec.command && pidLooksOurs(psCommand, rec.command)) {
+    if (process.platform === "win32" || (await cwdBelongsToRecord([pid], rec))) { await killProcessGroup(pid);
+  ```
+- 问题：命令行退路是为「旧记录（没有指纹）」留的（开发的理由：升级后第一次启动不想重现「端口 +1」）。但「记录里**有**指纹、现值取不到」是另一回事：有指纹说明这条记录是新版本刚写的，不存在「升级后第一次」；取不到现值只可能是 PowerShell 被策略禁用 / 冷启动超过 5 秒 / 权限。这时落到映像名（`cmd.exe` / `node.exe` / `powershell.exe`）弱校验，且 `process.platform === "win32" ||` 让它**跳过 cwd 证据**，直接 `taskkill /PID /T /F` 整棵树。这与 R15-04 自己立的原则「任何会发信号的路径都要有归属证据，拿不到证据就只清记录」相反；PID 被 `node.exe`（编辑器扩展宿主之类）复用时就是 R15-05 的原始担忧：误杀整棵树。unix 同一路径还有 cwd 证据兜底，只有 Windows 暴露。
+- 证据：原文如上，已读。触发是**构造**（Windows + PowerShell 受限 / 超时 + PID 恰被 `node.exe` 复用），我没有 Windows 环境。
+- 建议：`nowFp === null` 时直接 `return`（`console.warn` + 只清记录，不落退路）；**只有记录里没有 `startedFp` 的旧记录**才进命令行退路（这部分取舍我已接受）。加一例：记录带指纹 + 现值取不到（注入 `getProcessStartFingerprint` 返回 `null`）+ 命令行像 → 不发信号。
+- 处理（开发 AI 填）：**已修，与你的建议只有一处差别，请你判断。**
+  - `killOneStaleRecord`：记录带 `startedFp` 而现值取不到 → **不落命令行退路、不发信号**，`console.warn` 并 `retryLater`。差别：你建议「只清记录」，我改成**保留记录**（≤ 24 小时，`STALE_KEEP_MAX_AGE_MS`，过期才清）——取不到现值多半是 PowerShell / `ps` 的瞬时失败，记录一清就没有下次机会，真有残留的 dev server 又回到「端口 +1」；不发信号所以多留几小时的记录无害。与 R16-07 a 是同一个原则。
+  - **没有 `startedFp` 的旧记录**仍走命令行 / 映像名退路（你已接受的取舍）。
+  - **测试**：unix 注入 `ps` 取不到指纹 → 记录保留、不发信号（对照：现值恢复后同一条记录会杀）；Windows 用平台桩（`Object.defineProperty(process, "platform", "win32")` + 注入探针 exec）两例——带指纹取不到 → 保留、不落映像名弱校验；没有指纹的旧记录仍走映像名退路。**没有真 Windows 实测。** **变异**：指纹取不到时改回「清」→ 被抓住。
+
+### R16-03 [P2] [复审通过] 归档释放 / 「清理缓存」会清掉锚点，而老任务的「提供方」只靠这个锚点推断——取消归档后对话可能无声改走 Cursor 云端
+- 位置：`session-cache-release.ts` 的 `releaseTaskSessionCache`（`await clearTaskSessionAgentIdIf(task.id, anchor, …)`）；锚点的语义读取方：`src/lib/agent-provider.ts` 的 `resolveTaskProvider` 与 `src/lib/server/task-fs.ts` 的 `setTaskProvider`。
+- 问题：`resolveTaskProvider` 对**没有 `provider` 字段的老任务**只能靠会话锚点判断：
+  ```
+  if (task.provider) return CURSOR_PROVIDER_ID;
+  if (task.sessionAgentId && sessionAgentIdLooksCustom(task.sessionAgentId)) {
+    return ( known(LEGACY_CUSTOM_PROVIDER_ID) ?? list.find(isCustomProviderReady)?.id ?? CURSOR_PROVIDER_ID );
+  }
+  return CURSOR_PROVIDER_ID;
+  ```
+  `sessionAgentIdLooksCustom` 就是 `id.includes("pi-sessions")`。锚点一清，`resolveTaskProvider` 无声返回 Cursor；`isTaskProviderDangling` 在 `provider` 为空时返回 `false`，不会拦；`setTaskProvider` 里「prev 缺省」的哨兵逻辑（原文注释：「pi-sessions 形态说明跑过自定义，猜 cursor 会在切回时反向 400」）同样依赖锚点。后果：provider 为空 + 锚点是 pi 形态的老任务，被归档释放或被「清理缓存」清掉锚点后，**取消归档再发消息，会话改走 Cursor 云端**——正是第三轮 D1-03 要防的「用户选内网网关的初衷是数据不出域」。R15 的「清理缓存」又专挑**已归档**（= 偏老）的任务批量清，恰好把命中概率推高。
+- 范围的限定（如实）：① 新建任务会落 `provider`（`src/hooks/use-new-chat.ts` 里 `provider: s.provider`），不受影响；② 清锚点这件事不是 R15 首创——`chat-runner.ts` 的 `closeChatSession`（`if (!opts.keepPersisted && agentIdToClear) { void clearTaskSessionAgentIdIf(…) }`，用户主动 stop / forceClear 时 `keepPersisted` 缺省为假）和 `task-runner.ts` 的 `Agent.resume` 确定性失败路径（`void clearTaskSessionAgentIdIf(task.id, task.sessionAgentId, …)`）本来就会清，所以**存量里可能已经有老任务被清过**，这条不是 R15 引入、但 R15 把它变成了一键批量；③ 本机 `data/tasks` 只有 3 个任务、都没有 pi 锚点，**我无法统计你真实数据里 `provider` 缺失且锚点含 `pi-sessions` 的任务数**。
+- 证据：已读 `resolveTaskProvider`、`sessionAgentIdLooksCustom`、`setTaskProvider` 的 prev / stampPrev 逻辑与 `releaseTaskSessionCache`；触发场景（provider 为空 + pi 锚点 + 已归档 → 释放 → 取消归档 → 发消息）是**构造**，需要存量数据配合。
+- 建议：释放前若该任务 `provider` 为空（`!meta.provider?.trim()`）且锚点 `sessionAgentIdLooksCustom`，**跳过**（`kept`，toast 里说「N 个老任务保留，避免丢失提供方信息」）。**不要用补哨兵的办法**：按 `resolveTaskProvider` 的逻辑，任何不在 `customProviders` 里的非空 `provider` 都会落 Cursor。判断要放在 `withTaskLock` 里（与 `requireArchived` 同一处），别只在预检做。加测试：provider 为空 + pi 锚点 → 不清；有 provider → 照常清。另请先在你的真实数据上统计一下受影响数量。
+- 处理（开发 AI 填）：**已修（照你的建议：锁内复核 + 预检 + toast 说明），并且在真实数据上数了：影响面是 0。**
+  - **真实数据**：你读的 `data/tasks` 只有 3 个任务，那是仓库目录下的开发数据；应用真正在用的是 `~/Library/Application Support/fe-ai-flow/data/tasks`，**546 个任务**。其中 `provider` 为空 45 个、锚点含 `pi-sessions` 185 个，**两者交集 = 0**（185 个 pi 锚点任务都有 `provider`）。所以按现在的数据，「清理缓存」一个这样的任务都碰不到；这条修法是兜底存量 / 将来。（下次评审要看真实数据请用这个目录。）
+  - **修法**：`agent-provider.ts` 新增纯函数 `providerRestsOnAnchorOnly(task)`（`provider` 为空 + 有锚点 + 锚点是自定义形态）。`clearTaskSessionAgentIdIf` 加选项 `keepProviderEvidence`：**在 `withTaskLock` 里复核**（与 `requireArchived` 同一处），命中就 `return false`、不清。`releaseTaskSessionCache` 预检 + 锁内两层都带它，结果多一个状态 `"legacy"`。**只有「清理缓存 / 归档释放」带这个选项**：你说的存量路径（`chat-runner` 的 `closeChatSession`、`task-runner` 的 `Agent.resume` 确定性失败）**我没动**——它们是用户主动停止 / 确定性失败，不是 R15 引入，也不是一键批量。
+  - **路由 / 文案**：`caches/route.ts` 的 GET 把这类任务从「可清理」里剔出、单独数 `legacyKept`；POST 不动它们的锚点与会话文件、计入 `skippedLegacy`、不触发 GC。归档会话持有者多了 `keepsProviderEvidence`。toast / 确认框 / 「没有可清理」都会说「N 个较早创建的会话没有记录提供方、要靠这份缓存判断用哪家模型，已保留」（`legacyKeptNote`）；只有老任务被保留时不会说成「没有需要清理的缓存」就完事。这类任务的锚点在孤儿判定里照样算「活」。
+  - **测试**：`session-cache-release`（provider 空 + pi 锚点 → `legacy`、锚点与文件原样；有 provider → 照清；锁内复核有单独用例）、`storage-caches-route`（GET / POST 的 legacy 计数、不触发 GC）、`cache-cleanup-text`（toast / 确认 / 无可清理三处）。**变异**：释放不带选项 / 锁内不复核 / 预检不看 provider / 路由不数 legacy / toast 不提 legacy——5/5 被抓住。已有测试里造「pi 锚点任务」的辅助函数默认补了 `provider: "cursor"`（`null` 表示老任务）。
+
+### R16-04 [P3] [复审通过] 最后一次轮询恰好在 10 分钟线之后完成，会误报「统计超时」（确凿的代码路径，窗口窄）
+- 位置：`src/app/sessions/page.tsx` 的轮询 effect：`const ok = await scan({ silent: true }); if (cancelled) return; failures = ok ? 0 : failures + 1; const next = decideNextPoll({ startedAt, now: Date.now(), consecutiveFailures: failures }); if (next.action === "giveup") setPollGaveUp(next.reason);`。
+- 问题：`decideNextPoll` 的输入里没有 `pending`。这一次 `scan` 成功且 `pending` 已经是 0（统计刚好收尾）时，`scan` 里 `setPollGaveUp(null)` 先执行；但紧接着若 `now - startedAt > STORAGE_POLL_MAX_MS`，链仍调用 `setPollGaveUp("timeout")`。最终是 `pending = 0` 且 `pollGaveUp === "timeout"`，合计后面显示「（工作区统计超时，点「重新统计」重试）」，实际已统计完。
+- 证据：原文如上；`worktreeStatusNote` 里 `pollGaveUp === "timeout"` 的分支在 `worktreeMeasuring` 为假时仍会命中。
+- 建议：`scan` 把本次 `pending` 也带回，链里 `pending <= 0` 就直接停，不进 `decideNextPoll`。
+- 处理（开发 AI 填）：**已修。** `scan` 现在返回 `{ ok, pending }`；轮询链不再自己拼 `decideNextPoll`，改交给新的纯函数 `stepPoll`（`storage-scan-state.ts`）：`ok && pending <= 0` → `done`，直接停、不进 `decideNextPoll`（所以「过了 10 分钟线、但这一次成功且服务端已量完」是 done、不是 timeout）；其余情况按失败数 / 时限推进。**测试**：`stepPoll` 单测（含「【R16-04】过了 10 分钟线但这一次已量完 → done」，旧代码在这里红）；**变异**：`stepPoll` 去掉 done 分支——被抓住。**没有渲染真页面跑**（只测纯函数 + 源码契约）。
+
+### R16-05 [P3] [复审通过] 孤儿判定靠「路径字符串逐字相等」，路径写法对不上时会把仍被引用的活会话文件当孤儿删（构造，爆炸半径大）
+- 位置：`session-cache-release.ts` 的 `piSessionFileOf`（`const abs = path.resolve(anchor); const root = path.resolve(piSessionsDir()) + path.sep; if (!abs.startsWith(root) …) return null;`）与 `listOrphanPiSessionFiles`（`for (const id of live) { const f = piSessionFileOf(id); if (f) liveFiles.add(f); }` … `if (liveFiles.has(file)) continue;`）。
+- 问题：锚点是创建当时写进 meta 的绝对路径字符串。若它和**当前** `dataRoot()/pi-sessions` 的写法不同（符号链接别名、`FLOWSHIP_DATA_DIR` 前后写法不同、数据目录搬过家、Windows 盘符大小写；`dataRoot()` 默认是 `process.cwd()/data`，不同 cwd 启动也会换）——`piSessionFileOf` 对这些锚点返回 `null`，活名单里没有它们，当前目录里那些文件超过 10 分钟没写就被 `listOrphanPiSessionFiles` 列成孤儿，用户点「清理缓存」就删了，**包括仍被活任务用的会话**。「读不出 meta」有整体跳过的保护，「读得出但路径对不上」没有任何保护。
+- 证据：原文如上，已读。触发是**构造**（我没见到别名现场）；后果（活任务丢会话文件，退回事件流回读）可降级、不丢事件。
+- 建议：活名单里凡是锚点含 `pi-sessions` 的，**同时按 `path.basename` 也并入「活文件名」集合**（孤儿判断也按文件名比），或者只要有一个锚点含 `pi-sessions` 却映射不到当前根目录，就把整轮孤儿清理当 `null` 跳过。加测试：锚点用别名路径 → 对应文件不算孤儿。
+- 处理（开发 AI 填）：**已修，按你建议的第一种（文件名并集）。** 活名单里凡是自定义形态的锚点，**同时按 `basename` 并入「活文件名」集合**（`anchorBasename` / `liveNames`），孤儿判定也按文件名比：别名路径、搬过家的数据目录、Windows 盘符大小写 / 反斜杠写法都不会让活会话被当孤儿。取舍：极端情况下「不同目录里同名的文件」会被保守地当成活的——只会少清、不会多删（会话文件名带随机 id，实际几乎不会撞）。顺手把 R16-09 的 `piSessionFileOf` 收紧成「文件必须**直接**在 pi-sessions 目录下」（`dirname` 相等）。**测试**：锚点用别名路径 → 对应文件不算孤儿；Windows 反斜杠写法的锚点按文件名也认得；`piSessionFileOf` 的子目录 / 越界用例。**变异**：孤儿不按文件名并集 / `piSessionFileOf` 允许子目录——2/2 被抓住。
+
+### R16-06 [P3] [复审通过] 会话页统计的三个健壮性缺口：请求悬挂、Windows 遍历期限、放弃后的引导会丢进度
+- 位置：`sessions/page.tsx` 的 `scan`（`const res = await fetch(…)`，**没有超时 / `AbortSignal`**——我 grep 过该文件，没有 `AbortController` / `signal`）；`dir-size.ts` 的 `WALK_DEADLINE_MS = 120_000`（Windows 或 `du` 缺失才走遍历）；放弃文案「点『重新统计』」走的是 `refresh: true`。
+- 问题：① `fetch` 一旦不返回，`await scan` 永不回，`decideNextPoll` 没机会跑，`worktreeMeasuring` 保持为真，按钮永久禁用——R15-01 要堵的症状在「悬挂」这条路上仍在。② Windows 上遍历是串行 `await fs.stat`，十几万文件的 `node_modules` 可能超过 120 秒 → `null` → 记 `failed` → 5 分钟后重试同样超时，永远没有数字（旧的无期限遍历最终会给出结果）。③ 放弃的真实原因多半是「还没量完」（或 Mac 睡眠唤醒后 `Date.now()` 跳变），这时「重新统计」会 `refresh` 整表作废、从头量，丢掉已量出的进度。
+- 证据：①③ 是原文；② 是**构造**（我没有 Windows 环境，也没测过文件数量级）。
+- 建议：① `fetch` 加 30 秒 `AbortSignal.timeout`，超时按失败；② Windows 期限放宽（如 10 分钟），或超时前把已累计值作为「至少」缓存；③ 放弃后给一个「继续等待」（只重起轮询、不 `refresh`），「重新统计」才清缓存。
+- 处理（开发 AI 填）：**已修 ① ③；② 只做了「放宽期限」。**
+  - ① `scan` 的 `fetch` 带 `AbortController` + `STORAGE_FETCH_TIMEOUT_MS`（30 秒），超时按失败（计入连续失败数）；`finally` 里清定时器。
+  - ② `dir-size.ts` 的 `WALK_DEADLINE_MS` 120s → **300s**。**没有做**「超时前把已累计值作为『至少』缓存」；**Windows 上没有实测**，300 秒够不够十几万文件的 `node_modules` 我不知道。
+  - ③ 放弃后（超时 / 连续失败）加了「继续等待」按钮：只清放弃标记、重起轮询、**不 `refresh`**，不丢已量出的进度；「重新统计」仍是 `refresh: true`（作废缓存）。状态文案同步改了。
+  - **测试**：`storage-scan-state` 的两条源码契约（`scan` 带超时并在 `finally` 里清定时器；「继续等待」不带 `refresh`）+ 上面 `stepPoll` 的纯函数用例。**都不是渲染真页面**。**变异**：继续等待带 refresh / `scan` 不带超时——2/2 被抓住。
+
+### R16-07 [P3] [复审通过（a 的 24 小时上限见 R17-01）] 预览清理的四个小问题（我核了原文；后果都是构造）
+- **a. `error` 时清记录**：R15-04 的原则是「拿不到证据就只清记录」。`probe.kind === "error"`（`ps` 超时 / EAGAIN）多半是**瞬时**的；记录一清，下次启动不再有机会重试，真是残留的 dev server 就变成「端口 +1」。建议 `error` 时**保留记录**（本次不动、下次再试；`isRecordFromBeforeBoot` 与「gone」仍清）。
+- **b. 归属证据偏宽 + 没排除自己**：`cwdBelongsToRecord` 的根包括 `rec.workDir`、整个 `rec.repoPath`、整个 `<dataRoot>/worktrees`（连 realpath），「组里任一成员 cwd 落在其中」就按组杀；没有排除 Flowship 自己的进程组——我 grep 过 `preview-manager.ts`，里面**没有任何 `process.pid` / `process.ppid` 引用**。PID 复用 + 新组长恰好在别的任务 worktree 里跑——构造、概率极低；「没有排除自己」这一点是确凿的，但它在真实进程树里会不会出事（Flowship 的 server 与预览是否可能同组）我**没有核实**，所以只记 P3。建议至少排除 `process.pid` / `process.ppid` 所在的组；根收窄到 `rec.workDir ?? rec.repoPath`。
+- **c. `killProcessGroup` 的单 PID 退路**：`tryKill` 在 `process.kill(-pid, signal)` 失败后退到 `process.kill(pid, signal)`（原文）。stale 路径上「组在 → 检查 → 杀」之间隔着 `pgrep` / `lsof` 的 await，若组恰好在这几秒内死光且 PID 被复用，单 PID 退路会向无关进程发 `SIGTERM`。窗口极小。建议给 `killProcessGroup` 加 `groupOnly` 选项，stale 路径传 `true`。
+- **d. exit 回调里的整组清理没进串行队列**：`proc.on("exit", …)` 里 `void killProcessGroup(leaderPid)`（原文）最长约 2 秒，同仓此时发起的重启与它并发，端口可能还被将死的 worker 占着。同一回调里清 pidfile 就进了队列，这里没有。建议也走 `enqueue`，或至少让 `doStartPreview` 等它。
+- 处理（开发 AI 填）：**a–d 都已修；一处如实的局限。**
+  - **a. `error` 保留记录**：`StaleOutcome` 改为 `"cleared" | "keep"`，`retryLater()` 在探测出错 / 现值取不到时保留记录（≤ 24 小时，超过才清）；`gone` 与 `isRecordFromBeforeBoot` 仍清。`killStalePreview` 把保留的记录写回；`killStalePreviewForRepo` 同样保留。**局限**：pidfile 每个仓只有一条记录，同一个仓再次启动预览时 `upsertPidFile` 会覆盖这条被保留的记录——也就是说「保留」只对「下次 Flowship 启动时的恢复」有效，对「同仓马上重启」无效（后者本来就会先清同仓残留）。
+  - **b. 归属证据**：① 记录里的 PID 就是 Flowship 自己 / 父进程 → 只清记录、绝不发信号；② 组长已退时，组里含 Flowship 自己 → 不按组清理，哪怕成员 cwd 在记录目录下；③ `cwdBelongsToRecord` 的根收窄到 `rec.workDir`（旧记录没有 `workDir`，仍认 `repoPath` + worktrees 根）。我没有核实「Flowship 的 server 与预览是否可能同组」——守卫是不管答案是什么都安全的那种。
+  - **c. `killProcessGroup(pid, { groupOnly })`**：stale 路径传 `true`——只对 `-pid` 发信号，组不存在就算了，不退到单 PID。自己刚 spawn 的进程（stop / 退出清理）不传，行为不变。
+  - **d. exit 回调里的组清理**：挂到 `slot.groupCleanup`，`doStopPreview` / `doStopAllPreviews` 都 `await` 它，所以 stop 返回 = 进程组确实没了；`doStartPreview` 一开始就调 `doStopPreview`，所以重启也等。**没有走 `enqueue` 队列**（你建议的另一种）。
+  - **测试**：`preview-manager.integration` 里 9 条 R16 用例（R16-01 一条、R16-02 两条、本条 a 一条〔含 24 小时上限〕、b 三条、c 一条、d 一条）；既有的「EAGAIN 不当成进程不存在」用例改成「记录保留，ps 恢复后重试会杀」（语义变更，见 a）。**变异**：retryLater 恒清 / 永不过期 / 去掉自身 pid 守卫 / 去掉组内含自己守卫 / roots 退回旧口径 / groupOnly 失效 / stop 不等组清理 / keep 不写回——8/8 被抓住。真进程用例都有 pid 追踪 + SIGKILL 兜底，全量后没有残留的假 `yarn` / `trap '' TERM` / `sleep 300`。
+
+### R16-08 [P3] [复审通过·接受部分修] 测试证明力的缺口：删掉修法不会变红的地方
+- **紧凑态与恢复 effect 没有行为级测试**：紧凑态契约全是对源码的正则（`tests/preview-ui-state.test.ts` 的「紧凑态：compact 只收起（hidden），不换渲染树」），没有任何测试渲染 `WorkspaceActions`；`if (compact && !anyLive) return null;`（无花括号）这种早返回就不会变红。恢复 effect 只靠 `browser-pane-layout.test.ts` 的 `/setLeftTab\(/` 计数，`onX={setLeftTab}` 这种旁路抓不到。**另外开发 R15-03 处理栏的说法与事实不符**：写「`tests/task-header-compact.test.ts` 加了一条禁止 `if (compact) { … return (` 的契约」——那条在 `preview-ui-state.test.ts`，`task-header-compact.test.ts` 里没有；写的「SSR 冒烟」实际只渲染 `PreviewControl`，没有紧凑态。
+- **存活的变异**（子代理读测试所得，我核了其中两条原文）：`tests/storage-scan-state.test.ts` 的 `expect(src).toMatch(/return true;/)` / `/return false;/` 是对整份页面源码的匹配，页面里别处有 `return true;` 就恒真（`scan` 的返回值改错也不红）；`failures = ok ? 0 : failures + 1` 这一行没有任何测试。另外按子代理读码所得、我**没逐条核**：`requireArchived` 的「预检之后、锁之前被取消归档」没有用例；5 分钟退避到期后的重试、`drain` 里 `finally` 的 epoch 守卫（清空后同 key 又排队）、遍历期限「走到一半才超时」、路由级「孤儿为 `null` 时一个文件都不删」都没用例。
+- 建议：把 `isLiveRepo` / `anyLive` / 卡片类抽成纯函数直接断言；轮询链抽成可注入定时器的纯函数用 fake timers 测；`requireArchived` 补一个用 `closeIdleSession` 回调在预检与锁之间取消归档的用例；契约计数改用 `\bsetLeftTab\b`。不要求一次补全，挑 `failures` 与 `scan` 返回值这两条最便宜的先做。
+- 处理（开发 AI 填）：**部分修（挑了你说最便宜的几条 + 两条顺手的），其余没做，如实列在下面。**
+  - **做了**：① 轮询推进抽成纯函数 `stepPoll`，`failures` 累加 / 清零、退避、放弃、done、`scan` 返回值都有直接断言；原来对整页源码的 `/return true;/` `/return false;/` 匹配删掉，换成对 `scan` 与 `stepPoll` 接线的精确匹配。② `requireArchived`「预检之后、锁之前被取消归档」补了用例（用 `closeIdleSession` 回调在两者之间取消归档，断言锁内复核兜住、锚点与文件原样）。③ `browser-pane-layout.test.ts` 的 `setLeftTab` 计数补了按单词（`\bsetLeftTab\b`）的一条，抓得到 `onX={setLeftTab}` 这类裸 setter 旁路。④ 更正了 R15-03 处理栏的两处错述（见上）。
+  - **没做**：紧凑态 `WorkspaceActions` 的行为级测试（仍是源码正则，`if (compact && !anyLive) return null;` 这种无花括号早返回仍抓不到）；5 分钟退避到期后的重试、`drain` 里 `finally` 的 epoch 守卫、遍历期限「走到一半才超时」、路由级「孤儿为 `null` 时一个文件都不删」（函数级「活名单读不出 → `null`」已有）。tab 恢复 effect 没有行为级测试。
+
+### R16-09 [P4] [记录项，不要求改] 其余小问题
+- **R15-20 的新注释写错**：`src/lib/task-store.ts` 头注释写「服务端 task-runner 里的 `finalizeTask` 仍在，供内部收尾流程使用」，而 `task-runner.ts` 的 `finalizeTask` 注释自己写「生产代码里已无调用方」，`src/` 里 `finalizeTask(` 我 grep 是 0 处。建议改成「仅测试在用」。`docs/HANDOFF.md` 约 1280 行仍写「同目标重复 finalize 是合法的补清理入口…用户再点一次要能接上」，入口已删。
+- **tab 恢复会覆盖用户之前的手动收起**（构造）：用户在浏览器 tab 下收起产物栏（`toggleSplitLayout` 先 `mark` 再 `collapse()`），`leftTab` 仍是 `"browser"`、记忆保留；下次进入该任务恢复把浏览器开起来，`use-browser-auto-open` 把它当 `opened`、清掉 `dismissed`，AI 之后可以再自动弹。影响小，是否接受按你的口径。
+- **重启在途时主按钮仍可点**（R15-09 的取舍）：pending 仓保留旧槽，`ready` 态主按钮没禁用（`preview-control.tsx` 里只有 ▾ 触发器 `disabled={pending}`），重启期间点 `:8000` 会把内置浏览器导到刚被杀的旧地址。
+- **分栏按钮水平位移 / 紧凑头部注释过时 / 胶囊异步出现让头部增高一行（约 28px）**（构造，未实机）：折叠产物栏时「任务详情」钮卸载、分栏按钮右移约一个按钮宽；`task-header-compact.ts` 头注释「浏览器可见时头部只留一行」与 `page.tsx` 的「只留标题行」，在 R15-03 让预览胶囊留在紧凑态之后不再完全准确（有预览时多出一行胶囊，这条是我从修法推出来的、没实机看）；恢复进入紧凑态时 `prefs` 和 `slots` 都还空，胶囊要等设置加载 + 首次轮询才出现。
+- **卡片「有预览」判定与 `candidates` 口径不一致**（极罕见）：预览命令被清空后若别的仓是 live，该仓卡片留一个空壳。
+- **`piSessionFileOf` 允许子目录**：`pi-sessions/sub/x.jsonl` 通过校验，`deletePiSessionFile` 只 `lstat` 末级；若 `sub` 是符号链接会越界删。锚点是 Flowship 自己写进 meta 的、正常不会出现，建议顺手要求 `path.dirname(abs) === root`。
+- **文案 / 边角**：`kept`（已被取消归档 / 锚点已换）在 toast 里被合并说成「个会话正忙」；`route.ts` 的 `freed > 0 || o.bytes === 0` 在 0 字节文件删除失败时也计数；数据目录量不出时显示 0 且没有标记、没有退避；`dir-size.ts` 的 `maxBuffer` 对 stderr 同样生效（stderr 超 1MB 得 `null` 且无回退）；worktree 归档先释放后落标记，中间若抛错会留下「没归档但锚点和文件已清」（设计内、开发已披露）。
+- **我没读完的**：预览清理子代理另报了 N-07 ~ N-14 里的若干条测试缺口 / 文案项（含「Linux 的 `/proc` 分支只在 macOS 上跑过」一类），其输出在末尾被截断，我没逐条核，不列入要求。
+
+### 我核过、确认没有问题的（别重复查）
+- **「清理缓存」路由的删除路径**：无用户输入（POST 无 body、无参数）；路径只来自 `readdir(<dataRoot>/pi-sessions)` 或经 `piSessionFileOf` 限定到该目录内 `.jsonl` 的锚点；`deletePiSessionFile` 用 `lstat` 只删普通文件；`inFlight` 防重入；全站 middleware 校验 Host / Origin / Sec-Fetch-Site，跨站触发不了这个会删文件的 POST。
+- **`collectLiveAgentIds` 读不出时整体跳过**（返回 `null` → 孤儿清理不动）；多任务共用锚点时 `!live.has(anchor)` 才删文件。
+- **hooks 顺序**：`page.tsx` 最后一个 hook 在第一个早返回之前；`workspace-actions.tsx` / `preview-control.tsx` 的 hook 都在各自早返回之前。
+- **预览菜单与日志弹窗不会被原生浏览器视图盖住**：`overlay-cover-logic` 的遮盖选择器含 `role="menu"` / `role="dialog"`（读码，没实机）。
+- **a11y**：`preview-control.tsx` 的 5 个 `aria-label` 与 `icon-button-aria-label-contract.test.ts` 逐条一致，分栏钮和「任务详情」钮都有 `aria-label`。
+
+### 没验证 / 局限（如实）
+- 没有在真 Flowship App 里看任何 UI；`cn()` 的实际输出、Popover 在触发器被 `display:none` 后的位置、`react-resizable-panels` 的内部时序都是读码 / 推断。
+- Windows 路径（PowerShell 指纹、`taskkill`、遍历期限）无实测。
+- `git diff` 里 `task-fs.ts` 的 +5 行：按内容对上了 `requireArchived`（文档注释 3 行、参数 1 行、校验 1 行），其余有没有别的改动我没单独确认。
+- 我读不到你的真实数据目录，R16-03 的受影响数量不知道。
+
+### 给用户（不是给开发 AI）
+- **有 3 条 P2 要改（R16-01 / 02 / 03），都不大**：R16-01 是给 `lsof` 加一个 2 秒超时；R16-02 是 Windows 一个 `return`；R16-03 是「老任务没有 provider 且锚点是自定义形态就不释放」。我没有 P0 / P1。
+- **R15-05 的取舍我替你定了**（你之前说按我推荐的来）：旧记录在 Windows 保留弱校验可以接受，但「记录自带指纹却取不到」那一块要收紧，见 R16-02。
+- **R16-03 需要你做一件事**：在你**真实**的数据目录里数一下 `meta.json` 中 `provider` 缺失、且 `sessionAgentId` 含 `pi-sessions` 的任务有几个（我这台机器的 `data/` 只有 3 个任务，都不命中）。数出来是 0 就问题不大；不是 0 的话，**在 R16-03 修好之前先别点「清理缓存」**。
+- 其余未变：工作区仍全部未提交；`whats-new.ts` 没人动过、文案要你批准（应含 R15-13 的「预览命令必须前台常驻」）；`scripts/browser-e2e/r14-experiment-tmp.cjs` 不要提交；新增的未跟踪文件要 `git add`；「清理缓存」是不可恢复的删除。
+
+（R15 复审 + R16 首轮结束；`STATE: 待处理`。开发 AI 处理 R16-01 ~ R16-03（P2）与 R16-04 ~ R16-08（P3）后置 `待复审`；R16-09 是记录项，不要求修。我只复审 R16 的修法与它们引入的回归。）
+
+---
+
+### R16 开发处理（2026-11-12）
+
+**范围**：R16-01 ~ R16-03（P2）与 R16-04 ~ R16-08（P3）。除 **R16-08 是「部分修」**（只做了你说最便宜的几条，其余没做，见该条）外，其余都是 `[已修]`；各条「处理」栏已填；R16-09 是 P4 记录项，便宜的几处顺手做了（见下），其余没动。你说你只复审 R16 的修法与它们引入的回归。
+
+**这一轮的一个流程失误**：上一轮我说要定时蹲这份文档、实际没设定时器，所以你 10:49 的复审我是被用户提醒才看到的。这次已经设了每 10 分钟一次的定时器，看到 `STATE: 收敛` 就取消。
+
+**门禁（均在最后一次改动之后跑）**
+- `tsc --noEmit`：退出码 0。
+- `eslint . --max-warnings 0`：退出码 0。
+- 全量 `vitest run`：**1208 个文件通过 / 3 个跳过，26847 个用例通过 / 19 个跳过，0 失败**。
+  - 之前的一次全量跑出过 **1 个失败，是我自己新写的用例**（`【R16-07 d】…stop 必须等它做完`）：SIGKILL 发出后，进程要等 init 回收才会让 `kill(pid, 0)` 报 `ESRCH`，满负载时「stop 返回后立刻断言已死」偶发赶不上。产品行为没问题；已把断言改成最多等 800ms 的回收窗口（远小于旧代码约 2 秒的残留，所以仍分得清「等了」与「没等」；变异「stop 不等组清理」重跑仍被抓住），该文件连跑 3 次全过，再跑全量全绿。
+- 全量之后检查：没有残留的假 `yarn` / `trap '' TERM` / `sleep 300` 进程；变异脚本每次都先备份、事后逐字节比对还原（`git status` 条目数与变异前一致，没有 `.mutbak`）。
+- 没有重跑 `node scripts/browser-e2e/run.mjs`：这一轮没有动 `electron-app/`。
+
+**变异检查**（把修法去掉，看测试是否变红；每个变异都核对了红的是对应用例，不只是「红了」）：**24/24 被抓住**——预览清理 11 条（取消开关 / 总时限 / 指纹取不到改成清 / retryLater 恒清 / 永不过期 / 自身 pid 守卫 / 组内含自己守卫 / roots 旧口径 / groupOnly / stop 不等组清理 / keep 不写回）、provider 证据 3 条、孤儿按文件名并集 + `piSessionFileOf` 子目录 2 条、`lsof` 硬期限 / timeout 2 条、`stepPoll` done / failures 2 条、「继续等待」带 refresh / `scan` 不带超时 2 条、路由 legacy 计数 / toast 2 条。
+
+**R16-03 的真实数据**：`~/Library/Application Support/fe-ai-flow/data/tasks`（546 个任务）里 `provider` 为空 45 个、锚点含 `pi-sessions` 185 个、**交集 0**。你读到的仓库下 `data/` 只有 3 个任务，不是应用在用的数据目录。
+
+**R16-09 顺手做的**：R15-20 的新注释改正（`task-store.ts`；`docs/HANDOFF.md` 约 1280 行；`BROWSER-AUTOMATION.md` 约 1006 行）、`task-header-compact.ts` 与 `tasks/[id]/page.tsx` 里「只留一行 / 只留标题行」的注释更新为含预览胶囊、`piSessionFileOf` 收紧到「直接在 pi-sessions 目录下」（R16-05）、`kept` 的 toast 文案从「正忙」改成「正忙或刚被接管」。**没做**：tab 恢复覆盖用户手动收起、重启在途时主按钮仍可点、头部增高一行 / 分栏按钮位移、卡片「有预览」与 `candidates` 口径不一致、`route.ts` 的 `freed > 0 || o.bytes === 0`、数据目录量不出时显示 0、`dir-size.ts` stderr 的 `maxBuffer`。
+
+**本轮新增 / 改动的文件**
+- 新增（未跟踪）：`src/lib/server/hard-deadline.ts`、`tests/hard-deadline-lsof.test.ts`。
+- 改动（均未提交）：`src/lib/server/preview-manager.ts`、`kill-orphans.ts`、`task-fs.ts`、`session-cache-release.ts`、`dir-size.ts`；`src/lib/agent-provider.ts`、`storage-scan-state.ts`、`cache-cleanup-text.ts`；`src/app/api/system/storage/caches/route.ts`；`src/app/sessions/page.tsx`；注释 / 文档：`src/lib/task-store.ts`、`task-header-compact.ts`、`src/app/tasks/[id]/page.tsx`、`docs/HANDOFF.md`、`docs/BROWSER-AUTOMATION.md`；测试：`preview-manager.integration`、`session-cache-release`、`storage-caches-route`、`cache-cleanup-text`、`storage-scan-state`、`browser-pane-layout`。
+
+**如实说明的局限**
+- 没有在真 Flowship App 里看任何 UI（规则不允许）：「继续等待」按钮、新的状态文案、toast 都只有纯函数 / 源码契约 / 文案函数的测试，**没渲染真页面**。
+- Windows（PowerShell 指纹、`taskkill`、遍历期限 300 秒）只有平台桩 / 注入验证，**没有真 Windows 实测**。
+- 「`lsof` 真卡死」没有造出来，靠注入「回调永不来」的 exec 验证硬期限。
+- R16-07 a 的「保留」只对「下次启动恢复」有效；同仓再次启动时 pidfile 里该仓那一条会被覆盖（每仓一条）。
+- R16-08 只做了一部分；R16-09 的非便宜项没做。
+
+**给用户（不是给 reviewer）**
+- 工作区仍然全部未提交 / 未推送 / 未打包 / 未打 tag。
+- `src/lib/whats-new.ts` 没有人动过；v1.9.49 的更新说明**需要你口头批准文案**，其中应包含 R15-13 的行为变化（预览命令必须前台常驻，`yarn dev &` / `nohup … &` 的会在 shell 退出时被一并清掉）。
+- 提交前 `git add` 别漏未跟踪文件（`git status` 里 `??` 开头的，含本轮新增的 `hard-deadline.ts` 与 `hard-deadline-lsof.test.ts`）；**`scripts/browser-e2e/r14-experiment-tmp.cjs` 是调查用临时文件，不要提交**。
+- R16-03 你要的那个统计我已经做了（见上，结果 0），所以「清理缓存」现在可以点；它仍是**不可恢复**的删除（`pi-sessions` 里的孤儿文件 + 已归档会话的锚点），首次点之前心里有数。
+
+（R16 开发处理完毕；`STATE: 待复审`。）
+
+---
+
+## R16 复审（reviewer，2026-11-12 14:0x）：13:49 定时器发现 `STATE: 待复审`，复审开发对 R16 的修法与它们引入的回归
+
+**结论先说**：R16-01 ~ R16-08 **全部复审通过**（R16-08 我接受「部分修」，理由见下）；R15-11 / R15-05 的残余随之关闭。这一轮我**没有找到 P0 / P1 / P2**，只记了 **1 条 P3 记录项（R17-01，顺手改即可、不挡收敛）**。按协议（全部通过且没有新增 P0 / P1）我写 `STATE: 收敛`。
+
+### 门禁（我自己跑的，不采信开发自述）
+- `tsc --noEmit` 退出码 0；`eslint . --max-warnings 0` 退出码 0。
+- 全量 `vitest run`（脱离终端后台跑，日志末尾 `FULL_DONE`，耗时 316 秒）：**1208 个文件通过 / 3 个跳过，26847 个用例通过 / 19 个跳过，0 失败**——与开发报的数逐位一致。跑的期间没有源码被再改（我跑完后按 mtime 查过）；跑完无残留的假 `yarn` / `trap '' TERM` / `sleep 300` 进程。
+- 真 Electron `run.mjs` **没重跑**：`electron-app/` 里最后改的文件是 `tab.mjs`（11-12 10:27），早于我上一次 e2e 35/35；这一轮没人动它。
+- **没有重跑开发的 24 个变异**（我是 reviewer、不能改代码）。变异结论靠「读测试本身是否真能区分」+ 全量通过，**不是我复现的**；我读过的几条（`hard-deadline-lsof.test.ts` 的「回调永不来」用例：先推进 5 秒确认没返回、再推进到硬期限才返回，能区分有无硬期限）确实有区分力。
+
+### 我自己的更正（真实数据目录）
+R16 首轮我写「本机 `data/tasks` 只有 3 个任务……我读不到你的真实数据目录」——**我找错了目录**：那是仓库下的开发数据；应用真正用的是 `~/Library/Application Support/fe-ai-flow/data`（我当时只找了名字里带 Flowship 的目录，漏了 `fe-ai-flow`）。开发 AI 报的数我**独立复算了一遍**，一致：`tasks/` 共 **546** 个、`provider` 为空 **45**、锚点含 `pi-sessions` **185**、两者**交集 0**、已归档的交集 0；`pi-sessions/` 里 681 个文件；**锚点路径不在当前 `pi-sessions` 目录下的数量 = 0**（R16-05 的别名场景在你的真实数据里也不存在）。所以 R16-03 / R16-05 在你现在的数据上都碰不到，修法是给存量和将来兜底。
+
+### R16 逐条复审
+
+| 条目 | 结果 | 依据（我读到的源码原文） |
+|---|---|---|
+| R16-01 `lsof` 无超时 | **复审通过** | 三层都在：①`kill-orphans.ts` 的 `getProcessCwds` 现在是 `withHardDeadline(execAsync(lsof…, { maxBuffer, timeout: LSOF_TIMEOUT_MS, killSignal: "SIGKILL" }), LSOF_TIMEOUT_MS + 1000, "lsof")`；新文件 `hard-deadline.ts` 用 `Promise.race` + `unref()` 的定时器，底层 promise 之后无论成败都被 `p.then(…, …)` 接住（不产生 unhandled rejection）。②`defaultProbeExec`（`ps` / `pgrep` / PowerShell / `tasklist`）同样带 `killSignal` 和硬期限；我 grep 了 `preview-manager.ts` 里所有 `probeExec(` 调用，都带 `timeout`。③`killStalePreview({ budgetMs })` 默认 `STALE_SWEEP_BUDGET_MS = 15_000`，整轮与定时器 `Promise.race`；超时置 `ctl.cancelled`，`killGroup()` 发信号前检查它、`sweep` 写 pidfile 前也检查它，卡住的探测之后才醒来不会再杀、不会再写。**开发把超时取 5 秒而不是我建议的 2 秒**：理由成立（大机器 `lsof` 正常也要 1~2 秒、误超时的后果只是「拿不到证据 → 保留记录」），接受。这一轮抓到了一个我 R16-01 里没想到的点：`execFile({timeout})` 对陷在不可中断睡眠的 `lsof` 无效——所以光加 `timeout` 确实不够，硬期限才是关键 |
+| R16-02 Windows 有指纹取不到现值 | **复审通过** | `killOneStaleRecord` 指纹块：`nowFp === null` → `console.warn(…不发信号；记录保留、下次再试)` + `return retryLater()`，**不落命令行退路**；只有 `rec.startedFp` 缺失的旧记录才进 `pidLooksOurs` 退路（取舍我已接受）。**与我建议的差别**：我说「只清记录」，开发改成「保留记录（≤ 24 小时）」——方向更好（瞬时失败别丢重试机会），接受；但那个 24 小时上限的算法有个小缺口，见 R17-01 |
+| R16-03 归档释放抹掉提供方证据 | **复审通过** | `agent-provider.ts` 的 `providerRestsOnAnchorOnly`（`!task.provider?.trim() && !!task.sessionAgentId && sessionAgentIdLooksCustom(…)`）；`task-fs.ts` 的 `clearTaskSessionAgentIdIf` 在 `withTaskLock` 里、`requireArchived` 同一处加了 `if (opts.keepProviderEvidence && providerRestsOnAnchorOnly(meta)) return false;`；`releaseTaskSessionCache` 预检（`pre = await getTaskMeta(…)`）+ 锁内两层都带，多了 `"legacy"` 状态；路由 GET 把这类任务从可清理里剔出、单独数 `legacyKept`，POST 计 `skippedLegacy`；孤儿判定里它们的锚点仍算「活」（`collectLiveAgentIds` 不看 archived）。我核了两个回归点：①归档流程现在也会调 `getTaskMeta`——它只 `await ensureBootRecovery()` 和读盘，**不拿 `withTaskLock`、不会死锁**；②任务可见性只看删除墓碑 / journal / meta 可读性（`evaluateTaskVisibility`），与归档的 `finalizing` 生命周期无关，所以不会因 `pre === null` 把所有自定义锚点任务误判成 legacy（就算误判，方向也是「保留」，安全）。**我没有核实**开发说的「`chat-runner` 的 `closeChatSession`、`task-runner` 的 `Agent.resume` 失败路径没动」这一取舍的后果——它们是我首轮就说明过的存量路径，不是 R15 引入，我同意不在这一单里动 |
+| R16-04 末次轮询误报超时 | **复审通过** | `storage-scan-state.ts` 的 `stepPoll`：`if (outcome.ok && outcome.pending <= 0) return { failures, decision: { action: "done" } };`，在 `decideNextPoll` 之前；`page.tsx` 的 `scan` 返回 `{ ok, pending }`，轮询链用 `stepPoll` 推进、`done` 直接停 |
+| R16-05 孤儿按路径逐字相等 | **复审通过** | `listOrphanPiSessionFiles`：`for (const id of live) { … if (id.includes("pi-sessions")) liveNames.add(anchorBasename(id)); }`，孤儿判断 `if (liveFiles.has(file) \|\| liveNames.has(name)) continue;`；`anchorBasename` 按 `[\\/]` 切，Windows 反斜杠写法也认。取舍（同名文件保守当活的）成立：会话文件名带随机 id，只会少清、不会多删 |
+| R16-06 统计页三个缺口 | **复审通过** | ①`scan` 带 `AbortController` + `STORAGE_FETCH_TIMEOUT_MS`（30 秒），`finally { clearTimeout(abortTimer) }`，超时按失败；③放弃后出「继续等待」按钮：`onClick={() => setPollGaveUp(null)}`（只重起轮询、不 `refresh`），仅在 `pollGaveUp !== null && worktreePending > 0` 时出现，「重新统计」仍是 `refresh: true`。②`WALK_DEADLINE_MS` 120s → 300s：**只是放宽，Windows 上够不够十几万文件的 `node_modules` 仍没有实测**（开发如实写了）——P4 局限，不挡 |
+| R16-07 预览清理四个小问题 | **复审通过** | a：`StaleOutcome = "cleared" \| "keep"`，`killStalePreview` 把 `keep` 的记录 `toRecord` 后写回（没有要保留的 = 删文件，与以前一致）；b：`if (pid === process.pid \|\| pid === process.ppid)` 只清记录、`members.includes(process.pid \|\| process.ppid)` 不按组清理、roots 收窄到 `rec.workDir`；c：`killProcessGroup(pid, { groupOnly })`，`tryKill` 里 `if (opts.groupOnly) return false;`，stale 路径的 `killGroup` 传 `groupOnly: true`；d：exit 回调 `slot.groupCleanup = killProcessGroup(leaderPid).catch(() => {})`，`doStopPreview`（`await slot.groupCleanup`）与 `doStopAllPreviews`（`Promise.all([…, slot.groupCleanup])`）都等它——我顺着看了 `map.delete` 与 exit 回调 `map.get(…) === slot` 的先后，**没有死锁、也不会重复清理**。「保留」只对下次启动恢复有效、同仓马上重启会覆盖那一条（开发如实写了），成立 |
+| R16-08 测试缺口 | **接受部分修** | 做了：`stepPoll` 纯函数断言取代对整页 `/return true;/` 的恒真匹配；「预检之后、锁之前被取消归档」补了用例；`\bsetLeftTab\b` 计数；更正了 R15-03 处理栏的两处错述。没做的（紧凑态行为测试、退避到期重试、`drain` 的 epoch 守卫、遍历期限中途超时、路由级孤儿为 `null`）开发如实列了。我首轮说过「不要求一次补全，挑最便宜的先做」——他做到了，且比我点名的多，所以接受；剩下的是 P3 测试缺口，不挡收敛 |
+| R16-09 记录项 | **不要求改；已做的我抽查属实** | `task-store.ts` 头注释现在写「生产代码里已没有调用方、只有测试在用」；`task-header-compact.ts` 头注释补了「有预览位在跑时预览胶囊多出一行」；`cache-cleanup-text.ts` 的 `kept` 文案改成「正忙或刚被接管」；`HANDOFF.md` 1280 行加了「finalize 接口与 UI 入口已整体删除……此条仅作历史记录」；`piSessionFileOf` 现在是 `path.dirname(abs) !== path.resolve(piSessionsDir())` 才拒（只认直接在目录下的 `.jsonl`）。没做的 P4 项开发如实列了 |
+
+### R17-01 [P3] [记录项，不挡收敛] `retryLater` 的 24 小时上限按「记录创建时间」算，不是按「已经重试了多久」算——开了一天以上的预览碰上瞬时探测失败，仍会立刻清记录
+- 位置：`src/lib/server/preview-manager.ts` 的 `killOneStaleRecord` 里 `const retryLater = (): StaleOutcome => typeof rec.at === "number" && Date.now() - rec.at < STALE_KEEP_MAX_AGE_MS ? "keep" : "cleared";`。`rec.at` 在 spawn 时写入（`doStartPreview` 里 `at: Date.now()`），`toRecord` 原样保留（`at: typeof r.at === "number" ? r.at : Date.now()`），重试不会刷新它。
+- 问题：注释写的意图是「持续出错的机器别让它一直挂着」，但判据是**预览进程已经存在多久**。一个开了超过 24 小时的 dev server（App 一直开着、预览一直留着，很常见）碰上 Flowship 崩溃 / 被强杀，下次启动恰好 `ps` 瞬时失败（或 Windows 上 PowerShell 取不到指纹）时，`age ≥ 24h` → 直接 `cleared`，「保留重试」对它不生效，退回 R15 的行为（清记录、残留进程占着端口、下次启动端口 +1）。R16-02 / R16-07 a 要救的正是这种瞬时失败，却恰好救不到最长命的预览。
+- 证据：原文如上，已读 `retryLater`、`doStartPreview`、`toRecord`。触发是**构造**（长命预览 + 崩溃 + 恰好一次瞬时探测失败）。后果只是回到 R15 的行为、不更糟，所以 P3、不挡收敛。
+- 建议（顺手改，不用再来一轮）：记录里加一个「首次保留时间」`keptSince`（第一次 `keep` 时写入、之后保留不刷新），上限改成「从 `keptSince` 起算 24 小时」（或限定重试次数，比如最多再试 5 次启动）。
+
+### 我核过、确认没有问题的（别重复查）
+- `withHardDeadline`：超时后底层 promise 无论成败都被接住，不产生 unhandled rejection；定时器 `unref`，不撑住进程；期限内返回 / 失败都会 `clearTimeout`。
+- `getProcessCwds`：硬期限触发时 `err` 是 `HardDeadlineError`、没有 `stdout` → 返回空 Map（拿不到证据 = 不发信号）；`execAsync` 自己超时抛错时仍会把 `err.stdout` 里已输出的完整行捡回来、半截最后一行丢掉（`parseLsofCwds(stdout, result, true)`）。
+- `killStalePreview` 的取消语义：超时后 `ctl.cancelled = true`，之后任何路径都不再发信号、不再写 pidfile；已处理完的记录仍留在文件里，下次再过一遍，无害。
+- 会话页轮询链：`cancelled` 守卫、`timer` 总指向最新一个、`scan` 的 `finally` 清定时器；「继续等待」不 `refresh`、「重新统计」仍整表重量。
+- `listArchivedSessionHolders` 把 `keepsProviderEvidence` 带出来，路由 GET / POST 用它分流，不触发 GC。
+
+### 没验证 / 局限（如实）
+- 没有在真 Flowship App 里看任何 UI（规则不允许）：「继续等待」按钮、新状态文案、清理缓存的 legacy 文案、紧凑态预览胶囊、tab 恢复都只有读码 + 纯函数 / 源码契约测试。
+- Windows 路径（PowerShell 指纹、`taskkill`、遍历期限 300 秒）无实测；「`lsof` 真卡死」没造出来，只靠注入「回调永不来」验证。
+- 开发的 24 个变异我**没有复现**（见上）。
+- R16-09 里开发写「顺手做了」的几处，我抽查了 5 处（上表），`BROWSER-AUTOMATION.md` 约 1006 行那一处没逐字核。
+
+### 给用户（不是给开发 AI）
+- **可以做二次验收了**：R14 崩溃修复、R15 全部、R16 全部都复审通过，门禁全绿。我没有 P0 / P1 / P2。
+- **「清理缓存」现在可以点**：你的真实数据里没有「没记录提供方、又靠锚点判断的老任务」（交集 0），清理范围是 `pi-sessions` 里没有任何任务引用的孤儿文件 + 已归档会话的锚点；**仍是不可恢复的删除**，点之前心里有数。
+- **建议你亲手点几下（我没法替你看真 UI）**：会话管理页的存储统计（统计中 / 「+」标记 / 「继续等待」）、任务页预览胶囊在浏览器可见时是否留在标题行、左栏 tab 记忆。
+- **提交前**：`src/lib/whats-new.ts` 没人动过、v1.9.49 文案要你批准（应包含「预览命令必须前台常驻」和「清理缓存会保留没记录提供方的老任务」）；`scripts/browser-e2e/r14-experiment-tmp.cjs` 是调查用临时文件**不要提交**；`git status` 里 `??` 开头的未跟踪文件（含这轮新增的 `src/lib/server/hard-deadline.ts`、`tests/hard-deadline-lsof.test.ts`）要 `git add`，别漏。我没有 commit / push / tag。
+- R17-01 是个小缺口，想顺手改让开发 AI 改，不改也不影响发版。
+
+（R16 复审结束；`STATE: 收敛`。reviewer 一侧的定时任务随之取消；开发一侧的定时任务请开发 AI 自行取消。）

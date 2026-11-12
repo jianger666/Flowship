@@ -336,7 +336,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                     </div>
                     <div className="grid gap-1">
                       <span className="text-[11px] text-muted-foreground">预览启动命令</span>
-                      <Tooltip content="配了任务页才显示「预览」按钮、点击在该任务工作区起 dev server">
+                      <Tooltip content="配了任务页才显示「预览」按钮、点击在该任务工作区起 dev server。命令需要前台常驻（别用 & / nohup 丢到后台），主进程一退，它拉起的子进程会被一并清掉">
                         <Input
                           value={r.previewCommand ?? ""}
                           onChange={(e) =>

@@ -7,37 +7,29 @@
  * 1. 在 IDE 打开该仓工作区——cursor:// deep link
  * 2. 复制该仓实际工作目录路径——终端 cd 用
  * 3. 预览（按仓多预览位）——设置页配了「预览启动命令」才显示；组内挂载；
- *    不同仓可同时预览、同仓被别的任务占着时再起会顶掉
+ *    不同仓可同时预览、同仓被别的任务占着时再起会顶掉；控件见 preview-control.tsx（一个状态胶囊 + 菜单）
  * 4. 「需求群」——需求任务建/打开飞书需求群（日常轻量任务隐藏）
  * 5. 「任务文件夹」固定整条末尾（点击后用系统文件管理器打开）
  *
- * 预览状态轮询 /api/preview（仅本组件挂载期间、4s 一次、本地调用很轻）。
+ * 预览状态轮询 /api/preview（仅本组件挂载期间、平时 4s 一次、有预览在启动时 1.5s、本地调用很轻）。
  */
 
-import {
-  Copy,
-  ExternalLink,
-  FileTerminal,
-  Globe,
-  Loader2,
-  Play,
-  Square,
-  SquareArrowOutUpRight,
-} from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Copy, SquareArrowOutUpRight } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { requestOpenInBrowser } from "@/components/browser/browser-panel-bridge";
 import { useBrowserAvailable } from "@/components/browser/use-browser-session";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { getRepoWorkDirs, repoTail, shellQuotePath } from "@/lib/path-utils";
+import {
+  derivePreviewPhase,
+  mergePreviewSnapshot,
+  previewPollInterval,
+} from "@/lib/preview-ui-state";
 import { getSettings, initSettings } from "@/lib/local-store";
 import {
   fetchPreviewStatus,
@@ -46,9 +38,16 @@ import {
 } from "@/lib/task-store";
 import type { JumpIde, PreviewSlotStatus, Task } from "@/lib/types";
 import { BranchSwitcher } from "./branch-switcher";
+import { PreviewControl } from "./preview-control";
 
 interface Props {
   task: Task;
+  /**
+   * 紧凑态（任务页头部在「浏览器可见」时收成一行）：只留「有预览位 / 请求在途」的仓的预览胶囊——
+   * 点端口进内置浏览器之后正是最需要「看日志 / 重启 / 停止」的时刻，不能跟着仓库 / 分支一起藏起来；
+   * IDE 打开 / 复制路径 / 分支等其余操作收起（展开「任务详情」后回到完整形态）。组件始终挂着、轮询与状态不丢。
+   */
+  compact?: boolean;
 }
 
 // 小号纯图标按钮统一样式（省空间、给项目名/分支腾位置；语义靠 Tooltip）
@@ -58,7 +57,7 @@ const BTN_CLS = "size-6 shrink-0 justify-center p-0 text-muted-foreground hover:
 // 可访问名 = 动作 +（仓名）——多仓时每个仓都有一排同样的按钮，不带仓名就分不清是哪个仓的
 const iconLabel = (action: string, repoName: string): string => `${action}（${repoName}）`;
 
-export const WorkspaceActions = ({ task }: Props) => {
+export const WorkspaceActions = ({ task, compact = false }: Props) => {
   // 内置浏览器只在桌面端有：网页版不画「在内置浏览器打开」
   const browserAvailable = useBrowserAvailable();
   // 设置快照（jumpIde + 每仓预览命令）——挂载时读一次、设置页改完回来重新挂载自然刷新
@@ -68,8 +67,14 @@ export const WorkspaceActions = ({ task }: Props) => {
   } | null>(null);
   // 全部预览位（按仓；本组件按 taskId+repoPath 挑「自己的」）
   const [slots, setSlots] = useState<PreviewSlotStatus[]>([]);
-  // 启动 / 停止请求进行中（防双击）
-  const [busy, setBusy] = useState(false);
+  // 启动 / 停止请求进行中的仓（防双击；按仓独立，一仓在起不影响另一仓）
+  const [pendingRepos, setPendingRepos] = useState<ReadonlySet<string>>(() => new Set());
+  // 请求在途仓的「同步镜像」：轮询回调（useCallback、依赖为空）里要读到最新值，不能读闭包里的旧 state
+  const pendingRef = useRef<ReadonlySet<string>>(new Set());
+  // 启动 / 停止每完成一次加 1：轮询发出时记一份，响应回来发现变了就丢掉这份快照（它可能早于刚完成的操作）
+  const mutationEpochRef = useRef(0);
+  // 轮询时刻：交给预览控件算「启动中 → 运行中」「已运行多久」，组件渲染本身不读时钟
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     void initSettings().then(() => {
@@ -95,20 +100,35 @@ export const WorkspaceActions = ({ task }: Props) => {
   );
 
   const refreshSlots = useCallback(async () => {
+    const epoch = mutationEpochRef.current;
     try {
-      setSlots(await fetchPreviewStatus());
+      const snapshot = await fetchPreviewStatus();
+      // 请求期间本地刚完成过启动 / 停止：这份快照可能早于它，丢掉、等下一轮（本地已按响应更新过）
+      if (mutationEpochRef.current !== epoch) return;
+      // 在途的仓以本地为准（重启时服务端有「旧槽已删、新槽未放」的空窗），见 mergePreviewSnapshot
+      const pending = pendingRef.current;
+      setSlots((prev) => mergePreviewSnapshot(prev, snapshot, pending));
+      setNow(Date.now());
     } catch {
       // 本地接口偶发失败不打扰、下一轮轮询自纠
     }
   }, []);
 
-  // 有可预览仓才轮询（4s、本地调用很轻）；没配预览命令的任务零开销
+  // 本任务有预览还在「启动中」：快轮询，探到地址立刻亮出来；超过宽限期自动回慢档
+  const anyStarting = slots.some(
+    (s) => s.taskId === task.id && derivePreviewPhase(s, now) === "starting",
+  );
+
+  // 有可预览仓才轮询（平时 4s、启动中 1.5s、本地调用很轻）；没配预览命令的任务零开销
   useEffect(() => {
     if (candidates.length === 0) return;
     void refreshSlots();
-    const timer = setInterval(() => void refreshSlots(), 4000);
+    const timer = setInterval(
+      () => void refreshSlots(),
+      previewPollInterval({ anyStarting }),
+    );
     return () => clearInterval(timer);
-  }, [candidates.length, refreshSlots]);
+  }, [candidates.length, anyStarting, refreshSlots]);
 
   const workCwd = task.workCwd;
   const hasRepoBar = !!workCwd && task.repoPaths.length > 0;
@@ -138,9 +158,17 @@ export const WorkspaceActions = ({ task }: Props) => {
     }
   };
 
-  // 命令仅用于按钮 title 展示——实际执行的命令由 server 从权威配置查（CR-01）
+  const setRepoPending = (repoPath: string, on: boolean) => {
+    const next = new Set(pendingRef.current);
+    if (on) next.add(repoPath);
+    else next.delete(repoPath);
+    pendingRef.current = next;
+    setPendingRepos(next);
+  };
+
+  // 启动 / 重启 / 重新启动共用：命令由 server 从权威配置查（CR-01），server 起新进程前会先清掉同仓旧进程
   const start = async (repoPath: string) => {
-    setBusy(true);
+    setRepoPending(repoPath, true);
     try {
       const res = await startTaskPreview(task.id, repoPath);
       // 合并进本地 slots（同仓替换），避免等下一轮轮询
@@ -148,26 +176,28 @@ export const WorkspaceActions = ({ task }: Props) => {
         ...prev.filter((s) => s.repoPath !== res.slot.repoPath),
         res.slot,
       ]);
+      setNow(Date.now());
       if (res.replacedTaskTitle) {
         toast.info(`已停掉「${res.replacedTaskTitle}」对该仓的预览`);
       }
-      toast.success("预览启动中、探测到地址后可点「打开」");
     } catch (err) {
       toast.error(`预览启动失败：${(err as Error).message}`);
     } finally {
-      setBusy(false);
+      mutationEpochRef.current += 1;
+      setRepoPending(repoPath, false);
     }
   };
 
   const stop = async (repoPath: string) => {
-    setBusy(true);
+    setRepoPending(repoPath, true);
     try {
       await stopTaskPreview(repoPath);
       setSlots((prev) => prev.filter((s) => s.repoPath !== repoPath));
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
-      setBusy(false);
+      mutationEpochRef.current += 1;
+      setRepoPending(repoPath, false);
     }
   };
 
@@ -179,125 +209,53 @@ export const WorkspaceActions = ({ task }: Props) => {
   const repoNameOf = (repoPath: string): string =>
     ideTargets.find((t) => t.repoPath === repoPath)?.shortName ?? repoTail(repoPath);
 
-  /** 某仓组内的预览区：未跑→启动钮；本仓本任务在跑→运行态；本仓本任务已退→重试。
-   *  每仓独立判断、互不隐藏（修旧 bug：一仓预览中另一仓按钮消失）。 */
+  /** 某仓组内的预览区：每仓独立判断、互不隐藏（修旧 bug：一仓预览中另一仓按钮消失）。
+   *  没配预览命令的仓不渲染；状态与菜单都在 PreviewControl 里。 */
   const renderPreviewForRepo = (repoPath: string) => {
-    const repoName = repoNameOf(repoPath);
-    const mine = slots.find(
-      (s) => s.repoPath === repoPath && s.taskId === task.id,
-    );
-    if (mine && !mine.exited) {
-      return (
-        <>
-          <span className="inline-flex items-center gap-1 px-1 text-xs text-muted-foreground">
-            <span className="size-1.5 rounded-full bg-success" />
-            预览中
-          </span>
-          {mine.url && (
-            <Tooltip content={`打开 ${mine.url}`}>
-              <Button
-                variant="ghost"
-                size="sm"
-                className={BTN_CLS}
-                aria-label={iconLabel(`打开 ${mine.url}`, repoName)}
-                nativeButton={false}
-                render={
-                  <a
-                    href={mine.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="no-underline"
-                  />
-                }
-              >
-                <ExternalLink className="size-3.5" />
-              </Button>
-            </Tooltip>
-          )}
-          {mine.url && browserAvailable && (
-            <Tooltip content="在内置浏览器打开预览">
-              <Button
-                variant="ghost"
-                size="sm"
-                className={BTN_CLS}
-                aria-label={iconLabel("在内置浏览器打开预览", repoName)}
-                onClick={() => {
-                  // 展开任务页的浏览器面板并导航；没人接单（页面里没有浏览器面板）时提示，不静默失败
-                  if (!requestOpenInBrowser(task.id, mine.url as string)) {
-                    toast.info("当前页面没有内置浏览器面板");
-                  }
-                }}
-              >
-                <Globe className="size-3.5" />
-              </Button>
-            </Tooltip>
-          )}
-          <PreviewLogPopover slot={mine} repoName={repoName} />
-          <Tooltip content="停止预览 dev server">
-            <span className="inline-flex">
-              <Button
-                variant="ghost"
-                size="sm"
-                className={BTN_CLS}
-                aria-label={iconLabel("停止预览 dev server", repoName)}
-                disabled={busy}
-                onClick={() => void stop(repoPath)}
-              >
-                {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Square className="size-3.5" />}
-              </Button>
-            </span>
-          </Tooltip>
-        </>
-      );
-    }
-    if (mine && mine.exited) {
-      return (
-        <>
-          <span className="inline-flex items-center gap-1 px-1 text-xs text-destructive">
-            <span className="size-1.5 rounded-full bg-destructive/80" />
-            已退出
-          </span>
-          <PreviewLogPopover slot={mine} repoName={repoName} />
-          <Tooltip content="用同一命令重新启动预览">
-            <span className="inline-flex">
-              <Button
-                variant="ghost"
-                size="sm"
-                className={BTN_CLS}
-                aria-label={iconLabel("用同一命令重新启动预览", repoName)}
-                disabled={busy}
-                onClick={() => void start(mine.repoPath)}
-              >
-                <Play className="size-3.5" />
-              </Button>
-            </span>
-          </Tooltip>
-        </>
-      );
-    }
-    // 本任务本仓未占预览位：有命令才显示启动钮
     const c = candidates.find((x) => x.repoPath === repoPath);
     if (!c) return null;
+    const mine = slots.find((s) => s.repoPath === repoPath && s.taskId === task.id);
+    const occupiedBy = slots.find((s) => s.repoPath === repoPath && s.taskId !== task.id);
     return (
-      <Tooltip content={c.command}>
-        <span className="inline-flex">
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            aria-label={iconLabel(`启动预览:${c.command}`, repoName)}
-            disabled={busy}
-            onClick={() => void start(c.repoPath)}
-          >
-            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-          </Button>
-        </span>
-      </Tooltip>
+      <PreviewControl
+        repoName={repoNameOf(repoPath)}
+        command={c.command}
+        slot={mine}
+        occupiedBy={occupiedBy}
+        now={now}
+        pending={pendingRepos.has(repoPath)}
+        browserAvailable={browserAvailable}
+        onStart={() => void start(repoPath)}
+        onStop={() => void stop(repoPath)}
+        onOpenInBrowserPanel={(url) => {
+          // 展开任务页的浏览器面板并导航；没人接单（页面里没有浏览器面板）时提示，不静默失败
+          if (!requestOpenInBrowser(task.id, url)) {
+            toast.info("当前页面没有内置浏览器面板");
+          }
+        }}
+        // 稳定引用（useCallback、依赖为空）：不要在这里写内联箭头，否则每次渲染都是新回调
+        onRefresh={refreshSlots}
+      />
     );
   };
 
+  // 紧凑态（见 Props.compact）：只有「有预览位 / 请求在途」的仓留一个预览胶囊，其余一律 hidden——
+  // 用 CSS 收起而不是换一棵树：BranchSwitcher 等子组件不卸载，展开「任务详情」回到完整形态时状态还在
+  const isLiveRepo = (repoPath: string): boolean =>
+    pendingRepos.has(repoPath) ||
+    slots.some((s) => s.repoPath === repoPath && s.taskId === task.id);
+  const anyLive = candidates.some((c) => isLiveRepo(c.repoPath));
+  // 多仓才在紧凑态带仓名：单仓时胶囊本身就够了
+  const showNameInCompact = candidates.length > 1;
+  /** 仓卡片外壳：紧凑态下无预览的仓整张藏起、有预览的仓去掉边框与内边距（只剩胶囊） */
+  const cardClass = (repoPath: string): string =>
+    cn(
+      "flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-border/50 px-2 py-1",
+      compact && (isLiveRepo(repoPath) ? "gap-1 border-transparent p-0" : "hidden"),
+    );
+
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-1">
+    <div className={cn("mt-1 flex flex-wrap items-center gap-1", compact && !anyLive && "hidden")}>
       {/* 按仓分组：IDE 打开 + 复制该仓路径 + 预览（有命令才有）。
           cursor:// 同 frame 裸 <a>（壳 will-navigate 拦截转系统协议）——ui-conventions 约定 */}
       {ideTargets.map((t) => {
@@ -308,6 +266,8 @@ export const WorkspaceActions = ({ task }: Props) => {
         });
         const actions = (
           <>
+            {/* contents：非紧凑态不产生盒子、布局与原来一致；紧凑态整体 hidden（只留后面的预览胶囊） */}
+            <span className={cn("contents", compact && "hidden")}>
             {anchor && (
               <Tooltip content="在 IDE 打开项目">
                 <Button
@@ -338,25 +298,30 @@ export const WorkspaceActions = ({ task }: Props) => {
                 <Copy className="size-3.5" />
               </Button>
             </Tooltip>
+            </span>
             {renderPreviewForRepo(t.repoPath)}
           </>
         );
         return (
-          <div
-            key={t.repoPath}
-            className="flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-border/50 px-2 py-1"
-          >
+          <div key={t.repoPath} className={cardClass(t.repoPath)}>
             {/* 单行：项目短名（截断）+ 分支 chip（可切换）+ 分隔线 + 操作按钮（不换行） */}
-            <span className="min-w-0 max-w-36 truncate text-[11px] font-medium text-foreground">
+            <span
+              className={cn(
+                "min-w-0 max-w-36 truncate text-[11px] font-medium text-foreground",
+                compact && (showNameInCompact ? "font-normal text-muted-foreground" : "hidden"),
+              )}
+            >
               {t.shortName}
             </span>
-            <BranchSwitcher
-              task={task}
-              repoPath={t.repoPath}
-              variant="chip"
-              warning="切到非任务相关分支可能会有一些未知问题，请谨慎操作"
-            />
-            <span className="h-3 w-px shrink-0 bg-border" />
+            <span className={cn("contents", compact && "hidden")}>
+              <BranchSwitcher
+                task={task}
+                repoPath={t.repoPath}
+                variant="chip"
+                warning="切到非任务相关分支可能会有一些未知问题，请谨慎操作"
+              />
+              <span className="h-3 w-px shrink-0 bg-border" />
+            </span>
             <div className="flex shrink-0 items-center gap-0.5">{actions}</div>
           </div>
         );
@@ -373,10 +338,7 @@ export const WorkspaceActions = ({ task }: Props) => {
           </>
         );
         return (
-          <div
-            key={`orphan-${c.repoPath}`}
-            className="flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-border/50 px-2 py-1"
-          >
+          <div key={`orphan-${c.repoPath}`} className={cardClass(c.repoPath)}>
             {orphanInner}
           </div>
         );
@@ -385,43 +347,3 @@ export const WorkspaceActions = ({ task }: Props) => {
     </div>
   );
 };
-
-// 预览日志 popover（启动失败排查 / 看 dev server 输出）
-const PreviewLogPopover = ({
-  slot,
-  repoName,
-}: {
-  slot: PreviewSlotStatus;
-  /** 按钮可访问名里的仓名（与同排其它按钮同源，见 repoNameOf） */
-  repoName: string;
-}) => (
-  <Popover>
-    {/* PopoverTrigger.render 必须是可交互 DOM；Tooltip 不能塞进 render（同 combobox / 收件箱坑） */}
-    <Tooltip content="查看 dev server 最近输出">
-      <span className="inline-flex">
-        <PopoverTrigger
-          render={
-            <Button
-              variant="ghost"
-              size="sm"
-              className={BTN_CLS}
-              aria-label={iconLabel("查看 dev server 最近输出", repoName)}
-            >
-              <FileTerminal className="size-3.5" />
-            </Button>
-          }
-        />
-      </span>
-    </Tooltip>
-    <PopoverContent align="start" className="w-[480px] p-2">
-      <Tooltip content={slot.command}>
-        <div className="mb-1 truncate font-mono text-[11px] text-muted-foreground">
-          $ {slot.command}
-        </div>
-      </Tooltip>
-      <pre className="max-h-64 overflow-auto whitespace-pre-wrap wrap-anywhere rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
-        {slot.logTail.length > 0 ? slot.logTail.join("\n") : "（暂无输出）"}
-      </pre>
-    </PopoverContent>
-  </Popover>
-);

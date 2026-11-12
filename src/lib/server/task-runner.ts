@@ -629,6 +629,55 @@ export const cancelTaskRun = (taskId: string): boolean => {
 };
 
 /**
+ * 归档释放会话缓存用（见 session-cache-release.ts）：任务没在跑 / 没在启动才关内存会话，
+ * keepPersisted——盘上锚点由调用方随后条件清（本函数不 fire-and-forget 清，保证调用方 await 得到确定结果）。
+ * reap:false：会话空闲、没有要收的孤儿进程，也不去碰非隔离任务的真仓库目录。
+ */
+export const closeIdleTaskSessionForArchive = (
+  taskId: string,
+): "busy" | "closed" | "none" => {
+  if (runningTasks.has(taskId) || isTaskStarting(taskId)) return "busy";
+  return closeTaskSession(taskId, undefined, { reap: false, keepPersisted: true })
+    ? "closed"
+    : "none";
+};
+
+/**
+ * 释放一个**已归档**任务的会话缓存：关空闲内存会话 → 条件清盘上锚点 → 无人引用的 pi 会话文件一并删。
+ * 在忙的会话不动（busy）；永不抛。chat / task 两种会话各走各的内存表（chat-runner / agentSessions）。
+ * 动态 import：与 archiveTaskWithReport 里的 task-fs 同理（模块间有循环依赖，别在顶层拉进来）。
+ */
+export const releaseArchivedTaskSessionCache = async (
+  task: {
+    id: string;
+    mode: "chat" | "task";
+    sessionAgentId?: string;
+  },
+  opts: import("./session-cache-release").ReleaseOptions = {},
+): Promise<import("./session-cache-release").ReleaseResult> => {
+  const { releaseTaskSessionCache } = await import("./session-cache-release");
+  if (task.mode === "chat") {
+    const chat = await import("./chat-runner");
+    return releaseTaskSessionCache(
+      task,
+      {
+        closeIdleSession: chat.closeIdleChatSessionForArchive,
+        hasLiveSession: chat.hasChatSession,
+      },
+      opts,
+    );
+  }
+  return releaseTaskSessionCache(
+    task,
+    {
+      closeIdleSession: closeIdleTaskSessionForArchive,
+      hasLiveSession: (id) => agentSessions.has(id),
+    },
+    opts,
+  );
+};
+
+/**
  * 需求群自动播报（第三批）——action 落 awaiting_ack 之后的增强动作。
  *
  * 只在后置检查收口点里调（唯一的「action 完成」时刻）、复用同一份 check 租约：
@@ -2080,8 +2129,13 @@ const joinTerminalOpResources = async (
  * - merged：write [TASK_DONE]、agent 收尾退出、setTaskRepoStatus=merged + runStatus=idle
  * - abandoned：write [TASK_ABANDONED]、agent 立刻退、setTaskRepoStatus=abandoned + runStatus=idle
  *
- * 终态守卫（R14 Q7a-01）：已是 merged / abandoned 再收到「相反」终态 → 抛 {@link TaskTerminalConflictError}（route 409），
+ * 终态守卫（R14 Q7a-01）：已是 merged / abandoned 再收到「相反」终态 → 抛 {@link TaskTerminalConflictError}，
  * 不翻状态、不重复停预览 / 删 worktree。陈旧标签页点「放弃」、MR 其实早已合入，就是它的典型来源。
+ *
+ * 2026-11-12：任务页的「已合入 / 放弃」按钮与 POST /api/tasks/[id]/finalize 路由已移除（归档足够用，
+ * 且这两个按钮常因 stop / delete / finalize 互斥窗口报「任务正在停止/删除/终结」）——生产代码里已无调用方。
+ * 函数本身保留：其终态互斥 / 清理协调（ownership-r2x / r3x 一批矩阵测试）的断言都落在它上面，
+ * 历史上标成 merged / abandoned 的老任务也仍靠 {@link reopenTask} 恢复。要彻底删它得连同那批矩阵一起重写，另开一单。
  */
 export const finalizeTask = async (
   taskId: string,
@@ -2326,6 +2380,21 @@ const cancelSchedulesWithNotice = async (
   }
 };
 
+/** 归档收尾：释放会话缓存。回报「是否放掉了」给客户端 toast；永不抛。 */
+const releaseSessionCacheForArchive = async (task: Task): Promise<boolean> => {
+  try {
+    const res = await releaseArchivedTaskSessionCache({
+      id: task.id,
+      mode: task.mode === "chat" ? "chat" : "task",
+      sessionAgentId: task.sessionAgentId,
+    });
+    return res.status === "released";
+  } catch (err) {
+    console.warn(`[task-runner] archiveTask: 释放会话缓存失败（忽略）task=${task.id}`, err);
+    return false;
+  }
+};
+
 /**
  * 归档任务并清理隔离工作区（V1.1：归档不再只是藏行）。
  *
@@ -2412,7 +2481,17 @@ export const archiveTaskWithReport = async (
     // （条件字面保持原样：tests/schedule-wiring-contract 钉着「取消定时在这个早退之前」）
     if (task.mode === "chat" || !isWorktreeTask(task)) {
       const flagged = await setTaskPinArchive(taskId, { archived: true });
-      return flagged ? { task: flagged, report } : null;
+      if (!flagged) return null;
+      // 归档后的收尾（best-effort、先翻标记再做：失败也不影响归档本身）：
+      // ① 停预览——chat / 非隔离任务一样能起过 dev server，原先这条早退路径漏了；
+      // ② 释放会话缓存——会话空闲才动，在忙（仍在后台跑）的不碰
+      try {
+        await stopPreviewsForTask(taskId);
+      } catch (err) {
+        console.warn(`[task-runner] archiveTask: 停预览失败（忽略）task=${taskId}`, err);
+      }
+      report.sessionCacheReleased = await releaseSessionCacheForArchive(task);
+      return { task: flagged, report };
     }
     return await archiveWorktreeTaskLocked(task, report);
   } finally {
@@ -2462,6 +2541,8 @@ const archiveWorktreeTaskLocked = async (
   } catch (err) {
     console.warn(`[task-runner] archiveTask: 停预览失败（忽略）task=${taskId}`, err);
   }
+  // 会话缓存：上面 cancelTaskRun 已关内存会话并（fire-and-forget）清锚点；这里补上「确定清掉 + 删无主 pi 会话文件」
+  report.sessionCacheReleased = await releaseSessionCacheForArchive(task);
   // quarantine（join 超时、旧事务还可能写盘）→ fail-closed 不删目录，并如实告诉用户没清
   //（目录原样保留；取消归档后下次推进继续用，或稍后再归档一次清理）
   const removed = quarantined

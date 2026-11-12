@@ -247,6 +247,19 @@ export const isSameProvider = (a: string, b: string): boolean => {
 export const sessionAgentIdLooksCustom = (id: string): boolean =>
   id.includes("pi-sessions");
 
+/**
+ * 老任务没有 `provider` 字段时，「它用的是自定义提供方」**只剩锚点这一份证据**（pi-sessions 形态；
+ * {@link resolveTaskProvider} / setTaskProvider 都靠它推断）。这种任务的锚点不能被「非必须」的清理清掉——
+ * 一清，下次发消息 `resolveTaskProvider` 无声落回 Cursor，对话改走云端（评审 R16-03）。
+ */
+export const providerRestsOnAnchorOnly = (task: {
+  provider?: string;
+  sessionAgentId?: string;
+}): boolean =>
+  !task.provider?.trim() &&
+  !!task.sessionAgentId &&
+  sessionAgentIdLooksCustom(task.sessionAgentId);
+
 /** 落盘锚点能不能用这个 provider resume（跨 Cursor / 自定义必开新会话）。
  * 两条自定义之间锚点形态一样（都是 pi-sessions），分不开——切提供方时由
  * setTaskProvider 清掉 sessionAgentId，禁止拿 B 的凭据 resume A 的会话。

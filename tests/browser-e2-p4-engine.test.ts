@@ -20,6 +20,7 @@ const {
   FAIL_REASONS,
   FORBIDDEN_REQUEST_HEADERS,
   globMatch,
+  isConfirmedSameOrigin,
   isCorsPreflight,
   isForbiddenRequestHeader,
   isForbiddenResponseHeader,
@@ -31,6 +32,9 @@ const {
   normalizePattern,
   normalizeRuleHeaders,
   PAUSE_SAFETY_SLACK_MS,
+  REFUSE_URL,
+  requestHasBody,
+  terminalWouldCrashChromium,
   toCdpUrlPattern,
 } = engineMod as any;
 
@@ -390,13 +394,16 @@ describe("mergeRequestHeaders / buildFulfillParams", () => {
 
 // ───────────────────────── Fetch.requestPaused 处理器 ─────────────────────────
 
-const mkController = (rules: any[], opts: { paused?: () => boolean; isAppUrl?: (u: string) => boolean; send?: (m: string, p: any, s: any) => Promise<unknown>; onRuled?: (i: any) => void } = {}) => {
+const mkController = (
+  rules: any[],
+  opts: { paused?: () => boolean; isAppUrl?: (u: string) => boolean; send?: (m: string, p: any, s: any) => Promise<unknown>; onRuled?: (i: any) => void; log?: (m: string) => void } = {},
+) => {
   const sent: Array<{ method: string; params: any; sessionId: string | null }> = [];
   const send = vi.fn(async (method: string, params: any, sessionId: string | null) => {
     sent.push({ method, params, sessionId });
     return opts.send ? opts.send(method, params, sessionId) : {};
   });
-  const c = createPauseController({ send, getRules: () => rules, isPaused: opts.paused ?? (() => false), isAppUrl: opts.isAppUrl, onRuled: opts.onRuled, log: () => {} });
+  const c = createPauseController({ send, getRules: () => rules, isPaused: opts.paused ?? (() => false), isAppUrl: opts.isAppUrl, onRuled: opts.onRuled, log: opts.log ?? (() => {}) });
   return { c, sent, send };
 };
 const ev = (requestId: string, url: string, extra: Record<string, unknown> = {}) => ({ requestId, networkId: `n-${requestId}`, request: { url, method: "GET", headers: { Accept: "*/*" } }, ...extra });
@@ -601,5 +608,248 @@ describe("createPauseController：恰好一次 + 兜底", () => {
     c.dispose();
     await c.onPaused(ev("2", "https://a.test/y"));
     expect(sent).toEqual(["Fetch.continueRequest", "Fetch.continueRequest"]);
+  });
+});
+
+// ───────────────────────── R14：终结命令崩溃防护 ─────────────────────────
+//
+// 2026-11-11 16:29 正式包 v1.9.47 闪退：对「CORS 模式、带请求体、跨源」的 XHR / fetch 下任何终结命令——Fetch.fulfillRequest **和 Fetch.failRequest**——
+// Chromium 浏览器进程都会释放后使用（SIGSEGV；真 Electron 实测）。只有 Fetch.continueRequest 安全。
+// 引擎的防护：block / fail / mock 命中这类请求时**不发任何终结命令、也不放行真请求**，改发 continueRequest 并把 url 改写到受限端口（REFUSE_URL），请求在本机立刻失败。
+// 本组钉死判定的两边：必须拒的（宁可误拦）+ 必须照常处理的（不能误伤同源 / GET / 不带体 / 预检）。
+
+describe("R14：终结类规则命中「带请求体且不能确认同源」的请求 → 绝不发 fulfillRequest / failRequest，就地拒绝", () => {
+  const PAGE_ORIGIN = "https://crm-test.wukongedu.net";
+  const API_ORIGIN = "https://crm-api-test.wukongedu.net";
+  const API = `${API_ORIGIN}/api/handover/unassigned/page`;
+  const mockRules = () => rulesOf({ action: "mock", pattern: "*unassigned/page*", status: 200, body: '{"total":1}' });
+  /** 现场形态：跨源 JSON POST，hasPostData=true、postData 也给 */
+  const baseReq = (): Record<string, any> => ({ url: API, method: "POST", headers: { Origin: PAGE_ORIGIN, "Content-Type": "application/json" }, hasPostData: true, postData: '{"pageNum":1}' });
+  const paused = (id: string, over: Record<string, any> = {}) => ({ requestId: id, networkId: `n-${id}`, request: { ...baseReq(), ...over } });
+  const methodsOf = (sent: Array<{ method: string }>) => sent.map((s) => s.method);
+  /** 就地拒绝的唯一形态：continueRequest 带改写后的 url（且没有 headers / postData 等别的改写） */
+  const REFUSED = (id: string) => ({ requestId: id, url: REFUSE_URL });
+
+  it("REFUSE_URL：http、回环、端口 1（Chromium 受限端口，连接前就被拒）——不是 DNS 名、不是可能有服务在听的端口", () => {
+    const u = new URL(REFUSE_URL);
+    expect(u.protocol).toBe("http:");
+    expect(u.hostname).toBe("127.0.0.1");
+    expect(u.port).toBe("1");
+  });
+
+  it("现场形态（跨源 POST + JSON 体 + mock）：只发 continueRequest(url→REFUSE_URL)，绝无 fulfillRequest / failRequest；打 mock-refused 标记、hits 照常计数、写一行日志（不含 URL）", async () => {
+    const onRuled = vi.fn();
+    const logs: string[] = [];
+    const rules = mockRules();
+    const { c, sent } = mkController(rules, { onRuled, log: (m) => logs.push(m) });
+    await c.onPaused(paused("1"));
+    expect(methodsOf(sent)).toEqual(["Fetch.continueRequest"]);
+    expect(sent[0].params).toEqual(REFUSED("1"));
+    expect(onRuled).toHaveBeenCalledTimes(1);
+    expect(onRuled).toHaveBeenCalledWith({ sessionId: null, networkId: "n-1", ruled: "mock-refused", ruleId: "r1" });
+    expect(rules[0].hits).toBe(1);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("R14");
+    expect(logs[0]).toContain("mock 规则 r1");
+    expect(logs[0]).not.toContain("crm-api-test"); // URL 的 query 里可能有凭据：日志不写 URL
+    expect(c.pendingCount()).toBe(0);
+  });
+
+  it.each<[string, Record<string, any>]>([
+    ["PUT 带体", { method: "PUT" }],
+    ["PATCH 带体", { method: "PATCH" }],
+    ["只有 hasPostData=true（大体积 / 流式体 CDP 不给 postData）", { postData: undefined }],
+    ["只有非空 postData（没有 hasPostData 字段）", { hasPostData: undefined }],
+    ["只有 postDataEntries 非空", { hasPostData: undefined, postData: undefined, postDataEntries: [{ bytes: "e30=" }] }],
+    ["同 site 不同端口（现场就是这种）", { url: "http://127.0.0.1:4000/unassigned/page", headers: { Origin: "http://127.0.0.1:3000" } }],
+    ["同 host 不同 scheme", { url: `${API_ORIGIN}/unassigned/page`, headers: { Origin: "http://crm-api-test.wukongedu.net" } }],
+    ["Origin 头名小写（大小写不敏感地读）但值跨源", { headers: { origin: PAGE_ORIGIN } }],
+    ["没有 Origin 头 → 无法确认同源，保守拒绝", { headers: { "Content-Type": "application/json" } }],
+    ["headers 整个缺失", { headers: undefined }],
+    ["Origin 是 null（沙箱 iframe / file:）", { headers: { Origin: "null" } }],
+    ["Origin 解析失败", { headers: { Origin: "not a url" } }],
+    ["Origin 是空串", { headers: { Origin: "" } }],
+    ["请求 URL 解析失败（端口越界）", { url: "https://crm-api-test.wukongedu.net:99999/unassigned/page", headers: { Origin: "https://crm-api-test.wukongedu.net:99999" } }],
+    ["Origin 是 file:// 之类不透明 origin，不能当作同源", { url: `${API_ORIGIN}/unassigned/page`, headers: { Origin: "file://" } }],
+  ])("必须拒（mock）：%s → 就地拒绝，且绝不发 fulfillRequest / failRequest", async (_name, over) => {
+    const onRuled = vi.fn();
+    const { c, sent } = mkController(mockRules(), { onRuled });
+    await c.onPaused(paused("1", over));
+    expect(methodsOf(sent)).toEqual(["Fetch.continueRequest"]);
+    expect(sent[0].params).toEqual(REFUSED("1"));
+    expect(onRuled).toHaveBeenCalledWith(expect.objectContaining({ ruled: "mock-refused" }));
+  });
+
+  it.each<[string, Record<string, any>]>([
+    ["同源 POST 带体", { url: `${API_ORIGIN}/unassigned/page`, headers: { Origin: API_ORIGIN } }],
+    ["同源 PUT 带体", { url: `${API_ORIGIN}/unassigned/page`, method: "PUT", headers: { Origin: API_ORIGIN } }],
+    ["同源 POST，Origin 头名小写", { url: `${API_ORIGIN}/unassigned/page`, headers: { origin: API_ORIGIN } }],
+    ["同源 POST，Origin 带默认端口（序列化后与 URL 的 origin 相同）", { url: `${API_ORIGIN}/unassigned/page`, headers: { Origin: `${API_ORIGIN}:443` } }],
+    ["跨源 GET（不带体）", { method: "GET", hasPostData: undefined, postData: undefined }],
+    ["跨源 DELETE（不带体）", { method: "DELETE", hasPostData: undefined, postData: undefined }],
+    ["跨源 POST 不带体（hasPostData 缺失）", { hasPostData: undefined, postData: undefined }],
+    ["跨源 POST，hasPostData=false 且 postData 是空串", { hasPostData: false, postData: "" }],
+    ["跨源 POST，postDataEntries 是空数组", { hasPostData: undefined, postData: undefined, postDataEntries: [] }],
+  ])("不误伤（mock）：%s → 照常 fulfillRequest，标记仍是 mock", async (_name, over) => {
+    const onRuled = vi.fn();
+    const { c, sent } = mkController(mockRules(), { onRuled });
+    await c.onPaused(paused("1", over));
+    expect(methodsOf(sent)).toEqual(["Fetch.fulfillRequest"]);
+    expect(sent[0].params).toMatchObject({ requestId: "1", responseCode: 200 });
+    expect(onRuled).toHaveBeenCalledWith(expect.objectContaining({ ruled: "mock" }));
+  });
+
+  it("block / fail 规则命中同类请求也走就地拒绝（它们原来发的 failRequest 对这类请求同样会令 Chromium 崩溃）；条目 ruled 仍是 block / fail", async () => {
+    const onRuled = vi.fn();
+    const rules = rulesOf({ action: "block", pattern: "*/b" }, { action: "fail", pattern: "*/f", errorReason: "ConnectionRefused" });
+    const logs: string[] = [];
+    const { c, sent } = mkController(rules, { onRuled, log: (m) => logs.push(m) });
+    await c.onPaused(paused("b", { url: `${API_ORIGIN}/b` }));
+    await c.onPaused(paused("f", { url: `${API_ORIGIN}/f` }));
+    expect(methodsOf(sent)).toEqual(["Fetch.continueRequest", "Fetch.continueRequest"]);
+    expect(sent.map((x) => x.params)).toEqual([REFUSED("b"), REFUSED("f")]);
+    expect(onRuled.mock.calls.map((x) => x[0].ruled)).toEqual(["block", "fail"]);
+    expect(logs.map((l) => /命中 (\w+) 规则/.exec(l)?.[1])).toEqual(["block", "fail"]);
+  });
+
+  it("block / fail 对不危险的请求完全不变：跨源 GET / 同源带体 / 无体 POST 仍是 failRequest（errorReason 照旧）", async () => {
+    const rules = rulesOf({ action: "block", pattern: "*/b" }, { action: "fail", pattern: "*/f", errorReason: "ConnectionRefused" });
+    const { c, sent } = mkController(rules);
+    await c.onPaused(paused("b", { url: `${API_ORIGIN}/b`, method: "GET", hasPostData: undefined, postData: undefined }));
+    await c.onPaused(paused("f", { url: `${API_ORIGIN}/f`, headers: { Origin: API_ORIGIN } }));
+    await c.onPaused(paused("n", { url: `${API_ORIGIN}/f`, hasPostData: undefined, postData: undefined }));
+    expect(methodsOf(sent)).toEqual(["Fetch.failRequest", "Fetch.failRequest", "Fetch.failRequest"]);
+    expect(sent[0].params).toEqual({ requestId: "b", errorReason: "BlockedByClient" });
+    expect(sent[1].params).toEqual({ requestId: "f", errorReason: "ConnectionRefused" });
+  });
+
+  it("CORS 预检 OPTIONS（没有请求体）不受影响：mock 照常 204 代答、block / fail 照常 failRequest（实测预检的终结命令安全）；紧随其后的真 POST 才被就地拒绝", async () => {
+    const preflight = (id: string) => ({
+      requestId: id,
+      networkId: `n-${id}`,
+      request: { url: API, method: "OPTIONS", headers: { Origin: PAGE_ORIGIN, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type" } },
+    });
+    const m = mkController(mockRules());
+    await m.c.onPaused(preflight("pre"));
+    await m.c.onPaused(paused("post"));
+    expect(methodsOf(m.sent)).toEqual(["Fetch.fulfillRequest", "Fetch.continueRequest"]);
+    expect(m.sent[0].params).toMatchObject({ requestId: "pre", responseCode: 204, body: "" });
+    expect(m.sent[1].params).toEqual(REFUSED("post"));
+    const b = mkController(rulesOf({ action: "block", pattern: "*unassigned/page*" }));
+    await b.c.onPaused(preflight("pre"));
+    expect(b.sent.map((x) => x.method)).toEqual(["Fetch.failRequest"]);
+    expect(b.sent[0].params).toEqual({ requestId: "pre", errorReason: "BlockedByClient" });
+  });
+
+  it("set_headers / delay 对同样的请求行为与 R14 之前完全一致（continueRequest 实测安全）", async () => {
+    const onRuled = vi.fn();
+    const rules = rulesOf({ action: "set_headers", pattern: "*/h", headers: { "X-Dbg": "1" } }, { action: "delay", pattern: "*/d", delayMs: 5 });
+    const { c, sent } = mkController(rules, { onRuled });
+    await c.onPaused(paused("h", { url: `${API_ORIGIN}/h` }));
+    await c.onPaused(paused("d", { url: `${API_ORIGIN}/d` }));
+    expect(methodsOf(sent)).toEqual(["Fetch.continueRequest", "Fetch.continueRequest"]);
+    expect(sent[0].params.headers).toEqual(expect.arrayContaining([{ name: "X-Dbg", value: "1" }]));
+    expect(sent[0].params.url).toBeUndefined(); // 没有被改写 url
+    expect(sent[1].params).toEqual({ requestId: "d" });
+    expect(onRuled.mock.calls.map((x) => x[0].ruled)).toEqual(["headers", "delay"]);
+  });
+
+  it("mock + delay 叠加：照样先延迟、到点后仍是就地拒绝（延迟不能让它绕过防护）", async () => {
+    const { c, sent } = mkController(rulesOf({ action: "delay", pattern: "*unassigned/page*", delayMs: 30 }, { action: "mock", pattern: "*unassigned/page*", body: "x" }));
+    const t0 = Date.now();
+    await c.onPaused(paused("1"));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(25);
+    expect(methodsOf(sent)).toEqual(["Fetch.continueRequest"]);
+    expect(sent[0].params).toEqual(REFUSED("1"));
+  });
+
+  it("mock + set_headers 同时命中：整体判就地拒绝，不会因为有 set_headers 退化成带头的 continueRequest 把真 POST 放出去", async () => {
+    const { c, sent } = mkController(rulesOf({ action: "mock", pattern: "*unassigned/page*", body: "x" }, { action: "set_headers", pattern: "*unassigned/page*", headers: { "X-A": "1" } }));
+    await c.onPaused(paused("1"));
+    expect(sent.map((x) => x.params)).toEqual([REFUSED("1")]);
+  });
+
+  it("就地拒绝本身被浏览器拒绝（请求多半已经没了）：只记日志，**不**退回原样 continueRequest（那会把要拒绝的真请求放出去），也绝不发 failRequest / fulfillRequest", async () => {
+    const logs: string[] = [];
+    const { c, sent } = mkController(mockRules(), {
+      log: (m) => logs.push(m),
+      send: async () => {
+        throw new Error("Invalid InterceptionId");
+      },
+    });
+    await expect(c.onPaused(paused("1"))).resolves.toBeUndefined();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ method: "Fetch.continueRequest", params: REFUSED("1") });
+    expect(logs.some((l) => l.includes("就地拒绝失败"))).toBe(true);
+    expect(c.pendingCount()).toBe(0);
+  });
+
+  it("decideForRequest：危险类的决定是 refuse，没有 mock 对象（调用方想 fulfill 也拿不到参数）、没有 errorReason（想 failRequest 也没有原因可用）", () => {
+    const rules = mockRules();
+    const d = decideForRequest(rules, baseReq());
+    expect(d).toMatchObject({ verdict: "refuse", ruled: "mock-refused", mockRefused: true, terminalAction: "mock", decisiveRuleId: "r1", untouched: false });
+    expect("mock" in d).toBe(false);
+    expect("errorReason" in d).toBe(false);
+    const blk = decideForRequest(rulesOf({ action: "block", pattern: "*unassigned/page*" }), baseReq());
+    expect(blk).toMatchObject({ verdict: "refuse", ruled: "block", terminalAction: "block" });
+    expect(blk.mockRefused).toBeUndefined();
+    // 对照：能确认同源时仍是 fulfill，且不带 mockRefused
+    const ok = decideForRequest(rules, { ...baseReq(), url: `${API_ORIGIN}/unassigned/page`, headers: { Origin: API_ORIGIN } });
+    expect(ok).toMatchObject({ verdict: "fulfill", ruled: "mock" });
+    expect(ok.mockRefused).toBeUndefined();
+  });
+
+  it("红线不被削弱：Flowship 自身 origin 的请求仍然只 continueRequest 原样放行（isAppUrl 先于 R14 判定，不会被改写 url）", async () => {
+    const onRuled = vi.fn();
+    const { c, sent } = mkController(mockRules(), { isAppUrl: (u) => u.startsWith(API_ORIGIN), onRuled });
+    await c.onPaused(paused("1"));
+    expect(methodsOf(sent)).toEqual(["Fetch.continueRequest"]);
+    expect(sent[0].params).toEqual({ requestId: "1" });
+    expect(onRuled).not.toHaveBeenCalled();
+  });
+});
+
+describe("R14 纯函数：requestHasBody / isConfirmedSameOrigin / terminalWouldCrashChromium", () => {
+  it("requestHasBody：任何一个带体信号成立就算；脏输入一律 false 且不抛", () => {
+    expect(requestHasBody({ hasPostData: true })).toBe(true);
+    expect(requestHasBody({ postData: "{}" })).toBe(true);
+    expect(requestHasBody({ postDataEntries: [{}] })).toBe(true);
+    expect(requestHasBody({})).toBe(false);
+    expect(requestHasBody({ hasPostData: false, postData: "", postDataEntries: [] })).toBe(false);
+    // 类型不对的信号不算（"true" 字符串、数字 1 都不是 hasPostData === true）
+    expect(requestHasBody({ hasPostData: "true", postData: 1, postDataEntries: "x" })).toBe(false);
+    for (const bad of [null, undefined, 0, "x", []]) expect(requestHasBody(bad)).toBe(false);
+  });
+
+  it("isConfirmedSameOrigin：必须有 Origin 且与请求 URL 的 origin 逐字相等；缺失 / null / 解析失败 / 数组头值一律 false", () => {
+    const same = (origin: unknown, url: unknown, key = "Origin") => isConfirmedSameOrigin({ url, headers: { [key]: origin } });
+    expect(same("https://a.test", "https://a.test/x?y=1")).toBe(true);
+    expect(same("https://a.test", "https://a.test/x", "ORIGIN")).toBe(true);
+    expect(same("https://a.test:443", "https://a.test/x")).toBe(true);
+    expect(same("http://127.0.0.1:3000", "http://127.0.0.1:3000/p")).toBe(true);
+    expect(same("http://127.0.0.1:3000", "http://127.0.0.1:4000/p")).toBe(false);
+    expect(same("https://a.test", "http://a.test/x")).toBe(false);
+    expect(same("https://a.test", "https://b.a.test/x")).toBe(false);
+    expect(same("null", "https://a.test/x")).toBe(false);
+    expect(same("file://", "file:///x")).toBe(false);
+    expect(same("", "https://a.test/x")).toBe(false);
+    expect(same("https://a.test", "")).toBe(false);
+    expect(same("https://a.test", undefined)).toBe(false);
+    expect(same(["https://a.test"], "https://a.test/x")).toBe(false);
+    expect(isConfirmedSameOrigin({ url: "https://a.test/x" })).toBe(false);
+    expect(isConfirmedSameOrigin({ url: "https://a.test/x", headers: {} })).toBe(false);
+    for (const bad of [null, undefined, 0, "x"]) expect(isConfirmedSameOrigin(bad)).toBe(false);
+  });
+
+  it("terminalWouldCrashChromium = 带体 且 不能确认同源（真值表）", () => {
+    const U = "https://a.test/x";
+    const sameO = { Origin: "https://a.test" };
+    const crossO = { Origin: "https://b.test" };
+    expect(terminalWouldCrashChromium({ url: U, hasPostData: true, headers: crossO })).toBe(true);
+    expect(terminalWouldCrashChromium({ url: U, hasPostData: true, headers: {} })).toBe(true);
+    expect(terminalWouldCrashChromium({ url: U, hasPostData: true, headers: sameO })).toBe(false);
+    expect(terminalWouldCrashChromium({ url: U, headers: crossO })).toBe(false);
+    expect(terminalWouldCrashChromium({ url: U, headers: {} })).toBe(false);
+    expect(terminalWouldCrashChromium({ url: U })).toBe(false);
   });
 });

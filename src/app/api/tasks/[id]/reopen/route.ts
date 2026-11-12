@@ -3,7 +3,8 @@
  *
  * V0.6.12 恢复终态 task：把已合入 / 已放弃（merged / abandoned）的 task 拉回 developing、
  * 重新可推进。给「误 abandon」/「想把终结的 task 重新捡起来继续」留出路——
- * 否则一旦终结、详情页所有操作按钮全隐藏（canAdvance / canFinalize 都含 repoStatus !== 终态）、
+ * 否则一旦终结、详情页的推进类操作按钮全隐藏（canAdvance 含 repoStatus !== 终态；
+ * 原先的「已合入 / 放弃」入口 canFinalize 已随 2026-11-12 的 /finalize 路由一起删除）、
  * task 锁死只读、没救。
  *
  * # 行为

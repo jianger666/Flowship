@@ -9,7 +9,8 @@
  * - `fetchArtifactRevisions` / `fetchArtifactDiff` → `fetchActionRevisions` / `fetchActionDiff`
  * - `watchChatStream` → `watchTaskStream`（路由 watch-chat → watch-task）
  * - `appendEvent` 入参 phase → actionId
- * - 新增 `finalizeTask`（用户标 task 终态）
+ * - （2026-11-12 起 `finalizeTask` 客户端函数与对应的 finalize 接口已删：UI 不再有「已合入 / 放弃」入口，终结统一走归档；
+ *   服务端 task-runner 里的 `finalizeTask` 函数还留着，但生产代码里已没有调用方、只有测试在用）
  */
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
@@ -1968,28 +1969,6 @@ interface SubmitTaskQuestionFn {
   ): Promise<SubmitTaskQuestionResult>;
 }
 export const submitTaskQuestion = submitTaskQuestionImpl as SubmitTaskQuestionFn;
-
-/**
- * V0.6 任务终态控制（用户在 ack dialog 选「合入」/「abandon」）
- *
- * - merged: 标 repoStatus=merged + write [TASK_DONE] + Agent 退出
- * - abandoned: write [TASK_ABANDONED] + Agent 自然退出 + cleanup
- */
-export const finalizeTask = async (
-  taskId: string,
-  finalStatus: "merged" | "abandoned",
-): Promise<Task> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/finalize`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ finalStatus }),
-    },
-  );
-  const data = await handleJson<{ ok: true; task: Task }>(res);
-  return data.task;
-};
 
 /**
  * V0.6.12 恢复终态 task（merged / abandoned → developing）、重新可推进

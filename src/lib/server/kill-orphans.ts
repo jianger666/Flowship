@@ -73,8 +73,12 @@ import path from "node:path";
 // 后者带 task-op / resource-jobs 等一串依赖，且不少测试会 partial mock 它，
 // 本模块不该因此被拖累（也避免将来 task-worktrees 反向依赖本模块时成环）。
 import { dataRoot } from "./data-root";
+import { withHardDeadline } from "./hard-deadline";
 
 const execAsync = promisify(exec);
+
+/** `lsof` 的超时：它遇到失联的网络卷 / 卡住的 FUSE 挂载会无限期阻塞（评审 R16-01） */
+export const LSOF_TIMEOUT_MS = 5000;
 
 // Cursor agent 的 shell 工具跑命令时套的 wrapper 特征串（用户手动终端不会有这个）。
 // 形如：/bin/zsh -c snap=$(command cat <&3); builtin unsetopt aliases ...
@@ -128,15 +132,24 @@ const parseLsofCwds = (
   }
 };
 
-/** 批量取一组 pid 的 cwd（lsof 一次查完）→ Map<pid, cwd> */
-const getCwds = async (pids: number[]): Promise<Map<number, string>> => {
+/**
+ * 批量取一组 pid 的 cwd（lsof 一次查完）→ Map<pid, cwd>。
+ * **拿不到就是空（宁可漏杀、不误杀）**：超时 / 失败都返回已确认的部分（可能为空），绝不无限期等——
+ * exec 自带 timeout 只发 SIGKILL、子进程陷在不可中断睡眠时回调不来，所以外面再包一层硬期限（R16-01）。
+ */
+export const getProcessCwds = async (pids: number[]): Promise<Map<number, string>> => {
   const result = new Map<number, string>();
   if (pids.length === 0) return result;
   try {
     // -a -d cwd 只看 cwd 这个 fd；-Fpn 机读格式：p<pid> 行 + n<path> 行
-    const { stdout } = await execAsync(
-      `lsof -a -d cwd -Fpn -p ${pids.join(",")}`,
-      { maxBuffer: 8 * 1024 * 1024 },
+    const { stdout } = await withHardDeadline(
+      execAsync(`lsof -a -d cwd -Fpn -p ${pids.join(",")}`, {
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: LSOF_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      }),
+      LSOF_TIMEOUT_MS + 1000,
+      "lsof",
     );
     parseLsofCwds(stdout, result, false);
   } catch (err) {
@@ -274,7 +287,7 @@ const killOrphansInRepos = async (
     // 取候选的 cwd：先要落在任一 workDir 内（限定作用域）；
     // 无签名证据的 b 候选再额外要求 cwd 在 worktree 根下（原仓里的孤儿 node 不碰）。
     // 同时满足 a 的按 a 论（签名 + 归属已经是足够的证据），不受 worktree 根限制。
-    const cwds = await getCwds(candidates.map((p) => p.pid));
+    const cwds = await getProcessCwds(candidates.map((p) => p.pid));
     const roots = candidates.filter((p) => {
       const cwd = cwds.get(p.pid);
       if (!cwd || !isUnderAny(cwd, repoScopes)) return false;

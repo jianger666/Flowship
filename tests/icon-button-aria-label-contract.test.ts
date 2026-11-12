@@ -317,36 +317,51 @@ const loadPureFn = <F extends (...args: never[]) => unknown>(file: string, name:
 
 describe("工作区操作条：纯图标按钮的名字都带仓名（Q19-01）", () => {
   const FILE = "components/tasks/workspace-actions.tsx";
+  // 2026-11-12：预览相关的 6 个小图标收进了 PreviewControl（一个状态胶囊 + 菜单），它自己也要守同一条规矩
+  const PREVIEW_FILE = "components/tasks/preview-control.tsx";
 
-  it("workspace-actions.tsx 里每个 aria-label 都经 iconLabel（动作 +（仓名））生成，共 8 个", () => {
+  it("workspace-actions.tsx 里每个 aria-label 都经 iconLabel（动作 +（仓名））生成，共 2 个（IDE / 复制；预览的名字在 PreviewControl）", () => {
     const labels = ariaLabelValues(FILE);
-    expect(labels).toHaveLength(8);
+    expect(labels).toHaveLength(2);
     for (const v of labels) expect(v, v).toContain("iconLabel(");
   });
 
-  it("iconLabel 真跑：动作 +（仓名），仓名原样放进全角括号", () => {
-    const iconLabel = loadPureFn<(action: string, repoName: string) => string>(FILE, "iconLabel");
-    expect(iconLabel("复制工作区路径", "Flowship")).toBe("复制工作区路径（Flowship）");
-    expect(iconLabel("停止预览 dev server", "group/projA")).toBe("停止预览 dev server（group/projA）");
+  it("preview-control.tsx 里每个 aria-label 都经 iconLabel 生成且带 repoName，共 5 个", () => {
+    const labels = ariaLabelValues(PREVIEW_FILE);
+    expect(labels).toHaveLength(5);
+    for (const v of labels) {
+      expect(v, v).toContain("iconLabel(");
+      expect(v, v).toContain("repoName");
+    }
   });
 
-  it("8 个名字的动作文案与仓名来源逐个钉住（与各自 Tooltip 同文；「启动预览」例外：Tooltip 是命令本身，名字补了动词）", () => {
+  it.each([FILE, PREVIEW_FILE])("%s 里的 iconLabel 真跑：动作 +（仓名），仓名原样放进全角括号", (file) => {
+    const iconLabel = loadPureFn<(action: string, repoName: string) => string>(file, "iconLabel");
+    expect(iconLabel("复制工作区路径", "Flowship")).toBe("复制工作区路径（Flowship）");
+    expect(iconLabel("预览更多操作", "group/projA")).toBe("预览更多操作（group/projA）");
+  });
+
+  it("workspace-actions 的 2 个名字的动作文案与仓名来源逐个钉住（与各自 Tooltip 同文）", () => {
     expect(ariaLabelValues(FILE)).toEqual([
-      "{iconLabel(`打开 ${mine.url}`, repoName)}",
-      '{iconLabel("在内置浏览器打开预览", repoName)}',
-      '{iconLabel("停止预览 dev server", repoName)}',
-      '{iconLabel("用同一命令重新启动预览", repoName)}',
-      "{iconLabel(`启动预览:${c.command}`, repoName)}",
       '{iconLabel("在 IDE 打开项目", t.shortName)}',
       '{iconLabel("复制工作区路径", t.shortName)}',
-      '{iconLabel("查看 dev server 最近输出", repoName)}',
     ]);
   });
 
-  it("PreviewLogPopover 的两处调用都传了 repoName（漏传 tsc 也会报，这里再钉一道）", () => {
+  it("preview-control 的 5 个名字逐个钉住（「启动预览」例外：Tooltip 是命令本身，名字补了动词；胶囊按钮带着状态词，读屏听得出现在什么状态）", () => {
+    expect(ariaLabelValues(PREVIEW_FILE)).toEqual([
+      "{iconLabel(`启动预览:${command}`, repoName)}",
+      "{iconLabel(`在内置浏览器打开 ${url}`, repoName)}",
+      "{iconLabel(`打开 ${url}`, repoName)}",
+      "{iconLabel(`查看预览状态与日志（${mainLabel}）`, repoName)}",
+      '{iconLabel("预览更多操作", repoName)}',
+    ]);
+  });
+
+  it("WorkspaceActions 把与卡片同源的 repoName 传给 PreviewControl（漏传 tsc 也会报，这里再钉一道）", () => {
     const text = readFileSync(path.join(srcDir, FILE), "utf8");
-    expect(text.match(/<PreviewLogPopover\b/g)).toHaveLength(2);
-    expect(text.match(/<PreviewLogPopover slot=\{mine\} repoName=\{repoName\} \/>/g)).toHaveLength(2);
+    expect(text.match(/<PreviewControl\b/g)).toHaveLength(1);
+    expect(text).toContain("repoName={repoNameOf(repoPath)}");
   });
 
   it("名字里的仓名来源：与卡片上显示的是同一个 shortName，只有对不上的孤儿仓才回退到路径末段", () => {

@@ -21,14 +21,19 @@ const read = (rel: string): string => readFileSync(path.join(repoDir, rel), "utf
 const pageRaw = read("src/app/tasks/[id]/page.tsx");
 const mcpRaw = read("src/components/tasks/task-mcp-panel.tsx");
 
-describe("V12-04：终结确认文案不写死分支名（与 formatFinalizeNotice 同口径）", () => {
+describe("V12-04：终结文案不写死分支名（2026-11-12 起「已合入 / 放弃」按钮已移除，只剩历史事件文案）", () => {
   it("page.tsx 里不再出现「合入 main」", () => {
     expect(pageRaw).not.toMatch(/合入\s*main/);
   });
 
-  it("确认文案的措辞与事件流那句「任务已标记为已合入」一致：写「已合入」+ MR 已合并，不夹分支名", () => {
+  // 只钉文案函数本身：老任务事件流里已落盘的那句，页面按通用 info 事件渲染（不在这里验证渲染）
+  it("formatFinalizeNotice：历史文案仍产出原句（老任务事件流里已落盘的那句与之一致）", () => {
     expect(formatFinalizeNotice("merged")).toBe("任务已标记为已合入");
-    expect(pageRaw).toContain("标记本任务已合入（对应 MR 已合并）、agent 收尾结束 run");
+    expect(formatFinalizeNotice("abandoned")).toContain("放弃");
+  });
+
+  it("页面上的确认文案随按钮一起删了（不留死文案）", () => {
+    expect(pageRaw).not.toContain("标记本任务已合入（对应 MR 已合并）、agent 收尾结束 run");
   });
 });
 

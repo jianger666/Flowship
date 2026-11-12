@@ -155,12 +155,19 @@ export const makeP4Env = async (opts: P4EnvOptions = {}) => {
 
   /** 发出一个 `Fetch.requestPaused`（请求阶段）；返回 CDP 事件载荷 */
   let seq = 0;
-  const pause = (o: { url: string; method?: string; headers?: Record<string, string>; networkId?: string; requestId?: string; sessionId?: string }) => {
+  // R14：hasPostData / postData 与真 CDP 的 Fetch.requestPaused 载荷同名（Network.Request 的字段）；缺省不带，行为与加字段前完全一致
+  const pause = (o: { url: string; method?: string; headers?: Record<string, string>; networkId?: string; requestId?: string; sessionId?: string; hasPostData?: boolean; postData?: string }) => {
     const requestId = o.requestId ?? `fetch-${++seq}`;
     const params = {
       requestId,
       networkId: o.networkId ?? `net-${seq}`,
-      request: { url: o.url, method: o.method ?? "GET", headers: o.headers ?? { Accept: "*/*" } },
+      request: {
+        url: o.url,
+        method: o.method ?? "GET",
+        headers: o.headers ?? { Accept: "*/*" },
+        ...(o.hasPostData !== undefined ? { hasPostData: o.hasPostData } : {}),
+        ...(o.postData !== undefined ? { postData: o.postData } : {}),
+      },
       resourceType: "Fetch",
     };
     emit("Fetch.requestPaused", params, o.sessionId);

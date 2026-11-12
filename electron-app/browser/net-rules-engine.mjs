@@ -14,6 +14,7 @@
  *
  * # 红线（契约 §15.3）
  *  - Flowship 自身 origin（`isAppUrl`）永不拦截 / mock / 注入头——命中也只 `continueRequest`；
+ *  - R14：对「带请求体且不能确认同源」的请求**永不发终结命令**（`Fetch.fulfillRequest` / `Fetch.failRequest`，Chromium 浏览器进程释放后使用，整个 Flowship 闪退）——block / fail / mock 命中它们一律改成「就地拒绝」（`continueRequest` 把 url 改到受限端口，立刻本机失败、不外发），见 {@link terminalWouldCrashChromium} / {@link REFUSE_URL}；
  *  - `set_headers` 的值只存在于规则对象里，{@link describeRule}（list / 活动日志 / 状态）一律只给头名；
  *  - 禁止改的头见 {@link FORBIDDEN_REQUEST_HEADERS}：除了 HTTP 层的帧 / 连接类头，还有 `Cookie`（改 Cookie 等于绕过 browserStorageAccess 开关去写登录态）；
  *    mock 的响应头是**白名单**（R6-32，见 {@link ALLOWED_RESPONSE_HEADERS}）：`Set-Cookie` / `Clear-Site-Data` 等任何不在名单里的头都被拒（mock 不能成为写 / 清 cookie 与存储的通道）。
@@ -436,13 +437,74 @@ export const mergeRequestHeaders = (original, extra) => {
   return out;
 };
 
+const headerValue = (headers, name) => {
+  const hit = Object.entries(headers && typeof headers === "object" ? headers : {}).find(([k]) => k.toLowerCase() === name);
+  return typeof hit?.[1] === "string" ? hit[1] : undefined;
+};
+
+// ───────────────────────── R14：终结命令崩溃防护 ─────────────────────────
+//
+// 2026-11-11 16:29 正式包 v1.9.47 闪退（CrBrowserMain，EXC_BAD_ACCESS，地址 0xefefef…＝PartitionAlloc 把「释放后仍被引用」的内存刷成 0xEF，即 Chromium 浏览器进程里的释放后使用）。
+// 真 Electron 无头实测（42.4.0；事故简报称 42.11.18 / 43.8.8 同样崩）：
+//   · 对「**CORS 模式、带请求体、跨源**（同 site 不同端口也算）」的 XHR / fetch 下**任何终结命令**都崩：`Fetch.fulfillRequest` 崩，**`Fetch.failRequest` 也崩**
+//     （errorReason 换成 Failed / Aborted / ConnectionRefused / BlockedByClient / AccessDenied 都一样）；POST / PUT / PATCH，json / plain 都崩；与 mock 的 body 大小 / 有无 ACAO 头无关；
+//   · 不崩的：对它们发 `Fetch.continueRequest`（含改写 url）；跨源 GET / DELETE、跨源不带体的 POST、同源的 GET / POST / PUT 的 fulfill 与 fail；预检（OPTIONS，没有体）的 fulfill / fail；
+//     sendBeacon、表单导航（非 CORS 模式）的 fail。
+//   （事故简报里「fail / block 不崩」是被 CORS 预检混淆了：json 的跨源 POST 先发预检，fail 规则把预检先失败，真正带体的 POST 根本没发出来。）
+// 这是 Chromium 自己的 bug，我们改不了，只能绕开：命中这种组合时**不发任何终结命令**，也**不放行真请求**（mock / block 的目的通常就是别让真 POST 打到后端，放行会产生真实副作用），
+// 而是「就地拒绝」：`Fetch.continueRequest` 带改写后的 `url`={@link REFUSE_URL}（Chromium 受限端口，连接前就被拒绝），页面看到网络错误，请求体不会离开本机。
+// 实测：改写目标指向可连接端口时后端确实收到了改写后的请求（证明改写生效）；指向受限端口时监听器没收到任何连接、页面 XHR 报网络错误。
+// block / fail 规则命中同类请求也走这条路（它们原来发的 failRequest 同样会崩）；条目的 `ruled` 仍是 block / fail，只是 errorText 变成 net::ERR_UNSAFE_PORT；
+// mock 命中则打 `ruled: "mock-refused"`，AI 在 browser_network 里能看出是「mock 被安全拒绝」而不是别的失败。
+//
+// 判定宁可误拦也不要漏拦：「带体」只要有一个信号就算（hasPostData === true / postData 非空 / postDataEntries 非空）；
+// 「同源」必须**确认**——请求头里有 Origin，且它与请求 URL 的 origin 完全一致；没有 Origin、Origin 为 `null`、任何一边解析失败都按「不是同源」处理。
+// （sendBeacon / 表单导航因为也带体、也跨源，会被一并按危险处理——多拒几个无妨，漏一个就是整个 Flowship 闪退。）
+
+/**
+ * 「就地拒绝」把请求改写到的 URL：端口 1（tcpmux）在 Chromium 的受限端口表里，任何 scheme 都在**连接之前**被拒（net::ERR_UNSAFE_PORT），所以请求体、Cookie、Authorization 都不会离开本机。
+ * 不用 DNS 名（会真发解析）、不用别的端口（可能真有服务在听）。
+ */
+export const REFUSE_URL = "http://127.0.0.1:1/__flowship-net-rules-refused__";
+
+/** 请求是否带请求体（任何一个信号成立就算；CDP 的 Network.Request 在大体积 / 流式体时只给 hasPostData） */
+export const requestHasBody = (request) => {
+  if (!request || typeof request !== "object") return false;
+  if (request.hasPostData === true) return true;
+  if (typeof request.postData === "string" && request.postData !== "") return true;
+  return Array.isArray(request.postDataEntries) && request.postDataEntries.length > 0;
+};
+
+const originOfUrl = (value) => {
+  try {
+    const o = new URL(String(value)).origin;
+    return o === "null" ? null : o; // file: / data: / blob: 等不透明 origin 序列化成 "null"，不能当「同源」的依据
+  } catch {
+    return null;
+  }
+};
+
+/** 请求是否**确认**同源：Origin 头与请求 URL 的 origin 都能解析且相等（缺 Origin / `null` / 解析失败一律 false） */
+export const isConfirmedSameOrigin = (request) => {
+  const fromHeader = headerValue(request?.headers, "origin");
+  if (typeof fromHeader !== "string") return false;
+  const a = originOfUrl(fromHeader);
+  const b = originOfUrl(request?.url);
+  return a !== null && b !== null && a === b;
+};
+
+/** 对这个请求下终结命令（fulfillRequest / failRequest）会不会让 Chromium 浏览器进程崩溃：带请求体且不能确认同源 */
+export const terminalWouldCrashChromium = (request) => requestHasBody(request) && !isConfirmedSameOrigin(request);
+
 /**
  * 一个请求命中规则后的处理决定。
  * 优先级：先创建的「终结类」规则（block / fail / mock）赢；delay 取命中规则里最长的、与任何结果叠加；set_headers 全部命中的合并（后创建的覆盖同名）。
+ * R14：终结类规则（block / fail / mock）命中、但请求「带体且不能确认同源」（{@link terminalWouldCrashChromium}）时**不发终结命令**，改判 `refuse`（就地拒绝，见 {@link REFUSE_URL}）：
+ * block / fail 的 `ruled` 不变，mock 的 `ruled` 是 `"mock-refused"`（并带 `mockRefused: true`）；`terminalAction` 记下是哪种规则触发的，供日志用。
  * @param {Array<any>} rules
- * @param {{ url?: string, method?: string, headers?: Record<string,string> }} request
+ * @param {{ url?: string, method?: string, headers?: Record<string,string>, hasPostData?: boolean, postData?: string, postDataEntries?: unknown[] }} request
  * @param {{ isAppUrl?: (url: string) => boolean }} [opts]
- * @returns {{ verdict: "continue" | "fail" | "fulfill", untouched: boolean, delayMs: number, extraHeaders: Array<{name:string,value:string}>, errorReason?: string, mock?: object, matched: string[], ruled: string | null, decisiveRuleId?: string }}
+ * @returns {{ verdict: "continue" | "fail" | "fulfill" | "refuse", untouched: boolean, delayMs: number, extraHeaders: Array<{name:string,value:string}>, errorReason?: string, mock?: object, matched: string[], ruled: string | null, decisiveRuleId?: string, mockRefused?: boolean, terminalAction?: string }}
  */
 export const decideForRequest = (rules, request, { isAppUrl } = {}) => {
   const none = { verdict: "continue", untouched: true, delayMs: 0, extraHeaders: [], matched: [], ruled: null };
@@ -463,6 +525,11 @@ export const decideForRequest = (rules, request, { isAppUrl } = {}) => {
   for (const r of matched) if (r.action === "set_headers") extra.push(...r.headers);
   const extraHeaders = normalizeMerge(extra);
   const base = { delayMs, extraHeaders, matched: matched.map((r) => r.id), untouched: false };
+  // R14：带体且不能确认同源 → 任何终结命令都可能令 Chromium 崩溃，一律就地拒绝（只发 continueRequest 改写 url，见 REFUSE_URL）
+  if (terminal && terminalWouldCrashChromium(request)) {
+    const ruled = terminal.action === "mock" ? "mock-refused" : terminal.action;
+    return { ...base, verdict: "refuse", ruled, decisiveRuleId: terminal.id, terminalAction: terminal.action, ...(terminal.action === "mock" ? { mockRefused: true } : {}) };
+  }
   if (terminal?.action === "block") return { ...base, verdict: "fail", errorReason: "BlockedByClient", ruled: "block", decisiveRuleId: terminal.id };
   if (terminal?.action === "fail") return { ...base, verdict: "fail", errorReason: terminal.errorReason ?? "Failed", ruled: "fail", decisiveRuleId: terminal.id };
   if (terminal?.action === "mock") return { ...base, verdict: "fulfill", mock: terminal.mock, ruled: "mock", decisiveRuleId: terminal.id };
@@ -478,11 +545,6 @@ const normalizeMerge = (list) => {
   const m = new Map();
   for (const h of list) m.set(h.name.toLowerCase(), h);
   return [...m.values()];
-};
-
-const headerValue = (headers, name) => {
-  const hit = Object.entries(headers && typeof headers === "object" ? headers : {}).find(([k]) => k.toLowerCase() === name);
-  return typeof hit?.[1] === "string" ? hit[1] : undefined;
 };
 
 /** CORS 预检请求：OPTIONS + `Access-Control-Request-Method`（命中 mock 规则时由系统代答，否则页面的 fetch 会死在预检上） */
@@ -548,7 +610,8 @@ export const MAX_DELAYED_PENDING = 100;
  * 不变量（单测用假 CDP 逐条验证）：
  *  1. 每个被暂停的请求**恰好被处理一次**（continue / fail / fulfill 三选一）：`done` 在第一个 await 之前同步置位，之后任何路径（正常流程 / 兜底超时 /
  *     flush / 重复事件）都直接放弃；
- *  2. 任何异常（决策抛错、failRequest / fulfillRequest 被浏览器拒绝）退回 `continueRequest`——请求永不挂起；
+ *  2. 任何异常（决策抛错、failRequest / fulfillRequest 被浏览器拒绝）退回 `continueRequest`——请求永不挂起；**唯一例外**是 R14 的「就地拒绝」：它本身就是一条 continueRequest（带改写 url），
+ *     被拒绝时不能再退回「原样放行」（那会把本来要拒绝的真请求放出去），只记日志——失败多半是请求已经没了；
  *  3. 兜底超时：决策完成后按「延迟 + {@link PAUSE_SAFETY_SLACK_MS}」重新计时，到点无条件放行（`continueRequest` 本身失败就只能算了：请求多半已经死了）；
  *  4. 规则暂停（用户接管）/ 规则已清空 / dispose 之后到达的事件一律原样放行；`flush()` 把已挂起的（含正在等延迟的）立刻放行。
  *
@@ -624,6 +687,20 @@ export const createPauseController = (deps) => {
   };
   const continuePlain = (entry) => settle(entry, "Fetch.continueRequest", { requestId: entry.requestId });
 
+  /**
+   * R14「就地拒绝」：对「带体且不能确认同源」的请求不发终结命令（fulfill / fail 都会令 Chromium 崩溃），改发 continueRequest 把 url 改写到 {@link REFUSE_URL}，请求在本机立刻失败。
+   * 与 settle 的区别：失败**不**退回原样 continueRequest（那等于把要拒绝的真请求放出去）。
+   */
+  const refuse = async (entry) => {
+    if (entry.done) return;
+    finishEntry(entry);
+    try {
+      await deps.send("Fetch.continueRequest", { requestId: entry.requestId, url: REFUSE_URL }, entry.sessionId);
+    } catch (err) {
+      log(`[net-rules] 就地拒绝失败（请求多半已经没了；不退回原样放行，免得被拒绝的真请求外发）：${String(err?.message ?? err).slice(0, 120)}`);
+    }
+  };
+
   const arm = (entry, ms) => {
     if (entry.safety) clearT(entry.safety);
     entry.safety = setT(() => {
@@ -695,6 +772,10 @@ export const createPauseController = (deps) => {
           }
         }
         for (const r of deps.getRules()) if (d.matched.includes(r.id)) r.hits = (r.hits ?? 0) + 1;
+        // R14：终结类规则命中了「带体且不能确认同源」的请求——decideForRequest 已改判 refuse（下面不会走到 failRequest / fulfillRequest 分支），这里留一行日志（不写 URL：query 里可能有凭据）
+        if (d.verdict === "refuse") {
+          log(`[net-rules] 请求 ${requestId} 命中 ${d.terminalAction} 规则 ${d.decisiveRuleId}，但它带请求体且无法确认同源：Chromium 对这类请求下终结命令（fulfillRequest / failRequest）会令浏览器进程崩溃（R14），已改为就地拒绝（continueRequest 改写到受限端口），请求本机失败、未放行真请求`);
+        }
         if (d.delayMs > 0 && delayedPending < MAX_DELAYED_PENDING) {
           arm(entry, d.delayMs + PAUSE_SAFETY_SLACK_MS);
           entry.delaying = true;
@@ -706,6 +787,7 @@ export const createPauseController = (deps) => {
           // 等待期间用户接管了 / 规则被清空了：不再改写
           if (disposed || deps.isPaused()) return await continuePlain(entry);
         }
+        if (d.verdict === "refuse") return await refuse(entry);
         if (d.verdict === "fail") return await settle(entry, "Fetch.failRequest", { requestId, errorReason: d.errorReason });
         if (d.verdict === "fulfill") {
           // R6-31 第二道：fulfill 前再按「当下」重判一次——延迟等待期间批准可能被撤销、规则可能已被清掉。

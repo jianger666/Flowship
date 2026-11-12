@@ -799,6 +799,22 @@ export const sweepIdleChatSessions = (now: number = Date.now()): number => {
   return n;
 };
 
+/**
+ * 归档释放会话缓存用（见 session-cache-release.ts）：只关**空闲**的热会话，与空闲清扫 / 水位门同一道守卫
+ * （有 run / 后台子代理 / 排队 / 待答 / 在飞 steer / 回退中 / 收尾窗口都不动，返回 "busy"）。
+ * 只管内存会话、keepPersisted——盘上锚点由调用方随后条件清（带「内存里没有会话」的守卫）。
+ * 没有内存会话返回 "none"（空闲回收早就关了，常态）。
+ */
+export const closeIdleChatSessionForArchive = (
+  taskId: string,
+): "busy" | "closed" | "none" => {
+  const rec = runningChats.get(taskId);
+  if (!rec) return "none";
+  if (chatReclaimBlock(taskId, rec) !== null) return "busy";
+  closeChatSession(taskId, rec.instanceId, { keepPersisted: true });
+  return "closed";
+};
+
 {
   const g = globalThis as unknown as Record<string, NodeJS.Timeout | undefined>;
   const legacy = g[LEGACY_CHAT_SWEEPER_KEY];

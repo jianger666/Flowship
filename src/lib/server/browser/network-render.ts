@@ -28,13 +28,15 @@ export const safeInt = (v: unknown): string => (typeof v === "number" && Number.
 /** 值必须在白名单里才原样返回，否则 "?"（进可信行用：不让任意文字借可信行进来） */
 const safeEnum = (v: unknown, allowed: readonly string[]): string => (typeof v === "string" && allowed.includes(v) ? v : "?");
 
-export const RULED_VALUES = ["block", "fail", "mock", "delay", "headers"] as const;
+export const RULED_VALUES = ["block", "fail", "mock", "delay", "headers", "mock-refused"] as const;
 const RULED_ZH: Record<string, string> = {
   block: "被规则屏蔽",
   fail: "被规则置为失败",
   mock: "被规则模拟",
   delay: "被规则延迟",
   headers: "被规则加了请求头",
+  // R14：命中了 mock 规则，但请求「带请求体且无法确认同源」——对它 fulfill 会让 Chromium 崩溃，系统改成了让请求失败（没有放行真请求）
+  "mock-refused": "mock被安全拒绝(跨源带体请求不可模拟,请求已失败)",
 };
 export const CACHE_VALUES = ["fromMemoryCache", "fromDiskCache"] as const;
 const CACHE_ZH: Record<string, string> = { fromMemoryCache: "内存缓存命中", fromDiskCache: "磁盘缓存命中" };

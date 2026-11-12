@@ -64,7 +64,12 @@ import type {
 import { accumulateTokenUsage } from "@/lib/token-usage";
 import { normalizeReqId } from "@/lib/req-id";
 import { mrTargetBranchOf } from "@/lib/task-display";
-import { modelForProviderSwitch, isProviderSwitchLocked, sessionAgentIdLooksCustom } from "@/lib/agent-provider";
+import {
+  modelForProviderSwitch,
+  isProviderSwitchLocked,
+  providerRestsOnAnchorOnly,
+  sessionAgentIdLooksCustom,
+} from "@/lib/agent-provider";
 import { stampActionsProviderForSwitch, LEGACY_UNKNOWN_PROVIDER } from "@/lib/task-model";
 import {
   cleanupOrphanTaskWorktrees,
@@ -2170,12 +2175,21 @@ export const setTaskSessionAgentId = async (
  * 提交：prepareMetaWrite + commit(finalGuard)——每次 rename attempt 前复查
  * 「盘上仍是 expectedAgentId && extraGuard 仍 true」（beforeAttempt）。
  * 用于 Agent.resume 确定性失败 catch：避免迟到 clear 抹掉 B 同 agentId 新装的锚点。
+ * `opts.requireArchived`：锁内重读 meta 后还要求任务**仍是已归档**（评审 R15-07）——
+ * 「清理缓存」先列出一批已归档任务、再逐个串行释放，窗口里用户可能把其中一个取消归档；
+ * 复核放在 withTaskLock 里（取消归档的写 meta 也走这把锁），所以读到的 archived 在 commit 前不会再翻。
+ * `opts.keepProviderEvidence`（评审 R16-03）：老任务没有 `provider` 字段时，「它用的是自定义提供方」**只能**靠
+ * 锚点是 pi-sessions 形态来推断（`resolveTaskProvider` / `setTaskProvider` 都这样）。这种任务的锚点一清，
+ * 取消归档再发消息就会无声改走 Cursor 云端——违背「选内网网关 = 数据不出域」的初衷。
+ * 所以「归档释放 / 清理缓存」这类**非必须**的清锚点要开它：锁内重读 meta，没有 provider 且锚点是自定义形态就不清。
+ * 复核放在锁里（与 requireArchived 同一处），不只在预检——预检到提交之间 meta 可能变。
  * @returns true=已清；false=条件不符 / meta 不存在（best-effort 不抛）
  */
 export const clearTaskSessionAgentIdIf = async (
   taskId: string,
   expectedAgentId: string,
   extraGuard?: () => boolean,
+  opts: { requireArchived?: boolean; keepProviderEvidence?: boolean } = {},
 ): Promise<boolean> => {
   try {
     return await withTaskLock(taskId, async () => {
@@ -2183,6 +2197,8 @@ export const clearTaskSessionAgentIdIf = async (
       if (extraGuard && !extraGuard()) return false;
       const meta = await readMetaV06(taskId);
       if (!meta || meta.sessionAgentId !== expectedAgentId) return false;
+      if (opts.requireArchived && meta.archived !== true) return false;
+      if (opts.keepProviderEvidence && providerRestsOnAnchorOnly(meta)) return false;
       meta.sessionAgentId = undefined;
       // 条件事务——prepare 后 finalGuard 进 commit，堵 read/write await 夹缝
       const prepared = await prepareMetaWrite(meta);

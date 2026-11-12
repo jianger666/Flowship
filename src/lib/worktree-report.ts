@@ -89,6 +89,8 @@ export interface ArchiveReport {
   missedSchedules?: number;
   /** 取消归档时发现周期定时已用满次数、被改写成「已结束」的条数（Q9-06；旧服务端不带 = 0） */
   endedSchedules?: number;
+  /** 归档时放掉了 agent 会话缓存（会话锚点 + 自定义提供方的会话文件）；会话在忙 / 本来就没有 = 不带 / false */
+  sessionCacheReleased?: boolean;
 }
 
 export const emptyArchiveReport = (): ArchiveReport => ({
@@ -135,6 +137,9 @@ export const buildArchiveToast = (input: {
   }
   if (wt && wt.removed && wt.snapshotCount > 0) {
     parts.push("未提交的改动已存成快照");
+  }
+  if (report.sessionCacheReleased) {
+    parts.push("会话缓存已释放");
   }
   if (report.cancelledSchedules > 0) {
     parts.push(`${report.cancelledSchedules} 个定时已取消（取消归档可恢复）`);

@@ -9,6 +9,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { REFUSE_URL } from "../electron-app/browser/net-rules-engine.mjs";
+
 import { BrowserError, makeP4Env, type P4Env } from "./helpers/browser-e2-p4-fakes";
 
 const SECRET = "sk-live-SUPERSECRETVALUE123456";
@@ -165,6 +167,66 @@ describe("Fetch.requestPaused → 处理 + 网络条目标记", () => {
     expect(e.lastCmd("Fetch.fulfillRequest")!.params).toMatchObject({ responseCode: 200 });
     e.request("N9", { url: "https://a.test/api/x" });
     expect(e.tab.networkRing.list().find((x: any) => x.url.endsWith("/api/x"))).toMatchObject({ ruled: "mock" });
+  });
+
+  it("R14：mock 命中跨源带体的 POST → 就地拒绝（continueRequest 改写 url，绝无 fulfillRequest / failRequest）；条目 ruled=mock-refused 且算 failed；命中次数照常累加；同源 POST 与跨源 GET 的 mock 照常 fulfill", async () => {
+    const e = await mk();
+    await e.rules({ action: "mock", pattern: "*/api/handover/*", status: 200, body: '{"total":1}' });
+    const API = "https://crm-api.test/api/handover/unassigned/page";
+    // ① 现场形态：页面 https://crm.test 向 https://crm-api.test 发带 JSON 体的 POST
+    e.emit("Network.requestWillBeSent", { requestId: "X1", timestamp: 1, type: "XHR", request: { url: API, method: "POST", headers: { Origin: "https://crm.test" }, hasPostData: true } });
+    e.pause({ url: API, method: "POST", headers: { Origin: "https://crm.test", "Content-Type": "application/json" }, hasPostData: true, postData: "{}", networkId: "X1" });
+    await e.settle();
+    expect(e.cmds("Fetch.fulfillRequest")).toHaveLength(0);
+    expect(e.cmds("Fetch.failRequest")).toHaveLength(0);
+    const refusal = e.lastCmd("Fetch.continueRequest")!.params;
+    expect(refusal.url).toBe(REFUSE_URL);
+    expect(Object.keys(refusal).sort()).toEqual(["requestId", "url"]); // 没有 headers / postData 等别的改写
+    // canceled:true 与 block 用例同口径：CDP 对「被终结」的请求的 loadingFailed 可能带 canceled，那样默认不算失败——mock-refused 必须自己保证算 failed（tab.mjs 的 ruled 判定）
+    e.emit("Network.loadingFailed", { requestId: "X1", timestamp: 1.1, errorText: "net::ERR_UNSAFE_PORT", canceled: true, type: "XHR" });
+    expect(e.tab.networkRing.list().find((x: any) => x.url === API)).toMatchObject({ ruled: "mock-refused", failed: true });
+    // ② 同源 POST（Origin = 请求 URL 的 origin）：照常 fulfill，标记 mock
+    const SAME = "https://crm-api.test/api/handover/same";
+    e.emit("Network.requestWillBeSent", { requestId: "X2", timestamp: 2, type: "XHR", request: { url: SAME, method: "POST", headers: {}, hasPostData: true } });
+    e.pause({ url: SAME, method: "POST", headers: { Origin: "https://crm-api.test" }, hasPostData: true, postData: "{}", networkId: "X2" });
+    // ③ 跨源 GET：照常 fulfill
+    const GET = "https://crm-api.test/api/handover/get";
+    e.emit("Network.requestWillBeSent", { requestId: "X3", timestamp: 3, type: "XHR", request: { url: GET, method: "GET", headers: {} } });
+    e.pause({ url: GET, method: "GET", headers: { Origin: "https://crm.test" }, networkId: "X3" });
+    await e.settle();
+    expect(e.cmds("Fetch.fulfillRequest")).toHaveLength(2);
+    expect(e.cmds("Fetch.failRequest")).toHaveLength(0);
+    e.emit("Network.loadingFinished", { requestId: "X2", timestamp: 2.1 });
+    e.emit("Network.loadingFinished", { requestId: "X3", timestamp: 3.1 });
+    const byUrl = (u: string) => e.tab.networkRing.list().find((x: any) => x.url === u);
+    expect(byUrl(SAME)).toMatchObject({ ruled: "mock" });
+    expect(byUrl(GET)).toMatchObject({ ruled: "mock" });
+    expect(byUrl(SAME)?.failed).toBeFalsy();
+    // 三次都算命中（包括被拒的那次）
+    expect(((await e.rules({ action: "list" })).rules as any[])[0].hits).toBe(3);
+  });
+
+  it("R14：block / fail 命中跨源带体的 POST 同样就地拒绝（failRequest 对它们同样会令 Chromium 崩溃）；条目 ruled 仍是 block / fail 且算 failed", async () => {
+    const e = await mk();
+    await e.rules({ action: "block", pattern: "*/api/blocked*" });
+    await e.rules({ action: "fail", pattern: "*/api/failed*", errorReason: "ConnectionRefused" });
+    for (const [rid, path] of [["B1", "blocked"], ["F1", "failed"]] as const) {
+      const url = `https://crm-api.test/api/${path}`;
+      e.emit("Network.requestWillBeSent", { requestId: rid, timestamp: 1, type: "XHR", request: { url, method: "POST", headers: { Origin: "https://crm.test" }, hasPostData: true } });
+      e.pause({ url, method: "POST", headers: { Origin: "https://crm.test" }, hasPostData: true, postData: "x", networkId: rid });
+      await e.settle();
+      e.emit("Network.loadingFailed", { requestId: rid, timestamp: 1.1, errorText: "net::ERR_UNSAFE_PORT", canceled: false, type: "XHR" });
+    }
+    expect(e.cmds("Fetch.failRequest")).toHaveLength(0);
+    expect(e.cmds("Fetch.fulfillRequest")).toHaveLength(0);
+    expect(e.cmds("Fetch.continueRequest").map((c) => c.params.url)).toEqual([REFUSE_URL, REFUSE_URL]);
+    const list = e.tab.networkRing.list();
+    expect(list.find((x: any) => x.url.endsWith("/api/blocked"))).toMatchObject({ ruled: "block", failed: true });
+    expect(list.find((x: any) => x.url.endsWith("/api/failed"))).toMatchObject({ ruled: "fail", failed: true });
+    // 对照：同一条 block 规则对跨源 GET 仍是 failRequest(BlockedByClient)
+    e.pause({ url: "https://crm-api.test/api/blocked?g=1", method: "GET", headers: { Origin: "https://crm.test" } });
+    await e.settle();
+    expect(e.lastCmd("Fetch.failRequest")!.params.errorReason).toBe("BlockedByClient");
   });
 
   it("set_headers：continueRequest 带整体 headers（原头 + 新头）；命中次数累加到 list", async () => {

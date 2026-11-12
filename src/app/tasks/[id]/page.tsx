@@ -28,7 +28,8 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { usePanelRef } from "react-resizable-panels";
 import {
   ChevronLeft,
-  Flag,
+  ChevronsDown,
+  ChevronsUp,
   Loader2,
   PanelLeftClose,
   PanelLeftOpen,
@@ -38,7 +39,6 @@ import {
   RotateCcw,
   Sparkles,
   Square,
-  XCircle,
   Zap,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -53,6 +53,7 @@ import { registerBrowserPanelOpener } from "@/components/browser/browser-panel-b
 import { BrowserToggleButton } from "@/components/browser/browser-toggle-button";
 import { LeftPaneSwitch, type LeftPaneTab } from "@/components/browser/left-pane-switch";
 import { useBrowserAutoOpen } from "@/components/browser/use-browser-auto-open";
+import { useBrowserAvailable } from "@/components/browser/use-browser-session";
 import { MrInboxTaskBanner } from "@/components/mr-inbox/mr-inbox-task-banner";
 import { ActionWorkbenchHeader } from "@/components/tasks/action-workbench-header";
 import { AdvanceDialog } from "@/components/tasks/advance-dialog";
@@ -114,6 +115,16 @@ import {
 } from "@/lib/action-selection";
 import { describeCorruptTask } from "@/lib/corrupt-task-display";
 import {
+  isTaskHeaderCompact,
+  readTaskHeaderDetailsOpen,
+  writeTaskHeaderDetailsOpen,
+} from "@/lib/task-header-compact";
+import {
+  forgetTaskLeftTab,
+  readTaskLeftTab,
+  writeTaskLeftTab,
+} from "@/lib/task-left-tab-memory";
+import {
   deriveTaskHeaderRunBadge,
   taskStopButtonView,
 } from "@/lib/task-header-status";
@@ -154,7 +165,6 @@ import {
 } from "@/lib/testing-task";
 import {
   fetchTask,
-  finalizeTask,
   getPendingQuestionSend,
   appendTaskEvent,
   applyRewoundResult,
@@ -338,6 +348,8 @@ const TaskDetailPage = () => {
   // （列表 epoch / sticky 由 coordinator 通知；本页清 state；chat pending 由 ChatView 先清）
   const handleTaskDeleted = useCallback((deletedId: string) => {
     commitTaskDeleted(deletedId);
+    // 任务没了，它的左栏标签记忆一并忘掉（不是当前页的任务删除也要清）
+    forgetTaskLeftTab(deletedId);
     if (deletedId !== routeIdRef.current) return;
     clearStreaming();
     setTask(null);
@@ -358,8 +370,11 @@ const TaskDetailPage = () => {
     // 折叠态属于上一个任务的 Group（key=task.id、切任务会重挂）；新 Group 总是展开着挂
     setArtifactCollapsed(false);
     setEventStreamCollapsed(false);
-    // 左栏标签同理：浏览器标签属于上一个任务的会话，新任务回到「产物」
+    // 左栏标签同理：浏览器标签属于上一个任务的会话，先回到「产物」（仅复位 state、不写记忆）；
+    // 新任务上次停在浏览器的话，等分栏挂好后由下面的「恢复上次标签」effect 切过去
+    // （marker 同时清掉：A → B 还没加载完又切回 A 时，A 也要恢复）
     setLeftTab("artifact");
+    restoredLeftTabFor.current = null;
   }, [id, clearStreaming]);
 
   // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松——
@@ -778,6 +793,12 @@ const TaskDetailPage = () => {
   const [eventStreamCollapsed, setEventStreamCollapsed] = useState(false);
   // 左栏当前内容：产物 / 内置浏览器（仅桌面端有入口）。ArtifactPanel 始终挂着、只是隐藏，切回来不丢滚动与选区
   const [leftTab, setLeftTab] = useState<LeftPaneTab>("artifact");
+  // 用户 / 自动展开造成的标签切换都走这里：切 state 的同时记下「这个任务停在哪个标签」（lib/task-left-tab-memory），
+  // 切走（别的任务 / 对话页）再切回来由下面的恢复 effect 定位回去。任务切换时的复位不走这里（那是复位、不是用户的选择）
+  const switchLeftTab = useCallback((tab: LeftPaneTab) => {
+    setLeftTab(tab);
+    writeTaskLeftTab(routeIdRef.current, tab);
+  }, []);
   // 折叠态同步给「搜索此栏」路由：折叠后 Cmd/Ctrl+F 不再落进看不见的产物搜索框（R9a-01）；
   // 左栏切到浏览器时产物区同样看不见，一并算折叠；离开页面复位
   useEffect(() => {
@@ -827,9 +848,18 @@ const TaskDetailPage = () => {
   // 真窗口里库的表现未验证
   const showBrowserPane = useCallback(() => {
     prepareBrowserPaneEntry(artifactPanelRef.current, mainElRef.current?.clientWidth);
-    setLeftTab("browser");
-  }, [artifactPanelRef]);
+    switchLeftTab("browser");
+  }, [artifactPanelRef, switchLeftTab]);
   const browserPaneOpen = leftTab === "browser" && !artifactCollapsed;
+  // 头部紧凑态：浏览器真的看得见时，头部收成标题行（有预览位在跑时多一行预览胶囊），仓库 / 分支 / 测试链接 / 辅助入口 chip 收进「任务详情」展开钮（规则与持久化见 lib/task-header-compact）。
+  // 惰性初始值读 localStorage：初始 leftTab 恒为 artifact、紧凑态不生效，首帧 DOM 与服务端一致，不会水合不一致
+  const [headerDetailsOpen, setHeaderDetailsOpen] = useState(readTaskHeaderDetailsOpen);
+  const toggleHeaderDetails = useCallback(() => {
+    const next = !headerDetailsOpen;
+    setHeaderDetailsOpen(next);
+    writeTaskHeaderDetailsOpen(next);
+  }, [headerDetailsOpen]);
+  const headerCompact = isTaskHeaderCompact({ browserPaneOpen, detailsOpen: headerDetailsOpen });
   // 「放大浏览器」= 折叠事件流栏、浏览器占满整行。记下这次折叠是不是放大造成的：
   // 关闭浏览器 / 切回产物时只有「放大造成的」才自动把事件流还原；用户自己用头部按钮折叠的事件流，不替他展开
   const browserMaximizedRef = useRef(false);
@@ -853,8 +883,8 @@ const TaskDetailPage = () => {
   const closeBrowserPane = useCallback(() => {
     userCloseIntentRef.current.mark(Date.now());
     restoreEventStreamFromMaximize();
-    setLeftTab("artifact");
-  }, [restoreEventStreamFromMaximize]);
+    switchLeftTab("artifact");
+  }, [restoreEventStreamFromMaximize, switchLeftTab]);
   const toggleBrowserPane = useCallback(() => {
     if (browserPaneOpen) closeBrowserPane();
     else showBrowserPane();
@@ -866,10 +896,10 @@ const TaskDetailPage = () => {
       else {
         userCloseIntentRef.current.mark(Date.now());
         restoreEventStreamFromMaximize();
-        setLeftTab(tab);
+        switchLeftTab(tab);
       }
     },
-    [showBrowserPane, restoreEventStreamFromMaximize],
+    [showBrowserPane, restoreEventStreamFromMaximize, switchLeftTab],
   );
   // 「放大」把事件流折叠了，而 ask_user 答题卡就在事件流里：这时来了新的待回答提问，把放大造成的折叠还原（审核 R8-05 ①）。
   // 只管放大造成的（browserMaximizedRef）；用户自己折叠的事件流不替他展开。askId 的上升沿检测见 useRevealOnNewAsk
@@ -885,6 +915,18 @@ const TaskDetailPage = () => {
     if (!browserTaskId) return;
     return registerBrowserPanelOpener(browserTaskId, showBrowserPane);
   }, [browserTaskId, showBrowserPane]);
+  // 恢复上次的左栏标签：这个任务上次停在「浏览器」的话，分栏挂好后切过去（走 showBrowserPane：先放宽栏宽再换标签）。
+  // 时机：任务已加载（browserTaskId 非空）+ 主区宽度已量到（= ResizablePanelGroup 已挂）+ 有浏览器桥（网页版没有浏览器标签）；
+  // 每个任务只恢复一次（restoredLeftTabFor 记着），之后用户怎么切都以用户为准。
+  // 切回「产物」会把记忆删掉（lib/task-left-tab-memory），所以只有「最后一次停在浏览器」的任务才会被恢复
+  const browserAvailable = useBrowserAvailable();
+  const restoredLeftTabFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!browserTaskId || mainWidth == null || !browserAvailable) return;
+    if (restoredLeftTabFor.current === browserTaskId) return;
+    restoredLeftTabFor.current = browserTaskId;
+    if (readTaskLeftTab(browserTaskId) === "browser") showBrowserPane();
+  }, [browserTaskId, mainWidth, browserAvailable, showBrowserPane]);
   // AI 开始用浏览器 / 请用户操作时自动展开（只对当前显示的任务；手动收起后本轮不再自动弹）
   useBrowserAutoOpen({
     taskId: browserTaskId,
@@ -1089,15 +1131,9 @@ const TaskDetailPage = () => {
     task.repoStatus !== "merged" &&
     task.repoStatus !== "abandoned";
 
-  // 终结按钮：任务有 action（不是空壳）且没在跑（不是 running）、并且没被终结过
-  const canFinalize =
-    task.actions.length > 0 &&
-    task.runStatus !== "running" &&
-    task.repoStatus !== "merged" &&
-    task.repoStatus !== "abandoned";
-
-  // 恢复按钮：终态（merged / abandoned）才显示——给误 abandon / 想重新捡起的 task 留出路
-  // 终态时 canAdvance / canFinalize 都 false、其它操作按钮全隐藏、恢复是唯一入口
+  // 恢复按钮：终态（merged / abandoned）才显示——给历史上已标「已合入 / 已放弃」的任务留出路
+  // （2026-11-12：「已合入 / 放弃」按钮已去掉、归档足够用；新任务不会再进入这两个终态，但老任务里还有）
+  // 终态时 canAdvance 为 false、其它操作按钮全隐藏、恢复是唯一入口
   const canReopen =
     task.repoStatus === "merged" || task.repoStatus === "abandoned";
 
@@ -1289,35 +1325,8 @@ const TaskDetailPage = () => {
     }
   };
 
-  // ---- 终结：merged / abandoned ----
-  // V0.6.0.1：仅 task 模式可终结（MR 合入 / 放弃）；chat 模式 ChatView 顶部没按钮、走自然清理
-  const handleFinalize = async (finalStatus: "merged" | "abandoned") => {
-    if (!task) return;
-    const ok = await confirm({
-      title: finalStatus === "merged" ? "确认任务已合入" : "确认放弃任务",
-      description:
-        finalStatus === "merged"
-          ? // 不写死「main」：合入的目标分支因任务 / 仓而异（与事件流那句 formatFinalizeNotice「任务已标记为已合入」同口径）
-            "标记本任务已合入（对应 MR 已合并）、agent 收尾结束 run"
-          : "标记本任务已放弃、agent 收尾结束 run、产物保留只读",
-      destructive: finalStatus === "abandoned",
-      confirmLabel: finalStatus === "merged" ? "已合入" : "放弃任务",
-    });
-    if (!ok) return;
-    setStarting(true);
-    try {
-      const updated = await finalizeTask(task.id, finalStatus);
-      absorbTask(updated);
-      if (finalStatus === "abandoned") toast.success("任务已放弃");
-    } catch (err) {
-      toast.error(`终结失败：${(err as Error).message}`);
-    } finally {
-      setStarting(false);
-    }
-  };
-
   // ---- 恢复：merged / abandoned → developing ----
-  // 给误 abandon / 想重新捡起的终态 task 留出路（否则终态后操作按钮全隐藏、锁死只读）
+  // 给历史终态 task（老数据里的已合入 / 已放弃）留出路（否则终态后操作按钮全隐藏、锁死只读）
   const handleReopen = async () => {
     if (!task) return;
     const ok = await confirm({
@@ -1379,10 +1388,37 @@ const TaskDetailPage = () => {
   // runStatus 也进来：latch 要等 effect 才置位，首个 commit 不能把在跑的工具画成「已中断」（D9-03）
   const runFlags = deriveRunFlags({ runActive, runStatus: task.runStatus });
 
+  // 左右分栏的**唯一**开关（状态感知，动作与文案见 planSplitToggle / SPLIT_TOGGLE_LABEL）：
+  // 分栏时点它 = 收起产物栏、事件流占满（窄窗口把整行宽度让给事件流，V13 窄栏策略）；
+  // 事件流占满时点它 = 展开产物栏；产物 / 浏览器占满（浏览器「放大」或拖分隔条造成的）时点它 = 把事件流请回来。
+  // 以前这里是「产物栏」「事件流栏」两颗图标几乎一样的按钮，事件流占满时两颗都在往产物那边切，用户分不清。
+  // 图标与读屏名都随状态变（和侧栏开关同一套做法），不再另挂 aria-pressed / aria-expanded；拖分隔条到下限以下同样会自动折叠。
+  // JSX 只在这一处定义：正常态渲染在辅助入口 chip 行最右，头部紧凑态（chip 行收起）渲染在标题行右侧——同一时刻只挂其中一处
+  const splitToggleButton = (
+    <Tooltip content={SPLIT_TOGGLE_LABEL[splitToggleAction]}>
+      <Button
+        type="button"
+        variant="outline"
+        size="icon-sm"
+        onClick={toggleSplitLayout}
+        aria-label={SPLIT_TOGGLE_LABEL[splitToggleAction]}
+      >
+        {splitToggleAction === "collapse-artifact" ? (
+          <PanelLeftClose />
+        ) : splitToggleAction === "expand-artifact" ? (
+          <PanelLeftOpen />
+        ) : (
+          <PanelRightOpen />
+        )}
+      </Button>
+    </Tooltip>
+  );
+
   return (
     <div className="flex h-full flex-col">
-      {/* 顶部条 */}
-      <div className="shrink-0 px-6 py-3">
+      {/* 顶部条。浏览器可见时（headerCompact）只留标题行：下面标「紧凑态收起」的块用 hidden 隐藏、不卸载，
+          改动面板 / 批次进度等的状态与已拉的数据都保留，展开时不重新请求 */}
+      <div className={cn("shrink-0 px-6", headerCompact ? "py-2" : "py-3")}>
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <div className="min-w-0">
@@ -1459,15 +1495,20 @@ const TaskDetailPage = () => {
                 ) : null}
               </div>
               {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）
-                  ——本分支已是 task 模式（chat 模式在上面提前 return ChatView） */}
-              <WorkspaceActions task={task} />
-              {/* R14 Q3-01：MR 链接（ship / dev action 落档后出现、多仓平铺）。v1.7.1 头部重构误删，
-                  做成叶子组件放回来——只吃 mrs + 两份分支快照，不传整个 task */}
-              <TaskMrLinks
-                mrs={task.mrs}
-                repoTestBranches={task.repoTestBranches}
-                repoDevBranches={task.repoDevBranches}
-              />
+                  ——本分支已是 task 模式（chat 模式在上面提前 return ChatView）。
+                  紧凑态不能整块藏起来：它里面有预览胶囊（停止 / 重启 / 日志），点端口进内置浏览器后恰恰最需要它；
+                  所以它始终挂在 hidden 容器**外面**，由 compact 让它自己只留有预览的仓的胶囊（其余入口收起） */}
+              <WorkspaceActions task={task} compact={headerCompact} />
+              {/* 紧凑态收起：MR 链接（仓库 / 分支在上面 WorkspaceActions 里随 compact 收起），浏览器可见时折进「任务详情」 */}
+              <div className={cn(headerCompact && "hidden")}>
+                {/* R14 Q3-01：MR 链接（ship / dev action 落档后出现、多仓平铺）。v1.7.1 头部重构误删，
+                    做成叶子组件放回来——只吃 mrs + 两份分支快照，不传整个 task */}
+                <TaskMrLinks
+                  mrs={task.mrs}
+                  repoTestBranches={task.repoTestBranches}
+                  repoDevBranches={task.repoDevBranches}
+                />
+              </div>
             </div>
           </div>
 
@@ -1483,29 +1524,6 @@ const TaskDetailPage = () => {
                 {starting ? <Loader2 className="animate-spin" /> : <Zap />}
                 推进
               </Button>
-            )}
-            {canFinalize && (
-              <>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleFinalize("merged")}
-                  disabled={starting}
-                >
-                  <Flag />
-                  已合入
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleFinalize("abandoned")}
-                  disabled={starting}
-                  className="text-muted-foreground hover:text-destructive"
-                >
-                  <XCircle />
-                  放弃
-                </Button>
-              </>
             )}
             {/* 显隐只认 isStopButtonVisible（runStatus 单一口径，安全契约：点下去走 stopTaskAgent 核弹路径），
                 这里不并 runActive / awaitingAskAnswer。 */}
@@ -1541,12 +1559,41 @@ const TaskDetailPage = () => {
                 恢复
               </Button>
             )}
+            {/* 左栏在浏览器标签时，分栏按钮固定在标题行（不管头部此刻紧凑与否、产物栏是否折叠）：
+                紧凑态下辅助入口 chip 行已收起，不然浏览器标签下就没有入口能还原事件流；
+                按 leftTab 而不是 headerCompact 定位置——折叠产物栏会让 headerCompact 翻回 false，
+                按钮若跟着从标题行换到 chip 行，用户刚点的按钮就在眼前消失、页面整体下移、键盘焦点丢到 body（R15-21） */}
+            {leftTab === "browser" && splitToggleButton}
+            {/* 浏览器可见时才有：头部详情的收起 / 展开钮（读屏名固定为「任务详情」+ aria-expanded，不随状态改名） */}
+            {browserPaneOpen && (
+              <>
+                <Tooltip
+                  content={
+                    headerCompact
+                      ? "展开任务详情（仓库 / 分支 / 基本信息 / MCP / 改动…）"
+                      : "收起任务详情，给浏览器腾出空间"
+                  }
+                >
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon-sm"
+                    onClick={toggleHeaderDetails}
+                    aria-label="任务详情"
+                    aria-expanded={!headerCompact}
+                  >
+                    {headerCompact ? <ChevronsDown /> : <ChevronsUp />}
+                  </Button>
+                </Tooltip>
+              </>
+            )}
           </div>
         </div>
 
         {/* 任务级辅助入口同排：弹窗触发 chip（基本信息 / 任务上下文 / MCP / 分批）+
-            竖分隔线 + 执行型按钮（需求群 / 任务文件夹）——按交互类型分组 */}
-        <div className="mt-3 flex flex-wrap items-center gap-2">
+            竖分隔线 + 执行型按钮（需求群 / 任务文件夹）——按交互类型分组。
+            紧凑态收起（hidden、不卸载：改动面板 / 批次进度的状态与已拉的数据都保留） */}
+        <div className={cn("mt-3 flex flex-wrap items-center gap-2", headerCompact && "hidden")}>
           {/* 任务基本信息：编辑任务 dialog 入口（标题 / 角色 / 飞书链接 / 模型 / 分支）；
               跟标题同排会混进状态 Badge、放这排入口 chip 组首位；running 时隐藏 */}
           {task.runStatus !== "running" && (
@@ -1577,29 +1624,8 @@ const TaskDetailPage = () => {
           />
           <div className="h-4 w-px shrink-0 bg-border" />
           <TaskUtilityActions task={task} onTaskUpdate={absorbTask} />
-          {/* 左右分栏的**唯一**开关（状态感知，动作与文案见 planSplitToggle / SPLIT_TOGGLE_LABEL）：
-              分栏时点它 = 收起产物栏、事件流占满（窄窗口把整行宽度让给事件流，V13 窄栏策略）；
-              事件流占满时点它 = 展开产物栏；产物 / 浏览器占满（浏览器「放大」或拖分隔条造成的）时点它 = 把事件流请回来。
-              以前这里是「产物栏」「事件流栏」两颗图标几乎一样的按钮，事件流占满时两颗都在往产物那边切，用户分不清。
-              图标与读屏名都随状态变（和侧栏开关同一套做法），不再另挂 aria-pressed / aria-expanded；拖分隔条到下限以下同样会自动折叠 */}
-          <Tooltip content={SPLIT_TOGGLE_LABEL[splitToggleAction]}>
-            <Button
-              type="button"
-              variant="outline"
-              size="icon-sm"
-              className="ml-auto"
-              onClick={toggleSplitLayout}
-              aria-label={SPLIT_TOGGLE_LABEL[splitToggleAction]}
-            >
-              {splitToggleAction === "collapse-artifact" ? (
-                <PanelLeftClose />
-              ) : splitToggleAction === "expand-artifact" ? (
-                <PanelLeftOpen />
-              ) : (
-                <PanelRightOpen />
-              )}
-            </Button>
-          </Tooltip>
+          {/* 分栏开关的定义见上面的 splitToggleButton；左栏在浏览器标签时它在标题行右侧，这里只在产物标签挂 */}
+          {leftTab !== "browser" && <span className="ml-auto">{splitToggleButton}</span>}
         </div>
         {/* 提测收件箱提醒条：本需求（feishuStoryUrl 对应工作项）有未读待测 MR 时挂出 */}
         <MrInboxTaskBanner feishuStoryUrl={task.feishuStoryUrl} className="mt-3" />

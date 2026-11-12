@@ -1494,7 +1494,8 @@ export class BrowserTab {
     void __t0;
     if (typeof rest.status === "number" && rest.status >= 400) rest.failed = true;
     // E2·S3 A5：被规则 block / fail 掉的请求一定算「失败」（CDP 对 Fetch.failRequest 的 loadingFailed 可能带 canceled，那样默认不算失败）
-    if ((rest.ruled === "block" || rest.ruled === "fail") && typeof rest.errorText === "string" && rest.errorText !== "") rest.failed = true;
+    // R14：mock-refused（mock 命中了会让 Chromium 崩溃的「跨源 / 无法确认同源 + 带体」请求，引擎不发终结命令，改发 continueRequest 并把 url 改写到受限端口 REFUSE_URL、本机立刻失败）同理
+    if ((rest.ruled === "block" || rest.ruled === "fail" || rest.ruled === "mock-refused") && typeof rest.errorText === "string" && rest.errorText !== "") rest.failed = true;
     // V2：id 在这里分配（= 列表顺序，单调递增，clear 后不回绕），详情另存暂存表，环形缓冲里的条目保持轻量
     rest.id = ++this.netSeq;
     this.networkRing.push(rest);
@@ -1527,7 +1528,7 @@ export class BrowserTab {
   }
 
   /**
-   * E2·S3 A5：网络规则（Fetch.requestPaused）处理了一个请求，给对应的网络条目打 `ruled` 标记（block / fail / mock / delay / headers）。
+   * E2·S3 A5：网络规则（Fetch.requestPaused）处理了一个请求，给对应的网络条目打 `ruled` 标记（block / fail / mock / delay / headers / mock-refused）。
    * `networkId` 即 `Network.requestId`。正常情况 requestWillBeSent 先到、条目还在途；顺序反了就暂存（≤200 条），条目创建时取走。
    */
   noteNetworkRuled({ sessionId = null, networkId, ruled, ruleId } = {}) {

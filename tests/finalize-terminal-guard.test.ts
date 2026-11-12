@@ -1,10 +1,13 @@
 /**
- * R14 Q7a-01：finalizeTask 终态守卫 + finalize route 409
+ * R14 Q7a-01：finalizeTask 终态守卫
+ *
+ * 2026-11-12：任务页的「已合入 / 放弃」按钮和 POST /api/tasks/[id]/finalize 路由已移除（归档足够用），
+ * 原 route 级用例（终态冲突映射 409 / 其余错误语义）随路由一起删除；这里只保留 server 侧 finalizeTask 函数本身的守卫用例。
  *
  * 背景：任务已合入（merged）/ 已放弃（abandoned）之后，陈旧标签页（MR 其实早已合入、页面还停在「待合入」）再点「放弃」，
  * 旧实现不抛错——把 repoStatus 从 merged 翻成 abandoned、再写一条「任务已放弃」事件、再停预览 / 删 worktree / 取消定时。
  * 修复：finalizeTask 在占住 finalizing lifecycle 之后、任何副作用之前，读**盘上 fresh** 的 repoStatus——
- * 已是终态且与本次请求「相反」→ 抛 TaskTerminalConflictError（route 映射 409）；抛错后 finally 释放 lifecycle。
+ * 已是终态且与本次请求「相反」→ 抛 TaskTerminalConflictError；抛错后 finally 释放 lifecycle。
  * 「同目标」重复 finalize（merged → merged / abandoned → abandoned）**不拦**：它走完整流程（join 在飞 cleanup / 幂等补清理，
  * 由 ownership-r34-cleanup-coord 钉着）。
  *
@@ -55,11 +58,9 @@ const taskFs = await import("@/lib/server/task-fs");
 const previewManager = await import("@/lib/server/preview-manager");
 const taskWorktrees = await import("@/lib/server/task-worktrees");
 const scheduleStore = await import("@/lib/server/schedule-store");
-const { beginChatLifecycle, clearChatGate, endChatLifecycle, getChatLifecycle } =
-  await import("@/lib/server/chat-gate");
+const { clearChatGate, getChatLifecycle } = await import("@/lib/server/chat-gate");
 const { clearResourceJobs } = await import("@/lib/server/task-stream");
 const taskRunner = await import("@/lib/server/task-runner");
-const finalizeRoute = await import("@/app/api/tasks/[id]/finalize/route");
 
 const { finalizeTask, reopenTask } = taskRunner;
 
@@ -665,157 +666,6 @@ describe("finalizeTask 终态守卫：不该被误伤的既有行为（对照，
       const texts = await eventTexts(id);
       expect(texts.some((t) => t.includes(NOTICE_MERGED))).toBe(true);
       expect(texts.some((t) => t.includes(NOTICE_ABANDONED))).toBe(false);
-    },
-    TEST_TIMEOUT_MS,
-  );
-});
-
-// ═════════════════════════ route 级：POST /api/tasks/[id]/finalize ═════════════════════════
-
-/** 构造 finalize POST（body 可传对象，或传 raw 字符串模拟非 JSON） */
-const callFinalize = (
-  id: string,
-  body: unknown,
-  raw?: string,
-): Promise<Response> =>
-  finalizeRoute.POST(
-    new Request(`http://localhost/api/tasks/${id}/finalize`, {
-      method: "POST",
-      body: raw ?? JSON.stringify(body),
-    }),
-    { params: Promise.resolve({ id }) },
-  );
-
-interface FinalizeRouteBody {
-  ok?: boolean;
-  error?: string;
-  task?: { repoStatus?: string };
-}
-
-/**
- * 保护：route 把 TaskTerminalConflictError 映射成 409（陈旧标签页误点的 HTTP 语义），而不是 200 / 400。
- * [回归] 用例：改前第二次 POST 返回 200 + ok:true 并翻掉状态。
- */
-describe("POST /api/tasks/[id]/finalize：终态冲突映射 409", () => {
-  /**
-   * [回归] 保护：陈旧标签页场景的 HTTP 语义——任务已终态再 POST 相反的 finalStatus → **409**（不是 200、也不是 400），
-   * 响应 JSON 的 error 带「已合入 / 已放弃」让前端能给出准确提示；任务状态不被翻，且响应里没有 ok:true。
-   * 两个方向都测（已合入再放弃 / 已放弃再合入）。
-   * 改前：第二次 POST 返回 200 + ok:true，repoStatus 被翻掉。
-   */
-  it.each([
-    { first: "merged", second: "abandoned", hint: "任务已合入" },
-    { first: "abandoned", second: "merged", hint: "任务已放弃" },
-  ] as const)(
-    "[回归] 已 $first 再 POST $second → 409、error 含「$hint」、repoStatus 不变",
-    async ({ first, second, hint }) => {
-      const id = await makeTask();
-      const res1 = await callFinalize(id, { finalStatus: first, reason: "第一次" });
-      expect(res1.status, "第一次 finalize 应 200").toBe(200);
-      expect(await repoStatusOf(id)).toBe(first);
-
-      const res2 = await callFinalize(id, {
-        finalStatus: second,
-        reason: "陈旧标签页误点",
-      });
-      expect(
-        res2.status,
-        "已终态再 POST 相反的 finalStatus 必须 409（改前：200 并翻状态）",
-      ).toBe(409);
-      const json = (await res2.json()) as FinalizeRouteBody;
-      expect(json.error).toContain(hint);
-      expect(json.ok).toBeUndefined();
-
-      expect(await repoStatusOf(id), "409 之后状态不得被翻").toBe(first);
-    },
-    TEST_TIMEOUT_MS,
-  );
-});
-
-/**
- * 保护：route 的其余错误语义不因新增 409 分支而变——不存在 404、格式错 400、正常 / 同目标重复 200、其它 finalizeTask 错误仍 400。
- * 全部是 [对照] 用例：改前改后都绿。
- */
-describe("POST /api/tasks/[id]/finalize：其余错误语义不变（对照，改前改后都绿）", () => {
-  /** [对照] 保护：task 不存在 → 404 not_found（先于 finalizeTask，守卫不会误把它说成 409 / 400）。 */
-  it(
-    "[对照] task 不存在 → 404",
-    async () => {
-      const res = await callFinalize(`t_not_exist_${Date.now()}`, {
-        finalStatus: "merged",
-      });
-      expect(res.status).toBe(404);
-      expect(((await res.json()) as FinalizeRouteBody).error).toBe("not_found");
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  /**
-   * [对照] 保护：请求格式错仍是 400，且不碰任务——finalStatus 缺失 / 不是 merged|abandoned、body 不是 JSON。
-   * 状态码 409 只留给「终态冲突」，格式错不能被误映射。
-   */
-  it.each([
-    { name: "finalStatus 不是 merged/abandoned", body: { finalStatus: "developing" }, raw: undefined },
-    { name: "缺 finalStatus", body: {}, raw: undefined },
-    { name: "body 不是 JSON", body: undefined, raw: "这不是 JSON {" },
-  ])(
-    "[对照] 请求格式错（$name）→ 400，任务不受影响",
-    async ({ body, raw }) => {
-      const id = await makeTask();
-      const res = await callFinalize(id, body, raw);
-      expect(res.status).toBe(400);
-      expect(typeof ((await res.json()) as FinalizeRouteBody).error).toBe(
-        "string",
-      );
-      expect(await repoStatusOf(id)).toBe("developing");
-      expect(await taskFsCore.readEvents(id)).toEqual([]);
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  /**
-   * [对照] 保护：正常 finalize 仍 200 且 ok:true、响应带最新 task；同目标重复 POST 仍 200（守卫不拦同目标）。
-   */
-  it(
-    "[对照] 正常 finalize → 200 且 ok:true；同目标重复 POST → 仍 200",
-    async () => {
-      const id = await makeTask();
-
-      const res1 = await callFinalize(id, { finalStatus: "merged" });
-      expect(res1.status).toBe(200);
-      const json1 = (await res1.json()) as FinalizeRouteBody;
-      expect(json1.ok).toBe(true);
-      expect(json1.task?.repoStatus).toBe("merged");
-
-      const res2 = await callFinalize(id, { finalStatus: "merged" });
-      expect(res2.status, "同目标重复 POST 不拦").toBe(200);
-      const json2 = (await res2.json()) as FinalizeRouteBody;
-      expect(json2.ok).toBe(true);
-      expect(json2.task?.repoStatus).toBe("merged");
-      expect(await repoStatusOf(id)).toBe("merged");
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  /**
-   * [对照] 保护：409 只给「终态冲突」——其它 finalizeTask 抛错（这里用 stop 在飞、lifecycle 被占）仍是 400，
-   * 文案是「请稍后再试」。防止有人把 route 的 catch 改成一律 409。
-   */
-  it(
-    "[对照] 其它错误仍是 400、不被误映射成 409（stopping 在飞 → 400「请稍后再试」）",
-    async () => {
-      const id = await makeTask();
-      expect(beginChatLifecycle(id, "stopping")).toBe(true);
-      try {
-        const res = await callFinalize(id, { finalStatus: "merged" });
-        expect(res.status).toBe(400);
-        expect(((await res.json()) as FinalizeRouteBody).error).toContain(
-          "请稍后再试",
-        );
-      } finally {
-        endChatLifecycle(id, "stopping");
-      }
-      expect(await repoStatusOf(id)).toBe("developing");
     },
     TEST_TIMEOUT_MS,
   );
