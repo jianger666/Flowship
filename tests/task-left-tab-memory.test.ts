@@ -176,7 +176,7 @@ describe("页面接线契约（task 详情页左栏标签记忆）", () => {
   it("恢复 effect：任务已加载 + 分栏已挂 + 有浏览器桥才恢复；每个任务只恢复一次；走 showBrowserPane", () => {
     expect(code).toMatch(/const browserAvailable = useBrowserAvailable\(\);/);
     expect(code).toMatch(
-      /if \(!browserTaskId \|\| mainWidth == null \|\| !browserAvailable\) return;\s*if \(restoredLeftTabFor\.current === browserTaskId\) return;\s*restoredLeftTabFor\.current = browserTaskId;\s*if \(readTaskLeftTab\(browserTaskId\) === "browser"\) showBrowserPane\(\);/,
+      /if \(!browserTaskId \|\| mainWidth == null \|\| !browserAvailable\) return;\s*if \(restoredLeftTabFor\.current === browserTaskId\) return;\s*restoredLeftTabFor\.current = browserTaskId;\s*if \(readTaskLeftTab\(browserTaskId\) === "browser"\) \{\s*showBrowserPane\(\{ keepCollapsed: readTaskSplit\(browserTaskId\) === "artifact" \}\);\s*\}/,
     );
     expect(code).toMatch(/\}, \[browserTaskId, mainWidth, browserAvailable, showBrowserPane\]\);/);
   });

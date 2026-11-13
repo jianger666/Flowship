@@ -23,7 +23,7 @@
  *
  */
 
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { usePanelRef } from "react-resizable-panels";
 import {
@@ -124,6 +124,14 @@ import {
   readTaskLeftTab,
   writeTaskLeftTab,
 } from "@/lib/task-left-tab-memory";
+import {
+  applyTaskSplitRestore,
+  collapsedPaneFromLayout,
+  forgetTaskSplit,
+  readTaskSplit,
+  writeTaskSplit,
+  type CollapsedPane,
+} from "@/lib/task-split-memory";
 import {
   deriveTaskHeaderRunBadge,
   taskStopButtonView,
@@ -350,6 +358,7 @@ const TaskDetailPage = () => {
     commitTaskDeleted(deletedId);
     // 任务没了，它的左栏标签记忆一并忘掉（不是当前页的任务删除也要清）
     forgetTaskLeftTab(deletedId);
+    forgetTaskSplit(deletedId);
     if (deletedId !== routeIdRef.current) return;
     clearStreaming();
     setTask(null);
@@ -375,6 +384,8 @@ const TaskDetailPage = () => {
     // （marker 同时清掉：A → B 还没加载完又切回 A 时，A 也要恢复）
     setLeftTab("artifact");
     restoredLeftTabFor.current = null;
+    // 分栏收起态的恢复标记同理：新任务的 Group 重挂后要再按它自己的记忆恢复一次（复位只动 state，不写记忆）
+    restoredSplitFor.current = null;
   }, [id, clearStreaming]);
 
   // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松——
@@ -799,6 +810,11 @@ const TaskDetailPage = () => {
     setLeftTab(tab);
     writeTaskLeftTab(routeIdRef.current, tab);
   }, []);
+  // 分栏「哪一栏被收起」的记忆（lib/task-split-memory）：只在**用户动作**里写——点分栏按钮 / 拖分隔条 / 点浏览器的放大 / 用户动作造成的展开；
+  // 库因为窗口太窄自己折叠的不写。切走（别的任务 / 对话页）再切回来由下面的恢复 effect 把那一栏重新收起。null = 两栏都展开
+  const rememberSplit = useCallback((pane: CollapsedPane | null) => {
+    writeTaskSplit(routeIdRef.current, pane);
+  }, []);
   // 折叠态同步给「搜索此栏」路由：折叠后 Cmd/Ctrl+F 不再落进看不见的产物搜索框（R9a-01）；
   // 左栏切到浏览器时产物区同样看不见，一并算折叠；离开页面复位
   useEffect(() => {
@@ -831,14 +847,20 @@ const TaskDetailPage = () => {
       artifactCollapsed: artifact?.isCollapsed() ?? false,
       eventStreamCollapsed: eventStream?.isCollapsed() ?? false,
     });
-    if (action === "expand-event-stream") eventStream?.expand();
-    else if (action === "expand-artifact") artifact?.expand();
-    else {
+    // 记忆跟着「实际动手的那一栏」走：句柄还没挂好（artifact / eventStream 为 null）时什么都没发生，也就不写
+    if (action === "expand-event-stream") {
+      eventStream?.expand();
+      if (eventStream) rememberSplit(null);
+    } else if (action === "expand-artifact") {
+      artifact?.expand();
+      if (artifact) rememberSplit(null);
+    } else {
       // 折叠产物栏会连带关掉浏览器（浏览器住在产物栏里），算「用户主动收起」
       userCloseIntentRef.current.mark(Date.now());
       artifact?.collapse();
+      if (artifact) rememberSplit("artifact");
     }
-  }, [artifactPanelRef, eventStreamPanelRef]);
+  }, [artifactPanelRef, eventStreamPanelRef, rememberSplit]);
   // 渲染用：按钮此刻的动作（图标 / 提示 / 读屏名都由它决定）；与上面的回调同一个纯函数、同一份状态口径
   const splitToggleAction = planSplitToggle({ artifactCollapsed, eventStreamCollapsed });
   // 浏览器面板：展开（必要时先把折叠的左栏展开）/ 头部入口开关 / 自动展开与「在内置浏览器打开」共用。
@@ -846,10 +868,20 @@ const TaskDetailPage = () => {
   // 换标签会让 minSize 变成像素下限、库随即按新约束重新校验当前宽度（< 下限一半直接折叠），
   // 而在 setLeftTab 之后再 expand() 读到的还是旧约束。决策与操作顺序见 prepareBrowserPaneEntry（纯逻辑，有单测）；
   // 真窗口里库的表现未验证
-  const showBrowserPane = useCallback(() => {
-    prepareBrowserPaneEntry(artifactPanelRef.current, mainElRef.current?.clientWidth);
-    switchLeftTab("browser");
-  }, [artifactPanelRef, switchLeftTab]);
+  //
+  // keepCollapsed：只有「恢复上次的左栏标签」会传——用户上次是把产物栏收起之后离开的（浏览器标签还记着），回来时
+  // 只把标签放回浏览器、不替他把栏展开（展开会撤销他收起的选择）。其余入口（头部按钮 / 自动展开 / 在内置浏览器打开）
+  // 都不传：它们的意图就是「让浏览器看得见」，栏是收起的就展开，并把「产物栏收起」的记忆一并撤掉
+  const showBrowserPane = useCallback(
+    (opts?: { keepCollapsed?: boolean }) => {
+      if (!opts?.keepCollapsed) {
+        const entry = prepareBrowserPaneEntry(artifactPanelRef.current, mainElRef.current?.clientWidth);
+        if (entry.expanded) rememberSplit(null);
+      }
+      switchLeftTab("browser");
+    },
+    [artifactPanelRef, switchLeftTab, rememberSplit],
+  );
   const browserPaneOpen = leftTab === "browser" && !artifactCollapsed;
   // 头部紧凑态：浏览器真的看得见时，头部收成标题行（有预览位在跑时多一行预览胶囊），仓库 / 分支 / 测试链接 / 辅助入口 chip 收进「任务详情」展开钮（规则与持久化见 lib/task-header-compact）。
   // 惰性初始值读 localStorage：初始 leftTab 恒为 artifact、紧凑态不生效，首帧 DOM 与服务端一致，不会水合不一致
@@ -866,19 +898,24 @@ const TaskDetailPage = () => {
   const restoreEventStreamFromMaximize = useCallback(() => {
     if (!browserMaximizedRef.current) return;
     browserMaximizedRef.current = false;
-    if (eventStreamPanelRef.current?.isCollapsed()) eventStreamPanelRef.current.expand();
-  }, [eventStreamPanelRef]);
+    if (eventStreamPanelRef.current?.isCollapsed()) {
+      eventStreamPanelRef.current.expand();
+      rememberSplit(null);
+    }
+  }, [eventStreamPanelRef, rememberSplit]);
   const toggleBrowserMaximize = useCallback(() => {
     const eventStream = eventStreamPanelRef.current;
     if (!eventStream) return;
     if (eventStream.isCollapsed()) {
       browserMaximizedRef.current = false;
       eventStream.expand();
+      rememberSplit(null);
     } else {
       browserMaximizedRef.current = true;
       eventStream.collapse();
+      rememberSplit("event-stream");
     }
-  }, [eventStreamPanelRef]);
+  }, [eventStreamPanelRef, rememberSplit]);
   // 关闭浏览器 = 切回产物（不是把整个左栏折掉）：用户多半是想回去看产物
   const closeBrowserPane = useCallback(() => {
     userCloseIntentRef.current.mark(Date.now());
@@ -915,17 +952,47 @@ const TaskDetailPage = () => {
     if (!browserTaskId) return;
     return registerBrowserPanelOpener(browserTaskId, showBrowserPane);
   }, [browserTaskId, showBrowserPane]);
+  // 恢复分栏收起态（lib/task-split-memory）：用户上次把产物栏 / 事件流栏收起之后离开的，回来时分栏一挂好就按记忆把那一栏重新收起。
+  // useLayoutEffect：在首帧绘制前收起，不让用户看到「先展开、再缩回去」的一闪（chat 页的挂载修复同款，见 use-chat-browser-pane）。
+  // 时机：任务已加载 + 主区宽度已量到（= ResizablePanelGroup 已挂）+ 两个 Panel 的句柄都在；每个任务只恢复一次（restoredSplitFor 记着），
+  // 之后用户怎么折腾都以用户为准。与浏览器桥无关（网页版同样有这颗分栏按钮）。
+  // 事件流收起有一个例外：此刻有等待回答的提问就不收——答题卡在事件流里，而 useRevealOnNewAsk 只认「新出现」的提问
+  // （页面打开时就在等的不算新），收起了就没有任何东西会把它请出来
+  const pendingAskIdRef = useRef(pendingAskId);
+  pendingAskIdRef.current = pendingAskId;
+  const restoredSplitFor = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const taskId = task?.id;
+    if (!taskId || mainWidth == null) return;
+    if (restoredSplitFor.current === taskId) return;
+    const artifact = artifactPanelRef.current;
+    const eventStream = eventStreamPanelRef.current;
+    // Group 还没挂好 / 这个任务没有分栏（chat 模式）：不标记，等下一次依赖变化再来
+    if (!artifact || !eventStream) return;
+    restoredSplitFor.current = taskId;
+    const pane = readTaskSplit(taskId);
+    if (!pane || (pane === "event-stream" && pendingAskIdRef.current)) return;
+    const collapsed = applyTaskSplitRestore(pane, { artifact, eventStream });
+    // 停在浏览器标签上收起事件流 = 「放大」：记成放大，之后关浏览器 / 切回产物才会替他把事件流还原（拖出来的收起不是，保持原样）
+    if (collapsed && pane === "event-stream" && readTaskLeftTab(taskId) === "browser") {
+      browserMaximizedRef.current = true;
+    }
+  }, [task?.id, mainWidth, artifactPanelRef, eventStreamPanelRef]);
   // 恢复上次的左栏标签：这个任务上次停在「浏览器」的话，分栏挂好后切过去（走 showBrowserPane：先放宽栏宽再换标签）。
   // 时机：任务已加载（browserTaskId 非空）+ 主区宽度已量到（= ResizablePanelGroup 已挂）+ 有浏览器桥（网页版没有浏览器标签）；
   // 每个任务只恢复一次（restoredLeftTabFor 记着），之后用户怎么切都以用户为准。
-  // 切回「产物」会把记忆删掉（lib/task-left-tab-memory），所以只有「最后一次停在浏览器」的任务才会被恢复
+  // 切回「产物」会把记忆删掉（lib/task-left-tab-memory），所以只有「最后一次停在浏览器」的任务才会被恢复。
+  // 例外：用户是把**产物栏收起**之后离开的（split 记忆 = artifact；浏览器标签还记着，因为浏览器就住在产物栏里）——
+  // 只把标签放回浏览器，不替他把栏展开（keepCollapsed），否则这次恢复会撤销他收起的选择
   const browserAvailable = useBrowserAvailable();
   const restoredLeftTabFor = useRef<string | null>(null);
   useEffect(() => {
     if (!browserTaskId || mainWidth == null || !browserAvailable) return;
     if (restoredLeftTabFor.current === browserTaskId) return;
     restoredLeftTabFor.current = browserTaskId;
-    if (readTaskLeftTab(browserTaskId) === "browser") showBrowserPane();
+    if (readTaskLeftTab(browserTaskId) === "browser") {
+      showBrowserPane({ keepCollapsed: readTaskSplit(browserTaskId) === "artifact" });
+    }
   }, [browserTaskId, mainWidth, browserAvailable, showBrowserPane]);
   // AI 开始用浏览器 / 请用户操作时自动展开（只对当前显示的任务；手动收起后本轮不再自动弹）
   useBrowserAutoOpen({
@@ -1662,6 +1729,12 @@ const TaskDetailPage = () => {
               userResizeIntentRef.current.isActive(Date.now())
             ) {
               writeLayoutDebounced(task.id, artifact);
+            }
+            // 用户在分隔条上拖的结果里哪一栏是收起的（拖到下限以下自动折叠 / 从收起态拖开）→ 记忆；
+            // 同一个「只认用户意图」的闸：挂载 / 窗口缩放造成的折叠不记。布局残缺（unknown）时不写，免得冲掉记忆
+            const collapsedPane = collapsedPaneFromLayout(layout);
+            if (collapsedPane !== "unknown" && userResizeIntentRef.current.isActive(Date.now())) {
+              rememberSplit(collapsedPane === "none" ? null : collapsedPane);
             }
           }}
         >
