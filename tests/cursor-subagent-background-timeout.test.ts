@@ -6,6 +6,8 @@
  *   → 现在超时之后再给一段宽限，到点强制按失败收尾：子 agent 关掉、busy 放掉、名额还回、onSettled 恰好一次。
  * - 上限从「子代理开始」起算，不是从转后台那一刻（前台已经跑的时间要扣掉；提示词承诺「每个最长跑 N 分钟」）。
  * - 发给 SDK 的 cancel / close 自己也有期限，收尾不被它们拖住。
+ * - 默认不限制运行时长（2026-11-13 去掉原 30 分钟上限）：上面这些超时路径靠注入 `background.maxRuntimeMs` 覆盖，
+ *   末尾「默认不限时」一组钉住不注入时的行为。
  *
  * 不碰真实 SDK：子 agent / 子 run 是注入的假依赖；全程假时钟（确定性，不靠真睡眠）。
  */
@@ -14,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetSubagentResumablesForTests,
   BACKGROUND_SUBAGENT_CANCEL_GRACE_MS,
+  BACKGROUND_SUBAGENT_MAX_RUNTIME_MS,
   createCursorSubagentLink,
   type CursorSubagentDeps,
   type SubagentChildRun,
@@ -465,5 +468,102 @@ describe("上限从「子代理开始」起算：前台已经跑的时间要扣�
     expect(runs[0]!.cancelMock).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(runs[0]!.cancelMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("默认不限制运行时长（去掉原 30 分钟上限）", () => {
+  const MIN = 60_000;
+  const HOUR = 60 * MIN;
+
+  it("默认值就是 null（不限）——改回数值要有意识地改这里", () => {
+    expect(BACKGROUND_SUBAGENT_MAX_RUNTIME_MS).toBeNull();
+  });
+
+  it("后台子代理不注入上限：跑 48 小时也不 cancel、不收尾、仍占名额；没有任何超时计时器", async () => {
+    const { link, runs, events } = setup({ cancel: "ok" });
+    await call(link, { prompt: "慢活", run_in_background: true });
+    expect(link.control.backgroundRunning()).toBe(1);
+    // 没有超时计时器（不能用 setTimeout(Infinity)：Node 会当 1ms 立刻触发）
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(48 * HOUR);
+    expect(runs[0]!.cancelMock).not.toHaveBeenCalled();
+    expect(events).toHaveLength(0);
+    expect(link.control.backgroundRunning()).toBe(1);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("跑了很久以后自己做完：照常按 done 收尾、名额还回、不重复通知、计时器全清", async () => {
+    const { link, runs, events } = setup({ cancel: "ok" });
+    await call(link, { prompt: "慢活", run_in_background: true });
+    await vi.advanceTimersByTimeAsync(3 * HOUR);
+
+    runs[0]!.finish("跑了三小时的结果");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      status: "done",
+      text: expect.stringContaining("跑了三小时的结果"),
+    });
+    expect(events[0]!.durationMs).toBeGreaterThanOrEqual(3 * HOUR);
+    expect(link.control.backgroundRunning()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(HOUR);
+    expect(events).toHaveLength(1);
+    expect(runs[0]!.cancelMock).not.toHaveBeenCalled();
+  });
+
+  it("前台跑了 40 分钟才被插话转后台：以前会被 1 秒掐掉，现在继续跑直到自己结束", async () => {
+    const { link, runs, events } = setup({ cancel: "ok" });
+    const fg = call(link, { prompt: "前台" });
+    await vi.advanceTimersByTimeAsync(40 * MIN);
+    expect(link.control.detachForeground()).toBe(1);
+    expect((await fg).text).toContain("已转到后台");
+
+    await vi.advanceTimersByTimeAsync(2 * HOUR);
+    expect(runs[0]!.cancelMock).not.toHaveBeenCalled();
+    expect(events).toHaveLength(0);
+    expect(link.control.backgroundRunning()).toBe(1);
+
+    runs[0]!.finish("转后台后跑完的结果");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ status: "done", detached: true });
+  });
+
+  it("不限时并不削弱别的收尾：用户停止会话（cancelAll）仍会取消在跑的后台子代理", async () => {
+    const { link, runs, events } = setup({ cancel: "ok" });
+    await call(link, { prompt: "慢活", run_in_background: true });
+    await vi.advanceTimersByTimeAsync(2 * HOUR);
+
+    await link.cancelAll();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runs[0]!.cancelMock).toHaveBeenCalled();
+    expect(link.control.backgroundRunning()).toBe(0);
+    expect(events.every((e) => e.status !== "done")).toBe(true);
+  });
+
+  it("给主 AI 的工具说明：不限时写「不限制运行时长」、不再出现「最长跑 N 分钟」", () => {
+    const { link } = setup();
+    const desc = link.tool.description ?? "";
+    expect(desc).toContain("不限制运行时长");
+    expect(desc).not.toContain("最长跑");
+    expect(desc).not.toMatch(/\d+ 分钟/);
+  });
+
+  it("【对照】显式注入上限时说明仍写「每个最长跑 N 分钟」，超时路径照旧", async () => {
+    const { link, runs, events } = setup({
+      cancel: "ok",
+      background: { maxRuntimeMs: 30 * MIN },
+    });
+    expect(link.tool.description ?? "").toContain("每个最长跑 30 分钟");
+    expect(link.tool.description ?? "").not.toContain("不限制运行时长");
+
+    await call(link, { prompt: "x", run_in_background: true });
+    await vi.advanceTimersByTimeAsync(30 * MIN);
+    expect(runs[0]!.cancelMock).toHaveBeenCalledTimes(1);
+    expect(events[0]).toMatchObject({ status: "failed" });
+    expect(events[0]!.text).toContain("仍未完成");
   });
 });

@@ -114,7 +114,7 @@ import {
   type OneShotMemory,
 } from "./oneshot-session-memory";
 import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
-import { validateSubmitMr } from "./submit-mr-guard";
+import { shouldUpdateExistingMrOnReuse, validateSubmitMr } from "./submit-mr-guard";
 import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
 import { shouldDisposeAfterAction } from "./mem-governance";
 import { assertNoUpdatePendingRestart } from "./update-pending";
@@ -2889,6 +2889,10 @@ export const buildSessionBridges = (
           title: mr.title,
           description: mr.description,
           removeSourceBranch,
+          // 再次提测 / 再次联调复用已有 MR 时，把 AI 传来的新标题 / 描述更新上去（R21-02：否则测试看到的永远是第一版）。
+          // 只在「task.mrs 里已有同仓 + 同目标 + 同源分支的记录」时才覆盖（R22-02）：首次提交撞上人手建的 MR、
+          // 或 custom 技能提的新 MR，只复用、不改别人写的文字
+          updateExistingOnReuse: shouldUpdateExistingMrOnReuse(fresh, mr),
         });
         if (!result.ok) {
           if (!callerStillValid()) {
@@ -2906,6 +2910,17 @@ export const buildSessionBridges = (
           );
           return { ok: false, error: result.error };
         }
+
+        // 复用已有 MR 时的「标题 / 描述更新」结果：只在复用路径才有。失败不挡 ship（MR 已在、代码已推），
+        // 但要让 AI 知道「MR 页面没变」，由它写进 artifact（见 action-ship-update.md「MR description」）。
+        if (result.updateError) {
+          console.warn(
+            `[task-runner] 复用 MR 后更新标题 / 描述失败（${mr.projectPath} !${result.iid}）：${result.updateError}`,
+          );
+        }
+        const mrUpdateData: { mr_updated?: boolean; mr_update_error?: string } = {};
+        if (result.updated !== undefined) mrUpdateData.mr_updated = result.updated;
+        if (result.updateError) mrUpdateData.mr_update_error = result.updateError;
 
         // createMR 成功后、closeOpenMR / 本地写之前复查——
         // MR 已建不可撤销，但关旧 MR + 本地落盘仍是可阻止的副作用
@@ -3090,6 +3105,8 @@ export const buildSessionBridges = (
             has_conflicts: hasConflicts,
             merge_status: detailedStatus,
             merge_undetermined: mergeUndetermined,
+            // 复用已有 MR 时才有：mr_updated=true 已更新标题 / 描述；mr_update_error 有值 = 更新失败、MR 页面没变
+            ...mrUpdateData,
           },
         };
       } finally {

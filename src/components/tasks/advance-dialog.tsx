@@ -17,6 +17,13 @@
  *     - 默认（起新 agent）显示模型选择（常用 chips + 下拉、无单独小标题）、默认值 = 本 task 最近 action
  *       实际用的模型 → task.model → settings.defaultModel、可以临时换 base + 调 thinking/effort 等 params；
  *       勾续用后本段隐藏、续接走 task.model
+ *   - 「高级」折叠区（默认收起、开合走 view-memory）：只收低频纯运行参数——续用 agent + 提供方 / 模型
+ *     + ship 的「合并后删源分支」。近期推进里 dev 97% / ship 80% / review 72% / build 43% 一个字指令都没写，
+ *     用户基本是「弹窗 → 点推进」，这些项每次摆出来是噪音。折叠头显示当前取值摘要（偏离默认 / 开了删分支
+ *     用 warning 徽标标出，纯函数见 lib/advance-advanced-summary）。默认值与提交 payload 一字未改，折叠只是呈现。
+ *     **留主区不许藏**：action 选择、指令输入、dev 推送方式（直推 / 提 PR 对外副作用完全不同）、
+ *     批次选择 / 自由改动、plan 追加提示，以及所有阻断 / 警示（准入灰卡、缺 token / host、只读仓、推进失败原因）。
+ *     模型没选又不续用时（提交会被拦）高级区临时强制展开，保证选择器看得见。
  *
  * 行为：
  *   - 提交后父组件调 advanceTask(taskId, { actionType, userInstruction, reuseAgent, model? })
@@ -63,6 +70,7 @@ import {
 
 import { RichInput } from "@/components/rich-input";
 import { ComposerSessionProvider } from "@/components/composer-session";
+import { AdvanceAdvancedSection } from "@/components/tasks/advance-advanced-section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
@@ -75,18 +83,27 @@ import {
 } from "@/components/ui/dialog";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Label } from "@/components/ui/label";
+import { compactModelLabel } from "@/components/ui/model-select";
 import { ProviderModelPicker } from "@/components/ui/provider-model-picker";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip } from "@/components/ui/tooltip";
+import { useAdvanceAdvancedOpen } from "@/hooks/use-advance-advanced-open";
 import { useModels } from "@/hooks/use-models";
 import { useProviderSwitch } from "@/hooks/use-provider-switch";
 import { useRichInput } from "@/hooks/use-rich-input";
+import {
+  buildAdvancedSummary,
+  hasAdvancedItems,
+  resolveAdvancedItems,
+} from "@/lib/advance-advanced-summary";
 import { resolveAdvanceDialogOpenChange } from "@/lib/advance-dialog-close";
 import { buildActionInstructionHistory } from "@/lib/composer-history";
+import { resolveThinkingTriggerLabel } from "@/lib/custom-effort";
 import { getSettings } from "@/lib/local-store";
 import {
   getModelCredsForProvider,
   hasModelCredsForProvider,
+  providerDisplayName,
   resolveTaskProviderForPicker,
 } from "@/lib/agent-provider";
 import {
@@ -129,6 +146,7 @@ import { filterProbeableRepoPaths } from "@/lib/unc-path";
 import { cn } from "@/lib/utils";
 import {
   defaultModelForProvider,
+  isCursorProvider,
   isSharedTeamCategory,
   TEST_STRATEGY_LABEL,
 } from "@/lib/types";
@@ -508,6 +526,18 @@ export const AdvanceDialog = ({
   // 起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
   // 仅起新 agent（默认）时透传给父组件、勾续用时 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
+  // 打开瞬间的续用 / 模型默认值快照：高级区折叠头摘要据此判断「是否偏离默认」并强调
+  // （打开时随表单初始化一起灌入；SSE 推 task 不会重灌，弹窗内改过的才算偏离）
+  const [openDefaults, setOpenDefaults] = useState<{
+    reuseAgent: boolean;
+    model: ModelSelection;
+  }>({ reuseAgent: false, model: { id: "" } });
+  // 「高级」折叠区开合：用户偏好走 view-memory 记忆；forceAdvancedExpand 给阻断项（没选模型）临时撑开、不落盘
+  const {
+    expanded: advancedExpanded,
+    setExpanded: setAdvancedExpanded,
+    forceExpand: forceAdvancedExpand,
+  } = useAdvanceAdvancedOpen(open);
   // 推进时用的提供方：默认跟 task 走；弹窗内可换，提交时先切后推、本次直接用新的跑
   // （输入条是另一入口，都走 useProviderSwitch，确认/清覆盖/toast 同一套）
   const [pickedProvider, setPickedProvider] = useState<string>("");
@@ -623,12 +653,17 @@ export const AdvanceDialog = ({
     openProviderRef.current = providerId;
     setPickedProvider(providerId);
     // v0.9.11：「续用当前 Agent」默认勾选走设置页偏好（缺省 false = 每 action 新 agent）；dialog 内仍可临时切
-    setReuseAgent(s.reuseAgentDefault ?? false);
-    setPickedModel(
+    const initialReuse = s.reuseAgentDefault ?? false;
+    const initialModel: ModelSelection =
       defaultPickedModelRef.current ??
-        defaultModelForProvider(s, providerId) ??
-        { id: "" },
-    );
+      defaultModelForProvider(s, providerId) ??
+      { id: "" };
+    setReuseAgent(initialReuse);
+    setPickedModel(initialModel);
+    // 高级区摘要判「偏离默认」用的快照
+    setOpenDefaults({ reuseAgent: initialReuse, model: initialModel });
+    // 起新 agent 却没模型：提交会被拦「请选择模型」，选择器收在高级区里——临时撑开让它看得见（不落盘）
+    if (!initialReuse && !initialModel.id.trim()) forceAdvancedExpand();
     setGitToken(s.gitToken?.trim() || undefined);
     // 团队规范开关：缺省 true；关了推进列表隐藏挂载 knowledge skill 的自定义 action
     teamKnowledgeEnabledRef.current = s.teamKnowledgeEnabled !== false;
@@ -731,8 +766,8 @@ export const AdvanceDialog = ({
       resolveFlowLock(taskActionsRef.current, customMap),
       customMap,
     );
-    // setInstruction 引用稳定（弹窗不带草稿 scope）、进 deps 不会让本 effect 多跑
-  }, [open, defaultRemoveSourceBranch, setInstruction]);
+    // setInstruction / forceAdvancedExpand 引用稳定（弹窗不带草稿 scope、hook 内 useCallback）、进 deps 不会让本 effect 多跑
+  }, [open, defaultRemoveSourceBranch, setInstruction, forceAdvancedExpand]);
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
@@ -1125,6 +1160,52 @@ export const AdvanceDialog = ({
     pickedProvider !== "" &&
     pickedProvider !== (openProviderRef.current || taskProvider);
 
+  // 高级区适用项（按 action 类型）：全 false（没选中 action）时整区不渲染、不出空折叠
+  const advancedItems = useMemo(
+    () => resolveAdvancedItems(actionType),
+    [actionType],
+  );
+  // 高级区折叠头摘要：收起时用户靠它看清「这次实际怎么跑」，偏离默认 / 开了删分支的段带强调。
+  // 口径与 handleSubmit 一致：换了提供方 = 提交必然新会话；模型标签 / 思考档与模型下拉 trigger 同源
+  const advancedSummary = useMemo(() => {
+    const providerId = pickedProvider || taskProvider;
+    const pickedModelOption = availableModels.find(
+      (m) => m.id === pickedModel.id,
+    );
+    return buildAdvancedSummary({
+      actionType,
+      reuseAgent: reuseAgent && !providerChanged,
+      reuseAgentDefault: openDefaults.reuseAgent,
+      providerChanged,
+      providerLabel: providerChanged
+        ? providerDisplayName(getSettings(), providerId)
+        : "",
+      model: pickedModel,
+      defaultModel: openDefaults.model,
+      modelLabel: pickedModel.id
+        ? compactModelLabel(availableModels, pickedModel.id)
+        : "",
+      thinkingLabel: pickedModel.id
+        ? resolveThinkingTriggerLabel(
+            pickedModelOption,
+            pickedModel.params,
+            isCursorProvider(providerId),
+          )
+        : null,
+      removeSourceBranch,
+    });
+  }, [
+    actionType,
+    reuseAgent,
+    providerChanged,
+    pickedProvider,
+    taskProvider,
+    pickedModel,
+    availableModels,
+    openDefaults,
+    removeSourceBranch,
+  ]);
+
   const canSubmit = useMemo(() => {
     if (submitting || switchingProvider) return false;
     // v0.9.12：无选中（全部 action 被隐藏）不能提交
@@ -1239,6 +1320,9 @@ export const AdvanceDialog = ({
   const handleSubmit = async () => {
     // actionType 判空给 TS narrow 用（canSubmit 已含该拦截）
     if (!canSubmit || !actionType) return;
+    // 起新 agent 却没选模型：父组件 prepareRunArgs 会 toast「请选择模型」，而选择器收在高级区里——
+    // 先把高级区撑开让它看得见（只展开、不拦提交、不动 payload；拦截仍由父组件那一道负责）
+    if (!reuseAgent && !pickedModel.id.trim()) forceAdvancedExpand();
     // 富输入四件套：正文（`/skill`、`@文件` 以原文内联其中）+ 图 + 路径附件 + skill 引用
     const { text, images, attachments, skillRefs } = rich.payload();
     // 弹窗内换了提供方：先切后推（共用 hook：有锚点确认、清覆盖、toast），
@@ -1531,27 +1615,11 @@ export const AdvanceDialog = ({
             </ComposerSessionProvider>
           </div>
 
-          {/* action 专属附加区：有内容才占高（防抖占位会撑出大空档、已回退） */}
+          {/* action 专属附加区：有内容才占高（防抖占位会撑出大空档、已回退）。
+              只留「会决定对外副作用走向」的选项，不进高级区（低频运行参数才折叠） */}
           <div className="empty:hidden">
-            {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
-            {actionType === "ship" && (
-              <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
-                <label
-                  htmlFor="advance-remove-source"
-                  className="flex-1 cursor-pointer text-xs font-medium text-foreground"
-                >
-                  合并后删除源分支
-                </label>
-                <Switch
-                  id="advance-remove-source"
-                  checked={removeSourceBranch}
-                  onCheckedChange={setRemoveSourceBranch}
-                  disabled={submitting}
-                />
-              </div>
-            )}
-
-            {/* V0.x：联调（dev）——推送方式二选一：直推 develop / 提 PR（仅选「联调」时显示） */}
+            {/* V0.x：联调（dev）——推送方式二选一：直推 develop / 提 PR（仅选「联调」时显示）。
+                直推 / 提 PR 对外副作用完全不同，必须一直可见 */}
             {actionType === "dev" && (
               <div className="grid gap-1.5">
                 <Label>推送方式</Label>
@@ -1585,66 +1653,100 @@ export const AdvanceDialog = ({
             )}
           </div>
 
-          {/* 续用开关 + 提供方/模型选择合并视觉块；续用时模型区收起（续接 Run 不能换模型） */}
-          <div className="rounded-md border bg-muted/30 px-3 py-2">
-            <div className="flex items-center justify-between gap-2">
-              <label
-                htmlFor="advance-reuse-agent"
-                className="flex-1 cursor-pointer text-xs font-medium text-foreground"
-              >
-                续用当前 Agent
-              </label>
-              <Tooltip
-                content={
-                  providerChanged
-                    ? "换了提供方、只能起新会话，续用不可选"
-                    : "默认每 action 起新会话，勾上则续接当前会话"
-                }
-              >
-                <span className="inline-flex">
-                  <Switch
-                    id="advance-reuse-agent"
-                    checked={reuseAgent}
-                    onCheckedChange={setReuseAgent}
-                    disabled={submitting || switchingProvider || providerChanged}
-                  />
-                </span>
-              </Tooltip>
-            </div>
-            {/* 换了提供方：明示本次推进的新家 + 上下文代价（顶栏 chip 是弹窗确认，这里是行内提示） */}
-            {providerChanged && (
-              <p className="mt-1.5 text-[11px] text-muted-foreground">
-                本次推进将换到新提供方（精细上下文不保留，只留消息记录 + 磁盘文件），续用不可选
-              </p>
-            )}
-
-            {/* 展开 / 收起走 grid-rows 0fr↔1fr 过渡：高度平滑变化、弹窗不猛跳；
-                收起时 inert 挡 tab 焦点（视觉隐藏但仍挂载、状态不丢） */}
-            <div
-              className={cn(
-                "grid transition-[grid-template-rows,opacity] duration-200",
-                reuseAgent
-                  ? "grid-rows-[0fr] opacity-0"
-                  : "grid-rows-[1fr] opacity-100",
-              )}
-              inert={reuseAgent}
+          {/* 「高级」折叠区（默认收起、开合走 view-memory）：只收低频纯运行参数——
+              ship 的合并后删源分支 + 续用 agent / 提供方 / 模型。折叠头摘要显示当前取值，
+              偏离默认 / 开了删分支用 warning 徽标标出。阻断 / 警示 / 副作用走向类内容一律不进这里。
+              没选中 action（全隐藏）时无适用项、整区不渲染，不出空折叠 */}
+          {hasAdvancedItems(advancedItems) && (
+            <AdvanceAdvancedSection
+              open={advancedExpanded}
+              onOpenChange={setAdvancedExpanded}
+              summary={advancedSummary}
             >
-              <div className="overflow-hidden">
-                <div className="mt-2 border-t border-border/60 pt-2">
-                  <ProviderModelPicker
-                    variant="full"
-                    providerId={pickedProvider || taskProvider}
-                    onProviderChange={handleProviderChange}
-                    models={availableModels}
-                    selection={pickedModel}
-                    onModelChange={setPickedModel}
-                    disabled={submitting || switchingProvider}
-                    emptyPlaceholder="选择模型"
-                  />
-                </div>
+              <div className="flex flex-col gap-2">
+                {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
+                {advancedItems.removeSourceBranch && (
+                  <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
+                    <label
+                      htmlFor="advance-remove-source"
+                      className="flex-1 cursor-pointer text-xs font-medium text-foreground"
+                    >
+                      合并后删除源分支
+                    </label>
+                    <Switch
+                      id="advance-remove-source"
+                      checked={removeSourceBranch}
+                      onCheckedChange={setRemoveSourceBranch}
+                      disabled={submitting}
+                    />
+                  </div>
+                )}
+
+                {/* 续用开关 + 提供方/模型选择合并视觉块；续用时模型区收起（续接 Run 不能换模型） */}
+                {advancedItems.agentRuntime && (
+                  <div className="rounded-md border bg-muted/30 px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <label
+                        htmlFor="advance-reuse-agent"
+                        className="flex-1 cursor-pointer text-xs font-medium text-foreground"
+                      >
+                        续用当前 Agent
+                      </label>
+                      <Tooltip
+                        content={
+                          providerChanged
+                            ? "换了提供方、只能起新会话，续用不可选"
+                            : "默认每 action 起新会话，勾上则续接当前会话"
+                        }
+                      >
+                        <span className="inline-flex">
+                          <Switch
+                            id="advance-reuse-agent"
+                            checked={reuseAgent}
+                            onCheckedChange={setReuseAgent}
+                            disabled={submitting || switchingProvider || providerChanged}
+                          />
+                        </span>
+                      </Tooltip>
+                    </div>
+                    {/* 换了提供方：明示本次推进的新家 + 上下文代价（顶栏 chip 是弹窗确认，这里是行内提示） */}
+                    {providerChanged && (
+                      <p className="mt-1.5 text-[11px] text-muted-foreground">
+                        本次推进将换到新提供方（精细上下文不保留，只留消息记录 + 磁盘文件），续用不可选
+                      </p>
+                    )}
+
+                    {/* 展开 / 收起走 grid-rows 0fr↔1fr 过渡：高度平滑变化、弹窗不猛跳；
+                        收起时 inert 挡 tab 焦点（视觉隐藏但仍挂载、状态不丢） */}
+                    <div
+                      className={cn(
+                        "grid transition-[grid-template-rows,opacity] duration-200",
+                        reuseAgent
+                          ? "grid-rows-[0fr] opacity-0"
+                          : "grid-rows-[1fr] opacity-100",
+                      )}
+                      inert={reuseAgent}
+                    >
+                      <div className="overflow-hidden">
+                        <div className="mt-2 border-t border-border/60 pt-2">
+                          <ProviderModelPicker
+                            variant="full"
+                            providerId={pickedProvider || taskProvider}
+                            onProviderChange={handleProviderChange}
+                            models={availableModels}
+                            selection={pickedModel}
+                            onModelChange={setPickedModel}
+                            disabled={submitting || switchingProvider}
+                            emptyPlaceholder="选择模型"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          </div>
+            </AdvanceAdvancedSection>
+          )}
 
           {/* 上次推进失败的完整原因：整段原样（保留换行）+ 超长可滚动；提交中隐藏（重试已在途） */}
           {submitError && !submitting && (

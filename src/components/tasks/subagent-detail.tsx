@@ -50,6 +50,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { useRightDockSlot } from "@/hooks/use-right-dock-slot";
 import { RowViewStateScope } from "@/hooks/use-row-view-state";
 import { useStreamFollow } from "@/hooks/use-stream-follow";
 import { useSubagentRun } from "@/hooks/use-subagent-run";
@@ -567,6 +568,9 @@ export const SubagentDetailHost = ({
   );
 
   const visible = open && opened?.taskId === task.id;
+
+  // 右侧只有一条位：文件预览 / 代码改动面板打开时让位（后开的替换先开的）
+  useRightDockSlot("subagent-detail", visible, () => setOpen(false));
 
   const handleOpenChange = useCallback<
     NonNullable<ComponentProps<typeof Sheet>["onOpenChange"]>

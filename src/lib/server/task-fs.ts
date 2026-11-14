@@ -61,7 +61,8 @@ import type {
   TaskSummary,
   TurnTokenUsage,
 } from "@/lib/types";
-import { accumulateTokenUsage } from "@/lib/token-usage";
+import { accumulateTokenUsage, shouldAttributeTurnToAction } from "@/lib/token-usage";
+import { settleActiveTime } from "@/lib/action-active-time";
 import { normalizeReqId } from "@/lib/req-id";
 import { mrTargetBranchOf } from "@/lib/task-display";
 import {
@@ -86,7 +87,11 @@ import {
 } from "./task-worktrees";
 import { collectWorktreeRemoval, type DeleteWorktreeReport } from "@/lib/worktree-report";
 import { sameRepoPathList } from "@/lib/path-utils";
-import { BOOT_RECOVERY_TEXT } from "@/lib/stop-copy";
+import {
+  BOOT_RECOVERY_ACTION_WAS_RUNNING_KEY,
+  BOOT_RECOVERY_SUBKIND,
+  BOOT_RECOVERY_TEXT,
+} from "@/lib/stop-copy";
 import { reapTaskOrphans } from "./kill-orphans";
 import { maybeFireMidRunRotation, rotationUsageOf } from "./session-rotate";
 import { maybeGcSdkStore } from "./sdk-store-gc";
@@ -970,6 +975,11 @@ type RecoverTaskResult = {
  * 注意：事件追加成功而写 meta 失败时，重试会再追加一条同文案事件（双重故障、极少见，接受）。
  */
 const markZombieTaskError = async (id: string, meta: TaskMetaV06): Promise<boolean> => {
+  // 翻 error 之前先看一眼：当前 action 是不是真的在 running（R21-03）。
+  // 已交卷（awaiting_ack）后发一次性问答时任务级 runStatus 也是 running，重启会把已交卷的 action 一并翻成 error，
+  // 但它不是被「打断」的——前端「继续上次 Action」据此标记排除它，免得点一下把已完成的 action 整个重跑。
+  const actionWasRunning =
+    meta.actions.find((a) => a.id === meta.currentActionId)?.status === "running";
   // 写 error 事件 + 标 runStatus=error
   const event: TaskEvent = {
     id: newEventId(),
@@ -977,6 +987,11 @@ const markZombieTaskError = async (id: string, meta: TaskMetaV06): Promise<boole
     kind: "error",
     // task / chat 共用：文案单一来源 lib/stop-copy（D8-06，与停止确认框 / 停止后 info 同一说法）
     text: BOOT_RECOVERY_TEXT,
+    // 机器标记：前端「继续上次 Action」据此认出「被重启打断」的失败（不改文案、不加 actionId，避免改变既有展示）
+    meta: {
+      subkind: BOOT_RECOVERY_SUBKIND,
+      [BOOT_RECOVERY_ACTION_WAS_RUNNING_KEY]: actionWasRunning,
+    },
   };
   try {
     await appendEventLine(id, event);
@@ -988,12 +1003,18 @@ const markZombieTaskError = async (id: string, meta: TaskMetaV06): Promise<boole
     return false;
   }
 
+  // 进程死前最后一次落盘时刻：必须在下一行覆盖 updatedAt 之前取
+  const lastWriteAt = meta.updatedAt;
   meta.runStatus = "error";
   meta.updatedAt = event.ts;
   // 当前 action 如果在跑、标 error
   if (meta.currentActionId) {
     const action = meta.actions.find((a) => a.id === meta.currentActionId);
     if (action && (action.status === "running" || action.status === "awaiting_ack")) {
+      // 真实停止时刻未知（重启前的空档可能关过机 / 合过盖）：运行时长只结算到最后一次落盘，
+      // 宁可低估也不让关机空档把耗时统计灌成离群值
+      const settled = settleActiveTime(action, "error", event.ts, lastWriteAt);
+      if (settled) Object.assign(action, settled);
       action.status = "error";
       action.endedAt = event.ts;
     }
@@ -2330,9 +2351,10 @@ export const setTaskLastRewind = async (
  *
  * 双投影、一次写盘：
  *   - `meta.tokenUsage`   task 级（chat / task 两条链都走这里）
- *   - `action.tokenUsage` 只记到「此刻正在跑」的那条 action 上（回答「一次 build 烧了多少」）
- *     卡 status=running：迟到的 turn-ended（run 已收尾 / 旁路只读答疑在 idle 时跑）
- *     不会误记到已完成的 action 头上。
+ *   - `action.tokenUsage` 只记到 currentActionId 指向的那条 action 上（回答「一次 build 烧了多少」）
+ *     归属规则见 token-usage.shouldAttributeTurnToAction：turn-ended 在 run 收尾后才到、
+ *     action 多半已是 awaiting_ack / error，所以主线 run（opts.runKind 以 task- 开头）也记；
+ *     已 completed / cancelled 的 action、旁路问答不会被迟到的 turn-ended 污染。
  *
  * 刻意**不动 `meta.updatedAt`**——用量是旁路遥测，不该顶掉侧栏排序 / 已读判定。
  *
@@ -2344,6 +2366,8 @@ export const setTaskLastRewind = async (
 export const recordTurnUsage = async (
   taskId: string,
   turn: TurnTokenUsage,
+  /** run 性能埋点的 runKind（task-first / task-followup / question …），决定非 running 时能否归到 action */
+  opts?: { runKind?: string },
 ): Promise<Task | null> => {
   const task = await withTaskLock(taskId, async () => {
     // meta 损坏时 readMetaV06 会抛——埋点场景一律降级成「不记账」
@@ -2363,7 +2387,7 @@ export const recordTurnUsage = async (
       ? meta.actions.findIndex((a) => a.id === meta.currentActionId)
       : -1;
     const current = idx >= 0 ? meta.actions[idx] : undefined;
-    if (current && current.status === "running") {
+    if (current && shouldAttributeTurnToAction(current.status, opts?.runKind)) {
       const next: ActionRecord = {
         ...current,
         tokenUsage: accumulateTokenUsage(current.tokenUsage, turn, now),
@@ -3054,8 +3078,32 @@ type ActionPatchFields = Partial<
 >;
 
 /**
+ * action 状态迁移的统一副作用（patchAction / patchActionIfOwner / patchActionAndRunStatusIfOpFresh 共用）：
+ *   - running → 非 running：落 endedAt；任何 → running：清 endedAt（awaiting_ack → completed 等不动）
+ *   - 同步结算「实际运行时长」activeMs / runningSince（口径见 lib/action-active-time）
+ *
+ * 三个 patch 入口原先各手写一份 endedAt 判断，新增副作用要改三处且必漏；收敛到这里，
+ * 以后 status 迁移要加什么副作用只改本函数。直接改 `next`（调用方刚展开出来的新对象）。
+ *
+ * @param prev  迁移前的 action（用它的 status / activeMs / runningSince 判定）
+ * @param next  已合入 patch 的新 action（被就地补字段）
+ */
+const applyActionStatusTransition = (
+  prev: ActionRecord,
+  next: ActionRecord,
+  nextStatus: ActionStatus | undefined,
+  now: number,
+): void => {
+  if (!nextStatus) return;
+  if (nextStatus !== "running" && prev.status === "running") next.endedAt = now;
+  if (nextStatus === "running") next.endedAt = null;
+  const settled = settleActiveTime(prev, nextStatus, now);
+  if (settled) Object.assign(next, settled);
+};
+
+/**
  * patch 单条 action 状态 / 后置检查 / 副作用
- * - status 转 awaiting_ack / completed / error / cancelled 时自动 set endedAt
+ * - status 转 awaiting_ack / completed / error / cancelled 时自动 set endedAt（见 applyActionStatusTransition）
  * - runStatus / currentActionId 不在这里改（独立 setTaskRunStatus）
  */
 export const patchAction = async (
@@ -3074,16 +3122,7 @@ export const patchAction = async (
       ...action,
       ...patch,
     };
-    if (
-      patch.status &&
-      patch.status !== "running" &&
-      action.status === "running"
-    ) {
-      next.endedAt = now;
-    }
-    if (patch.status === "running") {
-      next.endedAt = null;
-    }
+    applyActionStatusTransition(action, next, patch.status, now);
     meta.actions = [
       ...meta.actions.slice(0, idx),
       next,
@@ -3145,6 +3184,8 @@ export const finalizeStaleAndIdleLocked = async (
       if (a.status !== "running" && a.status !== "awaiting_ack") return a;
       return {
         ...a,
+        // running → 终态时结算运行时长（awaiting_ack 本就不在跑，settle 返 null、不动）
+        ...(settleActiveTime(a, toStatus, now) ?? {}),
         status: toStatus,
         // running→终态自动落 endedAt；已有 endedAt（少见）保留
         endedAt: a.endedAt ?? now,
@@ -3312,16 +3353,7 @@ export const patchActionIfOwner = async (
       ...action,
       ...patch,
     };
-    if (
-      patch.status &&
-      patch.status !== "running" &&
-      action.status === "running"
-    ) {
-      next.endedAt = now;
-    }
-    if (patch.status === "running") {
-      next.endedAt = null;
-    }
+    applyActionStatusTransition(action, next, patch.status, now);
     meta.actions = [
       ...meta.actions.slice(0, idx),
       next,
@@ -3411,15 +3443,7 @@ export const patchActionAndRunStatusIfOpFresh = async (
       ...(extraPatch ?? {}),
       status: actionStatus,
     };
-    if (
-      actionStatus !== "running" &&
-      action.status === "running"
-    ) {
-      next.endedAt = now;
-    }
-    if (actionStatus === "running") {
-      next.endedAt = null;
-    }
+    applyActionStatusTransition(action, next, actionStatus, now);
     meta.actions = [
       ...meta.actions.slice(0, idx),
       next,

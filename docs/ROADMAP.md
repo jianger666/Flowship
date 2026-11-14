@@ -12,7 +12,7 @@
 一句话：**「飞书 story → 多仓 MR」的核心闭环 + Harness 加固 + 桌面端发版链、都已上线并在日常使用。**
 
 - **Action 体系全实装**：`plan / build / review / ship / dev（联调）/ learn / custom（自定义）`——任意触发不强制顺序、每步落 md artifact、action 间 HITL ack（test 已删、见「四、止损」）
-- **6 harness 门槛（缺门槛 5）**：前置准入 / 后置 deterministic check / 默认选中 / anti-patterns prompt / placeholder 动态；**门槛 5（cross-action 一致性自检）仍未做**、见「二、未来候选」
+- **6 harness 门槛（门槛 5 已拍板不做、其余 5 个已落地）**：前置准入 / 后置 deterministic check / 默认选中 / anti-patterns prompt / placeholder 动态；**门槛 5（cross-action 一致性自检）2026-11-13 已拍板不做**、见「四、止损」
 - **Shell 命令硬拦截**：beforeShellExecution hook + 黑名单策略引擎（确定性、非 prompt 软约束）
 - **GitLab REST 集成**：多仓 MR + 同分支累计 commit + 冲突门禁 + 飞书 @ 测试人员（A+C 策略）
 - **大需求分批 build** + 自适应 TDD 策略（每批 tdd/after/none、无测试设施自动退化）
@@ -30,8 +30,7 @@
 
 | 方向 | 内容 | 状态 / 依赖 |
 |---|---|---|
-| **Cost / Token Dashboard** | 每 task / action / 全局看 token + 成本、扫 `events.jsonl` 汇总；可选接 Langfuse / Helicone | 未做、数据源已有（events.jsonl 已记 token） |
-| **门槛 5：cross-action 一致性自检** | `plan ↔ build ↔ review` 漂移核查（借鉴 Spec Kit `/analyze`） | 未做、一直 pending |
+| **Cost / Token Dashboard** | 每 task / action / 全局看 token + 成本、扫 `events.jsonl` 汇总；可选接 Langfuse / Helicone | 看板未做；数据层已补齐：task 级 `meta.tokenUsage` 自 10 月起可靠；action 级 `tokenUsage` 已修归属（此前 79 个 action 只有 3 个有值）；新增 `activeMs` 区分「agent 实际运行」与「交卷后等人」（`endedAt-startedAt` 里 80%+ 是闲置空档，不能当耗时）。历史 action 无 `activeMs`、不回填（上线前跑过的老 action 被「再聊聊」拉回运行后也保持「未知」，不拿后一段冒充完整值）。token 不在 `events.jsonl` 里，看板应读 meta |
 | **多 task 复用 plan / artifact** | 链接式引用、不复制 | 未做 |
 | **比较同 task 多次执行差异** | `actions/` 时间序 diff 可视化 | 未做 |
 | **多角色扩展** | `be / data / mobile / qa`（`TaskRole` schema 已预留） | 未做 |
@@ -70,6 +69,7 @@
 | 黑名单 / 字符串 predicate（V0.5.6.5 试过、V0.6.0.1 已删） | 业务高频词误伤、replace by「客观可证伪 predicate」路线（命令 exit code / hash / 文件存在性 / JSON schema 校验） |
 | advance dialog「推荐」微标签（V0.6.0.1 已删） | 推断逻辑只是「流程顺推 + 业务状态映射」、谈不上智能推荐、暗示「我跟你说要走这个」反而误导。保留「默认选中」减少首次点击、但不标推荐二字 |
 | ActionTimeline 失败 chip retry 快捷入口（V0.6.0.1 加过又砍） | 语义混乱：点旧 error chip 实际是打断当前 running + 起新 action、跟直觉「修复那条历史」差太远。统一从「推进」按钮 + `forceNewAgent` 恢复 |
+| **门槛 5：cross-action 一致性自检**（`plan ↔ build ↔ review` 漂移核查，借鉴 Spec Kit `/analyze`；2026-11-13 用户拍板不做） | review action 已有四类差异核查段（`prompts/action-review.md`：范围偏离〔扩张 / 收缩〕、实现偏差、未完成 task、飞书需求对照），另有「已授权变更」分流与 bug 复审，plan ↔ 需求 ↔ 实现的差异已被它覆盖；再加一层自检是重复校验，维护成本 > 收益。**接受的边界**：这些差异段靠 prompt 约束 + 人审，`checkReview` 只硬校验「总评 / 跟飞书需求对照 / bug 复审」三段在不在 + 基底 commit + 只读指纹，不校验差异段内容 |
 
 ---
 
@@ -121,7 +121,7 @@ ai-flow 不自己维护 MCP / rules / skills、统一消费 Cursor 的全局（`
 |---|---|---|---|
 | Superpowers | TDD 红绿闭环（改「build 后补测」）| test ① | ✅ 以「build 侧自适应 TDD」落地 |
 | GStack | 真浏览器 QA（Playwright）+ diff-aware + 失败生成回归 | test ② | ❌ 止损（需 playwright MCP、ROI 低） |
-| Spec Kit | `/analyze` 跨 artifact 一致性 | 门槛 5 | ⏳ 仍未做（见「二、未来候选」） |
+| Spec Kit | `/analyze` 跨 artifact 一致性 | 门槛 5 | ❌ 2026-11-13 已拍板不做（review 差异段已覆盖，见「四、止损」） |
 | OpenSpec | archive 合并 delta → 注入 AGENTS.md | learn action | ✅ learn 已落地（先问后落） |
 | 我们独有 | 飞书验收用例作 test 基准 | test 护城河 | ❌ 随 test 止损 |
 

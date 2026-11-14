@@ -194,8 +194,11 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "repoPath",
       "actionArtifactsDir",
       "eventsLogPath",
+      // ship 精简版兜底时让 agent read 全量版用（值 = PROMPTS_DIR 拼 action-ship.md）
+      "shipFullPlaybookPath",
     ]);
-    for (const type of ["plan", "build", "review", "ship", "dev"]) {
+    // ship-update = 「再次提测」精简版（loadActionPrompt 按 shouldUseShipUpdatePlaybook 选用）
+    for (const type of ["plan", "build", "review", "ship", "ship-update", "dev"]) {
       const md = readFileSync(
         path.join(promptsDir, `action-${type}.md`),
         "utf-8",

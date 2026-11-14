@@ -60,12 +60,9 @@ describe("长内容不撑破视口", () => {
     );
     expect(popover).toContain('max-w-[calc(100vw-1rem)]');
     expect(dialog).toContain("overflow-x-hidden overflow-y-auto");
-    expect(localPreview).toContain(
-      "max-h-[min(90vh,calc(100vh-48px))]",
-    );
-    expect(localPreview).toContain(
-      "sm:max-w-[min(960px,80vw,calc(100vw-48px))]",
-    );
+    // 文件预览是右侧 Sheet：高度由 SheetContent 基类 inset-y-0 给，宽度两档都以视口为界
+    expect(localPreview).toContain("w-[min(760px,70vw)]");
+    expect(localPreview).toContain("w-[calc(100vw-6rem)]");
     expect(localPreview).toContain("min-h-0 flex-1 overflow-x-hidden overflow-y-auto");
   });
 });

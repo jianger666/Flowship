@@ -11,6 +11,7 @@ import {
   EMPTY_TURN_USAGE,
   formatTokens,
   normalizeTurnUsage,
+  shouldAttributeTurnToAction,
   turnTotalTokens,
 } from "@/lib/token-usage";
 import type { TurnTokenUsage } from "@/lib/types";
@@ -172,5 +173,38 @@ describe("turnTotalTokens / cacheHitRatio", () => {
     expect(cacheHitRatio(turn({ inputTokens: 0 }))).toBeNull();
     // cacheRead 是 input 的子集、脏数据超出时夹到 1
     expect(cacheHitRatio(turn({ cacheReadTokens: 99_999 }))).toBe(1);
+  });
+});
+
+describe("shouldAttributeTurnToAction（turn 用量归属到 action 的规则）", () => {
+  it("running：一律记（含旁路问答、含没传 runKind，沿用旧行为）", () => {
+    expect(shouldAttributeTurnToAction("running")).toBe(true);
+    expect(shouldAttributeTurnToAction("running", "task-first")).toBe(true);
+    expect(shouldAttributeTurnToAction("running", "question")).toBe(true);
+  });
+
+  it("awaiting_ack / error：只有主线 run（task- 开头的 runKind）才记", () => {
+    for (const status of ["awaiting_ack", "error"] as const) {
+      for (const kind of [
+        "task-first",
+        "task-reconnect",
+        "task-submit-followup",
+        "task-ask-reply",
+        "task-followup",
+      ]) {
+        expect(shouldAttributeTurnToAction(status, kind)).toBe(true);
+      }
+      // 旁路问答 / chat 链 / 没传 runKind：不记
+      expect(shouldAttributeTurnToAction(status, "question")).toBe(false);
+      expect(shouldAttributeTurnToAction(status, "chat-first")).toBe(false);
+      expect(shouldAttributeTurnToAction(status)).toBe(false);
+    }
+  });
+
+  it("completed / cancelled：不论 runKind 都不记（已收口的 action 不被迟到事件污染）", () => {
+    for (const status of ["completed", "cancelled"] as const) {
+      expect(shouldAttributeTurnToAction(status, "task-first")).toBe(false);
+      expect(shouldAttributeTurnToAction(status)).toBe(false);
+    }
   });
 });

@@ -52,6 +52,16 @@ export interface CreateMRInput {
   description: string;
   /** 合并后是否删源分支（V0.6.14、可配；调用方按 task.removeSourceBranchOnMerge 传、默认保留） */
   removeSourceBranch: boolean;
+  /**
+   * 撞 409 复用「同分支已有 open MR」时，是否用本次的 title / description **整段覆盖**现有 MR（默认 false = 只复用、不动它）。
+   *
+   * 为什么要有：再次提测（同分支多次 ship）必经复用路径，而提示词要求「保留旧描述、末尾追加新版段、标题带版本号」——
+   * 只复用不更新的话，测试人员点开 MR 看到的永远是第一版（审查 R21-02）。
+   * 为什么默认关：team-library 等调用方也走 createMR，它们复用时不该改别人的 MR。
+   * 是**覆盖**不是合并：调用方（AI）负责传「旧描述 + 追加段」的完整文本，这里不拼。
+   * 空字符串不覆盖（不会把现有描述清空）；与现有内容相同则不发请求。更新失败不当失败（MR 已存在），见结果的 updateError。
+   */
+  updateExistingOnReuse?: boolean;
 }
 
 export type CreateMRResult =
@@ -61,6 +71,13 @@ export type CreateMRResult =
       url: string;
       /** project 内 MR 编号（用户看到的 !N、不是全局 ID） */
       iid: number;
+      /**
+       * 仅在「复用已有 MR 且 updateExistingOnReuse=true」时才有：
+       * true = 已把 title / description 更新到 GitLab；false = 与现有内容相同、无需更新或本次没传内容。
+       */
+      updated?: boolean;
+      /** 复用已有 MR 想更新、但更新失败的原因（MR 本身仍可用；调用方应告知 AI / 用户「MR 页面没变」） */
+      updateError?: string;
     }
   | {
       ok: false;
@@ -280,7 +297,11 @@ const readJsonBody = async (
  *   解冲突后旧 MR 漏关双开，审查发现）
  */
 type FindOpenMRResult =
-  | { ok: true; mr: { url: string; iid: number } }
+  | {
+      ok: true;
+      // title / description 供「复用时判断要不要更新」；GitLab 字段缺失 / null 一律按空串
+      mr: { url: string; iid: number; title: string; description: string };
+    }
   | { ok: true; mr: null }
   | { ok: false; error: string };
 
@@ -330,11 +351,63 @@ const findOpenMR = async (
       // 确认没有同 source/target 的 open MR（空列表 / 缺字段）
       return { ok: true, mr: null };
     }
-    return { ok: true, mr: { url: first.web_url, iid: first.iid } };
+    return {
+      ok: true,
+      mr: {
+        url: first.web_url,
+        iid: first.iid,
+        title: typeof first.title === "string" ? first.title : "",
+        description: typeof first.description === "string" ? first.description : "",
+      },
+    };
   } catch (err) {
     return { ok: false, error: formatFetchNetworkError(err) };
   }
 };
+
+/**
+ * 更新单个 MR 的标题 / 描述（PUT，只带传入的字段；createMR 复用分支在 updateExistingOnReuse 时用）
+ *
+ * 只动 title / description：不碰 state / 源分支 / 目标分支 / remove_source_branch，避免「更新说明」顺手改了别的。
+ */
+const updateMR = async (input: {
+  config: GitLabConfig;
+  projectPath: string;
+  iid: number;
+  title?: string;
+  description?: string;
+}): Promise<{ ok: true } | { ok: false; error: string }> => {
+  let base: string;
+  let headers: HeadersInit;
+  try {
+    base = buildBaseUrl(input.config.host);
+    headers = buildHeaders(input.config.token);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  const patch: { title?: string; description?: string } = {};
+  if (input.title !== undefined) patch.title = input.title;
+  if (input.description !== undefined) patch.description = input.description;
+  const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}`;
+  try {
+    const res = await fetchWithGitToken(url, {
+      method: "PUT",
+      headers,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) {
+      return { ok: false, error: await formatGitLabError(res) };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: formatFetchNetworkError(err) };
+  }
+};
+
+/** 比较 MR 文本是否「实质相同」：GitLab 回读时可能把 CRLF 归一、去掉首尾空白，直接 === 会误判成有变化而白发一次 PUT */
+const sameMrText = (a: string, b: string): boolean =>
+  a.replace(/\r\n/g, "\n").trim() === b.replace(/\r\n/g, "\n").trim();
 
 /**
  * 创建 MR（V0.6.1.1 起幂等：撞 409「已有同分支 open MR」时自动复用现有 MR、不当失败）
@@ -382,7 +455,30 @@ export const createMR = async (
       if (res.status === 409 || res.status === 422) {
         const existing = await findOpenMR(input);
         if (existing.ok && existing.mr) {
-          return { ok: true, url: existing.mr.url, iid: existing.mr.iid };
+          const reused = { url: existing.mr.url, iid: existing.mr.iid };
+          // 默认只复用、不动现有 MR（team-library 等调用方的行为不变）
+          if (!input.updateExistingOnReuse) return { ok: true, ...reused };
+          // 再次提测：把本次的标题 / 描述更新上去（R21-02）。只发真正变了、且非空的字段
+          const patch: { title?: string; description?: string } = {};
+          if (input.title.trim() && !sameMrText(input.title, existing.mr.title)) {
+            patch.title = input.title;
+          }
+          if (input.description.trim() && !sameMrText(input.description, existing.mr.description)) {
+            patch.description = input.description;
+          }
+          if (patch.title === undefined && patch.description === undefined) {
+            return { ok: true, ...reused, updated: false };
+          }
+          const upd = await updateMR({
+            config: input.config,
+            projectPath: input.projectPath,
+            iid: existing.mr.iid,
+            ...patch,
+          });
+          // 更新失败不当失败：MR 已存在、代码已推上去，只把原因带回去让调用方如实告知
+          return upd.ok
+            ? { ok: true, ...reused, updated: true }
+            : { ok: true, ...reused, updated: false, updateError: upd.error };
         }
         return { ok: false, error: await formatGitLabError(res) };
       }

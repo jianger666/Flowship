@@ -145,6 +145,7 @@ submit_mr({
 - 返 `{ ok, data: { mr_url, mr_version, has_conflicts, merge_status, ... } }`、记下 `mr_url` + `has_conflicts` 给 artifact。
 - `has_conflicts: true` → 先别动手、记下、所有仓跑完统一到「## 冲突处理」问用户。
 - server 自动按 `(repoPath, dev 分支)` 维护本仓联调 MR——跟同仓的提测 MR（→ 测试分支）各记各的、各自累计 version、互不覆盖。
+- **再次联调（同仓同分支已有本任务记录过的联调 MR）**：server 复用它，并用你传的 `title` / `description` **整段覆盖**（相同则不发请求），要保留旧描述就传「旧描述（从现有 MR 读）+ 追加段」的完整文本；读不到旧描述就把 `description` 传空串（不覆盖、只更新标题）。返回里 `mr_update_error` 有值 = 没更新成功（不挡联调）、artifact 记一笔。首次联调撞上别人手建的同分支 MR 只复用、不改它。
 - 失败返 `{ ok: false, error }` → artifact 记错、继续下一个仓（不重试、不 force push、不降级到 `git push -o`）。
 
 ---

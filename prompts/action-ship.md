@@ -317,7 +317,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完按 super-p
 
 ## MR description 模板
 
-> 多次 ship 时、保留旧版的 description、在末尾加新版段。
+> 多次 ship 时、保留旧版的 description、在末尾加新版段。**注意是整段覆盖**：`submit_mr` 复用的同分支 MR 若本任务已记录过（即再次提测），server 会把你传的 `title` / `description` 原样更新到 GitLab 上（相同则不发请求），所以要传「旧描述（从现有 MR 读）+ 新版段」的完整文本，只传新版段会冲掉旧内容；**读不到旧描述就把 `description` 传空串**（空串不覆盖、只更新标题），artifact 里记「描述未更新」。首次提测撞上别人手建的同分支 MR 只复用、不改它。返回里 `mr_update_error` 有值 = 更新失败、MR 页面仍是旧的（不挡 ship），artifact 里如实记一笔。
 
 ```markdown
 ## 任务

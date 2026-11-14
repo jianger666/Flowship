@@ -46,8 +46,11 @@ export const zoomLevelToPercent = (level) => Math.round(1.2 ** clampZoomLevel(le
  * before-input-event 的 input → 用户侧快捷键意图。只认 keyDown、不认自动重复之外的组合键：
  * - Cmd（mac）/ Ctrl（其它）+ `=` / `+` 放大、`-` / `_` 缩小、`0` 重置
  * - Cmd/Ctrl+F → 打开查找条
+ * - Cmd/Ctrl+R → 刷新当前页；Cmd/Ctrl+Shift+R → 忽略缓存强刷
+ *   （必须在这里接住：页面持有焦点时按键只会进这个原生视图的 before-input-event，
+ *   放行就会被应用菜单的「重新加载」截走、刷新的是整个 Flowship 主窗口而不是这个页面）
  * 带 Alt 的组合一律不认（给页面自己的快捷键让路）。
- * @returns {{ kind: "zoom", action: "in"|"out"|"reset" } | { kind: "find" } | null}
+ * @returns {{ kind: "zoom", action: "in"|"out"|"reset" } | { kind: "find" } | { kind: "reload", force: boolean } | null}
  */
 export const classifyShortcut = (input, platform) => {
   if (!input || input.type !== "keyDown" || input.alt) return null;
@@ -60,6 +63,8 @@ export const classifyShortcut = (input, platform) => {
   if (key === "-" || key === "_") return { kind: "zoom", action: "out" };
   if (key === "0") return { kind: "zoom", action: "reset" };
   if ((key === "f" || key === "F") && !input.shift) return { kind: "find" };
+  // Shift 按下时 key 是大写 "R"，两种写法都认；Shift = 强刷（忽略缓存）
+  if (key === "r" || key === "R") return { kind: "reload", force: input.shift === true };
   return null;
 };
 
@@ -386,13 +391,17 @@ export const registerUserFeatures = (deps) => {
       }
     });
 
-    // 页面持有焦点时 Cmd/Ctrl+/-/0/F 到不了渲染进程（原生视图吃了键盘），只能在主进程 before-input-event 里接
+    // 页面持有焦点时 Cmd/Ctrl+/-/0/F/R 到不了渲染进程（原生视图吃了键盘），只能在主进程 before-input-event 里接
     wc.on("before-input-event", (event, input) => {
       const hit = classifyShortcut(input, platform);
       if (!hit) return;
       event.preventDefault();
       if (hit.kind === "zoom") {
         zoomTab(tab, hit.action);
+      } else if (hit.kind === "reload") {
+        // 只刷这个页面；整页刷新 Flowship 本身一律禁用（主窗口见 main.js 的 before-input-event、菜单里也已去掉「重新加载」）
+        if (hit.force) wc.reloadIgnoringCache();
+        else wc.reload();
       } else {
         const taskId = taskIdOf();
         if (taskId) sendToRenderer("browser:findRequested", taskId);

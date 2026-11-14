@@ -1086,10 +1086,26 @@ export interface ActionRecord {
 
   /**
    * 本 action 期间的 token 用量（回答「这次 build 到底烧了多少」）。
-   * 只在 action status=running 时把 turn 用量记到它头上（见 task-fs.recordTurnUsage）；
+   * 归属规则见 token-usage.shouldAttributeTurnToAction：running 一律记；
+   * turn-ended 在 run 收尾后才到、此时 action 多半已是 awaiting_ack / error，主线 run（task-*）也记；
+   * 旁路问答（question）和已 completed / cancelled 的不记。
    * 不存 = 这条 action 跑完时还没这个埋点 / 期间没收到过 turn-ended。
    */
   tokenUsage?: TokenUsageRollup;
+
+  /**
+   * 实际运行的累计毫秒：只累 status=running 的区间，不含「交卷后到再聊聊之间」的闲置。
+   * 结算规则与读取口径见 lib/action-active-time（所有 status 写盘点统一走 settleActiveTime）。
+   * 不存 = 老数据，读出来是「未知」，不要拿 endedAt - startedAt 冒充。
+   * 老数据被「再聊聊」拉回运行后同样一直不存（第一段已无法还原，只累后一段会得到偏小的真数）。
+   */
+  activeMs?: number;
+
+  /**
+   * 当前 running 区间的起点；仅 status=running 且发生过「拉回 running」时才有值。
+   * 缺省回退 startedAt（新建即 running 的首段）。转出 running 时结算进 activeMs 并清除。
+   */
+  runningSince?: number;
 }
 
 /**

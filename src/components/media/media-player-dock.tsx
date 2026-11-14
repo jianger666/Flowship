@@ -88,8 +88,15 @@ import {
   type MediaPrefs,
 } from "@/lib/media/media-memory";
 import { watchUserSeek, type ResumeNoticeWatch } from "@/lib/media/media-resume-notice";
-import { resolveMediaShortcut, stepRate, type MediaCommand } from "@/lib/media/media-shortcuts";
+import {
+  ESC_CLOSE_WINDOW_MS,
+  decideEscapeClose,
+  resolveMediaShortcut,
+  stepRate,
+  type MediaCommand,
+} from "@/lib/media/media-shortcuts";
 import { clampNumber, formatBytes, formatClock, parseClock } from "@/lib/media/media-time";
+import { notifyOverlayLayoutChanged } from "@/lib/overlay-layout-event";
 import { localMediaSubtitleUrl, localMediaSubtitlesUrl, localMediaUrl } from "@/lib/media/media-url";
 import {
   reportPlaying,
@@ -117,6 +124,20 @@ interface PendingStart {
   time: number | "resume";
   play: boolean;
 }
+
+/**
+ * 页面上「开着的」模态弹窗（确认框 / 输入框 / 设置…）：Esc 归它们，播放器不抢。
+ * base-ui 关闭时先打 data-closed / data-ending-style、动画完才摘 DOM，这段时间不算开着。
+ * 只认 dialog / alert-dialog：播放窗自己的快捷键帮助虽然也是 role="dialog"，但它走 showHelp 自己的 Esc 逻辑。
+ */
+const OPEN_MODAL_DIALOG_SELECTOR = [
+  '[data-slot="dialog-content"]',
+  '[data-slot="alert-dialog-content"]',
+]
+  .map((sel) => `${sel}:not([data-closed]):not([data-ending-style])`)
+  .join(",");
+
+const hasOpenModalDialog = (): boolean => document.querySelector(OPEN_MODAL_DIALOG_SELECTOR) !== null;
 
 const isEditableTarget = (t: EventTarget | null): boolean => {
   if (!(t instanceof HTMLElement)) return false;
@@ -191,6 +212,33 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   const [vp, setVp] = useState<Viewport>(() => ({ width: window.innerWidth, height: window.innerHeight }));
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  // 倍速 / 「更多」菜单是否展开：全屏控件不自动收起、Esc 归菜单都要用（键盘 effect 在下面，所以声明放这里）
+  const [menuOpen, setMenuOpen] = useState(false);
+  // 「再按一次 Esc 关闭」是否在提示中（只管界面；真正的时间窗口由 escArmedAtRef + decideEscapeClose 判）
+  const [escArmed, setEscArmed] = useState(false);
+  // 第一下 Esc 的时间（performance.now）；null = 没上膛
+  const escArmedAtRef = useRef<number | null>(null);
+  // 提示自动消失的计时器
+  const escTimerRef = useRef<number | null>(null);
+  // 最近一次退出全屏的时间（performance.now）：退出后的缓冲期内 Esc 不算，见 ESC_AFTER_FULLSCREEN_GRACE_MS
+  const fullscreenExitedAtRef = useRef<number | null>(null);
+
+  // 清掉 Esc 上膛状态与提示（其它键 / Esc 归别人 / 超时 / 真关闭时都走这里）
+  const disarmEsc = useCallback(() => {
+    escArmedAtRef.current = null;
+    if (escTimerRef.current !== null) {
+      window.clearTimeout(escTimerRef.current);
+      escTimerRef.current = null;
+    }
+    setEscArmed(false);
+  }, []);
+  // 卸载时清计时器（不 setState，避免卸载后更新）
+  useEffect(
+    () => () => {
+      if (escTimerRef.current !== null) window.clearTimeout(escTimerRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     const onResize = () => setVp({ width: window.innerWidth, height: window.innerHeight });
@@ -199,7 +247,12 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
   }, []);
 
   useEffect(() => {
-    const onFs = () => setIsFullscreen(document.fullscreenElement === rootRef.current);
+    const onFs = () => {
+      const fs = document.fullscreenElement === rootRef.current;
+      // 非全屏的变化（含退出）都记一笔：只会让「退出后短暂不认 Esc」宁多勿少
+      if (!fs) fullscreenExitedAtRef.current = performance.now();
+      setIsFullscreen(fs);
+    };
     document.addEventListener("fullscreenchange", onFs);
     return () => document.removeEventListener("fullscreenchange", onFs);
   }, []);
@@ -211,6 +264,19 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
     mode === "mini"
       ? { x: vp.width - MINI_W - DOCK_MARGIN, y: vp.height - MINI_H - DOCK_MARGIN, w: MINI_W, h: MINI_H }
       : floatGeo;
+
+  // 内置浏览器是原生视图、永远压在 HTML 之上：播放器与浏览器视口相交时得让浏览器换成截图占位（use-overlay-cover）。
+  // 播放器不在 body 直下、位置靠 style 变，MutationObserver 看不到，这里在「出现 / 挪位 / 改尺寸 / 全屏切换」时主动通知
+  useLayoutEffect(() => {
+    notifyOverlayLayoutChanged();
+  }, [rect.x, rect.y, rect.w, rect.h, isFullscreen]);
+  // 关闭播放器：DOM 摘掉后再评估一次，浏览器才能从截图占位恢复成真页面（通知本身是 50ms 去抖、评估时 DOM 已移除）
+  useEffect(
+    () => () => {
+      notifyOverlayLayoutChanged();
+    },
+    [],
+  );
 
   // 拖动 / 缩放
   const dragRef = useRef<{
@@ -708,10 +774,33 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
         // Esc 先关帮助（全屏的 Esc 由浏览器自己处理）
         if (showHelp) {
           setShowHelp(false);
+          disarmEsc();
           e.preventDefault();
           return;
         }
+        // 连按两次 Esc 关闭播放器：第一下上膛 + 提示，窗口内第二下才关；不吞事件，Esc 照样传给侧栏 / 菜单
+        const decision = decideEscapeClose(e, {
+          now: performance.now(),
+          armedAt: escArmedAtRef.current,
+          fullscreen: isFullscreen,
+          fullscreenExitedAt: fullscreenExitedAtRef.current,
+          menuOpen,
+          modalOpen: hasOpenModalDialog(),
+        });
+        if (decision === "reset") disarmEsc();
+        else if (decision === "close") {
+          disarmEsc();
+          closeMedia();
+        } else if (decision === "arm") {
+          escArmedAtRef.current = performance.now();
+          setEscArmed(true);
+          if (escTimerRef.current !== null) window.clearTimeout(escTimerRef.current);
+          escTimerRef.current = window.setTimeout(disarmEsc, ESC_CLOSE_WINDOW_MS);
+        }
+        return;
       }
+      // 上膛后按了别的键 = 不是要关，取消「再按一次」
+      disarmEsc();
       const cmd = resolveMediaShortcut(e, { groupSize, kind });
       if (!cmd) return;
       if (e.repeat && cmd.type === "toggle") {
@@ -732,7 +821,7 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
       window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("keyup", onKeyUp, true);
     };
-  }, [exec, groupSize, kind, showHelp]);
+  }, [exec, groupSize, kind, showHelp, isFullscreen, menuOpen, disarmEsc]);
 
   // ---------- 系统媒体键 ----------
   useMediaSession({
@@ -822,7 +911,6 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
 
   // 全屏：鼠标几秒不动就收起顶栏 / 控制区 / 鼠标指针；暂停、开着菜单 / 帮助 / 有报错时不收
   const { idle, onPointerMove: onIdleMove } = useIdleHide(isFullscreen, IDLE_HIDE_MS);
-  const [menuOpen, setMenuOpen] = useState(false);
   const chromeShown = chromeVisible({
     fullscreen: isFullscreen,
     paused: !playing,
@@ -907,15 +995,24 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
             <Tooltip content={path}>
               <div className="min-w-0 flex-1">
                 <div className="truncate text-xs font-medium leading-tight">{title}</div>
-                <div className="truncate text-[11px] leading-tight text-muted-foreground">
-                  {mode === "mini"
-                    ? `${formatClock(state.time)} / ${formatClock(state.duration)}`
-                    : [
-                        formatBytes(info?.size ?? 0),
-                        shortenHomePathDisplay(path.slice(0, Math.max(0, path.length - title.length - 1))),
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
+                {/* 第二行平时是大小 / 路径（收成一条时是时间）；按过第一下 Esc 时临时换成提示（不新增行、窗口不抖，收成一条时也看得见） */}
+                <div
+                  aria-live="polite"
+                  className={cn(
+                    "truncate text-[11px] leading-tight",
+                    escArmed ? "font-medium text-foreground" : "text-muted-foreground",
+                  )}
+                >
+                  {escArmed
+                    ? "再按一次 Esc 关闭播放器"
+                    : mode === "mini"
+                      ? `${formatClock(state.time)} / ${formatClock(state.duration)}`
+                      : [
+                          formatBytes(info?.size ?? 0),
+                          shortenHomePathDisplay(path.slice(0, Math.max(0, path.length - title.length - 1))),
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
                 </div>
               </div>
             </Tooltip>
@@ -931,12 +1028,16 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
                 </button>
               </Tooltip>
             )}
-            <Tooltip content="关闭">
+            <Tooltip content="关闭（连按两次 Esc）">
               <button
                 type="button"
                 aria-label="关闭播放器"
                 onClick={() => closeMedia()}
-                className="inline-flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                className={cn(
+                  "inline-flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+                  // 上膛中：关闭按钮跟着亮起来，和旁边的提示文字呼应
+                  escArmed && "bg-muted text-foreground",
+                )}
               >
                 <X className="size-4" />
               </button>

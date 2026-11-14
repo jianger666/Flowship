@@ -140,13 +140,20 @@ const shellSdkExecMs = (toolCall: ToolCallLike): number | undefined => {
  *
  * 频次：实测一次 agent.send 只发一条 turn-ended（哪怕中间跑了 40 多步、几十个工具），
  * 所以「一轮写一次 meta」的量级跟现有 patchAction 比可以忽略——绝不按 delta 写盘。
+ *
+ * runKind 必须透传：turn-ended 在 run 收尾后才到，action 往往已是 awaiting_ack / error，
+ * recordTurnUsage 要靠它区分「主线 run（记到 action）」和「旁路问答（不记）」。
  */
-const persistTurnUsage = (taskId: string, rawUsage: unknown): void => {
+const persistTurnUsage = (
+  taskId: string,
+  rawUsage: unknown,
+  runKind: string,
+): void => {
   const usage = normalizeTurnUsage(rawUsage);
   if (!usage) return;
   void (async () => {
     try {
-      const task = await recordTurnUsage(taskId, usage);
+      const task = await recordTurnUsage(taskId, usage, { runKind });
       if (task) publish(taskId, { kind: "task", task });
     } catch (err) {
       console.warn(`[perf] turn 用量落盘失败 task=${taskId}`, err);
@@ -508,7 +515,7 @@ export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
               ` cacheReadTokens=${u.cacheReadTokens} cacheWriteTokens=${u.cacheWriteTokens}${reasoning}`,
           );
           // 日志之外的副作用之一：落进 meta.json 供 UI 展示（内部已 try/catch + 火忘）
-          persistTurnUsage(ctx.taskId, u);
+          persistTurnUsage(ctx.taskId, u, ctx.runKind);
         }
         settleAfterTurnEnd();
       }

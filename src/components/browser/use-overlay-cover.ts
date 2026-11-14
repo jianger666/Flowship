@@ -30,6 +30,7 @@ import {
   type CoverNeed,
   type OverlayItem,
 } from "./overlay-cover-logic";
+import { OVERLAY_LAYOUT_EVENT } from "@/lib/overlay-layout-event";
 import { isElementRendered } from "./viewport-bounds";
 
 /** 去抖评估间隔：既够合并一次开合引起的一串 DOM 事件，又不至于让遮盖明显滞后 */
@@ -197,6 +198,8 @@ export const useOverlayCover = ({
     if (toaster) toastObserver.observe(toaster, { childList: true, subtree: true });
 
     window.addEventListener("resize", schedule);
+    // ④ 观察不到的浮层（挂在应用根部的播放器等）开合 / 挪位 / 改尺寸时主动通知（见 lib/overlay-layout-event）
+    window.addEventListener(OVERLAY_LAYOUT_EVENT, schedule);
     // 首次评估：面板打开时可能已经有浮层开着（比如从命令面板里点进来的）
     schedule();
 
@@ -209,6 +212,7 @@ export const useOverlayCover = ({
       attrObserver.disconnect();
       toastObserver.disconnect();
       window.removeEventListener("resize", schedule);
+      window.removeEventListener(OVERLAY_LAYOUT_EVENT, schedule);
       // 卸载时无条件让主进程恢复视图（R1-13）：不能只在 coveredNow 为真时才发——
       // 一次 setCovered(true) 可能正在途中（截图还没回来，coveredNow 仍是 false），漏发 false 就会让它事后落地、
       // 把视图永久藏起来。主进程对未 attach 的会话是空操作，对在途的 true 用序号令牌作废，重复发 false 无副作用

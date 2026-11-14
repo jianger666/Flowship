@@ -1,12 +1,18 @@
 /**
  * 播放器快捷键（media-shortcuts）：按键 → 命令；倍速档位步进
  */
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { RATES } from "@/lib/media/media-memory";
 import {
+  ESC_AFTER_FULLSCREEN_GRACE_MS,
+  ESC_CLOSE_WINDOW_MS,
+  decideEscapeClose,
   resolveMediaShortcut,
   stepRate,
+  type EscapeCloseContext,
   type MediaCommand,
   type ShortcutContext,
   type ShortcutEventLike,
@@ -247,5 +253,145 @@ describe("stepRate", () => {
     // 同方向本来就会走到相邻一档
     expect(stepRate(1 + 1e-7, 1)).toBe(1.25);
     expect(stepRate(1 - 1e-7, -1)).toBe(0.75);
+  });
+});
+
+describe("decideEscapeClose：连按两次 Esc 关闭播放器", () => {
+  const T0 = 100_000;
+  const idle: EscapeCloseContext = {
+    now: T0,
+    armedAt: null,
+    fullscreen: false,
+    fullscreenExitedAt: null,
+    menuOpen: false,
+    modalOpen: false,
+  };
+  const esc = (ctx: Partial<EscapeCloseContext> = {}, ev: Partial<ShortcutEventLike & { repeat: boolean }> = {}) =>
+    decideEscapeClose({ key: "Escape", ...ev }, { ...idle, ...ctx });
+
+  it("第一下只上膛（arm），不关", () => {
+    expect(esc()).toBe("arm");
+  });
+
+  it("窗口内的第二下才关（close）；边界 = 窗口时长含端点，超过一毫秒就当重新第一下", () => {
+    expect(esc({ armedAt: T0 - 300 })).toBe("close");
+    expect(esc({ armedAt: T0 - ESC_CLOSE_WINDOW_MS })).toBe("close");
+    expect(esc({ armedAt: T0 - ESC_CLOSE_WINDOW_MS - 1 })).toBe("arm");
+  });
+
+  it("时钟倒退（armedAt 在未来）不算连按：重新上膛", () => {
+    expect(esc({ armedAt: T0 + 5 })).toBe("arm");
+  });
+
+  it("全屏中：Esc 归浏览器（退出全屏），清掉上膛、不关——即便刚刚上过膛", () => {
+    expect(esc({ fullscreen: true })).toBe("reset");
+    expect(esc({ fullscreen: true, armedAt: T0 - 100 })).toBe("reset");
+  });
+
+  it("退出全屏后的缓冲期：「Esc 退出全屏 → 习惯性再按一下」不会上膛，更不会关", () => {
+    expect(esc({ fullscreenExitedAt: T0 - 100 })).toBe("reset");
+    expect(esc({ fullscreenExitedAt: T0 - 100, armedAt: T0 - 50 })).toBe("reset");
+    // 缓冲过后恢复正常
+    expect(esc({ fullscreenExitedAt: T0 - ESC_AFTER_FULLSCREEN_GRACE_MS })).toBe("arm");
+    expect(esc({ fullscreenExitedAt: T0 - ESC_AFTER_FULLSCREEN_GRACE_MS - 1, armedAt: T0 - 100 })).toBe("close");
+  });
+
+  it("倍速 / 更多菜单开着：Esc 归菜单，不关播放器、清掉上膛", () => {
+    expect(esc({ menuOpen: true })).toBe("reset");
+    expect(esc({ menuOpen: true, armedAt: T0 - 100 })).toBe("reset");
+  });
+
+  it("有模态弹窗开着：Esc 归弹窗，不关播放器、清掉上膛", () => {
+    expect(esc({ modalOpen: true })).toBe("reset");
+    expect(esc({ modalOpen: true, armedAt: T0 - 100 })).toBe("reset");
+  });
+
+  it("长按（repeat 帧）什么都不做：既不能自己上膛，也不能把已上膛的清掉或关掉", () => {
+    expect(esc({}, { repeat: true })).toBe("pass");
+    expect(esc({ armedAt: T0 - 100 }, { repeat: true })).toBe("pass");
+  });
+
+  it("输入法组字中 / 带修饰键的 Esc 不算", () => {
+    expect(esc({}, { isComposing: true })).toBe("pass");
+    for (const mod of ["ctrlKey", "metaKey", "altKey", "shiftKey"] as const) {
+      expect(esc({ armedAt: T0 - 100 }, { [mod]: true }), mod).toBe("pass");
+    }
+  });
+
+  it("不是 Esc 的键一律 pass（取消上膛由组件在「其它键」分支做）", () => {
+    for (const key of ["Enter", "q", " ", "Escape ", "esc"]) {
+      expect(decideEscapeClose({ key }, { ...idle, armedAt: T0 - 100 }), key).toBe("pass");
+    }
+  });
+
+  it("参数口径：窗口 1.5 秒、全屏退出缓冲 0.8 秒（改动要连同帮助文案一起改）", () => {
+    expect(ESC_CLOSE_WINDOW_MS).toBe(1500);
+    expect(ESC_AFTER_FULLSCREEN_GRACE_MS).toBe(800);
+  });
+
+  it("Esc 不再是普通快捷键：resolveMediaShortcut 仍对它返回 null（关闭走有状态的 decideEscapeClose）", () => {
+    expect(press("Escape")).toBeNull();
+  });
+});
+
+describe("连按 Esc 关闭：播放窗接线（源码契约；hook / 全屏行为要真机看）", () => {
+  const ROOT = path.resolve(import.meta.dirname, "..");
+  const dock = readFileSync(path.join(ROOT, "src/components/media/media-player-dock.tsx"), "utf-8");
+  const parts = readFileSync(path.join(ROOT, "src/components/media/media-dock-parts.tsx"), "utf-8");
+
+  it("键盘处理里 Esc 走 decideEscapeClose，喂的是全屏 / 退出全屏时间 / 菜单 / 模态弹窗 / 上膛时间", () => {
+    const at = dock.indexOf("decideEscapeClose(e, {");
+    expect(at).toBeGreaterThan(-1);
+    const call = dock.slice(at, dock.indexOf("});", at));
+    for (const field of [
+      "now: performance.now()",
+      "armedAt: escArmedAtRef.current",
+      "fullscreen: isFullscreen",
+      "fullscreenExitedAt: fullscreenExitedAtRef.current",
+      "menuOpen,",
+      "modalOpen: hasOpenModalDialog()",
+    ]) {
+      expect(call, field).toContain(field);
+    }
+  });
+
+  it("四种结果各自的动作：reset 清状态、close 清状态后 closeMedia、arm 上膛并起提示计时", () => {
+    expect(dock).toContain('if (decision === "reset") disarmEsc();');
+    expect(dock).toMatch(/decision === "close"\) \{\s*disarmEsc\(\);\s*closeMedia\(\);/);
+    expect(dock).toMatch(/decision === "arm"\) \{\s*escArmedAtRef\.current = performance\.now\(\);\s*setEscArmed\(true\);/);
+    expect(dock).toContain("window.setTimeout(disarmEsc, ESC_CLOSE_WINDOW_MS)");
+  });
+
+  it("Esc 分支里不吞事件（不 stopPropagation / preventDefault 的只有「关帮助」那一处）：侧栏 / 菜单照样能收到 Esc", () => {
+    const start = dock.indexOf("const decision = decideEscapeClose");
+    const end = dock.indexOf("disarmEsc();\n      const cmd = resolveMediaShortcut");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(dock.slice(start, end)).not.toMatch(/stopPropagation|preventDefault/);
+  });
+
+  it("按了别的键就取消上膛（在 resolveMediaShortcut 之前）；帮助开着时 Esc 先关帮助并清状态", () => {
+    expect(dock).toMatch(/disarmEsc\(\);\s*const cmd = resolveMediaShortcut\(e,/);
+    expect(dock).toMatch(/if \(showHelp\) \{\s*setShowHelp\(false\);\s*disarmEsc\(\);/);
+  });
+
+  it("全屏监听记录退出时间；menuOpen 声明在键盘 effect 之前（deps 数组里用到，不能晚于它声明）", () => {
+    expect(dock).toContain("if (!fs) fullscreenExitedAtRef.current = performance.now();");
+    expect(dock.indexOf("const [menuOpen, setMenuOpen]")).toBeLessThan(
+      dock.indexOf("}, [exec, groupSize, kind, showHelp, isFullscreen, menuOpen, disarmEsc]);"),
+    );
+    expect(dock).toContain("onMenuOpenChange={setMenuOpen}");
+  });
+
+  it("模态弹窗判定：只认开着的 dialog / alert-dialog（关闭动画中的不算）", () => {
+    expect(dock).toContain('[data-slot="dialog-content"]');
+    expect(dock).toContain('[data-slot="alert-dialog-content"]');
+    expect(dock).toContain(":not([data-closed]):not([data-ending-style])");
+  });
+
+  it("提示与可发现性：上膛时第二行换成提示、关闭按钮提示写明连按两次、帮助表有这一行", () => {
+    expect(dock).toContain("再按一次 Esc 关闭播放器");
+    expect(dock).toContain('<Tooltip content="关闭（连按两次 Esc）">');
+    expect(parts).toContain('["Esc  Esc"');
   });
 });

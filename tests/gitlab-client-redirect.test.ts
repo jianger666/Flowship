@@ -3,7 +3,7 @@
  *
  * 出站点清单（带 PAT 的）：
  *   fetch 侧（统一走 fetchWithGitToken，`redirect: "error"`）：
- *     gitlab-client.ts：findOpenMR（经 closeOpenMR）/ createMR / closeMR（经 closeOpenMR）/ getMRMergeStatus / getMR / mergeMR
+ *     gitlab-client.ts：findOpenMR（经 closeOpenMR）/ createMR / closeMR（经 closeOpenMR）/ updateMR（经 createMR 复用）/ getMRMergeStatus / getMR / mergeMR
  *     team-library.ts：getGitLabUploadIdentity、probeCanMirror（经 getTeamLibraryStatus）
  *   git 子进程侧（team-library.ts 的 buildAuthedGitArgs）：clone / fetch / push / ls-remote
  *     → `-c http.followRedirects=false`（git 默认 initial 会跟首个 3xx、并按新 host 重新向 inline helper 要凭据）
@@ -58,7 +58,7 @@ const listen = async (
 let a: Srv;
 let b: Srv;
 /** A 的行为：默认全部 302 → B；个别用例改成「先 200 再重定向」 */
-let aMode: "redirect" | "ok" | "list-ok-then-redirect" = "redirect";
+let aMode: "redirect" | "ok" | "list-ok-then-redirect" | "reuse-then-update-redirect" = "redirect";
 
 beforeAll(async () => {
   // B：「别的 host」——对 GitLab 请求回 401（让 git 的 credential helper 有机会被触发），记录一切
@@ -69,6 +69,17 @@ beforeAll(async () => {
   a = await listen((req, res) => {
     const url = req.url ?? "";
     const isList = req.method === "GET" && /\/merge_requests\?/.test(url);
+    // 再次提测的复用路径：POST 建 MR 撞 409 → GET 列表找到旧 MR（标题 / 描述与本次不同）→ PUT 更新这一步被重定向
+    if (aMode === "reuse-then-update-redirect" && (req.method === "POST" || isList)) {
+      if (req.method === "POST") {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: ["Another open merge request already exists for this source branch: !7"] }));
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify([{ web_url: "https://x/mr/7", iid: 7, title: "old title", description: "old desc" }]));
+      }
+      return;
+    }
     if (aMode === "ok" || (aMode === "list-ok-then-redirect" && isList)) {
       res.writeHead(200, { "content-type": "application/json" });
       if (/\/api\/v4\/user$/.test(url)) {
@@ -160,7 +171,7 @@ const expectRefused = (r: { ok: boolean; error?: string }): void => {
   }
 };
 
-describe("gitlab-client：6 个 REST 入口都不跟随重定向", () => {
+describe("gitlab-client：7 个 REST 入口都不跟随重定向", () => {
   it("对照：A 正常响应时 getMR 成功（证明 spy 改写 + allowlist 接线有效，不是「连不上」造成的假通过）", async () => {
     aMode = "ok";
     const r = await getMR({ config: config(), projectPath: "g/r", iid: 9 });
@@ -218,6 +229,34 @@ describe("gitlab-client：6 个 REST 入口都不跟随重定向", () => {
     expectRefused(r);
     // 列表那一跳确实走通了（A 收到 GET 列表 + PUT 关闭两个请求）
     expect(a.requests.map((q) => q.method)).toEqual(["GET", "PUT"]);
+  });
+
+  it("createMR 复用已有 MR → updateMR（PUT 更新标题 / 描述）：更新这一步被重定向——MR 仍算成功、带回 updateError、B 收不到 PAT", async () => {
+    aMode = "reuse-then-update-redirect";
+    const r = await createMR({
+      config: config(),
+      projectPath: "g/r",
+      sourceBranch: "feat",
+      targetBranch: "test",
+      title: "new title v2",
+      description: "old desc\n\n## v2 更新",
+      removeSourceBranch: false,
+      updateExistingOnReuse: true,
+    });
+    // 与其它入口不同：复用到的 MR 已存在，更新失败不当失败
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.iid).toBe(7);
+    expect(r.updated).toBe(false);
+    expect(r.updateError).toContain("重定向");
+    expect(r.updateError).not.toContain(FAKE_TOKEN);
+    // POST（409）→ GET（列表）→ PUT（更新、被重定向）三个请求都到过 A，B 一个都没收到
+    expect(a.requests.map((q) => q.method)).toEqual(["POST", "GET", "PUT"]);
+    expect(b.requests).toHaveLength(0);
+    expect(tokenSeenByB()).toBe(false);
+    for (const call of fetchSpy.mock.calls) {
+      expect((call[1] as RequestInit | undefined)?.redirect).toBe("error");
+    }
   });
 });
 

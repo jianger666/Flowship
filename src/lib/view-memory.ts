@@ -4,7 +4,7 @@
  * 三档存储、按「该记多久」选：
  * - sessionStorage：最后浏览的对话 / 输入草稿 / 看板时间范围——重启 app 即忘（符合预期、
  *   不产生陈旧状态）；Electron 单窗口、session 生命周期 = app 生命周期
- * - localStorage：输入条拖过的高度 / 侧栏分组折叠与置顶序——用户的全局偏好、跨重启保留
+ * - localStorage：输入条拖过的高度 / 侧栏分组折叠与置顶序 / 推进弹窗「高级选项」是否展开——用户的全局偏好、跨重启保留
  * - 模块级内存 Map：输入条附件快照（图 File 对象不可序列化、也不进配额）——
  *   SPA 路由切换组件会卸载、但模块常驻；reload 即忘无妨
  */
@@ -397,6 +397,28 @@ export const loadOutlineShowSchedule = (): boolean => {
 export const saveOutlineShowSchedule = (on: boolean) => {
   try {
     localStorage.setItem(OUTLINE_SHOW_SCHEDULE_KEY, on ? "1" : "0");
+  } catch {
+    /* 存储被禁忽略 */
+  }
+};
+
+// ---------- 推进弹窗「高级选项」折叠区是否展开（全局偏好、跨任务共用；默认收起） ----------
+
+const ADVANCE_ADVANCED_OPEN_KEY = "flowship:advance-advanced-open";
+
+/** 读推进弹窗高级区上次的开合；没存过 / 存储不可用都按「收起」 */
+export const loadAdvanceAdvancedOpen = (): boolean => {
+  try {
+    return localStorage.getItem(ADVANCE_ADVANCED_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+};
+
+/** 保存推进弹窗高级区的开合（用户亲手点触发器时才写；自动强制展开不落盘） */
+export const saveAdvanceAdvancedOpen = (open: boolean) => {
+  try {
+    localStorage.setItem(ADVANCE_ADVANCED_OPEN_KEY, open ? "1" : "0");
   } catch {
     /* 存储被禁忽略 */
   }

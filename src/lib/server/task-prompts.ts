@@ -59,7 +59,11 @@ import type {
   Task,
 } from "@/lib/types";
 import { TEST_STRATEGY_LABEL } from "@/lib/types";
-import { computeBatchProgress } from "@/lib/task-display";
+import {
+  computeBatchProgress,
+  mrKindOf,
+  mrTargetBranchOf,
+} from "@/lib/task-display";
 import { buildNextActionHead } from "@/lib/protocol-signals";
 import {
   isTestingRequirementTask,
@@ -81,6 +85,9 @@ const ACTION_PROMPT_FILE: Record<Exclude<ActionType, "custom">, string> = {
   ship: "action-ship.md",
   dev: "action-dev.md",
 };
+
+// 「再次提测」精简版 ship playbook（只在 shouldUseShipUpdatePlaybook 判定为真时替换 action-ship.md）
+const SHIP_UPDATE_PROMPT_FILE = "action-ship-update.md";
 
 const NULL_PLACEHOLDER = "（未提供）";
 
@@ -313,11 +320,72 @@ const loadSharedPrompt = async (task: Task): Promise<string> => {
   return `${filled.replace(/\s+$/, "")}\n\n${mediaDisplayPromptSection()}${browserSection ? `\n\n${browserSection}` : ""}\n`;
 };
 
+// ----------------- ship「再次提测」精简版选择 -----------------
+
+// 用户指令里明确要求「重新走完整流程」之类的措辞 → 回落全量版。
+// 宁可多命中（误回落只是多读几 KB）、也不能漏（误精简会少步骤）；
+// 「重新提测 / 再次提测」本身是正常说法、不在其中。
+const FULL_FLOW_REQUEST_RE =
+  /完整(版|流程|提测|playbook)|全流程|全量(版|流程)|整(套|个)流程|重新(走|探测|跑一遍|来过|开始)|重走|重头|从头|按首次|full\s*(flow|process|playbook)|from\s+scratch/i;
+
+/**
+ * 是否「精简版可直接复用的既有提测 MR」——保守、以下全部满足才算：
+ * - 不是本 action 内创建的：task.mrs 每仓每目标分支只留一条「当前最新」、首次提测中途续接（重启继续）时
+ *   本轮刚建的 v1 也在里面——不排除就会让同一 action 前后两次 loadActionPrompt 选到不同 playbook。
+ *   createdAt 是首次创建时间（upsert 保留）、`createdAt < action.startedAt` ⇔ 本 action 开始前就已存在；
+ *   写成「不满足 < 就排除」、NaN / 缺字段也落到排除（= 回落全量版）
+ * - 仍是 open：closed / merged 的旧 MR 不会被 submit_mr 复用（会新建）、不符合精简版「同一条 MR 再推一版」的前提
+ * - 是提测 MR（mrKindOf = ship、不是联调 dev MR）、且目标分支就是该仓配置的测试分支
+ *   （配了才比；没配无从比、按老口径兜底）。复用 task-display 的 helper、不另写一份判定
+ */
+const isReusableShipMr = (
+  task: Pick<Task, "repoTestBranches" | "repoDevBranches">,
+  action: Pick<ActionRecord, "startedAt">,
+  mr: Task["mrs"][number],
+): boolean => {
+  if (!(mr.createdAt < action.startedAt)) return false;
+  if (mr.status !== "open") return false;
+  if (mrKindOf(mr, task.repoTestBranches, task.repoDevBranches) !== "ship") {
+    return false;
+  }
+  const configured = task.repoTestBranches?.[mr.repoPath]?.trim();
+  return (
+    !configured || mrTargetBranchOf(mr, task.repoTestBranches) === configured
+  );
+};
+
+/**
+ * 本次 ship 是否用「再次提测」精简版 playbook（action-ship-update.md）。纯函数、可单测。
+ *
+ * 判定保守——拿不准一律回落全量版 action-ship.md（首次提测行为不变）：
+ * 1. action.type 必须是 ship；
+ * 2. 用户指令没要求「重新走完整流程」之类（FULL_FLOW_REQUEST_RE）；
+ * 3. task 没填 REQ-ID（填了 = 团队 wk-harness 流程、源分支要按 WK 规则定、规则只在全量版里）；
+ * 4. task.mrs 里至少有一条「可复用的既有提测 MR」（见 isReusableShipMr）。
+ *    多仓只有部分仓有既有 MR 也算——精简版自己对「该仓没有既有 MR」有兜底（转全量版）。
+ *
+ * 选择只改 playbook 文件名：playbook 在 super prompt 预算里是 L0（永不裁）、
+ * 换文件不引入新的裁剪路径；两处调用点（首包 / 续接载荷）走同一个 loadActionPrompt、判定一致。
+ */
+export const shouldUseShipUpdatePlaybook = (
+  task: Pick<
+    Task,
+    "mrs" | "reqId" | "repoTestBranches" | "repoDevBranches"
+  >,
+  action: Pick<ActionRecord, "type" | "userInstruction" | "startedAt">,
+): boolean => {
+  if (action.type !== "ship") return false;
+  if (FULL_FLOW_REQUEST_RE.test(action.userInstruction ?? "")) return false;
+  if (resolveReqId(task)) return false;
+  return (task.mrs ?? []).some((mr) => isReusableShipMr(task, action, mr));
+};
+
 // 加载某个 action 的 prompt、填模板变量
 // V0.6 模板可用占位符：
 //   {{taskId}} / {{taskTitle}} / {{repoPath}}（effective cwd）
 //   {{actionArtifactsDir}}（绝对路径、给 agent write 用）
 //   {{eventsLogPath}}（事件日志绝对路径）
+//   {{shipFullPlaybookPath}}（ship 全量版 playbook 的绝对路径、精简版兜底时让 agent read）
 // ⚠️ 加占位符记得同步 tests/protocol-signals.test.ts 的供值表对账
 export const loadActionPrompt = async (
   action: ActionRecord,
@@ -329,12 +397,16 @@ export const loadActionPrompt = async (
     repoPath: getTaskCwd(task),
     actionArtifactsDir: getActionsDir(task.id),
     eventsLogPath: getEventsLogPath(task.id),
+    shipFullPlaybookPath: path.join(PROMPTS_DIR, ACTION_PROMPT_FILE.ship),
   };
   // 自定义 action：主 skill 正文当 playbook（ACTION.md 只是挂载壳）、不走 prompts/action-*.md
   if (action.type === "custom") {
     return loadCustomActionPlaybook(action, vars);
   }
-  const tpl = await loadFileSafe(ACTION_PROMPT_FILE[action.type]);
+  const file = shouldUseShipUpdatePlaybook(task, action)
+    ? SHIP_UPDATE_PROMPT_FILE
+    : ACTION_PROMPT_FILE[action.type];
+  const tpl = await loadFileSafe(file);
   return fillTemplate(tpl, vars);
 };
 

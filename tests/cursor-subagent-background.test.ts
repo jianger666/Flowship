@@ -148,7 +148,9 @@ describe("工具定义：开了后台才有 run_in_background", () => {
     expect(link.tool.description).toContain(CURSOR_SUBAGENT_DESCRIPTION);
     expect(link.tool.description).toContain("run_in_background");
     expect(link.tool.description).toContain("最多 4 个");
-    expect(link.tool.description).toContain("30 分钟");
+    // 2026-11-13 用户决定去掉后台子代理 30 分钟运行上限：默认不限时（详见 cursor-subagent-background-timeout.test.ts）
+    expect(link.tool.description).toContain("不限制运行时长");
+    expect(link.tool.description).not.toContain("30 分钟");
     expect(link.tool.description).toContain("自动转到后台");
   });
 

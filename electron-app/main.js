@@ -3594,6 +3594,11 @@ if (!app.requestSingleInstanceLock()) {
     // mac 自定义应用菜单：默认菜单的 File→Close（Cmd+W）走 close 事件、会撞上
     // 「点 X = 二次确认退出」——把 Cmd+W 改绑「收进托盘」；其余菜单保留系统 role
     //（editMenu 必须保留、否则 Cmd+C/V 全失效）
+    // 「显示」菜单不能直接用 role: "viewMenu"：它自带「重新加载」(Cmd+R) / 「强制重新加载」(Cmd+Shift+R)，
+    // 作用对象是主窗口——内置浏览器的原生视图持有焦点时，主窗口的 before-input-event 收不到按键，
+    // 菜单加速键就把整个 Flowship 刷掉了（用户要的是刷浏览器页面、Flowship 自身禁刷新）。
+    // 所以手写子项：只去掉两个 reload，其余（开发者工具 / 缩放 / 全屏）保持系统 role 行为不变。
+    // 浏览器页面的 Cmd+R 由 browser/user-features 的 before-input-event 接管。
     if (process.platform === "darwin") {
       Menu.setApplicationMenu(
         Menu.buildFromTemplate([
@@ -3610,7 +3615,18 @@ if (!app.requestSingleInstanceLock()) {
           },
           // role 菜单默认英文、覆盖中文 label（子项仍是系统行为）
           { role: "editMenu", label: "编辑" },
-          { role: "viewMenu", label: "显示" },
+          {
+            label: "显示",
+            submenu: [
+              { role: "toggleDevTools" },
+              { type: "separator" },
+              { role: "resetZoom" },
+              { role: "zoomIn" },
+              { role: "zoomOut" },
+              { type: "separator" },
+              { role: "togglefullscreen" },
+            ],
+          },
           { role: "windowMenu", label: "窗口" },
         ]),
       );

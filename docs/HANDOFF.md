@@ -178,7 +178,7 @@ V0.5 phase 顺序拆掉后、用 6 个显性门槛补回保证：
 | 2. action 后置 deterministic check | runner 切 awaiting_ack 前跑、写 `action.postCheck` | `action-checks.ts` |
 | 3. 默认 default | 可见列表第一位（v0.9.12 删按 task 状态推断、通用化） | `advance-dialog.tsx` open-effect |
 | 4. action 级 anti-patterns prompt | 每个 `prompts/action-<type>.md` 头部红线段 | `prompts/action-*.md` |
-| 5. cross-action 一致性自检 | V0.6.4+ 再做 | - |
+| 5. cross-action 一致性自检 | 2026-11-13 用户拍板不做（review 差异段已覆盖，见 `docs/ROADMAP.md`「四、止损」） | - |
 | 6. placeholder 动态 | UI 按 action + task 状态变 | `advance-dialog.tsx: buildPlaceholder` |
 
 ### 后置 check 的边界：只查交付诚实性、不跑项目命令（v0.9.13 拍板）
@@ -1525,6 +1525,7 @@ ai-flow-action-hub/
   ④ **Q11b-03 的强制收尾会丢弃迟到结果**（决策依据③）；cancel / close 期限没开注入口，测试靠假时钟走完 30 秒——期限常量被改动会让对应用例红，但不是「注入」式的。强制收尾时 `abandoned` 的 `drive()` 如果挂在一个永不 resolve 的 `stream()` / `wait()` 上，这个 pending 的 Promise 会留到进程结束（只持有 run 引用，不占名额 / busy / 事件）。
   ⑤ **Q7b-05 的 task-runner 展示文案没有行为测试**：任务事件里的仓名、`formatWorktreeCleanupNotes` 调用方的传参是**展示文案**，难以不起整个 runner 来测；用「源码扫描 + 位置计数」守着（`repoTail` 在 task-runner 里出现的次数、没有本地定义、从 `path-utils` 导入），变异里「某处改回完整路径」靠这些扫描杀。
   ⑥ **Q11b-03 的 1 秒下限有一个用户可见的后果**（审查 AI 预审点名）：子代理在**前台**跑超过上限（默认 30 分钟；前台本身没有上限）之后，如果用户才插话把它转后台，它转后台后**只剩 1 秒**（`BACKGROUND_MIN_REMAINING_MS`）：1 秒后发 cancel，最坏再约 60 秒强制收尾，主 AI 收到的是「超过 30 分钟 仍未完成，已被终止」、详情面板记「失败·超时」。改前这种情况会**重新得到完整的 30 分钟**，所以改后它不会再跑下去、没产出的结果拿不到，想继续只能重新派。这是照台账公式 `max(1 秒, 上限 − 已跑)` 有意取的（让提示词里「每个最长跑 30 分钟」的承诺成立），不是遗漏；备选与回滚见决策依据①。
+     **【2026-11-13 更新：默认上限已去掉】** 用户看到后台子代理被「超过 30 分钟 仍未完成，已被终止」掐掉后，决定去掉这个上限：`BACKGROUND_SUBAGENT_MAX_RUNTIME_MS` 现在默认 `null`（= 不限时），`goBackground` 不再起超时 / 宽限计时器，工具说明写「不限制运行时长」。上面 ⑥ 的 1 秒下限后果因此**不再出现**（只有显式注入数值 `background.maxRuntimeMs` 时才生效，测试与日后护栏仍可用）。代价：卡死的后台子代理不会再被自动清掉，会一直占 4 个名额之一，所在会话也不会被空闲回收；唯一的出路是用户「停止会话」（会 cancel 该会话**全部**后台子代理），目前没有「单个子代理停止」按钮（`background-subagents-bar.tsx` 里写明了）——如嫌不便，下一步该补的是这个按钮，不是把上限加回来。没用 `Infinity` 是因为 Node 里 `setTimeout(Infinity)` 会在 1ms 后触发。
   ⑦ **Q7a-04 页面收到 409 后不自动重取任务**（决策依据⑨）：通常靠 SSE 推来的 `task` 帧自愈；本页 SSE 断线重连期间重发会再得 409，直到重连后的第一帧快照到达——期间用户等 SSE 自动重连恢复、或手动刷新页面即可；升级条件见决策依据⑨。这条路径没有真机验证。
   ⑧ **未覆盖的缺口**：（a）页面推进请求体多带的 `expectedCurrentActionId` 只靠源码扫描守着，没有渲染 / 点击级用例；（b）`runAdvanceExclusive` 是**进程内**的队列，两个 server 进程共用同一个数据目录（如 dev 版与打包版同时开）时 CAS 不覆盖；（c）Q11b-03 的收尾顺序（强制收尾 → `close()` → 摘 live / 放名额 / 通知）靠假时钟 + 假依赖验证，真实 SDK 的 `cancel()` / `close()` 在半死连接下的行为没有观测（台账也标 ◐）。
 - **用户可见变化（whats-new 1.9.38 候选，未经你批准不会写进 `src/lib/whats-new.ts`）**：① 后台子代理即使 SDK 的取消失效、连接半死，到点（默认 30 分钟，从子代理开始算起、不是从转后台那刻算起——前台已经跑超 30 分钟才被转后台的，转后台后约 1 秒就会被终止）也会被强制收尾——不再占着 4 个后台名额、不再让会话永远不被回收、侧栏不再一直转圈；② Windows 上 ship 提 MR 时，agent 写了「某仓跳过」不再被误判成「agent 漏报」，默认任务标题 / 「改动」面板 / 飞书 MR 按钮 / 提示词里的仓名也不再显示整条 `C:\...` 路径；③ 在任务页对同一个任务连点两次「推进」（或两个窗口同时推进）：第二次会收到「任务状态已变化（可能刚被推进过）、这次没有重复推进——请先看最新进度，确需再推进请重新发起」的提示，而不是悄悄多出一条 action 并把第一条取消。

@@ -22,11 +22,12 @@ const PREVIEW_DIR = "src/components/preview";
 const previewFiles = readdirSync(path.join(ROOT, PREVIEW_DIR)).filter((f) => /\.(ts|tsx)$/.test(f));
 
 const provider = read("src/components/ui/local-file-preview.tsx");
+const sheet = read("src/components/ui/sheet.tsx");
 const body = read("src/components/ui/local-file-preview-body.tsx");
 const code = read(`${PREVIEW_DIR}/code-viewer.tsx`);
 
 describe("外壳（local-file-preview.tsx）", () => {
-  it("关窗（Esc / 点遮罩 / X）统一走 requestClose；有未保存修改先确认，取消则窗口保持打开", () => {
+  it("关栏（Esc / 左上角 X）统一走 requestClose；有未保存修改先确认，取消则侧栏保持打开", () => {
     expect(provider).toMatch(/onOpenChange=\{\(next\) => \{\s*if \(!next\) requestClose\(\);/);
     const at = provider.indexOf("const requestClose = useCallback");
     const fn = provider.slice(at, provider.indexOf("}, []);", at));
@@ -74,12 +75,33 @@ describe("外壳（local-file-preview.tsx）", () => {
     expect(provider).toContain("onSelectSheet={handleSelectSheet}");
   });
 
-  it("窗口固定高度（虚拟列表 / 编辑器要确定高度的容器）+ 标准 / 放大两档；正文区仍是 min-h-0 flex-1 且不横向溢出", () => {
-    expect(provider).toContain("h-[min(90vh,calc(100vh-48px))]");
-    expect(provider).toContain("max-h-[min(90vh,calc(100vh-48px))]");
-    expect(provider).toContain("sm:max-w-[min(960px,80vw,calc(100vw-48px))]");
-    expect(provider).toContain("sm:max-w-[min(1400px,96vw,calc(100vw-48px))]");
+  it("侧栏高度 = 视口高度（虚拟列表 / 编辑器要确定高度的容器）+ 标准 / 加宽两档（都不超视口）；正文区仍是 min-h-0 flex-1 且不横向溢出", () => {
+    // 高度来自 SheetContent 基类的 inset-y-0；这里不能再手写 90vh 之类的居中弹窗高度
+    expect(sheet).toContain("fixed inset-y-0 right-0");
+    expect(provider).not.toContain("90vh");
+    expect(provider).toContain("<SheetContent");
+    expect(provider).toContain('"max-w-none gap-0 overflow-hidden bg-background p-0 text-foreground"');
+    expect(provider).toContain('wide ? "w-[calc(100vw-6rem)]" : "w-[min(760px,70vw)]"');
     expect(provider).toContain("min-h-0 flex-1 overflow-x-hidden overflow-y-auto");
+  });
+
+  it("外壳是右侧非模态 Sheet（不再是居中 Dialog）：关闭键在左上，顶栏左侧给它让位", () => {
+    expect(provider).toMatch(/<Sheet\s+open=\{open\}/);
+    expect(provider).not.toMatch(/<Dialog\b|<DialogContent\b/);
+    expect(provider).toContain("pr-3 pl-11");
+    expect(provider).not.toContain("pr-12 pl-3");
+    // 非模态 + 不因点外面而关（连点不同文件链接只是换内容）：这两条由 Sheet 基座保证，锁住别被改掉
+    expect(sheet).toMatch(/\bmodal\s*=\s*false,/);
+    expect(sheet).toMatch(/\bdisablePointerDismissal\s*=\s*true,/);
+    // 关栏退场动画（SheetContent duration-200）跑完再清内容
+    expect(provider).toContain("window.setTimeout(clearPreviewData, 260)");
+  });
+
+  it("右侧只有一条位：与代码改动面板 / 子代理抽屉共用 right-dock，后开的替换先开的（关闭走 requestClose，脏草稿仍会先确认）", () => {
+    expect(provider).toContain('useRightDockSlot("file-preview", open, requestClose)');
+    expect(provider.indexOf("const requestClose = useCallback")).toBeLessThan(
+      provider.indexOf('useRightDockSlot("file-preview"'),
+    );
   });
 
   it("音视频仍走全局播放器（未回退）", () => {

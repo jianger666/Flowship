@@ -160,7 +160,18 @@ export const CURSOR_SUBAGENT_INPUT_JSON_SCHEMA = {
 
 /** 后台运行的护栏默认值：同时在跑的后台子代理数 / 单个后台子代理最长运行时间 */
 export const BACKGROUND_SUBAGENT_MAX_CONCURRENT = 4;
-export const BACKGROUND_SUBAGENT_MAX_RUNTIME_MS = 30 * 60 * 1000;
+/**
+ * 单个后台子代理最长运行时间的默认值；`null` = 不限制（2026-11-13 用户拍板去掉原来的 30 分钟上限，
+ * 调研 / 长任务常常要跑更久，被「超过 30 分钟仍未完成」砍掉等于白跑）。
+ *
+ * 不限制 = 不设超时计时器，子代理一直跑到自己结束、或用户停止会话（会连带取消全部后台子代理）。
+ * 代价：挂死 / 失控的后台子代理不会再被自动清理——它占后台名额、会让会话不被空闲回收，
+ * 且目前没有「只停某一个后台子代理」的入口（见 background-subagents-bar.tsx）。
+ *
+ * 不用 `Infinity` 表示不限：`setTimeout(fn, Infinity)` 在 Node 里会被当成 1ms 立刻触发。
+ * 注入 `background.maxRuntimeMs`（数值）仍然生效、超时 / 宽限收尾整条路径照旧——单测靠它覆盖。
+ */
+export const BACKGROUND_SUBAGENT_MAX_RUNTIME_MS: number | null = null;
 /**
  * 超时 cancel 之后给「子 run 收尾」的宽限：到点还没收尾就强制收尾（R14 Q11b-03）。
  * SDK 的 `cancel()` 自己可能抛 / 被忽略 / 挂死——只发一次 cancel 就指望流会结束，job 就会永远留在表里：
@@ -179,12 +190,16 @@ const BACKGROUND_MIN_REMAINING_MS = 1_000;
 /** 开了后台运行的会话：在基础说明后追加的一段（数字取自本 link 实际生效的护栏） */
 export const cursorSubagentBackgroundNote = (limits: {
   maxConcurrent: number;
-  maxRuntimeMs: number;
+  /** null = 不限制运行时长（默认）；数值 = 每个最长跑这么多毫秒 */
+  maxRuntimeMs: number | null;
 }): string =>
   "run_in_background=true：派出后立刻返回（给你一个后台任务 id），子代理在后台干活，做完后系统会把它的输出作为一条消息发给你——" +
   "适合与你接下来的工作无关、耗时较长的独立子任务，这样你可以继续回应用户或做别的事；" +
   "你自己要拿到它的结果才能往下走的任务不要放后台（直接等它返回）。" +
-  `同时最多 ${limits.maxConcurrent} 个后台子代理，每个最长跑 ${Math.round(limits.maxRuntimeMs / 60000)} 分钟。` +
+  `同时最多 ${limits.maxConcurrent} 个后台子代理，` +
+  (limits.maxRuntimeMs === null
+    ? "不限制运行时长（会一直跑到它自己结束，或用户停止会话）。"
+    : `每个最长跑 ${Math.round(limits.maxRuntimeMs / 60000)} 分钟。`) +
   "你正在前台等的子代理，遇到用户插话时会自动转到后台继续跑——所以不必为了「怕用户插话」而特意放后台。" +
   "后台结果到达前不要编造它的内容；用户问起进度就如实说「还在跑」。";
 
@@ -277,7 +292,10 @@ export interface CursorSubagentDeps {
     onJobsChanged?: () => void;
     /** 同时在跑的后台子代理上限，缺省 {@link BACKGROUND_SUBAGENT_MAX_CONCURRENT} */
     maxConcurrent?: number;
-    /** 单个后台子代理最长运行时间，缺省 {@link BACKGROUND_SUBAGENT_MAX_RUNTIME_MS}；超时取消并按失败收尾 */
+    /**
+     * 单个后台子代理最长运行时间（毫秒）。缺省 = {@link BACKGROUND_SUBAGENT_MAX_RUNTIME_MS}（不限制）；
+     * 显式给数值则超时取消并按失败收尾（单测 / 将来想加护栏时用）
+     */
     maxRuntimeMs?: number;
     /**
      * 超时取消之后的宽限：到点子 run 还没收尾（cancel 失败 / 被忽略 / 流挂死）就强制按失败收尾，
@@ -730,7 +748,10 @@ export const createCursorSubagentLink = (
 
   /** 后台运行超时被终止的说明（送主 AI 的失败事件与过程记录共用同一句） */
   const timeoutMessage = (): string =>
-    `超过 ${formatDuration(maxRuntimeMs)} 仍未完成，已被终止`;
+    // 不限制时不会有超时（没有计时器），这里只为类型收口；文案不会被用户看到
+    maxRuntimeMs === null
+      ? "已被终止"
+      : `超过 ${formatDuration(maxRuntimeMs)} 仍未完成，已被终止`;
 
   /** 后台收尾：结果交给订阅方（chat-runner）。订阅方抛错只告警。 */
   const settleBackground = (
@@ -810,29 +831,33 @@ export const createCursorSubagentLink = (
     job.background = true;
     job.detach = undefined;
     recSafe(() => job.rec?.setBackground(job.detached));
-    // 上限从「子代理开始」算，不是从转后台这一刻：前台已经跑的时间要扣掉
-    // （否则前台跑了 25 分钟再被插话转后台的，总共能跑 55 分钟，与提示词里承诺的「每个最长跑 N 分钟」不符）。
-    // 前台本身没有上限：转后台时已经超了的，短暂收尾（至少 1 秒），不再多给一个完整的上限
-    const remainingMs = maxRuntimeMs - Math.max(0, Date.now() - job.startedAt);
-    const delayMs = Math.max(
-      Math.min(BACKGROUND_MIN_REMAINING_MS, maxRuntimeMs),
-      remainingMs,
-    );
-    job.timer = setTimeout(() => {
-      // 只打标、不在这里给记录收尾：cancel 来得太晚时子 run 可能其实已经成功返回，
-      // 主 AI 会收到 done——详情面板必须和主 AI 看到的一致。记录统一由 settle 按真实结局收尾
-      // （超时被杀 → settle 看到 cancelled 且 job.timedOut，写成「失败·超时」）
-      job.timedOut = true;
-      void cancelRunBounded(run);
-      // 宽限：cancel 之后流 / wait 仍不结束（cancel 抛错 / 被忽略 / 流挂死）→ 强制收尾，
-      // 不留僵尸 job。正常收尾（settleBackground）会把这个计时器清掉
-      job.graceTimer = setTimeout(
-        () => expire(new Error(timeoutMessage())),
-        cancelGraceMs,
+    // 不限制运行时长（默认）：不设超时计时器，一直跑到子 run 自己结束 / 用户停止会话；
+    // 收尾仍走下面的 settled.then → settleBackground（清名额、通知主 AI、更新界面），与有上限时一致
+    if (maxRuntimeMs !== null) {
+      // 上限从「子代理开始」算，不是从转后台这一刻：前台已经跑的时间要扣掉
+      // （否则前台跑了 25 分钟再被插话转后台的，总共能跑 55 分钟，与提示词里承诺的「每个最长跑 N 分钟」不符）。
+      // 前台本身没有上限：转后台时已经超了的，短暂收尾（至少 1 秒），不再多给一个完整的上限
+      const remainingMs = maxRuntimeMs - Math.max(0, Date.now() - job.startedAt);
+      const delayMs = Math.max(
+        Math.min(BACKGROUND_MIN_REMAINING_MS, maxRuntimeMs),
+        remainingMs,
       );
-      job.graceTimer.unref?.();
-    }, delayMs);
-    job.timer.unref?.();
+      job.timer = setTimeout(() => {
+        // 只打标、不在这里给记录收尾：cancel 来得太晚时子 run 可能其实已经成功返回，
+        // 主 AI 会收到 done——详情面板必须和主 AI 看到的一致。记录统一由 settle 按真实结局收尾
+        // （超时被杀 → settle 看到 cancelled 且 job.timedOut，写成「失败·超时」）
+        job.timedOut = true;
+        void cancelRunBounded(run);
+        // 宽限：cancel 之后流 / wait 仍不结束（cancel 抛错 / 被忽略 / 流挂死）→ 强制收尾，
+        // 不留僵尸 job。正常收尾（settleBackground）会把这个计时器清掉
+        job.graceTimer = setTimeout(
+          () => expire(new Error(timeoutMessage())),
+          cancelGraceMs,
+        );
+        job.graceTimer.unref?.();
+      }, delayMs);
+      job.timer.unref?.();
+    }
     void settled.then((outcome) => settleBackground(job, outcome));
     // 此刻起它算「后台在跑」：界面要画出来（前台转后台的那一刻同理）
     notifyJobsChanged();

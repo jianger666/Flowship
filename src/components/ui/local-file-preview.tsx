@@ -1,7 +1,12 @@
 "use client";
 
 /**
- * 本地文件预览：全局 Provider + 居中文档检视窗
+ * 本地文件预览：全局 Provider + 右侧非模态侧栏（文档检视）
+ *
+ * 2026-11-14 起从「居中弹窗」改成右侧侧栏（用户拍板：所有预览统一成侧面展开）：
+ *   读产物时要对着聊天，居中弹窗的蒙层把对话盖住了；侧栏非模态，左边仍可点，连点不同文件链接只是换内容。
+ *   与代码改动面板 / 子代理抽屉共用「右侧只有一条位」（lib/right-dock）：后开的替换先开的。
+ *   例外（不进侧栏）：音视频走全局播放器；聊天里点图片的全屏灯箱（image-preview）保留，看大图要尽量多的像素。
  *
  * 设计口径（frontend-design + ui-ux-pro-max）：
  * - 受众 = 工程师扫 harness 产物；单职 = 看清文件，不是「营销纸面」
@@ -26,11 +31,11 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { Tooltip } from "@/components/ui/tooltip";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { canOpenInIde, type LocalFileKind } from "@/lib/local-file-kind";
@@ -46,6 +51,7 @@ import {
 import { JUMP_IDE_LABEL } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useDialog } from "@/hooks/use-dialog";
+import { useRightDockSlot } from "@/hooks/use-right-dock-slot";
 import { useJumpIde } from "@/hooks/use-settings";
 import {
   LocalFilePreviewContext,
@@ -113,7 +119,7 @@ const extBadgeLabel = (absolutePath: string, kind?: LocalFileKind | null): strin
 };
 
 const WIDE_KEY = "flowship.preview.wide";
-/** 磁盘上的文件有没有变：轮询间隔（只在窗口开着、标签页可见时跑，一次一个很小的 stat） */
+/** 磁盘上的文件有没有变：轮询间隔（只在侧栏开着、标签页可见时跑，一次一个很小的 stat） */
 const STAT_POLL_MS = 2500;
 
 export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) => {
@@ -122,7 +128,7 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
   const confirmRef = useRef(confirm);
   confirmRef.current = confirm;
 
-  // open 与 state 拆开：关窗先 open=false 走 DialogContent 退场动画，再清 state
+  // open 与 state 拆开：关栏先 open=false 走 SheetContent 滑出动画，再清 state
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<PreviewState | null>(null);
   const [payload, setPayload] = useState<LocalFilePreviewPayload | null>(null);
@@ -225,10 +231,10 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
     [openPreview, ide],
   );
 
-  // 关窗动画结束后再卸内容（DialogContent duration-100，留一点余量）
+  // 关栏动画结束后再卸内容（SheetContent duration-200 滑出，留一点余量；早了会在滑出途中闪成空白）
   useEffect(() => {
     if (open) return;
-    const t = window.setTimeout(clearPreviewData, 160);
+    const t = window.setTimeout(clearPreviewData, 260);
     return () => window.clearTimeout(t);
   }, [open, clearPreviewData]);
 
@@ -367,6 +373,10 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
     })();
   }, []);
 
+  // 右侧只有一条位：代码改动面板 / 子代理抽屉打开时让位（后开的替换先开的）。
+  // 走 requestClose：有未保存修改会先确认；用户取消确认 = 没关成，两条栏暂时叠着，由用户自己决定
+  useRightDockSlot("file-preview", open, requestClose);
+
   const handleSelectSheet = useCallback((index: number) => {
     setSwitchingSheet(true);
     setSheetIndex(index);
@@ -421,48 +431,51 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
     <LocalFilePreviewContext.Provider value={previewContext}>
       {children}
       {/*
-        与推进弹窗同一套 Dialog + DialogContent：共享蒙层、开关动画、右上角 Close。
-        禁止再手写 Portal/Popup，否则关窗会瞬间卸 DOM、退场动画跑不起来。
+        与代码改动面板 / 子代理抽屉同一套 Sheet + SheetContent：右侧非模态（不渲染蒙层、左边照常可点）、
+        同一组开关动画、左上角 Close（Windows 右上角被系统窗口按钮占着，见 sheet.tsx）。
+        禁止再手写 Portal/Popup，否则关栏会瞬间卸 DOM、退场动画跑不起来。
+        Sheet 默认 disablePointerDismissal：连点不同文件链接只是换内容，点外面不会误关；Esc / 左上角 X 仍可关。
       */}
-      <Dialog
+      <Sheet
         open={open}
         onOpenChange={(next) => {
           if (!next) requestClose();
         }}
       >
-        <DialogContent
+        <SheetContent
           className={cn(
-            // bg-background：跟产物栏同一纸面色；别用 Dialog 默认 bg-popover（浅色更白），
+            // bg-background：跟产物栏同一纸面色；别用默认的浅色弹层底，
             // 否则 Streamdown 表格 bg-background / 表头叠色会跟外面漂开。
-            // 固定高度（不随内容伸缩）：虚拟列表 / 编辑器 / 图片查看器都需要一个确定高度的容器，也避免加载前后窗口大小跳动。
-            "flex h-[min(90vh,calc(100vh-48px))] max-h-[min(90vh,calc(100vh-48px))] w-full flex-col gap-0 overflow-hidden bg-background p-0 text-foreground",
-            wide
-              ? "sm:max-w-[min(1400px,96vw,calc(100vw-48px))]"
-              : "sm:max-w-[min(960px,80vw,calc(100vw-48px))]",
+            // 高度 = 视口高度（SheetContent 基类 inset-y-0，不随内容伸缩）：虚拟列表 / 编辑器 / 图片查看器都需要一个确定高度的容器，
+            // 也避免加载前后栏的大小跳动。
+            // 宽度两档，与代码改动面板同口径：标准 min(760px,70vw)；加宽留出左边 6rem（左上角有关闭键、macOS 窗口左上还有红绿灯）。
+            "max-w-none gap-0 overflow-hidden bg-background p-0 text-foreground",
+            wide ? "w-[calc(100vw-6rem)]" : "w-[min(760px,70vw)]",
           )}
         >
           {state ? (
             <>
               {/*
                 顶栏：左身份；路径用 Tooltip（与文件夹/IDE 同套，不用原生 title）；
-                文件动作一簇；关按钮走 DialogContent 内置（absolute top-2 right-2）。
+                文件动作一簇；关按钮走 SheetContent 内置（absolute top-1 left-2，故顶栏 pl-11 给它让位，
+                垂直方向与第一行标题大致对齐）。
               */}
-              <div className="flex shrink-0 items-center gap-2.5 border-b border-border/80 bg-muted/25 py-2.5 pr-12 pl-3">
+              <div className="flex shrink-0 items-center gap-2.5 border-b border-border/80 bg-muted/25 py-2.5 pr-3 pl-11">
                 <Tooltip content={`.${extLabel}`}>
                   <span className="inline-flex h-6 shrink-0 items-center rounded-sm bg-info/10 px-1.5 font-mono text-[11px] font-medium uppercase tracking-wide text-info">
                     .{extLabel}
                   </span>
                 </Tooltip>
                 <div className="min-w-0 flex-1">
-                  <DialogTitle className="truncate text-sm font-medium tracking-tight">
+                  <SheetTitle className="truncate text-sm font-medium tracking-tight">
                     <Tooltip content={state.absolutePath}>
                       <span className="block truncate">{displayLabel}</span>
                     </Tooltip>
                     {dirty && <span className="ml-1.5 text-xs font-normal text-warning">● 未保存</span>}
-                  </DialogTitle>
-                  <DialogDescription className="sr-only">
+                  </SheetTitle>
+                  <SheetDescription className="sr-only">
                     {state.absolutePath}
-                  </DialogDescription>
+                  </SheetDescription>
                   <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
                     <Tooltip content="点击复制路径">
                       <button
@@ -481,12 +494,12 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center rounded-md border border-border/70 bg-background p-0.5">
-                  <Tooltip content={wide ? "缩小窗口" : "放大窗口"}>
+                  <Tooltip content={wide ? "收窄预览" : "加宽预览"}>
                     <Button
                       type="button"
                       variant="ghost"
                       size="icon-xs"
-                      aria-label={wide ? "缩小窗口" : "放大窗口"}
+                      aria-label={wide ? "收窄预览" : "加宽预览"}
                       className="size-7 text-muted-foreground"
                       onClick={toggleWide}
                     >
@@ -573,8 +586,8 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
               </div>
             </>
           ) : null}
-        </DialogContent>
-      </Dialog>
+        </SheetContent>
+      </Sheet>
     </LocalFilePreviewContext.Provider>
   );
 };

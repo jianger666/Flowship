@@ -107,6 +107,63 @@ describe("recordTurnUsage", () => {
     expect(meta?.actions[0]?.tokenUsage).toBeUndefined();
   });
 
+  // turn-ended 在 run 收尾后才到：此时 action 多半已是 awaiting_ack / error。
+  // 只认 running 会让绝大多数 action 记不上（实测 11 月 79 个只有 3 个有用量）。
+  it("交卷后才到的 turn-ended（awaiting_ack + 主线 runKind）→ 记到该 action", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id, "awaiting_ack"));
+
+    await recordTurnUsage(id, usage(900, 90), { runKind: "task-first" });
+
+    const meta = await readMetaV06(id);
+    expect(meta?.tokenUsage?.total.inputTokens).toBe(900);
+    expect(meta?.actions[0]?.tokenUsage?.total.inputTokens).toBe(900);
+    expect(meta?.actions[0]?.tokenUsage?.turns).toBe(1);
+  });
+
+  it("没交卷就失败（error + 主线 runKind）→ 失败的 run 烧的 token 也记到该 action", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id, "error"));
+
+    await recordTurnUsage(id, usage(400, 40), { runKind: "task-followup" });
+
+    const meta = await readMetaV06(id);
+    expect(meta?.actions[0]?.tokenUsage?.total.inputTokens).toBe(400);
+  });
+
+  it("旁路问答（question）在 awaiting_ack 时跑 → 只记 task 级、不算这个 action 的活", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id, "awaiting_ack"));
+
+    await recordTurnUsage(id, usage(600, 60), { runKind: "question" });
+
+    const meta = await readMetaV06(id);
+    expect(meta?.tokenUsage?.total.inputTokens).toBe(600);
+    expect(meta?.actions[0]?.tokenUsage).toBeUndefined();
+  });
+
+  it("没传 runKind 的非 running action → 保守不记（兼容旧调用方）", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id, "awaiting_ack"));
+
+    await recordTurnUsage(id, usage(300, 30));
+
+    const meta = await readMetaV06(id);
+    expect(meta?.tokenUsage?.total.inputTokens).toBe(300);
+    expect(meta?.actions[0]?.tokenUsage).toBeUndefined();
+  });
+
+  it("已 completed 的 action 即使带主线 runKind 也不记（迟到的 turn-ended 不污染已收口的 action）", async () => {
+    const id = alloc();
+    await writeMeta(makeMeta(id, "completed"));
+
+    await recordTurnUsage(id, usage(500, 50), { runKind: "task-first" });
+
+    const meta = await readMetaV06(id);
+    expect(meta?.tokenUsage?.total.inputTokens).toBe(500);
+    expect(meta?.actions[0]?.tokenUsage).toBeUndefined();
+  });
+
   it("currentActionId 为空（chat 模式 / idle）→ 只记 task 级", async () => {
     const id = alloc();
     await writeMeta({

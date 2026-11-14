@@ -170,6 +170,7 @@ const SHORTCUT_ROWS: Array<[string, string]> = [
   ["0–9", "对比组：切换第几个；单个文件：跳到 0–90%"],
   ["Home  End", "跳到开头 / 结尾"],
   ["PageUp  PageDown", "上一个 / 下一个（对比组）"],
+  ["Esc  Esc", "连按两次关闭播放器（1.5 秒内；全屏时 Esc 只退出全屏）"],
 ];
 
 export const ShortcutHelp = ({ onClose }: { onClose: () => void }) => (

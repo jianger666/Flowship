@@ -85,6 +85,21 @@ describe("快捷键判定（before-input-event 的 input）", () => {
     expect(classifyShortcut(kd("=", { meta: true }), "win32")).toBeNull();
   });
 
+  it("刷新：Cmd/Ctrl+R = 普通刷新、加 Shift = 强刷（Shift 时 key 是大写 R）；平台修饰键规则同缩放", () => {
+    expect(classifyShortcut(kd("r", { meta: true }), "darwin")).toEqual({ kind: "reload", force: false });
+    expect(classifyShortcut(kd("R", { meta: true, shift: true }), "darwin")).toEqual({ kind: "reload", force: true });
+    expect(classifyShortcut(kd("r", { meta: true, shift: true }), "darwin")).toEqual({ kind: "reload", force: true });
+    expect(classifyShortcut(kd("r", { control: true }), "win32")).toEqual({ kind: "reload", force: false });
+    expect(classifyShortcut(kd("R", { control: true, shift: true }), "linux")).toEqual({ kind: "reload", force: true });
+    // 不是本平台的修饰键 / Cmd+Ctrl 同按 / 带 Alt / 没修饰键 / keyUp：不认
+    expect(classifyShortcut(kd("r", { control: true }), "darwin")).toBeNull();
+    expect(classifyShortcut(kd("r", { meta: true }), "win32")).toBeNull();
+    expect(classifyShortcut(kd("r", { meta: true, control: true }), "darwin")).toBeNull();
+    expect(classifyShortcut(kd("r", { meta: true, alt: true }), "darwin")).toBeNull();
+    expect(classifyShortcut(kd("r"), "darwin")).toBeNull();
+    expect(classifyShortcut({ type: "keyUp", key: "r", meta: true }, "darwin")).toBeNull();
+  });
+
   it("没有修饰键 / 带 Alt / Cmd+Ctrl 同按 / keyUp / Shift+F / 无关键 一律不拦", () => {
     expect(classifyShortcut(kd("="), "darwin")).toBeNull();
     expect(classifyShortcut(kd("=", { meta: true, alt: true }), "darwin")).toBeNull();
@@ -323,6 +338,8 @@ const makeWc = () => ({
   stopFindInPage: vi.fn(),
   isDevToolsOpened: () => false,
   openDevTools: vi.fn(),
+  reload: vi.fn(),
+  reloadIgnoringCache: vi.fn(),
   on: vi.fn(),
 });
 
@@ -630,5 +647,62 @@ describe("index.mjs / main.js 的接线", () => {
     const tabSrc = readFileSync(path.join(ROOT, "electron-app/browser/tab.mjs"), "utf8");
     // tab.mjs 现在是先 `let zoom = 100` 再在 try 里 `zoom = nav ? Math.round(1.2 ** …)`（主 agent 重构过），对 `zoom:` / `zoom =` 两种写法都认
     expect(tabSrc).toMatch(/zoom\s*[:=]\s*nav \? Math\.round\(1\.2 \*\* /);
+  });
+});
+
+describe("bindTab：页面持有焦点时的 Cmd/Ctrl+R 只刷新这个页面（不能漏给应用菜单刷掉整个 Flowship）", () => {
+  /** 调 bindTab 后取出挂到 wc 上的 before-input-event 处理函数 */
+  const hookInput = (s: ReturnType<typeof setup>) => {
+    s.feats.bindTab(s.tab);
+    const call = s.wc.on.mock.calls.find((c) => c[0] === "before-input-event");
+    expect(call, "必须在 wc 上挂 before-input-event").toBeTruthy();
+    return call![1] as (event: { preventDefault: () => void }, input: Record<string, unknown>) => void;
+  };
+  const press = (
+    handler: ReturnType<typeof hookInput>,
+    input: Record<string, unknown>,
+  ): { prevented: boolean } => {
+    const event = { preventDefault: vi.fn() };
+    handler(event, { type: "keyDown", ...input });
+    return { prevented: event.preventDefault.mock.calls.length > 0 };
+  };
+
+  it("Cmd+R：刷新该 tab + preventDefault（按键被吃掉、菜单加速键不会再触发）", () => {
+    const s = setup({ platform: "darwin" });
+    const handler = hookInput(s);
+    const r = press(handler, { key: "r", meta: true });
+    expect(r.prevented).toBe(true);
+    expect(s.wc.reload).toHaveBeenCalledTimes(1);
+    expect(s.wc.reloadIgnoringCache).not.toHaveBeenCalled();
+  });
+
+  it("Cmd+Shift+R：强刷（忽略缓存），同样吃掉按键", () => {
+    const s = setup({ platform: "darwin" });
+    const handler = hookInput(s);
+    const r = press(handler, { key: "R", meta: true, shift: true });
+    expect(r.prevented).toBe(true);
+    expect(s.wc.reloadIgnoringCache).toHaveBeenCalledTimes(1);
+    expect(s.wc.reload).not.toHaveBeenCalled();
+  });
+
+  it("win / linux：Ctrl+R 同样只刷新页面", () => {
+    const s = setup({ platform: "win32" });
+    const handler = hookInput(s);
+    expect(press(handler, { key: "r", control: true }).prevented).toBe(true);
+    expect(s.wc.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("刷新不连带缩放 / 查找副作用；无关按键不吃、不刷新", () => {
+    const s = setup({ platform: "darwin" });
+    const handler = hookInput(s);
+    press(handler, { key: "r", meta: true });
+    expect(s.wc.setZoomLevel).not.toHaveBeenCalled();
+    expect(s.wc.findInPage).not.toHaveBeenCalled();
+
+    s.wc.reload.mockClear();
+    expect(press(handler, { key: "r" }).prevented).toBe(false); // 没修饰键：页面自己的输入
+    expect(press(handler, { key: "a", meta: true }).prevented).toBe(false);
+    expect(press(handler, { key: "r", meta: true, alt: true }).prevented).toBe(false);
+    expect(s.wc.reload).not.toHaveBeenCalled();
   });
 });

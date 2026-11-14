@@ -16,7 +16,7 @@
  * （shell-output-bridge.createSdkSummaryDeltaPublisher，onDelta summary-*）。
  */
 
-import type { TokenUsageRollup, TurnTokenUsage } from "./types";
+import type { ActionStatus, TokenUsageRollup, TurnTokenUsage } from "./types";
 
 /** 全零用量（累加起点） */
 export const EMPTY_TURN_USAGE: TurnTokenUsage = {
@@ -95,6 +95,31 @@ export const accumulateTokenUsage = (
     turns: prevTurns + 1,
     updatedAt: now,
   };
+};
+
+/**
+ * 这一轮 turn 用量该不该记到「当前 action」头上（task 级 meta.tokenUsage 不受影响、恒记）。
+ *
+ * 为什么不能只认 running：turn-ended 在 run **收尾后**才到，此时 runner 往往已把 action
+ * 推进到 awaiting_ack（交卷）或 error（没交卷 / 异常）——只认 running 会让绝大多数 action 记不上
+ * （实测 11 月 79 个 action 里只有 3 个有用量）。
+ *
+ * 规则：
+ *   - running：一律记（旁路问答在 action 运行期间烧的也算这段时间的开销，沿用旧行为）
+ *   - awaiting_ack / error：只有主线 run（runKind 以 `task-` 开头：first / reconnect / submit-followup /
+ *     ask-reply / followup）才记；旁路只读答疑（`question`）常在 idle 时跑、不是这个 action 的活
+ *   - completed / cancelled：不记，迟到的 turn-ended 不能污染已收口的 action
+ *   - 没传 runKind：保守退回只认 running（兼容旧调用方）
+ */
+export const shouldAttributeTurnToAction = (
+  actionStatus: ActionStatus,
+  runKind?: string,
+): boolean => {
+  if (actionStatus === "running") return true;
+  if (actionStatus === "awaiting_ack" || actionStatus === "error") {
+    return typeof runKind === "string" && runKind.startsWith("task-");
+  }
+  return false;
 };
 
 /**

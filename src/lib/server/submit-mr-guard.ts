@@ -17,6 +17,7 @@ import type { ChatTaskAction } from "./chat-pending";
 import { gitEnv } from "./git-exec";
 import type { Task } from "../types";
 import { parseHostFromRemoteUrl, parseProjectPathFromRemoteUrl } from "../git-remote";
+import { mrTargetBranchOf } from "../task-display";
 import {
   taskUsesWkPrimaryFlow,
   validateWkSubmitSourceBranch,
@@ -88,6 +89,27 @@ export const deriveHostFromRepo = async (
     return null;
   }
 };
+
+/**
+ * 撞 409 复用「同分支已有 open MR」时，该不该用本次的 title / description **整段覆盖**它（审查 R22-02）。
+ *
+ * 只有「Flowship 自己已经记录过这条 MR」才算真正的再次提测 / 再次联调：task.mrs 里有
+ * 同仓 + 同目标分支 + 同源分支的记录。没有记录 = 本任务首次提这条 MR，或这条 MR 不是 Flowship 建的
+ * （人手建的、别的任务建的）——这时只复用、不动它的标题 / 描述，免得把别人写的文字冲掉。
+ *
+ * 用「目标分支」而不是只看仓：同仓的提测 MR（→测试分支）和联调 MR（→dev 分支）各记各的，互不影响。
+ * 没有 dev / custom 例外：它们同样只在「已有自己的记录」时才覆盖。
+ */
+export const shouldUpdateExistingMrOnReuse = (
+  task: Pick<Task, "mrs" | "repoTestBranches">,
+  a: { repoPath: string; sourceBranch: string; targetBranch: string },
+): boolean =>
+  (task.mrs ?? []).some(
+    (m) =>
+      m.repoPath === a.repoPath &&
+      mrTargetBranchOf(m, task.repoTestBranches) === a.targetBranch &&
+      m.branch === a.sourceBranch,
+  );
 
 // 校验 agent 上报的 submit_mr 参数是否在本 task 的授权范围内。
 // 不通过 = 越权 / agent 上报错、handler 直接拒、不调 GitLab。

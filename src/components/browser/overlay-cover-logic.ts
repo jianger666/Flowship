@@ -96,7 +96,9 @@ export const decideCoverAction = (input: {
  * 浮层都 Portal 到 <body>，带 role 或 data-slot：
  *  - dialog / alert-dialog / sheet：popup 带 role="dialog" / "alertdialog"，另有满屏的 `*-overlay` 背景层；
  *  - dropdown-menu / context-menu：role="menu"；select：role="listbox"；popover：data-slot="popover-content"；
- *  - 自写的图片灯箱 role="dialog"；「再聊聊」角落停靠窗 data-slot="dialog-docked-content"。
+ *  - 自写的图片灯箱 role="dialog"；「再聊聊」角落停靠窗 data-slot="dialog-docked-content"；
+ *  - 音视频播放器悬浮窗 data-media-dock：fixed 定位的 role="region"（不是 dialog），不加这条它会被原生视图压住一块。
+ *    它不在 <body> 直下、位置靠 style 变，所以开关 / 拖动 / 缩放要靠 lib/overlay-layout-event 主动通知评估。
  * 命令面板（Cmd+K）是 Dialog，同样被 role="dialog" 覆盖。
  */
 export const HARD_OVERLAY_SELECTOR = [
@@ -113,6 +115,7 @@ export const HARD_OVERLAY_SELECTOR = [
   '[data-slot="select-content"]',
   '[data-slot="popover-content"]',
   '[data-slot$="-overlay"]',
+  "[data-media-dock]",
 ].join(",");
 
 /**

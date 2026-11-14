@@ -88,6 +88,7 @@ import { stopConfirmDescription, stoppableQueuedCount } from "@/lib/stop-copy";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { TaskMrLinks } from "@/components/tasks/task-mr-links";
 import { ArchivedNotice } from "@/components/tasks/archived-bar";
+import { InterruptedActionBar } from "@/components/tasks/interrupted-action-bar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -154,6 +155,7 @@ import {
   buildFixBugInstruction,
 } from "@/lib/mr-inbox";
 import { advanceErrorMessage, planAdvanceUi } from "@/lib/advance-submit";
+import type { ResumeAdvanceInput } from "@/lib/resume-interrupted-action";
 import {
   classifyTaskDetailResult,
   type LoadOutcome,
@@ -1205,6 +1207,8 @@ const TaskDetailPage = () => {
     task.repoStatus === "merged" || task.repoStatus === "abandoned";
 
   // ---- 推进 ----
+  // 返回 true = 推进成功；false = 没成功（凭据缺失 / 准入拦截 / 页面陈旧…，原因已 toast + 写进 advanceError）。
+  // 推进弹窗（handleDialogSubmit 包一层丢掉返回值）与「继续上次 Action」（handleResumeInterrupted）共用这一条提交链路
   const handleAdvance = async (input: {
     actionType: ActionType;
     userInstruction: string;
@@ -1230,7 +1234,7 @@ const TaskDetailPage = () => {
     customActionId?: string;
     // 弹窗内换了提供方时带上切后的 task（用它算新家的凭据、不再读旧 task.provider）
     switchedTask?: Task;
-  }) => {
+  }): Promise<boolean> => {
     setStarting(true);
     // 新一轮提交：上一次的失败原因作废（失败了会重新写入）
     setAdvanceError(null);
@@ -1241,7 +1245,7 @@ const TaskDetailPage = () => {
       // 统一走 prepareRunArgs：apiKey + model（task.model || settings.defaultModel）
       // MCP 由 server 端读 cursor 配置、不在此传。校验失败 helper 内部 toast.error、返 null
       const args = prepareRunArgs(t);
-      if (!args) return;
+      if (!args) return false;
       // input.model 仅起新 agent 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
       const model = input.model?.id ? input.model : args.model;
       // gitToken 不在 prepareRunArgs 暴露字段里、单独读 settings（host 由 server 按仓库 remote 现推）
@@ -1328,6 +1332,7 @@ const TaskDetailPage = () => {
       const ui = planAdvanceUi({ ok: true });
       if (ui.closeDialog) setAdvanceDialogOpen(false);
       if (ui.clearPrefill) setAdvancePrefill(null);
+      return true;
     } catch (err) {
       // 失败：**不关弹窗、不清预填**（契约见 lib/advance-submit）——之前一律关掉并清空，
       // 用户写好的指令 / 贴的图 / 深链预填全丢、原因只剩被截成首行的 toast。
@@ -1337,9 +1342,33 @@ const TaskDetailPage = () => {
       setAdvanceError(ui.inlineError);
       if (ui.closeDialog) setAdvanceDialogOpen(false);
       if (ui.clearPrefill) setAdvancePrefill(null);
+      return false;
     } finally {
       setStarting(false);
     }
+  };
+
+  // 推进弹窗的 onSubmit 只要 Promise<void>：丢掉成败（失败原因已经走 advanceError 回到弹窗里）
+  const handleDialogSubmit = async (input: Parameters<typeof handleAdvance>[0]) => {
+    await handleAdvance(input);
+  };
+
+  // ---- 继续被服务重启打断的 action（InterruptedActionBar；只在用户点击后才会走到这里）----
+  // 走与推进弹窗同一条提交链路（handleAdvance：apiKey / model / gitToken / 分支快照 / 陈旧校验都在里面），
+  // 入参由 planResumeInterruptedAction 从被打断的 ActionRecord 还原。没提交成功（凭据缺失 / 准入拦截 / 页面陈旧）时
+  // 把推进弹窗打开：toast 只有一句结论，完整原因（advanceError）只有弹窗里读得到，用户可以在那里改了再推。
+  // 弹窗只能预填指令 / 自定义 action，action 类型还要用户自己点一下。
+  const handleResumeInterrupted = async (input: ResumeAdvanceInput) => {
+    if (await handleAdvance(input)) return;
+    const cur = taskRef.current;
+    // 失败期间任务已变成在跑 / 终态：别再弹推进弹窗（与 onReadvance 同口径）
+    if (!cur || cur.runStatus === "running") return;
+    if (cur.repoStatus === "merged" || cur.repoStatus === "abandoned") return;
+    setAdvancePrefill({
+      instruction: input.userInstruction,
+      customActionId: input.customActionId,
+    });
+    setAdvanceDialogOpen(true);
   };
 
   // ---- 停止：中断当前正在跑 / 等 ack 的 action ----
@@ -1703,6 +1732,14 @@ const TaskDetailPage = () => {
       {/* 已归档提示 + 一键恢复（R14 B6-3 / Q3-03）：没归档时它自己返回 null */}
       <ArchivedNotice task={task} onTaskUpdate={absorbTask} />
 
+      {/* 上次 Action 被服务重启打断：一键用原参数继续（必须用户点击、ship / dev / custom 先二次确认）；
+          没有可继续的它自己返回 null。busy 复用推进在途态，防与顶部「推进」叠跑 */}
+      <InterruptedActionBar
+        task={task}
+        onResume={handleResumeInterrupted}
+        busy={starting}
+      />
+
       {/* 主区 */}
       <div
         ref={mainWidthRef}
@@ -1924,7 +1961,7 @@ const TaskDetailPage = () => {
         prefill={advancePrefill}
         submitError={advanceError}
         onTaskUpdate={absorbTask}
-        onSubmit={handleAdvance}
+        onSubmit={handleDialogSubmit}
         submitting={starting}
       />
 

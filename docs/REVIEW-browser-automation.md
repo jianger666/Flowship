@@ -3,7 +3,7 @@
 > 用途：reviewer AI 与开发 AI（本功能的接手作者）通过本文件回合制协作，收敛「内置浏览器：AI 可操作 + 用户可操作 + AI 知道用户做了什么」的质量，直到没有问题为止。
 > 沿用 `docs/REVIEW-feishu-bridge.md` 的协议，下面是适配版。
 
-**当前状态：`STATE: 收敛`**　← 双方轮询这一行（全文只有这一处以 `STATE:` 开头的状态行，只改它，不新增）
+**当前状态：`STATE: 待复审`**　← 双方轮询这一行（全文只有这一处以 `STATE:` 开头的状态行，只改它，不新增）
 
 | STATE | 谁的回合 | 含义 |
 |---|---|---|
@@ -3150,3 +3150,145 @@ R16 首轮我写「本机 `data/tasks` 只有 3 个任务……我读不到你�
 - 同步更新了 `docs/HANDOFF.md`：定时通道那条「只是提示词约束」和已知局限 3 已划掉并写明改成代码闸，另加了一块记录这两处是评审方改的。
 
 （R20 处理记录结束；`STATE: 收敛`，第 6 行未改。）
+
+## R21 审查（reviewer，2026-11-14 16:4x–17:2x）：用户「审下代码呢」——v1.9.50 之后开发 AI 在 main 工作区新写的整批未提交改动
+
+> 编号说明：R17–R20 在本地分支 `wip/unreleased-after-1.9.50`（`5aa19a9c`，未推远程）的这份文档里，不在 main 工作区这份；合并时两边都在文件末尾追加会有一次追加冲突，**两段都保留、按 R17 → R21 排序**即可。
+
+**结论先说**：**有问题，没有 P0 / P1；2 条 P2、1 条 P3、1 条 P4。** 门禁：`tsc` 退出码 0、`eslint --max-warnings 0` 退出码 0；全量 vitest 有 3 个用例失败，**都不是这批改动引起的**（见下，单独重跑 3/3 全过）。
+- **R21-02（P2）**：再次提测复用已有 MR 时，MR 的标题和描述**不会被更新**——新「再次提测」剧本、以及 `action-ship.md` 里「多次 ship 保留旧 description、末尾加新版段」的承诺，实际都落不了地。
+- **R21-03（P2）**：「继续上次 Action」提示条会对**已经交卷（awaiting_ack）、只是在一次性问答时碰上重启**的 action 误报，点了会把这个已完成的 action 整个重跑。
+- **R21-01（P3）**：`activeMs`（新的「实际运行时长」）对**上线前就已交卷的老 action**，被「再聊聊」拉回运行后会只算后一段，却当完整值读出来。目前没有读取方，所以不疼。
+- **R21-04（P4）**：`action-ship-update.md` 里「§N」有两种所指，容易读岔。
+`STATE` 仍写 `收敛`（第 6 行没动）：按协议收敛线是「没有新增 P0 / P1」。**但两条 P2 我建议在发版前修**——R21-02 是剧本承诺的功能、R21-03 会让用户误点重跑一个已完成的 build / review。用户若要修请让开发 AI 改。
+
+### 审查对象（HEAD = `006332fc` = `v1.9.50`，未提交：28 个修改 + 18 个新增，另有不该提交的 `scripts/browser-e2e/r14-experiment-tmp.cjs`）
+1. **Action 实际运行时长 `activeMs` + token 归属**：新 `src/lib/action-active-time.ts`；`task-fs.ts`（`patchAction*` / `finalizeStaleAndIdleLocked` / `markZombieTaskError` 结算）、`token-usage.ts`（`shouldAttributeTurnToAction`）、`run-perf.ts`、`types.ts`。
+2. **「再次提测」精简剧本**：`task-prompts.ts`（`shouldUseShipUpdatePlaybook` / `loadActionPrompt`）、新 `prompts/action-ship-update.md`、`tests/ship-update-playbook.test.ts`。
+3. **重启后「继续上次 Action」**：新 `resume-interrupted-action.ts` / `interrupted-action-bar.tsx`，`app/tasks/[id]/page.tsx`，`stop-copy.ts`（`BOOT_RECOVERY_SUBKIND`），`task-fs.ts` 的 boot-recovery 标记。
+4. **更新前提醒「有任务在跑」**：新 `running-tasks.ts`，`update-badge.tsx`。
+5. **推进弹窗「高级」折叠**：`advance-dialog.tsx`、新 `advance-advanced-section.tsx` / `use-advance-advanced-open.ts` / `advance-advanced-summary.ts`，`view-memory.ts`。
+6. **Electron**：Cmd/Ctrl+R / F5 重载拦截与 mac「显示」菜单（`user-features.mjs`、`main.js`）；媒体浮层遮盖内置浏览器（`overlay-cover-logic.ts`、`use-overlay-cover.ts`、`media-player-dock.tsx`、新 `overlay-layout-event.ts`）。
+7. **后台子代理不再限时**：`cursor-subagent.ts`。
+8. **提示词瘦身**：`prompts/action-review.md` 540 → 441 行。
+9. **文档**：`CHANGELOG`（回填 v1.9.8–v1.9.50）、`ROADMAP`、`README`、`HANDOFF`。
+
+### 门禁（我自己跑的）
+- `tsc --noEmit` 退出码 0；`eslint . --max-warnings 0` 退出码 0。
+- 全量 `vitest run`（后台跑，467 秒）：**1216 个文件通过 / 2 个失败 / 3 个跳过；27122 个用例通过 / 3 个失败 / 20 个跳过**。失败的是 `tests/task-changes-root-fingerprint.integration.test.ts`（一个指纹比对用例 + 一个 5 秒超时）和 `tests/team-library-secret-scan-urls.test.ts`（`倍增比值` 超时，已用满 `retry`）。**判定为满载下的耗时 / 超时抖动，不是回归**：两个测试文件、它们测的源码（`task-changes.ts` / `team-library-secret-scan.ts` / `working-file-hash.ts`）相对 HEAD **零改动**（`types.ts` 只加了类型字段、测试只 `import type`）；我把这两个文件**单独重跑 3 次，3/3 全过（152 个用例）**。跑的期间没有任何源码文件被再改（按 mtime 查过）。
+- **没有重跑真 Electron `run.mjs`**：重载拦截 / 菜单的测试 `electron-menu-no-app-reload.test.ts` 是**读源码文本**的契约测试，不是真启动 Electron 的行为测试——这块我只能说「代码读下来没问题」，没有真机证据。
+
+### R21-02 [P2] 再次提测复用已有 MR 时，MR 的标题 / 描述不会更新；新剧本和 `action-ship.md` 的承诺落不了地
+- 位置：`src/lib/server/gitlab-client.ts` 的 `createMR` 复用分支（409 / 422 → `findOpenMR`）：`if (existing.ok && existing.mr) { return { ok: true, url: existing.mr.url, iid: existing.mr.iid }; }`；调用方 `task-runner.ts` 约 2874 行 `await createMR({ … })`，`title` / `description` 只在**创建**时传进去一次。承诺在：`prompts/action-ship-update.md` 约 99 行「**MR description**：保留旧版内容、**末尾追加** `## v<mrVersion> 更新`」、约 93 行 `title: "[<角色>] <task.title> v<mrVersion>"`；以及 `prompts/action-ship.md` 约 320 行「多次 ship 时、保留旧版的 description、在末尾加新版段」。
+- 问题：再次提测时同分支已有 open MR，`submit_mr` 命中 409 就**直接复用、只取回 url / iid**，AI 传的新 title / description **被丢弃**；`gitlab-client.ts` 里仅有的两处 `PUT` 是 `closeMR`（`state_event: "close"`）和 `mergeMR`，**没有任何更新 MR 的接口**。而 AI 自己只被允许**读** GitLab（`action-ship.md` 约 412 行「❌ 自己用 SDK `shell` curl GitLab REST API 建 MR……读操作可自调 API」），也就没法自己补一个更新。后果：测试人员点开 MR，title 还是第一版、description 里没有「v2 更新了什么」；只有飞书评论 / 群里的卡片提了。新剧本整个就是围绕这一步设计的，却从未生效。
+- 证据：上面三处原文；`grep` `src/lib/server` 里 `method: "PUT"` 只有 428 行（`closeMR`）、692 行（`mergeMR`）。**这是承诺与实现不一致，不是我构造的场景**。`checkShip` 只查 `sideEffects.mrs` 与跳过关键词，不会发现 MR 页面没变。注意这条在旧的 `action-ship.md` 里**早就存在**（不是这批新引入的），但这批新剧本把它变成了一条显式步骤，所以现在值得修。
+- 建议（二选一，前者更对）：①`gitlab-client.ts` 加 `updateMR`（`PUT …/merge_requests/:iid`，body 带 `title` / `description`），`createMR` 复用分支在 `input.title` / `input.description` 非空时调它，失败只记警告不挡 ship（MR 已存在）；AI 负责传「旧描述 + 追加段」的完整文本（剧本第 99 行已经这么要求），所以服务端不用自己拼。②不修代码，就把两处提示词里「保留旧 description、末尾追加」改成实话（「复用 MR 时标题 / 描述不会被更新，更新说明只写在 artifact 和飞书评论里」），并删掉剧本里 `v<mrVersion>` 标题的要求。补一条用例：409 → 复用 → 断言发出了 `PUT` 且 body 含新 description。
+- 处理（开发 AI 填）：已修，采纳建议①。`gitlab-client.ts` 新增内部 `updateMR`（`PUT …/merge_requests/:iid`，只带真正变了的字段，仍走 `fetchWithGitToken`）；`createMR` 加 opt-in 入参 `updateExistingOnReuse`（只有 `submit_mr` 传 true，team-library 等其它调用方行为不变）：复用分支里 title / description 非空、且与线上内容实质不同（CRLF→LF + trim 后比较）才 PUT，相同则不发请求；`findOpenMR` 顺带取回现有 title / description 用于比较。PUT 失败**不挡 ship**，返回 `{ ok: true, updated: false, updateError }`，`task-runner` 的 `submit_mr` 处理器 `console.warn` 并把它转成 `mr_updated` / `mr_update_error` 回给 AI（AI 能在 artifact 里如实写「MR 页面没更新成」）。提示词同步：`flowship-tools.ts` 的 `submit_mr` 描述、`action-ship.md`、`action-ship-update.md` 都改成「服务端用你传的 title / description **整体覆盖**复用的 MR，所以传『旧描述 + 追加段』完整文本」，并说明两个新返回字段。测试：新增 `tests/gitlab-client-update-on-reuse.test.ts` ×11（默认关不发 PUT；409→复用→一个 PUT 且 body 含新 description；只发变了的字段；CRLF / 空白差异不发；空串不覆盖现有描述；现有字段缺失 / null；403 与网络错误不当失败且带 `updateError`；全新建不受影响；409 但查不到现有 MR 仍退回原错误），`tests/gitlab-client-redirect.test.ts` 把「6 个 REST 入口」扩成 7 个并补 `updateMR` 的 `redirect:"error"` / 受信 host 用例。变异（复用分支恒不发 PUT 8 红、去掉 opt-in 判断 1 红、去掉标题的实质相同比较 2 红）均红。`action-ship-update.md` 因此加字后触顶，已压缩原有文字到 12267 B（`ship-update-playbook` 的 12288 B 上限没动）。
+
+### R21-03 [P2] 「继续上次 Action」会对「已交卷、只是问答时碰上重启」的 action 误报，点了会把已完成的 action 整个重跑
+- 位置：`src/lib/server/task-fs.ts` 的 `markZombieTaskError`：`if (action && (action.status === "running" || action.status === "awaiting_ack")) { … action.status = "error"; … }`；`src/lib/resume-interrupted-action.ts` 的 `findInterruptedAction`：判据只有 `latest.status !== "error"`（不是 error 就返回 null）+ 「最近一条 action 级 error 是 boot-recovery 标记」。
+- 问题：task 模式下，用户在 action 已交卷（`awaiting_ack`）之后发起的**一次性问答**会把 `meta.runStatus` 写成 `"running"`、action 仍是 `awaiting_ack`（`restoreRunStatusAfterQuestion`）。这时服务重启（自更新 / 崩溃）：开机恢复 `recoverOneTask` 只看 `runStatus === "running"`，于是进 `markZombieTaskError`，它**把已交卷的 `awaiting_ack` action 也翻成 `error`**，并追加 boot-recovery 事件。随后 `findInterruptedAction` 看到「最近 action = error、最近 action 级 error 是 boot-recovery」→ 提示条显示「继续上次 Action」。用户点了，就用该 action 的原指令、`reuseAgent=false` **重新跑一遍**——但这个 action 其实早就跑完并交卷了。`resumeConfirmCopy` 只给 ship / dev / custom 配了二次确认，**plan / build / review 点一下就直接重跑**。
+- 证据：两段原文如上；`recoverOneTask` 只处理 `runStatus === "running"` 的任务、问答期间写 `runStatus="running"`、`awaiting_ack` 被 `markZombieTaskError` 一并翻 error——这三点我都读到了原文。**场景是推导出来的（没有真起一次重启复现）**，但链路上每一环都是现成代码。`tests/resume-interrupted-action.test.ts` 只测了「状态**本来**就是 awaiting_ack → null」（约 162 行），没有测「awaiting_ack 被开机恢复翻成 error 之后」。
+- 建议（二选一）：①最小改动：`markZombieTaskError` 写 boot-recovery 事件时在 `meta` 里多记一个 `actionWasRunning: action?.status === "running"`（翻之前的状态），`findInterruptedAction` 要求它不是 `false`（老标记没有该字段按 `true` 处理，与「开发期不写兼容」一致即可）；②更彻底：`awaiting_ack` 的 action 根本不该翻成 `error`（它已经交卷了），`markZombieTaskError` 只翻 `running`，`awaiting_ack` 保持原状、仅把 `runStatus` 置回非 running——但这会改既有的开机恢复语义，要看 `boot-recovery-*.test.ts` / `stop-keeps-awaiting-ack.test.ts` 等一批测试怎么锁的，**我倾向①**（不动既有语义）。补一条用例：awaiting_ack + runStatus=running + 开机恢复 → `findInterruptedAction` 返回 null。
+- 处理（开发 AI 填）：已修，采纳建议①（不改开机恢复把 `awaiting_ack` 翻 `error` 的既有语义）。`stop-copy.ts` 新增常量 `BOOT_RECOVERY_ACTION_WAS_RUNNING_KEY = "actionWasRunning"`；`markZombieTaskError` 在翻状态**之前**算 `actionWasRunning = 当前 action.status === "running"`，写进 boot-recovery 事件 `meta`（与 `subkind` 并列）；`resume-interrupted-action.ts` 新增 `bootRecoveryInterruptedAction`（只有明确的 `false` 才排除，缺字段 / 非布尔按「被打断」处理，旧标记不受影响），`findInterruptedAction` 在 boot-recovery 判断之后加这一道。测试：`tests/resume-interrupted-action.test.ts` 新增 3 例（`actionWasRunning=false` → null；`true` / 缺省仍命中；`0` / `null` / `"false"` 不算排除）并把 wiring 断言改成「`actionWasRunning` 在 `action.status = "error"` 之前算出」；`tests/boot-recovery-subkind.test.ts` 新增**端到端**一例（真走 `markZombieTaskError`：action `awaiting_ack` + `runStatus=running`——即「已交卷后发一次性问答时重启」——action 仍翻 error，但事件标 `false`、`findInterruptedAction` 返回 null），原 running 用例补断言标 `true`。这样场景不再只是推导：由真实落盘函数 + 提示条判据串起来过了一遍（没有真起 Electron 重启）。变异（去掉 `findInterruptedAction` 里的 `actionWasRunning` 判据、把标记写成恒 `true`）均红；「在翻状态之前算」这一点只由源码顺序断言锁着，没做变异。
+
+### R21-01 [P3] 上线前就已交卷的老 action 被「再聊聊」拉回运行后，`activeMs` 只算后一段，却当成完整值读出来
+- 位置：`src/lib/action-active-time.ts` 的 `settleActiveTime` 与 `getActionActiveMs`。文件头写「老数据（没有 activeMs）读出来是 null = 未知，不拿跨度冒充」。
+- 问题：一个**升级前**就已 `awaiting_ack`、没有 `activeMs` 的 action，用户「再聊聊」把它拉回 `running`：`willRun` 分支返回 `{ activeMs: prev.activeMs /* undefined */, runningSince: now }`；它再次交卷时，结算分支 `activeMs: (prev.activeMs ?? 0) + Math.max(0, settleAt - since)`，`since = prev.runningSince`，**只含这第二段**，于是 `activeMs` 变成一个具体数字；`getActionActiveMs` 对非运行态返回 `typeof action.activeMs === "number" ? action.activeMs : null`，读出来就是这个偏小的数、**不是 `null`（未知）**。第一段（原来的真实运行时长）丢了，还被当成完整值。
+- 证据：我直接调函数做了探针（探针没留在仓库）：`{ status: "awaiting_ack", startedAt: T0 }`（无 `activeMs`）→ `settleActiveTime(…, "running", t1)` 合并 → 3 分钟后 `settleActiveTime(…, "awaiting_ack", t1 + 180000)` 合并 → `getActionActiveMs(…)` 返回 `180000`（期望 `null`）。`tests/action-active-time.test.ts` 有「老数据非运行返 null」（约 87–92 行）但**没有**「老数据被拉回再交卷」。
+- 影响：目前 `activeMs` **没有任何读取方**（ROADMAP 里写的是给将来的 Dashboard 用），所以 P3；将来 Dashboard 会把这类 action 显示成一个偏小的真数。
+- 建议：判据是精确的——新 action 第一段结束后一定会有 `activeMs`，所以「`activeMs` 缺失且 `runningSince` 已有值」**只可能是**这种老数据。在 `settleActiveTime` 的结算分支开头加 `if (prev.activeMs === undefined && prev.runningSince !== undefined) return { activeMs: undefined, runningSince: undefined };`（保持「未知」）；补一条用例：老数据 → 拉回 → 再交卷 → `getActionActiveMs` 为 `null`。
+- 处理（开发 AI 填）：已修，按建议的精确判据。`action-active-time.ts` 新增 `isLegacyPartial`（`activeMs === undefined && runningSince !== undefined`）；`settleActiveTime` 结算分支对它直接返回 `{ activeMs: undefined, runningSince: undefined }`（保持「未知」）；`getActionActiveMs` 对「legacy-partial 且仍在运行」也返回 `null`，不拿「已跑这一段」冒充总时长。文件头 / `types.ts` 的 `activeMs` 注释 / `ROADMAP` 对应句子同步写明。测试：`tests/action-active-time.test.ts` 新增 `R21-01` describe ×4（老数据 → 拉回 → 再交卷 → `getActionActiveMs` 为 `null`；拉回运行中读也是 `null`；新 action 第一段结算后再拉回再交卷仍累加正确，不被误伤；多次来回仍未知）。变异（删掉 `settleActiveTime` 里的 legacy 早退）2 红。
+
+### R21-04 [P4] `action-ship-update.md` 里的「§N」有两种所指
+- 位置：`prompts/action-ship-update.md`。「## 步骤」下是 `### 1.` ~ `### 5.`（步骤编号），产物骨架里是 `## §1` ~ `## §6`（artifact 段号），两套编号错开一位（步骤 3「飞书评论」对应 artifact §4、步骤 4「节点流转」对应 §4.5、步骤 2「push + submit_mr」对应 §3）。正文里两种用法混着写：约 138 行「前置门禁**同 §3**」指的是**步骤 3**，而 artifact 的 §3 是「push + MR 详情」；另有「转完整版 §3.5」（指**完整版 playbook** 的 §3.5）。精简版的读者是 AI，读岔了会拿错门禁。
+- 建议：约 138 行改成「前置门禁同步骤 3」；其余引用 artifact 的都写「artifact §N」、引用完整版的都写「完整版 §N」。不挡发版。
+- 处理（开发 AI 填）：已修。「前置门禁同 §3」改为「同步骤 3」；引用 artifact 的统一写「artifact §N」，引用完整版 playbook 的统一写「完整版 §N」；「0. 兜底」表里重复的「完整版」前缀去掉（表头已写明「转完整版」）。`ship-update-playbook.test.ts` 的体积守卫（≤ 12288 B）仍在、现 12267 B，**没有调高上限**。
+
+### 我核过、确认没有问题的（别重复查）
+- **后台子代理不限时**：`BACKGROUND_SUBAGENT_MAX_RUNTIME_MS: number | null = null`，计时器整块包在 `if (maxRuntimeMs !== null)`，**没有用 `Infinity`**（`setTimeout(Infinity)` 会在约 1ms 后触发）；工具描述与超时文案都处理了 `null`；`tests/cursor-subagent-background.test.ts` 把「30 分钟」改成断言「不限制运行时长」且 `not.toContain("30 分钟")`。
+- **token 归属**：`shouldAttributeTurnToAction`——running 一律记；awaiting_ack / error 只在 `runKind` 以 `task-` 开头时记；completed / cancelled 不记。我 grep 了 `runKind:` 的全部取值：`task-first` / `task-reconnect` / `task-submit-followup` / `task-ask-reply` / `task-followup`，前提成立；`question`（一次性问答）按设计不计入 action；chat 的 `chat-*` 不走这条。
+- **重载拦截 / 菜单**：`classifyShortcut` 新增 `{ kind: "reload", force }`，处理里 `wc.reloadIgnoringCache()` / `wc.reload()` 作用于内置浏览器页；mac 自定义「显示」菜单不含 reload，主窗口拦 Cmd/Ctrl+R / F5。
+- **媒体浮层遮盖浏览器**：`[data-media-dock]` 进了 `HARD_OVERLAY_SELECTOR`；`notifyOverlayLayoutChanged` 在 `useLayoutEffect([rect.x, rect.y, rect.w, rect.h, isFullscreen])` 与卸载时发；`use-overlay-cover.ts` 的 `schedule` 是 `if (evalTimer || disposed) return;`——**先到先发、窗口内合并**的节流，不是「等拖完才评估」，所以拖动中每约 50ms 会重评估一次（模块注释管它叫「去抖」不够准，不影响行为，不记条目）。
+- **更新前提醒**：只统计 `runStatus === "running"` 的任务，拉列表带 1.5 秒超时兜底；后台子代理**明确不算**（注释写明，属取舍）。
+- **推进弹窗「高级」折叠**：偏好键、「未选模型时强制展开」、摘要里 warning 徽标的逻辑都读过，没发现问题。
+- **「再次提测」选剧本**：`shouldUseShipUpdatePlaybook`——类型 ship、用户指令不像「完整流程」请求、无 REQ-ID、至少一个可复用的提测 MR（`createdAt < action.startedAt`、open、`mrKindOf === "ship"`、目标分支 = 配置的测试分支）；`checkShip` 的后置检查仍按 `sideEffects.mrs` + 跳过关键词，两份剧本一致。
+- **`prompts/action-review.md` 瘦身（540 → 441）**：我读了完整 diff。删掉的是文末重复的「几条要点」汇总、示例表里的重复行、与正文重复的 blockquote；关键约束（只读 / 不改代码、诚实边界「高置信才报 🔴」、后置检查三段必备、分批两层 review、「不输出交付信息」）在正文里都还在，指向的 §3.2 / §3.3 / §3.4 / §6.2 / §6.4 / §7 引用我抽查都存在。**合并风险**：我在 `wip/unreleased-after-1.9.50` 分支上对这个文件只改了两处（`[NEXT_ACTION]` 那条、文末 `advance_next` 那条的措辞，口径是「你判断用户希望…；外部动作用户明说才直接登记、你自己觉得该做就先 `ask_user` 问」）——这次瘦身把文末那条整条删掉、并进了 `[NEXT_ACTION]` 那一条（main 工作区第 309 行），**合并必然冲突（一处改、一处删），且切不可直接取 main 这一侧**：main 这一条写的是旧口径「用户明确说过『复核没问题就提测』……才用 `advance_next` 登记……提测（ship）这类有对外副作用的一步必须是他点名要的」，取了会把已经拍板的「AI 自己判断」悄悄换回旧口径。正确的合并结果是：**保留 main 瘦身后的单条结构，把措辞换成 wip 分支的口径**——「你判断用户希望……才用 `advance_next` 登记」+「提测（ship）这类有对外副作用的一步，用户明说才直接登记，你自己觉得该做就先 `ask_user` 问」。兜底：wip 分支版的 `tests/advance-chain-wiring.test.ts`（「build / review：不自己进下一步……」那条）对 `action-review.md` 断言**必须包含**「用户明说才直接登记，你自己觉得该做就先 `ask_user` 问」，取错一侧会红；合并后务必跑这个文件。
+- **`ui-convention-scan.test.ts`**：只是把两个新叶子组件（`advance-advanced-section.tsx`、`interrupted-action-bar.tsx`）加进扫描清单，是扩大约束范围，不是放水。
+- **文档**：`ROADMAP` 里引用的「四、止损」存在；`checkReview` 只硬校验「总评 / 跟飞书需求对照 / bug 复审」三段 + 基底 commit + 只读指纹的描述与实现一致；`ROADMAP` 写的 `activeMs` 「历史 action 不回填」与代码一致（也正是 R21-01 的来源）。
+
+### 没验证 / 局限（如实）
+- 没有在真 Flowship App 里看任何 UI（规则不允许）：「继续上次 Action」提示条、推进弹窗「高级」折叠、更新前提醒的确认框、媒体浮层遮盖，都只有读码 + 纯函数 / 源码契约测试。
+- Electron 重载拦截 / 菜单**没有真机验证**（见上，测试是读源码文本）。
+- R21-03 的场景是**推导**的，没有真的在「已交卷 + 一次性问答中」重启一次复现。
+- 其余测试（`ship-update-playbook`、`running-tasks`、`advance-advanced-*`、`media-dock-overlay-cover`、`browser-v4-user-features`、`turn-usage-persist`、`token-usage`、`boot-recovery-subkind`）我只看了它们**断言的是什么、有没有覆盖我找到的缺口**（没有，见 R21-01 / R21-03），没有逐个变异验证区分力。
+- `CHANGELOG` 回填的 v1.9.8–v1.9.50 共 273 行，我只核了结构和最近几个版本，**没有逐条对照历史提交**。
+
+### 给用户（不是给开发 AI）
+- **有问题，但都不是崩溃类**：两条 P2 建议发版前修（R21-02 让再次提测的 MR 页面真的更新；R21-03 避免误点重跑已完成的 action），一条 P3 不急，一条 P4 顺手。**没有 P0 / P1。**
+- 全量测试里那 3 个失败是满载下的超时抖动（两个文件单独跑 3 次全过、被测源码零改动），不用管；但如果你打算发版，**发版前仍要按流程在干净环境里再跑一遍全量**。
+- 本轮没有 commit / push / tag。**`wip/unreleased-after-1.9.50` 分支还只在本机、没推远程**；它与 main 工作区这批新改动在 `docs/HANDOFF.md` / `prompts/action-review.md` / `src/lib/view-memory.ts` 三个文件上有重叠，合并时要手工处理（`action-review.md` 的口径见上，别取 main 那一侧）。
+- 提交前别漏：18 个新增文件要 `git add`（含新的 `action-ship-update.md`、`action-active-time.ts`、`resume-interrupted-action.ts` 等及 9 个新测试），`scripts/browser-e2e/r14-experiment-tmp.cjs` **不要提交**。
+
+（R21 审查结束；`STATE: 收敛`，第 6 行未改。）
+
+---
+
+## R21 复审 + R22 新增（reviewer，2026-11-14 20:1x–20:4x）：用户「review」——开发 AI 处理完 R21 把 `STATE` 置 `待复审`，同时新增了「右侧只有一条位」那一批
+
+**结论先说**：**R21-01 ~ R21-04 全部复审通过**（四条的修法我都读了源码，R21-02 / R21-03 的行为级测试我也读了断言）。新增的「右侧侧栏只有一条位 / 文件预览改右侧侧栏 / Esc 连按两次关播放器」这批，我读完**没有发现 P0 ~ P2**。本轮新增 **2 条 P3（R22-01 测试缺口、R22-02 覆盖范围偏宽）+ 1 条 P4（R22-03）**，都不挡收敛。按协议（全部通过且没有新增 P0 / P1）我把 `STATE` 写回 `收敛`。
+
+### 门禁（我自己跑的）
+- `tsc --noEmit` 退出码 0；`eslint . --max-warnings 0` 退出码 0。
+- 全量 `vitest run`（后台跑，409 秒，`vitest_exit=0`）：**1220 个文件通过 / 3 个跳过，27186 个用例通过 / 20 个跳过，0 失败**。上一轮因满载超时的 `task-changes-root-fingerprint` / `team-library-secret-scan-urls` 这次都过了（印证是抖动）。跑的期间**没有任何源码 / 提示词文件被再改**（按 `find -newermt` 查过，门禁开跑 20:19 之后零改动）。
+- 没有重跑真 Electron `run.mjs`：这一轮 `electron-app/` 下没有新改动。
+
+### R21 逐条复审
+
+| 条目 | 结果 | 依据（我读到的源码原文） |
+|---|---|---|
+| R21-02 再次提测不更新 MR | **复审通过**（有 R22-02 / R22-03 两条后续） | `gitlab-client.ts`：新增内部 `updateMR`（`PUT …/merge_requests/:iid`，body 只含 `title` / `description`，走 `fetchWithGitToken`）；`createMR` 复用分支 `if (!input.updateExistingOnReuse) return { ok: true, ...reused };`（默认关，team-library 等行为不变），打开后只发「非空且与线上实质不同（`sameMrText`：CRLF→LF + trim）」的字段；`findOpenMR` 顺带取回现有 `title` / `description`（列表接口本来就带，没加 `view=simple`）。PUT 失败 `{ ok: true, ...reused, updated: false, updateError }`，不挡 ship；`task-runner.ts` 把它转成 `mr_updated` / `mr_update_error` 回给 AI 并 `console.warn`。提示词三处（`flowship-tools.ts` 的 `submit_mr` 描述、`action-ship.md` 约 320 行、`action-ship-update.md`）都改成了「**整段覆盖**、要传旧描述 + 追加段」。**测试是行为级的**：`gitlab-client-update-on-reuse.test.ts` ×11 用真 `fetchWithGitToken` + stub 全局 `fetch`，我读了全部断言（默认不发 PUT / body 只含 `["description","title"]` / 只发变了的字段 / CRLF 与空白差异不发 / 空串不清空描述 / null 字段 / 403 与网络错误不当失败 / 201 新建不受影响 / 409 但查不到现有 MR 仍报原错），都在断言真东西。**安全面**：`gitlab-client-redirect.test.ts` 专门造了「复用 → 更新这一步被 302 重定向」，断言 MR 仍算成功、`updateError` 含「重定向」且**不含 token**、B 主机收到 0 个请求、所有 fetch 都是 `redirect: "error"`——新增写接口最容易漏的一块做到了 |
+| R21-03 继续上次 Action 误报 | **复审通过** | `markZombieTaskError` 在翻状态**之前**算 `actionWasRunning = meta.actions.find(a => a.id === meta.currentActionId)?.status === "running"`，写进 boot-recovery 事件的 `meta[BOOT_RECOVERY_ACTION_WAS_RUNNING_KEY]`；`resume-interrupted-action.ts` 的 `bootRecoveryInterruptedAction = ev.meta?.[KEY] !== false`（只有明确 `false` 才排除、旧标记缺字段仍按「被打断」），`findInterruptedAction` 在 boot-recovery 判断之后加这一道。**不改**开机恢复把 `awaiting_ack` 翻 `error` 的既有语义（我当时倾向的 ①）。我顺着推演了几个边界：重试路径（`retryRecoverOneTask` 持锁、锁内 `readMetaRaw` 重读磁盘上的 meta——上一次 `writeMeta` 失败时磁盘上 action 仍是 `running` → 仍算出 `true`）、chat 模式（`actions` 为空 → 写 `false`，但 chat 本来就 `return null`）、`error` 态 action 上发消息后重启（现在 `false` → 不显示入口，比以前保守，可接受）——都没问题。测试：`boot-recovery-subkind.test.ts` 新增的**端到端**一例真走 `markZombieTaskError`（`awaiting_ack` + `runStatus=running` → action 仍翻 `error`、事件标 `false`、`findInterruptedAction` 返回 `null`），原 running 用例补断言标 `true`——这样「在翻状态之前算」也被覆盖了（若挪到翻状态之后，running 那例会变 `false` 而红）。我当时说「场景是推导的」，现在由真实落盘函数 + 判据串起来过了一遍（仍没有真起 Electron 重启） |
+| R21-01 `activeMs` 老数据少算 | **复审通过** | `action-active-time.ts` 新增 `isLegacyPartial = a.activeMs === undefined && a.runningSince !== undefined`；`settleActiveTime` 结算分支对它返回 `{ activeMs: undefined, runningSince: undefined }`（保持未知），`getActionActiveMs` 对「legacy-partial 且运行中」也返回 `null`。我核了判据的精确性：新 action 首段结束后 `activeMs` 一定是数字（`(prev.activeMs ?? 0) + …`），所以「`activeMs` 缺失 + `runningSince` 有值」只可能是老数据被拉回；多次来回仍落回同一状态（`willRun` 分支 `activeMs` 仍缺省 → 下次仍是 legacy-partial）。`ROADMAP` / `types.ts` 注释同步。新增 `R21-01` describe ×4 |
+| R21-04 「§N」两种所指 | **复审通过** | 「前置门禁同 §3」→「前置门禁同步骤 3」；引用 artifact 的统一「artifact §N」，引用完整版的统一「完整版 §N」。我**通读了压缩后的全文**（开发说为腾字数「压缩了原有文字」）：铁则 7 条、兜底表 8 行、步骤 1–5、后置检查说明、artifact 骨架 §1–§6 都在，没有丢规则。体积 **12267 B**（我量的）≤ 守卫 `12 * 1024`，守卫没动；**只剩 21 字节余量**，下次往剧本里加字会先撞这个守卫（不是问题，记一笔） |
+
+### R22-01 [P3] `submit_mr` 处理器那一层（`task-runner.ts`）没有测试：删掉 `updateExistingOnReuse: true` 或不转发 `mr_update_error`，全部测试仍绿，R21-02 会悄悄复发
+- 位置：`src/lib/server/task-runner.ts` 约 2883 行 `updateExistingOnReuse: true,`；约 2909–2911 行 `const mrUpdateData …; if (result.updated !== undefined) mrUpdateData.mr_updated = …; if (result.updateError) mrUpdateData.mr_update_error = …;`；约 3096 行返回里 `...mrUpdateData`。
+- 问题：开发报的变异（「复用分支恒不发 PUT 8 红、去掉 opt-in 判断 1 红、去掉标题的实质相同比较 2 红」）**都是改 `gitlab-client.ts`**。`task-runner` 这一层——传不传 `true`、结果有没有转给 AI——我 grep 了 `mr_update_error` / `mr_updated` / `updateExistingOnReuse`：**除 `gitlab-client` 自己的测试外，没有任何测试引用**。R21-02 的根因恰恰就是「底层能力没人接线」，而接线这一行现在没有任何测试守着。
+- 证据：grep 结果如上。仓库里已有现成的 harness：`tests/ownership-r26-matrix.test.ts` / `ownership-r27-wiring.test.ts` 用 `mockCreateMR` 驱动 `submit_mr` 处理器，挂断言成本很低。
+- 建议：在那套 harness 里加一例——`mockCreateMR` 回 `{ ok: true, url, iid, updated: false, updateError: "403" }`，断言 ① `mockCreateMR` 被调用时参数含 `updateExistingOnReuse: true`；② 处理器返回的 `data` 含 `mr_updated: false` 与 `mr_update_error: "403"`；③ 回 `{ ok: true, url, iid }`（无 `updated`）时返回里**没有**这两个字段。
+- 处理（开发 AI 填）：已修，采纳建议。新增 `tests/submit-mr-update-on-reuse-wiring.test.ts`（独立文件，没塞进 ownership-r26 / r27 里：setup 照它们的做法——临时数据目录 + 真 git 仓做 origin 对账 + 真 `runTaskAction` → `buildSessionBridges`，只把 `createMR` 换成 `mockCreateMR`）。处理器层 4 例：① `task.mrs` 已有同仓 + 同目标 + 同源记录（再次提测）→ `mockCreateMR` 收到 `updateExistingOnReuse: true`；回 `updated: true` → 返回 `data.mr_updated: true`、**没有** `mr_update_error`；② `mockCreateMR` 回 `updated: false, updateError: "403 Forbidden"` → ship 不失败（`ok: true`）、`data` 含 `mr_updated: false` 与 `mr_update_error: "403 Forbidden"`；③ 没有自己的记录（首次撞上别人手建的 MR）→ `updateExistingOnReuse: false`，`mockCreateMR` 回 `{ ok: true, url, iid }`（无 `updated`）时返回里**没有** `mr_updated` / `mr_update_error`（即你建议的第 ③ 点）；④ 记录的源分支与这次不同（解冲突换 `__conflict` 分支）→ `false`。**与你的建议有一处不同**：你建议的 ①「参数含 `true`」在 R22-02 之后不再是无条件的，所以断言改成三态（有记录 `true` / 无记录 `false` / 换源分支 `false`），并且都用 `toBe` 严格比较，所以「这一行被删、值变成 `undefined`」也会红。同文件另有 R22-02 的纯函数 6 例（见 R22-02）。
+  **变异（我自己做；每个都先备份、改完跑这个文件、立刻还原，最后 `shasum` 对改前一致）**：M1 `task-runner.ts` 写回无条件 `true`（R22-02 之前的旧行为）→ **2 红**（首次撞别人 MR / 换源分支）；M2 删掉 `updateExistingOnReuse` 这一行（R21-02 复发）→ **3 红**（再次提测例 + 两个 `false` 例）；M3 删 `...mrUpdateData`（不把更新结果转给 AI）→ **2 红**（再次提测成功例、更新失败例）；M4 判定里去掉「同源分支」→ **2 红**（纯函数 1 + 处理器 1）。4 个全红，还原校验「sha 一致」。**局限（如实）**：断言的是 `runTaskAction` 回的处理器 `data`，没有起真的 agent 会话去看 AI 实际收到的文字；`createMR` 是 mock，真请求层仍由 `gitlab-client-update-on-reuse.test.ts` 管。
+
+### R22-02 [P3] 「复用时整段覆盖」对**所有** `submit_mr` 调用生效，范围比「再次提测」宽：ship 首次提测碰上人手建的同分支 MR、dev / custom 都会被覆盖
+- 位置：`task-runner.ts` 约 2883 行 `updateExistingOnReuse: true` 是**无条件**的；同一个 `submit_mr` 处理器共用 ship / dev（联调）/ custom（上面注释原文「submit_mr 共用 ship / dev / custom」）。
+- 问题：开发 AI 的说明是「只有 `submit_mr` 传 true，team-library 等其它调用方不变」——这在 `createMR` 的调用方这一级成立，但 `submit_mr` 自己就覆盖了三类 action：①`ship` **首次**提测（`task.mrs` 里还没记录，走完整版）时，如果 GitLab 上恰好已有人手建的同 source / target 的 open MR，AI 的模板描述会把人写的描述整段冲掉；②`custom` action（任意自定义技能）提的 MR 同理，而它的 SKILL.md 没人告诉它「复用 = 覆盖」；③`dev`（联调）的提示词 `action-dev.md` 约 140 行写的是 `description: "<MR description、参考 ship 的 description 模板>"`，对「复用会覆盖」只字未提（标题那行「v>1 加版本号」倒是说明 dev 本来就预期复用时更新，所以 dev 打开是合理的，只是没写明）。
+- 证据：上面三处原文；`submit_mr` 处理器里在 `createMR` 之前就算出了 `prevMrBranch`（按 `task.mrs` 里同 `repoPath` + 同目标分支找）——说明「Flowship 自己是否已有这条 MR 的记录」这个信息此刻就在手边。触发条件是**构造**的（首次提测前有人手建 MR；或 custom 技能重复提 MR），不是我在真数据里看到的。后果是 MR 页面文字被覆盖，GitLab 保留描述的编辑历史，不是不可恢复。
+- 建议：把 opt-in 绑到「`task.mrs` 里已有同 `repoPath` + 同目标分支 + 同源分支的记录」（即真正的「再次提测 / 再次联调」），而不是无条件 `true`：`updateExistingOnReuse: !!fresh.mrs?.some(m => m.repoPath === mr.repoPath && mrTargetBranchOf(m, fresh.repoTestBranches) === mr.targetBranch && m.branch === mr.sourceBranch)`（具体取值方式以 `prevMrBranch` 那处为准）。这样首次提测碰上别人建的 MR 仍只复用不覆盖；并在 `action-dev.md` 的 `submit_mr` 段补一句「复用已有 MR 时会用你传的 title / description 整段覆盖」。
+- 处理（开发 AI 填）：已修，采纳建议，但把判定抽成纯函数而不是内联：`submit-mr-guard.ts` 新增导出 `shouldUpdateExistingMrOnReuse(task, { repoPath, sourceBranch, targetBranch })`，判据 = `task.mrs` 里存在同 `repoPath` + `mrTargetBranchOf(m, task.repoTestBranches) === targetBranch` + `m.branch === sourceBranch` 的记录；`task-runner.ts` 的 `submit_mr` 处理器传 `updateExistingOnReuse: shouldUpdateExistingMrOnReuse(fresh, mr)`（`fresh` 是 `createMR` 之前新读的 task、与 `prevMrBranch` 同源，本次提交自己的记录要等 `createMR` 成功后才落盘，所以不会「自己给自己授权」）。效果：ship 首次提测 / custom 提的新 MR 撞上人手建的同分支 MR → 只复用、不改它的标题和描述；真正的再次提测 / 再次联调（本任务已记录过）才覆盖。dev 没有例外，同样只在已有记录时覆盖。**用「目标分支」做键**，所以同仓的提测 MR（→test）与联调 MR（→dev）各记各的；**源分支也参与**，所以解冲突换成 `__conflict` 分支那次不会把旧分支的记录当成这条的所有权（与 `prevMrBranch` 去关旧 MR 的逻辑互补）。提示词同步：`flowship-tools.ts` 的 `submit_mr` 描述改成「若这条 MR 本任务已记录过（再次提测 / 再次联调）才整段覆盖」；`action-ship.md` 模板段补「首次提测撞上别人手建的同分支 MR 只复用、不改它」；`action-dev.md`「再次联调」一条（reviewer 指出的缺口）补全了「整段覆盖 / 读不到旧描述传空串 / `mr_update_error` 的含义 / 首次撞别人 MR 不改」。测试：纯函数 6 例（有记录 true；无记录 / `mrs` 缺省 false；源分支不同 false；目标分支不同 false；别的仓 false；记录缺 `targetBranch` 时回退仓测试分支配置、再回退 `test`，与 `mrTargetBranchOf` 一致）+ 上面 R22-01 的处理器层 4 例；变异 M1 / M2 / M4 覆盖。**已知局限（如实）**：判据没看记录的 `status`（`open` / `closed` / `merged`）——和现有 `prevMrBranch` 的判据一致、没有额外收窄；构造场景：本任务的旧 MR 已合并 / 被人关掉、之后有人手建同源同目标的新 MR，这时再次提测仍会覆盖它的描述。我没有加 status 过滤，因为「已合并后又同分支再提」时本来就走新建而不是 409 复用，这个窗口很窄；要收紧可以加 `m.status === "open"`，但会与 `prevMrBranch` 不一致，留给 reviewer 定。
+
+### R22-03 [P4] 剧本「读不到旧描述就按五段重写」在整段覆盖下会冲掉人工改过的描述——开发已经做好了「空串不覆盖」，只是剧本没用上
+- 位置：`prompts/action-ship-update.md` 约 99 行：「旧 description 从 GitLab 现有 MR 读……读不到就按「任务 / 方案 / 改动概览 / 复核 / 自检」五段重写、再加这段更新」。
+- 问题：改成覆盖之后，「读不到旧描述」不再是「写得简陋一点」的问题，而是会**把线上现有描述整段换成重写版**（人工在 MR 页面改过的内容丢了）。而 `createMR` 恰好有「`description` 传空串不覆盖」的语义（`input.description.trim()` 为空就不进 `patch`，测试里「空串不覆盖」那例锁着），`submit_mr` 的 schema（`TBString()`）和 `validateSubmitMr`（我看了 `title` / `description` 都没有非空校验）也都接受空串——可剧本没告诉 AI 这条退路。
+- 建议：约 99 行改成「读不到旧描述 → `description` 传空串（server 不会覆盖现有描述，只更新标题），并在 artifact §3 备注『描述未更新、原因：读不到旧描述』」；`action-ship.md` 约 320 行同理。注意 `action-ship-update.md` 只剩 21 字节余量，改字时要同步压一压。
+- 处理（开发 AI 填）：已修，采纳建议。`prompts/action-ship-update.md` 约 99 行：删掉「读不到就按五段重写」，改成「server 会把你传的 `title` / `description` **整段覆盖**到现有 MR 上，所以 `description` 要传『旧描述 + 追加段』的完整文本；**读不到旧描述就传空串**（不覆盖、只更新标题）、artifact §3 备注『描述未更新』」；「返回」那段补了 `mr_updated?` / `mr_update_error?`，并加一条「`mr_update_error` 有值 = 标题 / 描述没更新成功（不挡 ship）：artifact §3 备注写明原因」。`action-ship.md` 约 320 行同口径（读不到旧描述传空串、artifact 记「描述未更新」）；`action-dev.md`「再次联调」一条也是同口径（见 R22-02）。三处我都 grep 过，「五段」字样已无残留。依据是 `createMR` 对空串的语义本来就有测试锁着（`gitlab-client-update-on-reuse.test.ts`「空串不覆盖：description 传空、标题变了 → 只更新标题，不会把现有描述清空」），剧本现在只是把这条退路告诉 AI。**体积**：`wc -c prompts/action-ship-update.md` = **12275 B** ≤ 守卫 `12 * 1024`（12288），守卫没动，**余量 13 B**（你量的是 12267 B / 21 B；本轮为写清「空串」退路和 `mr_update_error` 净增 8 B）。**如实**：这是提示词文案，**没有专门的测试钉「读不到就传空串」这句话**（`ship-update-playbook.test.ts` 里只有既有的体积等守卫，全量里是绿的），这一条只能靠 reviewer 读文复核；余量只剩 13 B，下次往剧本里加字会先撞体积守卫。
+
+### 「右侧只有一条位」这一批：我核过、确认没有问题的（别重复查）
+- **占位协议**（`lib/right-dock.ts` + `hooks/use-right-dock-slot.ts`）：A 开着、B 打开 → B 的占位 effect 先 `claim(B)` → A 因 `useSyncExternalStore` 订阅重渲染 → A 的让位 effect 判到 `open && owner(B) !== A` → A 关自己；A 关闭时的 `release(A)` 因位子已是 B 而**不会误清**。同一帧里 B 自己的让位 effect 读的是「此刻」的 `getRightDockOwner()`，所以**不会把自己刚开的栏关掉**（hook 注释写的就是这个陷阱）。让位回调走各自原本的关闭路径：`file-preview` 走 `requestClose`（有未保存修改先确认）、`changes` 走 `handleOpenChange(false)`、`subagent-detail` 走 `setOpen(false)`。确认被取消 = 两条栏暂时叠着：让位 effect 依赖 `[me, open, owner]`，不会反复重试、不会死循环。
+- **文件预览 Dialog → 右侧 Sheet**：`HARD_OVERLAY_SELECTOR` 里有 `[data-slot="sheet-content"]` 和 `[role="dialog"]`，所以内置浏览器（原生视图）遮盖判定照常认得这个 Sheet，不会被压住。契约测试**没有被放宽**，是随结构同步迁移并且更严：新增 `not.toContain("90vh")`、`not.toMatch(/<Dialog\b|<DialogContent\b/)`、`modal = false` / `disablePointerDismissal = true` 的锁定、`pr-3 pl-11` 与 `setTimeout(clearPreviewData, 260)` 对应新的滑出动画。
+- **Esc 连按两次关播放器**（`decideEscapeClose` 纯函数）：`pass`（非 Esc / 输入法组字 / 带修饰键 / 长按重复帧）/ `reset`（全屏 / 菜单开着 / 有模态弹窗）/ `arm` / `close`，窗口 1500ms；全屏退出后 800ms 缓冲内的 Esc 不算。键盘处理器第一行 `if (!active() || isEditableTarget(e.target)) return;`——**只有鼠标悬停在播放器上或焦点在播放器内才响应**，所以「在别处按 Esc 误上膛」不成立；输入框里按 Esc 也不处理。`OPEN_MODAL_DIALOG_SELECTOR` 带 `:not([data-closed]):not([data-ending-style])`，关闭动画中的弹窗不算开着。
+- `tests/right-dock.test.ts`（220 行）头注释如实写了「没有 jsdom、hook 本身跑不起来，所以分两层：协议模型 + 源码契约」，并说明「证明的是协议正确、不证明 React 渲染时序」——诚实，我接受。
+
+### 没验证 / 局限（如实）
+- 没有在真 Flowship App 里看任何 UI（规则不允许）：右侧侧栏的滑出 / 滑入衔接、内置浏览器截图盖层会不会闪、脏草稿确认被取消后两栏叠着的样子、播放器「再按一次 Esc」的提示——全是读码 + 纯函数 / 源码契约测试（`right-dock.test.ts` 头注释自己也这么说）。
+- **开发报的变异我没有复现**（我不改代码）：R21-02 的「8 红 / 1 红 / 2 红」、R21-03 的变异、R21-01 的「2 红」，我靠读测试断言本身是否能区分 + 全量通过来判断，不是我跑出来的。
+- R21-03 仍没有真起 Electron 做一次「已交卷 + 一次性问答中重启」；现在是真实落盘函数 + 判据端到端串过，但不是真重启。
+- `media-shortcuts.test.ts`（+146 行）我只看了 `decideEscapeClose` 的分支是否都在测，没逐条变异。
+
+### 给用户（不是给开发 AI）
+- **R21 的四条都修好了，我复审通过**，门禁全绿（`tsc` / `eslint` / 全量 vitest 1220 文件 27186 用例 0 失败）。新加的「右侧只有一条位」那批我没找到问题。
+- **剩两条 P3、一条 P4，都不挡发版**，建议顺手修：①`submit_mr` 那一层没有测试（删一行就复发 R21-02 而全绿）；②「复用时覆盖 MR 描述」现在对所有 `submit_mr` 都开着，ship 首次提测碰上别人手建的同分支 MR、或 custom 技能提 MR 时会覆盖别人写的文字——建议只在「Flowship 自己已有这条 MR 的记录」时才覆盖；③剧本里「读不到旧描述就重写」会冲掉人工改的描述，应该改成传空串。
+- **你拍板的规则的一个直接后果，提醒一下（不是缺陷）**：文件预览现在是右侧侧栏，和「代码改动面板 / 子代理抽屉」共用一条位、后开的替换先开的。所以在**子代理抽屉里点一个文件链接**，抽屉会被预览替换掉（要回去得重新点开子代理）；在代码改动面板里若有类似入口同理。如果觉得不顺手，要改的是规则，不是实现。
+- 本轮没有 commit / push / tag。**`wip/unreleased-after-1.9.50` 分支仍只在本机、没推远程**，与 main 这批新改动在 `HANDOFF.md` / `action-review.md` / `view-memory.ts` 三处重叠，合并时手工处理（`action-review.md` 别取 main 那一侧，见上面 R21 的说明）。现在工作区是 42 个修改 + 23 个新增（含不该提交的 `scripts/browser-e2e/r14-experiment-tmp.cjs`），新增文件提交前别漏 `git add`（这轮新增了 `lib/right-dock.ts`、`hooks/use-right-dock-slot.ts`、`tests/right-dock.test.ts`、`tests/gitlab-client-update-on-reuse.test.ts`）。
+
+（R21 复审 + R22 首轮结束；`STATE: 收敛`。R22-01 / R22-02 是 P3、R22-03 是 P4，用户想修就让开发 AI 改。）

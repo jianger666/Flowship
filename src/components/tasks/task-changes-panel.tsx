@@ -25,6 +25,7 @@ import { ChangesSheet } from "@/components/tasks/changes/changes-sheet";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { clearFileDiffCache } from "@/hooks/use-file-diff";
+import { useRightDockSlot } from "@/hooks/use-right-dock-slot";
 import { useTaskChanges } from "@/hooks/use-task-changes";
 import {
   loadDiffPrefs,
@@ -110,6 +111,9 @@ export const TaskChangesPanel = ({ task, size = "sm" }: Props) => {
       setBaseRef(null);
     }
   }, []);
+
+  // 右侧只有一条位：文件预览 / 子代理抽屉打开时让位（后开的替换先开的；走 handleOpenChange(false) 以便一并重置范围与基线）
+  useRightDockSlot("changes", open, () => handleOpenChange(false));
 
   const handleRefresh = useCallback(() => {
     clearFileDiffCache();

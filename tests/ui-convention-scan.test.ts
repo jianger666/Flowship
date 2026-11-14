@@ -158,6 +158,8 @@ const FIXED_FILES = [
   "components/tasks/talk-queue-banner.tsx",
   "components/tasks/event-stream.tsx",
   "components/tasks/advance-dialog.tsx",
+  // 推进弹窗瘦身：高级选项折叠壳（新叶子组件；摘要强调只走 Badge warning 语义 token）
+  "components/tasks/advance-advanced-section.tsx",
   "app/sessions/page.tsx",
   "components/schedules/schedule-row.tsx",
   "components/tasks/task-changes-panel.tsx",
@@ -174,6 +176,8 @@ const FIXED_FILES = [
   "components/tasks/low-disk-bar.tsx",
   // R14 B6-3：已归档会话灰条（新叶子组件，详情页顶部；只走 muted 语义 token，不用整块 opacity）
   "components/tasks/archived-bar.tsx",
+  // 重启中断恢复：「继续上次 Action」提示条（新叶子组件，叠在已归档灰条旁；颜色只走 warning 语义 token、hover 提示用 Tooltip）
+  "components/tasks/interrupted-action-bar.tsx",
   "components/tasks/requirement-group-dialog.tsx",
   "components/conversation-composer.tsx",
   "components/composer-editor.tsx",

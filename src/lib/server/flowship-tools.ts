@@ -414,8 +414,8 @@ const submitMrDef: FlowshipToolDef = {
   label: "提交 GitLab MR（ship / 改bug / dev / custom）",
   description: [
     "server 同步调 GitLab REST API 建 MR。调用前须已 git push、并用 git rev-parse HEAD 拿 last_commit_hash。",
-    "同一仓再次 ship 直接再调即可、server 复用现有 open MR。多仓 task 每仓调一次。",
-    "返回 { ok, data:{ mr_url, has_conflicts, ... } }；has_conflicts=true 时绝不 merge/rebase 目标分支、先调 ask_user。",
+    "同一仓再次 ship 直接再调即可、server 复用现有 open MR；若这条 MR 本任务已记录过（再次提测 / 再次联调），还会用你传的 title / description **整段覆盖**它（要保留旧描述就传「旧描述 + 追加段」的完整文本；description 传空串 = 不动描述）。多仓 task 每仓调一次。",
+    "返回 { ok, data:{ mr_url, has_conflicts, ... } }；has_conflicts=true 时绝不 merge/rebase 目标分支、先调 ask_user。复用并覆盖时另有 mr_updated / mr_update_error：后者有值 = MR 标题 / 描述没更新成功（不挡 ship、请在 artifact 记一笔）。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),

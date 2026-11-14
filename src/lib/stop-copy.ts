@@ -67,3 +67,22 @@ export const stopNoticeText = (opts: {
  */
 export const BOOT_RECOVERY_TEXT =
   "[boot-recovery] Web 进程重启时本任务的 agent 正在运行、这一轮已中断。可在底部输入条说句话继续本步（任务也可点「推进」开始下一步）。";
+
+/**
+ * boot-recovery error 事件的机器标记（`meta.subkind`）：前端「继续上次 Action」只认它、不靠文案匹配
+ * （文案已改过一次，且 chat-turns 立约「新增过程类事件必须带 meta.subkind」）。task / chat 共用同一条事件，
+ * 标记也共用；是不是 task 模式由消费方自己判 `task.mode`。
+ */
+export const BOOT_RECOVERY_SUBKIND = "boot-recovery";
+
+/**
+ * boot-recovery error 事件的第二个机器标记（`meta[BOOT_RECOVERY_ACTION_WAS_RUNNING_KEY]`，boolean）：
+ * 开机恢复**翻 error 之前**，当前 action 是不是真的在 running（= 这个 action 是被重启「打断」的）。
+ *
+ * 为什么需要：开机恢复只看任务级 `runStatus === "running"`，而 task 里「已交卷（awaiting_ack）后发一次性问答」
+ * 也会把 runStatus 写成 running——这时重启，已交卷、早就跑完的 action 会被一并翻成 error。
+ * 光看「最近 action=error + 最近 error 是 boot-recovery」会把它当成被打断的、提示「继续上次 Action」，
+ * 点了就把已完成的 action 整个重跑（审查 R21-03）。false = 它不是被打断的，前端不给继续入口。
+ * 缺省（没有这个字段的旧标记）按 true 处理：只有明确写了 false 才排除。
+ */
+export const BOOT_RECOVERY_ACTION_WAS_RUNNING_KEY = "actionWasRunning";
