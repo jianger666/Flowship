@@ -59,12 +59,40 @@ export interface ResendPayload {
 }
 
 /**
+ * 把一条 user_reply 当时贴的图回读成上传载荷（取不到的跳过、partial=true）。
+ * 重发 / 重试 / 「编辑」打开编辑框时都用它；没贴过图返回空数组、partial=false。
+ */
+export const loadUserReplyImages = async (
+  taskId: string,
+  ev: TaskEvent,
+): Promise<{ images: ImagePayload[]; partial: boolean }> => {
+  const imgs = extractUserReplyImages(ev.meta);
+  if (imgs.length === 0) return { images: [], partial: false };
+  const payloads = await Promise.all(
+    imgs.map((img) =>
+      fetchUploadAsPayload(taskId, img.absPath, img.mimeType, img.filename),
+    ),
+  );
+  const ok = payloads.filter((p): p is ImagePayload => p != null);
+  return { images: ok, partial: ok.length < imgs.length };
+};
+
+export interface BuildResendPayloadOptions {
+  /**
+   * 调用方指定要带的图（「编辑」时用户在编辑框里增删后的最终这一组，可以是空数组 = 一张都不带）。
+   * 不传 = 照原消息的图回读（原样重发语义）。
+   */
+  images?: ImagePayload[];
+}
+
+/**
  * 从一条 user_reply 事件复建重发载荷。
  * skill 引用按原文重新解析（skill 列表可能已变、以当下真实存在的为准）。
  */
 export const buildResendPayload = async (
   taskId: string,
   ev: TaskEvent,
+  opts?: BuildResendPayloadOptions,
 ): Promise<ResendPayload> => {
   const text = ev.text;
 
@@ -77,16 +105,13 @@ export const buildResendPayload = async (
 
   let images: ImagePayload[] | undefined;
   let imagesPartial = false;
-  const imgs = extractUserReplyImages(ev.meta);
-  if (imgs.length > 0) {
-    const payloads = await Promise.all(
-      imgs.map((img) =>
-        fetchUploadAsPayload(taskId, img.absPath, img.mimeType, img.filename),
-      ),
-    );
-    const ok = payloads.filter((p): p is ImagePayload => p != null);
-    if (ok.length > 0) images = ok;
-    imagesPartial = ok.length < imgs.length;
+  if (opts?.images !== undefined) {
+    // 调用方已经把图定好了（编辑框里看到什么就带什么）：不再回读原消息的图，也就没有「部分未带上」
+    if (opts.images.length > 0) images = opts.images;
+  } else {
+    const loaded = await loadUserReplyImages(taskId, ev);
+    if (loaded.images.length > 0) images = loaded.images;
+    imagesPartial = loaded.partial;
   }
 
   const atts = extractUserReplyAttachments(ev.meta);

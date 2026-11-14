@@ -102,7 +102,17 @@ import {
   type AwaitingNotifier,
   type ChatTaskActionHandler,
 } from "./chat-pending";
-import { ONE_SHOT_SYSTEM_TOOL_NAMES } from "./one-shot-tools";
+import { oneShotSystemToolNames } from "./one-shot-tools";
+import {
+  discardOneShotMemory,
+  getOneShotMemoryEpoch,
+  invalidateOneShotMemory,
+  oneShotMemoryMatches,
+  oneShotModelKey,
+  peekOneShotMemory,
+  rememberOneShotMemory,
+  type OneShotMemory,
+} from "./oneshot-session-memory";
 import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
 import { validateSubmitMr } from "./submit-mr-guard";
 import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
@@ -3327,6 +3337,9 @@ export const installSessionIfCurrent = (
   callerToken: string,
 ): boolean => {
   if (!lease()) return false;
+  // 正式会话（有 action 的那条）装进来 = 上下文边界：聊天通道（一次性 agent）之前攒的对话记忆作废，
+  // 之后会话断了再聊也是重新起头（见 oneshot-session-memory.ts）
+  invalidateOneShotMemory(taskId);
   agentSessions.set(taskId, record);
   setChatTaskActionHandler(taskId, bridges.taskActionHandler, callerToken);
   setChatAwaitingNotifier(taskId, bridges.awaitingNotifier, callerToken);
@@ -4867,6 +4880,11 @@ const consumeSessionRun = async (
     opHandle: TaskOpHandle;
     /** 非属主轮的按轮次标记 token（sendToTaskSessionBody 登记）：本函数最外层 finally 按它收口 */
     nonOwnerTurnToken?: string;
+    /**
+     * 问一问 run **干净结束**（run.wait 返回 finished、走到 questionRun 正常收尾）时调一次。
+     * 出错 / 被停 / 失主走别的出口，不会调——聊天通道据此判断这一轮的 agent 能不能记下来下次接着聊。
+     */
+    onQuestionRunFinished?: () => void;
   },
 ): Promise<void> => {
   let cancelled = false;
@@ -5660,6 +5678,8 @@ const consumeSessionRun = async (
     // 问一问 run 答完：按当前 action 状态归回等待位（含 error 位、比下面的通用兜底全）
     // 答完期间若 stop bump 或已被接管 → 跳过 restore
     if (opts.questionRun) {
+      // run 本身是干净结束的（和后面是否失主无关）：先报一声，聊天通道据此记下这轮的 agent
+      opts.onQuestionRunFinished?.();
       // 失主不发 done（正常结束路径；lostStartOwner 早退已覆盖、此处双保险）
       if (lostStartOwner()) return;
       if (shouldRestoreAfterQuestion(opts.opHandle)) {
@@ -6236,13 +6256,16 @@ export const deliverTaskQuestion = async (
  *
  * 它是**属主自己的 agent**：用户在任务页说的话它都认真办——疑问就答、要改就改、
  * 要「之后再看」的事可以自己设定时。跟正式会话的区别只有「没有 action 这条链」（有意为之）：
- * - 不注入 action playbook；系统工具只挂不依赖 action 的（{@link ONE_SHOT_SYSTEM_TOOL_NAMES}：定时 / 等待，
- *   外加浏览器工具与子代理），交卷 / 提问 / 提 MR / 推进这类要靠 action 与 notifier 的不挂
+ * - 不注入 action playbook；系统工具只挂不依赖 action 的（{@link oneShotSystemToolNames}：定时 / 等待 / 自动推进，
+ *   定时到点那一轮没有自动推进；外加浏览器工具与子代理），交卷 / 提问 / 提 MR 这类要靠 action 与 notifier 的不挂
  *   （以前一个系统工具都不挂，于是「任务没推进过」就建不了定时）
  * - 运行期间登记一个 callerToken（只写期望 token、不注册 notifier / handler，见 setOneShotCallerToken），
  *   定时这类要验身份的工具才认它；收尾只摘自己的，被正式会话接管 / stop 摘了就不动
  * - 不注册 agentSessions / 不落盘锚点——它不能被后续「续用推进」误当正式会话
- * - 答完 close、下次再问再起（低频场景、冷启动可接受）
+ * - 答完照旧 close（不占内存、没有空闲计时器），但**干净答完**时记下它的 agentId（oneshot-session-memory.ts），
+ *   下一条消息 `Agent.resume` 把同一段对话接回来——聊天不是一句一句冷启动。换了模型 / 提供方 / 工作目录、
+ *   记忆过期（6 小时）/ 到顶（40 轮）、接不回或送不进去，一律退回新起一个带完整背景；正式会话装进来（action 开始）
+ *   时记忆作废（上下文边界，见 installSessionIfCurrent）
  *
  * ⚠️ 本函数是**属主自己的**通道（任务页输入条）：agent 能动手改小改动，且它是这个 task
  * 的一次 run（占 runningTasks、调用方先写 runStatus=running、收尾归位）。需求群里
@@ -6267,10 +6290,20 @@ export const startOneShotQuestion = (
   // observer 在公共入口、任何 await（含 ensureWorkspaceReady）之前同步拍——
   // ensure / 串行排队期间同 gen claim 会变 claimSeq，出队后 isTaskOpCurrent 即 false
   const oneshotOpHandle = snapshotTaskOp(task.id);
+  // 聊天记忆的 epoch 同样在任何 await 前抓：收尾写记忆时对不上 = 这期间正式会话装进来过（action 已开始），不写
+  const memEpoch = getOneShotMemoryEpoch(task.id);
   beginTaskStarting(task.id);
   void (async () => {
     // box：串行回调内赋值不被 TS CFA 当成「外层 let 从未赋值」
     const agentBox: { current: AgentInstance | null } = { current: null };
+    // 这一轮对聊天记忆的贡献：送出去了没 / run 干净结束没 / 记忆要对的那几项（finally 据此记下或丢弃）
+    const turn: {
+      sent: boolean;
+      clean: boolean;
+      turnsBefore: number;
+      boundChatId: string | null;
+      want: { providerId: string; modelKey: string; cwd: string } | null;
+    } = { sent: false, clean: false, turnsBefore: 0, boundChatId: null, want: null };
     // instanceId 在受理段分配，catch/consume 共用——
     // 绝不再从全局 runningTasks 读（表已被 B 换掉时会误拿 B 的号）
     let oneshotInstanceId: number | undefined;
@@ -6408,7 +6441,12 @@ export const startOneShotQuestion = (
           await writeOwnedEventAndPublish(
             task.id,
             () => isTaskOpCurrent(oneshotOpHandle),
-            { kind: "info", text: "正在启动 agent…", meta: { subkind: "boot" } },
+            {
+              kind: "info",
+              // 有上一轮的聊天记忆就说「恢复」（接不回会在下面退回新起，文案差一点无碍）
+              text: peekOneShotMemory(task.id) ? "正在恢复会话…" : "正在启动 agent…",
+              meta: { subkind: "boot" },
+            },
           );
           // SDK local 无 env 透传 → 启动前同步 company-env.json
           await syncCompanyEnvFileFromSettings();
@@ -6418,25 +6456,63 @@ export const startOneShotQuestion = (
           // 正式启动也要进同一条链，所以槽是空的、不会和它互相覆盖。失败路径统一由外层 finally 摘（只摘自己的）
           oneshotCallerToken = String(allocTaskRunInstanceId());
           setOneShotCallerToken(task.id, oneshotCallerToken);
-          const created = await withSdkDeadline(
-            Agent.create({
-              apiKey: creds.apiKey,
-              model: creds.model,
-              // 与入口同口径：悬空提供方直接抛（受理段排队期间设置被改也不会静默落回 Cursor）
-              providerId: oneshotProviderId,
-              // 系统工具只挂不依赖 action 的（定时 / 等待），交卷 / 提问这类不挂——见 one-shot-tools.ts
-              callerToken: oneshotCallerToken,
-              systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES,
-              taskId: task.id,
-              // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
-              local: { cwd: effectiveCwd, settingSources: [] },
-            }),
-            SDK_CREATE_RESUME_TIMEOUT_MS,
-            "Agent.create(oneshot)",
-          );
+          // create / resume 共用同一份入参（resume 接回的也是这套工具面：定时 / 等待 / 推进 + 浏览器 + 子代理；
+          // 定时到点那一轮没有「推进」——清单每轮按 scheduled 现算，resume 也按本轮入参重建工具）
+          const agentInput = {
+            apiKey: creds.apiKey,
+            model: creds.model,
+            // 与入口同口径：悬空提供方直接抛（受理段排队期间设置被改也不会静默落回 Cursor）
+            providerId: oneshotProviderId,
+            // 系统工具只挂不依赖 action 的（定时 / 等待 / 推进），交卷 / 提问这类不挂——见 one-shot-tools.ts
+            callerToken: oneshotCallerToken,
+            systemToolNames: oneShotSystemToolNames(scheduled === true),
+            taskId: task.id,
+            // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
+            local: { cwd: effectiveCwd, settingSources: [] },
+          };
+          const openFreshAgent = (): Promise<AgentInstance> =>
+            withSdkDeadline(
+              Agent.create(agentInput),
+              SDK_CREATE_RESUME_TIMEOUT_MS,
+              "Agent.create(oneshot)",
+            );
+          const memoWant = {
+            providerId: oneshotProviderId,
+            modelKey: oneShotModelKey(creds.model),
+            cwd: effectiveCwd,
+          };
+          turn.want = memoWant;
+          // 聊天不是一句一句冷启动：上一轮干净答完的 agent 只 close、记着 agentId，这一轮 resume 把同一段对话接回来。
+          // 换了模型 / 提供方 / 工作目录、或接不回（存储被清 / 会话文件没了）→ 退回新起一个、带完整背景
+          let resumedFrom: OneShotMemory | null = null;
+          let created: AgentInstance | null = null;
+          const prior = peekOneShotMemory(task.id);
+          if (prior) {
+            if (
+              oneShotMemoryMatches(prior, memoWant) &&
+              sessionMatchesProvider(prior.agentId, oneshotProviderId)
+            ) {
+              try {
+                created = await withSdkDeadline(
+                  Agent.resume(prior.agentId, agentInput),
+                  SDK_CREATE_RESUME_TIMEOUT_MS,
+                  "Agent.resume(oneshot)",
+                );
+                resumedFrom = prior;
+              } catch (err) {
+                console.warn(
+                  `[task-runner] task=${task.id} 聊天会话接不回、新起一个：${err instanceof Error ? err.message : String(err)}`,
+                );
+                discardOneShotMemory(task.id);
+              }
+            } else {
+              discardOneShotMemory(task.id);
+            }
+          }
+          if (!created) created = await openFreshAgent();
           agentBox.current = created;
           console.log(
-            `[task-runner] task=${task.id} 问一问兜底 agent 已起 agentId=${created.agentId}`,
+            `[task-runner] task=${task.id} 问一问兜底 agent ${resumedFrom ? "已接回" : "已起"} agentId=${created.agentId}`,
           );
           // V1 / create 返回后复查——stop / 同 gen claim 都不得 send
           if (
@@ -6484,7 +6560,19 @@ export const startOneShotQuestion = (
           });
           // V0.13.x 放开「只读答疑」（用户拍板「纯答疑限制太死」）——疑问就答、
           // 要改就改，只是不推进任务链（本 agent 没有 action 上下文）。
-          const prompt = [
+          const sectionTitle = scheduled ? "# 定时触发的消息" : "# 用户的话";
+          // 定时版没有「疑问 / 小改动」二分类，并明说这条通道没有 schedule 工具（见该常量注释）
+          const boundaryLines: readonly string[] = scheduled
+            ? SCHEDULE_ONE_SHOT_BOUNDARY_LINES
+            : [
+                "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
+                "- 用户要方案 / 要做的是大改动（整段功能 / 跨多文件重构）→ 主导权在你：你判断该正式走一步了，就调 `advance_next` 登记（plan 出方案 / build 实现 / review 复核），本轮说完收尾后系统代用户推进；拿不准、或想先跟用户对齐范围，就在回复里问。用户随时也能自己点「推进」。别在本轮里硬扛大改动",
+                "- `advance_next` 的规矩：你判断用户有这个意思才登记；提测（ship）/ 联调推送（dev）/ 往群里发消息这类对外动作，用户明说才登记，你自己觉得该做就先问；登记 ≠ 现在去做，登记后正常收尾",
+                "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）、推进（advance_next）可以用",
+                "- 不要提交 commit / 提 MR、处理完自然结束回复",
+              ];
+          // 首轮 / 接不回新起的：完整背景 + 群能力 + 边界
+          const fullPrompt = [
             scheduled
               ? `你在任务「${task.title}」里工作。下面是系统按会话里设过的定时自动触发的一条消息（不是用户刚说的话）：按其中你当时留的话处理，不要当成用户在提问或改需求。`
               : `你在任务「${task.title}」里工作。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手；要「之后再做 / 定期看」的事，用 schedule 工具设定时。`,
@@ -6493,19 +6581,25 @@ export const startOneShotQuestion = (
             "",
             ...groupLines,
             "",
-            scheduled ? "# 定时触发的消息" : "# 用户的话",
+            sectionTitle,
             askedText,
             "",
             "# 边界",
-            // 定时版没有「疑问 / 小改动」二分类，并明说这条通道没有 schedule 工具（见该常量注释）
-            ...(scheduled
-              ? SCHEDULE_ONE_SHOT_BOUNDARY_LINES
-              : [
-                  "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
-                  "- 大改动（整段功能 / 跨多文件重构）→ 说明建议、引导用户点「推进」走正式阶段（你没有任务链上下文、别硬扛）",
-                  "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）可以用",
-                  "- 不要提交 commit / 提 MR、处理完自然结束回复",
-                ]),
+            ...boundaryLines,
+          ].join("\n");
+          // 接着上一轮聊：任务背景它已经有了，这一轮只带新的一句 + 边界提醒；
+          // 需求群在两轮之间绑定 / 换过才把群能力那段补发一遍
+          const followPrompt = [
+            scheduled
+              ? "系统又按会话里设过的定时自动触发了一条消息（不是用户刚说的话）：按其中你当时留的话处理，不要当成用户在提问或改需求。"
+              : "用户在任务页接着说了一句话（还是同一段对话，任务背景同前）、按内容处理：疑问就答、修改要求就直接动手；要「之后再做 / 定期看」的事，用 schedule 工具设定时。",
+            "",
+            ...(resumedFrom && resumedFrom.boundChatId !== boundChatId ? [...groupLines, ""] : []),
+            sectionTitle,
+            askedText,
+            "",
+            "# 边界",
+            ...boundaryLines,
           ].join("\n");
           if (
             isTaskOpStale(task.id, admissionOpGen) ||
@@ -6514,30 +6608,63 @@ export const startOneShotQuestion = (
             abortStaleQuietly();
             return null;
           }
-          const perfTracker = createRunPerfTracker({
-            taskId: task.id,
-            agentId: created.agentId,
-            runKind: "question",
-            promptBytes: Buffer.byteLength(prompt, "utf-8"),
-          });
-          const run = await withSdkDeadline(
-            created.send(prompt, {
-              onDelta: composeOnDelta(
-                perfTracker.onDelta,
-                // one-shot 绑 observer handle
-                createShellOutputDeltaPublisher(task.id, () =>
-                  isTaskOpCurrent(oneshotOpHandle),
+          const sendTurn = async (
+            agent: AgentInstance,
+            promptText: string,
+          ): Promise<SessionRun> => {
+            const perfTracker = createRunPerfTracker({
+              taskId: task.id,
+              agentId: agent.agentId,
+              runKind: "question",
+              promptBytes: Buffer.byteLength(promptText, "utf-8"),
+            });
+            const sent = await withSdkDeadline(
+              agent.send(promptText, {
+                onDelta: composeOnDelta(
+                  perfTracker.onDelta,
+                  // one-shot 绑 observer handle
+                  createShellOutputDeltaPublisher(task.id, () =>
+                    isTaskOpCurrent(oneshotOpHandle),
+                  ),
+                  createSdkSummaryDeltaPublisher(task.id, () =>
+                    isTaskOpCurrent(oneshotOpHandle),
+                  ),
                 ),
-                createSdkSummaryDeltaPublisher(task.id, () =>
-                  isTaskOpCurrent(oneshotOpHandle),
-                ),
-              ),
-              onStep: perfTracker.onStep,
-            }),
-            SDK_SEND_TIMEOUT_MS,
-            "agent.send(oneshot)",
-          );
-          perfTracker.attachRun(run);
+                onStep: perfTracker.onStep,
+              }),
+              SDK_SEND_TIMEOUT_MS,
+              "agent.send(oneshot)",
+            );
+            perfTracker.attachRun(sent);
+            return sent;
+          };
+          let run: SessionRun;
+          try {
+            run = await sendTurn(created, resumedFrom ? followPrompt : fullPrompt);
+          } catch (err) {
+            if (!resumedFrom) throw err;
+            // 接回来的会话送不进去（存储被清 / 会话状态坏了）：这条记忆不再信任，关掉它，
+            // 新起一个带完整背景重来——用户这条消息不能因为「接不回」就丢
+            console.warn(
+              `[task-runner] task=${task.id} 接回的聊天会话送不进去、新起一个重来：${err instanceof Error ? err.message : String(err)}`,
+            );
+            discardOneShotMemory(task.id);
+            abortStaleQuietly();
+            resumedFrom = null;
+            if (
+              isTaskOpStale(task.id, admissionOpGen) ||
+              !isTaskOpCurrent(oneshotOpHandle)
+            ) {
+              return null;
+            }
+            created = await openFreshAgent();
+            agentBox.current = created;
+            run = await sendTurn(created, fullPrompt);
+          }
+          // 已经送出去：收尾时（finally）按这一轮是否干净结束决定记下 agent 还是丢掉记忆
+          turn.sent = true;
+          turn.turnsBefore = resumedFrom?.turns ?? 0;
+          turn.boundChatId = boundChatId;
 
           // send resolve 后插桩；失主则 cancel + 关本地、不注册 runningTasks
           await failpoint("oneshot.afterSend");
@@ -6578,6 +6705,9 @@ export const startOneShotQuestion = (
       await consumeSessionRun(task, liveAgent, admitted.run, {
         questionRun: true,
         opHandle: oneshotOpHandle,
+        onQuestionRunFinished: () => {
+          turn.clean = true;
+        },
       });
     } catch (err) {
       // stale / 失主中止路径不写 error（abortStaleQuietly 已处理）
@@ -6631,6 +6761,29 @@ export const startOneShotQuestion = (
         publish(task.id, { kind: "done", task: restored ?? task, ok: false });
       }
     } finally {
+      // 聊天记忆：干净答完 → 记下这一轮的 agentId，下一条消息 Agent.resume 接着聊；
+      // 送出去了但没干净结束（出错 / 被停 / 失主）→ 这条记忆不再信任，下一条冷启动。
+      // 没送出去（早退让位等）→ 什么都没变，不动。记忆是锦上添花，绝不挡收尾
+      try {
+        const live = agentBox.current;
+        if (turn.clean && live && turn.want) {
+          rememberOneShotMemory(
+            task.id,
+            {
+              agentId: live.agentId,
+              ...turn.want,
+              boundChatId: turn.boundChatId,
+              turns: turn.turnsBefore + 1,
+              savedAt: Date.now(),
+            },
+            memEpoch,
+          );
+        } else if (turn.sent) {
+          discardOneShotMemory(task.id);
+        }
+      } catch (memErr) {
+        console.warn(`[task-runner] task=${task.id} 记录聊天会话失败（不影响本轮）：`, memErr);
+      }
       try {
         agentBox.current?.close();
       } catch {

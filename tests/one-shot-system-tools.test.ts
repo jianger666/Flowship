@@ -2,7 +2,8 @@
  * 属主「一次性 agent」（task 页还没有会话 / 任务没推进过时，输入条与定时到点落到的那条通道）的系统工具。
  *
  * 以前这条通道一个系统工具都没挂：任务没推进过就建不了定时（AI 还自称「临时助手」）。现在：
- * - 清单（`ONE_SHOT_SYSTEM_TOOL_NAMES`）只含不依赖 action / notifier 的 `schedule`、`wait`；
+ * - 清单（`ONE_SHOT_SYSTEM_TOOL_NAMES`）只含不依赖 action / notifier 的 `schedule`、`wait`、`advance_next`
+ *   （聊天里的 AI 和正式会话里的 AI 一样握有「要不要往下推进」的主导权；推进起点可以是「还没有 action」）；
  * - 两条后端（Cursor `buildSdkCustomTools` / pi `buildCustomTools`）按 `systemToolNames` 收窄，不传 = 全挂（正式会话不受影响）；
  * - 一次性 agent 运行期间登记自己的 callerToken（`setOneShotCallerToken`），`schedule` 才认它；收尾只摘自己的；
  * - 端到端：一个从没推进过 action 的任务，用一次性 agent 的 token 能建 / 列 / 取消定时。
@@ -18,6 +19,8 @@ import { mkdtempSync, promises as fs, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-oneshot-tools-"));
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
@@ -51,7 +54,8 @@ const { getBrowserTools } = await import("@/lib/server/browser/tools");
 const { __resetBrowserSettingsForTest } = await import("@/lib/server/browser/settings");
 const { installFakeBrowser } = await import("./helpers/browser-bridge-fake");
 const { __buildCustomToolsForTest } = await import("@/lib/server/custom-agent-backend");
-const { ONE_SHOT_SYSTEM_TOOL_NAMES } = await import("@/lib/server/one-shot-tools");
+const { ONE_SHOT_SYSTEM_TOOL_NAMES, ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES, oneShotSystemToolNames } =
+  await import("@/lib/server/one-shot-tools");
 const {
   CALLER_MISMATCH_ERROR,
   clearOneShotCallerTokenIf,
@@ -62,7 +66,9 @@ const {
   cleanupChatTaskState,
 } = await import("@/lib/server/chat-pending");
 const { readSchedules } = await import("@/lib/server/schedule-store");
-const { taskDir } = await import("@/lib/server/task-fs-core");
+const { taskDir, writeMeta } = await import("@/lib/server/task-fs-core");
+const advanceChain = await import("@/lib/server/advance-chain");
+const advanceChainRunner = await import("@/lib/server/advance-chain-runner");
 
 afterAll(() => rmSync(TMP_ROOT, { recursive: true, force: true }));
 beforeEach(() => {
@@ -78,7 +84,6 @@ const ACTION_BOUND = [
   "set_plan_batches",
   "create_custom_action",
   "notify_group_testers",
-  "advance_next",
 ];
 
 interface SdkToolResult {
@@ -88,11 +93,46 @@ interface SdkToolResult {
 const textOf = (r: SdkToolResult): string => r.content.map((c) => c.text ?? "").join("");
 
 describe("清单与收窄（纯函数）", () => {
-  it("一次性 agent 的系统工具只有 schedule / wait，且都真实存在于 flowShipTools", () => {
-    expect([...ONE_SHOT_SYSTEM_TOOL_NAMES].sort()).toEqual(["schedule", "wait"]);
+  it("一次性 agent 的系统工具只有 schedule / wait / advance_next，且都真实存在于 flowShipTools", () => {
+    expect([...ONE_SHOT_SYSTEM_TOOL_NAMES].sort()).toEqual(["advance_next", "schedule", "wait"]);
     const all = flowShipTools.map((t) => t.name);
     for (const n of ONE_SHOT_SYSTEM_TOOL_NAMES) expect(all, n).toContain(n);
     for (const n of ACTION_BOUND) expect(ONE_SHOT_SYSTEM_TOOL_NAMES, n).not.toContain(n);
+  });
+
+  it("定时到点那一轮的清单（R19-01）：只有 schedule / wait，没有 advance_next；按 scheduled 选清单", () => {
+    expect([...ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES].sort()).toEqual(["schedule", "wait"]);
+    const all = flowShipTools.map((t) => t.name);
+    for (const n of ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES) expect(all, n).toContain(n);
+    for (const n of ACTION_BOUND) expect(ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES, n).not.toContain(n);
+    // 它就是用户在场清单去掉 advance_next，不会漏掉别的
+    expect([...ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES]).toEqual(
+      ONE_SHOT_SYSTEM_TOOL_NAMES.filter((n) => n !== "advance_next"),
+    );
+    expect(oneShotSystemToolNames(false)).toBe(ONE_SHOT_SYSTEM_TOOL_NAMES);
+    expect(oneShotSystemToolNames(true)).toBe(ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES);
+  });
+
+  it("定时清单喂给两条后端：Cursor / pi 都挂不出 advance_next（模型根本看不到这个工具）", () => {
+    const sdk = Object.keys(
+      buildSdkCustomTools("tok", { taskId: "tA", systemToolNames: ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES }),
+    );
+    expect(sdk).toContain("schedule");
+    expect(sdk).toContain("wait");
+    expect(sdk).not.toContain("advance_next");
+
+    const pi = (
+      __buildCustomToolsForTest(
+        "tok",
+        TMP_ROOT,
+        { input: { systemToolNames: ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES } } as never,
+        [],
+        "tB",
+      ) as unknown as Array<{ name: string }>
+    ).map((d) => d.name);
+    expect(pi).toContain("schedule");
+    expect(pi).toContain("wait");
+    expect(pi).not.toContain("advance_next");
   });
 
   it("pickSystemTools：不传 = 全挂（正式会话）；传了只留清单里的并保持原顺序；未知名字忽略", () => {
@@ -100,7 +140,7 @@ describe("清单与收窄（纯函数）", () => {
     expect(pickSystemTools().map((t) => t.name)).toEqual(flowShipTools.map((t) => t.name));
 
     const picked = pickSystemTools(ONE_SHOT_SYSTEM_TOOL_NAMES).map((t) => t.name);
-    expect(picked.sort()).toEqual(["schedule", "wait"]);
+    expect(picked.sort()).toEqual(["advance_next", "schedule", "wait"]);
     // 原顺序：flowShipTools 里 wait 在 schedule 前面
     const order = flowShipTools.map((t) => t.name).filter((n) => n === "wait" || n === "schedule");
     expect(pickSystemTools(["schedule", "wait"]).map((t) => t.name)).toEqual(order);
@@ -111,17 +151,17 @@ describe("清单与收窄（纯函数）", () => {
 });
 
 describe("两条后端都按 systemToolNames 收窄", () => {
-  it("Cursor：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait", () => {
+  it("Cursor：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait / advance_next", () => {
     const full = Object.keys(buildSdkCustomTools("tok", { taskId: "tA" }));
     for (const n of ["schedule", "wait", ...ACTION_BOUND]) expect(full, n).toContain(n);
 
     const narrow = Object.keys(
       buildSdkCustomTools("tok", { taskId: "tA", systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES }),
     );
-    expect(narrow.sort()).toEqual(["schedule", "wait"]);
+    expect(narrow.sort()).toEqual(["advance_next", "schedule", "wait"]);
   });
 
-  it("pi：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait，编码工具照常在", () => {
+  it("pi：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait / advance_next，编码工具照常在", () => {
     const names = (input: Record<string, unknown>): string[] =>
       (
         __buildCustomToolsForTest("tok", TMP_ROOT, { input } as never, [], "tB") as unknown as Array<{
@@ -197,7 +237,7 @@ describe("能力面（R10-02）：一次性 agent 带浏览器工具；Cursor �
     expect(getBrowserTools({ taskId: TASK, readOnly: true })).toEqual([]);
   });
 
-  it("Cursor（buildSdkCustomTools）：schedule / wait + 全部浏览器工具，恰好这些；action 绑定的系统工具一个都没有", () => {
+  it("Cursor（buildSdkCustomTools）：schedule / wait / advance_next + 全部浏览器工具，恰好这些；action 绑定的系统工具一个都没有", () => {
     const names = Object.keys(
       buildSdkCustomTools("oneshot-tok", { taskId: TASK, systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES }),
     );
@@ -205,7 +245,7 @@ describe("能力面（R10-02）：一次性 agent 带浏览器工具；Cursor �
     for (const n of ACTION_BOUND) expect(names, n).not.toContain(n);
   });
 
-  it("pi（buildCustomTools）：schedule / wait + 全部浏览器工具 + 编码工具；action 绑定的系统工具一个都没有", () => {
+  it("pi（buildCustomTools）：schedule / wait / advance_next + 全部浏览器工具 + 编码工具；action 绑定的系统工具一个都没有", () => {
     const names = (
       __buildCustomToolsForTest(
         "oneshot-tok",
@@ -220,7 +260,7 @@ describe("能力面（R10-02）：一次性 agent 带浏览器工具；Cursor �
     for (const n of ACTION_BOUND) expect(names, n).not.toContain(n);
   });
 
-  it("Cursor facade（Agent.create）：customTools = schedule / wait + 浏览器工具 + subagent，原生 task 被关；清单不漏进 SDK 入参", async () => {
+  it("Cursor facade（Agent.create）：customTools = schedule / wait / advance_next + 浏览器工具 + subagent，原生 task 被关；清单不漏进 SDK 入参", async () => {
     await Agent.create(oneShotInput as never);
     const arg = mockCursorCreate.mock.calls[0]![0] as Record<string, unknown>;
     const tools = customToolsOf(arg);
@@ -358,5 +398,45 @@ describe("端到端：从没推进过 action 的任务，用一次性 agent 的 
     expect(await call(tools, "schedule", { ...args, title: "x2", message: "y2" })).toBe(CALLER_MISMATCH_ERROR);
     expect(await readSchedules(id)).toHaveLength(1);
     cleanupChatTaskState(id);
+  });
+
+  it("advance_next：聊天里的 AI（登记了 token）在「从没推进过」的任务里能登记自动推进，起点是「还没有 action」；没登记 token 被拒、什么都不登记", async () => {
+    const id = await freshNeverAdvancedTask();
+    await writeMeta({
+      id,
+      title: "聊天里开的任务",
+      mode: "task",
+      repoStatus: "developing",
+      runStatus: "running",
+      currentActionId: null,
+      actions: [],
+      mrs: [],
+      repoPaths: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    } as unknown as TaskMetaV06);
+    const tools = buildSdkCustomTools("oneshot-tok", { taskId: id, systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES });
+    const args = { task_id: id, action: "plan", instruction: "先出个方案" };
+    try {
+      // 对照：没登记 token → 被拒，链表里什么都没有
+      const denied = JSON.parse(await call(tools, "advance_next", args)) as { ok: boolean };
+      expect(denied.ok).toBe(false);
+      expect(advanceChain.peekAdvanceChain(id)).toBeNull();
+
+      setOneShotCallerToken(id, "oneshot-tok");
+      const ok = JSON.parse(await call(tools, "advance_next", args)) as { ok: boolean; error?: string };
+      expect(ok.error).toBeUndefined();
+      expect(ok.ok).toBe(true);
+      expect(advanceChain.peekAdvanceChain(id)).toMatchObject({
+        taskId: id,
+        fromActionId: null,
+        actionType: "plan",
+        instruction: "先出个方案",
+      });
+    } finally {
+      advanceChain.__resetAdvanceChainStateForTest();
+      advanceChainRunner.__uninstallAdvanceChainConsumerForTest();
+      cleanupChatTaskState(id);
+    }
   });
 });

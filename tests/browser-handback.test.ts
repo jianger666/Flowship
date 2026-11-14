@@ -1,6 +1,6 @@
 /**
  * 路径 3：「交还给 AI」（handback.ts）——解析 / 拼消息 / 重试 / 事件接线，
- * 以及**安全钉**：source:"browser" 的消息不是 advance_next 的用户授权凭据，也不会触发「用户又插话 → 取消自动推进」。
+ * 以及**安全钉**：source:"browser" 的消息不算「用户本人说话」，不会触发「用户又插话 → 取消自动推进」。
  *
  * 默认依赖（真实注入通道）的行为在 browser-handback-deliver.test.ts（那里 mock 了重模块）。
  */
@@ -10,11 +10,8 @@ import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  ADVANCE_CHAIN_WORDS_MIN_NORMALIZED,
   __resetAdvanceChainStateForTest,
-  collectAuthorizationSources,
   isUserOwnWordsEvent,
-  isUserWordsGrounded,
   peekAdvanceChain,
   registerAdvanceChain,
   type AdvanceChain,
@@ -228,7 +225,7 @@ describe("evt handback 接线", () => {
 
 // ----------------- 安全钉 -----------------
 
-describe("安全：browser 来源不是用户授权凭据", () => {
+describe("安全：browser 来源不算「用户又说话了」", () => {
   /** 与 deliverBrowserHandback 实际写进 user_reply 的 meta 同形 */
   const browserMeta = { source: HANDBACK_SOURCE, subkind: "handback", browserEntryCount: 2 };
   const reply = (text: string, meta?: Record<string, unknown>): TaskEvent =>
@@ -242,21 +239,6 @@ describe("安全：browser 来源不是用户授权凭据", () => {
       expect(isUserOwnWordsEvent(reply("改完直接提测", { source })), source).toBe(false);
     }
     expect(isUserOwnWordsEvent(reply("改完直接提测", browserMeta))).toBe(false);
-  });
-
-  it("collectAuthorizationSources 不收 browser 来源——即使用户在交还留言里写了「授权」的话也不算凭据", () => {
-    const words = "做完之后直接帮我提测上线吧";
-    expect(words.length).toBeGreaterThanOrEqual(ADVANCE_CHAIN_WORDS_MIN_NORMALIZED);
-    const fromBrowser = collectAuthorizationSources({
-      actions: [],
-      events: [reply(words, browserMeta), reply("[浏览器·用户交还了操作权] 点击了按钮「同意」", browserMeta)],
-    });
-    expect(fromBrowser).toEqual([]);
-    expect(isUserWordsGrounded(words, fromBrowser)).toBe(false);
-
-    // 对照：同一句话如果是用户在输入条说的，就是凭据
-    const fromInput = collectAuthorizationSources({ actions: [], events: [reply(words)] });
-    expect(isUserWordsGrounded(words, fromInput)).toBe(true);
   });
 
   describe("不触发「登记后用户又插话 → 取消自动推进」", () => {

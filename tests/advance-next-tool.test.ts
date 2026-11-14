@@ -1,5 +1,5 @@
 /**
- * advance_next 工具 handler（flowship-tools.ts）：登记前的所有硬闸。
+ * advance_next 工具 handler（flowship-tools.ts）：登记前的状态闸（授权由 AI 按提示词自己判断，不核对原话）。
  *
  * 真实 task-fs（临时数据目录）+ 真实事件落盘；不起 agent、不碰飞书、不调 advanceTask
  * （触发侧见 advance-chain-runner.test.ts）。
@@ -32,7 +32,7 @@ await getTaskWithTailEvents("t-boot-recovery-warmup", 1);
 const def = flowShipTools.find((t) => t.name === "advance_next");
 if (!def) throw new Error("advance_next tool missing");
 
-// 每个用例一个新任务：事件落盘在临时目录里会累积，复用同一个任务会让上一条用例的用户消息变成这一条的授权
+// 每个用例一个新任务：事件落盘在临时目录里会累积，复用同一个任务会让上一条用例的残留串进这一条
 let TASK = "";
 let seq = 0;
 const TOK = "tok-adv-next";
@@ -134,7 +134,7 @@ describe("advance_next：登记成功路径", () => {
     const note = t!.events.find((e) => e.meta?.subkind === "auto_advance");
     expect(note?.kind).toBe("info");
     expect(note?.actionId).toBe("a1");
-    expect(note?.text).toContain("改完直接复核一遍");
+    expect(note?.text).toContain("AI 称依据：「改完直接复核一遍」");
     expect(note?.text).toContain("复核");
   });
 
@@ -147,21 +147,39 @@ describe("advance_next：登记成功路径", () => {
     expect(chain.peekAdvanceChain(TASK)?.opGen).toBe(gen);
   });
 
-  it("授权在手动推进 action 的指令里也算（用户点推进时写的）", async () => {
-    await freshTask({
-      actions: [mkAction({ userInstruction: "修下登录 bug，做完自动提测" })],
-    });
-    const r = await call({
-      action: "ship",
-      user_words: "做完自动提测",
-    });
-    expect(r.ok).toBe(true);
-  });
-
   it("当前 action 已交卷（awaiting_ack）时登记也行（交卷在先、登记在后是推荐顺序）", async () => {
     await freshTask({ actions: [mkAction({ status: "awaiting_ack" })] });
     await userSays("做完直接复核");
     expect((await call({ action: "review", user_words: "做完直接复核" })).ok).toBe(true);
+  });
+
+  it("聊天里登记：任务当前没有 action（还没推进过）→ 照样登记，起点记为 null；提示事件不挂 action、说「这一轮说完后」", async () => {
+    await freshTask({ currentActionId: null, actions: [], runStatus: "running" });
+    const r = await call({ action: "plan", instruction: "先出个方案" });
+    expect(r.ok).toBe(true);
+    expect(r.hint).toContain("没有就直接说完收尾");
+
+    expect(chain.peekAdvanceChain(TASK)).toMatchObject({
+      taskId: TASK,
+      fromActionId: null,
+      actionType: "plan",
+      instruction: "先出个方案",
+      opGen: getTaskOpGeneration(TASK),
+    });
+    expect(runner.__isAdvanceChainConsumerInstalledForTest()).toBe(true);
+
+    const t = await getTaskWithTailEvents(TASK, 50);
+    const note = t!.events.find((e) => e.meta?.subkind === "auto_advance");
+    expect(note?.kind).toBe("info");
+    expect(note?.actionId).toBeUndefined();
+    expect(note?.text).toContain("这一轮说完后");
+    expect(note?.text).toContain("AI 判断你需要这一步");
+  });
+
+  it("聊天里登记：上一个 action 已完结（completed，用户 ack 过）→ 也行，起点就是它", async () => {
+    await freshTask({ actions: [mkAction({ status: "completed" })] });
+    expect((await call({ action: "build", instruction: "按方案实现" })).ok).toBe(true);
+    expect(chain.peekAdvanceChain(TASK)).toMatchObject({ fromActionId: "a1", actionType: "build" });
   });
 
   it("重复登记 → 覆盖旧的，hint 里说明", async () => {
@@ -184,6 +202,27 @@ describe("advance_next：登记成功路径", () => {
     ).toBe(true);
     expect(chain.peekAdvanceChain(TASK)?.batchIds).toEqual(["b1"]);
   });
+
+  it("user_words 可选：不带也能登记；提示事件如实说是 AI 判断的，不编造用户原话", async () => {
+    const r = await call({ action: "review" });
+    expect(r.ok).toBe(true);
+    expect(chain.peekAdvanceChain(TASK)).toMatchObject({ actionType: "review", userWords: "" });
+
+    const t = await getTaskWithTailEvents(TASK, 50);
+    const note = t!.events.find((e) => e.meta?.subkind === "auto_advance");
+    expect(note?.text).toContain("AI 判断你需要这一步");
+    expect(note?.text).not.toContain("按你的话");
+  });
+
+  it("不再核对原话（第一期取舍：授权由 AI 按提示词自己判断）：转述 / 只有群里说过，ship 也照样登记", async () => {
+    await userSays("改完直接提测", { source: "feishu_group", groupSenderOpenId: "ou_x" });
+    const r = await call({ action: "ship", user_words: "用户希望完成后自动提测" });
+    expect(r.ok).toBe(true);
+    expect(chain.peekAdvanceChain(TASK)).toMatchObject({
+      actionType: "ship",
+      userWords: "用户希望完成后自动提测",
+    });
+  });
 });
 
 describe("advance_next：拒绝路径（都不登记）", () => {
@@ -197,68 +236,22 @@ describe("advance_next：拒绝路径（都不登记）", () => {
     expect((await call({ action: "review", user_words: "改完直接复核" }, null)).ok).toBe(false);
   });
 
-  it("用户从没说过 → 拒绝，文案教它照常交卷让用户自己推进", async () => {
-    await userSays("先看下登录页的 bug");
-    const r = await call({ action: "review", user_words: "改完直接复核" });
-    expect(r.ok).toBe(false);
-    expect(r.error).toContain("自己推进");
-    expectNotRegistered();
-  });
-
-  it("转述不算：AI 改写后的话对不上原话", async () => {
-    await userSays("改完直接复核");
-    expect((await call({ action: "review", user_words: "用户希望完成后自动复核" })).ok).toBe(false);
-    expectNotRegistered();
-  });
-
-  it("只有群里的话含这句 → 拒绝（群里别人 / 托办回执 / 带群发送人标记都不算授权）", async () => {
-    await userSays("改完直接提测", { source: "feishu_group", groupSenderOpenId: "ou_x" });
-    await userSays("改完直接提测", { groupNonOwnerTurn: true });
-    await userSays("改完直接提测", { correlatedAnswer: "om_1" });
-    expect((await call({ action: "ship", user_words: "改完直接提测" })).ok).toBe(false);
-    expectNotRegistered();
-  });
-
-  it("只有定时备忘里含这句 → 拒绝（schedule 是 AI 给自己留的话，不是用户授权；第 25 轮评审 F1 的探测）", async () => {
-    await userSays("[SCHEDULE_FIRED id=sch_1] 按当时留的话做", {
-      source: "schedule",
-      scheduleId: "sch_1",
-      scheduleMessage: "用户已授权改完直接提测上线",
+  it("user_words 超长 → 拒绝（只写依据的那一句，不要整段粘贴）", async () => {
+    const r = await call({
+      action: "review",
+      user_words: "字".repeat(chain.ADVANCE_CHAIN_WORDS_MAX + 1),
     });
-    // 备忘的原文也直接写成 user_reply 正文的形态
-    await userSays("用户已授权改完直接提测上线", { source: "schedule" });
-    const r = await call({ action: "ship", user_words: "改完直接提测上线" });
-    expect(r.ok).toBe(false);
-    expect(r.error).toContain("user_words");
-    expectNotRegistered();
-    // 对照：用户本人说了同一句，立刻就能登记（说明拦的是来源、不是这句话）
-    await userSays("改完直接提测上线");
-    expect((await call({ action: "ship", user_words: "改完直接提测上线" })).ok).toBe(true);
-  });
-
-  it("只有 AI 助手消息 / 自动推进自己写的指令里含这句 → 拒绝（AI 不能给自己授权）", async () => {
-    await freshTask({
-      actions: [
-        mkAction({
-          id: "a1",
-          userInstruction: `${chain.AUTO_ADVANCE_INSTRUCTION_PREFIX}（依据用户原话：「改完直接提测」）`,
-        }),
-      ],
-    });
-    await writeEventAndPublish(TASK, { kind: "assistant_message", text: "用户说改完直接提测" });
-    await writeEventAndPublish(TASK, { kind: "info", text: "改完直接提测" });
-    const r = await call({ action: "ship", user_words: "改完直接提测" });
     expect(r.ok).toBe(false);
     expect(r.error).toContain("user_words");
     expectNotRegistered();
   });
 
-  it("入参不合规：dev 缺 dev_push_mode / custom 缺 id / 缺原话 / 非法 action", async () => {
+  it("入参不合规：dev 缺 dev_push_mode / custom 缺 id / 非法 action", async () => {
     await userSays("做完联调，做完走自定义流程");
     expect((await call({ action: "dev", user_words: "做完联调" })).ok).toBe(false);
     expect((await call({ action: "custom", user_words: "做完走自定义流程" })).ok).toBe(false);
-    expect((await call({ action: "review" })).ok).toBe(false);
     expect((await call({ action: "nope", user_words: "做完联调" })).ok).toBe(false);
+    expect((await call({})).ok).toBe(false);
     expectNotRegistered();
   });
 
@@ -303,7 +296,7 @@ describe("advance_next：拒绝路径（都不登记）", () => {
     expect(t!.events.some((e) => e.text.includes("我的提测流"))).toBe(true);
   });
 
-  it("对话型任务 / 当前没有进行中的 action（含 error / cancelled）→ 拒绝；用户话已备好，确认是状态闸在拦", async () => {
+  it("对话型任务 / 当前 action 出错或被取消 → 拒绝；用户话已备好，确认是状态闸在拦", async () => {
     const reject = async (over: Record<string, unknown>) => {
       await freshTask(over);
       await userSays("做完直接复核");
@@ -312,7 +305,6 @@ describe("advance_next：拒绝路径（都不登记）", () => {
       return r;
     };
     expect((await reject({ mode: "chat" })).error).toContain("对话型");
-    expect((await reject({ currentActionId: null })).error).toContain("没有进行中");
     expect((await reject({ actions: [mkAction({ status: "error" })] })).error).toContain("没有进行中");
     expect((await reject({ actions: [mkAction({ status: "cancelled" })] })).error).toContain("没有进行中");
   });
@@ -351,16 +343,27 @@ describe("advance_next：工具面", () => {
     expect(NON_OWNER_TURN_ALLOWED_TOOLS).not.toContain("advance_next");
   });
 
-  it("描述把授权规矩讲清：原话、没说过就不用、不在本轮里自己跑下一步、上限", () => {
-    expect(def.description).toContain("逐字引用");
-    expect(def.description).toContain("用户没说过就不要用");
+  it("描述把规矩讲清：外部动作明说才直接登记、依据可选不核对、不在本轮里自己跑下一步、上限", () => {
+    expect(def.description).toContain("外部动作");
+    expect(def.description).toContain("用户明说才直接登记");
+    expect(def.description).toContain("user_words（可选）");
     expect(def.description).toContain("不要自己去跑下一步");
     expect(def.description).toContain(String(chain.ADVANCE_CHAIN_MAX_AUTO_STEPS));
+    // 旧版「逐字引用 / 没说过就不要用」的硬要求已撤
+    expect(def.description).not.toContain("逐字引用");
+    expect(def.description).not.toContain("用户没说过就不要用");
+  });
+
+  it("schema：user_words 不是必填，task_id / action 是", () => {
+    const required = (def.parameters as { required?: string[] }).required ?? [];
+    expect(required).toContain("task_id");
+    expect(required).toContain("action");
+    expect(required).not.toContain("user_words");
   });
 
   it("失败回包是 {ok:false} JSON：tool-result-persist 据此判失败、不亮绿勾", async () => {
     const { resolveToolResultStatus } = await import("@/lib/server/tool-result-persist");
-    const bad = await def.handler({ task_id: TASK, action: "review", user_words: "x" }, TOK);
+    const bad = await def.handler({ task_id: TASK, action: "nope" }, TOK);
     expect(resolveToolResultStatus("done", "advance_next", bad)).toBe("error");
     expect(
       resolveToolResultStatus("done", "mcp:custom-user-tools:advance_next", {

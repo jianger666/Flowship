@@ -161,7 +161,8 @@ describe("接线契约", () => {
     expect(src).toMatch(/const editHandler = onEditInPlace \?\? onResend;/);
     // 编辑态与「发送」都以 editHandler 为准（不是只认 onResend）
     expect(src).toMatch(/if \(editing && editHandler\) \{/);
-    expect(src).toMatch(/const ok = await runEdit\(trimmed, ev\);/);
+    // 发送带的是编辑框（user-edit-form）里最终的正文 + 图：见 tests/user-edit-images.test.ts
+    expect(src).toMatch(/const ok = await runEdit\(text, ev, images\);/);
     // （定时触发的消息不是用户说的话，另加 `!isScheduleMsg &&` 不给编辑 / 重发——见 schedule-wiring-contract；
     //  并入同会话的群成员的话同理加 `!isNonOwnerGroupMsg &&`）
     expect(src).toMatch(
@@ -198,7 +199,7 @@ describe("接线契约", () => {
     expect(iYield).toBeGreaterThan(iRewind);
     expect(iSend).toBeGreaterThan(iYield);
     // 发的是编辑后的文本，不是原文
-    expect(body).toMatch(/\.\.\.sourceEv,\s*text,/);
+    expect(body).toMatch(/\{\s*\.\.\.sourceEv,\s*text\s*\}/);
     expect(body).toMatch(/onUserReplyRef\.current\?\.\(\s*text,/);
     // 回退没成功不发
     expect(body).toMatch(/if \(rewound !== "ok"\) return false;/);

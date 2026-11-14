@@ -38,6 +38,8 @@ export const ROW_VIEW_FIELD = {
   // 用户消息原地编辑：是否在编辑 + 草稿（R4-05）
   userEditing: "user:editing",
   userEditDraft: "user:editDraft",
+  // 用户消息原地编辑：用户是否亲手把编辑框里的图全删了（图本身在附件快照里、见 lib/user-edit-images）
+  userEditImagesCleared: "user:editImagesCleared",
 } as const;
 
 export type RowViewField = (typeof ROW_VIEW_FIELD)[keyof typeof ROW_VIEW_FIELD];
@@ -70,11 +72,12 @@ export const eventRowViewKey = (
   field: RowViewField,
 ): string => rowViewStateKey(taskId, eventId, field);
 
-/** 用户消息原地编辑的两个状态 key（是否在编辑、草稿） */
+/** 用户消息原地编辑的三个状态 key（是否在编辑、草稿、用户是否亲手把图全删了） */
 export const userEditViewKeys = (
   taskId: string,
   eventId: string,
-): { editing: string; draft: string } => ({
+): { editing: string; draft: string; imagesCleared: string } => ({
   editing: eventRowViewKey(taskId, eventId, ROW_VIEW_FIELD.userEditing),
   draft: eventRowViewKey(taskId, eventId, ROW_VIEW_FIELD.userEditDraft),
+  imagesCleared: eventRowViewKey(taskId, eventId, ROW_VIEW_FIELD.userEditImagesCleared),
 });

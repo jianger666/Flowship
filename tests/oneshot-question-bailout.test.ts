@@ -32,12 +32,20 @@ const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-oneshot-bailout-"));
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockCreate = vi.fn();
+const mockResume = vi.fn();
 vi.mock("@cursor/sdk", () => ({
   Agent: {
     create: (...args: unknown[]) => mockCreate(...args),
-    resume: vi.fn(),
+    resume: (...args: unknown[]) => mockResume(...args),
   },
 }));
+
+// 需求群号：默认没绑（和以前一致）；聊天记忆那组用例里按需改，验证「两轮之间绑了群 → 接续提示补群能力」
+let mockBoundChatId: string | null = null;
+vi.mock("@/lib/server/feishu-group", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/server/feishu-group")>();
+  return { ...actual, getBoundGroupChatId: async () => mockBoundChatId };
+});
 
 vi.mock("@/lib/server/mcp-oauth", () => ({
   enrichMcpServersWithOAuth: async <T>(servers: T) => servers,
@@ -83,7 +91,14 @@ const {
   getExpectedCallerToken,
   setOneShotCallerToken,
 } = await import("@/lib/server/chat-pending");
-const { startOneShotQuestion } = await import("@/lib/server/task-runner");
+const { installSessionIfCurrent, startOneShotQuestion } = await import("@/lib/server/task-runner");
+const {
+  __resetOneShotMemoryForTest,
+  getOneShotMemoryEpoch,
+  invalidateOneShotMemory,
+  peekOneShotMemory,
+} = await import("@/lib/server/oneshot-session-memory");
+const { SCHEDULE_ONE_SHOT_BOUNDARY_LINES } = await import("@/lib/schedule");
 const { getTask, setTaskRunStatus } = await import("@/lib/server/task-fs");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
@@ -181,12 +196,25 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
    * 读快照 → 盘上写 running → fire-and-forget 起 one-shot。
    * 传进去的 task 快照带的是**提问前**的 runStatus（prevRunStatus 的来源）。
    */
-  const startLikeRoute = async (id: string) => {
+  const startLikeRoute = async (
+    id: string,
+    text = "这个接口啥时候好？",
+    opts: { creds?: typeof CREDS; scheduled?: boolean } = {},
+  ) => {
     const snapshot = (await getTask(id))!;
     await setTaskRunStatus(id, "running");
     seen = [];
+    unsub?.();
     unsub = subscribeTaskStream(id, (ev) => seen.push(ev));
-    startOneShotQuestion(snapshot, "这个接口啥时候好？", undefined, CREDS);
+    startOneShotQuestion(
+      snapshot,
+      text,
+      undefined,
+      opts.creds ?? CREDS,
+      undefined,
+      undefined,
+      opts.scheduled,
+    );
   };
 
   const lastDone = (): Extract<TaskStreamEvent, { kind: "done" }> | undefined =>
@@ -196,6 +224,9 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
 
   beforeEach(() => {
     mockCreate.mockReset();
+    mockResume.mockReset();
+    mockBoundChatId = null;
+    __resetOneShotMemoryForTest();
     seen = [];
   });
 
@@ -261,16 +292,298 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
       "set_plan_batches",
       "create_custom_action",
       "notify_group_testers",
-      "advance_next",
     ]) {
       expect(toolNames, `一次性 agent 不该有 ${forbidden}`).not.toContain(forbidden);
     }
+    // 聊天里的 AI 和正式会话里的 AI 一样握有推进的主导权：带 advance_next，提示词里写明怎么用
+    expect(toolNames).toContain("advance_next");
+    expect(prompt).toContain("主导权在你");
+    expect(prompt).toContain("`advance_next`");
+    expect(prompt).toContain("用户随时也能自己点「推进」");
+    expect(prompt).not.toContain("你没有任务链上下文");
     // 身份：不再自称「临时助手」
     expect(prompt).not.toContain("临时助手");
 
     expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
     expect(lastDone()?.ok).toBe(true);
     expect(runningTasks.has(id)).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // 聊天记忆：不是一句一句冷启动（oneshot-session-memory.ts）
+  // 干净答完 → 记下 agentId 并 close；下一条消息 Agent.resume 接回同一段对话，只带新的一句
+  // ─────────────────────────────────────────────────────────────
+
+  /** 跑完一轮：起一个 agent（create 或 resume 由调用方先装好 mock），等到收尾 */
+  const runTurn = async (
+    id: string,
+    text: string,
+    opts: { creds?: typeof CREDS; scheduled?: boolean } = {},
+  ): Promise<void> => {
+    await startLikeRoute(id, text, opts);
+    await waitUntil(() => !isTaskStarting(id));
+  };
+
+  it("第二条消息：Agent.resume 接回上一轮的 agent，只带新的一句（完整背景只在首轮）；工具面不变", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    mockCreate.mockResolvedValueOnce(first);
+
+    await runTurn(id, "先帮我看看登录页");
+    const firstPrompt = first.send.mock.calls[0]?.[0] as string;
+    expect(firstPrompt).toContain("# 任务背景");
+    expect(firstPrompt).toContain("先帮我看看登录页");
+    // 答完照旧关掉（不占内存），但记下了 agentId
+    expect(first.close).toHaveBeenCalled();
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_a", turns: 1, boundChatId: null });
+
+    const second = makeFakeAgent("agent_chat_a");
+    mockResume.mockResolvedValueOnce(second);
+    await runTurn(id, "那顺手把按钮改成蓝色");
+
+    expect(mockResume).toHaveBeenCalledTimes(1);
+    expect(mockResume.mock.calls[0]?.[0]).toBe("agent_chat_a");
+    expect(mockCreate).toHaveBeenCalledTimes(1); // 只有首轮 create
+    const resumeArg = mockResume.mock.calls[0]?.[1] as {
+      local?: { settingSources?: unknown[]; customTools?: Record<string, unknown> };
+    };
+    expect(resumeArg.local?.settingSources).toEqual([]);
+    const tools = Object.keys(resumeArg.local?.customTools ?? {});
+    for (const name of ["schedule", "wait", "advance_next"]) expect(tools).toContain(name);
+    expect(tools).not.toContain("submit_work");
+
+    const follow = second.send.mock.calls[0]?.[0] as string;
+    expect(follow).toContain("那顺手把按钮改成蓝色");
+    expect(follow).toContain("接着说了一句话");
+    expect(follow).toContain("# 边界");
+    expect(follow).toContain("主导权在你");
+    expect(follow).not.toContain("# 任务背景");
+    expect(follow).not.toContain("# 本任务的需求群");
+    // 又干净答完：轮数累加、这一轮也关掉
+    expect(second.close).toHaveBeenCalled();
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_a", turns: 2 });
+    expect(lastDone()?.ok).toBe(true);
+    expect((await readMetaV06(id))?.runStatus).toBe("awaiting_user");
+  });
+
+  it("接不回（resume 抛错：存储被清 / 会话文件没了）→ 新起一个、带完整背景；这条消息不丢、记忆换成新的", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    const fresh = makeFakeAgent("agent_chat_b");
+    mockCreate.mockResolvedValueOnce(first).mockResolvedValueOnce(fresh);
+    await runTurn(id, "先帮我看看登录页");
+
+    mockResume.mockRejectedValueOnce(new Error("AgentNotFoundError"));
+    await runTurn(id, "接着改一下");
+
+    expect(mockResume).toHaveBeenCalledTimes(1);
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+    const prompt = fresh.send.mock.calls[0]?.[0] as string;
+    expect(prompt).toContain("# 任务背景");
+    expect(prompt).toContain("接着改一下");
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_b", turns: 1 });
+    expect(lastDone()?.ok).toBe(true);
+  });
+
+  it("接回来了却送不进去（send 抛错）→ 关掉它、新起一个带完整背景重来；用户这条不丢", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    const fresh = makeFakeAgent("agent_chat_c");
+    mockCreate.mockResolvedValueOnce(first).mockResolvedValueOnce(fresh);
+    await runTurn(id, "先帮我看看登录页");
+
+    const broken = makeFakeAgent("agent_chat_a");
+    broken.send.mockRejectedValueOnce(new Error("session state broken"));
+    mockResume.mockResolvedValueOnce(broken);
+    await runTurn(id, "接着改一下");
+
+    expect(broken.close).toHaveBeenCalled();
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+    const prompt = fresh.send.mock.calls[0]?.[0] as string;
+    expect(prompt).toContain("# 任务背景");
+    expect(prompt).toContain("接着改一下");
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_c", turns: 1 });
+    expect(lastDone()?.ok).toBe(true);
+  });
+
+  it("换了模型（会话模型锁死换不了）→ 不接，直接新起；记忆换成新模型的", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    const other = makeFakeAgent("agent_chat_d");
+    mockCreate.mockResolvedValueOnce(first).mockResolvedValueOnce(other);
+    await runTurn(id, "先帮我看看登录页");
+
+    await runTurn(id, "换个模型继续", { creds: { apiKey: "k", model: { id: "m2", params: [] as never[] } } });
+
+    expect(mockResume).not.toHaveBeenCalled();
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+    expect(other.send.mock.calls[0]?.[0] as string).toContain("# 任务背景");
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_d", turns: 1 });
+  });
+
+  it("这一轮没干净结束（run 报错）→ 记忆丢弃，下一条冷启动、不去 resume 一个可能坏掉的会话", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    mockCreate.mockResolvedValueOnce(first);
+    await runTurn(id, "先帮我看看登录页");
+    expect(peekOneShotMemory(id)).not.toBeNull();
+
+    const failing = makeFakeAgent("agent_chat_a");
+    failing.wait.mockResolvedValue({ status: "error" as const });
+    mockResume.mockResolvedValueOnce(failing);
+    await runTurn(id, "接着改一下");
+    expect(lastDone()?.ok).toBe(false);
+    expect(peekOneShotMemory(id)).toBeNull();
+
+    const fresh = makeFakeAgent("agent_chat_e");
+    mockCreate.mockResolvedValueOnce(fresh);
+    await runTurn(id, "再试一次");
+    expect(mockResume).toHaveBeenCalledTimes(1); // 只有上面那次，这次没再去接
+    expect(fresh.send.mock.calls[0]?.[0] as string).toContain("# 任务背景");
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_e", turns: 1 });
+  });
+
+  it("正式会话装进来（action 开始）→ 记忆作废；在飞的旧一轮晚收尾也写不回去", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    mockCreate.mockResolvedValueOnce(first);
+    await runTurn(id, "先帮我看看登录页");
+    expect(peekOneShotMemory(id)).not.toBeNull();
+
+    // 正式会话安装点：lease 通过 = 真装进去，聊天记忆随之作废
+    const installed = installSessionIfCurrent(
+      () => true,
+      id,
+      {
+        instanceId: allocTaskRunInstanceId(),
+        agent: makeFakeAgent("agent_formal") as never,
+        agentId: "agent_formal",
+        createdAt: Date.now(),
+        lastActiveAt: Date.now(),
+        startSnapshot: { title: "登录优化" },
+      } as never,
+      {
+        taskActionHandler: (async () => ({ ok: true })) as never,
+        awaitingNotifier: (async () => {}) as never,
+      } as never,
+      "tok-formal",
+    );
+    expect(installed).toBe(true);
+    expect(peekOneShotMemory(id)).toBeNull();
+    // lease 不过 = 什么都没装，记忆也不动
+    agentSessions.delete(id);
+    cleanupChatTaskState(id);
+    const again = makeFakeAgent("agent_chat_f");
+    mockCreate.mockResolvedValueOnce(again);
+    await runTurn(id, "回到聊天");
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_f" });
+    expect(installSessionIfCurrent(() => false, id, {} as never, {} as never, "x")).toBe(false);
+    expect(peekOneShotMemory(id)).toMatchObject({ agentId: "agent_chat_f" });
+
+    // 竞态：这一轮还在飞时正式 action 开始了（invalidate），它晚一步干净收尾也不能把过期记忆写回去
+    let release!: () => void;
+    const gate = new Promise<{ status: "finished" }>((resolve) => {
+      release = () => resolve({ status: "finished" });
+    });
+    const slow = makeFakeAgent("agent_chat_a");
+    slow.wait.mockImplementation(() => gate);
+    mockResume.mockResolvedValueOnce(slow);
+    const epochAtEntry = getOneShotMemoryEpoch(id);
+    await startLikeRoute(id, "慢一点的一轮");
+    await waitUntil(() => slow.send.mock.calls.length > 0);
+    invalidateOneShotMemory(id);
+    expect(getOneShotMemoryEpoch(id)).toBe(epochAtEntry + 1);
+    release();
+    await waitUntil(() => !isTaskStarting(id));
+    expect(lastDone()?.ok).toBe(true);
+    expect(peekOneShotMemory(id)).toBeNull();
+  });
+
+  it("两轮之间绑了需求群 → 接续提示补发群能力那段；没变就不重复", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    mockCreate.mockResolvedValueOnce(first);
+    await runTurn(id, "先帮我看看登录页");
+    expect(first.send.mock.calls[0]?.[0] as string).not.toContain("oc_chat_1");
+
+    mockBoundChatId = "oc_chat_1";
+    const second = makeFakeAgent("agent_chat_a");
+    mockResume.mockResolvedValueOnce(second);
+    await runTurn(id, "把群里的人叫上");
+    const follow = second.send.mock.calls[0]?.[0] as string;
+    expect(follow).toContain("# 本任务的需求群");
+    expect(follow).toContain("oc_chat_1");
+    expect(follow).not.toContain("# 任务背景");
+    expect(peekOneShotMemory(id)).toMatchObject({ boundChatId: "oc_chat_1", turns: 2 });
+
+    const third = makeFakeAgent("agent_chat_a");
+    mockResume.mockResolvedValueOnce(third);
+    await runTurn(id, "再说一句");
+    expect(third.send.mock.calls[0]?.[0] as string).not.toContain("# 本任务的需求群");
+  });
+
+  it("定时到点的轮次也能接回同一段对话：接续提示用定时版措辞和边界；这一轮的工具里没有 advance_next（R19-01），用户的下一轮又有", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const first = makeFakeAgent("agent_chat_a");
+    mockCreate.mockResolvedValueOnce(first);
+    await runTurn(id, "明早提醒我看周报");
+
+    const second = makeFakeAgent("agent_chat_a");
+    mockResume.mockResolvedValueOnce(second);
+    await runTurn(id, "[SCHEDULE_FIRED id=s1] 提醒用户看周报", { scheduled: true });
+    const follow = second.send.mock.calls[0]?.[0] as string;
+    expect(follow).toContain("系统又按会话里设过的定时自动触发了一条消息");
+    expect(follow).toContain("# 定时触发的消息");
+    expect(follow).toContain("这里没有 `advance_next`");
+    for (const line of SCHEDULE_ONE_SHOT_BOUNDARY_LINES) expect(follow).toContain(line);
+    expect(follow).not.toContain("# 任务背景");
+    expect(mockResume).toHaveBeenCalledTimes(1);
+    // 代码层面：resume 按本轮入参重建工具，定时轮次拿到的是「没有 advance_next」的清单
+    const scheduledTools = Object.keys(
+      (mockResume.mock.calls[0]?.[1] as { local?: { customTools?: Record<string, unknown> } }).local
+        ?.customTools ?? {},
+    );
+    expect(scheduledTools).toContain("schedule");
+    expect(scheduledTools).toContain("wait");
+    expect(scheduledTools).not.toContain("advance_next");
+
+    // 定时轮次之后用户接着说话：同一段会话，advance_next 又回来了（不会被上一轮的清单带偏）
+    const third = makeFakeAgent("agent_chat_a");
+    mockResume.mockResolvedValueOnce(third);
+    await runTurn(id, "周报我看了，帮我出个方案吧");
+    expect(mockResume).toHaveBeenCalledTimes(2);
+    const userTools = Object.keys(
+      (mockResume.mock.calls[1]?.[1] as { local?: { customTools?: Record<string, unknown> } }).local
+        ?.customTools ?? {},
+    );
+    expect(userTools).toContain("advance_next");
+  });
+
+  it("定时到点是第一轮（没有可接回的记忆）→ 新起的 agent 也没有 advance_next", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+    const fresh = makeFakeAgent("agent_sched_first");
+    mockCreate.mockResolvedValueOnce(fresh);
+    await runTurn(id, "[SCHEDULE_FIRED id=s2] 看下 CI", { scheduled: true });
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    const tools = Object.keys(
+      (mockCreate.mock.calls[0]?.[0] as { local?: { customTools?: Record<string, unknown> } }).local
+        ?.customTools ?? {},
+    );
+    expect(tools).toContain("schedule");
+    expect(tools).toContain("wait");
+    expect(tools).not.toContain("advance_next");
+    const prompt = fresh.send.mock.calls[0]?.[0] as string;
+    expect(prompt).toContain("这里没有 `advance_next`");
   });
 
   // ─────────────────────────────────────────────────────────────

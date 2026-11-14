@@ -3,19 +3,29 @@
  *
  * # 它是什么
  *
- * 给 AI 一个 `advance_next` 工具：**用户在话里说了「做完直接 xx / 改完再复核 / 没问题就提测」**，
- * AI 在本 action 交卷后登记一条「链」，本轮 run 结束时由 runner 代替用户点一次「推进」。
- * 不是「自动推进开关」——触发依据只有用户的话；AI 没有用户授权时不该、也调不成这个工具（见下面「落地凭据」）。
+ * 给 AI 一个 `advance_next` 工具：AI 判断用户希望「这一步做完就继续下一步」
+ * （用户说了「改完直接提测 / 做完再复核 / 没问题就提 MR」，或交卷后说「提测吧」），
+ * 在本 action 交卷后登记一条「链」，本轮 run 结束时由 runner 代替用户点一次「推进」。
+ * 任务当前没有进行中的 action 时（用户在聊天里说话、任务还没推进过）也能登记：没有「交卷」可核，起点记为 null，
+ * 这一轮说完收尾就算；触发时仍要求任务没有当前 action。主导权在 AI：它判断要出方案就自己起，拿不准就问，用户也随时能手动推进。
  *
- * # 三道硬闸（提示词只是软约束，下面这几条是代码兜底）
+ * # 授权不再由代码核对（第一期取舍）
  *
- * 1. **落地凭据**：入参 `user_words` 必须能在用户**真说过**的话里逐字找到（action 的手动推进指令 + 最近的
- *    user_reply 事件；群里的话 / 定时备忘（AI 给自己留的） / 本机自动推进写的指令一律不算）。AI 编不出授权。
- * 2. **轮数上限**：没有人手动推进的情况下，最多连续自动推进 {@link ADVANCE_CHAIN_MAX_AUTO_STEPS} 步
+ * 要不要登记、ship / dev / 对外发消息这类外部动作该直接做还是先 ask_user，由 AI 按 `_super.md`
+ * 「外部动作」一节自己判断。早先版本要求 AI 逐字引用用户原话、服务端去事件日志里核对——太机械：
+ * 用户自然的说法（「搞吧」「发给测试」）对不上就被拒，AI 要么白问、要么换着法子重试。
+ * 代价：AI 判断错时代码不拦（提示词是软约束）。`user_words` 现在只是 AI 自述的依据（可选），不核对、只展示。
+ *
+ * # 仍在的硬闸（代码兜底）
+ *
+ * 1. **轮数上限**：没有人手动推进的情况下，最多连续自动推进 {@link ADVANCE_CHAIN_MAX_AUTO_STEPS} 步
  *   （防 review → build → review 无限回环）。任何一次人手推进（UI / 飞书群 / 选择卡）都会清零。
- * 3. **一次性 + 快照比对**：一条链只在「登记它的那一轮 run 正常结束」时触发一次；触发前核对
+ * 2. **一次性 + 快照比对**：一条链只在「登记它的那一轮 run 正常结束」时触发一次；触发前核对
  *    ① 没被停止 / 删除过（opGen 没变）② 当前 action 还是登记时那条且已交卷 ③ 没过期，
  *    推进本身再走 advanceTask 的 `expectedCurrentActionId` CAS——任何一项不成立都只落一条提示、不推进。
+ * 3. **登记后用户又插话 → 作废**：runner 监听到用户本人（{@link isUserOwnWordsEvent}）的新消息就取消这条链。
+ *
+ * 另外：群里非属主触发的轮次调不了本工具（`invokeFlowshipTool` 的白名单）；dev 必须显式 `dev_push_mode`。
  *
  * 不碰 ownership / 并发那套：触发时只是 advanceTask 的一个普通调用方（与 UI 路由、飞书群推进同级）。
  */
@@ -29,24 +39,14 @@ export const ADVANCE_CHAIN_MAX_AUTO_STEPS = 3;
 /** 链的有效期：build 这类长 action 可能跑很久，但超过这个时间还没收口就别再替用户做主了 */
 export const ADVANCE_CHAIN_TTL_MS = 4 * 60 * 60 * 1000;
 
-/**
- * 自动推进出来的 action，`userInstruction` 以它开头：
- * - 界面上一眼能看出这一步不是人点的；
- * - 落地凭据**跳过**带这个前缀的指令（AI 自己写的话不能给自己的下一次推进当授权）。
- */
+/** 自动推进出来的 action，`userInstruction` 以它开头：界面上一眼能看出这一步不是人点的 */
 export const AUTO_ADVANCE_INSTRUCTION_PREFIX = "[自动推进] ";
 
 /** 给下一个 action 的指令长度上限（字符） */
 export const ADVANCE_CHAIN_INSTRUCTION_MAX = 4000;
 
-/** 授权原话长度上限（字符；原话是引用，不是转述长文） */
+/** 依据（user_words，可选）长度上限（字符；写依据的那一句，不是整段粘贴） */
 export const ADVANCE_CHAIN_WORDS_MAX = 300;
-
-/** 授权原话去掉空白 / 标点后的最短长度（挡掉「好」「嗯」这种碰巧到处都能匹配的引用） */
-export const ADVANCE_CHAIN_WORDS_MIN_NORMALIZED = 4;
-
-/** 落地凭据最多回看多少条事件（调用方读尾部事件时用同一个数） */
-export const ADVANCE_CHAIN_GROUNDING_EVENT_TAIL = 150;
 
 /** 自动推进允许的目标（含 custom；dev / custom 还有额外必填，见 {@link parseAdvanceNextArgs}） */
 export const ADVANCE_CHAIN_ACTIONS = [
@@ -67,13 +67,16 @@ export interface AdvanceChainTarget {
 
 export interface AdvanceChain extends AdvanceChainTarget {
   taskId: string;
-  /** 登记时的当前 action（= 要交卷的那条）：触发时它必须还是当前 action 且已交卷 */
-  fromActionId: string;
+  /**
+   * 登记时的当前 action（= 要交卷的那条）：触发时它必须还是当前 action 且已交卷。
+   * null = 登记时任务没有当前 action（聊天里、任务还没推进过）：触发时仍必须没有当前 action，没有「交卷」可核。
+   */
+  fromActionId: string | null;
   /** 登记时的 admission token：停止 / 删除 / 终结会让它变化，变了就不再触发 */
   opGen: number;
   /** 已经带 {@link AUTO_ADVANCE_INSTRUCTION_PREFIX} 以外的纯指令正文 */
   instruction: string;
-  /** 用户授权原话（已 trim） */
+  /** AI 自述的依据（已 trim；空串 = 没写）。不核对是不是用户原话，只用于展示 */
   userWords: string;
   registeredAt: number;
 }
@@ -100,7 +103,7 @@ const asTrimmedString = (v: unknown): string =>
  * - `action`：plan / build / review / ship / dev / custom；custom 必须带 `custom_action_id`
  * - `dev`（联调）会往远端推代码：必须显式 `dev_push_mode`（direct / mr），**不替用户默认选直推**
  * - `batch_ids` 只对 build 有意义，别的类型传了忽略
- * - `user_words` 必填（是否真是用户说过的话由调用方拿凭据源核对，见 {@link isUserWordsGrounded}）
+ * - `user_words` 可选：AI 自述的依据（用户的哪句话让它判断要推进），只展示、不核对；超长拒绝
  */
 export const parseAdvanceNextArgs = (
   args: Record<string, unknown>,
@@ -115,17 +118,10 @@ export const parseAdvanceNextArgs = (
   const actionType = action as ActionType;
 
   const userWords = asTrimmedString(args.user_words);
-  if (!userWords) {
-    return {
-      ok: false,
-      error:
-        "缺 user_words：必须逐字引用用户说过的、授权你做完后自动推进的那句话。用户没这么说过就不要调用本工具，正常交卷让用户自己推进",
-    };
-  }
   if (userWords.length > ADVANCE_CHAIN_WORDS_MAX) {
     return {
       ok: false,
-      error: `user_words 太长（${userWords.length} 字、上限 ${ADVANCE_CHAIN_WORDS_MAX}）：只引用授权的那一句，不要整段粘贴`,
+      error: `user_words 太长（${userWords.length} 字、上限 ${ADVANCE_CHAIN_WORDS_MAX}）：只写依据的那一句，不要整段粘贴`,
     };
   }
 
@@ -168,39 +164,17 @@ export const parseAdvanceNextArgs = (
 };
 
 // ---------------------------------------------------------------------------
-// 落地凭据（纯函数）
+// 「用户本人说的话」判定（纯函数）
 // ---------------------------------------------------------------------------
-
-/** 去掉空白和常见中英文标点、转小写：引用时多一个标点 / 换行不该判不匹配 */
-export const normalizeForQuoteMatch = (s: string): string =>
-  s
-    .toLowerCase()
-    .replace(
-      /[\s\u3000，。、！？；：“”‘’「」『』（）《》【】…—·,.!?;:"'`()[\]{}<>~\-_/\\|*#>]+/g,
-      "",
-    );
-
-/**
- * 授权原话是否真出自用户说过的话。
- * `sources` 由 {@link collectAuthorizationSources} 给：只含用户本人的话。
- * 判据：规范化后长度够（见 {@link ADVANCE_CHAIN_WORDS_MIN_NORMALIZED}）且是某条来源的**子串**。
- */
-export const isUserWordsGrounded = (
-  userWords: string,
-  sources: readonly string[],
-): boolean => {
-  const needle = normalizeForQuoteMatch(userWords);
-  if (needle.length < ADVANCE_CHAIN_WORDS_MIN_NORMALIZED) return false;
-  return sources.some((s) => normalizeForQuoteMatch(s).includes(needle));
-};
 
 /**
  * 能算「用户本人说的」的 user_reply 来源——**白名单**：
  * - 无 `meta.source`：Flowship 输入条 / 推进弹窗；
  * - `"feishu"`：飞书私聊（已绑定的属主本人）。
  * 其余一律不算：`feishu_group`（群里的话，连属主在群里说的也不认）、`schedule`（AI 之前用 schedule 给自己留的备忘，
- * 到点以 user_reply 落盘，不是用户说的话——`_super.md` 明写「定时消息不构成用户授权」）、以及以后任何新增的来源。
- * 用白名单而不是「排除已知坏来源」：新增来源默认不能授权，不会因为漏列一个就让 AI 给自己授权（第 25 轮评审 F1）。
+ * 到点以 user_reply 落盘，不是用户说的话）、`browser`（浏览器交还）、以及以后任何新增的来源。
+ * 用白名单而不是「排除已知坏来源」：新增来源默认不算「用户说话」，不会因为漏列一个就让 AI 的自言自语顶替用户。
+ * 现在只用于「登记后用户又插话 → 作废这条链」（见 advance-chain-runner）。
  */
 const USER_OWN_SOURCES: ReadonlySet<unknown> = new Set([undefined, "feishu"]);
 
@@ -220,40 +194,24 @@ const isUserOwnWordsMeta = (
   );
 };
 
-/** 事件是不是「用户本人说的话」（user_reply 且来源在白名单内）：授权凭据来源 + 登记后「用户又插话」判定共用 */
+/** 事件是不是「用户本人说的话」（user_reply 且来源在白名单内）：登记后「用户又插话 → 作废」的判定用 */
 export const isUserOwnWordsEvent = (
   ev: Pick<TaskEvent, "kind" | "meta"> & { text?: string },
 ): boolean => ev.kind === "user_reply" && isUserOwnWordsMeta(ev);
 
 /**
- * 能当授权凭据的文本：
- * - 每条 action 的手动推进指令（`action.userInstruction`），**除了**自动推进写的（带前缀）
- * - 最近的 `user_reply` 事件（用户在输入条 / 飞书私聊说的话），**除了**群里来的与定时备忘（见 {@link isUserOwnWordsEvent}）
+ * 依据的展示文案：AI 写了依据就带上；没写就如实说是 AI 判断的（info 事件 / 新 action 指令 / runner 提示共用）。
+ * 带上时必须标明「AI 称」：引号里是 AI 自述、系统不核对，不能写得像服务端核对过的用户原话（评审 R18-02）。
  */
-export const collectAuthorizationSources = (input: {
-  actions: readonly Pick<ActionRecord, "userInstruction">[];
-  events: readonly Pick<TaskEvent, "kind" | "text" | "meta">[];
-}): string[] => {
-  const out: string[] = [];
-  for (const a of input.actions) {
-    const t = a.userInstruction ?? "";
-    if (!t.trim() || t.startsWith(AUTO_ADVANCE_INSTRUCTION_PREFIX)) continue;
-    out.push(t);
-  }
-  for (const ev of input.events) {
-    if (!isUserOwnWordsEvent(ev)) continue;
-    if (!ev.text?.trim()) continue;
-    out.push(ev.text);
-  }
-  return out;
-};
+export const describeAdvanceBasis = (userWords: string): string =>
+  userWords ? `AI 称依据：「${userWords}」` : "AI 判断你需要这一步";
 
-/** 自动推进写进新 action 的指令：前缀 + 指令正文 + 授权原话（用户回头看一眼就知道依据） */
+/** 自动推进写进新 action 的指令：前缀 + 指令正文 + 依据（用户回头看一眼就知道为什么推进） */
 export const buildAutoAdvanceInstruction = (
   chain: Pick<AdvanceChain, "instruction" | "userWords">,
 ): string => {
   const body = chain.instruction.trim();
-  const basis = `（依据用户原话：「${chain.userWords}」）`;
+  const basis = `（${describeAdvanceBasis(chain.userWords)}）`;
   return body
     ? `${AUTO_ADVANCE_INSTRUCTION_PREFIX}${body}\n\n${basis}`
     : `${AUTO_ADVANCE_INSTRUCTION_PREFIX}${basis}`;
@@ -312,13 +270,16 @@ export const evaluateChainFire = (input: {
       reason: "当前 action 已经变了（可能刚被推进过），自动推进让位",
     };
   }
-  const from = task.actions.find((a) => a.id === chain.fromActionId);
-  if (!from || (from.status !== "awaiting_ack" && from.status !== "completed")) {
-    return {
-      ok: false,
-      kind: "not_submitted",
-      reason: "这一步没有正常交卷，不自动推进下一步",
-    };
+  // 没有起点 action（聊天里登记的）就没有「交卷」可核：上面已核对「当前仍然没有 action」
+  if (chain.fromActionId !== null) {
+    const from = task.actions.find((a) => a.id === chain.fromActionId);
+    if (!from || (from.status !== "awaiting_ack" && from.status !== "completed")) {
+      return {
+        ok: false,
+        kind: "not_submitted",
+        reason: "这一步没有正常交卷，不自动推进下一步",
+      };
+    }
   }
   if (input.autoStepsSoFar >= ADVANCE_CHAIN_MAX_AUTO_STEPS) {
     return {

@@ -13,12 +13,11 @@
  * - 气泡（user_reply.text）只放用户自己写的话；没写就放一句「已把浏览器交还给 AI」；
  * - 操作摘要走 `agentContext`（只给 agent、不进气泡）——摘要是机器生成的、可能很长，不该冒充用户说的话。
  *
- * # 安全：交还消息不是授权凭据
+ * # 安全：交还消息不算「用户又说话了」
  * `meta.source = "browser"`，**不在** advance-chain 的 USER_OWN_SOURCES 白名单（只认无 source 与 feishu）里：
- * - 不能当 `advance_next.user_words` 的凭据（用户在浏览器里点点点、或页面诱导用户点「交还」，都不构成「用户授权自动推进」）；
- * - 也不会触发「登记后用户又插话 → 取消自动推进」的判定（那同样走 isUserOwnWordsEvent）——交还不是「说话」。
- * 白名单本身不动；tests/browser-handback.test.ts 钉死这两点。
- * 用户亲手写的 note 同样不算凭据（来源整体按 browser 标）：要授权推进，请用户在输入条里说。
+ * 不会触发「登记后用户又插话 → 取消自动推进」的判定（那走 isUserOwnWordsEvent）——用户在浏览器里点点点、
+ * 或页面诱导用户点「交还」，都不是「用户又说话了」。白名单本身不动；tests/browser-handback.test.ts 钉死这点。
+ * 用户亲手写的 note 同样按 browser 来源标。
  *
  * # 为什么动态 import 重模块
  * 本文件由 feishu-bridge/bootstrap 的锚点加载（它的模块图本来就含 @cursor/sdk）；但单测只想验证逻辑，

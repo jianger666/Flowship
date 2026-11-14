@@ -91,7 +91,10 @@ export const clearLastWork = () => {
 // "ask"：ask_user 内联答题卡是事件流（虚拟列表）里的一项，上滚离开视口会被卸载、
 //   组件 state 全丢；它的 id 是 `${taskId}:${askId}:${questionId}`（见 lib/ask-draft），
 //   提交成功 / ask 作废后由 ask-draft 的 clear / prune 清掉，不会无限堆积。
-export type DraftScope = "reply" | "talk" | "ask";
+// "edit"：chat 用户消息「原地编辑」里的图片（同样住在虚拟列表行里、滚出视口就卸载）。
+//   只用附件快照这一半（正文草稿走 useRowViewState）；id 是 `${taskId}:${eventId}`（见 lib/user-edit-images），
+//   取消 / 发送后由 clearUserEditImages 清掉。
+export type DraftScope = "reply" | "talk" | "ask" | "edit";
 
 const draftKey = (scope: DraftScope, taskId: string) =>
   `flowship:draft:${scope}:${taskId}`;

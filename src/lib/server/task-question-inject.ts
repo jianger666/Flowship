@@ -49,6 +49,7 @@ import {
   type RestrictedGroupContext,
 } from "@/lib/server/restricted-question";
 import { HeapPressureError } from "@/lib/server/sdk-store-gc";
+import { peekOneShotMemory } from "@/lib/server/oneshot-session-memory";
 import {
   TASK_BRANCH_GUARD_CODE,
   TaskBranchGuardError,
@@ -1464,7 +1465,8 @@ const runTaskQuestionInject = async (
     await writeEventAndPublish(task.id, {
       kind: "info",
       actionId: task.currentActionId ?? undefined,
-      text: "正在启动答疑 agent…",
+      // 上一轮的聊天记忆还在 = 这一条会接着刚才的对话聊，不是重新起一个
+      text: peekOneShotMemory(task.id) ? "正在接上刚才的对话…" : "正在启动答疑 agent…",
     });
     startOneShotQuestion(
       task,

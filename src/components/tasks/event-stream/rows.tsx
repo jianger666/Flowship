@@ -29,7 +29,6 @@ import {
   Plug,
   Quote,
   RotateCcw,
-  Send,
   Share2,
   Sparkles,
 } from "lucide-react";
@@ -101,10 +100,11 @@ import { getIdeAnchorProps } from "@/lib/ide-open";
 import { isImeComposing } from "@/lib/ime";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { pathBasename } from "@/lib/path-utils";
-import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
-import { useJumpIde, useSubmitShortcut } from "@/hooks/use-settings";
+import { useJumpIde } from "@/hooks/use-settings";
 import { actionTagLabel } from "@/lib/task-display";
+import type { ImagePayload } from "@/lib/task-store";
 import { isInTurnToolErrorEvent } from "@/lib/tool-display";
+import { clearUserEditImages } from "@/lib/user-edit-images";
 import {
   JUMP_IDE_LABEL,
   type Task,
@@ -121,6 +121,7 @@ import {
   PROCESS_BODY_RAIL,
   PROCESS_ROW_BUTTON,
 } from "./stream-style";
+import { UserEditForm } from "./user-edit-form";
 import {
   ActionTag,
   DEFAULT_EXPANDED_KINDS,
@@ -547,20 +548,25 @@ const EventRowImpl = ({
   // 与没接 onEditInPlace 时的旧编辑语义
   // 第二参 sourceEv：重发时带回原 meta.images / attachments（批 B）
   // 返回 false = 发送失败（编辑态保持）；true / void = 成功可关编辑
+  // 第三参 images：只有编辑框发送才传（用户在编辑框里增删后的最终这一组、可为空数组）；
+  // 「原样重发」不传 = 照 sourceEv 的原图回读
   onResend?: (
     text: string,
     sourceEv?: TaskEvent,
+    images?: ImagePayload[],
   ) => boolean | void | Promise<boolean | void>;
   /**
    * chat 任意一条用户消息的「原地编辑」（Codex / Cursor IDE 式）：编辑后这条消息及之后的对话被
    * 替换、从这里重新跑（父组件负责 确认 → 停当前回复 → 回退 → 发送）。
    * 传了它：编辑入口对每条用户消息都出现、编辑态的「发送」走它；没传：退回 onResend 的旧语义
    * （只有最后一条、编辑后作为新消息追加到末尾、原消息保留）。
+   * 第三参 images = 编辑框里最终要带的图（含用户新贴的、不含用户删掉的）。
    * 返回 false = 没成功（编辑态保持）；true / void = 成功。
    */
   onEditInPlace?: (
     text: string,
     sourceEv?: TaskEvent,
+    images?: ImagePayload[],
   ) => boolean | void | Promise<boolean | void>;
   // chat「最后一条 AI 回复」的重新生成：等价于把最后一条用户消息原样再发一遍
   // （append-only、历史保留、不做 fork）；父组件只给最后一条 assistant 传、内部复用 handleResend
@@ -640,14 +646,14 @@ const EventRowImpl = ({
     autoFocusEditRef.current = false;
     setEditing(false);
     setEditDraft("");
+    // 编辑框里的图（快照 + 「用户全删了」标记）一并清掉：下次再点编辑从原消息的图重新开始
+    clearUserEditImages(taskId, ev.id);
   };
   // 超长用户消息折叠展开态（Codex「显示更多」同款）：组件内 state、默认折叠
   const [userExpanded, setUserExpanded] = useState(false);
   // 编辑 / 重发飞行锁（防连点；失败时保持 editing）
   const [editSubmitting, setEditSubmitting] = useState(false);
   const resendLockRef = useRef(false);
-  // 提交快捷键跟随设置页偏好（Enter / Cmd+Enter、别写死）
-  const submitShortcut = useSubmitShortcut();
   // 选中 AI 正文 → 浮「引用」；与产物面板的「选中 → 分享到群」共用公共件
   // containerRef 挂在 AI 回复容器上（已 relative），按钮相对它定位
   const {
@@ -685,18 +691,20 @@ const EventRowImpl = ({
       autoFocusEditRef.current = false;
       setEditing(false);
       setEditDraft("");
+      clearUserEditImages(taskId, ev.id);
     }
-  }, [editHandler, editing, setEditing, setEditDraft]);
+  }, [editHandler, editing, setEditing, setEditDraft, taskId, ev.id]);
 
   const runHandler = async (
     handler: typeof onResend,
     text: string,
     sourceEv?: TaskEvent,
+    images?: ImagePayload[],
   ): Promise<boolean> => {
     if (!handler || resendLockRef.current) return false;
     resendLockRef.current = true;
     try {
-      const result = await handler(text, sourceEv);
+      const result = await handler(text, sourceEv, images);
       return result !== false;
     } finally {
       resendLockRef.current = false;
@@ -704,8 +712,8 @@ const EventRowImpl = ({
   };
   const runResend = (text: string, sourceEv?: TaskEvent) =>
     runHandler(onResend, text, sourceEv);
-  const runEdit = (text: string, sourceEv?: TaskEvent) =>
-    runHandler(editHandler, text, sourceEv);
+  const runEdit = (text: string, sourceEv: TaskEvent, images: ImagePayload[]) =>
+    runHandler(editHandler, text, sourceEv, images);
 
   // 附件 chip 的跳转 IDE（设置页可切 Cursor / IDEA）
   const jumpIde = useJumpIde();
@@ -1020,13 +1028,14 @@ const EventRowImpl = ({
       // 语义是「编辑后作为新消息发到末尾」、原消息保留、不是 fork；
       // 〔更新〕父组件传了 onEditInPlace 时改为「替换这条及之后的对话」，见 editHandler）
       if (editing && editHandler) {
-        const trimmed = editDraft.trim();
-        const submitEdit = () => {
-          if (!trimmed || editSubmitting) return;
+        // 编辑框（正文 + 图片的增删）在 user-edit-form：图片读 / 存 / 发的细节都在那边，
+        // 这里只管飞行锁与「发成功才关编辑态」
+        const submitEdit = (text: string, images: ImagePayload[]) => {
+          if (editSubmitting) return;
           setEditSubmitting(true);
           void (async () => {
             try {
-              const ok = await runEdit(trimmed, ev);
+              const ok = await runEdit(text, ev, images);
               if (ok) closeEdit();
             } finally {
               setEditSubmitting(false);
@@ -1034,51 +1043,18 @@ const EventRowImpl = ({
           })();
         };
         return (
-          <div className="rounded-2xl border border-ring bg-secondary p-2 shadow-sm">
-            <Textarea
-              value={editDraft}
-              onChange={(e) => setEditDraft(e.target.value)}
-              autoFocus={autoFocusEditRef.current}
-              disabled={editSubmitting}
-              className="max-h-64 min-h-[52px] resize-none border-none bg-transparent p-1.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
-              onKeyDown={(e) => {
-                if (e.key === "Escape" && !e.nativeEvent.isComposing) {
-                  e.preventDefault();
-                  if (!editSubmitting) closeEdit();
-                  return;
-                }
-                // 提交快捷键跟设置页偏好一致（helper 内部已处理 IME / enter vs mod-enter）
-                if (shouldSubmitOnKeyDown(e, submitShortcut)) {
-                  e.preventDefault();
-                  submitEdit();
-                }
-              }}
-            />
-            <div className="mt-1 flex items-center justify-end gap-1.5">
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 text-xs"
-                disabled={editSubmitting}
-                onClick={closeEdit}
-              >
-                取消
-              </Button>
-              <Button
-                size="sm"
-                className="h-7 text-xs"
-                disabled={!trimmed || editSubmitting}
-                onClick={submitEdit}
-              >
-                {editSubmitting ? (
-                  <Loader2 className="size-3 animate-spin" />
-                ) : (
-                  <Send className="size-3" />
-                )}
-                发送
-              </Button>
-            </div>
-          </div>
+          <UserEditForm
+            key={ev.id}
+            taskId={taskId}
+            ev={ev}
+            draft={editDraft}
+            onDraftChange={setEditDraft}
+            autoFocus={autoFocusEditRef.current}
+            submitting={editSubmitting}
+            imagesClearedKey={editKeys?.imagesCleared ?? null}
+            onCancel={closeEdit}
+            onSubmit={submitEdit}
+          />
         );
       }
       // 折叠判定纯逻辑在 lib/chat-stream-display（可单测）；行数阈值与 line-clamp-8 对应

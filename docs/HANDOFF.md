@@ -413,6 +413,75 @@ ai-flow-action-hub/
 
 > **v1.9.35 首次 tag 的 CI 红了（Linux `verify` 单测）**：701 个文件全过、只有 1 条 `Unhandled Rejection: EnvironmentTeardownError: Closing rpc while "onUserConsoleLog" was pending`（归因到 `ownership-r28-resource`）。原因：测试结束时 finalize / prewarm 链尾还有没人 await 的写盘（`appendEvent` 的 meta touch、meta.json.bak 刷新），目录一被清就 ENOENT、各打一条 console.warn，这条日志落在文件收尾之后，vitest 关 worker rpc 时还没送完 → 整次运行退出码 1。修法（只改测试）：`ownership-r28-resource` 的 `afterEach` 先排空任务锁（固定 5 轮 × 40ms，**时间裕量、不是同步点**）再清目录；`tests/setup/hermetic-env.ts` 的 `afterAll` 在删临时数据目录前让出 50ms（用模块加载时抓的真 `setTimeout`——第一版用全局 `setTimeout`，被 `vi.useFakeTimers()` 的 `warmup-scheduler` 卡成 hook 超时，已改）。**⚠ 本机一直没复现这类红的原因**：Cursor agent 的 shell 里有 `CURSOR_AGENT` 环境变量，vitest 检测到会进「agent 模式」、**不转发 console 输出**，于是永远不会有「日志还在路上」这种红；CI（和你自己在终端里跑）会转发。**要在本机模拟 CI：`env -u CURSOR_AGENT -u NODE_ENV CI=true pnpm vitest run`**（`NODE_ENV` 也会被宿主设成 `production`）。模拟 CI 的全量里，「文件收尾之后才发出的日志」从每次 6~8 条降到 0 条（3 次）；但这个红本身我**没在本机复现过**（修前模拟 CI 全量 2/2 也是绿的），所以「修好了」的证据是这个间接指标 + 3/3 全绿，不是红→绿对照。
 
+### 已做（2026-11-13 15:2x，**已发 v1.9.50 + 本机正式包已暂存换成含未发布改动的本地包**；评审方做的，用户：「发版，但是只发一个。就是 task 也折叠记忆这一个功能」「前面剩余的改动，你可以直接在我本地替换，把我的正式包替换了，我用几天没问题了再来找你发版」）
+
+> **v1.9.50 只含任务页分栏收起记忆**（commit `006332fc`，CI 全绿，`releases/latest` 已指向它）。**其余改动没有发**（下面各块 + 那 33 个文件），用户要「用几天没问题再发」——**没有用户再次明说前，不要合 main / 打 tag / 发版**，下一个版本号是 v1.9.51。**2026-11-13 15:5x 起这些改动已提交到本地分支 `wip/unreleased-after-1.9.50`**（基于 main `006332fc`，**未推远程、未合 main**；用户：「你搞个分支吧，我想让 AI 开发点其他东西了」，所以 main 工作区已还原干净）。下面各块里写的「没提交 / 没 `git add`」是各自当时的状态，现在以这条为准。后续在 main 上开发的东西和这个分支会有重叠文件（`task-runner.ts` / `event-stream.tsx` / `rows.tsx` / `advance-chain*.ts` / `one-shot-tools.ts` / `schedule.ts` / `prompts/*` 等），合并时先对一遍。
+>
+> **本机 `/Applications/Flowship.app` 会变成「本地 1.9.50」，不是官方 v1.9.50**：内容 = `006332fc` + 工作区 33 个文件（28 个已修改 + 5 个新增；**不含** `scripts/browser-e2e/r14-experiment-tmp.cjs`，那个永远不要提交），版本号标成 `1.9.50` 是故意的（壳按三段数字比版本，带后缀会让 `isNewer` 失灵；同号也让壳的轮询看到官方 1.9.50 时认为「已暂存、跳过下载」，不会把本地包覆盖掉）。**交付方式**：没有动正在运行的正式 app（这个会话就跑在它里面），而是把包放进壳自己的暂存区 `~/Library/Application Support/fe-ai-flow/updates/staged-1.9.50.app` + `staged.json`，壳在用户**真退出**（⌘Q / 托盘「退出」；只关窗口不算）或点更新徽标时用自己的原子替换逻辑换上。换完后旧包进 `updates/old-<ts>.app`、下次启动被清。**回滚 = 去 GitHub Releases 下官方 v1.9.50 的 dmg 装回**（那份不含上面这些未发布改动）。
+>
+> **打这个包时踩到的坑（以后本机打包请注意）**：我为对齐线上包的平铺布局用了 `pnpm install --config.node-linker=hoisted`，但 `scripts/lib/assemble-server.mjs` 的 `addSdkPlatformPackage` **只在 pnpm 默认（isolated）布局下补当前平台的 SDK 平台包**（hoisted 下它直接 return、交给 CI 的 `npm pack` 补）——结果第一版包里**缺 `@cursor/sdk-darwin-arm64`**（rg / 沙箱 helper / tree-sitter 全缺）。`smoke-boot-server` 测不出来（只看 readyz / 首页 / 静态资源）；我在包目录里用 node 解析「通过」也是**假阳性**（解析时顺着祖先目录蹭到了 worktree 根的 `node_modules`）。靠「`app-server` 文件清单和线上包对账」才发现（修后 8531 对 8531、两个方向零差异；平台包 11 个文件与线上包逐个 sha256 一致）。**本机打包二选一**：用默认 isolated 布局（assemble 会补）；或 hoisted + 手动把 `node_modules/@cursor/sdk-<平台>` 拷进 `dist/app-server/node_modules/@cursor/` 再 `electron-builder`。**验证包要放到祖先目录没有 `node_modules` 的地方**（如 `/tmp/xxx`），并对账文件清单，别只信 smoke。
+>
+> **门禁结果（独立 worktree、`006332fc` + 33 个文件叠加）**：typecheck 0、eslint 0 warning、`BUILD_STANDALONE=1 pnpm build`、assemble、smoke（构建机路径 + 包自带 Electron 当 node 在 `/tmp` 干净路径各一遍）均过；全量 vitest 1210 文件过、**1 条失败 `tests/preview-manager.integration.test.ts:1362`（R16-07 d 的「前提自检」`isAlive(bgPid)`）**——该测试文件和 `preview-manager.ts` 相对 HEAD 零改动，单跑 3/3 通过（73/73），失败是满负载下「等主进程退出」被拖慢、2 秒后的 KILL 已发出、「后台进程还活着」的前提不成立；和 11-12 注释里记的那次同属一类时序脆弱点。**不影响包，但是个真实的 flake 点**：CI 上若偶发红，先看是不是它。
+
+### 已做（2026-11-13，未发布；评审方直接改的，用户对评审的两条 P3 说「改」）· R18-03 编辑框原图静默丢失 + R19-01 定时轮次不该有 `advance_next`
+
+> **没提交 / 没 `git add` / 没启 dev server / 没碰 GUI。** 这两条是评审方（不是开发 AI）改的；开发 AI 接手前请先读一遍下面涉及的文件，别按旧版本覆盖。
+
+- **R18-03（`user-edit-form.tsx` / `lib/user-edit-images.ts` / `row-view-keys.ts` / `rows.tsx`）**：原来「原图是否已读进编辑框」的标记（`rowViewStateStore`）和图片快照（全局 LRU，`reply` / `talk` / `ask` / `edit` 共用 20 条 / 100MB）寿命不同——快照被挤掉而标记还在时，编辑框里没图、没转圈、没提示，发送会先回退删掉原消息再发 0 张图，原图永久丢失。**改成：快照是唯一事实，标记只记「用户亲手把最后一张图删了」**（`user:editImagesCleared`，值 `USER_EDIT_IMAGES_CLEARED = "cleared"`；组件 prop `imagesReadyKey` → `imagesClearedKey`，`userEditViewKeys().imagesReady` → `.imagesCleared`）。挂载时由纯函数 `shouldLoadOriginalImages({ originalCount, snapshotImageCount, userCleared })` 决定读不读原图：原消息有图 && 快照没图 && 没有「全删了」标记才读（同时覆盖「还没读过」和「快照被挤掉」）；本次挂载内读完（含全部读失败）就结案，不会一直转圈。删图统一走组件里的 `removeImage`（删到空才写标记）。**已知取舍**：快照被挤掉时用户之前的增删会丢，编辑框回到「原消息的图」——但图是看得见的，不再静默丢。
+- **R19-01（`one-shot-tools.ts` / `task-runner.ts` / `schedule.ts`）**：见上面「定时到点那条一次性通道」一条，已由提示词约束改成工具清单里直接不挂。
+- **测试**：`tests/user-edit-images.test.ts`（+纯函数表 5 条、+真实 LRU 淘汰回归 1 条；原「已读入标记」相关断言按新语义改；源码契约改钉 `setOriginalsSettled` / `removeImage` 封装）、`tests/one-shot-system-tools.test.ts`（+2：定时清单、两个后端都挂不出 `advance_next`）、`tests/advance-chain-wiring.test.ts`（清单 / 选择函数 / task-runner 现算）、`tests/oneshot-question-bailout.test.ts`（定时轮次 resume 的工具里没有 `advance_next`、之后用户轮次又有；定时作为第一轮 create 也没有）。变异验证（均已还原）：`shouldLoadOriginalImages` 恒 false → 3 条红；`oneShotSystemToolNames(false)` 写死 → 3 条红。
+
+### 已做（2026-11-13，未发布；用户：「1. 要改」，指上一块列的「每条消息仍是冷启动」）· 聊天不再一句一句冷启动：一次性 agent 答完只 close、记住 agentId，下一条 `Agent.resume` 接回同一段对话
+
+> **没提交 / 没 `git add` / 没启 dev server / 没打包 / 没碰 GUI。** 做法选的是「休眠 / 唤醒」，**不是**把一次性 agent 常驻进 `agentSessions`：一次性 agent 原注释明说「不注册 agentSessions，免得被续用推进误当正式会话」，而 `agentSessions` 背后是一整套 action 语义（ackContext / 锚点 / 空闲回收 / `resumeTaskSession` 会用正式工具面复活它），塞进去风险大；常驻进程还会和 `mem-governance` 的「即用即还」打架。
+
+- **新模块 `src/lib/server/oneshot-session-memory.ts`**（纯内存，挂 `globalThis`）：每个任务一条「上一轮干净答完的 agent」记录 `{agentId, providerId, modelKey, cwd, boundChatId, turns, savedAt}`。TTL 6 小时、最多接力 40 轮、最多记 200 个任务（挤最久没动的）。`invalidate`（推进 epoch + 清记忆）与 `discard`（只清记忆）分开：epoch 用来堵「旧一轮在正式 action 开始之后才收尾、把过期记忆写回去」的竞态——一轮入场时同步抓 epoch，收尾 `remember` 时对不上就不写。
+- **`startOneShotQuestion` 的变化**（`task-runner.ts`）：
+  - 受理段里 `peekOneShotMemory` → 提供方 / 模型指纹 / cwd 都对得上且 `sessionMatchesProvider` 才 `Agent.resume(agentId, 同一份入参)`（工具面不变：schedule / wait / advance_next + 浏览器 + 子代理；`callerToken` 照旧每轮新发）；换了模型 / 提供方 / 目录 → 丢弃记忆、新起。
+  - 提示词拆成两版：首轮（和接不回时新起的）= 原来那份完整背景；接回的 = 只带「用户接着说了一句」+ 新的一句 + 边界提醒，不再重复任务背景；两轮之间需求群绑定 / 换过才补发群能力那段（记忆里存了上一轮告诉过它的 chat_id）。定时到点的轮次同样能接回同一段对话，用定时版措辞和边界。
+  - **两层回退，用户这条消息不会因为「接不回」丢**：`Agent.resume` 抛错（存储被 `sdk-store-gc` 清了 / pi 会话文件没了）→ 丢弃记忆、新起；resume 成功但 `send` 抛错 → 关掉它、丢弃记忆、新起并带完整背景重发。
+  - 记下 / 丢弃只看「run 是否干净结束」：`consumeSessionRun` 新增 `onQuestionRunFinished` 回调，只在 questionRun 的正常收尾分支触发（出错 / 被停 / 失主走别的出口，不触发）。干净 → `finally` 里 `rememberOneShotMemory`；送出去了但没干净结束 → `discardOneShotMemory`（不去 resume 一个可能坏掉的会话——否则 `send` 不一定抛错、用户会被卡到过期）；没送出去（早退让位）→ 不动。
+  - 答完照旧 `close()`：不占内存、没有空闲计时器、不需要 stop / delete 钩子。
+- **失效点**：`installSessionIfCurrent`（正式会话的唯一安装点）装成功时 `invalidateOneShotMemory`——正式 action 开始是上下文边界，之前的聊天记忆作废，之后会话断了再聊也是重新起头。lease 不过什么都不动。
+- **输入条提示**：`task-question-inject.ts` 里原来固定写「正在启动答疑 agent…」，现在有记忆时写「正在接上刚才的对话…」；受理段的 boot 事件有记忆时写「正在恢复会话…」。
+- **⚠ 局限（没处理）**：
+  1. **纯内存**：服务重启后记忆没了，下一条消息冷启动（和这次改动之前一样，不算回归）。要跨重启得把 agentId 落盘，另一件事。
+  2. **`sdk-store-gc` 不认这些 agent**：它按「各任务现行 `sessionAgentId`」当活名单，一次性 agent 的存储行不在名单里——但只在 checkpoints 文件 > 50MB 且超过 10 分钟宽限时才会被清；被清了 `Agent.resume` 抛错，走上面的回退新起，用户感知是「这一条没接上上文」，不报错。没把它们加进活名单（要改 GC 的名单口径，风险不值）。
+  3. **resume 的成本没实测**：Cursor 路径 resume 要从 jsonl store 读回对话、pi 路径开会话文件，比「新起」多还是少、长对话下多慢，没量过（真 agent 没跑过）。40 轮上限是拍的数，没依据。
+  4. 一次性通道和正式会话仍是两套：用户点「推进」起正式 action 后，聊天记忆作废、正式 agent 从事件日志 + artifact 接上下文（和以前一样）。
+- **测试**：`oneshot-session-memory.test.ts`（纯状态机：模型指纹、TTL / 轮数上限 / 任务数上限、discard 不推进 epoch、invalidate 后旧 epoch 写不回）；`oneshot-question-bailout.test.ts` 新增 8 条真跑 `startOneShotQuestion` 的用例（接回只带新一句且工具面不变 / resume 抛错回退 / send 抛错回退并关旧 agent / 换模型不接 / run 报错丢弃记忆 / 正式会话装进来失效 + 在飞旧一轮晚收尾写不回去 / 绑群后补群能力 / 定时轮次接回）。**做过变异检查**：分别去掉「干净结束记下」「`installSessionIfCurrent` 里的失效」「remember 的 epoch 判断」，对应用例都会变红，还原后全绿。
+- **没验证**：没有真 agent 跑过；resume 真实延迟、长对话表现、GC 清掉存储后的回退，只有 fake agent 层面的验证。
+
+### 已做（2026-11-13，未发布；用户：「我进去直接就开聊，AI自助判断，如果他觉得要出方案还是啥，就自行推进方案还是说和用户确认都无所谓，反正主导权就在AI那儿。如果用户需要方案，但是AI有没有自动出方案，那用户自己去推进出方案也没问题」）· 聊天里的 AI 也握有「要不要往下推进」的主导权：`advance_next` 进一次性通道、起点可以是「还没有 action」
+
+> **没提交 / 没 `git add` / 没启 dev server / 没打包 / 没碰 GUI。** 上一块（第一期）做完后我说「新任务进去还得手动推进」，依据是读错了组件（读的是 `EventStream` 自带的输入框，task 页传了 `hideReplyComposer`、真正的说话条走 `submitTaskQuestion` → `handleTaskQuestionInject`）——用户纠正「我进去其实也能直接聊」。真实情况：新任务没有 action 时，说话条的消息本来就能到 AI（会话不通 / 任务没推进过 → 走一次性 agent）；缺的只是 **AI 在聊天里没法自己推进**（一次性通道没有 `advance_next`，提示词还让它「引导用户点推进」）。
+> **对「去掉一次性 AI 的概念」的理解（按推荐定的，没再问用户）**：做的是**能力 / 提示词对齐**——聊天里的 AI 和正式会话里的 AI 一样握有推进主导权，手动「推进」按钮照旧；**没有**去掉底层的「会话不通 / 任务没推进过 → 现起一个 agent」这套传输机制，`startOneShotQuestion` 这个函数名也没动（彻底删是大重构，用户没要求到这一步）。
+
+- **`advance_next` 的起点可以是「还没有 action」**：`AdvanceChain.fromActionId: string | null`，`null` = 登记时任务没有 action。`evaluateChainFire` 在起点为 `null` 时跳过「from 必须已交卷」那一核（没有可核的），但「当前 action 必须还是登记时那条」（即仍然没有 action）照常核——这期间用户手动推进过 / 别的链已推进，就静默让位，不会在别人的 action 上再叠一个；opGen / 4 小时 TTL / ≤3 步上限 / 对话型拒绝 / 登记后属主又说话就作废，全部照旧。`advanceTask` 的 `expectedCurrentActionId` 本来就支持 `null`（CAS 期望「没有当前 action」）。
+- **登记侧（`flowship-tools.ts` 的 `advance_next` handler）**：起点判定改为——有 current action 时，必须是 `running` / `awaiting_ack` / `completed`（`error` / `cancelled` 仍拒绝，文案「没有进行中的 action…」）；没有 current action → 登记成功、起点 `null`。info 提示事件在无起点时不挂 action、文案「这一轮说完后，自动推进到「…」」；回包 hint 与工具描述里补了「没有 action 时不用交卷，直接说完收尾」。
+- **一次性通道（`one-shot-tools.ts`）**：`ONE_SHOT_SYSTEM_TOOL_NAMES` 现在是 `schedule` / `wait` / `advance_next`（新增导出 `ADVANCE_NEXT_TOOL_NAME`）；仍然不含 `submit_work` / `ask_user` / `submit_mr` 等依赖 action / notifier 的工具。一次性 agent 运行期间登记的 callerToken 让它能过 `advance_next` 的 caller 校验（和 `schedule` 同一机制）。
+- **聊天通道提示词（`task-runner.ts`，`startOneShotQuestion` 的边界段）**：旧的「引导用户点推进走正式阶段（你没有任务链上下文…）」撤了，换成「主导权在你：你判断该正式走一步了就调 `advance_next`（plan / build / review），本轮说完收尾后系统代用户推进；拿不准或想先对齐范围就在回复里问；用户随时也能自己点推进；别在本轮里硬扛大改动」+「`advance_next` 的规矩：判断用户有这个意思才登记；提测 / 联调推送 / 往群里发消息这类对外动作用户明说才登记，自己觉得该做就先问；登记 ≠ 现在去做」。
+- **定时到点那条一次性通道（`schedule.ts` 的 `SCHEDULE_ONE_SHOT_BOUNDARY_LINES`）**：~~加了一行「这条通道里的 `advance_next` 别用」，只是提示词约束~~——**2026-11-13 评审方已改成代码闸（R19-01，用户「改」）**：`one-shot-tools.ts` 新增 `ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES`（`schedule` / `wait`，不含 `advance_next`）与 `oneShotSystemToolNames(scheduled)`，`startOneShotQuestion` 每轮按 `scheduled === true` 现算 `systemToolNames`（create / resume 共用同一份入参，两个后端 resume 都按本轮入参重建工具，所以用户轮次与定时轮次交替时各拿各的）；边界提示词那行改成「定时到点没有用户在场，这里没有 `advance_next`…」。用户在场的一次性轮次清单不变（仍含 `advance_next`）。
+- **⚠ 已知局限 / 风险（没处理，要的话再说）**：
+  1. ~~每条消息仍是冷启动~~：用户看了这条回「1. 要改」，已处理，见上一块「聊天不再一句一句冷启动」。
+  2. **对外动作只有提示词护栏**：第一期 R18-01 那条（ship / dev / 往群里发消息，进入 ship 就是唯一一道闸、没有代码级用户确认）现在多了一条入口——聊天里的 AI 也能登记 ship。同样没加代码闸，观察真实对话再定。
+  3. ~~定时到点轮次可以登记 `advance_next`（仅提示词禁止）~~：已改成工具清单里直接不挂（见上，R19-01）。
+  4. 一次性 agent 收尾会触发 runner：已读代码核实——`startOneShotQuestion` 走 `consumeSessionRun(..., { questionRun: true })`，正常答完在 questionRun 分支发 `done(ok: true)`、**不带 `origin`**（`task-runner.ts` 约 5662-5675 行），正是 runner 订阅的「属主主链 done」。但**没有端到端集成测试**（真起一次性 agent → 登记 → 收尾 → 触发 `advanceTask` 这一整条），只有各段分别的单测（登记 / 触发 / 工具清单 / 提示词）；真机行为要看。
+- **测试**：`advance-chain.test.ts`（无起点：仍无 action → ok；冒出 action → stale；opGen / TTL / 上限 / 对话型照管）、`advance-next-tool.test.ts`（无起点登记成功且事件不挂 action、起点 completed 成功、error / cancelled 仍拒；原「currentActionId=null 拒绝」那条已按新行为移走）、`advance-chain-runner.test.ts`（无起点触发时 CAS 期望 `null`、提示不挂 action；这期间已有 action → 静默让位）、`one-shot-system-tools.test.ts`（清单改为三个、`ACTION_BOUND` 去掉 `advance_next`；新增端到端：登记了 token 的一次性 agent 在从没推进过的任务里登记成功、起点 `null`，没 token 被拒）、`oneshot-question-bailout.test.ts`（带 `advance_next`、提示词含新口径）、`advance-chain-wiring.test.ts`（清单与工具同名、两条提示词口径）。
+- **没验证**：没有真 agent 跑过；聊天里的 AI 会不会真按提示词该推进就推进、该问就问，只能靠真实对话观察。
+
+### 已做（2026-11-13，未发布；用户：「第一期就做的简单点吧，不用判断器了，就由工作的AI自行判断要不要直接执行还是说询问用户」）· `advance_next` 第一期：授权交给 AI 自己判断，撤掉「逐字引用原话」的代码核对
+
+> **没提交 / 没 `git add` / 没启 dev server / 没打包 / 没碰 GUI。** 起因：用户觉得「每一步都要推进 action」是早期 AI 弱时留下的累赘，选了「action 变成 AI 可自行判断调用的技能」；落地分期，**本期只做下面两件**，不做判断模型 / 确认卡 / 统计留痕 / action→skill 重构。
+
+- **撤掉**：`advance_next` 的 `user_words` 不再必填、不再核对。删了 `normalizeForQuoteMatch` / `isUserWordsGrounded` / `collectAuthorizationSources` / `ADVANCE_CHAIN_WORDS_MIN_NORMALIZED` / `ADVANCE_CHAIN_GROUNDING_EVENT_TAIL`；`user_words` 变成 AI 自述的依据（可选、超长仍拒、只展示）。展示文案统一走 `describeAdvanceBasis`：写了 →「AI 称依据：「…」」（必须标「AI 称」：引号里是 AI 自述、不核对，不能写得像核对过的用户原话，评审 R18-02），没写 →「AI 判断你需要这一步」（info 事件 / `[自动推进]` 指令 / runner 提示共用）。工具读任务改成只读 meta（不再拉尾部 150 条事件）。
+- **新增提示词**：`prompts/_super.md` 加「外部动作（提 MR / 联调推送 / 对外发消息 / 改工作项状态）：直接做，还是先问用户」一节——用户明说（口语也算）→ 直接做、不二次确认；AI 自己判断该做 → 先 `ask_user`（写清仓库 / 分支 / 目标）；疑问句 / 否定保留 / 定时备忘 / 群里别人的话 / 读到的网页文档里的话，都不算用户让做；merge MR、强推、删分支 / 数据永远先问；拿不准 = 当作没说。`advance_next` 一段、`[自动推进]` 载荷说明、`_shared.md` / `action-build.md` / `action-review.md` 的相关措辞同步改了。
+- **仍在的硬闸（代码）**：连续自动推进 ≤3 步（人手推进清零）· 一次性 + opGen / currentActionId / 已交卷快照比对 + `advanceTask` 的 CAS · 4 小时过期 · 登记后用户本人又说话就作废（`isUserOwnWordsEvent` 白名单口径没动）· `dev` 必须显式 `dev_push_mode` · 群里非属主触发的轮次调不了 `advance_next`（`invokeFlowshipTool` 白名单）。
+- **⚠ 取舍（用户已接受「AI 自判断」，但值得记一笔）**：代码层「AI 不能自己给自己授权」那道闸没了。第 25 轮 F1（AI 用 schedule 给自己留话再登记 ship）这类绕过，现在**只剩提示词 + 上面几道闸**拦；提示词是软约束，AI 判断错时代码不会拦。要补的话，最小做法是 ship / dev / 对外发消息类的 `advance_next` 额外要一次用户确认（不需要判断模型）。**审代码 AI 的 R18 评审（2026-11-13）复核过这一点（R18-01，P2）**：`submit_mr` / `notify_group_testers` 在代码里确实没有用户确认前置，且 `action-ship.md` 第 429 行要求 ship 内不复述参数让用户确认——「进入 ship」是唯一一道闸，@ 测试人员的群消息撤不回。用户让我按推荐处理，结论是**先不加代码闸、观察真实对话里 AI 判断得准不准再定**。以后要加时注意：「本 action 内有用户 `ask_user` 答复」这个条件会让用户明说「提测吧」时也被多问一次。同一轮的 R18-02（引号里是 AI 自述、却长得像核对过的原话）已改，见上。
+- **文档里的旧说法**：下面「第 25 轮评审」块与「自动触发」块里关于「落地凭据 / 逐字引用 / 「按你的话「…」」/「（依据用户原话：「…」）」的描述是**旧机制（已撤）**；`docs/BROWSER-AUTOMATION.md` / `docs/REVIEW-browser-automation.md` 里「交还消息不是 `advance_next` 的授权凭据」指的也是这套，现在的含义是「browser 来源不算用户又说话了」（白名单没动，`browser-handback.test.ts` 仍钉着）。
+- **测试**：`advance-chain.test.ts`（删原话匹配 / 凭据来源用例，换成 `isUserOwnWordsEvent` 口径 + 依据文案 + user_words 可选）、`advance-next-tool.test.ts`（删 5 个拒绝用例，换成「不带 user_words 也能登记」「转述 / 只有群里说过 ship 也登记」「超长拒绝」「schema 可选」）、`advance-chain-wiring.test.ts`（提示词断言换成新措辞，含「外部动作」一节）、`browser-handback.test.ts`（去掉凭据用例）。
+- **没验证**：没有真 agent 跑过——AI 会不会真按「外部动作」一节该问就问、该做就做，只能靠真实对话观察。
+
 ### 已做（2026-11-11，未发布；用户：「这个也优化下，没有推进过，AI就建不了定时任务。不合理。把这个什么临时助手的概念去掉」，附截图）· 没推进过的 task 也能建定时：属主「一次性 agent」挂上 `schedule` / `wait`，不再自称「临时助手」
 
 - **现象**：task 页还没推进过任何 action（没有正式会话）时，在输入条里让 AI 建定时，AI 回答「我是任务页的临时答疑助手、工具里没有 schedule、主会话还没启动过所以没人能建」。**根因**：这种状态下输入条消息（和定时到点的消息）走 `startOneShotQuestion`（属主「问一问兜底」），它调 `Agent.create` **不带 `callerToken`**，而 agent facade 只在有 `callerToken` 时才挂 Flowship 系统工具；prompt 开头还写着「你是任务「X」的临时助手」。

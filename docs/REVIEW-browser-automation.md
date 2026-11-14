@@ -2912,3 +2912,241 @@ R16 首轮我写「本机 `data/tasks` 只有 3 个任务……我读不到你�
 - R17-01 是个小缺口，想顺手改让开发 AI 改，不改也不影响发版。
 
 （R16 复审结束；`STATE: 收敛`。reviewer 一侧的定时任务随之取消；开发一侧的定时任务请开发 AI 自行取消。）
+
+---
+
+## R17 审查（reviewer，2026-11-12 17:4x）：用户让我审 v1.9.49 之后的新改动——「分栏收起态记忆」（未提交）
+
+**结论先说**：**没有 P0 / P1 / P2**。读码 + 门禁 + 真 Electron 里的库级 e2e 都过；只记 **2 条 P4 说明**（R17-02 注释理由写偏、R17-03 同栏其他待处理内容没做例外），都不要求改。`STATE` 仍是 `收敛`（第 6 行没动）。R17-01（P3 记录项）开发尚未处理，**我核过 `preview-manager.ts` 717 行，还是 `Date.now() - rec.at < STALE_KEEP_MAX_AGE_MS`**。
+
+### 审查对象
+工作区未提交：`src/lib/task-split-memory.ts`（新，158 行）、`src/app/tasks/[id]/page.tsx`（+101/−15）、`tests/task-split-memory.test.ts`（新）、`tests/task-left-tab-memory.test.ts`（改了一条正则）、`scripts/browser-e2e/r17-task-split-restore.cjs` + `split-restore-harness/`（新）、`docs/BROWSER-AUTOMATION.md`（+1 条）。功能：按任务记住「产物栏 / 事件流栏哪一栏是收起的」，下次进这个任务时还原。
+
+### 门禁（我自己跑的）
+- `tsc --noEmit` 退出码 0；`eslint . --max-warnings 0` 退出码 0（我的后台脚本里那次没带 `--max-warnings 0`，已用严格模式单独补跑）。
+- 全量 `vitest run`（脱离终端后台跑，日志末尾 `FULL_DONE`，323 秒）：**1209 个文件通过 / 3 个跳过，26899 个用例通过 / 19 个跳过，0 失败**。与 R16 复审时相比 +1 文件、+52 用例；`task-split-memory.test.ts` 单跑正好 **52 条**，增量全部来自它。跑完我按 mtime 核过 4 个关键文件，期间没被再改；无残留进程。
+- 真 Electron：`node scripts/browser-e2e/run.mjs scripts/browser-e2e/r17-task-split-restore.cjs` → **`SMOKE SUMMARY 19/19 passed`**；跑完 `git status` 没多出任何产物（harness 用 vitest 带的 vite 打进临时目录）。
+
+### 逐点核对（我读到的源码原文）
+| 关注点 | 结果 | 依据 |
+|---|---|---|
+| 存储层健壮性 | 无问题 | `task-split-memory.ts` 用 `Map` 做中转（`__proto__` 之类的 taskId 不会污染原型）；读写全程 `try/catch` 吞错（隐私模式 / 配额满不影响页面）；超过 `TASK_SPLIT_MAX_ENTRIES = 100` 按插入序淘汰最旧；`writeTaskSplit(id, null)` 是删条目，不留空壳 |
+| 只有「用户动作」才写 | 无问题 | `onLayoutChanged` 里 `collapsedPaneFromLayout(layout)` 为 `"unknown"`（布局里缺一个 Panel）直接不写，其余要 `userResizeIntentRef.current.isActive(Date.now())` 才写——拖分隔条 / 键盘才算，窗口缩放引起的库内自动折叠、还原本身触发的布局变化都不写。按钮路径（`toggleSplitLayout` / `restoreEventStreamFromMaximize` / `toggleBrowserMaximize` / `showBrowserPane`）各自在展开或折叠成功后显式 `rememberSplit(...)` |
+| 还原时机 | 无问题 | `useLayoutEffect`：任务已加载 + `mainWidth != null`（= `ResizablePanelGroup` 已挂）+ 两个 Panel 句柄都在，之后才置 `restoredSplitFor.current = taskId`——句柄没到就 return，不会「标了已恢复却没恢复」；子组件的 layout effect 先于父组件跑，同一次提交里句柄已就位。A→B 切任务时 `[id]` 重置 effect 把 `restoredSplitFor` 清掉，`Group` 是 `key={task.id}` 重挂，B 会重新恢复 |
+| `applyTaskSplitRestore` | 无问题 | 只做折叠；目标句柄缺失 → `false`；`collapse()` 后用 `isCollapsed()` 回读确认，任何一步抛错都返回 `false`（调用方据此不置「放大」标记）。「两个句柄都在才恢复」是页面 layout effect 自己的前置条件（`!artifact \|\| !eventStream` 就 return），不是这个函数的 |
+| 待回答提问的例外 | 结论对，理由写偏（R17-02） | `pane === "event-stream" && pendingAskIdRef.current` 时不收，我顺着时序推过：不加这条例外，恢复把事件流收起之后 `useRevealOnNewAsk` 的 effect 不会再跑（依赖只有 `askId`、它没变），答题卡就被藏到没人请它出来。所以例外**必要且正确** |
+| 与「放大」的关系 | 无问题 | 恢复到「事件流收起 + 左栏停在浏览器」时置 `browserMaximizedRef.current = true`，之后关浏览器 / 切回产物才会替用户还原事件流；拖出来的收起（左栏在产物上）不置，保持原样。`onResize` 里「事件流重新露出 → `browserMaximizedRef = false`」没动 |
+| 左栏标签记忆联动 | 无问题 | 恢复到浏览器标签时 `showBrowserPane({ keepCollapsed: readTaskSplit(id) === "artifact" })`：产物栏记成收起就不替用户展开；其余入口（头部按钮、AI 自动开浏览器、桥）调 `showBrowserPane()` 不带参数，行为不变（我 grep 过 `showBrowserPane` / `registerBrowserPanelOpener` 全部调用方）。`keepCollapsed` 为真时跳过 `prepareBrowserPaneEntry`，也就不会误写「展开」 |
+| 删除任务 | 无问题 | `handleTaskDeleted` 里 `forgetTaskSplit(deletedId)` |
+| 库版本 | 属实 | `package.json` `^4.11.1`、`pnpm-lock.yaml` 解析到 `4.11.1`，与代码里用的 `usePanelRef` / `onLayoutChanged` / `isCollapsed()` 一致 |
+| `BROWSER-AUTOMATION.md` 新增的一条 | 属实 | 「100 条上限」「19 项 e2e」我都核对了（e2e 我自己跑出 19/19）；它也如实写了「`useLayoutEffect` 只靠源码契约守」「未在真 App 里看 UI」 |
+
+### R17-02 [P4] [记录项] 页面里「待回答提问不还原折叠」的注释，对 `useRevealOnNewAsk` 的描述不准（结论对、理由错）
+- 位置：`src/app/tasks/[id]/page.tsx` 约 959–960 行：「`useRevealOnNewAsk` 只认『新出现』的提问（页面打开时就在等的不算新）」。
+- 事实：hook 注释说的「首次渲染已在等的不算新」只在**首次渲染时 task 已有数据**才成立；而任务页首帧 `task === null`（事件走 `fetchTask` → `absorbTask` 才进来），`askId` 是 `null`，页面打开时就在等的提问对 hook 来说其实是 `null → x` 的上升沿，会触发 `shouldRevealForNewAsk`。没触发 reveal 的真正原因是**那一刻 `hidden()` 为假**（Group 还没挂、事件流没折叠），而恢复折叠发生在这之后、effect 不会重跑。
+- 后果：只有注释误导。将来有人把 hook 的 `prev` 改成「以任务 id 起步」之类，可能会误以为这个例外可以删。
+- 建议（顺手，不用再来一轮）：把那句注释改成「恢复折叠发生在 `useRevealOnNewAsk` 对这条提问跑完 effect 之后，它不会再跑一次，所以必须在恢复处自己避开」。
+
+### R17-03 [P4] [记录项] 事件流这一栏里不止有答题卡
+- 事实：`id="event-stream"` 的 Panel 里还有错误卡的「重试」（`StreamActionsProvider`）、底部 `TaskTalkComposer`（跟 AI 说话的输入条）、`TalkQueueBanner`、`ScheduleChip`。现在只有「待回答提问」做了例外；其他需要用户处理的东西（失败的轮次要点重试、想发一句话）在记住收起后，也会跟着被收着。
+- 为什么不要求改：收起是用户亲手选的、头部有展开按钮，这一栏本来就允许被收起（记忆之前，用户当次会话里收起同样会遮住它们）；要补的话要先定「什么算必须露出」的口径，属产品取舍。记在这里，是因为记忆让「忘了自己收起过」的概率比以前高。
+- 建议：先观察；如果你自己用着觉得「回来发现事件流收着、AI 其实已经失败 / 在等我」很烦，再把例外扩成「任务状态为失败 / 等待用户」时也不收。
+
+### 我核过、确认没有问题的（别重复查）
+- `collapsedPaneFromLayout` 的阈值与 `isArtifactCollapsedSize`（<1%）同口径；两个 Panel 的占比都是有限数字才返回 `none` / 某一栏，缺一个 / 非有限数 / 两栏同时 <1% 都返回 `unknown`（调用方不写记忆）。
+- 窄窗口下库自己把事件流折成 0（minSize 保护）不记忆，因为没有用户意图——回到宽窗口时不会被「记着收起」套住。
+- `useBrowserAutoOpen` 的 `onOpen: showBrowserPane` 调用不带参数，AI 自动开浏览器只会在「产物栏确实被收着」时展开它并记成展开，与「最后一次状态为准」一致。
+- 同域多个窗口共用 `localStorage`：后写覆盖先写，无锁，没有一致性要求。
+- SSR：读 `localStorage` 只在 layout effect 里（仅客户端）；React 19 下 `useLayoutEffect` 在服务端渲染不会再告警。
+
+### 没验证 / 局限（如实）
+- **没有在真 Flowship App 的任务页里看过任何 UI**（规则不允许）。e2e 的 harness 是**复刻**页面的 Panel 结构和恢复 effect（真库 + 真 `task-split-memory` + 真 `ui/resizable` 包装），**不是页面本身**；页面里的 `useLayoutEffect` 本体只受源码契约测试保护，harness 与页面之间若发生漂移，e2e 不会报。这是开发已写明的局限，我认同它是当前能做到的最好。
+- `inert` / `eventStreamCollapsed` 状态在恢复路径上的联动，我只从 `onResize → setEventStreamCollapsed` 的代码推过，没在真页面验证。
+- Windows / 网页版（非 Electron）没跑；逻辑不依赖 Electron，但没实测。
+- 首屏事件只取尾部 `EVENT_TAIL` 条：若待回答提问不在尾部里，`pendingAskId` 会是 `null`、例外不生效。agent 在等答复时不再产出事件，提问基本一定在尾部，我没造这个场景。
+
+### 给用户（不是给开发 AI）
+- **可以放心合**：门禁全绿、没有 P0–P2；这个功能我只在「真库 + 复刻页面」的层面验证过，**建议你在真 App 里亲手点三下**：①收起事件流 → 切走再回来（应还是收起）；②在浏览器标签上点「放大」→ 切走再回来；③让 AI 发起一个提问、并保持事件流是收起的状态离开任务，回来应该看到事件流是展开的、答题卡在。
+- **没提交、没进 v1.9.49**：这批改动是 v1.9.49 之后的。要发版的话 `src/lib/whats-new.ts` 要加一条（按 `AGENTS.md`，文案要你批准），建议写成「任务页会记住你收起的是哪一栏（产物 / 事件流），下次进这个任务还是那个状态」。
+- 提交前别漏 `git add`：`src/lib/task-split-memory.ts`、`tests/task-split-memory.test.ts`、`scripts/browser-e2e/r17-task-split-restore.cjs`、`scripts/browser-e2e/split-restore-harness/`；**`scripts/browser-e2e/r14-experiment-tmp.cjs` 是调查用临时文件，不要提交**。
+- 我这边没 commit / push / tag，也没删任何东西。
+
+（R17 审查结束；`STATE: 收敛`，第 6 行未改。）
+
+---
+
+## R18 审查（reviewer，2026-11-13 11:1x）：用户让我再审——这次是 R17 之后新增的两批未提交改动
+
+**结论先说**：门禁全绿，**没有 P0 / P1**；有 **1 条 P2 是「你自己拍板过的取舍」（R18-01，需要用户知情后确认，不要求开发改）**，**1 条 P3 真 bug（R18-03，数据会静默丢，建议顺手修）**，另 1 条 P3 文案 + 1 条 P4。`STATE` 仍写 `收敛`（第 6 行没动）：按协议收敛线是「没有新增 P0 / P1」，且 R18-01 是用户已拍板的决定、R18-03 触发条件苛刻。**但 R18-03 我建议修，用户若要修请让开发 AI 改。**
+
+### 审查对象（相对 R17 审查时新增的）
+1. **`advance_next` 第一期**（今天 10:34 前后改的）：撤掉「`user_words` 必填 + 服务端逐字核对用户原话」，授权改由 AI 按 `prompts/_super.md` 新增的「外部动作」一节自己判断。涉及 `advance-chain.ts` / `advance-chain-runner.ts` / `flowship-tools.ts` / `browser/handback.ts` / `browser/tools.ts`（只改注释）/ 4 个提示词 / 4 个测试文件 / `docs/HANDOFF.md`。
+2. **chat 用户消息「原地编辑」里能看 / 删 / 加图**（昨天 18:09 前后）：新 `user-edit-form.tsx`、`user-edit-images.ts`、`rows.tsx` / `event-stream.tsx` / `resend-payload.ts` / `row-view-keys.ts` / `view-memory.ts` 的接线 + `tests/user-edit-images.test.ts`。
+3. 分栏收起态记忆：R17 已审，**`page.tsx` / `task-split-memory.ts` / 对应测试的 mtime 与 R17 审查时逐位相同，没动**，结论不变。
+
+### 门禁（我自己跑的）
+- `tsc --noEmit` 退出码 0；`eslint . --max-warnings 0` 退出码 0。
+- 全量 `vitest run`（脱离终端后台跑，日志末尾 `FULL_DONE`，353 秒）：**1210 个文件通过 / 3 个跳过，26914 个用例通过 / 19 个跳过，0 失败**（R17 审查时 1209 / 26899：+1 文件 `user-edit-images.test.ts`、净 +15 用例）。跑的期间 7 个关键源码文件 mtime 与开跑前一致，无残留进程。
+- **没有重跑真 Electron e2e**：这两批改动都不在 `electron-app/` 里，也没有对应的 e2e 脚本。
+
+### 一、`advance_next` 去核对：我核过的
+| 关注点 | 结果 | 依据 |
+|---|---|---|
+| 被删符号没有残留引用 | 无问题 | `tsc` 通过；我 grep 了 `src` / `prompts`（排除 docs、tests）里的 `isUserWordsGrounded` / `collectAuthorizationSources` / `normalizeForQuoteMatch` / `ADVANCE_CHAIN_GROUNDING_EVENT_TAIL` / `ADVANCE_CHAIN_WORDS_MIN_NORMALIZED`：0 处 |
+| 工具改读 `getTaskMeta` 够不够用 | 无问题 | `getTaskMeta` 返回 `assembleTask(raw, [])`，带 `mode` / `currentActionId` / `actions`，工具只用到这三样 |
+| 仍在的硬闸 | 都还在、都有用例 | 连续自动推进 ≤3（`isAutoAdvanceCapReached`）、一次性 + `opGen` / 当前 action / 已交卷快照比对、4 小时 TTL、登记后用户本人插话作废（`isUserOwnWordsEvent`，白名单没动）、`dev` 必须显式 `dev_push_mode`、`NON_OWNER_TURN_ALLOWED_TOOLS` 不含 `advance_next`（测试仍钉着）——`advance-chain.test.ts` 里这些用例我都在清单里看到了 |
+| 提示词一致性 | 无问题 | `_super.md` / `_shared.md` / `action-build.md` / `action-review.md` 里旧说法（「逐字引用」「用户没说过就不用」「那句原话授权到哪就到哪」）已清；`advance-chain-wiring.test.ts` 用 `not.toContain` 钉着，同时断言新的「外部动作」一节 8 个关键短语 |
+| 被删的测试是不是在放水 | 合理 | 被删的都是「原话必须能在事件里找到」那一类（它们测的机制已撤）；`isUserOwnWordsEvent` 口径（群里 / 定时备忘 / 浏览器交还 / 未知来源不算）的用例改名保留，没有被删；新增了「不带 `user_words` 也能登记」「转述 / 只有群里说过 ship 也登记」「超长拒绝」「schema 不必填」 |
+| `browser/handback.ts` / `tools.ts` | 只改注释 | 「交还消息不是授权凭据」改成「不算用户又说话了」，与新机制一致；`browser-handback.test.ts` 保留了「browser 来源不触发取消自动推进」这条安全钉 |
+
+### R18-01 [P2] [用户已拍板的取舍；不要求开发改，需要你知情后确认] 去掉原话核对后，「AI 登记 ship / dev」只剩提示词一道软约束，而这两步的外部副作用撤不回
+- 位置：`src/lib/server/flowship-tools.ts` `advanceNextDef.handler`（原来 `isUserWordsGrounded` 那段整段删了）；`prompts/_super.md`「外部动作」一节是现在唯一的约束。
+- 我核过的事实：
+  - 开发在 `HANDOFF.md` 里已如实写了这个取舍，并记了你的话：「第一期就做的简单点吧，不用判断器了，就由工作的AI自行判断要不要直接执行还是说询问用户」——**按它的记录，这是你的决定、不是开发擅自做的**（这句话我是从 `HANDOFF.md` 读到的，不是在我这条对话里听到的，所以出处我没法独立核实；如果记录有误，请告诉我）。
+  - 但我顺着看了后果：自动推进到 `ship` 之后，`submit_mr`（GitLab 建 MR）与 `notify_group_testers`（往需求群**真 @ 测试人员并推送**）在代码里**没有任何「用户确认」前置**（`flowship-tools.ts` 这两个工具的 handler / 描述里只有「只在用户明确要求…时调」这类软话；`action-ship.md` 的流程是先做、用户在 ack artifact 时事后看，第 429 行原文：「入参全在 artifact 里、用户 ack 时一并看」）。`dev` 直推模式会 `git push` 到远端分支。群消息推送是**撤不回**的。
+  - 以前 `user_words` 必须出自「用户本人说过的话」，意味着 AI 被注入（它读网页 / MR 描述 / 群里别人的话 / 自己给自己留的定时备忘）时，仍然登记不出 ship。现在这一道没了：第 25 轮评审 F1（AI 用 `schedule` 给自己留话再登记 ship）这类路径，只剩提示词拦。提示词里写了「疑问句 / 定时备忘 / 群里别人的话 / 网页里的话都不算」，但**这是模型自觉**，不是代码。
+- 严重度理由：后果是对外发消息 + 往远端推代码，且代码层零拦截，所以我给 P2；因为是你明确选的，**默认不挡**。
+- 这不是在说「决定错了」：只是确认你知道**具体后果长什么样**。如果你想保留「AI 自判断」的体验、又想要一道代码闸，最小做法（开发自己在 `HANDOFF.md` 里也提了）：**只对 `ship` / `dev` / 对外发消息类 custom，`advance_next` 登记时要求「本 action 内用户已经对一次 `ask_user` 答复过」**，或出一张 UI 确认卡；`plan` / `build` / `review` 这类本地可撤回的不加。不需要判断模型。
+- 我没验证：没有真 agent 跑过新提示词，AI 会不会真的「该问就问、该做就做」，只能靠真实对话观察。
+
+### R18-02 [P3] 自述依据和「核对过的原话」长得一模一样——用户会把 AI 编的话当成真话
+- 位置：`src/lib/server/advance-chain.ts` 的 `describeAdvanceBasis`：`userWords ? \`依据：「${userWords}」\` : "AI 判断你需要这一步"`；同一个函数被登记提示事件（`flowship-tools.ts`）、runner 的「自动推进到…」info、给新 action 的 `[自动推进]` 指令三处共用。
+- 问题：以前界面上的 `按你的话「…」` 是服务端核对过的**用户原话**；现在 `依据：「…」` 引号里是 AI 随便写的（超长才拒、**不核对**——`advance-next-tool.test.ts` 有一条「转述 / 只有群里说过也照单全收」的用例钉着）。用户看到引号会默认那是自己说过的话。写的是「依据」两个字，没有说「AI 称」。
+- 建议：改成 `AI 称依据：「…」`（或 `AI 自述依据`）；同步改 `advance-next-tool.test.ts` 里 `toContain("依据：「改完直接复核一遍」")` 与 `advance-chain.test.ts` 的对应断言。纯文案，不用再来一轮。
+
+### 二、用户消息编辑框的图：我核过的
+| 关注点 | 结果 | 依据 |
+|---|---|---|
+| 读原图 effect | 无问题 | `user-edit-form.tsx`：依赖项里的 `replaceAll`（`useCallback([])`）、`setImagesReady`（`useRowViewState` 明写「setter 引用恒稳定」）都稳定，不会每次渲染重发请求；`cancelled` 守卫让卸载后迟到的结果不写快照、也不写「已读」标记，重挂会重读；读失败走 `.catch(() => ({ images: [], partial: true }))` + toast，不抛 |
+| 读完之前不让动图 | 无问题 | `useImageAttach({ disabled: submitting \|\| loadingOriginals, … })` + 附图按钮 / 发送都禁用：避免「读完整体替换」盖掉刚贴的图 |
+| 发送带的是编辑框里的图 | 无问题 | `onSubmit(trimmed, attach.toUploadPayload() ?? [])` → `rows.tsx` `runEdit(text, ev, images)` → `handleEditInPlace(text, sourceEv, images)` → `buildResendPayload(…, { images })`（传了就原样用、传空数组 = 一张不带、不传才回读原图）；旧「编辑后追加」路径 `handleResend` 也认 `imagesOverride`。edit-rewind 的两条源码契约我对着源码看了，改的正则与新代码一致，没有放宽 |
+| 只有图没字能发 | 无问题 | `canSubmit` 允许 `trimmed.length > 0 \|\| imageCount > 0`；`chat-view.tsx` 的 `submitUserReply` 里本来就写着「纯附件消息不放占位文案」，下游接得住 |
+| 发送失败把图放回输入框 | 无问题 | `mergeRestoredList(uploadPayloadsToPending(payload.images), imagesRef.current, (i) => i.data, maxComposerImages)`：恢复项在前、按内容去重、守 6 张上限；读的是此刻的 `imagesRef.current`、不是闭包旧值 |
+| 清理 | 无问题 | `closeEdit`、`editHandler` 消失的 effect 都调 `clearUserEditImages`（快照 + 「已读」标记一起清）；`view-memory.ts` 的 `DraftScope` 加了 `"edit"`，不影响其它 scope |
+| `rows.tsx` 去掉 `useSubmitShortcut` / `Send` 等导入 | 无问题 | `eslint --max-warnings 0` 通过，说明没有遗漏的未用导入或缺失引用 |
+
+### R18-03 [P3] [构造] 编辑框「原图已读入」标记和图片快照分存两处，快照被全局 LRU 挤掉后标记还在 → 重新挂回时编辑框里没有图、也没有提示，发送后原图永久丢失
+- 位置：`src/components/tasks/event-stream/user-edit-form.tsx`（`loadingOriginals = originalCount > 0 && !imagesReady`、`useImageAttach({ persist: { scope: "edit", … } })`）、`src/lib/user-edit-images.ts`（头注释自己写了「靠它区分『还没读过原图』和『读过、用户全删了』——这两种情况快照都是空」）、`src/lib/view-memory.ts`（`ATTACH_SNAP_COUNT_CAP = 20`、`attachSnapBytesCap = 100MB`，**`reply` / `talk` / `ask` / `edit` 四种 scope 共用一个 Map**，按最近写入淘汰）。
+- 问题：标记在 `rowViewStateStore`（600 条上限的 LRU），快照在 `attachmentSnapshots`（20 条 / 100MB 的另一个 LRU）。两边寿命不一致。快照是「图本体」，被淘汰时标记不一定跟着没。我已 grep 过：除了 LRU 淘汰、`clearUserEditImages`、`use-rich-input` / `task-terminal` 对其它 scope 的清理，没有别处会删 `"edit"` 快照。
+- 构造的触发：编辑一条带图的消息（原图读进来，标记 = true，快照 = 原图）→ 行滚出视口被卸载，或者切去别处 → 期间别的位置又攒了 ≥ 20 条未发送的图片快照（各任务输入框、答题卡的图），或总量超过 100MB（base64，一张几 MB 的截图，十几张就够）→ 这条编辑快照被挤掉；标记还在 → 重新挂回：`loadingOriginals = false`，`attach.images = []` → 编辑框里**没有图、没有「载入附图…」、没有 toast** → 用户只改了字、点发送 → `onEditRewind` 把原消息及之后的对话删掉 → 新消息带 **0 张图**发出，原图随原消息一起没了，且回退不可撤销。
+- 证据：原文如上。`tests/user-edit-images.test.ts` 第 201 行「读过原图后用户把图全删了（有标记、快照被删空）→ 编辑框里没有图，也不会又读回来」钉死的正是这个状态——**用户亲手全删**和**快照被淘汰**产生的是同一个状态，当前代码分不开。
+- 后果：只会在「同时有大量未发送的图」时发生，概率低（所以 P3）；但一旦发生是**静默丢数据**、不可恢复，这比一般 P3 重。
+- 建议（二选一，都很小）：①标记不存「已读入」而存「用户是否主动清空」：用户把最后一张图删掉时才写 `"cleared"`，**快照缺失且标记不是 `"cleared"` → 当作被淘汰，重新读原图**；②或让 `"edit"` scope 的快照不参与 `evictAttachmentSnapshots` 的淘汰（它的生命周期本来就由 `clearUserEditImages` 管）。
+
+### R18-04 [P4] [记录项] 「只有图没字」发送失败回填输入框时，开头会多两个换行
+- 位置：`event-stream.tsx` `handleEditInPlace`：`setDraft((prev) => (prev.trim() ? \`${text}\n\n${prev}\` : text))`。`text` 为空而输入框里已有字时得到 `"\n\n" + prev`。纯外观，不丢数据。建议 `text` 为空时直接保留 `prev`。
+
+### 我核过、确认没有问题的（别重复查）
+- `advance-chain-runner.ts` 只改了一处提示文案（经 `describeAdvanceBasis`），触发判定、快照比对、`advanceTask` 的 CAS 都没动。
+- `useRowViewState` 在 key 为 `null` 时退化成普通 `useState`：`imagesReadyKey = editKeys?.imagesReady ?? null` 在没有 key 的场景不会持久化，也不会抛。
+- `loadUserReplyImages` 对「没贴过图」直接返回空、不发请求；全部读不到 → 空 + `partial = true`，编辑框据此 toast；网络异常也只算读不到，不抛（用例都在）。
+- `docs/HANDOFF.md` 对 `advance_next` 第一期的描述与代码逐条对得上（被删的符号名、保留的硬闸、测试改动）；它也自己标了「文档里旧说法已失效」的位置。
+
+### 没验证 / 局限（如实）
+- **没有在真 App 里看过任何 UI**：编辑框的缩略图 / 粘贴 / 拖拽 / 6 张上限、「载入附图…」的显示都只有 `useImageAttach` + 渲染 / 源码契约测试；没有对应的真 Electron e2e。
+- 没有真 agent 验证新提示词（见 R18-01）。
+- R18-03 是我读码构造的，**没有在真页面里挤出来**（挤出来要造 20 个带图的位置或 100MB 快照）；`event-stream.tsx` 其余 2500 多行我只读了这次 diff 涉及的几个函数。
+- `docs/HANDOFF.md` 里没有「编辑框加图」那一批的条目（只有 `advance_next` 那一条）——不影响运行，提交前可让开发补一句。
+
+### 给用户（不是给开发 AI）
+- **直接答「有没有问题」**：没有会让程序出错的问题；**有一个你需要知道的取舍（R18-01）**和**一个建议修的小 bug（R18-03）**。
+- **R18-01**：你让 AI 自己判断后，AI 要是误判（或被网页 / 群里的话带偏），会**直接提 MR 并在需求群 @ 测试人员**，代码不拦；@ 消息发出去撤不回。你要是接受这个风险就不用动；想留一道保险，让开发 AI 做「ship / dev 要先有一次用户答复的 ask_user」就行。
+- **R18-03**：编辑带图的消息时，极端情况下（同时攒了很多未发送的图）图会被悄悄丢掉，且发送后原图删了找不回来。概率低，改动小，建议让开发 AI 顺手修。
+- **没提交、没进任何版本**：分栏收起态记忆（R17 审过）+ 这两批都在工作区。要发版的话 `src/lib/whats-new.ts` 要加条目，文案要你批准。
+- 提交前别漏 `git add`：`src/lib/task-split-memory.ts`、`tests/task-split-memory.test.ts`、`scripts/browser-e2e/r17-task-split-restore.cjs`、`scripts/browser-e2e/split-restore-harness/`、`src/components/tasks/event-stream/user-edit-form.tsx`、`src/lib/user-edit-images.ts`、`tests/user-edit-images.test.ts`；**`scripts/browser-e2e/r14-experiment-tmp.cjs` 是调查用临时文件，不要提交**。
+- 我没 commit / push / tag，也没删任何东西。
+
+（R18 审查结束；`STATE: 收敛`，第 6 行未改。）
+
+---
+
+## R19 审查（reviewer，2026-11-13 13:2x）：用户让我继续审——R18 之后新增的「聊天通道」两批改动
+
+**结论先说**：门禁全绿，**没有 P0 / P1 / P2**；只新增 **1 条 P3（R19-01，一行代码就能补的硬闸）**。R18 的处理情况见下表：**R18-03（会静默丢图的那条）开发还没动**。`STATE` 仍写 `收敛`（第 6 行没动）。
+
+### 门禁（我自己跑的）
+- `tsc --noEmit` 退出码 0；`eslint . --max-warnings 0` 退出码 0。
+- 全量 `vitest run`（脱离终端后台跑，日志末尾 `FULL_DONE`，415 秒）：**1211 个文件通过 / 3 个跳过，26942 个用例通过 / 19 个跳过，0 失败**（R18 时 1210 / 26914：+1 文件 `oneshot-session-memory.test.ts`（10 条）、净 +28 用例）。跑的期间 12 个关键源码 / 测试文件 mtime 与开跑前一致，无残留进程。
+- 真 Electron e2e **没跑**：这两批改动都在服务端 `task-runner` / 工具清单 / 提示词里，没有对应的 e2e 脚本，也不碰 `electron-app/`。
+
+### R18 的处理情况（我逐项核了代码，不采信自述）
+| 条目 | 状态 | 依据 |
+|---|---|---|
+| R18-01（P2，去核对后只剩提示词） | **用户已决定先观察，不加代码闸** | `HANDOFF.md` 记了这个结论，并写明「以后要加时注意：『本 action 内有用户 `ask_user` 答复』这个条件会让用户明说『提测吧』时也被多问一次」——这个提醒是对的。**但聊天通道的 AI 现在也能登记 ship，入口变多了**（见下 R19-01 与「给用户」） |
+| R18-02（P3，引号里是 AI 自述） | **已修** | `advance-chain.ts` `describeAdvanceBasis`：`AI 称依据：「…」`；我 grep 了整个 `src`，旧的 `依据：「` / `按你的话` 文案 0 处残留；测试已同步、全绿 |
+| R18-03（P3，编辑框原图标记与快照分存 → 静默丢图） | **没动** | `user-edit-form.tsx` / `user-edit-images.ts` / `view-memory.ts` / `event-stream.tsx` 的 mtime 仍是 11-12 18:03–18:09，没有 `"cleared"` 标记或快照豁免淘汰的改动 |
+| R18-04（P4，回填多两个换行） | 没动（不挡） | 同上 |
+
+### 审查对象
+1. **一次性聊天 agent 的会话记忆**（`oneshot-session-memory.ts` 新、`task-runner.ts` `startOneShotQuestion` / `installSessionIfCurrent` / `consumeSessionRun`、`task-question-inject.ts` 一处文案）：答完仍 `close()`，只记 `agentId`，下一条消息 `Agent.resume` 接回同一段对话；接不回 / 送不进去 / 换模型 / 换提供方 / 换目录 / 过期（6 小时）/ 到顶（40 轮）都退回「新起一个、带完整背景」。
+2. **`advance_next` 进一次性通道，起点可以是「还没有 action」**（`advance-chain.ts` 的 `fromActionId: string | null`、`evaluateChainFire`、`flowship-tools.ts` handler、`one-shot-tools.ts`、`advance-chain-runner.ts`、`schedule.ts` 一行提示词、边界提示词）。
+
+### 我核过的（别重复查）
+| 关注点 | 结果 | 依据 |
+|---|---|---|
+| 非属主群提问会不会串进这条通道 / 共用记忆 / 拿到 `advance_next` | **不会** | `startOneShotQuestion` 全仓只有 `task-question-inject.ts` 1471 行一处调用；它前面 1411–1437 行的 `if (questionOnly) { … startRestrictedGroupQuestion(…); return … }` 先把群里非属主的提问分走了；`ONE_SHOT_SYSTEM_TOOL_NAMES` 只在 `task-runner.ts` 6467 行（`startOneShotQuestion` 内）使用，受限答疑 agent 没有 `callerToken`，系统工具挂不上。所以属主的聊天上下文不会被群里的人接到，群里的人也登记不出推进 |
+| 起点为 `null` 的核对 | 无问题 | `evaluateChainFire` 顺序：任务在不在 → TTL → `opGen` → chat 型拒绝 → `(currentActionId ?? null) !== chain.fromActionId` 就让位 → 只有 `fromActionId !== null` 才核「已交卷」→ 步数上限。`advanceTask` 的 CAS 是 `input.expectedCurrentActionId !== undefined` 才查，`null` 就是「期望没有 action」；`fromActionId` 的所有使用处（runner 8 处、handler 1 处、`advance-chain.ts` 3 处）都处理了 `null`（提示事件不挂 action、失败事件用展开写法） |
+| 一次性 agent 收尾的 `done` 是不是 runner 订阅的那一帧 | 属实 | `task-runner.ts` 5680–5693：`onQuestionRunFinished?.()` 在前，随后 `publish(task.id, { kind: "done", task: freshQ ?? task, ok: true })`，**不带 `origin`**；`handleAdvanceChainFrame` 只认 `ev.origin === undefined` 的 `done` |
+| 记忆「记下」与「失效」的竞态 | 两种先后都安全 | `memEpoch` 在入场任何 `await` 前抓；`rememberOneShotMemory` 在 `finally` 里按它写，`installSessionIfCurrent` 里 `lease()` 通过后才 `invalidateOneShotMemory`（推进 epoch）：先失效后收尾 → epoch 对不上、不写；先收尾后失效 → 被清掉。lease 不过什么都不动 |
+| 接不回的回退 | 走得通 | ①`Agent.resume` 抛错 → `discardOneShotMemory` → `openFreshAgent()`；②resume 成功但 `send` 抛错 → `abortStaleQuietly()`（我读了，**只是 `close()` 当前 agent**，不动 runStatus / starting）→ 丢弃记忆 → 新起 → 带完整背景重发，`resumedFrom = null` 使 `turnsBefore` 从 0 算、`callerToken` 沿用同一个。③**pi 后端对缺文件会不会静默建空会话**（我担心的：「清理缓存」会删 `pi-sessions` 里不在任何任务锚点里的文件，一次性 agent 的会话文件正好不在锚点里）：`custom-agent-backend.ts` `resumeCustomAgent` 明确 `existsSync` 不存在就抛 `E_SESSION_MISSING`、空会话抛 `E_SESSION_EMPTY`，注释还写了「pi 对缺失文件会静默建空会话……缺文件 / 空会话一律抛」——所以走回退，不会出现「接上了但没有背景」 |
+| 没干净结束就不信任 | 无问题 | `turn.clean` 只由 `onQuestionRunFinished` 置；`turn.sent` 但不干净 → `discard`；没送出去（早退让位）→ 不动 |
+| 工具面 | 无问题 | `agentInput` 里 `callerToken` / `systemToolNames` 每轮重新装，`create` / `resume` 共用同一份；pi 的 `resumeCustomAgent` 也是按 `input` 重建工具，所以逐轮改工具清单（见 R19-01 的建议）对 resume 同样有效 |
+| 登记侧起点判定 | 无问题 | 有 current action 时必须是 `running` / `awaiting_ack` / `completed`，`error` / `cancelled` 拒绝；没有 current action → 登记、`fromActionId: null`；`currentId` 存在但找不到该 action 也拒绝；连续 ≤3 步上限、TTL、`opGen`、用户本人插话作废都沿用 |
+| 测试 | 合理 | 无起点触发 / 让位、清单三件套、`token` 没登记被拒、无起点登记成功（真 `task-fs` + 真工具）、记忆状态机 10 条、`startOneShotQuestion` 的 8 条（接回只带新一句 / resume 抛错回退 / send 抛错回退并关旧 agent / 换模型不接 / run 报错丢弃 / 正式会话装进来失效且在飞旧一轮写不回 / 绑群后补群能力 / 定时轮次接回） |
+
+### R19-01 [P3] 定时到点的一次性轮次，在代码层也拿得到 `advance_next`——「定时那条通道别用」只靠一行提示词
+- 位置：`src/lib/server/task-runner.ts` `startOneShotQuestion`：`const agentInput = { …, systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES, … }` 不分 `scheduled`；`scheduled` 只影响提示词（`boundaryLines` 取 `SCHEDULE_ONE_SHOT_BOUNDARY_LINES`，其中新增了一行「这条通道里的 `advance_next` 别用：定时到点是你自己留的备忘、不是用户在场说话」）。
+- 问题：定时到点的那一轮是**没有用户在场**的、由 AI 自己早先留的备忘触发的。那一轮里它可以直接登记 `advance_next`（plan / build / ship / dev…），本轮结束后 runner 代用户推进——这正是第 25 轮 F1（AI 用 `schedule` 给自己留话 → 到点再登记 ship）那条路径，原来的代码闸（`user_words` 必须出自用户本人的话）R18-01 已按你的决定撤掉，现在这条路上**只剩这一行提示词**。开发在 `HANDOFF.md` 里把它列成已知局限 3，如实。
+- 为什么我单独记一条：R18-01 的「给 ship / dev 加用户确认」要动登记协议、要想清楚体验，是个设计题；**而这一条是一行代码的事**——工具清单本来就是每轮在 `startOneShotQuestion` 里传的：`systemToolNames: scheduled ? ONE_SHOT_SYSTEM_TOOL_NAMES.filter((n) => n !== ADVANCE_NEXT_TOOL_NAME) : ONE_SHOT_SYSTEM_TOOL_NAMES`。这样定时轮次根本看不到这个工具，提示词那行也可以删。后果面与 R18-01 同类（本地代码改动 / 提 MR / 往群里推送），所以我给 P3、不挡。
+- 构造的触发：任务没推进过，用户在聊天里让 AI「明早九点帮我看下 X，没问题就提测」→ AI 用 `schedule` 留话 → 次日到点那一轮（无人在场）里 AI 登记 `advance_next(ship)`。提示词让它「用户明说才登记」，模型是否遵守没有代码保证。
+- 同类的、我没要求改的：**正式会话里的定时到点轮次**同样带全部工具（含 `advance_next`），那个工具清单是整会话固定的，没法逐轮收窄，只能靠 R18-01 的方案解决。
+
+### 没验证 / 局限（如实）
+- **没有真 agent 跑过**：`Agent.resume` 的真实延迟、长对话（接近 40 轮）的表现、`sdk-store-gc` 清掉 Cursor 存储后的回退，都只在 fake agent 层验证过。开发的 3 项变异检查（去掉「干净结束记下」「`installSessionIfCurrent` 里的失效」「`remember` 的 epoch 判断」，对应用例变红）我**没有复现**。
+- **没有端到端**「真起一次性 agent → 登记 `advance_next` → 收尾 → runner 触发 `advanceTask`」整条链的测试（开发已写明）；我只是顺着源码把 `done` 帧（不带 `origin`）→ `handleAdvanceChainFrame` → `fireAdvanceChain` → `waitRunSettled` → `evaluateChainFire` → `advanceTask` 的接线逐段读通了。
+- 记忆槽满 200 个任务时 epoch 墓碑会被挤掉、读回 0：若一轮入场时抓的恰好也是 0（任务从没失效过），挤掉之后旧一轮的写入会被接受。要同时有 200 个别的任务在这一轮的几分钟里写记忆，单用户场景下不可能，我只当 P4 说明、不记条目。
+- `task-runner.ts` 约 6900 行，我只读了这次 diff 涉及的函数与它们的邻近代码。
+- UI 文案「正在接上刚才的对话…」按「有记忆」判断，记忆存在但对不上（换了模型 / 目录）或接不回时文案会说错（开发已写明，无碍）。
+
+### 给用户（不是给开发 AI）
+- **直接答「有没有问题」**：没有会让程序出错的新问题；**有两件事你可能想让开发 AI 改**：①R18-03（编辑带图消息时，极端情况静默丢图）——**他这次还没改**；②R19-01（定时到点的聊天轮次不该有「自动推进」这个工具，一行代码）。
+- **R18-01 的提醒更新**：聊天里的 AI 现在也能登记「提测 / 联调推送」，且代码层没有拦截（只靠提示词里「用户明说才登记，自己觉得该做就先问」）。聊天通道又带着浏览器工具，AI 会读网页。你定了「先观察」，我不挡；只是这个入口让「被网页内容带偏」的可能路径多了一条。
+- **这一批的好处我也核实了**：记忆让「AI 在回复里先问、你回一句『好』再登记」这类两轮对话真的连得上（以前每条消息冷启动，问过什么它不记得）。
+- **仍然没提交、没进任何版本**：分栏记忆 + 编辑框加图 + `advance_next` 第一期 + 聊天通道两批，全在工作区。要发版 `src/lib/whats-new.ts` 要加条目，文案要你批准。
+- 提交前别漏 `git add`：`src/lib/server/oneshot-session-memory.ts`、`tests/oneshot-session-memory.test.ts`，以及之前列过的 `task-split-memory.ts`、`user-edit-form.tsx`、`user-edit-images.ts`、`task-split-memory.test.ts`、`user-edit-images.test.ts`、`r17-task-split-restore.cjs`、`split-restore-harness/`；**`scripts/browser-e2e/r14-experiment-tmp.cjs` 是调查用临时文件，不要提交**。
+- 我没 commit / push / tag，也没删任何东西。
+
+（R19 审查结束；`STATE: 收敛`，第 6 行未改。）
+
+---
+
+## R20 处理记录（reviewer，2026-11-13 13:3x）：R18-03 与 R19-01 由评审方按用户「改」直接修了
+
+> 这一节不是新审查，是记录：用户对「R18-03、R19-01 要不要改」答「改」，授权**我（评审方）**动手，所以这两条不是开发 AI 改的。没有 commit / push / tag，没删任何东西。开发 AI 接手前请先读下面列的文件，别按旧版本覆盖。
+
+### 改了什么
+| 条目 | 状态 | 改动 |
+|---|---|---|
+| R18-03（P3，快照被挤掉 → 编辑框静默 0 图 → 发送后原图永久丢失） | **已修** | 采用我当时建议的 ①：快照是唯一事实，标记只记「用户亲手把最后一张图删了」。`lib/user-edit-images.ts` 新增 `USER_EDIT_IMAGES_CLEARED = "cleared"` 与纯函数 `shouldLoadOriginalImages({ originalCount, snapshotImageCount, userCleared })`（原消息有图 && 快照没图 && 没有「全删了」标记 → 读原图，覆盖「没读过」和「快照被挤掉」）；`row-view-keys.ts`：`userEditImagesReady` → `userEditImagesCleared`（`user:editImagesCleared`）、`userEditViewKeys().imagesReady` → `.imagesCleared`；`rows.tsx` / `user-edit-form.tsx`：prop `imagesReadyKey` → `imagesClearedKey`；组件挂载时记下快照条数、本次挂载读完（含全部读失败）置 `originalsSettled` 不再转圈；删图统一走组件内 `removeImage`，删到空才写标记 |
+| R19-01（P3，定时到点的一次性轮次也有 `advance_next`，只靠一行提示词） | **已修** | 采用我当时建议的做法，并做成具名函数：`one-shot-tools.ts` 新增 `ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES`（= 用户在场清单去掉 `advance_next` = `schedule` / `wait`）与 `oneShotSystemToolNames(scheduled)`；`task-runner.ts`：`systemToolNames: oneShotSystemToolNames(scheduled === true)`；`schedule.ts`：边界提示词那行从「`advance_next` 别用」改成「这里没有 `advance_next`…」（事实陈述，不再是「请你别用」） |
+| 其余 | 没动 | R18-01（用户定「先观察」）、R18-04（P4）、正式会话里的定时轮次仍带全部工具——这一点我在 R19-01 末尾就写了「清单整会话固定、收窄不了」，仍属 R18-01 的范围 |
+
+### 我对这两处改动自己再核的点
+- **R18-03 的取舍（说实话）**：快照被挤掉时，用户之前在编辑框里的增删会丢、编辑框回到「原消息的图」——但这是**看得见的**（有「载入附图…」，且读回来之前发送按钮禁用），不再是静默 0 张图。我没有去改 `view-memory.ts` 的淘汰策略（我当时的方案 ②）：那会让 `edit` 快照在 LRU 里特殊化，牵涉面比这个大。
+- **R19-01 的 resume**：我之前读过 `resumeCustomAgent` 按 `input` 重建工具；这次用测试钉住了「定时轮次 resume 的 `customTools` 里没有 `advance_next`，随后用户轮次 resume 又有」。**Cursor 路径**的 `Agent.resume` 同样把本轮 `local.customTools` 传进去（测试里读的就是它）；**pi 路径**我这次没有另外起 pi 会话验证，依据是 `custom-agent-backend.ts` 里 `resumeCustomAgent` 按入参的 `systemToolNames` 现建工具（R19 审查时读过）+ `buildCustomTools` 单测（定时清单喂进去没有 `advance_next`）。
+- 模型在 resume 回来的历史里看过 `advance_next` 的定义，定时轮次里若仍想调它，只会得到「没有这个工具」的错误，不会登记成功。
+
+### 门禁（我自己跑的）
+- `tsc --noEmit` 退出码 0；`eslint . --max-warnings 0` 退出码 0。
+- 全量 `vitest run`（脱离终端后台跑，日志末尾 `FULL_DONE`）：**第二次 1211 个文件通过 / 3 个跳过，26952 个用例通过 / 19 个跳过，0 失败**（R19 时 26942：+10 = 编辑框 +6、一次性工具清单 +2、定时轮次 +2，wiring 一条拆成两条另算）。
+- **第一次全量有 1 条红，如实记：** `tests/agent-readonly.test.ts` 的 `pi buildReadOnlyToolDefs` 那条，原因是 5000ms 超时（卡在 `await import("@/lib/server/pi-coding-tools")` 这个大模块的冷加载上，不是断言失败）。我没碰过这个文件和它依赖的源码；单跑 3 次都通过（每次约 0.6 秒）；整套重跑一遍 0 失败。我判断是全量并发下的偶发慢，**不是这次改动引起的**，但我只做到「重跑通过」，没有去查为什么这条会在全量里偏慢——以后如果它再红，值得给它加超时或把动态 import 提到文件顶部。
+- 两次变异检查（都已还原）：①把 `shouldLoadOriginalImages` 改成恒 `false` → 3 条红（纯函数 1、淘汰回归 1、「载入附图」基本态 1）；②把 `oneShotSystemToolNames(scheduled === true)` 写死成 `(false)` → 3 条红（接线契约 1、定时轮次 resume 1、定时作为第一轮 create 1）。
+- 门禁期间文件 mtime 检查：自 13:17 起被改动的 `src/` / `tests/` 文件正好是我改的这 11 个（`rows.tsx`、`user-edit-form.tsx`、`row-view-keys.ts`、`schedule.ts`、`one-shot-tools.ts`、`task-runner.ts`、`user-edit-images.ts` 与 4 个测试文件），开跑后没有再被改；无残留的 vitest / tsc / eslint 进程。
+- 真浏览器 / Electron 没跑：编辑框这一块项目没有 jsdom，仍然是 SSR 首帧 + 源码契约 + 纯函数；**从没在真界面里点过「编辑 → 删图 → 滚走 → 回来 → 发送」**，R18-03 修的是状态判定，真机手感没验。
+
+### 给用户（不是给开发 AI）
+- **直接答「改好了没有」**：改好了，两条都是。全量测试最终 0 失败；中间有 1 条偶发超时红（和这次改动无关，重跑过了）。
+- 提交前别漏 `git add`：除之前列过的，**`src/lib/user-edit-images.ts`、`src/components/tasks/event-stream/user-edit-form.tsx`、`tests/user-edit-images.test.ts`** 仍是未跟踪的新文件；`scripts/browser-e2e/r14-experiment-tmp.cjs` 仍是调查用临时文件，**不要提交**。
+- 同步更新了 `docs/HANDOFF.md`：定时通道那条「只是提示词约束」和已知局限 3 已划掉并写明改成代码闸，另加了一块记录这两处是评审方改的。
+
+（R20 处理记录结束；`STATE: 收敛`，第 6 行未改。）

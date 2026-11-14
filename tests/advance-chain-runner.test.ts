@@ -168,6 +168,32 @@ describe("done 帧 → 触发", () => {
     expect(note?.text).toContain(`1/${ADVANCE_CHAIN_MAX_AUTO_STEPS}`);
   });
 
+  it("无起点的链（聊天里登记、当时任务没有 action）：任务仍没有 action → 这一轮结束就推进；CAS 期望「没有 action」，提示不挂 action", async () => {
+    h.setTask(mkTask({ currentActionId: null, actions: [] }));
+    registerAdvanceChain(mkChain({ fromActionId: null, actionType: "plan" }));
+    handleAdvanceChainFrame(T, done(true));
+    await flush();
+    expect(h.advance).toHaveBeenCalledTimes(1);
+    expect(h.advance.mock.calls[0]![0]).toMatchObject({
+      actionType: "plan",
+      expectedCurrentActionId: null,
+      viaAutoChain: true,
+    });
+    const note = h.events.find((e) => e.meta?.subkind === "auto_advance");
+    expect(note?.kind).toBe("info");
+    expect(note?.actionId).toBeUndefined();
+    expect(getAutoAdvanceSteps(T)).toBe(1);
+  });
+
+  it("无起点的链：这期间任务已有 action（用户手动推进过）→ 静默让位", async () => {
+    h.setTask(mkTask({ currentActionId: "a9" }));
+    registerAdvanceChain(mkChain({ fromActionId: null, actionType: "plan" }));
+    handleAdvanceChainFrame(T, done(true));
+    await flush();
+    expect(h.advance).not.toHaveBeenCalled();
+    expect(h.events).toEqual([]);
+  });
+
   it("dev / custom / build 的附加参数原样透传", async () => {
     registerAdvanceChain(mkChain({ actionType: "dev", devPushMode: "mr" }));
     handleAdvanceChainFrame(T, done(true));

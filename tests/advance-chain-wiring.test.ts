@@ -104,17 +104,34 @@ describe("提示词", () => {
   const build = read("prompts/action-build.md");
   const review = read("prompts/action-review.md");
 
-  it("_super 教 advance_next：要原话、没说过就不用、登记≠现在做、有上限", () => {
-    expect(superPrompt).toContain("**`advance_next`（按用户的话自动推进）**");
-    expect(superPrompt).toContain("逐字引用");
-    expect(superPrompt).toContain("用户没说过就不用");
+  it("_super 教 advance_next：AI 自判断、登记≠现在做、有上限；不再要求逐字引用原话", () => {
+    expect(superPrompt).toContain("**`advance_next`（自动推进到下一步）**");
     expect(superPrompt).toContain("登记 ≠ 现在去做下一步");
     expect(superPrompt).toContain("最多连续自动推进 3 步");
+    expect(superPrompt).not.toContain("逐字引用");
+    expect(superPrompt).not.toContain("用户没说过就不用");
   });
 
-  it("_super 教 [自动推进] 载荷怎么读：原话授权到哪就到哪", () => {
+  it("_super 有「外部动作」一节：明说直接做、自己判断先问、哪些话不算、哪些永远先问、拿不准先问", () => {
+    expect(superPrompt).toContain("**外部动作（提 MR / 联调推送 / 对外发消息 / 改工作项状态）：直接做，还是先问用户**");
+    for (const phrase of [
+      "用户明说要做这件事 → 直接做，不再二次确认",
+      "你自己判断「现在该做了」、用户没说 → 先 `ask_user` 问一句",
+      "疑问句",
+      "否定或保留",
+      "`[SCHEDULE_FIRED]`",
+      "群里别人的话",
+      "不自动 merge MR",
+      "拿不准算不算「明说」 → 当作没说，先问",
+    ]) {
+      expect(superPrompt).toContain(phrase);
+    }
+  });
+
+  it("_super 教 [自动推进] 载荷怎么读：依据在括号里，想继续往后推进要用户确有此意", () => {
     expect(superPrompt).toContain("`[自动推进]` 开头的 `[NEXT_ACTION]`");
-    expect(superPrompt).toContain("那句原话授权到哪就到哪");
+    expect(superPrompt).toContain("想继续往后自动推进，要用户确有此意");
+    expect(superPrompt).not.toContain("那句原话授权到哪就到哪");
   });
 
   it("旧措辞已撤：不再说「绝对不自动进入 / 自作主张…由用户在 UI 选」", () => {
@@ -124,11 +141,11 @@ describe("提示词", () => {
     expect(superPrompt).not.toContain("**下一 action 由用户选、不是你选**");
   });
 
-  it("build / review：默认不自己进下一步，授权才走 advance_next，ship 类必须用户点名", () => {
+  it("build / review：不自己进下一步，判断用户有此意才走 advance_next，ship 类用户明说才直接登记、否则先问", () => {
     for (const src of [build, review]) {
       expect(src).toContain("`advance_next`");
       expect(src).toContain("不要自己进入下一 action");
-      expect(src).toContain("点名");
+      expect(src).toContain("用户明说才直接登记，你自己觉得该做就先 `ask_user` 问");
     }
   });
 
@@ -144,6 +161,44 @@ describe("提示词", () => {
     for (const name of ["user_words", "instruction", "custom_action_id", "dev_push_mode"]) {
       expect(superPrompt).toContain(`\`${name}\``);
     }
+    // user_words 现在只是 AI 自述的依据：schema 里是可选
+    const required = (tool.parameters as { required?: string[] }).required ?? [];
+    expect(required).not.toContain("user_words");
+  });
+});
+
+describe("聊天里的 AI 也握有推进主导权（一次性通道）", () => {
+  it("用户在场的一次性清单含 advance_next、名字就是 flowShipTools 里那个；定时到点那一轮的清单不含它（R19-01：代码闸、不只靠提示词）", async () => {
+    const {
+      ADVANCE_NEXT_TOOL_NAME,
+      ONE_SHOT_SYSTEM_TOOL_NAMES,
+      ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES,
+      oneShotSystemToolNames,
+    } = await import("@/lib/server/one-shot-tools");
+    const { flowShipTools } = await import("@/lib/server/flowship-tools");
+    expect(ONE_SHOT_SYSTEM_TOOL_NAMES).toContain(ADVANCE_NEXT_TOOL_NAME);
+    expect(flowShipTools.map((t) => t.name)).toContain(ADVANCE_NEXT_TOOL_NAME);
+    expect(ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES).not.toContain(ADVANCE_NEXT_TOOL_NAME);
+    expect(oneShotSystemToolNames(false)).toBe(ONE_SHOT_SYSTEM_TOOL_NAMES);
+    expect(oneShotSystemToolNames(true)).toBe(ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES);
+    const { SCHEDULE_ONE_SHOT_BOUNDARY_LINES } = await import("@/lib/schedule");
+    const lines = SCHEDULE_ONE_SHOT_BOUNDARY_LINES.join("\n");
+    expect(lines).toContain("这里没有 `advance_next`");
+    expect(lines).not.toContain("`advance_next` 别用");
+  });
+
+  it("task-runner：一次性 agent 的 systemToolNames 按本轮 scheduled 现算（不再是写死的同一份清单）", () => {
+    const src = read("src/lib/server/task-runner.ts");
+    expect(src).toContain("systemToolNames: oneShotSystemToolNames(scheduled === true),");
+    expect(src).not.toContain("systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES");
+  });
+
+  it("task-runner 的聊天通道提示词：主导权在 AI（登记推进或问用户）、用户仍可手点；旧的「引导用户点推进」口径已撤", () => {
+    const src = read("src/lib/server/task-runner.ts");
+    expect(src).toContain("主导权在你：你判断该正式走一步了，就调 `advance_next` 登记");
+    expect(src).toContain("用户随时也能自己点「推进」");
+    expect(src).toContain("提测（ship）/ 联调推送（dev）/ 往群里发消息这类对外动作，用户明说才登记");
+    expect(src).not.toContain("你没有任务链上下文");
   });
 });
 

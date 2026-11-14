@@ -106,11 +106,14 @@ import {
   skipWait,
   type ImagePayload,
 } from "@/lib/task-store";
-import { runOptimisticSubmit } from "@/lib/optimistic-submit";
+import {
+  runOptimisticSubmit,
+  uploadPayloadsToPending,
+} from "@/lib/optimistic-submit";
 import { appendToDraft, registerComposerInsert } from "@/lib/composer-insert-bridge";
 import { shouldAutoFocusComposer } from "@/lib/composer-refocus";
 import { createSubmitLatch, startLatchedSubmit } from "@/lib/composer-actions";
-import { restoreDraftMerged } from "@/lib/talk-draft-merge";
+import { mergeRestoredList, restoreDraftMerged } from "@/lib/talk-draft-merge";
 import { MAX_PATHS } from "@/hooks/use-path-attach";
 import type { Task, TaskEvent } from "@/lib/types";
 import { isCompactionInfo } from "@/lib/compaction-display";
@@ -2117,7 +2120,12 @@ const EventStreamImpl = ({
   // 返回 false = 失败（编辑态保持）；true = 成功
   const resendLockRef = useRef(false);
   const handleResend = useCallback(
-    async (text: string, sourceEv?: TaskEvent): Promise<boolean> => {
+    async (
+      text: string,
+      sourceEv?: TaskEvent,
+      // 编辑框发送时传：编辑后的最终这组图（可为空数组），不再按原消息回读；原样重发不传
+      imagesOverride?: ImagePayload[],
+    ): Promise<boolean> => {
       if (resendLockRef.current) return false;
       resendLockRef.current = true;
       try {
@@ -2130,8 +2138,14 @@ const EventStreamImpl = ({
 
         let images: ImagePayload[] | undefined;
         let attachments: string[] | undefined;
+        if (imagesOverride !== undefined && imagesOverride.length > 0) {
+          images = imagesOverride;
+        }
         if (sourceEv) {
-          const imgs = extractUserReplyImages(sourceEv.meta);
+          const imgs =
+            imagesOverride !== undefined
+              ? []
+              : extractUserReplyImages(sourceEv.meta);
           if (imgs.length > 0) {
             const payloads = await Promise.all(
               imgs.map((img) =>
@@ -2176,17 +2190,25 @@ const EventStreamImpl = ({
 
   // chat 原地编辑任意一条用户消息：编辑后的内容替换「这条及之后的对话」，然后从这里重新跑。
   // 顺序：先回读图 / 附件（回退会删事件，图要在删之前取）→ 父组件 确认 / 停 / 回退 → 发新消息。
-  // 回退成功但新消息没发出去时旧消息已经删了，把用户打的字放回输入框、别让它丢。
+  // 回退成功但新消息没发出去时旧消息已经删了，把用户打的字和图放回输入框、别让它丢。
+  // images = 编辑框里最终这一组图（用户可能删了原图、贴了新图）；不传才按原消息回读。
   // 返回 false = 没改成（编辑态保持）；true = 回退已提交（这一行已不在了，编辑态随之消失）。
+  const replaceComposerImages = rich.attach.replaceAll;
+  const maxComposerImages = rich.attach.maxImages;
   const handleEditInPlace = useCallback(
-    async (text: string, sourceEv?: TaskEvent): Promise<boolean> => {
+    async (
+      text: string,
+      sourceEv?: TaskEvent,
+      images?: ImagePayload[],
+    ): Promise<boolean> => {
       if (!sourceEv || !onEditRewind || resendLockRef.current) return false;
       resendLockRef.current = true;
       try {
-        const payload = await buildResendPayload(task.id, {
-          ...sourceEv,
-          text,
-        });
+        const payload = await buildResendPayload(
+          task.id,
+          { ...sourceEv, text },
+          images !== undefined ? { images } : undefined,
+        );
         if (payload.imagesPartial) toast.warning("部分附图未能带上");
         const rewound = await onEditRewind(sourceEv);
         if (rewound !== "ok") return false;
@@ -2201,6 +2223,17 @@ const EventStreamImpl = ({
         );
         if (sent === false) {
           setDraft((prev) => (prev.trim() ? `${text}\n\n${prev}` : text));
+          if (payload.images && payload.images.length > 0) {
+            // 与输入框已有的图合并（此刻的、不是闭包里的）：恢复项在前、按内容去重、守上限
+            replaceComposerImages(
+              mergeRestoredList(
+                uploadPayloadsToPending(payload.images),
+                imagesRef.current,
+                (i) => i.data,
+                maxComposerImages,
+              ),
+            );
+          }
           inputRef.current?.focus();
           toast.warning(
             "已回到这条消息之前，但新消息没发出去；内容已放回输入框，可修改后重发",
@@ -2211,7 +2244,14 @@ const EventStreamImpl = ({
         resendLockRef.current = false;
       }
     },
-    [onEditRewind, task.id, setDraft, inputRef],
+    [
+      onEditRewind,
+      task.id,
+      setDraft,
+      inputRef,
+      replaceComposerImages,
+      maxComposerImages,
+    ],
   );
 
   // 最后一条用户消息：重发入口挂它；「重新生成」也复用它的原文 + 图/附件

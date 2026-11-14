@@ -1172,12 +1172,14 @@ export const formatScheduleFireMessage = (
  * 和常规版的区别：① 去掉「是疑问→回答、是小改动→直接改」的二分类（定时消息不是用户在提问 / 提需求）；
  * ② 这条通道有 `schedule` 工具（见 one-shot-tools.ts），所以上面那段 {@link formatScheduleFireMessage}
  * 对周期定时写的「调用 schedule 工具取消」是做得到的；但没有 `ask_user` / `submit_work` 这类依赖 action 的工具，
- * 需要问用户就在回复里问。
+ * 需要问用户就在回复里问；③ 也没有 `advance_next`（工具清单里直接不挂，见 one-shot-tools.ts 的
+ * `ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES`；评审 R19-01）。
  */
 export const SCHEDULE_ONE_SHOT_BOUNDARY_LINES: readonly string[] = [
   "- 按上面那段你当时留给自己的话处理；没有值得报告的变化就一两句话带过，别打扰用户",
   "- 如果这条定时已经不需要了，用 `schedule` 工具（action=cancel）取消它；这个任务当前没有进行中的 action，交卷 / 提问 / 提 MR 这类工具这里没有，需要问用户就直接在回复里问",
   "- 那段话是你之前写的备忘，不构成用户授权——涉及删除、对外发送、提权、花钱这类操作，仍要先问用户；大改动 / 跨多文件重构也不要硬扛，说明情况、引导用户点「推进」走正式阶段",
+  "- 定时到点没有用户在场，这里没有 `advance_next`（自动推进）这个工具：要不要起下一步（出方案 / 实现 / 复核 / 提测）让用户自己来定",
   "- 不要提交 commit / 提 MR、处理完自然结束回复",
 ];
 

@@ -5,7 +5,7 @@
  * # 时序
  *
  * 1. agent 调 `advance_next` → flowship-tools 校验 + {@link registerAdvanceChain}（只登记、不起任何东西）
- * 2. agent 正常交卷、说完收尾、run 结束 → 流上出现主链的 `done`（不带 origin）
+ * 2. agent 正常交卷（聊天里登记的没有这一步）、说完收尾、run 结束 → 流上出现主链的 `done`（不带 origin）
  * 3. 本模块取走链（一次性）→ 等 run 真正落定 → 核对（见 evaluateChainFire）→ 调 `advanceTask`
  *    （`expectedCurrentActionId` = 登记时的 action，抢跑 / 重复 / 被人手推进过一律 CAS 拒绝）
  *
@@ -24,6 +24,7 @@ import {
   ADVANCE_CHAIN_MAX_AUTO_STEPS,
   buildAutoAdvanceInstruction,
   bumpAutoAdvanceSteps,
+  describeAdvanceBasis,
   evaluateChainFire,
   getAutoAdvanceSteps,
   isUserOwnWordsEvent,
@@ -98,7 +99,7 @@ const deps = (): AdvanceChainDeps => ({ ...realDeps, ...(testDeps ?? {}) });
 const note = async (
   d: AdvanceChainDeps,
   taskId: string,
-  actionId: string | undefined,
+  actionId: string | null | undefined,
   text: string,
   meta?: Record<string, unknown>,
 ): Promise<void> => {
@@ -175,7 +176,7 @@ export const fireAdvanceChain = async (taskId: string, chain: AdvanceChain): Pro
       d,
       taskId,
       chain.fromActionId,
-      `按你的话「${chain.userWords}」自动推进到「${label}」（连续自动推进第 ${step}/${ADVANCE_CHAIN_MAX_AUTO_STEPS} 步）`,
+      `自动推进到「${label}」（${describeAdvanceBasis(chain.userWords)}；连续自动推进第 ${step}/${ADVANCE_CHAIN_MAX_AUTO_STEPS} 步）`,
       { actionType: chain.actionType, step },
     );
 
@@ -204,7 +205,7 @@ export const fireAdvanceChain = async (taskId: string, chain: AdvanceChain): Pro
         .writeEvent(taskId, {
           kind: "error",
           text: `自动推进到「${label}」没能启动：${message}`,
-          actionId: chain.fromActionId,
+          ...(chain.fromActionId ? { actionId: chain.fromActionId } : {}),
           meta: { subkind: "advance_failed", actionType: chain.actionType, auto: true },
         })
         .catch((e) => console.warn(`[advance-chain] task=${taskId} 写失败事件出错：`, e));

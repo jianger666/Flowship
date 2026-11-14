@@ -1278,7 +1278,7 @@ const askTool: FlowshipToolDef = {
         switch (r?.outcome) {
           case "done":
             b.trusted("用户已完成操作。");
-            // note 来自 app 界面里用户亲手填的话，不来自网页，所以按可信文本给；但它依旧不是 advance_next 的授权凭据
+            // note 来自 app 界面里用户亲手填的话，不来自网页，所以按可信文本给；但交还消息（source: browser）不算「用户又说话了」，不会取消自动推进链
             if (note) b.trusted(`用户留言：${note}`);
             if (entries.length > 0) appendUserActivity(b, entries, { header: TOOL_ACTIVITY_HEADER });
             b.trusted("请先 browser_snapshot 查看现状，再继续。");
