@@ -4,7 +4,8 @@
  * 为什么不沿用 task 页的 `task.uiLayout`（setTaskUiLayout）：那条路写进服务端 meta、
  * 字段 / 校验在 server（artifactPanelSize 之外的字段会被 PATCH 路由拒掉），UI 组不能碰。
  * 所以宽度记在本机 localStorage（全局一个值，不分任务——浏览器栏的合适宽度跟屏幕有关、跟任务无关）；
- * 开合只在本次运行内按任务记忆（默认收起，重启后不自动弹出一个空面板）。
+ * 开合只在本次运行内按任务记忆（默认收起，重启后不自动弹出一个空面板）；「放大（盖住对话）」同口径、依附于开着，
+ * 切走再切回仍是放大的（见 coverMemory / settleChatSplitAfterMount）。
  */
 
 export const CHAT_BROWSER_WIDTH_KEY = "flowship.chat-browser-width";
@@ -19,8 +20,8 @@ export const CHAT_BROWSER_MIN_PERCENT = 25;
  */
 export const CHAT_BROWSER_MAX_PERCENT = 100;
 /**
- * 能被**记住**的最大宽度（%）。盖住对话栏时浏览器是 100%，不在此列：那是一次性的「放大」状态，
- * 不写进记忆——否则下次打开浏览器就直接盖住对话，用户得先还原。
+ * 能被**记住**的最大宽度（%）。盖住对话栏时浏览器是 100%，不在此列：「放大」是另一份记忆（coverMemory，只在这次运行、
+ * 这次开着的期间有效），不写进宽度记忆——否则关掉浏览器再打开就直接盖住对话，用户得先还原。
  * 90 而不是 70：大屏上用户拖到 80% 多也是对话还剩 300px 以上的合理宽度，应该被记住。
  */
 export const CHAT_BROWSER_REMEMBER_MAX_PERCENT = 90;
@@ -230,7 +231,8 @@ export const applyChatSplitCommand = (cmd: ChatSplitCommand, handles: ChatSplitH
 /**
  * 挂载后修一次：挂载路径（切任务 / 重进聊天页、open 在内存里是 true）把记住的百分比原样当 defaultSize，
  * 记住 85–90% 而容器放不下 320px 对话栏时，库在注册时就把对话栏折叠了——页面一打开就是被盖住的（审核 R8-03）。
- * 「被盖住」是一次性的放大状态、从不持久化，所以挂载时对话栏折叠一定是库的产物，不是用户意图 → 还原到夹取后的宽度。
+ * 用户的「放大」只存在 coverMemory 里、由 settleChatSplitAfterMount 先按它恢复；走到这里时挂载折叠的对话栏
+ * 一定是库的产物，不是用户意图 → 还原到夹取后的宽度。
  * 没折叠（正常，或库只是夹到了下限）就不动。返回 true = 做了修复。
  */
 export const repairChatSplitAfterMount = (
@@ -248,6 +250,22 @@ export const repairChatSplitAfterMount = (
     { kind: "restore", browserPercent: resolveChatBrowserOpenPercent(rememberedPercent, groupWidthPx) },
     handles,
   );
+};
+
+export type ChatMountSettleResult = "covered" | "repaired" | "none";
+
+/**
+ * 挂载后（首帧绘制前）把分栏摆到该有的样子，调用方只调这一个：
+ *  - 用户上次离开时浏览器是「放大」着的（restoreCover）→ 再放大一次（命令层的 cover），返回 "covered"；
+ *  - 否则 / 放大没生效 → 走原有的 repairChatSplitAfterMount（库自己把对话栏折叠了就还原），返回 "repaired" / "none"。
+ * restoreCover 由调用方判：没记过放大、或此刻有等待回答的提问（答题卡在对话栏里，盖住就看不见了）都传 false。
+ */
+export const settleChatSplitAfterMount = (
+  handles: ChatSplitHandles,
+  opts: { restoreCover: boolean; rememberedPercent: number; groupWidthPx: number | null | undefined },
+): ChatMountSettleResult => {
+  if (opts.restoreCover && applyChatSplitCommand({ kind: "cover" }, handles)) return "covered";
+  return repairChatSplitAfterMount(handles, opts.rememberedPercent, opts.groupWidthPx) ? "repaired" : "none";
 };
 
 /** 存的值有效就用，否则默认；两位小数 */
@@ -295,10 +313,31 @@ export const writeChatBrowserPercent = (
 
 /** 本次运行内「某任务的 chat 浏览器栏开没开」；模块级，切走再切回不丢，重启后默认收起 */
 const openMemory = new Map<string, boolean>();
+/**
+ * 本次运行内「某任务的浏览器是不是『放大』着（盖住对话）」。与 openMemory 同口径：模块级、切走再切回不丢、
+ * 重启后默认不放大（重启后浏览器本身也是收起的，没有「放大着的空面板」这回事）。
+ * 只记用户的选择：点放大 / 还原、拖分隔条；库因为窗口太窄自己把对话栏折叠的不记（窗口放大后它会自己回来）。
+ * 它依附于「开着」：浏览器关了（含库自动收起）就一并忘掉，没开着时读出来恒为 false。
+ * 注意它和宽度记忆是两回事：放大时浏览器是 100%，不写进 CHAT_BROWSER_WIDTH_KEY，所以还原 / 下次打开仍回到用户记住的宽度。
+ */
+const coverMemory = new Map<string, boolean>();
 
 export const readChatBrowserOpen = (taskId: string): boolean => openMemory.get(taskId) === true;
 
 export const writeChatBrowserOpen = (taskId: string, open: boolean): void => {
-  if (open) openMemory.set(taskId, true);
-  else openMemory.delete(taskId);
+  if (open) {
+    openMemory.set(taskId, true);
+    return;
+  }
+  openMemory.delete(taskId);
+  coverMemory.delete(taskId);
+};
+
+export const readChatBrowserCovered = (taskId: string): boolean =>
+  openMemory.get(taskId) === true && coverMemory.get(taskId) === true;
+
+/** 记下 / 忘掉「放大着」。没开着时记不进去（放大依附于开着，见 coverMemory 的说明） */
+export const writeChatBrowserCovered = (taskId: string, covered: boolean): void => {
+  if (covered && openMemory.get(taskId) === true) coverMemory.set(taskId, true);
+  else coverMemory.delete(taskId);
 };

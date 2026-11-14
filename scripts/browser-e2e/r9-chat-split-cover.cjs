@@ -18,6 +18,8 @@
  *   B  挂载路径（R8-03）：记住的宽度大于容器放得下的值时，页面一打开对话栏 ≥320px、不盖住（1000px/85%、1000px/90%、1400px/90%）
  *   C  真鼠标拖分隔条：夹在对话 320px；拖过一半折叠 = 盖住（且 100% 不写进宽度记忆）；从盖住态拖出来；拖到很窄自己收起；大屏高占比写进记忆
  *   D  盖住态下容器缩窄仍盖住
+ *   E  放大记忆：放大着「切走再切回」（卸载 / 重新挂载聊天页）仍是放大的、对话栏不会又被打开；点还原 / X / 拖出来 / 有待回答的提问时不恢复；
+ *      库因容器太窄自己折叠对话栏不算用户选择、不记
  *
  * 只能经启动器运行（AGENTS.md「跑无头 Electron 脚本必须走启动器」）：
  *   node scripts/browser-e2e/run.mjs scripts/browser-e2e/r9-chat-split-cover.cjs --timeout 120
@@ -314,6 +316,111 @@ const run = async () => {
   await sleep(700);
   s = await c.ex(SZ);
   check("D4", "上面这种盖住态下点「还原」：能出来（不盖住、对话 ≥318px、浏览器 ≥298px）", !s.covered && s.main >= 318 && s.browser >= 298, s);
+  c.win.close();
+
+  // ─── E：放大记忆（切走再切回） ───
+  const MEMO_COVER = `window.__lib.readChatBrowserCovered()`;
+  const REMOUNT = async (c) => {
+    await c.ex(`window.unmountApp()`);
+    await sleep(200);
+    await c.ex(`window.mountApp()`);
+    await sleep(600);
+  };
+
+  // E1：放大 → 切走（卸载）→ 切回（重新挂载）：仍是放大的。这是用户报的那个问题
+  c = await fresh();
+  const base1 = await c.ex(SZ);
+  await cover(c);
+  check("E1a", "点放大后放大记忆为真", (await c.ex(MEMO_COVER)) === true);
+  await REMOUNT(c);
+  s = await c.ex(SZ);
+  check(
+    "E1b",
+    "放大 → 切走再切回：仍是放大的（浏览器占满、对话折叠成 0、inert、内层 overflow:hidden），对话栏没有又被打开",
+    s.open && s.covered && s.main === 0 && near(s.browser, 1400, 8) && s.chatInert && s.innerOverflow === "hidden" && s.panelMounted,
+    s,
+  );
+  // E2：恢复出的放大态点「还原」→ 回到用户记住的宽度（不是 100%），放大记忆清掉；再切走再切回不再盖住
+  await c.ex(CLICK_MAX);
+  await sleep(700);
+  s = await c.ex(SZ);
+  check("E2a", "恢复出的放大态点「还原」：回到放大前的宽度、对话可交互", !s.covered && near(s.main, base1.main, 2) && near(s.browser, base1.browser, 2) && !s.chatInert, { base: base1, after: s });
+  check("E2b", "还原后放大记忆为假", (await c.ex(MEMO_COVER)) === false);
+  await REMOUNT(c);
+  s = await c.ex(SZ);
+  check("E2c", "还原 → 切走再切回：不盖住、仍开着、回到记住的宽度", s.open && !s.covered && near(s.main, base1.main, 2), s);
+  c.win.close();
+
+  // E3：没放大过的普通开着状态，切走再切回不变（不会凭空盖住）
+  c = await fresh();
+  const base3 = await c.ex(SZ);
+  await REMOUNT(c);
+  s = await c.ex(SZ);
+  check("E3", "没放大：切走再切回仍是开着、不盖住、宽度不变", s.open && !s.covered && near(s.main, base3.main, 2) && near(s.browser, base3.browser, 2), { base3, s });
+  c.win.close();
+
+  // E4：放大 → X 关闭 → 切走再切回：关着、不盖住；再点「浏览器」打开：回到记住的宽度、不盖住
+  c = await fresh();
+  const base4 = await c.ex(SZ);
+  await cover(c);
+  await c.ex(CLICK_X);
+  await sleep(700);
+  check("E4a", "放大后点 X 关闭：放大记忆清掉", (await c.ex(MEMO_COVER)) === false);
+  await REMOUNT(c);
+  s = await c.ex(SZ);
+  check("E4b", "关闭后切走再切回：关着、对话占满、不盖住", !s.open && !s.covered && near(s.main, 1400) && s.browser === 0, s);
+  await c.ex(TOGGLE);
+  await sleep(500);
+  s = await c.ex(SZ);
+  check("E4c", "再点「浏览器」打开：回到记住的宽度、不盖住（不能残留放大态）", s.open && !s.covered && near(s.main, base4.main, 2), { base4: base4.main, s });
+  c.win.close();
+
+  // E5：真鼠标拖分隔条——拖到盖住记忆为真，切走再切回仍盖住；从盖住态拖出来记忆为假
+  c = await fresh();
+  let sepE = await c.ex(SEP);
+  await c.drag(sepE.x, sepE.y, 100, sepE.y);
+  s = await c.ex(SZ);
+  check("E5a", "拖到对话只剩 100px = 盖住，放大记忆为真", s.covered && (await c.ex(MEMO_COVER)) === true, s);
+  await REMOUNT(c);
+  s = await c.ex(SZ);
+  check("E5b", "拖出来的盖住也是：切走再切回仍盖住", s.open && s.covered && s.main === 0 && near(s.browser, 1400, 8), s);
+  sepE = await c.ex(SEP);
+  await c.drag(sepE.x, sepE.y, 700, sepE.y);
+  s = await c.ex(SZ);
+  check("E5c", "盖住态下把分隔条拖出来：不盖住，放大记忆为假", !s.covered && s.main > 300 && (await c.ex(MEMO_COVER)) === false, s);
+  await REMOUNT(c);
+  s = await c.ex(SZ);
+  check("E5d", "拖出来之后切走再切回：不盖住", s.open && !s.covered && s.main > 300, s);
+  c.win.close();
+
+  // E6：挂载时有等待回答的提问（答题卡在对话栏里）：不恢复放大、并忘掉放大记忆
+  c = await open("w=1400&h=600&preopen=1&precover=1&pendingask=1");
+  s = await c.ex(SZ);
+  check("E6a", "记着放大、但挂载时有待回答的提问：不盖住、对话可见可交互", s.open && !s.covered && s.main >= 318 && !s.chatInert, s);
+  check("E6b", "并且把放大记忆忘掉（那次展开是替用户做的，不是他的选择）", (await c.ex(MEMO_COVER)) === false);
+  c.win.close();
+
+  // E7：窄容器里记着放大——恢复放大，不会被「库折叠对话栏就还原」的修复路径吃掉
+  c = await open("w=1000&h=600&pct=85&preopen=1&precover=1");
+  s = await c.ex(SZ);
+  check("E7", "1000px / 记住 85% / 记着放大：挂载后是放大的（不被 R8-03 的修复还原成对话 320px）", s.open && s.covered && s.main === 0, s);
+  c.win.close();
+
+  // E8：没记着放大时，R8-03 的修复照旧（1000px / 85%：对话 ≥318px、不盖住）
+  c = await open("w=1000&h=600&pct=85&preopen=1");
+  s = await c.ex(SZ);
+  check("E8", "没记着放大：1000px / 记住 85% 挂载 → 仍被修复成对话 ≥318px、不盖住", s.open && !s.covered && s.main >= 318, s);
+  c.win.close();
+
+  // E9：库因容器太窄自己把对话栏折叠成盖住态（D3），不是用户的选择、不记：切走再切回按记住的宽度（容器放得下时对话栏回来）
+  c = await fresh("w=1400&h=600&pct=76");
+  await c.ex(`document.getElementById('box').style.width='640px'`);
+  await sleep(500);
+  s = await c.ex(SZ);
+  check("E9a", "占比 76% 时容器一步跳窄：库折叠成盖住态（预期），但放大记忆仍为假", s.covered && (await c.ex(MEMO_COVER)) === false, s);
+  await REMOUNT(c);
+  s = await c.ex(SZ);
+  check("E9b", "切走再切回（容器恢复 1400）：不盖住、对话栏回来", s.open && !s.covered && s.main >= 318, s);
   c.win.close();
 
   const failed = results.filter((x) => !x.ok);

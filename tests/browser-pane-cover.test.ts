@@ -20,8 +20,13 @@ import {
   CHAT_MAIN_MIN_PX,
   CHAT_MAIN_PANEL_ID,
   isChatCoveredSize,
+  readChatBrowserCovered,
+  readChatBrowserOpen,
   repairChatSplitAfterMount,
   resolveChatBrowserOpenPercent,
+  settleChatSplitAfterMount,
+  writeChatBrowserCovered,
+  writeChatBrowserOpen,
   writeChatBrowserPercent,
   type ChatSplitHandles,
 } from "@/components/browser/browser-layout-memory";
@@ -281,6 +286,99 @@ describe("repairChatSplitAfterMount：挂载即被库折叠的对话栏要还回
   });
 });
 
+describe("放大记忆：放大着切走再切回，对话栏不能又被打开", () => {
+  // 记忆是模块级 Map：每个用例用自己的 taskId，互不污染
+  let n = 0;
+  const id = () => `cover-memory-${++n}`;
+
+  it("没开着：记不进去、读出来恒为 false（放大依附于开着）", () => {
+    const t = id();
+    writeChatBrowserCovered(t, true);
+    expect(readChatBrowserCovered(t)).toBe(false);
+  });
+
+  it("开着：写 true 读 true，写 false 忘掉；任务之间互不影响", () => {
+    const a = id();
+    const b = id();
+    writeChatBrowserOpen(a, true);
+    writeChatBrowserOpen(b, true);
+    writeChatBrowserCovered(a, true);
+    expect(readChatBrowserCovered(a)).toBe(true);
+    expect(readChatBrowserCovered(b)).toBe(false);
+    writeChatBrowserCovered(a, false);
+    expect(readChatBrowserCovered(a)).toBe(false);
+  });
+
+  it("关掉浏览器（含库因窗口太窄自动收起）就忘掉放大；再打开不会残留放大态", () => {
+    const t = id();
+    writeChatBrowserOpen(t, true);
+    writeChatBrowserCovered(t, true);
+    writeChatBrowserOpen(t, false);
+    expect(readChatBrowserOpen(t)).toBe(false);
+    writeChatBrowserOpen(t, true);
+    expect(readChatBrowserCovered(t)).toBe(false);
+  });
+
+  it("重复写 open=true 不会清掉放大（onResize 在浏览器栏每次变宽都可能把 open 再写一遍 true）", () => {
+    const t = id();
+    writeChatBrowserOpen(t, true);
+    writeChatBrowserCovered(t, true);
+    writeChatBrowserOpen(t, true);
+    expect(readChatBrowserCovered(t)).toBe(true);
+  });
+});
+
+describe("settleChatSplitAfterMount：挂载后摆分栏——先恢复放大，否则走原有的修复", () => {
+  it("要恢复放大：浏览器栏占满、对话栏折叠成 0（命令层 cover），返回 covered", () => {
+    const f = makeFakeSplit({ main: 58, browser: 42 });
+    expect(settleChatSplitAfterMount(f.handles, { restoreCover: true, rememberedPercent: 42, groupWidthPx: 1400 })).toBe("covered");
+    expect(f.state).toEqual({ main: 0, browser: 100 });
+    expect(f.calls).toEqual(["browser.resize(100%)"]);
+  });
+
+  it("要恢复放大、而库注册时已经把对话栏折叠了：保持盖住，不会被「修复」还原回去", () => {
+    const f = makeFakeSplit({ main: 0, browser: 100 });
+    expect(settleChatSplitAfterMount(f.handles, { restoreCover: true, rememberedPercent: 85, groupWidthPx: 1000 })).toBe("covered");
+    expect(f.state).toEqual({ main: 0, browser: 100 });
+    // 反例（没有放大记忆）：同样的布局会被修复成对话 320px
+    const g = makeFakeSplit({ main: 0, browser: 100 });
+    expect(settleChatSplitAfterMount(g.handles, { restoreCover: false, rememberedPercent: 85, groupWidthPx: 1000 })).toBe("repaired");
+    expect(g.state).toEqual({ main: 32, browser: 68 });
+  });
+
+  it("不恢复放大：正常布局什么都不动（含有等待回答的提问时，调用方传 false）", () => {
+    const f = makeFakeSplit({ main: 58, browser: 42 });
+    expect(settleChatSplitAfterMount(f.handles, { restoreCover: false, rememberedPercent: 42, groupWidthPx: 1400 })).toBe("none");
+    expect(f.calls).toEqual([]);
+    expect(f.state).toEqual({ main: 58, browser: 42 });
+  });
+
+  it("放大命令的回读也由命令层兜底：浏览器栏命令静默无效时走 Group.setLayout，仍算 covered", () => {
+    const f = makeFakeSplit({ main: 58, browser: 42 }, { deadBrowser: true });
+    expect(settleChatSplitAfterMount(f.handles, { restoreCover: true, rememberedPercent: 42, groupWidthPx: 1400 })).toBe("covered");
+    expect(f.state).toEqual({ main: 0, browser: 100 });
+  });
+
+  it("放大没生效（命令与兜底都不行）→ 退回修复路径，布局不动、不抛错", () => {
+    const f = makeFakeSplit({ main: 58, browser: 42 }, { deadBrowser: true, noGroup: true });
+    expect(settleChatSplitAfterMount(f.handles, { restoreCover: true, rememberedPercent: 42, groupWidthPx: 1400 })).toBe("none");
+    expect(f.state).toEqual({ main: 58, browser: 42 });
+  });
+
+  it("句柄缺失（Group 还没挂好）→ none，不抛错", () => {
+    expect(
+      settleChatSplitAfterMount({ main: null, browser: null, group: null }, { restoreCover: true, rememberedPercent: 42, groupWidthPx: 1400 }),
+    ).toBe("none");
+  });
+
+  it("恢复出的放大态点「还原」：回到用户记住的宽度，不是 100%（放大不写进宽度记忆）", () => {
+    const f = makeFakeSplit({ main: 58, browser: 42 });
+    settleChatSplitAfterMount(f.handles, { restoreCover: true, rememberedPercent: 42, groupWidthPx: 1400 });
+    expect(applyChatSplitCommand({ kind: "restore", browserPercent: 42 }, f.handles)).toBe(true);
+    expect(f.state).toEqual({ main: 58, browser: 42 });
+  });
+});
+
 describe("接线契约（源码）", () => {
   const root = process.cwd();
   const read = (rel: string) => readFileSync(path.join(root, rel), "utf8");
@@ -336,12 +434,56 @@ describe("接线契约（源码）", () => {
     expect(cover).not.toContain('panel.resize("100%")');
   });
 
-  it("hook：挂载即开着的情况在首帧绘制前修一次（R8-03）；只在 initial.open 时做", () => {
+  it("hook：挂载即开着的情况在首帧绘制前摆一次分栏（R8-03 修复 + 恢复放大）；只在 initial.open 时做", () => {
     const i = hook.indexOf("useLayoutEffect(() => {");
     expect(i).toBeGreaterThan(-1);
-    const effect = hook.slice(i, hook.indexOf("}, [initial, splitHandles]);", i));
+    const effect = hook.slice(i, hook.indexOf("}, [initial, splitHandles, taskId]);", i));
+    expect(effect.length).toBeGreaterThan(0);
     expect(effect).toContain("if (!initial.open) return;");
-    expect(effect).toContain("repairChatSplitAfterMount(splitHandles(), initial.percent, wrapperRef.current?.clientWidth)");
+    // 原有的「库自己折叠对话栏就还原」没丢：由 settleChatSplitAfterMount 在不恢复放大时转给 repairChatSplitAfterMount
+    expect(effect).toContain("settleChatSplitAfterMount(splitHandles(), {");
+    expect(effect).toContain("rememberedPercent: initial.percent");
+    expect(effect).toContain("groupWidthPx: wrapperRef.current?.clientWidth");
+  });
+
+  it("hook：放大着切走再切回——挂载时按放大记忆恢复；有等待回答的提问不恢复并忘掉记忆", () => {
+    const i = hook.indexOf("useLayoutEffect(() => {");
+    const effect = hook.slice(i, hook.indexOf("}, [initial, splitHandles, taskId]);", i));
+    expect(effect).toContain("const restoreCover = initial.covered && !hasPendingAskRef.current;");
+    expect(effect).toContain("restoreCover,");
+    // 没恢复成（有提问）要把记忆写成 false：那次展开是我们替用户做的，不是他的选择
+    expect(effect).toContain("if (initial.covered && !restoreCover) writeChatBrowserCovered(taskId, false);");
+    // initial.covered 读的是记忆（按任务）
+    expect(hook).toContain("covered: readChatBrowserCovered(taskId)");
+    expect(hook).toContain("hasPendingAskRef.current = hasPendingAsk;");
+  });
+
+  it("hook：放大 / 还原按钮——命令真生效了才写放大记忆；库驱动的折叠（onMainResize）不写", () => {
+    const cover = hook.slice(hook.indexOf("const toggleCover = useCallback("), hook.indexOf("const revealChat = useCallback("));
+    expect(cover).toContain('if (applyChatSplitCommand({ kind: "cover" }, handles)) writeChatBrowserCovered(taskId, true);');
+    expect(cover).toContain(
+      'if (applyChatSplitCommand({ kind: "restore", browserPercent }, handles)) writeChatBrowserCovered(taskId, false);',
+    );
+    // 库因窗口太窄自己折叠对话栏也会进 onMainResize：那不是用户的选择，不能记（窗口放大后它会自己回来）
+    const onMain = hook.slice(hook.indexOf("const onMainResize = useCallback("), hook.indexOf("const toggleCover = useCallback("));
+    expect(onMain).toContain("setCoverState(");
+    expect(onMain).not.toContain("writeChatBrowserCovered");
+  });
+
+  it("hook：拖分隔条——只有用户意图活跃时才写放大记忆（拖到盖住 = true，拖出来 = false）", () => {
+    const onLayout = hook.slice(hook.indexOf("const onLayoutChanged = useCallback("));
+    expect(onLayout).toContain("if (!intentRef.current.isActive(Date.now())) return;");
+    expect(onLayout.indexOf("isActive(Date.now())")).toBeLessThan(onLayout.indexOf("writeChatBrowserCovered("));
+    expect(onLayout).toContain("writeChatBrowserCovered(taskId, isChatCoveredSize(main))");
+  });
+
+  it("ChatView：pendingAskId 先于 hook 算，并作为 hasPendingAsk 传进去", () => {
+    const view = strip(read("src/components/tasks/chat-view.tsx"));
+    const iAsk = view.indexOf("const pendingAskId = useMemo(");
+    const iHook = view.indexOf("useChatBrowserPane(task.id");
+    expect(iAsk).toBeGreaterThan(-1);
+    expect(iHook).toBeGreaterThan(iAsk);
+    expect(view).toContain("useChatBrowserPane(task.id, true, { hasPendingAsk: pendingAskId !== null })");
   });
 
   it("分栏：Group 与对话栏都把句柄交给 hook；Panel id 与命令层常量一致（setLayout 靠 id 对号入座）", () => {

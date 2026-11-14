@@ -167,10 +167,11 @@ export const ChatView = ({
   onTaskDeleted,
 }: Props) => {
   // 右侧内置浏览器栏：开合 / 宽度记忆 / 自动展开都收在这个 hook 里（默认收起，没打开过零开销）
-  const browserPane = useChatBrowserPane(task.id);
-  // 浏览器「放大」盖住了对话栏时来了新的待回答提问（答题卡就在被盖住的栏里）→ 自动还原（审核 R8-05 ①）。
+  // pendingAskId 要先于 hook 算：浏览器「放大」着切走再切回时 hook 会恢复放大，但此刻有等待回答的提问就不恢复（答题卡在对话栏里）
   // 只看 askId 的上升沿，按 events 引用缓存（流式吐字不重扫）
   const pendingAskId = useMemo(() => pendingAskIdOf(task.events), [task.events]);
+  const browserPane = useChatBrowserPane(task.id, true, { hasPendingAsk: pendingAskId !== null });
+  // 浏览器「放大」盖住了对话栏时来了新的待回答提问（答题卡就在被盖住的栏里）→ 自动还原（审核 R8-05 ①）
   useRevealOnNewAsk(pendingAskId, () => browserPane.chatCovered, browserPane.revealChat);
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
