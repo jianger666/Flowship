@@ -38,6 +38,13 @@ export const buildSessionRebuiltText = (
 };
 
 /**
+ * 连续被安全策略拦截、这次一条历史都没带时的提示（见 policy-block.ts）。
+ * 不能走上面那句：它是「AI 保留了 N 轮」，而这里一轮都没保留、且原因用户得知道。
+ */
+export const buildPolicyBlockOmittedText = (streak: number): string =>
+  `会话已重建：之前的请求已连续 ${Math.floor(streak)} 次被模型方的使用政策拦截，这次没有带入历史对话。需要前情请直接告诉 AI，或让它只回读事件日志里你和它的对话正文。`;
+
+/**
  * 读事件尾、算出实际会灌进起手 prompt 的轮数，有历史就写一条 info。
  * @returns true = 已写入；false = 没有历史 / 读写失败（均不抛）
  */
@@ -52,10 +59,12 @@ export const announceSessionRebuilt = async (
     );
     const selected = selectChatHistoryTurns(events, opts);
     // 扫描窗口之外可能还有更早的对话——与 runChatSession 一样算作 truncated
-    const text = buildSessionRebuiltText(
-      selected.turns.length,
-      selected.truncated || hasMore,
-    );
+    const text = selected.omittedForPolicyBlock
+      ? buildPolicyBlockOmittedText(selected.omittedForPolicyBlock)
+      : buildSessionRebuiltText(
+          selected.turns.length,
+          selected.truncated || hasMore,
+        );
     if (!text) return false;
     const written = await writeEventAndPublish(taskId, { kind: "info", text });
     return written !== null;

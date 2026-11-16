@@ -314,3 +314,76 @@ describe("接线契约 · 两个 runner 的非 finished 抛错都走 buildRunNot
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// 被模型方使用政策拦截（2026-11-16「接手重构马拉松视频」事故）
+// ---------------------------------------------------------------------------
+//
+// 原文取自事故现场 events.jsonl 里的 `Chat agent 异常：…`（run id / requestId 换成了假的）。
+// 这类错对请求内容的判定、不是网络 / 额度问题：原样重试（含自动重连）多半还会被拦。
+
+const policyBlockedRaw =
+  "agent run status=error\n--- SDK stream error message ---\nRequest blocked by Anthropic We are unable to complete this request because it was blocked under Anthropic's Usage Policy.\n--- SDK result dump ---\n" +
+  '{"id":"run-00000000-fake","requestId":"00000000-fake","status":"error","error":{"message":"Request blocked by Anthropic We are unable to complete this request because it was blocked under Anthropic\'s Usage Policy."},"model":{"id":"claude-sonnet-5-5"}}';
+
+describe("summarizeRunFailure · 被使用政策拦截", () => {
+  it("1. 事故原文 → isPolicyBlock、友好文案；原文一字不丢地留在 detail", () => {
+    const r = summarizeRunFailure(policyBlockedRaw, new Error(policyBlockedRaw));
+    expect(r.isPolicyBlock).toBe(true);
+    expect(r.isConnectionDrop).toBe(false);
+    expect(r.isSdkGiveUp).toBe(false);
+    expect(r.text).toContain("使用政策");
+    expect(r.text).toContain("不是网络或额度问题");
+    expect(r.text).not.toContain("SDK result dump");
+    expect(r.detail).toBe(policyBlockedRaw);
+  });
+
+  it("2. 文案只挂在 cause 上（message 是裸 status=error）也认", () => {
+    const err = new Error("agent run status=error", {
+      cause: new Error("Request blocked by Anthropic …Usage Policy"),
+    });
+    const r = summarizeRunFailure("agent run status=error", err);
+    expect(r.isPolicyBlock).toBe(true);
+    // 不会被当成「裸连接断」而去吞（那一类承诺「重试通常可恢复」，这里不成立）
+    expect(r.isConnectionDrop).toBe(false);
+  });
+
+  it("3. 不误伤：其它报错 isPolicyBlock 一律 false", () => {
+    for (const raw of [
+      taskBareDrop,
+      "agent run status=error",
+      "agent run status=error: model overloaded",
+      noProgressRaw,
+      connFailedStreamRaw,
+      "fetch failed",
+      "rate limit exceeded, see usage policy page",
+    ]) {
+      expect(summarizeRunFailure(raw, new Error(raw)).isPolicyBlock, raw).toBe(
+        false,
+      );
+    }
+  });
+
+  it("4. 友好文案 × 路径前缀不会被错误分类器判成额度 / 鉴权（别推「去设置」）", async () => {
+    const { classifyErrorText } = await import("@/lib/error-classify");
+    const r = summarizeRunFailure(policyBlockedRaw, new Error(policyBlockedRaw));
+    for (const prefix of ["", "Chat agent 异常：", "Task agent 失败：", "答疑失败："]) {
+      expect(classifyErrorText(`${prefix}${r.text}`).kind, prefix).toBe("unknown");
+    }
+  });
+});
+
+describe("isRetryableRunError · 被使用政策拦截一律不自动重连", () => {
+  it("1. 原文 → 不重连；attempt 不改变结论", () => {
+    const err = new Error(policyBlockedRaw);
+    expect(isRetryableRunError(policyBlockedRaw, err)).toBe(false);
+    expect(isRetryableRunError(policyBlockedRaw, err, 1)).toBe(false);
+  });
+
+  it("2. 即使同时带网络类关键字 / SDK 自标 isRetryable，也不重连（显式否决，不靠正则碰巧不匹配）", () => {
+    const withNetwork = `${policyBlockedRaw}\n(fetch failed, ECONNRESET)`;
+    expect(isRetryableRunError(withNetwork, new Error(withNetwork))).toBe(false);
+    const err = Object.assign(new Error(policyBlockedRaw), { isRetryable: true });
+    expect(isRetryableRunError(policyBlockedRaw, err)).toBe(false);
+  });
+});

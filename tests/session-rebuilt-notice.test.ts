@@ -174,6 +174,49 @@ describe("announceSessionRebuilt：读事件尾、写一条 info", () => {
     const infos = rebuiltInfos(await readEvents(id));
     expect(infos[0].text).toContain("全部 2 轮");
   });
+
+  /** 一轮「被安全策略拦截」：旧形态落盘（只有正文里的拦截原文）+ 用户再发一条 */
+  const appendBlockedTurn = async (id: string, retry: string): Promise<void> => {
+    await appendEvent(id, {
+      kind: "error",
+      text: "Chat agent 异常：agent run status=error\n--- SDK stream error message ---\nRequest blocked by Anthropic We are unable to complete this request because it was blocked under Anthropic's Usage Policy.",
+    });
+    await appendEvent(id, { kind: "user_reply", text: retry });
+  };
+
+  it("【被安全策略拦截】连续被拦 2 次：只保留最近 4 轮，info 里的 N 与实际带入同口径", async () => {
+    const id = await alloc();
+    await seedHistory(id, 10);
+    await appendEvent(id, { kind: "tool_call", text: "调用 shell" });
+    await appendBlockedTurn(id, "继续呢");
+    await appendBlockedTurn(id, "再试");
+    const cur = await appendEvent(id, { kind: "user_reply", text: "当前这条" });
+
+    await announceSessionRebuilt(id, { skipEventId: cur!.id });
+
+    const infos = rebuiltInfos(await readEvents(id));
+    expect(infos).toHaveLength(1);
+    expect(infos[0].text).toContain("最近 4 轮");
+  });
+
+  it("【被安全策略拦截】连续被拦 ≥3 次：没带任何历史，info 如实说明原因，不谎称「保留了 N 轮」", async () => {
+    const id = await alloc();
+    await seedHistory(id, 3);
+    await appendEvent(id, { kind: "tool_call", text: "调用 shell" });
+    await appendBlockedTurn(id, "继续呢");
+    await appendBlockedTurn(id, "再试");
+    await appendBlockedTurn(id, "再来一次");
+    const cur = await appendEvent(id, { kind: "user_reply", text: "当前这条" });
+
+    const wrote = await announceSessionRebuilt(id, { skipEventId: cur!.id });
+
+    expect(wrote).toBe(true);
+    const infos = rebuiltInfos(await readEvents(id));
+    expect(infos).toHaveLength(1);
+    expect(infos[0].text).toContain("连续 3 次被模型方的使用政策拦截");
+    expect(infos[0].text).toContain("没有带入历史对话");
+    expect(infos[0].text).not.toContain("保留了");
+  });
 });
 
 describe("口径同源契约：与 chat-runner 的接续切片用同一个选择函数和扫描窗口", () => {

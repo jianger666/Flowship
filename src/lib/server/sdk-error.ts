@@ -7,6 +7,8 @@
  * 方便事后直接从 events 定位根因（网络 / 限流 / 认证 / ...）、不用翻 dev server console。
  */
 
+import { isPolicyBlockText, POLICY_BLOCK_TEXT } from "@/lib/policy-block";
+
 /**
  * 从 error 对象抠出结构化字段：code / status / requestId / cause。
  * err 不是对象、或取字段抛错时静默兜底、返回已收集到的部分。
@@ -106,6 +108,9 @@ export interface RunFailureSummary {
   isConnectionDrop: boolean;
   // 命中「SDK 自己放弃了」类终态报错（见 SDK_GIVE_UP_RULES）：text 是友好文案、这类绝不自动重连
   isSdkGiveUp: boolean;
+  // 被模型方使用政策（Anthropic Usage Policy）自动拦截：对请求内容的判定、不是网络 / 额度问题。
+  // 原样重试多半还会被拦，调用方据此：不自动重连、chat 丢掉落盘会话锚点（见 policy-block.ts）
+  isPolicyBlock: boolean;
   // 完整原始诊断串（message + SDK 字段、始终算出）。连接断 / 额度时 text 是友好文案、
   // 但 detail 仍保留原始——调用方落进 error event 的 meta、事后可从 events.jsonl 直接定位、
   // 不必翻 app console。这也是排查「额度 vs 连接断」唯一能留下的线索（SDK 公开 API 不暴露 errorCode）。
@@ -214,6 +219,8 @@ export const isRetryableRunError = (
   // SDK 自己已经重试 / 续接多次才放弃——我们再重连一轮多半只会再重放一遍，最先判否
   //（即使同时带 isRetryable / 网络类关键字也不重连）
   if (summary.isSdkGiveUp) return false;
+  // 被使用政策拦截：重连只会把同一份内容再发一遍、再被拦一次
+  if (summary.isPolicyBlock) return false;
   if (summary.isConnectionDrop) return true;
   const bits = extractSdkErrorBits(err);
   if (bits.isRetryable === true) return true;
@@ -238,12 +245,25 @@ export const summarizeRunFailure = (
   const bits = extractSdkErrorBits(err);
   // 始终算原始诊断、落 meta（连接断 / 额度时 UI 显示友好文案、但原始细节不丢）
   const detail = buildSdkErrorMessage(rawMessage, err);
+  // 被使用政策拦截：一句看得懂的话；原始串照旧在 detail 里（错误卡可展开）。
+  // 放在最前——拦截文案不会和下面几类重叠，且「不是网络问题」这点必须先于任何重试判断说清
+  // 认 detail（= rawMessage + SDK 字段 / cause.message）：拦截文案有时只挂在 cause 上
+  if (isPolicyBlockText(detail)) {
+    return {
+      isConnectionDrop: false,
+      isSdkGiveUp: false,
+      isPolicyBlock: true,
+      text: POLICY_BLOCK_TEXT,
+      detail,
+    };
+  }
   // SDK 自己放弃本轮：一句看得懂的话；原始串（含 SDK error fields）照旧在 detail 里
   const giveUp = matchSdkGiveUp(rawMessage);
   if (giveUp) {
     return {
       isConnectionDrop: false,
       isSdkGiveUp: true,
+      isPolicyBlock: false,
       text: giveUp.text,
       detail,
     };
@@ -260,9 +280,16 @@ export const summarizeRunFailure = (
     return {
       isConnectionDrop: true,
       isSdkGiveUp: false,
+      isPolicyBlock: false,
       text: BARE_RUN_DROP_TEXT,
       detail,
     };
   }
-  return { isConnectionDrop: false, isSdkGiveUp: false, text: detail, detail };
+  return {
+    isConnectionDrop: false,
+    isSdkGiveUp: false,
+    isPolicyBlock: false,
+    text: detail,
+    detail,
+  };
 };

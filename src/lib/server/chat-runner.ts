@@ -59,6 +59,11 @@ import {
   selectChatHistoryTurns,
   type ChatHistoryInject,
 } from "@/lib/chat-history-inject";
+import {
+  CHAT_POLICY_BLOCK_NEXT_STEP,
+  isAnchorBlockedSession,
+  POLICY_BLOCK_AGENT_META_KEY,
+} from "@/lib/policy-block";
 import { isScheduleBoilerplateText } from "@/lib/chat-stream-display";
 import { parseScheduleClientItemId } from "@/lib/schedule";
 import { maybeGenerateChatTitle } from "./chat-title";
@@ -1433,7 +1438,8 @@ const buildOpeningStanceSection = (
   }
 
   const lines: string[] = [];
-  if (historyInject.turns.length > 0) {
+  // omittedForPolicyBlock：被拦截后这次一条历史都没带——turns 空也不是「窗口第一句」，要把交代段带上
+  if (historyInject.turns.length > 0 || historyInject.omittedForPolicyBlock) {
     lines.push(...formatChatHistorySection(historyInject));
     lines.push("## 用户的新消息", "");
   } else {
@@ -2046,6 +2052,27 @@ const registerChatNotifier = (
 };
 
 /**
+ * 落盘锚点是不是「被安全策略拦截的那个会话」：事件尾上最近一次失败是拦截、之后没有正常产出，
+ * 且被拦的就是这个锚点（新事件记了会话 id；被拦之后新起的会话不算，见 policy-block.ts）。
+ * 读盘失败按「没毒」处理——宁可照旧 resume，也不能因为读盘抖一下就丢掉健康会话的上下文。
+ */
+const isAnchorPoisonedByPolicyBlock = async (
+  taskId: string,
+  anchorAgentId: string,
+): Promise<boolean> => {
+  try {
+    const { events } = await readEventsTail(
+      taskId,
+      HISTORY_INJECT_SCAN_EVENTS,
+    );
+    return isAnchorBlockedSession(events, anchorAgentId);
+  } catch (err) {
+    console.warn(`[chat-runner] 读事件尾判拦截失败 task=${taskId}`, err);
+    return false;
+  }
+};
+
+/**
  * V0.11.1：从落盘的 sessionAgentId 恢复 chat 会话（服务重启 / 空闲回收后）。
  * 成功 = 会话表就位、返回本次注册的 instanceId（可立即 sendChatMessage）；失败返 null。
  *
@@ -2104,6 +2131,26 @@ export const resumeChatSession = async (
       console.warn(
         `[chat-runner] task=${task.id} 落盘会话与当前提供方不一致，跳过 resume`,
       );
+      void clearTaskSessionAgentIdIf(
+        task.id,
+        task.sessionAgentId,
+        () => !runningChats.has(task.id),
+      );
+      return null;
+    }
+    // 落盘会话被安全策略拦截「毒」过：它的历史里躺着被拦的内容，resume 只会整份重发、秒被再拦一次。
+    // 新版出错收尾已在拦截当场清锚点；这里兜修复前就卡住的旧对话（锚点还在、事件尾最近一次失败是拦截）。
+    // 返回 null = 与 resume 确定性失败同口径，调用方降级起新会话（带最近几轮对话文字）。
+    if (
+      task.sessionAgentId &&
+      (await isAnchorPoisonedByPolicyBlock(task.id, task.sessionAgentId))
+    ) {
+      console.warn(
+        `[chat-runner] task=${task.id} 落盘会话上次被安全策略拦截、跳过 resume 并清锚点、降级新会话`,
+      );
+      // 守卫只用「内存无会话」、不带 start lease：这里 return 后 finally 会立刻放掉自有预约，
+      // 清锚点是异步落盘（finalGuard 还会再查一遍），带 lease 判断会永远不通过、锚点清不掉。
+      // 不会误清后继会话：clearIf 只清「盘上仍是这个旧 agentId」，新会话落的是它自己的新 id
       void clearTaskSessionAgentIdIf(
         task.id,
         task.sessionAgentId,
@@ -2721,14 +2768,28 @@ const finalizeChatRunIfCurrent = async (
   const message =
     ctx.err instanceof Error ? ctx.err.message : String(ctx.err ?? "");
   const failure = summarizeRunFailure(message, ctx.err);
+  // 被使用政策拦截：拦的是整份请求内容，而被拦的内容（常是某条工具输出）就躺在落盘会话的历史里——
+  // 下面不能再保留锚点，否则下条消息 Agent.resume 接回、整份重发、秒被拦，聊天永远起不来
+  const policyBlocked = failure.isPolicyBlock;
   const eventText = failure.isConnectionDrop
     ? failure.text
-    : `Chat agent 异常：${failure.text}`;
+    : policyBlocked
+      ? `Chat agent 异常：${failure.text}\n${CHAT_POLICY_BLOCK_NEXT_STEP}`
+      : `Chat agent 异常：${failure.text}`;
   // 失败事件走 owned sink——失主不落盘不 publish
+  // meta.policyBlock：事件尾上「连续被拦几次」靠它数（trailingPolicyBlock）；
+  // 再记下被拦的是哪个会话（= 将被清掉的锚点）：之后 resume 前据此分辨「毒会话」与「被拦后新起的健康会话」。
+  // 冷启动占位期 agentId 是空串（还没回填）= 不知道，不写
   await writeOwnedEventAndPublish(taskId, isCurrent, {
     kind: "error",
     text: eventText,
-    meta: { detail: failure.detail },
+    meta: policyBlocked
+      ? {
+          detail: failure.detail,
+          policyBlock: true,
+          ...(rec.agentId ? { [POLICY_BLOCK_AGENT_META_KEY]: rec.agentId } : {}),
+        }
+      : { detail: failure.detail },
   });
   if (!isCurrent()) return false;
   const errorTask = await setTaskRunStatusIfRunOwner(
@@ -2744,10 +2805,12 @@ const finalizeChatRunIfCurrent = async (
   const dropped = failQueuedItemsCapturingTexts(taskId, "error");
   // error 收尾：关内存会话，但保留落盘 sessionAgentId——模型/区域等不可重试错
   // 并不代表持久化 agent 坏了；下条消息走既有「模式 2 resume → 失败降级模式 3」。
+  // 例外：被使用政策拦截（policyBlocked）——毒就在那个会话的历史里，必须清锚点、让下条消息
+  // 起新会话（只带最近几轮对话文字、不带工具输出），见 policy-block.ts。
   // stop / forceClear / rewind 仍走无 keepPersisted 的清锚点路径。
   // reason=error：出错收尾不是用户主动停的，仍在跑的后台子代理会随 close 被取消——让用户看得见
   const closed = closeChatSession(taskId, instanceId, {
-    keepPersisted: true,
+    keepPersisted: !policyBlocked,
     reason: "error",
     queueGenerationBeforeClear,
   });
@@ -3019,7 +3082,8 @@ const handleChatRunFailure = async (
  * 消费一个 chat run 的完整生命周期。
  * 自然 finished = 正常出口：runStatus → awaiting_user（等下一条消息）、**内存会话保留**；
  * cancel → 关内存但保留落盘 sessionAgentId（P0：下一条优先 Agent.resume 续接）；
- * error → 关内存但保留落盘 sessionAgentId（下一条优先 Agent.resume）。
+ * error → 关内存但保留落盘 sessionAgentId（下一条优先 Agent.resume）；
+ *         例外：被使用政策拦截 → 清锚点（毒在会话历史里，resume 只会再被拦，见 policy-block.ts）。
  */
 const consumeChatRun = async (
   task: Task,
