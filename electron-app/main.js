@@ -197,6 +197,9 @@ import {
 } from "./security-products.mjs";
 // 防后台节流实验开关（v1.9.28、默认关）：纯函数在 ./app-nap.mjs（单测直接 import）
 import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
+// 锁屏必黑屏（2026-11-16）：页面里在播的视频会让 Chromium 持有亮屏锁、锁屏后显示器不黑。
+// 不碰页面，锁屏时直接熄屏；依据 / 真机实测见 ./lock-display-off.mjs
+import { createLockDisplayOff, isLockDisplayOffEnabled, readIdle, runPmset } from "./lock-display-off.mjs";
 // server 子进程的 Node 启动旗标（堆上限 + 崩溃取证，走 argv 而不是 NODE_OPTIONS）：./node-options.mjs
 import { buildServerNodeArgs } from "./node-options.mjs";
 // 系统通知 payload 解析（taskId / target:"inbox" 点击去向，N1-12）：./notify-target.mjs
@@ -3526,6 +3529,25 @@ if (!app.requestSingleInstanceLock()) {
       });
     } catch (err) {
       log(`[main] powerMonitor shutdown 监听注册失败：${err?.message || err}`);
+    }
+    // 锁屏 / 解锁（macOS / Windows 触发，Linux 不触发；本功能只在 macOS 启用）：
+    // 内置浏览器里在播的视频会让 Chromium 持有「亮屏锁」，锁屏后显示器因此不黑。
+    // 这里不动页面（AI 仍要能操作浏览器，黑屏后也一样）；只在「Flowship 持有亮屏锁、且没有别的程序也在阻止熄屏」时
+    // 才让显示器熄灭（别的程序也在阻止 / 看不清谁在阻止就不介入，影响范围只限 Flowship 自己造成的亮屏）。
+    // FLOWSHIP_LOCK_DISPLAY_OFF=0 可整体关闭。回调里绝不能抛。
+    try {
+      const lockDisplayOff = createLockDisplayOff({
+        enabled: isLockDisplayOffEnabled(process.env, process.platform),
+        pid: process.pid,
+        execPmset: (args) => runPmset(execFile, args),
+        // 优先读毫秒级键鼠空闲（ioreg），读不到退回 Electron 的整秒值
+        readIdle: () => readIdle(execFile, () => powerMonitor.getSystemIdleTime()),
+        log,
+      });
+      powerMonitor.on("lock-screen", () => lockDisplayOff.onLock());
+      powerMonitor.on("unlock-screen", () => lockDisplayOff.onUnlock());
+    } catch (err) {
+      log(`[main] 锁屏熄屏监听注册失败（不影响使用）：${err?.message || err}`);
     }
     // 机器快照（启动慢定位用：内存/CPU 不够的机器冷启动天然慢，先排除硬件因素）
     try {
