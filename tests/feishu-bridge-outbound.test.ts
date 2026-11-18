@@ -142,6 +142,8 @@ const {
   redactToolDetail,
 } = await import("@/lib/server/feishu-bridge/outbound");
 
+const { __setMermaidRendererForTest } = await import("@/lib/server/feishu-bridge/mermaid-outbound");
+
 const { publishTaskStreamEvent } = await import("@/lib/server/task-stream");
 const { LarkApiError, classifyLarkFailure } = await import("@/lib/server/feishu-bridge/types");
 
@@ -255,6 +257,7 @@ afterEach(() => {
   __resetFeishuOutboundForTest();
   __setFallbackRetryDelayForTest(null);
   __setFinalizeBudgetForTest(null);
+  __setMermaidRendererForTest(null);
   vi.useRealTimers();
 });
 
@@ -284,6 +287,80 @@ describe("formatElapsed / replaceLocalImages", () => {
       async () => "should_not",
     );
     expect(remote).toContain("https://example.com/x.png");
+  });
+});
+
+describe("finalize：Mermaid 围栏出图", () => {
+  const FENCE = "```mermaid\ngraph TD\n  A[开始] --> B[结束]\n```";
+  const lastAnswer = (card: CardMock): string => String(card.pushAnswer.mock.calls.at(-1)?.[0] ?? "");
+  // 出图要写临时文件 / 走真实文件 I/O，finalize 不再能靠几次 flush 等到——等卡片终稿真的被调用
+  const runAndSettle = async (opts: Parameters<typeof runTurnWithHealth>[0]): Promise<CardMock> => {
+    const card = await runTurnWithHealth(opts);
+    await vi.waitFor(() => expect(card.finalize).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    return card;
+  };
+  const fakeRenderer = (over: { available?: boolean; fail?: boolean } = {}) => {
+    const renderPng = vi.fn<(source: string, opts: { timeoutMs?: number }) => Promise<{ png: Buffer }>>(async () => {
+      if (over.fail) throw new Error("Parse error");
+      return { png: Buffer.from("PNG") };
+    });
+    __setMermaidRendererForTest({ isAvailable: () => over.available ?? true, renderPng });
+    return renderPng;
+  };
+
+  it("有渲染能力：终稿里 mermaid 围栏变成「图 + 原围栏」（image_key 来自上传），再 finalize", async () => {
+    const renderPng = fakeRenderer();
+    const card = await runAndSettle({ taskId: "t_mm1", health: {}, answer: `流程如下：\n\n${FENCE}\n\n以上。` });
+    expect(renderPng).toHaveBeenCalledTimes(1);
+    expect(renderPng.mock.calls[0]![0]).toBe("graph TD\n  A[开始] --> B[结束]");
+    const final = lastAnswer(card);
+    expect(final).toMatch(/!\[Mermaid 图\]\(img_key_for_t_mm1-[0-9a-f-]{36}\.png\)\n\n```mermaid\ngraph TD/);
+    expect(final.startsWith("流程如下：\n\n![Mermaid 图]")).toBe(true);
+    expect(final.endsWith("```\n\n以上。")).toBe(true);
+    expect(card.finalize).toHaveBeenCalledTimes(1);
+    // 没有渲染失败的降级文案混进来
+    expect(final).not.toContain("仅 app 内可见");
+  });
+
+  it("没有渲染能力（web 模式 / 旧壳）：终稿与改动前完全一致（围栏原样）", async () => {
+    const renderPng = fakeRenderer({ available: false });
+    const answer = `流程如下：\n\n${FENCE}\n\n以上。`;
+    const card = await runAndSettle({ taskId: "t_mm2", health: {}, answer });
+    expect(renderPng).not.toHaveBeenCalled();
+    expect(lastAnswer(card)).toBe(answer);
+    expect(card.finalize).toHaveBeenCalledTimes(1);
+    expect(uploadImage).not.toHaveBeenCalled();
+  });
+
+  it("渲染失败：围栏原样保留，finalize 照常完成、不被拖垮", async () => {
+    fakeRenderer({ fail: true });
+    const answer = `见图：\n\n${FENCE}`;
+    const card = await runAndSettle({ taskId: "t_mm3", health: {}, answer });
+    expect(lastAnswer(card)).toBe(answer);
+    expect(card.finalize).toHaveBeenCalledTimes(1);
+    expect(card.finalize.mock.calls[0]![0]).toMatchObject({ ok: true });
+  });
+
+  it("同一条回复里 mermaid 图 + 本地图片都换成 image_key（出图结果不被当成本地路径再传一遍）", async () => {
+    fakeRenderer();
+    const card = await runAndSettle({
+      taskId: "t_mm4",
+      health: {},
+      answer: `${FENCE}\n\n另见 ![截图](/tmp/shot.png)`,
+    });
+    const final = lastAnswer(card);
+    expect(final).toMatch(/!\[Mermaid 图\]\(img_key_for_t_mm4-[0-9a-f-]{36}\.png\)/);
+    expect(final).toContain("![截图](img_key_for_shot.png)");
+    // 上传两次：一次 mermaid PNG、一次本地图；image_key（img_ 开头）没有被当本地路径二次上传
+    expect(uploadImage).toHaveBeenCalledTimes(2);
+  });
+
+  it("没有 mermaid 的普通回复：不触发任何出图 / 上传（快路径）", async () => {
+    const renderPng = fakeRenderer();
+    const card = await runAndSettle({ taskId: "t_mm5", health: {}, answer: "普通回复" });
+    expect(renderPng).not.toHaveBeenCalled();
+    expect(uploadImage).not.toHaveBeenCalled();
+    expect(lastAnswer(card)).toBe("普通回复");
   });
 });
 

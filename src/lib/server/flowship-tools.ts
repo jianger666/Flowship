@@ -51,7 +51,7 @@ import {
   type ScheduleRecord,
 } from "@/lib/schedule";
 import { WAIT_TOOL_NAME } from "@/lib/wait-display";
-import { ACTION_LABEL } from "@/lib/types";
+import { ACTION_LABEL, type CustomActionDef } from "@/lib/types";
 import {
   NON_OWNER_TURN_ALLOWED_TOOLS,
   buildNonOwnerToolDenied,
@@ -59,7 +59,7 @@ import {
 import { buildAskWaitCurl, openAskWait } from "./ask-wait";
 import { isNonOwnerTurnActive, touchNonOwnerTurn } from "./non-owner-turn-guard";
 import { cancelSchedule, createSchedule, readSchedules } from "./schedule-store";
-import { createCustomAction, getCustomAction } from "./custom-action-fs";
+import { createCustomAction, getCustomAction, listCustomActions } from "./custom-action-fs";
 import {
   WAIT_MAX_SECONDS,
   WAIT_MIN_SECONDS,
@@ -1036,6 +1036,30 @@ const scheduleDef: FlowshipToolDef = {
 const advanceNextFail = (error: string): { content: FlowshipToolContent } =>
   text(JSON.stringify({ ok: false, error }));
 
+/**
+ * advance_next 的 `custom_action_id` 宽松解析：先按 id（`app:<skill 目录名>` / `team:<名>` / 旧 id），
+ * 对不上再按 skill 名、label 精确匹配——模型常常只知道用户嘴里的「上线审查」或 skill 名 `release-review`，
+ * 不知道 `app:` 前缀规则，以前直接报「定义不存在」、用户点名的 action 就没推起来。
+ * 命中多个（app / team 同名、不同 skill 同 label）不替它挑，报歧义并列出完整 id。
+ */
+const resolveCustomActionRef = async (
+  ref: string,
+): Promise<{ def: CustomActionDef } | { error: string }> => {
+  const byId = await getCustomAction(ref);
+  if (byId) return { def: byId };
+  const all = await listCustomActions().catch(() => [] as CustomActionDef[]);
+  const live = all.filter((d) => !d.legacyPlaybook);
+  const bySkill = live.filter((d) => d.skill === ref);
+  const hits = bySkill.length > 0 ? bySkill : live.filter((d) => d.label === ref);
+  if (hits.length === 1) return { def: hits[0] };
+  if (hits.length > 1) {
+    return {
+      error: `「${ref}」对上了多个自定义 action（${hits.map((d) => d.id).join("、")}）：用其中一个完整 id 重试`,
+    };
+  }
+  return { error: `自定义 action 定义不存在：${ref}` };
+};
+
 const advanceNextDef: FlowshipToolDef = {
   name: "advance_next",
   label: "自动推进下一步",
@@ -1045,7 +1069,7 @@ const advanceNextDef: FlowshipToolDef = {
     "user_words（可选）：你依据的那句用户的话——写出来会展示给用户、方便他核对；没有明确依据就别填。系统不核对它。",
     "调用时机：本 action 的 artifact 写完、submit_work 拿到 [SUBMITTED] 之后调；然后正常说 1-3 句收尾并结束本轮。任务当前还没有进行中的 action（比如用户在聊天里说话、任务还没推进过）时：不用交卷，直接调、说完收尾即可。**不要自己去跑下一步、不要在本轮里替下一个 action 干活**——下一步由系统起一个新的 agent 来做。",
     "instruction：给下一个 action 的指令要点（新 agent 看不到当前对话、只能读 artifact）：写清用户对下一步的具体要求；用户对再往后的步骤也有要求（如「改完再复核」），一并写进去。",
-    "action：plan / build / review / ship / dev / custom。custom 必须带 custom_action_id；dev 必须显式给 dev_push_mode（direct 直推 / mr 提 PR，用户没说用哪种就先 ask_user，不要替他选）；build 可带 batch_ids 指定批次（缺省 = 自由改动，不计批次进度）。",
+    "action：plan / build / review / ship / dev / custom。custom 必须带 custom_action_id（完整 id 形如 `app:<skill 目录名>` / `team:<名>`；只知道用户说的名字时，填它的 label 或 skill 名也行，系统会对上）；dev 必须显式给 dev_push_mode（direct 直推 / mr 提 PR，用户没说用哪种就先 ask_user，不要替他选）；build 可带 batch_ids 指定批次（缺省 = 自由改动，不计批次进度）。",
     `限制：没有人手推进的情况下最多连续自动推进 ${ADVANCE_CHAIN_MAX_AUTO_STEPS} 步（防 复核→改→复核 无限回环，用户手动推进一次后重新计数）；一次性——只对登记它的这一轮有效，用户中途又发了新消息 / 点了停止就作废；同一任务只留最后一次登记。`,
     "返回 { ok:true } = 已登记；{ ok:false, error } = 没登记，按 error 办并在收尾里如实告诉用户「需要你自己推进下一步」。",
   ].join("\n"),
@@ -1095,14 +1119,16 @@ const advanceNextDef: FlowshipToolDef = {
       );
     }
 
+    let customDef: CustomActionDef | null = null;
     if (parsed.target.actionType === "custom") {
-      const def = await getCustomAction(parsed.target.customActionId!);
-      if (!def) {
-        return advanceNextFail(`自定义 action 定义不存在：${parsed.target.customActionId}`);
+      const resolved = await resolveCustomActionRef(parsed.target.customActionId!);
+      if ("error" in resolved) return advanceNextFail(resolved.error);
+      customDef = resolved.def;
+      if (customDef.legacyPlaybook) {
+        return advanceNextFail(`自定义 action「${customDef.label}」是旧格式、已停用`);
       }
-      if (def.legacyPlaybook) {
-        return advanceNextFail(`自定义 action「${def.label}」是旧格式、已停用`);
-      }
+      // 登记规范 id：触发侧按它启动，不再依赖模型填的是 id 还是名字
+      parsed.target.customActionId = customDef.id;
     }
 
     // 先装订阅再登记：装不上就别登记（登记了没人兑现 = 用户以为会自动推进、实际不会）
@@ -1127,8 +1153,7 @@ const advanceNextDef: FlowshipToolDef = {
 
     const label =
       chain.actionType === "custom"
-        ? ((await getCustomAction(chain.customActionId!).catch(() => null))?.label ??
-          "自定义 action")
+        ? (customDef?.label ?? "自定义 action")
         : ACTION_LABEL[chain.actionType];
     // 提示事件写失败不能让模型看到「登记失败」（链已登记，它会重试 → 覆盖同一条、无害，但会白说一句）
     await writeEventAndPublish(taskId, {

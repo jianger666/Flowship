@@ -154,6 +154,34 @@ export const buildArchiveToast = (input: {
 };
 
 /**
+ * 归档进行中的 toast 与「点了就走」的去向（侧栏用）。
+ *
+ * 归档 PATCH 是同步链路（停 agent、清隔离工作区，工作区带依赖目录时要几十秒），用户在等：
+ * - 离开页面要在**点击那一刻**定（用点击时的 activeId）、不能等服务端返回后再 push——
+ *   以前返回时才 `router.push`，而 activeId 还是点击那一帧的闭包值，用户早切去别处了也会被硬拽回排期页；
+ * - 进行中给 loading toast（成败都用同一个 id 就地换成结果），快归档（chat / 非隔离）不闪。
+ */
+export const ARCHIVE_PENDING_TOAST_DELAY_MS = 500;
+
+/** 同一任务的归档进行中 / 结果 toast 共用的 id（就地替换；不同任务各自一条、互不覆盖） */
+export const archiveToastId = (taskId: string): string => `archive-${taskId}`;
+
+/** 归档时正看着这个任务 → 该离开去哪（chat 回对话列表，其余回排期首页）；没在看它 → null（不动路由） */
+export const archiveLeaveTarget = (
+  task: { id: string; mode?: string },
+  activeId: string | undefined,
+): string | null => (activeId === task.id ? (task.mode === "chat" ? "/chats" : "/") : null);
+
+/** 归档进行中的 toast 文案：隔离工作区任务要清目录、多说一句让用户知道可以先去干别的 */
+export const buildArchivePendingToast = (
+  title: string,
+  willCleanup: boolean,
+): { message: string; description?: string } => ({
+  message: `正在归档「${title}」…`,
+  ...(willCleanup ? { description: "正在停止 agent、清理隔离工作区，可以先去做别的" } : {}),
+});
+
+/**
  * 取消归档后有没有定时相关的话要说（恢复了 / 已过点记为已错过 / 已用满次数记为已结束）。
  * 归档 toast 承诺过「N 个定时已取消（取消归档可恢复）」——结果与承诺对不上的两类（Q9-06）也要说，不能静默。
  */

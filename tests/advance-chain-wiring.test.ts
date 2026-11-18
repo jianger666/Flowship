@@ -128,6 +128,39 @@ describe("提示词", () => {
     }
   });
 
+  it("_super：用户这条消息先看是不是「点名要跑一个 action」——命中就 advance_next 登记、不在当前 action 里替它干活（用户说「上线审查一下」却在提测 action 里做完那次）", () => {
+    const at = superPrompt.indexOf("先看是不是「点名要跑一个 action」");
+    expect(at).toBeGreaterThan(-1);
+    // 在二分类规则之前（优先于问 / 改分类）
+    expect(at).toBeLessThan(superPrompt.indexOf("**分类规则（二分类铁则）**"));
+    const section = superPrompt.slice(at, superPrompt.indexOf("**分类规则（二分类铁则）**"));
+    for (const phrase of [
+      "也不在当前 action 里替它干活",
+      "`.flowship-action.json`",
+      "`app:<skill 目录名>`",
+      "`team:<名>`",
+      "label 或 skill 名",
+      "直接 `advance_next` 登记",
+      "原样带上",
+      "〈产出审阅中〉就先重新交卷",
+      "不算点名",
+    ]) {
+      expect(section).toContain(phrase);
+    }
+  });
+
+  it("聊天通道（没有进行中 action 的一次性 agent）同样有「点名要跑 action → advance_next」这条", () => {
+    const src = read("src/lib/server/task-runner.ts");
+    expect(src).toContain("用户点名要跑某个 action（「上线审查一下」");
+    expect(src).toContain("`custom_action_id` 填 label 或 skill 名即可");
+  });
+
+  it("advance_next 工具描述告诉模型 custom_action_id 可以填 label / skill 名", async () => {
+    const { flowShipTools } = await import("@/lib/server/flowship-tools");
+    const tool = flowShipTools.find((t) => t.name === "advance_next")!;
+    expect(tool.description).toContain("label 或 skill 名");
+  });
+
   it("_super 教 [自动推进] 载荷怎么读：依据在括号里，想继续往后推进要用户确有此意", () => {
     expect(superPrompt).toContain("`[自动推进]` 开头的 `[NEXT_ACTION]`");
     expect(superPrompt).toContain("想继续往后自动推进，要用户确有此意");

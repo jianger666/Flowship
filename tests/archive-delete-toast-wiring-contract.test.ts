@@ -36,7 +36,12 @@ describe("归档 toast：文案只认服务端回报（D2b-06）", () => {
 
   it("保留目录时 toast 走 warning 而不是 success", () => {
     expect(sessions).toMatch(/archiveToast\.kind === "warning" \? toast\.warning : toast\.success/);
-    expect(sidebar).toMatch(/archiveToast\.kind === "warning" \? toast\.warning : toast\.success/);
+    // 侧栏的分档在 runArchiveWithFeedback（src/lib/archive-feedback.ts，行为见 archive-feedback.test.ts），组件只传 resultToast
+    expect(sidebar).toContain("await runArchiveWithFeedback({");
+    expect(sidebar).toMatch(/resultToast: \(\{ report \}\) =>\s*buildArchiveToast\(/);
+    expect(src("src/lib/archive-feedback.ts")).toMatch(
+      /outcome\.kind === "warning" \? toast\.warning : toast\.success/,
+    );
   });
 });
 

@@ -204,6 +204,8 @@ export const createServerChannel = ({
           }
           return;
         default:
+          // `mermaid-render-*` 是同一条 IPC 上的另一套协议（electron-app/mermaid-render.mjs 自己挂监听处理），不是未知消息，别刷日志
+          if (msg.kind.startsWith("mermaid-render-")) return;
           log(`[browser-channel] 忽略未知 kind=${msg.kind}`);
       }
     } catch (err) {

@@ -1003,7 +1003,7 @@ describe("源码契约", () => {
     expect(src).toMatch(/#scheduleRefit\(\) \{[\s\S]*?this\.#enqueueEmulation\(/);
   });
 
-  it("Tab.send 是全仓唯一碰 debugger.sendCommand 的地方，并在这里补偿输入坐标", () => {
+  it("Tab.send 是内置浏览器里唯一碰 debugger.sendCommand 的地方（并在这里补偿输入坐标）；唯一例外是 Mermaid 渲染服务的私有隐藏窗口", () => {
     const dir = resolve(root, "electron-app");
     const hits: string[] = [];
     const walk = (d: string) => {
@@ -1014,7 +1014,14 @@ describe("源码契约", () => {
       }
     };
     walk(dir);
-    expect(hits).toEqual(["electron-app/browser/tab.mjs"]);
+    // 例外：electron-app/mermaid-render.mjs（飞书回复里的 mermaid 出图）在**自己的私有隐藏窗口**里发视口模拟 + 截图，
+    // 不碰任何用户 / AI 的标签页、不发输入事件，所以不存在「输入坐标要按缩放补偿」的问题。
+    // 下面把它能发的命令钉死：谁往里加 Input.* 之类的命令，这条就红，逼着重新评估是否该走 Tab.send
+    expect([...hits].sort()).toEqual(["electron-app/browser/tab.mjs", "electron-app/mermaid-render.mjs"]);
+    const mermaidMethods = [...read("electron-app/mermaid-render.mjs").matchAll(/sendCommand\(\s*"([A-Za-z.]+)"/g)].map((m) => m[1]);
+    expect(new Set(mermaidMethods)).toEqual(
+      new Set(["Emulation.setDeviceMetricsOverride", "Page.captureScreenshot", "Emulation.clearDeviceMetricsOverride"]),
+    );
     const src = read("electron-app/browser/tab.mjs");
     expect(src.match(/dbg\.sendCommand\(/g) ?? []).toHaveLength(2); // 同一行三元表达式里的两个分支
     expect(src).toMatch(/const wire = this\.#inputScale < 1 \? scaleInputParams\(method, params, this\.#inputScale\) : params;/);

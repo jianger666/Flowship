@@ -296,6 +296,93 @@ describe("advance_next：拒绝路径（都不登记）", () => {
     expect(t!.events.some((e) => e.text.includes("我的提测流"))).toBe(true);
   });
 
+  describe("custom_action_id 宽松解析：用户嘴里的名字 / skill 名也能对上（用户说「上线审查一下」那次，模型只知道名字、没推起来）", () => {
+    const releaseReview = {
+      id: "app:release-review",
+      label: "上线审查",
+      skill: "release-review",
+    };
+
+    it("填 label → 对上、登记的是规范 id，提示事件用 label", async () => {
+      await userSays("https://x.feishu.cn/wiki/abc\n上线审查一下");
+      vi.spyOn(customActionFs, "listCustomActions").mockResolvedValue([releaseReview] as never);
+      const r = await call({
+        action: "custom",
+        custom_action_id: "上线审查",
+        user_words: "上线审查一下",
+        instruction: "https://x.feishu.cn/wiki/abc",
+      });
+      expect(r.ok).toBe(true);
+      expect(chain.peekAdvanceChain(TASK)).toMatchObject({
+        actionType: "custom",
+        customActionId: "app:release-review",
+        instruction: "https://x.feishu.cn/wiki/abc",
+      });
+      const t = await getTaskWithTailEvents(TASK, 50);
+      expect(t!.events.some((e) => e.text.includes("上线审查"))).toBe(true);
+    });
+
+    it("填 skill 名 → 对上；skill 名优先于 label（同一个词既是某 skill 名又是别家 label 时不串）", async () => {
+      await userSays("上线审查一下");
+      vi.spyOn(customActionFs, "listCustomActions").mockResolvedValue([
+        releaseReview,
+        { id: "app:other", label: "release-review", skill: "other" },
+      ] as never);
+      const r = await call({
+        action: "custom",
+        custom_action_id: "release-review",
+        user_words: "上线审查一下",
+      });
+      expect(r.ok).toBe(true);
+      expect(chain.peekAdvanceChain(TASK)?.customActionId).toBe("app:release-review");
+    });
+
+    it("同名对上多个 → 不替它挑，报歧义并列出完整 id，不登记", async () => {
+      await userSays("上线审查一下");
+      vi.spyOn(customActionFs, "listCustomActions").mockResolvedValue([
+        releaseReview,
+        { id: "team:release-review-2", label: "上线审查", skill: "release-review-2" },
+      ] as never);
+      const r = await call({
+        action: "custom",
+        custom_action_id: "上线审查",
+        user_words: "上线审查一下",
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("app:release-review");
+      expect(r.error).toContain("team:release-review-2");
+      expectNotRegistered();
+    });
+
+    it("旧格式（legacyPlaybook）不参与按名字匹配；对不上 → 「不存在」", async () => {
+      await userSays("上线审查一下");
+      vi.spyOn(customActionFs, "listCustomActions").mockResolvedValue([
+        { id: "ca_old", label: "上线审查", skill: "", legacyPlaybook: "旧正文" },
+      ] as never);
+      const r = await call({
+        action: "custom",
+        custom_action_id: "上线审查",
+        user_words: "上线审查一下",
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("不存在");
+      expectNotRegistered();
+    });
+
+    it("完整 id 直接命中时不查列表（原行为不变）", async () => {
+      await userSays("上线审查一下");
+      vi.spyOn(customActionFs, "getCustomAction").mockResolvedValue(releaseReview as never);
+      const listSpy = vi.spyOn(customActionFs, "listCustomActions");
+      const r = await call({
+        action: "custom",
+        custom_action_id: "app:release-review",
+        user_words: "上线审查一下",
+      });
+      expect(r.ok).toBe(true);
+      expect(listSpy).not.toHaveBeenCalled();
+    });
+  });
+
   it("对话型任务 / 当前 action 出错或被取消 → 拒绝；用户话已备好，确认是状态闸在拦", async () => {
     const reject = async (over: Record<string, unknown>) => {
       await freshTask(over);

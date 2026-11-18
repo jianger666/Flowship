@@ -58,7 +58,12 @@ import {
   type SidebarGroup,
 } from "@/lib/sidebar-groups";
 import { setTaskArchivedWithReport, setTaskPinned, updateTaskFields } from "@/lib/task-store";
-import { buildArchiveToast, buildRestoreToast, restoreToastNeeded } from "@/lib/worktree-report";
+import { runArchiveWithFeedback } from "@/lib/archive-feedback";
+import {
+  buildArchiveToast,
+  buildRestoreToast,
+  restoreToastNeeded,
+} from "@/lib/worktree-report";
 import { isWorktreeTaskLike } from "@/lib/lightweight-task";
 import { cn } from "@/lib/utils";
 import {
@@ -453,76 +458,79 @@ export const AppSidebar = ({ open, width, resizing = false }: AppSidebarProps) =
     // 先乐观、再标记：标记窗口内轮询/SSE 回来的旧快照不得盖掉这一笔
     upsertTask({ ...task, archived: true });
     markArchiving(task.id, true);
-    try {
-      const { task: updated, report } = await setTaskArchivedWithReport(task.id, true);
-      upsertTask(updated);
-      setPinnedOrder((prev) => {
-        const order = prev.filter((id) => id !== task.id);
-        saveSidebarPinnedOrder(order);
-        return order;
-      });
-      if (activeId === task.id) {
-        router.push(task.mode === "chat" ? "/chats" : "/");
-      }
+    // 点了就走 + 进行中反馈 + 成败就地换结果 toast 的时序都在 runArchiveWithFeedback（可单测，见 archive-feedback.ts）；
+    // 这里只负责本地状态：落库后的 upsert / 置顶序、失败后恢复行、撤销
+    await runArchiveWithFeedback({
+      task,
+      activeId,
+      willCleanup,
+      archive: () => setTaskArchivedWithReport(task.id, true),
+      onArchived: ({ task: updated }) => {
+        upsertTask(updated);
+        setPinnedOrder((prev) => {
+          const order = prev.filter((id) => id !== task.id);
+          saveSidebarPinnedOrder(order);
+          return order;
+        });
+      },
       // toast 只认服务端回报（清了 / 保留了哪些工作区、取消了几条定时），不再按任务形状预测（review D2b-06）
-      const archiveToast = buildArchiveToast({
-        title: task.title,
-        wasRunning: task.runStatus === "running",
-        report,
-        plainSuffix: "、可在会话管理找回",
-      });
-      (archiveToast.kind === "warning" ? toast.warning : toast.success)(
-        archiveToast.message,
-        {
-          action: {
-            label: "撤销",
-            onClick: () => {
-              void (async () => {
-                // 恢复方向同样标记：窗口内服务端旧快照（archived:true）不得闪掉刚恢复的行
-                markArchiving(task.id, false);
-                try {
-                  const { task: restored, report: restoreReport } =
-                    await setTaskArchivedWithReport(task.id, false);
-                  upsertTask(restored);
-                  // 撤销也把定时找回来了：说一声（没定时就不打扰）
-                  // （Q9-06：已过点记为「已错过」/ 已用满次数的也要说，不只恢复了才说）
-                  if (restoreToastNeeded(restoreReport)) {
-                    toast.success(buildRestoreToast(task.title, restoreReport));
-                  }
-                  // 恢复归档的置顶时把手动序接回去（跟会话页 restorePinnedOrder 同语义），
-                  // 否则钉还在、序掉到末尾
-                  if (restored.pinned) {
-                    setPinnedOrder((prev) => {
-                      if (prev.includes(task.id)) return prev;
-                      const order = [...prev, task.id];
-                      saveSidebarPinnedOrder(order);
-                      return order;
-                    });
-                  }
-                } catch (err) {
-                  toast.error(`撤销失败：${(err as Error).message}`);
-                } finally {
-                  unmarkArchiving(task.id);
-                }
-              })();
-            },
-          },
+      resultToast: ({ report }) =>
+        buildArchiveToast({
+          title: task.title,
+          wasRunning: task.runStatus === "running",
+          report,
+          plainSuffix: "、可在会话管理找回",
+        }),
+      undoAction: () => ({
+        label: "撤销",
+        onClick: () => {
+          void (async () => {
+            // 恢复方向同样标记：窗口内服务端旧快照（archived:true）不得闪掉刚恢复的行
+            markArchiving(task.id, false);
+            try {
+              const { task: restored, report: restoreReport } =
+                await setTaskArchivedWithReport(task.id, false);
+              upsertTask(restored);
+              // 撤销也把定时找回来了：说一声（没定时就不打扰）
+              // （Q9-06：已过点记为「已错过」/ 已用满次数的也要说，不只恢复了才说）
+              if (restoreToastNeeded(restoreReport)) {
+                toast.success(buildRestoreToast(task.title, restoreReport));
+              }
+              // 恢复归档的置顶时把手动序接回去（跟会话页 restorePinnedOrder 同语义），
+              // 否则钉还在、序掉到末尾
+              if (restored.pinned) {
+                setPinnedOrder((prev) => {
+                  if (prev.includes(task.id)) return prev;
+                  const order = [...prev, task.id];
+                  saveSidebarPinnedOrder(order);
+                  return order;
+                });
+              }
+            } catch (err) {
+              toast.error(`撤销失败：${(err as Error).message}`);
+            } finally {
+              unmarkArchiving(task.id);
+            }
+          })();
         },
-      );
-    } catch (err) {
-      // 先放行再恢复：标记窗口内恢复性 upsert 会被当旧快照拒掉
-      unmarkArchiving(task.id);
-      upsertTask({ ...task, archived: task.archived });
-      toast.error(`归档失败：${(err as Error).message}`);
-      void refresh();
-    } finally {
-      unmarkArchiving(task.id);
-      setArchivingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(task.id);
-        return next;
-      });
-    }
+      }),
+      onFailed: () => {
+        // 先放行再恢复：标记窗口内恢复性 upsert 会被当旧快照拒掉
+        unmarkArchiving(task.id);
+        upsertTask({ ...task, archived: task.archived });
+        void refresh();
+      },
+      onSettled: () => {
+        unmarkArchiving(task.id);
+        setArchivingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(task.id);
+          return next;
+        });
+      },
+      navigate: (to) => router.push(to),
+      toast,
+    });
   };
 
   const empty = sorted.length === 0;

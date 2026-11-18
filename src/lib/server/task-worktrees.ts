@@ -16,8 +16,9 @@
  * 不 import task-fs / task-runner（task-fs 反过来 import 本模块、保证无环）。
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import os from "node:os";
 import { promisify } from "node:util";
 import { existsSync, promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
@@ -1072,6 +1073,141 @@ const forceRemoveWorktree = async (
     `[task-worktrees] worktree remove 被 initializing 锁拦住（git worktree add 被硬杀的残留，已 ${Math.round(verdict.ageMs / 1000)}s）、升级为 remove --force --force：${workDir}`,
   );
   return runGit(repoPath, ["worktree", "remove", "--force", "--force", workDir], timeoutMs, job);
+};
+
+// ----------------- 快速摘除：整目录改名进回收站、物理删除转后台 -----------------
+//
+// 隔离工作区的体量主要是克隆来的依赖目录（crm-web 的 worktree 实测约 29 万个文件）。`git worktree remove --force`
+// 是逐文件 unlink，在同步链路上（归档 / 终结 / 删任务都在等它）要几十秒到几分钟，还有 60s 超时：超时后被杀、
+// 再退回 `fs.rm` 重头删——用户看到的就是点了归档很久才有反馈。
+// 同卷 rename 是 O(1)：整目录挪进 `worktrees/.trash/`，`git worktree prune` 当场清登记（分支立刻可用），
+// 真正的逐文件删除交给独立的 `rm -rf` 进程在后台做。对外语义不变：原位置没了、登记清了、快照已先落。
+
+/** 回收站目录名：点开头 = 内部中转目录（与 `.dep-clone-tmp` 同约定：存储页不列、开机孤儿扫描兜底清崩溃遗留） */
+const TRASH_DIRNAME = ".trash";
+const getTrashDir = (): string => path.join(getWorktreesRoot(), TRASH_DIRNAME);
+
+type TrashGlobals = { __flowshipTrashPurges?: Set<Promise<void>> };
+const getTrashPurges = (): Set<Promise<void>> => {
+  const g = globalThis as TrashGlobals;
+  if (!g.__flowshipTrashPurges) g.__flowshipTrashPurges = new Set();
+  return g.__flowshipTrashPurges;
+};
+
+/** 等在途的后台清理结束（测试 / 优雅退出用；生产路径不 await） */
+export const waitForTrashPurges = async (): Promise<void> => {
+  while (getTrashPurges().size > 0) {
+    await Promise.allSettled([...getTrashPurges()]);
+  }
+};
+
+/**
+ * 后台删一个回收站目录：独立进程 + 低优先级，不占 libuv 线程池（几十万次 unlink 会把整个服务进程的 fs 调用都拖慢）。
+ * 第一遍 `rm -rf` 没删净（典型：只读子目录，目录里的东西 unlink 不动）→ `chmod -R u+rwX` 后再删一遍：
+ * 旧的同步删除遇到这种情形只能把目录留在原位报「没删掉」，这里最终能清掉。
+ * 还是不行 → 只 log——目录已不在任何任务可见的位置，开机孤儿扫描会再清一次。
+ */
+const purgeTrashDir = (dir: string): void => {
+  let settle!: () => void;
+  const done = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  const purges = getTrashPurges();
+  purges.add(done);
+  const finish = (): void => {
+    purges.delete(done);
+    settle();
+  };
+  const fallback = (): void => {
+    void fs
+      .rm(dir, { recursive: true, force: true, maxRetries: 3 })
+      .catch((err) => {
+        console.warn(`[task-worktrees] 回收站目录后台删除失败（开机孤儿扫描会再清）：${dir}：`, err);
+      })
+      .finally(finish);
+  };
+  /** 起一个后台子进程；起不来 / 出错 → 退回 fs.rm 兜底 */
+  const run = (args: string[], onClose: (code: number | null) => void): void => {
+    try {
+      const child = spawn(args[0], args.slice(1), { detached: true, stdio: "ignore" });
+      child.once("error", fallback);
+      child.once("close", onClose);
+      child.unref();
+      try {
+        if (child.pid) os.setPriority(child.pid, 10);
+      } catch {
+        /* 调不了优先级不影响删除 */
+      }
+    } catch {
+      fallback();
+    }
+  };
+  if (process.platform === "win32") {
+    fallback();
+    return;
+  }
+  run(["rm", "-rf", dir], (code) => {
+    if (code === 0) return finish();
+    run(["chmod", "-R", "u+rwX", dir], () => {
+      run(["rm", "-rf", dir], (retryCode) => {
+        if (retryCode !== 0) {
+          console.warn(
+            `[task-worktrees] 回收站目录后台删除未删净（rm 退出码 ${retryCode}、开机孤儿扫描会再清）：${dir}`,
+          );
+        }
+        finish();
+      });
+    });
+  });
+};
+
+/**
+ * 把 workDir 摘出去：改名进回收站 → prune 清登记 → 后台删。
+ * 返回 true = 原位置已空、git 登记已清（物理删除在后台）；false = 没走快路径、workDir 原样在原位，
+ * 调用方照旧走 `forceRemoveWorktree`——任何拿不准的情形（改名失败、登记被锁而 prune 清不掉）都退回旧路径，行为与此前一致。
+ * 调用点必须已经过自己的快照守卫（与 forceRemoveWorktree 同契约）。
+ */
+const detachWorktreeToTrash = async (
+  repoPath: string,
+  workDir: string,
+  taskId: string,
+): Promise<boolean> => {
+  // 逃生口：`FLOWSHIP_WORKTREE_FAST_REMOVE=0` 退回逐文件同步删（旧行为）
+  if (process.env.FLOWSHIP_WORKTREE_FAST_REMOVE === "0") return false;
+  // 登记目录要在改名前读（指针在目录里）；读不到 = 不是 git worktree（非 git 目录 / 独立仓形态），无登记可核对
+  const adminDir = await adminDirFromPointer(workDir);
+  const trashDir = getTrashDir();
+  const dest = path.join(
+    trashDir,
+    `${taskId}-${path.basename(workDir)}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
+  );
+  try {
+    await fs.mkdir(trashDir, { recursive: true });
+    await fs.rename(workDir, dest);
+  } catch {
+    return false;
+  }
+  await runGit(repoPath, ["worktree", "prune"]);
+  if (adminDir && (await pathExists(adminDir))) {
+    // 登记没清掉（被锁定：initializing 残留 / 用户手动 lock）：prune 不动锁定的登记。放回原位、交给旧路径处理
+    //（旧路径对 stale 的 initializing 锁会升级 --force --force，对用户手动锁原样失败再走 rm + prune），不在这里自作主张。
+    try {
+      await fs.rename(dest, workDir);
+      return false;
+    } catch (err) {
+      // 放不回去：目录（连 `.git` 指针）留在回收站、不动它——开机孤儿扫描会按「有指针的 worktree 残留」先快照再清、并 prune
+      console.warn(
+        `[task-worktrees] 快速摘除后登记未清、放回原位也失败（目录留在回收站、开机孤儿扫描接手）：${workDir} → ${dest}`,
+        err,
+      );
+      return true;
+    }
+  }
+  // 登记已清：回收站里的目录不再是 worktree，去掉 `.git` 指针——崩溃遗留被开机孤儿扫描看到时按「非 worktree 残留」直接清，
+  // 不会去给它做 git 快照 / 因为指针失效而永远保留
+  await fs.unlink(path.join(dest, ".git")).catch(() => {});
+  purgeTrashDir(dest);
+  return true;
 };
 
 /**
@@ -2985,11 +3121,14 @@ export const removeTaskWorktrees = async (
       snapshotFailures.push({ repoPath, workDir, reason: snap.reason });
       continue;
     }
-    // 优先走 git worktree remove（同时清 .git/worktrees 注册）；原仓库没了 / 命令失败退回 rm + prune
-    const removed = await forceRemoveWorktree(repoPath, workDir);
-    if (!removed.ok) {
-      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
-      await runGit(repoPath, ["worktree", "prune"]);
+    // 先试快速摘除（改名进回收站 + prune 清登记、逐文件删除转后台——依赖目录动辄几十万文件，同步删要等几分钟）；
+    // 拿不准的情形退回旧路径：git worktree remove（同时清 .git/worktrees 注册）；原仓库没了 / 命令失败再退回 rm + prune
+    if (!(await detachWorktreeToTrash(repoPath, workDir, t.id))) {
+      const removed = await forceRemoveWorktree(repoPath, workDir);
+      if (!removed.ok) {
+        await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+        await runGit(repoPath, ["worktree", "prune"]);
+      }
     }
     // 删后复核（第四轮 Q3-10d）：`fs.rm(...).catch(()=>{})` 吞掉了 EACCES / EBUSY（Windows 占用 / 权限），目录实际还在却无条件
     // 记「已清理」→ 归档 toast 说「已清理隔离工作区」。目录还在就如实记进保留列表（快照若已落，原因里一并说明）

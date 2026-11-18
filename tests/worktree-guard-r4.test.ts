@@ -408,13 +408,17 @@ describe("Q3-07：快照已落但目录删不掉——不能说「找不回了�
 
 describe("Q3-10(d)：目录删不掉不能报「已清理」（removeTaskWorktrees）", () => {
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
-    "只读子目录挡住删除：removedAny=false、记进 snapshotFailures（原因说明快照已落）；对照：删得掉时 removedAny=true、无失败",
+    "同步删除路径（FLOWSHIP_WORKTREE_FAST_REMOVE=0）：只读子目录挡住删除：removedAny=false、记进 snapshotFailures（原因说明快照已落）；对照：删得掉时 removedAny=true、无失败",
     async () => {
       const { repo, t, wd } = await setupTask("rm-stuck");
       const locked = path.join(wd, "locked");
       await fs.mkdir(locked, { recursive: true });
       await fs.writeFile(path.join(locked, "x.txt"), "x\n");
       await fs.chmod(locked, 0o555);
+      // 默认走「改名进回收站 + 后台删」的快路径：目录当场就挪走了、不会「留在原位」；这条钉的是同步删除路径
+      // （逃生口 / 改名失败的回退）在删不掉时仍然如实报「保留」、不说「已清理」
+      const prevFast = process.env.FLOWSHIP_WORKTREE_FAST_REMOVE;
+      process.env.FLOWSHIP_WORKTREE_FAST_REMOVE = "0";
       try {
         const removed = await removeTaskWorktrees(t);
 
@@ -425,6 +429,8 @@ describe("Q3-10(d)：目录删不掉不能报「已清理」（removeTaskWorktre
         expect(removed.snapshotFailures![0].reason).toContain("已存到 refs/flowship/wip/");
         expect(removed.snapshotRepos).toEqual([repo]); // 快照确实落了
       } finally {
+        if (prevFast === undefined) delete process.env.FLOWSHIP_WORKTREE_FAST_REMOVE;
+        else process.env.FLOWSHIP_WORKTREE_FAST_REMOVE = prevFast;
         await fs.chmod(locked, 0o755).catch(() => {});
       }
     },

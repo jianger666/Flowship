@@ -40,6 +40,7 @@ import {
   sendTextMessage as defaultSendTextMessage,
   uploadImage as defaultUploadImage,
 } from "./lark-api";
+import { renderMermaidForFeishu } from "./mermaid-outbound";
 import { classifyLarkFailure, describeLarkError, LarkApiError } from "./types";
 import type {
   CardStreamAppendAskOpts,
@@ -1547,8 +1548,15 @@ const finalizeTurn = async (
 
     // 决策 #12 简化：流式期间本地图路径原样；finalize 前一次性换 image_key 再全量 PUT
     if (turn.answerText) {
+      // Mermaid 围栏先渲成图（主进程隐藏窗口出 PNG → 上传 → 「图 + 原围栏」）；出不了图的块原样保留成代码块、永不抛。
+      // 必须在本地图片替换之前：产出的 `![Mermaid 图](image_key)` 走下面同一条路径时会被当成已上传的 key 放过
+      const withDiagrams = await renderMermaidForFeishu(turn.answerText, {
+        taskId,
+        upload: uploadImageImpl,
+        remainingBudgetMs: budgetDeadline - monoNow(),
+      });
       const replaced = await replaceLocalImagesInMarkdown(
-        turn.answerText,
+        withDiagrams,
         uploadImageImpl,
         taskId,
       );

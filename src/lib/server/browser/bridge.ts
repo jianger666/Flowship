@@ -559,7 +559,7 @@ const pushConfigNow = async (bridge: BrowserBridge): Promise<void> => {
 };
 
 /** 真实 IPC 通道此刻能不能建（vitest / next build 阶段 / 没有 process.send 都不建） */
-const canUseProcessChannel = (): boolean =>
+export const canUseProcessChannel = (): boolean =>
   typeof process.send === "function" &&
   process.connected !== false &&
   !process.env.VITEST &&

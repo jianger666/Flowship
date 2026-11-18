@@ -200,6 +200,7 @@ import { APP_NAP_MARKER, resolveAppNapMode } from "./app-nap.mjs";
 // 锁屏必黑屏（2026-11-16）：页面里在播的视频会让 Chromium 持有亮屏锁、锁屏后显示器不黑。
 // 不碰页面，锁屏时直接熄屏；依据 / 真机实测见 ./lock-display-off.mjs
 import { createLockDisplayOff, isLockDisplayOffEnabled, readIdle, runPmset } from "./lock-display-off.mjs";
+import { createMermaidRenderer } from "./mermaid-render.mjs";
 // server 子进程的 Node 启动旗标（堆上限 + 崩溃取证，走 argv 而不是 NODE_OPTIONS）：./node-options.mjs
 import { buildServerNodeArgs } from "./node-options.mjs";
 // 系统通知 payload 解析（taskId / target:"inbox" 点击去向，N1-12）：./notify-target.mjs
@@ -391,9 +392,19 @@ const browserManager = createBrowserManager({
   isTrustedIpcSender: (e, channel) => isTrustedIpcSender(e, channel ?? "browser:*"),
   log,
 });
-// 停车场窗口是常驻隐藏窗口，不算「用户窗口」：window-all-closed 的判定要忽略它（见 app.on("window-all-closed")）
+// Mermaid 出图（飞书回复里的 ```mermaid → PNG）：隐藏窗口加载 server 的渲染页、CDP 截图，经 server 的 IPC 通道收发请求。
+// 工厂是懒的（窗口在第一个请求到来时才建、空闲 60s 销毁），模块加载期不碰窗口；协议与隔离见 ./mermaid-render.mjs
+const mermaidRenderer = createMermaidRenderer({
+  BrowserWindow,
+  session,
+  getBaseUrl: () => BASE_URL,
+  log,
+});
+// 停车场窗口、Mermaid 渲染窗口都是常驻 / 按需的隐藏窗口，不算「用户窗口」：window-all-closed 的判定要忽略它们（见 app.on("window-all-closed")）
 const hasUserWindows = () =>
-  BrowserWindow.getAllWindows().some((w) => !w.isDestroyed() && !browserManager.isParkingWindow(w));
+  BrowserWindow.getAllWindows().some(
+    (w) => !w.isDestroyed() && !browserManager.isParkingWindow(w) && !mermaidRenderer.isRenderWindow(w),
+  );
 // 内置浏览器 destroy 不可逆、只做一次：放在 will-quit（退出已确定）里，见 app.on("will-quit")
 let browserManagerDestroyed = false;
 // stdout / stderr 的 EPIPE：从终端 / 管道启动、对端关掉后 console.log 会异步 emit 'error'，没有监听就是 uncaughtException。
@@ -946,6 +957,12 @@ const startServer = () => {
     browserManager.attachServerChannel(proc);
   } catch (err) {
     log(`[main] 内置浏览器挂 server 通道失败（不影响 server 启动）：${err?.message || err}`);
+  }
+  // Mermaid 出图：同一条 IPC 上的另一套协议（kind 以 mermaid-render- 开头），监听只认自己的消息、与浏览器通道互不干扰
+  try {
+    mermaidRenderer.attachServerProc(proc);
+  } catch (err) {
+    log(`[main] Mermaid 渲染挂 server 通道失败（不影响 server 启动）：${err?.message || err}`);
   }
   if (typeof proc.pid === "number") writeServerPidRecord(proc.pid);
   bootTimeline.mark("serverSpawn");
@@ -3880,7 +3897,7 @@ if (!app.requestSingleInstanceLock()) {
       if (quitting || hasUserWindows()) return;
       // 一个窗口都不剩时 Electron 会自己发，别重复
       if (BrowserWindow.getAllWindows().every((w) => w.isDestroyed())) return;
-      log("[main] 只剩内置浏览器的停车场窗口、按「所有窗口关闭」处理");
+      log("[main] 只剩内置浏览器的停车场窗口 / Mermaid 渲染窗口、按「所有窗口关闭」处理");
       app.emit("window-all-closed");
     });
   });
@@ -3895,6 +3912,11 @@ if (!app.requestSingleInstanceLock()) {
       browserManager.destroy();
     } catch (err) {
       log(`[main] 内置浏览器销毁出错（不挡退出）：${err?.message || err}`);
+    }
+    try {
+      mermaidRenderer.destroy();
+    } catch (err) {
+      log(`[main] Mermaid 渲染窗口销毁出错（不挡退出）：${err?.message || err}`);
     }
   });
 

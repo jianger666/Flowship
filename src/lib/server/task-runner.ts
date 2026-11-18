@@ -2518,6 +2518,15 @@ const archiveWorktreeTaskLocked = async (
   report: ArchiveReport,
 ): Promise<{ task: Task; report: ArchiveReport } | null> => {
   const taskId = task.id;
+  // 分段计时：归档 PATCH 是同步链路、用户在等——哪一段慢要能从日志里直接看出来（总耗时 ≥2s 才打、不刷屏）
+  const stepStartedAt = Date.now();
+  const stepMarks: Array<[string, number]> = [];
+  let stepLast = stepStartedAt;
+  const markStep = (name: string): void => {
+    const now = Date.now();
+    stepMarks.push([name, now - stepLast]);
+    stepLast = now;
+  };
   // R14 Q7a-03：revoke 在途启动意图——归档前入场的推进 / 预热 / 依赖克隆拿的是旧 opGen，此后再 claim 一律失败；
   // 没有这一步它们会和下面的 removeTaskWorktrees 并行写同一批目录。
   revokeTaskOps(taskId);
@@ -2537,22 +2546,27 @@ const archiveWorktreeTaskLocked = async (
   // R14 Q7a-03：join 启动链 + 资源 job——kickoffDeferredDepClone 等最长 15 分钟的依赖初始化就在 worktree 里跑，
   // 先 revoke 掉它们的子进程再等退场；等满仍没退 → quarantine，下面不删目录（fail-closed，与 finalize 同契约）。
   const quarantined = await joinTerminalOpResources(taskId, "archiveTask");
+  markStep("join");
   // 两个 wait 相互独立、失败都吞，并行等（串行最长挂 16s，归档 PATCH 一直悬着体验差）
   await Promise.all([
     waitForTaskToStop(taskId, 8000).catch(() => {}),
     waitForRestrictedQuestionsToStop(taskId, 8000).catch(() => {}),
   ]);
+  markStep("stop");
   // R14 Q7a-02：启动链已退场才清标记（与 stop-task 同口径）；还在飞（join 超时）则留给它自裁
   if (!isTaskStarting(taskId)) pendingStopRequests.delete(taskId);
   // 只收 running、awaiting_ack 留给恢复后 ack；顺带把问一问留下的 running 状态回 idle
   await finalizeStaleAndIdleLocked(taskId, { toStatus: "cancelled", leaveAwaitingAck: true }).catch(() => null);
+  markStep("finalize");
   try {
     await stopPreviewsForTask(taskId);
   } catch (err) {
     console.warn(`[task-runner] archiveTask: 停预览失败（忽略）task=${taskId}`, err);
   }
+  markStep("preview");
   // 会话缓存：上面 cancelTaskRun 已关内存会话并（fire-and-forget）清锚点；这里补上「确定清掉 + 删无主 pi 会话文件」
   report.sessionCacheReleased = await releaseSessionCacheForArchive(task);
+  markStep("cache");
   // quarantine（join 超时、旧事务还可能写盘）→ fail-closed 不删目录，并如实告诉用户没清
   //（目录原样保留；取消归档后下次推进继续用，或稍后再归档一次清理）
   const removed = quarantined
@@ -2561,6 +2575,7 @@ const archiveWorktreeTaskLocked = async (
         console.warn(`[task-runner] archiveTask: 清理 worktree 失败 task=${taskId}`, err);
         return null;
       });
+  markStep("worktree");
   if (quarantined) {
     // eslint-disable-next-line no-restricted-syntax -- 豁免：归档清理 owner 无条件语义
     await writeEventAndPublish(taskId, {
@@ -2588,6 +2603,13 @@ const archiveWorktreeTaskLocked = async (
     });
   }
   const archivedTask = await setTaskPinArchive(taskId, { archived: true });
+  markStep("marker");
+  const stepTotal = Date.now() - stepStartedAt;
+  if (stepTotal >= 2000) {
+    console.log(
+      `[archive-perf] task=${taskId} total=${stepTotal} ${stepMarks.map(([n, ms]) => `${n}=${ms}`).join(" ")}`,
+    );
+  }
   return archivedTask ? { task: archivedTask, report } : null;
 };
 
@@ -6585,6 +6607,7 @@ export const startOneShotQuestion = (
                 "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
                 "- 用户要方案 / 要做的是大改动（整段功能 / 跨多文件重构）→ 主导权在你：你判断该正式走一步了，就调 `advance_next` 登记（plan 出方案 / build 实现 / review 复核），本轮说完收尾后系统代用户推进；拿不准、或想先跟用户对齐范围，就在回复里问。用户随时也能自己点「推进」。别在本轮里硬扛大改动",
                 "- `advance_next` 的规矩：你判断用户有这个意思才登记；提测（ship）/ 联调推送（dev）/ 往群里发消息这类对外动作，用户明说才登记，你自己觉得该做就先问；登记 ≠ 现在去做，登记后正常收尾",
+                "- 用户点名要跑某个 action（「上线审查一下」「提测」「复核一下」；自定义 action = skills 目录里带 `.flowship-action.json` 的 skill，json 里的 `label` 就是名字）→ 不在这里替它干活：这条消息本身在让你做就直接 `advance_next` 登记（`instruction` 把链接 / 要求原样带上；自定义的 `custom_action_id` 填 label 或 skill 名即可）。疑问 / 否定 / 顺嘴提到不算点名",
                 "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）、推进（advance_next）可以用",
                 "- 不要提交 commit / 提 MR、处理完自然结束回复",
               ];
