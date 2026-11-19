@@ -146,6 +146,10 @@ jobs:
             sdk_platform: darwin-x64
             environment: release
     runs-on: ${{ matrix.os }}
+    env:
+      # 自签证书的 SHA-1 指纹（公开信息、不是密钥）。「导入 mac 签名证书」步骤用它做签名探针，
+      # electron-builder 步骤里 afterPack 用它签名并核对产物的签名身份；换证书只改这一处（win 不读）。
+      FLOWSHIP_SIGN_IDENTITY: "566f6cac5a06f6cca21f6cb23039e370a007137d"
     steps:
       - uses: actions/checkout@v4
 
@@ -200,8 +204,10 @@ jobs:
         shell: bash
         working-directory: electron-app
 
-      # mac 固定签名身份：把自签证书导进「临时钥匙串」（不碰 runner 的系统钥匙串、不改钥匙串搜索列表），
-      # 签名在 scripts/electron-after-pack.mjs 里用 codesign --keychain 直接做。
+      # mac 固定签名身份：把自签证书导进「临时钥匙串」，签名在 scripts/electron-after-pack.mjs 里用 codesign --keychain 直接做。
+      # v1.9.56 首发时 macOS 26 runner 上 codesign 报「no identity found」（同一个 p12 在本机能签），
+      # 所以导入后额外：① 把临时钥匙串加进用户搜索列表；② 把证书标成「代码签名受信任」（admin 域，runner 是一次性虚拟机、
+      # 不留痕）；③ 打印诊断并用同一身份签一个探针文件——签不上就在这一步红、日志里直接有原因，不用等到 build 跑完。
       # 为什么要固定身份：ad-hoc 的身份绑代码哈希、每个版本都变，用户在系统里给 Flowship 的「辅助功能」等授权
       # 每次升级都会失效；自签证书的身份是「identifier + 证书」、升级不变，授权保留。
       # fail-closed：缺 secret 就红、不退回 ad-hoc——悄悄发出 ad-hoc 版会让所有用户的授权白白再失效一次。
@@ -230,6 +236,37 @@ jobs:
           rm -f "$RUNNER_TEMP/flowship-sign.p12"
           echo "FLOWSHIP_SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
 
+          # ① 加进用户钥匙串搜索列表（保留原有项；路径里没有空格）
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+
+          # ② 证书标成代码签名受信任：自签证书默认 CSSMERR_TP_NOT_TRUSTED。失败只告警（探针才是最终裁判）
+          security find-certificate -a -p "$KC" > "$RUNNER_TEMP/flowship-sign.pem"
+          if ! sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/flowship-sign.pem"; then
+            echo "::warning::add-trusted-cert 失败、证书保持未受信任；以下面的签名探针结果为准"
+          fi
+          rm -f "$RUNNER_TEMP/flowship-sign.pem"
+
+          # ③ 诊断 + 探针：用 build 同一个身份、同一个钥匙串签一个临时文件，并核对签名身份就是预期证书
+          echo "::group::mac 签名身份诊断"
+          sw_vers
+          security list-keychains -d user
+          security find-identity -p codesigning "$KC"
+          security find-identity -v -p codesigning "$KC" || true
+          echo "::endgroup::"
+          PROBE="$RUNNER_TEMP/flowship-sign-probe"
+          cp /usr/bin/true "$PROBE"
+          if ! codesign --force --sign "$FLOWSHIP_SIGN_IDENTITY" --keychain "$KC" "$PROBE"; then
+            echo "::error::签名探针失败：codesign 用 $FLOWSHIP_SIGN_IDENTITY 签不上（诊断见上方「mac 签名身份诊断」）"
+            exit 1
+          fi
+          PROBE_REQ="$(codesign -d -r- "$PROBE" 2>&1)"
+          rm -f "$PROBE"
+          if [[ "$PROBE_REQ" != *"certificate root = H\"$FLOWSHIP_SIGN_IDENTITY\""* ]]; then
+            echo "::error::探针的签名身份不是预期证书 $FLOWSHIP_SIGN_IDENTITY：$PROBE_REQ"
+            exit 1
+          fi
+          echo "签名探针通过：$FLOWSHIP_SIGN_IDENTITY"
+
       # 压缩策略统一走 electron-builder.yml 的 compression: maximum（V0.11.4）——
       # 旧「win 降级到 level 3 提安装速度」特例已回收：实测对体积/安装速度都无变化
       # （LZMA 解压速度和压缩级别基本无关）、拉满后 exe 213MB→112MB
@@ -239,8 +276,7 @@ jobs:
           # electron-builder 自己不签名（identity: null）、也关掉证书自动发现防 CI 报错；
           # mac 签名由 scripts/electron-after-pack.mjs 用下面三个变量完成（win 不读它们）
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          # 自签证书的 SHA-1 指纹（公开信息、不是密钥）。afterPack 签完会核对产物的签名身份就是它，不对就红。
-          FLOWSHIP_SIGN_IDENTITY: "566f6cac5a06f6cca21f6cb23039e370a007137d"
+          # 签名身份指纹 FLOWSHIP_SIGN_IDENTITY 在 job 级 env 里（afterPack 签完会核对产物的签名身份就是它，不对就红）
           # 发版必须固定身份：没配 FLOWSHIP_SIGN_IDENTITY 就直接失败、不退回 ad-hoc
           FLOWSHIP_REQUIRE_STABLE_SIGN: "1"
 
