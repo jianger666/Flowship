@@ -17,11 +17,16 @@
  * - `preview`：起 / 看 / 停本任务项目的 dev server。只依赖 callerToken + 任务元数据，和 action 无关；用户在聊天里说
  *   「起一下项目看看」「把页面截个图」时，这个 AI 得能自己把服务起来再用浏览器工具去看，否则只能叫用户去点「预览」。
  *   **定时到点那一轮不挂它**（{@link ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES}）：没有用户在场，不该无人值守地拉起长驻进程。
+ * - `set_owner_note`：把所有者在聊天里说的长期授权记进任务上下文（群里非属主的轮次会读到，见 owner-note.ts）。只依赖
+ *   callerToken + 任务元数据，和 action 无关；所有者在聊天里说「别人 @ 你造数不用问我」时，这个 AI 得能当场记下来。
+ *   **定时到点那一轮不挂它**（{@link ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES}）：那是 AI 自己留的备忘、不是所有者在场说话，
+ *   「授权」没有来源，不能让 AI 靠备忘给自己（或别人）写授权。
  * 交卷 / 提问 / 提 MR / 设批次 / 自定义 action 这类要靠 action 与 notifier 的**不挂**（挂了也只会回「没有 notifier」，
  * 还让模型以为自己在 action 里）；浏览器工具与子代理随 callerToken 一起挂（见 flowship-tools 的 `buildSdkCustomTools` /
  * pi 的 `buildCustomTools`）——**有意保留**（用户 2026-11-11 决定：与正式会话一致、之后要它登录之类也用得上；
  * R10-02），不受这份清单收窄；由 tests/one-shot-system-tools.test.ts「能力面」一节钉住，改门控条件会红。
  */
+import { OWNER_NOTE_TOOL_NAME } from "@/lib/owner-note";
 import { SCHEDULE_TOOL_NAME } from "@/lib/schedule";
 import { WAIT_TOOL_NAME } from "@/lib/wait-display";
 
@@ -37,14 +42,21 @@ export const ONE_SHOT_SYSTEM_TOOL_NAMES: readonly string[] = [
   WAIT_TOOL_NAME,
   ADVANCE_NEXT_TOOL_NAME,
   PREVIEW_TOOL_NAME,
+  OWNER_NOTE_TOOL_NAME,
 ];
 
 /**
- * 定时到点那一轮的清单：同上、但**不含**需要用户在场才有意义的两个——
- * `advance_next`（登记不了「自动推进」）与 `preview`（不该无人值守地起长驻进程）
+ * 定时到点那一轮的清单：同上、但**不含**需要用户在场才有意义的三个——
+ * `advance_next`（登记不了「自动推进」）、`preview`（不该无人值守地起长驻进程）、
+ * `set_owner_note`（没有所有者在场说话，写不了「授权」）
  */
 export const ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES: readonly string[] =
-  ONE_SHOT_SYSTEM_TOOL_NAMES.filter((n) => n !== ADVANCE_NEXT_TOOL_NAME && n !== PREVIEW_TOOL_NAME);
+  ONE_SHOT_SYSTEM_TOOL_NAMES.filter(
+    (n) =>
+      n !== ADVANCE_NEXT_TOOL_NAME &&
+      n !== PREVIEW_TOOL_NAME &&
+      n !== OWNER_NOTE_TOOL_NAME,
+  );
 
 /**
  * 这一轮一次性 agent 该挂哪份系统工具清单（每轮重新算：同一任务的共用会话里，用户轮次与定时轮次交替时，

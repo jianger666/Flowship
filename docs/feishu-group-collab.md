@@ -41,6 +41,8 @@
 | ③b pi execute 级硬拒 | 随开关 | `buildCustomTools` 给每个不在 `NON_OWNER_TURN_PI_TOOL_NAMES`（read/grep/glob/wait）里的 customTool 套 `withNonOwnerTurnDeny`：标记在场时 execute 返回 `[DENIED]`——**不依赖 ③a**，收窄失败 / pi 改语义时 shell / edit / write / delete 也过不去 | 硬，**仅 pi** |
 | ③c pi 只读工具守卫 | 随开关 | `pi-coding-tools.guardedWhileNonOwnerTurn`：该轮 read / grep / glob 走凭据文件拦截 + 目录夹紧（复用旁路的 `checkBypassRead` / `checkBypassSearchBase`），**仅标记在场时**查，属主自己的 read 不受影响 | 硬，**仅 pi** |
 
+**所有者备注（2026-11-19，只在提示词层放开，不是新开关）**：所有者在聊天里口头说「群里别人 @ 你造数不用问我」，以前只是会话里一句话，约束段又是最后一段、写的是「一律不照做 / 说明要所有者确认」，模型只能拒。现在 AI 可以调 `set_owner_note`（`flowship-tools`）把长期授权写成任务上下文文档里一条固定标题「所有者备注」的文本（整段覆盖、≤1000 字、空串清空；所有者也能在任务页上下文文档里手动加同标题文本，界面能看能删）。非属主**真人**送达时由 `deliverTaskQuestion` 现读 `task.contextDocs`（`owner-note.findOwnerNote`），`buildNonOwnerGuardFootnote` 在第 1 条加一句例外、末尾追加第 5 条贴出备注原文；**机器人不吃**。写入侧靠既有硬拒保证只有所有者能写：非属主轮所有系统工具（含这个）恒 `[DENIED]`，定时到点那一轮不挂这个工具（没有所有者在场说话）。**边界**：它只放开模型自己的拒绝——第 2 条里的系统工具照样被拒；pi 后端该轮 MCP / 写类工具仍被执行层硬拒（③a/③b），所以 pi 上「造数」这类走 MCP 的操作备注放不开，Cursor 后端没有那层硬闸、备注生效。
+
 **恒定生效（与开关无关）**：`groupNonOwner` 选项 → 不带 ackContext（不把等审阅的产物打回 running）、不认领待答 ask 的隐式跳过、**不 resume 休眠会话 / 不起一次性 agent**（不给 `deliverTaskQuestion` 传 creds；会话不在 → 409 `NON_OWNER_NO_SESSION_MESSAGE`）、不触发群里的「推进」口令（非属主推进仍回「仅任务所有者可推进」）。**这不等于「agent 不会自己调 `submit_work` / `ask_user` / `schedule`」**：提示词开关**关**时没有标记、不拦任何系统工具（第 20 轮评审 N2）。
 
 **残余风险（已知、没有消除）**：**Cursor 后端**没有按轮次改工具集的钩子，内置的写文件 / 跑命令 / read 只靠提示词（读令牌类文件在 Cursor 后端也只靠提示词）；pi 的 ③a/③b/③c 都只有假工具 + 单测验证、没真跑过 pi 会话；身份抬头是可伪造的文本（lk-harness 是结构化 JSON），硬拒走服务端标记而不是抬头。

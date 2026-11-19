@@ -621,6 +621,7 @@ const FLOWSHIP_OWN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "schedule",
   "advance_next",
   "preview",
+  "set_owner_note",
 ]);
 
 /** 自有工具的裸名（`schedule` / `mcp:custom-user-tools:schedule` → `schedule`）；不是自有工具返回 null */

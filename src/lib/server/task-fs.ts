@@ -61,6 +61,7 @@ import type {
   TaskSummary,
   TurnTokenUsage,
 } from "@/lib/types";
+import { OWNER_NOTE_TITLE } from "@/lib/owner-note";
 import { accumulateTokenUsage, shouldAttributeTurnToAction } from "@/lib/token-usage";
 import { settleActiveTime } from "@/lib/action-active-time";
 import { normalizeReqId } from "@/lib/req-id";
@@ -2105,6 +2106,39 @@ export const removeContextDoc = async (
       return await hydrateTask(meta);
     }
     meta.contextDocs = after;
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
+ * 写 / 覆盖 / 清空任务上下文里的「所有者备注」（owner-note.ts）：整段覆盖，不是追加。
+ * 同标题的文本文档（手动加过几条）会被收成一条；content 去空白后为空 = 删掉。
+ * 字数上限由调用方（set_owner_note 工具）拦，这里只负责落盘。
+ */
+export const setOwnerNote = async (
+  taskId: string,
+  content: string,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    const text = content.trim();
+    const rest = (meta.contextDocs ?? []).filter(
+      (d) => !(d.type === "text" && d.title === OWNER_NOTE_TITLE),
+    );
+    meta.contextDocs = text
+      ? [
+          ...rest,
+          {
+            id: newContextDocId(),
+            title: OWNER_NOTE_TITLE,
+            content: text,
+            type: "text",
+            createdAt: Date.now(),
+          },
+        ]
+      : rest;
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);

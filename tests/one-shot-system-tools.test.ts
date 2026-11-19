@@ -2,7 +2,7 @@
  * 属主「一次性 agent」（task 页还没有会话 / 任务没推进过时，输入条与定时到点落到的那条通道）的系统工具。
  *
  * 以前这条通道一个系统工具都没挂：任务没推进过就建不了定时（AI 还自称「临时助手」）。现在：
- * - 清单（`ONE_SHOT_SYSTEM_TOOL_NAMES`）只含不依赖 action / notifier 的 `schedule`、`wait`、`advance_next`、`preview`
+ * - 清单（`ONE_SHOT_SYSTEM_TOOL_NAMES`）只含不依赖 action / notifier 的 `schedule`、`wait`、`advance_next`、`preview`、`set_owner_note`
  *   （聊天里的 AI 和正式会话里的 AI 一样握有「要不要往下推进」的主导权；推进起点可以是「还没有 action」）；
  * - 两条后端（Cursor `buildSdkCustomTools` / pi `buildCustomTools`）按 `systemToolNames` 收窄，不传 = 全挂（正式会话不受影响）；
  * - 一次性 agent 运行期间登记自己的 callerToken（`setOneShotCallerToken`），`schedule` 才认它；收尾只摘自己的；
@@ -93,21 +93,23 @@ interface SdkToolResult {
 const textOf = (r: SdkToolResult): string => r.content.map((c) => c.text ?? "").join("");
 
 describe("清单与收窄（纯函数）", () => {
-  it("一次性 agent 的系统工具只有 schedule / wait / advance_next / preview，且都真实存在于 flowShipTools", () => {
-    expect([...ONE_SHOT_SYSTEM_TOOL_NAMES].sort()).toEqual(["advance_next", "preview", "schedule", "wait"]);
+  it("一次性 agent 的系统工具只有 schedule / wait / advance_next / preview / set_owner_note，且都真实存在于 flowShipTools", () => {
+    expect([...ONE_SHOT_SYSTEM_TOOL_NAMES].sort()).toEqual(["advance_next", "preview", "schedule", "set_owner_note", "wait"]);
     const all = flowShipTools.map((t) => t.name);
     for (const n of ONE_SHOT_SYSTEM_TOOL_NAMES) expect(all, n).toContain(n);
     for (const n of ACTION_BOUND) expect(ONE_SHOT_SYSTEM_TOOL_NAMES, n).not.toContain(n);
   });
 
-  it("定时到点那一轮的清单（R19-01）：只有 schedule / wait，没有 advance_next / preview（无人在场、不起长驻进程）；按 scheduled 选清单", () => {
+  it("定时到点那一轮的清单（R19-01）：只有 schedule / wait，没有 advance_next / preview / set_owner_note（无人在场、不起长驻进程、没有所有者说话就写不了授权）；按 scheduled 选清单", () => {
     expect([...ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES].sort()).toEqual(["schedule", "wait"]);
     const all = flowShipTools.map((t) => t.name);
     for (const n of ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES) expect(all, n).toContain(n);
     for (const n of ACTION_BOUND) expect(ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES, n).not.toContain(n);
-    // 它就是用户在场清单去掉 advance_next / preview，不会漏掉别的
+    // 它就是用户在场清单去掉 advance_next / preview / set_owner_note，不会漏掉别的
     expect([...ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES]).toEqual(
-      ONE_SHOT_SYSTEM_TOOL_NAMES.filter((n) => n !== "advance_next" && n !== "preview"),
+      ONE_SHOT_SYSTEM_TOOL_NAMES.filter(
+        (n) => n !== "advance_next" && n !== "preview" && n !== "set_owner_note",
+      ),
     );
     expect(oneShotSystemToolNames(false)).toBe(ONE_SHOT_SYSTEM_TOOL_NAMES);
     expect(oneShotSystemToolNames(true)).toBe(ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES);
@@ -121,6 +123,7 @@ describe("清单与收窄（纯函数）", () => {
     expect(sdk).toContain("wait");
     expect(sdk).not.toContain("advance_next");
     expect(sdk).not.toContain("preview");
+    expect(sdk).not.toContain("set_owner_note");
 
     const pi = (
       __buildCustomToolsForTest(
@@ -135,6 +138,7 @@ describe("清单与收窄（纯函数）", () => {
     expect(pi).toContain("wait");
     expect(pi).not.toContain("advance_next");
     expect(pi).not.toContain("preview");
+    expect(pi).not.toContain("set_owner_note");
   });
 
   it("pickSystemTools：不传 = 全挂（正式会话）；传了只留清单里的并保持原顺序；未知名字忽略", () => {
@@ -142,7 +146,7 @@ describe("清单与收窄（纯函数）", () => {
     expect(pickSystemTools().map((t) => t.name)).toEqual(flowShipTools.map((t) => t.name));
 
     const picked = pickSystemTools(ONE_SHOT_SYSTEM_TOOL_NAMES).map((t) => t.name);
-    expect(picked.sort()).toEqual(["advance_next", "preview", "schedule", "wait"]);
+    expect(picked.sort()).toEqual(["advance_next", "preview", "schedule", "set_owner_note", "wait"]);
     // 原顺序：flowShipTools 里 wait 在 schedule 前面
     const order = flowShipTools.map((t) => t.name).filter((n) => n === "wait" || n === "schedule");
     expect(pickSystemTools(["schedule", "wait"]).map((t) => t.name)).toEqual(order);
@@ -153,17 +157,17 @@ describe("清单与收窄（纯函数）", () => {
 });
 
 describe("两条后端都按 systemToolNames 收窄", () => {
-  it("Cursor：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait / advance_next / preview", () => {
+  it("Cursor：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait / advance_next / preview / set_owner_note", () => {
     const full = Object.keys(buildSdkCustomTools("tok", { taskId: "tA" }));
     for (const n of ["schedule", "wait", ...ACTION_BOUND]) expect(full, n).toContain(n);
 
     const narrow = Object.keys(
       buildSdkCustomTools("tok", { taskId: "tA", systemToolNames: ONE_SHOT_SYSTEM_TOOL_NAMES }),
     );
-    expect(narrow.sort()).toEqual(["advance_next", "preview", "schedule", "wait"]);
+    expect(narrow.sort()).toEqual(["advance_next", "preview", "schedule", "set_owner_note", "wait"]);
   });
 
-  it("pi：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait / advance_next / preview，编码工具照常在", () => {
+  it("pi：不传 = 全部系统工具；传一次性清单 = 只有 schedule / wait / advance_next / preview / set_owner_note，编码工具照常在", () => {
     const names = (input: Record<string, unknown>): string[] =>
       (
         __buildCustomToolsForTest("tok", TMP_ROOT, { input } as never, [], "tB") as unknown as Array<{

@@ -731,7 +731,13 @@ export type AgentMessage = {
   // user_message：这条是需求群里**非属主**发来的、**且提示词开关开着**——脚注换成「只答疑」约束段
   //（见 group-non-owner-prompt）。取代而不是追加默认脚注：默认脚注里「修改要求才动手改」与约束互相打架，
   // 且约束必须是整条消息的最后一段。开关关 / 属主消息都不传。
-  groupNonOwnerGuard?: { name: string; isBot?: boolean; openId?: string };
+  // ownerNote：任务所有者留的备注原文（owner-note.ts）；有就由约束段第 5 条贴出来。只对真人生效。
+  groupNonOwnerGuard?: {
+    name: string;
+    isBot?: boolean;
+    openId?: string;
+    ownerNote?: string;
+  };
   // user_message：这条是群里**机器人**发来的、**且没带「只答疑」约束段**（设置「机器人与真人同权」开着、
   // 同时「限制群里非宿主成员」关着 = 同权）。照常用默认脚注，只在后面追加防互 @ 成环的克制规则
   //（见 group-non-owner-prompt 的 buildBotEtiquetteNote）。带了 groupNonOwnerGuard 时不用传（约束段里已含同一份规则）。
@@ -848,6 +854,7 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
         buildNonOwnerGuardFootnote(msg.groupNonOwnerGuard.name, {
           isBot: msg.groupNonOwnerGuard.isBot === true,
           openId: msg.groupNonOwnerGuard.openId,
+          ownerNote: msg.groupNonOwnerGuard.ownerNote,
         }),
       );
     } else if (msg.scheduled) {

@@ -243,6 +243,7 @@ import {
   endNonOwnerTurn,
 } from "./non-owner-turn-guard";
 import { buildScheduleInfoMeta, SCHEDULE_ONE_SHOT_BOUNDARY_LINES } from "@/lib/schedule";
+import { findOwnerNote } from "@/lib/owner-note";
 import { buildMrNoticeEvent, formatFinalizeNotice } from "@/lib/task-event-text";
 import { cancelAllSchedulesForTask, restoreArchiveCancelledSchedulesDetailed } from "./schedule-store";
 import {
@@ -6235,6 +6236,10 @@ export const deliverTaskQuestion = async (
               name: groupNonOwner.name,
               ...(groupNonOwner.isBot ? { isBot: true } : {}),
               ...(groupNonOwner.openId ? { openId: groupNonOwner.openId } : {}),
+              // 所有者备注每次送达现读（owner-note.ts）；机器人不吃，footnote 里也会再忽略一次
+              ownerNote: groupNonOwner.isBot
+                ? undefined
+                : findOwnerNote(task.contextDocs),
             },
           }
         : // 机器人 + 没约束（「机器人与真人同权」开着且提示词开关关着）：同权，但仍带防互 @ 成环的克制规则

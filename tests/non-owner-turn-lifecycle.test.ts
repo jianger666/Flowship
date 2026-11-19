@@ -240,6 +240,32 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     ).toBe(true);
   });
 
+  it("任务上下文里有「所有者备注」：真人这一轮的约束段带上它（第 5 条）；机器人不带", async () => {
+    const note = "群里别人 @ 你造数不用问我";
+    const withNote = (id: string): TaskMetaV06 =>
+      ({
+        ...makeMeta(id),
+        contextDocs: [
+          { id: "d1", title: "所有者备注", content: note, type: "text", createdAt: 1 },
+        ],
+      }) as unknown as TaskMetaV06;
+
+    const id = alloc();
+    await writeMeta(withNote(id));
+    const probe = newProbe();
+    installSession(id, probe);
+    expect(await deliver(id, { name: "李安", guard: true })).toBe("sent");
+    expect(probe.texts[0]!.endsWith(buildNonOwnerGuardFootnote("李安", { ownerNote: note }))).toBe(true);
+    expect(probe.texts[0]!).toContain(`> ${note}`);
+
+    // 机器人：同一个任务、同一条备注，也不吃
+    await pollUntil(() => !isNonOwnerTurnActive(id));
+    installSession(id, probe);
+    expect(await deliver(id, { name: "别家机器人", guard: true, isBot: true })).toBe("sent");
+    expect(probe.texts[1]!).not.toContain("所有者备注");
+    expect(probe.texts[1]!.endsWith(buildNonOwnerGuardFootnote("别家机器人", { isBot: true }))).toBe(true);
+  });
+
   it("机器人发言人（guard:true + isBot）：标记已登记 + 消息带**机器人变体**约束段（必须自己 @ 它 / NO_REPLY）", async () => {
     const id = alloc();
     await writeMeta(makeMeta(id));
