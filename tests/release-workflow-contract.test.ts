@@ -89,3 +89,66 @@ describe("release.yml：finalize 签名与转正", () => {
     expect(body).not.toMatch(/core\.info\(/);
   });
 });
+
+/**
+ * mac 固定签名身份（electron job）：
+ *  - 自签证书的私钥只能在 mac 两个架构的 job 里出现（`release` environment），win 进无 secret 的 `release-win`；
+ *  - 缺 secret 就红、不退回 ad-hoc（悄悄发出 ad-hoc 版会让所有用户的系统授权白白再失效一次）；
+ *  - workflow 与 scripts/electron-after-pack.mjs 用同一组环境变量名、electron-builder 自己不签名。
+ * 真正的签名行为靠 afterPack 里的 codesign + 签后核对指定要求；这里只钉 workflow 的文本结构。
+ */
+describe("release.yml：mac 固定签名身份（electron job）", () => {
+  const afterPack = readFileSync(path.resolve(import.meta.dirname, "../scripts/electron-after-pack.mjs"), "utf8");
+  const builderYml = readFileSync(path.resolve(import.meta.dirname, "../electron-builder.yml"), "utf8");
+
+  it("environment 隔离：mac 两个架构进 release（放签名私钥），win 进无 secret 的 release-win", () => {
+    const electron = jobBlock("electron");
+    expect(electron).toMatch(/^\s{4}environment:\s*\$\{\{\s*matrix\.environment\s*\}\}\s*$/m);
+    expect(electron).toMatch(/args: --win\s+sdk_platform: win32-x64\s+environment: release-win\s*\n/);
+    expect(electron).toMatch(/args: --mac --arm64\s+sdk_platform: darwin-arm64\s+environment: release\s*\n/);
+    expect(electron).toMatch(/args: --mac --x64\s+sdk_platform: darwin-x64\s+environment: release\s*\n/);
+  });
+
+  it("签名私钥 secret 只在 mac 的导入步骤里引用（各一次）；缺了就 exit 1、且导入发生在 electron-builder 之前", () => {
+    const electron = jobBlock("electron");
+    for (const name of ["FLOWSHIP_SIGN_P12_BASE64", "FLOWSHIP_SIGN_P12_PASSWORD"]) {
+      expect(yml.match(new RegExp(`secrets\\.${name}`, "g"))?.length, name).toBe(1);
+      expect(electron, name).toContain(`secrets.${name}`);
+    }
+    const start = electron.indexOf("- name: 导入 mac 签名证书");
+    const builder = electron.indexOf("- run: npx electron-builder");
+    expect(start, "缺少导入证书步骤").toBeGreaterThan(0);
+    expect(builder, "缺少 electron-builder 步骤").toBeGreaterThan(start);
+    const step = electron.slice(start, builder);
+    expect(step).toMatch(/if:\s*runner\.os == 'macOS'/);
+    expect(step).toMatch(/\[ -z "\$P12_BASE64" \]/);
+    expect(step).toMatch(/exit 1/);
+    expect(step).toContain('echo "FLOWSHIP_SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"');
+  });
+
+  it("electron-builder 步骤：发版要求固定身份；指纹是 40 位小写十六进制（afterPack 按它核对指定要求）", () => {
+    const electron = jobBlock("electron");
+    expect(electron).toMatch(/FLOWSHIP_REQUIRE_STABLE_SIGN:\s*"1"/);
+    expect(electron).toMatch(/CSC_IDENTITY_AUTO_DISCOVERY:\s*"false"/);
+    const m = electron.match(/FLOWSHIP_SIGN_IDENTITY:\s*"([^"]+)"/);
+    expect(m, "缺 FLOWSHIP_SIGN_IDENTITY").not.toBeNull();
+    expect(m![1]).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it("钥匙串清理步骤无论成败都执行，且只在 mac 上", () => {
+    const electron = jobBlock("electron");
+    expect(electron).toMatch(/if:\s*always\(\) && runner\.os == 'macOS'/);
+    expect(electron).toContain("security delete-keychain");
+  });
+
+  it("workflow 与 afterPack 用同一组环境变量名；electron-builder 自己不签名（identity: null）", () => {
+    for (const name of ["FLOWSHIP_SIGN_IDENTITY", "FLOWSHIP_SIGN_KEYCHAIN", "FLOWSHIP_REQUIRE_STABLE_SIGN"]) {
+      expect(afterPack, name).toContain(`process.env.${name}`);
+      expect(yml, name).toContain(name);
+    }
+    // 没配身份又要求固定身份时必须抛错、不能悄悄退回 ad-hoc
+    expect(afterPack).toMatch(/FLOWSHIP_REQUIRE_STABLE_SIGN === "1"/);
+    // 自签身份不被 electron-builder 的 find-identity -v 认可，签名只能走 afterPack
+    expect(builderYml).toMatch(/^\s+identity:\s*null\s*$/m);
+  });
+});

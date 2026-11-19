@@ -89,7 +89,11 @@ mac:
   # 本地 `pnpm electron:dist:test` 不带 flag 时 electron-builder 默认本机架构、行为不变。
   target:
     - target: dmg
-  # 不签名（内部分发、首次打开需右键 →「打开」过 Gatekeeper）
+  # electron-builder 自己不签名（identity: null）：它只认 `security find-identity -v` 列出的「受信任」有效身份，
+  # 而我们用的自签证书不是 Apple 认可的、默认不受信，builder 会直接找不到。
+  # 签名统一在 scripts/electron-after-pack.mjs 里用 codesign 直接做：配了 FLOWSHIP_SIGN_IDENTITY（自签证书指纹）
+  # 就用这张固定身份（升级后系统「辅助功能」等授权不再失效），没配退回 ad-hoc；afterPack 之后 builder 不会再动签名。
+  # 自签证书不被 Apple 认可：手动下载的 dmg 首次打开仍需右键 →「打开」过 Gatekeeper。
   identity: null
   # 内置浏览器里的网页（声音 / 视频检测、会议、录音页）用麦克风 / 摄像头时，macOS 系统授权框显示的说明文案。
   # Electron 模板的 Info.plist 本来就带这两个键（英文通用句），这里覆盖成中文、说清楚是谁在用、先问过用户。

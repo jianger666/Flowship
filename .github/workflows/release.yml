@@ -115,8 +115,15 @@ jobs:
   # electron-builder 往同 tag release 追加 asset（exe / dmg / latest.yml）不竞态
   electron:
     needs: build-release
+    # environment：mac 两个架构用受保护的 `release`（里面放代码签名私钥 FLOWSHIP_SIGN_P12_*；
+    # 配了 Required reviewers 就要审批才放行）；win 用单独的 `release-win`（无 secret、无保护，
+    # GitHub 按名字首次引用时自动建）。不让 win 也进 `release`：environment 级 secret 对引用它的 job 全部可见，
+    # win job 没理由碰签名私钥。也不写成「win 项留空」：文档没说空值怎么处理，宁可用确定的行为。
+    # 注意：release 配了 Required reviewers 时，mac 两个架构各要审批一次（加上 finalize 共 3 次），
+    # 矩阵又是串行（max-parallel: 1），审批前后面的 job 会排队等。
+    environment: ${{ matrix.environment }}
     strategy:
-      # mac 未签名、dmg 只是顺手产物——失败不连坐 win
+      # mac 现在要走签名证书、缺 secret 会红——失败不连坐 win
       fail-fast: false
       # 串行：win / mac 各自往同一个 draft release overwrite asset、并发会撞出
       # 0 字节的 latest.yml（v0.8.0 踩过、win electron-updater 全靠它、空了 win 自更新挂）——
@@ -127,14 +134,17 @@ jobs:
           - os: windows-latest
             args: --win
             sdk_platform: win32-x64
+            environment: release-win
           # arch 由 CLI flag 决定（electron-builder.yml 的 mac.target 不再写死 arch）
           - os: macos-latest
             args: --mac --arm64
             sdk_platform: darwin-arm64
+            environment: release
           # arm64 runner 上交叉打 x64 是 electron-builder 官方支持的、Electron 二进制按 arch 下载
           - os: macos-latest
             args: --mac --x64
             sdk_platform: darwin-x64
+            environment: release
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -190,14 +200,58 @@ jobs:
         shell: bash
         working-directory: electron-app
 
+      # mac 固定签名身份：把自签证书导进「临时钥匙串」（不碰 runner 的系统钥匙串、不改钥匙串搜索列表），
+      # 签名在 scripts/electron-after-pack.mjs 里用 codesign --keychain 直接做。
+      # 为什么要固定身份：ad-hoc 的身份绑代码哈希、每个版本都变，用户在系统里给 Flowship 的「辅助功能」等授权
+      # 每次升级都会失效；自签证书的身份是「identifier + 证书」、升级不变，授权保留。
+      # fail-closed：缺 secret 就红、不退回 ad-hoc——悄悄发出 ad-hoc 版会让所有用户的授权白白再失效一次。
+      # ⚠️ 私钥只在 `release` environment 里（见上面 electron job 的 environment 说明）；
+      #    换证书 = 所有用户重新授权一次，同时要改下面的 FLOWSHIP_SIGN_IDENTITY。
+      - name: 导入 mac 签名证书（临时钥匙串）
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          P12_BASE64: ${{ secrets.FLOWSHIP_SIGN_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.FLOWSHIP_SIGN_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ]; then
+            echo "::error::缺 FLOWSHIP_SIGN_P12_BASE64 / FLOWSHIP_SIGN_P12_PASSWORD（应放在 release environment 的 secret 里）、拒绝发出 ad-hoc 版"
+            exit 1
+          fi
+          KC="$RUNNER_TEMP/flowship-sign.keychain-db"
+          KC_PW="$(uuidgen)"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/flowship-sign.p12"
+          security create-keychain -p "$KC_PW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          security import "$RUNNER_TEMP/flowship-sign.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC" > /dev/null
+          rm -f "$RUNNER_TEMP/flowship-sign.p12"
+          echo "FLOWSHIP_SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
       # 压缩策略统一走 electron-builder.yml 的 compression: maximum（V0.11.4）——
       # 旧「win 降级到 level 3 提安装速度」特例已回收：实测对体积/安装速度都无变化
       # （LZMA 解压速度和压缩级别基本无关）、拉满后 exe 213MB→112MB
       - run: npx electron-builder ${{ matrix.args }} --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # mac 不签名（内部分发）、关掉证书自动发现防 CI 报错
+          # electron-builder 自己不签名（identity: null）、也关掉证书自动发现防 CI 报错；
+          # mac 签名由 scripts/electron-after-pack.mjs 用下面三个变量完成（win 不读它们）
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          # 自签证书的 SHA-1 指纹（公开信息、不是密钥）。afterPack 签完会核对产物的签名身份就是它，不对就红。
+          FLOWSHIP_SIGN_IDENTITY: "566f6cac5a06f6cca21f6cb23039e370a007137d"
+          # 发版必须固定身份：没配 FLOWSHIP_SIGN_IDENTITY 就直接失败、不退回 ad-hoc
+          FLOWSHIP_REQUIRE_STABLE_SIGN: "1"
+
+      # 临时钥匙串用完就删（runner 本来是一次性的，多一道保险）
+      - name: 清理 mac 签名钥匙串
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ -n "${FLOWSHIP_SIGN_KEYCHAIN:-}" ]; then
+            security delete-keychain "$FLOWSHIP_SIGN_KEYCHAIN" || true
+          fi
 
   # 所有平台包（exe / 两枚 mac dmg / latest.yml / latest-mac.yml）都传完后：
   # 1) 汇总两枚 mac dmg + 一枚 Windows exe 生成签名 update-manifest（必须在转正前、壳按 asset 名找条目）
