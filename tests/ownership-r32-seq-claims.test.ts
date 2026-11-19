@@ -50,11 +50,6 @@ vi.mock("@/lib/server/skills-loader", () => ({
 vi.mock("@/lib/server/kill-orphans", () => ({
   reapTaskOrphans: vi.fn(),
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
-}));
 
 const {
   clearEventSeqCounter,

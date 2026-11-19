@@ -257,7 +257,7 @@ export const oneLineAnswer = (text: string): string => {
   return line.length > 120 ? `${sliceHeadSafe(line, 120)}…` : line;
 };
 
-/** 列表时间：MM-DD HH:mm（普通 formatTs 只有 HH:mm，跨天轮次不够用） */
+/** 列表时间：始终带日期 MM-DD HH:mm（群问答列表的轮次常跨天；事件流的 formatTs 则是今天只显示 HH:mm、跨天才带日期） */
 export const formatGroupQaTs = (ts: number): string => {
   const d = new Date(ts);
   const p = (n: number) => String(n).padStart(2, "0");

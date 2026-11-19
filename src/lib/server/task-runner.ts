@@ -67,12 +67,7 @@ import {
   type ClaimHandle,
 } from "./action-side-effects";
 import { getActionsDir, getEventsLogPath, getTaskWorkspaceDir } from "./task-fs-core";
-import {
-  runActionCheck,
-  captureActionStartBaseline,
-  captureReadonlyRepoBaselines,
-} from "./action-checks";
-import { evaluateWkAdvanceGate } from "./wk-gate";
+import { evaluateWkAdvanceGate, evaluateWkPostStage } from "./wk-gate";
 import {
   buildRunNotFinishedError,
   isRetryableRunError,
@@ -690,7 +685,7 @@ export const releaseArchivedTaskSessionCache = async (
 /**
  * 需求群自动播报（第三批）——action 落 awaiting_ack 之后的增强动作。
  *
- * 只在后置检查收口点里调（唯一的「action 完成」时刻）、复用同一份 check 租约：
+ * 只在 action 收尾收口点里调（唯一的「action 完成」时刻）、复用同一份收尾租约：
  * 降级 info 事件走 `writeOwnedEventAndPublish` + `stillOwner`，租约没了就不写。
  * 整个调用**绝不抛**（broadcastActionCompletion 内部全包 + 自带超时），
  * 播报挂了不影响 action 已经完成的事实。
@@ -714,24 +709,23 @@ const broadcastActionToGroup = async (
 };
 
 /**
- * V0.8.18：后台跑某 action 的后置 deterministic check（异步、不阻塞调用方）。
+ * action 交卷后的收尾（后台跑、不阻塞调用方）：wk 阶段门禁（仅团队 wk 系 action，其余静默）→ 落 awaiting_ack → 群播报。
+ * （产物「必备段 / 基底 commit / MR 验真」等交付检查与红条已整套下线：产出能出来就是能出来，不再事后挑格式。）
  *
  * # 为什么后台跑（线上踩过）
- * check 若在 awaitingNotifier 里被 `submit_work` MCP 工具**同步 await**、工具就要阻塞到
- * check 跑完才返回、慢了会撞 Cursor SDK ~60s 工具超时 → agent 收到「超时」后困惑乱来。
- * 改成：notifier 立即返回、check 在这里后台跑、跑完再落结果 + 切 awaiting_ack
+ * 收尾若在 awaitingNotifier 里被 `submit_work` MCP 工具**同步 await**、工具就要阻塞到
+ * 它跑完才返回、慢了会撞 Cursor SDK ~60s 工具超时 → agent 收到「超时」后困惑乱来。
+ * 改成：notifier 立即返回、收尾在这里后台跑、跑完再切 awaiting_ack
  * （不再单独写「产出完成」里程碑事件——交卷后的固定收尾由平台在回合结束时补发）。
- * （交付诚实性检查多为 artifact 读文件 + git status hash、通常秒级；
- *   review 多仓 git 指纹仍可能上秒、后台架构保留。）
  *
  * # 去重 + 取消（消灭重复跑 + 状态交错）
- * 一个 task 同时只允许一个在跑的 check（runningChecks）。新一轮交卷（如按反馈改完再 submit_work）会
- * abort 旧的、用最新代码重跑。停止 / 推进新 action 调 abortRunningCheck。check 跑完前判「自己是否仍是
- * 当前 check + action 是否仍在 running」——被顶替 / abort / action 已 cancelled → 丢弃结果、不写状态不发事件
- * （否则会出现「旧 action 的 check 跑完后在新 action 运行期间冒出『产出完成』事件」的交错、线上踩过）。
+ * 一个 task 同时只允许一个在跑的收尾（runningChecks）。新一轮交卷（如按反馈改完再 submit_work）会
+ * abort 旧的、用最新代码重跑。停止 / 推进新 action 调 abortRunningCheck。跑完前判「自己是否仍是
+ * 当前收尾 + action 是否仍在 running」——被顶替 / abort / action 已 cancelled → 丢弃结果、不写状态不发事件
+ * （否则会出现「旧 action 的收尾跑完后在新 action 运行期间冒出『产出完成』事件」的交错、线上踩过）。
  */
 /**
- * 后置 check 独立租约——不再借用会在 consume finally 释放的 run opHandle。
+ * 收尾独立租约——不再借用会在 consume finally 释放的 run opHandle。
  * 存活凭据三件：① runningChecks 仍是 self；② 启动时快照的 opGen 未变（stop/DELETE revoke）；
  * ③ lifecycle === null。落状态仍走条件事务（awaiting_ack；runStatus 见下：收尾旁白还在跑就保持 running）。
  */
@@ -781,16 +775,18 @@ const runActionPostCheck = (
       getTaskOpGeneration(taskId) === checkGen &&
       getChatLifecycle(taskId) === null;
 
-    let postCheck: ActionRecord["postCheck"] | undefined;
     try {
       const fresh = await getTaskMeta(taskId);
       const targetAction = fresh?.actions.find((a) => a.id === actionId);
       if (fresh && targetAction) {
-        const result = await runActionCheck(fresh, targetAction);
-        postCheck = { passed: result.passed, details: result.details };
-        console.log(
-          `[task-runner] runActionPostCheck task=${taskId} action=${actionId} passed=${result.passed} details=${result.details.slice(0, 200)}`,
-        );
+        // wk 阶段门禁：只写事件流提示、不影响下面照常切 awaiting_ack；租约没了就不写
+        await evaluateWkPostStage(fresh, targetAction, async (kind, text) => {
+          await writeOwnedEventAndPublish(taskId, stillOwner, {
+            kind,
+            actionId,
+            text,
+          });
+        });
       }
     } catch (err) {
       console.warn(
@@ -849,7 +845,6 @@ const runActionPostCheck = (
       wrapUpStillGoing ? "running" : "awaiting_user",
       () => stillOwner(),
       { currentActionId: actionId, actionStatus: "running" },
-      postCheck ? { postCheck } : undefined,
     );
     if (patched) {
       publish(taskId, { kind: "task", task: patched });
@@ -873,8 +868,8 @@ const runActionPostCheck = (
 };
 
 /**
- * V0.8.18：取消某 task 正在后台跑的后置 check（停止 / 推进新 action 时调）。
- * abort 让 check 结果作废（不写 awaiting_ack、不发「产出完成」事件）。
+ * V0.8.18：取消某 task 正在后台跑的 action 收尾（停止 / 推进新 action 时调）。
+ * abort 让收尾结果作废（不写 awaiting_ack、不发「产出完成」事件）。
  */
 export const abortRunningCheck = (taskId: string): void => {
   const cur = runningChecks.get(taskId);
@@ -1577,25 +1572,6 @@ const advanceTaskCore = async (
   await failpoint("advance.afterAppend");
   publish(task.id, { kind: "task", task: taskAfterAppend });
   publish(task.id, { kind: "action", action });
-  // V0.6.27：review / build 启动基线；只读仓基线所有 action 都采（后置检测兜底）
-  // 采集失败 fail-open 不挡启动
-  // V1：baseline / 分支 await 正是「已 append、尚未 startingTasks」的竞态窗——每段后复查
-  if (actionType === "review" || actionType === "build") {
-    const baseline = await captureActionStartBaseline(task, actionType);
-    await abortIfTaskOpStale(task.id, opGen);
-    if (baseline) {
-      await patchAction(task.id, action.id, { startBaseline: baseline });
-      action.startBaseline = baseline;
-    }
-  }
-  {
-    const readonlyBaseline = await captureReadonlyRepoBaselines(task);
-    await abortIfTaskOpStale(task.id, opGen);
-    if (readonlyBaseline) {
-      await patchAction(task.id, action.id, { readonlyBaseline });
-      action.readonlyBaseline = readonlyBaseline;
-    }
-  }
   // owner 语境（已 claim）——opHandle lease
   // 日常轻量态（无飞书链接）：首次推进落一条 info，告知用户直接在原仓当前分支干活（只写一次、不刷屏）
   if (
@@ -3297,15 +3273,15 @@ export const buildSessionBridges = (
       return "accepted";
     }
 
-    // awaiting_start：agent 完成一个 action 调 submit_work(action_id) → 后台跑 check + 切 awaiting_ack
+    // awaiting_start：agent 完成一个 action 调 submit_work(action_id) → 后台收尾（wk 门禁）+ 切 awaiting_ack
     //                 或 agent 待命 submit_work(待命态、不带 action_id) → 只切 runStatus=awaiting_user
     if (signal.actionId) {
-      // V0.8.18：后置 deterministic check（build 的 lint/typecheck 可达 120s）改后台异步跑——
+      // V0.8.18：收尾改后台异步跑——
       // 这样 notifier 立即返回、agent 的 submit_work 工具秒回引导、第一时间挂上 curl long-poll 等 ack
-      // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
-      // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack
+      // （以前同步 await 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
+      // 收尾跑完由 runActionPostCheck 切 awaiting_ack
       // （固定收尾文案由平台在回合结束时补发、不再写里程碑事件）。
-      // postCheck 独立租约、不传 run opHandle
+      // 收尾用独立租约、不传 run opHandle
       // waitAndClaimPostCheck 等 mr 清空后同 tick claim / 换 token——关交接空窗与 ABA
       await failpoint("mcp.submitWork.beforeCheckStart");
       if (!callerStillValid()) return "stale";
@@ -6608,7 +6584,7 @@ export const startOneShotQuestion = (
                 "- 用户要方案 / 要做的是大改动（整段功能 / 跨多文件重构）→ 主导权在你：你判断该正式走一步了，就调 `advance_next` 登记（plan 出方案 / build 实现 / review 复核），本轮说完收尾后系统代用户推进；拿不准、或想先跟用户对齐范围，就在回复里问。用户随时也能自己点「推进」。别在本轮里硬扛大改动",
                 "- `advance_next` 的规矩：你判断用户有这个意思才登记；提测（ship）/ 联调推送（dev）/ 往群里发消息这类对外动作，用户明说才登记，你自己觉得该做就先问；登记 ≠ 现在去做，登记后正常收尾",
                 "- 用户点名要跑某个 action（「上线审查一下」「提测」「复核一下」；自定义 action = skills 目录里带 `.flowship-action.json` 的 skill，json 里的 `label` 就是名字）→ 不在这里替它干活：这条消息本身在让你做就直接 `advance_next` 登记（`instruction` 把链接 / 要求原样带上；自定义的 `custom_action_id` 填 label 或 skill 名即可）。疑问 / 否定 / 顺嘴提到不算点名",
-                "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）、推进（advance_next）可以用",
+                "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）、推进（advance_next）、项目预览（preview，起 dev server 看页面效果；起服务只能走它、别用 shell 自己起）可以用",
                 "- 不要提交 commit / 提 MR、处理完自然结束回复",
               ];
           // 首轮 / 接不回新起的：完整背景 + 群能力 + 边界

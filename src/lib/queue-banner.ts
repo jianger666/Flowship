@@ -182,3 +182,36 @@ export const queueEditKeyAction = (e: QueueEditKeyInput): QueueEditKeyAction | n
   }
   return null;
 };
+
+/** 「等消息送进队列」的复拉间隔 / 最多复拉次数（共约 6.4 秒；超过就当它真的不在队里了） */
+export const QUEUE_ARRIVAL_RETRY_MS = 800;
+export const QUEUE_ARRIVAL_RETRY_MAX = 8;
+
+/**
+ * 面板拉到的服务端队列是空的，但条上的数（本地账）还大于 0：是「还没送进来」还是「已经没了」？
+ *
+ * 条上的数在发送的**一瞬间**就加上了（本地先登记「排队中」），而服务端要等这条的请求走完受理前的步骤
+ * （存图 / 读浏览器操作摘要 / 等堆水位……）才入队。这几百毫秒到几秒里点开面板，拉到的就是空队——
+ * 直接写「队列已空（可能刚被发出或删除）」会让人以为消息丢了。所以这种情形先说「正在送进队列」并短间隔复拉几次，
+ * 复拉耗尽仍是空（真被发出 / 删除 / 是幽灵占位）才落回「队列已空」。
+ *
+ * 只在 fetch 模式（chat）：task 的面板条目就是实时快照，空了就是空了。
+ */
+export const shouldWaitForQueueArrival = (args: {
+  fetchMode: boolean;
+  open: boolean;
+  /** 拉取失败是另一回事（有自己的文案） */
+  loadError: boolean;
+  /** 最近一次拉到的条数；null = 还没拉到 */
+  fetchedCount: number | null;
+  /** 条上显示的数（本地账） */
+  queuedCount: number;
+  /** 已经复拉了几次 */
+  retries: number;
+}): boolean =>
+  args.fetchMode &&
+  args.open &&
+  !args.loadError &&
+  args.fetchedCount === 0 &&
+  args.queuedCount > 0 &&
+  args.retries < QUEUE_ARRIVAL_RETRY_MAX;

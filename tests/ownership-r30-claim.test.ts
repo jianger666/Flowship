@@ -72,10 +72,12 @@ const mockRunActionCheck = vi.fn(async () => ({
   passed: true,
   details: "ok",
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: () => mockRunActionCheck(),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
+vi.mock("@/lib/server/wk-gate", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/wk-gate")>()),
+  // 「收尾检查在跑」的可控钩子：只替换 action 收尾的 wk 门禁，advance 前置门禁保持真实
+  evaluateWkPostStage: async () => {
+    await mockRunActionCheck();
+  },
 }));
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
@@ -510,7 +512,7 @@ describe("ownership R30 claim + notifier outcome", () => {
       await raceExpectSettled(pWork, 12_000);
       expect(await pWork).toBe("accepted");
       await waitUntil(() => runningChecks.get(id)?.actionId === "act_ship", 5000);
-      // getTask await 后才进 runActionCheck——等 mock 真正挂上再断言 claim
+      // getTask await 后才进收尾检查——等 mock 真正挂上再断言 claim
       await waitUntil(() => mockRunActionCheck.mock.calls.length > 0, 5000);
       expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
 

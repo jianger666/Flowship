@@ -568,7 +568,7 @@ export interface FeAiFlowSettings {
 }
 
 /**
- * 自动播报档位——action 完成（产物过后置检查、进入待确认态）后自动发需求群。
+ * 自动播报档位——action 完成（进入待确认态）后自动发需求群。
  * - off：不自动播报（只有用户点分享 / agent 按 playbook 调 share_to_group 才发）
  * - ship：仅提测类（ship）跑完播报——群里最关心的是「提测了没、MR 在哪」
  * - all：每个 action 跑完都播报
@@ -828,7 +828,7 @@ export type CustomActionInput = Omit<
  * - running：agent 正在跑该 action
  * - awaiting_ack：跑完 artifact 已落、等用户 ack
  * - completed：用户 approve、后续 action 可基于本 action artifact 推进
- * - error：后置检查失败 / agent 报错
+ * - error：agent 报错
  * - cancelled：用户中途取消（N 不释放、避免 race）
  */
 export type ActionStatus =
@@ -963,40 +963,6 @@ export interface ActionRecord {
   excluded?: boolean;
 
   /**
-   * 后置 deterministic 检查（V0.6 门槛 2；v0.9.13 起只查 agent 交付诚实性、不跑项目命令）
-   * - plan: artifact 文件存在 + 内容长度 >= 100 + 必备段（需求理解 / Task 拆分、V0.6.27）
-   * - build: artifact 落盘非空（CheckRun 跑 typecheck/lint 那套 v0.9.13 删——存量项目基线红、全仓检查语义错配）
-   * - review: 基底 commit 一致 + 必备段非空 + bug 复审段非空（V0.6.9 fresh peer 阶段二）
-   *   + 工作区指纹未变（V0.6.27、review 只读硬校验）
-   * - ship（V0.6.1）：需提 MR 的仓都有 task.mrs 记录 + URL 非空、跳过仓有原因
-   * - custom：artifact 落盘非空（定义存在性由 advance 准入拦）
-   */
-  postCheck?: {
-    passed: boolean;
-    details: string;
-  };
-
-  /**
-   * V0.6.27：action 启动时记录的工作区基线（path → 指纹 / 状态 hash）、后置检查比对用
-   * - review action：key = task 各仓 path、value = worktreeFingerprint——checkReview 重算比对、
-   *   不一致 = agent 在 review 期间改了代码（review 只读铁律从 prompt 软约束升级硬校验）
-   * - build action：key = effective cwd 下「非本 task 的兄弟 git 仓」path、value = git status hash——
-   *   checkBuild 重算比对、变了 = agent 越权改了兄弟仓（多仓 cwd=公共父目录的 harness 缺口）
-   * - 记录失败（非 git 仓 / 命令失败）的仓不进 map、检查端对缺 key 跳过比对（fail-open）
-   */
-  startBaseline?: Record<string, string>;
-
-  /**
-   * 只读仓启动基线（path → porcelain / ahead-of-upstream）、所有 action 类型交卷后置比对用。
-   * 不比 HEAD（允许 pull / 切提测分支）；工作区变脏或本地多出 upstream 没有的 commit → 红条。
-   * 缺 key / 采集失败 → 该仓跳过（fail-open）。
-   */
-  readonlyBaseline?: Record<
-    string,
-    { porcelain: string; ahead: string | null }
-  >;
-
-  /**
    * 副作用记录（对外部世界的影响）
    *
    * V0.6.1：ship 改成多仓数组——同一 ship action 多仓场景产出 N 条 MR、一仓 1 条记录
@@ -1011,7 +977,7 @@ export interface ActionRecord {
       mrVersion: number;
       branch: string;
       commitHash: string;
-      /** V0.6.1.1：本次 ship 该仓 MR 跟 test 是否有冲突（true 时 ship 不发飞书评论、checkShip 判不干净） */
+      /** V0.6.1.1：本次 ship 该仓 MR 跟 test 是否有冲突（true 时 ship 不发飞书评论） */
       hasConflicts?: boolean;
     }>;
   };
@@ -1150,7 +1116,7 @@ export interface MRRecord {
    * V0.6.1.1：本仓 MR 跟 target(test) 是否有冲突
    * 每次 ship push 后 server poll GitLab detailed_merge_status 写入：
    * - true：feature 跟 test 冲突、待用户手动解决（AI 绝不 merge/rebase test→feature）；
-   *   有冲突时 ship 不发飞书评论（不能让测试人员收到合不了的 MR）、checkShip 也判 ship 不干净
+   *   有冲突时 ship 不发飞书评论（不能让测试人员收到合不了的 MR）
    * - false：可干净合 / 无冲突
    * - undefined：还没检测 / GitLab 还在异步算（undetermined）
    */
@@ -1730,7 +1696,7 @@ export interface Task {
   nonGitRepoPaths?: string[];
   /**
    * 只读仓清单（建 / 编辑任务改 repoPaths 时从 settings.repos[].readonly 快照落库）。
-   * 只读仓不进隔离 worktree（原地使用）、prompt 标注、后置检测、submit_mr 闸共用这份——
+   * 只读仓不进隔离 worktree（原地使用）、prompt 标注、submit_mr 闸共用这份——
    * 运行时不回头查设置（设置页中途改开关不影响已建任务）。
    * undefined = 无只读仓（老任务不迁移）。
    */
@@ -1803,7 +1769,7 @@ export interface Task {
   /**
    * V0.10：任务隔离工作区（git worktree）开关。
    * - true（新建 task 默认）→ runner 起 agent 前在 dataRoot/worktrees/<taskId>/ 逐仓
-   *   `git worktree add` 并确定性检出任务分支、agent cwd / 后置检查全走 worktree、
+   *   `git worktree add` 并确定性检出任务分支、agent cwd 走 worktree、
    *   并行任务不再互踩同一个仓的工作区
    * - false（新建弹窗的逃生口「直接在原仓库运行」）/ undefined（V0.10 前的老 task）
    *   → 直接在原仓库目录运行、分支靠 build checkout hint 引导 agent 自己切（旧行为）

@@ -263,13 +263,13 @@ describe("status 写入口 → 落盘 activeMs", () => {
     expect((done.endedAt as number) - (done.startedAt as number)).toBe(61 * MIN + 30_000);
   });
 
-  it("patchAction：不改 status 的 patch（如写 postCheck）不碰运行时长", async () => {
+  it("patchAction：不改 status 的 patch（如写 excluded）不碰运行时长", async () => {
     seed("t_nostatus");
     const { patchAction } = await loadTaskFs();
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(T0 + 5 * MIN);
     await patchAction("t_nostatus", "act_1", {
-      postCheck: { passed: true, details: "ok" },
+      excluded: true,
     });
     const a = readAction("t_nostatus");
     expect(a.activeMs).toBeUndefined();

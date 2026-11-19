@@ -78,7 +78,7 @@ export const checkActionPrerequisites = (
     case "plan":
       return { ok: true }; // 永远可
     case "build":
-      // 全仓只读 → 拒（部分只读放行：可写仓照常改、只读仓 prompt + 后置检测守）
+      // 全仓只读 → 拒（部分只读放行：可写仓照常改、只读仓靠 prompt + submit_mr 闸守）
       if (taskAllReposReadonly(task)) {
         return { ok: false, reason: ALL_READONLY_REPOS_BLOCK_REASON };
       }

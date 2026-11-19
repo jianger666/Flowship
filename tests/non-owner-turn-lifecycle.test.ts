@@ -40,11 +40,6 @@ vi.mock("@/lib/server/kill-orphans", () => ({ reapTaskOrphans: vi.fn() }));
 vi.mock("@/lib/server/meegle-cli", () => ({
   resolveUserIdentityForPrompt: async () => "",
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
-}));
 vi.mock("@/lib/server/chat-pending", async () => {
   // 真的 buildAgentMessage：要验消息里确有约束段
   const actual = await vi.importActual<

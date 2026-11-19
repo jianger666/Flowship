@@ -1069,6 +1069,18 @@ export const isChatRunActive = (taskId: string): boolean =>
   runningChats.get(taskId)?.runActive === true;
 
 /**
+ * 此刻**非 owner** 的 {@link sendChatMessage} 会不会直接回 busy（会话在、但 agent 还没就位或 run 在跑）。
+ * 判据与 sendChatMessage 的忙线早退（`!rec.agent || rec.runActive`）同一条——chat-inject 用它在**打发送前快照之前**
+ * 就决定入队：已知会回 busy 的消息先花 1–10s 扫仓库打快照再入队，既白打（flush 时自己重打）又把入队推迟、
+ * 排队面板这几秒里是空的。无会话返回 false（那是 no_session，不是 busy）。
+ * 同步、只读；owner（resume 自己认领了 runActive 的那一路）不能用它，它必须先发自己这条。
+ */
+export const isChatSendBusy = (taskId: string): boolean => {
+  const rec = runningChats.get(taskId);
+  return !!rec && (!rec.agent || rec.runActive);
+};
+
+/**
  * 仅用于「claimRun 后、owner send 前」的失败释放。
  * 认领态下没有真 run，直接把 runActive 复位 false；无会话时幂等 no-op。
  * why：认领不释放 = 会话永远假 busy、所有消息只进队无人消费。

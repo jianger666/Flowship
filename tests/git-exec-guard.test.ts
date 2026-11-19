@@ -106,7 +106,6 @@ describe("src 下每一处 git 调用点的 env 都来自 gitEnv()", () => {
     const files = new Set(sites.map((s) => s.file.replace(/\\/g, "/")));
 
     for (const f of [
-      "action-checks",
       "chat-checkpoint",
       "git-branches",
       "submit-mr-guard",

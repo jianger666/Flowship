@@ -2,7 +2,7 @@
  * 读 config.json 失败时，不能把任务的「只读仓 / 脚本仓」标记永久清掉（P1）。
  *
  * 旧行为：`snapshotRepoFlagPaths` 把读 config 失败（Windows 杀软占用 / 手改 JSON 没写完）转成空配置，
- * `readonlyRepoPaths` 被写成 undefined 落进 meta，且快照之后不再重算——submit-mr-guard / action-checks /
+ * `readonlyRepoPaths` 被写成 undefined 落进 meta，且快照之后不再重算——submit-mr-guard /
  * task-worktrees / task-changes 从此把只读仓当可写仓。
  * 现在：读取出错返回 null（区别于「读到了但没有只读仓」）；
  * - createTask：重试一次，仍失败就抛错（不建任务）；

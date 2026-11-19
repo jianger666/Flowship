@@ -68,6 +68,8 @@ vi.mock("@/lib/server/chat-runner", () => ({
   hasChatSession,
   isChatQueueDraining: vi.fn(() => false),
   isChatRunActive: vi.fn(() => false),
+  // 忙线判定（sendChatMessage 会不会回 busy）：本文件的热路径都是「会话在、空闲」→ false
+  isChatSendBusy: vi.fn(() => false),
   releaseChatRunClaim: vi.fn(),
   resumeChatSession,
   runChatSession,

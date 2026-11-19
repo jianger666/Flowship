@@ -36,6 +36,7 @@ import {
   hasChatSession,
   isChatQueueDraining,
   isChatRunActive,
+  isChatSendBusy,
   reclaimChatSessionsForWatermark,
   releaseChatRunClaim,
   resumeChatSession,
@@ -817,9 +818,19 @@ const runChatReplyInject = async (
       // 例外：resume owner 是预约确定的先到者，必须先发自己这条——不得把自己排到
       // 并发输家后面（否则 A resume 后 flush B、A 见 draining 再入队 → 顺序 B→A 反转）。
       // 后续队列等 owner run 结束由统一 flush 排出，FIFO 恢复 A→B。
+      //
+      // 「run 正在跑」（isChatSendBusy）也直接入队、不再先打发送前快照：下面 sendChatMessage 对非 owner 见忙必回 busy、
+      // 然后才入队，而快照（captureChatCheckpoint，要扫仓库 git 状态、大仓 1–10s）这时已经白打了——
+      // 排队的消息 flush 时会自己重打（chat-runner.flushChatQueue），这份快照没人用。
+      // 更糟的是它把「入队」整整推迟了一个快照：客户端本地早就显示「排队中」，服务端队列还是空的，
+      // 这几秒里点开排队面板只能看到「队列已空」（2026-11-19 实测：快照 10.4s、sendChatMessage=0ms 即这条路径）。
+      // 判定与入队之间没有 await（enqueueOrReject 入队前同步），与上面两个条件同等原子；
+      // 判定后 run 恰好结束的窄窗口由 run 末尾的「放 runActive → 同步 flush」兜住（排队时 runActive 仍为 true）。
       if (
         !resumedAsOwner &&
-        (getChatQueueCount(task.id) > 0 || isChatQueueDraining(task.id))
+        (getChatQueueCount(task.id) > 0 ||
+          isChatQueueDraining(task.id) ||
+          isChatSendBusy(task.id))
       ) {
         return enqueueOrReject();
       }

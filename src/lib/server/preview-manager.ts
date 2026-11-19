@@ -869,6 +869,20 @@ export const getPreviewStatus = (): PreviewSlotStatus[] =>
 export const stopPreview = (repoPath: string): Promise<void> =>
   enqueue(() => doStopPreview(repoPath));
 
+/**
+ * 只停「这个任务自己的」那个仓的预览：归属在串行队列里判（agent 的 `preview` 工具用）。
+ * 调用方在入队前查「是不是我的」不是原子的——查完到真正停之间，用户在 UI 里点「预览」可能刚把这个仓接管给了别的任务，
+ * 这时按仓直接停会把别人刚起的预览杀掉。队列里此刻 map 是权威：不是自己的（或已经没有）就什么都不动。
+ * 返回是否真的停了一个（false = 该仓没有本任务的预览位）。
+ */
+export const stopPreviewIfOwner = (repoPath: string, taskId: string): Promise<boolean> =>
+  enqueue(async () => {
+    const slot = getSlotsRef().get(repoPath);
+    if (!slot || slot.taskId !== taskId) return false;
+    await doStopPreview(repoPath);
+    return true;
+  });
+
 /** 停全部预览位（boot / DELETE 不带 repoPath / 全清用） */
 export const stopAllPreviews = (): Promise<void> => enqueue(doStopAllPreviews);
 
@@ -952,15 +966,28 @@ export interface StartPreviewInput {
   /** dev server 实际运行目录（隔离 task = worktree、否则 = 原仓库） */
   workDir: string;
   command: string;
+  /**
+   * 同仓被**别的任务**占着时是否顶掉它。默认 true（UI 点「预览」是用户明确的接管）；
+   * false = 被占就让位（yielded，不 spawn、不动旧位）——agent 的 `preview` 工具用，它不该顶掉别人。
+   * 判定在串行队列里做：调用方在入队前查「有没有被占」不是原子的，两个任务同时 start 同一个仓时
+   * 都能查到「没人占」、再按入队顺序后到的顶掉先到的，agent 那条「不顶别人」就破了。
+   */
+  takeOver?: boolean;
 }
+
+/** 同仓预览位被别的任务占着时的说明（队列内让位的 yieldReason、launch 的前置检查共用，免得两处文案漂移） */
+export const previewOccupiedReason = (holderTaskTitle: string): string =>
+  `这个仓的预览正被任务「${holderTaskTitle}」占用（同一个仓同时只能跑一个预览）`;
 
 /** startPreview 返回值；yielded=true 表示最终准入拒绝、未 spawn（route → 409） */
 export interface StartPreviewResult {
   replacedTaskTitle: string | null;
   status: PreviewSlotStatus;
-  /** spawn 前最终准入失败 */
+  /** spawn 前最终准入失败 / 不顶人时被别的任务占着 */
   yielded?: boolean;
   yieldReason?: string;
+  /** yielded 的原因是「同仓被别的任务占着、且调用方声明不顶掉」（区别于任务终结 / 停止这类准入拒绝） */
+  occupied?: boolean;
 }
 
 /**
@@ -978,15 +1005,44 @@ export const startPreview = (
   });
 };
 
+/** 让位结果：没 spawn、没动任何旧位；合成一个「已退出」的 status 给调用方（无 pid），原因同时进日志尾巴 */
+const yieldedStart = (
+  input: StartPreviewInput,
+  reason: string,
+  logLine: string,
+): StartPreviewResult => ({
+  replacedTaskTitle: null,
+  status: {
+    taskId: input.taskId,
+    taskTitle: input.taskTitle,
+    repoPath: input.repoPath,
+    workDir: input.workDir,
+    command: input.command,
+    startedAt: Date.now(),
+    url: null,
+    exited: true,
+    exitCode: null,
+    logTail: [logLine],
+  },
+  yielded: true,
+  yieldReason: reason,
+});
+
 const doStartPreview = async (
   input: StartPreviewInput,
 ): Promise<StartPreviewResult> => {
   const map = getSlotsRef();
   const replaced = map.get(input.repoPath) ?? null;
-  const replacedTaskTitle =
-    replaced && !replaced.exited && replaced.taskId !== input.taskId
-      ? replaced.taskTitle
-      : null;
+  // 「占着」= 别的任务的、还在跑的 slot（自己重起 / 对方已退出都不算）
+  const occupiedBy =
+    replaced && !replaced.exited && replaced.taskId !== input.taskId ? replaced : null;
+  const replacedTaskTitle = occupiedBy?.taskTitle ?? null;
+
+  // 不许顶别人（agent 工具）：在队列内（此刻 map 是权威、不会再有交错）判定，被占就让位、旧位原样不动
+  if (input.takeOver === false && occupiedBy) {
+    const reason = previewOccupiedReason(occupiedBy.taskTitle);
+    return { ...yieldedStart(input, reason, `未启动——${reason}`), occupied: true };
+  }
 
   // 只停同仓旧位（内存）+ 同仓 pidfile 残留——不动其它仓
   //（直接调 do 版本：本函数已在队列内、再 enqueue 会自锁）
@@ -998,24 +1054,7 @@ const doStartPreview = async (
   const admission = await admitPreviewSpawn(input.taskId);
   if (!admission.ok) {
     // 让位：不 spawn；合成已退出 status 给调用方（无 pid）
-    const yieldedStatus: PreviewSlotStatus = {
-      taskId: input.taskId,
-      taskTitle: input.taskTitle,
-      repoPath: input.repoPath,
-      workDir: input.workDir,
-      command: input.command,
-      startedAt: Date.now(),
-      url: null,
-      exited: true,
-      exitCode: null,
-      logTail: [`最终准入拒绝——${admission.reason}`],
-    };
-    return {
-      replacedTaskTitle: null,
-      status: yieldedStatus,
-      yielded: true,
-      yieldReason: admission.reason,
-    };
+    return yieldedStart(input, admission.reason, `最终准入拒绝——${admission.reason}`);
   }
 
   // shell 模式跑用户配置的命令串（可能带 && / 环境变量前缀）。

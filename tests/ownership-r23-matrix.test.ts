@@ -57,12 +57,6 @@ vi.mock("@/lib/server/kill-orphans", () => ({
 vi.mock("@/lib/server/meegle-cli", () => ({
   resolveUserIdentityForPrompt: async () => "",
 }));
-/** postcheck 秒过；advance 的 baseline 捕获也 mock 掉（M4/M7 走真实 advance） */
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
-}));
 vi.mock("@/lib/server/chat-pending", () => ({
   cleanupChatTaskState: vi.fn(),
   invalidateCallerToken: vi.fn(),

@@ -243,14 +243,6 @@ describe("接线契约：没法在不起 IDE / python / 真 shell 的前提下�
     expect(s.slice(at, at + 500)).toContain("env: stripHostInjectedEnvAndGitToken()");
   });
 
-  it("action-checks：runShell 的 git 子进程走 gitEnv（= 剔宿主注入变量 + 剔 PAT + 不等人输入；行为见 action-checks-run-shell.test.ts）", () => {
-    const s = src("src/lib/server/action-checks.ts");
-    expect(s).toMatch(/from "\.\/git-exec"/);
-    const at = s.indexOf("const proc = spawn(cmd, args, {");
-    expect(at).toBeGreaterThan(0);
-    expect(s.slice(at, at + 300)).toContain('env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" })');
-  });
-
   it("wk-gate：workflow-gate 的 python 脚本环境从 stripHostInjectedEnvAndGitToken 起步（剔宿主注入变量 + 剔 GitLab PAT），而不是整份 process.env", () => {
     const s = src("src/lib/server/wk-gate.ts");
     expect(s).toMatch(/from "\.\/host-env"/);

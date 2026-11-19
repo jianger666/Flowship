@@ -93,11 +93,22 @@ export const TASK_BRANCH_GUARD_CODE = "task_branch_guard";
  * - chat 任务（没有任务分支概念）
  * - WK 主流程（分支归 WK 工作流管：AI 会自己建 / 切业务分支，runner 只在 Action 边界按 status/REQ-ID 结果帮切；
  *   在消息送达时按落盘记录硬切，可能把 AI 刚切好的分支切回旧记录）
+ * - 联调（dev）正在跑：直推模式按提示词就是 `git checkout --detach origin/<dev>`、在 detached HEAD 上把 feature 合进去，
+ *   合并有冲突时就地停在冲突现场、ask_user 问用户怎么解。此刻 HEAD 不在任务分支是 action 自己的设计：
+ *   守卫硬切回必然失败（合并中途索引里有未解决的冲突）、真切成功了也会把 AI 从合并现场拽走，
+ *   结果用户的答复永远送不进去（用户反馈：「我压根没切过分支」）。分支由 dev action 自己管（收尾会切回 feature），
+ *   联调结束（交卷 / 出错 / 取消）后守卫照常恢复。
  * - 非 git / 只读仓、没记录分支名的仓（轻量日常任务不建分支）
  */
 export const collectBranchTargets = (task: Task): BranchTarget[] => {
   if (task.mode === "chat") return [];
   if (resolveFlowLock(task.actions ?? []) === "wk") return [];
+  const currentAction = (task.actions ?? []).find(
+    (a) => a.id === task.currentActionId,
+  );
+  if (currentAction?.type === "dev" && currentAction.status === "running") {
+    return [];
+  }
   const targets: BranchTarget[] = [];
 
   if (isWorktreeTask(task)) {

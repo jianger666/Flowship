@@ -1,5 +1,5 @@
 /**
- * Flowship 自有工具（交卷 / 提问 / 提 MR / 测试人员 / 批次 / 挂 action / 分享群 / 群 @ 测试）。
+ * Flowship 自有工具（交卷 / 提问 / 提 MR / 测试人员 / 批次 / 挂 action / 分享群 / 群 @ 测试 / 项目预览）。
  *
  *   - cursor：`buildSdkCustomTools` → `Agent.create({ local: { customTools } })`
  *   - custom：pi customTools（TypeBox schema，见 custom-agent-backend.ts）
@@ -78,6 +78,7 @@ import {
   registerAdvanceChain,
 } from "./advance-chain";
 import { getBrowserTools } from "./browser/tools";
+import { PREVIEW_TOOL_ACTIONS, dispatchPreviewTool } from "./preview-launch";
 import { getTask, getTaskMeta } from "./task-fs";
 import { getTaskOpGeneration, writeEventAndPublish } from "./task-stream";
 
@@ -720,13 +721,34 @@ const shareToGroupDef: FlowshipToolDef = {
 
 // ----------------- 需求群 @ 测试 notify_group_testers -----------------
 
+/**
+ * notify_group_testers 的返回体。
+ *
+ * skipped_duplicate 单独附一句 hint：这道去重**只按 action_id**（同一个 action 只放行一次、不看内容、不看 MR 版本）。
+ * 光一个 outcome 很容易被读成「上一轮已发出、没事了」——但「用户让这个 action 再提测一次」时，
+ * 新的 MR 版本 / 新改动的通知恰恰被它吞掉了，而 agent 还以为发成功过（2026-11-18 !257 的提测卡没发出）。
+ * 要重发只能走新的提测 action（新 action_id，去重自然重置），所以 hint 直接指路。
+ */
+export const buildNotifyTestersResult = (
+  outcome: string,
+  actionId: string,
+): { ok: true; outcome: string; hint?: string } =>
+  outcome === "skipped_duplicate"
+    ? {
+        ok: true,
+        outcome,
+        hint: `这次什么都没发：本 action（${actionId}）里已经发过一张提测通知卡，同一个 action 只放行一次（按 action 去重，不看内容 / MR 版本）。只是重复调用的话忽略即可；如果这是用户要求的**新一轮**提测（新 push / 新 MR 版本），不要在本 action 里补发，请先重新交卷、再用 advance_next 登记新的提测 action，由它重发通知。`,
+      }
+    : { ok: true, outcome };
+
 const notifyGroupTestersDef: FlowshipToolDef = {
   name: "notify_group_testers",
   label: "在需求群 IM @ 测试人员",
   description: [
     "提测 playbook：写完飞书项目评论之后调。往已绑定的需求群发一张提测通知卡（MR 按钮 + 邮箱 @ 同一批测试人员，能推飞书提及），替代工作项评论 @（评论 @ 不推通知）。",
     "入参只要 task_id、action_id。人从 task.feishuTesterUserKeys 取、MR 从本 action 的 submit_mr 记录取；不要传 open_id，不要用 share_to_group 代替。",
-    "只允许当前 running 的 ship 调。返回 { ok, outcome }：sent / skipped_*（没群 / bot 不在群 / 没人可换 / 无 MR / 有冲突 / 重复调用等）/ failed（超时或发送失败）。skipped 与 failed 都不是 ship 失败：原样记进 artifact 即可，不要改调 share_to_group。failed 可重调一次：若重调回 skipped_duplicate 说明上一轮实际已发出，不用再试。",
+    "只允许当前 running 的 ship 调。返回 { ok, outcome }：sent / skipped_*（没群 / bot 不在群 / 没人可换 / 无 MR / 有冲突 / 重复调用等）/ failed（超时或发送失败）。skipped 与 failed 都不是 ship 失败：原样记进 artifact 即可，不要改调 share_to_group。failed 可重调一次：若重调回 skipped_duplicate 说明本 action 里已经发出过，不用再试。",
+    "去重只按 action_id（同一个 action 只放行一次、不看内容 / MR 版本）：用户要求**新一轮**提测（新 push / 新 MR 版本）时，不要在本 action 里再调——请 advance_next 登记新的提测 action，新 action 会重新发通知；这种情况下回 skipped_duplicate 就是被去重吞掉了、并没有发出新卡，返回里的 hint 会写明。",
   ].join("\n"),
   parameters: TBObject({
     task_id: TBString(),
@@ -773,7 +795,7 @@ const notifyGroupTestersDef: FlowshipToolDef = {
         });
       },
     });
-    return text(JSON.stringify({ ok: true, outcome }));
+    return text(JSON.stringify(buildNotifyTestersResult(outcome, actionId)));
   },
 };
 
@@ -1174,6 +1196,45 @@ const advanceNextDef: FlowshipToolDef = {
   },
 };
 
+// ----------------- 项目预览 preview -----------------
+
+const previewDef: FlowshipToolDef = {
+  name: "preview",
+  label: "启动 / 查看 / 停止本任务项目的预览（dev server）",
+  description: [
+    "起本任务项目的 dev server、读它的运行状态、停掉它。**起服务只能走这个工具、不要用 shell 自己跑 dev / serve / --watch**（长驻进程会挂死 Run、任务停止后还会变成孤儿）；本工具起的进程由系统托管，任务终结 / 归档 / 删除、应用退出时自动清理（本轮结束、用户点「停止」不会停它，不用了自己 stop）。",
+    "action=start：起预览。启动命令来自设置页里该仓配的「预览启动命令」（你不能传命令）；工作目录由系统按任务算（隔离任务 = 该任务的 worktree）。会等最多约 20 秒、等到「探到地址」或「进程退出」就返回；到点还没好就返回 state=starting，用 `wait` 等一会儿再 action=status。本任务该仓已经在跑就不重起、直接返回现状（要重起先 stop 再 start）。同一个仓同时只能跑一个预览：若被别的任务占着会返回失败、**不会**顶掉它——如实告诉用户、由用户决定。",
+    "action=status：看本任务预览的现状：state=starting（还在起 / 地址还连不上）/ running（地址可访问）/ exited（进程退了）、url、reachable、exit_code、log_tail（最近日志）。没有在跑也会说明是不是被别的任务占着。",
+    "action=stop：停掉本任务的预览（只停本任务自己的、幂等）。",
+    "task_id 必填；repo_path 可选——任务只有一个仓时可省略，多仓任务 start 必须指定、status / stop 不填 = 本任务全部预览。",
+    "返回 JSON：{ ok:true, … } / { ok:false, error }。拿到 running 后用浏览器工具（browser_navigate / browser_screenshot）打开 url 看页面、截图；没配预览命令 / 工作区还没建 / 任务已终结这些失败，把 error 原话转告用户即可，别自己换办法起服务。",
+  ].join("\n"),
+  parameters: TBObject({
+    task_id: TBString(),
+    action: TBEnum([...PREVIEW_TOOL_ACTIONS]),
+    repo_path: TBOptional(TBString()),
+  }),
+  handler: async (args, callerToken) => {
+    const taskId = str(args.task_id);
+    // 失败形状统一 JSON（tool-result-persist 靠 ok:false 判失败、不亮绿勾）
+    if (!matchExpectedCallerToken(taskId, callerToken)) {
+      return text(JSON.stringify({ ok: false, error: CALLER_MISMATCH_ERROR }));
+    }
+    try {
+      const result = await dispatchPreviewTool({
+        taskId,
+        action: str(args.action),
+        repoPath: str(args.repo_path) || undefined,
+      });
+      return text(JSON.stringify(result));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[preview] 工具执行抛错 task=${taskId}：`, msg);
+      return text(JSON.stringify({ ok: false, error: `预览操作失败：${msg}` }));
+    }
+  },
+};
+
 /** Flowship 自有工具清单（cursor SDK customTools + pi customTools 共用） */
 export const flowShipTools: FlowshipToolDef[] = [
   submitWorkDef,
@@ -1188,6 +1249,7 @@ export const flowShipTools: FlowshipToolDef[] = [
   waitDef,
   scheduleDef,
   advanceNextDef,
+  previewDef,
 ];
 
 /**

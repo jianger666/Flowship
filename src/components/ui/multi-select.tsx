@@ -5,11 +5,16 @@
  *
  * generic over T：调用方传 options / getKey / renderOption，点选 toggle、弹层不关。
  * 视觉和弹层行为统一走 Picker，避免再手写一套 Portal。
+ *
+ * 搜索：传了 `getSearchText` 就在弹层顶部出搜索框（Picker 自带）；候选的 label 是 ReactNode、Picker 没法按它过滤，
+ * 所以由调用方说「这一项拿什么文本来搜」（如 `名称 + 路径`），匹配规则见 `matchesSearchQuery`（空格分词、都要命中）。
+ * 多选点完不关弹层、搜索词也保留，方便连着搜几个都勾上。
  */
 
 import { useMemo, type ReactNode } from "react";
 
 import { Picker } from "@/components/ui/picker";
+import { matchesSearchQuery } from "@/lib/search-match";
 
 interface MultiSelectProps<T> {
   // 可选项原始对象数组
@@ -26,6 +31,9 @@ interface MultiSelectProps<T> {
   // 未选时 trigger 占位
   placeholder?: ReactNode;
   invalid?: boolean;
+  // 搜索用的文本（如「名称 + 路径」）；传了才有搜索框
+  getSearchText?: (item: T) => string;
+  searchPlaceholder?: string;
 }
 
 export const MultiSelect = <T,>({
@@ -37,6 +45,8 @@ export const MultiSelect = <T,>({
   renderTrigger,
   placeholder,
   invalid,
+  getSearchText,
+  searchPlaceholder,
 }: MultiSelectProps<T>) => {
   const pickerOptions = useMemo(
     () =>
@@ -45,6 +55,15 @@ export const MultiSelect = <T,>({
         label: renderOption(item),
       })),
     [options, getKey, renderOption],
+  );
+
+  // key → 搜索文本：Picker 的过滤回调只拿得到 option（label 是 ReactNode），按 key 反查
+  const searchTextByKey = useMemo(
+    () =>
+      getSearchText
+        ? new Map(options.map((o) => [getKey(o), getSearchText(o)] as const))
+        : null,
+    [options, getKey, getSearchText],
   );
 
   // 把已选 key 换回 item、保持选中顺序（点 trigger 时调用方拿到的就是「先选谁后选谁」）
@@ -59,6 +78,14 @@ export const MultiSelect = <T,>({
     <Picker
       multiple
       options={pickerOptions}
+      searchable={searchTextByKey !== null}
+      searchPlaceholder={searchPlaceholder}
+      filterOption={
+        searchTextByKey
+          ? (option, query) =>
+              matchesSearchQuery(searchTextByKey.get(option.value) ?? option.value, query)
+          : undefined
+      }
       value={value}
       onChange={onChange}
       invalid={invalid}

@@ -224,7 +224,7 @@ export const isTaskNonGitRepo = (
 
 /**
  * 读快照判断某仓是否只读（undefined / 未列入 = 可写）。
- * 只读仓不进 worktree、prompt / 门禁 / 后置检测共用。
+ * 只读仓不进 worktree、prompt / 门禁共用。
  */
 export const isTaskReadonlyRepo = (
   t: WorktreeTaskLike,
@@ -321,7 +321,7 @@ export const getTaskWorkRepoPaths = (t: WorktreeTaskLike): string[] => {
 };
 
 /**
- * task 的 effective cwd（Agent.create / 后置检查 / orphan reap 统一走这里）。
+ * task 的 effective cwd（Agent.create / orphan reap 统一走这里）。
  *
  * 隔离任务：只对「映射进 worktree 的仓」算公共父——非 git / 只读靠绝对路径访问、
  * 不参与聚合（否则 worktree 在 Application Support、原仓在 Documents → 聚到 $HOME）。

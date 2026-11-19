@@ -74,10 +74,12 @@ const mockRunActionCheck = vi.fn(async () => ({
   passed: true,
   details: "ok",
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: () => mockRunActionCheck(),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
+vi.mock("@/lib/server/wk-gate", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/wk-gate")>()),
+  // 「收尾检查在跑」的可控钩子：只替换 action 收尾的 wk 门禁，advance 前置门禁保持真实
+  evaluateWkPostStage: async () => {
+    await mockRunActionCheck();
+  },
 }));
 
 const taskFsCore = await import("@/lib/server/task-fs-core");

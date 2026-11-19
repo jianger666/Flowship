@@ -19,7 +19,7 @@
  */
 
 import { useState } from "react";
-import { AlertTriangle, RotateCcw, X } from "lucide-react";
+import { RotateCcw, X } from "lucide-react";
 
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { EmptyHint } from "@/components/ui/empty-hint";
@@ -65,11 +65,6 @@ const ActionChip = ({
   const excludeBlockReason = getActionExcludeBlockReason(action);
   // timeline 只表达「正在查看」和「是否划除」：
   // action 运行状态会被长 shell 等待放大成噪音，不在导航条里再额外染色。
-  // postCheck 未过：列表上一眼可见的警示标（详情在警示标 tooltip、面板正文有完整红条）
-  const postCheckFailed = action.postCheck?.passed === false;
-  const postCheckSummary = postCheckFailed
-    ? action.postCheck!.details.split("\n")[0]!.slice(0, 120)
-    : "";
   return (
     <div className="group/chip relative inline-flex items-center">
       {/* 主 chip 不再包 tooltip——chip 上的文字本身就是标签、悬停提示冗余 */}
@@ -101,16 +96,6 @@ const ActionChip = ({
         </span>
         {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
         <span>{actionDisplayLabel(action, "short")}</span>
-        {postCheckFailed && (
-          <Tooltip content={postCheckSummary}>
-            <span className="inline-flex">
-              <AlertTriangle
-                className="size-3 text-destructive"
-                aria-label="后置检查未通过"
-              />
-            </span>
-          </Tooltip>
-        )}
       </ChoiceButton>
       {onToggleExclude && (
         <Tooltip

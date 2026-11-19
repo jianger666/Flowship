@@ -10,17 +10,12 @@
  * 构成「建 chat task → 起 preview」的无鉴权 RCE 链；改为服务端按 repoPath 从权威
  * config.json 查设置页配的 previewCommand、client 只能选「预览哪个仓」。
  */
-import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 
-import { getChatLifecycle } from "@/lib/server/chat-gate";
+import { launchTaskPreview } from "@/lib/server/preview-launch";
 import { errorResponse } from "@/lib/server/route-helpers";
-import { getRepoPreviewCommand } from "@/lib/server/settings-fs";
-import { getTaskMeta } from "@/lib/server/task-fs";
-import { getTaskWorkRepoPaths } from "@/lib/server/task-worktrees";
 import {
   getPreviewStatus,
-  startPreview,
   stopAllPreviews,
   stopPreview,
 } from "@/lib/server/preview-manager";
@@ -42,56 +37,13 @@ export const POST = async (req: Request) => {
     return errorResponse("缺少 taskId / repoPath");
   }
 
-  // 只用 repoPaths / repoStatus / title 等 meta 字段，不必整文件 parse 事件日志
-  const task = await getTaskMeta(taskId);
-  if (!task) return errorResponse("task 不存在", 404);
-  // finalize 清理窗内 / 终态任务拒起预览——finalize 会 stopPreviews 后
-  // removeTaskWorktrees，此窗口起的新 dev server 会变成 cwd 已删的孤儿进程
-  if (getChatLifecycle(taskId) !== null) {
-    return errorResponse("任务正在停止/终结、暂不能起预览", 409);
-  }
-  if (task.repoStatus === "merged" || task.repoStatus === "abandoned") {
-    return errorResponse("任务已终结、不能起预览", 409);
-  }
-  const idx = task.repoPaths.indexOf(repoPath);
-  if (idx < 0) {
-    return errorResponse(`repoPath 不属于该任务：${repoPath}`);
-  }
-
-  // 命令唯一来源 = 设置页 per-repo 配置（服务端权威 config.json）、不接受请求注入
-  const command = await getRepoPreviewCommand(repoPath);
-  if (!command) {
-    return errorResponse("该仓库未配置预览启动命令（设置页 → 仓库列表）", 409);
-  }
-
-  // 工作目录：隔离 task = 该仓 worktree、非隔离 = 原仓库（getTaskWorkRepoPaths 统一处理）
-  const workDir = getTaskWorkRepoPaths(task)[idx];
-  try {
-    await fs.access(workDir);
-  } catch {
-    return errorResponse(
-      "任务工作区还没创建（先推进一次任务、系统会自动建隔离工作区）",
-      409,
-    );
-  }
-
-  const started = await startPreview({
-    taskId,
-    taskTitle: task.title,
-    repoPath,
-    workDir,
-    command,
-  });
-  // 队列内最终准入拒绝（finalize/DELETE 已完成）→ 409，无新 pid
-  if (started.yielded) {
-    return errorResponse(
-      started.yieldReason ?? "任务已终结或正在停止、不能起预览",
-      409,
-    );
-  }
+  // 准入（任务 / 终态 / 仓 / 命令 / 工作区）与启动都在 launchTaskPreview：agent 的 preview 工具走同一套。
+  // UI 点「预览」是用户明确的接管动作 → takeOver: true（同仓被别的任务占着就顶掉、并返回被顶的任务名）
+  const launched = await launchTaskPreview({ taskId, repoPath, takeOver: true });
+  if (!launched.ok) return errorResponse(launched.error, launched.status);
   return NextResponse.json({
-    slot: started.status,
-    replacedTaskTitle: started.replacedTaskTitle,
+    slot: launched.slot,
+    replacedTaskTitle: launched.replacedTaskTitle,
   });
 };
 

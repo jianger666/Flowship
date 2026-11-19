@@ -5,7 +5,7 @@
  * 背景：`FLOWSHIP_GITLAB_TOKEN` 是 Flowship 调 GitLab API 的 PAT，留在 server 的 process.env 里。
  * git 本身不读它（团队库走自己的 `TL_GIT_TOKEN`），但 git 拉起的子进程——用户仓的钩子（post-checkout …）、
  * `core.fsmonitor`、外部 diff 驱动、`remote.<n>.uploadpack`——会整份继承 env，用户仓里的任何一行脚本都读得到它。
- * 此前 `task-worktrees.runGit` 的注释甚至写着「不剔 GitLab token」；chat-checkpoint / task-changes / action-checks 等
+ * 此前 `task-worktrees.runGit` 的注释甚至写着「不剔 GitLab token」；chat-checkpoint / task-changes 等
  * 只剔了宿主注入变量、或整份继承。现统一走 `git-exec.ts` 的 `gitEnv()`。
  *
  * 行为测试：真实 git + 真实钩子 / fsmonitor / clean 过滤器 / uploadpack 把自己拿到的关键变量落盘（mac / linux；Windows 的钩子语义不同，整组跳过，Windows 未验证）。
@@ -22,7 +22,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { computeWorktreeFingerprint } from "@/lib/server/action-checks";
 import { restoreRepoTree, snapshotRepoTree } from "@/lib/server/chat-checkpoint";
 import { checkoutGitBranch, listRepoBranches } from "@/lib/server/git-branches";
 import { createTask } from "@/lib/server/task-fs";
@@ -250,26 +249,5 @@ describe.skipIf(process.platform === "win32")("git 拉起的子进程拿不到 P
     expect(res.isRepo).toBe(true);
     expect(JSON.stringify(res.branches), "refresh 的 fetch 没把 origin 上的新分支拉下来").toContain("feat/probe");
     expectProbeClean(await readDump(out));
-  }, 30_000);
-
-  it("action-checks：computeWorktreeFingerprint 的 diff / ls-files 会运行 core.fsmonitor，hash-object 会运行 clean 过滤器", async () => {
-    const outFsm = path.join(TMP_ROOT, "fingerprint-fsmonitor.env");
-    const outClean = path.join(TMP_ROOT, "fingerprint-clean.env");
-    const repo = await initRepo("fingerprint");
-    // 未跟踪文件：指纹要对它们跑 `git hash-object --stdin-paths`（不带 --no-filters → 会运行 filter.<n>.clean，Q1-04）
-    await fs.writeFile(path.join(repo, ".gitattributes"), "*.probe filter=probe\n");
-    await fs.writeFile(path.join(repo, "note.probe"), "untracked\n");
-    const fsmonitor = path.join(TMP_ROOT, "fingerprint-fsmonitor.sh");
-    await writeExecutable(fsmonitor, probeScript(outFsm, "exit 0"));
-    const clean = path.join(TMP_ROOT, "fingerprint-clean.sh");
-    await writeExecutable(clean, probeScript(outClean, "cat"));
-    git(repo, "config", "core.fsmonitor", fsmonitor);
-    git(repo, "config", "filter.probe.clean", clean);
-
-    const fingerprint = await computeWorktreeFingerprint(repo);
-
-    expect(fingerprint, "指纹没算出来：被测命令在探针被拉起之前就失败了").toMatch(/^[0-9a-f]{64}$/);
-    expectProbeClean(await readDump(outFsm)); // git diff / git ls-files → core.fsmonitor
-    expectProbeClean(await readDump(outClean)); // git hash-object --stdin-paths → filter.probe.clean
   }, 30_000);
 });

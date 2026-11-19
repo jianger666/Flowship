@@ -57,11 +57,6 @@ vi.mock("@/lib/server/kill-orphans", () => ({
   registerBinaryUser: vi.fn(),
   LARK_CLI_BINARY_USER: "lark-cli",
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
-}));
 vi.mock("@/lib/server/update-pending", () => ({
   assertNoUpdatePendingRestart: async () => {},
 }));

@@ -67,11 +67,6 @@ vi.mock("@/lib/server/kill-orphans", () => ({
 vi.mock("@/lib/server/meegle-cli", () => ({
   resolveUserIdentityForPrompt: async () => "",
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
-}));
 
 const mockEnsureTaskWorktrees = vi.fn();
 vi.mock("@/lib/server/task-worktrees", async (importOriginal) => {

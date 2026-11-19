@@ -142,7 +142,7 @@ meegle comment add \
 
 路径 `actions/<N>-ship.md`、按下方骨架写、写完按 super-prompt 交卷。
 
-⚠️ **后置检查（runner 自动跑）**：本次每条 `submit_mr` 记录 URL 非空且无冲突；`task.repoPaths` 里**没创建 MR 的仓**必须在 artifact §3 写跳过原因——「跳过、原因：本仓无改动」、且**该仓末段名（如 `crm-web`）与「跳过 / 无改动 / 无需 / 未改」同在表格一行**。漏写判 ❌。
+⚠️ **别漏仓**：`task.repoPaths` 里**没创建 MR 的仓**必须在 artifact §3 写跳过原因——「跳过、原因：本仓无改动」、且**该仓末段名（如 `crm-web`）与「跳过 / 无改动 / 无需 / 未改」同在表格一行**；有 MR 的仓 URL 要完整、有冲突要如实写。
 
 ```markdown
 # Ship #<N>（再次提测 v<mrVersion>）

@@ -79,6 +79,8 @@ vi.mock("@/lib/server/chat-runner", () => ({
   hasChatSession: vi.fn(() => h.state.sessionAlive),
   isChatQueueDraining: vi.fn(() => false),
   isChatRunActive: vi.fn(() => h.state.sessionAlive),
+  // 忙线判定（sendChatMessage 会不会回 busy）：这些用例的热路径都是「会话在、空闲」→ false。与 isChatRunActive 无关
+  isChatSendBusy: vi.fn(() => false),
   reclaimChatSessionsForWatermark: h.reclaim,
   releaseChatRunClaim: vi.fn(),
   resumeChatSession: vi.fn(async () => null),

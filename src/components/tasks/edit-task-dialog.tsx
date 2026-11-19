@@ -317,6 +317,8 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                 getKey={(r) => r.path}
                 invalid={selectedRepos.length === 0}
                 placeholder="请选择"
+                getSearchText={(r) => `${r.name} ${r.path}`}
+                searchPlaceholder="搜索仓库名 / 路径"
                 renderOption={(r) => (
                   <>
                     <span className="block w-full truncate font-medium">

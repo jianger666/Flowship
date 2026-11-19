@@ -52,7 +52,7 @@
 - 被新的主链 `user_reply`（不带 `restrictedRunTag`）打断 → 上一轮收口成失败回群；旁路问题事件不算新一轮。
 - sameSession 不写旁路问答汇总（且并入同会话的问题事件 `groupNonOwnerTurn` 被 `collectGroupQaRounds` 的 temporal 配对排除，不会被当成「历史」轮多出一张重复的卡）；桥接关闭期间的 `done` 也清 turn。
 - **丢弃都回群交代**（`setTalkQueueGroupOtherDropHandler`，GO 引 TTQ、反向不引；机器人静默）：排队过期 / 属主在 app 里删 / 停止 / 重放时没会话 / 重放失败 / 任务终结·归档·删除整队清（`closed`：「这个任务已经结束（或被删除），你这条排队的消息没有处理」）。停止清 group_other 是 `stop-task` 里**单独一步**（`clearGroupOtherQueueOnStop`），`STOP_CLEARED_SOURCES=["app"]` 的口径（「停止保留群来源」）没动。
-- ~~限流（`admitGroupBypassRun`）~~ 已于 2026-11-06 删除（见第 3 条）。带图 + 主链正忙 → 不排队、回忙线（队列条目不存图）；空闲带图照常直送。
+- ~~限流（`admitGroupBypassRun`）~~ 已于 2026-11-06 删除（见第 3 条）。带图 + 主链正忙 → 〔2026-11-18 改〕照常进群问题队（队列条目存的是待下载句柄、不存 base64，入队零下载；回放时主链空闲了才下载直送；回放遇忙静默放回队首）；已下载好的 base64 不排、回忙线。空闲带图照常直送。
 
 ### 已接受的缝隙
 
@@ -789,8 +789,10 @@ prompt 就是同一段指令里既写「禁止改」又写「才动手改」，�
      `listGroupQuestionQueueView`（只读视图：id = messageId、发件人、是否机器人、≤120 字预览、
      入队时间，不含图片与启动凭据）合并进快照里的 `group_question` 来源，属主在队列横幅里能看到
      「群里有人在排队问」并可撤回（`removeGroupQuestionFromQueue`）。见下面「task 模式运行中消息排队」。
-   三条用户可见语义（review 九轮-4）：带图不排队（base64 常驻内存，图重发就行，
-   直接忙线拒收）；过期丢弃必回一句“超时作废”（入队 prune 和 pump-shift 两条路都有）；
+   三条用户可见语义（review 九轮-4）：带图照常排队（〔2026-11-18 改〕原先「带图不排队」是怕 base64
+   常驻内存，但非属主的图在入队时只是 `parsed.deferred` 句柄、零下载，回放主链空闲后才下载直送——
+   旧口径只会让带图的人收到一句「任务正在跑」就石沉大海；只有已经下载好的 base64 才不排、仍忙线拒收）；
+   过期丢弃必回一句“超时作废”（入队 prune 和 pump-shift 两条路都有）；
    回放注入抛错回一句“没接住”+ 写 `ok:false` 汇总。**以上所有系统回执（忙线 / 排队 ack /
    超时作废 / 没接住 / 失败）对机器人发件人一律静默**（`groupReplyMention` 返回 `null`，
    `replyToGroup` 见 `null` 直接丢弃只打日志；正式回答另走出向，见第 3 条与「群答疑的回复协议」），

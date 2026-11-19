@@ -132,6 +132,50 @@ describe("collectBranchTargets：每个仓『应该在哪条分支』", () => {
     expect(collectBranchTargets(makeTask(base))).toHaveLength(1);
   });
 
+  it("联调（dev）正在跑：直推在 origin/<dev> 的 detached HEAD 上合并、守卫让位（in-place / worktree 一样）；联调结束或换成别的 action 就恢复", () => {
+    const act = (
+      type: string,
+      status: string,
+      id = "a_cur",
+    ): Task["actions"][number] =>
+      ({ id, n: 1, type, status }) as unknown as Task["actions"][number];
+    const inPlace = (actions: Task["actions"], currentActionId = "a_cur") =>
+      makeTask({
+        repoPaths: ["/r/a"],
+        gitBranches: [{ repoPath: "/r/a", name: "feature/x", baseBranch: "" }],
+        actions,
+        currentActionId,
+      });
+    const isolated = (actions: Task["actions"], currentActionId = "a_cur") =>
+      makeTask({
+        id: "t_1700000000997_isodev",
+        isolateWorktree: true,
+        repoPaths: ["/r/a"],
+        title: "做点事",
+        actions,
+        currentActionId,
+      });
+
+    // 正在跑的联调：不管（含冲突态下等用户答复的那段——action 状态仍是 running）
+    expect(collectBranchTargets(inPlace([act("dev", "running")]))).toHaveLength(0);
+    expect(collectBranchTargets(isolated([act("dev", "running")]))).toHaveLength(0);
+
+    // 联调已收尾 / 出错 / 取消：守卫恢复，别的 action 在跑也照常管
+    for (const status of ["awaiting_ack", "completed", "error", "cancelled"]) {
+      expect(collectBranchTargets(inPlace([act("dev", status)]))).toHaveLength(1);
+      expect(collectBranchTargets(isolated([act("dev", status)]))).toHaveLength(1);
+    }
+    expect(collectBranchTargets(inPlace([act("build", "running")]))).toHaveLength(1);
+    expect(collectBranchTargets(isolated([act("ship", "running")]))).toHaveLength(1);
+
+    // 只看「当前」action：dev 跑过但已不是当前 → 照常管
+    expect(
+      collectBranchTargets(
+        inPlace([act("dev", "running", "a_old"), act("build", "running", "a_cur")]),
+      ),
+    ).toHaveLength(1);
+  });
+
   it("测试任务：只认填了『被测业务分支』的 git 仓（原仓目录）、不吃 gitBranches", () => {
     const task = makeTask({
       workRole: "qa",
@@ -327,6 +371,70 @@ describe("guardTaskBranchForUserTurn（真 git）", () => {
       // fail-closed：没动用户的未提交改动、HEAD 还在 side
       expect(branchOf(workDir)).toBe("side-detour");
       expect(await fs.readFile(path.join(workDir, "a.txt"), "utf8")).toBe("uncommitted work\n");
+    });
+  });
+
+  describe("联调（dev）合并冲突现场：detached HEAD + 未解决的合并（用户反馈『我压根没切过分支』）", () => {
+    let task: Task;
+    let workDir: string;
+    let taskBranch: string;
+    const devAction = (status: string): Task["actions"][number] =>
+      ({ id: "a_dev", n: 1, type: "dev", status }) as unknown as Task["actions"][number];
+    const mergeInProgress = (): boolean => {
+      try {
+        git(workDir, "rev-parse", "-q", "--verify", "MERGE_HEAD");
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    beforeAll(async () => {
+      const repo = await initRepo("dev-merge-repo");
+      git(repo, "branch", "develop", "main");
+      const base = makeTask({
+        isolateWorktree: true,
+        repoPaths: [repo],
+        repoBaseBranches: { [repo]: "main" },
+        title: "联调冲突",
+      });
+      await markTaskAlive(base.id);
+      const ensured = await ensureTaskWorktrees(base, () => true);
+      taskBranch = ensured.infos[0].name;
+      workDir = getTaskWorkRepoPaths(base)[0];
+
+      // 任务分支与 develop 各改 a.txt 同一行 → 合并必冲突
+      await fs.writeFile(path.join(workDir, "a.txt"), "feature side\n");
+      git(workDir, "commit", "-am", "feature change");
+      git(repo, "checkout", "develop");
+      await fs.writeFile(path.join(repo, "a.txt"), "develop side\n");
+      git(repo, "commit", "-am", "develop change");
+      git(repo, "checkout", "main");
+
+      // 联调直推的真实动作：origin/<dev> 的 detached HEAD 上合 feature、停在冲突态
+      git(workDir, "checkout", "--detach", "develop");
+      expect(() => git(workDir, "merge", taskBranch)).toThrow();
+      expect(branchOf(workDir)).toBe("");
+      expect(mergeInProgress()).toBe(true);
+
+      task = { ...base, actions: [devAction("running")], currentActionId: "a_dev" } as Task;
+    });
+
+    it("联调正在跑 → 守卫放行、不碰合并现场（HEAD 仍 detached、MERGE_HEAD 还在），用户的答复能送进去", async () => {
+      await expect(guardTaskBranchForUserTurn(task, () => true)).resolves.toBeUndefined();
+      expect(branchOf(workDir)).toBe("");
+      expect(mergeInProgress()).toBe(true);
+    });
+
+    it("对照：联调结束（出错）后同样的现场 → 守卫恢复、切不回来就拒发（行为与改前一致）", async () => {
+      const ended = { ...task, actions: [devAction("error")] } as Task;
+      const err = await guardTaskBranchForUserTurn(ended, () => true).catch((e) => e);
+      expect(err).toBeInstanceOf(TaskBranchGuardError);
+      expect((err as Error).message).toContain("自动切回失败");
+      expect((err as Error).message).toContain(taskBranch);
+      // fail-closed：现场原样、没被强切
+      expect(branchOf(workDir)).toBe("");
+      expect(mergeInProgress()).toBe(true);
     });
   });
 

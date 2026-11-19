@@ -47,8 +47,8 @@ const normalizeSeparators = (p: string): string => p.replace(/\\/g, "/");
  * （Windows 路径 `C:\w\crm-web` → `crm-web`）；取不到（空串 / 全是分隔符）→ 原值。
  * POSIX 路径的结果与历史写法 `p.split("/").filter(Boolean).pop() ?? p` 完全一致。
  *
- * R14 Q7b-05：旧写法只认 `/`——Windows 路径整条被当成「仓名」，ship 后置检查拿它当正则
- * 去 artifact 里找跳过说明、永远找不到（明明写了「crm-web 跳过」也判「agent 漏报」）。
+ * R14 Q7b-05：旧写法只认 `/`——Windows 路径整条被当成「仓名」，prompt / 事件流 / 卡片里
+ * 仓名位置显示整条盘符路径。
  * 取仓名一律走这里（`tests/repo-tail-windows.test.ts` 扫源码防止旧写法回流）。
  */
 export const repoTail = (p: string): string =>

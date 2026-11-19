@@ -132,7 +132,7 @@ V0.6.26 以前默认「单 SDK Run 跑全 task、forceNewAgent 是例外」、V0
 **会话内协议（V0.11 起「create + 多轮 send」、run 自然结束）**：
 
 - 用户每次「推进」action → 默认起新 agent + super prompt 冷启动；勾续用 → 对存活会话 `agent.send([NEXT_ACTION ...])` 接力
-- agent 跑完 action → 写完 artifact 后调 `submit_work(action_id)` **交卷**（非阻塞）→ 拿到 `[SUBMITTED]` 后说 1-3 句业务结论并结束 turn（固定横幅在 run 结束补发）→ runner **后台异步**跑后置检查（V0.8.18）、跑完把 action 标 `awaiting_ack`
+- agent 跑完 action → 写完 artifact 后调 `submit_work(action_id)` **交卷**（非阻塞）→ 拿到 `[SUBMITTED]` 后说 1-3 句业务结论并结束 turn（固定横幅在 run 结束补发）→ runner **后台异步**收尾（`runActionPostCheck`：wk 阶段门禁提示 → 把 action 标 `awaiting_ack` → 群播报；产物格式 / MR 验真等交付检查已于 2026-11-19 下线）
 - 用户操作以 send 送达：再聊聊 = `send([ACTION_ACK revise]+feedback)`、ask 答案优先走提问时挂上的 `/ask-wait` curl（同一轮 stdout），没挂上才 `send([ASK_USER_REPLY]…)`；**通过纯服务端落状态**（agent 不需要收信号）
 - 终结 task → finalize 直接 cancel 活 run + 关会话（不再发 [TASK_DONE] 信号）
 
@@ -148,7 +148,7 @@ Agent.create（每 action 默认新建 / 勾续用复用）
   → stop / error / finalize / 换新 agent / 服务重启 → 会话关闭（下次 fresh agent + artifact/events 恢复上下文）
 ```
 
-「run 自然 finished 但最后 action 还 running」时豁免两种正常情况（后置 check 在跑 = 刚交卷、pendingAsk 在等答案）、否则先 `agent.send` 追问补调 `submit_work`（最多 2 次）、仍不交则标 error。
+「run 自然 finished 但最后 action 还 running」时豁免两种正常情况（交卷收尾在跑 = 刚交卷、pendingAsk 在等答案）、否则先 `agent.send` 追问补调 `submit_work`（最多 2 次）、仍不交则标 error。
 
 ### 推进 dialog（V0.6 重写）
 
@@ -175,23 +175,20 @@ V0.5 phase 顺序拆掉后、用 6 个显性门槛补回保证：
 | 门槛 | 实现 | 位置 |
 |---|---|---|
 | 1. action 前置准入 | runner `checkActionPrerequisites` + UI dialog 灰掉 | `task-runner.ts` + `advance-dialog.tsx` |
-| 2. action 后置 deterministic check | runner 切 awaiting_ack 前跑、写 `action.postCheck` | `action-checks.ts` |
+| 2. ~~action 后置 deterministic check~~ | **2026-11-19 下线**（`action-checks.ts` 整个删除、`action.postCheck` 字段与前端红条一并去掉，见下节）；只剩 wk 系 action 的阶段门禁提示 | `wk-gate.ts: evaluateWkPostStage` |
 | 3. 默认 default | 可见列表第一位（v0.9.12 删按 task 状态推断、通用化） | `advance-dialog.tsx` open-effect |
 | 4. action 级 anti-patterns prompt | 每个 `prompts/action-<type>.md` 头部红线段 | `prompts/action-*.md` |
 | 5. cross-action 一致性自检 | 2026-11-13 用户拍板不做（review 差异段已覆盖，见 `docs/ROADMAP.md`「四、止损」） | - |
 | 6. placeholder 动态 | UI 按 action + task 状态变 | `advance-dialog.tsx: buildPlaceholder` |
 
-### 后置 check 的边界：只查交付诚实性、不跑项目命令（v0.9.13 拍板）
+### 后置 check 已下线（2026-11-19 拍板）
 
-门槛 2（action 后置 deterministic check、`action-checks.ts`）的检查范围**只到「agent 交付是否诚实」为止**：artifact 落盘 + 必备段 lint、review 只读指纹 / 基底 commit 验真、ship MR URL 覆盖所有仓、build 兄弟仓越权检测。
+原门槛 2（action 后置 deterministic check、`action-checks.ts`，v0.9.13 起只查「agent 交付是否诚实」：artifact 落盘 + 必备段 lint、review 只读指纹 / 基底 commit 验真、ship MR URL 覆盖所有仓、build 兄弟仓越权检测）**整个删除**。理由（取自 `task-runner.ts` 收尾注释）：产出能出来就是能出来，不再事后挑格式。
 
-**不跑项目命令**（typecheck / lint / test）。V0.6.25~V0.6.26 曾建过一整套 CheckRun（per-repo 配命令 + 自动检测 + 污染检测 + ship gate override 留痕）、v0.9.13 整套删除、根因是语义错配：
-
-- 全仓检查问的是「项目是不是绿的」、但存量项目基线本来就红（历史债）——agent 只改两个文件也永远红、红色失去信息量、还连带 ship 每次都要 override 填原因（用户实测「公司项目几乎全部不通过」）
-- 方向通用化后（测试 / BI 等非研发用户、纯自定义 action）「研发流程假设」不再成立
-- 代码质量校验由 build agent 自己做（`action-build.md` 让 agent 找仓库命令做**增量**校验、改哪查哪）+ review action 人审兜底
-
-保留的基建：`runActionPostCheck` 后台异步框架（`runningChecks` 去重 + abort、防状态交错——check 同步 await 会把交卷工具阻塞到超 Cursor SDK ~60s 工具超时、线上踩过）、`computeWorktreeFingerprint` / `computeRepoStatusHash`（review 指纹 + 兄弟仓基线用、V0.11.2 起纯 Node execFile git 实现）。`GET /ship-precheck`（reviewMissing 提醒）已于 V0.11.7 随黄条整链删除。
+- **删掉的**：`action-checks.ts` 及其测试；`ActionRecord.postCheck` / `startBaseline` / `readonlyBaseline` 字段；`action-timeline` / `artifact-panel` 的「后置检查未通过」红条；review 的只读指纹 + 基底 commit 校验、build 兄弟仓越权检测、只读仓后置检查、ship MR 核验与「跳过说明」、artifact 必备段 lint；`computeWorktreeFingerprint` / `computeRepoStatusHash`。
+- **随之变弱的保护**：review 不改文件、只读仓不被改、build 不越界到兄弟仓，现在**只靠提示词约束 + `submit_mr` 闸门**，没有事后兜底。要补回的话从「review 只读校验」做起，别整套恢复。
+- **保留的**：`runActionPostCheck`（函数名没改）的后台异步收尾框架——`runningChecks` 去重 + abort、防状态交错（收尾同步 await 会把交卷工具阻塞到超 Cursor SDK ~60s 工具超时、线上踩过）；里面现在只做 ① `evaluateWkPostStage`（团队 wk 系 action 的阶段门禁，info / error 写进事件流、**不拦** `awaiting_ack`）② 落 `awaiting_ack` ③ 群播报。
+- **仍不跑项目命令**（typecheck / lint / test）：V0.6.25~V0.6.26 的整套 CheckRun 已在 v0.9.13 删除（存量项目基线本来就红、全仓检查失去信息量；代码质量校验由 build agent 自己做增量校验 + review 人审兜底）。`GET /ship-precheck` 已于 V0.11.7 随黄条整链删除。
 
 ### Shell 命令硬拦截（已退役）
 

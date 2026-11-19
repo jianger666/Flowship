@@ -178,7 +178,7 @@ type RepoFlagPaths = {
  * - 对象：读到了（含 config.json 不存在 = 没配过仓）→ 无匹配时各自 undefined，表示「确认没有只读 / 脚本仓」；
  * - `null`：**读取出错**（Windows 杀软占用 / 手改 JSON 没写完 / 权限）。这不等于「没有只读仓」——
  *   以前把读失败转成空配置、`readonlyRepoPaths` 被写成 undefined 落进 meta，且快照之后不再重算，
- *   下游 submit-mr-guard / action-checks / task-worktrees / task-changes 就永远当它是可写仓、「只读仓」标记被永久清掉。
+ *   下游 submit-mr-guard / task-worktrees / task-changes 就永远当它是可写仓、「只读仓」标记被永久清掉。
  *   调用方必须区分处理（建任务重试、更新仓库保留 meta 里原值），参照 company-env-fs 对 error 状态「保留现状、不覆盖」的口径。
  */
 const snapshotRepoFlagPaths = async (
@@ -3063,7 +3063,6 @@ type ActionPatchFields = Partial<
   Pick<
     ActionRecord,
     | "status"
-    | "postCheck"
     | "sideEffects"
     | "agentModel"
     // 写回 agentModel 必须连戳一起改（task-model.planResumeModel），否则
@@ -3072,8 +3071,6 @@ type ActionPatchFields = Partial<
     | "excluded"
     | "artifactUpdatedAt"
     | "planBatches"
-    | "startBaseline"
-    | "readonlyBaseline"
   >
 >;
 
@@ -3102,7 +3099,7 @@ const applyActionStatusTransition = (
 };
 
 /**
- * patch 单条 action 状态 / 后置检查 / 副作用
+ * patch 单条 action 状态 / 副作用
  * - status 转 awaiting_ack / completed / error / cancelled 时自动 set endedAt（见 applyActionStatusTransition）
  * - runStatus / currentActionId 不在这里改（独立 setTaskRunStatus）
  */
@@ -3410,11 +3407,6 @@ export const patchActionAndRunStatusIfOpFresh = async (
   runStatus: RunStatus,
   isFresh: () => boolean,
   expected?: OpFreshExpected,
-  /**
-   * 与 status 同事务写入的附加字段（如 postCheck）。
-   * 不得用二次裸 patch——两写之间 stop 会留下「cancelled 后又写元数据」窗口。
-   */
-  extraPatch?: Partial<Pick<ActionRecord, "postCheck">>,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     // ① 锁内同步快查（内存 owner / epoch）
@@ -3440,7 +3432,6 @@ export const patchActionAndRunStatusIfOpFresh = async (
     const now = Date.now();
     const next: ActionRecord = {
       ...action,
-      ...(extraPatch ?? {}),
       status: actionStatus,
     };
     applyActionStatusTransition(action, next, actionStatus, now);

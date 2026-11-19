@@ -36,6 +36,7 @@ import {
 import { OverflowTooltip, Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { isImeComposing } from "@/lib/ime";
+import { resolveEnterPick } from "@/lib/search-match";
 
 export type PickerOption = {
   value: string;
@@ -358,8 +359,13 @@ export const Picker: PickerComponent = (props) => {
                   if (e.key !== "Enter" || isImeComposing(e)) return;
                   e.preventDefault();
                   if (loading) return;
-                  const target =
-                    filtered.find((o) => !o.disabled)?.value ?? customCandidate;
+                  // 多选里目标已选中就不动：pick 是 toggle，回车不该把已选项取消掉（见 resolveEnterPick）
+                  const target = resolveEnterPick({
+                    filtered,
+                    customCandidate,
+                    multiple,
+                    selectedKeys,
+                  });
                   if (target) pick(target);
                 }}
                 placeholder={searchPlaceholder}

@@ -21,6 +21,7 @@ import {
   UserCircle2,
 } from "lucide-react";
 
+import { formatEventTime } from "@/lib/format-event-time";
 import { sliceHeadSafe } from "@/lib/text-slice";
 import type { EventKind, TaskEvent } from "@/lib/types";
 
@@ -85,11 +86,9 @@ export const ActionTag = ({ label }: { label: string }) => (
   </span>
 );
 
-// HH:MM 简洁格式、事件流里只显示「这条事件几点几分」、不显示秒 / 日期
-export const formatTs = (ts: number): string => {
-  const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-};
+// 事件时间：今天只显示 HH:mm、跨天带上日期（MM-DD HH:mm、跨年再带年份），不显示秒。
+// 故意只收一个参数：别被 `.map(formatTs)` 把下标当成「现在」传进去
+export const formatTs = (ts: number): string => formatEventTime(ts);
 
 /** 相邻 thinking 收成一条（token 直接拼接、见 lib/merge-thinking） */
 export { coalesceAdjacentThinking as mergeAdjacentThinking } from "@/lib/merge-thinking";

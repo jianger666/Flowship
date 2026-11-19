@@ -212,13 +212,6 @@
 - `[USER_MESSAGE]`（带〈产出审阅中〉）→ 按 super-prompt「[USER_MESSAGE] 统一处理」。**改类**落地后按「跨 action 共享规范 §5.2 plan action 内联留痕」
 - `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行
 
-## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
-
-1. **artifact 文件存在**：`{{actionArtifactsDir}}/<n>-plan.md` 必须真存在、不能光声明没落地
-2. **内容长度**：trim 后 >= 100 字符、防 agent 空跑
-
-V0.6.0.1 起这里只做最低门槛 deterministic 检查、不再 grep「不确定字眼黑名单」。plan 的语义质量（含糊词 / 套话 / 复述 PRD）由「几条要点」段的硬约束 + 用户人眼把关 + revise 流程兜底。
-
 ## plan artifact 骨架
 
 ```markdown

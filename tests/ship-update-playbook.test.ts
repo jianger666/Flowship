@@ -4,8 +4,7 @@
  * 锁三件事：
  * 1) 选择逻辑 shouldUseShipUpdatePlaybook 的每个分支——判定保守、拿不准一律回落全量版
  * 2) loadActionPrompt 对精简版 / 全量版的选择与占位符填充（含 shipFullPlaybookPath 指向真实存在的全量版）
- * 3) 精简版内容守卫：体积上限、必留铁则不被后续瘦身误删、§0 兜底表引用的全量版章节真实存在、
- *    骨架产出的 artifact 仍能通过 checkShip
+ * 3) 精简版内容守卫：体积上限、必留铁则不被后续瘦身误删、§0 兜底表引用的全量版章节真实存在
  *
  * ⚠️ FLOWSHIP_DATA_DIR 必须在 import task-fs-core 之前设好（DATA_DIR 在模块加载时冻结）、用动态 import。
  */
@@ -22,10 +21,7 @@ process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 const { loadActionPrompt, shouldUseShipUpdatePlaybook } = await import(
   "@/lib/server/task-prompts"
 );
-const { runActionCheck } = await import("@/lib/server/action-checks");
-const { getActionArtifactPath, getActionsDir } = await import(
-  "@/lib/server/task-fs-core"
-);
+const { getActionsDir } = await import("@/lib/server/task-fs-core");
 
 const PROMPTS_DIR = path.join(process.cwd(), "prompts");
 const SHIP_FULL = path.join(PROMPTS_DIR, "action-ship.md");
@@ -312,7 +308,7 @@ describe("精简版内容守卫", () => {
     ["飞书评论 mention 块", "AT_USER_BLOCK"],
     ["需求群 @", "notify_group_testers"],
     ["v2+ 的「vN 更新」写法", "## v<mrVersion> 更新"],
-    ["无改动仓跳过说明（checkShip 依赖）", "跳过、原因：本仓无改动"],
+    ["无改动仓跳过说明", "跳过、原因：本仓无改动"],
     ["冲突兜底：转完整版 §3.5", "§3.5"],
     ["冲突兜底：转完整版 §3.6", "§3.6"],
     ["完整版路径占位符", "{{shipFullPlaybookPath}}"],
@@ -354,43 +350,5 @@ describe("精简版内容守卫", () => {
     expect(md).not.toMatch(/checkout -B/);
     expect(md).not.toMatch(/--abbrev-ref/);
     expect(md).not.toMatch(/jq -r \.gitToken|config\.json/);
-  });
-
-  it("骨架产出的 artifact 能通过 checkShip（有 MR 的仓 URL 非空无冲突 + 跳过的仓写了原因）", async () => {
-    const md = await readUpdate();
-    const skeleton = md.match(/```markdown\n(# Ship #[\s\S]*?)\n```/)?.[1];
-    expect(skeleton, "没抠到 artifact 骨架").toBeTruthy();
-    const artifact = skeleton!
-      .replace("<repoPath 1>", REPO_A)
-      .replace("<repoPath 2>", REPO_B);
-
-    const action = makeAction({
-      status: "awaiting_ack",
-      endedAt: T0 + 1000,
-      sideEffects: {
-        mrs: [
-          {
-            repoPath: REPO_A,
-            targetBranch: "test",
-            mrUrl: "https://gitlab.example.com/g/crm-web/-/merge_requests/1",
-            mrVersion: 2,
-            branch: "feature/x",
-            commitHash: "abc1234",
-            hasConflicts: false,
-          },
-        ],
-      },
-    } as Partial<ActionRecord>);
-    const task = makeTask([makeMr({ version: 2 })], {
-      id: `t_ship_update_check_${Math.random().toString(36).slice(2, 8)}`,
-      repoPaths: [REPO_A, REPO_B],
-    });
-    const abs = getActionArtifactPath(task.id, action.n, "ship");
-    expect(abs.startsWith(TMP_ROOT)).toBe(true);
-    await fs.mkdir(path.dirname(abs), { recursive: true });
-    await fs.writeFile(abs, artifact, "utf-8");
-
-    const r = await runActionCheck(task, action);
-    expect(r.passed, r.details).toBe(true);
   });
 });

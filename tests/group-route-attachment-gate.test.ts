@@ -229,7 +229,9 @@ describe("非属主：预解析不下载，闸门全拦下的消息零下载", (
     expect(sentTexts().some((t) => t.includes(GROUP_CHAT_NOT_OWNER))).toBe(true);
   });
 
-  it("忙线 + 带图（带图不排队）：忙线拒收，零下载", async () => {
+  it("忙线 + 带图：照常排队（图还是待下载的句柄，入队零下载、不占内存）；回放起 run 时才下载一次，图随注入送达", async () => {
+    // 曾经「带图不排」直接忙线拒收：人在群里 @ 了、图也发了，结果只得一句「等这一轮结束再问」，
+    // 没有排队也没有任何记录，消息就此石沉大海（2026-11-18）。排队的只是 deferred 句柄，没有 base64 躺内存的问题。
     const inFlight = { cancelled: false, cancel: () => {} };
     registerRestrictedQuestion(TASK, inFlight);
     try {
@@ -237,12 +239,22 @@ describe("非属主：预解析不下载，闸门全拦下的消息零下载", (
         msg("ou_stranger", "om_busy_img", "@Flowship 看图 [图]"),
         ctx,
       );
-      expect(r).toMatchObject({ kind: "skipped" });
-      expect(downloads).toEqual([]);
-      expect(sentTexts().some((t) => t.includes("群答疑还在跑"))).toBe(true);
+      expect(r).toMatchObject({ kind: "queued" });
+      expect(sentTexts().some((t) => t.includes("在排队了"))).toBe(true);
+      expect(sentTexts().some((t) => t.includes("群答疑还在跑"))).toBe(false);
     } finally {
       unregisterRestrictedQuestion(TASK, inFlight);
     }
+    expect(downloads).toEqual([]); // 排队期间不下载
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(shared.groupQuestionQueueLength(TASK)).toBe(1);
+
+    await pumpGroupQuestionQueue(TASK);
+
+    expect(downloads).toEqual(["om_busy_img"]);
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    expect(injectedPayload().images).toHaveLength(1);
+    expect(shared.groupQuestionQueueLength(TASK)).toBe(0);
   });
 
   it("忙线 + 只有文件：照常排队（入队时零下载）；回放起 run 时才下载一次，附件随注入送达", async () => {

@@ -87,7 +87,12 @@ import {
   type DockGeometry,
   type MediaPrefs,
 } from "@/lib/media/media-memory";
-import { watchUserSeek, type ResumeNoticeWatch } from "@/lib/media/media-resume-notice";
+import {
+  RESUME_NOTICE_PLAYED_SECONDS,
+  watchPlayedFor,
+  watchUserSeek,
+  type ResumeNoticeWatch,
+} from "@/lib/media/media-resume-notice";
 import {
   ESC_CLOSE_WINDOW_MS,
   decideEscapeClose,
@@ -394,6 +399,16 @@ export const MediaPlayerDock = ({ session }: { session: PlayerSession }) => {
       resumeWatchRef.current = null;
     };
   }, []);
+
+  // 「已从上次位置继续」的提示：续播后实际播放满几秒也自己收（都看了好几秒了，说明不想回去）。
+  // 每次出现提示（resumedFrom 变成新值）都重新计时；提示收掉 / 换文件时 resumedFrom 变 null，监听随 effect 清理
+  useEffect(() => {
+    if (resumedFrom === null) return;
+    const v = videoRef.current;
+    if (!v) return;
+    const watch = watchPlayedFor(v, RESUME_NOTICE_PLAYED_SECONDS, () => setResumedFrom(null));
+    return () => watch.stop();
+  }, [resumedFrom]);
 
   // 元数据到了：套用待办的起点（续播 / 指定时间 / 对比组切换保持进度）、播放
   useLayoutEffect(() => {

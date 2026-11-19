@@ -75,11 +75,6 @@ vi.mock("@/lib/server/kill-orphans", () => ({
 vi.mock("@/lib/server/meegle-cli", () => ({
   resolveUserIdentityForPrompt: async () => "",
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
-}));
 
 const { writeMeta, taskDir } = await import("@/lib/server/task-fs-core");
 const { agentSessions, runningTasks, clearTaskStarting } = await import(

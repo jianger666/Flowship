@@ -4,8 +4,7 @@
  *  - Q3-01：回退的 `ls-tree -r --name-only -z` 复用 runGit（旧 maxBuffer 8MiB）→ 大仓路径总字节超限时整体中止、
  *    原因为空（`String(e.stderr ?? e.message)` 对空串不回落）。现在：256MiB + `||` 回落；
  *  - Q3-02：WIP 守卫的 runGit 同样 `e.stderr ?? e.message` → 失败原因为空；
- *  - Q3-14：chat-checkpoint 的 runGit 整份继承 process.env（宿主注入变量原样交给用户仓的 git 钩子），
- *    action-checks 的 gitCapture / hash-object 同。
+ *  - Q3-14：chat-checkpoint 的 runGit 整份继承 process.env（宿主注入变量原样交给用户仓的 git 钩子）。
  *
  * 做法：真 git 临时仓；用一个「透传」的 execFile 包装在**特定 git 子命令**上注入超限错误（`stderr` 为空串、
  * `message` 为 "stdout maxBuffer length exceeded"，与 Node 的真实形态一致），其余调用原样走真 git。
@@ -291,30 +290,6 @@ describe.skipIf(process.platform === "win32")("Q3-14：git 钩子拿到的环境
 
     expect(res.ok).toBe(true);
     expectHostEnvAbsent(await fs.readFile(out, "utf8"));
-  });
-
-  it("action-checks：computeWorktreeFingerprint 的 gitCapture（git diff）与 hash-object 两处都剔宿主变量（Q1-01 / Q1-04）", async () => {
-    const { computeWorktreeFingerprint } = await import("@/lib/server/action-checks");
-    const repo = await initRepo("env-fp");
-    const outDiff = path.join(TMP_ROOT, "fp-diff.env");
-    const outHash = path.join(TMP_ROOT, "fp-hash.env");
-    // clean 过滤器是用户仓里可配的任意命令：tracked.txt 走 diff 路径、untracked.txt 走 hash-object 路径，各写各的文件
-    await fs.writeFile(path.join(repo, ".gitattributes"), "tracked.txt filter=dumpa\nuntracked.txt filter=dumpb\n");
-    git(repo, "config", "filter.dumpa.clean", `sh -c 'env >> "${outDiff}"; cat'`);
-    git(repo, "config", "filter.dumpb.clean", `sh -c 'env >> "${outHash}"; cat'`);
-    await fs.writeFile(path.join(repo, "tracked.txt"), "v1\n");
-    git(repo, "add", "-A");
-    git(repo, "commit", "-m", "tracked");
-    await fs.writeFile(path.join(repo, "tracked.txt"), "v2 改动\n");
-    await fs.writeFile(path.join(repo, "untracked.txt"), "新文件\n");
-    await fs.rm(outDiff, { force: true });
-    await fs.rm(outHash, { force: true });
-
-    const fp = await computeWorktreeFingerprint(repo);
-
-    expect(fp).toMatch(/^[0-9a-f]{64}$/);
-    expectHostEnvAbsent(await fs.readFile(outDiff, "utf8"));
-    expectHostEnvAbsent(await fs.readFile(outHash, "utf8"));
   });
 
   it("对照：GIT_INDEX_FILE 这类调用方显式给的增量变量仍然传得进 git（snapshotRepoTree 靠它隔离真实 index）", async () => {

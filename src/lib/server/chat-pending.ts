@@ -797,7 +797,8 @@ const EXTERNAL_EFFECT_ACTION_LABELS: Partial<Record<ActionType, string>> = {
  *
  * 为什么要有这段：脚注要求「无论问还是改都重新交卷」，agent 又还带着整套提测剧本的上下文——
  * 用户在提测之后说「这里再改下代码」，它很容易把「修改」理解成「提测这一步要重做」，改完又 push / 提 MR / 评论 / @ 测试，
- * 测试被无谓地再通知一遍。这里不加任何硬拦截（用户明确要再提测时它照做），只把「重新交卷只是刷新记录」讲明白。
+ * 测试被无谓地再通知一遍。这里不加任何硬拦截，只把「重新交卷只是刷新记录」讲明白；
+ * 用户明说要再提测 / 联调时，指给它走 advance_next 登记新 action（不在这份已交卷的产出里补发）。
  * 其它动作类型（plan / build / review / 自定义）返回空串，脚注保持原样。
  */
 export const buildExternalEffectNote = (actionType: ActionType | undefined): string => {
@@ -805,7 +806,11 @@ export const buildExternalEffectNote = (actionType: ActionType | undefined): str
   if (!label) return "";
   return [
     `这份产出是「${label}」：push / MR / 评论 / 群通知这些对外的事上一轮已经做完了，这里的「重新交卷」只是刷新这份记录，**不等于要再${label}一遍**。`,
-    `用户这句话要什么你就做什么：要你改代码就只改本地工作区，不要顺手重新 push / 提 MR / 评论 / @ 测试人员；用户明确说了要再${label} / 更新 MR / 通知，再去做对外那几步。`,
+    `用户这句话要什么你就做什么：要你改代码就只改本地工作区，不要顺手重新 push / 提 MR / 评论 / @ 测试人员。`,
+    // 「再提测」是点名要跑一个 action：在当前这份（已交卷的）产出里做会踩两个坑——群通知按 action 只放行一次、
+    // 这份产出上一轮已经发过，补发会被去重吞掉；产物 / 报告也会写回旧记录。所以走新 action，不在这里做
+    //（2026-11-18：用户说「ok，提测」，AI 在原 action 里做完了对外几步，新 MR 的群通知被去重吞掉）。
+    `用户明确说了要再${label} / 更新 MR / 通知，这就是在点名要跑一次新的「${label}」：**不要在当前这份产出里做对外那几步**（群通知等对外动作在一个 action 里只放行一次，这份产出上一轮已经发过，补发会被去重吞掉）。先重新交卷，拿到 [SUBMITTED] 后用 advance_next 登记一次新的「${label}」（user_words 填他的原话、instruction 带上他的要求）${label === "联调" ? "；联调要显式给 dev_push_mode（直推 / 提 PR），用户没说用哪种就先 ask_user" : ""}。`,
     `只改了本地的话，回复里直接说清楚「这次修改只在本地、MR 里还没有」，要不要再${label}由用户定（他可以直接对你说，也可以再推进一次）；修改记录里同样写明「仅本地改动、未推送」。`,
   ].join("");
 };

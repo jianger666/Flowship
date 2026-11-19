@@ -27,10 +27,13 @@ import {
   nextQueueAutoOpenTick,
   nextQueueAutoOpenTickForPending,
   predictSendNowMode,
+  QUEUE_ARRIVAL_RETRY_MAX,
+  QUEUE_ARRIVAL_RETRY_MS,
   queueAutoOpenOnProjection,
   queueEditKeyAction,
   sendNowCopy,
   shouldAutoOpenQueue,
+  shouldWaitForQueueArrival,
 } from "@/lib/queue-banner";
 
 const source = (rel: string) =>
@@ -318,5 +321,55 @@ describe("接线契约（补充；行为已由上面的纯函数测试锁住）"
   it("过时注释已修：立即发送不是「stop 清剩余队」（服务端会把其余排队放回去）", () => {
     expect(banner).not.toContain("stop 清剩余队");
     expect(banner).not.toMatch(/每次都自动弹开/);
+  });
+});
+
+describe("shouldWaitForQueueArrival：条上有数、服务端队列还空 → 先等，别立刻说「队列已空」（2026-11-19）", () => {
+  const base = {
+    fetchMode: true,
+    open: true,
+    loadError: false,
+    fetchedCount: 0 as number | null,
+    queuedCount: 1,
+    retries: 0,
+  };
+
+  it("面板开着、拉到空队、本地账 > 0、复拉没耗尽：等（这条还在送进队列的路上）", () => {
+    expect(shouldWaitForQueueArrival(base)).toBe(true);
+    expect(shouldWaitForQueueArrival({ ...base, retries: QUEUE_ARRIVAL_RETRY_MAX - 1 })).toBe(true);
+  });
+
+  it("复拉耗尽仍是空：不再等，落回「队列已空」（真被发出 / 删除 / 幽灵占位）", () => {
+    expect(shouldWaitForQueueArrival({ ...base, retries: QUEUE_ARRIVAL_RETRY_MAX })).toBe(false);
+  });
+
+  it.each([
+    ["task 的实时面板（非 fetch 模式）：空了就是空了", { fetchMode: false }],
+    ["面板没开", { open: false }],
+    ["拉取失败：有自己的文案", { loadError: true }],
+    ["还没拉到（null）：由加载态负责", { fetchedCount: null }],
+    ["拉到了非空：直接显示", { fetchedCount: 2 }],
+    ["本地账也是 0：条本身都不显示", { queuedCount: 0 }],
+  ])("不等：%s", (_name, over) => {
+    expect(shouldWaitForQueueArrival({ ...base, ...over })).toBe(false);
+  });
+
+  it("总等待时长是几秒量级（够覆盖存图 / 读浏览器摘要，又不会对真空队空等太久）", () => {
+    const total = QUEUE_ARRIVAL_RETRY_MS * QUEUE_ARRIVAL_RETRY_MAX;
+    expect(total).toBeGreaterThanOrEqual(3000);
+    expect(total).toBeLessThanOrEqual(10_000);
+  });
+
+  it("接线：面板用 shouldWaitForQueueArrival 决定文案与复拉；复拉不自动弹开；打开面板 / 拉到非空会清零", () => {
+    const src = source("src/components/tasks/queue-banner.tsx");
+    expect(src).toContain("shouldWaitForQueueArrival({");
+    expect(src).toContain("消息正在送进队列…");
+    // 复拉走 loadQueue(false)：不自动弹开、不抢焦点
+    expect(src).toMatch(/setArrivalRetries\(\(n\) => n \+ 1\);\s*loadQueue\(false\);/);
+    expect(src).toMatch(/setArrivalRetries\(0\);\s*loadQueue\(false\);/);
+    expect(src).toContain("if (list.length > 0) setArrivalRetries(0);");
+    // 等待态排在「队列已空」之前
+    expect(src.indexOf("waitingArrival ? (")).toBeGreaterThan(0);
+    expect(src.indexOf("waitingArrival ? (")).toBeLessThan(src.indexOf("队列已空（可能刚被发出或删除）"));
   });
 });

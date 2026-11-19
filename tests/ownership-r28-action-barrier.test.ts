@@ -75,10 +75,12 @@ const mockRunActionCheck = vi.fn(async () => ({
   passed: true,
   details: "ok",
 }));
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: () => mockRunActionCheck(),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
+vi.mock("@/lib/server/wk-gate", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/wk-gate")>()),
+  // 「收尾检查在跑」的可控钩子：只替换 action 收尾的 wk 门禁，advance 前置门禁保持真实
+  evaluateWkPostStage: async () => {
+    await mockRunActionCheck();
+  },
 }));
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
@@ -352,7 +354,7 @@ describe("ownership R28-4 ActionSideEffectCoordinator", () => {
 
       await raceExpectSettled(pWork, 12_000);
       expect(await pWork).toBe("accepted");
-      // runActionPostCheck 同步挂 runningChecks，runActionCheck 在 getTask await 后才调
+      // runActionPostCheck 同步挂 runningChecks，收尾检查在 getTask await 后才调
       await waitUntil(() => runningChecks.get(id)?.actionId === "act_ship", 5000);
       await waitUntil(() => mockRunActionCheck.mock.calls.length > 0, 5000);
       // check 跑完后 dropSelf 会 release postcheck；等 check 落完再断言无 claim

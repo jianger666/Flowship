@@ -14,6 +14,9 @@
  *   不挂它的话，这个 AI 面对「帮我出个方案」只能叫用户去点按钮——同一个 AI 在有没有 action 时能力不对等。
  *   **定时到点那一轮不挂它**（{@link ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES}）：那是 AI 自己留的备忘、不是用户在场说话，
  *   「要不要起下一步」的授权凭据没有来源；以前只在提示词里叫它别用，现在工具清单里直接没有（评审 R19-01）。
+ * - `preview`：起 / 看 / 停本任务项目的 dev server。只依赖 callerToken + 任务元数据，和 action 无关；用户在聊天里说
+ *   「起一下项目看看」「把页面截个图」时，这个 AI 得能自己把服务起来再用浏览器工具去看，否则只能叫用户去点「预览」。
+ *   **定时到点那一轮不挂它**（{@link ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES}）：没有用户在场，不该无人值守地拉起长驻进程。
  * 交卷 / 提问 / 提 MR / 设批次 / 自定义 action 这类要靠 action 与 notifier 的**不挂**（挂了也只会回「没有 notifier」，
  * 还让模型以为自己在 action 里）；浏览器工具与子代理随 callerToken 一起挂（见 flowship-tools 的 `buildSdkCustomTools` /
  * pi 的 `buildCustomTools`）——**有意保留**（用户 2026-11-11 决定：与正式会话一致、之后要它登录之类也用得上；
@@ -25,16 +28,23 @@ import { WAIT_TOOL_NAME } from "@/lib/wait-display";
 /** 与 flowship-tools 里 `advanceNextDef.name` 同值（tests/advance-chain-wiring.test.ts 钉死一致） */
 export const ADVANCE_NEXT_TOOL_NAME = "advance_next";
 
+/** 与 flowship-tools 里 `previewDef.name` 同值（tests/preview-tool.test.ts 钉死一致） */
+export const PREVIEW_TOOL_NAME = "preview";
+
 /** 用户在场说话（输入条 / 属主的聊天）那条一次性通道的系统工具清单 */
 export const ONE_SHOT_SYSTEM_TOOL_NAMES: readonly string[] = [
   SCHEDULE_TOOL_NAME,
   WAIT_TOOL_NAME,
   ADVANCE_NEXT_TOOL_NAME,
+  PREVIEW_TOOL_NAME,
 ];
 
-/** 定时到点那一轮的清单：同上、但**不含** `advance_next`（没有用户在场，登记不了「自动推进」） */
+/**
+ * 定时到点那一轮的清单：同上、但**不含**需要用户在场才有意义的两个——
+ * `advance_next`（登记不了「自动推进」）与 `preview`（不该无人值守地起长驻进程）
+ */
 export const ONE_SHOT_SCHEDULED_SYSTEM_TOOL_NAMES: readonly string[] =
-  ONE_SHOT_SYSTEM_TOOL_NAMES.filter((n) => n !== ADVANCE_NEXT_TOOL_NAME);
+  ONE_SHOT_SYSTEM_TOOL_NAMES.filter((n) => n !== ADVANCE_NEXT_TOOL_NAME && n !== PREVIEW_TOOL_NAME);
 
 /**
  * 这一轮一次性 agent 该挂哪份系统工具清单（每轮重新算：同一任务的共用会话里，用户轮次与定时轮次交替时，

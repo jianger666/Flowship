@@ -601,6 +601,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
             }}
             getKey={(r) => r.path}
             placeholder="选择仓库（可多选）"
+            getSearchText={(r) => `${r.name} ${r.path}`}
+            searchPlaceholder="搜索仓库名 / 路径"
             renderOption={(r) => (
               <>
                 <span className="block w-full truncate font-medium">{r.name}</span>

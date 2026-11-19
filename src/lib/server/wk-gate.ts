@@ -19,7 +19,7 @@
  * |---|---|---|
  * | 推进前（task-runner.advanceTaskCore 准入之后、appendAction 之前） | `wk-context-init.py` | 只 warn（它自己对「业务级 status.yaml 还没有」返 1 = 跳过语义）；脚本不在这版团队库里则整步跳过 |
  * | 紧接着 | `doc-quality-gate.py --command wk:xxx` | **打出 FAIL 结论 = 硬拦**：不 append action、不起 agent、错误进事件流 |
- * | action 收尾（runActionCheck → 本模块 runWkPostStage） | `doc-quality-gate.py --stage <stage>` | 同上 → postCheck.passed=false（UI 红条） |
+ * | action 收尾（task-runner.runActionPostCheck → 本模块 evaluateWkPostStage） | `doc-quality-gate.py --stage <stage>` | 未过 → 事件流写一条 error（不挡 action 切 awaiting_ack、不跳过用户审阅） |
  * | 门禁过后 | `wk-delivery-sync.py` | 只 warn（没配 hub 时压根不调） |
  *
  * `wk-state.py transition` **仍由 agent 调**——它要带只有 agent 才知道的 reason /
@@ -783,9 +783,8 @@ export const evaluateWkAdvanceGate = async (
 /**
  * action 收尾：post-stage 门禁 + （过了才）delivery sync。
  *
- * 门禁未过 → warn 级别的 blocked？不——后置这里返 "blocked" 表示
- * 「标记问题」：调用方（action-checks）把它并进 postCheck.passed=false，
- * UI 挂红条、用户能看到该修什么。delivery sync 失败只追加一行提示。
+ * 后置这里的 "blocked" 只表示「标记问题」（不拦任何流程）：调用方（evaluateWkPostStage）把它写成事件流里一条
+ * error，让用户看到该补什么。delivery sync 失败只追加一行提示。
  */
 export const runWkPostStage = async (
   plan: WkGatePlanActive,
@@ -842,4 +841,43 @@ export const runWkPostStage = async (
   }
 
   return { verdict: "pass", message: notes.join("\n") };
+};
+
+/**
+ * action 收尾的完整流程（判定 + 跑脚本 + 提示落事件流）；由 task-runner 在 action 切 awaiting_ack 之前后台调。
+ *
+ * 只有提示、没有决策：action 无论如何都照常进 awaiting_ack 让用户审阅（旧的「后置检查红条」已下线，
+ * 这里的结论改走事件流——和推进前门禁 {@link evaluateWkAdvanceGate} 同一个出口、同一套口径）：
+ * - 不是 wk 的 action：完全静默；
+ * - 降级（没配 doc_repo / 脚本起不来等）与 warn：写一条 info；
+ * - blocked：写一条 error；pass：不写（成功刷屏没意义）。
+ * 任何异常（含写事件失败）只打日志——门禁是质量闸门、不是可用性依赖，绝不能把 action 卡在收尾。
+ */
+export const evaluateWkPostStage = async (
+  task: Task,
+  action: ActionRecord,
+  writeEvent: WkGateEventSink,
+): Promise<void> => {
+  const notify = async (kind: "info" | "error", text: string): Promise<void> => {
+    try {
+      await writeEvent(kind, text);
+    } catch (err) {
+      console.warn(`[wk-gate] 阶段门禁提示写事件流失败 task=${task.id}：`, err);
+    }
+  };
+  try {
+    const plan = await planWkGateForAction(task, action);
+    if (!plan.applies) {
+      if (plan.reason !== "not-wk") await notify("info", plan.message);
+      return;
+    }
+    const report = await runWkPostStage(plan);
+    if (report.verdict === "blocked") await notify("error", report.message);
+    else if (report.verdict === "warn") await notify("info", report.message);
+  } catch (err) {
+    console.warn(
+      `[wk-gate] 阶段门禁异常 task=${task.id} action=${action.id}：`,
+      err,
+    );
+  }
 };

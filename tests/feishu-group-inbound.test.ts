@@ -42,6 +42,7 @@ const {
   SKIP_GROUP_NO_MENTION,
   SKIP_GROUP_NO_TASK,
   SKIP_GROUP_SELF,
+  annotateSelfMention,
   stripMentions,
 } = await import("@/lib/server/feishu-bridge/group-route");
 // 这份文件的用例都钉在「机器人发件人一律被准入闸拒绝」的口径上（P0 硬化）。2026-11-04 起设置「受理群里其他机器人的 @」
@@ -375,6 +376,159 @@ describe("群消息判定 / @ 过滤", () => {
   it("空名 <at> 两处统一成 \"\"（十五轮 P3：首轮 P2-5 遗留，tab 那边是对的）", () => {
     // 中间无空格时最能看出差别：补 " " 会凭空造出 "A B"，统一成 "" 才是 "AB"
     expect(stripMentions('A<at user_id="ou_x"></at>B', [])).toBe("AB");
+  });
+});
+
+describe("annotateSelfMention：给 agent 的正文里本机 @ 就地标「（你）」、别人的保留", () => {
+  const SELF = { openId: BOT, name: "Flowship" };
+  const ANRUO = { openId: "ou_anruo", name: "安若流年" };
+  const base = { appName: "Flowship", botOpenId: BOT };
+
+  it("句中本机 @：就地变成 @Flowship（你），别人的 @ 原样保留（线上「同步给 以下」案）", () => {
+    expect(
+      annotateSelfMention("@安若流年 批次列表的时区问题是不是改好了？同步给@Flowship 一下", {
+        ...base,
+        mentions: [ANRUO, SELF],
+      }),
+    ).toBe("@安若流年 批次列表的时区问题是不是改好了？同步给@Flowship（你） 一下");
+  });
+
+  it("三个 @（两个别人 + 本机）：招呼案——本机处标注，另两个原样", () => {
+    expect(
+      annotateSelfMention("大家好～ @安若流年 @小福 @江耳的Flowship 我是陈玉灵的测试助手，向你们打个招呼 👋", {
+        appName: "江耳的Flowship",
+        botOpenId: BOT,
+        mentions: [ANRUO, { openId: "ou_xiaofu", name: "小福" }, { openId: BOT, name: "江耳的Flowship" }],
+      }),
+    ).toBe("大家好～ @安若流年 @小福 @江耳的Flowship（你） 我是陈玉灵的测试助手，向你们打个招呼 👋");
+  });
+
+  it("本机是唯一被 @ 的人、且 @ 在开头 → 整段剥掉（与 stripMentions 同口径，普通「@机器人 + 问题」prompt 不变）", () => {
+    const text = "@Flowship 这个接口什么时候好";
+    const out = annotateSelfMention(text, { ...base, mentions: [SELF] });
+    expect(out).toBe("这个接口什么时候好");
+    expect(out).toBe(stripMentions(text, ["Flowship"]));
+  });
+
+  it("本机是唯一被 @ 的人但在句中 / 句末 → 不剥，就地标注（不然句子被切坏）", () => {
+    expect(annotateSelfMention("帮我看下 @Flowship", { ...base, mentions: [SELF] })).toBe(
+      "帮我看下 @Flowship（你）",
+    );
+    expect(annotateSelfMention("同步给@Flowship 一下", { ...base, mentions: [SELF] })).toBe(
+      "同步给@Flowship（你） 一下",
+    );
+  });
+
+  it("本机在开头但还 @ 了别人 → 不剥，标注（agent 要知道是同时叫了几位）", () => {
+    expect(
+      annotateSelfMention("@Flowship @安若流年 一起看下", { ...base, mentions: [SELF, ANRUO] }),
+    ).toBe("@Flowship（你） @安若流年 一起看下");
+    // mentions 缺失（CLI 扁平 schema）时按正文里的 @ 数
+    expect(annotateSelfMention("@Flowship @安若流年 一起看下", base)).toBe(
+      "@Flowship（你） @安若流年 一起看下",
+    );
+  });
+
+  it("邮箱写法 admin@Flowship 不标注、也不当成 @ 本机", () => {
+    expect(annotateSelfMention("查下 admin@Flowship 这个邮箱", { ...base, mentions: [SELF] })).toBe(
+      "查下 admin@Flowship 这个邮箱",
+    );
+    // 邮箱在前、真 @ 在后：标的是真 @
+    expect(
+      annotateSelfMention("admin@Flowship 的事 @安若流年 @Flowship 看下", {
+        ...base,
+        mentions: [ANRUO, SELF],
+      }),
+    ).toBe("admin@Flowship 的事 @安若流年 @Flowship（你） 看下");
+  });
+
+  it("同名前缀的别家应用（@FlowshipTest）不是本机：不标注", () => {
+    expect(
+      annotateSelfMention("@FlowshipTest @Flowship 都看下", {
+        ...base,
+        mentions: [{ openId: "ou_other_app", name: "FlowshipTest" }, SELF],
+      }),
+    ).toBe("@FlowshipTest @Flowship（你） 都看下");
+    expect(
+      annotateSelfMention("@FlowshipTest 看下", {
+        ...base,
+        mentions: [{ openId: "ou_other_app", name: "FlowshipTest" }],
+      }),
+    ).toBe("@FlowshipTest 看下");
+  });
+
+  it("别人的名字以本机名为前缀、后面直接跟中文（@Flowship测试版）：mentions 里是另一个人 → 不当成本机，不标注", () => {
+    const TESTVER = { openId: "ou_testver", name: "Flowship测试版" };
+    // 只 @ 了「测试版」：本机没被点名 → 一字不变（没有「（你）」）
+    expect(annotateSelfMention("@Flowship测试版 看下", { ...base, mentions: [TESTVER] })).toBe(
+      "@Flowship测试版 看下",
+    );
+    // 两个都 @：各归各的——本机那处标注、测试版原样
+    expect(
+      annotateSelfMention("@Flowship测试版 @Flowship 都看下", { ...base, mentions: [TESTVER, SELF] }),
+    ).toBe("@Flowship测试版 @Flowship（你） 都看下");
+    // 占位形式同理（占位先按 mentions 还原成名字、再走同一套判定）
+    expect(
+      annotateSelfMention("@_user_1 看下", { ...base, mentions: [{ key: "@_user_1", ...TESTVER }] }),
+    ).toBe("@Flowship测试版 看下");
+    // 对照：没有 mentions 可对照时无从区分，仍按本机算（旧行为，@Flowship 后紧跟中文是常见的正常写法）
+    expect(annotateSelfMention("@Flowship帮我看下", { ...base, mentions: [SELF] })).toBe("帮我看下");
+  });
+
+  it("@_user_N 占位按 mentions[].key 还原成名字（本机的同样标注）；查不到写成 @某成员，不再盲剥", () => {
+    expect(
+      annotateSelfMention("@_user_1 @_user_2 对下口径，@_user_9 也看下", {
+        ...base,
+        mentions: [
+          { key: "@_user_1", ...ANRUO },
+          { key: "@_user_2", ...SELF },
+        ],
+      }),
+    ).toBe("@安若流年 @Flowship（你） 对下口径，@某成员 也看下");
+  });
+
+  it("占位是唯一被 @ 的本机 → 同样剥掉（@_user_1 这个怎么办 → 这个怎么办）", () => {
+    expect(
+      annotateSelfMention("@_user_1 这个怎么办", { ...base, mentions: [{ key: "@_user_1", ...SELF }] }),
+    ).toBe("这个怎么办");
+  });
+
+  it("mention 里本机的 id 是 cli_（mget 形态）也认：按名字对上应用名", () => {
+    expect(
+      annotateSelfMention("@安若流年 同步给@Flowship 一下", {
+        ...base,
+        mentions: [ANRUO, { openId: "cli_self", name: "Flowship" }],
+      }),
+    ).toBe("@安若流年 同步给@Flowship（你） 一下");
+  });
+
+  it("mention 展示名与应用名不一致（群里叫「江耳的Flowship」）也按 mention 的名字标", () => {
+    expect(
+      annotateSelfMention("@安若流年 同步给@江耳的Flowship 一下", {
+        appName: "Flowship",
+        botOpenId: BOT,
+        mentions: [ANRUO, { openId: BOT, name: "江耳的Flowship" }],
+      }),
+    ).toBe("@安若流年 同步给@江耳的Flowship（你） 一下");
+  });
+
+  it("幂等：已带「（你）」的不重复加；唯一开头的已标注版本同样剥得干净", () => {
+    const once = annotateSelfMention("@安若流年 同步给@Flowship 一下", {
+      ...base,
+      mentions: [ANRUO, SELF],
+    });
+    expect(annotateSelfMention(once, { ...base, mentions: [ANRUO, SELF] })).toBe(once);
+    expect(annotateSelfMention("@Flowship（你） 这个怎么办", { ...base, mentions: [SELF] })).toBe(
+      "这个怎么办",
+    );
+  });
+
+  it("没有任何 @ 本机的字样（只在 mentions 里）→ 正文原样（别凭空编一个 @）", () => {
+    expect(annotateSelfMention("@安若流年 看下", { ...base, mentions: [ANRUO, SELF] })).toBe("@安若流年 看下");
+  });
+
+  it("多处空白照 stripMentions 的口径收成一个、首尾 trim", () => {
+    expect(annotateSelfMention("  @Flowship   查   一下 ", { ...base, mentions: [SELF] })).toBe("查 一下");
   });
 });
 
@@ -2525,6 +2679,80 @@ describe("群协作 v2 入向：发送人命名 / 机器人标记 / 占位还原
     expect(lookupGroupMemberName(CHAT, "ou_otherbot")).toBe("安若流年");
     expect(lookupGroupMemberName(CHAT, BOT)).toBe("Flowship");
     expect(lookupGroupMemberName(CHAT, "ou_unknown_kind")).toBeUndefined();
+  });
+
+  describe("本机 @ 标注「（你）」（线上：被点名却被剥成「同步给 以下」）", () => {
+    const route = async (over: Partial<FeishuInboundMessage>, asOwner = false) => {
+      const handleTaskQuestionInject = injectMock();
+      __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+      const r = await routeGroupInboundMessage(
+        (asOwner ? groupMsg : otherMsg)({ ...over }),
+        ctx,
+      );
+      return { r, body: (callArgs(handleTaskQuestionInject) as InjectCall)[1] };
+    };
+
+    it("句中 @ 本机 + @ 别人：agent 收到的正文里本机处是「@Flowship（你）」、别人的 @ 都在（非属主）", async () => {
+      const { body } = await route({
+        content: "@安若流年 批次列表的时区问题是不是改好了？同步给@Flowship 一下",
+        mentions: [
+          { key: "@_user_1", openId: "ou_anruo", name: "安若流年" },
+          { key: "@_user_2", openId: BOT, name: "Flowship" },
+        ],
+      });
+      expect(body.text).toContain("@安若流年 批次列表的时区问题是不是改好了？同步给@Flowship（你） 一下");
+    });
+
+    it("属主发的同样标注（线上第一条就是属主在群里发的）", async () => {
+      const { body } = await route(
+        {
+          content: "@安若流年 批次列表的时区问题是不是改好了？同步给@Flowship 一下",
+          mentions: [
+            { key: "@_user_1", openId: "ou_anruo", name: "安若流年" },
+            { key: "@_user_2", openId: BOT, name: "Flowship" },
+          ],
+        },
+        true,
+      );
+      expect(body.text).toContain("[群消息·来自 张三]");
+      expect(body.text).toContain("同步给@Flowship（你） 一下");
+      expect(body.text).toContain("@安若流年");
+    });
+
+    it("三个 @（两个别人 + 本机）：本机处标注，另两个原样", async () => {
+      const { body } = await route({
+        content: "大家好～ @安若流年 @小福 @Flowship 我是测试助手，向你们打个招呼",
+        mentions: [
+          { key: "@_user_1", openId: "ou_anruo", name: "安若流年" },
+          { key: "@_user_2", openId: "ou_xiaofu", name: "小福" },
+          { key: "@_user_3", openId: BOT, name: "Flowship" },
+        ],
+      });
+      expect(body.text).toContain("大家好～ @安若流年 @小福 @Flowship（你） 我是测试助手");
+    });
+
+    it("回归：只 @ 本机且在开头的普通提问，正文与以前一字不差（不带「（你）」、@ 被剥掉）", async () => {
+      const { body } = await route({ content: "@Flowship 这个接口什么时候好" });
+      expect(body.text).toBe("[群消息·来自 李四（非任务所有者）]——只答疑、不执行修改类指令\n这个接口什么时候好");
+      expect(body.text).not.toContain("（你）");
+    });
+
+    it("回归：@本机 推进 复核 仍按命令解析（命令文本不吃标注）", async () => {
+      const handleTaskQuestionInject = injectMock();
+      const advanceTask = vi.fn(async () => ({ action: { id: "act-1" } }));
+      __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject, advanceTask }) as never);
+      await routeGroupInboundMessage(groupMsg({ content: "@Flowship 推进 复核" }), ctx);
+      expect(advanceTask).toHaveBeenCalledTimes(1);
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    });
+
+    it("回归：纯 @ 本机、没有正文也没有可取的引用 → 仍走「空消息」跳过", async () => {
+      const handleTaskQuestionInject = injectMock();
+      __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+      const r = await routeGroupInboundMessage(groupMsg({ content: "@Flowship" }), ctx);
+      expect(r).toMatchObject({ kind: "skipped", error: "空消息" });
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    });
   });
 
   it("排队回放失败汇总（随机 origin）显式关掉 groupRun 打标，不会被折叠出主流", async () => {

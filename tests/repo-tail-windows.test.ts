@@ -3,8 +3,6 @@
  *
  * 背景：全库有十来处用 `p.split("/").filter(Boolean).pop() ?? p` 取仓名，只认 `/`。
  * Windows 仓路径 `C:\w\crm-web` 里没有 `/`，整条路径被当成「仓名」：
- *  - ship 后置检查拿它当正则去 artifact 里找「crm-web 跳过」类说明 → 永远找不到，
- *    agent 明明写了跳过原因也判「漏报」、ship 过不了；
  *  - 给 agent 的 prompt / 事件流 / 飞书卡片 / 任务页里，仓名位置显示整条盘符路径。
  * 修法：取仓名统一走 `path-utils.repoTail`（先把 `\` 归一成 `/` 再取末段）；
  * POSIX 路径的结果与历史写法逐字一致。本文件钉行为 + 扫源码防旧写法回流。
@@ -18,7 +16,6 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -30,13 +27,8 @@ const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-repo-tail-win-"));
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const { repoTail } = await import("@/lib/path-utils");
-const { runActionCheck } = await import("@/lib/server/action-checks");
-const { getActionArtifactPath } = await import("@/lib/server/task-fs-core");
 const { renderRepoBranchSection, renderRepoSection } = await import(
   "@/lib/server/task-prompts"
-);
-const { captureReadonlyRepoBaselines } = await import(
-  "@/lib/server/action-checks"
 );
 const { buildDepPrepareHint, getTaskWorktreesDir } = await import(
   "@/lib/server/task-worktrees"
@@ -87,145 +79,6 @@ describe("repoTail：取仓路径末段", () => {
   it("取不到末段（全是分隔符）→ 原值兜底，不返回空串", () => {
     expect(repoTail("\\\\")).toBe("\\\\");
     expect(repoTail("///")).toBe("///");
-  });
-});
-
-// ----------------- ship 后置检查：跳过说明按仓名末段匹配 -----------------
-
-const MR_URL = "https://git.example.com/x/-/merge_requests/1";
-
-const shipCase = (
-  repoPaths: string[],
-  mrRepo: string,
-  n: number,
-): { task: Task; action: ActionRecord } => {
-  const action = {
-    id: `act_ship_${n}`,
-    n,
-    type: "ship",
-    status: "awaiting_ack",
-    userInstruction: "",
-    artifactPath: `actions/${n}-ship.md`,
-    startedAt: Date.now(),
-    endedAt: Date.now(),
-    sideEffects: {
-      mrs: [{ repoPath: mrRepo, mrUrl: MR_URL, mrVersion: 1 }],
-    },
-  } as unknown as ActionRecord;
-  const task = {
-    id: `t_ship_win_${n}_${Math.random().toString(36).slice(2, 8)}`,
-    title: "ship-win",
-    repoStatus: "developing",
-    runStatus: "idle",
-    currentActionId: action.id,
-    actions: [action],
-    events: [],
-    mrs: [],
-    repoPaths,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  } as unknown as Task;
-  return { task, action };
-};
-
-const writeShipArtifact = async (
-  task: Task,
-  action: ActionRecord,
-  content: string,
-): Promise<void> => {
-  const abs = getActionArtifactPath(task.id, action.n, action.type);
-  if (!abs.startsWith(TMP_ROOT)) {
-    throw new Error(`artifact 路径未隔离到 TMP：${abs}`);
-  }
-  await fs.mkdir(path.dirname(abs), { recursive: true });
-  await fs.writeFile(abs, content, "utf-8");
-};
-
-describe("ship 后置检查：没提 MR 的仓要有跳过说明（按仓名末段匹配）", () => {
-  const SKIP_NOTE = "# Ship\n\n- crm-api：已提 MR\n- crm-web：本次无改动，跳过\n";
-
-  it("Windows 反斜杠仓路径：artifact 里写了「crm-web …跳过」→ 通过（修复前整条盘符路径当正则、永远找不到 → 误判漏报）", async () => {
-    const { task, action } = shipCase(
-      ["C:\\w\\crm-api", "C:\\w\\crm-web"],
-      "C:\\w\\crm-api",
-      1,
-    );
-    await writeShipArtifact(task, action, SKIP_NOTE);
-    const res = await runActionCheck(task, action);
-    expect(res.passed).toBe(true);
-    expect(res.details).toContain("被跳过、artifact 里都写了原因");
-    expect(res.details).not.toContain("漏报");
-  });
-
-  it("Windows 反斜杠 + 尾随分隔符 `C:\\w\\crm-web\\`：同样按末段 crm-web 匹配 → 通过", async () => {
-    const { task, action } = shipCase(
-      ["C:\\w\\crm-api\\", "C:\\w\\crm-web\\"],
-      "C:\\w\\crm-api\\",
-      2,
-    );
-    await writeShipArtifact(task, action, SKIP_NOTE);
-    const res = await runActionCheck(task, action);
-    expect(res.passed).toBe(true);
-  });
-
-  it("关键词在前、仓名在后的语序（backward 正则）也按末段匹配 → 通过", async () => {
-    const { task, action } = shipCase(
-      ["C:\\w\\crm-api", "C:\\w\\crm-web"],
-      "C:\\w\\crm-api",
-      3,
-    );
-    await writeShipArtifact(task, action, "# Ship\n\n跳过：本次没有改动的仓是 crm-web\n");
-    const res = await runActionCheck(task, action);
-    expect(res.passed).toBe(true);
-  });
-
-  it("Windows 路径但 artifact 里确实没写 crm-web 的跳过原因 → 仍判漏报（检查没被放水），文案点名这个仓", async () => {
-    const { task, action } = shipCase(
-      ["C:\\w\\crm-api", "C:\\w\\crm-web"],
-      "C:\\w\\crm-api",
-      4,
-    );
-    await writeShipArtifact(task, action, "# Ship\n\n- crm-api：已提 MR\n");
-    const res = await runActionCheck(task, action);
-    expect(res.passed).toBe(false);
-    expect(res.details).toContain("漏报");
-    expect(res.details).toContain("C:\\w\\crm-web");
-  });
-
-  it("Windows 路径：说明写在别的仓名旁边（crm-api 跳过）不能借给 crm-web", async () => {
-    const { task, action } = shipCase(
-      ["C:\\w\\crm-api", "C:\\w\\crm-web", "C:\\w\\pay"],
-      "C:\\w\\crm-api",
-      5,
-    );
-    // 只给 pay 写了跳过说明；crm-web 没有
-    await writeShipArtifact(task, action, "# Ship\n\n- pay：无改动，跳过\n");
-    const res = await runActionCheck(task, action);
-    expect(res.passed).toBe(false);
-    expect(res.details).toContain("C:\\w\\crm-web");
-    expect(res.details).not.toMatch(/漏报[^\n]*C:\\w\\pay/);
-  });
-
-  it("【对照】POSIX 路径行为不变：写了跳过说明通过、没写判漏报", async () => {
-    const ok = shipCase(["/w/crm-api", "/w/crm-web"], "/w/crm-api", 6);
-    await writeShipArtifact(ok.task, ok.action, SKIP_NOTE);
-    expect((await runActionCheck(ok.task, ok.action)).passed).toBe(true);
-
-    const bad = shipCase(["/w/crm-api", "/w/crm-web"], "/w/crm-api", 7);
-    await writeShipArtifact(bad.task, bad.action, "# Ship\n\n- crm-api：已提 MR\n");
-    const res = await runActionCheck(bad.task, bad.action);
-    expect(res.passed).toBe(false);
-    expect(res.details).toContain("/w/crm-web");
-  });
-
-  it("【对照】Windows 正斜杠 `C:/w/crm-web` 修复前就是对的，修复后仍对", async () => {
-    const { task, action } = shipCase(
-      ["C:/w/crm-api", "C:/w/crm-web"],
-      "C:/w/crm-api",
-      8,
-    );
-    await writeShipArtifact(task, action, SKIP_NOTE);
-    expect((await runActionCheck(task, action)).passed).toBe(true);
   });
 });
 
@@ -398,55 +251,6 @@ describe("依赖准备提示（buildDepPrepareHint）里的仓名", () => {
     expect(hint).toBeDefined();
     expect(hint).toContain("- `crm-web`：");
     expect(hint).not.toContain("- `C:\\w\\crm-web`：");
-  });
-});
-
-describe("只读仓后置检测的失败文案里的仓名", () => {
-  const git = (cwd: string, ...args: string[]): string =>
-    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-
-  it("只读仓被改脏：文案点名的是末段 crm-ro，不是整条路径", async () => {
-    const repo = path.join(WEIRD_ROOT, "ro", "C:\\w\\crm-ro");
-    mkdirSync(repo, { recursive: true });
-    git(repo, "init", "-b", "main");
-    git(repo, "config", "user.email", "t@t.local");
-    git(repo, "config", "user.name", "t");
-    writeFileSync(path.join(repo, "a.txt"), "hello\n");
-    git(repo, "add", "-A");
-    git(repo, "commit", "-m", "init");
-
-    const task = {
-      id: "t_ro_win",
-      mode: "task",
-      title: "ro-win",
-      repoStatus: "developing",
-      runStatus: "idle",
-      repoPaths: [repo],
-      readonlyRepoPaths: [repo],
-      actions: [],
-      mrs: [],
-    } as unknown as Task;
-    const baseline = await captureReadonlyRepoBaselines(task);
-    expect(baseline).toBeDefined();
-
-    // agent 越权改了只读仓
-    writeFileSync(path.join(repo, "dirty.txt"), "oops\n");
-    const action = {
-      id: "act_ro",
-      n: 1,
-      type: "ship",
-      status: "awaiting_ack",
-      userInstruction: "",
-      artifactPath: null, // ship 本身会判「没产出」，只读仓结果拼在它后面
-      startedAt: Date.now(),
-      endedAt: Date.now(),
-      readonlyBaseline: baseline,
-    } as unknown as ActionRecord;
-
-    const res = await runActionCheck(task, action);
-    expect(res.passed).toBe(false);
-    expect(res.details).toContain("只读仓被改动：crm-ro（");
-    expect(res.details).not.toContain("只读仓被改动：C:\\w\\crm-ro（");
   });
 });
 

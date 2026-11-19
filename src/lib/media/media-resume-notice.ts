@@ -4,6 +4,8 @@
  * 用户自己动了进度（拖进度条 / 键盘跳转 / 「跳转到…」/ 媒体键 / 点「从头播放」）之后，
  * 「已从上次的 X 继续」就不再描述当前状态了，提示应该自己消失，而不是一直挂着等人点「×」。
  * （2026-11-06 第一版只在「拖回开头」时收；用户随后说「任何手动拖动都收」，这里改成：除了续播自己的那一跳，任何 seek 都收。）
+ *
+ * 另一条收起规则：续播后**实际播放满几秒**也自己收（用户都看了好几秒了，肯定不想回去）。见 {@link watchPlayedFor}。
  */
 
 /** 只用到的那一小块 media 元素接口（方便测试里传假对象） */
@@ -51,5 +53,76 @@ export const watchUserSeek = (video: SeekedSource, onUserSeek: () => void): Resu
       expected = time;
     },
     stop: () => video.removeEventListener("seeked", onSeeked),
+  };
+};
+
+/** 续播后实际播放满多少秒，「已从上次的 X 继续」提示就自己收（用户：播了好几秒就说明不想回去了） */
+export const RESUME_NOTICE_PLAYED_SECONDS = 5;
+
+/**
+ * 一次 timeupdate 之间「用户实际看了多久」最多多少秒才算「正常播放」（按倍速折回墙钟后比较，见 watchPlayedFor）。
+ * 正常播放每次只隔零点几秒（后台标签页被限频时也不过几秒）；更大的跳变是 seek，不记入播放时长。
+ * 按墙钟比而不是按媒体位置比：4x 下 timeupdate 晚到 1.5 秒位置就走了 6 秒，按位置比会被误当成 seek 丢掉、提示收得更晚。
+ * seek 本身已由 seeking / seeked 重置基准，这里只是第二道保险。
+ */
+const MAX_PLAY_STEP_SECONDS = 5;
+
+/** {@link watchPlayedFor} 用到的 media 元素接口（方便测试里传假对象） */
+export type PlaybackSource = Pick<
+  HTMLMediaElement,
+  "addEventListener" | "removeEventListener" | "currentTime" | "paused" | "playbackRate"
+>;
+
+/** 倍速取不到 / 不合法（0、负数、NaN）时按 1x 算：宁可当正常速度，也别让累计停摆或炸成 Infinity */
+const effectiveRate = (rate: number): number => (Number.isFinite(rate) && rate > 0 ? rate : 1);
+
+/**
+ * 累计「实际播放」的时长，满 `seconds` 秒调一次 onElapsed（只调一次）。
+ *
+ * - 按媒体位置的前进量累计（timeupdate 之间的差值），**暂停 / 缓冲 / seek 都不算**：
+ *   暂停期间位置不动；seeking 把基准清掉、seeked 再重新取基准，所以拖进度那一跳不会被当成「播放了几十秒」。
+ * - 前进量要按倍速折回「用户实际看了多久」：2x 下位置每秒走 2 秒，不折算的话 5 秒阈值只需 2.5 秒就到、
+ *   4x 只要 1.25 秒——提示还没看清就没了。折算后阈值始终是墙钟意义上的几秒。
+ * - 累计的是总量、不要求连续：播 3 秒、暂停、再播 2 秒 = 5 秒。
+ * - 想重新计时就 stop 掉重建一个（dock 里每次出现提示都新建）。
+ */
+export const watchPlayedFor = (
+  video: PlaybackSource,
+  seconds: number,
+  onElapsed: () => void,
+): { stop: () => void } => {
+  // 基准从监听建立时的位置起算（dock 里监听是提示出现时才建的，此刻位置已是续播落点）
+  let last: number | null = video.currentTime;
+  let played = 0;
+  let fired = false;
+  const onTimeUpdate = () => {
+    const now = video.currentTime;
+    if (!video.paused && last !== null) {
+      // 位置前进量折成「用户实际看了多久」（墙钟）：累计和「是不是 seek」都按它判（倍速 1x 时与位置步长相同）
+      const step = now - last;
+      const watched = step / effectiveRate(video.playbackRate);
+      if (step > 0 && watched <= MAX_PLAY_STEP_SECONDS) played += watched;
+    }
+    last = now;
+    if (!fired && played >= seconds) {
+      fired = true;
+      onElapsed();
+    }
+  };
+  const onSeeking = () => {
+    last = null;
+  };
+  const onSeeked = () => {
+    last = video.currentTime;
+  };
+  video.addEventListener("timeupdate", onTimeUpdate);
+  video.addEventListener("seeking", onSeeking);
+  video.addEventListener("seeked", onSeeked);
+  return {
+    stop: () => {
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("seeking", onSeeking);
+      video.removeEventListener("seeked", onSeeked);
+    },
   };
 };

@@ -61,13 +61,11 @@ const resetCheckGate = () => {
     releaseCheckGate = r;
   });
 };
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => {
+vi.mock("@/lib/server/wk-gate", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/server/wk-gate")>()),
+  evaluateWkPostStage: vi.fn(async () => {
     await checkGate;
-    return { passed: true, details: "ok" };
   }),
-  captureActionStartBaseline: vi.fn(),
-  captureReadonlyRepoBaselines: vi.fn(),
 }));
 
 const taskFsCore = await import("@/lib/server/task-fs-core");

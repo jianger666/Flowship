@@ -67,12 +67,6 @@ vi.mock("@/lib/server/kill-orphans", () => ({
 vi.mock("@/lib/server/meegle-cli", () => ({
   resolveUserIdentityForPrompt: async () => "",
 }));
-/** advance / postcheck 秒过；本文件不验 check 本体 */
-vi.mock("@/lib/server/action-checks", () => ({
-  runActionCheck: vi.fn(async () => ({ passed: true, details: "ok" })),
-  captureActionStartBaseline: vi.fn(async () => null),
-  captureReadonlyRepoBaselines: vi.fn(async () => null),
-}));
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
 const { readEvents, readMetaV06, taskDir, writeMeta } = taskFsCore;

@@ -47,7 +47,7 @@ ship action 的目标：把当前 task 所有仓的代码改动 push 到 origin�
 
 > 同 task 后续 ship **不再**走本步——直接从 `task.feishuTesterUserKeys` 读上一次记忆的列表。
 >
-> 不管走 A / 走 C / 用户选「跳过」、**最终都必须调一次 `set_feishu_testers`**（拿到 user_key 调一次、跳过 / 没拿到也调一次 `set_feishu_testers({ task_id, action_id, user_keys: [] })`、空数组 = 显式记忆「跳过」）。**漏调** = 下一轮 ship 还要重新走 A+C、用户体验差、artifact 后置检查会挂。
+> 不管走 A / 走 C / 用户选「跳过」、**最终都必须调一次 `set_feishu_testers`**（拿到 user_key 调一次、跳过 / 没拿到也调一次 `set_feishu_testers({ task_id, action_id, user_keys: [] })`、空数组 = 显式记忆「跳过」）。**漏调** = 下一轮 ship 还要重新走 A+C、用户体验差。
 
 **A. 自动探测**（task.feishuStoryUrl 非空时优先走、用内置 `meegle` CLI）
 
@@ -410,13 +410,13 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完按 super-p
 - ❌ target_branch 探 origin/HEAD 拿 master / main（公司工作流 = 提测、填该仓配置的测试分支、没配才用 test）
 - ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不会落库、详情页看不到）
 - ❌ 自己用 SDK `shell` curl GitLab REST API 建 MR（MR 创建必须走 `submit_mr`、task.mrs 要落库；读操作可自调 API、见 super-prompt「GitLab 访问」）
-- ❌ 拿到测试人员 user_key 但漏调 set_feishu_testers（下次 ship 还要重新探、artifact 后置检查会发现）
+- ❌ 拿到测试人员 user_key 但漏调 set_feishu_testers（下次 ship 还要重新探）
 - ❌ mention 传 lark_user_id 或加 `lark_user_id_` 前缀（2026-06-12 起服务端按纯数字 user_key 校验、报 `cross tenant` / `no permission`）
 - ❌ 先跑 `meegle auth status` 预检再决定要不要做 §4.5（auth status 瞬态失败会被误判成未登录、直接跳过流转）
 - ❌ 强推到 master / main（GitLab 禁、且违反工作流）
 - ❌ commit message 跟实际改动来源不一致（普通流程看 build，WK 流程看完成报告、验证与 git diff）
 - ❌ 拿到 `submit_mr` 失败结果时自动重试 / force push（**绝对不**、artifact 记错、让用户手动处理）
-- ❌ 跳过的仓没在 artifact §3 写原因（后置检查会挡）
+- ❌ 跳过的仓没在 artifact §3 写原因
 - ❌ artifact 没写 `task.feishuTesterUserKeys` 来源（A / C / 沿用、需可审计）
 - ❌ ship 交卷后自动跑下一 action（绝对不、说完结论即结束回复、等用户推进）
 - ❌ 交卷后顺手调 `share_to_group` 把产物发需求群（产物默认不进群——只认用户明说）

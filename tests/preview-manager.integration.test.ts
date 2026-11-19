@@ -46,6 +46,7 @@ import {
   startPreview,
   stopAllPreviews,
   stopPreview,
+  stopPreviewIfOwner,
 } from "@/lib/server/preview-manager";
 
 const PID_FILE = path.join(TMP_ROOT, "preview.json");
@@ -228,6 +229,81 @@ describe("preview-manager（CR-10 / 按仓多位）", () => {
     expect(getPreviewStatus()).toHaveLength(0);
     expect(await readPidFile()).toBeNull();
   }, 15_000);
+
+  it("takeOver:false（agent 工具）同仓并发抢位：先入队的占着、后到的让位，不顶掉先到的、先到的进程不被杀", async () => {
+    // 前置检查（launchTaskPreview 里的 getPreviewStatus）在入队前、不是原子的：两个任务同时 start 同一个仓都能查到「没人占」，
+    // 原先按入队顺序后到的会顶掉先到的——agent「不顶别人」的承诺靠队列内再判一次才成立
+    const repo = "/repo/no-takeover-race";
+    const [r1, r2] = await Promise.all([
+      startPreview({ ...input("task-first", "sleep 30", repo), takeOver: false }),
+      startPreview({ ...input("task-second", "sleep 31", repo), takeOver: false }),
+    ]);
+    expect(r1.yielded).toBeUndefined();
+    expect(r1.status.exited).toBe(false);
+    expect(r2).toMatchObject({ yielded: true, occupied: true });
+    expect(r2.yieldReason).toContain("任务 task-first");
+    expect(r2.status.exited).toBe(true);
+    // 现场：仍是先到的占着、pidfile 仍是它、进程还活着
+    const slots = getPreviewStatus();
+    expect(slots).toHaveLength(1);
+    expect(slots[0]).toMatchObject({ taskId: "task-first", exited: false });
+    const recs = await pidRecords();
+    expect(recs).toHaveLength(1);
+    expect(recs[0]?.command).toBe("sleep 30");
+    await sleep(300); // 给「误杀」留出落地时间，再确认先到的还在
+    expect(isAlive(recs[0]!.pid)).toBe(true);
+  }, 20_000);
+
+  it("takeOver:false 不影响其余场景：没人占 → 照常起；自己重起（同任务）→ 照常换；对方已退出 → 照常起；takeOver 缺省 / true → 照旧顶人", async () => {
+    // 没人占
+    const a = await startPreview({ ...input("task-solo", "sleep 30", "/repo/nt-a"), takeOver: false });
+    expect(a.yielded).toBeUndefined();
+    expect(a.replacedTaskTitle).toBeNull();
+    // 同任务自己重起：不算「被别人占」
+    const a2 = await startPreview({ ...input("task-solo", "sleep 31", "/repo/nt-a"), takeOver: false });
+    expect(a2.yielded).toBeUndefined();
+    expect(getPreviewStatus().find((s) => s.repoPath === "/repo/nt-a")?.command).toBe("sleep 31");
+    // 对方已自然退出：位置是空的
+    await startPreview(input("task-gone", "sleep 0.05", "/repo/nt-b"));
+    expect(await waitUntil(() => getPreviewStatus().find((s) => s.repoPath === "/repo/nt-b")?.exited === true, 5000)).toBe(true);
+    const b = await startPreview({ ...input("task-next", "sleep 30", "/repo/nt-b"), takeOver: false });
+    expect(b.yielded).toBeUndefined();
+    expect(getPreviewStatus().find((s) => s.repoPath === "/repo/nt-b")).toMatchObject({ taskId: "task-next", exited: false });
+    // UI 语义不变：缺省 / true 照旧顶掉别的任务
+    const c1 = await startPreview(input("task-ui-1", "sleep 30", "/repo/nt-c"));
+    const c2 = await startPreview({ ...input("task-ui-2", "sleep 31", "/repo/nt-c"), takeOver: true });
+    expect(c1.yielded).toBeUndefined();
+    expect(c2.yielded).toBeUndefined();
+    expect(c2.replacedTaskTitle).toBe("任务 task-ui-1");
+  }, 20_000);
+
+  it("stopPreviewIfOwner：归属在队列里判——不是本任务的（被别的任务接管）不杀；是本任务的才停", async () => {
+    // agent 带 repo_path 的 stop：前置检查在队列外，查完到真正停之间 UI 可能已把这个仓接管给了别的任务
+    const repo = "/repo/stop-if-owner";
+    await startPreview(input("task-a", "sleep 30", repo));
+    // UI 接管：task-b 顶掉 task-a
+    await startPreview(input("task-b", "sleep 31", repo));
+    const recs = await pidRecords();
+    expect(recs).toHaveLength(1);
+    const bPid = recs[0]!.pid;
+    expect(recs[0]?.command).toBe("sleep 31");
+
+    // task-a 的 agent 此刻才来停「自己的」：这个仓现在是 task-b 的 → 什么都不动
+    expect(await stopPreviewIfOwner(repo, "task-a")).toBe(false);
+    expect(getPreviewStatus()).toMatchObject([{ taskId: "task-b", exited: false }]);
+    await sleep(300);
+    expect(isAlive(bPid)).toBe(true);
+    expect((await pidRecords()).map((r) => r.pid)).toEqual([bPid]);
+
+    // 该仓根本没有预览位 → false、无副作用
+    expect(await stopPreviewIfOwner("/repo/stop-if-owner-none", "task-a")).toBe(false);
+
+    // 本任务自己的 → 真停、进程组没了、pidfile 清掉
+    expect(await stopPreviewIfOwner(repo, "task-b")).toBe(true);
+    expect(getPreviewStatus()).toEqual([]);
+    expect(await waitUntil(() => !isProcessGroupAlive(bPid), 5000)).toBe(true);
+    expect(await pidRecords()).toEqual([]);
+  }, 20_000);
 
   it("被顶掉的旧进程迟到 exit：不清新进程的 pidfile", async () => {
     const repo = "/repo/late-exit";

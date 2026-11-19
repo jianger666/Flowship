@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   FLOWSHIP_SDK_CUSTOM_TOOLS_SERVER,
+  buildNotifyTestersResult,
   buildSdkCustomTools,
   flowShipTools,
   withFlowshipSdkCustomTools,
@@ -49,6 +50,22 @@ describe("buildSdkCustomTools", () => {
     // failed / 防重语义必须写进描述，否则 agent 拿到 failed 会愣住不知道该不该重试
     expect(notify?.description).toContain("failed");
     expect(notify?.description).toContain("skipped_duplicate");
+    // 去重只按 action：新一轮提测要走新 action（2026-11-18：原 action 里补发，新 MR 的通知被吞）
+    expect(notify?.description).toContain("只按 action_id");
+    expect(notify?.description).toContain("advance_next");
+  });
+
+  it("notify_group_testers：skipped_duplicate 附 hint 指路新 action；其它 outcome 原样不带 hint", () => {
+    const dup = buildNotifyTestersResult("skipped_duplicate", "act_9");
+    expect(dup).toMatchObject({ ok: true, outcome: "skipped_duplicate" });
+    expect(dup.hint).toContain("act_9");
+    expect(dup.hint).toContain("什么都没发");
+    expect(dup.hint).toContain("按 action 去重");
+    expect(dup.hint).toContain("advance_next");
+
+    for (const outcome of ["sent", "failed", "skipped_no_group", "skipped_bot_not_in_group"]) {
+      expect(buildNotifyTestersResult(outcome, "act_9")).toEqual({ ok: true, outcome });
+    }
   });
 
   it("notify_group_testers caller 不对 → 忽略", async () => {

@@ -131,6 +131,7 @@ import {
 import {
   type CardButtonValue,
   type FeishuInboundMessage,
+  type FeishuMention,
 } from "./types";
 
 const LOG = "[feishu-bridge/group-route]";
@@ -311,20 +312,25 @@ export const matchesBotMention = (
   msg: FeishuInboundMessage,
   bot: { openId?: string | null; appName?: string | null },
 ): boolean => {
-  const botOpenId = bot.openId?.trim() ?? "";
   const botName = bot.appName?.trim() ?? "";
   const mentions = msg.mentions ?? [];
-  if (mentions.length > 0) {
-    return mentions.some((m) => {
-      const mid = (m.openId ?? "").trim();
-      if (botOpenId && mid === botOpenId) return true;
-      // 两边都是 open_id 形态却不相等：确定是别人，名字再像也不算
-      if (botOpenId && OPEN_ID_RE.test(botOpenId) && OPEN_ID_RE.test(mid)) return false;
-      return !!botName && (m.name ?? "").trim() === botName;
-    });
-  }
+  if (mentions.length > 0) return mentions.some((m) => mentionIsBot(m, bot));
   if (!botName) return false;
   return msg.content.includes(`@${botName}`);
+};
+
+/** 单条 mention 是不是本机 bot（matchesBotMention 的逐条口径，规则见上；agent 正文标注「（你）」也按这条判） */
+export const mentionIsBot = (
+  m: FeishuMention,
+  bot: { openId?: string | null; appName?: string | null },
+): boolean => {
+  const botOpenId = bot.openId?.trim() ?? "";
+  const botName = bot.appName?.trim() ?? "";
+  const mid = (m.openId ?? "").trim();
+  if (botOpenId && mid === botOpenId) return true;
+  // 两边都是 open_id 形态却不相等：确定是别人，名字再像也不算
+  if (botOpenId && OPEN_ID_RE.test(botOpenId) && OPEN_ID_RE.test(mid)) return false;
+  return !!botName && (m.name ?? "").trim() === botName;
 };
 
 /** 剥掉正文里的 @ 占位（`@_user_1`）与 `@应用名`，留下真正的指令文本 */
@@ -345,6 +351,118 @@ export const stripMentions = (text: string, names: string[]): string => {
     .replace(/@_user_\d+/g, " ")
     .replace(/[ \t]{2,}/g, " ")
     .trim();
+};
+
+/** 给 agent 看的正文里，本机 @ 的就地标注（`@名字（你）`） */
+export const SELF_MENTION_MARK = "（你）";
+
+/** `@` 前面紧挨这些字符 = 邮箱 / 域名写法（`admin@Flowship`），不是在 @ 人 */
+const EMAIL_PREV_RE = /[A-Za-z0-9._-]/;
+const NAME_WORD_RE = /[A-Za-z0-9_]/;
+
+/** text[at] 处是不是 `@<name>`（名字以英文 / 数字结尾时，后面不能紧跟英文 / 数字——`@Flowship` 不是 `@FlowshipTest`） */
+const selfNameAt = (text: string, at: number, name: string): boolean => {
+  if (!text.startsWith(`@${name}`, at)) return false;
+  const last = name[name.length - 1];
+  const next = text[at + 1 + name.length];
+  return !(NAME_WORD_RE.test(last) && next !== undefined && NAME_WORD_RE.test(next));
+};
+
+/**
+ * 给 agent 看的群消息正文：**本机的 @ 就地标成 `@名字（你）`、别人的 @ 原样留着**。
+ *
+ * 为什么不能直接用 stripMentions 的输出：它是给命令解析用的（`@本机 推进` 要剥成 `推进`），
+ * 拿去喂 agent 就把「谁被点名了」整个抹掉——`@安若流年 …同步给@江耳的Flowship 一下` 变成 `…同步给 一下`，
+ * 多人被点名时 agent 只看到别人、以为不关自己的事。
+ *
+ * 规则：
+ * 1. 本机是**唯一**被 @ 的人、且 @ 在正文开头 → 整段剥掉（等同 stripMentions；95% 的「@机器人 + 问题」prompt 一字不变）；
+ * 2. 其余情形：第一处本机 @ 就地加「（你）」；邮箱写法（`@` 前紧挨字母数字 / `._-`）不算；已带「（你）」的不重复加；
+ * 3. `@_user_N` 占位按 mentions[].key 还原成名字（本机的同样标注），查不到写成 `@某成员`——不盲剥，免得别人的 @ 也丢；
+ * 4. 本机判定：应用名（appName）或 mentions 里按 {@link mentionIsBot} 认出的那几条的展示名。
+ *    mention 的 id 可能是 `cli_` 开头的 app_id，不能只靠 `ou_` 比。
+ *
+ * 只给 agent 看；命令解析仍用 stripMentions（调用方两份各用各的）。
+ */
+export const annotateSelfMention = (
+  text: string,
+  opts: {
+    appName?: string | null;
+    botOpenId?: string | null;
+    mentions?: FeishuMention[];
+  },
+): string => {
+  const bot = { openId: opts.botOpenId, appName: opts.appName };
+  const mentions = opts.mentions ?? [];
+  const selfMentions = mentions.filter((m) => mentionIsBot(m, bot));
+  const selfNames = [
+    ...new Set(
+      [opts.appName, ...selfMentions.map((m) => m.name)]
+        .map((n) => (n ?? "").trim().replace(/^@/, ""))
+        .filter(Boolean),
+    ),
+  ].sort((a, b) => b.length - a.length);
+  // 别人的展示名（mentions 里真被 @ 到的、不是本机的）：用来分辨「名字以本机名为前缀」的别人——
+  // `@Flowship测试版` 的 `Flowship` 后面是中文，光靠上面 selfNameAt 的英文 / 数字边界判不出来，
+  // 但它若在 mentions 里是另一个人，就按最长名字归给他（没有 mentions 可对照时无从区分，仍按本机算）
+  const otherNames = [
+    ...new Set(
+      mentions
+        .filter((m) => !mentionIsBot(m, bot))
+        .map((m) => (m.name ?? "").trim().replace(/^@/, ""))
+        .filter(Boolean),
+    ),
+  ].sort((a, b) => b.length - a.length);
+
+  // 占位还原：本机的还原成名字（下面照常标注）；查不到的写成 @某成员，不盲剥
+  const resolved = text.replace(/@_user_\d+/g, (ph) => {
+    const m = mentions.find((x) => x.key === ph);
+    if (!m) return "@某成员";
+    const shown = (m.name ?? "").trim().replace(/^@/, "");
+    const name = shown || (mentionIsBot(m, bot) ? (opts.appName ?? "").trim() : "");
+    return `@${name || "某成员"}`;
+  });
+
+  // 扫 @：本机的（位置 + 名字）与「别人的」分开记
+  const selfAts: Array<{ at: number; name: string }> = [];
+  let othersInText = 0;
+  for (let i = 0; i < resolved.length; i++) {
+    if (resolved[i] !== "@") continue;
+    if (i > 0 && EMAIL_PREV_RE.test(resolved[i - 1])) continue;
+    const next = resolved[i + 1];
+    if (next === undefined || /\s/.test(next)) continue;
+    const name = selfNames.find((n) => selfNameAt(resolved, i, n));
+    // 更长的别人名字盖过本机名（`@Flowship测试版` 是别人、不是「@Flowship」后面跟了字）
+    const longerOther = otherNames.find(
+      (o) => resolved.startsWith(`@${o}`, i) && (!name || o.length > name.length),
+    );
+    if (longerOther) {
+      othersInText++;
+      i += longerOther.length;
+    } else if (name) {
+      selfAts.push({ at: i, name });
+      i += name.length;
+    } else {
+      othersInText++;
+    }
+  }
+  const first = selfAts[0];
+  const normalize = (s: string): string => s.replace(/[ \t]{2,}/g, " ").trim();
+  if (!first) return normalize(resolved);
+
+  const tokenEnd = first.at + 1 + first.name.length;
+  const othersInMentions = mentions.some((m) => !mentionIsBot(m, bot));
+  const onlySelfAtStart =
+    othersInText === 0 && !othersInMentions && resolved.slice(0, first.at).trim() === "";
+  if (onlySelfAtStart) {
+    // 唯一被点名且在开头：照 stripMentions 的口径剥掉（连带可能已有的「（你）」）
+    const after = resolved.startsWith(SELF_MENTION_MARK, tokenEnd)
+      ? tokenEnd + SELF_MENTION_MARK.length
+      : tokenEnd;
+    return normalize(`${resolved.slice(0, first.at)} ${resolved.slice(after)}`);
+  }
+  if (resolved.startsWith(SELF_MENTION_MARK, tokenEnd)) return normalize(resolved);
+  return normalize(`${resolved.slice(0, tokenEnd)}${SELF_MENTION_MARK}${resolved.slice(tokenEnd)}`);
 };
 
 /** action 名 → 类型：内置 type 关键字 + 中文全称 / 短标 + 英文标（大小写不敏感） */
@@ -1246,6 +1364,52 @@ const injectGroupMessage = async (args: {
     sameSessionNonOwner
       ? null
       : rawBusyReason;
+
+  // 忙线时把这条普通问题攒进群问题队（调用方已判过「该不该排」：非属主 / task 型 / 非 pendingAsk / 非 feed / 图未下载）。
+  // 受理返回 queued 结果（并已回群一句「在排队了」）；没排上（启动凭据拿不到 / 队满 / 同一人超 2 槽）返 null，
+  // 由调用方落回忙线拒收。
+  const enqueueWhileBusy = async (): Promise<InjectResultPayload | null> => {
+    // 启动凭据拿不到就不排：回放必失败还占一次循环，不如直接忙线拒收（review P2-6）
+    const boot = await args.loadBootContext(task).catch(() => null);
+    if (!boot) return null;
+    const pushed = enqueueGroupQuestion(
+      taskId,
+      {
+        messageId,
+        chatId,
+        text: args.text,
+        parsed,
+        requester,
+        senderIds: args.senderIds,
+        ...(args.requesterIsBot ? { requesterIsBot: true as const } : {}),
+        boot,
+      },
+      Date.now(),
+      // 同一发送人最多占 2 个槽（G3-02）：超出落回忙线拒收（机器人静默）
+      { maxPerSender: GROUP_QUESTION_QUEUE_MAX_PER_SENDER },
+    );
+    // 入队时清掉的过期问题：人家收到过 ack，不能悄悄吞，一人回一句（review 八轮-2）。
+    // 机器人发件人的回执整条静默（groupReplyMention）——和 pump 里同一口径。
+    for (const e of pushed.ejected) {
+      await replyToGroup(
+        e.chatId,
+        "久等了，超时作废，麻烦重问",
+        groupReplyMention(e.requesterIsBot, e.requester),
+      );
+    }
+    if (!pushed.queued) return null;
+    const waiting =
+      pushed.position <= 1
+        ? "当前这轮答完就答你"
+        : `前面还有 ${pushed.position - 1} 个问题，答完就答你`;
+    await replyToGroup(
+      chatId,
+      `收到，在排队了，${waiting}`,
+      groupReplyMention(args.requesterIsBot, requester),
+    );
+    return { kind: "queued", messageId, taskId, text: args.text || undefined };
+  };
+
   if (busyReason) {
     // 排队回放遇忙（G3-03）：直接静默返回，由 pump 放回队首等下一轮 draining。
     // 不能落到下面的 replyToGroup(busyReason)——那是给「新到的群消息」的即时回执；
@@ -1262,67 +1426,20 @@ const injectGroupMessage = async (args: {
     // 用例见 tests/group-bypass-r8.test.ts）。
     // pump 回放时（fromPump）不再二次入队：还忙就静默等下一轮 draining。
     // 注：pendingAsk 其实到不了这里（busyReason 已豁免），上面再写一遍是显式的，不靠外层兜着。
-    // 带图不排：图片 base64 进队要在内存躺到 TTL，图多沉；图重发成本低，直接忙线拒收（review 八轮-3）
+    // 带图也排：非属主的图此刻是「待下载」状态（parsed.deferred 只是个句柄，不占内存），排队期间零下载，
+    // 回放时主链空闲了才真正下载（见 enqueueWhileBusy）。只有已经下载好的 base64（parsed.images）才不排——
+    // 那份数据会在内存里躺到 TTL；非属主走 deferDownloads，正常到不了这种状态。
     const queueable =
       !args.fromPump &&
       !isOwner &&
       task.mode !== "chat" &&
       !hasPendingAsk &&
       !feedIntoSession &&
-      parsed.images.length === 0 &&
-      // 待下载的资源里含图 = 带图（延后下载后 images 仍是空的，与下载后的口径一致）
-      !parsed.deferred?.hasImages;
+      parsed.images.length === 0;
     if (queueable) {
-      // 启动凭据拿不到就不排：回放必失败还占一次循环，不如直接忙线拒收（review P2-6）
-      const boot = await args.loadBootContext(task).catch(() => null);
-      if (!boot) {
-        await replyToGroup(
-          chatId,
-          busyReason,
-          groupReplyMention(args.requesterIsBot, requester),
-        );
-        return { kind: "skipped", messageId, taskId, error: busyReason };
-      }
-      const pushed = enqueueGroupQuestion(
-        taskId,
-        {
-          messageId,
-          chatId,
-          text: args.text,
-          parsed,
-          requester,
-          senderIds: args.senderIds,
-          ...(args.requesterIsBot ? { requesterIsBot: true as const } : {}),
-          boot,
-        },
-        Date.now(),
-        // 同一发送人最多占 2 个槽（G3-02）：超出落回下面的忙线拒收（机器人静默）
-        { maxPerSender: GROUP_QUESTION_QUEUE_MAX_PER_SENDER },
-      );
-      // 入队时清掉的过期问题：人家收到过 ack，不能悄悄吞，一人回一句（review 八轮-2）。
-      // 机器人发件人的回执整条静默（groupReplyMention）——和 pump 里同一口径。
-      if (pushed.ejected.length > 0) {
-        for (const e of pushed.ejected) {
-          await replyToGroup(
-            e.chatId,
-            "久等了，超时作废，麻烦重问",
-            groupReplyMention(e.requesterIsBot, e.requester),
-          );
-        }
-      }
-      if (pushed.queued) {
-        const waiting =
-          pushed.position <= 1
-            ? "当前这轮答完就答你"
-            : `前面还有 ${pushed.position - 1} 个问题，答完就答你`;
-        await replyToGroup(
-          chatId,
-          `收到，在排队了，${waiting}`,
-          groupReplyMention(args.requesterIsBot, requester),
-        );
-        return { kind: "queued", messageId, taskId, text: args.text || undefined };
-      }
-      // 满了 → 落回忙线拒收（原口径）
+      const queued = await enqueueWhileBusy();
+      if (queued) return queued;
+      // 排不上（启动凭据拿不到 / 队满 / 同一人超 2 槽）→ 落回下面的忙线拒收
     }
     await replyToGroup(
       chatId,
@@ -1332,13 +1449,26 @@ const injectGroupMessage = async (args: {
     return { kind: "skipped", messageId, taskId, error: busyReason };
   }
 
-  // 并入同会话的非属主 + 带图 + 主链正忙：不排队（图 base64 要在内存躺到 TTL、陌生人连发带图能占满槽位半小时；
-  // 图重发成本低），忙线直接拒收。空闲直送照常走注入链的图片校验落盘。
+  // 并入同会话的非属主 + 带图 + 主链正忙：不能像纯文本那样直接交给注入链——图要先下载成 base64，
+  // 进 task 待送达队列就得在内存里躺到主链空闲（陌生人连发带图能占满队列）。
+  // 所以这里改走群问题队：图还没下载（deferred），入队零下载、不占内存；回放时主链空闲了才下载并直送。
+  // 空闲直送照常走注入链的图片校验落盘。
   if (
     sameSessionNonOwner &&
     (runningTasks.has(task.id) || task.runStatus === "running") &&
     (parsed.images.length > 0 || parsed.deferred?.hasImages)
   ) {
+    // 排队回放遇忙：静默返回，由 pump 放回队首等下一轮 draining（同上：pump 每个 done / task / action 帧都会跑，
+    // 不能对同一个真人反复刷「任务正在跑」；入队 ack 早已承诺「答完就答你」）
+    if (args.fromPump) {
+      return { kind: "skipped", messageId, taskId, error: GROUP_TASK_RUNNING };
+    }
+    // 已经下载好的 base64（parsed.images）不排——非属主走 deferDownloads，正常到不了这种状态
+    if (parsed.images.length === 0 && parsed.deferred) {
+      const queued = await enqueueWhileBusy();
+      if (queued) return queued;
+      // 排不上（启动凭据拿不到 / 队满 / 同一人超 2 槽）→ 落回下面的忙线拒收
+    }
     await replyToGroup(
       chatId,
       GROUP_TASK_RUNNING,
@@ -2062,7 +2192,14 @@ export const routeGroupInboundMessage = async (
         : lookupGroupMemberName(msg.chat_id, id),
     ),
   };
+  // 两份正文各用各的：text 只给命令解析 / 空 @ 判定 / 引用锚点用（@本机 要剥掉才认得「推进 复核」）；
+  // agentText 才是给 agent 看的——本机的 @ 就地标「（你）」、别人的保留，别把「谁被点名了」抹掉
   const text = stripMentions(parsed.text, [appName ?? ""]);
+  const agentText = annotateSelfMention(parsed.text, {
+    appName,
+    botOpenId,
+    mentions: msg.mentions,
+  });
 
   // 回复 / 引用了某条消息 → 取回被引用的那条（任何带回复锚点的群消息都取，不只是正文为空的那种）。
   // 用户这句话本身就是「推进」命令时不取：命令只看用户自己写的那句，
@@ -2152,6 +2289,10 @@ export const routeGroupInboundMessage = async (
     });
   }
 
+  // 给 agent 的正文：空 @ 取回引用拼出来的（refSource）与命令文本为空的情形照旧用 effectiveText；
+  // 其余用带「（你）」标注的 agentText
+  const agentBody = refSource || text.length === 0 ? effectiveText : agentText;
+
   // 普通文本：群里任何人都能发（跨角色协作），但非属主只走答疑通道——
   // 写路径（改产物重交卷 / 唤醒全权限 agent）仍然只有本人能触发。
   // 关联消费（出问登记命中）是唯一的例外：命中才允许进属主会话当数据（见 injectGroupMessage 内）。
@@ -2160,7 +2301,7 @@ export const routeGroupInboundMessage = async (
     chatId: msg.chat_id,
     // 纯图/纯附件 @ 进来正文是空的：给一句兜底，和 pendingAsk 路径的 "(附图/附件)" 对齐
     //（review 十轮-3；到这里时上面空消息门已保证三者至少其一非空）
-    text: `${effectiveText || "(附图/附件)"}${quoteBlock ? `\n\n${quoteBlock}` : ""}`,
+    text: `${agentBody || "(附图/附件)"}${quoteBlock ? `\n\n${quoteBlock}` : ""}`,
     parsed,
     requester,
     isOwner,

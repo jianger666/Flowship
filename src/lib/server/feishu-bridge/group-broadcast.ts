@@ -1,7 +1,7 @@
 /**
  * 需求群自动播报（第三批）
  *
- * app 内跑完一个 action（产物过后置检查、切 awaiting_ack）后，按
+ * app 内跑完一个 action（切 awaiting_ack）后，按
  * `bridge-config.GROUP_COLLAB_POLICY.autoBroadcast` 档位自动把产物以分享卡发进需求群。
  * 该档位固定 `off`（2026-07-28 起不再是用户设置）——整条链保留、只是常驻不播。
  *

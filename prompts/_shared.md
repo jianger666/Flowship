@@ -149,7 +149,7 @@ artifact 全文用**中文**——除非引用代码 / 接口路径 / 文件路�
 
 1. **会自动改写文件的命令**——`lint --fix`、`eslint --fix`、任何 `*lint --fix`、`prettier --write`、`* format`、codemod、带 `--fix` / `--write` 的命令。
    - ⚠️ **跑仓库 `package.json` 里的 script 前、必须先 `read` 看它实际展开成什么**——很多仓库的 `lint` script 内部就是 `--fix`（真实事故：某 Angular 仓 `npm run lint` = `ng lint --fix=true`、整个仓库被逐文件自动改写）。**看到 `--fix` / `--write` 就不跑**、改用只读校验（typecheck / `tsc --noEmit` / 不带 fix 的 lint）。
-2. **长驻 / 不自己退出的命令**——dev server（`dev` / `serve` / `start`）、`--watch`、`tail -f`、交互式 REPL。这些不返回、会把 Run 挂死、还会留下后台子进程。要验证就跑一次性命令、不要起服务。
+2. **长驻 / 不自己退出的命令**——dev server（`dev` / `serve` / `start`）、`--watch`、`tail -f`、交互式 REPL。这些不返回、会把 Run 挂死、还会留下后台子进程。要验证就跑一次性命令、不要起服务。**要看页面效果 / 真跑起来验证时，用 `preview` 工具起项目**（系统托管进程、任务终结 / 归档 / 删除或应用退出时自动清理；本轮结束 / 点「停止」不会停它，见 super-prompt「`preview`」一节），不要用 shell 自己起。
 3. **耗时全量命令**——`pnpm build` / `vite build` / `mvn package` / `gradle build` 等（各 action 另有说明、默认不跑、ROI 低）。
 
 > **为什么这么严**：agent 用 shell 工具拉起的子进程是独立进程、**即使 task 被「停止」、agent 本体死了、这些子进程也可能 orphan 后在后台继续跑**（典型就是 `--fix` 在后台把整仓改花）。Flowship 有事后兜底清理、但**事前就不跑这类命令**才是根治。校验只用「跑完即退、不写文件」的只读命令。

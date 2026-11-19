@@ -24,6 +24,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // 类型是编译期擦除的，静态 import 不会先于下面的 FLOWSHIP_DATA_DIR 赋值触发模块副作用
 import type { WkGatePlanActive } from "@/lib/server/wk-gate";
+import type { ActionRecord, Task } from "@/lib/types";
 
 const TMP_ROOT = await fs.mkdtemp(path.join(os.tmpdir(), "wk-gate-"));
 process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
@@ -152,6 +153,18 @@ vi.mock("@/lib/server/wk-config", () => ({
   }),
 }));
 
+/** action 记录 → 定义的反查（evaluateWkPostStage 走 planWkGateForAction）；逐例设定 */
+const actionDefs = vi.hoisted(() => ({
+  byId: new Map<string, { skill: string; order?: number }>(),
+  throws: false,
+}));
+vi.mock("@/lib/server/custom-action-fs", () => ({
+  getCustomAction: async (id: string) => {
+    if (actionDefs.throws) throw new Error("读自定义 action 定义炸了");
+    return actionDefs.byId.get(id) ?? null;
+  },
+}));
+
 const {
   buildContextInitArgs,
   buildDeliverySyncArgs,
@@ -159,6 +172,7 @@ const {
   buildStageArgs,
   defaultPythonBin,
   evaluateWkAdvanceGate,
+  evaluateWkPostStage,
   planWkGate,
   preflightTimeoutMs,
   runWkPostStage,
@@ -220,6 +234,8 @@ beforeEach(() => {
   hoisted.queue.length = 0;
   hoisted.kills.length = 0;
   hoisted.children.clear();
+  actionDefs.byId.clear();
+  actionDefs.throws = false;
 });
 
 afterAll(async () => {
@@ -1051,6 +1067,127 @@ describe("evaluateWkAdvanceGate（推进钩子的决策 + 事件）", () => {
       boom,
     );
     expect(result.decision).toBe("proceed");
+  });
+});
+
+describe("evaluateWkPostStage（action 收尾：只写事件流、不改 action 状态）", () => {
+  const makeSink = () => {
+    const events: { kind: string; text: string }[] = [];
+    return {
+      events,
+      sink: async (kind: "info" | "error", text: string) => {
+        events.push({ kind, text });
+      },
+    };
+  };
+
+  /** 一条已收尾的 custom action；定义按 id 登记到 actionDefs（默认登记成 wk 阶段 action） */
+  const makeAction = (over: Partial<ActionRecord> = {}): ActionRecord =>
+    ({
+      id: "act_1",
+      n: 1,
+      type: "custom",
+      status: "awaiting_ack",
+      userInstruction: "",
+      artifactPath: "actions/1-custom.md",
+      customActionId: "team:wk-repo-execute",
+      startedAt: Date.now(),
+      endedAt: Date.now(),
+      ...over,
+    }) as ActionRecord;
+
+  const run = (
+    sink: (kind: "info" | "error", text: string) => Promise<void>,
+    action: ActionRecord = makeAction(),
+  ) => evaluateWkPostStage(makeTask() as unknown as Task, action, sink);
+
+  it("非 custom action（plan / build / ship …）：完全静默、不跑脚本", async () => {
+    await setupHappyWorld();
+    const { events, sink } = makeSink();
+    await run(sink, makeAction({ type: "build", customActionId: undefined }));
+    expect(events).toEqual([]);
+    expect(hoisted.calls).toHaveLength(0);
+  });
+
+  it("普通 custom action（不是 wk 阶段）：完全静默、不跑脚本", async () => {
+    await setupHappyWorld();
+    actionDefs.byId.set("team:wk-repo-execute", { skill: "my-own-skill" });
+    const { events, sink } = makeSink();
+    await run(sink);
+    expect(events).toEqual([]);
+    expect(hoisted.calls).toHaveLength(0);
+  });
+
+  it("wk 阶段门禁通过：不写事件（成功刷屏没意义），门禁脚本确实跑了", async () => {
+    await setupHappyWorld();
+    actionDefs.byId.set("team:wk-repo-execute", WK_DEF);
+    const { events, sink } = makeSink();
+    await run(sink);
+    expect(events).toEqual([]);
+    expect(hoisted.calls).toHaveLength(1);
+    expect(hoisted.calls[0]!.args).toContain("--stage");
+  });
+
+  it("wk 阶段门禁未过：写一条 error 事件、带脚本原文，且不抛（不拦 action 收尾）", async () => {
+    await setupHappyWorld();
+    actionDefs.byId.set("team:wk-repo-execute", WK_DEF);
+    hoisted.queue.push({
+      code: 1,
+      stdout:
+        "FAIL: repo-execute quality gate failed for /x/y\n" +
+        "- verification.md: missing marker `## Unverified Items`\n",
+    });
+    const { events, sink } = makeSink();
+    await run(sink);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ kind: "error" });
+    expect(events[0]!.text).toContain("## Unverified Items");
+  });
+
+  it("Hub 同步失败（warn）：写一条 info，不是 error", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "http://127.0.0.1:8088";
+    actionDefs.byId.set("team:wk-repo-execute", WK_DEF);
+    hoisted.queue.push({}); // 阶段门禁过
+    hoisted.queue.push({
+      code: 1,
+      stdout: "FAIL: publish to delivery hub failed: Connection refused\n",
+    });
+    const { events, sink } = makeSink();
+    await run(sink);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ kind: "info" });
+    expect(events[0]!.text).toContain("Delivery Hub 同步失败");
+  });
+
+  it("降级（没配 doc_repo）：写一条 info 说明跳过，不跑脚本", async () => {
+    await setupHappyWorld();
+    wkCfg.docRepoPath = "";
+    actionDefs.byId.set("team:wk-repo-execute", WK_DEF);
+    const { events, sink } = makeSink();
+    await run(sink);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ kind: "info" });
+    expect(hoisted.calls).toHaveLength(0);
+  });
+
+  it("门禁链路抛错（读 action 定义炸了）：吞掉、不写事件、不抛", async () => {
+    await setupHappyWorld();
+    actionDefs.throws = true;
+    const { events, sink } = makeSink();
+    await expect(run(sink)).resolves.toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it("写事件抛错：吞掉、不抛（日志问题不能卡住 action 收尾）", async () => {
+    await setupHappyWorld();
+    actionDefs.byId.set("team:wk-repo-execute", WK_DEF);
+    hoisted.queue.push({ code: 1, stdout: "FAIL: repo-execute quality gate failed\n" });
+    await expect(
+      run(async () => {
+        throw new Error("写事件炸了");
+      }),
+    ).resolves.toBeUndefined();
   });
 });
 

@@ -10,7 +10,8 @@
  * - 没有活会话 → 原只读旁路不变（降级通道）：restrictToQuestion:true、预登记 restricted
  * - 属主 / 答 pendingAsk 不受影响；机器人：设置「受理其他机器人」关 → 仍被准入闸拒（放开后的语义见 group-bots-allowed.test.ts）
  * - 202 排队：限流名额不退（重放不再过准入闸，不能让排队绕过 per-sender 滑动窗）
- * - 带图 + 主链正忙：不排队、忙线拒收；空闲带图照常直送
+ * - 带图 + 主链正忙：图还是待下载句柄 → 进群问题队（零下载），主链空闲后回放才下载直送；
+ *   已下载好的 base64 仍不排、忙线拒收；队满 / 同人超槽落回拒收；空闲带图照常直送
  *
  * 全 mock 外部调用——禁止真调飞书。
  */
@@ -31,12 +32,14 @@ const {
   __resetGroupChatCacheForTest,
   __setGroupRouteDepsForTest,
   GROUP_TASK_RUNNING,
+  pumpGroupQuestionQueue,
   routeGroupInboundMessage,
 } = await import("@/lib/server/feishu-bridge/group-route");
 const {
   __resetGroupAdvancePickForTest,
   __resetGroupReplyStateForTest,
   __resetThrottleForTest,
+  groupQuestionQueueLength,
   listGroupReplies,
 } = await import("@/lib/server/feishu-bridge/group-shared");
 const { __resetOutboundRegistryForTest } = await import(
@@ -306,6 +309,118 @@ describe("带图", () => {
     expect(r).toMatchObject({ kind: "skipped", taskId: "task-1" });
     expect(handleTaskQuestionInject).not.toHaveBeenCalled();
     expect(sentTexts(sendTextToChat)[0]).toContain(GROUP_TASK_RUNNING);
+  });
+
+  // 真实链路里非属主一律 deferDownloads 预解析：图是「待下载」的句柄，下载在闸门全过之后。
+  // 上面那两条用的是「已经下载好的 base64」（ctxWithImage），那种仍不排；这里钉死待下载的图。
+  const downloads: string[] = [];
+  const ctxDeferredImage = {
+    ...ctx,
+    parseContent: async (
+      m: FeishuInboundMessage,
+      opts?: { deferDownloads?: boolean },
+    ) => {
+      const download = async () => {
+        downloads.push(m.message_id);
+        return { text: m.content, images: [IMG], attachments: [] };
+      };
+      if (!opts?.deferDownloads) return download();
+      return {
+        text: m.content,
+        images: [],
+        attachments: [],
+        deferred: { hasImages: true, resolve: download },
+      };
+    },
+  };
+
+  it("主链正忙 + 带图（待下载）→ 进群问题队：回「在排队了」、零下载、不注入；pump 遇忙静默；空闲后才下载并直送", async () => {
+    // 2026-11-18 邹丽君 @ 机器人带截图，正撞上属主那一轮的收尾窗口：旧口径是「带图一律拒收」，
+    // 她只收到一句「任务正在跑、等这一轮结束再问」，消息没排队也没记录，石沉大海。
+    downloads.length = 0;
+    agentSessions.set("task-1", {} as never);
+    let running = true;
+    const handleTaskQuestionInject = vi.fn(async () =>
+      jsonRes({ ok: true }, 200),
+    );
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        sendTextToChat,
+        getTask: async () =>
+          fullTask({ runStatus: running ? "running" : "idle" }),
+        listTasks: async () => [
+          taskSummary({ runStatus: running ? "running" : "idle" }),
+        ],
+      }) as never,
+    );
+
+    const r = await routeGroupInboundMessage(groupMsg(), ctxDeferredImage);
+
+    expect(r).toMatchObject({ kind: "queued", taskId: "task-1" });
+    expect(sentTexts(sendTextToChat)).toHaveLength(1);
+    expect(sentTexts(sendTextToChat)[0]).toContain("在排队了");
+    expect(sentTexts(sendTextToChat)[0]).not.toContain(GROUP_TASK_RUNNING);
+    expect(downloads).toEqual([]); // 排队期间不下载、不占内存
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(groupQuestionQueueLength("task-1")).toBe(1);
+
+    // 还在忙：pump 静默放回队首（不刷屏、不下载）
+    await pumpGroupQuestionQueue("task-1");
+    expect(sentTexts(sendTextToChat)).toHaveLength(1);
+    expect(downloads).toEqual([]);
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(groupQuestionQueueLength("task-1")).toBe(1);
+
+    // 主链空闲：回放时才下载，图随注入直送（走并入同会话的通道）
+    running = false;
+    await pumpGroupQuestionQueue("task-1");
+    expect(downloads).toEqual(["om_g1"]);
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    expect(bodyOf(handleTaskQuestionInject).images).toHaveLength(1);
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      groupNonOwner: { name: "李四" },
+    });
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+
+  it("主链正忙 + 带图（待下载）但同一人已占满 2 个槽 → 落回忙线拒收（原口径）", async () => {
+    downloads.length = 0;
+    agentSessions.set("task-1", {} as never);
+    const handleTaskQuestionInject = vi.fn(async () => queuedRes());
+    const sendTextToChat = vi.fn(async () => ({
+      chat_id: CHAT,
+      message_id: "om_r",
+    }));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        sendTextToChat,
+        getTask: async () => fullTask({ runStatus: "running" }),
+        listTasks: async () => [taskSummary({ runStatus: "running" })],
+      }) as never,
+    );
+
+    for (const id of ["om_i1", "om_i2"]) {
+      const ok = await routeGroupInboundMessage(
+        groupMsg({ message_id: id }),
+        ctxDeferredImage,
+      );
+      expect(ok).toMatchObject({ kind: "queued" });
+    }
+    const third = await routeGroupInboundMessage(
+      groupMsg({ message_id: "om_i3" }),
+      ctxDeferredImage,
+    );
+
+    expect(third).toMatchObject({ kind: "skipped", error: GROUP_TASK_RUNNING });
+    expect(groupQuestionQueueLength("task-1")).toBe(2);
+    expect(sentTexts(sendTextToChat).at(-1)).toContain(GROUP_TASK_RUNNING);
+    expect(downloads).toEqual([]);
   });
 
   it("空闲 + 带图 → 照常直送（不排队也不拒）", async () => {

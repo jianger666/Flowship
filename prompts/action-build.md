@@ -101,7 +101,7 @@
 - **Java（Gradle）仓**（有 `build.gradle`）：编译如 `./gradlew compileJava`、检查如 `./gradlew check`
 - **其他技术栈**：看 README / CONTRIBUTING / Makefile 找编译 + 静态检查命令
 
-> ⛔ **跑 lint script 前先 `read` 看它真正是什么**（共享规范 §9）——很多仓库 `lint` script 内部带 `--fix`（真实事故：某 Angular 仓 `npm run lint` = `ng lint --fix=true`、把整仓自动改花、停止后还在后台 orphan 继续改）。**看到 `--fix` / `--write` 就不跑**、校验只用只读命令（typecheck / `tsc --noEmit` / 不带 fix 的 lint）。也不要起 dev server / `--watch`（长驻、挂死 Run）。
+> ⛔ **跑 lint script 前先 `read` 看它真正是什么**（共享规范 §9）——很多仓库 `lint` script 内部带 `--fix`（真实事故：某 Angular 仓 `npm run lint` = `ng lint --fix=true`、把整仓自动改花、停止后还在后台 orphan 继续改）。**看到 `--fix` / `--write` 就不跑**、校验只用只读命令（typecheck / `tsc --noEmit` / 不带 fix 的 lint）。也不要用 shell 起 dev server / `--watch`（长驻、挂死 Run）；真要看页面效果用 `preview` 工具（见 super-prompt）。
 
 > ⚠️ **不要跑全量 build / 打包命令**（如 `pnpm build` / `vite build` / `mvn package` / `gradle build`）—— 这类通常耗时几十秒到几分钟、上面的类型检查 / 编译已覆盖大部分错误、全量打包边际收益低、ROI 不值。除非用户在 plan / 反馈里**明确要求**、否则跳过。
 
@@ -186,9 +186,9 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 - `[USER_MESSAGE]`（带〈产出审阅中〉）→ 按 super-prompt「[USER_MESSAGE] 统一处理」。**改类**落地后用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾（格式 / 禁项见「跨 action 共享规范 §5.1」）
 - `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行、**不要自己进入 review**（你判断用户希望「改完自动复核」之类才用 `advance_next` 登记，见 super-prompt）
 
-## 自检（V0.6.3 起：runner 不再自动跑项目 typecheck/lint/test；交付诚实性检查（artifact 必备段 / 越权检测等）仍会跑——build 质量靠你自检 + 用户人眼把关）
+## 自检（runner 不会替你跑项目 typecheck/lint/test——build 质量靠你自检 + 用户人眼把关）
 
-> V0.6.3 撤掉了 runner 的自动后置检查（原来写死 `pnpm typecheck` / `pnpm lint`、对多技术栈如 Java 会误报、后面会重做成技术栈自适应 / 独立 check）。现在 build 的质量门槛**由你自己保证**：
+> build 的质量门槛**由你自己保证**：
 
 1. **§4 的类型检查 / 编译必须 exit 0**——不过就当场修、修到过为止（用户对低级错误零容忍）
 2. **lint / 静态检查（若仓库配了）exit 0**——同上

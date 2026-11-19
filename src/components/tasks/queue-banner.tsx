@@ -32,7 +32,13 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { LoadingState } from "@/components/ui/loading-state";
 import { summarize } from "@/components/tasks/event-stream/utils";
 import { useDialog } from "@/hooks/use-dialog";
-import { queueEditDraftToSave, queueEditKeyAction, type SendNowCopy } from "@/lib/queue-banner";
+import {
+  QUEUE_ARRIVAL_RETRY_MS,
+  queueEditDraftToSave,
+  queueEditKeyAction,
+  shouldWaitForQueueArrival,
+  type SendNowCopy,
+} from "@/lib/queue-banner";
 import { isImeComposing } from "@/lib/ime";
 
 /** 暂存中（held）的行按钮的 hover 提示 */
@@ -129,6 +135,8 @@ export const QueueBanner = ({
   const reqRef = useRef(0);
   // 拉取失败标记：失败与空队是两回事，面板文案要分开（之前失败也显示“队列已空”，误导）
   const [loadError, setLoadError] = useState(false);
+  // 拉到空队但条上还有数时，已经复拉了几次（见 shouldWaitForQueueArrival）；每次打开面板 / 拉到非空都清零
+  const [arrivalRetries, setArrivalRetries] = useState(0);
 
   const rows = liveRows ?? fetched;
 
@@ -141,6 +149,7 @@ export const QueueBanner = ({
       .then((list) => {
         if (reqRef.current !== myReq) return; // 过期回包（切 task / 手动关后）直接丢
         setFetched(list);
+        if (list.length > 0) setArrivalRetries(0);
         // 自动弹开专用：队里真有东西才开。本地 pending 可能是刚发出的在途
         // （会话恢复/重连时常见），空队弹开只剩一句“队列已空”，尴尬。
         if (openWhenNonEmpty && list.length > 0) {
@@ -164,8 +173,30 @@ export const QueueBanner = ({
     setAutoOpened(false);
     setOpen(next);
     if (!next) return;
+    setArrivalRetries(0);
     loadQueue(false);
   };
+
+  // 本地账说有排队、服务端快照却是空：消息多半还在路上（见 shouldWaitForQueueArrival）——短间隔复拉几次，
+  // 出现了就显示；复拉耗尽仍是空才落回「队列已空」。复拉不抢焦点、不自动弹开（loadQueue(false)）
+  const waitingArrival = shouldWaitForQueueArrival({
+    fetchMode: !!fetchRows && !liveRows,
+    open,
+    loadError,
+    fetchedCount: fetched ? fetched.length : null,
+    queuedCount,
+    retries: arrivalRetries,
+  });
+  useEffect(() => {
+    if (!waitingArrival || loading) return;
+    const timer = setTimeout(() => {
+      setArrivalRetries((n) => n + 1);
+      loadQueue(false);
+    }, QUEUE_ARRIVAL_RETRY_MS);
+    return () => clearTimeout(timer);
+    // loadQueue 每次渲染都是新函数；它只读 props / ref，这里按「该不该等 / 在不在拉 / 第几次」驱动即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waitingArrival, loading, arrivalRetries]);
 
   // 排队从无到有（调用方递增 tick）→ fetch 模式先拉快照、有货才弹；live 模式条目已在手、直接弹；
   // 队内 1→2 不重复弹、不打断编辑
@@ -338,6 +369,9 @@ export const QueueBanner = ({
           <div className="px-1 py-2 text-xs text-destructive">
             队列拉取失败，稍后重新点条子再试
           </div>
+        ) : waitingArrival ? (
+          // 条上有数、服务端队列还空：这条消息还在送进队列的路上，别说「已空」吓人（复拉耗尽才落回下面那句）
+          <LoadingState variant="inline" className="px-1" label="消息正在送进队列…" />
         ) : !rows || rows.length === 0 ? (
           <EmptyHint size="sm">队列已空（可能刚被发出或删除）</EmptyHint>
         ) : (
