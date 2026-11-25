@@ -200,9 +200,11 @@ describe("路径布局与真 koffi 的包对账", () => {
    * electron-app 没装依赖（别的开发机 / 精简 CI）就跳过。
    */
   const electronAppKoffiRoot = ((): string | null => {
+    // 只认 electron-app 自己名下装的 koffi。不能用 require.resolve("koffi")：解析不到时它会向上回落到仓库根里装的那份——
+    // 门禁（ci.yml）只在根目录 install，根里只有 runner 本机平台（linux-x64）的原生包，会被误判成「electron-app 装了依赖」，
+    // 四个目标平台一份都解析不到、下面的断言就红（v1.9.57 首发的 verify 就是这么红的）。
     try {
-      const req = createRequire(path.join(REPO_ROOT, "electron-app", "package.json"));
-      return path.dirname(fs.realpathSync(req.resolve("koffi")));
+      return fs.realpathSync(path.join(REPO_ROOT, "electron-app", "node_modules", "koffi"));
     } catch {
       return null;
     }
