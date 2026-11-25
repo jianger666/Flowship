@@ -364,10 +364,17 @@ const fileToBase64Image = async (
  * 人类可读文本、不是官方 OpenAPI 的 JSON（实证 2026-07-19）：
  * - post 图文混排 → `![Image](img_v3_xxx)\n正文`
  * - file 消息 → `<file key="file_v3_xxx" name="report.pdf"/>`
- * - image 消息 → `![Image](img_xxx)`
+ * - image 消息 → `![Image](img_xxx)`（mget 取回的 image 消息是 `[Image: img_xxx]`）
  * 所以各分支都要「JSON 优先、渲染文本兜底」双形态兼容。
  */
-const MD_IMAGE_RE = /!\[[^\]]*\]\((img_[A-Za-z0-9_-]+)\)/g;
+/**
+ * 图占位两种渲染形态（key 分别在第 1 / 2 个捕获组，用 {@link imageKeyOf} 取）：
+ * `![Image](img_xxx)`（post / 事件）与 `[Image: img_xxx]`（mget 对 image 类消息的渲染，2026-11-19 引用图片事故：
+ * 只认前者，引用里的图连所有者也解析不出 → 「图片消息缺少 image_key」）。
+ */
+const MD_IMAGE_RE =
+  /!\[[^\]]*\]\((img_[A-Za-z0-9_-]+)\)|\[Image:\s*(img_[A-Za-z0-9_-]+)\s*\]/g;
+const imageKeyOf = (m: RegExpExecArray | null): string => m?.[1] || m?.[2] || "";
 /** enrichment 渲染的文件标记：`<file key="file_xxx" name="…"/>`（name 可缺省） */
 const FILE_TAG_RE =
   /<file\s+key="(file_[A-Za-z0-9_-]+)"(?:\s+name="([^"]*)")?\s*\/>/;
@@ -518,7 +525,8 @@ const extractMarkdownImages = async (
   const re = new RegExp(MD_IMAGE_RE.source, "g");
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    if (m[1]) keys.push(m[1]);
+    const key = imageKeyOf(m);
+    if (key) keys.push(key);
   }
   if (keys.length === 0) {
     return { text, images, totalBytes };
@@ -584,7 +592,7 @@ const parseInboundContentImpl = async (
   if (type === "image") {
     const obj = tryParseJson(msg.content) as Record<string, unknown> | null;
     // enrichment 渲染形态兜底：content 是 `![Image](img_xxx)` 而非 JSON
-    const mdKey = new RegExp(MD_IMAGE_RE.source).exec(msg.content)?.[1] || "";
+    const mdKey = imageKeyOf(new RegExp(MD_IMAGE_RE.source).exec(msg.content));
     const imageKey =
       (obj && typeof obj.image_key === "string" && obj.image_key) ||
       (obj && typeof obj.file_key === "string" && obj.file_key) ||

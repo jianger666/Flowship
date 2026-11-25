@@ -486,9 +486,36 @@ describe("group_ask（需求群答题）", () => {
     expect(call[1]).toBe("方案 A");
     // 卡片回调事件只有 open_id、换不出姓名（要通讯录权限）→ 记泛称
     expect(call[4]).toMatchObject({ answeredBy: "群成员" });
+    // 点按钮的不是任务所有者：「选哪个」是外人替所有者做的决定 → 按「别人的内容在驱动」处理（第二轮评审 P0）
+    expect(call[4]).toMatchObject({ foreignContent: true });
     // 卡片置态**不在这里做**：injectPendingAskText 送达成功后统一置（群里打字作答走的
     // 也是它）——同一件事只留一个收口点，两个入口结果一致
     expect(batchUpdateCard).not.toHaveBeenCalled();
+  });
+
+  it("所有者自己点群答题卡的选项：不加 foreignContent（那是所有者本人的决定）", async () => {
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      chat_id: groupAskValue.chatId,
+      action_value: JSON.stringify(groupAskValue),
+    });
+    expect(injectPendingAskText).toHaveBeenCalledTimes(1);
+    const call = injectPendingAskText.mock.calls[0]! as unknown[];
+    expect(call[4]).not.toHaveProperty("foreignContent");
+  });
+
+  it("查不到应用 owner（getBotAppInfo 失败）：按外人算（fail-closed），答案照常受理", async () => {
+    getBotAppInfo.mockRejectedValue(new Error("boom"));
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_card",
+      chat_id: groupAskValue.chatId,
+      action_value: JSON.stringify(groupAskValue),
+    });
+    expect(injectPendingAskText).toHaveBeenCalledTimes(1);
+    const call = injectPendingAskText.mock.calls[0]! as unknown[];
+    expect(call[4]).toMatchObject({ foreignContent: true });
   });
 
   it("先到先得：已被答掉（无 pending）→ 不投递、群里回「已经有人回答了」", async () => {

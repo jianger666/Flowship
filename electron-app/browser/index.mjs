@@ -356,7 +356,11 @@ const abortableSleep = (ms, signal) =>
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 
-/** 让一个 promise 能被 signal 打断（底层命令自己会超时，不会泄漏太久）。 */
+/**
+ * 让一个 promise 能被 signal 打断（底层命令自己会超时，不会泄漏太久）。
+ * 注意这个前提对「要排队」的命令不成立：只有外层 promise 立刻失败，排着队的命令轮到时仍会发出去、还占着队列。
+ * 目前只有截图排队（Tab.#captureExclusive），它自己在出队时查 signal（调用方要把 signal 传给 tab.screenshot）。
+ */
 const abortable = (promise, signal) => {
   if (!signal) return promise;
   return new Promise((resolve, reject) => {
@@ -440,6 +444,10 @@ const validTaskId = (taskId) => typeof taskId === "string" && taskId !== "" && t
  *   startPicker?: Function,
  *   // V4 用户侧（契约 §14.3）：右键菜单要 Menu / clipboard，下载「显示 / 打开」要 shell；缺了对应功能静默不可用
  *   Menu?: any, clipboard?: any, shell?: any,
+ *   // 页面权限提示的系统层说明（permission-gate.mjs）：弹麦克风 / 摄像头提示时读一次 `getMediaAccessStatus`，系统层已拒绝就在提示条里多写一行；缺省 = 不提示
+ *   systemPreferences?: any,
+ *   // 电脑操作（desktop.v1，electron-app/desktop/manager.mjs 的实例）：与内置浏览器共用同一条 server 通道；缺省 = 不提供这项能力
+ *   desktop?: any,
  * }} deps
  */
 export const createBrowserManager = (deps) => {
@@ -594,7 +602,14 @@ export const createBrowserManager = (deps) => {
    * 权限处理器由 ensurePartitionConfigured 在每个 partition 上装一次（持久档案 + 每个无痕 partition）；
    * 守卫的 wc 事件由 host.createTab 在每个 tab 上 bindTab。config 读实时的镜像（用户关掉设置开关立即生效）。
    */
-  const permissionGate = createPermissionGate({ findOwner: findTabByWebContents, getConfig: () => config, isAppUrl: deps.isAppUrl, log });
+  const permissionGate = createPermissionGate({
+    findOwner: findTabByWebContents,
+    getConfig: () => config,
+    isAppUrl: deps.isAppUrl,
+    log,
+    // 系统层授权状态（macOS 隐私设置 / Windows 全局开关）：只在弹麦克风 / 摄像头提示时读一次，给提示条补一行说明；没注入就不提示
+    getMediaAccessStatus: (kind) => deps.systemPreferences?.getMediaAccessStatus?.(kind) ?? "unknown",
+  });
   const netGuard = createNetGuard({ findOwner: findTabByWebContents, getConfig: () => config, isAppUrl: deps.isAppUrl, log });
 
   /** 下载放行策略的运行态（download-policy.mjs 的纯函数 + 这里的计数）：key = 会话 taskId（找不到 owner 的归 ""） */
@@ -1050,6 +1065,7 @@ export const createBrowserManager = (deps) => {
         ...(a.scale !== undefined ? { scale: a.scale } : {}),
         ...(a.omitBackground ? { omitBackground: true } : {}),
         ...(a.annotate ? { annotate: true } : {}),
+        signal, // 截图在模拟队列里排队时，op 已超时 / 被停止 → 出队时不再发 CDP（Tab.#captureExclusive）
       }),
       signal,
     );
@@ -1326,6 +1342,18 @@ export const createBrowserManager = (deps) => {
    * @param {{ taskId: string, signal?: AbortSignal }} ctx
    */
   const dispatch = async (op, rawArgs, ctx = {}) => {
+    // 电脑操作的 op（desktop_ 前缀）走它自己的 manager：不属于浏览器会话，也不带 pendingPrompts
+    if (deps.desktop?.isDesktopOp?.(op)) return deps.desktop.handleOp(op, rawArgs, ctx);
+    // 任务被删 / 归档（server 的 closeBrowserSession 发来 close_session）：这个任务名下的电脑操作会话也要一并结束，
+    // 我们解锁的电脑锁回去——任务都没了，没人会再来结束它，只靠空闲超时（最长 3 分钟）会让电脑白白解着。
+    // fire-and-forget：不拖慢浏览器会话的清理，桌面这头出任何异常也不能挡住它
+    if (op === "close_session" && validTaskId(ctx?.taskId)) {
+      try {
+        deps.desktop?.onTaskClosed?.(ctx.taskId);
+      } catch (err) {
+        log(`[desktop] close_session 联动结束会话异常：${err?.message || err}`);
+      }
+    }
     const result = await dispatchOp(op, rawArgs, ctx);
     // 契约 §15.1：会话里有等待用户处理的提示（HTTP 认证 / 证书 / 权限 / evaluate 授权）时，每个 op 的结果都带上 `pendingPrompts`
     // （只有 id / kind / host / tabId，不含 detail 与任何回答内容）——server 的 run() 据此给 AI 写一句「已请用户处理」，AI 不会傻等 / 重试
@@ -1760,7 +1788,43 @@ export const createBrowserManager = (deps) => {
     if (destroyed) return;
     // 旧通道 close：其上挂起的请求全部以 CANCELLED 结束，会话本身不丢
     channel?.close();
-    channel = createServerChannel({ proc, dispatch, onConfig, onCancel, log });
+    const desktop = deps.desktop;
+    const created = createServerChannel({
+      proc,
+      dispatch,
+      // config / cancel 同时通知电脑操作（它自己挑要的字段；浏览器这边对不认识的键本来就忽略）
+      onConfig: (cfg) => {
+        onConfig(cfg);
+        try {
+          desktop?.onConfig?.(cfg);
+        } catch (err) {
+          log(`[desktop] config 处理异常：${err?.message || err}`);
+        }
+      },
+      onCancel: (taskId) => {
+        onCancel(taskId);
+        try {
+          desktop?.onCancel?.(taskId);
+        } catch (err) {
+          log(`[desktop] cancel 处理异常：${err?.message || err}`);
+        }
+      },
+      capabilities: desktop?.capabilities?.() ?? [],
+      // 通道关闭（server 退出 / 断线 / 被新通道取代）：电脑操作 fail-closed——会话收尾、总开关清零、不再推事件
+      onClose: () => {
+        if (!desktop) return;
+        try {
+          desktop.setEventSink?.(null);
+          desktop.onServerGone?.();
+        } catch (err) {
+          log(`[desktop] 通道关闭处理异常：${err?.message || err}`);
+        }
+      },
+      log,
+    });
+    channel = created;
+    // 电脑操作的事件（解锁 / 重新锁屏 / 用户接管…）经这条通道推给 server
+    desktop?.setEventSink?.((name, taskId, data) => created.sendEvent(name, taskId, data));
   };
 
   const destroy = () => {

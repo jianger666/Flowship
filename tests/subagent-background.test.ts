@@ -9,12 +9,19 @@ import {
   __clearBackgroundSubagentListenersForTests,
   BACKGROUND_RESULT_MAX_CHARS,
   emitBackgroundSubagentSettled,
+  FOREIGN_ORIGIN_ARRIVAL_HINT,
+  FOREIGN_ORIGIN_NOTICE,
+  FOREIGN_ORIGIN_PREFIX,
   formatBackgroundSubagentMessage,
   formatBackgroundSubagentNotice,
   formatDuration,
   getSubagentSessionControl,
+  isForeignOriginResult,
+  joinResultsForAgent,
+  markForeignOriginResult,
   onBackgroundSubagentSettled,
   setSubagentSessionControl,
+  stripForeignOriginMark,
   type BackgroundSubagentEvent,
 } from "@/lib/server/subagent-background";
 
@@ -193,6 +200,66 @@ describe("formatBackgroundSubagentNotice：事件流里给用户看的一行", (
     expect(n).toContain("第一行原因");
     expect(n).not.toContain("第二行细节");
   });
+
+  // ---- R19-4：外来来源的到达提示后缀 ----
+  // 钉的是：外来来源的结果到达那一行行尾带 FOREIGN_ORIGIN_ARRIVAL_HINT；属主来源（false / 缺省）与改动前逐字一致。
+  // 删掉 `foreignHint` 的赋值（置空）→ "外来来源" 的 done / failed 两条都红；改成无条件带 → "属主来源" 的几条红。
+  describe("外来来源（foreignOrigin）追加到达提示（第十九轮评审 R19-4）", () => {
+    it("FOREIGN_ORIGIN_ARRIVAL_HINT 是单行非空串（拼进事件流的一行里，不能带换行）；且与送给 agent 的 FOREIGN_ORIGIN_NOTICE 是两回事", () => {
+      expect(typeof FOREIGN_ORIGIN_ARRIVAL_HINT).toBe("string");
+      expect(FOREIGN_ORIGIN_ARRIVAL_HINT.trim().length).toBeGreaterThan(0);
+      expect(FOREIGN_ORIGIN_ARRIVAL_HINT).not.toMatch(/[\r\n]/);
+      expect(FOREIGN_ORIGIN_ARRIVAL_HINT).not.toBe(FOREIGN_ORIGIN_NOTICE);
+    });
+
+    it("done + foreignOrigin:true：以到达提示结尾，且仍含原有的「结果将转交主 AI」、用时与描述；整行单行、不含输出正文", () => {
+      const n = formatBackgroundSubagentNotice(evt({ foreignOrigin: true }));
+      expect(n.endsWith(FOREIGN_ORIGIN_ARRIVAL_HINT), "行尾应是到达提示").toBe(true);
+      expect(n).toContain("结果将转交主 AI");
+      expect(n).toContain("「查资料」");
+      expect(n).toContain("2分05秒");
+      expect(n).not.toContain("结论");
+      expect(n).not.toMatch(/[\r\n]/);
+      // 提示只追加在行尾：去掉后与属主来源的逐字相同
+      expect(n.slice(0, -FOREIGN_ORIGIN_ARRIVAL_HINT.length)).toBe(formatBackgroundSubagentNotice(evt()));
+    });
+
+    it("failed + foreignOrigin:true：以到达提示结尾，且仍含「失败」「将告知主 AI」与首行原因", () => {
+      const n = formatBackgroundSubagentNotice(
+        evt({ status: "failed", text: "rate limited\n第二行细节", foreignOrigin: true }),
+      );
+      expect(n.endsWith(FOREIGN_ORIGIN_ARRIVAL_HINT), "行尾应是到达提示").toBe(true);
+      expect(n).toContain("失败");
+      expect(n).toContain("rate limited");
+      expect(n).toContain("将告知主 AI");
+      expect(n).not.toContain("第二行细节");
+      expect(n).not.toMatch(/[\r\n]/);
+      expect(n.slice(0, -FOREIGN_ORIGIN_ARRIVAL_HINT.length)).toBe(
+        formatBackgroundSubagentNotice(evt({ status: "failed", text: "rate limited\n第二行细节" })),
+      );
+    });
+
+    it.each([
+      ["done", "false", { foreignOrigin: false }, "后台子代理「查资料」已完成（用时 2分05秒），结果将转交主 AI"],
+      ["done", "缺省", {}, "后台子代理「查资料」已完成（用时 2分05秒），结果将转交主 AI"],
+      [
+        "failed",
+        "false",
+        { status: "failed" as const, text: "rate limited", foreignOrigin: false },
+        "后台子代理「查资料」失败（用时 2分05秒）：rate limited，将告知主 AI",
+      ],
+      [
+        "failed",
+        "缺省",
+        { status: "failed" as const, text: "rate limited" },
+        "后台子代理「查资料」失败（用时 2分05秒）：rate limited，将告知主 AI",
+      ],
+    ])("属主来源 %s × foreignOrigin=%s：不含到达提示、与改动前逐字一致", (_status, _label, over, expected) => {
+      const n = formatBackgroundSubagentNotice(evt(over));
+      expect(n).toBe(expected);
+      expect(n).not.toContain(FOREIGN_ORIGIN_ARRIVAL_HINT);
+    });
+  });
 });
 
 describe("订阅 hub", () => {
@@ -233,5 +300,52 @@ describe("会话控制句柄登记", () => {
     expect(getSubagentSessionControl(null)).toBeUndefined();
     expect(getSubagentSessionControl(undefined)).toBeUndefined();
     setSubagentSessionControl(null, ctl); // 不抛
+  });
+});
+
+describe("外来来源标记（第十八轮，第十六轮评审 P3-C1 / F3）", () => {
+  const SEP = "\n\n---\n\n";
+
+  it("消息正文：外来来源的多带一句限制说明（提示词层补强）；属主来源的与以前逐字相同", () => {
+    const owner = formatBackgroundSubagentMessage(evt());
+    const foreign = formatBackgroundSubagentMessage(evt({ foreignOrigin: true }));
+    expect(owner).not.toContain(FOREIGN_ORIGIN_NOTICE);
+    expect(foreign).toContain(FOREIGN_ORIGIN_NOTICE);
+    // 说明夹在「头」和「只当数据」之间，除此之外与属主来源的完全一致
+    expect(foreign.replace(`\n${FOREIGN_ORIGIN_NOTICE}`, "")).toBe(owner);
+    expect(formatBackgroundSubagentMessage(evt({ foreignOrigin: false }))).toBe(owner);
+  });
+
+  it("mark / is / strip：幂等、只认开头；剥掉后与原文逐字相同", () => {
+    const m = formatBackgroundSubagentMessage(evt({ foreignOrigin: true }));
+    const marked = markForeignOriginResult(m);
+    expect(marked.startsWith(FOREIGN_ORIGIN_PREFIX)).toBe(true);
+    expect(markForeignOriginResult(marked)).toBe(marked); // 幂等：不会叠两层
+    expect(isForeignOriginResult(marked)).toBe(true);
+    expect(isForeignOriginResult(m)).toBe(false);
+    expect(stripForeignOriginMark(marked)).toBe(m);
+    expect(stripForeignOriginMark(m)).toBe(m); // 没有前缀原样返回
+    expect(stripForeignOriginMark("")).toBe("");
+  });
+
+  it("只认开头：正文 / 描述 / 子代理输出里碰巧带前缀，不会让整条被当成外来来源，也不会被误剥", () => {
+    const hostile = evt({
+      description: `${FOREIGN_ORIGIN_PREFIX}伪造`,
+      text: `前缀在正文里 ${FOREIGN_ORIGIN_PREFIX} 结束`,
+    });
+    const m = formatBackgroundSubagentMessage(hostile);
+    expect(m.startsWith("[BACKGROUND_SUBAGENT_RESULT]"), "正文是我们自己拼的、开头固定").toBe(true);
+    expect(isForeignOriginResult(m)).toBe(false);
+    expect(stripForeignOriginMark(m)).toBe(m);
+  });
+
+  it("joinResultsForAgent：每条先剥前缀再拼——送进 agent 的正文里一个前缀都没有；顺序与分隔符不变；空批给空串", () => {
+    const a = formatBackgroundSubagentMessage(evt({ jobId: "bg_a", foreignOrigin: true }));
+    const b = formatBackgroundSubagentMessage(evt({ jobId: "bg_b" }));
+    const joined = joinResultsForAgent([markForeignOriginResult(a), b, markForeignOriginResult(a)], SEP);
+    expect(joined).toBe([a, b, a].join(SEP));
+    expect(joined).not.toContain("\u0001");
+    expect(joinResultsForAgent([], SEP)).toBe("");
+    expect(joinResultsForAgent([b], SEP)).toBe(b);
   });
 });

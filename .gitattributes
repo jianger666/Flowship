@@ -1,0 +1,4 @@
+# Windows 解锁组件的资源文件：安装时会按 SHA-256 校验后再以管理员身份运行。
+# Windows 上 git 默认把 LF 转成 CRLF；校验本身会先把 CRLF 统一成 LF 再算哈希（见 electron-app/desktop/win-helper/protocol.mjs），
+# 这里再固定一遍换行，是双保险。
+electron-app/desktop/win-helper/assets/* text eol=lf

@@ -52,9 +52,9 @@ const log = (m) => console.log("[peer]", m);
 /** 退出前清临时 userData（app.exit 不触发 will-quit，所以不能挂在那上面） */
 const bye = (code) => {
   try {
-    fs.rmSync(TMP, { recursive: true, force: true });
-  } catch {
-    /* 临时目录清不掉不影响结果 */
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
   }
   app.exit(code);
 };

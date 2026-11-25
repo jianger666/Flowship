@@ -102,6 +102,9 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   browserNetworkBodyRead: true,
   browserAdvancedTools: true,
   browserMaxTabs: 20,
+  // 电脑操作：总开关与「锁屏时也能用」都默认关（只认显式 true）；开机密码不在 settings 里、只进系统钥匙串
+  computerUse: false,
+  computerUseLockedAccess: false,
   // 公司环境：默认空（设置页「环境配置」填写；运行时同步 company-env.json）
   companyEnv: emptyCompanyEnv(),
 };
@@ -321,6 +324,9 @@ export const normalizeSettings = (
       parsed.browserMaxTabs <= 60
         ? parsed.browserMaxTabs
         : 20,
+    // 电脑操作两个开关：只认显式 true（缺省 / 坏值 → 关）
+    computerUse: parsed.computerUse === true,
+    computerUseLockedAccess: parsed.computerUseLockedAccess === true,
     // 公司环境：缺 / 坏 → 空配置（不挡启动）
     companyEnv: normalizeCompanyEnv(parsed.companyEnv),
   };

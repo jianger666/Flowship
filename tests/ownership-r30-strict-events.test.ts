@@ -286,6 +286,14 @@ describe("R30：R29-4 strict 用户输入 + R29-6 seq durable", () => {
   });
 
   afterEach(async () => {
+    // 第三条链：seq sidecar（.event-seq）的 fire-and-forget 写链（persistSeqSidecar），不在下面两条链里。
+    // 每个新任务首次追加事件都会触发一次；本文件的 R29-4 用例很短，sidecar 的 tmp 写完、rename 前恰好撞上后面的 rm。
+    // 必须在 clearEventSeqCounter 之前拿到链的句柄——它会把该任务的 sidecar 链从表里摘掉。
+    // 取不到链表（key 改名）时退化为无操作，不影响用例本身
+    const sidecarChains = (
+      globalThis as unknown as Record<string, Map<string, Promise<void>> | undefined>
+    )["__flowshipEventSeqSidecarWriteChainV1__"];
+    const pendingSidecarWrites = ids.map((id) => sidecarChains?.get(id));
     for (const id of ids) {
       agentSessions.delete(id);
       clearTaskStarting(id);
@@ -296,7 +304,21 @@ describe("R30：R29-4 strict 用户输入 + R29-6 seq durable", () => {
       cleanupChatTaskState(id);
       clearEventSeqCounter(id);
     }
-    await new Promise((r) => setTimeout(r, 20));
+    // 排空每个任务的两条写盘链（meta 锁 + 事件追加链）再清目录——替换原来的 setTimeout(20)（时间裕量、不是同步点）。
+    // 路由里 fire-and-forget 的事件 / meta 写都排在这两条链上；交替两轮：锁里的写可能再排事件、反之亦然
+    // 带 3s 上限：万一哪个用例失败时把锁占住，清场不能卡死、更不能连累后面的用例（只是兜底，正常毫秒级完成；< vitest 默认 hookTimeout 10s）
+    await Promise.race([
+      (async () => {
+        for (let round = 0; round < 2; round++) {
+          for (const id of ids) {
+            await taskFsCore.withEventAppendChain(id, async () => undefined);
+            await taskFsCore.withTaskLock(id, async () => undefined);
+          }
+        }
+      })(),
+      new Promise<void>((r) => setTimeout(r, 3000)),
+    ]);
+    await Promise.all(pendingSidecarWrites);
     for (const id of ids) {
       await fs.rm(taskDir(id), { recursive: true, force: true }).catch(() => {});
     }

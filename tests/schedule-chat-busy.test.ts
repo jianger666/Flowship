@@ -213,6 +213,8 @@ describe("回归：定时触发遇到忙的 chat → 409 task_busy，不占用�
       const body = await jsonOf(res);
       expect(body.code).toBe("task_busy");
       expect(String(body.error)).toContain("稍后再送");
+      // 同上：队列非空 / 会话正在起也走这个 409，文案不能只说「在处理上一条消息」（第四轮评审）
+      expect(String(body.error)).toContain("正在启动");
       expect(getChatQueueCount(id), "定时消息不得占用户的队列名额").toBe(0);
       expect(h.writeUserEventAndPublishStrict, "没送进会话就不能写已发送的气泡").not.toHaveBeenCalled();
     },

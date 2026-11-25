@@ -6,16 +6,16 @@ import { describe, expect, it, vi } from "vitest";
 
 import { normalizeOpArgs } from "../electron-app/browser/index.mjs";
 import { createHandlers } from "../electron-app/browser/ops/permissions.mjs";
-import { createPermissionGate, getPermissionState } from "../electron-app/browser/permission-gate.mjs";
+import { MAX_RECENT_BLOCKED, createPermissionGate, getPermissionState } from "../electron-app/browser/permission-gate.mjs";
 import { MAX_GRANT_ENTRIES } from "../electron-app/browser/permission-policy.mjs";
 
 import { APP_ORIGIN, flush, makeEnv, type P1Config } from "./helpers/browser-e2-p1-fakes";
 
 const A = "https://a.example.com";
 
-const setup = async (cfg: Partial<P1Config> = {}, url = `${A}/page`) => {
+const setup = async (cfg: Partial<P1Config> = {}, url = `${A}/page`, gateExtra: Record<string, unknown> = {}) => {
   const env = makeEnv(cfg);
-  const gate = createPermissionGate({ findOwner: env.findOwner, getConfig: () => env.config, isAppUrl: env.isAppUrl, log: (m: string) => env.logs.push(m) });
+  const gate = createPermissionGate({ findOwner: env.findOwner, getConfig: () => env.config, isAppUrl: env.isAppUrl, log: (m: string) => env.logs.push(m), ...gateExtra });
   const tab = await env.openTab(url);
   gate.bindTab(tab);
   const scheduleState = vi.fn();
@@ -95,6 +95,206 @@ describe("list：总可用，只读", () => {
     s.config.pagePermissions = false;
     const r = (await s.call({ action: "list" })) as { grants: Array<{ active: boolean }> };
     expect(r.grants[0].active).toBe(false);
+  });
+
+  it("第二十一轮：list 带「最近被自动拒绝」清单（最新在前、最多 5 条、含固定文案 / 次数 / 几秒前）——页面要权限却没弹提示时 AI 据此排查", async () => {
+    const s = await setup();
+    expect(((await s.call({ action: "list" })) as { recentBlocked: unknown[] }).recentBlocked).toEqual([]);
+    getPermissionState(s.session).grants.deny(A, "microphone", "ai");
+    s.request("media", `${A}/page`, { mediaTypes: ["audio"] });
+    s.request("media", `${A}/page`, { mediaTypes: ["audio"] });
+    for (let i = 0; i < 6; i++) {
+      getPermissionState(s.session).grants.deny(`https://h${i}.example.com`, "geolocation", "ai");
+      s.request("geolocation", `https://h${i}.example.com/`);
+    }
+    const r = (await s.call({ action: "list" })) as { recentBlocked: Array<Record<string, unknown>> };
+    expect(r.recentBlocked).toHaveLength(5);
+    expect(r.recentBlocked[0]).toMatchObject({ origin: "https://h5.example.com", permission: "geolocation", reason: "explicit-deny-ai", count: 1 });
+    expect(r.recentBlocked[0].ageSec as number).toBeGreaterThanOrEqual(0);
+    expect(r.recentBlocked[0].ageSec as number).toBeLessThanOrEqual(5);
+    expect(typeof r.recentBlocked[0].reasonText).toBe("string");
+    expect(String(r.recentBlocked[0].reasonText)).toContain("拒绝");
+    // 内嵌框架来源另带 frameOrigin；顶层自己的请求没有这个字段
+    expect(r.recentBlocked[0]).not.toHaveProperty("frameOrigin");
+    expect(s.aiEntries()).toHaveLength(0); // list 只读，不写 AI 活动记录
+    const mic = (getPermissionState(s.session).recentBlocked as Array<Record<string, unknown>>).find((e) => e.permission === "microphone");
+    expect(mic).toMatchObject({ count: 2 });
+  });
+
+  it("第二十一轮：清单里的 ageSec 按「现在 − 记录时间」算（不是写死）；来自内嵌框架的请求带 frameOrigin（来源 = 顶层、frameOrigin = 嵌入页面）", async () => {
+    const s = await setup();
+    s.request("geolocation", "https://b.example.com/embed", { isMainFrame: false });
+    // 同一个会话 / gate，另起一份 handlers 把「现在」拨快 12 秒
+    const later = createHandlers({
+      requireSession: () => s.session,
+      getConfig: () => s.config,
+      electron: { isAppUrl: s.isAppUrl },
+      permissionGate: s.gate,
+      scheduleState: vi.fn(),
+      log: () => {},
+      now: () => Date.now() + 12_000,
+    });
+    const r = (await later.permissions("task-p1", normalizeOpArgs("permissions", { action: "list" }))) as { recentBlocked: Array<Record<string, unknown>> };
+    expect(r.recentBlocked).toHaveLength(1);
+    expect(r.recentBlocked[0]).toMatchObject({ origin: A, frameOrigin: "https://b.example.com", permission: "geolocation", reason: "cross-origin-frame" });
+    expect(r.recentBlocked[0].ageSec as number).toBeGreaterThanOrEqual(11);
+    expect(r.recentBlocked[0].ageSec as number).toBeLessThanOrEqual(13);
+  });
+
+  it("reset（不带 origin / permission）之后清单一并清空（授予 / 拒绝记录没了，原因就过期了）", async () => {
+    const s = await setup({ pagePermissions: true });
+    getPermissionState(s.session).grants.deny(A, "microphone", "ai");
+    s.request("media", `${A}/page`, { mediaTypes: ["audio"] });
+    expect(((await s.call({ action: "list" })) as { recentBlocked: unknown[] }).recentBlocked).toHaveLength(1);
+    await s.call({ action: "reset" });
+    expect(((await s.call({ action: "list" })) as { recentBlocked: unknown[] }).recentBlocked).toEqual([]);
+  });
+
+  it("R22-3：reset 带 origin / permission 时只清对应的几条（别的站点 / 别的权限的诊断仍有效）；media 合称与麦克风 / 摄像头互相算相关", async () => {
+    const H1 = "https://h1.example.com";
+    const H2 = "https://h2.example.com";
+    const seed = async () => {
+      const s = await setup({ pagePermissions: true });
+      const grants = getPermissionState(s.session).grants;
+      grants.deny(A, "microphone", "ai");
+      grants.deny(A, "camera", "ai");
+      grants.deny(H1, "geolocation", "ai");
+      grants.deny(H2, "microphone", "ai");
+      s.request("media", `${A}/page`, { mediaTypes: ["audio"] });
+      s.request("media", `${A}/page`, { mediaTypes: ["video"] });
+      s.request("geolocation", `${H1}/`);
+      s.request("media", `${H2}/`, { mediaTypes: ["audio"] });
+      return s;
+    };
+    const pairs = async (s: Awaited<ReturnType<typeof setup>>) =>
+      ((await s.call({ action: "list" })) as { recentBlocked: Array<{ origin: string; permission: string }> }).recentBlocked.map((e) => `${e.origin.replace("https://", "")}|${e.permission}`).sort();
+
+    const a = await seed();
+    expect(await pairs(a)).toEqual(["a.example.com|camera", "a.example.com|microphone", "h1.example.com|geolocation", "h2.example.com|microphone"]);
+    await a.call({ action: "reset", origin: A, permission: "microphone" });
+    expect(await pairs(a)).toEqual(["a.example.com|camera", "h1.example.com|geolocation", "h2.example.com|microphone"]);
+
+    const b = await seed();
+    await b.call({ action: "reset", origin: A }); // 只给 origin：该站点的都清，别的站点留着
+    expect(await pairs(b)).toEqual(["h1.example.com|geolocation", "h2.example.com|microphone"]);
+
+    const c = await seed();
+    await c.call({ action: "reset", permission: "media" }); // 只给 permission（media = 麦克风 + 摄像头）：所有站点的麦克风 / 摄像头清，定位留着
+    expect(await pairs(c)).toEqual(["h1.example.com|geolocation"]);
+
+    const d = await seed();
+    await d.call({ action: "reset", permission: "geolocation" });
+    expect(await pairs(d)).toEqual(["a.example.com|camera", "a.example.com|microphone", "h2.example.com|microphone"]);
+
+    // 合称 media 的那条记录（麦克风 + 摄像头一起请求时记的）：重置其中任意一项都算相关
+    const e = await setup({ pagePermissions: true });
+    getPermissionState(e.session).grants.deny(A, "microphone", "ai");
+    getPermissionState(e.session).grants.deny(A, "camera", "ai");
+    e.request("media", `${A}/page`, { mediaTypes: ["audio", "video"] });
+    expect(await pairs(e)).toEqual(["a.example.com|media"]);
+    await e.call({ action: "reset", permission: "camera" });
+    expect(await pairs(e)).toEqual([]);
+  });
+
+  it("R22-3：清单按目标标签的 partition 分开（与授予表同口径）：普通标签的 list 看不到无痕标签上被拒的来源，反之亦然；总数也只算同一份", async () => {
+    const s = await setup({ pagePermissions: true });
+    const H = "https://incog.example.com";
+    getPermissionState(s.session).grants.deny(A, "microphone", "ai");
+    s.request("media", `${A}/page`, { mediaTypes: ["audio"] }); // 普通标签
+    s.tab.incognito = true;
+    getPermissionState(s.session).incognitoGrants.deny(H, "geolocation", "ai");
+    s.request("geolocation", `${H}/`); // 无痕标签
+    const incog = (await s.call({ action: "list" })) as { recentBlocked: Array<{ origin: string }>; recentBlockedTotal: number };
+    expect(incog.recentBlocked.map((e) => e.origin)).toEqual([H]);
+    expect(incog.recentBlockedTotal).toBe(1);
+    s.tab.incognito = false;
+    const normal = (await s.call({ action: "list" })) as { recentBlocked: Array<{ origin: string }>; recentBlockedTotal: number };
+    expect(normal.recentBlocked.map((e) => e.origin)).toEqual([A]);
+    expect(normal.recentBlockedTotal).toBe(1);
+    // 无痕 partition 被 wipe（最后一个无痕标签关闭）：无痕那条作废，普通那条还在
+    s.tab.incognito = true;
+    getPermissionState(s.session).onPartitionWiped("flowship-incognito-1");
+    expect(((await s.call({ action: "list" })) as { recentBlocked: unknown[] }).recentBlocked).toEqual([]);
+    s.tab.incognito = false;
+    expect(((await s.call({ action: "list" })) as { recentBlocked: unknown[] }).recentBlocked).toHaveLength(1);
+  });
+
+  it("R22-3：清单被截断时回总数 recentBlockedTotal（只列最近 5 条，总数照实）", async () => {
+    const s = await setup();
+    for (let i = 0; i < 8; i++) {
+      getPermissionState(s.session).grants.deny(`https://t${i}.example.com`, "geolocation", "ai");
+      s.request("geolocation", `https://t${i}.example.com/`);
+    }
+    const r = (await s.call({ action: "list" })) as { recentBlocked: unknown[]; recentBlockedTotal: number };
+    expect(r.recentBlocked).toHaveLength(5);
+    expect(r.recentBlockedTotal).toBe(8);
+    const empty = (await (await setup()).call({ action: "list" })) as { recentBlockedTotal: number };
+    expect(empty.recentBlockedTotal).toBe(0);
+  });
+
+  it("R23-6：同 partition 的记录到 MAX_RECENT_BLOCKED 上限（更早的已被挤掉）时带 recentBlockedAtLeast，总数只是下限；没到上限不带；两个 partition 各算各的", async () => {
+    const s = await setup({ pagePermissions: true });
+    const deny = (incognito: boolean, host: string) => {
+      s.tab.incognito = incognito;
+      getPermissionState(s.session)[incognito ? "incognitoGrants" : "grants"].deny(`https://${host}`, "geolocation", "ai");
+      s.request("geolocation", `https://${host}/`);
+      s.tab.incognito = false;
+    };
+    for (let i = 0; i < MAX_RECENT_BLOCKED - 1; i++) deny(false, `n${i}.example.com`);
+    const below = (await s.call({ action: "list" })) as { recentBlockedTotal: number };
+    expect(below.recentBlockedTotal).toBe(MAX_RECENT_BLOCKED - 1);
+    expect(below).not.toHaveProperty("recentBlockedAtLeast");
+    deny(false, "n-last.example.com"); // 刚好到上限
+    const at = (await s.call({ action: "list" })) as { recentBlockedTotal: number; recentBlockedAtLeast?: boolean };
+    expect(at.recentBlockedTotal).toBe(MAX_RECENT_BLOCKED);
+    expect(at.recentBlockedAtLeast).toBe(true);
+    // 普通 partition 满了不影响无痕那一份的判断
+    deny(true, "private.example.com");
+    s.tab.incognito = true;
+    const incog = (await s.call({ action: "list" })) as { recentBlockedTotal: number };
+    expect(incog.recentBlockedTotal).toBe(1);
+    expect(incog).not.toHaveProperty("recentBlockedAtLeast");
+  });
+
+  it("R23-3：页内查询桩没装上时 list 带 queryStub.problems（scope + message，不带页面内容）；装上 / 没问题时不带这个字段", async () => {
+    const s = await setup();
+    expect(await s.call({ action: "list" })).not.toHaveProperty("queryStub");
+    s.tab.sendImpl = async (method) => {
+      if (method === "Page.addScriptToEvaluateOnNewDocument") throw new Error("cdp gone");
+      return {};
+    };
+    s.tab.attachChild("child-1");
+    const hook = [...s.tab.earlySessionHooks][0];
+    await hook(null);
+    await hook("child-1");
+    const r = (await s.call({ action: "list" })) as { queryStub?: { problems: Array<{ scope: string; message: string }> } };
+    expect(r.queryStub).toEqual({
+      problems: [
+        { scope: "main", message: "cdp gone" },
+        { scope: "frame", message: "cdp gone" },
+      ],
+    });
+    // 目标 tab 不存在 / 老版本 gate 没有该方法：不带、不崩
+    expect(await s.call({ action: "list", tabId: "t99" })).not.toHaveProperty("queryStub");
+    s.tab.sendImpl = async () => ({});
+    await hook(null);
+    await hook("child-1");
+    expect(await s.call({ action: "list" })).not.toHaveProperty("queryStub");
+  });
+
+  it("R22-3：系统层挡住麦克风 / 摄像头时 list 带 systemMedia（AI 点了授予页面仍无声时能直接看到这一层）；没问题时不带这个字段", async () => {
+    const blocked = await setup({}, `${A}/page`, { getMediaAccessStatus: (k: string) => (k === "microphone" ? "denied" : "restricted"), platform: "darwin" });
+    const r = (await blocked.call({ action: "list" })) as { systemMedia?: { platform: string; problems: Array<{ permission: string; status: string }> } };
+    expect(r.systemMedia).toEqual({
+      platform: "darwin",
+      problems: [
+        { permission: "microphone", status: "denied" },
+        { permission: "camera", status: "restricted" },
+      ],
+    });
+    const fine = await setup({}, `${A}/page`, { getMediaAccessStatus: () => "granted", platform: "darwin" });
+    expect(await fine.call({ action: "list" })).not.toHaveProperty("systemMedia");
+    expect(await (await setup()).call({ action: "list" })).not.toHaveProperty("systemMedia");
   });
 });
 
@@ -267,19 +467,51 @@ describe("grant / deny / reset", () => {
     expect(s.aiEntries()[0].summary).toContain("拒绝了");
   });
 
-  it("reset：按 origin / permission / 全部清；返回清掉的条数；写日志；同时清冷却", async () => {
+  it("reset：按 origin / permission / 全部清；返回清掉的条数；写日志；冷却只清范围内匹配的那些（R23-6：此前带范围的 reset 也会清空整张冷却表）", async () => {
     const s = await setup({ pagePermissions: true });
     await s.call({ action: "grant", permission: "geolocation" });
     await s.call({ action: "grant", permission: "notifications" });
     await s.call({ action: "grant", permission: "geolocation", origin: "https://b.example.com" });
-    getPermissionState(s.session).cooldown.set("k", Date.now() + 60_000);
+    const state = getPermissionState(s.session);
+    const until = Date.now() + 60_000;
+    const key = (origin: string, perm: string) => `${s.tab.id}|${origin}|${perm}`;
+    const B = "https://b.example.com";
+    for (const k of [key(A, "geolocation"), key(A, "notifications"), key(B, "geolocation")]) state.cooldown.set(k, until);
+    state.cancelCooldown.set(key(A, "geolocation"), until);
+    state.cancelStreak.set(key(B, "geolocation"), { n: 2, at: Date.now() });
+    const cooling = () => [...state.cooldown.keys()].map((k) => k.slice(s.tab.id.length + 1));
     expect(await s.call({ action: "reset", permission: "geolocation", origin: A })).toMatchObject({ cleared: 1, origin: A, permission: "geolocation" });
+    // 只清 A + geolocation 的那一条（含短冷却）；A 的通知、B 的定位冷却 / 取消计数都还在——页面行为与 list 的诊断记录保持一致
+    expect(cooling()).toEqual([`${A}|notifications`, `${B}|geolocation`]);
+    expect(state.cancelCooldown.size).toBe(0);
+    expect(state.cancelStreak.size).toBe(1);
     expect(await s.call({ action: "reset", origin: A })).toMatchObject({ cleared: 1 });
-    expect(getPermissionState(s.session).cooldown.size).toBe(0);
+    expect(cooling()).toEqual([`${B}|geolocation`]);
     expect(await s.call({ action: "reset" })).toMatchObject({ cleared: 1 });
+    expect(cooling()).toEqual([]);
+    expect(state.cancelStreak.size).toBe(0);
     expect(getPermissionState(s.session).grants.size).toBe(0);
     const resets = s.aiEntries().filter((e) => e.summary.includes("重置"));
     expect(resets).toHaveLength(3);
+  });
+
+  it("reset media（合称）展开成麦克风 + 摄像头两项：两项的冷却与取消计数都清；别的权限不动；只 reset 麦克风时摄像头的不动（R23-6；冷却类三张表的键都是独立权限名，门不产生合称 media 的键）", async () => {
+    const s = await setup({ pagePermissions: true });
+    const state = getPermissionState(s.session);
+    const until = Date.now() + 60_000;
+    const key = (perm: string) => `${s.tab.id}|${A}|${perm}`;
+    for (const p of ["microphone", "camera", "geolocation"]) state.cooldown.set(key(p), until);
+    for (const p of ["microphone", "camera"]) state.cancelStreak.set(key(p), { n: 1, at: Date.now() });
+    state.cancelCooldown.set(key("camera"), until);
+    await s.call({ action: "reset", permission: "media", origin: A });
+    expect([...state.cooldown.keys()].map((k) => k.split("|").pop())).toEqual(["geolocation"]);
+    expect(state.cancelStreak.size).toBe(0);
+    expect(state.cancelCooldown.size).toBe(0);
+    // 只 reset 麦克风：摄像头键不动
+    state.cooldown.clear();
+    for (const p of ["microphone", "camera"]) state.cooldown.set(key(p), until);
+    await s.call({ action: "reset", permission: "microphone", origin: A });
+    expect([...state.cooldown.keys()].map((k) => k.split("|").pop())).toEqual(["camera"]);
   });
 
   it("所有改动类动作都写 actor:ai 的活动日志（grant / deny / reset 各一条）", async () => {

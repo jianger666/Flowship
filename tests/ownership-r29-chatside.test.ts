@@ -150,16 +150,44 @@ const installHangingFailpoint = (name: string) => {
   return { waitHit: () => hit, release: () => release() };
 };
 
-/** 等 runActive / 会话就位 */
-const waitUntilActive = async (ms = 1600): Promise<void> => {
+// 等「状态落定」的统一预算：只是失败兜底上限——条件一成立马上返回，不是固定要等这么久。
+// 旧写法是手写的 40×20ms≈0.8s 轮询，全量并行 / CI 负载下不够。
+// （⑥ 红过的真因不是这个上限，而是 6a 遗留的 fire-and-forget 读改写覆盖了测试的裸 writeMeta，见下面 settleTaskWrites）
+const STATE_WAIT = { timeout: 10_000, interval: 20 } as const;
+
+/**
+ * 排空该任务的两条写盘链（事件追加链 + meta 锁）：此前遗留的 fire-and-forget 读改写
+ * （syncTaskPendingAskId / appendEvent 里 updatedAt 的 touch / 条件清锚点 …）都排在这两条链上。
+ *
+ * 为什么需要：这些读改写在锁里「读 meta → 改一个字段 → 整份写回」，而测试里直接 writeMeta 播种状态是**不进锁**的——
+ * 播种落在它们「读」与「写」之间，就会被它们读到的旧快照整份覆盖（锚点没了、runStatus 回到 running）。
+ * 实测（高负载下 ⑥ 约 1/7 复现，meta.json 的 rename 轨迹逐条对上）：测试写 B/idle 后 1ms，appendEvent 的 touch 把旧快照写了回去；
+ * 导致 resumeChatSession 拿到无锚点的任务返回 null，或迟到的 writeMeta(running) 提前触发间谍里的 cancelChatRun。
+ * 交替两轮：锁里的写可能再排事件、反之亦然。
+ */
+const settleTaskWrites = async (): Promise<void> => {
+  // 带 3s 上限：万一哪个用例失败时没放行 failpoint、把锁占住，清场不能卡死、更不能连累后面的用例（只是兜底，正常毫秒级完成；< vitest 默认 hookTimeout 10s）
+  await Promise.race([
+    (async () => {
+      for (let round = 0; round < 2; round++) {
+        await taskFsCore.withEventAppendChain(TASK_ID, async () => undefined);
+        await taskFsCore.withTaskLock(TASK_ID, async () => undefined);
+      }
+    })(),
+    new Promise<void>((r) => setTimeout(r, 3000)),
+  ]);
+};
+
+/** 等 runActive / 会话就位（上限同 STATE_WAIT：只是失败兜底，条件成立即返回） */
+const waitUntilActive = async (ms = 10_000): Promise<void> => {
   for (let i = 0; i < ms / 20; i++) {
     if (isChatRunActive(TASK_ID)) return;
     await new Promise((r) => setTimeout(r, 20));
   }
 };
 
-/** 等 chat notifier + caller token 注册完（晚于占位 runActive） */
-const waitUntilCallerToken = async (ms = 3000): Promise<string> => {
+/** 等 chat notifier + caller token 注册完（晚于占位 runActive）；上限同上 */
+const waitUntilCallerToken = async (ms = 10_000): Promise<string> => {
   for (let i = 0; i < ms / 20; i++) {
     const t = getExpectedCallerToken(TASK_ID);
     if (t) return t;
@@ -174,7 +202,9 @@ beforeEach(async () => {
   clearFailpoints();
   closeChatSessionUnconditional(TASK_ID);
   clearChatGate(TASK_ID);
-  await new Promise((r) => setTimeout(r, 30));
+  // 排空上一条用例遗留的写盘链再清目录（替换原来的 sleep(30)：时间裕量不是同步点；
+  // 否则迟到的事件追加 / meta 读改写会落进刚重建的任务目录，污染下一条用例的状态）
+  await settleTaskWrites();
   await fs.rm(taskDir(TASK_ID), { recursive: true, force: true }).catch(() => {});
   await writeMeta(makeMeta(TASK_ID));
   await fs.writeFile(
@@ -192,12 +222,14 @@ afterEach(async () => {
   forceClearChatRun(TASK_ID);
   closeChatSessionUnconditional(TASK_ID);
   clearChatGate(TASK_ID);
-  await new Promise((r) => setTimeout(r, 50));
+  // 排空写盘链（替换原来的 sleep(50)）
+  await settleTaskWrites();
 });
 
 afterAll(async () => {
   closeChatSessionUnconditional(TASK_ID);
-  await new Promise((r) => setTimeout(r, 50));
+  // 排空写盘链再删整个临时根（替换原来的 sleep(50)）
+  await settleTaskWrites();
   await fs.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 
@@ -499,28 +531,25 @@ describe("R29 chat 旁路共享写", () => {
         ],
       });
       expect(askOk).toMatchObject({ ok: true });
-      for (let i = 0; i < 40; i++) {
-        if (getPendingAsk(TASK_ID)) break;
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      expect(getPendingAsk(TASK_ID)).toBeTruthy();
+      await vi.waitFor(() => expect(getPendingAsk(TASK_ID)).toBeTruthy(), STATE_WAIT);
       expect((await readMetaV06(TASK_ID))?.runStatus).toBe("running");
 
       // 6b：关会话清锚点（持槽 close → 条件清匹配本 agentId）
       forceClearChatRun(TASK_ID);
-      for (let i = 0; i < 40; i++) {
-        const m = await readMetaV06(TASK_ID);
-        if (!m?.sessionAgentId) break;
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      expect((await readMetaV06(TASK_ID))?.sessionAgentId).toBeUndefined();
+      await vi.waitFor(async () => {
+        expect((await readMetaV06(TASK_ID))?.sessionAgentId).toBeUndefined();
+      }, STATE_WAIT);
       // 锚点被清只是 forceClear 收尾里的一步：等内存会话与启动预约也摘干净再进 6c。
       // 否则马上 resume 会被 resumeChatSession 入口的 runningChats / 预约检查挡回 null
       // （v1.9.38 发版门禁在 Linux CI 上红过一次：下面 expect(ownerId).not.toBeNull()；本机连跑 12 次复现不了，根因没确证）。
-      for (let i = 0; i < 50; i++) {
-        if (!hasChatSession(TASK_ID) && !hasChatStartReservation(TASK_ID)) break;
-        await new Promise((r) => setTimeout(r, 20));
-      }
+      await vi.waitFor(() => {
+        expect(hasChatSession(TASK_ID)).toBe(false);
+        expect(hasChatStartReservation(TASK_ID)).toBe(false);
+      }, STATE_WAIT);
+      // 上面两个等待在高负载下常常是空转（锚点还没落盘、forceClear 后内存会话立刻就空）——它们不是真同步点。
+      // 真同步点：把 6a / 6b 遗留的 fire-and-forget 读改写（ask 同步、updatedAt touch、条件清锚点）全部排空，
+      // 再用裸 writeMeta 播种 6c 的状态；否则播种会被它们读到的旧快照整份覆盖（见 settleTaskWrites）
+      await settleTaskWrites();
 
       // 6c：send 失主回滚——stop 后 map 空应落 idle（对齐既有 resume-owner 口径）
       mockResume.mockResolvedValue({
@@ -532,12 +561,15 @@ describe("R29 chat 旁路共享写", () => {
           cancel: vi.fn().mockResolvedValue(undefined),
         }),
       });
-      await writeMeta(
-        makeMeta(TASK_ID, {
-          sessionAgentId: AGENT_B,
-          runStatus: "idle",
-        }),
-      );
+      // 播种写进 meta 锁：与其它读改写串行，不会落在别人「读 → 写」的夹缝里
+      await taskFsCore.withTaskLock(TASK_ID, async () => {
+        await writeMeta(
+          makeMeta(TASK_ID, {
+            sessionAgentId: AGENT_B,
+            runStatus: "idle",
+          }),
+        );
+      });
       const ownerId = await resumeChatSession(
         asTask((await readMetaV06(TASK_ID))!),
         BOOT,
@@ -573,12 +605,9 @@ describe("R29 chat 旁路共享写", () => {
         { ownerInstanceId: ownerId! },
       );
       expect(sent).toBe("cancelled");
-      for (let i = 0; i < 40; i++) {
-        const m = await readMetaV06(TASK_ID);
-        if (m?.runStatus === "idle") break;
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      expect((await readMetaV06(TASK_ID))?.runStatus).toBe("idle");
+      await vi.waitFor(async () => {
+        expect((await readMetaV06(TASK_ID))?.runStatus).toBe("idle");
+      }, STATE_WAIT);
     },
     25_000,
   );

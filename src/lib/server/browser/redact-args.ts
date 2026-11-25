@@ -11,6 +11,7 @@
  *   `browser_dialog.prompt_text`、`browser_storage.value`（E2·A1：cookie / web storage 的值）、
  *   `browser_press_key` 的「会打出可见字符」的按键 → `[已隐藏 N 字符]`（N = 码点数）。
  *   不动 ref / submit / checked / values（下拉项）这类结构信息，所以摘要与工具块仍然可读。
+ *   电脑操作（desktop_*）走同一套：`desktop_type.text`、`desktop_key` 里会打出字符的按键（`keys` / `key` 都盖）。
  * - 空串不隐藏：`text:""` 是「清空输入框」，没有信息量，展示端要靠它显示「清空」。
  * - 幂等：已经是占位符的值不会被再包一层（`[已隐藏 5 字符]` 不会变成 `[已隐藏 11 字符]`）。
  * - 不改入参对象：有改动时返回浅拷贝，没改动返回原引用（工具真实执行用的 args 一个字不动）。
@@ -23,6 +24,15 @@
  */
 
 const BROWSER_PREFIX = "browser_";
+/**
+ * 电脑操作（desktop_*）工具同样要脱敏：`desktop_type.text`（往任意应用里打的字，含密码）、`desktop_key` 里会打出字符的按键。
+ * 复用同一套入口 / 占位符 / 外壳识别，免得再平行写一份。
+ */
+const DESKTOP_PREFIX = "desktop_";
+
+/** 是不是要走本文件脱敏的工具名（browser_* 或 desktop_*；入参已小写） */
+const isGuardedToolName = (lowerName: string): boolean =>
+  lowerName.startsWith(BROWSER_PREFIX) || lowerName.startsWith(DESKTOP_PREFIX);
 
 /** 占位符：`[已隐藏 N 字符]` */
 export const hiddenCharsText = (n: number): string => `[已隐藏 ${n} 字符]`;
@@ -60,6 +70,9 @@ const SECRET_BEARING_TOOLS: ReadonlySet<string> = new Set([
   "browser_network_rules",
   // E2·C4：write 的 text 是模型要放进用户剪贴板的内容（可能含口令 / 令牌），落盘前藏起来
   "browser_clipboard",
+  // 电脑操作：text 是打进任意应用的文字（可能是密码 / 验证码）；keys 里的单字符键同理
+  "desktop_type",
+  "desktop_key",
 ]);
 
 const hide = (v: unknown): unknown => {
@@ -112,6 +125,29 @@ export const keyTypesCharacter = (rawKey: string): boolean => {
   const mods = parts.filter((p) => p !== "");
   if (mods.length === 0 || codePointCount(last) !== 1) return false;
   return isPrintingCombo(mods);
+};
+
+/**
+ * 电脑操作的组合键写法里，「字符本身」的命名写法（electron-app/desktop/keys.mjs：`+` `-` 空格必须写成 plus / minus / space；
+ * `spacebar` 是主进程认的 space 别名——这里不认的话，`desktop_key("spacebar")` 就会漏藏）。
+ * 与 keys.mjs 的 KEY_ALIASES 对照由 tests/desktop-redact-display.test.ts 钉死。
+ */
+const DESKTOP_NAMED_CHAR_KEYS: ReadonlySet<string> = new Set(["plus", "minus", "space", "spacebar"]);
+
+/**
+ * desktop_key 的 keys 是否会打出一个可见字符：在 {@link keyTypesCharacter}（单字符、Shift / Alt / AltGr + 单字符）之外，
+ * 再认 plus / minus / space 这三个命名写法（`shift+plus` 同理），以及 `opt` 这个 alt 别名。
+ * 导出给 desktop/tools.ts 的结果文案共用：入参里隐藏了，回显也必须隐藏，两处不能各写一份。
+ * `cmd+plus`（放大）这类带「非打字修饰键」的组合不算——它是快捷键，不是在打字。
+ */
+export const desktopKeyTypesCharacter = (rawKey: string): boolean => {
+  const aliased = rawKey.replace(/(^|\+)\s*opt\s*(?=\+)/gi, "$1alt");
+  if (keyTypesCharacter(aliased)) return true;
+  const parts = aliased.trim().toLowerCase().split("+").map((p) => p.trim());
+  const last = parts.pop() ?? "";
+  if (!DESKTOP_NAMED_CHAR_KEYS.has(last)) return false;
+  const mods = parts.filter((p) => p !== "");
+  return mods.length === 0 || isPrintingCombo(mods);
 };
 
 // ----------------- 各工具的入参脱敏 -----------------
@@ -222,6 +258,19 @@ const redactFlatArgs = (tool: string, args: Record<string, unknown>): Record<str
       if ("text" in args) patch.text = hide(args.text);
       break;
     }
+    case "desktop_type": {
+      // text 是打进任意应用的文字；submit 等结构信息保留，折叠行仍可读
+      if ("text" in args) patch.text = hide(args.text);
+      break;
+    }
+    case "desktop_key": {
+      // 参数名正式叫 keys，工具也容忍写成 key（browser_press_key 的习惯）——两个都要盖到
+      for (const field of ["keys", "key"] as const) {
+        const v = args[field];
+        if (typeof v === "string" && desktopKeyTypesCharacter(v)) patch[field] = hiddenCharsText(1);
+      }
+      break;
+    }
     default:
       return args;
   }
@@ -256,16 +305,16 @@ const resolveBrowserTool = (
 ): { tool: string; wrapped: boolean } | null => {
   const n = typeof name === "string" ? name : "";
   const lower = n.toLowerCase();
-  if (lower.startsWith(BROWSER_PREFIX)) return { tool: lower, wrapped: false };
+  if (isGuardedToolName(lower)) return { tool: lower, wrapped: false };
   const wrapperTool =
-    isRecord(args) && typeof args.toolName === "string" && args.toolName.toLowerCase().startsWith(BROWSER_PREFIX)
+    isRecord(args) && typeof args.toolName === "string" && isGuardedToolName(args.toolName.toLowerCase())
       ? args.toolName.toLowerCase()
       : null;
   if (lower === "mcp") return wrapperTool ? { tool: wrapperTool, wrapped: true } : null;
   if (lower.startsWith("mcp:")) {
     // 归一化展示名 mcp:<server>:<tool>（tool 里的 : 被转义成 %3A，所以最后一个 : 之后就是工具名）
     const tail = lower.slice(lower.lastIndexOf(":") + 1);
-    if (!tail.startsWith(BROWSER_PREFIX)) return null;
+    if (!isGuardedToolName(tail)) return null;
     return { tool: tail, wrapped: wrapperTool !== null && isRecord(args) && "args" in args };
   }
   return null;

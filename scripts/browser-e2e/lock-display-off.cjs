@@ -43,8 +43,10 @@ const finish = (code) => {
   const failed = results.filter((r) => !r.ok);
   console.log(`E2E DONE ${results.length - failed.length}/${results.length} passed`);
   try {
-    fs.rmSync(TMP, { recursive: true, force: true });
-  } catch {}
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
   app.exit(code ?? (failed.length ? 1 : 0));
 };
 

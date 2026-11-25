@@ -398,6 +398,18 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
     expect(prompt).not.toContain("submit_work");
     expect(prompt).not.toContain("submit_mr");
 
+    // 旁路是「没有进行中的会话、又没接回来」时的只读通道——prompt 要把这点说清（只讲事实、不提开关：模型看不到开关状态），
+    // 否则模型只能瞎猜拒绝的理由（2026-11-19 玉灵：机器人答「得先让她确认限制开关关了没有」）。
+    // 开关关着时休眠会话会先被群入向接回来（tests/group-wake-session.test.ts），所以这句**不得**再断言「开关对这一路无效」。
+    // 指引只能是「请任务属主本人处理」：不教「请所有者说句话把会话唤醒再来 @ 我」——开关开着（默认）时会话醒了非属主也不能动手，
+    // 那句话是错指引（评审）。
+    // 注意措辞也受上面那一串「不得出现」的约束（没有放行措辞 / 没有 shell 用法）
+    expect(prompt).toContain("任务此刻没有进行中的会话");
+    expect(prompt).toContain("请任务属主本人处理");
+    expect(prompt).not.toContain("把会话唤醒");
+    expect(prompt).not.toContain("不受设置里任何开关影响");
+    expect(prompt).not.toContain("别拿开关当理由");
+
     // 「# 边界」必须是最后一段：约束后面不许再跟任何别的指令段
     const boundaryAt = prompt.lastIndexOf("\n# 边界");
     expect(boundaryAt).toBeGreaterThan(prompt.lastIndexOf("\n# 对方的话"));
@@ -857,6 +869,11 @@ describe("需求群非属主受限答疑（与 task 运行状态机解耦）", (
       expect(boundary).not.toContain("glob");
       expect(boundary).toContain("答完自然结束回复");
       expect(boundary).toContain("不替属主拍板");
+      // 「没有会话时只读 + 请属主本人处理」说明在「边界」里（带群上下文的版本同样要有）
+      expect(boundary).toContain("任务此刻没有进行中的会话");
+      expect(boundary).toContain("请任务属主本人处理");
+      expect(boundary).not.toContain("把会话唤醒");
+      expect(boundary).not.toContain("不受设置里任何开关影响");
       // 回复协议已下线：旧的「需属主确认」标记不再教给 agent
       expect(prompt).not.toContain("需属主确认");
     });

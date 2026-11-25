@@ -110,7 +110,7 @@ describe("一行能做什么：来源矩阵（客户端按钮显隐与服务端�
   });
 });
 
-describe("暂存（held）行：立即发送窗口内照常显示但不可操作（第十七轮 N1）", () => {
+describe("暂存（held）行：立即发送窗口内照常显示但不可操作（task-talk-queue 评审系列 N1）", () => {
   const panel = source("src/components/tasks/queue-banner.tsx");
   const talk = source("src/components/tasks/talk-queue-banner.tsx");
 

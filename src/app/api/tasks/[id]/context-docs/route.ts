@@ -19,14 +19,16 @@
  *   - 都有：加 1 条主条目 + N 条 image doc（image 标题前缀复用主条目 title）
  *
  * 返回最新 task（含完整 contextDocs）。
+ * 例外：文档已写进 meta、但读回最新任务视图失败时，回 201 `{ ok: true, committed: true, warning }`（没有 task），
+ * 调用方要按「已添加、请刷新确认」处理，别当失败重试。
  *
  * 不做的事：
  *   - 不主动改 task.status（用户加上下文不算业务进展、但会 bump updatedAt）
  *   - 不通知 agent run（节奏同步问题暂时由 UI 提示「下次启动 / revise 时生效」处理）
  */
 
-import { addContextDoc } from "@/lib/server/task-fs";
-import { saveImageAttachments } from "@/lib/server/task-artifacts";
+import { addContextDoc, isContextDocCommittedError } from "@/lib/server/task-fs";
+import { discardSavedImages, saveImageAttachments } from "@/lib/server/task-artifacts";
 import { parseAndValidateImages } from "@/lib/server/route-helpers";
 import type { AddContextDocInput } from "@/lib/types";
 
@@ -80,9 +82,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("至少填一个：title+content 主条目 或 贴图");
   }
 
+  // 图片先落盘（拿绝对路径）、文档再写进 meta：中间任何一步失败（所有者备注超限等校验在 addContextDoc 的锁内、读到最新文档之后才做，
+  // 预检挡不住并发写入；写 meta 失败；任务刚好被删），已落盘的图片没人引用了，必须收回——否则每次被拒的「备注 + 贴图」都在 uploads/ 里留一批孤儿图片
+  // （第三轮评审：以前这里先落盘再校验，超限就留孤儿）
+  let imagePaths: string[] | undefined;
   try {
-    // 落盘图片（拿绝对路径）
-    let imagePaths: string[] | undefined;
     if (images.length > 0) {
       const saved = await saveImageAttachments(id, images);
       imagePaths = saved.map((s) => s.absPath);
@@ -92,13 +96,28 @@ export const POST = async (req: Request, { params }: Ctx) => {
       mainDoc: hasMain ? { title, content } : undefined,
       imagePaths,
     });
-    if (!updated) return errorResponse("not_found", 404);
+    if (!updated) {
+      await discardSavedImages(id, imagePaths);
+      return errorResponse("not_found", 404);
+    }
     return new Response(JSON.stringify({ ok: true, task: updated }), {
       status: 201,
       headers: { "Content-Type": "application/json" },
     });
   } catch (err) {
+    // 文档已经写进 meta、只是读回最新任务视图失败：图片已被文档引用，这时回收就留下悬空引用（第四轮评审 P2）。
+    // 只回收「没加上」的那种失败（校验被拒 / 写 meta 失败 / 任务没了）
+    const committed = isContextDocCommittedError(err);
     const msg = err instanceof Error ? err.message : String(err);
+    if (committed) {
+      // 已生效的失败：文档已经落盘、请求本身成功了，只是没法回最新任务视图（所以没有 task）。
+      // 回 201 + warning 而不是 500：500 会让前端当成「没加上」弹错误、不清表单，用户再点一次就重复添加（第五轮评审 N3）
+      return new Response(JSON.stringify({ ok: true, committed: true, warning: msg }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    await discardSavedImages(id, imagePaths);
     return errorResponse(msg, 400);
   }
 };

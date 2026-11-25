@@ -105,7 +105,9 @@ export const ChoiceButton = ({
   disabled,
   ...rest
 }: ChoiceButtonProps) => {
-  const locked = Boolean(disabled) || useFormDisabled();
+  // hook 无条件调用（短路 `|| useFormDisabled()` 会让调用顺序随 disabled 变化，S-7）
+  const formDisabled = useFormDisabled();
+  const locked = Boolean(disabled) || formDisabled;
   return (
     <button
       type={type}

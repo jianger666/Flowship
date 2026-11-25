@@ -10,6 +10,13 @@
  *
  * 写盘不用 writeMeta：task-fs-core 的 DATA_DIR 在模块加载时冻结，
  * 测试 / 动态 FLOWSHIP_DATA_DIR 场景会写错目录；这里全程走运行时 dataRoot()。
+ *
+ * 并发（第五轮评审 P2）：本迁移由 boot-warmup 在 server 就绪后后台触发，此时用户已经可以操作任务，
+ * 而「读 meta → 改 → 整份写回」不加锁的话，会拿读到的旧快照盖掉这期间别人（withTaskLock 里的写者）
+ * 刚写的字段（runStatus / actions / updatedAt …）。所以：
+ * - 先无锁预检（绝大多数任务没有残留：不拿锁、不和任何人排队）；
+ * - 确实要改的任务才进 withTaskLock，并在锁内**重读、重判**后再写——别的写者在预检之后改过的东西都保留。
+ * 这里没有外层锁（warmup 顶层直接调用），withTaskLock 不可重入但不会因此死锁。
  */
 
 import { promises as fs } from "node:fs";
@@ -19,6 +26,7 @@ import { dataRoot, stripBom, writePrivateFileAtomic } from "./data-root";
 import {
   isValidMetaShape,
   META_FILE,
+  withTaskLock,
   type TaskMetaV06,
 } from "./task-fs-core";
 
@@ -54,6 +62,46 @@ export const pruneUsernameBranchTemplates = (
 };
 
 /**
+ * 读一个任务的 meta、判断要不要迁移。
+ * @returns 要迁移 → 读到的 meta + 清洗后的模板；不用迁移 / 读不了 / 不是 task 目录 → null（读失败、损坏会 warn，不抛）
+ */
+const inspectMeta = async (
+  metaPath: string,
+  id: string,
+): Promise<{ meta: TaskMetaV06; next: Record<string, string> | undefined } | null> => {
+  let rawText: string;
+  try {
+    rawText = await fs.readFile(metaPath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null; // 非 task 目录 / 无 meta
+    console.warn(
+      `[migrate-username] 读 meta 失败 taskId=${id}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripBom(rawText));
+  } catch {
+    console.warn(`[migrate-username] meta JSON 损坏、跳过 taskId=${id}`);
+    return null;
+  }
+  if (!isValidMetaShape(parsed)) {
+    // V0.5 残留等——不硬改
+    return null;
+  }
+
+  const meta = parsed as TaskMetaV06;
+  const { changed, next } = pruneUsernameBranchTemplates(
+    meta.repoBranchTemplates,
+  );
+  return changed ? { meta, next } : null;
+};
+
+/**
  * 扫 data/tasks 下各任务 meta.json，清含 username 占位符的 override。
  * @returns 实际改写的 task 数（供日志 / 单测断言）
  */
@@ -71,54 +119,34 @@ export const migrateUsernameBranchTemplates = async (): Promise<number> => {
   let modified = 0;
   for (const id of entries) {
     const metaPath = path.join(tasksRoot, id, META_FILE);
-    let rawText: string;
-    try {
-      rawText = await fs.readFile(metaPath, "utf-8");
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") continue; // 非 task 目录 / 无 meta
-      console.warn(
-        `[migrate-username] 读 meta 失败 taskId=${id}:`,
-        err instanceof Error ? err.message : err,
-      );
-      continue;
-    }
+    // 无锁预检：没有残留的任务（绝大多数）到此为止，不拿锁
+    if (!(await inspectMeta(metaPath, id))) continue;
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(stripBom(rawText));
-    } catch {
-      console.warn(`[migrate-username] meta JSON 损坏、跳过 taskId=${id}`);
-      continue;
-    }
-    if (!isValidMetaShape(parsed)) {
-      // V0.5 残留等——不硬改
-      continue;
-    }
-
-    const meta = parsed as TaskMetaV06;
-    const { changed, next } = pruneUsernameBranchTemplates(
-      meta.repoBranchTemplates,
-    );
-    if (!changed) continue;
-
-    meta.repoBranchTemplates = next;
-    try {
-      // 原子写（tmp+rename）；路径跟读侧一样走运行时 dataRoot()
-      await writePrivateFileAtomic(
-        metaPath,
-        JSON.stringify(meta, null, 2) + "\n",
-      );
-      modified += 1;
-      console.log(
-        `[migrate-username] 已清除 repoBranchTemplates 中的 username 占位符：taskId=${id}`,
-      );
-    } catch (err) {
-      console.warn(
-        `[migrate-username] 写回失败 taskId=${id}:`,
-        err instanceof Error ? err.message : err,
-      );
-    }
+    // 要改：进任务锁，锁内重读重判（预检之后别人可能已经改过 meta、甚至已经清掉了残留）
+    const wrote = await withTaskLock(id, async () => {
+      const fresh = await inspectMeta(metaPath, id);
+      if (!fresh) return false;
+      const { meta, next } = fresh;
+      meta.repoBranchTemplates = next;
+      try {
+        // 原子写（tmp+rename）；路径跟读侧一样走运行时 dataRoot()
+        await writePrivateFileAtomic(
+          metaPath,
+          JSON.stringify(meta, null, 2) + "\n",
+        );
+        console.log(
+          `[migrate-username] 已清除 repoBranchTemplates 中的 username 占位符：taskId=${id}`,
+        );
+        return true;
+      } catch (err) {
+        console.warn(
+          `[migrate-username] 写回失败 taskId=${id}:`,
+          err instanceof Error ? err.message : err,
+        );
+        return false;
+      }
+    });
+    if (wrote) modified += 1;
   }
   return modified;
 };

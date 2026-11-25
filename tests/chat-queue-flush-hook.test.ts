@@ -73,6 +73,7 @@ const {
   __clearQueuedMessageFlushedListenersForTest,
 } = await import("@/lib/server/chat-queue");
 type QueuedChatMsg = import("@/lib/server/chat-queue").QueuedChatMsg;
+const { startChatFromQueuedMessage } = await import("@/lib/server/chat-queue-send-now");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
@@ -190,5 +191,36 @@ describe("R1-13a：flushChatQueue 真链路触发 onQueuedMessageFlushed", () =>
       source: "feishu",
     });
     expect(seen[0]!.msg.displayText).toBe("user-hi");
+  });
+});
+
+// 第六轮评审 P3：「立即发送」走 resume 续接路径（有落盘锚点 → Agent.resume → sendChatMessage）送出后，要把这条操作结算成 handedOff。
+// steer 路径（delivered）、新会话路径（runChatSession 的 settleFirstOp）都会结算；sendChatMessage 自己不认 clientItemId、不结算，
+// 这条路径以前就停在 persisted（非终态），ledger 里查不到 delivered。用真实的 startChatFromQueuedMessage → resumeChatSession → sendChatMessage，只 mock SDK。
+describe("第六轮评审 P3：send-now 的 resume 续接路径送出后结算成 handedOff", () => {
+  it("Agent.resume + send 都成功：回 202（resumed）、ledger 里是 delivered，不是停在 persisted", async () => {
+    const pending = makePendingSend();
+    mockResume.mockResolvedValue({
+      agentId: AGENT_ID,
+      close: vi.fn(),
+      send: pending.send,
+    });
+    await writeMeta(makeMeta(TASK_ID, AGENT_ID));
+
+    const head: QueuedChatMsg = {
+      itemId: "item_send_now_resume_1",
+      agentText: "agent-hi",
+      displayText: "user-hi",
+      enqueuedAt: Date.now(),
+      skipPersistEvent: true, // 入队方已落过 user_reply：不落事件、不打检查点，直接以它的内容续接
+    };
+    const res = await startChatFromQueuedMessage(TASK_ID, head, BOOT);
+
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ ok: true, sentNow: true, resumed: true, itemId: head.itemId });
+    expect(mockResume, "走的是 resume 续接，不是新建会话").toHaveBeenCalledTimes(1);
+    expect(mockCreate).not.toHaveBeenCalled();
+    expect(pending.send, "消息确实送给了 agent").toHaveBeenCalledTimes(1);
+    expect(findRecentSettledEntry(TASK_ID, head.itemId)?.outcome).toBe("delivered");
   });
 });

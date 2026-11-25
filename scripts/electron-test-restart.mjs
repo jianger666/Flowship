@@ -4,7 +4,8 @@
  *
  *   BUILD_STANDALONE=1 pnpm build
  *   → pnpm electron:server
- *   → pnpm exec electron-builder 打 staging unpacked test 包（productName=FlowshipTest）
+ *   → pnpm exec electron-builder 打 staging unpacked test 包（productName=FlowshipTest；
+ *     mac 另带独立 bundle id，并在本机有固定测试证书时用它签名，见 scripts/lib/electron-test-signing.mjs）
  *   → 确认 staging 产物存在
  *   → 精确退出旧 FlowshipTest 进程
  *   → 将 staging 部署到规范路径（失败则恢复上一可用包并尝试重启旧版）
@@ -30,6 +31,12 @@ import {
   isTestAppRunningFromProbe,
   resolveTestAppPaths,
 } from "./lib/electron-test-restart.mjs";
+import {
+  buildTestBuildEnv,
+  readTestSigning,
+  resolveTestSigningDir,
+  unlockTestKeychain,
+} from "./lib/electron-test-signing.mjs";
 
 const PREFIX = "[electron:test:restart]";
 
@@ -228,9 +235,28 @@ async function main() {
   // node_modules/electron/dist 时直接指给它，test 打包完全离线（远程缺失时保留原行为）
   const localElectronDist = "node_modules/electron/dist";
   const electronDistPath = existsSync(localElectronDist) ? localElectronDist : undefined;
+
+  // mac：有本机固定测试证书就用它签名（身份不随打包变，「电脑操作」的系统授权和钥匙串里保存的开机密码都保留）；
+  // 没有就退回 ad-hoc（每次打包身份都变、授权失效）。证书用 node scripts/electron-test-signing.mjs 创建（幂等）。
+  let signing = null;
+  if (platform === "darwin") {
+    signing = await readTestSigning({ dir: resolveTestSigningDir() });
+    if (signing) {
+      await unlockTestKeychain(signing);
+      log("3/6", `用本机固定测试证书签名（指纹 ${signing.identity.slice(0, 8)}…）`);
+    } else {
+      log(
+        "3/6",
+        "没有本机固定测试证书 → ad-hoc 签名（每次重新打包，「电脑操作」的系统授权都会失效；运行 node scripts/electron-test-signing.mjs 创建证书）",
+      );
+    }
+  }
   await runSpawn(
     buildElectronBuilderDistTestSpawnSpec(platform, { electronDistPath }),
-    { label: "electron:dist:test (staging)" },
+    {
+      label: "electron:dist:test (staging)",
+      env: buildTestBuildEnv(process.env, signing),
+    },
   );
 
   log("4/6", `确认 staging 产物 ${layout.stagingArtifactPath}`);

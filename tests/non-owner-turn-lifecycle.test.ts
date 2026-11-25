@@ -60,12 +60,15 @@ vi.mock("@/lib/server/chat-pending", async () => {
   };
 });
 
-const { taskDir, writeMeta } = await import("@/lib/server/task-fs-core");
+const { taskDir, withEventAppendChain, withTaskLock, writeMeta } = await import(
+  "@/lib/server/task-fs-core"
+);
 const {
   agentSessions,
   allocTaskRunInstanceId,
   clearTaskStarting,
   forkPendingTasks,
+  isTaskStarting,
   pendingStopRequests,
   runningTasks,
 } = await import("@/lib/server/task-stream");
@@ -203,7 +206,13 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
   afterEach(async () => {
-    vi.restoreAllMocks();
+    // 先等后台 run / 启动链真收尾，再清：它们的尾巴里有 fire-and-forget 的 meta / 事件写盘
+    // （restoreRunStatusAfterQuestion、setTaskSessionAgentId 等），目录一删就落在已删目录上
+    // （实测清目录后 20~80ms 仍有 meta.json 的 rename）。超时只是兜底、不抛。
+    await pollUntil(
+      () => ids.every((id) => !isTaskStarting(id) && !runningTasks.has(id)),
+      5000,
+    );
     __resetNonOwnerTurnGuardForTest();
     for (const id of ids) {
       pendingStopRequests.delete(id);
@@ -214,11 +223,27 @@ describe("非属主一轮的按轮次标记生命周期", () => {
       clearChatGate(id);
       endChatLifecycle(id);
     }
-    await sleep(60);
+    // 排空每个任务的两条写盘链（meta 锁 + 事件追加链）再清目录——替换原来的 sleep(60)（时间裕量、不是同步点）。
+    // 交替两轮：锁里的写可能再排事件、反之亦然
+    // 带 3s 上限：万一哪个用例失败时没放行、把锁占住，清场不能卡死、更不能连累后面的用例（只是兜底，正常毫秒级完成；
+    // 与上面的 5s 等待加起来 < vitest 默认 hookTimeout 10s）
+    await Promise.race([
+      (async () => {
+        for (let round = 0; round < 2; round++) {
+          for (const id of ids) {
+            await withEventAppendChain(id, async () => undefined);
+            await withTaskLock(id, async () => undefined);
+          }
+        }
+      })(),
+      sleep(3000),
+    ]);
     for (const id of ids) {
       await fs.rm(taskDir(id), { recursive: true, force: true }).catch(() => {});
     }
     ids.length = 0;
+    // console 间谍留到清完目录之后才还原：收尾里万一还有 console 输出，不会落到文件收尾之后的真 console 上
+    vi.restoreAllMocks();
   });
   afterAll(async () => {
     await fs.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
@@ -233,6 +258,8 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     expect(await deliver(id, { name: "李四", guard: true })).toBe("sent");
     expect(probe.activeAtSend).toEqual([true]);
     expect(probe.texts[0]!.endsWith(buildNonOwnerGuardFootnote("李四"))).toBe(true);
+    // 开关开 = 约束段；「限制已关」声明只属于开关关的那条路，不能两个都出现
+    expect(probe.texts[0]!).not.toContain("限制群里非宿主成员");
     // run 收尾（consume 最外层 finally）后清
     expect(
       await pollUntil(() => !isNonOwnerTurnActive(id)),
@@ -314,6 +341,9 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     expect(await deliver(id, { name: "李四", guard: false })).toBe("sent");
     expect(probe.activeAtSend).toEqual([false]);
     expect(probe.texts[0]).not.toContain("非任务所有者「");
+    // 没有约束段，但要明说「限制已关」：状态不能靠「缺席」表示（2026-11-19 玉灵：关了开关，机器人仍拒绝造线索）
+    expect(probe.texts[0]).toContain("关掉了「限制群里非宿主成员」");
+    expect(probe.texts[0]).toContain("「只答疑」类的约束，对这条不再适用");
   });
 
   it("机器人 + guard:false（「机器人与真人同权」开着且提示词开关关着）：不登记标记、没有「只答疑」约束，但仍带防成环的克制提示", async () => {
@@ -327,6 +357,8 @@ describe("非属主一轮的按轮次标记生命周期", () => {
     const text = probe.texts[0]!;
     // 同权：没有约束段、没有「不修改任何文件」
     expect(text).not.toContain("不修改任何文件");
+    // 「限制已关」声明是给真人的；机器人另有克制规则，不吃这段
+    expect(text).not.toContain("限制群里非宿主成员");
     expect(text).not.toContain("本轮规则：");
     // 默认脚注保留（与真人 guard 关一致），后面追加克制提示（防互 @ 成环）
     expect(text).toContain("**修改要求**才动手改");

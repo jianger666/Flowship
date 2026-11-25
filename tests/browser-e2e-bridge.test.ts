@@ -30,6 +30,7 @@ import { BrowserBridgeError } from "@/lib/server/browser/types";
 import type { FlowshipToolDef, FlowshipToolResult } from "@/lib/server/flowship-tools";
 
 import { runElectronScript } from "../scripts/browser-e2e/run.mjs";
+import { currentSessionToken } from "./helpers/session-token";
 
 const E2E = !!process.env.FS_BROWSER_E2E;
 const PEER = path.resolve(import.meta.dirname, "../scripts/browser-e2e/bridge-peer.cjs");
@@ -201,7 +202,11 @@ describe.skipIf(!E2E)("内置浏览器 e2e：真实 bridge + tools ↔ 真实 El
 
     // 动态 import：只有真的跑 e2e 才会加载 flowship-tools 这条重链
     const mod = await import("@/lib/server/flowship-tools");
-    invoke = (tool, args, ctx) => mod.invokeFlowshipTool(tool, args, undefined, ctx);
+    // 第十八轮：咽喉对「标记会拒的那几类调用」（browser_evaluate 等）要求调用方 token 是该任务当前会话登记的那一个（过期会话闸，见 stale-session-gate.test.ts）。
+    // 这里扮演的是「当前会话里的 agent 在调工具」，所以先为这个任务登记一个当前会话 token、并把它传进去；传 undefined 会被闸 fail-closed 拒掉。
+    // 本文件整份 describe.skipIf(!E2E)，默认门禁跑不到——所以另有一条默认门禁里的契约（stale-session-gate.test.ts 的 tokenlessCalls 扫描）禁止测试以「静态上就不是真 token」的方式（字面 undefined / void 0 / null / 省略第三参 / 别名…）调咽喉。
+    // 注意：currentSessionToken 对任意 taskId 都补登记，所以这里**永远走不到「token 被拒」分支**——拒绝分支的行为在 stale-session-gate.test.ts 里验，不在这个 e2e 里（第二十轮评审 R20-9）。
+    invoke = (tool, args, ctx) => mod.invokeFlowshipTool(tool, args, currentSessionToken(ctx.taskId), ctx);
   }, 90_000);
 
   afterAll(async () => {

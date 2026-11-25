@@ -8,6 +8,9 @@
  *    verbatimSymlinks：本地（pnpm isolated）布局里有相对 symlink、原样保留才能解析；
  *    CI 布局（hoisted）全实体、verbatim 无副作用。
  *
+ * 1.5 koffi 原生模块（「电脑操作」要用）：app.asar.unpacked 里只留目标平台那份、并核对它在（scripts/lib/koffi-native.mjs）。
+ * 1.6 win：解锁组件的源码 + 安装脚本拷进 resources/win-helper/，拷之前核对 SHA-256（scripts/lib/win-helper-hashes.mjs）。
+ *
  * 2. mac：补一道完整 ad-hoc 签名（v0.7.10）。
  *    identity:null 是「跳过签名」、产物只剩 linker 级签名（Sealed Resources=none）、
  *    新 macOS + 浏览器下载（quarantine）评估直接「已损坏」死路（用户实测 0.7.9）。
@@ -26,18 +29,47 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { Arch } from "electron-builder";
+
+import { designatedRequirementNamesCertificate } from "./lib/codesign-requirement.mjs";
+import { prepareKoffiNative } from "./lib/koffi-native.mjs";
+import { installWinHelperAssets } from "./lib/win-helper-hashes.mjs";
+
 const execFileP = promisify(execFile);
 
 export default async (context) => {
   const src = path.join(process.cwd(), "dist", "app-server");
   // getResourcesDir：mac → <app>.app/Contents/Resources、win → <out>/resources
-  const dest = path.join(
-    context.packager.getResourcesDir(context.appOutDir),
-    "app-server",
-  );
+  const resourcesDir = context.packager.getResourcesDir(context.appOutDir);
+  const dest = path.join(resourcesDir, "app-server");
   await fs.rm(dest, { recursive: true, force: true });
   await fs.cp(src, dest, { recursive: true, verbatimSymlinks: true });
   console.log(`  • afterPack：server 布局已拷入 ${dest}`);
+
+  // 「电脑操作」用的 koffi 原生模块：只留目标平台那份并核对它在（交叉打包 mac x64 的关键，详见 scripts/lib/koffi-native.mjs）。
+  // 必须在 mac 整包签名之前（签名会把包内容封印）。
+  // 发版 CI（FLOWSHIP_REQUIRE_STABLE_SIGN=1；win / mac 是同一个打包步骤，变量名沿用最初的「mac 固定签名」用途，
+  // 在这里也代表「这是发版构建」）缺它直接红：win 和 mac 一样——装出一个「电脑操作」连驱动都加载不起来的安装包，
+  // 比发版当场红更糟（用户 / 同事点开才发现）。Windows 包里原生模块的路径公式已对着真 koffi 包核对过
+  // （@koromix/koffi-win32-x64/win32_x64/koffi.node，tests/koffi-native-pack.test.ts）。本机 / test 包只告警、不拦。
+  if (
+    context.electronPlatformName === "darwin" ||
+    context.electronPlatformName === "win32"
+  ) {
+    await prepareKoffiNative({
+      resourcesDir,
+      platform: context.electronPlatformName,
+      arch: Arch[context.arch],
+      strict: process.env.FLOWSHIP_REQUIRE_STABLE_SIGN === "1",
+    });
+  }
+
+  // Windows 解锁组件（锁屏时自动解锁，实验功能）的源码和安装脚本：拷到 resources/win-helper/（PowerShell 要读，不能留在 asar 里）。
+  // 拷之前核对哈希，对不上直接让构建失败——否则装出来的包里「安装解锁组件」永远过不了校验（详见 scripts/lib/win-helper-hashes.mjs）。
+  if (context.electronPlatformName === "win32") {
+    const helperDir = await installWinHelperAssets({ repoRoot: process.cwd(), resourcesDir });
+    console.log(`  • afterPack：解锁组件资源已拷入 ${helperDir}`);
+  }
 
   if (context.electronPlatformName === "darwin") {
     // appOutDir 下找 .app（产物只有一个）
@@ -77,16 +109,17 @@ export default async (context) => {
     await execFileP("codesign", ["--verify", "--deep", "--strict", appPath]);
     if (identity) {
       // 再核对「指定要求」里确实是这张证书：系统辅助功能 / 麦克风等授权认的就是它，
-      // 身份不对就在上传前红掉（输出可能在 stdout 或 stderr、合并判断）
+      // 身份不对就在上传前红掉（输出可能在 stdout 或 stderr、合并判断）。
+      // 证书被系统标成「受信任」（发版 CI）时打印 certificate root = H"…"，没被信任（本机 test 证书）时打印
+      // certificate leaf = H"…"——两种写法等价（见 scripts/lib/codesign-requirement.mjs），都算对。
       const { stdout, stderr } = await execFileP("codesign", [
         "-d",
         "-r-",
         appPath,
       ]);
-      const want = `certificate root = H"${identity.toLowerCase()}"`;
-      if (!`${stdout}\n${stderr}`.includes(want)) {
+      if (!designatedRequirementNamesCertificate(`${stdout}\n${stderr}`, identity)) {
         throw new Error(
-          `afterPack：签名身份不是预期证书（期望包含 ${want}）`,
+          `afterPack：签名身份不是预期证书（指定要求里没有 certificate root|leaf = H"${identity.toLowerCase()}"）`,
         );
       }
     }

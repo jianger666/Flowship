@@ -307,7 +307,12 @@ app.whenReady().then(async () => {
   await sleep(300);
   check("destroy 后 V4 的通道都已撤掉", wanted.every((n) => !listeners.has(n)) && !handlers.has("browser:revealDownload"));
   server.close();
-  fs.rmSync(tmp, { recursive: true, force: true });
+  // 清临时 userData：Chromium 退出前可能还在写缓存，偶发 ENOTEMPTY / EBUSY——重试几次，仍清不掉只告警（不让「全部通过」被清理失败变成 FATAL exit 1）
+  try {
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
   const passed = results.filter(Boolean).length;
   console.log(`\nSMOKE SUMMARY ${passed}/${results.length} passed`);
   app.exit(passed === results.length ? 0 : 1);

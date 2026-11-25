@@ -14,6 +14,8 @@
 
 import { redactCopyIfHit, redactSecretsInText } from "./event-secret-redact";
 import { appendEvent } from "./task-fs";
+import { registerNonOwnerRunProbe } from "./non-owner-turn-guard";
+import { invalidateCallerToken } from "./chat-pending";
 import { describeStorageDegraded } from "@/lib/storage-degraded";
 import type { BackgroundSubagentJobView } from "@/lib/background-subagents";
 import type { Task, TaskEvent, ActionRecord } from "@/lib/types";
@@ -313,6 +315,9 @@ const getRunnerState = (): TaskRunnerGlobalState => {
 };
 
 export const runningTasks = getRunnerState().runningTasks;
+// 「非属主轮」标记的寿命跟着 run 走（见 non-owner-turn-guard）：标记久没续期时问一句这个 task 的 run 还在不在。
+// 登记在这里（runningTasks 的定义处）而不是 task-runner：只要这张表存在，探针就在；同名登记 = 热更新覆盖
+registerNonOwnerRunProbe("task", (taskId) => runningTasks.has(taskId));
 export const agentSessions = getRunnerState().agentSessions;
 const subscribers = getRunnerState().subscribers;
 export const forkPendingTasks = getRunnerState().forkPendingTasks;
@@ -1010,11 +1015,46 @@ export const waitForTaskToStop = async (
  * - **被 supersede 的旧 consume**：只 cancel 自己的 run；若表内 session instance
  *   仍是入场记下的那份，禁止 close（会话已交给 / 留给后继持有者）。
  * 铁律：session 的关闭只能由当前持有者执行；完成信号只能由最终提交者发出。
+ *
+ * ## 「别人的内容在驱动」标记（non-owner-turn-guard）：**强清不碰标记**（第十五轮评审 P3-1）
+ * 强清只是把旧 run 摘出表、把会话从表里删掉——它**不让旧 run 停**：一次性前驱（oneshot / question run）不在 agentSessions、agent 不会被关，
+ * 被摘出表的 consume 也还在跑；而电脑操作闸（desktop/tools.ts 的 `desktopDeniedInNonOwnerTurn`）只按 taskId 上的标记判、不核对 callerToken
+ * （第十八轮起咽喉另有按 callerToken 拒的过期会话闸；第十八轮当时它管不到这一段——后继的 token 还没装上之前，旧 run 的 token 仍是表里「当前」那个，这一段只剩标记在罩；第十九轮评审 R19-3 起强清同步作废旧 token，闸现在也罩住这一段，见下）。所以在这里清标记会让这个被强清的活 run 在后继真正起跑之前照样能调 desktop_*（操作所有者的电脑）——这是第十五轮定分工时的理由；现在有了 token 作废，清不清标记对**过期会话闸圈住的那几类调用**（`desktop_*` 除收尾、`groupOpenTurnToolDenied` 命中者）的旧 run 已无影响；闸没圈的（`browser_navigate` / `click` / `type` / `upload` 等，handler 自己不核对 token）旧 run 在标记没了之后本来就不再受限，这条与清不清标记也无关（第二十轮评审 R20-7：此前写「已无影响」偏满，详见 non-owner-turn-guard.ts 头注释「已知边界」里 `beginNonOwnerTurn` 覆盖那一项）。「属主新启动才清」的分工没改、改它没有收益。
+ * 第十四轮评审 P3-3 曾在这里 `clearNonOwnerTurn`（理由：会话是本函数自己摘的、不经 closeTaskSession，调用方随后的 closeTaskSession 看不到会话、
+ * 到不了它清标记的那一行，属主的新启动会带着旧标记跑），第十五轮评审 P3-1 指出那个修法引入了上面这个窗口，改成下面的分工：
+ *  · 强清不碰标记——被强清的旧 run 在后继起跑之前继续受限；
+ *  · 属主自己的新启动在 `internalStartAgent` 里、首次 `send` 之前清（与它之间无 await；与 task 型属主 send 起点的 `clearNonOwnerTurn` 同口径）；
+ *  · 外来内容驱动的新启动（foreignContentTurn）在同一位置重新登记（登记会覆盖旧标记，没有空窗）；
+ *  · 旧 run 迟到的收尾按 token 摘（token 对不上就空过），不会清掉后继的标记。
+ * 代价：强清之后到后继 send 之前，属主自己的系统工具也被旧标记限制——这一段后继还在建 agent，没有属主的 run 在用它；建 agent 失败时标记留到下一次属主 send 起点 / 推进 / TTL。
+ * 残余的收口（第十八轮，第十六轮评审 P3-T2；用户授权按推荐处理；第十九轮评审 R19-3 订正了此前「已收口」偏满的说法）：后继 send 处清掉标记之后，被强清的旧 run 若**仍然活着**，它此后调 desktop_* 本来不再受标记限制——强清前已 `cancel()` 并等了 5 秒，
+ * 而系统自己给「取消之后 run 收尾」留的宽限 30 秒（`CANCEL_WAIT_GRACE_MS`，run-wait.ts）**只罩 `run.wait()`**——计时要等 stream 循环结束、进到 `cancelEscape.wait(run)` 才开始，流阶段（工具调用恰好发生在这）没有这个上限、只有 24h 硬顶（第十七轮评审 N1）；
+ * `wait()` 阶段正常毫秒～秒级、卡住时 5 秒到不了。所以「强清时旧 run 还没收完」不是没有现实路径的状态。
+ * 收口方式（**不**碰 SDK 层去让强清真停旧 run，而是在咽喉按 callerToken 拒）：`flowship-tools.ts` 的 `invokeFlowshipTool` 对「标记会拒的那几类调用」（`isStaleSessionRestrictedCall`：desktop_* 除收尾、
+ * `groupOpenTurnToolDenied` 命中的那几个）核对 `matchExpectedCallerToken(taskId, callerToken)`。callerToken 表 `expectedCallerTokens`（chat-pending.ts）是 task / chat / 一次性问答**共用的同一张进程级表**，
+ * 表是**单槽**（一个 taskId 一个 token），被强清的旧 run 的 token 一旦不是表里那个、再调这些工具就只得到 `CALLER_MISMATCH_ERROR`。
+ *
+ * **强清要自己作废旧 token**（第十九轮评审 R19-3；第十八轮漏了这一步，注释还写成「后继的 token 在属主新启动清标记之前就已装好」——对 task 的属主 send 起点与强清残局不成立）：
+ * 本函数把会话从 `agentSessions` 里删掉，随后调用方的 `closeTaskSession` 看到的是「没有会话」，到不了它摘 notifier / handler / token 的那几行，
+ * 旧 token 于是在后继 `installSessionIfCurrent` 装上新 token 之前一直是表里「当前」那个——这段（含后继创建失败的整个残局）旧 run 的受限调用仍能过闸，
+ * 正是第十八轮要堵的那类窗口。所以这里同步 `invalidateCallerToken(taskId)`（与 stop 同一个函数、只摘 token、不叫醒 `wait`）：
+ * 旧 run 的受限调用从强清这一刻起 fail-closed，不必等后继装好。三个调用点都发生在后继的 `Agent.create` / `installSessionIfCurrent` **之前**，不会误摘后继刚装的 token
+ * （`tests/task-forceclear-keeps-marker.test.ts` 钉着「强清之后、后继装好之前，旧 run 的受限调用已被拒」，`stale-session-gate.test.ts` 钉着函数体里有这一步）。
+ * 摘 token 后表里没有 token：`schedule` / `advance_next` / `set_owner_note` 这类自己核对 token 的工具对旧 run 也一并 fail-closed（与「会话被接管」同一语义，本来就该如此）。
+ *
+ * **仍管不到的一条**：`abortStuckRunForSend`（假死恢复）**刻意保留 session** 给后继 send 复用——新旧 run 共用同一个 token，闸区分不了「同一个会话里被放弃的 run」。
+ * 窗口 = 假死 run 被中止之后仍在跑、且后继属主 send 已清掉标记；它防的是「被接管的会话」，不是这个。未做的原因：要区分得给每个 run 一个独立身份并改 `callerToken` 的颁发方式，
+ * 动的是所有工具的 token 核对口径，超出本轮范围；现状与引入过期会话闸之前一致（没有退化），如实记在 COMPUTER-USE.md / HANDOFF。
+ *
+ * 钉着：`tests/stale-session-gate.test.ts`（单元 + 咽喉 + 故事 + 源码结构）与 `tests/task-forceclear-keeps-marker.test.ts` 的 task 真链路用例（强清 → 属主新启动 → 旧 run 调 desktop_screenshot / browser_evaluate 被拒、后继照常）。
+ * 三个调用点：advanceTask、resumeCurrentActionCore（等旧 run 满 5 秒）、internalStartAgent 的前驱处理（cancel 后等满 5 秒）。
  */
 export const forceClearStaleRunnerState = (taskId: string): void => {
   runningTasks.delete(taskId);
   forkPendingTasks.delete(taskId);
   pendingStopRequests.delete(taskId);
+  // R19-3：作废旧 token（见函数头注释）；必须与上面的摘表在同一个同步段里、且早于任何 await
+  invalidateCallerToken(taskId);
   // V0.11：连会话一起强清（agent close 尽力而为）——主动换主场景
   const session = agentSessions.get(taskId);
   if (session) {

@@ -59,6 +59,9 @@ describe("默认值与解析", () => {
       networkBodyRead: true,
       advancedTools: true,
       maxTabs: 20,
+      // 电脑操作（desktop.v1）：两个都是放开型，默认关
+      desktopEnabled: false,
+      desktopLockedAccess: false,
     });
     expect(parseBrowserSettings(undefined)).toEqual(BROWSER_SETTINGS_DEFAULTS);
     expect(parseBrowserSettings({ browserEvaluateEnabled: "true", browserRecordInputValues: 1 })).toEqual(BROWSER_SETTINGS_DEFAULTS);
@@ -134,7 +137,34 @@ describe("默认值与解析", () => {
       trustLoopbackCerts: true,
       networkBodyRead: true,
       maxTabs: 20,
+      desktopEnabled: false,
+      desktopLockedAccess: false,
     });
+  });
+
+  it("电脑操作两个开关（computerUse / computerUseLockedAccess）：放开型，只认显式 true；脏值一律关", () => {
+    for (const bad of ["true", 1, "yes", null, {}, [true], undefined]) {
+      const p = parseBrowserSettings({ computerUse: bad, computerUseLockedAccess: bad });
+      expect(p.desktopEnabled).toBe(false);
+      expect(p.desktopLockedAccess).toBe(false);
+    }
+    // 两个开关互相独立：只开「锁屏可用」不等于总开关开（总开关由主进程 manager 兜底，这里只负责如实解析）
+    expect(parseBrowserSettings({ computerUse: true })).toMatchObject({ desktopEnabled: true, desktopLockedAccess: false });
+    expect(parseBrowserSettings({ computerUseLockedAccess: true })).toMatchObject({ desktopEnabled: false, desktopLockedAccess: true });
+    expect(parseBrowserSettings({ computerUse: true, computerUseLockedAccess: true })).toMatchObject({ desktopEnabled: true, desktopLockedAccess: true });
+  });
+
+  it("toBrowserConfig 把电脑操作两个开关带进 config 载荷；缺省 / 非布尔不会变成 true", () => {
+    expect(toBrowserConfig({ ...BROWSER_SETTINGS_DEFAULTS, desktopEnabled: true, desktopLockedAccess: true })).toMatchObject({
+      desktopEnabled: true,
+      desktopLockedAccess: true,
+    });
+    expect(toBrowserConfig({ ...BROWSER_SETTINGS_DEFAULTS, desktopEnabled: "true" as never })).toMatchObject({ desktopEnabled: false });
+    // 老缓存（HMR 前的 bundle 建的 holder 里没有这两个字段）：缺字段按关
+    const legacy = { ...BROWSER_SETTINGS_DEFAULTS } as Record<string, unknown>;
+    delete legacy.desktopEnabled;
+    delete legacy.desktopLockedAccess;
+    expect(toBrowserConfig(legacy as never)).toMatchObject({ desktopEnabled: false, desktopLockedAccess: false });
   });
 });
 
@@ -195,5 +225,38 @@ describe("PATCH 字段级保存", () => {
     expect(disk.browserEvaluateEnabled).toBe(true);
     expect(disk.browserRecordInputValues).toBe(true);
     expect(getBrowserSettingsSync()).toEqual({ ...BROWSER_SETTINGS_DEFAULTS, evaluateEnabled: true, recordInputValues: true });
+  });
+
+  it("电脑操作两个键（computerUse / computerUseLockedAccess）经设置页的 PATCH 落盘后，同步缓存随之刷新并通知订阅者（bridge 据此把 config 推给主进程）", async () => {
+    await fs.writeFile(settingsFilePath(), JSON.stringify({ apiKey: "k" }), "utf-8");
+    const changes: Array<{ desktopEnabled: boolean; desktopLockedAccess: boolean }> = [];
+    onBrowserSettingsChange((s) => changes.push(s));
+    const patch = (p: Record<string, unknown>) =>
+      PATCH(
+        new Request("http://localhost/api/settings", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ patch: p }),
+        }),
+      );
+
+    expect((await patch({ computerUse: true })).status).toBe(200);
+    expect(getBrowserSettingsSync()).toMatchObject({ desktopEnabled: true, desktopLockedAccess: false });
+    expect(changes).toHaveLength(1);
+
+    expect((await patch({ computerUseLockedAccess: true })).status).toBe(200);
+    expect(getBrowserSettingsSync()).toMatchObject({ desktopEnabled: true, desktopLockedAccess: true });
+    expect(changes).toHaveLength(2);
+
+    const disk = JSON.parse(await fs.readFile(settingsFilePath(), "utf-8")) as Record<string, unknown>;
+    expect(disk.computerUse).toBe(true);
+    expect(disk.computerUseLockedAccess).toBe(true);
+
+    // 关回去：缓存跟着变；值没变的写盘不重复通知
+    expect((await patch({ computerUse: false })).status).toBe(200);
+    expect(getBrowserSettingsSync()).toMatchObject({ desktopEnabled: false, desktopLockedAccess: true });
+    expect(changes).toHaveLength(3);
+    expect((await patch({ computerUse: false })).status).toBe(200);
+    expect(changes).toHaveLength(3);
   });
 });

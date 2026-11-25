@@ -231,6 +231,16 @@ export type QueuedChatMsg = {
    * flush 落事件时浅合并；缺省 = 不合并、对既有调用方零行为变化。
    */
   extraMeta?: Record<string, unknown>;
+  /**
+   * 这条消息的内容出自别人：所有者在需求群里空 @ 引用别人的消息、或写了一句话再引用别人的消息
+   * （见 ChatInjectOptions.foreignContentTurn；第五轮评审 N1）。
+   * 带着它入队：会话忙时不再回 409 让所有者重发，而是排队；等轮到它出队、**真正送达的那一刻**
+   * （sendChatMessage / runChatSession 内部、agent.send 之前、同步）才登记 scope=desktop 的中途标记。
+   * 登记不能放在入队时：标记是任务级的，早登记会去限制属主此刻正在跑的那一轮，而那一轮的收尾又会按名把它清掉（= 无标记送达）。
+   * 队列项整体搬运（塞回队首 / 重排 / skipPersistEvent 展开）时这个字段跟着走；新建队列项的地方（chat-inject / runChatSession 的并发首条）要自己带上。
+   * 缺省 = 不是外来内容，对既有调用方零行为变化。
+   */
+  foreignContentTurn?: boolean;
 };
 
 /** 入队入参：itemId 可选（缺则自动分配） */
@@ -1225,6 +1235,21 @@ export const drainRemainingChatQueue = (taskId: string): QueuedChatMsg[] => {
   const cur = map.get(taskId) ?? [];
   map.delete(taskId);
   return [...cur];
+};
+
+/**
+ * 只读地看一眼某条排队消息（不改队列、不改顺序、不 settle）。
+ * 供「立即发送」在**取出之前**判断这条是不是外来内容（foreignContentTurn）：取出再塞回会破坏它在队里的位置。
+ * @returns 队里该条的浅拷贝；没有 → null
+ */
+export const peekQueuedChatMessage = (
+  taskId: string,
+  itemId: string,
+): QueuedChatMsg | null => {
+  if (!itemId) return null;
+  const cur = queues().get(taskId);
+  const found = cur?.find((m) => m.itemId === itemId);
+  return found ? { ...found } : null;
 };
 
 /**

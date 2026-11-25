@@ -556,10 +556,22 @@ export interface FeAiFlowSettings {
   browserTrustLoopbackCerts?: boolean;
   /** 内置浏览器（契约 §15 A7）：允许 AI 读取网络请求 / 响应体（已走脱敏管线）。**默认开；显式 false 才关** */
   browserNetworkBodyRead?: boolean;
-  /** 内置浏览器（契约 §15）：注册「高级调试」工具组（network_rules / perf / sources / debug）。**默认开；显式 false 才关**；对新开始的会话生效 */
+  /** 内置浏览器（契约 §15）：注册「高级调试」工具组（network_rules / perf / sources / debug）。**默认开；显式 false 才关**；关闭立即生效（每次调用实时读设置，进行中的会话也立刻拒绝这组工具），开启只对新开始的会话生效（工具表是建会话时一次性建好的） */
   browserAdvancedTools?: boolean;
   /** 内置浏览器（契约 §15 C6）：单个任务同时打开的标签页上限，5–60，缺省 20 */
   browserMaxTabs?: number;
+  /**
+   * 电脑操作总开关：让 AI 通过 Flowship 操作这台电脑上的任何应用（截图 / 点击 / 键入…）。
+   * **默认关；只认显式 true**。关 = AI 的电脑操作一律被拒（ACCESS_DISABLED，契约见 electron-app/desktop/types.mjs）。
+   * 设置页「电脑操作」卡；仅桌面端有意义。
+   */
+  computerUse?: boolean;
+  /**
+   * 电脑操作 · 「锁屏时也能用」：电脑锁屏时 AI 自动解锁 → 盖住屏幕干活 → 做完重新锁屏。**默认关；只认显式 true**。
+   * 这里只是开关。**开机密码绝不进 settings**（settings 是明文 JSON、会经 /api/settings/full 回传前端缓存）：
+   * 只能经 `window.__computerUse.setCredential` 写进本机系统钥匙串（见 `computer-use-bridge.ts`）。
+   */
+  computerUseLockedAccess?: boolean;
   /**
    * 公司环境配置（服务器 / PG / 日志 / XXL / Nacos / ELK / SLS / HTTP API）。
    * 排查类 action 用；运行时同步到 `<dataRoot>/company-env.json` 供 skill 读。

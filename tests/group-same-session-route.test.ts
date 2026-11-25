@@ -8,6 +8,7 @@
  *   群侧**不预登记**（登记由出向从 user_reply 事件现建）；
  *   queueIfBusy.source=group_other（带 senderKey / clientItemId）；忙时不被群侧忙线闸拒收
  * - 没有活会话 → 原只读旁路不变（降级通道）：restrictToQuestion:true、预登记 restricted
+ *   （唯一的例外：开关关 + 真人 + 有落盘锚点时先唤醒再并入，见文件末尾「开关已关 + 休眠会话」）
  * - 属主 / 答 pendingAsk 不受影响；机器人：设置「受理其他机器人」关 → 仍被准入闸拒（放开后的语义见 group-bots-allowed.test.ts）
  * - 202 排队：限流名额不退（重放不再过准入闸，不能让排队绕过 per-sender 滑动窗）
  * - 带图 + 主链正忙：图还是待下载句柄 → 进群问题队（零下载），主链空闲后回放才下载直送；
@@ -42,12 +43,18 @@ const {
   groupQuestionQueueLength,
   listGroupReplies,
 } = await import("@/lib/server/feishu-bridge/group-shared");
-const { __resetOutboundRegistryForTest } = await import(
+const { __resetOutboundRegistryForTest, registerOutboundQuestion } = await import(
   "@/lib/server/feishu-bridge/group-outbound-registry"
 );
-const { agentSessions } = await import("@/lib/server/task-stream");
+const { agentSessions, runningTasks } = await import("@/lib/server/task-stream");
 const { __setGroupBotsAllowedForTest } = await import(
   "@/lib/server/group-non-owner-guard-config"
+);
+const { GROUP_REPLY_WHERE, OWNER_GROUP_NOTE, buildOwnerGroupNote } = await import(
+  "@/lib/group-non-owner-prompt"
+);
+const { __resetOwnTenantKeyForTest, learnOwnTenantKey } = await import(
+  "@/lib/server/feishu-bridge/restricted-qa-gate"
 );
 
 const OWNER = "ou_owner";
@@ -560,5 +567,405 @@ describe("不受影响的路径", () => {
     await routeGroupInboundMessage(groupMsg(), ctx);
     expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
     expect(listGroupReplies("task-1")).toHaveLength(0);
+  });
+});
+
+describe("所有者群消息：尾注经 agentContext 送达（规矩随消息走，不常驻提示词）", () => {
+  const ownerMsg = () => groupMsg({ sender_id: OWNER, sender_name: "宿主" });
+
+  it.each([true, false])(
+    "task 型所有者（活会话在场：%s）→ options.agentContext = OWNER_GROUP_NOTE；气泡文本里没有它（只给 agent 看）",
+    async (live) => {
+      if (live) agentSessions.set("task-1", {} as never);
+      const handleTaskQuestionInject = vi.fn(async () =>
+        jsonRes({ ok: true }, 200),
+      );
+      __setGroupRouteDepsForTest(
+        baseDeps({ handleTaskQuestionInject }) as never,
+      );
+
+      await routeGroupInboundMessage(ownerMsg(), ctx);
+
+      expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+      expect(optsOf(handleTaskQuestionInject).agentContext).toBe(
+        OWNER_GROUP_NOTE,
+      );
+      expect(String(bodyOf(handleTaskQuestionInject).text)).not.toContain(
+        OWNER_GROUP_NOTE,
+      );
+    },
+  );
+
+  it("chat 型所有者：handleChatReplyInject 的 options.agentContext = OWNER_GROUP_NOTE（userReplyMetaExtra 照旧）", async () => {
+    const handleChatReplyInject = vi.fn(async () => jsonRes({ ok: true }, 200));
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleChatReplyInject,
+        listTasks: async () => [taskSummary({ mode: "chat" })],
+        getTask: async () => fullTask({ mode: "chat" }),
+      }) as never,
+    );
+
+    await routeGroupInboundMessage(ownerMsg(), ctx);
+
+    expect(handleChatReplyInject).toHaveBeenCalledTimes(1);
+    const opts = optsOf(handleChatReplyInject);
+    expect(opts.agentContext).toBe(OWNER_GROUP_NOTE);
+    expect(opts).toHaveProperty("userReplyMetaExtra");
+  });
+
+  it.each([true, false])(
+    "非所有者（活会话在场：%s，即并入同会话 / 只读旁路）→ 不带 agentContext：他们的尾注由注入链按设置开关现读追加，不走这里",
+    async (live) => {
+      if (live) agentSessions.set("task-1", {} as never);
+      const handleTaskQuestionInject = vi.fn(async () =>
+        jsonRes({ ok: true }, 200),
+      );
+      __setGroupRouteDepsForTest(
+        baseDeps({ handleTaskQuestionInject }) as never,
+      );
+
+      await routeGroupInboundMessage(groupMsg(), ctx);
+
+      expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+      expect(optsOf(handleTaskQuestionInject)).not.toHaveProperty(
+        "agentContext",
+      );
+    },
+  );
+});
+
+describe("所有者尾注：只写为真的半句（评审：排队 / 回复他人消息时不能说谎）", () => {
+  it("构造器：两个半句各自按需带；都不为真 → 空串（调用方据此不带 agentContext）；全量形态 = OWNER_GROUP_NOTE", () => {
+    expect(buildOwnerGroupNote()).toBe(OWNER_GROUP_NOTE);
+    const identityOnly = buildOwnerGroupNote({ replyToGroup: false });
+    const replyOnly = buildOwnerGroupNote({ identity: false });
+    expect(identityOnly).toContain("任务所有者本人在需求群里说的");
+    expect(identityOnly).not.toContain(GROUP_REPLY_WHERE);
+    expect(replyOnly).toContain(GROUP_REPLY_WHERE);
+    expect(replyOnly).not.toContain("任务所有者本人在需求群里说的");
+    expect(buildOwnerGroupNote({ identity: false, replyToGroup: false })).toBe("");
+    // 每个变体都是括号包好的完整一句，且都比全量短（不会因为拆变体多付钱）
+    for (const n of [identityOnly, replyOnly]) {
+      expect(n.startsWith("（") && n.endsWith("）")).toBe(true);
+      expect(n.length).toBeLessThan(OWNER_GROUP_NOTE.length);
+    }
+  });
+
+  it("所有者的消息预期会排队（主链在跑，没有回群登记）→ 只带身份、不说「会发到该群」", async () => {
+    agentSessions.set("task-1", {} as never);
+    const handleTaskQuestionInject = vi.fn(async () => queuedRes());
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        getTask: async () => fullTask({ runStatus: "running" }),
+        listTasks: async () => [taskSummary({ runStatus: "running" })],
+      }) as never,
+    );
+
+    await routeGroupInboundMessage(
+      groupMsg({ sender_id: OWNER, sender_name: "宿主" }),
+      ctx,
+    );
+
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    const note = String(optsOf(handleTaskQuestionInject).agentContext);
+    expect(note).toBe(buildOwnerGroupNote({ replyToGroup: false }));
+    expect(note).toContain("任务所有者本人在需求群里说的");
+    expect(note).not.toContain("原文发到该群");
+  });
+
+  it("所有者消息正常直送（有回群登记）→ 两个半句都带（对照）", async () => {
+    const handleTaskQuestionInject = vi.fn(async () => jsonRes({ ok: true }, 200));
+    __setGroupRouteDepsForTest(baseDeps({ handleTaskQuestionInject }) as never);
+
+    await routeGroupInboundMessage(
+      groupMsg({ sender_id: OWNER, sender_name: "宿主" }),
+      ctx,
+    );
+
+    expect(optsOf(handleTaskQuestionInject).agentContext).toBe(OWNER_GROUP_NOTE);
+  });
+});
+
+describe("开关已关 + 休眠会话 → 先接回会话、再按同会话并入（只对非属主真人）", () => {
+  const dormantTask = (over: Partial<Task> = {}): Task =>
+    fullTask({ sessionAgentId: "agent_persisted", ...over });
+
+  /** 唤醒桩：成功时把会话摆进表里（模拟 resume 成功），并记下调用顺序 */
+  const makeWake = (ok: boolean, order: string[] = []) =>
+    vi.fn(async () => {
+      order.push("wake");
+      if (ok) agentSessions.set("task-1", {} as never);
+      return ok;
+    });
+
+  /** 开关关 + 休眠任务（有锚点、没在跑、表里没会话）的默认摆法；over 覆盖任意依赖 */
+  const setup = (over: Record<string, unknown> = {}) => {
+    const order: string[] = [];
+    const wakeTaskSessionForGroup = makeWake(true, order);
+    const handleTaskQuestionInject = vi.fn(async () => {
+      order.push("inject");
+      return jsonRes({ ok: true }, 200);
+    });
+    __setGroupRouteDepsForTest(
+      baseDeps({
+        handleTaskQuestionInject,
+        wakeTaskSessionForGroup,
+        isGroupNonOwnerGuardEnabled: async () => false,
+        getTask: async () => dormantTask(),
+        ...over,
+      }) as never,
+    );
+    return { order, wakeTaskSessionForGroup, handleTaskQuestionInject };
+  };
+
+  it("成功：先唤醒再注入；唤醒凭据取自服务端 loadBootContext；按同会话口径并入（不是旁路）", async () => {
+    const { order, wakeTaskSessionForGroup, handleTaskQuestionInject } = setup();
+
+    const r = await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(r).toMatchObject({ kind: "sent", taskId: "task-1" });
+    expect(order).toEqual(["wake", "inject"]);
+    // 凭据来自服务端设置（ctx.loadBootContext），不来自发言人
+    expect(callArgs(wakeTaskSessionForGroup)).toEqual([
+      "task-1",
+      { apiKey: "sk-test", model: { id: "m1" } },
+    ]);
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: false,
+      groupNonOwner: { name: "李四", openId: STRANGER },
+    });
+    expect(metaOf(handleTaskQuestionInject)).toHaveProperty("groupNonOwnerTurn");
+    expect(metaOf(handleTaskQuestionInject)).not.toHaveProperty(
+      "restrictedRunTag",
+    );
+  });
+
+  it("唤醒失败 → 落回只读旁路：restrictToQuestion:true、带 restrictedRunTag，与没有唤醒时一致", async () => {
+    const wake = makeWake(false);
+    const { handleTaskQuestionInject } = setup({
+      wakeTaskSessionForGroup: wake,
+    });
+
+    await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wake).toHaveBeenCalledTimes(1);
+    const opts = optsOf(handleTaskQuestionInject);
+    expect(opts).toMatchObject({ restrictToQuestion: true });
+    expect(opts).not.toHaveProperty("groupNonOwner");
+    expect(metaOf(handleTaskQuestionInject)).toHaveProperty("restrictedRunTag");
+  });
+
+  it("开关开着（默认）→ 一律不唤醒，走只读旁路", async () => {
+    const { wakeTaskSessionForGroup, handleTaskQuestionInject } = setup({
+      isGroupNonOwnerGuardEnabled: async () => true,
+    });
+
+    await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: true,
+    });
+  });
+
+  it("机器人发言人（含「同权」）→ 不唤醒：防两个机器人互 @ 把唤醒放大，仍走只读旁路", async () => {
+    const { wakeTaskSessionForGroup, handleTaskQuestionInject } = setup();
+
+    await routeGroupInboundMessage(
+      groupMsg({
+        sender_id: "ou_otherbot",
+        sender_name: "别家机器人",
+        sender_type: "app",
+      }),
+      ctx,
+    );
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: true,
+    });
+  });
+
+  it("没有落盘锚点（从没起过会话 / 被停止清了）→ 不唤醒：这不是「休眠」，没得接", async () => {
+    const { wakeTaskSessionForGroup, handleTaskQuestionInject } = setup({
+      getTask: async () => fullTask(),
+    });
+
+    await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: true,
+    });
+  });
+
+  it("任务正在跑（runStatus=running）→ 不唤醒", async () => {
+    const { wakeTaskSessionForGroup } = setup({
+      getTask: async () => dormantTask({ runStatus: "running" }),
+    });
+
+    await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+  });
+
+  it("内存里有在跑的 run（runningTasks 占着：一次性 agent / 启动中，盘上 runStatus 还没写 running）→ 不唤醒", async () => {
+    const { wakeTaskSessionForGroup } = setup();
+    runningTasks.set("task-1", { instanceId: 1 } as never);
+    try {
+      await routeGroupInboundMessage(groupMsg(), ctx);
+    } finally {
+      runningTasks.delete("task-1");
+    }
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+  });
+
+  it("属主本人 → 不走唤醒段（属主的休眠会话由注入链带 creds 自己接回）", async () => {
+    const { wakeTaskSessionForGroup } = setup();
+
+    await routeGroupInboundMessage(
+      groupMsg({ sender_id: OWNER, sender_name: "宿主" }),
+      ctx,
+    );
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+  });
+
+  it("有待答 pendingAsk → 不唤醒（这条是在答提问，走 injectPendingAskText）", async () => {
+    const injectPendingAskText = vi.fn(async () => ({ ok: true as const }));
+    const { wakeTaskSessionForGroup } = setup({
+      getPendingAsk: () => ({ askId: "ask-1", questions: [] }),
+      injectPendingAskText,
+    });
+
+    await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+    expect(injectPendingAskText).toHaveBeenCalledTimes(1);
+  });
+
+  it("拿不到启动凭据（loadBootContext 返回 null）→ 不唤醒，走只读旁路", async () => {
+    const { wakeTaskSessionForGroup } = setup();
+
+    await routeGroupInboundMessage(groupMsg(), {
+      ...ctx,
+      loadBootContext: async () => null,
+    });
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+  });
+
+  it("排队回放（pump 重放）→ 不唤醒：回放由出向的 done / 终态事件调起，不在那条链上再阻塞一次 resume，照旧只读旁路", async () => {
+    let running = true;
+    const wake = makeWake(true);
+    const { handleTaskQuestionInject } = setup({
+      wakeTaskSessionForGroup: wake,
+      getTask: async () =>
+        dormantTask({ runStatus: running ? "running" : "idle" }),
+      listTasks: async () => [
+        taskSummary({ runStatus: running ? "running" : "idle" }),
+      ],
+    });
+
+    // 任务在跑：休眠任务的非属主问题进群问题队（此刻也不唤醒——在跑）
+    const r1 = await routeGroupInboundMessage(groupMsg(), ctx);
+    expect(r1).toMatchObject({ kind: "queued" });
+    expect(groupQuestionQueueLength("task-1")).toBe(1);
+    expect(wake).not.toHaveBeenCalled();
+
+    // 跑完、空闲了：pump 回放。条件上已满足「开关关 + 真人 + 有锚点 + 没在跑」，但回放不唤醒
+    running = false;
+    await pumpGroupQuestionQueue("task-1");
+
+    expect(wake).not.toHaveBeenCalled();
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: true,
+    });
+    expect(groupQuestionQueueLength("task-1")).toBe(0);
+  });
+
+  it("唤醒抛错 → 不影响路由：这条消息照旧走只读旁路（唤醒是尽力而为，不能把群消息变成路由失败）", async () => {
+    const wake = vi.fn(async () => {
+      throw new Error("boom: resume exploded");
+    });
+    const { handleTaskQuestionInject } = setup({ wakeTaskSessionForGroup: wake });
+
+    const r = await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ kind: "sent", taskId: "task-1" });
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: true,
+    });
+  });
+
+  it("开关开着不取凭据：loadBootContext 比「开关关 + 唤醒失败」少调一次（只有唤醒段多取这一次）", async () => {
+    const bootCalls = async (guardOn: boolean): Promise<number> => {
+      __resetGroupReplyStateForTest();
+      const loadBootContext = vi.fn(async () => ({
+        apiKey: "sk-test",
+        model: { id: "m1" },
+      }));
+      setup({
+        isGroupNonOwnerGuardEnabled: async () => guardOn,
+        wakeTaskSessionForGroup: makeWake(false),
+      });
+      await routeGroupInboundMessage(groupMsg(), { ...ctx, loadBootContext });
+      return loadBootContext.mock.calls.length;
+    };
+
+    const on = await bootCalls(true);
+    const off = await bootCalls(false);
+
+    expect(off - on).toBe(1);
+  });
+
+  it("关联回执（出问登记命中）→ 不唤醒：回执走的是活会话里的数据通道，会话不在不自动拉起", async () => {
+    registerOutboundQuestion({
+      taskId: "task-1",
+      chatId: CHAT,
+      messageId: "om_q1",
+      target: STRANGER,
+    });
+    const { wakeTaskSessionForGroup } = setup();
+
+    await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+  });
+
+  it("被准入闸拒绝的发件人（租户不符）→ 静默忽略、不唤醒：被拒的人不能顺手拉起 agent", async () => {
+    learnOwnTenantKey("t_own");
+    try {
+      const { wakeTaskSessionForGroup, handleTaskQuestionInject } = setup();
+
+      const r = await routeGroupInboundMessage(
+        groupMsg({ sender_tenant_key: "t_other" } as never),
+        ctx,
+      );
+
+      expect(r).toMatchObject({ kind: "skipped" });
+      expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+      expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    } finally {
+      __resetOwnTenantKeyForTest();
+    }
+  });
+
+  it("活会话已在 → 不重复唤醒，直接走原同会话路径", async () => {
+    agentSessions.set("task-1", {} as never);
+    const { wakeTaskSessionForGroup, handleTaskQuestionInject } = setup();
+
+    await routeGroupInboundMessage(groupMsg(), ctx);
+
+    expect(wakeTaskSessionForGroup).not.toHaveBeenCalled();
+    expect(optsOf(handleTaskQuestionInject)).toMatchObject({
+      restrictToQuestion: false,
+      groupNonOwner: { name: "李四" },
+    });
   });
 });

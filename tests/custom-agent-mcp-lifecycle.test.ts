@@ -105,8 +105,10 @@ beforeEach(() => {
   hoisted.connectMcpServer.mockImplementation(async (name: string) => bridges[name]);
   hoisted.createAgentSession.mockReset();
   hoisted.sessionOpen.mockReset();
+  // 生产代码经 openPersistedPiSession 会包装 sessionManager.appendMessage（落盘脱敏，见 pi-session-persist.ts）：真实的 SessionManager 一定有它，假对象也得有
   hoisted.sessionOpen.mockReturnValue({
     buildSessionContext: () => ({ messages: [{ role: "user" }] }),
+    appendMessage: () => "entry-1",
   });
 });
 
@@ -164,7 +166,10 @@ describe("resumeCustomAgent · 确定性失败不连 MCP、桥接后失败要关
   });
 
   it("会话为空 → E_SESSION_EMPTY，同样一个 MCP 都没连", async () => {
-    hoisted.sessionOpen.mockReturnValue({ buildSessionContext: () => ({ messages: [] }) });
+    hoisted.sessionOpen.mockReturnValue({
+      buildSessionContext: () => ({ messages: [] }),
+      appendMessage: () => "entry-1",
+    });
     await expect(resumeCustomAgent(existingFile(), input())).rejects.toMatchObject({
       code: "E_SESSION_EMPTY",
     });

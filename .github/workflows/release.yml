@@ -193,9 +193,12 @@ jobs:
         shell: bash
         working-directory: dist/app-server
 
-      # 壳的 runtime 依赖（只有 electron-updater）、装进 electron-app/node_modules 进 asar。
+      # 壳的 runtime 依赖（electron-updater + koffi）、装进 electron-app/node_modules 进 asar。
       # 必须用 pnpm（跟根项目一致）：electron-builder 按根 lockfile 判定 pm=pnpm、
       # npm 风格的 node_modules 收集不到、会 fallback 把主项目全家桶打进 asar（271M 事故）
+      # koffi 的原生模块按平台分包（@koromix/koffi-<os>-<arch>）：electron-app/package.json 的
+      # pnpm.supportedArchitectures 让每台 runner 都装齐 mac / win × arm64 / x64，这样 arm64 runner 上
+      # 交叉打 x64 dmg 时目标架构那份也在；afterPack（scripts/lib/koffi-native.mjs）再只留目标平台那份、缺了就红。
       - run: pnpm install --frozen-lockfile
         working-directory: electron-app
 
@@ -261,7 +264,16 @@ jobs:
           fi
           PROBE_REQ="$(codesign -d -r- "$PROBE" 2>&1)"
           rm -f "$PROBE"
-          if [[ "$PROBE_REQ" != *"certificate root = H\"$FLOWSHIP_SIGN_IDENTITY\""* ]]; then
+          # 与 afterPack、本机 test 包共用同一份判断（scripts/lib/codesign-requirement.mjs）：证书被系统标成受信任时指定要求打印
+          # certificate root = H"…"，没被信任（上面 add-trusted-cert 失败）时打印 certificate leaf = H"…"——自签证书链里只有它自己、
+          # 两种写法等价、系统里的授权都认，所以都算对。以前这里只认 root、afterPack 认 root|leaf：口径不一，
+          # add-trusted-cert 失败时探针先红、而 afterPack 本来是放行的（第三轮评审）
+          if ! printf '%s' "$PROBE_REQ" | node --input-type=module -e '
+            import { designatedRequirementNamesCertificate } from "./scripts/lib/codesign-requirement.mjs";
+            let out = "";
+            for await (const chunk of process.stdin) out += chunk;
+            process.exit(designatedRequirementNamesCertificate(out, process.env.FLOWSHIP_SIGN_IDENTITY) ? 0 : 1);
+          '; then
             echo "::error::探针的签名身份不是预期证书 $FLOWSHIP_SIGN_IDENTITY：$PROBE_REQ"
             exit 1
           fi

@@ -304,10 +304,14 @@ describe("请求处理器：询问用户", () => {
       getPermissionState(s.session).grants.allow(origin, "microphone", "user");
       getPermissionState(s.session).grants.allow(origin, "camera", "user");
     }
+    // 请求：跨源子框架要先核对「顶层是否委托了它」（tab.evalInFrames）；这个假 tab 没有该方法 = 核对不出来 = 拒绝（被委托的情形见 browser-mic-prompt-gate.test.ts）
     const cross = s.request("media", { requestingUrl: `${B}/f`, isMainFrame: false, mediaTypes: ["audio"] });
     await flush();
     expect(cross).toHaveBeenCalledWith(false);
-    expect(s.check("media", B, { isMainFrame: false, embeddingOrigin: A })).toBe(false);
+    // 检查：enumerateDevices 形状（带 securityOrigin）的跨源框架检查照旧拒绝——设备名不给第三方框架；
+    // 夹在别的站点里的「同源于顶层」框架（origin = 顶层、embeddingOrigin ≠ origin）也拒绝
+    // （第二十二轮起 media 的检查在授予之前一律回 false——含 permissions.query 形状的跨源框架检查：回 true 会让 WebRTC 的 ICE 收集拿到真实 IP，见 browser-mic-prompt-gate.test.ts 的 A）
+    expect(s.check("media", B, { isMainFrame: false, securityOrigin: B })).toBe(false);
     expect(s.check("media", A, { isMainFrame: false, embeddingOrigin: B })).toBe(false);
     expect(s.check("media", A, { isMainFrame: false })).toBe(true); // 同源子框架照常
     // Flowship 自己的页面：即使有授予记录也什么都不给

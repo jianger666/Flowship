@@ -1,6 +1,8 @@
 # ai-flow Electron 打包配置（V0.7.0）
 #
-# 结构说明：壳代码在 electron-app/（独立 package.json、runtime 依赖只有 electron-updater）。
+# 结构说明：壳代码在 electron-app/（独立 package.json、runtime 依赖只有 electron-updater 和 koffi——
+# koffi 是「电脑操作」调系统 API 用的原生模块，各平台的 .node 在 @koromix/koffi-<os>-<arch> 里，
+# 打包时由 scripts/electron-after-pack.mjs 只留目标平台那份）。
 # 不用单 package.json 结构——主 package.json 的 dependencies 是 next/react 全家桶、
 # electron-builder 会把 production deps 全拖进 asar、包体直接爆炸；server 侧依赖
 # 已经由 Next standalone 自己 trace 好、走 extraResources 进包。
@@ -17,7 +19,8 @@ directories:
   # 不用默认的 build/——.gitignore 把 build 整个忽略了
   buildResources: packaging
 
-# electron-updater 没有 native 依赖、跳过 rebuild 省时间
+# 跳过 rebuild：electron-updater 没有 native 依赖；koffi 的 .node 是预编译的 N-API 模块（ABI 稳定、
+# 不随 Electron 版本变），重新编译只会白费时间甚至编坏——别打开
 npmRebuild: false
 
 # 7z 压缩拉满（V0.11.4、实测 win exe 213.6MB → 112MB、-48%）：

@@ -15,6 +15,8 @@
  * 启动后发 `hello`，3 秒内收到 `hello-ack` 且 capabilities 含 `browser.v1` 才算可用（{@link isBrowserBridgeAvailable} 同步可查）。
  * 超时先判不可用，之后低频重发 hello（壳那边可能晚一点才挂上监听）；任何时候收到合格的 hello-ack 都会转回可用。
  * 通道断开：挂起请求全部以 CANCELLED 拒绝、转不可用（进程里的 IPC 通道断了没法重连；壳重启 server = 新进程 = 新握手）。
+ * 电脑操作（desktop_* 工具）复用同一条通道：主进程在 hello-ack 的 capabilities 里另带 `desktop.v1` 才算支持
+ * （{@link isDesktopBridgeAvailable}），config 里的 desktopEnabled / desktopLockedAccess 随 {@link BrowserBridge.syncConfig} 一起推。
  *
  * # 重要约束
  * 本文件会被 `instrumentation-node.ts` 提前动态加载（保证 hello-ack 早于用户第一次使用）。那条链**不能**拖进
@@ -94,9 +96,17 @@ export interface BrowserBridge {
   onSessionClosed: (cb: (taskId: string) => void) => () => void;
   /** 当前挂起请求数（测试 / 诊断） */
   pendingCount: (taskId?: string) => number;
+  /**
+   * 主进程在最近一次 hello-ack 里声明的能力里有没有 `name`（如电脑操作的 `desktop.v1`）。
+   * 可选：老的测试假 bridge 没实现 = 一律当没有（fail-closed），调用方用 `bridge.hasCapability?.(name) === true`。
+   */
+  hasCapability?: (name: string) => boolean;
   /** 拆掉监听 / 定时器，挂起请求全部拒绝（测试用；生产不调） */
   dispose: () => void;
 }
+
+/** 电脑操作的能力名（主进程 `electron-app/desktop/types.mjs` 的 DESKTOP_CAPABILITY） */
+export const DESKTOP_CAPABILITY = "desktop.v1";
 
 export interface CreateBridgeOptions {
   handshakeTimeoutMs?: number;
@@ -135,6 +145,8 @@ export const createBrowserBridge = (
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let seq = 0;
   let lastSentConfig: string | null = null;
+  /** 主进程最近一次 hello-ack 声明的能力（重新握手整体替换；断线 / 销毁后清空） */
+  let capabilities = new Set<string>();
   const offs: Array<() => void> = [];
   const pending = new Map<number, Pending>();
   const eventHandlers = new Map<string, Set<BrowserEventHandler>>();
@@ -258,11 +270,13 @@ export const createBrowserBridge = (
         if (!caps.includes("browser.v1")) {
           incompatible = true;
           state = "down";
+          capabilities = new Set();
           clearTimers();
           console.warn("[browser-bridge] 主进程不支持 browser.v1，内置浏览器不可用");
           return;
         }
         incompatible = false;
+        capabilities = new Set(caps.filter((c): c is string => typeof c === "string"));
         const wasReady = state === "ready";
         state = "ready";
         helloTries = 0;
@@ -310,6 +324,7 @@ export const createBrowserBridge = (
   const handleDisconnect = (): void => {
     if (disposed) return;
     state = "down";
+    capabilities = new Set();
     clearTimers();
     const n = rejectWhere(() => true, "CANCELLED", "与桌面壳的连接已断开");
     console.warn(`[browser-bridge] IPC 通道断开，已拒绝 ${n} 个挂起请求`);
@@ -408,6 +423,9 @@ export const createBrowserBridge = (
       trustLoopbackCerts: cfg.trustLoopbackCerts !== false,
       networkBodyRead: cfg.networkBodyRead !== false,
       maxTabs: normalizeBrowserMaxTabs(cfg.maxTabs),
+      // 电脑操作：「放开」型，只认显式 true（老调用方没传 = 关）。主进程那头也是同口径，不认就当关
+      desktopEnabled: cfg.desktopEnabled === true,
+      desktopLockedAccess: cfg.desktopLockedAccess === true,
     };
     const key = JSON.stringify(body);
     if (!force && key === lastSentConfig) return;
@@ -431,6 +449,7 @@ export const createBrowserBridge = (
     if (disposed) return;
     rejectWhere(() => true, "CANCELLED", "bridge 已销毁");
     disposed = true;
+    capabilities = new Set();
     clearTimers();
     for (const off of offs.splice(0)) off();
     eventHandlers.clear();
@@ -456,6 +475,7 @@ export const createBrowserBridge = (
       taskId === undefined
         ? pending.size
         : [...pending.values()].filter((p) => p.taskId === taskId).length,
+    hasCapability: (name) => capabilities.has(name),
     dispose,
   };
 };
@@ -604,6 +624,18 @@ export const isBrowserBridgeAvailable = (): boolean => {
   // 还没建过：只有真实通道在才值得尝试创建（顺带触发握手）
   if (!canUseProcessChannel()) return false;
   return getBrowserBridge()?.isAvailable() ?? false;
+};
+
+/**
+ * 同步查「电脑操作」是否可用：bridge 可用 **且** 主进程握手时声明了 `desktop.v1`。
+ * 主进程在不支持的平台（Linux 等）/ 组装失败时不会声明，此时不注册 desktop_* 工具、提示词里也没有那一节。
+ * 与 {@link isBrowserBridgeAvailable} 同口径（没有通道 / 没握手成功 / 断线 → false，零开销）。
+ */
+export const isDesktopBridgeAvailable = (): boolean => {
+  const h = bridgeHolder();
+  const b = h.override ?? h.bridge ?? (canUseProcessChannel() ? getBrowserBridge() : null);
+  if (!b || !b.isAvailable()) return false;
+  return b.hasCapability?.(DESKTOP_CAPABILITY) === true;
 };
 
 /** 任务被停止：取消该任务挂起的浏览器等待（没有 bridge 时无操作） */

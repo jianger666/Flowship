@@ -310,10 +310,10 @@ describe("loadBridgeBootContext 的 task 参数", () => {
  * 建出来的任务本身就用这份默认模型 / 提供方。
  */
 describe("契约：已有窗口的飞书路径不得再无参调 loadBridgeBootContext", () => {
+  // 读剥掉注释的源码：注释里提到的 `loadBridgeBootContext()` / 照抄的调用都不算真实调用点
   const read = async (rel: string): Promise<string> => {
-    const { readFileSync } = await import("node:fs");
-    const path = await import("node:path");
-    return readFileSync(path.resolve(import.meta.dirname, "..", rel), "utf8");
+    const { readSource } = await import("./helpers/source-text");
+    return readSource(rel);
   };
 
   it("card-action.ts：四处（私聊 ask / 重试 / 群 ask / 群推进选择卡）都带窗口任务", async () => {
@@ -331,10 +331,12 @@ describe("契约：已有窗口的飞书路径不得再无参调 loadBridgeBootC
     expect(src).toMatch(/loadBootContext:\s*async \(task\)\s*=>\s*\{\s*const boot = await loadBridgeBootContext\(task\)/);
   });
 
-  it("group-route.ts：三处取 boot 都传 task", async () => {
+  it("group-route.ts：四处取 boot 都传 task", async () => {
     const src = await read("src/lib/server/feishu-bridge/group-route.ts");
     // 只看真实调用（`await args.loadBootContext(`），注释里提到的 `loadBootContext()` 不算
     expect(src).not.toMatch(/await args\.loadBootContext\(\)/);
-    expect(src.match(/await args\.loadBootContext\(task\)/g)?.length ?? 0).toBe(3);
+    // 四处：群推进起 action / 开关关时唤醒休眠会话（2026-11-19，取凭据）/ 忙线排队 / 主投递——
+    // 全都得是这个任务自己的模型 / 提供方，不能退回设置页默认
+    expect(src.match(/await args\.loadBootContext\(task\)/g)?.length ?? 0).toBe(4);
   });
 });

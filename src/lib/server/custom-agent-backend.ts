@@ -82,7 +82,9 @@ import {
 import { dataRoot } from "./data-root";
 import { invokeFlowshipTool, pickSystemTools } from "./flowship-tools";
 import { getBrowserTools } from "./browser/tools";
+import { getDesktopTools } from "./desktop/tools";
 import { stripImageBlocks } from "./browser/image-redact";
+import { createPersistedPiSession, openPersistedPiSession } from "./pi-session-persist";
 import {
   buildNonOwnerToolDenied,
   NON_OWNER_TURN_ALLOWED_TOOLS,
@@ -797,10 +799,9 @@ const withNonOwnerTurnDeny = (def: ToolDefinition, taskId: string): ToolDefiniti
     execute: async (...args: unknown[]) => {
       // 命中即续期：这一轮还在调工具，标记就不能被固定 TTL 熬过期（第 20 轮评审 N1）
       if (touchNonOwnerTurn(taskId)) {
-        return {
-          content: [{ type: "text", text: buildNonOwnerToolDenied(name) }],
-          details: undefined,
-        };
+        // pi 的 execute 没有 isError 字段：失败必须抛错，agent-loop 才会按失败的工具调用呈现（界面上不亮绿勾）；
+        // 文案原样作为错误信息（它本来就是模型能据此改口的话）
+        throw new Error(buildNonOwnerToolDenied(name));
       }
       return prev(...args);
     },
@@ -875,6 +876,29 @@ const buildCustomTools = (
               description: t.description,
               parameters: t.parameters,
               // signal 接到请求上：run 被取消时 wait_for / ask_user_to_act 立刻退出（主进程也会收到 cancel）
+              execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal) =>
+                piToolResult(
+                  t.name,
+                  await invokeFlowshipTool(
+                    t,
+                    params as Record<string, unknown>,
+                    callerToken,
+                    { ...(taskId ? { taskId } : {}), ...(signal ? { signal } : {}) },
+                  ),
+                ),
+            }) as unknown as ToolDefinition,
+        )
+      : []),
+    // 电脑操作工具（desktop_*）：同样不在 flowShipTools 常量里，按会话追加（要求桌面壳声明 desktop.v1）；
+    // 映射与浏览器工具那段同形——signal 接到请求上，run 被取消时主进程也会收到 cancel（撤遮罩 / 锁回去）
+    ...(callerToken
+      ? getDesktopTools({ taskId, readOnly: false }).map(
+          (t) =>
+            ({
+              name: t.name,
+              label: t.label,
+              description: t.description,
+              parameters: t.parameters,
               execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal) =>
                 piToolResult(
                   t.name,
@@ -1434,7 +1458,8 @@ export const createCustomAgent = async (
         ? [...RESTRICTED_READONLY_TOOL_NAMES]
         : [...NATIVE_TOOLS, ...customTools.map((t) => t.name)],
       customTools,
-      sessionManager: SessionManager.create(cwd, piSessionDir()),
+      // 会话文件落盘前脱敏（截图 base64 / desktop_type 等明文入参），见 pi-session-persist.ts；不得直接 SessionManager.create
+      sessionManager: createPersistedPiSession(cwd, piSessionDir()),
     });
     const agentId = session.sessionFile ?? session.sessionId;
     // 只读旁路（readOnly）本来就只有 read/grep/glob、不参与「非属主轮收窄」
@@ -1475,7 +1500,7 @@ export const resumeCustomAgent = async (
   const { runtime, model, thinkingLevel } = await buildRuntime(input);
   const callerToken = input.callerToken;
   const readOnly = input.readOnly === true;
-  // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接。
+  // agentId 存的是上次的 sessionFile 路径 → openPersistedPiSession（= SessionManager.open + 落盘脱敏，见 pi-session-persist.ts）续接。
   // pi 对缺失文件会静默建空会话（resume「成功」但 messages=[]），随后 send 只有当前句、
   // 连起手 prompt 都没有。缺文件 / 空会话一律抛，让 chat-inject 降级新会话并注入最近对话。
   // 这两项检查必须排在桥接 MCP **之前**（R14 Q11-05）：它们是设计内的确定性失败（降级新会话是常态路径），
@@ -1483,7 +1508,7 @@ export const resumeCustomAgent = async (
   if (!existsSync(agentId)) {
     throw sessionResumeError("E_SESSION_MISSING", agentId);
   }
-  const sessionManager = SessionManager.open(agentId, piSessionDir(), cwd);
+  const sessionManager = openPersistedPiSession(agentId, piSessionDir(), cwd);
   if (sessionManager.buildSessionContext().messages.length === 0) {
     throw sessionResumeError("E_SESSION_EMPTY", agentId);
   }

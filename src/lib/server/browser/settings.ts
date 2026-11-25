@@ -30,6 +30,14 @@ export const BROWSER_MAX_TABS_DEFAULT = 20;
 export const BROWSER_MAX_TABS_MIN = 5;
 export const BROWSER_MAX_TABS_MAX = 60;
 
+/**
+ * 电脑操作（desktop.v1）的两个开关，同样是「放开」型：只认显式 true，缺省 / 坏值 / 读盘失败一律关。
+ * 借浏览器这份设置缓存与 config 推送链路，不另起一套（握手重推、设置变化重推都现成）。
+ * 键名与渲染端 `FeAiFlowSettings` 同名字段一致（设置页「电脑操作」卡片写它们）。
+ */
+export const DESKTOP_ENABLED_SETTING_KEY = "computerUse";
+export const DESKTOP_LOCKED_ACCESS_SETTING_KEY = "computerUseLockedAccess";
+
 export interface BrowserSettings {
   evaluateEnabled: boolean;
   recordInputValues: boolean;
@@ -39,6 +47,10 @@ export interface BrowserSettings {
   networkBodyRead: boolean;
   advancedTools: boolean;
   maxTabs: number;
+  /** 电脑操作总开关 */
+  desktopEnabled: boolean;
+  /** 电脑操作：锁屏时也能用（自动解锁 + 遮罩 + 重新锁屏） */
+  desktopLockedAccess: boolean;
 }
 
 export const BROWSER_SETTINGS_DEFAULTS: Readonly<BrowserSettings> = {
@@ -50,6 +62,8 @@ export const BROWSER_SETTINGS_DEFAULTS: Readonly<BrowserSettings> = {
   networkBodyRead: true,
   advancedTools: true,
   maxTabs: BROWSER_MAX_TABS_DEFAULT,
+  desktopEnabled: false,
+  desktopLockedAccess: false,
 };
 
 export const normalizeBrowserMaxTabs = (v: unknown): number =>
@@ -69,6 +83,8 @@ export const parseBrowserSettings = (
   networkBodyRead: raw?.browserNetworkBodyRead !== false,
   advancedTools: raw?.browserAdvancedTools !== false,
   maxTabs: normalizeBrowserMaxTabs(raw?.browserMaxTabs),
+  desktopEnabled: raw?.[DESKTOP_ENABLED_SETTING_KEY] === true,
+  desktopLockedAccess: raw?.[DESKTOP_LOCKED_ACCESS_SETTING_KEY] === true,
 });
 
 const CACHE_KEY = "__flowshipBrowserSettingsV1__";
@@ -150,6 +166,8 @@ export const toBrowserConfig = (s: BrowserSettings = getBrowserSettingsSync()): 
   trustLoopbackCerts: s.trustLoopbackCerts,
   networkBodyRead: s.networkBodyRead,
   maxTabs: s.maxTabs,
+  desktopEnabled: s.desktopEnabled === true,
+  desktopLockedAccess: s.desktopLockedAccess === true,
 });
 
 /** 单测复位 */

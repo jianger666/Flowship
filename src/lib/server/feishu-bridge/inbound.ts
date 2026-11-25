@@ -23,13 +23,14 @@ import {
   LARK_CLI_BINARY_USER,
 } from "@/lib/server/kill-orphans";
 import { stripHostInjectedEnvAndGitToken } from "@/lib/server/host-env";
+import { onSettingsWritten } from "@/lib/server/settings-fs";
 import { killOwnProcessTreeSync } from "@/lib/server/win-self-tree-kill";
 
 import { maybeSweepStaleAttachments } from "./attachment-store";
 import {
   getBridgeDataDir,
-  isFeishuBridgeKeepAwakeEnabled,
-  isFeishuChatBridgeEnabled,
+  readFeishuBridgeKeepAwakeState,
+  readFeishuChatBridgeEnabledState,
 } from "./bridge-config";
 import {
   getLastP2pChatId,
@@ -550,6 +551,14 @@ type ConsumerHandle = {
   state: ConsumerRuntimeState;
   child: ChildProcess | null;
   stopping: boolean;
+  /**
+   * 「停」的世代号：每次 stopConsumer +1。startConsumer 进来时记下，每个 await（探冲突 / 解析二进制）之后
+   * 复查——变了说明 await 期间被停过，放弃本次启动。
+   * 为什么不能只看 `stopping`：无子进程时 stopConsumer 同步跑完、`stopping` 立刻复位成 false，
+   * 退避重启定时器触发的 startConsumer 若正卡在 `event status` 探测里，醒来后看不出自己已被停过、会照常 spawn
+   *（桥接已关却又起了 consumer）。新字段可选：dev 热重载下 globalThis 上的旧 handle 没有它，按 0 处理。
+   */
+  stopEpoch?: number;
   restartTimer: ReturnType<typeof setTimeout> | null;
   backoffMs: number;
   startedAt: number;
@@ -639,10 +648,20 @@ const stopChildGracefully = async (child: ChildProcess): Promise<void> => {
       // ignore
     }
     // 再等一会；仍不 kill -9（漏退订）
-    await new Promise<void>((resolve) => {
-      child.once("exit", () => resolve());
-      setTimeout(() => resolve(), stopGraceMs).unref?.();
+    const exitedAfterTerm = await new Promise<boolean>((resolve) => {
+      child.once("exit", () => resolve(true));
+      setTimeout(() => resolve(false), stopGraceMs).unref?.();
     });
+    // 两档（stdin EOF + SIGTERM）都等满了它还活着：**刻意不强杀**（上面的取舍，R20-16 复核后维持），代价是这个进程被放弃、
+    // 仍可能占着事件订阅，下次开启时 `event status` 会把它报成「被 pid=… 占用」的冲突。放弃不能是静默的——记一条带 pid 的日志，
+    // 出了冲突时能对上号（要清掉它：在活动监视器 / 任务管理器里结束这个 pid）。
+    // （pid 为空 = spawn 根本没成功、没有进程可言，不报「放弃」。）
+    if (!exitedAfterTerm && child.exitCode === null && child.pid !== undefined) {
+      console.warn(
+        `[feishu-bridge/inbound] consumer pid=${child.pid} 在 stdin EOF + SIGTERM 之后仍未退出：已放弃等待、没有强杀（强杀会漏退订）。` +
+          "它可能仍占着事件订阅；下次开启若提示「被该 pid 占用」，请在活动监视器 / 任务管理器里手动结束它。",
+      );
+    }
   }
 };
 
@@ -857,6 +876,21 @@ type RuntimeSingleton = {
   lastInboundAt?: number;
   /** 历史上收到过消息但时间未知（老版本收的、时间戳没落盘）——自检不判红 */
   everInbound?: boolean;
+  /**
+   * 某次 sync 进行中又有人请求 sync（设置页切开关 / 30s 轮询 / status 接口撞车）：记一笔，
+   * 让在跑的那次收尾后再对一遍，而不是静默丢掉——否则开关恰好在同步中途被切，会停在旧值直到下一次轮询。
+   * 新字段一律可选：dev 热重载下 globalThis 上的旧单例对象没有它们，读到 undefined 按「无」处理。
+   */
+  resyncRequested?: boolean;
+  /**
+   * 在途那次 sync（含补跑轮）的 promise；被并入的调用 await 它，保证「返回时对账已收尾」（见 syncBridgeRuntime）。
+   * 空闲时为 null / undefined（热重载下旧单例没有它）。
+   */
+  syncPromise?: Promise<void> | null;
+  /** 写盘订阅的取消函数（null / undefined = 未订阅）：防重复订阅，停桥接时退订 */
+  settingsUnsub?: (() => void) | null;
+  /** 上一次见到的桥接开关取值摘要（见 bridgeSettingsKey）；取值没变的写盘不触发对账 */
+  settingsKey?: string;
 };
 
 const RUNTIME_KEY = "__flowshipFeishuBridgeRuntimeV1__";
@@ -1106,9 +1140,15 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
 const startConsumer = async (h: ConsumerHandle): Promise<void> => {
   if (h.stopping) return;
   if (h.child) return;
+  const epoch = h.stopEpoch ?? 0;
+  // await 之后是否应当放弃：期间被 stopConsumer 停过（世代号变了 / 仍在停）、或别的启动路径已经把 child 接上了
+  //（退避定时器与 sync 各自触发的两个 startConsumer 可能同时越过入口检查，不复查会 spawn 出两个 consumer）
+  const shouldAbort = (): boolean =>
+    h.stopping || (h.stopEpoch ?? 0) !== epoch || h.child !== null;
 
   // 单实例守卫（坑 #4）
   const conflict = await checkEventKeyConflict(h.spec.eventKey, h.ourPid);
+  if (shouldAbort()) return;
   if (conflict.conflict) {
     h.state.status = "conflict";
     h.state.conflictDetail = conflict.detail;
@@ -1119,6 +1159,7 @@ const startConsumer = async (h: ConsumerHandle): Promise<void> => {
   }
 
   const bin = await resolveLarkCliBin();
+  if (shouldAbort()) return;
   let child: ChildProcess;
   try {
     child = spawnImpl(
@@ -1143,6 +1184,7 @@ const startConsumer = async (h: ConsumerHandle): Promise<void> => {
 
 const stopConsumer = async (h: ConsumerHandle): Promise<void> => {
   h.stopping = true;
+  h.stopEpoch = (h.stopEpoch ?? 0) + 1;
   if (h.restartTimer) {
     clearTimeout(h.restartTimer);
     h.restartTimer = null;
@@ -1160,11 +1202,27 @@ const stopConsumer = async (h: ConsumerHandle): Promise<void> => {
   unregisterManagedChild(`feishu-bridge:${h.spec.eventKey}`);
 };
 
+/**
+ * 对齐防休眠：总开关关 → 停；总开关开 → 看子开关（默认开）。
+ *
+ * 子开关读失败（readFeishuBridgeKeepAwakeState 返回 null，R20-16）：**保持防休眠现状**（不启不停）、warn 一条、本轮照常往下，
+ * 留给 30s 轮询重试——与总开关读失败时「保持现状」同一口径。原先读失败当「开」：刚读完总开关紧接着第二次读盘瞬时失败
+ * （Windows 杀软瞬时占文件之类），会把用户关掉的防休眠误起 caffeinate。
+ */
 const syncKeepAwake = async (bridgeOn: boolean): Promise<void> => {
   const rt = getRuntime();
-  const want =
-    bridgeOn && (await isFeishuBridgeKeepAwakeEnabled());
-  if (want) rt.keepAwake.start();
+  if (!bridgeOn) {
+    rt.keepAwake.stop();
+    return;
+  }
+  const keepAwakeOn = await readFeishuBridgeKeepAwakeState();
+  if (keepAwakeOn === null) {
+    console.warn(
+      "[feishu-bridge/inbound] 读防休眠开关失败（config.json 暂不可读）：本轮防休眠保持现状、不启不停，等 30s 轮询重试",
+    );
+    return;
+  }
+  if (keepAwakeOn) rt.keepAwake.start();
   else rt.keepAwake.stop();
 };
 
@@ -1172,46 +1230,126 @@ const syncKeepAwake = async (bridgeOn: boolean): Promise<void> => {
 let upgradeHoldForInstall = false;
 
 /**
- * 读开关：开 → 确保 consumers + keep-awake；关 → 全停。
- * 幂等；dev 热重载靠 globalThis 单例不双跑。
+ * 单次对账：读开关 → 开则确保 consumers + keep-awake，关则全停。
  * 升级 hold 期间（安装链 suspend 后、resume 前）直接返回——防 30s 轮询中途重拉
  * 把正要覆盖的 exe 重新锁住（Windows 在跑的 exe 盖不掉，见 feishu-cli 安装链）。
+ * 只管「这一次读到什么就对齐到什么」；并发合并与补跑由外层 syncBridgeRuntime 负责。
+ *
+ * 已知边角（刻意不改）：开关只在本函数开头读**一次**。开启分支的 startConsumer 要等 `event status` 探测、
+ * 若这期间开关被关掉，本轮仍会把 consumer 启完，随后由补跑那一轮读到「关」再停掉——最终结果正确，
+ * 只是多一次无谓的启停；改成每个 await 后重读开关只会让这段逻辑更绕，收益仅是省一次启停。
+ *
+ * 读开关失败（readFeishuChatBridgeEnabledState 返回 null）：**保持现状直接返回**（不启、不停、不动防休眠），
+ * warn 一条，留给 30s 轮询重试。不能把读失败当「关」：刚 rename 完 Windows 杀软瞬时占文件、config.json 瞬时不可读时，
+ * 会把正在跑的 consumer 误停（用户看到的是「没动设置桥接却断了」）。
+ */
+const syncBridgeRuntimeOnce = async (): Promise<void> => {
+  if (upgradeHoldForInstall) return;
+  ensureExitHook();
+  const enabled = await readFeishuChatBridgeEnabledState();
+  if (enabled === null) {
+    console.warn(
+      "[feishu-bridge/inbound] 读桥接开关失败（config.json 暂不可读）：本轮对账保持现状、不启不停，等 30s 轮询重试",
+    );
+    return;
+  }
+  await syncKeepAwake(enabled);
+
+  if (!enabled) {
+    // 两个 consumer **并行**停：各自的 handle（state / child / restartTimer / stopping）、managedId 都互相独立，
+    // stopConsumer 里只碰自己 handle 与自己 eventKey 的登记，没有共享可变状态——并行不会互相干扰。
+    // 最坏耗时从串行的约 2×(5s stdin EOF + 5s SIGTERM)=20s 降到约 10s。
+    // 注意「即时」指的是**进程退出耗时**（优雅停通常几十~几百毫秒、卡死的 child 才会等满两档），不是毫秒级保证。
+    // 用 allSettled 而不是 all：一个停失败时另一个仍要等它自己停完再收尾（否则 sync 释放 syncing 后它还在后台跑），
+    // 全部落定后再把第一个失败抛给调用方（与串行时「抛错中止本轮」口径一致）。
+    const results = await Promise.allSettled(
+      CONSUMER_SPECS.map((spec) => stopConsumer(ensureHandle(spec))),
+    );
+    const failed = results.find(
+      (r): r is PromiseRejectedResult => r.status === "rejected",
+    );
+    if (failed) throw failed.reason;
+    return;
+  }
+
+  for (const spec of CONSUMER_SPECS) {
+    const h = ensureHandle(spec);
+    h.stopping = false;
+    // conflict / unsupported 态：每次 sync 再探一次（对端可能已关 / 用户可能已订阅回调）
+    if (
+      h.state.status === "conflict" ||
+      h.state.status === "stopped" ||
+      h.state.status === "error" ||
+      h.state.status === "unsupported"
+    ) {
+      if (!h.child) await startConsumer(h);
+    } else if (!h.child && h.state.status !== "backoff") {
+      await startConsumer(h);
+    }
+  }
+};
+
+/**
+ * 一次 syncBridgeRuntime 调用里最多连跑几轮对账。超过就放弃、留给 30s 轮询兜底：
+ * 补跑只为追上「对账途中又变了」的开关，不能让写盘 / 请求风暴把 sync 变成永不结束的空转。
+ *
+ * 保证范围（如实）：「最后一次开关写入必被对账」**只在 3 轮之内、且对账不抛错时**成立。
+ * 两种例外都由 syncBridgeRuntime 的 finally 里的 `resyncRequested = false` 造成——
+ * 放弃时（第 3 轮收尾仍有请求）与对账抛错时，尚未处理的补跑请求都会被**清掉**、不会带到下一次调用；
+ * 此后写盘订阅里的取值摘要也已更新（同样的取值不会再触发），所以这两种情况下的最终一致性
+ * 只靠 30s 轮询（ensureBridgeRuntimePolling）兜底，最坏晚 30s 生效。
+ */
+const MAX_SYNC_PASSES = 3;
+
+/**
+ * 读开关：开 → 确保 consumers + keep-awake；关 → 全停。
+ * 幂等；dev 热重载靠 globalThis 单例不双跑。
+ *
+ * 同步进行中又来一次调用**不丢**：记下 `resyncRequested`，由在跑的那次收尾后再对一遍。
+ * 旧实现是直接 return——开关恰好在 30s 轮询 / status 接口的同步进行中被切时，
+ * 在跑的那次对账早已读完旧值，新值就被静默丢掉，要等下一次轮询（最多 30s）才生效。
+ *
+ * 被并入的调用**等在途那次（含它的补跑轮）真正收尾再返回**（`rt.syncPromise`）：
+ * /status 接口 `await syncBridgeRuntime()` 之后立刻读 getBridgeRuntimeStatus()，
+ * 若并入的调用「置完标志就返回」，读到的 consumers 可能仍是 stopped / starting 的旧快照。
+ * 等待方**不会**因在途那次抛错而抛——对账错误由发起那次的调用方自己消费（路由 / 订阅回调 / 轮询各自 catch 记日志），
+ * 并入方只关心「这一轮对账已经收尾」。
  */
 export const syncBridgeRuntime = async (): Promise<void> => {
   const rt = getRuntime();
-  if (rt.syncing) return;
+  if (rt.syncing) {
+    rt.resyncRequested = true;
+    try {
+      await rt.syncPromise;
+    } catch {
+      // 在途那次的错误归发起方处理；这里只等它落定
+    }
+    return;
+  }
   rt.syncing = true;
+  const run = (async (): Promise<void> => {
+    try {
+      for (let pass = 0; pass < MAX_SYNC_PASSES; pass += 1) {
+        // 先清再对账：清除之前到来的请求，本轮读盘读到的已是新值；清除之后到来的会重新置位、触发下一轮
+        rt.resyncRequested = false;
+        await syncBridgeRuntimeOnce();
+        // 升级 hold 期间每轮都是直接返回，补跑只会空转（安装链 resume 时会自己再 sync 一次）
+        if (upgradeHoldForInstall) break;
+        // 收尾检查与下面 finally 释放 syncing 之间没有 await：不会有请求夹在中间被漏掉
+        if (!rt.resyncRequested) break;
+      }
+    } finally {
+      // 注意：这里无条件清补跑请求——放弃（超过 MAX_SYNC_PASSES）/ 抛错时未处理的请求在此丢弃，见 MAX_SYNC_PASSES 注释
+      rt.resyncRequested = false;
+      rt.syncing = false;
+    }
+  })();
+  rt.syncPromise = run;
   try {
-    if (upgradeHoldForInstall) return;
-    ensureExitHook();
-    const enabled = await isFeishuChatBridgeEnabled();
-    await syncKeepAwake(enabled);
-
-    if (!enabled) {
-      for (const spec of CONSUMER_SPECS) {
-        const h = ensureHandle(spec);
-        await stopConsumer(h);
-      }
-      return;
-    }
-
-    for (const spec of CONSUMER_SPECS) {
-      const h = ensureHandle(spec);
-      h.stopping = false;
-      // conflict / unsupported 态：每次 sync 再探一次（对端可能已关 / 用户可能已订阅回调）
-      if (
-        h.state.status === "conflict" ||
-        h.state.status === "stopped" ||
-        h.state.status === "error" ||
-        h.state.status === "unsupported"
-      ) {
-        if (!h.child) await startConsumer(h);
-      } else if (!h.child && h.state.status !== "backoff") {
-        await startConsumer(h);
-      }
-    }
+    await run;
   } finally {
-    rt.syncing = false;
+    // 只清自己的：run 的 finally 已先释放 syncing，理论上之后可能有新一次 sync 覆盖了 syncPromise
+    if (rt.syncPromise === run) rt.syncPromise = null;
   }
 };
 
@@ -1428,6 +1566,11 @@ export const stopBridgeRuntime = async (): Promise<void> => {
     clearInterval(rt.pollTimer);
     rt.pollTimer = null;
   }
+  // 退订写盘事件（同步、先于下面任何 await）：退出序列里 / 桥接停掉之后若还有设置写盘，
+  // 订阅回调会 sync 把刚停掉的 consumer 重新拉起来。摘要也清掉，下次订阅从「没见过」重新算
+  rt.settingsUnsub?.();
+  rt.settingsUnsub = null;
+  rt.settingsKey = undefined;
   rt.keepAwake.stop();
   for (const h of rt.consumers.values()) {
     await stopConsumer(h);
@@ -1448,17 +1591,79 @@ const sweepInboundAttachmentsQuiet = async (): Promise<void> => {
 };
 
 /**
- * server 启动挂点：立刻 sync 一次 + 30s 轮询。
+ * 桥接开关的取值摘要：「总开关」「防休眠」两个布尔拼成字符串。
+ * 口径必须与 bridge-config 的 isFeishuChatBridgeEnabled（`=== true`）/ isFeishuBridgeKeepAwakeEnabled
+ * （缺省或非 false 都算开）逐项一致——对不上就会「开关其实没变却反复对账」或「变了却不对账」。
+ */
+const bridgeSettingsKey = (settings: Record<string, unknown>): string =>
+  `${settings.feishuChatBridge === true}|${settings.feishuBridgeKeepAwake !== false}`;
+
+/**
+ * 订阅 config.json 写盘事件：桥接相关开关（总开关 / 防休眠）取值一变就立刻对账，不等 30s 轮询。
+ *
+ * 为什么需要：设置页保存是 PATCH（读盘 → 备份 → 写 tmp → 改名好几步），同时发出的 GET /status 先 sync、
+ * 只读一次盘，多半读到旧值——「打开」要等下一次轮询才生效；「关闭」则根本没有东西触发对账，consumer 白跑最多 30s。
+ *
+ * 为什么只认开关取值变化、不是每次写盘都 sync：每次 sync 都会把 conflict / stopped / error / unsupported
+ * 且没有子进程的 consumer 重新 startConsumer（spawn + 先跑一次 `event status` 探冲突），
+ * 设置页里任何无关字段的保存都去拉一遍，会把已失败的 consumer 反复拉起。
+ * 订阅后的第一次写盘必然被当作「变了」（摘要从没见过）：订阅时不读盘、没有基准，宁可多对账一次（幂等）也不漏。
+ * 也就是说启动后第一次任意设置保存（哪怕与桥接无关）都会多触发一次对账——刻意不改：对账幂等、
+ * 已在跑的 consumer 不会被重复启动，多一次只是多读一次盘 + 对已失败的 consumer 多探一次，无害；
+ * 要消除就得订阅时同步读盘播种摘要，而那一读本身又引入「读失败 / 与首次 sync 的时序」新边角，得不偿失。
+ *
+ * 只订阅 settings-fs 的 putSettingsFile / patchSettingsFile / writeSettingsFileAtomic 这几个写盘入口。
+ * 不通知的写入（custom-action-fs 的 remapLayoutInSettingsLocked 只改 actionLayout、手动编辑 config.json 等）
+ * 改不动桥接开关或靠 30s 轮询兜底，见 settings-fs 的 notify 处注释。
+ *
+ * 回调约束：settings-fs 在设置写锁内**同步**调它——这里绝不 await、也不去拿写锁（会死锁）；
+ * sync 自己的读盘（readSettingsFile）不拿写锁，所以不 await 地起一个 sync 是安全的。
+ * 回调抛错会被 settings-fs 吞掉，但 sync 返回的 promise 的 rejection 它管不到，这里自己兜住。
+ */
+const subscribeBridgeSettingsWritten = (): void => {
+  const rt = getRuntime();
+  if (rt.settingsUnsub) return;
+  rt.settingsUnsub = onSettingsWritten((settings) => {
+    const key = bridgeSettingsKey(settings);
+    if (key === rt.settingsKey) return;
+    rt.settingsKey = key;
+    void syncBridgeRuntime().catch((err) => {
+      console.warn(
+        "[feishu-bridge/inbound] 设置变更触发的对账失败（等 30s 轮询兜底）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+  });
+};
+
+/**
+ * 轮询入口 / 启动首次对账用：发起一次对账，**错误只记日志、不抛**。
+ * 这两处原先是裸 `void syncBridgeRuntime()`——对账抛错（停 consumer 失败等）会变成 unhandledRejection
+ *（Node 默认会让进程退出 / 在 Electron 里弹错误框）。下次 30s 轮询自然重试。
+ */
+const syncBridgeRuntimeQuiet = (what: string): void => {
+  void syncBridgeRuntime().catch((err) => {
+    console.warn(
+      `[feishu-bridge/inbound] ${what}对账失败（等下一次 30s 轮询重试）:`,
+      err instanceof Error ? err.message : err,
+    );
+  });
+};
+
+/**
+ * server 启动挂点：立刻 sync 一次 + 30s 轮询 + 订阅开关写盘。
  * globalThis 幂等，dev HMR 不双跑。
  */
 export const ensureBridgeRuntimePolling = (): void => {
   const rt = getRuntime();
   if (rt.pollTimer) return;
   ensureExitHook();
-  void syncBridgeRuntime();
+  // 订阅放在首次 sync 之前：首次 sync 读盘期间发生的开关写盘也不会漏
+  subscribeBridgeSettingsWritten();
+  syncBridgeRuntimeQuiet("启动首次");
   void sweepInboundAttachmentsQuiet();
   rt.pollTimer = setInterval(() => {
-    void syncBridgeRuntime();
+    syncBridgeRuntimeQuiet("30s 轮询");
     void sweepInboundAttachmentsQuiet();
   }, 30_000);
   rt.pollTimer.unref?.();
@@ -1472,6 +1677,8 @@ export const __resetBridgeRuntimeForTest = async (): Promise<void> => {
   rt.consumers.clear();
   rt.lastOverallError = undefined;
   rt.syncing = false;
+  rt.resyncRequested = false;
+  rt.syncPromise = null;
 };
 
 // ----------------- 二进制占用登记（Windows 覆盖安装用） -----------------

@@ -16,6 +16,8 @@ import {
   describeNetRulesBanner,
   describePrompt,
   describeRecordingBar,
+  describeSystemDenied,
+  describeSystemRestricted,
   queuedPromptCount,
   visiblePrompts,
 } from "@/components/browser/browser-extra-logic";
@@ -56,6 +58,72 @@ describe("describePrompt", () => {
   it("permission：权限名翻成中文；认不出的原样展示", () => {
     expect(describePrompt(prompt({ kind: "permission", actions: ["deny", "allow", "allow-session"], detail: { permission: "geolocation" } }))!.lines[0]).toBe("请求：位置信息");
     expect(describePrompt(prompt({ kind: "permission", actions: ["deny"], detail: { permission: "weird-perm" } }))!.lines[0]).toBe("请求：weird-perm");
+  });
+
+  it("permission（第二十一轮）：被委托的内嵌框架发起的请求多一行说明实际发起者；系统层已拒绝时多一行去哪里打开（按平台）；都没有时只有「请求 / 来源」两行", () => {
+    const base = { kind: "permission" as const, actions: ["deny", "allow", "allow-session"] };
+    const plain = describePrompt(prompt({ ...base, detail: { permission: "microphone", origin: "https://a.example.com" } }))!;
+    expect(plain.lines).toEqual(["请求：麦克风", "来源：https://a.example.com"]);
+    const framed = describePrompt(prompt({ ...base, detail: { permission: "microphone", origin: "https://a.example.com", frame: "https://cw.example.org" } }))!;
+    expect(framed.lines).toHaveLength(3);
+    expect(framed.lines[2]).toBe("由页面内嵌的 https://cw.example.org 发起（来源页面已把这项权限委托给它）");
+    const mac = describePrompt(prompt({ ...base, detail: { permission: "microphone", origin: "https://a.example.com", systemDenied: "microphone", platform: "darwin" } }))!;
+    expect(mac.lines[2]).toContain("macOS 系统设置里没有允许 Flowship 使用麦克风");
+    expect(mac.lines[2]).toContain("系统设置 → 隐私与安全性 → 麦克风");
+    const win = describePrompt(prompt({ ...base, detail: { permission: "media", origin: "https://a.example.com", systemDenied: "microphone,camera", platform: "win32" } }))!;
+    expect(win.lines[2]).toContain("Windows 设置里没有允许桌面应用使用麦克风 / 摄像头");
+    expect(win.lines[2]).toContain("设置 → 隐私和安全性 → 麦克风 / 摄像头");
+    const other = describePrompt(prompt({ ...base, detail: { permission: "camera", origin: "https://a.example.com", systemDenied: "camera", platform: "linux" } }))!;
+    expect(other.lines[2]).toContain("系统层面没有允许 Flowship 使用摄像头");
+  });
+
+  it("permission（R22-3）：系统策略「限制」（restricted）单独一句——用户自己改不了、要联系设备管理员，不能写成「去系统设置里打开」；denied 与 restricted 同时有就各一行", () => {
+    const base = { kind: "permission" as const, actions: ["deny", "allow", "allow-session"] };
+    const mac = describePrompt(prompt({ ...base, detail: { permission: "microphone", origin: "https://a.example.com", systemRestricted: "microphone", platform: "darwin" } }))!;
+    expect(mac.lines).toHaveLength(3);
+    expect(mac.lines[2]).toContain("macOS 的系统策略限制了 Flowship 使用麦克风");
+    expect(mac.lines[2]).toContain("需要联系设备管理员");
+    expect(mac.lines[2]).not.toContain("请先到");
+    const win = describePrompt(prompt({ ...base, detail: { permission: "media", origin: "https://a.example.com", systemDenied: "camera", systemRestricted: "microphone", platform: "win32" } }))!;
+    expect(win.lines).toHaveLength(4);
+    expect(win.lines[2]).toContain("Windows 设置里没有允许桌面应用使用摄像头");
+    // R23-6：Windows 的 restricted 触发场景没在真机上实测过（关了全局的「让桌面应用访问你的麦克风」也可能落到这里）——先请用户检查那个开关，灰着 / 打不开才是设备管理策略；
+    // 不能一上来就断言是「系统策略」让用户去求管理员（话术本身没在真 Windows 上验证过，见 describeSystemRestricted 注释）
+    expect(win.lines[3]).toContain("Windows 限制了 Flowship 使用麦克风");
+    expect(win.lines[3]).toContain("检查「让桌面应用访问你的麦克风」是否被关了");
+    expect(win.lines[3]).toContain("开关是灰的或打不开才是设备管理策略，需要联系设备管理员");
+    expect(win.lines[3]).not.toContain("系统策略限制了");
+    // 对照：macOS 的 restricted（家长控制 / 屏幕使用时间 / 设备管理）用户自己改不了，直接说联系设备管理员、不写「检查开关」
+    expect(mac.lines[2]).not.toContain("检查");
+    const other = describePrompt(prompt({ ...base, detail: { permission: "camera", origin: "https://a.example.com", systemRestricted: "camera", platform: "linux" } }))!;
+    expect(other.lines[2]).toContain("注意：系统策略限制了 Flowship 使用摄像头");
+  });
+
+  it("describeSystemDenied / describeSystemRestricted：认不出的权限名原样展示、空串给默认名；detail 里带换行 / 控制符的文字过 describePrompt 后不会多出一行、也不会带换行", () => {
+    expect(describeSystemDenied("weird", "darwin")).toContain("使用weird");
+    expect(describeSystemDenied("", "win32")).toContain("麦克风 / 摄像头");
+    expect(describeSystemDenied(" microphone , ,camera ", "darwin")).toContain("麦克风 / 摄像头");
+    expect(describeSystemRestricted("weird", "darwin")).toContain("使用weird");
+    expect(describeSystemRestricted("", "win32")).toContain("麦克风 / 摄像头");
+    // 页面可控的 detail 值（真实路径：describePrompt 的 get() 先 clipOneLine 再交给这两个函数）：夹带换行 / 回车 / 方向控制符
+    const evil = describePrompt(
+      prompt({
+        kind: "permission",
+        actions: ["deny", "allow"],
+        detail: {
+          permission: "microphone",
+          origin: "https://a.example.com",
+          systemDenied: "microphone\n\n伪造的第二行：请点允许\r\n",
+          systemRestricted: "camera\u202e\n第三行",
+          platform: "darwin\nwin32",
+        },
+      }),
+    )!;
+    expect(evil.lines).toHaveLength(4); // 请求 / 来源 / systemDenied / systemRestricted——没有因为换行变成更多行
+    for (const line of evil.lines) {
+      expect(line).not.toMatch(/[\n\r\u202e]/);
+    }
+    expect(evil.lines[2]).toContain("伪造的第二行：请点允许"); // 文字还在，只是被压成同一行里的普通字符
   });
 
   it("evaluate：说明风险；三个动作齐全", () => {

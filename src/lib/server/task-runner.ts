@@ -240,7 +240,11 @@ import {
 import {
   beginNonOwnerTurn,
   clearNonOwnerTurn,
+  endMidRunForeignContent,
   endNonOwnerTurn,
+  isGroupNonOwnerTurnActive,
+  isNonOwnerTurnActive,
+  type NonOwnerTurnScope,
 } from "./non-owner-turn-guard";
 import { buildScheduleInfoMeta, SCHEDULE_ONE_SHOT_BOUNDARY_LINES } from "@/lib/schedule";
 import { findOwnerNote } from "@/lib/owner-note";
@@ -525,6 +529,18 @@ export interface SessionCreds {
  *
  * @param opts.keepPersisted true = 保留落盘的 sessionAgentId（空闲回收用——下次操作 Agent.resume
  *   接回来）；缺省 false = 连持久化锚点一起清（停止 / 终结 / 报错 / 换新 agent 是真结束）
+ * @param opts.keepNonOwnerTurn true = 关会话时**不**顺手清这个 task 的「非属主轮 / 外来内容」标记。缺省 false = 真关到会话就清
+ *   （会话关了、这一轮不再存在：停止 / 终结 / 报错 / 换新 agent）；没有会话（带 / 不带 `expectedSessionInstanceId` 各一个 `return`）/ agentId 不符 / 实例号不符——
+ *   **三种情形、共四个 `return false`**——都在清除之前，那几种情形标记不动（第十四轮评审 P3-6 ①：此前写「无条件清」偏满；第十五轮评审 P3-6：再改「三处」为「三种情形四个 return」，源码契约数的是四个 return）。**同一轮的续接**是例外，要自己处理，忘了处理就是 fail-open（续上的那一轮没有标记地跑：
+ *   desktop_* / 写所有者备注 / 新建定时 / 自动推进全放开）。目前有两处：
+ *   ① **自动重连链传 true**（{@link tryAutoReconnect} 的三处）：重连是「同一轮的续接」——旧的坏会话摘掉、`Agent.resume` 接回、发一句「从断点继续」，
+ *   续上的那一轮仍是别人（或别人写的内容）在驱动，标记要留给它，由 consumeSessionRun 最外层的 finally 按 token / 按名收口
+ *   （与 chat 侧一致：chat-runner 里 reconnect 只摘表、不清标记，只有 restart 才清；第十三轮评审 P2-2）。失主让位的那一支
+ *   （刚 resume 出的记录要摘、op 已换主）同样不碰标记：它可能已是后继自己登记的。
+ *   ② **run 内水位的「自动压缩续接」不靠这个参数**（第十四轮评审 P2）：它 `void` 出去接力、旧 consume 随后 `return` 进 finally 按旧 token / 按名清，
+ *   只保留标记没用——所以由 `consumeSessionRun` 里 `rotationRequested` 的接力分支在关会话**之前**读 `isGroupNonOwnerTurnActive` / `isNonOwnerTurnActive`，为真就给
+ *   `resumeCurrentActionWithMessage` 传 `foreignContentTurn: true` 与旧标记的范围（`foreignContentScope`，第十五轮评审 P3-2），让新启动在首次 send 之前重新登记。
+ *   其余调用方（用户停止 / 终结 / 报错 / 换新 agent / 空闲回收 / 失主清理）都是「这一轮确实结束」，该清。
  * @returns 是否真的关了一个会话
  */
 export const closeTaskSession = (
@@ -535,6 +551,8 @@ export const closeTaskSession = (
     keepPersisted?: boolean;
     /** 会话内存实例号；传了则精确匹配才关（fail-closed） */
     expectedSessionInstanceId?: number;
+    /** 见上：自动重连链专用，关会话时保留「非属主轮 / 外来内容」标记 */
+    keepNonOwnerTurn?: boolean;
   } = {},
 ): boolean => {
   const session = agentSessions.get(taskId);
@@ -556,8 +574,10 @@ export const closeTaskSession = (
     return false;
   }
   agentSessions.delete(taskId);
-  // 会话没了，其上的「非属主轮」工具硬拒标记也没有意义——无条件清（宁多清别漏清）
-  clearNonOwnerTurn(taskId);
+  // 会话没了，其上的「非属主轮」工具硬拒标记也没有意义——到这里（前面四个 `return false` 都没拦下）就清，不看 token（宁多清别漏清）。
+  // 例外：自动重连链（keepNonOwnerTurn）——那是同一轮的续接，标记要留给续上的新会话（第十三轮评审 P2-2，见上面的参数说明）；
+  // 压缩续接则由调用方重新登记（第十四轮评审 P2）
+  if (!opts.keepNonOwnerTurn) clearNonOwnerTurn(taskId);
   // 会话是当前的 → 注册表里的 notifier / handler 必属于它、无条件注销安全
   setChatAwaitingNotifier(taskId, null);
   setChatTaskActionHandler(taskId, null);
@@ -590,14 +610,45 @@ export const closeTaskSession = (
 // 不做 60~90s 宽限期（按体感后续再补）。宽限期内的内存上限仍有界，见开工清单。
 const SESSION_IDLE_TTL_MS = 12 * 60 * 1000;
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+/**
+ * 「启动中」豁免的上限（第十五轮评审 P3-2 ③）：`isTaskStarting` 是没有时间戳的全局引用计数——启动链若挂死（某个 await 永不返回、
+ * 计数永不归零），这个会话就永远不会被回收（子进程 / 内存泄漏）。豁免最多认这么久：从 sweeper **第一次看到**这个 task 处于「启动中」起算，
+ * 超过就不再豁免、照常按空闲 TTL 回收（宁可让一次真的超长启动降级一次——send 失败后会走 resume / 新起 agent——也不让悬挂泄漏）。
+ * 取 3 个扫描间隔（30 分钟）：正常的启动飞行窗最长是 agent.send 的 120 秒、加上 create / resume / worktree 准备的几分钟，远低于它。
+ * 不改 `isTaskStarting` 本身的形状（引用计数有很多调用方，别处也在用）；起算点是 sweeper 自己记的（见下面的 startingSeenAt）。
+ */
+const SESSION_STARTING_EXEMPT_MAX_MS = 3 * SESSION_SWEEP_INTERVAL_MS;
 const SESSION_SWEEPER_KEY = "__flowshipSessionSweeperV1__";
 {
   const g = globalThis as unknown as Record<string, NodeJS.Timeout | undefined>;
   if (!g[SESSION_SWEEPER_KEY]) {
+    /** taskId → sweeper 第一次看到它处于「启动中」的时刻；一次 sweep 里没看到「启动中」（或 run 已在跑）就清掉，下次重新起算 */
+    const startingSeenAt = new Map<string, number>();
     g[SESSION_SWEEPER_KEY] = setInterval(() => {
       const now = Date.now();
       for (const [taskId, s] of agentSessions) {
-        if (runningTasks.has(taskId)) continue; // run 在跑不算空闲
+        if (runningTasks.has(taskId)) {
+          startingSeenAt.delete(taskId);
+          continue; // run 在跑不算空闲
+        }
+        // 启动飞行窗里（sendToTaskSession 等已受理、run 还没占上 runningTasks；agent.send 最长 120 秒）同样不算空闲：
+        // lastActiveAt 要等 send resolve 才刷新，闲置超 TTL 的会话刚收到消息、恰好撞上整点，就会在 send 进行中被关掉
+        // （这一次 send 失败降级；外来内容那一轮的标记也被 closeTaskSession 默认清掉）。与 DELETE / 停止 / 群唤醒同一把尺子（第十四轮评审 P3-7）。
+        // 豁免有上限（SESSION_STARTING_EXEMPT_MAX_MS）：启动链悬挂时计数永不归零，不能让它永远豁免下去（第十五轮评审 P3-2 ③）。
+        // 近似：「起算点」是第一次看到，两次 sweep 之间若有一次启动结束又来了另一次，会被当成同一次——要连续 4~5 次 sweep 都撞上启动中才会超限，现实里不会。
+        // 判界是 `<=`（上限含边界）：名义上（间隔恰好 10 分钟，如 fake timers）距首次看到 0 / 10 / 20 / 30 分钟的前 4 次都在豁免内、第 5 次（40 分钟）才回收；
+        // 真实的 setInterval 每次触发都比名义时刻晚几毫秒（Node 从回调触发的时刻重新计时，漂移只增不减），第 4 次的间隔会略大于 30 分钟，线上通常第 4 次就不再豁免
+        // （第十六轮评审 P3-T5：此前写「连续 4 次（≥ 30 分钟）」差一；tests/task-session-sweeper-starting.test.ts 的「豁免有上限」用例用 fake timers 钉的是名义口径）
+        if (isTaskStarting(taskId)) {
+          const since = startingSeenAt.get(taskId) ?? now;
+          startingSeenAt.set(taskId, since);
+          if (now - since <= SESSION_STARTING_EXEMPT_MAX_MS) continue;
+          console.warn(
+            `[task-runner] task=${taskId} 的「启动中」已被 sweeper 连续看到 ${Math.round((now - since) / 60000)} 分钟（疑似启动链悬挂），不再豁免、按空闲 TTL 判回收`,
+          );
+        } else {
+          startingSeenAt.delete(taskId);
+        }
         if (now - s.lastActiveAt > SESSION_IDLE_TTL_MS) {
           console.log(
             `[task-runner] 会话空闲回收 task=${taskId} agentId=${s.agentId}（闲置 ${Math.round((now - s.lastActiveAt) / 60000)} 分钟、可 resume 接回）`,
@@ -608,6 +659,10 @@ const SESSION_SWEEPER_KEY = "__flowshipSessionSweeperV1__";
             expectedSessionInstanceId: s.instanceId,
           });
         }
+      }
+      // 会话已不在表里的 task：别让起算点残留（Map 有界：只含「有会话且被看到启动中」的 task，会话摘了就清）
+      for (const taskId of startingSeenAt.keys()) {
+        if (!agentSessions.has(taskId)) startingSeenAt.delete(taskId);
       }
     }, SESSION_SWEEP_INTERVAL_MS);
     // 不阻止进程退出
@@ -1779,6 +1834,19 @@ export interface ResumeCurrentActionInput {
    * 缺省不阻塞。回调里不要 throw——后面还要起 agent。
    */
   onRunningCommitted?: (task: Task) => void;
+  /**
+   * 「别人写的内容在驱动」的一轮（所有者空 @ 引用了别人的消息等）：唤醒出来的新 agent 这一轮登记「群成员触发」标记
+   * （scope 见 {@link foreignContentScope}，缺省 desktop），见 non-owner-turn-guard。
+   * 两类调用方会带它：输入条唤醒（task-question-inject，所有者空 @ 引用别人）、run 内水位的「自动压缩续接」接力（consumeSessionRun，
+   * 那是**同一轮**的续接，标记跟着新 agent 走）。
+   */
+  foreignContentTurn?: boolean;
+  /**
+   * 配合 {@link foreignContentTurn}：新启动登记的标记范围。缺省 `desktop`（输入条唤醒：所有者自己的会话、只拒电脑操作）；
+   * 压缩续接要**原样沿用**旧一轮的范围——旧标记是 `all`（提示词开关开着的群非属主轮：系统工具整体硬拒）时，续上的那一轮也得是 `all`，
+   * 不能被降成 desktop（第十五轮评审 P3-2）。
+   */
+  foreignContentScope?: NonOwnerTurnScope;
 }
 
 export const resumeCurrentActionWithMessage = async (
@@ -2037,6 +2105,9 @@ const resumeCurrentActionCore = async (
     replanDirective,
     opGen,
     opHandle,
+    ...(input.foreignContentTurn
+      ? { foreignContentTurn: true, ...(input.foreignContentScope ? { foreignContentScope: input.foreignContentScope } : {}) }
+      : {}),
   });
 };
 
@@ -2693,6 +2764,14 @@ interface StartAgentInput {
    * owner handle——贯穿整条启动链；缺省则受理段自 claim（其它入口路径）。
    */
   opHandle?: TaskOpHandle;
+  /**
+   * 「别人写的内容在驱动」的一轮（resumeCurrentActionWithMessage 的两类调用方会带：输入条唤醒、run 内水位的压缩续接接力）：
+   * agent 起跑（send）前登记「群成员触发」标记（scope 见 {@link foreignContentScope}）、整轮 run 结束后摘。
+   * **没带这个标志 = 属主自己的新启动**：首次 send 之前把这个 task 上残留的旧标记清掉（见 internalStartAgent 里 send 之前那一段）。
+   */
+  foreignContentTurn?: boolean;
+  /** 配合 {@link foreignContentTurn}：登记的标记范围，缺省 `desktop`（压缩续接会原样沿用旧标记的范围，见 ResumeCurrentActionInput.foreignContentScope） */
+  foreignContentScope?: NonOwnerTurnScope;
 }
 
 // ----------------- V0.11.1：会话桥工厂（handler + notifier、create / resume 共用） -----------------
@@ -3704,6 +3783,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const agentBox: { current: AgentInstance | null } = { current: null };
       // V12：本条启动链的 owner handle（受理段 claim / 沿用调用方；失败/收尾靠它门控）
       let opHandle: TaskOpHandle | undefined;
+      // 「别人的内容在驱动」（input.foreignContentTurn）时登记的标记 token：send 前登记、下面的 finally 按 token 摘
+      let foreignContentToken: string | undefined;
       try {
         // V0.10：隔离 task 的 cwd = worktree（入口 ensureWorkspaceReady 已保证目录在盘上）
         // 存量清理：以前 inject 的 fe hooks.json 删掉（hooks 链路已退役、交卷改 send 追问）
@@ -4002,6 +4083,25 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               promptBudgetDropped: superPromptBuilt.dropped.map((d) => d.name),
               promptBudgetCompressed: superPromptBuilt.compressed,
             });
+            // 标记收口点（第十五轮评审 P3-1）：与下面的 `created.send` 之间不得有 await——这是新启动「接管这个 task 上标记」的唯一位置。
+            //  · 「别人写的内容在驱动」（所有者空 @ 引用了别人的消息 / 压缩续接接力）：agent 一开口就可能调工具，标记必须在 send 之前就位；
+            //    登记会覆盖 task 上残留的旧标记（含被强清的旧 run 留下的），范围沿用调用方给的（压缩续接 = 旧标记的范围，缺省 desktop）；
+            //  · 属主自己的新启动（没带 foreignContentTurn）：清掉 task 上残留的旧标记。前面强清（forceClearStaleRunnerState）不再清标记——
+            //    被强清的旧 run 并没有停（一次性前驱不在 agentSessions、agent 不会被关），desktop 闸只认 taskId 上的标记，在这之前清了它就能调电脑；
+            //    推迟到后继真要 send 的这一刻才清，旧 run 在建 agent 的这段时间里始终受限。与 task 型属主 send 起点（sendToTaskSessionBody 的
+            //    `if (!opts.nonOwnerTurn) clearNonOwnerTurn`）、一次性问答的属主启动（startOneShotQuestion 首次 sendTurn 之前的
+            //    `if (!foreignContent) clearNonOwnerTurn`，第十六轮评审 P3-T1）同口径。
+            //    残余的收口（第十八轮，第十六轮评审 P3-T2；用户授权按推荐处理；第十九轮评审 R19-3 订正此前「已收口」偏满的说法，第二十轮评审 R20-6 补齐这一处）：清掉之后，被强清放弃、但并没真停的旧 run 本来不再受限（强清前已 cancel 并等了 5 秒；而 CANCEL_WAIT_GRACE_MS（30 秒）只罩取消之后的 run.wait()——
+            //    计时要等 stream 循环结束才开始，流阶段没有这个上限、只有 24h 硬顶，第十七轮评审 N1）——现在由咽喉的过期会话闸（flowship-tools.ts 的 isStaleSessionRestrictedCall + matchExpectedCallerToken）按 callerToken 拒：
+            //    本处（internalStartAgent）的后继 token 在这里清标记之前就已装好（installSessionIfCurrent），旧 run 的受限调用得到 CALLER_MISMATCH_ERROR；
+            //    task 的属主 send 起点（sendToTaskSessionBody）不是这样——它先清标记、续接时才装 token，靠强清当场同步作废旧 token（R19-3）兜住。
+            //    **仍有一条更窄的残留**：闸只圈 desktop_* 与 groupOpenTurnToolDenied 那批（圈外的 browser_navigate / click / type / upload 等 handler 不核对 token，旧 run 清标记之后仍不受限，R20-7）；
+            //    abortStuckRunForSend（假死恢复）刻意保留会话给后继 send 复用、新旧 run 共用同一个 token，闸区分不了。详见 non-owner-turn-guard.ts 头注释。
+            if (input.foreignContentTurn) {
+              foreignContentToken = beginNonOwnerTurn(task.id, Date.now(), input.foreignContentScope ?? "desktop");
+            } else {
+              clearNonOwnerTurn(task.id);
+            }
             const run = await withSdkDeadline(
               created.send(superPrompt, {
                 onDelta: composeOnDelta(
@@ -4082,6 +4182,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         await consumeSessionRun(task, liveAgent, admitted.run, {
           errorActionId: action.id,
           opHandle: opHandle!,
+          // 「别人的内容在驱动」的标记交给 consume 在 run 结束时先于一切收尾摘掉（与 sendToTaskSession 同口径）：
+          // agent 交卷后会话是刻意保留的，不能指望「关会话」顺带清它
+          nonOwnerTurnToken: foreignContentToken,
         });
       } catch (err) {
         const failedAgent = agentBox.current;
@@ -4131,6 +4234,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           unsetChatTaskActionHandlerIf(task.id, bridges.taskActionHandler);
         }
       } finally {
+        // 没进 consume 的早退（让位 / send 抛错 / stale）在这里收口；进了 consume 的由它的 finally 按同一 token 先收
+        endNonOwnerTurn(task.id, foreignContentToken);
         endTaskStarting(task.id);
       }
     })();
@@ -4350,12 +4455,17 @@ const tryAutoReconnect = async (
     const y = yieldIfOpLost();
     if (y) return y;
   }
-  // 旧 agent 连接已死：只关自己入场时的会话实例、保留持久化锚点
+  // 旧 agent 连接已死：只关自己入场时的会话实例、保留持久化锚点。
+  // keepNonOwnerTurn：重连是同一轮的续接（下面 resume 之后发「从断点继续」、递归 consumeSessionRun 接着消费），
+  // 驱动这一轮的「非属主轮 / 外来内容」标记要留给续上的新会话——closeTaskSession 缺省会无条件清它，续上的那一轮就没有标记地跑了
+  // （desktop_* / 写所有者备注 / 新建定时 / 自动推进全放开；第十三轮评审 P2-2，chat 侧 reconnect 早就是只摘表不清标记）。
+  // 标记由 consumeSessionRun 最外层的 finally 收口（按 token / 按名）：续上的那一轮跑完、放弃重连、用户停止都走它，不会残留。
   if (myReconnectSessionId !== undefined) {
     closeTaskSession(task.id, undefined, {
       reap: false,
       keepPersisted: true,
       expectedSessionInstanceId: myReconnectSessionId,
+      keepNonOwnerTurn: true,
     });
   }
   const creds = await readServerCreds(task);
@@ -4367,12 +4477,14 @@ const tryAutoReconnect = async (
   {
     const y = yieldIfOpLost();
     if (y) {
-      // 失主必须关掉刚 resume 出的 agent/record——旧实现只 return 会泄漏 A
+      // 失主必须关掉刚 resume 出的 agent/record——旧实现只 return 会泄漏 A。
+      // keepNonOwnerTurn：失主 = op 已换主，标记可能已是后继自己登记的，这里不碰；本 consume 自己的标记由它的 finally 按 token 收口
       if (record) {
         const closed = closeTaskSession(task.id, undefined, {
           reap: false,
           keepPersisted: true,
           expectedSessionInstanceId: record.instanceId,
+          keepNonOwnerTurn: true,
         });
         if (!closed) {
           try {
@@ -4459,11 +4571,12 @@ const tryAutoReconnect = async (
     // 死会话当「别的实例已登记」CAS 让位——后面几轮全部空转、白白退避到放弃，死会话还一直占着位子。
     // 离线 / VPN 重连 / 刚唤醒笔记本最容易撞上（resume 靠本地存储能成功、send 要联网）。
     // 按 instanceId 门控只关自己装的那条（用户 / 推进已换主则 no-op）；keepPersisted 留锚点给下一轮 resume；
-    // reap:false——它还没跑过任何 shell。
+    // reap:false——它还没跑过任何 shell。keepNonOwnerTurn：同上，下一轮重连还要续这一轮、标记要留着。
     closeTaskSession(task.id, undefined, {
       reap: false,
       keepPersisted: true,
       expectedSessionInstanceId: record.instanceId,
+      keepNonOwnerTurn: true,
     });
     // 递归的「旧会话实例号」也换成刚摘掉的这条：它才是本轮之后「我关过的实例」，
     // 下一轮 resume 的 CAS（closedSessionInstanceId）据此只认「表里是别人 = 让位」。
@@ -5273,6 +5386,19 @@ const consumeSessionRun = async (
         // 凭据走服务端兜底（本路径没有 client bootArgs、同自动重连）；缺凭据落回普通 cancel 收尾
         const creds = await readServerCreds(task);
         if (isApiKeyFieldPresent(creds.apiKey) && creds.model) {
+          // 「别人的内容在驱动」的一轮（群成员触发 / 所有者空 @ 引用别人 / 别人答了 ask_user）：压缩续接是**同一轮**的续接，
+          // 标记要跟着新 agent 走（第十四轮评审 P2）。必须在 closeMySession 之前读——摘会话会无条件清标记，本 consume 的 finally 也会按
+          // token / 按名清；只给 closeTaskSession 加 keepNonOwnerTurn 不够（finally 照样清），所以让接力的新启动在首次 send 之前重新登记
+          // （internalStartAgent 的 foreignContentTurn 分支）。属主自己的一轮没有活标记 → 不带，不凭空造。
+          // 范围原样沿用（第十五轮评审 P3-2）：旧标记是 all（提示词开关开着的群非属主轮、系统工具整体硬拒）就续 all，不能降成 desktop。
+          //
+          // 为什么新标记不会被旧 run 的收尾清掉（第十五轮评审 P3-3「理由要改写」；顺序由 task-midrun-rotation-keeps-marker 的源码契约钉）：
+          //  · 旧 consume 的 finally 里清标记的两行（`endNonOwnerTurn` 按旧 token、`endMidRunForeignContent` 按名）是本分支 `return` 之后**最先同步执行**的语句，
+          //    排在 `await finalizeOpenToolCalls` 与 `runningTasks.delete` 之前；接力的新启动（resumeCurrentActionWithMessage）要等旧 record 退表、
+          //    中间隔着一串 await，才在 internalStartAgent 里登记——新标记一定晚于这两行；
+          //  · 就算顺序反了，这两行也伤不到新标记：按 token 清——旧 token 对不上；按名清——只清 midRun 型标记，新启动登记的是 send 起点型（beginNonOwnerTurn）。
+          const foreignContinues = isGroupNonOwnerTurnActive(task.id);
+          const foreignScope: NonOwnerTurnScope = isNonOwnerTurnActive(task.id) ? "all" : "desktop";
           closeMySession();
           await writeOwnedEventAndPublish(
             task.id,
@@ -5280,29 +5406,42 @@ const consumeSessionRun = async (
             { kind: "info", text: SESSION_ROTATION_INFO_TEXT },
           );
           const freshMeta = (await getTaskMeta(task.id)) ?? task;
-          void resumeCurrentActionWithMessage({
-            task: freshMeta,
-            userMessage: buildMidRunRotationRelayMessage(freshMeta),
-            apiKey: creds.apiKey,
-            fallbackModel: creds.model,
-            gitToken: creds.gitToken,
-          }).catch(async (err) => {
-            console.error(
-              `[task-runner] task=${task.id} 自动压缩续接失败`,
-              err,
-            );
-            // eslint-disable-next-line no-restricted-syntax -- detached catch（fire-and-forget）：resume 的 claimTaskOp 已换主、opts.opHandle 的 lease 闭包必 no-op，只能裸写事件
-            await writeEventAndPublish(task.id, {
-              kind: "error",
-              // 恢复文案统一走 stop-copy（第五轮 P4：原先硬编码「请在底部输入条说句话唤醒本阶段」，与其它停止 / 恢复文案漂移）
-              text: `自动压缩续接失败：${resumeHintFor(task.mode)}`,
+          // 测试插桩：停在「三个 await 刚结束、复查之前」，用例在这里模拟用户点停止（cancelTaskRun → cancelled=true）
+          await failpoint("consume.rotation.beforeRelay");
+          // 上面三个 await（读凭据 / 写灰线 / 读最新 meta）期间：用户可能点了停止（cancel 回调置 cancelled，旧 record 还在表里）、24h 硬超时可能到点、
+          // op 也可能被别的推进 / 唤醒接管。不复查就起接力，等于无视停止、新 run 还带着标记起来（第十五轮评审 P3-2）。
+          // 失主 = 别人已经接管，让位；停止 / 超时 = 落回下面「正常 cancel」收尾（会话已经摘了、灰线已写，不再起新 agent）
+          if (lostStartOwner()) return;
+          if (!cancelled && !hardTimedOut) {
+            void resumeCurrentActionWithMessage({
+              task: freshMeta,
+              userMessage: buildMidRunRotationRelayMessage(freshMeta),
+              apiKey: creds.apiKey,
+              fallbackModel: creds.model,
+              gitToken: creds.gitToken,
+              ...(foreignContinues ? { foreignContentTurn: true, foreignContentScope: foreignScope } : {}),
+            }).catch(async (err) => {
+              console.error(
+                `[task-runner] task=${task.id} 自动压缩续接失败`,
+                err,
+              );
+              // eslint-disable-next-line no-restricted-syntax -- detached catch（fire-and-forget）：resume 的 claimTaskOp 已换主、opts.opHandle 的 lease 闭包必 no-op，只能裸写事件
+              await writeEventAndPublish(task.id, {
+                kind: "error",
+                // 恢复文案统一走 stop-copy（第五轮 P4：原先硬编码「请在底部输入条说句话唤醒本阶段」，与其它停止 / 恢复文案漂移）
+                text: `自动压缩续接失败：${resumeHintFor(task.mode)}`,
+              });
             });
-          });
-          return;
+            return;
+          }
+          console.warn(
+            `[task-runner] task=${task.id} 自动压缩续接准备期间用户已停止 / 硬超时，不再起接力、按普通 cancel 收尾`,
+          );
+        } else {
+          console.warn(
+            `[task-runner] task=${task.id} 自动压缩续接缺凭据、按普通 cancel 收尾`,
+          );
         }
-        console.warn(
-          `[task-runner] task=${task.id} 自动压缩续接缺凭据、按普通 cancel 收尾`,
-        );
       }
       // 问一问的 run 被停：只是不想听它说了——action / 会话都不动、runStatus 归回等待位
       // gen stale 或已非 owner 时勿 restore
@@ -5871,6 +6010,19 @@ const consumeSessionRun = async (
   } finally {
     // 非属主轮结束：先于一切收尾释放按轮次的工具硬拒标记（按 token，不误清后继）
     endNonOwnerTurn(task.id, opts.nonOwnerTurnToken);
+    // 本轮进行中才补登的标记（非属主答了 agent 挂着的 ask_user、答案写进 curl stdout 同一轮继续）：没有 send 起点、没有 token，
+    // 这里按名清（只清 midRun 那种；send 起点登记的标记已在上一行按 token 收了）。
+    // 按名清不看归属：本 run 若已被 forceClear / abortStuck 摘出表、后继 B 占了 runningTasks 并为自己这一轮补登了中途标记，
+    // 本 run 迟到的收尾（卡住的 run 天然比后继收尾得晚）按名清会把 B 的标记一并清掉——B 后半段的 desktop_* / 写所有者备注 / 新建定时恒拒就失效了
+    // （第八轮评审 P3-4，与 chat 侧第七轮 N1 / 第八轮 N2 同类；chat 侧的判据见 chat-runner 的 isChatSlotHeldByOtherInstance）。
+    // 所以和下面摘 runningTasks 一样看归属：表里是别的 run 就不碰（B 的标记归 B 自己的收尾清）；表空 / 还是本 run 才清。
+    // myInstanceId 为空 = 本 consume 没登记过 record，表里有谁都算别人
+    {
+      const slotNow = runningTasks.get(task.id);
+      if (!(slotNow !== undefined && slotNow.instanceId !== myInstanceId)) {
+        endMidRunForeignContent(task.id);
+      }
+    }
     // 收尾持有者闭合未配对 tool running（cancel / error / finished 共用入口）
     // 必须在 release 之前；失主（已被后继 claim）lease 拒写、不伤 B
     // R14 Q7b-02：闭合本身抛错（读事件尾部 / 停后台 shell 跟踪失败：Windows 杀软 / 句柄占用 / EIO / ENOSPC）不能挡住下面的释放——
@@ -5960,7 +6112,12 @@ export const resumeTaskSession = async (
    * opHandle 必须由 caller 入场快照透传——本函数禁止自行 snapshotTaskOp
    * （重拍会在 Agent.resume await 期间拍成后继 B 的 observer、把 A 的 agent 绑到 B）。
    */
-  opts?: { closedSessionInstanceId?: number; opHandle?: TaskOpHandle },
+  opts?: {
+    closedSessionInstanceId?: number;
+    opHandle?: TaskOpHandle;
+    /** Agent.resume 的超时（毫秒），缺省 {@link SDK_CREATE_RESUME_TIMEOUT_MS}（180s）。群消息唤醒传短一些，见 wakeTaskSessionForGroup */
+    resumeTimeoutMs?: number;
+  },
 ): Promise<AgentSessionRecord | null> => {
   // 自定义允许空 Key（本地无鉴权）；缺字段才 resume 不了。Cursor 空 Key 由 SDK 自己失败。
   if (!task.sessionAgentId || !isApiKeyFieldPresent(creds.apiKey)) return null;
@@ -6041,7 +6198,7 @@ export const resumeTaskSession = async (
         local: { cwd: getTaskCwd(task), settingSources: [] },
         mcpServers: mergedMcp,
       }),
-      SDK_CREATE_RESUME_TIMEOUT_MS,
+      opts?.resumeTimeoutMs ?? SDK_CREATE_RESUME_TIMEOUT_MS,
       "Agent.resume",
     );
     const closeLocal = (): void => {
@@ -6158,6 +6315,105 @@ export const resumeTaskSession = async (
 };
 
 /**
+ * 群消息唤醒的 Agent.resume 上限。常态秒级；比属主自己 send 的 180s 短得多——唤醒发生在飞书入向的**全进程单链**里，
+ * 卡住会拖慢所有群与所有者命令（含 /stop）。
+ */
+const GROUP_WAKE_RESUME_TIMEOUT_MS = 30_000;
+/** 唤醒失败后同一任务的冷却：期间不再尝试（直接落旁路），免得陌生人每发一条就把入向链再卡一轮 */
+const GROUP_WAKE_FAIL_COOLDOWN_MS = 3 * 60_000;
+const groupWakeFailedAt = new Map<string, number>();
+
+const rememberGroupWakeFailure = (taskId: string): void => {
+  const now = Date.now();
+  // 有界：过期项在写入时顺手清（任务多时也不会无限涨）
+  if (groupWakeFailedAt.size >= 64) {
+    for (const [id, at] of groupWakeFailedAt) {
+      if (now - at >= GROUP_WAKE_FAIL_COOLDOWN_MS) groupWakeFailedAt.delete(id);
+    }
+  }
+  groupWakeFailedAt.set(taskId, now);
+};
+
+/** 仅测试：清空唤醒失败冷却 */
+export const __resetGroupWakeCooldownForTest = (): void => {
+  groupWakeFailedAt.clear();
+};
+
+/**
+ * 群里**非属主真人**的消息撞上休眠会话、且设置「限制群里非宿主成员」已关时，由群入向调用：把落盘锚点的会话接回来
+ * （{@link resumeTaskSession}），之后这条消息按「活会话 + 开关关」的既有路径并入——和属主在群里说话同一个标准。
+ *
+ * 为什么不放进注入链：task-question-inject 对非属主「绝不唤醒、不带 creds」是硬契约，那里不读开关才不会误唤醒。
+ * 唤醒由群入向在**送进去之前**单独做（且只在开关关时），注入链原样不动。
+ *
+ * 任一条件不满足 / 任何一步失败都返回 false，调用方落回只读旁路（行为与没有本函数时一致）：
+ * - 只 resume，**绝不**起新 agent / 一次性 agent / 唤醒模式：没有落盘锚点、凭据缺、任务已归档、在跑 / 启动中 / 终态 / 停止中、
+ *   堆内存高压、resume 让位或抛错，都算「没唤醒」；
+ * - 与 {@link sendToTaskSession} 走同一条串行链（runWithTaskSendSerial）：并发唤醒、与属主同时说话都排队，
+ *   排到时会话已在就直接 true，不会 resume 两次；
+ * - 「启动中」标记（begin/endTaskStarting）覆盖整个 resume：DELETE / 停止 / 收尾会等它落地再清工作区，
+ *   否则 resume 的 await 窗口里这些路径看不到「有人在起会话」（评审）；
+ * - opHandle 入场快照：排队期间 stop / 重发会让它失效，resume 各个 await 之后都会复查；
+ * - 短超时 + 失败冷却：群入向是**全进程单链**，resume 卡住会拖慢所有群与所有者命令（含 /stop），
+ *   所以只给 {@link GROUP_WAKE_RESUME_TIMEOUT_MS}；失败后同一任务 {@link GROUP_WAKE_FAIL_COOLDOWN_MS} 内不再尝试
+ *   （直接 false），免得陌生人每发一条就再卡一轮。没有更多限流——「无额外限流」是有意的，见 docs/feishu-group-collab.md。
+ *
+ * 凭据由调用方给（群入向用服务端设置里的 apiKey / 模型）：只用于 resume，不回显给发言人。
+ */
+export const wakeTaskSessionForGroup = async (
+  taskId: string,
+  creds: SessionCreds,
+): Promise<boolean> => {
+  if (agentSessions.has(taskId)) return true;
+  const failedAt = groupWakeFailedAt.get(taskId);
+  if (failedAt !== undefined) {
+    if (Date.now() - failedAt < GROUP_WAKE_FAIL_COOLDOWN_MS) return false;
+    groupWakeFailedAt.delete(taskId);
+  }
+  const opHandle = snapshotTaskOp(taskId);
+  try {
+    return await runWithTaskSendSerial(taskId, async () => {
+      if (agentSessions.has(taskId)) return true;
+      // 在跑 / 启动中 / 一次性 agent 占着：这不是「休眠」，别碰
+      if (runningTasks.has(taskId) || isTaskStarting(taskId)) return false;
+      // 上面的判断与这里之间没有 await：「启动中」标记同步挂上，resume 期间 DELETE / 停止 / 收尾都能看见
+      beginTaskStarting(taskId);
+      try {
+        const task = await getTaskMeta(taskId);
+        if (!task || task.mode === "chat" || task.archived || !task.sessionAgentId) return false;
+        if (task.runStatus === "running") return false;
+        // 与 sendToTaskSession 同一道堆内存门：高压时不新增一个常驻 agent
+        try {
+          assertHeapOk("群消息唤醒会话");
+        } catch (err) {
+          if (err instanceof HeapPressureError) return false;
+          /* 探针失败不挡 */
+        }
+        const record = await resumeTaskSession(task, creds, {
+          opHandle,
+          resumeTimeoutMs: GROUP_WAKE_RESUME_TIMEOUT_MS,
+        });
+        if (!record) {
+          rememberGroupWakeFailure(taskId);
+          return false;
+        }
+        groupWakeFailedAt.delete(taskId);
+        return true;
+      } finally {
+        endTaskStarting(taskId);
+      }
+    });
+  } catch (err) {
+    rememberGroupWakeFailure(taskId);
+    console.warn(
+      `[task-runner] task=${taskId} 群消息唤醒休眠会话失败（落回只读旁路）`,
+      err,
+    );
+    return false;
+  }
+};
+
+/**
  * V0.11：ask_user 答案送达（ask-reply 路由用）——`agent.send([ASK_USER_REPLY]…)` 续会话。
  * @returns 见 {@link SendTaskSessionResult}；只有 `sent` 表示送达
  */
@@ -6171,6 +6427,12 @@ export const deliverAskReply = async (
   opGen?: number,
   /** 路由已在 fulfillAskWait 之前守过分支（guardTaskBranchForUserTurn）、这里别再守一遍 */
   skipBranchGuard?: boolean,
+  /**
+   * 答案是别人写的（群里非属主答了属主会话挂着的 ask_user）：以 [ASK_USER_REPLY] 的形式进属主会话、没有任何抬头区分，
+   * 所以这一轮要登记「群成员触发」标记（scope=desktop）——desktop_* / 写所有者备注 / 新建定时 / 自动推进恒拒，
+   * 与关联回执喂会话、所有者空 @ 引用别人的消息同一套（见 non-owner-turn-guard / group-route 的 foreignContentTurn）。
+   */
+  foreignContent?: boolean,
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
     task,
@@ -6181,6 +6443,7 @@ export const deliverAskReply = async (
       runKind: "task-ask-reply",
       opGen,
       ...(skipBranchGuard ? { skipBranchGuard: true } : {}),
+      ...(foreignContent ? { groupNonOwnerOpenTurn: true } : {}),
     },
   );
 
@@ -6209,7 +6472,8 @@ export const deliverTaskQuestion = async (
    * 群里**非属主**触发的一轮（并入同会话路径）。`guard` 为真（提示词开关开、或发言人是机器人且没开「机器人与真人同权」）时：
    * 脚注换成「只答疑」约束段，且这一轮的 Flowship 系统工具被硬拒（non-owner-turn-guard）。
    * 开关关时传 `{ guard: false }`——只是不加约束，仍不带 ackContext / 不 resume（调用方保证）；
-   * 其中发言人是机器人（`isBot`）时仍追加防互 @ 成环的克制提示。
+   * 其中发言人是机器人（`isBot`）时仍追加防互 @ 成环的克制提示；发言人是真人时追加「限制已关闭」声明
+   * （buildNonOwnerOpenNote：不能只靠「缺席」表示关，见 group-non-owner-prompt 文件头）。
    */
   groupNonOwner?: {
     name: string;
@@ -6217,6 +6481,12 @@ export const deliverTaskQuestion = async (
     isBot?: boolean;
     /** 发言人 open_id：机器人变体提示词里给出 @ 标签的写法 */
     openId?: string;
+    /**
+     * 只登记「群成员触发」标记（scope=desktop）、**不改提示词**：这一轮以所有者语义注入（关联回执喂会话 /
+     * 所有者空 @ 引用别人的消息），但 AI 读到的指令性内容出自别人——desktop_* / 写所有者备注 / 新建定时 / 自动推进
+     * 不能放行。此时 name 无意义、guard 恒为 false。
+     */
+    markerOnly?: boolean;
   },
   /** 调用方已在更早处守过分支（见 guardTaskBranchForUserTurn）、这里别再守一遍 */
   skipBranchGuard?: boolean,
@@ -6230,7 +6500,9 @@ export const deliverTaskQuestion = async (
       attachmentPaths,
       ackContext,
       scheduled,
-      ...(groupNonOwner?.guard
+      ...(groupNonOwner?.markerOnly
+        ? {} // 只打标记、不动提示词（见参数说明）
+        : groupNonOwner?.guard
         ? {
             groupNonOwnerGuard: {
               name: groupNonOwner.name,
@@ -6250,7 +6522,11 @@ export const deliverTaskQuestion = async (
                 ...(groupNonOwner.openId ? { openId: groupNonOwner.openId } : {}),
               },
             }
-          : {}),
+          : // 真人 + 提示词开关关着（同权）：没有约束段，但要明说「限制已关」——模型看不到开关，
+            // 只剩抬头里的「非任务所有者」，不明说它会按只答疑继续保守（2026-11-19 玉灵：开关关了还是拒）
+            groupNonOwner
+            ? { groupNonOwnerOpen: { name: groupNonOwner.name } }
+            : {}),
     }),
     ackContext
       ? {
@@ -6258,6 +6534,8 @@ export const deliverTaskQuestion = async (
           errorActionId: ackContext.actionId,
           opGen,
           timing,
+          // 等审阅时所有者空 @ 引用别人的话也是「别人的内容在驱动」：这条分支同样要登记标记（只有 markerOnly 会走到这里）
+          ...(groupNonOwner?.markerOnly ? { groupNonOwnerOpenTurn: true } : {}),
           ...(skipBranchGuard ? { skipBranchGuard: true } : {}),
         }
       : {
@@ -6266,6 +6544,8 @@ export const deliverTaskQuestion = async (
           opGen,
           timing,
           ...(groupNonOwner?.guard ? { nonOwnerTurn: true } : {}),
+          // 提示词开关关着（同权）的群非属主一轮：不加「系统工具整体硬拒」，但电脑操作照样不放行（专用标记，见 non-owner-turn-guard）
+          ...(groupNonOwner && !groupNonOwner.guard ? { groupNonOwnerOpenTurn: true } : {}),
           ...(skipBranchGuard ? { skipBranchGuard: true } : {}),
         },
   );
@@ -6303,6 +6583,11 @@ export const startOneShotQuestion = (
   opGen?: number,
   /** 定时到点的消息（不是用户在任务页说的话）：提示词的措辞跟着换 */
   scheduled?: boolean,
+  /**
+   * 「别人写的内容在驱动」的一轮（所有者空 @ 引用了别人的消息等）：这个一次性 agent 运行期间登记「群成员触发」标记
+   * （scope=desktop）——desktop_* / 写所有者备注 / 新建定时 / 自动推进恒拒（见 non-owner-turn-guard）。
+   */
+  foreignContent?: boolean,
 ): void => {
   const prevRunStatus = task.runStatus === "running" ? "idle" : task.runStatus;
   // 同步捕获（路由可提前传入）；V2：纳入 startingTasks
@@ -6329,6 +6614,8 @@ export const startOneShotQuestion = (
     let oneshotInstanceId: number | undefined;
     // 本 one-shot 登记的 callerToken（受理段里分配，finally 只摘自己的）
     let oneshotCallerToken: string | undefined;
+    // 「别人的内容在驱动」时登记的标记 token（foreignContent；finally 按 token 摘，不误清后继）
+    let oneshotForeignToken: string | undefined;
     /**
      * stale 中止只关自己的 agent / 飞行窗——不写 task 级 runStatus。
      * 状态归 bump 方（stop/DELETE）收尾；旧 one-shot 无条件恢复 prevRunStatus
@@ -6476,6 +6763,8 @@ export const startOneShotQuestion = (
           // 正式启动也要进同一条链，所以槽是空的、不会和它互相覆盖。失败路径统一由外层 finally 摘（只摘自己的）
           oneshotCallerToken = String(allocTaskRunInstanceId());
           setOneShotCallerToken(task.id, oneshotCallerToken);
+          // 标记在 agent 起跑（send）之前登记；整轮 run 都在 consume 里 await，外层 finally 才摘
+          if (foreignContent) oneshotForeignToken = beginNonOwnerTurn(task.id, Date.now(), "desktop");
           // create / resume 共用同一份入参（resume 接回的也是这套工具面：定时 / 等待 / 推进 + 浏览器 + 子代理；
           // 定时到点那一轮没有「推进」——清单每轮按 scheduled 现算，resume 也按本轮入参重建工具）
           const agentInput = {
@@ -6549,7 +6838,8 @@ export const startOneShotQuestion = (
             `- 工作目录：${effectiveCwd}`,
           ];
           // 答疑链路也有群能力（用户拍板：输入条喊一声就能往需求群@人）：
-          // one-shot 没有系统工具（share_to_group / ask_user 都没挂），发群只走 shell lark-cli。
+          // one-shot 只挂 schedule / wait / advance_next / preview / set_owner_note（见 one-shot-tools 的清单），
+          // share_to_group / ask_user 都没挂，发群只走 shell lark-cli。
           // 这里只读取已绑群号（绝不建群），让模型知道往哪发、怎么发真@、卡住怎么问。
           let boundChatId: string | null = null;
           try {
@@ -6571,6 +6861,8 @@ export const startOneShotQuestion = (
                 ]
               : []),
           ];
+          // 属主在需求群里 @ 机器人时，「这是所有者说的 + 回复会发到该群」由 group-route 经 agentContext 拼在 questionText 后面，
+          // 随 buildAgentMessage 自然带到这里——不在提示词里常驻一段「群消息怎么读」（见 group-non-owner-prompt 的 OWNER_GROUP_NOTE）。
           const askedText = buildAgentMessage({
             kind: "user_message",
             text: questionText,
@@ -6589,7 +6881,7 @@ export const startOneShotQuestion = (
                 "- 用户要方案 / 要做的是大改动（整段功能 / 跨多文件重构）→ 主导权在你：你判断该正式走一步了，就调 `advance_next` 登记（plan 出方案 / build 实现 / review 复核），本轮说完收尾后系统代用户推进；拿不准、或想先跟用户对齐范围，就在回复里问。用户随时也能自己点「推进」。别在本轮里硬扛大改动",
                 "- `advance_next` 的规矩：你判断用户有这个意思才登记；提测（ship）/ 联调推送（dev）/ 往群里发消息这类对外动作，用户明说才登记，你自己觉得该做就先问；登记 ≠ 现在去做，登记后正常收尾",
                 "- 用户点名要跑某个 action（「上线审查一下」「提测」「复核一下」；自定义 action = skills 目录里带 `.flowship-action.json` 的 skill，json 里的 `label` 就是名字）→ 不在这里替它干活：这条消息本身在让你做就直接 `advance_next` 登记（`instruction` 把链接 / 要求原样带上；自定义的 `custom_action_id` 填 label 或 skill 名即可）。疑问 / 否定 / 顺嘴提到不算点名",
-                "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）、推进（advance_next）、项目预览（preview，起 dev server 看页面效果；起服务只能走它、别用 shell 自己起）可以用",
+                "- 这个任务当前没有进行中的 action：交卷 / 提问 / 提 MR 这类工具这里没有；需要问用户就直接在回复里问。定时（schedule）、等待（wait）、推进（advance_next）、项目预览（preview，起 dev server 看页面效果；起服务只能走它、别用 shell 自己起）、所有者备注（set_owner_note）可以用",
                 "- 不要提交 commit / 提 MR、处理完自然结束回复",
               ];
           // 首轮 / 接不回新起的：完整背景 + 群能力 + 边界
@@ -6659,6 +6951,16 @@ export const startOneShotQuestion = (
             perfTracker.attachRun(sent);
             return sent;
           };
+          // 属主自己的一次性问答（没传 foreignContent）：这一轮是所有者说的话，没有「别人的内容」在驱动，task 上若还挂着前一轮遗留的标记
+          // （外来内容轮没收口 / 被强清放弃的旧 run 的残留……）要在首次 send 之前清掉，否则这次问答（含定时到点那一轮）的 desktop_* / 写所有者备注 /
+          // 建定时会被一个不属于这一轮的旧标记拒掉——标记的寿命跟着 run 走（守卫头注释「TTL」一节）：过了 45 分钟 TTL 时探针答「run 还活着」就续期，而这一轮自己就是那个活 run，所以会一直拒到这一轮结束
+          // （只有 run 不在了才按 45 分钟兜底，绝对上限 25 小时；第十七轮评审 N2 订正此前「直到 TTL（45 分钟）」的说法——T1 这一清比旧说法的价值更大）。与 internalStartAgent 的属主新启动、task 型属主 send 起点同口径
+          // （第十六轮评审 P3-T1：此前一次性问答只有外来内容那一支登记、属主这一支什么都不做，三个属主起点里唯独它不对称）。
+          // 位置：紧贴首次 send——下面 `sendTurn` 的调用在它之后同步执行到 `agent.send`，中间没有 await（与 internalStartAgent 同一条纪律：
+          // 清得越晚，被强清放弃的旧 run 受限的时间越长；让位 return 都在上面，让位的 one-shot 不是这一轮的主人、不碰标记）。
+          // 外来内容那一支（foreignContent）已在上面 begin 过自己的标记（覆盖旧标记），不能清。
+          // 残余（同 internalStartAgent 的属主新启动，见 task-forceclear-keeps-marker 与守卫头注释）：被强清放弃、但没真停的旧 run 在这里之后不再受限。
+          if (!foreignContent) clearNonOwnerTurn(task.id);
           let run: SessionRun;
           try {
             run = await sendTurn(created, resumedFrom ? followPrompt : fullPrompt);
@@ -6812,6 +7114,7 @@ export const startOneShotQuestion = (
       }
       // 摘掉自己登记的 callerToken（只摘自己的：期间被正式会话换了 / 被 stop 摘了都不动）
       if (oneshotCallerToken) clearOneShotCallerTokenIf(task.id, oneshotCallerToken);
+      endNonOwnerTurn(task.id, oneshotForeignToken);
       endTaskStarting(task.id);
     }
   })();
@@ -6906,6 +7209,8 @@ const sendToTaskSession = async (
     timing?: (entry: string) => void;
     /** 本轮由群里非属主触发且提示词开关开：send 前登记按轮次标记，系统工具硬拒（见 non-owner-turn-guard） */
     nonOwnerTurn?: boolean;
+    /** 本轮由群里非属主触发但提示词开关关着（同权）：send 前登记「只拒电脑操作」的标记（scope=desktop） */
+    groupNonOwnerOpenTurn?: boolean;
     /** 调用方已自己做过 guardTaskBranchForUserTurn（ask-reply 路由在 fulfillAskWait 之前就守过）：别再守一遍、免得 in-place 提醒附两次 */
     skipBranchGuard?: boolean;
   } = {},
@@ -6936,6 +7241,7 @@ const sendToTaskSessionBody = async (
     /** 分节计时收集器（deliver 子阶段透出给 question-timing） */
     timing?: (entry: string) => void;
     nonOwnerTurn?: boolean;
+    groupNonOwnerOpenTurn?: boolean;
     skipBranchGuard?: boolean;
   },
 ): Promise<SendTaskSessionResult> => {
@@ -7097,6 +7403,8 @@ const sendToTaskSessionBody = async (
     let run: SessionRun;
     // 非属主轮：必须在 agent.send **之前**登记（send 一返回 agent 就可能开始调工具）
     if (opts.nonOwnerTurn) nonOwnerToken = beginNonOwnerTurn(task.id);
+    // 同权的群非属主轮：只拒电脑操作（系统工具照常放行）；收口复用同一个 token 通路（consume 的 finally / 本函数 finally）
+    else if (opts.groupNonOwnerOpenTurn) nonOwnerToken = beginNonOwnerTurn(task.id, Date.now(), "desktop");
     try {
       const runKind =
         opts.runKind ?? (opts.questionRun ? "question" : "task-followup");

@@ -203,7 +203,8 @@ const main = async () => {
     return call("click", { ref, tabId });
   };
   // 页面开 tab 限流（每 opener 10 秒 ≤ 3 个）是另一条已有单测覆盖的闸：脚本里每个小节前清一下，免得小节之间互相吃配额
-  const resetThrottle = () => sessionObj().pageTabTimes?.clear?.();
+  // 不用可选链：session.pageTabTimes 改名时让脚本抛错，而不是静默变成不清（第二十五轮评审文档 9）
+  const resetThrottle = () => sessionObj().pageTabTimes.clear();
   const closeAllExcept = async (keep) => {
     for (const t of await listTabs()) {
       if (t.id !== keep) await tryCall("tabs", { action: "close", tabId: t.id });
@@ -500,9 +501,9 @@ main()
     const failed = results.filter((r) => !r.ok);
     console.log(`SMOKE SUMMARY ${results.length - failed.length}/${results.length} passed${failed.length ? ` FAILED: ${failed.map((f) => f.id).join(",")}` : ""}`);
     try {
-      fs.rmSync(TMP, { recursive: true, force: true });
-    } catch {
-      /* 临时目录清不掉不影响结果 */
+      fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (err) {
+      console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
     }
     app.exit(failed.length ? 1 : 0);
   })

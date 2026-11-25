@@ -23,6 +23,7 @@ import { SIGNALS, buildNextActionHead } from "../protocol-signals";
 import {
   buildBotEtiquetteNote,
   buildNonOwnerGuardFootnote,
+  buildNonOwnerOpenNote,
 } from "../group-non-owner-prompt";
 import { cancelAskWait, resetAskWaitForTest } from "./ask-wait";
 import { interruptWaits } from "./session-wait";
@@ -455,6 +456,22 @@ export const getExpectedCallerToken = (taskId: string): string | null =>
   expectedCallerTokens.get(taskId) ?? null;
 
 /**
+ * 某个会话**登记过**的 token，此刻是不是已被作废（stop 摘了 / 被后继换了）。同步、只读。
+ *
+ * `registeredToken` 是会话记录上留的「本实例登记进表的那个 token」（RunningChatRecord.callerToken）：
+ * - **undefined = 没登记过**（理论上两条创建路径都会记；将来冒出一条不记的，或测试直塞的记录）：没有「被作废」可言 → false。
+ *   不能因为表里没有就判成被停止——chat 的 finished 收尾（finalizeChatRunIfCurrent）用本函数判「这一轮是不是在被停止的途中收的尾」，
+ *   判真会关会话，误判 = 每一轮自然收尾都把热会话关掉（第二十轮评审 R20-4 补的「合法无 token」负例）；
+ * - 登记过 → 表里仍是它才算有效；被摘（表里没有）/ 被换（表里是别人的）都算作废（fail-closed 口径同 {@link matchExpectedCallerToken}）。
+ */
+export const isRegisteredCallerTokenRevoked = (
+  taskId: string,
+  registeredToken: string | undefined,
+): boolean =>
+  registeredToken !== undefined &&
+  !matchExpectedCallerToken(taskId, registeredToken);
+
+/**
  * 属主一次性 agent（task 页还没有会话时，输入条 / 定时到点落到的那条通道，`startOneShotQuestion`）登记自己的身份：
  * **只写期望 token**，不注册 awaiting notifier / task action handler——它没有 action，交卷 / 提问这类工具也不会挂给它。
  * 有这个 token，`schedule` 这类要先验 callerToken 的工具才认它（没登记 = 一律 fail-closed 拒绝）。
@@ -742,6 +759,11 @@ export type AgentMessage = {
   // 同时「限制群里非宿主成员」关着 = 同权）。照常用默认脚注，只在后面追加防互 @ 成环的克制规则
   //（见 group-non-owner-prompt 的 buildBotEtiquetteNote）。带了 groupNonOwnerGuard 时不用传（约束段里已含同一份规则）。
   groupBotEtiquette?: { name: string; openId?: string };
+  // user_message：这条是群里**真人**非属主发来的、**且「限制群里非宿主成员」开关是关着的**（同权，没有约束段）。
+  // 照常用默认脚注，后面追加「限制已关闭」声明（见 group-non-owner-prompt 的 buildNonOwnerOpenNote）：
+  // 模型看不到开关、抬头里又写着「非任务所有者」，不明说它就继续按只答疑保守处理（2026-11-19 玉灵：开关关了还是拒）。
+  // 与 groupNonOwnerGuard / groupBotEtiquette 互斥（调用方保证）；scheduled / ackContext 的消息不吃（属主语义）。
+  groupNonOwnerOpen?: { name: string };
   // next_action 的元数据（拼 [NEXT_ACTION ...] 头）
   nextActionId?: string;
   nextActionType?: ActionType;
@@ -880,6 +902,9 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
             msg.groupBotEtiquette.openId,
           ),
         );
+      }
+      if (msg.groupNonOwnerOpen) {
+        lines.push(buildNonOwnerOpenNote(msg.groupNonOwnerOpen.name));
       }
     }
     return lines.join("\n");

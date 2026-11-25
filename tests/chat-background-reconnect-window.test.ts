@@ -66,6 +66,7 @@ const { getTask } = await import("@/lib/server/task-fs");
 const { emitBackgroundSubagentSettled } = await import(
   "@/lib/server/subagent-background"
 );
+const guard = await import("@/lib/server/non-owner-turn-guard");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
@@ -955,4 +956,139 @@ describe("F4-03：懒重启主路径 cancelChatRun(reason=restart) 也要留「�
     await settleTail(200);
     expect((await infoTexts()).some((t) => t.includes("个后台子代理"))).toBe(false);
   }, 20_000);
+});
+
+// =====================================================================
+// B5（R19-11）：外来来源的后台结果跨「重连暂存 → 放回」仍带队内前缀 → 新实例上带标记唤醒
+// =====================================================================
+
+/** 重连接回的新实例 R：每次 send 都记「文本 + send 被调用那一刻标记是否已就位」，给立刻结束的 run */
+const makeMarkerRecordingReconnectAgent = () => {
+  const sends: Array<{ text: string; marker: boolean }> = [];
+  const send = vi.fn().mockImplementation(async (text: string) => {
+    sends.push({ text: String(text), marker: guard.isGroupNonOwnerTurnActive(TASK_ID) });
+    return makeQuickRun();
+  });
+  return { agent: { agentId: PARENT_ID, close: vi.fn(), send }, send, sends };
+};
+
+describe("B5：外来来源的后台结果跨重连暂存 / 放回，前缀原样保留、新实例上带标记唤醒", () => {
+  beforeEach(() => {
+    guard.__resetNonOwnerTurnGuardForTest();
+  });
+  afterEach(() => {
+    guard.__resetNonOwnerTurnGuardForTest();
+  });
+
+  it("B5a：外来内容轮里派的子代理在重连退避窗口内完成 → pending → closeChatSession(reconnect) 暂存 → 新实例接回 restore → drain：新实例第 2 次 send 时标记在、正文含结果、不含前缀（暂存 / restore 把前缀剥掉会红）", async () => {
+    const a = makeParentRun(); // 无 steer：窗口内结果只能攒在 pending 里
+    const r = makeMarkerRecordingReconnectAgent();
+    const { tool } = await startParent(a.run);
+    mockResume.mockResolvedValueOnce(r.agent);
+    // 这一轮是外来内容驱动的：派之前先有活标记（派出那一刻读到 → foreignOrigin）
+    expect(guard.beginForeignContentMidRun(TASK_ID), "前置：新建标记").toBeDefined();
+    await dispatchBackground(tool, "外来轮窗口内完成");
+
+    a.breakStream();
+    await waitInBackoffWindow();
+    expect(mockResume).toHaveBeenCalledTimes(1); // 还没开始重连 resume
+    childRuns[0]!.release("外来来源的窗口内结果：FWIN-001");
+    await vi.waitFor(
+      async () => {
+        expect(await hasInfo("后台子代理「外来轮窗口内完成」已完成")).toBe(true);
+      },
+      { timeout: 1_500, interval: 20 },
+    );
+    expect(mockResume).toHaveBeenCalledTimes(1); // 确认这一切发生在退避窗口内
+
+    // 重连接回新实例：第 1 次 send 是重连提示，第 2 次才是后台结果
+    await vi.waitFor(() => expect(r.send).toHaveBeenCalledTimes(2), {
+      timeout: 12_000,
+      interval: 50,
+    });
+    expect(r.sends[0]!.text).toContain("网络连接中断");
+    expect(r.sends[1]!.text).toContain("[BACKGROUND_SUBAGENT_RESULT]");
+    expect(r.sends[1]!.text).toContain("FWIN-001");
+    expect(r.sends[1]!.text, "队内前缀绝不能进 agent").not.toContain("\u0001");
+    expect(
+      r.sends[1]!.marker,
+      "外来来源的结果跨重连暂存 / 放回后唤醒、send 时没有标记：前缀在暂存链里丢了，陌生人的内容进了不受限的一轮",
+    ).toBe(true);
+
+    // 一条结果只送一次；唤醒的那一轮收尾后标记清掉、没有「未送达」
+    await settleTail(300);
+    expect(r.send).toHaveBeenCalledTimes(2);
+    expect(r.sends.filter((s) => s.text.includes("FWIN-001"))).toHaveLength(1);
+    await vi.waitFor(() => expect(guard.isGroupNonOwnerTurnActive(TASK_ID), "唤醒的那一轮收尾后标记没清").toBe(false), {
+      timeout: 4_000,
+    });
+    expect(await hasInfo("未送达")).toBe(false);
+  }, 30_000);
+
+  it("B5a 对照：属主一轮里派的子代理同样跨重连暂存 / 放回 → 新实例第 2 次 send 无标记（证明上一条的「标记在」确实来自前缀，不是重连本身残留的标记）", async () => {
+    const a = makeParentRun();
+    const r = makeMarkerRecordingReconnectAgent();
+    const { tool } = await startParent(a.run);
+    mockResume.mockResolvedValueOnce(r.agent);
+    await dispatchBackground(tool, "属主轮窗口内完成");
+
+    a.breakStream();
+    await waitInBackoffWindow();
+    childRuns[0]!.release("属主来源的窗口内结果：OWIN-001");
+    await vi.waitFor(
+      async () => {
+        expect(await hasInfo("后台子代理「属主轮窗口内完成」已完成")).toBe(true);
+      },
+      { timeout: 1_500, interval: 20 },
+    );
+    await vi.waitFor(() => expect(r.send).toHaveBeenCalledTimes(2), {
+      timeout: 12_000,
+      interval: 50,
+    });
+    expect(r.sends[1]!.text).toContain("OWIN-001");
+    expect(r.sends[1]!.text).not.toContain("\u0001");
+    expect(r.sends[1]!.marker, "属主来源的结果被无故加了标记").toBe(false);
+    await settleTail(200);
+    expect(r.send).toHaveBeenCalledTimes(2);
+  }, 30_000);
+
+  it("B5b：外来来源的结果 steer 在飞时实例被重连替换（replaced，reason=reconnect）→ 带前缀暂存（front）→ 放回 → 新实例第 2 次 send 时标记在、正文含结果、不含前缀（replaced 分支暂存删掉 / 暂存剥前缀会红）", async () => {
+    // steer 永远挂起（最坏形态）：只能靠「实例被重连替换」的信号落定
+    const a = makeParentRun({ steer: () => new Promise<SteerOutcome>(() => {}) });
+    const r = makeMarkerRecordingReconnectAgent();
+    const { tool } = await startParent(a.run);
+    mockResume.mockResolvedValueOnce(r.agent);
+    expect(guard.beginForeignContentMidRun(TASK_ID), "前置：新建标记").toBeDefined();
+    await dispatchBackground(tool, "外来轮 steer 在飞");
+
+    // 流还活着、标记活着：外来来源的结果照常 steer 进这一轮（挂起、未确认）
+    childRuns[0]!.release("外来来源的 steer 在飞结果：FSTEER-002");
+    const steer = a.run.steer as ReturnType<typeof vi.fn>;
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
+    expect(String(steer.mock.calls[0]![0])).toContain("FSTEER-002");
+    expect(String(steer.mock.calls[0]![0]), "队内前缀绝不能进 agent").not.toContain("\u0001");
+
+    // 断流 → 退避 → 摘旧实例（steer 判 replaced → 暂存）→ resume → 重连 run 收尾后 drain
+    a.breakStream();
+    await vi.waitFor(() => expect(r.send).toHaveBeenCalledTimes(2), {
+      timeout: 12_000,
+      interval: 50,
+    });
+    expect(r.sends[0]!.text).toContain("网络连接中断");
+    expect(r.sends[1]!.text).toContain("FSTEER-002");
+    expect(r.sends[1]!.text, "队内前缀绝不能进 agent").not.toContain("\u0001");
+    expect(
+      r.sends[1]!.marker,
+      "replaced 暂存的外来来源结果放回后唤醒、send 时没有标记：前缀在 replaced 暂存里丢了",
+    ).toBe(true);
+
+    await settleTail(300);
+    expect(r.send).toHaveBeenCalledTimes(2);
+    expect(r.sends.filter((s) => s.text.includes("FSTEER-002"))).toHaveLength(1);
+    expect(steer, "旧实例上只 steer 过一次").toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(guard.isGroupNonOwnerTurnActive(TASK_ID), "唤醒的那一轮收尾后标记没清").toBe(false), {
+      timeout: 4_000,
+    });
+    expect(await hasInfo("未送达")).toBe(false);
+  }, 30_000);
 });

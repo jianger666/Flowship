@@ -27,10 +27,31 @@ export class FakeTab {
   destroyHooks = new Set<() => void>();
   emulationHooks = new Set<(e: { next: Emulation; prev: Emulation; patch: Emulation }) => void>();
   sessionHooks = new Set<(sid: string | null) => unknown>();
+  /** 与真 tab 同名同义：与域启用并行发的「早钩子」（R23-3，权限闸把页内查询桩注册在这里） */
+  earlySessionHooks = new Set<(sid: string | null) => unknown>();
+  /** 真 tab 的 `ensureCdp()`（调试连接自愈）；默认没有，要测「核对时 CDP 没就绪 → 触发自愈」的用例自己挂 */
+  ensureCdp?: () => Promise<void>;
   cdpListeners = new Set<(method: string, params: Record<string, unknown>, sid: string | null) => void>();
   sent: Array<{ method: string; params: Record<string, unknown>; sessionId: string | null }> = [];
   /** 让某条 CDP 命令失败 / 自定义应答 */
   sendImpl: (method: string, params: Record<string, unknown>, sessionId: string | null) => Promise<unknown> = async () => ({});
+  /**
+   * 真 tab 的 `evalInFrames`（各 frame 隔离世界里按值取表达式结果）。默认**没有**这个方法（= 核对不出来、跨源子框架的媒体请求一律拒绝），
+   * 要测「被委托的 iframe」的用例自己挂一个；调用记录在 evalInFramesCalls 里。
+   */
+  evalInFrames?: (expression: string, opts?: { timeoutMs?: number; totalMs?: number }) => Promise<Array<{ key: string; value: unknown }> | null>;
+  evalInFramesCalls: string[] = [];
+  /** 每次 evalInFrames 调用带进来的 opts（核对「timeoutMs / totalMs 传下去了」用）；需要测的用例在自己挂的 evalInFrames 里 push */
+  evalInFramesOpts: Array<{ timeoutMs?: number; totalMs?: number } | undefined> = [];
+  /**
+   * 真 tab 的 `frameInventory`（各会话 `Page.getFrameTree` 合并成 `[{ id, url }]`，取不到 = null）。默认**没有**这个方法——权限闸按「核对不出来」处理（fail closed，与缺 `evalInFrames` 同口径，R23-5），
+   * 所以要测「被委托的 iframe」的用例得一并挂上（`setup().frames(...)` 会按行生成）。
+   */
+  frameInventory?: (opts?: { timeoutMs?: number }) => Promise<Array<{ id: string; url: string }> | null>;
+  /** 每次 frameInventory 调用带进来的 opts（核对「timeoutMs 不超过剩余时间」用） */
+  frameInventoryOpts: Array<{ timeoutMs?: number } | undefined> = [];
+  /** 无痕标签（权限的授予 / 最近被拒按 partition 分开记） */
+  incognito = false;
   setInputIgnored = vi.fn(async () => {});
   releaseHeldButtons = vi.fn(async () => {});
   overlaySetActive = vi.fn(async () => {});
@@ -60,20 +81,33 @@ export class FakeTab {
     this.sessionHooks.add(fn);
     return () => this.sessionHooks.delete(fn);
   }
+  addEarlySessionHook(fn: (sid: string | null) => unknown) {
+    this.earlySessionHooks.add(fn);
+    return () => this.earlySessionHooks.delete(fn);
+  }
   onCdpEvent(fn: (method: string, params: Record<string, unknown>, sid: string | null) => void) {
     this.cdpListeners.add(fn);
     return () => this.cdpListeners.delete(fn);
   }
+  /** 假的 OOPIF 子会话表（与真 tab 的 `children` 同义）：`cdpSessionIds()` = 主会话 + 这些；`attachChild` 或 `Target.attachedToTarget` / `Target.detachedFromTarget` 事件维护它 */
+  children = new Set<string>();
   cdpSessionIds() {
-    return [null];
+    return [null, ...this.children];
+  }
+  /** 让一个子会话「存在」（权限闸只记仍存在的会话的桩失败；真 tab 里 `children.set` 先于该会话的任何钩子） */
+  attachChild(sessionId: string) {
+    this.children.add(sessionId);
   }
   send(method: string, params: Record<string, unknown> = {}, sessionId: string | null = null) {
     this.sent.push({ method, params, sessionId });
     return this.sendImpl(method, params, sessionId);
   }
-  /** 模拟 CDP 事件（如 Runtime.bindingCalled） */
+  /** 模拟 CDP 事件（如 Runtime.bindingCalled）；与真 tab 同序：监听者先看到事件，之后才更新子会话表 */
   emitCdp(method: string, params: Record<string, unknown>, sid: string | null = null) {
     for (const fn of [...this.cdpListeners]) fn(method, params, sid);
+    if (typeof params.sessionId !== "string" || params.sessionId === "") return;
+    if (method === "Target.attachedToTarget") this.children.add(params.sessionId);
+    if (method === "Target.detachedFromTarget") this.children.delete(params.sessionId);
   }
   /** 与真 tab.applyEmulation 同语义的最小实现：reset 清空，否则浅合并；成功后调 emulationHooks */
   async applyEmulation(patch: Emulation) {

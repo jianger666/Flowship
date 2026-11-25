@@ -7,6 +7,8 @@
  * 它替你做：清洗宿主注入的环境变量（AGENTS.md「agent shell 环境坑」）、语法预检（有语法错误只在终端报、
  * 根本不起 Electron，避免弹原生错误框挂死）、经 electron-bootstrap.cjs 兜住未捕获异常 / dialog、
  * 超时整组杀进程。退出码：0 = 脚本自己 app.exit(0)；2 = 参数 / 语法预检失败；124 = 超时；其它 = 脚本或 Electron 的退出码。
+ * 脚本自己的退出码各有约定、写在各脚本文件头（别在这里假设同一个数字同一个意思）：r12 / r21 这两个「哨兵」用 4 = INCOMPLETE（断言都过但有环境不满足的跳过项，不能当全绿）；
+ * r8 / r9 / r14 / r17 的 3 = 脚本抛错（FATAL）——所以 INCOMPLETE 特意没用 3。
  *
  * 不碰 Flowship / FlowshipTest 桌面包与 8676 / 8776 / 8876 端口——只起 node_modules 里那份 Electron、
  * 且脚本自己应把 userData 指向临时目录。

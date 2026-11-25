@@ -49,6 +49,7 @@ process.env.FLOWSHIP_DATA_DIR = path.join(
 );
 
 const {
+  GROUP_DESKTOP_THINKING_HIDDEN,
   GROUP_REPLY_CHUNK_MAX,
   GROUP_REPLY_MAX_CHUNKS,
   __resetGroupOutboundForTest,
@@ -1107,6 +1108,169 @@ describe("流式群卡：过程区（思考与工具折叠面板）", () => {
       model: "claude-sonnet-5",
       body: "答复",
     });
+  });
+});
+
+describe("流式群卡：这一轮动过电脑（desktop_*）→ 过程区不外发思考原文和 desktop 参数", () => {
+  // 群答疑卡全群可见；思考常会复述屏幕上的内容（聊天对象 / 消息 / 验证码……）
+  const SCREEN_SECRET = "屏幕上微信聊天窗口里张三说验证码是 482913";
+
+  const rawEvent = (kind: "tool_call" | "tool_result", meta: Record<string, unknown>, origin: string, text = "") =>
+    handleGroupOutboundEvent(TASK, {
+      kind: "event",
+      origin,
+      event: { id: `e-raw-${++seq}`, seq, ts: Date.now(), kind, text, meta },
+    } as never);
+
+  it("看完屏幕后的思考不累积、不外发；工具名与状态照常", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("我来看一下", tag);
+    await toolStart("d1", "desktop_screenshot", "{}", tag);
+    await thinking(SCREEN_SECRET, tag);
+    await toolEnd("d1", "desktop_screenshot", "ok", tag, "{}");
+    await thinking(`${SCREEN_SECRET}（第二段）`, tag);
+    await delta("，已经看过了", tag);
+    await done(true, tag);
+
+    const all = created[0]!.processes.join("\n---\n");
+    expect(all).not.toContain("482913");
+    expect(all).not.toContain("张三说");
+    const last = created[0]!.processes.at(-1)!;
+    expect(last).toContain("`desktop_screenshot` · completed");
+    expect(last).toContain(GROUP_DESKTOP_THINKING_HIDDEN);
+  });
+
+  it("动电脑之前已经攒下 / 推给群的思考：整块换成说明（卡上的过程区是整块替换的）", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    await thinking("先想一下步骤：第一步看屏幕", tag);
+    expect(created[0]!.processes.at(-1)).toContain("先想一下步骤");
+    await toolStart("d1", "desktop_screenshot", "{}", tag);
+    const last = created[0]!.processes.at(-1)!;
+    expect(last).not.toContain("先想一下步骤");
+    expect(last).toContain(GROUP_DESKTOP_THINKING_HIDDEN);
+    expect(last).toContain("`desktop_screenshot` · running");
+    // 多个思考段只留一条说明，不刷屏
+    expect(last.split(GROUP_DESKTOP_THINKING_HIDDEN)).toHaveLength(2);
+  });
+
+  it("思考段被工具隔成几段后再动电脑：合并成一条说明，前面工具的状态回填没错位（下标重建）", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    await thinking("第一段思考", tag);
+    await toolStart("c1", "Read", JSON.stringify({ path: "a.ts" }), tag);
+    await thinking("第二段思考", tag);
+    await toolStart("c2", "Shell", JSON.stringify({ command: "ls" }), tag);
+    await thinking("第三段思考", tag);
+    await toolStart("d1", "desktop_apps", "{}", tag);
+    // 三个思考段 → 一条说明；Read / Shell 还在运行中，随后各自完成
+    await toolEnd("c1", "Read", "ok", tag, JSON.stringify({ path: "a.ts" }));
+    await toolEnd("c2", "Shell", "error", tag, JSON.stringify({ command: "ls" }));
+    await toolEnd("d1", "desktop_apps", "ok", tag, "{}");
+    const last = created[0]!.processes.at(-1)!;
+    expect(last).not.toMatch(/第一段思考|第二段思考|第三段思考/);
+    expect(last).toContain("`Read` · completed");
+    expect(last).toContain("`Shell` · failed");
+    expect(last).toContain("`desktop_apps` · completed");
+    expect(last).toContain("a.ts");
+    expect(last.split(GROUP_DESKTOP_THINKING_HIDDEN)).toHaveLength(2);
+  });
+
+  it("desktop_* 的参数摘要（应用名 / 坐标 / 按键）不展示；非 desktop 工具的摘要照常", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    await toolStart("d1", "desktop_open_app", JSON.stringify({ name: "微信" }), tag);
+    await toolEnd("d1", "desktop_open_app", "ok", tag, JSON.stringify({ name: "微信" }));
+    await toolStart("d2", "desktop_click", JSON.stringify({ x: 321, y: 654 }), tag);
+    await toolStart("d3", "desktop_key", JSON.stringify({ keys: "cmd+f" }), tag);
+    await toolStart("c1", "Shell", JSON.stringify({ command: "git status" }), tag);
+    const last = created[0]!.processes.at(-1)!;
+    expect(last).toContain("`desktop_open_app` · completed");
+    expect(last).toContain("`desktop_click` · running");
+    expect(last).toContain("`desktop_key` · running");
+    expect(created[0]!.processes.join("\n")).not.toMatch(/微信|321|654|cmd\+f/);
+    expect(last).toContain("git status");
+  });
+
+  it("tool_result 不带工具名（只靠 callId 对上）也不会把 desktop_* 的参数写回面板", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    await rawEvent("tool_call", { callId: "d1", name: "desktop_open_app", args: JSON.stringify({ name: "钉钉" }) }, tag, "调用 desktop_open_app");
+    await rawEvent("tool_result", { callId: "d1", status: "ok", args: JSON.stringify({ name: "钉钉" }) }, tag, "工具完成");
+    const last = created[0]!.processes.at(-1)!;
+    expect(last).toContain("`desktop_open_app` · completed");
+    expect(created[0]!.processes.join("\n")).not.toContain("钉钉");
+  });
+
+  it("MCP 包装（name 是服务名、innerToolName 才是 desktop_*）同样认得出来", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    await thinking("开始前的思考", tag);
+    await rawEvent(
+      "tool_call",
+      { callId: "m1", name: "custom-user-tools", innerToolName: "desktop_type", args: JSON.stringify({ text: "你好" }) },
+      tag,
+      "调用 custom-user-tools",
+    );
+    await thinking(SCREEN_SECRET, tag);
+    const all = created[0]!.processes.join("\n---\n");
+    expect(created[0]!.processes.at(-1)).toContain("`desktop_type` · running");
+    expect(created[0]!.processes.at(-1)).not.toContain("开始前的思考");
+    expect(all).not.toContain("482913");
+  });
+
+  it("工具名大小写不敏感（与前端 isDesktopToolName 同口径）", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    await thinking("会泄漏的思考", tag);
+    await toolStart("d1", "Desktop_Screenshot", "{}", tag);
+    expect(created[0]!.processes.at(-1)).not.toContain("会泄漏的思考");
+  });
+
+  it("没动过电脑的 run 完全不受影响（思考原文照常展示）", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await delta("开口", tag);
+    await thinking("普通的思考", tag);
+    await toolStart("c1", "Read", JSON.stringify({ path: "b.ts" }), tag);
+    const last = created[0]!.processes.at(-1)!;
+    expect(last).toContain("普通的思考");
+    expect(last).not.toContain(GROUP_DESKTOP_THINKING_HIDDEN);
+  });
+
+  it("标记只属于这一条登记：别人的登记不受影响（下一轮重新判）", async () => {
+    const { created } = useStreaming();
+    const tagA = register(BOT, true);
+    await delta("A 开口", tagA);
+    await toolStart("d1", "desktop_screenshot", "{}", tagA);
+    await done(true, tagA);
+    const tagB = register({ openId: "ou_li", name: "李四" });
+    await delta("B 开口", tagB);
+    await thinking("B 的普通思考", tagB);
+    const procB = created.at(-1)!.processes.at(-1)!;
+    expect(procB).toContain("B 的普通思考");
+    expect(procB).not.toContain(GROUP_DESKTOP_THINKING_HIDDEN);
+  });
+
+  it("先动电脑、后来才起卡（NO_REPLY 零消息语义不变）：建卡首帧带的就是脱敏后的过程区", async () => {
+    const { created } = useStreaming();
+    const tag = register(BOT, true);
+    await thinking("起卡前的思考", tag);
+    await toolStart("d1", "desktop_screenshot", "{}", tag);
+    await thinking(SCREEN_SECRET, tag);
+    expect(created).toHaveLength(0);
+    await delta("结论", tag);
+    expect(created).toHaveLength(1);
+    const all = created[0]!.processes.join("\n---\n");
+    expect(all).not.toMatch(/起卡前的思考|482913/);
+    expect(created[0]!.processes.at(-1)).toContain(GROUP_DESKTOP_THINKING_HIDDEN);
   });
 });
 

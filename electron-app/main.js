@@ -31,6 +31,10 @@ import {
   // 内置浏览器（docs/BROWSER-AUTOMATION.md）：每个 tab 是一个 WebContentsView，session 用来配独立 partition 的权限 / 下载
   session,
   WebContentsView,
+  // 电脑操作（让 AI 操作整台电脑，见 ./desktop/index.mjs）：截屏 / 显示器信息 / 系统权限状态
+  desktopCapturer,
+  screen,
+  systemPreferences,
 } from "electron";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -209,6 +213,9 @@ import { parseNotifyPayload } from "./notify-target.mjs";
 // createBrowserManager 总入口在 ./browser/index.mjs；createIsAppUrl 只判「本应用自己的 origin（回环别名 + 自己的 server 端口）」
 import { createBrowserManager } from "./browser/index.mjs";
 import { createIsAppUrl } from "./browser/app-origin.mjs";
+// 电脑操作（AI 操作整台电脑，含锁屏时自动解锁；平台驱动 / 安全层 / 设置页 IPC 全在 ./desktop/index.mjs）。
+// 与内置浏览器共用同一条 server 通道（能力 desktop.v1，经 createBrowserManager 的 desktop 注入）
+import { createDesktop } from "./desktop/index.mjs";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
 // 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
@@ -376,6 +383,25 @@ const log = shellLogger.log;
 //   不复用上面那份 isAppUrl（external-url.mjs 的 isSameAppOrigin，只认 http:、服务于外链 / will-navigate），
 //   这份在 ./browser/app-origin.mjs（http / https 都按端口判，纯函数、有单测 tests/browser-app-origin.test.ts）
 // - isTrustedIpcSender：browser:* 每个入口的第一件事（契约 §5）；契约的签名是 (event)，壳里的是 (e, channel)，这里补个默认 channel 名
+// 电脑操作：工厂本身不碰系统（驱动 / koffi / 遮罩窗口都是首次真正用到才加载），模块加载期安全；
+// 失败（比如缺 koffi 的原生包）只让「电脑操作」不可用、不影响启动与内置浏览器
+let desktop = null;
+try {
+  desktop = createDesktop({
+    // powerSaveBlocker：前台会话期间不让显示器睡眠（睡了会锁屏、会话被打断、截图是黑的）
+    electron: { BrowserWindow, screen, desktopCapturer, systemPreferences, shell, clipboard, ipcMain, Notification, nativeImage, powerSaveBlocker },
+    userDataDir: app.getPath("userData"),
+    isTrustedIpcSender: (e, channel) => isTrustedIpcSender(e, channel ?? "computer-use:*"),
+    isTest: IS_TEST,
+    appInfo: { name: app.getName(), version: app.getVersion(), electron: process.versions.electron },
+    // Windows 解锁组件的源码 + 安装脚本：打包后放在 resources/win-helper/（afterPack 拷入并核对哈希；PowerShell 读不了 asar 里的文件），
+    // 开发期留空 = 用源码树里的 desktop/win-helper/assets/
+    helperAssetsDir: app.isPackaged ? path.join(process.resourcesPath, "win-helper") : undefined,
+    log,
+  });
+} catch (err) {
+  log(`[main] 电脑操作初始化失败（该功能不可用，不影响其它功能）：${err?.message || err}`);
+}
 const browserManager = createBrowserManager({
   app,
   BrowserWindow,
@@ -387,9 +413,13 @@ const browserManager = createBrowserManager({
   Menu,
   clipboard,
   shell,
+  // 页面权限提示的系统层说明：系统层已拒绝麦克风 / 摄像头时，提示条里多写一行去哪里打开（见 browser/permission-gate.mjs）
+  systemPreferences,
   getMainWindow: () => mainWindow,
   isAppUrl: createIsAppUrl(() => PORT),
   isTrustedIpcSender: (e, channel) => isTrustedIpcSender(e, channel ?? "browser:*"),
+  // 电脑操作：desktop_* 请求经内置浏览器的 server 通道进来（hello-ack 里多报一个 desktop.v1 能力）；null = 不可用
+  desktop: desktop?.manager ?? null,
   log,
 });
 // Mermaid 出图（飞书回复里的 ```mermaid → PNG）：隐藏窗口加载 server 的渲染页、CDP 截图，经 server 的 IPC 通道收发请求。
@@ -407,6 +437,18 @@ const hasUserWindows = () =>
   );
 // 内置浏览器 destroy 不可逆、只做一次：放在 will-quit（退出已确定）里，见 app.on("will-quit")
 let browserManagerDestroyed = false;
+// 电脑操作的退出收尾：撤遮罩；如果这台电脑是 AI 替用户解锁的，同步发出锁屏命令（尽力而为）。可重复调用；出错只记日志、不挡退出。
+// ⚠️ app.exit() 不触发 before-quit / will-quit（Electron 文档）：走它收尾的退出路径（mac 套用暂存更新）会绕过 will-quit 里的这一步。
+// 这一步对外可见——遮罩窗口随进程一起没了，而被 AI 解锁过的电脑不会自己锁回去：用户不在场时，退出之后就是一台既没遮罩也没锁屏的电脑。
+// 所以：will-quit 里调一次；每条以 app.exit() 收尾的路径也要在「退出已经确定」之后、exit 之前自己调（见 applyStagedUpdate 的 relaunch 分支、
+// before-quit 的暂存更新分支）。退出还可能取消（比如套用失败后应用继续跑）的位置不要调——destroy 会摘掉设置页用的 IPC。
+const destroyDesktop = () => {
+  try {
+    desktop?.destroy();
+  } catch (err) {
+    log(`[main] 电脑操作收尾出错（不挡退出）：${err?.message || err}`);
+  }
+};
 // stdout / stderr 的 EPIPE：从终端 / 管道启动、对端关掉后 console.log 会异步 emit 'error'，没有监听就是 uncaughtException。
 // 日志已经落盘，这里吞掉即可；监听里不能再 console.log（会递归）。
 for (const stream of [process.stdout, process.stderr]) stream?.on?.("error", () => {});
@@ -2649,6 +2691,9 @@ const applyStagedUpdate = async ({ relaunch, pendingMarker = relaunch } = {}) =>
   log(`[updater] v${meta.version} 已就位${relaunch ? "、即将重启" : "（退出路径、下次打开即新版）"}`);
   if (relaunch) {
     // server 已在替换前停掉（见函数开头）、这里直接重启进新包
+    // app.exit() 不触发 will-quit：电脑操作的收尾（撤遮罩 / 把 AI 解锁过的电脑锁回去）要在这里自己做。放在这里（退出已确定）而不是函数开头：
+    // 替换失败时应用继续跑（上面 catch 会拉回 server），那时 destroy 掉的话设置页的电脑操作 IPC 就没了
+    destroyDesktop();
     app.relaunch();
     app.exit(0);
   }
@@ -3530,6 +3575,12 @@ if (!app.requestSingleInstanceLock()) {
     } catch (err) {
       log(`[main] 内置浏览器注册 IPC 失败（浏览器面板不可用，不影响其它功能）：${err?.message || err}`);
     }
+    // 电脑操作的设置页 IPC（computer-use:*，同样每个入口先过 isTrustedIpcSender）：不可用时设置页卡片自己显示原因
+    try {
+      desktop?.registerIpc();
+    } catch (err) {
+      log(`[main] 电脑操作注册 IPC 失败（设置页卡片不可用，不影响其它功能）：${err?.message || err}`);
+    }
     // 系统关机 / 重启 / 注销：标记一下，before-quit 据此跳过「优雅停 server」（拖住退出会打断关机）
     try {
       powerMonitor.on("shutdown", () => {
@@ -3908,6 +3959,9 @@ if (!app.requestSingleInstanceLock()) {
   app.on("will-quit", () => {
     if (browserManagerDestroyed) return;
     browserManagerDestroyed = true;
+    // 电脑操作先收尾：撤遮罩；如果这台电脑是 AI 替用户解锁的，同步发出锁屏命令（尽力而为）——必须在 server 通道被拆之前，
+    // 也不依赖 server 是否还活着
+    destroyDesktop();
     try {
       browserManager.destroy();
     } catch (err) {
@@ -4021,6 +4075,9 @@ if (!app.requestSingleInstanceLock()) {
         event.preventDefault();
         // 这条路径以 app.exit(0) 收尾（成败都退），所以不复位 setQuitting——app.exit 会先销毁窗口，此时再新建停车场窗口 = SIGTRAP
         applyingStagedOnQuit = true;
+        // 同理：app.exit(0) 不触发 will-quit，电脑操作的收尾（撤遮罩 / 把 AI 解锁过的电脑锁回去）绕过去了——退出已经板上钉钉（下面 finally 无条件 exit），
+        // 趁早做：套用要拷整个 .app，可能要几十秒，不该让这段时间里电脑一直开着没锁
+        destroyDesktop();
         void applyStagedUpdateOnQuit().finally(() => {
           app.exit(0);
         });

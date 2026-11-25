@@ -1,10 +1,13 @@
 "use client";
 
 /**
- * 「内置浏览器」设置节（桌面端内置浏览器的两个开关 + 清登录态）。
+ * 「内置浏览器」设置节（桌面端内置浏览器的 AI 权限开关 + 标签页上限 + 清登录态）。
  *
- * 布局定式同偏好卡：统一设置行（名称 + 一句说明 | 控件）。
- * 无桌面壳（浏览器里访问 / pnpm dev:web）时 `window.__browser` 不存在：两个开关仍可改（只是个设置值），
+ * 布局定式同偏好卡：统一设置行（名称 + 一句说明 | 控件）。**每行说明只留一句**，补充说明进名称后面的 ⓘ 气泡
+ *（SettingRow 的 `detail`）——这张卡以前每行一大段字，用户点名过「一大串一大串的字」。
+ * 全部文案在 `@/lib/browser-settings-copy`（纯数据，契约测试直接断言它）；本文件只管布局和接线。
+ * 行序：AI 能做什么（脚本 / 登录态 / 页面权限）→ AI 能看到什么（网络正文 / 你的输入）→ 调试工具 → 浏览器自身（证书 / 标签页）→ 清除。
+ * 无桌面壳（浏览器里访问 / pnpm dev:web）时 `window.__browser` 不存在：开关仍可改（只是个设置值），
  * 但「清除浏览器登录数据」不可用，并给出「仅桌面端可用」的提示——不隐藏，免得用户找不到、也搞不清为什么没有。
  *
  * 清除前的确认走 `useDialog().confirm({ destructive: true })`（与面板菜单同一个流程 / 同一份文案，见 clear-data-flow.ts）。
@@ -21,6 +24,17 @@ import { IntInput } from "@/components/ui/int-input";
 import { SettingRow } from "@/components/ui/setting-row";
 import { Switch } from "@/components/ui/switch";
 import { useDialog } from "@/hooks/use-dialog";
+import {
+  BROWSER_SETTING_COPY as COPY,
+  type BrowserSettingCopy,
+} from "@/lib/browser-settings-copy";
+
+/** 文案条目 → SettingRow 的 label / hint / detail（detail 缺省就不出 ⓘ） */
+const rowCopy = (c: BrowserSettingCopy) => ({
+  label: c.label,
+  hint: c.hint,
+  detail: c.detail,
+});
 
 interface BrowserSectionProps {
   /** 允许 AI 在页面里执行 JS（browser_evaluate）。默认关 */
@@ -97,9 +111,9 @@ export const BrowserSection = ({
 
   return (
     <div className="divide-y divide-border/60">
+      {/* ① AI 能做什么：默认关、风险高的放最上面 */}
       <SettingRow
-        label="允许 AI 执行页面脚本"
-        hint="开启后 AI 可直接在网页里运行 JavaScript（browser_evaluate），能力强、风险也高；默认关闭。关闭时 AI 想执行脚本，会先在浏览器面板弹出审批卡，由你选择仅本任务允许、永久开启或拒绝"
+        {...rowCopy(COPY.evaluate)}
         control={
           <Switch
             checked={evaluateEnabled}
@@ -108,8 +122,20 @@ export const BrowserSection = ({
         }
       />
       <SettingRow
-        label="记录你输入的内容"
-        hint="开启后，你在浏览器里的输入会连同内容一起告诉 AI（邮箱、令牌、卡号等敏感格式仍会自动打码）；默认只记「输入了几个字」。密码框的内容无论如何都不记录"
+        {...rowCopy(COPY.storage)}
+        control={<Switch checked={storageAccess} onCheckedChange={onStorageAccessChange} />}
+      />
+      <SettingRow
+        {...rowCopy(COPY.permissions)}
+        control={<Switch checked={pagePermissions} onCheckedChange={onPagePermissionsChange} />}
+      />
+      {/* ② AI 能看到什么 */}
+      <SettingRow
+        {...rowCopy(COPY.networkBody)}
+        control={<Switch checked={networkBodyRead} onCheckedChange={onNetworkBodyReadChange} />}
+      />
+      <SettingRow
+        {...rowCopy(COPY.recordInput)}
         control={
           <Switch
             checked={recordInputValues}
@@ -117,34 +143,17 @@ export const BrowserSection = ({
           />
         }
       />
+      {/* ③ 调试工具 + 浏览器自身 */}
       <SettingRow
-        label="允许 AI 读写登录态"
-        hint="开启后 AI 能看到 Cookie / 本地存储的明文值，也能写入、删除、导出和导入登录状态。导出的文件含明文凭据（Cookie / 令牌），保存在任务目录（权限 0600），14 天后自动清理；无痕标签的数据不允许导出。默认关闭时只能看到名字和属性，值只显示长度和前 4 位"
-        control={<Switch checked={storageAccess} onCheckedChange={onStorageAccessChange} />}
-      />
-      <SettingRow
-        label="允许 AI 授予页面权限"
-        hint="开启后 AI 可以代你对页面请求的权限（定位、通知、读剪贴板等）点允许或拒绝；默认关闭，页面请求权限时由你在面板上决定。摄像头和麦克风也一样：网页（如声音 / 视频检测、会议页）第一次请求时会在面板上问你，不会静默打开"
-        control={<Switch checked={pagePermissions} onCheckedChange={onPagePermissionsChange} />}
-      />
-      <SettingRow
-        label="自动放行本机的自签名证书"
-        hint="只对真正的本机地址生效：localhost（含 *.localhost）、127.0.0.0/8 和 ::1，用于本机开发站点的自签名证书。*.local（局域网设备名，可能是别人的机器）不在此列，仍会询问你；其它网站的证书错误同样要你在面板上确认"
-        control={<Switch checked={trustLoopbackCerts} onCheckedChange={onTrustLoopbackCertsChange} />}
-      />
-      <SettingRow
-        label="允许 AI 读取网络响应内容"
-        hint="开启后 AI 可以查看请求和响应的正文（已自动隐去令牌、密码等敏感内容）；关闭后只能看到地址、状态和头部"
-        control={<Switch checked={networkBodyRead} onCheckedChange={onNetworkBodyReadChange} />}
-      />
-      <SettingRow
-        label="高级调试工具"
-        hint="给 AI 提供网络规则、性能分析、源码查看、断点调试、录制这组前端调试工具；关闭可以省一些提示词。对新开始的会话生效"
+        {...rowCopy(COPY.advancedTools)}
         control={<Switch checked={advancedTools} onCheckedChange={onAdvancedToolsChange} />}
       />
       <SettingRow
-        label="标签页数量上限"
-        hint="单个任务最多同时打开几个标签页（5–60）。每个标签页是一个独立的渲染进程，设太大会吃内存"
+        {...rowCopy(COPY.loopbackCerts)}
+        control={<Switch checked={trustLoopbackCerts} onCheckedChange={onTrustLoopbackCertsChange} />}
+      />
+      <SettingRow
+        {...rowCopy(COPY.maxTabs)}
         control={
           <IntInput
             value={maxTabs}
@@ -158,13 +167,10 @@ export const BrowserSection = ({
           />
         }
       />
+      {/* ④ 破坏性操作放最后 */}
       <SettingRow
-        label="清除浏览器登录数据"
-        hint={
-          desktop
-            ? "清掉内置浏览器保存的 Cookie 与站点数据，所有网站需要重新登录"
-            : "仅桌面端可用"
-        }
+        label={COPY.clearData.label}
+        hint={desktop ? COPY.clearData.hint : COPY.clearData.unavailable}
         control={
           <Button
             type="button"

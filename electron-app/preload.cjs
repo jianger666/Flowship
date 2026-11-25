@@ -246,3 +246,31 @@ contextBridge.exposeInMainWorld("__browser", {
    */
   serveLocalHtml: (absPath) => ipcRenderer.invoke("browser:serveLocalHtml", absPath),
 });
+
+// 电脑操作桥（设置页「电脑操作」卡；契约见 desktop/types.mjs 的 ComputerUseBridge，渲染端类型在 src/lib/computer-use-bridge.ts）：
+// - 通道名与 desktop/types.mjs 的 COMPUTER_USE_CHANNELS 一一对应（preload 在 sandbox 下只能 CJS、引不了 ESM，所以抄在这里；
+//   tests/desktop-index.test.ts 有一条守卫测试对照两边，改一边忘另一边会红）
+// - 主进程每个入口都再过 isTrustedIpcSender（只认本应用 origin）
+// - 安全：开机密码只能经 setCredential 单向写进主进程（系统钥匙串）；桥上没有任何「读回凭据」的方法
+contextBridge.exposeInMainWorld("__computerUse", {
+  /** @returns {Promise<object>} ComputerUseStatus */
+  getStatus: () => ipcRenderer.invoke("computer-use:status"),
+  /** 触发系统授权提示（并按需打开系统设置），返回最新状态 @param {"accessibility"|"screen"} kind */
+  requestPermission: (kind) => ipcRenderer.invoke("computer-use:request-permission", kind),
+  /** 直达系统设置对应页 @param {"accessibility"|"screen"} kind */
+  openSettings: (kind) => ipcRenderer.invoke("computer-use:open-settings", kind),
+  /** 只写不读 @param {{ password: string }} input @returns {Promise<{ ok: boolean, error?: string }>} */
+  setCredential: (input) => ipcRenderer.invoke("computer-use:set-credential", input),
+  /** 返回真实结果（钥匙串里没删掉就 ok:false）@returns {Promise<{ ok: boolean, error?: string }>} */
+  clearCredential: () => ipcRenderer.invoke("computer-use:clear-credential"),
+  /** 锁屏 → 自动解锁 → 回到桌面；逐步返回结果 */
+  testLockedAccess: () => ipcRenderer.invoke("computer-use:test-locked-access"),
+  /** Windows：开测试窗口 → 锁屏 → 锁屏状态下截图 / 打字验证；电脑保持锁屏，用户自己解锁。逐步返回结果 */
+  testBackground: () => ipcRenderer.invoke("computer-use:test-background"),
+  /** Windows：安装解锁组件（会弹系统管理员授权框）@returns {Promise<{ ok: boolean, error?: string }>} */
+  installUnlockHelper: () => ipcRenderer.invoke("computer-use:install-unlock-helper"),
+  /** Windows：卸载解锁组件并清掉它保存的开机密码 @returns {Promise<{ ok: boolean, error?: string }>} */
+  uninstallUnlockHelper: () => ipcRenderer.invoke("computer-use:uninstall-unlock-helper"),
+  /** 导出诊断文件（不含用户内容 / 凭据）@returns {Promise<{ path: string }>} */
+  exportDiagnostics: () => ipcRenderer.invoke("computer-use:export-diagnostics"),
+});

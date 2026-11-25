@@ -13,7 +13,7 @@ import {
   migrateUsernameBranchTemplates,
   pruneUsernameBranchTemplates,
 } from "@/lib/server/migrate-username-templates";
-import { META_FILE } from "@/lib/server/task-fs-core";
+import { META_FILE, withTaskLock } from "@/lib/server/task-fs-core";
 
 const tasksRoot = () => path.join(TMP_DATA, "tasks");
 
@@ -139,5 +139,93 @@ describe("migrateUsernameBranchTemplates", () => {
     // 幂等：第二次零操作
     const n2 = await migrateUsernameBranchTemplates();
     expect(n2).toBe(0);
+  });
+});
+
+// 第五轮评审 P2：迁移由 boot-warmup 在 server 就绪后后台触发，此时用户已经能操作任务。
+// 「读 meta → 改 → 整份写回」不加任务锁，会拿旧快照盖掉别的写者（withTaskLock 里）刚写的字段。
+describe("migrateUsernameBranchTemplates：和任务锁里的写者并发", () => {
+  const metaFile = (id: string) => path.join(tasksRoot(), id, META_FILE);
+  const readMeta = async (id: string) =>
+    JSON.parse(await fs.readFile(metaFile(id), "utf-8")) as Record<string, unknown>;
+  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+  /** 模拟任务锁里的写者：持锁后先读一份快照，等 gate 放行再把（改过的）快照整份写回——和 task-fs 的读-改-写同形 */
+  const startLockedWriter = async (id: string, mutate: (snap: Record<string, unknown>) => void) => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let held!: () => void;
+    const heldP = new Promise<void>((r) => {
+      held = r;
+    });
+    const done = withTaskLock(id, async () => {
+      const snap = await readMeta(id);
+      held();
+      await gate;
+      mutate(snap);
+      await fs.writeFile(metaFile(id), JSON.stringify(snap, null, 2), "utf-8");
+    });
+    await heldP;
+    return { release, done };
+  };
+
+  it("写者持锁期间迁移要等它：写者写的字段（runStatus / updatedAt）保留，残留也清干净", async () => {
+    await writeFakeMeta("task_race", {
+      repoBranchTemplates: {
+        "/repo/a": "feature/{username}/x",
+        "/repo/b": "feature/{storyId}",
+      },
+    });
+    const w = await startLockedWriter("task_race", (snap) => {
+      snap.runStatus = "running";
+      snap.updatedAt = 999;
+    });
+    const m = migrateUsernameBranchTemplates();
+    await wait(50); // 无锁的实现此刻早已用旧快照写完了
+    w.release();
+    await w.done;
+    const n = await m;
+
+    expect(n).toBe(1);
+    const meta = await readMeta("task_race");
+    expect(meta.runStatus).toBe("running");
+    expect(meta.updatedAt).toBe(999);
+    expect(meta.repoBranchTemplates).toEqual({ "/repo/b": "feature/{storyId}" });
+  });
+
+  it("预检之后别人已经把残留清掉了：锁内重读重判，不再写（返回 0），别人写的内容原样", async () => {
+    await writeFakeMeta("task_cleaned", {
+      repoBranchTemplates: { "/repo/a": "feature/{username}/x" },
+    });
+    const w = await startLockedWriter("task_cleaned", (snap) => {
+      snap.repoBranchTemplates = undefined;
+      snap.runStatus = "running";
+    });
+    const m = migrateUsernameBranchTemplates();
+    await wait(50);
+    w.release();
+    await w.done;
+
+    expect(await m).toBe(0);
+    const meta = await readMeta("task_cleaned");
+    expect(meta.runStatus).toBe("running");
+    expect(meta.repoBranchTemplates).toBeUndefined();
+  });
+
+  it("没有残留的任务不拿锁：别人长时间持有它的锁也不拖住迁移（稳态零排队）", async () => {
+    await writeFakeMeta("task_clean_busy", { repoBranchTemplates: { "/repo/a": "feature/{storyId}" } });
+    const w = await startLockedWriter("task_clean_busy", () => {});
+    try {
+      const outcome = await Promise.race([
+        migrateUsernameBranchTemplates(),
+        wait(1000).then(() => "blocked" as const),
+      ]);
+      expect(outcome).toBe(0);
+    } finally {
+      w.release();
+      await w.done;
+    }
   });
 });

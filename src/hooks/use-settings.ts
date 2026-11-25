@@ -43,6 +43,12 @@ import {
   type SaveRetrier,
 } from "@/lib/save-retry";
 import {
+  applyDraftRollback,
+  withRestoredNote,
+  type RolledBackKind,
+} from "@/lib/settings-draft-rollback";
+import { withRetryPending } from "@/lib/settings-retry-pending";
+import {
   describeSettingsUnreadable,
   type SettingsUnreadable,
 } from "@/lib/settings-unreadable";
@@ -133,6 +139,11 @@ export interface UseSettingsResult {
   retryLoad: () => Promise<void>;
   dirty: Record<SettingsField, boolean>;
   hasUnsaved: boolean;
+  /**
+   * 首次保存失败、正在自动重试的字段（R20-11）：界面显示的是新值、磁盘上仍是旧值。设置页据此在浮顶栏挂一条常驻提示；
+   * 该字段重试成功 / 被服务端拒绝 / 放弃重试 / 又被改 / 又发起新的保存时移出。
+   */
+  retryPending: ReadonlySet<string>;
   update: <K extends SettingsField>(key: K, value: FeAiFlowSettings[K]) => void;
   // 即时存某字段的指定值（编辑即保存：选择 / 开关 onChange、文本框 onBlur 调）
   saveFieldValue: <K extends SettingsField>(
@@ -192,6 +203,8 @@ const FIELD_EQ_KIND = {
   browserNetworkBodyRead: "boolTrue",
   browserAdvancedTools: "boolTrue",
   browserMaxTabs: "numberOr20",
+  computerUse: "boolFalse",
+  computerUseLockedAccess: "boolFalse",
   repos: "repos",
   disabledMcpServers: "stringSet",
   disabledSkills: "stringSet",
@@ -299,6 +312,12 @@ export const useSettings = (): UseSettingsResult => {
 
   // 已经写入 config.json 的快照（已保存版本）、和草稿对比算 dirty
   const [savedSettings, setSavedSettings] = useState<FeAiFlowSettings>(DEFAULT_SETTINGS);
+  // 给异步回调读最新的草稿 / 已保存值（S-5）：自动重试器的回调是惰性创建一次的闭包，捕获不到后来渲染出的 state，
+  // 回滚开关草稿时要读「最近一次已保存」的值，只能走 ref（写法同下面的 unreadableRef / hasUnsavedRef：每次渲染同步）
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const savedSettingsRef = useRef(savedSettings);
+  savedSettingsRef.current = savedSettings;
 
   // 是否已从 config 初始化灌过初值；防止 SSR 渲染时闪现空表单
   const [loaded, setLoaded] = useState(false);
@@ -321,6 +340,13 @@ export const useSettings = (): UseSettingsResult => {
     return () => {
       mountedRef.current = false;
     };
+  }, []);
+
+  // 首次保存失败、正在自动重试的字段集合（R20-11 的常驻提示）。惰性创建的重试器闭包也要调它，所以是稳定的 useCallback（只依赖 setState 与 mountedRef）
+  const [retryPending, setRetryPending] = useState<ReadonlySet<string>>(() => new Set());
+  const markRetryPending = useCallback((key: string, pending: boolean) => {
+    if (!mountedRef.current) return;
+    setRetryPending((prev) => withRetryPending(prev, key, pending));
   }, []);
 
   // 把 local-store 的 init 结果（真实配置 or 默认值 + 失败态）同步进 hook 状态；首次加载与「重试加载」共用
@@ -451,6 +477,12 @@ export const useSettings = (): UseSettingsResult => {
       browserNetworkBodyRead: !isFieldEqual("browserNetworkBodyRead", settings, savedSettings),
       browserAdvancedTools: !isFieldEqual("browserAdvancedTools", settings, savedSettings),
       browserMaxTabs: !isFieldEqual("browserMaxTabs", settings, savedSettings),
+      computerUse: !isFieldEqual("computerUse", settings, savedSettings),
+      computerUseLockedAccess: !isFieldEqual(
+        "computerUseLockedAccess",
+        settings,
+        savedSettings,
+      ),
       companyEnv: !isFieldEqual("companyEnv", settings, savedSettings),
       provider: !isFieldEqual("provider", settings, savedSettings),
       customProviders: !isFieldEqual("customProviders", settings, savedSettings),
@@ -475,6 +507,7 @@ export const useSettings = (): UseSettingsResult => {
     // 也就没人 cancel 重试，退避后失败的新值会被写盘、与输入框里看到的不一致。
     // 只丢待办、不 bump 世代：repo-card 先落盘安全版再 update 草稿，安全版若失败仍要排重试
     retrierRef.current?.dropPending(key);
+    markRetryPending(key, false);
     setSettings((prev) => ({ ...prev, [key]: value }));
   };
 
@@ -488,15 +521,47 @@ export const useSettings = (): UseSettingsResult => {
   // 不弹 success toast：编辑即存高频、刷屏没意义、仅失败时提示
   // S13-03：保存失败后的自动重试器（惰性建一次；字段级退避重试、新保存作废旧重试、卸载时补跑）
   const retrierRef = useRef<SaveRetrier | null>(null);
+  // S-5 / R20-10：保存被服务端 4xx 拒绝 / 重试放弃之后，boolean 开关与单选类字段（provider / defaultModel / jumpIde / linkOpenMode / userRole / submitShortcut / browserMaxTabs / meegleProject）
+  // 的草稿回滚成最近一次已保存的值（判定见 settings-draft-rollback）。
+  // 只读 ref（settingsRef / savedSettingsRef）+ 稳定的 setSettings，所以惰性创建一次的重试器闭包里调它也拿得到最新值。
+  // 返回回滚的类别（null = 没回滚；toast 据此补「开关已恢复为保存前的状态」/「已恢复为保存前的值」）。
+  // 文本框 / 整块编辑的列表对象不回滚：回滚会吃掉用户刚输入的内容或盖掉并发的修改（理由与分类见 settings-draft-rollback 头注释）。首次失败（5xx / 网络错误，会自动重试）也不调用它
+  const rollbackRejectedDraft = (key: SettingsField): RolledBackKind | null => {
+    const { rolledBack, kind } = applyDraftRollback(settingsRef.current, savedSettingsRef.current, key);
+    if (rolledBack) {
+      // 函数式更新：以 setState 当下的草稿为准，只改这一个字段
+      setSettings((prev) => applyDraftRollback(prev, savedSettingsRef.current, key).settings);
+    }
+    return rolledBack ? kind : null;
+  };
   const getRetrier = (): SaveRetrier => {
     if (!retrierRef.current) {
       retrierRef.current = createSaveRetrier({
-        onRecovered: () => toast.success("配置已自动重试保存成功"),
-        onGiveUp: () =>
-          toast.error("配置多次重试仍未能保存、请检查磁盘 / 服务后再改一次该项"),
-        // 重试那一次才被服务端 4xx 拒绝（如配置已被别处改成校验不过的形态）：同一份内容再重试没有意义
-        onRejected: (_key, status) =>
-          toast.error(rejectedToast(status, getLastSettingsRejectReason())),
+        // 三个出口（成功 / 放弃 / 被拒）都要把该字段移出「正在重试」集合，常驻提示才会消失（R20-11）
+        onRecovered: (key) => {
+          markRetryPending(key, false);
+          toast.success("配置已自动重试保存成功");
+        },
+        // 重试放弃（注意：重试器给的是 key）：开关 / 单选草稿回滚，免得界面显示已开（已选）、磁盘上其实没有
+        onGiveUp: (key) => {
+          markRetryPending(key, false);
+          toast.error(
+            withRestoredNote(
+              "配置多次重试仍未能保存、请检查磁盘 / 服务后再改一次该项",
+              rollbackRejectedDraft(key as SettingsField),
+            ),
+          );
+        },
+        // 重试那一次才被服务端 4xx 拒绝（如配置已被别处改成校验不过的形态）：同一份内容再重试没有意义，开关 / 单选草稿同样回滚
+        onRejected: (key, status) => {
+          markRetryPending(key, false);
+          toast.error(
+            withRestoredNote(
+              rejectedToast(status, getLastSettingsRejectReason()),
+              rollbackRejectedDraft(key as SettingsField),
+            ),
+          );
+        },
       });
     }
     return retrierRef.current;
@@ -528,6 +593,8 @@ export const useSettings = (): UseSettingsResult => {
     }
     const next: FeAiFlowSettings = { ...getSettings(), [key]: value };
     setSettings((prev) => ({ ...prev, [key]: value }));
+    // 新的保存取代该字段旧的待重试（saveWithRetry 里 retrier.cancel 同步作废它）：常驻提示先清掉，这次若又失败再由 onFailed 标上（R20-11）
+    markRetryPending(key, false);
     // 作废旧重试 + 失败登记重试都交给 saveWithRetry：它按世代判断「期间是否有同字段的新保存」，
     // V1 的 PUT 在路上时用户又存了 V2，V1 晚失败就不会再排重试（否则退避后用旧值覆盖 V2）
     // 走带状态码的 saveSettingsDetailed：4xx（服务端明确拒绝）不排重试，5xx / 网络错误才重试
@@ -546,10 +613,20 @@ export const useSettings = (): UseSettingsResult => {
       },
       // 保存失败：savedSettings 不动 → 字段保持 dirty、离页仍会拦截提示；
       // 并登记自动重试——之前失败后草稿再没人去存、只能等用户碰巧再改一次
-      onFailed: () => toast.error("保存失败：配置没能写入 config.json、将自动重试"),
+      onFailed: () => {
+        // 排上了自动重试：界面是新值、磁盘仍是旧值——挂常驻提示，直到重试成功 / 被拒 / 放弃（R20-11）
+        markRetryPending(key, true);
+        toast.error("保存失败：配置没能写入 config.json、将自动重试");
+      },
       // 被服务端 4xx 拒绝：不会重试，提示不能再说「将自动重试」
+      // 开关 / 单选类草稿同时回滚成已保存的值（S-5 / R20-10）：被拒 = 永远存不进去，草稿停在新值会显示「已生效」、字段一直 dirty 还拦离页
       onRejected: (status) =>
-        toast.error(rejectedToast(status, getLastSettingsRejectReason())),
+        toast.error(
+          withRestoredNote(
+            rejectedToast(status, getLastSettingsRejectReason()),
+            rollbackRejectedDraft(key),
+          ),
+        ),
     }).then((ok) => {
       if (ok) setSavedSettings((prev) => ({ ...prev, [key]: value }));
       return ok;
@@ -583,6 +660,7 @@ export const useSettings = (): UseSettingsResult => {
     retryLoad,
     dirty,
     hasUnsaved,
+    retryPending,
     update,
     saveFieldValue,
   };

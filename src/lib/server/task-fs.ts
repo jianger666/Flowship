@@ -61,7 +61,7 @@ import type {
   TaskSummary,
   TurnTokenUsage,
 } from "@/lib/types";
-import { OWNER_NOTE_TITLE } from "@/lib/owner-note";
+import { OWNER_NOTE_TITLE, ownerNoteOverflow } from "@/lib/owner-note";
 import { accumulateTokenUsage, shouldAttributeTurnToAction } from "@/lib/token-usage";
 import { settleActiveTime } from "@/lib/action-active-time";
 import { normalizeReqId } from "@/lib/req-id";
@@ -2018,6 +2018,24 @@ export const appendEvent = async (
 };
 
 /**
+ * `addContextDoc` 在「文档已经写进 meta」**之后**才失败（读回最新任务视图的 `hydrateTask` 抛错）时抛的错误：
+ * 这次添加**已经生效**——文档（连同它引用的图片）已落盘，调用方不能当成「没加上」去回收图片，
+ * 否则 meta 里留下指向已删文件的悬空引用（第四轮评审 P2：路由的 catch 一律回收，会删掉已被引用的图）。
+ * 用 `committed` 字段判定而不是 `instanceof`：模块被 HMR / `vi.resetModules` 重载后类身份会对不上。
+ */
+export class ContextDocCommittedError extends Error {
+  readonly committed = true as const;
+  constructor(cause: unknown) {
+    super(`上下文文档已保存，但读取最新任务状态失败：${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "ContextDocCommittedError";
+  }
+}
+
+/** 见 {@link ContextDocCommittedError}：这个错误说明「文档已经加上了」，只是后面读回任务视图失败 */
+export const isContextDocCommittedError = (err: unknown): err is ContextDocCommittedError =>
+  typeof err === "object" && err !== null && (err as { committed?: unknown }).committed === true;
+
+/**
  * 批量加上下文文档（V0.6.0.1 重写、支持图片）
  *
  * 入参分两部分：
@@ -2057,13 +2075,21 @@ export const addContextDoc = async (
       throw new Error("mainDoc.title / content 不能为空");
     }
 
+    // 所有者备注（owner-note.ts）：①一律按文本存——按内容猜类型的话，以 / 开头会变成 path、以 http 开头会变成 url，
+    // 而 findOwnerNote 只认文本，备注就「加成功了却静默失效」；②总长超上限直接拒绝——读取时超出的部分会被截掉，AI 看不到。
+    const isOwnerNote = hasMain && mainTitle === OWNER_NOTE_TITLE;
+    if (isOwnerNote) {
+      const overflow = ownerNoteOverflow(meta.contextDocs, mainContent);
+      if (overflow) throw new Error(overflow);
+    }
+
     const newDocs: TaskContextDoc[] = [];
     if (hasMain) {
       newDocs.push({
         id: newContextDocId(),
         title: mainTitle,
         content: mainContent,
-        type: inferContextDocType(mainContent),
+        type: isOwnerNote ? "text" : inferContextDocType(mainContent),
         createdAt: now,
       });
     }
@@ -2090,7 +2116,13 @@ export const addContextDoc = async (
     meta.contextDocs = [...(meta.contextDocs ?? []), ...newDocs];
     meta.updatedAt = now;
     await writeMeta(meta);
-    return await hydrateTask(meta);
+    // 到这里文档（连同它引用的图片）已经落盘生效：之后读回最新任务视图失败，要让调用方分得清「没加上」和「加上了、只是读回失败」，
+    // 否则路由会把已被引用的图片当孤儿删掉（见 ContextDocCommittedError）
+    try {
+      return await hydrateTask(meta);
+    } catch (err) {
+      throw new ContextDocCommittedError(err);
+    }
   });
 
 export const removeContextDoc = async (

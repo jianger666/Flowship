@@ -169,12 +169,12 @@ describe("pi：buildCustomTools", () => {
     await expect(click.execute("call-2", { ref: "e1" }, undefined)).rejects.toThrow(/重新调用 browser_snapshot/);
   });
 
-  it("非属主一轮：execute 层先被 withNonOwnerTurnDeny 拒（返回 DENIED 文本、不发请求）", async () => {
+  it("非属主一轮：execute 层先被 withNonOwnerTurnDeny 拒（抛错、错误信息是 DENIED 文案、不发请求）", async () => {
     const f = install();
     const snapshot = build("tok", "t1").find((t) => t.name === "browser_snapshot")!;
     beginNonOwnerTurn("t1");
-    const r = await snapshot.execute("call-3", {}, undefined);
-    expect(JSON.stringify(r.content)).toContain("DENIED");
+    // 被拒也是失败的工具调用：pi 的 execute 没有 isError，必须抛错（界面不能把拒绝显示成成功）
+    await expect(snapshot.execute("call-3", {}, undefined)).rejects.toThrow(/\[DENIED\]/);
     expect(f.calls).toHaveLength(0);
   });
 });

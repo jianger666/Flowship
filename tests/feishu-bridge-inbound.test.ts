@@ -646,12 +646,19 @@ describe("退出清理 runExitCleanup：优雅停之后同步强杀登记过的�
         forced = true;
       },
     });
-    const t0 = Date.now();
-    await __runExitCleanupForTest();
-    const elapsed = Date.now() - t0;
-    expect(forced).toBe(true);
-    expect(elapsed).toBeGreaterThanOrEqual(1400);
-    expect(elapsed).toBeLessThan(1900);
+    // 假时钟推进：上限（EXIT_HOOK_CLEANUP_CAP_MS = 1500）那一刻是确定的。
+    // 旧写法用真实时钟断言 elapsed ∈ [1400, 1900)：整进程卡顿 >400ms 就误报，还白等 1.5s
+    vi.useFakeTimers();
+    try {
+      const done = __runExitCleanupForTest();
+      await vi.advanceTimersByTimeAsync(1499);
+      expect(forced).toBe(false); // 上限没到：还在等卡死的优雅停，不会提前强杀
+      await vi.advanceTimersByTimeAsync(1);
+      await done;
+      expect(forced).toBe(true); // 刚到 1.5s 上限就放弃等待、同步强杀
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("某个强杀抛错不影响其它强杀、也不让退出清理抛", async () => {

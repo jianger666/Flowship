@@ -17,6 +17,7 @@ import path from "node:path";
 import { getPendingAsk } from "@/lib/server/chat-pending";
 import { dataRoot } from "@/lib/server/data-root";
 import { redactSecretsInText } from "@/lib/server/event-secret-redact";
+import { onSettingsWritten } from "@/lib/server/settings-fs";
 import { getTask } from "@/lib/server/task-fs";
 import { taskDir } from "@/lib/server/task-fs-core";
 import {
@@ -97,24 +98,73 @@ const ENABLED_CACHE_TTL_MS = 8_000;
 type EnabledCache = { value: boolean; at: number };
 /** null = 走真实读取；boolean = 单测强制 */
 let enabledOverride: boolean | null = null;
-let enabledCache: EnabledCache | null = null;
+
+/**
+ * 开关缓存 + 世代号 + 订阅句柄，**一起挂在 globalThis 的同一个 cell 上**（R20-14）。
+ *
+ * 为什么不是模块级变量：全局 tap（`getOutboundGlobal().registered`）是「先求值者胜」——dev 热重载后存活的 tap 仍是**第一版**模块的闭包，
+ * 它读的是第一版模块里的缓存变量；而旧写法的失效订阅是「后求值者胜」（模块每次重新求值先注销旧订阅、再订一个清**本版**变量的新订阅）。
+ * 两个方向相反：热重载之后，存活 tap 读的那份缓存没人作废，退回 8 秒 TTL = 修复前的行为。
+ * 现在缓存和世代号都在 cell 里、订阅用 `??=` 只订一次、回调闭包的是 cell 本身——不管存活的 tap 来自哪一版模块，它读到的缓存都会被作废。
+ * 没验证：真 Next dev 的热重载没有手点过；tests/feishu-bridge-enabled-cache-invalidate.test.ts 用 `vi.resetModules()` 重新求值模块来模拟「新旧两版并存」。
+ */
+type EnabledCell = {
+  cache: EnabledCache | null;
+  /**
+   * 缓存世代号：每次设置写盘 +1。读盘期间发生了写盘（世代号变了）→ 这次读到的值可能是写盘前的旧值，
+   * 照常返回给本次调用，但**不落进缓存**（否则作废之后又被在途的旧读重新填回 8 秒）。
+   */
+  gen: number;
+  unsub: (() => void) | null;
+};
+const ENABLED_CELL_KEY = "__flowshipFeishuOutboundEnabledCellV1__";
+
+// 设置一落盘就作废这份缓存：8 秒 TTL 是「关桥接后在途一轮仍会往飞书发回执 / 刚打开时缓存的 false 丢掉进行中的一轮」的最长残留。
+// 回调只清缓存（同步、不 await、不拿设置写锁——settings-fs 在写锁内同步调它）。
+// 任何设置写盘都作废（不区分是不是桥接开关）：重读一次 config.json 很便宜，比判「哪个键变了」更不容易漏。
+// 可逆：删掉订阅（`cell.unsub ??=` 那段）即回到「最多 8 秒后才发现开关变了」。
+const getEnabledCell = (): EnabledCell => {
+  const g = globalThis as unknown as Record<string, EnabledCell | undefined>;
+  const cell = (g[ENABLED_CELL_KEY] ??= { cache: null, gen: 0, unsub: null });
+  cell.unsub ??= onSettingsWritten(() => {
+    cell.gen += 1;
+    cell.cache = null;
+  });
+  return cell;
+};
+// 模块求值时就订上（和以前「模块求值即订阅」同一时机）；之后每次读缓存也会兜一次（`??=` 幂等）
+getEnabledCell();
 
 /** 单测强制开关；传 null 恢复 */
 export const __setBridgeEnabledForTest = (v: boolean | null): void => {
   enabledOverride = v;
-  enabledCache = null;
+  getEnabledCell().cache = null;
+};
+
+/** 读盘函数：默认读设置里的桥接总开关；单测可换成可控的（卡住 / 放行）来复现「读盘期间发生写盘」的竞态 */
+let readBridgeEnabledImpl: () => Promise<boolean> = isFeishuChatBridgeEnabled;
+/** 单测替换「读桥接总开关」；传 null 恢复 */
+export const __setBridgeEnabledReaderForTest = (fn: (() => Promise<boolean>) | null): void => {
+  readBridgeEnabledImpl = fn ?? isFeishuChatBridgeEnabled;
+  getEnabledCell().cache = null;
 };
 
 const isBridgeEnabledCached = async (): Promise<boolean> => {
   if (enabledOverride !== null) return enabledOverride;
+  const cell = getEnabledCell();
   const now = Date.now();
-  if (enabledCache && now - enabledCache.at < ENABLED_CACHE_TTL_MS) {
-    return enabledCache.value;
+  if (cell.cache && now - cell.cache.at < ENABLED_CACHE_TTL_MS) {
+    return cell.cache.value;
   }
-  const value = await isFeishuChatBridgeEnabled();
-  enabledCache = { value, at: now };
+  const gen = cell.gen;
+  const value = await readBridgeEnabledImpl();
+  if (gen === cell.gen) cell.cache = { value, at: now };
   return value;
 };
+
+/** 仅测试用：直接走缓存读取路径（isBridgeEnabledCached 本身不导出；正式调用点在 outbound 内部的事件处理里） */
+export const __isBridgeEnabledCachedForTest = (): Promise<boolean> =>
+  isBridgeEnabledCached();
 
 // ----------------- chat mode / 标题缓存 -----------------
 
@@ -273,8 +323,9 @@ export const __resetFeishuOutboundForTest = (): void => {
   g.toolIndexes.clear();
   g.chains.clear();
   modeCache.clear();
-  enabledCache = null;
+  getEnabledCell().cache = null;
   enabledOverride = null;
+  readBridgeEnabledImpl = isFeishuChatBridgeEnabled;
   createCardStreamImpl = defaultCreateCardStream;
   uploadImageImpl = defaultUploadImage;
   sendTextMessageImpl = defaultSendTextMessage;

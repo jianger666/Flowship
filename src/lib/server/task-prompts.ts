@@ -23,6 +23,7 @@ import { renderContextDocsSection } from "./context-docs-prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { mediaDisplayPromptSection } from "./media-display-prompt";
 import { browserPromptSection } from "./browser/prompt";
+import { desktopPromptSection } from "./desktop/prompt";
 import { detectAgentShellKind, type AgentShellKind } from "./agent-shell";
 import { GITLAB_TOKEN_ENV_NAME } from "./git-token-env";
 import { formatRepoSectionForPrompt, repoTail } from "@/lib/path-utils";
@@ -317,7 +318,9 @@ const loadSharedPrompt = async (task: Task): Promise<string> => {
   // 所以字节计入 L1、永不被裁。_shared.md §3 第 5 条的「不要写绝对路径」对展示 / 交付给用户的文件有一句例外指向它。
   // 内置浏览器一节同理（单一源在 browser/prompt.ts；chat 侧同一段）：无桌面壳时返回空串、不占 token
   const browserSection = browserPromptSection();
-  return `${filled.replace(/\s+$/, "")}\n\n${mediaDisplayPromptSection()}${browserSection ? `\n\n${browserSection}` : ""}\n`;
+  // 电脑操作一节同理（单一源在 desktop/prompt.ts；chat 侧同一段）：没有 desktop.v1 时返回空串
+  const desktopSection = desktopPromptSection();
+  return `${filled.replace(/\s+$/, "")}\n\n${mediaDisplayPromptSection()}${browserSection ? `\n\n${browserSection}` : ""}${desktopSection ? `\n\n${desktopSection}` : ""}\n`;
 };
 
 // ----------------- ship「再次提测」精简版选择 -----------------

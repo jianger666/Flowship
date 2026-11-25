@@ -24,6 +24,7 @@ import {
 import { createPermissionGate, getPermissionState } from "../electron-app/browser/permission-gate.mjs";
 import { createHandlers as createPermissionHandlers } from "../electron-app/browser/ops/permissions.mjs";
 import { createHandlers as createStorageHandlers } from "../electron-app/browser/ops/storage.mjs";
+import { BROWSER_SETTING_COPY } from "../src/lib/browser-settings-copy";
 import { firstPrompt, flush, makeEnv, type FakeTab } from "./helpers/browser-e2-p1-fakes";
 
 const PERSIST = "persist:flowship-browser";
@@ -339,26 +340,37 @@ describe("R6-22：权限授予按 partition 隔离", () => {
   });
 });
 
-describe("R6-23：设置页文案（源码契约）", () => {
+describe("R6-23：设置页文案（契约）", () => {
+  // 文案已抽成 `browser-settings-copy.ts` 的纯数据：每项 = 一句 hint（行内可见）+ detail（名称后 ⓘ 气泡）。
+  // 气泡 SSR 渲染不出来，所以这里直接断言数据；两处合起来算「用户看得到」。
   const card = readFileSync(path.resolve(import.meta.dirname, "../src/components/settings/browser-card.tsx"), "utf8");
+  const shown = (c: { hint: string; detail?: string }) => `${c.hint}${c.detail ?? ""}`;
 
   it("自动放行证书：写清只对真正的回环生效，`*.local` 明确「不在此列、仍会询问」，不再把 *.local 说成本机开发站点", () => {
-    const hint = /label="自动放行本机的自签名证书"\s*hint="([^"]+)"/.exec(card)?.[1] ?? "";
-    expect(hint).toContain("127.0.0.0/8");
-    expect(hint).toContain("::1");
-    expect(hint).toContain("*.localhost");
-    expect(hint).toMatch(/\*\.local（[^）]*）[^；]*不在此列[^；]*询问/);
+    const copy = BROWSER_SETTING_COPY.loopbackCerts;
+    expect(copy.label).toBe("自动放行本机的自签名证书");
+    const text = shown(copy);
+    expect(text).toContain("127.0.0.0/8");
+    expect(text).toContain("::1");
+    expect(text).toContain("*.localhost");
+    expect(text).toMatch(/\*\.local（[^）]*）[^；]*不在此列[^；]*询问/);
     // 旧文案把 *.local 与 localhost / 127.0.0.1 并列为「本机开发站点」
+    expect(text).not.toContain("localhost / 127.0.0.1 / *.local");
     expect(card).not.toContain("localhost / 127.0.0.1 / *.local");
+    // 卡片真的在用这份数据
+    expect(card).toContain("COPY.loopbackCerts");
   });
 
   it("读写登录态：写明导出文件含明文凭据、任务目录 0600、14 天后自动清理、无痕不能导出", () => {
-    const hint = /label="允许 AI 读写登录态"\s*hint="([^"]+)"/.exec(card)?.[1] ?? "";
-    expect(hint).toContain("明文凭据");
-    expect(hint).toContain("0600");
-    expect(hint).toContain("14 天后自动清理");
-    expect(hint).toContain("无痕标签的数据不允许导出");
-    expect(card).not.toContain("导出文件只放在任务目录里");
+    const copy = BROWSER_SETTING_COPY.storage;
+    expect(copy.label).toBe("允许 AI 读写登录态");
+    const text = shown(copy);
+    expect(text).toContain("明文凭据");
+    expect(text).toContain("0600");
+    expect(text).toContain("14 天后自动清理");
+    expect(text).toContain("无痕标签的数据不允许导出");
+    expect(text).not.toContain("导出文件只放在任务目录里");
+    expect(card).toContain("COPY.storage");
   });
 });
 

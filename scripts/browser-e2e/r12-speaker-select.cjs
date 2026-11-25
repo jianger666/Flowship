@@ -16,6 +16,12 @@
  * 「允许」路径只对麦克风验证，且只在系统授权状态已是 granted 时才跑（摄像头在系统层是 not-determined 时调 getUserMedia 会弹真机授权框，
  * 摄像头的放行路径由单测覆盖）。
  *
+ * 退出码：0 = 全部跑了且全过；1 = 有断言失败；2 = 脚本抛错；4 = 断言都过但有跳过（环境不满足三种：没有任何音频输出设备——扬声器名的两项没跑 /
+ * 除默认设备外没有可选的具体扬声器——setSinkId 一项没跑 / 系统层麦克风授权不是 granted——「允许」路径没跑）。
+ * 不用 3：本目录里 r8 / r9 / r14 / r17 的 3 是「脚本抛错」，r12 / r21 的 INCOMPLETE 特意避开这个已有明确含义的数字（各脚本的退出码本来各有约定、写在各自文件头，
+ * `run.mjs` 头注释也这么说；这里只是不让新增的用法与已有的撞车。第二十四轮 P3-8，第二十五轮评审文档 5；r21 同一套约定）。
+ * 跳过的项明说 SKIP、不计入通过（第二十三轮 R23-7）。
+ *
  * 只能经启动器运行：
  *   node scripts/browser-e2e/run.mjs scripts/browser-e2e/r12-speaker-select.cjs --timeout 120
  */
@@ -33,9 +39,15 @@ app.on("window-all-closed", () => {});
 dialog.showMessageBox = () => new Promise(() => {});
 
 const results = [];
+/** 环境不满足而没跑的项：不计入通过，有任何一项就以退出码 4 结束（第二十三轮 R23-7：以前这两处直接记一条写死 true 的 PASS，没跑完整的一次被当成 22/22 全绿） */
+const skipped = [];
 const check = (id, name, ok, detail) => {
   results.push({ id, name, ok: !!ok });
   console.log(`SMOKE ${ok ? "PASS" : "FAIL"} ${id} ${name}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ""}`);
+};
+const skip = (id, name, reason) => {
+  skipped.push({ id, name, reason });
+  console.log(`SMOKE SKIP ${id} ${name} ${JSON.stringify(reason)}`);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const waitFor = async (fn, ms = 8000) => {
@@ -129,7 +141,9 @@ const main = async () => {
   check("r12-no-error", "enumerateDevices 没有报错", top.err === undefined, top.err);
   const outs = top.outputs ?? [];
   if (outs.length === 0) {
-    check("r12-outputs-env", "本机没有任何音频输出设备（环境限制，无法验证扬声器名）", false, "no audiooutput");
+    // 没有任何音频输出设备是环境限制（与下面 r12-setsinkid 同类），不是 Flowship 的失败：显式 SKIP（不计入通过、退出码 4），不记成一条 FAIL（第二十四轮 P3-8：以前这里写 false，没设备的机器上整个脚本退出码 1）
+    skip("r12-outputs-named", "顶层页面：所有输出设备都带真实名字和 deviceId（不是「一个空名占位」）", "本机没有任何音频输出设备（环境限制，无法验证扬声器名）");
+    skip("r12-outputs-not-single-placeholder", "输出设备不是『单个空名占位』这一旧症状", "本机没有任何音频输出设备（环境限制）");
   } else {
     check("r12-outputs-named", "顶层页面：所有输出设备都带真实名字和 deviceId（不是「一个空名占位」）", outs.every((d) => d.label !== "" && d.hasId), outs);
     check("r12-outputs-not-single-placeholder", "输出设备不是『单个空名占位』这一旧症状", !(outs.length === 1 && outs[0].label === ""), outs);
@@ -143,7 +157,7 @@ const main = async () => {
     })()`);
     check("r12-setsinkid", "setSinkId(具体扬声器) 成功；乱写的 id 是 NotFoundError", sink.specific === "ok" && sink.fake === "NotFoundError", sink);
   } else {
-    check("r12-setsinkid", "本机除默认设备外没有可选的具体扬声器（环境限制，跳过 setSinkId 验证）", true, "skipped");
+    skip("r12-setsinkid", "setSinkId(具体扬声器) 成功；乱写的 id 是 NotFoundError", "本机除默认设备外没有可选的具体扬声器（环境限制）");
   }
 
   // 跨源 iframe（B 站点嵌在 A 里，即使写了 allow 属性）：看不到设备名
@@ -156,13 +170,17 @@ const main = async () => {
   check("r12-cross-origin-frame-hidden", "跨源 iframe（被别的站点嵌着）里设备名仍是空名占位", Array.isArray(fouts) && fouts.every((d) => d.label === ""), frame);
 
   // ───────── 麦克风 / 摄像头（询问）─────────
-  // 授予之前：设备名是空名占位、权限状态不是 granted（检查处理器不弹提示）
+  // 授予之前：设备名是空名占位（检查处理器不弹提示）
   check("r12-inputs-hidden-before-grant", "用户还没允许时，麦克风 / 摄像头名字仍是空名", (top.inputs ?? []).every((d) => d.label === "") && (top.cameras ?? []).every((d) => d.label === ""), { inputs: top.inputs, cameras: top.cameras });
   const perms0 = await ev(`(async () => ({
     mic: (await navigator.permissions.query({ name: 'microphone' })).state,
     cam: (await navigator.permissions.query({ name: 'camera' })).state,
   }))()`);
-  check("r12-perm-state-before-grant", "用户还没允许时，权限状态不是 granted", perms0.mic !== "granted" && perms0.cam !== "granted", perms0);
+  // 第二十一轮：Electron 的权限检查处理器只能回 boolean、没有 prompt 这一态——「还没授予」回 false 会让页面读到 denied，先 query 的页面就不会去请求、永远没有提示（同事的真实场景）。
+  // 第二十二轮：第二十一轮的第一版让检查处理器在待询问时回 true（页面读到 granted），实测会让 WebRTC 暴露真实内网 / 公网 IP（ICE 候选走同一个检查）——撤销了。
+  // 现在检查处理器只在已授予时回 true；页面读到的 denied 由页内小桩改成 prompt（见 r21-mic-prompt.cjs）：待询问 = prompt，不是 granted 也不是 denied，
+  // 所以这里能真正区分「还没授予」（prompt）与「已授予」（下面 r12-perm-granted-after 的 granted）。
+  check("r12-perm-state-before-grant", "用户还没允许时，permissions.query 对麦克风 / 摄像头读到 prompt（先 query 的页面会去请求并弹提示；不是 granted——还没授予，也不是 denied）", perms0.mic === "prompt" && perms0.cam === "prompt", perms0);
   check("r12-no-prompt-from-enumerate", "只枚举设备 / 查权限状态不会弹提示", sess().prompts.list().length === 0, sess().prompts.list());
 
   // 用户拒绝：不碰系统层，页面拿到 NotAllowedError
@@ -179,7 +197,20 @@ const main = async () => {
   await call("navigate", { url: urlA2 });
   await sleep(800);
   if (micOs !== "granted") {
-    check("r12-gum-allowed", `系统层麦克风授权状态是 ${micOs}（不是 granted），为免在本机弹系统授权框，跳过「允许」路径（由单测覆盖）`, true, "skipped");
+    // 整条「允许」路径都没跑：把依赖它的 9 项逐个登记为 SKIP（以前只记一条写死 true 的 r12-gum-allowed，其余 8 项连名字都不出现）
+    for (const [id, name] of [
+      ["r12-gum-prompt-2", "另一个 origin（localhost）重新弹提示"],
+      ["r12-gum-allowed", "用户「本会话一直允许」→ getUserMedia 成功"],
+      ["r12-perm-granted-after", "允许后 permissions.query(microphone) = granted"],
+      ["r12-input-names-after-grant", "允许后麦克风设备名可见"],
+      ["r12-camera-not-carried", "只允许麦克风：摄像头没被连带放开"],
+      ["r12-gum-no-reprompt", "已允许后同 origin 再请求不再弹提示"],
+      ["r12-camera-asked-separately", "麦克风已授予后只为摄像头弹提示"],
+      ["r12-camera-denied", "拒绝摄像头 → getUserMedia 被拒"],
+      ["r12-mic-unaffected-by-camera-deny", "拒绝摄像头不影响已授予的麦克风"],
+    ]) {
+      skip(id, name, `系统层麦克风授权状态是 ${micOs}（不是 granted），为免在本机弹系统授权框跳过「允许」路径（由单测覆盖）`);
+    }
   } else {
     await ev(GUM("{ audio: true }"));
     const p2 = await waitPermPrompt();
@@ -192,9 +223,11 @@ const main = async () => {
     check("r12-perm-granted-after", "允许后 permissions.query(microphone) = granted", perms1 === "granted", perms1);
     const after = await ev(PROBE);
     check("r12-input-names-after-grant", "只允许了麦克风：麦克风设备名可见（声音检测页的下拉不再是空名）", (after.inputs ?? []).length > 0 && after.inputs.every((d) => d.label !== "" && d.hasId), { inputs: after.inputs });
-    // R9-02：麦克风与摄像头是两个独立的授予——只允许了麦克风，摄像头的名字 / 权限状态都不能被连带放开（以前是「共用一条 media」，这里会看到 fake_device_0）
+    // R9-02：麦克风与摄像头是两个独立的授予——只允许了麦克风，摄像头的名字不能被连带放开、permissions.query(camera) 也不能是 granted
+    // （以前是「共用一条 media」，这里会看到 fake_device_0 / granted）。第二十二轮起「待询问」读到 prompt、已授予才是 granted，所以这条判据恢复了判别力：
+    // 摄像头没授予 → prompt（不是 granted）；摄像头是否还要单独问另由下面的 r12-camera-asked-separately 钉住
     const camState = await ev("(async () => (await navigator.permissions.query({ name: 'camera' })).state)()");
-    check("r12-camera-not-carried", "只允许了麦克风：摄像头名字仍是空名、permissions.query(camera) 不是 granted（没被连带）", (after.cameras ?? []).every((d) => d.label === "") && camState !== "granted", { cameras: after.cameras, camState });
+    check("r12-camera-not-carried", "只允许了麦克风：摄像头名字仍是空名、permissions.query(camera) 仍是 prompt（没被连带放开成 granted）", (after.cameras ?? []).every((d) => d.label === "") && camState === "prompt", { cameras: after.cameras, camState });
 
     // 同 origin 再次请求：不再弹提示，直接成功
     await ev(GUM("{ audio: true }"));
@@ -227,13 +260,16 @@ const main = async () => {
 main()
   .then(() => {
     const failed = results.filter((r) => !r.ok);
-    console.log(`SMOKE SUMMARY ${results.length - failed.length}/${results.length} passed${failed.length ? ` FAILED: ${failed.map((f) => f.id).join(",")}` : ""}`);
+    console.log(
+      `SMOKE SUMMARY ${results.length - failed.length}/${results.length} passed${skipped.length ? `, ${skipped.length} skipped（${skipped.map((x) => x.id).join(",")}）` : ""}${failed.length ? ` FAILED: ${failed.map((f) => f.id).join(",")}` : ""}`,
+    );
+    if (!failed.length && skipped.length) console.log("SMOKE INCOMPLETE 有跳过的项（环境不满足）：这一次不能当成全绿，退出码 4");
     try {
-      fs.rmSync(TMP, { recursive: true, force: true });
-    } catch {
-      /* 清不掉不影响结果 */
+      fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (err) {
+      console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
     }
-    app.exit(failed.length ? 1 : 0);
+    app.exit(failed.length ? 1 : skipped.length ? 4 : 0);
   })
   .catch((e) => {
     console.error("SMOKE ERROR", e);

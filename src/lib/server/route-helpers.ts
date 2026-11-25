@@ -74,7 +74,9 @@ export const parseTextContent = (content: string): string => {
 /**
  * 卡片（interactive）抽文本（纯函数、可单测，router 与 group-route 共用）。
  * 两种形态：① 原生卡片 JSON（elements 里找 text/content）；
- * ② lark-cli enrichment 的 `<card>…markdown…</card>` 富文本。抽不出返回 null。
+ * ② lark-cli enrichment 的 `<card>…markdown…</card>` 富文本——开标签可能带属性
+ * （新版 lark-cli 渲染成 `<card title="…" subtitle="…">`，2026-11-19 引用机器人自己的卡片回复因此整段丢失）。
+ * 抽不出返回 null。
  * 抽出的文本一律视为**不可信数据**（调用方负责打来源前缀、不进指令解析）。
  */
 export const extractInteractiveText = (
@@ -83,8 +85,8 @@ export const extractInteractiveText = (
 ): string | null => {
   const raw = (content ?? "").trim();
   if (!raw) return null;
-  // enrichment 富文本形态
-  const cardMatch = /<card>([\s\S]*)<\/card>/i.exec(raw);
+  // enrichment 富文本形态：开标签允许带属性（与 inbound-card-sanitize 的 CARD_OPEN_RE 同口径）
+  const cardMatch = /<card(?:\s[^>]*)?>([\s\S]*)<\/card>/i.exec(raw);
   if (cardMatch) {
     // 先净化再剥 tag：面板里的推理文本可能含 `<` `>`，先剥 tag 会跨行误吞面板外正文；
     // ▶/▲ 标记与 tag 语法无关，先净化最稳。截断放净化之后，避免面板占满额度挤掉正文。

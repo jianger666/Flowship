@@ -392,3 +392,48 @@ describe("isFieldEqual 桥接 boolean（R1-11）", () => {
     ).toBe(true);
   });
 });
+
+describe("电脑操作两个开关（computerUse / computerUseLockedAccess）", () => {
+  const KEYS = ["computerUse", "computerUseLockedAccess"] as const;
+  const base: FeAiFlowSettings = { ...DEFAULT_SETTINGS };
+  const withValue = (
+    key: (typeof KEYS)[number],
+    value: boolean | undefined,
+  ): FeAiFlowSettings => ({ ...base, [key]: value }) as FeAiFlowSettings;
+
+  it("默认都关；normalizeSettings 只认显式 true（缺省 / 字符串 / 数字 / 对象等脏值一律关）", () => {
+    for (const k of KEYS) {
+      expect(DEFAULT_SETTINGS[k]).toBe(false);
+      expect(normalizeSettings({})[k]).toBe(false);
+      expect(normalizeSettings(null)[k]).toBe(false);
+      expect(normalizeSettings({ [k]: true } as never)[k]).toBe(true);
+      for (const bad of ["true", 1, "yes", {}, [true]]) {
+        expect(normalizeSettings({ [k]: bad } as never)[k]).toBe(false);
+      }
+    }
+  });
+
+  it("两个开关互不串线：开一个不影响另一个", () => {
+    const n = normalizeSettings({ computerUse: true });
+    expect(n.computerUse).toBe(true);
+    expect(n.computerUseLockedAccess).toBe(false);
+  });
+
+  it("isFieldEqual（dirty 比较）：缺省视同 false（boolFalse）；切换 → 不相等", () => {
+    for (const k of KEYS) {
+      expect(isFieldEqual(k, withValue(k, undefined), withValue(k, false))).toBe(true);
+      expect(isFieldEqual(k, withValue(k, true), withValue(k, true))).toBe(true);
+      expect(isFieldEqual(k, withValue(k, true), withValue(k, false))).toBe(false);
+      expect(isFieldEqual(k, withValue(k, true), withValue(k, undefined))).toBe(false);
+    }
+  });
+
+  it("开机密码绝不进 settings：默认值 / 归一化结果里没有任何密码 / 凭据类字段（只能经 window.__computerUse.setCredential 进钥匙串）", () => {
+    // settings 是明文 JSON、还会被 /full 接口回传前端缓存——这类字段一旦出现就是泄露面
+    // （normalizeSettings 对未知键是原样透传的，所以守卫放在「默认字段表里不许出现」+ 卡片源码契约上）
+    const secretish = /pass(word|wd)?|credential|secret|unlock/i;
+    const leaked = (o: object) => Object.keys(o).filter((k) => secretish.test(k));
+    expect(leaked(DEFAULT_SETTINGS)).toEqual([]);
+    expect(leaked(normalizeSettings({ computerUse: true, computerUseLockedAccess: true }))).toEqual([]);
+  });
+});

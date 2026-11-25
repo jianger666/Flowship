@@ -190,10 +190,17 @@ export const toWaitDisplayCall = <M extends ToolCallShape>(msg: M): M => {
   return next as M;
 };
 
-/** 内置浏览器工具名前缀（与 browser-tool-display 的 BROWSER_TOOL_PREFIX 同值；这里不 import 以免与展示层互相依赖） */
+/**
+ * 内置浏览器 / 电脑操作工具名前缀（与 browser-tool-display 的 BROWSER_TOOL_PREFIX、desktop-tool-display 的 DESKTOP_TOOL_PREFIX 同值；
+ * 这里不 import 以免与展示层互相依赖）。两类工具的 Cursor MCP 外壳拆法完全一样（拆名字 + 入参、不动 result：结果里可能带截图），共用同一套改写。
+ */
 const BROWSER_TOOL_NAME_PREFIX = "browser_";
+const DESKTOP_TOOL_NAME_PREFIX = "desktop_";
 
-/** 是不是我们的 `browser_*` 工具调用（Cursor 的 MCP 外壳；pi 里它本来就叫 `browser_xxx`、不需要改写） */
+/**
+ * 是不是我们的 `browser_*` / `desktop_*` 工具调用（Cursor 的 MCP 外壳；pi 里它们本来就叫 `browser_xxx` / `desktop_xxx`、不需要改写）。
+ * 名字沿用「browser」是历史原因：电脑操作工具搭的是内置浏览器同一条链路，展示 / 脱敏 / 状态判定的咽喉都共用这个判断。
+ */
 export const isCursorBrowserCall = (msg: ToolCallShape): boolean => {
   if (msg.name !== "mcp") return false;
   if (!isRecord(msg.args)) return false;
@@ -201,7 +208,7 @@ export const isCursorBrowserCall = (msg: ToolCallShape): boolean => {
   return (
     msg.args.providerIdentifier === CURSOR_CUSTOM_TOOLS_SERVER &&
     typeof tool === "string" &&
-    tool.startsWith(BROWSER_TOOL_NAME_PREFIX)
+    (tool.startsWith(BROWSER_TOOL_NAME_PREFIX) || tool.startsWith(DESKTOP_TOOL_NAME_PREFIX))
   );
 };
 

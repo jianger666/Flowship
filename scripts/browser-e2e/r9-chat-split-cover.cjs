@@ -37,6 +37,23 @@ const { pathToFileURL } = require("node:url");
 const REPO = path.resolve(__dirname, "..", "..");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "fs-r9-split-"));
 app.setPath("userData", path.join(TMP, "userData"));
+// 清临时目录（含 userData 与 vite 打包出的 harness；第十七轮评审 B-2 补了正常收尾；第十八轮评审 R-1：打包失败 / FATAL 路径也要清，不留 TMP/harness）。
+// best-effort：Chromium 退出前可能还在写缓存，偶发 ENOTEMPTY / EBUSY——重试几次，仍清不掉只告警，不改退出码、不吞原始错误；可重复调用
+const cleanupTmp = () => {
+  // 先销毁剩下的窗口（Chromium 还抱着 userData 时 rmSync 容易 ENOTEMPTY），再清
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      w.destroy();
+    } catch {
+      /* 已销毁 */
+    }
+  }
+  try {
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
+};
 app.on("window-all-closed", () => {});
 
 const results = [];
@@ -425,6 +442,7 @@ const run = async () => {
 
   const failed = results.filter((x) => !x.ok);
   console.log(`SMOKE SUMMARY ${results.length - failed.length}/${results.length} passed`);
+  cleanupTmp(); // 清不掉只告警（不让「全部通过」被清理失败变成 FATAL exit 1；第十七轮评审 B-2：此前这个脚本建了临时目录却从不清）
   app.exit(failed.length ? 1 : 0);
 };
 
@@ -433,5 +451,6 @@ app
   .then(run)
   .catch((e) => {
     console.log("SMOKE FAIL fatal", (e && e.stack) || e);
+    cleanupTmp(); // 错误已先打出；清理只告警，退出码仍是 3
     app.exit(3);
   });

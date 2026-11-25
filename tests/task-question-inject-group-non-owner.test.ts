@@ -124,7 +124,7 @@ vi.mock("@/lib/server/chat-gate", () => ({ getChatLifecycle }));
 const { handleTaskQuestionInject, NON_OWNER_NO_SESSION_MESSAGE } = await import(
   "@/lib/server/task-question-inject"
 );
-const { __resetTaskTalkQueueForTest, listTalkQueue } = await import(
+const { __resetTaskTalkQueueForTest, __tickTalkQueueDrainForTest, listTalkQueue } = await import(
   "@/lib/server/task-talk-queue"
 );
 
@@ -557,5 +557,265 @@ describe("恒定拦点：非属主不等排空、不强清假死 run", () => {
     arrangeDraining();
     await handleTaskQuestionInject(TASK_ID, body, {});
     expect(waitForTaskToStop).toHaveBeenCalled();
+  });
+});
+
+// ---------- 评审后补（2026-11-19）：agentContext = 属主群消息尾注的载体 ----------
+// group-route 把 OWNER_GROUP_NOTE 经 `options.agentContext` 交进来；这一层以前没有直接断言——
+// 一次性 agent 那个用例是手动把尾注拼进文本模拟的，没走过这里。三条出口各钉一次。
+
+describe("agentContext（属主群消息尾注）：只给 agent 看、不进气泡，直送 / 唤醒 / 排队重放都带到", () => {
+  const NOTE = "（这条是任务所有者本人在需求群里说的，同他在输入条里说的一样对待。）";
+  const ownerBody = { text: "帮我看下登录页", bootArgs };
+  const userEventOf = (): { text: string } =>
+    (writeUserEventAndPublishStrict as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0]?.[1] as { text: string };
+
+  it("活会话直送：agent 文本 = 原文 + 空行 + 尾注；落盘气泡（user_reply.text）仍是原文", async () => {
+    agentSessions.set(TASK_ID, {});
+    const resp = await handleTaskQuestionInject(TASK_ID, ownerBody, { agentContext: NOTE });
+    expect(resp.status).toBe(200);
+    expect(String(deliverArgs()[1])).toContain(`帮我看下登录页\n\n${NOTE}`);
+    expect(userEventOf().text).toBe("帮我看下登录页");
+  });
+
+  it("对照：不传 agentContext → agent 文本里没有尾注（没有这条选项时与改动前一致）", async () => {
+    agentSessions.set(TASK_ID, {});
+    const resp = await handleTaskQuestionInject(TASK_ID, ownerBody, {});
+    expect(resp.status).toBe(200);
+    expect(String(deliverArgs()[1])).toContain("帮我看下登录页");
+    expect(String(deliverArgs()[1])).not.toContain(NOTE);
+  });
+
+  it("会话没了、属主唤醒当前 action：交给 resume 的 userMessage 同样带尾注，气泡仍是原文", async () => {
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    const resp = await handleTaskQuestionInject(TASK_ID, ownerBody, { agentContext: NOTE });
+    expect(resp.status).toBe(200);
+    const arg = (resumeCurrentActionWithMessage as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls[0]?.[0] as { userMessage: string };
+    expect(arg.userMessage).toContain(`帮我看下登录页\n\n${NOTE}`);
+    expect(userEventOf().text).toBe("帮我看下登录页");
+  });
+
+  it("忙时入队 → 这一轮跑完后真实 drain 重放：尾注随队列项保存、重放时仍拼在原文后（排队气泡不带尾注）", async () => {
+    getTask.mockImplementation(async () => runningTask());
+    agentSessions.set(TASK_ID, {});
+    runningTasks.set(TASK_ID, {
+      instanceId: 1,
+      agentId: "a",
+      startedAt: Date.now(),
+      startSnapshot: { title: "" },
+      cancel: () => {},
+    });
+    const queued = await handleTaskQuestionInject(TASK_ID, ownerBody, {
+      agentContext: NOTE,
+      queueIfBusy: { source: "group_owner", senderName: "陈属主", clientItemId: "om_own_1" },
+    });
+    expect(queued.status).toBe(202);
+    expect(deliverTaskQuestion).not.toHaveBeenCalled();
+    expect(listTalkQueue(TASK_ID)[0]?.preview ?? "").not.toContain(NOTE);
+
+    // 属主那一轮跑完：任务回到空闲，drain 重放队首
+    runningTasks.clear();
+    getTask.mockImplementation(async () => ackTask());
+    await __tickTalkQueueDrainForTest(TASK_ID);
+
+    expect(deliverTaskQuestion).toHaveBeenCalledTimes(1);
+    expect(String(deliverArgs()[1])).toContain(`帮我看下登录页\n\n${NOTE}`);
+    expect(userEventOf().text).toBe("帮我看下登录页");
+  });
+});
+
+// ---------- 评审后补（2026-11-21）：foreignContentTurn = 「别人写的内容在驱动」的轮次标记 ----------
+// 所有者空 @ 引用陌生人的消息 / 关联回执喂会话：以属主语义注入（不是非属主轮、提示词不改），
+// 但这一轮的指令性内容出自别人，要登记「群成员触发」标记（desktop_* / 写所有者备注 / 新建定时 / 自动推进恒拒）。
+// 三条送达分支（送活会话 / 唤醒 / 一次性 agent）各带一次；排队重放时原样带回；非属主轮不被它改写。
+
+describe("foreignContentTurn（别人写的内容在驱动）：三条送达分支都带到，排队重放也原样带回", () => {
+  const foreignBody = { text: "[群消息·来自 张三]\n（只 @ 了你，没写别的）", bootArgs };
+  const resumeArg = (): Record<string, unknown> =>
+    (resumeCurrentActionWithMessage as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0]?.[0] as Record<string, unknown>;
+  const oneShotArgs = (): unknown[] =>
+    (startOneShotQuestion as unknown as { mock: { calls: unknown[][] } }).mock.calls[0] ?? [];
+  const completedTask = (): Task => {
+    const t = ackTask() as unknown as { actions: Array<{ status: string }> };
+    t.actions[0]!.status = "completed";
+    return t as unknown as Task;
+  };
+
+  it("活会话直送：deliver 的 groupNonOwner 位是 markerOnly（属主语义——仍带 creds、不是非属主轮）", async () => {
+    agentSessions.set(TASK_ID, {});
+
+    const resp = await handleTaskQuestionInject(TASK_ID, foreignBody, { foreignContentTurn: true });
+
+    expect(resp.status).toBe(200);
+    const a = deliverArgs();
+    expect(a[9]).toEqual({ name: "", guard: false, markerOnly: true });
+    expect(a[3]).toBeDefined(); // creds：属主语义，休眠会话允许唤醒
+    expect(a[4]).toMatchObject({ actionId: "act-9" }); // 属主语义：照常带 ackContext
+  });
+
+  it("对照：没有 foreignContentTurn → deliver 的 groupNonOwner 位为空", async () => {
+    agentSessions.set(TASK_ID, {});
+    await handleTaskQuestionInject(TASK_ID, foreignBody, {});
+    expect(deliverArgs()[9]).toBeUndefined();
+  });
+
+  it("会话没了、属主唤醒当前 action：resume 入参带 foreignContentTurn；对照不带", async () => {
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    const resp = await handleTaskQuestionInject(TASK_ID, foreignBody, { foreignContentTurn: true });
+    expect(resp.status).toBe(200);
+    expect(resumeArg()).toMatchObject({ foreignContentTurn: true });
+
+    vi.clearAllMocks();
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    await handleTaskQuestionInject(TASK_ID, foreignBody, {});
+    expect(resumeArg()).not.toHaveProperty("foreignContentTurn");
+  });
+
+  it("当前 action 已完结（走一次性 agent）：startOneShotQuestion 第 8 参为 true；对照为 false", async () => {
+    getTask.mockImplementation(async () => completedTask());
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    const resp = await handleTaskQuestionInject(TASK_ID, foreignBody, { foreignContentTurn: true });
+    expect(resp.status).toBe(200);
+    expect(startOneShotQuestion).toHaveBeenCalledTimes(1);
+    expect(oneShotArgs()[7]).toBe(true);
+
+    vi.clearAllMocks();
+    getTask.mockImplementation(async () => completedTask());
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    await handleTaskQuestionInject(TASK_ID, foreignBody, {});
+    expect(oneShotArgs()[7]).toBe(false);
+  });
+
+  it("忙时入队 → 这一轮跑完后真实 drain 重放：foreignContentTurn 随队列项保存、重放时仍是 markerOnly", async () => {
+    getTask.mockImplementation(async () => runningTask());
+    agentSessions.set(TASK_ID, {});
+    runningTasks.set(TASK_ID, {
+      instanceId: 1,
+      agentId: "a",
+      startedAt: Date.now(),
+      startSnapshot: { title: "" },
+      cancel: () => {},
+    });
+
+    const queued = await handleTaskQuestionInject(TASK_ID, foreignBody, {
+      foreignContentTurn: true,
+      queueIfBusy: { source: "group_owner", senderName: "陈属主", clientItemId: "om_foreign_1" },
+    });
+    expect(queued.status).toBe(202);
+    expect(deliverTaskQuestion).not.toHaveBeenCalled();
+
+    runningTasks.clear();
+    getTask.mockImplementation(async () => ackTask());
+    await __tickTalkQueueDrainForTest(TASK_ID);
+
+    expect(deliverTaskQuestion).toHaveBeenCalledTimes(1);
+    expect(deliverArgs()[9]).toEqual({ name: "", guard: false, markerOnly: true });
+  });
+
+  it("非属主轮不被它改写：同时给了 groupNonOwner 与 foreignContentTurn → 仍按非属主轮（guard 变体）送、不走 markerOnly", async () => {
+    agentSessions.set(TASK_ID, {});
+
+    const resp = await handleTaskQuestionInject(TASK_ID, body, nonOwnerOpts({ foreignContentTurn: true }));
+
+    expect(resp.status).toBe(200);
+    expect(deliverArgs()[9]).toEqual({ name: "李四", guard: true });
+    expect(deliverArgs()[3]).toBeUndefined(); // 非属主依旧不传 creds
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 关联回执（correlatedAnswer）只送活会话（第四轮评审「feed 路径唤醒全权限 agent」）：
+// 回执的内容出自对方机器人 / 同事，group-route 只在「活会话在场」时才选这条路径；入口判断之后、送达之前会话刚好没了，
+// 以前会落到唤醒 / 一次性 agent——带写权限的全权限 agent，却由别人写的内容驱动，只带 scope=desktop 的标记，
+// 与「会话不在不自动唤醒」的约定相反。现在与非属主同口径：不传 creds、没送进去就 409。
+// ---------------------------------------------------------------------------
+
+describe("关联回执（correlatedAnswer）：只送活会话——会话没了回 409，绝不唤醒 / 新起任何 agent", () => {
+  const receiptBody = { text: "[群消息·来自 对接后端的机器人]\n学号是 20240001", bootArgs };
+  // group-route 对「关联回执喂会话」会同时置位这两项（correlatedAnswer + foreignContentTurn）
+  const receiptOpts = (extra: Record<string, unknown> = {}) => ({
+    correlatedAnswer: true,
+    foreignContentTurn: true,
+    ...extra,
+  });
+  const completedTask = (): Task => {
+    const t = ackTask() as unknown as { actions: Array<{ status: string }> };
+    t.actions[0]!.status = "completed";
+    return t as unknown as Task;
+  };
+
+  it("内存里没有会话（入口判断之后会话过期）：409 人话提示，不 deliver、不 resume、不起一次性 / 旁路", async () => {
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, receiptOpts());
+    expect(resp.status).toBe(409);
+    expect(((await resp.json()) as { error: string }).error).toBe(NON_OWNER_NO_SESSION_MESSAGE);
+    expect(deliverTaskQuestion).not.toHaveBeenCalled();
+    noWriteSideEffects();
+    expect(setTaskRunStatusIfRunOwner).not.toHaveBeenCalled();
+  });
+
+  it("送达那一刻会话没了（deliver 回 no_session）：409，同样不唤醒 / 新起", async () => {
+    agentSessions.set(TASK_ID, {});
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, receiptOpts());
+    expect(resp.status).toBe(409);
+    expect(((await resp.json()) as { error: string }).error).toBe(NON_OWNER_NO_SESSION_MESSAGE);
+    noWriteSideEffects();
+  });
+
+  it("送达时 send 失败（deliver 回 send_failed）：同样 409，不唤醒 / 新起", async () => {
+    agentSessions.set(TASK_ID, {});
+    deliverTaskQuestion.mockResolvedValue("send_failed");
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, receiptOpts());
+    expect(resp.status).toBe(409);
+    noWriteSideEffects();
+  });
+
+  it("当前 action 已完结（以前会走一次性 agent）：同样 409，不起一次性 agent", async () => {
+    getTask.mockImplementation(async () => completedTask());
+    agentSessions.set(TASK_ID, {});
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, receiptOpts());
+    expect(resp.status).toBe(409);
+    noWriteSideEffects();
+  });
+
+  it("只给 correlatedAnswer（不带 foreignContentTurn）也一样：拦的是关联回执本身", async () => {
+    agentSessions.set(TASK_ID, {});
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, { correlatedAnswer: true });
+    expect(resp.status).toBe(409);
+    noWriteSideEffects();
+  });
+
+  it("活会话在场：照常送达；不传 creds（deliver 不会把休眠会话复活成全权限），仍是 markerOnly 标记（属主语义）", async () => {
+    agentSessions.set(TASK_ID, {});
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, receiptOpts());
+    expect(resp.status).toBe(200);
+    expect(deliverTaskQuestion).toHaveBeenCalledTimes(1);
+    expect(deliverArgs()[3]).toBeUndefined(); // creds
+    expect(deliverArgs()[9]).toEqual({ name: "", guard: false, markerOnly: true });
+    noWriteSideEffects();
+  });
+
+  it("对照 1（所有者本人空 @ 引用别人）：只有 foreignContentTurn、没有 correlatedAnswer → 会话没了仍可唤醒（所有者触发，没被动）", async () => {
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, { foreignContentTurn: true });
+    expect(resp.status).toBe(200);
+    expect(resumeCurrentActionWithMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("对照 2（命中但会话本来就不在 → 只读旁路）：correlatedAnswer 与 restrictToQuestion 同时给，不被误拦成 409", async () => {
+    // group-route 在 correlated 命中但 !feedIntoSession 时就是这样传的（useOwnerInject=false → restrictToQuestion:true）
+    const resp = await handleTaskQuestionInject(TASK_ID, receiptBody, {
+      correlatedAnswer: true,
+      restrictToQuestion: true,
+      userReplyMetaExtra: META,
+    });
+    expect(resp.status).not.toBe(409);
+    expect(deliverTaskQuestion).not.toHaveBeenCalled();
+    expect(resumeCurrentActionWithMessage).not.toHaveBeenCalled();
   });
 });

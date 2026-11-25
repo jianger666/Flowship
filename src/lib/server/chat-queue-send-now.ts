@@ -33,6 +33,7 @@ import {
   getChatSystemCloseMark,
   isMessageOperationTerminal,
   markMessagePersisted,
+  peekQueuedChatMessage,
   settleMessageFailed,
   settleMessageHandedOff,
   takeQueuedChatMessage,
@@ -265,10 +266,18 @@ export const startChatFromQueuedMessage = async (
           head.agentText,
           head.imageAbsPaths,
           head.attachmentAbsPaths?.length ? head.attachmentAbsPaths : undefined,
-          { ownerInstanceId: claimedInstanceId },
+          {
+            ownerInstanceId: claimedInstanceId,
+            // 外来内容（所有者空 @ / 一句话再引用别人）：sendChatMessage 在 agent.send 前一刻登记中途标记（第五轮评审 N1）
+            ...(head.foreignContentTurn === true ? { foreignContentTurn: true } : {}),
+          },
         );
         if (sent === "sent") {
           agentStarted = true;
+          // 消息已交给 agent：和 steer（delivered）/ runChatSession（settleFirstOp）同口径，把这条操作结算成 handedOff（第六轮评审 P3）。
+          // sendChatMessage 不认 clientItemId、自己不结算——这里不补的话，这条停在 persisted（非终态）、ledger 里查不到 delivered。
+          // first-outcome-wins：已有终态（比如 sendChatMessage 返回前被用户停止）则跳过
+          settleMessageHandedOff(taskId, head.itemId);
           endChatQueueInFlight(taskId);
           const fresh = await getTask(taskId);
           return new Response(
@@ -314,6 +323,8 @@ export const startChatFromQueuedMessage = async (
       firstMessageEventId,
       startToken,
       clientItemId: head.itemId,
+      // 外来内容：runner 在首包 agent.send 前一刻登记中途标记，没送出去的出口自己清（第五轮评审 N1）
+      ...(head.foreignContentTurn === true ? { foreignContentTurn: true } : {}),
     });
     sessionPromise.catch((err) => {
       console.error(
@@ -459,6 +470,11 @@ const defaultSteerDeps: SteerSendNowDeps = {
 /** 可注入依赖——单测验 take → stop → start 顺序，不碰真实 stop/SDK */
 export type SendNowDeps = {
   take: typeof takeQueuedChatMessage;
+  /**
+   * 只读地看一眼目标条（默认真实实现）：判断它是不是外来内容（foreignContentTurn）——外来内容不 steer（见 sendQueuedChatMessageNow）。
+   * 缺省 = 真实 peekQueuedChatMessage；旧单测自构造 deps 不传也行。
+   */
+  peek?: typeof peekQueuedChatMessage;
   stop: (task: Task) => Promise<unknown>;
   start: typeof startChatFromQueuedMessage;
   getTask: typeof getTask;
@@ -489,22 +505,12 @@ const defaultRequeueRest = (
   rest: QueuedChatMsg[],
   afterItemId?: string,
 ): void => {
-  const { requeued, skipped } = enqueueChatMessagesFront(
-    taskId,
-    rest.map((m) => ({
-      itemId: m.itemId,
-      agentText: m.agentText,
-      displayText: m.displayText,
-      imageAbsPaths: m.imageAbsPaths,
-      savedImages: m.savedImages,
-      attachmentAbsPaths: m.attachmentAbsPaths,
-      attachmentMetas: m.attachmentMetas,
-      enqueuedAt: m.enqueuedAt,
-      skipPersistEvent: m.skipPersistEvent,
-      extraMeta: m.extraMeta,
-    })),
-    { afterItemId },
-  );
+  // 整条原样传：enqueueChatMessagesFront 内部本来就是 `{ ...msg }` 展开（withItemId），QueuedChatMsg 以后新增的字段自动跟着走。
+  // 以前这里逐字段重建——漏一个字段就静默丢一个：第五轮评审 N1 就漏过 foreignContentTurn（排队里的外来内容被塞回后丢了标记、无标记送达），
+  // 第六轮评审 P3 指出这是个会反复踩的坑，改成整条传（QueuedChatMsg 可直接赋给 QueuedChatMsgInput，类型上不用转）
+  const { requeued, skipped } = enqueueChatMessagesFront(taskId, rest, {
+    afterItemId,
+  });
   if (skipped > 0) {
     console.warn(
       `[chat-queue-send-now] task=${taskId} 塞回其余排队：${requeued} 条已塞回、${skipped} 条已在队里 / 已终态而跳过`,
@@ -769,9 +775,16 @@ export const sendQueuedChatMessageNow = async (
     );
   }
 
+  // 外来内容（foreignContentTurn：所有者在群里空 @ / 一句话再引用别人的消息）不 steer：
+  // steer 是把这条塞进属主**正在跑**的那一轮，而那一轮没有（也不该有）中途标记——等于外来内容无标记送达，
+  // 并且让陌生人写的内容进了一轮不受限的上下文。改走下面的「打断重发」：新会话 / resume 续接都会在首包前登记标记
+  // （startChatFromQueuedMessage 透传 head.foreignContentTurn；第五轮评审 N1）。
+  const peeked = (deps.peek ?? peekQueuedChatMessage)(taskId, trimmedId);
+  const isForeignItem = peeked?.foreignContentTurn === true;
+
   // 能插话就插话：不停止、不重开会话（Codex / Cursor IDE 口径）。
   // 不能（pi 后端 / 冷启动占位 / 收尾空窗 / 无 run 在跑）回退到下面的打断重发。
-  if (deps.steer?.canSteer(taskId)) {
+  if (!isForeignItem && deps.steer?.canSteer(taskId)) {
     return steerQueuedMessage(taskId, trimmedId, task, deps.steer, deps);
   }
 

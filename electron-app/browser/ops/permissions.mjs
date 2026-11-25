@@ -13,7 +13,7 @@
  *
  * 不走 runAction（那会把整个会话切成「AI 操作中」并锁住所有标签的输入，对一次内存表改动太重）；与 dialog 同样自己判控制权。
  */
-import { getPermissionState, permissionLabel } from "../permission-gate.mjs";
+import { BLOCK_REASON_TEXT, getPermissionState, MAX_RECENT_BLOCKED, permissionLabel } from "../permission-gate.mjs";
 import {
   ALLOWED_PERMISSIONS,
   ASKABLE_PERMISSIONS,
@@ -30,6 +30,8 @@ const PERMISSION_CHOICES = Object.freeze([...ASKABLE_PERMISSIONS, MEDIA_PERMISSI
 
 /** 入参权限名 → 实际要读写的独立权限名：`media` 展开成麦克风 + 摄像头，其余就是它自己 */
 const targetsOf = (perm) => (perm === MEDIA_PERMISSION ? [...MEDIA_ATOMS] : [perm]);
+/** `list` 里最多列几条「最近被自动拒绝」的请求 */
+const RECENT_BLOCKED_SHOWN = 5;
 import { BrowserError } from "../server-channel.mjs";
 
 export const OPS = Object.freeze(["permissions"]);
@@ -153,7 +155,61 @@ export const createHandlers = (deps) => {
     } catch {
       current = null;
     }
-    return { enabled, currentOrigin: current, grants, emulatedGeolocation: emulated };
+    // 第二十一轮：最近「没弹提示就被自动拒绝」的请求（最新在前，最多 RECENT_BLOCKED_SHOWN 条）——AI 据此回答「页面要麦克风为什么没弹提示」
+    // R22-3：与授予表同口径按 partition 分开——目标是普通标签就只给普通标签上的记录，目标是无痕标签就只给无痕的（无痕上被拒的来源不会漏进普通标签的 list，反之亦然）
+    const nowMs = typeof deps.now === "function" ? Number(deps.now()) : Date.now();
+    const targetTab = tryGetTab(session, a.tabId);
+    const wantIncognito = targetTab?.incognito === true;
+    const mine = (state.recentBlocked ?? []).filter((e) => (e.incognito === true) === wantIncognito);
+    const recentBlocked = mine.slice(0, RECENT_BLOCKED_SHOWN).map((e) => ({
+      origin: e.origin,
+      ...(e.frameOrigin ? { frameOrigin: e.frameOrigin } : {}),
+      permission: e.permission,
+      reason: e.reason,
+      // 固定文案（permission-gate 的 BLOCK_REASON_TEXT，不含页面内容）：server 直接展示，不用另存一份对照表
+      reasonText: BLOCK_REASON_TEXT[e.reason] ?? "",
+      count: e.count,
+      ageSec: Math.max(0, Math.round((nowMs - e.at) / 1000)),
+    }));
+    // 系统层（macOS 隐私设置 / Windows 全局开关）挡住的麦克风 / 摄像头：Flowship 里点了「允许」页面也拿不到流时，AI 能直接看到这一层
+    let systemMedia = null;
+    try {
+      const sys = deps.permissionGate?.systemMediaProblems?.();
+      if (sys && Array.isArray(sys.problems) && sys.problems.length > 0) systemMedia = { platform: sys.platform, problems: sys.problems };
+    } catch {
+      systemMedia = null;
+    }
+    // 第二十三轮 R23-3：页内「permissions.query 桩」没装上的会话（页面读麦克风 / 摄像头状态时可能读到 denied、因此根本不发请求）——这是 Flowship 自己的盲区，用户 / AI 在别处看不到
+    let stubProblems = [];
+    try {
+      const p = targetTab ? deps.permissionGate?.queryStubProblems?.(targetTab) : null;
+      if (Array.isArray(p)) stubProblems = p;
+    } catch {
+      stubProblems = [];
+    }
+    return {
+      enabled,
+      currentOrigin: current,
+      grants,
+      emulatedGeolocation: emulated,
+      recentBlocked,
+      // 清单被截断时让 AI 知道还有多少条没列出来（总数是同 partition 的条数，不是上限）
+      recentBlockedTotal: mine.length,
+      // 每个 partition 各自最多记 MAX_RECENT_BLOCKED 条：到顶了说明更早的记录已被挤掉，上面的总数只是下限（R23-6）
+      ...(mine.length >= MAX_RECENT_BLOCKED ? { recentBlockedAtLeast: true } : {}),
+      ...(systemMedia ? { systemMedia } : {}),
+      ...(stubProblems.length > 0 ? { queryStub: { problems: stubProblems } } : {}),
+    };
+  };
+
+  /** reset 带 origin / permission 时，哪些「最近被自动拒绝」条目随之失效：来源是该 origin（顶层）、权限相关（`media` 合称与其中任一项互相算相关） */
+  const blockedEntryMatches = (e, origin, perm) => {
+    if (origin !== undefined && e.origin !== origin) return false;
+    if (perm === undefined) return true;
+    if (e.permission === perm) return true;
+    const atoms = targetsOf(perm);
+    if (atoms.includes(e.permission)) return true;
+    return e.permission === MEDIA_PERMISSION && atoms.some((p) => MEDIA_ATOMS.includes(p));
   };
 
   return {
@@ -174,7 +230,15 @@ export const createHandlers = (deps) => {
           const resetArgs = { ...(origin !== undefined ? { origin } : {}), ...(p !== undefined ? { permission: p } : {}) };
           cleared += state.grants.reset(resetArgs) + (state.incognitoGrants?.reset(resetArgs) ?? 0);
         }
-        state.cooldown.clear();
+        // 冷却（用户拒绝的 30 秒 + 连续取消的短冷却）与下面的「最近被自动拒绝」同口径：reset 带 origin / permission 时只清对应的那些（R23-6：此前无条件清空整张冷却表，
+        // 别的站点的冷却没了、它们的 `cooldown` 诊断记录却还留着，list 与实际行为对不上）；不带范围 = 全清
+        state.dropCooldown({
+          ...(origin !== undefined ? { origin } : {}),
+          ...(perm !== undefined ? { permissions: targetsOf(perm) } : {}),
+        });
+        // 「最近被自动拒绝」是对旧授予 / 拒绝记录的诊断：对应的记录清了它就过期了（不清会让 AI 照着已失效的原因去排查）。
+        // R22-3：只清**对应的**那几条（reset 带 origin / permission 时，别的站点 / 别的权限的诊断仍然有效——原先一律清空会让 AI 丢掉与这次 reset 无关的线索）
+        state.dropBlocked((e) => blockedEntryMatches(e, origin, perm));
         const scope = `${origin !== undefined ? hostOf(origin) : "全部站点"}${perm !== undefined ? `的「${permissionLabel(perm)}」` : "的"}授予记录`;
         logAi(session, session.tabs?.find((t) => t.id === session.activeTabId), `重置了${scope}（清除 ${cleared} 条）`);
         scheduleSafe(deps, taskId);

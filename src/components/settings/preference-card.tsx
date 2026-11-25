@@ -282,7 +282,8 @@ export const PreferenceSections = ({
 
       <SettingRow
         label="链接默认打开方式"
-        hint="聊天和产物里的网页链接、HTML 文件。登录授权类链接、网页版、没有任务的页面始终用系统浏览器；右键可单次改用另一种"
+        hint="聊天和产物里的网页链接、HTML 文件怎么打开"
+        detail="登录授权类链接、网页版、没有任务的页面始终用系统浏览器；右键可单次改用另一种。"
         control={
           <Picker
             className="w-44"
@@ -384,8 +385,11 @@ export const PreferenceSections = ({
         />
       )}
 
+      {/* 这个开关只在「飞书消息桥接」开着时才起作用（syncKeepAwake：桥接开 && 本开关开）——
+          光秃秃一个名字放在偏好里，用户不知道它管什么、也不知道为什么没效果 */}
       <SettingRow
         label="插电时防休眠"
+        hint="飞书消息桥接开着、接着电源时，不让电脑休眠（桥接关着不起作用）"
         control={
           <Switch
             checked={feishuBridgeKeepAwake}

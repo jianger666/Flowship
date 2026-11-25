@@ -79,6 +79,7 @@ const {
   claimTaskOp,
   clearTaskStarting,
   getTaskOpGeneration,
+  isTaskStarting,
   pendingStopRequests,
   runningChecks,
   runningTasks,
@@ -364,6 +365,12 @@ describe("ownership R27 真实提交点矩阵", () => {
   afterEach(async () => {
     clearFailpoints();
     vi.restoreAllMocks();
+    // 先等启动链 / 后台 run 真收尾，再强清：它们的尾巴里有 fire-and-forget 的 meta / 事件写盘，
+    // 目录一删就落在已删目录上。超时只是兜底、不抛。
+    await waitUntil(
+      () => ids.every((id) => !isTaskStarting(id) && !runningTasks.has(id)),
+      5000,
+    ).catch(() => {});
     for (const id of ids) {
       pendingStopRequests.delete(id);
       clearTaskStarting(id);
@@ -375,7 +382,21 @@ describe("ownership R27 真实提交点矩阵", () => {
       cleanupChatTaskState(id);
       forceClearChatRun(id);
     }
-    await sleep(30);
+    // 排空每个任务的两条写盘链（meta 锁 + 事件追加链）再清目录——替换原来的 sleep(30)（时间裕量、不是同步点）。
+    // 交替两轮：锁里的写可能再排事件、反之亦然
+    // 带 3s 上限：本文件有「挂起 failpoint」的用例，万一失败时没放行、把锁占住，清场不能卡死、更不能连累后面的用例（只是兜底，正常毫秒级完成；
+    // 与上面的 5s 等待加起来 < vitest 默认 hookTimeout 10s）
+    await Promise.race([
+      (async () => {
+        for (let round = 0; round < 2; round++) {
+          for (const id of ids) {
+            await taskFsCore.withEventAppendChain(id, async () => undefined);
+            await taskFsCore.withTaskLock(id, async () => undefined);
+          }
+        }
+      })(),
+      sleep(3000),
+    ]);
     for (const id of ids) {
       await fs.rm(taskDir(id), { recursive: true, force: true }).catch(() => {});
       await fs

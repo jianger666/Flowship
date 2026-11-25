@@ -12,6 +12,7 @@
  * - 放行范围：答 pendingAsk 不经早期闸（它在答属主的提问），但 no_pending 落回旁路时补过闸（机器人发件人仍拒）；
  * - 排队回放：排队的真人问题在回放时同样放行并注入；机器人发件人根本进不了队。
  */
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -408,5 +409,91 @@ describe("放行范围与迟到闸", () => {
     await pumpGroupQuestionQueue(TASK);
     expect(handleTaskQuestionInject).not.toHaveBeenCalled();
     expect(shared.groupQuestionQueueLength(TASK)).toBe(0);
+  });
+
+  // 第四轮评审：队列条目以前不存 senderTenantKey / senderExternal，回放（fromPump）时这两个丢了——restrictedQaDenial 的注释写着
+  // 「排队回放也走这里，排队期间发件人不合规，回放时照样拒」，实际上租户 / 外部成员这两道在回放时恒不拦。
+  // 路由层能走到的场景：入队时本租户还没学到（属主没发过，不猜、放行排队），排队期间属主发了带 tenant_key 的消息 → 学到了 → 回放时必须照样拒。
+  // 注意：生产里这两个字段目前都没有数据源（见文件头 R7-2），这里钉的是「将来补上数据源后，回放不是个绕过口」。
+  const queueExtThenOwnerLearnsTenant = async (extTenant: string) => {
+    const inFlight = { cancelled: false, cancel: () => {} };
+    registerRestrictedQuestion(TASK, inFlight);
+    try {
+      // 入队：本租户未知 → 闸不拦；旁路在忙 → 排队
+      expect(
+        await routeGroupInboundMessage(
+          msg("ou_ext", "om_q_ext", { sender_tenant_key: extTenant } as never),
+          ctx,
+        ),
+      ).toMatchObject({ kind: "queued" });
+      expect(shared.groupQuestionQueueLength(TASK)).toBe(1);
+      // 排队期间属主发了一条带 tenant_key 的消息（旁路仍在忙：这条自己会被忙线挡下，但「学本租户」发生在忙线判定之前）
+      await routeGroupInboundMessage(
+        msg(OWNER, "om_o_learn", { sender_tenant_key: "t_own" } as never),
+        ctx,
+      );
+    } finally {
+      unregisterRestrictedQuestion(TASK, inFlight);
+    }
+    handleTaskQuestionInject.mockClear();
+    sendTextToChat.mockClear();
+    // 属主那条消息进来时顺带 pump 过一次：旁路还在忙，队首原样放回
+    expect(shared.groupQuestionQueueLength(TASK)).toBe(1);
+  };
+
+  it("排队回放：入队时本租户未知、排队期间学到本租户，回放时租户不一致照样拒（tenant_mismatch），不注入、不回群", async () => {
+    await queueExtThenOwnerLearnsTenant("t_other");
+
+    await pumpGroupQuestionQueue(TASK);
+
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(sendTextToChat).not.toHaveBeenCalled();
+    expect(shared.groupQuestionQueueLength(TASK)).toBe(0);
+    expect(denyEvents().map((e) => e.meta?.reason)).toEqual(["tenant_mismatch"]);
+  });
+
+  it("对照：排队期间学到的本租户就是发件人的租户 → 回放照常放行并以受限问答注入", async () => {
+    await queueExtThenOwnerLearnsTenant("t_own");
+
+    await pumpGroupQuestionQueue(TASK);
+
+    expect(handleTaskQuestionInject).toHaveBeenCalledTimes(1);
+    const opts = handleTaskQuestionInject.mock.calls[0]![2] as { restrictToQuestion?: boolean };
+    expect(opts.restrictToQuestion).toBe(true);
+    expect(shared.groupQuestionQueueLength(TASK)).toBe(0);
+    expect(denyEvents()).toHaveLength(0);
+  });
+
+  it("排队回放：队列里存着「外部成员」标记的问题，回放时照样按 external_member 拒（不注入、不回群）", async () => {
+    shared.enqueueGroupQuestion(TASK, {
+      messageId: "om_q_external",
+      chatId: CHAT,
+      text: "埋点查了吗",
+      parsed: { text: "埋点查了吗", images: [], attachments: [] } as never,
+      requester: { openId: "ou_ext", name: "外部同学" },
+      senderExternal: true,
+      boot: { apiKey: "k", model: { id: "m" } },
+    });
+    expect(shared.groupQuestionQueueLength(TASK)).toBe(1);
+
+    await pumpGroupQuestionQueue(TASK);
+
+    expect(handleTaskQuestionInject).not.toHaveBeenCalled();
+    expect(sendTextToChat).not.toHaveBeenCalled();
+    expect(shared.groupQuestionQueueLength(TASK)).toBe(0);
+    expect(denyEvents().map((e) => e.meta?.reason)).toEqual(["external_member"]);
+  });
+
+  // 入队那一头：路由层目前没有任何来源给 senderExternal（事件里没有这个标记），行为上触发不了——用结构断言钉住「入队时两个字段都存」
+  it("结构：入队（enqueueWhileBusy）把 senderTenantKey / senderExternal 一起存进队列条目", () => {
+    const src = readFileSync(
+      path.join(process.cwd(), "src/lib/server/feishu-bridge/group-route.ts"),
+      "utf8",
+    );
+    const start = src.indexOf("const pushed = enqueueGroupQuestion(");
+    expect(start).toBeGreaterThan(-1);
+    const block = src.slice(start, src.indexOf("Date.now(),", start));
+    expect(block).toContain("senderTenantKey: args.senderTenantKey");
+    expect(block).toContain("senderExternal: args.senderExternal");
   });
 });

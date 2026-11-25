@@ -47,7 +47,27 @@ export type BrowserOp =
   | "debug"
   | "touch"
   | "record"
-  | "clipboard";
+  | "clipboard"
+  // 电脑操作（desktop.v1）：与内置浏览器共用同一条 IPC 通道，op 名带 desktop_ 前缀（见 {@link DesktopOp}）
+  | DesktopOp;
+
+/**
+ * 电脑操作的 op（主进程 `electron-app/desktop/types.mjs` 的 DESKTOP_OPS，两边改动要同步；
+ * tests/desktop-tools.test.ts 里有一条对账测试钉着）。
+ * 只有握手时 capabilities 含 `desktop.v1` 才会用到（见 bridge.ts 的 `hasCapability`）。
+ */
+export type DesktopOp =
+  | "desktop_status"
+  | "desktop_screenshot"
+  | "desktop_click"
+  | "desktop_move"
+  | "desktop_drag"
+  | "desktop_scroll"
+  | "desktop_type"
+  | "desktop_key"
+  | "desktop_apps"
+  | "desktop_open_app"
+  | "desktop_end_session";
 
 export type BrowserErrorCode =
   | "NO_SESSION"
@@ -67,7 +87,14 @@ export type BrowserErrorCode =
   // 增强包 E2（契约 §15）
   | "ACCESS_DISABLED"
   | "DENIED"
-  | "UNSUPPORTED";
+  | "UNSUPPORTED"
+  // 电脑操作（desktop.v1）新增：缺系统权限 / 锁屏且锁屏可用没就绪 / 锁屏后台模式做不到（要走前台）/ 自动解锁失败 / 会话到时 / 被安全规则拦下
+  | "NEED_PERMISSION"
+  | "SCREEN_LOCKED"
+  | "NEED_FOREGROUND"
+  | "UNLOCK_FAILED"
+  | "SESSION_EXPIRED"
+  | "BLOCKED";
 
 /** server 侧额外的本地错误码：通道不可用（没有壳 / 握手失败 / 断线） */
 export type BrowserBridgeErrorCode = BrowserErrorCode | "UNAVAILABLE";
@@ -146,6 +173,10 @@ export interface BrowserConfig {
   networkBodyRead?: boolean;
   /** 契约 §15 C6：标签页上限（5–60，缺省 20） */
   maxTabs?: number;
+  /** 电脑操作总开关（设置 `computerUse`）：只认显式 true，缺省 = 关；主进程侧二次校验 */
+  desktopEnabled?: boolean;
+  /** 电脑操作「锁屏时也能用」（设置 `computerUseLockedAccess`）：只认显式 true，缺省 = 关 */
+  desktopLockedAccess?: boolean;
 }
 
 export interface BrowserRequestOptions {

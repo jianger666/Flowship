@@ -49,7 +49,7 @@ const { __resetOutboundRegistryForTest } = await import(
   "@/lib/server/feishu-bridge/group-outbound-registry"
 );
 const { agentSessions } = await import("@/lib/server/task-stream");
-const { buildNonOwnerGuardFootnote, buildNonOwnerGroupHeader } = await import(
+const { GROUP_REPLY_WHERE, buildNonOwnerGuardFootnote, buildNonOwnerGroupHeader } = await import(
   "@/lib/group-non-owner-prompt"
 );
 
@@ -174,7 +174,9 @@ describe("提示词：机器人变体", () => {
   it("真人变体：系统自动 @ 提问人（不用自己写）、不提机器人", () => {
     const t = buildNonOwnerGuardFootnote("李四");
     expect(t).toContain("非任务所有者「李四」");
-    expect(t).toContain("系统会在回复开头自动 @ 提问人");
+    // 回复去向是共享句（GROUP_REPLY_WHERE，单一来源）；这里钉住它对真人说的要点：系统自动 @，agent 不用再写
+    expect(t).toContain(GROUP_REPLY_WHERE);
+    expect(t).toContain("系统自动 @ 提问人，不用再写");
     expect(t).not.toContain("机器人");
     // isBot:false 与不传等价
     expect(buildNonOwnerGuardFootnote("李四", { isBot: false })).toBe(t);

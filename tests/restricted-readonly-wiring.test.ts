@@ -110,8 +110,10 @@ beforeEach(() => {
   hoisted.createAgentSession.mockReset();
   hoisted.createAgentSession.mockResolvedValue({ session: makeSession() });
   hoisted.sessionOpen.mockReset();
+  // 生产代码经 openPersistedPiSession 会包装 sessionManager.appendMessage（落盘脱敏，见 pi-session-persist.ts）：真实的 SessionManager 一定有它，假对象也得有
   hoisted.sessionOpen.mockReturnValue({
     buildSessionContext: () => ({ messages: [{ role: "user" }] }),
+    appendMessage: () => "entry-1",
   });
 });
 

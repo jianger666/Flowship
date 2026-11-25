@@ -167,6 +167,28 @@ export const saveImageAttachments = async (
   });
 };
 
+/**
+ * 回收 `saveImageAttachments` 刚落盘、却没能被任何记录引用的图片（调用方后面的步骤失败了：校验不过 / 写 meta 失败 / 任务刚好被删）。
+ * best-effort、绝不抛：回收失败只是留下孤儿文件，不能把调用方原本要返回的错误换成另一个。
+ * 只删本任务 `uploads/` 目录**直接**下的文件——传进来的路径不在那里就跳过（这是回收函数，不是通用删除）。
+ */
+export const discardSavedImages = async (
+  taskId: string,
+  absPaths: readonly string[] | undefined,
+): Promise<void> => {
+  if (!absPaths || absPaths.length === 0) return;
+  try {
+    const uploadsDir = path.resolve(taskDir(taskId), UPLOADS_DIR);
+    for (const p of absPaths) {
+      const resolved = path.resolve(p);
+      if (path.dirname(resolved) !== uploadsDir) continue;
+      await fs.unlink(resolved).catch(() => {});
+    }
+  } catch {
+    /* sanitizeId 之类抛错：同样只是没回收成 */
+  }
+};
+
 // ----------------- 粘贴超长文本附件（uploads/paste-<ts>.txt）-----------------
 
 /** 单次粘贴文本上限 2MB（UTF-8 字节），与 paste-text route / lib 常量对齐 */

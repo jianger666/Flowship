@@ -33,7 +33,7 @@ export const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
  * 限速只作用于「写日志」，不参与任何放行 / 拒绝决策。
  */
 export const OVERFLOW_LOG_WINDOW_MS = 60_000;
-/** 限速表的 key 上限（key 是提示的 kind，天然只有几个；封顶只是防御） */
+/** 限速表的 key 上限（防御）：满了挤掉最老的一项，不整表清空 */
 const OVERFLOW_THROTTLE_MAX_KEYS = 32;
 
 /**
@@ -55,7 +55,14 @@ export const createOverflowLogThrottle = ({ now = Date.now, windowMs = OVERFLOW_
         slot.suppressed += 1;
         return { log: false, suppressed: 0 };
       }
-      if (!slot && slots.size >= OVERFLOW_THROTTLE_MAX_KEYS) slots.clear();
+      if (!slot && slots.size >= OVERFLOW_THROTTLE_MAX_KEYS) {
+        // 满了：挤掉最老的一项——此前整表 `clear()`，会把所有仍在窗口内的键一起忘掉、下一轮每个键都再写一条日志
+        // （第二十四轮 P3-5；权限闸往这里放 `blocked:${perm}:${reason}` 这类键，不再只是几个 kind）。
+        // 不另做「先扫一遍剔掉窗口已过的」：槽按最近一次放行日志的先后排列，窗口已过的一定排在最前面、本来就先被挤掉；扫一遍与逐个挤对「放不放行」没有任何区别，
+        // 只会白白丢掉那些槽里「被吞掉的次数」（它们下一次放行时要写进「另有 N 次」）——变异验证里它是个等价突变，不可观察的代码不留
+        while (slots.size >= OVERFLOW_THROTTLE_MAX_KEYS) slots.delete(slots.keys().next().value);
+      }
+      slots.delete(k); // 先删后加：这一项挪到末尾（「最老」按最近一次放行日志算）
       slots.set(k, { at: t, suppressed: 0 });
       return { log: true, suppressed: slot?.suppressed ?? 0 };
     },

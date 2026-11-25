@@ -15,6 +15,42 @@ describe("extractInteractiveText", () => {
     expect(text).not.toContain("<card>");
   });
 
+  it("开标签带属性（新版 lark-cli：`<card title=… subtitle=…>`）：照样抽出正文、剥掉思考面板与页脚（2026-11-19 线上卡片）", () => {
+    // 真实样本：引用机器人自己的卡片回复时，lark-cli 1.0.98 返回的就是这个形态。
+    // 以前正则只认裸 `<card>`，这里匹配不上 → 当 JSON 解析失败 → null →「被引用的消息没有可读正文」
+    const raw = [
+      '<card title="【数英满班率】组班" subtitle="已完成">',
+      "▶ 思考与工具 · 0 次工具调用",
+      "    **思考 1** · completed",
+      "    I need to explain why I mixed up the context.",
+      "▲",
+      "@李安(ou_dd96879934291092a41e4b73ac936053) 我答错了,原因是那句「针对这个问题」没说指的是哪个问题。",
+      "",
+      "后来他补了一句「是说时区下拉的展示问题」并附了截图。",
+      "---",
+      "12s · claude-sonnet-5-5",
+      "</card>",
+    ].join("\n");
+
+    const text = extractInteractiveText(raw);
+
+    expect(text).toBe(
+      [
+        "@李安 我答错了,原因是那句「针对这个问题」没说指的是哪个问题。",
+        "",
+        "后来他补了一句「是说时区下拉的展示问题」并附了截图。",
+      ].join("\n"),
+    );
+  });
+
+  it("开标签带属性：属性值里有 `>` 之外的各种字符也不影响（只看到第一个 `>` 为止）", () => {
+    expect(
+      extractInteractiveText('<card title="a b" subtitle="进行中" id=1>\n正文 X\n</card>'),
+    ).toBe("正文 X");
+    // `<cardinal>` 之类不是 card 标签：不当卡片处理（落到 JSON 分支 → null）
+    expect(extractInteractiveText("<cardinal>\n正文 X\n</cardinal>")).toBeNull();
+  });
+
   it("原生卡片 JSON 收集 text/content 节点（含按钮对象里的 content）", () => {
     const text = extractInteractiveText(
       JSON.stringify({

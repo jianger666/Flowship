@@ -87,6 +87,48 @@ export const PERMISSION_LABEL: Record<string, string> = {
   "pointerLock": "鼠标锁定",
 };
 
+/**
+ * 系统层已经拒绝了 Flowship 使用麦克风 / 摄像头时，权限提示条里多写的一行（主进程在弹提示时读 `systemPreferences.getMediaAccessStatus`，
+ * 把「拒绝的那几项」与平台放进 detail.systemDenied / detail.platform；被系统策略限制的那几项放 detail.systemRestricted，见 {@link describeSystemRestricted}）。
+ * 点了「允许」也没用——页面仍拿不到流，要先去系统设置里打开。
+ * @param atoms 逗号分隔的权限名（microphone,camera）；认不出的原样展示
+ */
+export const describeSystemDenied = (atoms: string, platform: string): string => {
+  const names = atoms
+    .split(",")
+    .map((a) => a.trim())
+    .filter(Boolean)
+    .map((a) => PERMISSION_LABEL[a] ?? a)
+    .join(" / ");
+  const what = names || "麦克风 / 摄像头";
+  if (platform === "darwin") return `注意：macOS 系统设置里没有允许 Flowship 使用${what}，就算点「允许」页面也拿不到——请先到 系统设置 → 隐私与安全性 → ${what} 里打开 Flowship`;
+  if (platform === "win32") return `注意：Windows 设置里没有允许桌面应用使用${what}，就算点「允许」页面也拿不到——请先到 设置 → 隐私和安全性 → ${what} 里打开`;
+  return `注意：系统层面没有允许 Flowship 使用${what}，就算点「允许」页面也拿不到——请先在系统的隐私设置里打开`;
+};
+
+/**
+ * 系统层**限制**了 Flowship 使用麦克风 / 摄像头（`restricted`）时的提示行（`detail.systemRestricted`）。
+ * 与 {@link describeSystemDenied} 分开写：macOS 的 restricted 是家长控制 / 屏幕使用时间 / 设备管理 / 组织策略，用户自己改不了、要找设备管理员——写成「去设置里打开」会误导用户去翻一个并不存在的开关（R22-3）。
+ * **Windows 单独写**（第二十三轮 R23-6）：Electron 在 Windows 上报 `restricted` 的具体触发场景没有实测过，全局的「让桌面应用访问你的麦克风 / 摄像头」开关也可能落到这里——
+ * 一上来就说「联系管理员」会让只是关了开关的用户白白求助，所以先请他检查那个开关，灰着 / 打不开才是设备管理策略（这句话术本身没有在真 Windows 上验证过）。
+ */
+export const describeSystemRestricted = (atoms: string, platform: string): string => {
+  const names = atoms
+    .split(",")
+    .map((a) => a.trim())
+    .filter(Boolean)
+    .map((a) => PERMISSION_LABEL[a] ?? a)
+    .join(" / ");
+  const what = names || "麦克风 / 摄像头";
+  if (platform === "darwin") {
+    return `注意：macOS 的系统策略限制了 Flowship 使用${what}（家长控制 / 屏幕使用时间 / 设备管理 / 组织策略），就算点「允许」页面也拿不到——这在系统设置里改不了，需要联系设备管理员`;
+  }
+  if (platform === "win32") {
+    return `注意：Windows 限制了 Flowship 使用${what}，就算点「允许」页面也拿不到——请先到 设置 → 隐私和安全性 → ${what}，检查「让桌面应用访问你的${what}」是否被关了；开关是灰的或打不开才是设备管理策略，需要联系设备管理员`;
+  }
+  return `注意：系统策略限制了 Flowship 使用${what}（家长控制 / 设备管理 / 组织策略），就算点「允许」页面也拿不到——请先检查系统的隐私设置，改不了再联系设备管理员`;
+};
+
 export const describePrompt = (p: BrowserPromptInfo | null | undefined): PromptBarModel | null => {
   if (!p || typeof p !== "object" || typeof p.id !== "string") return null;
   const kind = p.kind in PROMPT_KIND_LABEL ? p.kind : null;
@@ -113,6 +155,13 @@ export const describePrompt = (p: BrowserPromptInfo | null | undefined): PromptB
     lines.push(`请求：${PERMISSION_LABEL[perm] ?? perm}`);
     const origin = get("origin");
     if (origin) lines.push(`来源：${origin}`);
+    // 被顶层页面委托了的嵌入框架（iframe allow="microphone"）发起的请求：授予按顶层站点给，这里说明实际发起者
+    const frame = get("frame");
+    if (frame) lines.push(`由页面内嵌的 ${frame} 发起（来源页面已把这项权限委托给它）`);
+    const systemDenied = get("systemDenied");
+    if (systemDenied) lines.push(describeSystemDenied(systemDenied, get("platform")));
+    const systemRestricted = get("systemRestricted");
+    if (systemRestricted) lines.push(describeSystemRestricted(systemRestricted, get("platform")));
   } else if (kind === "evaluate") {
     const what = get("summary");
     if (what) lines.push(`脚本摘要：${what}`);

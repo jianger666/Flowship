@@ -36,6 +36,7 @@ import type {
   FlowshipToolResult,
 } from "../flowship-tools";
 import { onWaitsCancelled } from "../session-wait";
+import { hasOpenDesktopSession, markDesktopSessionClosed } from "../desktop/open-sessions";
 import { appendUserActivity, fetchPendingUserActivity, TOOL_ACTIVITY_HEADER } from "./activity";
 import { getBrowserBridge, isBrowserBridgeAvailable } from "./bridge";
 import {
@@ -119,8 +120,12 @@ export const installBrowserStopHook = (): void => {
       st.inflightByScope.delete(key);
       return;
     }
-    // taskId：只有真有挂起请求才发（cleanup 类路径会被频繁调用，别每次都给主进程发空 cancel）
-    if (bridge.pendingCount(key) > 0) bridge.cancel(key);
+    // taskId：有挂起请求，或这个任务名下可能还开着电脑操作会话（模型想下一步的空档里没有请求在飞，
+    // 可电脑是我们解锁的、遮罩还盖着——不补这一发，停止后电脑要一直解着直到空闲超时）才发。
+    // 其它情况不发（cleanup 类路径会被频繁调用，别每次都给主进程发空 cancel）
+    const openDesktop = hasOpenDesktopSession(key);
+    if (openDesktop) markDesktopSessionClosed(key); // 我们这就通知主进程去结束它
+    if (openDesktop || bridge.pendingCount(key) > 0) bridge.cancel(key);
   });
 };
 
@@ -362,7 +367,8 @@ export const pendingPromptsHint = (raw: unknown): string => {
   return `⏳ 面板上有等待用户处理的事项：${kinds.join("、")}。已请用户处理，这些只能由用户决定——请不要重试同一操作，也不要替用户点；先结束本轮或用 ask_user 说明，处理完再继续。`;
 };
 
-const track = (ctx: FlowshipToolContext | undefined, delta: 1 | -1): void => {
+/** 登记 / 注销「这个 agent 实例（scope）有一个在飞的主进程请求」：停止联动据此决定要不要给主进程发 cancel。desktop_* 工具共用 */
+export const track = (ctx: FlowshipToolContext | undefined, delta: 1 | -1): void => {
   if (!ctx?.scope || !ctx.taskId) return;
   const st = stopState();
   if (delta === 1) {

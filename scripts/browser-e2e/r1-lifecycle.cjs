@@ -534,9 +534,9 @@ const main = async () => {
     const passed = results.filter((r) => r.ok).length;
     console.log(`SMOKE SUMMARY ${passed}/${results.length} passed${extra || ""}`);
     try {
-      fs.rmSync(TMP, { recursive: true, force: true });
-    } catch {
-      /* 临时目录清理失败不影响结论 */
+      fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (err) {
+      console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
     }
     app.exit(passed === results.length ? 0 : 1);
   };

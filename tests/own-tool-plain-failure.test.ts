@@ -214,9 +214,17 @@ describe("R7-01：真实工具 handler 的失败回包 → error（防文案漂�
 
   it("被新 agent 接管（CALLER_MISMATCH_ERROR）：对所有自有工具都是失败", async () => {
     const { CALLER_MISMATCH_ERROR } = await import("../src/lib/server/chat-pending");
-    for (const tool of ["schedule", "ask_user", "share_to_group", "submit_work"]) {
+    // create_custom_action（第二十轮评审 R20-9）：过期会话闸圈着它、它的 handler 又不核对 token，被拒时回的就是这句纯文本——此前表里没有它，只靠 isError 兜着
+    for (const tool of ["schedule", "ask_user", "share_to_group", "submit_work", "create_custom_action"]) {
       expect(
         resolveToolResultStatus("completed", tool, piText(CALLER_MISMATCH_ERROR)),
+        tool,
+      ).toBe("error");
+    }
+    // advance_next / set_owner_note 的拒绝是 JSON { ok:false, error }（工具描述里的契约），由 JSON 判据认
+    for (const tool of ["advance_next", "set_owner_note"]) {
+      expect(
+        resolveToolResultStatus("completed", tool, piText(JSON.stringify({ ok: false, error: CALLER_MISMATCH_ERROR }))),
         tool,
       ).toBe("error");
     }

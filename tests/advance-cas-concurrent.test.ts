@@ -66,6 +66,7 @@ const taskFsCore = await import("@/lib/server/task-fs-core");
 const { taskDir, writeMeta } = taskFsCore;
 const {
   clearTaskStarting,
+  isTaskStarting,
   pendingStopRequests,
   runningChecks,
   runningTasks,
@@ -171,10 +172,13 @@ describe("advanceTask × expectedCurrentActionId：串行队列里的 CAS", () =
   });
 
   afterEach(async () => {
-    // 后台 run 收敛后再清理，避免对已删目录落盘
-    await waitUntil(() => ids.every((id) => !runningTasks.has(id)), 8000).catch(
-      () => {},
-    );
+    // 后台 run 收敛后再清理，避免对已删目录落盘。
+    // 等的是「启动链 + run 都收尾」：start 的 IIFE 在 starting 窗口里 await 整个 consume，
+    // 只看 runningTasks 会漏掉它「预登记之前 / 收尾之后」的那一段（实测会在清目录后还落 meta.json）
+    await waitUntil(
+      () => ids.every((id) => !isTaskStarting(id) && !runningTasks.has(id)),
+      5000,
+    ).catch(() => {});
     for (const id of ids) {
       pendingStopRequests.delete(id);
       clearTaskStarting(id);
@@ -184,7 +188,22 @@ describe("advanceTask × expectedCurrentActionId：串行队列里的 CAS", () =
       clearChatGate(id);
       endChatLifecycle(id);
     }
-    await sleep(60);
+    // 排空每个任务的两条写盘链（meta 锁 + 事件追加链）：收尾里 fire-and-forget 的写
+    // （setTaskSessionAgentId / meta 回写 / 事件追加）都已排在链上，等它们真的落完再清目录。
+    // 替换原来的 sleep(60)：那只是时间裕量，不是同步点。交替两轮——锁里的写可能再排事件，反之亦然
+    // 带 3s 上限：万一哪个用例失败时没放行、把锁占住，清场不能卡死、更不能连累后面的用例（只是兜底，正常毫秒级完成；
+    // 与上面的 5s 等待加起来 < vitest 默认 hookTimeout 10s）
+    await Promise.race([
+      (async () => {
+        for (let round = 0; round < 2; round++) {
+          for (const id of ids) {
+            await taskFsCore.withEventAppendChain(id, async () => undefined);
+            await taskFsCore.withTaskLock(id, async () => undefined);
+          }
+        }
+      })(),
+      sleep(3000),
+    ]);
     for (const id of ids) {
       await fs.rm(taskDir(id), { recursive: true, force: true }).catch(() => {});
     }

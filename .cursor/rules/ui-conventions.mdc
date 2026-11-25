@@ -96,8 +96,10 @@ alwaysApply: true
 
 - **每个配置项一律用 `<SettingRow>`**（`src/components/ui/setting-row.tsx`）：左「名称 + 一句说明」右控件；宽控件（Input / ModelSelect）用 `stacked`（名称行 + 全宽控件、`labelExtra` 放名称行右侧操作按钮）。外层容器 `divide-y` 出行间分隔。
 - ⛔ 不要手拼「小节头 + Label + 控件 + 说明」多层文字——三层文字层级挤在一起就是「乱」的根源（踩过两轮）。
+- **`hint` 只写一句**（2026-11-24 立规，用户点名浏览器卡 / 飞书桥接块「一大串一大串的字」）：一句话（硬上限见 `tests/helpers/settings-copy-limits.ts`：hint ≤ 68 字、detail ≤ 140 字，数字只在那里写一份；宽屏一行放得下，窄窗口最多折成两行，和 `setting-row.tsx` 头注释同一个口径），写「这项是什么、开了会怎样」。放不下的背景 / 边界 / 清理期限一律进 **`detail`**（名称后面一个 ⓘ，悬停 / 键盘聚焦才出气泡；`SettingRow` 的 prop）；更长的规则（几段）收进行下面的折叠区（`<details>`，飞书桥接块的「更多规则与提示词」）。⛔ 不要把教程塞回 hint。**但做决定必须看到的词留在 hint 里**：默认关闭 / 风险 / 「开两个开关叠加后机器人也能改文件」这类——别全藏进气泡（气泡是悬停才出的，用户开开关前未必会看）。超限会红（`tests/settings-hint-brevity.test.ts`：扫浏览器卡 / 飞书块的文案**数据**，外加组件里的 `hint="…"` / `detail="…"` 字面量，以及 `hint={<>…</>}` / `hint={常量}` 里写死的静态文字——运行时才有的状态提示、三元 / `||` 兜底、别处 import 的常量量不到，要靠评审）。`detail` 另有一份常驻的 sr-only 文本、ⓘ 经 `aria-describedby` 引用它——读屏用户不靠悬停也能读到；触屏没有 hover，桌面应用以鼠标键盘为主，暂不做点开气泡。披露性文案（风险 / 数据去向）要让测试能断言它还在：抽成纯数据文件，测试直接 import（范例 `src/lib/browser-settings-copy.ts`）——别靠正则从 TSX 里抠。
+- **行里的 Switch 不用手写 aria-label**：`SettingRow` 通过 context（`setting-row-context.ts`）把「名称节点 id / 说明节点 id」递给里面的 `Switch`，没显式写名字时自动 `aria-labelledby` / `aria-describedby`。授权类开关（电脑操作等）仍要显式写 `aria-label`——名字要说清「授权什么」，不能只靠行标题。不在 `SettingRow` 里单独用的 Switch 照旧自己给名字。
 - **禁 placeholder-only 输入**：并排多个同类输入（如三个分支框）必须带迷你 label（`text-[11px] text-muted-foreground`）——有值后 placeholder 消失、用户就不知道哪个框是啥了（ui-ux-pro-max 规范同款）。
-- 设置分组按「用户心智」不按实现：模型（提供方 + 凭据 + 默认模型）/ 连接（GitLab / 飞书 / 环境）/ 团队 / 偏好 / 仓库 / 存储；能力类（Action / Skill / MCP）在 /actions 能力页。
+- 设置分组按「用户心智」不按实现：模型（提供方 + 凭据 + 默认模型）/ 连接（GitLab / 飞书 / 环境）/ 团队 / 偏好 / 内置浏览器 / 电脑操作 / 仓库；能力类（Action / Skill / MCP）在 /actions 能力页。**设置页是「一页长滚动 + 左侧锚点导航」，不是切页签**：每张组卡包 `wrapCard("<id>", …)`，`NAV_ITEMS` 与卡片一一对应、顺序一致（`tests/settings-nav-contract.test.ts` 守着；新增一张卡就要加导航项）。别改回「每个页签只有一两项」的旧布局。
 - **API Key 归属信息**用灰底信息块（`rounded-md border bg-muted/40` + 用户图标、姓名/邮箱一行、密钥名/日期一行），不要压成一行 `muted` 纯文本（2026-08-19 用户纠偏：块样式被自定义提供方 WIP 拆掉后要求加回）。
 
 ## 上标签下控件表单（Form / Field）

@@ -35,6 +35,9 @@ import {
   formatBackgroundSubagentMessage,
   formatBackgroundSubagentNotice,
   getSubagentSessionControl,
+  isForeignOriginResult,
+  joinResultsForAgent,
+  markForeignOriginResult,
   onBackgroundSubagentJobsChanged,
   onBackgroundSubagentSettled,
   setBackgroundSubagentSnapshotProvider,
@@ -72,6 +75,7 @@ import {
   cancelPendingIf,
   clearAskTakenMark,
   getPendingAsk,
+  isRegisteredCallerTokenRevoked,
   setChatAwaitingNotifier,
 } from "./chat-pending";
 import { failpoint } from "./failpoints";
@@ -79,6 +83,7 @@ import { interruptWaits } from "./session-wait";
 import { chatTurnProtocolSection } from "./turn-discipline";
 import { mediaDisplayPromptSection } from "./media-display-prompt";
 import { browserPromptSection } from "./browser/prompt";
+import { desktopPromptSection } from "./desktop/prompt";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { supersedePendingAsks } from "./ask-supersede";
 import { renderContextDocsSection } from "./context-docs-prompt";
@@ -143,6 +148,13 @@ import {
   withSdkDeadline,
 } from "./sdk-deadline";
 import { CANCEL_WAIT_GRACE_MS, createCancelEscape } from "./run-wait";
+import {
+  beginForeignContentMidRun,
+  endMidRunForeignContent,
+  isGroupNonOwnerTurnActive,
+  rollbackForeignContentMidRun,
+  registerNonOwnerRunProbe,
+} from "./non-owner-turn-guard";
 import { finalizeOpenToolCalls } from "./finalize-open-tools";
 import { RECONNECT_TOTAL_MAX, createReconnectBudget } from "./reconnect-budget";
 import {
@@ -280,6 +292,13 @@ interface RunningChatRecord {
    */
   replacedReason?: ChatCloseReason;
   /**
+   * 已经向用户提示过「已暂存」的外来来源后台结果条数（第十九轮评审 R19-4）：`drainBackgroundResults` 在「属主自己的一轮在跑（没有活标记）、队里有外来来源的结果」时把它们留在队里不 steer，
+   * 到达时那行只说「将转交」，之后一声不响——这一轮若被停止 / 出错 / 重启，这批结果会被作废并写「未送达」，用户从没见过中间那一步。
+   * 现在首次扣留（以及之后又多了新的外来来源结果）时落一行 info「已暂存、待当前这一轮结束后转交」，按这个计数去重（同一批不重复提示）；
+   * 它们被送出 / 并入有标记的一轮时清零。随会话实例存活：会话关了结果本来就作废（closeChatSession 另写「未送达」），重连暂存放回新实例时从 0 起算、可再提示一次（如实）。
+   */
+  foreignHeldNoticed?: number;
+  /**
    * 「立即发送」steer 在飞的消息（itemId → 用户看到的原文）：send-now 在 take 之后就经 registerInflightSteer 登记
    * （覆盖 take → steerChatRun 起手之间的 await 空窗），有了定论由它注销；调用方没提前登记时 steerChatRun 自己登记、落定即注销。
    * 为什么要有：这条消息已被 take 出队列、又刻意不占 in-flight 槽（steer 可能挂很久，不能卡住链式 flush），
@@ -314,6 +333,16 @@ interface RunningChatRecord {
    * 自动重连起的新实例不继承它（重连 prompt 不是定时文本）——该实例回落到 TTL 清扫，见 HANDOFF 的 X3 局限。
    */
   scheduledRun?: boolean;
+  /**
+   * 本实例登记进 callerToken 表（chat-pending 的 expectedCallerTokens）的身份——与 registerChatNotifier 传的是同一个值；
+   * 冷启动占位期、登记之前为 undefined。
+   * 为什么要记在 record 上（第十九轮评审 R19-2）：stop 一开始就同步摘掉表里的 token（stop-task 的 invalidateCallerToken，首个 await 之前），
+   * 而「摘会话」要等稍后的 cancelChatRun——中间隔着好几个 await。run 恰好在这段空窗里自然结束时，cancelChatRun 看到 runActive=true、只发了 rec.cancel()，
+   * finalizeChatRunIfCurrent 的 finished 分支又把会话「保留」下来：留下的是一个没有 token / notifier 的空壳，
+   * 属主之后的 desktop_* / browser_evaluate / schedule / ask_user 全回「任务已被新 agent 接管」，要等下一次 stop / 换模型才自愈。
+   * finished 分支据这个字段发现「表里的 token 已不是我的」（isRegisteredCallerTokenRevoked 为真；没登记过 = undefined 不算作废）、按停止的本意把会话关掉，见 finalizeChatRunIfCurrent。
+   */
+  callerToken?: string;
 }
 
 /**
@@ -412,12 +441,45 @@ const getRunnerState = (): ChatRunnerGlobalState => {
 };
 
 const runningChats = getRunnerState().runningChats;
+// 「非属主轮」标记的寿命跟着 run 走（见 non-owner-turn-guard）：标记久没续期时问一句这个 chat 的 run 还在不在
+// （runActive = 此刻有 run 在跑，不是「会话还在表里」）。同名登记 = 热更新覆盖。
+// 「在跑」除了表里 runActive 的那个，还要算上**自动重连链在飞**（getReconnectStops().has(taskId)，tryChatAutoReconnect 注册、finally 清）：
+// 重连的退避窗口里坏实例已被摘出表（resume 失败再退避，空窗可以连着好几次），这一轮其实还在——重连接上之后会接着跑——
+// 只看 runActive 会在这段空窗里答「没在跑」：被沿用过的标记让位判据失效（rollbackForeignContentMidRun 照清），或标记过期时不续命，
+// 重连接上后的那一轮就无标记地继续了（第十二轮评审 P2-1）。重连闭包的存续区间覆盖首次退避 / 摘表后的空窗 / resume 重试 /
+// 接上之后一直到那一轮收尾（consumeChatRun 在同一个 tryChatAutoReconnect 里被 await），与摘表前后的 runActive 首尾相接、没有缝。
+// getReconnectStops 是下面才声明的 const，探针只在被问到时才调（模块加载完之后），不会撞暂时性死区
+registerNonOwnerRunProbe("chat", (taskId) => runningChats.get(taskId)?.runActive === true || getReconnectStops().has(taskId));
 const drainingQueues = getRunnerState().drainingQueues;
 const pendingBackgroundResults = getRunnerState().pendingBackgroundResults;
 const stashedBackgroundResults = getRunnerState().stashedBackgroundResults;
 
 /** 每次 runningChats.set 前取号：同一持久化 agentId 的两个内存实例也绝不同号 */
 const allocChatInstanceId = (): number => getRunnerState().nextChatInstanceId++;
+
+/**
+ * 本任务的会话位上，此刻是不是「别的实例」在占着（表里有记录、且不是 myInstanceId；undefined / -1 = 本调用没有实例，表里有谁都算别人）。
+ *
+ * 用在收尾处按名清「中途登记的外来内容标记」（endMidRunForeignContent）之前。那个清除按任务名删、不看归属：
+ * 表里已经是别的实例时，标记多半是它登记的（本实例被摘表 → 新会话起来并为新的外来内容登记 → 本实例才迟到地收尾），按名清会把它一并清掉，
+ * 新一轮的外来内容就在无标记状态下继续——限制危险工具 / 电脑操作的保护提前失效（安全边界）。
+ *
+ * 判据是「表」，不是「本实例是被什么原因摘的」：第七轮评审 N1 只认 `replacedReason === "restart"`，第八轮评审 N2 就从别处漏了——
+ * 自动重连链的退避窗口里表是空的（坏实例先摘、过一会儿才 resume），新会话可以趁虚而入，随后重连链醒来看见别人、让位收场，
+ * 旧实例的收尾带着 replacedReason=reconnect 走到按名清；error 收尾摘表之后、清队通知落盘（IO）之前同样有一段空窗（第八轮评审 P3-2）。
+ * 凡是「表里已经是别人」，不论本实例怎么被摘的，都不碰。
+ *
+ * 表空 / 表里还是本实例 = 没有别人在占，标记只可能是本实例自己登记的 → 照旧按名清。
+ * 取舍：拿不准时偏向「不清」——被留下的标记最晚在占位实例自己的收尾里被清掉，代价只是多限制一阵；误清则是外来内容无保护。
+ * 前提（登记点都满足）：外来内容的标记只在「送达之前一刻、同步」登记，那一刻必有一个实例占着表（sendChatMessage 的存活会话 / runChatSession 的占位记录）。
+ */
+const isChatSlotHeldByOtherInstance = (
+  taskId: string,
+  myInstanceId: number | undefined,
+): boolean => {
+  const cur = runningChats.get(taskId);
+  return cur !== undefined && cur.instanceId !== myInstanceId;
+};
 
 /** 队列 drain 进行中（flushChatQueue 已占位、尚未 finally 清位）——chat-reply 应入队保 FIFO */
 export const isChatQueueDraining = (taskId: string): boolean =>
@@ -470,6 +532,49 @@ const noticeBackgroundResultsDropped = (
     kind: "info",
     text: `${count} 条后台子代理的结果未送达主 AI（${why}）`,
   });
+};
+
+/**
+ * 给用户一句话：外来来源（派出它的那一刻是群里非所有者触发的一轮）的后台结果被**扣留**了（第十九轮评审 R19-4）。
+ * 场景：这一刻在跑的是所有者自己的一轮（没有活标记），外来来源的结果不能 steer 进无标记的一轮，只能攒着、等这一轮收尾后带标记送出（见 drainBackgroundResults）。
+ * 到达那行只说「将转交」，之后若这一轮被停止 / 出错 / 重启，这批结果会被作废并写「未送达」——用户没见过中间这一步，所以扣留时落一行说明。
+ * 用 owned sink（本实例还在才落）：会话已关 / 已换，closeChatSession 会另写「未送达」，这里不再说。fire-and-forget，不挡 drain。
+ */
+const noticeForeignBackgroundResultsHeld = (
+  taskId: string,
+  rec: RunningChatRecord,
+  count: number,
+): void => {
+  if (count <= 0) return;
+  const instanceId = rec.instanceId;
+  void writeOwnedEventAndPublish(
+    taskId,
+    () => runningChats.get(taskId)?.instanceId === instanceId,
+    {
+      kind: "info",
+      text: `${count} 条后台子代理的结果来自群里他人触发的一轮：当前这一轮是所有者自己的，不并入，已暂存、待这一轮结束后单独转交主 AI`,
+    },
+  ).catch((err) => {
+    console.warn(`[chat-runner] 后台结果扣留提示落盘失败 task=${taskId}:`, err);
+  });
+};
+
+/**
+ * 扣留提示的去重入口（第十九轮评审 R19-4 / 第二十轮评审 R20-3）：外来来源的结果在「所有者自己的一轮」里被扣留时，
+ * 首次扣留（或之后又多了新的外来来源结果）才落一行；按 `rec.foreignHeldNoticed` 去重，同一批重复 drain 不重复提示。
+ * 送出（空闲唤醒 / 并入有标记的一轮）时 drainBackgroundResults 把它清零，下一次扣留会重新提示。
+ * 调用点有两处，缺一不可：① 这一轮能 steer（属主来源的照常 steer、外来来源的留下）；② 这一轮不能 steer（pi 后端 / 冷启动占位 /
+ * 刚收尾的空窗：整批都等收尾，其中外来来源的那几条一样是被扣留——R20-3 之前这里直接早退，用户见不到这一步）。
+ */
+const noteForeignResultsHeld = (
+  taskId: string,
+  rec: RunningChatRecord,
+  heldCount: number,
+): void => {
+  if (heldCount > (rec.foreignHeldNoticed ?? 0)) {
+    rec.foreignHeldNoticed = heldCount;
+    noticeForeignBackgroundResultsHeld(taskId, rec, heldCount);
+  }
 };
 
 /**
@@ -667,6 +772,24 @@ const closeChatSession = (
     // 被唤醒的 steer 落定后据此区分「系统自己清的队」与「之前 / 之后用户停止 / 回退清的队」（见 markChatSystemClose）
     markChatSystemClose(taskId, opts.queueGenerationBeforeClear);
     markChatInstanceReplacedByReconnect(rec, opts.reason);
+    // 懒重启 / 强清（restart）：摘表这一刻起，这个会话里「中途登记」的外来内容标记就到此为止——在摘表的同步段里清，
+    // 不留给旧 run 迟到的收尾。被强清的旧 run 是「cancel 卡住没按期退」的那种，它的 finally 可能在新会话已经起来、
+    // 并为新的外来内容登记了标记**之后**才跑；那里的 endMidRunForeignContent 按名清、不看归属，会把新标记一并清掉，
+    // 新一轮的外来内容就在无标记状态下继续（第七轮评审 N1，安全边界：限制危险工具 / 电脑操作的保护提前失效）。
+    // 所以分工是：摘表者清（此刻新会话还没起、不可能误清新标记；也不让旧会话的标记漏进新会话）
+    // + 被摘的旧 run 收尾时看「表里是不是别的实例」（isChatSlotHeldByOtherInstance）、是就不再按名清（consumeChatRun / runChatSession 两处 finally）。
+    // 这里只管 restart：reconnect 是同一轮的续接，标记要留给续接的新实例。
+    // error / 用户停止不在这里清，**也不能说成「紧随其后自己清」**：摘表到它们的 finally 之间隔着落盘（error 收尾要写清队通知、
+    // cancel 收尾要等写 idle），表是空的，新会话可以在这段空窗里起来并登记自己的标记（第八轮评审 P3-2）——
+    // 所以那一步（以及 reconnect 让位、lease 失效等所有按名清）的安全靠的是 finally 里的「表里有别人就不碰」，不靠摘表者清。
+    // 已收口（第十八轮，第十六轮评审 P3-C3；用户授权按推荐处理；第十九轮评审 R19-6 订正机制说法）：被强清（forceClearChatRun）放弃、但 cancel 卡住没真停的旧 run，在这里清掉标记之后到它收尾之前不再受标记限制——
+    // 但下面（**同一个同步段里**，且**所有 reason 都走**、不止这个 if 里的 reconnect / error / restart）的 setChatAwaitingNotifier(taskId, null) 把旧会话的 callerToken 一并摘了（chat 没有 task action handler，notifier 一摘 token 就没了）；
+    // 咽喉的「过期会话闸」（flowship-tools.ts 的 isStaleSessionRestrictedCall）对标记会拒的那几类调用核对 callerToken，旧 run 的 desktop_* / 恒拒清单于是仍被拒。
+    // 保证靠的是「callerToken 表单槽 + 摘表 / 清标记 / 摘 token 在同一个同步段」，**不是**「后继的 token 先装好」：chat 的后继 token 要到 registerChatNotifier（首次 send 之前）才装，在这之后；
+    // 两步之间表里没有 token（fail-closed）。所以本函数必须保持同步、摘 token 之前不能插 await（tests/stale-session-gate.test.ts 钉着）。
+    // close() 是否立刻让旧 run 的工具调用失效取决于 SDK（没有核实），所以不靠它。
+    // 钉死：tests/stale-session-gate.test.ts（含源码结构）+ chat-runner-foreign-marker-cleanup.test.ts 的 C3 真链路用例。
+    if (opts.reason === "restart") endMidRunForeignContent(taskId);
   }
   // 会话没了：后台子代理随 close 一并取消。非用户主动的关闭让用户看得见——
   // 读数必须在 agent.close() 之前（close 经 wrapAgentWithCancelLink 触发 cancelAll）、同步完成
@@ -1347,6 +1470,8 @@ const buildInitialPrompt = (
     // 内置浏览器一节（单一源 browser/prompt.ts；task 侧在 task-prompts 的 sharedRules 末尾追加同一段）。
     // 无桌面壳 / 握手失败时为空串——没有工具就不描述工具
     ...(browserPromptSection() ? [browserPromptSection(), ""] : []),
+    // 电脑操作一节同理（单一源 desktop/prompt.ts；task 侧同一段）：只有桌面壳声明了 desktop.v1（macOS / Windows）才有
+    ...(desktopPromptSection() ? [desktopPromptSection(), ""] : []),
     `## 任务 cwd（agent shell / read 默认基准目录）：${formatRepoSectionForPrompt(task.repoPaths, {
       nonGitRepoPaths: task.nonGitRepoPaths,
       originalRepoPaths: task.repoPaths,
@@ -1511,6 +1636,14 @@ export interface RunChatInput {
    * create/send/lease/stop/DELETE 失败由同一 handle 提交 failed（或 already_running 时入队）。
    */
   clientItemId?: string;
+  /**
+   * 首条消息的内容出自别人（所有者空 @ 引用别人 / 一句话再引用别人；见 QueuedChatMsg.foreignContentTurn，第五轮评审 N1）：
+   * 本函数在首包 `agent.send` **之前一刻、同步**登记 scope=desktop 的中途标记（agent 一拿到内容就可能调工具）。
+   * - 起会话阶段失败 / 被停 / 换实例等没走到 consumeChatRun 的出口，由本函数 finally 的 endMidRunForeignContent 清；
+   * - 此刻已有活标记（调用方预登记 / 另一路登记）→ beginForeignContentMidRun 返回 undefined，沿用它、不降级；
+   * - 已有会话在跑（并发首条）→ 首条改入队时带着这个标志，出队送达时再登记，不丢保护。
+   */
+  foreignContentTurn?: boolean;
 }
 
 /**
@@ -1532,7 +1665,11 @@ export const runChatSession = async (
     firstMessageEventId,
     startToken,
     clientItemId,
+    foreignContentTurn,
   } = input;
+
+  // 已把 run 交给 consumeChatRun（从此中途标记的清除归它：finalize / finally）。见本函数末尾 finally
+  let handedToConsume = false;
 
   /** 首条 operation 终态提交（first-outcome-wins；无 id 则 no-op） */
   const settleFirstOp = (
@@ -1557,10 +1694,19 @@ export const runChatSession = async (
     );
     // lease 失效 → 同 handle 明确 failed（禁止占位即 handedOff）
     settleFirstOp("stopped");
+    // 首条消息没送出去：调用方（ask-inject / chat-inject）为「别人的内容」补登的中途标记没有 run 来清，在这里清。
+    // 但 lease 失效 = 这期间有人 stop 过，新会话可能已经起来并登记了自己的标记：表里有别的实例在占就不碰（第八轮评审 P3-3，
+    // 按名清不看归属）——此刻调用方补登的那一个若是沿用了新会话的标记，就更不能清；若是新建的，留到占位实例自己收尾时清（多限制一阵、不漏保护）
+    if (!isChatSlotHeldByOtherInstance(task.id, undefined)) endMidRunForeignContent(task.id);
     return "lease_cancelled";
   }
 
   if (runningChats.has(task.id)) {
+    // ⚠️ 本分支必须**同步**返回——从函数入口到这里的 `return "already_running"` 之间不得出现任何 await（第十五轮评审 P3-3 F2）。
+    // chat-inject 的新会话路径靠它：`void sessionPromise.then(cb)` 之后紧接 `await Promise.resolve()`，「已 settle 的 promise 的 then 回调
+    // 排在 await 续体之前」，所以续体读到的 `queuedBehindOtherSession` 已经由 cb 置好；一旦这条分支前加了 await，promise 就晚于那次让出才 settle，
+    // 续体读到的恒为 false——「首条被别路占位、改入队」的标记回滚就悄悄失效、标记挂到别人那一轮上，而且没有任何报错。
+    // 时序由 tests/chat-runner-foreign-marker-cleanup.test.ts 的「顺序钉」用例钉着；真要加 await，先改那边的读法（例如让 runner 同步回调 / 返回值带出）
     // 并发首条都被过 hasChatSession===false 后各自 fire runChatSession，
     // 后者若静默 return → 气泡已落盘但 agent 永远收不到。有 firstMessage 就入队、
     // flush 时 skipPersistEvent 避免重复气泡。
@@ -1574,6 +1720,8 @@ export const runChatSession = async (
         attachmentAbsPaths: firstMessage.attachmentPaths,
         enqueuedAt: Date.now(),
         skipPersistEvent: true,
+        // 首条是别人的内容：改入队后保护不能丢——出队送达（sendChatMessage / flush）时再登记标记
+        ...(foreignContentTurn === true ? { foreignContentTurn: true } : {}),
       });
       console.warn(
         `[chat-runner] runChatSession task=${task.id} 已在跑、首条消息改入队（skipPersistEvent）`,
@@ -1607,7 +1755,9 @@ export const runChatSession = async (
   // 进入即占位注册：任何时刻（含 create/send/MCP 探测冷启动期）点停止、cancelChatRun 都能命中、
   // 置 cancelled（有 run 时一并真取消 SDK run）；agentId 先空、send 出来再回填。
   // 此处 runActive 只表示 starting，绝不等于消息已 handedOff。
-  runningChats.set(task.id, {
+  // agentId / agent 回填是就地改这个对象。
+  // 注意：本函数最后的 finally 判「表里是不是别人」靠的是上面定死的 myInstanceId（号），不靠这个对象——它可能早已被摘出表
+  const myRec: RunningChatRecord = {
     agentId: "",
     instanceId: myInstanceId,
     startedAt: Date.now(),
@@ -1625,7 +1775,8 @@ export const runChatSession = async (
       cancelled = true;
       if (run) void run.cancel().catch(() => {});
     },
-  });
+  };
+  runningChats.set(task.id, myRec);
   // 占位已转正 → 启动预约完成使命（带 token 精确释放；finally 再 release 也幂等）
   releaseChatStart(task.id, startToken);
 
@@ -1710,8 +1861,27 @@ export const runChatSession = async (
       });
     }
 
+    // 写上面那条「已跳过 MCP」提示是 await（有被剔除的 MCP 才真的等盘）：期间可能被停（cancelled）、或被强清 + 后继接管（实例号换了）。
+    // 登记 notifier / token 之前必须再复查一次、且**复查与登记之间不得有 await**（第二十轮评审 R20-2；前面那道复查在这个 await 之前）——
+    // 否则迟到的登记会盖掉后继已装好的 notifier / token（表是单槽）：后继的 record 记着自己的 token、表里却是旧的，
+    // R19-2 的收尾复查于是把后继每一轮自然收尾都判成「被停止」、会话被关。
+    // failpoint 在复查之前：测试按此名在这个 await 里注入「强清 + 后继接管」。
+    await failpoint("chat.start.afterMcpNotice");
+    if (cancelled || !isStartCurrent()) {
+      if (cancelled) {
+        await finishCancelled();
+        settleFirstOp("stopped");
+      } else {
+        // 实例被替换、首条未 send → failed
+        settleFirstOp("startup_failed");
+      }
+      return "started";
+    }
+
     // 3) 注入 awaiting notifier（V0.11.1 抽成共用、resume 时也要重注册）
     // 绑本实例 instanceId，ask/submit_work 状态写带 isCurrent
+    // 同时把 token 记到 record 上（与登记同一个同步段）：finished 收尾据它发现「stop 已摘走表里的 token」（R19-2）
+    myRec.callerToken = callerToken;
     registerChatNotifier(task, callerToken, myInstanceId);
 
     // prompt 素材与 Agent.create 并行（v1.1.x 提速）：skills / rules 读盘、identity 走
@@ -1894,6 +2064,11 @@ export const runChatSession = async (
       promptBytes,
       model,
     });
+    // 首条消息的内容出自别人（foreignContentTurn）：标记在这里、紧贴首包登记——agent 一拿到内容就可能调工具，必须先就位；
+    // 与下面 agent.send 之间不得有 await（登记之后再让出一次事件循环，上一轮 run 的收尾就可能把它按名清掉）。
+    // 没送出去的出口（被停 / 换实例 / send 抛错）由本函数最后的 finally 清；送出去的由 consumeChatRun 的 finally 清。
+    // 已有活标记 → 返回 undefined（沿用、不降级），所以调用方预登记过也不会重复
+    if (foreignContentTurn === true) beginForeignContentMidRun(task.id);
     run = await withSdkDeadline(
       agent.send(initialPrompt, {
         onDelta: composeOnDelta(
@@ -1959,9 +2134,12 @@ export const runChatSession = async (
       maybeGenerateChatTitle(task.id, apiKey, firstMessage.text);
     }
 
+    // 从这里起中途标记的清除归 consumeChatRun（finalize 在放 runActive 前清、finally 兜底）
+    handedToConsume = true;
     await consumeChatRun(task, run, () => cancelled);
   } catch (err) {
-    // Agent.create / send 阶段失败（consumeChatRun 内部错误它自己处理、不会抛）
+    // Agent.create / send 阶段失败（consumeChatRun 的常规失败它自己处理；只有它收尾时自己写盘也抛了才会冒到这里——
+    // 那时首条早已 handedOff、settleFirstOp 对终态 no-op，handleChatRunFailure 带实例门控、已收尾的实例整段 no-op）
     // stop 导致 create/send reject 时走 finishCancelled 口径（idle、不落 error），
     // 对齐 consumeChatRun 的 cancelled 分流；cancelled=false 才走 handleChatRunFailure。
     if (cancelled) {
@@ -1978,6 +2156,18 @@ export const runChatSession = async (
     // Agent.create reject / send reject → startup_failed（禁止留下 handedOff）
     settleFirstOp("startup_failed");
     await handleChatRunFailure(task, err, myInstanceId);
+  } finally {
+    // 首条消息是「别人的内容」（非属主答了 ask_user / 所有者空 @ 引用别人）时调用方在送达前补登了中途标记，
+    // 正常 run 由 consumeChatRun 的 finally 清；但起会话阶段失败 / 被停 / 换实例等**没走到 consume** 的出口没人清——
+    // 标记会一直挂着（至多 TTL，run 探针还会因后继的活 run 续命），属主的下一轮 desktop_* / set_owner_note 被误拒（第三轮评审）。
+    // 按名只清 midRun 那种。已经交给 consumeChatRun 的（handedToConsume）不在这里清：consume 的 finalize / finally 会清，
+    // 而 finished 出口 finalize 里 flush 已被触发，排队的外来内容（foreignContentTurn）可能已为「下一轮」登记了新标记，
+    // 这里再按名清会把它误清（第五轮评审 N1）。
+    // 例外：表里已经是别的实例了（isChatSlotHeldByOtherInstance）——本启动是被摘出表的（restart 强清 / error 收尾 / 重连让位…），
+    // 新会话趁空窗起来并为新的外来内容登记了标记；而「首包 send 挂起 → 被强清 → 新会话起来并登记 → 本函数才从迟到的 send 里醒来」正是这个 finally，
+    // 按名清会误清新会话的标记（第七轮评审 N1；第八轮评审 N2 起判据从「被 restart 摘的」放宽成「表里是别人」，不再只认 restart）。
+    // myInstanceId 是启动时定死的号：myRec 已可能不在表里，表里的是谁、和我是不是同一个，只能靠号比
+    if (!handedToConsume && !isChatSlotHeldByOtherInstance(task.id, myInstanceId)) endMidRunForeignContent(task.id);
   }
   return "started";
 };
@@ -2238,6 +2428,8 @@ export const resumeChatSession = async (
       disabledMcpServers: task.disabledMcpServers ?? [],
       repoPaths: [...(task.repoPaths ?? [])],
       providerId,
+      // 与下面 registerChatNotifier 登记的是同一个 token（R19-2：finished 收尾据它发现 stop 已摘走表里的 token）
+      callerToken,
       // claim 态没有真 run，stop（cancelChatRun 见 runActive 走 cancel）
       // 必须真正摘除本实例并记录 cancelled——owner 稍后 send 因 instanceId 不匹配
       // 整段 no-op，路由凭 cancelled 标记识别「用户已停止」、不再降级起新会话重放消息，
@@ -2640,6 +2832,20 @@ const runReconnectAttempt = async (
         meta: { kind: "reconnected", attempt },
       },
     );
+    // 上面闭合工具 / 落「重连成功」事件两个 await 是让出点：stop（claim 的 cancel 摘表）/ forceClear + 新会话都可以落在这里，
+    // 而 consumeChatRun 入口取的 rec 是「此刻表里的那个」——不复查就会把别人的实例当成本实例（A 的 run 接到 B 的记录上、改写它的 currentRun / cancel），
+    // 或表空时无主地一路消费到底（第八轮评审 P3-5）。与上面 send 受理后的复查同口径：丢弃迟到 run，
+    // stop 方 / 新实例已各自负责收尾，返 true 跳过失败路径
+    const curBeforeConsume = runningChats.get(task.id);
+    if (isCancelled() || !curBeforeConsume || curBeforeConsume.instanceId !== claimedInstanceId) {
+      void run.cancel().catch(() => {});
+      closeChatSession(task.id, claimedInstanceId);
+      consumeChatClaimCancelled(task.id, claimedInstanceId);
+      console.warn(
+        `[chat-runner] task=${task.id} 重连成功事件落盘期间实例 #${claimedInstanceId} 已被停止/替换、丢弃迟到 run`,
+      );
+      return true;
+    }
     await consumeChatRun(fresh, run, undefined, attempt, reconnectTotal);
     return true;
   } catch (sendErr) {
@@ -2677,6 +2883,12 @@ type FinalizeChatOutcome = "finished" | "cancelled" | "error";
 type FinalizeChatRunCtx = {
   task: Task;
   err?: unknown;
+  /**
+   * 出参：finished 收尾已在放 runActive 之前清过这一轮的「中途登记」标记。
+   * consumeChatRun 的 finally 据此跳过它那次兜底的按名清除——finalize 里 flush 已被触发，排队的外来内容
+   * 可能已经为「下一轮」登记了新标记（第五轮评审 N1），按名清会把它误清掉。
+   */
+  midRunMarkCleared?: boolean;
 };
 
 /**
@@ -2726,6 +2938,28 @@ const finalizeChatRunIfCurrent = async (
     // 写盘 await 后失主 → 不 publish / 不 flush（避免清 B 前端 streaming）
     if (!isCurrent()) return false;
     // 与下面 publish(done) / flush 之间不得再 await（新 send 只能在 done 发出之后才拿得到 idle）
+    // 这一轮「中途登记」的标记（别人的内容送进了这一轮）到此为止：必须在放 runActive **之前**、同一个同步段里清。
+    // 放掉 runActive 之后 flush 就可能把排队的外来内容送出去（sendChatMessage 内会为它登记**下一轮**的标记）；
+    // 清除若留给 consumeChatRun 的 finally（在 finalize 返回之后），登记与清除谁先谁后就只靠「微任务先于磁盘 IO」凑巧，
+    // 一旦反过来就是外来内容无标记送达（第五轮评审 N1：排队方案成立的前提）。
+    // 清过要告诉 consumeChatRun（ctx.midRunMarkCleared）：它 finally 里那次兜底的按名清不能再做——到那时 flush 可能已为下一轮登记了新标记
+    endMidRunForeignContent(taskId);
+    ctx.midRunMarkCleared = true;
+    // 与放 runActive 同一个同步段里复查「本会话的 token 还在不在表里」（第十九轮评审 R19-2）：stop 一开始就同步摘了表里的 token（stop-task 的
+    // invalidateCallerToken，首个 await 之前），而摘会话的 cancelChatRun 要等好几个 await 之后——它若恰好落在上面写盘那个 await 里，
+    // 看到的是 runActive=true、只发了 rec.cancel()（对一个已经结束的 run 是空操作），下面又把会话「保留」下来：留下一个没有 token / notifier 的空壳，
+    // 属主之后的 desktop_* / browser_evaluate / schedule / ask_user 全回「任务已被新 agent 接管」，要等下一次 stop / 换模型才自愈。
+    // token 已不是我的 = 这一轮是在被停止的途中收的尾：按停止的本意处理——关会话（保留落盘锚点：下一条消息 Agent.resume 接回、重新登记 token），
+    // 不再 flush / drain / 回收计时（攒着的后台结果由 closeChatSession 作废并写「未送达」）。stop 之后才到的 cancelChatRun 见表里没会话，返回 false，无副作用。
+    // 对照：token 复查之后才被摘的情形（stop 的 invalidate 排在这个同步段之后）没有问题——那时会话已是空闲，cancelChatRun 走「idle 会话 → 直接关」。
+    // ⚠️ 这里**不清队**（第二十轮评审 R20-1：第十九轮在这里写过 `failQueuedItems(cancelled)`，是 R19-2 自己带出的回归）：
+    // 队里排着的话要由 **stop 自己**取走原文、落「已停止，N 条排队消息未送达」那张卡——stop-task 在 cancelChatRun 之后
+    // `failQueuedItemsCapturingTexts(id, "stopped")` 同步取文本再清、紧接着 `noticeTalkQueueDropped` 写卡（count=0 不写卡）。
+    // 而 stop 摘 token（首个 await 之前）到它取文本之间隔着好几个 await（等半截输出落盘 / 资源任务收尾 / failpoint）：这个分支若恰好在这段空窗里先清队，
+    // 文本就取不到、队已空、卡不写——排队的话气泡消失、没有卡也没有任何提示（chat-view 对 queue_failed 只清气泡，告知全靠服务端那张卡）。
+    // 不清队没有代价：chat 会话 token 的摘除方只有两个——stop（之后一定走取文本 + 清队）和 DELETE（`cleanupChatTaskState`，它在那之前已 `failQueuedItems(deleted)`、队本来就空）；
+    // 取文本若发生在本分支**之前**，队同样是空的，这里什么都不用做。
+    const stopRacedWithFinish = isRegisteredCallerTokenRevoked(taskId, rec.callerToken);
     rec.runActive = false;
     if (doneTask) publish(taskId, { kind: "task", task: doneTask });
     publish(taskId, {
@@ -2733,6 +2967,10 @@ const finalizeChatRunIfCurrent = async (
       task: doneTask ?? ctx.task,
       ok: true,
     });
+    if (stopRacedWithFinish) {
+      closeChatSession(taskId, instanceId, { keepPersisted: true });
+      return true;
+    }
     void flushChatQueue(taskId);
     // 这一轮结束期间到达、没来得及插进去的后台子代理结果：现在送（空闲则唤醒一轮）
     void drainBackgroundResults(taskId);
@@ -2835,6 +3073,10 @@ const finalizeChatRunIfCurrent = async (
     ok: false,
   });
   publish(taskId, { kind: "error", message: eventText });
+  // 摘表之后、清队通知落盘（IO）之前的空窗：表是空的，新会话可以在这里起来并登记自己的外来内容标记；
+  // 本实例的 consumeChatRun finally 在 finalize 返回之后才按名清标记，必须认得出「表里已是别人」（第八轮评审 P3-2）。
+  // 插桩：测试按此名在空窗里起新会话（生产零开销，见 failpoints.ts）
+  await failpoint("chat.finalize.error.afterClose");
   await noticeQueuedItemsDropped(taskId, dropped);
   return true;
 };
@@ -3077,6 +3319,36 @@ const finalizeReconnectGaveUp = async (
   return true;
 };
 
+/**
+ * finalizeReconnectGaveUp 的兜底包装（第四轮评审）：它自己也要写盘（闭合未配对工具调用 / 把 running 落成 error），
+ * 写盘抛错（EACCES / EIO / 磁盘满 / 任务目录刚被删）以前会一路冒出 consumeChatRun——调用方的 .catch 只记日志，
+ * 结果前端收不到 done、streaming 一直卡着，排队的消息既没发也没通知（与 finalizeChatRunSafely 对常规收尾做的兜底是同一类问题）。
+ * 这里同口径兜底：表里仍没有任何会话才清队 + 发 done / error + 通知（用户退避期间新起了实例 B 就绝不碰它的队和状态）；
+ * runStatus 若因同一个 IO 故障没写成，留给下次启动的 boot-recovery。
+ * @returns 同 finalizeReconnectGaveUp；兜底路径恒为 false（状态没能落盘）
+ */
+const finalizeReconnectGaveUpSafely = async (
+  task: Task,
+  err: unknown,
+): Promise<boolean> => {
+  try {
+    return await finalizeReconnectGaveUp(task, err);
+  } catch (finErr) {
+    console.error(
+      `[chat-runner] task=${task.id} 自动重连放弃的收尾抛错、兜底清队并让前端收尾:`,
+      finErr,
+    );
+    if (runningChats.has(task.id)) return false;
+    const message = err instanceof Error ? err.message : String(err ?? "");
+    const eventText = `自动重连失败、会话已中断：${summarizeRunFailure(message, err).text}`;
+    const dropped = failQueuedItemsCapturingTexts(task.id, "error");
+    publish(task.id, { kind: "done", task, ok: false });
+    publish(task.id, { kind: "error", message: eventText });
+    await noticeQueuedItemsDropped(task.id, dropped);
+    return false;
+  }
+};
+
 // run 失败的统一收尾：收口到 finalizeChatRunIfCurrent
 // expectedInstanceId：旧 run 收尾带上实例门控；失主（含 map 空）整段 no-op
 const handleChatRunFailure = async (
@@ -3111,6 +3383,8 @@ const consumeChatRun = async (
   // 而 task 侧早就是「恢复后归零」（reconnect-budget.ts 是两边共用的口径）
   const reconnectBudget = createReconnectBudget(reconnectAttempt);
   let cancelled = false;
+  // finished 出口的收尾 ctx：finalize 清过中途标记会回写 midRunMarkCleared，finally 据此跳过兜底清除（见 FinalizeChatRunCtx）
+  const finishedFinalizeCtx: FinalizeChatRunCtx = { task };
   // 24h 硬超时：跟用户点停止分开，未答提问打 askExpired（UI「已过期」）
   let hardTimedOut = false;
   let hardTimer: NodeJS.Timeout | null = null;
@@ -3249,9 +3523,7 @@ const consumeChatRun = async (
     );
 
     // 自然 finished 也必须查 instance——旧实现完全不查、空窗可覆盖 B
-    await finalizeChatRunSafely(task.id, myInstanceId, "finished", {
-      task,
-    });
+    await finalizeChatRunSafely(task.id, myInstanceId, "finished", finishedFinalizeCtx);
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
     cancelEscape.dispose();
@@ -3330,14 +3602,45 @@ const consumeChatRun = async (
       }
       if (slotGone) {
         console.error("[chat-runner] task", task.id, "自动重连放弃:", giveUpErr);
-        await finalizeReconnectGaveUp(task, giveUpErr);
+        await finalizeReconnectGaveUpSafely(task, giveUpErr);
       } else {
         await handleChatRunFailure(task, giveUpErr, myInstanceId);
       }
     }
   } finally {
+    // 这一轮里「中途登记」的非属主标记（非属主答了 ask_user，答案送进这一轮 / 触发了这一轮）到此为止：
+    // 按名清（只清 midRun 那种），属主下一轮的工具不再受它限制。chat 没有「send 起点登记」的标记，所以这里清的就是全部。
+    // finished 出口 finalize 已在放 runActive 之前清过（finishedFinalizeCtx.midRunMarkCleared）→ 这里不能再清第二次：
+    // finalize 里 flush 已被触发，排队的外来内容（foreignContentTurn）可能已为「下一轮」登记了新标记，按名清会把它误清（第五轮评审 N1）。
+    // 其余出口（取消 / 报错 / 重连放弃 / finalize 抛错的兜底关会话）没有走到那次清除，仍在这里清。
+    // 例外：表里已经是别的实例了（isChatSlotHeldByOtherInstance）——本实例是被摘出表的，到这里时新会话已经起来、
+    // 并为新的外来内容登记了标记，按名清会把它误清。摘表的原因不止 restart：
+    //   · restart（懒重启 / 强清）：cancel 卡住没按期退的旧 run，收尾天然比新会话晚（第七轮评审 N1；restart 的摘表者还会当场清旧会话那一个）；
+    //   · reconnect 让位：重连退避窗口里表是空的，新会话趁虚而入，重连链醒来看见别人、让位 return true，旧 run 带着 replacedReason=reconnect 走到这里（第八轮评审 N2）；
+    //   · error 收尾：摘表之后还要落清队通知（IO），空窗里新会话可以起来（第八轮评审 P3-2）。
+    // 所以判据是「表」而不是 replacedReason。myInstanceId 取自入口那一刻的 rec（没有 rec = -1，表里有谁都算别人）
+    if (finishedFinalizeCtx.midRunMarkCleared !== true && !isChatSlotHeldByOtherInstance(task.id, myInstanceId)) {
+      endMidRunForeignContent(task.id);
+    }
     noteTurnWrapUp(task.id, rec?.agentId, ctx, streamEndedAt);
   }
+};
+
+/**
+ * fire-and-forget 地跑 consumeChatRun（sendChatMessage 受理后立刻返回、run 在后台跑完）。
+ *
+ * consumeChatRun 内部已 try/catch 包了常规失败，但它的收尾自己也要写盘（落 error 事件 / 改 runStatus / 闭合未配对的工具调用）：
+ * 写盘抛错（EACCES / EIO / 磁盘满 / 任务目录刚被删 → ENOENT）会从 catch 分支里冒出来——调用方是 `void …` 没有 .catch，
+ * 就变成 unhandledRejection，Node 默认会让整个 server 进程退出（第三轮评审：全量测试里出现过一次 ENOENT 的 Unhandled Rejection）。
+ * 与 task-runner 的 consume 兜底同口径（R14 Q7b-02）：只记日志，不往外冒。
+ */
+const consumeChatRunDetached = (task: Task, run: ChatRun): void => {
+  consumeChatRun(task, run).catch((err: unknown) => {
+    console.error(
+      `[chat-runner] task=${task.id} consumeChatRun 收尾时出错（已忽略，只记日志）:`,
+      err,
+    );
+  });
 };
 
 // ----------------- V0.11：sendChatMessage（续接存活会话） -----------------
@@ -3653,6 +3956,10 @@ const steerChatRunInner = async (
  *   forceClear 换新）时整段 no-op：不 send、不碰当前 record、也没有可
  *   释放的 claim。匹配场景下所有非 sent 的早退路径必须先释放认领，
  *   否则会话永远假 busy、消息只进队无人消费。
+ * @param opts.foreignContentTurn 这条消息的内容出自别人（队列里排着的外来内容出队，见 QueuedChatMsg.foreignContentTurn，
+ *   第五轮评审 N1）：在 `agent.send` 之前一刻、同步登记 scope=desktop 的中途标记；没送出去的出口（send 抛错 / 被停 / 实例被换）
+ *   用让位版 `rollbackForeignContentMidRun(task.id, token)` 回滚（登记之后被别路沿用过、且此刻有 run 在跑就让位，其余照清；不是按 token 硬清，
+ *   第十四轮评审 P3-1；第十六轮评审 P3-D1 订正此前「按 token 回滚」的说法），送出去的由这一轮 consumeChatRun 的 finally 清。此刻已有活标记 → 沿用它、不降级，回滚时也不误清它。
  * @returns 见 {@link SendChatMessageResult}；只有 `sent` 表示送达
  */
 export const sendChatMessage = async (
@@ -3660,7 +3967,7 @@ export const sendChatMessage = async (
   text: string,
   imagePaths?: string[],
   attachmentPaths?: string[],
-  opts?: { ownerInstanceId?: number },
+  opts?: { ownerInstanceId?: number; foreignContentTurn?: boolean },
 ): Promise<SendChatMessageResult> => {
   const ownerInstanceId = opts?.ownerInstanceId;
   const rec = runningChats.get(task.id);
@@ -3735,6 +4042,8 @@ export const sendChatMessage = async (
     cancelBeforeSend();
   };
 
+  // 外来内容（opts.foreignContentTurn）登记出来的中途标记 token；沿用已有标记 / 没登记 / 非外来时为 undefined（回滚是 no-op）
+  let foreignToken: string | undefined;
   let run: ChatRun;
   try {
     const prompt = composeChatPrompt(text, imagePaths, attachmentPaths);
@@ -3745,6 +4054,9 @@ export const sendChatMessage = async (
       promptBytes: Buffer.byteLength(prompt, "utf-8"),
       model: rec.model,
     });
+    // 外来内容：标记紧贴 agent.send 登记——agent 一拿到内容就可能调工具，必须先就位；
+    // 与下面 agent.send 之间不得有 await（登记之后再让出一次事件循环，上一轮 run 的收尾就可能把它按名清掉）
+    if (opts?.foreignContentTurn === true) foreignToken = beginForeignContentMidRun(task.id);
     run = await withSdkDeadline(
       rec.agent.send(prompt, {
         onDelta: composeOnDelta(
@@ -3769,6 +4081,10 @@ export const sendChatMessage = async (
     perfTracker.attachRun(run);
   } catch (err) {
     rec.runActive = false;
+    // 没送出去：外来内容登记的标记不能留着挡属主的下一轮（只回滚自己登记的那个 token；沿用别人的标记时 token 为 undefined、不误清）。
+    // 走「让位版」回滚（第十四轮评审 P3-1；不是按 token 硬清）：await agent.send 期间用户可以 stop——摘表之后别路的外来内容进得来、沿用这个标记（shared），
+    // 那一轮只靠它受限；A 迟到的失败出口不能把它一起清掉。runActive 已在上一行复位：本实例自己不会被探针算成「有 run 在跑」
+    rollbackForeignContentMidRun(task.id, foreignToken);
     console.error(`[chat-runner] sendChatMessage: task=${task.id} send 失败`, err);
     // 用户 stop 导致的抛错按用户主动关；其余是 send 自己失败，仍在跑的后台子代理会被取消——让用户看得见
     // ⚠️ 这条 reason=error 的关闭**不是** run 出错收尾：它不清队、不并入 inflightSteers（那是 finalize error / 兜底做的）。
@@ -3799,6 +4115,10 @@ export const sendChatMessage = async (
       //（claim record 的 cancel 已自行摘表 + 落 cancelled 标记、此处门控 no-op）
       closeChatSession(task.id, rec.instanceId);
     }
+    // 迟到 run 被丢弃、没有 consume 来收尾：外来内容登记的标记在这里回滚（第十四轮评审 P3-1：让位版，不是按 token 硬清）。
+    // 顺序有讲究：先摘本实例、再回滚——本实例自己还没摘的 runActive=true 记录会被探针算成「有 run 在跑」，
+    // 让位之后没人为这个标记收尾（孤儿）；摘了之后探针答的才是「别路的 run」（沿用者在跑 → 让位给它的收尾；没有 → 照清）
+    rollbackForeignContentMidRun(task.id, foreignToken);
     const wasCancelled =
       consumeChatClaimCancelled(task.id, rec.instanceId) || cancelledDuringSend;
     console.warn(
@@ -3817,12 +4137,14 @@ export const sendChatMessage = async (
   try {
     runningTask = await setTaskRunStatus(task.id, "running");
   } catch (statusErr) {
+    // 写失败不改变「agent 已受理」这个事实，照旧往下 consume 并返回 sent——但**不能在这里直接 consume**：
+    // 这个 await 期间 stop / forceClear 同样可以到达，而 consumeChatRun 入口取的 rec 是「此刻表里的那个」，
+    // 可能是别人的实例（A 的 run 被接到 B 的记录上、改写 B 的 currentRun / cancel）或没有记录（无主地一路消费到底）。
+    // 所以落到下面同一道复查（第八轮评审 P3-5）；runningTask 留 null = 不 publish task
     console.error(
       `[chat-runner] sendChatMessage: task=${task.id} 置 running 失败（agent 已受理）:`,
       statusErr,
     );
-    void consumeChatRun(task, run);
-    return "sent";
   }
   // 上面 await 期间 stop / forceClear 仍可到达——此时
   // consumeChatRun 尚未接管（rec.cancel 还是共享闭包），若不复查就 return "sent"，
@@ -3832,7 +4154,9 @@ export const sendChatMessage = async (
     !curAfterStatus || curAfterStatus.instanceId !== rec.instanceId;
   if (cancelledDuringSend || goneAfterStatus) {
     void run.cancel().catch(() => {});
+    // 同上：迟到 run 被丢弃、没有 consume 来收尾——先摘本实例、再让位版回滚（顺序与理由见上一处）
     if (!goneAfterStatus) closeChatSession(task.id, rec.instanceId);
+    rollbackForeignContentMidRun(task.id, foreignToken);
     const wasCancelled =
       consumeChatClaimCancelled(task.id, rec.instanceId) || cancelledDuringSend;
     // 回滚 idle 与 finalize 同口径——条件进锁内/finalGuard，提交瞬间复查 map 仍空；
@@ -3849,7 +4173,7 @@ export const sendChatMessage = async (
     return wasCancelled ? "cancelled" : "owner_invalid";
   }
   if (runningTask) publish(task.id, { kind: "task", task: runningTask });
-  void consumeChatRun(task, run);
+  consumeChatRunDetached(task, run);
   return "sent";
 };
 
@@ -3861,6 +4185,11 @@ export const sendChatMessage = async (
  *   2. 内存无会话但有 sessionAgentId + bootArgs → resume 后再 send
  *   3. 仍接不回 → 凭 bootArgs 起新会话、答案作首条 firstMessage
  *
+ * @param opts.foreignContentTurn 答案出自别人（非属主答 ask_user / 所有者答案里引用了别人的消息，见 ask-inject）：
+ *   标记**在每条送达路径里紧贴 agent.send 登记**（sendChatMessage / runChatSession 各自的 foreignContentTurn；sendChatMessage 没送出去的出口用让位版
+ *   `rollbackForeignContentMidRun` 回滚，不是按 token 硬清，第十六轮评审 P3-D1 订正此前「按 token 回滚」的说法；runChatSession 自己丢弃 token、靠 finally 按名清），
+ *   不由调用方在入口早登记——入口到送达之间隔着 resume（MCP 探活 + Agent.resume，秒级）、置 running 等一串 await，
+ *   上一个实例的收尾（endMidRunForeignContent 按名清）插进来就把早登记的标记清了，答案在无标记状态下送达（第八轮评审 P3-1；chat-inject 早就是这个做法）。
  * @returns false = 没凭据起不了新会话、调用方报错让用户用输入条唤醒
  */
 export const deliverChatAskReply = async (
@@ -3868,14 +4197,18 @@ export const deliverChatAskReply = async (
   replyText: string,
   imagePaths?: string[],
   bootArgs?: { apiKey?: string; model?: ModelSelection },
+  opts?: { foreignContentTurn?: boolean },
 ): Promise<boolean> => {
   // rewind 窗口内绝不能走 resume / 起新会话，直接返 false 让用户稍后用输入条答复
   if (isChatRewindInProgress(task.id)) {
     return false;
   }
+  const foreign = opts?.foreignContentTurn === true;
+  /** 每次 sendChatMessage 都带上：登记点在它里面（agent.send 前一刻），没送达它自己回滚 */
+  const foreignSendOpts = foreign ? { foreignContentTurn: true } : undefined;
   // 1) 存活会话直接 send
   if (hasChatSession(task.id)) {
-    const sent = await sendChatMessage(task, replyText, imagePaths);
+    const sent = await sendChatMessage(task, replyText, imagePaths, undefined, foreignSendOpts);
     if (sent === "sent") return true;
     // send pending 期间被 stop / 实例被替换 → 终态，
     // 不得落到下面 resume / 新会话把答案在「已停止」之后重放
@@ -3906,7 +4239,7 @@ export const deliverChatAskReply = async (
         replyText,
         imagePaths,
         undefined,
-        { ownerInstanceId: claimedInstanceId },
+        { ownerInstanceId: claimedInstanceId, ...(foreign ? { foreignContentTurn: true } : {}) },
       );
       if (sent === "sent") return true;
       // K1/L2：claim 被用户 stop 摘除 / 实例被替换 → 取消是终态，
@@ -3920,7 +4253,7 @@ export const deliverChatAskReply = async (
   if (apiKey === undefined || !model) return false;
   if (hasChatSession(task.id)) {
     // race：resume 后别处又起了 run → 再试一次 send
-    return (await sendChatMessage(task, replyText, imagePaths)) === "sent";
+    return (await sendChatMessage(task, replyText, imagePaths, undefined, foreignSendOpts)) === "sent";
   }
 
   // 与 chat-reply 模式 2 同口径——起新会话前同步占启动 lease，
@@ -3928,7 +4261,7 @@ export const deliverChatAskReply = async (
   const startToken = tryReserveChatStart(task.id);
   if (startToken === null) {
     if (hasChatSession(task.id)) {
-      return (await sendChatMessage(task, replyText, imagePaths)) === "sent";
+      return (await sendChatMessage(task, replyText, imagePaths, undefined, foreignSendOpts)) === "sent";
     }
     return false;
   }
@@ -3945,8 +4278,12 @@ export const deliverChatAskReply = async (
     // runChatSession 开头的幂等 return 会**静默吞掉 firstMessage**（答案丢失且无
     // 错误事件、调用方却报成功）。复查一次、已有会话就改走 send 续接。
     if (hasChatSession(task.id)) {
-      return (await sendChatMessage(task, replyText, imagePaths)) === "sent";
+      return (await sendChatMessage(task, replyText, imagePaths, undefined, foreignSendOpts)) === "sent";
     }
+    // 返回 true = 「已受理、会话在后台起」，不是「答案已经送进 agent」：runChatSession 是 fire-and-forget（与 chat-reply 模式 2 同口径），
+    // 起会话失败（lease 失效 / Agent.create 抛错 / 首包期间被停止）走 runChatSession 自己的出口——发 error 事件、收尾 runStatus、
+    // 按名清中途标记——而不是改调用方拿到的返回值，这里只 console.error 一行。真要「等会话建好再报成功」得改调用方的时序
+    // （第五轮评审记过这一条，没改：那会让每次答 ask 的请求多等一次 Agent.create）。
     void runChatSession({
       task: runningTask,
       apiKey,
@@ -3956,6 +4293,8 @@ export const deliverChatAskReply = async (
         imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
       },
       startToken,
+      // 答案出自别人：首包 agent.send 前一刻由 runChatSession 自己登记标记，起会话阶段失败的出口它自己的 finally 清（第八轮评审 P3-1）
+      ...(foreign ? { foreignContentTurn: true } : {}),
     }).catch((err) => {
       console.error(
         `[chat-runner] deliverChatAskReply runChatSession task=${task.id} failed:`,
@@ -4173,11 +4512,14 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         // 测试可在 persisted 后、send 前挂起（注入 stop / owner 失效）
         await failpoint("flushChatQueue.afterPersist");
 
+        // 外来内容（所有者空 @ / 一句话再引用别人，入队时带的 foreignContentTurn）：标记由 sendChatMessage 在 agent.send 前一刻登记、
+        // 没送出去时它自己回滚；这里只管透传，别在这一行之前自己登记（上面有落盘 / failpoint 的 await，会被上一轮收尾按名清掉）
         const sent = await sendChatMessage(
           task,
           msg.agentText || msg.displayText,
           msg.imageAbsPaths,
           msg.attachmentAbsPaths,
+          msg.foreignContentTurn === true ? { foreignContentTurn: true } : undefined,
         );
         if (sent !== "sent") {
           // 未 handoff → skipPersist 重排（禁止先记 delivered）
@@ -4260,6 +4602,7 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
  *  - 事件流先落一行给用户看的提示（正文只交给主 AI、由它转述，避免长输出刷屏）。
  *    这行落在结果真正进 send 之前，所以只说「将转交」、不能说「已交给」；之后若没送成
  *    （会话关了 / 重连放弃 / 被停止）由关会话 / 重连链尾另写一句「未送达」，不留假提示；
+ *    外来来源（群里非所有者触发的一轮派出的）的结果，提示里多一句「若此刻是所有者自己的一轮在跑会等它结束后单独转交」，真被扣留时 drain 另落一行（第十九轮评审 R19-4）；
  *  - 主 AI 空闲：唤醒一轮（sendChatMessage，不落用户气泡——这不是用户说的话）；
  *  - 主 AI 在忙：能 steer 就插进当前这一轮，否则攒着、这一轮收尾时再送。
  * 被取消的（停止 / 关会话 / 删任务）没人要结果，直接丢。
@@ -4302,7 +4645,10 @@ const deliverBackgroundSubagentResult = async (
     return;
   }
   const list = pendingBackgroundResults.get(taskId) ?? [];
-  list.push(formatBackgroundSubagentMessage(evt));
+  // 外来来源（派出那一刻处在外来内容驱动的一轮）的结果带队内前缀入队：队列 / 暂存 / putBack 这套管道照旧是纯字符串，
+  // 送出点（drainBackgroundResults）据前缀决定「能不能 steer / 要不要带标记唤醒」，并在送进 agent 之前剥掉
+  const message = formatBackgroundSubagentMessage(evt);
+  list.push(evt.foreignOrigin === true ? markForeignOriginResult(message) : message);
   pendingBackgroundResults.set(taskId, list);
   await drainBackgroundResults(taskId);
 };
@@ -4346,8 +4692,39 @@ export const drainBackgroundResults = async (taskId: string): Promise<void> => {
 
   if (rec.runActive) {
     // 忙：能 steer 就插进当前这一轮（AI 当前步骤结束后读到），否则等这一轮收尾（finalize 会再调本函数）
-    if (!canSteerChatRun(taskId)) return;
-    const batch = queued.splice(0);
+    if (!canSteerChatRun(taskId)) {
+      // R20-3：不能 steer 时整批都等收尾，其中外来来源的那几条在「所有者自己的一轮」（无活标记）里同样是被扣留，
+      // 要和下面能 steer 的分支一样落扣留提示（noteForeignResultsHeld 去重）；否则用户只见过到达时的「将转交」，
+      // 这一轮若被停止 / 出错，接着看到的就是「未送达」。活标记在 = 这一轮本来就是带标记的、收尾后照常带标记送出，不算扣留
+      if (!isGroupNonOwnerTurnActive(taskId)) {
+        noteForeignResultsHeld(taskId, rec, queued.filter(isForeignOriginResult).length);
+      }
+      return;
+    }
+    // 外来来源的结果（派出它的那一刻是外来内容驱动的一轮，见 BackgroundSubagentEvent.foreignOrigin；第十八轮，第十六轮评审 P3-C1 / F3 的收口）：
+    // 它是陌生人写的内容的衍生物，只能进「带标记」的一轮。与 sendQueuedChatMessageNow 对外来内容「不 steer」同一把尺子：
+    //  · 这一轮此刻已有活标记（还是那一轮外来内容驱动的、或别路中途登记的）→ 照常 steer 进去，标记本来就罩着这一轮的后半程；
+    //    顺手 beginForeignContentMidRun「加入」它（返回 undefined、只把标记置 shared）——登记者之后若回滚（直送没送达等），让位而不是把我们靠着的标记清掉；
+    //  · 没有活标记（属主自己的一轮，外来的那一轮早收尾了）→ 外来来源的**不 steer**：留在队里，这一轮收尾时 finalize 会再调本函数，
+    //    走下面「空闲：唤醒」那一支带 foreignContentTurn 送出。属主来源的（不带前缀）不受影响，照常 steer。
+    // 扣留（第十九轮评审 R19-4，按推荐定为设计、不设时间上限）：它等的是「没有所有者的一轮在跑、且用户排的队空了」——条件一满足就送；所有者连续排队发话时一直让位于用户（与 R14 Q8-01 同一原则）。
+    // 上限只有会话寿命：会话被关 / 回收 / 重启 / 这一轮被停止 → 随会话作废并写「N 条未送达」。为免用户看不见中间这一步，首次扣留时落一行 info（noticeForeignBackgroundResultsHeld，按 rec.foreignHeldNoticed 去重）。
+    // 可逆：把下面的分支改回无条件 steer 即回到第十八轮之前的行为（那样外来来源的结果会进无标记的所有者一轮，正是 F3 要堵的）。
+    const markerLive = isGroupNonOwnerTurnActive(taskId);
+    let batch: string[];
+    if (!markerLive && queued.some(isForeignOriginResult)) {
+      const held = queued.filter(isForeignOriginResult);
+      batch = queued.filter((m) => !isForeignOriginResult(m));
+      // 原地改（queued 就是表里那个数组）：外来来源的留着，剩下的才送
+      queued.splice(0, queued.length, ...held);
+      // R19-4：扣留不能无声无息——首次扣留（或之后又多了新的外来来源结果）落一行 info；按 foreignHeldNoticed 去重，同一批不重复提示
+      noteForeignResultsHeld(taskId, rec, held.length);
+      if (batch.length === 0) return;
+    } else {
+      batch = queued.splice(0);
+      if (batch.some(isForeignOriginResult)) beginForeignContentMidRun(taskId);
+      rec.foreignHeldNoticed = 0;
+    }
     // 主 AI 若正睡在 `wait` 里（典型：派了后台子代理、然后「等一会儿」等它们），steer 要等它这一步结束才送得进去，
     // 结果会被睡眠压住（最长 30 分钟，恰好等于下面的总期限）。后台结果正是它在等的新信息：叫醒它，
     // 它读到 [WAIT_INTERRUPTED] 后就能处理这批结果；还要等别的再调一次 wait 即可。
@@ -4361,7 +4738,7 @@ export const drainBackgroundResults = async (taskId: string): Promise<void> => {
     // 会话与这一轮都还在，SDK 之后仍可能读到这批结果。措辞要如实：不写「已被停止或关闭」，
     // 也不沿用面向用户插话的「一条插话…」（这批不是用户说的话），由这里按后台结果的口径写
     const steerState = { timedOut: false };
-    const outcome = await steerChatRun(taskId, batch.join(SEP), {
+    const outcome = await steerChatRun(taskId, joinResultsForAgent(batch, SEP), {
       onTimeout: () => {
         steerState.timedOut = true;
       },
@@ -4426,6 +4803,7 @@ export const drainBackgroundResults = async (taskId: string): Promise<void> => {
     return;
   }
   const batch = queued.splice(0);
+  rec.foreignHeldNoticed = 0;
   // 这批已 splice 出队、到达时也落过「将转交」，只有本函数手里拿着它：读任务抛错（meta 半写 / EIO）时
   // 不能让异常把它带走——外层只会 console.warn，用户就以为交给了主 AI，实际悄悄没了。如实补一句「未送达」
   let task: Task | null;
@@ -4438,14 +4816,26 @@ export const drainBackgroundResults = async (taskId: string): Promise<void> => {
   }
   // 任务已删除 / tombstone：没有人在看这条事件流了，不再提示
   if (!task) return;
-  const sent = await sendChatMessage(task, batch.join(SEP));
+  // 批里有外来来源的：这一轮按外来内容轮登记标记（sendChatMessage 在 agent.send 前一刻同步登记、没送达自己回滚；同 chat-inject / 排队的外来内容）。
+  // 混着属主来源的一起送也整轮带标记——宁可多限制一轮，不让外来来源的内容进无标记的一轮
+  const sent = await sendChatMessage(
+    task,
+    joinResultsForAgent(batch, SEP),
+    undefined,
+    undefined,
+    batch.some(isForeignOriginResult) ? { foreignContentTurn: true } : undefined,
+  );
   if (sent === "sent") return;
   if (sent === "cancelled" || sent === "owner_invalid" || sent === "no_session") {
     // 会话没了 / 被停止：结果作废，同样如实告诉用户没送到
     noticeBackgroundResultsDropped(taskId, batch.length, "会话已关闭或被停止");
     return;
   }
-  // busy / send_failed：放回去，等下一次（别人的 run 收尾时会再调）
+  // busy：放回去，等下一次（别人的 run 收尾时会再调）。
+  // send_failed：`sendChatMessage` 在 agent.send 抛错时已经把会话按 error 关掉了，`putBack` 看到会话已换 / 没了，
+  // 会落到「会话已关闭」的作废分支——写一条「未送达」、不复活、不泄给之后的新会话（chat-background-foreign-origin 的 B3 钉着），
+  // 并不是真的放回去等下一次（第十九轮评审 F3 管道复核订正此前把两者都写成「放回去」的注释）。仍统一走 `putBack`，
+  // 是为了让「放回还是作废」只由 `putBack` 里的实例校验决定，不在调用点再分支
   putBack(batch);
   // 例外：busy 是因为 rewind 门闩恰好在上面 getTask 的 await 里占上了——回退若被拒，没有 run 收尾会再调本函数，
   // 等门闩解除后补一次。仅「放回成功（同一实例仍在）+ 空闲」才补：会话已关就轮不到它，run 在跑则等它的收尾 drain

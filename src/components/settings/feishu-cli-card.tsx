@@ -62,6 +62,7 @@ export const FeishuCliSection = ({
   meegleProject,
   onMeegleProjectChange,
   feishuChatBridge,
+  feishuChatBridgeSaved,
   onFeishuChatBridgeChange,
   feishuBridgeStreaming,
   onFeishuBridgeStreamingChange,
@@ -75,6 +76,8 @@ export const FeishuCliSection = ({
   onMeegleProjectChange: (next: MeegleProjectSetting) => void;
   /** 消息桥接全局开关（决策 #3） */
   feishuChatBridge: boolean;
+  /** 总开关的值已落盘（父级的 `!dirty.feishuChatBridge`）：桥接块等它为真才拉状态探测，详见 FeishuBridgeBlock 的同名 prop */
+  feishuChatBridgeSaved?: boolean;
   onFeishuChatBridgeChange: (next: boolean) => void;
   /** 飞书私聊流式回复（默认开） */
   feishuBridgeStreaming: boolean;
@@ -379,6 +382,7 @@ export const FeishuCliSection = ({
         {/* 消息桥接：全局开关 + 引导检查（提案 4.4b） */}
         <FeishuBridgeBlock
           feishuChatBridge={feishuChatBridge}
+          feishuChatBridgeSaved={feishuChatBridgeSaved}
           onFeishuChatBridgeChange={onFeishuChatBridgeChange}
           feishuBridgeStreaming={feishuBridgeStreaming}
           onFeishuBridgeStreamingChange={onFeishuBridgeStreamingChange}

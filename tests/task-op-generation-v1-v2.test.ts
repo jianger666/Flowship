@@ -1244,7 +1244,12 @@ describe("V1/V2/W1–W3 taskOpGenerations + startingTasks + one-shot", () => {
           "idle",
           () => runningTasks.get(id)?.instanceId === aInstanceId,
         );
-        await sleep(30);
+        // 等钩子里的无锁读真的读完：它是一次真实磁盘 IO，固定 sleep(30) 在负载下读不完（这条偶发红过）。
+        // 读发生在 prepareGate 放行之前，所以读到的一定是「挂起期间」的盘上状态
+        await vi.waitFor(() => expect(midReadRunStatus).not.toBeUndefined(), {
+          timeout: 10_000,
+          interval: 10,
+        });
         // 挂起期间无锁读者看到的仍是旧值
         expect(midReadRunStatus).toBe("running");
         releasePrepare();
@@ -1303,7 +1308,11 @@ describe("V1/V2/W1–W3 taskOpGenerations + startingTasks + one-shot", () => {
           () => freshFlag,
           { currentActionId: "act_a", actionStatus: "awaiting_ack" },
         );
-        await sleep(30);
+        // 同上：等钩子里的无锁读读完再断言，不靠固定 sleep（负载下 30ms 读不完会读到 undefined）
+        await vi.waitFor(() => expect(midReadStatus).not.toBeUndefined(), {
+          timeout: 10_000,
+          interval: 10,
+        });
         expect(midReadStatus).toBe("awaiting_ack");
         releasePrepare();
         expect(await p).toBeNull();

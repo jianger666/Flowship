@@ -43,7 +43,9 @@ export const CheckboxRow = ({
   checkboxId,
   children,
 }: Props) => {
-  const locked = disabled || useFormDisabled();
+  // hook 无条件调用（短路 `|| useFormDisabled()` 会让调用顺序随 disabled 变化，S-7）
+  const formDisabled = useFormDisabled();
+  const locked = disabled || formDisabled;
   // 行点击 / 行键盘：直接切受控态（disabled 短路）
   const toggle = () => {
     if (locked) return;

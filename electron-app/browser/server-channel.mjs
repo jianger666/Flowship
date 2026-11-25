@@ -60,10 +60,14 @@ const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v)
  *   proc: { send?: Function, on: Function, off?: Function, removeListener?: Function, connected?: boolean },
  *   dispatch: (op: string, args: object, ctx: { taskId: string, signal: AbortSignal }) => Promise<unknown>,
  *   platform?: string,
- *   onConfig?: (cfg: { recordInputValues?: boolean, evaluateEnabled?: boolean }) => void,
+ *   onConfig?: (cfg: { recordInputValues?: boolean, evaluateEnabled?: boolean, desktopEnabled?: boolean, desktopLockedAccess?: boolean }) => void,
  *   onCancel?: (taskId: string) => void,
+ *   capabilities?: string[],
+ *   onClose?: () => void,
  *   log?: (msg: string) => void,
  * }} deps
+ *   capabilities：除 browser.v1 之外，主进程还能提供的能力（如 desktop.v1），原样放进 hello-ack；server 据此决定注册哪些工具。
+ *   onClose：通道关闭（server 退出 / 断线 / 被新通道取代）时调用一次，用来让依赖这条通道的模块 fail-closed。
  */
 export const createServerChannel = ({
   proc,
@@ -71,6 +75,8 @@ export const createServerChannel = ({
   platform = process.platform,
   onConfig,
   onCancel,
+  capabilities: extraCapabilities = [],
+  onClose,
   log = () => {},
 }) => {
   let closed = false;
@@ -167,7 +173,7 @@ export const createServerChannel = ({
     try {
       switch (msg.kind) {
         case "hello":
-          send({ kind: "hello-ack", platform, capabilities: [...CAPABILITIES] });
+          send({ kind: "hello-ack", platform, capabilities: [...new Set([...CAPABILITIES, ...extraCapabilities])] });
           return;
         case "config":
           if (isObject(msg)) {
@@ -175,7 +181,8 @@ export const createServerChannel = ({
             if (typeof msg.recordInputValues === "boolean") cfg.recordInputValues = msg.recordInputValues;
             if (typeof msg.evaluateEnabled === "boolean") cfg.evaluateEnabled = msg.evaluateEnabled;
             // 增强包 E2（契约 §15）：布尔项只认 boolean；maxTabs 只认 5–60 的整数；缺省 = 不改（沿用主进程默认）
-            for (const k of ["storageAccess", "pagePermissions", "trustLoopbackCerts", "networkBodyRead"]) {
+            // desktopEnabled / desktopLockedAccess：电脑操作（desktop.v1）的两个总开关，同样只认 boolean
+            for (const k of ["storageAccess", "pagePermissions", "trustLoopbackCerts", "networkBodyRead", "desktopEnabled", "desktopLockedAccess"]) {
               if (typeof msg[k] === "boolean") cfg[k] = msg[k];
             }
             if (Number.isInteger(msg.maxTabs) && msg.maxTabs >= 5 && msg.maxTabs <= 60) cfg.maxTabs = msg.maxTabs;
@@ -226,6 +233,11 @@ export const createServerChannel = ({
     closed = true;
     pending.clear();
     detach();
+    try {
+      onClose?.();
+    } catch (err) {
+      log(`[browser-channel] onClose 回调异常：${err?.message || err}`);
+    }
   };
 
   const onMessage = (m) => handleMessage(m);

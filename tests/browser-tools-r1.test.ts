@@ -393,10 +393,13 @@ describe("R1-34：常驻浏览器工具的 description + schema 体量预算", (
     // - R1 阶段：26 个工具总量 ≤ 9000（实测 8723），单个 ≤ 1100。
     // - E2（2026-11-09）：增强包给既有工具加了大量能力（browser_emulate +9 项、browser_network 过滤 / WS / SSE / HAR、browser_save PDF 选项、
     //   browser_screenshot annotate、browser_scroll until_stable / scroll_into_view、browser_inspect 三个 include…），
-    //   26 个工具的总量放宽到 13700（实测 13318，留约 3% 余量）；E2 新增的 9 个工具（permissions / storage / touch / clipboard /
-    //   network_rules / perf / sources / debug / record）单独计 ≤ 9800（实测 9369）；单个工具上限放宽到 1900（browser_emulate 约 1850，是最大的一个）。
+    //   26 个工具的总量放宽到 13700（E2 当时实测 13318，留约 3% 余量）；E2 新增的 9 个工具（permissions / storage / touch / clipboard /
+    //   network_rules / perf / sources / debug / record）单独计 ≤ 9800（E2 当时实测 9369）；单个工具上限放宽到 1900（browser_emulate 约 1850，是最大的一个）。
+    // - 第二十四轮重新实测（同口径：name + description + JSON.stringify(parameters)，evaluateEnabled 开）：26 个 R1 工具 13342（余量约 2.6%）、9 个 E2 工具 9669（余量约 1.3%——
+    //   permissions 等的描述后来陆续加了说明，当初注释里的 9369 早已过时；再往 E2 工具里加描述很快会撞上限，撞到时先问「这句话值不值得每轮 prompt 都带」，别直接抬预算）、
+    //   最大单个 browser_emulate 1848（余量 52 字符）。
     // - 描述仍是 ≤ 2 句（browser-tools.test.ts 守卫）；高级组（browser_network_rules / perf / sources / debug / record）受 browserAdvancedTools 开关控制，
-    //   关掉后每轮 prompt 少约 6.4k 字符（实测 6447，同口径）。
+    //   关掉后每轮 prompt 少约 6.6k 字符（第二十四轮实测 6594，同口径；早先记的 6447 已过时）。
     const r1 = all.filter((t) => BROWSER_TOOL_NAMES.includes(t.name));
     const e2 = all.filter((t) => !BROWSER_TOOL_NAMES.includes(t.name));
     const r1Total = r1.reduce((n, t) => n + sizeOf(t), 0);

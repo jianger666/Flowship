@@ -123,6 +123,35 @@ describe("tab.mjs：session 钩子 / 销毁钩子（源码契约，真行为由�
     expect(src).toMatch(/for \(const hook of \[\.\.\.this\.sessionHooks\]\)[\s\S]{0,200}await hook\(sessionId\)/);
     expect(src).toMatch(/for \(const hook of \[\.\.\.this\.destroyHooks\]\)/);
   });
+
+  it("早钩子（R23-3）：#setupSession 里 #runEarlyHooks 与各域 enable 放进同一个 Promise.all、在 Target.setAutoAttach 之前；destroy 清 earlySessionHooks（真行为见 browser-tab-eval-in-frames.test.ts）", async () => {
+    const src = await fs.readFile(path.join(__dirname, "../electron-app/browser/tab.mjs"), "utf8");
+    expect(src).toMatch(/addEarlySessionHook\(fn\)/);
+    // 钩子逐个跑、出错只记日志（#callEarlyHook 里 try / catch）；真行为（顺序 / 出错不拖垮 / 补调）见 browser-tab-eval-in-frames.test.ts 的 tab.addEarlySessionHook 一组——这里只钉结构，不当行为证据
+    // 第二十五轮 N-3 的两处（循环里每轮先判钩子「还在不在集合里」；#callEarlyHook 开头判 tab 已销毁）**不在这里钉源码形状**（第二十六轮 X-4：此前这里有两条整段复述源码布局的正则，纯格式改动就红）：
+    // 它们由 browser-tab-eval-in-frames.test.ts 的行为用例咬住——两个变异（不判仍在集合 / 不判已销毁）在**只跑那份行为用例**时都被杀（变异记录见 docs/BROWSER-AUTOMATION.md §19.5），正则没有额外的判别力
+    // R24-1：「这个会话已跑过早钩子这一批」的登记要与钩子清单的拷贝在同一段同步代码里（第一个 await 之前）——挪到 await 之后，构造期间 / 刚好此刻登记的钩子就可能既不在拷贝里、又不被补调（漏）或两边都调（重）
+    const runEarly = src.slice(src.indexOf("async #runEarlyHooks(sessionId)"));
+    const runEarlyBody = runEarly.slice(0, runEarly.indexOf("\n  }\n"));
+    const ranAt = runEarlyBody.indexOf("this.earlySessionsRan.add(sessionId)");
+    const copyAt = runEarlyBody.indexOf("[...this.earlySessionHooks]");
+    const firstAwait = runEarlyBody.indexOf("await ");
+    expect(ranAt).toBeGreaterThanOrEqual(0);
+    expect(copyAt).toBeGreaterThanOrEqual(0);
+    expect(firstAwait).toBeGreaterThanOrEqual(0);
+    expect(ranAt).toBeLessThan(firstAwait);
+    expect(Math.abs(copyAt - ranAt)).toBeLessThan(200); // 同一段里（中间没有别的语句边界要紧的东西）
+    const setup = src.slice(src.indexOf("async #setupSession(sessionId)"));
+    const early = setup.indexOf("const early = this.#runEarlyHooks(sessionId)");
+    const all = setup.indexOf("await Promise.all([");
+    const allEnd = setup.indexOf("]);", all);
+    const autoAttach = setup.indexOf('await s("Target.setAutoAttach"');
+    expect(early).toBeGreaterThanOrEqual(0);
+    expect(early).toBeLessThan(all); // 先发起（不 await），再与 enable 并行等
+    expect(setup.slice(all, allEnd)).toMatch(/\bearly\b/); // 同一个 Promise.all 里等它
+    expect(allEnd).toBeLessThan(autoAttach);
+    expect(src).toMatch(/this\.earlySessionHooks\.clear\(\)/);
+  });
 });
 
 describe("server-channel：config 消息解析 E2 新字段", () => {

@@ -11,6 +11,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import { isBrowserToolName } from "@/lib/browser-tool-display";
+import { isDesktopToolName } from "@/lib/desktop-tool-display";
 import { RESERVED_MCP_NAMES } from "@/lib/mcp-config";
 import { isMcpToolName } from "@/lib/mcp-tool-name";
 import { humanizeToolErrorText } from "@/lib/tool-error-text";
@@ -713,7 +714,10 @@ export const OWN_TOOL_PLAIN_FAILURE_PREFIXES: Readonly<
     "创建失败：",
     CALLER_MISMATCH_TEXT,
   ],
-  create_custom_action: ["label 不能为空", "主 skill「", "挂载失败："],
+  // CALLER_MISMATCH_TEXT：过期会话闸（flowship-tools.ts 的 staleSessionDenial）圈着 create_custom_action，而它的 handler 不核对 token——
+  // 被拒时回的就是这句纯文本。以前这张表漏了它，只靠 `isError` 兜着（第二十轮评审 R20-9）：下面 `resolveToolResultStatus` 里 `value.isError` 那一位只对 MCP / 浏览器 / 电脑操作的工具名生效，
+  // Cursor 路径若把自有工具拆成扁平名落事件，这一位就认不出（读码推断，没在真 Cursor 路径里实测）——所以让文本前缀这条独立的判据也认它，和 schedule / ask_user / share_to_group / submit_work 同口径
+  create_custom_action: ["label 不能为空", "主 skill「", "挂载失败：", CALLER_MISMATCH_TEXT],
   wait: ["参数错误："],
   ask_user: [CALLER_MISMATCH_TEXT, "任务已被接管/通知失败、请重试"],
   share_to_group: [CALLER_MISMATCH_TEXT],
@@ -754,7 +758,7 @@ export const resolveToolResultStatus = (
   // 名字一变就认不出 MCP、失败的浏览器操作被落成 success。不会产生假阳性——pi 路径的扁平名结果没有 value 信封，
   // 且这里只在 `isError === true` 时才判 error。
   if (
-    (isMcpToolName(toolName) || isBrowserToolName(toolName)) &&
+    (isMcpToolName(toolName) || isBrowserToolName(toolName) || isDesktopToolName(toolName)) &&
     env?.value &&
     env.value.isError === true
   ) {

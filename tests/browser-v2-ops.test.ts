@@ -478,6 +478,13 @@ describe("ops/read：handlers", () => {
     expect(fs.readFileSync(r.path, "utf8")).toBe("PNGDATA");
   });
 
+  it("save screenshot：op 的 signal 一路传给 tab.screenshot（截图在模拟队列里排队时，op 超时 / 停止后出队不再发 CDP，第九轮评审 P3-3）", async () => {
+    const e = env();
+    const ac = new AbortController();
+    await e.handlers.save("task", { kind: "screenshot", fullPage: false }, ac.signal);
+    expect(e.tab.screenshot).toHaveBeenCalledWith({ fullPage: false, format: "png", maxWidth: 100_000, signal: ac.signal });
+  });
+
   it("save pdf：优先 Page.printToPDF（printBackground 开）；CDP 不可用时退回 webContents.printToPDF；空文件拒绝保存", async () => {
     const cdp = env({ send: (m) => (m === "Page.printToPDF" ? { data: Buffer.from("%PDF-cdp").toString("base64") } : undefined) });
     const r1 = (await cdp.handlers.save("task", { kind: "pdf" }, undefined)) as any;

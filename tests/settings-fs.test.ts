@@ -889,6 +889,8 @@ describe("第七轮 P2-1：收缩判定只看「凭据与列表类」键，无�
     teamKnowledgeEnabled: true,
     feishuChatBridge: true,
     reuseAgentDefault: true,
+    computerUse: true,
+    computerUseLockedAccess: true,
   };
   const SECRETS = [
     FULL.apiKey,
@@ -992,6 +994,8 @@ describe("第七轮 P2-1：收缩判定只看「凭据与列表类」键，无�
     ["feishuBridgeKeepAwake true→false", { feishuBridgeKeepAwake: false }],
     ["feishuChatBridge true→false", { feishuChatBridge: false }],
     ["reuseAgentDefault true→false", { reuseAgentDefault: false }],
+    ["computerUse true→false", { computerUse: false }],
+    ["computerUseLockedAccess true→false", { computerUseLockedAccess: false }],
     ["取消星标模型（starredModels 变空对象）", { starredModels: {} }],
     ["重新启用 skill（disabledSkills 变空）", { disabledSkills: [] }],
     ["重新启用 rule（disabledRules 变空）", { disabledRules: [] }],

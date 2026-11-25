@@ -91,6 +91,7 @@ import {
 } from "@/lib/subagent-spec";
 
 import { getCachedModelOptions, listModelOptions } from "./model-catalog";
+import { isGroupNonOwnerTurnActive } from "./non-owner-turn-guard";
 import { withCursorJsonlStore } from "./sdk-agent-store";
 import {
   SDK_CREATE_RESUME_TIMEOUT_MS,
@@ -290,6 +291,13 @@ export interface CursorSubagentDeps {
      * 界面据此画「子代理在后台干活」条。不得抛（抛了只告警、不影响子代理收尾）。
      */
     onJobsChanged?: () => void;
+    /**
+     * 此刻这个会话是不是处在「群里非属主 / 外来内容驱动」的一轮（有活标记）。**每次派出子代理的那一刻、同步读一次**，
+     * 记在 job 上、收尾事件带 `foreignOrigin: true`（见 {@link BackgroundSubagentEvent.foreignOrigin}）：外来内容驱动的一轮派出的子代理，
+     * 它的结果回到主 AI 时要继承标记（第十八轮，第十六轮评审 P3-C1 / F3）。不提供 = 一律按「不是外来来源」（单测 / 没有 taskId 的调用）。
+     * 抛错按「是」处理（fail-closed：多限制一轮，好过让外来内容的结果无保护地回来）。
+     */
+    isForeignTurn?: () => boolean;
     /** 同时在跑的后台子代理上限，缺省 {@link BACKGROUND_SUBAGENT_MAX_CONCURRENT} */
     maxConcurrent?: number;
     /**
@@ -656,6 +664,8 @@ export const createCursorSubagentLink = (
     background: boolean;
     /** 是前台转后台的（用户插话触发） */
     detached: boolean;
+    /** 派出那一刻处在外来内容驱动的一轮（见 {@link BackgroundSubagentEvent.foreignOrigin}）；收尾事件原样带上 */
+    foreignOrigin?: boolean;
     /** 前台才有：触发转后台（让回调立刻返回） */
     detach?: () => void;
     /** 后台运行超时的计时器 */
@@ -725,6 +735,31 @@ export const createCursorSubagentLink = (
     }
   };
 
+  /**
+   * 读「此刻是不是外来内容驱动的一轮」：抛错 / 没提供都有明确口径（见 deps.background.isForeignTurn），绝不影响派出本身。
+   *
+   * **resume 的边界（第十九轮评审 R19-5；已定：作为已知边界写明，不做「子代理污染位」——用户 2026-11-24 09:51 授权「都按你推荐的来」）**：
+   * 这里读的是**这一次派出（含 resume）那一刻**的标记状态，不记「这个子代理当初是不是在外来轮里建的、有没有吃过外来内容」。
+   * 所以属主的一轮若主动 `resume` 一个当初在外来轮里建的子代理，它上下文里带着的外来内容、输出会按「属主来源」回到属主的一轮（不带限制说明、不扣留）。
+   * 读码已核实这条路径存在；威胁面是推测——要利用得属主这一轮的模型**主动**传出那个 `resume` id（id 只在本进程的登记表里、应用重启即丢；同一会话的历史里能看到），
+   * 而且子代理自己拿不到 Flowship 的受限工具（`childAgentOptions` 不挂 `customTools`，只有 Cursor 内置工具；其中 shell 的口子是另一条已知边界，见 COMPUTER-USE.md §5.4 ⑤）。
+   * 不做的理由：补法是给登记表里每个 agentId 记一个「污染位」（建时 foreign 即置位、resume 继承、跨淘汰 / 重启还得落盘），
+   * 还要决定「属主主动 resume 是否等于接受那份上下文」，复杂度与收益不成比例。**反悔路径**：`ResumableChild` 加 `tainted`，
+   * 建子代理时 `tainted = foreignOrigin`，`claimResumable` 之后把 `readForeignTurn() || claimed.info.tainted` 并进 `foreignOrigin` 即可（不改其它调用方）。
+   */
+  const readForeignTurn = (): boolean => {
+    if (!bg?.isForeignTurn) return false;
+    try {
+      return bg.isForeignTurn() === true;
+    } catch (err) {
+      console.warn(
+        "[cursor-subagent] 读取「外来内容轮」状态抛错（按外来来源处理）：",
+        err instanceof Error ? err.message : err,
+      );
+      return true;
+    }
+  };
+
   const control: SubagentSessionControl = {
     detachForeground: () => {
       let n = 0;
@@ -771,6 +806,7 @@ export const createCursorSubagentLink = (
       description: job.description,
       durationMs: Math.max(0, Date.now() - job.startedAt),
       detached: job.detached,
+      ...(job.foreignOrigin ? { foreignOrigin: true as const } : {}),
     };
     let evt: BackgroundSubagentEvent;
     if (outcome.ok) {
@@ -871,6 +907,9 @@ export const createCursorSubagentLink = (
   ): Promise<string> => {
     const gen0 = generation;
     const cancelled = (): boolean => generation !== gen0;
+    // 外来来源：派出的这一刻、同步、任何 await 之前读（建子 agent 要 await，期间那一轮可能已经收尾、标记已清）。
+    // 前台调用也读：它可能被用户插话转后台，收尾时才作为一条消息回到主 AI
+    const foreignOrigin = readForeignTurn();
 
     const wantsBackground = req.runInBackground === true;
     // 不支持后台的会话（task 模式 / 一次性调用）收到了也明说，不静默当前台跑——
@@ -1010,6 +1049,7 @@ export const createCursorSubagentLink = (
         startedAt: nextStartedAt(),
         background: false,
         detached: false,
+        ...(foreignOrigin ? { foreignOrigin: true } : {}),
         rec,
       };
 
@@ -1373,6 +1413,8 @@ export const createCursorSubagentLinkForSession = (opts: {
               emitBackgroundSubagentSettled(backgroundTaskId, evt),
             onJobsChanged: () =>
               emitBackgroundSubagentJobsChanged(backgroundTaskId),
+            // 派出那一刻这个任务有没有活标记（外来内容驱动的一轮）：收尾的结果回主 AI 时据此继承标记
+            isForeignTurn: () => isGroupNonOwnerTurnActive(backgroundTaskId),
           },
         }
       : {}),

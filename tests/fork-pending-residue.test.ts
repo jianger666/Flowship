@@ -16,6 +16,9 @@
  *   consume 的 finally 里，仅当 `iOwnRunner()`（runningTasks 里仍是自己那条 record）时顺带 `forkPendingTasks.delete`，
  *   和摘 runningTasks 同门——旧 run 一退出，它那一轮的标志就没了；失主（后继已换号）时绝不碰后继的标志。
  *
+ * 第八轮评审 P3-4（同一处 finally 的另一把「按名清」）：consume 的 finally 开头还有一行 `endMidRunForeignContent`（按任务名清「中途补登」的群成员标记），
+ * 也要和摘 runningTasks 同门——失主（表里已是后继 B 的 record）时不碰 B 为自己这一轮补登的标记；表空 / 还是本 run 才清。见文件末尾三条用例。
+ *
  * 手法（不用固定 sleep，状态都是确定的）：
  *   - `@/lib/server/finalize-open-tools` 用 vi.mock 包一层：让「第一次」闭合挂在手动 resolve 的 deferred 上——
  *     「旧 run 已自然结束、正卡在 finally」是确定状态，放行时机由用例说了算；
@@ -132,6 +135,11 @@ const { deliverAskReply, resumeCurrentActionWithMessage } = await import(
   "@/lib/server/task-runner"
 );
 const { getTask } = await import("@/lib/server/task-fs");
+const {
+  __resetNonOwnerTurnGuardForTest,
+  beginForeignContentMidRun,
+  isGroupNonOwnerTurnActive,
+} = await import("@/lib/server/non-owner-turn-guard");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
@@ -397,6 +405,7 @@ describe("R14 Q7b-04 forkPendingTasks：旧 run 自然结束的收尾期被唤�
     mockResume.mockReset();
     finalizeCtl.hook = null;
     finalizeCtl.calls.length = 0;
+    __resetNonOwnerTurnGuardForTest();
     // 静音被测代码的 log / warn / error，避免淹没测试输出
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -406,6 +415,7 @@ describe("R14 Q7b-04 forkPendingTasks：旧 run 自然结束的收尾期被唤�
   afterEach(async () => {
     vi.restoreAllMocks();
     finalizeCtl.hook = null;
+    __resetNonOwnerTurnGuardForTest();
     for (const release of gates.splice(0)) release();
     for (const id of ids) {
       pendingStopRequests.delete(id);
@@ -604,6 +614,130 @@ describe("R14 Q7b-04 forkPendingTasks：旧 run 自然结束的收尾期被唤�
       } finally {
         runningTasks.delete(id);
         forkPendingTasks.delete(id);
+      }
+    },
+    60_000,
+  );
+
+  // ---------------------------------------------------------------------------
+  // 第八轮评审 P3-4：收尾按名清「中途补登的群成员标记」也要和摘 runningTasks 同门
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 搭场景：run1（热会话）流在旁白后挂住，直到用例放行才**自然结束**（wait 回 finished）；
+   * finalizeOpenToolCalls 的第一次调用被 hold 住——它在 finally 里排在「按名清中途标记」**之后**，
+   * 所以 `finalizeCtl.calls.includes(id)` 成立 = 那一行已经执行过（既是正向信号，也让「断言时 run1 恰好卡在清完之后」是确定状态）。
+   */
+  const driveRun1ToMidRunClear = async (id: string) => {
+    await writeMeta(makeMeta(id, "awaiting_ack"));
+    const hold = makeDeferred();
+    gates.push(hold.resolve);
+    holdFirstFinalize(id, hold);
+    const gate = makeDeferred();
+    gates.push(gate.resolve);
+    const state = { streamed: false };
+    const run1 = {
+      id: "run_p34",
+      stream: async function* (): AsyncGenerator<unknown> {
+        state.streamed = true;
+        yield assistantMsg("旁白");
+        await gate.promise;
+      },
+      wait: vi.fn().mockResolvedValue({ status: "finished" as const }),
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    installSession(id, makeAgent(PERSISTED_AGENT_ID, [{ run: run1 }]));
+    expect(await deliver(id)).toBe("sent");
+    expect(await pollUntil(() => state.streamed), "run1 应在流（挂住）").toBe(true);
+    expect(runningTasks.has(id), "run1 占着表").toBe(true);
+    return {
+      /** run1 此刻才结束，并等到它走过 finally 里「按名清」那一行（卡在随后的闭合上） */
+      finishRun1: async () => {
+        gate.resolve();
+        expect(
+          await pollUntil(() => finalizeCtl.calls.includes(id)),
+          "run1 应已自然结束并走到 finally 的闭合（按名清中途标记那一行已执行）",
+        ).toBe(true);
+      },
+      hold,
+    };
+  };
+
+  it(
+    "run1 失主（forceClear 后后继 B 已占表、并为 B 这一轮补登了中途标记）→ run1 迟到的收尾不按名清掉 B 的标记",
+    async () => {
+      // 保护：finally 里按名清标记与摘 runningTasks 必须同门看归属。卡住的 run1 天然比后继收尾得晚，无条件按名清会把 B 的
+      // 「desktop_* / 写所有者备注 / 新建定时恒拒」在 B 后半段静默撤掉（第八轮评审 P3-4）。
+      const id = alloc();
+      const { finishRun1, hold } = await driveRun1ToMidRunClear(id);
+
+      // forceClear + 后继接管：换成新号的 record，并为 B 的这一轮补登标记
+      const successor = {
+        instanceId: allocTaskRunInstanceId(),
+        agentId: "agent_successor",
+        startedAt: Date.now(),
+        startSnapshot: { title: "successor" },
+        cancel: vi.fn(),
+      };
+      runningTasks.set(id, successor);
+      expect(beginForeignContentMidRun(id), "前置：B 的补登应成功（此刻没有任何标记）").toBeDefined();
+
+      try {
+        await finishRun1();
+        expect(
+          isGroupNonOwnerTurnActive(id),
+          "run1 迟到的收尾把后继 B 的中途标记按名清掉了（B 后半段的 desktop_* 等恒拒失效）",
+        ).toBe(true);
+        expect(runningTasks.get(id), "也不该摘后继的 record").toBe(successor);
+      } finally {
+        hold.resolve();
+        await settleMacrotasks();
+        runningTasks.delete(id);
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "对照：表里还是 run1 自己的 record → 收尾照常清掉本轮中途补登的标记",
+    async () => {
+      const id = alloc();
+      const { finishRun1, hold } = await driveRun1ToMidRunClear(id);
+      expect(beginForeignContentMidRun(id), "前置：补登应成功").toBeDefined();
+      expect(isGroupNonOwnerTurnActive(id)).toBe(true);
+
+      try {
+        await finishRun1();
+        expect(
+          isGroupNonOwnerTurnActive(id),
+          "run1 自己收尾却没清它这一轮补登的标记（会拒属主下一轮的电脑操作）",
+        ).toBe(false);
+      } finally {
+        hold.resolve();
+        await settleMacrotasks();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "对照：run1 被强清摘出表、后继还没起（表是空的）→ 迟到的收尾照常清掉标记（不能写成「不是自己的 record 就一律不清」）",
+    async () => {
+      // 保护：只在「表里是别的 run」时才让位；表空时没有谁能认领这个标记，不清会残留到 45 分钟 TTL。
+      const id = alloc();
+      const { finishRun1, hold } = await driveRun1ToMidRunClear(id);
+      expect(beginForeignContentMidRun(id), "前置：补登应成功").toBeDefined();
+      runningTasks.delete(id); // 强清：摘表，后继 B 尚未登记
+
+      try {
+        await finishRun1();
+        expect(
+          isGroupNonOwnerTurnActive(id),
+          "表空时 run1 迟到的收尾应清掉标记（否则它残留到 TTL，拒属主下一轮）",
+        ).toBe(false);
+      } finally {
+        hold.resolve();
+        await settleMacrotasks();
       }
     },
     60_000,

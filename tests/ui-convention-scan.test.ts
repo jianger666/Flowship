@@ -225,6 +225,14 @@ const FIXED_FILES = [
   "components/browser/browser-unavailable.tsx",
   "components/browser/browser-ask-watcher.tsx",
   "components/settings/browser-card.tsx",
+  // 电脑操作设置节（新叶子组件；颜色只走 success / warning / destructive 语义 token）
+  "components/settings/computer-use-card.tsx",
+  // 设置页瘦身（2026-11-24）：设置行加 detail 的 ⓘ 气泡（hover 提示一律 Tooltip）+ 行内开关的无障碍接线；
+  // 飞书桥接块 / 偏好卡的说明压成一句。颜色只走语义 token
+  "components/ui/setting-row.tsx",
+  "components/ui/switch.tsx",
+  "components/settings/feishu-bridge-block.tsx",
+  "components/settings/preference-card.tsx",
 ] as const;
 
 /** 内置浏览器的 UI 文件（FIXED_FILES 里属于它的那部分）：下面几条针对它的专项规则用 */

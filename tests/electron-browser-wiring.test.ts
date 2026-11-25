@@ -12,12 +12,14 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+// 去掉所有注释（整行的、块的、跟在代码后面的 `// …`），只用于按「代码」判断的断言：被注释掉的字样不能再让断言通过。
+// 用仓库共用的 helper（一遍扫描分出 代码 / 注释 / 字面量，认字符串、模板字符串、正则里的双斜杠与斜杠加星号；注释换成同样多的空格，下标 / 行号与原文一一对应），已用 acorn 取注释位置作基准在 main.js 与 browser 目录的几份 mjs 上逐字核对过。
+// 本文件以前自己有一份正则版：不认行尾注释，还把 main.js 里 URL 通配模板字符串末尾的斜杠加星号当成块注释起点，把它之后到下一个块注释结束符之间的一大段代码一并删掉——断言看到的「代码」与真实代码不一样（R23-8）。
+import { stripComments } from "./helpers/source-text";
+
 const ROOT = path.resolve(import.meta.dirname, "..");
 const read = (rel: string) => readFileSync(path.join(ROOT, rel), "utf8");
 const mainSrc = read("electron-app/main.js");
-
-/** 去掉整行注释与块注释（只用于「紧跟」这类按代码判断的断言） */
-const stripComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
 /** 从 `start` 之后第一个 `{` 起，配对大括号，返回整段（含括号）；字符串里的括号不处理（main.js 这几段够用） */
 const braceBlock = (src: string, start: number): string => {
@@ -36,6 +38,24 @@ const blockAfter = (src: string, start: number): string => {
   const open = src.indexOf("{", start);
   return src.slice(open + braceBlock(src, start).length);
 };
+
+describe("stripComments 看到的是真实代码（R23-8）", () => {
+  it("main.js 里 URL 通配模板字符串（以斜杠加星号结尾）之后的代码还在——旧的正则版把它当块注释起点、删掉了后面一大段；行尾注释剥掉、字符串里的双斜杠保留", () => {
+    const code = stripComments(mainSrc);
+    // 通配模板字符串本身是代码里的字符串，原样保留
+    expect(code).toContain("urls: [`${BASE_URL}/*`]");
+    // 它后面紧跟的几行代码没有被当成注释吞掉
+    expect(code).toMatch(/ses\.webRequest\.onSendHeaders\(filter, \(d\) => requestRecorder\.start\(d\.id, d\.url, d\.resourceType\)\);/);
+    expect(code).toContain("requestRecorder.responseStarted(d.id, d.statusCode, d.fromCache)");
+    // 行尾注释被剥掉：被注释掉的调用不能再让断言通过（这一行本身不在 main.js 里，合成一段做对照）
+    const synthetic = stripComments('const a = "http://x.test/*"; // browserManager.destroy()\nfoo(); /* proc.on("message") */ bar();\n');
+    expect(synthetic).toContain('"http://x.test/*"');
+    expect(synthetic).not.toContain("browserManager.destroy()");
+    expect(synthetic).not.toContain('proc.on("message")');
+    expect(synthetic).toContain("foo();");
+    expect(synthetic).toContain("bar();");
+  });
+});
 
 describe("server 子进程：第 4 路 ipc 通道", () => {
   const spawnAt = mainSrc.indexOf("const proc = spawn(serverNodeBin()");
@@ -110,6 +130,40 @@ describe("BrowserManager 创建与 registerIpc", () => {
     expect(deps).toMatch(/isTrustedIpcSender: \(e, channel\) => isTrustedIpcSender\(e, channel \?\? "browser:\*"\),/);
   });
 
+  it("第二十一轮：系统层授权状态的接线——main.js 把 systemPreferences 注入 createBrowserManager，index.mjs 把它的 getMediaAccessStatus 接进 createPermissionGate（取不到 = \"unknown\"）", () => {
+    // 先剥注释再匹配（R22-5：之前在原文上匹配，把 `systemPreferences,` 注释掉后注释里的字样仍然满足正则，这个断言不会变红）
+    const code = stripComments(mainSrc);
+    const at = code.indexOf("const browserManager = createBrowserManager(");
+    expect(at, "main.js 应有 createBrowserManager 调用").toBeGreaterThan(0);
+    expect(braceBlock(code, at)).toMatch(/\bsystemPreferences,/);
+    // systemPreferences 已从 electron 引入（否则 main.js 里是个未定义标识符，createBrowserManager 一调用就 ReferenceError）
+    // 按语义找 `import { app, … } from "electron"`（不绑换行 / 缩进 / 引号格式；格式变了也不该让断言因为「找不到 import」而误报）
+    const electronImport = /import\s*\{([^}]*)\}\s*from\s*["']electron["']/.exec(code);
+    expect(electronImport, "main.js 应有 `import { …, systemPreferences, … } from \"electron\"`——找不到整条 import 时先看格式 / 引入方式变了没，不要直接删这条断言").not.toBeNull();
+    expect(electronImport?.[1] ?? "", "main.js 从 electron 引入的名字里应含 systemPreferences（没引入 = createBrowserManager 一调用就 ReferenceError）").toMatch(/\bsystemPreferences\b/);
+    const indexSrc = stripComments(read("electron-app/browser/index.mjs"));
+    const gateAt = indexSrc.indexOf("createPermissionGate({");
+    expect(gateAt).toBeGreaterThan(0);
+    // 语义而不是格式：getMediaAccessStatus 这一项的箭头函数里调用了 deps.systemPreferences 的同名方法并把 kind 传下去（空白 / 是否带兜底值都不绑）
+    expect(braceBlock(indexSrc, gateAt)).toMatch(/getMediaAccessStatus\s*:\s*\(\s*kind\s*\)\s*=>[^,\n]*deps\.systemPreferences\?\.getMediaAccessStatus\?\.\(\s*kind\s*\)/);
+  });
+
+  it("第二十六轮 X-3：index.mjs 的 createTab 里 `permissionGate.bindTab(tab)` 全文恰好一处、落在 `new BrowserTab(` 之后、`return tab` 之前——收养的 window.open 弹窗在构造里就同步跑完了早钩子那一批，页内权限桩全靠 bindTab 之后的补调；这一行被删 / 挪到构造之前，门的单测照样全绿，只有真 Electron 的 r21（S10）会红", () => {
+    // 先剥注释再匹配：被注释掉的 bindTab 不算数（与上一条同一做法）
+    const code = stripComments(read("electron-app/browser/index.mjs"));
+    expect(code.match(/permissionGate\.bindTab\(tab\)/g), "全文只在 createTab 里 bindTab 一次").toHaveLength(1);
+    const head = /createTab\s*:\s*\(\{[^}]*\}\)\s*=>\s*/.exec(code);
+    expect(head, "index.mjs 应有 `createTab: ({ … }) => { … }`——找不到时先看写法变了没，不要直接删这条断言").not.toBeNull();
+    const body = braceBlock(code, head!.index + head![0].length); // 参数解构的花括号已跳过：这是函数体
+    const ctorAt = body.indexOf("new BrowserTab(");
+    const bindAt = body.indexOf("permissionGate.bindTab(tab)");
+    const returnAt = body.lastIndexOf("return tab");
+    expect(ctorAt, "createTab 里应有 new BrowserTab(").toBeGreaterThan(-1);
+    expect(bindAt, "createTab 里应有 permissionGate.bindTab(tab)").toBeGreaterThan(-1);
+    expect(ctorAt, "bindTab 要在构造之后（构造期间 tab 还没造好）").toBeLessThan(bindAt);
+    expect(returnAt, "bindTab 要在 return tab 之前").toBeGreaterThan(bindAt);
+  });
+
   it("registerIpc 在 app.whenReady 里、创建 splash / 主窗口之前被调用（失败不挡启动）", () => {
     const readyAt = mainSrc.indexOf("app.whenReady().then(async () => {");
     const regAt = mainSrc.indexOf("browserManager.registerIpc()");
@@ -178,6 +232,51 @@ describe("退出链：停车场窗口不拖住退出", () => {
     expect(blockAfter(body, tryAt).trimStart()).toMatch(/^catch \(err\) \{/);
     // main.js 全文只有这一处 destroy 调用
     expect(stripComments(mainSrc).match(/browserManager\.destroy\(\)/g)?.length).toBe(1);
+  });
+
+  /**
+   * app.exit() 不触发 before-quit / will-quit（Electron 文档）。电脑操作的收尾（撤遮罩 + 把 AI 解锁过的电脑锁回去）原来只在 will-quit 里：
+   * mac 套用暂存更新的两条路径都以 app.exit(0) 收尾，会把它整个绕过去——遮罩随进程消失，而电脑还开着没锁，用户又不在场。
+   * main.js 不能 import 进 vitest（真路径要打包过的 mac 应用 + 一份暂存更新才走得到），所以读源码字面钉住接线点。
+   */
+  it("电脑操作的退出收尾（destroyDesktop）：will-quit 里一次；两条以 app.exit(0) 收尾的路径（立即更新的 relaunch / 退出时套用暂存）也各自在 exit 之前做", () => {
+    const code = stripComments(mainSrc);
+
+    // 唯一的实现：try/catch 包着 desktop?.destroy()，出错只记日志、不挡退出；main.js 里 desktop?.destroy() 只此一处
+    const defAt = code.indexOf("const destroyDesktop = () => {");
+    expect(defAt, "main.js 应有 const destroyDesktop").toBeGreaterThan(0);
+    const def = braceBlock(code, defAt);
+    expect(def).toContain("desktop?.destroy();");
+    expect(def).toMatch(/catch \(err\) \{\s*log\(/);
+    expect(code.match(/desktop\?\.destroy\(\)/g)?.length).toBe(1);
+
+    // will-quit：在浏览器 / Mermaid 销毁之前（和原来一样先收尾电脑操作）
+    const wq = braceBlock(code, code.indexOf('app.on("will-quit", '));
+    expect(wq).toContain("destroyDesktop();");
+    expect(wq.indexOf("destroyDesktop();")).toBeLessThan(wq.indexOf("browserManager.destroy()"));
+
+    // 路径 A：applyStagedUpdate 的 relaunch 分支——替换成功、退出已确定之后、app.exit(0) 之前。
+    // 不能放在函数开头（那时替换还可能失败、应用继续跑，destroy 会摘掉设置页用的 IPC）
+    const fn = code.slice(code.indexOf("const applyStagedUpdate = async"), code.indexOf("const tryApplyStagedUpdateOnLaunch"));
+    const exitA = fn.lastIndexOf("app.exit(0);");
+    const destroyA = fn.lastIndexOf("destroyDesktop();");
+    expect(fn.match(/destroyDesktop\(\);/g)?.length).toBe(1);
+    expect(fn.indexOf("await fs.rm(stagedMetaFile()")).toBeGreaterThan(0);
+    expect(destroyA).toBeGreaterThan(fn.indexOf("await fs.rm(stagedMetaFile()")); // 套用（改盘）已经完成、暂存元信息已消费
+    expect(destroyA).toBeGreaterThan(fn.lastIndexOf("browserManager.setQuitting(false)")); // 失败回滚分支（应用继续跑）之后
+    expect(destroyA).toBeLessThan(exitA);
+
+    // 路径 B：before-quit 的暂存更新分支——app.exit(0) 在 finally 里无条件执行，退出板上钉钉，所以在开始套用之前就做
+    const bq = code.slice(code.indexOf('app.on("before-quit"'));
+    const applyAt = bq.indexOf("applyingStagedOnQuit = true");
+    const destroyB = bq.indexOf("destroyDesktop();", applyAt);
+    expect(applyAt).toBeGreaterThan(0);
+    expect(destroyB).toBeGreaterThan(applyAt);
+    expect(destroyB).toBeLessThan(bq.indexOf("applyStagedUpdateOnQuit()", applyAt));
+    expect(bq.slice(applyAt, bq.indexOf("app.exit(0)", applyAt))).toContain(".finally(() => {");
+
+    // 对账：main.js 里 app.exit( 恰好这两处。再加一条 app.exit 路径时这里会红——提醒你给它也配上 destroyDesktop()（绕过 will-quit 的都要）
+    expect(code.match(/\bapp\.exit\(/g)?.length).toBe(2);
   });
 
   it("退出途中不新建原生窗口（评审 R1-32 复审）：before-quit 最终通过时 setQuitting(true)，被推迟 / 取消的每条路径都复位，app.exit 路径保持置位", () => {

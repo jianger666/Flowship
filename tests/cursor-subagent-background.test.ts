@@ -706,3 +706,115 @@ describe("会话控制面登记在 attach 返回的 agent 上", () => {
     expect(events[0]!.parentAgentId).toBe("parent-xyz");
   });
 });
+
+describe("外来来源（isForeignTurn）：派出那一刻的状态记进 job、收尾事件带 foreignOrigin（第十八轮，第十六轮评审 P3-C1 / F3）", () => {
+  it("派出时处在外来内容驱动的一轮：后台收尾事件带 foreignOrigin: true（其余字段照旧）", async () => {
+    const { link, runs, events } = setup({ background: { isForeignTurn: () => true } });
+    await call(link, { prompt: "去查查", description: "查资料", run_in_background: true });
+    runs[0]!.finish("结论");
+    await settleTail();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ status: "done", description: "查资料", detached: false, foreignOrigin: true });
+  });
+
+  it("派出时不是（属主自己的一轮）/ 没提供 isForeignTurn：事件不带这个字段（与以前一致，不是 false）", async () => {
+    for (const background of [{ isForeignTurn: () => false }, {}] as const) {
+      const { link, runs, events } = setup({ background });
+      await call(link, { prompt: "x", run_in_background: true });
+      runs[0]!.finish();
+      await settleTail();
+      expect(events).toHaveLength(1);
+      expect("foreignOrigin" in events[0]!, JSON.stringify(Object.keys(background))).toBe(false);
+    }
+  });
+
+  it("按派出时刻取、不是收尾时刻：派出时是外来轮、收尾时标记早清了 → 仍 true；派出时不是、收尾时有了标记 → 仍不带", async () => {
+    let foreign = true;
+    const { link, runs, events } = setup({ background: { isForeignTurn: () => foreign } });
+    await call(link, { prompt: "外来轮派的", description: "A", run_in_background: true });
+    foreign = false; // 那一轮结束、标记清了
+    await call(link, { prompt: "属主轮派的", description: "B", run_in_background: true });
+    foreign = true; // 之后别的外来内容进来、又有了标记
+    runs[0]!.finish("A 的结果");
+    runs[1]!.finish("B 的结果");
+    await settleTail();
+    const byDesc = new Map(events.map((e) => [e.description, e]));
+    expect(byDesc.get("A")!.foreignOrigin).toBe(true);
+    expect("foreignOrigin" in byDesc.get("B")!).toBe(false);
+  });
+
+  it("派出时的状态是同步读的（建子 agent 的 await 之前）：建子 agent 期间标记变了也不影响", async () => {
+    let foreign = true;
+    const { link, runs, events, createChild } = setup({ background: { isForeignTurn: () => foreign } });
+    createChild.mockImplementationOnce(async () => {
+      foreign = false; // 建子 agent 期间那一轮收尾、标记清了
+      const run = manualRun();
+      runs.push(run);
+      return { send: vi.fn(async () => run), close: vi.fn() };
+    });
+    await call(link, { prompt: "x", run_in_background: true });
+    runs[0]!.finish();
+    await settleTail();
+    expect(events[0]!.foreignOrigin).toBe(true);
+  });
+
+  it("前台调用也读：被用户插话转后台的，收尾事件同样带派出时的状态（detached=true）", async () => {
+    const { link, runs, events } = setup({ background: { isForeignTurn: () => true } });
+    const fg = call(link, { prompt: "前台任务", description: "前台干活" });
+    await settleTail();
+    expect(link.control.detachForeground()).toBe(1);
+    await fg;
+    runs[0]!.finish("跑完了");
+    await settleTail();
+    expect(events[0]).toMatchObject({ status: "done", detached: true, foreignOrigin: true });
+  });
+
+  it("失败 / 取消的收尾事件也带上（投递方对 failed 一样要继承标记；cancelled 本来就丢）", async () => {
+    const { link, runs, events } = setup({ background: { isForeignTurn: () => true } });
+    await call(link, { prompt: "a", description: "会失败", run_in_background: true });
+    await call(link, { prompt: "b", description: "会取消", run_in_background: true });
+    runs[0]!.fail("rate limited");
+    await runs[1]!.cancel();
+    await settleTail();
+    const byDesc = new Map(events.map((e) => [e.description, e]));
+    expect(byDesc.get("会失败")).toMatchObject({ status: "failed", foreignOrigin: true });
+    expect(byDesc.get("会取消")).toMatchObject({ status: "cancelled", foreignOrigin: true });
+  });
+
+  it("resume 接着做也是一次新的派出：按这一次派出时的状态取", async () => {
+    let foreign = false;
+    const { link, runs, events } = setup({ withIds: true, background: { isForeignTurn: () => foreign } });
+    const first = call(link, { prompt: "第一次" });
+    await settleTail();
+    runs[0]!.finish("第一次结果");
+    const childId = /resume="(child-\d+)"/.exec((await first).text)?.[1];
+    expect(childId).toBeTruthy();
+    foreign = true; // 外来内容驱动的一轮里接着做
+    await call(link, { prompt: "接着做", resume: childId, run_in_background: true });
+    runs[1]!.finish("第二次结果");
+    await settleTail();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.foreignOrigin).toBe(true);
+  });
+
+  it("isForeignTurn 抛错按外来来源处理（fail-closed），派出本身不受影响", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { link, runs, events } = setup({
+        background: {
+          isForeignTurn: () => {
+            throw new Error("读标记炸了");
+          },
+        },
+      });
+      const out = await call(link, { prompt: "x", run_in_background: true });
+      expect(out.isError).toBe(false);
+      runs[0]!.finish();
+      await settleTail();
+      expect(events[0]!.foreignOrigin).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("外来内容轮"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

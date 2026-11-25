@@ -13,6 +13,7 @@ import {
   createBrowserBridge,
   getBrowserBridge,
   isBrowserBridgeAvailable,
+  isDesktopBridgeAvailable,
   type BridgeTransport,
 } from "@/lib/server/browser/bridge";
 import { BrowserBridgeError } from "@/lib/server/browser/types";
@@ -363,6 +364,113 @@ describe("evt / config", () => {
     t.emit(ack); // 壳重启后的新 manager 需要重新拿到 config
     b.syncConfig(cfg);
     expect(t.sent.filter((m) => m.kind === "config")).toHaveLength(2);
+  });
+
+  it("syncConfig 的载荷带电脑操作两个开关：放开型，只认显式 true；老调用方没传 = 关；改了会重推", () => {
+    const { t, b } = readyBridge();
+    const configs = () => t.sent.filter((m) => m.kind === "config");
+    const last = () => configs().at(-1);
+    b.syncConfig({ recordInputValues: false, evaluateEnabled: false });
+    expect(last()).toMatchObject({ desktopEnabled: false, desktopLockedAccess: false });
+    b.syncConfig({ recordInputValues: false, evaluateEnabled: false, desktopEnabled: true });
+    expect(last()).toMatchObject({ desktopEnabled: true, desktopLockedAccess: false });
+    expect(configs()).toHaveLength(2);
+    b.syncConfig({ recordInputValues: false, evaluateEnabled: false, desktopEnabled: true, desktopLockedAccess: true });
+    expect(last()).toMatchObject({ desktopEnabled: true, desktopLockedAccess: true });
+    expect(configs()).toHaveLength(3);
+    // 值没变不重发；脏值（字符串 / 数字）不会被当成 true
+    b.syncConfig({ recordInputValues: false, evaluateEnabled: false, desktopEnabled: true, desktopLockedAccess: true });
+    expect(configs()).toHaveLength(3);
+    b.syncConfig({ recordInputValues: false, evaluateEnabled: false, desktopEnabled: "true" as never, desktopLockedAccess: 1 as never });
+    expect(last()).toMatchObject({ desktopEnabled: false, desktopLockedAccess: false });
+  });
+});
+
+describe("能力声明（hasCapability / isDesktopBridgeAvailable）", () => {
+  const ackWith = (...caps: string[]) => ({ v: 1, kind: "hello-ack", capabilities: ["browser.v1", ...caps] });
+
+  it("hello-ack 带 desktop.v1 才有；没带 / 非字符串项被忽略", () => {
+    const t = makeTransport();
+    const b = createBrowserBridge(t);
+    b.start();
+    t.emit({ v: 1, kind: "hello-ack", capabilities: ["browser.v1", 42, null, "desktop.v1"] });
+    expect(b.hasCapability?.("desktop.v1")).toBe(true);
+    expect(b.hasCapability?.("browser.v1")).toBe(true);
+    expect(b.hasCapability?.("nope")).toBe(false);
+
+    const t2 = makeTransport();
+    const b2 = createBrowserBridge(t2);
+    b2.start();
+    t2.emit(ack);
+    expect(b2.isAvailable()).toBe(true);
+    expect(b2.hasCapability?.("desktop.v1")).toBe(false);
+  });
+
+  it("重新握手整体替换能力集（壳重启后没有了 desktop.v1 就不再有）", () => {
+    const t = makeTransport();
+    const b = createBrowserBridge(t);
+    b.start();
+    t.emit(ackWith("desktop.v1"));
+    expect(b.hasCapability?.("desktop.v1")).toBe(true);
+    t.emit(ack);
+    expect(b.hasCapability?.("desktop.v1")).toBe(false);
+  });
+
+  it("断线 / 销毁 / 主进程不支持 browser.v1 后能力清空", () => {
+    const t = makeTransport();
+    const b = createBrowserBridge(t);
+    b.start();
+    t.emit(ackWith("desktop.v1"));
+    t.disconnect();
+    expect(b.hasCapability?.("desktop.v1")).toBe(false);
+
+    const t2 = makeTransport();
+    const b2 = createBrowserBridge(t2);
+    b2.start();
+    t2.emit(ackWith("desktop.v1"));
+    b2.dispose();
+    expect(b2.hasCapability?.("desktop.v1")).toBe(false);
+
+    const t3 = makeTransport();
+    const b3 = createBrowserBridge(t3);
+    b3.start();
+    t3.emit(ackWith("desktop.v1"));
+    t3.emit({ v: 1, kind: "hello-ack", capabilities: ["desktop.v1"] }); // 不含 browser.v1：整条不可用
+    expect(b3.isAvailable()).toBe(false);
+    expect(b3.hasCapability?.("desktop.v1")).toBe(false);
+  });
+
+  it("isDesktopBridgeAvailable：bridge 可用且声明了 desktop.v1 才为真；老的假 bridge（没实现 hasCapability）一律为假", () => {
+    expect(isDesktopBridgeAvailable()).toBe(false); // 没有 bridge
+
+    const t = makeTransport();
+    const b = createBrowserBridge(t);
+    b.start();
+    __setBrowserBridgeForTest(b);
+    expect(isDesktopBridgeAvailable()).toBe(false); // 还没握手
+    t.emit(ack);
+    expect(isBrowserBridgeAvailable()).toBe(true);
+    expect(isDesktopBridgeAvailable()).toBe(false); // 浏览器可用但没有 desktop.v1
+    t.emit(ackWith("desktop.v1"));
+    expect(isDesktopBridgeAvailable()).toBe(true);
+    t.disconnect();
+    expect(isDesktopBridgeAvailable()).toBe(false); // 断线
+
+    const legacyFake = {
+      isAvailable: () => true,
+      start: () => {},
+      request: async () => ({}),
+      cancel: () => {},
+      closeSession: () => {},
+      syncConfig: () => {},
+      onEvent: () => () => {},
+      onSessionClosed: () => () => {},
+      pendingCount: () => 0,
+      dispose: () => {},
+    };
+    __setBrowserBridgeForTest(legacyFake);
+    expect(isBrowserBridgeAvailable()).toBe(true);
+    expect(isDesktopBridgeAvailable()).toBe(false);
   });
 });
 

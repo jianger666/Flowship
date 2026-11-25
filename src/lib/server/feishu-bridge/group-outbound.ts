@@ -37,7 +37,9 @@ import {
   writeEventAndPublish,
   type TaskStreamEvent,
 } from "@/lib/server/task-stream";
+import { isDesktopToolName } from "@/lib/desktop-tool-display";
 import { buildGroupQaSummaryEvent } from "@/lib/group-qa";
+import { onSettingsWritten } from "@/lib/server/settings-fs";
 import { getTask } from "@/lib/server/task-fs";
 import {
   setTalkQueueGroupOtherDropHandler,
@@ -188,25 +190,62 @@ const sendReceipt = async (
 // ----------------- 桥接开关缓存（对齐 p2p outbound） -----------------
 //
 // 有登记等着回群时，`assistant_delta` 是**每 token 一发**——每条都去 readSettingsFile
-// 读一次 config.json 就是一轮回答几百次同步读盘。短 TTL 足够：用户在设置页关桥接后
-// 最多多跑几秒的群回流。
+// 读一次 config.json 就是一轮回答几百次同步读盘。TTL 只是兜底（没走 settings-fs 写盘入口的改动，
+// 如手改 config.json）；设置页保存会通过 onSettingsWritten 立刻作废（见下方订阅），不再等满 8 秒。
 
 const BRIDGE_ENABLED_TTL_MS = 8_000;
 
-let bridgeEnabledCache: { value: boolean; at: number } | null = null;
+/**
+ * 开关缓存 + 世代号 + 订阅句柄，**一起挂在 globalThis 的同一个 cell 上**（R20-14，同 outbound.ts 的 `EnabledCell`，原因见那边）。
+ *
+ * 一句话：全局 tap（`getReg().registered`）是「先求值者胜」，dev 热重载后存活的 tap 仍是第一版模块的闭包、读第一版模块里的缓存变量；
+ * 旧写法的失效订阅是「后求值者胜」（每次重新求值先注销旧订阅、再订一个清**本版**变量的），两个方向相反——热重载后存活 tap 的缓存没人作废，
+ * 退回 8 秒 TTL。缓存 / 世代号放进 cell、订阅 `??=` 只订一次、回调闭包 cell 本身，就和是哪一版模块在读无关了。
+ */
+type BridgeEnabledCell = {
+  cache: { value: boolean; at: number } | null;
+  /**
+   * 缓存世代号：每次设置写盘 +1。读盘期间发生了写盘（世代号变了）→ 这次读到的值可能是写盘前的旧值，
+   * 照常返回给本次调用，但**不落进缓存**（否则作废之后又被在途的旧读重新填回 8 秒）。
+   */
+  gen: number;
+  unsub: (() => void) | null;
+};
+const BRIDGE_ENABLED_CELL_KEY = "__flowshipFeishuGroupOutboundEnabledCellV1__";
+
+// 设置一落盘就作废这份缓存：上面的 8 秒 TTL 是「关桥接后在途一轮仍往群里回流 / 发回执」与
+// 「刚打开时缓存的 false 让 handleGroupOutboundEvent 丢掉进行中的一轮」的最长残留。回调只清缓存（同步、不 await、
+// 不拿设置写锁：settings-fs 在写锁内同步调它）。任何设置写盘都作废（不区分是不是桥接开关）：
+// 重读一次 config.json 很便宜，比判「哪个键变了」更不容易漏。
+// 可逆：删掉订阅（`cell.unsub ??=` 那段）即回到「最多 8 秒后才发现开关变了」。
+// 没验证：真 Next dev 的热重载没有手点过；tests/feishu-bridge-enabled-cache-invalidate.test.ts 用 `vi.resetModules()` 模拟「新旧两版并存」。
+const getBridgeEnabledCell = (): BridgeEnabledCell => {
+  const g = globalThis as unknown as Record<string, BridgeEnabledCell | undefined>;
+  const cell = (g[BRIDGE_ENABLED_CELL_KEY] ??= { cache: null, gen: 0, unsub: null });
+  cell.unsub ??= onSettingsWritten(() => {
+    cell.gen += 1;
+    cell.cache = null;
+  });
+  return cell;
+};
+// 模块求值时就订上（和以前「模块求值即订阅」同一时机）；之后每次读缓存也会兜一次（`??=` 幂等）
+getBridgeEnabledCell();
 
 const isBridgeEnabledCached = async (): Promise<boolean> => {
+  const cell = getBridgeEnabledCell();
   const now = Date.now();
-  if (
-    bridgeEnabledCache &&
-    now - bridgeEnabledCache.at < BRIDGE_ENABLED_TTL_MS
-  ) {
-    return bridgeEnabledCache.value;
+  if (cell.cache && now - cell.cache.at < BRIDGE_ENABLED_TTL_MS) {
+    return cell.cache.value;
   }
+  const gen = cell.gen;
   const value = await deps.isBridgeEnabled();
-  bridgeEnabledCache = { value, at: now };
+  if (gen === cell.gen) cell.cache = { value, at: now };
   return value;
 };
+
+/** 仅测试用：直接走缓存读取路径（isBridgeEnabledCached 本身不导出） */
+export const __isBridgeEnabledCachedForTest = (): Promise<boolean> =>
+  isBridgeEnabledCached();
 
 /** 单测替换依赖；传 null 恢复 */
 export const __setGroupOutboundDepsForTest = (
@@ -214,7 +253,7 @@ export const __setGroupOutboundDepsForTest = (
 ): void => {
   deps = partial ? { ...defaultDeps(), ...partial } : defaultDeps();
   // 换了依赖 = 缓存里那个值来自上一套 mock，必须作废
-  bridgeEnabledCache = null;
+  getBridgeEnabledCell().cache = null;
 };
 
 // ----------------- done 后的排空重试 -----------------
@@ -636,8 +675,20 @@ const replyPrefix = (entry: PendingGroupReply): string =>
  *
  * ⚠️ 面板内容 = agent 的思考原文 + 工具名 / 参数摘要（命令、文件路径；凭据类已脱敏），**群里所有人都看得见**，
  * 而不只是属主——若觉得对外暴露太多，把它改成 false：卡退回「header + 正文 + footer」，不再累积 / 推送过程区。
+ * 例外收窄见 {@link GROUP_DESKTOP_THINKING_HIDDEN}：这一轮动过电脑（desktop_*）的，思考原文与这些工具的参数不外发。
  */
 const GROUP_CARD_SHOW_PROCESS = true;
+
+/**
+ * 这一轮调过电脑操作（desktop_*）之后，过程区里思考原文的替身。
+ *
+ * 为什么：思考是模型的自言自语，看完截图后常会复述屏幕上的东西（聊天对象、消息内容、文档标题、验证码……），
+ * 而群答疑卡是**全群可见**的——属主在群里让 AI 操作电脑时，群里的非属主也会看到这些。工具名和执行状态照常展示，
+ * 只是这一轮的思考原文不累积、不外发，已经攒下的也换成这句（卡上的过程区是整块替换的，下一次推送就会盖掉）。
+ * 只管思考与 desktop_* 的参数摘要（点击坐标、应用名、按键）；AI 最终写进正文的话是它要对群说的，不在此列。
+ */
+export const GROUP_DESKTOP_THINKING_HIDDEN =
+  "（本轮操作了电脑：思考内容可能带有屏幕上的信息，不在群里展示）";
 /** 单段思考累积上限（防一次超长思考把内存撑大；面板里本来就只展示前 1200 字） */
 const GROUP_THINKING_TEXT_MAX = 8_000;
 
@@ -658,6 +709,8 @@ type GroupStreamState = {
   lastProcess?: string;
   /** 渲染过程区时「正文是否已开始」（开放思考段在正文开始后置 completed；变化时才重渲染） */
   answerStarted?: boolean;
+  /** 本轮调过电脑操作（desktop_*）：之后思考原文不再累积 / 外发，desktop_* 的参数摘要也不展示（见 GROUP_DESKTOP_THINKING_HIDDEN） */
+  desktopSeen?: boolean;
 };
 
 /** 同时在飞的流式状态上限（防登记被各种路径悄悄摘掉后泄漏；超限丢最老的） */
@@ -739,6 +792,32 @@ type ProcessEventLike = {
   meta?: Record<string, unknown> | undefined;
 };
 
+/** 过程区里已有思考段吗（决定要不要补一条「思考内容不展示」的说明） */
+const hasThinkingPart = (parts: readonly ProcessPart[]): boolean =>
+  parts.some((p) => p.kind === "thinking");
+
+/**
+ * 这一轮刚动了电脑：把已攒下的思考段合并成一条替身（工具段原样保留）。
+ * parts 的下标变了，toolIndex 一并重建（tool_result 靠它回填状态）。
+ */
+const hideThinkingAfterDesktop = (st: GroupStreamState): void => {
+  let placed = false;
+  const next: ProcessPart[] = [];
+  for (const part of st.parts) {
+    if (part.kind !== "thinking") {
+      next.push(part);
+    } else if (!placed) {
+      placed = true;
+      next.push({ kind: "thinking", text: GROUP_DESKTOP_THINKING_HIDDEN });
+    }
+  }
+  st.parts = next;
+  st.toolIndex = new Map();
+  next.forEach((part, i) => {
+    if (part.kind === "tool") st.toolIndex.set(part.callId, i);
+  });
+};
+
 /** 把 thinking / tool_call / tool_result 累积进 parts（逻辑逐条对齐 outbound 的 handleThinking / handleToolCall / handleToolResult） */
 const applyProcessEvent = (
   st: GroupStreamState,
@@ -746,6 +825,13 @@ const applyProcessEvent = (
 ): void => {
   const meta = event.meta as Parameters<typeof toolNameFromMeta>[0];
   if (event.kind === "thinking") {
+    if (st.desktopSeen) {
+      // 动过电脑之后的思考：原文不累积；面板里没有思考段时补一条说明，免得看的人以为思考丢了
+      if (!hasThinkingPart(st.parts)) {
+        st.parts.push({ kind: "thinking", text: GROUP_DESKTOP_THINKING_HIDDEN });
+      }
+      return;
+    }
     const text = redactSecretsInText((event.text ?? "").trim());
     if (!text) return;
     // SDK 会把一次连贯思考拆成多条 thinking 事件：中间没有工具调用就并进同一「思考 N」段
@@ -762,7 +848,17 @@ const applyProcessEvent = (
   const callId =
     (meta && typeof meta.callId === "string" && meta.callId) || "";
   const name = toolNameFromMeta(meta);
-  const argsSummary = argsSummaryFromMeta(meta, event.text ?? "");
+  // 电脑操作：事件自己的工具名认得出来，或者 tool_result 没带名字、但按 callId 对上的那一行本来就是 desktop_*
+  const known = callId ? st.parts[st.toolIndex.get(callId) ?? -1] : undefined;
+  const desktopTool =
+    isDesktopToolName(name) ||
+    (known?.kind === "tool" && isDesktopToolName(known.name));
+  if (desktopTool && !st.desktopSeen) {
+    st.desktopSeen = true;
+    hideThinkingAfterDesktop(st);
+  }
+  // desktop_* 的参数摘要（应用名 / 坐标 / 按键）和结果摘要都不展示：只留工具名与执行状态
+  const argsSummary = desktopTool ? "" : argsSummaryFromMeta(meta, event.text ?? "");
   if (event.kind === "tool_call") {
     const id = callId || `anon_${st.parts.length + 1}`;
     const idx = st.toolIndex.get(id);
@@ -1437,5 +1533,5 @@ export const __resetGroupOutboundForTest = (): void => {
   setGroupAdvanceExpiryHandler(null);
   setGroupQuestionDroppedHandler(null);
   setTalkQueueGroupOtherDropHandler(null);
-  bridgeEnabledCache = null;
+  getBridgeEnabledCell().cache = null;
 };

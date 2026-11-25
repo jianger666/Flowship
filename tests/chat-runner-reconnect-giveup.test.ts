@@ -382,6 +382,138 @@ describe("重连放弃收尾的边界（R2-04 / R2-05 / R2-06）", () => {
     }
   }, 25_000);
 
+  // 第三轮评审：全量测试里出现过一次 ENOENT 的 Unhandled Rejection（放弃收尾写 meta.json 时目录已经没了）。根因是产品代码里的洞，不只是测试清理时序：
+  // sendChatMessage 里 `void consumeChatRun(task, run)` 没有 .catch，而 consumeChatRun 的放弃收尾（finalizeReconnectGaveUp）自己也要写盘——
+  // EACCES / EIO / 磁盘满 / 目录刚被删都会从 catch 分支里冒出来，变成 unhandledRejection（Node 默认会让整个 server 进程退出）。
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "放弃收尾自己写盘失败（退避期间任务目录变成只读）：不是 unhandledRejection；兜底让前端收到 done(ok=false) / error、清掉排队消息；会话槽位照常释放",
+    async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown): void => {
+        unhandled.push(reason);
+      };
+      process.on("unhandledRejection", onUnhandled);
+      const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+      const seen: Array<{ kind: string; ok?: boolean }> = [];
+      const unsub = subscribeTaskStream(TASK_ID, (ev) => {
+        seen.push({ kind: ev.kind, ok: (ev as { ok?: boolean }).ok });
+      });
+      const dir = taskDir(TASK_ID);
+      try {
+        const { releaseStream, agentRSend } = await startFailingRun();
+        // run 在飞时排一条消息：兜底收尾要把它清掉（「未送达」提示的落盘同样会失败，那一步只记 warn、不外抛）
+        enqueueOne("item_ro_q1");
+        expect(getChatQueueCount(TASK_ID)).toBe(1);
+        releaseStream();
+        // 进入退避（A 已摘表）后，把任务目录改成只读：之后放弃收尾要写 meta / 事件，全都 EACCES
+        await vi.waitFor(
+          async () => {
+            expect(hasReconnectingEvent(await readEvents(TASK_ID), 1)).toBe(true);
+          },
+          { timeout: 5_000, interval: 30 },
+        );
+        await fs.chmod(dir, 0o500);
+        await vi.waitFor(
+          () => {
+            expect(agentRSend).toHaveBeenCalledTimes(1);
+            expect(hasChatSession(TASK_ID)).toBe(false);
+          },
+          { timeout: 10_000, interval: 50 },
+        );
+        // 放弃收尾的写盘（失败）要走几次退避重试，慢机器 / 全量并行时远不止固定睡的那几百毫秒（第三轮全量里这里红过一次：
+        // 会话槽位已经释放、收尾的日志还没出来）。所以等**正面信号**：兜底的那条日志出现，或者（改前行为）冒出 unhandledRejection——
+        // 两者必居其一，之后的断言再各自给出明确的失败信息
+        await vi.waitFor(
+          () => {
+            const sawFallbackLog = errorLog.mock.calls.some((c) => c.map(String).join(" ").includes("自动重连放弃的收尾抛错"));
+            expect(sawFallbackLog || unhandled.length > 0, "放弃收尾既没留下兜底日志、也没冒出 unhandledRejection：它还没跑完？").toBe(true);
+          },
+          { timeout: 15_000, interval: 50 },
+        );
+        // Node 在宏任务之间派发 unhandledRejection：让出两拍
+        await new Promise<void>((r) => setImmediate(r));
+        await new Promise<void>((r) => setImmediate(r));
+      } finally {
+        await fs.chmod(dir, 0o700).catch(() => {});
+        process.off("unhandledRejection", onUnhandled);
+        unsub();
+      }
+      const logged = errorLog.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      errorLog.mockRestore();
+      expect(unhandled, "放弃收尾写盘失败冒成了 unhandledRejection（改前行为）").toEqual([]);
+      // 兜底确实接住了它（不是收尾恰好没抛）：留下一条可检索的日志
+      expect(logged).toContain("自动重连放弃的收尾抛错");
+      // 第四轮评审：光「不冒成 unhandledRejection」不够——被外层吞掉的话，前端收不到 done、streaming 一直卡着，排队消息既没发也没通知。
+      // 兜底要让前端收尾（done ok=false + error），并把排队消息清掉
+      expect(
+        seen.some((e) => e.kind === "done" && e.ok === false),
+        "前端没收到 done(ok=false)：streaming 会一直卡着",
+      ).toBe(true);
+      expect(
+        seen.some((e) => e.kind === "error"),
+        "前端没收到 error",
+      ).toBe(true);
+      expect(getChatQueueCount(TASK_ID), "排队消息没被清掉").toBe(0);
+      expect(isChatRunActive(TASK_ID)).toBe(false);
+    },
+    45_000,
+  );
+
+  // 接线契约：上面的行为测试走的是「正常受理」那一处——fire-and-forget 的 consume 一律走带 .catch 的 consumeChatRunDetached，不得再裸 `void consumeChatRun(`。
+  // 第八轮评审 P3-5 之前 sendChatMessage 里有两处调用（正常受理 + 置 running 写盘失败的 statusErr 分支）；statusErr 分支自己 consume 时没复查实例
+  // （这个 await 期间 stop / forceClear 可以到达，consumeChatRun 入口取的 rec 可能是别人的），现在它不再自己 consume、落到与成功路径共用的那道复查，
+  // 调用点只剩一处。statusErr 分支的行为（强清 + 换新会话 → 丢弃迟到 run）见 chat-runner-foreign-marker-cleanup.test.ts「consumeChatRun 的入口复查」。
+  it("sendChatMessage 里 fire-and-forget 的 consumeChatRun 全部走 consumeChatRunDetached（不得裸 void）；statusErr 分支不再自己 consume", async () => {
+    const src = await fs.readFile(
+      path.join(process.cwd(), "src/lib/server/chat-runner.ts"),
+      "utf8",
+    );
+    const code = src
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"));
+      })
+      .join("\n");
+    expect(code).not.toMatch(/\bvoid\s+consumeChatRun\s*\(/);
+    expect((code.match(/\bconsumeChatRunDetached\s*\(/g) ?? []).length).toBeGreaterThanOrEqual(1);
+    expect(code).toMatch(/consumeChatRun\(task, run\)\s*\.catch\(/);
+    // statusErr 分支（置 running 写盘失败）：从 catch 到实例复查 `curAfterStatus` 之间不得出现 consume 调用
+    const catchAt = code.indexOf("catch (statusErr)");
+    const guardAt = code.indexOf("const curAfterStatus", catchAt);
+    expect(catchAt, "找不到 statusErr 分支").toBeGreaterThan(0);
+    expect(guardAt, "statusErr 分支之后应紧跟实例复查（curAfterStatus）").toBeGreaterThan(catchAt);
+    expect(code.slice(catchAt, guardAt), "statusErr 分支不得在实例复查之前自己 consume（第八轮评审 P3-5）").not.toMatch(/consumeChatRun/);
+  });
+
+  // 第四轮评审：重连放弃的收尾要走带兜底的 finalizeReconnectGaveUpSafely（行为见上面「写盘失败」那条）。
+  // 兜底里「表里已经有别的实例就不碰」只在写盘抛错的瞬间恰好有新实例时才触发，行为上很难稳定复现——用结构断言钉住它
+  it("重连放弃的收尾只经 finalizeReconnectGaveUpSafely 调用；兜底先看表里有没有别的实例，再清队 / 发 done（不碰用户新起的实例）", async () => {
+    const src = await fs.readFile(
+      path.join(process.cwd(), "src/lib/server/chat-runner.ts"),
+      "utf8",
+    );
+    const code = src
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"));
+      })
+      .join("\n");
+    // 裸调用（`finalizeReconnectGaveUp(`，定义处是 `= async (` 不算）只允许出现在 Safely 自己里面 1 处；业务调用点（consumeChatRun 的放弃分支）一律是 Safely
+    expect((code.match(/\bfinalizeReconnectGaveUp\s*\(/g) ?? []).length).toBe(1);
+    expect(code).toMatch(/await finalizeReconnectGaveUpSafely\(task, giveUpErr\)/);
+    const start = code.indexOf("const finalizeReconnectGaveUpSafely");
+    expect(start).toBeGreaterThan(-1);
+    const body = code.slice(start, code.indexOf("const handleChatRunFailure", start));
+    const guard = body.indexOf("if (runningChats.has(task.id)) return false;");
+    const clearQueue = body.indexOf('failQueuedItemsCapturingTexts(task.id, "error")');
+    const done = body.indexOf('publish(task.id, { kind: "done", task, ok: false })');
+    expect(guard, "兜底里缺「表里已有别的实例就不碰」").toBeGreaterThan(-1);
+    expect(clearQueue).toBeGreaterThan(guard);
+    expect(done).toBeGreaterThan(guard);
+  });
+
   it("R2-06：error 清队的提示附每条被丢弃消息的摘要（80 字截断、空白折叠），完整文本放 meta.droppedTexts", async () => {
     const { releaseStream, agentRSend } = await startFailingRun();
     const long = `甲${"长".repeat(199)}尾`; // 201 字：摘要必须被截断、meta 里是完整原文

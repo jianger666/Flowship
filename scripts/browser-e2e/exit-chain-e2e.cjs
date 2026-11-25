@@ -9,7 +9,25 @@ const { app, BrowserWindow } = require("electron");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-app.setPath("userData", fs.mkdtempSync(path.join(os.tmpdir(), "fs-exit-e2e-")));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "fs-exit-e2e-"));
+app.setPath("userData", TMP);
+// 清临时 userData（第十七轮评审 B-2 补了正常收尾；第十八轮评审 R-1：FATAL 路径也要清）。
+// best-effort：Chromium 退出前可能还在写缓存，偶发 ENOTEMPTY / EBUSY——重试几次，仍清不掉只告警，不改退出码、不吞原始错误；可重复调用
+const cleanupTmp = () => {
+  // 先销毁剩下的窗口（Chromium 还抱着 userData 时 rmSync 容易 ENOTEMPTY），再清
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      w.destroy();
+    } catch {
+      /* 已销毁 */
+    }
+  }
+  try {
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 const check = (n, ok, x = "") => { results.push(ok); console.log(`${ok ? "PASS" : "FAIL"} ${n}${x ? " — " + x : ""}`); };
@@ -67,5 +85,6 @@ app.whenReady().then(async () => {
   check("停车场销毁、已无窗口 → 只由 Electron 原生补一次（我们的补发不重复）", emitted === 3, `emitted=${emitted} manual=${manual}`);
 
   console.log(`\n结果：${results.filter(Boolean).length}/${results.length}`);
+  cleanupTmp(); // 清不掉只告警（不让「全部通过」被清理失败变成 FATAL exit 1；第十七轮评审 B-2：此前这个脚本建了临时目录却从不清）
   app.exit(results.every(Boolean) ? 0 : 1);
-}).catch((e) => { console.error(e); app.exit(1); });
+}).catch((e) => { console.error(e); cleanupTmp(); app.exit(1); }); // 错误已先打出；清理只告警，退出码不变

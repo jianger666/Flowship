@@ -18,6 +18,7 @@ import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
 import { SCHEDULE_TOOL_NAME, scheduleToolSummary } from "@/lib/schedule";
 import { WAIT_TOOL_NAME, waitToolSummary } from "@/lib/wait-display";
 import { browserToolSummary, isBrowserToolName } from "@/lib/browser-tool-display";
+import { desktopToolSummary, isDesktopToolName } from "@/lib/desktop-tool-display";
 
 /** SSE ephemeral：不进 task.events / 不进持久 rows */
 export const isEphemeralToolOutputDelta = (ev: TaskEvent): boolean =>
@@ -1358,6 +1359,12 @@ export const toolBlockSummary = (block: ToolBlock): string => {
   if (isBrowserToolName(n)) {
     const browserSummary = browserToolSummary(n, block.args);
     if (browserSummary) return browserSummary;
+  }
+
+  // 电脑操作工具同理（点击 (320, 240) / 输入 5 个字符 / 按键 cmd+c；打出去的文字不回显）
+  if (isDesktopToolName(n)) {
+    const desktopSummary = desktopToolSummary(n, block.args);
+    if (desktopSummary) return desktopSummary;
   }
 
   // edit / write：路径 + 行统计

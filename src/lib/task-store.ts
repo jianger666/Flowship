@@ -2046,6 +2046,14 @@ export const setActionExcluded = async (
  *   - images：贴图（每张图作为独立 type=image doc 落盘）
  *   - 至少一个非空、title 和 content 必须一起填或一起省略
  */
+export type AddContextDocResult =
+  | { task: Task; committed?: undefined; warning?: undefined }
+  // 文档已落盘、但服务端读回最新任务视图失败（路由回 201 + committed）：没有 task，只有 warning。
+  // 调用方不能当失败重试（会重复添加）、也拿不到可 absorb 的 task
+  | { task: null; committed: true; warning: string };
+
+const COMMITTED_FALLBACK_WARNING = "上下文文档已保存，但读取最新任务状态失败";
+
 export const addContextDoc = async (
   taskId: string,
   input: {
@@ -2053,7 +2061,7 @@ export const addContextDoc = async (
     content?: string;
     images?: ImagePayload[];
   },
-): Promise<Task> => {
+): Promise<AddContextDocResult> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/context-docs`,
     {
@@ -2067,8 +2075,25 @@ export const addContextDoc = async (
       }),
     },
   );
-  const data = await handleJson<{ ok: true; task: Task }>(res);
-  return data.task;
+  const data = await handleJson<{
+    ok: true;
+    task?: Task;
+    committed?: boolean;
+    warning?: unknown;
+  }>(res);
+  if (data.task) return { task: data.task };
+  if (data.committed === true) {
+    return {
+      task: null,
+      committed: true,
+      warning:
+        typeof data.warning === "string" && data.warning.trim()
+          ? data.warning
+          : COMMITTED_FALLBACK_WARNING,
+    };
+  }
+  // 2xx 却既没有 task 也不是 committed：协议异常，别把 undefined 当成功交给调用方
+  throw new Error("服务端响应缺少 task");
 };
 
 export const removeContextDoc = async (

@@ -911,6 +911,18 @@ const handleGroupAskAction = async (
     warnLark("loadBridgeBootContext(group ask)", err);
   }
 
+  // 点按钮的人是不是任务所有者（应用 owner）：不是 = 答案是别人定的，要按「别人的内容在驱动」处理
+  // （注入后登记「群成员触发」标记、恒拒 desktop_* 等，见 ask-inject 的 foreignContent）。
+  // 按钮的文案虽是 agent 自己写的选项，但「选哪个」是外人替所有者做的决定——agent 问「要不要继续操作微信」，外人点「继续」
+  // 不能当作所有者授权。同样得放在 pending 比对之前（零 await 窗口）。查不到 owner = 按外人算（fail-closed）
+  let operatorIsOwner = false;
+  try {
+    const ownerOpenId = (await getBotAppInfo()).ownerOpenId;
+    operatorIsOwner = !!ownerOpenId && operatorOpenId === ownerOpenId;
+  } catch (err) {
+    warnLark("getBotAppInfo(group ask owner)", err);
+  }
+
   // ⚠️ 自此往下到 injectPendingAskText 调用之间不得出现 await（失效分支直接 return 的除外）
   const pending = getPendingAsk(value.taskId);
 
@@ -975,7 +987,7 @@ const handleGroupAskAction = async (
     opt.label,
     bootArgs,
     undefined,
-    { answeredBy },
+    { answeredBy, ...(operatorIsOwner ? {} : { foreignContent: true as const }) },
   );
   if (!result.ok) {
     // 没送进去就别挂着登记——否则下一轮无关的 done 会把结果误发进群

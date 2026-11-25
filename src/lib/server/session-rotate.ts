@@ -9,8 +9,12 @@
  * 摘要——与 resume 失败降级 / 切模型同一条路），把 GB 级旧 Agent 内存扔掉。
  * `events.jsonl` 是真相源、扔的只是 SDK 会话缓存，转坏上限 = 忘点远古上下文。
  *
- * 范围：只 chat（chat-inject 决策点）。task-runner 不动。
- * 阈值极高、正常会话撞不上；开关 = 阈值常量（改大即关）。
+ * 范围：最初只 chat（chat-inject 决策点），task-runner 不动——这句是 2026-09-03 的状态，**已过时**（第十五轮评审 P3-6 订正）：
+ * 之后 task-runner 也接了进来——边界轮换（有两个点，都用 `shouldRotateSession` + `isPerfRotationDue`：`advanceTask` 的 `rotationDue`〔日志 `via=advance-force-new`〕，
+ * 与 `sendToTaskSessionBody` 里问答 / 追问的边界轮换〔日志 `via=question-boundary`，task-runner.ts 约 :7290；第十六轮评审 P3-D4：此前这里只列了前一个〕）
+ * 与 run 内轮换（下面 `maybeFireMidRunRotation`，2026-09-22 自动压缩续接）；chat 仍只在消息边界懒重启、不登记 run 内触发器（见下面「run 内水位触发器」一节的「chat 不登记」）。
+ * 阈值极高、正常会话撞不上；**总开关是环境变量 `FLOWSHIP_TOKEN_WATERMARK`（缺省关，见下面 2026-10-08 一节），不是「阈值常量（改大即关）」**——
+ * 这句原先写的是 2026-10-08 之前的做法，已过时（第十六轮评审 P3-D4）。
  *
  * 为什么只看「会话累计」、不看「单轮」：
  * 转完后 `tokenUsage.last` 还是转前那轮的旧值（新轮没跑完）——若拿单轮做触发，
@@ -74,6 +78,8 @@ export const isTokenWatermarkEnabled = (
 
 /**
  * 水位到了返 true（总开关关闭时恒 false）。缺字段（老任务）→ 用 total 估算，再缺 = 不转。
+ * 注意比较的量：优先是 `sessionInputTokens`（当前 SDK 会话累计 input、新建锚点清零）；**缺这个字段时回退成任务累计的 `totalInputTokens`**——
+ * 所以「会话累计 input ≥ 200 万」对老任务不严格成立（第十六轮评审 P3-D4；转一次即自愈、之后走正常计数）。
  * 除总开关外是纯函数。
  */
 export const isSessionRotationDue = (u: RotationUsageLike): boolean =>

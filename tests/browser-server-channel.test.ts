@@ -62,6 +62,70 @@ describe("握手与 config", () => {
     proc.emit("message", { v: 1, kind: "config", evaluateEnabled: false });
     expect(onConfig).toHaveBeenLastCalledWith({ evaluateEnabled: false });
   });
+
+  it("电脑操作的两个总开关（desktopEnabled / desktopLockedAccess）同样只认 boolean", async () => {
+    const { proc, onConfig } = setup(async () => ({}));
+    proc.emit("message", { v: 1, kind: "config", desktopEnabled: true, desktopLockedAccess: false });
+    expect(onConfig).toHaveBeenLastCalledWith({ desktopEnabled: true, desktopLockedAccess: false });
+    proc.emit("message", { v: 1, kind: "config", desktopEnabled: "true", desktopLockedAccess: 1 });
+    expect(onConfig).toHaveBeenLastCalledWith({});
+  });
+});
+
+describe("扩展能力与关闭回调（电脑操作 desktop.v1）", () => {
+  const makeExt = (extra: { capabilities?: string[]; onClose?: () => void }) => {
+    const proc = new FakeProc();
+    const logs: string[] = [];
+    const channel = createServerChannel({
+      proc: proc as never,
+      dispatch: async () => ({}),
+      platform: "test-os",
+      log: (m) => logs.push(m),
+      ...extra,
+    });
+    return { proc, channel, logs };
+  };
+
+  it("hello-ack 的 capabilities = browser.v1 + 传入的扩展能力，重复项合并", () => {
+    const { proc } = makeExt({ capabilities: ["desktop.v1", "browser.v1", "desktop.v1"] });
+    proc.emit("message", { v: 1, kind: "hello" });
+    expect(proc.sent).toEqual([{ v: 1, kind: "hello-ack", platform: "test-os", capabilities: ["browser.v1", "desktop.v1"] }]);
+  });
+
+  it.each(["exit", "disconnect"])("proc %s：onClose 恰好调用一次（重复关闭不重复触发）", (ev) => {
+    const onClose = vi.fn();
+    const { proc, channel } = makeExt({ onClose });
+    expect(onClose).not.toHaveBeenCalled();
+    proc.emit(ev);
+    channel.close();
+    proc.emit(ev);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("主动 close() 也触发 onClose；onClose 抛错只记日志、不冒泡，通道照样关闭", () => {
+    const onClose = vi.fn(() => {
+      throw new Error("回调炸了");
+    });
+    const { channel, logs } = makeExt({ onClose });
+    expect(() => channel.close()).not.toThrow();
+    expect(channel.isClosed()).toBe(true);
+    expect(logs.join("\n")).toContain("回调炸了");
+  });
+
+  it("onClose 触发时挂起的请求已经被 abort、通道已标记关闭（回调里看到的是收尾后的状态）", async () => {
+    const seen: Array<{ closed: boolean; pending: number }> = [];
+    const proc = new FakeProc();
+    const holder: { channel?: ReturnType<typeof createServerChannel> } = {};
+    holder.channel = createServerChannel({
+      proc: proc as never,
+      dispatch: (_op, _args, ctx) => new Promise((_res, rej) => ctx.signal.addEventListener("abort", () => rej(ctx.signal.reason), { once: true })),
+      onClose: () => seen.push({ closed: holder.channel!.isClosed(), pending: holder.channel!.pendingCount() }),
+    });
+    proc.emit("message", { v: 1, kind: "req", id: 1, taskId: "t", op: "wait_for", args: {} });
+    proc.emit("exit");
+    await flush();
+    expect(seen).toEqual([{ closed: true, pending: 0 }]);
+  });
 });
 
 describe("req 分发", () => {

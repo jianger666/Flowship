@@ -68,6 +68,22 @@ afterAll(() => {
   rmSync(TMP_ROOT, { recursive: true, force: true });
 });
 
+describe("工具说明的行为锚点（说明常驻在每个任务里、预算护栏鼓励压缩；压缩时别把这些行为约束压没了）", () => {
+  const desc = flowShipTools.find((t) => t.name === "expect_group_reply")!.description;
+
+  it.each([
+    ["请直接 @本机机器人", "出问措辞：对方默认会 @ 它自己的负责人，不 @ 到本机机器人就收不到回复"],
+    ["只回实质答案，不用回复『收到』", "对方是机器人时，防两边互相客套成环"],
+    ["ttl_minutes: 10", "占位登记用短有效期，别长时间悬着"],
+    ["message_id 随手填个唯一串，每次换一个", "占位串不复用，否则被当成同一条去重"],
+    ["不知道 id 时不许填显示名", "target 只收稳定 id，防改名冒充"],
+    ["一次只等一件事", "多问串行"],
+    ["补问前需重新登记", "补问也要登记"],
+  ])("说明里有「%s」（%s）", (phrase) => {
+    expect(desc).toContain(phrase);
+  });
+});
+
 describe("expect_group_reply handler", () => {
   beforeEach(() => {
     __resetOutboundRegistryForTest();

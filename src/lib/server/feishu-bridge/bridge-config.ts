@@ -38,14 +38,64 @@ export const isFeishuChatBridgeEnabled = async (): Promise<boolean> => {
   return result.settings.feishuChatBridge === true;
 };
 
-/** 插电防休眠子开关（默认开；仅桥接开启时才有意义） */
-export const isFeishuBridgeKeepAwakeEnabled = async (): Promise<boolean> => {
-  const result = await readSettingsFile();
-  if (result.status !== "ok") return true;
-  const v = result.settings.feishuBridgeKeepAwake;
-  // 缺省 / 非 false → true（决策 #14）
-  return v !== false;
+/**
+ * 总开关的「带读失败信号」版本——**只给 inbound 的对账层用**：
+ * - `true` / `false`：读到了（文件不存在 = 从没配过 = 默认关 = false）；
+ * - `null`：读失败（config.json 损坏 / 权限 / 被杀软瞬时占用 / readSettingsFile 抛错）——**不知道开关现在是什么**。
+ *
+ * 为什么要区分：上面的 {@link isFeishuChatBridgeEnabled} 对外口径是 boolean（读失败 = false，
+ * group-outbound / outbound / group-broadcast 等调用方都按「读不到就当关」处理，保持不变）；
+ * 但对账层若把「读失败」当「关」，刚 rename 完 Windows 杀软瞬时占文件这类瞬态失败就会把正在跑的 consumer 误停。
+ * 对账层遇到 `null` 应保持现状（不启不停），留给 30s 轮询重试。
+ *
+ * 可逆性：删掉本函数、对账层改回调 isFeishuChatBridgeEnabled 即回到旧行为（读失败 = 关）。
+ */
+export const readFeishuChatBridgeEnabledState = async (): Promise<
+  boolean | null
+> => {
+  try {
+    const result = await readSettingsFile();
+    if (result.status === "ok") return result.settings.feishuChatBridge === true;
+    if (result.status === "missing") return false;
+    return null;
+  } catch {
+    return null;
+  }
 };
+
+/**
+ * 防休眠子开关的「带读失败信号」版本——**只给 inbound 的对账层用**（R20-16，与总开关的 {@link readFeishuChatBridgeEnabledState} 同一口径）：
+ * - `true` / `false`：读到了（文件不存在 / 缺省 / 非 false 都算 true——决策 #14：默认开；只有显式 false 才关）；
+ * - `null`：读失败（config.json 损坏 / 权限 / 被杀软瞬时占用 / readSettingsFile 抛错）——**不知道子开关现在是什么**。
+ *
+ * 为什么要区分：对账层读完总开关（=开）紧接着还要再读一次盘取这个子开关。原先读失败当 true：
+ * 用户其实关了防休眠、这第二次读恰好瞬时失败，就会被误起 caffeinate（直到下次轮询才纠正）；
+ * 读盘若直接抛，则整轮对账抛错、连 consumer 也没起。对账层遇到 `null` 应保持防休眠现状（不启不停）、本轮照常往下起 consumer，留给 30s 轮询重试。
+ *
+ * 可逆性：inbound 的 syncKeepAwake 改回调 {@link isFeishuBridgeKeepAwakeEnabled} 即回到旧行为（读失败 = 开）。
+ */
+export const readFeishuBridgeKeepAwakeState = async (): Promise<
+  boolean | null
+> => {
+  try {
+    const result = await readSettingsFile();
+    if (result.status === "ok") {
+      // 缺省 / 非 false → true（决策 #14）
+      return result.settings.feishuBridgeKeepAwake !== false;
+    }
+    if (result.status === "missing") return true;
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * 插电防休眠子开关（默认开；仅桥接开启时才有意义）。boolean 口径：读失败 = 开（默认值）。
+ * 对账层要区分「读失败」请用 {@link readFeishuBridgeKeepAwakeState}（返回 null 表示读失败）。
+ */
+export const isFeishuBridgeKeepAwakeEnabled = async (): Promise<boolean> =>
+  (await readFeishuBridgeKeepAwakeState()) ?? true;
 
 /**
  * 飞书卡片打字机（设置 → 连接 → 飞书集成「流式回复」，默认开；私聊卡与群答疑回复共用，群里的任务级覆盖见

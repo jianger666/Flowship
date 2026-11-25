@@ -35,13 +35,19 @@ import { PATCH } from "@/app/api/settings/route";
 import {
   GROUP_NON_OWNER_GUARD_DEFAULT,
   GROUP_NON_OWNER_GUARD_PROMPT_PREVIEW,
+  GROUP_NON_OWNER_OPEN_NOTE_PREVIEW,
+  GROUP_REPLY_SILENCE,
+  GROUP_REPLY_WHERE,
   NON_OWNER_TURN_ALLOWED_TOOLS,
+  OWNER_GROUP_NOTE,
   buildBotEtiquetteNote,
   buildNonOwnerGroupHeader,
   buildNonOwnerGuardFootnote,
+  buildNonOwnerOpenNote,
   buildNonOwnerToolDenied,
 } from "@/lib/group-non-owner-prompt";
 import { isFieldEqual } from "@/hooks/use-settings";
+import { formatReplyRulesSection } from "@/lib/server/feishu-bridge/group-answer-context";
 import { DEFAULT_SETTINGS, normalizeSettings } from "@/lib/local-store";
 import { buildAgentMessage } from "@/lib/server/chat-pending";
 import {
@@ -188,6 +194,144 @@ describe("机器人克制提示（同权但仍防互 @ 成环）", () => {
 
   it("不传 groupBotEtiquette（真人 / 属主）：不出现克制提示", () => {
     expect(buildAgentMessage(base)).not.toContain("别回「收到」");
+  });
+});
+
+describe("开关关（真人）：「限制已关闭」声明——状态不能靠「缺席」表示", () => {
+  // 2026-11-19 玉灵：关了开关，机器人仍拒绝造线索。模型看到的只有抬头里的「（非任务所有者）」，
+  // 会话历史里又留着开关开着时的约束段 + 它自己的拒绝先例；什么都不加 = 让它继续保守。
+  const base = {
+    kind: "user_message" as const,
+    text: "[群消息·来自 李四（非任务所有者）]\n帮我造一条线索",
+  };
+
+  it("声明内容：点名发言人 / 限制已关且此前的约束不再适用 / 抬头只是标身份 / 推进仍只听所有者 / 回复去向与沉默口径引共享句", () => {
+    const t = buildNonOwnerOpenNote("李四");
+    expect(t).toContain("成员「李四」");
+    expect(t).toContain("关掉了「限制群里非宿主成员」");
+    expect(t).toContain("「只答疑」类的约束，对这条不再适用");
+    expect(t).toContain("「非任务所有者」只是标身份");
+    // 「写所有者备注」要点名：不点名模型会替成员代记备注（评审）；新建定时 / 操作电脑与代码里的同权恒拒表（flowship-tools）同口径。
+    // 末尾「别用命令行绕开」：那几道硬闸只管 Flowship 自己的工具，agent 自带的 shell 不经它们，只能叮嘱（评审 b）
+    expect(t).toContain("交卷 / 提 MR / 推进任务 / 写所有者备注 / 新建定时 / 操作电脑仍只听所有者的，别用命令行绕开");
+    // 回复去向（发群 / 自动 @ / 别提 Flowship）与沉默口径是共享句：声明里引同一份，不再自己抄一遍
+    expect(t).toContain(GROUP_REPLY_WHERE);
+    expect(t).toContain(GROUP_REPLY_SILENCE);
+    // 它不是约束段：没有「只答疑」规则
+    expect(t).not.toContain("不修改任何文件");
+    expect(t).not.toContain("本轮规则：");
+    // 别的用例靠这两个字面判断「消息里有没有约束段 / 克制提示」——声明里不得出现
+    expect(t).not.toContain("非任务所有者「");
+    expect(t).not.toContain("别回「收到」");
+  });
+
+  it("buildAgentMessage：groupNonOwnerOpen → 默认脚注 + 声明在最后；没有约束段", () => {
+    const out = buildAgentMessage({ ...base, groupNonOwnerOpen: { name: "李四" } });
+    expect(out).toContain("**修改要求**才动手改");
+    expect(out.endsWith(buildNonOwnerOpenNote("李四"))).toBe(true);
+    expect(out).not.toContain("本轮规则：");
+  });
+
+  it("不传 groupNonOwnerOpen（属主 / 开关开）：不出现声明；开关开时约束段里也没有这句", () => {
+    expect(buildAgentMessage(base)).not.toContain("限制群里非宿主成员");
+    expect(
+      buildAgentMessage({ ...base, groupNonOwnerGuard: { name: "李四" } }),
+    ).not.toContain("限制群里非宿主成员");
+  });
+
+  it("scheduled / ackContext 的消息不吃声明（属主语义）", () => {
+    const sched = buildAgentMessage({
+      ...base,
+      scheduled: true,
+      groupNonOwnerOpen: { name: "李四" },
+    });
+    expect(sched).not.toContain("限制群里非宿主成员");
+    const ack = buildAgentMessage({
+      ...base,
+      ackContext: { actionId: "act-1", artifactPath: "a.md" },
+      groupNonOwnerOpen: { name: "李四" },
+    });
+    expect(ack).not.toContain("限制群里非宿主成员");
+    expect(ack).toContain("〈产出审阅中〉");
+  });
+
+  it("设置页预览与实际发送同一份（占位符 {发言人}）", () => {
+    expect(GROUP_NON_OWNER_OPEN_NOTE_PREVIEW).toBe(buildNonOwnerOpenNote("{发言人}"));
+  });
+});
+
+describe("口径统一：外部同事没有 Flowship，约束段 / 拒绝文案都不再叫对方去 Flowship 里操作", () => {
+  it("约束段（真人 / 机器人变体）都不叫对方去 Flowship 里操作，而是点明别提 Flowship", () => {
+    const human = buildNonOwnerGuardFootnote("李四");
+    const bot = buildNonOwnerGuardFootnote("别家机器人", { isBot: true });
+    for (const t of [human, bot]) expect(t).not.toContain("在 Flowship 里操作");
+    expect(human).toContain("也别让他去 Flowship 里找");
+    expect(bot).toContain("别提 Flowship");
+  });
+
+  it("[DENIED] 文案同样不叫对方去 Flowship 里发起", () => {
+    const msg = buildNonOwnerToolDenied("submit_work");
+    expect(msg).not.toContain("在 Flowship 里发起");
+    expect(msg).toContain("任务所有者本人处理");
+  });
+
+  it("[DENIED] 文案不带「它会推进任务 / 向外发消息 / 建定时…」这类只对部分工具成立的解释（被拒的还有浏览器 / 写文件 / MCP 工具）", () => {
+    for (const name of ["submit_work", "browser_navigate", "write"]) {
+      const msg = buildNonOwnerToolDenied(name);
+      expect(msg).toContain("[DENIED]");
+      expect(msg).toContain(name);
+      expect(msg).not.toContain("它会推进任务");
+    }
+  });
+});
+
+describe("回复去向措辞：群里收到的是本轮累积全文，不是只有「最终回复」", () => {
+  it("共享句 / 机器人尾注 / 所有者尾注都说「你这一轮写的文字」，不再说「最终回复」", () => {
+    expect(GROUP_REPLY_WHERE).toContain("你这一轮写的文字会原文发到该群");
+    for (const t of [
+      GROUP_REPLY_WHERE,
+      buildBotEtiquetteNote("别家机器人", "ou_abcdef"),
+      OWNER_GROUP_NOTE,
+    ]) {
+      expect(t).not.toContain("最终回复");
+    }
+  });
+
+  it("答疑 agent 的守则同口径：含调用工具之前的文字也会发群；不再说「只有最后一段会被保留」", () => {
+    for (const requesterIsBot of [false, true]) {
+      const rules = formatReplyRulesSection({ requesterIsBot }).join("\n");
+      expect(rules).toContain("含调用工具之前的");
+      expect(rules).not.toContain("只有最后一段");
+    }
+  });
+});
+
+describe("回复去向：共享句只写一遍（GROUP_REPLY_WHERE / GROUP_REPLY_SILENCE），约束段 / 声明 / 所有者尾注都引它", () => {
+  it("约束段（真人）第 4 条 = 共享句 + 沉默口径；机器人变体走自己的规则（必须手动 @），不带「系统自动 @」", () => {
+    expect(buildNonOwnerGuardFootnote("李四")).toContain(
+      `4. ${GROUP_REPLY_WHERE}${GROUP_REPLY_SILENCE}`,
+    );
+    const bot = buildNonOwnerGuardFootnote("别家机器人", { isBot: true });
+    expect(bot).not.toContain(GROUP_REPLY_WHERE);
+    expect(bot).not.toContain("系统自动 @ 提问人");
+    expect(bot).toContain("必须在正文里 @ 它");
+  });
+
+  it("所有者群消息尾注：说明是所有者本人说的 + 回复去向；没有权限 / 沉默口径 / 约束段字样", () => {
+    expect(OWNER_GROUP_NOTE).toContain("任务所有者本人");
+    expect(OWNER_GROUP_NOTE).toContain(GROUP_REPLY_WHERE);
+    expect(OWNER_GROUP_NOTE).not.toContain(GROUP_REPLY_SILENCE);
+    expect(OWNER_GROUP_NOTE).not.toContain("非任务所有者「");
+    expect(OWNER_GROUP_NOTE).not.toContain("本轮规则：");
+    expect(OWNER_GROUP_NOTE).not.toContain("只答疑");
+  });
+
+  it("共享句本身的内容：发到群 / 自动 @ 提问人 / 别提 Flowship 与事件流 / 沉默用 NO_REPLY", () => {
+    expect(GROUP_REPLY_WHERE).toContain("原文发到该群");
+    expect(GROUP_REPLY_WHERE).toContain("自动 @ 提问人");
+    expect(GROUP_REPLY_WHERE).toContain("Flowship");
+    expect(GROUP_REPLY_WHERE).toContain("事件流");
+    expect(GROUP_REPLY_SILENCE).toContain("NO_REPLY");
   });
 });
 

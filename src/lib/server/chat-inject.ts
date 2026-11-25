@@ -116,6 +116,11 @@ import {
   stringSetEquals,
 } from "@/lib/server/route-helpers";
 import { TASK_INJECT_BUSY_CODE } from "./task-inject-shared";
+import {
+  beginForeignContentMidRun,
+  isLiveMarkerToken,
+  rollbackForeignContentMidRun,
+} from "./non-owner-turn-guard";
 import { buildBrowserActivityNote, shouldAttachBrowserNote } from "./browser/activity";
 
 
@@ -159,6 +164,31 @@ export interface ChatInjectOptions {
    * 只能由服务端可信调用方经 options 传入——**不要**做成请求体字段（否则任何 HTTP 客户端都能往 agent 消息里塞内容）。
    */
   agentContext?: string;
+  /**
+   * 这一轮是「别人写的内容在驱动」：所有者在需求群里空 @ 指向了别人的消息，AI 读到的全部内容都出自那个人
+   * （第三轮评审 P1-1；task 型靠 send 起点登记标记，chat 没有这个机制，之前这种引用在 chat 里完全没标记）。
+   * 只能由服务端可信调用方经 options 传入（理由同 agentContext）。
+   * - 送达前补登一个 scope=desktop 的中途标记（agent 一拿到内容就可能调工具，必须先就位）：这一轮后面的 desktop_* /
+   *   写所有者备注 / 新建定时 / 自动推进恒拒；run 收尾由 consumeChatRun 的 finally 清，新会话起不来由 runChatSession 的 finally 清；
+   *   没送出去（送达成立**之前**的任何非 2xx / 抛错）在这里回滚；**送达一成立 token 就交出去**（`foreignRef.token = undefined`：直送 send 返回 sent、
+   *   askSkip 回写成功、新会话占位挂上之后），此后 commit / 存图 / 读盘等收尾 await 抛错、请求以错误结束，也**不再**回滚——标记已归 run 收尾按名清
+   *   （第十三轮评审 P3-1；第十四轮评审 P3-6 ④：此前这里只写「回滚」，没写交出 token 之后不再回滚）。
+   *   新会话的首条被别路会话占了位、改入队（runner 回 `already_running`）= 这条没有送达，预登记的标记就地回滚（第十四轮评审 P3-2）。
+   *   至少四处回滚（外层 finally / 入队成功 / 入队撞 `already_settled`〔第十六轮评审 P3-C2 补的第四处〕/ `already_running`；askSkip 回写的收回另算，见下）
+   *   都用让位版 `rollbackForeignContentMidRun`（第十五轮评审 P3-3 F1：此前是按 token 硬清，
+   *   会清掉别路沿用者那一轮的保护；第十七轮评审 N3 订正了此前「三处」的数法），`registerForeignMark` 在自己的 token 还活着时不二次登记（否则自己把自己置成「被沿用」，让位版就判不准）。
+   *   该 task 此刻已有活标记 → 不新建、不降级（已有的至少一样严）。
+   *   **登记点紧贴送达（registerForeignMark：sendChatMessage / runChatSession 之前、与它们之间不得有 await），不在入口登记**：
+   *   入口到送达之间有发送前快照（扫仓库、大仓 1–10 秒）等一串 await，上一轮 run 若恰好在这期间收尾，它 finally 里的
+   *   endMidRunForeignContent 是按名清、不看归属的，会把一个早早登记的标记一并清掉，这条消息就在无标记状态下送达了（第四轮评审）。
+   * - **忙时照常排队**（第五轮评审 N1：第四轮曾回 409 让发件人稍后再 @ 一次，所有者一句话只因 agent 正忙就丢了）：队列项带着
+   *   foreignContentTurn，标记**不在入队时登记**——那会去限制属主此刻正在跑的那一轮，而那一轮的收尾又会按名把它清掉；
+   *   等它出队、真正送达的那一刻（flush → sendChatMessage / 队列优先启动 → runChatSession，agent.send 之前、同步）才登记，
+   *   送达失败用让位版 `rollbackForeignContentMidRun` 回滚（不是按 token 硬清，第十五轮评审 P3-3 F1；第十七轮评审 N5 订正此前「按 token 回滚」的说法）。直送路径 sendChatMessage 返回 busy 才改入队时，上面预登记的标记在入队成功处回滚（enqueueOrReject）。
+   *   上一轮收尾（finalizeChatRunIfCurrent 的 finished 分支）在放 runActive 之前同步清掉那一轮的标记，
+   *   所以紧随其后 flush 出来的排队外来内容拿到的是干净的「下一轮」标记。
+   */
+  foreignContentTurn?: boolean;
 }
 
 const MAX_IMAGES_PER_REPLY = 6;
@@ -181,12 +211,31 @@ export const handleChatReplyInject = async (
   options: ChatInjectOptions = {},
 ): Promise<Response> => {
   const skipRef: { handle: AskSkipHandle | null } = { handle: null };
+  // 「别人的内容在驱动」的一轮（见 ChatInjectOptions.foreignContentTurn）：中途标记由 runChatReplyInject 在**送达前一刻**同步登记
+  // （registerForeignMark），这里只拿它登记出来的 token 做回滚。不能在入口登记：入口到送达之间的 await 里，
+  // 上一轮 run 的收尾会按名把它清掉（第四轮评审「标记竞态」）。与 ask-inject 对非属主答案的做法同一套（beginForeignContentMidRun）；
+  // 已有活标记时登记返回 undefined（不新建，回滚时也不会误清它）
+  const foreignRef: ForeignMarkRef = { token: undefined };
+  let accepted = false;
   try {
-    return await runChatReplyInject(id, body, options, skipRef);
+    const resp = await runChatReplyInject(id, body, options, skipRef, foreignRef);
+    // 2xx = 已送进会话 / 新会话已带着它起来了 / 已入队（入队时预登记的标记已在 enqueueOrReject 里回滚、改由出队时再登记）；
+    // 其余都没有 run 在处理它
+    accepted = resp.ok;
+    return resp;
   } finally {
     skipRef.handle?.rollback();
+    // 没送出去就别留着标记挡属主的下一轮（送出去的由 run 收尾清）。
+    // 让位版（第十五轮评审 P3-3 F1：此前是按 token 硬清）：登记之后若被别路沿用过、且此刻有 run 在跑，标记留给那一轮的收尾按名清——
+    // 硬清会把沿用者那一轮的保护清掉（典型：本路直送没送出去、落到新会话路径，别路 B 沿用了它并起了新会话）
+    if (!accepted) rollbackForeignContentMidRun(id, foreignRef.token);
   }
 };
+
+/** 「别人的内容在驱动」那一轮登记出来的中途标记 token（新建的才有；沿用已有标记 / 还没登记时为 undefined），供没送出去时回滚 */
+interface ForeignMarkRef {
+  token: string | undefined;
+}
 
 /**
  * X3(b)：chat 入口的堆水位门。返回非 null = 拒（503），调用方原样返回。
@@ -228,8 +277,27 @@ const runChatReplyInject = async (
   body: unknown,
   options: ChatInjectOptions,
   skipRef: { handle: AskSkipHandle | null },
+  foreignRef: ForeignMarkRef,
 ): Promise<Response> => {
   const parsed = (body ?? {}) as ChatInjectBody;
+
+  /**
+   * 「别人的内容在驱动」的一轮：把中途标记登记到位（见 ChatInjectOptions.foreignContentTurn 的说明）。
+   * **只能紧贴送达调用：与 sendChatMessage / runChatSession 之间不得有 await**——登记之后再让出一次事件循环，
+   * 上一轮 run 的收尾（endMidRunForeignContent 按名清）就可能插进来把它清掉。
+   * 此刻已有活标记 → beginForeignContentMidRun 返回 undefined（不新建、不降级），沿用它；新建了的 token 记在 foreignRef 里，
+   * 没送出去时回滚：外层 finally / 入队成功 / 入队撞 `already_settled` / `already_running`，至少这四处都走让位版 rollbackForeignContentMidRun（第十五轮评审 P3-3 F1；第四处是第十六轮评审 P3-C2 补的，第十七轮评审 N3 订正此前「三处」的数法）。
+   * 例外：「顶掉提问」的 curl 回写（askSkip）登记之后要等 fulfillAskSkipViaWait（最长 15 秒），那一处在等完之后自己收回
+   * （同样是 rollbackForeignContentMidRun，只是收回的时机与 foreignRef 的复位不同），见该处注释（第十一轮评审 P3-3）。
+   */
+  const registerForeignMark = (): void => {
+    if (options.foreignContentTurn !== true) return;
+    // 自己的标记还活着（直送路径登记过、sendChatMessage 没送出去又落到新会话路径 / 先 askSkip 再往下走）：不二次登记。
+    // 第二次 begin 会见到「活标记」把它置 shared（自己沿用自己），之后别路真沿用它时，让位版回滚就分不清谁在靠它（第十五轮评审 P3-3 F1）。
+    // 自己的标记没了（被清 / 被覆盖 / 过期）才重新登记：登记点紧贴送达的目的就是保证送达那一刻标记在
+    if (isLiveMarkerToken(id, foreignRef.token)) return;
+    foreignRef.token = beginForeignContentMidRun(id) ?? foreignRef.token;
+  };
 
   const text = parsed.text?.trim() ?? "";
 
@@ -534,11 +602,18 @@ const runChatReplyInject = async (
     // 「忙 → 下个 tick 重试 + 待投递合并 + 10 分钟窗口」处理（与 task 路径同口径）。以前这里照常入队：周期定时能把
     // 5 格队列占满（用户自己再发得到 409「排队已满」），回合结束后这些同一段内容的消息还逐条各起一轮 agent。
     // 窗口耗尽仍按「一次性 → 错过 / 周期 → 记一次失败」结算。软拒绝不手动 release——外层 finally 统一释放认领
+    // 文案不断言原因（第四轮评审）：走到这里的有「会话在跑」，也有「队列非空、无会话」的启动路径（会话正在起 / 起会话位被占），
+    // 后者并不是「正在处理上一条消息」；调度器靠 code 判断，不看文案
     if (options.scheduledTrigger) {
-      return errorResponse("会话正在处理上一条消息、稍后再送", 409, {
+      return errorResponse("会话这会儿正忙（在处理上一条消息或正在启动）、稍后再送", 409, {
         code: TASK_INJECT_BUSY_CODE,
       });
     }
+    // 别人的内容在驱动的一轮（所有者空 @ 引用别人 / 一句话再引用别人，见 ChatInjectOptions.foreignContentTurn）忙时**照常排队**，
+    // 但队列项带着 foreignContentTurn：中途标记不在入队时登记——那会去限制属主此刻正在跑的这一轮，而这一轮的收尾又会按名把它清掉；
+    // 而是等它出队、真正送达的那一刻（flush → sendChatMessage / 队列优先启动 → runChatSession）才在 agent.send 之前一刻登记，
+    // 送达失败用让位版 rollbackForeignContentMidRun 回滚（不是按 token 硬清；第十七轮评审 N5 订正此前「按 token 回滚」的说法）。（第四轮这里曾回 409「请稍后再 @ 我一次」：所有者一句「@bot 帮我看看这个」只因 agent 正忙就丢了，
+    // 第五轮评审 N1 判为回归；定时触发的 409 在上面，不受影响。）
     const queued = enqueueChatMessage(task.id, {
       // 优先用客户端预生成 id（兼容无 clientItemId 的旧入口 / task 侧）
       itemId: clientItemId,
@@ -558,10 +633,17 @@ const runChatReplyInject = async (
         Object.keys(options.userReplyMetaExtra).length > 0
           ? options.userReplyMetaExtra
           : undefined,
+      // 外来内容：出队送达时再登记中途标记（见上、QueuedChatMsg.foreignContentTurn）
+      ...(options.foreignContentTurn === true ? { foreignContentTurn: true } : {}),
     });
     if (!queued.ok) {
       // 同 id 已在 recentSettled → 终态 JSON（禁止再 append）
       if (queued.reason === "already_settled") {
+        // 同 id 在 claim 之后、入队之前被别处结算了（入口的 claim 已经拦住「claim 之前就结算」的那种，这里只剩这个竞态窗口，基本不可达）：
+        // 这条消息既没送达也没入队，直送路径预登记的标记要回滚（让位版，同下面入队成功处）。200 会让外层 finally 以为已受理（accepted=true）而不回滚，
+        // 不在这里清的话，标记会挂到属主此刻那一轮上（第十六轮评审 P3-C2）。回滚放在第一个 await 之前
+        rollbackForeignContentMidRun(id, foreignRef.token);
+        foreignRef.token = undefined;
         const freshSettled = await getTask(task.id);
         return new Response(
           JSON.stringify({
@@ -579,6 +661,13 @@ const runChatReplyInject = async (
     }
     // 记下当前条 itemId（队列优先启动路径稍后原样回给客户端）
     lastEnqueuedItemId = queued.itemId;
+    // 入队 = 这条消息现在没有送达：直送路径（先 registerForeignMark、sendChatMessage 返回 busy 才改入队）预登记的中途标记在此回滚，
+    // 改由它出队、真正送达那一刻再登记（队列项带着 foreignContentTurn）。不回滚的话 202 之后 accepted=true、finally 不会清它，
+    // 标记会一直去限制属主此刻正在跑的那一轮（第五轮评审 N1 改成排队之后新增的口子）。按 token 精确清，沿用别人的标记（token 为 undefined）时是 no-op。
+    // 让位版（第十五轮评审 P3-3 F1：此前是硬清）：登记之后别路也沿用过它、且此刻有 run 在跑，就留给那一轮的收尾按名清，不把沿用者的保护清掉；
+    // 没有别路沿用（registerForeignMark 不再自己沿用自己）就照清。代价是沿用者只是排了队时，标记会多挂到当前这一轮收尾（fail-safe，见 rollbackForeignContentMidRun 的残留）
+    rollbackForeignContentMidRun(id, foreignRef.token);
+    foreignRef.token = undefined;
     // 入队成功 → transfer 给 queue（finally 不再 release）
     opHandle?.transfer();
     // 入队 = 202 受理，这条消息（连同开头那句跳过上下文）一定会 flush 给 agent →
@@ -705,6 +794,23 @@ const runChatReplyInject = async (
     // 不会再 sendChatMessage——认领不释放 = 刚恢复的 idle 会话永远假 busy（后续消息只入队、
     // 空闲回收也跳过）。抛错 / 成功回写两条出口都要在返回前释放；
     // viaWait=false 才继续往下走 owner send，认领留给后面的 send / catch 处理。
+    // 外来内容（foreignContentTurn）走这条「顶掉提问」的回写：答案原文进的是属主此刻正在跑、本来没有标记的那一轮——
+    // 与热路径 / 新会话路径一样，要在送达前一刻登记中途标记（第五轮评审：这里原先先于下面两处 registerForeignMark 就送达了，
+    // 外来内容无标记送达）。登记点紧贴送达（与 fulfillAskSkipViaWait 之间不得有 await）。
+    //
+    // **登记之后要跨过 fulfillAskSkipViaWait 的长 await**（槽上没有 curl 时最长 ASK_WAIT_ATTACH_MS = 15 秒），窗口里别路的外来内容可能沿用这个标记
+    // （beginForeignContentMidRun 见到活标记返回 undefined、没有自己的 token）。所以没写进去时的收回走 rollbackForeignContentMidRun
+    // （沿用过且此刻还有 run 在跑就让位，与 ask-inject 同一套，第十一轮评审 P3-3）。这里不能留给 handleChatReplyInject 的 finally：
+    // askSkip 成功回写时 token 已交出去，finally 不会管；而失败收回要在继续往下走 owner send / 新会话**之前**就做完
+    // （第十五轮评审 P3-3 前 finally 还是按 token 硬清、会把沿用者正靠着的标记清掉；现在 finally 也是让位版，这里仍要自己收回是因为时机，不是语义）。
+    // 收回之后 foreignRef.token 置空（finally 不再按它清一遍）；viaWait=false 继续往下走 owner send / 新会话时，
+    // 后面的 registerForeignMark 在送达前一刻重新登记（让位的标记还活着就沿用它）——与 ask-inject「非 curl 路径收回、送达调用里再登记」同一做法。
+    registerForeignMark();
+    const askSkipMarkToken = foreignRef.token;
+    const retractAskSkipMark = (): void => {
+      rollbackForeignContentMidRun(task.id, askSkipMarkToken);
+      if (foreignRef.token === askSkipMarkToken) foreignRef.token = undefined;
+    };
     let viaWait: boolean;
     try {
       viaWait = await fulfillAskSkipViaWait(
@@ -721,12 +827,18 @@ const runChatReplyInject = async (
       if (ownerInstanceId !== null) {
         releaseChatRunClaim(task.id, ownerInstanceId);
       }
+      retractAskSkipMark();
       throw err;
     }
     if (viaWait && ownerInstanceId !== null) {
       releaseChatRunClaim(task.id, ownerInstanceId);
     }
+    if (!viaWait) retractAskSkipMark();
     if (viaWait) {
+      // 已写进 curl = 送达：内容进了属主此刻那一轮，那一轮靠这个标记限制 desktop_* 等。标记交给 run 收尾按名清；
+      // 之后收尾的 await（commit / 存图 / 取最新任务）万一抛错，handleChatReplyInject 的 finally 见 accepted=false 会按 foreignRef.token 回滚——
+      // 这里先把 token 交出去，外层就回滚不到它了（第十二轮评审 P3-3，既有问题：以前读盘一失败，已送达的内容就失去了保护）
+      foreignRef.token = undefined;
       await askSkip.commit();
       if (clientItemId) {
         settleMessageHandedOff(task.id, clientItemId);
@@ -858,6 +970,9 @@ const runChatReplyInject = async (
           stages: { ...sendStages, preSend: Date.now() - sendT0 },
           tags: { via: "inject" },
         });
+        // 「别人的内容在驱动」的一轮：标记在这里、紧贴送达登记（不在入口登记：上面的快照要等一阵，上一轮 run 的收尾会把早登记的标记清掉）。
+        // 与下面 sendChatMessage 之间不得有 await
+        registerForeignMark();
         const sent = await sendTimed(
           "sendChatMessage",
           sendChatMessage(
@@ -870,6 +985,10 @@ const runChatReplyInject = async (
         );
         if (sent === "sent") {
           sentOk = true;
+          // 已送达 = 内容进了正在跑的那一轮，那一轮靠这个标记限制 desktop_* 等；标记从这一刻起归 run 收尾按名清。
+          // 先把 token 交出去，再做后面任何 await（commit / 存图 / 取最新任务）：它们万一抛错，handleChatReplyInject 的 finally 见
+          // accepted=false 会按 foreignRef.token 回滚，把已送达的内容的保护清了（第十三轮评审 P3-1，与上面 askSkip 回写分支的第十二轮 P3-3 同一类）
+          foreignRef.token = undefined;
           // agent 已接管这条消息 → 那组没答的提问就此跳过（作废事件 + 飞书卡片终态）
           await askSkip.commit();
           // send===sent 即 handedOff（agent 已接管）；落盘失败仍算已送达
@@ -1194,6 +1313,9 @@ const runChatReplyInject = async (
           firstMessageEventId,
           startToken,
           clientItemId: head.itemId,
+          // 队首是外来内容（它可能是更早入队的、不一定是当前这条）：runner 在首包 agent.send 之前一刻登记中途标记，
+          // 没送出去的出口由 runner 自己清（第五轮评审 N1）
+          ...(head.foreignContentTurn === true ? { foreignContentTurn: true } : {}),
         });
         sessionPromise.catch((err) => {
           console.error(
@@ -1295,6 +1417,9 @@ const runChatReplyInject = async (
       }
       return leaseAbortedResponse();
     }
+    // 「别人的内容在驱动」的一轮：新会话带着这条消息起来，标记同样在这里、紧贴起会话登记（前面的快照 / 落盘 / 置 running 都有 await）。
+    // 与下面 runChatSession 之间不得有 await
+    registerForeignMark();
     const sessionPromise = runChatSession({
       task: runningTask,
       apiKey: bootArgs.apiKey,
@@ -1311,10 +1436,27 @@ const runChatReplyInject = async (
       startToken,
       // operation 交给 runner；send resolve 后才 handedOff
       clientItemId,
+      // 并发首条撞上已在跑的会话时 runner 会把首条改入队：带上外来标志，出队送达时再登记标记，保护不丢（第五轮评审 N1）。
+      // 上面 registerForeignMark 已登记过时，runner 内部登记因已有活标记而沿用、不重复
+      ...(options.foreignContentTurn === true ? { foreignContentTurn: true } : {}),
     });
     sessionPromise.catch((err) => {
       console.error(`[chat-reply] runChatSession task=${task.id} failed:`, err);
     });
+    // 并发首条里别路的会话先占了位：runChatSession 在它的第一个 await 之前就把首条**同步**改入队、立刻返回 "already_running"
+    // （队列项带 foreignContentTurn，出队送达时再登记标记）。这条消息此刻没有送达——预登记的标记不能挂到别人（常是属主自己）的 run 上，
+    // 要等那一轮收尾才清，白白限制它的 desktop_* / 写所有者备注 / 建定时（第十四轮评审 P3-2；与直送路径 busy 改入队处的回滚同一做法）。
+    // 下面那次 microtask 让出之后才读标志：已 settle 的 promise 的 then 回调排在 await 的续体之前
+    // （「already_running 同步早返回」这条时序由 chat-runner-foreign-marker-cleanup 钉着，runner 往那条分支前加 await 会让这里悄悄失效）
+    let queuedBehindOtherSession = false;
+    void sessionPromise.then(
+      (outcome) => {
+        if (outcome === "already_running") queuedBehindOtherSession = true;
+      },
+      () => {
+        /* 失败已由上面的 catch 记录 */
+      },
+    );
     // 同步 prologue 后 transfer；禁止占位即 delivered 200
     await Promise.resolve();
     if (clientItemId && isMessageOperationTerminal(task.id, clientItemId)) {
@@ -1330,6 +1472,14 @@ const runChatReplyInject = async (
     // starting 占位已挂 → transfer 给 runner；HTTP 返 persisted 202
     opHandle?.transfer();
     agentStarted = true;
+    // 首条改入队（别路的会话在占、runner 回了 already_running）：这条没有送达，预登记的标记就地回滚；
+    // 沿用别人标记时 token 为 undefined、不误清。没走这一支才是下面的「新会话已带着这条消息起来了」。
+    // 让位版（第十五轮评审 P3-3 F1：此前是硬清）：别路 B 若也沿用了这个标记（置了 shared）并正占着会话，硬清会让 B 那一轮失去保护——
+    // B 的 run 在跑就让位，标记留给它的收尾按名清；没人沿用就照清。runner 回 already_running 发生在它内层 begin 之前，所以这里不存在「自己沿用自己」
+    if (queuedBehindOtherSession) rollbackForeignContentMidRun(id, foreignRef.token);
+    // 新会话已带着这条消息起来了：标记归 run 收尾按名清，token 交出去——后面的 commit / 取最新任务万一抛错，
+    // handleChatReplyInject 的 finally 不会再按 token 把它回滚（第十三轮评审 P3-1；同上面直送路径）
+    foreignRef.token = undefined;
     // 新会话已带着这条消息（含跳过上下文）起来了 → 落跳过标记
     await askSkip.commit();
     // 懒重启 / resume 失败降级后的新会话：告诉用户 AI 保留了多少上文（首条消息无历史则不写）

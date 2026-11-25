@@ -284,10 +284,19 @@ const main = async () => {
 
   await call("close_session");
   server.close();
+  // 先释放浏览器管理器和主窗口再清临时 userData（第十五轮评审 P3-4：此前直接 rmSync，Chromium 还在往 userData 写缓存，
+  // 偶发 ENOTEMPTY 抛进 FATAL 分支——30/30 全过却 exit 1）
+  manager.destroy();
+  if (!mainWin.isDestroyed()) mainWin.destroy();
 
   const passed = results.filter((r) => r.ok).length;
   console.log(`SMOKE SUMMARY ${passed}/${results.length} passed`);
-  fs.rmSync(TMP, { recursive: true, force: true });
+  // 清临时 userData：Chromium 退出前可能还在写缓存，偶发 ENOTEMPTY / EBUSY——重试几次，仍清不掉只告警（不让「全部通过」被清理失败变成 FATAL exit 1）
+  try {
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
   app.exit(passed === results.length ? 0 : 1);
 };
 

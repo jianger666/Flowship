@@ -184,15 +184,26 @@ const main = async () => {
   check("a8-prompt-actions", "permission 提示的默认动作是 deny（actions[0]）", gp && gp.actions[0] === "deny", gp && gp.actions);
   const pend = await call("tabs", { action: "list" });
   check("a8-pending-hint", "有挂起提示时，其它 op 的结果带 pendingPrompts（只有 id/kind/host/tabId）", Array.isArray(pend.pendingPrompts) && pend.pendingPrompts[0]?.kind === "permission" && !("detail" in pend.pendingPrompts[0]), pend.pendingPrompts);
-  sess().prompts.cancel(gp.id); // 等价「超时 / 无人处理」→ 默认动作 deny
+  // 第二十二轮 R22-2：prompts.cancel 的语义是「提示作废」（页面导航走了 / 标签页关闭 / 会话销毁，与 cancelWhere 同一条结算路径）——这一次请求按默认动作拒绝，
+  // 但那不是用户的决定，**不进 30 秒冷却**。以前这里把 cancel 当成「超时 / 无人处理」来测冷却，其实测的是那个已修掉的缺陷（刷新页面后同一请求被静默拒绝）
+  sess().prompts.cancel(gp.id);
   const g1 = await waitFor(async () => {
     const v = await evJson("window.__geo");
     return v !== "pending" ? v : null;
   });
-  check("a8-geo-default-deny", "无人处理 → 默认拒绝（PERMISSION_DENIED=1），页面拿不到位置", g1 && g1.ok === false && g1.code === 1, g1);
+  check("a8-geo-default-deny", "提示被取消 → 这一次请求按默认动作拒绝（PERMISSION_DENIED=1），页面拿不到位置", g1 && g1.ok === false && g1.code === 1, g1);
+  await ev("window.__geo = 'pending'; navigator.geolocation.getCurrentPosition(p => { window.__geo = { ok: true }; }, e => { window.__geo = { ok: false, code: e.code }; }, { timeout: 8000 }); 1");
+  const gpAgain = await waitPrompt("permission");
+  check("a8-cancel-no-cooldown", "提示被取消不算拒绝、不进冷却：页面再请求会重新弹提示（不是被静默拒绝）", gpAgain && gpAgain.id !== gp.id && gpAgain.detail.permission === "geolocation", gpAgain && { id: gpAgain.id, detail: gpAgain.detail });
+  // 用户明确拒绝才进冷却：之后同一请求不再弹提示（防刷）
+  if (gpAgain) sess().prompts.answer(gpAgain.id, { action: "deny" });
+  await waitFor(async () => {
+    const v = await evJson("window.__geo");
+    return v !== "pending" ? v : null;
+  });
   await ev("window.__geo = 'pending'; navigator.geolocation.getCurrentPosition(p => { window.__geo = { ok: true }; }, e => { window.__geo = { ok: false, code: e.code }; }, { timeout: 8000 }); 1");
   await sleep(500);
-  check("a8-cooldown", "被拒后冷却期内同一请求不再弹提示（防刷）", prompts().length === 0, prompts());
+  check("a8-cooldown", "用户拒绝之后冷却期内同一请求不再弹提示（防刷）", prompts().length === 0, prompts());
 
   // 定位模拟：emulate 设了定位后自动成功（修掉「定位模拟被拒」）
   await call("emulate", { geolocation: { latitude: 31.2304, longitude: 121.4737 } });
@@ -222,23 +233,47 @@ const main = async () => {
     check(`a8-never-${name}`, `grant ${name} → DENIED（永远拒绝，开关开着也放不开）`, !r.ok && r.code === "DENIED", r.message);
   }
   // 摄像头 / 麦克风不再是红线（camera / microphone 是两个独立的授予，写 media = 两个一起）：开关开着 AI 可以授予 / 拒绝，页面 permissions.query 口径一致
+  // 第二十二轮：授予之前页面读到 prompt（页内桩把 Electron 回 false 读成的 denied 改成 prompt），授予之后才是 granted——
+  // 先记下授予前的读数，下面 a8-media-visible 才有「前后对比」的判别力（第二十一轮第一版里授予前后都读到 granted，那条断言是空转的）
+  const qm0 = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
+  const qc0 = await ev("navigator.permissions.query({ name: 'camera' }).then(s => s.state)");
+  check("a8-media-before-grant", "AI 授予之前页面 permissions.query 对麦克风 / 摄像头读到 prompt（不是 granted、也不是 denied）", qm0 === "prompt" && qc0 === "prompt", { qm0, qc0 });
   for (const name of ["camera", "microphone"]) {
     const r = await tryCall("permissions", { action: "grant", permission: name });
     check(`a8-media-${name}`, `grant ${name} → 生效（归询问类，不再是 DENIED）`, r.ok === true && r.value?.action === "grant" && r.value?.permission === name, r.message ?? r);
   }
   const qm = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
-  check("a8-media-visible", "AI 授予麦克风后页面 permissions.query(microphone) 看到 granted", qm === "granted", qm);
-  // R9-02：互不连带——只授予麦克风时摄像头仍不是 granted；写 media 才是两个一起
+  check("a8-media-visible", "AI 授予麦克风后页面 permissions.query(microphone) 从 prompt 变成 granted（授予前后对比，不是恒为 granted）", qm0 === "prompt" && qm === "granted", { before: qm0, after: qm });
+  // R9-02：互不连带——只授予麦克风时授予表里只有麦克风一条、query(camera) 不是 granted；写 media 才是两个一起。
+  // 第二十二轮：待询问 = prompt、已授予 = granted，「没被连带」的判据恢复为 query(camera) !== granted（第二十一轮第一版里待询问也读到 granted，才改成只看授予表）
   await call("permissions", { action: "reset" });
   await call("permissions", { action: "grant", permission: "microphone" });
   const qm2 = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
   const qc2 = await ev("navigator.permissions.query({ name: 'camera' }).then(s => s.state)");
-  check("a8-media-independent", "只授予麦克风：query(microphone)=granted，query(camera) 不是 granted（互不连带）", qm2 === "granted" && qc2 !== "granted", { qm2, qc2 });
+  const lmic = await call("permissions", { action: "list" });
+  check(
+    "a8-media-independent",
+    "只授予麦克风：query(microphone)=granted、query(camera)=prompt（没被连带成 granted），授予表里只有麦克风一条、没有摄像头（互不连带）",
+    qm2 === "granted" && qc2 === "prompt" && lmic.grants.some((g) => g.permission === "microphone" && g.decision === "allow") && !lmic.grants.some((g) => g.permission === "camera"),
+    { qm2, qc2, grants: lmic.grants },
+  );
+  await call("permissions", { action: "deny", permission: "camera" });
+  const qm4 = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
+  const qc4 = await ev("navigator.permissions.query({ name: 'camera' }).then(s => s.state)");
+  const ldeny = await call("permissions", { action: "list" });
+  // 显式拒绝（AI deny）时页面读到的是 prompt、不是 denied：检查处理器只能回 boolean，页内桩把所有 denied 都改成 prompt（已知限制，页面随后 getUserMedia 会被直接拒绝、不弹提示）；
+  // 所以「拒绝记录在、麦克风不受影响」要看授予表，页面侧只钉「摄像头绝不是 granted、麦克风仍是 granted」
+  check(
+    "a8-media-deny-independent",
+    "显式拒绝摄像头：授予表里摄像头是 deny、麦克风仍是 allow（两项独立）；页面侧 query(microphone)=granted，query(camera) 不是 granted（读到 prompt——已知限制，见 r21-mic-prompt.cjs）",
+    qm4 === "granted" && qc4 === "prompt" && ldeny.grants.some((g) => g.permission === "camera" && g.decision === "deny") && ldeny.grants.some((g) => g.permission === "microphone" && g.decision === "allow"),
+    { qm4, qc4, grants: ldeny.grants },
+  );
   await call("permissions", { action: "reset" });
   const rBoth = await tryCall("permissions", { action: "grant", permission: "media" });
   const qm3 = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
   const qc3 = await ev("navigator.permissions.query({ name: 'camera' }).then(s => s.state)");
-  check("a8-media-both", "grant media = 麦克风 + 摄像头一起：两者 query 都是 granted", rBoth.ok === true && rBoth.value?.permission === "media" && qm3 === "granted" && qc3 === "granted", { rBoth: rBoth.value ?? rBoth.message, qm3, qc3 });
+  check("a8-media-both", "grant media = 麦克风 + 摄像头一起：两者 query 都从 prompt 变成 granted（授予前后对比）", rBoth.ok === true && rBoth.value?.permission === "media" && qm3 === "granted" && qc3 === "granted", { rBoth: rBoth.value ?? rBoth.message, qm3, qc3, before: { qm0, qc0 } });
   await call("permissions", { action: "reset" });
   const rApp = await tryCall("permissions", { action: "grant", permission: "geolocation", origin: `https://127.0.0.1:${ports.app}` });
   check("a8-app-origin", "给 Flowship 自己的 origin grant → DENIED", !rApp.ok && rApp.code === "DENIED", rApp.message);
@@ -262,9 +297,13 @@ const main = async () => {
 
   // 关开关后，AI 写的授予立即失效
   await call("permissions", { action: "grant", permission: "geolocation" });
+  await call("permissions", { action: "grant", permission: "microphone" });
+  const qm5a = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
   manager.onConfig({ pagePermissions: false });
   const q3 = await ev("navigator.permissions.query({ name: 'geolocation' }).then(s => s.state)");
   check("a8-switch-off", "关掉开关后 AI 授予立即失效（页面不再是 granted）", q3 !== "granted", q3);
+  const qm5 = await ev("navigator.permissions.query({ name: 'microphone' }).then(s => s.state)");
+  check("a8-media-switch-off", "关掉开关后 AI 授予的麦克风也立即失效：页面从 granted 回到 prompt（待询问，不是 denied）", qm5a === "granted" && qm5 === "prompt", { before: qm5a, after: qm5 });
   const l4 = await call("permissions", { action: "list" });
   check("a8-switch-off-list", "list 把失效的 AI 授予标 active:false", l4.grants.some((g) => g.source === "ai" && g.active === false), l4.grants);
   manager.onConfig({ pagePermissions: true });
@@ -456,7 +495,12 @@ const main = async () => {
 
   const passed = results.filter((r) => r.ok).length;
   console.log(`E2P1 SUMMARY ${passed}/${results.length} passed`);
-  fs.rmSync(TMP, { recursive: true, force: true });
+  // 清临时 userData：Chromium 退出前可能还在写缓存，偶发 ENOTEMPTY / EBUSY——重试几次，仍清不掉只告警（不让「全部通过」被清理失败变成 FATAL exit 1）
+  try {
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
   app.exit(passed === results.length ? 0 : 1);
 };
 

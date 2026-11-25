@@ -337,6 +337,35 @@ describe("parseInboundContent 文件消息双形态", () => {
     // 原图转完即删，不堆积
     await expect(fs.access(p)).rejects.toThrow();
   });
+
+  it("image 消息 mget 渲染形态 `[Image: img_xxx]`：同样提取 key、下图（2026-11-19 引用图片事故：此前报「图片消息缺少 image_key」）", async () => {
+    const p = path.join(os.tmpdir(), `feishu-img-bracket-${Date.now()}.png`);
+    const buf = Buffer.alloc(64, 1);
+    buf.write("\x89PNG\r\n\x1a\n", 0);
+    await fs.writeFile(p, buf);
+    tmpFiles.push(p);
+    const downloaded: Array<[string, string]> = [];
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (mid, key) => {
+          downloaded.push([mid, key]);
+          return p;
+        },
+      }),
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "image",
+        message_id: "om_quoted_img",
+        content: "[Image: img_v3_0217j_071d1997-aa6b-45e3-b033-dc7b2c2ef52g]",
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.images).toHaveLength(1);
+    expect(downloaded).toEqual([
+      ["om_quoted_img", "img_v3_0217j_071d1997-aa6b-45e3-b033-dc7b2c2ef52g"],
+    ]);
+  });
 });
 
 describe("parseInboundContent 视频消息 media", () => {

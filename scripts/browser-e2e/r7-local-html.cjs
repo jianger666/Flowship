@@ -42,6 +42,40 @@ const check = (id, name, ok, detail) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 收尾登记表 + 统一收尾（第二十轮评审 R20-19）：此前 FATAL 出口只 exit——不关假 Flowship 服务、不 destroy manager、也不清 TMP。
+ * main 里一建好就登记；正常收尾与 FATAL 出口（`.catch`）共用同一个 cleanupAll，所以任何一步抛错都会走到同一套收尾。
+ * 每一步独立 try、互不拖累，且都幂等（manager.destroy 内部有 destroyed 守卫、server.close 重复调不抛、窗口逐个 destroy 并吞「已销毁」）。
+ * 清理本身 best-effort：Chromium 退出前可能还在写缓存，偶发 ENOTEMPTY / EBUSY——重试几次，仍清不掉只告警，不改退出码、不吞原始错误
+ *（不让「全部通过」被清理失败变成 FATAL exit 1）。不证明在 Windows 上一定清得掉（窗口 / manager 的句柄释放时机不同，可能残留）。
+ */
+const live = { flowServer: null, manager: null };
+const cleanupAll = () => {
+  try {
+    live.flowServer?.close();
+  } catch {
+    /* 已关 */
+  }
+  try {
+    live.manager?.destroy();
+  } catch {
+    /* 已销毁 */
+  }
+  // 剩下的窗口先销毁（Chromium 还抱着 userData 时 rmSync 容易 ENOTEMPTY），再清
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      w.destroy();
+    } catch {
+      /* 已销毁 */
+    }
+  }
+  try {
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
+};
+
 const PNG_1X1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 
 /** 0.5 秒 8kHz 单声道 16-bit 静音 WAV（<audio> 经 Range 读时长用） */
@@ -222,6 +256,7 @@ const main = async () => {
   await app.whenReady();
   const fx = buildFixture();
   const flow = await startFakeFlowship();
+  live.flowServer = flow.server;
   const v6 = await ipv6Supported();
   const mod = await import(pathToFileURL(path.resolve(__dirname, "../../electron-app/browser/index.mjs")).href);
   const appOrigin = await import(pathToFileURL(path.resolve(__dirname, "../../electron-app/browser/app-origin.mjs")).href);
@@ -253,6 +288,7 @@ const main = async () => {
     isTrustedIpcSender: () => true,
     log: (...a) => logs.push(a.join(" ")),
   });
+  live.manager = manager;
   manager.registerIpc();
   const serve = (p) => handlers.get("browser:serveLocalHtml")({}, p);
   const newTab = (taskId, url) => handlers.get("browser:newTab")({}, taskId, url);
@@ -447,8 +483,15 @@ const main = async () => {
       check("r7-broad-sibling", "单文件模式：入口 200、同目录兄弟文件 404", self.status === 200 && sibling.status === 404, { self: self.status, sibling: sibling.status });
     }
   } finally {
-    fs.rmSync(broadHtml, { force: true });
-    fs.rmSync(broadCss, { force: true });
+    // 只删两个小文件，口径与清 TMP 一致（第十六轮评审 P3-B2：此前是裸 rmSync，没 try 没重试，抛了会进 FATAL 分支）：重试几次，仍删不掉只告警
+    // 第十七轮评审 B-1：`maxRetries` / `retryDelay` 在非 `recursive` 时被 Node 忽略（fs.rmSync 文档），所以这里必须带 `recursive: true` 重试才真的生效（对单个文件也可以用）
+    for (const f of [broadHtml, broadCss]) {
+      try {
+        fs.rmSync(f, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      } catch (err) {
+        console.warn("SMOKE WARN 临时文件没清掉（不影响结果）：", f, err && err.message ? err.message : err);
+      }
+    }
   }
 
   // ── 7. AI 的 browser_navigate 对这个服务地址的口径：放行 B；根路径 404；两个 origin 的 localStorage / cookie 互相隔离 ──
@@ -495,7 +538,7 @@ const main = async () => {
   flow.server.close();
   const passed = results.filter((r) => r.ok).length;
   console.log(`SMOKE SUMMARY ${passed}/${results.length} passed`);
-  fs.rmSync(TMP, { recursive: true, force: true });
+  cleanupAll(); // 资源 + 临时 userData；清不掉只告警（见 cleanupAll 的说明）
   app.exit(passed === results.length ? 0 : 1);
 };
 
@@ -503,5 +546,6 @@ main().catch((err) => {
   console.error("SMOKE FATAL", err && err.stack ? err.stack : err);
   const passed = results.filter((r) => r.ok).length;
   console.log(`SMOKE SUMMARY ${passed}/${results.length} passed (FATAL)`);
+  cleanupAll(); // 错误已先打出；FATAL 路径同样关服务 / destroy manager / 清临时目录，退出码仍是 1（第二十轮评审 R20-19）
   app.exit(1);
 });

@@ -102,6 +102,8 @@ const KNOWN_SETTINGS_KEYS = [
   "browserNetworkBodyRead",
   "browserAdvancedTools",
   "browserMaxTabs",
+  "computerUse",
+  "computerUseLockedAccess",
 ] as const satisfies readonly (keyof FeAiFlowSettings)[];
 
 const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
@@ -734,6 +736,11 @@ const putSettingsFileLocked = async (
     settingsFilePath(),
     JSON.stringify(settings, null, 2),
   );
+  // 落盘（rename）成功之后通知订阅者：飞书桥的即时对账 / outbound 与 group-outbound 的开关缓存作废都靠它。
+  // 这是 putSettingsFile 与 patchSettingsFile 共用的唯一落盘点，删掉这行，设置页翻转桥接开关就退回「等 30s 轮询」。
+  // 注意：**不是所有写 config.json 的路径都通知**——custom-action-fs 的 remapLayoutInSettingsLocked
+  //（只改 actionLayout，与桥接开关无关）、用户手动编辑 config.json 都不会走到这里；
+  // 这类写入若改到了桥接相关键，靠 inbound 的 30s 轮询 / outbound 缓存的 8s TTL 兜底，最坏晚到这两个时长。
   notifySettingsWritten(settings);
   return { status: "ok" as const, settings, previous };
 };

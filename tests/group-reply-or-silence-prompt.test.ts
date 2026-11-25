@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import {
   GROUP_ACK_ONLY_TEXT,
   GROUP_NON_OWNER_GUARD_PROMPT_PREVIEW,
+  GROUP_REPLY_SILENCE,
   buildBotEtiquetteNote,
   buildBotFirstGreetingException,
   buildNonOwnerGuardFootnote,
@@ -109,7 +110,11 @@ describe("沉默只限于纯确认 / 复述：去掉模糊的「客套」", () =
   });
 
   it("真人变体第 4 条：沉默只剩「收到 / 好的」这类确认 / 复述，没有机器人才有的首次招呼例外", () => {
-    expect(humanFootnote).toContain(`对方没问实质问题（${GROUP_ACK_ONLY_TEXT}）就整段只写 NO_REPLY`);
+    // 真人版沉默口径是共享句 GROUP_REPLY_SILENCE：没问任何问题 + 纯确认 / 复述，才整段 NO_REPLY
+    expect(humanFootnote).toContain(`对方没问任何问题、${GROUP_ACK_ONLY_TEXT}时，整段只写 NO_REPLY`);
+    expect(humanFootnote).toContain(GROUP_REPLY_SILENCE);
+    // GROUP_ACK_ONLY_TEXT 自己以「只是」开头：拼进模板时不能再加一个（曾拼出「只是只是」）
+    expect(humanFootnote).not.toContain("只是只是");
     expect(humanFootnote).not.toContain("第一次");
     // 真人变体字面上不出现机器人变体的口子 / 禁令（既有测试也钉了 not 「别回「收到」」）
     expect(humanFootnote).not.toContain("别回「收到」");

@@ -18,13 +18,17 @@
  * - 「@ 了谁」看 mentions 里有没有**机器人自己的** open_id（getBotOpenId）；
  * - 「推进」要求 sender_id === 应用 owner open_id（BotAppInfo.ownerOpenId）——
  *   别人 @ 你的 bot 推进你的任务一律拒；
- * - 非属主的**普通文本**也不许碰写路径：强制 `restrictToQuestion`（只答疑、不复用属主
- *   的活会话、不改产物、不唤醒全权限 agent）+ 正文前缀标明「非任务所有者」；
+ * - 非属主的**普通文本**也不许碰写路径，分两条路（正文前缀都标明「非任务所有者」）：
+ *   ① **有活会话**（task 型）→ 并入属主的同一个会话、逐条各跑一轮（sameSessionNonOwner）：状态机级拦点恒定生效
+ *     （注入链的 groupNonOwner：不 snapshot 产物 / 不把 awaiting_ack 打回 running / 不认领待答 ask 的隐式跳过 / 不唤醒 /
+ *     不新起 agent；不传 creds、没送进会话就 409）；提示词约束与系统工具硬拒由设置里的「只答疑」开关决定；
+ *   ② **没有活会话** → 降级走 `restrictToQuestion` 只读旁路（只答疑、不复用属主的活会话、不改产物、不唤醒全权限 agent）。
+ *     「只答疑」开关已关时，选路之前会先试着把休眠会话接回来再走 ①（wakeTaskSessionForGroup，任何一步不成立都落回 ②）。
  *   **chat 型任务没有这条受限通道 → 非属主普通文本直接拒**（GROUP_CHAT_NOT_OWNER）。
  *   答 ask_user 不受限（那是 agent 主动问的、跨角色答题正是本功能的意义）。
- * - 唯一的例外：出问登记命中（两门：发件人==被问目标 / 窗口期内，
- *   且属主活会话在场）→ 以属主语义进会话当数据、群里不再回（见 injectGroupMessage 的 feedIntoSession；
- *   会话不在不自动唤醒，走只读）。
+ * - 以「属主语义」进会话（不是 restrictToQuestion）的只有：属主本人；以及出问登记命中（两门：发件人==被问目标 / 窗口期内，
+ *   且属主活会话在场）→ 当数据进会话、群里不再回（见 injectGroupMessage 的 feedIntoSession；会话不在不自动唤醒，走只读）。
+ *   属主本人空 @ 引用了别人的消息，同样是「别人的内容在驱动」，会登记 scope=desktop 的标记（foreignContentTurn）。
  * - 机器人互 @ 防环：**不再计数熔断**。改由两条规矩从源头掐——
  *   ① 系统回执对机器人整条静默（replyToGroup 的 mention=null），不给对方上下文喂噪音；
  *   ② 答疑 agent 的提示词里写明「谁该 @ / 什么时候不用回」，没话可说输出 NO_REPLY（出向不发）。
@@ -45,11 +49,14 @@ import type {
 import { getPendingAsk } from "@/lib/server/chat-pending";
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
 import { buildGroupQaSummaryEvent, cleanGroupQuestionText } from "@/lib/group-qa";
-import { buildNonOwnerGroupHeader } from "@/lib/group-non-owner-prompt";
-import { isGroupBotsAllowed } from "@/lib/server/group-non-owner-guard-config";
+import { buildNonOwnerGroupHeader, buildOwnerGroupNote } from "@/lib/group-non-owner-prompt";
+import {
+  isGroupBotsAllowed,
+  isGroupNonOwnerGuardEnabled,
+} from "@/lib/server/group-non-owner-guard-config";
 import { handleTaskQuestionInject } from "@/lib/server/task-question-inject";
 import { getTask, listTasks } from "@/lib/server/task-fs";
-import { advanceTask } from "@/lib/server/task-runner";
+import { advanceTask, wakeTaskSessionForGroup } from "@/lib/server/task-runner";
 import {
   agentSessions,
   getTaskOpGeneration,
@@ -105,7 +112,12 @@ import {
   sendInteractiveCardToChat,
   sendMarkdownCardToChat,
 } from "./lark-api";
-import { buildQuotedBlock, resolveQuoteAnchorId } from "./group-quote";
+import {
+  buildQuoteMissingBlock,
+  buildQuotedBlock,
+  escapeProtocolMarkers,
+  resolveQuoteAnchorId,
+} from "./group-quote";
 import { resolveInboundQuote } from "./inbound-quote";
 import { describeScopeShortage } from "@/lib/server/route-helpers";
 import type {
@@ -210,6 +222,10 @@ export interface GroupRouteDeps {
   handleChatReplyInject: typeof handleChatReplyInject;
   handleTaskQuestionInject: typeof handleTaskQuestionInject;
   advanceTask: typeof advanceTask;
+  /** 「限制群里非宿主成员」现在是开的吗（现读设置、不缓存；读不到取默认=开）。单测可替换 */
+  isGroupNonOwnerGuardEnabled: typeof isGroupNonOwnerGuardEnabled;
+  /** 开关已关 + 非属主真人撞上休眠会话时，把落盘会话接回来（只 resume，失败返回 false 落回旁路）。见 task-runner 同名函数 */
+  wakeTaskSessionForGroup: typeof wakeTaskSessionForGroup;
   rememberGroupReply: typeof rememberGroupReply;
   /** 预热群成员名单（发送人命名用；永不抛错，调用方另加硬超时） */
   fetchGroupRoster: typeof fetchGroupRoster;
@@ -244,6 +260,8 @@ const defaultDeps = (): GroupRouteDeps => ({
   handleChatReplyInject,
   handleTaskQuestionInject,
   advanceTask,
+  isGroupNonOwnerGuardEnabled,
+  wakeTaskSessionForGroup,
   rememberGroupReply,
   fetchGroupRoster,
   isAdvanceResultToGroupEnabled,
@@ -1252,12 +1270,27 @@ const injectGroupMessage = async (args: {
   senderTenantKey?: string;
   /** 发件人是不是外部成员（拿得到标记才传；当前 compact 事件没有 external 标记、没有调用方传它）：群答疑准入闸用，缺了不拦 */
   senderExternal?: boolean;
-  /** 空 @ 取回的被指消息（来源打标用，不做判定） */
-  refSource?: { messageId: string };
+  /**
+   * 空 @ 取回的被指消息。`messageId` 只用来打来源标；`foreign` = 被指的内容是**别人**写的（不是发件人自己 / 本机机器人的旧回复）：
+   * 所有者空 @ 指向别人的消息时，AI 读到的全部内容都出自别人，这一轮要登记「群成员触发」标记
+   * （见 injectGroupMessage 的 foreignContentTurn / foreignContentChatTurn；它被当作 pendingAsk 的答案时走 ask-inject 的 foreignContent）。
+   */
+  refSource?: { messageId: string; foreign?: boolean };
+  /**
+   * 这条消息**引用**了别人写的消息（不论发件人自己有没有写字），被引内容已经拼进 `text` 的引用块。
+   * 与 `refSource.foreign` 的区别：refSource 只覆盖「空 @」（@ 里除了「@」没有发件人自己的字）；所有者写了一句话（「看下这个」）
+   * 再引用别人的消息，一样是别人的内容在驱动这一轮——第四轮评审 P1-1（上一轮只补了空 @，这种以前没有任何标记）。
+   * 只对所有者有意义：非属主本来就走受限通道、有自己的标记。
+   */
+  quoteFromOthers?: boolean;
   /** 排队回放：忙时不再二次入队，静默等下一轮 draining */
   fromPump?: boolean;
 }): Promise<InjectResultPayload> => {
   const { taskId, chatId, requester, messageId, isOwner } = args;
+  // 「别人的内容在驱动」的所有者轮：所有者空 @ 指向了别人的消息，或所有者写了一句话再引用别人的消息（第四轮评审 P1-1：以前只认空 @ 那种）。
+  // 提前到最前面算：pendingAsk 分支（排在普通注入前面）和下面的普通注入都要用同一个判定。
+  const ownerQuotesOthers =
+    isOwner && (args.refSource?.foreign === true || args.quoteFromOthers === true);
   // let：非属主的待下载资源（parsed.deferred）在闸门全过之后 resolve 成完整解析结果、替换这里
   let parsed = args.parsed;
   const task = await deps.getTask(taskId);
@@ -1296,10 +1329,11 @@ const injectGroupMessage = async (args: {
 
   // 非属主 + task 型普通消息 + **活会话在场** → 并入属主的同一个会话（逐条，不合批）：不再起只读旁路 agent。
   // 状态机级拦点（不 ack / 不 askSkip / 不唤醒 / 不新起 agent）由注入链的 groupNonOwner 保证，提示词约束与系统工具
-  // 硬拒由设置里的开关决定（见 group-non-owner-prompt）。没有活会话 → 仍走原只读旁路（降级通道，硬约束）。
+  // 硬拒由设置里的开关决定（见 group-non-owner-prompt）。没有活会话 → 开关已关时先试着接回休眠会话（见准入闸之后的唤醒段），
+  // 接不回 / 开关开着 → 仍走原只读旁路（降级通道，硬约束）。
   // 答 pendingAsk / 关联回执喂会话各有自己的门，不算在内。回群不预登记：由出向从这条消息写下的 user_reply 事件
   // 现建登记（group-outbound 的 non-owner turn，按事件顺序对号入座、没有覆盖 / 错投窗口）。
-  const sameSessionNonOwner =
+  let sameSessionNonOwner =
     !isOwner &&
     task.mode !== "chat" &&
     !hasPendingAsk &&
@@ -1353,6 +1387,42 @@ const injectGroupMessage = async (args: {
     if (denied) return denyRestrictedQa(denied);
   }
 
+  // 开关已关 + 非属主**真人** + 休眠会话（有落盘锚点、没在跑）：把会话接回来，接回后按「活会话」口径并入，
+  // 和属主在群里说话同一个标准——开关只管会话存活的那 12~22 分钟，产品上说不通（玉灵：关了开关机器人还是拒绝造线索）。
+  // 放在准入闸之后：被拒的发件人不该顺手拉起 agent。只 resume，**绝不**起新 agent / 一次性 agent；机器人（含「同权」）、
+  // 关联回执、答 pendingAsk、chat 型、排队回放（fromPump：由出向的 done / 终态事件调起，不该在那条链上再阻塞一次 resume）不在此列；
+  // 任一条件不成立或唤醒失败，sameSessionNonOwner 保持 false、照旧走只读旁路。
+  // 开关开着（默认）这里一个字都不碰：不读凭据、不唤醒。
+  if (
+    !sameSessionNonOwner &&
+    !isOwner &&
+    !args.fromPump &&
+    args.requesterIsBot !== true &&
+    task.mode !== "chat" &&
+    !hasPendingAsk &&
+    !correlated &&
+    !!task.sessionAgentId &&
+    task.runStatus !== "running" &&
+    !runningTasks.has(taskId) &&
+    !(await deps.isGroupNonOwnerGuardEnabled())
+  ) {
+    // 唤醒是尽力而为：取凭据 / 唤醒任何一步抛错都只意味着「没接回」，绝不能把这条群消息变成路由失败
+    try {
+      const boot = await args.loadBootContext(task).catch(() => null);
+      if (
+        boot &&
+        (await deps.wakeTaskSessionForGroup(taskId, {
+          apiKey: boot.apiKey,
+          model: boot.model,
+        }))
+      ) {
+        sameSessionNonOwner = agentSessions.has(taskId);
+      }
+    } catch (err) {
+      console.warn(`${LOG} 群消息唤醒休眠会话抛错（落回只读旁路） task=${taskId}`, err);
+    }
+  }
+
   const rawBusyReason =
     hasPendingAsk || feedIntoSession ? null : groupMessageBusyReason(task);
   // 属主 task 型主链正忙：不在群侧拒收，交给注入链入 task 待送达队列（见下方 queueIfBusy）。
@@ -1382,6 +1452,9 @@ const injectGroupMessage = async (args: {
         requester,
         senderIds: args.senderIds,
         ...(args.requesterIsBot ? { requesterIsBot: true as const } : {}),
+        // 准入闸要看的发件人属性随队列存下，回放（pumpGroupQuestionQueue）原样带回——否则排队 → 回放这条路绕过租户 / 外部成员校验
+        ...(args.senderTenantKey ? { senderTenantKey: args.senderTenantKey } : {}),
+        ...(args.senderExternal !== undefined ? { senderExternal: args.senderExternal } : {}),
         boot,
       },
       Date.now(),
@@ -1491,7 +1564,8 @@ const injectGroupMessage = async (args: {
   }
 
   // 来源前缀：事件流 / agent 都能看出这句话来自群里的谁。
-  // 非属主再补一句降信任指引——写路径已由 restrictToQuestion 硬拦，这里是给 agent 的显式边界。
+  // 非属主再补一句降信任指引——写路径在只读旁路由 restrictToQuestion 硬拦、并入同会话时由 groupNonOwner 的状态机拦点硬拦，
+  // 这里是给 agent 的显式边界。
   // 关联命中再叠一层数据定语（只当数据用），喂会话与只读两路共用。
   // 存了 about/keywords 就得给模型看：不拼上去模型只能盲判（靠翻两小时前的历史碰运气）。
   const correlatedAwaited = correlated
@@ -1645,7 +1719,23 @@ const injectGroupMessage = async (args: {
       args.text || "(附图/附件)",
       bootArgs,
       parsed.images.length > 0 ? parsed.images : undefined,
-      { answeredBy: requester.name },
+      {
+        answeredBy: requester.name,
+        // 「别人的内容在驱动」→ ask-inject 登记「群成员触发」标记并转义答案里冒充抬头的字面量（第二轮评审 P0）：
+        // - 非属主（含机器人）答的：答案以 [ASK_USER_REPLY] 进属主会话，答题人不是所有者（foreignContent）；
+        // - 所有者空 @ 指向了别人的消息、或写了一句话再引用别人的消息（ownerQuotesOthers）：答案里有一块别人写的原文
+        //   （第三轮 P1-1 / 第四轮 P1-1——下面普通注入里的 foreignContentTurn 管着这种消息，可这条分支排在它前面、整段绕过了它）。
+        //   答题人**就是所有者**，所以用 ownerQuotedOthers 单独表达：标记照登记，但提示词不能说「答题人不是任务所有者」（第四轮评审 P2，文案与事实相反）。
+        // 属主自己答（含引用自己 / 本机机器人的旧回复）不加限制
+        ...(!isOwner
+          ? { foreignContent: true as const }
+          : ownerQuotesOthers
+            ? { ownerQuotedOthers: true as const }
+            : {}),
+        // args.text 是上面 handler 拼好的整段：别人写的部分（非属主的正文、被引用消息的正文）已经各自转义过，
+        // 引用块头尾是代码自己拼的——ask-inject 不能再对整段转义（会把头尾的半角 `[` 改成全角，见 protocol-escape 头注释；第四轮评审 P2）
+        textPreEscaped: true as const,
+      },
     );
     if (askResult.ok) {
       // 一问一答：关联登记在这里消费掉（当了答题答案，不再二次消费）
@@ -1718,9 +1808,36 @@ const injectGroupMessage = async (args: {
       : {}),
     ...(args.refSource ? { refSourceMessageId: args.refSource.messageId } : {}),
   };
-  // feedIntoSession 时走属主语义（restrictToQuestion:false + correlatedAnswer 上下文）；
-  // 否则非属主一律只答疑（原语义不动）。
+  // 属主 / 关联回执喂会话（restrictToQuestion:false + correlatedAnswer 上下文）/ 并入活会话的非属主
+  // （restrictToQuestion:false，由注入链的 groupNonOwner 做状态机级拦点）走会话注入；
+  // 其余非属主一律走只读旁路（restrictToQuestion:true，原语义不动）。
   const useOwnerInject = isOwner || feedIntoSession || sameSessionNonOwner;
+  // 「别人写的内容在驱动」的轮次：以所有者语义注入（不带 groupNonOwner、提示词不加约束），但 AI 读到的指令性内容出自别人——
+  // - 关联回执喂会话：回执是对方机器人 / 同事写的，只是被登记命中了；
+  // - 所有者空 @ 指向了别人的消息：这条 @ 里除了「@」没有任何所有者自己写的字。
+  // 这两种以前**没有任何标记**，等于一次无限制的所有者轮：desktop_* / 写所有者备注 / 新建定时 / 自动推进全放行。
+  // 现在登记 scope=desktop 的标记（系统工具照常放行，只恒拒那几个；与「同权」的群成员轮同一套，见 non-owner-turn-guard）。
+  // task 型靠 send 起点登记；chat 型没有这个机制（chat 里非属主本来就被拒，见 GROUP_CHAT_NOT_OWNER，唯一的外来内容就是所有者空 @ 引用别人），
+  // 由 chat-inject 在送达前补登中途标记、run 收尾清（见 ChatInjectOptions.foreignContentTurn；忙时照常排队、出队送达那一刻再登记标记）。
+  // （ownerQuotesOthers 在函数开头已算好：pendingAsk 分支也要用）
+  const foreignContentTurn =
+    task.mode !== "chat" && (feedIntoSession || ownerQuotesOthers);
+  const foreignContentChatTurn = task.mode === "chat" && ownerQuotesOthers;
+  // 所有者本人的群消息：经 agentContext（只给 agent 看、不进气泡的服务端可信通道）带一行尾注，说明「这是所有者说的 + 回复会发到该群」。
+  // chat 型 / task 型 / 一次性 agent / 排队重放 / 唤醒后送达都走 inject 的同一个 agentContext，所以 _super.md 与一次性提示词里
+  // 不再常驻「群消息怎么读」。非属主的尾注另走送达时现读开关的约束段 / 声明（buildAgentMessage），不在这里。
+  // 尾注只写**为真**的半句（评审）：空 @ 回复他人消息时正文是并入的别人的原话，不替它担保「所有者说的」；
+  // 没拿到回群登记（排队 / 推进占格，replyHandle 为 null）时这一轮的回复不会发回群，不能说「会发到该群」。
+  const ownerGroupNote = isOwner
+    ? buildOwnerGroupNote({
+        // 「这条是任务所有者本人说的」只在内容真由所有者自己写时才说：空 @ 并入了别人的原话（args.refSource）不说；
+        // 「一句话 + 引用别人」（ownerQuotesOthers）同样不说——这一轮已登记了外来内容的标记，提示词里却写「所有者本人说的」，
+        // 两头互相矛盾（第五轮评审 N4）。ownerQuotesOthers 已覆盖 refSource.foreign；引用所有者自己的话（refSource 非 foreign）仍由 !args.refSource 管
+        identity: !args.refSource && !ownerQuotesOthers,
+        replyToGroup: !!replyHandle,
+      })
+    : "";
+  const ownerAgentContext = ownerGroupNote ? { agentContext: ownerGroupNote } : {};
   let resp: Response;
   try {
     resp =
@@ -1734,7 +1851,11 @@ const injectGroupMessage = async (args: {
                 parsed.attachments.length > 0 ? parsed.attachments : undefined,
               bootArgs,
             },
-            { userReplyMetaExtra: metaExtra },
+            {
+              userReplyMetaExtra: metaExtra,
+              ...ownerAgentContext,
+              ...(foreignContentChatTurn ? { foreignContentTurn: true as const } : {}),
+            },
           )
         : await deps.handleTaskQuestionInject(
             taskId,
@@ -1749,6 +1870,7 @@ const injectGroupMessage = async (args: {
             },
             {
               userReplyMetaExtra: metaExtra,
+              ...ownerAgentContext,
               ...(sameSessionNonOwner
                 ? {
                     groupNonOwner: {
@@ -1758,11 +1880,13 @@ const injectGroupMessage = async (args: {
                     },
                   }
                 : {}),
-              // 非属主：只答疑——不 snapshot / 不把 awaiting_ack 打回 running（原 revise 语义）、
+              // 没并入活会话的非属主：只答疑——不 snapshot / 不把 awaiting_ack 打回 running（原 revise 语义）、
               // 会话断了也只起一次性答疑 agent，绝不唤醒当前 action 的全权限 agent。
-              // 关联命中喂会话是唯一的例外（出问登记两门已过，且活会话在场）。
+              // 不走这条的非属主有两类：关联命中喂会话（出问登记两门已过，且活会话在场）；并入活会话的
+              // （上面的 groupNonOwner 在注入链里做状态机级拦点：不传 creds、没送进去就 409，同样绝不唤醒）。
               restrictToQuestion: !useOwnerInject,
               ...(correlated ? { correlatedAnswer: true } : {}),
+              ...(foreignContentTurn ? { foreignContentTurn: true as const } : {}),
               // 属主本人的话 / 托办回执：agent 正在跑时入 task 待送达队列（202）而不是 409 丢掉
               //（回执丢了就是真实案例：对接后端机器人时用户觉得「没有排队机制」）。
               // 非属主的只读答疑旁路走群模块自己的队列，不传。
@@ -1915,6 +2039,9 @@ export const pumpGroupQuestionQueue = async (taskId: string): Promise<void> => {
             messageId: head.messageId,
             senderIds: head.senderIds,
             ...(head.requesterIsBot ? { requesterIsBot: true as const } : {}),
+            // 入队时存下的准入闸属性原样带回（回放也过 restrictedQaDenial，缺了 = 租户 / 外部成员校验在回放时不拦）
+            ...(head.senderTenantKey ? { senderTenantKey: head.senderTenantKey } : {}),
+            ...(head.senderExternal !== undefined ? { senderExternal: head.senderExternal } : {}),
             fromPump: true,
           });
         } catch (err) {
@@ -2076,11 +2203,15 @@ export const routeGroupInboundMessage = async (
   markGroupBotIdentityUsable(!!botOpenId?.trim() || !!appName?.trim());
 
   // 机器人自己发的（分享卡 / 回执）——绝不能再回灌，否则自问自答成环
-  // sender 形态不定（open_id / app_id / open_bot_id），三格都比（16:04 纯 @ 案：漏比会把自己或同类 bot 卷进来）
+  // sender 形态不定（open_id / app_id / open_bot_id），三格都比（16:04 纯 @ 案：漏比会把自己或同类 bot 卷进来）；
+  // 「自己」同样有两种 id：open_id（ou_…）与本机自建应用的 app_id（cli_…，上面已经取到）。第四轮评审：以前三格只跟 open_id 比，
+  // app_id 形态的 sender（`sender_app_id`，以及 bot 的 `sender_id` 就是 app_id 的事件）永远不等 → 自己发的卡 / 回执漏过这道，
+  // 下面会被当成「别家机器人的提问」；放开了「允许机器人提问」的群里就是自问自答成环。两种 id 都拿来比
+  const selfIds = [botOpenId, botAppId].filter((x): x is string => !!x);
   if (
-    botOpenId &&
+    selfIds.length > 0 &&
     [msg.sender_id, msg.sender_bot_open_id, msg.sender_app_id].some(
-      (id) => !!id && id === botOpenId,
+      (id) => !!id && selfIds.includes(id),
     )
   ) {
     return { kind: "skipped", messageId, error: SKIP_GROUP_SELF };
@@ -2205,8 +2336,10 @@ export const routeGroupInboundMessage = async (
   // 用户这句话本身就是「推进」命令时不取：命令只看用户自己写的那句，
   // 取回既慢（占 lark 队列、最多 5s）又没用。取不到 / 被限流 / 不是本群的消息 → 当没引用，消息照常走。
   const anchorId = resolveQuoteAnchorId(msg);
+  const quoteWanted =
+    !!anchorId && !(text.length > 0 && parseGroupCommand(text).kind === "advance");
   const quote =
-    anchorId && !(text.length > 0 && parseGroupCommand(text).kind === "advance")
+    anchorId && quoteWanted
       ? await resolveInboundQuote({
           msg,
           anchorId,
@@ -2219,9 +2352,10 @@ export const routeGroupInboundMessage = async (
       : null;
 
   // 空 @ 不再完全无声：先打日志，再看有没有指回的消息（bot 常发“纯 @ + thread 指回卡片”）
-  // ——有就把被指内容拼上继续走；取不到才按空消息跳过（fail-closed）。
-  let effectiveText = text;
-  let refSource: { messageId: string } | undefined;
+  // ——有就把被指内容当**数据块**带上继续走；取不到才按空消息跳过（fail-closed）。
+  // 被指的内容是别人写的，**不能**再拼成这条发言的正文：那样它既丢了「只当数据」的定语，又会被拿去解析命令
+  //（陌生人发一句「推进 ship」、所有者空 @ 引用它，就成了所有者的推进命令）。命令只看发件人自己写的那句。
+  let refSource: { messageId: string; foreign?: boolean } | undefined;
   if (
     text.length === 0 &&
     parsed.images.length === 0 &&
@@ -2231,16 +2365,13 @@ export const routeGroupInboundMessage = async (
     console.warn(
       `${LOG} 空消息跳过 message=${messageId} chat=${msg.chat_id} sender=${msg.sender_id} reply_to=${anchorId ?? ""}`,
     );
-    if (quote) {
-      // quote.text 已剥壳 / 还原 @ 占位（agent 看到的是干净正文），拼上用户自己的空 @ 一起走
-      const combined = stripMentions(
-        `${parsed.text}\n${quote.text}`,
-        [appName ?? ""],
-      ).trim();
-      if (combined) {
-        effectiveText = combined;
-        refSource = { messageId: quote.messageId };
-      }
+    // 被指的消息要有可读正文才算有（与以前「拼起来非空」同口径）；quote.text 已剥壳 / 还原 @ 占位 / 转义过协议标记
+    if (quote && quote.text.trim()) {
+      refSource = {
+        messageId: quote.messageId,
+        // 别人写的内容：这一轮要登记「群成员触发」标记（见 injectGroupMessage 的 foreignContentTurn）
+        ...(quote.fromOthers ? { foreign: true as const } : {}),
+      };
     }
     if (!refSource) {
       return { kind: "skipped", messageId, taskId, error: "空消息" };
@@ -2254,19 +2385,53 @@ export const routeGroupInboundMessage = async (
       attachments: [...parsed.attachments, ...quote.attachments],
     };
   }
-  // 正文非空时，引用以独立块跟在用户这句话后面（空 @ 的情形已把引用并进正文、不重复）
+  // 非属主引用里的图：不在这里下，并进它自己的「待下载」句柄（parsed.deferred）——和非属主自己发的图同一条路：
+  // 鉴权 / 准入 / 忙线闸门全过后才在 injectGroupMessage 里下载，被拦下的消息零下载；带图也因此照常走「带图不排 / 忙线入队」的判定。
+  if (quote?.loadImages) {
+    const loadQuoteImages = quote.loadImages;
+    const own = parsed.deferred;
+    const pre: ParsedInboundContent = { ...parsed, deferred: undefined };
+    let full: Promise<ParsedInboundContent> | null = null;
+    parsed = {
+      ...parsed,
+      deferred: {
+        hasImages: true,
+        resolve: () => {
+          if (!full) {
+            full = (async () => {
+              const base = own ? await own.resolve() : pre;
+              const qImages = await loadQuoteImages();
+              return { ...base, images: [...base.images, ...qImages] };
+            })().catch((err: unknown) => {
+              full = null; // 失败不缓存：排队回放等场景要能重试（与 router.parseInboundContent 同口径）
+              throw err;
+            });
+          }
+          return full;
+        },
+      },
+    };
+  }
+  // 引用以独立块跟在用户这句话后面；空 @ 的情形（refSource）也走这一块、只是块头换成「只有一个 @」的说法——
+  // 被指的内容始终是数据块，不拼进发言正文（见上面空 @ 分支的说明）。
+  // 想取却没取到（超时 / 已撤回 / 无权限 / 被限流）：明说「有引用、没取到」，别让 AI 看着一句
+  // 「针对这个问题……」去猜指代（2026-11-19 事故）。「推进」命令故意不取（quoteWanted=false）→ 不加。
   const quoteBlock =
-    quote && !refSource
+    quote
       ? buildQuotedBlock({
           messageId: quote.messageId,
           senderLabel: quote.senderLabel,
           text: quote.text,
           truncated: quote.truncated,
+          ...(refSource ? { viaEmptyMention: true as const } : {}),
         })
-      : "";
+      : quoteWanted && !quote && anchorId
+        ? buildQuoteMissingBlock(anchorId)
+        : "";
 
   // 6) 命令 / 普通消息分流（isOwner 已在第 5 步前判过）
-  const cmd = parseGroupCommand(effectiveText);
+  // 命令只看发件人**自己写的**那句（text）：被引用 / 被空 @ 指向的内容是别人写的，不参与命令解析
+  const cmd = parseGroupCommand(text);
   if (cmd.kind === "advance") {
     // 别人 @ 你的 bot 推进你的任务 → 拒（推进 = 起 agent、烧额度、改任务状态）。
     // 发起人是机器人同样不 @（和问答通道同理，@ 回去就续环）。
@@ -2289,19 +2454,23 @@ export const routeGroupInboundMessage = async (
     });
   }
 
-  // 给 agent 的正文：空 @ 取回引用拼出来的（refSource）与命令文本为空的情形照旧用 effectiveText；
-  // 其余用带「（你）」标注的 agentText
-  const agentBody = refSource || text.length === 0 ? effectiveText : agentText;
+  // 给 agent 的正文：带「（你）」标注的 agentText；空 @ / 纯图纯附件没有正文（被指的内容在 quoteBlock 里）
+  const agentBody = text.length === 0 ? "" : agentText;
+  // 非属主写的正文先转义协议标记：他能在正文里另起一行写 `[群消息·来自 <所有者>]` 去冒充抬头，而模型判断「这句是不是所有者说的」
+  // 靠的就是抬头。只转义这一段、**不**转义拼好的整段——下面的 quoteBlock 是代码自己拼的，头尾也是这些字面量；
+  // 所有者自己的话不动。入队后重放走的是这里拼好的 text，所以排队的也已经转义过。
+  const safeBody = isOwner ? agentBody : escapeProtocolMarkers(agentBody);
 
-  // 普通文本：群里任何人都能发（跨角色协作），但非属主只走答疑通道——
+  // 普通文本：群里任何人都能发（跨角色协作），但非属主只走答疑通道（有活会话并入同一会话、否则只读旁路）——
   // 写路径（改产物重交卷 / 唤醒全权限 agent）仍然只有本人能触发。
-  // 关联消费（出问登记命中）是唯一的例外：命中才允许进属主会话当数据（见 injectGroupMessage 内）。
+  // 关联消费（出问登记命中）：命中才允许进属主会话当数据（见 injectGroupMessage 内）。
   return injectGroupMessage({
     taskId,
     chatId: msg.chat_id,
     // 纯图/纯附件 @ 进来正文是空的：给一句兜底，和 pendingAsk 路径的 "(附图/附件)" 对齐
     //（review 十轮-3；到这里时上面空消息门已保证三者至少其一非空）
-    text: `${agentBody || "(附图/附件)"}${quoteBlock ? `\n\n${quoteBlock}` : ""}`,
+    // 空 @（refSource）的发言本身没有字，给一句说明、被指的内容在后面的引用块里
+    text: `${safeBody || (refSource ? "（只 @ 了你，没写别的）" : "(附图/附件)")}${quoteBlock ? `\n\n${quoteBlock}` : ""}`,
     parsed,
     requester,
     isOwner,
@@ -2319,5 +2488,8 @@ export const routeGroupInboundMessage = async (
     // 发件人租户（事件带了「确属发件人」的 tenant_key 才有；当前 compact 事件没有，生产里恒空）：群答疑准入闸的租户校验用，缺了不拦
     ...(msg.sender_tenant_key ? { senderTenantKey: msg.sender_tenant_key } : {}),
     ...(refSource ? { refSource } : {}),
+    // 引用的是别人写的消息（所有者空 @ 之外，写了一句话再引用也算）：这一轮要登记「群成员触发」标记（第四轮评审 P1-1）。
+    // 取不到引用（quote 为 null：限流 / 已撤回 / 没权限）时 AI 只看到「有引用、没取到」，没有别人的内容进来，不登记
+    ...(quote?.fromOthers ? { quoteFromOthers: true as const } : {}),
   });
 };

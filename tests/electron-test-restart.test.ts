@@ -15,6 +15,7 @@ import {
   isTestAppRunningFromProbe,
   resolveTestAppPaths,
   STAGING_SUBDIR,
+  TEST_APP_ID,
   TEST_PRODUCT_NAME,
 } from "../scripts/lib/electron-test-restart.mjs";
 
@@ -98,12 +99,13 @@ describe("describeDeployPlan", () => {
 });
 
 describe("buildDistTestArgs", () => {
-  it("mac / win 各带 productName 与 staging output", () => {
+  it("mac / win 各带 productName 与 staging output；只有 mac 另带独立 bundle id", () => {
     const stagingOut = path.join(ELECTRON_OUTPUT_DIR, STAGING_SUBDIR);
     expect(buildDistTestArgs("darwin")).toEqual([
       "--mac",
       "--dir",
       `-c.productName=${TEST_PRODUCT_NAME}`,
+      `-c.appId=${TEST_APP_ID}`,
       `-c.directories.output=${stagingOut}`,
     ]);
     expect(buildDistTestArgs("win32")).toEqual([
@@ -120,9 +122,17 @@ describe("buildDistTestArgs", () => {
       "--mac",
       "--dir",
       `-c.productName=${TEST_PRODUCT_NAME}`,
+      `-c.appId=${TEST_APP_ID}`,
       `-c.directories.output=${stagingOut}`,
       "-c.electronDist=node_modules/electron/dist",
     ]);
+  });
+
+  it("test 包的 bundle id 与正式版不同（共用的话系统把两者当成同一个 App，授权 / 钥匙串 / open 启动都会串）", () => {
+    expect(TEST_APP_ID).toBe("com.jianger.fe-ai-flow.test");
+    expect(TEST_APP_ID).not.toBe("com.jianger.fe-ai-flow");
+    // win 的 test 包不带这个参数（沿用原 id，行为不变）
+    expect(buildDistTestArgs("win32").some((a) => a.startsWith("-c.appId="))).toBe(false);
   });
 });
 

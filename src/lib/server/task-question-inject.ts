@@ -45,6 +45,10 @@ import {
   type AskSkipHandle,
 } from "@/lib/server/ask-skip";
 import {
+  beginForeignContentMidRun,
+  rollbackForeignContentMidRun,
+} from "@/lib/server/non-owner-turn-guard";
+import {
   startRestrictedGroupQuestion,
   type RestrictedGroupContext,
 } from "@/lib/server/restricted-question";
@@ -170,11 +174,21 @@ export interface TaskQuestionInjectOptions {
    */
   groupNonOwner?: { name: string; isBot?: boolean; openId?: string };
   /**
-   * 关联回执（出问登记两门已过）：以属主语义注入当数据，但与普通属主消息两处不同——
-   * ① 不认领 askSkip（不许外部回执顶掉属主的待答提问）；② 正文包不可信数据头。
-   * 只由 group-route 在 correlated 命中且活会话在场时置 true。
+   * 关联回执（出问登记两门已过）：以属主语义注入当数据，但与普通属主消息三处不同——
+   * ① 不认领 askSkip（不许外部回执顶掉属主的待答提问）；② 正文包不可信数据头；
+   * ③ **只送活会话**（第四轮评审）：不传 creds（deliver 不会把休眠会话复活成全权限会话）、会话没了 / 送不进去直接 409，
+   *    **绝不**唤醒当前 action、也不起一次性 agent——内容出自对方机器人 / 同事，不能由它驱动一个带写权限的新 agent。
+   * 只由 group-route 在 correlated 命中且活会话在场时置 true；入口判断之后会话刚好没了的竞态窗口由 ③ 兜底。
+   * 与 {@link restrictToQuestion} 同时出现时（命中但会话本来就不在 → 只读旁路）不受 ③ 影响。
    */
   correlatedAnswer?: boolean;
+  /**
+   * 「别人写的内容在驱动」的一轮：以属主语义注入（不是非属主轮、提示词不加约束），但 AI 读到的指令性内容出自别人——
+   * 关联回执喂会话（回执是对方机器人 / 同事写的）、所有者空 @ 引用了别人的消息（@ 里除了「@」没有所有者自己的字）。
+   * 这一轮登记「群成员触发」标记（scope=desktop）：desktop_* / 写所有者备注 / 新建定时 / 自动推进恒拒，其余系统工具照常。
+   * 三条送达分支（送活会话 / 唤醒 / 一次性 agent）都带；只由 group-route 对 task 型置位，**随排队一起存、重放时原样带回**。
+   */
+  foreignContentTurn?: boolean;
   /**
    * 定时任务到点触发（系统发的，不是用户说话）。与普通属主消息的三处不同——都是「别因为一条
    * 定时消息改动用户的任务状态」：
@@ -735,6 +749,11 @@ const runTaskQuestionInject = async (
   // 群里非属主并入活会话：与 questionOnly 共享「不 ack / 不 askSkip / 不唤醒」，但会 send 进活会话
   const nonOwner = !questionOnly && !!options.groupNonOwner;
   const guarded = questionOnly || nonOwner;
+  // 「只送活会话」：非属主并入，以及关联回执喂会话——回执的内容出自对方机器人 / 同事，group-route 只在「活会话在场」时才选这条路
+  // （feedIntoSession）。入口判断之后、送达之前会话刚好没了（过期 / 被收掉 / send 失败），不能落到唤醒 / 一次性 agent：
+  // 那两条都是带写权限的全权限 agent，却由别人写的内容驱动，只带 scope=desktop 的标记，与「会话不在不自动唤醒」的约定相反（第四轮评审）。
+  // questionOnly（关联命中但会话本来就不在 → 只读旁路）不受影响：旁路不 deliver、也不唤醒。
+  const liveSessionOnly = nonOwner || (!questionOnly && options.correlatedAnswer === true);
   // 内置浏览器活动摘要（拉取点在下方 agentText 前；声明提到这里是因为 tryQueueWhenBusy 的闭包要读它）
   let browserNote: string | null = null;
 
@@ -838,9 +857,9 @@ const runTaskQuestionInject = async (
   if (task.mode === "chat") {
     return errorResponse("chat 对话直接在输入框发消息即可", 409);
   }
-  // 非属主并入活会话：没有活会话就不并入（群入向只在有活会话时才走本路径，这里是竞态兜底）。
+  // 非属主并入活会话 / 关联回执喂会话：没有活会话就不并入（群入向只在有活会话时才走本路径，这里是竞态兜底）。
   // 绝不退化成唤醒 / 一次性 agent——那两条都是带写权限的全权限 agent。
-  if (nonOwner && !agentSessions.has(task.id)) {
+  if (liveSessionOnly && !agentSessions.has(task.id)) {
     return errorResponse(NON_OWNER_NO_SESSION_MESSAGE, 409);
   }
   // 有 pendingAsk 也不硬拦输入条：用户可绕过答题卡直接说话，那组提问按「隐式跳过」
@@ -1046,16 +1065,37 @@ const runTaskQuestionInject = async (
   }
 
   // 同一轮 curl 还挂着：跳过正文写进 stdout，本轮继续。写进去了就不要 send。
-  const viaWait = askSkip
-    ? await sendTimed(
-        "askSkipWait",
-        fulfillAskSkipViaWait(task.id, askSkip, liveAgentText, {
-          imageAbsPaths,
-          attachmentPaths:
-            attachmentPaths.length > 0 ? attachmentPaths : undefined,
-        }),
-      )
-    : false;
+  //
+  // 外来内容（foreignContentTurn：所有者空 @ 引用了别人的消息）走这条「顶掉提问」的回写（第六轮评审 P2-2）：答案原文进的是属主此刻
+  // 正在跑、本来没有标记的那一轮——它不经过下面的 deliverTaskQuestion（markerOnly 标记是在那里登记的），所以要在送达前一刻补登中途标记，
+  // 否则别人写的内容在没有「群成员触发」标记的状态下进了这一轮，desktop_* / 写所有者备注 / 新建定时 / 自动推进的恒拒形同虚设。
+  // chat 型同一个缺口第五轮已补（chat-inject 的 registerForeignMark），这里是 task 型的对应：
+  // - 登记点紧贴回写：与 fulfillAskSkipViaWait 之间不得有 await（登记放在上面守分支那段 await 之后，免得被上一轮 run 的收尾按名清掉）；
+  // - 此刻已有活标记（别的轮次登记的 all / desktop）→ beginForeignContentMidRun 返回 undefined、沿用它（不降级、不覆盖），下面回滚时 token 为空 = no-op；
+  // - 没写进去（curl 槽已经没了 / 抛错）→ 按 token 回滚，然后照旧往下走 deliverTaskQuestion（它自己登记 markerOnly 标记），
+  //   行为与没有这段登记时一致；写进去了的留给 run 收尾（task-runner 收尾处的 endMidRunForeignContent）清。
+  // - **登记之后要跨过 fulfillAskSkipViaWait 的长 await**（槽上没有 curl 时最长 ASK_WAIT_ATTACH_MS = 15 秒）：窗口里别路的外来内容可能沿用这个标记，
+  //   所以回滚走 rollbackForeignContentMidRun（沿用过且此刻还有 run 在跑就让位；与 ask-inject 同一套，第十一轮评审 P3-3），不是紧贴 send 的 endNonOwnerTurn。
+  //   这段回滚之前没有别的登记（deliverTaskQuestion 在它之后才登记），所以标记不会被自己沿用、回滚清得掉。
+  const foreignMidRunToken =
+    askSkip?.claimed && options.foreignContentTurn === true
+      ? beginForeignContentMidRun(task.id)
+      : undefined;
+  let viaWait = false;
+  try {
+    viaWait = askSkip
+      ? await sendTimed(
+          "askSkipWait",
+          fulfillAskSkipViaWait(task.id, askSkip, liveAgentText, {
+            imageAbsPaths,
+            attachmentPaths:
+              attachmentPaths.length > 0 ? attachmentPaths : undefined,
+          }),
+        )
+      : false;
+  } finally {
+    if (!viaWait) rollbackForeignContentMidRun(task.id, foreignMidRunToken);
+  }
   if (
     !viaWait &&
     pendingAskOpen &&
@@ -1101,9 +1141,9 @@ const runTaskQuestionInject = async (
               task,
               liveAgentText,
               imageAbsPaths,
-              // 非属主**不传 creds**：deliver 内「内存无会话 + 有 creds → resumeTaskSession」会把休眠会话复活成
+              // 非属主 / 关联回执**不传 creds**：deliver 内「内存无会话 + 有 creds → resumeTaskSession」会把休眠会话复活成
               // 全权限会话；不传则无内存会话时直接 no_session（下面 409）
-              nonOwner
+              liveSessionOnly
                 ? undefined
                 : {
                     apiKey,
@@ -1126,7 +1166,10 @@ const runTaskQuestionInject = async (
                       ? { openId: options.groupNonOwner.openId }
                       : {}),
                   }
-                : undefined,
+                : // 属主语义、但内容出自别人：只登记标记，不改提示词（见 options.foreignContentTurn）
+                  options.foreignContentTurn === true
+                  ? { name: "", guard: false, markerOnly: true }
+                  : undefined,
               branchGuarded,
             ),
           );
@@ -1152,9 +1195,9 @@ const runTaskQuestionInject = async (
     return staleResponse(task.id);
   }
   const sent = viaWait || deliverResult === "sent";
-  // 非属主没送进活会话（会话刚断 / send 失败）：到此为止，**绝不**落到唤醒 / 一次性 agent（全权限）。
+  // 非属主 / 关联回执没送进活会话（会话刚断 / send 失败）：到此为止，**绝不**落到唤醒 / 一次性 agent（全权限）。
   // 409 让群入向回一句人话；群入向本来就只在有活会话时才选这条路径。
-  if (nonOwner && !sent) {
+  if (liveSessionOnly && !sent) {
     return errorResponse(NON_OWNER_NO_SESSION_MESSAGE, 409);
   }
 
@@ -1364,6 +1407,7 @@ const runTaskQuestionInject = async (
             forceModel,
             gitToken: body.bootArgs?.gitToken?.trim() || undefined,
             opGen,
+            ...(options.foreignContentTurn === true ? { foreignContentTurn: true } : {}),
             onRunningCommitted: (next) => {
               runningCommitted = true;
               onRunningCommitted(next);
@@ -1476,6 +1520,7 @@ const runTaskQuestionInject = async (
       attachmentPaths.length > 0 ? attachmentPaths : undefined,
       opGen,
       options.scheduledTrigger === true,
+      options.foreignContentTurn === true,
     );
   }
 

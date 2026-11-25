@@ -15,6 +15,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { blockAfter, readSource } from "./helpers/source-text";
+
 const TMP = mkdtempSync(path.join(os.tmpdir(), "fe-pi-non-owner-exec-"));
 const DATA = path.join(TMP, "data");
 const WORK = path.join(TMP, "work");
@@ -32,6 +34,7 @@ const { createCustomAgent } = await import("@/lib/server/custom-agent-backend");
 const { seedModelsDevCatalogForTest } = await import("@/lib/server/models-dev-catalog");
 const { __resetNonOwnerTurnGuardForTest, beginNonOwnerTurn, endNonOwnerTurn } =
   await import("@/lib/server/non-owner-turn-guard");
+const { CALLER_MISMATCH_ERROR, cleanupChatTaskState, setOneShotCallerToken } = await import("@/lib/server/chat-pending");
 
 type Tool = {
   name: string;
@@ -51,6 +54,19 @@ const run = (
 
 const textOf = (r: { content: Array<{ type: string; text?: string }> }): string =>
   r.content.map((c) => c.text ?? "").join("\n");
+
+/**
+ * 被拒的工具调用：pi 的 execute 没有 isError 字段，失败必须抛错（agent-loop 才会按失败的工具调用呈现、界面不亮绿勾），
+ * 文案原样是错误信息。返回错误信息；没被拒（正常返回了结果）返回 null。
+ */
+const deniedMessage = async (p: Promise<unknown>): Promise<string | null> => {
+  try {
+    await p;
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+};
 
 const makeSession = () => ({
   sessionFile: "fake-session-file",
@@ -101,9 +117,9 @@ describe("非属主一轮：execute 层硬拒（标记在）", () => {
     const tools = await toolsOf();
     beginNonOwnerTurn("t1");
     const marker = path.join(WORK, "shell-ran.txt");
-    const r = await run(tools.shell!, "c1", { command: `echo hi > "${marker}"` });
-    expect(textOf(r)).toContain("[DENIED]");
-    expect(textOf(r)).toContain("shell");
+    const msg = await deniedMessage(run(tools.shell!, "c1", { command: `echo hi > "${marker}"` }));
+    expect(msg).toContain("[DENIED]");
+    expect(msg).toContain("shell");
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -111,13 +127,11 @@ describe("非属主一轮：execute 层硬拒（标记在）", () => {
     const tools = await toolsOf();
     beginNonOwnerTurn("t1");
     const target = path.join(WORK, "written.txt");
-    const w = await run(tools.write!, "c2", { path: target, content: "x" });
-    expect(textOf(w)).toContain("[DENIED]");
+    expect(await deniedMessage(run(tools.write!, "c2", { path: target, content: "x" }))).toContain("[DENIED]");
     expect(existsSync(target)).toBe(false);
     for (const name of ["edit", "delete", "task"]) {
       expect(tools[name], `${name} 应该在属主会话的工具集里`).toBeTruthy();
-      const r = await run(tools[name]!, "c3", {});
-      expect(textOf(r), name).toContain("[DENIED]");
+      expect(await deniedMessage(run(tools[name]!, "c3", {})), name).toContain("[DENIED]");
     }
   });
 
@@ -126,8 +140,7 @@ describe("非属主一轮：execute 层硬拒（标记在）", () => {
     beginNonOwnerTurn("t1");
     for (const name of ["submit_work", "ask_user", "schedule", "share_to_group"]) {
       expect(tools[name], `${name} 应该在属主会话的工具集里`).toBeTruthy();
-      const r = await run(tools[name]!, "c4", {});
-      expect(textOf(r), name).toContain("[DENIED]");
+      expect(await deniedMessage(run(tools[name]!, "c4", {})), name).toContain("[DENIED]");
     }
     // wait 不在包装拒绝之列：它自己的 handler 决定（这里 1 秒且立刻 abort，不真等）
     const ac = new AbortController();
@@ -192,8 +205,7 @@ describe("标记不在 / 不相干：全部透传（属主的轮次、开关关�
   it("一轮结束（endNonOwnerTurn）后立刻恢复：同一份工具定义不需要重建", async () => {
     const tools = await toolsOf();
     const token = beginNonOwnerTurn("t1");
-    const denied = await run(tools.shell!, "d4", { command: "echo no" });
-    expect(textOf(denied)).toContain("[DENIED]");
+    expect(await deniedMessage(run(tools.shell!, "d4", { command: "echo no" }))).toContain("[DENIED]");
     endNonOwnerTurn("t1", token);
     const ok = await run(tools.shell!, "d5", { command: "echo yes" });
     expect(textOf(ok)).toContain("yes");
@@ -230,8 +242,7 @@ describe("标记是滑动 TTL（第 20 轮评审 N1）：pi 工具咽喉命中�
     // 距起点 80 分钟、距上次工具调用 40 分钟：续期了就还在，没续就已过期、shell 会真跑
     at("11:20");
     const marker = path.join(WORK, "ttl-shell-ran.txt");
-    const denied = await run(tools.shell!, "n2", { command: `echo hi > "${marker}"` });
-    expect(textOf(denied)).toContain("[DENIED]");
+    expect(await deniedMessage(run(tools.shell!, "n2", { command: `echo hi > "${marker}"` }))).toContain("[DENIED]");
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -242,8 +253,7 @@ describe("标记是滑动 TTL（第 20 轮评审 N1）：pi 工具咽喉命中�
     beginNonOwnerTurn("t1");
     for (const hhmm of ["10:30", "11:00", "11:30", "12:00"]) {
       at(hhmm);
-      const r = await run(tools.shell!, `n-${hhmm}`, { command: "echo hi" });
-      expect(textOf(r), hhmm).toContain("[DENIED]");
+      expect(await deniedMessage(run(tools.shell!, `n-${hhmm}`, { command: "echo hi" })), hhmm).toContain("[DENIED]");
     }
   });
 
@@ -255,5 +265,46 @@ describe("标记是滑动 TTL（第 20 轮评审 N1）：pi 工具咽喉命中�
     at("10:46");
     const r = await run(tools.shell!, "n3", { command: "echo yes" });
     expect(textOf(r)).toContain("yes");
+  });
+});
+
+describe("闭包 token 接线（第二十轮评审 R20-5）：callerToken 入参 → pi 工具闭包", () => {
+  const ID = "t_pi_closure_tok";
+  afterEach(() => cleanupChatTaskState(ID));
+  // set_owner_note：受限工具（过期会话闸核对 token）；content 传空串 = 只清备注、没有别的副作用。pi 的失败是抛错，被拒返回错误信息、放行返回 null
+  const callNote = (tools: Record<string, Tool>) => run(tools.set_owner_note!, "w1", { task_id: ID, content: "" });
+
+  it("createCustomAgent：闭包带的就是入参里的 callerToken——表里登记同一个才放行；没登记 / 换成别人的 / 摘掉都被拒（fail-closed）", async () => {
+    const tools = await toolsOf({ taskId: ID, callerToken: "tok-pi-A" });
+    expect(tools.set_owner_note, "会话里应挂有 set_owner_note").toBeTruthy();
+    expect(await deniedMessage(callNote(tools)), "没登记：fail-closed").toContain(CALLER_MISMATCH_ERROR);
+    setOneShotCallerToken(ID, "tok-pi-A");
+    expect(await deniedMessage(callNote(tools)), "登记的就是闭包带的 token：不该被拒").toBeNull();
+    setOneShotCallerToken(ID, "tok-pi-B");
+    expect(await deniedMessage(callNote(tools)), "表里换成别人的：旧会话的闭包被拒").toContain(CALLER_MISMATCH_ERROR);
+    cleanupChatTaskState(ID);
+    expect(await deniedMessage(callNote(tools)), "摘掉之后被拒").toContain(CALLER_MISMATCH_ERROR);
+  });
+
+  it("没有 callerToken（受限答疑 / 标题生成）：不挂任何系统工具闭包——没有 token 可带，也就没有可被拿去冒用的入口", async () => {
+    const tools = await toolsOf({ taskId: ID, callerToken: undefined });
+    expect(tools.set_owner_note, "无 callerToken 的会话不该有 set_owner_note").toBeUndefined();
+    expect(tools.schedule).toBeUndefined();
+  });
+
+  it("源码结构：create / resume 各自取 input.callerToken 并原样交给 buildCustomTools（resume 需要真会话文件，这里靠结构钉）；闭包里三类工具（系统 / 浏览器 / 电脑）都把同一个 callerToken 交给咽喉", () => {
+    const src = readSource("src/lib/server/custom-agent-backend.ts");
+    expect(src.match(/const callerToken = input\.callerToken;/g)?.length, "create / resume 各取一次").toBe(2);
+    expect(
+      src.match(
+        /buildCustomTools\(\s*callerToken,\s*cwd,\s*\{ input, runtime, model, thinkingLevel \},\s*mcp\.toolDefs,\s*input\.taskId,\s*\)/g,
+      )?.length,
+      "create / resume 各把 callerToken + input.taskId 原样交给 buildCustomTools",
+    ).toBe(2);
+    const build = blockAfter(src, "const buildCustomTools = (");
+    expect(
+      build.match(/invokeFlowshipTool\(\s*t,\s*params as Record<string, unknown>,\s*callerToken,\s*\{/g)?.length,
+      "系统 / 浏览器 / 电脑操作三段映射各有一处、都用 buildCustomTools 的 callerToken 参数",
+    ).toBe(3);
   });
 });

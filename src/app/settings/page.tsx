@@ -6,8 +6,10 @@
  * 组卡按用户心智（2026-08-18：模型提供方从「连接」拆成独立一栏）：
  *   模型（Cursor SDK / 自定义两块目录，默认提供方在目录下面）/ 连接（GitLab Token + 飞书集成 + 环境配置）/
  *   团队（wk 流程：WK 产出目录 + Delivery Hub）/
- *   偏好（跳转 IDE + 分支模板 + 提交快捷键 + 续用 Agent）/ 仓库。
- * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航五项。
+ *   偏好（跳转 IDE + 分支模板 + 提交快捷键 + 续用 Agent）/ 内置浏览器 / 电脑操作 / 仓库。
+ * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航七项（与卡片自上而下的顺序一致）。
+ * 内置浏览器、电脑操作两张卡曾游离在导航之外：滚到它们时导航高亮会停在「偏好」、也点不到——2026-11-24 用户要求
+ * 「浏览器单独一个 tab」后并入导航（仍是长滚动 + 锚点，不是切页签：别回到「每个页签只有一两项」的旧布局）。
  * 存储已搬去 /sessions 会话管理（会话 tab + 存储占用 tab），设置不再挂载。
  *
  * - 能力类配置（MCP / Skill / Action）在 /actions 能力页 tab 管理
@@ -39,6 +41,8 @@ import { useApiKeyInfo } from "@/hooks/use-api-key-info";
 import { getSettings } from "@/lib/local-store";
 import { describeSettingsUnreadable } from "@/lib/settings-unreadable";
 import { describeSettingsLoadFailure } from "@/lib/settings-load-state";
+import { describeRetryPending } from "@/lib/settings-retry-pending";
+import { createScrollSpy, type ScrollSpy } from "@/lib/settings-scroll-end";
 import {
   CURSOR_PROVIDER_ID,
   DEFAULT_MEEGLE_PROJECT,
@@ -58,6 +62,7 @@ import { RepoCard } from "@/components/settings/repo-card";
 import { GitLabSection } from "@/components/settings/git-card";
 import { PreferenceSections } from "@/components/settings/preference-card";
 import { BrowserSection } from "@/components/settings/browser-card";
+import { ComputerUseSection } from "@/components/settings/computer-use-card";
 import { CompanyEnvSection } from "@/components/settings/company-env-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
 import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
@@ -67,12 +72,14 @@ import { useWhatsNew } from "@/components/whats-new-host";
 import { emptyCompanyEnv } from "@/lib/company-env";
 import { hasWhatsNewFor } from "@/lib/whats-new";
 
-// 左侧锚点导航（五组）：id 同 ?focus= 新取值
+// 左侧锚点导航（七组，顺序 = 卡片自上而下的顺序）：id 同 ?focus= 取值（card-<id>）
 const NAV_ITEMS: Array<{ focus: string; label: string }> = [
   { focus: "model", label: "模型" },
   { focus: "connect", label: "连接" },
   { focus: "team", label: "团队" },
   { focus: "prefs", label: "偏好" },
+  { focus: "browser", label: "内置浏览器" },
+  { focus: "computer-use", label: "电脑操作" },
   { focus: "repos", label: "仓库" },
 ];
 
@@ -104,6 +111,8 @@ const SettingsPage = () => {
     loadFailed,
     retrying,
     retryLoad,
+    retryPending,
+    dirty,
     update,
     saveFieldValue,
   } = useSettings();
@@ -173,6 +182,16 @@ const SettingsPage = () => {
 
   // 当前导航高亮项（点导航 / 滚动跟随都更新）
   const [activeFocus, setActiveFocus] = useState<string>(NAV_ITEMS[0].focus);
+  // 高亮的三个来源（点导航 / 深链、IntersectionObserver、滚到底）都经这一个控制器：点导航 / 深链之后有一段锁定期，期间滚动跟随不改高亮（R20-12，逻辑与单测见 settings-scroll-end）。
+  // 惰性创建一次（useRef），setActiveFocus 是稳定的 setState，所以回调里拿到的控制器永远是同一个
+  const scrollSpyRef = useRef<ScrollSpy | null>(null);
+  if (!scrollSpyRef.current) {
+    scrollSpyRef.current = createScrollSpy(
+      { now: () => Date.now(), setActive: setActiveFocus },
+      NAV_ITEMS[NAV_ITEMS.length - 1]!.focus,
+    );
+  }
+  const scrollSpy = scrollSpyRef.current;
   // ?focus= 锚点定位 + 短暂高亮
   const [highlightId, setHighlightId] = useState<string | null>(null);
 
@@ -181,11 +200,11 @@ const SettingsPage = () => {
     const id = `card-${focus}`;
     const el = document.getElementById(id);
     if (!el) return;
-    setActiveFocus(focus);
+    scrollSpy.navigate(focus);
     el.scrollIntoView({ behavior: "smooth", block: "start" });
     setHighlightId(id);
     window.setTimeout(() => setHighlightId(null), 1600);
-  }, []);
+  }, [scrollSpy]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -201,20 +220,26 @@ const SettingsPage = () => {
       router.replace(`/actions?tab=${CAPABILITY_FOCUS[raw]}`);
       return;
     }
+    // 加载失败时卡片区整体不渲染（见下面的 {!loadFailed && …}），此时没有锚点可滚；
+    // 依赖里带上 loadFailed：首次加载失败后「重试加载」成功，卡片才出现，这个 effect 才会再跑一次把 ?focus= 深链滚到位（S-6）。
+    // 不会重复滚动：loadFailed 只在「重试加载」成功时由 true 翻 false 一次；成功加载后它不再变
+    if (loadFailed) return;
     const focus = LEGACY_FOCUS[raw] ?? raw;
     requestAnimationFrame(() => scrollToFocus(focus));
-  }, [loaded, router, scrollToFocus]);
+  }, [loaded, loadFailed, router, scrollToFocus]);
 
   // 滚动跟随高亮：观察每张组卡、视口上半区内最靠前的算当前节
+  // 依赖同样带 loadFailed（S-6）：卡片受 !loadFailed 控制，失败态下没有节点可观察；重试成功后卡片渲染出来才能挂上观察器。
+  // 观察器每次重建前先 disconnect（cleanup），loadFailed 只翻一次，不会叠多个观察器
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || loadFailed) return;
     const observer = new IntersectionObserver(
       (entries) => {
         const visible = entries
           .filter((e) => e.isIntersecting)
           .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
         const first = visible[0]?.target?.id;
-        if (first?.startsWith("card-")) setActiveFocus(first.slice(5));
+        if (first?.startsWith("card-")) scrollSpy.observed(first.slice(5));
       },
       // 上缘 20% ~ 下缘 60% 之间算「当前在看」——偏向靠上的卡片
       { rootMargin: "-20% 0px -60% 0px" },
@@ -223,8 +248,20 @@ const SettingsPage = () => {
       const el = document.getElementById(`card-${item.focus}`);
       if (el) observer.observe(el);
     }
-    return () => observer.disconnect();
-  }, [loaded]);
+    // 最后一张卡太短、滚到底也进不了上面的观察区间时：滚到底就高亮最后一项（S-8g）。
+    // 滚动容器是 AppShell 的主区（不是 window），scroll 不冒泡，所以在 document 上用捕获阶段听，并只认包含最后一张卡的那个容器
+    const lastFocus = NAV_ITEMS[NAV_ITEMS.length - 1]!.focus;
+    const lastCard = document.getElementById(`card-${lastFocus}`);
+    const onScroll = (e: Event) => {
+      const box = e.target;
+      if (box instanceof HTMLElement && lastCard && box.contains(lastCard)) scrollSpy.scrolled(box);
+    };
+    document.addEventListener("scroll", onScroll, true);
+    return () => {
+      observer.disconnect();
+      document.removeEventListener("scroll", onScroll, true);
+    };
+  }, [loaded, loadFailed, scrollSpy]);
 
   // 组卡外层包稳定 id + 锚点高亮 ring；scroll-mt 要 ≥ sticky 返回顶栏高度（~7rem）、
   // 否则锚点定位后卡片标题被浮顶盖住
@@ -252,6 +289,9 @@ const SettingsPage = () => {
     : null;
   const loadFailureText =
     unreadableText ?? (loadFailed ? describeSettingsLoadFailure() : null);
+
+  // 首次保存失败、正在自动重试的字段（R20-11）：界面显示的是新值、磁盘上仍是旧值，常驻挂在浮顶栏里（滚到哪都看得见），重试成功 / 被拒 / 放弃后自动消失
+  const retryNotice = describeRetryPending(retryPending);
 
   // 返回 = 回来路（任务详情 / 首页都可能）、无历史（直开 /settings）兜底回首页
   const handleBack = () => {
@@ -326,6 +366,18 @@ const SettingsPage = () => {
             <DiagnosticsButton />
             <CheckUpdateButton />
           </div>
+          {retryNotice && (
+            <div
+              role="status"
+              className="mt-2 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2"
+            >
+              <CircleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0 text-warning" />
+              <div className="min-w-0 text-xs leading-relaxed text-muted-foreground">
+                <span className="font-medium text-foreground">{retryNotice.headline}。</span>
+                {retryNotice.detail}
+              </div>
+            </div>
+          )}
         </div>
 
         {loadFailureText && (
@@ -442,6 +494,7 @@ const SettingsPage = () => {
                 meegleProject={settings.meegleProject ?? { ...DEFAULT_MEEGLE_PROJECT }}
                 onMeegleProjectChange={(v) => saveFieldValue("meegleProject", v)}
                 feishuChatBridge={settings.feishuChatBridge === true}
+                feishuChatBridgeSaved={!dirty.feishuChatBridge}
                 onFeishuChatBridgeChange={(v) =>
                   saveFieldValue("feishuChatBridge", v)
                 }
@@ -521,7 +574,7 @@ const SettingsPage = () => {
           </Card>,
         )}
 
-        {/* ---- 内置浏览器（桌面端）：evaluate / 录输入值开关 + 清登录态；不进左侧锚点导航，不动现有分组 ---- */}
+        {/* ---- 内置浏览器（桌面端）：AI 权限开关 + 标签页上限 + 清登录态；左侧导航有独立入口（id=card-browser） ---- */}
         {wrapCard(
           "browser",
           <Card>
@@ -560,6 +613,27 @@ const SettingsPage = () => {
                 }
                 maxTabs={settings.browserMaxTabs ?? 20}
                 onMaxTabsChange={(v) => saveFieldValue("browserMaxTabs", v)}
+              />
+            </CardContent>
+          </Card>,
+        )}
+
+        {/* ---- 电脑操作（桌面端）：总开关 + macOS 权限 + 「锁屏时也能用」；同内置浏览器卡、左侧导航有独立入口（id=card-computer-use）。
+             开关走 saveFieldValue 落盘；开机密码绝不进 settings、只经 window.__computerUse 进系统钥匙串 ---- */}
+        {wrapCard(
+          "computer-use",
+          <Card>
+            <CardHeader>
+              <CardTitle>电脑操作</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ComputerUseSection
+                enabled={settings.computerUse === true}
+                onEnabledChange={(v) => saveFieldValue("computerUse", v)}
+                lockedAccess={settings.computerUseLockedAccess === true}
+                onLockedAccessChange={(v) =>
+                  saveFieldValue("computerUseLockedAccess", v)
+                }
               />
             </CardContent>
           </Card>,

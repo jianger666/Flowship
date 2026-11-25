@@ -37,7 +37,11 @@ export interface FakeBrowser {
   cleanup: () => void;
 }
 
-export const installFakeBrowser = (handlers: Record<string, OpHandler> = {}): FakeBrowser => {
+export const installFakeBrowser = (
+  handlers: Record<string, OpHandler> = {},
+  /** 主进程在 hello-ack 里声明的能力；缺省只有 browser.v1（电脑操作的测试传 `["browser.v1", "desktop.v1"]`） */
+  opts: { capabilities?: string[] } = {},
+): FakeBrowser => {
   const msgSubs = new Set<(m: unknown) => void>();
   const calls: FakeBrowser["calls"] = [];
   const other: FakeBrowser["other"] = [];
@@ -87,7 +91,7 @@ export const installFakeBrowser = (handlers: Record<string, OpHandler> = {}): Fa
 
   const bridge = createBrowserBridge(transport);
   bridge.start();
-  msgSubs.forEach((cb) => cb({ v: 1, kind: "hello-ack", capabilities: ["browser.v1"] }));
+  msgSubs.forEach((cb) => cb({ v: 1, kind: "hello-ack", capabilities: opts.capabilities ?? ["browser.v1"] }));
   __setBrowserBridgeForTest(bridge);
 
   fake.bridge = bridge;

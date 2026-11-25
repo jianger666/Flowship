@@ -16,6 +16,9 @@
  *
  * 注意：
  *  - setState 只改槽位、不会自动重渲染——要读最新值请再 render 一次（和真 React 一样，返回值是 render 时的快照）；
+ *  - useCallback 默认**不**记忆（每次 render 都返回新函数，老用例都是在这个语义下写的）；要验证「依赖了某个 useCallback 结果的 effect 何时重跑」
+ *    必须传 `createHookHarness({ memoCallbacks: true })`——此时 useCallback 像真 React 一样按 deps 记忆（deps 不变返回同一个函数），
+ *    否则 effect 的依赖里只要有它，每次 render 都会被当成「变了」而重跑，测不出真实的触发时机；
  *  - 只实现了 useRef / useState / useCallback / useMemo / useEffect / useLayoutEffect / useId / useSyncExternalStore（只读 getSnapshot），用到别的 hook 会直接抛错；
  *  - 依赖 React 内部字段（__CLIENT_INTERNALS_…）：React 升级后桩不够用会抛错，提醒重新评估这批测试。
  */
@@ -40,7 +43,17 @@ interface EffectSlot {
   pending: (() => Cleanup) | null;
   cleanup: Cleanup;
 }
-type Slot = RefSlot | StateSlot | EffectSlot;
+interface CallbackSlot {
+  kind: "callback";
+  fn: unknown;
+  deps: Deps;
+}
+type Slot = RefSlot | StateSlot | EffectSlot | CallbackSlot;
+
+export interface HookHarnessOptions {
+  /** true = useCallback 按 deps 记忆（见文件头注意事项）；缺省 false = 每次 render 都是新函数（老用例的语义） */
+  memoCallbacks?: boolean;
+}
 
 export interface HookHarness {
   /** 在桩 dispatcher 下执行一次 hook 函数体（= 一次 render），返回 hook 的返回值 */
@@ -59,7 +72,8 @@ const depsChanged = (prev: Deps, next: Deps): boolean =>
   prev.length !== next.length ||
   next.some((d, i) => !Object.is(d, prev[i]));
 
-export const createHookHarness = (): HookHarness => {
+export const createHookHarness = (options: HookHarnessOptions = {}): HookHarness => {
+  const memoCallbacks = options.memoCallbacks === true;
   const internals = (
     React as unknown as Record<string, { H: unknown } | undefined>
   ).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
@@ -115,7 +129,16 @@ export const createHookHarness = (): HookHarness => {
       });
       return [slot.value, slot.set];
     },
-    useCallback: (fn: unknown) => fn,
+    useCallback: (fn: unknown, deps?: Deps) => {
+      if (!memoCallbacks) return fn;
+      const slot = slotAt<CallbackSlot>(() => ({ kind: "callback", fn, deps }));
+      // 无 deps（undefined）= 每次重新生成，与真 React 一致；depsChanged 对 undefined 恒为 true
+      if (depsChanged(slot.deps, deps)) {
+        slot.fn = fn;
+        slot.deps = deps;
+      }
+      return slot.fn;
+    },
     useMemo: (fn: () => unknown) => fn(),
     // 客户端语义：每次 render 读一次 getSnapshot（不订阅——桩里没有「外部变化触发重渲」）。
     // 要看服务端 / 水合首帧（getServerSnapshot）请用 renderToStaticMarkup，它走的就是服务端快照

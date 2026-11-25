@@ -47,7 +47,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
-import { addContextDoc, removeContextDoc } from "@/lib/task-store";
+import {
+  OWNER_NOTE_TITLE,
+  ownerNoteBudget,
+  ownerNoteOverflow,
+} from "@/lib/owner-note";
+import {
+  addContextDoc,
+  fetchTask,
+  removeContextDoc,
+  type AddContextDocResult,
+} from "@/lib/task-store";
 import { sliceHeadSafe, sliceTailSafe } from "@/lib/text-slice";
 import type { Task, TaskContextDoc, TaskContextDocType } from "@/lib/types";
 
@@ -92,6 +102,59 @@ const imageThumbnailUrl = (
   return `/api/tasks/${encodeURIComponent(taskId)}/uploads/${encodeURIComponent(filename)}`;
 };
 
+export interface AddFeedback {
+  level: "success" | "info" | "warning";
+  message: string;
+  description?: string;
+}
+
+/**
+ * 加文档成功后该给用户什么提示（纯函数、可直测）。
+ * - 正常拿到最新 task：按任务是否在跑给 info / success；
+ * - 文档已落盘但服务端读回任务视图失败（task 为 null）：warning，说清「已保存、请稍后刷新确认」——
+ *   不能弹错误（文档其实加上了，用户会再点一次造成重复添加）。
+ */
+export const describeAddFeedback = (
+  result: AddContextDocResult,
+  isLive: boolean,
+): AddFeedback => {
+  if (result.task === null) {
+    return {
+      level: "warning",
+      message: "文档已保存，但刷新任务状态失败，请稍后刷新页面确认",
+      description: result.warning,
+    };
+  }
+  if (isLive) {
+    return {
+      level: "info",
+      message: "已加上下文、下次推进 action / revise 时生效",
+      description: "当前 agent run 拿不到、避免节奏错乱",
+    };
+  }
+  return { level: "success", message: "上下文文档已加" };
+};
+
+/**
+ * 文档已保存但响应里没有 task 时，尽力把任务重新拉一次交给父组件（走 onTaskUpdate = 父级的 absorbTask，按 id 并集合并事件）。
+ * 刚读回失败、这次多半也会失败：失败就静默（调用方已经提示「请稍后刷新页面确认」），绝不抛。
+ */
+export const refreshTaskAfterCommittedAdd = async (
+  taskId: string,
+  onTaskUpdate: (task: Task) => void,
+  fetcher: typeof fetchTask = fetchTask,
+): Promise<boolean> => {
+  try {
+    // tail 与任务页首屏一致（300），避免把整段事件历史拉回来
+    const fresh = await fetcher(taskId, { tail: 300, anchored: true });
+    if (!fresh) return false;
+    onTaskUpdate(fresh);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 interface Props {
   task: Task;
   // 父组件刷新整 task 状态、避免重复 fetch
@@ -127,16 +190,22 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
   const isLive =
     task.runStatus === "running" || task.runStatus === "awaiting_user";
 
+  // 标题填的是「所有者备注」：内容一律按文本存、总长有上限（owner-note.ts）。
+  // 超了当场提示并挡住提交——超出的部分 AI 看不到，服务端也会拒绝，不等它拒了才发现
+  const isOwnerNote = title.trim() === OWNER_NOTE_TITLE;
+  const noteOverflow = isOwnerNote ? ownerNoteOverflow(docs, content) : null;
+
   // 提交条件：title + content 一对必须同填或同空、加上 images 至少 1 项
   const canSubmit = useMemo(() => {
     if (submitting) return false;
+    if (noteOverflow) return false;
     const hasTitle = title.trim().length > 0;
     const hasContent = content.trim().length > 0;
     const hasMain = hasTitle && hasContent;
     const partialMain = hasTitle !== hasContent;
     if (partialMain) return false;
     return hasMain || attach.images.length > 0;
-  }, [submitting, title, content, attach.images.length]);
+  }, [submitting, noteOverflow, title, content, attach.images.length]);
 
   const resetForm = () => {
     setTitle("");
@@ -148,20 +217,21 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
     if (!canSubmit) return;
     setSubmitting(true);
     try {
-      const updated = await addContextDoc(task.id, {
+      const result = await addContextDoc(task.id, {
         title: title.trim() || undefined,
         content: content.trim() || undefined,
         images: attach.toUploadPayload(),
       });
-      onTaskUpdate(updated);
+      // 文档已落盘（有没有 task 都一样）：清表单，避免用户再点一次重复添加
+      if (result.task) onTaskUpdate(result.task);
       resetForm();
-      if (isLive) {
-        toast.info("已加上下文、下次推进 action / revise 时生效", {
-          description: "当前 agent run 拿不到、避免节奏错乱",
-        });
-      } else {
-        toast.success("上下文文档已加");
-      }
+      const fb = describeAddFeedback(result, isLive);
+      toast[fb.level](
+        fb.message,
+        fb.description ? { description: fb.description } : undefined,
+      );
+      // 没拿到最新 task：尽力重拉一次让列表出现新文档（失败静默、上面的 warning 已说明）
+      if (!result.task) void refreshTaskAfterCommittedAdd(task.id, onTaskUpdate);
     } catch (err) {
       toast.error(
         `加文档失败：${err instanceof Error ? err.message : String(err)}`,
@@ -418,6 +488,24 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                 onChange={(e) => setTitle(e.target.value)}
                 placeholder="如：后端技术方案 / 设计稿 / 开发补充"
               />
+              {/* 所有者备注的手动入口：不必指望 AI 自己调 set_owner_note——所有者亲手写一条，群里非所有者提问时由代码贴给 AI */}
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                <span>
+                  想让群里的人直接办某类事（如造测试数据），又不想整体关掉「限制群里非宿主成员」？
+                  标题填「{OWNER_NOTE_TITLE}」、内容写清授权范围，字面范围内的事 AI 会照办（只对群里的真人成员；用自定义模型时，写文件 / 跑命令 / 调 MCP 工具仍会被拒）。
+                </span>
+                {title.trim() !== OWNER_NOTE_TITLE ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-2 text-xs"
+                    onClick={() => setTitle(OWNER_NOTE_TITLE)}
+                  >
+                    标题填「{OWNER_NOTE_TITLE}」
+                  </Button>
+                ) : null}
+              </div>
             </div>
 
             <div className="grid gap-1.5">
@@ -433,6 +521,15 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                 rows={4}
                 className="resize-none"
               />
+              {/* 所有者备注：按文本保存（以 / 或 http 开头也一样）、总长有上限；超了在这里就说清楚、不让加 */}
+              {isOwnerNote ? (
+                <p
+                  className={`text-xs ${noteOverflow ? "text-destructive" : "text-muted-foreground"}`}
+                >
+                  {noteOverflow ??
+                    `所有者备注 ${content.trim().length} / ${ownerNoteBudget(docs)} 字；内容以 / 或 http 开头也会按文本保存`}
+                </p>
+              ) : null}
             </div>
 
             {/* 贴图区：缩略图（点击站内看大图、多图左右切换）+ 添加按钮 */}

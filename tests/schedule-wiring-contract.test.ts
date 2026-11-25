@@ -11,8 +11,14 @@ import { describe, expect, it } from "vitest";
 
 import { toolBlockSummary, type ToolBlock } from "@/lib/tool-display";
 
+import { readSource } from "./helpers/source-text";
+
+/**
+ * .ts 源码读**剥掉注释**的（注释里照抄一遍被检查的那句不算接线；第三轮评审 P1-4）。
+ * .tsx 读原文：JSX 文本里的 `//` 会被 stripComments 误当成注释（见 helpers/source-text.ts 头注释）。
+ */
 const src = (rel: string): string =>
-  readFileSync(path.resolve(import.meta.dirname, "..", rel), "utf-8");
+  rel.endsWith(".tsx") ? readFileSync(path.resolve(import.meta.dirname, "..", rel), "utf-8") : readSource(rel);
 
 describe("到点消息走普通用户消息的路径，但不抢用户的东西（scheduledTrigger）", () => {
   it("chat-inject：定时触发不认领「隐式跳过待答提问」（用惰性句柄）", () => {
@@ -40,8 +46,10 @@ describe("到点消息走普通用户消息的路径，但不抢用户的东西�
     expect(s).toMatch(
       /\btiming,\s*options\.scheduledTrigger === true,\s*nonOwner\s*\?\s*\{[\s\S]*?\}\s*:\s*undefined,\s*branchGuarded,\s*\),/,
     );
-    // startOneShotQuestion(... , opGen, options.scheduledTrigger === true)
-    expect(s).toMatch(/\bopGen,\s*options\.scheduledTrigger === true,\s*\);/);
+    // startOneShotQuestion(... , opGen, options.scheduledTrigger === true, options.foreignContentTurn === true)
+    // 末位新增了「内容来自别人」标记（foreignContentTurn，见该选项的注释：这一轮要登记 scope=desktop 标记）；
+    // scheduledTrigger 仍紧挨在 opGen 之后——它决定一次性 agent 的脚注是「定时到点」还是「用户的插话」
+    expect(s).toMatch(/\bopGen,\s*options\.scheduledTrigger === true,\s*options\.foreignContentTurn === true,\s*\);/);
     const runner = src("src/lib/server/task-runner.ts");
     // 两处 user_message 封装都带 scheduled
     const userMessageCalls = runner.match(/buildAgentMessage\(\{\s*kind: "user_message",[\s\S]*?\}\)/g) ?? [];

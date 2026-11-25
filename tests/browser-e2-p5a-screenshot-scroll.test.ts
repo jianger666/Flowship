@@ -282,7 +282,7 @@ const makeFakeTab = (
   };
   fake.collectAnnotationItems = (BrowserTab.prototype as unknown as { collectAnnotationItems: () => Promise<unknown> }).collectAnnotationItems;
   const shot = (o: Record<string, unknown> = {}) => (BrowserTab.prototype as unknown as { screenshot: (o: unknown) => Promise<ShotResult> }).screenshot.call(fake, o);
-  return { shot, calls, encoded };
+  return { shot, calls, encoded, send: fake.send as ReturnType<typeof vi.fn> };
 };
 
 const REFS = [
@@ -341,16 +341,18 @@ describe("tab.screenshot：新参数", () => {
     await expect(shot({ annotate: true })).rejects.toMatchObject({ code: "UNSUPPORTED" });
   });
 
-  it("omitBackground：先设透明背景覆盖、截完还原；截图失败时也还原", async () => {
+  // 第十轮评审 B-3：「设透明背景 → 截 → 还原」三条命令改由 Tab.send 在截图的排他段里整套发（原先三条各自 send、只有中间那条排队，并发时会交错）。
+  // 这里的假 send 只看得到 screenshot() 交给 send 的那一条：截图命令 + transparentBackground 选项。
+  // 线序（设 → 截 → 还原）、失败也还原、并发不交错，由真 Tab + 假 CDP 钉死，见 browser-emulation-fit.test.ts 的 B-3 用例。
+  it("omitBackground：截图命令带 transparentBackground 选项，screenshot 自己不再单发背景命令（设 / 还原由 Tab.send 的排他段整套发）", async () => {
     const ok = makeFakeTab();
     await ok.shot({ format: "png", omitBackground: true });
-    const ms = ok.calls.map((c) => c.method);
-    expect(ms).toEqual(["Emulation.setDefaultBackgroundColorOverride", "Page.captureScreenshot", "Emulation.setDefaultBackgroundColorOverride", "DOM.getContentQuads"].slice(0, 3));
-    expect(ok.calls[0].params).toEqual({ color: { r: 0, g: 0, b: 0, a: 0 } });
-    expect(ok.calls[2].params).toEqual({});
+    expect(ok.calls.map((c) => c.method)).toEqual(["Page.captureScreenshot"]);
+    const opts = ok.send.mock.calls[0]![4] as { transparentBackground?: boolean };
+    expect(opts.transparentBackground).toBe(true);
   });
 
-  it("omitBackground 在截图抛错时 finally 仍还原背景", async () => {
+  it("omitBackground 且截图抛错：错误原样抛出，screenshot 没有自己的还原步骤可漏（还原在 Tab.send 排他段的 finally 里）", async () => {
     const calls: string[] = [];
     const fake: Record<string, unknown> = {
       deps: {},
@@ -364,13 +366,24 @@ describe("tab.screenshot：新参数", () => {
     };
     const proto = BrowserTab.prototype as unknown as { screenshot: (o: unknown) => Promise<unknown> };
     await expect(proto.screenshot.call(fake, { format: "png", omitBackground: true })).rejects.toThrow("boom");
-    expect(calls).toEqual(["Emulation.setDefaultBackgroundColorOverride", "Page.captureScreenshot", "Emulation.setDefaultBackgroundColorOverride"]);
+    expect(calls).toEqual(["Page.captureScreenshot"]);
   });
 
   it("omitBackground 不在 jpeg 上生效（直接调用时不会误设背景）", async () => {
     const t = makeFakeTab();
     await t.shot({ format: "jpeg", omitBackground: true });
     expect(t.calls.some((c) => c.method === "Emulation.setDefaultBackgroundColorOverride")).toBe(false);
+    const opts = t.send.mock.calls[0]![4] as { transparentBackground?: boolean };
+    expect(opts.transparentBackground).toBeUndefined(); // 没带透明选项：send 不会替它设背景
+  });
+
+  it("没传 omitBackground：截图命令不带 transparentBackground；annotate 强制 png 也不会误带", async () => {
+    const t = makeFakeTab({ refs: REFS });
+    await t.shot({ format: "png" });
+    await t.shot({ annotate: true, format: "jpeg" });
+    for (const c of t.send.mock.calls.filter((c) => c[0] === "Page.captureScreenshot")) {
+      expect((c[4] as { transparentBackground?: boolean }).transparentBackground).toBeUndefined();
+    }
   });
 
   it("clip：转成 CDP clip（视口 CSS 像素，夹到视口内，带 scale）", async () => {

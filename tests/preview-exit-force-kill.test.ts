@@ -59,9 +59,18 @@ const runExitCleanupLikeHook = async (): Promise<void> => {
   forceKillAllManagedChildrenSync();
 };
 
-/** 先装好「忽略 TERM」再落个就绪标记——测试要等标记出现才发 TERM，否则 sh 还没执行 trap 就被 TERM 默认杀掉了 */
+/**
+ * 先装好「忽略 TERM」再落个就绪标记——测试要等标记出现才发 TERM，否则 sh 还没执行 trap 就被 TERM 默认杀掉了。
+ *
+ * 为什么不是 `while :; do sleep 1; done`：死循环每秒 fork 一个新 sleep，强杀（killpg 逐个给组员发信号）
+ * 恰好撞上 sh「正在 fork」的瞬间时，刚生出来的 sleep 会漏过这一轮 SIGKILL、变成 ppid=1 的孤儿再活 ≤1s，
+ * 进程组「还活着」~1.01s，把下面 250 / 500ms 的窗口撑爆（实测旧形态 300 次里约 5 次漏网，新形态 0/300）。
+ * 不是僵尸进程回收慢：僵尸态（`kill(-pgid,0)` 仍成功）实测只持续 ~2–11ms。
+ * 现在改成「先把长 sleep 放后台、再落标记、最后 wait」：标记出现时组里的进程已经 fork 完，
+ * 之后不会再有新进程出生，强杀面对的是一份静态进程表，只有 KILL 能杀（TERM 被 SIG_IGN 继承）。
+ */
 const ignoreTermCommand = (marker: string): string =>
-  `trap '' TERM; touch '${marker}'; while :; do sleep 1; done`;
+  `trap '' TERM; sleep 600 & touch '${marker}'; wait`;
 const spawnedPids: number[] = [];
 
 const startUncooperative = async (id: string): Promise<number> => {
@@ -93,7 +102,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  // 兜底收尾：测试失败时也不留 `trap '' TERM` 的死循环进程
+  // 兜底收尾：测试失败时也不留 `trap '' TERM` 的不死进程（600s 长 sleep + 等它的 sh）
   for (const pid of spawnedPids.splice(0)) {
     try {
       process.kill(-pid, "SIGKILL");

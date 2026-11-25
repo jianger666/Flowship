@@ -498,7 +498,7 @@ export const createHandlers = (deps) => {
       data = await abortable(printPdf(tab, a.pdf), signal);
     } else if (a.kind === "screenshot") {
       // maxWidth 给超大值：存盘要原图，不能被 snapshot 用的 1280 缩小
-      const shot = await abortable(tab.screenshot({ fullPage: a.fullPage !== false, format: "png", maxWidth: 100_000 }), signal);
+      const shot = await abortable(tab.screenshot({ fullPage: a.fullPage !== false, format: "png", maxWidth: 100_000, signal }), signal);
       data = Buffer.from(String(shot?.dataBase64 ?? ""), "base64");
     } else {
       const html = await abortable(runPageScript(tab, { source: SAVE_HTML_SOURCE, callOnNode }), signal);

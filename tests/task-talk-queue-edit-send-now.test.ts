@@ -284,7 +284,7 @@ describe("beginTalkQueueSendNow / endTalkQueueSendNow（取出 + 救其余 + dra
     expect(begun.item.itemId).toBe(b);
     expect(begun.rest.map((e) => e.itemId)).toEqual([a, c]);
     // 被救出的 A / C 不在队列里（stop 的清队碰不到），但**快照里仍然有它们**并标 held——
-    // 窗口常常是好几秒，快照里它们若消失，排队条会降成 0 整条消失、放回后又 0→N 自动弹开（第十七轮 N1）。
+    // 窗口常常是好几秒，快照里它们若消失，排队条会降成 0 整条消失、放回后又 0→N 自动弹开（task-talk-queue 评审系列 N1）。
     // （以前这里断言的是 [owner]，把「界面上看不到它们」当成了正确答案）
     expect(
       listTalkQueue(taskId).map((i) => [i.id, i.held === true]),
@@ -341,7 +341,7 @@ describe("beginTalkQueueSendNow / endTalkQueueSendNow（取出 + 救其余 + dra
   });
 });
 
-describe("暂存区（held）：立即发送窗口内快照不跳变（第十七轮 N1）", () => {
+describe("暂存区（held）：立即发送窗口内快照不跳变（task-talk-queue 评审系列 N1）", () => {
   const heldFlags = (taskId: string) =>
     buildTalkQueueSnapshot(taskId).map((i) => [i.preview, i.held === true]);
   const noHeld = (taskId: string) =>

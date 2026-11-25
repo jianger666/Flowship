@@ -79,6 +79,19 @@ export const BROWSER_NAV_DOWNLOAD_MS = 15_000;
 export const BROWSER_NAV_DOWNLOAD_MAX_MS = 60_000;
 /** 用户在地址栏 / 新建标签里输入的导航：与 navigate 的默认超时同长 */
 export const BROWSER_USER_NAV_DOWNLOAD_MS = 30_000;
+/** {@link BrowserTab.evalInFrames} 每批并发发出的 `Runtime.evaluate` 数（框架很多的页面别一次性塞几十条 CDP） */
+export const EVAL_IN_FRAMES_CONCURRENCY = 8;
+/**
+ * {@link BrowserTab.evalInFrames} 一次调用的总时限（毫秒）：分批串行发，每批最长 `timeoutMs`，框架很多又都卡死时 N / 8 批相加会远超调用方的预期
+ * （第二十三轮 R23-5：100 个卡死的框架约 19 秒）。总时限到了就不再发后面的批次，没轮到的框架不出现在结果里——调用方把「存在却没回应」当作核对不出来处理。
+ */
+export const EVAL_IN_FRAMES_TOTAL_MS = 3000;
+/**
+ * {@link BrowserTab.ensureCdp} 队列外自愈的最多轮数（第二十五轮 N-2）：单飞要等整个 `#attachDebugger`（含主 frame 同步 / 输入锁 / 模拟重放，可能长达几十秒）才结束，
+ * 这期间页面可能再崩一次（`render-process-gone` 只置 `cdpReady = false`）——醒来的调用方不重判就放行，后面的命令会白等 `CDP_TIMEOUT_MS`（20 秒）。
+ * 所以醒来后再判一次、仍没就绪就再来一轮；但不无限追着反复崩溃的页面跑，2 轮之后放行、由调用方的命令自己报错（放行前再判一次：tab 已关 → 抛 TAB_NOT_FOUND，仍没就绪 → 写一行日志，第二十六轮 T-5）。
+ */
+export const CDP_HEAL_MAX_ROUNDS = 2;
 
 /** 去掉 #fragment 再比较（`getURLChain()[0]` 是否保留 fragment 取决于引擎，两边都去掉就不依赖它）；解析失败返回 null */
 const urlNoHash = (u) => {
@@ -92,6 +105,18 @@ const urlNoHash = (u) => {
 };
 
 const CDP_TIMEOUT_MS = 20_000;
+/**
+ * omit_background 截图收尾里「还原默认背景」那条命令的超时（第十一轮评审 P3-5）：它只是善后，页面卡死时本来也发不进去——
+ * 按 CDP「同一会话的命令按序派发」的推断，超时只是我们不再等、命令在页面恢复后仍会按序执行（这是推断，没有在真页面卡死时实测，见 `#sendTransparent`），
+ * 所以不必像截图本身那样等满 CDP_TIMEOUT_MS，免得卡死的页面多占一次 20 秒队列。
+ */
+const TRANSPARENT_RESTORE_TIMEOUT_MS = 5_000;
+/**
+ * 显示被扣住（有槽位、矩形却还是停车场尺寸）而又没有截图在飞时，隔这么久兜底重摆一次（只试一次；第十一轮评审 P3-2）。
+ * 排它的有两个调用点：`#afterCapture`（截图刚结束、补摆失败）与 `#applyVisible` 的扣住分支（不在截图中：补摆失败时遮盖正开着、收尾没扣住，
+ * 之后遮盖放开的 setVisible(true) 才第一次扣住；第十二轮评审 P3-5）。
+ */
+const HELD_SHOW_RETRY_MS = 300;
 /** navigate 因认证 / 证书提示而延后超时之后，再给页面加载的宽限（E2·P1） */
 const NAV_AFTER_PROMPT_GRACE_MS = 15_000;
 /** JS 对话框最长挂起时间（契约 §14.1）：期间 AI 用 browser_dialog、用户点面板按钮处理；超时按旧策略兜底，页面不能无限卡死 */
@@ -253,12 +278,55 @@ export class BrowserTab {
    */
   #fitScale = 1;
   /**
-   * 最近一次**发出**的 scale（发送时就更新，失败回滚）。AI 的输入坐标按它补偿：CDP 命令在同一会话里按序执行，
-   * 排在缩放命令之后发出的输入，落地时用的就是这个比例（等应答再切会让这段时间里的点击差 1/scale 倍）。
+   * 最近一次**发出**的 scale（发送时就更新，失败回滚）。AI 的输入坐标按它补偿：按 CDP「同一会话的命令按序派发」的推断
+   * （没有在真页面卡死时实测，见 `#sendTransparent`），排在缩放命令之后发出的输入，落地时用的就是这个比例（等应答再切会让这段时间里的点击差 1/scale 倍）。
    */
   #inputScale = 1;
   /** 已有一个「按最新槽位重算缩放」的任务在模拟队列里等着：拖面板每帧都来一次 setBounds，合并成一个，永远只补最新的 */
   #refitQueued = false;
+  /**
+   * 有一条 `Page.captureScreenshot` 正占着模拟队列在 Chromium 里跑（互斥的原因见 `#captureExclusive`）。
+   * 期间 `#applySlot` 不去动原生视图的矩形，只记下「有被推迟的摆放」，截图结束后按最新槽位补摆一次。
+   */
+  #capturing = false;
+  /** 截图期间有一次 `#applySlot` 被推迟了：截图结束要补摆 */
+  #slotDeferred = false;
+  /**
+   * 视图的原生矩形此刻还是 `#park` 摆的 PARKING_BOUNDS（1280×800）——还没被 `#applySlot` 换成槽位矩形。
+   * 视图在这个状态下挂进主窗口、又赶上截图在飞（`#applySlot` 被推迟）时，此刻显示它会让一块 1280×800 的视图盖在主窗口左上角
+   * 直到截图结束（第九轮评审 B1）：见 `#applyVisible`。
+   */
+  #atParkingBounds = true;
+  /**
+   * 截图在飞时被停进了停车场（面板关了 / 切走了标签页）：停车场矩形要等截完再摆。此刻改矩形，截完 Chromium 写回的是「开始时记下的旧尺寸」——
+   * 真 Electron 实测（capture-emulation-race.cjs cx-09，第九轮评审 P3-4）：视图矩形是 1280×800、页面 innerWidth 却停在面板槽位的 1156，
+   * 要等下次打开面板才恢复。停车场里没有槽位，补摆靠不上 `#applySlot`，由 `#afterCapture` 补。
+   */
+  #parkDeferred = false;
+  /** 调用方最近一次想要的可见性（`moveToMain` 的 `visible` / `setVisible`）；`#showHeld` 期间据它在补摆完成后真正显示 */
+  #wantVisible = true;
+  /** 「显示」被扣住了：视图在主窗口里、矩形还是停车场尺寸（截图在飞，或收尾补摆失败了）——先藏着，摆成槽位矩形之后再按 `#wantVisible` 显示 */
+  #showHeld = false;
+  /**
+   * 收尾补摆失败后兜底重摆的定时器（只排一个，见 `#scheduleHeldShowRetry`；销毁时清掉）。包了一层 `{ handle }`：
+   * 「有没有排着」看这个对象在不在，**不看句柄本身的真假**——注入的假时钟（`setTimeoutFn`）可能返回 0 / undefined 之类的 falsy 句柄，
+   * 直接判句柄会被它绕过、同一时刻排出多个（第十五轮评审 P3-4；真 `setTimeout` 返回 Timeout 对象，生产里不会触发）
+   */
+  #heldShowRetry = null;
+  /**
+   * 透明背景截图收尾「还原默认背景」没成功的 CDP 会话（null = 主会话，其余是子会话 id；第十三轮评审 P3-7）。
+   * 页面还活着、还原却快速返回了 CDP 错误时，页面会一直留着透明默认背景，之后的普通 jpeg 截图可能是黑底；
+   * 下一条截图的排他段开头补发一次 `{}`（`#restoreDirtyBackground`）。还原超时也记（超时的还原按「同一会话按序派发」的推断会在页面恢复后生效，补发是幂等的、
+   * 多一道保险；推断没实测）；标签页已关（TAB_NOT_FOUND）没有对象，不记。
+   */
+  #bgDirty = new Set();
+  /**
+   * 队列外自愈（{@link ensureCdp}）在飞的那一次 `{ promise }`，没有则 null（第二十四轮 P3-2）。
+   * 每个 op 前的 `ensureCdp()` 与权限闸的 `kickCdpHeal` 都会触发自愈；此前没有单飞——两路重叠时各自 `children.clear()` + `#attachDebugger`，
+   * 同一个会话被初始化两遍（`#setupSession(null)` 并发、`Target.setAutoAttach` 重复、早钩子重复）。现在队列外的调用方共用同一次；
+   * 队列内的调用方（`#applyEmulationNow`）不能等它——重放要占的模拟队列正被队列内调用方自己占着（等于等自己），所以队列内仍走自己的那一次。
+   */
+  #healFlight = null;
   /** 最近一次通知渲染端的缩放百分比（整数）；只有它变了才推状态（拖面板时不必每帧推） */
   #notifiedFitPct = 100;
 
@@ -344,6 +412,10 @@ export class BrowserTab {
     this.cdpListeners = new Set();
     /** 契约 §15.1 扩展点：每个 CDP 会话（主 / OOPIF 子会话）初始化时调用；销毁时调用；各模块的 tab 级私有状态 */
     this.sessionHooks = new Set();
+    /** R23-3：与域启用并行发的「早钩子」（见 addEarlySessionHook） */
+    this.earlySessionHooks = new Set();
+    /** R24-1：已经跑过「早钩子这一批」的会话（null = 主会话，其余是 OOPIF 子会话 id）；`addEarlySessionHook` 据此给迟到登记的钩子补课 */
+    this.earlySessionsRan = new Set();
     this.destroyHooks = new Set();
     /** R6-09：「页面执行上下文已失效」订阅者（崩溃 / 跨文档导航提交 / debugger 断开）；见 addContextLostHook */
     this.contextLostHooks = new Set();
@@ -417,7 +489,16 @@ export class BrowserTab {
     this.viewFit = null;
     parkingWindow.contentView.addChildView(this.view);
     this.parentWindow = parkingWindow;
-    this.view.setBounds({ ...PARKING_BOUNDS });
+    if (this.#capturing && !this.#atParkingBounds) {
+      // 截图在飞、视图矩形还是槽位矩形：先不动（停车场里没人看，矩形晚几百毫秒无所谓），截完由 #afterCapture 摆成 PARKING_BOUNDS
+      this.#parkDeferred = true;
+    } else {
+      this.view.setBounds({ ...PARKING_BOUNDS });
+      this.#atParkingBounds = true;
+      this.#parkDeferred = false;
+    }
+    this.#showHeld = false;
+    this.#wantVisible = true;
     this.view.setVisible(true);
     try {
       this.wc.setAudioMuted(true);
@@ -441,6 +522,7 @@ export class BrowserTab {
     this.#hostLeft = true;
     this.#slot = null;
     this.viewFit = null;
+    this.#parkDeferred = false; // 视图已摘下、不在任何窗口里：没有停车场矩形要补摆
     try {
       if (parent && !(typeof parent.isDestroyed === "function" && parent.isDestroyed())) parent.contentView.removeChildView(this.view);
     } catch {
@@ -457,7 +539,7 @@ export class BrowserTab {
     this.#slot = bounds;
     this.#applySlot();
     this.#scheduleRefit();
-    this.view.setVisible(visible);
+    this.#applyVisible(visible);
     try {
       this.wc.setAudioMuted(false);
     } catch {
@@ -485,8 +567,78 @@ export class BrowserTab {
     const { bounds, fit } = fitBoundsToEmulation(this.#slot, this.emulation, this.#fitScale);
     const fitChanged = !sameViewFit(this.viewFit, fit);
     this.viewFit = fit;
-    this.view.setBounds(bounds);
+    // 截图在 Chromium 里临时改着视图尺寸、截完会把「开始时记下的尺寸」写回去：此刻改矩形，写回去的就是旧尺寸、画面与视图错位（见 #captureExclusive）。
+    // 推迟到截图结束再摆（拖面板最多晚几百毫秒）；viewFit 照常更新，渲染端的遮盖占位图不受影响
+    if (this.#capturing) this.#slotDeferred = true;
+    else {
+      this.view.setBounds(bounds);
+      this.#atParkingBounds = false;
+      this.#releaseShowHeld(); // 矩形已经是槽位矩形：被扣住的显示可以来了（收尾补摆失败后的下一次摆放成功也走这里，第十轮评审 B-1）
+    }
     if (fitChanged) this.hooks.onChange();
+  }
+
+  /** 放开被扣住的显示（`#showHeld`，见 `#applyVisible`）：按调用方最近一次想要的可见性显示。没扣住就什么都不做 */
+  #releaseShowHeld() {
+    if (!this.#showHeld) return;
+    this.#showHeld = false;
+    if (!this.destroyed) this.view.setVisible(this.#wantVisible);
+  }
+
+  /**
+   * 显示被扣住（有槽位、矩形仍是停车场尺寸）时的兜底重试（第十一轮评审 P3-2）：隔 HELD_SHOW_RETRY_MS 再 `#applySlot` 一次，成功就顺带放开被扣住的显示。
+   * 两个调用点：`#afterCapture`（截图刚结束、补摆失败）与 `#applyVisible` 的扣住分支（不在截图中；第十二轮评审 P3-5）。
+   * 定时器走注入的 `setTimeoutFn` / `clearTimeoutFn`（与对话框定时器同一套，测试可接管；第十三轮评审 P3-6：原先直接用全局 setTimeout / clearTimeout）。
+   * 只试一次、永不抛：重试自己也失败就停手，等下一次布局（拖面板 / 切标签页 / 重挂载）；期间已经放开 / 视图销毁 / 停回停车场（`#park` 清了扣住）
+   * 都不用再试。到点时若又有一条截图在飞，`#applySlot` 自己会推迟、交给那条截图的收尾补摆（不另排）。同一时刻最多排一个。
+   */
+  #scheduleHeldShowRetry() {
+    if (this.#heldShowRetry || this.destroyed) return;
+    // 真定时器不会在 setTimeout 返回之前触发；注入的假时钟（测试）可能同步触发回调——回调里先置 null、返回后再赋值句柄，
+    // 会把一个已经触发过的句柄残留下来，之后的兜底重摆都被上面的 `if (this.#heldShowRetry …) return` 挡掉（第十四轮评审 P3-4 ⑦）。
+    // 所以用 fired 标志：回调已经跑过就不再记句柄
+    let fired = false;
+    const handle = this.setTimeoutFn(() => {
+      fired = true;
+      this.#heldShowRetry = null;
+      try {
+        if (this.destroyed || !this.#showHeld) return;
+        this.#applySlot();
+      } catch (err) {
+        this.log(`[browser:${this.id}] 补摆视图矩形的兜底重试仍失败（等下一次布局）：${err?.message || err}`);
+      }
+    }, HELD_SHOW_RETRY_MS);
+    if (fired) return;
+    handle?.unref?.();
+    this.#heldShowRetry = { handle };
+  }
+
+  /**
+   * 设可见性（`moveToMain` / `setVisible` 的唯一出口）。
+   * 例外只有一种：要显示、而视图矩形还是停车场的 1280×800，且它「该是槽位矩形却还没摆成」——
+   *   · 截图在飞（`#applySlot` 被推迟了），或
+   *   · 视图有槽位、截图已经结束，但收尾补摆那次 `setBounds` 抛了（`#afterCapture`）：这时不在截图中，只看「有槽位 + 矩形仍是停车场尺寸」
+   *     （第十一轮评审 P3-2：原先条件要求截图在飞，补摆失败之后下一次 `setVisible(true)`——如遮盖放开——会直接把 1280×800 的视图显示出来）。
+   * 这时直接显示会让一块 1280×800 的视图盖在主窗口左上角（盖住事件流并拦点击），直到摆成槽位大小（截图在飞时：普通截图最长 20 秒，透明背景截图上限 45 秒、
+   * 页面整套卡死时透明截图通常 25 秒；上一条欠着「还原默认背景」要补发时，排他段开头再多最多 5 秒——即 25 / 50 / 30 秒，见 `#sendTransparent` / `#captureExclusive`）。
+   * 所以先藏着、记下想要的可见性（`#showHeld`），矩形真的摆成之后再显示（`#applySlot` 摆成功就放开，见 `#releaseShowHeld`）。
+   * 不能为此立刻去改矩形：截完 Chromium 会把「开始时记下的尺寸」写回去，立刻改的矩形会被写回成旧尺寸（见 `#captureExclusive`）。
+   * 矩形已经是槽位矩形（面板开着时切标签页 / 重挂载）不受影响：最多偏一点，不会有大视图盖界面，照常显示。
+   * 视图在停车场里（没有槽位）且没有截图在飞：矩形本来就是停车场尺寸、停车场里没人看，照常显示。
+   */
+  #applyVisible(visible) {
+    this.#wantVisible = visible;
+    if (visible && this.#atParkingBounds && (this.#capturing || this.#slot)) {
+      this.#showHeld = true;
+      this.view.setVisible(false);
+      // 不在截图中（只剩「有槽位 + 矩形仍是停车场尺寸」= 收尾补摆失败之后）：兜底重试原先只在 `#afterCapture` 里排，这一路没人来排，面板会一直空白到下一次布局
+      // （第十二轮评审 P3-5：补摆失败时遮盖正开着、`#showHeld` 为假，收尾没排重试；之后遮盖放开的 setVisible(true) 走到这里才第一次扣住）。
+      // 截图在飞时仍由 `#afterCapture` 排（它在截图结束、补摆之后才知道摆没摆成）
+      if (!this.#capturing) this.#scheduleHeldShowRetry();
+      return;
+    }
+    this.#showHeld = false;
+    this.view.setVisible(visible);
   }
 
   /**
@@ -543,7 +695,7 @@ export class BrowserTab {
   }
 
   setVisible(visible) {
-    if (!this.destroyed) this.view.setVisible(visible);
+    if (!this.destroyed) this.#applyVisible(visible);
   }
 
   /** 视图自己的截图 → jpeg dataURL（遮盖占位图用；宿主截图不含原生视图，探针 T1） */
@@ -784,8 +936,205 @@ export class BrowserTab {
 
   // ───────────────────────── CDP ─────────────────────────
 
-  /** 向主会话（或子会话）发 CDP 命令；带超时，避免页面卡死时把整个 op 链拖死 */
-  send(method, params = {}, sessionId = null, timeoutMs = CDP_TIMEOUT_MS) {
+  /**
+   * 向主会话（或子会话）发 CDP 命令；带超时，避免页面卡死时把整个 op 链拖死。
+   * `Page.captureScreenshot` 不直接发，先经 `#captureExclusive` 与设备模拟互斥（原因见那里）；其余命令原样直发。
+   * opts.signal：只对要排队的截图有意义——排队期间被放弃就不再发（见 `#captureExclusive`）；其余命令不排队，没有这个问题。
+   * opts.transparentBackground：只对截图有意义——「透明默认背景 → 截 → 还原」整套放进同一个排他段（见 `#sendTransparent`）。
+   */
+  send(method, params = {}, sessionId = null, timeoutMs = CDP_TIMEOUT_MS, opts = {}) {
+    if (this.#wcGone()) return Promise.reject(new BrowserError("TAB_NOT_FOUND", "标签页已关闭"));
+    if (method === "Page.captureScreenshot") {
+      const job = opts?.transparentBackground === true ? () => this.#sendTransparent(method, params, sessionId, timeoutMs) : () => this.#sendNow(method, params, sessionId, timeoutMs);
+      return this.#captureExclusive(job, opts?.signal);
+    }
+    return this.#sendNow(method, params, sessionId, timeoutMs);
+  }
+
+  /**
+   * omit_background 截图：「透明默认背景 → 截 → 还原」三条命令在同一个排他段里发（`#captureExclusive` 的 job）。
+   * 以前三条各自 `send`、只有中间那条排队：两条并发的透明截图会交错成「设、设、截、还原、截」（第二张在背景已被还原之后才截，不透明），
+   * 一条普通截图也可能夹在「设」与「还原」之间被截成透明底（第十轮评审 B-3）。放进同一个 job 之后，别的截图 / 模拟任务只能等这一整套结束。
+   * 还原在 finally 里（截图失败 / 超时也还原，不把页面留成透明底）；还原自己失败不抛（不能盖掉截图本身的结果）——页面崩了 / 标签页已关时没有东西可还原，其余情形见下面的日志与 `#bgDirty`。
+   * **「设」也在 try 里**（第十一轮评审 P3-5）：页面卡住时「设」可能超时、命令却在页面恢复后才生效——它若在 try 外，超时抛出后不会还原，
+   * 页面会被晚到的「设」留成透明底；放进 try，超时之后照样补发还原（同一会话里的命令按序派发，所以还原排在晚到的「设」之后——这是对 CDP 行为的推断，
+   * 没有在真页面卡死时实测；单测只钉了「设失败 / 超时也发还原」的命令序列）。
+   * 还原只是善后，超时取 TRANSPARENT_RESTORE_TIMEOUT_MS（5 秒）而不是满 20 秒——页面卡死时这条本来也发不进去，多等无益、白占队列。
+   * 还原失败 / 超时不抛（不能盖掉截图本身的结果 / 异常），但留一行日志（第十二轮评审 P3-6：原先 `.catch(() => {})` 一点痕迹都没有，事后没法知道这张截图之后页面可能留着透明底）；
+   * 标签页已关（TAB_NOT_FOUND）时没有东西可还原，不记也不欠。还原没成功（CDP 报错 / 超时）就在 `#bgDirty` 里记一笔「欠着」，下一条截图的排他段开头补发一次 `{}`
+   * （`#restoreDirtyBackground`，第十三轮评审 P3-7：页面活着、还原快速返回 CDP 错误时页面会留着透明底，之后的普通截图可能是黑底。第十二轮曾因「按序派发推断下超时的还原会在页面恢复后生效、
+   * 快速失败时覆盖随页面一起没了」而不做；评审指出快速失败的另一类——页面活着——没覆盖，且「严格有序」本身没实测，所以补上，补发是幂等的）。
+   * 代价：一条透明截图占队列的上限是 45 秒（「设」20 + 截 20 + 还原 5，要「设」差一点超时才应答、截图又卡住才会满）；页面整套卡死时通常 25 秒
+   * （「设」超时 20 秒 → 不截图 → 还原再等 5 秒）；普通截图仍是 1 条、最长 20 秒。上一条欠着还原时，排他段开头还要先补发（最多再 5 秒）：
+   * 透明截图最坏 5 + 45 = 50 秒（整套卡死时 5 + 25 = 30 秒）、普通截图最坏 5 + 20 = 25 秒（见 `#captureExclusive`；第十四轮评审 P3-4 ③：此前只写了 45 秒，没把欠账补发算进去；
+   * 第十五轮评审 P3-4：「整套卡死」一句原先只给了不欠账的 25 秒，与别处的 30 秒对不上，这里并列写全）。
+   * 这些数字都只是排他段里的上限：对外层 60 秒请求超时只剩 10 秒余量（单条、队列里没有别的任务时的口径，排着前序任务要按前序扣减），排他段之外的步骤也不在其中——见 `#captureExclusive` 的「对外层超时的余量」（第十六轮评审 P3-B5；第十七轮评审 B-5 补了排队扣减与 annotate / scale 两步）。
+   *
+   * 欠账只在**下一条截图**的排他段开头偿还：还原快速失败（页面活着、CDP 报错）时不立刻重试——队列里这时可能正排着别的截图 / 模拟任务，
+   * 立刻重试要么插队、要么再排一次，收益只是少一条「下一张截图前页面还是透明底」的窗口（设计取舍，第十四轮评审 P3-4 ②；没有截图再来的话，页面就一直留着透明默认背景，
+   * 直到下一次截图（补发）或 debugger 重新 attach（会话重建、覆盖随之归零）——第十八轮实测：渲染进程崩溃 + 重载**不会**清掉它（debugger 没掉线、会话还在），
+   * 原先写的「直到页面自己重载」不成立）。
+   */
+  async #sendTransparent(method, params, sessionId, timeoutMs) {
+    try {
+      await this.#sendNow("Emulation.setDefaultBackgroundColorOverride", { color: { r: 0, g: 0, b: 0, a: 0 } }, sessionId, timeoutMs);
+      return await this.#sendNow(method, params, sessionId, timeoutMs);
+    } finally {
+      await this.#sendNow("Emulation.setDefaultBackgroundColorOverride", {}, sessionId, Math.min(timeoutMs, TRANSPARENT_RESTORE_TIMEOUT_MS)).then(
+        () => {
+          this.#bgDirty.delete(sessionId ?? null);
+        },
+        (err) => {
+          if (err?.code === "TAB_NOT_FOUND") return;
+          this.#bgDirty.add(sessionId ?? null);
+          this.log(`[browser:${this.id}] 透明截图后还原默认背景失败 / 超时（页面卡死或已崩溃时没有东西可还原；其余情形页面可能暂时留着透明底，下一条截图前会补发一次还原）：${err?.message || err}`);
+        },
+      );
+    }
+  }
+
+  /**
+   * 补发上一条透明截图欠下的「还原默认背景」（`#bgDirty` 里每个会话各发一条 `{}`，各最多等 TRANSPARENT_RESTORE_TIMEOUT_MS）。
+   * 在 `#captureExclusive` 的排他段开头调（`#capturing` 已为真）：这样补发和接着要发的截图之间不会被别的截图 / 视口覆盖插进来。
+   * 成功就不再欠；标签页已关（TAB_NOT_FOUND）没有对象，整个清掉；仍失败：主会话继续欠着（下一条截图再试），子会话（iframe 随时会消失）只补这一次、补不上就丢——
+   * 否则它会每条截图白发一次、白记一行；两种都留一行日志。（目前只有 `screenshot()` 会带 transparentBackground，它固定走主会话，所以子会话这一支是泛化写法。）
+   * 永不抛、不挡后面的截图（它自己的命令各有超时）；没有欠账时什么都不做（正常路径零成本）。
+   * 代价：页面一直卡死时，每条截图的排他段多等一次 5 秒的补发（页面卡死时截图本来就要等满 20 秒超时）。
+   * 「5 秒」的前提是 `#bgDirty` 里至多一个会话（目前只有 `screenshot()` 带透明背景、固定走主会话）：补发按会话各等最多 5 秒，若将来有别的调用方对子会话也用
+   * 透明背景，欠账的会话越多这一段越长（第十五轮评审 P3-4）。
+   */
+  async #restoreDirtyBackground() {
+    if (this.#bgDirty.size === 0) return;
+    for (const sessionId of [...this.#bgDirty]) {
+      try {
+        await this.#sendNow("Emulation.setDefaultBackgroundColorOverride", {}, sessionId, TRANSPARENT_RESTORE_TIMEOUT_MS);
+        this.#bgDirty.delete(sessionId);
+      } catch (err) {
+        if (err?.code === "TAB_NOT_FOUND") {
+          this.#bgDirty.clear();
+          return;
+        }
+        if (sessionId !== null) this.#bgDirty.delete(sessionId);
+        this.log(`[browser:${this.id}] 补发上一条透明截图欠下的「还原默认背景」仍失败（${sessionId === null ? "继续欠着，下一条截图再试" : "子会话不再重试"}）：${err?.message || err}`);
+      }
+    }
+  }
+
+  /**
+   * 截图（`Page.captureScreenshot`）与「设备模拟 / 视图尺寸变化」互斥：排进与 emulate / 缩放重算同一条串行队列，
+   * 队列里这段时间 `#capturing` 为真，`#applySlot` 不动原生视图、截完再补摆。
+   *
+   * 为什么：设备模拟生效时，Chromium 处理一条截图会**临时**把页面改成模拟尺寸、截完再还原——它在开始时记下「当时的模拟参数 + 视图尺寸」，
+   * 截完原样写回去。写回去之前若插进来另一件会改这两样东西的事，写回去的就是过期的值：
+   *   - 另一条截图（AI 并行发的 browser_screenshot / browser_save 等感知类 op 不走 runAction，彼此不互斥）：它记下的「原始值」是第一条临时改过的值，
+   *     两条都结束后页面被留在模拟尺寸（1440×900、没有缩放）而原生视图仍是缩放后的小矩形；
+   *   - 一条新的视口覆盖（拖面板触发的缩放重算 / emulate）：被截图结束时写回的旧参数盖掉；
+   *   - 原生视图矩形变化（拖面板）：截图结束时把视图写回成旧尺寸。
+   * 结果都一样：页面画面比原生视图大、越出面板盖住别的区域，而主进程的账（fitScale / 视图矩形）是新的、面板上还写着「适应 79%」，
+   * 之后同比例的重算又被「比例没变」跳过，错位一直留着。真 Electron 复现与回归：`scripts/browser-e2e/capture-emulation-race.cjs`。
+   *
+   * 队列里只放截图那一段 CDP 命令（不含 `screenshot()` 里取布局、解码图片的部分）：普通截图 = 1 条；omit_background 截图 = 设背景 / 截 / 还原 3 条
+   * （见 `#sendTransparent`，必须在同一段里）；命令自带超时（CDP_TIMEOUT_MS = 20 秒，还原那条 5 秒）：
+   * 页面卡死（JS 对话框 / 断点暂停……）时队列被堵的时长：普通截图**最长 20 秒**；透明背景截图**上限 45 秒**（整套卡死通常 25 秒，见 `#sendTransparent`）；排着多条就按条累加；
+   * 上一条透明截图欠着「还原默认背景」（`#bgDirty`）时，排他段开头再多一次最多 5 秒的补发（`#restoreDirtyBackground`，第十三轮评审 P3-7；
+   * 「5 秒」的前提是只欠主会话一个，见该函数的注释）——所以**欠着账时**每条的上限是：普通截图 5 + 20 = 25 秒、透明截图 5 + 45 = 50 秒、
+   * 透明截图碰上整套卡死 5 + 25 = 30 秒（第十四轮评审 P3-4 ③、第十五轮评审 P3-4）。都不是永久堵死——
+   * 这段时间里 emulate / reset / 缩放重算 / 视图跟随拖面板都得等；超时只是放掉互斥，Chromium 之后晚到的写回挡不住（已知边界，见契约文档）。
+   * 没有设备模拟时同样走队列：多一次微任务，截图本身不变。
+   *
+   * **对外层超时的余量**（第十六轮评审 P3-B5）：上面这些数字只是**排他段里**的上限。bridge 对 `browser_screenshot` 用默认的 60 秒请求超时
+   * （`BROWSER_DEFAULT_REQUEST_TIMEOUT_MS`，`src/lib/server/browser/bridge.ts`；这个工具没有自己的 `timeoutMs`），欠着账的透明截图 5 + 45 = 50 秒，只剩 10 秒余量（这是**单条、队列里没有别的任务**时的口径，排着前序任务时要扣减，见下；第十七轮评审 B-5）；
+   * 而 `screenshot()` 在排他段**之外**还有几步，每条 CDP 命令各自最多 20 秒（`CDP_TIMEOUT_MS`），按路径逐条数（第十七轮评审 B-5 补了 annotate 与 scale 两步；第十八轮评审 R-4 再补全：
+   * 漏了每条截图收尾的 `layoutMetrics()` 与 webp 缩小分支，annotate 也不是笼统的「各占 20 秒」。下面的常量与分支都是对着 `screenshot()` / `collectAnnotationItems()` 逐条读代码核对的）：
+   *   · **所有路径**：开头的 `ensureCdp()`（自愈时不止一条命令）；以及**每条截图收尾**的 `layoutMetrics().catch(() => null)`（取视口 CSS 尺寸回报给 `browser_mouse`；`.catch` 只吞错误，页面不应答时仍要等满 20 秒才走到 catch）。
+   *   · **annotate**（只对视口截图）：`collectAnnotationItems()` 里先一条 `layoutMetrics()`（20 秒），再按 `BATCH = 32` 个一批取 `DOM.getContentQuads`、最多取 600 个 ref，即 ⌈600 / 32⌉ = **19 批、每批最长 20 秒**
+   *     （批内并行；单个失败只被静默跳过、不会提前结束，页面卡死时每批都要等满）。OOPIF 里的元素每批还要先算 `frameOffset`（沿 iframe 链每层一条 `DOM.getContentQuads`，每层最多 20 秒；同一个 frame 的结果按 sessionId + frameKey 缓存，只在第一次遇到它的那一批里付）。
+   *     所以 annotate 收集段的上限不是固定一档：主 frame 元素 20 + 19 × 20 = 400 秒，OOPIF 另加。annotate 可以与 scale 同用（`screenshot-kit` 只禁它与 full_page / ref / clip / webp 同用），那样还要再加下面 scale 的两条。
+   *   · **ref**：`DOM.scrollIntoViewIfNeeded` → `frameOffset`（每层 iframe 一条）→ `DOM.getContentQuads` → 取滚动偏移的 `layoutMetrics().catch`，依次串行，各最多 20 秒。
+   *   · **fullPage / clip**：各一条 `layoutMetrics()`。**只给 scale**（没有 ref / fullPage / clip）：一条 `layoutMetrics()` + 一条读 innerWidth / innerHeight 的 `Runtime.evaluate`（`.catch(() => null)` 同样只吞错误、仍要等满 20 秒）。
+   *   · **webp 且原图宽度超过 `maxWidth`** 的缩小分支：没有 clip 时再取一条 `layoutMetrics()`，然后**再发第二条 `Page.captureScreenshot`**（按比例缩小 scale 重截）。第二条是**第二个排他段**：重新排队、开头若还欠着账再补发一次（最多 5 秒），
+   *     所以这样的截图占排他队列两次（各最长 20 秒）。png / jpeg 路径只发一条 `Page.captureScreenshot`（第十八轮 R-3 核实：capture-emulation-race.cjs 的 saveFull 是 png，只发一条）。
+   * 页面「半卡」（部分命令能应答、部分要等满超时）时这些加起来可以越过 60 秒，外层先超时。
+   * **排队时按前序扣减**（第十七轮评审 B-5：此前只算了排他段自己的上限）：外层 60 秒从 op 开始就计，包含在 `#enqueueEmulation` 里排队等前序任务的时间——页面卡死、AI 并行发多条截图时，
+   * 第 k 条要先等前 k−1 条各自的上限（普通截图每条最长 20 秒、欠着账时 25 秒）才轮到发：第 3 条普通截图 = 2 × 20 + 自己的 20 = 60 秒，正好落在外层超时线上，更靠后的会先被外层超时。
+   * 所以上面「只剩 10 秒余量」只在队列为空时成立；队列非空时，余量 = 60 秒 − 前序任务的上限之和 − 排他段之外那几步。外层超时（server 发 `cancel`）只让这次 op 放弃：`signal` 只拦「还没轮到发」的命令，
+   * 已在飞的 CDP 命令仍按各自的超时走完、占着队列（见下面 `signal` 一段）。**没改**：这是余量说明，不是新增的堵死路径（每一步都有超时）；要压只能调 bridge 超时或这几个 CDP 超时，
+   * 属设计取舍，也没有在真页面半卡时实测。
+   * 「debugger 重新 attach 之后清掉 `#bgDirty`」**已做**（第十八轮 B5；此前因为没实测、风险不对称而没做）。真 Electron 42 / Chromium 148（macOS）实测（`scripts/browser-e2e/bg-override-reattach.cjs`）：
+   *   ① detach → 重新 attach 之后，默认背景色覆盖（不透明红 / 透明都试了）**不在了**，页面回到不透明默认底——欠着的「还原」已经没有东西可还原，作废；
+   *   ② 渲染进程崩溃再重载、debugger **没掉线**（`render-process-gone` 只置 `cdpReady = false`，`isAttached()` 仍为真）时覆盖**还在**——这一类欠账必须留着，
+   *      所以清账只发生在「`isAttached()` 为假、真的新 `attach`」那一支（`#attachDebugger`），不是每次自愈都清。
+   *   这是 Chromium 内部行为、可能随 Electron 升级变化：e2e 两边都有断言，升级后跑一遍即可发现；假 CDP 的单测只钉了「新 attach 才清、没掉线不清」的分支。
+   *   顺带的实测观察（不是断言）：设备模拟的**视口覆盖**（`setDeviceMetricsOverride`）在同一次 detach → attach 之后**还在**——`#attachDebugger` 里的 `#replayEmulation` 因此是冗余的幂等重发，
+   *   留着无害（按状态重发同一份覆盖），不要因为这条观察去删它（崩溃重载 / 页面重建等别的路径是否也保留没有逐一测过）。
+   *
+   * signal（可选）：排队等待期间调用方已放弃（op 超时 / 用户点停止）→ 出队时不再发 CDP、直接以 signal.reason 失败，不白占队列。
+   * `abortable` 只能让外层 promise 立刻失败，底层命令得自己超时；排队的命令轮到时才发，不查一下就会在调用方走了之后还占着队列。
+   */
+  #captureExclusive(job, signal) {
+    return this.#enqueueEmulation(async () => {
+      const abandoned = () => signal?.reason ?? new BrowserError("CANCELLED", "截图已被放弃（排队期间 op 已超时或被停止）");
+      if (signal?.aborted) throw abandoned();
+      this.#capturing = true;
+      try {
+        // 上一条透明截图的「还原默认背景」没成功过：先补发一次，再截（第十三轮评审 P3-7；放在 signal 检查之后——被放弃的截图什么都不发）
+        await this.#restoreDirtyBackground();
+        // 补发最多占 5 秒（页面卡死时会等满）：这期间调用方（op 超时 / 用户点停止）可能已经放弃——再查一次，放弃了就不发这条截图
+        // （第十四轮评审 P3-4 ①：原先补发之后直接 job()，白占一段队列）。补发本身已经做完：成功的欠账已清，没成功的（主会话）仍记在 `#bgDirty`、
+        // 留给下一条没被放弃的截图（第十五轮评审 P3-4：此前写「欠账不动」，对补发成功的那种不准）
+        if (signal?.aborted) throw abandoned();
+        return await job();
+      } finally {
+        this.#capturing = false;
+        this.#afterCapture();
+      }
+    });
+  }
+
+  /**
+   * 截图结束（成功 / 失败 / 超时都走这里，在 `#captureExclusive` 的 finally 里调）：补摆被推迟的视图矩形，再显示被扣住的视图（`#applyVisible`）。
+   * 绝不抛出：finally 里抛错会盖掉截图本身的结果 / 异常（`view.setBounds` 在视图刚被销毁时会抛）。三步各自 try——前一步失败不能让后一步不来。
+   * 「显示被扣住」的放开看矩形有没有真的摆成：补摆成功（`#applySlot` 顺带放开）或视图在停车场里（矩形本来就是停车场尺寸）才显示；
+   * 补摆抛错、矩形还是停车场尺寸时继续藏着，兜底重摆一次（`#scheduleHeldShowRetry`），仍不行就等下一次摆放成功再放开——
+   * 不能为「别让视图一直藏着」把 1280×800 的视图显示出来盖住主窗口（第十轮评审 B-1；重试与 `#applyVisible` 的旁路封堵是第十一轮评审 P3-2）。
+   */
+  #afterCapture() {
+    try {
+      if (this.#slotDeferred) {
+        this.#slotDeferred = false;
+        this.#applySlot(); // 截图期间被推迟的摆放：按最新槽位补摆一次
+      }
+    } catch (err) {
+      this.log(`[browser:${this.id}] 截图结束后补摆视图矩形出错（已忽略）：${err?.message || err}`);
+    }
+    try {
+      // 截图在飞时被停进停车场、矩形还没摆：此刻补成 PARKING_BOUNDS。这期间又被搬回主窗口（#slot 非空）就不用了，上面的 #applySlot 已按槽位摆过
+      if (this.#parkDeferred) {
+        this.#parkDeferred = false;
+        if (!this.#slot && !this.destroyed && this.parentWindow) {
+          this.view.setBounds({ ...PARKING_BOUNDS });
+          this.#atParkingBounds = true;
+        }
+      }
+    } catch (err) {
+      this.log(`[browser:${this.id}] 截图结束后摆停车场矩形出错（已忽略）：${err?.message || err}`);
+    }
+    try {
+      // 被扣住的显示：上面补摆成功时 #applySlot 已经放开了。走到这里还扣着，只有两种可能——
+      //   · 视图没有槽位（在停车场里，矩形本来就该是 PARKING_BOUNDS）→ 照常放开；
+      //   · 有槽位、矩形却还是停车场尺寸（上面的 setBounds 抛了，#applySlot 没走到「矩形已换」那一步）→ 不放：此刻显示 = 一块 1280×800 的视图盖在主窗口上，
+      //     正是 B1 要避免的；继续藏着，并兜底重摆一次（#scheduleHeldShowRetry，第十一轮评审 P3-2：原先没有重试，面板会一直空白到下一次拖动 / 切换），
+      //     重摆也失败就等下一次摆放成功（拖面板 / 切标签页 / 重挂载，都经 #applySlot）再显示（第十轮评审 B-1）。
+      if (this.#showHeld) {
+        if (this.#slot && this.#atParkingBounds) this.#scheduleHeldShowRetry();
+        else this.#releaseShowHeld();
+      }
+    } catch (err) {
+      this.log(`[browser:${this.id}] 截图结束后显示视图出错（已忽略）：${err?.message || err}`);
+    }
+  }
+
+  #sendNow(method, params, sessionId, timeoutMs) {
     if (this.#wcGone()) return Promise.reject(new BrowserError("TAB_NOT_FOUND", "标签页已关闭"));
     // 缩放适配生效时，AI 给的是页面 CSS 坐标、CDP 输入要的是视图坐标：在这唯一的出口统一乘 scale（契约 §14.4；全仓只有这里碰 debugger.sendCommand）
     const wire = this.#inputScale < 1 ? scaleInputParams(method, params, this.#inputScale) : params;
@@ -809,6 +1158,38 @@ export class BrowserTab {
   addSessionHook(fn) {
     this.sessionHooks.add(fn);
     return () => this.sessionHooks.delete(fn);
+  }
+
+  /**
+   * 第二十三轮 R23-3：注册「早钩子」`fn(sessionId | null)`——会话初始化一开始就与各域的 enable **并行**发出（`#setupSession` 里先于 `Target.setAutoAttach` / 页内脚本安装 / 普通会话钩子），
+   * 只给「不依赖任何 enable、越早越好」的命令用（页内权限桩的 `Page.addScriptToEvaluateOnNewDocument` + 当前文档补一遍 `Runtime.evaluate`）。
+   * 为什么：跨站 iframe（OOPIF）的会话是在子页面已经开始运行之后才挂上的，普通钩子排在 setup 末尾（域 enable → setAutoAttach → 页内脚本安装之后），页面第一批脚本可能先于桩运行；
+   * 早钩子把它提前到与域 enable 并行的第一批命令里。省下的 CDP 来回数是读代码估的、没有实测；实测的是效果：作者机器（macOS / Electron 42.4.0）上改前桩比 iframe 的第一个脚本晚 4.5~27.5 毫秒，
+   * 改后连续 3 轮每轮 8 次共 24/24 次已就位——是缩小窗口、不是消除（样本量与口径见 docs/BROWSER-AUTOMATION.md §19.3）。语义与 {@link addSessionHook} 相同（主会话重连 / 每个子会话都会调；出错只记日志、不影响初始化），
+   * 区别有两点：一是时机；二是**迟到登记的钩子会补调**——对已经跑过早钩子这一批、且仍存在的会话各补调一次（第二十四轮 R24-1）。
+   * 为什么要补：收养的 `window.open` 弹窗不用先 `loadURL`，构造函数里就同步跑完了主会话初始化的第一步（早钩子那一批），而调用方（`createTab`）登记钩子在 `new BrowserTab()` 返回之后——
+   * 此前弹窗的主会话从来没有跑过权限闸的桩钩子（真 Electron 复现：弹窗里 `permissions.query` 读到 denied、桩标记不存在、没有任何记录）。
+   * 普通 tab 登记时还没有任何会话跑过早钩子（先 `loadURL("about:blank")` 再 attach），不会补调、也不会重复调。补调不等结果（出错只记日志）；早钩子**不能**假设域已启用。返回取消函数。
+   * 同一个函数登记第二次（第二十五轮 N-4）：集合本来就去重，补调也不能再来一遍——它已经登记过，对存活的会话要么在这一批的拷贝里、要么已经补调过；直接返回取消函数。
+   * 两点限制（第二十六轮 T-3 / T-4）：① 重复登记返回的取消函数与第一次的删的是**同一条**集合条目——任一份取消，都会把它摘掉（另一份随之失效；`tests/browser-tab-eval-in-frames.test.ts` 把这当预期行为）；
+   * ② 「不漏、不重」只在同一个函数**没有被取消再重新登记**时成立：它在这一批进行中先取消、再重新登记，会被调两次（补调一次；这一批的循环里一次——它又回到集合里了）。
+   * 目前唯一的登记方（权限闸的 `bindTab`，每个 tab 登记一次、丢弃返回的取消函数）不会这样做，桩的重复安装也基本无害（页内脚本自带幂等保护、只包一层；最坏多留一条同样的新文档脚本），
+   * 所以没有加「按批记已调用」的代数去重；以后若出现取消再登记的调用方，在 `#runEarlyHooks` / 这里按批记录已调的钩子即可。
+   */
+  addEarlySessionHook(fn) {
+    const cancel = () => this.earlySessionHooks.delete(fn);
+    if (this.earlySessionHooks.has(fn)) return cancel;
+    this.earlySessionHooks.add(fn);
+    // tab 已销毁时不必另判：`#callEarlyHook` 开头就放弃（第二十六轮 X-1：此前这里套着一层 `if (!this.destroyed)`，被那处守卫完全遮住——删掉它没有任何行为变化）
+    for (const sessionId of [...this.earlySessionsRan]) {
+      // 子会话已经没了（detach / 自愈清表）：记录一并作废，不对它补调
+      if (sessionId !== null && !this.children.has(sessionId)) {
+        this.earlySessionsRan.delete(sessionId);
+        continue;
+      }
+      void this.#callEarlyHook(fn, sessionId);
+    }
+    return cancel;
   }
 
   /** 当前所有 CDP 会话 id：`null`（主会话）+ 全部 OOPIF 子会话 */
@@ -870,9 +1251,20 @@ export class BrowserTab {
     await this.#attachDebugger();
   }
 
-  async #attachDebugger() {
+  /**
+   * @param {{ queueReplay?: boolean }} [opts] queueReplay：自愈（`ensureCdp` 发现 `cdpReady` 为假或 debugger 掉了）时，模拟重放排进模拟队列、等在飞的截图结束再发。
+   *   首次初始化 / 初始化恢复不排队：那时没有任何模拟状态，重放是空操作（`#recoverInit` 的结果还会被并发调用共用，里面排队可能让队列里的任务等自己）。
+   */
+  async #attachDebugger({ queueReplay = false } = {}) {
     const dbg = this.wc.debugger;
-    if (!dbg.isAttached()) dbg.attach("1.3");
+    if (!dbg.isAttached()) {
+      dbg.attach("1.3");
+      // 全新的调试会话 ⇒ 上一条会话里欠着「还原」的默认背景色覆盖已经不在了，欠账作废（第十八轮 B5，真 Electron 42 / Chromium 148 实测：detach → attach 之后
+      // `Emulation.setDefaultBackgroundColorOverride` 的覆盖归零、页面回到不透明默认底）。**只在真的新 attach 时清**：渲染进程崩溃重载而 debugger 没掉线的那一类
+      // （`render-process-gone` 只置 `cdpReady = false`，`isAttached()` 仍为真）会话还在、覆盖也还在（同一实测），欠账必须留着，下一条截图开头才能还原。
+      // 同步清、紧跟在 attach 之后（中间没有 await）：别的调用在这两步之间插不进来；清完之后才发生的「设 / 还原失败」会照常重新记欠。
+      this.#bgDirty.clear();
+    }
     if (!this.dbgBound) {
       this.dbgBound = true;
       // 主会话的 sessionId：真 Electron 给的是空串 ""（不是 undefined / null），用 ?? 归一不掉；
@@ -882,25 +1274,45 @@ export class BrowserTab {
       dbg.on("message", (_e, method, params, sessionId) => this.#onCdpMessage(method, params, sessionId || null));
       dbg.on("detach", (_e, reason) => {
         this.cdpReady = false;
-        // debugger 断开 = 页面里的视口覆盖（含缩放）都没了；重新 attach 后由 #replayEmulation 按状态重放
+        // debugger 断开：本地的缩放账归 1；重新 attach 后由 #replayEmulation 按状态重放视口覆盖（第十八轮实测：Chromium 其实会保留 detach 前的视口覆盖，
+        // 重放只是幂等地再发一遍，见 `#captureExclusive` 的 JSDoc；默认背景色覆盖则会随 detach 丢，由 `#attachDebugger` 清 `#bgDirty`）
         this.#inputScale = 1;
         this.#fitScale = 1;
+        // detach 事件的 reason：Electron 文档只说它是「断开原因」的字符串，有哪些取值、是否因场景而异都没有逐一核实（第二十轮评审 R20-18：此前写成了事实）；本实现只把它写进日志、不据此分支，
+        // 清 `#bgDirty` 也不挂在这个处理器上，而是在 `#attachDebugger` 里按「`isAttached()` 为假、真的新 attach」判（第十八轮 B5）
         this.log(`[browser:${this.id}] debugger 断开 reason=${reason}`);
         this.#fireContextLost("detach");
       });
     }
     await this.#setupSession(null);
     this.cdpReady = true;
-    // debugger 重新 attach 后之前的覆盖都没了：按 tab 上存的状态重放（只对主会话，OOPIF 子会话不处理）
-    await this.#replayEmulation();
-    this.#applySlot(); // 重放里的缩放比例可能变了：视图跟着收成对应大小
-    await this.#syncMainFrameId();
+    // 主 frame 同步与输入锁不依赖模拟状态，排在模拟重放**之前**（第十一轮评审 P3-4）：自愈重放要排进模拟队列、等在飞的截图结束（普通截图最长 20 秒，透明背景截图上限 45 秒；上一条欠着还原时各再多最多 5 秒的补发），
+    // `cdpReady` 此刻已经为真、别的调用不会再等这次 attach——锁若排在重放后面，AI 驱动期间（desiredIgnore）用户的鼠标键盘会在这段等待里漏进页面。
     // 控制权在 CDP 就绪前就可能已经切到 ai（新 tab 诞生于 AI 驱动期间）：这里补上锁
+    await this.#syncMainFrameId();
     if (this.desiredIgnore) await this.#applyIgnore(true);
+    // debugger 重新 attach 之后：默认背景色覆盖会丢（`#bgDirty` 已在 `#attachDebugger` 开头清掉），**视口覆盖实测仍在**（第十八轮 B5 实测，见 `#captureExclusive` 的 JSDoc；
+    // 第二十轮评审 R20-18 订正此前「之前的覆盖都没了」的说法）——所以这里按 tab 上存的状态重放是幂等地再发一遍、不是在补丢掉的东西（只对主会话，OOPIF 子会话不处理）
+    await this.#replayEmulation(queueReplay);
+    this.#applySlot(); // 重放里的缩放比例可能变了：视图跟着收成对应大小
   }
 
-  /** 每次 op 前确认 CDP 可用：渲染进程崩溃重载后 debugger 会掉，这里自愈 */
-  async ensureCdp() {
+  /**
+   * 每次 op 前确认 CDP 可用，不可用就自愈（重新初始化会话）。
+   * 渲染进程崩溃 + 重载**不一定**让 debugger 掉线（第十八轮实测，macOS Electron 42 / Chromium 148）：`render-process-gone` 只置 `cdpReady = false`、`isAttached()` 仍为真，
+   * 此时自愈走的是「重新初始化」、**不是**新 `attach`（会话与默认背景色覆盖都还在——所以 `#bgDirty` 不能在这里清）；只有 debugger 真的掉线（`isAttached()` 为假）才会走到新 `attach`。
+   * 这是 Chromium 内部行为、没有在别的平台 / 版本验证过；`#attachDebugger` 与 `#captureExclusive` 的注释记着依据与边界。
+   */
+  ensureCdp() {
+    return this.#ensureCdp(false);
+  }
+
+  /**
+   * @param {boolean} inQueue 调用方此刻正占着模拟队列（`#applyEmulationNow` 在队列里跑）：自愈里的模拟重放直接发、不再排队——
+   *   排进自己所在的队列 = 等自己，死锁。队列外的调用方（每个 op 前的 `ensureCdp()`）自愈时，重放要排队：它发的是视口覆盖，
+   *   与在飞的截图交叉会被截图结束时写回的旧参数盖掉（第十轮评审 B-2；原先自愈路径绕过了截图 / 模拟互斥）。
+   */
+  async #ensureCdp(inQueue) {
     if (this.#wcGone()) throw new BrowserError("TAB_NOT_FOUND", "标签页已关闭");
     try {
       await this.ready;
@@ -911,9 +1323,43 @@ export class BrowserTab {
     }
     if (this.#wcGone()) throw new BrowserError("TAB_NOT_FOUND", "标签页已关闭");
     if (!this.cdpReady || !this.wc.debugger.isAttached()) {
-      this.children.clear();
-      this.isoContexts.clear();
-      await this.#attachDebugger();
+      if (inQueue) {
+        // 队列内（模拟应用里的自愈）：自己做一次、重放不排队；不等队列外的那一次（它的重放要排进此刻被我们占着的队列）
+        this.children.clear();
+        this.isoContexts.clear();
+        await this.#attachDebugger({ queueReplay: false });
+        return;
+      }
+      // 队列外（每个 op 前的 ensureCdp / 权限闸的 kickCdpHeal）：同一时刻只做一次，后到的等同一次（P3-2）。成败共用：失败时等的人拿到同一个错误（不进下一轮）。
+      // 醒来后重判（第二十五轮 N-2）：单飞结束时页面可能又崩了，仍没就绪就再来一轮，最多 CDP_HEAL_MAX_ROUNDS 轮（见该常量）；
+      // 释放登记（下面的 release）先于所有等待者的续行（它是在第一个等待者之前挂上的），所以续行里 `#healFlight` 已经是 null、第二轮由第一个醒来的调用方发起，其余的并进它。
+      // 第二十六轮 T-5：醒来后 tab 已关就和函数开头一样抛 TAB_NOT_FOUND（此前这里是静默 return，与开头不一致）；轮数用完后放行前再判一次（见循环之后）。
+      for (let round = 0; round < CDP_HEAL_MAX_ROUNDS; round++) {
+        if (round > 0) {
+          if (this.#wcGone()) throw new BrowserError("TAB_NOT_FOUND", "标签页已关闭");
+          if (this.cdpReady && this.wc.debugger.isAttached()) return;
+        }
+        if (this.#healFlight === null) {
+          const flight = { promise: null };
+          flight.promise = (async () => {
+            this.children.clear();
+            this.isoContexts.clear();
+            await this.#attachDebugger({ queueReplay: true });
+          })();
+          this.#healFlight = flight;
+          const release = () => {
+            if (this.#healFlight === flight) this.#healFlight = null;
+          };
+          flight.promise.then(release, release);
+        }
+        await this.#healFlight.promise;
+      }
+      // 轮数用完（页面可能在反复崩溃）：放行前最后判一次。tab 已关 → TAB_NOT_FOUND；仍没就绪 → 写一行日志再放行（不抛：由调用方的命令自己报错、有机会赶上恢复）——
+      // 没有这行日志，用户 / AI 只会看到后续命令等满超时（20 秒）才失败，Flowship 自己的日志里也看不出是自愈追不上（第二十六轮 T-5）
+      if (this.#wcGone()) throw new BrowserError("TAB_NOT_FOUND", "标签页已关闭");
+      if (!this.cdpReady || !this.wc.debugger.isAttached()) {
+        this.log(`[browser:${this.id}] CDP 自愈已重试 ${CDP_HEAL_MAX_ROUNDS} 轮、调试连接仍未就绪（页面可能在反复崩溃），不再追，交给后续命令自己报错`);
+      }
     }
   }
 
@@ -950,9 +1396,42 @@ export class BrowserTab {
     }
   }
 
-  /** 一个会话（主 / OOPIF 子会话）的统一初始化：域启用 → 自动挂接 → 绑定 → 页内脚本 */
+  /**
+   * 跑一个早钩子（出错只记日志）；永远不 reject。tab 已销毁就不跑（第二十五轮 N-3）：销毁时钩子集合被清空，但初始化里手上还有一份拷贝、补调也可能刚好排在销毁之后——
+   * 此时 CDP 命令必然失败，只会多写一行误导的「桩装不上」日志（OAuth 之类立刻关闭的弹窗上会出现）。
+   * 这是早钩子路径上唯一的「已销毁就不跑」判断：初始化循环与迟到登记的补调都经过它（第二十六轮 X-1）；
+   * 已经发出命令、在飞的那一个挡不住——它失败后是否记日志由钩子自己判断（权限闸的桩钩子在 catch 里判 `tab.destroyed`，第二十六轮 T-6）。
+   */
+  async #callEarlyHook(hook, sessionId) {
+    if (this.destroyed) return;
+    try {
+      await hook(sessionId);
+    } catch (err) {
+      this.log(`[browser:${this.id}] 会话早钩子出错（已忽略）：${err?.message || err}`);
+    }
+  }
+
+  /**
+   * 跑完所有早钩子（顺序执行，每个出错只记日志）；永远不 reject——它与域启用放在同一个 Promise.all 里，不能让钩子的错误拖垮会话初始化。
+   * 「这个会话已经跑过早钩子这一批」的登记与钩子清单的拷贝在**同一段同步代码**里完成（第一个 await 之前）：之后登记的钩子不在这份拷贝里，
+   * 由 {@link addEarlySessionHook} 补调；这之前登记的在拷贝里，不会被补调——不漏、不重。
+   * 前提（第二十六轮 T-3）：同一个函数没有在这一批进行中「先取消、再重新登记」——那样它会被调两次（补调一次 + 这里的循环一次），限制与取舍写在 {@link addEarlySessionHook}。
+   */
+  async #runEarlyHooks(sessionId) {
+    for (const k of [...this.earlySessionsRan]) if (k !== null && !this.children.has(k)) this.earlySessionsRan.delete(k);
+    this.earlySessionsRan.add(sessionId);
+    for (const hook of [...this.earlySessionHooks]) {
+      // 拷贝之后、轮到它之前被取消 / 销毁清空的钩子不再调（第二十五轮 N-3）
+      if (!this.earlySessionHooks.has(hook)) continue;
+      await this.#callEarlyHook(hook, sessionId);
+    }
+  }
+
+  /** 一个会话（主 / OOPIF 子会话）的统一初始化：（早钩子 ∥ 域启用）→ 自动挂接 → 绑定 → 页内脚本 → 普通会话钩子 */
   async #setupSession(sessionId) {
     const s = (method, params) => this.send(method, params ?? {}, sessionId);
+    // 早钩子（R23-3）与各域的 enable 同一时刻发出：不等 enable 的来回，页内权限桩因此比页面第一批脚本更有机会先到位
+    const early = this.#runEarlyHooks(sessionId);
     await Promise.all([
       s("Page.enable"),
       s("Runtime.enable"),
@@ -960,6 +1439,7 @@ export class BrowserTab {
       s("Network.enable", { maxTotalBufferSize: 2_000_000, maxResourceBufferSize: 500_000 }),
       s("Log.enable"),
       s("Emulation.setFocusEmulationEnabled", { enabled: true }),
+      early,
     ]);
     await s("Target.setAutoAttach", AUTO_ATTACH_PARAMS);
     await this.#installPageScripts(sessionId);
@@ -1742,7 +2222,7 @@ export class BrowserTab {
   async #runEmulationCommands(commands) {
     const failed = [];
     for (const { method, params } of commands) {
-      // 视口覆盖 / 清除会改变页面的缩放比例：输入补偿用的比例在**发出时**就切（同一会话按序执行），视图用的比例等**应答成功**再切
+      // 视口覆盖 / 清除会改变页面的缩放比例：输入补偿用的比例在**发出时**就切（按 CDP「同一会话的命令按序派发」的推断，没有在真页面卡死时实测），视图用的比例等**应答成功**再切
       const isMetrics = method === "Emulation.setDeviceMetricsOverride";
       const isClear = method === "Emulation.clearDeviceMetricsOverride";
       const nextScale = isMetrics ? (typeof params?.scale === "number" ? params.scale : 1) : 1;
@@ -1772,11 +2252,20 @@ export class BrowserTab {
     return failed;
   }
 
-  async #replayEmulation() {
-    const commands = withFitScale(toCdpCommands(this.emulation), this.#desiredFitScale());
-    if (commands.length === 0) return;
-    const failed = await this.#runEmulationCommands(commands);
-    if (failed.length > 0) this.log(`[browser:${this.id}] 重放设备模拟部分失败：${failed.join("；")}`);
+  /**
+   * @param {boolean} [queued] 排进模拟队列（与 emulate / 缩放重算 / 截图串行）。命令在出队时才按「那时」的 `this.emulation` 生成：
+   *   排队期间又来了新的 emulate，重放的就是最新状态（幂等），不会把它退回旧值。已经在队列里跑的调用方（`#applyEmulationNow`）必须传 false。
+   */
+  async #replayEmulation(queued = false) {
+    const replay = async () => {
+      if (this.#wcGone()) return; // 排队期间标签页已关
+      const commands = withFitScale(toCdpCommands(this.emulation), this.#desiredFitScale());
+      if (commands.length === 0) return;
+      const failed = await this.#runEmulationCommands(commands);
+      if (failed.length > 0) this.log(`[browser:${this.id}] 重放设备模拟部分失败：${failed.join("；")}`);
+    };
+    if (queued) await this.#enqueueEmulation(replay);
+    else await replay();
   }
 
   /**
@@ -1804,7 +2293,7 @@ export class BrowserTab {
   }
 
   async #applyEmulationNow(patch) {
-    await this.ensureCdp();
+    await this.#ensureCdp(true); // 已经在模拟队列里：自愈的模拟重放不能再排队（等自己）
     const prev = this.emulation;
     const next = mergeEmulation(prev, patch);
     this.emulation = next;
@@ -1896,6 +2385,78 @@ export class BrowserTab {
         this.send("Runtime.evaluate", { expression, contextId, silent: true }, this.#sessionOfKey(key), 3000).catch(() => {}),
       ),
     );
+  }
+
+  /**
+   * 在**每个 frame 的隔离世界**里各跑一遍 `expression`，按值取回结果：`[{ key, value }]`（key = `<会话>:<frameId>`）。
+   * 表达式必须返回可 JSON 序列化的值（或 undefined）；抛异常 / 超时 / 上下文刚好销毁的 frame 不出现在结果里（不抛）。
+   *
+   * 给权限闸用（permission-gate.mjs 的 frame-delegation 核对：iframe 有没有被顶层页面委托麦克风 / 摄像头）。
+   * 走隔离世界而不是主世界：页面脚本改不到隔离世界里的 `document.permissionsPolicy`，骗不了这个判断。
+   * 不先 `ensureCdp()`——这是在权限请求回调里被调的，自愈重连可能等很久；CDP 没就绪（`cdpReady` 为假：渲染进程崩溃重载 / debugger 掉线）时 `isoContexts` 里留的是**旧**上下文，
+   * 逐个发过去只会各等满 `timeoutMs`、什么也拿不到——直接返回 `null`，调用方按「没核对出来」处理（R22-3）。
+   * 分批并发（每批至多 {@link EVAL_IN_FRAMES_CONCURRENCY} 个）：框架很多的页面一次性发几十条 CDP 会把调试通道堵住。
+   * **总时限**（`totalMs`，缺省 {@link EVAL_IN_FRAMES_TOTAL_MS}，R23-5）：批与批之间串行，每批最长 `timeoutMs`，框架多又都卡死时相加会远超调用方预期；
+   * 总时限一到就不再发后面的批次，每批的单次超时也不超过剩余时间——没轮到的框架不出现在结果里（调用方对「存在却没回应」按核对不出来处理）。
+   * @param {string} expression
+   * @param {{ timeoutMs?: number, totalMs?: number }} [opts]
+   * @returns {Promise<Array<{ key: string, value: unknown }> | null>}
+   */
+  async evalInFrames(expression, { timeoutMs = 1500, totalMs = EVAL_IN_FRAMES_TOTAL_MS } = {}) {
+    if (!this.cdpReady) return null;
+    const entries = [...this.isoContexts.entries()];
+    const rows = [];
+    const startedAt = this.now();
+    for (let i = 0; i < entries.length; i += EVAL_IN_FRAMES_CONCURRENCY) {
+      const left = totalMs - (this.now() - startedAt);
+      if (left <= 0) break;
+      const perCallMs = Math.max(1, Math.min(timeoutMs, left));
+      const batch = entries.slice(i, i + EVAL_IN_FRAMES_CONCURRENCY);
+      const got = await Promise.all(
+        batch.map(async ([key, contextId]) => {
+          try {
+            const r = await this.send(
+              "Runtime.evaluate",
+              { expression, contextId, returnByValue: true, silent: true },
+              this.#sessionOfKey(key),
+              perCallMs,
+            );
+            if (r?.exceptionDetails) return null;
+            return { key, value: r?.result?.value };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      rows.push(...got);
+    }
+    return rows.filter((x) => x !== null);
+  }
+
+  /**
+   * 当前页面里**所有**框架（主会话 + 各 OOPIF 子会话）的清单 `[{ id, url }]`，来自各会话的 `Page.getFrameTree`（权限闸的委托核对用，R22-3）：
+   * {@link evalInFrames} 只能在「已建好隔离世界」的框架里跑——清单让调用方知道有没有框架**存在却还没有上下文**（那种框架的请求不能凭别的框架的答复下结论）。
+   * 同一 frameId 以先出现者为准、子会话排在主会话前（OOPIF 的根 frame 在父会话的树里也是一个叶子，url 以它自己会话里的为准）。
+   * 任何一个会话取不到（CDP 没就绪 / 超时 / 抛错）整体返回 `null`——清单不完整就等于没有，调用方按「没核对出来」处理。
+   * @param {{ timeoutMs?: number }} [opts]
+   * @returns {Promise<Array<{ id: string, url: string }> | null>}
+   */
+  async frameInventory({ timeoutMs = 1500 } = {}) {
+    if (!this.cdpReady) return null;
+    const sessions = [...this.children.keys(), null];
+    const found = new Map();
+    const walk = (n) => {
+      if (!n?.frame || typeof n.frame.id !== "string") return;
+      if (!found.has(n.frame.id)) found.set(n.frame.id, { id: n.frame.id, url: String(n.frame.url ?? "") });
+      for (const c of n.childFrames ?? []) walk(c);
+    };
+    try {
+      const trees = await Promise.all(sessions.map((sid) => this.send("Page.getFrameTree", {}, sid, timeoutMs)));
+      for (const t of trees) walk(t?.frameTree);
+    } catch {
+      return null;
+    }
+    return [...found.values()];
   }
 
   /** 页内归因 flag：所有 frame 的隔离世界都置位（点击可能落在任意 frame 里） */
@@ -2247,8 +2808,9 @@ export class BrowserTab {
   /**
    * 截图（E2·P5a 增强）。新参数：`clip`（视口 CSS 像素）/ `scale` / `omitBackground`（仅 png）/ `annotate` / format 加 webp。
    * 参数互斥关系在 screenshot-kit.normalizeScreenshotArgs 里校验过；这里对直接调用（save / picker）仍保持旧行为。
+   * signal（可选，op 的取消信号）：只管「截图命令在模拟队列里排着、调用方已放弃时别再发」，见 `#captureExclusive`；其余步骤（取布局 / 解码）不看它。
    */
-  async screenshot({ fullPage = false, ref, format = "jpeg", quality = 70, maxWidth = 1280, clip: userClip, scale, omitBackground = false, annotate = false } = {}) {
+  async screenshot({ fullPage = false, ref, format = "jpeg", quality = 70, maxWidth = 1280, clip: userClip, scale, omitBackground = false, annotate = false, signal } = {}) {
     await this.ensureCdp();
     const nativeImage = this.deps.nativeImage;
     const effScale = typeof scale === "number" && Number.isFinite(scale) && scale > 0 ? Math.min(3, Math.max(0.1, scale)) : 1;
@@ -2306,20 +2868,23 @@ export class BrowserTab {
     if (annotation && !nativeImage) throw new BrowserError("UNSUPPORTED", "当前环境不能在截图上绘制标注（缺少图像处理模块），请去掉 annotate");
     const capture = async (clipArg) => {
       const cdpFormat = annotation ? "png" : outFormat;
-      // omit_background：临时把默认背景设为全透明，finally 里一定还原（失败路径也还原，不把用户页面留成透明底）
+      // omit_background：临时把默认背景设为全透明、截完一定还原（失败路径也还原，不把用户页面留成透明底）。
+      // 「设 → 截 → 还原」三条命令必须在同一个排他段里发，由 send 的 transparentBackground 选项交给 #sendTransparent（第十轮评审 B-3）
       const overrideBg = omitBackground && cdpFormat === "png";
-      if (overrideBg) await this.send("Emulation.setDefaultBackgroundColorOverride", { color: { r: 0, g: 0, b: 0, a: 0 } });
-      try {
-        return await this.send("Page.captureScreenshot", {
+      return this.send(
+        "Page.captureScreenshot",
+        {
           format: cdpFormat,
           ...(cdpFormat === "png" ? {} : { quality: q }),
           fromSurface: true,
           captureBeyondViewport,
           ...(clipArg ? { clip: clipArg } : {}),
-        });
-      } finally {
-        if (overrideBg) await this.send("Emulation.setDefaultBackgroundColorOverride", {}).catch(() => {});
-      }
+        },
+        null,
+        undefined,
+        // signal：排队期间调用方已放弃（op 超时 / 用户停止）→ 出队时不再发这条命令（见 #captureExclusive）
+        { signal, ...(overrideBg ? { transparentBackground: true } : {}) },
+      );
     };
     let r = await capture(clip);
     // R1-29：超长页面的 fullPage png 可以是几十到几百 MB 的 base64，必须在解码（分配 Buffer、nativeImage 解码）之前拦下；
@@ -2489,6 +3054,10 @@ export class BrowserTab {
   #teardown({ closeWc }) {
     this.destroyed = true;
     this.cdpReady = false;
+    if (this.#heldShowRetry) {
+      this.clearTimeoutFn(this.#heldShowRetry.handle);
+      this.#heldShowRetry = null;
+    }
     if (closeWc) {
       try {
         if (this.wc.debugger.isAttached()) this.wc.debugger.detach();
@@ -2518,6 +3087,7 @@ export class BrowserTab {
     this.destroyHooks.clear();
     this.contextLostHooks.clear();
     this.sessionHooks.clear();
+    this.earlySessionHooks.clear();
     this.emulationHooks.clear();
     this.promptHold = null;
     for (const v of this.ext.values()) {

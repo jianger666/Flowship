@@ -7,11 +7,32 @@
  *
  * Actions 本身没法在本机跑，这里只能钉文本结构 + 把工作流里的判定表达式拿出来对样本跑一遍。
  */
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-const yml = readFileSync(path.resolve(import.meta.dirname, "../.github/workflows/release.yml"), "utf8");
+/**
+ * 去掉整行注释再拿去匹配：注释里提到的变量名 / 表达式不能让断言通过。否则哪天把某个 secret / 环境变量 / 步骤删了、
+ * 只在注释里留一句说明，契约测试照样绿（第二轮评审指出：原来读的是带注释的原文，`toContain(name)` 这类断言形同虚设）。
+ * 只处理整行注释（YAML 的 `#`，以及 `run: |` 脚本里整行的 shell 注释）；行尾注释不处理——release.yml 现在没有，
+ * 以后加的话别让注释成为某条断言唯一的依据。
+ */
+const stripYamlComments = (s: string): string =>
+  s
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n");
+
+/** 同理，JS 源码：去掉块注释、整行 `//` 注释和行内 ` // …` 尾注释（`http://` 这类前面不是空白的不动） */
+const stripJsComments = (s: string): string =>
+  s
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "")
+    .replace(/(\s)\/\/.*$/gm, "$1");
+
+const yml = stripYamlComments(readFileSync(path.resolve(import.meta.dirname, "../.github/workflows/release.yml"), "utf8"));
+const readJs = (rel: string): string => stripJsComments(readFileSync(path.resolve(import.meta.dirname, rel), "utf8"));
 
 /** 取某个顶层 job 的原文（从 `  <name>:` 到下一个两格缩进的 job 名或文件尾，注释行不算分界） */
 const jobBlock = (name: string): string => {
@@ -98,8 +119,8 @@ describe("release.yml：finalize 签名与转正", () => {
  * 真正的签名行为靠 afterPack 里的 codesign + 签后核对指定要求；这里只钉 workflow 的文本结构。
  */
 describe("release.yml：mac 固定签名身份（electron job）", () => {
-  const afterPack = readFileSync(path.resolve(import.meta.dirname, "../scripts/electron-after-pack.mjs"), "utf8");
-  const builderYml = readFileSync(path.resolve(import.meta.dirname, "../electron-builder.yml"), "utf8");
+  const afterPack = readJs("../scripts/electron-after-pack.mjs");
+  const builderYml = stripYamlComments(readFileSync(path.resolve(import.meta.dirname, "../electron-builder.yml"), "utf8"));
 
   it("environment 隔离：mac 两个架构进 release（放签名私钥），win 进无 secret 的 release-win", () => {
     const electron = jobBlock("electron");
@@ -135,6 +156,50 @@ describe("release.yml：mac 固定签名身份（electron job）", () => {
     expect(m![1]).toMatch(/^[0-9a-f]{40}$/);
   });
 
+  it("electron-builder 步骤对 win / mac 一视同仁（没有 if 条件）：发版标记因此也作用在 Windows 打包上——afterPack 靠它让缺 koffi 原生包当场红", () => {
+    const electron = jobBlock("electron");
+    const start = electron.indexOf("- run: npx electron-builder");
+    expect(start, "缺少 electron-builder 步骤").toBeGreaterThan(0);
+    const next = electron.indexOf("\n      - ", start + 1); // 下一个步骤
+    const step = electron.slice(start, next < 0 ? undefined : next);
+    expect(step).not.toMatch(/^\s*if:/m);
+    expect(step).toMatch(/FLOWSHIP_REQUIRE_STABLE_SIGN:\s*"1"/);
+    expect(electron).toMatch(/args: --win\b/);
+    // afterPack 里 koffi 的严格程度只看这个发版标记（不再按平台区分）
+    expect(afterPack).toMatch(/strict:\s*process\.env\.FLOWSHIP_REQUIRE_STABLE_SIGN === "1"/);
+  });
+
+  it("签名探针与 afterPack 口径一致：都走 scripts/lib/codesign-requirement.mjs（root / leaf 都认），workflow 里不再手写只认 root 的字符串（第三轮评审）", () => {
+    const electron = jobBlock("electron");
+    const start = electron.indexOf("- name: 导入 mac 签名证书");
+    const builder = electron.indexOf("- run: npx electron-builder");
+    expect(start, "缺少导入证书步骤").toBeGreaterThan(0);
+    const step = electron.slice(start, builder);
+    // 不再有手写的「certificate root = H…」判定（它只认 root：add-trusted-cert 失败时探针先红、afterPack 却是放行的）
+    expect(step).not.toMatch(/certificate root = H/);
+    expect(afterPack).toContain("designatedRequirementNamesCertificate");
+    // 把 workflow 里那段 node 判定原样取出来，对样本真跑（证书被信任 → root；没被信任 → leaf；别的证书 / 空输出 → 不过）
+    const m = step.match(/node --input-type=module -e '([\s\S]*?)'; then/);
+    expect(m, "探针里找不到 node 判定片段").not.toBeNull();
+    const code = m![1]!;
+    expect(code).toContain("./scripts/lib/codesign-requirement.mjs");
+    const FP = "566f6cac5a06f6cca21f6cb23039e370a007137d";
+    const OTHER = "0000000000000000000000000000000000000000";
+    const run = (stdin: string, fingerprint: string) =>
+      spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+        cwd: path.resolve(import.meta.dirname, ".."),
+        input: stdin,
+        env: { ...process.env, FLOWSHIP_SIGN_IDENTITY: fingerprint },
+        encoding: "utf8",
+      }).status;
+    expect(run(`designated => identifier "x" and certificate root = H"${FP}"`, FP)).toBe(0);
+    expect(run(`designated => identifier "x" and certificate leaf = H"${FP}"`, FP)).toBe(0);
+    expect(run(`designated => identifier "x" and certificate leaf = H"${OTHER}"`, FP)).toBe(1);
+    expect(run(`designated => cdhash H"${FP}"`, FP)).toBe(1);
+    expect(run("", FP)).toBe(1);
+    expect(run(`certificate root = H"${FP}"`, "")).toBe(1); // 没配身份 → 不放行
+  });
+
   it("钥匙串清理步骤无论成败都执行，且只在 mac 上", () => {
     const electron = jobBlock("electron");
     expect(electron).toMatch(/if:\s*always\(\) && runner\.os == 'macOS'/);
@@ -150,5 +215,30 @@ describe("release.yml：mac 固定签名身份（electron job）", () => {
     expect(afterPack).toMatch(/FLOWSHIP_REQUIRE_STABLE_SIGN === "1"/);
     // 自签身份不被 electron-builder 的 find-identity -v 认可，签名只能走 afterPack
     expect(builderYml).toMatch(/^\s+identity:\s*null\s*$/m);
+  });
+});
+
+describe("注释不算数：契约只认真正生效的配置（第二轮评审）", () => {
+  it("stripYamlComments / stripJsComments：注释里的名字去掉，真代码里的保留（含 `http://` 这类不是注释的 //）", () => {
+    const y = ["a: 1", "  # secrets.FOO_ONLY_IN_COMMENT", "run: |", "  # echo FOO_SHELL_COMMENT", "  echo real", "b: 2"].join("\n");
+    expect(stripYamlComments(y)).toBe(["a: 1", "run: |", "  echo real", "b: 2"].join("\n"));
+    const js = [
+      "const a = process.env.REAL; // process.env.TRAILING_ONLY",
+      "// process.env.LINE_ONLY",
+      "/* process.env.BLOCK_ONLY */",
+      'const u = "http://x.test/y";',
+    ].join("\n");
+    const out = stripJsComments(js);
+    expect(out).toContain("process.env.REAL");
+    expect(out).toContain('"http://x.test/y"');
+    for (const gone of ["TRAILING_ONLY", "LINE_ONLY", "BLOCK_ONLY"]) expect(out, gone).not.toContain(gone);
+  });
+
+  it("真实文件：release.yml 去注释之后不剩整行注释、仍是完整的工作流；原文确实带注释（否则上一条什么都没证明）", () => {
+    const raw = readFileSync(path.resolve(import.meta.dirname, "../.github/workflows/release.yml"), "utf8");
+    expect(raw.split("\n").some((l) => /^\s*#/.test(l))).toBe(true);
+    expect(yml.split("\n").some((l) => /^\s*#/.test(l))).toBe(false);
+    expect(yml).toContain("jobs:");
+    expect(jobBlock("finalize")).toMatch(/^\s{4}environment:\s*release\s*$/m);
   });
 });

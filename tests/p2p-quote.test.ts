@@ -21,6 +21,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  QUOTE_FETCH_OWNER_TIMEOUT_MS,
+  QUOTE_FETCH_TIMEOUT_MS,
+} from "@/lib/server/feishu-bridge/group-quote";
 import { resolveInboundQuote } from "@/lib/server/feishu-bridge/inbound-quote";
 import {
   __setLarkExecForTest,
@@ -159,6 +163,8 @@ beforeEach(() => {
 afterEach(() => {
   __setLarkExecForTest(null);
   __setLarkRetryBaseForTest(null);
+  // 用例里装的 console.warn spy 统一在这里还原：写在用例末尾的话，断言先失败就走不到，spy 会泄漏进后面的用例
+  vi.restoreAllMocks();
 });
 
 describe("回复一条消息：被引用的那条以引用块交给 agent（不进气泡）", () => {
@@ -167,7 +173,8 @@ describe("回复一条消息：被引用的那条以引用块交给 agent（不�
 
     expect(r).toMatchObject({ kind: "sent", taskId: "task-1" });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(fetchSpy.mock.calls[0]).toEqual([QUOTED, 5000]);
+    // 单聊只有属主：用属主预算
+    expect(fetchSpy.mock.calls[0]).toEqual([QUOTED, QUOTE_FETCH_OWNER_TIMEOUT_MS]);
     // 气泡 / 注入文本仍是用户原话
     expect(bodyOf().text).toBe("帮我看下这个");
     // 引用块：发送人、消息 id、数据定语、正文
@@ -653,5 +660,76 @@ describe("resolveInboundQuote（共享模块直测：单聊 / 群共用）", () 
       sender_id: "ou_owner",
     });
     expect(parseContent.mock.calls[1]?.[0]).toMatchObject({ chat_type: "group" });
+  });
+
+  it("取回预算：属主用长预算、非属主用短预算（属主的引用别被 lark 队列排队吃光 5 秒就丢，2026-11-19）", async () => {
+    const budgets: number[] = [];
+    const fetchDetail = vi.fn(async (_id: string, timeoutMs: number) => {
+      budgets.push(timeoutMs);
+      return detail({});
+    });
+    const parseContent = vi.fn(async () => ({ text: "", images: [], attachments: [] }));
+
+    await resolveInboundQuote({ ...baseArgs(), isOwner: true, parseContent, fetchDetail });
+    await resolveInboundQuote({ ...baseArgs(), isOwner: false, parseContent, fetchDetail });
+
+    expect(budgets).toEqual([QUOTE_FETCH_OWNER_TIMEOUT_MS, QUOTE_FETCH_TIMEOUT_MS]);
+    expect(QUOTE_FETCH_OWNER_TIMEOUT_MS).toBeGreaterThan(QUOTE_FETCH_TIMEOUT_MS);
+  });
+
+  it("取回失败（超时 / 抛错）：返回 null 并记一行带耗时的警告日志", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const parseContent = vi.fn(async () => ({ text: "", images: [], attachments: [] }));
+
+    const viaNull = await resolveInboundQuote({
+      ...baseArgs(),
+      parseContent,
+      fetchDetail: async () => null,
+    });
+    const viaThrow = await resolveInboundQuote({
+      ...baseArgs(),
+      parseContent,
+      fetchDetail: async () => {
+        throw new Error("boom");
+      },
+    });
+
+    expect(viaNull).toBeNull();
+    expect(viaThrow).toBeNull();
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(logged).toHaveLength(2);
+    for (const line of logged) {
+      expect(line).toContain("被引用消息取回失败");
+      expect(line).toContain(QUOTED);
+      expect(line).toMatch(/elapsed=\d+ms/);
+    }
+  });
+
+  it("fromOthers：引用的是发件人自己 / 本机机器人 → false；别人 / 发送人取不到 / 发件人 id 缺失 → true（失败即关闭）", async () => {
+    const parseContent = vi.fn(async () => ({ text: "", images: [], attachments: [] }));
+    const run = (over: Partial<InboundMessageDetail>, senderId?: string) =>
+      resolveInboundQuote({
+        ...baseArgs(),
+        ...(senderId === undefined ? {} : { msg: { ...baseArgs().msg, sender_id: senderId } }),
+        parseContent,
+        fetchDetail: async () => detail(over),
+      });
+
+    // 发件人自己（默认 detail 的发送人 = ou_owner = msg.sender_id）
+    expect((await run({}))?.fromOthers).toBe(false);
+    // 本机机器人自己的旧回复（selfIds 命中）
+    expect(
+      (await run({ sender: { kind: "bot", openId: "ou_botself", ids: ["cli_test"], name: "Flowship" } }))
+        ?.fromOthers,
+    ).toBe(false);
+    // 别人写的
+    expect(
+      (await run({ sender: { kind: "user", openId: "ou_stranger", ids: ["ou_stranger"], name: "李四" } }))
+        ?.fromOthers,
+    ).toBe(true);
+    // 引用的发送人信息缺失：无从判断是不是本人 → 当别人
+    expect((await run({ sender: { kind: "unknown", openId: "", ids: [], name: "" } }))?.fromOthers).toBe(true);
+    // 发件人 id 缺失：无从比对 → 当别人（哪怕引用的发送人恰好是 ou_owner）
+    expect((await run({}, ""))?.fromOthers).toBe(true);
   });
 });

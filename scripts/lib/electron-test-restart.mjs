@@ -4,6 +4,12 @@
 import path from "node:path";
 
 export const TEST_PRODUCT_NAME = "FlowshipTest";
+/**
+ * mac test 包独立的 bundle id（正式版是 com.jianger.fe-ai-flow，electron-builder.yml 里不动）。
+ * 和正式版共用 id 的话，系统把两者当成同一个 App：授权 / 钥匙串访问控制 / `open` 启动都会串到一起，
+ * 「电脑操作」的授权也没法只给 test 包。win32 的 test 包没有这个问题，沿用原 id。
+ */
+export const TEST_APP_ID = "com.jianger.fe-ai-flow.test";
 export const ELECTRON_OUTPUT_DIR = "dist/electron";
 /** electron-builder 临时输出，避免覆盖正在运行的规范产物 */
 export const STAGING_SUBDIR = ".test-restart-staging";
@@ -123,7 +129,7 @@ export function buildDistTestArgs(
   const outputFlag = `-c.directories.output=${stagingOutputRelative}`;
 
   if (platform === "darwin") {
-    const args = ["--mac", "--dir", productNameFlag, outputFlag];
+    const args = ["--mac", "--dir", productNameFlag, `-c.appId=${TEST_APP_ID}`, outputFlag];
     if (electronDistPath) args.push(`-c.electronDist=${electronDistPath}`);
     return args;
   }

@@ -256,6 +256,157 @@ describe("sendQueuedChatMessageNow 编排", () => {
     ]);
     clearChatQueue(tid);
   });
+
+  // ───────── 第五轮评审 N1：外来内容（所有者空 @ / 一句话再引用别人）排队后的「立即发送」 ─────────
+  // steer = 把这条塞进属主**正在跑**的那一轮：那一轮没有（也不该有）中途标记，外来内容就无标记送达了。
+  // 外来内容改走打断重发：start 在首包 agent.send 前一刻登记标记（startChatFromQueuedMessage 透传 head.foreignContentTurn）。
+
+  /** 能 steer 的 deps：steerFn 被调用 = 走了插话路径 */
+  const makeSteerableDeps = (
+    tid: string,
+    taken: QueuedChatMsg,
+    steerFn: ReturnType<typeof vi.fn>,
+  ): SendNowDeps => ({
+    getTask: vi.fn(async () => makeTask(tid)),
+    peek: vi.fn(() => taken),
+    take: vi.fn(() => taken),
+    stop: vi.fn(async () => ({ hadAgent: true, task: makeTask(tid) })),
+    start: vi.fn(async () => new Response("{}", { status: 202 })),
+    steer: {
+      canSteer: vi.fn(() => true),
+      flushAssistant: vi.fn(async () => undefined),
+      persistReply: vi.fn(async () => ({ ok: true as const })),
+      steer: steerFn as never,
+      isRunActive: vi.fn(() => true),
+      hasSession: vi.fn(() => true),
+      flushQueue: vi.fn(async () => undefined),
+    },
+  });
+
+  it("外来内容（foreignContentTurn）即使会话能 steer 也不 steer：走打断重发 take → stop → start，start 收到带标志的条目", async () => {
+    const taken = makeMsg({ itemId: "cq_foreign", foreignContentTurn: true });
+    const steerFn = vi.fn(async () => "delivered" as const);
+    const deps = makeSteerableDeps("t_foreign_nosteer", taken, steerFn);
+
+    const res = await sendQueuedChatMessageNow("t_foreign_nosteer", "cq_foreign", validBoot, deps);
+
+    expect(res.status).toBe(202);
+    expect(steerFn, "外来内容被塞进了属主正在跑的那一轮——那一轮没有标记，等于无标记送达").not.toHaveBeenCalled();
+    expect(deps.take).toHaveBeenCalledWith("t_foreign_nosteer", "cq_foreign");
+    expect(deps.stop).toHaveBeenCalledTimes(1);
+    expect(deps.start).toHaveBeenCalledTimes(1);
+    const startedWith = (deps.start as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as QueuedChatMsg;
+    expect(startedWith.foreignContentTurn, "打断重发的起点丢了标志：start 就不会在首包前登记标记").toBe(true);
+  });
+
+  it("对照：普通排队消息 + 会话能 steer → 仍走 steer 插话（不停止、不重开会话）", async () => {
+    const taken = makeMsg({ itemId: "cq_plain_steer" });
+    const steerFn = vi.fn(async () => "delivered" as const);
+    const deps = makeSteerableDeps("t_plain_steer", taken, steerFn);
+
+    const res = await sendQueuedChatMessageNow("t_plain_steer", "cq_plain_steer", validBoot, deps);
+
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ steered: true });
+    await vi.waitFor(() => expect(steerFn).toHaveBeenCalledTimes(1));
+    expect(deps.stop).not.toHaveBeenCalled();
+    expect(deps.start).not.toHaveBeenCalled();
+  });
+
+  // 第六轮评审 P2-4：上面「外来内容不 steer」那条的 deps 里写死了 peek: vi.fn(() => taken)——把生产的默认接线
+  // （deps.peek ?? peekQueuedChatMessage）整个去掉，它照样绿。路由里调用时不传 peek，走的是真实队列的 peekQueuedChatMessage：
+  // 这里用真实队列、不注入 peek，把「默认接线读得到队列条目上的 foreignContentTurn」钉一遍。
+  it("生产接线（不注入 peek、真实队列）：外来内容仍不 steer、start 收到带标志的条目；同一份 deps 下普通条目照常 steer", async () => {
+    const { enqueueChatMessage, clearChatQueue, takeQueuedChatMessage } = await import("@/lib/server/chat-queue");
+    const tid = `t_foreign_realpeek_${Date.now()}`;
+    clearChatQueue(tid);
+    const enqueue = (itemId: string, extra: Partial<QueuedChatMsg> = {}) =>
+      enqueueChatMessage(tid, { itemId, agentText: itemId, displayText: itemId, enqueuedAt: Date.now(), ...extra });
+    expect(enqueue("cq_rp_foreign", { foreignContentTurn: true }).ok).toBe(true);
+    expect(enqueue("cq_rp_plain").ok).toBe(true);
+
+    const steerFn = vi.fn(async () => "delivered" as const);
+    // 与生产一致：不传 peek（走默认的真实 peekQueuedChatMessage）；take 用真实队列的
+    const { peek: injectedPeek, ...base } = makeSteerableDeps(tid, makeMsg(), steerFn);
+    void injectedPeek;
+    const deps: SendNowDeps = { ...base, take: takeQueuedChatMessage };
+    expect("peek" in deps, "这条用例的意义就是不注入 peek").toBe(false);
+
+    const foreign = await sendQueuedChatMessageNow(tid, "cq_rp_foreign", validBoot, deps);
+    expect(foreign.status).toBe(202);
+    expect(steerFn, "外来内容被塞进了属主正在跑的那一轮——默认 peek 没读到队列条目上的标志").not.toHaveBeenCalled();
+    expect(deps.stop).toHaveBeenCalledTimes(1);
+    expect(deps.start).toHaveBeenCalledTimes(1);
+    const startedWith = (deps.start as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as QueuedChatMsg;
+    expect(startedWith.itemId).toBe("cq_rp_foreign");
+    expect(startedWith.foreignContentTurn, "真实队列取出来的条目要带着标志，start 才会在首包前登记标记").toBe(true);
+
+    // 对照：同一份 deps、同一条真实队列里的普通条目 → 仍然 steer（证明上面「不 steer」确实来自外来判断，不是 steer 本身走不通）
+    const plain = await sendQueuedChatMessageNow(tid, "cq_rp_plain", validBoot, deps);
+    expect(plain.status).toBe(202);
+    expect(await plain.json()).toMatchObject({ steered: true });
+    await vi.waitFor(() => expect(steerFn).toHaveBeenCalledTimes(1));
+    expect(deps.stop, "普通条目走插话：不再多停一次").toHaveBeenCalledTimes(1);
+    clearChatQueue(tid);
+  });
+
+  it("打断重发：其余排队里的外来内容经默认塞回仍带 foreignContentTurn（漏了这个标志 = 外来内容无标记送达）", async () => {
+    const { enqueueChatMessage, clearChatQueue, peekQueuedChatMessage, takeQueuedChatMessage, listQueuedChatMessages } =
+      await import("@/lib/server/chat-queue");
+    const tid = `t_foreign_requeue_${Date.now()}`;
+    clearChatQueue(tid);
+    const enqueue = (itemId: string, extra: Partial<QueuedChatMsg> = {}) =>
+      enqueueChatMessage(tid, { itemId, agentText: itemId, displayText: itemId, enqueuedAt: Date.now(), ...extra });
+    expect(enqueue("cq_fr_target").ok).toBe(true);
+    expect(enqueue("cq_fr_foreign", { foreignContentTurn: true }).ok).toBe(true);
+    expect(enqueue("cq_fr_plain").ok).toBe(true);
+    const deps: SendNowDeps = {
+      getTask: vi.fn(async () => makeTask(tid)),
+      // take / drainRest / requeueRest 走默认真实实现，只 mock 掉 stop（不真清）与 start
+      stop: vi.fn(async () => ({ hadAgent: true, task: makeTask(tid) })),
+      start: vi.fn(async () => new Response("{}", { status: 202 })),
+      take: takeQueuedChatMessage,
+    };
+
+    const res = await sendQueuedChatMessageNow(tid, "cq_fr_target", validBoot, deps);
+
+    expect(res.status).toBe(202);
+    expect(listQueuedChatMessages(tid).map((m) => m.itemId)).toEqual(["cq_fr_foreign", "cq_fr_plain"]);
+    expect(
+      peekQueuedChatMessage(tid, "cq_fr_foreign")?.foreignContentTurn,
+      "其余排队被塞回后丢了外来标志：它出队送达时就没有标记",
+    ).toBe(true);
+    expect(peekQueuedChatMessage(tid, "cq_fr_plain")?.foreignContentTurn).toBeUndefined();
+    clearChatQueue(tid);
+  });
+
+  it("打断重发：默认塞回整条原样带回——队列项里将来新增的字段也不会被悄悄丢掉（防回到「逐字段重建」，第六轮评审 P3）", async () => {
+    const { enqueueChatMessage, clearChatQueue, takeQueuedChatMessage } = await import("@/lib/server/chat-queue");
+    const tid = `t_requeue_whole_${Date.now()}`;
+    clearChatQueue(tid);
+    // 类型里还没有的字段：模拟「以后给 QueuedChatMsg 加了新字段、却忘了改塞回的那段代码」——第五轮就这样漏过 foreignContentTurn
+    const FUTURE = { someFutureField: "x" };
+    const enqueue = (itemId: string, extra: object = {}) =>
+      enqueueChatMessage(tid, { itemId, agentText: itemId, displayText: itemId, enqueuedAt: Date.now(), ...extra } as QueuedChatMsg);
+    expect(enqueue("cq_rw_target").ok).toBe(true);
+    expect(enqueue("cq_rw_rest", FUTURE).ok).toBe(true);
+    const deps: SendNowDeps = {
+      getTask: vi.fn(async () => makeTask(tid)),
+      // take / drainRest / requeueRest 走默认真实实现，只 mock 掉 stop（不真清）与 start
+      stop: vi.fn(async () => ({ hadAgent: true, task: makeTask(tid) })),
+      start: vi.fn(async () => new Response("{}", { status: 202 })),
+      take: takeQueuedChatMessage,
+    };
+
+    const res = await sendQueuedChatMessageNow(tid, "cq_rw_target", validBoot, deps);
+
+    expect(res.status).toBe(202);
+    // 用 take 把队列里的原条目整个取出来看（peek / list 只露出几个字段，看不出丢没丢）
+    const back = takeQueuedChatMessage(tid, "cq_rw_rest") as (QueuedChatMsg & typeof FUTURE) | null;
+    expect(back, "其余排队被塞回了队里").not.toBeNull();
+    expect(back?.someFutureField, "塞回后丢了队列项里的字段：默认塞回回到了「逐字段重建」").toBe("x");
+    clearChatQueue(tid);
+  });
 });
 
 describe("sendQueuedChatMessageNow · steer 插话路径", () => {

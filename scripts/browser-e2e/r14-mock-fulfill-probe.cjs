@@ -30,6 +30,23 @@ app.on("window-all-closed", () => {});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const probe = (msg) => console.log(`PROBE ${msg}`);
+// 清临时 userData（两个正常收尾处 + FATAL 路径共用；第十七轮评审 B-2 补了两个正常收尾；第十八轮评审 R-1：main 抛错的 FATAL 路径也要清）：
+// Chromium 退出前可能还在写缓存，偶发 ENOTEMPTY / EBUSY——重试几次，仍清不掉只告警，不改退出码、不吞原始错误；可重复调用
+const cleanupTmp = () => {
+  // 先销毁剩下的窗口（Chromium 还抱着 userData 时 rmSync 容易 ENOTEMPTY），再清
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      w.destroy();
+    } catch {
+      /* 已销毁 */
+    }
+  }
+  try {
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.warn("SMOKE WARN 临时目录没清掉（不影响结果）：", err && err.message ? err.message : err);
+  }
+};
 const uncaught = [];
 process.on("uncaughtException", (e) => {
   uncaught.push(String((e && e.message) || e));
@@ -228,6 +245,7 @@ document.getElementById('reload').onclick = function () { location.reload(); };
   probe(`END   S1c out=${await out()}`);
   if (S1_ONLY) {
     probe(`DONE S1 跑完、Electron 未崩 mode=${MODE}`);
+    cleanupTmp();
     app.exit(0);
     return;
   }
@@ -277,10 +295,12 @@ document.getElementById('reload').onclick = function () { location.reload(); };
   probe(`END   S6 out=${await out()}`);
 
   probe(`DONE 全部步骤跑完、Electron 未崩 uncaught=${uncaught.length}`);
+  cleanupTmp();
   app.exit(0);
 };
 
 main().catch((e) => {
   console.log("PROBE FAIL", (e && e.stack) || e);
+  cleanupTmp(); // 错误已先打出；清理只告警，退出码仍是 1
   app.exit(1);
 });

@@ -13,6 +13,7 @@
  *   B. readServerGitToken 读临时 config.json（只用假 token，绝不读真实配置）；
  *   C. 端到端：真走 resumeTaskSession → 注册的 submit_mr 桥 → createMR 收到的 token；
  *      以及 Host / Token 缺失时的报错必须分开、且指向真原因；
+ *      另（第二十轮评审 R20-5）：交给 SDK 的工具闭包带的 callerToken 与登记进表的是同一个（运行时接线，不是只看源码）；
  *   D. 接线契约：输入条入口把 bootArgs 的 gitToken 往下传。
  */
 import { execFileSync } from "node:child_process";
@@ -80,9 +81,13 @@ const { writeMeta, taskDir } = await import("@/lib/server/task-fs-core");
 const { agentSessions, runningTasks, clearTaskStarting } = await import(
   "@/lib/server/task-stream"
 );
-const { cleanupChatTaskState, runTaskAction } = await import(
-  "@/lib/server/chat-pending"
-);
+const {
+  CALLER_MISMATCH_ERROR,
+  cleanupChatTaskState,
+  getExpectedCallerToken,
+  invalidateCallerToken,
+  runTaskAction,
+} = await import("@/lib/server/chat-pending");
 const { clearChatGate } = await import("@/lib/server/chat-gate");
 const { readServerGitToken, resolveSessionGitToken, resumeTaskSession } =
   await import("@/lib/server/task-runner");
@@ -399,6 +404,25 @@ describe("C · resumeTaskSession → submit_mr 桥拿到的 Token", () => {
     expect(error).not.toContain("GitLab Token");
     expect(error).not.toContain("准入应该已被拦");
     expect(mockCreateMR).not.toHaveBeenCalled();
+  });
+
+  it("R20-5 接线：交给 SDK 的工具闭包带的 token 就是登记进表的那个（Agent.resume 的 callerToken === record.callerToken）——闭包调受限工具不被拒；token 作废后同一闭包被拒", async () => {
+    const { id, callerToken } = await resumeWith(ORIGIN_REPO, {});
+    expect(getExpectedCallerToken(id), "前置：resume 装好的会话把自己的 token 登记进了表").toBe(callerToken);
+    type SdkTool = { execute: (args: unknown, ctx?: unknown) => Promise<{ content: Array<{ text?: string }> }> };
+    const sdkOptions = mockResume.mock.calls[0]?.[1] as { local?: { customTools?: Record<string, SdkTool> } } | undefined;
+    // set_owner_note：受限工具（过期会话闸与 handler 自己都核对 token）；content 传空串 = 清空备注，没有别的副作用
+    const tool = sdkOptions?.local?.customTools?.set_owner_note;
+    expect(tool, "Agent.resume 没把系统工具交给 SDK（local.customTools.set_owner_note 缺失）").toBeTruthy();
+    const call = async (): Promise<string> =>
+      (await tool!.execute({ task_id: id, content: "" }, {})).content.map((c) => c.text ?? "").join("\n");
+
+    const ok = await call();
+    expect(ok, "闭包带的 token 不是登记进表的那个：当前会话自己的调用也被拒").not.toContain(CALLER_MISMATCH_ERROR);
+    expect(JSON.parse(ok)).toMatchObject({ ok: true });
+
+    invalidateCallerToken(id);
+    expect(await call(), "摘了 token 之后，同一个闭包必须被拒（fail-closed）").toContain(CALLER_MISMATCH_ERROR);
   });
 });
 

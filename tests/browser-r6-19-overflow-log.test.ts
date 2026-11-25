@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createActivityLog } from "../electron-app/browser/activity-log.mjs";
 import { ensureEvaluateApproval } from "../electron-app/browser/evaluate-approval.mjs";
 import { createNetGuard } from "../electron-app/browser/net-guard.mjs";
-import { createPermissionGate } from "../electron-app/browser/permission-gate.mjs";
+import { createPermissionGate, getPermissionState } from "../electron-app/browser/permission-gate.mjs";
 import {
   OVERFLOW_LOG_WINDOW_MS,
   PROMPT_KIND_LIMITS,
@@ -81,13 +81,52 @@ describe("createOverflowLogThrottle（纯）", () => {
     expect(th.take("k")).toEqual({ log: true, suppressed: 0 });
   });
 
-  it("key 表有上限（防御）：超过后整表清空重来，不会无限增长；reset 清空", () => {
-    const { th } = make();
-    for (let i = 0; i < 200; i++) th.take(`k${i}`);
-    // 清空发生过：最早的 key 再来是「新的」→ 放行
+  it("key 表有上限（防御，32 个）：满了只挤掉最老的一项，不整表清空——窗口内的其它键不会被一并忘掉（第二十四轮 P3-5：此前整表 clear()）；reset 清空", () => {
+    const { th } = make(60_000);
+    for (let i = 0; i < 32; i++) th.take(`k${i}`); // 32 个键都在窗口内
+    expect(th.take("k32").log).toBe(true); // 第 33 个新键放行，挤掉最老的 k0
+    // 其它键仍在窗口内：再来是被吞掉的、不是「新的」（整表清空的旧实现会让它们全部再写一条日志）
+    expect(th.take("k1").log).toBe(false);
+    expect(th.take("k31").log).toBe(false);
+    expect(th.take("k32").log).toBe(false);
+    // 被挤掉的最老一项：再来是新的（放行），并且这一次又挤掉当时最老的 k1
     expect(th.take("k0").log).toBe(true);
+    expect(th.take("k1").log).toBe(true);
+    // 表不会无限增长：200 个不同的键之后，最近的那些仍在表里（被吞掉），很早的早已被挤掉（放行）
+    for (let i = 0; i < 200; i++) th.take(`n${i}`);
+    expect(th.take("n199").log).toBe(false);
+    expect(th.take("n168").log).toBe(false); // 最近 32 个之内
+    expect(th.take("n0").log).toBe(true);
     th.reset();
+    expect(th.take("n199")).toEqual({ log: true, suppressed: 0 });
+  });
+
+  it("表满时只挤最老的一项：窗口已过的槽照样占位直到被挤掉，它们被吞掉的次数不丢（下一次放行时仍带出「另有 N 次」）；仍在窗口内的槽不受牵连；时钟倒退的槽按已过期处理（P3-5）", () => {
+    const { th, advance } = make(1000);
+    for (let i = 0; i < 32; i++) th.take(`k${i}`); // t = 10_000，表满
+    th.take("k5");
+    th.take("k5"); // k5 在窗口内被吞掉 2 次
+    advance(900);
+    th.take("k7"); // k7 在窗口内被吞掉 1 次（只计数、位置不动）
+    advance(600); // t = 11_500：所有槽（放行时刻都是 10_000）都已过窗口
+    expect(th.take("fresh").log).toBe(true); // 满了 → 只挤掉最老的 k0
+    // k5 窗口已过但仍在表里：再来放行、并带出之前吞掉的 2 次（先扫一遍「剔掉过期槽」的话这个数字会丢）
+    expect(th.take("k5")).toEqual({ log: true, suppressed: 2 });
+    // 刚才放行的 fresh / k5 在窗口内：再来是被吞掉的；k0 被挤掉了：再来是新的（并挤掉当时最老的 k1）
+    expect(th.take("fresh").log).toBe(false);
+    expect(th.take("k5").log).toBe(false);
     expect(th.take("k0")).toEqual({ log: true, suppressed: 0 });
+    expect(th.take("k1")).toEqual({ log: true, suppressed: 0 }); // 刚被 k0 挤掉，再来是新的（挤掉 k2）
+    expect(th.take("k31").log, "k31 窗口已过、还在表里 → 放行（带出它的 0 次）").toBe(true);
+    // 放行过的槽挪到末尾：k5 在 t = 11_500 放行过、比表里 k3 / k4 / k6~k30 都新——接下来 28 个新键只会先挤掉比它老的，k5 仍在窗口内（继续被吞掉）
+    for (let i = 0; i < 28; i++) th.take(`z${i}`);
+    expect(th.take("k5").log, "放行时挪到末尾：不会被这 28 个新键挤掉").toBe(false);
+    // 时钟倒退：槽的时间在「未来」，视同窗口已过——再来放行、不会被永久吞掉
+    const b = make(1000);
+    for (let i = 0; i < 32; i++) b.th.take(`f${i}`);
+    b.setNow(1);
+    expect(b.th.take("g").log).toBe(true); // 满表新键：挤掉最老的 f0
+    expect(b.th.take("f31").log, "倒退之后旧槽的时间在未来，视同已过期、放行").toBe(true);
   });
 
   it("overflowSuppressedNote：0 / 非法值 → 空串；正数 → 带次数", () => {
@@ -185,6 +224,51 @@ describe("permission-gate：overflow 日志限速，不挤掉用户条目，不�
     await flush();
     expect(cb2).not.toHaveBeenCalled(); // 没被冷却挡成立即拒绝
     expect((s.session.prompts.list() as Array<{ host: string }>).some((p) => p.host === "victim.example")).toBe(true); // 而是真的弹了提示
+  });
+
+  it("R23-4：overflow 也进「最近被自动拒绝」清单（reason prompt-overflow，按来源 + 权限合并计数）——页面读到被拒、AI 要能在 list 里查到原因；清单只多记录、不多写活动日志（日志仍是那一条限速的）", async () => {
+    const s = await setup();
+    await s.fillBucket();
+    // 一个接一个（同一时刻并发的同键请求本来就合并成一次询问，只有「上一次已经结算」之后的请求才各算一次）
+    for (let i = 0; i < 6; i++) {
+      s.request("geolocation", "https://victim.example");
+      await flush(30);
+    }
+    s.request("geolocation", "https://other.example");
+    await flush(30);
+    const blocked = getPermissionState(s.session).recentBlocked as Array<Record<string, unknown>>;
+    expect(blocked.map((e) => [e.origin, e.permission, e.reason, e.count])).toEqual([
+      ["https://other.example", "geolocation", "prompt-overflow", 1],
+      ["https://victim.example", "geolocation", "prompt-overflow", 6],
+    ]);
+    // 活动日志：只有那一条限速的「提示太多」，清单是静默记的（不会再写一条「已自动拒绝…」）
+    expect(overflowEntries(s, "permission")).toHaveLength(1);
+    expect(entriesOf(s).filter((e) => e.summary.includes("已自动拒绝"))).toHaveLength(0);
+    // 名额空出后同一来源被询问、不进冷却（与 R6-19 一致）：清单里的记录仍是历史，不影响决策
+    const first = (s.session.prompts.list() as Array<{ id: string }>)[0];
+    expect(s.session.prompts.answer(first.id, { action: "deny" })).toBe(true);
+    await flush();
+    const cb = s.request("geolocation", "https://victim.example");
+    await flush();
+    expect(cb).not.toHaveBeenCalled();
+    expect((s.session.prompts.list() as Array<{ host: string }>).some((p) => p.host === "victim.example")).toBe(true);
+  });
+
+  it("R23-4：媒体请求（麦克风）名额满同样记 prompt-overflow，权限名按展示名（microphone / camera / media）", async () => {
+    const s = await setup();
+    await s.fillBucket();
+    const mic = vi.fn();
+    s.gate.handleRequest(s.tab.wc, "media", mic, { requestingUrl: `${A}/page`, isMainFrame: true, mediaTypes: ["audio"] });
+    const both = vi.fn();
+    s.gate.handleRequest(s.tab.wc, "media", both, { requestingUrl: `https://other.example/`, isMainFrame: true, mediaTypes: ["audio", "video"] });
+    await flush(30);
+    expect(mic).toHaveBeenCalledWith(false);
+    expect(both).toHaveBeenCalledWith(false);
+    const blocked = getPermissionState(s.session).recentBlocked as Array<Record<string, unknown>>;
+    expect(blocked.map((e) => [e.permission, e.reason]).sort()).toEqual([
+      ["media", "prompt-overflow"],
+      ["microphone", "prompt-overflow"],
+    ]);
   });
 
   it("窗口过后再来一次 overflow：再写 1 条，带「另有 N 次」；中间的洪水没有一条被逐条记录", async () => {

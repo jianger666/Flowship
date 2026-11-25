@@ -99,6 +99,7 @@ const {
   peekOneShotMemory,
 } = await import("@/lib/server/oneshot-session-memory");
 const { SCHEDULE_ONE_SHOT_BOUNDARY_LINES } = await import("@/lib/schedule");
+const { OWNER_GROUP_NOTE } = await import("@/lib/group-non-owner-prompt");
 const { getTask, setTaskRunStatus } = await import("@/lib/server/task-fs");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
@@ -527,6 +528,31 @@ describe("属主一次性答疑 agent（startOneShotQuestion）", () => {
     mockResume.mockResolvedValueOnce(third);
     await runTurn(id, "再说一句");
     expect(third.send.mock.calls[0]?.[0] as string).not.toContain("# 本任务的需求群");
+  });
+
+  it("一次性 agent 的提示词不常驻「群消息怎么读」（提示词收敛）：所有者群消息的尾注由 group-route 经 agentContext 拼在原文后、原样落在「# 用户的话」里；边界清单仍点名 set_owner_note", async () => {
+    const id = alloc();
+    await seedAckedTask(id);
+
+    const first = makeFakeAgent("agent_chat_g");
+    mockCreate.mockResolvedValueOnce(first);
+    // inject 层把 agentContext 拼在原文后面（见 task-question-inject），这里直接模拟 questionText 已含尾注
+    await runTurn(id, `[群消息·来自 陈属主]\n帮我看下登录页\n\n${OWNER_GROUP_NOTE}`);
+    const firstPrompt = first.send.mock.calls[0]?.[0] as string;
+    expect(firstPrompt).not.toContain("# 群消息怎么读");
+    expect(firstPrompt.slice(firstPrompt.indexOf("# 用户的话"))).toContain(OWNER_GROUP_NOTE);
+    // 边界清单点名 set_owner_note（一次性 agent 其实挂着它，得告诉它能用）
+    const boundary = firstPrompt.slice(firstPrompt.lastIndexOf("# 边界"));
+    expect(boundary).toContain("set_owner_note");
+
+    // 续聊又来一条群消息（没带尾注）：一次性 agent 自己不补任何群消息规矩——规矩只由每条消息自带的尾注承担
+    const second = makeFakeAgent("agent_chat_g");
+    mockResume.mockResolvedValueOnce(second);
+    await runTurn(id, "[群消息·来自 陈属主]\n再看下注册页");
+    const secondPrompt = second.send.mock.calls[0]?.[0] as string;
+    expect(secondPrompt).not.toContain("# 群消息怎么读");
+    expect(secondPrompt).not.toContain(OWNER_GROUP_NOTE);
+    expect(secondPrompt).not.toContain("# 任务背景");
   });
 
   it("定时到点的轮次也能接回同一段对话：接续提示用定时版措辞和边界；这一轮的工具里没有 advance_next（R19-01），用户的下一轮又有", async () => {

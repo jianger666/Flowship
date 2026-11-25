@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import { createActivityLog, maskEmails } from "../electron-app/browser/activity-log.mjs";
 import { isCredentialName } from "../electron-app/browser/debug-policy.mjs";
 import * as mainMod from "../electron-app/browser/text-redact.mjs";
+import { BROWSER_SETTING_COPY } from "../src/lib/browser-settings-copy";
 import * as serverMod from "../src/lib/server/browser/redact-text";
 import { REDACT_FRAGMENTS, REDACT_VECTORS } from "./helpers/browser-redact-vectors";
 import { FALSE_POSITIVE_CATEGORIES, REAL_CARD_GENERATORS, mulberry32, withLuhn } from "./helpers/browser-redact-fp-samples";
@@ -90,12 +91,16 @@ describe("R6-41 ①：邮箱规则要求完整域名，排除 retina 资源名 /
     expect(e?.summary).not.toContain("me@example.com");
     expect(e?.summary).toContain(H);
 
-    const src = nodeFs.readFileSync(new URL("../src/components/settings/browser-card.tsx", import.meta.url), "utf8");
-    const hint = src.match(/hint="(开启后，你在浏览器里的输入[^"]*)"/)?.[1] ?? "";
-    expect(hint, "设置页「记录输入内容」的说明文案不见了").not.toBe("");
-    expect(hint).toContain("仍会自动打码");
-    expect(hint).toContain("邮箱");
-    expect(hint).toContain("密码框的内容无论如何都不记录");
+    // 文案已抽成纯数据（hint 一句话 + detail 的 ⓘ 气泡）：披露两处合起来看，钉的是「事实还在不在」，不钉它在哪一格
+    const copy = BROWSER_SETTING_COPY.recordInput;
+    const text = `${copy.hint}${copy.detail}`;
+    expect(copy.hint, "设置页「记录输入内容」的说明文案不见了").not.toBe("");
+    expect(text).toContain("仍会自动打码");
+    expect(text).toContain("邮箱");
+    expect(text).toContain("密码框的内容无论如何都不记录");
+    // 卡片真的在用这份数据（不是一份没人读的死文案）
+    const card = nodeFs.readFileSync(new URL("../src/components/settings/browser-card.tsx", import.meta.url), "utf8");
+    expect(card).toContain("COPY.recordInput");
   });
 });
 
