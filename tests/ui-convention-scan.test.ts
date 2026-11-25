@@ -224,6 +224,12 @@ const FIXED_FILES = [
   "components/browser/chat-browser-split.tsx",
   "components/browser/browser-unavailable.tsx",
   "components/browser/browser-ask-watcher.tsx",
+  // 收藏（2026-11-25）：地址栏星标 + 收藏夹对话框 / 空白页快捷列表（新叶子组件；颜色只走 warning / destructive 等语义 token，hover 提示一律 Tooltip）
+  "components/browser/bookmark-star.tsx",
+  "components/browser/bookmarks-dialog.tsx",
+  // 地址栏记忆（2026-11-25）：地址栏输入框 + 联想下拉（新叶子组件 + ui/autocomplete 封装；颜色只走 warning 等语义 token，删除按钮带 aria-label、不用原生 title）
+  "components/browser/address-input.tsx",
+  "components/ui/autocomplete.tsx",
   "components/settings/browser-card.tsx",
   // 电脑操作设置节（新叶子组件；颜色只走 success / warning / destructive 语义 token）
   "components/settings/computer-use-card.tsx",

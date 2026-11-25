@@ -556,7 +556,7 @@ export interface FeAiFlowSettings {
   browserTrustLoopbackCerts?: boolean;
   /** 内置浏览器（契约 §15 A7）：允许 AI 读取网络请求 / 响应体（已走脱敏管线）。**默认开；显式 false 才关** */
   browserNetworkBodyRead?: boolean;
-  /** 内置浏览器（契约 §15）：注册「高级调试」工具组（network_rules / perf / sources / debug）。**默认开；显式 false 才关**；关闭立即生效（每次调用实时读设置，进行中的会话也立刻拒绝这组工具），开启只对新开始的会话生效（工具表是建会话时一次性建好的） */
+  /** 内置浏览器（契约 §15）：注册「高级调试」工具组（network_rules / perf / sources / debug）。**默认关；只认显式 true**；关闭立即生效（每次调用实时读设置，进行中的会话也立刻拒绝这组工具），开启只对新开始的会话生效（工具表是建会话时一次性建好的） */
   browserAdvancedTools?: boolean;
   /** 内置浏览器（契约 §15 C6）：单个任务同时打开的标签页上限，5–60，缺省 20 */
   browserMaxTabs?: number;

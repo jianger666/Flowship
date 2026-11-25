@@ -95,12 +95,12 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   // 内置浏览器：evaluate / 录输入值都默认关（只认显式 true）
   browserEvaluateEnabled: false,
   browserRecordInputValues: false,
-  // 内置浏览器增强包 E2（契约 §15）：登录态读写 / 页面权限默认关；本机证书放行 / 网络响应体读取 / 高级调试工具组默认开；标签上限 20
+  // 内置浏览器增强包 E2（契约 §15）：登录态读写 / 页面权限 / 高级调试工具组默认关；本机证书放行 / 网络响应体读取默认开；标签上限 20
   browserStorageAccess: false,
   browserPagePermissions: false,
   browserTrustLoopbackCerts: true,
   browserNetworkBodyRead: true,
-  browserAdvancedTools: true,
+  browserAdvancedTools: false,
   browserMaxTabs: 20,
   // 电脑操作：总开关与「锁屏时也能用」都默认关（只认显式 true）；开机密码不在 settings 里、只进系统钥匙串
   computerUse: false,
@@ -316,7 +316,7 @@ export const normalizeSettings = (
     browserPagePermissions: parsed.browserPagePermissions === true,
     browserTrustLoopbackCerts: parsed.browserTrustLoopbackCerts !== false,
     browserNetworkBodyRead: parsed.browserNetworkBodyRead !== false,
-    browserAdvancedTools: parsed.browserAdvancedTools !== false,
+    browserAdvancedTools: parsed.browserAdvancedTools === true,
     browserMaxTabs:
       typeof parsed.browserMaxTabs === "number" &&
       Number.isInteger(parsed.browserMaxTabs) &&

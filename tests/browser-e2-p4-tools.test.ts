@@ -37,7 +37,7 @@ const textOf = (r: FlowshipToolResult): string => r.content.map((c) => (c.type =
 const callsOf = (op: string) => fake!.calls.filter((c) => c.op === op);
 
 beforeEach(() => {
-  __resetBrowserSettingsForTest();
+  __resetBrowserSettingsForTest({ advancedTools: true }); // 高级调试组默认关，这组测试测的是「已打开」的行为
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "info").mockImplementation(() => {});
 });
@@ -52,8 +52,12 @@ const withBrowser = (handlers: Parameters<typeof installFakeBrowser>[0] = {}) =>
 };
 
 describe("browser_network_rules：注册与 schema", () => {
-  it("高级调试组默认注册；browserAdvancedTools=false 时整组不注册", () => {
+  it("高级调试组默认不注册；browserAdvancedTools=true 才整组注册，关掉后又不注册", () => {
     withBrowser();
+    expect(toolOf("browser_network_rules")).toBeDefined(); // beforeEach 已显式打开
+    __resetBrowserSettingsForTest();
+    expect(toolOf("browser_network_rules")).toBeUndefined(); // 缺省 = 关
+    __resetBrowserSettingsForTest({ advancedTools: true });
     expect(toolOf("browser_network_rules")).toBeDefined();
     __resetBrowserSettingsForTest({ advancedTools: false });
     expect(toolOf("browser_network_rules")).toBeUndefined();

@@ -69,6 +69,10 @@ const E2_METHODS: Record<string, ["send" | "invoke", string]> = {
 const R7_METHODS: Record<string, ["send" | "invoke", string]> = {
   serveLocalHtml: ["invoke", "browser:serveLocalHtml"],
 };
+/** 用户侧「新建无痕标签页」（面板「更多」菜单；实现在 electron-app/browser/index.mjs）：独立通道，不是 newTab 的参数——老壳忽略多出的参数会悄悄开出持久标签 */
+const INCOGNITO_METHODS: Record<string, ["send" | "invoke", string]> = {
+  newIncognitoTab: ["invoke", "browser:newIncognitoTab"],
+};
 /** V4 推送：onFound 的 payload 是单个对象 { taskId, activeMatchOrdinal, matches }；onFindRequested 的 payload 是 taskId */
 const V4_PUSH: Record<string, { channel: string; listener: string }> = {
   onFound: { channel: "browser:found", listener: "const listener = (_event, found) => callback(found);" },
@@ -131,7 +135,8 @@ describe("preload.cjs：window.__browser 方法与通道", () => {
     const preloadChannels = new Set([...bridgeBlock.matchAll(/"(browser:\w+)"/g)].map((m) => m[1]));
     const e2Channels = Object.values(E2_METHODS).map(([, c]) => c);
     const r7Channels = Object.values(R7_METHODS).map(([, c]) => c);
-    expect([...preloadChannels].sort()).toEqual([...docChannels, ...v4Channels, ...e2Channels, ...r7Channels].sort());
+    const incognitoChannels = Object.values(INCOGNITO_METHODS).map(([, c]) => c);
+    expect([...preloadChannels].sort()).toEqual([...docChannels, ...v4Channels, ...e2Channels, ...r7Channels, ...incognitoChannels].sort());
     expect(docChannels.size).toBe(Object.keys(METHODS).length + Object.keys(PUSH_METHODS).length);
     expect(v4Channels.length).toBe(10);
   });
@@ -209,6 +214,28 @@ describe("preload.cjs：R7 本地 HTML 通道", () => {
     const types = read("src/lib/browser-bridge-types.ts");
     expect(types).toMatch(/\bserveLocalHtml\?\(absPath: string\): Promise<ServeLocalHtmlResult>/);
     expect(types).toMatch(/ServeLocalHtmlResult =\s*\|?\s*\{ ok: true; url: string; scope: "dir" \| "file" \}\s*\|\s*\{ ok: false; error: string \}/);
+  });
+});
+
+describe("preload.cjs：用户侧无痕标签通道", () => {
+  for (const [name, [kind, channel]] of Object.entries(INCOGNITO_METHODS)) {
+    it(`${name}：ipcRenderer.${kind}("${channel}", taskId, url)，只转发 (taskId, url)`, () => {
+      const re = new RegExp(`\\b${name}:\\s*\\(taskId, url\\)\\s*=>\\s*ipcRenderer\\.(send|invoke)\\("(browser:\\w+)", taskId, url\\)`);
+      const m = re.exec(bridgeBlock);
+      expect(m, `${name} 应是单行 arrow 直接转发 (taskId, url)`).not.toBeNull();
+      expect(m![1]).toBe(kind);
+      expect(m![2]).toBe(channel);
+    });
+  }
+
+  it("不是 newTab 的参数：newTab 仍只转发 (taskId, url)，不带「无痕」开关（老壳会静默忽略多出的参数、悄悄开出持久标签）", () => {
+    expect(bridgeBlock).toMatch(/\bnewTab:\s*\(taskId, url\)\s*=>\s*ipcRenderer\.invoke\("browser:newTab", taskId, url\)/);
+  });
+
+  it("window.__browser 的类型声明里有 newIncognitoTab（可选方法：老壳没有时 UI 不画入口）+ 结果类型", () => {
+    const types = read("src/lib/browser-bridge-types.ts");
+    expect(types).toMatch(/\bnewIncognitoTab\?\(taskId: string, url\?: string\): Promise<NewIncognitoTabResult>/);
+    expect(types).toMatch(/NewIncognitoTabResult = \{ ok: true; tabId: string \} \| \{ ok: false; error: string \}/);
   });
 });
 

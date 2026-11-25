@@ -386,7 +386,7 @@ describe("R1-33.3：browser_network include_body 的字符串 \"false\" / \"0\" 
 describe("R1-34：常驻浏览器工具的 description + schema 体量预算", () => {
   it("体量预算：R1 的 26 个工具总量 ≤ 13700、E2 新增工具总量 ≤ 9800、单个工具 ≤ 1900（name + description + parameters 字符数）", () => {
     withBrowser();
-    __resetBrowserSettingsForTest({ evaluateEnabled: true });
+    __resetBrowserSettingsForTest({ evaluateEnabled: true, advancedTools: true }); // 高级调试组默认关；预算按「全部打开」的最坏情况守
     const all = getBrowserTools({ taskId: TASK });
     const sizeOf = (t: FlowshipToolDef): number => t.name.length + t.description.length + JSON.stringify(t.parameters).length;
     // 预算演进（每次调整都要在这里写清楚理由，别让它无声膨胀）：
@@ -399,7 +399,7 @@ describe("R1-34：常驻浏览器工具的 description + schema 体量预算", (
     //   permissions 等的描述后来陆续加了说明，当初注释里的 9369 早已过时；再往 E2 工具里加描述很快会撞上限，撞到时先问「这句话值不值得每轮 prompt 都带」，别直接抬预算）、
     //   最大单个 browser_emulate 1848（余量 52 字符）。
     // - 描述仍是 ≤ 2 句（browser-tools.test.ts 守卫）；高级组（browser_network_rules / perf / sources / debug / record）受 browserAdvancedTools 开关控制，
-    //   关掉后每轮 prompt 少约 6.6k 字符（第二十四轮实测 6594，同口径；早先记的 6447 已过时）。
+    //   **默认关**（2026-11-25 起）：打开后每轮 prompt 多约 6.6k 字符（第二十四轮实测 6594，同口径）。这条预算按「全部打开」的最坏情况守；默认状态另有一条钉子（见下一条）。
     const r1 = all.filter((t) => BROWSER_TOOL_NAMES.includes(t.name));
     const e2 = all.filter((t) => !BROWSER_TOOL_NAMES.includes(t.name));
     const r1Total = r1.reduce((n, t) => n + sizeOf(t), 0);
@@ -409,6 +409,22 @@ describe("R1-34：常驻浏览器工具的 description + schema 体量预算", (
     expect(r1Total, `R1 26 个工具总体量 ${r1Total}`).toBeLessThanOrEqual(13700);
     expect(e2Total, `E2 新增工具总体量 ${e2Total}`).toBeLessThanOrEqual(9800);
     for (const t of all) expect(sizeOf(t), `${t.name} 体量`).toBeLessThanOrEqual(1900);
+  });
+
+  it("默认（高级调试组关）：E2 只挂 4 个 core 工具，比全开少 6k 字符以上——别让高级组悄悄回到默认开", () => {
+    withBrowser();
+    __resetBrowserSettingsForTest({ evaluateEnabled: true });
+    const dflt = getBrowserTools({ taskId: TASK });
+    expect(
+      dflt
+        .filter((t) => !BROWSER_TOOL_NAMES.includes(t.name))
+        .map((t) => t.name)
+        .sort(),
+    ).toEqual(["browser_clipboard", "browser_permissions", "browser_storage", "browser_touch"]);
+    __resetBrowserSettingsForTest({ evaluateEnabled: true, advancedTools: true });
+    const full = getBrowserTools({ taskId: TASK });
+    const total = (ts: FlowshipToolDef[]): number => ts.reduce((n, t) => n + t.name.length + t.description.length + JSON.stringify(t.parameters).length, 0);
+    expect(total(full) - total(dflt), "高级组体量").toBeGreaterThan(6000);
   });
 
   it("精简没丢关键信息：emulate 预设名齐全；mouse 讲了坐标系与越界；fill_form 指向 ask_user_to_act；wait_for 讲了网络空闲的坑；network 讲了开关要求", () => {

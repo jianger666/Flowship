@@ -97,7 +97,7 @@ describe("getBrowserTools：注册条件", () => {
 
   it("描述精炼（≤2 句）；参数 schema 是 object；浏览器工具不在非属主放行白名单里", () => {
     withBrowser();
-    __resetBrowserSettingsForTest({ evaluateEnabled: true });
+    __resetBrowserSettingsForTest({ evaluateEnabled: true, advancedTools: true }); // 高级调试组默认关；描述守卫要继续覆盖高级组
     for (const t of getBrowserTools({ taskId: TASK })) {
       const sentences = t.description.split("。").filter((s) => s.trim()).length;
       expect(sentences, `${t.name} 描述过长`).toBeLessThanOrEqual(2);

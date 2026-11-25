@@ -35,7 +35,7 @@
 
 frontmatter 没用户价值、占视觉、维护成本高。所有 action 同款。
 
-## 3. path 完整路径写法（V0.5.7.6 起加严、V0.6 沿用、所有涉及文件位置的字段都遵守）
+## 3. path 完整路径写法（所有涉及文件位置的字段都遵守）
 
 > 下面示例用前端 Vue 仓举例（`.vue` / `.js`）、**规则与语言无关**——Java 仓换 `.java` / `.xml`、Go 换 `.go` 同理：路径都从 cwd 起算、写完整、带行号。
 
@@ -46,7 +46,7 @@ artifact 里任何**文件位置引用**（task 改动 / 关键参考 / 实施�
 3. **不知道行号就只写文件路径**——不要瞎编行号
 4. **同一文件多次出现都写完整路径**——build / review agent 按行匹配、basename 简写(如 `selList.vue`)和裸冒号续接(如 `:414-503` 这种没前缀的)都让它找不到、只能 grep 浪费 token。一个文件同一行内列多段、每段都补完整 path、不要省
 5. **不要写绝对路径**（`~/Documents/...` / `/Users/foo/...`）——agent 在 `{{repoPath}}` 下跑、绝对路径换台机器就失效。**例外：向用户展示 / 交付的本机文件**（图片 / 音视频 / 文档 / 网页等产物，用户要在对话里点开预览的那种）按下文「本地文件展示」一节的写法：每个文件一个行内代码、写完整绝对路径（不要只写文件名、不要 `~/` 开头）。这个例外**只管给用户看的产物文件**，上面 1–4 条的仓库代码引用写法不变
-6. **严禁「同上 / 同前 / ↑ / 上同 / ditto」类省略词**（V0.6.0.1 加、用户实测踩过）——表格里多条 row 引用同一文件、每条都把完整 path 写全；agent 自我感觉「读起来重复」是 OK 的、用户拿这些 path 是为了点击跳转、省略词等于让 row 失去 affordance。表格列空间不够也不准缩水成「同上」、要么换段落形式、要么把同一文件的多个引用合并到一行（用顿号分隔多个 `path:line`）
+6. **严禁「同上 / 同前 / ↑ / 上同 / ditto」类省略词**（用户实测踩过）——表格里多条 row 引用同一文件、每条都把完整 path 写全；agent 自我感觉「读起来重复」是 OK 的、用户拿这些 path 是为了点击跳转、省略词等于让 row 失去 affordance。表格列空间不够也不准缩水成「同上」、要么换段落形式、要么把同一文件的多个引用合并到一行（用顿号分隔多个 `path:line`）
 
 > **多仓场景**：`{{repoPath}}` 是公共父目录（不是 git 仓库自身）、相对路径**首段必须是子仓目录名**（例 `projA/apps/foo/bar.vue`、不是直接 `apps/foo/bar.vue`）；详见 super-prompt 顶部「任务输入」段列出的子仓名清单。
 > ⚠️ 本节下方正例都是**单仓视角**形态（`apps/...` 起手）——多仓 task 写路径时**不要照抄这个形态**、每条前面都要补仓名（2026-06-12 实测踩过：ship artifact 写 `apps/cp-class-advisor-center/...` 漏了 `tch-service-center/` 前缀、用户点击跳转报「路径不存在」）。
@@ -55,11 +55,11 @@ artifact 里任何**文件位置引用**（task 改动 / 关键参考 / 实施�
 ```
 ❌ plan「改动」：BackLog.vue、home.vue                                            ← 没目录前缀
 ❌ plan「关键参考」：promoteExpireReason.js（formatPromoteExpireReasonDisplay）    ← 没目录前缀
-❌ build「修改记录·改动文件」：studentFollow.vue、lookStudentInformation.vue       ← V0.5.7.7 hot-fix 实测、用户截图反馈
+❌ build「修改记录·改动文件」：studentFollow.vue、lookStudentInformation.vue       ← 实测、用户截图反馈
 ❌ build「修改记录·改动文件」：promoteExpireReason.js（formatPromoteExpireReasonDisplay） ← 没目录前缀
-❌ review「实施位置」：recordModal.vue:2189-2225                                    ← V0.5.7.6 实测、纯文件名识别不出
+❌ review「实施位置」：recordModal.vue:2189-2225                                    ← 实测、纯文件名识别不出
 ❌ plan「改动」：TaskInfo.vue:75-100、`:414-503`、`:540-760`                       ← 后两段裸冒号、前端识别不出是路径、点不开
-❌ review 表格备注：「同上：90」/「同上：244-248」/「↑ 同前」                       ← V0.6.0.1 实测、表格 row 用「同上」指代上一行的文件名、用户没法点击跳转
+❌ review 表格备注：「同上：90」/「同上：244-248」/「↑ 同前」                       ← 实测、表格 row 用「同上」指代上一行的文件名、用户没法点击跳转
 ❌ 多仓 ship「已知风险」：apps/cp-class-advisor-center/src/views/schedule/classList.vue ← 2026-06-12 实测、多仓 task 漏仓名前缀、cursor 链接拼到公共父目录下、点击报「路径不存在」
 ```
 
@@ -135,15 +135,14 @@ artifact 全文用**中文**——除非引用代码 / 接口路径 / 文件路�
 
 - **task / 文件计数自检**：如果有汇总（「本 plan 涉及 Y 个 task、动 X 个文件」），写完后回头数一遍 task 列表 + 文件去重、确保数字对得上
 - **业务名词全称**：表格 / 正文里的 task 名 / 业务对象写全称、不要图省事简写到 2 字（如「学情 / 关单」要写「补升学情反馈 / 补升冲刺关单」）
-- **不要凭空编命令 / 端口**：artifact 里出现某条 shell 命令 / 端口 / URL 时、先用 `read` 拿 `{{repoPath}}/package.json`（**多仓时读对应子仓 `{{repoPath}}/<repo>/package.json`**）的 `scripts` / `README.md` / `.env.example` 拿真值；读不到写「<按团队 README 启动>」占位、严禁猜（V0.5.7.6 实测：AI 把端口 `8080` 脑补成 `8877`）
+- **不要凭空编命令 / 端口**：artifact 里出现某条 shell 命令 / 端口 / URL 时、先用 `read` 拿 `{{repoPath}}/package.json`（**多仓时读对应子仓 `{{repoPath}}/<repo>/package.json`**）的 `scripts` / `README.md` / `.env.example` 拿真值；读不到写「<按团队 README 启动>」占位、严禁猜（实测：AI 把端口 `8080` 脑补成 `8877`）
 
-## 8. 跨 action 约束（V0.6 新增）
+## 8. 跨 action 约束
 
-- **不要回头改上一个 action 的 artifact**——上游 artifact 已经 ack、属于历史档案、`read` 可以、`write` / `edit` 禁。**唯一例外**：review action 内部「用户在 ask_user 里拍板后、edit 最新 plan 的对应段、**原文不动**、在被改章节末尾追加 `> ⚠️ review #N 补录：…` blockquote 留痕」（V0.5.12 起的 review 闭环规则、V0.6 沿用、格式与写入范围以 action-review.md §6 为准、不用删除线）
-- **不要在本轮里自己跑下一个 action**——下一个 action 只在收到 [NEXT_ACTION ...] 信号后才跑（用户在 UI 推进，或你用 `advance_next` 登记、由系统在本轮结束后代推进，见 super-prompt）
+- **不要回头改上一个 action 的 artifact**——上游 artifact 已经 ack、属于历史档案、`read` 可以、`write` / `edit` 禁。**唯一例外**：review action 内部「用户在 ask_user 里拍板后、edit 最新 plan 的对应段、**原文不动**、在被改章节末尾追加 `> ⚠️ review #N 补录：…` blockquote 留痕」（review 闭环规则、格式与写入范围以 action-review.md §6 为准、不用删除线）
 - **默认每个 action 是新 agent**——上一轮脑子里的 PRD / 方案不在本轮上下文里。跨 action 接力只靠 `read` 历史 artifact（路径见 super-prompt 顶部「Artifact 文件路径」段；包括 chat 写过的临时结论）。不要假设还在同一条 SDK Run 里、也不要因为「刚才读过 contextDocs」就跳过重读 artifact
 
-## 9. shell 命令安全（V0.6.8、所有跑 shell 的 action 必守）
+## 9. shell 命令安全（所有跑 shell 的 action 必守）
 
 ⛔ **三类命令一律不跑**（跑了会改坏用户仓库 / 卡死 Run / 留杀不掉的后台进程）：
 

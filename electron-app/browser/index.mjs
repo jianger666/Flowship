@@ -12,6 +12,7 @@ import path from "node:path";
 
 import { createActivityLog } from "./activity-log.mjs";
 import * as actions from "./actions.mjs";
+import { collectClearTargets, haltTabsForClear, resumeTabsAfterClear } from "./clear-data.mjs";
 import { assertEvaluateNotUserControlled, ensureEvaluateApproval, revokeEvaluateApproval, runApprovedEvaluate } from "./evaluate-approval.mjs";
 import { debugPauseGate } from "./ops/debug.mjs";
 import { createIncognitoManager, INCOGNITO_PARTITION_RE, isIncognitoPartition, wipeIncognitoSession } from "./incognito.mjs";
@@ -1542,7 +1543,9 @@ export const createBrowserManager = (deps) => {
     // 经 tab.loadUrlByUser：同样登记「浏览器发起」令牌（R1-10 复审：用户在地址栏粘贴附件直链也不能被当成页面偷偷下载拦掉）
     tab.loadUrlByUser(r.url).catch(() => {});
     void session;
-    return { ok: true };
+    // url / kind：把「实际去的地址」与「是网址还是搜索词」告诉渲染侧——地址栏记忆只记用户敲的网址（kind === "url"），不记搜索词；
+    // 也不能让渲染侧自己再解析一遍（补协议、搜索回退的规则只有 resolveUserInput 一份）
+    return { ok: true, url: r.url, kind: r.kind };
   };
 
   const registerIpc = () => {
@@ -1659,6 +1662,32 @@ export const createBrowserManager = (deps) => {
       return tab.id;
     });
 
+    // 用户侧「新建无痕标签页」（面板「更多」菜单）。AI 侧早有 browser_tabs new incognito:true，用户这头此前没有入口。
+    // 独立通道而不是给 newTab 加第三个参数：老壳会静默忽略多出来的参数、悄悄开成**持久**标签——用户以为是无痕，登录态却写进了持久档案；
+    // 独立通道在老壳上根本不存在，渲染侧据 `typeof bridge.newIncognitoTab === "function"` 直接不画入口。
+    // 会话不存在也能建（和 newTab 一样懒创建会话、不额外开空白初始标签）。预期内的失败（地址被策略拒绝 / 标签页已达上限 / 浏览器已关闭）
+    // 都以 { ok:false, error } 返回给 toast 用，不 reject。
+    handle("browser:newIncognitoTab", async (taskId, url) => {
+      if (!validTaskId(taskId)) return { ok: false, error: "无效的任务" };
+      let target = null;
+      if (typeof url === "string" && url.trim() !== "") {
+        const verdict = resolveUserInput(url, { isAppUrl: deps.isAppUrl });
+        if (!verdict.ok) return { ok: false, error: verdict.reason };
+        target = verdict.url;
+      }
+      try {
+        const session = ensureSession(taskId, { initialTab: false });
+        const tab = await session.openTab({ activate: true, incognito: true });
+        if (target) void tab.ready.then(() => tab.loadUrlByUser(target)).catch(() => {});
+        return { ok: true, tabId: tab.id };
+      } catch (err) {
+        log(`[browser] 新建无痕标签页失败：${err?.message || err}`);
+        // 错误文案是写给 AI 的（「…（browser_tabs close）」）：用户面前去掉工具名
+        const message = err instanceof BrowserError ? err.message.replace(/（browser_tabs close）/g, "") : "";
+        return { ok: false, error: message || "无法新建无痕标签页" };
+      }
+    });
+
     // R7：本地 HTML → 一次性 token 的 loopback URL。只接绝对路径字符串；真正的范围 / 敏感文件 / 大小校验都在 local-html-server（open + 每个请求）。
     // 返回 { ok, url, scope } | { ok:false, error }；永不抛（渲染侧据 ok 回退到系统打开）
     handle("browser:serveLocalHtml", async (absPath) => {
@@ -1724,8 +1753,9 @@ export const createBrowserManager = (deps) => {
       return fn(s, ...args);
     });
 
-    handle("browser:clearBrowsingData", async () => {
-      // 只清持久档案（E2·A6）：无痕标签的内存 partition 各自在 tab 关闭时清空，这里不碰（也不该：它们的登录态是 AI 刚建立的、用户没要求清）
+    const clearBrowsingData = async () => {
+      // 只清持久档案（E2·A6）：无痕标签的内存 partition 各自在最后一个用它的 tab 关闭时清空，这里不碰。
+      // 也不该碰：无痕的语义就是「关了才清」，而「清除登录数据」要先终止再重载在用的标签（见 clear-data.mjs），对用户正在用的私密页是破坏性的；确认框文案已写明无痕标签页不受影响。
       const ses = deps.session.fromPartition(BROWSER_PARTITION);
       // R6-42：三个 Electron 清除调用**逐步隔离**——任何一个抛错都不能跳过后面的「例外表清除 + 断连」（以前 `clearAuthCache` 抛错会直接冒出去，
       // 用户点了「清除」，已放行的坏证书连接却还在、下个任务同主机既不询问也没有标注）。第一个错误记下来，全部做完后再抛（渲染进程仍能看到「清除失败」）。
@@ -1738,28 +1768,46 @@ export const createBrowserManager = (deps) => {
           log(`[browser] 清除浏览数据：${what} 失败（其余步骤照常进行）：${err?.message || err}`);
         }
       };
-      await attempt("clearStorageData", () =>
-        ses.clearStorageData({
-          storages: ["cookies", "localstorage", "indexdb", "serviceworkers", "cachestorage", "filesystem", "websql"],
-        }),
-      );
-      await attempt("clearCache", () => ses.clearCache?.());
-      await attempt("clearAuthCache", () => ses.clearAuthCache?.());
-      // E2·P1：页面权限的授予 / 冷却、证书例外是「会话内存里的浏览数据」，跟着一起清（各模块在自己的 ext 里实现 onBrowsingDataCleared）。
-      // R6-22：传入 partition——清除只作用于持久档案，无痕标签的例外 / 授予不受影响
-      for (const s of sessions.values()) {
-        for (const v of s.ext?.values?.() ?? []) {
-          try {
-            v?.onBrowsingDataCleared?.(BROWSER_PARTITION);
-          } catch (err) {
-            log(`[browser] 清除浏览数据的扩展回调出错（已忽略）：${err?.message || err}`);
+      // 先让已打开的页面停下来（clear-data.mjs 文件头有真机探针实测）：页面里的内存 token + 心跳会在清除后 1～2 秒内把登录 cookie / localStorage 写回并落盘，
+      // 「清除了但刷新还是登录状态」就是这么来的。终止 → 清除 → 恢复；无痕 / 空白页 / 非 http(s) 的标签不碰。
+      const halted = await haltTabsForClear(collectClearTargets(sessions.values(), { isAppUrl: deps.isAppUrl }), { log });
+      let reloadedTabs = 0;
+      try {
+        await attempt("clearStorageData", () =>
+          ses.clearStorageData({
+            storages: ["cookies", "localstorage", "indexdb", "serviceworkers", "cachestorage", "filesystem", "websql"],
+          }),
+        );
+        await attempt("clearCache", () => ses.clearCache?.());
+        await attempt("clearAuthCache", () => ses.clearAuthCache?.());
+        // E2·P1：页面权限的授予 / 冷却、证书例外是「会话内存里的浏览数据」，跟着一起清（各模块在自己的 ext 里实现 onBrowsingDataCleared）。
+        // R6-22：传入 partition——清除只作用于持久档案，无痕标签的例外 / 授予不受影响
+        for (const s of sessions.values()) {
+          for (const v of s.ext?.values?.() ?? []) {
+            try {
+              v?.onBrowsingDataCleared?.(BROWSER_PARTITION);
+            } catch (err) {
+              log(`[browser] 清除浏览数据的扩展回调出错（已忽略）：${err?.message || err}`);
+            }
           }
         }
+        // R6-10：用户放行过坏证书的连接会被 Chromium 复用（不再触发 certificate-error）——清了例外表却不断连接，下个任务同主机既不询问也没有标注。
+        // 放在例外表清空**之后**：先清表再断连，断连后的重连一定走「询问」。防御式（fake session 没有此方法就跳过）、吞错记日志：断连失败不应让「清除」整体报错
+        await closeConnectionsSafe(ses, log, "清除浏览数据");
+      } finally {
+        // 放进 finally：清除失败也要把用户的页面还回去，不能让标签停在空白页
+        reloadedTabs = resumeTabsAfterClear(halted, { log, isAppUrl: deps.isAppUrl });
       }
-      // R6-10：用户放行过坏证书的连接会被 Chromium 复用（不再触发 certificate-error）——清了例外表却不断连接，下个任务同主机既不询问也没有标注。
-      // 放在例外表清空**之后**：先清表再断连，断连后的重连一定走「询问」。防御式（fake session 没有此方法就跳过）、吞错记日志：断连失败不应让「清除」整体报错
-      await closeConnectionsSafe(ses, log, "清除浏览数据");
       if (failures.length > 0) throw failures[0];
+      return { reloadedTabs };
+    };
+    // 一次只跑一个：面板菜单与设置页都有入口，并发的两轮「终止 → 清除 → 恢复」会互相踩（后来者直接复用进行中的这一轮）
+    let clearing = null;
+    handle("browser:clearBrowsingData", () => {
+      clearing ??= clearBrowsingData().finally(() => {
+        clearing = null;
+      });
+      return clearing;
     });
 
     // V4 用户侧（契约 §14.3）：缩放 / 查找 / DevTools / 下载 reveal-open / 对话框与模拟转调，都在 user-features.mjs 里自己注册并过闸

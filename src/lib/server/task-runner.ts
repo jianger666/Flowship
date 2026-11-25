@@ -4035,6 +4035,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               gitlabAccessSection,
               buildLarkCliAuthMissingRule(),
               companyEnvBriefSection,
+              undefined, // budget：用默认
+              // Cursor 后端才带「账号级 User Rules 忽略声明」+「项目规则（必读）」；pi / 自定义后端不带（见 buildSuperPromptWithBudget）
+              isCursorProvider(createdProviderId),
             );
             const superPrompt = superPromptBuilt.prompt;
             await failpoint("start.afterPrompt");

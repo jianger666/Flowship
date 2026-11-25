@@ -3288,12 +3288,23 @@ describe("BrowserTab：截图与设备模拟 / 视图矩形互斥（并发截图
       if (!fatalClean.has(f)) bad.push(`${f}：第二十一轮新增的脚本，FATAL 出口必须在 exit 之前清理（不能登记进 FATAL_NO_CLEANUP_ALLOWLIST）`);
       if (f in FATAL_NO_CLEANUP_ALLOWLIST) bad.push(`${f}：不能在 FATAL_NO_CLEANUP_ALLOWLIST 里`);
     }
+    // 2026-11-25：clear-login-data（「清除登录数据」）/ user-incognito-tab（用户侧「新建无痕标签页」）/ history-signals（地址栏记忆依赖的主进程信号）三个真机 e2e 的两条退出路径（正常收尾 / 脚本抛错）
+    // 共用 cleanupTmp（先销毁剩余窗口、再清 TMP），新脚本从一开始就不进白名单
+    for (const f of ["clear-login-data.cjs", "user-incognito-tab.cjs", "history-signals.cjs"]) {
+      // 同 R22-5：新文件漏 `git add` 时本机目录里仍有、这条不会红，只有干净检出才红——先报「文件不存在」，别让首条报错变成「FATAL 出口必须清理」
+      if (!files.includes(f)) {
+        bad.push(`${f}：脚本文件不存在（新文件要手动 git add，漏 add 的干净检出会在这里红）`);
+        continue;
+      }
+      if (!fatalClean.has(f)) bad.push(`${f}：2026-11-25 新增的脚本，FATAL 出口必须在 exit 之前清理（不能登记进 FATAL_NO_CLEANUP_ALLOWLIST）`);
+      if (f in FATAL_NO_CLEANUP_ALLOWLIST) bad.push(`${f}：不能在 FATAL_NO_CLEANUP_ALLOWLIST 里`);
+    }
     expect(bad).toEqual([]);
     // 精确对账（第十六轮评审 P3-B3：此前 `>= 30` 容忍丢 4 处）。新增 / 删除脚本或清理点要同步改这几个数；匹配写坏了也会在这里红，而不是「没扫到 = 没问题」
-    expect(sites, "e2e 脚本里 fs.rmSync( 的调用点总数（r7-local-html 有 2 处：TMP + 两个小文件的循环；r14-mock-fulfill-probe 的 cleanupTmp 只有 1 处定义、3 处调用（两个正常收尾 + FATAL）；第十八轮 B5 新增 bg-override-reattach 1 处；第十八轮 R-1 给 12 个脚本加 FATAL 清理走各自的 cleanupTmp、没有新增站点；第二十一轮新增 r21-mic-prompt 1 处，在 cleanupAll 里）").toBe(49);
-    expect(withSites.size, "含 fs.rmSync( 的脚本数").toBe(48);
-    expect(mkdtempUsers.size, "用 mkdtempSync 的脚本数（都在上面的清理名单里）").toBe(48);
-    expect(fatalClean.size, "FATAL 出口会在 exit 之前清理的脚本数 = R-1 的 12 个 + capture-emulation-race + bg-override-reattach + r7-local-html（R20-19）+ r21-mic-prompt（第二十一轮，三条退出路径共用 cleanupAll）（其余 32 个登记在 FATAL_NO_CLEANUP_ALLOWLIST）").toBe(16);
+    expect(sites, "e2e 脚本里 fs.rmSync( 的调用点总数（r7-local-html 有 2 处：TMP + 两个小文件的循环；r14-mock-fulfill-probe 的 cleanupTmp 只有 1 处定义、3 处调用（两个正常收尾 + FATAL）；第十八轮 B5 新增 bg-override-reattach 1 处；第十八轮 R-1 给 12 个脚本加 FATAL 清理走各自的 cleanupTmp、没有新增站点；第二十一轮新增 r21-mic-prompt 1 处，在 cleanupAll 里；2026-11-25 新增 clear-login-data / user-incognito-tab / history-signals 各 1 处，在各自的 cleanupTmp 里）").toBe(52);
+    expect(withSites.size, "含 fs.rmSync( 的脚本数").toBe(51);
+    expect(mkdtempUsers.size, "用 mkdtempSync 的脚本数（都在上面的清理名单里）").toBe(51);
+    expect(fatalClean.size, "FATAL 出口会在 exit 之前清理的脚本数 = R-1 的 12 个 + capture-emulation-race + bg-override-reattach + r7-local-html（R20-19）+ r21-mic-prompt（第二十一轮，三条退出路径共用 cleanupAll）+ clear-login-data + user-incognito-tab + history-signals（2026-11-25，正常收尾 / 抛错两条出口共用 cleanupTmp）（其余 32 个登记在 FATAL_NO_CLEANUP_ALLOWLIST）").toBe(19);
     expect(Object.keys(FATAL_NO_CLEANUP_ALLOWLIST).length + fatalClean.size, "FATAL 白名单 + 会清的 = 全部建临时目录的脚本").toBe(mkdtempUsers.size);
     // R-1 的两处不在 `.catch` 里的提前失败出口，机器认不全，单独钉：manager-pick 的「找不到 view」早退、page-scripts 的 watchdog 超时——都要先清再 exit，退出码不变
     const mgrPick = readSource("scripts/browser-e2e/manager-pick-e2e.cjs");

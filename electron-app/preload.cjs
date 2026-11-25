@@ -170,6 +170,12 @@ contextBridge.exposeInMainWorld("__browser", {
   stop: (taskId) => ipcRenderer.send("browser:stop", taskId),
   /** @returns {Promise<string|null>} 新 tab 的 id */
   newTab: (taskId, url) => ipcRenderer.invoke("browser:newTab", taskId, url),
+  /**
+   * 用户侧「新建无痕标签页」（独立内存档案：不带持久登录态，关标签即清空）。独立方法而不是 newTab 的参数：老壳没有它时 UI 直接不画入口，
+   * 不会退化成悄悄开一个持久标签。
+   * @returns {Promise<{ ok: true, tabId: string } | { ok: false, error: string }>}
+   */
+  newIncognitoTab: (taskId, url) => ipcRenderer.invoke("browser:newIncognitoTab", taskId, url),
   selectTab: (taskId, tabId) => ipcRenderer.send("browser:selectTab", taskId, tabId),
   closeTab: (taskId, tabId) => ipcRenderer.send("browser:closeTab", taskId, tabId),
   // —— 谁在操作 ——

@@ -201,7 +201,7 @@ const FIELD_EQ_KIND = {
   browserPagePermissions: "boolFalse",
   browserTrustLoopbackCerts: "boolTrue",
   browserNetworkBodyRead: "boolTrue",
-  browserAdvancedTools: "boolTrue",
+  browserAdvancedTools: "boolFalse",
   browserMaxTabs: "numberOr20",
   computerUse: "boolFalse",
   computerUseLockedAccess: "boolFalse",

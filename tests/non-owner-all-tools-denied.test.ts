@@ -44,7 +44,7 @@ describe("非属主轮：全部系统工具硬拒（只给 ctx.taskId）", () =>
     expect(leaked).toEqual([]);
   });
   it("R1-33：枚举真实的 getBrowserTools（flowShipTools 常量里没有它们，按会话追加）：每个浏览器工具（含 evaluate）在非属主轮都 [DENIED] 且 handler / 主进程都没被碰", async () => {
-    __resetBrowserSettingsForTest({ evaluateEnabled: true });
+    __resetBrowserSettingsForTest({ evaluateEnabled: true, advancedTools: true }); // 高级调试组默认关；这里要枚举到全部浏览器工具（含高级组 5 个）
     const fake = installFakeBrowser({ status: () => ({ exists: true, pendingCount: 0 }) });
     try {
       const browserTools = getBrowserTools({ taskId: "tX", readOnly: false });
@@ -110,7 +110,7 @@ describe("R2-15 ①：非属主轮——遍历两条后端的真实注册产物"
   });
   afterEach(() => vi.restoreAllMocks());
   const setup = () => {
-    __resetBrowserSettingsForTest({ evaluateEnabled: true });
+    __resetBrowserSettingsForTest({ evaluateEnabled: true, advancedTools: true }); // 高级调试组默认关；遍历两条后端的真实注册产物要含高级组
     return installFakeBrowser({ status: () => ({ exists: true, pendingCount: 0 }) });
   };
   type Exec = (...a: unknown[]) => Promise<unknown>;

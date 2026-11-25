@@ -160,7 +160,7 @@ describe("R1-20：摘要读取的参数名与 tools.ts 的 schema 逐个对齐�
     const { installFakeBrowser } = await import("./helpers/browser-bridge-fake");
     const { getBrowserTools } = await import("@/lib/server/browser/tools");
     const { __resetBrowserSettingsForTest } = await import("@/lib/server/browser/settings");
-    __resetBrowserSettingsForTest({ evaluateEnabled: true });
+    __resetBrowserSettingsForTest({ evaluateEnabled: true, advancedTools: true }); // 高级调试组默认关；展示读的参数名要和「全部工具」的 schema 对账
     const fake = installFakeBrowser({});
     try {
       const schemaNames = new Set<string>();

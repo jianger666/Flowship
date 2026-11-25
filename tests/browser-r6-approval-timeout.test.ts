@@ -38,7 +38,7 @@ const tool = (name: string): FlowshipToolDef => {
 const call = (name: string, args: Record<string, unknown>) => tool(name).handler(args, "caller-token", { taskId: TASK });
 
 beforeEach(() => {
-  __resetBrowserSettingsForTest();
+  __resetBrowserSettingsForTest({ advancedTools: true }); // 高级调试组默认关；这组测的 perf / network_rules / debug 都在高级组里，需显式打开
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "info").mockImplementation(() => {});
 });
@@ -64,7 +64,7 @@ const withBrowser = (handlers: Record<string, (a: Record<string, unknown>) => un
   const timeouts = (op: string): Array<number | undefined> => spy.mock.calls.filter((c) => c[1] === op).map((c) => (c[3] as { timeoutMs?: number } | undefined)?.timeoutMs);
   return { spy, timeouts };
 };
-const gate = (on: boolean) => __resetBrowserSettingsForTest({ evaluateEnabled: on });
+const gate = (on: boolean) => __resetBrowserSettingsForTest({ evaluateEnabled: on, advancedTools: true });
 
 describe("R6-33·常量对账（防漂移）", () => {
   it("server 的审批等待 = 主进程 evaluate 审批卡的等待上限（120s），且比 bridge 默认超时长——这正是本条要修的缺口", () => {

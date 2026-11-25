@@ -22,8 +22,8 @@ export const BROWSER_RECORD_INPUT_SETTING_KEY = "browserRecordInputValues";
 
 /**
  * 增强包 E2（契约 §15）新增的 6 项：
- *  - 「放开」型（默认关，只认显式 true）：storageAccess（A1）/ pagePermissions（A8）
- *  - 「收紧」型（默认开，只认显式 false 才关）：trustLoopbackCerts（A4）/ networkBodyRead（A7）/ advancedTools（高级调试工具组）
+ *  - 「放开」型（默认关，只认显式 true）：storageAccess（A1）/ pagePermissions（A8）/ advancedTools（高级调试工具组：整组工具说明常驻 prompt 约 6.4k 字符，不用就不挂）
+ *  - 「收紧」型（默认开，只认显式 false 才关）：trustLoopbackCerts（A4）/ networkBodyRead（A7）
  *  - maxTabs（C6）：5–60 的整数，缺省 / 坏值 20
  */
 export const BROWSER_MAX_TABS_DEFAULT = 20;
@@ -60,7 +60,7 @@ export const BROWSER_SETTINGS_DEFAULTS: Readonly<BrowserSettings> = {
   pagePermissions: false,
   trustLoopbackCerts: true,
   networkBodyRead: true,
-  advancedTools: true,
+  advancedTools: false,
   maxTabs: BROWSER_MAX_TABS_DEFAULT,
   desktopEnabled: false,
   desktopLockedAccess: false,
@@ -81,7 +81,7 @@ export const parseBrowserSettings = (
   pagePermissions: raw?.browserPagePermissions === true,
   trustLoopbackCerts: raw?.browserTrustLoopbackCerts !== false,
   networkBodyRead: raw?.browserNetworkBodyRead !== false,
-  advancedTools: raw?.browserAdvancedTools !== false,
+  advancedTools: raw?.browserAdvancedTools === true,
   maxTabs: normalizeBrowserMaxTabs(raw?.browserMaxTabs),
   desktopEnabled: raw?.[DESKTOP_ENABLED_SETTING_KEY] === true,
   desktopLockedAccess: raw?.[DESKTOP_LOCKED_ACCESS_SETTING_KEY] === true,

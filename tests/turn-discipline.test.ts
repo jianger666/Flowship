@@ -1,5 +1,5 @@
 /**
- * 回合纪律 prompt 片段：chat / task 对 ask_user 措辞一致性
+ * 回合纪律 prompt 片段：chat 起手段 + 共享句子行（wait / schedule 的 task 侧靠 _super.md 段对账）
  */
 import { describe, expect, it } from "vitest";
 
@@ -11,7 +11,6 @@ import {
   SCHEDULE_TOOL_TURN_LINE,
   WAIT_TOOL_TURN_LINE,
   chatTurnProtocolSection,
-  turnDisciplineSection,
 } from "@/lib/server/turn-discipline";
 
 describe("turn-discipline ask_user 单一源", () => {
@@ -21,11 +20,9 @@ describe("turn-discipline ask_user 单一源", () => {
     expect(ASK_USER_TURN_LINE).not.toMatch(/别调/);
   });
 
-  it("chat / task 段都引用同一行、chat 不再禁 ask_user", () => {
+  it("chat 段引用同一行、chat 不再禁 ask_user", () => {
     const chat = chatTurnProtocolSection();
-    const task = turnDisciplineSection();
     expect(chat).toContain(ASK_USER_TURN_LINE);
-    expect(task).toContain(ASK_USER_TURN_LINE);
     expect(chat).not.toMatch(/别调 `ask_user`/);
     expect(chat).not.toMatch(/chat 模式禁用/);
   });
@@ -50,14 +47,12 @@ describe("turn-discipline wait 工具单一源", () => {
     expect(WAIT_TOOL_TURN_LINE).toContain("间隔拉长");
   });
 
-  it("chat / task 段都引用同一行（不各写各的，改措辞只改一处）", () => {
+  it("chat 段引用同一行（不各写各的，改措辞只改一处；task 侧由下面 _super.md 的 wait 段对账）", () => {
     expect(chatTurnProtocolSection()).toContain(WAIT_TOOL_TURN_LINE);
-    expect(turnDisciplineSection()).toContain(WAIT_TOOL_TURN_LINE);
   });
 
-  it("与「不要为闲聊 / 交卷执行等待」不矛盾：那两条禁的原话还在，wait 是另一件事", () => {
+  it("与「不要为闲聊执行等待」不矛盾：那条禁的原话还在，wait 是另一件事", () => {
     expect(chatTurnProtocolSection()).toContain("不要为闲聊执行等待 / 轮询");
-    expect(turnDisciplineSection()).toContain("不要为交卷执行等待 / 轮询");
   });
 
   it("WAIT_TOOL_TURN_LINE 带「别拿它空等」约束：手头能做的先做、等用户不是 wait 的活", () => {
@@ -65,7 +60,7 @@ describe("turn-discipline wait 工具单一源", () => {
     expect(WAIT_TOOL_TURN_LINE).toContain("ask_user");
   });
 
-  // _super.md 不注入 turnDisciplineSection（避免和核心机制复读），所以 wait 的纪律要自己写一段。
+  // _super.md 里没有可注入的共享片段（task 的交卷 / 结束回合写在它的「核心机制」里），所以 wait 的纪律要自己写一段。
   // 复审指出：之前只是挂在「不要执行等待命令」那条末尾的半句、也没有任何防空转约束；
   // 现在是独立的 `wait` 段——下面把共享行里的关键措辞对一遍，改共享行时这里会提醒同步
   describe("task 主提示词 _super.md 的 wait 段", () => {
@@ -131,18 +126,16 @@ describe("turn-discipline schedule 工具单一源", () => {
     expect(SCHEDULE_TOOL_TURN_LINE).toContain("不会补发");
   });
 
-  it("chat / task 段都引用同一行（不各写各的，改措辞只改一处）", () => {
+  it("chat 段引用同一行（不各写各的，改措辞只改一处；task 侧由下面 _super.md 的 schedule 段对账）", () => {
     expect(chatTurnProtocolSection()).toContain(SCHEDULE_TOOL_TURN_LINE);
-    expect(turnDisciplineSection()).toContain(SCHEDULE_TOOL_TURN_LINE);
   });
 
   it("与 wait 行并存、各管一件事：wait 行还在，schedule 行在它后面", () => {
-    for (const section of [chatTurnProtocolSection(), turnDisciplineSection()]) {
-      const w = section.indexOf(WAIT_TOOL_TURN_LINE);
-      const s = section.indexOf(SCHEDULE_TOOL_TURN_LINE);
-      expect(w).toBeGreaterThanOrEqual(0);
-      expect(s).toBeGreaterThan(w);
-    }
+    const section = chatTurnProtocolSection();
+    const w = section.indexOf(WAIT_TOOL_TURN_LINE);
+    const s = section.indexOf(SCHEDULE_TOOL_TURN_LINE);
+    expect(w).toBeGreaterThanOrEqual(0);
+    expect(s).toBeGreaterThan(w);
   });
 
   describe("task 主提示词 _super.md 的 schedule 段", () => {

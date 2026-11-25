@@ -27,7 +27,7 @@ const textOf = (r: FlowshipToolResult): string => r.content.map((c) => (c.type =
 const reqsOf = () => fake!.calls.filter((c) => c.op === "record");
 
 beforeEach(() => {
-  __resetBrowserSettingsForTest();
+  __resetBrowserSettingsForTest({ advancedTools: true }); // 高级调试组默认关，这组测试测的是「已打开」的行为
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "info").mockImplementation(() => {});
 });
@@ -45,11 +45,16 @@ const withBrowser = (record: (args: Record<string, unknown>) => unknown = () => 
 const REC = "rec-20261109-100507-ab12cd";
 
 describe("P9·注册与常量对账", () => {
-  it("高级组默认开 → browser_record 注册；advancedTools 关 → 不注册", () => {
+  it("高级组默认关 → browser_record 不注册；advancedTools 开 → 注册；再关 → 不注册", () => {
     withBrowser();
-    expect(getBrowserTools({ taskId: TASK }).map((t) => t.name)).toContain("browser_record");
+    const names = () => getBrowserTools({ taskId: TASK }).map((t) => t.name);
+    expect(names()).toContain("browser_record"); // beforeEach 已显式打开
+    __resetBrowserSettingsForTest();
+    expect(names()).not.toContain("browser_record"); // 缺省 = 关
+    __resetBrowserSettingsForTest({ advancedTools: true });
+    expect(names()).toContain("browser_record");
     __resetBrowserSettingsForTest({ advancedTools: false });
-    expect(getBrowserTools({ taskId: TASK }).map((t) => t.name)).not.toContain("browser_record");
+    expect(names()).not.toContain("browser_record");
   });
 
   it("server 的 action / 格式 / recId 形状与主进程逐项一致", () => {

@@ -344,7 +344,8 @@ const makeSessionEnv = (opts: { allocate?: boolean; maxTabs?: number } = {}) => 
   const host = {
     createTab: (a: { id: string; hooks: unknown; partition?: string }) => {
       createCalls.push(a);
-      const t = new ITab(a.id, a.partition);
+      // 与真 BrowserTab 一致：没指定 partition 的 tab 属于共享持久档案（`deps.partition ?? BROWSER_PARTITION`）
+      const t = new ITab(a.id, a.partition ?? BROWSER_PARTITION);
       created.push(t);
       return t;
     },
@@ -431,6 +432,83 @@ describe("BrowserSession.openTab({ incognito })", () => {
   });
 });
 
+// ───────────────────────── 无痕继承：无痕标签开出来的新标签不能掉进持久档案 ─────────────────────────
+
+describe("BrowserSession.openTab：opener 是无痕标签 → 新标签沿用它的 partition（页面 target=_blank / 右键「在新标签页打开」）", () => {
+  type NewTabHook = (info: { url: string; disposition: string; openerTabId: string; byUser?: boolean }) => void;
+  const hookOf = (env: ReturnType<typeof makeSessionEnv>, index: number) => (env.createCalls[index] as unknown as { hooks: { onNewTab: NewTabHook } }).hooks.onNewTab;
+  const summaries = (env: ReturnType<typeof makeSessionEnv>) => env.activityLog.addSystem.mock.calls.map((c) => c[0].summary as string);
+
+  it("openTab({ opener }) 的 opener 是无痕标签：createTab 拿到同一个 partition，不再向 host 分配新的；新标签也带 incognito 标记、记着 opener", async () => {
+    const env = makeSessionEnv();
+    const inc = (await env.session.openTab({ incognito: true })) as ITab;
+    const child = (await env.session.openTab({ opener: inc.id })) as ITab;
+    expect(env.createCalls[1].partition).toBe(env.createCalls[0].partition);
+    expect(isIncognitoPartition(env.createCalls[1].partition!)).toBe(true);
+    expect(env.allocate).toHaveBeenCalledTimes(1); // 只有第一个无痕标签向 host 要过名字
+    expect(child.opener).toBe(inc.id);
+    expect(env.session.listTabs().map((t) => [t.id, (t as { incognito?: boolean }).incognito === true])).toEqual([
+      ["t1", true],
+      ["t2", true],
+    ]);
+  });
+
+  it("opener 是普通标签 / 不存在 / 没给：createTab 参数里根本没有 partition（调用形状与 E1 一致），也不向 host 要名字", async () => {
+    const env = makeSessionEnv();
+    const plain = (await env.session.openTab({})) as ITab;
+    await env.session.openTab({ opener: plain.id });
+    await env.session.openTab({ opener: "t999" }); // opener 已经不在会话里
+    await env.session.openTab({});
+    expect(env.createCalls).toHaveLength(4);
+    for (const c of env.createCalls) expect("partition" in c).toBe(false);
+    expect(env.allocate).not.toHaveBeenCalled();
+    expect(env.session.listTabs().some((t) => "incognito" in t)).toBe(false);
+  });
+
+  it("显式 incognito:true 优先：拿全新的 partition，不与 opener 共用（AI / 用户明确要一个隔离环境）", async () => {
+    const env = makeSessionEnv();
+    const inc = (await env.session.openTab({ incognito: true })) as ITab;
+    await env.session.openTab({ opener: inc.id, incognito: true });
+    expect(env.allocate).toHaveBeenCalledTimes(2);
+    expect(env.createCalls[1].partition).not.toBe(env.createCalls[0].partition);
+    expect(isIncognitoPartition(env.createCalls[1].partition!)).toBe(true);
+  });
+
+  it("右键「在新标签页打开」（onNewTab · byUser）：从无痕标签里开的新标签留在同一个无痕环境；从普通标签里开的仍是持久档案", async () => {
+    const env = makeSessionEnv();
+    const plain = (await env.session.openTab({})) as ITab; // t1
+    const inc = (await env.session.openTab({ incognito: true })) as ITab; // t2
+    hookOf(env, 1)({ url: "https://a.example/x", disposition: "foreground-tab", openerTabId: inc.id, byUser: true });
+    hookOf(env, 0)({ url: "https://b.example/y", disposition: "foreground-tab", openerTabId: plain.id, byUser: true });
+    await flush();
+    expect(env.created).toHaveLength(4);
+    const [, , fromInc, fromPlain] = env.created;
+    expect(fromInc!.partition).toBe(inc.partition);
+    expect(fromInc!.opener).toBe(inc.id);
+    expect(fromPlain!.partition).toBe(BROWSER_PARTITION);
+    expect("partition" in env.createCalls[3]!).toBe(false); // 不替普通 opener 指定 partition：走 host 的默认（共享持久档案）
+  });
+
+  it("页面 target=_blank / 无手势 window.open 的兜底（onNewTab · byPage，opener 在后台）：同样继承；日志写「页面打开了无痕标签页」", async () => {
+    const env = makeSessionEnv();
+    const inc = (await env.session.openTab({ incognito: true })) as ITab; // t1
+    await env.session.openTab({}); // t2 变成激活标签，t1 退到后台：页面发起的新标签走「后台开」那一支（同步）
+    hookOf(env, 0)({ url: "https://c.example/z", disposition: "background-tab", openerTabId: inc.id });
+    await flush();
+    expect(env.created).toHaveLength(3);
+    expect(env.created[2]!.partition).toBe(inc.partition);
+    expect(summaries(env).some((s) => s.includes("页面打开了无痕标签页") && s.includes("c.example"))).toBe(true);
+  });
+
+  it("继承出来的标签照常计入标签页上限", async () => {
+    const env = makeSessionEnv({ maxTabs: 5 });
+    const inc = (await env.session.openTab({ incognito: true })) as ITab;
+    for (let i = 0; i < 4; i++) await env.session.openTab({ opener: inc.id });
+    await expect(env.session.openTab({ opener: inc.id })).rejects.toMatchObject({ code: "BAD_ARGS" });
+    expect(env.session.tabs).toHaveLength(5);
+  });
+});
+
 // ───────────────────────── manager 整合（假 electron） ─────────────────────────
 
 class MWc extends EventEmitter {
@@ -461,15 +539,21 @@ class MWc extends EventEmitter {
   debugger = { isAttached: () => true, attach: vi.fn(), detach: vi.fn(), on: vi.fn(), sendCommand: vi.fn(async () => ({})) };
 }
 
-const makeManager = (opts: { wipeFails?: boolean } = {}) => {
+const makeManager = (opts: { wipeFails?: boolean; isAppUrl?: (url: string) => boolean } = {}) => {
   const wcs: MWc[] = [];
   const viewArgs: Array<Record<string, any>> = [];
+  /** next = true：下一次建视图抛错（模拟 BrowserTab 构造失败），之后自动复位 */
+  const viewFail = { next: false };
   class FakeView {
     webContents: MWc;
     setBounds = vi.fn();
     setVisible = vi.fn();
     setBackgroundColor = vi.fn();
     constructor(o: Record<string, any>) {
+      if (viewFail.next) {
+        viewFail.next = false;
+        throw new Error("view boom");
+      }
       viewArgs.push(o);
       this.webContents = o.webContents ?? new MWc();
       wcs.push(this.webContents);
@@ -532,13 +616,13 @@ const makeManager = (opts: { wipeFails?: boolean } = {}) => {
     session: { fromPartition },
     ipcMain,
     getMainWindow: () => makeWin(),
-    isAppUrl: () => false,
+    isAppUrl: opts.isAppUrl ?? (() => false),
     isTrustedIpcSender: () => true,
     log: (m: string) => logs.push(m),
     startPicker: () => ({ cancel() {} }),
   } as never);
   const dispatch = (op: string, args: Record<string, unknown>, taskId = "T1") => (manager as any).dispatch(op, args, { taskId, signal: undefined });
-  return { manager, dispatch, wcs, viewArgs, fromPartition, sessions, handlers, logs };
+  return { manager, dispatch, wcs, viewArgs, viewFail, fromPartition, sessions, handlers, logs };
 };
 
 type TabsResult = { tabs: Array<{ id: string; incognito?: boolean }>; activeTabId: string };
@@ -722,6 +806,213 @@ describe("manager 整合：tabs new incognito", () => {
   });
 });
 
+// ───────────────────────── 用户侧入口：browser:newIncognitoTab ─────────────────────────
+
+describe("用户侧 browser:newIncognitoTab（面板「更多」菜单的入口；AI 侧的 tabs new incognito 早就有）", () => {
+  type Res = { ok: true; tabId: string } | { ok: false; error: string };
+  const setup = () => {
+    // isAppUrl：Flowship 自己的地址（这里假定 127.0.0.1:8876）在内置浏览器里一律拒绝，无痕标签也不例外
+    const env = makeManager({ isAppUrl: (u) => u.startsWith("http://127.0.0.1:8876") });
+    (env.manager as any).registerIpc();
+    const call = (...args: unknown[]) => env.handlers.get("browser:newIncognitoTab")!({}, ...args) as Promise<Res>;
+    const sessionOf = (taskId = "T1") => (env.manager as any).getSession(taskId) as { tabs: Array<{ id: string; incognito?: boolean; partition: string; wc: MWc }>; activeTabId: string } | undefined;
+    return { env, call, sessionOf };
+  };
+
+  it("会话不存在也能建：懒创建会话，只有这一个无痕标签（不额外带一个空白的持久初始标签），partition 是内存的无痕名", async () => {
+    const { env, call, sessionOf } = setup();
+    expect(await call("T1")).toEqual({ ok: true, tabId: "t1" });
+    const tabs = sessionOf()!.tabs;
+    expect(tabs.map((t) => [t.id, t.incognito === true])).toEqual([["t1", true]]);
+    expect(isIncognitoPartition(tabs[0]!.partition)).toBe(true);
+    expect([...env.sessions.keys()].filter((n) => isIncognitoPartition(n))).toEqual([tabs[0]!.partition]);
+    expect(sessionOf()!.activeTabId).toBe("t1");
+  });
+
+  it("会话已存在：只多一个无痕标签并激活它，原有的普通标签原样保留（不是 newTab：新标签是无痕的）", async () => {
+    const { env, call, sessionOf } = setup();
+    await env.dispatch("navigate", { url: "about:blank" });
+    expect(await call("T1")).toEqual({ ok: true, tabId: "t2" });
+    expect(sessionOf()!.tabs.map((t) => [t.id, t.incognito === true])).toEqual([
+      ["t1", false],
+      ["t2", true],
+    ]);
+    expect(sessionOf()!.activeTabId).toBe("t2");
+    // 对照：browser:newTab 开出来的是普通（持久档案）标签
+    const plainId = await env.handlers.get("browser:newTab")!({}, "T1");
+    expect(sessionOf()!.tabs.find((t) => t.id === plainId)!.incognito === true).toBe(false);
+  });
+
+  it("带地址：在新的无痕标签里加载（经 URL 策略解析，裸词按搜索）", async () => {
+    const { call, sessionOf } = setup();
+    expect(await call("T1", "example.com/a")).toEqual({ ok: true, tabId: "t1" });
+    await flush();
+    const loads = sessionOf()!.tabs[0]!.wc.loadURL.mock.calls.map((c: unknown[]) => c[0]);
+    expect(loads).toContain("https://example.com/a");
+  });
+
+  it("被 URL 策略拒绝的地址：{ ok:false, error }，不建会话、不建标签、不 reject", async () => {
+    const { env, call, sessionOf } = setup();
+    for (const input of ["file:///etc/passwd", "javascript:alert(1)", "http://127.0.0.1:8876/x"]) {
+      const res = await call("T1", input);
+      expect(res.ok, input).toBe(false);
+      expect(typeof (res as { error: string }).error, input).toBe("string");
+      expect((res as { error: string }).error.length, input).toBeGreaterThan(0);
+    }
+    expect(sessionOf()).toBeUndefined();
+    expect([...env.sessions.keys()].filter((n) => isIncognitoPartition(n))).toHaveLength(0);
+  });
+
+  it("空白地址 / 非字符串地址当作没给：照常开空白无痕标签", async () => {
+    const { call, sessionOf } = setup();
+    expect(await call("T1", "   ")).toEqual({ ok: true, tabId: "t1" });
+    expect(await call("T1", 42)).toEqual({ ok: true, tabId: "t2" });
+    expect(sessionOf()!.tabs.every((t) => t.incognito === true)).toBe(true);
+  });
+
+  it("无效的任务 id：{ ok:false }，什么都不建", async () => {
+    const { env, call } = setup();
+    for (const id of ["", undefined, 42, null, {}]) {
+      expect(await call(id)).toEqual({ ok: false, error: "无效的任务" });
+    }
+    expect([...env.sessions.keys()].filter((n) => isIncognitoPartition(n))).toHaveLength(0);
+  });
+
+  it("标签页已达上限：{ ok:false, error }，错误文案是给用户看的（不带写给 AI 的工具名 browser_tabs）；已有标签不受影响", async () => {
+    const { env, call, sessionOf } = setup();
+    for (let i = 0; i < MAX_TABS; i++) await env.dispatch("tabs", { action: "new" });
+    const res = await call("T1");
+    expect(res.ok).toBe(false);
+    const error = (res as { error: string }).error;
+    expect(error).toContain("标签页已达上限");
+    expect(error).not.toContain("browser_tabs");
+    expect(sessionOf()!.tabs).toHaveLength(MAX_TABS);
+    expect(env.logs.join("\n")).toContain("新建无痕标签页失败");
+  });
+
+  it("用户侧新建的无痕标签关闭后同样被清空（只清它自己的 partition，持久档案一次都没被清）", async () => {
+    const { env, call, sessionOf } = setup();
+    await env.dispatch("navigate", { url: "about:blank" });
+    expect(await call("T1")).toEqual({ ok: true, tabId: "t2" });
+    const incName = sessionOf()!.tabs.find((t) => t.id === "t2")!.partition;
+    const ses = env.sessions.get(incName)!;
+    expect(ses.clearStorageData).not.toHaveBeenCalled();
+    await env.handlers.get("browser:closeTab")!({}, "T1", "t2");
+    await flush();
+    expect(ses.clearStorageData).toHaveBeenCalledTimes(1);
+    expect(env.sessions.get(BROWSER_PARTITION)!.clearStorageData).not.toHaveBeenCalled();
+  });
+
+  it("两次新建 = 两个互相隔离的 partition（各有各的登录态）", async () => {
+    const { call, sessionOf } = setup();
+    await call("T1");
+    await call("T1");
+    const names = sessionOf()!.tabs.map((t) => t.partition);
+    expect(names).toHaveLength(2);
+    expect(new Set(names).size).toBe(2);
+  });
+
+  it("活动日志里写了「打开了无痕标签页」（AI 下一轮能看到用户开了一个）", async () => {
+    const { call, sessionOf } = setup();
+    await call("T1");
+    const session = sessionOf() as unknown as { activityLog: { list: () => Array<{ summary: string }> } };
+    expect(session.activityLog.list().map((e) => e.summary).join("\n")).toContain("无痕标签页");
+  });
+});
+
+// ───────────────────────── 无痕继承（真 manager）：无痕标签开出来的新标签留在同一个无痕环境 ─────────────────────────
+
+describe("无痕标签里开出的新标签留在同一个无痕环境（真 manager：BrowserTab 的 window-open 处理 → 会话 → partition 引用计数 → wipe）", () => {
+  type LiveTab = { id: string; partition: string; incognito: boolean; wc: MWc; hooks: { onNewTab: (info: Record<string, unknown>) => void } };
+  const setup = async () => {
+    const env = makeManager();
+    await env.dispatch("navigate", { url: "about:blank" }); // t1：普通标签
+    const r = (await env.dispatch("tabs", { action: "new", incognito: true })) as TabsResult; // t2：无痕，激活
+    const session = (env.manager as any).getSession("T1") as { tabs: LiveTab[]; activeTabId: string };
+    const incTab = session.tabs.find((t) => t.id === r.tabs.find((x) => x.incognito)!.id)!;
+    const plainTab = session.tabs.find((t) => t.id === "t1")!;
+    const incNames = () => [...env.sessions.keys()].filter((n) => isIncognitoPartition(n));
+    // 页面 target=_blank：Electron 调的是 wc 上登记的 setWindowOpenHandler
+    const pageOpens = (tab: LiveTab, url: string) => (tab.wc.setWindowOpenHandler as ReturnType<typeof vi.fn>).mock.calls[0]![0]({ url, disposition: "foreground-tab" }) as { action: string };
+    const childOf = (id: string) => session.tabs.find((t) => t.id === id);
+    return { env, session, incTab, plainTab, incNames, pageOpens, childOf };
+  };
+
+  it("页面 target=_blank（无痕标签在后台、没手势 → 后台开）：新标签沿用无痕 partition，没有多分配 session；原生窗口仍被 deny", async () => {
+    const { env, incTab, incNames, pageOpens, childOf } = await setup();
+    await env.dispatch("tabs", { action: "select", tabId: "t1" }); // 无痕标签退到后台：页面发起的新标签走「后台开」，同步完成
+    expect(pageOpens(incTab, "https://example.com/next")).toEqual({ action: "deny" });
+    await flush();
+    const child = childOf("t3")!;
+    expect(child).toBeDefined();
+    expect(child.partition).toBe(incTab.partition);
+    expect(child.incognito).toBe(true);
+    expect(incNames()).toEqual([incTab.partition]); // 全程只有一个无痕 session
+  });
+
+  it("右键「在新标签页打开」（byUser，前台开）：同样沿用同一个无痕 partition，新标签被激活", async () => {
+    const { session, incTab, incNames, childOf } = await setup();
+    incTab.hooks.onNewTab({ url: "https://example.com/menu", disposition: "foreground-tab", openerTabId: incTab.id, byUser: true });
+    await flush();
+    const child = childOf("t3")!;
+    expect(child.partition).toBe(incTab.partition);
+    expect(child.incognito).toBe(true);
+    expect(session.activeTabId).toBe("t3");
+    expect(incNames()).toEqual([incTab.partition]);
+  });
+
+  it("引用计数：先关 opener 不清空（子标签还在用这个 partition）；子标签也关了才清空；持久档案一次都没被清", async () => {
+    const { env, incTab, childOf } = await setup();
+    incTab.hooks.onNewTab({ url: "https://example.com/rc", disposition: "foreground-tab", openerTabId: incTab.id, byUser: true });
+    await flush();
+    expect(childOf("t3")!.partition).toBe(incTab.partition);
+    const ses = env.sessions.get(incTab.partition)!;
+
+    await env.dispatch("tabs", { action: "close", tabId: incTab.id });
+    await flush();
+    expect(childOf("t3")).toBeDefined();
+    expect(ses.clearStorageData).not.toHaveBeenCalled(); // 无痕环境里还有标签在用 → 不能清
+
+    await env.dispatch("tabs", { action: "close", tabId: "t3" });
+    await flush();
+    expect(ses.clearStorageData).toHaveBeenCalledTimes(1);
+    expect(ses.clearCache).toHaveBeenCalledTimes(1);
+    expect(env.sessions.get(BROWSER_PARTITION)!.clearStorageData).not.toHaveBeenCalled();
+  });
+
+  it("普通标签里开出的新标签仍在持久档案里（不被误当成无痕），也不会多出无痕 session", async () => {
+    const { plainTab, incNames, childOf } = await setup();
+    plainTab.hooks.onNewTab({ url: "https://example.com/plain", disposition: "foreground-tab", openerTabId: plainTab.id, byUser: true });
+    await flush();
+    const child = childOf("t3")!;
+    expect(child.partition).toBe(BROWSER_PARTITION);
+    expect(child.incognito).toBe(false);
+    expect(incNames()).toHaveLength(1); // 只有 t2 自己的那一个
+  });
+
+  it("继承出来的标签没建成（BrowserTab 构造抛错）：opener 还在用的名字不会被放回复用池——之后新开的无痕标签拿到的是另一个 partition，opener 关闭后仍恰好清空一次", async () => {
+    const { env, session, incTab, incNames } = await setup();
+    const ses = env.sessions.get(incTab.partition)!;
+    env.viewFail.next = true;
+    incTab.hooks.onNewTab({ url: "https://example.com/boom", disposition: "foreground-tab", openerTabId: incTab.id, byUser: true });
+    await flush();
+    expect(session.tabs.map((t) => t.id)).toEqual(["t1", incTab.id]); // 没有半成品标签
+    expect(env.logs.join("\n")).toContain("页面新窗口打开失败");
+
+    // abandon 对「有人在用」的名字必须是空操作：否则下一次 allocate 会把 opener 正在用的 partition 又发给一个无关的无痕标签（共享 cookie）
+    const r = (await env.dispatch("tabs", { action: "new", incognito: true })) as TabsResult;
+    const other = session.tabs.find((t) => t.id === r.activeTabId)!;
+    expect(other.incognito).toBe(true);
+    expect(other.partition).not.toBe(incTab.partition);
+    expect(incNames()).toHaveLength(2);
+
+    await env.dispatch("tabs", { action: "close", tabId: incTab.id });
+    await flush();
+    expect(ses.clearStorageData).toHaveBeenCalledTimes(1);
+    expect(env.sessions.get(other.partition)!.clearStorageData).not.toHaveBeenCalled();
+  });
+});
+
 // ───────────────────────── R6-10 / R6-11 / R6-22（S3）：真 createBrowserManager + 假 session ─────────────────────────
 
 describe("R6-10 / R6-11 / R6-22：清除数据 / 会话结束 / 无痕 wipe 的网络清理（经真 manager）", () => {
@@ -760,10 +1051,10 @@ describe("R6-10 / R6-11 / R6-22：清除数据 / 会话结束 / 无痕 wipe 的�
     persistent.closeAllConnections = vi.fn(async () => {
       throw new Error("conn-boom");
     });
-    await expect(env.handlers.get("browser:clearBrowsingData")!({})).resolves.toBeUndefined();
+    await expect(env.handlers.get("browser:clearBrowsingData")!({})).resolves.toEqual({ reloadedTabs: 0 });
     expect(env.logs.join("\n")).toContain("conn-boom");
     delete persistent.closeAllConnections;
-    await expect(env.handlers.get("browser:clearBrowsingData")!({})).resolves.toBeUndefined();
+    await expect(env.handlers.get("browser:clearBrowsingData")!({})).resolves.toEqual({ reloadedTabs: 0 });
   });
 
   it("无痕 wipe：wc 真正 destroyed 后断开连接；该 partition 的证书例外随之作废（名字复用时不继承）", async () => {

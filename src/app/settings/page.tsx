@@ -607,7 +607,7 @@ const SettingsPage = () => {
                 onNetworkBodyReadChange={(v) =>
                   saveFieldValue("browserNetworkBodyRead", v)
                 }
-                advancedTools={settings.browserAdvancedTools !== false}
+                advancedTools={settings.browserAdvancedTools === true}
                 onAdvancedToolsChange={(v) =>
                   saveFieldValue("browserAdvancedTools", v)
                 }

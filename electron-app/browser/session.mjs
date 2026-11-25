@@ -7,7 +7,7 @@
  * 本文件刻意不 import electron：tab 工厂、窗口、拾取器都由 host 注入，状态机因此可以用假 tab + 假定时器直接单测。
  */
 import { createDownloadRegistry, STATE_DOWNLOADS } from "./downloads.mjs";
-import { makeIncognitoPartition, nextIncognitoSeq } from "./incognito.mjs";
+import { isIncognitoPartition, makeIncognitoPartition, nextIncognitoSeq } from "./incognito.mjs";
 import { decidePopup } from "./popup-policy.mjs";
 import { createPromptHub } from "./prompts.mjs";
 import { BrowserError } from "./server-channel.mjs";
@@ -395,6 +395,10 @@ export class BrowserSession {
   /**
    * 新开 tab。
    * incognito（E2·A6）：用一个独立的内存 partition（不共享持久档案的登录态，tab 关闭即清空）；占 tab 上限的名额，与普通标签同等计数。
+   * 继承：opener 是无痕标签（页面 `target=_blank` / 无手势 `window.open` 的兜底 / 右键「在新标签页打开」/ 弹窗收养失败的回退，都带 opener 走到这里）时，
+   * 新标签沿用 opener 的 partition——同一个无痕环境共用登录态、一起引用计数、最后一个关掉才清空。
+   * 不继承的话它会静默落进持久档案：用户在「无痕」里点个链接，新标签却带着持久登录态，还会把新写的 cookie 留在磁盘上。
+   * 显式 `incognito:true` 优先（拿全新的 partition）；opener 是普通标签 / 找不到 / 没给，行为不变。
    * @param {{ url?: string, activate?: boolean, opener?: string, byPage?: boolean, viaGesture?: boolean, incognito?: boolean }} opts
    */
   async openTab({ url, activate = true, opener, byPage = false, viaGesture = true, incognito = false } = {}) {
@@ -405,12 +409,15 @@ export class BrowserSession {
       throw new BrowserError("BAD_ARGS", `标签页已达上限（${maxTabs} 个）：请先关闭不再需要的标签页（browser_tabs close）`);
     }
     const id = `t${++this.tabSeq}`;
-    const partition = incognito === true ? this.#allocateIncognito(id) : undefined;
+    // opener 还在 tabs 里就还持有它那份引用计数（摘除先于 / 同步于释放，见 index.mjs 的 destroyHook），所以继承同名 partition 不会碰上正在清空的名字
+    const openerPartition = opener ? this.tabs.find((t) => t.id === opener)?.partition : undefined;
+    const inherited = incognito !== true && isIncognitoPartition(openerPartition) ? openerPartition : undefined;
+    const partition = incognito === true ? this.#allocateIncognito(id) : inherited;
     const tab = this.host.createTab({ id, hooks: this.#tabHooks(id), ...(partition ? { partition } : {}) });
     tab.opener = opener ?? null;
     this.tabs.push(tab);
     if (activate || !this.activeTabId) this.#activate(tab);
-    const what = incognito === true ? "无痕标签页" : "新标签页";
+    const what = partition ? "无痕标签页" : "新标签页";
     this.#logSystem({
       kind: "tab_open",
       tabId: id,

@@ -11,8 +11,8 @@
  * # 设计原则（依据 Anthropic prompting best practices、沿用 2026-06-14 立的规矩）
  *
  * - dial back aggressive language：不堆「🚨 绝对禁止」、点明陷阱 + 解释 why
- * - 单一源：chat 起手用 chatTurnProtocolSection；task 的交卷/结束回合写在 _super.md「核心机制」、
- *   不再往 super 里灌 turnDisciplineSection（避免和核心机制复读）
+ * - 单一源：下面三条句子行（ASK_USER / WAIT / SCHEDULE）供 chat 起手段 chatTurnProtocolSection 引用；
+ *   task 的交卷 / 结束回合写在 _super.md「核心机制」里（wait / schedule 两段靠测试对账同口径）
  */
 
 /**
@@ -26,7 +26,7 @@ export const ASK_USER_TURN_LINE =
 /**
  * `wait` 工具的使用纪律（chat / task 单一源）。
  *
- * 和上面「不要为交卷 / 闲聊执行等待」不矛盾：那条禁的是「等用户」的旧协议套路；
+ * 和「不要为闲聊执行等待 / 轮询」（chat）、「不要执行任何等待 / 轮询命令」（_super.md）不矛盾：那两条禁的是「等用户」的旧协议套路；
  * 这条是「真有外部的事要等」时的正路——用我们自己的 `wait`（界面显示已等时长和原因、用户能跳过、停止 / 插话会叫醒它），
  * 不用 shell sleep（占一个终端、界面上是个没头没尾的命令），也不用 SDK 自带的 await（对界面完全不可见）。
  */
@@ -44,27 +44,6 @@ export const SCHEDULE_TOOL_TURN_LINE =
   "- 要在**之后**某个时间再做 / 再看一件事（N 分钟后查 CI、每 10 分钟看一次部署、明早提醒用户）→ 调 `schedule` 工具设定时，然后正常结束本轮：到点系统会把你当时留的话作为新消息发回本会话，不用干等。几十分钟的等待别用 `wait` 硬睡，也别自己写 sleep / cron / 后台脚本。建定时时 `message` 要写清三件事：到点做什么、没变化时一两句带过（别打扰用户）、什么时候该自己 `cancel` 它（周期任务别让它一直跑）。应用没开 / 电脑睡眠时错过的不会补发";
 
 /**
- * task 模式的「回合纪律」段（曾注入 _super.md；现交卷协议只留 super「核心机制」一处）。
- * 仍导出给测试对账 chat / task 对 ask_user 的同一句措辞。
- *
- * 讲清三件事：产物写好先交卷、拿到 [SUBMITTED] 后再说结论；提问走 ask_user；
- * 别执行任何等待命令（旧协议肌肉记忆 / 网上教程的轮询套路都不要）。
- */
-export const turnDisciplineSection = (): string =>
-  [
-    "### 回合纪律（怎么把控制权交回用户）",
-    "",
-    "你和用户之间是**多轮消息**：每一轮你干完该干的、调完该调的工具、就**正常结束本轮回复**（结束 turn）。用户的下一步（推进下一步 / 输入条说话 / 回答提问）会作为**新消息**发给你、你在同一会话里继续、上下文不丢。",
-    "",
-    "- 完成一个 action（写完 artifact）→ 调 `submit_work` 交卷 → 拿到 `[SUBMITTED]` 后再说 1-3 句业务结论并结束本轮",
-    ASK_USER_TURN_LINE,
-    "- **不要为交卷执行等待 / 轮询**——sleep / watch / 自己编的 curl 都不要。提问只用 `ask_user` 返回里的那条 curl",
-    WAIT_TOOL_TURN_LINE,
-    SCHEDULE_TOOL_TURN_LINE,
-    "- 交卷 / 提问是内部机制、别在正文里提工具名",
-  ].join("\n");
-
-/**
  * chat 起手 prompt 里的「怎么和用户对话」段（chat-runner buildInitialPrompt 用）。
  *
  * V0.11：chat 就是正常多轮对话——把回复正文直接输出（实时流式显示）、说完自然结束回复、
@@ -77,8 +56,9 @@ export const chatTurnProtocolSection = (): string =>
     "这是**正常的多轮对话**：用户发消息 → 你回答（正文直接输出、会一字一字实时显示给用户）→ **说完自然结束本轮回复** → 用户的下一条消息会续接同一会话、上下文不丢。",
     "",
     "几个关键：",
-    "- **回复正文直接输出**——要查的先查清楚、要写的真写出来（让你写一整篇作文、就把整篇直接输出）。别只说「我先查…我先写…」就结束回复 = 没交付、用户看到的是一句空话。",
-    "- **说完就正常结束回复**——不要为闲聊执行等待 / 轮询（sleep / watch / 自己编的 curl 都不要）；提问只用 `ask_user` 返回里的那条 curl。不要调 `submit_work`（本模式用不到它）。",
+    // 「回复正文直接输出、别只说我先查就结束」由 chat-runner 起手 prompt 末尾的 recency 钉子单独承担
+    //（钉在用户当前句之后、更靠近生成点），这里不重复；chat 不挂 submit_work（见 chat-system-tools.ts），也不再提它
+    "- **说完就正常结束回复**——不要为闲聊执行等待 / 轮询（sleep / watch / 自己编的 curl 都不要）；提问只用 `ask_user` 返回里的那条 curl。",
     ASK_USER_TURN_LINE,
     WAIT_TOOL_TURN_LINE,
     SCHEDULE_TOOL_TURN_LINE,

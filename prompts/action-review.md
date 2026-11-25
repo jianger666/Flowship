@@ -1,8 +1,5 @@
 # Action: review
 
-> 占位符在 super-prompt 顶部已注入：`{{taskId}}` `{{taskTitle}}` `{{repoPath}}`、artifact 绝对路径见 super-prompt「Artifact 文件路径」段。
-> 收到 `[NEXT_ACTION type=review ...]` 时翻到本段、按指令做。
-
 ---
 
 你正在跑 Flowship task 里的 **review action**。

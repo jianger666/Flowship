@@ -154,6 +154,9 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "reqIdLine",
       "userIdentityLine",
       "repoSection",
+      // 仅 Cursor 后端非空（task-prompts 按 isCursorBackend 供值；pi / 自定义后端供空串，见 task-prompt-cursor-rules.test.ts）
+      "projectRulesSection",
+      "cursorAccountRulesNote",
       "lightweightDailySection",
       "repoBranchSection",
       "repoPath",

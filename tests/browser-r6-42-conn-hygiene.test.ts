@@ -342,7 +342,7 @@ describe("R6-42b·真 manager：clearBrowsingData 的 Electron 清除调用任�
   it("基线（无失败）：依次 clearStorageData → clearCache → clearAuthCache →（例外表清）→ closeAllConnections；resolve", async () => {
     const t = await prepare();
     t.env.order.length = 0;
-    await expect(t.clear()).resolves.toBeUndefined();
+    await expect(t.clear()).resolves.toEqual({ reloadedTabs: 0 }); // 只有 about:blank 标签 = 没有要终止 / 恢复的页面
     expect(t.env.order).toEqual(["clearStorageData", "clearCache", "clearAuthCache", "closeAllConnections"]);
     expect(t.state.hasCertExceptions(BROWSER_PARTITION)).toBe(false);
     expect(t.state.hasCertExceptions(t.incName)).toBe(true); // 无痕的例外不动

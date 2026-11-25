@@ -360,6 +360,8 @@ describe("index.mjs（A 组）：每个 browser:* IPC 入口第一件事过 isTr
     "ext",
     // R7：本地 HTML → 一次性 token 的 loopback URL（local-html-server.mjs；行为见 tests/browser-r7-local-html-ipc.test.ts）
     "serveLocalHtml",
+    // 用户侧「新建无痕标签页」（面板「更多」菜单；行为见 tests/browser-e2-p2-incognito.test.ts「用户侧 browser:newIncognitoTab」）
+    "newIncognitoTab",
   ].map((n) => `browser:${n}`);
 
   if (!existsSync(indexPath)) {

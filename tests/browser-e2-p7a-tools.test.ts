@@ -27,7 +27,7 @@ const opCalls = (op: string) => fake!.calls.filter((c) => c.op === op);
 const untrustedBlocks = (text: string): string[] => [...text.matchAll(new RegExp(`<${UNTRUSTED_TAG}[^>]*>\\n([\\s\\S]*?)\\n</${UNTRUSTED_TAG}>`, "g"))].map((m) => m[1]);
 
 beforeEach(() => {
-  __resetBrowserSettingsForTest();
+  __resetBrowserSettingsForTest({ advancedTools: true }); // 高级调试组默认关，这组测试测的是「已打开」的行为
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "info").mockImplementation(() => {});
 });
@@ -43,11 +43,16 @@ const withBrowser = (handlers: Parameters<typeof installFakeBrowser>[0] = {}) =>
 };
 
 describe("注册与 schema", () => {
-  it("默认（高级调试组开）注册；关掉 browserAdvancedTools 后不注册；描述 ≤ 2 句", () => {
+  it("高级调试组默认不注册；打开 browserAdvancedTools 才注册，关掉后又不注册；描述 ≤ 2 句", () => {
     withBrowser();
-    expect(tool("browser_sources").description.split("。").filter((s) => s.trim()).length).toBeLessThanOrEqual(2);
+    expect(tool("browser_sources").description.split("。").filter((s) => s.trim()).length).toBeLessThanOrEqual(2); // beforeEach 已显式打开
+    const has = () => getBrowserTools({ taskId: TASK }).some((t) => t.name === "browser_sources");
+    __resetBrowserSettingsForTest();
+    expect(has()).toBe(false); // 缺省 = 关
+    __resetBrowserSettingsForTest({ advancedTools: true });
+    expect(has()).toBe(true);
     __resetBrowserSettingsForTest({ advancedTools: false });
-    expect(getBrowserTools({ taskId: TASK }).find((t) => t.name === "browser_sources")).toBeUndefined();
+    expect(has()).toBe(false);
   });
 
   it("action 是枚举且必填；types 是枚举数组；其余可选", () => {

@@ -23,8 +23,11 @@ export const displayFileName = (name: string | null | undefined): string =>
 /** tooltip 内容的长度上限（页面标题可达数 MB，不能整段塞进 tooltip）；R1-37 */
 export const TOOLTIP_TEXT_MAX = 300;
 
-/** 无痕标签页的说明（E2·A6）：tab 条徽章的 Tooltip 与读屏文案共用，口径与 browser_tabs 的工具描述一致 */
-export const INCOGNITO_TAB_HINT = "无痕标签页：独立的内存档案，不共享登录态，关闭即销毁";
+/**
+ * 无痕标签页的说明（E2·A6）：tab 条徽章的 Tooltip 与读屏文案共用，口径与 browser_tabs 的工具描述一致。
+ * 末尾那句是给用户的实话：「无痕」在这里是**隔离登录环境**（比如用另一个账号 / 登出态看页面），不是对 AI 保密——同一会话里 AI 仍能看到并操作它。
+ */
+export const INCOGNITO_TAB_HINT = "无痕标签页：独立的内存档案，不共享登录态，关闭即销毁；AI 仍可看到并操作它";
 
 /** tab 的 Tooltip 文本：基础文本（标题 / 地址，已 clipOneLine）+ 无痕说明。非无痕原样返回 */
 export const tabTooltipText = (base: string, incognito: boolean | undefined): string =>

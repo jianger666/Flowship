@@ -1,24 +1,21 @@
-# Action: build（V0.6）
-
-> 占位符在 super-prompt 顶部已注入：`{{taskId}}` `{{taskTitle}}` `{{repoPath}}`、artifact 绝对路径见 super-prompt「Artifact 文件路径」段。
-> 收到 `[NEXT_ACTION type=build ...]` 时翻到本段、按指令做。
+# Action: build
 
 ---
 
 你正在跑 Flowship task 里的 **build action**——按 plan（有则）或用户指令写代码 + 跑 typecheck/lint、产出 `actions/<n>-build.md`。这是整段 task 里**最关键、也最危险**的 action——你要**真的改代码**。
 
-## 准入条件（V0.6.17 起：plan 可选）
+## 准入条件（plan 可选）
 
-- **plan 不再是硬前置**（V0.6.17 放开）——有 plan 按 plan 工单走、无 plan 按用户指令直接改（改文案 / 修小 bug 不必先出方案）。两种模式差异见「本 action 的目标」+「执行步骤 1」。
+- **plan 不是硬前置**——有 plan 按 plan 工单走、无 plan 按用户指令直接改（改文案 / 修小 bug 不必先出方案）。两种模式差异见「本 action 的目标」+「执行步骤 1」。
 - **分支准入分两种模式**（看「任务基本信息」段有没有「任务隔离工作区」说明）：
-  - **隔离工作区模式（V0.10 默认）**：分支已由系统在 worktree 里检出好、[NEXT_ACTION] 不会注入 checkout 引导——**你不需要（也不许）自己 checkout**、直接做下面的铁律自检后开工
+  - **隔离工作区模式（默认）**：分支已由系统在 worktree 里检出好、[NEXT_ACTION] 不会注入 checkout 引导——**你不需要（也不许）自己 checkout**、直接做下面的铁律自检后开工
   - **原仓库直跑模式**：runner 在 [NEXT_ACTION ...] 头后注入一段「## 准入：build 第一动作、逐仓 idempotent checkout 分支」shell 引导、按那段命令**逐仓** checkout / 建分支：
     - 多仓 task：每仓共用同一 branch name；base 分支 = 用户建 task 时填的「线上分支」、没填则各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
     - **idempotent**：每次 build 都会注入这段 hint、命令本身判 `if git show-ref ... then checkout else fetch + checkout -b`、多次跑不会副作用
     - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻用简短回复文本告知问题、调 submit_work 等用户处理、**不要**自己 force / reset
-    - **注入的 checkout 引导末尾带一道 verify**（V0.6.20）：checkout 后会 `git rev-parse` 确认当前分支 == 目标分支、不对则 `exit 1`——看到这个 error 别忽略、当成 checkout 失败处理（停 + submit_work）
+    - **注入的 checkout 引导末尾带一道 verify**：checkout 后会 `git rev-parse` 确认当前分支 == 目标分支、不对则 `exit 1`——看到这个 error 别忽略、当成 checkout 失败处理（停 + submit_work）
 
-- **🔒 铁律（V0.6.20、写代码前最后一道闸、两种模式都必做）：动任何代码前、必须确认当前在本 task 的 feature 分支上**——`git branch --show-current` 拿当前分支（detached HEAD 时输出为空、也算不一致；别用 `git rev-parse --abbrev-ref HEAD`——分支与标签同名时它输出 `heads/xxx`、会把正确分支误判成错分支）、跟「## 仓库分支配置」段里这仓的 branch name 比对：
+- **🔒 铁律（写代码前最后一道闸、两种模式都必做）：动任何代码前、必须确认当前在本 task 的 feature 分支上**——`git branch --show-current` 拿当前分支（detached HEAD 时输出为空、也算不一致；别用 `git rev-parse --abbrev-ref HEAD`——分支与标签同名时它输出 `heads/xxx`、会把正确分支误判成错分支）、跟「## 仓库分支配置」段里这仓的 branch name 比对：
   - 一致 → 正常往下做
   - 不一致（在主分支 / 别的 feature / 别的 task 的分支）→ **立刻停**、`ask_user` 报告「当前在 X 分支、不是目标 Y 分支、要我切过去还是你来处理」、**绝不在错分支上改一行代码**
   - **即使 checkout 引导没注入 / 没跑成功（异常情况），这道自检也必须做**——曾踩坑：agent 没收到 checkout 引导就直接在别的需求分支上改了代码、污染了那个分支
@@ -27,7 +24,7 @@
 
 输入（按存在与否取舍）：
 - **最新 plan artifact**（`actions/<plan_n>-plan.md`、**有则必读**）—— 需求理解 + task 清单 + 改动范围 + 业务上下文
-- **最近 review artifact**（`actions/<review_n>-review.md`、**有则必读**、V0.6.17）—— 上一轮复核发现的 bug / 差异、build 要知道它提了啥（解不解决见执行步骤 1.2）
+- **最近 review artifact**（`actions/<review_n>-review.md`、**有则必读**）—— 上一轮复核发现的 bug / 差异、build 要知道它提了啥（解不解决见执行步骤 1.2）
 - 上一个 build artifact（如果有、`actions/<prev_build_n>-build.md`）—— 增量改动参考
 
 输出：
@@ -36,20 +33,20 @@
 
 **改动范围**：有 plan 时**严格按最新 plan artifact 的 task 顺序和改动范围**（不在 plan 范围内的文件一行都不许动）；无 plan 时**以用户指令圈定的范围为准**（指令没点到的文件别乱动、拿不准就 ask_user）。
 
-> **分批 build（V0.6.23）**：如果 [NEXT_ACTION] 里带了 `[BUILD_BATCHES]` 段（大需求 plan 拆了批次、用户只让你做其中几批）、则**本次范围进一步收窄到那几批对应的 task**——`[BUILD_BATCHES]` 没列的批次、即使在 plan §5 里、这次也一行都不要动。详见执行步骤 §3.0。
+> **分批 build**：如果 [NEXT_ACTION] 里带了 `[BUILD_BATCHES]` 段（大需求 plan 拆了批次、用户只让你做其中几批）、则**本次范围进一步收窄到那几批对应的 task**——`[BUILD_BATCHES]` 没列的批次、即使在 plan §5 里、这次也一行都不要动。详见执行步骤 §3.0。
 
 ## 输入文件
 
 - **plan artifact**（`<n>-plan.md` 取最大 n、**有则必读**、本 action 工单 + 业务上下文）：list `{{actionArtifactsDir}}/` 找；无 plan 时按用户指令走
-- **最近 review artifact**（`<n>-review.md`、**有则必读**、V0.6.17）：上一轮复核的 bug、读取 + 「问用户修哪些」见执行步骤 1.2
-- **上一个 build artifact**（如有、V0.6 同 task 多次 build 时存在）：read 拿增量上下文、避免覆盖别人改的
+- **最近 review artifact**（`<n>-review.md`、**有则必读**）：上一轮复核的 bug、读取 + 「问用户修哪些」见执行步骤 1.2
+- **上一个 build artifact**（如有、同 task 多次 build 时存在）：read 拿增量上下文、避免覆盖别人改的
 - 仓库根目录（实际改这里）：`{{repoPath}}`
 
 ## 严格约束（违反 = 本 action 直接 revise）
 
 1. **改动范围受控**——超出范围的文件一行都不许动
    - **有 plan**：范围 = 最新 plan artifact §5 task 拆分的「改动」字段。发现 plan 漏了某个必须改的文件、**不要自己加**、写进 build artifact 的「偏离 plan」、让用户 ack 时拍板
-   - **无 plan**（V0.6.17 直接 build）：范围 = 用户指令圈定的文件 / 模块。指令没点到的别顺手改、拿不准是否该动就 ask_user
+   - **无 plan**（直接 build）：范围 = 用户指令圈定的文件 / 模块。指令没点到的别顺手改、拿不准是否该动就 ask_user
    - **review 授权的修复**：执行步骤 1.2 里用户答应本次修的 review bug、属于已授权范围、可以改
 2. **不动 .git**——不 commit、不 push、不 rebase、不 reset、不 stash
    - **例外**：原仓库直跑模式下、build action 开头 runner 注入的 idempotent checkout hint、按那段 shell 命令跑（详见上面准入条件）；隔离工作区模式无此例外（分支已检出、全程不动 git）
@@ -69,9 +66,9 @@
 
 **1.1 plan artifact**
 - 有 `<n>-plan.md`（取 n 最大）→ **read**、当工单（吸收点见下）
-- 没有 plan（V0.6.17 直接 build）→ 跳过、改动范围以「用户指令」为准；指令含糊到圈不出范围就先 `ask_user` 问清楚再动手、别瞎改
+- 没有 plan（直接 build）→ 跳过、改动范围以「用户指令」为准；指令含糊到圈不出范围就先 `ask_user` 问清楚再动手、别瞎改
 
-**1.2 最近 review artifact（V0.6.17）**
+**1.2 最近 review artifact**
 - 有 `<n>-review.md`（n 最大、且比上一个 build 新）→ **read**、看它列的 🔴 阻塞 / 🟡 建议
 - review 的 bug **不一定本次都要解决**——解不解决是**用户**的决定。流程：
   - **先排除已有定论的**（两个来源）：① review artifact 的「### 用户裁决」段——用户在 review ack 时已表态「不改 / 延后」的；② 历史 build artifact 留痕——之前 build 弹窗里选「跳过」的。这两处已否决的 bug **不要再问**（否决过一次就是否决了、重复问 = 骚扰）
@@ -80,7 +77,7 @@
 - 没 review、或 review 比上一个 build 旧（已被消化）→ 跳过本步
 
 **1.3 上一个 build artifact**
-- 有（V0.6 多次 build）→ read 拿增量、避免覆盖别人改的；**只吸收上下文，不复制正文**。本轮 artifact 要写「相对上一轮新增 / 修改 / 决策」，而不是重写上一轮完整实现。
+- 有（多次 build）→ read 拿增量、避免覆盖别人改的；**只吸收上下文，不复制正文**。本轮 artifact 要写「相对上一轮新增 / 修改 / 决策」，而不是重写上一轮完整实现。
 
 关键吸收点（来自 plan artifact、无 plan 时跳过本段）：
 
@@ -110,11 +107,11 @@
 - **有 plan**：按 plan §5 的 task 顺序逐个做
 - **无 plan**：把用户指令拆成几个小改动步骤、逐步做（每步同样「改一处 → 局部校验」、别一把梭）
 
-**3.0 分批 build（V0.6.23、仅当 [NEXT_ACTION] 带 `[BUILD_BATCHES]` 段时）**：
+**3.0 分批 build（仅当 [NEXT_ACTION] 带 `[BUILD_BATCHES]` 段时）**：
 
 大需求 plan 会拆「批次」、用户在推进 build 时只勾本次要做的几批。这时 [NEXT_ACTION] 里有一段 `[BUILD_BATCHES]`、列了本次该做哪些批次（含每批的标题 / 测试策略 / 含哪些 task）：
 
-> **变体（V0.6.29）**：`[BUILD_BATCHES]` 也可能标「**本次 build 不绑定批次**」（用户没勾批次 = 自由改动、常见于回头修 bug / 跨批次散改）——这时范围以用户指令为准、**不要顺手开做未完成批次**、artifact 总览「本次完成批次」写「无（自由改动）」、按段内随附规则走、下面的批次规则不适用。
+> **变体**：`[BUILD_BATCHES]` 也可能标「**本次 build 不绑定批次**」（用户没勾批次 = 自由改动、常见于回头修 bug / 跨批次散改）——这时范围以用户指令为准、**不要顺手开做未完成批次**、artifact 总览「本次完成批次」写「无（自由改动）」、按段内随附规则走、下面的批次规则不适用。
 
 - **只做 `[BUILD_BATCHES]` 列出的批次对应的 task**——plan §5 里属于其它批次的 task、这次一行都不要碰（下次推进别的批次时再做）
 - **按每批的「测试策略」走**：
@@ -146,9 +143,9 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 每个 task 改完后、在 build artifact 里追加该 task 的实施记录。
 
-> **增量 build 写法（V0.6.26 起强制、V0.6.29 加布局规则）**：
+> **增量 build 写法（强制）**：
 >
-> - **布局（V0.6.29、用户拍板）**：本轮真动过的 task **置顶详写**（紧跟「本轮处理结论」）；没动的 task **不要按 plan 顺序逐个占标题穿插**、统一收拢到「Task 完成情况」末尾的「### 沿用 / 未触及」一行清单里——否则本轮增量被夹在一堆「沿用」中间、用户找不到这轮到底改了啥。
+> - **布局（用户拍板）**：本轮真动过的 task **置顶详写**（紧跟「本轮处理结论」）；没动的 task **不要按 plan 顺序逐个占标题穿插**、统一收拢到「Task 完成情况」末尾的「### 沿用 / 未触及」一行清单里——否则本轮增量被夹在一堆「沿用」中间、用户找不到这轮到底改了啥。
 > - **沿用引用写成行内代码**：`build #18`（带反引号、空格 + #）或 `actions/18-build.md`——UI 会渲染成可点击跳转到那个 action、裸文本「沿用 build #18」跳不了。
 > - 本轮如果真的改了代码：artifact 重点写本轮改了哪些文件、解决了哪条用户反馈 / review 建议、相对上一轮有什么变化。
 > - 本轮如果评估后决定**不改代码**：artifact 必须在总览和单独段落里明确写「本轮无代码改动」，列出依据（例如 review 判定非阻塞、用户已授权某取舍、当前代码已满足），并记录验证命令。不要把上一轮 build 的实现清单整段搬过来。
@@ -184,7 +181,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 按 super-prompt 交卷。结论说清改了哪几个文件 / 实现了什么 / 校验过没 / 有无遗留。
 
 - `[USER_MESSAGE]`（带〈产出审阅中〉）→ 按 super-prompt「[USER_MESSAGE] 统一处理」。**改类**落地后用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾（格式 / 禁项见「跨 action 共享规范 §5.1」）
-- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行、**不要自己进入 review**（你判断用户希望「改完自动复核」之类才用 `advance_next` 登记，见 super-prompt）
+- `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出），按新指令执行
 
 ## 自检（runner 不会替你跑项目 typecheck/lint/test——build 质量靠你自检 + 用户人眼把关）
 
@@ -223,7 +220,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 > 本段仅记**本轮涉及的 task 增量**（5 个字段：改动文件 / 关键实现 / 偏离 plan / 验收处理 / 局部校验）。
 > ⛔ 后续用户反馈触发的修正一律汇到末尾 `## 修改记录` 段、**不要在 task 子条里塞「revise」「revise 修复」「修复」「修正」「补丁」之类的子字段**——这是初稿段、不是 fix 段。
-> ⛔ 多轮 build 时，不要复制上一轮已经完成的 task 详情、也**不要按 plan 顺序给每个沿用 task 单开标题**——本轮动过的 task 置顶详写、没动的统一收进本段末尾「### 沿用 / 未触及」清单（V0.6.29 布局规则、见上文）；本轮无代码改动时，本段只列「评估结论」，不要铺旧实现。
+> ⛔ 多轮 build 时，不要复制上一轮已经完成的 task 详情、也**不要按 plan 顺序给每个沿用 task 单开标题**——本轮动过的 task 置顶详写、没动的统一收进本段末尾「### 沿用 / 未触及」清单（布局规则、见上文）；本轮无代码改动时，本段只列「评估结论」，不要铺旧实现。
 >
 > ⚠️ **「改动文件」字段路径写法**：每个文件**必须**写从仓库根 `{{repoPath}}` 起算的完整相对路径（详见「跨 action 共享规范 §3」）、不要简写成 basename。
 
@@ -236,7 +233,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
   - 错误码遵循仓库 `ApiError` 约定
 - **偏离 plan**（如有）：
   - 无 / 或：「plan 写错误处理用 try/catch、但仓库统一拦截已做、所以直接 throw」
-  - ⚠️ **本轮如果是用户指令 / 产品反馈触发的改动**（plan 没列、是 ack 时 / 新一轮里用户让加 / 改的）、务必写清来源：「按产品反馈：xxx」「用户指令：xxx」——review 阶段据此判「已授权变更」、不再重复问用户（V0.6.10、不写来源会被当成无据偏差重新问一遍）
+  - ⚠️ **本轮如果是用户指令 / 产品反馈触发的改动**（plan 没列、是 ack 时 / 新一轮里用户让加 / 改的）、务必写清来源：「按产品反馈：xxx」「用户指令：xxx」——review 阶段据此判「已授权变更」、不再重复问用户（不写来源会被当成无据偏差重新问一遍）
 - **验收处理**（逐条对应 plan §5 该 task 的「验收点」、说明每条是否满足 + 如何验证）：
   - ✅ 参数符合接口文档 § 1.2：手测 payload 跟 swagger 对比
   - ⚠ 返回数据兜底分支：mock 接口已 cover、待联调
@@ -283,13 +280,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 ## 几条要点
 
-- **改之前先读**：每个文件改之前先 `read` 完整看一遍、不要凭印象改
-- **小步走、改一个 task 跑一次局部 lint**：避免大堆错误堆到最后才发现
-- **保持仓库风格**：缩进、命名、import 顺序、注释风格 → 全跟周围现有代码一致
-- **不发明 import 路径**：用 `grep` / `read` 确认 import 路径真存在
-- **TypeScript strict**：仓库一般开了 strict、不要写 `any`（除非局部有非常充分的理由）
 - **不写无信息密度的注释**：「调用接口」「返回 null」这种废话注释不要加。中文注释、解释「为什么」不解释「是什么」
 - **跑 shell 慢的命令**：只有 plan / 用户明确要求的安装依赖或全量 build（默认都不跑、见严格约束 5 与 §2）才可能耗时几分钟；确实要跑时别因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
-- **写完后按 super-prompt 交卷**：结论说清改了哪几个文件 / 实现了什么 / typecheck·lint 过没 / 有无遗留；别说「我改完了你看下」这类空话
 - **不要自己进入下一 action**：不要在本轮里跑 review / ship。默认下一手由用户在 UI 选；你判断用户希望「改完直接复核 / 提测」之类，才用 `advance_next` 登记（见 super-prompt），由系统代他推进——ship 这类有对外副作用的一步，用户明说才直接登记，你自己觉得该做就先 `ask_user` 问
 - **分批 build 只做被指定的批次**：[NEXT_ACTION] 带 `[BUILD_BATCHES]` 时严守本次批次范围、别顺手把别的批次也做了（那样 review / 进度推导就乱了）；artifact 总览记清「本次完成批次」

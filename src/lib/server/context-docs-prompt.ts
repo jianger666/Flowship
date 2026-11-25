@@ -38,24 +38,11 @@ const renderContextDocBody = (doc: TaskContextDoc): string => {
 };
 
 /**
- * 渲染 contextDocs 段、空列表也会返回一段「目前没文档」的文本
- *
- * @param fallbackHint 没有任何 docs 时附加的提示语
- *                     - plan 模式：「→ 如果 plan phase 上下文极度缺失...」
- *                     - chat 模式：「→ 用户没传上下文文档、按对话内容判断要不要追问」
+ * 渲染 contextDocs 段；没有文档时返回空串（整段不注入——「用户没提供文档」不需要专门说一段，调用方对空串不占位）
  */
-export const renderContextDocsSection = (
-  task: Task,
-  fallbackHint?: string,
-): string => {
+export const renderContextDocsSection = (task: Task): string => {
   const docs = task.contextDocs ?? [];
-  if (docs.length === 0) {
-    const lines = ["## 用户提供的上下文文档（0 份）", "", "用户目前没有提供任何上下文文档。"];
-    if (fallbackHint) {
-      lines.push("", fallbackHint);
-    }
-    return lines.join("\n");
-  }
+  if (docs.length === 0) return "";
   const items = docs.map((doc, i) => {
     const idx = i + 1;
     let typeLabel: string;

@@ -18,18 +18,21 @@ import {
   useMemo,
   useRef,
   useState,
+  type FocusEvent,
   type FormEvent,
   type ReactNode,
 } from "react";
 import {
   ArrowLeft,
   ArrowRight,
+  BookMarked,
   Bot,
   ChevronRight,
   Code,
   ExternalLink,
   Globe,
   Hand,
+  History,
   Info,
   Loader2,
   Maximize2,
@@ -41,6 +44,7 @@ import {
   RotateCcw,
   RotateCw,
   Search,
+  Star,
   Trash2,
   User,
   VenetianMask,
@@ -63,6 +67,8 @@ import { Input } from "@/components/ui/input";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { insertIntoComposer } from "@/lib/composer-insert-bridge";
+import { findBookmarkByUrl } from "@/lib/browser-bookmarks";
+import type { AddressSuggestion } from "@/lib/browser-history";
 import type {
   ActivityActor,
   ActivityEntry,
@@ -71,6 +77,10 @@ import type {
   TabInfo,
 } from "@/lib/browser-bridge-types";
 import { cn } from "@/lib/utils";
+import { AddressInput } from "./address-input";
+import { BookmarkStar } from "./bookmark-star";
+import { bookmarkTargetOf, bookmarkToggleLabel, resolveBookmarkOpen } from "./bookmark-flow";
+import { BookmarkQuickList, BookmarksDialog, type OnOpenBookmark } from "./bookmarks-dialog";
 import { BrowserDialogBar } from "./browser-dialog-bar";
 import { BrowserExtraBars } from "./browser-extra-bars";
 import { BrowserDownloads } from "./browser-downloads";
@@ -105,10 +115,15 @@ import {
   tabTooltipText,
   type StatusBarModel,
 } from "./browser-status";
-import { runClearBrowsingData } from "./clear-data-flow";
+import { clearSuccessMessage, runClearBrowsingData } from "./clear-data-flow";
 import { pasteImageIntoComposer } from "./composer-image-paste";
+import { canOpenIncognitoTab, runOpenIncognitoTab } from "./incognito-flow";
+import { addressSuggestionsOf, clearHistorySuccessMessage, historyErrorText, runClearHistory } from "./history-flow";
 import { composePickedText } from "./pick-compose";
+import { useBookmarkActions } from "./use-bookmark-actions";
 import { useBrowserAvailable, useBrowserSession } from "./use-browser-session";
+import { useHistory } from "./use-history";
+import { useTypedVisitRecorder } from "./use-typed-visit-recorder";
 
 interface BrowserPanelProps {
   taskId: string;
@@ -459,20 +474,30 @@ const ActivityLog = memo(function ActivityLog({ recent }: { recent: ActivityEntr
   );
 });
 
-const EmptyState = () => (
-  <div className="absolute inset-0 flex items-center justify-center p-6">
-    <EmptyHint
-      variant="dashed"
-      size="lg"
-      align="center"
-      icon={<Globe className="size-6 text-muted-foreground" aria-hidden />}
-      className="max-w-sm"
-    >
-      <div className="text-sm font-medium text-foreground">还没有浏览器会话</div>
-      <p className="mt-1">
-        让 AI 去查资料或操作网页，会话会自动出现在这里；你也可以在上方地址栏输入网址，自己先开始。
-      </p>
-    </EmptyHint>
+const EmptyState = ({
+  onOpenBookmark,
+  onManageBookmarks,
+}: {
+  onOpenBookmark: OnOpenBookmark;
+  onManageBookmarks: () => void;
+}) => (
+  // 内层 m-auto：内容矮时居中，高了从顶部起滚动（justify-center 在溢出时会把顶部裁掉）；没有收藏时快捷列表不渲染
+  <div className="absolute inset-0 flex overflow-y-auto p-6">
+    <div className="m-auto flex w-full max-w-sm flex-col items-center gap-4">
+      <EmptyHint
+        variant="dashed"
+        size="lg"
+        align="center"
+        icon={<Globe className="size-6 text-muted-foreground" aria-hidden />}
+        className="w-full"
+      >
+        <div className="text-sm font-medium text-foreground">还没有浏览器会话</div>
+        <p className="mt-1">
+          让 AI 去查资料或操作网页，会话会自动出现在这里；你也可以在上方地址栏输入网址，自己先开始。
+        </p>
+      </EmptyHint>
+      <BookmarkQuickList onOpen={onOpenBookmark} onManage={onManageBookmarks} />
+    </div>
   </div>
 );
 
@@ -486,6 +511,9 @@ const BrowserPanelInner = ({
 }: BrowserPanelProps) => {
   const { state } = useBrowserSession(taskId);
   const { confirm } = useDialog();
+  // 地址栏记忆：只记「用户亲自敲的网址、且成功打开了」的访问（判定见 typed-visit.ts）；AI 导航 / 无痕标签 / 搜索词都不走这条
+  const history = useHistory();
+  const { begin: beginTypedVisit } = useTypedVisitRecorder({ tabs: state?.tabs, record: history.record });
 
   const exists = !!state?.exists;
   // 空状态下用户输入网址 = 要启动会话：这时才 attach（attach 会懒创建会话与渲染进程）
@@ -494,32 +522,43 @@ const BrowserPanelInner = ({
 
   const stateRef = useRef<BrowserState | null>(state);
   stateRef.current = state;
-  // 会话还没建好时输入的网址：等视口 attach 成功后再导航
-  const pendingNavRef = useRef<string | null>(null);
+  // 会话还没建好时输入的网址：等视口 attach 成功后再导航（remember = 这次导航是用户在地址栏敲 / 联想里选的，成功了要记进地址栏记忆）
+  const pendingNavRef = useRef<{ text: string; remember: boolean } | null>(null);
 
   const doNavigate = useCallback(
-    async (input: string) => {
+    async (input: string, remember: boolean) => {
       const bridge = window.__browser;
       if (!bridge) return;
+      // 提交那一刻的活动标签：地址栏记忆靠它判断「有没有离开出发地」（状态推送有去抖，此刻读到的还是出发地）
+      const before = findActiveTab(stateRef.current);
+      const startedAt = Date.now();
       try {
         const res = await bridge.navigate(taskId, input);
-        if (!res.ok) toast.error(res.error ?? "无法打开这个地址");
+        if (!res.ok) {
+          toast.error(res.error ?? "无法打开这个地址");
+          return;
+        }
+        // 只记地址栏里敲的网址：搜索词（kind=search）不记；老壳不回 url / kind → 也不记；
+        // 聊天链接 / 预览入口 / 点收藏项（remember=false）也不记——它们不是「用户敲过的网址」
+        if (remember && res.kind === "url" && typeof res.url === "string") {
+          beginTypedVisit({ url: res.url, tabId: before?.id ?? null, startUrl: before?.url ?? "", startedAt });
+        }
       } catch (err) {
         toast.error(`打开失败：${err instanceof Error ? err.message : String(err)}`);
       }
     },
-    [taskId],
+    [taskId, beginTypedVisit],
   );
 
   const navigate = useCallback(
-    (raw: string) => {
+    (raw: string, { remember = false }: { remember?: boolean } = {}) => {
       const text = raw.trim();
       if (!text) return;
       if (stateRef.current?.exists) {
-        void doNavigate(text);
+        void doNavigate(text, remember);
         return;
       }
-      pendingNavRef.current = text;
+      pendingNavRef.current = { text, remember };
       setStarted(true);
     },
     [doNavigate],
@@ -529,7 +568,7 @@ const BrowserPanelInner = ({
     const pending = pendingNavRef.current;
     if (!pending) return;
     pendingNavRef.current = null;
-    void doNavigate(pending);
+    void doNavigate(pending.text, pending.remember);
   }, [doNavigate]);
 
   // 聊天里的链接 / 本地 HTML 要求「在新标签打开」：会话已存在且当前标签有内容 → newTab；失败（地址被策略拒绝等）给个提示
@@ -592,6 +631,24 @@ const BrowserPanelInner = ({
 
   const activeTab = findActiveTab(state);
 
+  // 收藏：地址栏星标 / 「更多」菜单 / 收藏夹对话框 / 空白页快捷列表共用一份 store（use-bookmark-actions.ts）。
+  // 只有 http(s) 网页能收藏：bookmarkTarget 为 null（没会话 / about:blank / 错误页）→ 星标不画、菜单项置灰
+  const bookmarkApi = useBookmarkActions();
+  const [bookmarksOpen, setBookmarksOpen] = useState(false);
+  const bookmarkTarget = exists ? bookmarkTargetOf(activeTab) : null;
+  const starred = bookmarkTarget ? findBookmarkByUrl(bookmarkApi.bookmarks, bookmarkTarget.url) !== undefined : false;
+  const toggleBookmark = () => {
+    if (bookmarkTarget) void bookmarkApi.toggle(bookmarkTarget);
+  };
+  // 点收藏项：默认在当前标签打开（没会话时 navigate 会启动会话）；「新标签页打开」只在会话已存在时才走 newTab
+  const openBookmark = useCallback<OnOpenBookmark>(
+    (url, { newTab }) => {
+      if (resolveBookmarkOpen({ newTab, sessionExists: stateRef.current?.exists === true }) === "new-tab") void openInNewTab(url);
+      else navigate(url);
+    },
+    [navigate, openInNewTab],
+  );
+
   // 页内查找条（契约 §14.3）：记「在哪个 tab 上打开的」——切 tab 后条自然收起，不用 effect 同步 state
   const [findTabId, setFindTabId] = useState<string | null>(null);
   const [findToken, setFindToken] = useState(0);
@@ -618,10 +675,44 @@ const BrowserPanelInner = ({
   const addressValue = editing ? draft : currentUrl;
   const loading = !!activeTab?.loading;
 
+  // 地址联想（地址栏记忆）：只在用户敲了字之后出；聚焦时刻记下「现在」——联想按「多久没去了」排序，渲染里不能调 Date.now()
+  const [typed, setTyped] = useState(false);
+  const [focusedAt, setFocusedAt] = useState(0);
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const suggestions = useMemo(
+    () =>
+      addressSuggestionsOf({
+        editing,
+        typed,
+        query: draft,
+        history: history.history,
+        bookmarks: bookmarkApi.bookmarks,
+        now: focusedAt,
+      }),
+    [editing, typed, draft, history.history, bookmarkApi.bookmarks, focusedAt],
+  );
+  const onFocusAddress = (e: FocusEvent<HTMLInputElement>) => {
+    setDraft(currentUrl);
+    setTyped(false);
+    setFocusedAt(Date.now());
+    setEditing(true);
+    e.currentTarget.select();
+    // 别的窗口 / 别的任务可能改过记忆：每次聚焦拉一次最新的（失败静默，用已有的）
+    void history.reload();
+  };
+  const submitAddress = (text: string) => {
+    setTyped(false);
+    navigate(text, { remember: true });
+    (document.activeElement as HTMLElement | null)?.blur();
+  };
   const onSubmitAddress = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    navigate(draft);
-    (document.activeElement as HTMLElement | null)?.blur();
+    submitAddress(draft);
+  };
+  const pickSuggestion = (s: AddressSuggestion) => submitAddress(s.url);
+  const removeSuggestion = (s: AddressSuggestion) => {
+    if (s.historyId === null) return;
+    history.remove(s.historyId).catch((err) => toast.error(`删除失败：${historyErrorText(err)}`));
   };
 
   const statusModel = describeStatusBar(state);
@@ -635,6 +726,13 @@ const BrowserPanelInner = ({
   const downloads = useMemo(() => readDownloads(state?.downloads), [state?.downloads]);
   const bridgeCaps = typeof window === "undefined" ? undefined : window.__browser;
   const canOpenDevTools = typeof bridgeCaps?.openDevTools === "function";
+  // 老壳没有 newIncognitoTab：不画入口（不能退化成 newTab，见 incognito-flow.ts）
+  const canIncognito = canOpenIncognitoTab(bridgeCaps);
+  const openIncognito = () =>
+    void runOpenIncognitoTab({
+      open: () => window.__browser?.newIncognitoTab?.(taskId),
+      onError: (msg) => toast.error(msg),
+    });
 
   const openExternal = () => {
     if (!isExternalOpenableUrl(activeTab?.url)) return;
@@ -644,12 +742,22 @@ const BrowserPanelInner = ({
     else window.open(url, "_blank", "noopener,noreferrer");
   };
 
+  // 清除地址栏记忆（只清联想用的网址记录；收藏夹 / 登录状态不动）：先确认，取消绝不碰数据
+  const clearHistory = async () => {
+    await runClearHistory({
+      confirm,
+      clear: history.clear,
+      onSuccess: (removed) => toast.success(clearHistorySuccessMessage(removed)),
+      onError: (msg) => toast.error(`清除失败：${msg}`),
+    });
+  };
+
   // 确认 → 清除的流程与设置页共用（clear-data-flow.ts）：同一份文案、取消绝不碰数据
   const clearData = async () => {
     await runClearBrowsingData({
       confirm,
       clear: () => window.__browser?.clearBrowsingData(),
-      onSuccess: () => toast.success("已清除浏览器登录数据"),
+      onSuccess: (result) => toast.success(clearSuccessMessage(result)),
       onError: (msg) => toast.error(`清除失败：${msg}`),
     });
   };
@@ -674,6 +782,7 @@ const BrowserPanelInner = ({
           内层 min-w-0 overflow-hidden 是最后一道兜底：真有放不下的组合，宁可裁掉也别把面板撑出横向滚动条 */}
       <div className="@container min-w-0 shrink-0">
         <div
+          ref={toolbarRef}
           data-slot="browser-toolbar"
           className="relative flex min-w-0 items-center gap-1 overflow-hidden border-b px-2 py-1.5 @max-[360px]:gap-0.5 @max-[360px]:px-1"
         >
@@ -715,29 +824,36 @@ const BrowserPanelInner = ({
               <span className="min-w-0 flex-1 truncate">正在拾取，点击页面元素；Esc 取消</span>
             </div>
           ) : (
-            <form onSubmit={onSubmitAddress} className="min-w-0 flex-1">
-              <Input
-                type="text"
+            <form onSubmit={onSubmitAddress} className="relative min-w-0 flex-1">
+              {/* 输入框 + 地址联想下拉（见 address-input.tsx）；联想与排序、记忆的来源与存储见 lib/browser-history.ts */}
+              <AddressInput
                 value={addressValue}
-                aria-label="地址栏"
-                placeholder={exists ? "输入网址或搜索词" : "输入网址开始浏览"}
-                spellCheck={false}
-                autoComplete="off"
-                className="h-7 text-xs md:text-xs"
-                onFocus={(e) => {
-                  setDraft(currentUrl);
-                  setEditing(true);
-                  e.currentTarget.select();
+                onTextChange={(text) => {
+                  setDraft(text);
+                  setTyped(true);
                 }}
+                onFocus={onFocusAddress}
                 onBlur={() => setEditing(false)}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") {
-                    setEditing(false);
-                    e.currentTarget.blur();
-                  }
+                onEscape={(input) => {
+                  setEditing(false);
+                  input.blur();
                 }}
+                suggestions={suggestions}
+                onPick={pickSuggestion}
+                onRemove={removeSuggestion}
+                anchorRef={toolbarRef}
+                placeholder={exists ? "输入网址或搜索词" : "输入网址开始浏览"}
+                // 星标画在输入框里（见 bookmark-star.tsx）：给它留右内边距；窄于 360px 星标让位（「更多」菜单里有同样的入口），边距一并收回
+                className={cn("h-7 text-xs md:text-xs", bookmarkTarget && "pr-8 @max-[360px]:pr-2.5")}
               />
+              {bookmarkTarget && (
+                <BookmarkStar
+                  starred={starred}
+                  busy={bookmarkApi.busy}
+                  onToggle={toggleBookmark}
+                  className="@max-[360px]:hidden"
+                />
+              )}
             </form>
           )}
 
@@ -780,6 +896,27 @@ const BrowserPanelInner = ({
               </DropdownMenuTrigger>
             </Tooltip>
             <DropdownMenuContent align="end" className="min-w-52">
+              {canIncognito && (
+                <>
+                  <DropdownMenuItem onClick={openIncognito}>
+                    <VenetianMask className="size-3.5" />
+                    新建无痕标签页
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </>
+              )}
+              <DropdownMenuItem onClick={toggleBookmark} disabled={!bookmarkTarget || bookmarkApi.busy}>
+                <Star className={cn("size-3.5", starred && "fill-warning text-warning")} />
+                {bookmarkToggleLabel(starred)}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setBookmarksOpen(true)}>
+                <BookMarked className="size-3.5" />
+                收藏夹…
+                {bookmarkApi.bookmarks.length > 0 && (
+                  <span className="ml-auto pl-3 text-xs tabular-nums text-muted-foreground">{bookmarkApi.bookmarks.length}</span>
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
               <DropdownMenuItem onClick={openFind} disabled={!exists}>
                 <Search className="size-3.5" />
                 在页面中查找
@@ -820,6 +957,10 @@ const BrowserPanelInner = ({
                 在系统浏览器打开当前页
               </DropdownMenuItem>
               <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => void clearHistory()}>
+                <History className="size-3.5" />
+                清除浏览历史
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => void clearData()} className="text-destructive">
                 <Trash2 className="size-3.5" />
                 清除登录数据
@@ -892,10 +1033,14 @@ const BrowserPanelInner = ({
       {findOpen && <BrowserFindBar taskId={taskId} focusToken={findToken} onClose={closeFind} />}
 
       <BrowserViewport taskId={taskId} attachEnabled={attachEnabled} onAttached={handleAttached}>
-        {!attachEnabled && <EmptyState />}
+        {!attachEnabled && (
+          <EmptyState onOpenBookmark={openBookmark} onManageBookmarks={() => setBookmarksOpen(true)} />
+        )}
       </BrowserViewport>
 
       {exists && <ActivityLog recent={recent ?? []} />}
+
+      <BookmarksDialog open={bookmarksOpen} onOpenChange={setBookmarksOpen} onOpen={openBookmark} />
     </div>
   );
 };

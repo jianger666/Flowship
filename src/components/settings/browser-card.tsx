@@ -18,7 +18,7 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
-import { runClearBrowsingData } from "@/components/browser/clear-data-flow";
+import { clearSuccessMessage, runClearBrowsingData } from "@/components/browser/clear-data-flow";
 import { Button } from "@/components/ui/button";
 import { IntInput } from "@/components/ui/int-input";
 import { SettingRow } from "@/components/ui/setting-row";
@@ -99,12 +99,13 @@ export const BrowserSection = ({
       clear: async () => {
         setBusy(true);
         try {
-          await api.clearBrowsingData();
+          // 要把主进程的结果（重新加载了几个标签）原样交回去给 onSuccess 出提示，所以这里 return 而不是丢弃
+          return await api.clearBrowsingData();
         } finally {
           setBusy(false);
         }
       },
-      onSuccess: () => toast.success("已清除内置浏览器的登录数据"),
+      onSuccess: (result) => toast.success(clearSuccessMessage(result)),
       onError: (msg) => toast.error(`清除失败：${msg}`),
     });
   };

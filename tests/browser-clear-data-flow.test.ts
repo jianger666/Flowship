@@ -12,6 +12,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   CLEAR_BROWSING_DATA_CONFIRM,
+  clearSuccessMessage,
+  reloadedTabsOf,
   runClearBrowsingData,
   type ClearDataDeps,
 } from "@/components/browser/clear-data-flow";
@@ -41,6 +43,20 @@ describe("runClearBrowsingData", () => {
     expect(CLEAR_BROWSING_DATA_CONFIRM.confirmLabel).toBe("清除");
     expect(CLEAR_BROWSING_DATA_CONFIRM.description).toContain("所有网站");
     expect(CLEAR_BROWSING_DATA_CONFIRM.description).toContain("所有任务共用");
+  });
+
+  it("确认框文案写明副作用：已打开的网页会重新加载（未保存的内容丢失）、无痕标签不受影响", () => {
+    // 不停下页面的话页面里的内存 token 会把登录态写回；停下就意味着页面会重新加载——要在用户点之前就让他知道
+    expect(CLEAR_BROWSING_DATA_CONFIRM.description).toContain("已打开的网页会重新加载");
+    expect(CLEAR_BROWSING_DATA_CONFIRM.description).toContain("未保存");
+    expect(CLEAR_BROWSING_DATA_CONFIRM.description).toContain("无痕标签页不受影响");
+  });
+
+  it("onSuccess 收到 clear 的返回值（主进程给的 { reloadedTabs }），用来出提示", async () => {
+    const { deps, onSuccess } = makeDeps({ clear: vi.fn(async () => ({ reloadedTabs: 2 })) });
+    await runClearBrowsingData(deps);
+    expect(onSuccess).toHaveBeenCalledTimes(1);
+    expect(onSuccess).toHaveBeenCalledWith({ reloadedTabs: 2 });
   });
 
   it("用户确认 → 先 confirm、再 clear、最后 onSuccess（顺序钉死）", async () => {
@@ -108,6 +124,21 @@ describe("runClearBrowsingData", () => {
   });
 });
 
+describe("clearSuccessMessage / reloadedTabsOf：重新加载了页面就说一声", () => {
+  it("有标签被重新加载 → 提示里带数量（否则用户会奇怪页面为什么自己刷新了）", () => {
+    expect(clearSuccessMessage({ reloadedTabs: 3 })).toBe("已清除浏览器登录数据，已重新加载 3 个标签页");
+    expect(reloadedTabsOf({ reloadedTabs: 1 })).toBe(1);
+  });
+
+  it("0 个 / 老壳返回 undefined / 形状不对 → 只说已清除，绝不因为返回值形状把「成功」变成报错", () => {
+    const plain = "已清除浏览器登录数据";
+    for (const r of [{ reloadedTabs: 0 }, undefined, null, {}, "x", 5, { reloadedTabs: "2" }, { reloadedTabs: -1 }, { reloadedTabs: 1.5 }, { reloadedTabs: Number.NaN }]) {
+      expect(clearSuccessMessage(r), JSON.stringify(r)).toBe(plain);
+      expect(reloadedTabsOf(r)).toBe(0);
+    }
+  });
+});
+
 describe("接线（源码契约）", () => {
   const root = path.resolve(import.meta.dirname, "..");
   const read = (rel: string) => readFileSync(path.join(root, rel), "utf8");
@@ -127,5 +158,17 @@ describe("接线（源码契约）", () => {
     const panel = strip(read("src/components/browser/browser-panel.tsx"));
     expect(panel).toMatch(/runClearBrowsingData\(\{\s*confirm,/);
     expect(panel).not.toContain("清除浏览器登录数据？");
+  });
+
+  it("两处成功提示都走 clearSuccessMessage（带重新加载的标签数）；设置页把主进程的结果交回去而不是丢弃", () => {
+    const card = strip(read("src/components/settings/browser-card.tsx"));
+    const panel = strip(read("src/components/browser/browser-panel.tsx"));
+    const ok = /onSuccess:\s*\(result\)\s*=>\s*toast\.success\(clearSuccessMessage\(result\)\)/;
+    expect(card).toMatch(ok);
+    expect(panel).toMatch(ok);
+    expect(card).toMatch(/return await api\.clearBrowsingData\(\)/);
+    // 不再各写各的固定文案
+    expect(card).not.toContain("已清除内置浏览器的登录数据");
+    expect(panel).not.toMatch(/toast\.success\("已清除/);
   });
 });

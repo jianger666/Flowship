@@ -145,7 +145,8 @@ interface BrowserBridge {
   setCovered(taskId: string, covered: boolean): Promise<string | null>
         // covered=true：对视图截图 → 隐藏视图 → 返回 jpeg dataURL（UI 画占位图）；covered=false：恢复显示；失败返回 null
   // —— 用户导航（地址栏 / 按钮，走 URL 策略；裸词按搜索处理 https://www.bing.com/search?q=）——
-  navigate(taskId: string, input: string): Promise<{ ok: boolean; error?: string }>
+  navigate(taskId: string, input: string): Promise<{ ok: boolean; error?: string; url?: string; kind?: "url" | "search" }>
+        // 成功时多带「解析后的目标地址 + 类型」（地址栏记忆据此登记，§21；老壳不带这两个字段 → 渲染侧不记）；失败只有 error
   back(taskId: string): void;  forward(taskId: string): void;  reload(taskId: string): void;  stop(taskId: string): void
   newTab(taskId: string, url?: string): Promise<string | null>
   selectTab(taskId: string, tabId: string): void
@@ -160,7 +161,7 @@ interface BrowserBridge {
   getState(taskId: string): Promise<BrowserState | null>
   onState(cb: (taskId: string, state: BrowserState) => void): () => void   // 推送全部任务的状态（主进程 50ms 去抖），返回取消订阅
   onPicked(cb: (taskId: string, picked: PickedElement) => void): () => void
-  clearBrowsingData(): Promise<void>                              // 清登录态（cookies/storage），面板溢出菜单用
+  clearBrowsingData(): Promise<{ reloadedTabs: number } | void>   // 清登录态（cookies/storage），面板溢出菜单与设置页用；先终止已打开的页面、清完再回原地址（§20.1），返回重新加载了几个标签（老壳返回 undefined）
 }
 interface Bounds { x:number; y:number; width:number; height:number }   // CSS 像素，相对主窗口内容区左上角，主进程取整
 interface BrowserState {
@@ -443,7 +444,7 @@ server `src/lib/server/browser/tools.ts`：各切片的工具定义放在文件�
 | HTTP Basic / Digest / 代理认证 | `login` 事件 → 面板「等待你处理」条，**只有用户能输入**，凭据不经过 AI / 日志 / 状态，Flowship 层不记住（Chromium 认证缓存任务结束时清，见 A3），60s 无人处理取消 | 无开关 |
 | 证书错误 | `certificate-error` 默认拒绝，用户在面板上「仅本次对该主机继续」；loopback 自签证书可自动放行，工具结果里标注 | `browserTrustLoopbackCerts` **默认开** |
 | 多档案 / 无痕 | 仅**临时无痕标签**（内存 partition，关闭即销毁）；多个持久档案仍不做（用户已拍板共享单档案） | 无开关 |
-| 网络请求拦截 / mock | `browser_network_rules`：block / set_headers / mock / fail / delay，每 tab ≤ 20 条、仅存在规则时才 `Fetch.enable`、Flowship origin 不生效、面板常驻横幅 + 一键清除、用户接管时自动暂停 | `browserAdvancedTools` **默认开**（整组高级调试工具） |
+| 网络请求拦截 / mock | `browser_network_rules`：block / set_headers / mock / fail / delay，每 tab ≤ 20 条、仅存在规则时才 `Fetch.enable`、Flowship origin 不生效、面板常驻横幅 + 一键清除、用户接管时自动暂停 | `browserAdvancedTools` **默认关**（整组高级调试工具） |
 
 另新增（§15）：页面权限（`browser_permissions`，`browserPagePermissions` 默认关；修掉「定位模拟被拒」）、`evaluate` 审批卡（`browserEvaluateEnabled` 语义改为「免审批」）、网络响应体读取开关（`browserNetworkBodyRead` 默认开）、标签上限可配（`browserMaxTabs`）。
 
@@ -461,7 +462,7 @@ server `src/lib/server/browser/tools.ts`：各切片的工具定义放在文件�
 
 ### 14.4 状态 / 类型增量（主 agent 已加进 `src/lib/browser-bridge-types.ts`，`downloads` 由 V3 生产、`dialog` / `emulation` 由 V5 生产，V4 消费）
 
-`TabInfo` += `emulation?: string | null`、`zoom?: number`；`BrowserState` += `windowFocused?: boolean`（R1-35，见 §5）、`dialog?: DialogInfo | null`、`downloads?: DownloadInfo[]`（类型上是可选的，免得老测试夹具与老壳报类型错；**主进程总是给**：`emptyState` 与 `buildState` 必须给默认值 `dialog:null, downloads:[]`，UI 读取时仍要容忍缺省）；新增类型 `DownloadInfo` / `DialogInfo` / `FoundInPage`。server 侧 `BrowserTabInfo` 同步加了 `emulation?`。
+`TabInfo` += `emulation?: string | null`、`zoom?: number`、`loadFailed?: true`（§21：最近一次导航加载失败时才有、新导航一开始就清；只给渲染端用，AI 工具的标签输出是显式挑字段、不带它）；`BrowserState` += `windowFocused?: boolean`（R1-35，见 §5）、`dialog?: DialogInfo | null`、`downloads?: DownloadInfo[]`（类型上是可选的，免得老测试夹具与老壳报类型错；**主进程总是给**：`emptyState` 与 `buildState` 必须给默认值 `dialog:null, downloads:[]`，UI 读取时仍要容忍缺省）；新增类型 `DownloadInfo` / `DialogInfo` / `FoundInPage`。server 侧 `BrowserTabInfo` 同步加了 `emulation?`。
 
 **设备模拟下的视图适配（`TabInfo.viewFit?` / `TabInfo.fitScale?`）**：设备模拟（`emulate`）把页面视口固定成 `width × height`（DIP），原生视图和它不一样大时：**视图比它大** → 多出来的是白板（A：视图收窄成模拟尺寸、**水平居中、顶部对齐**，DevTools 设备模式的摆法，两边是占位 div 的底色）；**视图比它小** → 页面被裁切（B：整体缩小适应，等价 DevTools 的「Fit to window」）。
 - **B 的做法**：模拟视口宽高都明确（预设一定满足；只给宽或高、另一维自适应的不缩放，只走 A）且比槽位大时，`scale = min(1, 槽位宽/模拟宽, 槽位高/模拟高)`（向下取 3 位小数，不放大，低于 0.1 不缩），发 `Emulation.setDeviceMetricsOverride { …原参数, scale, dontSetVisibleSize:true }`，原生视图收成 `floor(模拟尺寸 × scale)`、居中。**`scale` 必须和 `dontSetVisibleSize:true` 一起给**——不给时 Chromium 会再按「视图/模拟尺寸」缩一次（0.6 变成 0.36），且结果取决于设置顺序；给了之后任何顺序下页面都恰好铺满视图（真机探针 + r10 验证）。
@@ -671,7 +672,7 @@ E1 收尾时用探针（真 Electron）发现「`browser_network` 里看不到�
 | `browserPagePermissions` | `pagePermissions` | **关**（只认显式 true） | 允许 AI `browser_permissions grant / deny / reset`（A8） |
 | `browserTrustLoopbackCerts` | `trustLoopbackCerts` | **开**（显式 false 才关） | 自动放行**真正回环**（`localhost` / `*.localhost` / `127.0.0.0/8` / `::1`）的自签证书错误（A4）；`*.local`（mDNS，局域网设备名）**不放行、走询问**（R6-23） |
 | `browserNetworkBodyRead` | `networkBodyRead` | **开**（显式 false 才关） | 允许读网络请求 / 响应体（已走脱敏管线；从 `evaluate` 总闸里拆出，A7） |
-| `browserAdvancedTools` | （仅 server 用） | **开**（显式 false 才关） | 注册「高级调试」工具组（network_rules / perf / sources / debug / record）；对新会话生效 |
+| `browserAdvancedTools` | （仅 server 用） | **关**（只认显式 true） | 注册「高级调试」工具组（network_rules / perf / sources / debug / record）；对新会话生效 |
 | `browserMaxTabs` | `maxTabs` | 20（5–60 整数；`onConfig` 收到坏值保持原值，`session.maxTabs()` 读到越界值时按 20 兜底） | 单任务标签页上限（C6） |
 | `browserEvaluateEnabled`（既有） | `evaluateEnabled` | 关 | **语义变化（A7）**：不再决定「工具是否注册」，而是「是否免审批」：`browser_evaluate` 始终注册，没开时调用会弹审批卡 |
 
@@ -851,7 +852,7 @@ E1 收尾时用探针（真 Electron）发现「`browser_network` 里看不到�
 - 平台限制：Electron 不实现 `window.prompt()`，`dialog` 工具的 `promptText` 实际不可达。未覆盖：`beforeunload` 对话框、`import_state` 之后 IndexedDB 的还原。
 - 其它集成改动：`browser_network` 的 `network_detail` 规整多了 `frameLimit`（默认 50，≤ 200）；`eslint.config.mjs` 忽略 `electron-app/browser/vendor/**`；`browser-tool-display.ts` 补了 `annotate` / `scroll_into_view` / `until_stable` 的折叠行文案。
 
-**工具体量预算（`tests/browser-tools-r1.test.ts` R1-34 已改写）**：R1 的 26 个工具总量 ≤ 13700（R1 阶段 ≤ 9000；E2 给既有工具加了大量参数，当时实测 13318，第二十三轮重量为 13342）；E2 新增 9 个工具总量 ≤ 9800（当时实测 9369，第二十三轮重量为 9669——往 `browser_permissions` 的描述里并了两小句，见 §19.4）；单个工具 ≤ 1900（最大是 `browser_emulate` ≈ 1850）；描述仍 ≤ 2 句。高级组（`browserAdvancedTools`）关掉后每轮 prompt 约少 6.4k 字符（R6 复测 6447，口径 = `name + description + JSON.stringify(parameters)`；原文写「约 5k」偏低）。预算阈值是「实测值 + 3–5%」，实际成了棘轮——后续新增能力应先瘦 `emulate` / `network_rules` / `sources` / `network` 的 schema，再决定是否抬阈值。
+**工具体量预算（`tests/browser-tools-r1.test.ts` R1-34 已改写）**：R1 的 26 个工具总量 ≤ 13700（R1 阶段 ≤ 9000；E2 给既有工具加了大量参数，当时实测 13318，第二十三轮重量为 13342）；E2 新增 9 个工具总量 ≤ 9800（当时实测 9369，第二十三轮重量为 9669——往 `browser_permissions` 的描述里并了两小句，见 §19.4）；单个工具 ≤ 1900（最大是 `browser_emulate` ≈ 1850）；描述仍 ≤ 2 句。高级组（`browserAdvancedTools`，默认关）打开后每轮 prompt 约多 6.4k 字符（R6 复测 6447，口径 = `name + description + JSON.stringify(parameters)`；原文写「约 5k」偏低）。预算阈值是「实测值 + 3–5%」，实际成了棘轮——后续新增能力应先瘦 `emulate` / `network_rules` / `sources` / `network` 的 schema，再决定是否抬阈值。
 
 ### 15.7 真机脚本清单与「未实机验证」
 
@@ -1135,3 +1136,73 @@ E1 收尾时用探针（真 Electron）发现「`browser_network` 里看不到�
 - **桩钩子在 tab 已销毁时不写「桩装不上」**（第二十六轮 T-6）：弹窗一出来就关（OAuth 之类）时，在飞的安装命令失败会写一行误导日志、进失败记录；现在 `tab.destroyed` 时静默。同一类的另一处——补装当前文档失败的那行日志——我一并加了同样的判断（评审只点了前一处，在此披露）。反悔：去掉两处 `destroyed` 判断。
 - **删掉 e2-infra 里两条复述源码布局的正则**（第二十六轮 X-4）：依据见 §19.5 第二十六轮变异（行为用例单独就能杀死对应的突变）。代价：这两处实现被改坏时，只有 `browser-tab-eval-in-frames` 的行为用例会红（一处不再冗余覆盖）。反悔：把那两条正则加回 `browser-e2-infra.test.ts`——不建议（纯格式改动就假红）。
 - **崩溃循环用例的崩溃次数取 10**（第二十六轮 X-2）：有限值下，实现被改成无界追逐时用例变红；`Infinity` 会卡死。10 远大于 `CDP_HEAL_MAX_ROUNDS`、够区分「追两轮」与「一直追」。反悔：改大 / 改小那个常数即可。
+
+## 20. 用户侧三件事：「清除登录数据」没清干净、加收藏、加无痕入口（2026-11-25 用户反馈：「浏览器可以加上收藏，加上无痕模式，然后清除登录数据好像有问题」）
+
+### 20.1 「清除登录数据」：清完又被页面写回（根因与修复）
+
+- **现象**：点了「清除登录数据」，刷新页面仍是登录状态。真机探针（Electron 42，持久 partition，页面带内存 token + 续期心跳）实测：只调 `clearStorageData` 时，**返回的瞬间** cookie / localStorage / sessionStorage 确实是空的，但**还开着的页面里 JS 没停**——内存里的 access token 与续期心跳会在 1～2 秒内把 HttpOnly 登录 cookie 重新种回、把 localStorage 写回，约 30 秒后落盘。
+- **修复**（`electron-app/browser/clear-data.mjs`，在 `browser:clearBrowsingData` 里接入）：对持久档案里所有 http(s) 标签（非无痕、非空白页 / 错误页 / 非 http(s)、非 Flowship 自身地址；**跨任务**——清除本来就作用于整份持久档案）做「终止 → 清除 → 恢复」：① `loadURL("about:blank")` 终止页面（旧文档卸载、在途请求取消、定时器 / 心跳 / persist 回写全停）；② 照旧清 cookies / storage / cache / authCache / 例外表并断连；③ 回到原地址（走 `loadUrlByUser`），页面以登出态重新加载，再把终止与恢复多出来的两条历史（`about:blank` 与旧的同址条目）修剪掉，后退栈与当前下标复原。恢复放在 `finally`：清除失败也要把页面还回去。
+- **beforeunload**：页面带离开确认（编辑中的表单）时 Electron 默认静默取消导航（`ERR_ABORTED`、页面原地不动），所以终止期间临时挂 `will-prevent-unload` 强制放行（用户已在确认框里同意「已打开的网页会重新加载」），终止后摘掉监听。页面刚被 beforeunload 拦过一次导航时，那个离开确认框还挂在 Tab 上（CDP 把它挂成 `pendingDialog`），Chromium 要一两秒才结算、期间新导航会 `ERR_FAILED`（探针 D）：终止前**先确认掉它**（只碰 beforeunload——页面自己的 confirm / alert / prompt 一律不替用户点，那可能是「确定删除全部？」）；仍遇到 `ERR_FAILED`（Tab 没跟踪到的残留）才在总时限内按 100 / 250 / 500 / 1000 ms 重试，别的失败不重试（重试只会和用户的另一次导航抢）。每个标签终止最多等 3 秒（各标签并发），超时的标签在恢复阶段补救。
+- **单飞**：面板菜单与设置页都有入口，并发的两轮「终止 → 清除 → 恢复」会互相踩；后来者直接复用进行中的这一轮（拿到同一个结果），结束后可以再来；上一轮失败也会释放。
+- **渲染侧**：桥返回 `{ reloadedTabs }`（`ClearBrowsingDataResult`；老壳返回 undefined、形状不对一律当 0——渲染侧只拿它决定提示文案，不能让「清除成功」变成报错）；确认框文案补了「已打开的网页会重新加载，未保存的内容会丢失；无痕标签页不受影响」；成功 toast 在有页面被重新加载时写「已重新加载 N 个标签页」；设置页说明同步。面板菜单与设置页共用 `clear-data-flow.ts`（先确认、取消绝不碰数据）。
+- **无痕不碰**：无痕标签是各自的内存 partition、关闭即清；「清除登录数据」只作用于持久档案（确认框写明）。反过来，它也不该去终止用户正在用的私密页。
+- **已知限制（如实）**：① 用户当时停在历史中间（后退过）时**前进栈会丢**——`about:blank` 是一次真实导航，Chromium 会截掉当前下标之后的条目（探针 C4）；② 页面里未保存的内容会丢（确认框已写明）；③ 终止没在时限内成功的标签（页面卡死 / 页面自己的对话框在等用户）：恢复阶段只对「确实停在 about:blank」的标签动手，其余原地不动，用户在面板上能看到那个对话框；④ 修剪历史只在栈**恰好**是 `[旧页, about:blank, 新页]`（长度、当前下标、中间条目都对得上）时才做，用户这期间又导航 / 后退、或页面没提交，宁可多留两条历史也不乱删。反悔：整段接线就是 `index.mjs` 里 `clearBrowsingData` 开头的 `haltTabsForClear(...)` 与 `finally` 里的 `resumeTabsAfterClear(...)`，去掉即回到只清存储的老行为（登录态会被页面写回）。
+- **验证（2026-11-25，macOS，Electron 42）**：单测 `tests/browser-clear-data.test.ts`（46：假 wc / 假 tab 驱动 `clear-data.mjs`，加真 `createBrowserManager` + 假 electron 的顺序钉死 / 清除失败仍恢复 / 流程中途意外抛出仍恢复 / 无痕与空白页与 Flowship 自身地址不碰 / 跨会话 / 单飞）+ `browser-clear-data-flow.test.ts`（14）；真机 `scripts/browser-e2e/clear-login-data.cjs`（17/17：真 CDP、真 session、本地 fixture——老行为在这里翻车，旧页面的心跳 1～2 秒内把 sid 写回；还核对了磁盘 Cookie 库、历史栈复原、监听不泄漏、无痕不动，以及**挂着 beforeunload 确认框时「先确认掉、`about:blank` 一次就成」**，而不是靠 `ERR_FAILED` 重试熬过去）。变异：`clear-data.mjs` 25 个、`index.mjs` 接线 7 个、渲染流 6 个、真机 6 个，全部杀死，仅 1 个等价变异（恢复阶段不把 `isAppUrl` 传给 `resumeTabsAfterClear`：收集阶段已经用同一个纯函数策略过滤过同一个地址，生产里不可能出现差异）。真机组里没放「`ERR_FAILED` 不重试」：真 Chromium 里「先确认」与「重试」互为兜底、单独去掉任何一个流程都能走通，只有单测（假 wc 能分别造出两种状态）区分得出来。
+
+### 20.2 用户侧「新建无痕标签页」
+
+- **背景**：AI 侧早有 `browser_tabs new incognito:true`（§15 A6），用户这头没有入口。现在面板「更多」菜单第一项是「新建无痕标签页」；会话不存在也能建（和 `newTab` 一样懒创建会话、不额外开空白初始标签）。
+- **独立通道 `browser:newIncognitoTab`（invoke）+ 桥上的**可选**方法 `newIncognitoTab?`，不是给 `newTab` 加第三个参数**：老壳会静默忽略多出来的参数、悄悄开成**持久**标签——用户以为是无痕、登录态却写进了持久档案；独立通道在老壳上根本不存在，UI 据 `typeof bridge.newIncognitoTab === "function"` 直接不画入口，**绝不退化成 `newTab`**。预期内的失败（地址被策略拒绝 / 标签页已达上限 / 浏览器已关闭）返回 `{ ok:false, error }`（中文，去掉了写给 AI 的「（browser_tabs close）」），UI 用 toast；永不 reject。**契约对账**：这条通道不在 §8.2「IPC 通道名」那一行（该行与 preload 的清单由 `tests/electron-browser-preload.test.ts` 逐条对账，无痕入口在测试里单列 `INCOGNITO_METHODS`），§5 的 `BrowserBridge` 块也不列它（那个块里的方法都必须进测试的 `METHODS`）；类型见 `src/lib/browser-bridge-types.ts`。
+- **顺手修的泄漏（`session.openTab`）**：无痕标签开出的新标签（例如页面无手势的 `window.open` 开的后台标签）以前落进**持久**档案；现在继承 opener 的 partition（共用同一个内存 session，靠引用计数保证先关的不会把还开着的清掉）。显式 `incognito:true` 仍是全新的 partition、不与 opener 共用；普通 opener 开出的标签不带 partition 键。
+- **验证**：`tests/browser-e2-p2-incognito.test.ts`（80）+ `browser-incognito-flow.test.ts`（16）；真机 `scripts/browser-e2e/user-incognito-tab.cjs`（18/18：用户入口开出的标签与持久档案隔离、关标签即清、继承及其负对照）；变异：继承逻辑 5 个 + 真机 1 个，全部杀死。
+
+### 20.3 收藏
+
+- **范围**：地址栏星标（一键收藏 / 取消收藏当前页）、「更多」菜单（收藏此页 / 取消收藏、带数量的「收藏夹…」）、收藏夹对话框（点一行 = 在当前标签打开；悬停 / 键盘聚焦才出「新标签页打开 / 删除」；超过 8 条出过滤框；删除有 8 秒撤销，撤销带着原 `createdAt` 加回、回到原来的位置而不是顶到最前）、没有会话时空白页上的快捷列表（最近 6 条，「管理」/「全部 N 个」进对话框）。**全局一份、所有任务共用**（和持久登录档案同口径）。
+- **存储与接口**：服务端 JSON `<dataRoot>/browser-bookmarks.json`（`{ v:1, bookmarks }`，0600、原子写、写入串行化）；`GET / POST / DELETE /api/browser/bookmarks`（`src/app/api/browser/bookmarks/route.ts`）；纯函数共享模块 `src/lib/browser-bookmarks.ts`（规整 / 解析 / 去重 / 排序 / 过滤——「已收藏」客户端按 URL 比、服务端按 URL 去重，两边必须同一份口径），落盘层 `src/lib/server/browser-bookmarks.ts`。
+  - **地址**：只收 http / https，剥掉 userinfo（密码不能明文落进 JSON），**hash 算身份的一部分**（hash 路由的 SPA 里 `#/a` 与 `#/b` 是不同页面）；POST 按规整后的地址**幂等**（已有则更新标题回 200，新建回 201）；标题经 `clipOneLine` 清控制 / 格式字符并截断，页面没给标题就用主机名；限额：500 条（满了回 409 `limit_reached`，**不自动淘汰**——静默丢用户数据比报「已满」糟得多）、地址 ≤ 2048、标题 ≤ 200。`createdAt` 只在有限数、≥ 0、不晚于现在 + 60 秒时采用（撤销删除要回到原位置），否则按现在。
+  - **坏文件**：读路径当空列表、不动文件；写路径先把坏文件改名 `.corrupt-<时间戳>` 留证据再写新的；读不出来（权限 / 路径被占等）**抛错、绝不当空列表**（否则下一次写入会把用户的收藏盖掉）。路由对外只回固定文案 + 稳定 `code`（`invalid_url` 400 / `limit_reached` 409 / `not_found` 404 / `*_failed` 500），不透出内部错误原文和路径。
+- **客户端**：共享 store（`bookmarks-store.ts`，`useSyncExternalStore`）：加载单飞、乱序保护（陈旧结果会重拉一次）、后台刷新失败保留旧列表、删除遇 404 当成功、未加载时的变更先重拉；对话框里删了，地址栏星标立刻跟着灭。星标画在地址栏 `<form>` 里（绝对定位，输入框留 `pr-8`），**面板窄于 360px 时让位**（容器查询，与缩放标签同一条规则；「更多」菜单里仍有入口）。
+- **刻意不是 AI 工具**：收藏是用户私人的整理，不进工具集、不进 prompt，`electron-app/`、`prompts/`、`skills/`、`src/lib/server/browser/` 里都不出现（`tests/browser-bookmarks-ui.test.ts` 的源码扫描钉着）。反悔：想让 AI 能读收藏，就在 `tools*.ts` 里加只读工具、走服务端的 `listBookmarks()`，并同时改掉那条扫描。
+- **取舍（按推荐定的，没有问用户）**：全局一份而不是分任务；hash 算身份；满 500 条拒绝而不是淘汰最旧的；标题以页面标题为准、不做编辑；没做文件夹 / 排序 / 导入导出 / 跨设备同步。反悔：限额改 `BOOKMARK_LIMIT`；要让 hash 不算身份，在 `normalizeBookmarkUrl` 里 `u.password = ""` 之后加 `u.hash = ""`，并改掉单测里区分 hash 的用例。
+- **验证**：单测 lib 28 / server 35 / route 16 / store 24 / flow 36 / ui 33（`tests/browser-bookmarks-*.test.ts`、`browser-bookmark-flow.test.ts`；UI 是 SSR + 源码契约，对话框正文拆成纯展示组件逐状态断言）；真机排版 `scripts/browser-e2e/r13-panel-layout.cjs`（真 BrowserPanel + 真 Tailwind + 真鼠标，harness 里收藏接口由内存桩应答）新增 r13-16 ~ r13-24：星标位置 / 让位 / 已收藏态、点星标往返、「更多」菜单、对话框限高可滚动、行内操作悬停与键盘聚焦才显示、真键盘过滤、删除、Esc、数量联动，脚本总计 24/24。变异：server 18 / lib 10 / route 7 / store 16 / flow 19 / ui 18 + 真机排版 7，全部杀死，仅 1 个等价变异（store 的 `set` 不判断「是否变化」就通知：所有调用路径传入的快照与当前必有差异，那个判断是防御性的）。
+- **没验证（如实）**：没有在真 Flowship 桌面包里点过收藏 / 无痕入口 / 清除登录数据（项目规则不许操作界面）；真机排版 harness 里的收藏接口是内存桩、不是真 Next 路由——路由本身由 `browser-bookmarks-route.test.ts` 直接调 `GET / POST / DELETE` 验证。
+
+## 21. 地址栏记忆与联想（2026-11-25 用户：「我正常用谷歌，输入网址，输入多了就会有记忆，这个里面可以做吗」）
+
+### 21.1 行为
+
+- **联想**：在地址栏敲字，输入框下方弹联想（最多 6 条）：按「网址 + 页面标题」匹配（多个词要都出现；档位依次是地址从头匹配 > 主机名某一段开头 > 地址包含 > 标题词首 > 标题包含），同档里常去 / 刚去过的靠前（`frecency`：按最近程度分段衰减 × (1 + log2 访问次数)，收藏过的加分）。**收藏夹也参与**：带实心星标、没有「×」；同一个地址历史与收藏各有一条时合并成一条。
+- **键盘 / 鼠标**：↑ ↓ 选择（输入框里的文字不变）；Enter 打开高亮项，**没有高亮项时 Enter 照旧提交输入框里的文字**；Esc 第一下只收下拉（输入框保持焦点与文字），再按才退出编辑；鼠标点一行 = 打开（点选不会先让输入框失焦把下拉收掉）。历史项右端的「×」（悬停 / 高亮才出现）或高亮后按 Shift+Delete / Shift+Backspace = 忘掉这一条，下拉不关。
+- **清除**：「更多」菜单里的「清除浏览历史」（在「清除登录数据」之前；先弹确认，取消绝不碰数据；不影响收藏夹 / 登录状态 / 已打开的页面）。
+- **不做行内补全**（输入框里自动补出后半截网址）：它与输入法组词冲突。真机用 CDP `Input.imeSetComposition` + `insertText` 验过：组词中下拉保持原样、组词提交后联想与草稿正确更新。
+- **与原生视图的关系**：下拉带 `role="listbox"`，`use-overlay-cover` 据此让原生视图遮盖让位（下拉开着时面板请求 `setCovered(true)`，收起后恢复），不用额外接线；下拉与整条工具栏同宽、贴着工具栏下沿（锚点是工具栏而不是输入框，窄面板里不会缩成输入框那么窄）。
+
+### 21.2 记什么、不记什么
+
+- **只记「用户在地址栏里敲（或从联想里选）的、成功打开了的网址」**（带页面标题）。不记：AI 的导航（工具走自己的通道，根本不经过地址栏）、无痕标签、搜索词（`kind:"search"`）、聊天里点的链接 / 预览入口 / 收藏项（这些入口调 `navigate(url)` 不带 `remember`；`browser-panel.tsx` 里 `remember: true` 只出现在 `submitAddress` 一处，`tests/browser-history-ui.test.ts` 钉着）、老壳（回包里没有 `url` / `kind`）。所以它是「我常敲的网址」，不是 Chrome 那种完整的浏览历史。
+- **成功怎么判定**：`browser:navigate` 提交后立刻返回、主进程不会回头告诉结果，渲染侧靠标签状态推送自己判（`typed-visit.ts` 纯逻辑 + `typed-visit-recorder.ts` 执行体 + `use-typed-visit-recorder.ts` 薄 hook）。登记的是主进程解析后的地址与提交那一刻的活动标签。记：标签离开了出发地址（新文档提交）、没有 `loadFailed`、加载结束（页面已提交 10 秒仍挂着一个不返回的子资源 → 按已打开算）；重定向记**敲的地址**（下次敲同样的字还会走同样的跳转）；敲的就是当前页地址（回车 = 重新加载）也算。放弃：90 秒还没结论、标签没了 / 是无痕、`loadFailed`、跳到非网页地址。标题只在「没跳到别的站点、且不是浏览器拿 URL 顶替的占位标题」时记，否则联想里显示主机名。纯等待的两个时刻（10 秒宽限 / 90 秒 TTL）没有状态推送来触发，recorder 自己设定时器到点复核。
+- **主进程只多了两个「信号」**（不含任何记忆逻辑）：① `browser:navigate` 成功回 `{ ok:true, url, kind }`；② `TabInfo.loadFailed`（`tab.lastLoadError` 非空时才有）。真机实测（`scripts/browser-e2e/history-signals.cjs`，11 项）：成功 / 404 → url = 敲的地址、loading 回 false、无 `loadFailed`；重定向 → url = 最终地址；连接被拒 → `loadFailed:true`、loading 回 false、url 仍是敲的地址、title = `host:port`；新导航一开始 `loadFailed` 就消失；下载 → url 不变、无 `loadFailed`；有一个永远不返回的子资源 → url / title 已提交、loading 一直为 true。
+
+### 21.3 存储与接口
+
+- **服务端 JSON** `<dataRoot>/browser-history.json`（`{ v:1, history }`，0600、原子写、写入串行化），**全局一份、所有任务共用**（和收藏夹、持久登录档案同口径）。`GET / POST / DELETE /api/browser/history`（`?id=` 删一条、`?all=1` 清空；`src/app/api/browser/history/route.ts`；POST 的访问时间一律用服务端的现在）；纯函数共享模块 `src/lib/browser-history.ts`（规整 / 去重 / 排序 / 联想匹配与排序），落盘层 `src/lib/server/browser-history.ts`，客户端共享 store `history-store.ts` + `use-history.ts`。
+- **口径同收藏夹**：URL 共用 `normalizeBookmarkUrl`（只收 http / https、剥 userinfo、hash 算身份的一部分——联想里才能标出「已收藏」）；标题是页面可控文字，入库与展示都过 `clipOneLine`，渲染按纯文本。**上限 1000 条，满了淘汰最久没访问的**（和收藏夹「满了拒绝」相反：历史本来就是记个大概）；同一个地址累加次数、刷新最近访问时间，空标题不覆盖旧标题；系统时钟被往回拨过时，新访问的时间不会比已有记录更早（否则一入库就被当场淘汰）。
+- **坏文件**同收藏夹（读路径当空列表、写路径先改名 `.corrupt-<时间戳>`、读不出来抛错而不是当空列表）；「清除」是真删（连坏文件一起删、不留备份）。每次聚焦地址栏拉一次最新记忆（别的窗口 / 任务可能改过），失败不弹提示。
+
+### 21.4 刻意不是 AI 工具
+
+记忆是用户自己的上网习惯，不进工具集、不进 prompt：`electron-app/`、`prompts/`、`skills/`、`src/lib/server/browser/` 里都不出现它的模块与接口，`src/lib/server` 里也只有它自己的存储模块（`tests/browser-history-ui.test.ts` 的源码扫描钉着）。页面里的指令借不了 AI 往里塞东西，AI 也读不到用户去过哪些站。反悔：想让 AI 能读，就在 `tools*.ts` 里加只读工具、走服务端读函数，并同时改掉那条扫描。
+
+### 21.5 真机才暴露的问题（单测与读源码都看不出来）
+
+- **Enter 提交不了表单**：base-ui 的 Autocomplete 会在 Root 旁边塞一个隐藏的文本框（做表单值同步），于是地址栏 `<form>` 里有两个文本框——浏览器「只有一个文本框才靠 Enter 隐式提交」的规则失效，**按 Enter 什么都不发生**（最常用的操作就坏了；只有「Enter 打开高亮项」走的是 `click()` 所以没受影响）。修复：`AddressInput` 里放一个隐藏的默认提交按钮（有默认提交按钮时 Enter 改为点它；输入法组词中按 Enter 不会触发，与普通输入框一致）。真机 r13-29 钉着（修之前这条是红的）。
+- **弹层被推歪 5px**：base-ui Positioner 默认 `collisionPadding` 为 5px，锚点（工具栏）贴着窗口边时弹层会被推开 5px、与工具栏对不齐；`AutocompleteContent` 默认改为 0。真机 r13-25 钉着（修之前红）。
+- **无头 harness 的焦点**：harness 窗口是 `show:false`，页面没有「焦点」，`focus` 事件不触发、React 的 `onFocus` 不跑（地址栏进不了编辑态，敲的字会被还原成当前页地址）；真机脚本里先 `webContents.focus()` 再点输入框。
+
+### 21.6 验证（2026-11-25，macOS，Electron 42）
+
+- **单测**：`tests/browser-history-lib.test.ts` 53 / `-server` 40 / `-route` 20 / `-store` 28 / `-flow` 20 / `-ui` 26、`browser-typed-visit.test.ts` 45 / `browser-typed-visit-recorder.test.ts` 14（UI 是 SSR + 源码契约，下拉本体在 Portal 里服务端是空的，所以联想行 `SuggestionRow` 单独导出来渲染；键盘 / 鼠标 / 焦点交互只能在真机里验）；既有断言随两处主进程信号更新（`browser-actions` / `browser-r1-main-process` 里 `browser:navigate` 的回包形状）。
+- **真机**：`scripts/browser-e2e/history-signals.cjs`（11/11：上节的各种导航结果下标签状态长什么样，是判定逻辑的哨兵）；`scripts/browser-e2e/r13-panel-layout.cjs`（真 BrowserPanel + 真 Tailwind + 真键盘 / 鼠标，harness 里记忆接口是内存桩）新增 r13-25 ~ r13-36：弹层几何（与工具栏同宽、贴下沿、在窗口内、第一行点得到自己）与不抢焦点、遮盖让位与恢复、↑↓ + Enter、无高亮 Enter 提交输入框文字、无匹配不弹与 Esc 两段式、「×」点删 / Shift+Delete 键盘删、鼠标点选、收藏参与联想、300px 窄面板不溢出、「清除浏览历史」确认 / 取消 / 清空；脚本总计 36/36。
+- **未验证（如实）**：没有在真 Flowship 桌面包里点过地址栏联想（项目规则不许操作界面）；r13 harness 里的记忆接口是内存桩、不是真 Next 路由（路由本身由 `browser-history-route.test.ts` 直接调 `GET / POST / DELETE` 验证）；「连接被拒」用本机空闲端口，DNS 失败（与代理相关）没有逐一覆盖，只靠 `loadFailed` 同一个信号；本轮没做变异检验。

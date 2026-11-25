@@ -455,7 +455,7 @@ describe("groupOpenTurnToolDenied：兄弟入口按入参拒（要所有者开�
 describe("同权轮：真实的浏览器工具（假 bridge）——名字对账；被拒时一次主进程请求都没发出去", () => {
   let fake: ReturnType<typeof installFakeBrowser> | null = null;
   beforeEach(() => {
-    __resetBrowserSettingsForTest();
+    __resetBrowserSettingsForTest({ advancedTools: true }); // 高级调试组默认关；恒拒表里有 browser_debug / perf / network_rules，对账它们要显式打开
     fake = installFakeBrowser({ evaluate: () => ({ type: "number", value: 2 }) });
   });
   afterEach(() => {
@@ -493,7 +493,7 @@ describe("同权轮：真实的浏览器工具（假 bridge）——名字对账
     const tools = getBrowserTools({ taskId: TASK, readOnly: false });
     const schemaOf = (name: string): string => {
       const t = tools.find((x) => x.name === name);
-      if (!t) throw new Error(`getBrowserTools 里没有 ${name}（高级调试组默认注册）`);
+      if (!t) throw new Error(`getBrowserTools 里没有 ${name}（高级调试组需显式打开：advancedTools: true）`);
       return JSON.stringify(t.parameters);
     };
     const need: Array<[string, string[]]> = [

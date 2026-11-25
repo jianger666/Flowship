@@ -791,6 +791,11 @@ export class BrowserTab {
       ...(this.#fitScale < 1 ? { fitScale: this.#fitScale } : {}),
       // E2·A6：无痕标签（只在为真时带，普通标签的 info 形状不变）
       ...(this.incognito ? { incognito: true } : {}),
+      // 当前显示的是「主 frame 加载失败」的错误页（连接被拒 / DNS 解析失败…；被新导航 / 停止打断的不算，HTTP 404 / 500 也不算）。
+      // 只在为真时带。为什么要单独给：失败的导航也会提交一个错误页，而 getURL() 返回的仍是用户敲的那个地址（真机实测：不是 chrome-error://），
+      // loading 也照常变回 false——渲染侧光看 url / loading 分不出「打开了」还是「打不开」（地址栏记忆据此不记失败的地址）。
+      // 下一次主 frame 跨文档导航开始时清掉（did-start-navigation）。
+      ...(this.lastLoadError ? { loadFailed: true } : {}),
     };
   }
 

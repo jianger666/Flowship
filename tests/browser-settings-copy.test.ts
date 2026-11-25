@@ -113,10 +113,12 @@ describe("浏览器卡文案：一句话 hint + 气泡 detail", () => {
     expect(C.permissions.detail).toContain("屏幕共享和 USB 永远拒绝");
   });
 
-  it("S-8c 默认开的三项（网络正文 / 高级调试 / 本机证书）hint 里写「默认开」；默认关的项不写", () => {
-    for (const k of ["networkBody", "advancedTools", "loopbackCerts"] as const) expect(C[k].hint, k).toContain("默认开");
+  it("S-8c 默认开的两项（网络正文 / 本机证书）hint 里写「默认开」；默认关的项（含高级调试）不写，高级调试明写「默认关」", () => {
+    for (const k of ["networkBody", "loopbackCerts"] as const) expect(C[k].hint, k).toContain("默认开");
     // 默认关的几项不能带「默认开」（含「默认开启」字样的子串也不行）
-    for (const k of ["evaluate", "storage", "permissions", "recordInput"] as const) expect(C[k].hint, k).not.toContain("默认开");
+    for (const k of ["evaluate", "storage", "permissions", "recordInput", "advancedTools"] as const) expect(C[k].hint, k).not.toContain("默认开");
+    // 高级调试默认关（整组工具说明常驻 prompt，默认不挂才省 token）：用户得主动打开，hint 必须说清「默认关」
+    expect(C.advancedTools.hint).toContain("默认关");
   });
 
   it("S-8a / R20-13 高级调试：关闭时进行中的会话也马上被拒；省提示词要到新会话才生效、重新开启也只对新会话——两件事分开说，不再混成一句「立即生效」", () => {

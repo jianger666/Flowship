@@ -1805,7 +1805,7 @@ describe("R1-10 复审：browser-initiated 下载 / 拦截记录节流 / 在途�
       manager.registerIpc();
       const url = "https://example.com/export/report.xlsx";
       const r = await handlers.get("browser:navigate")!({}, "T1", url);
-      expect(r).toEqual({ ok: true });
+      expect(r).toEqual({ ok: true, url, kind: "url" });
       const first = makeItem({ gesture: false, url });
       fire(first);
       expect(first.cancel).not.toHaveBeenCalled();

@@ -218,7 +218,6 @@ artifact 路径：`actions/<N>-dev.md`、按下方骨架写、写完按 super-pr
 - ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不落库、详情页看不到）
 - ❌ push 被拒（non-fast-forward）时 force push 覆盖远程（绝对不、报用户处理 / 重跑）
 - ❌ 在任务工作区里 `git checkout -B "$DEV" "origin/$DEV"` / `git checkout -b` / `git branch -f` / `git reset` 本地 dev 分支（worktree 与主仓共享 refs、会把用户主仓同名本地 dev 分支重置成 origin 并留下反向暂存 diff；直推一律走 `git checkout --detach "origin/$DEV"`）
-- ❌ 交卷后自动跑下一 action（绝对不、说完结论即结束回复、等用户推进）
 
 ## 调用礼仪
 

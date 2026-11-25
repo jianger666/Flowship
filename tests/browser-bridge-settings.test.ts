@@ -33,6 +33,7 @@ import {
   watchBrowserSettings,
 } from "@/lib/server/browser/settings";
 import { settingsFilePath, writeSettingsFileAtomic } from "@/lib/server/settings-fs";
+import { readSource } from "./helpers/source-text";
 
 afterAll(async () => {
   await fs.rm(TMP_ROOT, { recursive: true, force: true });
@@ -57,7 +58,7 @@ describe("默认值与解析", () => {
       pagePermissions: false,
       trustLoopbackCerts: true,
       networkBodyRead: true,
-      advancedTools: true,
+      advancedTools: false,
       maxTabs: 20,
       // 电脑操作（desktop.v1）：两个都是放开型，默认关
       desktopEnabled: false,
@@ -68,26 +69,27 @@ describe("默认值与解析", () => {
     expect(parseBrowserSettings({ browserEvaluateEnabled: true })).toEqual({ ...BROWSER_SETTINGS_DEFAULTS, evaluateEnabled: true });
   });
 
-  it("E2 放开型（storageAccess / pagePermissions）只认显式 true；脏值一律关", () => {
-    for (const bad of ["true", 1, "yes", null, {}, [true]]) {
-      const p = parseBrowserSettings({ browserStorageAccess: bad, browserPagePermissions: bad });
+  it("E2 放开型（storageAccess / pagePermissions / advancedTools）只认显式 true；缺省与脏值一律关", () => {
+    for (const bad of [undefined, "true", 1, "yes", null, {}, [true]]) {
+      const p = parseBrowserSettings({ browserStorageAccess: bad, browserPagePermissions: bad, browserAdvancedTools: bad });
       expect(p.storageAccess).toBe(false);
       expect(p.pagePermissions).toBe(false);
+      expect(p.advancedTools).toBe(false);
     }
-    const on = parseBrowserSettings({ browserStorageAccess: true, browserPagePermissions: true });
+    const on = parseBrowserSettings({ browserStorageAccess: true, browserPagePermissions: true, browserAdvancedTools: true });
     expect(on.storageAccess).toBe(true);
     expect(on.pagePermissions).toBe(true);
+    expect(on.advancedTools).toBe(true);
   });
 
-  it("E2 收紧型（trustLoopbackCerts / networkBodyRead / advancedTools）缺省与脏值都开，只有显式 false 才关", () => {
+  it("E2 收紧型（trustLoopbackCerts / networkBodyRead）缺省与脏值都开，只有显式 false 才关", () => {
     for (const dirty of [undefined, "false", 0, null, "no"]) {
-      const p = parseBrowserSettings({ browserTrustLoopbackCerts: dirty, browserNetworkBodyRead: dirty, browserAdvancedTools: dirty });
+      const p = parseBrowserSettings({ browserTrustLoopbackCerts: dirty, browserNetworkBodyRead: dirty });
       expect(p.trustLoopbackCerts).toBe(true);
       expect(p.networkBodyRead).toBe(true);
-      expect(p.advancedTools).toBe(true);
     }
-    const off = parseBrowserSettings({ browserTrustLoopbackCerts: false, browserNetworkBodyRead: false, browserAdvancedTools: false });
-    expect([off.trustLoopbackCerts, off.networkBodyRead, off.advancedTools]).toEqual([false, false, false]);
+    const off = parseBrowserSettings({ browserTrustLoopbackCerts: false, browserNetworkBodyRead: false });
+    expect([off.trustLoopbackCerts, off.networkBodyRead]).toEqual([false, false]);
   });
 
   it("E2 maxTabs：5–60 的整数才认，边界含；其余回 20", () => {
@@ -103,7 +105,7 @@ describe("默认值与解析", () => {
     expect(DEFAULT_SETTINGS.browserPagePermissions).toBe(false);
     expect(DEFAULT_SETTINGS.browserTrustLoopbackCerts).toBe(true);
     expect(DEFAULT_SETTINGS.browserNetworkBodyRead).toBe(true);
-    expect(DEFAULT_SETTINGS.browserAdvancedTools).toBe(true);
+    expect(DEFAULT_SETTINGS.browserAdvancedTools).toBe(false);
     expect(DEFAULT_SETTINGS.browserMaxTabs).toBe(20);
     const n = normalizeSettings({ browserStorageAccess: "yes", browserTrustLoopbackCerts: "no", browserMaxTabs: 3 } as never);
     expect(n.browserStorageAccess).toBe(false);
@@ -115,6 +117,29 @@ describe("默认值与解析", () => {
     expect(isFieldEqual("browserMaxTabs", { ...DEFAULT_SETTINGS, browserMaxTabs: 30 }, DEFAULT_SETTINGS)).toBe(false);
     expect(isFieldEqual("browserTrustLoopbackCerts", { ...DEFAULT_SETTINGS, browserTrustLoopbackCerts: undefined }, DEFAULT_SETTINGS)).toBe(true);
     expect(isFieldEqual("browserStorageAccess", { ...DEFAULT_SETTINGS, browserStorageAccess: undefined }, DEFAULT_SETTINGS)).toBe(true);
+    // 高级调试组默认关：缺省 / 显式 false 与默认值相等（不会被误判成「有未保存修改」），显式 true 才算改动
+    expect(isFieldEqual("browserAdvancedTools", { ...DEFAULT_SETTINGS, browserAdvancedTools: undefined }, DEFAULT_SETTINGS)).toBe(true);
+    expect(isFieldEqual("browserAdvancedTools", { ...DEFAULT_SETTINGS, browserAdvancedTools: true }, DEFAULT_SETTINGS)).toBe(false);
+    // 本地解析同口径：缺省 / 脏值 → 关，只有显式 true 才开
+    expect(normalizeSettings({} as never).browserAdvancedTools).toBe(false);
+    expect(normalizeSettings({ browserAdvancedTools: "true" } as never).browserAdvancedTools).toBe(false);
+    expect(normalizeSettings({ browserAdvancedTools: true } as never).browserAdvancedTools).toBe(true);
+  });
+
+  it("高级调试组默认关：server 解析 / 本地解析 / 设置页读法 / 脏检查字段类型四处同口径（只认显式 true），不能只翻一处让设置页开关和 server 实际行为对不上", async () => {
+    const hook = readSource("src/hooks/use-settings.ts");
+    expect(hook).toMatch(/browserAdvancedTools:\s*"boolFalse"/);
+    expect(hook).not.toMatch(/browserAdvancedTools:\s*"boolTrue"/);
+    // 设置页是 .tsx：不走 readSource（它不适合读 JSX 文本）
+    const page = await fs.readFile(path.resolve(import.meta.dirname, "..", "src/app/settings/page.tsx"), "utf-8");
+    expect(page).toContain("advancedTools={settings.browserAdvancedTools === true}");
+    expect(page).not.toMatch(/browserAdvancedTools\s*!==\s*false/);
+    const store = readSource("src/lib/local-store.ts");
+    expect(store).toContain("browserAdvancedTools: parsed.browserAdvancedTools === true");
+    expect(store).not.toMatch(/browserAdvancedTools\s*!==\s*false/);
+    const server = readSource("src/lib/server/browser/settings.ts");
+    expect(server).toContain("advancedTools: raw?.browserAdvancedTools === true");
+    expect(server).not.toMatch(/browserAdvancedTools\s*!==\s*false/);
   });
 
   it("前端 normalizeSettings / DEFAULT_SETTINGS 口径一致，且脏检测用 boolFalse", () => {

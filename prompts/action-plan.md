@@ -1,13 +1,10 @@
-# Action: plan（V0.6）
-
-> 占位符在 super-prompt 顶部已注入：`{{taskId}}` `{{taskTitle}}` `{{repoPath}}`、artifact 绝对路径见 super-prompt「Artifact 文件路径」段。
-> 收到 `[NEXT_ACTION type=plan ...]` 时翻到本段、按指令做。
+# Action: plan
 
 ---
 
 你正在跑 Flowship task 里的 **plan action**——读 contextDocs + 扫仓库 + 出 / 改技术方案、产出 `actions/<n>-plan.md`。
 
-## 准入条件（V0.6 门槛 1）
+## 准入条件（门槛 1）
 
 - 永远可（除非 task 已 archived）
 - 第 N 次 plan（N > 1、用户反馈方案需要调整）时、必须先 read 上一次 plan artifact 拿增量上下文
@@ -40,8 +37,8 @@
 
 - 任务标题：{{taskTitle}}（task ID 见 super-prompt 顶部）
 - 仓库根目录：{{repoPath}}（agent cwd 就是这里）
-- **上下文文档清单**：见 super-prompt 顶部「用户提供的上下文文档」章节、已经列出全部 doc（含 URL / path / 短文本）
-- **历次 plan artifact**（V0.6、n > 1 时）：`actions/<prev_plan_n>-plan.md`、用 SDK `read` 工具读最新那一份拿增量上下文（同 task 内多次 plan）
+- **上下文文档清单**：见 super-prompt 顶部「用户提供的上下文文档」章节（没有该章节 = 用户没加文档）、列出全部 doc（含 URL / path / 短文本）
+- **历次 plan artifact**（n > 1 时）：`actions/<prev_plan_n>-plan.md`、用 SDK `read` 工具读最新那一份拿增量上下文（同 task 内多次 plan）
 
 ## 执行步骤
 
@@ -107,7 +104,7 @@
 
 > **跟飞书原文有差异（推断 / 偏离 / 找不到来源）一律走 ask_user 闭环**——差异本质是「AI 不确定的点」、应该 ask_user 让用户拍板、用户答完再落 artifact、而不是先列表再让用户审。
 
-### 5. 打包 `ask_user`（V0.3.2 单次内打包、V0.5.6 整个 action 内按需多次调）
+### 5. 打包 `ask_user`（单次内打包、整个 action 内按需多次调）
 
 写完初稿后、把**当前轮要确认的点**收集到一个 `ask_user` 调用里、**一次问完**；按需多次调、直到所有问题都收敛到 A 路径（明确决策）：
 
@@ -127,7 +124,7 @@
 - **task 拆分粒度**：「这个改动是 1 个 task 还是拆成 2 个」
 - **风险项**：能枚举的（A or B、做还是不做）一律打包进 questions
 
-**关键约束**（沿用 V0.5.6 重写）：
+**关键约束**：
 
 - **单次调用内**：当前轮想问的全部打包进 questions[]、不要同一时刻调多次（一时刻只能有一个 pending、第二次会顶替第一次）
 - **整个 action 内无次数上限**：按内容判断、按需多次调（典型流程见 §5.2）——不要因为「问过一轮」就跳过
@@ -137,7 +134,7 @@
 - **已问过的不重问**：调 ask_user 前看 contextDocs / plan artifact 正文里的 `> ✅ ask_user 已确认：xxx` 内联备注有没有同款问题、有就直接用现成答案
 - **问的问题必须跟本仓库相关**——纯后端 / 跨端的问题、不要问
 
-### 5.1 拿到 ask_user 答案后按清晰度分级（V0.5.5、V0.5.6 加 D）
+### 5.1 拿到 ask_user 答案后按清晰度分级
 
 ⚠️ **跟 super-prompt 的 [USER_MESSAGE] 处理不是同一回事**——那边处理「用户在输入条发的 freeform 消息」、§5.1 处理「ask_user 弹窗答案」。下面这套 A/B/C/D/E 分级只用在「ask_user 答案」场景：
 
@@ -356,4 +353,3 @@
 - **⛔ 不省略业务名词 / task name**：表格 / 正文里出现的 task 名 / 业务对象**写全称**、不要图省事用脑内简写
 - **本仓视角**：本 action 只服务于「本仓库（{{repoPath}}）要改什么」、其它端的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨端边界相关时才碰
 - **大需求才分批**：task 多 / 跨层 / 一次 build 跑不稳妥时、才调 `set_plan_batches` 上报批次（见 §5.3）、artifact **不写**批次表（系统自动渲染）；小需求别分批、保持单次 build（分批是为防大需求跑乱、不是 KPI、宁可不分也别硬切）
-- **写完后按 super-prompt 交卷**：结论说清方案要点 / 关键决策 / 有无待确认项；别说「我写完了你看下」这类空话

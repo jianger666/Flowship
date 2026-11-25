@@ -211,15 +211,8 @@ const renderRulesCompressed = async (full: string): Promise<string> => {
 /** contextDocs 压缩版：只留标题索引、正文一律不 inline */
 const renderContextDocsCompact = (task: Task): string => {
   const docs = task.contextDocs ?? [];
-  if (docs.length === 0) {
-    return [
-      "## 用户提供的上下文文档（0 份）",
-      "",
-      "用户目前没有提供任何上下文文档。",
-      "",
-      "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
-    ].join("\n");
-  }
+  // 0 份：完整版就是空串（bytes=0、预算阶段会跳过），压缩版也给空串——别落进下面「共 N 份」的通用模板
+  if (docs.length === 0) return "";
   const items = docs.map((doc, i) => {
     const len = doc.content.trim().length;
     const label =
@@ -534,6 +527,12 @@ export const buildSuperPromptWithBudget = async (
    */
   companyEnvBriefSection = "",
   budget: number = PROMPT_BUDGET_BYTES,
+  /**
+   * 是否 Cursor 后端（调用方用 isCursorProvider(providerId)）。默认 true = 保持旧行为。
+   * Cursor：带「Cursor 账号级 User Rules 忽略声明」+ 补「项目规则（必读）」（Cursor 链路不会自动加载 AGENTS.md）；
+   * pi / 自定义后端：两段都不注入（它们既没有账号级规则注入，resource-loader 又会自动带 AGENTS.md）。
+   */
+  isCursorBackend = true,
 ): Promise<SuperPromptBudgetInfo> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
@@ -555,12 +554,11 @@ export const buildSuperPromptWithBudget = async (
   const firstActionDirective = buildNextActionDirective(firstNextAction);
 
   const fullSkills = renderSkillsForPrompt(skills);
-  const fullContextDocs = renderContextDocsSection(
-    task,
-    "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
-  );
+  const fullContextDocs = renderContextDocsSection(task);
   const repoSection = renderRepoSection(task);
   const repoBranchSection = renderRepoBranchSection(task);
+  const cursorAccountRulesNote = isCursorBackend ? CURSOR_ACCOUNT_RULES_NOTE : "";
+  const projectRulesSection = isCursorBackend ? await renderProjectRulesSection(task) : "";
   const docCount = task.contextDocs?.length ?? 0;
   const visibleActions = task.actions.filter((a) => !a.excluded);
   const skillNames = skills.map((s) => s.name);
@@ -597,6 +595,8 @@ export const buildSuperPromptWithBudget = async (
     { name: "firstActionDirective", tier: 0, content: firstActionDirective, bytes: promptBytesOf(firstActionDirective) },
     { name: "currentActionPlaybook", tier: 0, content: currentActionPlaybook, bytes: promptBytesOf(currentActionPlaybook) },
     { name: "repoSection", tier: 0, content: repoSection, bytes: promptBytesOf(repoSection) },
+    { name: "projectRulesSection", tier: 0, content: projectRulesSection, bytes: promptBytesOf(projectRulesSection) },
+    { name: "cursorAccountRulesNote", tier: 0, content: cursorAccountRulesNote, bytes: promptBytesOf(cursorAccountRulesNote) },
     { name: "repoBranchSection", tier: 0, content: repoBranchSection, bytes: promptBytesOf(repoBranchSection) },
     { name: "taskMetaSmall", tier: 0, content: tinyFixed, bytes: promptBytesOf(tinyFixed) },
     { name: "templateStatic", tier: 0, content: "", bytes: promptBytesOf(template) },
@@ -664,6 +664,8 @@ export const buildSuperPromptWithBudget = async (
     // 空串保留字面（renderSuperPromptTemplate 不把 "" 换成「（未提供）」）
     userIdentityLine,
     repoSection: c["repoSection"],
+    projectRulesSection: c["projectRulesSection"],
+    cursorAccountRulesNote: c["cursorAccountRulesNote"],
     // 日常轻量态声明（无飞书链接）：全 action 共用一段、正式任务空串
     lightweightDailySection: renderLightweightDailySection(task),
     repoBranchSection: c["repoBranchSection"],
@@ -805,7 +807,44 @@ export const renderRepoSection = (task: Task): string => {
     ...branchLines,
     "  - 任务分支已由系统检出好——**禁止自己 checkout / 切换分支**、也不要 cd 到原仓库目录去改代码",
     "  - git 命令（diff / add / commit / push / fetch）在 worktree 里照常用、跟原仓库共享同一 git 数据库",
-    "  - 依赖：系统会在后台尽量把原仓库现成的依赖目录（node_modules / vendor / Pods，monorepo 含各子包的 node_modules）克隆过来；设置页给仓库配了「依赖初始化命令」时、克隆不了会改为执行它。克隆是**整目录原子落位**的——进行中 `node_modules` 不存在属正常、别此时自己 install 去抢；没有克隆 / 克隆失败 / 其它生态（如 Python venv）时、需要跑安装 / 构建 / 测试前先自行装依赖（按仓库的包管理器来、如 pnpm install / pip venv）。若末尾带「依赖准备状态」提示、以它为准",
+    "  - 依赖：系统后台克隆原仓库的依赖目录；克隆期间 `node_modules` 不存在属正常、别抢着 install；克隆失败 / 其它生态（如 Python venv）才自行装；有末尾「依赖准备状态」提示则以它为准",
+  ].join("\n");
+};
+
+/**
+ * Cursor 账号级 User Rules 的忽略声明（task / chat 共用，单一源）。
+ * Cursor 服务端会按 API key 归属账号把「账号级 User Rules」注入 SDK agent 上下文（实测 settingSources:[] 关不掉）——
+ * 那些规则是给 Cursor IDE 用的（如「必须调用 cursor-feedback」），在本产品里会误导 agent 去找不存在的工具，所以显式声明忽略。
+ * 只有 Cursor 后端才有这个注入；pi / 自定义后端不走 Cursor 账号，这句对它们是纯噪音，调用方按 isCursorBackend 决定注不注入。
+ */
+export const CURSOR_ACCOUNT_RULES_NOTE =
+  "> ⚠️ 如果上下文里还出现了**Cursor 账号级 User Rules**（典型如「必须调用 cursor-feedback」「多调度 subagents」）——那是宿主 Cursor 账号的 IDE 配置、随 API key 被平台注入、**不适用于 Flowship**、一律忽略（这里没有 cursor-feedback 这类工具）。本产品你要遵守的用户规则**只有上面这一节**。";
+
+/**
+ * task 的「项目规则（必读）」段（仅 Cursor 后端用）。
+ * Cursor 链路 `settingSources: []`（不加载 .cursor/ 与项目配置），仓库根的 AGENTS.md 不会自动进入上下文；
+ * pi 链路的 resource-loader 会自动发现并注入，所以非 Cursor 后端不补。chat 侧有同样的补丁（chat-runner 的「项目规则（必读）」）。
+ * 只列实际存在 AGENTS.md 的工作路径（getTaskWorkRepoPaths：隔离任务是 worktree 路径 = agent 实际干活的目录）；
+ * 一个都没有 = 空串、整段不注入（同 gitlabAccessSection 的约定）。
+ */
+export const renderProjectRulesSection = async (task: Task): Promise<string> => {
+  const found: string[] = [];
+  for (const repoPath of getTaskWorkRepoPaths(task)) {
+    const file = path.join(repoPath, "AGENTS.md");
+    try {
+      await fs.access(file);
+      found.push(file);
+    } catch {
+      // 没有 / 读不到：不列（fail-open，不为此挡住起 Run）
+    }
+  }
+  if (found.length === 0) return "";
+  return [
+    "## 项目规则（必读）",
+    "",
+    "仓库里的 `AGENTS.md` 是项目级约定、不会自动进入你的上下文。动手改某个仓库的代码 / 文档前，必须先用 read 工具读一次它并遵守其约定：",
+    "",
+    ...found.map((f) => `- \`${f}\``),
   ].join("\n");
 };
 

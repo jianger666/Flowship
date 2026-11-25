@@ -2,8 +2,8 @@
  * 增强包 E2 的工具装配（契约 §15.1）：各切片的工具模块在这里登记。
  *
  * - core：始终注册（storage / permissions / touch / clipboard），能力闸门在 handler 与主进程里按设置再拦；
- * - advanced：「高级调试」组（network_rules / perf / sources / debug / record），由设置 `browserAdvancedTools` 一个开关控制；
- *   工具描述每轮都进 prompt，所以高级组允许整组关掉省 token。
+ * - advanced：「高级调试」组（network_rules / perf / sources / debug / record），由设置 `browserAdvancedTools` 一个开关控制（默认关）；
+ *   工具描述每轮都进 prompt（约 6.4k 字符），所以默认不挂，用户在设置里打开后新开始的会话才带上。
  */
 import type { FlowshipToolDef } from "../flowship-tools";
 import type { BrowserToolKit } from "./tools";

@@ -747,10 +747,15 @@ describe("manager.registerIpc：契约 §8.2 通道与可信发送者", () => {
     }
     expect(manager.getSession("T1")).toBeUndefined();
 
-    expect(await nav({}, "T1", "how to cook rice")).toEqual({ ok: true });
+    // 成功时回「实际去的地址 + 是网址还是搜索词」：渲染侧的地址栏记忆只记 kind=url（不记搜索词），补协议 / 搜索回退的规则只有主进程这一份
+    expect(await nav({}, "T1", "how to cook rice")).toEqual({
+      ok: true,
+      url: "https://www.bing.com/search?q=how%20to%20cook%20rice",
+      kind: "search",
+    });
     expect(views).toHaveLength(1);
     expect(views[0].webContents.loadURL).toHaveBeenLastCalledWith("https://www.bing.com/search?q=how%20to%20cook%20rice");
-    expect(await nav({}, "T1", "example.com/a")).toEqual({ ok: true });
+    expect(await nav({}, "T1", "example.com/a")).toEqual({ ok: true, url: "https://example.com/a", kind: "url" });
     expect(views[0].webContents.loadURL).toHaveBeenLastCalledWith("https://example.com/a");
     manager.destroy();
   });

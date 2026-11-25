@@ -35,6 +35,12 @@ export interface TabInfo {
   /** 无痕标签（契约 §15 A6）：独立的内存 partition，关闭即销毁；缺省 / false = 共享的持久档案 */
   incognito?: boolean;
   /**
+   * 当前显示的是「主 frame 加载失败」的错误页（连接被拒 / DNS 解析失败等；被新导航或停止打断的、HTTP 404 / 500 都不算）。
+   * 只在为真时出现。失败的导航仍会提交一个错误页，`url` 仍是用户敲的那个地址、`loading` 照常变回 false，
+   * 所以光看这两个字段分不出「打开了」还是「打不开」——需要「这次导航成没成」的 UI（地址栏记忆）看这个字段。
+   */
+  loadFailed?: boolean;
+  /**
    * 设备模拟把原生视图收窄后，它占占位 div 的比例（契约 §14.4「设备模拟下的视图适配」）：0..1，与宿主缩放无关。
    * 只给遮盖占位图定位用；视图没被收窄（无模拟 / 模拟视口不比占位 div 小）时缺省 = 铺满整个占位 div。
    */
@@ -214,6 +220,11 @@ export interface PickedElement {
   reactSource?: { file: string; line?: number; component?: string } | null;
 }
 
+/** `clearBrowsingData` 的结果：被终止并重新加载的已打开标签数（无痕 / 空白页 / 非 http(s) 的标签不计） */
+export interface ClearBrowsingDataResult {
+  reloadedTabs: number;
+}
+
 /** preload 暴露给渲染进程的浏览器桥（契约 §5） */
 export interface BrowserBridge {
   // —— 视图生命周期（面板挂载 / 卸载 / 尺寸）——
@@ -230,7 +241,11 @@ export interface BrowserBridge {
   setCovered(taskId: string, covered: boolean): Promise<string | null>;
 
   // —— 用户导航（地址栏 / 按钮，走 URL 策略；裸词按搜索处理）——
-  navigate(taskId: string, input: string): Promise<{ ok: boolean; error?: string }>;
+  /**
+   * ok:true 时还带 `url`（实际去的地址，已补协议 / 已换成搜索页）与 `kind`（"url" = 用户敲的是网址；"search" = 按搜索词处理）——
+   * 渲染侧不用自己再解析一遍。老壳只回 `{ ok }`：这两个字段都可能缺省，调用方要按「没有」处理。
+   */
+  navigate(taskId: string, input: string): Promise<{ ok: boolean; error?: string; url?: string; kind?: "url" | "search" }>;
   back(taskId: string): void;
   forward(taskId: string): void;
   reload(taskId: string): void;
@@ -256,8 +271,11 @@ export interface BrowserBridge {
   /** 推送全部任务的状态（主进程 50ms 去抖），返回取消订阅 */
   onState(cb: (taskId: string, state: BrowserState) => void): () => void;
   onPicked(cb: (taskId: string, picked: PickedElement) => void): () => void;
-  /** 清登录态（cookies / storage），面板溢出菜单用 */
-  clearBrowsingData(): Promise<void>;
+  /**
+   * 清登录态（cookies / storage），面板溢出菜单与设置页用。清除前会先让已打开的页面停下、清完再回到原地址（否则页面里的内存 token
+   * 会在几秒内把登录态写回），返回重新加载了几个标签；老壳返回 undefined
+   */
+  clearBrowsingData(): Promise<ClearBrowsingDataResult | void>;
 
   // —— V4 用户侧（契约 §14.3）。老壳没有这些方法：调用处一律可选链 / 先判存在 ——
   /** 缩放当前 tab（每 tab 独立，−3…+5 档、步进 0.5；TabInfo.zoom 是百分比） */
@@ -292,10 +310,19 @@ export interface BrowserBridge {
    * 永不 reject：失败 `{ ok:false, error }`，调用方回退系统打开。老壳没有它。
    */
   serveLocalHtml?(absPath: string): Promise<ServeLocalHtmlResult>;
+  /**
+   * 用户侧「新建无痕标签页」：独立内存档案（不带持久登录态，关标签即清空），会话不存在也能建。url 可省（空白无痕页）。
+   * 永不 reject：失败 `{ ok:false, error }`（error 是能直接给用户看的中文）。老壳没有它——UI 据此不画入口，
+   * **绝不能退化成 `newTab`**（那会悄悄开出一个持久标签，登录态会写进持久档案）。
+   */
+  newIncognitoTab?(taskId: string, url?: string): Promise<NewIncognitoTabResult>;
 }
 
 /** `serveLocalHtml` 的结果 */
 export type ServeLocalHtmlResult = { ok: true; url: string; scope: "dir" | "file" } | { ok: false; error: string };
+
+/** `newIncognitoTab` 的结果 */
+export type NewIncognitoTabResult = { ok: true; tabId: string } | { ok: false; error: string };
 
 /** `browser:find` 的选项（主进程只认这三个布尔） */
 export interface FindOptions {

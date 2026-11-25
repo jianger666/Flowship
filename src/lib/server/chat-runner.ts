@@ -27,6 +27,7 @@
  */
 
 import { Agent } from "./agent-backend";
+import { CHAT_SYSTEM_TOOL_NAMES } from "./chat-system-tools";
 import {
   getSubagentDisplayLookup,
   getSubagentParentModel,
@@ -123,6 +124,7 @@ import {
 } from "./cursor-config";
 import { resolveUserIdentityForPrompt } from "./meegle-cli";
 import {
+  CURSOR_ACCOUNT_RULES_NOTE,
   buildGitlabAccessDirective,
   buildLarkCliAuthMissingRule,
   renderReadonlyRepoDirective,
@@ -1427,14 +1429,10 @@ const buildInitialPrompt = (
     "",
     // 工具清单 = 能力导向、不硬编码具体工具名：cursor 链路真实名是 Read/StrReplace 等
     // PascalCase、pi 链路是 read/edit 等小写——写死任何一端都会漂移（双链路审计实测踩过），
-    // schema 才是唯一真相源，这里只做能力概述并显式声明权威来源
+    // schema 才是唯一真相源，这里只声明权威来源——不再复述能力清单（读 / 搜 / 编辑 / shell 这些是在重述 schema，模型本来就看得到）
     "## 你能用的工具",
     "",
-    "核心能力（**准确名称与参数一律以你实际收到的工具 schema 为准，不要凭记忆猜名字**）：",
-    "  - 读文件（图片会作为附件给你看）　按内容搜索　按文件名找文件",
-    "  - 编辑已有文件　新建 / 整文件覆盖　删除文件　跑 shell 命令（timeout 参数语义见 schema 说明）　分派子任务",
-    "",
-    "另外还有平台工具（提问 `ask_user` 等）和用户配置的 MCP 工具（飞书 / github / context7 等），已在你收到的工具列表里、按场景用。",
+    "**准确名称与参数一律以你实际收到的工具 schema 为准，不要凭记忆猜名字**（含平台工具与用户配置的 MCP 工具，按场景用）。",
     "",
   );
   // 仅 win32 注入（PowerShell 语法条再按当前壳判定）——mac 用户不吃无关内容
@@ -1451,18 +1449,14 @@ const buildInitialPrompt = (
     "",
     // Cursor 服务端会按 API key 归属账号把「账号级 User Rules」注入 SDK agent 上下文
     //（实测确认、settingSources:[] 关不掉）——那些规则是给 Cursor IDE 用的（如「必须调
-    // cursor-feedback」）、在本产品里会误导 agent 找不存在的工具、显式声明忽略
-    "> ⚠️ 如果上下文里还出现了**Cursor 账号级 User Rules**（典型如「必须调用 cursor-feedback」「多调度 subagents」）——那是宿主 Cursor 账号的 IDE 配置、随 API key 被平台注入、**不适用于 Flowship**、一律忽略（这里没有 cursor-feedback 这类工具）。本产品你要遵守的用户规则**只有上面这一节**。",
-    "",
+    // cursor-feedback」）、在本产品里会误导 agent 找不存在的工具、显式声明忽略。
+    // 只有 Cursor 后端才有这个注入；pi / 自定义后端不走 Cursor 账号，对它们这句是纯噪音，不注入
+    ...(isCursorBackend ? [CURSOR_ACCOUNT_RULES_NOTE, ""] : []),
     "## Skills（Flowship 自带能力扩展）",
     "",
     "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read` 工具读取对应 SKILL.md 拿完整指令：",
     "",
     renderSkillsForPrompt(skills),
-    "",
-    "调用规则：",
-    "   - skill 触发是判断性的、不是每轮都读、按描述匹配场景再读",
-    "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
     "",
     // 本地文件展示写法（展示 / 交付给用户的本机文件都写完整绝对路径；单一源 media-display-prompt；task 侧在 task-prompts 的 sharedRules 末尾追加同一段）
     mediaDisplayPromptSection(),
@@ -1534,13 +1528,9 @@ const buildInitialPrompt = (
       "",
     );
   }
-  lines.push(
-    renderContextDocsSection(
-      task,
-      "→ 用户没传上下文文档、按对话内容判断要不要主动调 MCP / read / grep 摸资料。",
-    ),
-    "",
-  );
+  // 没有上下文文档时整段不注入（空串不占位）
+  const contextDocsSection = renderContextDocsSection(task);
+  if (contextDocsSection) lines.push(contextDocsSection, "");
 
   lines.push(
     ...buildOpeningStanceSection(task.id, firstMessage, historyInject),
@@ -1966,7 +1956,9 @@ export const runChatSession = async (
         // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
         // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
         // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
-        // 系统工具（ask_user / submit_work 等）由 facade 按 callerToken 挂 local.customTools。
+        // 系统工具（ask_user 等）由 facade 按 callerToken 挂 local.customTools；
+        // systemToolNames 把 chat 用不上的 5 个 task / action 容器工具（submit_work / advance_next 等）收掉，见 chat-system-tools.ts。
+        systemToolNames: CHAT_SYSTEM_TOOL_NAMES,
         local: {
           // 未绑工作目录（自由对话没选目录）→ cwd 用用户主目录、不用 process.cwd()
           //（打包后 = app 内部目录、对终端用户无意义）。对齐 codex（默认终端 pwd）/
@@ -2379,6 +2371,8 @@ export const resumeChatSession = async (
         callerToken,
         taskId: task.id,
         backgroundSubagents: true,
+        // 同 create：resume 按本轮入参重建工具、不沿用上次的清单，漏传就悄悄回到「系统工具全挂」
+        systemToolNames: CHAT_SYSTEM_TOOL_NAMES,
         // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
         model: bootArgs.model,
         // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）

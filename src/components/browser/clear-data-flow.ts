@@ -17,20 +17,37 @@ export interface ClearDataConfirmOptions {
 
 export const CLEAR_BROWSING_DATA_CONFIRM: ClearDataConfirmOptions = {
   title: "清除浏览器登录数据？",
+  // 「已打开的网页会重新加载」是这次修复带来的行为：不停下页面的话，页面里的内存 token 会把登录态写回；要让用户在点之前就知道
   description:
-    "会清掉内置浏览器里所有网站的登录状态（cookies 与本地存储）。所有任务共用同一份，清除后需要重新登录。",
+    "会清掉内置浏览器里所有网站的登录状态（cookies 与本地存储）。所有任务共用同一份，清除后需要重新登录。已打开的网页会重新加载，未保存的内容会丢失；无痕标签页不受影响。",
   confirmLabel: "清除",
   destructive: true,
 };
 
 export type ClearDataOutcome = "cancelled" | "cleared" | "failed";
 
+/**
+ * 从主进程的返回值里取「重新加载了几个标签」。老壳返回 undefined、返回值形状不对都当 0：
+ * 渲染侧只拿它决定提示文案，不能因为它的形状让「清除成功」变成报错。
+ */
+export const reloadedTabsOf = (result: unknown): number => {
+  const n = (result as { reloadedTabs?: unknown } | null | undefined)?.reloadedTabs;
+  return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : 0;
+};
+
+/** 清除成功后的 toast：有页面被重新加载就说一声（否则用户会奇怪页面为什么自己刷新了） */
+export const clearSuccessMessage = (result: unknown): string => {
+  const n = reloadedTabsOf(result);
+  return n > 0 ? `已清除浏览器登录数据，已重新加载 ${n} 个标签页` : "已清除浏览器登录数据";
+};
+
 export interface ClearDataDeps {
   /** 弹确认框；resolve true = 用户确认 */
   confirm: (opts: ClearDataConfirmOptions) => Promise<boolean>;
   /** 真正清除（主进程 `clearBrowsingData`） */
   clear: () => Promise<unknown> | undefined;
-  onSuccess: () => void;
+  /** 清除成功；入参是 `clear` 的返回值（主进程给的 `{ reloadedTabs }`，老壳 / 无桥是 undefined），交给 {@link clearSuccessMessage} 出文案 */
+  onSuccess: (result: unknown) => void;
   onError: (message: string) => void;
 }
 
@@ -42,8 +59,8 @@ export const runClearBrowsingData = async (deps: ClearDataDeps): Promise<ClearDa
   const ok = await deps.confirm(CLEAR_BROWSING_DATA_CONFIRM);
   if (!ok) return "cancelled";
   try {
-    await deps.clear();
-    deps.onSuccess();
+    const result = await deps.clear();
+    deps.onSuccess(result);
     return "cleared";
   } catch (err) {
     deps.onError(err instanceof Error ? err.message : String(err));
